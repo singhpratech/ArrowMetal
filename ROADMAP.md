@@ -17,10 +17,10 @@ Ordered roughly by impact divided by effort. Each item is a self-contained contr
 - [x] **RecordBatch**: multiple columns, struct import/export, C Stream import. Open: C Stream export,
       C Device Stream, nested struct children.
 - [x] **Group-by** over dense keys (sum/count/min/max/mean). Open: hash group-by for arbitrary keys, 64-bit min/max.
-- [ ] **Sort / argsort** (radix sort on the GPU), then **top-k**.
-- [ ] **Strings** (`utf8`, `large_utf8`, and `utf8_view`): equality, prefix match, length, hashing.
+- [x] **Sort / argsort / top-k**: GPU LSD radix sort, stable, nulls last, total order for floats. Open: multi-column sort keys.
+- [x] **Strings** (`utf8`, `large_utf8` import): byte/char length, equals/starts/ends/contains, murmur3 hash, GPU filter/take, dictionary encode (CPU). Open: `utf8_view`, GPU dictionary encode, case folding, regex.
 - [ ] **Dictionary-encoded** arrays: compare and filter on codes without decoding.
-- [ ] **Async / pipelined API** (see docs/DESIGN.md): return command buffers or Swift `async` results instead of blocking per kernel; fuse
+- [x] **Batched execution** (`batch { }`, lengths flow on the GPU). In progress: async / completion handlers.: return command buffers or Swift `async` results instead of blocking per kernel; fuse
       kernels into one command buffer; expose `MTLSharedEvent` through `sync_event` in the device interface.
 - [ ] **Metal 4** command-encoding path and residency sets for very large columns.
 

@@ -12,6 +12,16 @@ Core
 - MetalRecordBatch with filter/take/slice/selecting; struct (+s) C Data import/export; ArrowArrayStream import.
 - Arrow C Data Interface and C Device Data Interface (ARROW_DEVICE_METAL) import and export.
 
+Strings and sorting
+- `MetalStringArray` (utf8): byte/char length, equals/starts_with/ends_with/contains, MurmurHash3, GPU filter/take,
+  dictionary encoding; import/export through the C Data Interface (large_utf8 narrowed on import).
+- GPU LSD radix sort: `argsort`, `sorted`, `topK`, `MetalRecordBatch.sorted(by:)`; stable, nulls last, IEEE total order.
+
+Execution model
+- `MetalContext.batch { }`: one command buffer per chain; kernels read lengths from device buffers so pending
+  filter results chain without a CPU sync; pool parks buffers while a batch is open.
+- Software IEEE-754 Float64 (add/sub/mul/div/sum) on the GPU, bit-exact against the CPU.
+
 Bindings
 - libArrowMetalC C ABI (include/arrowmetal.h) and python/arrowmetal ctypes package (Arrow PyCapsule protocol).
 

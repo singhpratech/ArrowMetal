@@ -233,9 +233,16 @@ final class CInteropTests: XCTestCase {
     }
 
     func testUnsupportedTypeThrows() throws {
-        var schema = ArrowSchema(); exportArrowSchema(format: "u", into: &schema)
-        var arr = ArrowArray(); arr.n_buffers = 3; arr.release = { _ in }
+        var schema = ArrowSchema(); exportArrowSchema(format: "+l", into: &schema)   // list: not supported
+        var arr = ArrowArray(); arr.n_buffers = 2; arr.n_children = 1; arr.release = { _ in }
         XCTAssertThrowsError(try importArrowArray(schema: &schema, array: &arr))
+        var s2 = ArrowSchema(); exportArrowSchema(format: "z", into: &s2)             // binary: not supported yet
+        var a2 = ArrowArray(); a2.n_buffers = 3; a2.release = { _ in }
+        XCTAssertThrowsError(try importArrowArray(schema: &s2, array: &a2))
+        var s3 = ArrowSchema(); exportArrowSchema(format: "u", into: &s3)             // utf8 with no buffers: invalid, not a crash
+        var a3 = ArrowArray(); a3.n_buffers = 3; a3.release = { _ in }
+        XCTAssertThrowsError(try importArrowArray(schema: &s3, array: &a3))
+        s2.release?(&s2); s3.release?(&s3)
         schema.release?(&schema)
     }
 }

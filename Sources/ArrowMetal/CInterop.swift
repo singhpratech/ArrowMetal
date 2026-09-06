@@ -83,7 +83,7 @@ public func importArrowArray(schema: UnsafePointer<ArrowSchema>, array: UnsafeMu
         throw ArrowMetalError.unsupportedType("nested/dictionary arrays are not supported (format \(fmt))")
     }
     if fmt == "u" || fmt == "U" { return try importStringArray(large: fmt == "U", array: array, context: context) }
-    guard array.pointee.n_buffers == 2 else {
+    guard array.pointee.n_buffers == 2, array.pointee.buffers != nil else {
         throw ArrowMetalError.invalidArrowArray("expected 2 buffers for primitive array, got \(array.pointee.n_buffers)")
     }
     // Fast path: an array exported by ArrowMetal in this process. Share the MTLBuffer objects directly.
@@ -145,7 +145,7 @@ public func importArrowArray(schema: UnsafePointer<ArrowSchema>, array: UnsafeMu
 /// utf8 / large_utf8 import. Zero-copy for utf8 when page aligned and offset 0; large_utf8 offsets are narrowed
 /// (one pass) when the data is under 2 GB.
 private func importStringArray(large: Bool, array: UnsafeMutablePointer<ArrowArray>, context: MetalContext) throws -> ImportResult {
-    guard array.pointee.n_buffers == 3 else { throw ArrowMetalError.invalidArrowArray("expected 3 buffers for utf8") }
+    guard array.pointee.n_buffers == 3, array.pointee.buffers != nil else { throw ArrowMetalError.invalidArrowArray("expected 3 buffers for utf8") }
     let owner = ImportedCArray(moving: array)
     let a = owner.array
     let length = Int(a.length), offset = Int(a.offset)

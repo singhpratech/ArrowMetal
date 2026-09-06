@@ -72,3 +72,11 @@ Things learned the hard way. Add to this whenever something surprises you.
   final newline. Generated MSL fragments that start with a directive must begin with a newline.
 - Float64 sum on the GPU accumulates with `d_add` in tree order; per-threadgroup partials are combined on
   the CPU in `Double`. Results differ from a sequential CPU sum only by normal floating-point reordering.
+
+## Round 7 (2026-09-06): strings and sort
+- Generated MSL written through a shell heredoc must use `\(K)` (one backslash) for Swift interpolation; a
+  doubled backslash reaches the Metal compiler as literal text. Same newline rule as before for `#define`.
+- LSD radix sort with 8-bit digits, 4096-element blocks and a stable in-chunk ranking is correct across all
+  types and sizes; descending order must invert keys rather than reverse the ascending result, or ties flip.
+- MurmurHash3 x86_32 reference vectors (seed 0): "" -> 0, "a" -> 0x3c2569b2, "abc" -> 0xb3dd93fa, "hello" -> 0x248bfa47.
+  Four collisions among 100k 32-bit hashes is normal (birthday bound), not a bug.
