@@ -113,6 +113,9 @@ public enum Executor {
             let lo = Swift.min(Swift.max(offset, 0), n)
             let len = Swift.max(Swift.min(count, n - lo), 0)
             if lo == 0 && len == n { return input }
+            // `slice` is a CPU-side view (and a CPU copy when the offset is not word aligned), so the
+            // rows it looks at have to exist before it runs: this is a sync point.
+            try (input.columns.first?.metalContext ?? .shared).flush(reopen: true)
             return try input.slice(offset: lo, length: len)
 
         case .distinct(let child, let subset):

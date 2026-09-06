@@ -1153,6 +1153,68 @@ void        am_query_result_release(am_query_result* r);
 // Parses and canonicalises a query without running it (NULL plus am_last_error() on a bad query).
 const char* am_query_canonical(const char* expr_text);
 
+// ---------------------------------------------------------------------------------------------------
+// The lazy query engine: a whole plan in one call (docs/ENGINE.md).
+//
+// Register the tables the plan reads once with am_plan_source (it takes am_array handles you already
+// hold and retains them), then send the plan as JSON. The engine type-checks it, optimizes it
+// (predicate pushdown, projection pruning, filter fusion, constant folding, expression CSE, join
+// reordering), lowers it to physical operators with maximal fused Metal kernels, and runs the whole
+// thing inside one command buffer.
+//
+//   plan   := {"op": OP, ...}
+//   OP     := "scan"        {"source": NAME, "columns": [NAME, ...]?}
+//           | "filter"      {"input": plan, "predicate": SEXPR}
+//           | "select"      {"input": plan, "exprs": [[NAME, SEXPR], ...]}
+//           | "with_columns"{"input": plan, "exprs": [[NAME, SEXPR], ...]}
+//           | "aggregate"   {"input": plan, "aggs": [[AGGOP, NAME, SEXPR?], ...]}
+//           | "group_by"    {"input": plan, "keys": [[NAME, SEXPR], ...], "aggs": [...]}
+//           | "sort"        {"input": plan, "by": [[NAME, DESCENDING], ...]}
+//           | "limit"       {"input": plan, "count": INT, "offset": INT?}
+//           | "unique"      {"input": plan, "subset": [NAME, ...]?}
+//           | "join"        {"left": plan, "right": plan, "left_on": [...], "right_on": [...],
+//                            "how": "inner"|"left"|"right"|"full"|"semi"|"anti", "suffix": STR?}
+//           | "join_asof"   {"left": plan, "right": plan, "left_on": NAME, "right_on": NAME,
+//                            "by": [...]?, "by_right": [...]?, "tolerance": INT?,
+//                            "strategy": "backward"|"forward"|"nearest"?, "suffix": STR?}
+//           | "concat"      {"inputs": [plan, ...]}
+//           | "window"      {"input": plan, "specs": [{"name": NAME, "fn": WFN, "column": NAME?,
+//                            "n": INT?, "partition_by": [...]?, "order_by": [[NAME, DESC], ...]?}, ...]}
+//           | "explode"     {"input": plan, "columns": [NAME]}
+//   AGGOP  := "sum" | "min" | "max" | "mean" | "count"
+//   WFN    := "row_number" | "rank" | "dense_rank" | "lag" | "lead" | "cum_sum"
+//           | "rolling_sum" | "rolling_mean" | "rolling_min" | "rolling_max"
+//           | "sum" | "min" | "max" | "mean" | "count"     -- a whole-partition aggregate
+//   SEXPR  := the expression grammar above, verbatim.
+//
+// Example: sum(amount) by region where amount > 100, biggest first, top 10.
+//   {"op":"limit","count":10,"input":
+//     {"op":"sort","by":[["total",true]],"input":
+//       {"op":"group_by","keys":[["region","(col \"region\")"]],
+//        "aggs":[["sum","total","(col \"amount\")"]],"input":
+//         {"op":"filter","predicate":"(gt (col \"amount\") (int 100))","input":
+//           {"op":"scan","source":"sales"}}}}}
+//
+// am_plan_explain returns the optimized logical plan and the physical plan it lowers to, as text
+// valid until the next call on this thread (NULL plus am_last_error() when the plan does not
+// type-check). am_plan_run returns a result handle; am_plan_column hands out a new am_array handle
+// the caller releases with am_release, and the result itself with am_plan_result_release.
+typedef struct am_plan_source_t am_plan_source;
+typedef struct am_plan_result_t am_plan_result;
+
+int  am_plan_source(const char* name, am_array** columns, const char** names, int64_t n_columns,
+                    am_plan_source** out);
+void am_plan_source_release(am_plan_source* s);
+int  am_plan_run(const char* plan_json, am_plan_source** sources, int64_t n_sources, int optimize,
+                 am_plan_result** out);
+const char* am_plan_explain(const char* plan_json, am_plan_source** sources, int64_t n_sources,
+                            int optimize);
+int64_t     am_plan_column_count(am_plan_result* r);
+int64_t     am_plan_row_count(am_plan_result* r);
+const char* am_plan_column_name(am_plan_result* r, int64_t i);
+int         am_plan_column(am_plan_result* r, int64_t i, am_array** out);
+void        am_plan_result_release(am_plan_result* r);
+
 #ifdef __cplusplus
 }
 #endif
