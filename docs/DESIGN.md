@@ -89,30 +89,34 @@ invisible at a thousand groups and is the whole cost at ten million.
 
 | grouped aggregate | groups | before | after | change |
 |---|---:|---:|---:|---:|
-| min (int64 values) | 1,000 | 18.7 ms | 3.0 ms | 6.2x |
+| min (int64 values) | 1,000 | 18.7 ms | 2.7 ms | 6.9x |
 | min | 100,000 | 35.8 ms | 3.5 ms | 10.2x |
 | min | 10,000,000 | 1189 ms | 17.0 ms | 70x |
-| max | 1,000 | 18.8 ms | 2.9 ms | 6.4x |
+| max | 1,000 | 18.8 ms | 2.7 ms | 7.0x |
 | max | 100,000 | 36.0 ms | 3.5 ms | 10.2x |
 | max | 10,000,000 | 1228 ms | 17.8 ms | 69x |
 | mean | 10,000,000 | 338 ms | 30.3 ms | 11x |
-| variance (float64, ddof=1) | 1,000 | 512 ms | 9.1 ms | 56x |
-| variance | 100,000 | 500 ms | 10.8 ms | 46x |
-| variance | 10,000,000 | 823 ms | 32.4 ms | 25x |
-| first | 100,000 | 10.7 ms | 4.1 ms | 2.6x |
-| first | 10,000,000 | 480 ms | 17.3 ms | 28x |
-| list | 1,000 | 20.3 ms | 8.6 ms | 2.4x |
-| list | 100,000 | 20.8 ms | 9.7 ms | 2.1x |
+| variance (float64, ddof=1) | 1,000 | 512 ms | 6.5 ms | 79x |
+| variance | 100,000 | 500 ms | 11.1 ms | 45x |
+| variance | 10,000,000 | 823 ms | 34.8 ms | 24x |
+| first | 100,000 | 10.7 ms | 4.4 ms | 2.4x |
+| first | 10,000,000 | 480 ms | 18.1 ms | 27x |
+| list | 1,000 | 20.3 ms | 6.7 ms | 3.0x |
+| list | 100,000 | 20.8 ms | 11.6 ms | 1.8x |
 | sum | any | unchanged (already the atomic path) | | |
 | count | any | unchanged | | |
 | count_distinct | any | unchanged — still two full radix sorts | | |
 
-At 50M rows against the fastest CPU library: min 3.3x / 5.2x / 7.0x at 1k / 100k / 10M groups (from
-0.25x / 0.56x / 0.21x), variance 1.1x / 4.2x / 5.8x (from 0.05x), `first` 8.4x / 7.3x / 6.5x, `list`
-10.5x / 9.6x. `count_distinct` is the remaining shortfall: it still dictionary-encodes the values with
-one radix sort and collapses the packed `(group, code)` pairs with another, where the CPU libraries keep
-a hash set per group. A segmented sort of the values inside each group's counting-sort run, or a
-per-group hash, is the fix — but the sort of the *key* column is gone from every aggregate.
+At 50M rows, against the fastest of Polars / pyarrow / pandas: min 2.5x / 3.9x / 5.5x at 1k / 100k / 10M
+groups, where it was 0.25x / 0.56x / 0.21x; variance 0.71x / 3.3x / 4.9x, where it was 0.05x at 100k;
+`first` 5.9x / 6.0x / 5.2x; `list` 10.2x / 8.1x / 5.2x. Two caveats on those ratios. At a **thousand**
+groups every grouped aggregate lands near 2.5x, `sum` and `count` included, because a fresh
+`group_by([...])` spends about 7 ms of the 10 ms rebuilding the dense key mapping — reuse the object and
+the aggregate itself is 3 ms. And **`count_distinct` is the remaining shortfall** (0.55x): it still
+dictionary-encodes the values with one radix sort and collapses the packed `(group, code)` pairs with
+another, where the CPU libraries keep a hash set per group. A segmented sort of the values inside each
+group's counting-sort run, or a per-group hash, is the fix — but the sort of the *key* column is gone
+from every aggregate.
 
 ## Latency (small inputs)
 Measured floor on M4 Max: an empty kernel with encode + commit + wait costs ~116 µs; ten kernels in one
