@@ -75,23 +75,8 @@ enum SegmentedSource {
     /// counts we divide by, which are far below 2^53), and the inverse of the prelude's `d_key`.
     private static let helpers = """
 
-    inline ulong d_from_float(float f) {
-        uint b = as_type<uint>(f);
-        ulong s = (ulong)(b >> 31);
-        uint e = (b >> 23) & 0xFFu;
-        uint m = b & 0x7FFFFFu;
-        if (e == 0xFFu) return (s << 63) | 0x7FF0000000000000ul | ((ulong)m << 29);
-        if (e == 0u) {
-            if (m == 0u) return s << 63;
-            int sh = 0;
-            while ((m & 0x800000u) == 0u) { m <<= 1; sh++; }
-            m &= 0x7FFFFFu;
-            long ee = (long)(1 - 127 - sh) + 1023;
-            return (s << 63) | ((ulong)ee << 52) | ((ulong)m << 29);
-        }
-        long ee = (long)e - 127 + 1023;
-        return (s << 63) | ((ulong)ee << 52) | ((ulong)m << 29);
-    }
+    // d_from_float comes from DoubleMath.msl
+
     inline ulong d_from_ucount(ulong v) {
         if (v == 0ul) return 0ul;
         uint p = 63u;
