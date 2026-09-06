@@ -49,3 +49,13 @@ Rules we follow so the comparison is fair:
 - Sorting uses separate no-null columns (Int64 over the full range, Float64 in [-1e9, 1e9]).
 - Strings: 10M utf8 values drawn uniformly from 1000 distinct keys shaped `cust_NNN_region` (13 bytes each).
 - Python: a venv with `polars pyarrow pandas numpy` on Python 3.13.
+
+## polars_bench.py
+
+`PYTHONPATH=python python Benchmarks/polars_bench.py [rows] [iterations]` compares native Polars
+against the three ways of reaching the GPU from Polars — the `.arrowmetal` namespaces, the Rust
+expression plugin inside a lazy plan, and the same kernels with the columns already resident —
+for sum, filter+sum, group-by, top-k and string contains, in wall-ms and CPU-ms. It also prints
+the hand-off cost and the buffer addresses that prove the import copies nothing. The published
+tables at 10M and 50M rows are in [../docs/POLARS.md](../docs/POLARS.md). The plugin rows are
+skipped when `polars-plugin/target/release/libarrowmetal_polars.dylib` has not been built.

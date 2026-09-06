@@ -3839,3 +3839,76 @@ def concat(frames):
     if not frames:
         raise ArrowMetalError("concat needs at least one frame")
     return frames[0].concat(frames[1:])
+
+
+# ---------------------------------------------------------------------------------------------
+# Polars integration (docs/POLARS.md), imported lazily.
+#
+# `import arrowmetal` must not pull in Polars: the package's only hard dependency is pyarrow, and
+# importing Polars costs a couple of hundred milliseconds. So the bridge lives in its own module
+# and arrives on first use, through the module-level `__getattr__` below:
+#
+#     am.from_polars(df)      -> imports arrowmetal.polars_bridge, then answers
+#     am.polars_plugin        -> imports the expression-plugin registration module
+#
+# Importing `arrowmetal.polars_bridge` is also what registers the `.arrowmetal` namespaces on
+# Series, DataFrame and LazyFrame, so that any of these arms `df.arrowmetal...`:
+#
+#     import arrowmetal.polars_bridge          # explicit
+#     am.from_polars(df)                       # or just use the bridge
+#     import polars as pl; import arrowmetal   # or import Polars first -- see below
+#
+# The last one works because, when Polars is already loaded, registering costs nothing extra and
+# a user who has imported both plainly wants the namespace.
+# ---------------------------------------------------------------------------------------------
+
+_POLARS_BRIDGE_EXPORTS = ("from_polars", "to_polars", "zero_copy", "zero_copy_report",
+                          "register_polars", "polars_bridge")
+_POLARS_PLUGIN_EXPORTS = ("polars_plugin", "plugin_path", "plugin_available")
+
+
+def _load_polars_bridge():
+    # `from . import polars_bridge` would go through this module's own `__getattr__` again
+    # (importlib asks the package for the attribute), so import by name instead.
+    import importlib
+    _pb = importlib.import_module(__name__ + ".polars_bridge")
+    g = globals()
+    g["polars_bridge"] = _pb
+    g["from_polars"] = _pb.from_polars
+    g["to_polars"] = _pb.to_polars
+    g["zero_copy"] = _pb.zero_copy
+    g["zero_copy_report"] = _pb.zero_copy_report
+    g["register_polars"] = _pb.register_namespaces
+    return _pb
+
+
+def _load_polars_plugin():
+    import importlib
+    _pp = importlib.import_module(__name__ + ".polars_plugin")
+    g = globals()
+    g["polars_plugin"] = _pp
+    g["plugin_path"] = _pp.plugin_path
+    g["plugin_available"] = _pp.available
+    return _pp
+
+
+def __getattr__(name):
+    """PEP 562 lazy attributes: the Polars bridge and expression plugin load on first touch."""
+    if name in _POLARS_BRIDGE_EXPORTS:
+        _load_polars_bridge()
+        return globals()[name]
+    if name in _POLARS_PLUGIN_EXPORTS:
+        _load_polars_plugin()
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_POLARS_BRIDGE_EXPORTS) | set(_POLARS_PLUGIN_EXPORTS))
+
+
+if "polars" in sys.modules:      # Polars was imported first: arm `.arrowmetal` right away
+    try:
+        _load_polars_bridge()
+    except Exception:            # a broken/partial Polars must not break `import arrowmetal`
+        pass

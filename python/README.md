@@ -56,3 +56,21 @@ absent; the suite needs a real Metal device.
 
 Not covered by the group-by kernels today: `min`/`max` on 64-bit values, `mean` on Float32, and Float64
 values for any aggregate. `python/tests` pins those as expected errors so the tests flag it when they land.
+
+## Polars
+
+Three tiers, all shipping in this repository — see [docs/POLARS.md](../docs/POLARS.md):
+
+```python
+import polars as pl, arrowmetal as am
+
+am.from_polars(df)                              # -> dict[str, MetalArray], zero copy
+df.arrowmetal.group_by("k").sum("v")            # tier 1: the GPU around Polars
+pl.col("v").arrowmetal.sum()                    # tier 2: inside a lazy plan (needs the Rust plugin)
+lf.arrowmetal.collect_gpu(query)                # tier 3: Polars runs the plan, the GPU finishes it
+```
+
+`import arrowmetal` still does not import Polars: the bridge loads on first use (or at import when
+Polars is already loaded). Tier 2 needs one extra build,
+`cd polars-plugin && cargo build --release`; the other two are pure Python over the Arrow C Data
+Interface. `PYTHONPATH=python python -m pytest python/tests/test_polars.py -q` runs the suite.

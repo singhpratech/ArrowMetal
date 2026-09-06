@@ -28,6 +28,9 @@ classifiers = [
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
+# The Polars bridge and the .arrowmetal namespaces (docs/POLARS.md). Not a hard dependency:
+# `import arrowmetal` never imports Polars, and the bridge module loads on first use.
+polars = ["polars>=1.0"]
 
 [project.urls]
 Homepage = "https://github.com/arrowmetal/ArrowMetal"
