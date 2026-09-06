@@ -389,11 +389,10 @@ enum ExprCompiler {
     }
 
     /// A hash of the generated source, used to key the process-wide pipeline cache.
-    static func sourceKey(_ s: String) -> String {
-        var h: UInt64 = 0xcbf29ce484222325
-        for b in s.utf8 { h = (h ^ UInt64(b)) &* 0x100000001b3 }
-        return String(h, radix: 36) + "-\(s.utf8.count)"
-    }
+    /// The generated source is the key: `MetalContext` keys its pipeline cache by string, and a hash
+    /// collision there would silently hand back the wrong kernel. This is looked up once per compiled
+    /// query per function (the `Compiled.pipelines` map absorbs the rest), so the length costs nothing.
+    static func sourceKey(_ s: String) -> String { s }
 
     static func makeArray(_ t: ExprType, length: Int, values: MetalArrowBuffer, validity: MetalArrowBuffer?,
                           ctx: MetalContext, pendingLength: MetalArrowBuffer? = nil, capacity: Int = 0) throws -> AnyMetalArray {

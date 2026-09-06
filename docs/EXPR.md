@@ -240,7 +240,7 @@ thousandth of the CPU time.
 
 ## Correctness
 
-- `Tests/ArrowMetalTests/ExprTests.swift` — 20 suites against Swift oracles at 0 / 1 / 33 / 4097 /
+- `Tests/ArrowMetalTests/ExprTests.swift` — 20 test cases against Swift oracles at 0 / 1 / 33 / 4097 /
   1 000 003 rows with nulls: every operator alone, deep mixed trees with shared subtrees, bit-exact
   float64 arithmetic and comparisons (including ±0, subnormals, infinities and NaN), Kleene predicates,
   all four terminals, batched vs unbatched, the pipeline-cache hit, the error cases, and the canonical
