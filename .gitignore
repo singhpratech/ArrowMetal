@@ -10,3 +10,11 @@ private/
 # Local benchmark outputs
 Benchmarks/results/local/
 .claude/
+# Python build artifacts (the dylib is copied in by scripts/build_wheel.sh)
+python/arrowmetal/libArrowMetalC.dylib
+python/dist/
+python/build/
+python/*.egg-info/
+__pycache__/
+*.py[co]
+.pytest_cache/
