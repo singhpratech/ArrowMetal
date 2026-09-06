@@ -3200,3 +3200,37 @@ class _ExprNamespace:
 
 
 expr = _ExprNamespace()
+
+
+# ---------------------------------------------------------------------------------------------------
+# DuckDB bridge (docs/DUCKDB.md), imported lazily so that `import arrowmetal` never needs duckdb.
+#
+# `am.from_duckdb(rel)` lifts a DuckDB result onto the GPU, `am.to_duckdb(con, name, arrays)` hands
+# GPU output back as a DuckDB view, `am.duckdb_gpu_query(con, sql, then=...)` does both around one
+# callable, and `am.duckdb_batches` / `am.duckdb_aggregate` / `am.duckdb_group_by` stream a table
+# larger than memory through the same kernels. Everything crosses over the Arrow C Data / C Stream
+# interfaces, which on Apple silicon is a pointer hand-off and not a copy.
+# ---------------------------------------------------------------------------------------------------
+_DUCKDB_EXPORTS = ("from_duckdb", "to_duckdb", "duckdb_gpu_query", "duckdb_batches",
+                   "duckdb_aggregate", "duckdb_group_by", "duckdb_reader", "duckdb_table",
+                   "duckdb_is_zero_copy")
+
+
+def __getattr__(name):
+    """PEP 562 lazy attributes: the duckdb bridge loads on first use, not on import."""
+    if name in _DUCKDB_EXPORTS or name == "duckdb_bridge":
+        # importlib, not `from . import duckdb_bridge`: the latter comes back through this hook
+        # while the submodule is still being bound, and recurses.
+        import importlib
+        duckdb_bridge = importlib.import_module(".duckdb_bridge", __name__)
+        if name == "duckdb_bridge":
+            globals()["duckdb_bridge"] = duckdb_bridge
+            return duckdb_bridge
+        attr = getattr(duckdb_bridge, "is_zero_copy" if name == "duckdb_is_zero_copy" else name)
+        globals()[name] = attr
+        return attr
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(list(globals()) + list(_DUCKDB_EXPORTS))
