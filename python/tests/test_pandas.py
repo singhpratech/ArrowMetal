@@ -590,6 +590,18 @@ def test_default_routing_table_leaves_single_pass_ops_in_pandas(frames):
     assert set(accel.NEVER_BY_DEFAULT) <= {op for _, op in accel.REGISTRY}
 
 
+def test_numpy_backed_round_and_isin_stay_in_pandas(frames):
+    """pandas' numpy `round` is an order of magnitude faster than its pyarrow one, so a numpy-backed
+    column keeps it — while the same call on an Arrow-backed column goes to the GPU."""
+    with accelerated(threshold=0, route_all=False) as st:
+        frames["numpy"]["f"].round(2)
+        frames["numpy"]["i"].isin([1, 2])
+        frames["arrow"]["f"].round(2)
+        frames["arrow"]["i"].isin([1, 2])
+    assert st.cpu.get("round") == 1 and st.gpu.get("round") == 1
+    assert st.cpu.get("isin") == 1 and st.gpu.get("isin") == 1
+
+
 def test_route_all_turns_the_rest_on(frames):
     s = frames["arrow"]["i"]
     with accelerated(threshold=0, route_all=True) as st:

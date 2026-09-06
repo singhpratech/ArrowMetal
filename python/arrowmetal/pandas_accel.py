@@ -214,6 +214,19 @@ NEVER_BY_DEFAULT = ("sum", "min", "max", "mean", "count", "abs",
 ROW_FACTOR = {op: None for op in NEVER_BY_DEFAULT}
 
 
+#: Operations that win on an Arrow-backed column but lose on a numpy-backed one, because pandas'
+#: numpy kernel for them is far faster than its pyarrow kernel *and* the column has to be converted
+#: to Arrow first. `round` at 10M rows: 252 ms in pandas on an Arrow-backed float column against
+#: 4 ms on a numpy one, while the GPU needs about 25 ms either way. Same table, same rules — edit it
+#: or clear it. `route_all()` clears this too.
+_NUMPY_NEVER_DEFAULT = frozenset({"round", "isin"})
+NUMPY_NEVER = set(_NUMPY_NEVER_DEFAULT)
+
+
+def _numpy_blocked(op, series):
+    return op in NUMPY_NEVER and isinstance(series.dtype, np.dtype)
+
+
 def route_all(on=True):
     """Route every operation in the registry, including the ones pandas does better on its own.
 
@@ -221,6 +234,7 @@ def route_all(on=True):
     exercise every GPU path."""
     for op in NEVER_BY_DEFAULT:
         ROW_FACTOR[op] = 1 if on else None
+    NUMPY_NEVER.clear() if on else NUMPY_NEVER.update(_NUMPY_NEVER_DEFAULT)
 
 
 def _big(obj, factor=1):
@@ -431,6 +445,8 @@ def _impl_top_k(largest):
 def _impl_isin(orig, self, values):
     if not isinstance(self, pd.Series) or not _eligible(self, ("numeric", "string")):
         return _UNSUPPORTED
+    if _numpy_blocked("isin", self):
+        return _UNSUPPORTED
     try:
         vals = list(values)
     except TypeError:
@@ -456,6 +472,8 @@ def _impl_unary(name):
 
 def _impl_round(orig, self, decimals=0, *a, **k):
     if a or k or not isinstance(self, pd.Series) or not _eligible(self, ("numeric",)):
+        return _UNSUPPORTED
+    if _numpy_blocked("round", self):
         return _UNSUPPORTED
     if dtype_family(self.dtype) == "numeric" and _b._metal(self).format not in ("f", "g"):
         return _UNSUPPORTED                     # rounding an integer column is the identity
