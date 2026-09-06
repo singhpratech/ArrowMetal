@@ -162,12 +162,18 @@ enum KernelSource {
     /// Numeric cast. Float to integer truncates toward zero; out-of-range is unspecified (as in Arrow's unchecked cast).
     static func cast(From: String, To: String) -> String { prelude + """
     kernel void cast_kernel(device const \(From)* a [[buffer(0)]], constant uint& n [[buffer(1)]],
-                            device \(To)* out [[buffer(2)]], uint i [[thread_position_in_grid]]) {
-        if (i < n) out[i] = (\(To))a[i];
+                            device \(To)* out [[buffer(2)]], uint t [[thread_position_in_grid]]) {
+        uint i = t * 4u;
+        if (i + 4u <= n) {
+            \(From)4 v = *(device const \(From)4*)(a + i);
+            *(device \(To)4*)(out + i) = \(To)4(v);
+        } else {
+            for (; i < n; i++) out[i] = (\(To))a[i];
+        }
     }
     """ }
 
-    /// Element-wise arithmetic. One thread per element.
+    /// Element-wise arithmetic. Each thread handles 4 elements through vector loads/stores; the tail is scalar.
     static func arithmetic(T: String) -> String {
         let ops: [(String, String)] = [("add", "+"), ("sub", "-"), ("mul", "*"), ("div", "/")]
         var s = prelude
@@ -177,15 +183,28 @@ enum KernelSource {
                                             constant \(T)& scalar [[buffer(1)]],
                                             constant uint& n [[buffer(2)]],
                                             device \(T)* out [[buffer(3)]],
-                                            uint i [[thread_position_in_grid]]) {
-                if (i < n) out[i] = a[i] \(op) scalar;
+                                            uint t [[thread_position_in_grid]]) {
+                uint i = t * 4u;
+                if (i + 4u <= n) {
+                    \(T)4 v = *(device const \(T)4*)(a + i);
+                    *(device \(T)4*)(out + i) = v \(op) scalar;
+                } else {
+                    for (; i < n; i++) out[i] = a[i] \(op) scalar;
+                }
             }
             kernel void arith_array_\(name)(device const \(T)* a [[buffer(0)]],
                                            device const \(T)* b [[buffer(1)]],
                                            constant uint& n [[buffer(2)]],
                                            device \(T)* out [[buffer(3)]],
-                                           uint i [[thread_position_in_grid]]) {
-                if (i < n) out[i] = a[i] \(op) b[i];
+                                           uint t [[thread_position_in_grid]]) {
+                uint i = t * 4u;
+                if (i + 4u <= n) {
+                    \(T)4 va = *(device const \(T)4*)(a + i);
+                    \(T)4 vb = *(device const \(T)4*)(b + i);
+                    *(device \(T)4*)(out + i) = va \(op) vb;
+                } else {
+                    for (; i < n; i++) out[i] = a[i] \(op) b[i];
+                }
             }
 
             """
@@ -262,6 +281,72 @@ enum KernelSource {
             for (uint k = 0; k < TG / 32u; k++) total += simdTotals[k];
             blockCounts[tgid] = total;
         }
+    }
+    // Exclusive scan of block counts, single threadgroup (blocks <= a few hundred thousand is fine: each thread
+    // handles a strided range, then a TG-wide scan of the per-thread totals).
+    kernel void filter_scan(device uint* blockCounts [[buffer(0)]],
+                            constant uint& blocks [[buffer(1)]],
+                            device uint* total [[buffer(2)]],
+                            uint lid [[thread_index_in_threadgroup]],
+                            uint sgid [[simdgroup_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+        threadgroup uint simdTotals[32];
+        uint per = (blocks + TG - 1) / TG;
+        uint lo = lid * per, hi = min(blocks, lo + per);
+        uint local = 0;
+        for (uint b = lo; b < hi; b++) local += blockCounts[b];
+        uint pre = simd_prefix_exclusive_sum(local);
+        uint t = simd_sum(local);
+        if (lane == 0) simdTotals[sgid] = t;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint prefix = 0;
+        for (uint k = 0; k < sgid; k++) prefix += simdTotals[k];
+        uint run = prefix + pre;
+        for (uint b = lo; b < hi; b++) { uint c = blockCounts[b]; blockCounts[b] = run; run += c; }
+        if (lid == TG - 1) *total = run;
+    }
+    // Fused predicate: selection word computed inline from `vals OP scalar` and validity (no bitmap round trip).
+    inline uint pred_word(device const \(T)* vals, device const uchar* validity, uint hasValidity,
+                          uint w, uint n, uint op, \(T) scalar) {
+        uint base = w * 32u;
+        if (base >= n) return 0u;
+        uint limit = min(32u, n - base);
+        uint bits = 0;
+        for (uint j = 0; j < limit; j++) {
+            \(T) v = vals[base + j];
+            bool r;
+            switch (op) { case 0: r = v == scalar; break; case 1: r = v != scalar; break; case 2: r = v < scalar; break;
+                          case 3: r = v <= scalar; break; case 4: r = v > scalar; break; default: r = v >= scalar; break; }
+            if (r) bits |= (1u << j);
+        }
+        if (hasValidity) {
+            uint vbits = 0;
+            for (uint j = 0; j < limit; j++) if (bit_get(validity, base + j)) vbits |= (1u << j);
+            bits &= vbits;
+        }
+        return bits;
+    }
+    kernel void filter_pred_count(device const \(T)* vals [[buffer(0)]],
+                                  device const uchar* validity [[buffer(1)]],
+                                  constant uint& n [[buffer(2)]],
+                                  constant uint& hasValidity [[buffer(3)]],
+                                  constant uint& op [[buffer(4)]],
+                                  constant \(T)& scalar [[buffer(5)]],
+                                  device uint* sel [[buffer(6)]],
+                                  device uint* blockCounts [[buffer(7)]],
+                                  uint w [[thread_position_in_grid]],
+                                  uint lid [[thread_index_in_threadgroup]],
+                                  uint tgid [[threadgroup_position_in_grid]],
+                                  uint sgid [[simdgroup_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+        threadgroup uint simdTotals[32];
+        uint word = pred_word(vals, validity, hasValidity, w, n, op, scalar);
+        if (w * 32u < n) sel[w] = word;
+        uint c = popcount(word);
+        uint t = simd_sum(c);
+        if (lane == 0) simdTotals[sgid] = t;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid == 0) { uint total = 0; for (uint k = 0; k < TG / 32u; k++) total += simdTotals[k]; blockCounts[tgid] = total; }
     }
     kernel void filter_scatter(device const \(T)* vals [[buffer(0)]],
                                device const uchar* validity [[buffer(1)]],

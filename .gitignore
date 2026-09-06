@@ -5,3 +5,7 @@
 xcuserdata/
 .DS_Store
 Package.resolved
+# Internal strategy notes, never committed
+private/
+# Local benchmark outputs
+Benchmarks/results/local/

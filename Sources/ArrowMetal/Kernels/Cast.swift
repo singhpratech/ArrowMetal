@@ -19,7 +19,7 @@ extension MetalArray {
                     enc.setBuffer(values.mtl, offset: values.offset, index: 0)
                     Dispatch.setUInt(enc, length, index: 1)
                     enc.setBuffer(out.mtl, offset: out.offset, index: 2)
-                    Dispatch.dispatch1D(enc, pso, count: length)
+                    Dispatch.dispatch1D(enc, pso, count: (length + 3) / 4)
                 }
             }
         } else {

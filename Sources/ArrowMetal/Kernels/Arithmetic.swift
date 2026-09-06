@@ -21,7 +21,7 @@ extension MetalArray {
             Dispatch.setScalar(enc, scalar, index: 1)
             Dispatch.setUInt(enc, length, index: 2)
             enc.setBuffer(out.mtl, offset: out.offset, index: 3)
-            Dispatch.dispatch1D(enc, pso, count: length)
+            Dispatch.dispatch1D(enc, pso, count: (length + 3) / 4)
         }
         return MetalArray<T>(length: length, nullCount: nullCount, validity: validity, values: out, context: ctx)
     }
@@ -41,7 +41,7 @@ extension MetalArray {
             enc.setBuffer(other.values.mtl, offset: other.values.offset, index: 1)
             Dispatch.setUInt(enc, length, index: 2)
             enc.setBuffer(out.mtl, offset: out.offset, index: 3)
-            Dispatch.dispatch1D(enc, pso, count: length)
+            Dispatch.dispatch1D(enc, pso, count: (length + 3) / 4)
         }
         let v = try BitmapOps.combineValidity(ctx, validity, other.validity, bits: length)
         let res = MetalArray<T>(length: length, nullCount: 0, validity: v, values: out, context: ctx)
