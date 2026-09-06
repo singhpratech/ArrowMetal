@@ -269,8 +269,11 @@ And it is slower than just writing the SQL:
 | `order by v desc limit 100` | 7.2 ms | 105.9 ms |
 | full sort | 64.0 ms | 540.4 ms |
 
-The kernels are not the problem - the same group-by from the Python bridge runs in 4.6 ms at 50M
-rows. Three things in the extension's path are:
+(The group-by rows compute all four aggregates at once, which is what `arrowmetal_group_by` returns,
+so they are not comparable to the single-`sum` group-by in §5.)
+
+The kernels are not the problem - the same GPU group-by from the Python bridge runs in 4.6 ms at 50M
+rows, against these hundreds. Three things in the extension's path are:
 
 1. **The DataChunk assembly is single-threaded.** DuckDB emits ~2048-row chunks and one ArrowMetal
    array is one contiguous buffer, so the extension memcpys chunk after chunk on one thread while
