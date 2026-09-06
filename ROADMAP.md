@@ -2,6 +2,9 @@
 
 Ordered roughly by impact divided by effort. Each item is a self-contained contribution. Open an issue to claim one.
 
+Where each item sits against the full Apache Arrow compute and type lists is tracked in
+[docs/COVERAGE.md](docs/COVERAGE.md).
+
 ## Near term (good first contributions)
 - [x] **Take / gather** kernel (`take(indices:)`), the other half of selection.
 - [x] **Count / any / all** for boolean arrays on the GPU.
