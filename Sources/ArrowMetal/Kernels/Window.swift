@@ -30,33 +30,76 @@ extension MetalArray {
 
     /// SQL `ROW_NUMBER() OVER (ORDER BY value NULLS LAST)`: 1-based position of each row in the sorted
     /// order, returned aligned to the original rows. Ties keep the input order (the argsort is stable).
-    /// The result never contains nulls.
-    public func rowNumber() throws -> MetalArray<Int32> { try scatterIntRank(mode: 0) }
+    /// The result never contains nulls. Arrow spells this `rank(tiebreaker="first")`.
+    public func rowNumber(descending: Bool = false,
+                          nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
+        try scatterIntRank(mode: 0, descending: descending, nullPlacement: nullPlacement)
+    }
 
     /// SQL `RANK()`: the 1-based position of the *first* row of each tie group, so equal values share a
-    /// rank and the following rank skips the gap. Nulls are one tie group at the end.
-    public func rank() throws -> MetalArray<Int32> { try scatterIntRank(mode: 1) }
+    /// rank and the following rank skips the gap. Arrow's `rank(tiebreaker="min")`.
+    public func rank(descending: Bool = false,
+                     nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
+        try scatterIntRank(mode: 1, descending: descending, nullPlacement: nullPlacement)
+    }
 
-    /// SQL `DENSE_RANK()`: 1-based index of each distinct value in ascending order, with no gaps.
-    /// Nulls, being one tie group at the end, take the last index.
-    public func denseRank() throws -> MetalArray<Int32> { try scatterIntRank(mode: 2) }
+    /// SQL `DENSE_RANK()`: 1-based index of each distinct value in the order, with no gaps.
+    /// Arrow's `rank(tiebreaker="dense")`.
+    public func denseRank(descending: Bool = false,
+                          nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
+        try scatterIntRank(mode: 2, descending: descending, nullPlacement: nullPlacement)
+    }
+
+    /// Arrow `rank(tiebreaker="max")`: every row of a tie group takes the group's *last* 1-based
+    /// position, so a group of three at positions 4, 5, 6 all rank 6.
+    public func maxRank(descending: Bool = false,
+                        nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
+        try scatterIntRank(mode: 3, descending: descending, nullPlacement: nullPlacement)
+    }
+
+    /// Arrow `rank`, with the whole option surface in one call: the sort direction, where the nulls go
+    /// and which of the four tiebreakers numbers a tie group.
+    ///
+    /// `rank(descending:nullPlacement:)`, `denseRank`, `maxRank` and `rowNumber` are the four
+    /// tiebreakers under their SQL names; this is the same work behind Arrow's spelling.
+    public func rank(tiebreaker: RankTiebreaker, descending: Bool = false,
+                     nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
+        let mode: Int
+        switch tiebreaker {
+        case .first: mode = 0
+        case .min: mode = 1
+        case .dense: mode = 2
+        case .max: mode = 3
+        }
+        return try scatterIntRank(mode: mode, descending: descending, nullPlacement: nullPlacement)
+    }
 
     /// SQL `PERCENT_RANK()`: `(rank - 1) / (n - 1)` as float64, 0 for a single-row column.
     /// Computed with the correctly rounded software binary64 divide, so it matches a host `Double`
     /// division bit for bit.
-    public func percentRank() throws -> MetalArray<Double> { try scatterDoubleRank(mode: 0) }
+    public func percentRank(descending: Bool = false,
+                            nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Double> {
+        try scatterDoubleRank(mode: 0, descending: descending, nullPlacement: nullPlacement)
+    }
 
     /// SQL `CUME_DIST()`: the fraction of rows at or before this row's value in the order, as float64.
     /// Equal values share the value, and the largest one (or the nulls, when there are any) gets 1.
-    public func cumeDist() throws -> MetalArray<Double> { try scatterDoubleRank(mode: 1) }
+    public func cumeDist(descending: Bool = false,
+                         nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Double> {
+        try scatterDoubleRank(mode: 1, descending: descending, nullPlacement: nullPlacement)
+    }
 
     /// Sorted order plus the run marks, scan and run bounds every ranking function shares.
-    private func windowOrder() throws -> WindowOrder? {
+    private func windowOrder(descending: Bool, nullPlacement: NullPlacement) throws -> WindowOrder? {
         let ctx = context
         let n = length
         guard n > 0 else { return nil }
         try Dispatch.checkLength(n)
-        let m = n - nullCount                    // the non-null values occupy sorted positions [0, m)
+        // The nulls occupy one contiguous block of the sorted order: [m, n) at the end, [0, nullCount)
+        // at the start. Everything downstream only needs those two bounds.
+        let m = n - nullCount
+        let nullLo = nullPlacement == .atEnd ? m : 0
+        let nullHi = nullPlacement == .atEnd ? n : nullCount
         let uType = UniqueSource.unsignedType(width: T.byteWidth)
         let src = WindowSource.ranking(U: uType)
         func pso(_ f: String) throws -> MTLComputePipelineState {
@@ -81,7 +124,7 @@ extension MetalArray {
             keyArray = MetalArray<T>(length: n, nullCount: nullCount, validity: validity, values: norm, context: ctx)
         }
 
-        let ord = try keyArray.argsort()          // full order, nulls last
+        let ord = try keyArray.argsort(descending: descending, nullPlacement: nullPlacement)
         let marks = try MetalArrowBuffer.allocate(byteCount: n * 4, zeroed: false, context: ctx)
         let ranks = try MetalArrowBuffer.allocate(byteCount: n * 4, zeroed: false, context: ctx)
         let startPos = try MetalArrowBuffer.allocate(byteCount: n * 4, context: ctx)
@@ -97,8 +140,9 @@ extension MetalArray {
             enc.setBuffer(keyValues.mtl, offset: keyValues.offset, index: 0)
             enc.setBuffer(ord.values.mtl, offset: ord.values.offset, index: 1)
             Dispatch.setLength(enc, n, nil, index: 2)
-            Dispatch.setUInt(enc, m, index: 3)
+            Dispatch.setUInt(enc, nullLo, index: 3)
             enc.setBuffer(marks.mtl, offset: marks.offset, index: 4)
+            Dispatch.setUInt(enc, nullHi, index: 5)
             Dispatch.dispatch1D(enc, marksPSO, count: n)
             enc.memoryBarrier(scope: .buffers)
 
@@ -136,9 +180,12 @@ extension MetalArray {
         return WindowOrder(ord: ord, marks: marks, ranks: ranks, startPos: startPos, endPos: endPos, n: n, source: src, unsignedType: uType)
     }
 
-    private func scatterIntRank(mode: Int) throws -> MetalArray<Int32> {
+    private func scatterIntRank(mode: Int, descending: Bool = false,
+                                nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
         let ctx = context
-        guard let o = try windowOrder() else { return try MetalArray<Int32>([Int32](), context: ctx) }
+        guard let o = try windowOrder(descending: descending, nullPlacement: nullPlacement) else {
+            return try MetalArray<Int32>([Int32](), context: ctx)
+        }
         let out = try MetalArrowBuffer.allocate(byteCount: o.n * 4, zeroed: false, context: ctx)
         let p = try Dispatch.pipeline(ctx, family: "window", source: o.source, function: "win_scatter_int", type: o.unsignedType)
         try ctx.run { enc in
@@ -150,15 +197,19 @@ extension MetalArray {
             Dispatch.setLength(enc, o.n, nil, index: 4)
             Dispatch.setUInt(enc, mode, index: 5)
             enc.setBuffer(out.mtl, offset: out.offset, index: 6)
+            enc.setBuffer(o.endPos.mtl, offset: o.endPos.offset, index: 7)
             Dispatch.dispatch1D(enc, p, count: o.n)
         }
         ctx.retainUntilFlush(o)
         return MetalArray<Int32>(length: o.n, nullCount: 0, validity: nil, values: out, context: ctx)
     }
 
-    private func scatterDoubleRank(mode: Int) throws -> MetalArray<Double> {
+    private func scatterDoubleRank(mode: Int, descending: Bool = false,
+                                   nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Double> {
         let ctx = context
-        guard let o = try windowOrder() else { return try MetalArray<Double>([Double](), context: ctx) }
+        guard let o = try windowOrder(descending: descending, nullPlacement: nullPlacement) else {
+            return try MetalArray<Double>([Double](), context: ctx)
+        }
         let out = try MetalArrowBuffer.allocate(byteCount: o.n * 8, zeroed: false, context: ctx)
         let p = try Dispatch.pipeline(ctx, family: "window", source: o.source, function: "win_scatter_double", type: o.unsignedType)
         try ctx.run { enc in

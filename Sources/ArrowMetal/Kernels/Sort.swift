@@ -2,9 +2,14 @@ import Foundation
 import Metal
 
 extension MetalArray {
-    /// Arrow `array_sort_indices`: indices that sort the values ascending, stable. Nulls go last.
-    /// NaN sorts after +inf (total order). Runs an LSD radix sort on the GPU (4 passes for 32-bit, 8 for 64-bit).
-    public func argsort(descending: Bool = false) throws -> MetalArray<Int32> {
+    /// Arrow `array_sort_indices`: indices that sort the values, stable.
+    ///
+    /// `descending` picks the direction and `nullPlacement` decides whether the null rows sit after every
+    /// value (Arrow's default) or before every one of them; the two are independent, exactly as in Arrow,
+    /// so nulls stay at the chosen end in both directions. NaN sorts after +inf (total order). Runs an
+    /// LSD radix sort on the GPU (4 passes for 32-bit, 8 for 64-bit).
+    public func argsort(descending: Bool = false,
+                        nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
         try Dispatch.checkLength(length)
         let ctx = context
         let n = length
@@ -87,21 +92,29 @@ extension MetalArray {
         // index array, which is cheap relative to the sort; descending reverses the non-null prefix.
         let idx = MetalArray<Int32>(length: n, nullCount: 0, validity: nil, values: valsA, context: ctx)
         guard let bm = validity?.typed(UInt8.self) else { return idx }
-        // Nulls last, keeping the stable order among them (a stable partition of the index array).
+        // A stable partition of the index array moves the nulls to whichever end the caller asked for,
+        // keeping their original row order among themselves (Arrow's stable order for nulls is the input
+        // order, not the order of the bytes that happen to sit under the validity bitmap). This is the
+        // same host-side pass the nulls-last path has always run; `at_start` only changes where the two
+        // blocks are written.
         let out = try MetalArrowBuffer.allocate(byteCount: n * 4, zeroed: false, context: ctx)
         let src2 = valsA.typed(Int32.self), dst = out.mutableTyped(Int32.self)
-        var k = 0
-        for i in 0..<n { let j = src2[i]; if Bitmap.isSet(bm, Int(j)) { dst[k] = j; k += 1 } }
-        // Null rows: Arrow's stable order is their original order, not the order of the bytes under the bitmap.
         var nulls: [Int32] = []
+        nulls.reserveCapacity(nullCount)
         for i in 0..<n { let j = src2[i]; if !Bitmap.isSet(bm, Int(j)) { nulls.append(j) } }
         nulls.sort()
+        var k = nullPlacement == .atStart ? nulls.count : 0
+        for i in 0..<n { let j = src2[i]; if Bitmap.isSet(bm, Int(j)) { dst[k] = j; k += 1 } }
+        k = nullPlacement == .atStart ? 0 : k
         for j in nulls { dst[k] = j; k += 1 }
         return MetalArray<Int32>(length: n, nullCount: 0, validity: nil, values: out, context: ctx)
     }
 
-    /// Sorted copy (nulls last).
-    public func sorted(descending: Bool = false) throws -> MetalArray<T> { try take(try argsort(descending: descending)) }
+    /// Sorted copy (nulls at whichever end `nullPlacement` names, `atEnd` by default).
+    public func sorted(descending: Bool = false,
+                       nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<T> {
+        try take(try argsort(descending: descending, nullPlacement: nullPlacement))
+    }
 
     /// Indices of the k smallest (or largest) values, in the same order `argsort` would put them.
     ///

@@ -195,11 +195,14 @@ extension MetalArray {
     /// itself null. Computed as `(s + e) / (2n)` over the run's sorted positions `[s, e)` with the
     /// correctly rounded software binary64 divide, so it matches a host `Double` division bit for bit.
     ///
-    /// Arrow's `sort_keys` / `null_placement` options are not implemented: this is always the single
-    /// ascending key with nulls at the end.
-    public func rankQuantile() throws -> MetalArray<Double> {
+    /// Arrow's full option surface is here: `descending` picks the direction of the single sort key and
+    /// `nullPlacement` decides which end the nulls sit at (they are one tie group either way).
+    public func rankQuantile(descending: Bool = false,
+                             nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Double> {
         let ctx = context
-        guard let o = try rankOrder() else { return try MetalArray<Double>([Double](), context: ctx) }
+        guard let o = try rankOrder(descending: descending, nullPlacement: nullPlacement) else {
+            return try MetalArray<Double>([Double](), context: ctx)
+        }
         let out = try MetalArrowBuffer.allocate(byteCount: o.n * 8, zeroed: false, context: ctx)
         let p = try Dispatch.pipeline(ctx, family: "selection-rank", source: o.source,
                                       function: "sel_quantile_scatter", type: o.unsignedType)
@@ -221,9 +224,12 @@ extension MetalArray {
     /// evaluated on the GPU with Acklam's rational approximation plus one Halley refinement through
     /// `erfc`. Accurate to about a float32 ulp of the true quantile (roughly 1e-6 absolute over the
     /// range a rank can produce); the float64 form is `rankNormal()`.
-    public func rankNormalFloat32() throws -> MetalArray<Float> {
+    public func rankNormalFloat32(descending: Bool = false,
+                                  nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Float> {
         let ctx = context
-        guard let o = try rankOrder() else { return try MetalArray<Float>([Float](), context: ctx) }
+        guard let o = try rankOrder(descending: descending, nullPlacement: nullPlacement) else {
+            return try MetalArray<Float>([Float](), context: ctx)
+        }
         let out = try MetalArrowBuffer.allocate(byteCount: o.n * 4, zeroed: false, context: ctx)
         let p = try Dispatch.pipeline(ctx, family: "selection-rank", source: o.source,
                                       function: "sel_normal_scatter_f32", type: o.unsignedType)
@@ -245,8 +251,9 @@ extension MetalArray {
     /// function on the host through Wichura's AS 241 (`NormalQuantile.ppf`), which is accurate to
     /// about 1e-16 relative. Metal has no `double`, and the software binary64 in `DoubleMath` has no
     /// `log`/`exp`/`erfc`, so the inverse CDF itself is the one part of this that runs on the CPU.
-    public func rankNormal() throws -> MetalArray<Double> {
-        let q = try rankQuantile()
+    public func rankNormal(descending: Bool = false,
+                           nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Double> {
+        let q = try rankQuantile(descending: descending, nullPlacement: nullPlacement)
         let n = q.length
         let p = q.mutableValuePointer
         for i in 0..<n { p[i] = NormalQuantile.ppf(p[i]) }
@@ -254,12 +261,15 @@ extension MetalArray {
     }
 
     /// One argsort plus the run bookkeeping every quantile-rank function shares.
-    private func rankOrder() throws -> RankOrder? {
+    private func rankOrder(descending: Bool, nullPlacement: NullPlacement) throws -> RankOrder? {
         let ctx = context
         let n = length
         guard n > 0 else { return nil }
         try Dispatch.checkLength(n)
+        // The null rows form one contiguous block of the sorted order at whichever end was asked for.
         let m = n - nullCount
+        let nullLo = nullPlacement == .atEnd ? m : 0
+        let nullHi = nullPlacement == .atEnd ? n : nullCount
         let uType = UniqueSource.unsignedType(width: T.byteWidth)
         let src = SelectionSource.ranking(U: uType)
         func pso(_ f: String) throws -> MTLComputePipelineState {
@@ -284,7 +294,7 @@ extension MetalArray {
             keyArray = MetalArray<T>(length: n, nullCount: nullCount, validity: validity, values: norm, context: ctx)
         }
 
-        let ord = try keyArray.argsort()                       // full order, nulls last
+        let ord = try keyArray.argsort(descending: descending, nullPlacement: nullPlacement)
         let marks = try MetalArrowBuffer.allocate(byteCount: n * 4, zeroed: false, context: ctx)
         let marksPSO = try pso("sel_marks")
         try ctx.run { enc in
@@ -292,8 +302,9 @@ extension MetalArray {
             enc.setBuffer(keyValues.mtl, offset: keyValues.offset, index: 0)
             enc.setBuffer(ord.values.mtl, offset: ord.values.offset, index: 1)
             Dispatch.setLength(enc, n, nil, index: 2)
-            Dispatch.setUInt(enc, m, index: 3)
+            Dispatch.setUInt(enc, nullLo, index: 3)
             enc.setBuffer(marks.mtl, offset: marks.offset, index: 4)
+            Dispatch.setUInt(enc, nullHi, index: 5)
             Dispatch.dispatch1D(enc, marksPSO, count: n)
         }
         ctx.retainUntilFlush(keyValues); ctx.retainUntilFlush(ord)

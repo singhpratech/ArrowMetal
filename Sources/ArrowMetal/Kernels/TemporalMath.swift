@@ -3,12 +3,15 @@ import Darwin
 import Metal
 
 /// The unit a temporal value is rounded to by ``MetalTemporalArray/floorTemporal(to:multiple:)`` and
-/// friends. `nanosecond` … `day` are fixed-length and round by integer arithmetic in the value's own
-/// resolution; `month`, `quarter` and `year` go through the civil calendar.
+/// friends — Arrow's `RoundTemporalOptions.unit`, with the same eleven names.
+///
+/// `nanosecond` … `day` are fixed-length and round by integer arithmetic in the value's own
+/// resolution. `week` is seven of those days on a Monday or Sunday grid. `month`, `quarter` and
+/// `year` go through the civil calendar.
 public enum TemporalRoundUnit: String, Sendable, CaseIterable {
-    case nanosecond, microsecond, millisecond, second, minute, hour, day, month, quarter, year
+    case nanosecond, microsecond, millisecond, second, minute, hour, day, week, month, quarter, year
 
-    /// Nanoseconds in one unit, or nil for the calendar units.
+    /// Nanoseconds in one unit, or nil for `week` and the calendar units.
     var nanoseconds: Int64? {
         switch self {
         case .nanosecond: return 1
@@ -18,17 +21,64 @@ public enum TemporalRoundUnit: String, Sendable, CaseIterable {
         case .minute: return 60_000_000_000
         case .hour: return 3_600_000_000_000
         case .day: return 86_400_000_000_000
-        case .month, .quarter, .year: return nil
+        case .week, .month, .quarter, .year: return nil
         }
     }
-    /// Calendar months in one unit, or nil for the fixed-length units.
+    /// Calendar months in one unit, or nil for the fixed-length units and for `year`, which counts in
+    /// whole years from year 0 rather than in months from the epoch (which is what Arrow does).
     var months: Int64? {
         switch self {
         case .month: return 1
         case .quarter: return 3
-        case .year: return 12
         default: return nil
         }
+    }
+    /// Nanoseconds in the *greater* calendar unit `calendar_based_origin` starts the grid from, for the
+    /// fixed-length units. `day`, `week` and the calendar units resolve their origin on the GPU instead,
+    /// because it depends on the value's own month or year.
+    var calendarOriginNanoseconds: Int64? {
+        switch self {
+        case .nanosecond: return 1_000               // start of the containing microsecond
+        case .microsecond: return 1_000_000          // ... millisecond
+        case .millisecond: return 1_000_000_000      // ... second
+        case .second: return 60_000_000_000          // ... minute
+        case .minute: return 3_600_000_000_000       // ... hour
+        case .hour: return 86_400_000_000_000        // ... day
+        default: return nil
+        }
+    }
+    /// Whether this unit needs a date, which `time32`, `time64` and `duration` do not carry.
+    var needsCalendar: Bool {
+        switch self {
+        case .week, .month, .quarter, .year: return true
+        default: return false
+        }
+    }
+}
+
+/// Arrow's `RoundTemporalOptions`, field for field.
+public struct RoundTemporalOptions: Sendable, Equatable {
+    /// How many `unit`s make one step of the grid.
+    public var multiple: Int
+    /// The unit the grid is built from.
+    public var unit: TemporalRoundUnit
+    /// Weeks start on Monday (Arrow's default) or on Sunday. Only `unit == .week` reads this.
+    public var weekStartsMonday: Bool
+    /// `ceil` of a value that already sits on a boundary returns the next boundary rather than the
+    /// value. Ignored on `month`, `quarter` and `year`, where Arrow's own `ceil` always advances.
+    public var ceilIsStrictlyGreater: Bool
+    /// Start the grid at the beginning of the next-greater calendar unit of the value itself (the
+    /// containing day for hours, the containing month for days, the containing year for weeks and
+    /// months) rather than at 1970-01-01T00:00:00.
+    public var calendarBasedOrigin: Bool
+
+    public init(multiple: Int = 1, unit: TemporalRoundUnit = .day, weekStartsMonday: Bool = true,
+                ceilIsStrictlyGreater: Bool = false, calendarBasedOrigin: Bool = false) {
+        self.multiple = multiple
+        self.unit = unit
+        self.weekStartsMonday = weekStartsMonday
+        self.ceilIsStrictlyGreater = ceilIsStrictlyGreater
+        self.calendarBasedOrigin = calendarBasedOrigin
     }
 }
 
@@ -70,43 +120,103 @@ extension MetalTemporalArray {
 
     // MARK: - Rounding
 
-    /// Arrow `floor_temporal`: the largest multiple of `multiple` × `unit` at or below each value.
+    /// Arrow `floor_temporal`: the largest grid point at or below each value.
     public func floorTemporal(to unit: TemporalRoundUnit, multiple: Int = 1) throws -> MetalTemporalArray {
-        try roundTemporal(mode: 0, to: unit, multiple: multiple)
+        try floorTemporal(RoundTemporalOptions(multiple: multiple, unit: unit))
     }
-    /// Arrow `ceil_temporal`: the smallest multiple of `multiple` × `unit` at or above each value.
+    /// Arrow `ceil_temporal`: the smallest grid point at or above each value.
     /// A value already on a boundary is unchanged (Arrow's `ceil_is_strictly_greater = false`).
     public func ceilTemporal(to unit: TemporalRoundUnit, multiple: Int = 1) throws -> MetalTemporalArray {
-        try roundTemporal(mode: 1, to: unit, multiple: multiple)
+        try ceilTemporal(RoundTemporalOptions(multiple: multiple, unit: unit))
     }
-    /// Arrow `round_temporal`: the nearest multiple of `multiple` × `unit`. A value exactly halfway
-    /// rounds **up** (toward +infinity), which is Arrow's behaviour and not "half to even".
+    /// Arrow `round_temporal`: the nearest grid point. A value exactly halfway rounds **up** (toward
+    /// +infinity), which is what Arrow does — not "half to even".
     public func roundTemporal(to unit: TemporalRoundUnit, multiple: Int = 1) throws -> MetalTemporalArray {
-        try roundTemporal(mode: 2, to: unit, multiple: multiple)
+        try roundTemporal(RoundTemporalOptions(multiple: multiple, unit: unit))
     }
 
-    /// The shared driver. Rounding to a unit finer than the array's own resolution is the identity.
-    private func roundTemporal(mode: Int, to unit: TemporalRoundUnit, multiple: Int) throws -> MetalTemporalArray {
-        guard multiple >= 1 else {
-            throw ArrowMetalError.invalidArrowArray("temporal rounding needs multiple >= 1, got \(multiple)")
-        }
-        let kind: Int, p: Int64
-        if let months = unit.months {
+    /// Arrow `floor_temporal` with the whole option surface.
+    public func floorTemporal(_ options: RoundTemporalOptions) throws -> MetalTemporalArray {
+        try roundTemporal(mode: 0, options)
+    }
+    /// Arrow `ceil_temporal` with the whole option surface.
+    public func ceilTemporal(_ options: RoundTemporalOptions) throws -> MetalTemporalArray {
+        try roundTemporal(mode: 1, options)
+    }
+    /// Arrow `round_temporal` with the whole option surface.
+    public func roundTemporal(_ options: RoundTemporalOptions) throws -> MetalTemporalArray {
+        try roundTemporal(mode: 2, options)
+    }
+
+    /// How the grid and its origin are described to the kernel: see `TemporalMathSource`.
+    private struct RoundPlan {
+        var kind = 0
+        var period: Int64 = 1
+        var originKind = 0
+        var originBase: Int64 = 0
+        var originPeriod: Int64 = 1
+    }
+
+    /// Turns the options into that description, or returns nil when the unit is finer than this
+    /// array's own resolution and the whole operation is the identity.
+    private func plan(_ options: RoundTemporalOptions) throws -> RoundPlan? {
+        let unit = options.unit, multiple = Int64(options.multiple)
+        let calendar = options.calendarBasedOrigin
+        if unit.needsCalendar {
             switch type {
-            case .date32, .date64, .timestamp:
-                kind = 1
-                p = months * Int64(multiple)
+            case .date32, .date64, .timestamp: break
             case .time32, .time64, .duration:
                 throw ArrowMetalError.unsupportedType(
                     "rounding to \(unit.rawValue) needs a date, which \(type.arrowFormat) does not carry")
             }
-        } else {
-            let ns = unit.nanoseconds!
-            let tick = nanosecondsPerTick
-            if ns < tick || ns % tick != 0 { return self }        // finer than the storage: nothing to do
-            kind = 0
-            p = (ns / tick) * Int64(multiple)
         }
+        var p = RoundPlan()
+        let tick = nanosecondsPerTick, tpd = ticksPerDay
+        switch unit {
+        case .year:
+            p.kind = 2
+            p.period = multiple
+        case .quarter, .month:
+            p.kind = 1
+            p.period = unit.months! * multiple
+            p.originKind = calendar ? 1 : 0
+        case .week:
+            // The week grid is a fixed 7-day one; only where it is anchored changes.
+            p.kind = 0
+            p.period = 7 * multiple * tpd
+            // 1969-12-29 was a Monday and 1969-12-28 a Sunday, three and four days before the epoch.
+            let anchorDays: Int64 = options.weekStartsMonday ? -3 : -4
+            if calendar {
+                p.originKind = 4
+                p.originBase = anchorDays          // the kernel reads this as a *day* count
+            } else {
+                p.originKind = 0
+                p.originBase = anchorDays * tpd
+            }
+        default:
+            let ns = unit.nanoseconds!
+            if ns < tick || ns % tick != 0 { return nil }        // finer than the storage: nothing to do
+            p.kind = 0
+            p.period = (ns / tick) * multiple
+            guard calendar else { break }
+            if unit == .day {
+                p.originKind = 2                                  // start of the containing month
+            } else if let greater = unit.calendarOriginNanoseconds, greater % tick == 0 {
+                p.originKind = 1
+                p.originPeriod = greater / tick
+            }
+            // A greater unit finer than the storage tick leaves the origin at the epoch, which is
+            // where every value already sits on that grid, so the answer is the same either way.
+        }
+        return p
+    }
+
+    /// The shared driver.
+    private func roundTemporal(mode: Int, _ options: RoundTemporalOptions) throws -> MetalTemporalArray {
+        guard options.multiple >= 1 else {
+            throw ArrowMetalError.invalidArrowArray("temporal rounding needs multiple >= 1, got \(options.multiple)")
+        }
+        guard let plan = try plan(options) else { return self }
         let ctx = context, n = length
         try Dispatch.checkLength(n)
         let width = type.usesInt64 ? 8 : 4
@@ -114,16 +224,22 @@ extension MetalTemporalArray {
         if n > 0 {
             let pso = try mathPipeline("temporal_round")
             let vals = values
-            var pv = p, tpd = ticksPerDay
+            var pv = plan.period, tpd = ticksPerDay
+            var base = plan.originBase, originPeriod = plan.originPeriod
+            let flags = options.ceilIsStrictlyGreater ? 1 : 0
             try ctx.run { enc in
                 enc.setComputePipelineState(pso)
                 enc.setBuffer(vals.mtl, offset: vals.offset, index: 0)
                 Dispatch.setLength(enc, n, nil, index: 1)
                 Dispatch.setUInt(enc, mode, index: 2)
-                Dispatch.setUInt(enc, kind, index: 3)
+                Dispatch.setUInt(enc, plan.kind, index: 3)
                 enc.setBytes(&pv, length: 8, index: 4)
                 enc.setBytes(&tpd, length: 8, index: 5)
                 enc.setBuffer(out.mtl, offset: out.offset, index: 6)
+                Dispatch.setUInt(enc, plan.originKind, index: 7)
+                enc.setBytes(&base, length: 8, index: 8)
+                enc.setBytes(&originPeriod, length: 8, index: 9)
+                Dispatch.setUInt(enc, flags, index: 10)
                 Dispatch.dispatch1D(enc, pso, count: n)
             }
         }

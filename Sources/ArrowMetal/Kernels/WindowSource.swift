@@ -129,14 +129,21 @@ enum WindowSource {
     // [m, n) the nulls; the nulls are one tie group, so only position m starts a run among them.
     // Position 0 writes 0 because the rank of a sorted position is the *exclusive* scan of the marks
     // plus its own mark: the first run must come out as 0.
+    // A run boundary in the sorted order. The nulls occupy the half-open block [nullLo, nullHi) —
+    // at the end for null_placement "at_end", at the front for "at_start" — and are one single tie
+    // group, so the only marks inside that block are at its first position.
     kernel void win_marks(device const \(U)* vals [[buffer(0)]], device const int* ord [[buffer(1)]],
-                          device const uint* nPtr [[buffer(2)]], constant uint& m [[buffer(3)]],
-                          device int* marks [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+                          device const uint* nPtr [[buffer(2)]], constant uint& nullLo [[buffer(3)]],
+                          device int* marks [[buffer(4)]], constant uint& nullHi [[buffer(5)]],
+                          uint i [[thread_position_in_grid]]) {
         uint n = *nPtr;
         if (i >= n) return;
+        bool here = (i >= nullLo && i < nullHi);
+        bool prev = (i >= 1u) && (i - 1u >= nullLo && i - 1u < nullHi);
         int f;
         if (i == 0u) f = 0;
-        else if (i >= m) f = (i == m) ? 1 : 0;
+        else if (here != prev) f = 1;              // crossing into or out of the null block
+        else if (here) f = 0;                      // inside the null block: one tie group
         else f = (vals[ord[i]] != vals[ord[i - 1u]]) ? 1 : 0;
         marks[i] = f;
     }
@@ -150,15 +157,24 @@ enum WindowSource {
         if (i == 0u || marks[i] != 0) startPos[d] = (int)i;
         if (i + 1u == n || marks[i + 1u] != 0) endPos[d] = (int)(i + 1u);
     }
-    // mode 0 row_number (1-based sorted position), 1 rank (the run's first position + 1), 2 dense_rank.
+    // Arrow's four `rank` tiebreakers, plus SQL's names for them:
+    //   mode 0 "first" / ROW_NUMBER  1-based sorted position
+    //   mode 1 "min"   / RANK        the run's first position + 1
+    //   mode 2 "dense" / DENSE_RANK  1-based index of the distinct value
+    //   mode 3 "max"                 the run's last position + 1, i.e. one-past-last
     kernel void win_scatter_int(device const int* ord [[buffer(0)]], device const int* ranks [[buffer(1)]],
                                 device const int* marks [[buffer(2)]], device const int* startPos [[buffer(3)]],
                                 device const uint* nPtr [[buffer(4)]], constant uint& mode [[buffer(5)]],
-                                device int* out [[buffer(6)]], uint i [[thread_position_in_grid]]) {
+                                device int* out [[buffer(6)]], device const int* endPos [[buffer(7)]],
+                                uint i [[thread_position_in_grid]]) {
         uint n = *nPtr;
         if (i >= n) return;
         int d = ranks[i] + marks[i];
-        int v = (mode == 0u) ? (int)(i + 1u) : ((mode == 1u) ? (startPos[d] + 1) : (d + 1));
+        int v;
+        if (mode == 0u) v = (int)(i + 1u);
+        else if (mode == 1u) v = startPos[d] + 1;
+        else if (mode == 2u) v = d + 1;
+        else v = endPos[d];
         out[ord[i]] = v;
     }
     // mode 0 percent_rank = (rank - 1) / (n - 1), 1 cume_dist = (rows at or before this value) / n.

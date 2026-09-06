@@ -2655,3 +2655,366 @@ MetalArray.hypot = _hypot
 MetalArray.round_to_multiple = _round_to_multiple
 MetalArray.round_binary = _round_binary
 MetalArray.round = _am_round
+
+
+# ---------------------------------------------------------------------------
+# The option surfaces: Arrow's CastOptions, null_placement, tiebreaker,
+# null_matching_behavior, the distinct-value order and RoundTemporalOptions.
+#
+# Each of these mirrors one pyarrow.compute options class, spelled the way pyarrow spells it, with
+# pyarrow's own default — so a call that passes nothing behaves like the pyarrow call that passes
+# nothing. The two places where this package deliberately keeps its own default are named in the
+# docstrings: `is_in` / `index_in` default to `"skip"` (pyarrow defaults to `"match"`), and `cast`
+# defaults to `safe=False` (pyarrow defaults to `safe=True`), because both are what the plain entry
+# points here have always done.
+_lib.am_cast_ex.argtypes = [_P, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.POINTER(_P)]
+_lib.am_cast_ex.restype = ctypes.c_int
+_lib.am_argsort_ex.argtypes = [_P, ctypes.c_int, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_argsort_ex.restype = ctypes.c_int
+_lib.am_partition_nth_ex.argtypes = [_P, ctypes.c_int64, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_partition_nth_ex.restype = ctypes.c_int
+_lib.am_rank_ex.argtypes = [_P, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_rank_ex.restype = ctypes.c_int
+_lib.am_rank_quantile_ex.argtypes = [_P, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_rank_quantile_ex.restype = ctypes.c_int
+_lib.am_is_in_ex.argtypes = [_P, _P, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_is_in_ex.restype = ctypes.c_int
+_lib.am_index_in_ex.argtypes = [_P, _P, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_index_in_ex.restype = ctypes.c_int
+_lib.am_unique_ex.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_unique_ex.restype = ctypes.c_int
+_lib.am_value_counts_ex.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_value_counts_ex.restype = ctypes.c_int
+_lib.am_dictionary_encode_ex.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P), ctypes.POINTER(_P)]
+_lib.am_dictionary_encode_ex.restype = ctypes.c_int
+_lib.am_round_temporal_ex.argtypes = [_P, ctypes.c_int, ctypes.c_char_p, ctypes.c_int64,
+                                      ctypes.c_uint32, ctypes.POINTER(_P)]
+_lib.am_round_temporal_ex.restype = ctypes.c_int
+_lib.am_list_parent_indices64.argtypes = [_P, ctypes.POINTER(_P)]
+_lib.am_list_parent_indices64.restype = ctypes.c_int
+
+#: Arrow's `null_placement`: where the null rows sit in a sorted order, in either direction.
+NULL_PLACEMENT = ["at_end", "at_start"]
+#: Arrow's `rank` tiebreakers.
+TIEBREAKERS = ["min", "max", "first", "dense"]
+#: Arrow's `null_matching_behavior` for `is_in` / `index_in`.
+NULL_MATCHING = ["match", "skip", "emit_null", "inconclusive"]
+#: The order the distinct values of `unique` / `value_counts` / `dictionary_encode` come back in.
+VALUE_ORDERS = ["first_appearance", "sorted"]
+#: Arrow's `CastOptions` flags, in the bit order the C ABI passes them.
+CAST_FLAGS = ["allow_int_overflow", "allow_time_truncate", "allow_time_overflow",
+              "allow_decimal_truncate", "allow_float_truncate", "allow_invalid_utf8"]
+
+_ARROW_FORMATS = {
+    "int8": "c", "uint8": "C", "int16": "s", "uint16": "S", "int32": "i", "uint32": "I",
+    "int64": "l", "uint64": "L", "halffloat": "e", "float16": "e", "float": "f", "float32": "f",
+    "double": "g", "float64": "g", "bool": "b", "string": "u", "utf8": "u",
+    "large_string": "U", "binary": "z", "large_binary": "Z", "date32[day]": "tdD",
+    "date64[ms]": "tdm",
+}
+
+
+def _index_of(table, value, what):
+    if value not in table:
+        raise ArrowMetalError(f"unknown {what} {value!r}; expected one of {table}")
+    return table.index(value)
+
+
+def _cast_flag_bits(safe=None, **flags):
+    """The C ABI's CastOptions bit field from pyarrow's flag names.
+
+    `safe=True` is every flag off (Arrow's checked cast) and `safe=False` every flag on; individual
+    flags override whichever `safe` chose.
+    """
+    bits = 0 if safe else (1 << len(CAST_FLAGS)) - 1
+    for name, value in flags.items():
+        if name not in CAST_FLAGS:
+            raise ArrowMetalError(f"unknown cast option {name!r}; expected one of {CAST_FLAGS}")
+        bit = 1 << CAST_FLAGS.index(name)
+        bits = (bits | bit) if value else (bits & ~bit)
+    return bits
+
+
+def _arrow_format(target):
+    """The Arrow C-data format string for a type named as a pyarrow `DataType`, a type alias
+    (`"int8"`, `"timestamp[s]"`) or already as a format string."""
+    if isinstance(target, str):
+        if target in _ARROW_FORMATS:
+            return _ARROW_FORMATS[target]
+        if len(target) == 1 and target in "cCsSiIlLfgbeuUzZn":
+            return target
+        try:
+            target = pa.type_for_alias(target)
+        except Exception:
+            return target                       # already a C-data format string ("tdD", "d:10,2", "+l")
+    t = target
+    name = str(t)
+    if name in _ARROW_FORMATS:
+        return _ARROW_FORMATS[name]
+    if pa.types.is_decimal(t):
+        width = {128: "", 256: ",256", 32: ",32", 64: ",64"}[t.bit_width]
+        return f"d:{t.precision},{t.scale}{width}"
+    if pa.types.is_timestamp(t):
+        return "ts" + {"s": "s", "ms": "m", "us": "u", "ns": "n"}[t.unit] + ":" + (t.tz or "")
+    if pa.types.is_duration(t):
+        return "tD" + {"s": "s", "ms": "m", "us": "u", "ns": "n"}[t.unit]
+    if pa.types.is_time32(t):
+        return "tt" + {"s": "s", "ms": "m"}[t.unit]
+    if pa.types.is_time64(t):
+        return "tt" + {"us": "u", "ns": "n"}[t.unit]
+    if pa.types.is_date32(t):
+        return "tdD"
+    if pa.types.is_date64(t):
+        return "tdm"
+    if pa.types.is_list(t) or pa.types.is_large_list(t):
+        return "+l"
+    if pa.types.is_struct(t):
+        return "+s"
+    raise ArrowMetalError(f"no Arrow format string for {target!r}")
+
+
+def _child_formats(target):
+    """The child target formats a nested cast needs, flattened depth-first."""
+    if isinstance(target, str):
+        try:
+            target = pa.type_for_alias(target)
+        except Exception:
+            return []
+
+    if not isinstance(target, pa.DataType):
+        return []
+    if pa.types.is_list(target) or pa.types.is_large_list(target):
+        return [_arrow_format(target.value_type)] + _child_formats(target.value_type)
+    if pa.types.is_struct(target):
+        return [_arrow_format(target.field(i).type) for i in range(target.num_fields)]
+    return []
+
+
+def _cast_ex(self, target, safe=None, **flags):
+    """Arrow `cast` with the whole `CastOptions` surface.
+
+    `target` is a pyarrow `DataType`, a type alias (`"int8"`, `"timestamp[s]"`), or an Arrow C-data
+    format string. `safe=True` is Arrow's checked cast: a value that would not survive the round trip
+    raises instead of wrapping. The six `allow_*` flags each turn one class of loss back on:
+
+        col.cast("int8", safe=True)                       # raises on a value that does not fit
+        col.cast("int8", safe=True, allow_int_overflow=True)   # ... except integer overflow
+
+    The default here stays `safe=False`, the unchecked C-style conversion this package has always done
+    and what `MetalArray.cast()` still is; pyarrow's default is `safe=True`.
+
+    Beyond the numeric conversions this reaches every type: bool to and from numbers, numbers and
+    temporal values to utf8 and back, temporal resolution changes and the date/timestamp conversions,
+    integer to and from decimal128 and a decimal rescale, and `list<T>` -> `list<U>` and struct casts,
+    which cast the children and share the offsets and validity bitmaps.
+    """
+    fmt = _arrow_format(target)
+    kids = ",".join(_child_formats(target))
+    return _call(_lib.am_cast_ex, self._h, fmt.encode(), kids.encode() if kids else None,
+                 _cast_flag_bits(safe, **flags))
+
+
+def _argsort_ex(self, descending=False, null_placement="at_end"):
+    """Arrow `array_sort_indices` / single-key `sort_indices` with `null_placement`.
+
+    The nulls form one block at the end (Arrow's default) or the start, in *both* directions — the
+    placement is independent of the order, exactly as in Arrow. Stable throughout.
+    """
+    return _call(_lib.am_argsort_ex, self._h, 1 if descending else 0,
+                 _index_of(NULL_PLACEMENT, null_placement, "null_placement"))
+
+
+def _partition_nth_ex(self, pivot, null_placement="at_end"):
+    """Arrow `partition_nth_indices`: indices arranged so that position `pivot` holds the index a
+    sorted order would put there, everything before it no greater and everything after it no smaller.
+
+    A GPU radix select for the pivot value plus three stream compactions — O(len(self)), not a sort.
+    The permutation is not the sorted one and Arrow does not promise it is.
+    """
+    return _call(_lib.am_partition_nth_ex, self._h, int(pivot),
+                 _index_of(NULL_PLACEMENT, null_placement, "null_placement"))
+
+
+def _rank_ex(self, sort_keys="ascending", null_placement="at_end", tiebreaker="min"):
+    """Arrow `rank` with its whole option surface.
+
+    `sort_keys` is `"ascending"` or `"descending"`, `null_placement` `"at_end"` or `"at_start"`, and
+    `tiebreaker` one of `"min"` (Arrow's default), `"max"`, `"first"` or `"dense"`. One GPU argsort,
+    run marks, a scan and a scatter back to the original rows; the result never contains nulls.
+    """
+    if sort_keys not in ("ascending", "descending"):
+        raise ArrowMetalError('sort_keys must be "ascending" or "descending"')
+    return _call(_lib.am_rank_ex, self._h, _index_of(TIEBREAKERS, tiebreaker, "tiebreaker"),
+                 1 if sort_keys == "descending" else 0,
+                 _index_of(NULL_PLACEMENT, null_placement, "null_placement"))
+
+
+def _rank_quantile_ex(self, sort_keys="ascending", null_placement="at_end"):
+    """Arrow `rank_quantile`: `(average 1-based rank of the row's tie group - 0.5) / n`, as float64.
+
+    Nulls are one tie group at whichever end `null_placement` names, and the result is never itself
+    null. Computed on the GPU as `(s + e) / 2n` over the run's sorted positions with the correctly
+    rounded software binary64 divide.
+    """
+    if sort_keys not in ("ascending", "descending"):
+        raise ArrowMetalError('sort_keys must be "ascending" or "descending"')
+    return _call(_lib.am_rank_quantile_ex, self._h, 0, 1 if sort_keys == "descending" else 0,
+                 _index_of(NULL_PLACEMENT, null_placement, "null_placement"))
+
+
+def _rank_normal_ex(self, sort_keys="ascending", null_placement="at_end", float32=False):
+    """Arrow `rank_normal`: the normal percent-point function of `rank_quantile()`.
+
+    float64 evaluates the inverse CDF on the host with Wichura's AS 241 (about 1e-16 relative)
+    because Metal has no `double`; `float32=True` runs Acklam plus one Halley refinement entirely on
+    the GPU, within about 1e-6.
+    """
+    if sort_keys not in ("ascending", "descending"):
+        raise ArrowMetalError('sort_keys must be "ascending" or "descending"')
+    return _call(_lib.am_rank_quantile_ex, self._h, 2 if float32 else 1,
+                 1 if sort_keys == "descending" else 0,
+                 _index_of(NULL_PLACEMENT, null_placement, "null_placement"))
+
+
+def _is_in_ex(self, values, null_matching_behavior="skip"):
+    """Arrow `is_in` with `null_matching_behavior`.
+
+    * `"match"` — a null element matches a null in the value set (pyarrow's `skip_nulls=False`)
+    * `"skip"` — a null element never matches (pyarrow's `skip_nulls=True`); the default here
+    * `"emit_null"` — a null element gives a null result
+    * `"inconclusive"` — a null element gives null, and so does a non-matching one when the value set
+      itself holds a null; SQL's three-valued `IN`
+    """
+    s = self._same_type_array(values)                    # keep it alive across the call
+    return _call(_lib.am_is_in_ex, self._h, s._h,
+                 _index_of(NULL_MATCHING, null_matching_behavior, "null_matching_behavior"))
+
+
+def _index_in_ex(self, values, null_matching_behavior="skip"):
+    """Arrow `index_in` with `null_matching_behavior`: the int32 position of each element's first
+    occurrence in `values`, null where it is absent.
+
+    Only `"match"` differs from the other three, which all report null for a null element and for a
+    miss: with `"match"` a null element reports the position of the value set's first null.
+    """
+    s = self._same_type_array(values)                    # keep it alive across the call
+    return _call(_lib.am_index_in_ex, self._h, s._h,
+                 _index_of(NULL_MATCHING, null_matching_behavior, "null_matching_behavior"))
+
+
+def _unique_ex(self, order="first_appearance"):
+    """Arrow `unique`: the distinct values.
+
+    `order="first_appearance"` is Arrow's own order and the default here, and — as in Arrow — keeps
+    the null as one entry at the position of the first null row. It is one group-min over the row
+    indices, a stable argsort of those minima and a gather, all on the GPU, on top of the sorted pass.
+    `order="sorted"` is that sorted pass on its own: ascending, nulls dropped, and the cheaper of the
+    two. A utf8 column has no null entry in either order, because the GPU string dictionary has no
+    slot for one.
+    """
+    return _call(_lib.am_unique_ex, self._h, _index_of(VALUE_ORDERS, order, "order"))
+
+
+def _value_counts_ex(self, order="first_appearance"):
+    """Arrow `value_counts`: a struct column of `values` and their int64 `counts`, in the same two
+    orders `unique()` offers and with the same null handling."""
+    return _call(_lib.am_value_counts_ex, self._h, _index_of(VALUE_ORDERS, order, "order"))
+
+
+def _dictionary_encode_ex(self, order="first_appearance"):
+    """Arrow `dictionary_encode`: `(codes, dictionary)` with the dictionary in first-appearance order
+    (Arrow's own, the default) or ascending. The dictionary never holds a null in either order and a
+    null row gets a null code, as in Arrow."""
+    c = _P()
+    v = _P()
+    _check(_lib.am_dictionary_encode_ex(self._h, _index_of(VALUE_ORDERS, order, "order"),
+                                        ctypes.byref(c), ctypes.byref(v)))
+    return MetalArray(c), MetalArray(v)
+
+
+_ROUND_TEMPORAL_UNITS = ["nanosecond", "microsecond", "millisecond", "second", "minute", "hour",
+                         "day", "week", "month", "quarter", "year"]
+
+
+def _round_temporal_flags(week_starts_monday, ceil_is_strictly_greater, calendar_based_origin):
+    return ((1 if week_starts_monday else 0) | (2 if ceil_is_strictly_greater else 0)
+            | (4 if calendar_based_origin else 0))
+
+
+def _temporal_round_ex(self, mode, unit, multiple, week_starts_monday, ceil_is_strictly_greater,
+                       calendar_based_origin):
+    if unit not in _ROUND_TEMPORAL_UNITS:
+        raise ArrowMetalError(f"unknown rounding unit {unit!r}; expected one of {_ROUND_TEMPORAL_UNITS}")
+    if multiple < 1:
+        raise ArrowMetalError("temporal rounding needs multiple >= 1")
+    return _call(_lib.am_round_temporal_ex, self._h, mode, unit.encode(), int(multiple),
+                 _round_temporal_flags(week_starts_monday, ceil_is_strictly_greater,
+                                       calendar_based_origin))
+
+
+def _floor_temporal_ex(self, unit="day", multiple=1, week_starts_monday=True,
+                       ceil_is_strictly_greater=False, calendar_based_origin=False):
+    """Arrow `floor_temporal` with the whole `RoundTemporalOptions` surface.
+
+    The arguments keep this package's own order (`unit` first, then `multiple`), where pyarrow's
+    RoundTemporalOptions puts `multiple` first; everything else is spelled as pyarrow spells it.
+    `unit` is any of Arrow's eleven, `week` included. `week_starts_monday` picks the week grid.
+    `calendar_based_origin` starts the grid at the beginning of the value's own next-greater calendar
+    unit — the containing day for hours, the containing month for days, the containing year for weeks
+    and months — instead of at 1970-01-01T00:00:00.
+    """
+    return _temporal_round_ex(self, 0, unit, multiple, week_starts_monday, ceil_is_strictly_greater,
+                              calendar_based_origin)
+
+
+def _ceil_temporal_ex(self, unit="day", multiple=1, week_starts_monday=True,
+                      ceil_is_strictly_greater=False, calendar_based_origin=False):
+    """Arrow `ceil_temporal` with the whole `RoundTemporalOptions` surface.
+
+    A value already on a boundary is left alone unless `ceil_is_strictly_greater` — except on `month`,
+    `quarter` and `year`, where Arrow's own ceil always advances a boundary value and the flag makes
+    no difference. That quirk is reproduced here on purpose.
+    """
+    return _temporal_round_ex(self, 1, unit, multiple, week_starts_monday, ceil_is_strictly_greater,
+                              calendar_based_origin)
+
+
+def _round_temporal_ex(self, unit="day", multiple=1, week_starts_monday=True,
+                       ceil_is_strictly_greater=False, calendar_based_origin=False):
+    """Arrow `round_temporal` with the whole `RoundTemporalOptions` surface. A value exactly halfway
+    rounds **up** (toward +infinity), which is what Arrow does — not half to even."""
+    return _temporal_round_ex(self, 2, unit, multiple, week_starts_monday, ceil_is_strictly_greater,
+                              calendar_based_origin)
+
+
+def _list_parent_indices64(self):
+    """Arrow `list_parent_indices` in **int64**, the width pyarrow returns. The same GPU binary
+    search as `list_parent_indices()`, widened by the GPU cast."""
+    return _call(_lib.am_list_parent_indices64, self._h)
+
+
+MetalArray.cast = _cast_ex
+MetalArray.argsort = _argsort_ex
+MetalArray.array_sort_indices = _argsort_ex
+MetalArray.sort_indices = _argsort_ex
+MetalArray.partition_nth_indices = _partition_nth_ex
+MetalArray.rank = _rank_ex
+MetalArray.rank_quantile = _rank_quantile_ex
+MetalArray.rank_normal = _rank_normal_ex
+MetalArray.is_in = _is_in_ex
+MetalArray.index_in = _index_in_ex
+MetalArray.unique = _unique_ex
+MetalArray.value_counts = _value_counts_ex
+MetalArray.dictionary_encode = _dictionary_encode_ex
+MetalArray.floor_temporal = _floor_temporal_ex
+MetalArray.ceil_temporal = _ceil_temporal_ex
+MetalArray.round_temporal = _round_temporal_ex
+MetalArray.list_parent_indices64 = _list_parent_indices64
+
+
+def _sort_ex(self, descending=False, null_placement="at_end"):
+    """A sorted copy: `take` of `argsort`, with the same options."""
+    return self.take(self.argsort(descending=descending, null_placement=null_placement))
+
+
+MetalArray.sort = _sort_ex
