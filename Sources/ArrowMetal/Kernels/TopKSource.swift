@@ -18,16 +18,28 @@ import Foundation
 /// of a strided fill whose strides only tile `[c, cap)` when they all start from one `c`. Reading the
 /// atomic per thread does not guarantee that (Round 8 in docs/FINDINGS.md).
 enum TopKSource {
-    /// `kind` names the value mapping, `V` is the MSL type of a row, `K` the key type (uint or ulong).
-    static func source(kind: String, V: String, K: String) -> String {
+    /// The `inline K tk_map(V v, uint inv)` declaration: the order-preserving key of a value, with `inv`
+    /// reversing the order for "largest". Shared with `RadixSelectSource` so both selection paths and
+    /// `argsort` agree on one total order.
+    ///
+    /// The float mappings canonicalise exactly as `SortSource` does, or top_k would order the ties this
+    /// library calls equal differently from argsort: -0.0 collapses onto 0.0, every NaN onto one value after
+    /// +inf, and a reversed order keeps NaN at the end rather than mirroring it to the front. `nan` is a
+    /// separate flag because the descending key is the free maximum, not the flipped key.
+    ///
+    /// Narrow integers get a key of their own width (8 or 16 bits) rather than a widened 32-bit one: the
+    /// radix select splits on the *top* digit, and a widened key would put every row in one bin.
+    static func keyMap(kind: String, V: String, K: String) -> String {
         let keyMax = K == "ulong" ? "ULONG_MAX" : "UINT_MAX"
-        // The float mappings canonicalise exactly as `SortSource` does, or top_k would order the ties
-        // this library calls equal differently from argsort: -0.0 collapses onto 0.0, every NaN onto
-        // one value after +inf, and a reversed order keeps NaN at the end rather than mirroring it to
-        // the front. `nan` is a separate flag because the descending key is the free maximum, not ~k.
         let map: String
         var nanFlag = "bool nan = false;"
+        var flip = "~k"                 // full-width reversal; for a narrow key it is (mask - k)
+        var maxKey = keyMax
         switch kind {
+        case "i8": map = "\(K) k = ((uint)(int)v + 128u) & 0xFFu;"; flip = "(0xFFu - k)"; maxKey = "0xFFu"
+        case "u8": map = "\(K) k = (uint)v;"; flip = "(0xFFu - k)"; maxKey = "0xFFu"
+        case "i16": map = "\(K) k = ((uint)(int)v + 32768u) & 0xFFFFu;"; flip = "(0xFFFFu - k)"; maxKey = "0xFFFFu"
+        case "u16": map = "\(K) k = (uint)v;"; flip = "(0xFFFFu - k)"; maxKey = "0xFFFFu"
         case "i32": map = "\(K) k = (uint)v ^ 0x80000000u;"
         case "u32": map = "\(K) k = (uint)v;"
         case "f32":
@@ -45,10 +57,16 @@ enum TopKSource {
                 \(K) k = (b & 0x8000000000000000ul) ? ~b : (b | 0x8000000000000000ul);
             """
         }
+        return "inline \(K) tk_map(\(V) v, uint inv) { \(nanFlag) \(map) return inv ? (nan ? \(maxKey) : \(flip)) : k; }"
+    }
+
+    /// `kind` names the value mapping, `V` is the MSL type of a row, `K` the key type (uint or ulong).
+    static func source(kind: String, V: String, K: String) -> String {
+        let keyMax = K == "ulong" ? "ULONG_MAX" : "UINT_MAX"
         return KernelSource.prelude + """
 
         #define TK_NOROW 0xFFFFFFFFu
-        inline \(K) tk_map(\(V) v, uint inv) { \(nanFlag) \(map) return inv ? (nan ? \(keyMax) : ~k) : k; }
+        \(keyMap(kind: kind, V: V, K: K))
         // Lexicographic (key, row). Row indices are unique, so this is a strict total order.
         inline bool tk_less(\(K) a, uint ai, \(K) b, uint bi) { return (a < b) || (a == b && ai < bi); }
 
