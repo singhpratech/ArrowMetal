@@ -206,7 +206,7 @@ those types do not go, and [docs/COVERAGE.md](docs/COVERAGE.md) says so on each 
 
 ## What is implemented
 
-**306 of Apache Arrow v25's 307 compute function names** — 231 entirely on the GPU, 20 on the host, 55
+**306 of Apache Arrow v25's 307 compute function names** — 241 entirely on the GPU, 20 on the host, 45
 with a stated limitation, 1 (`binary_slice`) not implemented. Every one of those names has a row in
 [docs/ARROW_FUNCTIONS.md](docs/ARROW_FUNCTIONS.md) naming the Swift file behind it, the ArrowMetal call
 that reaches it and what it does differently, and that table is generated from a registry the test suite
