@@ -132,6 +132,28 @@ Requirements: macOS 14+ / iOS 17+, Swift 5.10+. Shaders compile at runtime so th
 enough to build and use it. Running the test suite needs Xcode (for XCTest):
 `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`.
 
+## Reading Arrow files
+
+The Arrow IPC streaming and file formats are read and written directly, with no dependencies: a small
+FlatBuffers codec lives in `Sources/ArrowMetal/IPC`. Buffers land straight in Metal shared memory, so a
+file read is ready for the GPU with no further copy.
+
+```swift
+let batches = try ArrowIPCReader(url: url).readAll()          // .arrow or .arrows, memory mapped
+try ArrowIPCWriter.write(batches, to: url)                     // file format, readable by pyarrow
+
+let reader = try ArrowIPCReader(url: url)                      // random access via the file footer
+print(reader.schema.names, reader.batchCount)
+let first = try reader.batch(at: 0)
+
+let stream = try ArrowIPCWriter.encode(batches, format: .stream)   // Data, for sockets or Flight
+```
+
+Int8 to UInt64, Float32/64, Bool, Utf8, LargeUtf8 and Binary are read into their `MetalArray` types.
+Temporal columns (`date32/64`, `time32/64`, `timestamp`, `duration`) are carried by their storage integer
+array while the logical type stays visible in `reader.schema`. Dictionary encoding, nested types,
+compressed bodies and big-endian data are rejected with a clear error.
+
 ## What is implemented
 
 - `MetalArrowBuffer`: page-aligned shared-memory buffers, zero-copy wrap of foreign page-aligned memory.
@@ -152,6 +174,8 @@ enough to build and use it. Running the test suite needs Xcode (for XCTest):
 - NaN: `min`/`max` skip NaN and return null if only NaN remains; `sum` propagates NaN; comparisons follow IEEE.
 - C Data Interface import/export for primitive arrays and struct (`+s`) record batches, C Stream Interface
   import, C Device Data Interface import/export, `MTLBuffer` recovery from our own exports.
+- `ArrowIPCReader` / `ArrowIPCWriter`: the Arrow IPC streaming and file formats, including a minimal
+  FlatBuffers reader and builder, with no dependencies. Cross-checked against pyarrow in both directions.
 - A CPU reference implementation of every kernel, used as the oracle in tests.
 
 ## Design notes
