@@ -132,15 +132,13 @@ public func am_parquet_encodings(_ f: OpaquePointer?, _ rowGroup: Int64, _ colum
 public func am_parquet_read(_ f: OpaquePointer?, _ columns: UnsafePointer<UnsafePointer<CChar>?>?,
                             _ nColumns: Int64, _ rowGroup: Int64,
                             _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
-    let groups: UnsafePointer<Int64>?
-    var one = rowGroup
-    if rowGroup >= 0 {
-        return withUnsafePointer(to: &one) { p in
-            am_parquet_read_ex(f, columns, nColumns, p, 1, nil, 1, out)
-        }
+    guard rowGroup >= 0 else {
+        return am_parquet_read_ex(f, columns, nColumns, nil, 0, nil, 1, out)
     }
-    groups = nil
-    return am_parquet_read_ex(f, columns, nColumns, groups, 0, nil, 1, out)
+    var one = rowGroup
+    return withUnsafePointer(to: &one) { p in
+        am_parquet_read_ex(f, columns, nColumns, p, 1, nil, 1, out)
+    }
 }
 
 /// Full read: projection, row-group selection, statistics filters and the dictionary switch.
