@@ -197,23 +197,11 @@ public final class MetalStringArray: @unchecked Sendable {
         return res
     }
 
-    /// Dictionary-encodes on the CPU (hash map over bytes): returns dense Int32 codes in [0, unique.count) plus
-    /// the unique strings in first-seen order. Feeds `GroupBy`. Null strings become null codes.
+    /// Dictionary-encodes on the GPU (`Kernels/StringDictionary.swift`): returns dense Int32 codes in
+    /// [0, unique.count) plus the unique strings in first-seen order. Feeds `GroupBy`. Null strings
+    /// become null codes.
     public func dictionaryEncode() throws -> (codes: MetalArray<Int32>, unique: MetalStringArray) {
-        var map: [ArraySlice<UInt8>: Int32] = [:]
-        var uniques: [String?] = []
-        var codes: [Int32?] = []
-        codes.reserveCapacity(length)
-        let o = offsets.typed(Int32.self), d = data.typed(UInt8.self)
-        let bytes = UnsafeBufferPointer(start: d, count: totalBytes)
-        for i in 0..<length {
-            guard isValid(i) else { codes.append(nil); continue }
-            let slice = Array(bytes[Int(o[i])..<Int(o[i + 1])])[...]
-            if let c = map[slice] { codes.append(c) } else {
-                let c = Int32(uniques.count); map[slice] = c; uniques.append(String(decoding: slice, as: UTF8.self)); codes.append(c)
-            }
-        }
-        return (try MetalArray<Int32>(codes, context: context), try MetalStringArray(uniques, context: context))
+        try dictionaryEncodeGPU()
     }
 }
 

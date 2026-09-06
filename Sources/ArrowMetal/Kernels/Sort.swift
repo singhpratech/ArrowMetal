@@ -103,8 +103,15 @@ extension MetalArray {
     /// Sorted copy (nulls last).
     public func sorted(descending: Bool = false) throws -> MetalArray<T> { try take(try argsort(descending: descending)) }
 
-    /// Indices of the k smallest (or largest) values.
+    /// Indices of the k smallest (or largest) values, in the same order `argsort` would put them.
+    ///
+    /// For k up to 1024 this is a partial selection (`Kernels/TopK.swift`): each threadgroup keeps only
+    /// the best k of its own block, and one small radix sort orders the surviving candidates — about one
+    /// read per row instead of the eight radix passes a full sort costs. Larger k, types the selection
+    /// kernel does not map, and the case where fewer than k rows are non-null fall back to the sort.
     public func topK(_ k: Int, largest: Bool = true) throws -> MetalArray<Int32> {
+        guard k > 0 else { return try MetalArray<Int32>([Int32](), context: context) }
+        if let selected = try topKSelect(k, largest: largest) { return selected }
         let idx = try argsort(descending: largest)
         return try idx.slice(offset: 0, length: Swift.min(k, idx.length))
     }

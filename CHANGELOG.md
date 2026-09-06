@@ -8,7 +8,9 @@ Core
 - Kernels: sum/min/max/mean, compare, add/sub/mul/div (vectorised, defined integer division by zero),
   filter (one command buffer, GPU scan) and fused filter(where:), take, cast, slice, boolean and/or/not/count/any/all.
 - Float64 compare/min/max/filter/take/slice on the GPU via order-preserving bit patterns; NaN semantics.
-- GroupBy over dense integer keys: count, sum, mean, min, max (privatised and device-atomic paths).
+- GroupBy over dense integer keys: count, sum, mean, min, max (privatised and device-atomic paths), plus a
+  sort-based segmented path with no atomics — sumDouble/meanDouble/sumFloatAsDouble/meanFloat and
+  min64/max64 — which covers the Float64 and 64-bit min/max cases 32-bit atomics cannot express.
 - MetalRecordBatch with filter/take/slice/selecting; struct (+s) C Data import/export; ArrowArrayStream import.
 - Batched execution (`MetalContext.batch { }`) and its non-blocking form: `batchAsync` (Swift `async`
   and completion-handler), with `MetalArray.sumAsync`/`meanAsync` for scalars, so the calling thread is
@@ -17,8 +19,12 @@ Core
 
 Strings and sorting
 - `MetalStringArray` (utf8): byte/char length, equals/starts_with/ends_with/contains, MurmurHash3, GPU filter/take,
-  dictionary encoding; import/export through the C Data Interface (large_utf8 narrowed on import).
-- GPU LSD radix sort: `argsort`, `sorted`, `topK`, `MetalRecordBatch.sorted(by:)`; stable, nulls last, IEEE total order.
+  GPU dictionary encoding (hash, argsort, byte-comparing boundaries, rank scan and gather; collisions detected
+  and re-hashed, with the host path as the final fallback); import/export through the C Data Interface
+  (large_utf8 narrowed on import).
+- GPU LSD radix sort: `argsort`, `sorted`, `MetalRecordBatch.sorted(by:)`; stable, nulls last, IEEE total order.
+- `topK`: per-threadgroup selection for k <= 1024 (threshold plus a bitonic compaction in threadgroup memory,
+  then one radix sort of the candidates), matching the full sort index for index; the sort path above that.
 
 Temporal, binary and dictionary types
 - `MetalTemporalArray`: date32/date64, time32/time64, timestamp (unit + optional timezone) and duration,
