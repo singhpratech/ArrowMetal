@@ -2173,3 +2173,283 @@ def _tdigest(self, q=0.5):
 MetalArray.skew = _skew
 MetalArray.kurtosis = _kurtosis
 MetalArray.tdigest = _tdigest
+# ---- remaining selection / sort / random / aggregate functions (see include/arrowmetal.h)
+#
+# inverse_permutation, scatter, winsorize, rank_quantile, rank_normal, random, true_unless_null,
+# count_all, first_last, utf8_swapcase, utf8_zero_fill, make_struct and pivot_wider, plus the
+# Arrow-named aliases for calls that already exist under a different name. Appended rather than
+# written into the class body so this file stays additive.
+_lib.am_inverse_permutation.argtypes = [_P, ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_inverse_permutation.restype = ctypes.c_int
+_lib.am_scatter.argtypes = [_P, _P, ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_scatter.restype = ctypes.c_int
+_lib.am_winsorize.argtypes = [_P, ctypes.c_double, ctypes.c_double, ctypes.POINTER(_P)]
+_lib.am_winsorize.restype = ctypes.c_int
+_lib.am_rank.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_rank.restype = ctypes.c_int
+_lib.am_random.argtypes = [ctypes.c_int64, ctypes.c_uint64, ctypes.POINTER(_P)]
+_lib.am_random.restype = ctypes.c_int
+_lib.am_true_unless_null.argtypes = [_P, ctypes.POINTER(_P)]
+_lib.am_true_unless_null.restype = ctypes.c_int
+_lib.am_count_all.argtypes = [_P]
+_lib.am_count_all.restype = ctypes.c_int64
+_lib.am_first_last.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_first_last.restype = ctypes.c_int
+_lib.am_str_extra.argtypes = [_P, ctypes.c_int, ctypes.c_char_p, ctypes.c_int64, ctypes.c_int64,
+                              ctypes.POINTER(_P)]
+_lib.am_str_extra.restype = ctypes.c_int
+_lib.am_pivot_wider.argtypes = [_P, _P, ctypes.POINTER(ctypes.c_char_p), ctypes.c_int64, ctypes.c_int,
+                                ctypes.POINTER(_P)]
+_lib.am_pivot_wider.restype = ctypes.c_int
+_lib.am_make_struct.argtypes = [ctypes.POINTER(_P), ctypes.POINTER(ctypes.c_char_p), ctypes.c_int64,
+                                ctypes.POINTER(_P)]
+_lib.am_make_struct.restype = ctypes.c_int
+
+# Op numbering is the C ABI contract; see include/arrowmetal.h.
+_RANK = {"quantile": 0, "normal": 1, "normal_f32": 2}
+_STR_EXTRA = {"utf8_swapcase": 0, "utf8_zero_fill": 1}
+
+
+def _as_array(obj):
+    """Anything that can be a MetalArray: one already, or something with the Arrow C array protocol."""
+    return obj if isinstance(obj, MetalArray) else MetalArray.from_arrow(obj)
+
+
+def _inverse_permutation(self, max_index=-1):
+    """Arrow `inverse_permutation`: for the i-th index, the index-th output element is i.
+
+    The output has `max_index + 1` elements, or this column's length when `max_index` is negative.
+    A position no index names comes back null; when several positions name the same one the last
+    wins, as in Arrow (and deterministically here - the GPU scatter takes an atomic maximum over the
+    source positions). Null indices are skipped and an index outside [0, max_index] raises. The
+    result is always int32; Arrow's `output_type` option is not implemented.
+    """
+    return _call(_lib.am_inverse_permutation, self._h, max_index)
+
+
+def _scatter(self, indices, max_index=-1):
+    """Arrow `scatter`: place the i-th value at the position named by the i-th index.
+
+    Same shape rules as `inverse_permutation` - unassigned positions null, duplicates last-wins -
+    and it works for every column type, because it is that inverse permutation used as a `take`.
+    """
+    idx = _as_array(indices)          # keep the handle alive across the call
+    return _call(_lib.am_scatter, self._h, idx._h, max_index)
+
+
+def _winsorize(self, lower_limit, upper_limit):
+    """Arrow `winsorize`: clamp to the quantiles at `lower_limit` and `upper_limit`.
+
+    The limits are Arrow's *nearest* quantiles rather than interpolated ones: with m non-null,
+    non-NaN values sorted ascending, a limit q picks sorted[round(q * (m - 1))], halfway rounding to
+    the even index. Nulls stay null and NaNs pass through unchanged. One GPU sort, one clamp kernel.
+    """
+    return _call(_lib.am_winsorize, self._h, float(lower_limit), float(upper_limit))
+
+
+def _rank_quantile(self):
+    """Arrow `rank_quantile`: (average 1-based rank of the row's tie group - 0.5) / n, as float64.
+
+    Nulls sort last as one tie group (pyarrow's default null_placement="at_end") and NaN is one
+    value after +inf; no result is ever null. Arrow's sort_keys / null_placement options are not
+    implemented - this is always the single ascending key with nulls at the end.
+    """
+    return _call(_lib.am_rank, self._h, _RANK["quantile"])
+
+
+def _rank_normal(self, float32=False):
+    """Arrow `rank_normal`: the normal percent-point function of `rank_quantile()`.
+
+    float64 by default, with the inverse CDF evaluated on the host through Wichura's AS 241 (about
+    1e-16 relative), because Metal has neither `double` nor `log`/`exp`/`erfc` for the software
+    binary64. `float32=True` runs it entirely on the GPU (Acklam plus one Halley refinement) and
+    lands within about 1e-6 of the float64 answer.
+    """
+    return _call(_lib.am_rank, self._h, _RANK["normal_f32" if float32 else "normal"])
+
+
+def _true_unless_null(self):
+    """Arrow `true_unless_null`: true for every valid row, null for every null one."""
+    return _call(_lib.am_true_unless_null, self._h)
+
+
+def _count_all(self):
+    """Arrow `count_all`: the number of rows, valid or not."""
+    return int(_lib.am_count_all(self._h))
+
+
+def _first_last(self, skip_nulls=True):
+    """Arrow `first_last`: a one-row struct with fields `first` and `last` of this column's type.
+
+    With `skip_nulls` the first and last non-null values are used (both null when no row is valid);
+    with `skip_nulls=False` the first and last rows are taken as they are.
+    """
+    return _call(_lib.am_first_last, self._h, 1 if skip_nulls else 0)
+
+
+def _utf8_swapcase(self):
+    """Arrow `utf8_swapcase`, on the GPU over Basic Latin, Latin-1 Supplement and Latin Extended-A.
+
+    Code points outside those blocks - and U+00DF, which Arrow swaps to U+1E9E - pass through
+    unchanged rather than being mangled, so the output is always valid UTF-8.
+    """
+    return _call(_lib.am_str_extra, self._h, _STR_EXTRA["utf8_swapcase"], b"", 0, 0)
+
+
+def _utf8_zero_fill(self, width, padding="0"):
+    """Arrow `utf8_zero_fill`: left-pad to `width` code points, inserting the padding after a leading
+    + or -. Strings already at or over `width` are unchanged; the content need not be numeric."""
+    pad = padding.encode()
+    return _call(_lib.am_str_extra, self._h, _STR_EXTRA["utf8_zero_fill"], pad, len(pad), int(width))
+
+
+def random(n, initializer=0):
+    """Arrow `random`: `n` uniform float64 values in [0, 1), generated on the GPU.
+
+    Philox4x32-10 (Salmon, Moraes, Dror & Shaw, SC'11) keyed by `initializer`: element i comes from
+    the counter (i, 0, 0, 0), so the stream depends only on the seed - not on the device or the
+    launch geometry - and a prefix of a long draw equals a short draw with the same seed. Pass
+    "system" for a seed from the operating system's random source.
+
+    The stream is ArrowMetal's own; it does not reproduce the numbers Arrow C++ generates for the
+    same seed (Arrow uses pcg32_fast on the host).
+    """
+    if initializer == "system":
+        seed = int.from_bytes(os.urandom(8), "little")
+    elif isinstance(initializer, int):
+        seed = initializer & 0xFFFFFFFFFFFFFFFF
+    else:
+        raise ArrowMetalError('random initializer must be an int or "system"')
+    return _call(_lib.am_random, int(n), seed)
+
+
+def make_struct(arrays, names):
+    """Arrow `make_struct`: compose equal-length columns into one struct column. Metadata only."""
+    cols = [_as_array(a) for a in arrays]
+    if not cols:
+        raise ArrowMetalError("make_struct needs at least one column")
+    if len(names) != len(cols):
+        raise ArrowMetalError(f"make_struct got {len(names)} names for {len(cols)} columns")
+    handles = (_P * len(cols))(*[c._h for c in cols])
+    cnames = (ctypes.c_char_p * len(names))(*[n.encode() for n in names])
+    out = _P()
+    _check(_lib.am_make_struct(handles, cnames, len(cols), ctypes.byref(out)))
+    return MetalArray(out)
+
+
+def pivot_wider(pivot_keys, pivot_values, key_names, unexpected_key_behavior="ignore"):
+    """Arrow `pivot_wider`: a one-row struct with a field per entry of `key_names`.
+
+    A key that never appears, or appears only with a null value, gives a null field; a key carrying
+    more than one non-null value raises, as in Arrow. The key column may be utf8, binary, dictionary
+    or any integer type. This one runs on the host: the output is one row wide however long the
+    input is.
+    """
+    if unexpected_key_behavior not in ("ignore", "raise"):
+        raise ArrowMetalError('unexpected_key_behavior must be "ignore" or "raise"')
+    keys, values = _as_array(pivot_keys), _as_array(pivot_values)
+    names = list(key_names)
+    cnames = (ctypes.c_char_p * max(len(names), 1))(*[n.encode() for n in names])
+    out = _P()
+    _check(_lib.am_pivot_wider(keys._h, values._h, cnames, len(names),
+                               1 if unexpected_key_behavior == "raise" else 0, ctypes.byref(out)))
+    return MetalArray(out)
+
+
+MetalArray.inverse_permutation = _inverse_permutation
+MetalArray.scatter = _scatter
+MetalArray.winsorize = _winsorize
+MetalArray.rank_quantile = _rank_quantile
+MetalArray.rank_normal = _rank_normal
+MetalArray.true_unless_null = _true_unless_null
+MetalArray.count_all = _count_all
+MetalArray.first_last = _first_last
+MetalArray.utf8_swapcase = _utf8_swapcase
+MetalArray.utf8_zero_fill = _utf8_zero_fill
+
+# Arrow-named aliases for calls that already exist under an ArrowMetal name. Each is the same code
+# path bound to a second name, not a second implementation.
+MetalArray.array_filter = MetalArray.filter                 # Arrow array_filter
+MetalArray.array_take = MetalArray.take                     # Arrow array_take
+MetalArray.array_sort_indices = MetalArray.argsort          # Arrow array_sort_indices
+MetalArray.sort_indices = MetalArray.argsort                # Arrow sort_indices, single key
+MetalArray.dictionary_decode = MetalArray.decode            # Arrow dictionary_decode
+MetalArray.invert = MetalArray.__invert__                   # Arrow invert
+MetalArray.ascii_swapcase = MetalArray.swapcase             # Arrow ascii_swapcase
+MetalArray.ascii_lpad = MetalArray.pad_left                 # Arrow ascii_lpad / utf8_lpad
+MetalArray.ascii_rpad = MetalArray.pad_right                # Arrow ascii_rpad / utf8_rpad
+MetalArray.utf8_lpad = MetalArray.pad_left
+MetalArray.utf8_rpad = MetalArray.pad_right
+
+
+def _top_k_unstable(self, k):
+    """Arrow `top_k_unstable`: indices of the k largest values (GPU partial selection for k <= 1024)."""
+    return self.top_k(k, largest=True)
+
+
+def _bottom_k_unstable(self, k):
+    """Arrow `bottom_k_unstable`: indices of the k smallest values."""
+    return self.top_k(k, largest=False)
+
+
+def _select_k_unstable(self, k, largest=False):
+    """Arrow `select_k_unstable`: indices of the k best values, smallest first by default."""
+    return self.top_k(k, largest=largest)
+
+
+MetalArray.top_k_unstable = _top_k_unstable
+MetalArray.bottom_k_unstable = _bottom_k_unstable
+MetalArray.select_k_unstable = _select_k_unstable
+
+
+# ---- associative transforms and the partial sort, wired through to Python
+_lib.am_unique.argtypes = [_P, ctypes.POINTER(_P)]
+_lib.am_unique.restype = ctypes.c_int
+_lib.am_value_counts.argtypes = [_P, ctypes.POINTER(_P)]
+_lib.am_value_counts.restype = ctypes.c_int
+_lib.am_partition_nth_indices.argtypes = [_P, ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_partition_nth_indices.restype = ctypes.c_int
+
+
+def _unique(self):
+    """Arrow `unique`: the distinct non-null values.
+
+    ArrowMetal returns them **ascending** (one GPU sort plus a run scan); Arrow returns them in order
+    of first appearance. Sort the pyarrow answer, or ours, when the two have to line up.
+    """
+    return _call(_lib.am_unique, self._h)
+
+
+def _value_counts(self):
+    """Arrow `value_counts`: a struct column with fields `values` and `counts` (int64).
+
+    Same ascending order as `unique()`, where Arrow uses order of first appearance.
+    """
+    return _call(_lib.am_value_counts, self._h)
+
+
+def _partition_nth_indices(self, n):
+    """Arrow `partition_nth_indices`: indices that put the n smallest values first.
+
+    Answered with the full stable GPU argsort, which satisfies the contract; there is no cheaper
+    partial-partition kernel yet (`top_k` is the one that does less work than a full sort).
+    """
+    return _call(_lib.am_partition_nth_indices, self._h, int(n))
+
+
+def _count(self, mode="only_valid"):
+    """Arrow `count`: the number of valid rows ("only_valid"), null rows ("only_null") or all rows
+    ("all"). O(1) metadata — the null count is already carried on the column."""
+    if mode == "only_valid":
+        return len(self) - self.null_count
+    if mode == "only_null":
+        return self.null_count
+    if mode == "all":
+        return len(self)
+    raise ArrowMetalError('count mode must be "only_valid", "only_null" or "all"')
+
+
+MetalArray.unique = _unique
+MetalArray.value_counts = _value_counts
+MetalArray.partition_nth_indices = _partition_nth_indices
+MetalArray.count = _count

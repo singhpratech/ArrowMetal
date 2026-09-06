@@ -897,6 +897,97 @@ int  am_group_pivot_wider(am_groupby* gb, am_array* pivot_keys, am_array* values
 // Arrow's buffer_size option has no counterpart here; delta is fixed at 100 through this entry point.
 int  am_reduce_ex2(am_array* a, int op, double p1, double* out_f64, int* is_null);
 
+// Remaining selection, sort, random and aggregate functions.
+//
+// am_inverse_permutation / am_scatter: for the i-th index the index-th output element is i, and
+// scatter is that inverse permutation used as a take. The output has max_index + 1 elements, or the
+// input's length when max_index is negative. A position no index names comes back **null**; when
+// several positions name the same one the **last** wins (Arrow's rule, and deterministic here: the
+// scatter takes an atomic maximum over the source positions, and a maximum does not depend on thread
+// order). Null indices are skipped; an index outside [0, max_index] is an error. The inverse
+// permutation is always int32 (Arrow's output_type option is not implemented); scatter accepts any
+// column type, nested ones included, because take already turns a null index into a null row.
+int  am_inverse_permutation(am_array* a, int64_t max_index, am_array** out);
+int  am_scatter(am_array* values, am_array* indices, int64_t max_index, am_array** out);
+
+// am_winsorize: values below the lower quantile take the lower quantile's value and values above the
+// upper one take the upper quantile's value. The limits are Arrow's *nearest* quantiles, not
+// interpolated ones: with m non-null, non-NaN values sorted ascending, a limit q picks
+// sorted[round(q * (m - 1))] with the halfway case going to the even index. Nulls stay null and NaNs
+// pass through unchanged (they take part in neither the limits nor the comparison). Requires
+// 0 <= lower <= upper <= 1. One GPU sort plus one clamp kernel.
+int  am_winsorize(am_array* a, double lower_limit, double upper_limit, am_array** out);
+
+// am_rank: op 0 rank_quantile (float64), op 1 rank_normal (float64), op 2 rank_normal (float32).
+//
+// rank_quantile gives each row (average 1-based rank of its tie group - 0.5) / n, pyarrow's
+// definition, computed on the GPU as (s + e) / (2n) over the tie group's sorted positions [s, e)
+// with the correctly rounded software binary64 divide. Nulls sort last and form one tie group
+// (pyarrow's default null_placement = "at_end") and NaN is one value after +inf; no result is null.
+// Arrow's sort_keys / null_placement options are not implemented.
+//
+// rank_normal is the normal percent-point function of that quantile. Op 1 evaluates it on the host
+// with Wichura's AS 241 (about 1e-16 relative); op 2 evaluates it on the GPU in float32 with
+// Acklam's rational approximation plus one Halley refinement, which lands within about 1e-6 of the
+// float64 answer. Metal has no `double` and the software binary64 has no log/exp/erfc, so the
+// float64 inverse CDF is the one part of this that runs on the CPU.
+int  am_rank(am_array* a, int op, am_array** out);
+
+// am_random: `count` uniform float64 values in [0, 1), generated on the GPU with Philox4x32-10
+// (Salmon, Moraes, Dror & Shaw, SC'11) keyed by `seed`. Element i comes from the counter (i,0,0,0),
+// so the stream depends only on the seed — not on the device or the launch geometry — and the top
+// 53 bits of each draw become a multiple of 2^-53, so no value is ever 1.0. The stream is
+// ArrowMetal's own: it does not reproduce Arrow C++'s pcg32_fast numbers for the same seed.
+int  am_random(int64_t count, uint64_t seed, am_array** out);
+
+// am_true_unless_null: true for every valid row, null for every null one. The values bitmap is a
+// host memset and the validity bitmap is shared with the input with no copy, so no kernel runs.
+// Union and run-end encoded columns are refused: neither has a top-level validity bitmap to share.
+int  am_true_unless_null(am_array* a, am_array** out);
+
+// am_count_all: the number of rows, valid or not. -1 for a NULL handle.
+int64_t am_count_all(am_array* a);
+
+// am_first_last: a one-row struct ("+s") with fields `first` and `last` of the column's own type.
+// With skip_nulls != 0 the first and last non-null values are used (both null when no row is valid);
+// with skip_nulls == 0 the first and last rows are taken as they are.
+int  am_first_last(am_array* a, int skip_nulls, am_array** out);
+
+// am_str_extra: op 0 utf8_swapcase, op 1 utf8_zero_fill (p1 = width in code points, arg = the pad
+// character, defaulting to "0"). Both are two-pass GPU transforms.
+//
+// utf8_swapcase covers the same blocks utf8_upper / utf8_lower do — Basic Latin, Latin-1 Supplement
+// and Latin Extended-A, including the length-changing pairs. Everything above U+017F, and U+00DF
+// (which Arrow swaps to U+1E9E), passes through unchanged rather than being mangled.
+//
+// utf8_zero_fill left-pads to `width` code points, inserting the padding after a leading + or -, and
+// leaves a string already at or over `width` alone. The content need not be numeric.
+int  am_str_extra(am_array* a, int op, const char* arg, int64_t arg_len, int64_t p1, am_array** out);
+
+// am_pivot_wider: one struct row with a field per entry of key_names, each of the value column's
+// type. A key that never appears, or appears only with a null value, gives a null field; a key that
+// carries more than one non-null value is an error, as in Arrow. raise_unexpected != 0 is Arrow's
+// unexpected_key_behavior = "raise". The key column may be utf8, binary, dictionary or any integer
+// type (integers match by their decimal rendering). This one runs on the host: the output is one row
+// wide however long the input is.
+int  am_pivot_wider(am_array* keys, am_array* values, const char* const* key_names, int64_t n_keys,
+                    int raise_unexpected, am_array** out);
+
+// am_make_struct: composes equal-length columns into one struct-typed column ("+s"), with the given
+// field names. Metadata only — the children are shared, nothing is copied and no kernel runs.
+int  am_make_struct(am_array** arrays, const char* const* names, int64_t count, am_array** out);
+
+// am_unique / am_value_counts / am_partition_nth_indices.
+//
+// unique returns the distinct non-null values; ArrowMetal orders them **ascending** (one GPU sort
+// plus a run scan) where Arrow orders them by first appearance. value_counts is the same pass,
+// returned as a struct ("+s") with fields `values` and `counts` (int64), in the same ascending
+// order. partition_nth_indices answers with the full stable argsort, which satisfies Arrow's
+// contract (the n smallest first) at the cost of one radix sort.
+int  am_unique(am_array* a, am_array** out);
+int  am_value_counts(am_array* a, am_array** out);
+int  am_partition_nth_indices(am_array* a, int64_t n, am_array** out);
+
 #ifdef __cplusplus
 }
 #endif
