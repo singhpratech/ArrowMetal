@@ -169,3 +169,43 @@ strides must tile a range, come from a per-thread `atomic_load_explicit(..., mem
 Broadcast it through a plain threadgroup variable between barriers. The other `atomic_load_explicit` sites
 (`SortSource`, `GroupBySource`, `JoinSource`, `StringExtraSource`) were checked: each reads a slot the
 calling thread owns, so none of them tiles or branches on a shared count.
+
+## Round 9 (2026-09-06): radix select, and the LSD radix sort's blocking at small n
+
+**The two-pass trick.** A GPU radix select normally costs three passes over the column: histogram the top
+digit, count how many rows fall in the selected range per block, then scatter them in order. The count pass
+is redundant if the histogram keeps its counts **per sub-block** instead of only globally — the digit-major
+table `counts[digit * subBlocks + sub]` is simultaneously the global histogram (summed over sub-blocks) and
+the offset table the scatter needs (summed over digits <= target). At 50M rows that is 1 ms saved out of 3.
+
+**One sub-block per simdgroup, not per threadgroup.** Making the output granularity a simdgroup's slice
+rather than a threadgroup's removes every `threadgroup_barrier` from the scatter: the rank of a selected row
+within its slice is `simd_prefix_exclusive_sum` over 32 lanes plus a running base each lane computes
+identically. The cost is an 8x larger count table (256 * 8 * groups words, ~8 MB at 50M rows), which is
+noise next to the 400 MB the pass reads anyway.
+
+**The final sort was the bottleneck, and it was a blocking bug.** After selection there are only ~200k
+candidates left to order, but `argsort` of 200k UInt64 measured 2.2-2.9 ms — as slow as sorting 800k. The
+cause was `elemsPerBlock = 4096` fixed: 200k rows is 49 threadgroups, 20k rows is *five*, on a GPU with 40
+cores, and `radix_scatter` does an O(TG) rank loop per element that nothing else can overlap. Halving the
+block size until there are at least 64 blocks (inputs above ~256k rows are untouched, so the 50M argsort is
+unchanged) took argsort of 20k from 1.99 ms to 0.41 ms and of 200k from 2.20 to 1.34 ms, and it is most of
+why `top_k(100)` went from 5.6 ms to 2.9 ms.
+
+**Refine on the compacted array, not the column.** The selected bin is ~n/256 rows, which still dominates
+the final ordering. Running the same histogram + compaction *again* over the compacted candidates (a few
+hundred thousand keys, microseconds) shrinks it by another 256x. One extra round trip, and it takes the
+survivors under the 2048 pairs a single-threadgroup bitonic sort can order in one dispatch.
+
+**Benchmark data hides skew.** `rng.integers(-(2**62), 2**62)` spreads over only 128 of the 256 top-digit
+bins, so the candidate bin is n/128, not n/256. Worth remembering when reading a selection benchmark: the
+bin size, and therefore the final sort, depends entirely on the key distribution's top byte.
+
+**A float key's top byte is the exponent, so float columns are the skewed case.** The top byte of a float64
+key is the sign plus seven exponent bits, so a column of uniform doubles concentrates in a handful of bins
+rather than spreading over 256, and the bin holding the wanted rank can be a large fraction of the column.
+When it is over the compaction budget the search narrows another digit over the column instead, one more full
+pass — which is why the same 50M Float64 median measures anywhere between 2.7 and 3.9 ms depending on exactly
+where the rank lands, while Int64 keys are stable. Raising the budget so the big bin gets compacted instead is
+faster still, but a 25M-row bin needs 300 MB of scratch for a 400 MB column, and a median already 100x faster
+than pyarrow is not worth a 75% memory overhead.

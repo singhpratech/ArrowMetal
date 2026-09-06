@@ -33,7 +33,11 @@ extension MetalArray {
         var keysB = try MetalArrowBuffer.allocate(byteCount: n * kb, zeroed: false, context: ctx)
         var valsA = try MetalArrowBuffer.allocate(byteCount: n * 4, zeroed: false, context: ctx)
         var valsB = try MetalArrowBuffer.allocate(byteCount: n * 4, zeroed: false, context: ctx)
-        let elemsPerBlock = 4096
+        // A fixed 4096 elements per block leaves a small sort on a handful of threadgroups: a 20k-element
+        // argsort (the size top-k's final ordering lands on) would run on five. Halve the block until there
+        // are at least 64 of them; inputs above ~256k are unaffected.
+        var elemsPerBlock = 4096
+        while elemsPerBlock > 256 && (n + elemsPerBlock - 1) / elemsPerBlock < 64 { elemsPerBlock >>= 1 }
         let blocks = (n + elemsPerBlock - 1) / elemsPerBlock
         let counts = try MetalArrowBuffer.allocate(byteCount: 256 * blocks * 4, zeroed: false, context: ctx)
         let tg = MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1)
@@ -105,13 +109,25 @@ extension MetalArray {
 
     /// Indices of the k smallest (or largest) values, in the same order `argsort` would put them.
     ///
-    /// For k up to 1024 this is a partial selection (`Kernels/TopK.swift`): each threadgroup keeps only
-    /// the best k of its own block, and one small radix sort orders the surviving candidates — about one
-    /// read per row instead of the eight radix passes a full sort costs. Larger k, types the selection
-    /// kernel does not map, and the case where fewer than k rows are non-null fall back to the sort.
+    /// Three implementations, all producing the same total order (key, then row index):
+    ///
+    /// - **Radix select** (`Kernels/RadixSelect.swift`) for any k: a digit histogram finds the bin holding
+    ///   the k-th key, then one compaction pass keeps only the rows that can still be in the answer. Two
+    ///   passes over the column, and a sort of roughly `k + n/256` rows.
+    /// - **Per-threadgroup selection** (`Kernels/TopK.swift`) for k up to 1024 on small inputs: one dispatch,
+    ///   each threadgroup keeping the best k of its own block. It has no mid-flight readback, so it wins
+    ///   where latency rather than bandwidth decides.
+    /// - The **full argsort** for everything else: types with no key mapping, k close to n, and the case
+    ///   where fewer than k rows are non-null, which needs the null rows placed.
     public func topK(_ k: Int, largest: Bool = true) throws -> MetalArray<Int32> {
         guard k > 0 else { return try MetalArray<Int32>([Int32](), context: context) }
-        if let selected = try topKSelect(k, largest: largest) { return selected }
+        if TopK.preferRadixSelect(n: length, k: k) {
+            if let r = try topKRadixSelect(k, largest: largest) { return r }
+            if let s = try topKSelect(k, largest: largest) { return s }
+        } else {
+            if let s = try topKSelect(k, largest: largest) { return s }
+            if let r = try topKRadixSelect(k, largest: largest) { return r }
+        }
         let idx = try argsort(descending: largest)
         return try idx.slice(offset: 0, length: Swift.min(k, idx.length))
     }

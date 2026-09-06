@@ -11,7 +11,7 @@ import Metal
 // | `index` | one GPU pass, device-wide atomic minimum over the matching rows |
 // | `first` / `last` | one GPU pass over the validity bitmap (atomic min/max index), one host read |
 // | `any` / `all` | one GPU pass, word-wise popcounts of `values & validity` and of `validity` |
-// | `quantile` / `approximate_median` | GPU sort (radix) plus an indexed host read: exact, not approximate |
+// | `quantile` / `approximate_median` | GPU radix select on the order-preserving key: exact, not approximate |
 // | `mode` | GPU `value_counts` plus a host argmax |
 // | `count_distinct` | GPU `unique().length` |
 //
@@ -191,17 +191,23 @@ extension MetalArray {
 
     // MARK: - quantile / median / mode / count_distinct
 
-    /// Arrow `quantile` with linear interpolation, computed exactly: the values are sorted on the GPU
-    /// and the result is read at the interpolated position. `q` is clamped to [0, 1].
+    /// Arrow `quantile` with linear interpolation, computed exactly. `q` is clamped to [0, 1].
+    ///
+    /// Only the one or two values that bracket the interpolated position are needed, so this is a GPU radix
+    /// select on the order-preserving key (`Kernels/RadixSelectValue.swift`) — two passes over the column —
+    /// rather than a full sort. Small columns keep the sort, which is already cheap there.
     ///
     /// Nulls are skipped. A NaN is not a null: it sorts after `+inf` and therefore drags a high quantile
     /// with it, exactly as sorting the column and indexing it would.
     public func quantile(_ q: Double) throws -> Double? {
         let m = validCount
         guard m > 0 else { return nil }
-        let sortedValues = try sorted()
         let position = Swift.max(0.0, Swift.min(1.0, q)) * Double(m - 1)
         let low = Int(position.rounded(.down)), high = Int(position.rounded(.up))
+        if let (a, b) = try quantileBounds(low: low, high: high) {
+            return low == high ? a : a + (b - a) * (position - Double(low))
+        }
+        let sortedValues = try sorted()
         return withExtendedLifetime(sortedValues) {
             let p = sortedValues.valuePointer
             let a = p[low].asDouble, b = p[high].asDouble
@@ -210,8 +216,22 @@ extension MetalArray {
         }
     }
 
-    /// Arrow `approximate_median`, computed exactly (`quantile(0.5)`): this package sorts on the GPU
-    /// instead of sketching, so there is nothing approximate about the answer.
+    /// The values at ranks `low` and `high` (adjacent, or equal) among the non-null values, by radix select.
+    /// Nil when the selection path does not apply and the caller should sort instead.
+    private func quantileBounds(low: Int, high: Int) throws -> (Double, Double)? {
+        guard length >= 1 << 12 else { return nil }        // sorting a small column is already cheap
+        guard let found = try radixSelectKey(rank: low, largest: false) else { return nil }
+        let a = TopK.value(fromKey: found.key, largest: false, T.self).asDouble
+        if low == high { return (a, a) }
+        // The two ranks are adjacent, so one search settles both unless `low` was the last row of the bin.
+        var next = found.next
+        if next == nil { next = try radixSelectKey(rank: high, largest: false)?.key }
+        guard let nk = next else { return nil }
+        return (a, TopK.value(fromKey: nk, largest: false, T.self).asDouble)
+    }
+
+    /// Arrow `approximate_median`, computed exactly (`quantile(0.5)`): this package selects the middle rank
+    /// on the GPU instead of sketching, so there is nothing approximate about the answer.
     public func approximateMedian() throws -> Double? { try quantile(0.5) }
 
     /// Arrow `mode`: the most common non-null value and how often it occurs. Ties go to the smallest

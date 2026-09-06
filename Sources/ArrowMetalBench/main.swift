@@ -448,26 +448,39 @@ time("Swift  [Double].sort() (1 core, introsort)", bytes: rows * 16, section: se
     sink(dblA[rows - 1])
 }
 
-sec = "top_k(100 of \(rows) Int64)"; print("\n" + sec)
-let topKCount = 100
-try time("Metal  top_k (full radix argsort + slice)", bytes: rows * 8, section: sec) { sink(try sortI64.topK(topKCount)) }
-time("CPU \(cores)-core top_k (per-core running top-k)", bytes: rows * 8, section: sec) {
-    let p = opaque(sortI64).valuePointer
-    let parts = parallelChunks(rows) { lo, hi -> [Int64] in
-        var best = [Int64](repeating: Int64.min, count: topKCount)
-        var thr = Int64.min
-        for i in lo..<hi {
-            let v = p[i]
-            if v > thr {
-                var j = 1
-                while j < topKCount && best[j] < v { best[j - 1] = best[j]; j += 1 }
-                best[j - 1] = v
-                thr = best[0]
+// Three very different k. The GPU radix select reads the column twice whatever k is; the CPU baseline's
+// running top-k degrades as k grows, because its insertion is linear in k.
+for topKCount in [100, 10_000, 100_000] {
+    sec = "top_k(\(topKCount) of \(rows) Int64)"; print("\n" + sec)
+    try time("Metal  top_k (GPU radix select)", bytes: rows * 8, section: sec) { sink(try sortI64.topK(topKCount)) }
+    time("CPU \(cores)-core top_k (per-core running top-k)", bytes: rows * 8, section: sec) {
+        let p = opaque(sortI64).valuePointer
+        let parts = parallelChunks(rows) { lo, hi -> [Int64] in
+            var best = [Int64](repeating: Int64.min, count: topKCount)
+            var thr = Int64.min
+            for i in lo..<hi {
+                let v = p[i]
+                if v > thr {
+                    var j = 1
+                    while j < topKCount && best[j] < v { best[j - 1] = best[j]; j += 1 }
+                    best[j - 1] = v
+                    thr = best[0]
+                }
             }
+            return best
         }
-        return best
+        sink(parts.flatMap { $0 }.sorted().suffix(topKCount))
     }
-    sink(parts.flatMap { $0 }.sorted().suffix(topKCount))
+}
+
+// quantile is the same selection, but only the key at one rank is wanted, so the winners are counted and
+// never written and the bin is finished on the host.
+sec = "quantile(0.5) of \(rows) Int64"; print("\n" + sec)
+try time("Metal  quantile (GPU radix select)", bytes: rows * 8, section: sec) { sink(try sortI64.quantile(0.5)) }
+time("CPU 1-core median (sort then index)", bytes: rows * 8, section: sec) {
+    var v = [Int64](UnsafeBufferPointer(start: opaque(sortI64).valuePointer, count: rows))
+    v.sort()
+    sink(v[rows / 2])
 }
 
 // ---------------------------------------------------------------------------------------------------

@@ -95,6 +95,207 @@ final class TopKTests: XCTestCase {
         XCTAssertEqual(bottom, Array(vals.sorted().prefix(50)))
     }
 
+    // MARK: - Radix select (Kernels/RadixSelect.swift)
+    //
+    // `topK` picks between three implementations by (n, k); these check the answer against the CPU oracle
+    // both through `topK` and through the radix-select entry point directly, so a routing change cannot
+    // quietly stop covering a path.
+
+    /// Both the routed answer and the radix-select path, against the oracle.
+    private func checkPaths<T: ArrowPrimitive>(_ vals: [T?], _ k: Int, largest: Bool, _ label: String,
+                                               file: StaticString = #filePath, line: UInt = #line) throws {
+        let a = try MetalArray<T>(vals)
+        let want = cpuTopK(vals, k, largest: largest)
+        XCTAssertEqual(try a.topK(k, largest: largest).toRawArray(), want, "topK \(label)", file: file, line: line)
+        // Nil means the path declined (k close to n, or fewer than k non-null rows): the sort answers those.
+        if let direct = try a.topKRadixSelect(k, largest: largest) {
+            XCTAssertEqual(direct.toRawArray(), want, "radix \(label)", file: file, line: line)
+        }
+    }
+
+    /// Every key type, both directions, every null ratio, over the shapes that straddle the sub-block,
+    /// threadgroup and candidate-budget boundaries.
+    func testRadixSelectAllTypesAndDirections() throws {
+        try requireRealGPU()
+        var rng = Rng(s: 0xF00D)
+        for n in [1, 33, 4097] {
+            for nullRatio in [0.0, 0.1, 0.5, 0.99] {
+                func nulled<V>(_ make: (Int) -> V) -> [V?] {
+                    (0..<n).map { i in Double.random(in: 0..<1, using: &rng) < nullRatio ? nil : make(i) }
+                }
+                for k in [1, 17, 100, 1024, 1025] where k <= n {
+                    for largest in [true, false] {
+                        let label = "n=\(n) k=\(k) nulls=\(nullRatio) largest=\(largest)"
+                        try checkPaths(nulled { _ in Int8.random(in: .min ... .max, using: &rng) }, k, largest: largest, "i8 " + label)
+                        try checkPaths(nulled { _ in UInt8.random(in: .min ... .max, using: &rng) }, k, largest: largest, "u8 " + label)
+                        try checkPaths(nulled { _ in Int16.random(in: .min ... .max, using: &rng) }, k, largest: largest, "i16 " + label)
+                        try checkPaths(nulled { _ in UInt16.random(in: .min ... .max, using: &rng) }, k, largest: largest, "u16 " + label)
+                        try checkPaths(nulled { _ in Int32.random(in: .min ... .max, using: &rng) }, k, largest: largest, "i32 " + label)
+                        try checkPaths(nulled { _ in UInt32.random(in: .min ... .max, using: &rng) }, k, largest: largest, "u32 " + label)
+                        try checkPaths(nulled { _ in Int64.random(in: .min ... .max, using: &rng) }, k, largest: largest, "i64 " + label)
+                        try checkPaths(nulled { _ in UInt64.random(in: .min ... .max, using: &rng) }, k, largest: largest, "u64 " + label)
+                        try checkPaths(nulled { i in i % 97 == 0 ? Float.nan : Float.random(in: -1e6...1e6, using: &rng) },
+                                       k, largest: largest, "f32 " + label)
+                        try checkPaths(nulled { i in i % 89 == 0 ? Double.nan : Double.random(in: -1e9...1e9, using: &rng) },
+                                       k, largest: largest, "f64 " + label)
+                    }
+                }
+            }
+        }
+        // n = 0: every k answers with an empty result.
+        XCTAssertEqual(try MetalArray<Int64>([Int64]()).topK(1).length, 0)
+        XCTAssertEqual(try MetalArray<Double>([Double]()).topK(100, largest: false).length, 0)
+    }
+
+    /// A million rows: k on both sides of the selection kernel's 1024 limit, up to k = n, and k = n - 1 and
+    /// k = n, which no selection path can shortcut.
+    func testRadixSelectLargeShapes() throws {
+        try requireRealGPU()
+        var rng = Rng(s: 0xC0FFEE)
+        let n = 1_000_003
+        let i64 = try MetalArray<Int64>((0..<n).map { _ in Int64.random(in: .min ... .max, using: &rng) })
+        let f64 = try MetalArray<Double>((0..<n).map { i in
+            i % 2003 == 0 ? Double.nan : Double.random(in: -1e9...1e9, using: &rng)
+        })
+        let nullable = try MetalArray<Int64>((0..<n).map { i in
+            i % 10 == 0 ? nil : Int64.random(in: .min ... .max, using: &rng)
+        })
+        // At this size the oracle is the full argsort — the definition `topK` has to match — which the CPU
+        // oracle in the stress test below independently pins down at the smaller sizes.
+        func both<T: ArrowPrimitive>(_ a: MetalArray<T>, _ k: Int, _ largest: Bool, _ label: String) throws {
+            let want = try viaSort(a, k, largest: largest)
+            XCTAssertEqual(try a.topK(k, largest: largest).toRawArray(), want, "topK " + label)
+            if let direct = try a.topKRadixSelect(k, largest: largest) {
+                XCTAssertEqual(direct.toRawArray(), want, "radix " + label)
+            }
+        }
+        for k in [1, 17, 100, 1024, 1025, 10_000, 100_000, n - 1, n] {
+            for largest in [true, false] {
+                let label = "n=\(n) k=\(k) largest=\(largest)"
+                try both(i64, k, largest, "i64 " + label)
+                if k <= 100_000 {        // k near n falls back to the sort for every type; once is enough
+                    try both(f64, k, largest, "f64 " + label)
+                    try both(nullable, k, largest, "i64-nulls " + label)
+                }
+            }
+        }
+    }
+
+    /// Data the histogram cannot split: three distinct values, every value the same, and the float values
+    /// the key deliberately merges.
+    func testRadixSelectTiesAndSpecialValues() throws {
+        try requireRealGPU()
+        var rng = Rng(s: 0x7E5)
+        for n in [4097, 300_007] {
+            let three: [Int64?] = (0..<n).map { _ in [Int64.min, 0, Int64.max].randomElement(using: &rng)! }
+            let same = [Int64?](repeating: 42, count: n)
+            let sameNulls: [Int64?] = (0..<n).map { i in i % 3 == 0 ? nil : 42 }
+            for k in [1, 17, 1024, 10_000] where k <= n / 2 {
+                for largest in [true, false] {
+                    try checkPaths(three, k, largest: largest, "3-distinct n=\(n) k=\(k) largest=\(largest)")
+                    try checkPaths(same, k, largest: largest, "all-equal n=\(n) k=\(k) largest=\(largest)")
+                    try checkPaths(sameNulls, k, largest: largest, "all-equal+nulls n=\(n) k=\(k) largest=\(largest)")
+                }
+            }
+        }
+        // -0.0 ties with +0.0 and every NaN is one value after +inf, in both directions.
+        let odd: [Double?] = (0..<20_000).map { i in
+            switch i % 5 {
+            case 0: return -0.0
+            case 1: return 0.0
+            case 2: return Double.nan
+            case 3: return i % 10 == 3 ? Double.infinity : -Double.infinity
+            default: return Double(i % 7) - 3
+            }
+        }
+        let oddF: [Float?] = odd.map { $0.map { Float($0) } }
+        for k in [1, 17, 1024, 5000] {
+            for largest in [true, false] {
+                try checkPaths(odd, k, largest: largest, "f64-odd k=\(k) largest=\(largest)")
+                try checkPaths(oddF, k, largest: largest, "f32-odd k=\(k) largest=\(largest)")
+            }
+        }
+    }
+
+    /// 50M rows, the size the benchmark and the performance target are stated at. Release-only and opt-in:
+    /// set `ARROWMETAL_BIG=1`.
+    func testRadixSelectFiftyMillionRows() throws {
+        guard ProcessInfo.processInfo.environment["ARROWMETAL_BIG"] != nil else { return }
+        try requireRealGPU()
+        var rng = Rng(s: 0x5150)
+        let n = 50_000_000
+        var raw = [Int64](repeating: 0, count: n)
+        for i in 0..<n { raw[i] = Int64(bitPattern: rng.next()) }
+        let a = try MetalArray<Int64>(raw)
+        // The oracle here is the full argsort, which is the definition `topK` has to match.
+        for k in [1, 100, 1024, 1025, 10_000, 100_000] {
+            for largest in [true, false] {
+                let want = try a.argsort(descending: largest).slice(offset: 0, length: k).toRawArray()
+                XCTAssertEqual(try a.topK(k, largest: largest).toRawArray(), want, "n=\(n) k=\(k) largest=\(largest)")
+            }
+        }
+    }
+
+    // MARK: - kthElement and the quantile that rides on it
+
+    func testKthElementMatchesSortedValue() throws {
+        try requireRealGPU()
+        var rng = Rng(s: 0x0BADF00D)
+        func check<T: ArrowPrimitive>(_ vals: [T?], _ label: String) throws {
+            let a = try MetalArray<T>(vals)
+            let sortedAsc = try a.sorted().toRawArray()
+            let sortedDesc = try a.sorted(descending: true).toRawArray()
+            let m = a.validCount
+            guard m > 0 else {
+                XCTAssertNil(try a.kthElement(1), label)
+                return
+            }
+            for r in Set([1, 2, 3, m / 2, m - 1, m].filter { $0 >= 1 && $0 <= m }) {
+                XCTAssertEqual(try a.kthElement(r)?.asDouble, sortedAsc[r - 1].asDouble, "\(label) asc rank \(r)")
+                XCTAssertEqual(try a.kthElement(r, largest: true)?.asDouble, sortedDesc[r - 1].asDouble,
+                               "\(label) desc rank \(r)")
+            }
+            XCTAssertNil(try a.kthElement(0), label)
+            XCTAssertNil(try a.kthElement(m + 1), label)
+        }
+        for n in [1, 33, 4097, 200_003] {
+            try check((0..<n).map { _ in Int64.random(in: .min ... .max, using: &rng) as Int64? }, "i64 n=\(n)")
+            try check((0..<n).map { i in i % 7 == 0 ? nil : Int32.random(in: -1000...1000, using: &rng) }, "i32-nulls n=\(n)")
+            try check((0..<n).map { _ in Double.random(in: -1e9...1e9, using: &rng) as Double? }, "f64 n=\(n)")
+            try check((0..<n).map { _ in UInt8.random(in: .min ... .max, using: &rng) as UInt8? }, "u8 n=\(n)")
+            try check([Int64?](repeating: 7, count: n), "all-equal n=\(n)")
+        }
+        try check([Int64?](), "empty")
+        try check([Int64?](repeating: nil, count: 100), "all-null")
+    }
+
+    /// `quantile` now selects instead of sorting; it has to answer exactly what the sort answered.
+    func testQuantileMatchesTheSortedAnswer() throws {
+        try requireRealGPU()
+        var rng = Rng(s: 0x9_1A5)
+        for n in [4096, 4097, 100_003] {
+            let d: [Double?] = (0..<n).map { i in i % 11 == 0 ? nil : Double.random(in: -1e9...1e9, using: &rng) }
+            let i64: [Int64?] = (0..<n).map { i in i % 13 == 0 ? nil : Int64.random(in: -1_000_000...1_000_000, using: &rng) }
+            let da = try MetalArray<Double>(d), ia = try MetalArray<Int64>(i64)
+            for q in [0.0, 0.001, 0.25, 0.5, 0.75, 0.999, 1.0] {
+                XCTAssertEqual(try da.quantile(q)!, sortedQuantile(d.compactMap { $0 }, q), accuracy: 1e-9,
+                               "f64 n=\(n) q=\(q)")
+                XCTAssertEqual(try ia.quantile(q)!, sortedQuantile(i64.compactMap { $0 }.map(Double.init), q), accuracy: 1e-9,
+                               "i64 n=\(n) q=\(q)")
+            }
+            XCTAssertEqual(try da.approximateMedian()!, sortedQuantile(d.compactMap { $0 }, 0.5), accuracy: 1e-9)
+        }
+    }
+
+    /// The definition `quantile` has always had: sort, then read the interpolated position.
+    private func sortedQuantile(_ vals: [Double], _ q: Double) -> Double {
+        let s = vals.sorted()
+        let position = Swift.max(0, Swift.min(1, q)) * Double(s.count - 1)
+        let lo = Int(position.rounded(.down)), hi = Int(position.rounded(.up))
+        if lo == hi { return s[lo] }
+        return s[lo] + (s[hi] - s[lo]) * (position - Double(lo))
+    }
+
     // MARK: - Randomised stress against a CPU oracle
     //
     // `topKSelect` was once seen to disagree with pyarrow on one cell of a 13k-case differential run and
@@ -109,6 +310,10 @@ final class TopKTests: XCTestCase {
     /// Order-preserving 64-bit key, and a NaN flag, matching `TopKSource.tk_map` / `SortSource`.
     private static func oracleKey<T: ArrowPrimitive>(_ v: T) -> (key: UInt64, nan: Bool) {
         switch v {
+        case let x as Int8: return (UInt64(UInt8(bitPattern: x) ^ 0x80), false)
+        case let x as UInt8: return (UInt64(x), false)
+        case let x as Int16: return (UInt64(UInt16(bitPattern: x) ^ 0x8000), false)
+        case let x as UInt16: return (UInt64(x), false)
         case let x as Int32: return (UInt64(UInt32(bitPattern: x) ^ 0x8000_0000), false)
         case let x as UInt32: return (UInt64(x), false)
         case let x as Int64: return (UInt64(bitPattern: x) ^ 0x8000_0000_0000_0000, false)
@@ -153,16 +358,19 @@ final class TopKTests: XCTestCase {
     private func checkAgainstCPU<T: ArrowPrimitive>(_ vals: [T?], _ k: Int, largest: Bool, _ label: String,
                                                     file: StaticString = #filePath, line: UInt = #line) throws {
         let a = try MetalArray<T>(vals)
-        let got = try a.topK(k, largest: largest).toRawArray()
         let want = cpuTopK(vals, k, largest: largest)
-        if got != want {
+        func compare(_ got: [Int32], _ via: String) {
+            guard got != want else { return }
             var where_ = "lengths \(got.count) vs \(want.count)"
             for i in 0..<Swift.min(got.count, want.count) where got[i] != want[i] {
                 where_ = "first mismatch at \(i): got \(got[i]) want \(want[i])"
                 break
             }
-            XCTFail("\(label): \(where_)\ngot  \(got.prefix(24))\nwant \(want.prefix(24))", file: file, line: line)
+            XCTFail("\(label) [\(via)]: \(where_)\ngot  \(got.prefix(24))\nwant \(want.prefix(24))", file: file, line: line)
         }
+        compare(try a.topK(k, largest: largest).toRawArray(), "topK")
+        // Whatever the routing picked, the radix-select path has to agree wherever it applies.
+        if let direct = try a.topKRadixSelect(k, largest: largest) { compare(direct.toRawArray(), "radix") }
     }
 
     /// Kernels run between two top-k calls so the buffer pool hands back recycled, dirty memory.
@@ -194,7 +402,9 @@ final class TopKTests: XCTestCase {
             let failingShape = it % 4 == 0
             let n = failingShape ? 100_003 : [1, 2, 17, 255, 256, 257, 1023, 4096, 32_768, 32_769,
                                               100_003, 262_144, 1_000_003].randomElement(using: &rng)!
-            let k = failingShape ? 17 : Swift.max(1, Swift.min(1024, [1, 2, 3, 17, 64, 255, 256, 257, 1000, 1024]
+            // k spans both sides of the per-threadgroup kernel's 1024 limit so the radix path is exercised too.
+            let k = failingShape ? 17 : Swift.max(1, Swift.min(n, [1, 2, 3, 17, 64, 255, 256, 257, 1000, 1024,
+                                                                   1025, 4096, 10_000, 100_000]
                                                     .randomElement(using: &rng)!))
             guard k <= n else { continue }
             let nullRatio = failingShape ? 0.3 : [0.0, 0.05, 0.3, 0.5, 0.9].randomElement(using: &rng)!
