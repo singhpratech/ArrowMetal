@@ -963,3 +963,97 @@ def _am_cast(self, target):
 
 
 MetalArray.cast = _am_cast
+# ---- window, pairwise, rolling-window and multi-column sort entry points
+_lib.am_window.argtypes = [_P, ctypes.c_int, ctypes.c_int64, ctypes.c_int64, _P, ctypes.POINTER(_P)]
+_lib.am_window.restype = ctypes.c_int
+_lib.am_lexsort.argtypes = [ctypes.POINTER(_P), ctypes.POINTER(ctypes.c_int), ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_lexsort.restype = ctypes.c_int
+
+# Op numbering is the C ABI contract; see include/arrowmetal.h.
+_WINDOW = {"row_number": 0, "rank": 1, "dense_rank": 2, "percent_rank": 3, "cume_dist": 4,
+           "shift": 5, "pairwise_diff": 6, "cumulative_prod": 7, "cumulative_mean": 8,
+           "rolling_sum": 9, "rolling_min": 10, "rolling_max": 11, "rolling_mean": 12}
+
+
+def _window(self, op, p1=0, p2=0, scalar=None):
+    """One window / shift / pairwise / rolling op by name; the table is in include/arrowmetal.h."""
+    return _call(_lib.am_window, self._h, _WINDOW[op], p1, p2, scalar)
+
+
+MetalArray.window = _window
+MetalArray._window = _window
+
+
+def _no_arg_window(op, doc):
+    def f(self):
+        return self._window(op)
+    f.__name__ = op
+    f.__doc__ = doc
+    return f
+
+
+# The ranking functions take no arguments and rank ascending with nulls last, SQL-style: nulls sort
+# after every value and form one tie group, so none of them ever returns a null.
+for _op, _doc in [
+    ("row_number", "SQL ROW_NUMBER(): 1-based position in sorted order, aligned to the original rows."),
+    ("rank", "SQL RANK(): the position of the first row of each tie group, so ranks skip after a tie."),
+    ("dense_rank", "SQL DENSE_RANK(): 1-based index of each distinct value, with no gaps."),
+    ("percent_rank", "SQL PERCENT_RANK(): (rank - 1) / (n - 1) as float64, 0 for a single row."),
+    ("cume_dist", "SQL CUME_DIST(): the fraction of rows at or before this row's value, as float64."),
+    ("cumulative_prod", "Arrow cumulative_prod: running product, null exactly where the input is null."),
+    ("cumulative_mean", "Arrow cumulative_mean: running mean of the non-null values so far, as float64."),
+]:
+    setattr(MetalArray, _op, _no_arg_window(_op, _doc))
+del _op, _doc
+
+
+def _shift(self, by, fill=None):
+    """Lag (positive `by`) or lead (negative one): out[i] = self[i - by]. A row that would read outside
+    the array takes `fill`, or becomes null when `fill` is None."""
+    return self._window("shift", p1=by, scalar=None if fill is None else self._scalar(fill))
+
+
+def _pairwise_diff(self, period=1):
+    """Arrow pairwise_diff: out[i] = self[i] - self[i - period], null where either side is missing."""
+    return self._window("pairwise_diff", p1=period)
+
+
+def _rolling(op):
+    def f(self, window, min_periods=None):
+        return self._window(op, p1=window, p2=0 if min_periods is None else min_periods)
+    f.__name__ = op
+    f.__doc__ = ("Trailing rolling %s over `window` rows ending at each output, null until `min_periods` "
+                 "non-null rows are in the window (which defaults to the whole window). min and max scan "
+                 "the window; sum and mean are O(n) prefix-sum differences, so one NaN or infinity in a "
+                 "float column affects every later window." % op.split("_")[1])
+    return f
+
+
+MetalArray.shift = _shift
+MetalArray.pairwise_diff = _pairwise_diff
+for _op in ("rolling_sum", "rolling_min", "rolling_max", "rolling_mean"):
+    setattr(MetalArray, _op, _rolling(_op))
+del _op
+
+
+def lexsort_indices(columns, descending=None):
+    """Multi-column (lexicographic) sort: int32 indices ordering the rows by each column in turn, the
+    first column being the most significant.
+
+    `descending` is one flag per column, or None for all ascending. Successive stable GPU radix argsorts
+    from the least significant key upwards; nulls come last in every key, in both directions.
+
+        idx = am.lexsort_indices([region, revenue], [False, True])
+        region.take(idx), revenue.take(idx)
+    """
+    cols = [c if isinstance(c, MetalArray) else MetalArray.from_arrow(c) for c in columns]
+    if not cols:
+        raise ArrowMetalError("lexsort needs at least one column")
+    flags = descending if descending is not None else [False] * len(cols)
+    if len(flags) != len(cols):
+        raise ArrowMetalError(f"descending has {len(flags)} entries for {len(cols)} columns")
+    handles = (_P * len(cols))(*[c._h for c in cols])
+    desc = (ctypes.c_int * len(cols))(*[1 if d else 0 for d in flags])
+    out = _P()
+    _check(_lib.am_lexsort(handles, desc, len(cols), ctypes.byref(out)))
+    return MetalArray(out)

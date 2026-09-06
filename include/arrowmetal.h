@@ -334,6 +334,54 @@ int  am_parse(am_array* a, const char* format, int strict, am_array** out);
 // an error on date32, whose tick is a whole day.
 int  am_temporal_math(am_array* a, int op, int64_t p1, am_array* b /* or NULL */, am_array** out);
 
+// ---------------------------------------------------------------------------------------------------
+// Window functions, shifts, pairwise differences, running products/means and rolling windows (all GPU).
+//
+// am_window op numbering, and what p1 / p2 / scalar_or_null mean for each:
+//
+//   op  name              p1              p2            scalar_or_null   output   notes
+//   --  ----------------  --------------  ------------  ---------------  -------  --------------------
+//    0  row_number        -               -             -                int32    1-based, sort order
+//    1  rank              -               -             -                int32    min rank of a tie
+//    2  dense_rank        -               -             -                int32    no gaps
+//    3  percent_rank      -               -             -                float64  (rank - 1)/(n - 1)
+//    4  cume_dist         -               -             -                float64  rows <= value, / n
+//    5  shift             by (lag > 0)    -             fill or NULL     input    NULL fill = nulls
+//    6  pairwise_diff     period          -             -                input    a[i] - a[i - period]
+//    7  cumulative_prod   -               -             -                input    running product
+//    8  cumulative_mean   -               -             -                float64  running mean
+//    9  rolling_sum       window          min_periods   -                input    trailing window
+//   10  rolling_min       window          min_periods   -                input
+//   11  rolling_max       window          min_periods   -                input
+//   12  rolling_mean      window          min_periods   -                float64
+//
+// Ranking (ops 0-4) is one GPU argsort plus a scan, and the answer comes back aligned to the original
+// rows. Nulls follow SQL `ORDER BY x NULLS LAST`: they sort after every value and form one tie group, so
+// row_number numbers them last in row order, rank and dense_rank give them all one rank, and no ranking
+// result is itself null. Float ties use Arrow value equality: every NaN is one value (after +inf) and
+// -0.0 equals 0.0.
+//
+// Ops 5 and 6 are null-propagating: a row that reads outside the array is null (or takes the shift's
+// fill scalar, a pointer to one value of the array's element type), and pairwise_diff is null wherever
+// either side is. A negative p1 leads rather than lags.
+//
+// Ops 7 and 8 skip nulls the way am_cumulative does: the output is null exactly where the input is and
+// the running value carries across unchanged. Integer products wrap; float32 and float64 reassociate.
+// cumulative_mean converts to binary64 first, so int64 magnitudes above 2^53 round on the way in.
+//
+// Rolling windows (ops 9-12) are trailing: the window ending at row i covers rows [i - window + 1, i].
+// p2 = min_periods is how many non-null rows the window needs before a value is produced; 0 or less
+// means "the whole window". min and max scan the window (O(n * window), NaN skipped, an all-NaN window
+// giving +/-inf); sum and mean are the difference of two prefix sums, so they are O(n) but a NaN or
+// infinity anywhere in a float column poisons every later window.
+int  am_window(am_array* a, int op, int64_t p1, int64_t p2, const void* scalar_or_null, am_array** out);
+
+// Multi-column (lexicographic) sort: int32 indices ordering the rows by each column in turn, the first
+// column being the most significant. `descending` has one entry per column, or may be NULL for all
+// ascending. Successive stable radix argsorts from the least significant key upwards; nulls come last in
+// every key whichever direction it is sorted in. utf8, binary and dictionary columns are not sortable.
+int  am_lexsort(am_array** columns, const int* descending, int64_t count, am_array** out);
+
 #ifdef __cplusplus
 }
 #endif
