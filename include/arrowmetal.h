@@ -176,6 +176,95 @@ int  am_binary(am_array* a, int op, am_array* b /* or NULL */, const void* scala
 // Two-level GPU scan; integer sums wrap and are exact, float sums reassociate.
 int  am_cumulative(am_array* a, int op, am_array** out);
 
+// ---------------------------------------------------------------------------------------------------
+// Regular expressions, SQL LIKE and splitting (utf8 in).
+//
+// Matching runs on the CPU (ICU, via NSRegularExpression), sharded across cores. A pattern with no
+// metacharacter (none of \ . [ ] { } ( ) * + ? ^ $ |) is routed to the existing byte-wise GPU kernels
+// instead, as is a `^literal` pattern (ICU's `^` is exactly "start of input") and a LIKE pattern whose
+// only wildcards are a leading and/or trailing `%`. A trailing `$` deliberately stays on the CPU:
+// ICU's `$` also matches immediately before a final line terminator, so `abc$` matches "abc\n" while
+// ends_with("abc") does not.
+//
+// `pattern` is the regular expression, the literal separator (ops 5/6) or the LIKE pattern (op 4).
+// `repl` is the ICU replacement template for op 3 and the capture-group name for op 9. `flags` bit 0
+// requests case-insensitive matching. Anything an op does not use may be NULL / 0.
+//
+//  op  name                        args                                  output  notes
+//  --  --------------------------  ------------------------------------  ------  --------------------
+//   0  match_substring_regex       pattern                               bool    unanchored search
+//   1  count_substring_regex       pattern                               int32   non-overlapping
+//   2  find_substring_regex        pattern                               int32   byte offset, -1 absent
+//   3  replace_substring_regex     pattern, repl = ICU template          utf8    every match; groups
+//                                                                                are $1, $2 (not \1)
+//   4  match_like                  pattern = SQL LIKE (% and _)          bool    \ escapes % _ \
+//   5  split_pattern values        pattern = literal separator           utf8    the flattened pieces
+//   6  split_pattern offsets       pattern = literal separator           int32   n+1 list offsets
+//   7  split_whitespace values     -                                     utf8    runs of ASCII space
+//   8  split_whitespace offsets    -                                     int32   n+1 list offsets
+//   9  extract_regex               pattern, repl = group name            utf8    one named group;
+//                                                                                null where no match
+//  10  split_pattern_regex values  pattern                               utf8
+//  11  split_pattern_regex offsets pattern                               int32   n+1 list offsets
+//
+// ArrowMetal has no list type, so a split is returned as the (values, offsets) pair of an Arrow
+// list<utf8>: row i owns values[offsets[i] .. offsets[i+1]). Call the op twice, once for each half.
+// A null input row owns no pieces and its two offsets are equal.
+int  am_regex(am_array* a, int op, const uint8_t* pattern, int64_t len,
+              const uint8_t* repl, int64_t rlen, int flags, am_array** out);
+
+// Casts between utf8 and the numeric and boolean types.
+//
+// am_to_strings is Arrow `cast(utf8)` over a primitive or boolean array. Integers are formatted on the
+// GPU (two passes: digit counts, prefix scan into the offsets buffer, then the digits) with no leading
+// zeros and no separators; INT64_MIN and UINT64_MAX are exact. Floats are formatted on the CPU as the
+// shortest decimal string that round-trips, which differs from Arrow in two documented ways: a whole
+// value keeps a ".0" (1.0, not 1) and the exponent form is Swift's (1e+20). Booleans give "true" /
+// "false". Nulls stay null and emit no bytes.
+int  am_to_strings(am_array* a, am_array** out);
+
+// am_parse does three things, chosen by the input type and the format string:
+//   * a is utf8 and format is one of "c C s S i I l L f g b" -> Arrow `cast` to that type. Integers
+//     parse on the GPU; the whole value must match [+-]?[0-9]+ (leading zeros fine, no whitespace, no
+//     radix prefix, no exponent) and a "-" is rejected for an unsigned target. Floats and bools parse
+//     on the CPU; a bool is "true"/"false"/"1"/"0", case-insensitively. A value that does not parse,
+//     or that is out of the target's range, comes back null unless `strict` is non-zero, which makes
+//     it an error instead.
+//   * a is utf8 and format is anything else -> `strptime` with that C format, UTC, producing
+//     timestamp[us]; rescale afterwards with am_temporal_cast_unit. The whole value must be consumed.
+//     Fields the format does not mention default to 1970-01-01 00:00:00.
+//   * a is temporal -> `strftime` with that C format, UTC, producing utf8. %f is an ArrowMetal
+//     extension expanding to the six-digit fractional second. `strict` is ignored.
+int  am_parse(am_array* a, const char* format, int strict, am_array** out);
+
+// Temporal rounding, arithmetic and the calendar fields am_temporal_extract does not cover. All GPU,
+// all UTC; a timestamp's timezone rides along as metadata and is never applied.
+//
+//  op  name             extra args                        output       notes
+//  --  ---------------  --------------------------------  -----------  ----------------------------
+//   0  floor_temporal   p1 = unit | (multiple << 8)        same type    largest multiple <= value
+//   1  ceil_temporal    p1 = unit | (multiple << 8)        same type    a value on a boundary stays
+//   2  round_temporal   p1 = unit | (multiple << 8)        same type    halves go up (+infinity)
+//   3  add_duration     b = duration column, or p1 ticks   same type    b is rescaled to a's unit
+//   4  subtract         b = same family                    duration     finer of the two units
+//   5  days_between     b = date-carrying column           int64        whole UTC days, a -> b
+//   6  quarter          -                                  int32        1-4
+//   7  day_of_year      -                                  int32        1-based
+//   8  iso_week         -                                  int32        ISO 8601, 1-53
+//   9  iso_year         -                                  int32        ISO 8601 week-numbering year
+//  10  is_leap_year     -                                  bool
+//  11  millisecond      -                                  int32        since the last full second
+//  12  microsecond      -                                  int32        since the last full ms
+//  13  nanosecond       -                                  int32        since the last full us
+//
+// Rounding units for p1's low byte: 0 nanosecond, 1 microsecond, 2 millisecond, 3 second, 4 minute,
+// 5 hour, 6 day, 7 month, 8 quarter, 9 year. A multiple of 0 means 1. Units 0-6 are fixed length and
+// round by integer arithmetic in the value's own resolution — rounding to a unit finer than that
+// resolution is the identity. Units 7-9 go through the civil calendar and need a column that carries
+// a date (date32, date64, timestamp); a duration or a time-of-day column is an error. add_duration is
+// an error on date32, whose tick is a whole day.
+int  am_temporal_math(am_array* a, int op, int64_t p1, am_array* b /* or NULL */, am_array** out);
+
 #ifdef __cplusplus
 }
 #endif

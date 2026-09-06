@@ -607,3 +607,214 @@ def coalesce(*arrays):
     out = _P()
     _check(_lib.am_coalesce(handles, len(arrays), ctypes.byref(out)))
     return MetalArray(out)
+
+
+# ---- regex, string <-> number casts, temporal rounding and arithmetic
+# Appended rather than written into the class body so the file stays additive.
+# Op numbering is the C ABI contract; see include/arrowmetal.h.
+import re as _re
+
+_lib.am_regex.argtypes = [_P, ctypes.c_int, ctypes.c_char_p, ctypes.c_int64,
+                          ctypes.c_char_p, ctypes.c_int64, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_regex.restype = ctypes.c_int
+_lib.am_to_strings.argtypes = [_P, ctypes.POINTER(_P)]
+_lib.am_to_strings.restype = ctypes.c_int
+_lib.am_parse.argtypes = [_P, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_parse.restype = ctypes.c_int
+_lib.am_temporal_math.argtypes = [_P, ctypes.c_int, ctypes.c_int64, _P, ctypes.POINTER(_P)]
+_lib.am_temporal_math.restype = ctypes.c_int
+
+_REGEX = {"match_substring_regex": 0, "count_substring_regex": 1, "find_substring_regex": 2,
+          "replace_substring_regex": 3, "match_like": 4,
+          "split_pattern_values": 5, "split_pattern_offsets": 6,
+          "split_whitespace_values": 7, "split_whitespace_offsets": 8,
+          "extract_regex": 9, "split_pattern_regex_values": 10, "split_pattern_regex_offsets": 11}
+_TEMPORAL_MATH = {"floor": 0, "ceil": 1, "round": 2, "add_duration": 3, "subtract": 4,
+                  "days_between": 5, "quarter": 6, "day_of_year": 7, "iso_week": 8, "iso_year": 9,
+                  "is_leap_year": 10, "millisecond": 11, "microsecond": 12, "nanosecond": 13}
+_ROUND_UNITS = ["nanosecond", "microsecond", "millisecond", "second", "minute", "hour",
+                "day", "month", "quarter", "year"]
+_PARSE_FORMATS = {"int8": "c", "uint8": "C", "int16": "s", "uint16": "S", "int32": "i", "uint32": "I",
+                  "int64": "l", "uint64": "L", "float": "f", "float32": "f", "double": "g",
+                  "float64": "g", "bool": "b", "boolean": "b"}
+# The (?<name>...) groups of a pattern, in order. ICU spells named groups this way; RE2 (and so
+# pyarrow) writes (?P<name>...), which is not accepted here.
+_NAMED_GROUP = _re.compile(r"\(\?<([A-Za-z_][A-Za-z0-9_]*)>")
+
+
+def _am_regex_call(self, op, pattern="", repl="", ignore_case=False):
+    p = pattern.encode("utf-8") if isinstance(pattern, str) else bytes(pattern)
+    r = repl.encode("utf-8") if isinstance(repl, str) else bytes(repl)
+    return _call(_lib.am_regex, self._h, _REGEX[op], p, len(p), r, len(r), 1 if ignore_case else 0)
+
+
+def _am_match_substring_regex(self, pattern, ignore_case=False):
+    """Arrow `match_substring_regex`: boolean array, true where the pattern matches anywhere.
+    A pattern with no metacharacter (or `^literal`) runs on the GPU; anything else on the CPU."""
+    return _am_regex_call(self, "match_substring_regex", pattern, ignore_case=ignore_case)
+
+
+def _am_count_substring_regex(self, pattern, ignore_case=False):
+    """int32 count of non-overlapping matches per value."""
+    return _am_regex_call(self, "count_substring_regex", pattern, ignore_case=ignore_case)
+
+
+def _am_find_substring_regex(self, pattern, ignore_case=False):
+    """int32 byte offset of the first match, -1 when there is none."""
+    return _am_regex_call(self, "find_substring_regex", pattern, ignore_case=ignore_case)
+
+
+def _am_replace_substring_regex(self, pattern, replacement, ignore_case=False):
+    """Arrow `replace_substring_regex`, every match. The replacement is an ICU template: capture
+    groups are $1, $2 ... (RE2, and so pyarrow, writes \\1, \\2)."""
+    return _am_regex_call(self, "replace_substring_regex", pattern, replacement, ignore_case=ignore_case)
+
+
+def _am_extract_regex(self, pattern, ignore_case=False):
+    """Arrow `extract_regex` as a dict of {group name: MetalArray}. The pattern needs at least one
+    (?<name>...) group; a row that does not match is null in every column."""
+    names = []
+    for name in _NAMED_GROUP.findall(pattern):
+        if name not in names:
+            names.append(name)
+    if not names:
+        raise ArrowMetalError("extract_regex needs at least one named group, e.g. (?<year>\\d+)")
+    return {n: _am_regex_call(self, "extract_regex", pattern, n, ignore_case=ignore_case) for n in names}
+
+
+def _am_match_like(self, pattern, ignore_case=False):
+    """Arrow `match_like`: SQL LIKE, `%` for any run of characters and `_` for exactly one; a
+    backslash escapes them. A pure prefix / suffix / contains / equality pattern runs on the GPU."""
+    return _am_regex_call(self, "match_like", pattern, ignore_case=ignore_case)
+
+
+def _am_split_pattern(self, pattern, regex=False, ignore_case=False):
+    """Splits each value, returning the (offsets, values) pair of an Arrow list<utf8>: row i owns
+    values[offsets[i]:offsets[i + 1]]. ArrowMetal has no list type, hence the pair."""
+    kind = "split_pattern_regex" if regex else "split_pattern"
+    offsets = _am_regex_call(self, kind + "_offsets", pattern, ignore_case=ignore_case)
+    values = _am_regex_call(self, kind + "_values", pattern, ignore_case=ignore_case)
+    return offsets, values
+
+
+def _am_split_whitespace(self):
+    """Splits on runs of ASCII whitespace, as Python's str.split() does. Returns (offsets, values)."""
+    return (_am_regex_call(self, "split_whitespace_offsets"),
+            _am_regex_call(self, "split_whitespace_values"))
+
+
+def _am_to_strings(self):
+    """Arrow `cast(utf8)`: the decimal text of every value. Integers format on the GPU; floats and
+    booleans on the CPU. A float keeps its `.0` (1.0, not 1) and uses Swift's exponent form."""
+    return _call(_lib.am_to_strings, self._h)
+
+
+def _am_parse(self, target, strict=False):
+    """Arrow `cast` from utf8 to a numeric or boolean type. Integers parse on the GPU: the whole
+    value must match [+-]?[0-9]+. A value that does not parse is null, or an error when strict."""
+    name = target if isinstance(target, str) else str(target)
+    fmt = name if len(name) == 1 and name in "cCsSiIlLfgb" else _PARSE_FORMATS.get(name)
+    if fmt is None:
+        raise ArrowMetalError(f"cannot parse into {target}")
+    return _call(_lib.am_parse, self._h, fmt.encode(), 1 if strict else 0)
+
+
+def _am_strftime(self, fmt):
+    """Formats a temporal column in UTC with a C strftime format. `%f` is an ArrowMetal extension for
+    the six-digit fractional second. CPU."""
+    return _call(_lib.am_parse, self._h, fmt.encode(), 0)
+
+
+def _am_strptime(self, fmt):
+    """Parses a utf8 column with a C strptime format, UTC, into timestamp[us]. Values that do not
+    parse come back null. CPU."""
+    return _call(_lib.am_parse, self._h, fmt.encode(), 0)
+
+
+def _am_temporal_math(self, op, p1=0, other=None):
+    return _call(_lib.am_temporal_math, self._h, _TEMPORAL_MATH[op], p1,
+                 other._h if other is not None else None)
+
+
+def _am_round_arg(unit, multiple):
+    if unit not in _ROUND_UNITS:
+        raise ArrowMetalError(f"unknown rounding unit {unit!r}; expected one of {_ROUND_UNITS}")
+    if multiple < 1:
+        raise ArrowMetalError("temporal rounding needs multiple >= 1")
+    return _ROUND_UNITS.index(unit) | (multiple << 8)
+
+
+def _am_floor_temporal(self, unit, multiple=1):
+    """Arrow `floor_temporal`: the largest multiple of `multiple` x `unit` at or below each value."""
+    return _am_temporal_math(self, "floor", _am_round_arg(unit, multiple))
+
+
+def _am_ceil_temporal(self, unit, multiple=1):
+    """Arrow `ceil_temporal`. A value already on a boundary is left alone."""
+    return _am_temporal_math(self, "ceil", _am_round_arg(unit, multiple))
+
+
+def _am_round_temporal(self, unit, multiple=1):
+    """Arrow `round_temporal`. A value exactly halfway rounds up (toward +infinity)."""
+    return _am_temporal_math(self, "round", _am_round_arg(unit, multiple))
+
+
+def _am_add_duration(self, other):
+    """Adds a duration column (rescaled to this array's unit) or a scalar count of this array's own
+    ticks. The result keeps this array's type."""
+    if isinstance(other, MetalArray):
+        return _am_temporal_math(self, "add_duration", 0, other)
+    return _am_temporal_math(self, "add_duration", int(other))
+
+
+def _am_subtract_temporal(self, other):
+    """`self - other` as a duration, in the finer of the two resolutions."""
+    return _am_temporal_math(self, "subtract", 0, other)
+
+
+def _am_days_between(self, other):
+    """Arrow `days_between(self, other)`: whole UTC days from self to other, int64."""
+    return _am_temporal_math(self, "days_between", 0, other)
+
+
+MetalArray.match_substring_regex = _am_match_substring_regex
+MetalArray.count_substring_regex = _am_count_substring_regex
+MetalArray.find_substring_regex = _am_find_substring_regex
+MetalArray.replace_substring_regex = _am_replace_substring_regex
+MetalArray.extract_regex = _am_extract_regex
+MetalArray.match_like = _am_match_like
+MetalArray.split_pattern = _am_split_pattern
+MetalArray.split_whitespace = _am_split_whitespace
+MetalArray.to_strings = _am_to_strings
+MetalArray.parse = _am_parse
+MetalArray.strftime = _am_strftime
+MetalArray.strptime = _am_strptime
+MetalArray.floor_temporal = _am_floor_temporal
+MetalArray.ceil_temporal = _am_ceil_temporal
+MetalArray.round_temporal = _am_round_temporal
+MetalArray.add_duration = _am_add_duration
+MetalArray.subtract_temporal = _am_subtract_temporal
+MetalArray.days_between = _am_days_between
+MetalArray.quarter = lambda self: _am_temporal_math(self, "quarter")
+MetalArray.day_of_year = lambda self: _am_temporal_math(self, "day_of_year")
+MetalArray.iso_week = lambda self: _am_temporal_math(self, "iso_week")
+MetalArray.iso_year = lambda self: _am_temporal_math(self, "iso_year")
+MetalArray.is_leap_year = lambda self: _am_temporal_math(self, "is_leap_year")
+MetalArray.millisecond = lambda self: _am_temporal_math(self, "millisecond")
+MetalArray.microsecond = lambda self: _am_temporal_math(self, "microsecond")
+MetalArray.nanosecond = lambda self: _am_temporal_math(self, "nanosecond")
+
+# cast() gains a string target: cast("string") / cast(pa.string()) is to_strings().
+_am_numeric_cast = MetalArray.cast
+
+
+def _am_cast(self, target):
+    """Arrow `cast`. Numeric targets run the GPU cast kernel; "string" / "utf8" formats the values
+    (see to_strings)."""
+    name = target if isinstance(target, str) else str(target)
+    if name in ("string", "utf8", "large_string", "u", "U"):
+        return self.to_strings()
+    return _am_numeric_cast(self, target)
+
+
+MetalArray.cast = _am_cast
