@@ -1182,3 +1182,109 @@ MetalArray.any = _any
 MetalArray.all = _all
 MetalArray.run_end_encode = _run_end_encode
 MetalArray.run_end_decode = _run_end_decode
+# ---- the temporal functions beyond am_temporal_extract / am_temporal_math: the option-carrying week
+# numbers, the struct-valued extractors, subsecond, is_dst and every *_between difference.
+# Appended rather than written into the class body so the file stays additive.
+# Op numbering is the C ABI contract; see include/arrowmetal.h.
+_lib.am_temporal_extra.argtypes = [_P, ctypes.c_int, ctypes.c_int64, ctypes.c_int64, _P, ctypes.POINTER(_P)]
+_lib.am_temporal_extra.restype = ctypes.c_int
+
+_TEMPORAL_EXTRA = {"week": 0, "us_week": 1, "us_year": 2, "iso_calendar": 3, "year_month_day": 4,
+                   "is_dst": 5, "day_of_week": 6, "subsecond": 7,
+                   "years_between": 8, "quarters_between": 9, "months_between": 10,
+                   "weeks_between": 11, "hours_between": 12, "minutes_between": 13,
+                   "seconds_between": 14, "milliseconds_between": 15,
+                   "microseconds_between": 16, "nanoseconds_between": 17}
+
+
+def _am_temporal_extra(self, op, p1=0, p2=0, other=None):
+    """One temporal op by name; the table is in include/arrowmetal.h."""
+    return _call(_lib.am_temporal_extra, self._h, _TEMPORAL_EXTRA[op], int(p1), int(p2),
+                 other._h if other is not None else None)
+
+
+def _am_week(self, week_starts_monday=True, count_from_zero=False, first_week_is_fully_in_year=False):
+    """Arrow `week` with the full WeekOptions, int64, UTC.
+
+    `count_from_zero` numbers the weeks against the value's own calendar year, so a date at the start
+    of a year that belongs to the previous year's last week comes out as 0 rather than 52 or 53.
+    `first_week_is_fully_in_year` makes week 1 the first week lying wholly inside January; without it
+    the ISO majority rule applies and a week beginning on 29, 30 or 31 December is week 1 of the next
+    year. The defaults reproduce iso_week."""
+    bits = ((1 if week_starts_monday else 0) | (2 if count_from_zero else 0)
+            | (4 if first_week_is_fully_in_year else 0))
+    return _am_temporal_extra(self, "week", bits)
+
+
+def _am_weeks_between(self, other, count_from_zero=True, week_start=1):
+    """Arrow `weeks_between(self, other)`: week boundaries crossed, both sides floored to the start of
+    their week first. `week_start` is 1 = Monday ... 7 = Sunday. `count_from_zero` is part of Arrow's
+    DayOfWeekOptions and is accepted for signature parity, but does not change the answer."""
+    return _am_temporal_extra(self, "weeks_between", 1 if count_from_zero else 0, week_start,
+                              other=other)
+
+
+def _am_day_of_week_options(self, count_from_zero=True, week_start=1):
+    """Arrow `day_of_week` with DayOfWeekOptions; `week_start` uses the ISO numbering (1 = Monday ...
+    7 = Sunday) and is unaffected by `count_from_zero`. The default options keep the existing int32
+    result (Monday = 0); any other combination returns int64, as pyarrow does."""
+    if count_from_zero and week_start == 1:
+        return _am_day_of_week_int32(self)
+    return _am_temporal_extra(self, "day_of_week", 1 if count_from_zero else 0, week_start)
+
+
+def _no_arg_temporal_extra(op, doc):
+    def f(self):
+        return _am_temporal_extra(self, op)
+    f.__name__ = op
+    f.__doc__ = doc
+    return f
+
+
+def _between_temporal_extra(op, doc):
+    def f(self, other):
+        return _am_temporal_extra(self, op, other=other)
+    f.__name__ = op
+    f.__doc__ = doc
+    return f
+
+
+_am_day_of_week_int32 = MetalArray.day_of_week
+MetalArray.week = _am_week
+MetalArray.weeks_between = _am_weeks_between
+MetalArray.day_of_week = _am_day_of_week_options
+
+for _op, _doc in [
+    ("us_week", "Arrow us_week: the week number with Sunday-start weeks and the majority rule, 1-53."),
+    ("us_year", "Arrow us_year: the US epidemiological week-numbering year, that is the year owning "
+                "the Wednesday of this date's Sunday-start week."),
+    ("iso_calendar", "Arrow iso_calendar: a struct of int64 iso_year, iso_week and iso_day_of_week "
+                     "(1 = Monday). Read a field with struct_field(name)."),
+    ("year_month_day", "Arrow year_month_day: a struct of int64 year, month and day."),
+    ("is_dst", "Arrow is_dst: whether each value falls in daylight saving time in the column's own "
+               "timezone. Needs a timestamp carrying a timezone; a naive one is an error. CPU."),
+    ("subsecond", "Arrow subsecond: the fraction of a second, in [0, 1), as float64. date32 and "
+                  "date64 answer 0 (pyarrow has no kernel for them); duration is rejected."),
+]:
+    setattr(MetalArray, _op, _no_arg_temporal_extra(_op, _doc))
+del _op, _doc
+
+# Every *_between counts boundaries crossed from self to other: each side is truncated to the unit
+# first and the difference taken afterwards, so it is not the truncated difference. Positive when
+# `other` is later. The two sides may differ in unit and in type, which is more permissive than
+# pyarrow, where both arguments must have the same type.
+for _op, _doc in [
+    ("years_between", "Arrow years_between: the difference of the two calendar years."),
+    ("quarters_between", "Arrow quarters_between: the difference of year * 4 + quarter."),
+    ("months_between", "The int64 month difference, that is the difference of year * 12 + month. "
+                       "Arrow spells the same quantity month_interval_between and returns an interval."),
+    ("hours_between", "Arrow hours_between: hour boundaries crossed."),
+    ("minutes_between", "Arrow minutes_between: minute boundaries crossed."),
+    ("seconds_between", "Arrow seconds_between: second boundaries crossed."),
+    ("milliseconds_between", "Arrow milliseconds_between: millisecond boundaries crossed."),
+    ("microseconds_between", "Arrow microseconds_between: microsecond boundaries crossed."),
+    ("nanoseconds_between", "Arrow nanoseconds_between: nanosecond boundaries crossed; wraps in "
+                            "int64 past about 292 years, as Arrow's does."),
+]:
+    setattr(MetalArray, _op, _between_temporal_extra(_op, _doc))
+del _op, _doc

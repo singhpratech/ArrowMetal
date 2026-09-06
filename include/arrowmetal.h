@@ -424,6 +424,57 @@ int  am_reduce_ex(am_array* a, int op, double p1, int64_t* out_i64, double* out_
 // take, filter and slice on a run-end encoded array decode first; IPC writing needs a decode as well.
 int  am_run_end_encode(am_array* a, am_array** out);
 int  am_run_end_decode(am_array* a, am_array** out);
+// The temporal functions beyond am_temporal_extract and am_temporal_math: the option-carrying week
+// numbers, the struct-valued extractors, subsecond, is_dst and every *_between difference. UTC
+// throughout — a timestamp's timezone rides along as metadata and is never applied to the value —
+// with is_dst the one exception, since its whole job is to ask what that timezone was doing.
+//
+// `b` is the second column for the *_between ops (a is the start, b the end, so the answer is
+// positive when b is later) and is ignored otherwise. Anything an op does not use may be NULL / 0.
+//
+//  op  name                   p1                    p2          output   notes
+//  --  ---------------------  --------------------  ----------  -------  ------------------------------
+//   0  week                   WeekOptions bits      -           int64    see the bits below
+//   1  us_week                -                     -           int64    Sunday weeks, 1-53
+//   2  us_year                -                     -           int64    US epidemiological year
+//   3  iso_calendar           -                     -           struct   iso_year/iso_week/iso_day_of_week
+//   4  year_month_day         -                     -           struct   year/month/day
+//   5  is_dst                 -                     -           bool     CPU; needs a timezone
+//   6  day_of_week            count_from_zero       week_start  int64    week_start 1 = Mon ... 7 = Sun
+//   7  subsecond              -                     -           float64  fraction of a second, [0, 1)
+//   8  years_between          -                     -           int64    calendar years crossed
+//   9  quarters_between       -                     -           int64    difference of year*4 + quarter
+//  10  months_between         -                     -           int64    difference of year*12 + month
+//  11  weeks_between          count_from_zero       week_start  int64    week boundaries crossed
+//  12  hours_between          -                     -           int64    hour boundaries crossed
+//  13  minutes_between        -                     -           int64
+//  14  seconds_between        -                     -           int64
+//  15  milliseconds_between   -                     -           int64
+//  16  microseconds_between   -                     -           int64
+//  17  nanoseconds_between    -                     -           int64    wraps in int64 past ~292 years
+//
+// Op 0's p1 packs WeekOptions: bit 0 week_starts_monday, bit 1 count_from_zero, bit 2
+// first_week_is_fully_in_year. The default (bit 0 alone, so p1 = 1) is iso_week; p1 = 0 is us_week.
+// count_from_zero numbers the weeks against the value's own calendar year, so a date at the start of
+// a year belonging to the previous year's last week comes out as 0 rather than 52 or 53.
+// first_week_is_fully_in_year makes week 1 the first week lying wholly inside January; without it the
+// ISO majority rule applies and a week beginning on 29, 30 or 31 December is week 1 of the next year.
+//
+// p2 = week_start uses the ISO numbering (1 = Monday ... 7 = Sunday) and is unaffected by
+// count_from_zero, which only decides whether op 6 counts from 0 or from 1. Op 11 accepts
+// count_from_zero for signature parity with Arrow but the value does not change its answer.
+//
+// Ops 3 and 4 return a struct array; read its fields with am_struct_field. A null input row makes the
+// struct row null and leaves the three children valid, which is the shape Arrow produces.
+//
+// Ops 0-6 and 8-11 need a column that carries a date (date32, date64 or timestamp); op 7 and ops
+// 12-17 also accept time32 / time64 (ticks since midnight). duration is rejected everywhere here, and
+// op 5 needs a timestamp whose format string carries a timezone — a naive one is an error, exactly as
+// in Arrow. Every *_between counts *boundaries crossed*: each side is truncated to the unit first and
+// the difference taken afterwards, so it is not the truncated difference. The two sides may differ in
+// unit and in type (a date32 against a timestamp[ns], say); both are mapped onto the op's own ruler
+// first, which is more permissive than Arrow, where both arguments must have the same type.
+int  am_temporal_extra(am_array* a, int op, int64_t p1, int64_t p2, am_array* b_or_null, am_array** out);
 
 #ifdef __cplusplus
 }

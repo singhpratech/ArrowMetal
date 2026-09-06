@@ -617,3 +617,176 @@ def test_run_end_encoding_round_trips_through_pyarrow():
     imported = am.array(pc.run_end_encode(pa.array([2, 2, None, 3], pa.int64())))
     assert imported.format == "+r"
     assert pylist(imported.run_end_decode()) == [2, 2, None, 3]
+
+
+# ---------------------------------------------------------------- temporal: week numbers, the
+# struct extractors, subsecond, is_dst and every *_between. pyarrow.compute is the oracle throughout.
+
+import itertools as _itertools
+import random as _random
+
+_LOW_SECOND = -2_208_988_800     # 1900-01-01T00:00:00Z
+_HIGH_SECOND = 7_258_118_400     # 2200-01-01T00:00:00Z
+
+
+def _random_seconds(n, seed):
+    """`n` UTC seconds spanning 1900-2200, with the awkward instants pinned in front."""
+    rng = _random.Random(seed)
+    out = [rng.randint(_LOW_SECOND, _HIGH_SECOND - 1) for _ in range(n)]
+    pinned = [0, -1, 1, -86_400, 86_400, -86_401, _LOW_SECOND, _HIGH_SECOND - 1,
+              951_782_400, 1_388_534_400, 1_420_070_400, 1_451_606_400, 1_451_779_200]
+    for i, v in enumerate(pinned[:n]):
+        out[i] = v
+    return out
+
+
+def _dates(seconds, nulls=True):
+    days = [s // 86_400 for s in seconds]
+    if nulls:
+        days = [None if i % 7 == 3 else d for i, d in enumerate(days)]
+    return pa.array(days, pa.date32())
+
+
+def test_week_matches_pyarrow_for_every_option_combination():
+    values = _dates(_random_seconds(20_000, 101))
+    col = am.array(values)
+    for wsm, cfz, fwfy in _itertools.product([True, False], repeat=3):
+        got = pylist(col.week(week_starts_monday=wsm, count_from_zero=cfz,
+                              first_week_is_fully_in_year=fwfy))
+        want = pc.week(values, week_starts_monday=wsm, count_from_zero=cfz,
+                       first_week_is_fully_in_year=fwfy).to_pylist()
+        assert got == want, (wsm, cfz, fwfy)
+    assert pylist(col.us_week()) == pc.us_week(values).to_pylist()
+    assert pylist(col.us_year()) == pc.us_year(values).to_pylist()
+    assert col.week().type == pa.int64()
+
+
+def test_iso_calendar_and_year_month_day_match_pyarrow():
+    values = _dates(_random_seconds(20_000, 202))
+    col = am.array(values)
+    got = col.iso_calendar()
+    assert got.format == "+s"
+    expected = pc.iso_calendar(values)
+    assert got.to_arrow().type == expected.type
+    assert got.to_arrow().to_pylist() == expected.to_pylist()
+
+    # pyarrow 25.0.1's own `year_month_day` kernel segfaults on arrays of this size, so the oracle
+    # here is its year / month / day kernels, which compute exactly the same three fields.
+    ymd = col.year_month_day()
+    assert ymd.format == "+s"
+    assert ymd.to_arrow().type == pa.struct([("year", pa.int64()), ("month", pa.int64()),
+                                             ("day", pa.int64())])
+    year, month, day = pc.year(values), pc.month(values), pc.day(values)
+    assert pylist(ymd.struct_field("year")) == year.cast(pa.int64()).to_pylist()
+    assert pylist(ymd.struct_field("month")) == month.cast(pa.int64()).to_pylist()
+    assert pylist(ymd.struct_field("day")) == day.cast(pa.int64()).to_pylist()
+
+    # struct_field reaches one child by name.
+    fields = am.array(_dates([0, 86_400], nulls=False)).iso_calendar()
+    assert pylist(fields.struct_field("iso_week")) == [1, 1]
+    assert pylist(fields.struct_field("iso_day_of_week")) == [4, 5]
+
+
+def test_day_of_week_options_match_pyarrow():
+    values = _dates(_random_seconds(5_000, 303))
+    col = am.array(values)
+    for cfz, week_start in _itertools.product([True, False], range(1, 8)):
+        got = pylist(col.day_of_week(count_from_zero=cfz, week_start=week_start))
+        assert got == pc.day_of_week(values, count_from_zero=cfz, week_start=week_start).to_pylist()
+
+
+def test_subsecond_matches_pyarrow_bit_for_bit():
+    rng = _random.Random(404)
+    ticks = [s * 1_000_000_000 + rng.randrange(1_000_000_000)
+             for s in _random_seconds(20_000, 405)]
+    for unit, scale in [("ns", 1), ("us", 1_000), ("ms", 1_000_000), ("s", 1_000_000_000)]:
+        values = pa.array([t // scale for t in ticks], pa.timestamp(unit))
+        assert pylist(am.array(values).subsecond()) == pc.subsecond(values).to_pylist()
+    for values in [pa.array([1_500_000_123, None, 86_399_999_999_999], pa.time64("ns")),
+                   pa.array([1_500, None, 86_399_999], pa.time32("ms"))]:
+        assert pylist(am.array(values).subsecond()) == pc.subsecond(values).to_pylist()
+
+
+def test_is_dst_matches_pyarrow():
+    # 1900 through 2037. Past the 2038 cliff Foundation projects each zone's current DST rule
+    # forward while pyarrow's bundled timezone database stops, so the two disagree there — a
+    # difference in the timezone data, not in the kernel.
+    rng = _random.Random(506)
+    seconds = [rng.randint(_LOW_SECOND, 2_140_000_000) for _ in range(20_000)]
+    for zone in ["America/New_York", "Europe/Berlin", "Australia/Sydney", "UTC"]:
+        values = pa.array([None if i % 7 == 3 else s for i, s in enumerate(seconds)],
+                          pa.timestamp("s", tz=zone))
+        assert pylist(am.array(values).is_dst()) == pc.is_dst(values).to_pylist(), zone
+    # Every unit, and a fixed offset, which never observes DST.
+    for unit, scale in [("s", 1), ("ms", 10 ** 3), ("us", 10 ** 6), ("ns", 10 ** 9)]:
+        values = pa.array([1_672_531_200 * scale, 1_688_000_000 * scale, None],
+                          pa.timestamp(unit, tz="America/New_York"))
+        assert pylist(am.array(values).is_dst()) == [False, True, None]
+    fixed = pa.array([1_688_000_000], pa.timestamp("s", tz="+02:00"))
+    assert pylist(am.array(fixed).is_dst()) == pc.is_dst(fixed).to_pylist() == [False]
+    with pytest.raises(am.ArrowMetalError):
+        am.array(pa.array([0], pa.timestamp("s"))).is_dst()
+
+
+def test_every_between_matches_pyarrow_over_100k_pairs():
+    n = 100_000
+    a_seconds = _random_seconds(n, 607)
+    b_seconds = _random_seconds(n, 708)
+    a_seconds[0], b_seconds[0] = 0, -1          # a negative difference
+    a_seconds[1], b_seconds[1] = -1, 0
+    a = pa.array([None if i % 11 == 5 else s for i, s in enumerate(a_seconds)], pa.timestamp("s"))
+    b = pa.array([None if i % 13 == 7 else s for i, s in enumerate(b_seconds)], pa.timestamp("s"))
+    ma, mb = am.array(a), am.array(b)
+    for name in ["years_between", "quarters_between", "weeks_between", "days_between",
+                 "hours_between", "minutes_between", "seconds_between", "milliseconds_between",
+                 "microseconds_between", "nanoseconds_between"]:
+        assert pylist(getattr(ma, name)(mb)) == getattr(pc, name)(a, b).to_pylist(), name
+    # weeks_between with every DayOfWeekOptions combination, on a smaller slice.
+    sa, sb = a.slice(0, 5_000), b.slice(0, 5_000)
+    msa, msb = am.array(sa), am.array(sb)
+    for cfz, week_start in _itertools.product([True, False], range(1, 8)):
+        got = pylist(msa.weeks_between(msb, count_from_zero=cfz, week_start=week_start))
+        assert got == pc.weeks_between(sa, sb, count_from_zero=cfz,
+                                       week_start=week_start).to_pylist()
+    # months_between is Arrow's month_interval_between as a plain int64 count. pyarrow cannot hand a
+    # month interval back to Python, so the oracle is year * 12 + month from pyarrow's own kernels.
+    ay, am_, by, bm = (pc.year(a).to_pylist(), pc.month(a).to_pylist(),
+                       pc.year(b).to_pylist(), pc.month(b).to_pylist())
+    want = [None if ay[i] is None or by[i] is None
+            else (by[i] * 12 + bm[i]) - (ay[i] * 12 + am_[i]) for i in range(n)]
+    assert pylist(ma.months_between(mb)) == want
+
+
+def test_between_accepts_mixed_units_and_types():
+    # 2021-03-04T23:59:00Z -> 2021-03-05T00:01:00Z: one day, one hour and two minutes of boundaries.
+    left = am.array(pa.array([1_614_902_340], pa.timestamp("s")))
+    right = am.array(pa.array([1_614_902_460_000], pa.timestamp("ms", tz="UTC")))
+    assert pylist(left.days_between(right)) == [1]
+    assert pylist(left.hours_between(right)) == [1]
+    assert pylist(left.minutes_between(right)) == [2]
+    assert pylist(right.seconds_between(left)) == [-120]
+    d32 = am.array(pa.array([0], pa.date32()))
+    ns = am.array(pa.array([86_400_000_000_001], pa.timestamp("ns")))
+    assert pylist(d32.hours_between(ns)) == [24]
+    assert pylist(d32.nanoseconds_between(ns)) == [86_400_000_000_001]
+    with pytest.raises(am.ArrowMetalError):
+        am.array(pa.array([0], pa.duration("s"))).seconds_between(am.array(pa.array([1], pa.duration("s"))))
+
+
+def test_temporal_extra_shapes_and_nulls():
+    for n in [0, 1, 33, 4097]:
+        values = _dates(_random_seconds(n, 800 + n))
+        nulls = values.null_count
+        col = am.array(values)
+        for result in [col.week(), col.us_week(), col.us_year(), col.subsecond(),
+                       col.day_of_week(count_from_zero=False, week_start=3)]:
+            assert len(result) == n
+            assert result.null_count == nulls
+        got = col.iso_calendar()
+        assert len(got) == n and got.null_count == nulls
+        assert got.to_arrow().to_pylist() == pc.iso_calendar(values).to_pylist()
+        ymd = col.year_month_day()
+        assert len(ymd) == n and ymd.null_count == nulls
+        assert pylist(ymd.struct_field("day")) == pc.day(values).cast(pa.int64()).to_pylist()
+        assert pylist(col.years_between(col)) == [None if v is None else 0
+                                                  for v in values.to_pylist()]
