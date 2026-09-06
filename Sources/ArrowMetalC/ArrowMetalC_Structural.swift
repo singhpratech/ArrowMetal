@@ -86,6 +86,8 @@ private func withStructural<R>(_ a: AnyMetalArray, _ body: (any StructuralCOps) 
         }
     case .dictionary: throw ArrowMetalError.unsupportedType("decode the dictionary array first")
     case .decimal(let d): throw ArrowMetalError.unsupportedType("\(d.type) columns use am_decimal_op, not this entry point")
+    case .list, .structure, .map, .union:
+        throw ArrowMetalError.unsupportedType("operation needs a primitive array, got \(a.arrowFormat)")
     }
 }
 

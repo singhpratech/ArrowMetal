@@ -19,6 +19,14 @@ public enum AnyMetalArray {
     case decimal(MetalDecimalArray)
     /// A dictionary-encoded array: int32 codes into `values`.
     indirect case dictionary(codes: MetalArray<Int32>, values: AnyMetalArray)
+    /// list / large_list / fixed_size_list: int32 offsets over a child of any supported type.
+    case list(MetalListArray)
+    /// struct as a column (not only as the record batch container).
+    case structure(MetalStructArray)
+    /// map: a list of non-nullable `struct<key, value>` entries.
+    case map(MetalMapArray)
+    /// dense or sparse union.
+    case union(MetalUnionArray)
 
     public var length: Int {
         switch self {
@@ -38,6 +46,10 @@ public enum AnyMetalArray {
         case .binary(let a): return a.length
         case .decimal(let a): return a.length
         case .dictionary(let codes, _): return codes.length
+        case .list(let a): return a.length
+        case .structure(let a): return a.length
+        case .map(let a): return a.length
+        case .union(let a): return a.length
         }
     }
 
@@ -60,6 +72,10 @@ public enum AnyMetalArray {
         case .decimal(let a): return a.type.arrowFormat
         // The C Data Interface puts the index type at the top level of a dictionary schema.
         case .dictionary: return "i"
+        case .list(let a): return a.arrowFormat
+        case .structure: return "+s"
+        case .map: return "+m"
+        case .union(let a): return a.arrowFormat
         }
     }
 }
@@ -98,6 +114,8 @@ public func importArrowArray(schema: UnsafePointer<ArrowSchema>, array: UnsafeMu
     guard array.pointee.release != nil else { throw ArrowMetalError.releasedArray }
     // The schema decides whether an array is dictionary-encoded; the indices are imported inside.
     if schema.pointee.dictionary != nil { return try importDictionaryArray(schema: schema, array: array, context: context) }
+    // Nested types (list, large_list, fixed_size_list, struct, map, union) recurse through this function.
+    if isNestedFormat(fmt) { return try importNestedArray(format: fmt, schema: schema, array: array, context: context) }
     guard array.pointee.n_children == 0, array.pointee.dictionary == nil else {
         throw ArrowMetalError.unsupportedType("nested/dictionary arrays are not supported (format \(fmt))")
     }
@@ -416,6 +434,10 @@ extension AnyMetalArray {
         case .binary(let a): a.exportArrowArray(into: out)
         case .decimal(let a): a.exportArrowArray(into: out)
         case .dictionary(let codes, let values): exportDictionaryArray(codes: codes, values: values, into: out)
+        case .list(let a): a.exportArrowArray(into: out)
+        case .structure(let a): a.exportArrowArray(into: out)
+        case .map(let a): a.exportArrowArray(into: out)
+        case .union(let a): a.exportArrowArray(into: out)
         }
     }
     public func exportArrowDeviceArray(into out: UnsafeMutablePointer<ArrowDeviceArray>) {
@@ -427,6 +449,14 @@ extension AnyMetalArray {
         if case .dictionary(_, let values) = self {
             exportDictionarySchema(values: values, name: name, into: out)
             return
+        }
+        // A nested schema carries its children, so each nested array writes its own.
+        switch self {
+        case .list(let a): return a.exportArrowSchema(name: name, into: out)
+        case .structure(let a): return a.exportArrowSchema(name: name, into: out)
+        case .map(let a): return a.exportArrowSchema(name: name, into: out)
+        case .union(let a): return a.exportArrowSchema(name: name, into: out)
+        default: break
         }
         ArrowMetal.exportArrowSchema(format: arrowFormat, name: name, into: out)
     }

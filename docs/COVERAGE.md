@@ -23,16 +23,16 @@ them so a claim can be checked in one jump.
 | String transforms | 9 | 0 | 2 | 1 | 0 | 7 | 19 |
 | String containment and matching | 7 | 0 | 0 | 2 | 0 | 1 | 10 |
 | Temporal | 0 | 0 | 0 | 0 | 1 | 5 | 6 |
-| Conversions and casts | 0 | 1 | 2 | 0 | 1 | 2 | 6 |
+| Conversions and casts | 0 | 2 | 2 | 0 | 1 | 1 | 6 |
 | Selections | 4 | 0 | 1 | 0 | 0 | 0 | 5 |
 | Containment / set lookup | 2 | 0 | 0 | 0 | 0 | 1 | 3 |
 | Sorts and partitions | 3 | 1 | 1 | 0 | 0 | 2 | 7 |
-| Structural and conditional | 4 | 0 | 2 | 0 | 0 | 7 | 13 |
+| Structural and conditional | 6 | 1 | 0 | 0 | 0 | 7 | 14 |
 | Associative transforms | 2 | 0 | 0 | 0 | 3 | 0 | 5 |
 | Pairwise and cumulative | 1 | 0 | 1 | 0 | 0 | 3 | 5 |
 | Hashing | 1 | 0 | 0 | 0 | 0 | 1 | 2 |
-| **Total (compute functions)** | **59** | **6** | **26** | **5** | **6** | **56** | **158** |
-| Arrow types (matrix below) | 5 | 0 | 3 | 1 | 6 | 11 | 26 |
+| **Total (compute functions)** | **61** | **8** | **24** | **5** | **6** | **55** | **159** |
+| Arrow types (matrix below) | 7 | 0 | 6 | 1 | 6 | 8 | 28 |
 
 Interop uses a separate vocabulary and is counted apart: 6 shipped, 1 partial, 3 planned, 1 in progress
 (11 rows).
@@ -316,10 +316,11 @@ zero-copy and a null row emits no bytes. All of them are reachable from Swift, f
 | `replace_with_mask` | **Not planned** | No roadmap item. |
 | `is_null` / `is_valid` | **GPU** | `Kernels/Structural.swift`, bitmap word kernels over the validity bitmap: `is_null` is a word-wise NOT of it, `is_valid` shares it zero-copy, and an array with no bitmap gets a constant word fill. Primitive and boolean arrays; the result never has nulls itself. `isNull()` / `isValid()` in Swift, `am_is_null` / `am_is_valid` in C, `is_null()` / `is_valid()` in Python. |
 | `is_nan` / `is_finite` / `is_inf` | **Not planned** | No roadmap item. |
-| `make_struct` | **Partial** | `MetalRecordBatch(names:columns:)` composes equal-length columns and exports as a `+s` struct array, which is the record-batch form of this. It is not a compute function over struct-typed columns. |
-| `struct_field` | **Partial** | `batch[name]` and `selecting(_:)` project columns out of a record batch; there is no struct-typed array to extract a field from. |
-| `list_element` / `list_flatten` / `list_parent_indices` / `list_slice` / `list_value_length` | **Not planned** | Out of scope for 0.1.0: ArrowMetal has no list type, and ragged nested compute is a different kernel design from flat columnar. |
-| `map_lookup` | **Not planned** | Out of scope: no map type. |
+| `make_struct` | **CPU** | `MetalStructArray(names:children:valid:)` composes equal-length columns into a struct-typed column, and `MetalRecordBatch(names:columns:)` does the record-batch form of the same thing (`Sources/ArrowMetal/Nested.swift`). Metadata only — the children are shared, nothing is copied and no kernel runs. |
+| `struct_field` | **GPU** | `MetalStructArray.structField(_:)` (`Nested.swift`), `am_struct_field` in C, `struct_field()` in Python. The struct's own nulls are propagated into the field, matching Arrow: a field of a null row is null, which is one GPU gather when the struct has a validity bitmap and free when it has none. `batch[name]` / `selecting(_:)` still project columns out of a record batch. |
+| `list_element` / `list_flatten` / `list_value_length` | **GPU** | `Kernels/NestedSource.swift`, over `list`, `large_list`, `fixed_size_list` and `map`, with a child of any supported type including another nested array. `listValueLength()` → int32, null in / null out; `listFlatten()` is the child restricted to `offsets[0] ..< offsets[length]`; `listElement(_:)` builds child indices on the GPU and gathers through the child's own `take`, giving **null** where the row is null or shorter than the index (Arrow raises instead). `am_list_value_length` / `am_list_flatten` / `am_list_element` in C, `list_value_length()` / `list_flatten()` / `list_element()` in Python. |
+| `list_parent_indices` / `list_slice` | **Not planned** | No roadmap item. Both are one more kernel over the offsets buffer the three functions above already use. |
+| `map_lookup` | **Not planned** | No roadmap item. The `map` type itself imports, exports and selects (see the type matrix); nothing looks a key up. |
 
 ## Associative transforms
 
@@ -381,10 +382,11 @@ outright.
 | `utf8` | **GPU** | Byte/char length, equals/starts_with/ends_with/contains, count_substring/find_substring, murmur3 hash, `dictionary_encode` (GPU), filter, take, C Data import/export, and the transforms that build new string arrays: ASCII and Latin case mapping, trim/ltrim/rtrim, pad, slice, repeat, replace, reverse, element-wise join and the `ascii_is_*` predicates. `dictionary_encode` is CPU. |
 | `large_utf8` | **Partial** | Import only, and only when the data is under 2 GB: 64-bit offsets are narrowed to int32 in one pass. Exports come back out as `utf8`. |
 | `utf8_view` / `binary_view` | **Planned** | [ROADMAP → Medium term → Strings](../ROADMAP.md#medium-term) lists `utf8_view` as open. |
-| `list` / `large_list` / `fixed_size_list` / `list_view` / `large_list_view` | **Not planned** | Out of scope for 0.1.0: ragged nested data needs a different kernel design, and the flat analytics case is not finished yet. |
-| `struct` | **Partial** | Supported only as the record-batch container: `+s` import and export with one child per column, non-nested children, no top-level nulls and no offset. [ROADMAP → Medium term → RecordBatch](../ROADMAP.md#medium-term) lists "nested struct children" as open. There is no compute over struct-typed columns. |
-| `map` | **Not planned** | Out of scope: nested. |
-| `union` (dense and sparse) | **Not planned** | Out of scope: a type-id-dispatched layout defeats the uniform-thread model kernels rely on. |
+| `list` / `large_list` / `fixed_size_list` | **Partial** | `MetalListArray` (`Sources/ArrowMetal/Nested.swift`): C Data import and export of `+l`, `+L` and `+w:N`, `list_value_length` / `list_flatten` / `list_element`, and `filter` / `take` / `slice`. The child is an `AnyMetalArray`, so it may be any supported type including another list, a struct or a map, recursively. Offsets are always int32 in Metal memory: `large_list` offsets are narrowed on import (and come back out as `+l`, as `large_utf8` comes back out as `utf8`), and a `fixed_size_list` materialises the `i * N` offsets its layout implies, so one set of kernels covers all three. `take` recomputes the offsets with the existing GPU scan and expands the selected rows' source ranges into one child index array that the child's own `take` gathers; a `slice` of a variable-length list shares both the offsets buffer and the child. Not implemented: aggregates or arithmetic over list values, `list_parent_indices`, `list_slice`. |
+| `list_view` / `large_list_view` | **Not planned** | No roadmap item; the out-of-order sizes-and-offsets layout is a different importer from the three above. |
+| `struct` | **GPU** | `MetalStructArray` (`Nested.swift`) is `+s` as a **column**, not only as the record-batch container: named children of any supported type, its own validity bitmap, arbitrary nesting in either direction (a struct of lists, a list of structs), `structField(_:)`, and `filter` / `take` / `slice` by delegating to the children and gathering the struct's own validity. `importArrowRecordBatch` keeps its top-level meaning and now accepts nested children. No aggregate takes a struct column. |
+| `map` | **Partial** | `MetalMapArray` (`Nested.swift`): `+m` import and export — a list of non-nullable `struct<key, value>` entries, with `keys_sorted` carried through — plus `filter` / `take` / `slice` and the `list_*` functions on the entries. There is no `map_lookup` and no compute over keys or values. |
+| `union` (dense and sparse) | **Partial** | `MetalUnionArray` (`Nested.swift`): `+ud:` and `+us:` import and export with the type ids, the dense offsets and one child per variant, plus `filter` / `take` / `slice` (dense selects type ids and offsets, sparse moves the children with the selection). No kernel reads a union's values: a type-id-dispatched layout defeats the uniform-thread model the compute kernels rely on. Unions carry no validity bitmap, per Arrow 1.0. |
 | `dictionary` | **In progress** | Concurrent branch this week adds the type. [ROADMAP → Medium term](../ROADMAP.md#medium-term) covers the compute half: "compare and filter on codes without decoding". Today the importer rejects any array with a `dictionary` pointer. |
 | `run_end_encoded` | **Not planned** | No roadmap item. |
 | Extension types | **Not planned** | No roadmap item; the importer reads `format` only and would need `ARROW:extension:name` metadata handling. |

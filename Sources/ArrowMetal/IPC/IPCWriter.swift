@@ -33,6 +33,8 @@ extension AnyMetalArray {
         // Arrow IPC has no decimal type in this package yet. The value is a placeholder: `recordBatchMessage`
         // rejects decimal columns before it is ever written to a message.
         case .decimal: return .binary
+        // Nested columns have no IPC type here: the writer rejects them before this value is used.
+        case .list, .structure, .map, .union: return .binary
         }
     }
 }
@@ -317,6 +319,8 @@ public enum ArrowIPCWriter {
                 throw ArrowIPCError.unsupported("dictionary-encoded columns are not written yet; call decode() on the column first")
             case .decimal(let a):
                 throw ArrowIPCError.unsupported("decimal columns (\(a.type)) are not written to Arrow IPC yet; export them through the C Data Interface")
+            case .list, .structure, .map, .union:
+                throw ArrowIPCError.unsupported("nested columns (list, struct, map, union) are not written to IPC yet")
             case .string(let a), .binary(let a):
                 body.addValidity(a.validity, nullCount: a.nullCount, length: a.length)
                 if case .varBinary(true) = type.storage {
