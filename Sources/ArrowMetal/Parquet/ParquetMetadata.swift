@@ -20,7 +20,7 @@ public enum ParquetPhysicalType: Int32, Sendable {
         case .fixedLenByteArray: return nil
         }
     }
-    var name: String {
+    public var name: String {
         switch self {
         case .boolean: return "BOOLEAN"
         case .int32: return "INT32"
