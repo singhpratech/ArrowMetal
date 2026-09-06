@@ -142,12 +142,19 @@ def _dict_fingerprint(d):
 def _source_for(data):
     """The `_Source` for a scanned object, reusing the one from an earlier `scan` of the same object.
 
-    A `pyarrow` Table/RecordBatch and a Polars DataFrame are immutable, so identity is enough. A dict
-    is not, so its keys and value identities are checked before the cache is trusted.
+    Only what cannot change under the cache is cached: a `pyarrow` Table or RecordBatch, which is
+    immutable, by identity; a dict, by its keys and the identity of its values. A Polars DataFrame is
+    scanned fresh every time, because `insert_column` and friends mutate one in place and the reuse
+    would be silently stale.
     """
+    if isinstance(data, dict):
+        fp = _dict_fingerprint(data)
+    elif isinstance(data, (_pa.Table, _pa.RecordBatch)):
+        fp = None
+    else:
+        return _Source(*_query_columns(data))
     key = id(data)
     hit = _sources_by_object.get(key)
-    fp = _dict_fingerprint(data) if isinstance(data, dict) else None
     if hit is not None and hit[0]() is data and hit[1] == fp:
         return hit[2]
     if isinstance(data, _pa.Table):
@@ -188,23 +195,23 @@ _OPAQUE_OPS = frozenset({"join", "join_asof"})
 def _walk(node, out):
     """Every column name `node` and its inputs mention, and whether they narrow the scan's schema.
 
-    False is both "does not narrow" and "the analysis does not apply"; either way the caller imports
-    every column, so the two need not be told apart.
+    True or False answer the question; None means the analysis does not apply and `out` is not to be
+    trusted.
     """
     op = node.get("op")
     if op in _OPAQUE_OPS:
-        return False
+        return None
     for key in ("keys", "exprs"):
         for pair in node.get(key) or []:
             out.add(pair[0])
             if not _add_expr(pair[1], out):
-                return False
+                return None
     for a in node.get("aggs") or []:
         out.add(a[1])
         if len(a) > 2 and a[2] and not _add_expr(a[2], out):
-            return False
+            return None
     if node.get("predicate") is not None and not _add_expr(node["predicate"], out):
-        return False
+        return None
     for key in ("by", "order_by"):
         for pair in node.get(key) or []:
             out.add(pair[0] if isinstance(pair, (list, tuple)) else pair)
@@ -224,8 +231,8 @@ def _walk(node, out):
     narrows = op in _NARROWING_OPS
     for kid in kids:
         child = _walk(kid, out)
-        if child is False:
-            return False
+        if child is None:
+            return None
         narrows = narrows or child
     return narrows
 
@@ -597,6 +604,10 @@ class LazyFrame:
         handles, boxes = [], []
         for name, src in self._sources.items():
             names = src.names if want is None else [n for n in src.names if n in want]
+            # `.agg(am.agg.count("n"))` names no column at all, and a source with no columns has no
+            # rows either. One column is all the length needs.
+            if not names and src.names:
+                names = src.names[:1]
             cols = src.columns(names, rows=source_rows)
             n = len(cols)
             harr = (_P * max(n, 1))(*[c._h for c in cols])
