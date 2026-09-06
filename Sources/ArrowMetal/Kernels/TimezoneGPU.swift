@@ -108,94 +108,151 @@ final class TimeZoneTable: @unchecked Sendable {
         guard let zone = try? resolveTimeZone(name) else { return nil }
         let lo = Date(timeIntervalSince1970: Double(loSecond))
         let hi = Date(timeIntervalSince1970: Double(hiSecond))
-        var transUTC: [Int64] = []
-        var offsets: [Int32] = [Int32(zone.secondsFromGMT(for: lo))]
-        var dstFlags: [UInt8] = [zone.isDaylightSavingTime(for: lo) ? 1 : 0]
+        var instants = Set<Int64>()
         var cursor = lo
         while let next = zone.nextDaylightSavingTimeTransition(after: cursor), next < hi {
             guard next > cursor else { return nil }                    // no progress: give up
-            guard transUTC.count < maxTransitions else { return nil }
-            let t = Int64(next.timeIntervalSince1970.rounded(.down))
-            transUTC.append(t)
-            offsets.append(Int32(zone.secondsFromGMT(for: next)))
-            dstFlags.append(zone.isDaylightSavingTime(for: next) ? 1 : 0)
+            guard instants.count < maxTransitions else { return nil }
+            instants.insert(Int64(next.timeIntervalSince1970.rounded(.down)))
             cursor = next
         }
+        // The zoneinfo file also changes the *designation* without changing the offset — US "war time"
+        // becomes "peace time" in September 1945 at the same -0400 — and `%Z` has to see those. Adding
+        // them as extra transitions is free for every other kernel: the two intervals either side then
+        // simply carry the same offset.
+        let zoneinfo = ZoneInfoFile(name: name)
+        if let zi = zoneinfo {
+            for (k, t) in zi.transitions.enumerated() where t > loSecond && t < hiSecond {
+                let prev = k == 0 ? 0 : Int(zi.typeIndex[k - 1]), cur = Int(zi.typeIndex[k])
+                guard prev < zi.types.count, cur < zi.types.count else { continue }
+                if zi.types[prev].name != zi.types[cur].name { instants.insert(t) }
+            }
+        }
+        guard instants.count <= maxTransitions else { return nil }
+        let transUTC = instants.sorted()
+        var offsets: [Int32] = [Int32(zone.secondsFromGMT(for: lo))]
+        var dstFlags: [UInt8] = [zone.isDaylightSavingTime(for: lo) ? 1 : 0]
+        for t in transUTC {
+            let d = Date(timeIntervalSince1970: Double(t))
+            offsets.append(Int32(zone.secondsFromGMT(for: d)))
+            dstFlags.append(zone.isDaylightSavingTime(for: d) ? 1 : 0)
+        }
         // Verify: the offset Foundation reports just before and just after every transition must be the
-        // one the table claims, and the table must be strictly sorted. A zone that fails this is left
-        // to the host path rather than silently answered wrongly.
+        // one the table claims. A zone that fails this is left to the host path rather than silently
+        // answered wrongly.
         for i in 0..<transUTC.count {
-            if i > 0 && transUTC[i] <= transUTC[i - 1] { return nil }
             let t = transUTC[i]
             let before = Int32(zone.secondsFromGMT(for: Date(timeIntervalSince1970: Double(t - 1))))
-            let after = Int32(zone.secondsFromGMT(for: Date(timeIntervalSince1970: Double(t))))
-            if before != offsets[i] || after != offsets[i + 1] { return nil }
+            if before != offsets[i] { return nil }
         }
-        let abbrev = abbreviations(zone: zone, name: name, offsets: offsets, dstFlags: dstFlags,
-                                   transUTC: transUTC)
+        let abbrev = abbreviations(zoneinfo: zoneinfo, zone: zone, offsets: offsets, transUTC: transUTC)
         return try TimeZoneTable(name: name, transUTC: transUTC, offsets: offsets, dstFlags: dstFlags,
                                  abbrev: abbrev, context: context)
     }
 
     /// One NUL-padded `%Z` abbreviation per interval.
     ///
-    /// The names Arrow prints ("CET", "CEST", "IST", "-03") come from the tz database's own designation
+    /// The names Arrow prints ("CET", "CEST", "EWT", "IST", "-03") are the tz database's own designation
     /// strings, which Foundation does not expose — `TimeZone.abbreviation(for:)` answers "GMT+1" for
-    /// Berlin. They are read instead straight out of the compiled zoneinfo file, whose type records pair
-    /// a UTC offset and a DST flag with a designation; matching an interval's `(offset, isDST)` against
-    /// those records recovers the right string. Zones with no readable zoneinfo file fall back to
-    /// Foundation's abbreviation, which is still a correct — if differently spelled — name for the offset.
-    private static func abbreviations(zone: TimeZone, name: String, offsets: [Int32],
-                                      dstFlags: [UInt8], transUTC: [Int64]) -> [UInt8] {
-        let types = zoneinfoTypes(name)
+    /// Berlin. They are read instead straight out of the compiled zoneinfo file, looked up at the
+    /// instant each interval begins so that two types sharing an offset are still told apart (US
+    /// "war time" in 1942 is EWT, not EDT, at the same -0400). A zone with no readable zoneinfo file,
+    /// or one whose file disagrees with Foundation about the offset, falls back to Foundation's
+    /// abbreviation — still a correct, if differently spelled, name for that offset.
+    private static func abbreviations(zoneinfo: ZoneInfoFile?, zone: TimeZone, offsets: [Int32],
+                                      transUTC: [Int64]) -> [UInt8] {
         var out = [UInt8](repeating: 0, count: offsets.count * abbrevStride)
         for i in 0..<offsets.count {
-            var text = types.first { $0.offset == offsets[i] && $0.isDST == (dstFlags[i] != 0) }?.name
+            // The instant the interval begins (one second before the first transition for interval 0).
+            let at: Int64 = transUTC.isEmpty ? 0 : (i == 0 ? transUTC[0] - 1 : transUTC[i - 1])
+            var text = zoneinfo?.designation(at: at, offset: offsets[i])
             if text == nil {
-                // A representative instant inside the interval, for Foundation's own spelling.
-                let mid: Int64
-                if transUTC.isEmpty { mid = 0 }
-                else if i == 0 { mid = transUTC[0] - 86_400 }
-                else if i == offsets.count - 1 { mid = transUTC[i - 1] + 86_400 }
-                else { mid = transUTC[i - 1] + (transUTC[i] - transUTC[i - 1]) / 2 }
-                text = zone.abbreviation(for: Date(timeIntervalSince1970: Double(mid)))
+                text = zone.abbreviation(for: Date(timeIntervalSince1970: Double(at)))
             }
             let bytes = Array((text ?? "UTC").utf8.prefix(abbrevStride - 1))
             for (k, b) in bytes.enumerated() { out[i * abbrevStride + k] = b }
         }
         return out
     }
+}
 
-    /// `(offset, isDST, designation)` for every local-time type in the compiled zoneinfo file, or an
-    /// empty list when there is none. Only the version-1 header block is read, which every TZif file
-    /// carries: the 64-bit block that follows repeats the same type records.
-    private static func zoneinfoTypes(_ name: String) -> [(offset: Int32, isDST: Bool, name: String)] {
-        guard !name.contains("..") , name.allSatisfy({ $0.isLetter || $0.isNumber || "/_+-".contains($0) })
-        else { return [] }
+/// The parts of a compiled zoneinfo (TZif) file `%Z` needs: the transition instants, the local-time
+/// type each one selects, and each type's UTC offset and designation. The 64-bit (version 2) block is
+/// preferred so that transitions past 2038 are described; a version-1 file falls back to its own block.
+private struct ZoneInfoFile {
+    var transitions: [Int64] = []
+    var typeIndex: [UInt8] = []
+    var types: [(offset: Int32, name: String)] = []
+
+    init?(name: String) {
+        guard !name.contains(".."), !name.hasPrefix("/"),
+              name.allSatisfy({ $0.isLetter || $0.isNumber || "/_+-".contains($0) }) else { return nil }
         var data: Data? = nil
         for root in ["/usr/share/zoneinfo/", "/var/db/timezone/zoneinfo/"] {
             if let d = try? Data(contentsOf: URL(fileURLWithPath: root + name)) { data = d; break }
         }
-        guard let d = data, d.count > 44, d[0] == 0x54, d[1] == 0x5A, d[2] == 0x69, d[3] == 0x66 else { return [] }
-        func be32(_ at: Int) -> Int { Int(d[at]) << 24 | Int(d[at + 1]) << 16 | Int(d[at + 2]) << 8 | Int(d[at + 3]) }
-        let isutcnt = be32(20), isstdcnt = be32(24), leapcnt = be32(28)
-        let timecnt = be32(32), typecnt = be32(36), charcnt = be32(40)
-        guard typecnt > 0, typecnt < 1024, charcnt >= 0, charcnt < 4096, timecnt >= 0 else { return [] }
-        let typesAt = 44 + timecnt * 5
-        let charsAt = typesAt + typecnt * 6
-        guard charsAt + charcnt <= d.count, isutcnt >= 0, isstdcnt >= 0, leapcnt >= 0 else { return [] }
-        var out: [(Int32, Bool, String)] = []
-        for i in 0..<typecnt {
+        guard let d = data, d.count > 44,
+              d[0] == 0x54, d[1] == 0x5A, d[2] == 0x69, d[3] == 0x66 else { return nil }   // "TZif"
+        let version = d[4]
+
+        func be32(_ at: Int) -> Int {
+            Int(d[at]) << 24 | Int(d[at + 1]) << 16 | Int(d[at + 2]) << 8 | Int(d[at + 3])
+        }
+        /// Reads the six counts of a header at `at`, or nil when they are not sane.
+        func counts(_ at: Int) -> (isutc: Int, isstd: Int, leap: Int, time: Int, type: Int, char: Int)? {
+            guard at + 44 <= d.count else { return nil }
+            let c = (be32(at + 20), be32(at + 24), be32(at + 28), be32(at + 32), be32(at + 36), be32(at + 40))
+            guard c.0 >= 0, c.1 >= 0, c.2 >= 0, c.3 >= 0, c.4 > 0, c.4 < 4096, c.5 >= 0, c.5 < 8192
+            else { return nil }
+            return c
+        }
+        guard let c1 = counts(0) else { return nil }
+        var base = 44, timeWidth = 4, leapWidth = 8, c = c1
+        if version >= 0x32 {                                    // '2' or later: use the 64-bit block
+            let v1size = c1.time * 5 + c1.type * 6 + c1.char + c1.leap * 8 + c1.isstd + c1.isutc
+            guard let c2 = counts(44 + v1size) else { return nil }
+            base = 44 + v1size + 44
+            timeWidth = 8
+            leapWidth = 12
+            c = c2
+        }
+        _ = leapWidth
+        let typesAt = base + c.time * (timeWidth + 1)
+        let charsAt = typesAt + c.type * 6
+        guard charsAt + c.char <= d.count else { return nil }
+        for i in 0..<c.time {
+            let p = base + i * timeWidth
+            var v: Int64 = 0
+            for k in 0..<timeWidth { v = (v << 8) | Int64(d[p + k]) }
+            if timeWidth == 4 { v = Int64(Int32(truncatingIfNeeded: v)) }
+            transitions.append(v)
+            typeIndex.append(d[base + c.time * timeWidth + i])
+        }
+        for i in 0..<c.type {
             let p = typesAt + i * 6
             let raw = UInt32(d[p]) << 24 | UInt32(d[p + 1]) << 16 | UInt32(d[p + 2]) << 8 | UInt32(d[p + 3])
-            let offset = Int32(bitPattern: raw)
-            let isDST = d[p + 4] != 0
             var idx = charsAt + Int(d[p + 5])
             var bytes: [UInt8] = []
-            while idx < d.count, d[idx] != 0, bytes.count < abbrevStride - 1 { bytes.append(d[idx]); idx += 1 }
-            out.append((offset, isDST, String(decoding: bytes, as: UTF8.self)))
+            while idx < d.count, d[idx] != 0, bytes.count < TimeZoneTable.abbrevStride - 1 {
+                bytes.append(d[idx]); idx += 1
+            }
+            types.append((Int32(bitPattern: raw), String(decoding: bytes, as: UTF8.self)))
         }
-        return out.map { (offset: $0.0, isDST: $0.1, name: $0.2) }
+        guard !types.isEmpty else { return nil }
+    }
+
+    /// The designation in force at UTC second `at`, provided its offset is the `offset` the caller
+    /// expects; nil when the file disagrees, so the caller can fall back.
+    func designation(at: Int64, offset: Int32) -> String? {
+        var lo = 0, hi = transitions.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if transitions[mid] <= at { lo = mid + 1 } else { hi = mid }
+        }
+        // Before the first transition tzcode uses the first non-DST type, which is type 0 in practice.
+        let t = lo == 0 ? 0 : Int(typeIndex[lo - 1])
+        guard t < types.count, types[t].offset == offset, !types[t].name.isEmpty else { return nil }
+        return types[t].name
     }
 }
 
@@ -389,6 +446,26 @@ extension MetalTemporalArray {
             if TZDispatch.flag(flags, .outOfRange) != nil { return nil }
         }
         return MetalBooleanArray(length: n, nullCount: nullCount, validity: validity, values: out, context: ctx)
+    }
+
+    // MARK: - to_timezone
+
+    /// Arrow's `cast` between timezones: retags a `timestamp` with `tz` (or with none when `tz` is nil).
+    ///
+    /// Metadata only, and deliberately so — Arrow stores a timestamp as UTC ticks whatever timezone the
+    /// type carries, so moving a column from `America/New_York` to `Asia/Tokyo` changes no value. The
+    /// function that *does* change values is `local_timestamp`, and the one that reads naive values as
+    /// wall clocks is `assume_timezone`. The zone is resolved first, so an unknown one is an error here
+    /// rather than at the first use.
+    public func toTimezone(_ tz: String?) throws -> MetalTemporalArray {
+        guard case .timestamp(let unit, _) = type else {
+            throw ArrowMetalError.unsupportedType("to_timezone is only defined for timestamps, not \(type.arrowFormat)")
+        }
+        if let tz, !tz.isEmpty {
+            _ = try resolveTimeZone(tz)
+            return try MetalTemporalArray(type: .timestamp(unit, timezone: tz), try int64Values())
+        }
+        return try MetalTemporalArray(type: .timestamp(unit, timezone: nil), try int64Values())
     }
 
     // MARK: - utc_offset

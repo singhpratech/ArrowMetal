@@ -1196,21 +1196,37 @@ _ROWS = [
      _u("nanosecond"), ((_TS,), {})),
     ("is_leap_year", "TemporalExtraction", GPU, "Kernels/TemporalMath.swift", "is_leap_year()", "UTC.",
      _u("is_leap_year"), ((_TS,), {})),
-    ("strftime", "TemporalExtraction", CPU, "Kernels/TemporalMath.swift", "strftime(format)",
-     "The C library's `strftime` against a `gmtime_r` struct on the host, plus a `%f` extension for "
-     "microseconds. Not a Unicode date pattern, and always UTC.",
+    ("strftime", "TemporalExtraction", GPU, "Kernels/TemporalFormat.swift", "strftime(format)",
+     "A C `strftime` format string, not a Unicode date pattern. The format is compiled on the host "
+     "into a small op list uploaded as a constant buffer, so one generic kernel serves every format "
+     "and none costs a shader recompile; the output width is data dependent, so it is the two-pass "
+     "shape — measure every row, scan the lengths into the Arrow offsets buffer on the GPU, emit. "
+     "`%Y %m %d %e %H %I %M %S %f %j %y %b %B %h %a %A %p %C %G %V %u %w %z %Z %F %T %D %R %n %t %%` "
+     "and literals run on the GPU; anything else falls back to the C library. A timestamp carrying a "
+     "timezone formats in that zone, as pyarrow does. Two documented departures from pyarrow, both of "
+     "them C's behaviour: `%S` stays two digits (pyarrow folds the fractional second into it) and "
+     "`%f` is ArrowMetal's six-digit fraction (pyarrow prints it literally).",
      lambda args, options: _out(_a(args[0]).strftime(options["format"])),
      ((_TS,), {"format": "%Y-%m-%d"})),
-    ("strptime", "TemporalExtraction", CPU, "Kernels/TemporalMath.swift", "strptime(format)",
-     "The C library's `strptime` on the host, UTC. `error_is_null` is not implemented — an unparseable "
-     "row is null either way.",
+    ("strptime", "TemporalExtraction", GPU, "Kernels/TemporalFormat.swift", "strptime(format)",
+     "The inverse of `strftime` on the same compiled op list, one pass with one thread per 32 rows so "
+     "each thread owns a whole validity word. The grammar is the C library's: a numeric field takes at "
+     "least one and at most its own width in digits and must land in its range, whitespace matches any "
+     "whitespace, and the whole value must be consumed. `%Y %m %d %e %H %I %M %S %f %y %b %B %h %a %A "
+     "%p %z %F %T %D %R %n %t %%` run on the GPU; anything else falls back to the C library's "
+     "`strptime`. Fields the format omits default to 1970-01-01 00:00:00, which is C's default rather "
+     "than pyarrow's 1900-01-01. `error_is_null` is not implemented — an unparseable row is null "
+     "either way.",
      lambda args, options: _out(_a(args[0]).strptime(options["format"])),
      ((pa.array(["2020-01-02", None, "1999-12-31"]),), {"format": "%Y-%m-%d"}),
      _oracle_keyword("strptime", unit="us")),
-    ("is_dst", "TemporalExtraction", CPU, "Kernels/TemporalExtra.swift", "is_dst()",
+    ("is_dst", "TemporalExtraction", GPU, "Kernels/TemporalExtra.swift", "is_dst()",
      "The one function here that does apply a timestamp's timezone, and so the one that needs the "
-     "IANA tz database — host data with no GPU-resident form. Runs on the host, sharded over "
-     "`DispatchQueue.concurrentPerform`. A naive timestamp is an error, as in Arrow.",
+     "IANA tz database. The zone's transition table is enumerated once on the host, uploaded once and "
+     "cached (`Kernels/TimezoneGPU.swift`), and the kernel is a binary search over it. A naive "
+     "timestamp is an error, as in Arrow. Agrees with pyarrow exactly from 1900 through 2037; past "
+     "2038 the host tz database projects each zone's current rule forward while pyarrow's bundled one "
+     "stops, so the two diverge there — a difference in the timezone data, not in the kernel.",
      _u("is_dst"), ((_TS_TZ,), {})),
     ("iso_calendar", "TemporalExtraction", GPU, "Kernels/TemporalExtra.swift", "iso_calendar()",
      "A struct of int64 `iso_year`, `iso_week` and `iso_day_of_week` (1 = Monday), UTC.",
@@ -1283,22 +1299,26 @@ _ROWS = [
      "The difference of the two calendar years.", _b("years_between"), ((_TS, _TS2), {})),
 
     # ---- Timezone ----------------------------------------------------------
-    ("assume_timezone", "Timezone", CPU, "Sources/ArrowMetal/Timezone.swift",
+    ("assume_timezone", "Timezone", GPU, "Kernels/TimezoneGPU.swift",
      "assume_timezone(tz, ambiguous, nonexistent)",
-     "Reads a naive column as wall-clock times in `tz` and returns the instants they name. Host-side "
-     "deliberately: the offsets are a lookup in the IANA tz database, which has no GPU-resident form, "
-     "so uploading the transition table per call would cost more than the arithmetic saves. Sharded "
-     "over `DispatchQueue.concurrentPerform` with a per-shard offset cache. A local time that occurs "
-     "twice or never raises by default; `\"earliest\"` / `\"latest\"` pick one, as Arrow does.",
+     "Reads a naive column as wall-clock times in `tz` and returns the instants they name. A timezone "
+     "is a step function over a few hundred instants — `America/New_York` has 559 UTC-offset "
+     "transitions between 1800 and 2200 — so the table is enumerated once per zone from the host tz "
+     "database, uploaded once and cached, and the kernel is a binary search plus an add. The search "
+     "runs over the *local* start of each interval, which decides Arrow's ambiguous and nonexistent "
+     "cases in the same pass: two intervals still running is a fall-back, none running is a "
+     "spring-forward gap. Raises for either by default; `\"earliest\"` / `\"latest\"` pick one, as "
+     "Arrow does. The host implementation stays as the fallback for a zone the tz database will not "
+     "enumerate and for values outside 1800-2200.",
      lambda args, options: _out(_a(args[0]).assume_timezone(options["timezone"],
                                                             options.get("ambiguous", "raise"),
                                                             options.get("nonexistent", "raise"))),
      ((_TS,), {"timezone": "America/New_York"}),
      lambda args, options: pc.assume_timezone(args[0], options["timezone"])),
-    ("local_timestamp", "Timezone", CPU, "Sources/ArrowMetal/Timezone.swift", "local_timestamp()",
+    ("local_timestamp", "Timezone", GPU, "Kernels/TimezoneGPU.swift", "local_timestamp()",
      "The wall-clock time each instant names in the column's own timezone, as a naive timestamp of "
-     "the same unit. Host-side for the same reason as `assume_timezone`; a column with no timezone "
-     "comes back unchanged.", _u("local_timestamp"), ((_TS_TZ,), {})),
+     "the same unit. One pass over the same transition table as `assume_timezone`; a column with no "
+     "timezone comes back unchanged.", _u("local_timestamp"), ((_TS_TZ,), {})),
 
     # ---- Random ------------------------------------------------------------
     ("random", "Random", GPU, "Kernels/Selection.swift", "am.random(n, initializer)",

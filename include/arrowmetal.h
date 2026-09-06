@@ -314,9 +314,17 @@ int  am_to_strings(am_array* a, am_array** out);
 //     it an error instead.
 //   * a is utf8 and format is anything else -> `strptime` with that C format, UTC, producing
 //     timestamp[us]; rescale afterwards with am_temporal_cast_unit. The whole value must be consumed.
-//     Fields the format does not mention default to 1970-01-01 00:00:00.
-//   * a is temporal -> `strftime` with that C format, UTC, producing utf8. %f is an ArrowMetal
-//     extension expanding to the six-digit fractional second. `strict` is ignored.
+//     Fields the format does not mention default to 1970-01-01 00:00:00. **GPU** (one pass, one thread
+//     per 32 rows) for %Y %m %d %e %H %I %M %S %f %y %b %B %h %a %A %p %z %F %T %D %R %n %t %%,
+//     whitespace and literals; anything else falls back to the C library's strptime on the host.
+//   * a is temporal -> `strftime` with that C format, producing utf8. %f is an ArrowMetal extension
+//     expanding to the six-digit fractional second, and %S stays two digits (which is C's reading, not
+//     pyarrow's -- pyarrow folds the fraction into %S and prints %f literally). `strict` is ignored.
+//     **GPU**, two passes (measure, scan into offsets, emit) for %Y %m %d %e %H %I %M %S %f %j %y %b %B
+//     %h %a %A %p %C %G %V %u %w %z %Z %F %T %D %R %n %t %% and literals; anything else falls back to
+//     the C library on the host. On the GPU path a timestamp carrying a timezone is formatted **in that
+//     zone**, as pyarrow does, which is what gives %z and %Z an answer; a naive timestamp, a date and a
+//     time are UTC. The host fallback is UTC throughout.
 int  am_parse(am_array* a, const char* format, int strict, am_array** out);
 
 // Temporal rounding, arithmetic and the calendar fields am_temporal_extract does not cover. All GPU,
@@ -440,7 +448,8 @@ int  am_run_end_decode(am_array* a, am_array** out);
 // The temporal functions beyond am_temporal_extract and am_temporal_math: the option-carrying week
 // numbers, the struct-valued extractors, subsecond, is_dst and every *_between difference. UTC
 // throughout — a timestamp's timezone rides along as metadata and is never applied to the value —
-// with is_dst the one exception, since its whole job is to ask what that timezone was doing.
+// with is_dst the one exception, since its whole job is to ask what that timezone was doing; it reads
+// the GPU-resident transition table am_assume_timezone builds.
 //
 // `b` is the second column for the *_between ops (a is the start, b the end, so the answer is
 // positive when b is later) and is ignored otherwise. Anything an op does not use may be NULL / 0.
@@ -452,7 +461,7 @@ int  am_run_end_decode(am_array* a, am_array** out);
 //   2  us_year                -                     -           int64    US epidemiological year
 //   3  iso_calendar           -                     -           struct   iso_year/iso_week/iso_day_of_week
 //   4  year_month_day         -                     -           struct   year/month/day
-//   5  is_dst                 -                     -           bool     CPU; needs a timezone
+//   5  is_dst                 -                     -           bool     needs a timezone (tz table)
 //   6  day_of_week            count_from_zero       week_start  int64    week_start 1 = Mon ... 7 = Sun
 //   7  subsecond              -                     -           float64  fraction of a second, [0, 1)
 //   8  years_between          -                     -           int64    calendar years crossed
@@ -687,9 +696,12 @@ int  am_map_lookup(am_array* a, const uint8_t* key_bytes, int64_t len, int occur
 // instants they name, tagged with that timezone. The unit and the sub-second part are unchanged.
 // `tz` is an IANA name ("America/New_York") or a fixed offset ("+02:00").
 //
-// **CPU**, deliberately: the tz database is host data (Foundation's TimeZone) with no GPU-resident form,
-// so the per-value offsets are computed on the host, sharded over DispatchQueue.concurrentPerform with a
-// per-shard cache of the current offset's validity interval.
+// **GPU**: a timezone is a step function over a few hundred instants (America/New_York has 559 UTC
+// offset transitions between 1800 and 2200), so the transition table is enumerated once per zone from
+// Foundation's TimeZone, uploaded once and cached; the kernel is a binary search over it and an add.
+// The host implementation stays as the fallback for a zone Foundation will not enumerate and for values
+// outside 1800-2200. Past 2038 both report the rules Foundation projects forward, which is where they
+// part company with pyarrow's bundled tz data -- see docs/COVERAGE.md.
 //
 // `ambiguous` and `nonexistent` are 0 raise (Arrow's default), 1 earliest, 2 latest. A local time that
 // occurs twice (a DST fall-back) picks the earlier / later instant; one that never occurs (a
@@ -697,9 +709,21 @@ int  am_map_lookup(am_array* a, const uint8_t* key_bytes, int64_t len, int occur
 int  am_assume_timezone(am_array* a, const char* tz, int ambiguous, int nonexistent, am_array** out);
 
 // Arrow local_timestamp: the wall-clock time each instant names in the column's own timezone, as a naive
-// timestamp of the same unit. A column with no timezone comes back unchanged. **CPU**, for the same
-// reason as am_assume_timezone.
+// timestamp of the same unit. A column with no timezone comes back unchanged. **GPU**, on the same
+// transition table as am_assume_timezone.
 int  am_local_timestamp(am_array* a, am_array** out);
+
+// The UTC offset in seconds that applies to each value in the column's own timezone, as int32. One GPU
+// pass over the same transition table -- the cheapest way to ask what a zone was doing at a set of
+// instants, and what strftime's %z and %Z are built on. A naive timestamp answers 0 everywhere; a fixed
+// offset answers its own offset.
+int  am_utc_offset(am_array* a, am_array** out);
+
+// Arrow's cast between timezones: retags a timestamp with `tz`, or strips the timezone when `tz` is NULL
+// or empty. Metadata only, deliberately -- Arrow stores a timestamp as UTC ticks whatever timezone the
+// type carries, so no value changes. am_local_timestamp is the function that does change values, and
+// am_assume_timezone the one that reads naive values as wall clocks. An unknown zone is an error.
+int  am_to_timezone(am_array* a, const char* tz, am_array** out);
 
 // ARROW:extension:name of an extension column, or NULL when the column is not an extension type. The
 // pointer is owned by the library and stays valid for the process's lifetime.

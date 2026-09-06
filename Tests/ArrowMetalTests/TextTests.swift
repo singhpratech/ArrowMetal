@@ -547,6 +547,152 @@ final class TextTests: XCTestCase {
         XCTAssertEqual(try d.strftime("%Y-%m-%d").toArray(), ["2020-02-29"])
     }
 
+    /// Every specifier the GPU formatter claims, byte for byte against the C library it replaced.
+    ///
+    /// `MetalTemporalArray.formatUTC` is that C library path (`gmtime_r` + `strftime` with `%f`
+    /// pre-expanded), so this is the GPU kernel against the implementation it took over from, over
+    /// 20k random instants from 1900 to 2100 in all four resolutions.
+    func testStrftimeGPUIsByteExactAgainstTheCLibrary() throws {
+        try requireRealGPU()
+        let formats = ["%Y", "%m", "%d", "%e", "%H", "%I", "%M", "%S", "%j", "%y", "%C",
+                       "%b", "%B", "%h", "%a", "%A", "%p", "%G", "%V", "%u", "%w",
+                       "%F", "%T", "%D", "%R", "%n", "%t", "%%",
+                       "%Y-%m-%d %H:%M:%S", "%A, %B %e, %Y", "%d/%b/%Y %I:%M %p", "%G-W%V-%u",
+                       "literal %% text %Y!", "%Y-%m-%dT%H:%M:%S.%f"]
+        let n = 20_000
+        let seconds = randomSeconds(n, seed: 7_705)
+        for unit in [ArrowTemporalUnit.second, .milli, .micro, .nano] {
+            let per = unit.perSecond
+            var g = TextRNG(31 + UInt64(per % 1_000))
+            let sub: [Int64] = (0..<n).map { _ in per == 1 ? 0 : Int64(g.next() % UInt64(per)) }
+            let values: [Int64?] = (0..<n).map { $0 % 997 == 5 ? nil : seconds[$0] * per + sub[$0] }
+            let ts = try MetalTemporalArray(type: .timestamp(unit, timezone: nil), values)
+            for f in formats {
+                let got = try ts.strftime(f).toArray()
+                for i in stride(from: 0, to: n, by: 7) {
+                    guard values[i] != nil else { XCTAssertNil(got[i]); continue }
+                    let micros = per <= 1_000_000 ? sub[i] * (1_000_000 / per) : sub[i] / (per / 1_000_000)
+                    let want = MetalTemporalArray.formatUTC(seconds: seconds[i], microseconds: micros,
+                                                            format: f)
+                    XCTAssertEqual(got[i], want, "format \(f) unit \(unit) row \(i) value \(values[i]!)")
+                    if got[i] != want { return }
+                }
+            }
+        }
+        // date32 goes through the same kernel with whole days.
+        let days: [Int64?] = [0, 18_321, -25_567, 47_481, nil]
+        let d = try MetalTemporalArray(type: .date32, days)
+        for f in ["%Y-%m-%d", "%j", "%A %B %e", "%G-W%V-%u"] {
+            let got = try d.strftime(f).toArray()
+            for (i, v) in days.enumerated() {
+                guard let v else { XCTAssertNil(got[i]); continue }
+                XCTAssertEqual(got[i], MetalTemporalArray.formatUTC(seconds: v * 86_400, microseconds: 0,
+                                                                    format: f), "\(f) row \(i)")
+            }
+        }
+        // An unknown specifier is not a failure: it falls back to the C library.
+        let ts = try MetalTemporalArray(type: .timestamp(.second, timezone: nil), [Int64(0)])
+        XCTAssertEqual(try ts.strftime("%c").toArray(),
+                       [MetalTemporalArray.formatUTC(seconds: 0, microseconds: 0, format: "%c")])
+    }
+
+    /// A timestamp carrying a timezone formats in that zone on the GPU path, which is what makes `%z`
+    /// and `%Z` meaningful. Checked against Foundation's own offset, and `%Z` against the abbreviation
+    /// the zone's own transition table carries.
+    func testStrftimeAppliesTheColumnTimezone() throws {
+        try requireRealGPU()
+        for tz in ["America/New_York", "Europe/Berlin", "Australia/Sydney", "Asia/Kolkata", "UTC"] {
+            let zone = try resolveTimeZone(tz)
+            // Two instants a year apart in each hemisphere's summer and winter.
+            let instants: [Int64] = [1_704_067_200, 1_719_792_000, -1_000_000_000, 946_684_800]
+            let ts = try MetalTemporalArray(type: .timestamp(.second, timezone: tz),
+                                            instants.map { Optional($0) })
+            let clock = try ts.strftime("%Y-%m-%d %H:%M:%S").toArray()
+            let offsets = try ts.strftime("%z").toArray()
+            let names = try ts.strftime("%Z").toArray()
+            let lookup = try ts.utcOffset().toArray()
+            for (i, t) in instants.enumerated() {
+                let o = Int64(zone.secondsFromGMT(for: Date(timeIntervalSince1970: Double(t))))
+                XCTAssertEqual(clock[i], MetalTemporalArray.formatUTC(seconds: t + o, microseconds: 0,
+                                                                      format: "%Y-%m-%d %H:%M:%S"),
+                               "\(tz) row \(i)")
+                let sign = o < 0 ? "-" : "+"
+                let a = abs(o)
+                XCTAssertEqual(offsets[i], String(format: "%@%02d%02d", sign, a / 3600, (a / 60) % 60),
+                               "\(tz) %z row \(i)")
+                XCTAssertEqual(lookup[i], Int32(o), "\(tz) utcOffset row \(i)")
+                XCTAssertFalse(names[i]?.isEmpty ?? true, "\(tz) %Z row \(i)")
+            }
+        }
+        // The well-known spellings, which Foundation's own `abbreviation(for:)` does not produce.
+        let winter: Int64 = 1_704_067_200, summer: Int64 = 1_719_792_000
+        for (tz, expected) in [("America/New_York", ["EST", "EDT"]), ("Europe/Berlin", ["CET", "CEST"]),
+                               ("Asia/Kolkata", ["IST", "IST"])] {
+            let ts = try MetalTemporalArray(type: .timestamp(.second, timezone: tz), [winter, summer])
+            XCTAssertEqual(try ts.strftime("%Z").toArray(), expected.map { Optional($0) }, tz)
+        }
+    }
+
+    /// The GPU parser against the C library's `strptime` + `timegm`, on well-formed and malformed
+    /// input alike. The one deliberate difference is `%f`, which C has no notion of.
+    func testStrptimeGPUAgreesWithTheCLibrary() throws {
+        try requireRealGPU()
+        let formats = ["%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d/%b/%Y %H:%M:%S", "%m/%d/%y",
+                       "%Y-%m-%dT%H:%M:%S", "%B %d, %Y", "%A %d %B %Y", "%H:%M:%S", "%I:%M %p"]
+        let n = 5_000
+        let seconds = randomSeconds(n, seed: 4_242)
+        for f in formats {
+            let ts = try MetalTemporalArray(type: .timestamp(.second, timezone: nil),
+                                            seconds.map { Optional($0) })
+            let text = try ts.strftime(f)
+            let got = try text.strptime(f, unit: .second).toArray()
+            let rows = text.toArray()
+            for i in stride(from: 0, to: n, by: 3) {
+                XCTAssertEqual(got[i], Self.cStrptime(rows[i]!, f), "format \(f) row \(i) text \(rows[i]!)")
+                if got[i] != Self.cStrptime(rows[i]!, f) { return }
+            }
+        }
+        // Malformed input fails the same way it fails on the host.
+        let bad = ["2020-01-02", "nonsense", "2020-01-02 extra", "", "2020-13-02", "2020-01-32",
+                   "9999-12-31", " 2020-01-02", "2020-01-02 ", "2020-1-2", "20200102",
+                   "+2020-01-02", "-0001-01-01", "2020-01-", "2020--1-02"]
+        for f in ["%Y-%m-%d", "%Y-%m-%d %H:%M:%S"] {
+            let text = try MetalStringArray(bad.map { Optional($0) } + [nil])
+            let got = try text.strptime(f, unit: .second).toArray()
+            for (i, s) in bad.enumerated() {
+                XCTAssertEqual(got[i], Self.cStrptime(s, f), "format \(f) input \"\(s)\"")
+            }
+            XCTAssertNil(got[bad.count])
+        }
+        // Two documented departures from the host path, both of them the C library falling short.
+        // `timegm` reports failure for a year the proleptic Gregorian calendar handles exactly:
+        let ancient = try MetalStringArray(["0001-01-01", "0000-01-01"])
+        XCTAssertEqual(try ancient.strptime("%Y-%m-%d", unit: .second).toArray(),
+                       [-62_135_596_800, -62_167_219_200])
+        XCTAssertEqual(Self.cStrptime("0001-01-01", "%Y-%m-%d"), -1)
+        // And `%f` is ArrowMetal's own: it round-trips against `strftime`, which C cannot do.
+        let micros = try MetalTemporalArray(type: .timestamp(.micro, timezone: nil),
+                                            [1_614_834_367_008_009, nil, -1])
+        let text = try micros.strftime("%Y-%m-%dT%H:%M:%S.%f")
+        XCTAssertEqual(try text.strptime("%Y-%m-%dT%H:%M:%S.%f", unit: .micro).toArray(),
+                       [1_614_834_367_008_009, nil, -1])
+    }
+
+    /// The C library's `strptime` + `timegm`, the implementation the GPU parser replaced.
+    private static func cStrptime(_ s: String, _ format: String) -> Int64? {
+        var tmv = tm()
+        tmv.tm_mday = 1
+        tmv.tm_year = 70
+        let parsed: Bool = s.withCString { cs in
+            format.withCString { cf in
+                guard let rest = Darwin.strptime(cs, cf, &tmv) else { return false }
+                return rest.pointee == 0
+            }
+        }
+        guard parsed else { return nil }
+        return Int64(timegm(&tmv))
+    }
+
     func testStrptimeFailuresAreNull() throws {
         try requireRealGPU()
         let text = try MetalStringArray(["2020-01-02", "nonsense", "2020-01-02 extra", nil, ""])

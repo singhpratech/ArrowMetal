@@ -278,17 +278,25 @@ extension MetalTemporalArray {
         return MetalBooleanArray(length: n, nullCount: nullCount, validity: validity, values: out, context: ctx)
     }
 
-    // MARK: - Formatting and parsing (CPU)
+    // MARK: - Formatting and parsing
 
-    /// Arrow `strftime`, UTC. `format` is a **C `strftime` format string** (`%Y-%m-%d %H:%M:%S`),
-    /// evaluated by the C library against a `struct tm` built with `gmtime_r` — not a `DateFormatter`
-    /// Unicode pattern. One extension beyond C: `%f` expands to the six-digit fractional second, so
-    /// `"%Y-%m-%dT%H:%M:%S.%f"` prints microseconds. Null in, null out; a value whose seconds do not
-    /// fit a `time_t` calendar comes back null.
+    /// Arrow `strftime`. `format` is a **C `strftime` format string** (`%Y-%m-%d %H:%M:%S`) — not a
+    /// `DateFormatter` Unicode pattern. One extension beyond C: `%f` expands to the six-digit
+    /// fractional second, so `"%Y-%m-%dT%H:%M:%S.%f"` prints microseconds. Null in, null out.
+    ///
+    /// **GPU** (`Kernels/TemporalFormat.swift`, two passes) for `%Y %m %d %e %H %I %M %S %f %j %y %b
+    /// %B %h %a %A %p %C %G %V %u %w %z %Z %F %T %D %R %n %t %%` and literal text; any other specifier
+    /// falls back to the C library on the host, evaluated against a `gmtime_r` struct, where a value
+    /// whose seconds do not fit a `time_t` calendar comes back null.
+    ///
+    /// A `timestamp` carrying a timezone formats **in that zone** on the GPU path, which is what
+    /// pyarrow does and what gives `%z` and `%Z` an answer; a naive timestamp, a `date` and a `time`
+    /// are UTC. The host fallback is UTC throughout.
     public func strftime(_ format: String) throws -> MetalStringArray {
         guard let (mode, divisor) = type.extraction else {
             throw ArrowMetalError.unsupportedType("strftime is not defined for \(type.arrowFormat)")
         }
+        if let gpu = try strftimeGPU(format) { return gpu }
         let n = length
         var rows = [String?](repeating: nil, count: n)
         for i in 0..<n {
@@ -350,9 +358,21 @@ extension MetalStringArray {
     /// Arrow `strptime`, UTC. `format` is a **C `strptime` format string**; the whole value must be
     /// consumed, so trailing text is a failure. Fields the format does not mention default to
     /// 1970-01-01 00:00:00. A row that does not parse comes back null, or throws when `strict` is set.
-    /// Always CPU (`strptime` + `timegm`), sharded over `DispatchQueue.concurrentPerform`.
+    ///
+    /// **GPU** (`Kernels/TemporalFormat.swift`, one pass, one thread per 32 rows so each thread owns a
+    /// whole validity word) for `%Y %m %d %e %H %I %M %S %f %y %b %B %h %a %A %p %z %F %T %D %R %n %t
+    /// %%`, whitespace and literal text; any other specifier falls back to the C library's `strptime`
+    /// plus `timegm` on the host, sharded over `DispatchQueue.concurrentPerform`. `%f` is the inverse
+    /// of `strftime`'s `%f` extension and has no host equivalent — the C library rejects it.
     public func strptime(_ format: String, unit: ArrowTemporalUnit = .second,
                          timezone: String? = nil, strict: Bool = false) throws -> MetalTemporalArray {
+        if let gpu = try strptimeGPU(format, unit: unit, timezone: timezone) {
+            if strict, gpu.nullCount > nullCount {
+                throw ArrowMetalError.invalidArrowArray(
+                    "\(gpu.nullCount - nullCount) of \(length) values do not match the format \"\(format)\"")
+            }
+            return gpu
+        }
         let n = length, ctx = context
         let outVals = try MetalArrowBuffer.allocate(byteCount: Swift.max(n * 8, 8), zeroed: true, context: ctx)
         let outValid = try MetalArrowBuffer.allocate(byteCount: Swift.max(Bitmap.byteCount(bits: n), 1),

@@ -865,14 +865,23 @@ def _am_parse(self, target, strict=False):
 
 
 def _am_strftime(self, fmt):
-    """Formats a temporal column in UTC with a C strftime format. `%f` is an ArrowMetal extension for
-    the six-digit fractional second. CPU."""
+    """Formats a temporal column with a C strftime format. `%f` is an ArrowMetal extension for the
+    six-digit fractional second and `%S` stays two digits, which is C's reading rather than pyarrow's.
+
+    GPU (two passes: measure every row, scan into the offsets buffer, emit) for `%Y %m %d %e %H %I %M
+    %S %f %j %y %b %B %h %a %A %p %C %G %V %u %w %z %Z %F %T %D %R %n %t %%` and literal text; any
+    other specifier falls back to the C library on the host. A timestamp carrying a timezone is
+    formatted in that zone on the GPU path, as pyarrow does; a naive one is UTC."""
     return _call(_lib.am_parse, self._h, fmt.encode(), 0)
 
 
 def _am_strptime(self, fmt):
     """Parses a utf8 column with a C strptime format, UTC, into timestamp[us]. Values that do not
-    parse come back null. CPU."""
+    parse come back null.
+
+    GPU (one pass, one thread per 32 rows) for `%Y %m %d %e %H %I %M %S %f %y %b %B %h %a %A %p %z %F
+    %T %D %R %n %t %%`, whitespace and literal text; any other specifier falls back to the C library's
+    strptime on the host."""
     return _call(_lib.am_parse, self._h, fmt.encode(), 0)
 
 
@@ -1398,7 +1407,8 @@ for _name, _extra in [("am_cast_float16", [ctypes.c_int]), ("am_decimal_widen", 
                       ("am_list_slice", [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64]),
                       ("am_map_lookup", [ctypes.c_char_p, ctypes.c_int64, ctypes.c_int]),
                       ("am_assume_timezone", [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]),
-                      ("am_local_timestamp", []), ("am_extension_storage", []),
+                      ("am_local_timestamp", []), ("am_utc_offset", []),
+                      ("am_to_timezone", [ctypes.c_char_p]), ("am_extension_storage", []),
                       ("am_extension_wrap", [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int64]),
                       ("am_interval_between", [_P, ctypes.c_int]),
                       ("am_interval_field", [ctypes.c_int])]:
@@ -1545,9 +1555,10 @@ def _assume_timezone(self, tz, ambiguous="raise", nonexistent="raise"):
     """Arrow `assume_timezone`: reads a naive timestamp column as wall-clock times in `tz` and returns
     the instants they name, tagged with that timezone. The unit and the sub-second part are unchanged.
 
-    **CPU**: the tz database is host data, so the per-value offsets are computed on the host (sharded
-    across cores) rather than on the GPU. A local time that occurs twice or never is an error by
-    default; pass "earliest" / "latest" to pick one, as Arrow does."""
+    **GPU**: the zone's UTC-offset transition table (a few hundred instants) is enumerated once from
+    the host tz database, uploaded once and cached, and the kernel is a binary search over it and an
+    add. A local time that occurs twice or never is an error by default; pass "earliest" / "latest" to
+    pick one, as Arrow does."""
     a = _TZ_HANDLING.get(ambiguous)
     n = _TZ_HANDLING.get(nonexistent)
     if a is None or n is None:
@@ -1557,9 +1568,25 @@ def _assume_timezone(self, tz, ambiguous="raise", nonexistent="raise"):
 
 def _local_timestamp(self):
     """Arrow `local_timestamp`: the wall-clock time each instant names in the column's own timezone, as
-    a naive timestamp of the same unit. A column with no timezone comes back unchanged. **CPU**, for
-    the same reason as `assume_timezone`."""
+    a naive timestamp of the same unit. A column with no timezone comes back unchanged. **GPU**, on the
+    same transition table as `assume_timezone`."""
     return _call(_lib.am_local_timestamp, self._h)
+
+
+def _utc_offset(self):
+    """The UTC offset in seconds that applies to each value in the column's own timezone, as int32.
+
+    **GPU**: one pass over the same transition table `assume_timezone` and `local_timestamp` use, so
+    this is the cheapest way to ask what a zone was doing at a set of instants. A naive timestamp
+    answers 0 everywhere and a fixed-offset zone answers its own offset."""
+    return _call(_lib.am_utc_offset, self._h)
+
+
+def _to_timezone(self, tz):
+    """Arrow's `cast` between timezones: retags a timestamp with `tz`, or strips the timezone when `tz`
+    is None. Metadata only — Arrow stores a timestamp as UTC ticks whatever timezone the type carries,
+    so no value changes; `local_timestamp` is the function that does change values."""
+    return _call(_lib.am_to_timezone, self._h, None if tz is None else tz.encode("utf-8"))
 
 
 def _interval_between(self, other, kind):
@@ -1623,6 +1650,8 @@ MetalArray.list_slice = _list_slice
 MetalArray.map_lookup = _map_lookup
 MetalArray.assume_timezone = _assume_timezone
 MetalArray.local_timestamp = _local_timestamp
+MetalArray.utc_offset = _utc_offset
+MetalArray.to_timezone = _to_timezone
 MetalArray.interval_between = _interval_between
 MetalArray.interval_field = _interval_field
 MetalArray.extension_name = _extension_name
@@ -1721,7 +1750,8 @@ for _op, _doc in [
                      "(1 = Monday). Read a field with struct_field(name)."),
     ("year_month_day", "Arrow year_month_day: a struct of int64 year, month and day."),
     ("is_dst", "Arrow is_dst: whether each value falls in daylight saving time in the column's own "
-               "timezone. Needs a timestamp carrying a timezone; a naive one is an error. CPU."),
+               "timezone. Needs a timestamp carrying a timezone; a naive one is an error. GPU: a "
+               "binary search over the zone's transition table, which is uploaded once per zone."),
     ("subsecond", "Arrow subsecond: the fraction of a second, in [0, 1), as float64. date32 and "
                   "date64 answer 0 (pyarrow has no kernel for them); duration is rejected."),
 ]:
