@@ -346,6 +346,16 @@ impl Array {
         check(unsafe { ffi::am_export(self.handle, schema, array) })
     }
 
+    /// `export` through raw pointers, for a caller holding another crate's ABI-compatible
+    /// `ArrowSchema`/`ArrowArray` (`polars_arrow::ffi`, whose fields are not public).
+    ///
+    /// # Safety
+    /// Both pointers must be non-null and point at unset (released) structs of the layouts in
+    /// this module.
+    pub unsafe fn export_raw(&self, schema: *mut ArrowSchema, array: *mut ArrowArray) -> Result<()> {
+        check(unsafe { ffi::am_export(self.handle, schema, array) })
+    }
+
     pub fn len(&self) -> i64 {
         unsafe { ffi::am_length(self.handle) }
     }

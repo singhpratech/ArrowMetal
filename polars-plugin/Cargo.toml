@@ -1,0 +1,33 @@
+[workspace]
+members = ["arrowmetal-sys"]
+
+[package]
+name = "arrowmetal-polars"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "GPU expressions for Polars lazy plans, backed by ArrowMetal on Apple silicon"
+repository = "https://github.com/arrowmetal/ArrowMetal"
+publish = false
+
+[lib]
+name = "arrowmetal_polars"
+# cdylib is what Polars dlopen()s; rlib keeps `cargo test` able to link the crate.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+arrowmetal-sys = { path = "arrowmetal-sys" }
+# Pinned to the Rust crates that py-polars 1.44.x is built from: the polars workspace at tag
+# py-1.44.1 carries version 0.55.1, and pyo3-polars 0.28 is the release that tracks it. The
+# plugin ABI is checked at load time (`_polars_plugin_get_version`), so a mismatched pair is
+# refused by Polars with "this Polars engine doesn't support plugin version".
+polars = { version = "0.55.1", default-features = false, features = ["dtype-struct", "dtype-full"] }
+polars-plan = { version = "0.55.1", default-features = false }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
+pyo3-polars = { version = "0.28.0", features = ["derive", "dtype-full"] }
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "debuginfo"
