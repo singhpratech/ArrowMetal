@@ -241,9 +241,9 @@ def test_not_runnable_row_names_its_reason(name):
 def test_print_markdown_table(capsys):
     """Print the per-section counts, and check the full table is complete and well formed.
 
-    The counts are what a reader wants on every run; the full 307-row table is what gets pasted into
-    docs/COVERAGE.md, so it comes out of `python/tests/function_table_report.py` instead of scrolling
-    past on every test run.
+    The counts are what a reader wants on every run; the full 307-row table is the body of
+    docs/ARROW_FUNCTIONS.md, so it comes out of `python/tests/function_table_report.py` instead of
+    scrolling past on every test run.
     """
     table = F.markdown_table()
     assert table.count("\n") == len(F.list_functions()) + 1, "one row per Arrow name, plus the header"

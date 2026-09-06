@@ -6,7 +6,8 @@ every claim the project makes.
 | Read this | To learn |
 |---|---|
 | [../README.md](../README.md) | What ArrowMetal is, the pitch, headline numbers, quick start in Swift and Python |
-| [COVERAGE.md](COVERAGE.md) | Exactly which Apache Arrow compute functions and types are supported, and how (GPU, CPU, partial), function by function |
+| [ARROW_FUNCTIONS.md](ARROW_FUNCTIONS.md) | Coverage of Apache Arrow compute by **exact name**: all 307 v25 function names, one row each, generated from a registry the test suite executes against `pyarrow.compute` |
+| [COVERAGE.md](COVERAGE.md) | The same ground by **family**, with the Arrow type matrix and interop: which functions and types are supported, and how (GPU, GPU/CPU, CPU, partial) |
 | [EVALUATION.md](EVALUATION.md) | How correctness is checked: CPU oracles, the scenario matrix, bit-exact IEEE-754 tests, and the differential harness against pyarrow.compute, with open findings |
 | [TESTING.md](TESTING.md) | Every test suite, what it covers, and the commands to run it |
 | [BENCHMARKS.md](BENCHMARKS.md) | Every benchmark round with hardware, methodology, wall time and CPU time; the tables the README quotes |

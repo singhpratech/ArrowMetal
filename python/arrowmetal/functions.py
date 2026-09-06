@@ -5,9 +5,9 @@ and :func:`call_function` — over the Arrow v25 compute function list (283 name
 the 24 ``hash_*`` grouped aggregates). Every one of those names is present. A name either resolves
 to an ArrowMetal call, or it carries an explicit record saying it is not implemented and why.
 
-The single source of truth is :data:`_TABLE` below. :func:`function_table` reads it, the tests read
-it, and ``python/tests/function_table_report.py`` turns it into the Markdown that goes into
-``docs/COVERAGE.md``. Nothing here infers a status from anything else, so a row is only ever as
+The single source of truth is :data:`_ROWS` below. :func:`function_table` reads it, the tests read it,
+and ``python/tests/function_table_report.py --page`` turns it into the whole of
+``docs/ARROW_FUNCTIONS.md``. Nothing here infers a status from anything else, so a row is only ever as
 accurate as the line that states it — and the test suite calls every row that claims to work.
 
 Status vocabulary, deliberately strict:
@@ -1691,8 +1691,8 @@ def call_function(name, args, options=None):
 
 
 def markdown_table(sections=None):
-    """The registry as a Markdown table, ready to paste into docs/COVERAGE.md."""
-    lines = ["| Arrow function | Section | Status | Implementation | ArrowMetal call | Notes |",
+    """The registry as a Markdown table — the body of docs/ARROW_FUNCTIONS.md."""
+    lines = ["| Arrow function | Section | Status | ArrowMetal call | Implementation | Notes |",
              "|---|---|---|---|---|---|"]
     wanted = sections or SECTIONS
     for section in wanted:
@@ -1701,9 +1701,11 @@ def markdown_table(sections=None):
                 continue
             status = {GPU: "**GPU**", CPU: "**CPU**", PARTIAL: "**Partial**",
                       MISSING: "Missing", PENDING: "Pending"}[f.status]
-            notes = f.notes.replace("|", "\\|").replace("\n", " ")
-            lines.append(f"| `{f.name}` | {f.section} | {status} | `{f.swift_file}` | "
-                         f"`{f.method}` | {notes} |")
+            # A literal pipe would end the cell, even inside a code span, so escape it everywhere.
+            def cell(text):
+                return text.replace("|", "\\|").replace("\n", " ")
+            lines.append(f"| `{cell(f.name)}` | {cell(f.section)} | {status} | `{cell(f.method)}` | "
+                         f"`{cell(f.swift_file)}` | {cell(f.notes)} |")
     return "\n".join(lines)
 
 
