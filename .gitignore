@@ -1,0 +1,7 @@
+.build/
+.build-asan/
+.swiftpm/
+*.xcodeproj
+xcuserdata/
+.DS_Store
+Package.resolved
