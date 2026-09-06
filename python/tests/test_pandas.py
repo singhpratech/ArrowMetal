@@ -353,6 +353,9 @@ def test_lazy_module_attributes():
     assert callable(am.from_pandas) and callable(am.to_pandas)
     with pytest.raises(AttributeError):
         am.definitely_not_a_thing
+    # the pandas bridge must register on the shared hook list, never replace the module __getattr__
+    assert any(names() and "from_pandas" in names() for _, names in am._LAZY_HOOKS)
+    assert "from_pandas" in dir(am)
 
 
 def test_accessor_query(frames):

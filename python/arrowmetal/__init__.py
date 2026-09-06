@@ -3208,11 +3208,11 @@ _PANDAS_EXPORTS = {"from_pandas": "pandas_bridge", "to_pandas": "pandas_bridge",
                    "zero_copy_report": "pandas_bridge", "pandas_bridge": None, "pandas_accel": None}
 
 
-def __getattr__(name):
+def _pandas_getattr(name):
     """`am.from_pandas` / `am.to_pandas` / `am.pandas_bridge` / `am.pandas_accel` on first use."""
     where = _PANDAS_EXPORTS.get(name, ...)
     if where is ...:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+        raise AttributeError(name)
     import importlib
     mod = importlib.import_module(f"{__name__}.{where or name}")
     value = mod if where is None else getattr(mod, name)
@@ -3220,5 +3220,25 @@ def __getattr__(name):
     return value
 
 
-def __dir__():
-    return sorted(list(globals()) + list(_PANDAS_EXPORTS))
+# Every lazy bridge registers here rather than defining its own module `__getattr__`: a second
+# definition would replace the first and silently disable the bridges that came before it.
+try:
+    _LAZY_HOOKS
+except NameError:
+    _LAZY_HOOKS = []
+
+    def __getattr__(name):
+        for _hook, _names in _LAZY_HOOKS:
+            try:
+                return _hook(name)
+            except AttributeError:
+                continue
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    def __dir__():
+        names = list(globals())
+        for _hook, _names in _LAZY_HOOKS:
+            names += list(_names())
+        return sorted(set(names))
+
+_LAZY_HOOKS.append((_pandas_getattr, lambda: list(_PANDAS_EXPORTS)))
