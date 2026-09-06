@@ -14,8 +14,9 @@ extension MetalArray {
         let ctx = context
         let out = try MetalArrowBuffer.allocate(byteCount: n * T.byteWidth, zeroed: false, context: ctx)
         let isDouble = T.self == Double.self
-        let src = isDouble ? KernelSource.arithmeticDouble : KernelSource.arithmetic(T: T.mslType)
-        let pso = try Dispatch.pipeline(ctx, family: "arith", source: src, function: "arith_scalar_\(op.rawValue)", type: isDouble ? "double" : T.mslType)
+        let pso = try Dispatch.pipeline(ctx, family: "arith",
+                                        source: isDouble ? KernelSource.arithmeticDouble : KernelSource.arithmetic(T: T.mslType),
+                                        function: "arith_scalar_\(op.rawValue)", type: isDouble ? "double" : T.mslType)
         try ctx.run { enc in
             enc.setComputePipelineState(pso)
             enc.setBuffer(values.mtl, offset: values.offset, index: 0)
@@ -35,8 +36,9 @@ extension MetalArray {
         let ctx = context
         let out = try MetalArrowBuffer.allocate(byteCount: n * T.byteWidth, zeroed: false, context: ctx)
         let isDouble = T.self == Double.self
-        let src = isDouble ? KernelSource.arithmeticDouble : KernelSource.arithmetic(T: T.mslType)
-        let pso = try Dispatch.pipeline(ctx, family: "arith", source: src, function: "arith_array_\(op.rawValue)", type: isDouble ? "double" : T.mslType)
+        let pso = try Dispatch.pipeline(ctx, family: "arith",
+                                        source: isDouble ? KernelSource.arithmeticDouble : KernelSource.arithmetic(T: T.mslType),
+                                        function: "arith_array_\(op.rawValue)", type: isDouble ? "double" : T.mslType)
         try ctx.run { enc in
             enc.setComputePipelineState(pso)
             enc.setBuffer(values.mtl, offset: values.offset, index: 0)

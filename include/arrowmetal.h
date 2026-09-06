@@ -1074,6 +1074,26 @@ int  am_cumulative_checked(am_array* a, int op, int64_t p1, am_array** out);
 int  am_math_extra(am_array* a, int op, am_array* b /* or NULL */, const void* scalar /* or NULL */,
                    int64_t p1, am_array** out);
 
+// Dispatch latency (see docs/RESIDENT.md).
+//
+// am_resident_mode asks for a persistent GPU worker: one long-running kernel spinning on a work
+// queue in unified memory, so a small op costs a memory round trip instead of a command buffer.
+// It returns 1 if the mode took effect and 0 if it did not, and on Apple silicon it always returns
+// 0 -- a running Metal kernel and the CPU are not cache coherent through shared storage, so a CPU
+// store reaches a spinning kernel only when the line is evicted, which measured 0.4 to 1.4 seconds
+// against a 65 microsecond command-buffer round trip. am_resident_mode_reason() has the detail.
+int         am_resident_mode(int on);
+int         am_resident_mode_available(void);
+const char* am_resident_mode_reason(void);
+
+// The path that replaced it. With the low-latency wait on (the default), a command buffer signals
+// an MTLSharedEvent whose value the CPU polls straight out of memory instead of calling
+// waitUntilCompleted: ~65 us against ~78 us per round trip on an M4 Max. Both calls return the
+// setting now in force. am_spin_microseconds sets how long the CPU spins before it blocks; 0 blocks
+// immediately, which costs latency and frees the core.
+int     am_low_latency_wait(int on);
+int64_t am_spin_microseconds(int64_t microseconds);   // pass a negative value to read without setting
+
 #ifdef __cplusplus
 }
 #endif

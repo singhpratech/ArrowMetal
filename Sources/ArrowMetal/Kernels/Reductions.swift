@@ -135,9 +135,13 @@ extension MetalArray {
         else { mslT = T.mslType; acc = "ulong"; minInit = "ULONG_MAX"; maxInit = "0" }
         // Float sum must include NaN (it propagates); only min/max skip NaN.
         if fn == "reduce_sum" { extra = "true" }
-        let src = KernelSource.reductions(T: mslT, ACC: acc, minInit: minInit, maxInit: maxInit, load: load, extra: extra,
-                                          combineSum: combineSum, extraPrelude: extraPrelude)
-        let pso = try Dispatch.pipeline(ctx, family: "reduce", source: src, function: fn, type: mslT + (extra == "true" ? "" : "/skipnan") + (extraPrelude.isEmpty ? "" : "/dd"))
+        // The source generator is passed inline (not via a `let`) so a warm pipeline cache never
+        // builds the MSL: that string work measured ~20 µs per call, a fifth of a 1,000-row sum.
+        let pso = try Dispatch.pipeline(ctx, family: "reduce",
+                                        source: KernelSource.reductions(T: mslT, ACC: acc, minInit: minInit, maxInit: maxInit,
+                                                                        load: load, extra: extra, combineSum: combineSum,
+                                                                        extraPrelude: extraPrelude),
+                                        function: fn, type: mslT + (extra == "true" ? "" : "/skipnan") + (extraPrelude.isEmpty ? "" : "/dd"))
         // Enough threadgroups to saturate the GPU, but few enough that the CPU finalise is trivial.
         let groups = Swift.max(1, Swift.min(2048, (n + Dispatch.threadgroupSize - 1) / Dispatch.threadgroupSize))
         let partials = try MetalArrowBuffer.allocate(byteCount: groups * 8, zeroed: false, context: ctx)

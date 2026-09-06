@@ -66,21 +66,80 @@ public final class MetalContext: @unchecked Sendable {
     /// Recycles page-aligned buffers so repeated kernels do not pay mmap and page-fault costs.
     public let pool: BufferPool
 
+    // MARK: Low-latency completion (see docs/RESIDENT.md)
+
+    /// Wait for command buffers on an `MTLSharedEvent` the command buffer signals, instead of
+    /// `waitUntilCompleted`. Measured on M4 Max: ~65 µs median per empty round trip against ~78 µs
+    /// for `waitUntilCompleted` and ~80 µs for spinning on `MTLCommandBuffer.status`.
+    /// Set to false to restore the previous behaviour.
+    public var lowLatencyWait = true
+    /// The event every synchronous command buffer signals. `signaledValue` lives in memory the CPU
+    /// can read without a driver round trip, which is why spinning on it beats spinning on `status`.
+    let completionEvent: MTLSharedEvent?
+    /// Serialises "take the next event value, encode the signal, commit" so that event values are
+    /// handed out in commit order. Without it a second thread could signal a higher value first and
+    /// release a waiter whose own work has not run.
+    let commitLock = NSLock()
+    private var nextEventValue: UInt64 = 0
+
     public init(device: MTLDevice? = nil, poolLimitBytes: Int? = nil) throws {
         guard let dev = device ?? MTLCreateSystemDefaultDevice() else { throw ArrowMetalError.noMetalDevice }
         guard let q = dev.makeCommandQueue() else { throw ArrowMetalError.noMetalDevice }
         self.device = dev
         self.queue = q
+        self.completionEvent = dev.makeSharedEvent()
         // Default cap: a quarter of the recommended working set, at most 8 GB.
         let cap = poolLimitBytes ?? Swift.min(Int(dev.recommendedMaxWorkingSetSize) / 4, 8 << 30)
         self.pool = BufferPool(limitBytes: cap)
         self.pool.context = self
     }
 
+    /// Commits `cb` and blocks until it has completed, using the cheapest wait available.
+    ///
+    /// With `lowLatencyWait` the command buffer signals a shared event whose value the CPU polls
+    /// directly out of memory; the event value is taken under `commitLock` so values are issued in
+    /// commit order and `signaledValue >= v` really does mean "this command buffer finished".
+    func commitAndWait(_ cb: MTLCommandBuffer) {
+        guard lowLatencyWait, let ev = completionEvent else {
+            cb.commit()
+            wait(cb)
+            return
+        }
+        commitLock.lock()
+        nextEventValue &+= 1
+        let v = nextEventValue
+        cb.encodeSignalEvent(ev, value: v)
+        cb.commit()
+        commitLock.unlock()
+        waitForEvent(ev, value: v, cb)
+    }
+
+    /// Spins on the shared event, then falls back to blocking. Reads the clock once per 64 polls:
+    /// `mach_absolute_time` is ~20x cheaper than `DispatchTime.now()` (which goes through
+    /// `dispatch_time`) and the polled value itself is a plain memory read.
+    private func waitForEvent(_ ev: MTLSharedEvent, value v: UInt64, _ cb: MTLCommandBuffer) {
+        let deadline = machNow() &+ MetalContext.ticks(microseconds: spinMicroseconds)
+        var poll = 0
+        while ev.signaledValue < v {
+            poll &+= 1
+            if poll & 63 == 0 {
+                if cb.status == .error { return }
+                if machNow() > deadline { cb.waitUntilCompleted(); return }
+            }
+        }
+    }
+
     /// Returns a compiled compute pipeline for `function` inside `source`, compiling and caching on first use.
-    public func pipeline(source: String, function: String, cacheKey: String) throws -> MTLComputePipelineState {
+    ///
+    /// `source` is an autoclosure on purpose: generating the MSL for a kernel family is string work
+    /// (interpolation plus `replacingOccurrences`) that measured ~20 µs per call on M4 Max — a fifth of
+    /// a 1,000-row `sum` — even though the pipeline was already compiled and cached. Deferring it means
+    /// the string is only ever built on a cache miss. Callers must pass the generator expression
+    /// directly rather than a `let` computed beforehand, or the saving is lost.
+    public func pipeline(source: @autoclosure () -> String, function: String, cacheKey: String) throws -> MTLComputePipelineState {
         lock.lock(); defer { lock.unlock() }
         if let p = pipelines[cacheKey] { return p }
+        let source = source()
         let lib: MTLLibrary
         if let l = libraries[source] {
             lib = l
@@ -137,8 +196,7 @@ public final class MetalContext: @unchecked Sendable {
         }
         try body(enc)
         enc.endEncoding()
-        cb.commit()
-        wait(cb)
+        commitAndWait(cb)
         if let err = cb.error { throw ArrowMetalError.pipelineCreationFailed("command buffer failed: \(err)") }
         return cb
     }
@@ -214,8 +272,7 @@ public final class MetalContext: @unchecked Sendable {
     /// Called automatically by any CPU-side read of a pending result.
     public func flush(reopen: Bool = false) throws {
         guard let b = detachBatch() else { return }
-        b.commandBuffer.commit()
-        wait(b.commandBuffer)
+        commitAndWait(b.commandBuffer)
         var firstError: Error? = nil
         do { try finishBatch(b) } catch { firstError = error }
         if reopen { try openBatch() }
@@ -235,13 +292,32 @@ public final class MetalContext: @unchecked Sendable {
     /// Spin for up to `spinMicroseconds`, then block. Spinning avoids a scheduler round trip for short kernels.
     public var spinMicroseconds: UInt64 = 300
     func wait(_ cb: MTLCommandBuffer) {
-        let deadline = DispatchTime.now().uptimeNanoseconds + spinMicroseconds * 1000
+        // The clock is read once per 64 polls. Profiling a 1,000-row `sum` showed 60% of the call's
+        // CPU samples inside `DispatchTime.now()` -> `dispatch_time` -> `mach_absolute_time`, against
+        // 4% actually reading `MTLCommandBuffer.status`: the spin was measuring the clock, not the GPU.
+        let deadline = machNow() &+ MetalContext.ticks(microseconds: spinMicroseconds)
+        var poll = 0
         while cb.status != .completed {
             if cb.status == .error { return }
-            if DispatchTime.now().uptimeNanoseconds > deadline { cb.waitUntilCompleted(); return }
+            poll &+= 1
+            if poll & 63 == 0, machNow() > deadline { cb.waitUntilCompleted(); return }
         }
     }
+
+    /// Mach ticks for a duration in microseconds, using the timebase read once per process.
+    static func ticks(microseconds: UInt64) -> UInt64 {
+        microseconds &* 1000 &* UInt64(timebase.denom) / UInt64(timebase.numer)
+    }
+    private static let timebase: mach_timebase_info_data_t = {
+        var t = mach_timebase_info_data_t()
+        mach_timebase_info(&t)
+        return t
+    }()
 }
+
+/// Raw monotonic tick count. `mach_absolute_time` is a single register read on Apple silicon; the
+/// `DispatchTime.now()` path adds a `dispatch_time` call and a unit conversion on every poll.
+@inline(__always) func machNow() -> UInt64 { mach_absolute_time() }
 
 final class ManagedAtomicCounter: @unchecked Sendable {
     private var v = 0
