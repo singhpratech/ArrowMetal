@@ -12,7 +12,7 @@ struct PageBlock {
 
 /// Block decompression of Parquet pages.
 ///
-/// SNAPPY, LZ4 and LZ4_RAW run entirely on the GPU (`DecompressSource`), one SIMD group per page.
+/// SNAPPY, LZ4 and LZ4_RAW run entirely on the GPU (`DecompressSource`), one threadgroup per page.
 /// UNCOMPRESSED needs no work at all: the mapped file *is* the page buffer, so the reader passes the
 /// file's own `MTLBuffer` straight to the decoders.
 ///
@@ -23,20 +23,10 @@ struct PageBlock {
 /// installed, a ZSTD column raises `ParquetError.unsupported` naming the missing library rather than
 /// returning wrong data.
 enum Decompress {
-    /// Decompresses every block into one shared buffer.
+    /// Decompresses every block into a buffer the caller owns, so several codecs can share one buffer.
     ///
     /// `source` is bound at `sourceOffset`, so `block.srcOffset` is relative to that: a column chunk
     /// anywhere in a multi-gigabyte file still addresses its pages with 32-bit offsets.
-    static func pages(_ ctx: MetalContext, codec: ParquetCodec,
-                      source: MTLBuffer, sourceOffset: Int,
-                      blocks: [PageBlock], outByteCount: Int) throws -> MetalArrowBuffer {
-        guard !blocks.isEmpty else { return try MetalArrowBuffer.allocate(byteCount: 1, context: ctx) }
-        let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(outByteCount, 1), zeroed: false, context: ctx)
-        try into(ctx, codec: codec, source: source, sourceOffset: sourceOffset, blocks: blocks, out: out)
-        return out
-    }
-
-    /// As `pages`, but into a buffer the caller already owns (so several codecs can share one buffer).
     static func into(_ ctx: MetalContext, codec: ParquetCodec, source: MTLBuffer, sourceOffset: Int,
                      blocks: [PageBlock], out: MetalArrowBuffer) throws {
         guard !blocks.isEmpty else { return }

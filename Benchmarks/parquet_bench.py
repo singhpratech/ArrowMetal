@@ -144,6 +144,32 @@ def codec_throughput(directory, rows, page_size):
             codec, os.path.getsize(path) / 1e6, best, raw / (best / 1000.0), pw, note))
 
 
+def warm_first_compute(path, repeat):
+    """Time to first compute with the file handle kept open, which is how a query engine holds it.
+
+    ArrowMetal maps the file and hands its bytes to Metal when the handle is created; a fresh handle per
+    query pays for that every time, and for the minor faults of a brand-new mapping. pyarrow's
+    ParquetFile is reused the same way here, so the comparison is like for like.
+    """
+    print("%-24s %10s %10s" % ("reader (warm handle)", "read ms", "sum ms"))
+    f = am.ParquetFile(path)
+    best_r = best_s = None
+    for _ in range(repeat + 1):
+        cols, w, _ = timed(lambda: f.read(columns=["price"]))
+        _, w2, _ = timed(lambda: cols["price"].sum())
+        best_r = w if best_r is None else min(best_r, w)
+        best_s = w2 if best_s is None else min(best_s, w2)
+    print("%-24s %10.0f %10.0f" % ("arrowmetal (GPU)", best_r, best_s))
+    pf = pq.ParquetFile(path)
+    best_r = best_s = None
+    for _ in range(repeat + 1):
+        t, w, _ = timed(lambda: pf.read(columns=["price"]))
+        _, w2, _ = timed(lambda: t["price"].to_numpy().sum())
+        best_r = w if best_r is None else min(best_r, w)
+        best_s = w2 if best_s is None else min(best_s, w2)
+    print("%-24s %10.0f %10.0f" % ("pyarrow.ParquetFile", best_r, best_s))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", type=int, default=50_000_000)
@@ -186,6 +212,8 @@ def main():
                     tt = w if tt is None else min(tt, w)
                 print("%-20s %10.0f %10.0f %10.0f %10.0f" % (name, best_w, best_c, mb / (best_w / 1000.0), tt))
                 rows_out.append((codec, name, best_w, best_c, mb / (best_w / 1000.0), tt))
+            print()
+            warm_first_compute(path, args.repeat)
         if args.codec_scan:
             for ps in (1 << 20, 1 << 16):
                 codec_throughput(args.dir, min(args.rows, 20_000_000), ps)

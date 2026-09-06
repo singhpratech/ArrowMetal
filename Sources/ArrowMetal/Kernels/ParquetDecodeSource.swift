@@ -119,13 +119,6 @@ enum ParquetDecodeSource {
         return v & ((1ul << bw) - 1ul);
     }
 
-    // Bit width needed to hold values in [0, maxValue].
-    inline uint pq_bit_width(uint maxValue) {
-        uint w = 0u;
-        while (maxValue > 0u) { w++; maxValue >>= 1; }
-        return w;
-    }
-
     // Exclusive prefix sum of `v` across a 256-thread threadgroup. Returns this thread's exclusive
     // prefix; `total` receives the sum over the whole threadgroup. `sg` is scratch of >= 32 uints.
     inline uint pq_tg_scan(uint v, threadgroup uint* sg, uint lane, uint sgid, uint nsg, thread uint& total) {

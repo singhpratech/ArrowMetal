@@ -349,7 +349,7 @@ extension ParquetFile {
     private func emptyLeaf(_ leaf: ParquetLeaf, options: ParquetReadOptions) throws -> ParquetLeafData {
         let ctx = context
         let width = Swift.max(physicalWidth(leaf), 1)
-        if leaf.physical == .byteArray || (leaf.physical == .fixedLenByteArray && wantsVariable(leaf)) {
+        if leaf.physical == .byteArray {
             let off = try MetalArrowBuffer.allocate(byteCount: 8, context: ctx)
             let dat = try MetalArrowBuffer.allocate(byteCount: 1, context: ctx)
             return ParquetLeafData(leaf: leaf, file: self, context: ctx, levels: 0, nonNull: 0,
@@ -370,7 +370,6 @@ extension ParquetFile {
         case .fixedLenByteArray: return leaf.typeLength
         }
     }
-    func wantsVariable(_ leaf: ParquetLeaf) -> Bool { false }
 
     func bitWidth(of v: Int) -> Int { v <= 0 ? 0 : (Int.bitWidth - v.leadingZeroBitCount) }
 }

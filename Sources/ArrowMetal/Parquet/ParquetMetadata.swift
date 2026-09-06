@@ -9,17 +9,6 @@ public enum ParquetPhysicalType: Int32, Sendable {
     case boolean = 0, int32 = 1, int64 = 2, int96 = 3, float = 4, double = 5
     case byteArray = 6, fixedLenByteArray = 7
 
-    /// Fixed byte width, or nil for BYTE_ARRAY (and FIXED_LEN_BYTE_ARRAY, whose width is per column).
-    var fixedWidth: Int? {
-        switch self {
-        case .boolean: return 1          // one *bit*, handled specially
-        case .int32, .float: return 4
-        case .int64, .double: return 8
-        case .int96: return 12
-        case .byteArray: return nil
-        case .fixedLenByteArray: return nil
-        }
-    }
     public var name: String {
         switch self {
         case .boolean: return "BOOLEAN"
@@ -55,7 +44,6 @@ public enum ParquetEncoding: Int32, Sendable {
         case .byteStreamSplit: return "BYTE_STREAM_SPLIT"
         }
     }
-    var isDictionary: Bool { self == .rleDictionary || self == .plainDictionary }
 }
 
 /// `parquet.thrift` `CompressionCodec`.
