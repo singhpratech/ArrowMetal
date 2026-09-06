@@ -36,12 +36,30 @@ enum KernelSource {
             threadgroup uint scount[TG];
             \(ACC) acc = \(initVal);
             uint cnt = 0;
+            // Bulk: 4 consecutive elements per iteration through a vector load (the 4 validity bits sit in one byte).
+            uint n4 = n & ~3u;
             if (hasValidity) {
-                for (uint i = gid; i < n; i += gridSize) {
+                for (uint i = gid * 4u; i < n4; i += gridSize * 4u) {
+                    uint vb = (validity[i >> 3] >> (i & 7u)) & 0xFu;
+                    if (vb == 0u) continue;
+                    \(T)4 x = *(device const \(T)4*)(vals + i);
+                    if (vb & 1u) { \(ACC) v = \(loadExpr.replacingOccurrences(of: "vals[i]", with: "x.x")); if (\(extra.replacingOccurrences(of: "vals[i]", with: "x.x"))) { acc = \(combine); cnt++; } }
+                    if (vb & 2u) { \(ACC) v = \(loadExpr.replacingOccurrences(of: "vals[i]", with: "x.y")); if (\(extra.replacingOccurrences(of: "vals[i]", with: "x.y"))) { acc = \(combine); cnt++; } }
+                    if (vb & 4u) { \(ACC) v = \(loadExpr.replacingOccurrences(of: "vals[i]", with: "x.z")); if (\(extra.replacingOccurrences(of: "vals[i]", with: "x.z"))) { acc = \(combine); cnt++; } }
+                    if (vb & 8u) { \(ACC) v = \(loadExpr.replacingOccurrences(of: "vals[i]", with: "x.w")); if (\(extra.replacingOccurrences(of: "vals[i]", with: "x.w"))) { acc = \(combine); cnt++; } }
+                }
+                for (uint i = n4 + gid; i < n; i += gridSize) {
                     if (bit_get(validity, i) && (\(extra))) { \(ACC) v = \(loadExpr); acc = \(combine); cnt++; }
                 }
             } else {
-                for (uint i = gid; i < n; i += gridSize) { if (\(extra)) { \(ACC) v = \(loadExpr); acc = \(combine); cnt++; } }
+                for (uint i = gid * 4u; i < n4; i += gridSize * 4u) {
+                    \(T)4 x = *(device const \(T)4*)(vals + i);
+                    { \(ACC) v = \(loadExpr.replacingOccurrences(of: "vals[i]", with: "x.x")); if (\(extra.replacingOccurrences(of: "vals[i]", with: "x.x"))) { acc = \(combine); cnt++; } }
+                    { \(ACC) v = \(loadExpr.replacingOccurrences(of: "vals[i]", with: "x.y")); if (\(extra.replacingOccurrences(of: "vals[i]", with: "x.y"))) { acc = \(combine); cnt++; } }
+                    { \(ACC) v = \(loadExpr.replacingOccurrences(of: "vals[i]", with: "x.z")); if (\(extra.replacingOccurrences(of: "vals[i]", with: "x.z"))) { acc = \(combine); cnt++; } }
+                    { \(ACC) v = \(loadExpr.replacingOccurrences(of: "vals[i]", with: "x.w")); if (\(extra.replacingOccurrences(of: "vals[i]", with: "x.w"))) { acc = \(combine); cnt++; } }
+                }
+                for (uint i = n4 + gid; i < n; i += gridSize) { if (\(extra)) { \(ACC) v = \(loadExpr); acc = \(combine); cnt++; } }
             }
             shared[lid] = acc; scount[lid] = cnt;
             threadgroup_barrier(mem_flags::mem_threadgroup);

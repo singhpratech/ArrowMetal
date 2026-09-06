@@ -1,6 +1,24 @@
 # Benchmark history
 
-## 2026-09-06, Apple M4 Max, v0.3: group-by, fused query, and ArrowMetal called from Python
+## 2026-09-06, Apple M4 Max, round 4: latency and batched execution
+Fixed cost per call (µs, best of 30). "5-op chain" is compare, compare, and, filter, sum.
+
+| rows | GPU sum | CPU 1-core sum | GPU filter | CPU 1-core filter | GPU group-by | chain unbatched | chain batched |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,000 | 152 | 0 | 167 | 1 | 144 | 624 | 346 |
+| 10,000 | 144 | 1 | 169 | 8 | 165 | 575 | 320 |
+| 100,000 | 136 | 6 | 153 | 223 | 198 | 590 | 330 |
+| 1,000,000 | 228 | 64 | 244 | 2,351 | 497 | 853 | 549 |
+| 10,000,000 | 315 | 798 | 625 | 23,726 | 615 | 1,390 | 1,047 |
+
+Raw Metal floor on this machine: empty kernel encode + commit + wait 116 µs; ten kernels in one command
+buffer 100 µs total. The GPU overtakes one CPU core at roughly 100k rows for filter and 1M rows for sum.
+
+Query at 50M rows: unbatched 2.21 ms, batched 1.88 ms, 16-core CPU 6.46 ms, Polars lazy 15.68 ms.
+From Python: 2.31 ms unbatched, 1.90 ms with `with am.batch():`.
+
+
+## 2026-09-06, Apple M4 Max, round 3: group-by, fused query, and ArrowMetal called from Python
 Swift side (Metal vs 16-core Swift):
 
 | Operation | Metal | 16-core Swift |
@@ -29,7 +47,7 @@ took about 60 ms; every later operation on it is zero-copy in and out.
 All runs: best of 5, release build, 50,000,000 rows. Hardware is named per run. Reproduce with
 `swift run -c release arrowmetal-bench` and `python Benchmarks/python_bench.py` (venv with polars, pyarrow, pandas).
 
-## 2026-09-06, Apple M4 Max (16 CPU cores), v0.2 + buffer pool
+## 2026-09-06, Apple M4 Max (16 CPU cores), round 2: buffer pool, all-core baselines
 Metal vs 16-core Swift vs Accelerate (all cores) vs Polars 1.44 (16 threads) vs pyarrow 25 vs pandas 3.0.
 
 | Operation | Metal | 16-core Swift / Accelerate | Polars | pyarrow | pandas |
@@ -51,6 +69,6 @@ Metal vs 16-core Swift vs Accelerate (all cores) vs Polars 1.44 (16 threads) vs 
 Notes: the Metal numbers include allocation of the output from the pool and the CPU-side wait. Polars
 numbers are eager single-expression calls; its lazy engine would fuse compare + filter.
 
-## 2026-09-06, Apple M4 Max, v0.1 (before the pool, single-core baselines)
+## 2026-09-06, Apple M4 Max, round 1 (before the pool, single-core baselines)
 Kept for history: sum Int64 1.07 ms, compare 1.18, filter 5.36, multiply 6.84, cast 5.04, take 8.09.
 The pool removed 2 to 3x of allocation overhead from write-heavy kernels.

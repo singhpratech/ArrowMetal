@@ -8,7 +8,8 @@ import ArrowMetal
 //   - Accelerate vDSP where an equivalent exists (Float32, no nulls)
 // Usage: arrowmetal-bench [rows] [iterations]
 
-let rows = CommandLine.arguments.count > 1 ? Int(CommandLine.arguments[1])! : 50_000_000
+let latencyMode = CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "latency"
+let rows = CommandLine.arguments.count > 1 && !latencyMode ? Int(CommandLine.arguments[1])! : 50_000_000
 let iters = CommandLine.arguments.count > 2 ? Int(CommandLine.arguments[2])! : 5
 let cores = ProcessInfo.processInfo.activeProcessorCount
 
@@ -135,6 +136,38 @@ func cpuFilterParallel<T>(_ p: UnsafePointer<T>, n: Int, sel: UnsafePointer<UInt
 }
 
 let ctx = MetalContext.shared
+
+// ---- Latency mode: fixed cost per call at small sizes, GPU vs 1 core (which is what small sizes get on the CPU side).
+if latencyMode {
+    print("ArrowMetal latency on \(ctx.device.name): microseconds per call, best of \(max(iters, 20))\n")
+    print(String(format: "  %-10@ %12@ %12@ %14@ %14@ %14@ %14@ %14@", "rows" as NSString, "GPU sum" as NSString, "CPU sum" as NSString, "GPU filter" as NSString, "CPU filter" as NSString, "GPU group-by" as NSString, "5-op chain" as NSString, "chain batched" as NSString))
+    func best(_ body: () throws -> Void) rethrows -> Double {
+        try body()
+        var b = Double.infinity
+        for _ in 0..<max(iters, 20) { let t0 = DispatchTime.now().uptimeNanoseconds; try body(); b = min(b, Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e3) }
+        return b
+    }
+    for n in [1_000, 10_000, 100_000, 1_000_000, 10_000_000] {
+        var gen = SystemRandomNumberGenerator()
+        let col = try MetalArray<Int64>((0..<n).map { _ in Int64.random(in: -1000...1000, using: &gen) })
+        let keys = try MetalArray<Int32>((0..<n).map { _ in Int32.random(in: 0..<16, using: &gen) })
+        let gb = try keys.groupBy(keyCount: 16)
+        let out = UnsafeMutablePointer<Int64>.allocate(capacity: n)
+        let gs = try best { sink(try col.sum()) }
+        let cs = best { sink(cpuSumInt64(opaque(col), 0, n)) }
+        let gf = try best { sink(try col.filter(where: .gt, 0)) }
+        let cf = best { let p = opaque(col).valuePointer; var k = 0; for i in 0..<n where p[i] > 0 { out[k] = p[i]; k += 1 }; sink(k) }
+        let gg = try best { sink(try gb.sum(col)) }
+        // A 5-kernel chain: two compares, and, filter, sum. Unbatched = 5 round trips; batched = 1.
+        let chain = try best { sink(try col.filter(try col.compare(.gt, -500).and(try col.compare(.lt, 500))).sum()) }
+        let chainB = try best { sink(try ctx.batch { try col.filter(try col.compare(.gt, -500).and(try col.compare(.lt, 500))).sum() }) }
+        print(String(format: "  %-10d %9.0f µs %9.0f µs %11.0f µs %11.0f µs %11.0f µs %11.0f µs %11.0f µs", n, gs, cs, gf, cf, gg, chain, chainB))
+        out.deallocate()
+    }
+    print("\nFixed cost per GPU call is the small-row number; the crossover with one CPU core is where the columns meet.")
+    exit(0)
+}
+
 print("ArrowMetal bench on \(ctx.device.name), rows=\(rows), iterations=\(iters) (best of), CPU cores=\(cores)\n")
 
 // --- Int64 column with ~10% nulls ---
@@ -227,6 +260,9 @@ let amountF = try MetalArray<Float>((0..<rows).map { _ in Float.random(in: 0...5
 try time("Metal  filter + filter + sum", bytes: rows * (4 + 4), section: sec) {
     let m = try keys5.compare(.eq, 2).and(try amountF.compare(.gt, 100))
     sink(try amountF.filter(m).sum())
+}
+try time("Metal  same, batched (one command buffer)", bytes: rows * (4 + 4), section: sec) {
+    sink(try ctx.batch { try amountF.filter(try keys5.compare(.eq, 2).and(try amountF.compare(.gt, 100))).sum() })
 }
 time("CPU \(cores)-core fused loop", bytes: rows * (4 + 4), section: sec) {
     let kp = opaque(keys5).valuePointer, ap = amountF.valuePointer

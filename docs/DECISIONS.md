@@ -2,6 +2,19 @@
 
 Architecture and product decisions, newest first. Each entry says what was decided, why, and what it rules out.
 
+## 2026-09-06: Version stays 0.1.0 until the public launch
+Everything built before going public is one release. Internal rounds are tracked in the changelog under a
+single unreleased 0.1.0 heading and in docs/BENCHMARKS.md as numbered rounds.
+
+## 2026-09-06: Batched execution with lazy materialisation instead of futures
+A per-thread open command buffer with sync-on-read keeps the synchronous API (every method still returns a
+real array) while removing the ~120 µs round trip between chained kernels. Futures would have changed every
+signature. Cost: a reduction inside a batch still syncs; filter results carry a worst-case buffer until read.
+
+## 2026-09-06: One C ABI, thin idiomatic wrappers per language
+No per-language ports. `libArrowMetalC` takes and returns Arrow C Data Interface structs plus opaque handles.
+Python, Rust, Go, C#, R, C++ all have Arrow bindings that produce and consume those structs.
+
 ## 2026-09-06: Name is ArrowMetal
 "AppleArrow" and "AppleMetalArrow" were rejected: "Apple" in a product name invites a trademark complaint and
 implies Apple built it. "Arrow" is an Apache Software Foundation mark; the README carries a non-endorsement note.

@@ -185,6 +185,7 @@ public struct GroupBy<K: ArrowIndex> {
                 Dispatch.dispatch1D(enc, packPSO, count: K)
             }
         }
+        try ctx.syncPoint()   // results are read on the CPU next
         return (out, counts)
     }
 

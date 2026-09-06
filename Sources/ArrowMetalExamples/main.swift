@@ -70,4 +70,12 @@ for w in 0..<5 {
     line += String(format: "w%d=%.1f ", w, try s.mean()!)
 }
 print(line + "  [\(ms(t0))]")
+// ---------------------------------------------------------------------------------------------
+print("\nScenario 6: the same query, batched into one GPU command buffer")
+t0 = DispatchTime.now()
+let batchedSum = try MetalContext.shared.batch {
+    let m = try region.compare(.eq, 2).and(try amount.compare(.gt, 100)).and(try orders["returned"]!.asBoolean!.not())
+    return try amount.filter(m).sum()!.asDouble
+}
+print("  sum(amount)=\(String(format: "%.1f", batchedSum)) (matches scenario 1: \(abs(batchedSum - sum) < 1))   [\(ms(t0))]")
 print("\ndone")

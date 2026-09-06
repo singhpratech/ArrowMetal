@@ -266,6 +266,7 @@ private func fillDevice(_ out: UnsafeMutablePointer<ArrowDeviceArray>) {
 extension MetalArray {
     /// Exports through the CPU C Data Interface. Because the buffers are in unified memory this is zero-copy.
     public func exportArrowArray(into out: UnsafeMutablePointer<ArrowArray>) {
+        ensure()
         fillExportedArray(length: length, nullCount: nullCount, validity: validity, values: values, keep: self, into: out)
     }
     /// Exports through the C Device Data Interface with `device_type = ARROW_DEVICE_METAL`. Also zero-copy.
@@ -280,6 +281,7 @@ extension MetalArray {
 
 extension MetalBooleanArray {
     public func exportArrowArray(into out: UnsafeMutablePointer<ArrowArray>) {
+        ensure()
         fillExportedArray(length: length, nullCount: nullCount, validity: validity, values: values, keep: self, into: out)
     }
     public func exportArrowDeviceArray(into out: UnsafeMutablePointer<ArrowDeviceArray>) {

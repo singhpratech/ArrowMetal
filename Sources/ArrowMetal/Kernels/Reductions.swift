@@ -121,6 +121,7 @@ extension MetalArray {
             enc.dispatchThreadgroups(MTLSize(width: groups, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1))
         }
+        try ctx.syncPoint()   // the partials are read on the CPU next
         return (partials, counts, groups)
     }
 }

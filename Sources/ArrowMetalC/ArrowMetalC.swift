@@ -16,7 +16,7 @@ private func lastErrorPtr() -> UnsafePointer<CChar>? {
     Thread.current.threadDictionary["ArrowMetalC.lastErrorC"] = c
     return UnsafePointer(c)
 }
-private let versionC = strdup("0.3.0")!
+private let versionC = strdup("0.1.0")!
 private let deviceNameC = strdup(MetalContext.shared.device.name)!
 private var formatCache: [String: UnsafeMutablePointer<CChar>] = [:]
 private let formatLock = NSLock()
@@ -343,4 +343,15 @@ private func countErased<K: ArrowIndex>(_ gb: GroupBy<K>, _ v: AnyMetalArray) th
     case .float64(let x): return try gb.count(x)
     case .boolean: throw ArrowMetalError.unsupportedType("count over boolean values")
     }
+}
+
+// MARK: - Batching
+
+/// Opens a batch on the calling thread: every call until am_batch_end appends to one command buffer.
+@_cdecl("am_batch_begin") public func am_batch_begin() -> Int32 {
+    do { try MetalContext.shared.beginBatch(); return 0 } catch { setError(error); return 1 }
+}
+/// Runs the batch and closes it. Deferred errors (e.g. take out of range) are reported here.
+@_cdecl("am_batch_end") public func am_batch_end() -> Int32 {
+    do { try MetalContext.shared.endBatch(); return 0 } catch { setError(error); return 1 }
 }

@@ -59,6 +59,7 @@ extension MetalArray {
         let validityOut = try BitmapOps.combineValidity(ctx, validity, other.validity, bits: length)
         let res = MetalBooleanArray(length: length, nullCount: 0, validity: validityOut, values: out, context: ctx)
         res.recomputeNullCount()
+        ctx.retainUntilFlush(self)
         return res
     }
 }

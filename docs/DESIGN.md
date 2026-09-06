@@ -35,13 +35,24 @@ Device peak on M4 Max is ~546 GB/s. Single-pass kernels sit at 55-70% of peak; t
 buffer setup and the CPU wait.
 
 ## Latency (small inputs)
-Every public call today is one command buffer: encode, commit, `waitUntilCompleted`. That costs roughly
-100-300 µs per call regardless of size, so for arrays under ~1M elements the fixed cost dominates. The
-`filter` kernels are already fused into one command buffer (count, scan, scatter) to avoid a CPU round trip.
+Measured floor on M4 Max: an empty kernel with encode + commit + wait costs ~116 µs; ten kernels in one
+command buffer cost ~100 µs in total. So the fixed cost is the round trip, not the kernel, and the only lever
+is fewer round trips.
 
-Planned: a **pipeline** API where operations append to one command buffer and results are materialised on
-first read (`let q = ctx.pipeline(); let s = q.filter(...).sum(); q.run()`), plus completion handlers for
-async Swift. Expected to bring per-op overhead below 20 µs when batched, and to let the CPU keep working.
+Unbatched, every public call is one command buffer (~140-170 µs fixed). `filter` already fuses its three
+kernels into one command buffer with a GPU scan.
+
+**Batched execution** (`MetalContext.batch { }`, `am_batch_begin/end` in C, `with am.batch():` in Python):
+kernels append to one serial compute encoder; results are created immediately with their buffers, but a
+result whose length the GPU decides (filter) or whose null count needs a bitmap read is marked *pending*.
+Any CPU-side read (a reduction, `length`, `nullCount`, subscripts, export) triggers a *sync point*: the
+open command buffer is committed and waited once, deferred fix-ups run (lengths, null counts, `take`
+bounds errors), and a fresh batch is opened so the caller keeps batching. While any batch is open the
+pool parks returned buffers instead of recycling them, so pending GPU work can never observe a reused
+buffer. Per-thread batches; nested `batch` calls join the outer one.
+
+Not yet: returning futures for reductions (a `sum()` inside a batch still syncs), and completion handlers
+for fully asynchronous Swift.
 
 ## Roadmap for "no room left"
 1. **Pipelined execution** (above). Biggest win for query-shaped work and for Python callers.

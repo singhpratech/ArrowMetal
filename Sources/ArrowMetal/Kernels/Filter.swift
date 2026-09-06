@@ -95,6 +95,19 @@ extension MetalArray {
             enc.setBuffer((validBytes ?? outValues).mtl, offset: 0, index: 7)
             enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
         }
+        if ctx.isBatching {
+            // Length is decided by the GPU: pack validity for the worst case now, fix length/nulls after the flush.
+            var outValidity: MetalArrowBuffer? = nil
+            if let vb = validBytes { outValidity = try BitmapOps.packBits(ctx, bytes: vb, bits: length) }
+            let res = MetalArray<T>(length: 0, nullCount: 0, validity: outValidity, values: outValues, context: ctx)
+            res.capacityLength = length
+            ctx.retainUntilFlush(sel); ctx.retainUntilFlush(blockCounts); if let vb = validBytes { ctx.retainUntilFlush(vb) }
+            ctx.retainUntilFlush(self)
+            res.deferLength(from: total) { [res] in
+                if let v = res.validity { res._nullCount = res._length - Bitmap.popcount(v.typed(UInt8.self), bits: res._length) }
+            }
+            return res
+        }
         let outLen = withExtendedLifetime(total) { Int(total.typed(UInt32.self)[0]) }
         var outValidity: MetalArrowBuffer? = nil
         if let vb = validBytes, outLen > 0 {

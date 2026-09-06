@@ -8,6 +8,7 @@ jobs:
       - run: sudo xcode-select -s /Applications/Xcode_16.4.app || true
       - run: swift --version
       - run: swift build
-      - run: swift test
+      - run: system_profiler SPDisplaysDataType | grep -E 'Chipset|Vendor|Metal' || true
+      - run: ARROWMETAL_DEBUG_SHADERS=1 swift test
       - run: swift test -c release
       - run: swift run -c release arrowmetal-bench 2000000 2

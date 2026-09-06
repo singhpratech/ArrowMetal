@@ -71,6 +71,8 @@ PYTHONPATH=python python -c "import arrowmetal as am; print(am.device_name())"
 import pyarrow as pa, polars as pl, arrowmetal as am
 col = am.array(pl.Series([1, None, 3, 40]).to_arrow())
 print(col.filter_where(">", 2).sum(), pl.from_arrow(col.filter_where(">", 2).to_arrow()))
+with am.batch():                                   # several kernels, one GPU round trip
+    total = col.filter((col > 1) & (col < 40)).sum()
 ```
 The same C ABI (`include/arrowmetal.h`) serves Rust, Go, C#, R, C++ and C through their Arrow C Data
 Interface bindings. See [python/README.md](python/README.md).
@@ -90,6 +92,14 @@ let orders = try MetalRecordBatch(names: ["region", "amount"], columns: [.int32(
 let hits = try orders.filter(try region.compare(.eq, 2).and(try amount.compare(.gt, 100)))
 let sample = try hits.take(try MetalArray<Int32>([0, 5, 9]))
 let window = try hits.slice(offset: 32, length: 1000)             // zero-copy view
+```
+
+Chains of operations can share one GPU round trip:
+
+```swift
+let total = try MetalContext.shared.batch {
+    try amount.filter(try region.compare(.eq, 2).and(try amount.compare(.gt, 100))).sum()   // one command buffer
+}
 ```
 
 Five end-to-end scenarios (analytics query, feature preparation, Float64 with NaN, C Data Interface

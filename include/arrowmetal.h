@@ -48,6 +48,11 @@ int  am_slice(am_array* a, int64_t offset, int64_t length, am_array** out);
 // Group-by over dense int32/int64 keys in [0, key_count). agg: 0 sum, 1 count(rows), 2 min, 3 max, 4 mean, 5 count(values)
 int  am_group_by(am_array* keys, int64_t key_count, int agg, am_array* values /* may be NULL for count rows */, am_array** out);
 
+// Batching: between begin and end, every call on this thread appends to one GPU command buffer. The GPU runs
+// once at end (or at the first call that must read a result, such as am_reduce or am_export).
+int  am_batch_begin(void);
+int  am_batch_end(void);
+
 #ifdef __cplusplus
 }
 #endif

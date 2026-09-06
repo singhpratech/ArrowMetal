@@ -38,3 +38,13 @@ Things learned the hard way. Add to this whenever something surprises you.
 - Crossing the C boundary from Python costs nothing measurable per call (ctypes overhead is ~10 µs);
   exporting a result back to pyarrow is zero-copy (3.55 ms vs 3.57 ms with export).
 - Importing pyarrow buffers is one memcpy: pyarrow's allocator is 64-byte aligned, not page aligned.
+
+## Round 4 (2026-09-06)
+- GitHub's `macos-15` Apple silicon runners expose an "Apple Paravirtual device" GPU with 3 CPU cores:
+  ~16 GB/s for a sum. Use CI for correctness only; never publish its numbers.
+- The paravirtual GPU failed `makeComputePipelineState` for kernels that pass on M4 Max (round 3 push).
+  `ARROWMETAL_DEBUG_SHADERS=1` now dumps generated MSL and the full compiler log on failure; CI sets it.
+- `makeCommandBufferWithUnretainedReferences` plus a spin-wait did not measurably reduce per-call latency;
+  the ~120 µs floor is the round trip. Batching is what works: chains pay it once.
+- A `sum()` on a batched filter result still costs a second round trip because the reduction needs the
+  filtered length on the CPU. Next: kernels read `n` from a device buffer so pending lengths flow on the GPU.

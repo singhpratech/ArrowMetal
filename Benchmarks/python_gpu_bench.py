@@ -69,6 +69,10 @@ gr = am.array(pa.array(region)); ga = am.array(pa.array(amount))
 q = pl.DataFrame({"region": region, "amount": amount}); ql = q.lazy()
 QB = rows * 8
 bench(sec, "ArrowMetal (GPU)", QB, lambda: ga.filter((gr == 2) & (ga > 100)).sum())
+def _batched():
+    with am.batch():
+        return ga.filter((gr == 2) & (ga > 100)).sum()
+bench(sec, "ArrowMetal (GPU, batched)", QB, _batched)
 bench(sec, "polars lazy (fused)", QB, lambda: ql.filter((pl.col("region") == 2) & (pl.col("amount") > 100)).select(pl.col("amount").sum()).collect())
 bench(sec, "numpy masked sum", QB, lambda: amount[(region == 2) & (amount > 100)].sum())
 

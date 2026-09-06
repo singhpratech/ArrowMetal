@@ -1,26 +1,21 @@
 # Changelog
 
-## 0.3.0 (2026-09-06)
-- Buffer pool with unzeroed kernel outputs (2-3x faster write-heavy kernels).
-- Filter runs in one command buffer with a GPU scan; fused `filter(where:)` predicate path.
-- Vectorised arithmetic and cast kernels (4 elements per thread).
-- `GroupBy` over dense integer keys: count, sum, mean, min, max; privatised and device-atomic paths.
-- C ABI (`libArrowMetalC`, `include/arrowmetal.h`) and a Python package (`python/arrowmetal`).
-- Scenario matrix, concurrency and pool tests; Polars/pyarrow/pandas and in-process Python benchmarks.
-- Docs: decision log, findings, benchmark history, design and future capability.
+## 0.1.0 (unreleased, in development)
+Everything below ships together as the first public release.
 
-## 0.2.0 (2026-09-06)
-- `take` (gather) with Int32/Int64/UInt32 indices, null indices and GPU bounds checking.
-- `cast` between all primitive types; `slice` with zero-copy views at 32-element alignment.
-- Float64 compare/min/max/filter/take/slice on the GPU via order-preserving bit patterns.
-- NaN semantics: min/max skip NaN (null if nothing else), sum propagates, IEEE comparisons.
-- Boolean `filter`, `take`, `slice`, `count`, `any`, `all`.
-- `MetalRecordBatch` with filter/take/slice/selecting; struct (`+s`) C Data Interface import/export;
-  `ArrowArrayStream` import; device export of batches.
-- Examples executable with five end-to-end scenarios; benchmark rows for take, Float64 and cast.
-
-## 0.1.0 (2026-09-06)
-- Initial release: Metal shared-memory Arrow buffers and primitive/boolean arrays.
-- GPU kernels: sum, min, max, mean, compare, add/sub/mul/div, filter, boolean and/or/not.
+Core
+- Metal shared-memory Arrow buffers (page aligned, pooled) and primitive/boolean arrays.
+- Kernels: sum/min/max/mean, compare, add/sub/mul/div (vectorised, defined integer division by zero),
+  filter (one command buffer, GPU scan) and fused filter(where:), take, cast, slice, boolean and/or/not/count/any/all.
+- Float64 compare/min/max/filter/take/slice on the GPU via order-preserving bit patterns; NaN semantics.
+- GroupBy over dense integer keys: count, sum, mean, min, max (privatised and device-atomic paths).
+- MetalRecordBatch with filter/take/slice/selecting; struct (+s) C Data import/export; ArrowArrayStream import.
 - Arrow C Data Interface and C Device Data Interface (ARROW_DEVICE_METAL) import and export.
-- CPU reference implementation and test suite; benchmark executable.
+
+Bindings
+- libArrowMetalC C ABI (include/arrowmetal.h) and python/arrowmetal ctypes package (Arrow PyCapsule protocol).
+
+Quality
+- CPU reference for every kernel; 26 tests including a scenario matrix over every type, null density, size
+  and sliced input; concurrency and pool tests; CI on hosted Apple silicon in debug and release.
+- Benchmarks: Swift vs all-core CPU vs Accelerate; Polars/pyarrow/pandas; ArrowMetal from Python in-process; latency mode.

@@ -38,8 +38,11 @@ extension MetalArray {
                 Dispatch.dispatch1D(enc, pso, count: n)
             }
         }
-        let failed = withExtendedLifetime(errorFlag) { errorFlag.typed(UInt32.self)[0] != 0 }
-        if failed { throw ArrowMetalError.invalidArrowArray("take: index out of range (array length \(length))") }
+        let srcLen = length
+        try ctx.afterFlush { [errorFlag] in
+            if errorFlag.typed(UInt32.self)[0] != 0 { throw ArrowMetalError.invalidArrowArray("take: index out of range (array length \(srcLen))") }
+        }
+        ctx.retainUntilFlush(errorFlag); ctx.retainUntilFlush(self); ctx.retainUntilFlush(indices); ctx.retainUntilFlush(validBytes)
         var outValidity: MetalArrowBuffer? = nil
         if (hasV || hasIV) && n > 0 { outValidity = try BitmapOps.packBits(ctx, bytes: validBytes, bits: n) }
         let res = MetalArray<T>(length: n, nullCount: 0, validity: outValidity, values: out, context: ctx)

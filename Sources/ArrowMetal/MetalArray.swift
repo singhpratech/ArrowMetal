@@ -32,21 +32,35 @@ public enum Bitmap {
 /// and a values buffer (buffer 1). `offset` is always 0; imported arrays with a non-zero
 /// offset are materialised with the offset applied.
 public final class MetalArray<T: ArrowPrimitive>: @unchecked Sendable {
-    public let length: Int
-    public internal(set) var nullCount: Int
-    /// Validity bitmap, nil when there are no nulls.
+    /// Number of elements. Reading it materialises a pending batched result whose length the GPU decides.
+    public var length: Int { ensure(); return _length }
+    var _length: Int
+    /// Null count. Reading it materialises pending results.
+    public var nullCount: Int { get { ensure(); return _nullCount } set { _nullCount = newValue } }
+    var _nullCount: Int
+    /// Validity bitmap, nil when there are no nulls. Buffers are usable by the GPU while a batch is pending.
     public let validity: MetalArrowBuffer?
     public let values: MetalArrowBuffer
     public let context: MetalContext
+    /// Set while this array's contents are still being produced by an open batch.
+    var pending = false
+    /// Length known without a sync (worst case for pending filter results).
+    var capacityLength: Int
 
     public init(length: Int, nullCount: Int, validity: MetalArrowBuffer?, values: MetalArrowBuffer, context: MetalContext = .shared) {
         precondition(values.byteCount >= length * T.byteWidth)
         if let v = validity { precondition(v.byteCount >= Bitmap.byteCount(bits: length)) }
-        self.length = length
-        self.nullCount = nullCount
+        self._length = length
+        self._nullCount = nullCount
         self.validity = validity
         self.values = values
         self.context = context
+        self.capacityLength = length
+    }
+
+    /// Forces the batch that produces this array to run (no-op otherwise).
+    @inline(__always) func ensure() {
+        if pending { try? context.syncPoint() }
     }
 
     /// Builds an array from Swift values, copying them into Metal shared memory.
@@ -80,15 +94,37 @@ public final class MetalArray<T: ArrowPrimitive>: @unchecked Sendable {
         return MetalArray(length: length, nullCount: 0, validity: bm, values: vb, context: context)
     }
 
-    /// Recomputes `nullCount` from the validity bitmap (used after GPU kernels write a bitmap).
+    /// Recomputes `nullCount` from the validity bitmap. When a batch is open the count is deferred until it
+    /// runs, and the array is marked pending.
     public func recomputeNullCount() {
-        guard let v = validity else { nullCount = 0; return }
-        nullCount = length - Bitmap.popcount(v.typed(UInt8.self), bits: length)
+        guard let v = validity else { _nullCount = 0; return }
+        if context.isBatching {
+            pending = true
+            try? context.afterFlush { [self] in
+                self._nullCount = self._length - Bitmap.popcount(v.typed(UInt8.self), bits: self._length)
+                self.pending = false
+            }
+            context.retainUntilFlush(self)
+        } else {
+            _nullCount = _length - Bitmap.popcount(v.typed(UInt8.self), bits: _length)
+        }
+    }
+
+    /// Marks this array as produced by the open batch with a length the GPU will report in `lengthBuffer`.
+    func deferLength(from lengthBuffer: MetalArrowBuffer, then: @escaping () -> Void) {
+        pending = true
+        try? context.afterFlush { [self] in
+            self._length = Int(lengthBuffer.typed(UInt32.self)[0])
+            then()
+            self.pending = false
+        }
+        context.retainUntilFlush(self)
+        context.retainUntilFlush(lengthBuffer)
     }
 
     /// Raw pointers are valid only while the array is alive; prefer `withValues`.
-    public var valuePointer: UnsafePointer<T> { values.typed(T.self) }
-    public var mutableValuePointer: UnsafeMutablePointer<T> { values.mutableTyped(T.self) }
+    public var valuePointer: UnsafePointer<T> { ensure(); return values.typed(T.self) }
+    public var mutableValuePointer: UnsafeMutablePointer<T> { ensure(); return values.mutableTyped(T.self) }
 
     /// Scoped, lifetime-safe access to the values.
     public func withValues<R>(_ body: (UnsafeBufferPointer<T>) throws -> R) rethrows -> R {
@@ -96,6 +132,7 @@ public final class MetalArray<T: ArrowPrimitive>: @unchecked Sendable {
     }
 
     public func isValid(_ i: Int) -> Bool {
+        ensure()
         guard let v = validity else { return true }
         return Bitmap.isSet(v.typed(UInt8.self), i)
     }
@@ -111,16 +148,21 @@ public final class MetalArray<T: ArrowPrimitive>: @unchecked Sendable {
 
 /// A boolean Arrow array: values are a packed bitmap (LSB order), same as the validity bitmap.
 public final class MetalBooleanArray: @unchecked Sendable {
-    public let length: Int
-    public internal(set) var nullCount: Int
+    public var length: Int { ensure(); return _length }
+    var _length: Int
+    public var nullCount: Int { get { ensure(); return _nullCount } set { _nullCount = newValue } }
+    var _nullCount: Int
     public let validity: MetalArrowBuffer?
     public let values: MetalArrowBuffer
     public let context: MetalContext
+    var pending = false
 
     public init(length: Int, nullCount: Int, validity: MetalArrowBuffer?, values: MetalArrowBuffer, context: MetalContext = .shared) {
         precondition(values.byteCount >= Bitmap.byteCount(bits: length))
-        self.length = length; self.nullCount = nullCount; self.validity = validity; self.values = values; self.context = context
+        self._length = length; self._nullCount = nullCount; self.validity = validity; self.values = values; self.context = context
     }
+
+    @inline(__always) func ensure() { if pending { try? context.syncPoint() } }
 
     public convenience init(_ vals: [Bool], context: MetalContext = .shared) throws {
         let vb = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: vals.count), context: context)
@@ -136,11 +178,21 @@ public final class MetalBooleanArray: @unchecked Sendable {
     }
 
     public func recomputeNullCount() {
-        guard let v = validity else { nullCount = 0; return }
-        nullCount = length - Bitmap.popcount(v.typed(UInt8.self), bits: length)
+        guard let v = validity else { _nullCount = 0; return }
+        if context.isBatching {
+            pending = true
+            try? context.afterFlush { [self] in
+                self._nullCount = self._length - Bitmap.popcount(v.typed(UInt8.self), bits: self._length)
+                self.pending = false
+            }
+            context.retainUntilFlush(self)
+        } else {
+            _nullCount = _length - Bitmap.popcount(v.typed(UInt8.self), bits: _length)
+        }
     }
 
     public func isValid(_ i: Int) -> Bool {
+        ensure()
         guard let v = validity else { return true }
         return Bitmap.isSet(v.typed(UInt8.self), i)
     }
@@ -148,6 +200,7 @@ public final class MetalBooleanArray: @unchecked Sendable {
     public func toArray() -> [Bool?] { (0..<length).map { self[$0] } }
     /// Number of true values among valid slots.
     public var trueCount: Int {
+        ensure()
         guard let v = validity else { return Bitmap.popcount(values.typed(UInt8.self), bits: length) }
         var n = 0
         let vp = v.typed(UInt8.self), bp = values.typed(UInt8.self)
