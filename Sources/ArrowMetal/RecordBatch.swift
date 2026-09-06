@@ -114,10 +114,9 @@ extension AnyMetalArray {
         case .float32(let a): return .float32(try a.slice(offset: offset, length: length))
         case .float64(let a): return .float64(try a.slice(offset: offset, length: length))
         case .boolean(let a): return .boolean(try a.slice(offset: offset, length: length))
-        case .string(let a): return .string(try a.take(try MetalArray<Int32>((offset..<(offset + length)).map { Int32($0) }, context: a.context)))
+        case .string(let a): return .string(try a.slice(offset: offset, length: length))
         case .temporal(let a): return .temporal(try a.slice(offset: offset, length: length))
-        case .binary(let a):
-            return .binary(markBinary(try a.take(try MetalArray<Int32>((offset..<(offset + length)).map { Int32($0) }, context: a.context))))
+        case .binary(let a): return .binary(markBinary(try a.slice(offset: offset, length: length)))
         case .decimal(let a): return .decimal(try a.slice(offset: offset, length: length))
         case .dictionary(let codes, let values):
             return .dictionary(codes: try codes.slice(offset: offset, length: length), values: values)

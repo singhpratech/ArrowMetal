@@ -169,7 +169,7 @@ public func importArrowArray(schema: UnsafePointer<ArrowSchema>, array: UnsafeMu
     if let own = ownedExportBuffers(array) {
         let owner = ImportedCArray(moving: array)
         let a = owner.array
-        let arr = try rebuild(format: fmt, length: Int(a.length), nullCount: Int(a.null_count),
+        let arr = try rebuild(format: fmt, offset: Int(a.offset), length: Int(a.length), nullCount: Int(a.null_count),
                               validity: own.validity, values: own.values, context: context)
         return ImportResult(array: arr, zeroCopy: true)
     }
@@ -183,26 +183,31 @@ public func importArrowArray(schema: UnsafePointer<ArrowSchema>, array: UnsafeMu
     var nullCount = Int(a.null_count)
 
     if fmt == "b" {
-        let (vals, zc1) = try bitBuffer(valuesPtr, length: length, offset: offset, owner: owner, context: context)
+        // A non-zero Arrow offset is carried, not applied: both bitmaps are wrapped whole and the array
+        // starts at bit `offset` (see `MetalArray.offset`), so a sliced producer imports zero-copy too.
+        let bits = offset + length
+        let (vals, zc1) = try bitBuffer(valuesPtr, length: bits, offset: 0, owner: owner, context: context)
         var validity: MetalArrowBuffer? = nil
         var zc2 = true
-        if let vp = validityPtr { (validity, zc2) = try bitBuffer(vp, length: length, offset: offset, owner: owner, context: context) }
-        let arr = MetalBooleanArray(length: length, nullCount: 0, validity: validity, values: vals, context: context)
-        if nullCount < 0 { arr.recomputeNullCount() } else { arr.setNullCount(nullCount) }
+        if let vp = validityPtr { (validity, zc2) = try bitBuffer(vp, length: bits, offset: 0, owner: owner, context: context) }
+        let arr = MetalBooleanArray(offset: offset, length: length, validity: validity, values: vals,
+                                    nullCount: nullCount < 0 ? nil : nullCount, context: context)
         return ImportResult(array: .boolean(arr), zeroCopy: zc1 && zc2)
     }
 
     guard let ty = arrowPrimitiveType(forFormat: fmt) else { throw ArrowMetalError.unsupportedType(fmt) }
 
     func build<T: ArrowPrimitive>(_: T.Type) throws -> (MetalArray<T>, Bool) {
-        let byteCount = length * T.byteWidth
-        let src = valuesPtr.advanced(by: offset * T.byteWidth)
-        let (vals, zc1) = try MetalArrowBuffer.wrapOrCopy(src, byteCount: byteCount, keepAlive: owner, context: context)
+        // The producer's `offset` is carried on the array rather than applied, so an array sliced by the
+        // producer (pyarrow's `Array.slice`, a Polars column view) imports without touching a byte.
+        let (vals, zc1) = try MetalArrowBuffer.wrapOrCopy(valuesPtr, byteCount: (offset + length) * T.byteWidth,
+                                                          keepAlive: owner, context: context)
         var validity: MetalArrowBuffer? = nil
         var zc2 = true
-        if let vp = validityPtr { (validity, zc2) = try bitBuffer(vp, length: length, offset: offset, owner: owner, context: context) }
-        let arr = MetalArray<T>(length: length, nullCount: 0, validity: validity, values: vals, context: context)
-        if nullCount < 0 { arr.recomputeNullCount(); nullCount = arr.nullCount } else { arr.setNullCount(nullCount) }
+        if let vp = validityPtr { (validity, zc2) = try bitBuffer(vp, length: offset + length, offset: 0, owner: owner, context: context) }
+        let arr = MetalArray<T>(offset: offset, length: length, validity: validity, values: vals,
+                                nullCount: nullCount < 0 ? nil : nullCount, context: context)
+        if nullCount < 0 { nullCount = arr.nullCount }
         return (arr, zc1 && zc2)
     }
 
@@ -375,13 +380,15 @@ public func exportArrowSchema(format: String, name: String = "", into out: Unsaf
 }
 
 private func fillExportedArray(length: Int, nullCount: Int, validity: MetalArrowBuffer?, values: MetalArrowBuffer,
-                               keep: AnyObject, into out: UnsafeMutablePointer<ArrowArray>) {
+                               offset: Int = 0, keep: AnyObject, into out: UnsafeMutablePointer<ArrowArray>) {
     var keeps: [AnyObject] = [keep, values]
     if let v = validity { keeps.append(v) }
     let holder = ExportHolder(keep: keeps, bufferPtrs: [validity?.contents, values.contents], format: nil, name: nil)
     out.pointee.length = Int64(length)
     out.pointee.null_count = Int64(nullCount)
-    out.pointee.offset = 0
+    // Arrow's own `offset`: a slice at an offset that is not a multiple of 32 exports the parent's buffers
+    // with the offset attached, so export stays zero-copy at every offset.
+    out.pointee.offset = Int64(offset)
     out.pointee.n_buffers = 2
     out.pointee.n_children = 0
     out.pointee.buffers = UnsafeMutablePointer<UnsafeRawPointer?>(holder.buffers)
@@ -403,7 +410,8 @@ extension MetalArray {
     /// Exports through the CPU C Data Interface. Because the buffers are in unified memory this is zero-copy.
     public func exportArrowArray(into out: UnsafeMutablePointer<ArrowArray>) {
         ensure()
-        fillExportedArray(length: length, nullCount: nullCount, validity: validity, values: values, keep: self, into: out)
+        fillExportedArray(length: length, nullCount: nullCount, validity: rawValidity, values: rawValues,
+                          offset: offset, keep: self, into: out)
     }
     /// Exports through the C Device Data Interface with `device_type = ARROW_DEVICE_METAL`. Also zero-copy.
     public func exportArrowDeviceArray(into out: UnsafeMutablePointer<ArrowDeviceArray>) {
@@ -418,7 +426,8 @@ extension MetalArray {
 extension MetalBooleanArray {
     public func exportArrowArray(into out: UnsafeMutablePointer<ArrowArray>) {
         ensure()
-        fillExportedArray(length: length, nullCount: nullCount, validity: validity, values: values, keep: self, into: out)
+        fillExportedArray(length: length, nullCount: nullCount, validity: rawValidity, values: rawValues,
+                          offset: offset, keep: self, into: out)
     }
     public func exportArrowDeviceArray(into out: UnsafeMutablePointer<ArrowDeviceArray>) {
         withUnsafeMutablePointer(to: &out.pointee.array) { exportArrowArray(into: $0) }
@@ -531,18 +540,16 @@ func ownedExportBuffers(_ array: UnsafePointer<ArrowArray>) -> (validity: MetalA
 }
 
 /// Builds a typed array from already-owned buffers.
-private func rebuild(format: String, length: Int, nullCount: Int, validity: MetalArrowBuffer?, values: MetalArrowBuffer,
-                     context: MetalContext) throws -> AnyMetalArray {
+private func rebuild(format: String, offset: Int = 0, length: Int, nullCount: Int, validity: MetalArrowBuffer?,
+                     values: MetalArrowBuffer, context: MetalContext) throws -> AnyMetalArray {
     func mk<T: ArrowPrimitive>(_: T.Type) -> MetalArray<T> {
-        let a = MetalArray<T>(length: length, nullCount: 0, validity: validity, values: values, context: context)
-        if nullCount < 0 { a.recomputeNullCount() } else { a.setNullCount(nullCount) }
-        return a
+        MetalArray<T>(offset: offset, length: length, validity: validity, values: values,
+                      nullCount: nullCount < 0 ? nil : nullCount, context: context)
     }
     switch format {
     case "b":
-        let a = MetalBooleanArray(length: length, nullCount: 0, validity: validity, values: values, context: context)
-        if nullCount < 0 { a.recomputeNullCount() } else { a.setNullCount(nullCount) }
-        return .boolean(a)
+        return .boolean(MetalBooleanArray(offset: offset, length: length, validity: validity, values: values,
+                                          nullCount: nullCount < 0 ? nil : nullCount, context: context))
     case "c": return .int8(mk(Int8.self))
     case "C": return .uint8(mk(UInt8.self))
     case "s": return .int16(mk(Int16.self))

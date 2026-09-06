@@ -40,7 +40,9 @@ extension AnyMetalArray {
     /// Stable argsort of whichever concrete array this is, nulls last (`MetalArray.argsort`).
     ///
     /// Booleans go through their unpacked byte form and temporal columns through their integer storage.
-    /// Strings, binary and dictionary-encoded columns have no order-preserving GPU key yet, so they throw.
+    /// utf8 and binary columns sort byte-wise through the prefix radix sort in `Kernels/StringSort.swift`,
+    /// so a lexsort may mix them freely with numeric keys. Dictionary-encoded and nested columns have no
+    /// order-preserving GPU key yet, so they throw.
     public func argsortIndices(descending: Bool = false) throws -> MetalArray<Int32> {
         switch self {
         case .int8(let a): return try a.argsort(descending: descending)
@@ -59,7 +61,11 @@ extension AnyMetalArray {
             case .int32(let a): return try a.argsort(descending: descending)
             case .int64(let a): return try a.argsort(descending: descending)
             }
-        case .string, .binary, .dictionary, .runEndEncoded, .decimal, .list, .structure, .map, .union:
+        // utf8 and binary sort byte-wise on the GPU (`Kernels/StringSort.swift`), which is the order
+        // Arrow defines for them.
+        case .string(let a): return try a.argsort(descending: descending)
+        case .binary(let a): return try a.argsort(descending: descending)
+        case .dictionary, .runEndEncoded, .decimal, .list, .structure, .map, .union:
             throw ArrowMetalError.unsupportedType("sort by \(arrowFormat) is not implemented")
         // float16 sorts through the float32 widening; the rest have no order-preserving GPU key.
         case .float16(let a): return try a.toFloat32().argsort(descending: descending)

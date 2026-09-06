@@ -68,6 +68,8 @@ _lib.am_str_unary.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]; _lib.am_str
 _lib.am_str_match.argtypes = [_P, ctypes.c_int, ctypes.c_char_p, ctypes.c_int64, ctypes.POINTER(_P)]; _lib.am_str_match.restype = ctypes.c_int
 _lib.am_str_equals_array.argtypes = [_P, _P, ctypes.POINTER(_P)]; _lib.am_str_equals_array.restype = ctypes.c_int
 _lib.am_str_dictionary_encode.argtypes = [_P, ctypes.POINTER(_P), ctypes.POINTER(_P)]; _lib.am_str_dictionary_encode.restype = ctypes.c_int
+_lib.am_dictionary_encode.argtypes = [_P, ctypes.POINTER(_P), ctypes.POINTER(_P)]; _lib.am_dictionary_encode.restype = ctypes.c_int
+_lib.am_join.argtypes = [_P, _P, ctypes.c_int, ctypes.POINTER(_P), ctypes.POINTER(_P)]; _lib.am_join.restype = ctypes.c_int
 _lib.am_temporal_extract.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]; _lib.am_temporal_extract.restype = ctypes.c_int
 _lib.am_temporal_cast_unit.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]; _lib.am_temporal_cast_unit.restype = ctypes.c_int
 _lib.am_dictionary_decode.argtypes = [_P, ctypes.POINTER(_P)]; _lib.am_dictionary_decode.restype = ctypes.c_int
@@ -266,9 +268,27 @@ class MetalArray:
             return i.value & 0xFFFFFFFFFFFFFFFF
         return f.value
 
-    def sum(self): return self._reduce(0)
-    def min(self): return self._reduce(1)
-    def max(self): return self._reduce(2)
+    def _decimal_reduce(self, op):
+        """sum / min / max of a decimal column, as a decimal.Decimal (None when every row is null).
+
+        A 128-bit result does not fit an int64 out-parameter, so am_decimal_op 18-20 return a length-1
+        decimal column; this reads that one value back through the C Data Interface."""
+        one = self._decimal_op(op).to_arrow()
+        return one[0].as_py() if one[0].is_valid else None
+
+    def sum(self):
+        """Sum of the non-null values. Integers accumulate (and wrap) in 64 bits, floats in double,
+        decimals in 128 bits through am_decimal_op."""
+        return self._decimal_reduce(18) if self.format.startswith("d:") else self._reduce(0)
+
+    def min(self):
+        """Smallest non-null value; decimals go through am_decimal_op."""
+        return self._decimal_reduce(19) if self.format.startswith("d:") else self._reduce(1)
+
+    def max(self):
+        """Largest non-null value; decimals go through am_decimal_op."""
+        return self._decimal_reduce(20) if self.format.startswith("d:") else self._reduce(2)
+
     def mean(self): return self._reduce(3)
 
     # ---- element-wise
@@ -343,9 +363,14 @@ class MetalArray:
     def ends_with(self, p): return self._match(2, p)
     def str_contains(self, p): return self._match(3, p)
     def dictionary_encode(self):
-        """Returns (codes: int32 MetalArray, unique: string MetalArray). Use codes.group_by(len(unique))."""
+        """Arrow `dictionary_encode`: returns (codes: int32 MetalArray, values: MetalArray).
+
+        `codes[i]` indexes `values`, so `values.take(codes)` reproduces the column, and a null row gives a
+        null code. Works on every column type: utf8 and binary go through the host hash map, primitive,
+        temporal and boolean columns through the GPU `unique()` pipeline. Use
+        `codes.group_by(len(values))` to aggregate by the encoded column."""
         c = _P(); u = _P()
-        _check(_lib.am_str_dictionary_encode(self._h, ctypes.byref(c), ctypes.byref(u)))
+        _check(_lib.am_dictionary_encode(self._h, ctypes.byref(c), ctypes.byref(u)))
         return MetalArray(c), MetalArray(u)
 
     # ---- temporal (date, time, timestamp), extracted in UTC
@@ -1057,6 +1082,36 @@ def lexsort_indices(columns, descending=None):
     out = _P()
     _check(_lib.am_lexsort(handles, desc, len(cols), ctypes.byref(out)))
     return MetalArray(out)
+
+_JOIN_KIND = {"inner": 0, "left": 1}
+
+
+def join(left_keys, right_keys, how="inner"):
+    """GPU hash join in index form: the (left row, right row) pairs whose keys are equal.
+
+    Returns two int32 index arrays of the same length. Apply them with `take` to build the joined
+    columns:
+
+        li, ri = am.join(orders["customer_id"], customers["id"])
+        orders_name, customer_city = orders["name"].take(li), customers["city"].take(ri)
+
+    `how` is "inner" (only matching left rows) or "left" (every left row once per match, and once with a
+    null right index when it has none). Duplicate keys on either side produce every combination; null keys
+    never match; the pair order is unspecified. Keys must be int32 or int64 on both sides — a temporal
+    column joins on its storage integer, a dictionary column on its codes.
+
+    This is what `MetalRecordBatch.join(other, on:rightKey:kind:)` does on the Swift side: these indices,
+    then a `take` of every column of both sides, with the duplicated right key column dropped.
+    """
+    l = left_keys if isinstance(left_keys, MetalArray) else MetalArray.from_arrow(left_keys)
+    r = right_keys if isinstance(right_keys, MetalArray) else MetalArray.from_arrow(right_keys)
+    if how not in _JOIN_KIND:
+        raise ArrowMetalError('join how must be "inner" or "left"')
+    li, ri = _P(), _P()
+    _check(_lib.am_join(l._h, r._h, _JOIN_KIND[how], ctypes.byref(li), ctypes.byref(ri)))
+    return MetalArray(li), MetalArray(ri)
+
+
 # ---- statistical and positional aggregates, run-end encoding (see include/arrowmetal.h)
 _lib.am_reduce_ex.argtypes = [_P, ctypes.c_int, ctypes.c_double, ctypes.POINTER(ctypes.c_int64),
                               ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_int),

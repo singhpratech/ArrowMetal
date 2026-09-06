@@ -304,16 +304,19 @@ public func am_slice(_ a: OpaquePointer?, _ offset: Int64, _ length: Int64, _ ou
     return run(out) { try x.slice(offset: Int(offset), length: Int(length)) }
 }
 /// Indices that sort the array (stable, nulls last). Output is int32.
+///
+/// Numeric, boolean and temporal columns take the radix argsort; utf8 and binary columns take the
+/// byte-wise prefix radix sort in `Kernels/StringSort.swift`. Both go through `AnyMetalArray.argsortIndices`.
 @_cdecl("am_argsort")
 public func am_argsort(_ a: OpaquePointer?, _ descending: Int32, _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
     guard let x = handle(a) else { return 2 }
-    return run(out) { .int32(try withPrimitive(x) { try $0.argsort(descending != 0) }) }
+    return run(out) { .int32(try x.argsortIndices(descending: descending != 0)) }
 }
 /// Sorted copy of the array (stable, nulls last). Same element type as the input.
 @_cdecl("am_sort")
 public func am_sort(_ a: OpaquePointer?, _ descending: Int32, _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
     guard let x = handle(a) else { return 2 }
-    return run(out) { try x.take(try withPrimitive(x) { try $0.argsort(descending != 0) }) }
+    return run(out) { try x.take(try x.argsortIndices(descending: descending != 0)) }
 }
 /// Indices of the k largest (or smallest) values, in sorted order. Output is int32.
 @_cdecl("am_top_k")
