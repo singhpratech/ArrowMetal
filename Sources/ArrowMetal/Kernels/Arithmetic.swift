@@ -12,7 +12,7 @@ extension MetalArray {
         guard Dispatch.runsOnGPU(T.self) else { return try CPUReference.arithmetic(self, op, scalar: scalar) }
         try Dispatch.checkLength(length)
         let ctx = context
-        let out = try MetalArrowBuffer.allocate(byteCount: length * T.byteWidth, context: ctx)
+        let out = try MetalArrowBuffer.allocate(byteCount: length * T.byteWidth, zeroed: false, context: ctx)
         let src = KernelSource.arithmetic(T: T.mslType)
         let pso = try Dispatch.pipeline(ctx, family: "arith", source: src, function: "arith_scalar_\(op.rawValue)", type: T.mslType)
         try ctx.run { enc in
@@ -32,7 +32,7 @@ extension MetalArray {
         guard Dispatch.runsOnGPU(T.self) else { return try CPUReference.arithmetic(self, op, array: other) }
         try Dispatch.checkLength(length)
         let ctx = context
-        let out = try MetalArrowBuffer.allocate(byteCount: length * T.byteWidth, context: ctx)
+        let out = try MetalArrowBuffer.allocate(byteCount: length * T.byteWidth, zeroed: false, context: ctx)
         let src = KernelSource.arithmetic(T: T.mslType)
         let pso = try Dispatch.pipeline(ctx, family: "arith", source: src, function: "arith_array_\(op.rawValue)", type: T.mslType)
         try ctx.run { enc in

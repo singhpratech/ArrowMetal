@@ -19,6 +19,9 @@ public final class MetalArrowBuffer: @unchecked Sendable {
     public let offset: Int
     /// Object kept alive for the lifetime of this buffer when memory is borrowed (zero-copy import).
     private let keepAlive: AnyObject?
+    /// Whether the MTLBuffer came from the pool and should return to it.
+    private let pooled: Bool
+    private let poolContext: MetalContext?
 
     /// Whether the memory was borrowed without a copy from an external owner.
     public var isBorrowed: Bool { keepAlive != nil }
@@ -29,28 +32,49 @@ public final class MetalArrowBuffer: @unchecked Sendable {
         self.byteCount = byteCount
         self.offset = offset
         self.keepAlive = keepAlive
+        self.pooled = false
+        self.poolContext = nil
     }
 
-    /// Allocates a zeroed shared buffer of `byteCount` bytes.
+    init(mtl: MTLBuffer, byteCount: Int, pooled: Bool, context: MetalContext = .shared) {
+        self.mtl = mtl
+        self.byteCount = byteCount
+        self.offset = 0
+        self.keepAlive = nil
+        self.pooled = pooled
+        self.poolContext = context
+    }
+
+    deinit {
+        if pooled, let ctx = poolContext { ctx.pool.give(mtl) }
+    }
+
+    /// Allocates a shared buffer of `byteCount` bytes, zeroed unless `zeroed` is false.
     ///
     /// Memory is page aligned (pointer and length) and wrapped with `makeBuffer(bytesNoCopy:)`.
     /// This guarantees that any pointer ArrowMetal hands out through the C Data / C Device interfaces
     /// can be re-wrapped as an `MTLBuffer` by a foreign Metal consumer without a copy, and that
     /// bitmap kernels may safely read whole trailing 32-bit words.
-    public static func allocate(byteCount: Int, context: MetalContext = .shared) throws -> MetalArrowBuffer {
+    /// Buffers are recycled through the context's pool; pass `zeroed: false` for outputs a kernel fully writes.
+    public static func allocate(byteCount: Int, zeroed: Bool = true, context: MetalContext = .shared) throws -> MetalArrowBuffer {
         let page = metalPageSize()
         let padded = max(roundUp(byteCount, to: page), page)
+        if let b = context.pool.take(length: padded) {
+            if zeroed { memset(b.contents(), 0, padded) }
+            return MetalArrowBuffer(mtl: b, byteCount: byteCount, pooled: true)
+        }
         var raw: UnsafeMutableRawPointer? = nil
         guard posix_memalign(&raw, page, padded) == 0, let mem = raw else {
             throw ArrowMetalError.bufferAllocationFailed(bytes: padded)
         }
-        memset(mem, 0, padded)
+        // Small blocks come from the recycled malloc heap and are not zero; large ones are fresh mmap pages.
+        if zeroed { memset(mem, 0, padded) }
         guard let b = context.device.makeBuffer(bytesNoCopy: mem, length: padded, options: [.storageModeShared],
                                                 deallocator: { ptr, _ in free(ptr) }) else {
             free(mem)
             throw ArrowMetalError.bufferAllocationFailed(bytes: padded)
         }
-        return MetalArrowBuffer(mtl: b, byteCount: byteCount)
+        return MetalArrowBuffer(mtl: b, byteCount: byteCount, pooled: true)
     }
 
     /// Creates a buffer holding a copy of `bytes`.

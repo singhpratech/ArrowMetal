@@ -9,7 +9,7 @@ extension MetalArray {
         if U.self == T.self { return self as! MetalArray<U> }
         try Dispatch.checkLength(length)
         let ctx = context
-        let out = try MetalArrowBuffer.allocate(byteCount: length * U.byteWidth, context: ctx)
+        let out = try MetalArrowBuffer.allocate(byteCount: length * U.byteWidth, zeroed: false, context: ctx)
         if Dispatch.runsOnGPU(T.self) && Dispatch.runsOnGPU(U.self) {
             let src = KernelSource.cast(From: T.mslType, To: U.mslType)
             let pso = try Dispatch.pipeline(ctx, family: "cast", source: src, function: "cast_kernel", type: "\(T.mslType)->\(U.mslType)")

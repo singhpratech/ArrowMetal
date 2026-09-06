@@ -18,9 +18,9 @@ extension MetalArray {
         let mslT = Dispatch.moveType(T.self)
         let src = KernelSource.take(T: mslT, I: I.mslType)
         let pso = try Dispatch.pipeline(ctx, family: "take", source: src, function: "take_kernel", type: "\(mslT)/\(I.mslType)")
-        let out = try MetalArrowBuffer.allocate(byteCount: n * T.byteWidth, context: ctx)
+        let out = try MetalArrowBuffer.allocate(byteCount: n * T.byteWidth, zeroed: false, context: ctx)
         let hasV = validity != nil, hasIV = indices.validity != nil
-        let validBytes = try MetalArrowBuffer.allocate(byteCount: Swift.max(n, 1), context: ctx)
+        let validBytes = try MetalArrowBuffer.allocate(byteCount: Swift.max(n, 1), zeroed: false, context: ctx)
         let errorFlag = try MetalArrowBuffer.allocate(byteCount: 4, context: ctx)
         if n > 0 {
             try ctx.run { enc in

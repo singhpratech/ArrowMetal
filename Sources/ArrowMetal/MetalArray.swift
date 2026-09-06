@@ -51,7 +51,7 @@ public final class MetalArray<T: ArrowPrimitive>: @unchecked Sendable {
 
     /// Builds an array from Swift values, copying them into Metal shared memory.
     public convenience init(_ vals: [T], context: MetalContext = .shared) throws {
-        let vb = try MetalArrowBuffer.allocate(byteCount: vals.count * T.byteWidth, context: context)
+        let vb = try MetalArrowBuffer.allocate(byteCount: vals.count * T.byteWidth, zeroed: false, context: context)
         // Plain loop on purpose: a `withUnsafeBytes` closure here miscompiled under -O with Swift 6.3.3
         // (crash on entry in release builds only). The optimiser turns this into a memcpy anyway.
         let dst = vb.mutableTyped(T.self)

@@ -108,8 +108,8 @@ extension MetalArray {
         let pso = try Dispatch.pipeline(ctx, family: "reduce", source: src, function: fn, type: mslT + (extra == "true" ? "" : "/skipnan"))
         // Enough threadgroups to saturate the GPU, but few enough that the CPU finalise is trivial.
         let groups = Swift.max(1, Swift.min(2048, (length + Dispatch.threadgroupSize - 1) / Dispatch.threadgroupSize))
-        let partials = try MetalArrowBuffer.allocate(byteCount: groups * 8, context: ctx)
-        let counts = try MetalArrowBuffer.allocate(byteCount: groups * 4, context: ctx)
+        let partials = try MetalArrowBuffer.allocate(byteCount: groups * 8, zeroed: false, context: ctx)
+        let counts = try MetalArrowBuffer.allocate(byteCount: groups * 4, zeroed: false, context: ctx)
         try ctx.run { enc in
             enc.setComputePipelineState(pso)
             enc.setBuffer(values.mtl, offset: values.offset, index: 0)

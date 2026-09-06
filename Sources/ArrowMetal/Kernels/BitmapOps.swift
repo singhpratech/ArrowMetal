@@ -8,7 +8,7 @@ enum BitmapOps {
 
     static func binary(_ ctx: MetalContext, _ fn: String, _ a: MetalArrowBuffer, _ b: MetalArrowBuffer, bits: Int) throws -> MetalArrowBuffer {
         let w = words(bits: bits)
-        let out = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: bits), context: ctx)
+        let out = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: bits), zeroed: false, context: ctx)
         let pso = try ctx.pipeline(source: KernelSource.bitmap, function: fn, cacheKey: "bitmap/\(fn)")
         try ctx.run { enc in
             enc.setComputePipelineState(pso)
@@ -33,7 +33,7 @@ enum BitmapOps {
 
     static func packBits(_ ctx: MetalContext, bytes: MetalArrowBuffer, bits: Int) throws -> MetalArrowBuffer {
         let w = words(bits: bits)
-        let out = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: bits), context: ctx)
+        let out = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: bits), zeroed: false, context: ctx)
         let pso = try ctx.pipeline(source: KernelSource.bitmap, function: "pack_bits", cacheKey: "bitmap/pack_bits")
         try ctx.run { enc in
             enc.setComputePipelineState(pso)
@@ -46,7 +46,7 @@ enum BitmapOps {
     }
 
     static func unpackBits(_ ctx: MetalContext, bits: MetalArrowBuffer, count: Int) throws -> MetalArrowBuffer {
-        let out = try MetalArrowBuffer.allocate(byteCount: count, context: ctx)
+        let out = try MetalArrowBuffer.allocate(byteCount: count, zeroed: false, context: ctx)
         guard count > 0 else { return out }
         let pso = try ctx.pipeline(source: KernelSource.bitmap, function: "unpack_bits", cacheKey: "bitmap/unpack_bits")
         try ctx.run { enc in

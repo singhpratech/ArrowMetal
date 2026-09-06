@@ -22,7 +22,7 @@ extension MetalArray {
         try Dispatch.checkLength(length)
         let ctx = context
         let words = BitmapOps.words(bits: length)
-        let out = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: length), context: ctx)
+        let out = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: length), zeroed: false, context: ctx)
         let isDouble = T.self == Double.self
         let src = isDouble ? KernelSource.compareDouble : KernelSource.compare(T: T.mslType)
         let pso = try Dispatch.pipeline(ctx, family: "cmp", source: src, function: "cmp_scalar_\(op.rawValue)", type: isDouble ? "double" : T.mslType)
@@ -44,7 +44,7 @@ extension MetalArray {
         try Dispatch.checkLength(length)
         let ctx = context
         let words = BitmapOps.words(bits: length)
-        let out = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: length), context: ctx)
+        let out = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: length), zeroed: false, context: ctx)
         let isDouble = T.self == Double.self
         let src = isDouble ? KernelSource.compareDouble : KernelSource.compare(T: T.mslType)
         let pso = try Dispatch.pipeline(ctx, family: "cmp", source: src, function: "cmp_array_\(op.rawValue)", type: isDouble ? "double" : T.mslType)
@@ -73,7 +73,7 @@ extension MetalBooleanArray {
     }
     public func not() throws -> MetalBooleanArray {
         let words = BitmapOps.words(bits: length)
-        let out = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: length), context: context)
+        let out = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: length), zeroed: false, context: context)
         let pso = try context.pipeline(source: KernelSource.bitmap, function: "bitmap_not", cacheKey: "bitmap/bitmap_not")
         try context.run { enc in
             enc.setComputePipelineState(pso)

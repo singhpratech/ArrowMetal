@@ -22,7 +22,7 @@ extension MetalArray {
         let sel = try mask.selectionBitmap()
         let words = BitmapOps.words(bits: length)
         let blocks = Swift.max(1, (words + Dispatch.threadgroupSize - 1) / Dispatch.threadgroupSize)
-        let blockCounts = try MetalArrowBuffer.allocate(byteCount: blocks * 4, context: ctx)
+        let blockCounts = try MetalArrowBuffer.allocate(byteCount: blocks * 4, zeroed: false, context: ctx)
         let mslT = Dispatch.moveType(T.self)
         let src = KernelSource.filter(T: mslT)
         let countPSO = try Dispatch.pipeline(ctx, family: "filter", source: src, function: "filter_count", type: mslT)
@@ -46,9 +46,9 @@ extension MetalArray {
             return Int(total)
         }
 
-        let outValues = try MetalArrowBuffer.allocate(byteCount: outLen * T.byteWidth, context: ctx)
+        let outValues = try MetalArrowBuffer.allocate(byteCount: outLen * T.byteWidth, zeroed: false, context: ctx)
         let hasValidity = validity != nil
-        let validBytes = hasValidity ? try MetalArrowBuffer.allocate(byteCount: Swift.max(outLen, 1), context: ctx) : nil
+        let validBytes = hasValidity ? try MetalArrowBuffer.allocate(byteCount: Swift.max(outLen, 1), zeroed: false, context: ctx) : nil
 
         try ctx.run { enc in
             enc.setComputePipelineState(scatterPSO)

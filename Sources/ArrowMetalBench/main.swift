@@ -93,16 +93,45 @@ func cpuSumInt64(_ a: MetalArray<Int64>, _ lo: Int, _ hi: Int) -> Int64 {
     return s
 }
 
-func parallel<R: AdditiveArithmetic>(_ n: Int, _ f: (Int, Int) -> R) -> R {
-    let chunks = cores * 4
-    var partial = [R](repeating: .zero, count: chunks)
+/// Splits [0, n) into chunks aligned to 64 elements (keeps bitmap bytes/words chunk-private) and runs
+/// `f` on all cores. Returns one result per chunk.
+func parallelChunks<R>(_ n: Int, _ f: (Int, Int) -> R) -> [R] {
+    let chunks = max(1, min(cores * 4, (n + 63) / 64))
+    let per = ((n + chunks - 1) / chunks + 63) / 64 * 64
+    var partial = [R?](repeating: nil, count: chunks)
     partial.withUnsafeMutableBufferPointer { out in
         DispatchQueue.concurrentPerform(iterations: chunks) { c in
-            let lo = n * c / chunks, hi = n * (c + 1) / chunks
+            let lo = min(n, c * per), hi = min(n, (c + 1) * per)
             out[c] = f(lo, hi)
         }
     }
-    return partial.reduce(.zero, +)
+    return partial.map { $0! }
+}
+func parallel<R: AdditiveArithmetic>(_ n: Int, _ f: (Int, Int) -> R) -> R { parallelChunks(n, f).reduce(.zero, +) }
+
+/// Parallel filter over an Arrow layout: per-chunk count, prefix, per-chunk scatter.
+func cpuFilterParallel<T>(_ p: UnsafePointer<T>, n: Int, sel: UnsafePointer<UInt8>, into out: UnsafeMutablePointer<T>) -> Int {
+    func popcountRange(_ lo: Int, _ hi: Int) -> Int {
+        var c = 0; var i = lo
+        while i < hi { var b = sel[i >> 3]; if i + 8 > hi { b &= UInt8((1 << (hi - i)) - 1) }; c += b.nonzeroBitCount; i += 8 }
+        return c
+    }
+    let counts = parallelChunks(n, popcountRange)
+    var offsets = [Int](repeating: 0, count: counts.count); var acc = 0
+    for (i, c) in counts.enumerated() { offsets[i] = acc; acc += c }
+    let chunks = counts.count
+    let per = ((n + chunks - 1) / chunks + 63) / 64 * 64
+    DispatchQueue.concurrentPerform(iterations: chunks) { c in
+        let lo = min(n, c * per), hi = min(n, (c + 1) * per)
+        var k = offsets[c]; var i = lo
+        while i < hi {
+            var byte = sel[i >> 3]
+            if i + 8 > hi { byte &= UInt8((1 << (hi - i)) - 1) }
+            while byte != 0 { let j = byte.trailingZeroBitCount; out[k] = p[i + j]; k += 1; byte &= byte - 1 }
+            i += 8
+        }
+    }
+    return acc
 }
 
 let ctx = MetalContext.shared
@@ -120,56 +149,90 @@ let bytesI64 = rows * 8
 
 var sec = "sum(Int64, 10% nulls)"; print(sec)
 try time("Metal  sum", bytes: bytesI64, section: sec) { sink(try colI64.sum()) }
-time("CPU 1-core  sum (null-aware loop)", bytes: bytesI64, section: sec) { sink(cpuSumInt64(colI64, 0, rows)) }
 time("CPU \(cores)-core sum (null-aware loop)", bytes: bytesI64, section: sec) { sink(parallel(rows) { cpuSumInt64(colI64, $0, $1) }) }
 
 sec = "min(Int64, 10% nulls)"; print("\n" + sec)
 try time("Metal  min", bytes: bytesI64, section: sec) { sink(try colI64.min()) }
-time("CPU 1-core  min (null-aware loop)", bytes: bytesI64, section: sec) { sink(cpuMinInt64(opaque(colI64))) }
+time("CPU \(cores)-core min (null-aware loop)", bytes: bytesI64, section: sec) {
+    let a = opaque(colI64); let p = a.valuePointer; let bm = a.validity!.typed(UInt8.self)
+    sink(parallelChunks(rows) { lo, hi in var m = Int64.max; for i in lo..<hi where (bm[i >> 3] >> (i & 7)) & 1 == 1 { m = min(m, p[i]) }; return m }.min()!)
+}
 
 sec = "compare(Int64 > 0) -> boolean bitmap"; print("\n" + sec)
 try time("Metal  compare", bytes: bytesI64, section: sec) { sink(try colI64.compare(.gt, 0)) }
-let cmpOut = UnsafeMutablePointer<UInt8>.allocate(capacity: rows / 8 + 1)
-time("CPU 1-core  compare (packed bitmap)", bytes: bytesI64, section: sec) { cpuCompareGt(opaque(colI64), 0, into: cmpOut); sink(cmpOut[0]) }
+let cmpOut = UnsafeMutablePointer<UInt8>.allocate(capacity: rows / 8 + 64)
+time("CPU \(cores)-core compare (packed bitmap)", bytes: bytesI64, section: sec) {
+    let p = opaque(colI64).valuePointer
+    _ = parallelChunks(rows) { lo, hi in
+        var i = lo
+        while i < hi { var b: UInt8 = 0; let lim = min(8, hi - i); for j in 0..<lim where p[i + j] > 0 { b |= 1 << j }; cmpOut[i >> 3] = b; i += 8 }
+        return 0
+    }
+    sink(cmpOut[0])
+}
 
 sec = "filter(Int64 where > 0) -> compacted (~45% kept)"; print("\n" + sec)
 let mask = try colI64.compare(.gt, 0)
 try time("Metal  filter", bytes: bytesI64, section: sec) { sink(try colI64.filter(mask)) }
 let selBits = try mask.and(mask).values  // materialised selection bitmap (mask has no nulls here)
 let filtOut = UnsafeMutablePointer<Int64>.allocate(capacity: rows)
-time("CPU 1-core  filter (bit-scan loop)", bytes: bytesI64, section: sec) { sink(cpuFilterInt64(opaque(colI64), sel: selBits.typed(UInt8.self), into: filtOut)) }
+time("CPU \(cores)-core filter (count, prefix, scatter)", bytes: bytesI64, section: sec) {
+    sink(cpuFilterParallel(opaque(colI64).valuePointer, n: rows, sel: selBits.typed(UInt8.self), into: filtOut))
+}
 
 sec = "compare + filter pipeline"; print("\n" + sec)
 try time("Metal  compare then filter", bytes: bytesI64, section: sec) { sink(try colI64.filter(try colI64.compare(.gt, 0))) }
-time("Swift  [Int64].filter { $0 > 0 } (no nulls)", bytes: bytesI64, section: sec) { sink(i64raw.filter { $0 > 0 }) }
+time("CPU \(cores)-core compare then filter", bytes: bytesI64, section: sec) {
+    let p = opaque(colI64).valuePointer
+    _ = parallelChunks(rows) { lo, hi in
+        var i = lo
+        while i < hi { var b: UInt8 = 0; let lim = min(8, hi - i); for j in 0..<lim where p[i + j] > 0 { b |= 1 << j }; cmpOut[i >> 3] = b; i += 8 }
+        return 0
+    }
+    sink(cpuFilterParallel(p, n: rows, sel: cmpOut, into: filtOut))
+}
+time("Swift  [Int64].filter { $0 > 0 } (1 core, no nulls)", bytes: bytesI64, section: sec) { sink(i64raw.filter { $0 > 0 }) }
 
 sec = "multiply(Int64 * 3)"; print("\n" + sec)
 try time("Metal  multiply scalar", bytes: bytesI64 * 2, section: sec) { sink(try colI64.multiply(3)) }
-try time("CPU 1-core  multiply scalar", bytes: bytesI64 * 2, section: sec) { sink(try CPUReference.arithmetic(colI64, .mul, scalar: 3)) }
+let mulOut = UnsafeMutablePointer<Int64>.allocate(capacity: rows)
+time("CPU \(cores)-core multiply scalar", bytes: bytesI64 * 2, section: sec) {
+    let p = opaque(colI64).valuePointer
+    _ = parallelChunks(rows) { lo, hi in for i in lo..<hi { mulOut[i] = p[i] &* 3 }; return 0 }
+    sink(mulOut[0])
+}
 
 sec = "take(Int64, 25M random indices)"; print("\n" + sec)
 let takeIdx = try MetalArray<Int32>((0..<(rows / 2)).map { _ in Int32.random(in: 0..<Int32(rows), using: &g) })
 try time("Metal  take", bytes: rows / 2 * (8 + 4 + 8), section: sec) { sink(try colI64.take(takeIdx)) }
-time("CPU 1-core  take (gather loop)", bytes: rows / 2 * (8 + 4 + 8), section: sec) {
-    let p = colI64.valuePointer, ip = takeIdx.valuePointer
-    var out = [Int64](repeating: 0, count: rows / 2)
-    out.withUnsafeMutableBufferPointer { o in for i in 0..<o.count { o[i] = p[Int(ip[i])] } }
-    sink(out)
+let takeOut = UnsafeMutablePointer<Int64>.allocate(capacity: rows / 2)
+time("CPU \(cores)-core take (gather loop)", bytes: rows / 2 * (8 + 4 + 8), section: sec) {
+    let p = opaque(colI64).valuePointer, ip = takeIdx.valuePointer
+    _ = parallelChunks(rows / 2) { lo, hi in for i in lo..<hi { takeOut[i] = p[Int(ip[i])] }; return 0 }
+    sink(takeOut[0])
 }
 
 sec = "Float64: compare(> 500) then filter"; print("\n" + sec)
 let colF64 = try MetalArray<Double>((0..<rows).map { _ in Double.random(in: 0...1000, using: &g) })
 try time("Metal  compare then filter (bit-pattern kernels)", bytes: rows * 8, section: sec) { sink(try colF64.filter(try colF64.compare(.gt, 500))) }
-let f64raw = colF64.toRawArray()
-time("Swift  [Double].filter { $0 > 500 }", bytes: rows * 8, section: sec) { sink(opaque(f64raw).filter { $0 > 500 }) }
+let f64Out = UnsafeMutablePointer<Double>.allocate(capacity: rows)
+time("CPU \(cores)-core compare then filter", bytes: rows * 8, section: sec) {
+    let p = opaque(colF64).valuePointer
+    _ = parallelChunks(rows) { lo, hi in
+        var i = lo
+        while i < hi { var b: UInt8 = 0; let lim = min(8, hi - i); for j in 0..<lim where p[i + j] > 500 { b |= 1 << j }; cmpOut[i >> 3] = b; i += 8 }
+        return 0
+    }
+    sink(cpuFilterParallel(p, n: rows, sel: cmpOut, into: f64Out))
+}
 
 sec = "cast(Int64 -> Float32)"; print("\n" + sec)
 try time("Metal  cast", bytes: rows * 12, section: sec) { sink(try colI64.cast(to: Float.self)) }
-time("CPU 1-core  convert loop", bytes: rows * 12, section: sec) {
-    var out = [Float](repeating: 0, count: rows)
-    let src = opaque(i64raw)
-    out.withUnsafeMutableBufferPointer { dst in for i in 0..<rows { dst[i] = Float(src[i]) } }
-    sink(out)
+let castOut = UnsafeMutablePointer<Float>.allocate(capacity: rows)
+time("CPU \(cores)-core convert loop", bytes: rows * 12, section: sec) {
+    let p = opaque(colI64).valuePointer
+    _ = parallelChunks(rows) { lo, hi in for i in lo..<hi { castOut[i] = Float(p[i]) }; return 0 }
+    sink(castOut[0])
 }
 
 // --- Float32 column, no nulls: compare with vDSP ---
@@ -179,19 +242,45 @@ let bytesF32 = rows * 4
 sec = "sum(Float32, no nulls)"; print("\n" + sec)
 try time("Metal  sum", bytes: bytesF32, section: sec) { sink(try colF32.sum()) }
 time("vDSP   sum (Accelerate, 1 core)", bytes: bytesF32, section: sec) { sink(vDSP.sum(f32)) }
+time("vDSP   sum (Accelerate, \(cores) cores)", bytes: bytesF32, section: sec) {
+    let p = opaque(colF32).valuePointer
+    sink(parallel(rows) { lo, hi in vDSP.sum(UnsafeBufferPointer(start: p + lo, count: hi - lo)) })
+}
 
 sec = "max(Float32, no nulls)"; print("\n" + sec)
 try time("Metal  max", bytes: bytesF32, section: sec) { sink(try colF32.max()) }
 time("vDSP   maximum (Accelerate, 1 core)", bytes: bytesF32, section: sec) { sink(vDSP.maximum(f32)) }
+time("vDSP   maximum (Accelerate, \(cores) cores)", bytes: bytesF32, section: sec) {
+    let p = opaque(colF32).valuePointer
+    sink(parallelChunks(rows) { lo, hi in vDSP.maximum(UnsafeBufferPointer(start: p + lo, count: hi - lo)) }.max()!)
+}
 
 sec = "multiply(Float32 * 2.5)"; print("\n" + sec)
 try time("Metal  multiply scalar", bytes: bytesF32 * 2, section: sec) { sink(try colF32.multiply(2.5)) }
 var outF = [Float](repeating: 0, count: rows)
 time("vDSP   multiply scalar (Accelerate, 1 core)", bytes: bytesF32 * 2, section: sec) { vDSP.multiply(2.5, f32, result: &outF); sink(outF[0]) }
+let mulF = UnsafeMutablePointer<Float>.allocate(capacity: rows)
+time("vDSP   multiply scalar (Accelerate, \(cores) cores)", bytes: bytesF32 * 2, section: sec) {
+    let p = opaque(colF32).valuePointer
+    _ = parallelChunks(rows) { lo, hi in
+        var dst = UnsafeMutableBufferPointer(start: mulF + lo, count: hi - lo)
+        vDSP.multiply(2.5, UnsafeBufferPointer(start: p + lo, count: hi - lo), result: &dst); return 0
+    }
+    sink(mulF[0])
+}
 
 sec = "compare(Float32 > 0) then filter"; print("\n" + sec)
 try time("Metal  compare then filter", bytes: bytesF32, section: sec) { sink(try colF32.filter(try colF32.compare(.gt, 0))) }
-time("Swift  [Float].filter { $0 > 0 }", bytes: bytesF32, section: sec) { sink(f32.filter { $0 > 0 }) }
+let f32Out = UnsafeMutablePointer<Float>.allocate(capacity: rows)
+time("CPU \(cores)-core compare then filter", bytes: bytesF32, section: sec) {
+    let p = opaque(colF32).valuePointer
+    _ = parallelChunks(rows) { lo, hi in
+        var i = lo
+        while i < hi { var b: UInt8 = 0; let lim = min(8, hi - i); for j in 0..<lim where p[i + j] > 0 { b |= 1 << j }; cmpOut[i >> 3] = b; i += 8 }
+        return 0
+    }
+    sink(cpuFilterParallel(p, n: rows, sel: cmpOut, into: f32Out))
+}
 
 // Markdown table for the README.
 print("\n\n| Operation | Implementation | Time (ms) | Throughput (GB/s) |\n|---|---|---:|---:|")

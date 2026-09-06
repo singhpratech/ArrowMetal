@@ -43,11 +43,17 @@ public final class MetalContext: @unchecked Sendable {
         do { return try MetalContext() } catch { fatalError("\(error)") }
     }()
 
-    public init(device: MTLDevice? = nil) throws {
+    /// Recycles page-aligned buffers so repeated kernels do not pay mmap and page-fault costs.
+    public let pool: BufferPool
+
+    public init(device: MTLDevice? = nil, poolLimitBytes: Int? = nil) throws {
         guard let dev = device ?? MTLCreateSystemDefaultDevice() else { throw ArrowMetalError.noMetalDevice }
         guard let q = dev.makeCommandQueue() else { throw ArrowMetalError.noMetalDevice }
         self.device = dev
         self.queue = q
+        // Default cap: a quarter of the recommended working set, at most 8 GB.
+        let cap = poolLimitBytes ?? Swift.min(Int(dev.recommendedMaxWorkingSetSize) / 4, 8 << 30)
+        self.pool = BufferPool(limitBytes: cap)
     }
 
     /// Returns a compiled compute pipeline for `function` inside `source`, compiling and caching on first use.
@@ -86,5 +92,47 @@ public final class MetalContext: @unchecked Sendable {
         cb.waitUntilCompleted()
         if let err = cb.error { throw ArrowMetalError.pipelineCreationFailed("command buffer failed: \(err)") }
         return cb
+    }
+}
+
+/// Size-bucketed free list of shared `MTLBuffer`s. Exact-length matches only (lengths are page multiples,
+/// so repeated same-size allocations, the common case in a pipeline, always hit).
+public final class BufferPool: @unchecked Sendable {
+    public let limitBytes: Int
+    private let lock = NSLock()
+    private var free: [Int: [MTLBuffer]] = [:]
+    private var order: [Int] = []          // lengths in insertion order for eviction
+    public private(set) var pooledBytes = 0
+
+    init(limitBytes: Int) { self.limitBytes = limitBytes }
+
+    func take(length: Int) -> MTLBuffer? {
+        lock.lock(); defer { lock.unlock() }
+        guard var list = free[length], let b = list.popLast() else { return nil }
+        free[length] = list.isEmpty ? nil : list
+        pooledBytes -= length
+        return b
+    }
+
+    func give(_ b: MTLBuffer) {
+        lock.lock(); defer { lock.unlock() }
+        let len = b.length
+        if len > limitBytes { return }
+        while pooledBytes + len > limitBytes, let evictLen = order.first {
+            order.removeFirst()
+            if var list = free[evictLen], let _ = list.popLast() {
+                free[evictLen] = list.isEmpty ? nil : list
+                pooledBytes -= evictLen
+            }
+        }
+        free[len, default: []].append(b)
+        order.append(len)
+        pooledBytes += len
+    }
+
+    /// Releases every pooled buffer back to the OS.
+    public func drain() {
+        lock.lock(); defer { lock.unlock() }
+        free.removeAll(); order.removeAll(); pooledBytes = 0
     }
 }
