@@ -70,7 +70,7 @@ final class DoubleMathTests: XCTestCase {
             for i in 0..<n { vals.append(i % 11 == 0 ? nil : Double.random(in: -1000...1000, using: &g)) }
             let a = try MetalArray<Double>(vals)
             let s = try a.sum(), ref = CPUReference.sum(a)
-            if let ref { XCTAssertEqual(s!.asDouble, ref.asDouble, accuracy: max(Double(n) * 1000 * 1e-15 * 4, 1e-9), "n=\(n)")   // reassociation error grows with n and magnitude } else { XCTAssertNil(s) }
+            if let ref { XCTAssertEqual(s!.asDouble, ref.asDouble, accuracy: max(Double(n) * 1000 * 1e-15 * 4, 1e-9), "n=\(n)") } else { XCTAssertNil(s) }   // tolerance: reassociation error grows with n and magnitude
             if let ref { XCTAssertEqual(try a.mean()!, ref.asDouble / Double(a.validCount), accuracy: 1e-9) } else { XCTAssertNil(try a.mean()) }
         }
         let big = try MetalArray<Double>([1e308, 1e308]); XCTAssertEqual(try big.sum(), .float(.infinity))
