@@ -105,8 +105,67 @@ random slot access, which is why the win narrows from 10x to 2x. The 1000- and 1
 4 ms against pyarrow's 700-2000.
 
 Integer, boolean, temporal and dictionary key columns still take the range path (~22 ms at 50M rows);
-they never enter the hash table. `unique` and `value_counts` are not implemented for string columns, so
-there was nothing there to route.
+they never enter the hash table when they are group-by keys.
+
+### The same table for the distinct-value functions
+
+`unique`, `value_counts`, `count_distinct`, `mode` and `dictionary_encode` over a **primitive** column had
+the same problem for the same reason: all five began with an argsort of every row, so all five cost the
+same whatever the cardinality, and all five lost to CPU libraries that use a hash table (0.11x to 0.71x
+of pyarrow/Polars/pandas at 10M rows before this change). `Kernels/HashTable.swift` is the string table
+with the byte comparison removed — the key *is* the 64-bit value, so equality on it is exact — and the
+estimate, the growth retry, the rank scan and the id pass are literally the same code.
+
+Turning a column into that key is one kernel: integers widen (sign-extended, so the map is injective),
+and floats are normalised first — every NaN to one bit pattern, `-0.0` to `0.0` — so bit equality means
+Arrow value equality, which is what `unique`'s sort path achieves by normalising before the sort. The
+order does not change either: the distinct values come back **ascending**, because the last stage
+argsorts the `K` representative values. Sorting `K` values instead of `n` rows is the whole trick.
+`count_distinct` skips even that — it is the occupied-slot count, so it never gathers or orders anything.
+
+Because the table keeps the lowest row per slot, first-appearance order is available for one argsort of
+`K` int32s (`HashGroups.firstSlotOrder`, exposed as `HashDistinct.firstRows`) rather than another pass
+over the rows — which is what an `order:` option would want.
+
+The threshold is `1 << 16` rows: below it the sort is a handful of small passes and the table's extra
+round trips do not pay for themselves. `ARROWMETAL_NO_HASH=1` forces the sort path in a shipping binary,
+which is how the before column below was measured.
+
+M4 Max, 50M `int64` rows, Swift, best of 3:
+
+| function | distinct | before (sort) | **after (hash table)** |
+|---|---|---:|---:|
+| `unique` | 1,000 / 100k / 10M | 142.7 / 147.2 / 303.9 ms | **12.3 / 14.5 / 89.7** |
+| `value_counts` | 1,000 / 100k / 10M | 141.2 / 235.5 / 443.3 | **14.2 / 17.7 / 110.6** |
+| `count_distinct` | 1,000 / 100k / 10M | 142.3 / 282.3 / 265.0 | **9.6 / 10.1 / 42.5** |
+| `mode` | 1,000 / 100k / 10M | 142.2 / 199.7 / 278.0 | **13.9 / 17.9 / 121.6** |
+| `dictionary_encode` | 1,000 / 100k / 10M | 162.3 / 295.5 / 277.2 | **12.8 / 16.5 / 108.2** |
+
+Against the CPU libraries on the same buffers, called from Python (50M rows, best of 3, ms):
+
+| function | distinct | ArrowMetal | Polars | pyarrow | vs the best of them |
+|---|---|---:|---:|---:|---:|
+| `unique` | 1,000 | 12.2 | 120.9 | 97.2 | **7.9x** |
+| | 100,000 | 14.1 | 141.8 | 89.8 | **6.4x** |
+| | 10,000,000 | 91.1 | 191.3 | 715.1 | 2.1x |
+| `value_counts` | 1,000 | 14.1 | 130.6 | 154.5 | **9.2x** |
+| | 100,000 | 17.6 | 340.1 | 221.4 | **12.6x** |
+| | 10,000,000 | 113.6 | 1781.0 | 1620.0 | **14.3x** |
+| `count_distinct` | 1,000 | 9.7 | 121.0 | 91.4 | **9.4x** |
+| | 100,000 | 9.8 | 137.1 | 90.4 | **9.2x** |
+| | 10,000,000 | 41.8 | 183.8 | 798.3 | **4.4x** |
+| `mode` | 1,000 | 27.7 | 85.1 | 23.2 | 0.8x |
+| | 100,000 | 35.1 | 93.6 | 583.0 | 2.7x |
+| | 10,000,000 | 247.1 | 494.3 | 1107.3 | 2.0x |
+
+Two cases are worth being honest about. `unique` at ten million distinct is only 2.1x Polars because
+ArrowMetal orders its output and Polars does not: 30 of those 91 ms are the argsort of the ten million
+distinct values, which a hash-order `unique` would not pay. And `mode` is measured through a Python
+binding that computes it **twice** (`_mode` in `python/arrowmetal/__init__.py` calls the reduction once
+for the value and again for the count) — the Swift figures are 13.9 / 17.9 / 121.6 ms, i.e. 1.7x / 32.6x /
+9.1x pyarrow. At 1,000 distinct pyarrow's `mode` is genuinely fast because the values span a narrow range
+and it counts into a direct-indexed table rather than a hash map; the same range trick already exists here
+in `GroupByKeys.rangeIds` and is the obvious next step for these five functions.
 
 ## Latency (small inputs)
 Measured floor on M4 Max: an empty kernel with encode + commit + wait costs ~116 µs; ten kernels in one

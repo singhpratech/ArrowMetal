@@ -750,6 +750,42 @@ for gbDistinct in [1_000, 100_000, 10_000_000] where gbDistinct <= gbRows {
     }
 }
 
+// ---------------------------------------------------------------------------------------------------
+// The distinct-value functions over a primitive column (Kernels/HashTable.swift): unique, value_counts,
+// count_distinct, mode and dictionary_encode, at three cardinalities. All five used to argsort every
+// row; the hash table makes them cost what the distinct count costs. `dictionary_encode` on a primitive
+// column has no C entry point, so this is the only place it is measured.
+// ---------------------------------------------------------------------------------------------------
+
+/// All-core CPU count_distinct over an Int64 column: per-core hash sets, merged.
+func cpuCountDistinct(_ a: MetalArray<Int64>) -> Int {
+    let p = a.valuePointer
+    let parts = parallelChunks(a.length) { lo, hi -> Set<Int64> in
+        var s = Set<Int64>(minimumCapacity: 1 << 16)
+        for i in lo..<hi { s.insert(p[i]) }
+        return s
+    }
+    var all = Set<Int64>(minimumCapacity: 1 << 16)
+    for p in parts { all.formUnion(p) }
+    return all.count
+}
+
+for dvDistinct in [1_000, 100_000, 10_000_000] where dvDistinct <= rows {
+    if let only = benchOnly, !"distinct-value ops over \(rows) int64 (\(dvDistinct) distinct)".contains(only) { continue }
+    var raw = [Int64](repeating: 0, count: rows)
+    for i in 0..<rows { raw[i] = Int64.random(in: 0..<Int64(dvDistinct), using: &g) &* 7 }
+    let dvCol = try MetalArray<Int64>(raw)
+    raw = []
+    let dvBytes = rows * 8
+    sec = "distinct-value ops over \(rows) int64 (\(dvDistinct) distinct)"; print("\n" + sec)
+    try time("Metal  unique", bytes: dvBytes, section: sec) { sink(try dvCol.unique().length) }
+    try time("Metal  value_counts", bytes: dvBytes, section: sec) { sink(try dvCol.valueCounts().counts.length) }
+    try time("Metal  count_distinct", bytes: dvBytes, section: sec) { sink(try dvCol.countDistinct()) }
+    try time("Metal  mode", bytes: dvBytes, section: sec) { sink(try dvCol.mode()?.count ?? 0) }
+    try time("Metal  dictionary_encode", bytes: dvBytes, section: sec) { sink(try dvCol.dictionaryEncode().unique.length) }
+    time("CPU \(cores)-core hash count_distinct", bytes: dvBytes, section: sec) { sink(cpuCountDistinct(opaque(dvCol))) }
+}
+
 // Markdown table for the README.
 print("\n\n| Operation | Implementation | Time (ms) | Throughput (GB/s) | CPU time (ms) |\n|---|---|---:|---:|---:|")
 for (s, l, ms, gb, cpu) in results { print("| \(s) | \(l) | \(String(format: "%.2f", ms)) | \(String(format: "%.1f", gb)) | \(String(format: "%.1f", cpu)) |") }

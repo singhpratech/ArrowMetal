@@ -50,7 +50,7 @@ extension MetalStringArray {
     /// It wins everywhere it has been measured — the table is fewer passes than the argsort even at a
     /// hundred rows — but the sort path stays reachable for a zero-row column, where there is no table
     /// to build, and as the reference the tests compare against.
-    static func prefersHashTable(rows: Int) -> Bool { rows > 0 }
+    static func prefersHashTable(rows: Int) -> Bool { rows > 0 && !HashTable.disabled }
 
     /// Dense ids `0 ..< groupCount` for `GroupByKeys`, null rows taking the dedicated id `groupCount`.
     /// Returns the ids and the group count *including* the null group, exactly as `densify` does.
@@ -84,6 +84,10 @@ extension MetalStringArray {
     }
 
     // MARK: - The table
+
+    static func pso(_ ctx: MetalContext, _ fn: String) throws -> MTLComputePipelineState {
+        try ctx.pipeline(source: StringHashTableSource.source, function: fn, cacheKey: "strhash/\(fn)")
+    }
 
     /// MurmurHash-grade 64-bit hash of every row's bytes, both halves from one pass over the data.
     /// Null rows hash to 0 and are never inserted.
@@ -134,181 +138,39 @@ extension MetalStringArray {
         }
 
         let keys = try hashes ?? hash64()
-        let flagsBase = (validity == nil ? 0 : Self.hasValidityFlag) | (verify ? Self.verifyFlag : 0)
         let v = validity ?? offsets
+        let flagsBase = (validity == nil ? 0 : 1) | (verify ? 2 : 0)
 
-        // Largest table we would ever build: at least two slots per non-null row, so an insert into it
-        // always finds a free slot and the last attempt cannot fail.
-        var cap = 1024
-        while cap < 2 * nonNull { cap <<= 1 }
-
-        // Cardinality estimate from a 1/64 slice of the hash space. Below the threshold the table is
-        // small either way, so the estimate is not worth a pass.
-        var estimate = nonNull
-        if initialSlots != nil {
-            estimate = 0
-        } else if nonNull > 1 << 17 {
-            let sampleBits = 6
-            var pilot = 1024
-            while pilot < 4 * (nonNull >> sampleBits) { pilot <<= 1 }
-            pilot = Swift.min(pilot, 1 << 21)
-            let slots = try MetalArrowBuffer.allocate(byteCount: pilot * 4, zeroed: false, context: ctx)
-            let failed = try build(keys: keys, slots: slots, slotCount: pilot, flags: flagsBase,
-                                   sampleMask: (1 << sampleBits) - 1, maxProbe: 64,
-                                   slotOf: nil, firstOfSlot: nil)
-            let sampled = try failed ? 0 : occupancy(slots: slots, count: pilot).total
-            // A pilot that ran out of probe budget is one whose slice was denser than the table it was
-            // given; fall back to sizing for the worst case rather than trusting a truncated count.
-            estimate = sampled == 0 ? nonNull : Swift.min(nonNull, sampled << sampleBits)
-            ctx.retainUntilFlush(slots)
-        }
-
-        // Three slots per estimated distinct value keeps the load factor near 0.3, where linear probing
-        // is still one probe for almost every row.
-        var slotCount = initialSlots ?? 1024
-        while slotCount < 3 * estimate && slotCount < cap { slotCount <<= 1 }
-        slotCount = Swift.min(slotCount, cap)
-
-        let slotOf = try MetalArrowBuffer.allocate(byteCount: n * 4, zeroed: false, context: ctx)
-        var slots: MetalArrowBuffer
-        var firstOfSlot: MetalArrowBuffer
-        while true {
-            let last = slotCount >= cap
-            slots = try MetalArrowBuffer.allocate(byteCount: slotCount * 4, zeroed: false, context: ctx)
-            firstOfSlot = try MetalArrowBuffer.allocate(byteCount: slotCount * 4, zeroed: false, context: ctx)
-            let failed = try build(keys: keys, slots: slots, slotCount: slotCount,
-                                   flags: flagsBase | Self.writeSlotsFlag, sampleMask: 0,
-                                   maxProbe: last ? Int(UInt32.max) : 96,
-                                   slotOf: slotOf, firstOfSlot: firstOfSlot)
-            if !failed { break }
-            // The estimate was low and probe chains grew past the budget. Retry with a bigger table; the
-            // last attempt has two slots per row and no budget, so this terminates.
-            slotCount = Swift.min(slotCount << 3, cap)
-        }
-        ctx.retainUntilFlush(slots); ctx.retainUntilFlush(firstOfSlot); ctx.retainUntilFlush(slotOf)
-
-        let (cum, groupCount) = try occupancy(slots: slots, count: slotCount)
-        // One representative row per group, in slot order, then the relabelling that turns slot order
-        // into first-seen order.
-        let firstSlotOrder = try compact(slots: slots, firstOfSlot: firstOfSlot, cum: cum,
-                                         slotCount: slotCount, groupCount: groupCount)
-        let perm = try firstSlotOrder.argsort()
-        let relabel = try perm.argsort()
-        let firstRows = try firstSlotOrder.take(perm)
-
-        let ids = try MetalArrowBuffer.allocate(byteCount: n * 4, zeroed: false, context: ctx)
-        let p = try Self.pso(ctx, "sht_ids")
-        try ctx.run { enc in
-            enc.setComputePipelineState(p)
-            enc.setBuffer(slotOf.mtl, offset: slotOf.offset, index: 0)
-            enc.setBuffer(v.mtl, offset: v.offset, index: 1)
-            Dispatch.setUInt(enc, validity == nil ? 0 : Self.hasValidityFlag, index: 2)
-            Dispatch.setUInt(enc, nullId ?? groupCount, index: 3)
-            enc.setBuffer(cum.values.mtl, offset: cum.values.offset, index: 4)
-            enc.setBuffer(relabel.values.mtl, offset: relabel.values.offset, index: 5)
-            Dispatch.setLength(enc, n, nil, index: 6)
-            enc.setBuffer(ids.mtl, offset: ids.offset, index: 7)
-            Dispatch.dispatch1D(enc, p, count: n)
-        }
-        ctx.retainUntilFlush(cum); ctx.retainUntilFlush(relabel); ctx.retainUntilFlush(self)
-        try ctx.syncPoint()
-        return StringHashTableIds(ids: ids, rows: n, groupCount: groupCount, firstRows: firstRows)
-    }
-
-    // MARK: - Stages
-
-    private static let hasValidityFlag = 1
-    private static let verifyFlag = 2
-    private static let writeSlotsFlag = 4
-
-    private static func pso(_ ctx: MetalContext, _ fn: String) throws -> MTLComputePipelineState {
-        try ctx.pipeline(source: StringHashTableSource.source, function: fn, cacheKey: "strhash/\(fn)")
-    }
-
-    /// Clears the table and inserts every (sampled, non-null) row. Returns true when a row ran out of
-    /// probe budget, which means the table was too small — never that the input was bad.
-    private func build(keys: MetalArray<UInt64>, slots: MetalArrowBuffer, slotCount: Int, flags: Int,
-                       sampleMask: Int, maxProbe: Int, slotOf: MetalArrowBuffer?,
-                       firstOfSlot: MetalArrowBuffer?) throws -> Bool {
-        let ctx = context
-        let errorFlag = try MetalArrowBuffer.allocate(byteCount: 4, context: ctx)
-        let fillPSO = try Self.pso(ctx, "sht_fill")
-        let buildPSO = try Self.pso(ctx, "sht_build")
-        let v = validity ?? offsets
-        try ctx.run { enc in
-            enc.setComputePipelineState(fillPSO)
-            enc.setBuffer(slots.mtl, offset: slots.offset, index: 0)
-            Dispatch.setUInt(enc, 0, index: 1)
-            Dispatch.setLength(enc, slotCount, nil, index: 2)
-            Dispatch.dispatch1D(enc, fillPSO, count: slotCount)
-            if let firstOfSlot {
-                enc.setBuffer(firstOfSlot.mtl, offset: firstOfSlot.offset, index: 0)
-                Dispatch.setUInt(enc, Int(UInt32.max), index: 1)
-                Dispatch.setLength(enc, slotCount, nil, index: 2)
-                Dispatch.dispatch1D(enc, fillPSO, count: slotCount)
+        // The estimate, the growth retry and the rank scan are shared with the primitive table; only the
+        // insert kernel differs, because only this one compares bytes.
+        let g = try HashTable.groups(ctx: ctx, rows: n, nonNull: nonNull, initialSlots: initialSlots) {
+            slots, slotCount, sampleMask, maxProbe, slotOf, firstOfSlot in
+            try HashTable.runBuild(ctx: ctx, function: "sht_build", source: StringHashTableSource.source,
+                                   cacheKey: "strhash/sht_build", slots: slots, slotCount: slotCount,
+                                   rows: n, slotOf: slotOf, firstOfSlot: firstOfSlot) { enc, errorFlag in
+                enc.setBuffer(self.offsets.mtl, offset: self.offsets.offset, index: 0)
+                enc.setBuffer(self.data.mtl, offset: self.data.offset, index: 1)
+                enc.setBuffer(keys.values.mtl, offset: keys.values.offset, index: 2)
+                enc.setBuffer(v.mtl, offset: v.offset, index: 3)
+                Dispatch.setUInt(enc, flagsBase | (slotOf != nil ? 4 : 0), index: 4)
+                Dispatch.setLength(enc, n, nil, index: 5)
+                Dispatch.setUInt(enc, slotCount - 1, index: 6)
+                Dispatch.setUInt(enc, sampleMask, index: 7)
+                Dispatch.setUInt(enc, maxProbe, index: 8)
+                enc.setBuffer(slots.mtl, offset: slots.offset, index: 9)
+                enc.setBuffer((slotOf ?? errorFlag).mtl, offset: (slotOf ?? errorFlag).offset, index: 10)
+                enc.setBuffer((firstOfSlot ?? errorFlag).mtl, offset: (firstOfSlot ?? errorFlag).offset, index: 11)
+                enc.setBuffer(errorFlag.mtl, offset: errorFlag.offset, index: 12)
             }
-            enc.memoryBarrier(scope: .buffers)
-            enc.setComputePipelineState(buildPSO)
-            enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-            enc.setBuffer(data.mtl, offset: data.offset, index: 1)
-            enc.setBuffer(keys.values.mtl, offset: keys.values.offset, index: 2)
-            enc.setBuffer(v.mtl, offset: v.offset, index: 3)
-            Dispatch.setUInt(enc, flags, index: 4)
-            Dispatch.setLength(enc, length, nil, index: 5)
-            Dispatch.setUInt(enc, slotCount - 1, index: 6)
-            Dispatch.setUInt(enc, sampleMask, index: 7)
-            Dispatch.setUInt(enc, maxProbe, index: 8)
-            enc.setBuffer(slots.mtl, offset: slots.offset, index: 9)
-            enc.setBuffer((slotOf ?? errorFlag).mtl, offset: (slotOf ?? errorFlag).offset, index: 10)
-            enc.setBuffer((firstOfSlot ?? errorFlag).mtl, offset: (firstOfSlot ?? errorFlag).offset, index: 11)
-            enc.setBuffer(errorFlag.mtl, offset: errorFlag.offset, index: 12)
-            Dispatch.dispatch1D(enc, buildPSO, count: length)
         }
         ctx.retainUntilFlush(keys); ctx.retainUntilFlush(self)
-        try ctx.syncPoint()
-        return withExtendedLifetime(errorFlag) { errorFlag.typed(UInt32.self)[0] != 0 }
-    }
 
-    /// Marks the occupied slots and scans the marks: `cum[s] - 1` is the rank of slot `s` among the
-    /// occupied ones, and the last entry is how many groups there are.
-    private func occupancy(slots: MetalArrowBuffer, count: Int) throws -> (cum: MetalArray<Int32>, total: Int) {
-        let ctx = context
-        let marks = try MetalArrowBuffer.allocate(byteCount: count * 4, zeroed: false, context: ctx)
-        let p = try Self.pso(ctx, "sht_mark")
-        try ctx.run { enc in
-            enc.setComputePipelineState(p)
-            enc.setBuffer(slots.mtl, offset: slots.offset, index: 0)
-            Dispatch.setLength(enc, count, nil, index: 1)
-            enc.setBuffer(marks.mtl, offset: marks.offset, index: 2)
-            Dispatch.dispatch1D(enc, p, count: count)
-        }
-        ctx.retainUntilFlush(slots)
-        let cum = try MetalArray<Int32>(length: count, nullCount: 0, validity: nil, values: marks, context: ctx)
-            .cumulativeSum()
-        try ctx.syncPoint()
-        let total = withExtendedLifetime(cum) { Int(cum.valuePointer[count - 1]) }
-        return (cum, total)
-    }
-
-    /// One representative row per occupied slot, in slot order.
-    private func compact(slots: MetalArrowBuffer, firstOfSlot: MetalArrowBuffer, cum: MetalArray<Int32>,
-                         slotCount: Int, groupCount: Int) throws -> MetalArray<Int32> {
-        let ctx = context
-        let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(groupCount, 1) * 4, zeroed: false, context: ctx)
-        if groupCount > 0 {
-            let p = try Self.pso(ctx, "sht_compact")
-            try ctx.run { enc in
-                enc.setComputePipelineState(p)
-                enc.setBuffer(slots.mtl, offset: slots.offset, index: 0)
-                enc.setBuffer(firstOfSlot.mtl, offset: firstOfSlot.offset, index: 1)
-                enc.setBuffer(cum.values.mtl, offset: cum.values.offset, index: 2)
-                Dispatch.setLength(enc, slotCount, nil, index: 3)
-                enc.setBuffer(out.mtl, offset: out.offset, index: 4)
-                Dispatch.dispatch1D(enc, p, count: slotCount)
-            }
-            ctx.retainUntilFlush(slots); ctx.retainUntilFlush(firstOfSlot); ctx.retainUntilFlush(cum)
-            try ctx.syncPoint()
-        }
-        return MetalArray<Int32>(length: groupCount, nullCount: 0, validity: nil, values: out, context: ctx)
+        // Slot order into first-seen order: sort the groups by their lowest row, and invert.
+        let perm = try g.firstSlotOrder.argsort()
+        let relabel = try perm.argsort()
+        let firstRows = try g.firstSlotOrder.take(perm)
+        let ids = try HashTable.writeIds(ctx: ctx, rows: n, validity: validity, fallbackBuffer: offsets,
+                                         groups: g, relabel: relabel, nullId: nullId ?? g.groupCount)
+        return StringHashTableIds(ids: ids, rows: n, groupCount: g.groupCount, firstRows: firstRows)
     }
 }

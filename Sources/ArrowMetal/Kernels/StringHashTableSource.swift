@@ -15,13 +15,10 @@ import Foundation
 /// costs one extra probe and can never merge two different strings. That is what lets this path drop
 /// the retry loop `StringDictionary` needs.
 ///
-/// | kernel | what it does |
-/// |---|---|
-/// | `sht_fill` | fills a uint buffer with a constant (clearing the table on the GPU, not with a host memset) |
-/// | `sht_hash64` | one 64-bit hash per row, both halves from a single pass over the bytes |
-/// | `sht_build` | inserts every non-null row, records the slot it landed in, and tracks the lowest row per slot |
-/// | `sht_mark` | 1 per occupied slot, the input to the rank scan |
-/// | `sht_ids` | each row's dense group id: `relabel[rank[slot] ]`, with null rows given a caller-chosen id |
+/// Only the two kernels that know about strings live here: `sht_hash64` (one 64-bit hash per row, from
+/// a single pass over the bytes) and `sht_build` (the insert, which decides equality by comparing bytes).
+/// Clearing the table, ranking the occupied slots, compacting the representatives and writing the ids
+/// are type-independent and live in `HashTableSource`.
 enum StringHashTableSource {
     static let source: String = KernelSource.prelude + """
 
@@ -134,38 +131,6 @@ enum StringHashTableSource {
         if (i < atomic_load_explicit(&firstOfSlot[s], memory_order_relaxed)) {
             atomic_fetch_min_explicit(&firstOfSlot[s], i, memory_order_relaxed);
         }
-    }
-
-    kernel void sht_fill(device uint* buf [[buffer(0)]], constant uint& value [[buffer(1)]],
-                         device const uint* nPtr [[buffer(2)]], uint i [[thread_position_in_grid]]) {
-        if (i < *nPtr) buf[i] = value;
-    }
-
-    kernel void sht_mark(device const uint* slots [[buffer(0)]], device const uint* nPtr [[buffer(1)]],
-                         device int* out [[buffer(2)]], uint s [[thread_position_in_grid]]) {
-        if (s < *nPtr) out[s] = slots[s] != 0u ? 1 : 0;
-    }
-
-    // One representative row per occupied slot, written at that slot's rank: the compaction the rank
-    // scan makes possible without a separate filter pass.
-    kernel void sht_compact(device const uint* slots [[buffer(0)]], device const uint* firstOfSlot [[buffer(1)]],
-                            device const int* cum [[buffer(2)]], device const uint* nPtr [[buffer(3)]],
-                            device int* out [[buffer(4)]], uint s [[thread_position_in_grid]]) {
-        if (s >= *nPtr || slots[s] == 0u) return;
-        out[cum[s] - 1] = (int)firstOfSlot[s];
-    }
-
-    // Dense group id per row. `cum` is the INCLUSIVE scan of the occupancy marks, so `cum[s] - 1` is
-    // the rank of slot `s` among occupied slots; `relabel` turns that slot-order rank into the
-    // first-seen order the sort path produces, so both paths hand back the very same ids.
-    kernel void sht_ids(device const uint* slotOf [[buffer(0)]], device const uchar* validity [[buffer(1)]],
-                        constant uint& flags [[buffer(2)]], constant uint& nullId [[buffer(3)]],
-                        device const int* cum [[buffer(4)]], device const int* relabel [[buffer(5)]],
-                        device const uint* nPtr [[buffer(6)]], device int* out [[buffer(7)]],
-                        uint i [[thread_position_in_grid]]) {
-        if (i >= *nPtr) return;
-        if ((flags & SHT_HAS_VALIDITY) != 0u && !bit_get(validity, i)) { out[i] = (int)nullId; return; }
-        out[i] = relabel[cum[slotOf[i]] - 1];
     }
     """
 }

@@ -51,6 +51,11 @@ enum HashTable {
         let firstSlotOrder: MetalArray<Int32>
     }
 
+    /// Set `ARROWMETAL_NO_HASH=1` to force every caller back onto the sort path. Nothing in the library
+    /// needs it — both paths give the same answer — but it is how the before/after benchmark numbers in
+    /// `docs/DESIGN.md` were measured, in one binary.
+    static let disabled = ProcessInfo.processInfo.environment["ARROWMETAL_NO_HASH"] != nil
+
     static func pso(_ ctx: MetalContext, _ fn: String) throws -> MTLComputePipelineState {
         try ctx.pipeline(source: HashTableSource.shared, function: fn, cacheKey: "hashtable/\(fn)")
     }
@@ -236,7 +241,7 @@ extension MetalArray {
     /// cardinality: below `1 << 16` rows the sort is a handful of small passes and the table's extra
     /// round trips do not pay for themselves, and above it the table has won at every cardinality
     /// measured — including the worst case of every row distinct, where it matches the sort.
-    static func prefersHashTable(rows: Int) -> Bool { rows >= 1 << 16 }
+    static func prefersHashTable(rows: Int) -> Bool { rows >= 1 << 16 && !HashTable.disabled }
 
     /// The 64-bit grouping key of every element. Integers widen; floats are normalised so that bit
     /// equality means Arrow value equality (one NaN, `-0.0 == 0.0`).
@@ -262,12 +267,13 @@ extension MetalArray {
     /// How this element type becomes a 64-bit key: the MSL type its buffer is read as, and the
     /// expression that maps a value `v` to the key.
     static var keyMapping: (mslType: String, expr: String) {
-        if T.self == Float.self {
+        if T.isFloatingPoint {
             // Read the bits, not the float: Apple GPUs flush subnormals in float arithmetic, and Arrow
             // equality wants every NaN to be one value and -0 to equal +0.
-            return ("uint", "(ulong)(((v & 0x7FFFFFFFu) > 0x7F800000u) ? 0x7FC00000u : (((v & 0x7FFFFFFFu) == 0u) ? 0u : v))")
-        }
-        if T.self == Double.self {
+            if T.byteWidth == 4 {
+                return ("uint", "(ulong)(((v & 0x7FFFFFFFu) > 0x7F800000u) ? 0x7FC00000u : (((v & 0x7FFFFFFFu) == 0u) ? 0u : v))")
+            }
+            precondition(T.byteWidth == 8, "no 64-bit key mapping for a \(T.byteWidth)-byte float")
             return ("ulong", "((v & 0x7FFFFFFFFFFFFFFFUL) > 0x7FF0000000000000UL) ? 0x7FF8000000000000UL : (((v & 0x7FFFFFFFFFFFFFFFUL) == 0UL) ? 0UL : v)")
         }
         // Sign-extend signed integers and zero-extend unsigned ones: both are injective into 64 bits.
@@ -331,5 +337,16 @@ extension MetalArray {
         let ids = try HashTable.writeIds(ctx: context, rows: length, validity: validity, fallbackBuffer: values,
                                          groups: distinct.groups, relabel: distinct.relabel, nullId: 0)
         return MetalArray<Int32>(length: length, nullCount: nullCount, validity: validity, values: ids, context: context)
+    }
+
+    /// Rows per distinct value, in the order of `distinct.values`: the dense-key group-by counting rows,
+    /// with null rows sent to a group of their own that is then dropped.
+    func hashCounts(_ distinct: HashDistinct<T>) throws -> MetalArray<Int64> {
+        let k = distinct.count
+        let ids = try HashTable.writeIds(ctx: context, rows: length, validity: validity, fallbackBuffer: values,
+                                         groups: distinct.groups, relabel: distinct.relabel, nullId: k)
+        let dense = MetalArray<Int32>(length: length, nullCount: 0, validity: nil, values: ids, context: context)
+        let counts = try GroupBy(keys: dense, keyCount: k + (nullCount > 0 ? 1 : 0)).count()
+        return counts.length == k ? counts : try counts.slice(offset: 0, length: k)
     }
 }
