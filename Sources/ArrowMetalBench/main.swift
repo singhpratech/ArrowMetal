@@ -606,6 +606,135 @@ time("CPU \(cores)-core hash dictionary + group-by sum", bytes: dictBytes, secti
     sink(total.count)
 }
 
+// ---------------------------------------------------------------------------------------------------
+// Group-by over ARBITRARY keys (Kernels/GroupByKeys.swift): utf8 keys and two-column keys at full size,
+// against the same all-core CPU hash group-by. The key-mapping stage is timed both on its own and as
+// part of the whole query, because a real query pays for it once and then aggregates several columns.
+// ---------------------------------------------------------------------------------------------------
+
+/// A utf8 column of `n` fixed-width 12-byte keys drawn from `distinct` values, built straight into the
+/// Arrow buffers (a 50-million-element Swift [String] would cost more than the benchmark).
+func makeStringKeys(_ n: Int, distinct: Int, _ gen: inout SystemRandomNumberGenerator) throws -> (MetalStringArray, [Int32]) {
+    let width = 12
+    let offsets = try MetalArrowBuffer.allocate(byteCount: (n + 1) * 4, zeroed: false)
+    let data = try MetalArrowBuffer.allocate(byteCount: n * width, zeroed: false)
+    let op = offsets.mutableTyped(Int32.self)
+    let dp = data.mutableTyped(UInt8.self)
+    var codes = [Int32](repeating: 0, count: n)
+    let digits = Array("0123456789abcdefghijklmnopqrstuvwxyz".utf8)
+    for i in 0..<n {
+        let c = Int32.random(in: 0..<Int32(distinct), using: &gen)
+        codes[i] = c
+        op[i] = Int32(i * width)
+        var v = Int(c)
+        let base = i * width
+        dp[base] = UInt8(ascii: "k")
+        for j in stride(from: width - 1, through: 1, by: -1) { dp[base + j] = digits[v % 36]; v /= 36 }
+    }
+    op[n] = Int32(n * width)
+    return (MetalStringArray(length: n, nullCount: 0, validity: nil, offsets: offsets, data: data), codes)
+}
+
+/// All-core CPU group-by sum over fixed-width 12-byte keys: FNV-1a into per-core dictionaries, merged.
+func cpuStringGroupBySum(_ col: MetalStringArray, _ amounts: MetalArray<Int64>) -> Int {
+    let off = col.offsets.typed(Int32.self), dat = col.data.typed(UInt8.self)
+    let vp = amounts.valuePointer
+    let n = col.length
+    let parts = parallelChunks(n) { lo, hi -> [UInt64: Int64] in
+        var acc = [UInt64: Int64](minimumCapacity: 1 << 16)
+        for i in lo..<hi {
+            var h: UInt64 = 0xcbf2_9ce4_8422_2325
+            for q in Int(off[i])..<Int(off[i + 1]) { h = (h ^ UInt64(dat[q])) &* 0x100_0000_01b3 }
+            acc[h, default: 0] &+= vp[i]
+        }
+        return acc
+    }
+    var total = [UInt64: Int64](minimumCapacity: 1 << 16)
+    for part in parts { for (k, v) in part { total[k, default: 0] &+= v } }
+    return total.count
+}
+
+/// All-core CPU group-by sum over two int32 key columns.
+func cpuTwoColumnGroupBySum(_ a: MetalArray<Int32>, _ b: MetalArray<Int32>, _ amounts: MetalArray<Int64>) -> Int {
+    let ap = a.valuePointer, bp = b.valuePointer, vp = amounts.valuePointer
+    let parts = parallelChunks(a.length) { lo, hi -> [Int64: Int64] in
+        var acc = [Int64: Int64](minimumCapacity: 1 << 16)
+        for i in lo..<hi { acc[(Int64(ap[i]) << 32) | Int64(UInt32(bitPattern: bp[i])), default: 0] &+= vp[i] }
+        return acc
+    }
+    var total = [Int64: Int64](minimumCapacity: 1 << 16)
+    for part in parts { for (k, v) in part { total[k, default: 0] &+= v } }
+    return total.count
+}
+
+let gbRows = rows
+let gbAmounts = try colI64.slice(offset: 0, length: gbRows)
+
+for gbDistinct in [1_000, 100_000, 10_000_000] where gbDistinct <= gbRows {
+    let (keyCol, _) = try makeStringKeys(gbRows, distinct: gbDistinct, &g)
+    let keyBytes = keyCol.totalBytes + (gbRows + 1) * 4 + gbRows * 8
+    sec = "group-by sum over \(gbRows) utf8 keys (\(gbDistinct) distinct)"; print("\n" + sec)
+    try time("Metal  group_by(utf8) + sum (key mapping included)", bytes: keyBytes, section: sec) {
+        let gbk = try GroupByKeys(columns: [.string(keyCol)])
+        sink(try gbk.groupBy.sum(gbAmounts))
+    }
+    let cachedKeys = try GroupByKeys(columns: [.string(keyCol)])
+    try time("Metal  sum on a cached key mapping (GPU only)", bytes: keyBytes, section: sec) {
+        sink(try cachedKeys.groupBy.sum(gbAmounts))
+    }
+    try time("Metal  key mapping only (utf8 -> dense ids)", bytes: keyBytes, section: sec) {
+        sink(try GroupByKeys(columns: [.string(keyCol)]).groupCount)
+    }
+    time("CPU \(cores)-core hash group-by sum", bytes: keyBytes, section: sec) {
+        sink(cpuStringGroupBySum(opaque(keyCol), opaque(gbAmounts)))
+    }
+    print("  groups: \(cachedKeys.groupCount)")
+}
+
+for gbDistinct in [1_000, 100_000, 10_000_000] where gbDistinct <= gbRows {
+    // Two int32 key columns whose combination has `gbDistinct` distinct values.
+    let side = Int32(max(2, Int(Double(gbDistinct).squareRoot().rounded(.up))))
+    var ka = [Int32](repeating: 0, count: gbRows), kb = ka
+    for i in 0..<gbRows { ka[i] = Int32.random(in: 0..<side, using: &g); kb[i] = Int32.random(in: 0..<side, using: &g) }
+    let colA = try MetalArray<Int32>(ka), colB = try MetalArray<Int32>(kb)
+    ka = []; kb = []
+    let twoBytes = gbRows * 16
+    sec = "group-by sum over \(gbRows) rows by two int32 columns (~\(Int(side) * Int(side)) distinct)"
+    print("\n" + sec)
+    try time("Metal  group_by([a, b]) + sum (key mapping included)", bytes: twoBytes, section: sec) {
+        let gbk = try GroupByKeys(columns: [.int32(colA), .int32(colB)])
+        sink(try gbk.groupBy.sum(gbAmounts))
+    }
+    let cachedTwo = try GroupByKeys(columns: [.int32(colA), .int32(colB)])
+    try time("Metal  sum on a cached key mapping (GPU only)", bytes: twoBytes, section: sec) {
+        sink(try cachedTwo.groupBy.sum(gbAmounts))
+    }
+    time("CPU \(cores)-core hash group-by sum", bytes: twoBytes, section: sec) {
+        sink(cpuTwoColumnGroupBySum(opaque(colA), opaque(colB), opaque(gbAmounts)))
+    }
+    print("  groups: \(cachedTwo.groupCount)")
+
+    // The measured alternative for the multi-column fold: hashing the two dense id columns into one
+    // 64-bit key instead of the injective radix combine. Both then re-encode the composite, so the
+    // difference is only how the composite is formed — except that the hash needs a verification pass
+    // this does NOT time, so what it reports is a lower bound on the hash strategy.
+    if gbDistinct == 100_000 {
+        sec = "multi-column key fold, \(gbRows) rows (~\(Int(side) * Int(side)) distinct)"; print("\n" + sec)
+        let idsA = try GroupByKeys.denseIds(.int32(colA), colA.context)
+        let idsB = try GroupByKeys.denseIds(.int32(colB), colB.context)
+        try time("radix combine a * Kb + b, then re-encode (shipping)", bytes: twoBytes, section: sec) {
+            let composite = try GroupByKeys.combine(idsA.0, idsB.0, cardinality: idsB.1, colA.context)
+            sink(try composite.dictionaryEncode().unique.length)
+        }
+        let a64 = try idsA.0.cast(to: Int64.self), b64 = try idsB.0.cast(to: Int64.self)
+        try time("64-bit hash combine, then re-encode (no verify pass)", bytes: twoBytes, section: sec) {
+            let ha = try a64.arithmetic(.mul, Int64(bitPattern: 0x9E37_79B9_7F4A_7C15))
+            let hb = try b64.arithmetic(.mul, Int64(bitPattern: 0xC2B2_AE3D_27D4_EB4F))
+            sink(try (try ha.bitwise(.xor, hb)).dictionaryEncode().unique.length)
+        }
+    }
+}
+
 // Markdown table for the README.
 print("\n\n| Operation | Implementation | Time (ms) | Throughput (GB/s) | CPU time (ms) |\n|---|---|---:|---:|---:|")
 for (s, l, ms, gb, cpu) in results { print("| \(s) | \(l) | \(String(format: "%.2f", ms)) | \(String(format: "%.1f", gb)) | \(String(format: "%.1f", cpu)) |") }

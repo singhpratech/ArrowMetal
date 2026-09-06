@@ -527,11 +527,10 @@ final class AggregateTests: XCTestCase {
                 }
             }
         }
-        // The grouped median is not implemented here, and says so.
-        let groups = try GroupBy(keys: try MetalArray<Int32>([0, 1]), keyCount: 2)
-        XCTAssertThrowsError(try groups.approximateMedian(try MetalArray<Int32>([1, 2]))) { error in
-            XCTAssertTrue("\(error)".contains("segmented"), "\(error)")
-        }
+        // The grouped median used to throw; the segmented sort in Kernels/AggregatesExtra.swift now
+        // answers it exactly (AggregatesExtraTests covers it against a per-key oracle at scale).
+        let groups = try GroupBy(keys: try MetalArray<Int32>([0, 0, 1]), keyCount: 2)
+        XCTAssertEqual(try groups.approximateMedian(try MetalArray<Int32>([1, 4, 9])).toArray(), [2.5, 9])
     }
 
     /// A nullable boolean array (`MetalBooleanArray` only builds non-null ones from Swift values).

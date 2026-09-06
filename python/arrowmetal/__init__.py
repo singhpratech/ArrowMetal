@@ -1972,3 +1972,204 @@ def _hash64_any(self):
 
 
 MetalArray.hash64 = _hash64_any
+
+
+# ---- group-by over arbitrary key columns, the rest of the grouped aggregates, and the scalar
+# skew / kurtosis / tdigest. Mirrors the op tables in include/arrowmetal.h.
+_lib.am_group_by_keys.argtypes = [ctypes.POINTER(_P), ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_group_by_keys.restype = ctypes.c_int
+_lib.am_group_by_group_count.argtypes = [_P]
+_lib.am_group_by_group_count.restype = ctypes.c_int64
+_lib.am_group_by_keys_result.argtypes = [_P, ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_group_by_keys_result.restype = ctypes.c_int
+_lib.am_group_by_ids.argtypes = [_P, ctypes.POINTER(_P)]
+_lib.am_group_by_ids.restype = ctypes.c_int
+_lib.am_group_by_release.argtypes = [_P]
+_lib.am_group_agg_ex.argtypes = [_P, _P, ctypes.c_int, ctypes.c_double, ctypes.POINTER(_P)]
+_lib.am_group_agg_ex.restype = ctypes.c_int
+_lib.am_group_pivot_wider.argtypes = [_P, _P, _P, ctypes.POINTER(ctypes.c_char_p), ctypes.c_int64,
+                                      ctypes.POINTER(_P)]
+_lib.am_group_pivot_wider.restype = ctypes.c_int
+_lib.am_reduce_ex2.argtypes = [_P, ctypes.c_int, ctypes.c_double, ctypes.POINTER(ctypes.c_double),
+                               ctypes.POINTER(ctypes.c_int)]
+_lib.am_reduce_ex2.restype = ctypes.c_int
+
+_GROUP_AGG = {"sum": 0, "count_all": 1, "count": 2, "mean": 3, "min": 4, "max": 5, "min_max": 6,
+              "first": 7, "last": 8, "first_last": 9, "one": 10, "list": 11, "distinct": 12,
+              "count_distinct": 13, "any": 14, "all": 15, "product": 16,
+              "variance": 17, "variance_sample": 18, "stddev": 19, "stddev_sample": 20,
+              "approximate_median": 21, "quantile": 22, "skew": 23, "kurtosis": 24, "tdigest": 25}
+_REDUCE_EX2 = {"skew": 0, "kurtosis": 1, "tdigest": 2, "skew_sample": 3, "kurtosis_sample": 4}
+
+
+class GroupByKeys:
+    """Arrow `hash_*` aggregation over arbitrary key columns.
+
+    Built by `am.group_by([...])`. The key columns are mapped to dense group ids on the GPU — any key
+    type works (integers sparse or negative, float32/float64 with -0.0 == 0.0 and one NaN group, bool,
+    temporal, utf8, binary, dictionary, decimal) and several columns fold together — and every
+    aggregate then runs against those ids.
+
+        gb = am.group_by([region, year])
+        keys = gb.keys()                       # one pyarrow array per key column, one row per group
+        totals = gb.sum(revenue).to_arrow()
+
+    A null key forms its own group, as in Arrow. The group ORDER is deterministic but is not pyarrow's
+    first-seen order: label the rows with `keys()` and sort both sides before comparing.
+    """
+
+    def __init__(self, columns):
+        cols = [c if isinstance(c, MetalArray) else MetalArray.from_arrow(c) for c in columns]
+        if not cols:
+            raise ArrowMetalError("group_by needs at least one key column")
+        self._columns = cols
+        handles = (_P * len(cols))(*[c._h for c in cols])
+        out = _P()
+        _check(_lib.am_group_by_keys(handles, len(cols), ctypes.byref(out)))
+        self._h = out
+        self.group_count = _lib.am_group_by_group_count(self._h)
+
+    def __del__(self):
+        try:
+            if getattr(self, "_h", None):
+                _lib.am_group_by_release(self._h)
+                self._h = None
+        except Exception:
+            pass
+
+    def __len__(self):
+        return self.group_count
+
+    def keys(self):
+        """The distinct key values, one row per group, in group order: one pyarrow array per key column."""
+        out = []
+        for i in range(len(self._columns)):
+            h = _P()
+            _check(_lib.am_group_by_keys_result(self._h, i, ctypes.byref(h)))
+            out.append(MetalArray(h).to_arrow())
+        return out
+
+    def ids(self):
+        """The dense group id of every row (int32, never null)."""
+        return _call(_lib.am_group_by_ids, self._h)
+
+    def _agg(self, name, values, p1=0.0):
+        if values is None:
+            handle = None
+        else:
+            handle = (values if isinstance(values, MetalArray) else MetalArray.from_arrow(values))._h
+        out = _P()
+        _check(_lib.am_group_agg_ex(self._h, handle, _GROUP_AGG[name], float(p1), ctypes.byref(out)))
+        return MetalArray(out)
+
+    def sum(self, values): return self._agg("sum", values)
+    def count(self, values): return self._agg("count", values)
+    def count_all(self): return self._agg("count_all", None)
+    def mean(self, values): return self._agg("mean", values)
+    def min(self, values): return self._agg("min", values)
+    def max(self, values): return self._agg("max", values)
+
+    def min_max(self, values):
+        """Arrow `hash_min_max`: one struct<min, max> column, both extremes from one read of the values."""
+        return self._agg("min_max", values)
+
+    def first(self, values): return self._agg("first", values)
+    def last(self, values): return self._agg("last", values)
+
+    def first_last(self, values):
+        """Arrow `hash_first_last`: one struct<first, last> column."""
+        return self._agg("first_last", values)
+
+    def one(self, values):
+        """Arrow `hash_one`: one value per group — here always the group's lowest row, null included."""
+        return self._agg("one", values)
+
+    def list(self, values):
+        """Arrow `hash_list`: every value of the group, in row order, as a list column."""
+        return self._agg("list", values)
+
+    def distinct(self, values):
+        """Arrow `hash_distinct`: the distinct non-null values of the group, ascending, as a list column."""
+        return self._agg("distinct", values)
+
+    def count_distinct(self, values): return self._agg("count_distinct", values)
+    def any(self, values): return self._agg("any", values)
+    def all(self, values): return self._agg("all", values)
+
+    def product(self, values):
+        """Arrow `hash_product`, on the GPU: a segmented multiply reduction. Integers wrap in 64 bits."""
+        return self._agg("product", values)
+
+    def variance(self, values, ddof=0):
+        return self._agg("variance" if ddof == 0 else "variance_sample", values)
+
+    def stddev(self, values, ddof=0):
+        return self._agg("stddev" if ddof == 0 else "stddev_sample", values)
+
+    def approximate_median(self, values):
+        """Arrow `hash_approximate_median`, computed exactly (a GPU sort by (group, value), not a sketch)."""
+        return self._agg("approximate_median", values)
+
+    def quantile(self, values, q):
+        """Exact per-group quantile with linear interpolation; q is clamped to [0, 1]."""
+        return self._agg("quantile", values, q)
+
+    def skew(self, values):
+        """Arrow `hash_skew`, biased (population) as Arrow's default is."""
+        return self._agg("skew", values)
+
+    def kurtosis(self, values):
+        """Arrow `hash_kurtosis`: excess kurtosis, biased."""
+        return self._agg("kurtosis", values)
+
+    def tdigest(self, values, q=0.5):
+        """Arrow `hash_tdigest`: a t-digest estimate of q per group (GPU sort, host centroid merge)."""
+        return self._agg("tdigest", values, q)
+
+    def pivot_wider(self, pivot_keys, values, names):
+        """Arrow `hash_pivot_wider` over a utf8 pivot-key column: a struct with one field per name."""
+        p = pivot_keys if isinstance(pivot_keys, MetalArray) else MetalArray.from_arrow(pivot_keys)
+        v = values if isinstance(values, MetalArray) else MetalArray.from_arrow(values)
+        encoded = [n.encode() for n in names]
+        arr = (ctypes.c_char_p * len(encoded))(*encoded)
+        out = _P()
+        _check(_lib.am_group_pivot_wider(self._h, p._h, v._h, arr, len(encoded), ctypes.byref(out)))
+        return MetalArray(out)
+
+
+def group_by(keys):
+    """Group by one or more key columns of any supported type: `am.group_by([region, year])`.
+
+    A single array is accepted for a single key column. Returns a `GroupByKeys`."""
+    if not isinstance(keys, (list, tuple)):
+        keys = [keys]
+    return GroupByKeys(keys)
+
+
+def _reduce_ex2(self, op, p1=0.0):
+    f, null = ctypes.c_double(), ctypes.c_int()
+    _check(_lib.am_reduce_ex2(self._h, _REDUCE_EX2[op], float(p1), ctypes.byref(f), ctypes.byref(null)))
+    return None if null.value else f.value
+
+
+def _skew(self, biased=True):
+    """Arrow `skew`: the third standardised central moment, biased (population) by default."""
+    return _reduce_ex2(self, "skew" if biased else "skew_sample")
+
+
+def _kurtosis(self, biased=True):
+    """Arrow `kurtosis`: excess kurtosis, biased by default."""
+    return _reduce_ex2(self, "kurtosis" if biased else "kurtosis_sample")
+
+
+def _tdigest(self, q=0.5):
+    """Arrow `tdigest`: the t-digest estimate of quantile q (GPU sort, one host centroid merge, delta 100).
+
+    A sketch, so it agrees with pyarrow.compute.tdigest to within the sketch's own error rather than
+    exactly; q = 0 and q = 1 are the exact minimum and maximum. `quantile()` is the exact answer."""
+    return _reduce_ex2(self, "tdigest", q)
+
+
+MetalArray.skew = _skew
+MetalArray.kurtosis = _kurtosis
+MetalArray.tdigest = _tdigest

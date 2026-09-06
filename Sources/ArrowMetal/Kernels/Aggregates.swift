@@ -402,27 +402,12 @@ extension GroupBy {
 
     /// Arrow `hash_product` per key, wrapping in Int64 exactly as the scalar `product` does.
     ///
-    /// This one runs on the **host**: Metal has no 64-bit atomic multiply and no threadgroup-private
-    /// multiply table that would beat a single pass over unified memory. Keys outside `[0, keyCount)`
-    /// and null keys are skipped, as everywhere else in `GroupBy`.
+    /// This runs on the **GPU** (`Kernels/AggregatesExtra.swift`): Metal has no 64-bit atomic multiply,
+    /// so the multiplication is segmented instead of atomic — the keys are argsorted once and one
+    /// threadgroup multiplies one key's run. Keys outside `[0, keyCount)` and null keys are skipped, as
+    /// everywhere else in `GroupBy`; a key with no valid value is null.
     public func product<T: ArrowPrimitive>(_ values: MetalArray<T>) throws -> MetalArray<Int64> where T: FixedWidthInteger {
-        guard values.length == keys.length else { throw ArrowMetalError.lengthMismatch(keys.length, values.length) }
-        let out = try MetalArray<Int64>.allocate(length: keyCount, withValidity: true, context: values.context)
-        withExtendedLifetime((keys, values, out)) {
-            let k = keys.valuePointer, v = values.valuePointer
-            let d = out.mutableValuePointer, valid = out.validity!.mutableTyped(UInt8.self)
-            for i in 0..<keyCount { d[i] = 1 }
-            for i in 0..<keys.length {
-                if !keys.isValid(i) || !values.isValid(i) { continue }
-                let key = Int(k[i].asInt64)
-                guard key >= 0, key < keyCount else { continue }
-                d[key] &*= v[i].asInt64
-                Bitmap.set(valid, key)
-            }
-            for i in 0..<keyCount where !Bitmap.isSet(valid, i) { d[i] = 0 }
-        }
-        out.recomputeNullCount()
-        return out
+        try productInt(values)
     }
 
     /// Arrow `hash_variance` per key (`ddof` 0 for the population variance, 1 for the sample one).
@@ -526,16 +511,13 @@ extension GroupBy {
         return counts
     }
 
-    /// Arrow `hash_approximate_median` is **not implemented**.
+    /// Arrow `hash_approximate_median` per key, computed **exactly** — `quantile(values, 0.5)`.
     ///
-    /// It needs a segmented selection over the rows of each key — a sort by (key, value) followed by a
-    /// per-segment index — and this tree has no segmented-sort file to build it on. The scalar
-    /// `MetalArray.approximateMedian()` covers a single column; for a grouped median today, filter per
-    /// key and call it, or sort by the key column and slice.
+    /// The segmented sort it needs now exists (`Kernels/AggregatesExtra.swift`): two stable GPU radix
+    /// argsorts put the rows in (key, value) order, and a per-key kernel reads the two values that
+    /// bracket the median position. A key with no valid value is null.
     public func approximateMedian<T: ArrowPrimitive>(_ values: MetalArray<T>) throws -> MetalArray<Double> {
-        throw ArrowMetalError.unsupportedType(
-            "grouped approximate_median needs a segmented sort, which this build does not have; "
-            + "filter per key and call approximateMedian(), or sort by the key column and slice (\(values.length) rows)")
+        try quantile(values, 0.5)
     }
 }
 

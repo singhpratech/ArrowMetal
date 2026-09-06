@@ -813,6 +813,90 @@ int  am_indices_nonzero(am_array* a, am_array** out);
 // slice of it.
 int  am_hash64(am_array* a, am_array** out);
 
+// ---------------------------------------------------------------------------------------------------
+// Group-by over arbitrary key columns, the rest of the grouped aggregates, and the three scalar
+// aggregates am_reduce_ex does not cover. See Kernels/GroupByKeys.swift and Kernels/AggregatesExtra.swift.
+// ---------------------------------------------------------------------------------------------------
+
+// An opaque key mapping: dense group ids for a set of key columns, plus the key values per group.
+typedef struct am_groupby am_groupby;
+
+// Maps `count` key columns (>= 1, all the same length) to dense group ids on the GPU and returns a
+// handle. Any key type works: int8..int64, uint8..uint64, float32/float64 (-0.0 == 0.0, all NaNs one
+// group), bool, temporal, date, utf8, binary, dictionary and decimal128/decimal256. Several columns are
+// folded pairwise into one injective 64-bit key and re-encoded, so up to four (and more) columns are
+// fine. A null key is not skipped: it forms its own group, as Arrow's hash aggregation does.
+//
+// Group ORDER is deterministic but is NOT pyarrow's first-seen order — it is ascending by key for
+// numeric, boolean, temporal and decimal columns (nulls last), first-seen for utf8 and binary, and
+// lexicographic in column order for several columns. Label the rows with am_group_by_keys_result.
+int  am_group_by_keys(am_array** columns, int64_t count, am_groupby** out);
+// Number of groups, or -1 for a NULL handle.
+int64_t am_group_by_group_count(am_groupby* gb);
+// The i-th key column, one row per group, in group order and with the input column's Arrow type.
+int  am_group_by_keys_result(am_groupby* gb, int64_t i, am_array** out);
+// The dense group id of every row (int32, never null) — the key column am_group_by wants.
+int  am_group_by_ids(am_groupby* gb, am_array** out);
+void am_group_by_release(am_groupby* gb);
+
+// One grouped aggregate, one row per group.
+//
+//  op  Arrow function            values          result type          notes
+//  --  ------------------------  --------------  -------------------  ----------------------------------
+//   0  hash_sum                  numeric         int64/uint64/double  integers wrap in 64 bits
+//   1  hash_count_all            (may be NULL)   int64                rows per group, nulls included
+//   2  hash_count                any             int64                non-null values per group
+//   3  hash_mean                 numeric         double
+//   4  hash_min                  numeric         values' type         fused kernel, NaN skipped
+//   5  hash_max                  numeric         values' type
+//   6  hash_min_max              numeric         struct<min, max>     one read of the values
+//   7  hash_first                numeric         values' type         first non-null in row order
+//   8  hash_last                 numeric         values' type
+//   9  hash_first_last           numeric         struct<first, last>
+//  10  hash_one                  numeric         values' type         the lowest row of the group
+//  11  hash_list                 numeric         list<values' type>   every value, in row order
+//  12  hash_distinct             numeric         list<values' type>   distinct non-null values, ascending
+//  13  hash_count_distinct       numeric         int64
+//  14  hash_any                  boolean         boolean
+//  15  hash_all                  boolean         boolean
+//  16  hash_product              numeric         int64 / double       GPU segmented multiply, wraps
+//  17  hash_variance (pop)       numeric         double               ddof = 0; float32 deviations
+//  18  hash_variance (sample)    numeric         double               ddof = 1
+//  19  hash_stddev (pop)         numeric         double
+//  20  hash_stddev (sample)      numeric         double
+//  21  hash_approximate_median   numeric         double               exact: a GPU sort, not a sketch
+//  22  hash_quantile             numeric         double               p1 = q in [0, 1], linear interpolation
+//  23  hash_skew                 numeric         double               biased (population), Arrow's default
+//  24  hash_kurtosis             numeric         double               excess kurtosis, biased
+//  25  hash_tdigest              numeric         double               p1 = q; GPU sort + CPU centroid merge
+//
+// A group with no value to answer with is null. Temporal columns aggregate their storage integers.
+// Ops 17-20 form their deviations in float32 (about 1e-6 relative), so a float64 value column is
+// narrowed here rather than rejected. Ops 23 and 24 do the same and land near 1e-5.
+int  am_group_agg_ex(am_groupby* gb, am_array* values /* NULL only for op 1 */, int op, double p1, am_array** out);
+
+// Arrow `hash_pivot_wider` over a utf8 pivot-key column: the result is a struct with one field per name,
+// field `n` holding the value of the row in that group whose pivot key equals `n` (the lowest such row
+// when there are several; Arrow raises instead).
+int  am_group_pivot_wider(am_groupby* gb, am_array* pivot_keys, am_array* values,
+                          const char** names, int64_t name_count, am_array** out);
+
+// The scalar aggregates am_reduce_ex does not cover. Writes one double; *is_null is set when the column
+// has no answer (no valid value, or a zero second moment, which leaves skew and kurtosis undefined).
+//
+//  op  function                  p1              notes
+//  --  ------------------------  --------------  ---------------------------------------------------
+//   0  skew                      -               biased (population), Arrow's default
+//   1  kurtosis                  -               excess kurtosis, biased
+//   2  tdigest                   q in [0, 1]     GPU sort + a single host centroid merge, delta = 100
+//   3  skew (sample-corrected)   -               the unbiased G1
+//   4  kurtosis (sample)         -               the unbiased G2
+//
+// tdigest is a sketch: it agrees with pyarrow.compute.tdigest to within the sketch's own error, not to
+// the last bit. Because the values arrive fully sorted from the GPU there is nothing to buffer, so
+// Arrow's buffer_size option has no counterpart here; delta is fixed at 100 through this entry point.
+int  am_reduce_ex2(am_array* a, int op, double p1, double* out_f64, int* is_null);
+
 #ifdef __cplusplus
 }
 #endif
