@@ -68,6 +68,8 @@ _lib.am_str_unary.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]; _lib.am_str
 _lib.am_str_match.argtypes = [_P, ctypes.c_int, ctypes.c_char_p, ctypes.c_int64, ctypes.POINTER(_P)]; _lib.am_str_match.restype = ctypes.c_int
 _lib.am_str_equals_array.argtypes = [_P, _P, ctypes.POINTER(_P)]; _lib.am_str_equals_array.restype = ctypes.c_int
 _lib.am_str_dictionary_encode.argtypes = [_P, ctypes.POINTER(_P), ctypes.POINTER(_P)]; _lib.am_str_dictionary_encode.restype = ctypes.c_int
+_lib.am_dictionary_encode.argtypes = [_P, ctypes.POINTER(_P), ctypes.POINTER(_P)]; _lib.am_dictionary_encode.restype = ctypes.c_int
+_lib.am_join.argtypes = [_P, _P, ctypes.c_int, ctypes.POINTER(_P), ctypes.POINTER(_P)]; _lib.am_join.restype = ctypes.c_int
 _lib.am_temporal_extract.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]; _lib.am_temporal_extract.restype = ctypes.c_int
 _lib.am_temporal_cast_unit.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]; _lib.am_temporal_cast_unit.restype = ctypes.c_int
 _lib.am_dictionary_decode.argtypes = [_P, ctypes.POINTER(_P)]; _lib.am_dictionary_decode.restype = ctypes.c_int
@@ -266,9 +268,27 @@ class MetalArray:
             return i.value & 0xFFFFFFFFFFFFFFFF
         return f.value
 
-    def sum(self): return self._reduce(0)
-    def min(self): return self._reduce(1)
-    def max(self): return self._reduce(2)
+    def _decimal_reduce(self, op):
+        """sum / min / max of a decimal column, as a decimal.Decimal (None when every row is null).
+
+        A 128-bit result does not fit an int64 out-parameter, so am_decimal_op 18-20 return a length-1
+        decimal column; this reads that one value back through the C Data Interface."""
+        one = self._decimal_op(op).to_arrow()
+        return one[0].as_py() if one[0].is_valid else None
+
+    def sum(self):
+        """Sum of the non-null values. Integers accumulate (and wrap) in 64 bits, floats in double,
+        decimals in 128 bits through am_decimal_op."""
+        return self._decimal_reduce(18) if self.format.startswith("d:") else self._reduce(0)
+
+    def min(self):
+        """Smallest non-null value; decimals go through am_decimal_op."""
+        return self._decimal_reduce(19) if self.format.startswith("d:") else self._reduce(1)
+
+    def max(self):
+        """Largest non-null value; decimals go through am_decimal_op."""
+        return self._decimal_reduce(20) if self.format.startswith("d:") else self._reduce(2)
+
     def mean(self): return self._reduce(3)
 
     # ---- element-wise
@@ -313,15 +333,25 @@ class MetalArray:
         if not isinstance(indices, MetalArray):
             indices = MetalArray.from_arrow(pa.array(indices, type=pa.int32()))
         return _call(_lib.am_take, self._h, indices._h)
-    def slice(self, offset, length): return _call(_lib.am_slice, self._h, offset, length)
+    def slice(self, offset, length):
+        """Arrow `slice`: a zero-copy view of `length` rows starting at `offset`.
+
+        O(1) at every offset. An offset that is a multiple of 32 becomes a pair of buffer views; any
+        other offset rides on Arrow's `offset` field, so exporting the slice back to pyarrow still moves
+        no bytes."""
+        return _call(_lib.am_slice, self._h, offset, length)
 
     # ---- sorting (GPU radix sort; stable, nulls last)
     def argsort(self, descending=False):
-        """Int32 indices that sort the array (Arrow `array_sort_indices`)."""
+        """Int32 indices that sort the array (Arrow `array_sort_indices`).
+
+        Numeric, boolean and temporal columns take the radix argsort. utf8 and binary columns take the
+        prefix radix sort and come out in byte-wise lexicographic order — the order Arrow defines for
+        them, index for index with `pyarrow.compute.array_sort_indices`, not Unicode collation."""
         return _call(_lib.am_argsort, self._h, 1 if descending else 0)
 
     def sort(self, descending=False):
-        """Sorted copy of the array."""
+        """Sorted copy of the array, with the same ordering rules as `argsort`."""
         return _call(_lib.am_sort, self._h, 1 if descending else 0)
 
     def top_k(self, k, largest=True):
@@ -343,9 +373,14 @@ class MetalArray:
     def ends_with(self, p): return self._match(2, p)
     def str_contains(self, p): return self._match(3, p)
     def dictionary_encode(self):
-        """Returns (codes: int32 MetalArray, unique: string MetalArray). Use codes.group_by(len(unique))."""
+        """Arrow `dictionary_encode`: returns (codes: int32 MetalArray, values: MetalArray).
+
+        `codes[i]` indexes `values`, so `values.take(codes)` reproduces the column, and a null row gives a
+        null code. Works on every column type: utf8 and binary go through the host hash map, primitive,
+        temporal and boolean columns through the GPU `unique()` pipeline. Use
+        `codes.group_by(len(values))` to aggregate by the encoded column."""
         c = _P(); u = _P()
-        _check(_lib.am_str_dictionary_encode(self._h, ctypes.byref(c), ctypes.byref(u)))
+        _check(_lib.am_dictionary_encode(self._h, ctypes.byref(c), ctypes.byref(u)))
         return MetalArray(c), MetalArray(u)
 
     # ---- temporal (date, time, timestamp), extracted in UTC
@@ -1077,6 +1112,35 @@ def lexsort_indices(columns, descending=None, null_placement="at_end"):
 
 def _bad_placement(value):
     raise ArrowMetalError(f"unknown null_placement {value!r}; expected 'at_end' or 'at_start'")
+_JOIN_KIND = {"inner": 0, "left": 1}
+
+
+def join(left_keys, right_keys, how="inner"):
+    """GPU hash join in index form: the (left row, right row) pairs whose keys are equal.
+
+    Returns two int32 index arrays of the same length. Apply them with `take` to build the joined
+    columns:
+
+        li, ri = am.join(orders["customer_id"], customers["id"])
+        orders_name, customer_city = orders["name"].take(li), customers["city"].take(ri)
+
+    `how` is "inner" (only matching left rows) or "left" (every left row once per match, and once with a
+    null right index when it has none). Duplicate keys on either side produce every combination; null keys
+    never match; the pair order is unspecified. Keys must be int32 or int64 on both sides — a temporal
+    column joins on its storage integer, a dictionary column on its codes.
+
+    This is what `MetalRecordBatch.join(other, on:rightKey:kind:)` does on the Swift side: these indices,
+    then a `take` of every column of both sides, with the duplicated right key column dropped.
+    """
+    l = left_keys if isinstance(left_keys, MetalArray) else MetalArray.from_arrow(left_keys)
+    r = right_keys if isinstance(right_keys, MetalArray) else MetalArray.from_arrow(right_keys)
+    if how not in _JOIN_KIND:
+        raise ArrowMetalError('join how must be "inner" or "left"')
+    li, ri = _P(), _P()
+    _check(_lib.am_join(l._h, r._h, _JOIN_KIND[how], ctypes.byref(li), ctypes.byref(ri)))
+    return MetalArray(li), MetalArray(ri)
+
+
 # ---- statistical and positional aggregates, run-end encoding (see include/arrowmetal.h)
 _lib.am_reduce_ex.argtypes = [_P, ctypes.c_int, ctypes.c_double, ctypes.POINTER(ctypes.c_int64),
                               ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_int),
@@ -3699,6 +3763,13 @@ def _dictionary_encode_ex(self, order="first_appearance"):
     """Arrow `dictionary_encode`: `(codes, dictionary)` with the dictionary in first-appearance order
     (Arrow's own, the default) or ascending. The dictionary never holds a null in either order and a
     null row gets a null code, as in Arrow."""
+    if self.format == "b":
+        # Booleans have no order-option kernel; the general entry point (unique pipeline) covers them and
+        # first appearance == ascending for two values, so `order` is honoured either way.
+        c = _P()
+        v = _P()
+        _check(_lib.am_dictionary_encode(self._h, ctypes.byref(c), ctypes.byref(v)))
+        return MetalArray(c), MetalArray(v)
     c = _P()
     v = _P()
     _check(_lib.am_dictionary_encode_ex(self._h, _index_of(VALUE_ORDERS, order, "order"),
@@ -3892,7 +3963,7 @@ def _load_polars_plugin():
     return _pp
 
 
-def __getattr__(name):
+def _polars_getattr(name):
     """PEP 562 lazy attributes: the Polars bridge and expression plugin load on first touch."""
     if name in _POLARS_BRIDGE_EXPORTS:
         _load_polars_bridge()
@@ -3900,11 +3971,28 @@ def __getattr__(name):
     if name in _POLARS_PLUGIN_EXPORTS:
         _load_polars_plugin()
         return globals()[name]
+    raise AttributeError(name)
+
+
+_LAZY_HOOKS = [(_polars_getattr, lambda: set(_POLARS_BRIDGE_EXPORTS) | set(_POLARS_PLUGIN_EXPORTS))]
+
+
+def __getattr__(name):
+    """One PEP 562 hook for every optional integration (Polars, DuckDB, pandas, ...): each bridge
+    registers (getattr, names) in `_LAZY_HOOKS` and the chain tries them in order."""
+    for hook, _names in _LAZY_HOOKS:
+        try:
+            return hook(name)
+        except AttributeError:
+            continue
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__():
-    return sorted(set(globals()) | set(_POLARS_BRIDGE_EXPORTS) | set(_POLARS_PLUGIN_EXPORTS))
+    names = set(globals())
+    for _hook, lazy_names in _LAZY_HOOKS:
+        names |= set(lazy_names())
+    return sorted(names)
 
 
 if "polars" in sys.modules:      # Polars was imported first: arm `.arrowmetal` right away
@@ -3928,7 +4016,7 @@ _DUCKDB_EXPORTS = ("from_duckdb", "to_duckdb", "duckdb_gpu_query", "duckdb_batch
                    "duckdb_is_zero_copy")
 
 
-def __getattr__(name):
+def _duckdb_getattr(name):
     """PEP 562 lazy attributes: the duckdb bridge loads on first use, not on import."""
     if name in _DUCKDB_EXPORTS or name == "duckdb_bridge":
         # importlib, not `from . import duckdb_bridge`: the latter comes back through this hook
@@ -3941,8 +4029,7 @@ def __getattr__(name):
         attr = getattr(duckdb_bridge, "is_zero_copy" if name == "duckdb_is_zero_copy" else name)
         globals()[name] = attr
         return attr
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    raise AttributeError(name)
 
 
-def __dir__():
-    return sorted(list(globals()) + list(_DUCKDB_EXPORTS))
+_LAZY_HOOKS.append((_duckdb_getattr, lambda: list(_DUCKDB_EXPORTS) + ["duckdb_bridge"]))

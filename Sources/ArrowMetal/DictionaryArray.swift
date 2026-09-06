@@ -130,7 +130,9 @@ func exportDictionaryArray(codes: MetalArray<Int32>, values: AnyMetalArray, into
     values.exportArrowArray(into: holder.dict)
     out.pointee.length = holder.indices.pointee.length
     out.pointee.null_count = holder.indices.pointee.null_count
-    out.pointee.offset = 0
+    // A sliced dictionary array exports its parent's index buffers with the slice as an Arrow offset,
+    // exactly as a primitive slice does; the offset belongs to the indices, never to the dictionary.
+    out.pointee.offset = holder.indices.pointee.offset
     out.pointee.n_buffers = holder.indices.pointee.n_buffers
     out.pointee.n_children = 0
     out.pointee.buffers = holder.indices.pointee.buffers      // owned by the indices export, kept alive by holder

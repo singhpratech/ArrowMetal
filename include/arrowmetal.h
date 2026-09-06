@@ -1349,6 +1349,27 @@ int64_t     am_plan_row_count(am_plan_result* r);
 const char* am_plan_column_name(am_plan_result* r, int64_t i);
 int         am_plan_column(am_plan_result* r, int64_t i, am_array** out);
 void        am_plan_result_release(am_plan_result* r);
+// GPU hash join (equi-join) in index form. join_type: 0 inner, 1 left outer.
+//
+// Both outputs are int32 index arrays of the same length: out_left_idx[i] is a row of left_keys and
+// out_right_idx[i] the row of right_keys that matches it. Duplicate keys on either side yield every
+// combination (many to many); null keys never match; with a left join an unmatched left row appears once
+// with a null right index. The pair order is unspecified. Apply the pairs with am_take on the columns you
+// want -- that composition is exactly what MetalRecordBatch.join does on the Swift side (take every column
+// of both sides with these indices, then drop the duplicated right key column).
+//
+// Keys must be int32 or int64 on both sides (a temporal column joins on its storage integer and a
+// dictionary column on its codes); a mixed int32/int64 pair is widened to int64. The right side is the
+// build side: a device-memory open-addressing table of 2^ceil(log2(2 * right rows)) slots with duplicate
+// keys chained per bucket, probed twice (count, GPU exclusive scan, write) so the output needs no atomics.
+int  am_join(am_array* left_keys, am_array* right_keys, int join_type,
+             am_array** out_left_idx, am_array** out_right_idx);
+
+// Arrow dictionary_encode for every column type: dense int32 codes plus the distinct values they index.
+// utf8 and binary go through the host hash map, primitive / temporal / boolean columns through the GPU
+// unique() pipeline, and an already-dictionary column comes back as its own codes and values. A null row
+// gives a null code. am_str_dictionary_encode is the utf8-only spelling of the same call.
+int  am_dictionary_encode(am_array* a, am_array** out_codes, am_array** out_values);
 
 #ifdef __cplusplus
 }

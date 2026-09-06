@@ -663,6 +663,12 @@ def family_sort(d, n, sd):
             "polars": lambda: sd.s.p.arg_sort(),
             "pyarrow": lambda: pc.array_sort_indices(sd.s.a),
             "pandas": lambda: sd.s.d.argsort()})
+    if sd is not None:
+        case(f, "sort utf8", sd.n, sd.s.nbytes * 2, {
+            "arrowmetal": lambda: sd.s.g.sort(),
+            "polars": lambda: sd.s.p.sort(),
+            "pyarrow": lambda: pc.take(sd.s.a, pc.array_sort_indices(sd.s.a)),
+            "pandas": lambda: sd.s.d.sort_values()})
     case(f, "sort float64", n, n * 16, {
         "arrowmetal": lambda: ff.g.sort(),
         "polars": lambda: ff.p.sort(),
@@ -866,17 +872,30 @@ def family_join(d, n):
     right_pd = pd.DataFrame({"k": right_keys, "w": right_vals})
 
     def am_join():
-        pos = g_lk.index_in(g_rk)          # int32 position in the build side, null when absent
-        keep = pos.is_valid()
-        return g_lv.filter(keep), g_rv.take(pos.drop_null())
+        li, ri = am.join(g_lk, g_rk)       # GPU hash join, index pairs
+        return g_lv.take(li), g_rv.take(ri)
 
     case(f, f"inner hash join ({n} x {build_n} on int64)", n, n * 16 + build_n * 16, {
         "arrowmetal": am_join,
         "polars": lambda: left_pl.join(right_pl, on="k", how="inner"),
         "pyarrow": lambda: left_tb.join(right_tb, keys="k", join_type="inner"),
         "pandas": lambda: left_pd.merge(right_pd, on="k", how="inner")},
-        notes={"arrowmetal": "no join kernel: composed from index_in + is_valid + filter + take "
-                             "(requires unique build-side keys)"})
+        notes={"arrowmetal": "am.join index pairs, then one take per output column"})
+    case(f, f"hash join indices ({n} x {build_n} on int64)", n, n * 8 + build_n * 8, {
+        "arrowmetal": lambda: am.join(g_lk, g_rk),
+        "polars": lambda: left_pl.join(right_pl, on="k", how="inner"),
+        "pyarrow": lambda: left_tb.join(right_tb, keys="k", join_type="inner"),
+        "pandas": lambda: left_pd.merge(right_pd, on="k", how="inner")},
+        notes={"arrowmetal": "the join kernel alone (am_join): the matching index pairs, no payload gather",
+               "polars": "no index-only join; the full join is the closest equivalent",
+               "pyarrow": "no index-only join; the full join is the closest equivalent",
+               "pandas": "no index-only join; the full join is the closest equivalent"})
+    case(f, f"left outer hash join ({n} x {build_n} on int64)", n, n * 8 + build_n * 8, {
+        "arrowmetal": lambda: am.join(g_lk, g_rk, how="left"),
+        "polars": lambda: left_pl.join(right_pl, on="k", how="left"),
+        "pyarrow": lambda: left_tb.join(right_tb, keys="k", join_type="left outer"),
+        "pandas": lambda: left_pd.merge(right_pd, on="k", how="left")},
+        notes={"arrowmetal": "am_join join_type 1: index pairs with a null right index for an unmatched left row"})
     del g_rk, g_rv, g_lk, g_lv, left_pl, right_pl, left_tb, right_tb, left_pd, right_pd
     gc.collect()
 
@@ -1570,15 +1589,20 @@ CAUSE_HINTS = [
     (lambda fam, op: "match_like" in op,
      "`match_like` should take the GPU prefix path here (Regex.likePredicate); if this row is short of "
      "3x the GPU predicate itself is the cost, not a fallback."),
-    (lambda fam, op: "argsort utf8" in op,
-     "`am_argsort` goes through `withPrimitive`, and `Sort.swift`'s type switch has no utf8 case, so "
-     "there is no string sort at all - on the GPU or through the C ABI."),
+    (lambda fam, op: fam == "sort" and "utf8" in op and op.startswith(("argsort", "sort")),
+     "`Kernels/StringSort.swift` sorts these on the GPU: an LSD radix over 7-byte prefix chunks, one "
+     "stable radix pass per chunk, so the pass count is `ceil(longest row / 7)`. Each pass is a full "
+     "64-bit radix argsort plus a gather of the next chunk's keys, which is several times the column "
+     "in traffic; Polars sorts strings with one multi-threaded comparison sort over pointers. Wider "
+     "chunks, or refining only the tie runs after the first pass, is the lever."),
     (lambda fam, op: "dictionary_encode (int32)" in op,
-     "The C ABI only has `am_str_dictionary_encode`, which takes utf8. Swift already has the primitive "
-     "path (`DictionaryCompute.dictionaryEncoded()`); it is simply not exported."),
+     "`am_dictionary_encode` routes an integer column to `DictionaryCompute.dictionaryEncoded()`, "
+     "which is the GPU `unique()` pipeline: a full radix argsort of the column, run marks, a scan and "
+     "a gather. pandas builds its categories from one hash-table pass. A hash-based dense-encoding "
+     "kernel (the one `am_group_by_keys` already has for narrow ranges) is the fix."),
     (lambda fam, op: fam == "decimal" and "sum" in op,
-     "`am_reduce` goes through the primitive path, which rejects `d:p,s`. There is no decimal "
-     "reduction kernel behind the C ABI."),
+     "`sum` on a decimal column routes to `am_decimal_op` op 18 (128-bit threadgroup partials, host "
+     "combine). If this row is short of 3x the reduction itself is the cost."),
     (lambda fam, op: any(t in op for t in SORT_BASED),
      "Sort-based path: ArrowMetal answers this with a full GPU radix sort plus a run scan, where the "
      "CPU libraries use a hash table (count_distinct, mode, unique, value_counts) or a partial "
@@ -1599,13 +1623,14 @@ CAUSE_HINTS = [
      "Below the ~150 us dispatch floor: encode + commit + wait dominates the kernel. Batching removes "
      "most of it, but a single small call cannot beat an in-cache CPU loop."),
     (lambda fam, op: fam == "reductions" and ("first" in op or "last" in op or "any" in op or "all" in op),
-     "A scalar answer the CPU can short-circuit or read in O(1); the GPU still pays a full dispatch "
-     "plus a pass over the column."),
+     "Answered by a short-circuiting host scan of the bitmap in shared memory (no dispatch at all), so "
+     "what is left is the ~1 us of ctypes marshalling around a call that itself takes a microsecond or "
+     "two. The baselines answer the same question in their own process with no FFI hop."),
     (lambda fam, op: op.startswith("slice ("),
-     "`MetalArray.slice` (Sources/ArrowMetal/Slice.swift) is zero-copy only when the offset is a "
-     "multiple of 32; any other offset falls into a **single-threaded host loop** copying element by "
-     "element, plus a `recomputeNullCount()` scan. Polars, pyarrow and pandas all return a view. "
-     "Carrying an Arrow `offset` on the array, as the C Data interface allows, makes this free."),
+     "`MetalArray.slice` (Sources/ArrowMetal/Slice.swift) is now a zero-copy view at every offset and "
+     "O(1) in the length, like the baselines: what this row measures is the ctypes hop into the C ABI "
+     "and the Python wrapper object around the returned handle, roughly a microsecond, against an "
+     "in-process metadata tweak on the other side. Both are constant time; neither is moving data."),
     (lambda fam, op: "dictionary_encode" in op,
      "`MetalStringArray.dictionaryEncode()` now takes the GPU hash path "
      "(`dictionaryEncodeGPU`, up to three hash rounds); what is left is the uniques buffer being "
@@ -1640,10 +1665,10 @@ CAUSE_HINTS = [
      "The chain's group-by rebuilds the dense key mapping after the filter, which is most of the "
      "measured time; the filter and the aggregate themselves are each well inside the bar."),
     (lambda fam, op: fam == "join",
-     "A GPU hash join exists in Swift (`MetalRecordBatch.join`, Sources/ArrowMetal/Kernels/Join.swift) "
-     "but is **not exported through the C ABI**, so the Python row is composed from index_in + "
-     "is_valid + filter + take: four dispatches and four full passes against one fused CPU hash join. "
-     "Exporting the existing kernel is the fix."),
+     "The GPU hash join (`Sources/ArrowMetal/Kernels/Join.swift`) is reached through `am_join` / "
+     "`am.join`: build the table over the right keys, probe the left twice (count, GPU scan, write). "
+     "If this row is short of 3x the build side no longer fits in cache and the probe's random reads "
+     "into device memory are the cost."),
     (lambda fam, op: fam == "nested",
      "Nested kernels are one thread per row over an offsets buffer; the CPU equivalents are often "
      "metadata-only (a zero-copy child view) and so cannot be beaten by any amount of bandwidth."),

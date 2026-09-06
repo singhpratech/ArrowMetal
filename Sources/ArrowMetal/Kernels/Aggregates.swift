@@ -266,7 +266,7 @@ extension MetalArray {
     /// first row gives nil). Nil for an empty array or one with no valid value.
     public func first(skipNulls: Bool = true) throws -> T? {
         guard length > 0 else { return nil }
-        guard skipNulls, validity != nil else { return self[0] }
+        guard skipNulls, rawValidity != nil else { return self[0] }
         guard let bounds = try validBounds() else { return nil }
         return withExtendedLifetime(self) { valuePointer[bounds.first] }
     }
@@ -275,17 +275,36 @@ extension MetalArray {
     public func last(skipNulls: Bool = true) throws -> T? {
         let n = length
         guard n > 0 else { return nil }
-        guard skipNulls, validity != nil else { return self[n - 1] }
+        guard skipNulls, rawValidity != nil else { return self[n - 1] }
         guard let bounds = try validBounds() else { return nil }
         return withExtendedLifetime(self) { valuePointer[bounds.last] }
     }
 
-    /// First and last row with a validity bit set, found by a GPU atomic min / max over the bitmap.
+    /// First and last row with a validity bit set.
+    ///
+    /// Read on the host from Metal shared memory, 64 bitmap bits at a time inwards from each end, so the
+    /// cost is the distance to the first (last) valid row — O(1) for the usual mostly-valid column, and no
+    /// GPU dispatch at all. Only a column whose first `Aggregates.hostScanLimit` bits are all null (and
+    /// which is large enough for a full GPU pass to be worth its ~150 us dispatch floor) falls through to
+    /// the atomic min / max kernel below.
     func validBounds() throws -> (first: Int, last: Int)? {
-        guard let v = validity else { return length > 0 ? (0, length - 1) : nil }
+        guard let v = rawValidity else { return length > 0 ? (0, length - 1) : nil }
         let ctx = context
         let n = length
-        guard n > 0, validCount > 0 else { return nil }
+        guard n > 0 else { return nil }
+        let off = offset
+        let limit = n > Aggregates.gpuScanFloor ? Aggregates.hostScanLimit : Int.max
+        let host: (first: Int, last: Int)?? = withExtendedLifetime(v) { () -> (first: Int, last: Int)?? in
+            let p = v.typed(UInt8.self)
+            guard let f = Bitmap.firstSet(p, from: off, bits: Swift.min(n, limit)) else {
+                if limit < n { return nil }        // inconclusive: escalate to the GPU
+                return .some(nil)                  // scanned the whole column: no valid row
+            }
+            guard let l = Bitmap.lastSet(p, from: off, bits: n) else { return .some(nil) }
+            return .some((f, l))
+        }
+        if let answer = host { return answer }
+        guard validCount > 0 else { return nil }
         try Dispatch.checkLength(n)
         let out = try MetalArrowBuffer.allocate(byteCount: 8, zeroed: false, context: ctx)
         withExtendedLifetime(out) {
@@ -295,9 +314,10 @@ extension MetalArray {
         }
         let pso = try Dispatch.pipeline(ctx, family: "aggregate", source: AggregatesSource.common,
                                         function: "agg_valid_bounds", type: "common")
+        guard let vn = validity else { return (0, n - 1) }   // normalised: the kernel sees no offset
         try ctx.run { enc in
             enc.setComputePipelineState(pso)
-            enc.setBuffer(v.mtl, offset: v.offset, index: 0)
+            enc.setBuffer(vn.mtl, offset: vn.offset, index: 0)
             Dispatch.setLength(enc, n, nil, index: 1)
             enc.setBuffer(out.mtl, offset: out.offset, index: 2)
             enc.setBuffer(out.mtl, offset: out.offset + 4, index: 3)
@@ -369,13 +389,37 @@ extension MetalBooleanArray {
         }
     }
 
-    /// Arrow `any` with `skip_nulls`, on the GPU: true when at least one valid value is true.
-    /// (`any` without parentheses is the host popcount in `Slice.swift`; this is the kernel form.)
-    public func anyTrue() throws -> Bool { try trueAndValidCounts().trueCount > 0 }
+    /// Arrow `any` with `skip_nulls`: true when at least one valid value is true.
+    ///
+    /// A word-wise host scan of `values & validity` in Metal shared memory that stops at the first true
+    /// bit, so the answer is usually two loads and no GPU work at all — this is what the CPU libraries do,
+    /// and a full GPU pass cannot beat a short circuit. A large column whose first
+    /// `Aggregates.hostScanLimit` bits give no answer escalates to the counting kernel.
+    public func anyTrue() throws -> Bool {
+        let n = length
+        guard n > 0 else { return false }
+        let limit = n > Aggregates.gpuScanFloor ? Aggregates.hostScanLimit : Int.max
+        let host = withExtendedLifetime(self) { () -> Bool? in
+            Bitmap.anySet(rawValues.typed(UInt8.self), rawValidity?.typed(UInt8.self),
+                          from: offset, bits: n, limit: limit)
+        }
+        if let host { return host }
+        return try trueAndValidCounts().trueCount > 0
+    }
 
-    /// Arrow `all` with `skip_nulls`, on the GPU: true when every valid value is true, and true for an
-    /// empty or all-null array, matching Arrow's default `min_count = 0`.
+    /// Arrow `all` with `skip_nulls`: true when every valid value is true, and true for an empty or
+    /// all-null array, matching Arrow's default `min_count = 0`.
+    ///
+    /// The mirror of `anyTrue`: a host scan that stops at the first word holding a valid false.
     public func allTrue() throws -> Bool {
+        let n = length
+        guard n > 0 else { return true }
+        let limit = n > Aggregates.gpuScanFloor ? Aggregates.hostScanLimit : Int.max
+        let host = withExtendedLifetime(self) { () -> Bool? in
+            Bitmap.allSet(rawValues.typed(UInt8.self), rawValidity?.typed(UInt8.self),
+                          from: offset, bits: n, limit: limit)
+        }
+        if let host { return host }
         let (t, v) = try trueAndValidCounts()
         return t == v
     }
@@ -551,6 +595,13 @@ struct AggMeanParams {
 }
 
 enum Aggregates {
+    /// How many bits a short-circuiting host scan (`first`, `last`, `any`, `all`) reads before it gives up
+    /// and lets a full GPU pass answer instead. 1 Mibit is 128 KB, well inside L2, and takes roughly 10 us
+    /// to scan — about a fifteenth of the GPU's dispatch floor, so escalating is never the wrong call.
+    static let hostScanLimit = 1 << 20
+    /// Below this length a full host scan is cheaper than any dispatch, so the scan never escalates.
+    static let gpuScanFloor = 8 << 20
+
     /// Enough threadgroups to saturate the GPU while keeping the host combine trivial.
     static func groupCount(_ n: Int) -> Int {
         Swift.max(1, Swift.min(2048, (n + Dispatch.threadgroupSize - 1) / Dispatch.threadgroupSize))
