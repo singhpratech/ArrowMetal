@@ -167,7 +167,7 @@ suite notices if either engine changes its mind.
 | A null in `is_in`'s value set | ignored; a null element never matches, so the result has no nulls — Arrow's `skip_nulls=True` | the same with `skip_nulls=True`; its default matches null to null | `test_is_in_never_matches_a_null_where_arrow_matches_null_to_null` |
 | Empty pattern in `replace` | the identity | `pc.replace_substring` does not terminate on an empty pattern — the harness must never call it with one | `test_empty_replace_pattern_is_the_identity` |
 | Empty pattern in `count_substring` | code points + 1 | bytes + 1 | `test_empty_pattern_counts_code_points_where_arrow_counts_bytes` |
-| `float64` `sqrt`/`exp`/`ln`/`log10`/`log2` | evaluated in `float` and widened: ~7 significant digits, nothing below the smallest float32 normal or above `FLT_MAX` | evaluated in double | `test_float64_transcendentals_are_evaluated_in_float32` |
+| `float64` `sqrt`/`exp`/`ln`/`log10`/`log2`/`power` | software IEEE-754 binary64 on the GPU: `sqrt` correctly rounded, the others within 1 ulp of libm over the whole double range (was: evaluated in `float`, fixed 2026-09-06) | evaluated in double | `test_float64_transcendentals_are_true_binary64` |
 | `list_element` on a row shorter than the index | null | raises `ArrowInvalid` for the whole column | `test_list_element_of_a_short_row_is_null_where_pyarrow_raises` |
 | `parse` of a string that is not a number | null | `cast` raises, even with `safe=False` | `test_parse_returns_null_where_pyarrow_raises` |
 | adding a duration to a time of day past midnight | wraps inside the day | raises: the result is outside `[0, 86400)` | `test_time_of_day_addition_wraps_where_pyarrow_raises` |

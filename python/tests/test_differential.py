@@ -1287,11 +1287,16 @@ def _rounding(src, shape):
 _register_optional("rounding", NUMERIC, ["floor", "ceil", "round", "trunc"], _rounding)
 
 
+def _eps_of(src):
+    return _EPS["float64"] if pa.types.is_float64(src.type) else _EPS["float32"]
+
+
 def _float32_representable(src):
-    """The values ArrowMetal's transcendental kernels can carry: they evaluate in `float`, so a
-    float64 operand outside the float32 normal range underflows to zero or overflows to inf on the
-    way in. Documented in include/arrowmetal.h and pinned by
-    test_float64_transcendentals_are_evaluated_in_float32."""
+    """For a float32 column, the values its `float` kernels can carry. A float64 column is evaluated
+    in software binary64 (Kernels/DoubleTranscendental.swift) over the whole double range, so it is
+    returned untouched; test_float64_transcendentals_are_true_binary64 pins that."""
+    if pa.types.is_float64(src.type):
+        return src
     filled = pc.fill_null(src, pa.scalar(0.0, src.type))
     magnitude = pc.abs(filled)
     tiny = pa.scalar(float(np.finfo(np.float32).tiny), src.type)
@@ -1316,10 +1321,11 @@ def _sqrt(src, shape):
     relative 1e-6 -- over the values a float32 can hold
     (test_float64_transcendentals_are_evaluated_in_float32 pins what happens outside)."""
     _, got, expected = _evaluated_in_float(src, ["sqrt"], [pc.sqrt])
-    return got, expected
+    # float32: ~7 digits; float64: correctly rounded, so a couple of ulp covers the oracle's own libm.
+    return got, expected, ((1e-6, 0.0) if pa.types.is_float32(src.type) else (4.0 * _EPS["float64"], 0.0))
 
 
-_register_optional("sqrt", FLOATING, ["sqrt"], _sqrt, tol=1e-6)
+_register_optional("sqrt", FLOATING, ["sqrt"], _sqrt)
 
 
 def _exp(src, shape):
@@ -1331,11 +1337,12 @@ def _exp(src, shape):
     x = -58, which no 1e-6 bound could accept. The bound below is that mechanism, with a margin."""
     base = _float32_representable(src)
     magnitude = pc.abs(pc.fill_null(base, pa.scalar(0.0, base.type)))
-    small = base.filter(pc.less_equal(magnitude, pa.scalar(87.0, base.type)))
+    limit = 87.0 if pa.types.is_float32(base.type) else 700.0
+    small = base.filter(pc.less_equal(magnitude, pa.scalar(limit, base.type)))
     _, got, expected = _evaluated_in_float(small, ["exp"], [pc.exp])
     peak = pc.max(pc.abs(pc.fill_null(small, pa.scalar(0.0, small.type)))).as_py()
     peak = 0.0 if peak is None or not math.isfinite(peak) else abs(peak)
-    return got, expected, (4.0 * _EPS["float32"] * (1.0 + peak), 0.0)
+    return got, expected, (4.0 * _eps_of(src) * (1.0 + peak), 0.0)
 
 
 _register_optional("exp", FLOATING, ["exp"], _exp)
@@ -4072,16 +4079,22 @@ def test_arrow_cumulative_max_default_start_clamps_negative_floats():
     assert pylist(am.array(a).cumulative_max()) == [-1.0, -1.0]
 
 
-def test_float64_transcendentals_are_evaluated_in_float32():
-    """`sqrt`/`exp`/`ln`/`log10`/`log2` convert to `float`, evaluate there and widen back, so a
-    float64 operand outside the float32 range loses everything below the smallest normal and above
-    FLT_MAX -- documented in include/arrowmetal.h, and why the matrix trims the input."""
-    a = pa.array([1e-300, 1e300], pa.float64())
-    assert pylist(am.array(a).sqrt()) == [0.0, math.inf]
-    assert pc.sqrt(a).to_pylist() == [1e-150, 1e150]
-    # Inside the float32 range the two agree to about seven significant digits.
-    b = pa.array([2.0], pa.float64())
-    assert pylist(am.array(b).sqrt())[0] == pytest.approx(pc.sqrt(b)[0].as_py(), rel=1e-6)
+def test_float64_transcendentals_are_true_binary64():
+    """`sqrt`/`exp`/`ln`/`log10`/`log2`/`power` on a float64 column run in software IEEE-754 binary64
+    on the GPU (Kernels/DoubleTranscendental.swift): the whole double range, sqrt correctly rounded,
+    the rest within 1 ulp of libm. Until 2026-09-06 they evaluated in `float` and lost everything
+    outside the float32 range; this pins the fix."""
+    a = pa.array([1e-300, 1e300, 2.0], pa.float64())
+    assert pylist(am.array(a).sqrt()) == pc.sqrt(a).to_pylist() == [1e-150, 1e150, math.sqrt(2.0)]
+    b = pa.array([-700.0, 700.0, 1e-10, 1e300], pa.float64())
+    for name in ("exp", "ln", "log10", "log2"):
+        got = pylist(getattr(am.array(b), name)())
+        want = getattr(pc, name)(b).to_pylist()
+        for g, w in zip(got, want):
+            if math.isfinite(w) and w != 0.0:
+                assert abs(g - w) <= 2 * abs(w) * _EPS["float64"], (name, g, w)
+            else:
+                assert g == w or (math.isnan(g) and math.isnan(w)), (name, g, w)
 
 
 def test_floor_and_ceil_keep_the_integer_type_where_pyarrow_widens_to_double():
