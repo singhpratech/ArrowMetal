@@ -14,6 +14,7 @@ every claim the project makes.
 | [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md) | The complete operation-by-operation comparison against Polars, pyarrow.compute and pandas at 10M and 50M rows, with a verdict per row and a shortfall list of everything below the 3x bar |
 | [DESIGN.md](DESIGN.md) | How it works: buffers, kernels, batching, GPU-side lengths, software Float64, where the time goes |
 | [EXPR.md](EXPR.md) | Fused expression queries: one runtime-generated kernel for a whole expression DAG, the grammar, how nulls are compiled, the numbers and the limits |
+| [ENGINE.md](ENGINE.md) | The lazy query engine: the logical plan, the optimizer rules with `explain()` examples, fusion planning, the full join matrix (multi-key, utf8, outer, semi/anti, as-of), window functions, the plan grammar, the numbers and the limits |
 | [DECISIONS.md](DECISIONS.md) | Why it is built this way, one dated entry per decision |
 | [FINDINGS.md](FINDINGS.md) | Things learned the hard way: toolchain quirks, Metal limits, bugs and their lessons |
 | [../ROADMAP.md](../ROADMAP.md) | What is next and what is open for contributors |
@@ -34,6 +35,7 @@ swift run -c release arrowmetal-bench            # Metal vs all CPU cores vs Acc
 python Benchmarks/python_bench.py                # Polars / pyarrow / pandas on the same data shapes
 PYTHONPATH=python python Benchmarks/python_gpu_bench.py   # ArrowMetal from Python vs Polars, in-process
 PYTHONPATH=python python Benchmarks/expr_bench.py         # fused expression queries vs one kernel per operator
+PYTHONPATH=python python Benchmarks/engine_bench.py       # the lazy query engine vs Polars lazy and DuckDB
 swift run -c release arrowmetal-examples         # six end-to-end scenarios
 ```
 

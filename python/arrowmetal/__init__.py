@@ -3792,3 +3792,50 @@ def _sort_ex(self, descending=False, null_placement="at_end"):
 
 
 MetalArray.sort = _sort_ex
+
+
+# ---------------------------------------------------------------------------------------------------
+# The lazy query engine (python/arrowmetal/lazy.py).
+#
+# `am.scan(...)` starts a Polars-shaped lazy query. Nothing runs until `.collect()`: the plan goes to
+# the Swift engine as one JSON document, is type-checked and optimized (predicate pushdown, projection
+# pruning, filter fusion, constant folding, CSE, join reordering), lowered to physical operators with
+# maximal fused Metal kernels, and executed inside one command buffer. See docs/ENGINE.md.
+#
+#     q = (am.scan(table)
+#            .filter(am.col("amount") > 100)
+#            .group_by("region").agg(am.agg.sum("amount", "total"))
+#            .sort("total", descending=True)
+#            .limit(10))
+#     q.explain()          # the optimized plan, the way Polars prints one
+#     q.collect()          # -> pyarrow.Table
+# ---------------------------------------------------------------------------------------------------
+
+from . import lazy as _lazy_module
+
+_lazy_module._bind({
+    "lib": _lib,
+    "P": _P,
+    "check": _check,
+    "MetalArray": MetalArray,
+    "Expr": Expr,
+    "as_expr": _as_expr,
+    "col": col,
+    "pa": pa,
+    "ArrowMetalError": ArrowMetalError,
+    "query_columns": _query_columns,
+})
+
+LazyFrame = _lazy_module.LazyFrame
+Agg = _lazy_module.Agg
+agg = _lazy_module.agg
+scan = _lazy_module.scan
+lazy = _lazy_module
+
+
+def concat(frames):
+    """Vertical concatenation of lazy frames with identical schemas (SQL `UNION ALL`)."""
+    frames = list(frames)
+    if not frames:
+        raise ArrowMetalError("concat needs at least one frame")
+    return frames[0].concat(frames[1:])
