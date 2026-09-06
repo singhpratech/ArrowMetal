@@ -56,8 +56,13 @@ filter result binds the GPU-written total as that pointer and is dispatched at i
 next kernel (compare, arithmetic, cast, bitmap ops, another filter, a reduction's partial pass) never needs
 the CPU to know the length. A reduction still syncs once to read its partials.
 
-Not yet: futures for reduction results, completion handlers / Swift `async` so the calling thread is
-released while the GPU works, and Float64 sum/arithmetic on the GPU (double-float emulation).
+**Float64 without hardware doubles.** `Kernels/DoubleMath.swift` carries a software IEEE-754 binary64
+(`d_add`, `d_sub`, `d_mul`, `d_div`) over `ulong` bit patterns, correctly rounded. Sum accumulates with
+`d_add`; arithmetic kernels run one element per thread. It is slower than native Float32 math but still
+memory-bound at 50M rows, and it means no Float64 column ever falls back to the CPU.
+
+Not yet: futures for reduction results, and completion handlers / Swift `async` so the calling thread is
+released while the GPU works.
 
 ## Roadmap for "no room left"
 1. **Pipelined execution** (above). Biggest win for query-shaped work and for Python callers.

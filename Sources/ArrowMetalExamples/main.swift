@@ -42,7 +42,7 @@ let scaled = try amt.subtract(try amt.min()!).divide(try amt.max()! - (try amt.m
 print("  sampled \(feat.length) rows, qty->Float \(qtyF.length), amount scaled: min=\(try scaled.min()!) max=\(try scaled.max()!) nulls=\(scaled.nullCount)   [\(ms(t0))]")
 
 // ---------------------------------------------------------------------------------------------
-print("\nScenario 3: Float64 prices with NaN (exact GPU compare/min/max/filter, CPU sum)")
+print("\nScenario 3: Float64 prices with NaN (compare, min, max, filter and software-IEEE sum, all on the GPU)")
 t0 = DispatchTime.now()
 let prices = try MetalArray<Double>((0..<n).map { i in i % 1000 == 0 ? .nan : Double.random(in: 10...1000, using: &g) })
 let cheap = try prices.filter(try prices.compare(.lt, 100))

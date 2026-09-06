@@ -19,7 +19,8 @@ enum KernelSource {
     /// Reduction kernels: sum / min / max with null awareness. `ACC` is the accumulator type.
     /// Each threadgroup writes one partial and one valid-count; the CPU finalises the partials.
     static func reductions(T: String, ACC: String, minInit: String, maxInit: String,
-                           load: String = "(ACC)vals[i]", extra: String = "true") -> String {
+                           load: String = "(ACC)vals[i]", extra: String = "true", combineSum: String = "acc + v",
+                           extraPrelude: String = "") -> String {
         let loadExpr = load.replacingOccurrences(of: "ACC", with: ACC)
         func body(_ name: String, _ initVal: String, _ combine: String) -> String { """
         kernel void reduce_\(name)(device const \(T)* vals [[buffer(0)]],
@@ -71,8 +72,8 @@ enum KernelSource {
             if (lid == 0) { partials[tgid] = shared[0]; counts[tgid] = scount[0]; }
         }
         """ }
-        return prelude
-            + body("sum", "0", "acc + v")
+        return prelude + extraPrelude
+            + body("sum", "0", combineSum)
             + body("min", minInit, "min(acc, v)")
             + body("max", maxInit, "max(acc, v)")
     }
@@ -250,6 +251,31 @@ enum KernelSource {
         }
         return s
     }
+
+    /// Float64 arithmetic through software IEEE-754 (see DoubleMath). One element per thread.
+    static let arithmeticDouble: String = {
+        var s = prelude + DoubleMath.msl
+        for (name, fn) in [("add", "d_add"), ("sub", "d_sub"), ("mul", "d_mul"), ("div", "d_div")] {
+            s += """
+            kernel void arith_scalar_\(name)(device const ulong* a [[buffer(0)]],
+                                            constant ulong& scalar [[buffer(1)]],
+                                            device const uint* nPtr [[buffer(2)]],
+                                            device ulong* out [[buffer(3)]],
+                                            uint i [[thread_position_in_grid]]) {
+                if (i < *nPtr) out[i] = \(fn)(a[i], scalar);
+            }
+            kernel void arith_array_\(name)(device const ulong* a [[buffer(0)]],
+                                           device const ulong* b [[buffer(1)]],
+                                           device const uint* nPtr [[buffer(2)]],
+                                           device ulong* out [[buffer(3)]],
+                                           uint i [[thread_position_in_grid]]) {
+                if (i < *nPtr) out[i] = \(fn)(a[i], b[i]);
+            }
+
+            """
+        }
+        return s
+    }()
 
     /// Bitmap word operations (validity combination) and bit packing.
     static let bitmap = prelude + """

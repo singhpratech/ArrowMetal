@@ -3,7 +3,7 @@ where the library supports it). Data has the same shape and distribution as the 
 
 Usage: python Benchmarks/python_bench.py [rows] [iterations]
 """
-import sys, time, os
+import sys, time, os, resource
 import numpy as np
 import polars as pl
 import pyarrow as pa
@@ -15,13 +15,19 @@ iters = int(sys.argv[2]) if len(sys.argv) > 2 else 5
 rng = np.random.default_rng(42)
 results = []
 
+def cpu_seconds():
+    r = resource.getrusage(resource.RUSAGE_SELF)
+    return r.ru_utime + r.ru_stime
+
+
 def bench(section, label, bytes_, fn):
     fn()
-    best = float("inf")
+    best = float("inf"); best_cpu = float("inf")
     for _ in range(iters):
-        t0 = time.perf_counter(); fn(); best = min(best, time.perf_counter() - t0)
-    print(f"  {label:<44} {best*1000:9.2f} ms  {bytes_/best/1e9:7.1f} GB/s")
-    results.append((section, label, best * 1000, bytes_ / best / 1e9))
+        c0 = cpu_seconds(); t0 = time.perf_counter(); fn(); wall = time.perf_counter() - t0; cpu = cpu_seconds() - c0
+        if wall < best: best, best_cpu = wall, cpu
+    print(f"  {label:<44} {best*1000:9.2f} ms  {bytes_/best/1e9:7.1f} GB/s  {best_cpu*1000:8.1f} CPU-ms")
+    results.append((section, label, best * 1000, bytes_ / best / 1e9, best_cpu * 1000))
 
 print(f"Python bench: polars {pl.__version__} ({pl.thread_pool_size()} threads), pyarrow {pa.__version__} "
       f"({pa.cpu_count()} threads), pandas {pd.__version__}; rows={rows}, best of {iters}\n")
@@ -139,6 +145,6 @@ bench(sec, "polars  compare then filter", B4, lambda: pl_f32.filter(pl_f32 > 0))
 bench(sec, "pyarrow compare then filter", B4, lambda: pc.filter(arr_f32, pc.greater(arr_f32, 0)))
 bench(sec, "numpy   boolean index", B4, lambda: f32[f32 > 0])
 
-print("\n\n| Operation | Implementation | Time (ms) | Throughput (GB/s) |\n|---|---|---:|---:|")
-for s, l, ms, gb in results:
-    print(f"| {s} | {l} | {ms:.2f} | {gb:.1f} |")
+print("\n\n| Operation | Implementation | Time (ms) | Throughput (GB/s) | CPU time (ms) |\n|---|---|---:|---:|---:|")
+for s, l, ms, gb, cpu in results:
+    print(f"| {s} | {l} | {ms:.2f} | {gb:.1f} | {cpu:.1f} |")

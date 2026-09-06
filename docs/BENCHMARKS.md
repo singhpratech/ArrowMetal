@@ -1,5 +1,49 @@
 # Benchmark history
 
+## 2026-09-06, Apple M4 Max, round 6: CPU time per operation (the "CPU stays free" claim, measured)
+50M rows, best of 5. CPU time is process user+system time consumed by the call (all threads).
+
+| Operation | Implementation | Wall ms | CPU ms |
+|---|---|---:|---:|
+| sum Int64, 10% nulls | Metal | 1.07 | 0.4 |
+| sum Int64, 10% nulls | 16-core Swift | 4.87 | 66.6 |
+| sum Int64, 10% nulls | Polars (from Python) | 15.65 | 15.6 |
+| filter Int64 > 0 | Metal | 2.95 | 1.0 |
+| filter Int64 > 0 | 16-core Swift | 3.49 | 48.8 |
+| filter Int64 > 0 | Polars | 22.79 | 22.7 |
+| take 25M random indices | Metal | 5.91 | 0.8 |
+| take 25M random indices | 16-core Swift | 11.75 | 154.6 |
+| take 25M random indices | Polars gather | 163.92 | 163.9 |
+| group-by sum, 5 keys | Metal | 1.72 | 0.4 |
+| group-by sum, 5 keys | 16-core Swift | 5.67 | 83.1 |
+| group-by sum, 1000 keys | Metal (from Python) | 1.91 | 0.4 |
+| group-by sum, 1000 keys | Polars | 84.06 | 1182.7 |
+| group-by sum, 1000 keys | pyarrow | 18.67 | 250.8 |
+| query: filter two columns + sum | Metal, batched | 1.75 | 0.4 |
+| query: filter two columns + sum | 16-core Swift fused loop | 6.27 | 86.5 |
+| query: filter two columns + sum | Polars lazy | 15.81 | 26.6 |
+| Float64 compare + filter | Metal | 3.37 | 0.8 |
+| Float64 compare + filter | 16-core Swift | 5.86 | 73.7 |
+
+A GPU query costs the CPU well under a millisecond; the same work on the CPU costs 50 to 1200
+CPU-milliseconds, which is time the rest of the application does not get.
+
+Float64 sum, add, sub, mul, div now run on the GPU through software IEEE-754 (bit-exact; see round 6 in
+docs/FINDINGS.md).
+
+
+## 2026-09-06, Apple M4 Max, round 5: lengths flow on the GPU
+5-op chain (compare, compare, and, filter, sum), µs per call, best of 30:
+
+| rows | unbatched | batched (round 4, two syncs) | batched (round 5, one sync) |
+|---:|---:|---:|---:|
+| 1,000 | 642 | 346 | 256 |
+| 10,000 | 580 | 320 | 232 |
+| 100,000 | 573 | 330 | 243 |
+| 1,000,000 | 872 | 549 | 428 |
+| 10,000,000 | 1,344 | 1,047 | 970 |
+
+
 ## 2026-09-06, Apple M4 Max, round 4: latency and batched execution
 Fixed cost per call (µs, best of 30). "5-op chain" is compare, compare, and, filter, sum.
 

@@ -9,20 +9,20 @@ extension MetalArray {
     /// Element-wise arithmetic with a scalar. Integer overflow wraps; integer division by zero is unspecified
     /// (the GPU does not trap), matching Arrow's non-checked kernels only for overflow.
     public func arithmetic(_ op: ArithmeticOp, _ scalar: T) throws -> MetalArray<T> {
-        guard Dispatch.runsOnGPU(T.self) else { return try CPUReference.arithmetic(self, op, scalar: scalar) }
         let n = dispatchLength
         try Dispatch.checkLength(n)
         let ctx = context
         let out = try MetalArrowBuffer.allocate(byteCount: n * T.byteWidth, zeroed: false, context: ctx)
-        let src = KernelSource.arithmetic(T: T.mslType)
-        let pso = try Dispatch.pipeline(ctx, family: "arith", source: src, function: "arith_scalar_\(op.rawValue)", type: T.mslType)
+        let isDouble = T.self == Double.self
+        let src = isDouble ? KernelSource.arithmeticDouble : KernelSource.arithmetic(T: T.mslType)
+        let pso = try Dispatch.pipeline(ctx, family: "arith", source: src, function: "arith_scalar_\(op.rawValue)", type: isDouble ? "double" : T.mslType)
         try ctx.run { enc in
             enc.setComputePipelineState(pso)
             enc.setBuffer(values.mtl, offset: values.offset, index: 0)
-            Dispatch.setScalar(enc, scalar, index: 1)
+            if isDouble { Dispatch.setScalar(enc, (scalar as! Double).bitPattern, index: 1) } else { Dispatch.setScalar(enc, scalar, index: 1) }
             Dispatch.setLength(enc, n, lengthBuffer, index: 2)
             enc.setBuffer(out.mtl, offset: out.offset, index: 3)
-            Dispatch.dispatch1D(enc, pso, count: (n + 3) / 4)
+            Dispatch.dispatch1D(enc, pso, count: isDouble ? n : (n + 3) / 4)
         }
         return inheritPending(MetalArray<T>(length: knownLength, nullCount: _nullCount, validity: validity, values: out, context: ctx))
     }
@@ -30,20 +30,20 @@ extension MetalArray {
     /// Element-wise arithmetic with another array. Output validity is the AND of both inputs.
     public func arithmetic(_ op: ArithmeticOp, _ other: MetalArray<T>) throws -> MetalArray<T> {
         try checkSameLength(other)
-        guard Dispatch.runsOnGPU(T.self) else { return try CPUReference.arithmetic(self, op, array: other) }
         let n = dispatchLength
         try Dispatch.checkLength(n)
         let ctx = context
         let out = try MetalArrowBuffer.allocate(byteCount: n * T.byteWidth, zeroed: false, context: ctx)
-        let src = KernelSource.arithmetic(T: T.mslType)
-        let pso = try Dispatch.pipeline(ctx, family: "arith", source: src, function: "arith_array_\(op.rawValue)", type: T.mslType)
+        let isDouble = T.self == Double.self
+        let src = isDouble ? KernelSource.arithmeticDouble : KernelSource.arithmetic(T: T.mslType)
+        let pso = try Dispatch.pipeline(ctx, family: "arith", source: src, function: "arith_array_\(op.rawValue)", type: isDouble ? "double" : T.mslType)
         try ctx.run { enc in
             enc.setComputePipelineState(pso)
             enc.setBuffer(values.mtl, offset: values.offset, index: 0)
             enc.setBuffer(other.values.mtl, offset: other.values.offset, index: 1)
             Dispatch.setLength(enc, n, lengthBuffer, index: 2)
             enc.setBuffer(out.mtl, offset: out.offset, index: 3)
-            Dispatch.dispatch1D(enc, pso, count: (n + 3) / 4)
+            Dispatch.dispatch1D(enc, pso, count: isDouble ? n : (n + 3) / 4)
         }
         let v = try BitmapOps.combineValidity(ctx, validity, other.validity, bits: n, lengthBuffer: lengthBuffer)
         let res = inheritPending(MetalArray<T>(length: knownLength, nullCount: 0, validity: v, values: out, context: ctx))

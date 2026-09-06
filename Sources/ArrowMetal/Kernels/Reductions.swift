@@ -20,12 +20,17 @@ extension MetalArray {
     /// Float32 sums accumulate per-thread in float and finalise in double.
     public func sum() throws -> SumResult? {
         if !pending && validCount == 0 { return nil }
-        guard Dispatch.runsOnGPU(T.self) else { return CPUReference.sum(self) }
         let (partials, counts, groups) = try runReduction("reduce_sum")
         if validCount == 0 { return nil }   // (now synced) all-null after a pending filter
         // The raw pointers below must not outlive the buffer objects (release builds shorten lifetimes).
         return withExtendedLifetime((partials, counts)) {
-            if T.isFloatingPoint {
+            if T.self == Double.self {
+                // Partials are IEEE doubles produced by software d_add on the GPU; combine on the CPU.
+                let p = partials.typed(UInt64.self)
+                var acc = 0.0
+                for g in 0..<groups { acc += Double(bitPattern: p[g]) }
+                return .float(acc)
+            } else if T.isFloatingPoint {
                 let p = partials.typed(Float.self)
                 var acc = 0.0
                 for g in 0..<groups { acc += Double(p[g]) }
@@ -100,7 +105,12 @@ extension MetalArray {
         let acc: String, mslT: String
         let minInit: String, maxInit: String
         var load = "(ACC)vals[i]", extra = "true"
-        if T.self == Double.self {
+        var combineSum = "acc + v", extraPrelude = ""
+        if T.self == Double.self && fn == "reduce_sum" {
+            // Software IEEE double accumulation on raw bit patterns.
+            mslT = "long"; acc = "ulong"; minInit = "0"; maxInit = "0"
+            load = "(ulong)vals[i]"; combineSum = "d_add(acc, v)"; extraPrelude = DoubleMath.msl
+        } else if T.self == Double.self {
             mslT = "long"; acc = "long"; minInit = "LONG_MAX"; maxInit = "LONG_MIN"
             load = "d_key(vals[i])"; extra = "!d_isnan(vals[i])"
         } else if T.isFloatingPoint { mslT = T.mslType; acc = "float"; minInit = "INFINITY"; maxInit = "-INFINITY"; extra = "!isnan(vals[i])" }
@@ -108,8 +118,9 @@ extension MetalArray {
         else { mslT = T.mslType; acc = "ulong"; minInit = "ULONG_MAX"; maxInit = "0" }
         // Float sum must include NaN (it propagates); only min/max skip NaN.
         if fn == "reduce_sum" { extra = "true" }
-        let src = KernelSource.reductions(T: mslT, ACC: acc, minInit: minInit, maxInit: maxInit, load: load, extra: extra)
-        let pso = try Dispatch.pipeline(ctx, family: "reduce", source: src, function: fn, type: mslT + (extra == "true" ? "" : "/skipnan"))
+        let src = KernelSource.reductions(T: mslT, ACC: acc, minInit: minInit, maxInit: maxInit, load: load, extra: extra,
+                                          combineSum: combineSum, extraPrelude: extraPrelude)
+        let pso = try Dispatch.pipeline(ctx, family: "reduce", source: src, function: fn, type: mslT + (extra == "true" ? "" : "/skipnan") + (extraPrelude.isEmpty ? "" : "/dd"))
         // Enough threadgroups to saturate the GPU, but few enough that the CPU finalise is trivial.
         let groups = Swift.max(1, Swift.min(2048, (n + Dispatch.threadgroupSize - 1) / Dispatch.threadgroupSize))
         let partials = try MetalArrowBuffer.allocate(byteCount: groups * 8, zeroed: false, context: ctx)

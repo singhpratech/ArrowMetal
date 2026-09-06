@@ -7,6 +7,14 @@ C Device Data Interface (`ARROW_DEVICE_METAL`).
 > Status: v0.1, early and small on purpose. The core works, is tested against a CPU oracle, and is fast.
 > Everything on the [roadmap](ROADMAP.md) is up for grabs.
 
+## The pitch in one paragraph
+
+Every array is Arrow layout in memory the GPU already shares, so there is nothing to upload. Reductions,
+filters, gathers and group-by run on the GPU 1.5x to 3x faster than all 16 CPU cores and 5x to 40x faster
+than Polars, and while they run the CPU is free for the rest of the application: the benchmark tables
+report CPU time per operation next to wall time. Chains of operations share one GPU round trip. The whole
+thing is reachable from Swift, Python, and any language with Arrow bindings through one C ABI.
+
 ## Why this exists
 
 Apple silicon has one physical memory shared by CPU and GPU. An Arrow buffer placed in a `MTLBuffer` with
@@ -29,15 +37,16 @@ arrow-swift or anything else that speaks the C Data Interface.
 Apple M4 Max (16 CPU cores), 50,000,000 rows, best of 5, release build. Full history and methodology in
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and [Benchmarks/README.md](Benchmarks/README.md).
 
-**Called from Python, same in-process data**, against Polars (16 threads), pyarrow.compute and pandas:
+**Called from Python, same in-process data**, against Polars (16 threads), pyarrow.compute and pandas.
+Wall time, with the CPU time each call consumed in parentheses:
 
 | Operation | ArrowMetal | Polars | pyarrow | pandas |
 |---|---:|---:|---:|---:|
-| sum Int64, 10% nulls | **1.05 ms** | 15.78 | 48.26 | 47.75 |
-| filter Int64 > 0 | **3.55** | 22.99 | 211.05 | 271.50 |
-| take 25M random indices | **5.98** | 164.82 | 138.61 | |
-| group-by sum, 1000 keys | **2.05** | 84.65 | 18.73 | |
-| filter two columns + sum | **3.13** | 16.41 (lazy) | | 109.46 (numpy) |
+| sum Int64, 10% nulls | **1.07 ms** (0.4 CPU-ms) | 15.65 (15.6) | 48.76 (48.7) | 47.86 (47.8) |
+| filter Int64 > 0 | **3.59** (0.7) | 22.79 (22.7) | 211.89 (211.8) | 270.10 (270.1) |
+| take 25M random indices | **5.86** (0.7) | 163.92 (163.9) | 134.87 (134.9) | |
+| group-by sum, 1000 keys | **1.91** (0.4) | 84.06 (1182.7) | 18.67 (250.8) | |
+| filter two columns + sum, batched | **1.77** (0.5) | 15.81 (26.6, lazy) | | 109.05 (numpy) |
 
 **Swift, against all 16 CPU cores** (tight typed loops over the same Arrow layout) and Accelerate:
 
@@ -136,9 +145,10 @@ enough to build and use it. Running the test suite needs Xcode (for XCTest):
   up to 1024 keys, device atomics beyond; 64-bit sums via split 32-bit atomics with carry).
 - `libArrowMetalC`: a C ABI over everything above, and a ctypes Python package that speaks the Arrow
   PyCapsule protocol.
-- Float64: Metal has no `double`, so compare, min, max, filter, take and slice run on the GPU using an
-  order-preserving map of the IEEE bit pattern (exact, NaN and signed zero handled); sum and arithmetic run
-  on the CPU through the same API.
+- Float64 on the GPU even though Metal has no `double`: compare, min, max, filter, take and slice use an
+  order-preserving map of the IEEE bit pattern; sum, add, subtract, multiply and divide use a software
+  IEEE-754 binary64 implementation on 64-bit integers that is correctly rounded (bit-exact against Swift's
+  `Double` over millions of random and edge-case inputs, subnormals and NaN included).
 - NaN: `min`/`max` skip NaN and return null if only NaN remains; `sum` propagates NaN; comparisons follow IEEE.
 - C Data Interface import/export for primitive arrays and struct (`+s`) record batches, C Stream Interface
   import, C Device Data Interface import/export, `MTLBuffer` recovery from our own exports.

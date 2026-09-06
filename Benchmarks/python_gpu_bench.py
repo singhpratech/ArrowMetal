@@ -3,7 +3,7 @@
 Usage: PYTHONPATH=python python Benchmarks/python_gpu_bench.py [rows] [iterations]
 Requires .build/release/libArrowMetalC.dylib (swift build -c release --product ArrowMetalC).
 """
-import sys, time
+import sys, time, resource
 import numpy as np, pyarrow as pa, pyarrow.compute as pc, polars as pl, pandas as pd
 import arrowmetal as am
 
@@ -13,13 +13,19 @@ rng = np.random.default_rng(42)
 results = []
 
 
+def cpu_seconds():
+    r = resource.getrusage(resource.RUSAGE_SELF)
+    return r.ru_utime + r.ru_stime
+
+
 def bench(section, label, bytes_, fn):
     fn()
-    best = float("inf")
+    best = float("inf"); best_cpu = float("inf")
     for _ in range(iters):
-        t0 = time.perf_counter(); fn(); best = min(best, time.perf_counter() - t0)
-    print(f"  {label:<44} {best*1000:9.2f} ms  {bytes_/best/1e9:7.1f} GB/s")
-    results.append((section, label, best * 1000, bytes_ / best / 1e9))
+        c0 = cpu_seconds(); t0 = time.perf_counter(); fn(); wall = time.perf_counter() - t0; cpu = cpu_seconds() - c0
+        if wall < best: best, best_cpu = wall, cpu
+    print(f"  {label:<44} {best*1000:9.2f} ms  {bytes_/best/1e9:7.1f} GB/s  {best_cpu*1000:8.1f} CPU-ms")
+    results.append((section, label, best * 1000, bytes_ / best / 1e9, best_cpu * 1000))
 
 
 print(f"ArrowMetal {am.version()} on {am.device_name()} vs polars {pl.__version__} ({pl.thread_pool_size()} threads), "
@@ -76,6 +82,6 @@ bench(sec, "ArrowMetal (GPU, batched)", QB, _batched)
 bench(sec, "polars lazy (fused)", QB, lambda: ql.filter((pl.col("region") == 2) & (pl.col("amount") > 100)).select(pl.col("amount").sum()).collect())
 bench(sec, "numpy masked sum", QB, lambda: amount[(region == 2) & (amount > 100)].sum())
 
-print("\n\n| Operation | Implementation | Time (ms) | Throughput (GB/s) |\n|---|---|---:|---:|")
-for s, l, ms, gb_ in results:
-    print(f"| {s} | {l} | {ms:.2f} | {gb_:.1f} |")
+print("\n\n| Operation | Implementation | Time (ms) | Throughput (GB/s) | CPU time (ms) |\n|---|---|---:|---:|---:|")
+for s, l, ms, gb_, cpu in results:
+    print(f"| {s} | {l} | {ms:.2f} | {gb_:.1f} | {cpu:.1f} |")

@@ -21,4 +21,8 @@ keys = am.array(pa.array([0, 1, 0, 2], pa.int32()))
 print(keys.group_by(3).sum(col).to_arrow())
 ```
 
+Float64 columns (NumPy's and pandas' default) run entirely on the GPU: compare, filter, take, sum and
+arithmetic use a software IEEE-754 implementation that is bit-exact with the CPU. Use `with am.batch():`
+around a chain of operations to pay one GPU round trip instead of one per call.
+
 See `Benchmarks/python_gpu_bench.py` for a side-by-side with Polars, pyarrow.compute and pandas on the same data.

@@ -43,10 +43,12 @@ Kernel outputs that are fully written skip zeroing.
 Each threadgroup writes a partial; the host (or a scan kernel) finalises. Deterministic float sums, works for
 64-bit integers (Apple GPUs expose no 64-bit atomics from MSL).
 
-## 2026-09-06: Float64 on the GPU through order-preserving bit patterns
+## 2026-09-06: Float64 on the GPU: bit-pattern ordering plus software IEEE-754
 Metal has no `double`. Compare, min, max, filter, take and slice treat Float64 as `long` with an
-order-preserving key (NaN and signed zero handled). Sum and arithmetic stay on the CPU until double-float
-emulation lands.
+order-preserving key (NaN and signed zero handled). Sum, add, subtract, multiply and divide use a software
+binary64 implementation on 64-bit integers, correctly rounded and bit-exact against the CPU. Chosen over
+double-float (two `float`) emulation because Float64 is the default numeric type in Python and an
+approximate result there would be a support burden forever.
 
 ## 2026-09-06: NaN semantics
 `min`/`max` skip NaN and return null if only NaN remains; `sum` propagates NaN; comparisons follow IEEE.

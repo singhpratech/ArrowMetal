@@ -60,19 +60,30 @@ func cpuFilterInt64(_ a: MetalArray<Int64>, sel: UnsafePointer<UInt8>, into out:
     return k
 }
 
-var results: [(String, String, Double, Double)] = []  // section, label, ms, GB/s
+var results: [(String, String, Double, Double, Double)] = []  // section, label, ms, GB/s, CPU ms
+
+/// Process CPU time (user + system) in seconds: what the operation takes away from the rest of the app.
+func cpuSeconds() -> Double {
+    var ru = rusage()
+    getrusage(RUSAGE_SELF, &ru)
+    return Double(ru.ru_utime.tv_sec) + Double(ru.ru_utime.tv_usec) / 1e6 + Double(ru.ru_stime.tv_sec) + Double(ru.ru_stime.tv_usec) / 1e6
+}
 
 func time(_ label: String, bytes: Int, section: String, _ body: () throws -> Void) rethrows {
     try body() // warm-up (compiles pipelines)
     var best = Double.infinity
+    var bestCPU = Double.infinity
     for _ in 0..<iters {
+        let c0 = cpuSeconds()
         let t0 = DispatchTime.now().uptimeNanoseconds
         try body()
-        best = min(best, Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9)
+        let wall = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9
+        let cpu = cpuSeconds() - c0
+        if wall < best { best = wall; bestCPU = cpu }
     }
     let gbps = Double(bytes) / best / 1e9
-    print(String(format: "  %-40s %9.2f ms  %7.1f GB/s", (label as NSString).utf8String!, best * 1000, gbps))
-    results.append((section, label, best * 1000, gbps))
+    print(String(format: "  %-44s %9.2f ms  %7.1f GB/s  %8.1f CPU-ms", (label as NSString).utf8String!, best * 1000, gbps, bestCPU * 1000))
+    results.append((section, label, best * 1000, gbps, bestCPU * 1000))
 }
 
 // Null-aware Int64 sum over an Arrow layout, single core, range [lo, hi).
@@ -136,6 +147,10 @@ func cpuFilterParallel<T>(_ p: UnsafePointer<T>, n: Int, sel: UnsafePointer<UInt
 }
 
 let ctx = MetalContext.shared
+if ctx.isVirtualDevice {
+    print("ArrowMetal bench: virtual Metal device (\(ctx.device.name)) detected; benchmarks need real Apple silicon. Skipping.")
+    exit(0)
+}
 
 // ---- Latency mode: fixed cost per call at small sizes, GPU vs 1 core (which is what small sizes get on the CPU side).
 if latencyMode {
@@ -359,5 +374,5 @@ time("CPU \(cores)-core compare then filter", bytes: bytesF32, section: sec) {
 }
 
 // Markdown table for the README.
-print("\n\n| Operation | Implementation | Time (ms) | Throughput (GB/s) |\n|---|---|---:|---:|")
-for (s, l, ms, gb) in results { print("| \(s) | \(l) | \(String(format: "%.2f", ms)) | \(String(format: "%.1f", gb)) |") }
+print("\n\n| Operation | Implementation | Time (ms) | Throughput (GB/s) | CPU time (ms) |\n|---|---|---:|---:|---:|")
+for (s, l, ms, gb, cpu) in results { print("| \(s) | \(l) | \(String(format: "%.2f", ms)) | \(String(format: "%.1f", gb)) | \(String(format: "%.1f", cpu)) |") }

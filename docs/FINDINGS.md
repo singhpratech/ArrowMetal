@@ -59,3 +59,16 @@ Things learned the hard way. Add to this whenever something surprises you.
   filter result binds its GPU-written total as that buffer, so compare / arithmetic / cast / bitmap ops /
   another filter / a reduction can consume it inside the same command buffer with worst-case dispatch sizes.
   Reductions still sync to read partials, but a filter followed by a sum is now one round trip.
+
+## Round 6 (2026-09-06): software IEEE-754 double on the GPU
+- Add, subtract and multiply implemented on `ulong` with 3 guard bits and sticky are bit-exact against Swift's
+  `Double` for 1M random pairs including subnormals, signed zeros, infinities and NaN (`d_finish` handles
+  normalisation, subnormal shift-with-sticky, round-to-nearest-even, and rounding carry).
+- Division: a float-seeded Newton iteration was within 1 ulp only 93% of the time and wrong for subnormal
+  inputs. Replaced with restoring long division on the significands (57 quotient bits). Two bugs on the way:
+  one extra quotient bit shifted every result by 2x, and the restoring loop needs `rem < mb` before the first
+  step (take the first quotient bit explicitly). Lesson: test division on ratios above and below 1.
+- A preprocessor `#define` glued to the previous line (`}#define`) because Swift multi-line strings drop the
+  final newline. Generated MSL fragments that start with a directive must begin with a newline.
+- Float64 sum on the GPU accumulates with `d_add` in tree order; per-threadgroup partials are combined on
+  the CPU in `Double`. Results differ from a sequential CPU sum only by normal floating-point reordering.
