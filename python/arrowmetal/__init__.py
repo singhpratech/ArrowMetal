@@ -9,7 +9,7 @@ so results drop straight back into Polars, pandas, DuckDB or pyarrow.compute.
     kept = col.filter_where(">", 1)           # runs on the GPU
     kept.to_arrow()                           # -> pyarrow.Array([3])
 """
-import ctypes, ctypes.util, os, struct, sys
+import ctypes, ctypes.util, decimal, os, struct, sys
 import pyarrow as pa
 
 __version__ = "0.1.0"
@@ -84,6 +84,8 @@ _lib.am_batch_end.restype = ctypes.c_int
 _lib.am_unary.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]; _lib.am_unary.restype = ctypes.c_int
 _lib.am_binary.argtypes = [_P, ctypes.c_int, _P, _P, ctypes.POINTER(_P)]; _lib.am_binary.restype = ctypes.c_int
 _lib.am_cumulative.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]; _lib.am_cumulative.restype = ctypes.c_int
+_lib.am_decimal_op.argtypes = [_P, ctypes.c_int, _P, _P, ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_decimal_op.restype = ctypes.c_int
 
 # Op numbering is the C ABI contract; see include/arrowmetal.h.
 _UNARY = {"negate": 0, "abs": 1, "sign": 2, "sqrt": 3, "exp": 4, "ln": 5, "log10": 6, "log2": 7,
@@ -95,6 +97,36 @@ _CUMULATIVE = {"sum": 0, "min": 1, "max": 2}
 
 _UNITS = {"s": "s", "m": "ms", "u": "us", "n": "ns"}
 _TEMPORAL_FIELDS = {"year": 0, "month": 1, "day": 2, "day_of_week": 3, "hour": 4, "minute": 5, "second": 6}
+
+
+# Decimal op numbering is the C ABI contract; see include/arrowmetal.h.
+_DECIMAL_ROUND = {"round": 12, "ceil": 13, "floor": 14, "truncate": 15, "trunc": 15}
+
+
+def _decimal_type(fmt):
+    """pyarrow type for an Arrow decimal format string ("d:p,s" / "d:p,s,256"), or None."""
+    if not fmt.startswith("d:"):
+        return None
+    parts = fmt[2:].split(",")
+    if len(parts) < 2:
+        return None
+    p, s = int(parts[0]), int(parts[1])
+    return pa.decimal256(p, s) if len(parts) > 2 and parts[2] == "256" else pa.decimal128(p, s)
+
+
+def _decimal_scale(fmt):
+    return int(fmt[2:].split(",")[1])
+
+
+def _decimal_scalar(v, scale):
+    """16 little-endian bytes for a decimal scalar. An int is the unscaled value; a Decimal, float or
+    string is the real value and is multiplied by 10^scale (halves away from zero)."""
+    if isinstance(v, int):
+        unscaled = v
+    else:
+        d = v if isinstance(v, decimal.Decimal) else decimal.Decimal(str(v))
+        unscaled = int((d * (10 ** scale)).to_integral_value(rounding=decimal.ROUND_HALF_UP))
+    return ctypes.create_string_buffer(int(unscaled).to_bytes(16, "little", signed=True), 16)
 
 
 def _temporal_type(fmt):
@@ -203,6 +235,9 @@ class MetalArray:
         temporal = _temporal_type(fmt)
         if temporal is not None:
             return temporal
+        dec = _decimal_type(fmt)
+        if dec is not None:
+            return dec
         # "i" is also the index format of a dictionary array; ask the exported schema which one it is.
         return self.to_arrow().type
 
@@ -210,7 +245,11 @@ class MetalArray:
         return f"MetalArray({self.type}, len={len(self)}, nulls={self.null_count}, device={device_name()!r})"
 
     def _scalar(self, v):
-        code = _STRUCT.get(self.format)
+        fmt = self.format
+        # A decimal scalar is 16 little-endian bytes, which is what am_compare_scalar expects for "d:p,s".
+        if fmt.startswith("d:"):
+            return _decimal_scalar(v, _decimal_scale(fmt))
+        code = _STRUCT.get(fmt)
         if code is None:
             raise ArrowMetalError("scalar operations need a primitive array")
         return ctypes.create_string_buffer(struct.pack(code, v), 8)
@@ -530,6 +569,45 @@ class MetalArray:
     def cumulative_sum(self): return self.cumulative("sum")
     def cumulative_min(self): return self.cumulative("min")
     def cumulative_max(self): return self.cumulative("max")
+
+    # ---- decimals (decimal128 "d:p,s", decimal256 "d:p,s,256"); op table in include/arrowmetal.h.
+    # The comparison operators (==, <, ...) already work on decimal columns through the ordinary compare
+    # path; a scalar may be an int (the unscaled value) or a Decimal / float / string (the real value).
+    def _decimal_op(self, op, other=None, scalar=None, p1=0):
+        b = other._h if isinstance(other, MetalArray) else None
+        return _call(_lib.am_decimal_op, self._h, op, b, scalar, p1)
+
+    def _decimal_operand(self, other):
+        """(array_handle, scalar_buffer) for a decimal binary op."""
+        if isinstance(other, MetalArray):
+            return other, None
+        return None, _decimal_scalar(other, _decimal_scale(self.format))
+
+    def decimal_add(self, other):
+        """Element-wise sum with another decimal column of the same scale, or with a scalar. Wraps."""
+        a, s = self._decimal_operand(other)
+        return self._decimal_op(6, a, s)
+
+    def decimal_sub(self, other):
+        """Element-wise difference with another decimal column of the same scale, or with a scalar."""
+        a, s = self._decimal_operand(other)
+        return self._decimal_op(7, a, s)
+
+    def decimal_mul(self, other):
+        """Multiply by another decimal column (result scale = s1 + s2, precision p1 + p2 + 1) or by an
+        integer scalar (the type is unchanged)."""
+        if isinstance(other, MetalArray):
+            return self._decimal_op(8, other, None)
+        return self._decimal_op(8, None, ctypes.create_string_buffer(struct.pack("q", int(other)), 8))
+
+    def decimal_round(self, scale, mode="round"):
+        """Rescale to `scale` decimal places: 'round' (halves away from zero), 'ceil', 'floor' or
+        'truncate'. Scaling up is exact."""
+        return self._decimal_op(_DECIMAL_ROUND[mode], None, None, scale)
+
+    def to_float64(self):
+        """The decimal values as float64 (unscaled / 10^scale). Runs on the host, 53 bits of precision."""
+        return self._decimal_op(16)
 
 
 class GroupBy:

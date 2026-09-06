@@ -23,7 +23,7 @@ int  am_export_device(am_array* a, struct ArrowSchema* schema, struct ArrowDevic
 void am_release(am_array* a);
 int64_t     am_length(am_array* a);
 int64_t     am_null_count(am_array* a);
-const char* am_format(am_array* a);          // Arrow format string: c C s S i I l L f g b u z t...
+const char* am_format(am_array* a);          // Arrow format string: c C s S i I l L f g b u z t... d:p,s
 
 // Reductions. out_kind: 0 = int64 in out_i64, 1 = uint64 in out_u64 (same slot), 2 = float64 in out_f64.
 // op: 0 sum, 1 min, 2 max, 3 mean. *is_null is set when there is no valid value.
@@ -175,6 +175,59 @@ int  am_binary(am_array* a, int op, am_array* b /* or NULL */, const void* scala
 // Output is null exactly where the input is, and the running value carries across nulls unchanged.
 // Two-level GPU scan; integer sums wrap and are exact, float sums reassociate.
 int  am_cumulative(am_array* a, int op, am_array** out);
+
+// ---------------------------------------------------------------------------------------------------
+// Decimals: decimal128 (am_format "d:precision,scale") and decimal256 ("d:precision,scale,256").
+//
+// An element is a fixed-width two's-complement little-endian integer -- 16 bytes for decimal128, 32 for
+// decimal256 -- holding the *unscaled* value; `scale` says where the point sits. Import and export go
+// through the ordinary am_import / am_export with that format string, and am_filter, am_take and am_slice
+// work on both widths. Comparisons also work through am_compare_scalar / am_compare_array (the scalar is
+// 16 little-endian bytes), which is what the Python `==`, `<`, ... operators use.
+//
+// One entry point with an op table. Pass exactly one of `b` (array form) or `scalar` (scalar form);
+// anything an op does not use may be NULL / 0. Unless a row says otherwise the scalar is 16 little-endian
+// bytes read at the array's own scale, both sides must have the same scale (a mismatch is an error, not a
+// silent rescale), nulls propagate, and arithmetic wraps modulo 2^128 exactly as Arrow's unchecked kernels
+// do. Everything except the casts runs on the GPU on 64-bit limbs.
+//
+//  op  name              b / scalar                       p1            output        notes
+//  --  ----------------  -------------------------------  ------------  ------------  ----------------------
+//   0  equal             either                           -             bool
+//   1  not_equal         either                           -             bool
+//   2  less              either                           -             bool
+//   3  less_equal        either                           -             bool
+//   4  greater           either                           -             bool
+//   5  greater_equal     either                           -             bool          256-bit scalars are
+//                                                                                     sign-extended from 16 B
+//   6  add               either                           -             same decimal  wraps
+//   7  subtract          either                           -             same decimal  wraps
+//   8  multiply          b: element-wise; scalar: int64_t  -             decimal       array form gives
+//                                                                                     precision p1+p2+1 and
+//                                                                                     scale s1+s2; the int64
+//                                                                                     form keeps the type
+//   9  negate            -                                -             same decimal
+//  10  abs               -                                -             same decimal
+//  11  sign              -                                -             int32         -1 / 0 / 1
+//  12  round             -                                target scale  decimal       halves away from zero
+//  13  ceil              -                                target scale  decimal       toward +inf
+//  14  floor             -                                target scale  decimal       toward -inf
+//  15  truncate          -                                target scale  decimal       toward zero
+//  16  cast to float64   -                                -             float64       CPU; 53-bit precision
+//  17  cast to decimal   -                                scale         decimal128    CPU; input is float64
+//                                                                                     or int64, precision 38
+//  18  sum               -                                -             decimal[1]    null when no valid value
+//  19  min               -                                -             decimal[1]
+//  20  max               -                                -             decimal[1]
+//
+// Ops 12-15 return a decimal with scale = p1: scaling up multiplies (exact, widening the precision) and
+// scaling down divides with the named rounding mode. Reductions come back as a length-1 array because a
+// 128-bit result does not fit an int64_t out-parameter; read it with am_export.
+//
+// decimal256 supports import/export, ops 0-5, am_filter / am_take / am_slice and op 18 (sum). The other
+// ops raise an error naming decimal128 rather than computing something wrong.
+int  am_decimal_op(am_array* a, int op, am_array* b /* or NULL */, const void* scalar /* or NULL */,
+                   int64_t p1, am_array** out);
 
 #ifdef __cplusplus
 }

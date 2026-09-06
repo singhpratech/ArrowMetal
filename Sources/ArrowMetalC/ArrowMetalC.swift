@@ -92,7 +92,7 @@ private func withPrimitive<R>(_ a: AnyMetalArray, _ body: (any PrimitiveOps) thr
     case .float64(let x): return try body(x)
     case .boolean: throw ArrowMetalError.unsupportedType("operation needs a primitive array, got boolean")
     case .string: throw ArrowMetalError.unsupportedType("operation needs a primitive array, got utf8")
-    case .temporal, .binary, .dictionary:
+    case .temporal, .binary, .dictionary, .decimal:
         throw ArrowMetalError.unsupportedType("operation needs a primitive array, got \(a.arrowFormat)")
     }
 }
@@ -185,7 +185,7 @@ func unwrap<T: ArrowPrimitive>(_ a: AnyMetalArray, _: T.Type) -> MetalArray<T>? 
     case .uint64(let x): return x as? MetalArray<T>
     case .float32(let x): return x as? MetalArray<T>
     case .float64(let x): return x as? MetalArray<T>
-    case .boolean, .string, .temporal, .binary, .dictionary: return nil
+    case .boolean, .string, .temporal, .binary, .dictionary, .decimal: return nil
     }
 }
 private func cmpOp(_ op: Int32) throws -> CompareOp {
@@ -216,11 +216,23 @@ public func am_reduce(_ a: OpaquePointer?, _ op: Int32, _ outI: UnsafeMutablePoi
 @_cdecl("am_compare_scalar")
 public func am_compare_scalar(_ a: OpaquePointer?, _ op: Int32, _ scalar: UnsafeRawPointer?, _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
     guard let x = handle(a), let scalar else { return 2 }
+    // Decimal columns compare through their own kernels; the scalar is 16 little-endian bytes.
+    if case .decimal(let d) = x {
+        return run(out) { .boolean(try d.compare(try cmpOp(op), ArrowDecimal128(
+            lo: scalar.loadUnaligned(fromByteOffset: 0, as: UInt64.self),
+            hi: scalar.loadUnaligned(fromByteOffset: 8, as: UInt64.self)))) }
+    }
     return run(out) { .boolean(try withPrimitive(x) { try $0.compareScalar(try cmpOp(op), scalar) }) }
 }
 @_cdecl("am_compare_array")
 public func am_compare_array(_ a: OpaquePointer?, _ op: Int32, _ b: OpaquePointer?, _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
     guard let x = handle(a), let y = handle(b) else { return 2 }
+    if case .decimal(let d) = x {
+        return run(out) {
+            guard case .decimal(let e) = y else { throw ArrowMetalError.unsupportedType("cannot compare \(x.arrowFormat) with \(y.arrowFormat)") }
+            return .boolean(try d.compare(try cmpOp(op), e))
+        }
+    }
     return run(out) { .boolean(try withPrimitive(x) { try $0.compareArray(try cmpOp(op), y) }) }
 }
 @_cdecl("am_arith_scalar")
@@ -367,7 +379,7 @@ private func countErased<K: ArrowIndex>(_ gb: GroupBy<K>, _ v: AnyMetalArray) th
     case .uint64(let x): return try gb.count(x)
     case .float32(let x): return try gb.count(x)
     case .float64(let x): return try gb.count(x)
-    case .boolean, .string, .temporal, .binary, .dictionary:
+    case .boolean, .string, .temporal, .binary, .dictionary, .decimal:
         throw ArrowMetalError.unsupportedType("count over non-numeric values")
     }
 }

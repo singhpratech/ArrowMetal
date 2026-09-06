@@ -15,6 +15,8 @@ public enum AnyMetalArray {
     case temporal(MetalTemporalArray)
     /// binary / large_binary: utf8's layout with the bytes left uninterpreted.
     case binary(MetalStringArray)
+    /// decimal128 / decimal256: raw 16- or 32-byte two's-complement values plus precision and scale.
+    case decimal(MetalDecimalArray)
     /// A dictionary-encoded array: int32 codes into `values`.
     indirect case dictionary(codes: MetalArray<Int32>, values: AnyMetalArray)
 
@@ -34,6 +36,7 @@ public enum AnyMetalArray {
         case .string(let a): return a.length
         case .temporal(let a): return a.length
         case .binary(let a): return a.length
+        case .decimal(let a): return a.length
         case .dictionary(let codes, _): return codes.length
         }
     }
@@ -54,6 +57,7 @@ public enum AnyMetalArray {
         case .string: return "u"
         case .temporal(let a): return a.type.arrowFormat
         case .binary: return "z"
+        case .decimal(let a): return a.type.arrowFormat
         // The C Data Interface puts the index type at the top level of a dictionary schema.
         case .dictionary: return "i"
         }
@@ -99,6 +103,7 @@ public func importArrowArray(schema: UnsafePointer<ArrowSchema>, array: UnsafeMu
     }
     if fmt == "u" || fmt == "U" { return try importStringArray(large: fmt == "U", array: array, context: context) }
     if fmt == "z" || fmt == "Z" { return try importBinaryArray(large: fmt == "Z", array: array, context: context) }
+    if fmt.hasPrefix("d:") { return try importDecimalArray(type: try ArrowDecimalType.parse(fmt), array: array, context: context) }
     if fmt.hasPrefix("t") { return try importTemporalArray(type: try ArrowTemporalType.parse(fmt), array: array, context: context) }
     guard array.pointee.n_buffers == 2, array.pointee.buffers != nil else {
         throw ArrowMetalError.invalidArrowArray("expected 2 buffers for primitive array, got \(array.pointee.n_buffers)")
@@ -409,6 +414,7 @@ extension AnyMetalArray {
         case .string(let a): a.exportArrowArray(into: out)
         case .temporal(let a): a.exportArrowArray(into: out)
         case .binary(let a): a.exportArrowArray(into: out)
+        case .decimal(let a): a.exportArrowArray(into: out)
         case .dictionary(let codes, let values): exportDictionaryArray(codes: codes, values: values, into: out)
         }
     }
