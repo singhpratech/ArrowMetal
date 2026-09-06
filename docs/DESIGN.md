@@ -34,6 +34,80 @@ Swift apps ───────────────────────
 Device peak on M4 Max is ~546 GB/s. Single-pass kernels sit at 55-70% of peak; the rest is command
 buffer setup and the CPU wait.
 
+## Group-by over string keys: a hash table instead of a sort
+
+`GroupByKeys` turns a key column into dense ids `0 ..< K` before any aggregate runs. For `utf8` and
+`binary` columns that used to mean the GPU string dictionary: hash every row to 64 bits, **argsort the
+hashes**, mark run boundaries by comparing the bytes of adjacent sorted strings. Correct, but the argsort
+is eight radix passes over 50 million 64-bit keys — ~185 ms — and it costs the same whether the column
+holds a thousand distinct keys or ten million. Real group-by keys are low cardinality, so the sort was
+paying row-count prices for distinct-count work.
+
+`Kernels/StringHashTable.swift` replaces it with an open-addressing table sized to the cardinality:
+
+1. **Hash** every non-null row to 64 bits in one pass over the bytes (`sht_hash64`).
+2. **Estimate** the distinct count by building a throwaway table over a **1/64 slice of the hash space**
+   — a row takes part only when `(h >> 40) & 63 == 0`. Each distinct string makes that decision once, so
+   the occupied-slot count times 64 estimates the cardinality no matter how skewed the row frequencies
+   are (a *row* sample would not: it sees the frequent keys and misses the rest). The estimate only sizes
+   the real table, and being wrong costs a retry, never a wrong answer.
+3. **Build** the table with three slots per estimated distinct value: linear probing, `slots[s] = row + 1`
+   so every atomic stays 32-bit (Metal has no 64-bit atomics), and the key of an occupied slot is the
+   string of row `slots[s] - 1`. Equality is decided by **comparing the bytes** of the candidate against
+   that representative, the same rule `is_in` uses, so a 64-bit hash collision costs one extra probe and
+   can never merge two different strings. Each row also records the slot it landed in and folds itself
+   into that slot's lowest row index with an `atomic_fetch_min` guarded by a plain load.
+4. **Rank** the occupied slots with the same GPU scan `unique()` uses, compact one representative row per
+   slot, and **relabel** into first-seen order with two argsorts over the *distinct* count.
+
+Two design choices are worth stating plainly. Nothing is cached beside the slot — not the hash, not a
+key prefix — because MSL only guarantees `memory_order_relaxed`: a companion array could be read before
+its writer had published it, and a probe that then walked past its own bucket would give one string two
+group ids. Reading `hashes[slots[s] - 1]` cannot go stale, because the hashes are written by an earlier
+kernel and never change. And because byte comparison decides equality, this path needs **no re-hash retry
+and no host fallback**, unlike the sort path it replaces. The only retry is a table that turned out too
+small; the last attempt gets two slots per row and an unbounded probe budget, so it cannot fail.
+
+The byte comparison was measured against deciding equality on the 64-bit hash alone: 17.5 vs 13.7 ms at
+a thousand distinct keys, 22.9 vs 17.0 ms at 100k, and no difference at all at 10 million (where the
+random slot access dominates). A 20-30% saving is not worth an answer that is only correct to the
+birthday bound, so there is no unverified mode.
+
+The result is identical to the sort path — same group ids, same group keys, same first-seen dictionary
+order, same null semantics (a null key still forms its own group, id `K`) — which is what
+`Tests/ArrowMetalTests/StringHashTableTests.swift` asserts, case by case, against both the host hash map
+and the old path.
+
+### Measured (M4 Max, 50M rows, 12-byte utf8 keys, best of 5)
+
+Group-by sum over a utf8 key column, key mapping included. Metal from Swift; Polars 1.44 (16 threads),
+pyarrow 25 and the 16-core Swift hash group-by on the same buffers.
+
+| distinct keys | Metal before (sort) | **Metal after (hash table)** | pyarrow | Polars | 16-core CPU |
+|---|---:|---:|---:|---:|---:|
+| 1,000 | 203.3 ms | **20.4** | 58.0 | 208.1 | 117.7 |
+| 100,000 | 231.5 | **27.0** | 194.2 | 221.4 | 303.8 |
+| 10,000,000 | 322.7 | **154.1** | 3387.6 | 751.7 | 2336.1 |
+
+`dictionary_encode` on the same column, which is the mapping plus the first-seen relabel and the gather
+of the distinct strings:
+
+| distinct keys | sort path (old) | **hash table** | pyarrow `dictionary_encode` |
+|---|---:|---:|---:|
+| 1,000 | 275.8 ms | **20.9** | 422.3 |
+| 100,000 | 329.0 | **26.1** | 603.0 |
+| 10,000,000 | 438.9 | **268.1** | 4500.4 |
+
+At a thousand keys the whole table is 4096 slots — 16 KB — so every probe is a cache hit and the pass is
+memory-bound on the key bytes. At ten million the table is 32 M slots (128 MB) and the cost becomes the
+random slot access, which is why the win narrows from 10x to 2x. The 1000- and 100k-key cases are now
+**2.9x and 7.2x faster than pyarrow**, against 5.4x and 1.7x *slower* before, and they cost the CPU about
+4 ms against pyarrow's 700-2000.
+
+Integer, boolean, temporal and dictionary key columns still take the range path (~22 ms at 50M rows);
+they never enter the hash table. `unique` and `value_counts` are not implemented for string columns, so
+there was nothing there to route.
+
 ## Latency (small inputs)
 Measured floor on M4 Max: an empty kernel with encode + commit + wait costs ~116 µs; ten kernels in one
 command buffer cost ~100 µs in total. So the fixed cost is the round trip, not the kernel, and the only lever
@@ -101,6 +175,8 @@ completion).
    group-by over strings maps to the dense-key path.
 6. **Sort / top-k**: radix sort on 32/64-bit keys with payload; argsort for record batches.
 7. **Hash group-by** for arbitrary keys (open addressing in device memory), feeding the same aggregators.
+   Done for `utf8` / `binary` keys (above); the same table would replace the sort for float and
+   wide-range integer keys, which still argsort.
 8. **Float64 sum/arithmetic** on the GPU via double-float (two `float`) arithmetic, or opt-in Float32.
 9. **Binary archives** (`MTLBinaryArchive`) so the first call does not pay ~100 ms of shader compilation.
 10. **Metal 4** command encoding and residency sets for very large resident datasets.

@@ -69,7 +69,12 @@ func cpuSeconds() -> Double {
     return Double(ru.ru_utime.tv_sec) + Double(ru.ru_utime.tv_usec) / 1e6 + Double(ru.ru_stime.tv_sec) + Double(ru.ru_stime.tv_usec) / 1e6
 }
 
+/// `ARROWMETAL_BENCH_ONLY=<substring>` runs only the cases whose section or label contains it, which is
+/// how a single case is measured while tuning a kernel. Unset (the default) runs everything.
+let benchOnly = ProcessInfo.processInfo.environment["ARROWMETAL_BENCH_ONLY"]
+
 func time(_ label: String, bytes: Int, section: String, _ body: () throws -> Void) rethrows {
+    if let only = benchOnly, !section.contains(only), !label.contains(only) { return }
     try body() // warm-up (compiles pipelines)
     var best = Double.infinity
     var bestCPU = Double.infinity
@@ -671,6 +676,7 @@ let gbRows = rows
 let gbAmounts = try colI64.slice(offset: 0, length: gbRows)
 
 for gbDistinct in [1_000, 100_000, 10_000_000] where gbDistinct <= gbRows {
+    if let only = benchOnly, !"group-by sum over \(gbRows) utf8 keys (\(gbDistinct) distinct)".contains(only) { continue }
     let (keyCol, _) = try makeStringKeys(gbRows, distinct: gbDistinct, &g)
     let keyBytes = keyCol.totalBytes + (gbRows + 1) * 4 + gbRows * 8
     sec = "group-by sum over \(gbRows) utf8 keys (\(gbDistinct) distinct)"; print("\n" + sec)
@@ -685,6 +691,14 @@ for gbDistinct in [1_000, 100_000, 10_000_000] where gbDistinct <= gbRows {
     try time("Metal  key mapping only (utf8 -> dense ids)", bytes: keyBytes, section: sec) {
         sink(try GroupByKeys(columns: [.string(keyCol)]).groupCount)
     }
+    // The two utf8 -> dense id strategies side by side: the hash table (shipping, cost scales with the
+    // distinct count) and the argsort of the 64-bit hashes it replaced (cost scales with the row count).
+    try time("Metal  dictionary_encode(utf8), hash table", bytes: keyBytes, section: sec) {
+        sink(try keyCol.dictionaryEncode().unique.length)
+    }
+    try time("Metal  dictionary_encode(utf8), sort path (old)", bytes: keyBytes, section: sec) {
+        sink(try keyCol.dictionaryEncodeSorted().unique.length)
+    }
     time("CPU \(cores)-core hash group-by sum", bytes: keyBytes, section: sec) {
         sink(cpuStringGroupBySum(opaque(keyCol), opaque(gbAmounts)))
     }
@@ -692,6 +706,7 @@ for gbDistinct in [1_000, 100_000, 10_000_000] where gbDistinct <= gbRows {
 }
 
 for gbDistinct in [1_000, 100_000, 10_000_000] where gbDistinct <= gbRows {
+    if let only = benchOnly, !"two int32 columns".contains(only), !"multi-column key fold".contains(only) { continue }
     // Two int32 key columns whose combination has `gbDistinct` distinct values.
     let side = Int32(max(2, Int(Double(gbDistinct).squareRoot().rounded(.up))))
     var ka = [Int32](repeating: 0, count: gbRows), kb = ka

@@ -195,6 +195,13 @@ for gb_distinct in (1_000, 100_000, 10_000_000):
     bench(sec, "pyarrow group_by(utf8)", KB, lambda _t=tbl_k: _t.group_by("k").aggregate([("x", "sum")]))
     print(f"    groups: ArrowMetal {_cached.group_count}, pyarrow {tbl_k.group_by('k').aggregate([]).num_rows}")
 
+    # The stage underneath that group-by, on its own: utf8 -> dense codes plus the distinct values in
+    # first-seen order. ArrowMetal runs the GPU hash table in Kernels/StringHashTable.swift.
+    sec = f"dictionary_encode(utf8) ({gb_distinct} distinct)"
+    print("\n" + sec)
+    bench(sec, "ArrowMetal (GPU hash table)", KB, lambda _g=g_keys: _g.dictionary_encode())
+    bench(sec, "pyarrow dictionary_encode", KB, lambda _a=key_arr: pc.dictionary_encode(_a))
+
     side = max(2, int(np.ceil(np.sqrt(gb_distinct))))
     ka = rng.integers(0, side, size=rows, dtype=np.int32)
     kb = rng.integers(0, side, size=rows, dtype=np.int32)
