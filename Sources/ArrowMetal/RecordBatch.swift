@@ -24,6 +24,8 @@ extension AnyMetalArray {
         case .structure(let a): return a.nullCount
         case .map(let a): return a.nullCount
         case .union(let a): return a.nullCount
+        // Nulls live in the run values; count the rows they cover.
+        case .runEndEncoded(let runEnds, let values): return runEndNullCount(runEnds, values)
         }
     }
 
@@ -50,6 +52,8 @@ extension AnyMetalArray {
         case .structure(let a): return .structure(try a.filter(mask))
         case .map(let a): return .map(try a.filter(mask))
         case .union(let a): return .union(try a.filter(mask))
+        // Run-end encoding is not preserved by selection: decode, then filter.
+        case .runEndEncoded: return try runEndDecode().filter(mask)
         }
     }
 
@@ -75,6 +79,7 @@ extension AnyMetalArray {
         case .structure(let a): return .structure(try a.take(idx))
         case .map(let a): return .map(try a.take(idx))
         case .union(let a): return .union(try a.take(idx))
+        case .runEndEncoded: return try runEndDecode().take(idx)
         }
     }
 
@@ -102,6 +107,7 @@ extension AnyMetalArray {
         case .structure(let a): return .structure(try a.slice(offset: offset, length: length))
         case .map(let a): return .map(try a.slice(offset: offset, length: length))
         case .union(let a): return .union(try a.slice(offset: offset, length: length))
+        case .runEndEncoded: return try runEndDecode().slice(offset: offset, length: length)
         }
     }
 

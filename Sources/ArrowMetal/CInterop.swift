@@ -27,6 +27,9 @@ public enum AnyMetalArray {
     case map(MetalMapArray)
     /// dense or sparse union.
     case union(MetalUnionArray)
+    /// A run-end encoded array ("+r"): `runEnds[j]` is the exclusive end of run `j`, `values[j]` its value.
+    /// Run ends are narrowed to int32 on import, as dictionary indices are.
+    indirect case runEndEncoded(runEnds: MetalArray<Int32>, values: AnyMetalArray)
 
     public var length: Int {
         switch self {
@@ -50,6 +53,7 @@ public enum AnyMetalArray {
         case .structure(let a): return a.length
         case .map(let a): return a.length
         case .union(let a): return a.length
+        case .runEndEncoded(let runEnds, _): return runEndLogicalLength(runEnds)
         }
     }
 
@@ -76,6 +80,7 @@ public enum AnyMetalArray {
         case .structure: return "+s"
         case .map: return "+m"
         case .union(let a): return a.arrowFormat
+        case .runEndEncoded: return "+r"
         }
     }
 }
@@ -116,6 +121,8 @@ public func importArrowArray(schema: UnsafePointer<ArrowSchema>, array: UnsafeMu
     if schema.pointee.dictionary != nil { return try importDictionaryArray(schema: schema, array: array, context: context) }
     // Nested types (list, large_list, fixed_size_list, struct, map, union) recurse through this function.
     if isNestedFormat(fmt) { return try importNestedArray(format: fmt, schema: schema, array: array, context: context) }
+    // Run-end encoded arrays carry their run ends and values as two children.
+    if fmt == "+r" { return try importRunEndArray(schema: schema, array: array, context: context) }
     guard array.pointee.n_children == 0, array.pointee.dictionary == nil else {
         throw ArrowMetalError.unsupportedType("nested/dictionary arrays are not supported (format \(fmt))")
     }
@@ -438,6 +445,7 @@ extension AnyMetalArray {
         case .structure(let a): a.exportArrowArray(into: out)
         case .map(let a): a.exportArrowArray(into: out)
         case .union(let a): a.exportArrowArray(into: out)
+        case .runEndEncoded(let runEnds, let values): exportRunEndArray(runEnds: runEnds, values: values, into: out)
         }
     }
     public func exportArrowDeviceArray(into out: UnsafeMutablePointer<ArrowDeviceArray>) {
@@ -456,6 +464,7 @@ extension AnyMetalArray {
         case .structure(let a): return a.exportArrowSchema(name: name, into: out)
         case .map(let a): return a.exportArrowSchema(name: name, into: out)
         case .union(let a): return a.exportArrowSchema(name: name, into: out)
+        case .runEndEncoded(_, let values): return exportRunEndSchema(values: values, name: name, into: out)
         default: break
         }
         ArrowMetal.exportArrowSchema(format: arrowFormat, name: name, into: out)

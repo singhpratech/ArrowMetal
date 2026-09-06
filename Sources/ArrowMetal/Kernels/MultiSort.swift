@@ -59,7 +59,7 @@ extension AnyMetalArray {
             case .int32(let a): return try a.argsort(descending: descending)
             case .int64(let a): return try a.argsort(descending: descending)
             }
-        case .string, .binary, .dictionary, .decimal, .list, .structure, .map, .union:
+        case .string, .binary, .dictionary, .runEndEncoded, .decimal, .list, .structure, .map, .union:
             throw ArrowMetalError.unsupportedType("sort by \(arrowFormat) is not implemented")
         }
     }
@@ -82,6 +82,7 @@ extension AnyMetalArray {
         case .temporal(let a): return a.context
         case .binary(let a): return a.context
         case .dictionary(let codes, _): return codes.context
+        case .runEndEncoded(let runEnds, _): return runEnds.context
         case .decimal(let a): return a.context
         case .list(let a): return a.context
         case .structure(let a): return a.context

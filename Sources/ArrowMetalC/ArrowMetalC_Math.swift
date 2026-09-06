@@ -104,6 +104,7 @@ private func withMath<R>(_ a: AnyMetalArray, _ body: (any MathOps) throws -> R) 
     case .decimal(let d): throw ArrowMetalError.unsupportedType("\(d.type) columns use am_decimal_op, not this entry point")
     case .list, .structure, .map, .union:
         throw ArrowMetalError.unsupportedType("operation needs a primitive array, got \(a.arrowFormat)")
+    case .runEndEncoded: throw ArrowMetalError.unsupportedType("decode the run-end encoded array first")
     }
 }
 

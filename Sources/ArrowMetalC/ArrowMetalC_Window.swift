@@ -74,7 +74,7 @@ private func withWindow<R>(_ a: AnyMetalArray, _ body: (any WindowOps) throws ->
     case .float32(let x): return try body(x)
     case .float64(let x): return try body(x)
     case .boolean: throw ArrowMetalError.unsupportedType("window functions need a primitive array, got boolean")
-    case .string, .binary, .decimal, .list, .structure, .map, .union:
+    case .string, .binary, .decimal, .list, .structure, .map, .union, .runEndEncoded:
         throw ArrowMetalError.unsupportedType("window functions need a primitive array, got \(a.arrowFormat)")
     case .temporal(let t):
         switch t.storage {
