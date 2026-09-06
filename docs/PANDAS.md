@@ -55,7 +55,7 @@ df.am.query(am.filter(am.col("price") > 100).sum(am.col("size")))   # one fused 
 
 | Method | Notes |
 |---|---|
-| `groupby(by, dropna=True, sort=True, as_index=True).sum/mean/min/max/count(cols)` | one or several key columns of any type |
+| `groupby(by, dropna=True, sort=True, as_index=True).sum/mean/min/max/count(cols)` and `.size()` | one or several key columns of any type |
 | `sort_values(by, ascending)` | one or several columns, per-column direction, stable, nulls last |
 | `filter(mask)` | |
 | `merge(right, on=..., how="inner")` | needs a unique, null-free key on the right frame |
@@ -244,10 +244,69 @@ explicitly or keep `sort_values` out of the accelerated set with `accel.disabled
 
 Measured with `PYTHONPATH=python python Benchmarks/pandas_bench.py <rows> <iters>` on an Apple
 M4 Max, pandas 3.0.5 / pyarrow 25.0.1 / Python 3.13, best of five, on the same in-process frame.
-The accessor and accel rows include the conversion the dtype forces, the GPU work, and the trip back
-into a pandas object — nothing is pre-converted between iterations.
+The accessor and accel rows include the conversion the dtype forces, the map into Metal, the GPU
+work, and the trip back into a pandas object — nothing is pre-converted or cached between
+iterations, so these are the numbers a pandas user actually gets, not kernel times.
 
-<!-- NUMBERS -->
+`routes to` is where accel mode sent the call with the shipped table; the `accessor` column is
+always the GPU, so it also shows what those operations would cost if you routed them.
+
+### Arrow-backed frame (`pd.ArrowDtype`, what `read_parquet(dtype_backend="pyarrow")` gives you)
+
+| Operation | 10M pandas | 10M accessor | 10M accel | 10M accel x | 50M pandas | 50M accessor | 50M accel | 50M accel x | routes to |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `sum` (int64) | 1.0 | 2.4 | 1.0 | 1.01x | 4.9 | 10.5 | 4.8 | 1.02x | pandas |
+| `mean` (float64) | 1.2 | 2.6 | 1.2 | 0.96x | 5.6 | 14.5 | 5.7 | 0.98x | pandas |
+| `s > 0` | 1.5 | 2.6 | 1.4 | 1.14x | 6.4 | 11.1 | 6.5 | 0.99x | pandas |
+| `abs` (float64) | 1.6 | 2.6 | 1.6 | 0.98x | 7.6 | 13.0 | 7.5 | 1.02x | pandas |
+| `round(2)` | 22.3 | 4.1 | 4.9 | **4.55x** | 110.9 | 18.5 | 22.6 | **4.91x** | GPU |
+| `isin` (10 values) | 66.8 | 3.3 | 8.8 | **7.62x** | 337.4 | 13.8 | 39.3 | **8.59x** | GPU |
+| `nunique` | 35.5 | 9.8 | 9.6 | **3.69x** | 176.1 | 18.8 | 19.2 | **9.17x** | GPU |
+| `value_counts` (utf8) | 95.5 | 38.9 | 39.5 | **2.42x** | 476.6 | 157.7 | 170.4 | **2.80x** | GPU |
+| groupby-sum, 1k keys | 99.4 | 15.4 | 15.9 | **6.26x** | 504.3 | 32.4 | 35.6 | **14.18x** | GPU |
+| groupby-sum, 100k keys | 103.0 | 17.7 | 16.4 | **6.26x** | 450.7 | 34.9 | 35.2 | **12.80x** | GPU |
+| `sort_values` (int64) | 392.7 | 69.9 | 62.4 | **6.30x** | 2312.1 | 324.9 | 305.3 | **7.57x** | GPU |
+| `nlargest(100)` | 53.3 | 7.7 | 8.0 | **6.64x** | 264.0 | 28.9 | 29.0 | **9.10x** | GPU |
+| `str.contains` | 97.6 | 3.4 | 3.7 | **26.06x** | 492.6 | 16.3 | 18.8 | **26.22x** | GPU |
+| `df[df.i > 0]` | 58.2 | 35.6 | 30.0 | **1.94x** | 284.6 | 124.6 | 105.2 | **2.71x** | GPU |
+| `merge`, 100k int keys | 233.4 | 37.9 | 38.0 | **6.15x** | 1258.5 | 132.6 | 134.8 | **9.34x** | GPU |
+
+### numpy-backed frame (plain `pd.DataFrame({...})`)
+
+Every column has to be converted to Arrow first, and pandas' numpy kernels are much faster than its
+pyarrow ones, so the same operations win by less — and `round`/`isin` are left to pandas here.
+
+| Operation | 10M pandas | 10M accessor | 10M accel | 10M accel x | 50M pandas | 50M accessor | 50M accel | 50M accel x | routes to |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `sum` (int64) | 1.1 | 2.7 | 1.1 | 1.00x | 5.1 | 11.2 | 5.2 | 0.97x | pandas |
+| `mean` (float64) | 4.1 | 23.3 | 4.1 | 0.99x | 21.1 | 116.3 | 20.6 | 1.02x | pandas |
+| `s > 0` | 1.2 | 3.0 | 1.1 | 1.04x | 5.4 | 12.6 | 5.5 | 0.99x | pandas |
+| `abs` (float64) | 1.5 | 22.7 | 1.5 | 1.00x | 7.4 | 110.8 | 7.3 | 1.01x | pandas |
+| `round(2)` | 4.1 | 25.6 | 4.1 | 0.99x | 20.3 | 120.5 | 20.6 | 0.98x | pandas |
+| `isin` (10 values) | 8.0 | 4.6 | 7.7 | 1.05x | 41.5 | 14.2 | 41.2 | 1.01x | pandas |
+| `nunique` | 16.7 | 9.6 | 9.8 | **1.69x** | 89.8 | 20.3 | 19.0 | **4.72x** | GPU |
+| `value_counts` (utf8) | 91.5 | 43.4 | 43.2 | **2.12x** | 460.6 | 178.1 | 185.1 | **2.49x** | GPU |
+| groupby-sum, 1k keys | 38.7 | 9.4 | 9.3 | **4.16x** | 198.9 | 33.2 | 36.7 | **5.42x** | GPU |
+| groupby-sum, 100k keys | 77.8 | 18.9 | 18.6 | **4.19x** | 362.7 | 40.9 | 36.8 | **9.85x** | GPU |
+| `sort_values` (int64) | 1068.4 | 95.6 | 89.5 | **11.94x** | 6178.0 | 473.1 | 434.6 | **14.22x** | GPU |
+| `nlargest(100)` | 52.3 | 11.3 | 11.1 | **4.73x** | 267.6 | 31.3 | 29.8 | **8.98x** | GPU |
+| `str.contains` | 98.0 | 8.4 | 13.0 | **7.53x** | 520.2 | 32.0 | 56.6 | **9.19x** | GPU |
+| `df[df.i > 0]` | 56.7 | 61.4 | 57.7 | 0.98x | 274.2 | 259.5 | 237.1 | **1.16x** | GPU |
+| `merge`, 100k int keys | 147.6 | 120.5 | 77.6 | **1.90x** | 638.0 | 262.1 | 285.3 | **2.24x** | GPU |
+
+Read it this way: **an Arrow-backed frame is where the GPU pays.** Group-by, sort, top-k, merge and
+string scanning are 6x to 26x on a 50M-row frame with no code change at all; the operations pandas
+already does at memory bandwidth are left alone and cost nothing; and the whole-frame operations
+(`sort_values` on a DataFrame, `df[mask]`, `merge`) carry every column across, which is why they
+land lower than the single-column ones.
+
+Two caveats visible in the numbers. The GPU CPU-ms column (in the benchmark output, not repeated
+here) is roughly a third of the wall time on group-by and sort, so the cores are free while the GPU
+works — a real advantage the wall-clock ratio understates. And a numpy **float** column costs about
+2 ms per million values to convert, because building the validity bitmap from the NaNs is a
+single-threaded pyarrow pass: that is the whole difference between the accessor's 13 ms for `abs` on
+an Arrow-backed 50M-row float column and its 111 ms on the numpy one, and it is why every
+single-pass float operation stays in pandas there.
 
 ## Limits
 
@@ -267,6 +326,14 @@ into a pandas object — nothing is pre-converted between iterations.
 - **Below the threshold nothing is accelerated.** At a million rows most of these operations are
   already sub-millisecond in pandas and the GPU launch cannot pay for itself. The default of two
   million rows is deliberately conservative; lower it if your columns are wide.
+- **Single-pass operations are not accelerated at all**, at any size: `sum`, `min`, `max`, `mean`,
+  `count`, `abs` and the scalar comparisons, plus `round` and `isin` on a numpy-backed column. The
+  measurement and the reasoning are above; `route_all()` overrides it, and the `.am` accessor never
+  applies it.
+- **A numpy float column costs about 2 ms per million values to convert**, because pyarrow builds
+  the validity bitmap from the NaNs in a single-threaded pass. Arrow-backed columns skip it
+  entirely — which is the single biggest thing you can do to make this faster: read your data with
+  `dtype_backend="pyarrow"`.
 - **Install once.** `install()` and `uninstall()` rewrite pandas' method slots. Cycling them a
   hundred-odd times in one process can leave an already-specialized `x[mask]` call site bound to
   whichever `__getitem__` CPython first saw — an interpreter-level artifact of repeatedly rewriting a
