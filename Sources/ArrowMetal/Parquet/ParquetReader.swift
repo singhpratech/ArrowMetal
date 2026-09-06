@@ -78,9 +78,15 @@ extension ParquetFile {
         let wanted = try selectedFields(options.columns)
         var names: [String] = []
         var columns: [AnyMetalArray] = []
-        for f in wanted {
-            names.append(f.name)
-            columns.append(try readField(f, rowGroups: groups, options: options))
+        // One open command buffer for the whole read: the decode is a chain of small kernels per column,
+        // and a command buffer per kernel would spend more time on round trips than on the GPU. The
+        // handful of places that must read a GPU result (a page scan total, an offsets total) flush and
+        // reopen the batch through `MetalContext.syncPoint`.
+        try context.batch {
+            for f in wanted {
+                names.append(f.name)
+                columns.append(try readField(f, rowGroups: groups, options: options))
+            }
         }
         if columns.isEmpty {
             // A projection of no columns still has a row count; expose it as an empty batch.

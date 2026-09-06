@@ -84,10 +84,8 @@ enum Decompress {
         let desc = try blockBuffer(ctx, blocks)
         let status = try MetalArrowBuffer.allocate(byteCount: blocks.count * 4, context: ctx)
         let pso = try ctx.pipeline(source: DecompressSource.source, function: function, cacheKey: "parquet/decompress/\(function)")
-        // 8 SIMD groups per threadgroup, one page each.
-        let simdWidth = 32
-        let perTG = Swift.max(1, 256 / simdWidth)
-        let groups = (blocks.count + perTG - 1) / perTG
+        // One threadgroup per page: thread 0 parses the token stream out of an 8 KB threadgroup-memory
+        // window while all 256 threads move the bytes.
         try ctx.run { enc in
             enc.setComputePipelineState(pso)
             enc.setBuffer(source, offset: sourceOffset, index: 0)
@@ -95,8 +93,8 @@ enum Decompress {
             enc.setBuffer(desc.mtl, offset: desc.offset, index: 2)
             Dispatch.setUInt(enc, blocks.count, index: 3)
             enc.setBuffer(status.mtl, offset: status.offset, index: 4)
-            enc.dispatchThreadgroups(MTLSize(width: groups, height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: perTG * simdWidth, height: 1, depth: 1))
+            enc.dispatchThreadgroups(MTLSize(width: blocks.count, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
         }
         try ctx.syncPoint()
         let st = status.typed(UInt32.self)
