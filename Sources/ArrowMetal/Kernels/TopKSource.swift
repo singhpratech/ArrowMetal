@@ -12,6 +12,11 @@ import Foundation
 /// map `SortSource` uses (with `inv` flipping it for "largest"). Row indices are unique, so the order is
 /// total and the result matches a full stable argsort exactly. The buffer is dynamic threadgroup memory
 /// so that a small k costs a small allocation and keeps occupancy up.
+///
+/// The count of held entries is read once per chunk by thread 0 and broadcast through `shared_c`. Every
+/// thread needs the *same* value: it decides a branch containing `threadgroup_barrier`, and it is the base
+/// of a strided fill whose strides only tile `[c, cap)` when they all start from one `c`. Reading the
+/// atomic per thread does not guarantee that (Round 8 in docs/FINDINGS.md).
 enum TopKSource {
     /// `kind` names the value mapping, `V` is the MSL type of a row, `K` the key type (uint or ulong).
     static func source(kind: String, V: String, K: String) -> String {
@@ -62,12 +67,20 @@ enum TopKSource {
                                 uint lid [[thread_index_in_threadgroup]],
                                 uint tgid [[threadgroup_position_in_grid]]) {
             threadgroup atomic_uint held;
+            // The count every thread works from. Reading `held` per thread is not safe: a relaxed atomic
+            // load is not guaranteed to give every thread the same answer, and this one decides both a
+            // barrier-carrying branch and the range each thread fills. One thread reads it, the rest take
+            // it from here. See the `held` note in docs/FINDINGS.md.
+            threadgroup uint shared_c;
             threadgroup \(K) thrKey;
             threadgroup uint thrRow;
             if (lid == 0u) {
                 atomic_store_explicit(&held, 0u, memory_order_relaxed);
                 thrKey = \(keyMax); thrRow = TK_NOROW;      // nothing held yet: everything beats it
             }
+            // Sentinels everywhere to start: a slot no one writes then reads as "no row" and is dropped by
+            // the host, never as the (key 0, row 0) pair that would sort ahead of every real candidate.
+            for (uint i = lid; i < cap; i += TG) { bufKey[i] = \(keyMax); bufRow[i] = TK_NOROW; }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             uint n = *nPtr;
@@ -75,7 +88,9 @@ enum TopKSource {
             uint end = min(n, start + elemsPerBlock);
             for (uint base = start; base < end; base += TG) {
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                uint c = atomic_load_explicit(&held, memory_order_relaxed);
+                if (lid == 0u) shared_c = min(atomic_load_explicit(&held, memory_order_relaxed), cap);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                uint c = shared_c;
                 if (c + TG > cap) {
                     // Sort the buffer, keep the best k, and tighten the threshold to the k-th best.
                     for (uint i = c + lid; i < cap; i += TG) { bufKey[i] = \(keyMax); bufRow[i] = TK_NOROW; }
@@ -97,7 +112,9 @@ enum TopKSource {
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            uint c = atomic_load_explicit(&held, memory_order_relaxed);
+            if (lid == 0u) shared_c = min(atomic_load_explicit(&held, memory_order_relaxed), cap);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint c = shared_c;
             for (uint i = c + lid; i < cap; i += TG) { bufKey[i] = \(keyMax); bufRow[i] = TK_NOROW; }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             TK_BITONIC

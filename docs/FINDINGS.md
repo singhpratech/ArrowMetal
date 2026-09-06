@@ -80,3 +80,56 @@ Things learned the hard way. Add to this whenever something surprises you.
   types and sizes; descending order must invert keys rather than reverse the ascending result, or ties flip.
 - MurmurHash3 x86_32 reference vectors (seed 0): "" -> 0, "a" -> 0x3c2569b2, "abc" -> 0xb3dd93fa, "hello" -> 0x248bfa47.
   Four collisions among 100k 32-bit hashes is normal (birthday bound), not a bug.
+
+## Round 8 (2026-09-06): a threadgroup atomic read that is not uniform (`top_k`)
+
+**Symptom.** One cell of a 13,000-case differential run diverged and then passed on every rerun:
+`top_k / float64`, 100,003 rows, 30% nulls, k = 17, descending — `result[0]` was row 0 where pyarrow says
+row 35254. A randomised stress against a CPU oracle (`TopKTests.testStressAgainstCPUOracle`) reproduced it
+at roughly 1 in 900 calls across every key type, both directions, n from 32k to 1M and k from 1 to 1024.
+The failure always looked the same: a run of zeros at the front of the result, the true answer after them.
+
+**Root cause.** `topk_select` keeps a per-threadgroup candidate buffer in threadgroup memory with an atomic
+count `held`. Every thread read that count itself:
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint c = atomic_load_explicit(&held, memory_order_relaxed);   // Kernels/TopKSource.swift
+    ...
+    for (uint i = c + lid; i < cap; i += TG) { bufKey[i] = keyMax; bufRow[i] = TK_NOROW; }
+
+`c` bounds the range each thread pads with sentinels, and the union over `lid` covers `[c, cap)` **only if
+every thread has the same `c`**. It does not: on an M4 Max, one simdgroup out of eight occasionally comes
+back with a newer value than the rest — a relaxed atomic load is not ordered by the preceding barrier the
+way a plain threadgroup read is, so it can be satisfied late, after other threads have already run ahead
+and incremented `held`. The threads holding the larger `c` start their stride later and the slots they
+should have covered are never written. Instrumenting the kernel showed 7 to 63 such holes per threadgroup,
+clustered at 32 and 64 — one and two simdgroups.
+
+Those holes hold zeroed pool memory, which reads as `(key 0, row 0)`. That pair is the *minimum* of the
+`(key, row)` order, so the bitonic sort moves it to the front of the buffer and it becomes the block's
+answer; the host then sees row 0 as the top candidate. Worse, if a block accumulates k or more holes the
+compaction sets its threshold to `bufKey[k-1] = (0, 0)`, which nothing can beat, and the block is blind for
+the rest of the scan. The same read also decides `if (c + TG > cap)`, a branch containing
+`threadgroup_barrier`, so a non-uniform `c` was undefined behaviour in its own right.
+
+**Fix.** Thread 0 reads `held` once per chunk into a plain `threadgroup uint shared_c` (clamped to `cap`)
+between two barriers, and every thread takes `c` from there; the branch and the fill ranges are now uniform
+by construction. Belt and braces, the buffer is filled with sentinels once at kernel entry, so a slot no one
+writes reads as "no row" and the host drops it instead of it masquerading as row 0.
+
+**Cost.** One extra `threadgroup_barrier` per 256-row chunk, and one `cap`-element sentinel fill per block
+(2 to 8 strided stores per thread, once). Below the noise floor: `top_k(100 of 20M Int64)` on M4 Max runs
+3.11 / 3.31 / 3.38 ms with the fix against 3.22 / 3.30 / 4.37 ms without it. The pass is still about one
+read per row.
+
+**How it was found.** A stress test comparing against a CPU oracle (not against `argsort`, which shares the
+sort keys) with pool-churning kernels in between; then poisoning the candidate buffers before the dispatch
+to prove the kernel really wrote those zeros rather than leaving stale bytes; then a debug buffer carrying
+each threadgroup's `held`, arrival count and compaction count, which showed the holes were inside `[0, c)`
+and `[c, cap)` in simdgroup-sized runs.
+
+**Rule.** In MSL, never let a value that decides a barrier-carrying branch, or a per-thread loop bound whose
+strides must tile a range, come from a per-thread `atomic_load_explicit(..., memory_order_relaxed)`.
+Broadcast it through a plain threadgroup variable between barriers. The other `atomic_load_explicit` sites
+(`SortSource`, `GroupBySource`, `JoinSource`, `StringExtraSource`) were checked: each reads a slot the
+calling thread owns, so none of them tiles or branches on a shared count.

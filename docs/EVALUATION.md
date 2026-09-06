@@ -246,6 +246,7 @@ assertions, so the suite notices a relapse.
 | `sum`/`mean` over Float32 accumulated in Float32 | they accumulate in double, as Arrow's do | `test_float32_sum_does_not_overflow_before_arrow_does` |
 | Grouped `sum` over UInt64 came back as Int64 | the aggregate keeps the value type | `test_group_by_sum_over_uint64_stays_unsigned` |
 | Float32 comparison treated subnormal operands as zero | comparisons are exact, on bit keys; only arithmetic still flushes | `test_float32_comparison_distinguishes_subnormals_from_zero` |
+| `top_k` put row 0 first about once in 900 calls: every thread read the candidate count from a relaxed threadgroup atomic, one simdgroup could see a newer value, and the sentinel padding then left holes that sorted ahead of the real candidates | the count is broadcast through a plain threadgroup variable between barriers, and the buffer starts full of sentinels | `TopKTests.testStressAgainstCPUOracle` (`ARROWMETAL_STRESS=1` for the long run) |
 
 Four more turned up while closing those, and were fixed here rather than written down:
 
