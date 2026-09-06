@@ -34,6 +34,7 @@ enum GroupOrderSource {
 
     #define MAXK 1024u
     #define NOKEY 0xFFFFFFFFu
+    #define SUBBLOCKS (TG / 32u)
 
     // Resolves row `i` to its group id, or NOKEY when the row takes part in no group.
     inline uint cs_key(device const \(KT)* keys, device const uchar* kvalid, uint flags, uint K, uint i) {
@@ -70,7 +71,9 @@ enum GroupOrderSource {
         }
     }
 
-    // Rows per (block, group), block-major so a block's slice of the table is contiguous.
+    // Rows per (block, group), block-major so a block's slice of the table is contiguous. A "block"
+    // here is one **simdgroup**, not one threadgroup, because the scatter below ranks a row against the
+    // rows of its own block and doing that across 32 lanes instead of 256 is eight times less work.
     kernel void cs_hist_blocks(device const \(KT)* keys [[buffer(0)]],
                                device const uchar* kvalid [[buffer(1)]],
                                constant uint& n [[buffer(2)]],
@@ -78,39 +81,17 @@ enum GroupOrderSource {
                                constant uint& K [[buffer(4)]],
                                constant uint& chunk [[buffer(5)]],
                                device atomic_uint* hist [[buffer(6)]],
-                               uint lid [[thread_index_in_threadgroup]],
-                               uint tgid [[threadgroup_position_in_grid]]) {
-        uint base = tgid * K;
-        uint start = tgid * chunk, end = min(n, start + chunk);
-        for (uint i = start + lid; i < end; i += TG) {
+                               uint tgid [[threadgroup_position_in_grid]],
+                               uint sgid [[simdgroup_index_in_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+        uint lb = tgid * SUBBLOCKS + sgid;
+        uint base = lb * K;
+        uint start = lb * chunk, end = min(n, start + chunk);
+        for (uint i = start + lane; i < end; i += 32u) {
             uint k = cs_key(keys, kvalid, flags, K, i);
             if (k == NOKEY) continue;
             atomic_fetch_add_explicit(&hist[base + k], 1u, memory_order_relaxed);
         }
-    }
-
-    // The same, with the block's table privatised in threadgroup memory (K <= 1024).
-    kernel void cs_hist_blocks_priv(device const \(KT)* keys [[buffer(0)]],
-                                    device const uchar* kvalid [[buffer(1)]],
-                                    constant uint& n [[buffer(2)]],
-                                    constant uint& flags [[buffer(3)]],
-                                    constant uint& K [[buffer(4)]],
-                                    constant uint& chunk [[buffer(5)]],
-                                    device uint* hist [[buffer(6)]],
-                                    uint lid [[thread_index_in_threadgroup]],
-                                    uint tgid [[threadgroup_position_in_grid]]) {
-        threadgroup atomic_uint t[MAXK];
-        for (uint k = lid; k < K; k += TG) atomic_store_explicit(&t[k], 0u, memory_order_relaxed);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        uint start = tgid * chunk, end = min(n, start + chunk);
-        for (uint i = start + lid; i < end; i += TG) {
-            uint k = cs_key(keys, kvalid, flags, K, i);
-            if (k == NOKEY) continue;
-            atomic_fetch_add_explicit(&t[k], 1u, memory_order_relaxed);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        uint base = tgid * K;
-        for (uint k = lid; k < K; k += TG) hist[base + k] = atomic_load_explicit(&t[k], memory_order_relaxed);
     }
 
     // ---------------------------------------------------------------- scan
@@ -161,8 +142,9 @@ enum GroupOrderSource {
     // ---------------------------------------------------------------- scatter
 
     // Stable: a block owns a reserved slice of every group's run and fills it in row order. Within a
-    // sub-chunk of TG rows a thread's rank among the earlier rows of the same group comes from one
-    // sweep of the threadgroup's key array, and the last row of each group advances the cursor.
+    // sub-chunk of 32 rows a lane's rank among the earlier rows of the same group comes from one sweep
+    // of its simdgroup's key array, and the last row of each group advances the cursor. Nothing crosses
+    // simdgroups, so the only synchronisation is a simdgroup barrier.
     kernel void cs_scatter(device const \(KT)* keys [[buffer(0)]],
                            device const uchar* kvalid [[buffer(1)]],
                            constant uint& n [[buffer(2)]],
@@ -171,35 +153,38 @@ enum GroupOrderSource {
                            constant uint& chunk [[buffer(5)]],
                            device uint* cursor [[buffer(6)]],
                            device int* ord [[buffer(7)]],
-                           uint lid [[thread_index_in_threadgroup]],
-                           uint tgid [[threadgroup_position_in_grid]]) {
+                           uint tgid [[threadgroup_position_in_grid]],
+                           uint sgid [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
         threadgroup uint skey[TG];
-        uint base = tgid * K;
-        uint start = tgid * chunk, end = min(n, start + chunk);
-        for (uint c = start; c < end; c += TG) {
-            uint i = c + lid;
+        uint lb = tgid * SUBBLOCKS + sgid;
+        uint base = lb * K, off = sgid * 32u;
+        uint start = lb * chunk, end = min(n, start + chunk);
+        for (uint c = start; c < end; c += 32u) {
+            uint i = c + lane;
             uint k = (i < end) ? cs_key(keys, kvalid, flags, K, i) : NOKEY;
-            skey[lid] = k;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            skey[off + lane] = k;
+            simdgroup_barrier(mem_flags::mem_threadgroup);
             uint pos = 0u;
             bool last = false;
             bool active = (k != NOKEY);
             if (active) {
                 uint rank = 0u;
                 last = true;
-                for (uint j = 0u; j < TG; j++) {
-                    if (skey[j] != k) continue;
-                    if (j < lid) rank++;
-                    else if (j > lid) last = false;
+                for (uint j = 0u; j < 32u; j++) {
+                    uint kj = skey[off + j];
+                    if (kj != k) continue;
+                    if (j < lane) rank++;
+                    else if (j > lane) last = false;
                 }
                 pos = cursor[base + k] + rank;
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
             if (active) {
                 ord[pos] = (int)i;
                 if (last) cursor[base + k] = pos + 1u;
             }
-            threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+            simdgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
         }
     }
 

@@ -29,9 +29,15 @@ extension GroupBy {
             try Dispatch.pipeline(ctx, family: "grouporder", source: src, function: f, type: K.mslType)
         }
         let blocks0 = Swift.max(1, Swift.min(1024, (n + 4095) / 4096))
-        let blockCap = Swift.max(1, GroupOrderSource.chunkedBudget / kc)
-        let blocks = Swift.min(blocks0, blockCap)
-        let chunkedFits = blocks == blocks0 || blocks >= 32
+        // The chunked path partitions the rows one **simdgroup** at a time, so its block count is a
+        // multiple of the simdgroups per threadgroup and its histogram has one row per simdgroup.
+        let sub = Dispatch.threadgroupSize / 32
+        let wanted = Swift.max(sub, Swift.min(2048, (n + 8191) / 8192))
+        var logical = Swift.min(wanted, Swift.max(sub, GroupOrderSource.chunkedBudget / kc))
+        logical = Swift.min(logical, Swift.max(512, (1 << 20) / kc))
+        logical = Swift.max(sub, (logical / sub) * sub)
+        let physical = logical / sub
+        let chunkedFits = logical == wanted || physical >= 8
         // Once runs are short the atomic scatter plus a per-run sort costs less than the chunked
         // scatter's per-row threadgroup sweep, and it does not allocate a per-block histogram at all.
         let atomicFirst = kc > GroupByExtremaSource.maxPrivateKeys && n < kc * 1024
@@ -71,22 +77,23 @@ extension GroupBy {
         }
 
         func runChunked() throws -> GroupSegments {
-            let priv = kc <= GroupByExtremaSource.maxPrivateKeys
-            let histPSO = try pso(priv ? "cs_hist_blocks_priv" : "cs_hist_blocks")
+            let histPSO = try pso("cs_hist_blocks")
             let totalsPSO = try pso("cs_totals"), offPSO = try pso("cs_block_offsets")
             let scatPSO = try pso("cs_scatter")
-            let hist = try MetalArrowBuffer.allocate(byteCount: blocks * kc * 4, zeroed: false, context: ctx)
+            let hist = try MetalArrowBuffer.allocate(byteCount: logical * kc * 4, zeroed: false, context: ctx)
+            let physGrid = MTLSize(width: physical, height: 1, depth: 1)
             try ctx.run { enc in
-                if !priv { zero(enc, hist, blocks * kc); enc.memoryBarrier(scope: .buffers) }
+                zero(enc, hist, logical * kc)
+                enc.memoryBarrier(scope: .buffers)
                 enc.setComputePipelineState(histPSO)
-                bindRows(enc, blocks)
+                bindRows(enc, logical)
                 enc.setBuffer(hist.mtl, offset: 0, index: 6)
-                enc.dispatchThreadgroups(MTLSize(width: blocks, height: 1, depth: 1), threadsPerThreadgroup: tg)
+                enc.dispatchThreadgroups(physGrid, threadsPerThreadgroup: tg)
                 enc.memoryBarrier(scope: .buffers)
                 enc.setComputePipelineState(totalsPSO)
                 enc.setBuffer(hist.mtl, offset: 0, index: 0)
                 Dispatch.setUInt(enc, kc, index: 1)
-                Dispatch.setUInt(enc, blocks, index: 2)
+                Dispatch.setUInt(enc, logical, index: 2)
                 enc.setBuffer(total.mtl, offset: 0, index: 3)
                 Dispatch.dispatch1D(enc, totalsPSO, count: kc)
                 enc.memoryBarrier(scope: .buffers)
@@ -98,14 +105,14 @@ extension GroupBy {
                 enc.setBuffer(hist.mtl, offset: 0, index: 0)
                 enc.setBuffer(segStart.mtl, offset: 0, index: 1)
                 Dispatch.setUInt(enc, kc, index: 2)
-                Dispatch.setUInt(enc, blocks, index: 3)
+                Dispatch.setUInt(enc, logical, index: 3)
                 Dispatch.dispatch1D(enc, offPSO, count: kc)
                 enc.memoryBarrier(scope: .buffers)
                 enc.setComputePipelineState(scatPSO)
-                bindRows(enc, blocks)
+                bindRows(enc, logical)
                 enc.setBuffer(hist.mtl, offset: 0, index: 6)
                 enc.setBuffer(ord.mtl, offset: 0, index: 7)
-                enc.dispatchThreadgroups(MTLSize(width: blocks, height: 1, depth: 1), threadsPerThreadgroup: tg)
+                enc.dispatchThreadgroups(physGrid, threadsPerThreadgroup: tg)
             }
             ctx.retainUntilFlush(keys); ctx.retainUntilFlush(hist)
             try ctx.syncPoint()

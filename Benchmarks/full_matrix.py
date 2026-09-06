@@ -795,35 +795,55 @@ def family_groupby(d, n):
         del ka, kb, df_2, tbl_2, pdf_2
         gc.collect()
 
-    # the remaining grouped aggregates, at 100k groups
-    distinct = 100_000 if n >= 100_000 else 1_000
-    k = d.keys(distinct)
+    # the remaining grouped aggregates, at every cardinality the sum/min/max rows use — these are the
+    # ones the sort-free group-by work is measured by, so they need the same 1k / 100k / 10M sweep.
     fl = d("f64")
-    df = pl.DataFrame({"k": k.p, "x": fl.p})
-    tbl = pa.table({"k": k.a, "x": fl.a})
-    pdf = pd.DataFrame({"k": k.n, "x": fl.d})
-    B = n * 12
-    case(f, f"variance by key ({distinct} groups)", n, B, {
-        "arrowmetal": lambda: am.group_by([k.g]).variance(fl.g, ddof=1),
-        "polars": lambda: df.group_by("k").agg(pl.col("x").var()),
-        "pyarrow": lambda: tbl.group_by("k").aggregate([("x", "variance")]),
-        "pandas": lambda: pdf.groupby("k", sort=False)["x"].var()})
-    case(f, f"count_distinct by key ({distinct} groups)", n, B, {
-        "arrowmetal": lambda: am.group_by([k.g]).count_distinct(fl.g),
-        "polars": lambda: df.group_by("k").agg(pl.col("x").n_unique()),
-        "pyarrow": lambda: tbl.group_by("k").aggregate([("x", "count_distinct")]),
-        "pandas": lambda: pdf.groupby("k", sort=False)["x"].nunique()})
-    case(f, f"first by key ({distinct} groups)", n, B, {
-        "arrowmetal": lambda: am.group_by([k.g]).first(fl.g),
-        "polars": lambda: df.group_by("k").agg(pl.col("x").first()),
-        "pyarrow": lambda: tbl.group_by("k", use_threads=False).aggregate([("x", "first")]),
-        "pandas": lambda: pdf.groupby("k", sort=False)["x"].first()})
-    case(f, f"list by key ({distinct} groups)", n, n * 20, {
-        "arrowmetal": lambda: am.group_by([k.g]).list(fl.g),
-        "polars": lambda: df.group_by("k").agg(pl.col("x")),
-        "pyarrow": lambda: tbl.group_by("k").aggregate([("x", "list")]),
-        "pandas": lambda: pdf.groupby("k", sort=False)["x"].apply(list)},
-        notes={"pandas": "pandas has no vectorised list aggregation; apply(list) is its idiom"})
+    for distinct in (1_000, 100_000, 10_000_000):
+        if distinct > n:
+            continue
+        k = d.keys(distinct)
+        df = pl.DataFrame({"k": k.p, "x": fl.p})
+        tbl = pa.table({"k": k.a, "x": fl.a})
+        pdf = pd.DataFrame({"k": k.n, "x": fl.d})
+        B = n * 12
+        case(f, f"variance by key ({distinct} groups)", n, B, {
+            "arrowmetal": (lambda _k=k: am.group_by([_k.g]).variance(fl.g, ddof=1)),
+            "polars": (lambda _d=df: _d.group_by("k").agg(pl.col("x").var())),
+            "pyarrow": (lambda _t=tbl: _t.group_by("k").aggregate([("x", "variance")])),
+            "pandas": (lambda _p=pdf: _p.groupby("k", sort=False)["x"].var())})
+        case(f, f"stddev by key ({distinct} groups)", n, B, {
+            "arrowmetal": (lambda _k=k: am.group_by([_k.g]).stddev(fl.g, ddof=1)),
+            "polars": (lambda _d=df: _d.group_by("k").agg(pl.col("x").std())),
+            "pyarrow": (lambda _t=tbl: _t.group_by("k").aggregate([("x", "stddev")])),
+            "pandas": (lambda _p=pdf: _p.groupby("k", sort=False)["x"].std())})
+        case(f, f"min by key, float64 ({distinct} groups)", n, B, {
+            "arrowmetal": (lambda _k=k: am.group_by([_k.g]).min(fl.g)),
+            "polars": (lambda _d=df: _d.group_by("k").agg(pl.col("x").min())),
+            "pyarrow": (lambda _t=tbl: _t.group_by("k").aggregate([("x", "min")])),
+            "pandas": (lambda _p=pdf: _p.groupby("k", sort=False)["x"].min())})
+        case(f, f"max by key, float64 ({distinct} groups)", n, B, {
+            "arrowmetal": (lambda _k=k: am.group_by([_k.g]).max(fl.g)),
+            "polars": (lambda _d=df: _d.group_by("k").agg(pl.col("x").max())),
+            "pyarrow": (lambda _t=tbl: _t.group_by("k").aggregate([("x", "max")])),
+            "pandas": (lambda _p=pdf: _p.groupby("k", sort=False)["x"].max())})
+        case(f, f"count_distinct by key ({distinct} groups)", n, B, {
+            "arrowmetal": (lambda _k=k: am.group_by([_k.g]).count_distinct(fl.g)),
+            "polars": (lambda _d=df: _d.group_by("k").agg(pl.col("x").n_unique())),
+            "pyarrow": (lambda _t=tbl: _t.group_by("k").aggregate([("x", "count_distinct")])),
+            "pandas": (lambda _p=pdf: _p.groupby("k", sort=False)["x"].nunique())})
+        case(f, f"first by key ({distinct} groups)", n, B, {
+            "arrowmetal": (lambda _k=k: am.group_by([_k.g]).first(fl.g)),
+            "polars": (lambda _d=df: _d.group_by("k").agg(pl.col("x").first())),
+            "pyarrow": (lambda _t=tbl: _t.group_by("k", use_threads=False).aggregate([("x", "first")])),
+            "pandas": (lambda _p=pdf: _p.groupby("k", sort=False)["x"].first())})
+        case(f, f"list by key ({distinct} groups)", n, n * 20, {
+            "arrowmetal": (lambda _k=k: am.group_by([_k.g]).list(fl.g)),
+            "polars": (lambda _d=df: _d.group_by("k").agg(pl.col("x"))),
+            "pyarrow": (lambda _t=tbl: _t.group_by("k").aggregate([("x", "list")])),
+            "pandas": (lambda _p=pdf: _p.groupby("k", sort=False)["x"].apply(list))},
+            notes={"pandas": "pandas has no vectorised list aggregation; apply(list) is its idiom"})
+        del df, tbl, pdf
+        gc.collect()
 
 
 def family_join(d, n):
@@ -1592,12 +1612,15 @@ CAUSE_HINTS = [
     (lambda fam, op: fam == "nested",
      "Nested kernels are one thread per row over an offsets buffer; the CPU equivalents are often "
      "metadata-only (a zero-copy child view) and so cannot be beaten by any amount of bandwidth."),
-    (lambda fam, op: fam == "group-by" and any(a in op for a in ("min ", "max ", "variance",
-                                                                 "count_distinct", "first ", "list ")),
-     "These aggregates go through `GroupBy.segments()` (Sources/ArrowMetal/Kernels/Segmented.swift), "
-     "which runs a **full stable GPU argsort of the key column** before the segmented reduction. Only "
-     "sum / mean / count take the cheap atomic accumulation path. A segmented min/max and a Welford "
-     "variance over that atomic path would remove the sort."),
+    (lambda fam, op: fam == "group-by" and "count_distinct" in op,
+     "Two full GPU radix sorts: one to dictionary-encode the values, one over the packed `(group, "
+     "code)` int64 to collapse repeats. The CPU libraries keep a hash set per group instead. A "
+     "segmented sort of the values inside each group's counting-sort run, or a per-group hash, is the "
+     "fix; the sort of the key column itself is already gone."),
+    (lambda fam, op: fam == "group-by" and any(a in op for a in ("list ", "quantile", "median")),
+     "The ordering itself is now a counting sort by group id (Sources/ArrowMetal/Kernels/GroupOrder.swift), "
+     "so what is left is the gather that materialises the child column plus, at very high cardinality, "
+     "one threadgroup per group in the run-concatenation kernel."),
     (lambda fam, op: fam == "group-by",
      "The dense key mapping (`am_group_by_keys`) is rebuilt on every call and, at low cardinality, "
      "costs more than the aggregation itself; the CPU libraries' hash table over a thousand keys sits "
@@ -1614,8 +1637,9 @@ CAUSE_HINTS = [
      "per element against one vectorised hardware instruction on the CPU. Compute-bound, not "
      "bandwidth-bound."),
     (lambda fam, op: fam == "group-by" and "10000000 groups" in op,
-     "At 10M groups the group table no longer fits in threadgroup memory and the kernel falls back to "
-     "device atomics, which serialise on contention."),
+     "At 10M groups the per-group table no longer fits in threadgroup memory, so every row's update "
+     "goes to device memory: the table is tens of megabytes and each row touches a random line of it, "
+     "which is a cache miss per row rather than a contended atomic."),
     (lambda fam, op: fam == "decimal",
      "128-bit decimal arithmetic is emulated from 32-bit lanes on the GPU, so each element costs "
      "several instructions where the CPU has native 128-bit adds."),

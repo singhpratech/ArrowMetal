@@ -6,8 +6,8 @@ import Foundation
 /// and `hash_tdigest`.
 ///
 /// Everything grouped here is **segmented**, in the sense `SegmentedSource` established: the rows are
-/// argsorted by group id once, which makes each group one contiguous run, and a threadgroup reduces one
-/// run. That is what makes 64-bit min/max and per-group order statistics possible at all — Metal has no
+/// put in group order once by a counting sort on the group id, which makes each group one contiguous
+/// run, and a threadgroup reduces one run. That is what makes 64-bit min/max and per-group order statistics possible at all — Metal has no
 /// 64-bit atomics, and a median is not an atomic reduction in the first place.
 ///
 /// | kernel | shape |

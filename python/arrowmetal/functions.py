@@ -1565,13 +1565,13 @@ _ROWS = [
      "A segmented multiply reduction. Integers wrap in 64 bits exactly as the scalar `product` does, "
      "and float products reassociate across the threads of a group.",
      _hashk("product"), ((_GKEY_STR, _GVAL_INT), {}), _oracle_hashk("product")),
-    ("hash_stddev", "GroupedAggregations", GPU, "Kernels/GroupByKeys.swift", "group_by(keys).stddev(values, ddof)",
-     "The square root of `hash_variance`, and so carries the same float32 deviations: expect about "
-     "1e-5 relative.", _hashk("stddev"), ((_GKEY_STR, _GVAL_INT), {}), _oracle_hashk("stddev")),
-    ("hash_variance", "GroupedAggregations", GPU, "Kernels/GroupByKeys.swift", "group_by(keys).variance(values, ddof)",
-     "Two GPU passes: per-group means, then the squared deviations. The deviations are formed in "
-     "float32 about a float64 mean, so expect about 1e-5 relative on well-conditioned data rather "
-     "than the 1e-15 of the scalar `variance`.",
+    ("hash_stddev", "GroupedAggregations", GPU, "Kernels/GroupMoments.swift", "group_by(keys).stddev(values, ddof)",
+     "The square root of `hash_variance`, and so carries the same binary64 accuracy.",
+     _hashk("stddev"), ((_GKEY_STR, _GVAL_INT), {}), _oracle_hashk("stddev")),
+    ("hash_variance", "GroupedAggregations", GPU, "Kernels/GroupMoments.swift", "group_by(keys).variance(values, ddof)",
+     "Two GPU passes over the counting-sort order, both in true binary64: an exact per-group mean, "
+     "then the sums of the deviations and their squares about it with the shift correction. About "
+     "1e-16 relative on a float64 column, which is closer to the exact answer than pyarrow's own.",
      _hashk("variance"), ((_GKEY_STR, _GVAL_INT), {}), _oracle_hashk("variance")),
     ("hash_pivot_wider", "GroupedAggregations", GPU, "Kernels/AggregatesExtra.swift",
      "group_by(keys).pivot_wider(pivot_keys, values, names)",
@@ -1580,9 +1580,8 @@ _ROWS = [
      _call_group_pivot, ((_PKEY, _PPIVOT, _PVAL), {"key_names": ["x", "y"]}), _oracle_group_pivot),
     ("hash_kurtosis", "GroupedAggregations", GPU, "Kernels/AggregatesExtra.swift",
      "group_by(keys).kurtosis(values)",
-     "Excess kurtosis, biased, from two GPU passes over the per-group means. Same float32 deviations "
-     "as `hash_variance`, so about 1e-5 relative. A group with too few values is null here where "
-     "pyarrow returns NaN.",
+     "Excess kurtosis, biased, from two GPU passes over the per-group means, in binary64 like "
+     "`hash_variance`. A group with too few values is null here where pyarrow returns NaN.",
      _hashk("kurtosis"), ((_GKEY_STR, _GVAL_INT), {}), _oracle_hashk("kurtosis")),
     ("hash_skew", "GroupedAggregations", GPU, "Kernels/AggregatesExtra.swift", "group_by(keys).skew(values)",
      "The third standardised central moment, biased. Same passes, precision and null-on-degenerate "

@@ -1,10 +1,11 @@
 import Foundation
 import Metal
 
-/// The sorted key order of a `GroupBy` plus `[start, end)` per key.
+/// The group order of a `GroupBy` plus `[start, end)` per key.
 ///
-/// Building it is the expensive part of a segmented aggregate (one argsort of the keys), so it is a
-/// value the caller can hold and pass to several aggregates.
+/// Building it is the expensive part of a segmented aggregate — a counting sort by group id
+/// (`Kernels/GroupOrder.swift`), or the argsort of the keys when neither counting-sort shape fits — so
+/// it is a value the caller can hold and pass to several aggregates. `GroupBy` also caches it.
 public final class GroupSegments {
     /// Row index of each non-null key, ascending by key (stable, so rows inside a group keep their order).
     let ord: MetalArray<Int32>
@@ -22,9 +23,9 @@ public final class GroupSegments {
 /// Sort-based segmented aggregation for `GroupBy`.
 ///
 /// `GroupBy`'s atomic path is bounded by what Metal's atomics can express: 32-bit only, so no 64-bit
-/// min/max and no Float64 values. This path removes atomics from the aggregation entirely. The keys are
-/// argsorted once, which makes every group one contiguous run of the sorted order; a threadgroup then
-/// reduces one run privately and writes a single result. Float64 arithmetic uses the same software
+/// min/max and no Float64 values. This path removes atomics from the aggregation entirely. The rows are
+/// put in group order once (a counting sort by group id), which makes every group one contiguous run; a
+/// threadgroup then reduces one run privately and writes a single result. Float64 arithmetic uses the same software
 /// binary64 implementation as `sum` (`DoubleMath`), so each addition is correctly rounded.
 ///
 /// Nulls follow Arrow: a null key or a key outside `[0, keyCount)` contributes nothing, null values are
