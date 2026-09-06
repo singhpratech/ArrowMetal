@@ -1057,3 +1057,213 @@ def lexsort_indices(columns, descending=None):
     out = _P()
     _check(_lib.am_lexsort(handles, desc, len(cols), ctypes.byref(out)))
     return MetalArray(out)
+
+
+# ---- trigonometry, the remaining boolean operators, float classification, the conditional
+# ---- transforms and a 64-bit value hash. Op numbering is the C ABI contract; see include/arrowmetal.h.
+_lib.am_trig.argtypes = [_P, ctypes.c_int, _P, ctypes.POINTER(_P)]
+_lib.am_trig.restype = ctypes.c_int
+_lib.am_logical.argtypes = [_P, ctypes.c_int, _P, ctypes.POINTER(_P)]
+_lib.am_logical.restype = ctypes.c_int
+_lib.am_float_class.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_float_class.restype = ctypes.c_int
+_lib.am_fill_null_direction.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_fill_null_direction.restype = ctypes.c_int
+_lib.am_case_when.argtypes = [ctypes.POINTER(_P), ctypes.POINTER(_P), ctypes.c_int64, _P, ctypes.POINTER(_P)]
+_lib.am_case_when.restype = ctypes.c_int
+_lib.am_choose.argtypes = [_P, ctypes.POINTER(_P), ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_choose.restype = ctypes.c_int
+_lib.am_replace_with_mask.argtypes = [_P, _P, _P, ctypes.POINTER(_P)]
+_lib.am_replace_with_mask.restype = ctypes.c_int
+_lib.am_indices_nonzero.argtypes = [_P, ctypes.POINTER(_P)]
+_lib.am_indices_nonzero.restype = ctypes.c_int
+_lib.am_hash64.argtypes = [_P, ctypes.POINTER(_P)]
+_lib.am_hash64.restype = ctypes.c_int
+
+_TRIG = {"sin": 0, "cos": 1, "tan": 2, "asin": 3, "acos": 4, "atan": 5,
+         "sinh": 6, "cosh": 7, "tanh": 8, "asinh": 9, "acosh": 10, "atanh": 11,
+         "atan2": 12,
+         "sin_checked": 13, "cos_checked": 14, "tan_checked": 15, "asin_checked": 16,
+         "acos_checked": 17, "acosh_checked": 18, "atanh_checked": 19}
+_LOGICAL = {"xor": 0, "and_not": 1, "and_not_kleene": 2}
+_FLOAT_CLASS = {"is_nan": 0, "is_finite": 1, "is_inf": 2}
+
+
+def _as_metal(x):
+    return x if isinstance(x, MetalArray) else MetalArray.from_arrow(x)
+
+
+def _trig_method(name, doc):
+    op = _TRIG[name]
+
+    def f(self):
+        return _call(_lib.am_trig, self._h, op, None)
+
+    f.__name__ = name
+    f.__doc__ = doc
+    return f
+
+
+# float32 runs Metal's library functions (with the six hyperbolics written out from well-conditioned
+# identities, because Metal's own lose accuracy and get +/-infinity wrong); float64 runs a software
+# binary64 implementation on the GPU, since Metal has no double. Measured against the host libm over a
+# million random arguments per function the worst case is 4 ulp (float32) and 5 ulp (float64).
+for _name in ("sin", "cos", "tan", "asin", "acos", "atan",
+              "sinh", "cosh", "tanh", "asinh", "acosh", "atanh"):
+    setattr(MetalArray, _name, _trig_method(
+        _name, "Arrow `%s`, element-wise on a float32 or float64 column. Null in, null out." % _name))
+
+# Arrow's `_checked` twins: same values, but a domain violation on a non-null row raises instead of
+# returning NaN. asin/acos need |x| <= 1, acosh needs x >= 1, atanh needs |x| < 1, and sin/cos/tan
+# reject +/-infinity. NaN never raises and null rows are never inspected, as in pyarrow.
+for _name in ("sin_checked", "cos_checked", "tan_checked", "asin_checked",
+              "acos_checked", "acosh_checked", "atanh_checked"):
+    setattr(MetalArray, _name, _trig_method(
+        _name, "Arrow `%s`: as %s, but raises on a domain violation." % (_name, _name[:-8])))
+del _name
+
+
+def _am_atan2(self, other):
+    """Arrow `atan2(y, x)` with this column as y: the angle of (x, y) in [-pi, pi].
+
+    `other` may be another column or a scalar (which is broadcast into a column first). Follows the
+    C99 special-value table, including the four +/-0 and four +/-infinity cases."""
+    if not isinstance(other, MetalArray):
+        if hasattr(other, "__arrow_c_array__") or isinstance(other, (pa.Array, pa.ChunkedArray, list)):
+            other = MetalArray.from_arrow(other)
+        else:
+            other = MetalArray.from_arrow(pa.array([other] * len(self), type=self.type))
+    return _call(_lib.am_trig, self._h, _TRIG["atan2"], other._h)
+
+
+MetalArray.atan2 = _am_atan2
+
+
+def _logical_method(name, doc):
+    op = _LOGICAL[name]
+
+    def f(self, other):
+        # Bind the import to a local: a temporary MetalArray would be released before the call.
+        o = _as_metal(other)
+        return _call(_lib.am_logical, self._h, op, o._h)
+
+    f.__name__ = name
+    f.__doc__ = doc
+    return f
+
+
+MetalArray.xor = _logical_method(
+    "xor", "Arrow `xor` over two boolean columns. Nulls propagate (output validity is the AND).")
+MetalArray.and_not = _logical_method(
+    "and_not", "Arrow `and_not`: `a AND NOT b` over two boolean columns. Nulls propagate.")
+MetalArray.and_not_kleene = _logical_method(
+    "and_not_kleene",
+    "Arrow `and_not_kleene`: three-valued `a AND NOT b`. A valid false on the left or a valid true "
+    "on the right gives false even when the other side is null.")
+MetalArray.__xor__ = MetalArray.xor
+
+
+def _float_class_method(name, doc):
+    op = _FLOAT_CLASS[name]
+
+    def f(self):
+        return _call(_lib.am_float_class, self._h, op)
+
+    f.__name__ = name
+    f.__doc__ = doc
+    return f
+
+
+# Arrow defines all three on every numeric type, not only the float ones, and propagates nulls.
+MetalArray.is_nan = _float_class_method(
+    "is_nan", "Arrow `is_nan`. False everywhere on an integer column; null where the input is null.")
+MetalArray.is_finite = _float_class_method(
+    "is_finite", "Arrow `is_finite`. True everywhere on an integer column; null where the input is null.")
+MetalArray.is_inf = _float_class_method(
+    "is_inf", "Arrow `is_inf`. False everywhere on an integer column; null where the input is null.")
+
+
+def _am_fill_null_forward(self):
+    """Arrow `fill_null_forward`: every null takes the value of the nearest non-null element before
+    it. Leading nulls stay null. One GPU max-scan plus a gather."""
+    return _call(_lib.am_fill_null_direction, self._h, 1)
+
+
+def _am_fill_null_backward(self):
+    """Arrow `fill_null_backward`: every null takes the value of the nearest non-null element after
+    it. Trailing nulls stay null."""
+    return _call(_lib.am_fill_null_direction, self._h, 0)
+
+
+MetalArray.fill_null_forward = _am_fill_null_forward
+MetalArray.fill_null_backward = _am_fill_null_backward
+
+
+def case_when(conds, values, default=None):
+    """Arrow `case_when`: each row takes the value of the first condition that is true.
+
+    `conds` are boolean columns and `values` value columns of one type and length, one per condition;
+    `default` (or None, giving nulls) supplies the rows no condition matches. A **null condition
+    counts as false** and the row falls through, which is what Arrow does; a null in the chosen
+    branch's values does make the output null.
+
+        am.case_when([x > 10, x > 5], [big, medium], small)
+    """
+    cs = [_as_metal(c) for c in conds]
+    vs = [_as_metal(v) for v in values]
+    if len(cs) != len(vs) or not cs:
+        raise ArrowMetalError(f"case_when needs one value column per condition, got {len(cs)} and {len(vs)}")
+    ch = (_P * len(cs))(*[c._h for c in cs])
+    vh = (_P * len(vs))(*[v._h for v in vs])
+    out = _P()
+    d = None if default is None else _as_metal(default)
+    _check(_lib.am_case_when(ch, vh, len(cs), None if d is None else d._h, ctypes.byref(out)))
+    return MetalArray(out)
+
+
+def choose(indices, values):
+    """Arrow `choose`: `values[indices[i]][i]`, element-wise.
+
+    `indices` is an int32, int64 or uint32 column; a null index gives a null output, and an index
+    outside `[0, len(values))` raises, as in Arrow."""
+    idx = _as_metal(indices)
+    vs = [_as_metal(v) for v in values]
+    if not vs:
+        raise ArrowMetalError("choose needs at least one value column")
+    vh = (_P * len(vs))(*[v._h for v in vs])
+    out = _P()
+    _check(_lib.am_choose(idx._h, vh, len(vs), ctypes.byref(out)))
+    return MetalArray(out)
+
+
+def _am_replace_with_mask(self, mask, replacements):
+    """Arrow `replace_with_mask`: rows where `mask` is true take the next value from `replacements`,
+    in order; rows where the mask is null become null; every other row keeps its own value.
+
+    `replacements` must hold at least as many elements as the mask has valid trues (fewer raises, a
+    surplus is ignored, both as in pyarrow)."""
+    # Bind the imports to locals: a temporary MetalArray would be released before the call.
+    m, r = _as_metal(mask), _as_metal(replacements)
+    return _call(_lib.am_replace_with_mask, self._h, m._h, r._h)
+
+
+def _am_indices_nonzero(self):
+    """Arrow `indices_nonzero`: the uint64 row numbers where the value is valid and not zero.
+
+    `-0.0` counts as zero and every NaN counts as non-zero, as in Arrow."""
+    return _call(_lib.am_indices_nonzero, self._h)
+
+
+def _am_hash64(self):
+    """A 64-bit hash of every element, as uint64 (an ArrowMetal extension: Arrow has no element-wise
+    hash function).
+
+    MurmurHash3's finaliser over the value's own bytes, seeded with the golden ratio; `-0.0` hashes
+    as `+0.0` and every NaN as one canonical NaN, so Arrow-equal values always hash equal. Nulls hash
+    to 0 and stay null. See include/arrowmetal.h for the exact definition."""
+    return _call(_lib.am_hash64, self._h)
+
+
+MetalArray.replace_with_mask = _am_replace_with_mask
+MetalArray.indices_nonzero = _am_indices_nonzero
+MetalArray.hash64 = _am_hash64
