@@ -20,10 +20,10 @@ them so a claim can be checked in one jump.
 | Comparisons | 8 | 0 | 0 | 0 | 0 | 0 | 8 |
 | Logical | 4 | 0 | 0 | 0 | 0 | 3 | 7 |
 | String predicates | 1 | 0 | 0 | 0 | 0 | 3 | 4 |
-| String transforms | 9 | 0 | 2 | 1 | 0 | 7 | 19 |
-| String containment and matching | 7 | 0 | 0 | 2 | 0 | 1 | 10 |
-| Temporal | 0 | 0 | 0 | 0 | 1 | 5 | 6 |
-| Conversions and casts | 0 | 2 | 2 | 0 | 1 | 1 | 6 |
+| String transforms | 9 | 2 | 2 | 0 | 0 | 7 | 20 |
+| String containment and matching | 7 | 2 | 0 | 0 | 0 | 1 | 10 |
+| Temporal | 2 | 1 | 1 | 0 | 1 | 1 | 6 |
+| Conversions and casts | 0 | 2 | 3 | 0 | 1 | 0 | 6 |
 | Selections | 4 | 0 | 1 | 0 | 0 | 0 | 5 |
 | Containment / set lookup | 2 | 0 | 0 | 0 | 0 | 1 | 3 |
 | Sorts and partitions | 3 | 1 | 1 | 0 | 0 | 2 | 7 |
@@ -31,7 +31,7 @@ them so a claim can be checked in one jump.
 | Associative transforms | 2 | 0 | 0 | 0 | 3 | 0 | 5 |
 | Pairwise and cumulative | 1 | 0 | 1 | 0 | 0 | 3 | 5 |
 | Hashing | 1 | 0 | 0 | 0 | 0 | 1 | 2 |
-| **Total (compute functions)** | **61** | **8** | **24** | **5** | **6** | **55** | **159** |
+| **Total (compute functions)** | **63** | **13** | **26** | **2** | **6** | **50** | **160** |
 | Arrow types (matrix below) | 7 | 0 | 6 | 1 | 6 | 8 | 28 |
 
 Interop uses a separate vocabulary and is counted apart: 6 shipped, 1 partial, 3 planned, 1 in progress
@@ -47,12 +47,12 @@ replace, reverse, join and `ascii_is_*` transforms, and Arrow C Data, C Device a
 of them — over `int8/16/32/64`, `uint8/16/32/64`, `float32`, `float64`, `bool` and `utf8`, null-aware with
 Arrow semantics and checked against a CPU oracle in the test suite.
 
-**The scope it does not claim:** decimals; compute over nested types (lists, structs, maps, unions); regex
-and Unicode-table string work (full case folding beyond Latin-1 Supplement and Latin Extended-A,
-normalisation, Unicode-whitespace trimming, splitting); window and pairwise functions
+**The scope it does not claim:** decimals; compute over nested types (lists, structs, maps, unions);
+Unicode-table string work (full case folding beyond Latin-1 Supplement and Latin Extended-A,
+normalisation, Unicode-whitespace trimming and splitting — the ASCII splits and the regex functions do
+ship, on the CPU); window and pairwise functions
 (`cumulative_sum`/`_min`/`_max` do ship — see Pairwise and cumulative — but `cumulative_prod`,
-`cumulative_mean` and `pairwise_diff` do not); temporal component extraction, temporal arithmetic, timezones and
-`strftime`/`strptime`; statistical aggregates (`stddev`, `variance`, `quantile`, `mode`, `tdigest`);
+`cumulative_mean` and `pairwise_diff` do not); timezones; statistical aggregates (`stddev`, `variance`, `quantile`, `mode`, `tdigest`);
 set lookup over strings; `case_when`, `replace_with_mask` and the forward/backward null fills; checked
 arithmetic and overflow-erroring casts. The long form is at the bottom of this file.
 
@@ -221,7 +221,8 @@ zero-copy and a null row emits no bytes. All of them are reachable from Swift, f
 | `ascii_lower` / `ascii_upper` / `ascii_swapcase` / `ascii_capitalize` | **GPU** | `asciiLower()`, `asciiUpper()`, `asciiSwapcase()`, `asciiCapitalize()`. Byte-wise over `a`–`z` / `A`–`Z`; every other byte, UTF-8 continuation bytes included, is copied through, so the output is always valid UTF-8 and the same length as the input. |
 | `utf8_lower` / `utf8_upper` | **Partial** | `utf8Lower()` / `utf8Upper()`, GPU, **simple (1:1 code point) case mapping over three blocks only**: Basic Latin; Latin-1 Supplement U+00C0–U+00DE and U+00E0–U+00FE minus U+00D7 (×) and U+00F7 (÷), plus U+00FF ↔ U+0178; and Latin Extended-A U+0100–U+017F in its alternating pairs, with U+0130 (İ) → `i`, U+0131 (ı) → `I` and U+017F (ſ) → `S` — three mappings that shrink a string from two bytes to one, which is why the two-pass shape is not optional. Everything above U+017F is copied through byte-for-byte (Greek, Cyrillic, CJK, emoji). The multi-character expansions Arrow's utf8proc applies are **not** implemented: U+00DF (ß → `SS`), U+0149 (ŉ → `ʼN`) and U+00B5 (µ → U+039C) pass through unchanged. Full Unicode case folding stays on the [ROADMAP](../ROADMAP.md#medium-term). |
 | `utf8_capitalize` / `ascii_title` / `utf8_title` | **Not planned** | No roadmap item. `ascii_capitalize` is covered by the row above; the Unicode form needs the same tables `utf8_upper` stops short of, and the title-case functions need word segmentation on top of that. |
-| `replace_substring_regex` / `extract_regex` / `extract_regex_span` | **Planned** | [ROADMAP → Medium term → Strings](../ROADMAP.md#medium-term) lists "regex" as open. Nothing regex-shaped exists today, and a backtracking engine is a poor fit for SIMT — treat this as unclaimed until a design lands. |
+| `replace_substring_regex` / `extract_regex` | **CPU** | `Kernels/Regex.swift`. A backtracking engine is a poor fit for SIMT, so matching runs on the host through `NSRegularExpression` (ICU), sharded over `DispatchQueue.concurrentPerform` chunks of 4096 rows. `replaceSubstringRegex(_:with:maxReplacements:)` falls through to the **GPU** `replaceSubstring` kernel when the pattern has no metacharacter and the template has no `$`. Two documented differences from pyarrow, which uses RE2: the replacement template is ICU's (`$1`, not `\1`), and `extractRegex(_:)` returns a `[String: MetalStringArray]` of the `(?<name>…)` groups rather than a struct array, because ArrowMetal has no struct-typed column. A row that does not match is null in every group. |
+| `extract_regex_span` | **Not planned** | No roadmap item; `extractRegex` returns the matched text, not its offsets. |
 | `ascii_reverse` / `binary_reverse` / `utf8_reverse` | **GPU** | `reverse()` reverses **code points**, not grapheme clusters: a combining mark or a ZWJ emoji sequence comes back in reverse code point order. That is `utf8_reverse`; `binary_reverse` (byte order) is not exposed separately. |
 | `replace_substring` | **GPU** | `replaceSubstring(_:with:maxReplacements:)`, non-overlapping and left to right, `maxReplacements` < 0 meaning all. Byte-wise, so a multi-byte pattern works. An empty pattern is the identity, matching Foundation's `replacingOccurrences(of: "", with:)` rather than Python's insert-everywhere. |
 | `binary_replace_slice` / `utf8_replace_slice` | **Not planned** | No roadmap item; expressible as `sliceCodeunits` + `concat`. |
@@ -233,7 +234,7 @@ zero-copy and a null row emits no bytes. All of them are reachable from Swift, f
 | `binary_repeat` | **GPU** | `repeat(_ n:)`, `n == 0` giving empty strings and `n < 0` raising. |
 | `binary_join_element_wise` | **GPU** | `concat(_:separator:)` over two equal-length arrays, one scalar separator. Validities are ANDed on the GPU, so a null on either side gives a null output — Arrow's default `EMIT_NULL` null handling; the `REPLACE`/`SKIP` options are not implemented. |
 | `binary_join` (list of strings) | **Not planned** | Out of scope for 0.1.0: the input is a list array, which ArrowMetal has no type for. |
-| `split_pattern` / `split_pattern_regex` / `ascii_split_whitespace` / `utf8_split_whitespace` | **Not planned** | No roadmap item; the output is a list array, which ArrowMetal has no type for. |
+| `split_pattern` / `split_pattern_regex` / `ascii_split_whitespace` | **CPU** | `Kernels/Regex.swift`: `splitPattern(_:maxSplits:reverse:)`, `splitPatternRegex(_:maxSplits:)` and `splitWhitespace(maxSplits:reverse:)`. ArrowMetal still has no list type, so the result is the `(offsets, values)` **pair** of an Arrow `list<utf8>` — row `i` owns `values[offsets[i] ..< offsets[i+1]]` — and a null input row owns no pieces. `splitWhitespace` splits on runs of ASCII whitespace and drops the empty pieces at both ends, which is Python's `str.split()`; `maxSplits` keeps the remaining whitespace inside the last piece, as Python does. `utf8_split_whitespace` (Unicode whitespace) is not implemented. |
 | `utf8_normalize` | **Not planned** | Out of scope for a GPU kernel library: full Unicode normalisation tables in MSL buy nothing over the CPU. |
 
 ## String containment and matching
@@ -245,8 +246,8 @@ zero-copy and a null row emits no bytes. All of them are reachable from Swift, f
 | `match_substring` | **GPU** | `contains(_:)`, byte-wise, case-sensitive, no `ignore_case` option. |
 | `starts_with` | **GPU** | `startsWith(_:)`. |
 | `ends_with` | **GPU** | `endsWith(_:)`. |
-| `match_substring_regex` / `match_like` | **Planned** | Regex is listed as open under [ROADMAP → Medium term → Strings](../ROADMAP.md#medium-term). |
-| `count_substring_regex` / `find_substring_regex` | **Planned** | Same roadmap item. |
+| `match_substring_regex` / `match_like` | **CPU** | `Kernels/Regex.swift`: `matchSubstringRegex(_:ignoreCase:)` and `matchLike(_:)`, matched on the host with `NSRegularExpression` over concurrent chunks. Both have a **GPU** fast path: a pattern with no metacharacter (none of `\ . [ ] { } ( ) * + ? ^ $ \|`) routes to the `contains` kernel and `^literal` to `startsWith`, since ICU's `^` is exactly "start of input". A trailing `$` deliberately does not — ICU also matches it before a final line terminator, so `abc$` matches `"abc\n"` while `endsWith("abc")` does not. `match_like` translates `%`/`_` to a `\A…\z`-anchored regex, with `\` escaping a wildcard; a pure prefix, suffix, contains or equality pattern routes to `startsWith`/`endsWith`/`contains`/`equals`, which is exact because SQL `LIKE` anchors to the whole value. |
+| `count_substring_regex` / `find_substring_regex` | **CPU** | Same file and the same sharding. A literal pattern routes to the existing **GPU** `countSubstring` / `findSubstring` kernels. `findSubstringRegex` reports the **byte** offset of the first match, or -1, matching `find_substring`. |
 | `count_substring` | **GPU** | `countSubstring(_:)` → Int32, non-overlapping occurrences, byte-wise and case-sensitive (no `ignore_case`). An empty pattern counts the code point boundaries, `charLength() + 1`, matching Arrow. Nulls propagate. |
 | `find_substring` | **GPU** | `findSubstring(_:)` → Int32, the **byte** offset of the first occurrence or -1 when absent; an empty pattern finds 0. Byte-wise and case-sensitive. Nulls propagate. |
 | `index_in` / `is_in` (strings) | **Not planned** | No roadmap item; see Containment below. |
@@ -255,11 +256,11 @@ zero-copy and a null row emits no bytes. All of them are reachable from Swift, f
 
 | Arrow function group | Status | Notes |
 |---|---|---|
-| Component extraction: `year`, `month`, `day`, `day_of_week`, `day_of_year`, `hour`, `minute`, `second`, `subsecond`, `millisecond`, `microsecond`, `nanosecond`, `quarter`, `week`, `iso_week`, `iso_year`, `iso_calendar`, `us_week`, `us_year`, `year_month_day`, `is_leap_year`, `is_dst` | **Not planned** | No roadmap item. Once temporal types land (below) the existing integer kernels apply to the underlying values, but calendar decomposition itself is unwritten. |
-| Differences: `days_between`, `hours_between`, `minutes_between`, `seconds_between`, `weeks_between`, `months_between`, `quarters_between`, `years_between`, `*_interval_between` | **Not planned** | No roadmap item. |
-| Rounding: `ceil_temporal`, `floor_temporal`, `round_temporal` | **Not planned** | No roadmap item. |
+| Component extraction: `year`, `month`, `day`, `day_of_week`, `hour`, `minute`, `second`, `day_of_year`, `quarter`, `iso_week`, `iso_year`, `is_leap_year`, `millisecond`, `microsecond`, `nanosecond` | **GPU** | `Temporal.swift` decomposes the calendar with Howard Hinnant's `civil_from_days`; `Kernels/TemporalMath.swift` extends it in its own source file with `dayOfYear()`, `quarter()`, `isoWeek()`, `isoYear()`, `isLeapYear()` (a packed boolean bitmap, one 32-bit word per thread) and the three subsecond components. Arrow's nesting for those: `millisecond` counts from the last full second, `microsecond` from the last full millisecond, `nanosecond` from the last full microsecond. UTC only — a timestamp's timezone is metadata and is never applied. `subsecond`, `week`/`us_week`/`us_year`, `iso_calendar`, `year_month_day` and `is_dst` are not implemented. |
+| Differences and arithmetic: `days_between`, `subtract` / `add` over temporal types, `hours_between`, `minutes_between`, `seconds_between`, `weeks_between`, `months_between`, `quarters_between`, `years_between`, `*_interval_between` | **Partial** | `Kernels/TemporalMath.swift`, all GPU: `daysBetween(_:)` floors both sides to their UTC day and returns the int64 day difference; `subtractTemporal(_:)` gives `timestamp − timestamp` (or `duration − duration`, `date32 − date32`, `date64 − date64`) as a `duration` in the finer of the two resolutions; `addDuration(_:)` adds a duration column (rescaled to the receiver's unit) or a scalar of the receiver's own ticks. The other `*_between` functions and calendar-aware `months_between` are not implemented, and `addDuration` is rejected on `date32`, whose tick is a whole day. |
+| Rounding: `ceil_temporal`, `floor_temporal`, `round_temporal` | **GPU** | `Kernels/TemporalMath.swift`: `floorTemporal(to:multiple:)`, `ceilTemporal`, `roundTemporal` over `nanosecond` … `day` (integer arithmetic in the value's own resolution; rounding to a unit finer than the storage is the identity) and `month` / `quarter` / `year` (the civil algorithm and its inverse `days_from_civil`, so it needs a column that carries a date). `ceil` leaves a value already on a boundary alone, which is Arrow's `ceil_is_strictly_greater = false`; `round` sends an exact half **up**, toward +infinity. Checked against Foundation's `Calendar` in UTC over 100k random timestamps in `TextTests`. `calendar_based_origin` and week-based units are not implemented. |
 | Timezones: `assume_timezone`, `local_timestamp` | **Not planned** | Out of scope for a GPU kernel library: the tz database is host data. |
-| `strftime` / `strptime` | **Not planned** | Out of scope: string formatting and parsing against locale/tz data belong on the CPU. |
+| `strftime` / `strptime` | **CPU** | `Kernels/TemporalMath.swift`. Formatting and parsing against calendar data belong on the host, so both go through the C library with a UTC `tm` (`gmtime_r` + `strftime`, `strptime` + `timegm`) rather than a `DateFormatter` Unicode pattern — the format string is a **C strftime/strptime format**, which is what Arrow takes. `%f` is an ArrowMetal extension expanding to the six-digit fractional second. `strptime` must consume the whole value; a row that does not parse comes back null, or throws with `strict: true`. `strptime` is sharded over `DispatchQueue.concurrentPerform`. No locale and no timezone offsets: UTC only. |
 | Temporal **types** (`date32`, `date64`, `time32`, `time64`, `timestamp`, `duration`) | **In progress** | A concurrent branch is adding temporal type import/export and routing them onto the existing fixed-width integer kernels this week. Not in 0.1.0 as published here: `arrowPrimitiveType(forFormat:)` accepts only `c C s S i I l L f g` today. |
 
 ## Conversions and casts
@@ -269,7 +270,7 @@ zero-copy and a null row emits no bytes. All of them are reachable from Swift, f
 | `cast` (numeric → numeric) | **Partial** | `Kernels/Cast.swift`, GPU, across all ten primitives. Unchecked only: integer narrowing wraps and float → int truncates toward zero, which is Arrow's `safe=false`. There is no `safe=true` overflow-erroring cast. |
 | `cast` involving Float64 | **CPU** | `Dispatch.runsOnGPU` excludes `Double`, so any cast with Float64 on either side runs a host loop. Note that Float64 *arithmetic* and *reductions* do run on the GPU — the cast is the exception. |
 | `cast` boolean ↔ integer | **Partial** | `MetalBooleanArray.toUInt8Array()` is a public GPU unpack (bitmap → uint8). The reverse packing exists but is internal. |
-| `cast` string ↔ numeric / temporal | **Not planned** | No roadmap item. |
+| `cast` string ↔ numeric / temporal | **Partial** | `Kernels/StringCast.swift`. **Integer → string** is GPU (`str_itoa_*`, the same two-pass length/bytes shape as the string transforms), exact for `Int64.min` and `UInt64.max`; **string → integer** is GPU (`str_parse_int`, one thread per 32 rows so the validity word needs no atomics), the whole value matching `[+-]?[0-9]+` with leading zeros allowed and everything else — empty, malformed, out of range, a `-` on an unsigned target — becoming null, which is Arrow's `safe=false`; `strict: true` throws instead. **Float and boolean** conversions are CPU: floats format as the shortest decimal string that round-trips, which differs from Arrow in keeping a `.0` on a whole value and using Swift's exponent form, and parse with Swift's `Double`/`Float` initialiser; booleans are `"true"`/`"false"` out and `"true"`/`"false"`/`"1"`/`"0"` case-insensitively in. **Temporal ↔ string** goes through the `strftime` / `strptime` row above. Reachable as `am_to_strings` / `am_parse` in C and `to_strings()` / `cast("string")` / `parse(type)` in Python. Decimal and the checked (`safe=true`) forms are not implemented. |
 | `cast` to/from decimal | **CPU** | `Sources/ArrowMetal/Decimal.swift`, decimal128 only, one host pass each. `toFloat64()` divides the unscaled 128-bit value by 10^scale; `MetalDecimalArray.fromFloat64(_:type:)` multiplies by 10^scale and rounds halves away from zero, turning a non-finite or out-of-range value into null; `fromInt64(_:type:)` multiplies exactly (wrapping past 128 bits). Both directions carry Double's 53 bits of precision, so a cast through float64 is lossy above 2^53 — deliberately host code, since a kernel would buy nothing over the PCIe-free unified memory. `am_decimal_op` ops 16 and 17, `to_float64()` in Python. Decimal ↔ string and decimal ↔ decimal128-with-another-precision are not implemented (use `round`/`ceil`/`floor`/`truncate` to change scale). |
 | `cast` dictionary | **In progress** | Follows the dictionary type work in flight this week. |
 
@@ -379,7 +380,7 @@ outright.
 | `interval` (month, day_time, month_day_nano) | **Not planned** | No roadmap item. |
 | `binary` / `large_binary` | **In progress** | Concurrent branch this week. The `utf8` layout kernels apply unchanged (byte length, equality, prefix/suffix, hash, filter, take); only the importer and the char-length kernel are utf8-specific. |
 | `fixed_size_binary` | **Not planned** | No roadmap item. |
-| `utf8` | **GPU** | Byte/char length, equals/starts_with/ends_with/contains, count_substring/find_substring, murmur3 hash, `dictionary_encode` (GPU), filter, take, C Data import/export, and the transforms that build new string arrays: ASCII and Latin case mapping, trim/ltrim/rtrim, pad, slice, repeat, replace, reverse, element-wise join and the `ascii_is_*` predicates. `dictionary_encode` is CPU. |
+| `utf8` | **GPU** | Byte/char length, equals/starts_with/ends_with/contains, count_substring/find_substring, murmur3 hash, `dictionary_encode` (GPU), filter, take, C Data import/export, and the transforms that build new string arrays: ASCII and Latin case mapping, trim/ltrim/rtrim, pad, slice, repeat, replace, reverse, element-wise join and the `ascii_is_*` predicates, plus GPU integer↔string casts. The regex functions, SQL `LIKE`, splitting and the float/boolean casts are CPU. |
 | `large_utf8` | **Partial** | Import only, and only when the data is under 2 GB: 64-bit offsets are narrowed to int32 in one pass. Exports come back out as `utf8`. |
 | `utf8_view` / `binary_view` | **Planned** | [ROADMAP → Medium term → Strings](../ROADMAP.md#medium-term) lists `utf8_view` as open. |
 | `list` / `large_list` / `fixed_size_list` | **Partial** | `MetalListArray` (`Sources/ArrowMetal/Nested.swift`): C Data import and export of `+l`, `+L` and `+w:N`, `list_value_length` / `list_flatten` / `list_element`, and `filter` / `take` / `slice`. The child is an `AnyMetalArray`, so it may be any supported type including another list, a struct or a map, recursively. Offsets are always int32 in Metal memory: `large_list` offsets are narrowed on import (and come back out as `+l`, as `large_utf8` comes back out as `utf8`), and a `fixed_size_list` materialises the `i * N` offsets its layout implies, so one set of kernels covers all three. `take` recomputes the offsets with the existing GPU scan and expands the selected rows' source ranges into one child index array that the child's own `take` gathers; a `slice` of a variable-length list shares both the offsets buffer and the child. Not implemented: aggregates or arithmetic over list values, `list_parent_indices`, `list_slice`. |
@@ -428,12 +429,13 @@ apply unchanged; they are not part of the claim as published here.
 
 **What it does not claim.** ArrowMetal does not do decimals (`decimal32/64/128/256`); it does not do compute
 over nested types — lists, structs, maps, unions (struct appears only as the record-batch container, and
-there is no compute over struct-typed columns); it does not do regex, full Unicode case folding beyond the
+there is no compute over struct-typed columns); it does not do full Unicode case folding beyond the
 Latin-1 Supplement and Latin Extended-A blocks (the multi-character expansions of ß, ŉ and µ are left
-alone), normalisation, Unicode-whitespace trimming, splitting or any other Unicode-table-driven string
-transform; it does not do window or pairwise functions, and of the cumulative family only `cumulative_sum`,
-`cumulative_min` and `cumulative_max` ship; it does not do temporal component extraction, temporal arithmetic,
-timezones or `strftime`/`strptime`; it does not do statistical aggregates (`stddev`, `variance`, `quantile`,
+alone), normalisation, Unicode-whitespace trimming or Unicode splitting — the regex functions, SQL
+`LIKE` and the ASCII splits do ship, on the CPU behind the same API, with a GPU fast path for patterns
+that are really literals; it does not do window or pairwise functions, and of the cumulative family only `cumulative_sum`,
+`cumulative_min` and `cumulative_max` ship; it does not do
+timezones; it does not do statistical aggregates (`stddev`, `variance`, `quantile`,
 `mode`, `tdigest`, `approximate_median`); it does not do set lookup over strings, nor the structural
 functions it has no kernel for (`case_when`, `choose`, `replace_with_mask`, `fill_null_forward`/`_backward`,
 `is_nan`/`is_finite`/`is_inf`); it does not do checked arithmetic or overflow-erroring casts; and it is not a query planner, a SQL engine or a
