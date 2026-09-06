@@ -32,6 +32,14 @@ enum Decompress {
                       blocks: [PageBlock], outByteCount: Int) throws -> MetalArrowBuffer {
         guard !blocks.isEmpty else { return try MetalArrowBuffer.allocate(byteCount: 1, context: ctx) }
         let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(outByteCount, 1), zeroed: false, context: ctx)
+        try into(ctx, codec: codec, source: source, sourceOffset: sourceOffset, blocks: blocks, out: out)
+        return out
+    }
+
+    /// As `pages`, but into a buffer the caller already owns (so several codecs can share one buffer).
+    static func into(_ ctx: MetalContext, codec: ParquetCodec, source: MTLBuffer, sourceOffset: Int,
+                     blocks: [PageBlock], out: MetalArrowBuffer) throws {
+        guard !blocks.isEmpty else { return }
         switch codec {
         case .uncompressed:
             try gpuCopy(ctx, source: source, sourceOffset: sourceOffset, blocks: blocks, out: out)
@@ -46,7 +54,6 @@ enum Decompress {
         case .lzo:
             throw ParquetError.unsupported("LZO compression")
         }
-        return out
     }
 
     private static func blockBuffer(_ ctx: MetalContext, _ blocks: [PageBlock]) throws -> MetalArrowBuffer {
