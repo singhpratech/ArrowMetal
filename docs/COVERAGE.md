@@ -26,12 +26,12 @@ them so a claim can be checked in one jump.
 | Conversions and casts | 0 | 1 | 2 | 0 | 1 | 2 | 6 |
 | Selections | 3 | 0 | 1 | 0 | 0 | 1 | 5 |
 | Containment / set lookup | 0 | 0 | 0 | 0 | 0 | 3 | 3 |
-| Sorts and partitions | 2 | 1 | 2 | 0 | 0 | 2 | 7 |
+| Sorts and partitions | 3 | 1 | 1 | 0 | 0 | 2 | 7 |
 | Structural and conditional | 0 | 0 | 2 | 0 | 0 | 11 | 13 |
-| Associative transforms | 0 | 1 | 0 | 1 | 3 | 0 | 5 |
+| Associative transforms | 2 | 0 | 0 | 0 | 3 | 0 | 5 |
 | Pairwise and cumulative | 0 | 0 | 0 | 0 | 0 | 5 | 5 |
 | Hashing | 1 | 0 | 0 | 0 | 0 | 1 | 2 |
-| **Total (compute functions)** | **29** | **7** | **15** | **7** | **6** | **87** | **151** |
+| **Total (compute functions)** | **32** | **6** | **14** | **6** | **6** | **87** | **151** |
 | Arrow types (matrix below) | 5 | 0 | 3 | 1 | 6 | 11 | 26 |
 
 Interop uses a separate vocabulary and is counted apart: 6 shipped, 1 partial, 3 planned, 1 in progress
@@ -39,9 +39,10 @@ Interop uses a separate vocabulary and is counted apart: 6 shipped, 1 partial, 3
 
 **The scope ArrowMetal 0.1.0 claims 100% of:** flat analytics on primitive, boolean and string columns —
 `sum`/`min`/`max`/`mean`, the six comparisons, wrapping `add`/`subtract`/`multiply`/`divide`, boolean
-`and`/`or`/`not`, `filter`/`take`/`slice`, numeric `cast`, single-key `sort`/`argsort`/top-k, group-by
-`count`/`sum`/`mean`/`min`/`max` over dense integer keys, `utf8` length/`equals`/`starts_with`/`ends_with`/
-`contains`/murmur3 hash, and Arrow C Data, C Device and C Stream interop for all of them — over `int8/16/32/64`,
+`and`/`or`/`not`, `filter`/`take`/`slice`, numeric `cast`, single-key `sort`/`argsort` and a partial-selection
+top-k, group-by `count`/`sum`/`mean`/`min`/`max` over dense integer keys for every primitive value type,
+`utf8` length/`equals`/`starts_with`/`ends_with`/`contains`/murmur3 hash/`dictionary_encode`, and Arrow
+C Data, C Device and C Stream interop for all of them — over `int8/16/32/64`,
 `uint8/16/32/64`, `float32`, `float64`, `bool` and `utf8`, null-aware with Arrow semantics and checked
 against a CPU oracle in the test suite.
 
@@ -80,7 +81,7 @@ Counts in the summary are counts of **rows**. A row covers one Arrow function un
 | `count` (valid values) | **CPU** | `validCount` = `length - nullCount`; the null count comes from a host popcount over the validity bitmap (`MetalArray.swift`, `Bitmap.popcount`). O(1) once the count is known. |
 | `count_all` (rows) | **CPU** | `length`, O(1) metadata. Inside an open batch, reading it forces a sync point. |
 | `count_distinct` | **Not planned** | No roadmap item. Would follow the numeric `unique` work now in flight. |
-| `any` | **CPU** | `MetalBooleanArray.any` is a host popcount of `values & validity` (`Slice.swift`, `MetalArray.swift`). No GPU kernel despite the README's kernel list. |
+| `any` | **CPU** | `MetalBooleanArray.any` is a host popcount of `values & validity` (`Slice.swift`, `MetalArray.swift`). There is no kernel for it, and the README's kernel list says so. |
 | `all` | **CPU** | As `any`; true for empty and all-null input, matching Arrow's `all` with `skip_nulls`. |
 | `index` | **Not planned** | No roadmap item. |
 | `first` / `last` / `first_last` | **Not planned** | No roadmap item. Element access (`array[i]`) is not the same function — it does not skip nulls. |
@@ -95,17 +96,26 @@ Counts in the summary are counts of **rows**. A row covers one Arrow function un
 
 ## Aggregations — grouped (`hash_*`)
 
-All grouped aggregates go through `GroupBy` (`Kernels/GroupBy.swift`), which takes **dense integer keys in
-`[0, keyCount)`** — the shape a dictionary encoding produces. Keys outside the range and null keys are
-skipped. Privatised threadgroup tables up to 1024 keys, device atomics beyond; 64-bit sums use split 32-bit
-atomics with carry because MSL has no 64-bit atomics.
+All grouped aggregates go through `GroupBy`, which takes **dense integer keys in `[0, keyCount)`** — the
+shape a dictionary encoding produces. Keys outside the range and null keys are skipped. There are two
+implementations behind it.
+
+The **atomic** path (`Kernels/GroupBy.swift`) uses privatised threadgroup tables up to 1024 keys and device
+atomics beyond; 64-bit sums use split 32-bit atomics with carry because MSL has no 64-bit atomics. That is
+also its ceiling: no 64-bit min/max, no Float64 values.
+
+The **segmented** path (`Kernels/Segmented.swift`) removes atomics from the aggregation. It argsorts the
+keys once, which makes each group a contiguous run of the sorted order, then reduces one run per
+threadgroup. `segments()` returns the sorted order so several aggregates share the one sort. It covers
+exactly what the atomic path could not: Float64 sums and means (through the software binary64 adder in
+`Kernels/DoubleMath.swift`), Float32 sums and means accumulated in Float64, and 64-bit min/max.
 
 | Arrow function | Status | Notes |
 |---|---|---|
-| `hash_sum` | **Partial** | GPU, dense integer keys only. Integer values only through `sum`; Float32 through the separate `sumFloat` (which finalises on the host); no Float64. |
-| `hash_mean` | **Partial** | GPU sum + GPU count, divided per key on the host. Integer values only. |
-| `hash_min` | **Partial** | GPU, dense keys, and the value type must be 32-bit or narrower (Int8/16/32, UInt8/16/32, Float32) — 64-bit atomic min/max is not available in MSL. Cast first. |
-| `hash_max` | **Partial** | As `hash_min`. |
+| `hash_sum` | **Partial** | GPU, dense integer keys only — but all value types now. Integers through the atomic `sum`; Float32 through `sumFloat` (Float32 accumulation, host finalise) or `sumFloatAsDouble` (Float64 accumulation, GPU); Float64 through `sumDouble`, which adds with the software binary64 adder on the GPU. |
+| `hash_mean` | **Partial** | GPU, dense keys. Integer values through `mean` (GPU sum + GPU count, host division); Float32 and Float64 through `meanFloat` / `meanDouble`, which sum and divide entirely on the GPU. |
+| `hash_min` | **Partial** | GPU, dense keys, all ten primitive value types. 32-bit and narrower use the atomic `min`; Int64, UInt64 and Float64 use `min64` on the segmented path, since MSL has no 64-bit atomic min/max. `min64` forwards narrower types to `min`, so it is safe to call for any type. |
+| `hash_max` | **Partial** | As `hash_min` (`max` / `max64`). |
 | `hash_count` (valid values per key) | **Partial** | GPU, dense keys. |
 | `hash_count_all` (rows per key) | **Partial** | GPU, dense keys. |
 | `hash_min_max` | **Not planned** | No roadmap item; call `hash_min` and `hash_max`. |
@@ -115,7 +125,7 @@ atomics with carry because MSL has no 64-bit atomics.
 | `hash_count_distinct` / `hash_distinct` | **Not planned** | No roadmap item. |
 | `hash_first` / `hash_last` / `hash_one` / `hash_list` | **Not planned** | No roadmap item. |
 | `hash_approximate_median` / `hash_tdigest` | **Not planned** | No roadmap item. |
-| Group-by over arbitrary (non-dense) keys | **Planned** | [ROADMAP → Medium term → Group-by](../ROADMAP.md#medium-term): "hash group-by for arbitrary keys, 64-bit min/max". Today the caller must dictionary-encode first. |
+| Group-by over arbitrary (non-dense) keys | **Planned** | [ROADMAP → Medium term → Group-by](../ROADMAP.md#medium-term): "hash group-by for arbitrary keys, 64-bit min/max". The 64-bit min/max half of that item is done (`min64` / `max64`); the caller must still dictionary-encode arbitrary keys first, which for `utf8` is now itself a GPU pass. |
 | Hash join (Acero, not a compute function) | **In progress** | A concurrent branch is building a GPU hash join this week. Not in 0.1.0 as published here. |
 
 ## Element-wise arithmetic
@@ -267,7 +277,7 @@ offsets, data bytes. Everything below is byte-wise and case-sensitive.
 | `sort_indices` (multiple sort keys) | **Partial** | One key only. [ROADMAP → Medium term → Sort](../ROADMAP.md#medium-term) lists "multi-column sort keys" as open. |
 | Sorted copy (`sorted()`) and `MetalRecordBatch.sorted(by:)` | **GPU** | Argsort then take. Not an Arrow compute function name, but it is what callers use. |
 | Nulls-last placement in the sorted index array | **CPU** | The radix sort runs on the GPU; the stable partition that moves null rows to the end is a host pass over the index array (`Sort.swift`). |
-| `select_k_unstable` (top-k) | **Partial** | `topK(_:largest:)` is a full GPU argsort followed by a slice — correct, and much more work than a partial selection needs. Single key. |
+| `select_k_unstable` (top-k) | **GPU** | `Kernels/TopK.swift`: for k ≤ 1024 each threadgroup keeps the best k of its own block in threadgroup memory (threshold plus a bitonic compaction), and one radix sort over the `blocks * k` candidates orders the winners. Same total order as `argsort` — value key, ties by row — so the result is index-for-index what the full sort would give. Larger k, and the case where fewer than k rows are non-null, fall back to the argsort-and-slice. Single key. 50M Int64, k=100: 4.0 ms against 128 ms for the full sort. |
 | `partition_nth_indices` | **Not planned** | No roadmap item. |
 | `rank` / `rank_quantile` / `rank_normal` | **Not planned** | No roadmap item. |
 
@@ -293,8 +303,8 @@ offsets, data bytes. Everything below is byte-wise and case-sensitive.
 
 | Arrow function | Status | Notes |
 |---|---|---|
-| `dictionary_encode` (utf8) | **CPU** | `MetalStringArray.dictionaryEncode()` builds the code array with a host hash map over the string bytes and returns dense Int32 codes plus the uniques in first-seen order — exactly the input `GroupBy` wants. Reachable from Swift, the C ABI (`am_str_dictionary_encode`) and Python. |
-| `dictionary_encode` on the GPU | **Planned** | [ROADMAP → Medium term → Strings](../ROADMAP.md#medium-term) lists "GPU dictionary encode" as open. |
+| `dictionary_encode` (utf8) | **GPU** | `Kernels/StringDictionary.swift`. Hash each string, argsort the hashes, mark run boundaries by comparing the full **bytes** of adjacent sorted strings, rank the marks with the same GPU scan `unique()` uses, and gather the dictionary with the string gather. Codes are relabelled into first-seen order, so the result is identical to the host version this replaced — same codes, same dictionary order. Reachable from Swift, the C ABI (`am_str_dictionary_encode`) and Python. 10M strings, 200k distinct: 43 ms against 1.3 s for the host path. |
+| `dictionary_encode` (utf8) collision handling | **GPU** | Rows are grouped by a 64-bit key (two independent murmur3 seeds) and the boundary kernel counts content runs against key runs; equal totals prove every bucket holds one distinct string. A bucket that does not is re-hashed under new seeds, and `MetalStringArray.dictionaryEncodeCPU()` remains as the final fallback, so the result is correct rather than probably correct. |
 | `dictionary_encode` (numeric) | **In progress** | A concurrent branch is adding numeric dictionary encoding this week. Not in 0.1.0 as published here. |
 | `unique` | **In progress** | Same branch: `unique` over numeric columns. |
 | `value_counts` | **In progress** | Same branch: `value_counts` over numeric columns. |
@@ -316,7 +326,7 @@ grouped aggregates, covered above. The row below is an ArrowMetal extension.
 
 | Function | Status | Notes |
 |---|---|---|
-| `hash32` over `utf8` (MurmurHash3 x86_32, seed 0) | **GPU** | `Kernels/StringSource.swift`. Nulls hash to 0 and stay null. Reachable as `am_str_unary(kind: 2)` and `.hash32()` in Python. |
+| `hash32` over `utf8` (MurmurHash3 x86_32, seed 0) | **GPU** | `Kernels/StringSource.swift`. Nulls hash to 0 and stay null. Reachable as `am_str_unary(kind: 2)` and `.hash32()` in Python. A seeded variant is internal to `Kernels/StringDictionary.swift`, which needs two independent hashes. |
 | Hash of primitive values | **Not planned** | No roadmap item; the in-progress hash join will need one and may bring it. |
 
 ## Type matrix
@@ -345,7 +355,7 @@ outright.
 | `interval` (month, day_time, month_day_nano) | **Not planned** | No roadmap item. |
 | `binary` / `large_binary` | **In progress** | Concurrent branch this week. The `utf8` layout kernels apply unchanged (byte length, equality, prefix/suffix, hash, filter, take); only the importer and the char-length kernel are utf8-specific. |
 | `fixed_size_binary` | **Not planned** | No roadmap item. |
-| `utf8` | **GPU** | Byte/char length, equals/starts_with/ends_with/contains, murmur3 hash, filter, take, C Data import/export. `dictionary_encode` is CPU. |
+| `utf8` | **GPU** | Byte/char length, equals/starts_with/ends_with/contains, murmur3 hash, `dictionary_encode`, filter, take, C Data import/export. |
 | `large_utf8` | **Partial** | Import only, and only when the data is under 2 GB: 64-bit offsets are narrowed to int32 in one pass. Exports come back out as `utf8`. |
 | `utf8_view` / `binary_view` | **Planned** | [ROADMAP → Medium term → Strings](../ROADMAP.md#medium-term) lists `utf8_view` as open. |
 | `list` / `large_list` / `fixed_size_list` / `list_view` / `large_list_view` | **Not planned** | Out of scope for 0.1.0: ragged nested data needs a different kernel design, and the flat analytics case is not finished yet. |
@@ -379,8 +389,9 @@ outright.
 `uint8/16/32/64`, `float32`, `float64`, `bool` and `utf8`: the reductions `sum`, `min`, `max`, `mean`; the
 six comparisons against a scalar or another column; wrapping `add`/`subtract`/`multiply`/`divide`; boolean
 `and`/`or`/`not`; `filter` (including a fused predicate form), `take` and `slice`; numeric `cast`;
-single-key `sort`, `argsort` and top-k; group-by `count`/`sum`/`mean`/`min`/`max` over dense integer keys;
-`utf8` byte and character length, `equals`/`starts_with`/`ends_with`/`contains` and murmur3 hash; and Arrow
+single-key `sort`, `argsort` and top-k; group-by `count`/`sum`/`mean`/`min`/`max` over dense integer keys,
+over every primitive value type; `utf8` byte and character length, `equals`/`starts_with`/`ends_with`/
+`contains`, murmur3 hash and `dictionary_encode`; and Arrow
 C Data, C Device and C Stream interop for all of it — every one of them null-aware with Arrow semantics and
 checked element-for-element against a CPU oracle in the test suite. Temporal columns join that sentence when
 the in-progress temporal types land, because they are fixed-width integers underneath and the same kernels

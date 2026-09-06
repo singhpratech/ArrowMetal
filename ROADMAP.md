@@ -19,9 +19,12 @@ Where each item sits against the full Apache Arrow compute and type lists is tra
 ## Medium term
 - [x] **RecordBatch**: multiple columns, struct import/export, C Stream import. Open: C Stream export,
       C Device Stream, nested struct children.
-- [x] **Group-by** over dense keys (sum/count/min/max/mean). Open: hash group-by for arbitrary keys, 64-bit min/max.
-- [x] **Sort / argsort / top-k**: GPU LSD radix sort, stable, nulls last, total order for floats. Open: multi-column sort keys.
-- [x] **Strings** (`utf8`, `large_utf8` import): byte/char length, equals/starts/ends/contains, murmur3 hash, GPU filter/take, dictionary encode (CPU). Open: `utf8_view`, GPU dictionary encode, case folding, regex.
+- [x] **Group-by** over dense keys (sum/count/min/max/mean), atomic tables plus a sort-based segmented path
+      that adds Float64 sums/means and 64-bit min/max. Open: hash group-by for arbitrary keys.
+- [x] **Sort / argsort / top-k**: GPU LSD radix sort, stable, nulls last, total order for floats; top-k is a
+      per-threadgroup selection for k <= 1024. Open: multi-column sort keys, GPU nulls-last partition.
+- [x] **Strings** (`utf8`, `large_utf8` import): byte/char length, equals/starts/ends/contains, murmur3 hash,
+      GPU filter/take, GPU dictionary encode. Open: `utf8_view`, case folding, regex.
 - [ ] **Dictionary-encoded** arrays: compare and filter on codes without decoding.
 - [x] **Batched execution** (`batch { }`, lengths flow on the GPU). In progress: async / completion handlers.: return command buffers or Swift `async` results instead of blocking per kernel; fuse
       kernels into one command buffer; expose `MTLSharedEvent` through `sync_event` in the device interface.

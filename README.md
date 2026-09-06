@@ -164,17 +164,30 @@ and what is not there at all: [docs/COVERAGE.md](docs/COVERAGE.md).
 - `MetalArray<T>` for Int8/16/32/64, UInt8/16/32/64, Float32, Float64; `MetalBooleanArray` with packed bits.
 - `MetalRecordBatch`: named equal-length columns with `filter`, `take`, `slice`, `selecting`.
 - Kernels: `sum`, `min`, `max`, `mean`, `compare` (6 ops, scalar and array), `add/sub/mul/div` (scalar and
-  array, vectorised), `filter` and fused `filter(where:)` (single command buffer, GPU scan), `take`
-  (Int32/Int64/UInt32 indices, bounds checked), `cast`, `slice` (zero-copy when 32-aligned), boolean
-  `and/or/not/count/any/all`. All null-aware with Arrow semantics.
-- `GroupBy` over dense integer keys: `count`, `sum`, `mean`, `min`, `max` (privatised threadgroup tables for
-  up to 1024 keys, device atomics beyond; 64-bit sums via split 32-bit atomics with carry).
+  array, vectorised — integer division by zero is **defined as 0** here rather than raising, matching the
+  CPU oracle but not Arrow's `divide`), `filter` and fused `filter(where:)` (single command buffer, GPU
+  scan), `take` (Int32/Int64/UInt32 indices, bounds checked), `cast` (GPU across the ten primitives, but a
+  cast with Float64 on either side runs on the host), `slice` (zero-copy when 32-aligned), boolean
+  `and/or/not`. All null-aware with Arrow semantics. Boolean `count`/`any`/`all` are host popcounts over
+  the bitmap, not kernels.
+- Single-key `sort`/`argsort` (GPU LSD radix) and `topK` (GPU per-threadgroup selection for k ≤ 1024, a
+  full argsort above that). The stable partition that moves null rows to the end of a sorted index array
+  is a host pass.
+- `GroupBy` over dense integer keys, in two forms. Atomic tables (privatised in threadgroup memory up to
+  1024 keys, device atomics beyond; 64-bit sums via split 32-bit atomics with carry): `count`, `sum`,
+  `mean`, `min`, `max` — 32-bit-or-narrower values only for min/max, and integer values only for `sum`
+  and `mean`, because Metal's atomics are 32-bit. A sort-based segmented path with no atomics at all
+  (`segments()` once, then any number of aggregates): `sumDouble`, `meanDouble`, `sumFloatAsDouble`,
+  `meanFloat`, and `min64`/`max64` over Int64/UInt64/Float64.
+- `dictionaryEncode` for `utf8` on the GPU: hash, argsort, byte-comparing run boundaries, GPU rank scan
+  and gather; dense Int32 codes plus the dictionary in first-seen order, ready for `GroupBy`.
 - `libArrowMetalC`: a C ABI over everything above, and a ctypes Python package that speaks the Arrow
   PyCapsule protocol.
 - Float64 on the GPU even though Metal has no `double`: compare, min, max, filter, take and slice use an
-  order-preserving map of the IEEE bit pattern; sum, add, subtract, multiply and divide use a software
-  IEEE-754 binary64 implementation on 64-bit integers that is correctly rounded (bit-exact against Swift's
-  `Double` over millions of random and edge-case inputs, subnormals and NaN included).
+  order-preserving map of the IEEE bit pattern; sum, add, subtract, multiply, divide and the segmented
+  group-by sums and means use a software IEEE-754 binary64 implementation on 64-bit integers that is
+  correctly rounded (bit-exact against Swift's `Double` over millions of random and edge-case inputs,
+  subnormals and NaN included). `cast` is the exception: with Float64 on either side it runs on the host.
 - NaN: `min`/`max` skip NaN and return null if only NaN remains; `sum` propagates NaN; comparisons follow IEEE.
 - C Data Interface import/export for primitive arrays and struct (`+s`) record batches, C Stream Interface
   import, C Device Data Interface import/export, `MTLBuffer` recovery from our own exports.

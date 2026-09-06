@@ -78,6 +78,86 @@ final class StringTests: XCTestCase {
         XCTAssertEqual(sums[0], 0)
     }
 
+    // MARK: - GPU dictionary encoding
+
+    /// Same grouping as the host oracle: same decoded string per row, same partition of rows into
+    /// groups, and (because the GPU path relabels into first-seen order) the very same codes.
+    private func checkDictionaryEncode(_ strings: [String?], file: StaticString = #filePath, line: UInt = #line) throws {
+        let a = try MetalStringArray(strings)
+        let (codes, unique) = try a.dictionaryEncodeGPU()
+        let (refCodes, refUnique) = try a.dictionaryEncodeCPU()
+        let u = unique.toArray(), ru = refUnique.toArray()
+        XCTAssertEqual(unique.nullCount, 0, "dictionary carries no nulls", file: file, line: line)
+        XCTAssertEqual(Set(u.map { $0! }).count, u.count, "dictionary is distinct", file: file, line: line)
+        // Every row decodes to itself, which is the property that actually matters.
+        let decoded = codes.toArray().map { $0.map { u[Int($0)]! } }
+        XCTAssertEqual(decoded, strings, "decoded rows", file: file, line: line)
+        // Same partition of rows into groups as the oracle, and in fact the same labels.
+        XCTAssertEqual(codes.toArray(), refCodes.toArray(), "codes", file: file, line: line)
+        XCTAssertEqual(u, ru, "dictionary order", file: file, line: line)
+    }
+
+    func testDictionaryEncodeGPUMatchesHost() throws {
+        try requireRealGPU()
+        var rng = SystemRandomNumberGenerator()
+        try checkDictionaryEncode(sample)
+        try checkDictionaryEncode([])
+        try checkDictionaryEncode([nil, nil, nil])
+        try checkDictionaryEncode(["only"])
+        try checkDictionaryEncode([""])
+        try checkDictionaryEncode(["", nil, "", "x", ""])
+        try checkDictionaryEncode((0..<5000).map { "v\($0)" })                      // all distinct
+        try checkDictionaryEncode((0..<5000).map { _ in "same" })                    // all identical
+        try checkDictionaryEncode((0..<200_003).map { i in
+            i % 23 == 0 ? nil : "k-\(Int.random(in: 0..<3000, using: &rng))-\(String(repeating: "y", count: i % 5))"
+        })
+    }
+
+    /// Two different strings that really do share a MurmurHash3 x86_32 seed-0 hash, found by search.
+    /// They must still land in different dictionary entries, interleaved or not.
+    func testDictionaryEncodeSurvivesRealHashCollision() throws {
+        try requireRealGPU()
+        let candidates = (0..<400_000).map { "c\($0)" }
+        let hashes = try MetalStringArray(candidates).hash32().toRawArray()
+        var seen: [UInt32: String] = [:]
+        var pair: (String, String)? = nil
+        for (i, h) in hashes.enumerated() {
+            if let prev = seen[h], prev != candidates[i] { pair = (prev, candidates[i]); break }
+            seen[h] = candidates[i]
+        }
+        let (x, y) = try XCTUnwrap(pair, "no murmur3 seed-0 collision found among 400k candidates")
+        XCTAssertEqual(try MetalStringArray([x]).hash32().toRawArray()[0], try MetalStringArray([y]).hash32().toRawArray()[0])
+        XCTAssertNotEqual(x, y)
+        // Interleaved, which is the arrangement a hash-only grouping would get wrong.
+        var interleaved: [String?] = []
+        for i in 0..<2000 { interleaved.append(i % 2 == 0 ? x : y) }
+        interleaved.insert(nil, at: 17)
+        try checkDictionaryEncode(interleaved)
+        try checkDictionaryEncode([x, y, x, "z", y, x])
+        // And mixed into a large column.
+        try checkDictionaryEncode((0..<100_000).map { i in i % 7 == 0 ? x : (i % 7 == 1 ? y : "f\(i % 500)") })
+    }
+
+    /// The collision detector itself: hand `encode` a key that deliberately puts distinct strings in one
+    /// bucket and it must decline rather than emit wrong codes. This is the path a real 64-bit collision
+    /// would take, and the reason `dictionaryEncode` is correct rather than merely probably correct.
+    func testDictionaryEncodeRejectsCollidingKeys() throws {
+        try requireRealGPU()
+        let strings: [String?] = ["a", "b", "a", "b", "c", nil, "a"]
+        let a = try MetalStringArray(strings)
+        let allSame = try MetalArray<UInt64>(strings.map { $0 == nil ? nil : UInt64(0) })
+        XCTAssertNil(try a.encode(keys: allSame), "one bucket for three distinct strings must be rejected")
+        // A key that is faithful (equal strings share it, distinct strings do not) is accepted, and the
+        // codes it produces are the oracle's.
+        let faithful = try MetalArray<UInt64>(strings.map { s in s.map { UInt64($0.utf8.first ?? 0) } })
+        let ok = try XCTUnwrap(try a.encode(keys: faithful))
+        XCTAssertEqual(ok.codes.toArray(), try a.dictionaryEncodeCPU().codes.toArray())
+        XCTAssertEqual(ok.unique.toArray(), ["a", "b", "c"])
+        // Every row identical: a single bucket is correct here, so it is accepted.
+        let same = try MetalStringArray(["q", "q", "q"])
+        XCTAssertNotNil(try same.encode(keys: try MetalArray<UInt64>([0, 0, 0])))
+    }
+
     func testScan() throws {
         try requireRealGPU()
         for n in [0, 1, 255, 256, 257, 70_000, 1_000_001] {
