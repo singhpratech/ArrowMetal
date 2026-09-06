@@ -166,8 +166,8 @@ int  am_or_kleene(am_array* a, am_array* b, am_array** out);
 // (pyarrow's `sign` normalises -0.0 to 0.0 and narrows an integer column to int8; these keep the column's
 // own type at every width.) On float32, `sign` and 8-11 read the bit pattern rather than comparing, so a
 // subnormal operand is not flushed: sign(1.4e-45) is 1, ceil(1.4e-45) is 1.0 and round(-0.4) is -0.0.
-// On float64, ops 0-2 and 8-11 are exact (bit-pattern kernels); 3-7 are evaluated in float and widened,
-// so expect about 7 correct significant decimal digits.
+// On float64, ops 0-2 and 8-11 are exact (bit-pattern kernels), op 3 (`sqrt`) is correctly rounded, and
+// ops 4-7 run in software binary64 within 1 ulp of libm (measured over 10^6 inputs per function).
 int  am_unary(am_array* a, int op, am_array** out);
 
 // am_binary op numbering:
@@ -181,8 +181,9 @@ int  am_unary(am_array* a, int op, am_array** out);
 // Element-wise min/max skip NaN and break a ±0 tie the way fmin/fmax do: min keeps -0.0 and max keeps 0.0,
 // whichever side it came from, so the pair is commutative.
 // `modulo` is C remainder (the sign follows the dividend) and defines x % 0 as 0, as `divide` does;
-// `power` uses repeated squaring on integers, wraps, and defines a negative exponent as 0. `power` and
-// `modulo` are not implemented for float64. Ops 0-6 propagate nulls; 7 and 8 skip them, so a null on one
+// `power` uses repeated squaring on integers, wraps, and defines a negative exponent as 0; on float64 it
+// is software binary64, within 1 ulp of libm and matching C99's edge table exactly. `modulo` is still not
+// implemented for float64. Ops 0-6 propagate nulls; 7 and 8 skip them, so a null on one
 // side yields the other side's value and only two nulls make a null.
 int  am_binary(am_array* a, int op, am_array* b /* or NULL */, const void* scalar /* or NULL */, am_array** out);
 
@@ -1067,10 +1068,9 @@ int  am_cumulative_checked(am_array* a, int op, int64_t p1, am_array** out);
 // Taylor series near zero -- the usual (exp(x)-1)*x/log(exp(x)) repair is unusable because the Metal
 // front end folds log(exp(x)) back to x. float64 runs entirely in software binary64 -- a natural log by
 // argument reduction plus an atanh series, exp by argument reduction against a 107-bit ln 2 plus a
-// Taylor series, sqrt by Newton refinement of a float seed. Measured against Foundation over 10^6
-// random inputs: expm1 and logb within 2 ulp, log1p and hypot within 1 ulp. That makes these four
-// considerably more accurate on float64 than am_unary's sqrt/exp/ln/log2/log10, which still take the
-// float detour (about 7 significant digits).
+// Taylor series, sqrt by digit-by-digit extraction (correctly rounded). Measured against Foundation
+// over 10^6 random inputs: expm1 and logb within 2 ulp, log1p and hypot within 1 ulp. am_unary's
+// sqrt/exp/ln/log2/log10 and am_binary's power are software binary64 too, and no less accurate.
 int  am_math_extra(am_array* a, int op, am_array* b /* or NULL */, const void* scalar /* or NULL */,
                    int64_t p1, am_array** out);
 

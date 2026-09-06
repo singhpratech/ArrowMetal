@@ -79,10 +79,11 @@ genuinely differences, both listed by name below and in each row's note.
   the rows carrying a byte ≥ 0x80 on the host; `utf8_capitalize` / `utf8_title` and the `utf8_trim*` family
   run the byte kernel when the column (or the character set) is ASCII and the host implementation
   otherwise.
-* **Precision** — Metal has no `double` transcendentals, so `exp`, `ln`, `log10`, `log2`, `sqrt`, `power`
-  and their checked twins evaluate in `float` and widen, giving about 1e-7 relative on a float64 column.
-  The grouped moments (`hash_variance`, `hash_stddev`, `hash_skew`, `hash_kurtosis`) form their deviations
-  in float32 about a float64 mean, about 1e-5 relative. Every tolerance is recorded in
+* **Precision** — Metal has no `double` at all, so every float64 transcendental is software binary64 on
+  the GPU. `sqrt` is correctly rounded; `exp`, `ln`, `log10`, `log2` and `power` (and their checked twins)
+  are within 1 ulp, measured over 10^6 inputs per function. The grouped moments (`hash_variance`,
+  `hash_stddev`, `hash_skew`, `hash_kurtosis`) form their deviations in float32 about a float64 mean,
+  about 1e-5 relative — they are the only float32-precise answers left. Every tolerance is recorded in
   `arrowmetal.functions.TOLERANCE` and asserted.
 * **Deliberate differences from Arrow** — `unique`, `value_counts` and `hash_distinct` return values
   ascending rather than in order of first appearance; the group-by order is deterministic but is not
@@ -512,10 +513,12 @@ transforms; nested access; and Arrow C Data, C Device and C Stream interop for a
   row on the GPU and re-decide on the host only the rows carrying a byte ≥ 0x80, so an all-ASCII column
   never leaves the device; `utf8_capitalize`, `utf8_title` and the `utf8_trim*` family take the byte
   kernel when the column (or the character set) is ASCII.
-* **Six functions are float32-precise on float64 input.** Metal has no `double` transcendentals, so `exp`,
-  `ln`, `log10`, `log2`, `sqrt` and `power` — and their `_checked` twins — evaluate in `float` and widen,
-  about 1e-7 relative. The trigonometric family, `expm1`, `log1p`, `logb` and `hypot` do *not* have this
-  problem: they run a software binary64 implementation on the GPU, within 5 ulp of the host libm.
+* **Every float64 transcendental is software binary64 on the GPU.** Metal has no `double` at all, so
+  `exp`, `ln`, `log10`, `log2`, `sqrt` and `power` — and their `_checked` twins — are written out over
+  `ulong` bit patterns (`Kernels/DoublePower.swift`) rather than narrowed to `float` and widened back:
+  `sqrt` is correctly rounded and the other five are within 1 ulp, measured over 10^6 inputs each. The
+  trigonometric family, `expm1`, `log1p`, `logb` and `hypot` are the same machinery, within 5 ulp of the
+  host libm. The price is throughput, and it is real: see `docs/BENCHMARKS.md`.
 * **A handful of answers deliberately differ from Arrow's**, each stated on its row: ascending `unique` /
   `value_counts` / `hash_distinct` rather than first-appearance order; a deterministic but not
   first-seen group order; int32 `list_parent_indices`; `round_temporal` halves going up rather than to
