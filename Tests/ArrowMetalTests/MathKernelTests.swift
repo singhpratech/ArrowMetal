@@ -572,7 +572,8 @@ final class MathKernelTests: XCTestCase {
         XCTAssertThrowsError(try i.ln(), "ln needs a float column")
         XCTAssertThrowsError(try i.exp(), "exp needs a float column")
         let d = try MetalArray<Double>([1, 2, 3])
-        XCTAssertThrowsError(try d.power(2), "float64 power is not implemented")
+        // float64 power is software binary64 on the GPU since the DoublePower work; it must not throw.
+        XCTAssertEqual(try d.power(2).toArray(), [1, 4, 9])
         XCTAssertThrowsError(try d.modulo(2), "float64 modulo is not implemented")
         XCTAssertThrowsError(try i.binaryMath(.minElementWise, 3), "min_element_wise has no scalar form")
         XCTAssertThrowsError(try i.bitwise(.and, try MetalArray<Int32>([1, 2])), "length mismatch")
