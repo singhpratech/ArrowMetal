@@ -77,7 +77,14 @@ private func withStructural<R>(_ a: AnyMetalArray, _ body: (any StructuralCOps) 
     case .float32(let x): return try body(x)
     case .float64(let x): return try body(x)
     case .boolean: throw ArrowMetalError.unsupportedType("operation needs a primitive array, got boolean")
-    case .string: throw ArrowMetalError.unsupportedType("operation needs a primitive array, got utf8")
+    case .string, .binary: throw ArrowMetalError.unsupportedType("operation needs a primitive array, got \(a.arrowFormat)")
+    case .temporal(let t):
+        // Temporal columns are integers underneath; run the structural op on the storage.
+        switch t.storage {
+        case .int32(let x): return try body(x)
+        case .int64(let x): return try body(x)
+        }
+    case .dictionary: throw ArrowMetalError.unsupportedType("decode the dictionary array first")
     }
 }
 
