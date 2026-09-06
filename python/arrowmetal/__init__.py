@@ -3824,6 +3824,7 @@ _lazy_module._bind({
     "pa": pa,
     "ArrowMetalError": ArrowMetalError,
     "query_columns": _query_columns,
+    "as_pa_array": _as_pa_array,
 })
 
 LazyFrame = _lazy_module.LazyFrame
