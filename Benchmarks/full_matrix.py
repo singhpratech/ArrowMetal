@@ -1024,6 +1024,17 @@ def family_temporal(d, n):
         "polars": lambda: ts.p.dt.strftime("%Y-%m-%d"),
         "pyarrow": lambda: pc.strftime(ts.a, format="%Y-%m-%d"),
         "pandas": lambda: pdt.dt.strftime("%Y-%m-%d")})
+    # strptime is fed ArrowMetal's own strftime output: pyarrow's strftime folds the fractional second
+    # into %S, and none of the three CPU libraries will then parse "%Y-%m-%d %H:%M:%S" back.
+    stamps = ts.g.strftime("%Y-%m-%d %H:%M:%S").to_arrow()
+    st_g = am.MetalArray.from_arrow(stamps)
+    st_p = pl.Series(stamps)
+    st_d = stamps.to_pandas()
+    case(f, "strptime (%Y-%m-%d %H:%M:%S)", n, n * 28, {
+        "arrowmetal": lambda: st_g.strptime("%Y-%m-%d %H:%M:%S"),
+        "polars": lambda: st_p.str.strptime(pl.Datetime("us"), "%Y-%m-%d %H:%M:%S"),
+        "pyarrow": lambda: pc.strptime(stamps, format="%Y-%m-%d %H:%M:%S", unit="us"),
+        "pandas": lambda: pd.to_datetime(st_d, format="%Y-%m-%d %H:%M:%S")})
     case(f, "assume_timezone (America/New_York)", n, n * 16, {
         "arrowmetal": lambda: ts.g.assume_timezone("America/New_York", ambiguous="earliest",
                                                    nonexistent="latest"),
@@ -1033,6 +1044,24 @@ def family_temporal(d, n):
                                               nonexistent="latest"),
         "pandas": lambda: pdt.dt.tz_localize("America/New_York", ambiguous=True,
                                              nonexistent="shift_forward")})
+    # The tz-aware column the next two rows read; every library gets the same values.
+    aware = ts.a.cast(pa.timestamp("us", "America/New_York"))
+    aw_g = am.MetalArray.from_arrow(aware)
+    aw_p = pl.Series(aware)
+    aw_d = aware.to_pandas()
+    case(f, "local_timestamp (America/New_York)", n, n * 16, {
+        "arrowmetal": lambda: aw_g.local_timestamp(),
+        "polars": lambda: aw_p.dt.replace_time_zone(None),
+        "pyarrow": lambda: pc.local_timestamp(aware),
+        "pandas": lambda: aw_d.dt.tz_localize(None)},
+        notes={"polars": "replace_time_zone(None) keeps the wall clock, which is local_timestamp"})
+    case(f, "is_dst (America/New_York)", n, n * 9, {
+        "arrowmetal": lambda: aw_g.is_dst(),
+        "polars": lambda: aw_p.dt.dst_offset(),
+        "pyarrow": lambda: pc.is_dst(aware),
+        "pandas": None},
+        notes={"polars": "no is_dst; dst_offset is the same tz lookup",
+               "pandas": "no vectorised is_dst on a tz-aware Series"})
 
 
 def family_window(d, n):
@@ -1569,8 +1598,14 @@ CAUSE_HINTS = [
      "everything else is NSRegularExpression row by row across 4096-row chunks."),
     (lambda fam, op: fam == "strings" and "replace" in op,
      "Variable-length output: the kernel measures every row's new length, prefix-sums, then writes."),
-    (lambda fam, op: fam == "temporal" and ("strftime" in op or "timezone" in op),
-     "Documented host path: strftime and the tz database are CPU-side (`assume_timezone` says so)."),
+    (lambda fam, op: fam == "temporal" and ("strftime" in op or "strptime" in op),
+     "Two passes plus a prefix scan, and the output is 10 to 20 bytes a row: the whole cost is writing "
+     "the text. `Kernels/TemporalFormat.swift` compiles the format into an op list on the host, so the "
+     "kernel is generic and no format costs a shader recompile."),
+    (lambda fam, op: fam == "temporal" and ("timezone" in op or "local_timestamp" in op or "is_dst" in op),
+     "The zone's transition table (a few hundred instants) is uploaded once per zone and cached, so "
+     "the per-row work is a ten-step binary search and an add — the pass is bandwidth-bound on the "
+     "values themselves. See `Kernels/TimezoneGPU.swift`."),
     (lambda fam, op: fam == "temporal",
      "Civil-calendar arithmetic: days-from-civil and its inverse are a few dozen integer operations "
      "per row on both sides, so this is compute-bound rather than bandwidth-bound and the GPU's only "

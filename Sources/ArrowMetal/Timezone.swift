@@ -3,11 +3,22 @@ import CArrowABI
 
 // Arrow `assume_timezone` and `local_timestamp`.
 //
-// Both run on the **CPU**, deliberately: a timezone conversion is a lookup in the IANA tz database, which
-// is host data (Foundation's `TimeZone`) with no GPU-resident form. Uploading the transition table per
-// call would cost more than the arithmetic saves, so the values are converted on the host, sharded over
-// `DispatchQueue.concurrentPerform`, with a per-shard cache of the current offset's validity interval so
-// a run of nearby timestamps costs one tz lookup rather than one per row.
+// Both run on the **GPU**. A timezone is a step function over a few hundred instants — 559 transitions
+// for `America/New_York` between 1800 and 2200 — so the transition table is enumerated once per zone
+// from Foundation's `TimeZone`, uploaded once and cached (see `Kernels/TimezoneGPU.swift`), and each
+// function is then a single pass whose per-row work is a ten-step binary search and an add.
+//
+// What remains here is the **host fallback**, kept as the reference implementation and still used for a
+// zone Foundation will not enumerate, for values outside the tabulated 1800-2200 window, and on a
+// virtual GPU. It converts on the host, sharded over `DispatchQueue.concurrentPerform`, with a
+// per-shard cache of the current offset's validity interval so a run of nearby timestamps costs one tz
+// lookup rather than one per row. The GPU table is built from exactly the two Foundation primitives
+// this path calls, `secondsFromGMT(for:)` and `nextDaylightSavingTimeTransition(after:)`, and verified
+// against them at both ends of every interval before use, so the two paths agree by construction.
+//
+// Past 2038 both paths report the *projected* rules Foundation extends the last known rule with, which
+// is what Foundation's own enumeration returns; a zone whose real rules change after that date will
+// differ from a tz database released later, exactly as the host path has always differed.
 //
 // Neither function changes the resolution: a `timestamp[ns]` stays `timestamp[ns]`, and the sub-second
 // part of every value is carried across untouched (offsets are whole seconds in the tz database, and
@@ -138,6 +149,10 @@ extension MetalTemporalArray {
             throw ArrowMetalError.unsupportedType("assume_timezone needs a timestamp column with no timezone, got \(type.arrowFormat)")
         }
         let zone = try resolveTimeZone(tz)
+        if let gpu = try assumeTimezoneGPU(unit: unit, zone: tz, name: tz,
+                                           ambiguous: ambiguous, nonexistent: nonexistent) {
+            return gpu
+        }
         let per = unit.perSecond
         let src = try int64Values()
         let n = src.length
@@ -201,6 +216,7 @@ extension MetalTemporalArray {
             return self
         }
         let zone = try resolveTimeZone(tzName)
+        if let gpu = try localTimestampGPU(unit: unit, zone: tzName) { return gpu }
         let per = unit.perSecond
         let src = try int64Values()
         let n = src.length

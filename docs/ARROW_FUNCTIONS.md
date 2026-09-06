@@ -92,9 +92,9 @@ PYTHONPATH=python python -m pytest python/tests/test_functions.py -q
 | Categorizations | 6 | 1 | 0 | 0 | 0 | 7 |
 | Selecting | 4 | 0 | 0 | 0 | 0 | 4 |
 | Conversions | 4 | 0 | 2 | 0 | 0 | 6 |
-| TemporalExtraction | 21 | 3 | 0 | 0 | 0 | 24 |
+| TemporalExtraction | 24 | 0 | 0 | 0 | 0 | 24 |
 | TemporalDifference | 11 | 0 | 2 | 0 | 0 | 13 |
-| Timezone | 0 | 2 | 0 | 0 | 0 | 2 |
+| Timezone | 2 | 0 | 0 | 0 | 0 | 2 |
 | Random | 1 | 0 | 0 | 0 | 0 | 1 |
 | Associative | 2 | 0 | 2 | 0 | 0 | 4 |
 | Selections | 7 | 0 | 0 | 0 | 0 | 7 |
@@ -104,9 +104,9 @@ PYTHONPATH=python python -m pytest python/tests/test_functions.py -q
 | Pairwise | 2 | 0 | 0 | 0 | 0 | 2 |
 | Cumulative | 7 | 0 | 0 | 0 | 0 | 7 |
 | GroupedAggregations | 23 | 0 | 1 | 0 | 0 | 24 |
-| Total | 272 | 18 | 17 | 0 | 0 | 307 |
+| Total | 277 | 13 | 17 | 0 | 0 | 307 |
 
-Totals: **272 gpu**, **18 cpu**, **17 partial**, **0 missing**, **0 pending** over 307 Arrow function names.
+Totals: **277 gpu**, **13 cpu**, **17 partial**, **0 missing**, **0 pending** over 307 Arrow function names.
 
 ## Every Arrow function name
 
@@ -328,9 +328,9 @@ Totals: **272 gpu**, **18 cpu**, **17 partial**, **0 missing**, **0 pending** ov
 | `microsecond` | TemporalExtraction | **GPU** | `microsecond()` | `Kernels/TemporalMath.swift` | UTC. |
 | `nanosecond` | TemporalExtraction | **GPU** | `nanosecond()` | `Kernels/TemporalMath.swift` | UTC. |
 | `is_leap_year` | TemporalExtraction | **GPU** | `is_leap_year()` | `Kernels/TemporalMath.swift` | UTC. |
-| `strftime` | TemporalExtraction | **CPU** | `strftime(format)` | `Kernels/TemporalMath.swift` | The C library's `strftime` against a `gmtime_r` struct on the host, plus a `%f` extension for microseconds. Not a Unicode date pattern, and always UTC. |
-| `strptime` | TemporalExtraction | **CPU** | `strptime(format)` | `Kernels/TemporalMath.swift` | The C library's `strptime` on the host, UTC. `error_is_null` is not implemented — an unparseable row is null either way. |
-| `is_dst` | TemporalExtraction | **CPU** | `is_dst()` | `Kernels/TemporalExtra.swift` | The one function here that does apply a timestamp's timezone, and so the one that needs the IANA tz database — host data with no GPU-resident form. Runs on the host, sharded over `DispatchQueue.concurrentPerform`. A naive timestamp is an error, as in Arrow. |
+| `strftime` | TemporalExtraction | **GPU** | `strftime(format)` | `Kernels/TemporalFormat.swift` | A C `strftime` format string, not a Unicode date pattern. The format is compiled on the host into a small op list uploaded as a constant buffer, so one generic kernel serves every format and none costs a shader recompile; the output width is data dependent, so it is the two-pass shape — measure every row, scan the lengths into the Arrow offsets buffer on the GPU, emit. `%Y %m %d %e %H %I %M %S %f %j %y %b %B %h %a %A %p %C %G %V %u %w %z %Z %F %T %D %R %n %t %%` and literals run on the GPU; anything else falls back to the C library. A timestamp carrying a timezone formats in that zone, as pyarrow does. Two documented departures from pyarrow, both of them C's behaviour: `%S` stays two digits (pyarrow folds the fractional second into it) and `%f` is ArrowMetal's six-digit fraction (pyarrow prints it literally). |
+| `strptime` | TemporalExtraction | **GPU** | `strptime(format)` | `Kernels/TemporalFormat.swift` | The inverse of `strftime` on the same compiled op list, one pass with one thread per 32 rows so each thread owns a whole validity word. The grammar is the C library's: a numeric field takes at least one and at most its own width in digits and must land in its range, whitespace matches any whitespace, and the whole value must be consumed. `%Y %m %d %e %H %I %M %S %f %y %b %B %h %a %A %p %z %F %T %D %R %n %t %%` run on the GPU; anything else falls back to the C library's `strptime`. Fields the format omits default to 1970-01-01 00:00:00, which is C's default rather than pyarrow's 1900-01-01. `error_is_null` is not implemented — an unparseable row is null either way. |
+| `is_dst` | TemporalExtraction | **GPU** | `is_dst()` | `Kernels/TemporalExtra.swift` | The one function here that does apply a timestamp's timezone, and so the one that needs the IANA tz database. The zone's transition table is enumerated once on the host, uploaded once and cached (`Kernels/TimezoneGPU.swift`), and the kernel is a binary search over it. A naive timestamp is an error, as in Arrow. Agrees with pyarrow exactly from 1900 through 2037; past 2038 the host tz database projects each zone's current rule forward while pyarrow's bundled one stops, so the two diverge there — a difference in the timezone data, not in the kernel. |
 | `iso_calendar` | TemporalExtraction | **GPU** | `iso_calendar()` | `Kernels/TemporalExtra.swift` | A struct of int64 `iso_year`, `iso_week` and `iso_day_of_week` (1 = Monday), UTC. |
 | `subsecond` | TemporalExtraction | **GPU** | `subsecond()` | `Kernels/TemporalExtra.swift` | The fraction of a second in [0, 1) as float64, UTC. date32 and date64 answer 0 (pyarrow has no kernel for them) and duration is rejected. |
 | `us_week` | TemporalExtraction | **GPU** | `us_week()` | `Kernels/TemporalExtra.swift` | The US week number: Sunday-start weeks and the majority rule, 1-53. UTC. |
@@ -350,8 +350,8 @@ Totals: **272 gpu**, **18 cpu**, **17 partial**, **0 missing**, **0 pending** ov
 | `seconds_between` | TemporalDifference | **GPU** | `seconds_between(other)` | `Kernels/TemporalExtra.swift` | Second boundaries crossed. |
 | `weeks_between` | TemporalDifference | **GPU** | `weeks_between(other, count_from_zero, week_start)` | `Kernels/TemporalExtra.swift` | Week boundaries crossed, both sides floored to the start of their week first. `week_start` is 1 = Monday ... 7 = Sunday; `count_from_zero` is accepted for signature parity and does not change the answer, as in Arrow. |
 | `years_between` | TemporalDifference | **GPU** | `years_between(other)` | `Kernels/TemporalExtra.swift` | The difference of the two calendar years. |
-| `assume_timezone` | Timezone | **CPU** | `assume_timezone(tz, ambiguous, nonexistent)` | `Sources/ArrowMetal/Timezone.swift` | Reads a naive column as wall-clock times in `tz` and returns the instants they name. Host-side deliberately: the offsets are a lookup in the IANA tz database, which has no GPU-resident form, so uploading the transition table per call would cost more than the arithmetic saves. Sharded over `DispatchQueue.concurrentPerform` with a per-shard offset cache. A local time that occurs twice or never raises by default; `"earliest"` / `"latest"` pick one, as Arrow does. |
-| `local_timestamp` | Timezone | **CPU** | `local_timestamp()` | `Sources/ArrowMetal/Timezone.swift` | The wall-clock time each instant names in the column's own timezone, as a naive timestamp of the same unit. Host-side for the same reason as `assume_timezone`; a column with no timezone comes back unchanged. |
+| `assume_timezone` | Timezone | **GPU** | `assume_timezone(tz, ambiguous, nonexistent)` | `Kernels/TimezoneGPU.swift` | Reads a naive column as wall-clock times in `tz` and returns the instants they name. A timezone is a step function over a few hundred instants — `America/New_York` has 559 UTC-offset transitions between 1800 and 2200 — so the table is enumerated once per zone from the host tz database, uploaded once and cached, and the kernel is a binary search plus an add. The search runs over the *local* start of each interval, which decides Arrow's ambiguous and nonexistent cases in the same pass: two intervals still running is a fall-back, none running is a spring-forward gap. Raises for either by default; `"earliest"` / `"latest"` pick one, as Arrow does. The host implementation stays as the fallback for a zone the tz database will not enumerate and for values outside 1800-2200. |
+| `local_timestamp` | Timezone | **GPU** | `local_timestamp()` | `Kernels/TimezoneGPU.swift` | The wall-clock time each instant names in the column's own timezone, as a naive timestamp of the same unit. One pass over the same transition table as `assume_timezone`; a column with no timezone comes back unchanged. |
 | `random` | Random | **GPU** | `am.random(n, initializer)` | `Kernels/Selection.swift` | Philox4x32-10 keyed by the seed, one counter per element, so the stream depends only on the seed. The top 53 bits of each draw become a multiple of 2^-53 in [0, 1). ArrowMetal's own stream: it does not reproduce Arrow C++'s pcg32_fast numbers for the same seed. |
 | `unique` | Associative | **Partial** | `unique()` | `Kernels/Unique.swift` | One GPU sort plus a run scan. The values come back **ascending**; Arrow returns them in order of first appearance, and nulls are dropped rather than kept. |
 | `value_counts` | Associative | **Partial** | `value_counts()` | `Kernels/Unique.swift` | The same pass, returned as a struct of `values` and `counts`. Ascending order, not first appearance; nulls are dropped. |

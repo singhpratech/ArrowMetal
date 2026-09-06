@@ -181,14 +181,15 @@ extension MetalTemporalArray {
         return MetalArray<Double>(length: n, nullCount: nullCount, validity: validity, values: out, context: ctx)
     }
 
-    // MARK: - is_dst (CPU)
+    // MARK: - is_dst (GPU)
 
     /// Arrow `is_dst`: whether each value falls in daylight saving time in the column's own timezone.
     ///
     /// Only a `timestamp` carrying a timezone can answer; a naive timestamp throws, as pyarrow does.
-    /// This is the one function in the package that reads the timezone database, so it runs on the
-    /// host through Foundation's `TimeZone`, sharded over `DispatchQueue.concurrentPerform`. A fixed
-    /// offset ("+02:00") never observes DST and answers false everywhere.
+    /// **GPU**: the zone's DST flags ride along with the transition table `Kernels/TimezoneGPU.swift`
+    /// uploads once per zone, so this is one pass and a binary search per row. The host loop below is
+    /// the fallback for a zone Foundation will not enumerate and for values outside the tabulated
+    /// window. A fixed offset ("+02:00") never observes DST and answers false everywhere.
     public func isDST() throws -> MetalBooleanArray {
         guard case .timestamp(let unit, let tz) = type else {
             throw ArrowMetalError.unsupportedType("is_dst is only defined for timestamps, not \(type.arrowFormat)")
@@ -199,6 +200,7 @@ extension MetalTemporalArray {
         guard let zone = Self.lookupTimeZone(name) else {
             throw ArrowMetalError.invalidArrowArray("unknown timezone \"\(name)\"")
         }
+        if let gpu = try isDSTGPU(unit: unit, zone: name) { return gpu }
         let n = length, ctx = context
         let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(Bitmap.byteCount(bits: n), 1),
                                                 zeroed: true, context: ctx)

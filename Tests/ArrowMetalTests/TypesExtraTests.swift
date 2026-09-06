@@ -730,6 +730,129 @@ final class TypesExtraTests: XCTestCase {
         }
     }
 
+    /// The GPU transition table against Foundation itself, over 50k random instants from 1900 to 2100
+    /// in every resolution, for the six zones that between them cover northern and southern DST, a
+    /// half-hour offset, a zone that abandoned DST and one with no transitions at all.
+    func testTimezoneTableMatchesFoundationForEveryZone() throws {
+        try requireRealGPU()
+        let zones = ["America/New_York", "Europe/Berlin", "Australia/Sydney", "Asia/Kolkata",
+                     "America/Sao_Paulo", "UTC"]
+        let n = 50_000
+        var g = SystemRandomNumberGenerator()
+        _ = g
+        var state: UInt64 = 0x2026_0906
+        func nextSecond() -> Int64 {
+            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            let lo: Int64 = -2_208_988_800, hi: Int64 = 4_102_444_800
+            return lo + Int64((state >> 11) % UInt64(hi - lo))
+        }
+        let seconds = (0..<n).map { _ in nextSecond() }
+        for name in zones {
+            let zone = try resolveTimeZone(name)
+            for unit in [ArrowTemporalUnit.second, .milli, .micro, .nano] {
+                let per = unit.perSecond
+                let values: [Int64?] = (0..<n).map { $0 % 613 == 11 ? nil : seconds[$0] * per }
+                let aware = try MetalTemporalArray(type: .timestamp(unit, timezone: name), values)
+                let local = try aware.localTimestamp().toArray()
+                let offsets = try aware.utcOffset().toArray()
+                let dst = try aware.isDST().toArray()
+                for i in stride(from: 0, to: n, by: 11) {
+                    guard values[i] != nil else {
+                        XCTAssertNil(local[i]); XCTAssertNil(dst[i]); continue
+                    }
+                    let d = Date(timeIntervalSince1970: Double(seconds[i]))
+                    let o = Int64(zone.secondsFromGMT(for: d))
+                    XCTAssertEqual(local[i], (seconds[i] + o) * per, "\(name) \(unit) row \(i)")
+                    XCTAssertEqual(offsets[i], Int32(o), "\(name) \(unit) offset row \(i)")
+                    XCTAssertEqual(dst[i], zone.isDaylightSavingTime(for: d), "\(name) \(unit) dst row \(i)")
+                }
+                // assume_timezone against a Foundation oracle, with both policies pinned so that
+                // ambiguous and nonexistent local times still produce a value.
+                let naive = try MetalTemporalArray(type: .timestamp(unit, timezone: nil), values)
+                let early = try naive.assumeTimezone(name, ambiguous: .earliest, nonexistent: .earliest)
+                    .toArray()
+                let late = try naive.assumeTimezone(name, ambiguous: .latest, nonexistent: .latest).toArray()
+                for i in stride(from: 0, to: n, by: 101) {
+                    guard values[i] != nil else { XCTAssertNil(early[i]); continue }
+                    XCTAssertEqual(early[i], Self.expectedAssume(seconds[i], zone, per: per, earliest: true),
+                                   "\(name) \(unit) earliest row \(i) local \(seconds[i])")
+                    XCTAssertEqual(late[i], Self.expectedAssume(seconds[i], zone, per: per, earliest: false),
+                                   "\(name) \(unit) latest row \(i) local \(seconds[i])")
+                }
+            }
+        }
+    }
+
+    /// Every ambiguous and nonexistent minute around every DST change from 2000 to 2037, against the
+    /// same Foundation oracle and under all four policy combinations.
+    func testEveryDSTEdgeMinuteFrom2000To2037() throws {
+        try requireRealGPU()
+        for name in ["America/New_York", "Europe/Berlin", "Australia/Sydney", "America/Sao_Paulo"] {
+            let zone = try resolveTimeZone(name)
+            var edges: [Int64] = []
+            var cursor = Date(timeIntervalSince1970: 946_684_800)                   // 2000-01-01
+            let end = Date(timeIntervalSince1970: 2_145_916_800)                    // 2038-01-01
+            while let next = zone.nextDaylightSavingTimeTransition(after: cursor), next < end {
+                edges.append(Int64(next.timeIntervalSince1970.rounded(.down)))
+                cursor = next
+            }
+            XCTAssertFalse(edges.isEmpty, name)
+            // The wall clocks around each change, minute by minute. The window has to be centred on the
+            // *local* time of the transition — in New York that is five hours from the UTC instant —
+            // and to span both offsets, since the repeated hour and the skipped hour live between them.
+            func offset(at t: Int64) -> Int64 {
+                Int64(zone.secondsFromGMT(for: Date(timeIntervalSince1970: Double(t))))
+            }
+            var locals: [Int64] = []
+            for e in edges {
+                let a = offset(at: e - 1), b = offset(at: e)
+                locals += stride(from: e + Swift.min(a, b) - 3_600, to: e + Swift.max(a, b) + 3_600,
+                                 by: 60).map { $0 }
+            }
+            let naive = try MetalTemporalArray(type: .timestamp(.second, timezone: nil),
+                                               locals.map { Optional($0) })
+            for earliest in [true, false] {
+                let amb: ArrowAmbiguousHandling = earliest ? .earliest : .latest
+                let non: ArrowNonexistentHandling = earliest ? .earliest : .latest
+                let got = try naive.assumeTimezone(name, ambiguous: amb, nonexistent: non).toArray()
+                for (i, l) in locals.enumerated() {
+                    XCTAssertEqual(got[i], Self.expectedAssume(l, zone, per: 1, earliest: earliest),
+                                   "\(name) earliest=\(earliest) local \(l)")
+                    if got[i] != Self.expectedAssume(l, zone, per: 1, earliest: earliest) { return }
+                }
+            }
+            // And `raise` really does raise somewhere in that set.
+            XCTAssertThrowsError(try naive.assumeTimezone(name), name)
+        }
+    }
+
+    /// Foundation's answer to `assume_timezone` for one wall clock: every UTC offset `o` for which
+    /// `local - o` really is at offset `o`. Two of them is an ambiguous time and none is a gap, whose
+    /// `earliest` / `latest` are the last instant before and the first instant after the transition.
+    private static func expectedAssume(_ local: Int64, _ zone: TimeZone, per: Int64,
+                                       earliest: Bool) -> Int64? {
+        func offset(at t: Int64) -> Int64 {
+            Int64(zone.secondsFromGMT(for: Date(timeIntervalSince1970: Double(t))))
+        }
+        var candidates: [Int64] = []
+        for probe in [local, local - offset(at: local), local - 86_400, local + 86_400] {
+            let o = offset(at: probe)
+            if !candidates.contains(o) { candidates.append(o) }
+        }
+        let valid = candidates.filter { offset(at: local - $0) == $0 }
+        if valid.count == 1 { return (local - valid[0]) * per }
+        if valid.count >= 2 {
+            let o = earliest ? valid.max()! : valid.min()!
+            return (local - o) * per
+        }
+        // A gap: find the transition that opened it.
+        let after = candidates.max()!
+        guard let next = zone.nextDaylightSavingTimeTransition(
+            after: Date(timeIntervalSince1970: Double(local - after - 1))) else { return nil }
+        let t = Int64(next.timeIntervalSince1970.rounded(.down))
+        return earliest ? t * per - 1 : t * per
+    }
+
     // MARK: - record batch integration
 
     func testRecordBatchCarriesEveryNewType() throws {
