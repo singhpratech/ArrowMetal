@@ -1,0 +1,8 @@
+cargo:rerun-if-env-changed=ARROWMETAL_LIB_DIR
+cargo:rerun-if-env-changed=ARROWMETAL_LIB
+cargo:rerun-if-env-changed=ARROWMETAL_PYTHON_DIR
+cargo:rustc-link-search=native=/Users/aiexplore369/Documents/ai_coding/appleunifiedarrrowframework/.claude/worktrees/agent-a5138fb66652099b5/.build/arm64-apple-macosx/release
+cargo:rustc-link-lib=dylib=ArrowMetalC
+cargo:rustc-link-arg=-Wl,-rpath,/Users/aiexplore369/Documents/ai_coding/appleunifiedarrrowframework/.claude/worktrees/agent-a5138fb66652099b5/.build/arm64-apple-macosx/release
+cargo:lib_dir=/Users/aiexplore369/Documents/ai_coding/appleunifiedarrrowframework/.claude/worktrees/agent-a5138fb66652099b5/.build/arm64-apple-macosx/release
+cargo:rustc-env=ARROWMETAL_SYS_LIB_DIR=/Users/aiexplore369/Documents/ai_coding/appleunifiedarrrowframework/.claude/worktrees/agent-a5138fb66652099b5/.build/arm64-apple-macosx/release

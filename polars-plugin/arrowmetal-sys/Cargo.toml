@@ -1,0 +1,20 @@
+[package]
+name = "arrowmetal-sys"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Raw FFI bindings to libArrowMetalC (ArrowMetal's C ABI)"
+repository = "https://github.com/arrowmetal/ArrowMetal"
+publish = false
+# Declaring the native library lets build.rs publish `cargo:lib_dir=...` to dependents as
+# DEP_ARROWMETALC_LIB_DIR, which is how the plugin cdylib learns where to point its own rpath.
+links = "ArrowMetalC"
+build = "build.rs"
+
+[lib]
+name = "arrowmetal_sys"
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
