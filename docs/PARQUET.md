@@ -34,17 +34,23 @@ For one leaf column, across every selected row group at once:
     -> pq_levels_to_bitmap definition levels -> an Arrow validity bitmap
 ```
 
-### The file is one `MTLBuffer`
+### The file's bytes are the GPU's bytes
 
-`ParquetFile` `mmap`s the whole file. `mmap` always returns a page-aligned address, so the mapping is
-wrapped with `makeBuffer(bytesNoCopy:)` — the same trick `MetalArrowBuffer.wrapOrCopy` uses for zero-copy
-Arrow import. Every page of every column chunk is then addressable by a kernel as a byte offset into one
-buffer, pages are faulted in lazily by whichever kernel first touches them, and a projection that reads
-two of forty columns never brings the other thirty-eight into memory. An **uncompressed** file needs no
-staging buffer at all: the mapped file *is* the page buffer the decoders read.
+`ParquetFile` `mmap`s the whole file. `mmap` always returns a page-aligned address, so any range of the
+mapping can be wrapped with `makeBuffer(bytesNoCopy:)` — the same trick `MetalArrowBuffer.wrapOrCopy` uses
+for zero-copy Arrow import. A column chunk's pages are then addressable by a kernel as byte offsets into
+that buffer, and pages are faulted in by whichever kernel first touches them. An **uncompressed** file
+needs no staging buffer at all: the mapped file *is* the page buffer the decoders read, so the values go
+from page cache to Arrow array without the host ever loading them.
 
-Column chunks are addressed with 32-bit offsets relative to a per-column binding point, so file size is
-not a limit; a single column chunk larger than 4 GiB is (it raises `ParquetError.unsupported`).
+Wrapping is not free — it puts the bytes in the GPU's page tables, at roughly 17 ms per gigabyte on an
+M4 Max — so a read wraps exactly the byte span its columns occupy, once, and caches it. That matters
+because column chunks are interleaved by row group: in a file with fifty row groups, *one* column's chunks
+already span nearly the whole file, so wrapping per column would map the same pages once per column. It
+also means **holding the `ParquetFile` across queries is worth real time**; see the benchmarks.
+
+Chunks are addressed with 32-bit offsets relative to the wrap's base, so file size is not a limit; a
+single column chunk larger than 4 GiB is (it raises `ParquetError.unsupported`).
 
 ### Page layout is computed on the GPU, not the host
 
@@ -115,7 +121,9 @@ input" or "copy N bytes from N' bytes back in the output". A single block cannot
 but a Parquet file has thousands of pages, each an independent block, and that is the parallelism.
 
 One SIMD group (32 lanes) owns one page. Lane 0 walks the token stream and broadcasts each parsed token
-with `simd_broadcast`; all 32 lanes then move that token's bytes. Two details matter:
+with `simd_broadcast`; all 32 lanes then move that token's bytes. A 256-thread threadgroup per page was
+tried and is *worse* — a threadgroup barrier per token costs more than the extra lanes are worth, because
+real pages have tens of thousands of small tokens rather than a few large ones. Two details do help:
 
 - **The token stream is staged in threadgroup memory.** Every tag byte lane 0 reads is a dependent
   device-memory load, and one of those costs hundreds of cycles. All 32 lanes cooperatively stage the next
@@ -221,6 +229,11 @@ let batch = try f.read(ParquetReadOptions(
 cols = am.read_parquet("trades.parquet", columns=["price", "qty"],
                        filters=[("price", ">", 100)])
 total = cols["price"].sum()          # already on the GPU
+
+# Across several queries, keep the handle: mapping the file is a per-open cost.
+f = am.ParquetFile("trades.parquet")
+for day in days:
+    px = f.read(columns=["price"], filters=[("day", "==", day)])["price"]
 ```
 
 Only the requested column chunks are ever touched — their pages are never even faulted in. `filters` is
@@ -240,28 +253,91 @@ Measured on an Apple M4 Max (Mac16,6, 64 GB), macOS 26.x, release build. 50,000,
 work does not appear in it; `ttfc` is *time to first compute* — read one `float64` column and sum it,
 which is the smallest query anyone actually runs.
 
-<!-- BENCHMARK TABLE -->
+### Whole-table read, 50 M rows x 8 columns
+
+| codec | reader | wall ms | CPU ms | MB/s | ttfc ms |
+|---|---|---:|---:|---:|---:|
+| snappy | **arrowmetal (GPU)** | 440 | **225** | 3759 | 189 |
+| snappy | pyarrow.parquet | 282 | 1955 | 5855 | 127 |
+| snappy | polars | 157 | 1469 | 10502 | 36 |
+| snappy | pandas | 441 | 2253 | 3750 | 132 |
+| lz4 | **arrowmetal (GPU)** | 394 | **217** | 4240 | 203 |
+| lz4 | pyarrow.parquet | 293 | 1738 | 5701 | 122 |
+| lz4 | polars | 93 | 1109 | 17957 | 21 |
+| lz4 | pandas | 306 | 1598 | 5450 | 118 |
+| none | **arrowmetal (GPU)** | 305 | **262** | 7301 | 250 |
+| none | pyarrow.parquet | 206 | 951 | 10814 | 101 |
+| none | polars | 84 | 861 | 26592 | 28 |
+| none | pandas | 317 | 1245 | 7030 | 134 |
+
+ArrowMetal is 1.4-3.6x behind Polars and pyarrow on wall time and **4-9x ahead on CPU time**: the decode is
+work the host never does. The `ttfc` column above re-opens the file for every query, which is the wrong
+way to hold a 2 GB file and costs ArrowMetal the most, because mapping it and handing its pages to Metal
+is a per-open cost the CPU readers do not have. Keep the handle, which is what a query engine does:
+
+### One `float64` column (400 MB of values), file handle kept open
+
+| codec | reader | read ms | sum ms |
+|---|---|---:|---:|
+| snappy | **arrowmetal (GPU)** | **11** | **2** |
+| snappy | pyarrow.ParquetFile | 98 | 8 |
+| lz4 | **arrowmetal (GPU)** | **16** | **3** |
+| lz4 | pyarrow.ParquetFile | 105 | 7 |
+| none | **arrowmetal (GPU)** | **7** | **3** |
+| none | pyarrow.ParquetFile | 57 | 7 |
+
+That is the shape a query actually has — open once, project a column, compute — and it is a 6-9x win on
+the read plus a 2-3x win on the reduction, because the values are already in GPU memory when the
+reduction starts. 400 MB decoded in 7 ms is 57 GB/s.
+
+### Decompression on its own
+
+One `int64` column of 20 M rows, deliberately *structured* data (an LCG sequence, so Snappy finds many
+short matches and emits many tokens — the hard case for a GPU), 1 MB pages:
+
+| codec | file MB | am ms | am MB/s | decode alone |
+|---|---:|---:|---:|---:|
+| none | 160 | 4.0 | 40154 | — |
+| snappy | 152 | 33.6 | 4762 | 5.4 GB/s |
+| lz4 | 161 | 4.4 | 36711 | (pyarrow wrote it barely compressed) |
+| zstd (host, libzstd) | 120 | 14.1 | 11325 | 15.8 GB/s |
+
+Page size, same column at 5 M rows (40 MB of values), MB/s of decoded output:
+
+| page size | none | snappy | lz4 | zstd (host) | gzip (host) |
+|---|---:|---:|---:|---:|---:|
+| 1 MB | 19791 | 2226 | 5468 | 3766 | 1658 |
+| 256 KB | 14947 | 2245 | 6572 | 5437 | 2411 |
+| 64 KB | 13710 | 2511 | 3548 | 4648 | — |
 
 Reproduce with:
 
 ```
-PYTHONPATH=python python Benchmarks/parquet_bench.py --rows 50000000 --codecs snappy,lz4,none
+PYTHONPATH=python python Benchmarks/parquet_bench.py --rows 50000000 --codecs snappy,lz4,none --codec-scan
 ```
 
 ### What the numbers say
 
-- **Uncompressed and dictionary-heavy data is where the GPU wins**, and it wins on CPU time everywhere:
-  the decode is compute the host never does, so a process that reads on the GPU keeps its cores.
-- **The arrays land in GPU memory already**, so the next operation is free of an import. That is what
-  `ttfc` measures, and it is the number that matters for a query engine: the CPU readers have to hand
-  their arrays to something else before any compute happens.
-- **Snappy and LZ4 at 1 MB pages are a loss against a good CPU implementation.** The reason is structural
-  and worth stating plainly: an LZ77 token stream is serial, so a page is decoded by one SIMD group, and a
-  column with 1 MB pages has only as many pages as it has megabytes. At 32 pages the GPU is running 32
-  SIMD groups on a device that wants thousands. Smaller pages change the verdict — measured on the same
-  data, a 4 M-row `int64` column decodes in 15.9 ms at 1 MB pages, 13.4 ms at 64 KB and 9.4 ms at 16 KB,
-  against 9-11 ms for pyarrow — and a wide table decodes all of its columns' pages concurrently. If you
-  control the writer and want GPU reads, write smaller pages.
+- **CPU time is the headline.** Reading the whole 50 M-row table costs the host 217-262 ms of CPU against
+  951-2253 ms for the CPU readers. The decode is compute the process never does, so the cores stay free
+  for whatever else is running.
+- **The arrays land in GPU memory already.** Summing the column ArrowMetal just decoded takes 2-3 ms; the
+  CPU readers pay 7-8 ms *and* had to materialise the array first. There is no import step, because the
+  decode wrote into Metal shared memory in the first place.
+- **Opening the file is a real per-open cost, so do not re-open it.** Mapping a 2 GB file and handing its
+  pages to Metal costs ~17 ms per gigabyte plus the minor faults of a fresh mapping — around 230 ms for
+  this file, which is most of the `ttfc` column. Holding the `ParquetFile` across queries, which is what
+  a query engine does, removes all of it and turns the same read into 7-16 ms.
+- **Snappy on *compressible* data is the weak spot, and the reason is structural.** An LZ77 token stream
+  is serial, so a page is decoded by one SIMD group, and the cost scales with the number of *tokens*, not
+  with bytes. Incompressible pages are one huge literal and decode at memory speed — the `price` column,
+  400 MB of random doubles, comes back in 11 ms. A page full of short matches costs a token each, and an
+  LCG-generated `int64` column decodes at 2-5 GB/s where the uncompressed path does 14-40 GB/s. Smaller
+  pages help a little (the table above) but do not change the shape of it: this is the one part of
+  Parquet that a GPU is structurally bad at, and it is honest to say so.
+- **Where the GPU is unambiguously ahead is the uncompressed and dictionary paths**, which is also where
+  a GPU-resident analytics stack wants to be: 40 GB/s for a plain `int64` column, and a dictionary column
+  that comes back as an Arrow dictionary array without materialising a single string.
 
 ## The writer
 

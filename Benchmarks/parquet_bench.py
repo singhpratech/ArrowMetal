@@ -64,6 +64,18 @@ def build(path, rows, codec, chunk=2_000_000, page_size=1 << 20):
     return os.path.getsize(path)
 
 
+def complete(path):
+    """True when `path` is a finished Parquet file: a run killed mid-write leaves a truncated one."""
+    try:
+        if os.path.getsize(path) < 12:
+            return False
+        with open(path, "rb") as fh:
+            fh.seek(-4, os.SEEK_END)
+            return fh.read(4) == b"PAR1"
+    except OSError:
+        return False
+
+
 def timed(fn):
     gc.collect()
     c0, w0 = time.process_time(), time.perf_counter()
@@ -120,7 +132,7 @@ def codec_throughput(directory, rows, page_size):
     base = None
     for codec in ("none", "snappy", "lz4", "zstd", "gzip"):
         path = os.path.join(directory, "codec-%s-%d-%d.parquet" % (codec, rows, page_size))
-        if not os.path.exists(path):
+        if not complete(path):
             t = pa.table({"v": pa.array(np.arange(rows, dtype=np.int64) * 2654435761 % (1 << 40))})
             try:
                 pq.write_table(t, path, compression=codec if codec != "none" else None,
@@ -128,6 +140,9 @@ def codec_throughput(directory, rows, page_size):
             except Exception as e:
                 print("%-12s skipped (%s)" % (codec, e))
                 continue
+        if not complete(path):
+            print("%-12s skipped (could not be written)" % codec)
+            continue
         raw = rows * 8 / 1e6
         f = am.ParquetFile(path)
         best = None
@@ -138,8 +153,8 @@ def codec_throughput(directory, rows, page_size):
         if codec == "none":
             base = best
         note = ""
-        if base is not None and codec != "none" and best > base:
-            note = "  (%.1f MB/s of decode alone)" % (raw / ((best - base) / 1000.0))
+        if base is not None and codec != "none" and best > base * 1.2:
+            note = "  (%.0f MB/s of decode alone)" % (raw / ((best - base) / 1000.0))
         print("%-12s %10.1f %10.1f %10.0f %10.1f%s" % (
             codec, os.path.getsize(path) / 1e6, best, raw / (best / 1000.0), pw, note))
 
@@ -180,6 +195,7 @@ def main():
     ap.add_argument("--codec-scan", action="store_true",
                     help="also measure per-codec decompression throughput on one column")
     ap.add_argument("--page-size", type=int, default=1 << 20)
+    ap.add_argument("--skip-main", action="store_true", help="only run --codec-scan")
     args = ap.parse_args()
 
     os.makedirs(args.dir, exist_ok=True)
@@ -187,9 +203,9 @@ def main():
     print("rows:   {:,}".format(args.rows))
     rows_out = []
     try:
-        for codec in args.codecs.split(","):
+        for codec in ([] if args.skip_main else args.codecs.split(",")):
             path = os.path.join(args.dir, "bench-%s-%d.parquet" % (codec, args.rows))
-            if not os.path.exists(path):
+            if not complete(path):
                 t0 = time.perf_counter()
                 size = build(path, args.rows, codec, page_size=args.page_size)
                 print("wrote %s (%.2f GB) in %.1f s" % (os.path.basename(path), size / 1e9,
@@ -215,7 +231,7 @@ def main():
             print()
             warm_first_compute(path, args.repeat)
         if args.codec_scan:
-            for ps in (1 << 20, 1 << 16):
+            for ps in (1 << 20, 1 << 18, 1 << 16):
                 codec_throughput(args.dir, min(args.rows, 20_000_000), ps)
     finally:
         if not args.keep:
