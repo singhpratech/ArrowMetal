@@ -51,6 +51,7 @@ final class ScenarioMatrixTests: XCTestCase {
     }
 
     func testMatrix() throws {
+        try requireRealGPU()
         for n in Self.sizes {
             for nulls in Self.nullRatios {
                 for sliced in [false, true] {
@@ -83,6 +84,7 @@ final class ScenarioMatrixTests: XCTestCase {
 
     /// Many threads using the shared context at once: pipeline cache, pool and command queue must be safe.
     func testConcurrentUse() throws {
+        try requireRealGPU()
         let cols = try (0..<8).map { c in try MetalArray<Int64>((0..<200_000).map { Int64($0 % (c + 2)) }) }
         var failures = 0
         let lock = NSLock()
@@ -103,6 +105,7 @@ final class ScenarioMatrixTests: XCTestCase {
 
     /// Pool churn: allocate, free, reallocate at many sizes and verify contents are never stale where they must be zero.
     func testPoolReuseKeepsZeroSemantics() throws {
+        try requireRealGPU()
         for round in 0..<3 {
             for n in [10, 1000, 5000, 100_000] {
                 let a = try MetalArray<Int32>((0..<n).map { Int32($0 + round) })

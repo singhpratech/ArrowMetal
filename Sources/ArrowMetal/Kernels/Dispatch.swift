@@ -17,6 +17,14 @@ enum Dispatch {
         enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)
     }
 
+    /// Binds an element count for a kernel's `device const uint* nPtr` argument. A pending array (its length
+    /// still being decided by GPU work in the open batch) binds its length buffer, so the count flows on the
+    /// GPU without a sync; otherwise the known length is passed inline.
+    static func setLength(_ enc: MTLComputeCommandEncoder, _ n: Int, _ lengthBuffer: MetalArrowBuffer?, index: Int) {
+        if let lb = lengthBuffer { enc.setBuffer(lb.mtl, offset: lb.offset, index: index) }
+        else { var u = UInt32(n); enc.setBytes(&u, length: 4, index: index) }
+    }
+
     static func setUInt(_ enc: MTLComputeCommandEncoder, _ v: Int, index: Int) {
         var u = UInt32(v)
         enc.setBytes(&u, length: 4, index: index)

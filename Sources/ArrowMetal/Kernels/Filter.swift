@@ -6,7 +6,7 @@ extension MetalBooleanArray {
     /// an element is selected when the mask is true AND the mask is valid.
     func selectionBitmap() throws -> MetalArrowBuffer {
         guard let v = validity else { return values }
-        return try BitmapOps.binary(context, "bitmap_and", values, v, bits: length)
+        return try BitmapOps.binary(context, "bitmap_and", values, v, bits: dispatchLength, lengthBuffer: lengthBuffer)
     }
 }
 
@@ -16,7 +16,7 @@ extension MetalArray {
     /// Two GPU passes: per-block popcount, then a scatter using an in-threadgroup prefix scan;
     /// the block offsets are scanned on the CPU (one entry per 8192 elements).
     public func filter(_ mask: MetalBooleanArray) throws -> MetalArray<T> {
-        guard mask.length == length else { throw ArrowMetalError.lengthMismatch(length, mask.length) }
+        try checkSameLength(mask)
         let sel = try mask.selectionBitmap()
         return try compact(selection: sel, prepare: nil)
     }
@@ -26,14 +26,14 @@ extension MetalArray {
     public func filter(where op: CompareOp, _ scalar: T) throws -> MetalArray<T> {
         if T.self == Double.self { return try filter(try compare(op, scalar)) }
         let ctx = context
-        let sel = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: length), zeroed: false, context: ctx)
+        let sel = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: dispatchLength), zeroed: false, context: ctx)
         let opIndex = UInt32(CompareOp.allCases.firstIndex(of: op)!)
-        let vals = values, vld = validity ?? values, hasV = validity != nil, n = length
+        let vals = values, vld = validity ?? values, hasV = validity != nil, n = dispatchLength, lb = lengthBuffer
         return try compact(selection: sel) { enc, pso, blockCounts, grid, tg in
             enc.setComputePipelineState(pso)
             enc.setBuffer(vals.mtl, offset: vals.offset, index: 0)
             enc.setBuffer(vld.mtl, offset: vld.offset, index: 1)
-            Dispatch.setUInt(enc, n, index: 2)
+            Dispatch.setLength(enc, n, lb, index: 2)
             Dispatch.setUInt(enc, hasV ? 1 : 0, index: 3)
             Dispatch.setUInt(enc, Int(opIndex), index: 4)
             Dispatch.setScalar(enc, scalar, index: 5)
@@ -49,6 +49,8 @@ extension MetalArray {
     /// worst case (input length) and trimmed to the real length afterwards.
     func compact(selection sel: MetalArrowBuffer,
                  prepare: ((MTLComputeCommandEncoder, MTLComputePipelineState, MetalArrowBuffer, MTLSize, MTLSize) throws -> Void)?) throws -> MetalArray<T> {
+        let length = dispatchLength           // worst case while pending; kernels read the true n from the buffer
+        let lb = lengthBuffer
         try Dispatch.checkLength(length)
         let ctx = context
         let words = BitmapOps.words(bits: length)
@@ -73,14 +75,14 @@ extension MetalArray {
             } else {
                 enc.setComputePipelineState(countPSO)
                 enc.setBuffer(sel.mtl, offset: sel.offset, index: 0)
-                Dispatch.setUInt(enc, length, index: 1)
+                Dispatch.setLength(enc, length, lb, index: 1)
                 enc.setBuffer(blockCounts.mtl, offset: 0, index: 2)
                 enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
             }
             enc.memoryBarrier(scope: .buffers)
             enc.setComputePipelineState(scanPSO)
             enc.setBuffer(blockCounts.mtl, offset: 0, index: 0)
-            Dispatch.setUInt(enc, blocks, index: 1)
+            Dispatch.setLength(enc, length, lb, index: 1)
             enc.setBuffer(total.mtl, offset: 0, index: 2)
             enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: tg)
             enc.memoryBarrier(scope: .buffers)
@@ -88,7 +90,7 @@ extension MetalArray {
             enc.setBuffer(values.mtl, offset: values.offset, index: 0)
             enc.setBuffer((validity ?? values).mtl, offset: (validity ?? values).offset, index: 1)
             enc.setBuffer(sel.mtl, offset: sel.offset, index: 2)
-            Dispatch.setUInt(enc, length, index: 3)
+            Dispatch.setLength(enc, length, lb, index: 3)
             Dispatch.setUInt(enc, hasValidity ? 1 : 0, index: 4)
             enc.setBuffer(blockCounts.mtl, offset: 0, index: 5)
             enc.setBuffer(outValues.mtl, offset: 0, index: 6)
@@ -98,7 +100,7 @@ extension MetalArray {
         if ctx.isBatching {
             // Length is decided by the GPU: pack validity for the worst case now, fix length/nulls after the flush.
             var outValidity: MetalArrowBuffer? = nil
-            if let vb = validBytes { outValidity = try BitmapOps.packBits(ctx, bytes: vb, bits: length) }
+            if let vb = validBytes { outValidity = try BitmapOps.packBits(ctx, bytes: vb, bits: length, lengthBuffer: total) }
             let res = MetalArray<T>(length: 0, nullCount: 0, validity: outValidity, values: outValues, context: ctx)
             res.capacityLength = length
             ctx.retainUntilFlush(sel); ctx.retainUntilFlush(blockCounts); if let vb = validBytes { ctx.retainUntilFlush(vb) }
@@ -130,14 +132,14 @@ extension MetalBooleanArray {
 
     /// One byte (0/1) per element with the same validity (shared, zero-copy).
     public func toUInt8Array() throws -> MetalArray<UInt8> {
-        let out = try BitmapOps.unpackBits(context, bits: values, count: length)
-        return MetalArray<UInt8>(length: length, nullCount: nullCount, validity: validity, values: out, context: context)
+        let out = try BitmapOps.unpackBits(context, bits: values, count: dispatchLength, lengthBuffer: lengthBuffer)
+        return inheritPending(MetalArray<UInt8>(length: knownLength, nullCount: _nullCount, validity: validity, values: out, context: context))
     }
 
     /// Inverse of `toUInt8Array`: non-zero bytes become true.
     public static func fromUInt8Array(_ a: MetalArray<UInt8>) throws -> MetalBooleanArray {
-        let packed = a.length == 0 ? try MetalArrowBuffer.allocate(byteCount: 0, context: a.context)
-                                   : try BitmapOps.packBits(a.context, bytes: a.values, bits: a.length)
-        return MetalBooleanArray(length: a.length, nullCount: a.nullCount, validity: a.validity, values: packed, context: a.context)
+        let packed = a.dispatchLength == 0 ? try MetalArrowBuffer.allocate(byteCount: 0, context: a.context)
+                                   : try BitmapOps.packBits(a.context, bytes: a.values, bits: a.dispatchLength, lengthBuffer: a.lengthBuffer)
+        return a.inheritPending(MetalBooleanArray(length: a.knownLength, nullCount: a._nullCount, validity: a.validity, values: packed, context: a.context))
     }
 }

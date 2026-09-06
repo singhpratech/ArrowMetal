@@ -4,6 +4,7 @@ import CArrowABI
 
 final class BatchTests: XCTestCase {
     func testChainMatchesUnbatched() throws {
+        try requireRealGPU()
         let ctx = MetalContext.shared
         var g = SystemRandomNumberGenerator()
         for n in [0, 1, 1000, 300_000] {
@@ -36,6 +37,7 @@ final class BatchTests: XCTestCase {
     }
 
     func testDeferredLengthAndNullCountResolveAfterBatch() throws {
+        try requireRealGPU()
         let a = try MetalArray<Int32>((0..<10_000).map { $0 % 5 == 0 ? nil : Int32($0) })
         let out = try MetalContext.shared.batch { () -> MetalArray<Int32> in
             let r = try a.filter(where: .gt, 100)
@@ -57,6 +59,7 @@ final class BatchTests: XCTestCase {
     }
 
     func testTakeErrorSurfacesAtBatchEnd() throws {
+        try requireRealGPU()
         let a = try MetalArray<Int32>([1, 2, 3])
         XCTAssertThrowsError(try MetalContext.shared.batch { _ = try a.take(try MetalArray<Int32>([0, 7])) })
         XCTAssertFalse(MetalContext.shared.isBatching)
@@ -64,6 +67,7 @@ final class BatchTests: XCTestCase {
     }
 
     func testPoolParksBuffersWhileBatching() throws {
+        try requireRealGPU()
         let ctx = MetalContext.shared
         let a = try MetalArray<Int64>((0..<100_000).map { Int64($0) })
         let result: SumResult? = try ctx.batch {
@@ -84,6 +88,7 @@ final class BatchTests: XCTestCase {
     }
 
     func testExportInsideBatchMaterialises() throws {
+        try requireRealGPU()
         let a = try MetalArray<Float>([1, 2, 3, 4])
         var schema = ArrowSchema(); var arr = ArrowArray()
         try MetalContext.shared.batch {

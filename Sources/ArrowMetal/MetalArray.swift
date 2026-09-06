@@ -46,6 +46,13 @@ public final class MetalArray<T: ArrowPrimitive>: @unchecked Sendable {
     var pending = false
     /// Length known without a sync (worst case for pending filter results).
     var capacityLength: Int
+    /// Device buffer holding the true length while pending (written by the GPU), nil otherwise.
+    var lengthBuffer: MetalArrowBuffer? { pending ? _lengthBuffer : nil }
+    var _lengthBuffer: MetalArrowBuffer?
+    /// Length to size dispatches with (no sync): worst case while pending.
+    var dispatchLength: Int { pending ? capacityLength : _length }
+    /// Length without forcing a sync; only meaningful when not pending.
+    var knownLength: Int { _length }
 
     public init(length: Int, nullCount: Int, validity: MetalArrowBuffer?, values: MetalArrowBuffer, context: MetalContext = .shared) {
         precondition(values.byteCount >= length * T.byteWidth)
@@ -113,6 +120,7 @@ public final class MetalArray<T: ArrowPrimitive>: @unchecked Sendable {
     /// Marks this array as produced by the open batch with a length the GPU will report in `lengthBuffer`.
     func deferLength(from lengthBuffer: MetalArrowBuffer, then: @escaping () -> Void) {
         pending = true
+        _lengthBuffer = lengthBuffer
         try? context.afterFlush { [self] in
             self._length = Int(lengthBuffer.typed(UInt32.self)[0])
             then()
@@ -156,6 +164,12 @@ public final class MetalBooleanArray: @unchecked Sendable {
     public let values: MetalArrowBuffer
     public let context: MetalContext
     var pending = false
+    var _capacityLength: Int = 0
+    var capacityLength: Int { pending ? _capacityLength : _length }
+    var lengthBuffer: MetalArrowBuffer? { pending ? _lengthBuffer : nil }
+    var _lengthBuffer: MetalArrowBuffer?
+    var dispatchLength: Int { pending ? _capacityLength : _length }
+    var knownLength: Int { _length }
 
     public init(length: Int, nullCount: Int, validity: MetalArrowBuffer?, values: MetalArrowBuffer, context: MetalContext = .shared) {
         precondition(values.byteCount >= Bitmap.byteCount(bits: length))
@@ -210,5 +224,78 @@ public final class MetalBooleanArray: @unchecked Sendable {
             n += byte.nonzeroBitCount
         }
         return n
+    }
+}
+
+// MARK: - Pending propagation (batched execution)
+
+extension MetalArray {
+    /// Element-wise results of a pending input are pending too, with the same length source.
+    func inheritPending<R: PendingCarrier>(_ r: R) -> R {
+        if pending, let lb = _lengthBuffer {
+            r.markPending(capacity: capacityLength, lengthBuffer: lb)
+            context.retainUntilFlush(self)
+        }
+        return r
+    }
+    /// Length equality without forcing a sync when both come from the same pending source.
+    func checkSameLength<O: PendingCarrier>(_ other: O) throws {
+        if pending || other.isPending {
+            if let a = _lengthBuffer, let b = other.pendingLengthBuffer, a === b { return }
+            if pending && other.isPending && _lengthBuffer == nil && other.pendingLengthBuffer == nil { return }
+            _ = length; _ = other.resolvedLength   // sync both and compare
+        }
+        guard other.resolvedLength == length else { throw ArrowMetalError.lengthMismatch(length, other.resolvedLength) }
+    }
+}
+
+extension MetalBooleanArray {
+    func inheritPending<R: PendingCarrier>(_ r: R) -> R {
+        if pending, let lb = _lengthBuffer {
+            r.markPending(capacity: capacityLength, lengthBuffer: lb)
+            context.retainUntilFlush(self)
+        }
+        return r
+    }
+    func checkSameLength<O: PendingCarrier>(_ other: O) throws {
+        if pending || other.isPending {
+            if let a = _lengthBuffer, let b = other.pendingLengthBuffer, a === b { return }
+            _ = length; _ = other.resolvedLength
+        }
+        guard other.resolvedLength == length else { throw ArrowMetalError.lengthMismatch(length, other.resolvedLength) }
+    }
+}
+
+protocol PendingCarrier: AnyObject {
+    var isPending: Bool { get }
+    var pendingLengthBuffer: MetalArrowBuffer? { get }
+    var resolvedLength: Int { get }
+    func markPending(capacity: Int, lengthBuffer: MetalArrowBuffer)
+}
+
+extension MetalArray: PendingCarrier {
+    var isPending: Bool { pending }
+    var pendingLengthBuffer: MetalArrowBuffer? { _lengthBuffer }
+    var resolvedLength: Int { length }
+    func markPending(capacity: Int, lengthBuffer: MetalArrowBuffer) {
+        capacityLength = capacity
+        deferLength(from: lengthBuffer) {}
+    }
+}
+extension MetalBooleanArray: PendingCarrier {
+    var isPending: Bool { pending }
+    var pendingLengthBuffer: MetalArrowBuffer? { _lengthBuffer }
+    var resolvedLength: Int { length }
+    func markPending(capacity: Int, lengthBuffer: MetalArrowBuffer) {
+        _capacityLength = capacity
+        pending = true
+        _lengthBuffer = lengthBuffer
+        try? context.afterFlush { [self] in
+            self._length = Int(lengthBuffer.typed(UInt32.self)[0])
+            if let v = self.validity { self._nullCount = self._length - Bitmap.popcount(v.typed(UInt8.self), bits: self._length) }
+            self.pending = false
+        }
+        context.retainUntilFlush(self)
+        context.retainUntilFlush(lengthBuffer)
     }
 }

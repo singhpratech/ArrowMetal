@@ -4,6 +4,7 @@ import CArrowABI
 
 final class TakeCastSliceTests: XCTestCase {
     func testTakeWithNullsAndNullIndices() throws {
+        try requireRealGPU()
         for n in [0, 1, 33, 1000, 100_003] {
             var srcVals: [Int64?] = []
             for i in 0..<n { srcVals.append(i % 7 == 0 ? nil : Int64(i)) }
@@ -34,12 +35,14 @@ final class TakeCastSliceTests: XCTestCase {
     }
 
     func testTakeOutOfRangeThrows() throws {
+        try requireRealGPU()
         let src = try MetalArray<Int32>([1, 2, 3])
         XCTAssertThrowsError(try src.take(try MetalArray<Int32>([0, 3])))
         XCTAssertThrowsError(try src.take(try MetalArray<Int64>([-1])))
     }
 
     func testTakeFloat64AndBoolean() throws {
+        try requireRealGPU()
         let d = try MetalArray<Double>([1.5, nil, -0.0, .nan, 4])
         let r = try d.take(try MetalArray<Int32>([4, 3, 1, 0]))
         XCTAssertEqual(r[0], 4); XCTAssertTrue(r[1]!.isNaN); XCTAssertNil(r[2]); XCTAssertEqual(r[3], 1.5)
@@ -48,6 +51,7 @@ final class TakeCastSliceTests: XCTestCase {
     }
 
     func testCast() throws {
+        try requireRealGPU()
         let i = try MetalArray<Int32>([-5, nil, 300, 7])
         XCTAssertEqual(try i.cast(to: Int8.self).toArray(), [-5, nil, 44, 7])       // 300 wraps
         XCTAssertEqual(try i.cast(to: Float.self).toArray(), [-5, nil, 300, 7])
@@ -65,6 +69,7 @@ final class TakeCastSliceTests: XCTestCase {
     }
 
     func testSliceAlignedIsZeroCopyAndUnalignedCopies() throws {
+        try requireRealGPU()
         let n = 1000
         var aVals: [Int32?] = []
         for i in 0..<n { aVals.append(i % 3 == 0 ? nil : Int32(i)) }
@@ -92,6 +97,7 @@ final class TakeCastSliceTests: XCTestCase {
 
 final class Float64AndBooleanTests: XCTestCase {
     func testFloat64CompareMinMaxFilterOnGPU() throws {
+        try requireRealGPU()
         var g = SystemRandomNumberGenerator()
         for n in [0, 1, 31, 32, 33, 4097, 300_000] {
             var vals: [Double?] = []
@@ -121,6 +127,7 @@ final class Float64AndBooleanTests: XCTestCase {
     }
 
     func testBooleanFilterCountAnyAll() throws {
+        try requireRealGPU()
         for n in [0, 1, 33, 1000, 70_000] {
             let b = try MetalBooleanArray((0..<n).map { $0 % 3 == 0 })
             let m = try MetalBooleanArray((0..<n).map { $0 % 2 == 0 })
@@ -155,6 +162,7 @@ final class RecordBatchTests: XCTestCase {
     }
 
     func testFilterTakeSliceSelect() throws {
+        try requireRealGPU()
         let n = 10_000
         let b = try makeBatch(n)
         let mask = try b["qty"]!.asInt32!.compare(.ge, 8)
@@ -177,6 +185,7 @@ final class RecordBatchTests: XCTestCase {
     }
 
     func testStructExportImportRoundTrip() throws {
+        try requireRealGPU()
         let b = try makeBatch(1000)
         var schema = ArrowSchema(); var arr = ArrowArray()
         b.exportArrowSchema(name: "batch", into: &schema)
@@ -199,6 +208,7 @@ final class RecordBatchTests: XCTestCase {
 
     /// A minimal ArrowArrayStream producer yielding `count` struct batches, as a foreign library would.
     func testArrayStreamImport() throws {
+        try requireRealGPU()
         final class Producer { var remaining = 3; var batches: [MetalRecordBatch] = [] }
         let p = Producer()
         p.batches = try (0..<3).map { try makeBatch(100 * ($0 + 1)) }

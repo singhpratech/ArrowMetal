@@ -14,6 +14,7 @@ final class GroupByTests: XCTestCase {
     }
 
     func testSumCountMeanAcrossKeyCounts() throws {
+        try requireRealGPU()
         var g = SystemRandomNumberGenerator()
         for K in [1, 5, 1000, 1024, 1025, 5000, 100_000] {
             for n in [0, 1, 1000, 300_000] {
@@ -39,6 +40,7 @@ final class GroupByTests: XCTestCase {
     }
 
     func testSumCarryAndWrapping() throws {
+        try requireRealGPU()
         // Values whose low 32 bits overflow many times, plus wrap past Int64.max.
         let keys = try MetalArray<Int32>([Int32](repeating: 0, count: 5000) + [1, 1])
         let vals = try MetalArray<Int64>([Int64](repeating: 0xFFFF_FFFF, count: 5000) + [Int64.max, 1])
@@ -52,6 +54,7 @@ final class GroupByTests: XCTestCase {
     }
 
     func testFloatSumMinMax() throws {
+        try requireRealGPU()
         var g = SystemRandomNumberGenerator()
         for K in [3, 2000] {
             let n = 200_000
@@ -75,6 +78,7 @@ final class GroupByTests: XCTestCase {
     }
 
     func testIntMinMaxAndCountValues() throws {
+        try requireRealGPU()
         let keys = try MetalArray<Int32>([0, 1, 0, 2, 1, nil, 0])
         let i32 = try MetalArray<Int32>([5, -7, nil, 9, 3, 100, -2])
         let gb = try keys.groupBy(keyCount: 4)

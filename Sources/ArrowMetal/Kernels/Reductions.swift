@@ -19,9 +19,10 @@ extension MetalArray {
     /// Integer sums are exact (Int64/UInt64 accumulation, wrapping on overflow like Arrow's `sum`).
     /// Float32 sums accumulate per-thread in float and finalise in double.
     public func sum() throws -> SumResult? {
-        if validCount == 0 { return nil }
+        if !pending && validCount == 0 { return nil }
         guard Dispatch.runsOnGPU(T.self) else { return CPUReference.sum(self) }
         let (partials, counts, groups) = try runReduction("reduce_sum")
+        if validCount == 0 { return nil }   // (now synced) all-null after a pending filter
         // The raw pointers below must not outlive the buffer objects (release builds shorten lifetimes).
         return withExtendedLifetime((partials, counts)) {
             if T.isFloatingPoint {
@@ -45,15 +46,17 @@ extension MetalArray {
 
     /// Minimum non-null value, or nil if none.
     public func min() throws -> T? {
-        if validCount == 0 { return nil }
+        if !pending && validCount == 0 { return nil }
         let (partials, counts, groups) = try runReduction("reduce_min")
+        if validCount == 0 { return nil }
         return finaliseMinMax(partials, counts, groups, initial: T.maxValue) { Swift.min($0, $1) }
     }
 
     /// Maximum non-null value, or nil if none.
     public func max() throws -> T? {
-        if validCount == 0 { return nil }
+        if !pending && validCount == 0 { return nil }
         let (partials, counts, groups) = try runReduction("reduce_max")
+        if validCount == 0 { return nil }
         return finaliseMinMax(partials, counts, groups, initial: T.minValue) { Swift.max($0, $1) }
     }
 
@@ -91,8 +94,9 @@ extension MetalArray {
 
     /// Runs a reduction kernel and returns (partials, counts, threadgroupCount).
     private func runReduction(_ fn: String) throws -> (MetalArrowBuffer, MetalArrowBuffer, Int) {
-        try Dispatch.checkLength(length)
+        try Dispatch.checkLength(dispatchLength)
         let ctx = context
+        let n = dispatchLength
         let acc: String, mslT: String
         let minInit: String, maxInit: String
         var load = "(ACC)vals[i]", extra = "true"
@@ -107,14 +111,14 @@ extension MetalArray {
         let src = KernelSource.reductions(T: mslT, ACC: acc, minInit: minInit, maxInit: maxInit, load: load, extra: extra)
         let pso = try Dispatch.pipeline(ctx, family: "reduce", source: src, function: fn, type: mslT + (extra == "true" ? "" : "/skipnan"))
         // Enough threadgroups to saturate the GPU, but few enough that the CPU finalise is trivial.
-        let groups = Swift.max(1, Swift.min(2048, (length + Dispatch.threadgroupSize - 1) / Dispatch.threadgroupSize))
+        let groups = Swift.max(1, Swift.min(2048, (n + Dispatch.threadgroupSize - 1) / Dispatch.threadgroupSize))
         let partials = try MetalArrowBuffer.allocate(byteCount: groups * 8, zeroed: false, context: ctx)
         let counts = try MetalArrowBuffer.allocate(byteCount: groups * 4, zeroed: false, context: ctx)
         try ctx.run { enc in
             enc.setComputePipelineState(pso)
             enc.setBuffer(values.mtl, offset: values.offset, index: 0)
             if let v = validity { enc.setBuffer(v.mtl, offset: v.offset, index: 1) } else { enc.setBuffer(values.mtl, offset: 0, index: 1) }
-            Dispatch.setUInt(enc, length, index: 2)
+            Dispatch.setLength(enc, n, lengthBuffer, index: 2)
             Dispatch.setUInt(enc, validity == nil ? 0 : 1, index: 3)
             enc.setBuffer(partials.mtl, offset: 0, index: 4)
             enc.setBuffer(counts.mtl, offset: 0, index: 5)

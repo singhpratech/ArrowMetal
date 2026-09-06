@@ -11,8 +11,8 @@ extension MetalArray {
     /// Arrow `take`: gathers `indices` from this array. A null index yields a null output element.
     /// Throws `invalidArrowArray` if any index is out of range (checked on the GPU, reported after the dispatch).
     public func take<I: ArrowIndex>(_ indices: MetalArray<I>) throws -> MetalArray<T> {
-        try Dispatch.checkLength(length)
-        try Dispatch.checkLength(indices.length)
+        try Dispatch.checkLength(dispatchLength)
+        try Dispatch.checkLength(indices.length)   // index arrays sync if pending: their length sizes the output
         let ctx = context
         let n = indices.length
         let mslT = Dispatch.moveType(T.self)
@@ -30,7 +30,7 @@ extension MetalArray {
                 enc.setBuffer(indices.values.mtl, offset: indices.values.offset, index: 2)
                 enc.setBuffer((indices.validity ?? indices.values).mtl, offset: (indices.validity ?? indices.values).offset, index: 3)
                 Dispatch.setUInt(enc, n, index: 4)
-                Dispatch.setUInt(enc, length, index: 5)
+                Dispatch.setLength(enc, dispatchLength, lengthBuffer, index: 5)
                 Dispatch.setUInt(enc, (hasV ? 1 : 0) | (hasIV ? 2 : 0), index: 6)
                 enc.setBuffer(out.mtl, offset: out.offset, index: 7)
                 enc.setBuffer(validBytes.mtl, offset: validBytes.offset, index: 8)
@@ -38,7 +38,7 @@ extension MetalArray {
                 Dispatch.dispatch1D(enc, pso, count: n)
             }
         }
-        let srcLen = length
+        let srcLen = dispatchLength
         try ctx.afterFlush { [errorFlag] in
             if errorFlag.typed(UInt32.self)[0] != 0 { throw ArrowMetalError.invalidArrowArray("take: index out of range (array length \(srcLen))") }
         }

@@ -51,8 +51,13 @@ bounds errors), and a fresh batch is opened so the caller keeps batching. While 
 pool parks returned buffers instead of recycling them, so pending GPU work can never observe a reused
 buffer. Per-thread batches; nested `batch` calls join the outer one.
 
-Not yet: returning futures for reductions (a `sum()` inside a batch still syncs), and completion handlers
-for fully asynchronous Swift.
+**Lengths flow on the GPU.** Every kernel takes its element count as `device const uint* nPtr`. A pending
+filter result binds the GPU-written total as that pointer and is dispatched at its worst-case size, so the
+next kernel (compare, arithmetic, cast, bitmap ops, another filter, a reduction's partial pass) never needs
+the CPU to know the length. A reduction still syncs once to read its partials.
+
+Not yet: futures for reduction results, completion handlers / Swift `async` so the calling thread is
+released while the GPU works, and Float64 sum/arithmetic on the GPU (double-float emulation).
 
 ## Roadmap for "no room left"
 1. **Pipelined execution** (above). Biggest win for query-shaped work and for Python callers.

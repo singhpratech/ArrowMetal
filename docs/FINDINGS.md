@@ -48,3 +48,14 @@ Things learned the hard way. Add to this whenever something surprises you.
   the ~120 µs floor is the round trip. Batching is what works: chains pay it once.
 - A `sum()` on a batched filter result still costs a second round trip because the reduction needs the
   filtered length on the CPU. Next: kernels read `n` from a device buffer so pending lengths flow on the GPU.
+
+## Round 5 (2026-09-06)
+- With full compiler logs enabled, the paravirtual GPU on GitHub runners fails `makeComputePipelineState`
+  for arbitrary trivial kernels (`bitmap_not`, `cast_kernel`) with no diagnostic while identical kernels
+  pass in the same run. It is the virtual Metal stack, not a construct. Mitigation: one retry on pipeline
+  creation, and GPU tests `XCTSkip` on devices whose name contains "Paravirtual" (`ARROWMETAL_FORCE_GPU_TESTS=1`
+  overrides). CI validates the build, interop and CPU paths; GPU correctness runs on real hardware.
+- Kernels now read their element count from a device buffer (`device const uint* nPtr`). A pending
+  filter result binds its GPU-written total as that buffer, so compare / arithmetic / cast / bitmap ops /
+  another filter / a reduction can consume it inside the same command buffer with worst-case dispatch sizes.
+  Reductions still sync to read partials, but a filter followed by a sum is now one round trip.

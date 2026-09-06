@@ -24,7 +24,7 @@ enum KernelSource {
         func body(_ name: String, _ initVal: String, _ combine: String) -> String { """
         kernel void reduce_\(name)(device const \(T)* vals [[buffer(0)]],
                                   device const uchar* validity [[buffer(1)]],
-                                  constant uint& n [[buffer(2)]],
+                                  device const uint* nPtr [[buffer(2)]],
                                   constant uint& hasValidity [[buffer(3)]],
                                   device \(ACC)* partials [[buffer(4)]],
                                   device uint* counts [[buffer(5)]],
@@ -34,6 +34,7 @@ enum KernelSource {
                                   uint gridSize [[threads_per_grid]]) {
             threadgroup \(ACC) shared[TG];
             threadgroup uint scount[TG];
+            uint n = *nPtr;
             \(ACC) acc = \(initVal);
             uint cnt = 0;
             // Bulk: 4 consecutive elements per iteration through a vector load (the 4 validity bits sit in one byte).
@@ -84,9 +85,10 @@ enum KernelSource {
             s += """
             kernel void cmp_scalar_\(name)(device const \(T)* a [[buffer(0)]],
                                           constant \(T)& scalar [[buffer(1)]],
-                                          constant uint& n [[buffer(2)]],
+                                          device const uint* nPtr [[buffer(2)]],
                                           device uint* out [[buffer(3)]],
                                           uint w [[thread_position_in_grid]]) {
+                uint n = *nPtr;
                 uint base = w * 32u;
                 if (base >= n) return;
                 uint limit = min(32u, n - base);
@@ -96,9 +98,10 @@ enum KernelSource {
             }
             kernel void cmp_array_\(name)(device const \(T)* a [[buffer(0)]],
                                          device const \(T)* b [[buffer(1)]],
-                                         constant uint& n [[buffer(2)]],
+                                         device const uint* nPtr [[buffer(2)]],
                                          device uint* out [[buffer(3)]],
                                          uint w [[thread_position_in_grid]]) {
+                uint n = *nPtr;
                 uint base = w * 32u;
                 if (base >= n) return;
                 uint limit = min(32u, n - base);
@@ -126,9 +129,10 @@ enum KernelSource {
             }
             kernel void cmp_scalar_\(name)(device const long* a [[buffer(0)]],
                                           constant long& scalar [[buffer(1)]],
-                                          constant uint& n [[buffer(2)]],
+                                          device const uint* nPtr [[buffer(2)]],
                                           device uint* out [[buffer(3)]],
                                           uint w [[thread_position_in_grid]]) {
+                uint n = *nPtr;
                 uint base = w * 32u;
                 if (base >= n) return;
                 uint limit = min(32u, n - base);
@@ -138,9 +142,10 @@ enum KernelSource {
             }
             kernel void cmp_array_\(name)(device const long* a [[buffer(0)]],
                                          device const long* b [[buffer(1)]],
-                                         constant uint& n [[buffer(2)]],
+                                         device const uint* nPtr [[buffer(2)]],
                                          device uint* out [[buffer(3)]],
                                          uint w [[thread_position_in_grid]]) {
+                uint n = *nPtr;
                 uint base = w * 32u;
                 if (base >= n) return;
                 uint limit = min(32u, n - base);
@@ -162,13 +167,14 @@ enum KernelSource {
                             device const \(I)* idx [[buffer(2)]],
                             device const uchar* idxValidity [[buffer(3)]],
                             constant uint& n [[buffer(4)]],
-                            constant uint& srcLen [[buffer(5)]],
+                            device const uint* srcLenPtr [[buffer(5)]],
                             constant uint& flags [[buffer(6)]],
                             device \(T)* out [[buffer(7)]],
                             device uchar* outValidBytes [[buffer(8)]],
                             device atomic_uint* errorFlag [[buffer(9)]],
                             uint i [[thread_position_in_grid]]) {
         if (i >= n) return;
+        uint srcLen = *srcLenPtr;
         if ((flags & 2u) && !bit_get(idxValidity, i)) { out[i] = 0; outValidBytes[i] = 0; return; }
         long j = (long)idx[i];
         if (j < 0 || j >= (long)srcLen) { atomic_store_explicit(errorFlag, 1u, memory_order_relaxed); out[i] = 0; outValidBytes[i] = 0; return; }
@@ -179,8 +185,9 @@ enum KernelSource {
 
     /// Numeric cast. Float to integer truncates toward zero; out-of-range is unspecified (as in Arrow's unchecked cast).
     static func cast(From: String, To: String) -> String { prelude + """
-    kernel void cast_kernel(device const \(From)* a [[buffer(0)]], constant uint& n [[buffer(1)]],
+    kernel void cast_kernel(device const \(From)* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]],
                             device \(To)* out [[buffer(2)]], uint t [[thread_position_in_grid]]) {
+        uint n = *nPtr;
         uint i = t * 4u;
         if (i + 4u <= n) {
             \(From)4 v = *(device const \(From)4*)(a + i);
@@ -211,9 +218,10 @@ enum KernelSource {
             s += """
             kernel void arith_scalar_\(name)(device const \(T)* a [[buffer(0)]],
                                             constant \(T)& scalar [[buffer(1)]],
-                                            constant uint& n [[buffer(2)]],
+                                            device const uint* nPtr [[buffer(2)]],
                                             device \(T)* out [[buffer(3)]],
                                             uint t [[thread_position_in_grid]]) {
+                uint n = *nPtr;
                 uint i = t * 4u;
                 if (i + 4u <= n) {
                     \(T)4 v = *(device const \(T)4*)(a + i);
@@ -224,9 +232,10 @@ enum KernelSource {
             }
             kernel void arith_array_\(name)(device const \(T)* a [[buffer(0)]],
                                            device const \(T)* b [[buffer(1)]],
-                                           constant uint& n [[buffer(2)]],
+                                           device const uint* nPtr [[buffer(2)]],
                                            device \(T)* out [[buffer(3)]],
                                            uint t [[thread_position_in_grid]]) {
+                uint n = *nPtr;
                 uint i = t * 4u;
                 if (i + 4u <= n) {
                     \(T)4 va = *(device const \(T)4*)(a + i);
@@ -244,34 +253,36 @@ enum KernelSource {
 
     /// Bitmap word operations (validity combination) and bit packing.
     static let bitmap = prelude + """
+    // Bitmap word ops: n is the bit count (from a device buffer so pending lengths flow on the GPU).
     kernel void bitmap_and(device const uint* a [[buffer(0)]], device const uint* b [[buffer(1)]],
-                           constant uint& words [[buffer(2)]], device uint* out [[buffer(3)]],
+                           device const uint* nPtr [[buffer(2)]], device uint* out [[buffer(3)]],
                            uint w [[thread_position_in_grid]]) {
-        if (w < words) out[w] = a[w] & b[w];
+        if (w < (*nPtr + 31u) / 32u) out[w] = a[w] & b[w];
     }
     kernel void bitmap_and_not(device const uint* a [[buffer(0)]], device const uint* b [[buffer(1)]],
-                               constant uint& words [[buffer(2)]], device uint* out [[buffer(3)]],
+                               device const uint* nPtr [[buffer(2)]], device uint* out [[buffer(3)]],
                                uint w [[thread_position_in_grid]]) {
-        if (w < words) out[w] = a[w] & ~b[w];
+        if (w < (*nPtr + 31u) / 32u) out[w] = a[w] & ~b[w];
     }
     kernel void bitmap_or(device const uint* a [[buffer(0)]], device const uint* b [[buffer(1)]],
-                          constant uint& words [[buffer(2)]], device uint* out [[buffer(3)]],
+                          device const uint* nPtr [[buffer(2)]], device uint* out [[buffer(3)]],
                           uint w [[thread_position_in_grid]]) {
-        if (w < words) out[w] = a[w] | b[w];
+        if (w < (*nPtr + 31u) / 32u) out[w] = a[w] | b[w];
     }
     kernel void bitmap_not(device const uint* a [[buffer(0)]],
-                           constant uint& words [[buffer(2)]], device uint* out [[buffer(3)]],
+                           device const uint* nPtr [[buffer(2)]], device uint* out [[buffer(3)]],
                            uint w [[thread_position_in_grid]]) {
-        if (w < words) out[w] = ~a[w];
+        if (w < (*nPtr + 31u) / 32u) out[w] = ~a[w];
     }
     // Unpacks a bitmap into one byte per element. One thread per element.
-    kernel void unpack_bits(device const uchar* bits [[buffer(0)]], constant uint& n [[buffer(1)]],
+    kernel void unpack_bits(device const uchar* bits [[buffer(0)]], device const uint* nPtr [[buffer(1)]],
                             device uchar* out [[buffer(2)]], uint i [[thread_position_in_grid]]) {
-        if (i < n) out[i] = bit_get(bits, i) ? 1 : 0;
+        if (i < *nPtr) out[i] = bit_get(bits, i) ? 1 : 0;
     }
     // Packs one byte-per-element (0/1) buffer into a bitmap. One thread per output word.
-    kernel void pack_bits(device const uchar* bytes [[buffer(0)]], constant uint& n [[buffer(1)]],
+    kernel void pack_bits(device const uchar* bytes [[buffer(0)]], device const uint* nPtr [[buffer(1)]],
                           device uint* out [[buffer(2)]], uint w [[thread_position_in_grid]]) {
+        uint n = *nPtr;
         uint base = w * 32u;
         if (base >= n) return;
         uint limit = min(32u, n - base);
@@ -294,7 +305,7 @@ enum KernelSource {
         return word;
     }
     kernel void filter_count(device const uint* sel [[buffer(0)]],
-                             constant uint& n [[buffer(1)]],
+                             device const uint* nPtr [[buffer(1)]],
                              device uint* blockCounts [[buffer(2)]],
                              uint w [[thread_position_in_grid]],
                              uint lid [[thread_index_in_threadgroup]],
@@ -302,6 +313,7 @@ enum KernelSource {
                              uint sgid [[simdgroup_index_in_threadgroup]],
                              uint lane [[thread_index_in_simdgroup]]) {
         threadgroup uint simdTotals[32];
+        uint n = *nPtr;
         uint c = popcount(masked_word(sel, w, n));
         uint t = simd_sum(c);
         if (lane == 0) simdTotals[sgid] = t;
@@ -315,12 +327,13 @@ enum KernelSource {
     // Exclusive scan of block counts, single threadgroup (blocks <= a few hundred thousand is fine: each thread
     // handles a strided range, then a TG-wide scan of the per-thread totals).
     kernel void filter_scan(device uint* blockCounts [[buffer(0)]],
-                            constant uint& blocks [[buffer(1)]],
+                            device const uint* nPtr [[buffer(1)]],
                             device uint* total [[buffer(2)]],
                             uint lid [[thread_index_in_threadgroup]],
                             uint sgid [[simdgroup_index_in_threadgroup]],
                             uint lane [[thread_index_in_simdgroup]]) {
         threadgroup uint simdTotals[32];
+        uint blocks = max(1u, ((*nPtr + 31u) / 32u + TG - 1u) / TG);
         uint per = (blocks + TG - 1) / TG;
         uint lo = lid * per, hi = min(blocks, lo + per);
         uint local = 0;
@@ -358,7 +371,7 @@ enum KernelSource {
     }
     kernel void filter_pred_count(device const \(T)* vals [[buffer(0)]],
                                   device const uchar* validity [[buffer(1)]],
-                                  constant uint& n [[buffer(2)]],
+                                  device const uint* nPtr [[buffer(2)]],
                                   constant uint& hasValidity [[buffer(3)]],
                                   constant uint& op [[buffer(4)]],
                                   constant \(T)& scalar [[buffer(5)]],
@@ -370,6 +383,7 @@ enum KernelSource {
                                   uint sgid [[simdgroup_index_in_threadgroup]],
                                   uint lane [[thread_index_in_simdgroup]]) {
         threadgroup uint simdTotals[32];
+        uint n = *nPtr;
         uint word = pred_word(vals, validity, hasValidity, w, n, op, scalar);
         if (w * 32u < n) sel[w] = word;
         uint c = popcount(word);
@@ -381,7 +395,7 @@ enum KernelSource {
     kernel void filter_scatter(device const \(T)* vals [[buffer(0)]],
                                device const uchar* validity [[buffer(1)]],
                                device const uint* sel [[buffer(2)]],
-                               constant uint& n [[buffer(3)]],
+                               device const uint* nPtr [[buffer(3)]],
                                constant uint& hasValidity [[buffer(4)]],
                                device const uint* blockOffsets [[buffer(5)]],
                                device \(T)* out [[buffer(6)]],
@@ -392,6 +406,7 @@ enum KernelSource {
                                uint sgid [[simdgroup_index_in_threadgroup]],
                                uint lane [[thread_index_in_simdgroup]]) {
         threadgroup uint simdTotals[32];
+        uint n = *nPtr;
         uint word = masked_word(sel, w, n);
         uint c = popcount(word);
         uint local = simd_prefix_exclusive_sum(c);

@@ -38,6 +38,9 @@ public final class MetalContext: @unchecked Sendable {
     private var pipelines: [String: MTLComputePipelineState] = [:]
     private var libraries: [String: MTLLibrary] = [:]
 
+    /// True on virtualised GPUs (GitHub-hosted runners) where Metal pipeline creation is unreliable.
+    public var isVirtualDevice: Bool { device.name.localizedCaseInsensitiveContains("paravirtual") }
+
     /// Set ARROWMETAL_DEBUG_SHADERS=1 to dump generated MSL and full compiler diagnostics on failure.
     static let debugShaders = ProcessInfo.processInfo.environment["ARROWMETAL_DEBUG_SHADERS"] != nil
 
@@ -92,7 +95,13 @@ public final class MetalContext: @unchecked Sendable {
             throw ArrowMetalError.pipelineCreationFailed("function \(function) not found")
         }
         do {
-            let p = try device.makeComputePipelineState(function: fn)
+            let p: MTLComputePipelineState
+            do { p = try device.makeComputePipelineState(function: fn) }
+            catch {
+                // Virtualised GPUs (GitHub's "Apple Paravirtual device") fail pipeline creation sporadically; retry once.
+                usleep(20_000)
+                p = try device.makeComputePipelineState(function: fn)
+            }
             pipelines[cacheKey] = p
             return p
         } catch {

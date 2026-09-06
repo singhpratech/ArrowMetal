@@ -26,6 +26,7 @@ final class KernelTests: XCTestCase {
     }
 
     func testReductionsAllTypes() throws {
+        try requireRealGPU()
         for n in [0, 1, 7, 33, 255, 256, 257, 100_003, 1_000_000] {
             try checkReductions(try randomArray(Int8.self, n: n, nullFraction: 0.1) { T in Int8.random(in: .min ... .max, using: &T) })
             try checkReductions(try randomArray(UInt8.self, n: n, nullFraction: 0.1) { T in UInt8.random(in: .min ... .max, using: &T) })
@@ -48,6 +49,7 @@ final class KernelTests: XCTestCase {
     }
 
     func testMeanAndOverflowWrap() throws {
+        try requireRealGPU()
         let a = try MetalArray<Int64>([Int64.max, 1])
         XCTAssertEqual(try a.sum(), .int(Int64.min))
         let b = try MetalArray<Int32>([1, 2, nil, 3])
@@ -55,6 +57,7 @@ final class KernelTests: XCTestCase {
     }
 
     func testCompareScalarAndArray() throws {
+        try requireRealGPU()
         for n in [0, 1, 31, 32, 33, 1000, 65_537] {
             let a = try randomArray(Int32.self, n: n, nullFraction: 0.2) { T in Int32.random(in: -50...50, using: &T) }
             let b = try randomArray(Int32.self, n: n, nullFraction: 0.2) { T in Int32.random(in: -50...50, using: &T) }
@@ -72,6 +75,7 @@ final class KernelTests: XCTestCase {
     }
 
     func testBooleanLogic() throws {
+        try requireRealGPU()
         let a = try MetalBooleanArray([true, false, true, false, true])
         let b = try MetalBooleanArray([true, true, false, false, true])
         XCTAssertEqual(try a.and(b).toArray(), [true, false, false, false, true])
@@ -81,6 +85,7 @@ final class KernelTests: XCTestCase {
     }
 
     func testArithmetic() throws {
+        try requireRealGPU()
         for n in [0, 1, 255, 10_001] {
             let a = try randomArray(Int64.self, n: n, nullFraction: 0.2) { T in Int64.random(in: -1000...1000, using: &T) }
             let b = try randomArray(Int64.self, n: n, nullFraction: 0.2) { T in Int64.random(in: 1...1000, using: &T) }
@@ -101,6 +106,7 @@ final class KernelTests: XCTestCase {
     }
 
     func testFilter() throws {
+        try requireRealGPU()
         for n in [0, 1, 31, 32, 33, 8191, 8192, 8193, 100_000, 1_000_001] {
             let a = try randomArray(Int32.self, n: n, nullFraction: 0.15) { T in Int32.random(in: -100...100, using: &T) }
             let mask = try a.compare(.gt, 0)
@@ -125,6 +131,7 @@ final class KernelTests: XCTestCase {
 
 final class CInteropTests: XCTestCase {
     func testExportImportRoundTripIsZeroCopy() throws {
+        try requireRealGPU()
         let a = try MetalArray<Int64>([1, nil, 3, 4, nil])
         var schema = ArrowSchema(); var arr = ArrowArray()
         a.exportArrowSchema(name: "x", into: &schema)
@@ -144,6 +151,7 @@ final class CInteropTests: XCTestCase {
     }
 
     func testDeviceExport() throws {
+        try requireRealGPU()
         let a = try MetalArray<Float>([1, 2, 3])
         var d = ArrowDeviceArray()
         a.exportArrowDeviceArray(into: &d)
@@ -189,6 +197,7 @@ final class CInteropTests: XCTestCase {
     }
 
     func testImportForeignPageAlignedIsZeroCopyAndReleasesOnDeinit() throws {
+        try requireRealGPU()
         let released = UnsafeMutablePointer<Bool>.allocate(capacity: 1); released.pointee = false
         var schema = ArrowSchema(); exportArrowSchema(format: "i", into: &schema)
         let vals = (0..<5000).map { Int32($0) }

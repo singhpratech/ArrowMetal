@@ -7,23 +7,25 @@ extension MetalArray {
     /// Casts involving Float64 run on the CPU.
     public func cast<U: ArrowPrimitive>(to _: U.Type) throws -> MetalArray<U> {
         if U.self == T.self { return self as! MetalArray<U> }
-        try Dispatch.checkLength(length)
+        let n = dispatchLength
+        try Dispatch.checkLength(n)
         let ctx = context
-        let out = try MetalArrowBuffer.allocate(byteCount: length * U.byteWidth, zeroed: false, context: ctx)
+        let out = try MetalArrowBuffer.allocate(byteCount: n * U.byteWidth, zeroed: false, context: ctx)
         if Dispatch.runsOnGPU(T.self) && Dispatch.runsOnGPU(U.self) {
             let src = KernelSource.cast(From: T.mslType, To: U.mslType)
             let pso = try Dispatch.pipeline(ctx, family: "cast", source: src, function: "cast_kernel", type: "\(T.mslType)->\(U.mslType)")
-            if length > 0 {
+            if n > 0 {
                 try ctx.run { enc in
                     enc.setComputePipelineState(pso)
                     enc.setBuffer(values.mtl, offset: values.offset, index: 0)
-                    Dispatch.setUInt(enc, length, index: 1)
+                    Dispatch.setLength(enc, n, lengthBuffer, index: 1)
                     enc.setBuffer(out.mtl, offset: out.offset, index: 2)
-                    Dispatch.dispatch1D(enc, pso, count: (length + 3) / 4)
+                    Dispatch.dispatch1D(enc, pso, count: (n + 3) / 4)
                 }
             }
+            return inheritPending(MetalArray<U>(length: knownLength, nullCount: _nullCount, validity: validity, values: out, context: ctx))
         } else {
-            let src = valuePointer, dst = out.mutableTyped(U.self)
+            let src = valuePointer, dst = out.mutableTyped(U.self)   // valuePointer syncs if pending
             for i in 0..<length { dst[i] = U.convert(src[i]) }
         }
         return MetalArray<U>(length: length, nullCount: nullCount, validity: validity, values: out, context: ctx)

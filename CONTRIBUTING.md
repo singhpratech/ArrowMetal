@@ -24,7 +24,14 @@ swift run -c release arrowmetal-bench 10000000 3
 ```
 XCTest needs Xcode; the library itself builds with Command Line Tools only.
 
+## CI and real hardware
+GitHub's hosted Apple silicon runners expose an "Apple Paravirtual device" whose Metal compiler fails
+sporadically, so GPU tests are skipped there (`requireRealGPU()`), and CI proves the build, interop and CPU
+paths only. Run the full suite on a real Mac before merging; set `ARROWMETAL_FORCE_GPU_TESTS=1` to run GPU
+tests on a virtual device anyway.
+
 ## Debugging GPU kernels
+- `ARROWMETAL_DEBUG_SHADERS=1` dumps the generated MSL and the full compiler log when a shader or pipeline fails.
 - `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 swift run ...` enables API and shader validation.
 - Compilation errors from `makeLibrary(source:)` include line numbers relative to the generated source; print
   `KernelSource.<family>(T:)` to see it.
