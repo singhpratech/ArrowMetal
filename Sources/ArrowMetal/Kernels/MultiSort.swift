@@ -61,6 +61,16 @@ extension AnyMetalArray {
             }
         case .string, .binary, .dictionary, .runEndEncoded, .decimal, .list, .structure, .map, .union:
             throw ArrowMetalError.unsupportedType("sort by \(arrowFormat) is not implemented")
+        // float16 sorts through the float32 widening; the rest have no order-preserving GPU key.
+        case .float16(let a): return try a.toFloat32().argsort(descending: descending)
+        case .smallDecimal(let s):
+            switch s.storage {
+            case .int32(let a): return try a.argsort(descending: descending)
+            case .int64(let a): return try a.argsort(descending: descending)
+            }
+        case .extended(let a): return try a.storage.argsortIndices(descending: descending)
+        case .null, .interval, .fixedBinary:
+            throw ArrowMetalError.unsupportedType("sort by \(arrowFormat) is not implemented")
         }
     }
 
@@ -88,6 +98,12 @@ extension AnyMetalArray {
         case .structure(let a): return a.context
         case .map(let a): return a.context
         case .union(let a): return a.context
+        case .null(let a): return a.context
+        case .float16(let a): return a.context
+        case .smallDecimal(let a): return a.context
+        case .interval(let a): return a.context
+        case .fixedBinary(let a): return a.context
+        case .extended(let a): return a.storage.metalContext
         }
     }
 }

@@ -529,6 +529,145 @@ int  am_string_index_in(am_array* a, am_array* set, am_array** out);  // int32
 int  am_binary_join(am_array* list, const uint8_t* sep, int64_t sep_len,
                     am_array* sep_array /* or NULL */, am_array** out);
 
+// ---------------------------------------------------------------------------------------------------
+// The remaining Arrow type-matrix rows and the type-adjacent functions.
+//
+// am_import / am_export already carry every one of these through the C Data Interface, and am_filter /
+// am_take / am_slice already work on them, so what follows is only the compute each type has:
+//
+//   format        type                      notes
+//   ------------  ------------------------  ----------------------------------------------------------
+//   "n"           null                      length only, no buffers; exports with n_buffers = 0
+//   "e"           float16                   binary16 patterns; compute goes through float32
+//   "d:p,s,32"    decimal32                 widens to decimal128 for compute
+//   "d:p,s,64"    decimal64                 widens to decimal128 for compute
+//   "tiM"         interval[month]           int32 months
+//   "tiD"         interval[day_time]        int32 days + int32 milliseconds
+//   "tin"         interval[month_day_nano]  int32 months + int32 days + int64 nanoseconds
+//   "w:N"         fixed_size_binary         N raw bytes per element
+//   "+vl" / "+vL" list_view / large_list_view   imported as "+l" (see below), never exported as a view
+//
+// A "+vl" / "+vL" array is converted on import to the contiguous int32 offsets MetalListArray uses: rows
+// that already lie back to back keep the producer's child untouched, and anything else (out of order,
+// overlapping or with gaps) materialises a contiguous child with one GPU gather. Either way the array
+// exports as a plain list ("+l"), because ArrowMetal has no view-shaped column.
+//
+// An extension type is a storage type plus the schema metadata keys ARROW:extension:name and
+// ARROW:extension:metadata. am_import decodes them (the metadata blob is the C Data Interface's own
+// int32-count, length-prefixed key/value encoding) and keeps them beside the storage array, am_format
+// reports the *storage* format, and am_export writes both keys back so a consumer that knows the type —
+// pyarrow with the extension registered — reconstructs it. Every other metadata key survives too.
+
+// float16 <-> float32 on the GPU. `to_half` non-zero narrows a float32 column (round to nearest-even,
+// overflow to +/-infinity); zero widens a float16 column (exact). Arithmetic is never done in half
+// precision: widen, compute with the float32 kernels, and cast back here when you want a half result.
+int  am_cast_float16(am_array* a, int to_half, am_array** out);
+
+// decimal32 / decimal64 -> decimal128 on the GPU (sign extension into two limbs), so am_decimal_op can
+// run on the result. A decimal128 column passes through unchanged.
+int  am_decimal_widen(am_array* a, am_array** out);
+// decimal128 -> decimal32 (`bit_width` 32) or decimal64 (64) on the GPU, keeping the scale. `precision`
+// 0 means "as much as the target width allows". A value that does not fit wraps (Arrow's unchecked cast).
+int  am_decimal_narrow(am_array* a, int bit_width, int64_t precision, am_array** out);
+
+// Arrow equal (`op` 0) / not_equal (`op` 1) over a fixed_size_binary column, on the GPU as a byte
+// compare. Pass `b_or_null` for the array form, or `scalar_bytes` / `len` (exactly the element width)
+// for the scalar form. Null in, null out; the array form ANDs the two validity bitmaps. Ordering
+// comparisons are not defined for this type and are an error.
+int  am_fixed_binary_compare(am_array* a, int op, am_array* b_or_null,
+                             const uint8_t* scalar_bytes, int64_t len, am_array** out);
+// FNV-1a 64 over each element's bytes, on the GPU: an ArrowMetal extension, not Arrow's `hash64`.
+// Null in, null out; the output is uint64.
+int  am_fixed_binary_hash64(am_array* a, am_array** out);
+
+// Arrow add(timestamp | date, interval) on the GPU. `interval` is a "tiM", "tiD" or "tin" column of a's
+// length, or of length 1 to broadcast. Month arithmetic goes through the civil calendar and clamps the
+// day to the target month's length (2024-01-31 + 1 month = 2024-02-29), which is what Arrow does; days
+// are whole UTC days, and the interval's sub-day field is converted to the column's own resolution,
+// truncating toward zero when the column is coarser. date32 counts whole days, so an interval with a
+// non-zero sub-day part is rejected there rather than silently dropped. The result has a's type and is
+// null wherever either side is.
+//
+// pyarrow has no `add` kernel for (timestamp, interval), so this one has no pyarrow oracle to compare
+// against; it is checked against a host civil-calendar oracle instead.
+int  am_add_interval(am_array* a, am_array* interval, am_array** out);
+
+// The three Arrow difference functions that return an interval, on the GPU. `kind` is 0
+// month_interval_between ("tiM"), 1 day_time_interval_between ("tiD"), 2
+// month_day_nano_interval_between ("tin"); `a` is Arrow's `start` and `b` its `end`.
+//
+// Every field is the difference of the corresponding *truncated* field, which is how Arrow defines
+// these: months are month boundaries crossed ((y2 - y1) * 12 + (m2 - m1), so 2020-01-31 -> 2020-02-01 is
+// one month), the day field is the difference of the day-of-month fields (month_day_nano) or of the
+// whole days (day_time), and the sub-day field is the difference of the two times of day. The day and
+// sub-day fields may therefore have the opposite sign to the month count. Both columns must be date or
+// timestamp columns of the same length; they are brought to a common resolution first. Null in, null out.
+int  am_interval_between(am_array* a, am_array* b, int kind, am_array** out);
+
+// One field of an interval column as a plain integer column: `field` 0 months (int32), 1 days (int32),
+// 2 nanoseconds (int64). A field the layout does not carry comes back as zeros. This is how to read an
+// interval[month] or interval[day_time] column from a binding whose Arrow library cannot represent those
+// types (pyarrow 25 cannot wrap them in Python).
+int  am_interval_field(am_array* a, int field, am_array** out);
+
+// Arrow list_parent_indices: for every child element the list references — the same range
+// am_list_flatten returns — the index of the row that covers it. One GPU binary search per element, so
+// empty and null rows cost nothing. Accepts list, large_list, fixed_size_list and map. The result is
+// **int32** where pyarrow returns int64, because list offsets are int32 throughout this package.
+int  am_list_parent_indices(am_array* a, am_array** out);
+
+// Arrow list_slice: row[start:stop:step] for every row, as a variable-length list ("+l") whatever the
+// input layout was. A negative `stop` means "to the end of each row"; `start` must be >= 0 and `step`
+// >= 1, as Arrow requires. A null row stays null and a row shorter than `start` becomes empty. GPU: one
+// kernel for the new row lengths, the shared scan for the offsets, one kernel to expand the indices.
+int  am_list_slice(am_array* a, int64_t start, int64_t stop, int64_t step, am_array** out);
+
+// Arrow map_lookup: the value(s) whose key matches, per row. `occurrence` is 0 first, 1 last, 2 all.
+// For a map with utf8 or binary keys the key is `key_bytes` / `len`; for a map with integer keys it is
+// the first 8 bytes of `key_bytes` read as a little-endian int64 (`len` must be 8). `first` / `last`
+// return the map's item type, `all` returns a list of it, and all three are null where the row is null
+// or the key is absent — an empty list never stands for "not found", matching pyarrow. GPU: one kernel
+// scans each row's entry range reporting the first match, the last match and the match count; `all`
+// scans the counts into offsets and a second kernel writes the matching entry indices to gather.
+// Float and nested key types are rejected.
+int  am_map_lookup(am_array* a, const uint8_t* key_bytes, int64_t len, int occurrence, am_array** out);
+
+// Arrow assume_timezone: reads a naive timestamp column as wall-clock times in `tz` and returns the
+// instants they name, tagged with that timezone. The unit and the sub-second part are unchanged.
+// `tz` is an IANA name ("America/New_York") or a fixed offset ("+02:00").
+//
+// **CPU**, deliberately: the tz database is host data (Foundation's TimeZone) with no GPU-resident form,
+// so the per-value offsets are computed on the host, sharded over DispatchQueue.concurrentPerform with a
+// per-shard cache of the current offset's validity interval.
+//
+// `ambiguous` and `nonexistent` are 0 raise (Arrow's default), 1 earliest, 2 latest. A local time that
+// occurs twice (a DST fall-back) picks the earlier / later instant; one that never occurs (a
+// spring-forward gap) becomes the last instant before / the first instant after the gap.
+int  am_assume_timezone(am_array* a, const char* tz, int ambiguous, int nonexistent, am_array** out);
+
+// Arrow local_timestamp: the wall-clock time each instant names in the column's own timezone, as a naive
+// timestamp of the same unit. A column with no timezone comes back unchanged. **CPU**, for the same
+// reason as am_assume_timezone.
+int  am_local_timestamp(am_array* a, am_array** out);
+
+// ARROW:extension:name of an extension column, or NULL when the column is not an extension type. The
+// pointer is owned by the library and stays valid for the process's lifetime.
+const char* am_extension_name(am_array* a);
+// ARROW:extension:metadata as raw bytes, or NULL when there is none; `out_len` receives the byte count.
+// Same ownership as am_extension_name.
+const char* am_extension_metadata(am_array* a, int64_t* out_len);
+// The storage column of an extension array (the array itself for every other type), so the ordinary
+// kernels can run on it without an export/import round trip.
+int  am_extension_storage(am_array* a, am_array** out);
+// Tags a column as the storage of an extension type, so am_export writes the two metadata keys.
+// `metadata` may be NULL (with `metadata_len` 0).
+int  am_extension_wrap(am_array* a, const char* name, const uint8_t* metadata, int64_t metadata_len,
+                       am_array** out);
+
+// A null column of `length` elements: every value null, no buffers. There is nothing to import for this
+// type, so this is how a caller makes one.
+int  am_null_array(int64_t length, am_array** out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -19,6 +19,7 @@ import math
 import os
 import re
 import struct
+import sys
 
 import numpy as np
 import pyarrow as pa
@@ -1270,6 +1271,25 @@ def _contains_negative_zero(src):
     return any(v == 0.0 and math.copysign(1.0, v) < 0 for v in src.to_pylist() if v is not None)
 
 
+def _prefix_product_leaves_safe_range(src):
+    """True when a sequential running product of the values gets within 2^40 of overflow or of the
+    smallest normal for the type. A parallel scan multiplies in a different order, so past that point
+    which intermediates overflow (inf), underflow (0) or meet (inf * 0 = NaN) depends on the order."""
+    values = [v for v in src.to_pylist() if v is not None]
+    if not values:
+        return False
+    if pa.types.is_float32(src.type):
+        hi, lo = 3.4028235e38 / 2.0 ** 40, 1.1754944e-38 * 2.0 ** 40
+    else:
+        hi, lo = sys.float_info.max / 2.0 ** 40, sys.float_info.min * 2.0 ** 40
+    running = 1.0
+    for v in values:
+        running *= v
+        if math.isnan(running) or math.isinf(running) or running == 0.0 or abs(running) > hi or abs(running) < lo:
+            return True
+    return False
+
+
 FINDINGS = [
     Finding("float32-subnormal-ftz",
             "Float32 arithmetic flushes subnormal results and operands to zero",
@@ -1283,6 +1303,10 @@ FINDINGS = [
     Finding("negative-zero-set-lookup",
             "is_in/index_in match -0.0 with 0.0, the total order unique/sort use; Arrow keeps them apart",
             ["is_in", "index_in"], FLOATING, data_check=_contains_negative_zero),
+    Finding("cumulative-prod-reassociation",
+            "cumulative_prod is a parallel scan; once a running product overflows or underflows, which "
+            "intermediates become inf, 0 or NaN depends on the multiplication order",
+            ["cumulative_prod"], FLOATING, data_check=_prefix_product_leaves_safe_range),
 ]
 
 
@@ -1777,6 +1801,23 @@ def test_is_in_separates_negative_zero_from_zero():
     values = pa.array([-0.0], pa.float64())
     assert pylist(am.array(a).is_in(am.array(values))) == \
         pc.is_in(a, value_set=values, skip_nulls=True).to_pylist()
+
+
+@pytest.mark.xfail(strict=True, reason="cumulative-prod-reassociation: the GPU scan multiplies in a "
+                                       "different order, so an overflowing and an underflowing "
+                                       "intermediate can meet as inf * 0 = NaN where Arrow's sequential "
+                                       "product stays inf")
+def test_cumulative_prod_matches_arrow_past_overflow():
+    a = pa.array([1e30, 1e30, 1e-30, 1e-30] * 8, pa.float32())
+    assert pylist(am.array(a).cumulative_prod()) == pc.cumulative_prod(a).to_pylist()
+
+
+def test_cumulative_prod_matches_arrow_inside_range():
+    """Without overflow or underflow the reassociated product agrees to float tolerance."""
+    a = pa.array([1.5, -2.0, 0.25, 3.0, None, 2.0, -1.25, 8.0], pa.float64())
+    got = pylist(am.array(a).cumulative_prod())
+    want = pc.cumulative_prod(a, skip_nulls=True).to_pylist()
+    assert all((g is None and w is None) or abs(g - w) <= 1e-12 * max(1.0, abs(w)) for g, w in zip(got, want))
 
 
 def test_is_in_matches_nan_to_nan_in_both():

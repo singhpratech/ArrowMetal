@@ -61,6 +61,12 @@ extension AnyMetalArray {
         case .structure(let a): return a.validity
         case .map(let a): return a.entries.validity
         case .union: return nil
+        case .null: return nil
+        case .float16(let a): return a.validity
+        case .smallDecimal(let a): return a.validity
+        case .interval(let a): return a.validity
+        case .fixedBinary(let a): return a.validity
+        case .extended(let e): return e.storage.validityBitmap
         }
     }
 
@@ -133,7 +139,8 @@ extension AnyMetalArray {
                 let (ends, vals) = try a.runEndParts()
                 return .runEndEncoded(runEnds: ends, values: .temporal(try MetalTemporalArray(type: t.type, vals)))
             }
-        case .string, .binary, .dictionary, .decimal, .list, .structure, .map, .union:
+        case .extended(let e): return try e.storage.runEndEncode()
+        case .string, .binary, .dictionary, .decimal, .list, .structure, .map, .union, .null, .float16, .smallDecimal, .interval, .fixedBinary:
             throw ArrowMetalError.unsupportedType("run-end encoding is defined for primitive, boolean and temporal arrays, not \(arrowFormat)")
         }
     }

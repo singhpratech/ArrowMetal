@@ -617,3 +617,225 @@ def test_run_end_encoding_round_trips_through_pyarrow():
     imported = am.array(pc.run_end_encode(pa.array([2, 2, None, 3], pa.int64())))
     assert imported.format == "+r"
     assert pylist(imported.run_end_decode()) == [2, 2, None, 3]
+# ---------------------------------------------------------------- the remaining type-matrix rows
+#
+# null, float16, decimal32 / decimal64, the interval family, fixed_size_binary, list_view, extension
+# types, list_parent_indices, list_slice, map_lookup, assume_timezone, local_timestamp and the three
+# interval-returning *_between functions. Every result is compared to pyarrow.compute where pyarrow has
+# the kernel, and to plain Python where it does not.
+
+import random as _random  # noqa: E402
+
+_TYPES_EXTRA_SIZES = [0, 1, 33, 4097]
+
+
+def _nullable(values, every):
+    return [None if i % every == 0 else v for i, v in enumerate(values)]
+
+
+def test_null_type_round_trip_and_selection():
+    a = pa.nulls(5)
+    col = am.array(a)
+    assert col.format == "n"
+    assert col.type == pa.null()
+    assert len(col) == 5 and col.null_count == 5
+    assert col.to_arrow().equals(a)
+    mask = am.array(pa.array([True, False, True, False, True]))
+    assert len(col.filter(mask)) == 3
+    assert len(col.slice(1, 2)) == 2
+    assert pylist(am.nulls(3)) == [None, None, None]
+
+
+def test_float16_round_trip_and_casts():
+    values = [1.5, None, -3.25, 0.0, 65504.0, 1e-8]
+    a = pa.array(values, pa.float64()).cast(pa.float16())
+    col = am.array(a)
+    assert col.format == "e"
+    assert col.type == pa.float16()
+    assert col.to_arrow().equals(a)
+    # Widening is exact and matches pyarrow's own cast.
+    assert pylist(col.to_float32()) == a.cast(pa.float32()).to_pylist()
+    # Narrowing back is the identity on values that are already halves.
+    assert col.to_float32().to_float16().to_arrow().equals(a)
+    # Compute runs in float32: the result is only rounded back to half on an explicit cast.
+    wide = col.to_float32()
+    assert wide.max() == pc.max(a.cast(pa.float32())).as_py()
+    assert pylist(wide > 0.0) == pylist(am.array(pc.greater(a.cast(pa.float32()), 0.0)))
+
+
+@pytest.mark.parametrize("bits,arrow_type", [(32, pa.decimal32(7, 2)), (64, pa.decimal64(15, 3))])
+def test_small_decimal_round_trip_and_widening(bits, arrow_type):
+    a = pa.array([1, None, -3, 0], type=arrow_type)
+    col = am.array(a)
+    assert col.format == f"d:{arrow_type.precision},{arrow_type.scale},{bits}"
+    assert col.type == arrow_type
+    assert col.to_arrow().equals(a)
+    wide = col.to_decimal128()
+    assert wide.format == f"d:{arrow_type.precision},{arrow_type.scale}"
+    assert pylist(wide) == a.to_pylist()
+    assert wide.to_small_decimal(bits, arrow_type.precision).to_arrow().equals(a)
+
+
+def test_fixed_size_binary_round_trip_compare_and_hash():
+    a = pa.array([b"abcd", None, b"efgh", b"abcd"], type=pa.binary(4))
+    col = am.array(a)
+    assert col.format == "w:4"
+    assert col.type == pa.binary(4)
+    assert col.to_arrow().equals(a)
+    assert pylist(col.fixed_binary_compare("==", b"abcd")) == \
+        pc.equal(a, pa.scalar(b"abcd", pa.binary(4))).to_pylist()
+    assert pylist(col.fixed_binary_compare("!=", b"abcd")) == \
+        pc.not_equal(a, pa.scalar(b"abcd", pa.binary(4))).to_pylist()
+    assert pylist(col.fixed_binary_compare("==", col)) == [True, None, True, True]
+    hashes = pylist(col.hash64())
+    assert hashes[1] is None and hashes[0] == hashes[3] and hashes[0] != hashes[2]
+    with pytest.raises(am.ArrowMetalError):
+        col.fixed_binary_compare("<", b"abcd")
+
+
+def test_month_day_nano_interval_round_trip():
+    start = pa.array([0, 86400 * 40, None], type=pa.timestamp("s"))
+    end = pa.array([86400 * 400, 0, 5], type=pa.timestamp("s"))
+    a = pc.month_day_nano_interval_between(start, end)
+    col = am.array(a)
+    assert col.format == "tin"
+    assert col.type == pa.month_day_nano_interval()
+    assert col.to_arrow().equals(a)
+
+
+def test_interval_between_matches_pyarrow():
+    _random.seed(11)
+    n = 100_000
+    lo, hi = -2_208_988_800, 7_258_118_400          # 1900-01-01 .. 2200-01-01
+    raw_start = [_random.randint(lo, hi) for _ in range(n)]
+    raw_end = [_random.randint(lo, hi) for _ in range(n)]
+    start = pa.array(raw_start, type=pa.timestamp("s"))
+    end = pa.array(raw_end, type=pa.timestamp("s"))
+    a, b = am.array(start), am.array(end)
+    expected = pc.month_day_nano_interval_between(start, end)
+    assert a.month_day_nano_interval_between(b).to_arrow().equals(expected)
+    # pyarrow 25 cannot wrap interval[month] / interval[day_time] arrays in Python, so those two are
+    # compared field by field against the month_day_nano result and a plain Python oracle.
+    months = pylist(a.month_interval_between(b).interval_field("months"))
+    assert months == [v.months for v in expected.to_pylist()]
+    dt = a.day_time_interval_between(b)
+    assert pylist(dt.interval_field("days")) == \
+        [(e // 86400) - (s // 86400) for s, e in zip(raw_start, raw_end)]
+    assert pylist(dt.interval_field("nanoseconds")) == \
+        [((e % 86400) - (s % 86400)) * 10 ** 9 for s, e in zip(raw_start, raw_end)]
+
+
+def test_add_interval_clamps_the_day_like_arrow():
+    # 2024-01-31 + 1 month is 2024-02-29, and + 1 month again is 2024-03-29.
+    jan31 = 1_706_659_200
+    ts = am.array(pa.array([jan31, jan31], type=pa.timestamp("s")))
+    iv = pa.array([(1, 0, 0), (2, 3, 0)], type=pa.month_day_nano_interval())
+    got = pylist(ts.add_interval(iv))
+    # 2024-01-31 + 2 months clamps to 2024-03-31, and the 3 days then land on 2024-04-03.
+    assert [d.strftime("%Y-%m-%d") for d in got] == ["2024-02-29", "2024-04-03"]
+    # pyarrow has no add(timestamp, interval) kernel, so there is no pyarrow oracle for this one.
+    assert not hasattr(pc, "add_interval")
+
+
+@pytest.mark.parametrize("n", _TYPES_EXTRA_SIZES)
+def test_list_parent_indices_and_slice_match_pyarrow(n):
+    rows = [None if i % 5 == 2 else list(range(i % 4)) for i in range(n)]
+    a = pa.array(rows, type=pa.list_(pa.int64()))
+    col = am.array(a)
+    # ArrowMetal returns int32 where pyarrow returns int64; the values are the same.
+    assert pylist(col.list_parent_indices()) == pc.list_parent_indices(a).to_pylist()
+    assert pylist(col.list_slice(1, 3)) == pc.list_slice(a, 1, 3).to_pylist()
+    assert pylist(col.list_slice(0, None, 2)) == pc.list_slice(a, 0, step=2).to_pylist()
+
+
+@pytest.mark.parametrize("occurrence", ["first", "last", "all"])
+def test_map_lookup_matches_pyarrow(occurrence):
+    rows = [[("a", 1), ("b", 2), ("a", 3)], None, [], [("c", 9)], [("a", 4)]]
+    a = pa.array(rows, type=pa.map_(pa.string(), pa.int64()))
+    col = am.array(a)
+    assert pylist(col.map_lookup("a", occurrence)) == \
+        pc.map_lookup(a, pa.scalar("a"), occurrence).to_pylist()
+    assert pylist(col.map_lookup("zz", occurrence)) == \
+        pc.map_lookup(a, pa.scalar("zz"), occurrence).to_pylist()
+
+
+def test_map_lookup_integer_keys_matches_pyarrow():
+    rows = [[(1, 10), (2, 20), (1, 30)], None, [(7, 70)]]
+    a = pa.array(rows, type=pa.map_(pa.int32(), pa.int64()))
+    col = am.array(a)
+    for occurrence in ("first", "last", "all"):
+        assert pylist(col.map_lookup(1, occurrence)) == \
+            pc.map_lookup(a, pa.scalar(1, pa.int32()), occurrence).to_pylist()
+
+
+def test_list_view_imports_as_a_list():
+    offsets = pa.array([3, 0, 1], pa.int32())
+    sizes = pa.array([1, 2, 2], pa.int32())
+    view = pa.ListViewArray.from_arrays(offsets, sizes, pa.array([1, 2, 3, 4]))
+    col = am.array(view)
+    # A list view has no ArrowMetal column of its own, so it comes back as a plain list.
+    assert col.format == "+l"
+    assert pylist(col) == view.to_pylist()
+
+
+@pytest.mark.parametrize("unit", ["s", "ms", "us", "ns"])
+def test_assume_timezone_and_local_timestamp_match_pyarrow(unit):
+    base = 1_672_574_400                             # 2023-01-01T12:00:00Z, safely away from transitions
+    step = {"s": 1, "ms": 10 ** 3, "us": 10 ** 6, "ns": 10 ** 9}[unit]
+    naive = pa.array(_nullable([(base + i * 86_400) * step for i in range(200)], 17),
+                     type=pa.timestamp(unit))
+    col = am.array(naive)
+    got = col.assume_timezone("America/New_York").to_arrow()
+    assert got.equals(pc.assume_timezone(naive, "America/New_York"))
+    back = am.array(got).local_timestamp().to_arrow()
+    assert back.equals(pc.local_timestamp(got))
+    assert back.equals(naive)
+
+
+def _naive_seconds(y, m, d, hh, mm):
+    """The wall-clock instant as a naive timestamp value (seconds, read as if UTC)."""
+    import datetime
+    return int(datetime.datetime(y, m, d, hh, mm, tzinfo=datetime.timezone.utc).timestamp())
+
+
+def test_assume_timezone_ambiguous_and_nonexistent():
+    tz = "America/New_York"
+    # 2023-11-05 01:30 local happens twice in New York (EDT then EST).
+    ambiguous = pa.array([_naive_seconds(2023, 11, 5, 1, 30)], type=pa.timestamp("s"))
+    col = am.array(ambiguous)
+    with pytest.raises(am.ArrowMetalError):
+        col.assume_timezone(tz)
+    early = pylist(col.assume_timezone(tz, ambiguous="earliest"))[0]
+    late = pylist(col.assume_timezone(tz, ambiguous="latest"))[0]
+    assert late.timestamp() - early.timestamp() == 3600
+    assert early == pc.assume_timezone(ambiguous, tz, ambiguous="earliest").to_pylist()[0]
+    assert late == pc.assume_timezone(ambiguous, tz, ambiguous="latest").to_pylist()[0]
+
+    # 2023-03-12 02:30 local never happens in New York (the spring-forward gap).
+    gap = pa.array([_naive_seconds(2023, 3, 12, 2, 30)], type=pa.timestamp("s"))
+    g = am.array(gap)
+    with pytest.raises(am.ArrowMetalError):
+        g.assume_timezone(tz)
+    before = pylist(g.assume_timezone(tz, nonexistent="earliest"))[0]
+    after = pylist(g.assume_timezone(tz, nonexistent="latest"))[0]
+    assert after.timestamp() - before.timestamp() == 1
+
+
+def test_extension_type_round_trip_and_metadata():
+    storage = pa.array([bytes(range(16)), None], type=pa.binary(16))
+    a = pa.ExtensionArray.from_storage(pa.uuid(), storage)
+    col = am.array(a)
+    assert col.extension_name == "arrow.uuid"
+    assert col.extension_metadata == b""
+    assert col.format == "w:16", "the format is the storage type's"
+    assert col.type == pa.uuid()
+    assert col.to_arrow().equals(a)
+    # Selection keeps the extension tag.
+    kept = col.filter(am.array(pa.array([True, False])))
+    assert kept.extension_name == "arrow.uuid"
+    assert kept.to_arrow().type == pa.uuid()
+    assert col.extension_storage().format == "w:16"
+    assert col.extension_storage().extension_name is None
+    # A plain column can be tagged as extension storage.
+    wrapped = am.array(storage).as_extension_type("arrow.uuid")
+    assert wrapped.to_arrow().type == pa.uuid()

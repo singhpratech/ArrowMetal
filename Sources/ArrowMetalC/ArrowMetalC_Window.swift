@@ -82,6 +82,10 @@ private func withWindow<R>(_ a: AnyMetalArray, _ body: (any WindowOps) throws ->
         case .int64(let x): return try body(x)
         }
     case .dictionary: throw ArrowMetalError.unsupportedType("decode the dictionary array first")
+    case .float16(let x): return try body(try x.toFloat32())
+    case .extended(let e): return try withWindow(e.storage, body)
+    case .null, .smallDecimal, .interval, .fixedBinary:
+        throw ArrowMetalError.unsupportedType("window functions need a primitive array, got \(a.arrowFormat)")
     }
 }
 

@@ -39,6 +39,9 @@ extension AnyMetalArray {
         case .list, .structure, .map, .union: return .binary
         // Run-end encoding has no IPC support here: the writer rejects such a column and asks for a decode.
         case .runEndEncoded(_, let values): return values.ipcType
+        // Likewise for the type-matrix additions in TypesExtra.swift; the writer rejects them too.
+        case .null, .float16, .smallDecimal, .interval, .fixedBinary: return .binary
+        case .extended(let a): return a.storage.ipcType
         }
     }
 }
@@ -187,6 +190,12 @@ public enum ArrowIPCWriter {
         case .structure(let x): return ObjectIdentifier(x)
         case .map(let x): return ObjectIdentifier(x)
         case .union(let x): return ObjectIdentifier(x)
+        case .null(let x): return ObjectIdentifier(x)
+        case .float16(let x): return ObjectIdentifier(x)
+        case .smallDecimal(let x): return ObjectIdentifier(x)
+        case .interval(let x): return ObjectIdentifier(x)
+        case .fixedBinary(let x): return ObjectIdentifier(x)
+        case .extended(let x): return ObjectIdentifier(x)
         }
     }
 
@@ -441,6 +450,8 @@ public enum ArrowIPCWriter {
             throw ArrowIPCError.unsupported("decimal columns (\(a.type)) are not written to Arrow IPC yet; export them through the C Data Interface")
         case .list, .structure, .map, .union:
             throw ArrowIPCError.unsupported("nested columns (list, struct, map, union) are not written to IPC yet")
+        case .null, .float16, .smallDecimal, .interval, .fixedBinary, .extended:
+            throw ArrowIPCError.unsupported("\(column.arrowFormat) columns are not written to Arrow IPC yet; export them through the C Data Interface")
         case .string(let a), .binary(let a):
             body.addValidity(a.validity, nullCount: a.nullCount, length: a.length)
             if case .varBinary(true) = type.storage {

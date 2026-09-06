@@ -130,7 +130,8 @@ extension AnyMetalArray {
             }
         case .runEndEncoded:
             return try runEndDecode().dictionaryEncoded()
-        case .decimal, .list, .structure, .map, .union:
+        case .extended(let e): return try e.storage.dictionaryEncoded()
+        case .decimal, .list, .structure, .map, .union, .null, .float16, .smallDecimal, .interval, .fixedBinary:
             throw ArrowMetalError.unsupportedType("dictionary encoding of \(arrowFormat) is not implemented")
         }
     }

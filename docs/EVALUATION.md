@@ -121,7 +121,7 @@ stays in the input — it poisons every later element in both engines
 
 ## Open findings
 
-Four divergences the harness found that are not bugs but are not free choices either: each is a place
+Five divergences the harness found that are not bugs but are not free choices either: each is a place
 where a kernel's own consistency was preferred to Arrow's answer, or where a documented limit of the GPU
 path shows through. Together they account for all 46 failing cases. Each has an entry in `FINDINGS` in
 `test_differential.py`, so the matrix groups the affected cells under the finding instead of burying them,
@@ -210,6 +210,29 @@ pc.is_in(a, value_set=s, skip_nulls=True)               # [False, True]
 Matching Arrow here would mean `is_in` disagreeing with `unique`, `dictionary_encode` and `sort` about how
 many distinct values a column has, which is the worse of the two inconsistencies. Reproductions:
 `test_is_in_separates_negative_zero_from_zero` (xfail) and `test_is_in_matches_nan_to_nan_in_both`.
+
+### 5. `cumulative_prod` reassociates, so overflow and underflow land differently
+
+*`cumulative_prod/float32` and `cumulative_prod/float64`, the datasets whose running product leaves the
+normal range.*
+
+The running product is a two-level parallel scan (`Kernels/Window.swift`), so the multiplications happen
+in a different order from Arrow's left-to-right loop. Inside the normal range that only moves the last
+ulp, which the float tolerance absorbs (`test_cumulative_prod_matches_arrow_inside_range`). Once an
+intermediate overflows or underflows the order decides the answer: Arrow's sequential product turns to
+`inf` (or `0`) and stays there, while the scan can pair an overflowed partial with an underflowed one and
+produce `inf * 0 = NaN`, or skip the overflow altogether.
+
+```python
+a = pa.array([1e30, 1e30, 1e-30, 1e-30] * 8, pa.float32())
+pc.cumulative_prod(a)                        # [1e30, inf, inf, inf, ...]
+am.array(a).cumulative_prod().to_arrow()     # [1e30, inf, 1e30, nan, ...]
+```
+
+Matching Arrow exactly would need a sequential pass, which is the one thing the GPU should not do.
+The finding is classified by the data (`_prefix_product_leaves_safe_range`): a dataset counts only when
+its sequential running product gets within 2^40 of overflow or of the smallest normal. Reproduction:
+`test_cumulative_prod_matches_arrow_past_overflow` (xfail).
 
 ## Findings that were fixed
 
