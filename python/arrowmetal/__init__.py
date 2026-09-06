@@ -1057,3 +1057,260 @@ def lexsort_indices(columns, descending=None):
     out = _P()
     _check(_lib.am_lexsort(handles, desc, len(cols), ctypes.byref(out)))
     return MetalArray(out)
+# ---- the remaining Arrow type-matrix rows and the type-adjacent functions
+#
+# null ("n"), float16 ("e"), decimal32 / decimal64 ("d:p,s,32" / "d:p,s,64"), the three interval layouts
+# ("tiM", "tiD", "tin"), fixed_size_binary ("w:N"), list_view / large_list_view ("+vl" / "+vL", imported
+# as "+l"), extension types, and the timezone functions. Appended rather than written into the class body
+# so this section stays self-contained; op numbering is the C ABI contract (see include/arrowmetal.h).
+for _name, _extra in [("am_cast_float16", [ctypes.c_int]), ("am_decimal_widen", []),
+                      ("am_decimal_narrow", [ctypes.c_int, ctypes.c_int64]),
+                      ("am_fixed_binary_compare", [ctypes.c_int, _P, ctypes.c_char_p, ctypes.c_int64]),
+                      ("am_fixed_binary_hash64", []), ("am_add_interval", [_P]),
+                      ("am_list_parent_indices", []),
+                      ("am_list_slice", [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64]),
+                      ("am_map_lookup", [ctypes.c_char_p, ctypes.c_int64, ctypes.c_int]),
+                      ("am_assume_timezone", [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]),
+                      ("am_local_timestamp", []), ("am_extension_storage", []),
+                      ("am_extension_wrap", [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int64]),
+                      ("am_interval_between", [_P, ctypes.c_int]),
+                      ("am_interval_field", [ctypes.c_int])]:
+    getattr(_lib, _name).argtypes = [_P] + _extra + [ctypes.POINTER(_P)]
+    getattr(_lib, _name).restype = ctypes.c_int
+_lib.am_extension_name.argtypes = [_P]
+_lib.am_extension_name.restype = ctypes.c_char_p
+_lib.am_extension_metadata.argtypes = [_P, ctypes.POINTER(ctypes.c_int64)]
+_lib.am_extension_metadata.restype = ctypes.c_char_p
+_lib.am_null_array.argtypes = [ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_null_array.restype = ctypes.c_int
+
+_OCCURRENCE = {"first": 0, "last": 1, "all": 2}
+_TZ_HANDLING = {"raise": 0, "earliest": 1, "latest": 2}
+_INTERVAL_BETWEEN = {"month": 0, "day_time": 1, "month_day_nano": 2}
+_INTERVAL_FIELDS = {"months": 0, "days": 1, "nanoseconds": 2}
+# pyarrow can build a type object for month_day_nano_interval only; interval[month] and
+# interval[day_time] have no Python type or Array class (pyarrow 25), so `type` and `to_arrow()` raise
+# for those two and `interval_field()` is the way to read their values.
+_INTERVAL_TYPES = {"tiM": "interval[month]", "tiD": "interval[day_time]", "tin": "interval[month_day_nano]"}
+
+
+def _extra_type(fmt):
+    """pyarrow type for one of the formats this section adds, or None when it is not one of them."""
+    if fmt == "n":
+        return pa.null()
+    if fmt == "e":
+        return pa.float16()
+    if fmt.startswith("w:"):
+        return pa.binary(int(fmt[2:]))
+    if fmt == "tin":
+        return pa.month_day_nano_interval()
+    if fmt in ("tiM", "tiD"):
+        raise ArrowMetalError(
+            f"pyarrow has no Python type for {_INTERVAL_TYPES[fmt]}; read the values with "
+            "interval_field('months' | 'days' | 'nanoseconds')")
+    if fmt.startswith("d:"):
+        parts = fmt[2:].split(",")
+        if len(parts) == 3 and parts[2] in ("32", "64"):
+            p, s = int(parts[0]), int(parts[1])
+            return pa.decimal32(p, s) if parts[2] == "32" else pa.decimal64(p, s)
+    return None
+
+
+_type_before_extra = MetalArray.type
+
+
+@property
+def _type_with_extra(self):
+    """pyarrow type of this array, including the types added by this section. An extension column
+    reports its extension type (the schema carries `ARROW:extension:name`), not its storage type."""
+    if self.extension_name is not None:
+        return self.to_arrow().type
+    t = _extra_type(self.format)
+    if t is not None:
+        return t
+    return _type_before_extra.fget(self)
+
+
+def _to_float32(self):
+    """Arrow `cast(float32)` of a float16 column: exact, one GPU pass through Metal's native `half`."""
+    return _call(_lib.am_cast_float16, self._h, 0)
+
+
+def _to_float16(self):
+    """Arrow `cast(float16)` of a float32 column: round to nearest-even on the GPU, overflowing to
+    +/-infinity. Arithmetic is never done in half precision - compute in float32 and cast back here."""
+    return _call(_lib.am_cast_float16, self._h, 1)
+
+
+def _to_decimal128(self):
+    """GPU widening cast of a decimal32 / decimal64 column to decimal128, which is where every decimal
+    kernel lives. A decimal128 column comes back unchanged."""
+    return _call(_lib.am_decimal_widen, self._h)
+
+
+def _to_small_decimal(self, bit_width, precision=0):
+    """GPU narrowing cast of a decimal128 column back to decimal32 (`bit_width` 32) or decimal64 (64),
+    keeping the scale. A value that does not fit wraps, which is Arrow's unchecked cast."""
+    if bit_width not in (32, 64):
+        raise ArrowMetalError("bit_width must be 32 or 64")
+    return _call(_lib.am_decimal_narrow, self._h, bit_width, precision)
+
+
+def _fixed_binary_compare(self, op, other):
+    """Arrow `equal` / `not_equal` over a fixed_size_binary column, on the GPU (byte compare).
+    `other` is another MetalArray of the same width, or a bytes value exactly one element wide."""
+    code = {"==": 0, "eq": 0, "equal": 0, "!=": 1, "ne": 1, "not_equal": 1}.get(op)
+    if code is None:
+        raise ArrowMetalError("fixed_size_binary supports == and != only")
+    if isinstance(other, MetalArray):
+        return _call(_lib.am_fixed_binary_compare, self._h, code, other._h, None, 0)
+    b = other.encode("utf-8") if isinstance(other, str) else bytes(other)
+    return _call(_lib.am_fixed_binary_compare, self._h, code, None, b, len(b))
+
+
+def _fixed_binary_hash64(self):
+    """FNV-1a 64 over each element's bytes (an ArrowMetal extension, not Arrow's `hash64`), on the GPU.
+    Null in, null out; the result is a uint64 column."""
+    return _call(_lib.am_fixed_binary_hash64, self._h)
+
+
+def _add_interval(self, interval):
+    """Arrow `add(timestamp | date, interval)` on the GPU. `interval` is an interval column of the same
+    length, or of length 1 to broadcast. Month arithmetic clamps the day to the target month's length
+    (2024-01-31 + 1 month = 2024-02-29), as Arrow does; days are whole UTC days and the sub-day part is
+    truncated toward zero when the column is coarser than the interval."""
+    iv = interval if isinstance(interval, MetalArray) else MetalArray.from_arrow(interval)
+    return _call(_lib.am_add_interval, self._h, iv._h)
+
+
+def _list_parent_indices(self):
+    """Arrow `list_parent_indices`: for every child element the list references, the index of the row
+    that covers it. GPU (one binary search per element). ArrowMetal returns **int32** where pyarrow
+    returns int64, because list offsets are int32 throughout this package; the values are the same."""
+    return _call(_lib.am_list_parent_indices, self._h)
+
+
+def _list_slice(self, start, stop=None, step=1):
+    """Arrow `list_slice`: `row[start:stop:step]` for every row, as a variable-length list. `stop=None`
+    slices to the end of each row. `start` must be >= 0 and `step` >= 1, as Arrow requires; a null row
+    stays null and a row shorter than `start` becomes empty. GPU."""
+    return _call(_lib.am_list_slice, self._h, start, -1 if stop is None else stop, step)
+
+
+def _map_lookup(self, key, occurrence="first"):
+    """Arrow `map_lookup`: the value(s) whose key matches, per row. `occurrence` is "first", "last" or
+    "all"; "all" returns a list of the item type. Both are null where the row is null or the key is
+    absent, matching pyarrow. Keys may be utf8 / binary (pass a str or bytes) or an integer type (pass
+    an int). GPU: one key compare per entry inside each row's range."""
+    occ = _OCCURRENCE.get(occurrence)
+    if occ is None:
+        raise ArrowMetalError('occurrence must be "first", "last" or "all"')
+    if isinstance(key, bool) or not isinstance(key, (str, bytes, bytearray, int)):
+        raise ArrowMetalError("map_lookup key must be a str, bytes or int")
+    if isinstance(key, int):
+        b = int(key).to_bytes(8, "little", signed=True)
+    else:
+        b = key.encode("utf-8") if isinstance(key, str) else bytes(key)
+    return _call(_lib.am_map_lookup, self._h, b, len(b), occ)
+
+
+def _assume_timezone(self, tz, ambiguous="raise", nonexistent="raise"):
+    """Arrow `assume_timezone`: reads a naive timestamp column as wall-clock times in `tz` and returns
+    the instants they name, tagged with that timezone. The unit and the sub-second part are unchanged.
+
+    **CPU**: the tz database is host data, so the per-value offsets are computed on the host (sharded
+    across cores) rather than on the GPU. A local time that occurs twice or never is an error by
+    default; pass "earliest" / "latest" to pick one, as Arrow does."""
+    a = _TZ_HANDLING.get(ambiguous)
+    n = _TZ_HANDLING.get(nonexistent)
+    if a is None or n is None:
+        raise ArrowMetalError('ambiguous / nonexistent must be "raise", "earliest" or "latest"')
+    return _call(_lib.am_assume_timezone, self._h, tz.encode("utf-8"), a, n)
+
+
+def _local_timestamp(self):
+    """Arrow `local_timestamp`: the wall-clock time each instant names in the column's own timezone, as
+    a naive timestamp of the same unit. A column with no timezone comes back unchanged. **CPU**, for
+    the same reason as `assume_timezone`."""
+    return _call(_lib.am_local_timestamp, self._h)
+
+
+def _interval_between(self, other, kind):
+    """One of Arrow's three interval-producing differences (`self` is `start`, `other` is `end`), on the
+    GPU: "month", "day_time" or "month_day_nano". Every field is the difference of the corresponding
+    truncated field, as Arrow defines it - months are month boundaries crossed, and the day and sub-day
+    fields may have the opposite sign."""
+    code = _INTERVAL_BETWEEN.get(kind)
+    if code is None:
+        raise ArrowMetalError('kind must be "month", "day_time" or "month_day_nano"')
+    b = other if isinstance(other, MetalArray) else MetalArray.from_arrow(other)
+    return _call(_lib.am_interval_between, self._h, b._h, code)
+
+
+def _interval_field(self, field):
+    """One field of an interval column as a plain integer column: "months" (int32), "days" (int32) or
+    "nanoseconds" (int64). A field the layout does not carry comes back as zeros. This is how to read
+    an interval[month] or interval[day_time] column, which pyarrow cannot wrap in Python."""
+    code = _INTERVAL_FIELDS.get(field)
+    if code is None:
+        raise ArrowMetalError('field must be "months", "days" or "nanoseconds"')
+    return _call(_lib.am_interval_field, self._h, code)
+
+
+@property
+def _extension_name(self):
+    """`ARROW:extension:name` of an extension column, or None when this is not an extension type."""
+    v = _lib.am_extension_name(self._h)
+    return None if v is None else v.decode()
+
+
+@property
+def _extension_metadata(self):
+    """`ARROW:extension:metadata` of an extension column as bytes, or None when there is none."""
+    n = ctypes.c_int64()
+    v = _lib.am_extension_metadata(self._h, ctypes.byref(n))
+    return None if v is None else v[:n.value]
+
+
+def _extension_storage(self):
+    """The storage column of an extension array (the array itself for every other type)."""
+    return _call(_lib.am_extension_storage, self._h)
+
+
+def _as_extension_type(self, name, metadata=None):
+    """Tags this column as the storage of an extension type, so `to_arrow()` writes
+    `ARROW:extension:name` / `:metadata` and pyarrow rebuilds the extension type when it is registered."""
+    md = None if metadata is None else (metadata.encode("utf-8") if isinstance(metadata, str) else bytes(metadata))
+    return _call(_lib.am_extension_wrap, self._h, name.encode("utf-8"), md, 0 if md is None else len(md))
+
+
+MetalArray.to_float32 = _to_float32
+MetalArray.to_float16 = _to_float16
+MetalArray.to_decimal128 = _to_decimal128
+MetalArray.to_small_decimal = _to_small_decimal
+MetalArray.fixed_binary_compare = _fixed_binary_compare
+MetalArray.hash64 = _fixed_binary_hash64
+MetalArray.add_interval = _add_interval
+MetalArray.list_parent_indices = _list_parent_indices
+MetalArray.list_slice = _list_slice
+MetalArray.map_lookup = _map_lookup
+MetalArray.assume_timezone = _assume_timezone
+MetalArray.local_timestamp = _local_timestamp
+MetalArray.interval_between = _interval_between
+MetalArray.interval_field = _interval_field
+MetalArray.extension_name = _extension_name
+MetalArray.extension_metadata = _extension_metadata
+MetalArray.extension_storage = _extension_storage
+MetalArray.as_extension_type = _as_extension_type
+MetalArray.month_interval_between = lambda self, other: _interval_between(self, other, "month")
+MetalArray.day_time_interval_between = lambda self, other: _interval_between(self, other, "day_time")
+MetalArray.month_day_nano_interval_between = lambda self, other: _interval_between(self, other, "month_day_nano")
+# `type` is replaced last, so `extension_name` is already attached when the property runs.
+MetalArray.type = _type_with_extra
+
+
+def nulls(length):
+    """A `null` column of `length` elements: every value null, no buffers."""
+    out = _P()
+    _check(_lib.am_null_array(length, ctypes.byref(out)))
+    return MetalArray(out)

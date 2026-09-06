@@ -173,7 +173,11 @@ final class TemporalTests: XCTestCase {
     func testUnsupportedTemporalFormatThrows() throws {
         let p = CProducer()
         let arr = p.array(length: 1, nullCount: 0, buffers: [nil, p.copied([Int32(0)])])
-        XCTAssertThrowsError(try importArrowArray(schema: p.schema("tiM"), array: arr))
+        // "tdX" is not a temporal format at all. ("tiM", the month interval, used to land here; it is now
+        // imported as an interval column by TypesExtra.swift, which the assertion below records.)
+        XCTAssertThrowsError(try importArrowArray(schema: p.schema("tdX"), array: arr))
+        let ivArr = p.array(length: 1, nullCount: 0, buffers: [nil, p.copied([Int32(0)])])
+        XCTAssertEqual(try importArrowArray(schema: p.schema("tiM"), array: ivArr).array.arrowFormat, "tiM")
         p.destroy()
     }
 

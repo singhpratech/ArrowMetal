@@ -27,6 +27,18 @@ public enum AnyMetalArray {
     case map(MetalMapArray)
     /// dense or sparse union.
     case union(MetalUnionArray)
+    /// The Arrow `null` type ("n"): a length and no buffers (`TypesExtra.swift`).
+    case null(MetalNullArray)
+    /// float16 ("e"): binary16 bit patterns; compute goes through float32 (`TypesExtra.swift`).
+    case float16(MetalFloat16Array)
+    /// decimal32 / decimal64 ("d:p,s,32" / "d:p,s,64"); compute goes through decimal128 (`TypesExtra.swift`).
+    case smallDecimal(MetalSmallDecimalArray)
+    /// interval[month] / interval[day_time] / interval[month_day_nano] (`TypesExtra.swift`).
+    case interval(MetalIntervalArray)
+    /// fixed_size_binary ("w:N"): N raw bytes per element (`TypesExtra.swift`).
+    case fixedBinary(MetalFixedBinaryArray)
+    /// An extension type: a storage array plus `ARROW:extension:name` / `:metadata` (`ExtensionType.swift`).
+    case extended(MetalExtensionArray)
 
     public var length: Int {
         switch self {
@@ -50,6 +62,12 @@ public enum AnyMetalArray {
         case .structure(let a): return a.length
         case .map(let a): return a.length
         case .union(let a): return a.length
+        case .null(let a): return a.length
+        case .float16(let a): return a.length
+        case .smallDecimal(let a): return a.length
+        case .interval(let a): return a.length
+        case .fixedBinary(let a): return a.length
+        case .extended(let a): return a.length
         }
     }
 
@@ -76,6 +94,13 @@ public enum AnyMetalArray {
         case .structure: return "+s"
         case .map: return "+m"
         case .union(let a): return a.arrowFormat
+        case .null: return "n"
+        case .float16: return "e"
+        case .smallDecimal(let a): return a.type.arrowFormat
+        case .interval(let a): return a.unit.arrowFormat
+        case .fixedBinary(let a): return a.arrowFormat
+        // An extension type has no format of its own; the schema carries the name in its metadata.
+        case .extended(let a): return a.arrowFormat
         }
     }
 }
@@ -112,8 +137,15 @@ public func importArrowArray(schema: UnsafePointer<ArrowSchema>, array: UnsafeMu
     guard let fmtC = schema.pointee.format else { throw ArrowMetalError.invalidArrowArray("schema.format is null") }
     let fmt = String(cString: fmtC)
     guard array.pointee.release != nil else { throw ArrowMetalError.releasedArray }
+    // An extension type is a storage type plus two metadata keys; the storage goes through this function
+    // again with the keys stripped (`ExtensionType.swift`).
+    if let info = extensionInfo(schema) {
+        return try importExtensionArray(info, schema: schema, array: array, context: context)
+    }
     // The schema decides whether an array is dictionary-encoded; the indices are imported inside.
     if schema.pointee.dictionary != nil { return try importDictionaryArray(schema: schema, array: array, context: context) }
+    // null, float16, decimal32/64, interval, fixed_size_binary and the list views (`TypesExtra.swift`).
+    if let r = try importExtraFormats(format: fmt, schema: schema, array: array, context: context) { return r }
     // Nested types (list, large_list, fixed_size_list, struct, map, union) recurse through this function.
     if isNestedFormat(fmt) { return try importNestedArray(format: fmt, schema: schema, array: array, context: context) }
     guard array.pointee.n_children == 0, array.pointee.dictionary == nil else {
@@ -438,6 +470,12 @@ extension AnyMetalArray {
         case .structure(let a): a.exportArrowArray(into: out)
         case .map(let a): a.exportArrowArray(into: out)
         case .union(let a): a.exportArrowArray(into: out)
+        case .null(let a): a.exportArrowArray(into: out)
+        case .float16(let a): a.exportArrowArray(into: out)
+        case .smallDecimal(let a): a.exportArrowArray(into: out)
+        case .interval(let a): a.exportArrowArray(into: out)
+        case .fixedBinary(let a): a.exportArrowArray(into: out)
+        case .extended(let a): a.exportArrowArray(into: out)
         }
     }
     public func exportArrowDeviceArray(into out: UnsafeMutablePointer<ArrowDeviceArray>) {
@@ -450,6 +488,8 @@ extension AnyMetalArray {
             exportDictionarySchema(values: values, name: name, into: out)
             return
         }
+        // An extension schema is the storage schema plus the extension metadata.
+        if case .extended(let a) = self { return a.exportArrowSchema(name: name, into: out) }
         // A nested schema carries its children, so each nested array writes its own.
         switch self {
         case .list(let a): return a.exportArrowSchema(name: name, into: out)

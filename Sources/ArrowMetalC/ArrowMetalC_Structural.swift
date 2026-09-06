@@ -88,6 +88,10 @@ private func withStructural<R>(_ a: AnyMetalArray, _ body: (any StructuralCOps) 
     case .decimal(let d): throw ArrowMetalError.unsupportedType("\(d.type) columns use am_decimal_op, not this entry point")
     case .list, .structure, .map, .union:
         throw ArrowMetalError.unsupportedType("operation needs a primitive array, got \(a.arrowFormat)")
+    case .float16(let x): return try body(try x.toFloat32())
+    case .extended(let e): return try withStructural(e.storage, body)
+    case .null, .smallDecimal, .interval, .fixedBinary:
+        throw ArrowMetalError.unsupportedType("operation needs a primitive array, got \(a.arrowFormat)")
     }
 }
 

@@ -24,6 +24,12 @@ extension AnyMetalArray {
         case .structure(let a): return a.nullCount
         case .map(let a): return a.nullCount
         case .union(let a): return a.nullCount
+        case .null(let a): return a.nullCount
+        case .float16(let a): return a.nullCount
+        case .smallDecimal(let a): return a.nullCount
+        case .interval(let a): return a.nullCount
+        case .fixedBinary(let a): return a.nullCount
+        case .extended(let a): return a.nullCount
         }
     }
 
@@ -50,6 +56,12 @@ extension AnyMetalArray {
         case .structure(let a): return .structure(try a.filter(mask))
         case .map(let a): return .map(try a.filter(mask))
         case .union(let a): return .union(try a.filter(mask))
+        case .null(let a): return .null(try a.filter(mask))
+        case .float16(let a): return .float16(try a.filter(mask))
+        case .smallDecimal(let a): return .smallDecimal(try a.filter(mask))
+        case .interval(let a): return .interval(try a.filter(mask))
+        case .fixedBinary(let a): return .fixedBinary(try a.filter(mask))
+        case .extended(let a): return .extended(try a.filter(mask))
         }
     }
 
@@ -75,6 +87,12 @@ extension AnyMetalArray {
         case .structure(let a): return .structure(try a.take(idx))
         case .map(let a): return .map(try a.take(idx))
         case .union(let a): return .union(try a.take(idx))
+        case .null(let a): return .null(try a.take(idx))
+        case .float16(let a): return .float16(try a.take(idx))
+        case .smallDecimal(let a): return .smallDecimal(try a.take(idx))
+        case .interval(let a): return .interval(try a.take(idx))
+        case .fixedBinary(let a): return .fixedBinary(try a.take(idx))
+        case .extended(let a): return .extended(try a.take(idx))
         }
     }
 
@@ -102,6 +120,12 @@ extension AnyMetalArray {
         case .structure(let a): return .structure(try a.slice(offset: offset, length: length))
         case .map(let a): return .map(try a.slice(offset: offset, length: length))
         case .union(let a): return .union(try a.slice(offset: offset, length: length))
+        case .null(let a): return .null(try a.slice(offset: offset, length: length))
+        case .float16(let a): return .float16(try a.slice(offset: offset, length: length))
+        case .smallDecimal(let a): return .smallDecimal(try a.slice(offset: offset, length: length))
+        case .interval(let a): return .interval(try a.slice(offset: offset, length: length))
+        case .fixedBinary(let a): return .fixedBinary(try a.slice(offset: offset, length: length))
+        case .extended(let a): return .extended(try a.slice(offset: offset, length: length))
         }
     }
 
