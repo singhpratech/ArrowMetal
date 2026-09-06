@@ -10,6 +10,9 @@ Core
 - Float64 compare/min/max/filter/take/slice on the GPU via order-preserving bit patterns; NaN semantics.
 - GroupBy over dense integer keys: count, sum, mean, min, max (privatised and device-atomic paths).
 - MetalRecordBatch with filter/take/slice/selecting; struct (+s) C Data import/export; ArrowArrayStream import.
+- Batched execution (`MetalContext.batch { }`) and its non-blocking form: `batchAsync` (Swift `async`
+  and completion-handler), with `MetalArray.sumAsync`/`meanAsync` for scalars, so the calling thread is
+  free while the GPU works.
 - Arrow C Data Interface and C Device Data Interface (ARROW_DEVICE_METAL) import and export.
 
 Strings and sorting

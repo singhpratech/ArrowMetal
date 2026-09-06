@@ -61,8 +61,34 @@ the CPU to know the length. A reduction still syncs once to read its partials.
 `d_add`; arithmetic kernels run one element per thread. It is slower than native Float32 math but still
 memory-bound at 50M rows, and it means no Float64 column ever falls back to the CPU.
 
-Not yet: futures for reduction results, and completion handlers / Swift `async` so the calling thread is
-released while the GPU works.
+### Async
+`MetalContext.batchAsync` is `batch { }` without the wait. It records `body`'s kernels into one command
+buffer exactly as `batch` does, then commits and hangs an `MTLCommandBuffer.addCompletedHandler` off it
+instead of spinning. The deferred fix-ups — `afterFlush` closures (pending lengths, null counts, `take`
+bounds errors), `pool.releaseParked()`, the `openBatches` decrement — run on the GPU's completion thread,
+so the calling thread is released the moment the work is committed. Two forms:
+
+```swift
+let kept = try await ctx.batchAsync { try amount.filter(where: .gt, 100) }   // suspends, no thread held
+ctx.batchAsync({ try amount.filter(where: .gt, 100) }) { result in ... }     // returns immediately
+```
+
+`flush` is split into `detachBatch()` (end encoding, unhook from the thread) and `finishBatch(_:)` (the
+post-completion fix-ups, which touch no thread-local state); the synchronous path calls both back to back
+around its wait, the async path puts the completion handler in between. Batches stay per-thread: `body`
+runs synchronously, before the first suspension, so the batch is opened, filled and detached without a
+thread hop. Nested calls join the enclosing batch, as with `batch`.
+
+Sync points still exist *inside* `body`. A reduction, `length` or `nullCount` of a pending filter result, a
+subscript or an export commits the open batch and blocks right there, exactly as in `batch { }`. So `body`
+should return something that does not force a sync — a pending array from `filter`, `compare`, `take`,
+`cast` or arithmetic. Its length, null count and contents are resolved by the time the `await` returns.
+For a scalar there is an async accessor: `MetalArray.sumAsync()` (and `meanAsync()`) records the reduction
+kernel in an async batch and combines the per-threadgroup partials on the completion path, so nothing
+blocks. Deferred errors are thrown from the `await` (or delivered as `.failure`), not from the recording.
+
+Not yet: async accessors for `min`/`max`/group-by, and cancellation (a committed command buffer runs to
+completion).
 
 ## Roadmap for "no room left"
 1. **Pipelined execution** (above). Biggest win for query-shaped work and for Python callers.

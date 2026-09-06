@@ -22,6 +22,11 @@ extension MetalArray {
         if !pending && validCount == 0 { return nil }
         let (partials, counts, groups) = try runReduction("reduce_sum")
         if validCount == 0 { return nil }   // (now synced) all-null after a pending filter
+        return finaliseSum(partials, counts, groups)
+    }
+
+    /// CPU half of `sum`: combines the per-threadgroup partials. Pure CPU, no GPU work, no sync.
+    func finaliseSum(_ partials: MetalArrowBuffer, _ counts: MetalArrowBuffer, _ groups: Int) -> SumResult {
         // The raw pointers below must not outlive the buffer objects (release builds shorten lifetimes).
         return withExtendedLifetime((partials, counts)) {
             if T.self == Double.self {
@@ -97,8 +102,16 @@ extension MetalArray {
         return any ? acc : nil
     }
 
-    /// Runs a reduction kernel and returns (partials, counts, threadgroupCount).
+    /// Records a reduction kernel and waits for it, returning (partials, counts, threadgroupCount).
     private func runReduction(_ fn: String) throws -> (MetalArrowBuffer, MetalArrowBuffer, Int) {
+        let r = try recordReduction(fn)
+        try context.syncPoint()   // the partials are read on the CPU next
+        return r
+    }
+
+    /// Records a reduction kernel *without* syncing. The partials are only valid once the command buffer
+    /// they were recorded into has completed (see `sumAsync`).
+    func recordReduction(_ fn: String) throws -> (MetalArrowBuffer, MetalArrowBuffer, Int) {
         try Dispatch.checkLength(dispatchLength)
         let ctx = context
         let n = dispatchLength
@@ -136,7 +149,7 @@ extension MetalArray {
             enc.dispatchThreadgroups(MTLSize(width: groups, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1))
         }
-        try ctx.syncPoint()   // the partials are read on the CPU next
+        ctx.retainUntilFlush(partials); ctx.retainUntilFlush(counts); ctx.retainUntilFlush(self)
         return (partials, counts, groups)
     }
 }

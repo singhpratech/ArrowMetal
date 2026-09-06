@@ -174,26 +174,44 @@ public final class MetalContext: @unchecked Sendable {
     public func beginBatch() throws { if currentBatch == nil { try openBatch() } }
     public func endBatch() throws { try flush() }
 
-    private func openBatch() throws {
+    func openBatch() throws {
         guard let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { throw ArrowMetalError.noMetalDevice }
         currentBatch = Batch(commandBuffer: cb, encoder: enc)
         openBatches.increment()
     }
 
-    /// Commits the open batch (if any), waits, runs deferred fix-ups, and reopens a fresh batch if `reopen`.
-    /// Called automatically by any CPU-side read of a pending result.
-    public func flush(reopen: Bool = false) throws {
-        guard let b = currentBatch else { return }
+    /// Ends encoding on the open batch and detaches it from this thread, *without* committing.
+    /// Returns nil when nothing is open. The caller owns the batch from here: it must commit
+    /// `b.commandBuffer` and, once that buffer has completed, call `finishBatch(_:)` exactly once.
+    /// (`flush` does both back to back; `batchAsync` puts a completion handler in between.)
+    func detachBatch() -> Batch? {
+        guard let b = currentBatch else { return nil }
         currentBatch = nil
         b.encoder.endEncoding()
-        b.commandBuffer.commit()
-        wait(b.commandBuffer)
+        return b
+    }
+
+    /// Post-completion half of `flush`: pool bookkeeping and the deferred fix-ups (lengths, null counts,
+    /// `take` bounds errors). Call exactly once, after `b.commandBuffer` has completed. Touches no
+    /// thread-local state, so it is safe from a command buffer completion handler.
+    func finishBatch(_ b: Batch) throws {
         openBatches.decrement()
         pool.releaseParked()
         var firstError: Error? = nil
         if let err = b.commandBuffer.error { firstError = ArrowMetalError.pipelineCreationFailed("command buffer failed: \(err)") }
         for f in b.afterFlush { do { try f() } catch { if firstError == nil { firstError = error } } }
         b.retained.removeAll()
+        if let e = firstError { throw e }
+    }
+
+    /// Commits the open batch (if any), waits, runs deferred fix-ups, and reopens a fresh batch if `reopen`.
+    /// Called automatically by any CPU-side read of a pending result.
+    public func flush(reopen: Bool = false) throws {
+        guard let b = detachBatch() else { return }
+        b.commandBuffer.commit()
+        wait(b.commandBuffer)
+        var firstError: Error? = nil
+        do { try finishBatch(b) } catch { firstError = error }
         if reopen { try openBatch() }
         if let e = firstError { throw e }
     }
