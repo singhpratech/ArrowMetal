@@ -39,10 +39,16 @@ def normalise(table):
     return out
 
 
+def has_struct(table):
+    return any(pa.types.is_struct(f.type) for f in table.schema)
+
+
 @pytest.mark.skipif(not fixture_paths(), reason="fixtures not generated")
 @pytest.mark.parametrize("path", fixture_paths(), ids=lambda p: os.path.basename(p)[:-8])
 def test_matches_pyarrow(path):
     want = pq.read_table(path)
+    if has_struct(want):
+        pytest.skip("struct columns are read leaf by leaf; see test_struct_leaves")
     try:
         got = am.read_parquet_table(path)
     except am.ArrowMetalError as e:
@@ -58,6 +64,8 @@ def test_matches_pyarrow(path):
 @pytest.mark.parametrize("path", fixture_paths(), ids=lambda p: os.path.basename(p)[:-8])
 def test_types_match_pyarrow(path):
     want = pq.read_table(path)
+    if has_struct(want):
+        pytest.skip("struct columns are read leaf by leaf")
     try:
         got = am.read_parquet_table(path)
     except am.ArrowMetalError as e:
@@ -109,6 +117,22 @@ def test_dictionary_encoded_columns():
     assert pa.types.is_dictionary(arr.type)
     plain = am.read_parquet(path, columns=["s"], dictionary=False)["s"].to_arrow()
     assert arr.cast(arr.type.value_type).to_pylist() == plain.to_pylist()
+
+
+def test_struct_leaves():
+    """A struct column is not reassembled, but each of its leaves reads by dotted path."""
+    path = os.path.join(FIXTURES, "struct__plain_none.parquet")
+    if not os.path.exists(path):
+        pytest.skip("fixture not generated")
+    want = pq.read_table(path)
+    got = am.read_parquet_table(path, columns=["addr.city", "addr.zip", "k"])
+    assert got.column_names == ["addr.city", "addr.zip", "k"]
+    assert got["addr.city"].to_pylist() == [v["city"] if v else None for v in want["addr"].to_pylist()]
+    assert got["addr.zip"].to_pylist() == [v["zip"] if v else None for v in want["addr"].to_pylist()]
+    assert got["k"].to_pylist() == want["k"].to_pylist()
+    # Asking for the struct itself says so rather than returning something wrong.
+    with pytest.raises(am.ArrowMetalError):
+        am.read_parquet(path, columns=["addr"])
 
 
 def test_arrays_are_gpu_resident():

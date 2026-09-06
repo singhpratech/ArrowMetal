@@ -191,6 +191,18 @@ def main():
     except TypeError as e:                                    # older pyarrow
         print("skipping integer decimals: %s" % e)
 
+    # A struct column: its leaves are read by dotted path.
+    n = 300
+    st2 = pa.table({
+        "addr": pa.array([None if i % 23 == 0
+                          else {"city": ["London", "Paris", "Tokyo"][i % 3], "zip": i * 7}
+                          for i in range(n)],
+                         pa.struct([("city", pa.string()), ("zip", pa.int32())])),
+        "k": pa.array(list(range(n)), pa.int64()),
+    })
+    write(st2, "struct__plain_none", compression="none", use_dictionary=False, data_page_size=8192)
+    write(st2, "struct__dict_snappy", compression="snappy", use_dictionary=True, data_page_size=8192)
+
     # Degenerate shapes.
     write(flat.slice(0, 0), "empty__plain_none", compression="none", use_dictionary=False)
     write(pa.table({"x": pa.array([None] * 500, pa.int64()),

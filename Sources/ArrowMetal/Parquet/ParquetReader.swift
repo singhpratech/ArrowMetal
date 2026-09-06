@@ -134,13 +134,16 @@ extension ParquetFile {
         return groups
     }
 
+    /// Resolves projected names. A top-level field name selects that field; a dotted path selects one
+    /// leaf on its own, which is how a struct's members are read (`"addr.city"`).
     func selectedFields(_ names: [String]?) throws -> [ParquetField] {
         guard let names else { return fields }
         return try names.map { n in
-            guard let f = fields.first(where: { $0.name == n }) ?? fields.first(where: { $0.leaves.contains { $0.dottedPath == n } }) else {
-                throw ParquetError.malformed("no column named \(n)")
+            if let f = fields.first(where: { $0.name == n }) { return f }
+            if let leaf = leaves.first(where: { $0.dottedPath == n }) {
+                return ParquetField(name: n, kind: .leaf(leaf), nullable: leaf.maxDefinition > 0)
             }
-            return f
+            throw ParquetError.malformed("no column named \(n)")
         }
     }
 
