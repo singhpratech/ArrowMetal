@@ -333,15 +333,25 @@ class MetalArray:
         if not isinstance(indices, MetalArray):
             indices = MetalArray.from_arrow(pa.array(indices, type=pa.int32()))
         return _call(_lib.am_take, self._h, indices._h)
-    def slice(self, offset, length): return _call(_lib.am_slice, self._h, offset, length)
+    def slice(self, offset, length):
+        """Arrow `slice`: a zero-copy view of `length` rows starting at `offset`.
+
+        O(1) at every offset. An offset that is a multiple of 32 becomes a pair of buffer views; any
+        other offset rides on Arrow's `offset` field, so exporting the slice back to pyarrow still moves
+        no bytes."""
+        return _call(_lib.am_slice, self._h, offset, length)
 
     # ---- sorting (GPU radix sort; stable, nulls last)
     def argsort(self, descending=False):
-        """Int32 indices that sort the array (Arrow `array_sort_indices`)."""
+        """Int32 indices that sort the array (Arrow `array_sort_indices`).
+
+        Numeric, boolean and temporal columns take the radix argsort. utf8 and binary columns take the
+        prefix radix sort and come out in byte-wise lexicographic order — the order Arrow defines for
+        them, index for index with `pyarrow.compute.array_sort_indices`, not Unicode collation."""
         return _call(_lib.am_argsort, self._h, 1 if descending else 0)
 
     def sort(self, descending=False):
-        """Sorted copy of the array."""
+        """Sorted copy of the array, with the same ordering rules as `argsort`."""
         return _call(_lib.am_sort, self._h, 1 if descending else 0)
 
     def top_k(self, k, largest=True):

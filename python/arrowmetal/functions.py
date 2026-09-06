@@ -442,11 +442,14 @@ def _call_group_pivot(args, options):
 
 _ROWS = [
     # ---- Aggregations ------------------------------------------------------
-    ("all", "Aggregations", GPU, "Kernels/Aggregates.swift", "all()",
-     "One GPU pass over the values and validity bitmaps. Null-only input gives None, as Arrow does.",
+    ("all", "Aggregations", CPU, "Kernels/Aggregates.swift", "all()",
+     "A word-wise host scan of `validity & ~values` that stops at the first valid false, so the usual "
+     "answer costs one load and no dispatch; a large column with no answer in its first mebibit falls "
+     "back to the counting kernel. Null-only input gives None, as Arrow does.",
      _u("all"), (( _BOOL,), {})),
-    ("any", "Aggregations", GPU, "Kernels/Aggregates.swift", "any()",
-     "Same pass as `all`.", _u("any"), ((_BOOL,), {})),
+    ("any", "Aggregations", CPU, "Kernels/Aggregates.swift", "any()",
+     "The mirror of `all`: a host scan of `values & validity` that stops at the first true.",
+     _u("any"), ((_BOOL,), {})),
     ("approximate_median", "Aggregations", GPU, "Kernels/Aggregates.swift", "median()",
      "Exact, not approximate: a GPU sort and an interpolated read, not a sketch. Answers are therefore "
      "at least as good as Arrow's.", _u("median"), ((_FLT,), {})),
@@ -458,8 +461,11 @@ _ROWS = [
      _u("count_all"), ((_INT,), {}), _oracle_count_all),
     ("count_distinct", "Aggregations", GPU, "Kernels/Unique.swift", "count_distinct()",
      "The length of `unique()`: one GPU sort and a run scan.", _u("count_distinct"), ((_INT,), {})),
-    ("first", "Aggregations", GPU, "Kernels/Aggregates.swift", "first()",
-     "A GPU pass takes the atomic minimum valid index, then one host read fetches the value.",
+    ("first", "Aggregations", CPU, "Kernels/Aggregates.swift", "first()",
+     "A word-wise host scan of the validity bitmap in shared memory, stopping at the first valid row, "
+     "then one read of that slot. No dispatch: the cost is the distance to the first valid row, so a "
+     "mostly-valid column answers in two loads. A column whose first mebibit is all null escalates to "
+     "the atomic-minimum kernel.",
      _u("first"), ((_INT,), {})),
     ("first_last", "Aggregations", GPU, "Kernels/Selection.swift", "first_last()",
      "`first()` and `last()` packaged as the one-row struct Arrow returns. `min_count` is not implemented.",
@@ -473,8 +479,8 @@ _ROWS = [
      "Excess kurtosis, biased by default as Arrow's is: two GPU passes, the same per-type deviation "
      "machinery `variance` uses, so about 1e-15 relative on a float64 column.",
      _u("kurtosis"), ((_FLT,), {})),
-    ("last", "Aggregations", GPU, "Kernels/Aggregates.swift", "last()",
-     "The atomic maximum valid index, mirroring `first`.", _u("last"), ((_INT,), {})),
+    ("last", "Aggregations", CPU, "Kernels/Aggregates.swift", "last()",
+     "The same host scan as `first`, run inwards from the end.", _u("last"), ((_INT,), {})),
     ("max", "Aggregations", GPU, "Kernels/Reductions.swift", "max()",
      "Threadgroup partials, host finalise, no atomics.", _u("max"), ((_INT,), {})),
     ("mean", "Aggregations", GPU, "Kernels/Reductions.swift", "mean()",
@@ -1318,9 +1324,10 @@ _ROWS = [
      "appearance; nulls are dropped.",
      lambda args, options: _a(args[0]).value_counts().to_arrow().to_pylist(), ((_INT,), {}),
      _oracle_sorted_value_counts),
-    ("dictionary_encode", "Associative", GPU, "Kernels/StringDictionary.swift", "dictionary_encode()",
-     "GPU hashing for utf8, a GPU sort for primitives. Returns `(codes, values)` rather than Arrow's "
-     "dictionary-typed array.",
+    ("dictionary_encode", "Associative", GPU, "Kernels/DictionaryCompute.swift", "dictionary_encode()",
+     "GPU hashing for utf8 and binary (`Kernels/StringDictionary.swift`), the GPU `unique()` pipeline "
+     "for primitive, temporal and boolean columns; reachable from every binding through "
+     "`am_dictionary_encode`. Returns `(codes, values)` rather than Arrow's dictionary-typed array.",
      lambda args, options: _a(args[0]).dictionary_encode()[0].to_arrow(), ((_STR,), {}),
      lambda args, options: pc.dictionary_encode(args[0]).indices),
     ("dictionary_decode", "Associative", GPU, "Sources/ArrowMetal/DictionaryArray.swift", "dictionary_decode()",
@@ -1357,14 +1364,17 @@ _ROWS = [
 
     # ---- Sorts and partitions ---------------------------------------------
     ("array_sort_indices", "Sorts", GPU, "Kernels/Sort.swift", "array_sort_indices(descending)",
-     "LSD radix sort, stable, nulls last, total order for floats (NaN after +inf). Arrow's "
-     "`null_placement=\"at_start\"` is not implemented.",
+     "LSD radix sort, stable, nulls last, total order for floats (NaN after +inf). utf8 and binary "
+     "columns take the prefix radix sort in `Kernels/StringSort.swift` and come out in byte-wise "
+     "lexicographic order, index for index with pyarrow. Arrow's `null_placement=\"at_start\"` is not "
+     "implemented.",
      lambda args, options: _out(_a(args[0]).array_sort_indices(options.get("order", "ascending") == "descending")),
      ((_INT,), {})),
     ("sort_indices", "Sorts", PARTIAL, "Kernels/MultiSort.swift", "sort_indices() / am.lexsort_indices(cols)",
      "Single key through the radix argsort; multiple keys through `lexsort_indices`, which is "
-     "successive stable argsorts from the least significant key upwards. utf8, binary and dictionary "
-     "key columns are not sortable, and `null_placement=\"at_start\"` is not implemented.",
+     "successive stable argsorts from the least significant key upwards. utf8 and binary keys are "
+     "sortable (`Kernels/StringSort.swift`); dictionary and nested key columns are not, and "
+     "`null_placement=\"at_start\"` is not implemented.",
      lambda args, options: _out(_a(args[0]).sort_indices()), ((_INT,), {})),
     ("partition_nth_indices", "Sorts", PARTIAL, "Kernels/MultiSort.swift", "partition_nth_indices(pivot)",
      "Answered with the full stable GPU argsort, which satisfies Arrow's contract (the n smallest "

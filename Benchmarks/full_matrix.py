@@ -663,6 +663,12 @@ def family_sort(d, n, sd):
             "polars": lambda: sd.s.p.arg_sort(),
             "pyarrow": lambda: pc.array_sort_indices(sd.s.a),
             "pandas": lambda: sd.s.d.argsort()})
+    if sd is not None:
+        case(f, "sort utf8", sd.n, sd.s.nbytes * 2, {
+            "arrowmetal": lambda: sd.s.g.sort(),
+            "polars": lambda: sd.s.p.sort(),
+            "pyarrow": lambda: pc.take(sd.s.a, pc.array_sort_indices(sd.s.a)),
+            "pandas": lambda: sd.s.d.sort_values()})
     case(f, "sort float64", n, n * 16, {
         "arrowmetal": lambda: ff.g.sort(),
         "polars": lambda: ff.p.sort(),
@@ -846,17 +852,30 @@ def family_join(d, n):
     right_pd = pd.DataFrame({"k": right_keys, "w": right_vals})
 
     def am_join():
-        pos = g_lk.index_in(g_rk)          # int32 position in the build side, null when absent
-        keep = pos.is_valid()
-        return g_lv.filter(keep), g_rv.take(pos.drop_null())
+        li, ri = am.join(g_lk, g_rk)       # GPU hash join, index pairs
+        return g_lv.take(li), g_rv.take(ri)
 
     case(f, f"inner hash join ({n} x {build_n} on int64)", n, n * 16 + build_n * 16, {
         "arrowmetal": am_join,
         "polars": lambda: left_pl.join(right_pl, on="k", how="inner"),
         "pyarrow": lambda: left_tb.join(right_tb, keys="k", join_type="inner"),
         "pandas": lambda: left_pd.merge(right_pd, on="k", how="inner")},
-        notes={"arrowmetal": "no join kernel: composed from index_in + is_valid + filter + take "
-                             "(requires unique build-side keys)"})
+        notes={"arrowmetal": "am.join index pairs, then one take per output column"})
+    case(f, f"hash join indices ({n} x {build_n} on int64)", n, n * 8 + build_n * 8, {
+        "arrowmetal": lambda: am.join(g_lk, g_rk),
+        "polars": lambda: left_pl.join(right_pl, on="k", how="inner"),
+        "pyarrow": lambda: left_tb.join(right_tb, keys="k", join_type="inner"),
+        "pandas": lambda: left_pd.merge(right_pd, on="k", how="inner")},
+        notes={"arrowmetal": "the join kernel alone (am_join): the matching index pairs, no payload gather",
+               "polars": "no index-only join; the full join is the closest equivalent",
+               "pyarrow": "no index-only join; the full join is the closest equivalent",
+               "pandas": "no index-only join; the full join is the closest equivalent"})
+    case(f, f"left outer hash join ({n} x {build_n} on int64)", n, n * 8 + build_n * 8, {
+        "arrowmetal": lambda: am.join(g_lk, g_rk, how="left"),
+        "polars": lambda: left_pl.join(right_pl, on="k", how="left"),
+        "pyarrow": lambda: left_tb.join(right_tb, keys="k", join_type="left outer"),
+        "pandas": lambda: left_pd.merge(right_pd, on="k", how="left")},
+        notes={"arrowmetal": "am_join join_type 1: index pairs with a null right index for an unmatched left row"})
     del g_rk, g_rv, g_lk, g_lv, left_pl, right_pl, left_tb, right_tb, left_pd, right_pd
     gc.collect()
 
