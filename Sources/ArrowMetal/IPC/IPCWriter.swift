@@ -16,6 +16,20 @@ extension AnyMetalArray {
         case .float64: return .float(bits: 64)
         case .boolean: return .bool
         case .string: return .utf8
+        case .binary: return .binary
+        case .temporal(let t):
+            func u(_ x: ArrowTemporalUnit) -> ArrowIPCTimeUnit {
+                switch x { case .second: return .second; case .milli: return .millisecond; case .micro: return .microsecond; case .nano: return .nanosecond }
+            }
+            switch t.type {
+            case .date32: return .date32
+            case .date64: return .date64
+            case .time32(let x): return .time32(u(x))
+            case .time64(let x): return .time64(u(x))
+            case .timestamp(let x, let tz): return .timestamp(u(x), timezone: tz)
+            case .duration(let x): return .duration(u(x))
+            }
+        case .dictionary(_, let values): return values.ipcType   // written decoded; see recordBatchMessage
         }
     }
 }
@@ -291,7 +305,14 @@ public enum ArrowIPCWriter {
             case .boolean(let a):
                 body.addValidity(a.validity, nullCount: a.nullCount, length: a.length)
                 body.add(a.values.contents, byteCount: Bitmap.byteCount(bits: a.length))
-            case .string(let a):
+            case .temporal(let t):
+                switch t.storage {
+                case .int32(let a): append(&body, a, width: 4)
+                case .int64(let a): append(&body, a, width: 8)
+                }
+            case .dictionary:
+                throw ArrowIPCError.unsupported("dictionary-encoded columns are not written yet; call decode() on the column first")
+            case .string(let a), .binary(let a):
                 body.addValidity(a.validity, nullCount: a.nullCount, length: a.length)
                 if case .varBinary(true) = type.storage {
                     // Widen the 32-bit offsets this package stores to the 64-bit ones large_* needs.
