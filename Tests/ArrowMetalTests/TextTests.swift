@@ -200,7 +200,7 @@ final class TextTests: XCTestCase {
         for n in [0, 1, 33, 4097] {
             let values = sampleStrings(n, seed: UInt64(n) &+ 61)
             let array = try MetalStringArray(values)
-            let (offsets, pieces) = try array.splitPattern("b")
+            let (offsets, pieces) = try array.splitPatternPair("b")
             let offs = offsets.toArray().map { Int($0!) }
             XCTAssertEqual(offs.count, n + 1)
             let flat = pieces.toArray()
@@ -217,33 +217,38 @@ final class TextTests: XCTestCase {
         try requireRealGPU()
         let array = try MetalStringArray(["a,b,c,d"])
         func pieces(_ r: MetalStringArray.SplitResult) -> [String] { r.values.toArray().map { $0! } }
-        XCTAssertEqual(pieces(try array.splitPattern(",", maxSplits: 1)), ["a", "b,c,d"])
-        XCTAssertEqual(pieces(try array.splitPattern(",", maxSplits: 1, reverse: true)), ["a,b,c", "d"])
-        XCTAssertEqual(pieces(try array.splitPattern(",")), ["a", "b", "c", "d"])
+        XCTAssertEqual(pieces(try array.splitPatternPair(",", maxSplits: 1)), ["a", "b,c,d"])
+        XCTAssertEqual(pieces(try array.splitPatternPair(",", maxSplits: 1, reverse: true)), ["a,b,c", "d"])
+        XCTAssertEqual(pieces(try array.splitPatternPair(",")), ["a", "b", "c", "d"])
     }
 
-    func testSplitWhitespaceMatchesPythonSplit() throws {
+    /// Arrow's whitespace split cuts at every maximal whitespace run, so a leading or trailing run
+    /// leaves an empty piece behind and the empty string splits to one empty piece. (Python's
+    /// no-argument `str.split()` drops those; `str.split(sep)` does not, and Arrow follows the latter.)
+    func testSplitWhitespaceKeepsEndPieces() throws {
         try requireRealGPU()
         let values: [String?] = ["a b  c", "  lead", "trail  ", "   ", "", nil, "one"]
         let array = try MetalStringArray(values)
-        let (offsets, pieces) = try array.splitWhitespace()
+        let (offsets, pieces) = try array.splitWhitespacePair()
         let offs = offsets.toArray().map { Int($0!) }
         let flat = pieces.toArray().map { $0! }
-        let expected = [["a", "b", "c"], ["lead"], ["trail"], [], [], [], ["one"]]
+        let expected = [["a", "b", "c"], ["", "lead"], ["trail", ""], ["", ""], [""], [], ["one"]]
         for i in 0..<values.count {
             XCTAssertEqual(Array(flat[offs[i]..<offs[i + 1]]), expected[i], "row \(i)")
         }
-        // maxSplits keeps the whitespace inside the remainder, as Python's str.split does.
-        XCTAssertEqual(MetalStringArray.splitWhitespace(" a b  ", maxSplits: 1, reverse: false), ["a", "b  "])
-        XCTAssertEqual(MetalStringArray.splitWhitespace(" a b  ", maxSplits: 1, reverse: true), [" a", "b"])
+        XCTAssertEqual(MetalStringArray.splitWhitespace(" a b  ", unicode: false, maxSplits: 1, reverse: false),
+                       ["", "a b  "])
+        XCTAssertEqual(MetalStringArray.splitWhitespace(" a b  ", unicode: false, maxSplits: 1, reverse: true),
+                       [" a b", ""])
     }
 
     func testSplitPatternRegex() throws {
         try requireRealGPU()
         let array = try MetalStringArray(["a1b22c", nil, "abc"])
-        let (offsets, pieces) = try array.splitPatternRegex("[0-9]+")
+        let (offsets, pieces) = try array.splitPatternRegexPair("[0-9]+")
         XCTAssertEqual(offsets.toArray(), [0, 3, 3, 4])
         XCTAssertEqual(pieces.toArray(), ["a", "b", "c", "abc"])
+        XCTAssertThrowsError(try array.splitPatternRegex("[0-9]+", maxSplits: 1, reverse: true))
     }
 
     // MARK: - Integer ↔ string
@@ -568,7 +573,7 @@ final class TextTests: XCTestCase {
             XCTAssertEqual(try array.matchLike("%a%").length, n)
             XCTAssertEqual(try array.parse(Int32.self).length, n)
             XCTAssertEqual(try MetalArray<Int32>([Int32?]()).toStrings().length, 0)
-            let (offsets, pieces) = try array.splitPattern(",")
+            let (offsets, pieces) = try array.splitPatternPair(",")
             XCTAssertEqual(offsets.length, n + 1)
             XCTAssertEqual(pieces.length, n == 0 ? 0 : (values[0] == nil ? 0 : 1))
         }

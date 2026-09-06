@@ -10,8 +10,10 @@ final class StringTransformTests: XCTestCase {
 
     // MARK: - CPU oracles
 
-    /// Simple (1:1) uppercase over the blocks the kernel documents as covered.
+    /// Simple (1:1) uppercase over U+0000–U+017F, which is the block the GPU table claims.
     static func cpUpper(_ c: UInt32) -> UInt32 {
+        if c == 0xB5 { return 0x39C }
+        if c == 0xDF { return 0x1E9E }
         if c >= 0x61 && c <= 0x7A { return c - 32 }
         if c >= 0xE0 && c <= 0xFE && c != 0xF7 { return c - 32 }
         if c == 0xFF { return 0x178 }
@@ -28,13 +30,39 @@ final class StringTransformTests: XCTestCase {
         if c >= 0xC0 && c <= 0xDE && c != 0xD7 { return c + 32 }
         if c == 0x178 { return 0xFF }
         if c == 0x130 { return 0x69 }
+        if c == 0x138 { return c }                 // kra has no case at all
         if c >= 0x100 && c <= 0x137 { return c | 1 }
         if c >= 0x139 && c <= 0x148 { return (c & 1) == 1 ? c + 1 : c }
         if c >= 0x14A && c <= 0x177 { return c | 1 }
         if c >= 0x179 && c <= 0x17E { return (c & 1) == 1 ? c + 1 : c }
         return c
     }
+    /// Unicode's **simple** (1:1) case mapping, reconstructed from Swift's full ones exactly as the
+    /// documentation on `Kernels/StringUnicode.swift` describes: a full mapping of one scalar is the
+    /// simple mapping, a longer one leaves the code point alone, and ß / İ / the Greek
+    /// iota-subscript blocks are the three places where the two disagree.
+    ///
+    /// Written here independently of `UnicodeClass` so the test is an oracle rather than an echo.
+    static func refSimpleUpper(_ u: Unicode.Scalar) -> Unicode.Scalar {
+        if u.value == 0xDF { return Unicode.Scalar(0x1E9E)! }
+        if (0x1F80...0x1F87).contains(u.value) || (0x1F90...0x1F97).contains(u.value)
+            || (0x1FA0...0x1FA7).contains(u.value) { return Unicode.Scalar(u.value + 8)! }
+        let m = u.properties.uppercaseMapping.unicodeScalars
+        return m.count == 1 ? m.first! : u
+    }
+    static func refSimpleLower(_ u: Unicode.Scalar) -> Unicode.Scalar {
+        if u.value == 0x130 { return Unicode.Scalar(0x69)! }
+        let m = u.properties.lowercaseMapping.unicodeScalars
+        return m.count == 1 ? m.first! : u
+    }
     static func refCase(_ s: String, upper: Bool) -> String {
+        var v = String.UnicodeScalarView()
+        for u in s.unicodeScalars { v.append(upper ? refSimpleUpper(u) : refSimpleLower(u)) }
+        return String(v)
+    }
+    /// The old, Latin-blocks-only mapping, kept so `testCaseMappingStaysInsideTheCoveredBlocks`
+    /// can prove the GPU table still agrees with it inside U+0000–U+017F.
+    static func refLatinCase(_ s: String, upper: Bool) -> String {
         var v = String.UnicodeScalarView()
         for u in s.unicodeScalars { v.append(Unicode.Scalar(upper ? cpUpper(u.value) : cpLower(u.value))!) }
         return String(v)
@@ -221,19 +249,21 @@ final class StringTransformTests: XCTestCase {
         let a = try MetalStringArray(covered)
         XCTAssertEqual(try a.utf8Upper().toArray(), covered.map { $0.uppercased() })
         XCTAssertEqual(try a.utf8Lower().toArray(), covered.map { $0.lowercased() })
-        // The documented exceptions pass through unchanged, and the three length-changing maps.
+        // The irregular entries of the block: ß and µ now map (their simple uppercase leaves the
+        // block), ŉ and ĸ do not (ŉ's full uppercase is two characters, ĸ has no case at all), and
+        // ı / ſ / İ change the byte length.
         let odd = try MetalStringArray(["ß", "ŉ", "µ", "ĸ", "ı", "İ", "ſ", "ÿ", "Ÿ"])
-        XCTAssertEqual(try odd.utf8Upper().toArray(), ["ß", "ŉ", "µ", "ĸ", "I", "İ", "S", "Ÿ", "Ÿ"])
+        XCTAssertEqual(try odd.utf8Upper().toArray(), ["ẞ", "ŉ", "Μ", "ĸ", "I", "İ", "S", "Ÿ", "Ÿ"])
         XCTAssertEqual(try odd.utf8Lower().toArray(), ["ß", "ŉ", "µ", "ĸ", "ı", "i", "ſ", "ÿ", "ÿ"])
         // Two bytes in, one byte out: the output offsets must shrink.
         let shrink = try MetalStringArray(["ıſİ"])
         XCTAssertEqual(shrink.totalBytes, 6)
         XCTAssertEqual(try shrink.utf8Upper().totalBytes, 4)   // I(1) + S(1) + İ(2)
         XCTAssertEqual(try shrink.utf8Lower().totalBytes, 5)   // ı(2) + ſ(2) + i(1)
-        // Nothing above U+017F is touched.
-        let untouched = try MetalStringArray(["ΑΒΓ", "АБВ", "日本語", "🍇"])
-        XCTAssertEqual(try untouched.utf8Upper().toArray(), ["ΑΒΓ", "АБВ", "日本語", "🍇"])
-        XCTAssertEqual(try untouched.utf8Lower().toArray(), ["ΑΒΓ", "АБВ", "日本語", "🍇"])
+        // Above U+017F the host takes over, so Greek and Cyrillic map and the rest passes through.
+        let beyond = try MetalStringArray(["ΑΒΓ", "АБВ", "日本語", "🍇"])
+        XCTAssertEqual(try beyond.utf8Upper().toArray(), ["ΑΒΓ", "АБВ", "日本語", "🍇"])
+        XCTAssertEqual(try beyond.utf8Lower().toArray(), ["αβγ", "абв", "日本語", "🍇"])
     }
 
     // MARK: - Trimming
