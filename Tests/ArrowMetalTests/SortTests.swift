@@ -62,10 +62,16 @@ final class SortTests: XCTestCase {
 }
 
 extension ArrowPrimitive {
-    /// IEEE total order for floats (NaN after +inf, -0 before +0), plain < otherwise.
+    /// Arrow sort order for floats: every NaN is one value placed after +inf, -0.0 ties with 0.0; plain < otherwise.
     func isTotallyLess(_ o: Self) -> Bool {
-        if let a = self as? Double, let b = o as? Double { return a.isTotallyOrdered(belowOrEqualTo: b) && a.bitPattern != b.bitPattern }
-        if let a = self as? Float, let b = o as? Float { return a.isTotallyOrdered(belowOrEqualTo: b) && a.bitPattern != b.bitPattern }
+        if let a = self as? Double, let b = o as? Double {
+            if a.isNaN || b.isNaN { return !a.isNaN && b.isNaN }
+            return a < b
+        }
+        if let a = self as? Float, let b = o as? Float {
+            if a.isNaN || b.isNaN { return !a.isNaN && b.isNaN }
+            return a < b
+        }
         return self < o
     }
 }
