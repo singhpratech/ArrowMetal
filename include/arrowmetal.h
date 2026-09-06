@@ -145,6 +145,37 @@ int  am_index_in(am_array* a, am_array* set_array, am_array** out);
 int  am_and_kleene(am_array* a, am_array* b, am_array** out);
 int  am_or_kleene(am_array* a, am_array* b, am_array** out);
 
+// ---------------------------------------------------------------------------------------------------
+// Element-wise math, bit-wise ops and cumulative functions (all GPU, all null-aware).
+//
+// am_unary op numbering:
+//    0 negate   1 abs    2 sign    3 sqrt    4 exp     5 ln      6 log10   7 log2
+//    8 floor    9 ceil  10 round  11 trunc  12 bit_wise_not
+// Notes: 3-7 need a float32/float64 column (cast an integer one first). 8-11 are the identity on an
+// integer column and keep its type; `round` rounds halves away from zero. Integer `negate` and `abs`
+// wrap, so abs(INT8_MIN) is INT8_MIN. `sign` returns -1/0/1 and leaves NaN and both signed zeros alone.
+// On float64, ops 0-2 and 8-11 are exact (bit-pattern kernels); 3-7 are evaluated in float and widened,
+// so expect about 7 correct significant decimal digits.
+int  am_unary(am_array* a, int op, am_array** out);
+
+// am_binary op numbering:
+//    0 bit_wise_and   1 bit_wise_or   2 bit_wise_xor   3 shift_left   4 shift_right
+//    5 modulo         6 power         7 min_element_wise             8 max_element_wise
+// Pass exactly one of `b` (array form) or `scalar` (scalar form, a pointer to a value of the array's
+// element type); ops 7 and 8 have no scalar form. Ops 0-4 need an integer column; `shift_right` is
+// arithmetic on a signed one and logical on an unsigned one, and a shift count outside [0, bit width)
+// yields 0 (or the sign fill for a signed `shift_right`) rather than raising as Arrow does.
+// `modulo` is C remainder (the sign follows the dividend) and defines x % 0 as 0, as `divide` does;
+// `power` uses repeated squaring on integers, wraps, and defines a negative exponent as 0. `power` and
+// `modulo` are not implemented for float64. Ops 0-6 propagate nulls; 7 and 8 skip them, so a null on one
+// side yields the other side's value and only two nulls make a null.
+int  am_binary(am_array* a, int op, am_array* b /* or NULL */, const void* scalar /* or NULL */, am_array** out);
+
+// am_cumulative op numbering: 0 cumulative_sum, 1 cumulative_min, 2 cumulative_max.
+// Output is null exactly where the input is, and the running value carries across nulls unchanged.
+// Two-level GPU scan; integer sums wrap and are exact, float sums reassociate.
+int  am_cumulative(am_array* a, int op, am_array** out);
+
 #ifdef __cplusplus
 }
 #endif

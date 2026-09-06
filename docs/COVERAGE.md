@@ -15,9 +15,9 @@ them so a claim can be checked in one jump.
 |---|---:|---:|---:|---:|---:|---:|---:|
 | Aggregations — scalar | 4 | 4 | 1 | 0 | 0 | 12 | 21 |
 | Aggregations — grouped (`hash_*`) | 0 | 0 | 6 | 1 | 1 | 7 | 15 |
-| Element-wise arithmetic | 3 | 0 | 1 | 1 | 0 | 11 | 16 |
-| Bit-wise and shifts | 0 | 0 | 0 | 0 | 0 | 6 | 6 |
-| Comparisons | 6 | 0 | 0 | 0 | 0 | 2 | 8 |
+| Element-wise arithmetic | 5 | 0 | 8 | 1 | 0 | 2 | 16 |
+| Bit-wise and shifts | 4 | 0 | 2 | 0 | 0 | 0 | 6 |
+| Comparisons | 8 | 0 | 0 | 0 | 0 | 0 | 8 |
 | Logical | 4 | 0 | 0 | 0 | 0 | 3 | 7 |
 | String predicates | 1 | 0 | 0 | 0 | 0 | 3 | 4 |
 | String transforms | 9 | 0 | 2 | 1 | 0 | 7 | 19 |
@@ -29,9 +29,9 @@ them so a claim can be checked in one jump.
 | Sorts and partitions | 2 | 1 | 2 | 0 | 0 | 2 | 7 |
 | Structural and conditional | 4 | 0 | 2 | 0 | 0 | 7 | 13 |
 | Associative transforms | 0 | 1 | 0 | 1 | 3 | 0 | 5 |
-| Pairwise and cumulative | 0 | 0 | 0 | 0 | 0 | 5 | 5 |
+| Pairwise and cumulative | 1 | 0 | 1 | 0 | 0 | 3 | 5 |
 | Hashing | 1 | 0 | 0 | 0 | 0 | 1 | 2 |
-| **Total (compute functions)** | **47** | **7** | **17** | **6** | **6** | **75** | **158** |
+| **Total (compute functions)** | **56** | **7** | **27** | **6** | **6** | **56** | **158** |
 | Arrow types (matrix below) | 5 | 0 | 3 | 1 | 6 | 11 | 26 |
 
 Interop uses a separate vocabulary and is counted apart: 6 shipped, 1 partial, 3 planned, 1 in progress
@@ -49,8 +49,9 @@ Arrow semantics and checked against a CPU oracle in the test suite.
 
 **The scope it does not claim:** decimals; compute over nested types (lists, structs, maps, unions); regex
 and Unicode-table string work (full case folding beyond Latin-1 Supplement and Latin Extended-A,
-normalisation, Unicode-whitespace trimming, splitting); window,
-cumulative and pairwise functions; temporal component extraction, temporal arithmetic, timezones and
+normalisation, Unicode-whitespace trimming, splitting); window and pairwise functions
+(`cumulative_sum`/`_min`/`_max` do ship — see Pairwise and cumulative — but `cumulative_prod`,
+`cumulative_mean` and `pairwise_diff` do not); temporal component extraction, temporal arithmetic, timezones and
 `strftime`/`strptime`; statistical aggregates (`stddev`, `variance`, `quantile`, `mode`, `tdigest`);
 set lookup over strings; `case_when`, `replace_with_mask` and the forward/backward null fills; checked
 arithmetic and overflow-erroring casts. The long form is at the bottom of this file.
@@ -122,6 +123,10 @@ atomics with carry because MSL has no 64-bit atomics.
 
 ## Element-wise arithmetic
 
+`modulo` (`%`, C remainder semantics, `x % 0` defined as 0) is an ArrowMetal extension rather than an
+Arrow function name, so it has no row of its own; it lives beside `power` in `Kernels/Rounding.swift`
+and is reachable as `am_binary(op 5)` and `.modulo()` / `__mod__` in Python.
+
 | Arrow function | Status | Notes |
 |---|---|---|
 | `add` | **GPU** | Scalar and array forms, vectorised 4-wide (`Kernels/Arithmetic.swift`). Integer overflow wraps, like Arrow's unchecked `add`. Float64 runs a software IEEE-754 binary64 adder on the GPU, bit-exact against Swift's `Double`. |
@@ -129,28 +134,28 @@ atomics with carry because MSL has no 64-bit atomics.
 | `multiply` | **GPU** | As `add`. |
 | `divide` | **Partial** | GPU, but integer division by zero is **defined as 0** here (`KernelSource.swift`, matched by the CPU oracle in `ArrowPrimitive.swift`) rather than raising. Check this against Arrow's `divide` before relying on it. Float division follows IEEE. |
 | `add_checked` / `subtract_checked` / `multiply_checked` / `divide_checked` | **Planned** | [ROADMAP → Near term → Checked arithmetic](../ROADMAP.md#near-term-good-first-contributions): report overflow and division by zero like Arrow. |
-| `negate` / `negate_checked` | **Not planned** | No roadmap item; expressible as `0 - x` / `x * -1`. |
-| `abs` / `abs_checked` | **Not planned** | No roadmap item. |
-| `sign` | **Not planned** | No roadmap item. |
-| `power` / `power_checked` | **Not planned** | No roadmap item. |
-| `sqrt` / `sqrt_checked` | **Not planned** | No roadmap item. Trivial as a kernel; Float64 would need software binary64. |
-| `exp` | **Not planned** | No roadmap item. |
-| `ln` / `log2` / `log10` / `log1p` / `logb` (and `_checked`) | **Not planned** | No roadmap item. |
+| `negate` / `negate_checked` | **Partial** | `negate()` is GPU over all ten primitives (`Kernels/Rounding.swift`); integers wrap, so `negate(int8 -128)` is `-128`, and unsigned negation is modular. Float64 flips the sign bit, exactly. `negate_checked` is not implemented — see the checked-arithmetic row above. |
+| `abs` / `abs_checked` | **Partial** | `abs()` is GPU over all ten primitives; `abs(int8 -128)` wraps to `-128`, unsigned is the identity, Float64 clears the sign bit exactly. `abs_checked` is not implemented. |
+| `sign` | **GPU** | `sign()` over all ten primitives: -1/0/1 in the input's own type (0 or 1 for unsigned). Floats keep NaN and both signed zeros, matching Arrow. |
+| `power` / `power_checked` | **Partial** | `power()`, scalar and array forms, GPU. Integers use repeated squaring and wrap; a **negative exponent is defined as 0** here (Arrow raises), and `0^0` is 1. Float32 uses MSL `pow`. Not implemented for Float64 (it would have to drop to float precision) and `power_checked` is not implemented. |
+| `sqrt` / `sqrt_checked` | **Partial** | `sqrt()` is GPU on float columns; an integer column throws rather than being promoted to float64 as Arrow does — cast first. On Float64 the value is converted to `float`, evaluated and widened back, so roughly 7 correct significant digits (documented in `Kernels/RoundingSource.swift`). `sqrt_checked` is not implemented. |
+| `exp` | **Partial** | `exp()` on float columns only, same Float64 precision caveat as `sqrt`. |
+| `ln` / `log2` / `log10` / `log1p` / `logb` (and `_checked`) | **Partial** | `ln()`, `log2()`, `log10()` are GPU on float columns, with the same Float64 precision caveat. `log1p`, `logb` and the `_checked` forms are not implemented. |
 | `sin` / `cos` / `tan` / `asin` / `acos` / `atan` / `atan2` | **Not planned** | No roadmap item. |
 | `sinh` / `cosh` / `tanh` / `asinh` / `acosh` / `atanh` | **Not planned** | No roadmap item. |
-| `ceil` / `floor` / `trunc` | **Not planned** | No roadmap item. |
-| `round` / `round_to_multiple` / `round_binary` | **Not planned** | No roadmap item; Arrow's rounding modes are a spec surface of their own. |
+| `ceil` / `floor` / `trunc` | **GPU** | `Kernels/Rounding.swift`, all ten primitives. On an integer column they are the identity and keep its type (Arrow promotes to float64 instead). Float64 clears the fractional mantissa bits on the GPU, exactly, signed zeros and infinities included. |
+| `round` / `round_to_multiple` / `round_binary` | **Partial** | `round()` only, and only one mode: **halves away from zero** (Arrow's `HALF_TOWARDS_INFINITY`, not its `HALF_TO_EVEN` default). Exact on Float64. `round_to_multiple`, `round_binary` and the other nine `RoundMode`s are not implemented. |
 
 ## Bit-wise and shifts
 
 | Arrow function | Status | Notes |
 |---|---|---|
-| `bit_wise_and` | **Not planned** | No roadmap item. Note the confusion risk: boolean `and`/`or`/`not` over *packed bitmaps* are GPU kernels (see Logical), but these integer-valued bit-wise ops are not implemented. |
-| `bit_wise_or` | **Not planned** | No roadmap item. |
-| `bit_wise_xor` | **Not planned** | No roadmap item. |
-| `bit_wise_not` | **Not planned** | No roadmap item. |
-| `shift_left` / `shift_left_checked` | **Not planned** | No roadmap item. |
-| `shift_right` / `shift_right_checked` | **Not planned** | No roadmap item. |
+| `bit_wise_and` | **GPU** | `Kernels/Bitwise.swift`, scalar and array forms, over the eight integer types. Note the two different things called "and": boolean `and`/`or`/`not` over *packed bitmaps* are the Logical section below; these are value-level ops on integer columns. A float column throws. |
+| `bit_wise_or` | **GPU** | As `bit_wise_and`. |
+| `bit_wise_xor` | **GPU** | As `bit_wise_and`. |
+| `bit_wise_not` | **GPU** | `bitwiseNot()`; validity is shared zero-copy with the input. |
+| `shift_left` / `shift_left_checked` | **Partial** | `shiftLeft()` is GPU, scalar and array forms. Arrow raises on a shift count that is negative or at least the bit width and C leaves it undefined; ArrowMetal **defines** it as 0 instead (`Kernels/BitwiseSource.swift`, matched by the test oracle). In-range shifts drop the bits that leave the top. `shift_left_checked` is not implemented. |
+| `shift_right` / `shift_right_checked` | **Partial** | `shiftRight()` is arithmetic on signed columns and logical on unsigned ones. An out-of-range count is **defined** as the sign fill: 0 for a non-negative value or an unsigned column, -1 for a negative one. `shift_right_checked` is not implemented. |
 
 ## Comparisons
 
@@ -162,8 +167,8 @@ atomics with carry because MSL has no 64-bit atomics.
 | `less_equal` | **GPU** | As `equal`. |
 | `greater` | **GPU** | As `equal`. |
 | `greater_equal` | **GPU** | As `equal`. |
-| `max_element_wise` | **Not planned** | No roadmap item. |
-| `min_element_wise` | **Not planned** | No roadmap item. |
+| `max_element_wise` | **GPU** | `maxElementWise(_:)` (`Kernels/Rounding.swift`), two columns of the same type. Nulls are skipped, which is Arrow's `skip_nulls` default: a null on one side yields the other side's value and only two nulls make a null, so the output validity is the OR of the inputs', not the AND. NaN loses, as it does in the `min`/`max` reductions. Float64 compares on order-preserving bit patterns, exactly. |
+| `min_element_wise` | **GPU** | As `max_element_wise`. |
 
 ## Logical
 
@@ -321,9 +326,9 @@ zero-copy and a null row emits no bytes. All of them are reachable from Swift, f
 
 | Arrow function | Status | Notes |
 |---|---|---|
-| `cumulative_sum` / `cumulative_sum_checked` | **Not planned** | No roadmap item. A GPU exclusive prefix scan already exists internally (`exclusiveScanToOffsets`, used to build string offsets), so this is close — but nothing is exposed, and sequential-dependency window work is not what this library claims. |
-| `cumulative_prod` | **Not planned** | No roadmap item. |
-| `cumulative_max` / `cumulative_min` | **Not planned** | No roadmap item. |
+| `cumulative_sum` / `cumulative_sum_checked` | **Partial** | `cumulativeSum()` is GPU (`Kernels/Cumulative.swift`): a two-level inclusive scan — block scan, exclusive scan of the block totals, add back. Nulls are skipped in Arrow's sense: the output is null exactly where the input is and the running value carries across unchanged. Integers wrap and are exact; Float32 and Float64 reassociate the additions, so the last ulp can differ from a strictly sequential sum (Float64 accumulates through the software binary64 adder). `cumulative_sum_checked` is not implemented. The scan needs an exact count, so a pending batched input is materialised first. |
+| `cumulative_prod` | **Not planned** | No roadmap item. The scan in `Cumulative.swift` takes any associative combine, so this is one more entry in its op table. |
+| `cumulative_max` / `cumulative_min` | **GPU** | Same two-level scan, exact on every type including Float64 (bit-pattern ordering, NaN skipped). |
 | `cumulative_mean` | **Not planned** | No roadmap item. |
 | `pairwise_diff` / `pairwise_diff_checked` | **Not planned** | No roadmap item. |
 
@@ -353,7 +358,7 @@ outright.
 | `uint8` / `uint16` / `uint32` / `uint64` | **GPU** | Full kernel set. |
 | `float16` (halffloat) | **Not planned** | No roadmap item, though MSL has `half` so it would be cheap. |
 | `float32` | **GPU** | Full kernel set. NaN skipped by min/max, propagated by sum. |
-| `float64` | **Partial** | Metal has no `double`. Compare/min/max/filter/take/slice/sort run on the GPU over order-preserving bit patterns; sum and add/sub/mul/div run a software IEEE-754 binary64 implementation on the GPU that is correctly rounded and bit-exact against Swift's `Double`. Only `cast` falls back to the host, and group-by min/max/sum do not accept it. |
+| `float64` | **Partial** | Metal has no `double`. Compare/min/max/filter/take/slice/sort run on the GPU over order-preserving bit patterns; sum and add/sub/mul/div run a software IEEE-754 binary64 implementation on the GPU that is correctly rounded and bit-exact against Swift's `Double`. `negate`/`abs`/`sign`/`floor`/`ceil`/`round`/`trunc`, element-wise min/max and the cumulative functions are exact too (bit-pattern kernels); `sqrt`/`exp`/`ln`/`log10`/`log2` drop to `float` precision and widen back (~7 significant digits), and `power`/`modulo` are not implemented for it at all. Only `cast` falls back to the host, and group-by min/max/sum do not accept it. |
 | `decimal32` / `decimal64` | **Not planned** | Out of scope for 0.1.0: 128/256-bit fixed-point arithmetic in MSL is a project of its own with no bandwidth win. |
 | `decimal128` / `decimal256` | **Not planned** | Same. ArrowMetal explicitly does not claim decimals. |
 | `date32` / `date64` | **In progress** | Concurrent branch this week; not in 0.1.0 as published here. |
@@ -413,8 +418,8 @@ over nested types — lists, structs, maps, unions (struct appears only as the r
 there is no compute over struct-typed columns); it does not do regex, full Unicode case folding beyond the
 Latin-1 Supplement and Latin Extended-A blocks (the multi-character expansions of ß, ŉ and µ are left
 alone), normalisation, Unicode-whitespace trimming, splitting or any other Unicode-table-driven string
-transform; it does not do window,
-cumulative or pairwise functions; it does not do temporal component extraction, temporal arithmetic,
+transform; it does not do window or pairwise functions, and of the cumulative family only `cumulative_sum`,
+`cumulative_min` and `cumulative_max` ship; it does not do temporal component extraction, temporal arithmetic,
 timezones or `strftime`/`strptime`; it does not do statistical aggregates (`stddev`, `variance`, `quantile`,
 `mode`, `tdigest`, `approximate_median`); it does not do set lookup over strings, nor the structural
 functions it has no kernel for (`case_when`, `choose`, `replace_with_mask`, `fill_null_forward`/`_backward`,
