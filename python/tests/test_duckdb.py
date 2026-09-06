@@ -351,6 +351,17 @@ def test_extension_group_by_matches_duckdb(ext_con):
 
 
 @extension
+def test_extension_group_by_a_float_key(ext_con):
+    """A DOUBLE key is declared DOUBLE and must be written as one - it used to go out as a BIGINT."""
+    ext_con.execute("create table fk as select (i % 5 + 0.5)::DOUBLE k, i::BIGINT v "
+                    "from range(1000) r(i)")
+    got = ext_con.sql("select * from arrowmetal_group_by('fk', 'k', 'v') order by key").fetchall()
+    expected = ext_con.sql(
+        "select k, count(v), sum(v), min(v), max(v) from fk group by k order by k").fetchall()
+    assert got == expected
+
+
+@extension
 def test_extension_top_k_matches_duckdb(ext_con):
     make_table(ext_con)
     got = [row[0] for row in ext_con.sql("select * from arrowmetal_top_k('t', 'v', 10)").fetchall()]

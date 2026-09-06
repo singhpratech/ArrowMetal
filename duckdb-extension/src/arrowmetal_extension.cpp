@@ -358,6 +358,7 @@ struct BindData {
 	std::string expr;
 	int64_t k = 0;
 	bool value_is_float = false;
+	bool key_is_float = false;   // arrowmetal_group_by: main() needs it to pick the output pointer
 };
 
 struct InitData {
@@ -511,12 +512,12 @@ void bind(duckdb_bind_info info) {
 	case Kind::GroupBy: {
 		bool key_found = false;
 		std::string key_error;
-		const bool key_is_float = column_is_float(conn.handle, data->table, data->key, key_found, key_error);
+		data->key_is_float = column_is_float(conn.handle, data->table, data->key, key_found, key_error);
 		if (!key_found) {
 			duckdb_bind_set_error(info, key_error.c_str());
 			return;
 		}
-		add_column(info, "key", key_is_float ? DUCKDB_TYPE_DOUBLE : DUCKDB_TYPE_BIGINT);
+		add_column(info, "key", data->key_is_float ? DUCKDB_TYPE_DOUBLE : DUCKDB_TYPE_BIGINT);
 		add_column(info, "count", DUCKDB_TYPE_BIGINT);
 		add_column(info, "sum", value_type);
 		add_column(info, "min", value_type);
@@ -804,7 +805,8 @@ void main_function(duckdb_function_info info, duckdb_data_chunk output) {
 			// the rest DOUBLE.
 			const bool as_double =
 			    (bind_data->kind == Kind::Agg && (c == 4 || (bind_data->value_is_float && c != 1))) ||
-			    (bind_data->kind == Kind::GroupBy && bind_data->value_is_float && c >= 2) ||
+			    (bind_data->kind == Kind::GroupBy &&
+			     (c == 0 ? bind_data->key_is_float : (c >= 2 && bind_data->value_is_float))) ||
 			    ((bind_data->kind == Kind::TopK || bind_data->kind == Kind::Sort) &&
 			     bind_data->value_is_float) ||
 			    (bind_data->kind == Kind::Query && c == 1);
