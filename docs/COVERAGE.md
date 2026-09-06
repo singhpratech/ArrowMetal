@@ -26,12 +26,12 @@ them so a claim can be checked in one jump.
 | Conversions and casts | 0 | 1 | 2 | 0 | 1 | 2 | 6 |
 | Selections | 4 | 0 | 1 | 0 | 0 | 0 | 5 |
 | Containment / set lookup | 2 | 0 | 0 | 0 | 0 | 1 | 3 |
-| Sorts and partitions | 2 | 1 | 2 | 0 | 0 | 2 | 7 |
+| Sorts and partitions | 4 | 1 | 3 | 0 | 0 | 0 | 8 |
 | Structural and conditional | 4 | 0 | 2 | 0 | 0 | 7 | 13 |
 | Associative transforms | 0 | 1 | 0 | 1 | 3 | 0 | 5 |
-| Pairwise and cumulative | 1 | 0 | 1 | 0 | 0 | 3 | 5 |
+| Pairwise and cumulative | 4 | 0 | 2 | 0 | 0 | 0 | 6 |
 | Hashing | 1 | 0 | 0 | 0 | 0 | 1 | 2 |
-| **Total (compute functions)** | **56** | **7** | **27** | **6** | **6** | **56** | **158** |
+| **Total (compute functions)** | **61** | **7** | **29** | **6** | **6** | **51** | **160** |
 | Arrow types (matrix below) | 5 | 0 | 3 | 1 | 6 | 11 | 26 |
 
 Interop uses a separate vocabulary and is counted apart: 6 shipped, 1 partial, 3 planned, 1 in progress
@@ -39,7 +39,7 @@ Interop uses a separate vocabulary and is counted apart: 6 shipped, 1 partial, 3
 
 **The scope ArrowMetal 0.1.0 claims 100% of:** flat analytics on primitive, boolean and string columns —
 `sum`/`min`/`max`/`mean`, the six comparisons, wrapping `add`/`subtract`/`multiply`/`divide`, boolean
-`and`/`or`/`not`, `filter`/`take`/`slice`, numeric `cast`, single-key `sort`/`argsort`/top-k, group-by
+`and`/`or`/`not`, `filter`/`take`/`slice`, numeric `cast`, single- and multi-key `sort`/`argsort`/top-k, group-by
 `count`/`sum`/`mean`/`min`/`max` over dense integer keys, `is_null`/`is_valid`/`fill_null`/`drop_null`/
 `if_else`/`coalesce`/`is_in`/`index_in`/`and_kleene`/`or_kleene`, `utf8` length/`equals`/`starts_with`/`ends_with`/
 `contains`/`count_substring`/`find_substring`/murmur3 hash, the ASCII case, trim, pad, slice, repeat,
@@ -49,9 +49,10 @@ Arrow semantics and checked against a CPU oracle in the test suite.
 
 **The scope it does not claim:** decimals; compute over nested types (lists, structs, maps, unions); regex
 and Unicode-table string work (full case folding beyond Latin-1 Supplement and Latin Extended-A,
-normalisation, Unicode-whitespace trimming, splitting); window and pairwise functions
-(`cumulative_sum`/`_min`/`_max` do ship — see Pairwise and cumulative — but `cumulative_prod`,
-`cumulative_mean` and `pairwise_diff` do not); temporal component extraction, temporal arithmetic, timezones and
+normalisation, Unicode-whitespace trimming, splitting); the statistical ranking transforms
+(`rank_quantile`, `rank_normal`) and the checked forms of the cumulative and pairwise functions — the
+ranking, shift, pairwise-difference, cumulative and rolling-window families themselves do ship, see Sorts
+and partitions and Pairwise and cumulative; temporal component extraction, temporal arithmetic, timezones and
 `strftime`/`strptime`; statistical aggregates (`stddev`, `variance`, `quantile`, `mode`, `tdigest`);
 set lookup over strings; `case_when`, `replace_with_mask` and the forward/backward null fills; checked
 arithmetic and overflow-erroring casts. The long form is at the bottom of this file.
@@ -287,12 +288,13 @@ zero-copy and a null row emits no bytes. All of them are reachable from Swift, f
 | Arrow function | Status | Notes |
 |---|---|---|
 | `array_sort_indices` | **GPU** | `Kernels/Sort.swift`: LSD radix sort, 4 passes for 32-bit keys and 8 for 64-bit, stable. Ascending or descending. Total order for floats (NaN after +inf). |
-| `sort_indices` (multiple sort keys) | **Partial** | One key only. [ROADMAP → Medium term → Sort](../ROADMAP.md#medium-term) lists "multi-column sort keys" as open. |
-| Sorted copy (`sorted()`) and `MetalRecordBatch.sorted(by:)` | **GPU** | Argsort then take. Not an Arrow compute function name, but it is what callers use. |
+| `sort_indices` (multiple sort keys) | **GPU** | `Kernels/MultiSort.swift`: successive stable radix argsorts from the least significant key upwards, the keys reordered with `take` between passes, so k keys cost k argsorts and no new kernel. Ascending or descending per key; nulls last in every key in both directions. `lexsortIndices(_:descending:)` and `MetalRecordBatch.sorted(by: [(column:descending:)])` in Swift, `am_lexsort` in C, `lexsort_indices()` in Python. utf8, binary and dictionary key columns throw — there is no order-preserving GPU key for them yet. |
+| Sorted copy (`sorted()`) and `MetalRecordBatch.sorted(by:)` | **GPU** | Argsort then take, single key or several. Not an Arrow compute function name, but it is what callers use. |
 | Nulls-last placement in the sorted index array | **CPU** | The radix sort runs on the GPU; the stable partition that moves null rows to the end is a host pass over the index array (`Sort.swift`). |
 | `select_k_unstable` (top-k) | **Partial** | `topK(_:largest:)` is a full GPU argsort followed by a slice — correct, and much more work than a partial selection needs. Single key. |
-| `partition_nth_indices` | **Not planned** | No roadmap item. |
-| `rank` / `rank_quantile` / `rank_normal` | **Not planned** | No roadmap item. |
+| `partition_nth_indices` | **Partial** | `partitionNthIndices(_:)` (`Kernels/MultiSort.swift`) returns a full `argsort`, which trivially satisfies the partition contract but costs a sort rather than the O(length) a selection algorithm would. Documented as such at the call site; the signature is the one a real partition would have. |
+| `rank` / `rank_quantile` / `rank_normal` | **Partial** | `rank()` is GPU (`Kernels/Window.swift`): one argsort, run marks over the sorted order, a two-level scan of those marks, and a scatter back to the original rows. Arrow's `tiebreaker` options are separate calls here — `rank()` is `min`, `denseRank()` is `dense`, `rowNumber()` is `first`; `max` is not implemented, and neither is `rank_quantile` or `rank_normal`. |
+| SQL window ranking: `row_number`, `dense_rank`, `percent_rank`, `cume_dist` | **GPU** | An ArrowMetal extension, not Arrow compute function names. Same argsort-plus-scan as `rank`, so all five cost one sort. Nulls follow `ORDER BY x NULLS LAST`: they sort after every value and form one tie group, so no ranking result is itself null. Float ties use Arrow value equality (every NaN is one value, ordered after +inf; `-0.0` equals `0.0`). `percentRank()` and `cumeDist()` come back as float64 through the correctly rounded software binary64 divide. `am_window` ops 0-4 in C, `row_number()` / `rank()` / `dense_rank()` / `percent_rank()` / `cume_dist()` in Python. |
 
 ## Structural and conditional transforms
 
@@ -327,10 +329,11 @@ zero-copy and a null row emits no bytes. All of them are reachable from Swift, f
 | Arrow function | Status | Notes |
 |---|---|---|
 | `cumulative_sum` / `cumulative_sum_checked` | **Partial** | `cumulativeSum()` is GPU (`Kernels/Cumulative.swift`): a two-level inclusive scan — block scan, exclusive scan of the block totals, add back. Nulls are skipped in Arrow's sense: the output is null exactly where the input is and the running value carries across unchanged. Integers wrap and are exact; Float32 and Float64 reassociate the additions, so the last ulp can differ from a strictly sequential sum (Float64 accumulates through the software binary64 adder). `cumulative_sum_checked` is not implemented. The scan needs an exact count, so a pending batched input is materialised first. |
-| `cumulative_prod` | **Not planned** | No roadmap item. The scan in `Cumulative.swift` takes any associative combine, so this is one more entry in its op table. |
+| `cumulative_prod` | **GPU** | `cumulativeProd()` (`Kernels/Window.swift`) runs the scan from `CumulativeSource` with a multiply, so it is the same three passes as `cumulative_sum` and skips nulls the same way. Integer products wrap and are exact; Float32 and Float64 reassociate, and a Float32 product that drifts into the subnormals comes back as zero (Apple GPUs flush Float32 denormals — the Float64 path uses the software multiplier and keeps them). `cumulative_prod_checked` is not implemented. |
 | `cumulative_max` / `cumulative_min` | **GPU** | Same two-level scan, exact on every type including Float64 (bit-pattern ordering, NaN skipped). |
-| `cumulative_mean` | **Not planned** | No roadmap item. |
-| `pairwise_diff` / `pairwise_diff_checked` | **Not planned** | No roadmap item. |
+| `cumulative_mean` | **GPU** | `cumulativeMean()` returns float64 for every input type: a binary64 running sum over an int32 running count of non-null rows, then the correctly rounded software divide. Output null exactly where the input is. Values widen to binary64 first, so int64 magnitudes above 2^53 round on the way in, and the sum reassociates as `cumulative_sum` does. |
+| `pairwise_diff` / `pairwise_diff_checked` | **Partial** | `pairwiseDiff(period:)` is GPU, one thread per element: `out[i] = a[i] - a[i - period]`, null where either side is null or falls outside the array, and a negative period differences forwards. Integers wrap; Float32 subtracts in `float` and Float64 through the correctly rounded software binary64 subtract, so both are exact. `pairwise_diff_checked` is not implemented. |
+| `shift` (lag / lead) and trailing rolling `sum` / `min` / `max` / `mean` | **GPU** | ArrowMetal extensions, not Arrow compute function names (`Kernels/Window.swift`). `shift(by:fill:)` moves rows forwards or backwards, filling with a scalar or a null. The rolling calls take `window` and `minPeriods` (how many non-null rows the trailing window needs before it produces a value; fewer gives a null). Min and max scan the window, one thread per output — O(n · window), the right shape up to a few thousand rows per window — with NaN skipped as the reductions skip it. Sum and mean are the difference of two prefix sums, so they are O(n); the price is that a float window sum loses cancellation digits, and one NaN or infinity in a float column poisons every later window. `rollingMean` returns float64. `am_window` ops 5 and 9-12 in C, `shift()` / `rolling_sum()` / `rolling_min()` / `rolling_max()` / `rolling_mean()` in Python. |
 
 ## Hashing
 
@@ -402,7 +405,7 @@ outright.
 `uint8/16/32/64`, `float32`, `float64`, `bool` and `utf8`: the reductions `sum`, `min`, `max`, `mean`; the
 six comparisons against a scalar or another column; wrapping `add`/`subtract`/`multiply`/`divide`; boolean
 `and`/`or`/`not`; `filter` (including a fused predicate form), `take` and `slice`; numeric `cast`;
-single-key `sort`, `argsort` and top-k; group-by `count`/`sum`/`mean`/`min`/`max` over dense integer keys;
+single- and multi-key `sort`, `argsort` and top-k; group-by `count`/`sum`/`mean`/`min`/`max` over dense integer keys;
 `is_null`, `is_valid`, `fill_null`, `drop_null`, `if_else`, `coalesce`, `is_in`, `index_in` and the Kleene
 `and_kleene`/`or_kleene`; `utf8` byte and character length, `equals`/`starts_with`/`ends_with`/`contains`,
 `count_substring`, `find_substring` and murmur3 hash, plus the string transforms that build new `utf8`
@@ -418,8 +421,9 @@ over nested types — lists, structs, maps, unions (struct appears only as the r
 there is no compute over struct-typed columns); it does not do regex, full Unicode case folding beyond the
 Latin-1 Supplement and Latin Extended-A blocks (the multi-character expansions of ß, ŉ and µ are left
 alone), normalisation, Unicode-whitespace trimming, splitting or any other Unicode-table-driven string
-transform; it does not do window or pairwise functions, and of the cumulative family only `cumulative_sum`,
-`cumulative_min` and `cumulative_max` ship; it does not do temporal component extraction, temporal arithmetic,
+transform; of the window family it does not do `rank_quantile` or `rank_normal`, nor any of the checked
+(overflow-raising) cumulative or pairwise forms — the ranking, shift, pairwise-difference, cumulative and
+rolling-window calls themselves ship; it does not do temporal component extraction, temporal arithmetic,
 timezones or `strftime`/`strptime`; it does not do statistical aggregates (`stddev`, `variance`, `quantile`,
 `mode`, `tdigest`, `approximate_median`); it does not do set lookup over strings, nor the structural
 functions it has no kernel for (`case_when`, `choose`, `replace_with_mask`, `fill_null_forward`/`_backward`,
