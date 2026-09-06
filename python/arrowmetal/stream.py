@@ -51,7 +51,7 @@ _S = _P            # am_stream*
 _R = _P            # am_stream_result*
 
 _lib.am_stream_last_error.restype = ctypes.c_char_p
-_lib.am_stream_open_ipc.argtypes = [ctypes.c_char_p, ctypes.c_int]
+_lib.am_stream_open_ipc.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
 _lib.am_stream_open_ipc.restype = _S
 _lib.am_stream_from_c_stream.argtypes = [ctypes.c_void_p, ctypes.c_int]
 _lib.am_stream_from_c_stream.restype = _S
@@ -509,18 +509,24 @@ def _export_c_stream(obj):
     return out
 
 
-def scan_ipc(path, prefetch=3, batch_rows=None):
+def scan_ipc(path, prefetch=3, readers=1, batch_rows=None):
     """Stream an Arrow IPC file, or a directory of them, off disk.
 
     The file is memory mapped and read one record batch at a time, with `prefetch` batches read
     ahead on their own thread and the unified buffer cache warmed ahead of the read cursor. Pass
     `prefetch=0` to read synchronously.
 
+    `readers > 1` reads that many files of a *directory* at once, one thread each, which is what it
+    takes to saturate an Apple SSD or a warm page cache: a single reader thread tops out around
+    10 GB/s. Batch order is then not preserved, which every operator here tolerates except a
+    `filter(...).sink_ipc(...)` that must keep the source's row order.
+
     `batch_rows` is accepted for symmetry with `scan_arrow` but the IPC file's own record batch
     boundaries decide the batch size; it is ignored (with no error) when the file already has them."""
     del batch_rows      # the IPC file's own record batches are the unit of streaming
     path = os.fspath(path)
-    return Stream(_lib.am_stream_open_ipc(str(path).encode(), int(prefetch)), description=str(path))
+    return Stream(_lib.am_stream_open_ipc(str(path).encode(), int(prefetch), int(readers)),
+                  description=str(path))
 
 
 def scan_arrow(obj, prefetch=3):

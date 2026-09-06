@@ -92,10 +92,12 @@ public func am_stream_last_error() -> UnsafePointer<CChar>? {
 
 /// Opens an Arrow IPC file, or a directory of them, as a prefetching stream source.
 @_cdecl("am_stream_open_ipc")
-public func am_stream_open_ipc(_ path: UnsafePointer<CChar>?, _ prefetchDepth: Int32) -> OpaquePointer? {
+public func am_stream_open_ipc(_ path: UnsafePointer<CChar>?, _ prefetchDepth: Int32,
+                               _ readers: Int32) -> OpaquePointer? {
     guard let path else { return nil }
     do {
-        let q = try StreamQuery(ipc: String(cString: path), prefetchDepth: Int(prefetchDepth))
+        let q = try StreamQuery(ipc: String(cString: path), prefetchDepth: Int(prefetchDepth),
+                                readers: Int(Swift.max(1, readers)))
         return OpaquePointer(Unmanaged.passRetained(StreamBox(q)).toOpaque())
     } catch {
         setStreamError(error)

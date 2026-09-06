@@ -132,6 +132,87 @@ final class StreamTests: XCTestCase {
         XCTAssertGreaterThan(src.totalBytes, 0)
     }
 
+    func testParallelSourceReadsEveryRowAcrossFiles() throws {
+        try requireRealGPU()
+        let dir = scratch.appendingPathComponent("parallel")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var expected: Set<Int64> = []
+        for f in 0..<6 {
+            let rows = Self.rows(500, offset: f * 500)
+            expected.formUnion(rows.map { $0.id })
+            let sink = try IPCStreamSink(url: dir.appendingPathComponent(String(format: "p-%03d.arrows", f)))
+            // Several batches per file, so the readers interleave.
+            for chunk in stride(from: 0, to: rows.count, by: 137) {
+                try sink.write(try Self.batch(Array(rows[chunk..<Swift.min(chunk + 137, rows.count)])))
+            }
+            try sink.finish()
+        }
+        let src = try ParallelIPCSource(directory: dir, readers: 4, depth: 2)
+        let all = try concatBatches(try src.collect())
+        // Order is deliberately not preserved; every row must still arrive exactly once.
+        let got = try XCTUnwrap(all["id"]?.asInt64).toArray().compactMap { $0 }
+        XCTAssertEqual(got.count, expected.count)
+        XCTAssertEqual(Set(got), expected)
+        XCTAssertGreaterThan(src.totalBytes, 0)
+        src.close()
+    }
+
+    func testParallelSourceFeedsAnAggregateIdentically() throws {
+        try requireRealGPU()
+        let dir = scratch.appendingPathComponent("parallel-agg")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var all: [Row] = []
+        for f in 0..<5 {
+            let rows = Self.rows(900, offset: f * 900)
+            all += rows
+            let sink = try IPCStreamSink(url: dir.appendingPathComponent(String(format: "p-%03d.arrows", f)))
+            try sink.write(try Self.batch(rows))
+            try sink.finish()
+        }
+        let serial = try StreamQuery(source: try openIPCSource(dir.path, readers: 1)).sum("value")
+        let parallel = try StreamQuery(source: try openIPCSource(dir.path, readers: 4)).sum("value")
+        XCTAssertEqual(serial?.asInt64, all.compactMap { $0.value }.reduce(0, &+))
+        XCTAssertEqual(parallel?.asInt64, serial?.asInt64)
+    }
+
+    func testExternalSortMergesInPassesWhenThereAreManyRuns() throws {
+        try requireRealGPU()
+        let n = 12_000
+        let rows = Self.rows(n)
+        // 120 batches means 120 runs, which is past the default fan-in of 32: the merge has to run
+        // in passes rather than open every run at once.
+        let src = try source(rows, sizes: Array(repeating: n / 120, count: 120))
+        let collected = CollectingSink()
+        let op = try ExternalSortOperator(keys: [ExternalSortOperator.Key("amount")],
+                                          sink: collected, scratch: scratch)
+        op.mergeFanIn = 8
+        let r = try StreamingExecutor(source: src).run(op)
+        XCTAssertEqual(op.runCount, 120)
+        XCTAssertEqual(r.rowsOut, n)
+        let out = try XCTUnwrap(try collected.table())
+        XCTAssertEqual(try XCTUnwrap(out["amount"]?.asFloat64).toArray().compactMap { $0 },
+                       rows.map { $0.amount }.sorted())
+        // Every intermediate run file is cleaned up.
+        let left = try FileManager.default.contentsOfDirectory(atPath: scratch.path)
+            .filter { $0.hasPrefix("run-") || $0.hasPrefix("merge-") }
+        XCTAssertEqual(left, [])
+    }
+
+    func testExternalSortWithLimitAcrossManyRuns() throws {
+        try requireRealGPU()
+        let n = 9_000
+        let rows = Self.rows(n)
+        let src = try source(rows, sizes: Array(repeating: 100, count: 90))
+        let collected = CollectingSink()
+        let op = try ExternalSortOperator(keys: [ExternalSortOperator.Key("amount", descending: true)],
+                                          sink: collected, scratch: scratch, limit: 17)
+        op.mergeFanIn = 4
+        _ = try StreamingExecutor(source: src).run(op)
+        let out = try XCTUnwrap(try collected.table())
+        XCTAssertEqual(try XCTUnwrap(out["amount"]?.asFloat64).toArray().compactMap { $0 },
+                       Array(rows.map { $0.amount }.sorted(by: >).prefix(17)))
+    }
+
     func testPrefetchingSourceYieldsTheSameBatches() throws {
         try requireRealGPU()
         let rows = Self.rows(4_000)

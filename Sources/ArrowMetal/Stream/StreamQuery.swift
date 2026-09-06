@@ -29,8 +29,14 @@ public final class StreamQuery {
     }
 
     /// A query over an Arrow IPC file or a directory of them, with readahead and triple buffering.
-    public convenience init(ipc path: String, prefetchDepth: Int = 3, context: MetalContext = .shared) throws {
-        self.init(source: try openIPCSource(path, prefetchDepth: prefetchDepth, context: context), context: context)
+    ///
+    /// `readers > 1` reads several files of a directory at once, which scales the read stage with
+    /// cores at the cost of the source's batch order (see `ParallelIPCSource`).
+    public convenience init(ipc path: String, prefetchDepth: Int = 3, readers: Int = 1,
+                            context: MetalContext = .shared) throws {
+        self.init(source: try openIPCSource(path, prefetchDepth: prefetchDepth, readers: readers,
+                                            context: context),
+                  context: context)
     }
 
     // MARK: builders

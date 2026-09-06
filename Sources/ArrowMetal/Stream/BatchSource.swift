@@ -410,15 +410,172 @@ extension BatchSource where Self == IPCFileSource {
 }
 
 /// A prefetching source over an Arrow IPC file or a directory of them.
+///
+/// `readers > 1` on a directory reads several files at once with `ParallelIPCSource`, which scales
+/// the read stage with cores but does not preserve batch order (see that type). Everything else
+/// keeps the source's order.
 public func openIPCSource(_ path: String, prefetchDepth: Int = 3,
                           budgetBytes: Int = 2 << 30,
+                          readers: Int = 1,
                           context: MetalContext = .shared) throws -> BatchSource {
     var isDir: ObjCBool = false
     guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir) else {
         throw ArrowIPCError.malformed("no such path: \(path)")
     }
     let url = URL(fileURLWithPath: path)
+    if isDir.boolValue, readers > 1 {
+        return try ParallelIPCSource(directory: url, readers: readers,
+                                     depth: Swift.max(1, prefetchDepth), context: context)
+    }
     let base: BatchSource = isDir.boolValue ? try IPCDirectorySource(directory: url, context: context)
                                             : try IPCFileSource(url: url, context: context)
     return prefetchDepth <= 0 ? base : PrefetchingSource(base, depth: prefetchDepth, budgetBytes: budgetBytes)
+}
+
+// MARK: - Parallel reading
+
+/// Reads a directory of Arrow IPC files with several threads at once.
+///
+/// `PrefetchingSource` hides the read behind the GPU, but it is still *one* thread doing the mapping
+/// and the import. On a machine whose page cache already holds the dataset that thread is the
+/// bottleneck: one core copies at roughly 10 GB/s while the whole chip can do several times that.
+/// This source gives each of `readers` threads its own files and its own `IPCFileSource`, so the
+/// read stage scales with cores.
+///
+/// **Batch order is not preserved.** Batches arrive interleaved across files, in whatever order the
+/// threads finish. Every streaming operator here is order independent — aggregates, sketches,
+/// group-by, top-k, the external sort's run generation, both joins — but a `filter -> sink_ipc` that
+/// must preserve the source's row order needs `readers: 1`.
+public final class ParallelIPCSource: BatchSource {
+    private let urls: [URL]
+    private let context: MetalContext
+    private let readers: Int
+    private let depth: Int
+    private let budgetBytes: Int
+
+    private let lock = NSCondition()
+    private var queue: [MetalRecordBatch] = []
+    private var queuedBytes = 0
+    private var nextFile = 0
+    private var live = 0
+    private var failure: Error?
+    private var stopped = false
+    private var started = false
+    private var read: Int64 = 0
+    private let total: Int64
+    private var schemaFound: ArrowIPCSchema?
+
+    /// Nanoseconds summed across the reader threads, so it can exceed wall time — which is the point.
+    public private(set) var readNanos: UInt64 = 0
+
+    public var streamSchema: ArrowIPCSchema? { lock.lock(); defer { lock.unlock() }; return schemaFound }
+    public var bytesRead: Int64 { lock.lock(); defer { lock.unlock() }; return read }
+    public var totalBytes: Int64 { total }
+
+    public init(files: [URL], readers: Int = 4, depth: Int = 2, budgetBytes: Int = 2 << 30,
+                context: MetalContext = .shared) throws {
+        guard !files.isEmpty else { throw ArrowIPCError.malformed("no Arrow IPC files given") }
+        self.urls = files
+        self.context = context
+        self.readers = Swift.max(1, Swift.min(readers, files.count))
+        self.depth = Swift.max(1, depth)
+        self.budgetBytes = Swift.max(1 << 20, budgetBytes)
+        var t: Int64 = 0
+        for u in files {
+            t += ((try? FileManager.default.attributesOfItem(atPath: u.path))?[.size] as? NSNumber)?.int64Value ?? 0
+        }
+        self.total = t
+    }
+
+    public convenience init(directory: URL, readers: Int = 4, depth: Int = 2,
+                            extensions: Set<String> = ["arrow", "arrows", "ipc", "feather"],
+                            context: MetalContext = .shared) throws {
+        let entries = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        let files = entries.filter { extensions.contains($0.pathExtension.lowercased()) }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        guard !files.isEmpty else { throw ArrowIPCError.malformed("no Arrow IPC files in \(directory.path)") }
+        try self.init(files: files, readers: readers, depth: depth, context: context)
+    }
+
+    private func start() {
+        guard !started else { return }
+        started = true
+        live = readers
+        for i in 0..<readers {
+            let t = Thread { [weak self] in self?.readLoop() }
+            t.name = "ArrowMetal.prefetch.\(i)"
+            t.stackSize = 1 << 20
+            t.start()
+        }
+    }
+
+    /// Claims the next unread file, or nil when they are all taken.
+    private func claimFile() -> URL? {
+        lock.lock(); defer { lock.unlock() }
+        guard nextFile < urls.count, !stopped else { return nil }
+        defer { nextFile += 1 }
+        return urls[nextFile]
+    }
+
+    private func readLoop() {
+        while let url = claimFile() {
+            do {
+                let source = try IPCFileSource(url: url, context: context)
+                while true {
+                    lock.lock()
+                    // The queue is shared, so the depth is per reader and multiplied out here.
+                    while !stopped && (queue.count >= depth * readers || queuedBytes >= budgetBytes) { lock.wait() }
+                    if stopped { lock.unlock(); source.close(); finishReader(); return }
+                    if schemaFound == nil { schemaFound = source.streamSchema }
+                    lock.unlock()
+
+                    let t0 = machNow()
+                    guard let b = try source.nextBatch() else { break }
+                    let took = nanos(since: t0)
+
+                    lock.lock()
+                    readNanos &+= took
+                    queue.append(b)
+                    queuedBytes += batchBytes(b)
+                    lock.broadcast()
+                    lock.unlock()
+                }
+                lock.lock(); read += source.totalBytes; lock.unlock()
+                source.close()
+            } catch {
+                lock.lock()
+                if failure == nil { failure = error }
+                stopped = true
+                lock.broadcast()
+                lock.unlock()
+                finishReader()
+                return
+            }
+        }
+        finishReader()
+    }
+
+    private func finishReader() {
+        lock.lock()
+        live -= 1
+        lock.broadcast()
+        lock.unlock()
+    }
+
+    public func nextBatch() throws -> MetalRecordBatch? {
+        lock.lock()
+        start()
+        while queue.isEmpty && live > 0 { lock.wait() }
+        if let e = failure, queue.isEmpty { lock.unlock(); throw e }
+        guard !queue.isEmpty else { lock.unlock(); return nil }
+        let b = queue.removeFirst()
+        queuedBytes -= batchBytes(b)
+        lock.broadcast()
+        lock.unlock()
+        return b
+    }
+
+    public func close() {
+        lock.lock(); stopped = true; lock.broadcast(); lock.unlock()
+    }
 }

@@ -190,7 +190,9 @@ public final class StreamingExecutor {
         var result = try op.finish()
         stats.mergeNanos = mergeNanos
         stats.bytesRead = source.bytesRead
-        stats.readNanos = (source as? PrefetchingSource)?.readNanos ?? stats.readStallNanos
+        if let p = source as? PrefetchingSource { stats.readNanos = p.readNanos }
+        else if let p = source as? ParallelIPCSource { stats.readNanos = p.readNanos }
+        else { stats.readNanos = stats.readStallNanos }
         stats.wallNanos = nanos(since: t0)
         result.stats = stats
         return result

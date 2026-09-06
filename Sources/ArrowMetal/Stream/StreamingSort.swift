@@ -30,6 +30,9 @@ public final class ExternalSortOperator: StreamOperator {
     public let limit: Int?
     /// Rows per output batch out of the merge.
     public var outputBatchRows = 65_536
+    /// Most runs merged at once. Each open run costs a file descriptor and one batch of memory, so a
+    /// dataset that spills hundreds of runs is merged in passes rather than all at once.
+    public var mergeFanIn = 32
     public private(set) var runURLs: [URL] = []
     /// Number of sorted runs spilled.
     public var runCount: Int { runURLs.count }
@@ -76,10 +79,42 @@ public final class ExternalSortOperator: StreamOperator {
     }
 
     public func finish() throws -> StreamResult {
-        defer { if deleteRuns { for u in runURLs { try? FileManager.default.removeItem(at: u) } } }
+        var intermediates: [URL] = []
+        defer {
+            if deleteRuns { for u in runURLs { try? FileManager.default.removeItem(at: u) } }
+            for u in intermediates { try? FileManager.default.removeItem(at: u) }
+        }
         var written = 0
         if !runURLs.isEmpty {
-            written = try kWayMerge(runs: runURLs, keys: keys, sink: sink, limit: limit,
+            // Bounded fan-in. 589 batches means 589 runs, and opening them all at once would want 589
+            // file descriptors and 589 resident batches; merging in passes of `mergeFanIn` keeps both
+            // constant. `limit` is applied to every pass: the global first n rows are always inside
+            // the union of each group's first n, so an intermediate run never needs to be longer.
+            var runs = runURLs
+            var pass = 0
+            while runs.count > mergeFanIn {
+                var next: [URL] = []
+                var i = 0
+                while i < runs.count {
+                    let chunk = Array(runs[i..<Swift.min(i + mergeFanIn, runs.count)])
+                    i += mergeFanIn
+                    if chunk.count == 1 { next.append(chunk[0]); continue }
+                    let url = scratch.appendingPathComponent(String(format: "merge-%d-%05d.arrows", pass, next.count))
+                    let s = try IPCStreamSink(url: url)
+                    _ = try kWayMerge(runs: chunk, keys: keys, sink: s, limit: limit,
+                                      outputBatchRows: outputBatchRows, context: context)
+                    try s.finish()
+                    intermediates.append(url)
+                    next.append(url)
+                    // The inputs of this pass are done with; free their bytes before the next pass.
+                    for u in chunk where u != url {
+                        if deleteRuns || intermediates.contains(u) { try? FileManager.default.removeItem(at: u) }
+                    }
+                }
+                runs = next
+                pass += 1
+            }
+            written = try kWayMerge(runs: runs, keys: keys, sink: sink, limit: limit,
                                     outputBatchRows: outputBatchRows, context: context)
         }
         try sink.finish()
@@ -95,8 +130,10 @@ private final class RunCursor {
     let source: IPCFileSource
     var batch: MetalRecordBatch?
     var row = 0
-    /// Key values of the current batch, one array per sort key.
-    var keyValues: [[StreamValue]] = []
+    /// Key values of the current batch, one column per sort key. `StreamColumn` rather than
+    /// `[StreamValue]`: a merge holds one batch per open run, so the key storage is the cursor's
+    /// whole memory footprint and plain `[Int64]` / `[Double]` is a third of the boxed form.
+    var keyValues: [StreamColumn] = []
 
     init(url: URL, context: MetalContext) throws {
         self.source = try IPCFileSource(url: url, context: context)
@@ -113,7 +150,7 @@ private final class RunCursor {
                 guard let c = b[k.column] else {
                     throw ArrowMetalError.invalidArrowArray("run is missing sort column \(k.column)")
                 }
-                return try c.streamValues()
+                return try c.streamColumn()
             }
             return true
         }
@@ -121,7 +158,7 @@ private final class RunCursor {
 
     var exhausted: Bool { batch == nil || row >= (batch?.length ?? 0) }
 
-    func key(_ i: Int) -> StreamValue { keyValues[i][row] }
+    func key(_ i: Int) -> StreamValue { keyValues[i].value(row) }
 }
 
 /// Merges sorted runs into one ordered stream, writing output batches to `sink`.

@@ -1179,8 +1179,10 @@ typedef struct am_stream_result am_stream_result;
 const char* am_stream_last_error(void);
 
 // Opens an Arrow IPC file or a directory of them. prefetch_depth batches are read ahead on their own
-// thread (3 is a good default; 0 disables prefetching).
-am_stream* am_stream_open_ipc(const char* path, int prefetch_depth);
+// thread (3 is a good default; 0 disables prefetching). readers > 1 reads that many files of a
+// directory at once, which scales the read stage with cores; batch order is then NOT preserved, so
+// use readers = 1 when the output must keep the source's row order.
+am_stream* am_stream_open_ipc(const char* path, int prefetch_depth, int readers);
 // Takes ownership of a foreign ArrowArrayStream and streams its batches.
 am_stream* am_stream_from_c_stream(struct ArrowArrayStream* in, int prefetch_depth);
 void       am_stream_release(am_stream* s);
