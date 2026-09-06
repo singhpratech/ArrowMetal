@@ -1182,3 +1182,205 @@ MetalArray.any = _any
 MetalArray.all = _all
 MetalArray.run_end_encode = _run_end_encode
 MetalArray.run_end_decode = _run_end_decode
+# ---- the remaining Arrow string surface: character-class predicates, capitalize / title / center /
+# replace-slice / trim / normalize, extract_regex_span, binary_join and string is_in / index_in.
+# Op numbering is the C ABI contract; see include/arrowmetal.h.
+_lib.am_string_predicate.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_string_predicate.restype = ctypes.c_int
+_lib.am_string_transform.argtypes = [_P, ctypes.c_int, ctypes.c_int64, ctypes.c_int64,
+                                     ctypes.c_char_p, ctypes.c_int64, ctypes.c_char_p, ctypes.c_int64,
+                                     ctypes.POINTER(_P)]
+_lib.am_string_transform.restype = ctypes.c_int
+_lib.am_string_is_in.argtypes = [_P, _P, ctypes.POINTER(_P)]
+_lib.am_string_is_in.restype = ctypes.c_int
+_lib.am_string_index_in.argtypes = [_P, _P, ctypes.POINTER(_P)]
+_lib.am_string_index_in.restype = ctypes.c_int
+_lib.am_binary_join.argtypes = [_P, ctypes.c_char_p, ctypes.c_int64, _P, ctypes.POINTER(_P)]
+_lib.am_binary_join.restype = ctypes.c_int
+
+_STRING_PREDICATE = {"ascii_is_printable": 0, "ascii_is_title": 1, "string_is_ascii": 2,
+                     "utf8_is_alnum": 3, "utf8_is_alpha": 4, "utf8_is_decimal": 5, "utf8_is_digit": 6,
+                     "utf8_is_lower": 7, "utf8_is_numeric": 8, "utf8_is_printable": 9,
+                     "utf8_is_space": 10, "utf8_is_title": 11, "utf8_is_upper": 12}
+_STRING_EXTRA = {"ascii_title": 0, "utf8_capitalize": 1, "utf8_title": 2, "utf8_center": 3,
+                 "utf8_replace_slice": 4, "binary_replace_slice": 5,
+                 "utf8_trim": 6, "utf8_ltrim": 7, "utf8_rtrim": 8,
+                 "utf8_trim_whitespace": 9, "utf8_ltrim_whitespace": 10, "utf8_rtrim_whitespace": 11,
+                 "utf8_normalize": 12, "extract_regex_span_start": 13, "extract_regex_span_length": 14}
+_NORMALIZATION_FORMS = {"NFC": 0, "NFKC": 1, "NFD": 2, "NFKD": 3}
+_STRING_FORMATS = ("u", "U", "z", "Z")
+
+
+def _am_string_predicate(self, op):
+    """One character-class predicate by name; the table is in include/arrowmetal.h."""
+    return _call(_lib.am_string_predicate, self._h, _STRING_PREDICATE[op])
+
+
+def _am_string_transform(self, op, p1=0, p2=0, arg1="", arg2=""):
+    """One of the extra string transforms by name; the table is in include/arrowmetal.h."""
+    a1 = arg1.encode("utf-8") if isinstance(arg1, str) else bytes(arg1)
+    a2 = arg2.encode("utf-8") if isinstance(arg2, str) else bytes(arg2)
+    return _call(_lib.am_string_transform, self._h, _STRING_EXTRA[op], p1, p2,
+                 a1, len(a1), a2, len(a2))
+
+
+MetalArray.string_predicate = _am_string_predicate
+MetalArray.string_transform = _am_string_transform
+
+
+def _predicate_method(op, doc):
+    def f(self):
+        return _am_string_predicate(self, op)
+    f.__name__ = op
+    f.__doc__ = doc
+    return f
+
+
+# The Unicode predicates run on the GPU for every row whose bytes are all < 0x80 and on the CPU
+# (Swift's Unicode.Scalar.Properties, sharded over 4096-row chunks) for the rest, so an ASCII-only
+# column never leaves the device. Nulls propagate.
+for _op, _doc in [
+    ("ascii_is_printable", "Every byte is in 0x20-0x7E. The empty string is true."),
+    ("ascii_is_title", "Byte-wise title case over runs of ASCII letters; at least one letter."),
+    ("string_is_ascii", "Every byte is < 0x80. The empty string is true."),
+    ("utf8_is_alnum", "Non-empty and every code point is a letter or a number."),
+    ("utf8_is_alpha", "Non-empty and every code point is in an L* category."),
+    ("utf8_is_decimal", "Non-empty and every code point is category Nd."),
+    ("utf8_is_digit", "Non-empty and every code point is category Nd or No."),
+    ("utf8_is_lower", "At least one cased code point and no upper-case one."),
+    ("utf8_is_numeric", "Non-empty and every code point is category Nd, Nl or No."),
+    ("utf8_is_printable", "No Cc/Cf/Cs/Co/Cn/Zs/Zl/Zp code point, except U+0020. Empty is true."),
+    ("utf8_is_space", "Non-empty and every code point is Unicode whitespace (U+200B is not)."),
+    ("utf8_is_title", "At least one cased code point, in title case."),
+    ("utf8_is_upper", "At least one cased code point and no lower-case one."),
+]:
+    setattr(MetalArray, _op, _predicate_method(_op, _doc))
+del _op, _doc
+
+
+def _am_ascii_title(self):
+    """Arrow `ascii_title`: byte-wise, the first ASCII letter of every run of ASCII letters is upper-
+    cased and the rest lower-cased, so "unicode" with accents becomes uNicoDe. Always GPU."""
+    return _am_string_transform(self, "ascii_title")
+
+
+def _am_utf8_capitalize(self):
+    """Arrow `utf8_capitalize`: first code point upper-cased, every later one lower-cased."""
+    return _am_string_transform(self, "utf8_capitalize")
+
+
+def _am_utf8_title(self):
+    """Arrow `utf8_title`: the first cased code point of every word upper-cased, the rest lower-cased,
+    where a word is a maximal run of cased code points."""
+    return _am_string_transform(self, "utf8_title")
+
+
+def _am_utf8_center(self, width, pad=" "):
+    """Arrow `utf8_center`: pads to `width` code points on both sides, the odd pad character going on
+    the right ("a" centred in 4 is "*a**"). `pad` must be exactly one code point."""
+    return _am_string_transform(self, "utf8_center", p1=width, arg1=pad)
+
+
+def _am_utf8_replace_slice(self, start, stop, replacement):
+    """Arrow `utf8_replace_slice`: replaces code points [start, stop) with `replacement`. Negative
+    indices count from the end, both ends clamp, and stop < start inserts without deleting."""
+    return _am_string_transform(self, "utf8_replace_slice", p1=start, p2=stop, arg1=replacement)
+
+
+def _am_binary_replace_slice(self, start, stop, replacement):
+    """Arrow `binary_replace_slice`: the same substitution indexed in bytes, returning `binary`."""
+    return _am_string_transform(self, "binary_replace_slice", p1=start, p2=stop, arg1=replacement)
+
+
+def _trim_method(with_set, without_set, doc):
+    def f(self, characters=None):
+        if characters is None:
+            return _am_string_transform(self, without_set)
+        return _am_string_transform(self, with_set, arg1=characters)
+    f.__name__ = with_set
+    f.__doc__ = doc
+    return f
+
+
+def _am_utf8_normalize(self, form):
+    """Arrow `utf8_normalize`: "NFC", "NFKC", "NFD" or "NFKD". Always CPU (Foundation)."""
+    key = form.upper() if isinstance(form, str) else form
+    if key not in _NORMALIZATION_FORMS:
+        raise ArrowMetalError("normalisation form must be one of NFC, NFKC, NFD, NFKD, got %r" % (form,))
+    return _am_string_transform(self, "utf8_normalize", p1=_NORMALIZATION_FORMS[key])
+
+
+def _am_extract_regex_span(self, pattern, ignore_case=False):
+    """Arrow `extract_regex_span`, as {group name: (start, length)} pairs of int32 arrays.
+
+    Offsets and lengths count bytes, as Arrow's do. The pattern needs at least one (?<name>...) group;
+    a row that does not match, a null row, and a group that took part in no alternative are null in
+    both arrays. Always CPU (ICU, sharded over 4096-row chunks)."""
+    import re as _re
+    names = _re.findall(r"\(\?P?<([A-Za-z_][A-Za-z0-9_]*)>", pattern)
+    if not names:
+        raise ArrowMetalError("extract_regex_span needs at least one named group, e.g. (?<year>\\d+)")
+    flags = 1 if ignore_case else 0
+    return {n: (_am_string_transform(self, "extract_regex_span_start", p2=flags, arg1=pattern, arg2=n),
+                _am_string_transform(self, "extract_regex_span_length", p2=flags, arg1=pattern, arg2=n))
+            for n in dict.fromkeys(names)}
+
+
+def _am_binary_join(self, separator):
+    """Arrow `binary_join`: joins the child strings of every row of a list<utf8>.
+
+    `separator` is a scalar string or a per-row string column. An empty row joins to the empty string;
+    a null row, any null element inside a row, and a null separator give a null output row."""
+    if isinstance(separator, str):
+        sep = separator.encode("utf-8")
+        return _call(_lib.am_binary_join, self._h, sep, len(sep), None)
+    s = separator if isinstance(separator, MetalArray) else MetalArray.from_arrow(separator)
+    return _call(_lib.am_binary_join, self._h, b"", 0, s._h)
+
+
+MetalArray.ascii_title = _am_ascii_title
+MetalArray.utf8_capitalize = _am_utf8_capitalize
+MetalArray.utf8_title = _am_utf8_title
+MetalArray.utf8_center = _am_utf8_center
+MetalArray.utf8_replace_slice = _am_utf8_replace_slice
+MetalArray.binary_replace_slice = _am_binary_replace_slice
+MetalArray.utf8_trim = _trim_method(
+    "utf8_trim", "utf8_trim_whitespace",
+    "Arrow `utf8_trim` / `utf8_trim_whitespace`: strips both ends, of Unicode whitespace by default or "
+    "of any code point in `characters`. GPU for an ASCII character set or an all-ASCII column.")
+MetalArray.utf8_ltrim = _trim_method(
+    "utf8_ltrim", "utf8_ltrim_whitespace", "Leading-only form of utf8_trim.")
+MetalArray.utf8_rtrim = _trim_method(
+    "utf8_rtrim", "utf8_rtrim_whitespace", "Trailing-only form of utf8_trim.")
+MetalArray.utf8_normalize = _am_utf8_normalize
+MetalArray.extract_regex_span = _am_extract_regex_span
+MetalArray.binary_join = _am_binary_join
+
+# is_in() and index_in() gain string support: a utf8 or binary column goes to the GPU string hash
+# table, everything else keeps the primitive binary-search path.
+_am_primitive_is_in = MetalArray.is_in
+_am_primitive_index_in = MetalArray.index_in
+
+
+def _am_is_in_any(self, values):
+    """Arrow `is_in`: boolean array, true where the element is among the non-null `values`.
+
+    Nulls in `values` are ignored and a null element is never in the set, so the result never has
+    nulls (pyarrow's `skip_nulls=True`; `skip_nulls=False` is not implemented)."""
+    if self.format in _STRING_FORMATS:
+        s = values if isinstance(values, MetalArray) else MetalArray.from_arrow(values)
+        return _call(_lib.am_string_is_in, self._h, s._h)
+    return _am_primitive_is_in(self, values)
+
+
+def _am_index_in_any(self, values):
+    """Arrow `index_in`: int32 index into `values` of each element's first occurrence there, null
+    where the element is null or absent."""
+    if self.format in _STRING_FORMATS:
+        s = values if isinstance(values, MetalArray) else MetalArray.from_arrow(values)
+        return _call(_lib.am_string_index_in, self._h, s._h)
+    return _am_primitive_index_in(self, values)
+
+
+MetalArray.is_in = _am_is_in_any
+MetalArray.index_in = _am_index_in_any

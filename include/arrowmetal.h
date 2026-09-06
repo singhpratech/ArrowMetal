@@ -425,6 +425,97 @@ int  am_reduce_ex(am_array* a, int op, double p1, int64_t* out_i64, double* out_
 int  am_run_end_encode(am_array* a, am_array** out);
 int  am_run_end_decode(am_array* a, am_array** out);
 
+// ---------------------------------------------------------------------------------------------------
+// The remaining Arrow string surface: character-class predicates, capitalize / title / center /
+// replace-slice / trim / normalize, extract_regex_span, binary_join and string is_in / index_in.
+//
+// am_string_predicate returns a boolean array; nulls propagate. Ops 0-2 are byte-wise and entirely
+// GPU. Ops 3-12 are Arrow's Unicode utf8_is_* family: one GPU pass answers every row and reports, in a
+// second bitmap, which rows carry a byte >= 0x80; only those rows are re-decided on the CPU, so an
+// ASCII-only column never leaves the device. The empty string is true for the two printable predicates
+// and for string_is_ascii, and false for every other op.
+//
+//  op  name                 GPU/CPU   notes
+//  --  -------------------  --------  ----------------------------------------------------------------
+//   0  ascii_is_printable   GPU       every byte in 0x20-0x7E
+//   1  ascii_is_title       GPU       byte-wise title case over runs of ASCII letters
+//   2  string_is_ascii      GPU       every byte < 0x80
+//   3  utf8_is_alnum        GPU/CPU   every code point is a letter or a number
+//   4  utf8_is_alpha        GPU/CPU   category L*
+//   5  utf8_is_decimal      GPU/CPU   category Nd
+//   6  utf8_is_digit        GPU/CPU   category Nd or No
+//   7  utf8_is_lower        GPU/CPU   >= 1 cased code point, none of them upper case
+//   8  utf8_is_numeric      GPU/CPU   category Nd, Nl or No
+//   9  utf8_is_printable    GPU/CPU   not Cc/Cf/Cs/Co/Cn/Zs/Zl/Zp, with U+0020 added back
+//  10  utf8_is_space        GPU/CPU   Zs/Zl/Zp plus U+0009-U+000D, U+001C-U+001F and U+0085
+//  11  utf8_is_title        GPU/CPU   >= 1 cased code point, in title case
+//  12  utf8_is_upper        GPU/CPU   >= 1 cased code point, none of them lower case
+//
+// pyarrow classifies with utf8proc; this uses Swift's Unicode.Scalar.Properties, reconstructing
+// utf8proc's rules: a code point is upper case when its simple lower-case mapping changes it or it is
+// category Lt, and lower case when its simple upper-case mapping changes it or it is category Ll, minus
+// the Roman numerals U+2160-U+216F. A titlecase letter is therefore both, which is why utf8_is_upper
+// and utf8_is_lower are both false on U+01C5. Note U+001C-U+001F are utf8_is_space but not
+// ascii_is_space, and U+200B (zero-width space) is not whitespace at all.
+int  am_string_predicate(am_array* a, int op, am_array** out);
+
+// am_string_transform. arg1/arg2 are UTF-8 byte arguments, p1/p2 the integer ones; anything an op does
+// not use may be NULL / 0.
+//
+//  op  name                    args                              output  GPU/CPU  notes
+//  --  ----------------------  --------------------------------  ------  -------  ---------------------
+//   0  ascii_title             -                                 utf8    GPU      byte-wise
+//   1  utf8_capitalize         -                                 utf8    GPU/CPU  first cp up, rest down
+//   2  utf8_title              -                                 utf8    GPU/CPU  first cased cp of a word
+//   3  utf8_center             p1 = width, arg1 = pad            utf8    GPU      odd pad on the right
+//   4  utf8_replace_slice      p1 = start, p2 = stop, arg1 = new utf8    GPU      code point indices
+//   5  binary_replace_slice    p1 = start, p2 = stop, arg1 = new binary  GPU      byte indices
+//   6  utf8_trim               arg1 = character set              utf8    GPU/CPU
+//   7  utf8_ltrim              arg1 = character set              utf8    GPU/CPU
+//   8  utf8_rtrim              arg1 = character set              utf8    GPU/CPU
+//   9  utf8_trim_whitespace    -                                 utf8    GPU/CPU  Unicode whitespace
+//  10  utf8_ltrim_whitespace   -                                 utf8    GPU/CPU
+//  11  utf8_rtrim_whitespace   -                                 utf8    GPU/CPU
+//  12  utf8_normalize          p1 = 0 NFC, 1 NFKC, 2 NFD, 3 NFKD utf8    CPU      Foundation
+//  13  extract_regex_span      arg1 = pattern, arg2 = group      int32   CPU      byte start offset
+//  14  extract_regex_span len  arg1 = pattern, arg2 = group      int32   CPU      byte length
+//
+// Ops 1, 2, 6-11 take the GPU byte kernel when the whole column is ASCII (ops 6-8 whenever the
+// character set itself is ASCII, since a byte-wise trim can never split a UTF-8 sequence) and the CPU,
+// sharded over 4096-row chunks, otherwise. `utf8_center` counts code points and needs a one-code-point
+// pad; `ascii_center`, which counts bytes, is not exposed separately, exactly as `ascii_lpad` is not.
+// Slice indices count code points (op 4) or bytes (op 5): negative values count from the end, both ends
+// clamp into range, and a stop below start inserts without deleting. Ops 13/14 need a pattern with at
+// least one (?<name>...) group and report byte offsets; a row that does not match, and a group that
+// took part in no alternative, are null in both arrays. p2 bit 0 requests case-insensitive matching.
+// Two documented differences from pyarrow: op 12 follows the Unicode standard (and Python's
+// unicodedata.normalize), while pyarrow's utf8_normalize never composes, so its NFC output equals its
+// NFD output; and ops 13/14 use ICU, whose \d matches every Unicode decimal digit, where pyarrow's RE2
+// \d is ASCII only — the same difference am_regex already documents.
+int  am_string_transform(am_array* a, int op, int64_t p1, int64_t p2,
+                         const uint8_t* arg1, int64_t len1,
+                         const uint8_t* arg2, int64_t len2, am_array** out);
+
+// Arrow is_in / index_in over utf8, on the GPU. The value set is hashed with the 64-bit key
+// dictionary_encode uses and inserted into an open-addressing table of row indices; every probe
+// confirms its candidate by comparing bytes, so a hash collision costs one extra probe and never a
+// wrong answer, and duplicates in the set collapse onto the lowest row index, which is what index_in
+// reports. Nulls in the value set are ignored and a null value is never in the set, so is_in never
+// returns a null and index_in is null exactly where the value is null or absent. pyarrow's default is
+// the opposite (skip_nulls=False, where a null value matches a null in the set); that option is not
+// implemented — pass skip_nulls=True to pyarrow to compare.
+int  am_string_is_in(am_array* a, am_array* set, am_array** out);     // bool
+int  am_string_index_in(am_array* a, am_array* set, am_array** out);  // int32
+
+// Arrow binary_join over a list<utf8>: two GPU passes, one summing the child byte lengths plus
+// count - 1 separators into a per-row output length and one copying the bytes. Pass a scalar separator
+// in sep / sep_len, or a per-row utf8 column in sep_array (which then wins; pass NULL for the scalar
+// form). An empty row joins to the empty string; a null row, any null element inside a row, and a null
+// separator all give a null output row (Arrow's EMIT_NULL; the REPLACE / SKIP options are not
+// implemented). For the two-column form see am_str_concat (binary_join_element_wise).
+int  am_binary_join(am_array* list, const uint8_t* sep, int64_t sep_len,
+                    am_array* sep_array /* or NULL */, am_array** out);
+
 #ifdef __cplusplus
 }
 #endif
