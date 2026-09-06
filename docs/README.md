@@ -14,6 +14,7 @@ every claim the project makes.
 | [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md) | The complete operation-by-operation comparison against Polars, pyarrow.compute and pandas at 10M and 50M rows, with a verdict per row and a shortfall list of everything below the 3x bar |
 | [DESIGN.md](DESIGN.md) | How it works: buffers, kernels, batching, GPU-side lengths, software Float64, where the time goes |
 | [EXPR.md](EXPR.md) | Fused expression queries: one runtime-generated kernel for a whole expression DAG, the grammar, how nulls are compiled, the numbers and the limits |
+| [DUCKDB.md](DUCKDB.md) | Using ArrowMetal from DuckDB: the zero-copy Python bridge, the loadable SQL extension, streaming tables larger than memory, and an honest account of which shapes the GPU wins and which it loses |
 | [DECISIONS.md](DECISIONS.md) | Why it is built this way, one dated entry per decision |
 | [FINDINGS.md](FINDINGS.md) | Things learned the hard way: toolchain quirks, Metal limits, bugs and their lessons |
 | [../ROADMAP.md](../ROADMAP.md) | What is next and what is open for contributors |
