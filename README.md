@@ -111,6 +111,24 @@ let total = try MetalContext.shared.batch {
 }
 ```
 
+`batchAsync` is the same thing without the wait, so the CPU is free while the GPU scans. Return a pending
+array from the body (anything that reads a scalar on the CPU would sync inside it) and use the async
+accessors for scalars:
+
+```swift
+let ctx = MetalContext.shared
+let hits = try await ctx.batchAsync {                          // records, commits, releases the thread
+    try amount.filter(try region.compare(.eq, 2).and(try amount.compare(.gt, 100)))
+}
+print(hits.length)                                             // already resolved: no GPU round trip
+let total = try await hits.sumAsync()                          // reduction, still without blocking
+
+// Callback form, for code that is not async:
+ctx.batchAsync({ try amount.filter(where: .gt, 100) }) { result in
+    switch result { case .success(let hits): print(hits.length); case .failure(let e): print(e) }
+}
+```
+
 Five end-to-end scenarios (analytics query, feature preparation, Float64 with NaN, C Data Interface
 interop, sliced windows) live in `Sources/ArrowMetalExamples`: `swift run -c release arrowmetal-examples`.
 
