@@ -1,0 +1,4 @@
+# The compiled extension and the DuckDB C headers the build fetches. Neither belongs in the repo:
+# the first is a binary, the second is 360 KB of generated header that build.sh downloads on demand.
+build/
+third_party/
