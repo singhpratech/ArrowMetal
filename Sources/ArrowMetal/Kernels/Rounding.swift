@@ -154,10 +154,11 @@ extension MetalArray {
         return res
     }
 
-    /// `power` and `modulo` on `float64` would have to run through the `float` path, which is far too
-    /// coarse to be worth shipping; say so instead of returning a bad answer.
+    /// `power` on `float64` runs in software binary64 (`Kernels/DoublePower.swift`). `modulo` still has
+    /// no float64 kernel: it would have to take the `float` detour, which is far too coarse to be worth
+    /// shipping, so say so instead of returning a bad answer.
     private static func requireBinarySupported(_ op: BinaryMathOp) throws {
-        if T.self == Double.self && !op.isMinMax {
+        if T.self == Double.self && op == .modulo {
             throw ArrowMetalError.unsupportedType("\(op.rawValue) is not implemented for float64; cast to float32 first")
         }
     }

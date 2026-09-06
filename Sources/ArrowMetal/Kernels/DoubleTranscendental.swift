@@ -18,7 +18,7 @@ import Foundation
 ///
 /// | function  | method                                                                    | measured |
 /// |-----------|---------------------------------------------------------------------------|----------|
-/// | `dt_sqrt` | `float` seed, three Newton steps `y = (y + m/y)/2` on a `[1,4)` mantissa   | (via `hypot`) |
+/// | `dt_sqrt` | `DoubleMath.d_sqrt`, digit by digit                                        | correctly rounded |
 /// | `dt_ln`   | `x = 2^e·m`, `m` folded to `[1/√2, √2]`, `atanh` series in `s = (m-1)/(m+1)`, `e·ln2` in a hi/lo split | (via `logb`) |
 /// | `dt_expm1`| `x = k·ln2 + r` (no reduction below 0.5), Taylor `r·Σ rⁿ/(n+1)!`, then `2^k(1+E) − 1` | ≤ 2 ulp |
 /// | `dt_log1p`| four-term series below `2^-20`, else `ln(u)·x/(u−1)` (Kahan's correction)  | ≤ 1 ulp  |
@@ -152,35 +152,10 @@ enum DoubleTranscendental {
             return dt_is_even(t) ? away : t;
         }
 
-        // ---- square root: float seed refined by Newton in binary64 ---------------------------------
-        inline float dt_seed_f(ulong b) {                // b is finite, normal, in [1, 4)
-            long e = (long)d_exp(b) - 1023;
-            return ldexp(1.0f + ldexp((float)d_mant(b), -52), (int)e);
-        }
-        inline ulong dt_widen_f(float x) {               // x is finite, normal and positive
-            uint b = as_type<uint>(x);
-            uint e = (b >> 23) & 0xFFu;
-            uint m = b & 0x7FFFFFu;
-            if (e == 0u) return 0ul;
-            return ((ulong)((long)e - 127 + 1023) << 52) | ((ulong)m << 29);
-        }
-        inline ulong dt_sqrt(ulong a) {
-            if (d_is_nan(a)) return a | (1ul << 51);
-            if (d_is_zero(a)) return a;                  // ±0
-            if ((a >> 63) != 0ul) return D_QNAN;         // negative
-            if (d_exp(a) == 0x7FFul) return a;           // +inf
-            long e;
-            ulong x = a;
-            if (d_exp(x) == 0ul) { x = d_mul(x, dt_pow2(200)); e = (long)d_exp(x) - 1023 - 200; }
-            else e = (long)d_exp(x) - 1023;
-            long k = (e >> 1);                            // floor(e / 2); m = a / 2^(2k) lands in [1, 4)
-            ulong m = dt_ldexp(a, -2 * k);
-            ulong y = dt_widen_f(sqrt(dt_seed_f(m)));
-            y = d_mul(d_add(y, d_div(m, y)), DT_HALF);
-            y = d_mul(d_add(y, d_div(m, y)), DT_HALF);
-            y = d_mul(d_add(y, d_div(m, y)), DT_HALF);
-            return dt_ldexp(y, k);
-        }
+        // ---- square root ---------------------------------------------------------------------------
+        // `d_sqrt` is correctly rounded and costs less than the three Newton steps (each a software
+        // division) this used to take, so `hypot` simply inherits it.
+        inline ulong dt_sqrt(ulong a) { return d_sqrt(a); }
 
         // ---- natural logarithm ---------------------------------------------------------------------
         inline ulong dt_ln(ulong a) {

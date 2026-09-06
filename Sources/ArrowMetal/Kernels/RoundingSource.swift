@@ -9,10 +9,10 @@ import Foundation
 ///   * `float64` — values travel as raw `ulong` bit patterns because Metal has no `double`. Sign, abs,
 ///     `floor`/`ceil`/`round`/`trunc` and element-wise min/max are **exact**, done on the bit pattern
 ///     with the software binary64 adder from `DoubleMath` for the one carry each rounding step needs.
-///     `sqrt`/`exp`/`ln`/`log10`/`log2` are **not** exact: they convert to `float`, evaluate there and
-///     widen back, so expect about 7 correct significant decimal digits (relative error up to ~1e-6)
-///     and no subnormal or above-`float`-range results. `power` and `modulo` on `float64` are not
-///     implemented at all — `Rounding.swift` throws rather than return a silently poor answer.
+///     `sqrt` is **correctly rounded** (`d_sqrt`, a digit-by-digit extraction), and `exp`, `ln`,
+///     `log10`, `log2` and `power` run entirely in software binary64 through `DoublePower` — within
+///     2 ulp, measured. `modulo` on `float64` is still not implemented — `Rounding.swift` throws
+///     rather than return a silently poor answer.
 enum RoundingSource {
     /// Rounding of a value away from zero adds ±1, which needs a real binary64 add.
     private static let dOne = "0x3FF0000000000000ul"
@@ -136,38 +136,7 @@ enum RoundingSource {
     // MARK: - Float64
 
     static let double: String = {
-        var s = KernelSource.prelude + DoubleMath.msl + """
-
-        // ---- binary64 <-> float conversions, used only by the transcendental kernels.
-        inline float d2f(ulong b) {
-            ulong sgn = b >> 63;
-            long e = (long)((b >> 52) & 0x7FFul);
-            ulong m = b & 0xFFFFFFFFFFFFFul;
-            if (e == 0x7FF) {
-                if (m != 0ul) return as_type<float>(0x7FC00000u);
-                return sgn ? -INFINITY : INFINITY;
-            }
-            float sig = ldexp((float)m, -52);
-            if (e == 0) { if (m == 0ul) return sgn ? -0.0f : 0.0f; e = 1; }
-            else sig += 1.0f;
-            float r = ldexp(sig, (int)(e - 1023));
-            return sgn ? -r : r;
-        }
-        inline ulong f2d(float x) {
-            uint b = as_type<uint>(x);
-            ulong sgn = (ulong)(b >> 31);
-            uint e = (b >> 23) & 0xFFu;
-            uint m = b & 0x7FFFFFu;
-            if (e == 0xFFu) return (sgn << 63) | (m != 0u ? D_QNAN : D_INF);
-            if (e == 0u) {
-                if (m == 0u) return sgn << 63;
-                long ee = -126;
-                while ((m & 0x800000u) == 0u) { m <<= 1; ee--; }
-                m &= 0x7FFFFFu;
-                return (sgn << 63) | ((ulong)(ee + 1023) << 52) | ((ulong)m << 29);
-            }
-            return (sgn << 63) | ((ulong)((long)e - 127 + 1023) << 52) | ((ulong)m << 29);
-        }
+        var s = KernelSource.prelude + DoubleMath.msl + DoubleTranscendental.msl + DoublePower.msl + """
 
         // ---- exact bit-pattern operations
         inline ulong m_negate(ulong a) { return a ^ 0x8000000000000000ul; }
@@ -225,15 +194,16 @@ enum RoundingSource {
             return m_dlt(b, a) ? a : b;
         }
 
-        // ---- float-precision transcendentals, widened back to binary64
-        inline ulong m_sqrt(ulong a) { return f2d(sqrt(d2f(a))); }
-        inline ulong m_exp(ulong a) { return f2d(exp(d2f(a))); }
-        inline ulong m_ln(ulong a) { return f2d(log(d2f(a))); }
-        inline ulong m_log10(ulong a) { return f2d(log10(d2f(a))); }
-        inline ulong m_log2(ulong a) { return f2d(log2(d2f(a))); }
+        // ---- software binary64 transcendentals: no float detour, no lost digits.
+        inline ulong m_sqrt(ulong a) { return d_sqrt(a); }
+        inline ulong m_exp(ulong a) { return dp_exp(a); }
+        inline ulong m_ln(ulong a) { return dp_ln(a); }
+        inline ulong m_log10(ulong a) { return dp_log10(a); }
+        inline ulong m_log2(ulong a) { return dp_log2(a); }
+        inline ulong m_power(ulong a, ulong b) { return dp_pow(a, b); }
 
         """
-        s += kernels(T: "ulong", unary: allUnary, binary: [])
+        s += kernels(T: "ulong", unary: allUnary, binary: ["power"])
         return s
     }()
 

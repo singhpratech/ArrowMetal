@@ -4,7 +4,8 @@ import Foundation
 ///
 /// Values travel as raw 64-bit patterns (`ulong`). `d_add`, `d_sub`, `d_mul` are correctly rounded
 /// (round to nearest, ties to even) including subnormals, signed zeros, infinities and NaN propagation.
-/// `d_div` is a restoring long division on the significands, also correctly rounded.
+/// `d_div` is a restoring long division on the significands, also correctly rounded, and `d_sqrt` is a
+/// restoring digit-by-digit extraction, correctly rounded too — bit-identical to `Foundation.sqrt`.
 enum DoubleMath {
     static let msl = """
 
@@ -122,6 +123,51 @@ enum DoubleMath {
         if (rem != 0ul) q |= 1ul;                       // sticky
         // q = floor(ma * 2^56 / mb) (57 bits at most)  =>  value = (q / 2^55) * 2^(ea - eb - 1)
         return d_finish(s, ea - eb + 1022, q);
+    }
+
+    // Correctly rounded square root: schoolbook digit-by-digit extraction on the significand, in
+    // integers only. No seed, no Newton step, no division — and, unlike a refined approximation, no
+    // final "is this the right side of the midpoint?" question to answer, because the remainder
+    // answers it exactly.
+    //
+    // Write a = M * 2^k with M an integer and k **even** (halving an odd exponent is what loses the
+    // last bit, so the significand absorbs the odd one). Then sqrt(a) = sqrt(M) * 2^(k/2), and 54
+    // restoring steps produce q = floor(sqrt(M * 2^54)): 53 significand bits and one guard bit, with
+    // the running remainder as an exact sticky flag. Every intermediate stays inside 64 bits (the
+    // remainder never exceeds 2q + 1 < 2^55, and is shifted by two before each comparison).
+    inline ulong d_sqrt(ulong a) {
+        if (d_is_nan(a)) return a | (1ul << 51);
+        if (d_is_zero(a)) return a;                     // sqrt(-0) is -0, as IEEE-754 says
+        if ((a >> 63) != 0ul) return D_QNAN;
+        if (d_exp(a) == 0x7FFul) return a;              // +inf
+        long k;
+        ulong m;
+        if (d_exp(a) == 0ul) {                          // subnormal: normalise, no arithmetic needed
+            m = d_mant(a); k = -1074;
+            while ((m >> 52) == 0ul) { m <<= 1; k--; }
+        } else {
+            m = d_mant(a) | (1ul << 52); k = (long)d_exp(a) - 1075;
+        }
+        if (k & 1) { m <<= 1; k--; }                    // m now spans [2^52, 2^54) and k is even
+        ulong q = 0ul, rem = 0ul, t;
+        for (int i = 0; i < 27; i++) {                  // the 54 bits of m, two at a time
+            rem = (rem << 2) | ((m >> (52 - 2 * i)) & 3ul);
+            t = (q << 2) | 1ul; q <<= 1;
+            if (rem >= t) { rem -= t; q |= 1ul; }
+        }
+        for (int i = 0; i < 27; i++) {                  // 27 more pairs of zeros: the fraction bits
+            rem <<= 2;
+            t = (q << 2) | 1ul; q <<= 1;
+            if (rem >= t) { rem -= t; q |= 1ul; }
+        }
+        ulong s = q >> 1;
+        // A set guard bit always comes with a non-zero remainder: an exact halfway result would need a
+        // 54-bit root, whose square has 107 significant bits and so cannot be a double. The tie term is
+        // written out anyway, because relying on that silently would be worse than paying for one `and`.
+        if ((q & 1ul) && (rem != 0ul || (s & 1ul))) s++;
+        long e = (k >> 1) + 26 + 1023;                  // sqrt of any finite double is normal
+        if ((s >> 53) != 0ul) { s >>= 1; e++; }
+        return ((ulong)e << 52) | (s & 0xFFFFFFFFFFFFFul);
     }
     """
 }

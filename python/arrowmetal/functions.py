@@ -187,23 +187,27 @@ def _interval(kind, field):
 
 
 # Rows whose answer is right but not bit-identical to Arrow's, with the relative tolerance the
-# difference justifies. Three families:
+# difference justifies. Four families:
 #
-# * **1e-6** — a float32 evaluation of a float64 column. Metal has no `double` transcendentals, so
-#   `exp`, the plain logarithms, `sqrt`, `power` and their `_checked` twins compute in `float` and
-#   widen the result.
-# * **1e-14** — the software binary64 routines: the trigonometric and hyperbolic family, `atan2`,
-#   `expm1`, `log1p`, `logb` and `hypot` are within 5 ulp of the host libm.
+# * **1e-6** — a float32 evaluation of a float64 column. Only the tdigest sketch is left here: `exp`,
+#   the plain logarithms, `sqrt`, `power` and their `_checked` twins used to take that detour and now
+#   run in software binary64 (`Kernels/DoublePower.swift`).
+# * **1e-15** — the 1-ulp software binary64 routines: `exp`, `ln`, `log2`, `log10`, `power` and their
+#   `_checked` twins. `sqrt` is not listed at all, because it is correctly rounded and therefore
+#   bit-identical to Arrow's.
+# * **1e-14** — the rest of the software binary64 routines: the trigonometric and hyperbolic family,
+#   `atan2`, `expm1`, `log1p`, `logb` and `hypot` are within 5 ulp of the host libm.
 # * **1e-5** — the *grouped* moments, whose per-group deviations are formed in float32 about a
 #   float64 mean (see `Kernels/AggregatesExtra.swift`).
 #
 # The note on each row says so; these are the numbers the test suite holds them to.
 _FLOAT32_EVAL = 1e-6
 _BINARY64 = 1e-14
-TOLERANCE = {"exp": _FLOAT32_EVAL, "ln": _FLOAT32_EVAL, "log10": _FLOAT32_EVAL, "log2": _FLOAT32_EVAL,
-             "sqrt": _FLOAT32_EVAL, "power": _FLOAT32_EVAL, "sqrt_checked": _FLOAT32_EVAL,
-             "ln_checked": _FLOAT32_EVAL, "log10_checked": _FLOAT32_EVAL, "log2_checked": _FLOAT32_EVAL,
-             "power_checked": _FLOAT32_EVAL,
+_BINARY64_1ULP = 1e-15
+TOLERANCE = {"exp": _BINARY64_1ULP, "ln": _BINARY64_1ULP, "log10": _BINARY64_1ULP,
+             "log2": _BINARY64_1ULP, "power": _BINARY64_1ULP,
+             "ln_checked": _BINARY64_1ULP, "log10_checked": _BINARY64_1ULP,
+             "log2_checked": _BINARY64_1ULP, "power_checked": _BINARY64_1ULP,
              "hash_mean": 1e-12, "mean": 1e-12, "stddev": 1e-12, "variance": 1e-12,
              "skew": 1e-12, "kurtosis": 1e-12, "tdigest": _FLOAT32_EVAL,
              "hash_variance": 1e-5, "hash_stddev": 1e-5, "hash_skew": 1e-5, "hash_kurtosis": 1e-5,
@@ -525,23 +529,28 @@ _ROWS = [
     ("divide", "Arithmetic", GPU, "Kernels/Arithmetic.swift", "a / b",
      "Integer division by zero is undefined here rather than an error; that is `divide_checked`'s job.",
      _op("/"), ((_INT, _INT2), {})),
-    ("exp", "Arithmetic", PARTIAL, "Kernels/Rounding.swift", "exp()",
-     "Evaluated in `float` even for a float64 column: Metal has no `double` transcendentals, so the "
-     "answer is correct to about float32 precision (1e-7 relative) rather than to a float64 ulp.",
+    ("exp", "Arithmetic", GPU, "Kernels/Rounding.swift", "exp()",
+     "Software binary64 on a float64 column (`Kernels/DoublePower.swift`): argument reduction against "
+     "a 107-bit ln 2 pair, then the exp series. Measured **1 ulp** against Foundation over 10^6 inputs "
+     "spanning -745.2 to 709.78, subnormal results and the overflow edge included.",
      _u("exp"), ((_FLT2,), {})),
     ("multiply", "Arithmetic", GPU, "Kernels/Arithmetic.swift", "a * b", "Wrapping on integers.",
      _op("*"), ((_INT, _INT2), {})),
     ("negate", "Arithmetic", GPU, "Kernels/Rounding.swift", "negate()", "Wrapping on integers.",
      _u("negate"), ((_INT,), {})),
-    ("power", "Arithmetic", PARTIAL, "Kernels/Rounding.swift", "power(other)",
-     "Element-wise `pow` on **float32 only**: a float64 column raises rather than losing precision "
-     "silently (Metal has no `double` transcendental to call). Cast first.",
-     _b("power"), ((_F32, _F32B), {})),
+    ("power", "Arithmetic", GPU, "Kernels/Rounding.swift", "power(other)",
+     "Element-wise `pow`, scalar or column exponent. Integers use repeated squaring and wrap. float64 "
+     "runs in software binary64 (`Kernels/DoublePower.swift`): log2 of the base as an unevaluated "
+     "hi/lo pair against a split exponent, so the 61 bits the product needs survive. Measured **1 "
+     "ulp** over 10^6 random pairs, and the C99 edge table (x^0, 0^y, 1^y, (-1)^int, inf/NaN) matches "
+     "libm exactly.",
+     _b("power"), ((_FLT_POS, _FLT2), {})),
     ("sign", "Arithmetic", GPU, "Kernels/Rounding.swift", "sign()", "-1 / 0 / 1.",
      _u("sign"), ((_INT,), {})),
-    ("sqrt", "Arithmetic", PARTIAL, "Kernels/Rounding.swift", "sqrt()",
-     "A negative input gives NaN, as Arrow's unchecked `sqrt` does. Evaluated in `float` for float64 "
-     "columns too, so the last digits differ from a float64 square root.",
+    ("sqrt", "Arithmetic", GPU, "Kernels/Rounding.swift", "sqrt()",
+     "A negative input gives NaN, as Arrow's unchecked `sqrt` does. On float64 this is "
+     "`DoubleMath.d_sqrt`, a digit-by-digit extraction in integers and therefore **correctly rounded** "
+     "— bit-identical to Foundation over 10^6 random bit patterns, subnormals included.",
      _u("sqrt"), ((_FLT_POS,), {})),
     ("subtract", "Arithmetic", GPU, "Kernels/Arithmetic.swift", "a - b", "Wrapping on integers.",
      _op("-"), ((_INT, _INT2), {})),
@@ -562,12 +571,13 @@ _ROWS = [
      "Raises for INT_MIN on a signed column and — unlike pyarrow, which has no unsigned kernel at "
      "all — for every non-zero value on an unsigned one.", _u("negate_checked"), ((_INT,), {})),
     ("power_checked", "Arithmetic", GPU, "Kernels/Checked.swift", "power_checked(other)",
-     "Raises for a negative integer exponent and for any repeated-squaring step that would wrap. On "
-     "a float column this is the float32-evaluated `power`, so the same 1e-7 relative applies.",
+     "Raises for a negative integer exponent and for any repeated-squaring step that would wrap. A "
+     "float column never raises, as in Arrow, and is bit-identical to the unchecked `power` — so on "
+     "float64 it is the same 1-ulp software binary64 answer.",
      _b("power_checked"), ((_INT, _INT2), {})),
-    ("sqrt_checked", "Arithmetic", PARTIAL, "Kernels/Checked.swift", "sqrt_checked()",
+    ("sqrt_checked", "Arithmetic", GPU, "Kernels/Checked.swift", "sqrt_checked()",
      "Raises `square root of negative number`; NaN, -0.0 and +inf do not raise. Bit-identical to the "
-     "unchecked `sqrt`, and so evaluated in `float` for a float64 column too.",
+     "unchecked `sqrt`, and so correctly rounded on a float64 column too.",
      _u("sqrt_checked"), ((_FLT_POS,), {})),
     ("subtract_checked", "Arithmetic", GPU, "Kernels/Checked.swift", "subtract_checked(other)",
      "As `add_checked`.", _b("subtract_checked"), ((_INT, _INT2), {})),
@@ -628,24 +638,27 @@ _ROWS = [
      ((_FLT_ROUND,), {"multiple": 0.5})),
 
     # ---- Logarithmic -------------------------------------------------------
-    ("ln", "Logarithmic", PARTIAL, "Kernels/Rounding.swift", "ln()",
-     "Metal's `log`, evaluated in `float` even for a float64 column, so the answer is correct to about float32 "
-     "precision (1e-7 relative) rather than to a float64 ulp.", _u("ln"), ((_FLT_POS,), {})),
-    ("log10", "Logarithmic", PARTIAL, "Kernels/Rounding.swift", "log10()",
-     "Metal's `log10`, evaluated in `float` even for a float64 column, so the answer is correct to about float32 "
-     "precision (1e-7 relative) rather than to a float64 ulp.", _u("log10"), ((_FLT_POS,), {})),
-    ("log2", "Logarithmic", PARTIAL, "Kernels/Rounding.swift", "log2()",
-     "Metal's `log2`, evaluated in `float` even for a float64 column, so the answer is correct to about float32 "
-     "precision (1e-7 relative) rather than to a float64 ulp.", _u("log2"), ((_FLT_POS,), {})),
-    ("ln_checked", "Logarithmic", PARTIAL, "Kernels/Checked.swift", "ln_checked()",
-     "Raises `logarithm of zero` / `logarithm of negative number`. Bit-identical to the unchecked "
-     "`ln`, so a float64 column is still evaluated in `float` (about 1e-7 relative).",
+    ("ln", "Logarithmic", GPU, "Kernels/Rounding.swift", "ln()",
+     "Metal's `log` on float32; on float64 the software binary64 of `Kernels/DoublePower.swift`, which "
+     "carries log2(x) as an unevaluated hi/lo pair and scales it by a split ln 2 so the leading product "
+     "is exact. Measured **1 ulp** against Foundation over 10^6 inputs from 5e-324 to 1e308, plus "
+     "passes concentrated near 1 and over the subnormals.", _u("ln"), ((_FLT_POS,), {})),
+    ("log10", "Logarithmic", GPU, "Kernels/Rounding.swift", "log10()",
+     "Metal's `log10` on float32; on float64 the same software binary64 reduction as `ln`, scaled by a "
+     "split log10 2 instead. Measured **1 ulp** over 10^6 inputs.", _u("log10"), ((_FLT_POS,), {})),
+    ("log2", "Logarithmic", GPU, "Kernels/Rounding.swift", "log2()",
+     "Metal's `log2` on float32; on float64 the software binary64 reduction rounded once, so an exact "
+     "power of two comes back exactly. Measured **1 ulp** over 10^6 inputs.", _u("log2"), ((_FLT_POS,), {})),
+    ("ln_checked", "Logarithmic", GPU, "Kernels/Checked.swift", "ln_checked()",
+     "Raises `logarithm of zero` / `logarithm of negative number` — the boundary is exact, so +5e-324 "
+     "passes and -5e-324 does not, and NaN and +inf never raise. Bit-identical to the unchecked `ln`, "
+     "and so the same 1-ulp software binary64 answer on a float64 column.",
      _u("ln_checked"), ((_FLT_POS,), {})),
-    ("log10_checked", "Logarithmic", PARTIAL, "Kernels/Checked.swift", "log10_checked()",
-     "Same domain check and same float32 evaluation as `ln_checked`.",
+    ("log10_checked", "Logarithmic", GPU, "Kernels/Checked.swift", "log10_checked()",
+     "Same domain check and the same 1-ulp software binary64 evaluation as `ln_checked`.",
      _u("log10_checked"), ((_FLT_POS,), {})),
-    ("log2_checked", "Logarithmic", PARTIAL, "Kernels/Checked.swift", "log2_checked()",
-     "Same domain check and same float32 evaluation as `ln_checked`.",
+    ("log2_checked", "Logarithmic", GPU, "Kernels/Checked.swift", "log2_checked()",
+     "Same domain check and the same 1-ulp software binary64 evaluation as `ln_checked`.",
      _u("log2_checked"), ((_FLT_POS,), {})),
     ("log1p", "Logarithmic", GPU, "Kernels/MathExtra.swift", "log1p()",
      "ln(1 + x), accurate for small x, through the software binary64 routine — full float64 precision, "
