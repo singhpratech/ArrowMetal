@@ -18,6 +18,7 @@ extension AnyMetalArray {
         case .string(let a): return a.nullCount
         case .temporal(let a): return a.nullCount
         case .binary(let a): return a.nullCount
+        case .decimal(let a): return a.nullCount
         case .dictionary(let codes, _): return codes.nullCount
         }
     }
@@ -39,6 +40,7 @@ extension AnyMetalArray {
         case .string(let a): return .string(try a.filter(mask))
         case .temporal(let a): return .temporal(try a.filter(mask))
         case .binary(let a): return .binary(markBinary(try a.filter(mask)))
+        case .decimal(let a): return .decimal(try a.filter(mask))
         case .dictionary(let codes, let values): return .dictionary(codes: try codes.filter(mask), values: values)
         }
     }
@@ -59,6 +61,7 @@ extension AnyMetalArray {
         case .string(let a): return .string(try a.take(idx))
         case .temporal(let a): return .temporal(try a.take(idx))
         case .binary(let a): return .binary(markBinary(try a.take(idx)))
+        case .decimal(let a): return .decimal(try a.take(idx))
         case .dictionary(let codes, let values): return .dictionary(codes: try codes.take(idx), values: values)
         }
     }
@@ -80,6 +83,7 @@ extension AnyMetalArray {
         case .temporal(let a): return .temporal(try a.slice(offset: offset, length: length))
         case .binary(let a):
             return .binary(markBinary(try a.take(try MetalArray<Int32>((offset..<(offset + length)).map { Int32($0) }, context: a.context))))
+        case .decimal(let a): return .decimal(try a.slice(offset: offset, length: length))
         case .dictionary(let codes, let values):
             return .dictionary(codes: try codes.slice(offset: offset, length: length), values: values)
         }
@@ -94,6 +98,7 @@ extension AnyMetalArray {
     public var asString: MetalStringArray? { if case .string(let a) = self { return a } else { return nil } }
     public var asTemporal: MetalTemporalArray? { if case .temporal(let a) = self { return a } else { return nil } }
     public var asBinary: MetalStringArray? { if case .binary(let a) = self { return a } else { return nil } }
+    public var asDecimal: MetalDecimalArray? { if case .decimal(let a) = self { return a } else { return nil } }
 }
 
 /// A set of equal-length named columns: the Metal-resident equivalent of an Arrow RecordBatch.
