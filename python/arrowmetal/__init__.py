@@ -72,6 +72,16 @@ _lib.am_group_by.argtypes = [_P, ctypes.c_int64, ctypes.c_int, _P, ctypes.POINTE
 _lib.am_group_by.restype = ctypes.c_int
 _lib.am_batch_begin.restype = ctypes.c_int
 _lib.am_batch_end.restype = ctypes.c_int
+_lib.am_unary.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]; _lib.am_unary.restype = ctypes.c_int
+_lib.am_binary.argtypes = [_P, ctypes.c_int, _P, _P, ctypes.POINTER(_P)]; _lib.am_binary.restype = ctypes.c_int
+_lib.am_cumulative.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]; _lib.am_cumulative.restype = ctypes.c_int
+
+# Op numbering is the C ABI contract; see include/arrowmetal.h.
+_UNARY = {"negate": 0, "abs": 1, "sign": 2, "sqrt": 3, "exp": 4, "ln": 5, "log10": 6, "log2": 7,
+          "floor": 8, "ceil": 9, "round": 10, "trunc": 11, "bitwise_not": 12}
+_BINARY = {"bitwise_and": 0, "bitwise_or": 1, "bitwise_xor": 2, "shift_left": 3, "shift_right": 4,
+           "modulo": 5, "power": 6, "min_element_wise": 7, "max_element_wise": 8}
+_CUMULATIVE = {"sum": 0, "min": 1, "max": 2}
 
 
 def version():
@@ -263,6 +273,70 @@ class MetalArray:
     # ---- group-by over dense keys in [0, key_count)
     def group_by(self, key_count):
         return GroupBy(self, key_count)
+
+    # ---- element-wise math (GPU; nulls in, nulls out)
+    def unary(self, op):
+        """One unary math op by name: negate, abs, sign, sqrt, exp, ln, log10, log2, floor, ceil,
+        round, trunc, bitwise_not. See include/arrowmetal.h for the exact semantics."""
+        return _call(_lib.am_unary, self._h, _UNARY[op])
+
+    def negate(self): return self.unary("negate")
+    def abs(self): return self.unary("abs")
+    def sign(self): return self.unary("sign")
+    def sqrt(self): return self.unary("sqrt")
+    def exp(self): return self.unary("exp")
+    def ln(self): return self.unary("ln")
+    def log10(self): return self.unary("log10")
+    def log2(self): return self.unary("log2")
+    def floor(self): return self.unary("floor")
+    def ceil(self): return self.unary("ceil")
+    def round(self):
+        """Rounds halves away from zero. The identity on an integer column."""
+        return self.unary("round")
+    def trunc(self): return self.unary("trunc")
+
+    def binary(self, op, other):
+        """One binary math op by name against a MetalArray or a scalar: bitwise_and, bitwise_or,
+        bitwise_xor, shift_left, shift_right, modulo, power, min_element_wise, max_element_wise."""
+        code = _BINARY[op]
+        if isinstance(other, MetalArray):
+            return _call(_lib.am_binary, self._h, code, other._h, None)
+        return _call(_lib.am_binary, self._h, code, None, self._scalar(other))
+
+    # Integer bit-wise ops. `__and__`/`__or__`/`__invert__` are the boolean-bitmap kernels, so these
+    # value-level ops are spelled out by name instead.
+    def bitwise_and(self, other): return self.binary("bitwise_and", other)
+    def bitwise_or(self, other): return self.binary("bitwise_or", other)
+    def bitwise_xor(self, other): return self.binary("bitwise_xor", other)
+    def bitwise_not(self): return self.unary("bitwise_not")
+    def shift_left(self, other):
+        """Shift counts outside [0, bit width) give 0, rather than raising as Arrow does."""
+        return self.binary("shift_left", other)
+    def shift_right(self, other):
+        """Arithmetic on a signed column, logical on an unsigned one; an out-of-range count gives the
+        sign fill (signed) or 0 (unsigned)."""
+        return self.binary("shift_right", other)
+
+    def modulo(self, other):
+        """C remainder: the sign follows the dividend. Integer x % 0 is defined as 0."""
+        return self.binary("modulo", other)
+
+    def power(self, other):
+        """Repeated squaring on integers (wrapping; a negative exponent is defined as 0), `pow` on
+        floats. Not implemented for float64."""
+        return self.binary("power", other)
+
+    def min_element_wise(self, other): return self.binary("min_element_wise", other)
+    def max_element_wise(self, other): return self.binary("max_element_wise", other)
+
+    def __mod__(self, o): return self.modulo(o)
+    def __pow__(self, o): return self.power(o)
+
+    # ---- cumulative (two-level GPU scan; output null where input null, the run unbroken)
+    def cumulative(self, op): return _call(_lib.am_cumulative, self._h, _CUMULATIVE[op])
+    def cumulative_sum(self): return self.cumulative("sum")
+    def cumulative_min(self): return self.cumulative("min")
+    def cumulative_max(self): return self.cumulative("max")
 
 
 class GroupBy:
