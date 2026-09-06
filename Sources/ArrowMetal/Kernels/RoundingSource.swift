@@ -26,23 +26,68 @@ enum RoundingSource {
             s += """
             inline \(T) m_negate(\(T) a) { return -a; }
             inline \(T) m_abs(\(T) a) { return fabs(a); }
-            // Arrow `sign`: NaN and both zeros come back unchanged, everything else is ±1.
-            inline \(T) m_sign(\(T) a) { return (a > 0.0f) ? 1.0f : ((a < 0.0f) ? -1.0f : a); }
+            // Arrow `sign`: NaN and both zeros come back unchanged, everything else is ±1. Decided on
+            // the bit pattern rather than with `>`/`<`, which flush subnormal operands to zero and
+            // would report sign(1.4e-45) as 1.4e-45 instead of 1.
+            inline \(T) m_sign(\(T) a) {
+                uint b = as_type<uint>(a), mag = b & 0x7FFFFFFFu;
+                if (mag == 0u || mag > 0x7F800000u) return a;      // ±0 and NaN pass through
+                return (b & 0x80000000u) ? -1.0f : 1.0f;
+            }
             inline \(T) m_sqrt(\(T) a) { return sqrt(a); }
             inline \(T) m_exp(\(T) a) { return exp(a); }
             inline \(T) m_ln(\(T) a) { return log(a); }
             inline \(T) m_log10(\(T) a) { return log10(a); }
             inline \(T) m_log2(\(T) a) { return log2(a); }
-            inline \(T) m_floor(\(T) a) { return floor(a); }
-            inline \(T) m_ceil(\(T) a) { return ceil(a); }
+            // A subnormal operand is flushed to zero before the library rounding functions see it,
+            // which would make ceil(1.4e-45) zero instead of one. The answer is decided from the bit
+            // pattern in that range: |a| < 1, so only the sign matters.
+            inline bool f_subnormal(uint b) { return (b & 0x7F800000u) == 0u && (b & 0x007FFFFFu) != 0u; }
+            inline \(T) m_floor(\(T) a) {
+                uint b = as_type<uint>(a);
+                if (f_subnormal(b)) return (b & 0x80000000u) ? -1.0f : 0.0f;
+                return floor(a);
+            }
+            inline \(T) m_ceil(\(T) a) {
+                uint b = as_type<uint>(a);
+                if (f_subnormal(b)) return (b & 0x80000000u) ? as_type<\(T)>(0x80000000u) : 1.0f;
+                return ceil(a);
+            }
             // MSL `round` is C99 `round`: ties away from zero, which is the mode ArrowMetal defines.
-            inline \(T) m_round(\(T) a) { return round(a); }
-            inline \(T) m_trunc(\(T) a) { return trunc(a); }
+            // A rounded-to-zero result keeps the sign of its operand -- round(-0.4) is -0.0 -- which
+            // the library function drops here but the float64 kernel below preserves.
+            inline \(T) m_round(\(T) a) {
+                \(T) r = round(a);
+                if ((as_type<uint>(r) & 0x7FFFFFFFu) != 0u) return r;
+                return as_type<\(T)>(as_type<uint>(a) & 0x80000000u);
+            }
+            inline \(T) m_trunc(\(T) a) {
+                uint b = as_type<uint>(a);
+                if (f_subnormal(b)) return as_type<\(T)>(b & 0x80000000u);
+                return trunc(a);
+            }
             inline \(T) m_power(\(T) a, \(T) b) { return pow(a, b); }
             inline \(T) m_modulo(\(T) a, \(T) b) { return fmod(a, b); }
-            // Element-wise min/max skip NaN (a NaN operand loses), like the reductions in this library.
-            inline \(T) m_min_ew(\(T) a, \(T) b) { if (isnan(a)) return b; if (isnan(b)) return a; return a < b ? a : b; }
-            inline \(T) m_max_ew(\(T) a, \(T) b) { if (isnan(a)) return b; if (isnan(b)) return a; return a > b ? a : b; }
+            // Order-preserving unsigned key: comparing these compares the floats exactly, without the
+            // flush-to-zero the arithmetic comparison operators apply to subnormal operands.
+            inline uint f_ord(uint b) { return (b & 0x80000000u) ? ~b : (b | 0x80000000u); }
+            // Element-wise min/max skip NaN (a NaN operand loses), like the reductions in this library,
+            // and follow `fmin`/`fmax` on a ±0 tie: min keeps -0.0, max keeps 0.0, whichever side it is
+            // on, so the pair is commutative.
+            inline \(T) m_min_ew(\(T) a, \(T) b) {
+                if (isnan(a)) return b;
+                if (isnan(b)) return a;
+                uint ka = as_type<uint>(a), kb = as_type<uint>(b);
+                if (((ka | kb) & 0x7FFFFFFFu) == 0u) return as_type<\(T)>((ka | kb) & 0x80000000u);
+                return f_ord(ka) < f_ord(kb) ? a : b;
+            }
+            inline \(T) m_max_ew(\(T) a, \(T) b) {
+                if (isnan(a)) return b;
+                if (isnan(b)) return a;
+                uint ka = as_type<uint>(a), kb = as_type<uint>(b);
+                if (((ka | kb) & 0x7FFFFFFFu) == 0u) return as_type<\(T)>((ka & kb) & 0x80000000u);
+                return f_ord(kb) < f_ord(ka) ? a : b;
+            }
 
             """
         } else {
@@ -164,14 +209,19 @@ enum RoundingSource {
             return t;
         }
         inline bool m_dlt(ulong a, ulong b) { return d_key((long)a) < d_key((long)b); }
+        // On a ±0 tie `d_key` calls the two equal, so the sign is chosen the way `fmin`/`fmax` do:
+        // min keeps -0.0 and max keeps 0.0 whichever side it came from, which also makes the pair
+        // commutative.
         inline ulong m_min_ew(ulong a, ulong b) {
             if (d_is_nan(a)) return b;
             if (d_is_nan(b)) return a;
+            if (((a | b) & 0x7FFFFFFFFFFFFFFFul) == 0ul) return (a | b) & 0x8000000000000000ul;
             return m_dlt(a, b) ? a : b;
         }
         inline ulong m_max_ew(ulong a, ulong b) {
             if (d_is_nan(a)) return b;
             if (d_is_nan(b)) return a;
+            if (((a | b) & 0x7FFFFFFFFFFFFFFFul) == 0ul) return (a & b) & 0x8000000000000000ul;
             return m_dlt(b, a) ? a : b;
         }
 

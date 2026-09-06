@@ -773,18 +773,28 @@ _register_group_op("mean", "mean", tol="result_float")
 # time this module is imported, so the matrix picks up new kernels without any edit here; the ones
 # still missing are listed by test_absent_optional_operations_are_reported.
 
-def _register_optional(name, types, methods, fn, tol=None):
+def _register_optional(name, types, methods, fn, tol=None, note=""):
     missing = [m for m in methods if not hasattr(am.MetalArray, m)]
     if missing:
         ABSENT.append((name, ", ".join(missing)))
         return
-    OPS.append(Op(name, types, fn, tol, note="optional kernel, discovered at import"))
+    OPS.append(Op(name, types, fn, tol,
+                  note=note or "optional kernel, discovered at import"))
 
 
-def _unary_optional(name, method, oracle, types, tol=None):
+def _unary_optional(name, method, oracle, types, tol=None, note=""):
     def fn(src, shape, method=method, oracle=oracle):
         return arrow(getattr(am.array(src), method)()), oracle(src)
-    _register_optional(name, types, [method], fn, tol)
+    _register_optional(name, types, [method], fn, tol, note)
+
+
+def _sign_oracle(src):
+    """`pc.sign` narrows an integer column to int8; ArrowMetal's unary math kernels keep the column's
+    own type. -1/0/1 are representable in every integer type, so casting the oracle back loses nothing
+    from the value comparison, and the type difference itself is pinned by
+    test_sign_keeps_the_column_type_where_pyarrow_narrows_to_int8."""
+    signs = pc.sign(src)
+    return signs.cast(src.type) if signs.type != src.type else signs
 
 
 _unary_optional("is_null", "is_null", pc.is_null, ALL_TYPES)
@@ -792,16 +802,66 @@ _unary_optional("is_valid", "is_valid", pc.is_valid, ALL_TYPES)
 _unary_optional("is_nan", "is_nan", pc.is_nan, FLOATING)
 _unary_optional("abs", "abs", pc.abs, NUMERIC)
 _unary_optional("negate", "negate", pc.negate, SIGNED + FLOATING)
-_unary_optional("sign", "sign", pc.sign, NUMERIC)
+_unary_optional("sign", "sign", _sign_oracle, NUMERIC,
+                note="pc.sign returns int8 for an integer column; the oracle is cast back")
 _unary_optional("upper", "upper", pc.utf8_upper, ["utf8"])
 _unary_optional("lower", "lower", pc.utf8_lower, ["utf8"])
 _unary_optional("trim", "trim", pc.utf8_trim_whitespace, ["utf8"])
 _unary_optional("reverse", "reverse", pc.utf8_reverse, ["utf8"])
 _unary_optional("bitwise_not", "bitwise_not", pc.bit_wise_not, INTEGER)
-_unary_optional("cumulative_sum", "cumulative_sum", pc.cumulative_sum, NUMERIC, tol="float")
-_unary_optional("cumulative_prod", "cumulative_prod", pc.cumulative_prod, NUMERIC, tol="float")
-_unary_optional("cumulative_max", "cumulative_max", pc.cumulative_max, NUMERIC)
-_unary_optional("cumulative_min", "cumulative_min", pc.cumulative_min, NUMERIC)
+
+
+# ---- cumulative ----------------------------------------------------
+#
+# Two options have to be spelled out for the oracle to mean what the kernels implement:
+#
+#   * `skip_nulls`. ArrowMetal's cumulative kernels carry the running value across nulls and leave the
+#     output null exactly where the input is, which is Arrow's `skip_nulls=True`. Arrow's *default* is
+#     False -- the first null poisons the rest of the column. ArrowMetal has no such mode;
+#     test_cumulative_functions_skip_nulls_where_arrow_propagates_them pins the difference.
+#   * `start`. Arrow's default start for `cumulative_max` is `numeric_limits<T>::min()`, which on a
+#     float column is the smallest positive *normal*, so Arrow's default clamps every negative maximum
+#     to 1.18e-38 (and `cumulative_min` clamps +inf down to FLT_MAX). The neutral identity is passed
+#     explicitly instead; test_arrow_cumulative_max_default_start_clamps_negative_floats pins why.
+
+def _cumulative_oracle(fn, float_start=None):
+    def oracle(src):
+        if float_start is not None and type_name_of(src) in FLOATING:
+            return fn(src, start=pa.scalar(float_start, src.type), skip_nulls=True)
+        return fn(src, skip_nulls=True)
+    return oracle
+
+
+def _cumulative_sum(src, shape):
+    """The two engines associate a float running sum differently -- ArrowMetal scans in blocks, Arrow
+    accumulates left to right -- so float columns get the same roundoff bound the reductions use,
+    with two adjustments:
+
+      * values that can make a partial sum overflow are filtered out of a float column: ±inf, and
+        anything above `type_max / n`. Past that point the divergence is not roundoff at all -- one
+        association reaches ±inf where the other does not, and `inf - inf` is NaN -- so no bound can
+        express it. NaN itself stays in: it poisons every later element in both engines alike, and
+        test_cumulative_sum_propagates_nan_and_reassociates_infinities pins both halves.
+      * the roundoff bound is the reductions' `8·eps·sqrt(n)·Σ|x|`, measured over the same input."""
+    name = type_name_of(src)
+    if name in FLOATING:
+        filled = pc.fill_null(src, pa.scalar(0.0, src.type))
+        limit = pa.scalar(float(np.finfo(NUMPY_TYPE[name]).max) / max(len(src), 1), src.type)
+        src = src.filter(pc.or_(pc.is_nan(filled), pc.less_equal(pc.abs(filled), limit)))
+    got = arrow(am.array(src).cumulative_sum())
+    expected = pc.cumulative_sum(src, skip_nulls=True)
+    if name not in FLOATING:
+        return got, expected
+    return got, expected, (FLOAT_TOL[name], float_sum_bound(_drop_nan(src), name))
+
+
+_register_optional("cumulative_sum", NUMERIC, ["cumulative_sum"], _cumulative_sum)
+_unary_optional("cumulative_prod", "cumulative_prod", _cumulative_oracle(pc.cumulative_prod),
+                NUMERIC, tol="float")
+_unary_optional("cumulative_max", "cumulative_max",
+                _cumulative_oracle(pc.cumulative_max, float_start=-math.inf), NUMERIC)
+_unary_optional("cumulative_min", "cumulative_min",
+                _cumulative_oracle(pc.cumulative_min, float_start=math.inf), NUMERIC)
 
 
 def _binary_optional(name, method, oracle, types):
@@ -814,8 +874,41 @@ def _binary_optional(name, method, oracle, types):
 _binary_optional("bitwise_and", "bitwise_and", pc.bit_wise_and, INTEGER)
 _binary_optional("bitwise_or", "bitwise_or", pc.bit_wise_or, INTEGER)
 _binary_optional("bitwise_xor", "bitwise_xor", pc.bit_wise_xor, INTEGER)
-_binary_optional("shift_left", "shift_left", pc.shift_left, INTEGER)
-_binary_optional("shift_right", "shift_right", pc.shift_right, INTEGER)
+
+
+#: Shift counts both engines define the same way: `std::numeric_limits<T>::digits`, which excludes the
+#: sign bit, so int32 agrees on 0..30 and uint32 on 0..31.
+def _shift_digits(name):
+    return NUMPY_TYPE[name].itemsize * 8 - (1 if name in SIGNED else 0)
+
+
+def _shift_counts(other, name):
+    """The generated column, folded into the shift counts both engines agree on.
+
+    Out of that range the two diverge by design -- ArrowMetal shifts the bits out (0, or the sign fill
+    for a signed `shift_right`), pyarrow's unchecked kernel returns the operand untouched and
+    `shift_left_checked` raises -- so the matrix stays inside it and
+    test_out_of_range_shift_counts_shift_the_bits_out_where_pyarrow_returns_the_operand pins the rest.
+    Nulls in the count column are preserved, so null propagation is still under test."""
+    wide = pa.uint64() if name in UNSIGNED else pa.int64()
+    c = pc.cast(other, wide, safe=False)
+    c = pc.bit_wise_and(c, pa.scalar(2 ** 63 - 1, wide))            # drop the sign bit: counts >= 0
+    digits = pa.scalar(_shift_digits(name), wide)
+    c = pc.subtract(c, pc.multiply(pc.divide(c, digits), digits))   # c % digits, exactly
+    return pc.cast(c, ARROW_TYPE[name], safe=False)
+
+
+def _shift_optional(name, method, oracle):
+    def fn(src, shape, method=method, oracle=oracle):
+        type_name = type_name_of(src)
+        counts = _shift_counts(make_array(type_name, shape, seed=1), type_name)
+        return arrow(getattr(am.array(src), method)(am.array(counts))), oracle(src, counts)
+    _register_optional(name, INTEGER, [method], fn,
+                       note="shift counts folded into [0, digits); out-of-range counts pinned apart")
+
+
+_shift_optional("shift_left", "shift_left", pc.shift_left)
+_shift_optional("shift_right", "shift_right", pc.shift_right)
 
 
 def _fill_null(src, shape):
@@ -828,20 +921,294 @@ _register_optional("fill_null", ALL_TYPES, ["fill_null"], _fill_null)
 
 
 def _if_else(src, shape):
+    """In ArrowMetal the boolean condition is the receiver: `cond.if_else(left, right)`."""
     cond = make_array("bool", shape, seed=2)
     other = make_array(type_name_of(src), shape, seed=1)
-    return arrow(am.array(src).if_else(am.array(cond), am.array(other))), pc.if_else(cond, src, other)
+    return arrow(am.array(cond).if_else(am.array(src), am.array(other))), pc.if_else(cond, src, other)
 
 
 _register_optional("if_else", ALL_TYPES, ["if_else"], _if_else)
 
 
 def _is_in(src, shape):
+    """`skip_nulls=True` is the mode ArrowMetal implements: a null in the value set is ignored and a
+    null element never matches, so the result has no nulls. Arrow's default (`skip_nulls=False`) makes
+    a null in the value set match a null element -- pinned by
+    test_is_in_never_matches_a_null_where_arrow_matches_null_to_null."""
     values = src.slice(0, min(len(src), 5))
-    return arrow(am.array(src).is_in(am.array(values))), pc.is_in(src, value_set=values)
+    return (arrow(am.array(src).is_in(am.array(values))),
+            pc.is_in(src, value_set=values, skip_nulls=True))
 
 
 _register_optional("is_in", ALL_TYPES, ["is_in"], _is_in)
+
+
+def _index_in(src, shape):
+    values = src.slice(0, min(len(src), 5))
+    return (arrow(am.array(src).index_in(am.array(values))),
+            pc.index_in(src, value_set=values, skip_nulls=True).cast(pa.int32()))
+
+
+_register_optional("index_in", ALL_TYPES, ["index_in"], _index_in)
+
+
+def _drop_null(src, shape):
+    return arrow(am.array(src).drop_null()), pc.drop_null(src)
+
+
+_register_optional("drop_null", ALL_TYPES, ["drop_null"], _drop_null)
+
+
+def _kleene(src, shape):
+    other = make_array("bool", shape, seed=1)
+    x, y = am.array(src), am.array(other)
+    return ([arrow(x.and_kleene(y)), arrow(x.or_kleene(y))],
+            [pc.and_kleene(src, other), pc.or_kleene(src, other)])
+
+
+_register_optional("kleene", ["bool"], ["and_kleene", "or_kleene"], _kleene,
+                   note="three-valued logic, as opposed to the null-propagating & and |")
+
+
+# ---- element-wise math beyond + - * / -------------------------------
+
+def _rounding(src, shape):
+    """`pc.floor`/`ceil`/`trunc` widen an integer column to double; ArrowMetal's unary kernels are the
+    identity there and keep the column's type, so the oracle is cast back. Above 2^53 that cast is
+    Arrow's loss, not a kernel's, so those rows are dropped from an integer column. `pc.round`
+    defaults to half-to-even; ArrowMetal rounds halves away from zero, Arrow's
+    `half_towards_infinity`."""
+    name = type_name_of(src)
+    if name in INTEGER:
+        wide = pc.cast(src, pa.int64() if name in SIGNED else pa.uint64(), safe=False)
+        limit = pa.scalar(2 ** 53, wide.type)
+        inside = pc.less_equal(wide, limit)
+        if name in SIGNED:
+            inside = pc.and_(inside, pc.greater_equal(wide, pa.scalar(-2 ** 53, wide.type)))
+        src = src.filter(pc.fill_null(inside, True))
+    x = am.array(src)
+    got, expected = [], []
+    for method, fn in [("floor", pc.floor), ("ceil", pc.ceil), ("trunc", pc.trunc),
+                       ("round", lambda a: pc.round(a, round_mode="half_towards_infinity"))]:
+        result = fn(src)
+        got.append(arrow(getattr(x, method)()))
+        expected.append(result.cast(src.type) if result.type != src.type else result)
+    return got, expected
+
+
+_register_optional("rounding", NUMERIC, ["floor", "ceil", "round", "trunc"], _rounding)
+
+
+def _float32_representable(src):
+    """The values ArrowMetal's transcendental kernels can carry: they evaluate in `float`, so a
+    float64 operand outside the float32 normal range underflows to zero or overflows to inf on the
+    way in. Documented in include/arrowmetal.h and pinned by
+    test_float64_transcendentals_are_evaluated_in_float32."""
+    filled = pc.fill_null(src, pa.scalar(0.0, src.type))
+    magnitude = pc.abs(filled)
+    tiny = pa.scalar(float(np.finfo(np.float32).tiny), src.type)
+    big = pa.scalar(float(np.finfo(np.float32).max), src.type)
+    inside = pc.and_(pc.greater_equal(magnitude, tiny), pc.less_equal(magnitude, big))
+    return src.filter(pc.or_(pc.equal(filled, pa.scalar(0.0, src.type)), inside))
+
+
+def _evaluated_in_float(src, methods, oracles):
+    src = _float32_representable(src)
+    x = am.array(src)
+    got, expected = [], []
+    for method, fn in zip(methods, oracles):
+        result = fn(src)
+        got.append(arrow(getattr(x, method)()))
+        expected.append(result.cast(src.type) if result.type != src.type else result)
+    return src, got, expected
+
+
+def _sqrt(src, shape):
+    """Evaluated in `float` on both float types -- about 7 correct significant digits, hence the
+    relative 1e-6 -- over the values a float32 can hold
+    (test_float64_transcendentals_are_evaluated_in_float32 pins what happens outside)."""
+    _, got, expected = _evaluated_in_float(src, ["sqrt"], [pc.sqrt])
+    return got, expected
+
+
+_register_optional("sqrt", FLOATING, ["sqrt"], _sqrt, tol=1e-6)
+
+
+def _exp(src, shape):
+    """`exp` needs its *result* inside the float32 range as well as its argument: past |x| ~ 87 a
+    float32 exponential is inf or zero while Arrow's double is still finite.
+
+    Its tolerance is not a constant. Rounding the argument to float32 moves it by |x|·eps32, and
+    exp(x + d) = exp(x)·(1 + d), so the *relative* error of the result grows with |x| -- 3.5e-6 at
+    x = -58, which no 1e-6 bound could accept. The bound below is that mechanism, with a margin."""
+    base = _float32_representable(src)
+    magnitude = pc.abs(pc.fill_null(base, pa.scalar(0.0, base.type)))
+    small = base.filter(pc.less_equal(magnitude, pa.scalar(87.0, base.type)))
+    _, got, expected = _evaluated_in_float(small, ["exp"], [pc.exp])
+    peak = pc.max(pc.abs(pc.fill_null(small, pa.scalar(0.0, small.type)))).as_py()
+    peak = 0.0 if peak is None or not math.isfinite(peak) else abs(peak)
+    return got, expected, (4.0 * _EPS["float32"] * (1.0 + peak), 0.0)
+
+
+_register_optional("exp", FLOATING, ["exp"], _exp)
+
+
+def _logarithm(src, shape):
+    """The logarithms need an absolute bound as well as a relative one: rounding the argument to
+    float32 moves ln(x) by about `eps32` *whatever the size of the result*, so a result near zero --
+    ln of anything close to 1.0 -- has no meaningful relative accuracy at all."""
+    _, got, expected = _evaluated_in_float(src, ["ln", "log10", "log2"],
+                                           [pc.ln, pc.log10, pc.log2])
+    return got, expected, (1e-6, 1e-6)
+
+
+_register_optional("logarithm", FLOATING, ["ln", "log10", "log2"], _logarithm)
+
+
+def _element_wise_min_max(src, shape):
+    other = make_array(type_name_of(src), shape, seed=1)
+    x, y = am.array(src), am.array(other)
+    return ([arrow(x.min_element_wise(y)), arrow(x.max_element_wise(y))],
+            [pc.min_element_wise(src, other), pc.max_element_wise(src, other)])
+
+
+_register_optional("element_wise_min_max", NUMERIC, ["min_element_wise", "max_element_wise"],
+                   _element_wise_min_max, note="Arrow's skip_nulls default: one null yields the other side")
+
+
+def _modulo(src, shape):
+    """C remainder, built from the truncating division both engines already agree on. 0 and -1 are
+    kept out of the divisor for the same reason `arith_array` keeps them out."""
+    name = type_name_of(src)
+    other = make_array(name, shape, seed=1)
+    bad = pc.is_in(other, value_set=pa.array([0, -1] if name in SIGNED else [0], other.type))
+    divisor = pc.if_else(bad, pa.scalar(1, other.type), other)
+    expected = pc.subtract(src, pc.multiply(pc.divide(src, divisor), divisor))
+    return arrow(am.array(src).modulo(am.array(divisor))), expected
+
+
+_register_optional("modulo", INTEGER, ["modulo"], _modulo)
+
+
+def _power(src, shape):
+    """Exponents are folded into [0, 8]: a negative one is defined as 0 here and raises in Arrow, and
+    beyond a handful the wrapped repeated squaring has nothing left to compare."""
+    name = type_name_of(src)
+    other = make_array(name, shape, seed=1)
+    wide = pa.uint64() if name in UNSIGNED else pa.int64()
+    e = pc.bit_wise_and(pc.cast(other, wide, safe=False), pa.scalar(7, wide))
+    exponent = pc.cast(e, other.type, safe=False)
+    return arrow(am.array(src).power(am.array(exponent))), pc.power(src, exponent)
+
+
+_register_optional("power", INTEGER, ["power"], _power)
+
+
+# ---- string transforms ---------------------------------------------
+
+for _name, _method, _oracle in [
+        ("ascii_upper", "ascii_upper", pc.ascii_upper),
+        ("ascii_lower", "ascii_lower", pc.ascii_lower),
+        ("swapcase", "swapcase", pc.ascii_swapcase),
+        ("capitalize", "capitalize", pc.ascii_capitalize),
+        ("ltrim", "ltrim", pc.ascii_ltrim_whitespace),
+        ("rtrim", "rtrim", pc.ascii_rtrim_whitespace),
+        ("str_reverse", "str_reverse", pc.utf8_reverse),
+        ("is_alnum", "is_alnum", pc.ascii_is_alnum),
+        ("is_alpha", "is_alpha", pc.ascii_is_alpha),
+        ("is_digit", "is_digit", pc.ascii_is_decimal),
+        ("is_space", "is_space", pc.ascii_is_space),
+        ("is_upper", "is_upper", pc.ascii_is_upper),
+        ("is_lower", "is_lower", pc.ascii_is_lower)]:
+    _unary_optional(_name, _method, _oracle, ["utf8"])
+
+
+def _replace(src, shape):
+    """The empty pattern is left out: ArrowMetal defines it as the identity and Arrow inserts the
+    replacement between every code point (test_empty_replace_pattern_is_the_identity pins it)."""
+    x = am.array(src)
+    got, expected = [], []
+    for pattern, replacement, limit in [("a", "X", -1), ("app", "", -1), ("a", "yy", 1),
+                                        ("é", "e", -1), ("zzz", "!", -1)]:
+        got.append(arrow(x.replace(pattern, replacement, limit)))
+        expected.append(pc.replace_substring(src, pattern=pattern, replacement=replacement,
+                                             max_replacements=None if limit < 0 else limit))
+    return got, expected
+
+
+_register_optional("replace", ["utf8"], ["replace"], _replace)
+
+
+def _repeat(src, shape):
+    x = am.array(src)
+    return ([arrow(x.repeat(0)), arrow(x.repeat(1)), arrow(x.repeat(3))],
+            [pc.binary_repeat(src, 0), pc.binary_repeat(src, 1), pc.binary_repeat(src, 3)])
+
+
+_register_optional("repeat", ["utf8"], ["repeat"], _repeat)
+
+
+def _slice_codeunits(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for start, stop in [(0, None), (1, 3), (2, None), (-3, None), (0, -1), (5, 2)]:
+        got.append(arrow(x.slice_codeunits(start, stop)))
+        expected.append(pc.utf8_slice_codeunits(src, start) if stop is None
+                        else pc.utf8_slice_codeunits(src, start, stop))
+    return got, expected
+
+
+_register_optional("slice_codeunits", ["utf8"], ["slice_codeunits"], _slice_codeunits)
+
+
+def _pad(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for width, pad in [(0, " "), (6, " "), (9, "*")]:
+        got += [arrow(x.pad_left(width, pad)), arrow(x.pad_right(width, pad))]
+        expected += [pc.utf8_lpad(src, width, padding=pad), pc.utf8_rpad(src, width, padding=pad)]
+    return got, expected
+
+
+_register_optional("pad", ["utf8"], ["pad_left", "pad_right"], _pad)
+
+
+def _substring_search(src, shape):
+    """The empty pattern is left out of `count_substring`: ArrowMetal counts code points + 1 and
+    Arrow counts bytes + 1, which only differ on multi-byte input
+    (test_empty_pattern_counts_code_points_where_arrow_counts_bytes)."""
+    x = am.array(src)
+    got, expected = [], []
+    for pattern in ["a", "app", "é", "\t", "zzz", "x" * 300]:
+        got += [arrow(x.count_substring(pattern)), arrow(x.find_substring(pattern))]
+        expected += [pc.count_substring(src, pattern).cast(pa.int32()),
+                     pc.find_substring(src, pattern).cast(pa.int32())]
+    return got, expected
+
+
+_register_optional("substring_search", ["utf8"], ["count_substring", "find_substring"],
+                   _substring_search)
+
+
+def _str_concat(src, shape):
+    other = make_array("utf8", shape, seed=1)
+    x, y = am.array(src), am.array(other)
+    return ([arrow(x.str_concat(y)), arrow(x.str_concat(y, "-"))],
+            [pc.binary_join_element_wise(src, other, ""),
+             pc.binary_join_element_wise(src, other, "-")])
+
+
+_register_optional("str_concat", ["utf8"], ["str_concat"], _str_concat)
+
+
+def _dictionary_decode(src, shape):
+    """`decode` materialises a dictionary-encoded column; the oracle is Arrow's own decode of the
+    same pa.DictionaryArray."""
+    encoded = src.dictionary_encode()
+    return arrow(am.array(encoded).decode()), encoded.cast(pa.string())
+
+
+_register_optional("dictionary_decode", ["utf8"], ["decode"], _dictionary_decode)
 
 
 # ------------------------------------------------------------------ the runner
@@ -861,38 +1228,61 @@ def resolve_tol(mode, type_name):
 
 
 class Finding:
-    """A divergence this harness has already reported. Failures that match one are still failures --
-    the report still exits 1 -- but they are grouped as known so a new failure stands out."""
+    """A divergence this harness has already reported and docs/EVALUATION.md explains. Failures that
+    match one are still failures -- the cell reads `known n/N` and pytest xfails it -- but they no
+    longer gate: the report exits on *unclassified* divergences, so a new one stands out.
 
-    def __init__(self, ident, title, ops, types, flavors=None, needs_nulls=False):
+    `data_check` narrows a finding to the datasets whose *values* trigger it, which the (operation,
+    type, shape) triple alone cannot express -- a case-mapping gap only bites on the strings that
+    need the mapping."""
+
+    def __init__(self, ident, title, ops, types, flavors=None, needs_nulls=False, data_check=None):
         self.id, self.title = ident, title
         self.ops, self.types, self.flavors, self.needs_nulls = set(ops), set(types), flavors, needs_nulls
+        self.data_check = data_check
 
     def matches(self, op_name, type_name, shape):
         if op_name not in self.ops or type_name not in self.types:
             return False
         if self.flavors is not None and shape.flavor not in self.flavors:
             return False
-        return not self.needs_nulls or shape.null_ratio > 0
+        if self.needs_nulls and shape.null_ratio <= 0:
+            return False
+        return self.data_check is None or self.data_check(make_array(type_name, shape))
+
+
+#: The case mappings ArrowMetal deliberately does not implement (see include/arrowmetal.h): anything
+#: cased above Latin Extended-A, and the three multi-character expansions inside it.
+_MULTI_CHAR_CASE = {"ß", "ŉ", "µ"}       # ß -> SS, ŉ -> ʼN, µ -> Μ
+
+
+def _needs_case_mapping_outside_latin(src):
+    for s in src.to_pylist():
+        for ch in s or "":
+            if ch in _MULTI_CHAR_CASE:
+                return True
+            if ord(ch) > 0x17F and (ch.upper() != ch or ch.lower() != ch):
+                return True
+    return False
+
+
+def _contains_negative_zero(src):
+    return any(v == 0.0 and math.copysign(1.0, v) < 0 for v in src.to_pylist() if v is not None)
 
 
 FINDINGS = [
-    Finding("argsort-null-order",
-            "argsort/top_k order the null indices by the bytes under the validity bitmap",
-            ["argsort", "top_k"], NUMERIC, needs_nulls=True),
     Finding("float32-subnormal-ftz",
-            "Float32 kernels flush subnormals to zero (arithmetic and comparison)",
-            ["arith_scalar", "arith_array", "compare_array", "compare_scalar"],
-            ["float32"], flavors={"special"}),
-    Finding("negative-zero-sort-order",
-            "sort/argsort order -0.0 before 0.0 instead of leaving the tie in input order",
-            ["sort", "argsort", "top_k"], FLOATING, flavors={"special"}),
-    Finding("float32-reduction-accumulator",
-            "sum/mean over Float32 accumulate in Float32 and overflow where Arrow uses a double",
-            ["sum", "mean", "group_by_sum", "group_by_mean"], ["float32"], flavors={"special"}),
-    Finding("uint64-group-sum-signed",
-            "group-by sum over UInt64 values comes back as Int64, so totals above 2^63 go negative",
-            ["group_by_sum", "group_by_mean"], ["uint64"], flavors={"special"}),
+            "Float32 arithmetic flushes subnormal results and operands to zero",
+            ["arith_scalar", "arith_array"], ["float32"], flavors={"special"}),
+    Finding("utf8-case-latin-only",
+            "upper/lower map Basic Latin, Latin-1 and Latin Extended-A only; the rest passes through",
+            ["upper", "lower"], ["utf8"], data_check=_needs_case_mapping_outside_latin),
+    Finding("sign-of-negative-zero",
+            "sign keeps the sign of -0.0 where pyarrow normalises it to 0.0",
+            ["sign"], FLOATING, data_check=_contains_negative_zero),
+    Finding("negative-zero-set-lookup",
+            "is_in/index_in match -0.0 with 0.0, the total order unique/sort use; Arrow keeps them apart",
+            ["is_in", "index_in"], FLOATING, data_check=_contains_negative_zero),
 ]
 
 
@@ -970,8 +1360,20 @@ def test_absent_optional_operations_are_reported():
 
 # ------------------------------------------------------------------ coverage of the public API
 
-#: MetalArray/GroupBy members that no single pyarrow.compute call corresponds to.
-_NOT_DIFFERENTIABLE = {"from_arrow", "to_arrow", "null_count", "format", "type", "group_by"}
+#: MetalArray/GroupBy members that no single pyarrow.compute call corresponds to: the accessors, and
+#: the three generic dispatchers whose every op is reached through a named form below.
+_NOT_DIFFERENTIABLE = {"from_arrow", "to_arrow", "null_count", "format", "type", "group_by",
+                       "unary", "binary", "cumulative"}
+
+#: Methods with no case in this matrix because the generator makes no array they apply to. The
+#: temporal kernels need timestamp/duration/time columns, which are covered by
+#: Tests/ArrowMetalTests/TemporalTests.swift instead; test_methods_outside_the_matrix_are_reported
+#: prints them so the gap stays visible.
+_NO_MATRIX_TYPE = {
+    "year": "timestamp column", "month": "timestamp column", "day": "timestamp column",
+    "day_of_week": "timestamp column", "hour": "timestamp column", "minute": "timestamp column",
+    "second": "timestamp column", "cast_unit": "timestamp/duration/time column",
+}
 
 #: Method -> the operation that exercises it.
 _COVERED_BY = {
@@ -983,6 +1385,13 @@ _COVERED_BY = {
     "starts_with": "str_match", "ends_with": "str_match", "str_contains": "str_match",
     "str_equals": "str_match", "dictionary_encode": "dictionary_encode",
     "count": "group_by_count", "count_values": "group_by_count_values",
+    "and_kleene": "kleene", "or_kleene": "kleene",
+    "floor": "rounding", "ceil": "rounding", "round": "rounding", "trunc": "rounding",
+    "ln": "logarithm", "log10": "logarithm", "log2": "logarithm",
+    "min_element_wise": "element_wise_min_max", "max_element_wise": "element_wise_min_max",
+    "pad_left": "pad", "pad_right": "pad",
+    "count_substring": "substring_search", "find_substring": "substring_search",
+    "decode": "dictionary_decode",
 }
 
 
@@ -994,12 +1403,21 @@ def public_api():
 def test_every_public_operation_has_a_differential_case():
     """Fails when a method is added to MetalArray or GroupBy without a case here, so the harness
     cannot silently fall behind the library."""
-    known = _NOT_DIFFERENTIABLE | set(_COVERED_BY) | {o.name for o in OPS} | {n for n, _ in ABSENT}
+    known = _NOT_DIFFERENTIABLE | set(_COVERED_BY) | set(_NO_MATRIX_TYPE) | \
+        {o.name for o in OPS} | {n for n, _ in ABSENT}
     missing = sorted(n for n in public_api() if n not in known)
     assert not missing, (
         "no differential case for: " + ", ".join(missing) +
-        " -- add an Op, or an entry in _COVERED_BY / _NOT_DIFFERENTIABLE, "
+        " -- add an Op, or an entry in _COVERED_BY / _NO_MATRIX_TYPE / _NOT_DIFFERENTIABLE, "
         "in python/tests/test_differential.py")
+
+
+def test_methods_outside_the_matrix_are_reported():
+    """Not a failure: a record of the methods the generator cannot reach, and why."""
+    for name, reason in sorted(_NO_MATRIX_TYPE.items()):
+        print(f"outside the matrix: {name} (needs a {reason})")
+    assert all(hasattr(am.MetalArray, n) for n in _NO_MATRIX_TYPE), \
+        "_NO_MATRIX_TYPE lists a method MetalArray no longer has"
 
 
 # ------------------------------------------------------------------ pinned divergences
@@ -1116,6 +1534,119 @@ def test_group_by_ignores_keys_outside_the_declared_range():
     assert len(pa.table({"k": keys}).group_by("k").aggregate([([], "count_all")])) == 4
 
 
+def test_sign_keeps_the_column_type_where_pyarrow_narrows_to_int8():
+    """`am_unary` returns the column's own type for every op it defines, `sign` included; `pc.sign`
+    narrows an integer column to int8. The values agree, so the matrix casts the oracle back."""
+    a = pa.array([-5, 0, 7], pa.int32())
+    assert am.array(a).sign().type == pa.int32() and pc.sign(a).type == pa.int8()
+    assert pylist(am.array(a).sign()) == pc.sign(a).to_pylist() == [-1, 0, 1]
+    f = pa.array([-2.5, 0.0, 3.0], pa.float64())
+    assert am.array(f).sign().type == pc.sign(f).type == pa.float64()
+
+
+@pytest.mark.parametrize("method,fn", [("shift_left", pc.shift_left), ("shift_right", pc.shift_right)])
+def test_out_of_range_shift_counts_shift_the_bits_out_where_pyarrow_returns_the_operand(method, fn):
+    """A count outside [0, bit width) shifts every bit out on the GPU -- 0, or the sign fill for a
+    signed `shift_right`. pyarrow's unchecked kernel returns the operand untouched, and its checked
+    variant raises. Arrow's range excludes the sign bit, so int32 already diverges at 31."""
+    a = pa.array([-8, -8, 1024, 1024], pa.int32())
+    counts = pa.array([-1, 40, 31, 32], pa.int32())
+    got = pylist(getattr(am.array(a), method)(am.array(counts)))
+    assert got == ([0, 0, 0, 0] if method == "shift_left" else [-1, -1, 0, 0])
+    assert fn(a, counts).to_pylist() == [-8, -8, 1024, 1024]
+    with pytest.raises(pa.ArrowInvalid):
+        getattr(pc, method + "_checked")(a, counts)
+
+
+def test_cumulative_functions_skip_nulls_where_arrow_propagates_them():
+    """ArrowMetal's cumulative kernels carry the running value across a null and leave the output
+    null exactly where the input is -- Arrow's `skip_nulls=True`. Arrow's default is the other one:
+    the first null poisons every later element. ArrowMetal has no such mode."""
+    a = pa.array([1, 2, None, 4], pa.int64())
+    assert pylist(am.array(a).cumulative_sum()) == \
+        pc.cumulative_sum(a, skip_nulls=True).to_pylist() == [1, 3, None, 7]
+    assert pc.cumulative_sum(a).to_pylist() == [1, 3, None, None]
+    assert pylist(am.array(a).cumulative_max()) == \
+        pc.cumulative_max(a, skip_nulls=True).to_pylist() == [1, 2, None, 4]
+
+
+def test_arrow_cumulative_max_default_start_clamps_negative_floats():
+    """Why the matrix passes `start` explicitly: Arrow's default start for `cumulative_max` is the
+    type's `numeric_limits::min()`, which on a float column is the smallest positive normal, so every
+    negative running maximum comes back clamped to 1.18e-38."""
+    a = pa.array([-1.0, -2.0], pa.float32())
+    assert pc.cumulative_max(a).to_pylist() == [float(np.finfo(np.float32).tiny)] * 2
+    assert pc.cumulative_max(a, start=pa.scalar(-math.inf, pa.float32())).to_pylist() == [-1.0, -1.0]
+    assert pylist(am.array(a).cumulative_max()) == [-1.0, -1.0]
+
+
+def test_float64_transcendentals_are_evaluated_in_float32():
+    """`sqrt`/`exp`/`ln`/`log10`/`log2` convert to `float`, evaluate there and widen back, so a
+    float64 operand outside the float32 range loses everything below the smallest normal and above
+    FLT_MAX -- documented in include/arrowmetal.h, and why the matrix trims the input."""
+    a = pa.array([1e-300, 1e300], pa.float64())
+    assert pylist(am.array(a).sqrt()) == [0.0, math.inf]
+    assert pc.sqrt(a).to_pylist() == [1e-150, 1e150]
+    # Inside the float32 range the two agree to about seven significant digits.
+    b = pa.array([2.0], pa.float64())
+    assert pylist(am.array(b).sqrt())[0] == pytest.approx(pc.sqrt(b)[0].as_py(), rel=1e-6)
+
+
+def test_floor_and_ceil_keep_the_integer_type_where_pyarrow_widens_to_double():
+    """`pc.floor`/`ceil`/`trunc` return a double for an integer column -- and refuse the column
+    outright past 2^53, where a double can no longer hold it. ArrowMetal's are the identity and keep
+    the column's type, so they answer at every magnitude. That is why the matrix compares them on
+    integer values within 2^53."""
+    small = pa.array([-3, 7], pa.int64())
+    assert am.array(small).floor().type == pa.int64() and pc.floor(small).type == pa.float64()
+    assert pylist(am.array(small).floor()) == [-3, 7] == \
+        [int(v) for v in pc.floor(small).to_pylist()]
+    big = pa.array([2 ** 62 + 1], pa.int64())
+    assert pylist(am.array(big).floor()) == [2 ** 62 + 1]
+    with pytest.raises(pa.ArrowInvalid):
+        pc.floor(big)
+
+
+def test_empty_replace_pattern_is_the_identity():
+    """ArrowMetal defines an empty pattern as the identity. `pc.replace_substring` is not compared
+    here at all: on an empty pattern Arrow's kernel does not terminate, so the harness must never
+    call it with one -- which is also why the matrix's replace patterns are all non-empty."""
+    a = pa.array(["abc", "", None], pa.string())
+    assert pylist(am.array(a).replace("", "-")) == ["abc", "", None]
+
+
+def test_empty_pattern_counts_code_points_where_arrow_counts_bytes():
+    """`count_substring("")` is a length + 1 in both engines -- of code points here, of bytes in
+    Arrow, so the two only differ on multi-byte input."""
+    a = pa.array(["héllo", "abc"], pa.string())
+    assert pylist(am.array(a).count_substring("")) == [6, 4]
+    assert pc.count_substring(a, "").to_pylist() == [7, 4]
+
+
+def test_element_wise_min_max_break_a_zero_tie_like_fmin_and_fmax_in_both():
+    """-0.0 and 0.0 are equal, so which one comes back is a tie-break: both engines answer the way
+    `fmin`/`fmax` do, so the result does not depend on the operand order."""
+    for ty in (pa.float32(), pa.float64()):
+        a, b = pa.array([0.0, -0.0], ty), pa.array([-0.0, 0.0], ty)
+        assert pylist(am.array(a).min_element_wise(am.array(b))) == \
+            pc.min_element_wise(a, b).to_pylist() == [-0.0, -0.0]
+        assert pylist(am.array(a).max_element_wise(am.array(b))) == \
+            pc.max_element_wise(a, b).to_pylist() == [0.0, 0.0]
+        assert struct.pack("<d", pylist(am.array(a).min_element_wise(am.array(b)))[0]) == \
+            struct.pack("<d", -0.0)
+
+
+def test_is_in_never_matches_a_null_where_arrow_matches_null_to_null():
+    """ArrowMetal ignores nulls in the value set and never matches a null element, so `is_in` never
+    returns null -- Arrow's `skip_nulls=True`. Arrow's default makes null match null."""
+    a = pa.array([1, None], pa.int32())
+    values = am.array(pa.array([1, None], pa.int32()))
+    assert pylist(am.array(a).is_in(values)) == \
+        pc.is_in(a, value_set=pa.array([1, None], pa.int32()), skip_nulls=True).to_pylist() == \
+        [True, False]
+    assert pc.is_in(a, value_set=pa.array([1, None], pa.int32())).to_pylist() == [True, True]
+
+
 # ------------------------------------------------------------------ open findings
 #
 # Reproductions of bugs this harness found. They are xfail(strict=True), so they start passing --
@@ -1131,15 +1662,14 @@ def _payload_pair():
     return loud, quiet
 
 
-@pytest.mark.xfail(strict=True, reason="argsort-null-order: argsort orders the null indices by the "
-                                       "bytes left under the validity bitmap instead of by position")
 def test_argsort_null_block_is_stable():
+    """Was a finding: the null indices used to come back ordered by the bytes under the validity
+    bitmap. Two arrays Arrow calls equal must argsort identically, and like Arrow."""
     loud, quiet = _payload_pair()
     assert pylist(am.array(loud).argsort()) == pylist(am.array(quiet).argsort())
     assert pylist(am.array(loud).argsort()) == pc.array_sort_indices(loud).to_pylist()
 
 
-@pytest.mark.xfail(strict=True, reason="argsort-null-order: top_k inherits the argsort null ordering")
 def test_top_k_null_block_is_stable():
     loud, _ = _payload_pair()
     assert pylist(am.array(loud).top_k(4, False)) == pc.array_sort_indices(loud).to_pylist()
@@ -1154,13 +1684,21 @@ def test_float32_arithmetic_keeps_subnormal_results():
         pc.multiply(a, pa.scalar(0.5, pa.float32())).to_pylist()
 
 
-@pytest.mark.xfail(strict=True, reason="float32-subnormal-ftz: Float32 comparison treats subnormal "
-                                       "operands as zero")
 def test_float32_comparison_distinguishes_subnormals_from_zero():
+    """Only the *arithmetic* kernels flush: the comparison kernels compare float32 exactly, so a
+    subnormal is greater than zero and different from -0.0, as in Arrow."""
     smallest = float(np.finfo(np.float32).tiny) * 2.0 ** -23     # 1.4e-45
     a = pa.array([smallest], pa.float32())
     assert pylist(am.array(a).compare(">", 0.0)) == \
         pc.greater(a, pa.scalar(0.0, pa.float32())).to_pylist() == [True]
+    assert pylist(am.array(pa.array([-0.0], pa.float32())).compare("==", am.array(a))) == [False]
+
+
+def test_sign_of_a_float32_subnormal_is_one():
+    """The sign kernel decides on the bit pattern, so it does not inherit the arithmetic flush."""
+    smallest = float(np.finfo(np.float32).tiny) * 2.0 ** -23
+    a = pa.array([smallest, -smallest], pa.float32())
+    assert pylist(am.array(a).sign()) == pc.sign(a).to_pylist() == [1.0, -1.0]
 
 
 def test_float64_arithmetic_and_comparison_keep_subnormals():
@@ -1172,24 +1710,37 @@ def test_float64_arithmetic_and_comparison_keep_subnormals():
     assert pylist(am.array(a).compare(">", 0.0)) == [True, True]
 
 
-@pytest.mark.xfail(strict=True, reason="negative-zero-sort-order: the radix sort separates -0.0 from "
-                                       "0.0, which Arrow treats as a tie held in input order")
-def test_negative_zero_is_a_sort_tie():
-    a = pa.array([0.0, -0.0, 0.0, -0.0], pa.float64())
-    assert pylist(am.array(a).argsort()) == pc.array_sort_indices(a).to_pylist()
+@pytest.mark.parametrize("ty", [pa.float32(), pa.float64()])
+def test_negative_zero_is_a_sort_tie(ty):
+    """IEEE-754 calls -0.0 and 0.0 equal, so both engines leave the tie in input order -- the sort
+    keys canonicalise the sign of zero rather than sorting on the raw bit pattern."""
+    a = pa.array([0.0, -0.0, 0.0, -0.0], ty)
+    assert pylist(am.array(a).argsort()) == pc.array_sort_indices(a).to_pylist() == [0, 1, 2, 3]
+    assert pylist(am.array(a).argsort(True)) == \
+        pc.array_sort_indices(a, order="descending").to_pylist() == [0, 1, 2, 3]
+    assert pylist(am.array(a).top_k(4)) == [0, 1, 2, 3]
 
 
-@pytest.mark.xfail(strict=True, reason="float32-reduction-accumulator: sum over Float32 accumulates "
-                                       "in Float32 and overflows where Arrow accumulates in double")
+@pytest.mark.parametrize("ty", [pa.float32(), pa.float64()])
+def test_nan_sorts_last_in_both_directions_in_both(ty):
+    """NaN goes after +inf ascending and stays at the end descending, next to the nulls -- Arrow's
+    null_placement covers NaN too, so a reversed order does not mirror it to the front."""
+    a = pa.array([1.0, math.nan, math.inf, -math.inf, None], ty)
+    assert pylist(am.array(a).argsort()) == pc.array_sort_indices(a).to_pylist() == [3, 0, 2, 1, 4]
+    assert pylist(am.array(a).argsort(True)) == \
+        pc.array_sort_indices(a, order="descending").to_pylist() == [2, 0, 3, 1, 4]
+    assert pylist(am.array(a).top_k(3)) == [2, 0, 3]
+
+
 def test_float32_sum_does_not_overflow_before_arrow_does():
+    """Was a finding: the Float32 reductions accumulate in double now, as Arrow's do."""
     big = float(np.finfo(np.float32).max)
     a = pa.array([big, big], pa.float32())
     assert am.array(a).sum() == pc.sum(a).as_py()          # Arrow: 6.805646932770577e+38
 
 
-@pytest.mark.xfail(strict=True, reason="uint64-group-sum-signed: group-by sum over UInt64 values "
-                                       "returns an Int64 array")
 def test_group_by_sum_over_uint64_stays_unsigned():
+    """Was a finding: the grouped total used to be reported as int64 whatever the value type."""
     keys = pa.array([0, 0], pa.int32())
     values = pa.array([2 ** 63, 2 ** 63 - 5], pa.uint64())
     total = am.array(keys).group_by(1).sum(am.array(values))
@@ -1197,8 +1748,60 @@ def test_group_by_sum_over_uint64_stays_unsigned():
     assert pylist(total) == group_oracle(keys, values, 1, "sum")
 
 
+@pytest.mark.xfail(strict=True, reason="sign-of-negative-zero: ArrowMetal's sign returns -0.0 for "
+                                       "-0.0, where pyarrow normalises the result to 0.0")
+def test_sign_of_negative_zero_matches_pyarrow():
+    a = pa.array([-0.0, 0.0], pa.float64())
+    assert struct.pack("<d", pylist(am.array(a).sign())[0]) == \
+        struct.pack("<d", pc.sign(a).to_pylist()[0])
+
+
+@pytest.mark.xfail(strict=True, reason="utf8-case-latin-only: upper/lower cover Basic Latin, Latin-1 "
+                                       "Supplement and Latin Extended-A; other code points pass through")
+def test_case_mapping_covers_all_of_unicode():
+    a = pa.array(["Ωμέγα"], pa.string())
+    assert pylist(am.array(a).upper()) == pc.utf8_upper(a).to_pylist()
+
+
+def test_case_mapping_inside_latin_extended_a_matches_pyarrow():
+    """The blocks ArrowMetal does cover are expected to agree exactly, byte lengths included."""
+    a = pa.array(["héllo", "ÅNGSTRÖM", "naïve", "ſ", "İ", "ı", "Ÿ", "ÿ", "œŒ"], pa.string())
+    assert pylist(am.array(a).upper()) == pc.utf8_upper(a).to_pylist()
+    assert pylist(am.array(a).lower()) == pc.utf8_lower(a).to_pylist()
+
+
+@pytest.mark.xfail(strict=True, reason="negative-zero-set-lookup: is_in maps -0.0 onto 0.0, the total "
+                                       "order unique() and the sort use; Arrow's hash keeps them apart")
+def test_is_in_separates_negative_zero_from_zero():
+    a = pa.array([0.0, -0.0], pa.float64())
+    values = pa.array([-0.0], pa.float64())
+    assert pylist(am.array(a).is_in(am.array(values))) == \
+        pc.is_in(a, value_set=values, skip_nulls=True).to_pylist()
+
+
+def test_is_in_matches_nan_to_nan_in_both():
+    """The other float special case agrees: one NaN is in a set that holds a NaN."""
+    a = pa.array([math.nan, 1.0], pa.float64())
+    values = pa.array([math.nan], pa.float64())
+    assert pylist(am.array(a).is_in(am.array(values))) == \
+        pc.is_in(a, value_set=values, skip_nulls=True).to_pylist() == [True, False]
+
+
+def test_cumulative_sum_propagates_nan_and_reassociates_infinities():
+    """NaN poisons the rest of the running sum in both engines. ±inf is where the block scan and a
+    left-to-right accumulation part company -- `inf - inf` is NaN, and which of the two an element
+    sees depends on the association -- which is why the matrix filters infinities out."""
+    a = pa.array([1.0, math.nan, 2.0], pa.float64())
+    assert pylist(am.array(a).cumulative_sum())[0] == pc.cumulative_sum(a, skip_nulls=True)[0].as_py()
+    assert all(math.isnan(v) for v in pylist(am.array(a).cumulative_sum())[1:])
+    assert all(math.isnan(v) for v in pc.cumulative_sum(a, skip_nulls=True).to_pylist()[1:])
+    b = pa.array([math.inf, -math.inf], pa.float64())
+    assert math.isnan(pylist(am.array(b).cumulative_sum())[1])
+    assert math.isnan(pc.cumulative_sum(b, skip_nulls=True).to_pylist()[1])
+
+
 def test_argsort_is_a_permutation_with_nulls_last_and_values_in_order():
-    """The weaker properties that do hold on the data the xfail above rejects."""
+    """The weaker properties that hold whatever the values under the null bits are."""
     rng = np.random.default_rng(5)
     for n in (33, 1000):
         values = rng.integers(-50, 50, n).astype(np.int32)

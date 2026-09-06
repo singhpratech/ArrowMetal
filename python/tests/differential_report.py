@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Run the whole ArrowMetal-vs-pyarrow.compute matrix and print it. Exit code 1 on any failure.
+"""Run the whole ArrowMetal-vs-pyarrow.compute matrix and print it. Exit code 1 on any *unclassified*
+divergence -- a cell that fails without an entry in FINDINGS and a paragraph in docs/EVALUATION.md.
 
     PYTHONPATH=python python python/tests/differential_report.py
     DIFF_QUICK=1 ...    # drop the 100k row datasets
@@ -115,8 +116,8 @@ def render(cells, ops, types, total, elapsed):
     failed = sum(c.failed for c in cells.values())
     skipped = sum(c.skipped for c in cells.values())
     brand_new = sum(c.new for c in cells.values())
-    add(f"total: {total} cases  |  pass {passed}  fail {failed} ({brand_new} unclassified)  "
-        f"skip {skipped}  |  {elapsed:.1f}s")
+    add(f"total: {total} cases  |  pass {passed}  fail {failed} ({brand_new} unclassified, "
+        f"{failed - brand_new} documented)  skip {skipped}  |  {elapsed:.1f}s")
     add("legend: 'ok N' all N datasets agree ('+Ns' = N skipped); 'known n/N' n datasets hit an open "
         "finding below; 'NEW n/N' an unclassified divergence; 'skip N' not implemented for that "
         "type; '-' out of scope")
@@ -177,7 +178,10 @@ def render(cells, ops, types, total, elapsed):
         add("  " + ", ".join(f"{name}" for name, _ in diff.ABSENT))
         add("")
 
-    add("FAIL" if failed else "PASS")
+    # The gate is the unclassified count: a documented divergence is a decision on the record, with a
+    # FINDINGS entry, an xfail reproduction and a paragraph in docs/EVALUATION.md behind it. Anything
+    # else is a divergence nobody has looked at yet, and that is what CI must not let through.
+    add("FAIL" if brand_new else ("PASS (%d documented divergence(s))" % failed if failed else "PASS"))
     return "\n".join(lines)
 
 
@@ -193,7 +197,7 @@ def main(argv=None):
 
     cells, ops, types, total, elapsed = run(op_filter, type_filter, args.quiet)
     print(render(cells, ops, types, total, elapsed))
-    return 1 if any(c.failed for c in cells.values()) else 0
+    return 1 if any(c.new for c in cells.values()) else 0
 
 
 if __name__ == "__main__":
