@@ -176,13 +176,16 @@ extension ParquetFile {
             dictInfos[i] = info
         }
 
+        // Only this column's byte range is wrapped for the GPU, so a projection never pays for the
+        // columns it skips.
+        let (mapped, mappedOffset) = try buffer(covering: srcBase..<maxEnd)
         let pageData: MTLBuffer
         let pageDataOffset: Int
         var owned: MetalArrowBuffer? = nil
         if !anyCompressed {
             // The mapped file *is* the page buffer.
-            pageData = fileBuffer.mtl
-            pageDataOffset = fileBuffer.offset + srcBase
+            pageData = mapped.mtl
+            pageDataOffset = mapped.offset + mappedOffset
             for i in infos.indices { infos[i].dataOffset = UInt32(dataPages[i].bodyOffset - srcBase) }
             for i in dictInfos.indices { dictInfos[i].dataOffset = UInt32(dictPages[i].bodyOffset - srcBase) }
         } else {
@@ -219,12 +222,12 @@ extension ParquetFile {
             for (i, p) in dataPages.enumerated() { stage(p, codecOf[i], &infos[i]) }
             let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(dst, 1), zeroed: false, context: ctx)
             if !copies.isEmpty {
-                try Decompress.into(ctx, codec: .uncompressed, source: fileBuffer.mtl,
-                                    sourceOffset: fileBuffer.offset + srcBase, blocks: copies, out: out)
+                try Decompress.into(ctx, codec: .uncompressed, source: mapped.mtl,
+                                    sourceOffset: mapped.offset + mappedOffset, blocks: copies, out: out)
             }
             for (codec, blocks) in byCodec {
-                try Decompress.into(ctx, codec: codec, source: fileBuffer.mtl,
-                                    sourceOffset: fileBuffer.offset + srcBase, blocks: blocks, out: out)
+                try Decompress.into(ctx, codec: codec, source: mapped.mtl,
+                                    sourceOffset: mapped.offset + mappedOffset, blocks: blocks, out: out)
             }
             owned = out
             pageData = out.mtl
@@ -338,6 +341,7 @@ extension ParquetFile {
         }
         // Keep the decompressed page buffer alive for as long as anything might still point into it.
         if let owned { data.retain(owned) }
+        data.retain(mapped)
         data.retain(pagesBuf)
         return data
     }

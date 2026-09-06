@@ -39,3 +39,17 @@ swift run -c release arrowmetal-examples         # six end-to-end scenarios
 
 Every benchmark table in the repository names the machine it was measured on. Numbers from GitHub-hosted
 runners are never published: their GPU is virtual.
+
+
+## Parquet on the GPU
+
+| Read this | To learn |
+|---|---|
+| [PARQUET.md](PARQUET.md) | The Parquet reader that decodes on the Apple GPU: the pipeline, the parallel RLE strategy, GPU Snappy and LZ4, the supported encoding/codec/type matrix, projection and statistics pushdown, benchmarks against pyarrow / Polars / pandas, the small writer, and the limits |
+
+```
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter "ParquetTests|ParquetWriterTests"
+PYTHONPATH=python python -m pytest python/tests/test_parquet.py -q     # every fixture vs pyarrow.parquet
+PYTHONPATH=python python Benchmarks/parquet_bench.py --rows 50000000   # vs pyarrow, Polars, pandas
+python Tests/Fixtures/generate_parquet.py                              # regenerate the committed fixtures
+```

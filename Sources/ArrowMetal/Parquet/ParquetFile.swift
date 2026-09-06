@@ -3,14 +3,15 @@ import Metal
 
 // A Parquet file, mapped once and read from the GPU.
 //
-// The whole file is `mmap`ed and, because `mmap` always hands back a page-aligned address, the mapping
-// is wrapped as a single `MTLBuffer` with `makeBuffer(bytesNoCopy:)` — the same trick `MetalArrowBuffer`
-// uses for zero-copy Arrow import. Every page of every column chunk is therefore already addressable by
-// a compute kernel as a byte offset into one buffer, and the CPU never reads a byte of column data: it
-// only parses the footer and the page headers, which are metadata.
+// The whole file is `mmap`ed, and because `mmap` always hands back a page-aligned address, any range of
+// it can be wrapped as an `MTLBuffer` with `makeBuffer(bytesNoCopy:)` — the same trick `MetalArrowBuffer`
+// uses for zero-copy Arrow import. A column chunk's pages are then addressable by a compute kernel as
+// byte offsets into that buffer, and the CPU never reads a byte of column data: it only parses the
+// Thrift footer and the page headers, which are metadata.
 //
-// Pages are faulted in lazily by the kernel that first reads them, so a projection that touches two of
-// forty columns never brings the other thirty-eight into memory.
+// Ranges are wrapped lazily, one per column chunk read (see `buffer(covering:)`), and pages are faulted
+// in by the kernel that first touches them, so a projection over two of forty columns brings neither the
+// other thirty-eight columns' bytes into memory nor their pages into the GPU's page tables.
 
 /// One `mmap`ed range of a file, wrapped as an `MTLBuffer`.
 final class MappedRegion: @unchecked Sendable {
@@ -49,8 +50,14 @@ public final class ParquetFile: @unchecked Sendable {
     let fd: Int32
     let fileSize: Int
     private let region: MappedRegion
-    /// The whole file as one Metal buffer (offset 0 == byte 0 of the file).
-    let fileBuffer: MetalArrowBuffer
+    /// Metal wrappers over sub-ranges of the mapping, one per column chunk actually read.
+    ///
+    /// Wrapping bytes with `makeBuffer(bytesNoCopy:)` makes the GPU's page tables cover them, and that
+    /// costs time proportional to the range -- roughly 20 ms per gigabyte on an M4 Max. Wrapping the
+    /// whole file up front would charge every projection for the columns it does not read, so ranges are
+    /// wrapped on demand and cached: reading two columns of a forty-column file maps two column chunks.
+    private var wrapped: [Int: MetalArrowBuffer] = [:]
+    private let wrapLock = NSLock()
 
     public var numRows: Int64 { metadata.numRows }
     public var rowGroupCount: Int { metadata.rowGroups.count }
@@ -88,12 +95,27 @@ public final class ParquetFile: @unchecked Sendable {
             self.leaves = built.leaves
             self.fields = built.fields
         } catch { close(fd); throw error }
-        do {
-            let (buf, _) = try MetalArrowBuffer.wrapOrCopy(UnsafeRawPointer(region.base),
-                                                           byteCount: region.length,
-                                                           keepAlive: region, context: context)
-            self.fileBuffer = buf
-        } catch { close(fd); throw error }
+    }
+
+    /// A Metal buffer covering `range` of the file, plus the offset of `range.lowerBound` inside it.
+    /// Ranges are rounded out to page boundaries (what `makeBuffer(bytesNoCopy:)` requires) and cached.
+    func buffer(covering range: Range<Int>) throws -> (buffer: MetalArrowBuffer, offset: Int) {
+        let page = metalPageSize()
+        let start = (Swift.max(range.lowerBound, 0) / page) * page
+        let end = Swift.min(roundUp(Swift.max(range.upperBound, start + 1), to: page), region.length)
+        wrapLock.lock()
+        if let b = wrapped[start], b.byteCount >= end - start {
+            wrapLock.unlock()
+            return (b, range.lowerBound - start)
+        }
+        wrapLock.unlock()
+        let (buf, _) = try MetalArrowBuffer.wrapOrCopy(UnsafeRawPointer(region.base).advanced(by: start),
+                                                       byteCount: end - start,
+                                                       keepAlive: region, context: context)
+        wrapLock.lock()
+        wrapped[start] = buf
+        wrapLock.unlock()
+        return (buf, range.lowerBound - start)
     }
 
     deinit { close(fd) }
