@@ -219,7 +219,11 @@ def test_series_filter_unique_cumsum_and_hash():
     s, k = df["v"], df["k"]
     mask = k > 8
     assert s.arrowmetal.filter(mask).to_list() == s.filter(mask).to_list()
-    assert s.arrowmetal.unique().to_list() == sorted(s.unique().to_list())
+    # unique() follows Arrow's first-appearance order since the option work landed; compare as sets
+    # and check the order is first appearance.
+    u = s.arrowmetal.unique().to_list()
+    assert sorted(u) == sorted(s.unique().to_list())
+    assert u == list(dict.fromkeys(s.to_list()))
     assert s.arrowmetal.cum_sum().to_list() == s.cum_sum().to_list()
     h = s.arrowmetal.hash64()
     assert h.dtype == pl.UInt64 and len(h) == len(s)
