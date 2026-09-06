@@ -83,12 +83,12 @@ public func am_regex(_ a: OpaquePointer?, _ op: Int32,
         case .findSubstring: return .int32(try s.findSubstringRegex(pat, ignoreCase: ignoreCase))
         case .replaceSubstring: return .string(try s.replaceSubstringRegex(pat, with: rep, ignoreCase: ignoreCase))
         case .matchLike: return .boolean(try s.matchLike(pat, ignoreCase: ignoreCase))
-        case .splitPatternValues: return .string(try s.splitPattern(pat).values)
-        case .splitPatternOffsets: return .int32(try s.splitPattern(pat).offsets)
-        case .splitWhitespaceValues: return .string(try s.splitWhitespace().values)
-        case .splitWhitespaceOffsets: return .int32(try s.splitWhitespace().offsets)
-        case .splitRegexValues: return .string(try s.splitPatternRegex(pat, ignoreCase: ignoreCase).values)
-        case .splitRegexOffsets: return .int32(try s.splitPatternRegex(pat, ignoreCase: ignoreCase).offsets)
+        case .splitPatternValues: return .string(try s.splitPatternPair(pat).values)
+        case .splitPatternOffsets: return .int32(try s.splitPatternPair(pat).offsets)
+        case .splitWhitespaceValues: return .string(try s.splitWhitespacePair().values)
+        case .splitWhitespaceOffsets: return .int32(try s.splitWhitespacePair().offsets)
+        case .splitRegexValues: return .string(try s.splitPatternRegexPair(pat, ignoreCase: ignoreCase).values)
+        case .splitRegexOffsets: return .int32(try s.splitPatternRegexPair(pat, ignoreCase: ignoreCase).offsets)
         case .extractGroup:
             let groups = try s.extractRegex(pat, ignoreCase: ignoreCase)
             guard let column = groups[rep] else {

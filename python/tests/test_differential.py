@@ -1882,8 +1882,12 @@ def _regex_replace(src, shape):
     return got, expected
 
 
-def _as_list_array(offsets, values):
-    """The (offsets, values) pair ArrowMetal's split returns, as the list<utf8> Arrow produces."""
+def _as_list_array(*parts):
+    """A split result as the list<utf8> Arrow produces: either the list array ArrowMetal now returns
+    (one MetalArray of format "+l") or the older (offsets, values) pair."""
+    if len(parts) == 1:
+        return arrow(parts[0])
+    offsets, values = parts
     return pa.ListArray.from_arrays(arrow(offsets), arrow(values))
 
 
@@ -1892,10 +1896,10 @@ def _regex_split(src, shape):
     x = am.array(src)
     got, expected = [], []
     for separator in (" ", "a", "\t", "pp"):
-        got.append(_as_list_array(*x.split_pattern(separator)))
+        got.append(_as_list_array(x.split_pattern(separator)))
         expected.append(pc.split_pattern(src, separator))
     for pattern in ("[0-9]", "l+", "a|b"):
-        got.append(_as_list_array(*x.split_pattern(pattern, regex=True)))
+        got.append(_as_list_array(x.split_pattern(pattern, regex=True)))
         expected.append(pc.split_pattern_regex(src, pattern))
     return got, expected
 
@@ -1904,7 +1908,7 @@ def _regex_split(src, shape):
     note="ArrowMetal splits on runs of whitespace and drops the empty ends, as Python's str.split() "
          "does; pc.utf8_split_whitespace splits at every whitespace character")
 def _split_whitespace(src, shape):
-    return _as_list_array(*am.array(src).split_whitespace()), pc.utf8_split_whitespace(src)
+    return _as_list_array(am.array(src).split_whitespace()), pc.utf8_split_whitespace(src)
 
 
 @op("regex_extract", ["utf8"],

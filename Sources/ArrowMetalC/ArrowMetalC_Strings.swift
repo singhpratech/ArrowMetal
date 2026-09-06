@@ -23,12 +23,19 @@ enum StrTransformOp: Int32 {
 private let errorKeyStrings = "ArrowMetalC.lastError"
 private func setStringsError(_ e: Error) { Thread.current.threadDictionary[errorKeyStrings] = "\(e)" }
 
+/// A `utf8` **or** `binary` array. Arrow's `binary_length`, `binary_repeat`, `binary_reverse` and the
+/// byte-wise trims are defined on both, `MetalStringArray` stores both, and every transform below
+/// carries the `isBinary` flag through — so a `binary` column comes back `binary`.
 @inline(__always) private func stringHandle(_ p: OpaquePointer?) throws -> MetalStringArray {
     guard let p else { throw ArrowMetalError.invalidArrowArray("null array handle") }
     let a = Unmanaged<Box>.fromOpaque(UnsafeRawPointer(p)).takeUnretainedValue().a
-    guard case .string(let s) = a else { throw ArrowMetalError.unsupportedType("expected a utf8 array, got \(a.arrowFormat)") }
-    return s
+    switch a {
+    case .string(let s), .binary(let s): return s
+    default: throw ArrowMetalError.unsupportedType("expected a utf8 or binary array, got \(a.arrowFormat)")
+    }
 }
+/// `utf8` unless the transform produced (or preserved) Arrow `binary`.
+@inline(__always) private func emit(_ s: MetalStringArray) -> AnyMetalArray { s.isBinary ? .binary(s) : .string(s) }
 @inline(__always) private func emitString(_ a: AnyMetalArray, _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
     out?.pointee = OpaquePointer(Unmanaged.passRetained(Box(a)).toOpaque())
     return 0
@@ -61,24 +68,24 @@ public func am_str_transform(_ a: OpaquePointer?, _ op: Int32,
             throw ArrowMetalError.invalidArrowArray("unknown string transform op \(op)")
         }
         switch kind {
-        case .asciiUpper: return .string(try s.asciiUpper())
-        case .asciiLower: return .string(try s.asciiLower())
-        case .utf8Upper: return .string(try s.utf8Upper())
-        case .utf8Lower: return .string(try s.utf8Lower())
-        case .asciiSwapcase: return .string(try s.asciiSwapcase())
-        case .asciiCapitalize: return .string(try s.asciiCapitalize())
-        case .trimWhitespace: return .string(try s.trim())
-        case .ltrimWhitespace: return .string(try s.ltrim())
-        case .rtrimWhitespace: return .string(try s.rtrim())
-        case .trim: return .string(try s.trim(characters: a1))
-        case .ltrim: return .string(try s.ltrim(characters: a1))
-        case .rtrim: return .string(try s.rtrim(characters: a1))
-        case .replaceSubstring: return .string(try s.replaceSubstring(a1, with: a2, maxReplacements: Int(p1)))
-        case .repeatCopies: return .string(try s.repeat(Int(p1)))
-        case .sliceCodeunits: return .string(try s.sliceCodeunits(start: Int(p1), stop: Int(p2)))
-        case .padLeft: return .string(try s.padLeft(width: Int(p1), pad: a1.isEmpty ? " " : a1))
-        case .padRight: return .string(try s.padRight(width: Int(p1), pad: a1.isEmpty ? " " : a1))
-        case .reverse: return .string(try s.reverse())
+        case .asciiUpper: return emit(try s.asciiUpper())
+        case .asciiLower: return emit(try s.asciiLower())
+        case .utf8Upper: return emit(try s.utf8Upper())
+        case .utf8Lower: return emit(try s.utf8Lower())
+        case .asciiSwapcase: return emit(try s.asciiSwapcase())
+        case .asciiCapitalize: return emit(try s.asciiCapitalize())
+        case .trimWhitespace: return emit(try s.trim())
+        case .ltrimWhitespace: return emit(try s.ltrim())
+        case .rtrimWhitespace: return emit(try s.rtrim())
+        case .trim: return emit(try s.trim(characters: a1))
+        case .ltrim: return emit(try s.ltrim(characters: a1))
+        case .rtrim: return emit(try s.rtrim(characters: a1))
+        case .replaceSubstring: return emit(try s.replaceSubstring(a1, with: a2, maxReplacements: Int(p1)))
+        case .repeatCopies: return emit(try s.repeat(Int(p1)))
+        case .sliceCodeunits: return emit(try s.sliceCodeunits(start: Int(p1), stop: Int(p2)))
+        case .padLeft: return emit(try s.padLeft(width: Int(p1), pad: a1.isEmpty ? " " : a1))
+        case .padRight: return emit(try s.padRight(width: Int(p1), pad: a1.isEmpty ? " " : a1))
+        case .reverse: return emit(try s.reverse())
         case .countSubstring: return .int32(try s.countSubstring(a1))
         case .findSubstring: return .int32(try s.findSubstring(a1))
         case .isAlnum: return .boolean(try s.classify(.alnum))

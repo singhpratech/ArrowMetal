@@ -16,9 +16,9 @@ import Metal
 /// classified identically by the byte rules and by the Unicode tables, so the host only revisits the
 /// rows that second bitmap marks — an all-ASCII column never touches the CPU at all.
 ///
-/// The transforms split **per array**: `utf8_capitalize` and `utf8_title` run the byte kernel when the
-/// whole column is ASCII and the CPU otherwise, because an output length that depends on a Unicode
-/// table cannot be computed in the GPU length pass.
+/// The case transforms and the `utf8_trim*` family split **per row** as well, in
+/// `Kernels/StringUnicode.swift`: an exact GPU table covers every code point at or below U+017F, and
+/// the length kernel declines any row above it so the host can redo just those.
 ///
 /// ## Documented differences from pyarrow
 ///
@@ -41,8 +41,8 @@ import Metal
 ///   categories, with U+0020 (the space) added back. The empty string is printable; every other
 ///   predicate here is false on it.
 ///
-/// Case *mapping* (`utf8_capitalize`, `utf8_title`) uses Unicode's **simple** 1:1 mappings, as
-/// utf8proc does, reconstructed from Swift's full mappings: a full mapping of exactly one scalar is
+/// Case *mapping* (`utf8_upper`, `utf8_lower`, `utf8_swapcase`, `utf8_capitalize`, `utf8_title`) uses
+/// Unicode's **simple** 1:1 mappings, as utf8proc does, reconstructed from Swift's full mappings: a full mapping of exactly one scalar is
 /// the simple mapping, a longer one leaves the code point alone, and U+00DF (ß → ẞ), U+0130 (İ → i)
 /// and the Greek iota-subscript blocks U+1F80–U+1F87 / U+1F90–U+1F97 / U+1FA0–U+1FA7 (which map +8)
 /// are the exceptions where the two disagree. Everything else that Swift would expand to several
@@ -439,37 +439,15 @@ extension MetalStringArray {
     public func asciiTitle() throws -> MetalStringArray { try extraTransform(.asciiTitle) }
 
     /// Arrow `utf8_capitalize`: the first code point upper-cased, every later one lower-cased.
-    /// GPU (as `ascii_capitalize`) when the column is all ASCII, CPU otherwise.
-    public func utf8Capitalize() throws -> MetalStringArray {
-        if try isAllASCII() { return try transform(.asciiCapitalize) }
-        return try mapRowsConcurrently { s in
-            var out = String.UnicodeScalarView()
-            for (i, u) in s.unicodeScalars.enumerated() {
-                out.append(i == 0 ? UnicodeClass.simpleUpper(u) : UnicodeClass.simpleLower(u))
-            }
-            return String(out)
-        }
-    }
+    ///
+    /// Split **per row** (`Kernels/StringUnicode.swift`): a row entirely inside the Latin blocks
+    /// (U+0000–U+017F) is mapped by the GPU table, any other row on the host.
+    public func utf8Capitalize() throws -> MetalStringArray { try unicodeCapitalize() }
 
     /// Arrow `utf8_title`: the first **cased** code point of every word is upper-cased and the rest
-    /// lower-cased, where a word is a maximal run of cased code points. GPU (as `ascii_title`) when
-    /// the column is all ASCII, CPU otherwise.
-    public func utf8Title() throws -> MetalStringArray {
-        if try isAllASCII() { return try extraTransform(.asciiTitle) }
-        return try mapRowsConcurrently { s in
-            var out = String.UnicodeScalarView()
-            var boundary = true
-            for u in s.unicodeScalars {
-                if UnicodeClass.isCased(u) {
-                    out.append(boundary ? UnicodeClass.simpleUpper(u) : UnicodeClass.simpleLower(u))
-                    boundary = false
-                } else {
-                    out.append(u); boundary = true
-                }
-            }
-            return String(out)
-        }
-    }
+    /// lower-cased, where a word is a maximal run of cased code points. Same per-row GPU/host split as
+    /// ``utf8Capitalize()``.
+    public func utf8Title() throws -> MetalStringArray { try unicodeTitle() }
 
     // MARK: - Centering
 
@@ -509,60 +487,32 @@ extension MetalStringArray {
     static let unicodeWhitespaceASCII: [UInt8] = [0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x1C, 0x1D, 0x1E, 0x1F, 0x20]
 
     /// Arrow `utf8_trim`: strips leading and trailing code points that appear in `characters`.
-    /// An ASCII set runs on the **GPU** (byte-wise trimming can never split a UTF-8 sequence, since
-    /// every continuation byte is ≥ 0x80); a set with a non-ASCII character runs on the CPU.
-    /// An empty set is the identity.
+    ///
+    /// An all-ASCII set never leaves the **GPU** at all — byte-wise trimming cannot split a UTF-8
+    /// sequence, since every continuation byte is ≥ 0x80. A set with a non-ASCII character splits
+    /// **per row**: the GPU trims the rows whose bytes are all < 0x80 with the set's ASCII part (the
+    /// only part such a row could match), the host trims the rest. An empty set is the identity.
     public func utf8Trim(characters: String) throws -> MetalStringArray {
-        try unicodeTrim(characters, left: true, right: true)
+        try unicodeTrimRows(.trim, set: Set(characters.unicodeScalars))
     }
     /// Leading-only form of ``utf8Trim(characters:)``.
     public func utf8Ltrim(characters: String) throws -> MetalStringArray {
-        try unicodeTrim(characters, left: true, right: false)
+        try unicodeTrimRows(.ltrim, set: Set(characters.unicodeScalars))
     }
     /// Trailing-only form of ``utf8Trim(characters:)``.
     public func utf8Rtrim(characters: String) throws -> MetalStringArray {
-        try unicodeTrim(characters, left: false, right: true)
-    }
-
-    private func unicodeTrim(_ characters: String, left: Bool, right: Bool) throws -> MetalStringArray {
-        let bytes = Array(characters.utf8)
-        if bytes.allSatisfy({ $0 < 0x80 }) {
-            return try transform(left && right ? .trimCharacters : (left ? .ltrimCharacters : .rtrimCharacters),
-                                 arg1: bytes)
-        }
-        let set = Set(characters.unicodeScalars)
-        return try trimScalars(left: left, right: right) { set.contains($0) }
+        try unicodeTrimRows(.rtrim, set: Set(characters.unicodeScalars))
     }
 
     /// Arrow `utf8_trim_whitespace`: strips leading and trailing **Unicode** whitespace (see
-    /// ``UnicodeClass/isSpace(_:)``). GPU when the column is all ASCII — the whitespace set restricted
-    /// to ASCII is a ten-byte set the existing trim kernel handles — and CPU otherwise.
-    public func utf8TrimWhitespace() throws -> MetalStringArray { try whitespaceTrim(left: true, right: true) }
+    /// ``UnicodeClass/isSpace(_:)``), split **per row**: the GPU takes the rows whose bytes are all
+    /// < 0x80, where that class is the ten bytes of ``unicodeWhitespaceASCII``, and the host takes the
+    /// rest.
+    public func utf8TrimWhitespace() throws -> MetalStringArray { try unicodeTrimWhitespaceRows(.trim) }
     /// Leading-only form of ``utf8TrimWhitespace()``.
-    public func utf8LtrimWhitespace() throws -> MetalStringArray { try whitespaceTrim(left: true, right: false) }
+    public func utf8LtrimWhitespace() throws -> MetalStringArray { try unicodeTrimWhitespaceRows(.ltrim) }
     /// Trailing-only form of ``utf8TrimWhitespace()``.
-    public func utf8RtrimWhitespace() throws -> MetalStringArray { try whitespaceTrim(left: false, right: true) }
-
-    private func whitespaceTrim(left: Bool, right: Bool) throws -> MetalStringArray {
-        if try isAllASCII() {
-            return try transform(left && right ? .trimCharacters : (left ? .ltrimCharacters : .rtrimCharacters),
-                                 arg1: Self.unicodeWhitespaceASCII)
-        }
-        return try trimScalars(left: left, right: right, UnicodeClass.isSpace)
-    }
-
-    /// The CPU trim: drops code points from either end while `inSet` holds.
-    private func trimScalars(left: Bool, right: Bool,
-                             _ inSet: @escaping (Unicode.Scalar) -> Bool) throws -> MetalStringArray {
-        try mapRowsConcurrently { s in
-            var scalars = Array(s.unicodeScalars)[...]
-            if left { while let f = scalars.first, inSet(f) { scalars = scalars.dropFirst() } }
-            if right { while let l = scalars.last, inSet(l) { scalars = scalars.dropLast() } }
-            var v = String.UnicodeScalarView()
-            for u in scalars { v.append(u) }
-            return String(v)
-        }
-    }
+    public func utf8RtrimWhitespace() throws -> MetalStringArray { try unicodeTrimWhitespaceRows(.rtrim) }
 
     // MARK: - Normalisation
 
@@ -596,6 +546,9 @@ extension MetalStringArray {
         }
         let re = try Self.compileRegex(pattern, ignoreCase: ignoreCase)
         let n = length
+        let mask = try regexPrefilter(pattern, ignoreCase: ignoreCase)
+        let candidates = mask?.bitsPointer
+        defer { withExtendedLifetime(mask) {} }
         var result: [String: RegexSpan] = [:]
         for name in names {
             var starts = [Int32?](repeating: nil, count: n)
@@ -603,6 +556,7 @@ extension MetalStringArray {
             starts.withUnsafeMutableBufferPointer { sb in
                 lengths.withUnsafeMutableBufferPointer { lb in
                     forEachRowConcurrently { i, s in
+                        if let candidates, !Bitmap.isSet(candidates, i) { return }
                         guard let s, let m = re.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) else { return }
                         let r = m.range(withName: name)
                         guard r.location != NSNotFound, let rr = Range(r, in: s) else { return }

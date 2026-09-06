@@ -110,8 +110,13 @@ extension MetalStringArray {
             }
         }
         for b in [a1, a2, scratch, lens] { ctx.retainUntilFlush(b) }
-        return MetalStringArray(length: n, nullCount: nullCount, validity: validity,
-                                offsets: outOffsets, data: outData, context: ctx)
+        ctx.retainUntilFlush(self)
+        let out = MetalStringArray(length: n, nullCount: nullCount, validity: validity,
+                                   offsets: outOffsets, data: outData, context: ctx)
+        // A `binary` column stays `binary`: `binary_length`, `binary_repeat` and the byte-wise trims
+        // are defined on it, and Arrow gives them a `binary` result.
+        out.isBinary = isBinary
+        return out
     }
 
     // MARK: - Case mapping
@@ -125,28 +130,23 @@ extension MetalStringArray {
     /// Arrow `ascii_capitalize`: first byte upper-cased, the rest lower-cased (ASCII only).
     public func asciiCapitalize() throws -> MetalStringArray { try transform(.asciiCapitalize) }
 
-    /// Simple (1:1 code point) Unicode uppercase over three blocks; everything else is copied
-    /// through byte-for-byte.
+    /// Arrow `utf8_upper`: Unicode's **simple** (1:1 code point) upper-case mapping, over every script.
     ///
-    /// **Covered:** Basic Latin `a`–`z`; Latin-1 Supplement U+00E0–U+00FE except U+00F7 (÷), plus
-    /// U+00FF (ÿ) → U+0178 (Ÿ); Latin Extended-A U+0100–U+017F in its alternating pairs, including
-    /// U+0131 (ı) → `I` and U+017F (ſ) → `S`, which shorten the string from two bytes to one.
+    /// Split per row (`Kernels/StringUnicode.swift`): a row whose code points are all at or below
+    /// U+017F — Basic Latin, the Latin-1 Supplement and Latin Extended-A, `"ß"` → `"ẞ"` and `"µ"` →
+    /// `"Μ"` included — is mapped by the GPU table; any row above that block is mapped on the host
+    /// with Swift's Unicode tables, sharded over 4096-row chunks. Both paths agree with pyarrow.
     ///
-    /// **Not covered** (input passes through unchanged): U+00DF (ß), whose full uppercase is the
-    /// two-character `SS`; U+0149 (ŉ), whose full uppercase is `ʼN`; U+00B5 (µ), whose simple
-    /// uppercase U+039C lies outside the covered blocks; U+0138 (ĸ), which has no uppercase; and
-    /// every code point above U+017F — Greek, Cyrillic, CJK, emoji and the rest.
-    public func utf8Upper() throws -> MetalStringArray { try transform(.utf8Upper) }
+    /// Simple, not full: `"ﬁ"` and `"ŉ"` pass through, because their full upper-case mappings are two
+    /// characters long and utf8proc — which is what Arrow uses — leaves them alone too.
+    public func utf8Upper() throws -> MetalStringArray { try unicodeUpper() }
 
-    /// Simple (1:1 code point) Unicode lowercase over the same three blocks as ``utf8Upper()``.
+    /// Arrow `utf8_lower`: Unicode's simple lower-case mapping, with the same per-row GPU/host split
+    /// as ``utf8Upper()``.
     ///
-    /// **Covered:** `A`–`Z`; U+00C0–U+00DE except U+00D7 (×); U+0178 (Ÿ) → U+00FF (ÿ); Latin
-    /// Extended-A U+0100–U+017F in its alternating pairs, including U+0130 (İ) → `i`, which
-    /// shortens the string from two bytes to one.
-    ///
-    /// **Not covered** (input passes through unchanged): everything above U+017F, and the
-    /// code points listed on ``utf8Upper()`` that need multi-character expansions.
-    public func utf8Lower() throws -> MetalStringArray { try transform(.utf8Lower) }
+    /// `"İ"` lower-cases to `"i"` alone, and `"Σ"` to `"σ"` in every position — the contextual
+    /// final-sigma rule is not part of the simple mapping and Arrow does not apply it either.
+    public func utf8Lower() throws -> MetalStringArray { try unicodeLower() }
 
     // MARK: - Trimming
 
@@ -199,12 +199,19 @@ extension MetalStringArray {
         return try transform(.repeatCopies, p1: n)
     }
 
-    /// Arrow `utf8_slice_codeunits` with `step == 1`: the substring from code point `start` up to
-    /// (not including) code point `stop`. Negative indices count from the end of the string, both
-    /// ends are clamped into range, and `stop <= start` gives an empty string. Slicing always
-    /// lands on UTF-8 code point boundaries, so multi-byte characters are never split.
-    public func sliceCodeunits(start: Int, stop: Int = Int.max) throws -> MetalStringArray {
-        try transform(.sliceCodeunits, p1: start, p2: stop)
+    /// Arrow `utf8_slice_codeunits`: the substring `value[start:stop:step]`, counted in **code
+    /// points**, with Python's slice rules.
+    ///
+    /// Negative indices count from the end of the string, both ends clamp into range, and a negative
+    /// `step` walks backwards (so `step: -1` reverses). `stop == nil` means "to the end" going
+    /// forwards and "to the beginning" going backwards. Slicing always lands on UTF-8 code point
+    /// boundaries, so a multi-byte character is never split. Always GPU; `step == 1` takes the
+    /// dedicated kernel in `StringTransformSource`, any other step the one in `StringBytesSource`.
+    public func sliceCodeunits(start: Int, stop: Int? = nil, step: Int = 1) throws -> MetalStringArray {
+        guard step != 0 else { throw ArrowMetalError.invalidArrowArray("utf8_slice_codeunits step cannot be zero") }
+        let end = Self.sliceStop(stop, step: step)
+        if step == 1 { return try transform(.sliceCodeunits, p1: start, p2: end) }
+        return try byteTransform(.sliceCodepoints, p1: start, p2: end, p3: step)
     }
 
     /// Arrow `utf8_lpad`: left-pads with `pad` until the string is `width` code points wide.

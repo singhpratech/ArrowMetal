@@ -30,11 +30,20 @@ import Metal
 ///   named groups `(?<name>…)`).
 /// * `replaceSubstringRegex` takes an **ICU template**: capture groups are `$1`, `$2`, …, and a
 ///   literal `$` is written `\$`. RE2 (and therefore pyarrow) spells them `\1`, `\2`.
-/// * `extractRegex` returns a dictionary of arrays rather than a struct array, because ArrowMetal has
-///   no struct-typed column. A row that does not match is null in every group; a group that took part
-///   in no alternative is the empty string.
-/// * `splitPattern` / `splitWhitespace` return the `(offsets, values)` pair of an Arrow `list<utf8>`
-///   rather than a list array, for the same reason.
+/// * `extractRegex` returns a dictionary of arrays, which is the convenient thing to hold in Swift;
+///   `extractRegexStruct` (`Kernels/StringStructs.swift`) returns Arrow's own struct column. A row that
+///   does not match is null in every group; a group that took part in no alternative is the empty string.
+///
+/// ## The GPU literal pre-filter
+///
+/// Every host path here first asks `Kernels/StringLike.swift` for a literal run that every match must
+/// contain. When there is one and it is selective enough, the byte-wise `contains` kernel marks the
+/// candidate rows and only those reach ICU; the rest take the answer a non-match implies. The result is
+/// identical either way — see `requiredLiteral(_:)` for exactly what the analysis will and will not
+/// claim.
+///
+/// Splitting has moved to `Kernels/StringSplit.swift`, which returns a real `list<utf8>`; only
+/// `splitPatternRegex` still runs here.
 extension MetalStringArray {
 
     // MARK: - Pattern analysis
@@ -94,33 +103,47 @@ extension MetalStringArray {
     }
 
     /// A boolean result: one bit per row, validity shared with the input.
-    private func booleanResult(_ predicate: @escaping (String) -> Bool) throws -> MetalBooleanArray {
+    ///
+    /// `candidates`, when given, is the packed bitmap from ``regexPrefilter(_:ignoreCase:)``: a row
+    /// whose bit is clear cannot match, so the engine is never asked about it and the bit stays false.
+    private func booleanResult(candidates: UnsafePointer<UInt8>? = nil,
+                               _ predicate: @escaping (String) -> Bool) throws -> MetalBooleanArray {
         let n = length
         let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(Bitmap.byteCount(bits: n), 1),
                                                 zeroed: true, context: context)
         let bits = out.mutableTyped(UInt8.self)
         forEachRowConcurrently { i, s in
+            if let candidates, !Bitmap.isSet(candidates, i) { return }
             guard let s, predicate(s) else { return }
             Bitmap.set(bits, i)
         }
         return MetalBooleanArray(length: n, nullCount: nullCount, validity: validity, values: out, context: context)
     }
 
-    /// An int32 result, validity shared with the input.
-    private func int32Result(_ value: @escaping (String) -> Int32) throws -> MetalArray<Int32> {
+    /// An int32 result, validity shared with the input. A row the pre-filter clears takes `absent`.
+    private func int32Result(candidates: UnsafePointer<UInt8>? = nil, absent: Int32 = 0,
+                             _ value: @escaping (String) -> Int32) throws -> MetalArray<Int32> {
         let n = length
         let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(n * 4, 4), zeroed: true, context: context)
         let p = out.mutableTyped(Int32.self)
-        forEachRowConcurrently { i, s in p[i] = s.map(value) ?? 0 }
+        forEachRowConcurrently { i, s in
+            if let candidates, !Bitmap.isSet(candidates, i) { p[i] = s == nil ? 0 : absent; return }
+            p[i] = s.map(value) ?? 0
+        }
         return MetalArray<Int32>(length: n, nullCount: nullCount, validity: validity, values: out, context: context)
     }
 
-    /// A `utf8` result built from one new string per row (nil keeps the row null).
-    private func stringResult(_ value: @escaping (String) -> String) throws -> MetalStringArray {
+    /// A `utf8` result built from one new string per row (nil keeps the row null). A row the
+    /// pre-filter clears has no match to rewrite, so it comes back unchanged.
+    private func stringResult(candidates: UnsafePointer<UInt8>? = nil,
+                              _ value: @escaping (String) -> String) throws -> MetalStringArray {
         let n = length
         var rows = [String?](repeating: nil, count: n)
         rows.withUnsafeMutableBufferPointer { buf in
-            forEachRowConcurrently { i, s in buf[i] = s.map(value) }
+            forEachRowConcurrently { i, s in
+                if let candidates, !Bitmap.isSet(candidates, i) { buf[i] = s; return }
+                buf[i] = s.map(value)
+            }
         }
         return try MetalStringArray(rows, context: context)
     }
@@ -141,7 +164,12 @@ extension MetalStringArray {
             return try matches(pred, literal)
         }
         let re = try Self.compileRegex(pattern, ignoreCase: ignoreCase)
-        return try booleanResult { re.firstMatch(in: $0, range: Self.fullRange($0)) != nil }
+        let mask = try regexPrefilter(pattern, ignoreCase: ignoreCase)
+        return try withExtendedLifetime(mask) {
+            try booleanResult(candidates: mask?.bitsPointer) {
+                re.firstMatch(in: $0, range: Self.fullRange($0)) != nil
+            }
+        }
     }
 
     /// Arrow `count_substring_regex`: the number of non-overlapping matches per value.
@@ -149,7 +177,12 @@ extension MetalStringArray {
     public func countSubstringRegex(_ pattern: String, ignoreCase: Bool = false) throws -> MetalArray<Int32> {
         if !ignoreCase, Self.isRegexLiteral(pattern) { return try countSubstring(pattern) }
         let re = try Self.compileRegex(pattern, ignoreCase: ignoreCase)
-        return try int32Result { Int32(re.numberOfMatches(in: $0, range: Self.fullRange($0))) }
+        let mask = try regexPrefilter(pattern, ignoreCase: ignoreCase)
+        return try withExtendedLifetime(mask) {
+            try int32Result(candidates: mask?.bitsPointer, absent: 0) {
+                Int32(re.numberOfMatches(in: $0, range: Self.fullRange($0)))
+            }
+        }
     }
 
     /// Arrow `find_substring_regex`: the **byte** offset of the first match, or -1 when there is none.
@@ -157,10 +190,13 @@ extension MetalStringArray {
     public func findSubstringRegex(_ pattern: String, ignoreCase: Bool = false) throws -> MetalArray<Int32> {
         if !ignoreCase, Self.isRegexLiteral(pattern) { return try findSubstring(pattern) }
         let re = try Self.compileRegex(pattern, ignoreCase: ignoreCase)
-        return try int32Result { s in
-            guard let m = re.firstMatch(in: s, range: Self.fullRange(s)),
-                  let r = Range(m.range, in: s) else { return -1 }
-            return Self.byteOffset(of: r.lowerBound, in: s)
+        let mask = try regexPrefilter(pattern, ignoreCase: ignoreCase)
+        return try withExtendedLifetime(mask) {
+            try int32Result(candidates: mask?.bitsPointer, absent: -1) { s in
+                guard let m = re.firstMatch(in: s, range: Self.fullRange(s)),
+                      let r = Range(m.range, in: s) else { return -1 }
+                return Self.byteOffset(of: r.lowerBound, in: s)
+            }
         }
     }
 
@@ -178,7 +214,9 @@ extension MetalStringArray {
         }
         let re = try Self.compileRegex(pattern, ignoreCase: ignoreCase)
         let limit = maxReplacements
-        return try stringResult { s in
+        let mask = try regexPrefilter(pattern, ignoreCase: ignoreCase)
+        return try withExtendedLifetime(mask) {
+        try stringResult(candidates: mask?.bitsPointer) { s in
             var out = ""
             out.reserveCapacity(s.count)
             var last = s.startIndex
@@ -194,6 +232,7 @@ extension MetalStringArray {
             out += s[last...]
             return out
         }
+        }
     }
 
     /// Arrow `extract_regex`, as one `utf8` array per **named** capture group.
@@ -208,11 +247,15 @@ extension MetalStringArray {
         }
         let re = try Self.compileRegex(pattern, ignoreCase: ignoreCase)
         let n = length
+        let mask = try regexPrefilter(pattern, ignoreCase: ignoreCase)
+        let candidates = mask?.bitsPointer
+        defer { withExtendedLifetime(mask) {} }
         var columns = [[String?]](repeating: [String?](repeating: nil, count: n), count: names.count)
         for k in columns.indices {
             columns[k].withUnsafeMutableBufferPointer { buf in
                 let name = names[k]
                 forEachRowConcurrently { i, s in
+                    if let candidates, !Bitmap.isSet(candidates, i) { return }
                     guard let s, let m = re.firstMatch(in: s, range: Self.fullRange(s)) else { return }
                     let r = m.range(withName: name)
                     guard r.location != NSNotFound, let rr = Range(r, in: s) else { buf[i] = ""; return }
@@ -323,11 +366,17 @@ extension MetalStringArray {
     /// Arrow `match_like`: SQL `LIKE`, where `%` matches any run of characters and `_` exactly one.
     /// A backslash escapes `%`, `_` and itself. Nulls propagate.
     ///
-    /// A pure prefix / suffix / contains / equality pattern runs on the GPU; anything else is
-    /// translated to a `\A…\z` anchored regex and matched on the CPU.
+    /// Every case-sensitive pattern runs on the **GPU**. A pure prefix / suffix / contains / equality
+    /// pattern takes the byte-wise `startsWith` / `endsWith` / `contains` / `equals` kernel; anything
+    /// else — a `_` anywhere, an interior `%`, any mixture — is compiled into the byte program in
+    /// `Kernels/StringLike.swift` and matched by `lk_like`, where `_` and `%` count **code points**.
+    /// Only `ignoreCase: true` still goes to ICU, as a `\A…\z` anchored regex on the host.
     public func matchLike(_ pattern: String, ignoreCase: Bool = false) throws -> MetalBooleanArray {
         let tokens = Self.parseLike(pattern)
-        if !ignoreCase, let (pred, literal) = Self.likePredicate(tokens) { return try matches(pred, literal) }
+        if !ignoreCase {
+            if let (pred, literal) = Self.likePredicate(tokens) { return try matches(pred, literal) }
+            return try likeMatch(program: Self.likeProgram(tokens))
+        }
         let re = try Self.compileRegex(Self.likeRegex(tokens), ignoreCase: ignoreCase, dotMatchesNewlines: true)
         return try booleanResult { re.firstMatch(in: $0, range: Self.fullRange($0)) != nil }
     }
@@ -357,22 +406,40 @@ extension MetalStringArray {
         return (offsetsArray, try MetalStringArray(flat, context: context))
     }
 
-    /// Arrow `split_pattern`: splits each value on the literal `pattern`.
-    /// `maxSplits < 0` means every occurrence; `reverse` counts them from the end of the value.
-    /// An empty pattern is rejected, as it is in Arrow. Always CPU.
-    public func splitPattern(_ pattern: String, maxSplits: Int = -1, reverse: Bool = false) throws -> SplitResult {
+    /// Arrow `split_pattern`: splits each value on the literal `pattern`, as a `list<utf8>`.
+    ///
+    /// Every occurrence makes a boundary, so a value that begins or ends with the pattern gains an
+    /// empty end piece and a value with no occurrence comes back as one piece. `maxSplits < 0` means
+    /// every occurrence; otherwise the first `maxSplits` are used, or the last `maxSplits` when
+    /// `reverse` is set. An empty pattern is rejected, as it is in Arrow. Always **GPU**
+    /// (`Kernels/StringSplit.swift`).
+    public func splitPattern(_ pattern: String, maxSplits: Int = -1,
+                             reverse: Bool = false) throws -> MetalListArray {
         guard !pattern.isEmpty else {
             throw ArrowMetalError.invalidArrowArray("splitPattern needs a non-empty pattern")
         }
-        return try splitResult { s in Self.split(s, on: pattern, maxSplits: maxSplits, reverse: reverse) }
+        return try splitOnGPU(.literal, pattern: Array(pattern.utf8), maxSplits: maxSplits, reverse: reverse)
     }
 
-    /// Arrow `split_pattern_regex`: splits each value on the matches of `pattern`. Always CPU.
-    public func splitPatternRegex(_ pattern: String, maxSplits: Int = -1,
-                                  ignoreCase: Bool = false) throws -> SplitResult {
+    /// ``splitPattern(_:maxSplits:reverse:)`` as the flat `(offsets, values)` pair.
+    public func splitPatternPair(_ pattern: String, maxSplits: Int = -1,
+                                 reverse: Bool = false) throws -> SplitResult {
+        try splitPattern(pattern, maxSplits: maxSplits, reverse: reverse).stringPair()
+    }
+
+    /// Arrow `split_pattern_regex`: splits each value on the matches of `pattern`, as a `list<utf8>`.
+    ///
+    /// Always CPU — the regex engine is a host backtracker. `reverse` is refused, exactly as Arrow
+    /// refuses it ("Cannot split in reverse with regex"). An empty match is skipped rather than
+    /// producing an empty piece, so a pattern that can match nothing terminates instead of looping.
+    public func splitPatternRegex(_ pattern: String, maxSplits: Int = -1, reverse: Bool = false,
+                                  ignoreCase: Bool = false) throws -> MetalListArray {
+        guard !reverse else {
+            throw ArrowMetalError.invalidArrowArray("cannot split in reverse with regex")
+        }
         let re = try Self.compileRegex(pattern, ignoreCase: ignoreCase)
         let limit = maxSplits
-        return try splitResult { s in
+        return try listFromPair(try splitResult { s in
             var out: [String] = []
             var last = s.startIndex
             var done = 0
@@ -385,14 +452,43 @@ extension MetalStringArray {
             }
             out.append(String(s[last...]))
             return out
-        }
+        })
     }
 
-    /// Arrow `ascii_split_whitespace`: splits on runs of ASCII whitespace
-    /// (space, `\t`, `\n`, `\v`, `\f`, `\r`), dropping the empty pieces at both ends — the behaviour
-    /// of Python's `str.split()` with no argument. `maxSplits < 0` means every run. Always CPU.
-    public func splitWhitespace(maxSplits: Int = -1, reverse: Bool = false) throws -> SplitResult {
-        try splitResult { s in Self.splitWhitespace(s, maxSplits: maxSplits, reverse: reverse) }
+    /// ``splitPatternRegex(_:maxSplits:reverse:ignoreCase:)`` as the flat `(offsets, values)` pair.
+    public func splitPatternRegexPair(_ pattern: String, maxSplits: Int = -1, reverse: Bool = false,
+                                      ignoreCase: Bool = false) throws -> SplitResult {
+        try splitPatternRegex(pattern, maxSplits: maxSplits, reverse: reverse,
+                              ignoreCase: ignoreCase).stringPair()
+    }
+
+    /// Arrow `ascii_split_whitespace` (`unicode == false`) and `utf8_split_whitespace`
+    /// (`unicode == true`), as a `list<utf8>`.
+    ///
+    /// A separator is a **maximal run** of whitespace, so leading and trailing whitespace each
+    /// produce one empty piece and the empty string splits to one empty piece — Arrow's behaviour,
+    /// and Python's `str.split(sep)` rather than its no-argument form. The ASCII class is the space
+    /// and `\t`–`\r`; the Unicode class is ``UnicodeClass/isSpace(_:)``, which adds `Zs`/`Zl`/`Zp`,
+    /// U+001C–U+001F and U+0085 and deliberately excludes U+200B.
+    ///
+    /// Both forms are **GPU**: the Unicode whitespace class is eighteen code points plus three
+    /// control ranges, small enough to spell out in MSL, so the kernel decodes UTF-8 as it walks
+    /// rather than handing the row to the host.
+    ///
+    /// **Difference from pyarrow (25.0.1):** with `unicode: true`, `reverse: true` and a finite
+    /// `maxSplits`, pyarrow fails to merge a multi-byte whitespace character with the whitespace
+    /// beside it — `"\\u0020\\u3000x"` split once in reverse gives it `[" ", "x"]` where the maximal
+    /// run gives `["", "x"]`. This keeps the runs maximal in both directions.
+    public func splitWhitespace(unicode: Bool = false, maxSplits: Int = -1,
+                                reverse: Bool = false) throws -> MetalListArray {
+        try splitOnGPU(unicode ? .unicodeWhitespace : .whitespace, pattern: [],
+                       maxSplits: maxSplits, reverse: reverse)
+    }
+
+    /// ``splitWhitespace(unicode:maxSplits:reverse:)`` as the flat `(offsets, values)` pair.
+    public func splitWhitespacePair(unicode: Bool = false, maxSplits: Int = -1,
+                                    reverse: Bool = false) throws -> SplitResult {
+        try splitWhitespace(unicode: unicode, maxSplits: maxSplits, reverse: reverse).stringPair()
     }
 
     // MARK: - CPU split helpers (also the test oracle)
@@ -418,29 +514,37 @@ extension MetalStringArray {
         return out
     }
 
-    static func splitWhitespace(_ s: String, maxSplits: Int, reverse: Bool) -> [String] {
-        let b = Array(s.utf8)
-        func isSpace(_ c: UInt8) -> Bool { c == 0x20 || (c >= 0x09 && c <= 0x0D) }
-        func text(_ r: Range<Int>) -> String { String(decoding: b[r], as: UTF8.self) }
-        var tokens: [Range<Int>] = []                       // maximal non-whitespace runs
+    /// The whitespace split of one value: cut at every maximal whitespace run, keeping the empty
+    /// pieces a leading or trailing run produces. Also the oracle the tests hold the kernel to.
+    static func splitWhitespace(_ s: String, unicode: Bool, maxSplits: Int, reverse: Bool) -> [String] {
+        let scalars = Array(s.unicodeScalars)
+        func isWS(_ u: Unicode.Scalar) -> Bool {
+            unicode ? UnicodeClass.isSpace(u) : (u.value == 0x20 || (0x09...0x0D).contains(u.value))
+        }
+        func text(_ r: Range<Int>) -> String {
+            var v = String.UnicodeScalarView()
+            for k in r { v.append(scalars[k]) }
+            return String(v)
+        }
+        var runs: [Range<Int>] = []                          // maximal whitespace runs
         var i = 0
-        while i < b.count {
-            while i < b.count && isSpace(b[i]) { i += 1 }
-            if i >= b.count { break }
-            let start = i
-            while i < b.count && !isSpace(b[i]) { i += 1 }
-            tokens.append(start..<i)
+        while i < scalars.count {
+            if isWS(scalars[i]) {
+                let start = i
+                while i < scalars.count && isWS(scalars[i]) { i += 1 }
+                runs.append(start..<i)
+            } else { i += 1 }
         }
-        if maxSplits < 0 || tokens.count <= maxSplits { return tokens.map(text) }
-        // Past the split budget the remainder is one piece, keeping the whitespace inside it.
-        if !reverse {
-            var out = tokens.prefix(maxSplits).map(text)
-            out.append(text(tokens[maxSplits].lowerBound..<b.count))
-            return out
+        if maxSplits >= 0 && runs.count > maxSplits {
+            runs = reverse ? Array(runs.suffix(maxSplits)) : Array(runs.prefix(maxSplits))
         }
-        let firstKept = tokens.count - maxSplits
-        var out = [text(0..<tokens[firstKept - 1].upperBound)]
-        out.append(contentsOf: tokens[firstKept...].map(text))
+        var out: [String] = []
+        var last = 0
+        for r in runs {
+            out.append(text(last..<r.lowerBound))
+            last = r.upperBound
+        }
+        out.append(text(last..<scalars.count))
         return out
     }
 }

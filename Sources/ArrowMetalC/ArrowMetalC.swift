@@ -397,9 +397,13 @@ private func countErased<K: ArrowIndex>(_ gb: GroupBy<K>, _ v: AnyMetalArray) th
 
 // MARK: - Strings
 
+/// A `utf8` **or** `binary` array: the two share a layout, and every Arrow name that reaches here is
+/// a byte operation (`binary_length`, the predicates, the hash) that Arrow defines on both.
 private func string(_ a: AnyMetalArray) throws -> MetalStringArray {
-    guard case .string(let s) = a else { throw ArrowMetalError.unsupportedType("expected a utf8 array") }
-    return s
+    switch a {
+    case .string(let s), .binary(let s): return s
+    default: throw ArrowMetalError.unsupportedType("expected a utf8 or binary array, got \(a.arrowFormat)")
+    }
 }
 /// kind: 0 byte length, 1 char length, 2 hash32
 @_cdecl("am_str_unary")

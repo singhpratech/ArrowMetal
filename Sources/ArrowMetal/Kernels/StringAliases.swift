@@ -72,18 +72,13 @@ extension MetalStringArray {
     }
 
     /// Arrow `utf8_swapcase`: upper-case characters become lower case and vice versa, one code point
-    /// at a time.
+    /// at a time, over every script.
     ///
-    /// **Covered** — the same blocks the `utf8_upper` / `utf8_lower` tables cover: Basic Latin;
-    /// Latin-1 Supplement U+00C0–U+00DE and U+00E0–U+00FE (except the two multiplication/division
-    /// signs), plus U+00FF ↔ U+0178; Latin Extended-A U+0100–U+017F in its alternating pairs,
-    /// including U+0131 (ı) → `I`, U+0130 (İ) → `i` and U+017F (ſ) → `S`.
-    ///
-    /// **Not covered** (the code point passes through unchanged, where Arrow would change it):
-    /// U+00DF (ß), which Arrow swaps to U+1E9E (ẞ); U+00B5 (µ); U+0149 (ŉ); and every code point
-    /// above U+017F — Greek, Cyrillic, Armenian, Deseret and the rest. Nothing is ever mangled: an
-    /// uncovered character is copied byte for byte, so the output is always valid UTF-8.
-    public func utf8Swapcase() throws -> MetalStringArray { try extraTransform(.utf8Swapcase) }
+    /// Split per row (`Kernels/StringUnicode.swift`): a row whose code points are all at or below
+    /// U+017F is swapped by the GPU table — `"ß"` → `"ẞ"` and `"µ"` → `"Μ"` included — and any row
+    /// above that block on the host. A **titlecase** letter is both upper and lower case for Arrow and
+    /// so stays put: `"ǅ"` swaps to `"ǅ"`, while `"Ǆ"` swaps to `"ǆ"`.
+    public func utf8Swapcase() throws -> MetalStringArray { try unicodeSwapcase() }
 
     /// Arrow `utf8_zero_fill`: left-pads each string to `width` **code points** with `padding`,
     /// inserting the padding *after* a leading `+` or `-` so a signed number keeps its sign in front.
