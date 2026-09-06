@@ -163,9 +163,9 @@ def main():
     write(intn, "deltanulls__plain_none", compression="none", use_dictionary=False, data_page_size=8192)
 
     # Several row groups (each with its own dictionary page).
-    write(flat, "groups__dict_snappy", compression="snappy", use_dictionary=True, row_group_size=700,
+    write(flat, "groups__dict_snappy", compression="snappy", use_dictionary=True, row_group_size=180,
           data_page_size=4096)
-    write(flat, "groups__plain_none", compression="none", use_dictionary=False, row_group_size=700,
+    write(flat, "groups__plain_none", compression="none", use_dictionary=False, row_group_size=180,
           data_page_size=4096)
 
     # Long strings and empty values.

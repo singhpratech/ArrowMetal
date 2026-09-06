@@ -251,9 +251,9 @@ final class ParquetTests: XCTestCase {
         XCTAssertEqual(b["s"]?.arrowFormat, "u")
         XCTAssertEqual(b["blob"]?.arrowFormat, "z")
         XCTAssertEqual(b["fx"]?.arrowFormat, "w:4")
-        XCTAssertEqual(b["ts_us"]?.arrowFormat, "tsu:UTC")
-        XCTAssertEqual(b["ts_ms"]?.arrowFormat, "tsm:UTC")
-        XCTAssertEqual(b["ts_ns"]?.arrowFormat, "tsn:UTC")
+        XCTAssertEqual(b["ts_us"]?.arrowFormat, "tsu:")     // pyarrow writes tz-naive timestamps
+        XCTAssertEqual(b["ts_ms"]?.arrowFormat, "tsm:")
+        XCTAssertEqual(b["ts_ns"]?.arrowFormat, "tsn:")
         XCTAssertEqual(b["date"]?.arrowFormat, "tdD")
         XCTAssertEqual(b["time_ms"]?.arrowFormat, "ttm")
         XCTAssertEqual(b["time_us"]?.arrowFormat, "ttu")

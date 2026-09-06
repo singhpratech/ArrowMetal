@@ -119,8 +119,10 @@ struct ParquetValueDecoder {
         // delta byte-array encodings, a dense staging buffer built here.
         let valOffset = try MetalArrowBuffer.allocate(byteCount: Swift.max(totalNonNull * 4, 4), zeroed: true, context: ctx)
         let valLength = try MetalArrowBuffer.allocate(byteCount: Swift.max(totalNonNull * 4, 4), zeroed: true, context: ctx)
-        // Groups whose bytes live somewhere other than the page buffer are gathered separately.
-        var staged: [(indices: [Int], source: MTLBuffer, offset: Int)] = []
+        // Groups whose bytes live somewhere other than the page buffer are gathered separately. The
+        // staging buffer is held here, not just its MTLBuffer: dropping the wrapper would return the
+        // allocation to the pool while the gather still points into it.
+        var staged: [(indices: [Int], source: MetalArrowBuffer)] = []
 
         for (enc, idx) in g {
             let sub = try subset(idx)
@@ -138,7 +140,7 @@ struct ParquetValueDecoder {
                 try deltaLengthByteArray(idx, sub, valOffset: valOffset, valLength: valLength)
             case .deltaByteArray:
                 let buf = try deltaByteArray(idx, sub, valOffset: valOffset, valLength: valLength)
-                staged.append((idx, buf.mtl, buf.offset))
+                staged.append((idx, buf))
             default:
                 throw ParquetError.unsupported("\(enc.name) on BYTE_ARRAY")
             }
@@ -161,10 +163,11 @@ struct ParquetValueDecoder {
                                offsets: offsets, out: data)
         }
         for s in staged {
-            try runGatherBytes(source: s.source, sourceOffset: s.offset, pages: try subset(s.indices),
+            try runGatherBytes(source: s.source.mtl, sourceOffset: s.source.offset, pages: try subset(s.indices),
                                count: s.indices.count, valOffset: valOffset, valLength: valLength,
                                offsets: offsets, out: data)
         }
+        withExtendedLifetime(staged) {}
         return .bytes(offsets: offsets, data: data)
     }
 
