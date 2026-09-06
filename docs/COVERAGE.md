@@ -18,20 +18,20 @@ them so a claim can be checked in one jump.
 | Element-wise arithmetic | 3 | 0 | 1 | 1 | 0 | 11 | 16 |
 | Bit-wise and shifts | 0 | 0 | 0 | 0 | 0 | 6 | 6 |
 | Comparisons | 6 | 0 | 0 | 0 | 0 | 2 | 8 |
-| Logical | 3 | 0 | 0 | 0 | 0 | 3 | 6 |
+| Logical | 4 | 0 | 0 | 0 | 0 | 3 | 7 |
 | String predicates | 0 | 0 | 0 | 0 | 0 | 3 | 3 |
 | String transforms | 2 | 0 | 0 | 2 | 0 | 10 | 14 |
 | String containment and matching | 5 | 0 | 0 | 2 | 0 | 3 | 10 |
 | Temporal | 0 | 0 | 0 | 0 | 1 | 5 | 6 |
 | Conversions and casts | 0 | 1 | 2 | 0 | 1 | 2 | 6 |
-| Selections | 3 | 0 | 1 | 0 | 0 | 1 | 5 |
-| Containment / set lookup | 0 | 0 | 0 | 0 | 0 | 3 | 3 |
+| Selections | 4 | 0 | 1 | 0 | 0 | 0 | 5 |
+| Containment / set lookup | 2 | 0 | 0 | 0 | 0 | 1 | 3 |
 | Sorts and partitions | 2 | 1 | 2 | 0 | 0 | 2 | 7 |
-| Structural and conditional | 0 | 0 | 2 | 0 | 0 | 11 | 13 |
+| Structural and conditional | 4 | 0 | 2 | 0 | 0 | 7 | 13 |
 | Associative transforms | 0 | 1 | 0 | 1 | 3 | 0 | 5 |
 | Pairwise and cumulative | 0 | 0 | 0 | 0 | 0 | 5 | 5 |
 | Hashing | 1 | 0 | 0 | 0 | 0 | 1 | 2 |
-| **Total (compute functions)** | **29** | **7** | **15** | **7** | **6** | **87** | **151** |
+| **Total (compute functions)** | **37** | **7** | **15** | **7** | **6** | **80** | **152** |
 | Arrow types (matrix below) | 5 | 0 | 3 | 1 | 6 | 11 | 26 |
 
 Interop uses a separate vocabulary and is counted apart: 6 shipped, 1 partial, 3 planned, 1 in progress
@@ -40,8 +40,9 @@ Interop uses a separate vocabulary and is counted apart: 6 shipped, 1 partial, 3
 **The scope ArrowMetal 0.1.0 claims 100% of:** flat analytics on primitive, boolean and string columns —
 `sum`/`min`/`max`/`mean`, the six comparisons, wrapping `add`/`subtract`/`multiply`/`divide`, boolean
 `and`/`or`/`not`, `filter`/`take`/`slice`, numeric `cast`, single-key `sort`/`argsort`/top-k, group-by
-`count`/`sum`/`mean`/`min`/`max` over dense integer keys, `utf8` length/`equals`/`starts_with`/`ends_with`/
-`contains`/murmur3 hash, and Arrow C Data, C Device and C Stream interop for all of them — over `int8/16/32/64`,
+`count`/`sum`/`mean`/`min`/`max` over dense integer keys, `is_null`/`is_valid`/`fill_null`/`drop_null`/
+`if_else`/`coalesce`/`is_in`/`index_in`/`and_kleene`/`or_kleene`, `utf8` length/`equals`/`starts_with`/
+`ends_with`/`contains`/murmur3 hash, and Arrow C Data, C Device and C Stream interop for all of them — over `int8/16/32/64`,
 `uint8/16/32/64`, `float32`, `float64`, `bool` and `utf8`, null-aware with Arrow semantics and checked
 against a CPU oracle in the test suite.
 
@@ -49,9 +50,8 @@ against a CPU oracle in the test suite.
 and Unicode-table string work (case folding, normalisation, trimming, padding, splitting); window,
 cumulative and pairwise functions; temporal component extraction, temporal arithmetic, timezones and
 `strftime`/`strptime`; statistical aggregates (`stddev`, `variance`, `quantile`, `mode`, `tdigest`);
-set lookup (`is_in`, `index_in`); conditional and null-filling structural functions (`if_else`, `case_when`,
-`coalesce`, `fill_null`); checked arithmetic and overflow-erroring casts. The long form is at the bottom of
-this file.
+set lookup over strings; `case_when`, `replace_with_mask` and the forward/backward null fills; checked
+arithmetic and overflow-erroring casts. The long form is at the bottom of this file.
 
 ## Legend
 
@@ -172,7 +172,8 @@ atomics with carry because MSL has no 64-bit atomics.
 | `invert` (`not`) | **GPU** | Validity is shared zero-copy with the input. |
 | `xor` | **Not planned** | No roadmap item; one line of MSL away from the existing bitmap kernels. |
 | `and_not` | **Not planned** | No roadmap item. |
-| `and_kleene` / `or_kleene` / `and_not_kleene` | **Not planned** | No roadmap item. The three-valued variants need the validity bitmap in the value computation, not just AND-ed alongside. |
+| `and_kleene` / `or_kleene` | **GPU** | `Kernels/Structural.swift`, one thread per 32-bit word: the value words are `a & b` / `a | b` and the validity word is computed from both operands' validity, so `false AND null` is `false` and `true OR null` is `true`. With no nulls on either side the call falls through to the plain `and` / `or` kernel. `andKleene` / `orKleene` in Swift, `am_and_kleene` / `am_or_kleene` in C, `and_kleene` / `or_kleene` in Python. |
+| `and_not_kleene` | **Not planned** | No roadmap item; expressible as `a.andKleene(b.not())` only when `b` has no nulls, so it needs its own kernel. |
 
 ## String predicates
 
@@ -248,15 +249,15 @@ offsets, data bytes. Everything below is byte-wise and case-sensitive.
 | `filter` / `array_filter` | **GPU** | `Kernels/Filter.swift`: per-block popcount, GPU scan, scatter, validity pack — all in one command buffer. Null mask entries drop the element (Arrow's `null_selection_behavior = "drop"`); the `"emit_null"` option is not implemented. Works for primitives, booleans and `utf8`. |
 | `filter(where:)` (fused predicate + compaction) | **GPU** | ArrowMetal extension, not an Arrow function: the comparison is evaluated inside the counting pass so no boolean array is materialised. |
 | `take` / `array_take` | **GPU** | Int32/Int64/UInt32 index arrays. A null index yields a null output element; out-of-range indices set a GPU error flag that is raised after the dispatch. Strings gather through offsets + a GPU byte copy. |
-| `drop_null` | **Not planned** | No roadmap item, and it is not expressible today because `is_valid` is not exposed as a compute function. |
+| `drop_null` | **GPU** | `Kernels/Structural.swift`: `is_valid` followed by the existing `filter` compaction, so it is one command buffer with no host round trip. An array with no validity bitmap is returned unchanged. `dropNull()` in Swift (primitive and boolean), `am_drop_null` in C, `drop_null()` in Python. |
 | `slice` (array method, not a compute function) | **Partial** | Zero-copy `MTLBuffer` view when the offset is a multiple of 32 (keeps bitmap words and values aligned for the kernels); otherwise one host copy (`Sources/ArrowMetal/Slice.swift`). |
 
 ## Containment / set lookup
 
 | Arrow function | Status | Notes |
 |---|---|---|
-| `is_in` | **Not planned** | No roadmap item. The hash table from the in-progress hash join is the natural base for it. |
-| `index_in` | **Not planned** | No roadmap item. |
+| `is_in` | **GPU** | `Kernels/Structural.swift`, all ten primitive types. The value set is reduced to its sorted distinct non-null values with the existing `unique()`, and each element binary-searches it on the GPU (no hash table). Nulls in the set are ignored and a null element never matches, so the result never has nulls — Arrow's `null_matching_behavior = "skip"`. Float equality is Arrow value equality, as in `unique()`: every NaN is one value and `-0.0` equals `0.0`. `isIn(_:)` in Swift (a `[T]` or a `MetalArray<T>`), `am_is_in` in C, `is_in()` in Python. Strings are not covered. |
+| `index_in` | **GPU** | Same search, returning the int32 position in the caller's set array of each element's **first** occurrence there, and null where the element is null or absent. The unique-rank-to-first-row map is a group-by min over the set's dictionary codes, so it too runs on the GPU. `indexIn(_:)` in Swift, `am_index_in` in C, `index_in()` in Python. |
 | `indices_nonzero` | **Not planned** | No roadmap item; the filter kernel already contains the scan-and-scatter it needs. |
 
 ## Sorts and partitions
@@ -275,14 +276,14 @@ offsets, data bytes. Everything below is byte-wise and case-sensitive.
 
 | Arrow function | Status | Notes |
 |---|---|---|
-| `fill_null` | **Not planned** | No roadmap item. An internal CPU helper (`MetalArray.fillNull`, used by string gather) exists but is not public API — do not count it as coverage. |
+| `fill_null` | **GPU** | `Kernels/Structural.swift`, one thread per element, all ten primitive types plus `bool`; the result drops the validity bitmap. Float64 moves as a raw 64-bit value, so no software binary64 is involved. Spelled `fillingNull(_:)` in Swift because the internal host-side `MetalArray.fillNull` used by string gather still exists (`MetalStringArray.swift`); `am_fill_null` in C, `fill_null()` in Python. |
 | `fill_null_forward` / `fill_null_backward` | **Not planned** | No roadmap item; both are scan-shaped. |
-| `if_else` | **Not planned** | No roadmap item. Straightforward as a kernel and a common gap — a good first contribution. |
-| `case_when` | **Not planned** | No roadmap item. |
-| `coalesce` | **Not planned** | No roadmap item. |
+| `if_else` | **GPU** | `Kernels/Structural.swift`. Array/array, array/scalar, scalar/array and scalar/scalar branches, all ten primitive types plus `bool` (booleans go through the existing unpack/repack). A null condition yields a null output; otherwise the chosen branch's value and null-ness are copied through. `MetalArray.ifElse(_:_:_:)` and `cond.ifElse(_:_:)` in Swift, `am_if_else` in C, `if_else()` in Python. |
+| `case_when` | **Not planned** | No roadmap item; `if_else` covers the two-branch case. |
+| `coalesce` | **GPU** | `Kernels/Structural.swift`: a left fold of a two-input kernel, stopping early once the accumulator has no validity bitmap left. Any number of same-typed, same-length inputs. `MetalArray.coalesce(_:)` in Swift, `am_coalesce` in C, module-level `coalesce()` in Python. |
 | `choose` | **Not planned** | No roadmap item. |
 | `replace_with_mask` | **Not planned** | No roadmap item. |
-| `is_null` / `is_valid` | **Not planned** | No roadmap item. Per-element `isValid(_:)` and `nullCount` accessors exist, but neither materialises a boolean array. |
+| `is_null` / `is_valid` | **GPU** | `Kernels/Structural.swift`, bitmap word kernels over the validity bitmap: `is_null` is a word-wise NOT of it, `is_valid` shares it zero-copy, and an array with no bitmap gets a constant word fill. Primitive and boolean arrays; the result never has nulls itself. `isNull()` / `isValid()` in Swift, `am_is_null` / `am_is_valid` in C, `is_null()` / `is_valid()` in Python. |
 | `is_nan` / `is_finite` / `is_inf` | **Not planned** | No roadmap item. |
 | `make_struct` | **Partial** | `MetalRecordBatch(names:columns:)` composes equal-length columns and exports as a `+s` struct array, which is the record-batch form of this. It is not a compute function over struct-typed columns. |
 | `struct_field` | **Partial** | `batch[name]` and `selecting(_:)` project columns out of a record batch; there is no struct-typed array to extract a field from. |
@@ -380,7 +381,9 @@ outright.
 six comparisons against a scalar or another column; wrapping `add`/`subtract`/`multiply`/`divide`; boolean
 `and`/`or`/`not`; `filter` (including a fused predicate form), `take` and `slice`; numeric `cast`;
 single-key `sort`, `argsort` and top-k; group-by `count`/`sum`/`mean`/`min`/`max` over dense integer keys;
-`utf8` byte and character length, `equals`/`starts_with`/`ends_with`/`contains` and murmur3 hash; and Arrow
+`is_null`, `is_valid`, `fill_null`, `drop_null`, `if_else`, `coalesce`, `is_in`, `index_in` and the Kleene
+`and_kleene`/`or_kleene`; `utf8` byte and character length, `equals`/`starts_with`/`ends_with`/`contains`
+and murmur3 hash; and Arrow
 C Data, C Device and C Stream interop for all of it — every one of them null-aware with Arrow semantics and
 checked element-for-element against a CPU oracle in the test suite. Temporal columns join that sentence when
 the in-progress temporal types land, because they are fixed-width integers underneath and the same kernels
@@ -392,9 +395,9 @@ there is no compute over struct-typed columns); it does not do regex, Unicode ca
 trimming, padding, splitting or any other Unicode-table-driven string transform; it does not do window,
 cumulative or pairwise functions; it does not do temporal component extraction, temporal arithmetic,
 timezones or `strftime`/`strptime`; it does not do statistical aggregates (`stddev`, `variance`, `quantile`,
-`mode`, `tdigest`, `approximate_median`); it does not do set lookup (`is_in`, `index_in`); it does not do
-conditional and null-filling structural functions (`if_else`, `case_when`, `coalesce`, `fill_null`); it does
-not do checked arithmetic or overflow-erroring casts; and it is not a query planner, a SQL engine or a
+`mode`, `tdigest`, `approximate_median`); it does not do set lookup over strings, nor the structural
+functions it has no kernel for (`case_when`, `choose`, `replace_with_mask`, `fill_null_forward`/`_backward`,
+`is_nan`/`is_finite`/`is_inf`); it does not do checked arithmetic or overflow-erroring casts; and it is not a query planner, a SQL engine or a
 tensor library. Several of those are near-term roadmap items rather than refusals — the rows above say which
 is which, one function at a time.
 
