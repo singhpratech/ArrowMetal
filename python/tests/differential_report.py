@@ -85,7 +85,7 @@ def run(op_filter=None, type_filter=None, quiet=False):
         if not quiet and total % 250 == 0:
             print(f"  ... {total} cases, {time.time() - started:.0f}s", file=sys.stderr)
 
-    order_types.sort(key=lambda t: diff.ALL_TYPES.index(t))
+    order_types.sort(key=lambda t: diff.MATRIX_TYPES.index(t))
     return cells, order_ops, order_types, total, time.time() - started
 
 
@@ -95,22 +95,31 @@ def render(cells, ops, types, total, elapsed):
 
     add("ArrowMetal vs pyarrow.compute -- differential matrix")
     add(f"arrowmetal {am.__version__} on {am.device_name()} | pyarrow {pa.__version__}")
-    add(f"{len(diff.SHAPES)} datasets per (operation, type): sizes "
+    add(f"{len(diff.OPS)} operations x {len(diff.MATRIX_TYPES)} column types x "
+        f"{len(diff.SHAPES)} datasets: sizes "
         f"{', '.join(str(s) for s in diff.sizes())}; null ratios "
         f"{', '.join(f'{r:g}' for r in diff.NULL_RATIOS)}; flavors random, sliced, special")
     add("")
 
+    # The matrix is 40-odd types wide, so the table is printed in blocks of at most COLUMNS types and
+    # a block leaves out the operations that do not apply to any of its types -- otherwise every row
+    # would be mostly '-' and no line would fit on a screen.
     width = max(len(o) for o in ops) if ops else 10
     col = max(12, max((len(t) for t in types), default=8) + 2)
-    add("operation".ljust(width) + " | " + " | ".join(t.center(col) for t in types))
-    add("-" * width + "-+-" + "-+-".join("-" * col for _ in types))
-    for op_name in ops:
-        row = [op_name.ljust(width)]
-        for t in types:
-            cell = cells.get((op_name, t))
-            row.append(("-" if cell is None or cell.total == 0 else cell.mark()).center(col))
-        add(" | ".join(row))
-    add("")
+    columns = max(1, 150 // (col + 3))
+    for start in range(0, len(types), columns):
+        block = types[start:start + columns]
+        add("operation".ljust(width) + " | " + " | ".join(t.center(col) for t in block))
+        add("-" * width + "-+-" + "-+-".join("-" * col for _ in block))
+        for op_name in ops:
+            marks = [cells.get((op_name, t)) for t in block]
+            if all(c is None or c.total == 0 for c in marks):
+                continue
+            row = [op_name.ljust(width)]
+            for cell in marks:
+                row.append(("-" if cell is None or cell.total == 0 else cell.mark()).center(col))
+            add(" | ".join(row))
+        add("")
 
     passed = sum(c.passed for c in cells.values())
     failed = sum(c.failed for c in cells.values())
@@ -171,6 +180,14 @@ def render(cells, ops, types, total, elapsed):
         for reason, where in sorted(skips.items()):
             add(f"  {reason}")
             add(f"    {', '.join(sorted(where))}")
+        add("")
+
+    shown = {op_name for op_name, _ in cells}
+    no_oracle = {n: why for n, why in diff._NO_ORACLE.items() if n in shown}
+    if no_oracle:
+        add("no pyarrow oracle -- compared against a reference written in test_differential.py:")
+        for name, why in sorted(no_oracle.items()):
+            add(f"  {name}: {why}")
         add("")
 
     if diff.ABSENT:

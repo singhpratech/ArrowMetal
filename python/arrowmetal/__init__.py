@@ -2655,3 +2655,40 @@ MetalArray.hypot = _hypot
 MetalArray.round_to_multiple = _round_to_multiple
 MetalArray.round_binary = _round_binary
 MetalArray.round = _am_round
+
+# ---- decimal columns reach the rest of the numeric surface.
+#
+# `am_decimal_op` defines negate (9), abs (10), sign (11) and the sum / min / max reductions (18-20),
+# but every one of them was unreachable from Python: `unary()` and `_reduce()` route a decimal column
+# to the primitive entry points, which reject it. Dispatching on the format here is what makes
+# `x.negate()`, `x.abs()`, `x.sign()`, `x.sum()`, `x.min()` and `x.max()` work on a decimal column, as
+# the matching pyarrow.compute functions do.
+_DECIMAL_UNARY_OPS = {"negate": 9, "abs": 10, "sign": 11}
+_DECIMAL_REDUCE_OPS = {"sum": 18, "min": 19, "max": 20}
+_primitive_unary = MetalArray.unary
+_primitive_reduce = MetalArray._reduce
+
+
+def _unary_any(self, op):
+    """One unary math op by name. A decimal column takes the decimal kernels for negate, abs and sign;
+    every other op, and every other type, keeps the primitive path."""
+    if self.format.startswith("d:") and op in _DECIMAL_UNARY_OPS:
+        return self._decimal_op(_DECIMAL_UNARY_OPS[op])
+    return _primitive_unary(self, op)
+
+
+def _reduce_any(self, op):
+    """sum / min / max / mean. A decimal column reduces through `am_decimal_op`, which answers with a
+    length-1 decimal array (a 128-bit total does not fit an int64 out-parameter); the value comes back
+    as a Python `decimal.Decimal`, which is what `pc.sum(...).as_py()` returns too."""
+    name = ("sum", "min", "max", "mean")[op]
+    if self.format.startswith("d:"):
+        if name not in _DECIMAL_REDUCE_OPS:
+            raise ArrowMetalError(f"{name} is not defined for a decimal column")
+        result = self._decimal_op(_DECIMAL_REDUCE_OPS[name]).to_arrow()
+        return result[0].as_py() if len(result) else None
+    return _primitive_reduce(self, op)
+
+
+MetalArray.unary = _unary_any
+MetalArray._reduce = _reduce_any
