@@ -2453,3 +2453,204 @@ MetalArray.unique = _unique
 MetalArray.value_counts = _value_counts
 MetalArray.partition_nth_indices = _partition_nth_indices
 MetalArray.count = _count
+# ---- checked (overflow-raising) arithmetic and the remaining element-wise math
+# Op numbering is the C ABI contract; the tables are in include/arrowmetal.h.
+_lib.am_unary_checked.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_unary_checked.restype = ctypes.c_int
+_lib.am_binary_checked.argtypes = [_P, ctypes.c_int, _P, _P, ctypes.POINTER(_P)]
+_lib.am_binary_checked.restype = ctypes.c_int
+_lib.am_cumulative_checked.argtypes = [_P, ctypes.c_int, ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_cumulative_checked.restype = ctypes.c_int
+_lib.am_math_extra.argtypes = [_P, ctypes.c_int, _P, _P, ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_math_extra.restype = ctypes.c_int
+
+_UNARY_CHECKED = {"negate": 0, "abs": 1, "sqrt": 2, "ln": 3, "log10": 4, "log2": 5, "log1p": 6}
+_BINARY_CHECKED = {"add": 0, "subtract": 1, "multiply": 2, "divide": 3, "power": 4,
+                   "shift_left": 5, "shift_right": 6, "logb": 7}
+_CUMULATIVE_CHECKED = {"cumulative_sum": 0, "cumulative_prod": 1, "pairwise_diff": 2}
+_MATH_EXTRA = {"expm1": 0, "log1p": 1, "logb": 2, "hypot": 3,
+               "round": 4, "round_to_multiple": 5, "round_binary": 6}
+# Arrow's RoundMode, in Arrow's own numbering.
+_ROUND_MODES = ("down", "up", "towards_zero", "towards_infinity", "half_down", "half_up",
+                "half_towards_zero", "half_towards_infinity", "half_to_even", "half_to_odd")
+
+
+def _round_mode_code(mode):
+    """Arrow round-mode name (or index) to its number."""
+    if isinstance(mode, int):
+        if not 0 <= mode < len(_ROUND_MODES):
+            raise ArrowMetalError(f"unknown round mode {mode}")
+        return mode
+    try:
+        return _ROUND_MODES.index(mode)
+    except ValueError:
+        raise ArrowMetalError(f"unknown round mode {mode!r}; expected one of {', '.join(_ROUND_MODES)}")
+
+
+def _unary_checked(self, op):
+    """One checked unary op by name: negate, abs, sqrt, ln, log10, log2, log1p.
+
+    The values are those of the unchecked op; an element outside the valid range raises
+    ArrowMetalError naming the Arrow message and the first offending row, for example
+    "negate_checked: overflow at index 3"."""
+    return _call(_lib.am_unary_checked, self._h, _UNARY_CHECKED[op])
+
+
+def _binary_checked(self, op, other):
+    """One checked binary op by name against a MetalArray or a scalar: add, subtract, multiply,
+    divide, power, shift_left, shift_right, logb."""
+    code = _BINARY_CHECKED[op]
+    if isinstance(other, MetalArray):
+        return _call(_lib.am_binary_checked, self._h, code, other._h, None)
+    return _call(_lib.am_binary_checked, self._h, code, None, self._scalar(other))
+
+
+def _math_extra(self, op, other=None, scalar=None, p1=0):
+    """One expm1 / log1p / logb / hypot / rounding op; the table is in include/arrowmetal.h."""
+    b = other._h if isinstance(other, MetalArray) else None
+    return _call(_lib.am_math_extra, self._h, _MATH_EXTRA[op], b, scalar, p1)
+
+
+MetalArray.unary_checked = _unary_checked
+MetalArray.binary_checked = _binary_checked
+MetalArray.math_extra = _math_extra
+MetalArray._math_extra = _math_extra
+
+
+def _checked_binary_method(name, doc):
+    def f(self, other):
+        return _binary_checked(self, name, other)
+    f.__name__ = name + "_checked"
+    f.__doc__ = doc
+    return f
+
+
+def _checked_unary_method(name, doc):
+    def f(self):
+        return _unary_checked(self, name)
+    f.__name__ = name + "_checked"
+    f.__doc__ = doc
+    return f
+
+
+# On a float column the four arithmetic ops never raise: Arrow treats an overflow to infinity and a NaN
+# as ordinary results, and so does this package. Only divide-by-zero and the log/root domain errors do.
+for _name, _doc in [
+    ("add", "Arrow add_checked: add() with an ArrowMetalError where an integer element would wrap."),
+    ("subtract", "Arrow subtract_checked: subtract() with an ArrowMetalError where an integer element would wrap."),
+    ("multiply", "Arrow multiply_checked: multiply() with an ArrowMetalError where an integer element would wrap."),
+    ("divide", "Arrow divide_checked: raises 'divide by zero' for a zero divisor on any type, and "
+               "'overflow' for INT_MIN / -1."),
+    ("power", "Arrow power_checked: raises for a negative integer exponent and for any repeated-squaring "
+              "step that would wrap. Float columns never raise."),
+    ("shift_left", "Arrow shift_left_checked: raises when the shift amount is negative or at least the "
+                   "precision of the type (the bit width, less one on a signed column), so "
+                   "shift_left_checked(int64, 63) raises. Bits shifted off the top are not an error."),
+    ("shift_right", "Arrow shift_right_checked: same amount check as shift_left_checked."),
+    ("logb", "Arrow logb_checked(base): raises when the value or the base is zero or negative."),
+]:
+    setattr(MetalArray, _name + "_checked", _checked_binary_method(_name, _doc))
+del _name, _doc
+
+for _name, _doc in [
+    ("negate", "Arrow negate_checked: raises for INT_MIN on a signed column and, unlike pyarrow (which "
+               "has no unsigned kernel at all), for every non-zero value on an unsigned one."),
+    ("abs", "Arrow abs_checked: raises only for INT_MIN on a signed integer column."),
+    ("sqrt", "Arrow sqrt_checked: raises 'square root of negative number'. NaN, -0.0 and +inf do not raise."),
+    ("ln", "Arrow ln_checked: raises 'logarithm of zero' or 'logarithm of negative number'."),
+    ("log10", "Arrow log10_checked: same domain check as ln_checked."),
+    ("log2", "Arrow log2_checked: same domain check as ln_checked."),
+    ("log1p", "Arrow log1p_checked: the domain boundary is -1, so -1 raises 'logarithm of zero' and "
+              "anything below it 'logarithm of negative number'."),
+]:
+    setattr(MetalArray, _name + "_checked", _checked_unary_method(_name, _doc))
+del _name, _doc
+
+
+def _cumulative_sum_checked(self):
+    """Arrow cumulative_sum_checked: the running sum, raising where a step would wrap.
+
+    Null rows are skipped and the running value carries across them, which is this package's
+    cumulative_sum() behaviour; pyarrow's default instead makes every row after a null null."""
+    return _call(_lib.am_cumulative_checked, self._h, _CUMULATIVE_CHECKED["cumulative_sum"], 0)
+
+
+def _cumulative_prod_checked(self):
+    """Arrow cumulative_prod_checked: the running product, raising where a step would wrap."""
+    return _call(_lib.am_cumulative_checked, self._h, _CUMULATIVE_CHECKED["cumulative_prod"], 0)
+
+
+def _pairwise_diff_checked(self, period=1):
+    """Arrow pairwise_diff_checked: self[i] - self[i - period], raising where that would wrap."""
+    return _call(_lib.am_cumulative_checked, self._h, _CUMULATIVE_CHECKED["pairwise_diff"], period)
+
+
+MetalArray.cumulative_sum_checked = _cumulative_sum_checked
+MetalArray.cumulative_prod_checked = _cumulative_prod_checked
+MetalArray.pairwise_diff_checked = _pairwise_diff_checked
+
+
+def _expm1(self):
+    """Arrow expm1: exp(x) - 1, accurate for small x. Float columns only (cast an integer one first)."""
+    return _math_extra(self, "expm1")
+
+
+def _log1p(self):
+    """Arrow log1p: ln(1 + x), accurate for small x. x == -1 gives -inf and x < -1 gives NaN;
+    log1p_checked() raises on both."""
+    return _math_extra(self, "log1p")
+
+
+def _logb(self, base):
+    """Arrow logb(x, base) = ln(x) / ln(base), with a scalar base or a column of bases."""
+    if isinstance(base, MetalArray):
+        return _math_extra(self, "logb", other=base)
+    return _math_extra(self, "logb", scalar=self._scalar(base))
+
+
+def _hypot(self, other):
+    """Arrow hypot: sqrt(x^2 + y^2), scaled so that a large or tiny pair neither overflows nor
+    underflows on the way. An infinite operand gives inf even opposite a NaN, as IEEE-754 prescribes."""
+    if isinstance(other, MetalArray):
+        return _math_extra(self, "hypot", other=other)
+    return _math_extra(self, "hypot", scalar=self._scalar(other))
+
+
+def _round_to_multiple(self, multiple, mode="half_to_even"):
+    """Arrow round_to_multiple: round_int(x / multiple) * multiple. `multiple` must be positive.
+
+    `mode` is any Arrow RoundMode name: down, up, towards_zero, towards_infinity, half_down, half_up,
+    half_towards_zero, half_towards_infinity, half_to_even (the default), half_to_odd."""
+    return _math_extra(self, "round_to_multiple", scalar=self._scalar(multiple), p1=_round_mode_code(mode))
+
+
+def _round_binary(self, ndigits, mode="half_to_even"):
+    """Arrow round_binary: round() with one ndigits per row (an int32 column, or anything pyarrow can
+    turn into one). The result is null wherever either column is."""
+    if not isinstance(ndigits, MetalArray):
+        ndigits = MetalArray.from_arrow(pa.array(ndigits, pa.int32()))
+    return _math_extra(self, "round_binary", other=ndigits, p1=_round_mode_code(mode))
+
+
+# round() keeps its no-argument meaning (halves away from zero); passing ndigits or mode selects the
+# general Arrow round kernel, whose default mode is Arrow's own half_to_even.
+_am_round_halves_away = MetalArray.round
+
+
+def _am_round(self, ndigits=None, mode=None):
+    """Arrow round. With no arguments, halves go away from zero (this method's historical behaviour).
+    With `ndigits` and/or `mode` this is Arrow's round(x, ndigits, round_mode), evaluated as
+    round_int(x * 10^ndigits) / 10^ndigits and defaulting to ndigits=0, mode="half_to_even"."""
+    if ndigits is None and mode is None:
+        return _am_round_halves_away(self)
+    p1 = _round_mode_code(mode if mode is not None else "half_to_even") | (int(ndigits or 0) << 8)
+    return _math_extra(self, "round", p1=p1)
+
+
+MetalArray.expm1 = _expm1
+MetalArray.log1p = _log1p
+MetalArray.logb = _logb
+MetalArray.hypot = _hypot
+MetalArray.round_to_multiple = _round_to_multiple
+MetalArray.round_binary = _round_binary
+MetalArray.round = _am_round

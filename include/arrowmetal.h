@@ -988,6 +988,92 @@ int  am_unique(am_array* a, am_array** out);
 int  am_value_counts(am_array* a, am_array** out);
 int  am_partition_nth_indices(am_array* a, int64_t n, am_array** out);
 
+// ---------------------------------------------------------------------------------------------------
+// Checked (overflow-raising) arithmetic. Every op below computes the same values as its unchecked twin
+// -- it runs the same kernel -- and additionally reports the first element that left the valid range.
+//
+// A failing element makes the call return 1; am_last_error() then reads "<op>: <arrow message> at index
+// <row>", for example "add_checked: overflow at index 4097" or "divide_checked: divide by zero at
+// index 0". The messages are Arrow's own wording: overflow / divide by zero / square root of negative
+// number / logarithm of zero / logarithm of negative number / shift amount must be >= 0 and less than
+// precision of type / integers to negative integer powers are not allowed.
+//
+// How it works: the check is a second, read-only GPU pass that writes into a small flag buffer only from
+// an element that actually fails (one atomic_or for the kind, one atomic_min for the row), and both
+// passes are encoded into a single command buffer, so a checked op costs one GPU round trip like an
+// unchecked one. Nulls are never checked, on either side of a binary op.
+//
+// Inside am_batch_begin / am_batch_end the check joins the open command buffer and the flag is read at
+// the sync point, so the error surfaces from am_batch_end (or from the first call that forces a sync),
+// not from the call that queued it.
+//
+// Floats: Arrow's checked float kernels raise only on a domain error, never on overflow to infinity, so
+// add_checked / subtract_checked / multiply_checked / power_checked / negate_checked / abs_checked on a
+// float column never raise (and cost nothing extra), while divide_checked by zero and the domain errors
+// of sqrt / ln / log2 / log10 / log1p / logb do.
+//
+// am_unary_checked op numbering:
+//    0 negate_checked   1 abs_checked   2 sqrt_checked
+//    3 ln_checked       4 log10_checked 5 log2_checked   6 log1p_checked
+// negate_checked raises for INT_MIN on a signed column and, unlike Arrow (which ships no unsigned kernel
+// at all), for every non-zero value on an unsigned one. abs_checked raises only for INT_MIN. Ops 2-6
+// need a float32/float64 column here; Arrow promotes an integer one to float64, so cast first.
+int  am_unary_checked(am_array* a, int op, am_array** out);
+
+// am_binary_checked op numbering:
+//    0 add_checked   1 subtract_checked   2 multiply_checked   3 divide_checked
+//    4 power_checked 5 shift_left_checked 6 shift_right_checked 7 logb_checked
+// Pass exactly one of `b` (array form) or `scalar` (a pointer to one value of the array's element type).
+// divide_checked raises "divide by zero" for a zero divisor on every type and "overflow" for
+// INT_MIN / -1. power_checked raises for a negative integer exponent and for any repeated-squaring step
+// that would wrap. The shifts follow Arrow and check the *amount* only -- it must be in [0, precision),
+// where precision is the bit width for an unsigned column and one less for a signed one, so
+// shift_left_checked(int64 1, 63) raises -- while bits shifted off the top are not an error.
+int  am_binary_checked(am_array* a, int op, am_array* b /* or NULL */, const void* scalar /* or NULL */,
+                       am_array** out);
+
+// am_cumulative_checked op numbering: 0 cumulative_sum_checked, 1 cumulative_prod_checked,
+// 2 pairwise_diff_checked (p1 = period; ops 0 and 1 ignore p1).
+// The scan itself reassociates, so the check is a second pass over the finished running values -- each
+// out[i] must be out[i - 1] combined with vals[i] without wrapping, which is the sequential recurrence
+// Arrow evaluates, so the reported row is the one Arrow would stop at. Null rows are skipped and the
+// running value carries across them, exactly as in am_cumulative.
+int  am_cumulative_checked(am_array* a, int op, int64_t p1, am_array** out);
+
+// ---------------------------------------------------------------------------------------------------
+// The remaining element-wise math: expm1, log1p, logb, hypot and the rounding family (all GPU).
+//
+//  op  name               b / scalar                p1                          notes
+//  --  -----------------  ------------------------  --------------------------  ------------------------
+//   0  expm1              -                         -                           float column only
+//   1  log1p              -                         -                           float column only
+//   2  logb               base column or scalar     -                           ln(x) / ln(base)
+//   3  hypot              other column or scalar    -                           sqrt(x^2 + y^2), scaled
+//   4  round              -                         mode | (ndigits << 8)       any numeric column
+//   5  round_to_multiple  multiple scalar           mode                        multiple must be > 0
+//   6  round_binary       int32 ndigits column      mode                        per-row ndigits
+//
+// Round modes (Arrow's own numbering): 0 DOWN (floor), 1 UP (ceil), 2 TOWARDS_ZERO, 3 TOWARDS_INFINITY,
+// 4 HALF_DOWN, 5 HALF_UP, 6 HALF_TOWARDS_ZERO, 7 HALF_TOWARDS_INFINITY, 8 HALF_TO_EVEN, 9 HALF_TO_ODD.
+// `round` is round_int(x * 10^ndigits) / 10^ndigits (and the reciprocal form for a negative ndigits),
+// the expression Arrow evaluates; `round_to_multiple` is round_int(x / multiple) * multiple.
+//
+// On an integer column the rounding family works on the quotient and remainder, so an int64 above 2^53
+// rounds exactly; a non-negative ndigits is the identity. Two extremes are defined here rather than
+// raised as Arrow raises them: a float ndigits past the type's decimal range is the identity, and an
+// integer ndigits whose multiple does not fit the column type gives 0.
+//
+// Precision: float32 uses the MSL library functions, except that expm1 and log1p (which MSL lacks) are
+// Taylor series near zero -- the usual (exp(x)-1)*x/log(exp(x)) repair is unusable because the Metal
+// front end folds log(exp(x)) back to x. float64 runs entirely in software binary64 -- a natural log by
+// argument reduction plus an atanh series, exp by argument reduction against a 107-bit ln 2 plus a
+// Taylor series, sqrt by Newton refinement of a float seed. Measured against Foundation over 10^6
+// random inputs: expm1 and logb within 2 ulp, log1p and hypot within 1 ulp. That makes these four
+// considerably more accurate on float64 than am_unary's sqrt/exp/ln/log2/log10, which still take the
+// float detour (about 7 significant digits).
+int  am_math_extra(am_array* a, int op, am_array* b /* or NULL */, const void* scalar /* or NULL */,
+                   int64_t p1, am_array** out);
+
 #ifdef __cplusplus
 }
 #endif

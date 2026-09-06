@@ -11,6 +11,10 @@ public enum ArrowMetalError: Error, CustomStringConvertible {
     case invalidArrowArray(String)
     case lengthMismatch(Int, Int)
     case releasedArray
+    /// A checked (overflow-raising) kernel found at least one offending element. `op` is the Arrow
+    /// function name, `index` the first offending row when the GPU could report it, and `detail` the
+    /// Arrow message ("overflow", "divide by zero", "logarithm of zero", ...).
+    case overflow(op: String, index: Int?, detail: String)
 
     public var description: String {
         switch self {
@@ -22,6 +26,8 @@ public enum ArrowMetalError: Error, CustomStringConvertible {
         case .invalidArrowArray(let s): return "Invalid ArrowArray: \(s)"
         case .lengthMismatch(let a, let b): return "Array length mismatch: \(a) vs \(b)"
         case .releasedArray: return "ArrowArray has already been released"
+        case .overflow(let op, let index, let detail):
+            return index.map { "\(op): \(detail) at index \($0)" } ?? "\(op): \(detail)"
         }
     }
 }
