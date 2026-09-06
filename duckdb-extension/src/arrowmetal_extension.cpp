@@ -118,66 +118,9 @@ void set_bit(std::vector<uint64_t> &bitmap, int64_t index, bool valid) {
 	}
 }
 
-// Runs `sql` on a fresh connection and lifts its single column onto the GPU.
-// On failure returns nullptr and fills `error`.
-am_array *pull_column(duckdb_connection conn, const std::string &sql, std::string &error) {
-	duckdb_result result;
-	if (duckdb_query(conn, sql.c_str(), &result) == DuckDBError) {
-		const char *msg = duckdb_result_error(&result);
-		error = msg ? msg : "query failed";
-		duckdb_destroy_result(&result);
-		return nullptr;
-	}
-	const duckdb_type type = duckdb_column_type(&result, 0);
-	const char *format = nullptr;
-	idx_t width = 0;
-	bool is_float = false;
-	if (!arrow_format_for(type, &format, &width, &is_float)) {
-		error = "arrowmetal: column type " + std::to_string(static_cast<int>(type)) +
-		        " is not one the GPU path handles; use the Python bridge (docs/DUCKDB.md) for "
-		        "strings, decimals and nested types";
-		duckdb_destroy_result(&result);
-		return nullptr;
-	}
-
-	auto buffers = std::unique_ptr<ArrowBuffers>(new ArrowBuffers());
-	int64_t rows = 0;
-	int64_t nulls = 0;
-	while (true) {
-		duckdb_data_chunk chunk = duckdb_fetch_chunk(result);
-		if (!chunk) {
-			break;
-		}
-		const idx_t count = duckdb_data_chunk_get_size(chunk);
-		if (count == 0) {
-			duckdb_destroy_data_chunk(&chunk);
-			continue;
-		}
-		duckdb_vector vector = duckdb_data_chunk_get_vector(chunk, 0);
-		const uint8_t *data = static_cast<const uint8_t *>(duckdb_vector_get_data(vector));
-		const uint64_t *valid = duckdb_vector_get_validity(vector);
-
-		buffers->values.resize(static_cast<size_t>((rows + int64_t(count)) * int64_t(width)));
-		std::memcpy(buffers->values.data() + static_cast<size_t>(rows) * width, data,
-		            static_cast<size_t>(count) * width);
-
-		// Grow the validity bitmap to cover the new rows, defaulting to valid.
-		const size_t words = static_cast<size_t>((rows + int64_t(count) + 63) / 64);
-		buffers->validity.resize(words, ~uint64_t(0));
-		if (valid) {
-			for (idx_t i = 0; i < count; i++) {
-				const bool row_valid = (valid[i / 64] >> (i % 64)) & 1u;
-				if (!row_valid) {
-					set_bit(buffers->validity, rows + int64_t(i), false);
-					nulls++;
-				}
-			}
-		}
-		rows += int64_t(count);
-		duckdb_destroy_data_chunk(&chunk);
-	}
-	duckdb_destroy_result(&result);
-
+// Hands one assembled Arrow buffer set to ArrowMetal, which takes ownership of it.
+am_array *import_buffers(std::unique_ptr<ArrowBuffers> buffers, const char *format, int64_t rows,
+                         int64_t nulls, std::string &error) {
 	if (buffers->validity.empty()) {
 		buffers->validity.resize(1, ~uint64_t(0));
 	}
@@ -202,18 +145,110 @@ am_array *pull_column(duckdb_connection conn, const std::string &sql, std::strin
 	am_array *out = nullptr;
 	// am_import takes the ArrowArray: on success ArrowMetal owns `buffers` and releases it, on
 	// failure the array was not moved and the unique_ptr still owns it.
-	if (am_import(&schema, &array, &out) != 0) {
-		error = "arrowmetal: " + am_error();
-		if (schema.release) {
-			schema.release(&schema);
-		}
-		return nullptr;
-	}
-	buffers.release();
+	const int rc = am_import(&schema, &array, &out);
 	if (schema.release) {
 		schema.release(&schema);
 	}
+	if (rc != 0) {
+		error = "arrowmetal: " + am_error();
+		return nullptr;
+	}
+	buffers.release();
 	return out;
+}
+
+// Runs `sql` and lifts ALL of its columns onto the GPU in one scan.
+//
+// Pulling several columns together matters: the scan is the expensive half of everything this
+// extension does, and a group-by that fetched its key and its values separately would pay for the
+// table twice. On failure the vector comes back empty and `error` says why.
+std::vector<am_array *> pull_columns(duckdb_connection conn, const std::string &sql,
+                                     std::string &error) {
+	std::vector<am_array *> out;
+	duckdb_result result;
+	if (duckdb_query(conn, sql.c_str(), &result) == DuckDBError) {
+		const char *msg = duckdb_result_error(&result);
+		error = msg ? msg : "query failed";
+		duckdb_destroy_result(&result);
+		return out;
+	}
+
+	const idx_t column_count = duckdb_column_count(&result);
+	std::vector<const char *> formats(column_count, nullptr);
+	std::vector<idx_t> widths(column_count, 0);
+	for (idx_t c = 0; c < column_count; c++) {
+		bool is_float = false;
+		if (!arrow_format_for(duckdb_column_type(&result, c), &formats[c], &widths[c], &is_float)) {
+			error = std::string("arrowmetal: column ") + duckdb_column_name(&result, c) +
+			        " has a type the GPU path does not handle; the Python bridge (docs/DUCKDB.md) "
+			        "covers strings, decimals and nested types";
+			duckdb_destroy_result(&result);
+			return out;
+		}
+	}
+
+	std::vector<std::unique_ptr<ArrowBuffers>> buffers;
+	std::vector<int64_t> nulls(column_count, 0);
+	for (idx_t c = 0; c < column_count; c++) {
+		buffers.emplace_back(new ArrowBuffers());
+	}
+
+	int64_t rows = 0;
+	while (true) {
+		duckdb_data_chunk chunk = duckdb_fetch_chunk(result);
+		if (!chunk) {
+			break;
+		}
+		const idx_t count = duckdb_data_chunk_get_size(chunk);
+		if (count == 0) {
+			duckdb_destroy_data_chunk(&chunk);
+			continue;
+		}
+		for (idx_t c = 0; c < column_count; c++) {
+			duckdb_vector vector = duckdb_data_chunk_get_vector(chunk, c);
+			const uint8_t *data = static_cast<const uint8_t *>(duckdb_vector_get_data(vector));
+			const uint64_t *valid = duckdb_vector_get_validity(vector);
+			ArrowBuffers &target = *buffers[c];
+			const idx_t width = widths[c];
+
+			target.values.resize(static_cast<size_t>((rows + int64_t(count)) * int64_t(width)));
+			std::memcpy(target.values.data() + static_cast<size_t>(rows) * width, data,
+			            static_cast<size_t>(count) * width);
+
+			// Grow the validity bitmap to cover the new rows, defaulting to valid.
+			target.validity.resize(static_cast<size_t>((rows + int64_t(count) + 63) / 64), ~uint64_t(0));
+			if (valid) {
+				for (idx_t i = 0; i < count; i++) {
+					if (!((valid[i / 64] >> (i % 64)) & 1u)) {
+						set_bit(target.validity, rows + int64_t(i), false);
+						nulls[c]++;
+					}
+				}
+			}
+		}
+		rows += int64_t(count);
+		duckdb_destroy_data_chunk(&chunk);
+	}
+	duckdb_destroy_result(&result);
+
+	for (idx_t c = 0; c < column_count; c++) {
+		am_array *column = import_buffers(std::move(buffers[c]), formats[c], rows, nulls[c], error);
+		if (!column) {
+			for (am_array *done : out) {
+				am_release(done);
+			}
+			out.clear();
+			return out;
+		}
+		out.push_back(column);
+	}
+	return out;
+}
+
+// The single-column case, which is most of them.
+am_array *pull_column(duckdb_connection conn, const std::string &sql, std::string &error) {
+	std::vector<am_array *> columns = pull_columns(conn, sql, error);
+	return columns.empty() ? nullptr : columns[0];
 }
 
 // A scalar coming back from am_reduce / am_query, kept in the widest form of each kind so that an
@@ -528,17 +563,19 @@ void run_agg(duckdb_connection conn, const BindData &bind_data, InitData &init) 
 }
 
 void run_group_by(duckdb_connection conn, const BindData &bind_data, InitData &init) {
+	// One scan for both columns: reading the table twice would cost more than the group-by does.
+	std::vector<am_array *> pulled = pull_columns(
+	    conn, "SELECT " + quote(bind_data.key) + ", " + quote(bind_data.column) + " FROM " +
+	              quote(bind_data.table), init.error);
+	if (pulled.size() < 2) {
+		for (am_array *handle : pulled) {
+			am_release(handle);
+		}
+		return;
+	}
 	Column keys, values;
-	keys.handle = pull_column(conn, "SELECT " + quote(bind_data.key) + " FROM " + quote(bind_data.table),
-	                          init.error);
-	if (!keys) {
-		return;
-	}
-	values.handle = pull_column(conn, "SELECT " + quote(bind_data.column) + " FROM " +
-	                                      quote(bind_data.table), init.error);
-	if (!values) {
-		return;
-	}
+	keys.handle = pulled[0];
+	values.handle = pulled[1];
 
 	am_array *key_columns[1] = {keys.handle};
 	am_groupby *gb = nullptr;
@@ -639,16 +676,25 @@ void run_query(duckdb_connection conn, const BindData &bind_data, InitData &init
 		return;
 	}
 
+	// All of them in one scan, so a five-column expression does not read the table five times.
+	std::string projection;
+	for (size_t i = 0; i < names.size(); i++) {
+		projection += (i ? ", " : "") + quote(names[i]);
+	}
+	std::vector<am_array *> pulled = pull_columns(
+	    conn, "SELECT " + projection + " FROM " + quote(bind_data.table), init.error);
+	if (pulled.size() != names.size()) {
+		for (am_array *handle : pulled) {
+			am_release(handle);
+		}
+		return;
+	}
 	std::vector<Column> columns(names.size());
 	std::vector<am_array *> handles;
 	std::vector<const char *> name_pointers;
 	for (size_t i = 0; i < names.size(); i++) {
-		columns[i].handle = pull_column(conn, "SELECT " + quote(names[i]) + " FROM " +
-		                                          quote(bind_data.table), init.error);
-		if (!columns[i]) {
-			return;
-		}
-		handles.push_back(columns[i].handle);
+		columns[i].handle = pulled[i];
+		handles.push_back(pulled[i]);
 		name_pointers.push_back(names[i].c_str());
 	}
 
