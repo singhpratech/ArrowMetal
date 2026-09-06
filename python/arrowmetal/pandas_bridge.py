@@ -75,6 +75,14 @@ def _values_address(obj):
     return a[-1] if a else None
 
 
+def _widen_dictionary(arr):
+    """ArrowMetal reads dictionary indices as int32 or int64; a pandas Categorical often gets int8
+    or int16 from pyarrow, so widen those (the array was being copied anyway)."""
+    if pa.types.is_dictionary(arr.type) and arr.type.index_type.bit_width < 32:
+        return pa.DictionaryArray.from_arrays(arr.indices.cast(pa.int32()), arr.dictionary)
+    return arr
+
+
 def _pandas_values(obj):
     """(ExtensionArray or ndarray, dtype) for a Series, Index, ExtensionArray or ndarray."""
     if isinstance(obj, (pd.Series, pd.Index)):
@@ -114,7 +122,7 @@ def to_arrow(obj):
     #    NumpyExtensionArray is an ExtensionArray too but holds a bare ndarray, so it falls through
     #    to the numpy path below (where NaN -> null happens).
     if isinstance(values, pd.api.extensions.ExtensionArray) and not isinstance(values, _NUMPY_EA):
-        arr = _as_pa_array(pa.array(values))
+        arr = _widen_dictionary(_as_pa_array(pa.array(values)))
         kind = "categorical" if isinstance(values, pd.Categorical) else "pandas masked extension array"
         return Conversion(arr, False, f"{kind} -> Arrow, one copy", dtype)
 
