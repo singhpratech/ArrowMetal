@@ -84,12 +84,16 @@ enum SortSource {
     kernel void key_from_i32(device const int* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { uint k = (uint)a[i] ^ 0x80000000u; out[i] = inv ? ~k : k; } }
     kernel void key_from_u32(device const uint* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { uint k = a[i]; out[i] = inv ? ~k : k; } }
     kernel void key_from_f32(device const uint* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], uint i [[thread_position_in_grid]]) {
-        if (i >= *nPtr) return; uint b = a[i]; if ((b & 0x7FFFFFFFu) == 0u) b = 0u; if ((b & 0x7FFFFFFFu) > 0x7F800000u) b = 0x7F800001u; /* -0 == +0; every NaN is one value after +inf */ uint k = (b & 0x80000000u) ? ~b : (b | 0x80000000u); out[i] = inv ? ~k : k;
+        if (i >= *nPtr) return; uint b = a[i]; if ((b & 0x7FFFFFFFu) == 0u) b = 0u; bool nan = (b & 0x7FFFFFFFu) > 0x7F800000u; if (nan) b = 0x7F800001u; /* -0 == +0; every NaN is one value after +inf */ uint k = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+        /* NaN stays at the end when the order is reversed, next to the nulls, as in Arrow. UINT_MAX is
+           free: only a NaN can map to key 0, so only a NaN can invert to UINT_MAX. */
+        out[i] = inv ? (nan ? 0xFFFFFFFFu : ~k) : k;
     }
     kernel void key_from_i64(device const long* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { ulong k = (ulong)a[i] ^ 0x8000000000000000ul; out[i] = inv ? ~k : k; } }
     kernel void key_from_u64(device const ulong* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { ulong k = a[i]; out[i] = inv ? ~k : k; } }
     kernel void key_from_f64(device const ulong* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], uint i [[thread_position_in_grid]]) {
-        if (i >= *nPtr) return; ulong b = a[i]; if ((b & 0x7FFFFFFFFFFFFFFFul) == 0ul) b = 0ul; if ((b & 0x7FFFFFFFFFFFFFFFul) > 0x7FF0000000000000ul) b = 0x7FF0000000000001ul; ulong k = (b & 0x8000000000000000ul) ? ~b : (b | 0x8000000000000000ul); out[i] = inv ? ~k : k;
+        if (i >= *nPtr) return; ulong b = a[i]; if ((b & 0x7FFFFFFFFFFFFFFFul) == 0ul) b = 0ul; bool nan = (b & 0x7FFFFFFFFFFFFFFFul) > 0x7FF0000000000000ul; if (nan) b = 0x7FF0000000000001ul; ulong k = (b & 0x8000000000000000ul) ? ~b : (b | 0x8000000000000000ul);
+        out[i] = inv ? (nan ? 0xFFFFFFFFFFFFFFFFul : ~k) : k;
     }
     kernel void iota_u32(device uint* out [[buffer(0)]], device const uint* nPtr [[buffer(1)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) out[i] = i; }
     """ }

@@ -13,8 +13,8 @@ it and compares, so a kernel that is wrong in an unanticipated way still fails.
 |---|---|
 | Files | `python/tests/test_differential.py` (the harness), `python/tests/differential_report.py` (the runner) |
 | Oracle | `pyarrow.compute` 25.0.1 |
-| Cases in the default matrix | 6,318, about 7 s on an M4 Max; 7,020 in about 140 s with `DIFF_LARGE=1` |
-| Result at 0.1.0 | 5,903 pass, 145 fail across 5 open findings, 270 skip (kernels not implemented), 0 unclassified |
+| Cases in the default matrix | 13,176, about 13 s on an M4 Max; more with `DIFF_LARGE=1` |
+| Result at 0.1.0 | 12,617 pass, 46 fail across 4 documented divergences, 513 skip (kernels not implemented), 0 unclassified |
 
 ## Method
 
@@ -34,7 +34,7 @@ to produce an overflowed answer (see *Divergences* below).
   33 and 100,003 are deliberately not multiples of a threadgroup or SIMD width.
 - **Null ratios** 0, 0.3 and 1.0. Nulls are applied with `pa.array(values, mask=...)`, which leaves the
   original numbers *under* the validity bitmap — what a real column looks like after a filter, and what a
-  kernel is required to ignore. That choice is what surfaced finding 1.
+  kernel is required to ignore. That choice is what surfaced the argsort null-order bug.
 - **Special values** (the `special` flavor): each type's min and max, 0, 1, -1, half-range; for floats
   `-0.0`, NaN, ±inf, the smallest normal, the smallest subnormal and their negatives, `FLT_MAX`/`DBL_MAX`
   and machine epsilon; for strings the empty string, multi-byte UTF-8 (`héllo`, `日本語`, `Ωμέγα`, an
@@ -48,16 +48,18 @@ That is 27 datasets per (operation, type) by default.
 
 **Every method that exists is in scope.** Operations are a registry in `test_differential.py`, and
 `test_every_public_operation_has_a_differential_case` fails if a method is added to `MetalArray` or
-`GroupBy` without one, so the harness cannot silently fall behind the library. Kernels that are on the
-roadmap but absent at 0.1.0 — `is_null`, `is_valid`, `is_nan`, `abs`, `negate`, `sign`, `upper`, `lower`,
-`trim`, `reverse`, `fill_null`, `if_else`, `is_in`, `cumulative_sum`/`_prod`/`_max`/`_min`,
-`bitwise_and`/`_or`/`_xor`/`_not`, `shift_left`, `shift_right` — already have their oracle written and
-register themselves the moment the method appears on `MetalArray`. Until then the report lists them as
-absent.
+`GroupBy` without one, so the harness cannot silently fall behind the library. Optional operations
+register themselves the moment the method appears on `MetalArray`, so a new kernel joins the matrix
+with no edit here; the ones still missing (`is_nan`, `reverse`, `cumulative_prod` at 0.1.0) are listed
+by the report as absent. Two methods can never be reached this way and say so instead of passing
+quietly: the temporal kernels (`year`…`second`, `cast_unit`), because the generator makes no timestamp
+column — `Tests/ArrowMetalTests/TemporalTests.swift` covers those — and the generic dispatchers
+`unary`, `binary` and `cumulative`, every op of which is reached through a named form that *is* in the
+matrix. `test_methods_outside_the_matrix_are_reported` prints that list on every run.
 
 **Comparison strictness.** Results are compared as `pyarrow.Array`s, not as Python lists, so the *type* is
 part of the comparison: a kernel that returns the right numbers as `int64` instead of `uint64` fails, which
-is how finding 5 turned up. Integers, booleans, strings and index vectors are compared exactly. Float
+is how the unsigned group-by total turned up. Integers, booleans, strings and index vectors are compared exactly. Float
 arithmetic (`+ - * /`, scalar and array, Float32 and Float64) is compared *bit-exact* — `Array.equals` is
 deliberately not used for float types, because Arrow calls `-0.0` and `0.0` equal and `NaN` and `NaN`
 unequal, and this harness needs the opposite of both. Reductions get a tolerance, because the two engines
@@ -67,9 +69,11 @@ all (`sqrt(100000)·2^-24 ≈ 2e-5` on its own).
 
 **Not-implemented versus wrong.** An `ArrowMetalError` whose message matches a known gap ("Unsupported
 Arrow type", "group-by min/max needs a 32-bit or narrower type", …) is a *skip*; any other error, or a
-wrong answer, is a *failure*. The 270 skips in the default run are all group-by combinations the kernels do
-not cover — `min`/`max` on 64-bit values, `mean` on Float32, and any aggregate over Float64 — the same set
-`test_arrowmetal.py` pins as expected errors.
+wrong answer, is a *failure*. The 513 skips in the default run are the group-by combinations the kernels do
+not cover — `min`/`max` on 64-bit values, `mean` on Float32, and any aggregate over Float64, the same set
+`test_arrowmetal.py` pins as expected errors — plus the primitive-only kernels (`is_null`, `is_valid`,
+`fill_null`, `drop_null`, `if_else`, `is_in`, `index_in`) on `utf8` and, for the two set-lookup kernels,
+on `bool`.
 
 ## Deliberate and documented divergences
 
@@ -90,163 +94,152 @@ suite notices if either engine changes its mind.
 | NaN's position in a sort | after `+inf` | after `+inf` — identical | `test_sort_places_nan_after_positive_infinity_in_both` |
 | Group-by keys outside `[0, key_count)` | dropped | given their own group | `test_group_by_ignores_keys_outside_the_declared_range` |
 | Integer `mean` when the total overflows | divides the wrapped 64-bit sum, matching its own `sum()` | accumulates in double | `test_integer_mean_wraps_where_pyarrow_widens` |
+| `min`/`max` of an all-NaN column | null | NaN | `test_all_nan_min_max_is_null_in_arrowmetal_and_nan_in_pyarrow` |
+| `sign` of an integer column | keeps the column's type | narrows to `int8` | `test_sign_keeps_the_column_type_where_pyarrow_narrows_to_int8` |
+| `floor`/`ceil`/`trunc` of an integer column | the identity, keeps the type at any magnitude | widens to double, and refuses the column past 2^53 | `test_floor_and_ceil_keep_the_integer_type_where_pyarrow_widens_to_double` |
+| Shift count outside `[0, bit width)` | shifts the bits out: 0, or the sign fill for a signed `shift_right` | unchecked returns the operand untouched; checked raises. Arrow's range also excludes the sign bit, so `int32 << 31` already differs | `test_out_of_range_shift_counts_shift_the_bits_out_where_pyarrow_returns_the_operand` |
+| Nulls in `cumulative_sum`/`_min`/`_max` | the running value carries across a null, output null where input null — Arrow's `skip_nulls=True` | the same with `skip_nulls=True`; its *default* propagates the first null to the end. ArrowMetal has no such mode | `test_cumulative_functions_skip_nulls_where_arrow_propagates_them` |
+| A null in `is_in`'s value set | ignored; a null element never matches, so the result has no nulls — Arrow's `skip_nulls=True` | the same with `skip_nulls=True`; its default matches null to null | `test_is_in_never_matches_a_null_where_arrow_matches_null_to_null` |
+| Empty pattern in `replace` | the identity | `pc.replace_substring` does not terminate on an empty pattern — the harness must never call it with one | `test_empty_replace_pattern_is_the_identity` |
+| Empty pattern in `count_substring` | code points + 1 | bytes + 1 | `test_empty_pattern_counts_code_points_where_arrow_counts_bytes` |
+| `float64` `sqrt`/`exp`/`ln`/`log10`/`log2` | evaluated in `float` and widened: ~7 significant digits, nothing below the smallest float32 normal or above `FLT_MAX` | evaluated in double | `test_float64_transcendentals_are_evaluated_in_float32` |
 
-Because `min`/`max` skip NaN in both engines but disagree on what is left when *every* value is NaN (see
-finding 6), the matrix compares `min`/`max`/`mean` on NaN-free input, and the NaN behaviour is pinned in
-tests of its own.
+Two of Arrow's own defaults would make the matrix meaningless if the harness accepted them, so the oracle
+states the option instead and a test records why. `pc.cumulative_max`'s default `start` is
+`numeric_limits<T>::min()`, which on a float column is the smallest positive *normal* — so Arrow's default
+clamps every negative running maximum to 1.18e-38 (`test_arrow_cumulative_max_default_start_clamps_negative_floats`);
+the matrix passes ∓inf explicitly. And `pc.round` defaults to half-to-even where ArrowMetal rounds halves
+away from zero, so the oracle asks for `half_towards_infinity`, the mode the kernel documents.
+
+Because `min`/`max` skip NaN in both engines but disagree on what is left when *every* value is NaN, the
+matrix compares `min`/`max`/`mean` on NaN-free input and the NaN behaviour is pinned in tests of its own.
+For the same reason the float `cumulative_sum` comparison drops the values that can overflow a partial sum
+(±inf, and anything above `type_max / n`): past that point one association reaches ±inf where the other
+does not, and `inf - inf` is NaN, which is not a roundoff difference any bound can express. NaN itself
+stays in the input — it poisons every later element in both engines
+(`test_cumulative_sum_propagates_nan_and_reassociates_infinities`).
 
 ## Open findings
 
-Six divergences the harness found that are not deliberate; the first five account for all 145 failing
-cases. **None has been fixed** — this document and the tests are the record. Each has an
-`xfail(strict=True)` reproduction in `test_differential.py`, so the suite turns red the moment a kernel
-starts behaving, and the first five have an entry in `FINDINGS` in the same file, so the matrix groups the
-affected cells under the finding instead of burying them.
+Four divergences the harness found that are not bugs but are not free choices either: each is a place
+where a kernel's own consistency was preferred to Arrow's answer, or where a documented limit of the GPU
+path shows through. Together they account for all 46 failing cases. Each has an entry in `FINDINGS` in
+`test_differential.py`, so the matrix groups the affected cells under the finding instead of burying them,
+and an `xfail(strict=True)` reproduction, so the suite turns red the moment a kernel changes its mind.
 
-### 1. `argsort` and `top_k` order null indices by the bytes under the validity bitmap
+### 1. Float32 arithmetic flushes subnormals to zero
 
-*116 of the 145 failing cases. Affects every numeric type, every dataset with nulls.*
+*8 failing cases: `arith_scalar/float32`, `arith_array/float32`, `special` flavor.*
 
-`am_argsort` documents a stable sort with nulls last. The values are sorted correctly and the nulls do land
-last, but their *indices* come back ordered by whatever is in the values buffer at those positions, rather
-than in input order. Two arrays Arrow considers equal therefore argsort differently:
-
-```python
-mask = np.array([True, True, True, False])
-loud  = pa.array(np.array([30, 20, 10, 7], np.int32), mask=mask, type=pa.int32())
-quiet = pa.array(np.array([ 0,  0,  0, 7], np.int32), mask=mask, type=pa.int32())
-loud.equals(quiet)                       # True -- both are [None, None, None, 7]
-
-am.array(loud).argsort().to_arrow()      # [3, 2, 1, 0]     <- ordered by 30 > 20 > 10
-am.array(quiet).argsort().to_arrow()     # [3, 0, 1, 2]
-pc.array_sort_indices(loud)              # [3, 0, 1, 2]     <- stable: null indices in input order
-```
-
-`top_k(k, largest=False)` inherits it (`[3, 2, 1, 0]` where Arrow gives `[3, 0, 1, 2]`). `sort()` is not
-affected — every element it returns for those positions is null either way. Nothing here is *invalid*: the
-result is always a permutation, the nulls are always last, and `take(argsort())` still reproduces
-`sort()`. It is the stability guarantee that does not hold, and the index order becomes an unpredictable
-function of buffer contents that Arrow says are meaningless. Anything that argsorts one column to reorder
-another gets a different, arbitrary permutation of its null rows on each input.
-
-Likely cause: the radix sort keys nulls on their raw payload with a sentinel high bit, instead of on the
-row index. Reproductions: `test_argsort_null_block_is_stable`, `test_top_k_null_block_is_stable`. The
-properties that *do* hold are asserted, not assumed, in
-`test_argsort_is_a_permutation_with_nulls_last_and_values_in_order`.
-
-### 2. Float32 kernels flush subnormals to zero
-
-*11 failing cases: `arith_scalar/float32`, `arith_array/float32`, `compare_array/float32`, `special` flavor.*
-
-Metal's default fast-math mode is flush-to-zero and denormals-are-zero. The Float32 arithmetic and
-comparison kernels inherit it, so a subnormal result becomes `0.0` and a subnormal operand compares as
-zero — while import/export round-trips the same values perfectly, which makes the loss look like a data
-bug rather than a math-mode one.
+Metal's default math mode is flush-to-zero and denormals-are-zero. The Float32 **arithmetic** kernels
+inherit it, so a subnormal result becomes `0.0` and a subnormal operand contributes nothing — while
+import/export round-trips the same values perfectly, which makes the loss look like a data bug rather
+than a math-mode one.
 
 ```python
 tiny = 1.1754943508222875e-38                      # smallest normal float32
 a = pa.array([tiny, 1.0], pa.float32())
 am.array(a).arith("*", 0.5).to_arrow()             # [0.0, 0.5]
 pc.multiply(a, pa.scalar(0.5, pa.float32()))       # [5.877471754111438e-39, 0.5]   (so does numpy)
-
-smallest = 1.401298464324817e-45                   # smallest subnormal float32
-b = pa.array([smallest], pa.float32())
-am.array(b).compare(">", 0.0).to_arrow()           # [False]
-pc.greater(b, pa.scalar(0.0, pa.float32()))        # [True]
-
-# and a subnormal compares equal to -0.0:
-am.array(pa.array([-0.0], pa.float32())) == am.array(b)   # [True]; pyarrow says [False]
 ```
 
 Float64 is unaffected — it runs through the software IEEE-754 path and returns the subnormal, which
-`test_float64_arithmetic_and_comparison_keep_subnormals` asserts. The divergence is Float32-only and
-therefore looks like a missing `-fno-fast-math` (or an explicit denormal mode) on the Float32 kernels
-rather than anything algorithmic.
+`test_float64_arithmetic_and_comparison_keep_subnormals` asserts. The kernels that do not add or multiply
+were taken off the flush: `compare` builds bit keys, and `sign`, `floor`, `ceil`, `trunc`, `round` and the
+element-wise `min`/`max` decide the subnormal and signed-zero cases from the bit pattern, so
+`sign(1.4e-45)` is `1` and `ceil(1.4e-45)` is `1.0`, as in Arrow
+(`test_float32_comparison_distinguishes_subnormals_from_zero`, `test_sign_of_a_float32_subnormal_is_one`,
+`testFloat32SignAndRoundingCorners`). Only `+ - * /` still flush.
 
-Reproductions: `test_float32_arithmetic_keeps_subnormal_results`,
-`test_float32_comparison_distinguishes_subnormals_from_zero`.
+Reproduction: `test_float32_arithmetic_keeps_subnormal_results`.
 
-### 3. `sort` and `argsort` split the `-0.0` / `0.0` tie
+### 2. `upper` and `lower` map Latin only
 
-*44 failing cases across `sort`, `argsort` and `top_k` on both float types, `special` flavor.*
+*18 failing cases: `upper/utf8`, `lower/utf8`, every dataset whose strings need a mapping outside the
+covered blocks.*
 
-IEEE-754 says `-0.0 == 0.0`, so Arrow's stable sort leaves them in input order. The radix sort compares bit
-patterns, where `-0.0` has the sign bit set, and puts every `-0.0` before every `0.0`:
-
-```python
-a = pa.array([0.0, -0.0, 0.0, -0.0], pa.float64())
-am.array(a).argsort().to_arrow()            # [1, 3, 0, 2]
-pc.array_sort_indices(a)                    # [0, 1, 2, 3]
-am.array(a).sort().to_arrow()               # [-0.0, -0.0, 0.0, 0.0]
-a.take(pc.array_sort_indices(a))            # [ 0.0, -0.0, 0.0, -0.0]
-```
-
-Descending is wrong in the mirror direction (`[0, 2, 1, 3]` against Arrow's `[0, 1, 2, 3]`). It is the same
-stability guarantee as finding 1, broken by a different mechanism, and the sorted *values* are still in
-non-decreasing order under `==`. Fixing it means canonicalising `-0.0` to `0.0` in the radix key, which
-costs one instruction per element in the key-building pass.
-
-Reproduction: `test_negative_zero_is_a_sort_tie`.
-
-### 4. `sum` and `mean` over Float32 accumulate in Float32
-
-*2 failing cases, `special` flavor only.*
-
-`pc.sum` over a Float32 column returns a **double** — Arrow widens the accumulator on purpose. ArrowMetal
-accumulates in Float32, so a total that exceeds `FLT_MAX` becomes ±inf, and once an inf of each sign is in
-play the result is NaN where Arrow's is finite or infinite:
+`am_str_transform` ops 2 and 3 implement the simple (1:1 code point) case mappings of Basic Latin, Latin-1
+Supplement and Latin Extended-A, including the ones that change the byte length (`ſ` → `S`, `İ`/`ı`).
+Everything above U+017F is copied through, and the multi-character expansions (`ß` → `SS`, `ŉ`, `µ`) are
+not applied. pyarrow uses full Unicode.
 
 ```python
-big = 3.4028234663852886e+38                       # FLT_MAX
-a = pa.array([big, big], pa.float32())
-am.array(a).sum()                                  # inf
-pc.sum(a).as_py()                                  # 6.805646932770577e+38
+a = pa.array(["Ωμέγα", "ÅNGSTRÖM"], pa.string())
+am.array(a).upper().to_arrow()      # ['Ωμέγα', 'ÅNGSTRÖM']   <- the Greek passes through
+pc.utf8_upper(a)                    # ['ΩΜΈΓΑ', 'ÅNGSTRÖM']
 ```
 
-On the generated `special` dataset that turns into `sum() -> nan` where Arrow gives `inf`. Ordinary data is
-unaffected beyond the roundoff the harness's error bound already allows; the divergence needs values within
-a factor of two of `FLT_MAX`. Grouped `sum` over Float32 has the same accumulator but no failing case in the
-default matrix. Reproduction: `test_float32_sum_does_not_overflow_before_arrow_does`.
+A full case table is a data-size decision rather than a kernel one, and it is out of scope at 0.1.0 — the
+header says so. The finding is classified *by the data*: a dataset counts under it only if it actually
+contains a code point outside the covered blocks, so a regression inside them still shows up as a new
+divergence. Reproductions: `test_case_mapping_covers_all_of_unicode` (xfail) and
+`test_case_mapping_inside_latin_extended_a_matches_pyarrow` (the blocks that must agree exactly).
 
-### 5. Grouped `sum` over UInt64 values returns Int64
+### 3. `sign` keeps the sign of `-0.0`
 
-*8 failing cases: `group_by_sum/uint64` and `group_by_mean/uint64`, `special` flavor.*
+*8 failing cases: `sign/float32`, `sign/float64`, the datasets containing a negative zero.*
 
-`am_group_by` with `agg = sum` reports an `int64` array regardless of the value type, so a UInt64 group
-total above `2^63` comes back negative. The bits are right; the type is not.
+`am_unary`'s `sign` returns `-1`/`0`/`1` and leaves NaN and both signed zeros alone, so `sign(-0.0)` is
+`-0.0`. pyarrow normalises it:
 
 ```python
-keys   = pa.array([0, 0], pa.int32())
-values = pa.array([2**63, 2**63 - 5], pa.uint64())
-am.array(keys).group_by(1).sum(am.array(values)).type       # int64  (should be uint64)
-am.array(keys).group_by(1).sum(am.array(values)).to_arrow() # [-5]
-pa.table({"k": keys, "v": values}).group_by("k").aggregate([("v", "sum")])
-                                                            # [18446744073709551611]
+a = pa.array([-0.0, 0.0, math.nan], pa.float64())
+am.array(a).sign().to_arrow()      # [-0.0, 0.0, nan]
+pc.sign(a)                         # [ 0.0, 0.0, nan]
 ```
 
-`group_by(...).mean(...)` divides the same signed total, so it is wrong by the same reinterpretation
-(`-0.71` where Arrow gives `2.6e18`). The scalar `MetalArray.sum()` does *not* have this problem: it reads
-`out_kind == 1` and masks back to unsigned. Reproduction:
-`test_group_by_sum_over_uint64_stays_unsigned`.
+Keeping the operand is the documented behaviour (`include/arrowmetal.h`) and the one that loses no
+information; the two engines agree on every other value, NaN included. Reproduction:
+`test_sign_of_negative_zero_matches_pyarrow`.
 
-### 6. `min` and `max` return null for an all-NaN array
+### 4. `is_in` and `index_in` treat `-0.0` and `0.0` as one value
 
-*No failing matrix cases — the matrix compares min/max on NaN-free input. Pinned as a divergence.*
+*6 failing cases: `is_in/float64`, `index_in/float64`, the datasets containing a negative zero.*
 
-ArrowMetal treats NaN as missing throughout, so with nothing but NaN left it reports null, even though the
-array's `null_count` is 0. pyarrow returns NaN.
+The set lookup is a binary search over `unique()`, which orders values by the same total order the radix
+sort uses: every NaN is one value, and `-0.0` is `0.0`. Arrow's hash lookup keeps the two zeros apart (it
+agrees with us on NaN).
 
 ```python
-a = pa.array([math.nan, math.nan], pa.float64())
-a.null_count                       # 0
-am.array(a).min()                  # None
-pc.min(a).as_py()                  # nan
+a = pa.array([0.0, -0.0], pa.float64())
+s = pa.array([-0.0], pa.float64())
+am.array(a).is_in(am.array(s)).to_arrow()               # [True, True]
+pc.is_in(a, value_set=s, skip_nulls=True)               # [False, True]
 ```
 
-Defensible as a design choice, and the more consistent one given that ArrowMetal skips NaN elsewhere — but
-it is not written down anywhere, and `min()` returning `None` for an array with no nulls will surprise a
-caller that branches on `null_count`. It belongs in `include/arrowmetal.h` next to the sort's NaN note
-either way. Pinned by `test_all_nan_min_max_is_null_in_arrowmetal_and_nan_in_pyarrow`.
+Matching Arrow here would mean `is_in` disagreeing with `unique`, `dictionary_encode` and `sort` about how
+many distinct values a column has, which is the worse of the two inconsistencies. Reproductions:
+`test_is_in_separates_negative_zero_from_zero` (xfail) and `test_is_in_matches_nan_to_nan_in_both`.
+
+## Findings that were fixed
+
+The five bugs the first run of this matrix reported are closed. The reproductions stayed, as plain
+assertions, so the suite notices a relapse.
+
+| Was | Now | Test |
+|---|---|---|
+| `argsort`/`top_k` ordered null indices by the bytes under the validity bitmap | null rows keep their input order | `test_argsort_null_block_is_stable`, `test_top_k_null_block_is_stable` |
+| `sort`/`argsort`/`top_k` split the `-0.0` / `0.0` tie | the sort keys canonicalise the sign of zero, so the tie holds input order | `test_negative_zero_is_a_sort_tie` |
+| `sum`/`mean` over Float32 accumulated in Float32 | they accumulate in double, as Arrow's do | `test_float32_sum_does_not_overflow_before_arrow_does` |
+| Grouped `sum` over UInt64 came back as Int64 | the aggregate keeps the value type | `test_group_by_sum_over_uint64_stays_unsigned` |
+| Float32 comparison treated subnormal operands as zero | comparisons are exact, on bit keys; only arithmetic still flushes | `test_float32_comparison_distinguishes_subnormals_from_zero` |
+
+Four more turned up while closing those, and were fixed here rather than written down:
+
+- **`top_k` did not canonicalise floats at all.** The selection kernel carries its own key mapping, which
+  the `-0.0` and NaN fix had never reached, so `top_k` could order a column differently from `argsort`. It
+  now uses the same mapping (`testNaNAndNegativeZeroPlacement`).
+- **A descending sort mirrored NaN to the front.** Arrow's null placement covers NaN, so a reversed order
+  keeps NaN at the end, next to the nulls; the key mapping now sends NaN to the maximum key when the order
+  is inverted (`test_nan_sorts_last_in_both_directions_in_both`).
+- **Element-wise `min`/`max` broke a ±0 tie by position**, so `min(0.0, -0.0)` and `min(-0.0, 0.0)`
+  disagreed. Both now answer the way `fmin`/`fmax` do — min keeps `-0.0`, max keeps `0.0`
+  (`test_element_wise_min_max_break_a_zero_tie_like_fmin_and_fmax_in_both`).
+- **Float32 `sign`, `ceil`, `floor`, `trunc` and `round` inherited the arithmetic flush**, so
+  `sign(1.4e-45)` returned the subnormal itself, `ceil(1.4e-45)` was `0.0`, and `round(-0.4)` lost the
+  sign of its zero. All five decide those cases on the bit pattern now, which is what the exact float64
+  kernels already did (`testFloat32SignAndRoundingCorners`).
+
 
 ## What passed
 
@@ -258,18 +251,27 @@ Everything else, on all 27 datasets per cell:
   and Int64 totals that wrap.
 - **Comparisons** all six operators, scalar and array, on all numeric types — including UInt64 against
   `2^63`, where a signed comparison would flip.
-- **Arithmetic** `+ - * /`, scalar and array, bit-exact on both float types (outside finding 2) and exact
-  under wrapping on all eight integer types.
+- **Arithmetic** `+ - * /`, scalar and array, bit-exact on both float types (outside finding 1) and exact
+  under wrapping on all eight integer types; `modulo` and `power` on all eight, against a truncating-division
+  oracle and with the exponent folded into [0, 8).
 - **Casts** all 100 numeric source/target pairs, matching `Array.cast(safe=False)` including narrowing
   wraps and float→int truncation toward zero.
 - **Boolean** `and`, `or`, `not` with nulls.
 - **Selection** `filter` (null mask entries drop the row, as in Arrow), `filter_where` for all six
   predicates, `take` with repeated and null indices, `slice`.
-- **`sort`** ascending and descending on all numeric types, at every size, outside finding 3.
+- **`sort`, `argsort`, `top_k`** ascending and descending on all numeric types, at every size, including
+  `-0.0`, NaN and null placement -- the three now agree with Arrow everywhere in the matrix.
+- **Element-wise math** `abs`, `negate`, `sign`, `floor`, `ceil`, `round`, `trunc`, `sqrt`, `exp`, `ln`,
+  `log10`, `log2`, element-wise `min`/`max`, the four bit-wise ops and both shifts.
+- **Cumulative** `sum`, `min`, `max` on all ten numeric types, nulls included.
+- **Structural** `is_null`, `is_valid`, `fill_null`, `drop_null`, `if_else`, `is_in`, `index_in` and the
+  Kleene `and`/`or`.
 - **Strings** `byte_length`, `char_length`, `starts_with`, `ends_with`, `str_contains`, `str_equals`
   (scalar and array) against 11 patterns including the empty string, a multi-byte prefix, a tab and a
-  300-byte needle; `dictionary_encode` round trip and first-seen dictionary order; `hash32` null
-  propagation and injectivity.
+  300-byte needle; the ASCII case and trim transforms, `replace`, `repeat`, `slice_codeunits`, the two
+  pads, `str_reverse`, `str_concat`, `count_substring`, `find_substring` and the six ASCII predicates;
+  `dictionary_encode` round trip, first-seen dictionary order and `decode`; `hash32` null propagation and
+  injectivity.
 - **Group-by** `count`, `count_values`, `sum`, `min`, `max`, `mean` on every value type the kernels cover.
 
 ## Reading the report
@@ -277,8 +279,13 @@ Everything else, on all 27 datasets per cell:
 `differential_report.py` prints one row per operation and one column per type. A cell says `ok N` when all
 N datasets agree, `known n/N` when n of them hit one of the open findings above, `NEW n/N` for a divergence
 that is *not* in this document, `skip N` where the kernel does not exist for that type, and `-` where the
-operation does not apply. It exits 1 whenever anything failed, so it is usable as a gate; the useful signal
-in CI is the `unclassified` count in the totals line, which is 0 at 0.1.0 and should stay there.
+operation does not apply.
+
+**It exits on the `unclassified` count, not on the failure count.** A documented divergence has a FINDINGS
+entry, a strict-xfail reproduction and a paragraph above it: it is a decision on the record, and holding CI
+red on it would only teach everyone to ignore the gate. An unclassified divergence is one nobody has looked
+at, and that is what fails the build -- 0 at 0.1.0, and it should stay there. The totals line prints both
+numbers, and the last line reads `PASS (n documented divergence(s))` so the count cannot drift unnoticed.
 
 `--ops` and `--types` narrow the matrix while chasing one cell:
 

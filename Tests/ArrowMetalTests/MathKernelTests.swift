@@ -412,6 +412,54 @@ final class MathKernelTests: XCTestCase {
         XCTAssertEqual(try d1.maxElementWise(d2).toArray(), [1.5, 9.0, -2.25, nil], "float64 max_element_wise")
     }
 
+    /// -0.0 and 0.0 are equal, so which of the two comes back is a tie-break: `fmin` keeps the
+    /// negative zero and `fmax` the positive one, whichever side it is on, which also makes the pair
+    /// commutative. Subnormal operands must survive the comparison on `float32`, where the arithmetic
+    /// `<` flushes them to zero.
+    func testMinMaxElementWiseZeroTiesAndSubnormals() throws {
+        try requireRealGPU()
+        let tiny = Float.leastNonzeroMagnitude                       // 1.4e-45, subnormal
+        let a = try MetalArray<Float>([0.0, -0.0, -0.0, tiny])
+        let b = try MetalArray<Float>([-0.0, 0.0, -0.0, -0.0])
+        XCTAssertEqual(try a.minElementWise(b).toRawArray().map { $0.bitPattern },
+                       [Float](repeating: -0.0, count: 4).map { $0.bitPattern }, "float32 min keeps -0.0")
+        XCTAssertEqual(try a.maxElementWise(b).toRawArray().map { $0.bitPattern },
+                       [0.0, 0.0, -0.0, tiny].map { $0.bitPattern }, "float32 max keeps 0.0, and the subnormal wins")
+        let ta = Double.leastNonzeroMagnitude
+        let c = try MetalArray<Double>([0.0, -0.0, -0.0, ta])
+        let d = try MetalArray<Double>([-0.0, 0.0, -0.0, -0.0])
+        XCTAssertEqual(try c.minElementWise(d).toRawArray().map { $0.bitPattern },
+                       [Double](repeating: -0.0, count: 4).map { $0.bitPattern }, "float64 min keeps -0.0")
+        XCTAssertEqual(try c.maxElementWise(d).toRawArray().map { $0.bitPattern },
+                       [0.0, 0.0, -0.0, ta].map { $0.bitPattern }, "float64 max keeps 0.0")
+    }
+
+    /// The `float32` kernels run in a flush-to-zero math mode, so `sign`, `floor`, `ceil` and `trunc`
+    /// decide the subnormal and signed-zero cases from the bit pattern instead of from `<` and the
+    /// library rounding functions -- the same answers the exact `float64` kernels give.
+    func testFloat32SignAndRoundingCorners() throws {
+        try requireRealGPU()
+        let tiny = Float.leastNonzeroMagnitude                        // 1.4e-45
+        let vals: [Float] = [0.0, -0.0, tiny, -tiny, Float.leastNormalMagnitude, -0.4, 0.4, -1.5,
+                             2.5, -2.5, 1.0, -1.0, .infinity, -.infinity]
+        let a = try MetalArray<Float>(vals)
+        XCTAssertEqual(try a.sign().toRawArray().map { $0.bitPattern },
+                       vals.map { ($0 == 0 ? $0 : ($0 < 0 ? -1 : 1) as Float).bitPattern },
+                       "sign: ±0 pass through, every other magnitude is ±1")
+        for (op, mode) in [(UnaryMathOp.floor, FloatingPointRoundingRule.down), (.ceil, .up),
+                           (.trunc, .towardZero), (.round, .toNearestOrAwayFromZero)] {
+            let got = try a.unaryMath(op).toRawArray()
+            for (i, v) in vals.enumerated() where !v.isInfinite {
+                XCTAssertEqual(got[i].bitPattern, v.rounded(mode).bitPattern,
+                               "\(op) bit pattern at \(i) (\(v))")
+            }
+        }
+        let nan = try MetalArray<Float>([Float.nan])
+        for op in [UnaryMathOp.floor, .ceil, .round, .trunc, .sign] {
+            XCTAssertTrue(try nan.unaryMath(op).toRawArray()[0].isNaN, "\(op) propagates NaN")
+        }
+    }
+
     // MARK: - Cumulative
 
     func cumulativeOracle<T>(_ vals: [T?], identity: T, _ combine: (T, T) -> T) -> [T?] {

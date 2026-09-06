@@ -16,19 +16,34 @@ enum TopKSource {
     /// `kind` names the value mapping, `V` is the MSL type of a row, `K` the key type (uint or ulong).
     static func source(kind: String, V: String, K: String) -> String {
         let keyMax = K == "ulong" ? "ULONG_MAX" : "UINT_MAX"
+        // The float mappings canonicalise exactly as `SortSource` does, or top_k would order the ties
+        // this library calls equal differently from argsort: -0.0 collapses onto 0.0, every NaN onto
+        // one value after +inf, and a reversed order keeps NaN at the end rather than mirroring it to
+        // the front. `nan` is a separate flag because the descending key is the free maximum, not ~k.
         let map: String
+        var nanFlag = "bool nan = false;"
         switch kind {
         case "i32": map = "\(K) k = (uint)v ^ 0x80000000u;"
         case "u32": map = "\(K) k = (uint)v;"
-        case "f32": map = "uint b = as_type<uint>(v); \(K) k = (b & 0x80000000u) ? ~b : (b | 0x80000000u);"
+        case "f32":
+            nanFlag = "bool nan = (as_type<uint>(v) & 0x7FFFFFFFu) > 0x7F800000u;"
+            map = """
+            uint b = as_type<uint>(v); if ((b & 0x7FFFFFFFu) == 0u) b = 0u; if (nan) b = 0x7F800001u;
+                \(K) k = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+            """
         case "i64": map = "\(K) k = (ulong)v ^ 0x8000000000000000ul;"
         case "u64": map = "\(K) k = (ulong)v;"
-        default:    map = "ulong b = (ulong)v; \(K) k = (b & 0x8000000000000000ul) ? ~b : (b | 0x8000000000000000ul);"
+        default:
+            nanFlag = "bool nan = ((ulong)v & 0x7FFFFFFFFFFFFFFFul) > 0x7FF0000000000000ul;"
+            map = """
+            ulong b = (ulong)v; if ((b & 0x7FFFFFFFFFFFFFFFul) == 0ul) b = 0ul; if (nan) b = 0x7FF0000000000001ul;
+                \(K) k = (b & 0x8000000000000000ul) ? ~b : (b | 0x8000000000000000ul);
+            """
         }
         return KernelSource.prelude + """
 
         #define TK_NOROW 0xFFFFFFFFu
-        inline \(K) tk_map(\(V) v, uint inv) { \(map) return inv ? ~k : k; }
+        inline \(K) tk_map(\(V) v, uint inv) { \(nanFlag) \(map) return inv ? (nan ? \(keyMax) : ~k) : k; }
         // Lexicographic (key, row). Row indices are unique, so this is a strict total order.
         inline bool tk_less(\(K) a, uint ai, \(K) b, uint bi) { return (a < b) || (a == b && ai < bi); }
 

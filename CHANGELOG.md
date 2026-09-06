@@ -48,4 +48,9 @@ Bindings
 Quality
 - CPU reference for every kernel; 26 tests including a scenario matrix over every type, null density, size
   and sliced input; concurrency and pool tests; CI on hosted Apple silicon in debug and release.
+- Differential matrix against `pyarrow.compute` (docs/EVALUATION.md): 13,176 cases per run, 0 unclassified
+  divergences. Fixed from its findings: stable null order in argsort and top_k, the -0.0 tie in the sort
+  keys (top_k included, which had its own key mapping), NaN kept at the end of a descending sort, float32
+  sums in software double, unsigned group-by sums, exact float32 comparison, float32 `sign`/`ceil`/`floor`/
+  `trunc`/`round` and element-wise `min`/`max` on subnormals and signed zeros.
 - Benchmarks: Swift vs all-core CPU vs Accelerate; Polars/pyarrow/pandas; ArrowMetal from Python in-process; latency mode.

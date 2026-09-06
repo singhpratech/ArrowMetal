@@ -49,6 +49,10 @@ int  am_take(am_array* a, am_array* indices, am_array** out);
 int  am_slice(am_array* a, int64_t offset, int64_t length, am_array** out);
 
 // Sorting (GPU LSD radix sort; stable, nulls last, NaN after +inf).
+// Float keys are canonicalised first: -0.0 sorts as 0.0 (they are equal, so the tie keeps input order)
+// and every NaN is one value. Nulls and NaN stay at the end when `descending` is set -- a reversed order
+// does not mirror them to the front -- and am_top_k maps its keys the same way, so it agrees with
+// am_argsort element for element.
 int  am_argsort(am_array* a, int descending, am_array** out);   // int32 indices
 int  am_sort(am_array* a, int descending, am_array** out);      // sorted copy, same type
 int  am_top_k(am_array* a, int64_t k, int largest, am_array** out);  // int32 indices of the k largest/smallest
@@ -141,7 +145,9 @@ int  am_if_else(am_array* cond, am_array* left, am_array* right, am_array** out)
 int  am_coalesce(am_array** arrays, int64_t count, am_array** out);
 // Set lookup against the non-null values of set_array. Nulls in the set are ignored and a null element
 // never matches, so am_is_in never returns nulls; am_index_in returns int32 indices into set_array
-// (first occurrence) and null where the element is null or absent.
+// (first occurrence) and null where the element is null or absent. Both search the same total order
+// am_unique and the sort use, so on a float column every NaN is one value and -0.0 matches 0.0
+// (pyarrow's hash lookup agrees on NaN and keeps the two zeros apart).
 int  am_is_in(am_array* a, am_array* set_array, am_array** out);
 int  am_index_in(am_array* a, am_array* set_array, am_array** out);
 // Three-valued logic over boolean arrays: false AND null = false, true OR null = true.
@@ -157,6 +163,9 @@ int  am_or_kleene(am_array* a, am_array* b, am_array** out);
 // Notes: 3-7 need a float32/float64 column (cast an integer one first). 8-11 are the identity on an
 // integer column and keep its type; `round` rounds halves away from zero. Integer `negate` and `abs`
 // wrap, so abs(INT8_MIN) is INT8_MIN. `sign` returns -1/0/1 and leaves NaN and both signed zeros alone.
+// (pyarrow's `sign` normalises -0.0 to 0.0 and narrows an integer column to int8; these keep the column's
+// own type at every width.) On float32, `sign` and 8-11 read the bit pattern rather than comparing, so a
+// subnormal operand is not flushed: sign(1.4e-45) is 1, ceil(1.4e-45) is 1.0 and round(-0.4) is -0.0.
 // On float64, ops 0-2 and 8-11 are exact (bit-pattern kernels); 3-7 are evaluated in float and widened,
 // so expect about 7 correct significant decimal digits.
 int  am_unary(am_array* a, int op, am_array** out);
@@ -168,6 +177,9 @@ int  am_unary(am_array* a, int op, am_array** out);
 // element type); ops 7 and 8 have no scalar form. Ops 0-4 need an integer column; `shift_right` is
 // arithmetic on a signed one and logical on an unsigned one, and a shift count outside [0, bit width)
 // yields 0 (or the sign fill for a signed `shift_right`) rather than raising as Arrow does.
+// (pyarrow's unchecked shifts return the operand unchanged there, and its range excludes the sign bit.)
+// Element-wise min/max skip NaN and break a ±0 tie the way fmin/fmax do: min keeps -0.0 and max keeps 0.0,
+// whichever side it came from, so the pair is commutative.
 // `modulo` is C remainder (the sign follows the dividend) and defines x % 0 as 0, as `divide` does;
 // `power` uses repeated squaring on integers, wraps, and defines a negative exponent as 0. `power` and
 // `modulo` are not implemented for float64. Ops 0-6 propagate nulls; 7 and 8 skip them, so a null on one
@@ -175,7 +187,8 @@ int  am_unary(am_array* a, int op, am_array** out);
 int  am_binary(am_array* a, int op, am_array* b /* or NULL */, const void* scalar /* or NULL */, am_array** out);
 
 // am_cumulative op numbering: 0 cumulative_sum, 1 cumulative_min, 2 cumulative_max.
-// Output is null exactly where the input is, and the running value carries across nulls unchanged.
+// Output is null exactly where the input is, and the running value carries across nulls unchanged --
+// pyarrow's `skip_nulls=True`, not its default, which propagates the first null to the end of the column.
 // Two-level GPU scan; integer sums wrap and are exact, float sums reassociate.
 int  am_cumulative(am_array* a, int op, am_array** out);
 
