@@ -1231,60 +1231,6 @@ MetalArray.string_transform = _am_string_transform
 def _predicate_method(op, doc):
     def f(self):
         return _am_string_predicate(self, op)
-# ---- the temporal functions beyond am_temporal_extract / am_temporal_math: the option-carrying week
-# numbers, the struct-valued extractors, subsecond, is_dst and every *_between difference.
-# Appended rather than written into the class body so the file stays additive.
-# Op numbering is the C ABI contract; see include/arrowmetal.h.
-_lib.am_temporal_extra.argtypes = [_P, ctypes.c_int, ctypes.c_int64, ctypes.c_int64, _P, ctypes.POINTER(_P)]
-_lib.am_temporal_extra.restype = ctypes.c_int
-
-_TEMPORAL_EXTRA = {"week": 0, "us_week": 1, "us_year": 2, "iso_calendar": 3, "year_month_day": 4,
-                   "is_dst": 5, "day_of_week": 6, "subsecond": 7,
-                   "years_between": 8, "quarters_between": 9, "months_between": 10,
-                   "weeks_between": 11, "hours_between": 12, "minutes_between": 13,
-                   "seconds_between": 14, "milliseconds_between": 15,
-                   "microseconds_between": 16, "nanoseconds_between": 17}
-
-
-def _am_temporal_extra(self, op, p1=0, p2=0, other=None):
-    """One temporal op by name; the table is in include/arrowmetal.h."""
-    return _call(_lib.am_temporal_extra, self._h, _TEMPORAL_EXTRA[op], int(p1), int(p2),
-                 other._h if other is not None else None)
-
-
-def _am_week(self, week_starts_monday=True, count_from_zero=False, first_week_is_fully_in_year=False):
-    """Arrow `week` with the full WeekOptions, int64, UTC.
-
-    `count_from_zero` numbers the weeks against the value's own calendar year, so a date at the start
-    of a year that belongs to the previous year's last week comes out as 0 rather than 52 or 53.
-    `first_week_is_fully_in_year` makes week 1 the first week lying wholly inside January; without it
-    the ISO majority rule applies and a week beginning on 29, 30 or 31 December is week 1 of the next
-    year. The defaults reproduce iso_week."""
-    bits = ((1 if week_starts_monday else 0) | (2 if count_from_zero else 0)
-            | (4 if first_week_is_fully_in_year else 0))
-    return _am_temporal_extra(self, "week", bits)
-
-
-def _am_weeks_between(self, other, count_from_zero=True, week_start=1):
-    """Arrow `weeks_between(self, other)`: week boundaries crossed, both sides floored to the start of
-    their week first. `week_start` is 1 = Monday ... 7 = Sunday. `count_from_zero` is part of Arrow's
-    DayOfWeekOptions and is accepted for signature parity, but does not change the answer."""
-    return _am_temporal_extra(self, "weeks_between", 1 if count_from_zero else 0, week_start,
-                              other=other)
-
-
-def _am_day_of_week_options(self, count_from_zero=True, week_start=1):
-    """Arrow `day_of_week` with DayOfWeekOptions; `week_start` uses the ISO numbering (1 = Monday ...
-    7 = Sunday) and is unaffected by `count_from_zero`. The default options keep the existing int32
-    result (Monday = 0); any other combination returns int64, as pyarrow does."""
-    if count_from_zero and week_start == 1:
-        return _am_day_of_week_int32(self)
-    return _am_temporal_extra(self, "day_of_week", 1 if count_from_zero else 0, week_start)
-
-
-def _no_arg_temporal_extra(op, doc):
-    def f(self):
-        return _am_temporal_extra(self, op)
     f.__name__ = op
     f.__doc__ = doc
     return f
@@ -1352,10 +1298,6 @@ def _trim_method(with_set, without_set, doc):
             return _am_string_transform(self, without_set)
         return _am_string_transform(self, with_set, arg1=characters)
     f.__name__ = with_set
-def _between_temporal_extra(op, doc):
-    def f(self, other):
-        return _am_temporal_extra(self, op, other=other)
-    f.__name__ = op
     f.__doc__ = doc
     return f
 
@@ -1699,6 +1641,73 @@ def nulls(length):
     out = _P()
     _check(_lib.am_null_array(length, ctypes.byref(out)))
     return MetalArray(out)
+# ---- the temporal functions beyond am_temporal_extract / am_temporal_math: the option-carrying week
+# numbers, the struct-valued extractors, subsecond, is_dst and every *_between difference.
+# Appended rather than written into the class body so the file stays additive.
+# Op numbering is the C ABI contract; see include/arrowmetal.h.
+_lib.am_temporal_extra.argtypes = [_P, ctypes.c_int, ctypes.c_int64, ctypes.c_int64, _P, ctypes.POINTER(_P)]
+_lib.am_temporal_extra.restype = ctypes.c_int
+
+_TEMPORAL_EXTRA = {"week": 0, "us_week": 1, "us_year": 2, "iso_calendar": 3, "year_month_day": 4,
+                   "is_dst": 5, "day_of_week": 6, "subsecond": 7,
+                   "years_between": 8, "quarters_between": 9, "months_between": 10,
+                   "weeks_between": 11, "hours_between": 12, "minutes_between": 13,
+                   "seconds_between": 14, "milliseconds_between": 15,
+                   "microseconds_between": 16, "nanoseconds_between": 17}
+
+
+def _am_temporal_extra(self, op, p1=0, p2=0, other=None):
+    """One temporal op by name; the table is in include/arrowmetal.h."""
+    return _call(_lib.am_temporal_extra, self._h, _TEMPORAL_EXTRA[op], int(p1), int(p2),
+                 other._h if other is not None else None)
+
+
+def _am_week(self, week_starts_monday=True, count_from_zero=False, first_week_is_fully_in_year=False):
+    """Arrow `week` with the full WeekOptions, int64, UTC.
+
+    `count_from_zero` numbers the weeks against the value's own calendar year, so a date at the start
+    of a year that belongs to the previous year's last week comes out as 0 rather than 52 or 53.
+    `first_week_is_fully_in_year` makes week 1 the first week lying wholly inside January; without it
+    the ISO majority rule applies and a week beginning on 29, 30 or 31 December is week 1 of the next
+    year. The defaults reproduce iso_week."""
+    bits = ((1 if week_starts_monday else 0) | (2 if count_from_zero else 0)
+            | (4 if first_week_is_fully_in_year else 0))
+    return _am_temporal_extra(self, "week", bits)
+
+
+def _am_weeks_between(self, other, count_from_zero=True, week_start=1):
+    """Arrow `weeks_between(self, other)`: week boundaries crossed, both sides floored to the start of
+    their week first. `week_start` is 1 = Monday ... 7 = Sunday. `count_from_zero` is part of Arrow's
+    DayOfWeekOptions and is accepted for signature parity, but does not change the answer."""
+    return _am_temporal_extra(self, "weeks_between", 1 if count_from_zero else 0, week_start,
+                              other=other)
+
+
+def _am_day_of_week_options(self, count_from_zero=True, week_start=1):
+    """Arrow `day_of_week` with DayOfWeekOptions; `week_start` uses the ISO numbering (1 = Monday ...
+    7 = Sunday) and is unaffected by `count_from_zero`. The default options keep the existing int32
+    result (Monday = 0); any other combination returns int64, as pyarrow does."""
+    if count_from_zero and week_start == 1:
+        return _am_day_of_week_int32(self)
+    return _am_temporal_extra(self, "day_of_week", 1 if count_from_zero else 0, week_start)
+
+
+def _no_arg_temporal_extra(op, doc):
+    def f(self):
+        return _am_temporal_extra(self, op)
+    f.__name__ = op
+    f.__doc__ = doc
+    return f
+
+
+def _between_temporal_extra(op, doc):
+    def f(self, other):
+        return _am_temporal_extra(self, op, other=other)
+    f.__name__ = op
+    f.__doc__ = doc
+    return f
+
+
 _am_day_of_week_int32 = MetalArray.day_of_week
 MetalArray.week = _am_week
 MetalArray.weeks_between = _am_weeks_between
@@ -1738,3 +1747,228 @@ for _op, _doc in [
 ]:
     setattr(MetalArray, _op, _between_temporal_extra(_op, _doc))
 del _op, _doc
+
+
+# ---- trigonometry, the remaining boolean operators, float classification, the conditional
+# ---- transforms and a 64-bit value hash. Op numbering is the C ABI contract; see include/arrowmetal.h.
+_lib.am_trig.argtypes = [_P, ctypes.c_int, _P, ctypes.POINTER(_P)]
+_lib.am_trig.restype = ctypes.c_int
+_lib.am_logical.argtypes = [_P, ctypes.c_int, _P, ctypes.POINTER(_P)]
+_lib.am_logical.restype = ctypes.c_int
+_lib.am_float_class.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_float_class.restype = ctypes.c_int
+_lib.am_fill_null_direction.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_fill_null_direction.restype = ctypes.c_int
+_lib.am_case_when.argtypes = [ctypes.POINTER(_P), ctypes.POINTER(_P), ctypes.c_int64, _P, ctypes.POINTER(_P)]
+_lib.am_case_when.restype = ctypes.c_int
+_lib.am_choose.argtypes = [_P, ctypes.POINTER(_P), ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_choose.restype = ctypes.c_int
+_lib.am_replace_with_mask.argtypes = [_P, _P, _P, ctypes.POINTER(_P)]
+_lib.am_replace_with_mask.restype = ctypes.c_int
+_lib.am_indices_nonzero.argtypes = [_P, ctypes.POINTER(_P)]
+_lib.am_indices_nonzero.restype = ctypes.c_int
+_lib.am_hash64.argtypes = [_P, ctypes.POINTER(_P)]
+_lib.am_hash64.restype = ctypes.c_int
+
+_TRIG = {"sin": 0, "cos": 1, "tan": 2, "asin": 3, "acos": 4, "atan": 5,
+         "sinh": 6, "cosh": 7, "tanh": 8, "asinh": 9, "acosh": 10, "atanh": 11,
+         "atan2": 12,
+         "sin_checked": 13, "cos_checked": 14, "tan_checked": 15, "asin_checked": 16,
+         "acos_checked": 17, "acosh_checked": 18, "atanh_checked": 19}
+_LOGICAL = {"xor": 0, "and_not": 1, "and_not_kleene": 2}
+_FLOAT_CLASS = {"is_nan": 0, "is_finite": 1, "is_inf": 2}
+
+
+def _as_metal(x):
+    return x if isinstance(x, MetalArray) else MetalArray.from_arrow(x)
+
+
+def _trig_method(name, doc):
+    op = _TRIG[name]
+
+    def f(self):
+        return _call(_lib.am_trig, self._h, op, None)
+
+    f.__name__ = name
+    f.__doc__ = doc
+    return f
+
+
+# float32 runs Metal's library functions (with the six hyperbolics written out from well-conditioned
+# identities, because Metal's own lose accuracy and get +/-infinity wrong); float64 runs a software
+# binary64 implementation on the GPU, since Metal has no double. Measured against the host libm over a
+# million random arguments per function the worst case is 4 ulp (float32) and 5 ulp (float64).
+for _name in ("sin", "cos", "tan", "asin", "acos", "atan",
+              "sinh", "cosh", "tanh", "asinh", "acosh", "atanh"):
+    setattr(MetalArray, _name, _trig_method(
+        _name, "Arrow `%s`, element-wise on a float32 or float64 column. Null in, null out." % _name))
+
+# Arrow's `_checked` twins: same values, but a domain violation on a non-null row raises instead of
+# returning NaN. asin/acos need |x| <= 1, acosh needs x >= 1, atanh needs |x| < 1, and sin/cos/tan
+# reject +/-infinity. NaN never raises and null rows are never inspected, as in pyarrow.
+for _name in ("sin_checked", "cos_checked", "tan_checked", "asin_checked",
+              "acos_checked", "acosh_checked", "atanh_checked"):
+    setattr(MetalArray, _name, _trig_method(
+        _name, "Arrow `%s`: as %s, but raises on a domain violation." % (_name, _name[:-8])))
+del _name
+
+
+def _am_atan2(self, other):
+    """Arrow `atan2(y, x)` with this column as y: the angle of (x, y) in [-pi, pi].
+
+    `other` may be another column or a scalar (which is broadcast into a column first). Follows the
+    C99 special-value table, including the four +/-0 and four +/-infinity cases."""
+    if not isinstance(other, MetalArray):
+        if hasattr(other, "__arrow_c_array__") or isinstance(other, (pa.Array, pa.ChunkedArray, list)):
+            other = MetalArray.from_arrow(other)
+        else:
+            other = MetalArray.from_arrow(pa.array([other] * len(self), type=self.type))
+    return _call(_lib.am_trig, self._h, _TRIG["atan2"], other._h)
+
+
+MetalArray.atan2 = _am_atan2
+
+
+def _logical_method(name, doc):
+    op = _LOGICAL[name]
+
+    def f(self, other):
+        # Bind the import to a local: a temporary MetalArray would be released before the call.
+        o = _as_metal(other)
+        return _call(_lib.am_logical, self._h, op, o._h)
+
+    f.__name__ = name
+    f.__doc__ = doc
+    return f
+
+
+MetalArray.xor = _logical_method(
+    "xor", "Arrow `xor` over two boolean columns. Nulls propagate (output validity is the AND).")
+MetalArray.and_not = _logical_method(
+    "and_not", "Arrow `and_not`: `a AND NOT b` over two boolean columns. Nulls propagate.")
+MetalArray.and_not_kleene = _logical_method(
+    "and_not_kleene",
+    "Arrow `and_not_kleene`: three-valued `a AND NOT b`. A valid false on the left or a valid true "
+    "on the right gives false even when the other side is null.")
+MetalArray.__xor__ = MetalArray.xor
+
+
+def _float_class_method(name, doc):
+    op = _FLOAT_CLASS[name]
+
+    def f(self):
+        return _call(_lib.am_float_class, self._h, op)
+
+    f.__name__ = name
+    f.__doc__ = doc
+    return f
+
+
+# Arrow defines all three on every numeric type, not only the float ones, and propagates nulls.
+MetalArray.is_nan = _float_class_method(
+    "is_nan", "Arrow `is_nan`. False everywhere on an integer column; null where the input is null.")
+MetalArray.is_finite = _float_class_method(
+    "is_finite", "Arrow `is_finite`. True everywhere on an integer column; null where the input is null.")
+MetalArray.is_inf = _float_class_method(
+    "is_inf", "Arrow `is_inf`. False everywhere on an integer column; null where the input is null.")
+
+
+def _am_fill_null_forward(self):
+    """Arrow `fill_null_forward`: every null takes the value of the nearest non-null element before
+    it. Leading nulls stay null. One GPU max-scan plus a gather."""
+    return _call(_lib.am_fill_null_direction, self._h, 1)
+
+
+def _am_fill_null_backward(self):
+    """Arrow `fill_null_backward`: every null takes the value of the nearest non-null element after
+    it. Trailing nulls stay null."""
+    return _call(_lib.am_fill_null_direction, self._h, 0)
+
+
+MetalArray.fill_null_forward = _am_fill_null_forward
+MetalArray.fill_null_backward = _am_fill_null_backward
+
+
+def case_when(conds, values, default=None):
+    """Arrow `case_when`: each row takes the value of the first condition that is true.
+
+    `conds` are boolean columns and `values` value columns of one type and length, one per condition;
+    `default` (or None, giving nulls) supplies the rows no condition matches. A **null condition
+    counts as false** and the row falls through, which is what Arrow does; a null in the chosen
+    branch's values does make the output null.
+
+        am.case_when([x > 10, x > 5], [big, medium], small)
+    """
+    cs = [_as_metal(c) for c in conds]
+    vs = [_as_metal(v) for v in values]
+    if len(cs) != len(vs) or not cs:
+        raise ArrowMetalError(f"case_when needs one value column per condition, got {len(cs)} and {len(vs)}")
+    ch = (_P * len(cs))(*[c._h for c in cs])
+    vh = (_P * len(vs))(*[v._h for v in vs])
+    out = _P()
+    d = None if default is None else _as_metal(default)
+    _check(_lib.am_case_when(ch, vh, len(cs), None if d is None else d._h, ctypes.byref(out)))
+    return MetalArray(out)
+
+
+def choose(indices, values):
+    """Arrow `choose`: `values[indices[i]][i]`, element-wise.
+
+    `indices` is an int32, int64 or uint32 column; a null index gives a null output, and an index
+    outside `[0, len(values))` raises, as in Arrow."""
+    idx = _as_metal(indices)
+    vs = [_as_metal(v) for v in values]
+    if not vs:
+        raise ArrowMetalError("choose needs at least one value column")
+    vh = (_P * len(vs))(*[v._h for v in vs])
+    out = _P()
+    _check(_lib.am_choose(idx._h, vh, len(vs), ctypes.byref(out)))
+    return MetalArray(out)
+
+
+def _am_replace_with_mask(self, mask, replacements):
+    """Arrow `replace_with_mask`: rows where `mask` is true take the next value from `replacements`,
+    in order; rows where the mask is null become null; every other row keeps its own value.
+
+    `replacements` must hold at least as many elements as the mask has valid trues (fewer raises, a
+    surplus is ignored, both as in pyarrow)."""
+    # Bind the imports to locals: a temporary MetalArray would be released before the call.
+    m, r = _as_metal(mask), _as_metal(replacements)
+    return _call(_lib.am_replace_with_mask, self._h, m._h, r._h)
+
+
+def _am_indices_nonzero(self):
+    """Arrow `indices_nonzero`: the uint64 row numbers where the value is valid and not zero.
+
+    `-0.0` counts as zero and every NaN counts as non-zero, as in Arrow."""
+    return _call(_lib.am_indices_nonzero, self._h)
+
+
+def _am_hash64(self):
+    """A 64-bit hash of every element, as uint64 (an ArrowMetal extension: Arrow has no element-wise
+    hash function).
+
+    MurmurHash3's finaliser over the value's own bytes, seeded with the golden ratio; `-0.0` hashes
+    as `+0.0` and every NaN as one canonical NaN, so Arrow-equal values always hash equal. Nulls hash
+    to 0 and stay null. See include/arrowmetal.h for the exact definition."""
+    return _call(_lib.am_hash64, self._h)
+
+
+MetalArray.replace_with_mask = _am_replace_with_mask
+MetalArray.indices_nonzero = _am_indices_nonzero
+MetalArray.hash64 = _am_hash64
+
+# ---- hash64 is defined for both fixed_size_binary (FNV-1a over the element bytes) and the
+# primitive types (the 64-bit value hash); dispatch on the column's format.
+_hash64_primitive = _am_hash64
+
+
+def _hash64_any(self):
+    """64-bit hash per element on the GPU: FNV-1a over the bytes of a fixed_size_binary column,
+    the value hash for primitive and boolean columns. Null in, null out."""
+    if self.format.startswith("w:"):
+        return _fixed_binary_hash64(self)
+    return _hash64_primitive(self)
+
+
+MetalArray.hash64 = _hash64_any

@@ -1012,3 +1012,144 @@ def test_temporal_extra_shapes_and_nulls():
         assert pylist(ymd.struct_field("day")) == pc.day(values).cast(pa.int64()).to_pylist()
         assert pylist(col.years_between(col)) == [None if v is None else 0
                                                   for v in values.to_pylist()]
+
+
+# ---------------------------------------------------------------- trigonometry, logic, conditionals
+
+
+TRIG_DOMAIN = {
+    "sin": (-20.0, 20.0), "cos": (-20.0, 20.0), "tan": (-20.0, 20.0),
+    "asin": (-1.0, 1.0), "acos": (-1.0, 1.0), "atan": (-50.0, 50.0),
+    "sinh": (-10.0, 10.0), "cosh": (-10.0, 10.0), "tanh": (-10.0, 10.0),
+    "asinh": (-50.0, 50.0), "acosh": (1.0, 50.0), "atanh": (-0.99, 0.99),
+}
+
+
+def _trig_column(lo, hi, ty):
+    step = (hi - lo) / 40.0
+    vals = [None if i % 7 == 3 else lo + step * i for i in range(41)]
+    return pa.array(vals, type=ty)
+
+
+@pytest.mark.parametrize("name", sorted(TRIG_DOMAIN))
+@pytest.mark.parametrize("ty", [pa.float64(), pa.float32()])
+def test_trig_matches_pyarrow(name, ty):
+    lo, hi = TRIG_DOMAIN[name]
+    src = _trig_column(lo, hi, ty)
+    got = pylist(getattr(am.array(src), name)())
+    want = getattr(pc, name)(src).to_pylist()
+    assert len(got) == len(want)
+    for g, w in zip(got, want):
+        if g is None or w is None:
+            assert g is w
+        else:
+            assert g == pytest.approx(w, rel=1e-12 if ty == pa.float64() else 1e-6, abs=1e-300)
+
+
+def test_atan2_array_and_scalar():
+    y = pa.array([1.0, -1.0, 0.0, 3.0, None], pa.float64())
+    x = pa.array([1.0, 2.0, -1.0, 0.0, 1.0], pa.float64())
+    got = pylist(am.array(y).atan2(x))
+    want = pc.atan2(y, x).to_pylist()
+    for g, w in zip(got, want):
+        assert g is None if w is None else g == pytest.approx(w)
+    scalar = pylist(am.array(y).atan2(2.0))
+    for g, v in zip(scalar, y.to_pylist()):
+        assert g is None if v is None else g == pytest.approx(math.atan2(v, 2.0))
+
+
+@pytest.mark.parametrize("name,bad", [("sin_checked", math.inf), ("cos_checked", -math.inf),
+                                      ("tan_checked", math.inf), ("asin_checked", 1.5),
+                                      ("acos_checked", -1.5), ("acosh_checked", 0.5),
+                                      ("atanh_checked", 1.0)])
+def test_trig_checked(name, bad):
+    unchecked = name[: -len("_checked")]
+    lo, hi = TRIG_DOMAIN[unchecked]
+    src = _trig_column(lo, hi, pa.float64())
+    # In-domain (and NaN, and nulls) gives exactly the unchecked answer.
+    assert pylist(getattr(am.array(src), name)()) == pylist(getattr(am.array(src), unchecked)())
+    nan_ok = pa.array([float("nan"), None, (lo + hi) / 2], pa.float64())
+    assert pylist(getattr(am.array(nan_ok), name)())[1] is None
+    # One out-of-domain value raises, and pyarrow agrees that it should.
+    vals = src.to_pylist()
+    vals[4] = bad
+    with pytest.raises(am.ArrowMetalError):
+        getattr(am.array(pa.array(vals, pa.float64())), name)()
+    with pytest.raises(pa.ArrowInvalid):
+        getattr(pc, name)(pa.array(vals, pa.float64()))
+
+
+def test_xor_and_not_and_kleene():
+    a = pa.array([True, True, False, None, None, False], pa.bool_())
+    b = pa.array([True, False, None, True, False, False], pa.bool_())
+    assert pylist(am.array(a).xor(b)) == pc.xor(a, b).to_pylist()
+    assert pylist(am.array(a) ^ am.array(b)) == pc.xor(a, b).to_pylist()
+    assert pylist(am.array(a).and_not(b)) == pc.and_not(a, b).to_pylist()
+    assert pylist(am.array(a).and_not_kleene(b)) == pc.and_not_kleene(a, b).to_pylist()
+
+
+@pytest.mark.parametrize("src", [
+    pa.array([1.5, None, float("nan"), float("inf"), float("-inf"), -0.0, 1e308], pa.float64()),
+    pa.array([1.5, None, float("nan"), float("inf"), float("-inf"), -0.0, 1e38], pa.float32()),
+    pa.array([1, None, 3, -4, 0, 7, 9], pa.int32()),
+])
+def test_float_classification(src):
+    assert pylist(am.array(src).is_nan()) == pc.is_nan(src).to_pylist()
+    assert pylist(am.array(src).is_finite()) == pc.is_finite(src).to_pylist()
+    assert pylist(am.array(src).is_inf()) == pc.is_inf(src).to_pylist()
+
+
+@pytest.mark.parametrize("src", [INT64, FLOAT64, FLOAT32, BOOL])
+def test_fill_null_forward_and_backward(src):
+    assert pylist(am.array(src).fill_null_forward()) == pc.fill_null_forward(src).to_pylist()
+    assert pylist(am.array(src).fill_null_backward()) == pc.fill_null_backward(src).to_pylist()
+
+
+def test_case_when_matches_pyarrow():
+    c1 = pa.array([True, False, None, False, True, True, False, None, True], pa.bool_())
+    c2 = pa.array([False, True, True, None, False, False, True, True, False], pa.bool_())
+    v1 = pa.array([10, 20, 30, 40, 50, 60, 70, 80, 90], pa.int64())
+    v2 = pa.array([1, 2, None, 4, 5, 6, 7, 8, 9], pa.int64())
+    cond = pa.StructArray.from_arrays([c1, c2], ["a", "b"])
+    assert pylist(am.case_when([c1, c2], [v1, v2], INT64)) == pc.case_when(cond, v1, v2, INT64).to_pylist()
+    assert pylist(am.case_when([c1, c2], [v1, v2])) == pc.case_when(cond, v1, v2).to_pylist()
+
+
+def test_choose_matches_pyarrow_and_rejects_out_of_range():
+    idx = pa.array([0, 1, 2, None, 1, 0, 2, 1, 0], pa.int64())
+    cols = [pa.array([i * 100 + j for j in range(9)], pa.int64()) for i in range(3)]
+    assert pylist(am.choose(idx, cols)) == pc.choose(idx, *cols).to_pylist()
+    with pytest.raises(am.ArrowMetalError):
+        am.choose(pa.array([0, 3], pa.int64()), [c.slice(0, 2) for c in cols])
+
+
+def test_replace_with_mask_matches_pyarrow():
+    mask = pa.array([True, False, None, True, False, True, False, None, False], pa.bool_())
+    repl = pa.array([-1, None, -3], pa.int64())
+    assert pylist(am.array(INT64).replace_with_mask(mask, repl)) == \
+        pc.replace_with_mask(INT64, mask, repl).to_pylist()
+    with pytest.raises(am.ArrowMetalError):
+        am.array(INT64).replace_with_mask(mask, repl.slice(0, 2))
+
+
+@pytest.mark.parametrize("src", [INT64, FLOAT64, BOOL])
+def test_indices_nonzero_matches_pyarrow(src):
+    got = am.array(src).indices_nonzero()
+    assert got.type == pa.uint64()
+    assert pylist(got) == pc.indices_nonzero(src).to_pylist()
+
+
+def test_hash64_is_deterministic_and_value_based():
+    h = am.array(INT64).hash64()
+    assert h.type == pa.uint64()
+    values = pylist(h)
+    assert values[1] is None and values[7] is None          # nulls stay null
+    assert pylist(am.array(INT64).hash64()) == values       # deterministic
+    # Equal values hash equal across signed zero and NaN payloads.
+    zeros = pylist(am.array(pa.array([0.0, -0.0], pa.float64())).hash64())
+    assert zeros[0] == zeros[1]
+    nans = pa.array([float("nan")] * 2, pa.float64())
+    assert len(set(pylist(am.array(nans).hash64()))) == 1
+    # Distinct values collide rarely.
+    big = pa.array(list(range(50_000)), pa.int64())
+    assert len(set(pylist(am.array(big).hash64()))) == 50_000

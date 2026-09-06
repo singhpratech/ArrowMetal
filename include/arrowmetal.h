@@ -719,6 +719,100 @@ int  am_extension_wrap(am_array* a, const char* name, const uint8_t* metadata, i
 // type, so this is how a caller makes one.
 int  am_null_array(int64_t length, am_array** out);
 
+// ---------------------------------------------------------------------------------------------------
+// Trigonometry, the remaining logical operators, float classification, the conditional transforms and
+// a 64-bit value hash (all GPU).
+//
+// am_trig op numbering. Ops 0-11 are unary and need `b` to be NULL; op 12 is atan2 and needs `b`; ops
+// 13-19 are Arrow's `_checked` twins, which raise a domain error instead of returning NaN.
+//
+//   op  name           op  name           op  name              op  name
+//   --  -------------  --  -------------  --  ----------------  --  ----------------
+//    0  sin             6  sinh           12  atan2(a, b)       16  asin_checked
+//    1  cos             7  cosh           13  sin_checked       17  acos_checked
+//    2  tan             8  tanh           14  cos_checked       18  acosh_checked
+//    3  asin            9  asinh          15  tan_checked       19  atanh_checked
+//    4  acos           10  acosh
+//    5  atan           11  atanh
+//
+// Float columns only: an integer column is an error rather than being promoted to float64, as with
+// sqrt / exp / ln. Nulls propagate (op 12 ANDs both validity bitmaps; every other op shares the
+// input's zero-copy). atan2(y, x) takes this array as y and `b` as x, and follows the C99 special
+// value table including the four ±0 and four ±infinity cases.
+//
+// float32 runs Metal's library functions, with the six hyperbolics written out from well-conditioned
+// identities because Metal's own are inaccurate and get ±infinity wrong. float64 runs a **software
+// binary64** implementation on the GPU (Metal has no double): Cody-Waite reduction against a 128-bit
+// pi/2 plus Taylor series over the correctly rounded software adder and multiplier. Measured against
+// the host libm over a million random arguments per function, the maximum error is 4 ulp for float32
+// and 5 ulp for float64 (sin 2, cos 3, tan 5, asin 4, acos 4, atan 2, sinh 4, cosh 2, tanh 3,
+// asinh 3, acosh 3, atanh 4). sin / cos / tan reduce exactly for |x| <= 2^45 * pi/2 ~ 5.5e13; beyond
+// that the reduction degrades in step with the argument's own ulp, and |x| >= 2^62 returns NaN.
+//
+// The domains the `_checked` ops enforce, matching pyarrow: asin and acos need |x| <= 1, acosh needs
+// x >= 1, atanh needs |x| < 1, and sin / cos / tan reject +/-infinity. A NaN input never raises and a
+// null row is never inspected. The check is a device flag plus an atomic min of the offending index,
+// read back after the dispatch, so a clean column costs nothing and the error names the first bad row.
+int  am_trig(am_array* a, int op, am_array* b_or_null, am_array** out);
+
+// Boolean logic beyond and / or / not and the Kleene pair. op: 0 xor, 1 and_not, 2 and_not_kleene.
+// xor and and_not propagate nulls (output validity is the AND of both inputs). and_not_kleene is
+// three-valued: a valid false on the left or a valid true on the right gives false even when the
+// other side is null. Word-wise over the packed bitmaps, one thread per 32-bit output word.
+int  am_logical(am_array* a, int op, am_array* b, am_array** out);
+
+// Float classification. op: 0 is_nan, 1 is_finite, 2 is_inf. Defined on every numeric type, as in
+// Arrow: an integer column answers the constant (is_finite everywhere true, the other two false).
+// Nulls propagate — a null element gives a **null** predicate, matching pyarrow.compute.is_nan.
+// The float tests read the raw bit pattern, so float64 needs no software binary64.
+int  am_float_class(am_array* a, int op, am_array** out);
+
+// Arrow fill_null_forward (forward != 0) / fill_null_backward. Every null takes the value of the
+// nearest non-null element on the chosen side; nulls with none there stay null. One GPU max-scan over
+// "index of the last valid row so far", then a gather. Primitive and boolean arrays; an array with no
+// validity bitmap is returned unchanged.
+int  am_fill_null_direction(am_array* a, int forward, am_array** out);
+
+// Arrow case_when: `count` boolean conditions and `count` value columns, all of one length, the value
+// columns all of one type, plus an optional default. Each row takes the value of the first condition
+// that is true. **A null condition counts as false** (the row falls through), which is what Arrow
+// does; a null in the chosen branch's values does make the output null. With else_or_null = NULL a
+// row that matches no condition is null. Implemented as a right-to-left fold of the GPU if_else
+// kernel, so k branches cost k passes.
+int  am_case_when(am_array** conds, am_array** values, int64_t count, am_array* else_or_null, am_array** out);
+
+// Arrow choose: out[i] = values[indices[i]][i]. Indices are int32, int64 or uint32; a null index
+// gives a null output, and an index outside [0, count) is an error, as in Arrow. The range check is
+// one GPU min and one GPU max over the index column (both skip nulls).
+int  am_choose(am_array* indices, am_array** values, int64_t count, am_array** out);
+
+// Arrow replace_with_mask: rows where `mask` is true take the next value from `replacements`, in
+// order; rows where the mask is null become null; every other row keeps its own value. `replacements`
+// must hold at least as many elements as the mask has valid trues (fewer is an error, a surplus is
+// ignored, both as in pyarrow). One GPU sum-scan of the mask gives each selected row its position in
+// `replacements`, then one gather. Primitive and boolean arrays.
+int  am_replace_with_mask(am_array* a, am_array* mask, am_array* replacements, am_array** out);
+
+// Arrow indices_nonzero: the **uint64** row numbers where the value is valid and not zero, in order.
+// -0.0 counts as zero and every NaN counts as non-zero (the IEEE != 0 test), as in Arrow. iota put
+// through the existing GPU stream compaction. The result never has nulls.
+int  am_indices_nonzero(am_array* a, am_array** out);
+
+// A 64-bit hash of primitive values (uint64 out). Arrow publishes no element-wise hash function, so
+// this is an ArrowMetal extension, defined so it is reproducible from the specification alone:
+//
+//     hash64(v) = fmix64(normalise(v) ^ 0x9E3779B97F4A7C15)
+//
+// with fmix64 the MurmurHash3 128-bit finaliser (k ^= k >> 33; k *= 0xFF51AFD7ED558CCD;
+// k ^= k >> 33; k *= 0xC4CEB9FE1A85EC53; k ^= k >> 33) and `normalise` the value's own bytes read as
+// the unsigned type of the same width and zero-extended — for floats, after mapping -0.0 to +0.0 and
+// every NaN to the canonical quiet NaN, so that **Arrow-equal values always hash equal**, which is
+// what a hash join needs. Booleans normalise to 0 or 1. The golden-ratio seed keeps the value 0 from
+// hashing to 0, which leaves 0 free for nulls: a null hashes to 0 **and stays null**, matching the
+// existing am_str_unary(kind: 2) hash over utf8. Deterministic, and identical for a column and any
+// slice of it.
+int  am_hash64(am_array* a, am_array** out);
+
 #ifdef __cplusplus
 }
 #endif
