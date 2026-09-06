@@ -358,15 +358,17 @@ Files it writes are read back byte-identically by ArrowMetal *and* by pyarrow �
 
 ## Correctness
 
-- `Tests/Fixtures/generate_parquet.py` writes 39 small fixtures (1.8 MB total, committed): every logical
-  dataset once per encoding/codec/page-version variant, plus long strings, lists, several row groups,
-  all-null columns, an empty file, a single-row file and INT96 timestamps.
+- `Tests/Fixtures/generate_parquet.py` writes 44 small fixtures (1.8 MB total, committed): every logical
+  dataset once per encoding/codec/page-version variant, plus long strings (up to 64 KB), lists of `int64`
+  and of `string`, several row groups, decimals stored both as `FIXED_LEN_BYTE_ARRAY` and as `INT32` /
+  `INT64`, a struct column, all-null columns, an empty file, a single-row file and INT96 timestamps.
 - `Tests/ArrowMetalTests/ParquetTests.swift` reads **every variant of a dataset and compares them element
   for element**, which checks the encodings against each other, plus known-value, type, list, statistics
   and projection tests.
 - `python/tests/test_parquet.py` reads **every fixture twice** — once on the GPU, once with
-  `pyarrow.parquet` — and asserts the values, nulls and types are identical. That is 84 checks over the
-  fixture set.
+  `pyarrow.parquet` — and asserts the values, nulls and types are identical: 91 checks over the fixture
+  set, plus projection, row-group selection, statistics pushdown, dictionary output, struct leaves and a
+  50 M-row round trip behind `ARROWMETAL_PARQUET_BIG=1`.
 - `ParquetWriterTests` and the Python writer test close the round trip.
 
 ```
