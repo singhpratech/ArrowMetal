@@ -2735,3 +2735,468 @@ def spin_microseconds(microseconds=None):
     """How long the CPU spins before it blocks on a command buffer. 0 blocks immediately, which costs
     latency but frees the core. Call with no argument to read the current value."""
     return int(_lib.am_spin_microseconds(-1 if microseconds is None else int(microseconds)))
+
+
+# ---------------------------------------------------------------------------------------------------
+# Fused expression queries: one Metal kernel for a whole expression DAG.
+#
+# Build an expression with am.col(...) and Python operators, finish it with a terminal (project,
+# a reduction, or a group-by), then run it over a record batch, a dict of arrays, or a pyarrow Table:
+#
+#     import arrowmetal as am
+#     am.query(tbl, am.filter((am.col("region") == 2) & (am.col("amount") > 100)).sum(am.col("amount")))
+#     am.query(tbl, ((am.col("a") * 2 + am.col("b")) / (am.col("c") + 1) - am.col("d")).alias("r").project())
+#     am.query(tbl, am.group_by(am.col("k"), 1000).sum(am.col("v")))
+#
+# The whole tree is lowered to one runtime-generated kernel: the inputs are read once no matter how
+# many operators there are. The wire format is the s-expression grammar in include/arrowmetal.h;
+# `.sexpr()` shows it and `repr()` shows a Polars-like rendering. See docs/EXPR.md.
+_lib.am_query.argtypes = [ctypes.POINTER(_P), ctypes.POINTER(ctypes.c_char_p), ctypes.c_int64,
+                          ctypes.c_char_p, ctypes.POINTER(_P)]
+_lib.am_query.restype = ctypes.c_int
+_lib.am_query_column_count.argtypes = [_P]
+_lib.am_query_column_count.restype = ctypes.c_int64
+_lib.am_query_column_name.argtypes = [_P, ctypes.c_int64]
+_lib.am_query_column_name.restype = ctypes.c_char_p
+_lib.am_query_column.argtypes = [_P, ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_query_column.restype = ctypes.c_int
+_lib.am_query_scalar_count.argtypes = [_P]
+_lib.am_query_scalar_count.restype = ctypes.c_int64
+_lib.am_query_scalar_name.argtypes = [_P, ctypes.c_int64]
+_lib.am_query_scalar_name.restype = ctypes.c_char_p
+_lib.am_query_scalar.argtypes = [_P, ctypes.c_int64, ctypes.POINTER(ctypes.c_int64),
+                                 ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_int),
+                                 ctypes.POINTER(ctypes.c_int)]
+_lib.am_query_scalar.restype = ctypes.c_int
+_lib.am_query_result_release.argtypes = [_P]
+_lib.am_query_canonical.argtypes = [ctypes.c_char_p]
+_lib.am_query_canonical.restype = ctypes.c_char_p
+
+# Arrow type name -> the grammar's type token.
+_EXPR_TYPES = {"int8": "i8", "int16": "i16", "int32": "i32", "int64": "i64",
+               "uint8": "u8", "uint16": "u16", "uint32": "u32", "uint64": "u64",
+               "float": "f32", "float32": "f32", "double": "f64", "float64": "f64",
+               "bool": "bool", "boolean": "bool", "string": "str", "utf8": "str"}
+
+
+def _expr_type_token(t):
+    if isinstance(t, str):
+        tok = _EXPR_TYPES.get(t)
+    else:
+        tok = _EXPR_TYPES.get(str(t))
+    if tok is None:
+        raise ArrowMetalError(f"unsupported expression type {t!r}; expected one of {sorted(set(_EXPR_TYPES))}")
+    return tok
+
+
+def _sq(s):
+    out = ['"']
+    for ch in s:
+        if ch == '"':
+            out.append('\\"')
+        elif ch == "\\":
+            out.append("\\\\")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+class Expr:
+    """One node of an ArrowMetal expression tree.
+
+    Immutable. Operators (+ - * / == != < <= > >= & | ~) and the methods below build new nodes;
+    nothing runs until the expression reaches am.query(). `repr()` renders it the way Polars does,
+    `.sexpr()` gives the wire form."""
+
+    __slots__ = ("_s", "_r", "_name")
+
+    def __init__(self, sexpr, text, name=None):
+        self._s, self._r, self._name = sexpr, text, name
+
+    def __repr__(self):
+        return self._r
+
+    def sexpr(self):
+        """The serialised s-expression, the exact text the C ABI takes."""
+        return self._s
+
+    def alias(self, name):
+        """Names this expression for `project`."""
+        return Expr(self._s, self._r, name)
+
+    # ---- operators
+    def _bin(self, op, sym, other, reverse=False):
+        a, b = (_as_expr(other), self) if reverse else (self, _as_expr(other))
+        return Expr(f"({op} {a._s} {b._s})", f"({a._r} {sym} {b._r})")
+
+    def __add__(self, o): return self._bin("add", "+", o)
+    def __radd__(self, o): return self._bin("add", "+", o, True)
+    def __sub__(self, o): return self._bin("sub", "-", o)
+    def __rsub__(self, o): return self._bin("sub", "-", o, True)
+    def __mul__(self, o): return self._bin("mul", "*", o)
+    def __rmul__(self, o): return self._bin("mul", "*", o, True)
+    def __truediv__(self, o): return self._bin("div", "/", o)
+    def __rtruediv__(self, o): return self._bin("div", "/", o, True)
+    def __eq__(self, o): return self._bin("eq", "==", o)
+    def __ne__(self, o): return self._bin("ne", "!=", o)
+    def __lt__(self, o): return self._bin("lt", "<", o)
+    def __le__(self, o): return self._bin("le", "<=", o)
+    def __gt__(self, o): return self._bin("gt", ">", o)
+    def __ge__(self, o): return self._bin("ge", ">=", o)
+    def __and__(self, o): return self._bin("and", "&", o)
+    def __or__(self, o): return self._bin("or", "|", o)
+    def __xor__(self, o): return self._bin("bit_xor", "^", o)
+    def __invert__(self): return Expr(f"(not {self._s})", f"(~{self._r})")
+    def __neg__(self): return Expr(f"(negate {self._s})", f"(-{self._r})")
+    def __hash__(self): return hash(self._s)
+
+    def and_kleene(self, o):
+        """Three-valued AND: false wins over null (Arrow's and_kleene)."""
+        return self._bin("and_kleene", "&k", o)
+
+    def or_kleene(self, o):
+        """Three-valued OR: true wins over null (Arrow's or_kleene)."""
+        return self._bin("or_kleene", "|k", o)
+
+    def bitwise_and(self, o): return self._bin("bit_and", "&&", o)
+    def bitwise_or(self, o): return self._bin("bit_or", "||", o)
+    def shift_left(self, o): return self._bin("shl", "<<", o)
+    def shift_right(self, o): return self._bin("shr", ">>", o)
+
+    def _un(self, op, text=None):
+        return Expr(f"({op} {self._s})", f"{text or op}({self._r})")
+
+    def abs(self): return self._un("abs")
+    def sqrt(self): return self._un("sqrt")
+    def exp(self): return self._un("exp")
+    def ln(self): return self._un("ln")
+    def round(self):
+        """Halves away from zero (Arrow's round with mode='half_towards_infinity')."""
+        return self._un("round")
+    def bitwise_not(self): return self._un("bit_not")
+
+    def cast(self, t):
+        tok = _expr_type_token(t)
+        return Expr(f"(cast {self._s} {tok})", f"{self._r}.cast({tok})")
+
+    def is_null(self): return Expr(f"(is_null {self._s})", f"{self._r}.is_null()")
+    def is_valid(self): return Expr(f"(is_valid {self._s})", f"{self._r}.is_valid()")
+
+    def fill_null(self, other):
+        o = _as_expr(other)
+        return Expr(f"(fill_null {self._s} {o._s})", f"{self._r}.fill_null({o._r})")
+
+    def is_in(self, values):
+        items = [_as_expr(v) for v in values]
+        return Expr("(is_in " + self._s + " " + " ".join(i._s for i in items) + ")",
+                    f"{self._r}.is_in({[v for v in values]!r})")
+
+    def starts_with(self, pattern):
+        return Expr(f"(starts_with {self._s} {_sq(pattern)})", f"{self._r}.starts_with({pattern!r})")
+
+    def contains(self, pattern):
+        return Expr(f"(contains {self._s} {_sq(pattern)})", f"{self._r}.contains({pattern!r})")
+
+    def str_equals(self, pattern):
+        return Expr(f"(str_eq {self._s} {_sq(pattern)})", f"{self._r}.str_equals({pattern!r})")
+
+    # ---- terminals
+    def sum(self, name=None): return Query().sum(self, name)
+    def min(self, name=None): return Query().min(self, name)
+    def max(self, name=None): return Query().max(self, name)
+    def mean(self, name=None): return Query().mean(self, name)
+    def count(self, name=None): return Query().count(self, name)
+
+    def project(self):
+        """A one-column project of this expression."""
+        return Query().project([self])
+
+
+def _as_expr(v):
+    if isinstance(v, Expr):
+        return v
+    if isinstance(v, bool):
+        return Expr(f"(bool {'true' if v else 'false'})", repr(v))
+    if isinstance(v, int):
+        return Expr(f"(int {v})", repr(v))
+    if isinstance(v, float):
+        return Expr(f"(float {v!r})", repr(v))
+    if isinstance(v, str):
+        return Expr(f"(str {_sq(v)})", repr(v))
+    if v is None:
+        raise ArrowMetalError("a bare None has no type; use am.null('int64') for a typed null literal")
+    raise ArrowMetalError(f"cannot use {type(v).__name__} as an expression literal")
+
+
+def col(name):
+    """A column reference: `am.col("amount") > 100`."""
+    return Expr(f"(col {_sq(name)})", f'col("{name}")', name)
+
+
+def lit(v, type=None):
+    """A literal. Without `type` an integer or float adapts to whatever it is compared with;
+    with `type` it is pinned (`am.lit(2, "int32")`)."""
+    if type is None:
+        return _as_expr(v)
+    tok = _expr_type_token(type)
+    if tok in ("f32", "f64"):
+        return Expr(f"({tok} {float(v)!r})", repr(v))
+    if tok == "bool":
+        return Expr(f"(bool {'true' if v else 'false'})", repr(v))
+    if tok == "str":
+        return Expr(f"(str {_sq(v)})", repr(v))
+    return Expr(f"({tok} {int(v)})", repr(v))
+
+
+def null(type):
+    """A typed null literal, for fill_null / if_else branches."""
+    return Expr(f"(null {_expr_type_token(type)})", f"null({type})")
+
+
+def if_else(cond, a, b):
+    """Arrow if_else: null where `cond` is null, otherwise the chosen branch (and its validity)."""
+    c, x, y = _as_expr(cond), _as_expr(a), _as_expr(b)
+    return Expr(f"(if_else {c._s} {x._s} {y._s})", f"if_else({c._r}, {x._r}, {y._r})")
+
+
+def coalesce_expr(*exprs):
+    """Arrow coalesce: the first non-null of its arguments."""
+    xs = [_as_expr(e) for e in exprs]
+    return Expr("(coalesce " + " ".join(x._s for x in xs) + ")",
+                "coalesce(" + ", ".join(x._r for x in xs) + ")")
+
+
+class Query:
+    """A whole query: an optional filter, an optional group-by key, and one terminal.
+
+    Chain it: `am.filter(pred).project([...])`, `am.filter(pred).sum(expr)`,
+    `am.group_by(key, 1000).sum(value)`. `.sexpr()` is the wire form."""
+
+    def __init__(self):
+        self._filter = None
+        self._key = None
+        self._key_count = 0
+        self._key_name = "key"
+        self._project = None
+        self._aggs = []
+
+    def _copy(self):
+        q = Query()
+        q._filter, q._key, q._key_count = self._filter, self._key, self._key_count
+        q._key_name, q._project, q._aggs = self._key_name, self._project, list(self._aggs)
+        return q
+
+    def filter(self, pred):
+        """Keep the rows where `pred` is true and not null (Arrow's 'drop' null behaviour)."""
+        q = self._copy()
+        p = _as_expr(pred)
+        q._filter = p if q._filter is None else (q._filter & p)
+        return q
+
+    def group_by(self, key, key_count, name="key"):
+        """Group by a dense integer key expression in [0, key_count). Rows whose key is null or out
+        of range are skipped. The result carries one row per key, in key order."""
+        q = self._copy()
+        q._key, q._key_count, q._key_name = _as_expr(key), int(key_count), name
+        return q
+
+    def project(self, exprs):
+        """Materialise one output column per expression. `exprs` may be a list of Expr (named by
+        `.alias()`, or by the column they read), a list of (name, Expr) pairs, or a dict."""
+        q = self._copy()
+        out = []
+        if isinstance(exprs, dict):
+            items = list(exprs.items())
+        else:
+            items = list(exprs)
+        for i, item in enumerate(items):
+            if isinstance(item, tuple):
+                name, e = item[0], _as_expr(item[1])
+            else:
+                e = _as_expr(item)
+                name = e._name or f"col{i}"
+            out.append((name, e))
+        q._project = out
+        return q
+
+    def _agg(self, op, e, name):
+        q = self._copy()
+        q._aggs = list(q._aggs) + [(op, name or (op if e is None or e._name is None else e._name), e)]
+        return q
+
+    def sum(self, e, name=None): return self._agg("sum", _as_expr(e), name)
+    def min(self, e, name=None): return self._agg("min", _as_expr(e), name)
+    def max(self, e, name=None): return self._agg("max", _as_expr(e), name)
+    def mean(self, e, name=None): return self._agg("mean", _as_expr(e), name)
+
+    def count(self, e=None, name=None):
+        """count() counts rows that pass the filter; count(expr) counts non-null values of expr."""
+        return self._agg("count", None if e is None else _as_expr(e), name or "count")
+
+    def aggregate(self, aggs):
+        """Several aggregates in one kernel: [("sum", "total", expr), ("count", "n", None), ...]."""
+        q = self._copy()
+        q._aggs = list(q._aggs) + [(op, name, None if e is None else _as_expr(e)) for op, name, e in aggs]
+        return q
+
+    def sexpr(self):
+        parts = []
+        if self._filter is not None:
+            parts.append(f"(filter {self._filter._s})")
+        if self._key is not None:
+            parts.append(f"(group_by {self._key_count} {_sq(self._key_name)} {self._key._s})")
+        if self._project is not None:
+            parts.append("(project " + " ".join(f"(as {_sq(n)} {e._s})" for n, e in self._project) + ")")
+        elif self._aggs:
+            body = []
+            for op, name, e in self._aggs:
+                body.append(f"({op} {_sq(name)}" + (f" {e._s})" if e is not None else ")"))
+            parts.append("(aggregate " + " ".join(body) + ")")
+        else:
+            raise ArrowMetalError("a query needs a terminal: .project([...]) or .sum(...)/.count()/...")
+        return "(query " + " ".join(parts) + ")"
+
+    def __repr__(self):
+        bits = []
+        if self._filter is not None:
+            bits.append(f"filter({self._filter._r})")
+        if self._key is not None:
+            bits.append(f"group_by({self._key._r}, {self._key_count})")
+        if self._project is not None:
+            bits.append("project([" + ", ".join(f"{n}={e._r}" for n, e in self._project) + "])")
+        else:
+            bits.append(", ".join(f"{op}({'' if e is None else e._r}).alias({n!r})"
+                                  for op, name, e in self._aggs for n in [name]))
+        return "Query." + ".".join(b for b in bits if b)
+
+
+def filter(pred):
+    """Start a query with a row filter: `am.filter(am.col("x") > 3).sum(am.col("y"))`."""
+    return Query().filter(pred)
+
+
+_group_by_keys = group_by      # the hash group-by over arbitrary key columns, defined above
+
+
+def group_by(keys, key_count=None, name="key"):
+    """Two forms.
+
+    `am.group_by([region, year])` groups arbitrary key *columns* and returns a `GroupByKeys`
+    (unchanged from before).
+
+    `am.group_by(am.col("k"), 1000)` starts a fused expression query grouped by a dense integer key
+    expression in [0, 1000): `am.group_by(am.col("k"), 1000).sum(am.col("v"))`."""
+    if isinstance(keys, Expr):
+        if key_count is None:
+            raise ArrowMetalError("group_by(expr, key_count) needs the size of the dense key space")
+        return Query().group_by(keys, key_count, name)
+    return _group_by_keys(keys)
+
+
+def project(exprs):
+    """Start a projection-only query."""
+    return Query().project(exprs)
+
+
+def _as_pa_array(c):
+    """A ChunkedArray flattened to one Array (pyarrow versions differ on what combine_chunks returns)."""
+    if isinstance(c, pa.ChunkedArray):
+        if c.num_chunks == 1:
+            return c.chunk(0)
+        if c.num_chunks == 0:
+            return pa.array([], c.type)
+        return pa.concat_arrays([ch for ch in c.chunks])
+    return c
+
+
+def _query_columns(data):
+    """(names, arrays) from a dict, a pyarrow RecordBatch/Table, or a Polars DataFrame."""
+    if isinstance(data, dict):
+        return list(data.keys()), list(data.values())
+    if isinstance(data, pa.Table):
+        return list(data.column_names), [_as_pa_array(c) for c in data.columns]
+    if isinstance(data, pa.RecordBatch):
+        return list(data.schema.names), [data.column(i) for i in range(data.num_columns)]
+    if hasattr(data, "to_arrow") and hasattr(data, "columns"):      # polars.DataFrame
+        t = data.to_arrow()
+        return list(t.column_names), [_as_pa_array(c) for c in t.columns]
+    raise ArrowMetalError("query() needs a dict of arrays, a pyarrow RecordBatch/Table, or a Polars DataFrame")
+
+
+def query(data, q):
+    """Runs a fused query over `data` and returns pyarrow arrays (project / group_by) or Python
+    scalars (aggregate; a single aggregate comes back bare, several as a dict by name).
+
+    `data` is a dict of arrays (pyarrow, numpy, MetalArray, lists), a pyarrow RecordBatch or Table,
+    or a Polars DataFrame. Columns are imported into Metal memory zero-copy where the producer's
+    buffers allow it, so passing MetalArrays you already hold avoids any import at all."""
+    if isinstance(q, Expr):
+        q = Query().project([q])
+    names, arrays = _query_columns(data)
+    handles = [a if isinstance(a, MetalArray) else MetalArray.from_arrow(a) for a in arrays]
+    n = len(handles)
+    harr = (_P * max(n, 1))(*[h._h for h in handles])
+    narr = (ctypes.c_char_p * max(n, 1))(*[nm.encode() for nm in names])
+    out = _P()
+    _check(_lib.am_query(harr, narr, n, q.sexpr().encode(), ctypes.byref(out)))
+    try:
+        ncol = _lib.am_query_column_count(out)
+        if ncol > 0:
+            res = {}
+            for i in range(ncol):
+                nm = _lib.am_query_column_name(out, i).decode()
+                h = _P()
+                _check(_lib.am_query_column(out, i, ctypes.byref(h)))
+                res[nm] = MetalArray(h).to_arrow()
+            return res
+        vals = {}
+        for i in range(_lib.am_query_scalar_count(out)):
+            nm = _lib.am_query_scalar_name(out, i).decode()
+            iv, fv = ctypes.c_int64(), ctypes.c_double()
+            kind, isnull = ctypes.c_int(), ctypes.c_int()
+            _check(_lib.am_query_scalar(out, i, ctypes.byref(iv), ctypes.byref(fv),
+                                        ctypes.byref(kind), ctypes.byref(isnull)))
+            if isnull.value:
+                vals[nm] = None
+            elif kind.value == 2:
+                vals[nm] = fv.value
+            elif kind.value == 1:
+                vals[nm] = iv.value & 0xFFFFFFFFFFFFFFFF
+            else:
+                vals[nm] = iv.value
+        return next(iter(vals.values())) if len(vals) == 1 else vals
+    finally:
+        _lib.am_query_result_release(out)
+
+
+def query_canonical(q):
+    """Parses and type-checks the query text without running it, returning its canonical form.
+    Raises ArrowMetalError naming the offending node when the text is not a valid query."""
+    text = q.sexpr() if isinstance(q, (Query, Expr)) else q
+    r = _lib.am_query_canonical(text.encode())
+    if r is None:
+        _check(1)
+    return r.decode()
+
+
+class _ExprNamespace:
+    """`am.expr.col(...)`, for callers who prefer a namespace to bare module functions."""
+    col = staticmethod(col)
+    lit = staticmethod(lit)
+    null = staticmethod(null)
+    if_else = staticmethod(if_else)
+    coalesce = staticmethod(coalesce_expr)
+    filter = staticmethod(filter)
+    group_by = staticmethod(group_by)
+    project = staticmethod(project)
+    query = staticmethod(query)
+    Expr = Expr
+    Query = Query
+
+
+expr = _ExprNamespace()
