@@ -68,6 +68,11 @@ _lib.am_str_unary.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]; _lib.am_str
 _lib.am_str_match.argtypes = [_P, ctypes.c_int, ctypes.c_char_p, ctypes.c_int64, ctypes.POINTER(_P)]; _lib.am_str_match.restype = ctypes.c_int
 _lib.am_str_equals_array.argtypes = [_P, _P, ctypes.POINTER(_P)]; _lib.am_str_equals_array.restype = ctypes.c_int
 _lib.am_str_dictionary_encode.argtypes = [_P, ctypes.POINTER(_P), ctypes.POINTER(_P)]; _lib.am_str_dictionary_encode.restype = ctypes.c_int
+_lib.am_str_transform.argtypes = [_P, ctypes.c_int, ctypes.c_char_p, ctypes.c_int64, ctypes.c_char_p, ctypes.c_int64,
+                                  ctypes.c_int64, ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_str_transform.restype = ctypes.c_int
+_lib.am_str_concat.argtypes = [_P, _P, ctypes.c_char_p, ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_str_concat.restype = ctypes.c_int
 _lib.am_group_by.argtypes = [_P, ctypes.c_int64, ctypes.c_int, _P, ctypes.POINTER(_P)]
 _lib.am_group_by.restype = ctypes.c_int
 _lib.am_batch_begin.restype = ctypes.c_int
@@ -259,6 +264,75 @@ class MetalArray:
         c = _P(); u = _P()
         _check(_lib.am_str_dictionary_encode(self._h, ctypes.byref(c), ctypes.byref(u)))
         return MetalArray(c), MetalArray(u)
+
+    # ---- string transforms (utf8 -> utf8, int32 or bool); op table in include/arrowmetal.h
+    def _transform(self, op, arg1="", arg2="", p1=0, p2=0):
+        a1 = arg1.encode("utf-8") if isinstance(arg1, str) else bytes(arg1)
+        a2 = arg2.encode("utf-8") if isinstance(arg2, str) else bytes(arg2)
+        return _call(_lib.am_str_transform, self._h, op, a1, len(a1), a2, len(a2), p1, p2)
+
+    def ascii_upper(self): return self._transform(0)
+    def ascii_lower(self): return self._transform(1)
+
+    def upper(self):
+        """Uppercase (ASCII, Latin-1 Supplement and Latin Extended-A; other code points pass through)."""
+        return self._transform(2)
+
+    def lower(self):
+        """Lowercase over the same blocks as upper()."""
+        return self._transform(3)
+
+    def swapcase(self): return self._transform(4)
+    def capitalize(self): return self._transform(5)
+
+    def trim(self, characters=None):
+        """Strip both ends: ASCII whitespace by default, or any byte in `characters`."""
+        return self._transform(6) if characters is None else self._transform(9, characters)
+
+    def ltrim(self, characters=None):
+        return self._transform(7) if characters is None else self._transform(10, characters)
+
+    def rtrim(self, characters=None):
+        return self._transform(8) if characters is None else self._transform(11, characters)
+
+    def replace(self, pattern, replacement, max_replacements=-1):
+        """Replace non-overlapping occurrences, left to right. An empty pattern is the identity."""
+        return self._transform(12, pattern, replacement, max_replacements)
+
+    def repeat(self, n):
+        """n copies of each string concatenated (Arrow binary_repeat)."""
+        return self._transform(13, p1=n)
+
+    def slice_codeunits(self, start, stop=None):
+        """Substring by code point index; negative indices count from the end (Arrow utf8_slice_codeunits)."""
+        return self._transform(14, p1=start, p2=(2**63 - 1) if stop is None else stop)
+
+    def pad_left(self, width, pad=" "): return self._transform(15, pad, p1=width)
+    def pad_right(self, width, pad=" "): return self._transform(16, pad, p1=width)
+
+    def str_reverse(self):
+        """Reverse the code points of each string (Arrow utf8_reverse)."""
+        return self._transform(17)
+
+    def str_concat(self, other, separator=""):
+        """a + separator + b element-wise (Arrow binary_join_element_wise); null in either side gives null."""
+        sep = separator.encode("utf-8")
+        return _call(_lib.am_str_concat, self._h, other._h, sep, len(sep))
+
+    def count_substring(self, pattern):
+        """int32 count of non-overlapping occurrences; an empty pattern counts code points + 1."""
+        return self._transform(18, pattern)
+
+    def find_substring(self, pattern):
+        """int32 byte offset of the first occurrence, -1 when absent."""
+        return self._transform(19, pattern)
+
+    def is_alnum(self): return self._transform(20)
+    def is_alpha(self): return self._transform(21)
+    def is_digit(self): return self._transform(22)
+    def is_space(self): return self._transform(23)
+    def is_upper(self): return self._transform(24)
+    def is_lower(self): return self._transform(25)
 
     # ---- group-by over dense keys in [0, key_count)
     def group_by(self, key_count):
