@@ -13,6 +13,7 @@ every claim the project makes.
 | [BENCHMARKS.md](BENCHMARKS.md) | Every benchmark round with hardware, methodology, wall time and CPU time; the tables the README quotes |
 | [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md) | The complete operation-by-operation comparison against Polars, pyarrow.compute and pandas at 10M and 50M rows, with a verdict per row and a shortfall list of everything below the 3x bar |
 | [DESIGN.md](DESIGN.md) | How it works: buffers, kernels, batching, GPU-side lengths, software Float64, where the time goes |
+| [PANDAS.md](PANDAS.md) | pandas on the GPU: the `.am` accessor and the zero-code-change accel mode, what routes to the GPU and when, the zero-copy and null rules, the numbers and the limits |
 | [EXPR.md](EXPR.md) | Fused expression queries: one runtime-generated kernel for a whole expression DAG, the grammar, how nulls are compiled, the numbers and the limits |
 | [DECISIONS.md](DECISIONS.md) | Why it is built this way, one dated entry per decision |
 | [FINDINGS.md](FINDINGS.md) | Things learned the hard way: toolchain quirks, Metal limits, bugs and their lessons |
@@ -34,6 +35,7 @@ swift run -c release arrowmetal-bench            # Metal vs all CPU cores vs Acc
 python Benchmarks/python_bench.py                # Polars / pyarrow / pandas on the same data shapes
 PYTHONPATH=python python Benchmarks/python_gpu_bench.py   # ArrowMetal from Python vs Polars, in-process
 PYTHONPATH=python python Benchmarks/expr_bench.py         # fused expression queries vs one kernel per operator
+PYTHONPATH=python python Benchmarks/pandas_bench.py       # plain pandas vs the .am accessor vs accel mode
 swift run -c release arrowmetal-examples         # six end-to-end scenarios
 ```
 
