@@ -209,11 +209,10 @@ def astype_like(series, dtype):
         return series.astype(dtype)
     except Exception:
         pass
-    np_dtype = getattr(dtype, "numpy_dtype", None) or (dtype if isinstance(dtype, np.dtype) else None)
     try:
         np_dtype = np.dtype(dtype)
     except Exception:
-        pass
+        np_dtype = None
     if isinstance(np_dtype, np.dtype) and np_dtype.kind == "b":
         return series.fillna(False).astype(bool)
     if isinstance(np_dtype, np.dtype) and np_dtype.kind in "fiu":
@@ -320,7 +319,10 @@ def groupby_aggregate(keys, values, how, dropna=True, sort=True):
     n = len(mkeys[0])
     gb = _am_group_by(mkeys)
     mvals = [_metal(v) for v in values]
-    aggs = [gb.sum(v) if how == "sum" else getattr(gb, how)(v) for v in mvals]
+    if how == "count_all":                      # pandas `size`: rows per group, nulls included
+        aggs = [gb.count_all() for _ in mvals]
+    else:
+        aggs = [getattr(gb, how)(v) for v in mvals]
     if how == "sum":
         aggs = [a.fill_null(0) for a in aggs]
     key_cols = [MetalArray.from_arrow(k) for k in gb.keys()]
@@ -521,10 +523,11 @@ class SeriesAccessor:
     __hash__ = object.__hash__
 
     def filter(self, mask):
-        """Boolean-mask selection on the GPU, index taken along."""
-        m = _metal(mask if not isinstance(mask, pd.Series) else mask.fillna(False))
+        """Boolean-mask selection on the GPU, index taken along. A null in the mask drops the row,
+        as `df[mask]` does in pandas."""
+        m = _metal(mask).fill_null(False)
         arr = _metal(self._s).filter(m)
-        pos = m.fill_null(False).indices_nonzero().to_arrow().to_numpy(zero_copy_only=False)
+        pos = m.indices_nonzero().to_arrow().to_numpy(zero_copy_only=False)
         return self._wrap(arr, self._s.index[pos])
 
     # -- strings
@@ -577,11 +580,15 @@ class GPUGroupBy:
     def count(self, columns=None): return self._agg("count", columns)
 
     def size(self):
-        keys, _ = groupby_aggregate([self._df[k] for k in self._keys],
-                                    [self._df[self._keys[0]]], "count",
-                                    dropna=self._dropna, sort=self._sort)
-        gb = group_ids([self._df[k] for k in self._keys])
-        raise ArrowMetalError("size() is not part of the GPU group-by; use count()")
+        """Rows per group, counting nulls — pandas `groupby(...).size()`."""
+        keys, counts = groupby_aggregate([self._df[k] for k in self._keys],
+                                         [self._df[self._keys[0]]], "count_all",
+                                         dropna=self._dropna, sort=self._sort)
+        index = (pd.Index(pd.arrays.ArrowExtensionArray(keys[0]), name=self._keys[0])
+                 if len(keys) == 1 else
+                 pd.MultiIndex.from_arrays([pd.arrays.ArrowExtensionArray(k) for k in keys],
+                                           names=self._keys))
+        return _arrow_series(counts[0], index, None)
 
 
 class DataFrameAccessor:
@@ -627,8 +634,9 @@ class DataFrameAccessor:
         return pd.DataFrame(data, index=self._df.index[pos])
 
     def filter(self, mask):
-        m = _metal(mask if not isinstance(mask, pd.Series) else mask.fillna(False))
-        pos = m.fill_null(False).indices_nonzero().to_arrow().to_numpy(zero_copy_only=False)
+        """Boolean-mask selection of rows on the GPU; a null in the mask drops the row."""
+        m = _metal(mask).fill_null(False)
+        pos = m.indices_nonzero().to_arrow().to_numpy(zero_copy_only=False)
         return self._take(pos.astype(np.int64))
 
     def merge(self, right, on=None, left_on=None, right_on=None, how="inner", suffixes=("_x", "_y")):

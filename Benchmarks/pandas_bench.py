@@ -33,11 +33,15 @@ parser.add_argument("rows", nargs="?", type=int, default=10_000_000)
 parser.add_argument("iters", nargs="?", type=int, default=5)
 parser.add_argument("--backend", default="both", choices=["arrow", "numpy", "both"])
 parser.add_argument("--csv", default=None, help="write the rows to this CSV as well")
+parser.add_argument("--route-all", action="store_true",
+                    help="also route the operations the shipped table leaves to pandas, so the "
+                         "GPU cost of every one of them is visible")
 args = parser.parse_args()
 
 ROWS, ITERS = args.rows, args.iters
 rng = np.random.default_rng(20240906)
 results = []
+routing = {}
 
 
 def cpu_seconds():
@@ -72,14 +76,17 @@ def trio(section, backend, plain, accessor, accel_fn=None):
     p = bench(section, backend, "pandas", plain)
     a = bench(section, backend, "accessor", accessor)
     pandas_accel.install(threshold=0)
+    pandas_accel.route_all(args.route_all)
     pandas_accel.reset_stats()
     try:
         c = bench(section, backend, "accel", accel_fn or plain)
         routed = pandas_accel.stats().gpu_calls
     finally:
+        pandas_accel.route_all(False)
         pandas_accel.uninstall()
     if routed == 0:
-        print("      (accel: nothing routed to the GPU — it ran in pandas)")
+        print("      (accel: not routed — the shipped table leaves this one to pandas)")
+        routing[(section, backend)] = "pandas"
     for label, ms in (("accessor", a), ("accel", c)):
         if ms == ms and p == p and ms > 0:
             print(f"      {label} speedup: {p / ms:.2f}x")
@@ -122,6 +129,13 @@ def run(backend):
     s, f, w = df["i"], df["f"], df["w"]
     trio("sum(int64)", backend, lambda: s.sum(), lambda: s.am.sum())
     trio("mean(float64)", backend, lambda: f.mean(), lambda: f.am.mean())
+    trio("compare(int64 > 0)", backend, lambda: s > 0, lambda: s.am > 0)
+    trio("abs(float64)", backend, lambda: f.abs(), lambda: f.am.abs())
+    trio("round(float64, 2)", backend, lambda: f.round(2), lambda: f.am.round(2))
+    trio("isin(10 int values)", backend,
+         lambda: s.isin(list(range(10))), lambda: s.am.isin(list(range(10))))
+    trio("nunique(int64)", backend, lambda: s.nunique(), lambda: s.am.nunique())
+    trio("value_counts(utf8)", backend, lambda: w.value_counts(), lambda: w.am.value_counts())
     trio("groupby-sum 1k keys", backend,
          lambda: df.groupby("k1")["i"].sum(), lambda: df.am.groupby("k1").sum("i"))
     trio("groupby-sum 100k keys", backend,
@@ -144,8 +158,8 @@ print(f"ArrowMetal {am.version()} on {am.device_name()}; pandas {pd.__version__}
 for backend in (["arrow", "numpy"] if args.backend == "both" else [args.backend]):
     run(backend)
 
-print("\n| Operation | Backend | pandas ms | accessor ms | accel ms | accessor x | accel x |")
-print("|---|---|---:|---:|---:|---:|---:|")
+print("\n| Operation | Backend | pandas ms | accessor ms | accel ms | accessor x | accel x | accel routes to |")
+print("|---|---|---:|---:|---:|---:|---:|---|")
 by = {}
 for section, backend, label, ms, cpu, err in results:
     by.setdefault((section, backend), {})[label] = ms
@@ -155,7 +169,8 @@ for (section, backend), row in by.items():
         return f"{p / v:.2f}x" if p and v and v == v and p == p else "-"
     def m(v):
         return f"{v:.1f}" if v is not None and v == v else "-"
-    print(f"| {section} | {backend} | {m(p)} | {m(a)} | {m(c)} | {x(a)} | {x(c)} |")
+    where = routing.get((section, backend), "GPU")
+    print(f"| {section} | {backend} | {m(p)} | {m(a)} | {m(c)} | {x(a)} | {x(c)} | {where} |")
 
 if args.csv:
     with open(args.csv, "w") as fh:

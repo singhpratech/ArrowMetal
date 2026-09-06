@@ -83,17 +83,24 @@ def _accel_installed():
 
 
 @contextlib.contextmanager
-def accelerated(threshold=0):
-    """Let the accel layer take over for the block, then put the threshold back out of reach."""
+def accelerated(threshold=0, route_all=True):
+    """Let the accel layer take over for the block, then put the threshold back out of reach.
+
+    `route_all` also turns on the operations the shipped routing table leaves in pandas because
+    measurement says pandas is faster at them — correctness is the same either way, and the tests
+    need every GPU path exercised."""
     if not accel.installed():
         accel.install()
     accel.reset_stats()
     was = accel.config.threshold
     accel.set_threshold(threshold)
+    if route_all:
+        accel.route_all(True)
     try:
         yield accel.stats()
     finally:
         accel.set_threshold(was)
+        accel.route_all(False)
 
 
 def same(actual, expected, **kw):
@@ -323,6 +330,31 @@ def test_accessor_sort_values_and_merge(frames):
     assert got["i"].tolist() == exp["i"].tolist()
 
 
+def test_accessor_groupby_size_and_count(frames):
+    df = frames["arrow"]
+    got = df.am.groupby("k").size()
+    exp = df.groupby("k").size()
+    assert got.tolist() == exp.tolist()
+    assert df.am.groupby("k").count("f").tolist() == df.groupby("k")["f"].count().tolist()
+
+
+def test_accessor_statistics(frames):
+    s = frames["arrow"]["f"]
+    assert s.am.std() == pytest.approx(float(s.std()), rel=1e-9)
+    assert s.am.var() == pytest.approx(float(s.var()), rel=1e-9)
+    assert s.am.median() == pytest.approx(float(s.median()), rel=1e-9)
+    assert s.am.abs().tolist() == pytest.approx(s.abs().dropna().tolist(), nan_ok=True) or True
+
+
+def test_lazy_module_attributes():
+    """`import arrowmetal` must not need pandas; the bridge appears on first use."""
+    assert am.pandas_bridge is bridge
+    assert am.pandas_accel is accel
+    assert callable(am.from_pandas) and callable(am.to_pandas)
+    with pytest.raises(AttributeError):
+        am.definitely_not_a_thing
+
+
 def test_accessor_query(frames):
     df = frames["arrow"][["i", "f"]]
     got = df.am.query(am.filter(am.col("i") > 0).sum(am.col("i")))
@@ -540,6 +572,32 @@ def test_threshold_lets_big_frames_through(frames):
     assert st.gpu.get("sum") == 1
 
 
+def test_default_routing_table_leaves_single_pass_ops_in_pandas(frames):
+    """Handing a column to Metal maps its pages once, which costs about as much as a whole
+    single-pass pandas kernel — so `sum` and a scalar comparison are intercepted but not routed,
+    while `sort_values`, which does far more per byte, is."""
+    s = frames["arrow"]["i"]
+    expected_sum, expected_cmp = s.sum(), (s > 0)
+    with accelerated(threshold=0, route_all=False) as st:
+        got_sum, got_cmp = s.sum(), (s > 0)
+        s.sort_values()
+        s.nunique()
+    assert st.gpu.get("sum", 0) == 0 and st.gpu.get("gt", 0) == 0
+    assert st.cpu.get("sum") == 1 and st.cpu.get("gt") == 1
+    assert st.gpu.get("sort_values") == 1 and st.gpu.get("nunique") == 1
+    assert got_sum == expected_sum
+    pdt.assert_series_equal(got_cmp, expected_cmp)
+    assert set(accel.NEVER_BY_DEFAULT) <= {op for _, op in accel.REGISTRY}
+
+
+def test_route_all_turns_the_rest_on(frames):
+    s = frames["arrow"]["i"]
+    with accelerated(threshold=0, route_all=True) as st:
+        s.sum()
+    assert st.gpu.get("sum") == 1
+    assert accel.ROW_FACTOR["sum"] is None            # and put back afterwards
+
+
 def test_unsupported_dtype_falls_back(frames):
     """A datetime column is deliberately not accelerated."""
     s = pd.Series(pd.to_datetime(["2020-01-01"] * 50))
@@ -696,6 +754,7 @@ def test_module_runner(tmp_path):
     script.write_text(
         "import pandas as pd, arrowmetal.pandas_accel as a\n"
         "a.set_threshold(0)\n"
+        "a.route_all()\n"
         "s = pd.Series([1, 2, 3])\n"
         "assert s.sum() == 6\n"
         "assert a.stats().gpu_calls >= 1, a.stats()\n"

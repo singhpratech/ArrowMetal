@@ -82,7 +82,7 @@ python -m arrowmetal.pandas_accel my_script.py
 ARROWMETAL_PANDAS_ACCEL=1 python my_script.py
 ```
 
-A call is routed to the GPU only when **all three** hold:
+A call is routed to the GPU only when **all four** hold:
 
 1. **dtype** — the column is numeric, boolean or utf8, in any of the three pandas storage flavours
    (numpy-backed, `pd.ArrowDtype` / `int64[pyarrow]`, or the masked nullable dtypes `Int64`,
@@ -91,25 +91,60 @@ A call is routed to the GPU only when **all three** hold:
    (`install(threshold=...)`, `set_threshold(...)`, or `ARROWMETAL_PANDAS_ACCEL_THRESHOLD`).
    Below that the launch latency costs more than the kernel saves;
 3. **arguments** — the call uses arguments the kernels implement exactly (the "not routed" column
-   below).
+   below);
+4. **the operation is worth it** — see the next section. Five reductions, `abs` and the scalar
+   comparisons are intercepted but deliberately left to pandas.
 
 Everything else runs in pandas, unchanged. **Any exception inside the GPU path is caught, recorded
 in `stats()`, and the original pandas method is run instead.** The accel layer is never the reason
 a program fails.
 
+### Why some operations are intercepted but not routed
+
+Handing a pandas column to Metal is zero-copy — the GPU reads the very bytes pandas holds, and
+`am.zero_copy_report` proves it by address — but it is not *free*: the pages have to be mapped into
+the device's address space once. On an M4 Max, for a 50M-row (400 MB) `int64[pyarrow]` column:
+
+| Step | Time |
+|---|---|
+| `Series.array._pa_array` → `pyarrow.Array` | 0.00 ms (the same buffer) |
+| that buffer mapped into Metal (`MetalArray.from_arrow`) | 6.7 ms |
+| `sum` on the GPU, column already mapped | **1.07 ms** (374 GB/s) |
+| `Series.sum()` in pandas | 4.9 ms |
+
+The kernel is 4.6x faster than pandas. The map is not, and one `sum` cannot amortise it. So the
+shipped routing table leaves alone every operation that reads each byte once and writes at most one
+byte back — `sum`, `min`, `max`, `mean`, `count`, `abs`, and the six scalar comparisons — and routes
+the ones that do enough per byte to pay for the map many times over: sorts, hash group-bys, merges,
+string scans, `round`, `isin`, `nunique`, `value_counts`, boolean-mask selection.
+
+That table is data, not a hard-coded rule:
+
+```python
+accel.NEVER_BY_DEFAULT     # ('sum', 'min', 'max', 'mean', 'count', 'abs', 'eq', 'ne', ...)
+accel.ROW_FACTOR           # op -> rows needed as a multiple of the threshold, or None for "never"
+accel.route_all()          # route everything anyway
+accel.ROW_FACTOR["sum"] = 1
+```
+
+The `.am` accessor has no such table: it always runs on the GPU, and `s.am.to_metal()` gives you the
+mapped column so that a chain of operations pays the map once. Nothing about correctness changes
+either way — only where the work runs.
+
 ### What is intercepted
 
 | pandas call | Routed to the GPU when | Not routed (falls through) |
 |---|---|---|
-| `Series.sum/min/max/mean` | numeric column | `skipna=False`, `min_count>0`, `numeric_only` |
-| `Series.count/nunique` | numeric, boolean or utf8 | — |
+| `Series.sum/min/max/mean` | numeric column, and `route_all()` | by default, always — see above; also `skipna=False`, `min_count>0`, `numeric_only` |
+| `Series.count` | numeric, boolean or utf8, and `route_all()` | by default, always — see above |
+| `Series.nunique` | numeric, boolean or utf8 | — |
 | `Series.value_counts` | numeric, boolean or utf8 | `normalize=True`, `bins=` |
 | `Series.sort_values` | numeric, boolean or utf8 | `key=`, `na_position="first"`, `inplace=True` |
 | `Series.nlargest/nsmallest` | numeric | `keep != "first"` |
 | `Series.isin` | numeric or utf8 | any `NaN`/`None` in `values` (pandas matches NaN to NaN; Arrow's `is_in` does not) |
-| `Series.abs` | numeric | — |
+| `Series.abs` | numeric, and `route_all()` | by default, always — see above |
 | `Series.round` | float | integer columns (pandas' answer is the identity, so there is nothing to win) |
-| `Series.__eq__ __ne__ __lt__ __le__ __gt__ __ge__` | numeric vs a numeric scalar; utf8 vs a string for `==`/`!=` | another Series (pandas aligns indexes first), `NaN` as the operand, ordering comparisons on strings |
+| `Series.__eq__ __ne__ __lt__ __le__ __gt__ __ge__` | numeric vs a numeric scalar, or utf8 vs a string for `==`/`!=`, and `route_all()` | by default, always — see above; also another Series (pandas aligns indexes first), `NaN` as the operand, ordering comparisons on strings |
 | `Series[bool_mask]` | any supported dtype, mask of the same length and index | anything but a full-length boolean mask |
 | `Series.str.contains` | literal pattern | a real regex, `case=False`, `flags=`, explicit `na=` |
 | `Series.str.startswith/endswith` | a single string pattern | a tuple of patterns |
@@ -138,6 +173,8 @@ accel.stats().to_frame()                # the same as a DataFrame: gpu / cpu / e
 accel.reset_stats()
 accel.uninstall()                       # every original method back
 accel.REGISTRY                          # the contract, as data
+accel.ROW_FACTOR                        # the routing table, as data
+accel.route_all()                       # route the operations pandas is otherwise faster at
 ```
 
 `stats()` reports four things per operation: `gpu` (routed), `cpu` (fell through, with the reason

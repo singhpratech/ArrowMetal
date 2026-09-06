@@ -198,12 +198,37 @@ def dtype_family(dtype):
     return None
 
 
-def _big(obj):
-    return len(obj) >= config.threshold
+#: Rows an operation needs before the GPU is worth it, as a multiple of `config.threshold` —
+#: or **None, meaning it is intercepted but never routed**, because measurement says pandas does it
+#: better. Handing a column to Metal maps its pages once, and that map costs about as much as a
+#: whole single-pass pandas kernel (6.7 ms for a 400 MB column against 4.9 ms for pandas' `sum`),
+#: while the kernel itself takes 1.1 ms. So an operation that reads each byte once and writes at
+#: most one byte back — `sum`, `min`, `max`, `mean`, `count`, `abs`, a scalar comparison — cannot
+#: pay for the map, and an operation that does more per byte — a sort, a hash group-by, a merge,
+#: a string scan, `round`, `isin`, `nunique` — pays for it many times over.
+#:
+#: The table is data: edit it, or call `route_all()` to route everything anyway (which is what the
+#: `.am` accessor does — see docs/PANDAS.md for the measured ratios behind every entry).
+NEVER_BY_DEFAULT = ("sum", "min", "max", "mean", "count", "abs",
+                    "eq", "ne", "lt", "le", "gt", "ge")
+ROW_FACTOR = {op: None for op in NEVER_BY_DEFAULT}
 
 
-def _eligible(series, families):
-    return _big(series) and dtype_family(series.dtype) in families
+def route_all(on=True):
+    """Route every operation in the registry, including the ones pandas does better on its own.
+
+    Correctness is unaffected — this only changes where the work runs. The test suite uses it to
+    exercise every GPU path."""
+    for op in NEVER_BY_DEFAULT:
+        ROW_FACTOR[op] = 1 if on else None
+
+
+def _big(obj, factor=1):
+    return factor is not None and len(obj) >= config.threshold * factor
+
+
+def _eligible(series, families, factor=1):
+    return _big(series, factor) and dtype_family(series.dtype) in families
 
 
 # ---------------------------------------------------------------------------------------------
@@ -315,7 +340,7 @@ def _impl_reduce(how, families=("numeric",)):
     def impl(orig, self, *a, **k):
         if a or k.get("skipna", True) is not True or k.get("min_count", 0) or k.get("level") is not None:
             return _UNSUPPORTED
-        if not isinstance(self, pd.Series) or not _eligible(self, families):
+        if not isinstance(self, pd.Series) or not _eligible(self, families, ROW_FACTOR.get(how, 1)):
             return _UNSUPPORTED
         v = _b.reduce(self, how)
         if v is None:
@@ -341,7 +366,9 @@ def _impl_nunique(orig, self, dropna=True):
 
 
 def _impl_count(orig, self, *a, **k):
-    if a or k or not isinstance(self, pd.Series) or not _eligible(self, ("numeric", "bool", "string")):
+    if a or k or not isinstance(self, pd.Series):
+        return _UNSUPPORTED
+    if not _eligible(self, ("numeric", "bool", "string"), ROW_FACTOR["count"]):
         return _UNSUPPORTED
     return _like_probe(orig(_probe(self)), int(len(self) - _b._metal(self).null_count))
 
@@ -418,7 +445,9 @@ def _impl_isin(orig, self, values):
 
 def _impl_unary(name):
     def impl(orig, self, *a, **k):
-        if a or k or not isinstance(self, pd.Series) or not _eligible(self, ("numeric",)):
+        if a or k or not isinstance(self, pd.Series):
+            return _UNSUPPORTED
+        if not _eligible(self, ("numeric",), ROW_FACTOR.get(name, 1)):
             return _UNSUPPORTED
         arr = getattr(_b._metal(self), name)().to_arrow()
         return _finish(arr, self.index, self.name, self.dtype)
@@ -440,7 +469,7 @@ _COMPARISONS = {"__eq__": "eq", "__ne__": "ne", "__lt__": "lt",
 
 def _impl_compare(op):
     def impl(orig, self, other):
-        if not isinstance(self, pd.Series) or not _big(self):
+        if not isinstance(self, pd.Series) or not _big(self, ROW_FACTOR.get(op, 1)):
             return _UNSUPPORTED
         fam = dtype_family(self.dtype)
         if fam == "string":
@@ -502,9 +531,7 @@ def _impl_str_match(kind):
             return _UNSUPPORTED
         if not isinstance(pat, str):
             return _UNSUPPORTED
-        if k.get("na", pd.NA) is not pd.NA and "na" in k:
-            return _UNSUPPORTED
-        if a:
+        if a or "na" in k:            # an explicit `na=` changes what a null value maps to
             return _UNSUPPORTED
         if kind == "contains":
             if not k.get("case", True) or k.get("flags", 0):
