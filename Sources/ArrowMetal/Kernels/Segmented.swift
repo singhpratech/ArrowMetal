@@ -30,8 +30,21 @@ public final class GroupSegments {
 /// Nulls follow Arrow: a null key or a key outside `[0, keyCount)` contributes nothing, null values are
 /// skipped, and a key with no valid value comes back null.
 extension GroupBy {
-    /// Argsorts the keys and marks the run of each key in the sorted order.
+    /// Puts the rows in group order and marks the run of each key.
+    ///
+    /// The keys are already dense ids in `[0, keyCount)`, so this is a **counting sort**
+    /// (`Kernels/GroupOrder.swift`) — one pass over the keys — not the four-pass radix argsort it used
+    /// to be. The argsort stays as the fallback for the shapes the counting sort declines: a group count
+    /// too large for a per-block histogram whose longest run is also too long to re-order cheaply.
     public func segments() throws -> GroupSegments {
+        if let cached = cache.segments { return cached }
+        let s = try countingSortOrder() ?? (try argsortSegments())
+        cache.segments = s
+        return s
+    }
+
+    /// Argsorts the keys and marks the run of each key in the sorted order.
+    func argsortSegments() throws -> GroupSegments {
         try Dispatch.checkLength(keys.length)
         let ctx = keys.context
         let n = keys.length

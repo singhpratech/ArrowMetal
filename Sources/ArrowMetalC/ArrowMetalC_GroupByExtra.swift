@@ -166,12 +166,11 @@ extension MetalArray: GroupedValueOps {
         case 12: return .list(try gb.distinct(self))
         case 13: return .int64(try gb.countDistinct(self))
         case 16: return try producted(gb)
-        // The grouped variance forms its deviations in Float32, so a Float64 column is cast here rather
-        // than rejected; the header says so, and the precision note applies either way.
-        case 17: return .float64(try narrowed().variance(gb, ddof: 0))
-        case 18: return .float64(try narrowed().variance(gb, ddof: 1))
-        case 19: return .float64(try narrowed().stddev(gb, ddof: 0))
-        case 20: return .float64(try narrowed().stddev(gb, ddof: 1))
+        // The grouped variance now runs in binary64 on the values as they are, Float64 included.
+        case 17: return .float64(try gb.variance(self, ddof: 0))
+        case 18: return .float64(try gb.variance(self, ddof: 1))
+        case 19: return .float64(try gb.stddev(self, ddof: 0))
+        case 20: return .float64(try gb.stddev(self, ddof: 1))
         case 21: return .float64(try gb.approximateMedian(self))
         case 22: return .float64(try gb.quantile(self, p1))
         case 23: return .float64(try gb.skew(self))

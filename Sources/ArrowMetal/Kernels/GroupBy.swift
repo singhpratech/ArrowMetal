@@ -8,6 +8,13 @@ public struct GroupBy<K: ArrowIndex> {
     public let keys: MetalArray<K>
     public let keyCount: Int
 
+    /// Work that depends only on the keys, so several aggregates over one `GroupBy` pay for it once.
+    /// A reference type deliberately: copies of the struct share it.
+    final class Cache {
+        var segments: GroupSegments?
+    }
+    let cache = Cache()
+
     public init(keys: MetalArray<K>, keyCount: Int) throws {
         guard keyCount > 0, keyCount <= Int(UInt32.max) / 4 else { throw ArrowMetalError.invalidArrowArray("keyCount out of range") }
         self.keys = keys
