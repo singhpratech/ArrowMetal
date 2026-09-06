@@ -61,9 +61,10 @@ the CPU to know the length. A reduction still syncs once to read its partials.
 accumulates with `d_add`; arithmetic kernels run one element per thread. `d_div` is a Newton reciprocal
 seeded by one hardware `float` division, with the exact 128-bit remainder `N - q·D` settling the last
 bit; `d_sqrt` extracts the root digit by digit in integers. Both are correctly rounded rather than close,
-and `DoubleMathTests` holds them to Swift's own `Double` bit for bit. `add`, `multiply` and `divide` all
-run at this machine's memory ceiling (≈388 GB/s at 50M rows), so no Float64 column ever falls back to the
-CPU and the software arithmetic is not visible in a bandwidth-bound query at all.
+and `DoubleMathTests` holds them to Swift's own `Double` bit for bit. `add` and `multiply` run at this
+machine's memory ceiling (≈390 GB/s at 50M rows) and `divide` within 15% of it (331 GB/s), so no Float64
+column ever falls back to the CPU and the software arithmetic is all but invisible in a bandwidth-bound
+query.
 
 The transcendentals are a different story, and worth being explicit about. `Kernels/DoubleTranscendental.swift`
 (`expm1`, `log1p`, `logb`, `hypot`, the ten `RoundMode`s) and `Kernels/DoublePower.swift` (`exp`, `ln`,

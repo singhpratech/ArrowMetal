@@ -33,12 +33,25 @@ Newton reciprocal with an exact remainder correction instead of a 57-step restor
 
 | op | before | after | GB/s before | GB/s after | ratio vs fastest CPU |
 |---|---:|---:|---:|---:|---:|
-| `divide` (float64) | 9.6 ms | **3.2 ms** | 125.3 | 377.7 | 1.12x -> **3.26x** |
-| `multiply` (float64) | 4.6 ms | **3.1 ms** | 260.9 | 388.5 | 2.32x -> **3.37x** |
-| `add` (float64) | 3.1 ms | 3.1 ms | 390.1 | 388.9 | 3.53x |
+| `divide` (float64) | 9.6 ms | **3.6 ms** | 125.3 | 331.1 | 1.12x -> **3.00x** |
+| `multiply` (float64) | 4.6 ms | **3.1 ms** | 260.9 | 390.8 | 2.32x -> **3.46x** |
+| `add` (float64) | 3.1 ms | 3.1 ms | 390.1 | 388.4 | 3.33x |
 
-All three now sit at this machine's memory ceiling: the software divide has stopped being visible. Both
-rewrites stay correctly rounded — `DoubleMathTests` compares them with Swift's `Double` bit for bit.
+`multiply` and `add` now sit exactly at this machine's memory ceiling and `divide` is within 15% of it,
+so the software arithmetic has all but stopped being visible. Both rewrites stay correctly rounded —
+`DoubleMathTests` compares them with Swift's `Double` bit for bit.
+
+`divide` measured 3.2 ms (377 GB/s, 3.26x) with **two** Newton steps, which is provably enough while
+`MetalContext` compiles with `mathMode = .safe`: that makes the `float` seed correctly rounded and good
+to 2^-22, and two steps saturate the 63 bits the reciprocal holds. The shipped code takes a third step
+and pays 0.4 ms for it, because the two-step version is only correct *given a compile flag set in another
+file* — under fast math the seed would be looser, the quotient would land further than the single
+correction step covers, and `d_div` would quietly stop being correctly rounded. 0.4 ms on an operation
+already near the memory ceiling is a cheap price for removing that coupling.
+
+**Measure on a quiet machine.** These runs were repeated until two agreed: a second Metal process on the
+same GPU inflates the short memory-bound rows (`sqrt` 12.7 -> 30.6 ms in one contended run) while barely
+touching the compute-bound ones, which reads as a plausible result rather than an obvious error.
 
 ## 2026-09-06, Apple M4 Max, round 7: sort and strings
 50M Int64/Float64 rows and 10M utf8 values (1000 distinct keys, `cust_NNN_region`, 130 MB of bytes),

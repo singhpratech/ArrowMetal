@@ -13,6 +13,10 @@ in hardware and show what the software path costs.
 
 Each row reports the best of `iters` runs after one warm-up, in milliseconds and in GB/s over the bytes
 actually moved (one read and one write per element, two reads for a two-column op).
+
+Run it on a quiet machine. "Best of five" filters CPU scheduling noise but not a second process holding
+the GPU: another Metal workload running alongside inflates the short, memory-bound rows (`sqrt`, `add`)
+by 2-3x while barely moving the compute-bound ones, which reads as a plausible but wrong result.
 """
 import sys, time
 
