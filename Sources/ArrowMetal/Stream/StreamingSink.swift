@@ -202,11 +202,13 @@ public final class ArrowStreamExporter {
     /// per-array release callbacks own the buffers, so nothing extra is retained here).
     public private(set) var batchesProduced = 0
 
+    /// The exporter owns its producer: the consumer's `ArrowArrayStream` is often the only thing
+    /// keeping either alive, so a weak capture here would end the stream before its first batch.
     public init(_ source: BatchSource) {
-        self.next = { [weak source] in try source?.nextBatch() }
+        self.next = { try source.nextBatch() }
     }
     public init(_ reader: StreamBatchReader) {
-        self.next = { [weak reader] in try reader?.nextOutputBatch() }
+        self.next = { try reader.nextOutputBatch() }
     }
     public init(next: @escaping () throws -> MetalRecordBatch?) { self.next = next }
 

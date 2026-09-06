@@ -75,6 +75,8 @@ public struct StreamResult {
     public var rowsOut = 0
     public var stats = StreamStats()
 
+    public init() {}
+
     public func scalar(_ name: String) -> ExprScalar? {
         scalarNames.firstIndex(of: name).map { scalars[$0] }
     }
@@ -265,7 +267,6 @@ public final class FilterProjectOperator: StreamOperator {
     public let query: ExprQuery
     public let sink: StreamSink
     private var rows = 0
-    private var lastBatch: MetalRecordBatch?
 
     public init(query: ExprQuery, sink: StreamSink) {
         self.query = query
@@ -285,7 +286,6 @@ public final class FilterProjectOperator: StreamOperator {
     public func merge(_ partial: Any) throws {
         guard let b = partial as? MetalRecordBatch else { return }
         rows += b.length
-        lastBatch = b
         try sink.write(b)
     }
 
@@ -383,10 +383,8 @@ public final class StreamAggregateOperator: StreamOperator {
                 throw ArrowMetalError.invalidArrowArray("no column named \(name)")
             }
             if let f = filter {
-                // Materialise the filtered column with the same fused kernel the aggregates use.
-                let q = ExprQueryBuilder().filter(f).project([("v", .column(name))])
-                let fr = try runExprQuery(q, names: batch.names, columns: batch.columns,
-                                          context: batch.firstContext ?? .shared)
+                let fr = try streamFilterProject(batch, filter: f, projections: [("v", .column(name))],
+                                                 context: batch.firstContext ?? .shared)
                 guard let c = fr["v"] else { throw ArrowMetalError.invalidArrowArray("filter produced no column") }
                 col = c
             }
@@ -513,10 +511,10 @@ public final class StreamGroupByOperator: StreamOperator {
         var work = batch
         if let f = filter {
             var proj: [(String, Expr)] = keyColumns.map { ($0, .column($0)) }
-            for a in aggregates { if let c = a.column, !proj.contains(where: { $0.0 == c }) { proj.append((c, .column(c))) } }
-            let q = ExprQueryBuilder().filter(f).project(proj)
-            let r = try runExprQuery(q, names: batch.names, columns: batch.columns, context: context)
-            work = try r.recordBatch()
+            for a in aggregates where a.column != nil {
+                if !proj.contains(where: { $0.0 == a.column! }) { proj.append((a.column!, .column(a.column!))) }
+            }
+            work = try streamFilterProject(batch, filter: f, projections: proj, context: context)
         }
         guard work.length > 0 else { return nil }
 
@@ -540,13 +538,19 @@ public final class StreamGroupByOperator: StreamOperator {
         let gk = try GroupByKeys(columns: keyCols)
         guard gk.groupCount > 0 else { return nil }
         if keyTemplates == nil { keyTemplates = keyCols }
-        let keyValues = try gk.groupKeys().map { try gk.trim($0).streamValues() }
+        let keyCandidates = try gk.groupKeys().map { try gk.trim($0) }
+        var aggCols: [(AnyMetalArray?, AnyMetalArray?, AnyMetalArray?)] = []
+        for a in aggregates { aggCols.append(try hostPartial(a, gk, work)) }
+        // Every kernel above is recorded into the open batch; run it before any value is read back.
+        try context.syncPoint()
+        let keyValues = try keyCandidates.map { try $0.streamValues() }
         var aggValues: [[StreamValue]] = []
         var aggCounts: [[StreamValue]] = []
         var aggSquares: [[StreamValue]] = []
-        for a in aggregates {
-            let (v, c, sq) = try hostPartial(a, gk, work)
-            aggValues.append(v); aggCounts.append(c); aggSquares.append(sq)
+        for (v, c, sq) in aggCols {
+            aggValues.append(v == nil ? [] : try v!.streamValues())
+            aggCounts.append(c == nil ? [] : try c!.streamValues())
+            aggSquares.append(sq == nil ? [] : try sq!.streamValues())
         }
         return HostPartial(groupCount: gk.groupCount, keys: keyValues, values: aggValues,
                            counts: aggCounts, squares: aggSquares)
@@ -601,37 +605,32 @@ public final class StreamGroupByOperator: StreamOperator {
         }
     }
 
-    /// One batch's arbitrary-key aggregate rows, brought to the host.
+    /// One batch's arbitrary-key aggregate columns, one row per group, still on the GPU.
     private func hostPartial(_ a: StreamAggregate, _ gk: GroupByKeys, _ batch: MetalRecordBatch)
-        throws -> ([StreamValue], [StreamValue], [StreamValue]) {
+        throws -> (AnyMetalArray?, AnyMetalArray?, AnyMetalArray?) {
         let gb = gk.groupBy
         switch a.op {
         case .count where a.column == nil:
-            let c = try gk.trim(.int64(try gb.count()))
-            return ([], try c.streamValues(), [])
+            return (nil, try gk.trim(.int64(try gb.count())), nil)
         case .count:
             let col = try column(a, batch)
-            let c = try gk.trim(.int64(try countValid(col, gb)))
-            return ([], try c.streamValues(), [])
+            return (nil, try gk.trim(.int64(try countValid(col, gb))), nil)
         case .sum, .mean:
             let col = try column(a, batch)
-            let s = try gk.trim(try groupSum(col, gb))
-            let c = try gk.trim(.int64(try countValid(col, gb)))
-            return (try s.streamValues(), try c.streamValues(), [])
+            return (try gk.trim(try groupSum(col, gb)), try gk.trim(.int64(try countValid(col, gb))), nil)
         case .min:
             let col = try column(a, batch)
-            return (try gk.trim(try groupMinMax(col, gb, isMin: true)).streamValues(), [], [])
+            return (try gk.trim(try groupMinMax(col, gb, isMin: true)), nil, nil)
         case .max:
             let col = try column(a, batch)
-            return (try gk.trim(try groupMinMax(col, gb, isMin: false)).streamValues(), [], [])
+            return (try gk.trim(try groupMinMax(col, gb, isMin: false)), nil, nil)
         case .variance, .stddev:
             let col = try column(a, batch)
             let dbl = try toDouble(col)
             let sq = try dbl.multiply(dbl)
-            let s = try gk.trim(.float64(try gb.sumDouble(dbl)))
-            let q = try gk.trim(.float64(try gb.sumDouble(sq)))
-            let c = try gk.trim(.int64(try countValid(col, gb)))
-            return (try s.streamValues(), try c.streamValues(), try q.streamValues())
+            return (try gk.trim(.float64(try gb.sumDouble(dbl))),
+                    try gk.trim(.int64(try countValid(col, gb))),
+                    try gk.trim(.float64(try gb.sumDouble(sq))))
         case .countDistinctApprox:
             throw ArrowMetalError.unsupportedType("count_distinct_approx is a whole-dataset aggregate, not a group-by one")
         }
@@ -651,6 +650,8 @@ public final class StreamGroupByOperator: StreamOperator {
     }
 
     private func mergeDense(_ d: DensePartial) throws {
+        // A partial recorded before the spill can still arrive after it; fold it into the host table.
+        if spilled { try foldDensePartialIntoHostTable(d); return }
         if denseSum.isEmpty {
             denseSum = Array(repeating: nil, count: aggregates.count)
             denseCount = Array(repeating: nil, count: aggregates.count)
@@ -705,6 +706,31 @@ public final class StreamGroupByOperator: StreamOperator {
         case .uint(let x): acc.sumUInt &+= x; acc.kind = Swift.max(acc.kind, 2)
         case .double(let x): acc.sumDouble += x; acc.kind = 3
         default: break
+        }
+    }
+
+    /// Folds one dense-key partial straight into the host table (used once the state has spilled).
+    private func foldDensePartialIntoHostTable(_ d: DensePartial) throws {
+        guard let K = denseKeyCount else { return }
+        var sums: [[StreamValue]] = [], counts: [[StreamValue]] = []
+        var mins: [[StreamValue]] = [], maxs: [[StreamValue]] = []
+        for (s, c, mn, mx) in d.parts {
+            sums.append(s == nil ? [] : try s!.streamValues())
+            counts.append(c == nil ? [] : try AnyMetalArray.int64(c!).streamValues())
+            mins.append(mn == nil ? [] : try mn!.streamValues())
+            maxs.append(mx == nil ? [] : try mx!.streamValues())
+        }
+        for k in 0..<K {
+            var any = false
+            var accs = table[StreamGroupKey(values: [.int(Int64(k))])]
+                ?? Array(repeating: StreamAccumulator(), count: aggregates.count)
+            for i in 0..<aggregates.count {
+                if counts[i].count > k, case .int(let n) = counts[i][k], n > 0 { accs[i].count += n; any = true }
+                if sums[i].count > k, !sums[i][k].isNull { addInto(&accs[i], sums[i][k]); any = true }
+                if mins[i].count > k, !mins[i][k].isNull { accs[i].minV = minStreamValue(accs[i].minV, mins[i][k]); any = true }
+                if maxs[i].count > k, !maxs[i][k].isNull { accs[i].maxV = maxStreamValue(accs[i].maxV, maxs[i][k]); any = true }
+            }
+            if any { table[StreamGroupKey(values: [.int(Int64(k))])] = accs }
         }
     }
 
@@ -893,7 +919,12 @@ func groupSum(_ col: AnyMetalArray, _ gb: GroupBy<Int32>) throws -> AnyMetalArra
 }
 
 func groupMinMax(_ col: AnyMetalArray, _ gb: GroupBy<Int32>, isMin: Bool) throws -> AnyMetalArray {
-    func f<T: ArrowPrimitive>(_ a: MetalArray<T>) throws -> MetalArray<T> { isMin ? try gb.min(a) : try gb.max(a) }
+    // Metal has no 64-bit atomics, so `GroupBy.min`/`max` only take 32-bit and narrower values; wider
+    // ones go through the segmented (sorted-key) reduction instead.
+    func f<T: ArrowPrimitive>(_ a: MetalArray<T>) throws -> MetalArray<T> {
+        if T.byteWidth > 4 { return isMin ? try gb.min64(a) : try gb.max64(a) }
+        return isMin ? try gb.min(a) : try gb.max(a)
+    }
     switch col {
     case .int8(let a): return .int8(try f(a))
     case .int16(let a): return .int16(try f(a))
@@ -1004,9 +1035,8 @@ public final class StreamTopKOperator: StreamOperator {
     public func process(_ batch: MetalRecordBatch) throws -> Any? {
         var work = batch
         if let f = filter {
-            let q = ExprQueryBuilder().filter(f).project(batch.names.map { ($0, Expr.column($0)) })
-            work = try runExprQuery(q, names: batch.names, columns: batch.columns,
-                                    context: batch.firstContext ?? .shared).recordBatch()
+            work = try streamFilterProject(batch, filter: f, projections: nil,
+                                           context: batch.firstContext ?? .shared)
         }
         guard work.length > 0, k > 0 else { return nil }
         let out = try topKRows(work, column: column, k: k, largest: largest)
@@ -1084,4 +1114,73 @@ func argsortAny(_ c: AnyMetalArray, descending: Bool) throws -> MetalArray<Int32
     default:
         return try c.argsortIndices(descending: descending)
     }
+}
+
+// MARK: - Filter and project, with columns the fused compiler cannot materialise
+
+/// True when the fused Expr compiler can *emit* a column of this type as a projection output.
+///
+/// The compiler evaluates every expression into a fixed-width register, so utf8, binary, temporal,
+/// decimal and nested columns cannot be a projection's output — only its input.
+func exprCanMaterialise(_ c: AnyMetalArray) -> Bool {
+    switch c {
+    case .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64,
+         .float32, .float64, .boolean:
+        return true
+    default:
+        return false
+    }
+}
+
+/// Applies a filter and a projection to one batch, choosing between one fused kernel and the
+/// two-step path that a string (or other non-register) passthrough column forces.
+///
+/// * **Fused** — every output is a numeric or boolean expression: the predicate and all projections
+///   compile into one kernel, the batch is read once, nothing intermediate is materialised.
+/// * **Two-step** — some output is a plain `utf8` / `binary` / temporal / decimal column, which the
+///   compiler cannot write. The predicate still compiles into one fused kernel, producing a boolean
+///   mask; the mask then drives the GPU `filter`, which carries *any* column type, and only the
+///   computed outputs go back through the compiler.
+func streamFilterProject(_ batch: MetalRecordBatch, filter: Expr?, projections: [(String, Expr)]?,
+                         context: MetalContext) throws -> MetalRecordBatch {
+    let projs = projections ?? batch.names.map { ($0, Expr.column($0)) }
+    func passthrough(_ e: Expr) -> String? { if case .column(let n) = e { return n }; return nil }
+
+    let fusable = projs.allSatisfy { p in
+        guard let n = passthrough(p.1), let c = batch[n] else { return true }
+        return exprCanMaterialise(c)
+    }
+    if fusable {
+        var b = ExprQueryBuilder()
+        if let f = filter { b = b.filter(f) }
+        return try runExprQuery(b.project(projs), names: batch.names, columns: batch.columns,
+                                context: context).recordBatch()
+    }
+
+    var work = batch
+    if let f = filter {
+        let mq = ExprQueryBuilder().project([("__mask", f)])
+        let r = try runExprQuery(mq, names: batch.names, columns: batch.columns, context: context)
+        guard let mask = r["__mask"]?.asBoolean else {
+            throw ArrowMetalError.unsupportedType("a streaming filter predicate must be boolean")
+        }
+        work = try batch.filter(mask)
+    }
+    var out: [String: AnyMetalArray] = [:]
+    var computed: [(String, Expr)] = []
+    for (name, e) in projs {
+        if let src = passthrough(e), let c = work[src] { out[name] = c } else { computed.append((name, e)) }
+    }
+    if !computed.isEmpty {
+        let r = try runExprQuery(ExprQueryBuilder().project(computed), names: work.names,
+                                 columns: work.columns, context: context)
+        for (i, n) in r.names.enumerated() { out[n] = r.columns[i] }
+    }
+    var names: [String] = [], cols: [AnyMetalArray] = []
+    for (name, _) in projs {
+        guard let c = out[name] else { throw ArrowMetalError.invalidArrowArray("projection \(name) produced nothing") }
+        names.append(name)
+        cols.append(c)
+    }
+    return try MetalRecordBatch(names: names, columns: cols)
 }
