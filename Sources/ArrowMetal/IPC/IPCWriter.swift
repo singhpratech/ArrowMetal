@@ -30,6 +30,8 @@ extension AnyMetalArray {
             case .duration(let x): return .duration(u(x))
             }
         case .dictionary(_, let values): return values.ipcType   // written decoded; see recordBatchMessage
+        // Nested columns have no IPC type here: the writer rejects them before this value is used.
+        case .list, .structure, .map, .union: return .binary
         }
     }
 }
@@ -312,6 +314,8 @@ public enum ArrowIPCWriter {
                 }
             case .dictionary:
                 throw ArrowIPCError.unsupported("dictionary-encoded columns are not written yet; call decode() on the column first")
+            case .list, .structure, .map, .union:
+                throw ArrowIPCError.unsupported("nested columns (list, struct, map, union) are not written to IPC yet")
             case .string(let a), .binary(let a):
                 body.addValidity(a.validity, nullCount: a.nullCount, length: a.length)
                 if case .varBinary(true) = type.storage {

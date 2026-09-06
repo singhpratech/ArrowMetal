@@ -176,6 +176,23 @@ int  am_binary(am_array* a, int op, am_array* b /* or NULL */, const void* scala
 // Two-level GPU scan; integer sums wrap and are exact, float sums reassociate.
 int  am_cumulative(am_array* a, int op, am_array** out);
 
+// ---------------------------------------------------------------------------------------------------
+// Nested types: list ("+l"), large_list ("+L", offsets narrowed to int32 on import), fixed_size_list
+// ("+w:N"), struct ("+s"), map ("+m") and dense/sparse union ("+ud:", "+us:").
+//
+// am_import / am_export carry all of them through the C Data Interface, recursively, and am_filter /
+// am_take / am_slice work on them unchanged. The calls below are the nested-specific surface.
+// am_list_* accept a list, large_list, fixed_size_list or map array; a map is a list of
+// struct<key, value>, so am_list_flatten on one yields its entries struct.
+int  am_list_value_length(am_array* a, am_array** out);            // int32 per-row child count, null in / null out
+int  am_list_flatten(am_array* a, am_array** out);                 // the child, restricted to the referenced range
+int  am_list_element(am_array* a, int64_t index, am_array** out);  // element `index` of every row; null when absent
+int  am_struct_field(am_array* a, const char* name, am_array** out);
+// Child navigation: 1 child for a list (its values), a map (its entries struct) or a dictionary (its
+// values), one per field for a struct, one per variant for a union, 0 for a flat array.
+int64_t am_child_count(am_array* a);                               // -1 for a null handle
+int  am_child(am_array* a, int64_t i, am_array** out);
+
 #ifdef __cplusplus
 }
 #endif

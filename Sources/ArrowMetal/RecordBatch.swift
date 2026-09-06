@@ -19,6 +19,10 @@ extension AnyMetalArray {
         case .temporal(let a): return a.nullCount
         case .binary(let a): return a.nullCount
         case .dictionary(let codes, _): return codes.nullCount
+        case .list(let a): return a.nullCount
+        case .structure(let a): return a.nullCount
+        case .map(let a): return a.nullCount
+        case .union(let a): return a.nullCount
         }
     }
 
@@ -40,6 +44,10 @@ extension AnyMetalArray {
         case .temporal(let a): return .temporal(try a.filter(mask))
         case .binary(let a): return .binary(markBinary(try a.filter(mask)))
         case .dictionary(let codes, let values): return .dictionary(codes: try codes.filter(mask), values: values)
+        case .list(let a): return .list(try a.filter(mask))
+        case .structure(let a): return .structure(try a.filter(mask))
+        case .map(let a): return .map(try a.filter(mask))
+        case .union(let a): return .union(try a.filter(mask))
         }
     }
 
@@ -60,6 +68,10 @@ extension AnyMetalArray {
         case .temporal(let a): return .temporal(try a.take(idx))
         case .binary(let a): return .binary(markBinary(try a.take(idx)))
         case .dictionary(let codes, let values): return .dictionary(codes: try codes.take(idx), values: values)
+        case .list(let a): return .list(try a.take(idx))
+        case .structure(let a): return .structure(try a.take(idx))
+        case .map(let a): return .map(try a.take(idx))
+        case .union(let a): return .union(try a.take(idx))
         }
     }
 
@@ -82,6 +94,10 @@ extension AnyMetalArray {
             return .binary(markBinary(try a.take(try MetalArray<Int32>((offset..<(offset + length)).map { Int32($0) }, context: a.context))))
         case .dictionary(let codes, let values):
             return .dictionary(codes: try codes.slice(offset: offset, length: length), values: values)
+        case .list(let a): return .list(try a.slice(offset: offset, length: length))
+        case .structure(let a): return .structure(try a.slice(offset: offset, length: length))
+        case .map(let a): return .map(try a.slice(offset: offset, length: length))
+        case .union(let a): return .union(try a.slice(offset: offset, length: length))
         }
     }
 

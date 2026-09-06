@@ -607,3 +607,72 @@ def coalesce(*arrays):
     out = _P()
     _check(_lib.am_coalesce(handles, len(arrays), ctypes.byref(out)))
     return MetalArray(out)
+
+
+# ---- nested types: list ("+l"), large_list ("+L"), fixed_size_list ("+w:N"), struct ("+s"),
+# map ("+m") and dense/sparse union ("+ud:", "+us:").
+#
+# filter / take / slice and the Arrow C Data round trip already work on them through the generic
+# entry points; these add the nested compute surface and child navigation. Methods are attached to
+# MetalArray here rather than in the class body so this section stays self-contained.
+for _name, _extra in [("am_list_value_length", []), ("am_list_flatten", []),
+                      ("am_list_element", [ctypes.c_int64]), ("am_struct_field", [ctypes.c_char_p]),
+                      ("am_child", [ctypes.c_int64])]:
+    getattr(_lib, _name).argtypes = [_P] + _extra + [ctypes.POINTER(_P)]
+    getattr(_lib, _name).restype = ctypes.c_int
+_lib.am_child_count.argtypes = [_P]
+_lib.am_child_count.restype = ctypes.c_int64
+
+
+def _list_value_length(self):
+    """Arrow `list_value_length`: int32 child count per row, null where the row is null."""
+    return _call(_lib.am_list_value_length, self._h)
+
+
+def _list_flatten(self):
+    """Arrow `list_flatten`: the child array, restricted to the range this list references."""
+    return _call(_lib.am_list_flatten, self._h)
+
+
+def _list_element(self, index):
+    """Arrow `list_element`: element `index` of every row; null where the row is null or too short."""
+    return _call(_lib.am_list_element, self._h, index)
+
+
+def _struct_field(self, name):
+    """Arrow `struct_field`: one field of a struct array by name."""
+    return _call(_lib.am_struct_field, self._h, name.encode("utf-8"))
+
+
+def _child_count(self):
+    """Number of child arrays: 1 for a list, map or dictionary, one per field/variant for a struct
+    or union, 0 for a flat array."""
+    return _lib.am_child_count(self._h)
+
+
+def _child(self, i):
+    """Child `i`: a list's values, a map's `entries` struct, a struct's field, a union's variant."""
+    return _call(_lib.am_child, self._h, i)
+
+
+MetalArray.list_value_length = _list_value_length
+MetalArray.list_flatten = _list_flatten
+MetalArray.list_element = _list_element
+MetalArray.struct_field = _struct_field
+MetalArray.child_count = _child_count
+MetalArray.child = _child
+
+_NESTED_PREFIXES = ("+l", "+L", "+w:", "+s", "+m", "+u")
+_prev_type_property = MetalArray.type
+
+
+@property
+def _type_with_nested(self):
+    """pyarrow type of this array. Nested formats carry their children, so the type comes from the
+    exported schema; everything else keeps the flat mapping."""
+    if self.format.startswith(_NESTED_PREFIXES):
+        return self.to_arrow().type
+    return _prev_type_property.fget(self)
+
+
+MetalArray.type = _type_with_nested
