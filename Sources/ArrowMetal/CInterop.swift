@@ -10,6 +10,7 @@ public enum AnyMetalArray {
     case int64(MetalArray<Int64>), uint64(MetalArray<UInt64>)
     case float32(MetalArray<Float>), float64(MetalArray<Double>)
     case boolean(MetalBooleanArray)
+    case string(MetalStringArray)
 
     public var length: Int {
         switch self {
@@ -24,6 +25,7 @@ public enum AnyMetalArray {
         case .float32(let a): return a.length
         case .float64(let a): return a.length
         case .boolean(let a): return a.length
+        case .string(let a): return a.length
         }
     }
 
@@ -40,6 +42,7 @@ public enum AnyMetalArray {
         case .float32: return "f"
         case .float64: return "g"
         case .boolean: return "b"
+        case .string: return "u"
         }
     }
 }
@@ -79,6 +82,7 @@ public func importArrowArray(schema: UnsafePointer<ArrowSchema>, array: UnsafeMu
     guard array.pointee.n_children == 0, array.pointee.dictionary == nil else {
         throw ArrowMetalError.unsupportedType("nested/dictionary arrays are not supported (format \(fmt))")
     }
+    if fmt == "u" || fmt == "U" { return try importStringArray(large: fmt == "U", array: array, context: context) }
     guard array.pointee.n_buffers == 2 else {
         throw ArrowMetalError.invalidArrowArray("expected 2 buffers for primitive array, got \(array.pointee.n_buffers)")
     }
@@ -138,6 +142,52 @@ public func importArrowArray(schema: UnsafePointer<ArrowSchema>, array: UnsafeMu
     }
 }
 
+/// utf8 / large_utf8 import. Zero-copy for utf8 when page aligned and offset 0; large_utf8 offsets are narrowed
+/// (one pass) when the data is under 2 GB.
+private func importStringArray(large: Bool, array: UnsafeMutablePointer<ArrowArray>, context: MetalContext) throws -> ImportResult {
+    guard array.pointee.n_buffers == 3 else { throw ArrowMetalError.invalidArrowArray("expected 3 buffers for utf8") }
+    let owner = ImportedCArray(moving: array)
+    let a = owner.array
+    let length = Int(a.length), offset = Int(a.offset)
+    let validityPtr = a.buffers[0].map { UnsafeRawPointer($0) }
+    guard let offPtr = a.buffers[1].map({ UnsafeRawPointer($0) }) else { throw ArrowMetalError.invalidArrowArray("offsets buffer is null") }
+    let dataPtr = a.buffers[2].map { UnsafeRawPointer($0) }
+    var zc = true
+    var validity: MetalArrowBuffer? = nil
+    if let vp = validityPtr { let (b, z) = try bitBuffer(vp, length: length, offset: offset, owner: owner, context: context); validity = b; zc = zc && z }
+    let offsets: MetalArrowBuffer
+    let data: MetalArrowBuffer
+    if !large && offset == 0 {
+        let (ob, z1) = try MetalArrowBuffer.wrapOrCopy(offPtr, byteCount: (length + 1) * 4, keepAlive: owner, context: context)
+        let total = Int(ob.typed(Int32.self)[length])
+        let (db, z2) = try MetalArrowBuffer.wrapOrCopy(dataPtr ?? offPtr, byteCount: total, keepAlive: owner, context: context)
+        offsets = ob; data = db; zc = zc && z1 && z2
+    } else {
+        // Materialise: narrow / rebase offsets so the slice starts at 0.
+        zc = false
+        let ob = try MetalArrowBuffer.allocate(byteCount: (length + 1) * 4, zeroed: false, context: context)
+        let op = ob.mutableTyped(Int32.self)
+        var start = 0, end = 0
+        if large {
+            let src = offPtr.assumingMemoryBound(to: Int64.self)
+            start = Int(src[offset]); end = Int(src[offset + length])
+            guard end - start < Int(Int32.max) else { throw ArrowMetalError.unsupportedType("large_utf8 over 2 GB") }
+            for i in 0...length { op[i] = Int32(Int(src[offset + i]) - start) }
+        } else {
+            let src = offPtr.assumingMemoryBound(to: Int32.self)
+            start = Int(src[offset]); end = Int(src[offset + length])
+            for i in 0...length { op[i] = src[offset + i] - Int32(start) }
+        }
+        let db = try MetalArrowBuffer.allocate(byteCount: end - start, zeroed: false, context: context)
+        if end > start, let dp = dataPtr { memcpy(db.mutableContents, dp + start, end - start) }
+        offsets = ob; data = db
+    }
+    let arr = MetalStringArray(length: length, nullCount: 0, validity: validity, offsets: offsets, data: data, context: context)
+    let nc = Int(a.null_count)
+    if nc < 0 { arr.recomputeNullCount() } else { arr.setNullCount(nc) }
+    return ImportResult(array: .string(arr), zeroCopy: zc)
+}
+
 /// Imports an `ArrowDeviceArray`. Metal and CPU device types are accepted; both point at unified memory.
 public func importArrowDeviceArray(schema: UnsafePointer<ArrowSchema>, array: UnsafeMutablePointer<ArrowDeviceArray>,
                                    context: MetalContext = .shared) throws -> ImportResult {
@@ -184,6 +234,13 @@ extension MetalArray {
 }
 extension MetalBooleanArray {
     func setNullCount(_ n: Int) { self.nullCount = n }
+}
+extension MetalStringArray {
+    func setNullCount(_ n: Int) { self.nullCount = n }
+    public func recomputeNullCount() {
+        guard let v = validity else { nullCount = 0; return }
+        nullCount = length - Bitmap.popcount(v.typed(UInt8.self), bits: length)
+    }
 }
 
 // MARK: - Export
@@ -293,6 +350,31 @@ extension MetalBooleanArray {
     }
 }
 
+extension MetalStringArray {
+    public func exportArrowArray(into out: UnsafeMutablePointer<ArrowArray>) {
+        var keeps: [AnyObject] = [self, offsets, data]
+        if let v = validity { keeps.append(v) }
+        let holder = ExportHolder(keep: keeps, bufferPtrs: [validity?.contents, offsets.contents, data.contents], format: nil, name: nil)
+        out.pointee.length = Int64(length)
+        out.pointee.null_count = Int64(nullCount)
+        out.pointee.offset = 0
+        out.pointee.n_buffers = 3
+        out.pointee.n_children = 0
+        out.pointee.buffers = UnsafeMutablePointer<UnsafeRawPointer?>(holder.buffers)
+        out.pointee.children = nil
+        out.pointee.dictionary = nil
+        out.pointee.release = releaseExportedArray
+        out.pointee.private_data = Unmanaged.passRetained(holder).toOpaque()
+    }
+    public func exportArrowDeviceArray(into out: UnsafeMutablePointer<ArrowDeviceArray>) {
+        withUnsafeMutablePointer(to: &out.pointee.array) { exportArrowArray(into: $0) }
+        fillDevice(out)
+    }
+    public func exportArrowSchema(name: String = "", into out: UnsafeMutablePointer<ArrowSchema>) {
+        ArrowMetal.exportArrowSchema(format: "u", name: name, into: out)
+    }
+}
+
 extension AnyMetalArray {
     public func exportArrowArray(into out: UnsafeMutablePointer<ArrowArray>) {
         switch self {
@@ -307,6 +389,7 @@ extension AnyMetalArray {
         case .float32(let a): a.exportArrowArray(into: out)
         case .float64(let a): a.exportArrowArray(into: out)
         case .boolean(let a): a.exportArrowArray(into: out)
+        case .string(let a): a.exportArrowArray(into: out)
         }
     }
     public func exportArrowDeviceArray(into out: UnsafeMutablePointer<ArrowDeviceArray>) {

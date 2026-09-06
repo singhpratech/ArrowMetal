@@ -15,6 +15,7 @@ extension AnyMetalArray {
         case .float32(let a): return a.nullCount
         case .float64(let a): return a.nullCount
         case .boolean(let a): return a.nullCount
+        case .string(let a): return a.nullCount
         }
     }
 
@@ -32,6 +33,7 @@ extension AnyMetalArray {
         case .float32(let a): return .float32(try a.filter(mask))
         case .float64(let a): return .float64(try a.filter(mask))
         case .boolean(let a): return .boolean(try a.filter(mask))
+        case .string(let a): return .string(try a.filter(mask))
         }
     }
 
@@ -48,6 +50,7 @@ extension AnyMetalArray {
         case .float32(let a): return .float32(try a.take(idx))
         case .float64(let a): return .float64(try a.take(idx))
         case .boolean(let a): return .boolean(try a.take(idx))
+        case .string(let a): return .string(try a.take(idx))
         }
     }
 
@@ -64,6 +67,7 @@ extension AnyMetalArray {
         case .float32(let a): return .float32(try a.slice(offset: offset, length: length))
         case .float64(let a): return .float64(try a.slice(offset: offset, length: length))
         case .boolean(let a): return .boolean(try a.slice(offset: offset, length: length))
+        case .string(let a): return .string(try a.take(try MetalArray<Int32>((offset..<(offset + length)).map { Int32($0) }, context: a.context)))
         }
     }
 
@@ -73,6 +77,7 @@ extension AnyMetalArray {
     public var asFloat32: MetalArray<Float>? { if case .float32(let a) = self { return a } else { return nil } }
     public var asFloat64: MetalArray<Double>? { if case .float64(let a) = self { return a } else { return nil } }
     public var asBoolean: MetalBooleanArray? { if case .boolean(let a) = self { return a } else { return nil } }
+    public var asString: MetalStringArray? { if case .string(let a) = self { return a } else { return nil } }
 }
 
 /// A set of equal-length named columns: the Metal-resident equivalent of an Arrow RecordBatch.

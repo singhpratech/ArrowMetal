@@ -62,6 +62,10 @@ for name, extra in [("am_compare_scalar", [ctypes.c_int, _P]), ("am_compare_arra
                     ("am_slice", [ctypes.c_int64, ctypes.c_int64])]:
     getattr(_lib, name).argtypes = [_P] + extra + [ctypes.POINTER(_P)]
     getattr(_lib, name).restype = ctypes.c_int
+_lib.am_str_unary.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]; _lib.am_str_unary.restype = ctypes.c_int
+_lib.am_str_match.argtypes = [_P, ctypes.c_int, ctypes.c_char_p, ctypes.c_int64, ctypes.POINTER(_P)]; _lib.am_str_match.restype = ctypes.c_int
+_lib.am_str_equals_array.argtypes = [_P, _P, ctypes.POINTER(_P)]; _lib.am_str_equals_array.restype = ctypes.c_int
+_lib.am_str_dictionary_encode.argtypes = [_P, ctypes.POINTER(_P), ctypes.POINTER(_P)]; _lib.am_str_dictionary_encode.restype = ctypes.c_int
 _lib.am_group_by.argtypes = [_P, ctypes.c_int64, ctypes.c_int, _P, ctypes.POINTER(_P)]
 _lib.am_group_by.restype = ctypes.c_int
 _lib.am_batch_begin.restype = ctypes.c_int
@@ -148,7 +152,8 @@ class MetalArray:
     @property
     def type(self):
         return pa.type_for_alias({"c": "int8", "C": "uint8", "s": "int16", "S": "uint16", "i": "int32", "I": "uint32",
-                                  "l": "int64", "L": "uint64", "f": "float32", "g": "float64", "b": "bool"}[self.format])
+                                  "l": "int64", "L": "uint64", "f": "float32", "g": "float64", "b": "bool",
+                                  "u": "string"}[self.format])
 
     def __repr__(self):
         return f"MetalArray({self.type}, len={len(self)}, nulls={self.null_count}, device={device_name()!r})"
@@ -182,7 +187,7 @@ class MetalArray:
             return _call(_lib.am_compare_array, self._h, _OPS[op], other._h)
         return _call(_lib.am_compare_scalar, self._h, _OPS[op], self._scalar(other))
 
-    def __eq__(self, o): return self.compare("==", o)
+    def __eq__(self, o): return self.str_equals(o) if self.format == "u" else self.compare("==", o)
     def __ne__(self, o): return self.compare("!=", o)
     def __lt__(self, o): return self.compare("<", o)
     def __le__(self, o): return self.compare("<=", o)
@@ -219,6 +224,26 @@ class MetalArray:
             indices = MetalArray.from_arrow(pa.array(indices, type=pa.int32()))
         return _call(_lib.am_take, self._h, indices._h)
     def slice(self, offset, length): return _call(_lib.am_slice, self._h, offset, length)
+
+    # ---- strings (utf8)
+    def byte_length(self): return _call(_lib.am_str_unary, self._h, 0)
+    def char_length(self): return _call(_lib.am_str_unary, self._h, 1)
+    def hash32(self): return _call(_lib.am_str_unary, self._h, 2)
+    def _match(self, pred, pattern):
+        b = pattern.encode("utf-8")
+        return _call(_lib.am_str_match, self._h, pred, b, len(b))
+    def str_equals(self, other):
+        if isinstance(other, MetalArray):
+            return _call(_lib.am_str_equals_array, self._h, other._h)
+        return self._match(0, other)
+    def starts_with(self, p): return self._match(1, p)
+    def ends_with(self, p): return self._match(2, p)
+    def str_contains(self, p): return self._match(3, p)
+    def dictionary_encode(self):
+        """Returns (codes: int32 MetalArray, unique: string MetalArray). Use codes.group_by(len(unique))."""
+        c = _P(); u = _P()
+        _check(_lib.am_str_dictionary_encode(self._h, ctypes.byref(c), ctypes.byref(u)))
+        return MetalArray(c), MetalArray(u)
 
     # ---- group-by over dense keys in [0, key_count)
     def group_by(self, key_count):

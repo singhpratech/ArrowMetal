@@ -48,6 +48,13 @@ int  am_slice(am_array* a, int64_t offset, int64_t length, am_array** out);
 // Group-by over dense int32/int64 keys in [0, key_count). agg: 0 sum, 1 count(rows), 2 min, 3 max, 4 mean, 5 count(values)
 int  am_group_by(am_array* keys, int64_t key_count, int agg, am_array* values /* may be NULL for count rows */, am_array** out);
 
+// Strings (utf8). unary kind: 0 byte length (int32), 1 char length (int32), 2 murmur3 hash (uint32).
+// match pred: 0 equals, 1 starts_with, 2 ends_with, 3 contains; pattern is UTF-8 bytes.
+int  am_str_unary(am_array* a, int kind, am_array** out);
+int  am_str_match(am_array* a, int pred, const uint8_t* pattern, int64_t len, am_array** out);
+int  am_str_equals_array(am_array* a, am_array* b, am_array** out);
+int  am_str_dictionary_encode(am_array* a, am_array** codes, am_array** unique);
+
 // Batching: between begin and end, every call on this thread appends to one GPU command buffer. The GPU runs
 // once at end (or at the first call that must read a result, such as am_reduce or am_export).
 int  am_batch_begin(void);
