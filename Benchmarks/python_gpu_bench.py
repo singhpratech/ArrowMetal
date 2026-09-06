@@ -162,12 +162,20 @@ for gb_distinct in (1_000, 100_000, 10_000_000):
     if gb_distinct > rows:
         continue
     codes = rng.integers(0, gb_distinct, size=rows, dtype=np.int32)
-    # Fixed-width 12-byte keys, built once as a pyarrow utf8 array without a Python list round trip.
+    # Fixed-width 12-byte keys, built straight into the Arrow buffers with vectorised numpy: "k" plus
+    # the code's low 44 bits in hex. (np.char.mod over 50 million elements would cost more than the
+    # benchmark it feeds.)
     width = 12
-    body = np.char.mod("%011x", codes).astype("S12")
+    hexdigits = np.frombuffer(b"0123456789abcdef", dtype=np.uint8)
+    body = np.empty((rows, width), dtype=np.uint8)
+    body[:, 0] = ord("k")
+    acc = codes.astype(np.uint64)
+    for _j in range(width - 1, 0, -1):
+        body[:, _j] = hexdigits[(acc & 0xF).astype(np.intp)]
+        acc >>= 4
     offsets = np.arange(rows + 1, dtype=np.int32) * width
-    data = np.frombuffer(body.tobytes(), dtype=np.uint8)
-    key_arr = pa.Array.from_buffers(pa.utf8(), rows, [None, pa.py_buffer(offsets), pa.py_buffer(data)])
+    key_arr = pa.Array.from_buffers(pa.utf8(), rows,
+                                    [None, pa.py_buffer(offsets), pa.py_buffer(body.reshape(-1))])
     g_keys = am.array(key_arr)
     p_keys = pl.Series("k", key_arr)
     KB = rows * width + (rows + 1) * 4 + rows * 8
