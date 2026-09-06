@@ -1,0 +1,633 @@
+import Foundation
+import Metal
+
+// The scalar aggregates Arrow defines beyond sum / min / max / mean / count, on the GPU.
+//
+// | function | how it runs |
+// |---|---|
+// | `product` | one GPU pass, per-threadgroup partial products, host combine |
+// | `variance` / `stddev` | two GPU passes (sum, then squared deviations from that mean), host combine |
+// | `min_max` | one GPU pass producing both partials |
+// | `index` | one GPU pass, device-wide atomic minimum over the matching rows |
+// | `first` / `last` | one GPU pass over the validity bitmap (atomic min/max index), one host read |
+// | `any` / `all` | one GPU pass, word-wise popcounts of `values & validity` and of `validity` |
+// | `quantile` / `approximate_median` | GPU sort (radix) plus an indexed host read: exact, not approximate |
+// | `mode` | GPU `value_counts` plus a host argmax |
+// | `count_distinct` | GPU `unique().length` |
+//
+// `tdigest` is **out of scope**: it is an approximate sketch whose merge step is inherently sequential
+// per digest, and the exact `quantile` here covers the same question on the data sizes this package
+// targets. There is no plan to add it.
+//
+// Precision. Integer `product` accumulates in Int64 / UInt64 and wraps, as Arrow's does. Float32
+// products accumulate per thread in `float` and are combined in `double`, so they reassociate and every
+// multiplication rounds in float: over thousands of factors expect a relative error around 1e-5.
+// Float64 products run the software binary64 multiply on the GPU (`DoubleMath`), correctly rounded per
+// operation but still reassociated across threads. Variance and standard deviation are computed in two
+// passes: the mean comes from `sum()`, and the squared deviations are accumulated in compensated float
+// pairs (Neumaier) for integer and Float32 columns, or in software binary64 for Float64 columns, then
+// combined on the host in `Double`. Expect a relative error of about 1e-7 for Float32 and integer
+// columns and about 1e-15 for Float64 columns. Integer deviations subtract the integer part of the mean
+// in 64-bit before converting to float, so a column of large integers keeps its precision; the
+// exception is a UInt64 column with values above `Int64.max`, where that subtraction wraps.
+
+extension MetalArray {
+
+    // MARK: - product
+
+    /// Arrow `product` of the non-null values, or nil when there is no valid value.
+    ///
+    /// Integers accumulate in Int64 / UInt64 and wrap on overflow, matching Arrow. Float32 accumulates
+    /// in `float` per thread and combines in `double`; Float64 multiplies through the software binary64
+    /// routine on the GPU.
+    public func product() throws -> SumResult? {
+        guard validCount > 0 else { return nil }
+        let ctx = context
+        let n = length
+        try Dispatch.checkLength(n)
+        let spec = AggregateSpec.of(T.self)
+        let groups = Aggregates.groupCount(n)
+        let partials = try MetalArrowBuffer.allocate(byteCount: groups * 8, zeroed: false, context: ctx)
+        let counts = try MetalArrowBuffer.allocate(byteCount: groups * 4, zeroed: false, context: ctx)
+        let pso = try Dispatch.pipeline(ctx, family: "aggregate", source: spec.source, function: "agg_product", type: spec.key)
+        try ctx.run { enc in
+            enc.setComputePipelineState(pso)
+            Aggregates.bindValues(enc, self)
+            enc.setBuffer(partials.mtl, offset: 0, index: 4)
+            enc.setBuffer(counts.mtl, offset: 0, index: 5)
+            Aggregates.dispatch(enc, groups: groups)
+        }
+        try ctx.syncPoint()
+        return withExtendedLifetime((partials, counts)) {
+            if T.self == Double.self {
+                let p = partials.typed(UInt64.self)
+                var acc = 1.0
+                for g in 0..<groups { acc *= Double(bitPattern: p[g]) }
+                return .float(acc)
+            } else if T.isFloatingPoint {
+                let p = partials.typed(Float.self)
+                var acc = 1.0
+                for g in 0..<groups { acc *= Double(p[g]) }
+                return .float(acc)
+            } else if T.minValue < 0 as T {
+                let p = partials.typed(Int64.self)
+                var acc: Int64 = 1
+                for g in 0..<groups { acc &*= p[g] }
+                return .int(acc)
+            } else {
+                let p = partials.typed(UInt64.self)
+                var acc: UInt64 = 1
+                for g in 0..<groups { acc &*= p[g] }
+                return .uint(acc)
+            }
+        }
+    }
+
+    // MARK: - variance / stddev
+
+    /// Arrow `variance`. `ddof` is the delta degrees of freedom: 0 (the default) is the population
+    /// variance, 1 the sample variance. Nil when fewer than `ddof + 1` valid values remain.
+    ///
+    /// Two passes: `sum()` for the mean, then a GPU pass over the squared deviations from it.
+    public func variance(ddof: Int = 0) throws -> Double? {
+        guard let (sumSquares, count) = try squaredDeviations(), count > ddof else { return nil }
+        return sumSquares / Double(count - ddof)
+    }
+
+    /// Population standard deviation (`ddof: 1` gives the sample one). Nil when there is nothing to measure.
+    public func stddev(ddof: Int = 0) throws -> Double? {
+        guard let v = try variance(ddof: ddof) else { return nil }
+        return v.squareRoot()
+    }
+
+    /// The sum of squared deviations from the mean and the number of values that contributed.
+    private func squaredDeviations() throws -> (Double, Int)? {
+        let valid = validCount
+        guard valid > 0, let s = try sum() else { return nil }
+        let mean = s.asDouble / Double(valid)
+        // A NaN or infinite mean (a NaN in a Float64 column, or an overflowing float sum) has no variance.
+        guard mean.isFinite else { return nil }
+        let ctx = context
+        let n = length
+        try Dispatch.checkLength(n)
+        let spec = AggregateSpec.of(T.self)
+        let groups = Aggregates.groupCount(n)
+        let partials = try MetalArrowBuffer.allocate(byteCount: groups * 8, zeroed: false, context: ctx)
+        let counts = try MetalArrowBuffer.allocate(byteCount: groups * 4, zeroed: false, context: ctx)
+        var params = AggMeanParams()
+        switch spec.moment {
+        case .integer:
+            let floored = mean.rounded(.down)
+            params.ipart = Int64(clampedTo: floored)
+            params.hi = Float(mean - floored)
+        case .float:
+            params.hi = Float(mean)
+            params.lo = Float(mean - Double(Float(mean)))
+        case .double:
+            params.bits = mean.bitPattern
+        }
+        let pso = try Dispatch.pipeline(ctx, family: "aggregate", source: spec.source, function: "agg_moment", type: spec.key)
+        try ctx.run { enc in
+            enc.setComputePipelineState(pso)
+            Aggregates.bindValues(enc, self)
+            enc.setBytes(&params, length: MemoryLayout<AggMeanParams>.size, index: 4)
+            enc.setBuffer(partials.mtl, offset: 0, index: 5)
+            enc.setBuffer(counts.mtl, offset: 0, index: 6)
+            Aggregates.dispatch(enc, groups: groups)
+        }
+        try ctx.syncPoint()
+        return withExtendedLifetime((partials, counts)) {
+            let c = counts.typed(UInt32.self)
+            var total = 0.0, contributed = 0
+            if spec.moment == .double {
+                let p = partials.typed(UInt64.self)
+                for g in 0..<groups where c[g] > 0 { total += Double(bitPattern: p[g]); contributed += Int(c[g]) }
+            } else {
+                let p = partials.typed(Float.self)
+                for g in 0..<groups where c[g] > 0 {
+                    total += Double(p[2 * g]) + Double(p[2 * g + 1])
+                    contributed += Int(c[g])
+                }
+            }
+            return (total, contributed)
+        }
+    }
+
+    // MARK: - min_max
+
+    /// Arrow `min_max` in a single pass: one kernel produces both partials, so the values are read once.
+    /// Nil when every value is null (or NaN, which is skipped as `min` / `max` do).
+    public func minMax() throws -> (min: T, max: T)? {
+        guard validCount > 0 else { return nil }
+        let ctx = context
+        let n = length
+        try Dispatch.checkLength(n)
+        let spec = AggregateSpec.of(T.self)
+        let groups = Aggregates.groupCount(n)
+        let mins = try MetalArrowBuffer.allocate(byteCount: groups * 8, zeroed: false, context: ctx)
+        let maxs = try MetalArrowBuffer.allocate(byteCount: groups * 8, zeroed: false, context: ctx)
+        let counts = try MetalArrowBuffer.allocate(byteCount: groups * 4, zeroed: false, context: ctx)
+        let pso = try Dispatch.pipeline(ctx, family: "aggregate", source: spec.source, function: "agg_minmax", type: spec.key)
+        try ctx.run { enc in
+            enc.setComputePipelineState(pso)
+            Aggregates.bindValues(enc, self)
+            enc.setBuffer(mins.mtl, offset: 0, index: 4)
+            enc.setBuffer(maxs.mtl, offset: 0, index: 5)
+            enc.setBuffer(counts.mtl, offset: 0, index: 6)
+            Aggregates.dispatch(enc, groups: groups)
+        }
+        try ctx.syncPoint()
+        return withExtendedLifetime((mins, maxs, counts)) { () -> (min: T, max: T)? in
+            let c = counts.typed(UInt32.self)
+            var lo = T.maxValue, hi = T.minValue, any = false
+            for g in 0..<groups where c[g] > 0 {
+                any = true
+                lo = Swift.min(lo, Aggregates.decodeKey(T.self, mins, g))
+                hi = Swift.max(hi, Aggregates.decodeKey(T.self, maxs, g))
+            }
+            return any ? (lo, hi) : nil
+        }
+    }
+
+    // MARK: - quantile / median / mode / count_distinct
+
+    /// Arrow `quantile` with linear interpolation, computed exactly: the values are sorted on the GPU
+    /// and the result is read at the interpolated position. `q` is clamped to [0, 1].
+    ///
+    /// Nulls are skipped. A NaN is not a null: it sorts after `+inf` and therefore drags a high quantile
+    /// with it, exactly as sorting the column and indexing it would.
+    public func quantile(_ q: Double) throws -> Double? {
+        let m = validCount
+        guard m > 0 else { return nil }
+        let sortedValues = try sorted()
+        let position = Swift.max(0.0, Swift.min(1.0, q)) * Double(m - 1)
+        let low = Int(position.rounded(.down)), high = Int(position.rounded(.up))
+        return withExtendedLifetime(sortedValues) {
+            let p = sortedValues.valuePointer
+            let a = p[low].asDouble, b = p[high].asDouble
+            if low == high { return a }
+            return a + (b - a) * (position - Double(low))
+        }
+    }
+
+    /// Arrow `approximate_median`, computed exactly (`quantile(0.5)`): this package sorts on the GPU
+    /// instead of sketching, so there is nothing approximate about the answer.
+    public func approximateMedian() throws -> Double? { try quantile(0.5) }
+
+    /// Arrow `mode`: the most common non-null value and how often it occurs. Ties go to the smallest
+    /// value, as Arrow does. Nil when every value is null.
+    ///
+    /// GPU `value_counts` (sort, mark runs, scan) plus a host argmax over the distinct values.
+    public func mode() throws -> (value: T, count: Int64)? {
+        let (values, counts) = try valueCounts()
+        guard values.length > 0 else { return nil }
+        return withExtendedLifetime((values, counts)) { () -> (value: T, count: Int64)? in
+            let v = values.valuePointer, c = counts.valuePointer
+            var best = 0
+            for i in 1..<values.length where c[i] > c[best] { best = i }
+            return (v[best], c[best])
+        }
+    }
+
+    /// Arrow `count_distinct` over the non-null values (`mode = "only_valid"`). GPU, through `unique()`.
+    public func countDistinct() throws -> Int { try unique().length }
+
+    // MARK: - first / last / index
+
+    /// Arrow `first`: the first value, skipping nulls unless `skipNulls` is false (in which case a null
+    /// first row gives nil). Nil for an empty array or one with no valid value.
+    public func first(skipNulls: Bool = true) throws -> T? {
+        guard length > 0 else { return nil }
+        guard skipNulls, validity != nil else { return self[0] }
+        guard let bounds = try validBounds() else { return nil }
+        return withExtendedLifetime(self) { valuePointer[bounds.first] }
+    }
+
+    /// Arrow `last`, with the same null handling as `first`.
+    public func last(skipNulls: Bool = true) throws -> T? {
+        let n = length
+        guard n > 0 else { return nil }
+        guard skipNulls, validity != nil else { return self[n - 1] }
+        guard let bounds = try validBounds() else { return nil }
+        return withExtendedLifetime(self) { valuePointer[bounds.last] }
+    }
+
+    /// First and last row with a validity bit set, found by a GPU atomic min / max over the bitmap.
+    func validBounds() throws -> (first: Int, last: Int)? {
+        guard let v = validity else { return length > 0 ? (0, length - 1) : nil }
+        let ctx = context
+        let n = length
+        guard n > 0, validCount > 0 else { return nil }
+        try Dispatch.checkLength(n)
+        let out = try MetalArrowBuffer.allocate(byteCount: 8, zeroed: false, context: ctx)
+        withExtendedLifetime(out) {
+            let p = out.mutableTyped(UInt32.self)
+            p[0] = UInt32.max      // smallest valid index
+            p[1] = 0               // largest valid index, stored as index + 1
+        }
+        let pso = try Dispatch.pipeline(ctx, family: "aggregate", source: AggregatesSource.common,
+                                        function: "agg_valid_bounds", type: "common")
+        try ctx.run { enc in
+            enc.setComputePipelineState(pso)
+            enc.setBuffer(v.mtl, offset: v.offset, index: 0)
+            Dispatch.setLength(enc, n, nil, index: 1)
+            enc.setBuffer(out.mtl, offset: out.offset, index: 2)
+            enc.setBuffer(out.mtl, offset: out.offset + 4, index: 3)
+            Dispatch.dispatch1D(enc, pso, count: n)
+        }
+        try ctx.syncPoint()
+        return withExtendedLifetime(out) { () -> (first: Int, last: Int)? in
+            let p = out.typed(UInt32.self)
+            guard p[0] != UInt32.max, p[1] > 0 else { return nil }
+            return (Int(p[0]), Int(p[1]) - 1)
+        }
+    }
+
+    /// Arrow `index`: the first row that equals `value`, or -1 when it is absent.
+    ///
+    /// GPU: every matching row atomically lowers a single device-wide minimum. Equality is Arrow value
+    /// equality for floats (`-0.0` equals `0.0`, and NaN equals nothing, including itself).
+    public func index(of value: T) throws -> Int64 {
+        let ctx = context
+        let n = length
+        guard n > 0 else { return -1 }
+        try Dispatch.checkLength(n)
+        let spec = AggregateSpec.of(T.self)
+        let out = try MetalArrowBuffer.allocate(byteCount: 4, zeroed: false, context: ctx)
+        withExtendedLifetime(out) { out.mutableTyped(UInt32.self)[0] = UInt32.max }
+        let pso = try Dispatch.pipeline(ctx, family: "aggregate", source: spec.source, function: "agg_index", type: spec.key)
+        try ctx.run { enc in
+            enc.setComputePipelineState(pso)
+            Aggregates.bindValues(enc, self)
+            if let d = value as? Double { Dispatch.setScalar(enc, Int64(bitPattern: d.bitPattern), index: 4) }
+            else { Dispatch.setScalar(enc, value, index: 4) }
+            enc.setBuffer(out.mtl, offset: out.offset, index: 5)
+            Dispatch.dispatch1D(enc, pso, count: n)
+        }
+        try ctx.syncPoint()
+        let found = withExtendedLifetime(out) { out.typed(UInt32.self)[0] }
+        return found == UInt32.max ? -1 : Int64(found)
+    }
+}
+
+// MARK: - boolean any / all on the GPU
+
+extension MetalBooleanArray {
+    /// Number of true (and valid) values and number of valid values, in one GPU pass over the bitmap
+    /// words. The host-side `trueCount` property computes the same first number on the CPU.
+    public func trueAndValidCounts() throws -> (trueCount: Int, validCount: Int) {
+        let n = length
+        guard n > 0 else { return (0, 0) }
+        try Dispatch.checkLength(n)
+        let ctx = context
+        let out = try MetalArrowBuffer.allocate(byteCount: 8, context: ctx)
+        let pso = try Dispatch.pipeline(ctx, family: "aggregate", source: AggregatesSource.common,
+                                        function: "agg_bool_counts", type: "common")
+        let vld = validity ?? values
+        try ctx.run { enc in
+            enc.setComputePipelineState(pso)
+            enc.setBuffer(values.mtl, offset: values.offset, index: 0)
+            enc.setBuffer(vld.mtl, offset: vld.offset, index: 1)
+            Dispatch.setUInt(enc, validity == nil ? 0 : 1, index: 2)
+            Dispatch.setLength(enc, n, nil, index: 3)
+            enc.setBuffer(out.mtl, offset: out.offset, index: 4)
+            enc.setBuffer(out.mtl, offset: out.offset + 4, index: 5)
+            Dispatch.dispatch1D(enc, pso, count: BitmapOps.words(bits: n))
+        }
+        try ctx.syncPoint()
+        return withExtendedLifetime(out) {
+            let p = out.typed(UInt32.self)
+            return (Int(p[0]), Int(p[1]))
+        }
+    }
+
+    /// Arrow `any` with `skip_nulls`, on the GPU: true when at least one valid value is true.
+    /// (`any` without parentheses is the host popcount in `Slice.swift`; this is the kernel form.)
+    public func anyTrue() throws -> Bool { try trueAndValidCounts().trueCount > 0 }
+
+    /// Arrow `all` with `skip_nulls`, on the GPU: true when every valid value is true, and true for an
+    /// empty or all-null array, matching Arrow's default `min_count = 0`.
+    public func allTrue() throws -> Bool {
+        let (t, v) = try trueAndValidCounts()
+        return t == v
+    }
+}
+
+// MARK: - grouped aggregates (hash_* over dense keys)
+
+// The grouped forms of the aggregates above, over the same dense keys `GroupBy` already takes (the codes
+// a dictionary encoding produces). Each one is built from GPU primitives that already exist:
+//
+// | function | how it runs |
+// |---|---|
+// | `hash_first` / `hash_last` | group-by min / max over a row index array, then one `take` — all GPU |
+// | `hash_any` / `hash_all` | group-by max / min over the unpacked boolean bytes — all GPU |
+// | `hash_variance` / `hash_stddev` | GPU means, a GPU gather of the mean per row, GPU deviations, GPU sum |
+// | `hash_count_distinct` | GPU dictionary encoding of the values, GPU `unique` over packed (key, code) pairs |
+// | `hash_product` | one host pass over the key and value buffers (there is no 64-bit atomic multiply) |
+// | `hash_approximate_median` | **not implemented** — see `approximateMedian` below |
+
+extension GroupBy {
+    /// Arrow `hash_first`: the first non-null value of each key, in row order. Keys with no valid value
+    /// are null. GPU: a group-by minimum over the row indices, then a `take`.
+    public func first<T: ArrowPrimitive>(_ values: MetalArray<T>) throws -> MetalArray<T> {
+        try values.take(try rowIndex(values, wantFirst: true))
+    }
+
+    /// Arrow `hash_last`: the last non-null value of each key. GPU, as `first`.
+    public func last<T: ArrowPrimitive>(_ values: MetalArray<T>) throws -> MetalArray<T> {
+        try values.take(try rowIndex(values, wantFirst: false))
+    }
+
+    /// The first (or last) row index per key among the rows whose value is non-null, or null for a key
+    /// with no such row. The row indices carry the values' validity bitmap, so nulls are skipped.
+    private func rowIndex<T: ArrowPrimitive>(_ values: MetalArray<T>, wantFirst: Bool) throws -> MetalArray<Int32> {
+        guard values.length == keys.length else { throw ArrowMetalError.lengthMismatch(keys.length, values.length) }
+        let iota = try MetalArray<Int32>.iota(values.length, context: values.context)
+        let masked = MetalArray<Int32>(length: values.length, nullCount: values.nullCount,
+                                       validity: values.validity, values: iota.values, context: values.context)
+        return wantFirst ? try min(masked) : try max(masked)
+    }
+
+    /// Arrow `hash_any` over a boolean column: true for a key with at least one true value, null for a
+    /// key with no valid value. GPU: the bits become bytes and a group-by maximum does the rest.
+    public func any(_ values: MetalBooleanArray) throws -> MetalBooleanArray {
+        try MetalBooleanArray.fromUInt8Array(try max(try values.toUInt8Array()))
+    }
+
+    /// Arrow `hash_all` over a boolean column: true when every valid value of the key is true.
+    public func all(_ values: MetalBooleanArray) throws -> MetalBooleanArray {
+        try MetalBooleanArray.fromUInt8Array(try min(try values.toUInt8Array()))
+    }
+
+    /// Arrow `hash_product` per key, wrapping in Int64 exactly as the scalar `product` does.
+    ///
+    /// This one runs on the **host**: Metal has no 64-bit atomic multiply and no threadgroup-private
+    /// multiply table that would beat a single pass over unified memory. Keys outside `[0, keyCount)`
+    /// and null keys are skipped, as everywhere else in `GroupBy`.
+    public func product<T: ArrowPrimitive>(_ values: MetalArray<T>) throws -> MetalArray<Int64> where T: FixedWidthInteger {
+        guard values.length == keys.length else { throw ArrowMetalError.lengthMismatch(keys.length, values.length) }
+        let out = try MetalArray<Int64>.allocate(length: keyCount, withValidity: true, context: values.context)
+        withExtendedLifetime((keys, values, out)) {
+            let k = keys.valuePointer, v = values.valuePointer
+            let d = out.mutableValuePointer, valid = out.validity!.mutableTyped(UInt8.self)
+            for i in 0..<keyCount { d[i] = 1 }
+            for i in 0..<keys.length {
+                if !keys.isValid(i) || !values.isValid(i) { continue }
+                let key = Int(k[i].asInt64)
+                guard key >= 0, key < keyCount else { continue }
+                d[key] &*= v[i].asInt64
+                Bitmap.set(valid, key)
+            }
+            for i in 0..<keyCount where !Bitmap.isSet(valid, i) { d[i] = 0 }
+        }
+        out.recomputeNullCount()
+        return out
+    }
+
+    /// Arrow `hash_variance` per key (`ddof` 0 for the population variance, 1 for the sample one).
+    ///
+    /// GPU, in the same two-pass shape as the scalar form: the per-key means come from `sum` and `count`,
+    /// a `take` by the key gathers each row's mean, and the squared deviations are summed per key.
+    /// Deviations are computed in Float32, so expect a relative error around 1e-6; a column whose values
+    /// need more than 24 bits of mantissa should be scaled first.
+    public func variance<T: ArrowPrimitive>(_ values: MetalArray<T>, ddof: Int = 0) throws -> MetalArray<Double> {
+        guard values.length == keys.length else { throw ArrowMetalError.lengthMismatch(keys.length, values.length) }
+        let counts = try count(values)
+        let means = try meanPerKey(values, counts: counts)
+        let asFloat = try values.cast(to: Float.self)
+        let perRow = try means.take(keys)                                  // null key or empty group -> null
+        let deviation = try asFloat.arithmetic(.sub, perRow)
+        let squares = try deviation.arithmetic(.mul, deviation)
+        let sums = try sumFloat(squares)
+        let out = try MetalArray<Double>.allocate(length: keyCount, withValidity: true, context: values.context)
+        withExtendedLifetime((counts, sums, out)) {
+            let c = counts.valuePointer, s = sums.valuePointer
+            let d = out.mutableValuePointer, valid = out.validity!.mutableTyped(UInt8.self)
+            for k in 0..<keyCount where Int(c[k]) > ddof && sums.isValid(k) {
+                d[k] = s[k] / Double(Int(c[k]) - ddof)
+                Bitmap.set(valid, k)
+            }
+        }
+        out.recomputeNullCount()
+        return out
+    }
+
+    /// Arrow `hash_stddev` per key: the square root of `variance`.
+    public func stddev<T: ArrowPrimitive>(_ values: MetalArray<T>, ddof: Int = 0) throws -> MetalArray<Double> {
+        let v = try variance(values, ddof: ddof)
+        let out = try MetalArray<Double>.allocate(length: keyCount, withValidity: true, context: v.context)
+        withExtendedLifetime((v, out)) {
+            let s = v.valuePointer
+            let d = out.mutableValuePointer, valid = out.validity!.mutableTyped(UInt8.self)
+            for k in 0..<keyCount where v.isValid(k) { d[k] = s[k].squareRoot(); Bitmap.set(valid, k) }
+        }
+        out.recomputeNullCount()
+        return out
+    }
+
+    /// The mean of each key as a Float32 array (0 where a key has no valid value).
+    private func meanPerKey<T: ArrowPrimitive>(_ values: MetalArray<T>, counts: MetalArray<Int64>) throws -> MetalArray<Float> {
+        let sums: [Double]
+        if let f = values as? MetalArray<Float> {
+            let s = try sumFloat(f)
+            sums = (0..<keyCount).map { s.isValid($0) ? s.valuePointer[$0] : 0 }
+        } else if let d = values as? MetalArray<Double> {
+            throw ArrowMetalError.unsupportedType("group-by variance over Float64 values (cast to Float32 first); \(d.length) rows")
+        } else {
+            let s = try sumErased(values)
+            sums = (0..<keyCount).map { s.isValid($0) ? Double(s.valuePointer[$0]) : 0 }
+        }
+        var means = [Float](repeating: 0, count: keyCount)
+        for k in 0..<keyCount where counts.valuePointer[k] > 0 {
+            means[k] = Float(sums[k] / Double(counts.valuePointer[k]))
+        }
+        return try MetalArray<Float>(means, context: values.context)
+    }
+
+    /// `sum` over any integer element type, without the caller having to name it.
+    private func sumErased<T: ArrowPrimitive>(_ values: MetalArray<T>) throws -> MetalArray<Int64> {
+        switch values {
+        case let x as MetalArray<Int8>: return try sum(x)
+        case let x as MetalArray<UInt8>: return try sum(x)
+        case let x as MetalArray<Int16>: return try sum(x)
+        case let x as MetalArray<UInt16>: return try sum(x)
+        case let x as MetalArray<Int32>: return try sum(x)
+        case let x as MetalArray<UInt32>: return try sum(x)
+        case let x as MetalArray<Int64>: return try sum(x)
+        case let x as MetalArray<UInt64>: return try sum(x)
+        default: throw ArrowMetalError.unsupportedType("grouped statistics over \(T.arrowFormat)")
+        }
+    }
+
+    /// Arrow `hash_count_distinct`: distinct non-null values per key.
+    ///
+    /// GPU: the values are dictionary encoded (sort + run marks + scan), each row becomes the packed
+    /// key `key * uniqueCount + code`, `unique()` collapses repeats, and a group-by count over the
+    /// unpacked keys counts what is left. Rows with a null key or a null value are dropped first.
+    public func countDistinct<T: ArrowPrimitive>(_ values: MetalArray<T>) throws -> MetalArray<Int64> {
+        guard values.length == keys.length else { throw ArrowMetalError.lengthMismatch(keys.length, values.length) }
+        let ctx = values.context
+        let (codes, unique) = try values.dictionaryEncode()
+        let width = Int64(Swift.max(unique.length, 1))
+        guard values.length > 0, unique.length > 0 else {
+            return MetalArray<Int64>(length: keyCount, nullCount: 0, validity: nil,
+                                     values: try MetalArrowBuffer.allocate(byteCount: keyCount * 8, context: ctx),
+                                     context: ctx)
+        }
+        // Pack (key, code) into one int64. Rows whose key or code is null carry a null through the
+        // arithmetic and are dropped before the distinct pass.
+        let keys64 = try keys.cast(to: Int64.self)
+        let codes64 = try codes.cast(to: Int64.self)
+        let packed = try (try keys64.arithmetic(.mul, width)).arithmetic(.add, codes64)
+        let distinct = try packed.dropNull().unique()
+        let distinctKeys = try distinct.arithmetic(.div, width)
+        let counts = try (try GroupBy<Int64>(keys: distinctKeys, keyCount: keyCount)).count()
+        return counts
+    }
+
+    /// Arrow `hash_approximate_median` is **not implemented**.
+    ///
+    /// It needs a segmented selection over the rows of each key — a sort by (key, value) followed by a
+    /// per-segment index — and this tree has no segmented-sort file to build it on. The scalar
+    /// `MetalArray.approximateMedian()` covers a single column; for a grouped median today, filter per
+    /// key and call it, or sort by the key column and slice.
+    public func approximateMedian<T: ArrowPrimitive>(_ values: MetalArray<T>) throws -> MetalArray<Double> {
+        throw ArrowMetalError.unsupportedType(
+            "grouped approximate_median needs a segmented sort, which this build does not have; "
+            + "filter per key and call approximateMedian(), or sort by the key column and slice (\(values.length) rows)")
+    }
+}
+
+// MARK: - plumbing
+
+/// Mean parameters for the second variance pass; the layout matches `AggMeanParams` in the MSL source.
+struct AggMeanParams {
+    var ipart: Int64 = 0
+    var bits: UInt64 = 0
+    var hi: Float = 0
+    var lo: Float = 0
+}
+
+enum Aggregates {
+    /// Enough threadgroups to saturate the GPU while keeping the host combine trivial.
+    static func groupCount(_ n: Int) -> Int {
+        Swift.max(1, Swift.min(2048, (n + Dispatch.threadgroupSize - 1) / Dispatch.threadgroupSize))
+    }
+
+    static func dispatch(_ enc: MTLComputeCommandEncoder, groups: Int) {
+        enc.dispatchThreadgroups(MTLSize(width: groups, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1))
+    }
+
+    /// Values, validity, length and a validity flag: buffers 0 to 3 of every aggregate kernel.
+    static func bindValues<T: ArrowPrimitive>(_ enc: MTLComputeCommandEncoder, _ a: MetalArray<T>) {
+        enc.setBuffer(a.values.mtl, offset: a.values.offset, index: 0)
+        let v = a.validity ?? a.values
+        enc.setBuffer(v.mtl, offset: v.offset, index: 1)
+        Dispatch.setLength(enc, a.length, nil, index: 2)
+        Dispatch.setUInt(enc, a.validity == nil ? 0 : 1, index: 3)
+    }
+
+    /// Turns one min/max partial back into an element value (the inverse of the kernel's `ag_key`).
+    static func decodeKey<T: ArrowPrimitive>(_: T.Type, _ buffer: MetalArrowBuffer, _ g: Int) -> T {
+        if T.self == Double.self { return Dispatch.doubleFromKey(buffer.typed(Int64.self)[g]) as! T }
+        if T.isFloatingPoint { return T(buffer.typed(Float.self)[g]) }
+        if T.minValue < 0 as T { return T(truncatingIfNeededInt64: buffer.typed(Int64.self)[g]) }
+        return T(truncatingIfNeededUInt64: buffer.typed(UInt64.self)[g])
+    }
+}
+
+/// The generated MSL for one element type, plus the cache key it is compiled under.
+struct AggregateSpec {
+    let source: String
+    let key: String
+    let moment: AggregatesSource.MomentMode
+
+    static func of<T: ArrowPrimitive>(_: T.Type) -> AggregateSpec {
+        if T.self == Double.self {
+            // Float64 travels as raw 64-bit patterns; every arithmetic step is a software binary64 routine.
+            return AggregateSpec(
+                source: AggregatesSource.source(
+                    T: "long", ACC: "ulong", KEYACC: "long",
+                    productInit: "0x3FF0000000000000ul", productMul: "d_mul(a, b)", load: "(ulong)vals[i]",
+                    include: "!d_isnan((long)vals[i])", key: "d_key((long)vals[i])",
+                    minInit: "LONG_MAX", maxInit: "LONG_MIN",
+                    equal: "(!d_isnan((long)a) && !d_isnan((long)b) && d_key((long)a) == d_key((long)b))",
+                    moment: .double, extraPrelude: DoubleMath.msl),
+                key: "g", moment: .double)
+        }
+        if T.isFloatingPoint {
+            return AggregateSpec(
+                source: AggregatesSource.source(
+                    T: "float", ACC: "float", KEYACC: "float",
+                    productInit: "1.0f", productMul: "a * b", load: "(float)vals[i]",
+                    include: "!isnan(vals[i])", key: "vals[i]",
+                    minInit: "INFINITY", maxInit: "-INFINITY", equal: "a == b", moment: .float),
+                key: "f", moment: .float)
+        }
+        let signed = T.minValue < 0 as T
+        return AggregateSpec(
+            source: AggregatesSource.source(
+                T: T.mslType, ACC: signed ? "long" : "ulong", KEYACC: signed ? "long" : "ulong",
+                // Signed multiplication is done on the unsigned representation so overflow wraps rather
+                // than being undefined, which is what Arrow's `product` specifies.
+                productInit: signed ? "1L" : "1ul",
+                productMul: signed ? "(long)((ulong)a * (ulong)b)" : "a * b",
+                load: signed ? "(long)vals[i]" : "(ulong)vals[i]",
+                include: "true", key: signed ? "(long)vals[i]" : "(ulong)vals[i]",
+                minInit: signed ? "LONG_MAX" : "ULONG_MAX", maxInit: signed ? "LONG_MIN" : "0ul",
+                equal: "a == b", moment: .integer),
+            key: T.arrowFormat, moment: .integer)
+    }
+}
+
+extension Int64 {
+    /// Saturating conversion from a Double that may be out of Int64's range.
+    init(clampedTo d: Double) {
+        if d.isNaN { self = 0 }
+        else if d <= -9.223372036854775e18 { self = .min }
+        else if d >= 9.223372036854775e18 { self = .max }
+        else { self = Int64(d) }
+    }
+}

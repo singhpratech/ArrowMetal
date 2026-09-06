@@ -29,7 +29,11 @@ extension AnyMetalArray {
             case .timestamp(let x, let tz): return .timestamp(u(x), timezone: tz)
             case .duration(let x): return .duration(u(x))
             }
-        case .dictionary(_, let values): return values.ipcType   // written decoded; see recordBatchMessage
+        // A dictionary column writes int32 codes into the record batch and its values into a
+        // DictionaryBatch message (see ArrowIPCWriter.encode).
+        case .dictionary(_, let values): return .dictionary(index: .int(bits: 32, signed: true), value: values.ipcType)
+        // Run-end encoding has no IPC support here: the writer rejects such a column and asks for a decode.
+        case .runEndEncoded(_, let values): return values.ipcType
         }
     }
 }
@@ -41,9 +45,12 @@ extension AnyMetalArray {
 /// let stream = try ArrowIPCWriter.encode(batches, format: .stream)
 /// ```
 ///
-/// Pass an explicit `schema` to write logical types that have no dedicated array class yet
-/// (`date32`, `timestamp`, `duration`, `binary`, `large_utf8`, ...); the storage of each column
-/// must match the physical layout of the type it is given.
+/// Columns carry their own logical type: `.temporal` writes `date32` / `timestamp` / ..., `.binary`
+/// writes `binary`, and `.dictionary` writes int32 codes plus one `DictionaryBatch` per column (a
+/// complete dictionary, never a delta, and one per column for the whole file or stream).
+/// Pass an explicit `schema` to write a type a column's own storage does not name — `large_utf8`,
+/// `large_binary`, or a temporal type over a plain integer column; the storage of each column must
+/// match the physical layout of the type it is given. Run-end encoded columns are refused: decode first.
 public enum ArrowIPCWriter {
 
     /// Encodes `batches` as Arrow IPC bytes.
@@ -55,6 +62,26 @@ public enum ArrowIPCWriter {
         if format == .file { out.append(contentsOf: arrowFileMagic) }
 
         appendMessage(&out, metadata: schemaMessage(schema), body: nil)
+        // One complete dictionary per dictionary-encoded column, written before the record batches.
+        // No deltas and no replacements: every batch must share one dictionary per column.
+        var dictionaryBlocks: [(offset: Int, metadataLength: Int, bodyLength: Int)] = []
+        for (i, field) in schema.fields.enumerated() {
+            guard case .dictionary(_, let valueType) = field.type, let id = field.dictionaryID else { continue }
+            guard let first = batches.first, case .dictionary(_, let values) = first.columns[i] else {
+                if batches.isEmpty { continue }
+                throw ArrowIPCError.malformed("column '\(field.name)' is \(field.type) but the batch is not dictionary encoded")
+            }
+            for (b, batch) in batches.enumerated().dropFirst() {
+                guard case .dictionary(_, let other) = batch.columns[i], identity(other) == identity(values) else {
+                    throw ArrowIPCError.unsupported(
+                        "batch \(b) column '\(field.name)' carries a different dictionary; delta and replacement dictionaries are not written")
+                }
+            }
+            let start = out.count
+            let (metadata, body) = try dictionaryBatchMessage(values, type: valueType, id: id)
+            let metadataLength = appendMessage(&out, metadata: metadata, body: body)
+            dictionaryBlocks.append((start, metadataLength, body.count))
+        }
         var blocks: [(offset: Int, metadataLength: Int, bodyLength: Int)] = []
         for batch in batches {
             let start = out.count
@@ -67,7 +94,7 @@ public enum ArrowIPCWriter {
         out.append(contentsOf: littleEndian(Int32(0)))
 
         if format == .file {
-            let footer = footerMessage(schema, blocks: blocks)
+            let footer = footerMessage(schema, dictionaries: dictionaryBlocks, blocks: blocks)
             out.append(contentsOf: footer)
             out.append(contentsOf: littleEndian(Int32(footer.count)))
             out.append(contentsOf: arrowFileMagicTail)
@@ -91,28 +118,66 @@ public enum ArrowIPCWriter {
             guard let first = batches.first else {
                 throw ArrowIPCError.malformed("cannot derive a schema from an empty batch list; pass one explicitly")
             }
-            return ArrowIPCSchema(fields: zip(first.names, first.columns).map {
-                ArrowIPCField(name: $0, type: $1.ipcType, nullable: true)
+            return ArrowIPCSchema(fields: zip(first.names, first.columns).enumerated().map { i, pair in
+                let type = pair.1.ipcType
+                // Dictionary columns need an id to tie them to their DictionaryBatch; the column index does.
+                if case .dictionary = type { return ArrowIPCField(name: pair.0, type: type, nullable: true, dictionaryID: Int64(i)) }
+                return ArrowIPCField(name: pair.0, type: type, nullable: true)
             })
         }()
-        for (b, batch) in batches.enumerated() {
-            guard batch.columnCount == schema.fields.count else {
-                throw ArrowIPCError.malformed("batch \(b) has \(batch.columnCount) columns, the schema has \(schema.fields.count)")
+        // An explicit schema may name a dictionary column without giving it an id; the column index does.
+        let resolved = ArrowIPCSchema(fields: schema.fields.enumerated().map { i, field in
+            if case .dictionary = field.type, field.dictionaryID == nil {
+                return ArrowIPCField(name: field.name, type: field.type, nullable: field.nullable, dictionaryID: Int64(i))
             }
-            for (i, field) in schema.fields.enumerated() {
+            return field
+        })
+        for (b, batch) in batches.enumerated() {
+            guard batch.columnCount == resolved.fields.count else {
+                throw ArrowIPCError.malformed("batch \(b) has \(batch.columnCount) columns, the schema has \(resolved.fields.count)")
+            }
+            for (i, field) in resolved.fields.enumerated() {
                 guard compatible(batch.columns[i], field.type) else {
                     throw ArrowIPCError.malformed(
                         "batch \(b) column '\(batch.names[i])' is \(batch.columns[i].ipcType) but the schema says \(field.type)")
                 }
             }
         }
-        return schema
+        return resolved
     }
 
     /// Whether a column's storage can carry values of `type`.
     private static func compatible(_ column: AnyMetalArray, _ type: ArrowIPCType) -> Bool {
-        if case .varBinary = type.storage, case .string = column { return true }
-        return column.ipcType == type.physicalType
+        if column.ipcType == type { return true }
+        if case .dictionary(_, let valueType) = type {
+            guard case .dictionary(_, let values) = column else { return false }
+            return compatible(values, valueType)
+        }
+        if case .varBinary = type.storage {
+            switch column { case .string, .binary: return true; default: break }
+        }
+        return column.ipcType == type.physicalType || column.ipcType.physicalType == type.physicalType
+    }
+
+    /// The array object behind a column: two batches share a dictionary when these match.
+    private static func identity(_ a: AnyMetalArray) -> ObjectIdentifier {
+        switch a {
+        case .int8(let x): return ObjectIdentifier(x)
+        case .uint8(let x): return ObjectIdentifier(x)
+        case .int16(let x): return ObjectIdentifier(x)
+        case .uint16(let x): return ObjectIdentifier(x)
+        case .int32(let x): return ObjectIdentifier(x)
+        case .uint32(let x): return ObjectIdentifier(x)
+        case .int64(let x): return ObjectIdentifier(x)
+        case .uint64(let x): return ObjectIdentifier(x)
+        case .float32(let x): return ObjectIdentifier(x)
+        case .float64(let x): return ObjectIdentifier(x)
+        case .boolean(let x): return ObjectIdentifier(x)
+        case .string(let x), .binary(let x): return ObjectIdentifier(x)
+        case .temporal(let x): return ObjectIdentifier(x)
+        case .dictionary(let codes, _): return ObjectIdentifier(codes)
+        case .runEndEncoded(let runEnds, _): return ObjectIdentifier(runEnds)
+        }
     }
 
     private static func estimatedSize(_ batches: [MetalRecordBatch]) -> Int {
@@ -156,12 +221,29 @@ public enum ArrowIPCWriter {
     /// Writes one `Field` table and returns its offset.
     private static func field(_ b: FBBuilder, _ f: ArrowIPCField) -> Int {
         let nameOffset = b.createString(f.name)
+        // A dictionary field carries the *value* type in the union and the index type under `dictionary`.
         let (kind, typeOffset) = type(b, f.type)
+        var encodingOffset = 0
+        if case .dictionary(let index, _) = f.type {
+            // indexType is written even for the int32 default: Arrow C++ rejects a null one.
+            var bits = 32, signed = true
+            if case .int(let b2, let s2) = index { bits = b2; signed = s2 }
+            b.startObject(2)
+            b.addScalar(id: 0, Int32(bits), default: 0)
+            b.addScalar(id: 1, signed, default: false)
+            let indexOffset = b.endObject()
+            // DictionaryEncoding { id: long; indexType: Int; isOrdered: bool; dictionaryKind: short }
+            b.startObject(4)
+            b.addScalar(id: 0, f.dictionaryID ?? 0, default: 0)
+            b.addOffset(id: 1, indexOffset)
+            encodingOffset = b.endObject()
+        }
         b.startObject(7)
         b.addOffset(id: 0, nameOffset)
         b.addScalar(id: 1, f.nullable, default: false)
         b.addScalar(id: 2, kind.rawValue, default: FBTypeKind.none.rawValue)
         b.addOffset(id: 3, typeOffset)
+        b.addOffset(id: 4, encodingOffset)
         return b.endObject()
     }
 
@@ -207,6 +289,8 @@ public enum ArrowIPCWriter {
             b.startObject(1)
             b.addScalar(id: 0, u.rawValue, default: fbDateUnitMillisecond)
             return (.duration, b.endObject())
+        case .dictionary(_, let value):
+            return type(b, value)
         }
     }
 
@@ -236,20 +320,23 @@ public enum ArrowIPCWriter {
     }
 
     private static func footerMessage(_ schema: ArrowIPCSchema,
+                                      dictionaries dictionaryBlocks: [(offset: Int, metadataLength: Int, bodyLength: Int)],
                                       blocks: [(offset: Int, metadataLength: Int, bodyLength: Int)]) -> [UInt8] {
         let b = FBBuilder()
         let schemaOffset = schemaTable(b, schema)
         // struct Block { offset: long; metaDataLength: int; <4 bytes padding> bodyLength: long; }
-        b.startVector(elementSize: fbBlockStride, count: 0, alignment: 8)
-        let dictionaries = b.endVector(0)
-        b.startVector(elementSize: fbBlockStride, count: blocks.count, alignment: 8)
-        for block in blocks.reversed() {
-            b.place(Int64(block.bodyLength))
-            b.pad(4)
-            b.place(Int32(block.metadataLength))
-            b.place(Int64(block.offset))
+        func blockVector(_ list: [(offset: Int, metadataLength: Int, bodyLength: Int)]) -> Int {
+            b.startVector(elementSize: fbBlockStride, count: list.count, alignment: 8)
+            for block in list.reversed() {
+                b.place(Int64(block.bodyLength))
+                b.pad(4)
+                b.place(Int32(block.metadataLength))
+                b.place(Int64(block.offset))
+            }
+            return b.endVector(list.count)
         }
-        let recordBatches = b.endVector(blocks.count)
+        let dictionaries = blockVector(dictionaryBlocks)
+        let recordBatches = blockVector(blocks)
         b.startObject(5)
         b.addScalar(id: 0, fbMetadataVersionV5, default: 0)
         b.addOffset(id: 1, schemaOffset)
@@ -289,42 +376,8 @@ public enum ArrowIPCWriter {
         body.data.reserveCapacity(estimatedSize([batch]))
 
         for (i, column) in batch.columns.enumerated() {
-            let type = schema.fields[i].type
             nodes.append((Int64(column.length), Int64(column.nullCount)))
-            switch column {
-            case .int8(let a): append(&body, a, width: 1)
-            case .uint8(let a): append(&body, a, width: 1)
-            case .int16(let a): append(&body, a, width: 2)
-            case .uint16(let a): append(&body, a, width: 2)
-            case .int32(let a): append(&body, a, width: 4)
-            case .uint32(let a): append(&body, a, width: 4)
-            case .int64(let a): append(&body, a, width: 8)
-            case .uint64(let a): append(&body, a, width: 8)
-            case .float32(let a): append(&body, a, width: 4)
-            case .float64(let a): append(&body, a, width: 8)
-            case .boolean(let a):
-                body.addValidity(a.validity, nullCount: a.nullCount, length: a.length)
-                body.add(a.values.contents, byteCount: Bitmap.byteCount(bits: a.length))
-            case .temporal(let t):
-                switch t.storage {
-                case .int32(let a): append(&body, a, width: 4)
-                case .int64(let a): append(&body, a, width: 8)
-                }
-            case .dictionary:
-                throw ArrowIPCError.unsupported("dictionary-encoded columns are not written yet; call decode() on the column first")
-            case .string(let a), .binary(let a):
-                body.addValidity(a.validity, nullCount: a.nullCount, length: a.length)
-                if case .varBinary(true) = type.storage {
-                    // Widen the 32-bit offsets this package stores to the 64-bit ones large_* needs.
-                    let source = a.offsets.typed(Int32.self)
-                    var wide = [Int64](repeating: 0, count: a.length + 1)
-                    for j in 0...a.length { wide[j] = Int64(source[j]) }
-                    wide.withUnsafeBytes { body.add($0.baseAddress, byteCount: $0.count) }
-                } else {
-                    body.add(a.offsets.contents, byteCount: (a.length + 1) * 4)
-                }
-                body.add(a.data.contents, byteCount: a.totalBytes)
-            }
+            try appendColumn(&body, column, type: schema.fields[i].type)
         }
 
         let b = FBBuilder()
@@ -346,6 +399,76 @@ public enum ArrowIPCWriter {
         b.addOffset(id: 2, buffersVector)
         let header = b.endObject()
         return (message(b, header: header, kind: .recordBatch, bodyLength: body.data.count), body.data)
+    }
+
+    /// Appends one column's Arrow buffers to the message body, in the order the type prescribes.
+    /// A dictionary column contributes its *codes*; the values travel in a dictionary batch.
+    private static func appendColumn(_ body: inout Body, _ column: AnyMetalArray, type: ArrowIPCType) throws {
+        switch column {
+        case .int8(let a): append(&body, a, width: 1)
+        case .uint8(let a): append(&body, a, width: 1)
+        case .int16(let a): append(&body, a, width: 2)
+        case .uint16(let a): append(&body, a, width: 2)
+        case .int32(let a): append(&body, a, width: 4)
+        case .uint32(let a): append(&body, a, width: 4)
+        case .int64(let a): append(&body, a, width: 8)
+        case .uint64(let a): append(&body, a, width: 8)
+        case .float32(let a): append(&body, a, width: 4)
+        case .float64(let a): append(&body, a, width: 8)
+        case .boolean(let a):
+            body.addValidity(a.validity, nullCount: a.nullCount, length: a.length)
+            body.add(a.values.contents, byteCount: Bitmap.byteCount(bits: a.length))
+        case .temporal(let t):
+            switch t.storage {
+            case .int32(let a): append(&body, a, width: 4)
+            case .int64(let a): append(&body, a, width: 8)
+            }
+        case .dictionary(let codes, _):
+            append(&body, codes, width: 4)
+        case .runEndEncoded:
+            throw ArrowIPCError.unsupported("run-end encoded columns are not written; call runEndDecode() on the column first")
+        case .string(let a), .binary(let a):
+            body.addValidity(a.validity, nullCount: a.nullCount, length: a.length)
+            if case .varBinary(true) = type.storage {
+                // Widen the 32-bit offsets this package stores to the 64-bit ones large_* needs.
+                let source = a.offsets.typed(Int32.self)
+                var wide = [Int64](repeating: 0, count: a.length + 1)
+                for j in 0...a.length { wide[j] = Int64(source[j]) }
+                wide.withUnsafeBytes { body.add($0.baseAddress, byteCount: $0.count) }
+            } else {
+                body.add(a.offsets.contents, byteCount: (a.length + 1) * 4)
+            }
+            body.add(a.data.contents, byteCount: a.totalBytes)
+        }
+    }
+
+    /// A `DictionaryBatch` message: one complete dictionary (`isDelta = false`) for id `id`.
+    private static func dictionaryBatchMessage(_ values: AnyMetalArray, type: ArrowIPCType,
+                                               id: Int64) throws -> (metadata: [UInt8], body: Data) {
+        var body = Body()
+        try appendColumn(&body, values, type: type)
+        let b = FBBuilder()
+        b.startVector(elementSize: fbFieldNodeStride, count: 1, alignment: 8)
+        b.place(Int64(values.nullCount))
+        b.place(Int64(values.length))
+        let nodesVector = b.endVector(1)
+        b.startVector(elementSize: fbBufferStride, count: body.buffers.count, alignment: 8)
+        for buffer in body.buffers.reversed() {
+            b.place(buffer.length)
+            b.place(buffer.offset)
+        }
+        let buffersVector = b.endVector(body.buffers.count)
+        b.startObject(5)
+        b.addScalar(id: 0, Int64(values.length), default: 0)
+        b.addOffset(id: 1, nodesVector)
+        b.addOffset(id: 2, buffersVector)
+        let recordBatch = b.endObject()
+        // DictionaryBatch { id: long; data: RecordBatch; isDelta: bool }
+        b.startObject(3)
+        b.addScalar(id: 0, id, default: 0)
+        b.addOffset(id: 1, recordBatch)
+        let header = b.endObject()
+        return (message(b, header: header, kind: .dictionaryBatch, bodyLength: body.data.count), body.data)
     }
 
     private static func append<T: ArrowPrimitive>(_ body: inout Body, _ array: MetalArray<T>, width: Int) {

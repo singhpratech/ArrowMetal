@@ -71,9 +71,30 @@ final class IPCTests: XCTestCase {
             case (.float64(let x), .float64(let y)): XCTAssertEqual(x.toArray(), y.toArray(), name, file: file, line: line)
             case (.boolean(let x), .boolean(let y)): XCTAssertEqual(x.toArray(), y.toArray(), name, file: file, line: line)
             case (.string(let x), .string(let y)): XCTAssertEqual(x.toArray(), y.toArray(), name, file: file, line: line)
+            case (.binary(let x), .binary(let y)): XCTAssertEqual(x.toByteArrays(), y.toByteArrays(), name, file: file, line: line)
+            case (.temporal(let x), .temporal(let y)):
+                XCTAssertEqual(x.type, y.type, name, file: file, line: line)
+                XCTAssertEqual(x.toArray(), y.toArray(), name, file: file, line: line)
+            case (.dictionary, .dictionary):
+                // Compare decoded: a round trip may renumber the codes.
+                assertColumnsEqual(try! a.columns[i].decode(), try! b.columns[i].decode(), name, file: file, line: line)
             default: XCTFail("column '\(name)' changed type", file: file, line: line)
             }
             XCTAssertEqual(a.columns[i].nullCount, b.columns[i].nullCount, name, file: file, line: line)
+        }
+    }
+
+    /// Value comparison for two columns of the same concrete type (used for decoded dictionaries).
+    private func assertColumnsEqual(_ a: AnyMetalArray, _ b: AnyMetalArray, _ name: String,
+                                    file: StaticString = #filePath, line: UInt = #line) {
+        switch (a, b) {
+        case (.string(let x), .string(let y)): XCTAssertEqual(x.toArray(), y.toArray(), name, file: file, line: line)
+        case (.binary(let x), .binary(let y)): XCTAssertEqual(x.toByteArrays(), y.toByteArrays(), name, file: file, line: line)
+        case (.int32(let x), .int32(let y)): XCTAssertEqual(x.toArray(), y.toArray(), name, file: file, line: line)
+        case (.int64(let x), .int64(let y)): XCTAssertEqual(x.toArray(), y.toArray(), name, file: file, line: line)
+        case (.float64(let x), .float64(let y)): XCTAssertEqual(x.toArray(), y.toArray(), name, file: file, line: line)
+        case (.temporal(let x), .temporal(let y)): XCTAssertEqual(x.toArray(), y.toArray(), name, file: file, line: line)
+        default: XCTFail("column '\(name)' decoded to \(a.arrowFormat) vs \(b.arrowFormat)", file: file, line: line)
         }
     }
 
@@ -162,12 +183,16 @@ final class IPCTests: XCTestCase {
         XCTAssertEqual(readBack["s"]!.asString!.toArray(), strings)
     }
 
-    /// Logical types with no dedicated array class travel as their storage integers.
+    /// Temporal and binary columns keep their logical type through a round trip: the reader hands back
+    /// `.temporal` / `.binary`, not the storage integers or the utf8 they are made of.
     func testTemporalAndBinaryLogicalTypes() throws {
         let days = try MetalArray<Int32>([19723, 19724, nil, 0, -1])
         let micros = try MetalArray<Int64>([1_700_000_000_000_000, nil, 0, -86_400_000_000, 42])
         let numeric = try MetalRecordBatch(names: ["day", "when", "elapsed", "clock"], columns: [
-            .int32(days), .int64(micros), .int64(micros), .int64(micros),
+            .temporal(try MetalTemporalArray(type: .date32, days)),
+            .temporal(try MetalTemporalArray(type: .timestamp(.micro, timezone: "UTC"), micros)),
+            .temporal(try MetalTemporalArray(type: .duration(.nano), micros)),
+            .temporal(try MetalTemporalArray(type: .time64(.micro), micros)),
         ])
         XCTAssertEqual(numeric.length, 5)
         let schema = ArrowIPCSchema(fields: [
@@ -176,12 +201,25 @@ final class IPCTests: XCTestCase {
             ArrowIPCField(name: "elapsed", type: .duration(.nanosecond)),
             ArrowIPCField(name: "clock", type: .time64(.microsecond)),
         ])
+        // The schema derived from the columns themselves matches the explicit one.
+        let derived = try ArrowIPCReader(data: try ArrowIPCWriter.encode([numeric]))
+        XCTAssertEqual(derived.schema, schema)
+        assertEqual(numeric, try derived.batch(at: 0))
+
         let reader = try ArrowIPCReader(data: try ArrowIPCWriter.encode([numeric], schema: schema))
         XCTAssertEqual(reader.schema, schema)
         assertEqual(numeric, try reader.batch(at: 0))
+        XCTAssertEqual(try reader.batch(at: 0)["day"]!.asTemporal!.toArray(), [19723, 19724, nil, 0, -1])
+
+        // Storage integers still write against an explicit temporal schema; they read back as temporal.
+        let asIntegers = try MetalRecordBatch(names: ["day", "when", "elapsed", "clock"], columns: [
+            .int32(days), .int64(micros), .int64(micros), .int64(micros),
+        ])
+        let fromIntegers = try ArrowIPCReader(data: try ArrowIPCWriter.encode([asIntegers], schema: schema))
+        assertEqual(numeric, try fromIntegers.batch(at: 0))
 
         let bytes = try MetalRecordBatch(names: ["blob", "big"], columns: [
-            .string(try MetalStringArray(["\u{01}\u{02}", nil, "bytes"])),
+            .binary(try MetalStringArray(bytes: [[0x01, 0x02], nil, Array("bytes".utf8)])),
             .string(try MetalStringArray(["one", "twö", nil])),
         ])
         let binarySchema = ArrowIPCSchema(fields: [
@@ -378,32 +416,124 @@ final class IPCTests: XCTestCase {
                                (0..<n).map { $0 == 1 ? nil : "héllo-\(b)-\($0)-日本" })
                 XCTAssertEqual(batch["flags"]!.asBoolean!.toArray(),
                                (0..<n).map { $0 == 2 ? nil : $0 % 3 == 0 })
-                XCTAssertEqual(batch["days"]!.asInt32!.toArray(), (0..<n).map { Int32(19723 + b * 10 + $0) })
-                XCTAssertEqual(batch["when"]!.asInt64!.toArray(), (0..<n).map { Int64(1_700_000_000_000_000 + b * 1000 + $0) })
-                XCTAssertEqual(batch["blob"]!.asString!.toArray().first!, nil)
+                XCTAssertEqual(batch["days"]!.asTemporal!.type, .date32)
+                XCTAssertEqual(batch["days"]!.asTemporal!.toArray(), (0..<n).map { Int64(19723 + b * 10 + $0) })
+                XCTAssertEqual(batch["when"]!.asTemporal!.type, .timestamp(.micro, timezone: nil))
+                XCTAssertEqual(batch["when"]!.asTemporal!.toArray(), (0..<n).map { Int64(1_700_000_000_000_000 + b * 1000 + $0) })
+                XCTAssertEqual(batch["blob"]!.asBinary!.toByteArrays().first!, nil)
+                XCTAssertEqual(batch["blob"]!.asBinary!.bytes(at: 1), [1, UInt8(b)])
                 XCTAssertEqual(batch["big"]!.asString!.toArray(), (0..<n).map { "large-\(b)-\($0)" })
             }
         }
     }
 
-    /// A pyarrow file that uses features we do not implement has to fail with a clear error.
-    func testDictionaryEncodedInputIsRejected() throws {
+    /// A pyarrow file with dictionary-encoded columns reads back as `.dictionary` (codes + values).
+    func testDictionaryEncodedInputIsRead() throws {
         _ = try requirePython()
         let url = temporaryFile()
-        defer { try? FileManager.default.removeItem(at: url) }
+        let streamURL = temporaryFile("arrows")
+        defer {
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(at: streamURL)
+        }
         let script = """
         import sys, pyarrow as pa
-        col = pa.array(["a", "b", "a", "c"]).dictionary_encode()
-        batch = pa.record_batch([col], names=["k"])
+        col = pa.array(["a", "b", None, "a", "c"]).dictionary_encode()
+        nums = pa.array([10, 20, 10, None, 30], type=pa.int64()).dictionary_encode()
+        batch = pa.record_batch([col, nums], names=["k", "n"])
         with pa.ipc.new_file(sys.argv[1], batch.schema) as w:
+            w.write_batch(batch)
+        with pa.ipc.new_stream(sys.argv[2], batch.schema) as w:
             w.write_batch(batch)
         print("ok")
         """
-        XCTAssertEqual(try runPython(script, [url.path]).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
-        XCTAssertThrowsError(try ArrowIPCReader(url: url)) { error in
-            guard case ArrowIPCError.unsupported(let what) = error else { return XCTFail("\(error)") }
-            XCTAssertTrue(what.contains("dictionary"), what)
+        XCTAssertEqual(try runPython(script, [url.path, streamURL.path]).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
+        for source in [url, streamURL] {
+            let reader = try ArrowIPCReader(url: source)
+            let batch = try reader.batch(at: 0)
+            let k = try XCTUnwrap(batch["k"]?.asDictionary)
+            XCTAssertEqual(k.values.asString?.toArray(), ["a", "b", "c"])
+            XCTAssertEqual(k.codes.toArray(), [0, 1, nil, 0, 2])
+            XCTAssertEqual(try batch["k"]!.decode().asString?.toArray(), ["a", "b", nil, "a", "c"])
+            let n = try XCTUnwrap(batch["n"]?.asDictionary)
+            XCTAssertEqual(n.values.asInt64?.toArray(), [10, 20, 30])
+            XCTAssertEqual(try batch["n"]!.decode().asInt64?.toArray(), [10, 20, 10, nil, 30])
         }
+    }
+
+    /// Dictionary columns survive our own round trip in both encapsulations.
+    func testDictionaryColumnsRoundTrip() throws {
+        let codes = try MetalArray<Int32>([0, 2, nil, 1, 1, 0])
+        let values = AnyMetalArray.string(try MetalStringArray(["red", "green", "blue"]))
+        let column = AnyMetalArray.dictionary(codes: codes, values: values)
+        let batch = try MetalRecordBatch(names: ["colour"], columns: [column])
+        for format in [ArrowIPCFormat.stream, .file] {
+            let reader = try ArrowIPCReader(data: try ArrowIPCWriter.encode([batch], format: format))
+            XCTAssertEqual(reader.schema.fields[0].type, .dictionary(index: .int(bits: 32, signed: true), value: .utf8))
+            let back = try reader.batch(at: 0)
+            let d = try XCTUnwrap(back["colour"]?.asDictionary)
+            XCTAssertEqual(d.codes.toArray(), [0, 2, nil, 1, 1, 0])
+            XCTAssertEqual(d.values.asString?.toArray(), ["red", "green", "blue"])
+            assertEqual(batch, back)
+        }
+        // Two batches sharing one dictionary.
+        let second = try MetalRecordBatch(names: ["colour"], columns: [
+            .dictionary(codes: try MetalArray<Int32>([2, 2]), values: values),
+        ])
+        let both = try ArrowIPCReader(data: try ArrowIPCWriter.encode([batch, second])).readAll()
+        XCTAssertEqual(both.map(\.length), [6, 2])
+        XCTAssertEqual(try both[1]["colour"]!.decode().asString?.toArray(), ["blue", "blue"])
+        // A second, different dictionary for the same column is refused rather than silently wrong.
+        let other = try MetalRecordBatch(names: ["colour"], columns: [
+            .dictionary(codes: try MetalArray<Int32>([0]), values: .string(try MetalStringArray(["red"]))),
+        ])
+        XCTAssertThrowsError(try ArrowIPCWriter.encode([batch, other]))
+    }
+
+    /// pyarrow reads the dictionary and temporal columns we write, in both encapsulations.
+    func testPyarrowReadsOurDictionaryAndTemporalColumns() throws {
+        _ = try requirePython()
+        let fileURL = temporaryFile()
+        let streamURL = temporaryFile("arrows")
+        defer {
+            try? FileManager.default.removeItem(at: fileURL)
+            try? FileManager.default.removeItem(at: streamURL)
+        }
+        let column = AnyMetalArray.dictionary(codes: try MetalArray<Int32>([0, 2, nil, 1, 1, 0]),
+                                              values: .string(try MetalStringArray(["red", "green", "blue"])))
+        let stamps = AnyMetalArray.temporal(try MetalTemporalArray(type: .timestamp(.micro, timezone: "UTC"),
+                                                                   try MetalArray<Int64>([1, 2, nil, 4, 5, 6])))
+        let days = AnyMetalArray.temporal(try MetalTemporalArray(type: .date32,
+                                                                 try MetalArray<Int32>([19723, 19724, 0, 1, 2, nil])))
+        let blob = AnyMetalArray.binary(try MetalStringArray(bytes: [[1, 2], nil, [], [3], [4, 5, 6], [7]]))
+        let batch = try MetalRecordBatch(names: ["colour", "when", "day", "blob"], columns: [column, stamps, days, blob])
+        try ArrowIPCWriter.write([batch], to: fileURL, format: .file)
+        try ArrowIPCWriter.write([batch], to: streamURL, format: .stream)
+        let script = """
+        import sys, pyarrow as pa
+
+        def check(table, label):
+            table.validate(full=True)
+            colour = table.column("colour")
+            assert pa.types.is_dictionary(colour.type), (label, colour.type)
+            assert colour.type.value_type == pa.string(), (label, colour.type)
+            assert colour.to_pylist() == ["red", "blue", None, "green", "green", "red"], (label, colour.to_pylist())
+            when = table.column("when")
+            assert when.type == pa.timestamp("us", "UTC"), (label, when.type)
+            assert when.to_pylist()[2] is None
+            assert table.column("day").type == pa.date32(), (label, table.column("day").type)
+            assert table.column("day").to_pylist()[5] is None
+            blob = table.column("blob")
+            assert blob.type == pa.binary(), (label, blob.type)
+            assert blob.to_pylist() == [b"\\x01\\x02", None, b"", b"\\x03", b"\\x04\\x05\\x06", b"\\x07"], (label, blob.to_pylist())
+
+        with pa.ipc.open_file(sys.argv[1]) as r:
+            check(r.read_all(), "file")
+        with pa.ipc.open_stream(sys.argv[2]) as r:
+            check(r.read_all(), "stream")
+        print("ok")
+        """
+        XCTAssertEqual(try runPython(script, [fileURL.path, streamURL.path]).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
     }
 
     /// Reads a 1 GB file and reports throughput. Off by default; set ARROWMETAL_IPC_THROUGHPUT=1.

@@ -570,3 +570,50 @@ def test_polars_string_column_dictionary_encode():
     expected = series.value_counts().to_dict(as_series=False)
     expected = dict(zip(expected["s"], expected["count"]))
     assert dict(zip(uniques, counts)) == expected
+
+
+# ---------------------------------------------------------------- statistical aggregates
+
+def test_statistical_aggregates_match_pyarrow():
+    a = am.array(FLOAT64)
+    valid = [v for v in FLOAT64.to_pylist() if v is not None]
+    assert a.product() == pytest.approx(math.prod(valid), rel=1e-12)
+    assert a.variance() == pytest.approx(pc.variance(FLOAT64, ddof=0).as_py(), rel=1e-12)
+    assert a.variance(1) == pytest.approx(pc.variance(FLOAT64, ddof=1).as_py(), rel=1e-12)
+    assert a.stddev() == pytest.approx(pc.stddev(FLOAT64, ddof=0).as_py(), rel=1e-12)
+    assert a.stddev(1) == pytest.approx(pc.stddev(FLOAT64, ddof=1).as_py(), rel=1e-12)
+    assert a.median() == pytest.approx(pc.approximate_median(FLOAT64).as_py(), rel=1e-12)
+    for q in (0.0, 0.25, 0.5, 0.9, 1.0):
+        assert a.quantile(q) == pytest.approx(pc.quantile(FLOAT64, q=q)[0].as_py(), rel=1e-12)
+    assert a.count_distinct() == pc.count_distinct(FLOAT64).as_py()
+    assert a.min_max() == (pc.min(FLOAT64).as_py(), pc.max(FLOAT64).as_py())
+    assert a.first() == valid[0]
+    assert a.last() == valid[-1]
+    assert a.index(FLOAT64[2].as_py()) == 2
+    assert a.index(-12345.0) == -1
+
+
+def test_mode_and_boolean_any_all():
+    values = pa.array([4, 4, 7, None, 7, 7], pa.int32())
+    assert am.array(values).mode() == (7, 3)
+    assert am.array(values).count_distinct() == 2
+    assert am.array(BOOL).any() is True
+    assert am.array(BOOL).all() is False
+    assert am.array(pa.array([True, None, True])).all() is True
+    assert am.array(pa.array([False, None, False])).any() is False
+
+
+def test_run_end_encoding_round_trips_through_pyarrow():
+    source = pa.array([1, 1, 1, None, None, 4, 4, 9], pa.int32())
+    encoded = am.array(source).run_end_encode()
+    assert encoded.format == "+r"
+    assert len(encoded) == len(source)
+    exported = encoded.to_arrow()
+    assert pa.types.is_run_end_encoded(exported.type)
+    assert exported.to_pylist() == source.to_pylist()
+    assert pylist(encoded.run_end_decode()) == source.to_pylist()
+
+    # A run-end array pyarrow produced imports and decodes just as well.
+    imported = am.array(pc.run_end_encode(pa.array([2, 2, None, 3], pa.int64())))
+    assert imported.format == "+r"
+    assert pylist(imported.run_end_decode()) == [2, 2, None, 3]

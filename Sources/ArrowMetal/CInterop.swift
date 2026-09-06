@@ -17,6 +17,9 @@ public enum AnyMetalArray {
     case binary(MetalStringArray)
     /// A dictionary-encoded array: int32 codes into `values`.
     indirect case dictionary(codes: MetalArray<Int32>, values: AnyMetalArray)
+    /// A run-end encoded array ("+r"): `runEnds[j]` is the exclusive end of run `j`, `values[j]` its value.
+    /// Run ends are narrowed to int32 on import, as dictionary indices are.
+    indirect case runEndEncoded(runEnds: MetalArray<Int32>, values: AnyMetalArray)
 
     public var length: Int {
         switch self {
@@ -35,6 +38,7 @@ public enum AnyMetalArray {
         case .temporal(let a): return a.length
         case .binary(let a): return a.length
         case .dictionary(let codes, _): return codes.length
+        case .runEndEncoded(let runEnds, _): return runEndLogicalLength(runEnds)
         }
     }
 
@@ -56,6 +60,7 @@ public enum AnyMetalArray {
         case .binary: return "z"
         // The C Data Interface puts the index type at the top level of a dictionary schema.
         case .dictionary: return "i"
+        case .runEndEncoded: return "+r"
         }
     }
 }
@@ -94,6 +99,8 @@ public func importArrowArray(schema: UnsafePointer<ArrowSchema>, array: UnsafeMu
     guard array.pointee.release != nil else { throw ArrowMetalError.releasedArray }
     // The schema decides whether an array is dictionary-encoded; the indices are imported inside.
     if schema.pointee.dictionary != nil { return try importDictionaryArray(schema: schema, array: array, context: context) }
+    // Run-end encoded arrays carry their run ends and values as two children.
+    if fmt == "+r" { return try importRunEndArray(schema: schema, array: array, context: context) }
     guard array.pointee.n_children == 0, array.pointee.dictionary == nil else {
         throw ArrowMetalError.unsupportedType("nested/dictionary arrays are not supported (format \(fmt))")
     }
@@ -410,6 +417,7 @@ extension AnyMetalArray {
         case .temporal(let a): a.exportArrowArray(into: out)
         case .binary(let a): a.exportArrowArray(into: out)
         case .dictionary(let codes, let values): exportDictionaryArray(codes: codes, values: values, into: out)
+        case .runEndEncoded(let runEnds, let values): exportRunEndArray(runEnds: runEnds, values: values, into: out)
         }
     }
     public func exportArrowDeviceArray(into out: UnsafeMutablePointer<ArrowDeviceArray>) {
@@ -420,6 +428,10 @@ extension AnyMetalArray {
         // A dictionary schema carries the value type under `dictionary`; everything else is a flat format.
         if case .dictionary(_, let values) = self {
             exportDictionarySchema(values: values, name: name, into: out)
+            return
+        }
+        if case .runEndEncoded(_, let values) = self {
+            exportRunEndSchema(values: values, name: name, into: out)
             return
         }
         ArrowMetal.exportArrowSchema(format: arrowFormat, name: name, into: out)

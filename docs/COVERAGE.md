@@ -13,8 +13,8 @@ them so a claim can be checked in one jump.
 
 | Arrow function category | GPU | CPU | Partial | Planned | In progress | Not planned | Rows |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Aggregations — scalar | 4 | 4 | 1 | 0 | 0 | 12 | 21 |
-| Aggregations — grouped (`hash_*`) | 0 | 0 | 6 | 1 | 1 | 7 | 15 |
+| Aggregations — scalar | 16 | 2 | 0 | 0 | 0 | 3 | 21 |
+| Aggregations — grouped (`hash_*`) | 0 | 1 | 10 | 1 | 1 | 3 | 16 |
 | Element-wise arithmetic | 5 | 0 | 8 | 1 | 0 | 2 | 16 |
 | Bit-wise and shifts | 4 | 0 | 2 | 0 | 0 | 0 | 6 |
 | Comparisons | 8 | 0 | 0 | 0 | 0 | 0 | 8 |
@@ -28,13 +28,13 @@ them so a claim can be checked in one jump.
 | Containment / set lookup | 2 | 0 | 0 | 0 | 0 | 1 | 3 |
 | Sorts and partitions | 2 | 1 | 2 | 0 | 0 | 2 | 7 |
 | Structural and conditional | 4 | 0 | 2 | 0 | 0 | 7 | 13 |
-| Associative transforms | 0 | 1 | 0 | 1 | 3 | 0 | 5 |
+| Associative transforms | 1 | 1 | 1 | 1 | 3 | 0 | 7 |
 | Pairwise and cumulative | 1 | 0 | 1 | 0 | 0 | 3 | 5 |
 | Hashing | 1 | 0 | 0 | 0 | 0 | 1 | 2 |
-| **Total (compute functions)** | **56** | **7** | **27** | **6** | **6** | **56** | **158** |
-| Arrow types (matrix below) | 5 | 0 | 3 | 1 | 6 | 11 | 26 |
+| **Total (compute functions)** | **69** | **6** | **31** | **6** | **6** | **43** | **161** |
+| Arrow types (matrix below) | 7 | 0 | 3 | 1 | 5 | 10 | 26 |
 
-Interop uses a separate vocabulary and is counted apart: 6 shipped, 1 partial, 3 planned, 1 in progress
+Interop uses a separate vocabulary and is counted apart: 7 shipped, 1 partial, 3 planned
 (11 rows).
 
 **The scope ArrowMetal 0.1.0 claims 100% of:** flat analytics on primitive, boolean and string columns —
@@ -52,7 +52,8 @@ and Unicode-table string work (full case folding beyond Latin-1 Supplement and L
 normalisation, Unicode-whitespace trimming, splitting); window and pairwise functions
 (`cumulative_sum`/`_min`/`_max` do ship — see Pairwise and cumulative — but `cumulative_prod`,
 `cumulative_mean` and `pairwise_diff` do not); temporal component extraction, temporal arithmetic, timezones and
-`strftime`/`strptime`; statistical aggregates (`stddev`, `variance`, `quantile`, `mode`, `tdigest`);
+`strftime`/`strptime`; `tdigest` and `skew`/`kurtosis` (the other statistical aggregates — `stddev`,
+`variance`, `quantile`, `mode`, `count_distinct`, `first`/`last`, `index` — do ship, see Aggregations);
 set lookup over strings; `case_when`, `replace_with_mask` and the forward/backward null fills; checked
 arithmetic and overflow-erroring casts. The long form is at the bottom of this file.
 
@@ -75,24 +76,24 @@ Counts in the summary are counts of **rows**. A row covers one Arrow function un
 | Arrow function | Status | Notes |
 |---|---|---|
 | `sum` | **GPU** | `Kernels/Reductions.swift`. Threadgroup partials, host finalise, no atomics. Integers accumulate in Int64/UInt64 and wrap; Float32 accumulates per thread in `float` and finalises in `double`, so the last ulp can differ from a strictly sequential double sum; Float64 uses a software IEEE-754 binary64 adder on the GPU (`Kernels/DoubleMath.swift`). Returns nil when there is no valid value, matching Arrow. |
-| `product` | **Not planned** | No roadmap item. Same reduction shape as `sum`; nobody has claimed it. |
+| `product` | **GPU** | `Kernels/Aggregates.swift`, the same threadgroup-partial shape as `sum`. Integers accumulate in Int64/UInt64 and wrap, as Arrow's does; Float32 accumulates in `float` per thread and combines in `double`, so thousands of factors reassociate (about 1e-5 relative); Float64 multiplies through the software binary64 routine on the GPU. Nil when there is no valid value. `product()` in Swift, `am_reduce_ex` op 0 in C, `product()` in Python. |
 | `mean` | **GPU** | GPU sum divided by the valid count on the host (`Reductions.swift`). |
 | `min` | **GPU** | NaN is skipped; all-NaN returns null, matching Arrow's `min_max`. Float64 reduces on order-preserving 64-bit keys. |
 | `max` | **GPU** | Same as `min`. |
-| `min_max` | **Partial** | No fused kernel: call `min()` and `max()`, which is two passes over the data. |
+| `min_max` | **GPU** | `Kernels/Aggregates.swift`: one kernel produces both partials from a single read of the values, and the host combines them. NaN is skipped, as in `min`/`max`. `minMax()` in Swift, `am_reduce_ex` ops 14 and 15 in C, `min_max()` in Python. |
 | `count` (valid values) | **CPU** | `validCount` = `length - nullCount`; the null count comes from a host popcount over the validity bitmap (`MetalArray.swift`, `Bitmap.popcount`). O(1) once the count is known. |
 | `count_all` (rows) | **CPU** | `length`, O(1) metadata. Inside an open batch, reading it forces a sync point. |
-| `count_distinct` | **Not planned** | No roadmap item. Would follow the numeric `unique` work now in flight. |
-| `any` | **CPU** | `MetalBooleanArray.any` is a host popcount of `values & validity` (`Slice.swift`, `MetalArray.swift`). No GPU kernel despite the README's kernel list. |
-| `all` | **CPU** | As `any`; true for empty and all-null input, matching Arrow's `all` with `skip_nulls`. |
-| `index` | **Not planned** | No roadmap item. |
-| `first` / `last` / `first_last` | **Not planned** | No roadmap item. Element access (`array[i]`) is not the same function — it does not skip nulls. |
-| `mode` | **Not planned** | No roadmap item; needs a hash table, which arrives with hash group-by. |
-| `quantile` | **Not planned** | No roadmap item. |
-| `approximate_median` | **Not planned** | No roadmap item. |
-| `tdigest` | **Not planned** | No roadmap item. |
-| `stddev` | **Not planned** | No roadmap item. |
-| `variance` | **Not planned** | No roadmap item. |
+| `count_distinct` | **GPU** | `unique().length` (`Kernels/Aggregates.swift` over `Kernels/Unique.swift`): sort, mark run boundaries, scan. Non-null values only, Arrow's `mode = "only_valid"`. `countDistinct()` in Swift, `am_reduce_ex` op 8 in C, `count_distinct()` in Python. |
+| `any` | **GPU** | `MetalBooleanArray.anyTrue()` (`Kernels/Aggregates.swift`) reduces the bitmap word-wise on the GPU: popcounts of `values & validity` and of `validity`, summed per simdgroup and added atomically. The host popcount property `any` (`Slice.swift`) is still there and returns the same answer. `am_reduce_ex` op 12 in C, `any()` in Python. |
+| `all` | **GPU** | `allTrue()`, the same word-wise pass as `any`: true when the true count equals the valid count, so an empty or all-null column is true, matching Arrow's `all` with `skip_nulls`. `am_reduce_ex` op 13 in C, `all()` in Python. |
+| `index` | **GPU** | `index(of:)` (`Kernels/Aggregates.swift`): every matching row lowers one device-wide atomic minimum, so the answer is the first row holding the value and -1 when it is absent. Float equality is Arrow value equality (`-0.0` equals `0.0`, NaN equals nothing). `am_reduce_ex` op 11 in C (the value travels as a double), `index()` in Python. |
+| `first` / `last` / `first_last` | **GPU** | `first(skipNulls:)` / `last(skipNulls:)` (`Kernels/Aggregates.swift`): a GPU pass over the validity bitmap takes the atomic minimum and maximum valid index, then one host read fetches the value. With `skipNulls: false` the first (or last) row is returned as it is, null included. `first_last` is the two calls; there is no fused form. `am_reduce_ex` ops 9 and 10 in C, `first()` / `last()` in Python. |
+| `mode` | **GPU** | `mode()` (`Kernels/Aggregates.swift`) is GPU `value_counts` (sort, run marks, scan) plus a host argmax over the distinct values, returning the value and its count. Ties go to the smallest value, as Arrow does. Only the single most common value: Arrow's `n` option is not implemented. `am_reduce_ex` ops 7 and 16 in C, `mode()` in Python. |
+| `quantile` | **GPU** | `quantile(_:)` (`Kernels/Aggregates.swift`): the GPU radix sort orders the values and the result is read at the interpolated position, so the answer is exact. Linear interpolation only (Arrow's default); the `lower` / `higher` / `nearest` / `midpoint` options are not implemented, and only one q per call. `q` is clamped to [0, 1]. `am_reduce_ex` op 5 in C, `quantile()` in Python. |
+| `approximate_median` | **GPU** | `approximateMedian()` is `quantile(0.5)` — exact, not a sketch, because sorting on the GPU is cheap enough that approximating would buy nothing. `am_reduce_ex` op 6 in C, `median()` in Python. |
+| `tdigest` | **Not planned** | Out of scope, deliberately: a t-digest is an approximate sketch whose merge is sequential per digest, and the exact `quantile` above answers the same question on the data sizes this package targets. Stated in `Kernels/Aggregates.swift`. |
+| `stddev` | **GPU** | The square root of `variance`, same two passes. `stddev(ddof:)` in Swift, `am_reduce_ex` ops 3 and 4 in C, `stddev()` in Python. |
+| `variance` | **GPU** | `variance(ddof:)` (`Kernels/Aggregates.swift`), Welford-free and two-pass: `sum()` gives the mean, then a GPU pass sums the squared deviations from it. Integer and Float32 columns accumulate those in compensated (Neumaier) float pairs, and integer deviations subtract the integer part of the mean in 64-bit first, so large integers keep their precision; Float64 columns accumulate in software binary64. Both are combined on the host in `Double`. Expect about 1e-7 relative error for Float32 and integers, 1e-15 for Float64. `ddof` 0 is the population variance, 1 the sample one; nil when there are fewer than `ddof + 1` valid values. `am_reduce_ex` ops 1 and 2 in C, `variance()` in Python. |
 | `skew` | **Not planned** | No roadmap item. |
 | `kurtosis` | **Not planned** | No roadmap item. |
 
@@ -111,13 +112,14 @@ atomics with carry because MSL has no 64-bit atomics.
 | `hash_max` | **Partial** | As `hash_min`. |
 | `hash_count` (valid values per key) | **Partial** | GPU, dense keys. |
 | `hash_count_all` (rows per key) | **Partial** | GPU, dense keys. |
-| `hash_min_max` | **Not planned** | No roadmap item; call `hash_min` and `hash_max`. |
-| `hash_any` / `hash_all` | **Not planned** | No roadmap item. |
-| `hash_product` | **Not planned** | No roadmap item. |
-| `hash_stddev` / `hash_variance` | **Not planned** | No roadmap item. |
-| `hash_count_distinct` / `hash_distinct` | **Not planned** | No roadmap item. |
-| `hash_first` / `hash_last` / `hash_one` / `hash_list` | **Not planned** | No roadmap item. |
-| `hash_approximate_median` / `hash_tdigest` | **Not planned** | No roadmap item. |
+| `hash_min_max` | **Not planned** | No roadmap item; call `hash_min` and `hash_max`. The fused scalar `min_max` has no grouped counterpart. |
+| `hash_any` / `hash_all` | **Partial** | GPU, dense keys: `GroupBy.any(_:)` / `all(_:)` (`Kernels/Aggregates.swift`) unpack the boolean bitmap into bytes and run the existing group-by maximum / minimum, so a key with no valid value is null. Boolean values only. |
+| `hash_product` | **CPU** | `GroupBy.product(_:)` is one host pass over the key and value buffers, wrapping in Int64 like the scalar `product`. Metal has no 64-bit atomic multiply, so there is no GPU form; integer values only. |
+| `hash_stddev` / `hash_variance` | **Partial** | GPU, dense keys: per-key means from the existing `sum`/`count`, a `take` by key gathers each row's mean, and the squared deviations are summed per key with `sumFloat`. Deviations are computed in Float32, so expect about 1e-6 relative error; Float64 value columns are rejected (cast to Float32 first). `ddof` as in the scalar form. |
+| `hash_count_distinct` / `hash_distinct` | **Partial** | `GroupBy.countDistinct(_:)` is GPU, dense keys: the values are dictionary encoded, each row becomes the packed key `key * uniqueCount + code`, `unique()` collapses the repeats and a group-by count over the unpacked keys counts what is left. `hash_distinct` (the values themselves) is not implemented. |
+| `hash_first` / `hash_last` | **Partial** | GPU, dense keys: a group-by minimum / maximum over a row-index array that carries the values' validity, then one `take`. Any value type. `GroupBy.first(_:)` / `last(_:)`. |
+| `hash_one` / `hash_list` | **Not planned** | No roadmap item. |
+| `hash_approximate_median` / `hash_tdigest` | **Not planned** | `GroupBy.approximateMedian(_:)` exists but throws: a grouped median needs a segmented sort (sort by key then by value, then index within each segment), and this tree has no segmented-sort kernel to build on. Filter per key and call the scalar `approximateMedian()`, or sort by the key column and slice. `hash_tdigest` follows `tdigest`: out of scope. |
 | Group-by over arbitrary (non-dense) keys | **Planned** | [ROADMAP → Medium term → Group-by](../ROADMAP.md#medium-term): "hash group-by for arbitrary keys, 64-bit min/max". Today the caller must dictionary-encode first. |
 | Hash join (Acero, not a compute function) | **In progress** | A concurrent branch is building a GPU hash join this week. Not in 0.1.0 as published here. |
 
@@ -321,6 +323,8 @@ zero-copy and a null row emits no bytes. All of them are reachable from Swift, f
 | `dictionary_encode` (numeric) | **In progress** | A concurrent branch is adding numeric dictionary encoding this week. Not in 0.1.0 as published here. |
 | `unique` | **In progress** | Same branch: `unique` over numeric columns. |
 | `value_counts` | **In progress** | Same branch: `value_counts` over numeric columns. |
+| `dictionary_encode` (temporal, boolean, binary) | **Partial** | `AnyMetalArray.dictionaryEncoded()` (`Kernels/DictionaryCompute.swift`) covers every column type this package has: temporal and boolean columns go through the GPU numeric encoder (the temporal type is carried over to the values), `utf8` and `binary` through the existing host hash map. Returns `.dictionary(codes:values:)` rather than a loose pair. |
+| Dictionary compute without decoding (`compare`, `filter`, `take`, `slice`, `unique`, `value_counts`, `group_by`) | **GPU** | `Kernels/DictionaryCompute.swift`. `dictionaryCompare(_:_:)` compares the dictionary once and gathers the booleans by the codes (`values.length` comparisons plus one gather, not one per row); `filter`/`take`/`slice` touch the codes only and share the values array; `dictionaryUnique()` / `dictionaryValueCounts()` run over the codes and gather once; `dictionaryGroupBy()` hands the codes straight to `GroupBy` as dense keys. String dictionaries compare with `==` and `!=` only. |
 
 ## Pairwise and cumulative
 
@@ -375,8 +379,8 @@ outright.
 | `struct` | **Partial** | Supported only as the record-batch container: `+s` import and export with one child per column, non-nested children, no top-level nulls and no offset. [ROADMAP → Medium term → RecordBatch](../ROADMAP.md#medium-term) lists "nested struct children" as open. There is no compute over struct-typed columns. |
 | `map` | **Not planned** | Out of scope: nested. |
 | `union` (dense and sparse) | **Not planned** | Out of scope: a type-id-dispatched layout defeats the uniform-thread model kernels rely on. |
-| `dictionary` | **In progress** | Concurrent branch this week adds the type. [ROADMAP → Medium term](../ROADMAP.md#medium-term) covers the compute half: "compare and filter on codes without decoding". Today the importer rejects any array with a `dictionary` pointer. |
-| `run_end_encoded` | **Not planned** | No roadmap item. |
+| `dictionary` | **GPU** | Int32 codes plus a type-erased values array (`DictionaryArray.swift`), with C Data import/export and IPC read/write of `DictionaryBatch` messages (complete dictionaries, `isDelta = false`). Compute runs on the codes without decoding — compare, filter, take, slice, unique, value_counts and group-by (`Kernels/DictionaryCompute.swift`) — and `decode()` materialises with `take` when a caller wants the flat column. Int64 indices are narrowed to int32 on import. |
+| `run_end_encoded` | **GPU** | `RunEndEncoded.swift`: `"+r"` import and export (run ends of int16/int32/int64 are narrowed to int32), `runEndEncode()` on the GPU (boundary marks, bitmap pack, compaction of an iota, one gather) for primitive, boolean and temporal columns, and `runEndDecode()` on the GPU (one binary search of the run ends per output row, then a gather). Runs are maximal stretches of bit-equal, equally-null neighbours, so `-0.0` and `0.0` start different runs. `take` / `filter` / `slice` decode first; IPC writing needs an explicit decode. `am_run_end_encode` / `am_run_end_decode` in C, `run_end_encode()` / `run_end_decode()` in Python. |
 | Extension types | **Not planned** | No roadmap item; the importer reads `format` only and would need `ARROW:extension:name` metadata handling. |
 
 ## Interop (not compute — separate vocabulary)
@@ -390,7 +394,7 @@ outright.
 | C Stream Interface export | **Planned** | [ROADMAP → Medium term → RecordBatch](../ROADMAP.md#medium-term): "Open: C Stream export, C Device Stream". |
 | Record batch as `+s` struct array | **Partial** | Import and export both work; import rejects struct-level nulls, a non-zero offset, and nested children. |
 | `MTLBuffer` recovery from our own exports | **Shipped** | `metalBuffers(of:)` for device arrays this process produced. |
-| Arrow IPC (file and stream) read / write | **In progress** | A concurrent branch is adding IPC this week. Nothing in 0.1.0 as published here reads or writes IPC; callers go through the C Data Interface. |
+| Arrow IPC (file and stream) read / write | **Shipped** | `IPC/IPCReader.swift` and `IPC/IPCWriter.swift`, no dependencies: both encapsulations, random access through the file footer, and cross-checked against pyarrow in both directions. Columns keep their logical type — temporal columns read and write as `.temporal`, `binary` / `large_binary` as `.binary`, and dictionary-encoded columns as `.dictionary` through `DictionaryBatch` messages (complete dictionaries only: a delta batch, a replacement for an id, or a batch carrying a different dictionary for a column is refused rather than silently mis-decoded). Compression, view types and run-end encoded columns are not written. |
 | Python: PyCapsule `__arrow_c_array__` | **Shipped** | `python/arrowmetal/__init__.py` over the C ABI. |
 | Python: `__arrow_c_device_array__`, wheel with the dylib inside | **Planned** | [ROADMAP → Integrations](../ROADMAP.md#integrations). |
 | arrow-swift and MLX bridges, DuckDB/DataFusion UDF | **Planned** | [ROADMAP → Integrations](../ROADMAP.md#integrations). |

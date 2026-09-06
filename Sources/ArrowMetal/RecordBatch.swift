@@ -19,6 +19,8 @@ extension AnyMetalArray {
         case .temporal(let a): return a.nullCount
         case .binary(let a): return a.nullCount
         case .dictionary(let codes, _): return codes.nullCount
+        // Nulls live in the run values; count the rows they cover.
+        case .runEndEncoded(let runEnds, let values): return runEndNullCount(runEnds, values)
         }
     }
 
@@ -40,6 +42,8 @@ extension AnyMetalArray {
         case .temporal(let a): return .temporal(try a.filter(mask))
         case .binary(let a): return .binary(markBinary(try a.filter(mask)))
         case .dictionary(let codes, let values): return .dictionary(codes: try codes.filter(mask), values: values)
+        // Run-end encoding is not preserved by selection: decode, then filter.
+        case .runEndEncoded: return try runEndDecode().filter(mask)
         }
     }
 
@@ -60,6 +64,7 @@ extension AnyMetalArray {
         case .temporal(let a): return .temporal(try a.take(idx))
         case .binary(let a): return .binary(markBinary(try a.take(idx)))
         case .dictionary(let codes, let values): return .dictionary(codes: try codes.take(idx), values: values)
+        case .runEndEncoded: return try runEndDecode().take(idx)
         }
     }
 
@@ -82,6 +87,7 @@ extension AnyMetalArray {
             return .binary(markBinary(try a.take(try MetalArray<Int32>((offset..<(offset + length)).map { Int32($0) }, context: a.context))))
         case .dictionary(let codes, let values):
             return .dictionary(codes: try codes.slice(offset: offset, length: length), values: values)
+        case .runEndEncoded: return try runEndDecode().slice(offset: offset, length: length)
         }
     }
 

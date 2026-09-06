@@ -176,6 +176,51 @@ int  am_binary(am_array* a, int op, am_array* b /* or NULL */, const void* scala
 // Two-level GPU scan; integer sums wrap and are exact, float sums reassociate.
 int  am_cumulative(am_array* a, int op, am_array** out);
 
+// ---------------------------------------------------------------------------------------------------
+// Statistical and positional aggregates, run-end encoding.
+//
+// am_reduce_ex writes one scalar, exactly like am_reduce: out_kind is 0 for an int64 in *out_i64,
+// 1 for a uint64 in the same slot, 2 for a double in *out_f64, and *is_null is set when the column has
+// no value to answer with (every row null, or fewer values than the degrees of freedom).
+//
+//  op  function                  p1                    out_kind          notes
+//  --  ------------------------  --------------------  ----------------  ---------------------------------
+//   0  product                   -                     column's kind     integers wrap in int64 / uint64
+//   1  variance (population)     -                     double            ddof = 0
+//   2  variance (sample)         -                     double            ddof = 1
+//   3  stddev (population)       -                     double
+//   4  stddev (sample)           -                     double
+//   5  quantile                  q in [0, 1] (clamped) double            linear interpolation, exact
+//   6  approximate_median        -                     double            exact: a GPU sort, not a sketch
+//   7  mode (value)              -                     column's kind     ties go to the smallest value
+//   8  count_distinct            -                     int64             non-null values only
+//   9  first                     -                     column's kind     skips nulls
+//  10  last                      -                     column's kind     skips nulls
+//  11  index                     the value to find     int64             first row holding it, -1 when absent
+//  12  any                       -                     int64 (0 or 1)    boolean columns only
+//  13  all                       -                     int64 (0 or 1)    boolean columns only
+//  14  min_max -> min            -                     column's kind     one kernel produces both
+//  15  min_max -> max            -                     column's kind
+//  16  mode (count)              -                     int64             how often the mode occurs
+//
+// Ops 0-11 and 14-16 accept primitive and temporal columns (a temporal column aggregates its storage
+// integers); ops 8, 12 and 13 accept boolean columns. `p1` for op 11 is a double, so an integer value
+// above 2^53 cannot be expressed exactly; ops that do not use it ignore it.
+//
+// Precision: float32 statistics accumulate squared deviations in compensated float pairs and float64
+// ones in software binary64, so expect about 1e-7 and 1e-15 relative error respectively. A float32
+// `product` over thousands of factors reassociates and rounds in float (about 1e-5 relative).
+// `tdigest` is out of scope: `quantile` here is exact, so there is no sketch to approximate it with.
+int  am_reduce_ex(am_array* a, int op, double p1, int64_t* out_i64, double* out_f64, int* out_kind, int* is_null);
+
+// Run-end encoding ("+r"): two children, run_ends (int32 here; int16/int32/int64 are accepted on import)
+// and values. am_format reports "+r"; am_length reports the decoded, logical length.
+// am_run_end_encode takes a primitive, boolean or temporal array and collapses adjacent equal values
+// (bit equality, and nulls form runs of their own). am_run_end_decode expands one back.
+// take, filter and slice on a run-end encoded array decode first; IPC writing needs a decode as well.
+int  am_run_end_encode(am_array* a, am_array** out);
+int  am_run_end_decode(am_array* a, am_array** out);
+
 #ifdef __cplusplus
 }
 #endif

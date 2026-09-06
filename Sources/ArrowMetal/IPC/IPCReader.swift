@@ -35,9 +35,11 @@ enum ArrowIPCStorage: Equatable {
 
 /// The Arrow logical types ArrowMetal can read from and write to IPC.
 ///
-/// Temporal types have no dedicated array class yet, so they are carried by their storage
-/// integer array (`date32` as `Int32` days, `timestamp` as `Int64` ticks, ...). The logical
-/// type is preserved in `ArrowIPCReader.schema` and written back out unchanged.
+/// Each one maps to the array class that carries it: temporal types to `MetalTemporalArray`
+/// (`.temporal`), `binary` / `large_binary` to a byte-flagged `MetalStringArray` (`.binary`), and a
+/// dictionary-encoded column to `.dictionary(codes:values:)` — its codes come from the record batch and
+/// its values from a `DictionaryBatch` message. A column written from the storage integers of a temporal
+/// type against an explicit schema is accepted too, and reads back as `.temporal`.
 public enum ArrowIPCType: Equatable, Sendable, CustomStringConvertible {
     case int(bits: Int, signed: Bool)
     case float(bits: Int)
@@ -52,6 +54,9 @@ public enum ArrowIPCType: Equatable, Sendable, CustomStringConvertible {
     case time64(ArrowIPCTimeUnit)
     case timestamp(ArrowIPCTimeUnit, timezone: String?)
     case duration(ArrowIPCTimeUnit)
+    /// A dictionary-encoded column: `index` is the type of the codes stored in the record batch,
+    /// `value` the type of the dictionary itself (which travels in a separate `DictionaryBatch`).
+    indirect case dictionary(index: ArrowIPCType, value: ArrowIPCType)
 
     public var description: String {
         switch self {
@@ -68,6 +73,7 @@ public enum ArrowIPCType: Equatable, Sendable, CustomStringConvertible {
         case .time64(let u): return "time64[\(u)]"
         case .timestamp(let u, let tz): return "timestamp[\(u)\(tz.map { ", tz=\($0)" } ?? "")]"
         case .duration(let u): return "duration[\(u)]"
+        case .dictionary(let i, let v): return "dictionary<\(i), \(v)>"
         }
     }
 
@@ -78,6 +84,8 @@ public enum ArrowIPCType: Equatable, Sendable, CustomStringConvertible {
         case .date64, .time64, .timestamp, .duration: return .int(bits: 64, signed: true)
         case .binary: return .utf8
         case .largeBinary: return .largeUtf8
+        // The record batch carries the codes; the values ride in a dictionary batch.
+        case .dictionary(let index, _): return index.physicalType
         default: return self
         }
     }
@@ -91,6 +99,34 @@ public enum ArrowIPCType: Equatable, Sendable, CustomStringConvertible {
         case .largeUtf8, .largeBinary: return .varBinary(large: true)
         case .date32, .time32: return .fixedWidth(bytes: 4)
         case .date64, .time64, .timestamp, .duration: return .fixedWidth(bytes: 8)
+        case .dictionary(let index, _): return index.storage
+        }
+    }
+
+    /// The value type of a dictionary column, or nil for everything else.
+    var dictionaryValueType: ArrowIPCType? {
+        if case .dictionary(_, let v) = self { return v }
+        return nil
+    }
+
+    /// The Arrow temporal type this logical type maps to, or nil when it is not temporal.
+    var temporalType: ArrowTemporalType? {
+        func u(_ x: ArrowIPCTimeUnit) -> ArrowTemporalUnit {
+            switch x {
+            case .second: return .second
+            case .millisecond: return .milli
+            case .microsecond: return .micro
+            case .nanosecond: return .nano
+            }
+        }
+        switch self {
+        case .date32: return .date32
+        case .date64: return .date64
+        case .time32(let x): return .time32(u(x))
+        case .time64(let x): return .time64(u(x))
+        case .timestamp(let x, let tz): return .timestamp(u(x), timezone: tz)
+        case .duration(let x): return .duration(u(x))
+        default: return nil
         }
     }
 }
@@ -100,10 +136,14 @@ public struct ArrowIPCField: Equatable, Sendable {
     public let name: String
     public let type: ArrowIPCType
     public let nullable: Bool
-    public init(name: String, type: ArrowIPCType, nullable: Bool = true) {
+    /// The dictionary id that ties a dictionary-encoded column to its `DictionaryBatch` message.
+    /// Nil for every other column; the writer assigns one per dictionary column when it derives a schema.
+    public let dictionaryID: Int64?
+    public init(name: String, type: ArrowIPCType, nullable: Bool = true, dictionaryID: Int64? = nil) {
         self.name = name
         self.type = type
         self.nullable = nullable
+        self.dictionaryID = dictionaryID
     }
 }
 
@@ -166,6 +206,10 @@ public final class ArrowIPCReader {
     private let data: Data
     private let holder: ArrowIPCSourceHolder
     private let messages: [ArrowIPCMessageRef]
+    /// `DictionaryBatch` messages, in the order they appear (stream) or the footer lists them (file).
+    private let dictionaryMessages: [ArrowIPCMessageRef]
+    /// Dictionary values by id, materialised once on the first batch read.
+    private var dictionaries: [Int64: AnyMetalArray] = [:]
     private let context: MetalContext
     /// Borrow mapped pages instead of copying when they happen to be page aligned.
     private let allowZeroCopy: Bool
@@ -195,6 +239,7 @@ public final class ArrowIPCReader {
         self.format = parsed.format
         self.schema = parsed.schema
         self.messages = parsed.messages
+        self.dictionaryMessages = parsed.dictionaries
     }
 
     /// Reads every record batch.
@@ -225,14 +270,16 @@ public final class ArrowIPCReader {
     }
 
     private static func scan(_ raw: UnsafeRawBufferPointer)
-        throws -> (format: ArrowIPCFormat, schema: ArrowIPCSchema, messages: [ArrowIPCMessageRef]) {
+        throws -> (format: ArrowIPCFormat, schema: ArrowIPCSchema, messages: [ArrowIPCMessageRef],
+                   dictionaries: [ArrowIPCMessageRef]) {
         guard raw.count >= 8 else { throw ArrowIPCError.notArrowIPC }
         if hasPrefix(raw, arrowFileMagic, at: 0) { return try scanFile(raw) }
         return try scanStream(raw)
     }
 
     private static func scanFile(_ raw: UnsafeRawBufferPointer)
-        throws -> (format: ArrowIPCFormat, schema: ArrowIPCSchema, messages: [ArrowIPCMessageRef]) {
+        throws -> (format: ArrowIPCFormat, schema: ArrowIPCSchema, messages: [ArrowIPCMessageRef],
+                   dictionaries: [ArrowIPCMessageRef]) {
         let n = raw.count
         guard n >= 8 + 10, hasPrefix(raw, arrowFileMagicTail, at: n - 6) else {
             throw ArrowIPCError.malformed("file does not end with the ARROW1 magic")
@@ -245,8 +292,17 @@ public final class ArrowIPCReader {
         let footer = try FBBuf(raw, from: footerStart, count: footerLength).root()
         guard let schemaTable = try footer.table(1) else { throw ArrowIPCError.malformed("footer has no schema") }
         let schema = try parseSchema(schemaTable)
-        if let dicts = try footer.vector(2), dicts.count > 0 {
-            throw ArrowIPCError.unsupported("dictionary encoded columns")
+        var dictionaries: [ArrowIPCMessageRef] = []
+        if let dicts = try footer.vector(2) {
+            for i in 0..<dicts.count {
+                let p = try dicts.structAt(i, stride: fbBlockStride)
+                let offset = Int(try footer.buf.load(Int64.self, at: p))
+                guard let msg = try message(raw, at: offset),
+                      msg.headerType == FBMessageHeader.dictionaryBatch.rawValue else {
+                    throw ArrowIPCError.malformed("dictionary block \(i) is not a dictionary batch")
+                }
+                dictionaries.append(msg.ref)
+            }
         }
         var messages: [ArrowIPCMessageRef] = []
         if let blocks = try footer.vector(3) {
@@ -266,14 +322,16 @@ public final class ArrowIPCReader {
                 messages.append(msg.ref)
             }
         }
-        return (.file, schema, messages)
+        return (.file, schema, messages, dictionaries)
     }
 
     private static func scanStream(_ raw: UnsafeRawBufferPointer)
-        throws -> (format: ArrowIPCFormat, schema: ArrowIPCSchema, messages: [ArrowIPCMessageRef]) {
+        throws -> (format: ArrowIPCFormat, schema: ArrowIPCSchema, messages: [ArrowIPCMessageRef],
+                   dictionaries: [ArrowIPCMessageRef]) {
         var pos = 0
         var schema: ArrowIPCSchema? = nil
         var messages: [ArrowIPCMessageRef] = []
+        var dictionaries: [ArrowIPCMessageRef] = []
         while pos < raw.count {
             guard let m = try message(raw, at: pos) else { break }     // end-of-stream marker
             switch m.headerType {
@@ -286,7 +344,8 @@ public final class ArrowIPCReader {
                 guard schema != nil else { throw ArrowIPCError.malformed("record batch before the schema message") }
                 messages.append(m.ref)
             case FBMessageHeader.dictionaryBatch.rawValue:
-                throw ArrowIPCError.unsupported("dictionary batches")
+                guard schema != nil else { throw ArrowIPCError.malformed("dictionary batch before the schema message") }
+                dictionaries.append(m.ref)
             case FBMessageHeader.tensor.rawValue, FBMessageHeader.sparseTensor.rawValue:
                 throw ArrowIPCError.unsupported("tensor messages")
             default:
@@ -295,7 +354,7 @@ public final class ArrowIPCReader {
             pos = m.next
         }
         guard let schema else { throw ArrowIPCError.notArrowIPC }
-        return (.stream, schema, messages)
+        return (.stream, schema, messages, dictionaries)
     }
 
     /// Decodes one encapsulated message header at `pos`. Returns nil at the end-of-stream marker.
@@ -342,7 +401,7 @@ public final class ArrowIPCReader {
     private static func parseField(_ field: FBTable) throws -> ArrowIPCField {
         let name = try field.string(0) ?? ""
         let nullable = try field.bool(1)
-        if try field.field(4) != nil { throw ArrowIPCError.unsupported("dictionary encoded column '\(name)'") }
+        let encoding = try field.table(4)
         if let children = try field.vector(5), children.count > 0 {
             throw ArrowIPCError.unsupported("nested column '\(name)'")
         }
@@ -353,7 +412,20 @@ public final class ArrowIPCReader {
         guard let type = try field.table(3) else {
             throw ArrowIPCError.malformed("column '\(name)' has no type table")
         }
-        return ArrowIPCField(name: name, type: try parseType(kind, type, column: name), nullable: nullable)
+        let valueType = try parseType(kind, type, column: name)
+        guard let encoding else { return ArrowIPCField(name: name, type: valueType, nullable: nullable) }
+        // DictionaryEncoding { id: long; indexType: Int; isOrdered: bool; dictionaryKind: short }
+        let id = try encoding.int64(0)
+        var index = ArrowIPCType.int(bits: 32, signed: true)
+        if let it = try encoding.table(1) {
+            let bits = Int(try it.int32(0))
+            guard [8, 16, 32, 64].contains(bits) else {
+                throw ArrowIPCError.unsupported("\(bits)-bit dictionary indices (column '\(name)')")
+            }
+            index = .int(bits: bits, signed: try it.bool(1))
+        }
+        return ArrowIPCField(name: name, type: .dictionary(index: index, value: valueType),
+                             nullable: nullable, dictionaryID: id)
     }
 
     private static func parseType(_ kind: FBTypeKind, _ type: FBTable, column: String) throws -> ArrowIPCType {
@@ -403,15 +475,16 @@ public final class ArrowIPCReader {
         let length: Int
     }
 
-    private func buildBatch(header: FBTable, raw: UnsafeRawBufferPointer,
-                            bodyOffset: Int, bodyLength: Int) throws -> MetalRecordBatch {
+    /// The `RecordBatch` table's own fields: logical length, field nodes and buffer ranges.
+    /// Shared by record batch and dictionary batch messages (a dictionary batch wraps a record batch).
+    private func recordBatchParts(header: FBTable, bodyLength: Int)
+        throws -> (length: Int, nodes: [(length: Int, nullCount: Int)], buffers: [BodyBuffer]) {
         if try header.field(3) != nil { throw ArrowIPCError.unsupported("compressed record batch bodies") }
         if let variadic = try header.vector(4), variadic.count > 0 {
             throw ArrowIPCError.unsupported("variadic buffers (view types)")
         }
         let length = Int(try header.int64(0))
         guard length >= 0 else { throw ArrowIPCError.malformed("negative record batch length") }
-
         var nodes: [(length: Int, nullCount: Int)] = []
         if let vec = try header.vector(1) {
             nodes.reserveCapacity(vec.count)
@@ -436,12 +509,19 @@ public final class ArrowIPCReader {
                 buffers.append(BodyBuffer(offset: off, length: len))
             }
         }
+        return (length, nodes, buffers)
+    }
+
+    private func buildBatch(header: FBTable, raw: UnsafeRawBufferPointer,
+                            bodyOffset: Int, bodyLength: Int) throws -> MetalRecordBatch {
+        let (length, nodes, buffers) = try recordBatchParts(header: header, bodyLength: bodyLength)
         guard nodes.count == schema.fields.count else {
             throw ArrowIPCError.malformed("record batch has \(nodes.count) field nodes for \(schema.fields.count) columns")
         }
 
         lastBatchWasZeroCopy = false
         borrowedAny = false
+        try materialiseDictionaries(raw: raw)
         var columns: [AnyMetalArray] = []
         columns.reserveCapacity(schema.fields.count)
         var next = 0
@@ -505,19 +585,38 @@ public final class ArrowIPCReader {
                 if nulls < 0 { a.recomputeNullCount() } else { a.nullCount = nulls }
                 return a
             }
+            var flat: AnyMetalArray
             switch field.type.physicalType {
-            case .int(bits: 8, signed: true): return .int8(make(Int8.self))
-            case .int(bits: 8, signed: false): return .uint8(make(UInt8.self))
-            case .int(bits: 16, signed: true): return .int16(make(Int16.self))
-            case .int(bits: 16, signed: false): return .uint16(make(UInt16.self))
-            case .int(bits: 32, signed: true): return .int32(make(Int32.self))
-            case .int(bits: 32, signed: false): return .uint32(make(UInt32.self))
-            case .int(bits: 64, signed: true): return .int64(make(Int64.self))
-            case .int(bits: 64, signed: false): return .uint64(make(UInt64.self))
-            case .float(bits: 32): return .float32(make(Float.self))
-            case .float(bits: 64): return .float64(make(Double.self))
+            case .int(bits: 8, signed: true): flat = .int8(make(Int8.self))
+            case .int(bits: 8, signed: false): flat = .uint8(make(UInt8.self))
+            case .int(bits: 16, signed: true): flat = .int16(make(Int16.self))
+            case .int(bits: 16, signed: false): flat = .uint16(make(UInt16.self))
+            case .int(bits: 32, signed: true): flat = .int32(make(Int32.self))
+            case .int(bits: 32, signed: false): flat = .uint32(make(UInt32.self))
+            case .int(bits: 64, signed: true): flat = .int64(make(Int64.self))
+            case .int(bits: 64, signed: false): flat = .uint64(make(UInt64.self))
+            case .float(bits: 32): flat = .float32(make(Float.self))
+            case .float(bits: 64): flat = .float64(make(Double.self))
             default: throw ArrowIPCError.unsupported("\(field.type) columns (column '\(field.name)')")
             }
+            // date / time / timestamp / duration keep their logical type: the storage integers are
+            // wrapped in a MetalTemporalArray, so `column.asTemporal` round trips.
+            if let t = field.type.temporalType {
+                switch flat {
+                case .int32(let a): return .temporal(try MetalTemporalArray(type: t, a))
+                case .int64(let a): return .temporal(try MetalTemporalArray(type: t, a))
+                default: throw ArrowIPCError.malformed("column '\(field.name)' has the wrong storage for \(field.type)")
+                }
+            }
+            // A dictionary-encoded column: the record batch holds the codes, the values came in a
+            // dictionary batch. Codes are narrowed to int32, as everywhere else in ArrowMetal.
+            if case .dictionary = field.type {
+                guard let id = field.dictionaryID, let values = dictionaries[id] else {
+                    throw ArrowIPCError.malformed("column '\(field.name)' has no dictionary batch")
+                }
+                return .dictionary(codes: try codes(from: flat, column: field.name), values: values)
+            }
+            return flat
 
         case .bits:
             let bitmap = try validity()
@@ -570,7 +669,63 @@ public final class ArrowIPCReader {
             let a = MetalStringArray(length: length, nullCount: 0, validity: bitmap,
                                      offsets: offsets, data: bytes, context: context)
             if nulls < 0 { a.recomputeNullCount() } else { a.setNullCount(nulls) }
-            return .string(a)
+            // binary / large_binary keep the utf8 layout but come back as `.binary`, bytes uninterpreted.
+            switch field.type {
+            case .binary, .largeBinary: return .binary(markBinary(a))
+            default: return .string(a)
+            }
+        }
+    }
+
+    /// Narrows a code column of any integer width to the int32 codes `AnyMetalArray.dictionary` holds.
+    private func codes(from flat: AnyMetalArray, column: String) throws -> MetalArray<Int32> {
+        switch flat {
+        case .int32(let a): return a
+        case .int8(let a): return try a.cast(to: Int32.self)
+        case .uint8(let a): return try a.cast(to: Int32.self)
+        case .int16(let a): return try a.cast(to: Int32.self)
+        case .uint16(let a): return try a.cast(to: Int32.self)
+        case .uint32(let a): return try a.cast(to: Int32.self)
+        case .int64(let a): return try a.cast(to: Int32.self)
+        case .uint64(let a): return try a.cast(to: Int32.self)
+        default: throw ArrowIPCError.malformed("dictionary indices of column '\(column)' are not integers")
+        }
+    }
+
+    /// Reads every `DictionaryBatch` message once, on the first batch read.
+    ///
+    /// Only complete dictionaries are supported: a delta batch (`isDelta = true`) is rejected, and a
+    /// replacement for an id that is already known is rejected too.
+    private func materialiseDictionaries(raw: UnsafeRawBufferPointer) throws {
+        guard dictionaries.count < dictionaryMessages.count else { return }
+        for ref in dictionaryMessages {
+            let meta = try FBBuf(raw, from: ref.metadataOffset, count: ref.metadataLength)
+            guard let header = try meta.root().table(2) else {
+                throw ArrowIPCError.malformed("dictionary batch has no header")
+            }
+            // DictionaryBatch { id: long; data: RecordBatch; isDelta: bool }
+            let id = try header.int64(0)
+            guard try header.bool(2) == false else {
+                throw ArrowIPCError.unsupported("delta dictionary batches (isDelta = true)")
+            }
+            guard let data = try header.table(1) else {
+                throw ArrowIPCError.malformed("dictionary batch \(id) has no record batch")
+            }
+            guard let field = schema.fields.first(where: { $0.dictionaryID == id }),
+                  let valueType = field.type.dictionaryValueType else {
+                throw ArrowIPCError.malformed("dictionary batch \(id) matches no column")
+            }
+            if dictionaries[id] != nil {
+                throw ArrowIPCError.unsupported("a replacement dictionary for id \(id)")
+            }
+            let valueField = ArrowIPCField(name: field.name + ".dictionary", type: valueType, nullable: true)
+            let (length, nodes, buffers) = try recordBatchParts(header: data, bodyLength: ref.bodyLength)
+            guard nodes.count == 1, buffers.count >= valueType.storage.bufferCount else {
+                throw ArrowIPCError.malformed("dictionary batch \(id) has \(nodes.count) field nodes")
+            }
+            dictionaries[id] = try buildColumn(field: valueField, length: length, nullCount: nodes[0].nullCount,
+                                               buffers: Array(buffers[0..<valueType.storage.bufferCount]),
+                                               raw: raw, bodyOffset: ref.bodyOffset)
         }
     }
 }

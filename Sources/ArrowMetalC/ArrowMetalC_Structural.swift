@@ -85,6 +85,7 @@ private func withStructural<R>(_ a: AnyMetalArray, _ body: (any StructuralCOps) 
         case .int64(let x): return try body(x)
         }
     case .dictionary: throw ArrowMetalError.unsupportedType("decode the dictionary array first")
+    case .runEndEncoded: throw ArrowMetalError.unsupportedType("decode the run-end encoded array first")
     }
 }
 

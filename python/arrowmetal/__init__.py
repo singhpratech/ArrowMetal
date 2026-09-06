@@ -607,3 +607,130 @@ def coalesce(*arrays):
     out = _P()
     _check(_lib.am_coalesce(handles, len(arrays), ctypes.byref(out)))
     return MetalArray(out)
+
+
+# ---- statistical and positional aggregates, run-end encoding (see include/arrowmetal.h)
+_lib.am_reduce_ex.argtypes = [_P, ctypes.c_int, ctypes.c_double, ctypes.POINTER(ctypes.c_int64),
+                              ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_int),
+                              ctypes.POINTER(ctypes.c_int)]
+_lib.am_reduce_ex.restype = ctypes.c_int
+for _name in ("am_run_end_encode", "am_run_end_decode"):
+    getattr(_lib, _name).argtypes = [_P, ctypes.POINTER(_P)]
+    getattr(_lib, _name).restype = ctypes.c_int
+
+_REDUCE_EX = {"product": 0, "variance": 1, "variance_sample": 2, "stddev": 3, "stddev_sample": 4,
+              "quantile": 5, "median": 6, "mode": 7, "count_distinct": 8, "first": 9, "last": 10,
+              "index": 11, "any": 12, "all": 13, "min_of_min_max": 14, "max_of_min_max": 15,
+              "mode_count": 16}
+
+
+def _reduce_ex(self, op, p1=0.0):
+    """One scalar aggregate through am_reduce_ex; None when the column has no answer."""
+    i, f = ctypes.c_int64(), ctypes.c_double()
+    kind, null = ctypes.c_int(), ctypes.c_int()
+    _check(_lib.am_reduce_ex(self._h, _REDUCE_EX[op], float(p1), ctypes.byref(i), ctypes.byref(f),
+                             ctypes.byref(kind), ctypes.byref(null)))
+    if null.value:
+        return None
+    if kind.value == 2:
+        return f.value
+    if kind.value == 1:
+        return i.value & 0xFFFFFFFFFFFFFFFF
+    return i.value
+
+
+def _product(self):
+    """Arrow `product` of the non-null values (integers wrap in 64 bits)."""
+    return _reduce_ex(self, "product")
+
+
+def _variance(self, ddof=0):
+    """Population variance (ddof=0) or sample variance (ddof=1) of the non-null values."""
+    return _reduce_ex(self, "variance" if ddof == 0 else "variance_sample")
+
+
+def _stddev(self, ddof=0):
+    """Population or sample standard deviation."""
+    return _reduce_ex(self, "stddev" if ddof == 0 else "stddev_sample")
+
+
+def _quantile(self, q):
+    """Exact quantile with linear interpolation; q is clamped to [0, 1]."""
+    return _reduce_ex(self, "quantile", q)
+
+
+def _median(self):
+    """Arrow `approximate_median`, computed exactly (the values are sorted on the GPU)."""
+    return _reduce_ex(self, "median")
+
+
+def _mode(self):
+    """(value, count) of the most common non-null value; ties go to the smallest value."""
+    value = _reduce_ex(self, "mode")
+    if value is None:
+        return None
+    return (value, _reduce_ex(self, "mode_count"))
+
+
+def _count_distinct(self):
+    """Number of distinct non-null values."""
+    return _reduce_ex(self, "count_distinct")
+
+
+def _first(self):
+    """First non-null value, or None."""
+    return _reduce_ex(self, "first")
+
+
+def _last(self):
+    """Last non-null value, or None."""
+    return _reduce_ex(self, "last")
+
+
+def _index(self, value):
+    """Row of the first occurrence of `value`, or -1 when it is absent."""
+    return _reduce_ex(self, "index", value)
+
+
+def _min_max(self):
+    """(min, max) in one pass over the values."""
+    return (_reduce_ex(self, "min_of_min_max"), _reduce_ex(self, "max_of_min_max"))
+
+
+def _any(self):
+    """True when any valid value of a boolean column is true."""
+    v = _reduce_ex(self, "any")
+    return None if v is None else bool(v)
+
+
+def _all(self):
+    """True when every valid value of a boolean column is true."""
+    v = _reduce_ex(self, "all")
+    return None if v is None else bool(v)
+
+
+def _run_end_encode(self):
+    """Run-end encode a primitive, boolean or temporal column ("+r": run_ends plus values)."""
+    return _call(_lib.am_run_end_encode, self._h)
+
+
+def _run_end_decode(self):
+    """Expand a run-end encoded column back into a flat one."""
+    return _call(_lib.am_run_end_decode, self._h)
+
+
+MetalArray.product = _product
+MetalArray.variance = _variance
+MetalArray.stddev = _stddev
+MetalArray.quantile = _quantile
+MetalArray.median = _median
+MetalArray.mode = _mode
+MetalArray.count_distinct = _count_distinct
+MetalArray.first = _first
+MetalArray.last = _last
+MetalArray.index = _index
+MetalArray.min_max = _min_max
+MetalArray.any = _any
+MetalArray.all = _all
+MetalArray.run_end_encode = _run_end_encode
+MetalArray.run_end_decode = _run_end_decode
