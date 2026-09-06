@@ -92,6 +92,8 @@ private func withPrimitive<R>(_ a: AnyMetalArray, _ body: (any PrimitiveOps) thr
     case .float64(let x): return try body(x)
     case .boolean: throw ArrowMetalError.unsupportedType("operation needs a primitive array, got boolean")
     case .string: throw ArrowMetalError.unsupportedType("operation needs a primitive array, got utf8")
+    case .temporal, .binary, .dictionary:
+        throw ArrowMetalError.unsupportedType("operation needs a primitive array, got \(a.arrowFormat)")
     }
 }
 
@@ -179,7 +181,7 @@ func unwrap<T: ArrowPrimitive>(_ a: AnyMetalArray, _: T.Type) -> MetalArray<T>? 
     case .uint64(let x): return x as? MetalArray<T>
     case .float32(let x): return x as? MetalArray<T>
     case .float64(let x): return x as? MetalArray<T>
-    case .boolean, .string: return nil
+    case .boolean, .string, .temporal, .binary, .dictionary: return nil
     }
 }
 private func cmpOp(_ op: Int32) throws -> CompareOp {
@@ -342,7 +344,8 @@ private func countErased<K: ArrowIndex>(_ gb: GroupBy<K>, _ v: AnyMetalArray) th
     case .uint64(let x): return try gb.count(x)
     case .float32(let x): return try gb.count(x)
     case .float64(let x): return try gb.count(x)
-    case .boolean, .string: throw ArrowMetalError.unsupportedType("count over non-numeric values")
+    case .boolean, .string, .temporal, .binary, .dictionary:
+        throw ArrowMetalError.unsupportedType("count over non-numeric values")
     }
 }
 

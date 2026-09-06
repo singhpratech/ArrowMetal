@@ -150,6 +150,10 @@ enough to build and use it. Running the test suite needs Xcode (for XCTest):
   IEEE-754 binary64 implementation on 64-bit integers that is correctly rounded (bit-exact against Swift's
   `Double` over millions of random and edge-case inputs, subnormals and NaN included).
 - NaN: `min`/`max` skip NaN and return null if only NaN remains; `sum` propagates NaN; comparisons follow IEEE.
+- Temporal types (`date32/64`, `time32/64`, `timestamp` with timezone, `duration`): the integer kernels
+  forwarded unchanged, plus GPU `year/month/day/dayOfWeek/hour/minute/second` in UTC, `toDate32`, `castUnit`.
+- `binary` / `large_binary` (utf8's layout, exported as `z`) and dictionary-encoded arrays (int32 codes plus a
+  value array; filter/take/slice run on the codes, `decode()` materialises with `take`).
 - C Data Interface import/export for primitive arrays and struct (`+s`) record batches, C Stream Interface
   import, C Device Data Interface import/export, `MTLBuffer` recovery from our own exports.
 - A CPU reference implementation of every kernel, used as the oracle in tests.

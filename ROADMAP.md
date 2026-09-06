@@ -19,7 +19,12 @@ Ordered roughly by impact divided by effort. Each item is a self-contained contr
 - [x] **Group-by** over dense keys (sum/count/min/max/mean). Open: hash group-by for arbitrary keys, 64-bit min/max.
 - [x] **Sort / argsort / top-k**: GPU LSD radix sort, stable, nulls last, total order for floats. Open: multi-column sort keys.
 - [x] **Strings** (`utf8`, `large_utf8` import): byte/char length, equals/starts/ends/contains, murmur3 hash, GPU filter/take, dictionary encode (CPU). Open: `utf8_view`, GPU dictionary encode, case folding, regex.
-- [ ] **Dictionary-encoded** arrays: compare and filter on codes without decoding.
+- [x] **Dictionary-encoded** arrays: imported as int32 codes plus a value array, filtered/taken/sliced on the
+      codes without decoding, `decode()` materialises with `take`, exported back as a dictionary array.
+      Open: compare against a scalar by translating it to a code.
+- [x] **Temporal and binary types**: date32/64, time32/64, timestamp (with timezone), duration, `binary`
+      and `large_binary`; GPU `year/month/day/dayOfWeek/hour/minute/second` (civil-from-days, UTC),
+      `toDate32`, `castUnit`. Open: local-time extraction with a timezone database, interval types.
 - [x] **Batched execution** (`batch { }`, lengths flow on the GPU). In progress: async / completion handlers.: return command buffers or Swift `async` results instead of blocking per kernel; fuse
       kernels into one command buffer; expose `MTLSharedEvent` through `sync_event` in the device interface.
 - [ ] **Metal 4** command-encoding path and residency sets for very large columns.

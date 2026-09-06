@@ -23,7 +23,7 @@ int  am_export_device(am_array* a, struct ArrowSchema* schema, struct ArrowDevic
 void am_release(am_array* a);
 int64_t     am_length(am_array* a);
 int64_t     am_null_count(am_array* a);
-const char* am_format(am_array* a);          // Arrow format string: c C s S i I l L f g b
+const char* am_format(am_array* a);          // Arrow format string: c C s S i I l L f g b u z t...
 
 // Reductions. out_kind: 0 = int64 in out_i64, 1 = uint64 in out_u64 (same slot), 2 = float64 in out_f64.
 // op: 0 sum, 1 min, 2 max, 3 mean. *is_null is set when there is no valid value.
@@ -54,6 +54,16 @@ int  am_str_unary(am_array* a, int kind, am_array** out);
 int  am_str_match(am_array* a, int pred, const uint8_t* pattern, int64_t len, am_array** out);
 int  am_str_equals_array(am_array* a, am_array* b, am_array** out);
 int  am_str_dictionary_encode(am_array* a, am_array** codes, am_array** unique);
+
+// Temporal (date32 "tdD", date64 "tdm", time32 "tts"/"ttm", time64 "ttu"/"ttn", timestamp "tss:"/"tsm:"/
+// "tsu:"/"tsn:" plus an optional timezone, duration "tDs"/"tDm"/"tDu"/"tDn"), binary ("z"/"Z") and
+// dictionary-encoded arrays (am_format reports the index format "i"; the values ride in schema.dictionary).
+// field: 0 year, 1 month, 2 day, 3 day of week (Monday = 0), 4 hour, 5 minute, 6 second. UTC, int32 out.
+int  am_temporal_extract(am_array* a, int field, am_array** out);
+// unit: 0 s, 1 ms, 2 us, 3 ns. Timestamps keep their timezone; narrowing truncates toward zero.
+int  am_temporal_cast_unit(am_array* a, int unit, am_array** out);
+// Materialises a dictionary-encoded array (take of the values by the codes).
+int  am_dictionary_decode(am_array* a, am_array** out);
 
 // Batching: between begin and end, every call on this thread appends to one GPU command buffer. The GPU runs
 // once at end (or at the first call that must read a result, such as am_reduce or am_export).
