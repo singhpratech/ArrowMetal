@@ -134,6 +134,9 @@ enough to build and use it. Running the test suite needs Xcode (for XCTest):
 
 ## What is implemented
 
+Function-by-function status against the Apache Arrow compute and type lists, including what runs on the CPU
+and what is not there at all: [docs/COVERAGE.md](docs/COVERAGE.md).
+
 - `MetalArrowBuffer`: page-aligned shared-memory buffers, zero-copy wrap of foreign page-aligned memory.
 - `MetalArray<T>` for Int8/16/32/64, UInt8/16/32/64, Float32, Float64; `MetalBooleanArray` with packed bits.
 - `MetalRecordBatch`: named equal-length columns with `filter`, `take`, `slice`, `selecting`.
