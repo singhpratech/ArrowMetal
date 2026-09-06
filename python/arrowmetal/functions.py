@@ -661,8 +661,8 @@ _ROWS = [
      "Same domain check and the same 1-ulp software binary64 evaluation as `ln_checked`.",
      _u("log2_checked"), ((_FLT_POS,), {})),
     ("log1p", "Logarithmic", GPU, "Kernels/MathExtra.swift", "log1p()",
-     "ln(1 + x), accurate for small x, through the software binary64 routine — full float64 precision, "
-     "unlike the plain `ln`. x == -1 gives -inf and x < -1 gives NaN.",
+     "ln(1 + x), accurate for small x, through the software binary64 routine — the cancellation `ln(1 + x)` "
+     "would suffer near zero is what this one exists to avoid. x == -1 gives -inf and x < -1 gives NaN.",
      _u("log1p"), ((_FLT_POS,), {})),
     ("log1p_checked", "Logarithmic", GPU, "Kernels/Checked.swift", "log1p_checked()",
      "As `log1p`, raising at the domain boundary: -1 gives `logarithm of zero` and anything below it "

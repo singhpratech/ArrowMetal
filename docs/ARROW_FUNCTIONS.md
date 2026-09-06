@@ -73,10 +73,10 @@ PYTHONPATH=python python -m pytest python/tests/test_functions.py -q
 | Section | GPU | CPU | Partial | Missing | Pending | Rows |
 |---|---:|---:|---:|---:|---:|---:|
 | Aggregations | 20 | 3 | 1 | 0 | 0 | 24 |
-| Arithmetic | 16 | 0 | 4 | 0 | 0 | 20 |
+| Arithmetic | 20 | 0 | 0 | 0 | 0 | 20 |
 | Bitwise | 8 | 0 | 0 | 0 | 0 | 8 |
 | Rounding | 6 | 0 | 0 | 0 | 0 | 6 |
-| Logarithmic | 4 | 0 | 6 | 0 | 0 | 10 |
+| Logarithmic | 10 | 0 | 0 | 0 | 0 | 10 |
 | Trigonometric | 20 | 0 | 0 | 0 | 0 | 20 |
 | Comparisons | 8 | 0 | 0 | 0 | 0 | 8 |
 | Logical | 8 | 0 | 0 | 0 | 0 | 8 |
@@ -104,9 +104,9 @@ PYTHONPATH=python python -m pytest python/tests/test_functions.py -q
 | Pairwise | 2 | 0 | 0 | 0 | 0 | 2 |
 | Cumulative | 7 | 0 | 0 | 0 | 0 | 7 |
 | GroupedAggregations | 23 | 0 | 1 | 0 | 0 | 24 |
-| Total | 231 | 20 | 55 | 1 | 0 | 307 |
+| Total | 241 | 20 | 45 | 1 | 0 | 307 |
 
-Totals: **231 gpu**, **20 cpu**, **55 partial**, **1 missing**, **0 pending** over 307 Arrow function names.
+Totals: **241 gpu**, **20 cpu**, **45 partial**, **1 missing**, **0 pending** over 307 Arrow function names.
 
 ## Every Arrow function name
 
@@ -139,20 +139,20 @@ Totals: **231 gpu**, **20 cpu**, **55 partial**, **1 missing**, **0 pending** ov
 | `abs` | Arithmetic | **GPU** | `abs()` | `Kernels/Rounding.swift` | One thread per element. |
 | `add` | Arithmetic | **GPU** | `a + b` | `Kernels/Arithmetic.swift` | Wrapping on integers, which is Arrow's unchecked `add`. |
 | `divide` | Arithmetic | **GPU** | `a / b` | `Kernels/Arithmetic.swift` | Integer division by zero is undefined here rather than an error; that is `divide_checked`'s job. |
-| `exp` | Arithmetic | **Partial** | `exp()` | `Kernels/Rounding.swift` | Evaluated in `float` even for a float64 column: Metal has no `double` transcendentals, so the answer is correct to about float32 precision (1e-7 relative) rather than to a float64 ulp. |
+| `exp` | Arithmetic | **GPU** | `exp()` | `Kernels/Rounding.swift` | Software binary64 on a float64 column (`Kernels/DoublePower.swift`): argument reduction against a 107-bit ln 2 pair, then the exp series. Measured **1 ulp** against Foundation over 10^6 inputs spanning -745.2 to 709.78, subnormal results and the overflow edge included. |
 | `multiply` | Arithmetic | **GPU** | `a * b` | `Kernels/Arithmetic.swift` | Wrapping on integers. |
 | `negate` | Arithmetic | **GPU** | `negate()` | `Kernels/Rounding.swift` | Wrapping on integers. |
-| `power` | Arithmetic | **Partial** | `power(other)` | `Kernels/Rounding.swift` | Element-wise `pow` on **float32 only**: a float64 column raises rather than losing precision silently (Metal has no `double` transcendental to call). Cast first. |
+| `power` | Arithmetic | **GPU** | `power(other)` | `Kernels/Rounding.swift` | Element-wise `pow`, scalar or column exponent. Integers use repeated squaring and wrap. float64 runs in software binary64 (`Kernels/DoublePower.swift`): log2 of the base as an unevaluated hi/lo pair against a split exponent, so the 61 bits the product needs survive. Measured **1 ulp** over 10^6 random pairs, and the C99 edge table (x^0, 0^y, 1^y, (-1)^int, inf/NaN) matches libm exactly. |
 | `sign` | Arithmetic | **GPU** | `sign()` | `Kernels/Rounding.swift` | -1 / 0 / 1. |
-| `sqrt` | Arithmetic | **Partial** | `sqrt()` | `Kernels/Rounding.swift` | A negative input gives NaN, as Arrow's unchecked `sqrt` does. Evaluated in `float` for float64 columns too, so the last digits differ from a float64 square root. |
+| `sqrt` | Arithmetic | **GPU** | `sqrt()` | `Kernels/Rounding.swift` | A negative input gives NaN, as Arrow's unchecked `sqrt` does. On float64 this is `DoubleMath.d_sqrt`, a digit-by-digit extraction in integers and therefore **correctly rounded** — bit-identical to Foundation over 10^6 random bit patterns, subnormals included. |
 | `subtract` | Arithmetic | **GPU** | `a - b` | `Kernels/Arithmetic.swift` | Wrapping on integers. |
 | `abs_checked` | Arithmetic | **GPU** | `abs_checked()` | `Kernels/Checked.swift` | The unchecked kernel plus a read-only check pass in the same command buffer, so a checked op costs one GPU round trip. Raises only for INT_MIN on a signed integer column. |
 | `add_checked` | Arithmetic | **GPU** | `add_checked(other)` | `Kernels/Checked.swift` | Wrapping is an error rather than a result: an `ArrowMetalError` naming the Arrow message and the first offending row. Float columns never raise, as in Arrow. |
 | `divide_checked` | Arithmetic | **GPU** | `divide_checked(other)` | `Kernels/Checked.swift` | Raises `divide by zero` for a zero divisor on any type, and `overflow` for INT_MIN / -1. |
 | `multiply_checked` | Arithmetic | **GPU** | `multiply_checked(other)` | `Kernels/Checked.swift` | As `add_checked`. |
 | `negate_checked` | Arithmetic | **GPU** | `negate_checked()` | `Kernels/Checked.swift` | Raises for INT_MIN on a signed column and — unlike pyarrow, which has no unsigned kernel at all — for every non-zero value on an unsigned one. |
-| `power_checked` | Arithmetic | **GPU** | `power_checked(other)` | `Kernels/Checked.swift` | Raises for a negative integer exponent and for any repeated-squaring step that would wrap. On a float column this is the float32-evaluated `power`, so the same 1e-7 relative applies. |
-| `sqrt_checked` | Arithmetic | **Partial** | `sqrt_checked()` | `Kernels/Checked.swift` | Raises `square root of negative number`; NaN, -0.0 and +inf do not raise. Bit-identical to the unchecked `sqrt`, and so evaluated in `float` for a float64 column too. |
+| `power_checked` | Arithmetic | **GPU** | `power_checked(other)` | `Kernels/Checked.swift` | Raises for a negative integer exponent and for any repeated-squaring step that would wrap. A float column never raises, as in Arrow, and is bit-identical to the unchecked `power` — so on float64 it is the same 1-ulp software binary64 answer. |
+| `sqrt_checked` | Arithmetic | **GPU** | `sqrt_checked()` | `Kernels/Checked.swift` | Raises `square root of negative number`; NaN, -0.0 and +inf do not raise. Bit-identical to the unchecked `sqrt`, and so correctly rounded on a float64 column too. |
 | `subtract_checked` | Arithmetic | **GPU** | `subtract_checked(other)` | `Kernels/Checked.swift` | As `add_checked`. |
 | `expm1` | Arithmetic | **GPU** | `expm1()` | `Kernels/MathExtra.swift` | exp(x) - 1, accurate for small x, through the software binary64 routine on a float64 column (within about 5 ulp of the host libm). Float columns only, as in Arrow. |
 | `hypot` | Arithmetic | **GPU** | `hypot(other)` | `Kernels/MathExtra.swift` | sqrt(x^2 + y^2), scaled so a large or tiny pair neither overflows nor underflows on the way. An infinite operand gives inf even opposite a NaN, as IEEE-754 prescribes. |
@@ -170,13 +170,13 @@ Totals: **231 gpu**, **20 cpu**, **55 partial**, **1 missing**, **0 pending** ov
 | `round` | Rounding | **GPU** | `round(ndigits, mode)` | `Kernels/MathExtra.swift` | All ten Arrow round modes and any `ndigits`, evaluated as round_int(x * 10^ndigits) / 10^ndigits. `round()` with no argument keeps its historical meaning (halves away from zero); passing either option selects Arrow's kernel, whose defaults are ndigits=0 and half_to_even. |
 | `round_binary` | Rounding | **GPU** | `round_binary(ndigits, mode)` | `Kernels/MathExtra.swift` | `round` with one `ndigits` per row, from an int32 column. Null wherever either column is. |
 | `round_to_multiple` | Rounding | **GPU** | `round_to_multiple(multiple, mode)` | `Kernels/MathExtra.swift` | round_int(x / multiple) * multiple, for any positive scalar multiple and any Arrow round mode. |
-| `ln` | Logarithmic | **Partial** | `ln()` | `Kernels/Rounding.swift` | Metal's `log`, evaluated in `float` even for a float64 column, so the answer is correct to about float32 precision (1e-7 relative) rather than to a float64 ulp. |
-| `log10` | Logarithmic | **Partial** | `log10()` | `Kernels/Rounding.swift` | Metal's `log10`, evaluated in `float` even for a float64 column, so the answer is correct to about float32 precision (1e-7 relative) rather than to a float64 ulp. |
-| `log2` | Logarithmic | **Partial** | `log2()` | `Kernels/Rounding.swift` | Metal's `log2`, evaluated in `float` even for a float64 column, so the answer is correct to about float32 precision (1e-7 relative) rather than to a float64 ulp. |
-| `ln_checked` | Logarithmic | **Partial** | `ln_checked()` | `Kernels/Checked.swift` | Raises `logarithm of zero` / `logarithm of negative number`. Bit-identical to the unchecked `ln`, so a float64 column is still evaluated in `float` (about 1e-7 relative). |
-| `log10_checked` | Logarithmic | **Partial** | `log10_checked()` | `Kernels/Checked.swift` | Same domain check and same float32 evaluation as `ln_checked`. |
-| `log2_checked` | Logarithmic | **Partial** | `log2_checked()` | `Kernels/Checked.swift` | Same domain check and same float32 evaluation as `ln_checked`. |
-| `log1p` | Logarithmic | **GPU** | `log1p()` | `Kernels/MathExtra.swift` | ln(1 + x), accurate for small x, through the software binary64 routine — full float64 precision, unlike the plain `ln`. x == -1 gives -inf and x < -1 gives NaN. |
+| `ln` | Logarithmic | **GPU** | `ln()` | `Kernels/Rounding.swift` | Metal's `log` on float32; on float64 the software binary64 of `Kernels/DoublePower.swift`, which carries log2(x) as an unevaluated hi/lo pair and scales it by a split ln 2 so the leading product is exact. Measured **1 ulp** against Foundation over 10^6 inputs from 5e-324 to 1e308, plus passes concentrated near 1 and over the subnormals. |
+| `log10` | Logarithmic | **GPU** | `log10()` | `Kernels/Rounding.swift` | Metal's `log10` on float32; on float64 the same software binary64 reduction as `ln`, scaled by a split log10 2 instead. Measured **1 ulp** over 10^6 inputs. |
+| `log2` | Logarithmic | **GPU** | `log2()` | `Kernels/Rounding.swift` | Metal's `log2` on float32; on float64 the software binary64 reduction rounded once, so an exact power of two comes back exactly. Measured **1 ulp** over 10^6 inputs. |
+| `ln_checked` | Logarithmic | **GPU** | `ln_checked()` | `Kernels/Checked.swift` | Raises `logarithm of zero` / `logarithm of negative number` — the boundary is exact, so +5e-324 passes and -5e-324 does not, and NaN and +inf never raise. Bit-identical to the unchecked `ln`, and so the same 1-ulp software binary64 answer on a float64 column. |
+| `log10_checked` | Logarithmic | **GPU** | `log10_checked()` | `Kernels/Checked.swift` | Same domain check and the same 1-ulp software binary64 evaluation as `ln_checked`. |
+| `log2_checked` | Logarithmic | **GPU** | `log2_checked()` | `Kernels/Checked.swift` | Same domain check and the same 1-ulp software binary64 evaluation as `ln_checked`. |
+| `log1p` | Logarithmic | **GPU** | `log1p()` | `Kernels/MathExtra.swift` | ln(1 + x), accurate for small x, through the software binary64 routine — the cancellation `ln(1 + x)` would suffer near zero is what this one exists to avoid. x == -1 gives -inf and x < -1 gives NaN. |
 | `log1p_checked` | Logarithmic | **GPU** | `log1p_checked()` | `Kernels/Checked.swift` | As `log1p`, raising at the domain boundary: -1 gives `logarithm of zero` and anything below it `logarithm of negative number`. |
 | `logb` | Logarithmic | **GPU** | `logb(base)` | `Kernels/MathExtra.swift` | ln(x) / ln(base) in software binary64, with a scalar base or a column of bases. |
 | `logb_checked` | Logarithmic | **GPU** | `logb_checked(base)` | `Kernels/Checked.swift` | As `logb`, raising when the value or the base is zero or negative. |

@@ -3,11 +3,11 @@ import Foundation
 /// Software IEEE-754 **binary64 transcendentals** for Metal, layered on the correctly rounded
 /// `d_add` / `d_sub` / `d_mul` / `d_div` of `DoubleMath`.
 ///
-/// Apple GPUs have no `double` at all, so the existing `float64` `sqrt`/`exp`/`ln`/`log2`/`log10`
-/// kernels convert to `float`, evaluate there and widen back — about seven correct significant digits
-/// (`RoundingSource` documents that). The new element-wise math (`expm1`, `log1p`, `logb`, `hypot` and
-/// the ten `RoundMode`s) does not settle for that: everything below is evaluated in binary64 through the
-/// software arithmetic, so the results carry the full 53-bit significand.
+/// Apple GPUs have no `double` at all. `float64` `sqrt`/`exp`/`ln`/`log2`/`log10` used to convert to
+/// `float`, evaluate there and widen back — about seven correct significant digits — and `expm1`,
+/// `log1p`, `logb`, `hypot` and the ten `RoundMode`s here were the first not to settle for that.
+/// `Kernels/DoublePower.swift` has since taken the same route for the five above and for `power`, so
+/// every float64 transcendental in the package now carries the full 53-bit significand.
 ///
 /// Everything is a raw `ulong` bit pattern, and every function is prefixed `dt_` so it can sit beside
 /// `DoubleMath`'s `d_*` (whose `d_exp` is the *exponent field*, not the exponential) in one translation

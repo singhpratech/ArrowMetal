@@ -1,5 +1,45 @@
 # Benchmark history
 
+## 2026-09-06, Apple M4 Max, round 8: what real binary64 costs
+
+50M Float64 rows, best of 5, release build, against numpy 2.5, pyarrow 25 and Polars 1.44 on the same
+data. Reproduce with `PYTHONPATH=python python Benchmarks/float64_math_bench.py`.
+
+`sqrt`, `exp`, `ln`, `log2` and `log10` used to narrow a float64 column to `float`, call Metal's own
+library and widen the answer back — seven correct significant decimal digits out of sixteen — and `power`
+was not implemented for float64 at all. They now run in software binary64 from end to end: `sqrt`
+correctly rounded, the rest within 1 ulp. Here is the bill.
+
+| op | before (float detour) | after (binary64) | GB/s after | fastest CPU | ratio |
+|---|---:|---:|---:|---:|---:|
+| `sqrt` | 3.2 ms | 12.7 ms | 63.1 | 12.7 (numpy) | 1.00x |
+| `exp` | 5.2 ms | 59.4 ms | 13.5 | 76.7 (numpy) | 1.29x |
+| `ln` | 3.2 ms | 82.3 ms | 9.7 | 92.9 (numpy) | 1.13x |
+| `log2` | 4.5 ms | 76.5 ms | 10.5 | 92.7 (numpy) | 1.21x |
+| `log10` | 3.1 ms | 81.9 ms | 9.8 | 105.4 (numpy) | 1.29x |
+| `power(x, 2.5)` | *not implemented* | 120.9 ms | 6.6 | 242.7 (pyarrow) | 2.01x |
+| `power(x, y)` | *not implemented* | 123.8 ms | 9.7 | 238.8 (numpy) | 1.93x |
+
+Read that honestly: the old kernels were memory bound at 250 GB/s because they were doing float32 work on
+float64 data. The new ones are compute bound on forty-odd software binary64 operations per element, and a
+logarithm costs 25x more than it used to. It still beats every CPU library on the same machine, but by
+1.1-2x rather than by the 25x the old `ln` would have shown — and the old `ln`'s answer was wrong in the
+ninth digit. The float32 kernels are untouched and still run at 200-240 GB/s (`ln` on float32: 1.7 ms,
+45x the fastest CPU), so a column that does not need sixteen digits should not be float64.
+
+Two arithmetic ops moved the other way in the same round, from reworking `DoubleMath` itself — `clz`
+normalisation instead of shift loops, four 32x32 partial products instead of an emulated 64x64, and a
+Newton reciprocal with an exact remainder correction instead of a 57-step restoring long division:
+
+| op | before | after | GB/s before | GB/s after | ratio vs fastest CPU |
+|---|---:|---:|---:|---:|---:|
+| `divide` (float64) | 9.6 ms | **3.2 ms** | 125.3 | 377.7 | 1.12x -> **3.26x** |
+| `multiply` (float64) | 4.6 ms | **3.1 ms** | 260.9 | 388.5 | 2.32x -> **3.37x** |
+| `add` (float64) | 3.1 ms | 3.1 ms | 390.1 | 388.9 | 3.53x |
+
+All three now sit at this machine's memory ceiling: the software divide has stopped being visible. Both
+rewrites stay correctly rounded — `DoubleMathTests` compares them with Swift's `Double` bit for bit.
+
 ## 2026-09-06, Apple M4 Max, round 7: sort and strings
 50M Int64/Float64 rows and 10M utf8 values (1000 distinct keys, `cust_NNN_region`, 130 MB of bytes),
 best of 5, release build. CPU time is process user+system time consumed by the call (all threads).

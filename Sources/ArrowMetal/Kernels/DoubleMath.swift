@@ -148,6 +148,13 @@ enum DoubleMath {
     // correctly rounded one and not an approximation with a good reputation. The correction never took
     // more than a single step over 200k random significand pairs, and `DoubleMathTests` compares the
     // result against Swift's `Double` bit for bit.
+    //
+    // Three Newton steps, not the two the `mathMode = .safe` reciprocal needs. Under safe math the seed
+    // is good to about 2^-22 and two steps already saturate the 63 bits `V` holds; the third costs
+    // around 25 instructions in a kernel that is memory bound anyway, and it keeps the seed requirement
+    // down at 2^-12 — so the quotient stays within the one correction step this code allows for even if
+    // the compile options ever move to fast math. A numerical kernel that quietly stops being correctly
+    // rounded when a build flag changes is not worth the instructions saved.
     inline ulong d_div(ulong a, ulong b) {
         ulong s = (a ^ b) >> 63;
         int ea = (int)d_exp(a), eb = (int)d_exp(b);
@@ -164,7 +171,7 @@ enum DoubleMath {
         ulong D = mb << 11;                             // [2^63, 2^64)
         float rf = 1.0f / (float)((uint)(D >> 32));
         ulong V = ((ulong)(uint)(rf * 18014398509481984.0f)) << 40;   // rf * 2^54, about 23 good bits
-        for (int i = 0; i < 2; i++) {                   // 23 -> 45 -> past the 62 bits V can hold
+        for (int i = 0; i < 3; i++) {                   // 23 -> 45 -> past the 62 bits V can hold
             long e = (long)(1ul << 62) - (long)d_mulhi(D, V);
             V = (e >= 0) ? (V + 4ul * d_mulhi(V, (ulong)e)) : (V - 4ul * d_mulhi(V, (ulong)(-e)));
         }
