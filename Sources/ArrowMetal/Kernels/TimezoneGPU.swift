@@ -93,7 +93,7 @@ final class TimeZoneTable: @unchecked Sendable {
     /// Keyed by zone name and device: a table is a handful of kilobytes, so caching the *failure* too
     /// keeps a pathological zone from being re-enumerated on every call.
     static func table(for name: String, context: MetalContext) -> TimeZoneTable? {
-        let key = "\(name)#\(UInt(bitPattern: ObjectIdentifier(context).hashValue))"
+        let key = "\(name)#\(UInt(bitPattern: ObjectIdentifier(context)))"
         lock.lock()
         if let hit = cache[key] { lock.unlock(); return hit }
         lock.unlock()

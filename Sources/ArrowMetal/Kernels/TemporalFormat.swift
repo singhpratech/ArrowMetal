@@ -209,6 +209,9 @@ extension MetalTemporalArray {
     /// what makes `%z` and `%Z` meaningful; a naive column, a `date` and a `time` are UTC. `%S` stays
     /// two digits and `%f` is the six-digit fraction, which is this package's documented C-`strftime`
     /// reading and differs from pyarrow's (pyarrow folds the fraction into `%S` and leaves `%f` alone).
+    ///
+    /// The transition table covers 1800 to 2200; a value outside that window takes the offset of the
+    /// outermost interval, which is the zone's own LMT before 1800 and its projected rule after 2200.
     func strftimeGPU(_ format: String) throws -> MetalStringArray? {
         guard let (mode, divisor) = type.extraction, !context.isVirtualDevice,
               let compiled = TemporalFormat.compileFormat(format) else { return nil }
@@ -257,6 +260,11 @@ extension MetalTemporalArray {
         let outOffsets = try MetalArray<Int32>(length: n, nullCount: 0, validity: nil, values: lens,
                                                context: ctx).exclusiveScanToOffsets()
         let total = Int(withExtendedLifetime(outOffsets) { outOffsets.typed(Int32.self)[n] })
+        guard total >= 0 else {
+            // Arrow's `utf8` offsets are int32, so the whole result must fit 2 GB. The scan wrapped.
+            throw ArrowMetalError.invalidArrowArray(
+                "strftime(\"\(format)\") over \(n) rows exceeds the 2 GB an Arrow utf8 array can address")
+        }
         let outData = try MetalArrowBuffer.allocate(byteCount: Swift.max(total, 1), zeroed: false, context: ctx)
         if n > 0 {
             let pso = try ctx.pipeline(source: TemporalFormatSource.source, function: "fmt_write",
