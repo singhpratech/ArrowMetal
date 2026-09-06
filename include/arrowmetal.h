@@ -124,6 +124,27 @@ int  am_str_concat(am_array* a, am_array* b, const uint8_t* separator, int64_t s
 int  am_batch_begin(void);
 int  am_batch_end(void);
 
+// Structural and conditional transforms, set lookup, and three-valued (Kleene) logic.
+// am_is_null / am_is_valid / am_fill_null / am_drop_null accept primitive and boolean arrays;
+// everything else is primitive only except am_if_else, which also takes two boolean branches.
+int  am_is_null(am_array* a, am_array** out);      // boolean array, true where a is null; never null itself
+int  am_is_valid(am_array* a, am_array** out);     // complement of am_is_null
+// scalar points at one value of a's element type; for a boolean array it points at one byte (non-zero = true).
+int  am_fill_null(am_array* a, const void* scalar, am_array** out);
+int  am_drop_null(am_array* a, am_array** out);    // the non-null elements, in order
+// cond ? left : right. cond is boolean; left and right share a type and cond's length. Null cond -> null out.
+int  am_if_else(am_array* cond, am_array* left, am_array* right, am_array** out);
+// First non-null across `count` arrays of one type and length.
+int  am_coalesce(am_array** arrays, int64_t count, am_array** out);
+// Set lookup against the non-null values of set_array. Nulls in the set are ignored and a null element
+// never matches, so am_is_in never returns nulls; am_index_in returns int32 indices into set_array
+// (first occurrence) and null where the element is null or absent.
+int  am_is_in(am_array* a, am_array* set_array, am_array** out);
+int  am_index_in(am_array* a, am_array* set_array, am_array** out);
+// Three-valued logic over boolean arrays: false AND null = false, true OR null = true.
+int  am_and_kleene(am_array* a, am_array* b, am_array** out);
+int  am_or_kleene(am_array* a, am_array* b, am_array** out);
+
 #ifdef __cplusplus
 }
 #endif

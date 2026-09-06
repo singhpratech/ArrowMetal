@@ -393,6 +393,70 @@ class MetalArray:
     def group_by(self, key_count):
         return GroupBy(self, key_count)
 
+    # ---- structural, conditional and set lookup (GPU)
+    def _same_type_array(self, values):
+        """Anything array-like becomes a MetalArray of this array's element type."""
+        if isinstance(values, MetalArray):
+            return values
+        return MetalArray.from_arrow(pa.array(list(values), type=self.type))
+
+    def _branch(self, v, hint=None):
+        """An if_else branch: an array as given, or a scalar broadcast to this array's length.
+        `hint` is the Arrow type the other branch already fixed, so the two agree."""
+        if isinstance(v, MetalArray):
+            return v
+        if isinstance(v, (pa.Array, pa.ChunkedArray)) or hasattr(v, "__arrow_c_array__"):
+            return MetalArray.from_arrow(v)
+        if isinstance(v, (list, tuple)):
+            return MetalArray.from_arrow(pa.array(list(v), type=hint))
+        return MetalArray.from_arrow(pa.array([v] * len(self), type=hint))
+
+    def is_null(self):
+        """Arrow `is_null`: boolean array, true where this element is null. Never null itself."""
+        return _call(_lib.am_is_null, self._h)
+
+    def is_valid(self):
+        """Arrow `is_valid`: the complement of `is_null`."""
+        return _call(_lib.am_is_valid, self._h)
+
+    def fill_null(self, v):
+        """Arrow `fill_null`: nulls become `v`; the result has no nulls."""
+        if self.format == "b":
+            return _call(_lib.am_fill_null, self._h, ctypes.create_string_buffer(bytes([1 if v else 0]), 8))
+        return _call(_lib.am_fill_null, self._h, self._scalar(v))
+
+    def drop_null(self):
+        """Arrow `drop_null`: the non-null elements, in order."""
+        return _call(_lib.am_drop_null, self._h)
+
+    def if_else(self, left, right):
+        """Arrow `if_else` with this boolean array as the condition: `self ? left : right`.
+        Either branch may be an array or a scalar; a null condition yields a null element."""
+        hint = next((v.type for v in (left, right) if isinstance(v, MetalArray)), None)
+        l = self._branch(left, hint)                     # keep both alive across the call
+        r = self._branch(right, l.type)
+        return _call(_lib.am_if_else, self._h, l._h, r._h)
+
+    def is_in(self, values):
+        """Arrow `is_in`: boolean array, true where the element is among the non-null `values`.
+        Nulls in `values` are ignored and a null element never matches, so the result has no nulls."""
+        s = self._same_type_array(values)                # keep it alive across the call
+        return _call(_lib.am_is_in, self._h, s._h)
+
+    def index_in(self, values):
+        """Arrow `index_in`: int32 index into `values` of each element's first occurrence there,
+        null where the element is null or absent."""
+        s = self._same_type_array(values)                # keep it alive across the call
+        return _call(_lib.am_index_in, self._h, s._h)
+
+    def and_kleene(self, o):
+        """Arrow `and_kleene`: three-valued AND (`false AND null` is `false`)."""
+        return _call(_lib.am_and_kleene, self._h, o._h)
+
+    def or_kleene(self, o):
+        """Arrow `or_kleene`: three-valued OR (`true OR null` is `true`)."""
+        return _call(_lib.am_or_kleene, self._h, o._h)
+
 
 class GroupBy:
     def __init__(self, keys, key_count):
@@ -448,3 +512,24 @@ _ArrowArray._fields_ = [("length", ctypes.c_int64), ("null_count", ctypes.c_int6
 def array(obj):
     """Shorthand for MetalArray.from_arrow."""
     return MetalArray.from_arrow(obj)
+
+
+# ---- structural, conditional and set-lookup entry points
+for _name, _extra in [("am_is_null", []), ("am_is_valid", []), ("am_fill_null", [_P]), ("am_drop_null", []),
+                      ("am_if_else", [_P, _P]), ("am_is_in", [_P]), ("am_index_in", [_P]),
+                      ("am_and_kleene", [_P]), ("am_or_kleene", [_P])]:
+    getattr(_lib, _name).argtypes = [_P] + _extra + [ctypes.POINTER(_P)]
+    getattr(_lib, _name).restype = ctypes.c_int
+_lib.am_coalesce.argtypes = [ctypes.POINTER(_P), ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_coalesce.restype = ctypes.c_int
+
+
+def coalesce(*arrays):
+    """Arrow `coalesce`: the first non-null value across the arrays, element-wise. All of them must
+    have the same type and length; an element is null only when it is null in every input."""
+    if not arrays:
+        raise ArrowMetalError("coalesce needs at least one array")
+    handles = (_P * len(arrays))(*[a._h for a in arrays])
+    out = _P()
+    _check(_lib.am_coalesce(handles, len(arrays), ctypes.byref(out)))
+    return MetalArray(out)
