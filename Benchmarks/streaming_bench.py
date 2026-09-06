@@ -15,11 +15,16 @@ and an out-of-memory kill costs one cell of the matrix instead of the run. A cel
 out or is killed is reported with the reason.
 
 Correctness is cross-checked: ArrowMetal's answer for filter_sum, groupby_1k, topk and sort_limit is
-compared against the reference engine (Polars, or pyarrow when Polars is unavailable) with a 1e-9
+compared against a CPU reference (Polars, falling back to DuckDB or pyarrow) with a 1e-9
 relative tolerance on float sums, and the approximate distinct count is reported against the true
 cardinality, which the generator knows exactly.
 
 Output is a Markdown table per workload on stdout, plus --json for the raw numbers.
+
+One format caveat: the dataset is written with IPC *stream* framing by default, which has no footer,
+and Polars' scan_ipc and pyarrow.dataset both refuse it. Pass --ipc-format file to write footered IPC
+files instead when those engines are part of the comparison; every reader here detects the framing
+from the magic bytes, so ArrowMetal and the manual pyarrow path read either one.
 """
 import argparse
 import glob
@@ -105,10 +110,13 @@ def manifest_path(data_dir):
 
 def open_ipc(path):
     """A reader for one part file. The format is taken from the magic bytes rather than assumed, so
-    a dataset written with --ipc-format file still reads back here."""
+    a dataset written with --ipc-format file still reads back here.
+
+    OSFile rather than memory_map on purpose: mapped pages count towards ru_maxrss, which would make
+    every engine that mmaps its input look like it held the whole dataset in memory."""
     with open(path, "rb") as fh:
         magic = fh.read(6)
-    src = pa.memory_map(path, "rb")
+    src = pa.OSFile(path, "rb")
     return pa.ipc.open_file(src) if magic == b"ARROW1" else pa.ipc.open_stream(src)
 
 
@@ -164,13 +172,17 @@ def generate(args, data_dir):
     """Write the dataset as part-NNNN.arrows, one file per ~1 GB. Returns the manifest."""
     capped, wanted, free = target_bytes(args, data_dir)
     batch_bytes = args.batch_rows * BYTES_PER_ROW
-    batches_per_file = max(1, int(round(1e9 / batch_bytes)))
+    # ~1 GB per file, except when the whole dataset is smaller than that (a smoke run).
+    batches_per_file = max(1, min(int(round(1e9 / batch_bytes)), int(round(capped / batch_bytes))))
     file_rows = batches_per_file * args.batch_rows
     n_files = max(1, int(round(capped / (file_rows * BYTES_PER_ROW))))
     total_rows = n_files * file_rows
     print(f"dataset: requested {wanted / 1e9:.1f} GB, free {free / 1e9:.1f} GB, "
           f"budget {args.disk_budget_gb:.1f} GB -> generating {total_rows * BYTES_PER_ROW / 1e9:.1f} GB "
           f"({total_rows:,} rows, {n_files} files x {batches_per_file} batches x {args.batch_rows:,})")
+    if args.ipc_format == "stream":
+        print("note: IPC stream framing has no footer, so Polars' scan_ipc and pyarrow.dataset "
+              "cannot open it; re-run with --ipc-format file to measure those engines.")
 
     schema = pa.schema([("id", pa.int64()), ("region", pa.int32()), ("bigkey", pa.int64()),
                         ("label", pa.string()), ("amount", pa.float64()), ("qty", pa.int32()),
@@ -422,20 +434,22 @@ def polars_lazy(ctx):
     import polars as pl
     pattern = os.path.join(ctx.data_dir, "part-*.arrows")
     try:
-        lf = pl.scan_ipc(pattern)
+        # memory_map=False so mapped pages do not land in this process's peak RSS.
+        lf = pl.scan_ipc(pattern, memory_map=False)
         lf.collect_schema()                    # forces the scan to open a file, so a format
         return lf                              # mismatch surfaces here rather than mid-query
     except Exception as exc:
-        first = f"{type(exc).__name__}: {exc}".replace("\n", " ")[:160]
+        first = f"{type(exc).__name__}: {exc}".replace("\n", " ")[:120]
     try:
         import pyarrow.dataset as pads
         lf = pl.scan_pyarrow_dataset(pads.dataset(ctx.files, format="ipc"))
         lf.collect_schema()
         return lf
     except Exception as exc:
-        second = f"{type(exc).__name__}: {exc}".replace("\n", " ")[:160]
+        second = f"{type(exc).__name__}: {exc}".replace("\n", " ")[:120]
     raise RuntimeError(f"polars cannot scan this dataset: scan_ipc -> {first}; "
-                       f"scan_pyarrow_dataset -> {second}")
+                       f"scan_pyarrow_dataset -> {second}; both want IPC file framing, so "
+                       "regenerate with --ipc-format file")
 
 
 def pl_collect(lf):
@@ -537,7 +551,11 @@ def duck_query(ctx, sql, register_dim=False):
     con, source = duck_relation(ctx)
     if register_dim:
         con.register("dim", dim_table())
-    return con.sql(sql).arrow(), {"source": source}
+    out = con.sql(sql).arrow()
+    # DuckDB's .arrow() returns a Table on older builds and a RecordBatchReader on newer ones.
+    if isinstance(out, pa.RecordBatchReader):
+        out = out.read_all()
+    return out, {"source": source}
 
 
 def dk_filter_sum(ctx):
@@ -847,8 +865,8 @@ def report(records, ctx_bytes, rows, engines, workloads, checks):
         read_s = s.get("read_s")
         read_gbs = (s.get("bytes_read", 0) / read_s / 1e9) if read_s else None
         print(f"| {workload} | {fmt(s.get('overlap'), '.2f')} | {s.get('batches', '-')} | "
-              f"{s.get('rows', '-')} | {fmt(s.get('read_s'), '.1f')} | {fmt(s.get('gpu_s'), '.1f')} | "
-              f"{fmt(s.get('merge_s'), '.1f')} | {fmt(read_gbs, '.2f')} |")
+              f"{s.get('rows', '-')} | {fmt(s.get('read_s'), '.2f')} | {fmt(s.get('gpu_s'), '.2f')} | "
+              f"{fmt(s.get('merge_s'), '.2f')} | {fmt(read_gbs, '.2f')} |")
     print()
 
 
@@ -856,14 +874,18 @@ def cross_check(records, rows, workloads, engines):
     """Compare ArrowMetal against the reference engine on the checked workloads. Returns the per-cell
     labels for the report."""
     checks = {}
-    reference = "polars" if "polars" in engines else "pyarrow"
+    # Polars is the preferred reference; per workload it falls back to whichever other CPU engine
+    # produced an answer, so one engine failing does not cost every cross-check.
+    candidates = [e for e in ("polars", "duckdb", "pyarrow") if e in engines]
     for workload in workloads:
         if workload not in CHECKED:
             continue
-        ref = records.get((workload, reference))
+        reference = next((e for e in candidates
+                          if (records.get((workload, e)) or {}).get("status") == "ok"), None)
+        ref = records.get((workload, reference)) if reference else None
         cand = records.get((workload, "arrowmetal"))
-        if ref is None or ref["status"] != "ok":
-            checks[(workload, "arrowmetal")] = f"no {reference} reference"
+        if ref is None:
+            checks[(workload, "arrowmetal")] = "no CPU reference"
             continue
         checks[(workload, reference)] = "reference"
         if cand is None or cand["status"] != "ok":

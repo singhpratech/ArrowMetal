@@ -291,3 +291,100 @@ private func concatValidity(_ parts: [(MetalArrowBuffer?, Int)], total: Int,
     }
     return (bm, nulls)
 }
+
+// MARK: - A POD view of a small result column, for the hot merge loops
+
+/// One column of a per-batch result, read out to the host in its own storage type.
+///
+/// `streamValues()` is convenient but hands back `[StreamValue]`, an enum with `String` and `[UInt8]`
+/// payloads: every element copy is ARC traffic. The streaming group-by's merge touches one element
+/// per group per aggregate per batch — hundreds of millions of times on a ten-million-key run — so it
+/// reads columns as *this* instead, switches on the case once per column, and then runs a tight loop
+/// over plain `[Int64]` / `[Double]` storage that the optimiser can keep in registers.
+public enum StreamColumn {
+    case ints([Int64], valid: [Bool]?)
+    case uints([UInt64], valid: [Bool]?)
+    case doubles([Double], valid: [Bool]?)
+    case other([StreamValue])
+    case empty
+
+    public var count: Int {
+        switch self {
+        case .ints(let v, _): return v.count
+        case .uints(let v, _): return v.count
+        case .doubles(let v, _): return v.count
+        case .other(let v): return v.count
+        case .empty: return 0
+        }
+    }
+
+    @inline(__always) public func isValid(_ i: Int) -> Bool {
+        switch self {
+        case .ints(_, let v), .uints(_, let v), .doubles(_, let v):
+            return v.map { i < $0.count && $0[i] } ?? true
+        case .other(let v): return i < v.count && !v[i].isNull
+        case .empty: return false
+        }
+    }
+
+    /// The element as a `StreamValue` (used by the slow path and by the result builder).
+    public func value(_ i: Int) -> StreamValue {
+        guard isValid(i) else { return .null }
+        switch self {
+        case .ints(let v, _): return .int(v[i])
+        case .uints(let v, _): return .uint(v[i])
+        case .doubles(let v, _): return .double(v[i])
+        case .other(let v): return v[i]
+        case .empty: return .null
+        }
+    }
+
+    /// The int64 storage when this column has it, for the merge's fast path.
+    public var asInts: [Int64]? { if case .ints(let v, _) = self { return v } else { return nil } }
+}
+
+extension AnyMetalArray {
+    /// Reads this column out to host storage without going through `StreamValue` where it can.
+    public func streamColumn() throws -> StreamColumn {
+        func validity(_ n: Int, _ bitmap: MetalArrowBuffer?, _ nulls: Int) -> [Bool]? {
+            guard nulls > 0, let b = bitmap else { return nil }
+            let p = b.typed(UInt8.self)
+            return (0..<n).map { Bitmap.isSet(p, $0) }
+        }
+        func ints<T: ArrowPrimitive & BinaryInteger>(_ a: MetalArray<T>) -> StreamColumn {
+            let n = a.length
+            let p = a.valuePointer
+            return .ints((0..<n).map { Int64($0 < n ? Int64(p[$0]) : 0) }, valid: validity(n, a.validity, a.nullCount))
+        }
+        switch self {
+        case .int8(let a): return ints(a)
+        case .int16(let a): return ints(a)
+        case .int32(let a): return ints(a)
+        case .int64(let a): return ints(a)
+        case .uint8(let a): return ints(a)
+        case .uint16(let a): return ints(a)
+        case .uint32(let a): return ints(a)
+        case .uint64(let a):
+            let n = a.length, p = a.valuePointer
+            return .uints((0..<n).map { p[$0] }, valid: validity(n, a.validity, a.nullCount))
+        case .float32(let a):
+            let n = a.length, p = a.valuePointer
+            return .doubles((0..<n).map { Double(p[$0]) }, valid: validity(n, a.validity, a.nullCount))
+        case .float64(let a):
+            let n = a.length, p = a.valuePointer
+            return .doubles((0..<n).map { p[$0] }, valid: validity(n, a.validity, a.nullCount))
+        case .temporal(let t):
+            let n = t.length
+            switch t.storage {
+            case .int32(let a):
+                let p = a.valuePointer
+                return .ints((0..<n).map { Int64(p[$0]) }, valid: validity(n, a.validity, a.nullCount))
+            case .int64(let a):
+                let p = a.valuePointer
+                return .ints((0..<n).map { p[$0] }, valid: validity(n, a.validity, a.nullCount))
+            }
+        default:
+            return .other(try streamValues())
+        }
+    }
+}

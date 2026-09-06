@@ -443,8 +443,12 @@ public final class StreamAggregateOperator: StreamOperator {
 // MARK: - Streaming group-by
 
 /// A group's key, as host values. `Hashable` so the global table is a plain dictionary.
-struct StreamGroupKey: Hashable {
-    let values: [StreamValue]
+enum StreamGroupKey: Hashable {
+    /// The overwhelmingly common shape. Kept out of an array so a lookup allocates nothing: the
+    /// 10-million-key merge probes this dictionary once per group per batch, hundreds of millions of
+    /// times, and an `[StreamValue]` box per probe dominated everything else.
+    case single(StreamValue)
+    case multi([StreamValue])
 }
 
 /// A running accumulator for one aggregate of one group.
@@ -485,8 +489,17 @@ public final class StreamGroupByOperator: StreamOperator {
     public var gpuStateBudgetBytes = 512 << 20
     public var ddof = 0
 
-    /// Host table (arbitrary keys, or a dense state that spilled).
-    private var table: [StreamGroupKey: [StreamAccumulator]] = [:]
+    /// Host table (arbitrary keys, or a dense state that spilled), as a struct of arrays:
+    /// `slot` maps a key to a group index, `groupKeyCols` holds the key values column-wise, and
+    /// `accs` is a flat `groups * aggregates.count` array of accumulators mutated in place. The
+    /// obvious `[Key: [Accumulator]]` allocated one array per group *per batch*; this allocates none.
+    private var slot: [StreamGroupKey: Int] = [:]
+    /// The specialised table for a single integer key (the common shape, and the big one).
+    private var intSlot: [Int64: Int] = [:]
+    private var nullKeyGroup: Int?
+    private var groupKeyCols: [[StreamValue]] = []
+    private var accs: [StreamAccumulator] = []
+    private var groupCount: Int { groupKeyCols.first?.count ?? 0 }
     private var keyTemplates: [AnyMetalArray]?
     /// GPU-resident dense state, one array per aggregate.
     private var denseSum: [AnyMetalArray?] = []
@@ -543,14 +556,14 @@ public final class StreamGroupByOperator: StreamOperator {
         for a in aggregates { aggCols.append(try hostPartial(a, gk, work)) }
         // Every kernel above is recorded into the open batch; run it before any value is read back.
         try context.syncPoint()
-        let keyValues = try keyCandidates.map { try $0.streamValues() }
-        var aggValues: [[StreamValue]] = []
-        var aggCounts: [[StreamValue]] = []
-        var aggSquares: [[StreamValue]] = []
+        let keyValues = try keyCandidates.map { try $0.streamColumn() }
+        var aggValues: [StreamColumn] = []
+        var aggCounts: [StreamColumn] = []
+        var aggSquares: [StreamColumn] = []
         for (v, c, sq) in aggCols {
-            aggValues.append(v == nil ? [] : try v!.streamValues())
-            aggCounts.append(c == nil ? [] : try c!.streamValues())
-            aggSquares.append(sq == nil ? [] : try sq!.streamValues())
+            aggValues.append(v == nil ? .empty : try v!.streamColumn())
+            aggCounts.append(c == nil ? .empty : try c!.streamColumn())
+            aggSquares.append(sq == nil ? .empty : try sq!.streamColumn())
         }
         return HostPartial(groupCount: gk.groupCount, keys: keyValues, values: aggValues,
                            counts: aggCounts, squares: aggSquares)
@@ -576,10 +589,10 @@ public final class StreamGroupByOperator: StreamOperator {
     }
     struct HostPartial {
         let groupCount: Int
-        let keys: [[StreamValue]]
-        let values: [[StreamValue]]
-        let counts: [[StreamValue]]
-        let squares: [[StreamValue]]
+        let keys: [StreamColumn]
+        let values: [StreamColumn]
+        let counts: [StreamColumn]
+        let squares: [StreamColumn]
     }
 
     /// One batch's dense-key aggregate arrays, still on the GPU.
@@ -671,33 +684,125 @@ public final class StreamGroupByOperator: StreamOperator {
         if bytes > gpuStateBudgetBytes && !spilled { try spillDenseToHost() }
     }
 
+    /// Index of `key`, inserting a new group (with the key values in `row`) when it is new.
+    private func groupIndex(_ key: StreamGroupKey, _ row: [StreamValue]) -> Int {
+        if let i = slot[key] { return i }
+        if groupKeyCols.isEmpty { groupKeyCols = Array(repeating: [], count: Swift.max(row.count, 1)) }
+        let i = groupCount
+        slot[key] = i
+        for j in 0..<groupKeyCols.count { groupKeyCols[j].append(j < row.count ? row[j] : .null) }
+        accs.append(contentsOf: repeatElement(StreamAccumulator(), count: aggregates.count))
+        return i
+    }
+
     private func mergeHost(_ h: HostPartial) throws {
-        for g in 0..<h.groupCount {
-            let key = StreamGroupKey(values: h.keys.map { $0.count > g ? $0[g] : .null })
-            var accs = table[key] ?? Array(repeating: StreamAccumulator(), count: aggregates.count)
-            for (i, a) in aggregates.enumerated() {
-                var acc = accs[i]
-                switch a.op {
-                case .count:
-                    if h.counts[i].count > g, case .int(let n) = h.counts[i][g] { acc.count += n }
-                case .sum, .mean:
-                    if h.counts[i].count > g, case .int(let n) = h.counts[i][g] { acc.count += n }
-                    if h.values[i].count > g { addInto(&acc, h.values[i][g]) }
-                case .min:
-                    if h.values[i].count > g { acc.minV = minStreamValue(acc.minV, h.values[i][g]) }
-                case .max:
-                    if h.values[i].count > g { acc.maxV = maxStreamValue(acc.maxV, h.values[i][g]) }
-                case .variance, .stddev:
-                    if h.counts[i].count > g, case .int(let n) = h.counts[i][g] { acc.count += n }
-                    if h.values[i].count > g, let v = h.values[i][g].asDouble { acc.sumDouble += v; acc.kind = 3 }
-                    if h.squares[i].count > g, let v = h.squares[i][g].asDouble { acc.sumSq += v }
-                case .countDistinctApprox:
-                    break
-                }
-                accs[i] = acc
+        let m = aggregates.count
+        let nKeys = keyColumns.count
+        if groupKeyCols.isEmpty { groupKeyCols = Array(repeating: [], count: Swift.max(nKeys, 1)) }
+
+        // Locate every group first, in one pass, so the accumulate loops below are index arithmetic
+        // on plain storage. A single integer key gets its own `[Int64: Int]` table: that is the
+        // shape of a ten-million-key group-by, and it keeps `StreamValue` out of the hot path.
+        var base = [Int](repeating: 0, count: h.groupCount)
+        if nKeys == 1, case .ints(let ks, let kv) = h.keys[0] {
+            for g in 0..<h.groupCount {
+                let null = kv.map { !$0[g] } ?? false
+                base[g] = (null ? groupIndexNullKey() : groupIndexInt(ks[g])) * m
             }
-            table[key] = accs
+        } else {
+            var row = [StreamValue](repeating: .null, count: nKeys)
+            for g in 0..<h.groupCount {
+                for j in 0..<nKeys { row[j] = h.keys[j].value(g) }
+                let key: StreamGroupKey = nKeys == 1 ? .single(row[0]) : .multi(row)
+                base[g] = groupIndex(key, row) * m
+            }
         }
+
+        for (i, a) in aggregates.enumerated() {
+            let counts = h.counts[i], values = h.values[i], squares = h.squares[i]
+            switch a.op {
+            case .count:
+                if let c = counts.asInts {
+                    for g in 0..<h.groupCount where g < c.count { accs[base[g] + i].count += c[g] }
+                }
+            case .sum, .mean:
+                if let c = counts.asInts {
+                    for g in 0..<h.groupCount where g < c.count { accs[base[g] + i].count += c[g] }
+                }
+                accumulate(values, into: i, base: base, groups: h.groupCount)
+            case .min:
+                for g in 0..<h.groupCount where values.isValid(g) {
+                    accs[base[g] + i].minV = minStreamValue(accs[base[g] + i].minV, values.value(g))
+                }
+            case .max:
+                for g in 0..<h.groupCount where values.isValid(g) {
+                    accs[base[g] + i].maxV = maxStreamValue(accs[base[g] + i].maxV, values.value(g))
+                }
+            case .variance, .stddev:
+                if let c = counts.asInts {
+                    for g in 0..<h.groupCount where g < c.count { accs[base[g] + i].count += c[g] }
+                }
+                if case .doubles(let v, let valid) = values {
+                    for g in 0..<h.groupCount where g < v.count && (valid?[g] ?? true) {
+                        accs[base[g] + i].sumDouble += v[g]
+                        accs[base[g] + i].kind = 3
+                    }
+                }
+                if case .doubles(let q, let valid) = squares {
+                    for g in 0..<h.groupCount where g < q.count && (valid?[g] ?? true) {
+                        accs[base[g] + i].sumSq += q[g]
+                    }
+                }
+            case .countDistinctApprox:
+                break
+            }
+        }
+    }
+
+    /// Adds one aggregate column into the accumulators, switching on its storage once.
+    private func accumulate(_ column: StreamColumn, into i: Int, base: [Int], groups: Int) {
+        switch column {
+        case .ints(let v, let valid):
+            for g in 0..<groups where g < v.count && (valid?[g] ?? true) {
+                accs[base[g] + i].sumInt &+= v[g]
+                accs[base[g] + i].kind = Swift.max(accs[base[g] + i].kind, 1)
+            }
+        case .uints(let v, let valid):
+            for g in 0..<groups where g < v.count && (valid?[g] ?? true) {
+                accs[base[g] + i].sumUInt &+= v[g]
+                accs[base[g] + i].kind = Swift.max(accs[base[g] + i].kind, 2)
+            }
+        case .doubles(let v, let valid):
+            for g in 0..<groups where g < v.count && (valid?[g] ?? true) {
+                accs[base[g] + i].sumDouble += v[g]
+                accs[base[g] + i].kind = 3
+            }
+        case .other(let v):
+            for g in 0..<groups where g < v.count { addInto(&accs[base[g] + i], v[g]) }
+        case .empty:
+            break
+        }
+    }
+
+    /// Group index for an integer key, through the specialised table.
+    @inline(__always) private func groupIndexInt(_ k: Int64) -> Int {
+        if let i = intSlot[k] { return i }
+        let i = groupCount
+        intSlot[k] = i
+        groupKeyCols[0].append(.int(k))
+        for j in 1..<groupKeyCols.count { groupKeyCols[j].append(.null) }
+        accs.append(contentsOf: repeatElement(StreamAccumulator(), count: aggregates.count))
+        return i
+    }
+
+    /// Group index of the null key (Arrow gives nulls a group of their own).
+    private func groupIndexNullKey() -> Int {
+        if let i = nullKeyGroup { return i }
+        let i = groupCount
+        nullKeyGroup = i
+        for j in 0..<groupKeyCols.count { groupKeyCols[j].append(.null) }
+        accs.append(contentsOf: repeatElement(StreamAccumulator(), count: aggregates.count))
+        return i
     }
 
     private func addInto(_ acc: inout StreamAccumulator, _ v: StreamValue) {
@@ -722,15 +827,25 @@ public final class StreamGroupByOperator: StreamOperator {
         }
         for k in 0..<K {
             var any = false
-            var accs = table[StreamGroupKey(values: [.int(Int64(k))])]
-                ?? Array(repeating: StreamAccumulator(), count: aggregates.count)
             for i in 0..<aggregates.count {
-                if counts[i].count > k, case .int(let n) = counts[i][k], n > 0 { accs[i].count += n; any = true }
-                if sums[i].count > k, !sums[i][k].isNull { addInto(&accs[i], sums[i][k]); any = true }
-                if mins[i].count > k, !mins[i][k].isNull { accs[i].minV = minStreamValue(accs[i].minV, mins[i][k]); any = true }
-                if maxs[i].count > k, !maxs[i][k].isNull { accs[i].maxV = maxStreamValue(accs[i].maxV, maxs[i][k]); any = true }
+                if counts[i].count > k, case .int(let n) = counts[i][k], n > 0 { any = true }
+                if sums[i].count > k, !sums[i][k].isNull { any = true }
+                if mins[i].count > k, !mins[i][k].isNull { any = true }
+                if maxs[i].count > k, !maxs[i][k].isNull { any = true }
             }
-            if any { table[StreamGroupKey(values: [.int(Int64(k))])] = accs }
+            guard any else { continue }
+            if groupKeyCols.isEmpty { groupKeyCols = Array(repeating: [], count: Swift.max(keyColumns.count, 1)) }
+            let base = groupIndexInt(Int64(k)) * aggregates.count
+            for i in 0..<aggregates.count {
+                if counts[i].count > k, case .int(let n) = counts[i][k], n > 0 { accs[base + i].count += n }
+                if sums[i].count > k, !sums[i][k].isNull { addInto(&accs[base + i], sums[i][k]) }
+                if mins[i].count > k, !mins[i][k].isNull {
+                    accs[base + i].minV = minStreamValue(accs[base + i].minV, mins[i][k])
+                }
+                if maxs[i].count > k, !maxs[i][k].isNull {
+                    accs[base + i].maxV = maxStreamValue(accs[base + i].maxV, maxs[i][k])
+                }
+            }
         }
     }
 
@@ -747,16 +862,22 @@ public final class StreamGroupByOperator: StreamOperator {
             maxs.append(denseMax[i] == nil ? [] : try denseMax[i]!.streamValues())
         }
         for k in 0..<K {
-            var accs = Array(repeating: StreamAccumulator(), count: aggregates.count)
             var any = false
-            for (i, a) in aggregates.enumerated() {
-                if counts[i].count > k, case .int(let n) = counts[i][k], n > 0 { accs[i].count = n; any = true }
-                if sums[i].count > k { addInto(&accs[i], sums[i][k]); any = any || !sums[i][k].isNull }
-                if mins[i].count > k, !mins[i][k].isNull { accs[i].minV = mins[i][k]; any = true }
-                if maxs[i].count > k, !maxs[i][k].isNull { accs[i].maxV = maxs[i][k]; any = true }
-                _ = a
+            for i in 0..<aggregates.count {
+                if counts[i].count > k, case .int(let n) = counts[i][k], n > 0 { any = true }
+                if sums[i].count > k, !sums[i][k].isNull { any = true }
+                if mins[i].count > k, !mins[i][k].isNull { any = true }
+                if maxs[i].count > k, !maxs[i][k].isNull { any = true }
             }
-            if any { table[StreamGroupKey(values: [.int(Int64(k))])] = accs }
+            guard any else { continue }
+            if groupKeyCols.isEmpty { groupKeyCols = Array(repeating: [], count: Swift.max(keyColumns.count, 1)) }
+            let base = groupIndexInt(Int64(k)) * aggregates.count
+            for i in 0..<aggregates.count {
+                if counts[i].count > k, case .int(let n) = counts[i][k], n > 0 { accs[base + i].count = n }
+                if sums[i].count > k, !sums[i][k].isNull { addInto(&accs[base + i], sums[i][k]) }
+                if mins[i].count > k, !mins[i][k].isNull { accs[base + i].minV = mins[i][k] }
+                if maxs[i].count > k, !maxs[i][k].isNull { accs[base + i].maxV = maxs[i][k] }
+            }
         }
         denseSum = []; denseCount = []; denseMin = []; denseMax = []
     }
@@ -814,24 +935,31 @@ public final class StreamGroupByOperator: StreamOperator {
 
     /// The host table as a record batch, sorted by key so the output is deterministic.
     private func hostResultBatch() throws -> MetalRecordBatch {
-        let keys = table.keys.sorted { a, b in
-            for (x, y) in zip(a.values, b.values) where x != y { return StreamValue.less(x, y) }
+        // Order the *group indices*, not the keys: the key values stay column-wise where they were
+        // written, so a ten-million-group result never builds ten million little key arrays.
+        let order = (0..<groupCount).sorted { a, b in
+            for col in groupKeyCols {
+                let x = col[a], y = col[b]
+                if x != y { return StreamValue.less(x, y) }
+            }
             return false
         }
         var names = keyColumns
         var cols: [AnyMetalArray] = []
-        for (j, k) in keyColumns.enumerated() {
-            _ = k
-            let vals = keys.map { $0.values.count > j ? $0.values[j] : StreamValue.null }
+        for j in 0..<keyColumns.count {
+            let column = j < groupKeyCols.count ? groupKeyCols[j] : []
+            let vals = order.map { $0 < column.count ? column[$0] : StreamValue.null }
             let fallback = AnyMetalArray.int64(try MetalArray<Int64>([Int64](), context: context))
             let template = keyTemplates.flatMap { $0.count > j ? $0[j] : nil } ?? fallback
             cols.append(try template.rebuild(vals, context: context))
         }
+        let m = aggregates.count
         for (i, a) in aggregates.enumerated() {
             names.append(a.name)
             var vals: [StreamValue] = []
-            for key in keys {
-                let acc = table[key]![i]
+            vals.reserveCapacity(order.count)
+            for g in order {
+                let acc = accs[g * m + i]
                 switch a.op {
                 case .count: vals.append(.int(acc.count))
                 case .sum:
