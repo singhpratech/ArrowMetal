@@ -20,7 +20,9 @@ duckdb/extension-ci-tools writes:
     field 1   32 bytes   the literal "4"   the marker that identifies a DuckDB extension at all
     signature 256 bytes  zero, i.e. unsigned
 
-Every field is ASCII, NUL-padded to 32 bytes, and the fields are written high number first.
+Every field is ASCII, NUL-padded to 32 bytes, and the fields are written high number first. The
+output of this script has been diffed against that of DuckDB's own script for the same inputs and is
+byte-identical, so an extension it stamps is indistinguishable from one the DuckDB CI produced.
 
 An unsigned extension loads only into a database started with `allow_unsigned_extensions`; see
 docs/DUCKDB.md.
