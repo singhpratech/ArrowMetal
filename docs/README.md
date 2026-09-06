@@ -11,6 +11,7 @@ every claim the project makes.
 | [EVALUATION.md](EVALUATION.md) | How correctness is checked: CPU oracles, the scenario matrix, bit-exact IEEE-754 tests, and the differential harness against pyarrow.compute, with open findings |
 | [TESTING.md](TESTING.md) | Every test suite, what it covers, and the commands to run it |
 | [BENCHMARKS.md](BENCHMARKS.md) | Every benchmark round with hardware, methodology, wall time and CPU time; the tables the README quotes |
+| [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md) | The complete operation-by-operation comparison against Polars, pyarrow.compute and pandas at 10M and 50M rows, with a verdict per row and a shortfall list of everything below the 3x bar |
 | [DESIGN.md](DESIGN.md) | How it works: buffers, kernels, batching, GPU-side lengths, software Float64, where the time goes |
 | [DECISIONS.md](DECISIONS.md) | Why it is built this way, one dated entry per decision |
 | [FINDINGS.md](FINDINGS.md) | Things learned the hard way: toolchain quirks, Metal limits, bugs and their lessons |
