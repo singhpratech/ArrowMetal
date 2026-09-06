@@ -189,6 +189,127 @@ def test_slice_matches_pyarrow():
     assert pylist(got) == INT64.slice(2, 4).to_pylist()
 
 
+@pytest.mark.parametrize("offset", [0, 1, 7, 31, 32, 33, 4097])
+def test_slice_at_any_offset_matches_pyarrow(offset):
+    """Every offset is a zero-copy view; the awkward ones (not a multiple of 32) ride on Arrow's
+    `offset` field, so the values, the null count and a re-export must all still agree."""
+    src = pa.array([None if i % 7 == 3 else i for i in range(8000)], pa.int64())
+    length = 8000 - offset - 11
+    got = am.array(src).slice(offset, length)
+    want = src.slice(offset, length)
+    assert pylist(got) == want.to_pylist()
+    assert got.null_count == want.null_count
+    assert got.to_arrow().equals(want)
+
+
+@pytest.mark.parametrize("offset", [1, 7, 33])
+def test_slice_then_compute_matches_pyarrow(offset):
+    src = pa.array([None if i % 7 == 3 else (i * 37) % 5000 for i in range(8000)], pa.int64())
+    length = 8000 - offset - 11
+    got, want = am.array(src).slice(offset, length), src.slice(offset, length)
+    assert got.sum() == pc.sum(want).as_py()
+    assert got.min() == pc.min(want).as_py()
+    assert got.first() == pc.first(want).as_py()
+    assert got.last() == pc.last(want).as_py()
+    assert pylist(got.sort()) == pc.take(want, pc.array_sort_indices(want)).to_pylist()
+    assert pylist(got.filter(got > 2500)) == pc.filter(want, pc.greater(want, 2500)).to_pylist()
+
+
+def test_slice_of_a_string_column_is_a_view():
+    src = pa.array([None if i % 9 == 2 else f"row-{i}" for i in range(3000)])
+    for offset in (1, 7, 33, 1024):
+        got = am.array(src).slice(offset, 500)
+        assert pylist(got) == src.slice(offset, 500).to_pylist()
+
+
+# ---------------------------------------------------------------- join
+
+
+def test_join_returns_the_matching_index_pairs():
+    left = pa.array([1, 2, 3, 2, 5], pa.int64())
+    right = pa.array([2, 3, 3, 7], pa.int64())
+    li, ri = am.join(am.array(left), am.array(right))
+    got = sorted(zip(pylist(li), pylist(ri)))
+    want = sorted((l, r) for l in range(len(left)) for r in range(len(right))
+                  if left[l].as_py() == right[r].as_py())
+    assert got == want
+
+
+def test_left_join_keeps_unmatched_rows_with_a_null_right_index():
+    left = pa.array([1, 2, 9], pa.int64())
+    right = pa.array([2, 9], pa.int64())
+    li, ri = am.join(am.array(left), am.array(right), how="left")
+    assert sorted(zip(pylist(li), pylist(ri))) == [(0, None), (1, 0), (2, 1)]
+
+
+def test_join_null_keys_never_match():
+    left = pa.array([None, 4], pa.int64())
+    right = pa.array([None, 4], pa.int64())
+    li, ri = am.join(am.array(left), am.array(right))
+    assert list(zip(pylist(li), pylist(ri))) == [(1, 1)]
+
+
+def test_join_rejects_an_unknown_how():
+    with pytest.raises(am.ArrowMetalError):
+        am.join(am.array(pa.array([1], pa.int64())), am.array(pa.array([1], pa.int64())), how="outer")
+
+
+# ---------------------------------------------------------------- dictionary_encode
+
+
+@pytest.mark.parametrize("values,arrow_type", [
+    ([3, 1, 3, None, 2], pa.int32()),
+    ([3, 1, 3, None, 2], pa.int64()),
+    ([1.5, 0.5, 1.5, None], pa.float64()),
+    ([True, False, True, None], pa.bool_()),
+    (["b", "a", "b", None], pa.string()),
+])
+def test_dictionary_encode_round_trips_for_every_type(values, arrow_type):
+    src = pa.array(values, arrow_type)
+    codes, uniques = am.array(src).dictionary_encode()
+    assert pc.take(uniques.to_arrow(), codes.to_arrow()).to_pylist() == values
+
+
+def test_dictionary_encode_on_a_wide_integer_column():
+    src = pa.array([(i * 7) % 1000 for i in range(50_000)], pa.int32())
+    codes, uniques = am.array(src).dictionary_encode()
+    assert len(uniques) == 1000
+    assert pc.take(uniques.to_arrow(), codes.to_arrow()).equals(src)
+
+
+# ---------------------------------------------------------------- utf8 sort
+
+
+def test_utf8_argsort_matches_pyarrow_byte_order():
+    src = pa.array(["banana", "Apple", "apple", None, "Zebra", "", "ab", "ab\x00", "abc"])
+    assert pylist(am.array(src).argsort()) == pc.array_sort_indices(src).to_pylist()
+    assert pylist(am.array(src).sort()) == pc.take(src, pc.array_sort_indices(src)).to_pylist()
+
+
+def test_utf8_argsort_descending_keeps_nulls_last():
+    src = pa.array(["b", None, "a", "c"])
+    assert pylist(am.array(src).argsort(descending=True)) == [3, 0, 2, 1]
+
+
+def test_lexsort_accepts_a_string_key():
+    region = am.array(pa.array(["west", "east", "west", "east"]))
+    revenue = am.array(pa.array([10, 30, 20, 5], pa.int64()))
+    assert pylist(am.lexsort_indices([region, revenue])) == [3, 1, 0, 2]
+
+
+# ---------------------------------------------------------------- decimal reductions
+
+
+def test_decimal_sum_min_max():
+    import decimal
+    values = [decimal.Decimal(f"{i}.{i % 10}{i % 7}") for i in range(500)]
+    src = pa.array(values, pa.decimal128(18, 4))
+    a = am.array(src)
+    assert a.sum() == sum(values)
+    assert a.min() == min(values)
+    assert a.max() == max(values)
+
+
 # ---------------------------------------------------------------- cast
 
 

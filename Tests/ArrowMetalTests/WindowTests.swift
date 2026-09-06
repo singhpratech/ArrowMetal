@@ -445,7 +445,11 @@ final class WindowTests: XCTestCase {
         let one = try batch.sorted(by: [("region", false)])
         XCTAssertEqual(one["label"]!.asString!.toArray(), try batch.sorted(by: "region")["label"]!.asString!.toArray())
         XCTAssertThrowsError(try batch.sorted(by: [("nope", false)]))
-        XCTAssertThrowsError(try batch.sorted(by: [("label", false)]))   // no order-preserving key for utf8
+        // utf8 keys sort byte-wise on the GPU (Kernels/StringSort.swift), so a string key is accepted.
+        let byLabel = try batch.sorted(by: [("label", false)])
+        XCTAssertEqual(byLabel["label"]!.asString!.toArray(), ["a", "b", "c", "d", "e", "f", "g"])
+        let byLabelDesc = try batch.sorted(by: [("label", true)])
+        XCTAssertEqual(byLabelDesc["label"]!.asString!.toArray(), ["g", "f", "e", "d", "c", "b", "a"])
     }
 
     func testPartitionNthIndices() throws {

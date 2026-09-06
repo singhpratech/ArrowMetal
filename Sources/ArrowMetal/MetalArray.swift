@@ -200,12 +200,19 @@ public final class MetalArray<T: ArrowPrimitive>: @unchecked Sendable {
         normLock.lock(); defer { normLock.unlock() }
         if let v = _normValues { return (_normValidity, v) }
         let n = _length
-        let vb = (try? MetalArrowBuffer.allocate(byteCount: Swift.max(n * T.byteWidth, 1), zeroed: false, context: context)) ?? rawValues
+        // Failing here would hand a kernel the unshifted parent buffer, which is silently wrong; only an
+        // out-of-memory condition can cause it, so say so rather than compute the wrong answer.
+        guard let vb = try? MetalArrowBuffer.allocate(byteCount: Swift.max(n * T.byteWidth, 1), zeroed: false, context: context) else {
+            preconditionFailure("out of memory normalising a sliced array of \(n) elements")
+        }
         withExtendedLifetime(rawValues) {
             if n > 0 { memcpy(vb.mutableContents, rawValues.contents.advanced(by: offset * T.byteWidth), n * T.byteWidth) }
         }
         var bm: MetalArrowBuffer? = nil
-        if let rv = rawValidity, let b = try? MetalArrowBuffer.allocate(byteCount: Swift.max(Bitmap.byteCount(bits: n), 1), context: context) {
+        if let rv = rawValidity {
+            guard let b = try? MetalArrowBuffer.allocate(byteCount: Swift.max(Bitmap.byteCount(bits: n), 1), context: context) else {
+                preconditionFailure("out of memory normalising a sliced array's validity bitmap")
+            }
             withExtendedLifetime(rv) { Bitmap.copyBits(rv.typed(UInt8.self), from: offset, into: b.mutableTyped(UInt8.self), bits: n) }
             bm = b
         }
@@ -417,12 +424,17 @@ public final class MetalBooleanArray: @unchecked Sendable {
         if let v = _normValues { return (_normValidity, v) }
         let n = _length
         let bytes = Swift.max(Bitmap.byteCount(bits: n), 1)
-        let vb = (try? MetalArrowBuffer.allocate(byteCount: bytes, context: context)) ?? rawValues
+        guard let vb = try? MetalArrowBuffer.allocate(byteCount: bytes, context: context) else {
+            preconditionFailure("out of memory normalising a sliced boolean array of \(n) rows")
+        }
         withExtendedLifetime(rawValues) {
             Bitmap.copyBits(rawValues.typed(UInt8.self), from: offset, into: vb.mutableTyped(UInt8.self), bits: n)
         }
         var bm: MetalArrowBuffer? = nil
-        if let rv = rawValidity, let b = try? MetalArrowBuffer.allocate(byteCount: bytes, context: context) {
+        if let rv = rawValidity {
+            guard let b = try? MetalArrowBuffer.allocate(byteCount: bytes, context: context) else {
+                preconditionFailure("out of memory normalising a sliced boolean array's validity bitmap")
+            }
             withExtendedLifetime(rv) { Bitmap.copyBits(rv.typed(UInt8.self), from: offset, into: b.mutableTyped(UInt8.self), bits: n) }
             bm = b
         }

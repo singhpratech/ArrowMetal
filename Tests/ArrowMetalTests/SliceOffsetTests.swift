@@ -176,6 +176,22 @@ final class SliceOffsetTests: XCTestCase {
         }
     }
 
+    func testStringSliceExportsAndRoundTrips() throws {
+        let n = 3000
+        let src: [String?] = (0..<n).map { $0 % 9 == 2 ? nil : "value-\($0)" }
+        let a = try MetalStringArray(src, context: .shared)
+        for off in [1, 7, 31, 33, 2049] {
+            let len = n - off - 11
+            let s = try a.slice(offset: off, length: len)
+            var schema = ArrowSchema(), array = ArrowArray()
+            s.exportArrowSchema(into: &schema)
+            s.exportArrowArray(into: &array)
+            let back = try importArrowArray(schema: &schema, array: &array).array
+            guard case .string(let str) = back else { return XCTFail("expected a utf8 column") }
+            XCTAssertEqual(str.toArray(), Array(src[off..<(off + len)]), "utf8 round trip at offset \(off)")
+        }
+    }
+
     // MARK: - cost
 
     func testFiftyMillionRowSliceIsUnderOneMillisecond() throws {

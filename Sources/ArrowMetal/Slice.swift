@@ -46,14 +46,16 @@ extension MetalStringArray {
     /// Arrow `slice` on a utf8 / binary column, without touching the character data.
     ///
     /// The offsets are a buffer view (Arrow offsets are absolute, so the shared data buffer stays valid as
-    /// is) and the validity bitmap is a view too whenever the offset is byte aligned; otherwise the bitmap
-    /// alone — one bit per row, never the data — is shifted into a fresh buffer. Nothing else is copied.
+    /// is) and the validity bitmap is a view too when the offset is a multiple of 32, which keeps the
+    /// bitmap's 32-bit words aligned for the kernels that bind it as `device const uint*`; at any other
+    /// offset the bitmap alone — one bit per row, never the data — is shifted into a fresh buffer.
+    /// Nothing else is copied.
     public func slice(offset: Int, length newLength: Int) throws -> MetalStringArray {
         precondition(offset >= 0 && newLength >= 0 && offset + newLength <= length, "slice out of range")
         let off = offsets.view(byteOffset: offset * 4, byteCount: (newLength + 1) * 4)
         var bm: MetalArrowBuffer? = nil
         if let v = validity {
-            if offset % 8 == 0 {
+            if offset % 32 == 0 {
                 bm = v.view(byteOffset: offset / 8, byteCount: Bitmap.byteCount(bits: newLength))
             } else {
                 let b = try MetalArrowBuffer.allocate(byteCount: Swift.max(Bitmap.byteCount(bits: newLength), 1), context: context)

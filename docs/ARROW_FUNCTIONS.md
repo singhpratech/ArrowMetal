@@ -72,7 +72,7 @@ PYTHONPATH=python python -m pytest python/tests/test_functions.py -q
 
 | Section | GPU | CPU | Partial | Missing | Pending | Rows |
 |---|---:|---:|---:|---:|---:|---:|
-| Aggregations | 20 | 3 | 1 | 0 | 0 | 24 |
+| Aggregations | 16 | 7 | 1 | 0 | 0 | 24 |
 | Arithmetic | 16 | 0 | 4 | 0 | 0 | 20 |
 | Bitwise | 8 | 0 | 0 | 0 | 0 | 8 |
 | Rounding | 6 | 0 | 0 | 0 | 0 | 6 |
@@ -104,25 +104,25 @@ PYTHONPATH=python python -m pytest python/tests/test_functions.py -q
 | Pairwise | 2 | 0 | 0 | 0 | 0 | 2 |
 | Cumulative | 7 | 0 | 0 | 0 | 0 | 7 |
 | GroupedAggregations | 23 | 0 | 1 | 0 | 0 | 24 |
-| Total | 231 | 20 | 55 | 1 | 0 | 307 |
+| Total | 227 | 24 | 55 | 1 | 0 | 307 |
 
-Totals: **231 gpu**, **20 cpu**, **55 partial**, **1 missing**, **0 pending** over 307 Arrow function names.
+Totals: **227 gpu**, **24 cpu**, **55 partial**, **1 missing**, **0 pending** over 307 Arrow function names.
 
 ## Every Arrow function name
 
 | Arrow function | Section | Status | ArrowMetal call | Implementation | Notes |
 |---|---|---|---|---|---|
-| `all` | Aggregations | **GPU** | `all()` | `Kernels/Aggregates.swift` | One GPU pass over the values and validity bitmaps. Null-only input gives None, as Arrow does. |
-| `any` | Aggregations | **GPU** | `any()` | `Kernels/Aggregates.swift` | Same pass as `all`. |
+| `all` | Aggregations | **CPU** | `all()` | `Kernels/Aggregates.swift` | A word-wise host scan of `validity & ~values` that stops at the first valid false, so the usual answer costs one load and no dispatch; a large column with no answer in its first mebibit falls back to the counting kernel. Null-only input gives None, as Arrow does. |
+| `any` | Aggregations | **CPU** | `any()` | `Kernels/Aggregates.swift` | The mirror of `all`: a host scan of `values & validity` that stops at the first true. |
 | `approximate_median` | Aggregations | **GPU** | `median()` | `Kernels/Aggregates.swift` | Exact, not approximate: a GPU sort and an interpolated read, not a sketch. Answers are therefore at least as good as Arrow's. |
 | `count` | Aggregations | **CPU** | `count(mode)` | `Sources/ArrowMetal/MetalArray.swift` | O(1) metadata: the null count already rides on the column. `mode` accepts only_valid / only_null / all. |
 | `count_all` | Aggregations | **CPU** | `count_all()` | `Kernels/Selection.swift` | The row count, valid or not. O(1) metadata; inside an open batch, reading it forces a sync point. |
 | `count_distinct` | Aggregations | **GPU** | `count_distinct()` | `Kernels/Unique.swift` | The length of `unique()`: one GPU sort and a run scan. |
-| `first` | Aggregations | **GPU** | `first()` | `Kernels/Aggregates.swift` | A GPU pass takes the atomic minimum valid index, then one host read fetches the value. |
+| `first` | Aggregations | **CPU** | `first()` | `Kernels/Aggregates.swift` | A word-wise host scan of the validity bitmap in shared memory, stopping at the first valid row, then one read of that slot. No dispatch: the cost is the distance to the first valid row, so a mostly-valid column answers in two loads. A column whose first mebibit is all null escalates to the atomic-minimum kernel. |
 | `first_last` | Aggregations | **GPU** | `first_last()` | `Kernels/Selection.swift` | `first()` and `last()` packaged as the one-row struct Arrow returns. `min_count` is not implemented. |
 | `index` | Aggregations | **GPU** | `index(value)` | `Kernels/Aggregates.swift` | Row of the first occurrence, -1 when absent. The value crosses the C ABI as a double, so an integer above 2^53 cannot be expressed exactly. |
 | `kurtosis` | Aggregations | **GPU** | `kurtosis(biased)` | `Kernels/AggregatesExtra.swift` | Excess kurtosis, biased by default as Arrow's is: two GPU passes, the same per-type deviation machinery `variance` uses, so about 1e-15 relative on a float64 column. |
-| `last` | Aggregations | **GPU** | `last()` | `Kernels/Aggregates.swift` | The atomic maximum valid index, mirroring `first`. |
+| `last` | Aggregations | **CPU** | `last()` | `Kernels/Aggregates.swift` | The same host scan as `first`, run inwards from the end. |
 | `max` | Aggregations | **GPU** | `max()` | `Kernels/Reductions.swift` | Threadgroup partials, host finalise, no atomics. |
 | `mean` | Aggregations | **GPU** | `mean()` | `Kernels/Reductions.swift` | The sum kernel over a valid-count, divided on the host. |
 | `min` | Aggregations | **GPU** | `min()` | `Kernels/Reductions.swift` | Threadgroup partials, host finalise. |
@@ -355,7 +355,7 @@ Totals: **231 gpu**, **20 cpu**, **55 partial**, **1 missing**, **0 pending** ov
 | `random` | Random | **GPU** | `am.random(n, initializer)` | `Kernels/Selection.swift` | Philox4x32-10 keyed by the seed, one counter per element, so the stream depends only on the seed. The top 53 bits of each draw become a multiple of 2^-53 in [0, 1). ArrowMetal's own stream: it does not reproduce Arrow C++'s pcg32_fast numbers for the same seed. |
 | `unique` | Associative | **Partial** | `unique()` | `Kernels/Unique.swift` | One GPU sort plus a run scan. The values come back **ascending**; Arrow returns them in order of first appearance, and nulls are dropped rather than kept. |
 | `value_counts` | Associative | **Partial** | `value_counts()` | `Kernels/Unique.swift` | The same pass, returned as a struct of `values` and `counts`. Ascending order, not first appearance; nulls are dropped. |
-| `dictionary_encode` | Associative | **GPU** | `dictionary_encode()` | `Kernels/StringDictionary.swift` | GPU hashing for utf8, a GPU sort for primitives. Returns `(codes, values)` rather than Arrow's dictionary-typed array. |
+| `dictionary_encode` | Associative | **GPU** | `dictionary_encode()` | `Kernels/DictionaryCompute.swift` | GPU hashing for utf8 and binary (`Kernels/StringDictionary.swift`), the GPU `unique()` pipeline for primitive, temporal and boolean columns; reachable from every binding through `am_dictionary_encode`. Returns `(codes, values)` rather than Arrow's dictionary-typed array. |
 | `dictionary_decode` | Associative | **GPU** | `dictionary_decode()` | `Sources/ArrowMetal/DictionaryArray.swift` | A `take` of the values through the codes. |
 | `filter` | Selections | **GPU** | `filter(mask)` | `Kernels/Filter.swift` | Per-block popcount, GPU scan, scatter and validity pack, all in one command buffer. A null mask entry drops the row (Arrow's `null_selection_behavior="drop"`); `"emit_null"` is not implemented. |
 | `array_filter` | Selections | **GPU** | `array_filter(mask)` | `Kernels/Filter.swift` | The same kernel under Arrow's array-only name. |
@@ -364,8 +364,8 @@ Totals: **231 gpu**, **20 cpu**, **55 partial**, **1 missing**, **0 pending** ov
 | `drop_null` | Selections | **GPU** | `drop_null()` | `Kernels/Structural.swift` | The filter kernel driven by the validity bitmap. |
 | `inverse_permutation` | Selections | **GPU** | `inverse_permutation(max_index)` | `Kernels/Selection.swift` | An atomic scatter: for the i-th index the index-th output is i. Unassigned slots are null and duplicates resolve to the last source position, deterministically (the scatter is an atomic maximum). Always int32 — Arrow's `output_type` is not implemented. |
 | `scatter` | Selections | **GPU** | `scatter(indices, max_index)` | `Kernels/Selection.swift` | The inverse permutation used as a `take`, so it works for every column type. Unassigned positions are null and duplicate indices resolve to the last value. |
-| `array_sort_indices` | Sorts | **GPU** | `array_sort_indices(descending)` | `Kernels/Sort.swift` | LSD radix sort, stable, nulls last, total order for floats (NaN after +inf). Arrow's `null_placement="at_start"` is not implemented. |
-| `sort_indices` | Sorts | **Partial** | `sort_indices() / am.lexsort_indices(cols)` | `Kernels/MultiSort.swift` | Single key through the radix argsort; multiple keys through `lexsort_indices`, which is successive stable argsorts from the least significant key upwards. utf8, binary and dictionary key columns are not sortable, and `null_placement="at_start"` is not implemented. |
+| `array_sort_indices` | Sorts | **GPU** | `array_sort_indices(descending)` | `Kernels/Sort.swift` | LSD radix sort, stable, nulls last, total order for floats (NaN after +inf). utf8 and binary columns take the prefix radix sort in `Kernels/StringSort.swift` and come out in byte-wise lexicographic order, index for index with pyarrow. Arrow's `null_placement="at_start"` is not implemented. |
+| `sort_indices` | Sorts | **Partial** | `sort_indices() / am.lexsort_indices(cols)` | `Kernels/MultiSort.swift` | Single key through the radix argsort; multiple keys through `lexsort_indices`, which is successive stable argsorts from the least significant key upwards. utf8 and binary keys are sortable (`Kernels/StringSort.swift`); dictionary and nested key columns are not, and `null_placement="at_start"` is not implemented. |
 | `partition_nth_indices` | Sorts | **Partial** | `partition_nth_indices(pivot)` | `Kernels/MultiSort.swift` | Answered with the full stable GPU argsort, which satisfies Arrow's contract (the n smallest first) but does more work than a true partial partition and returns a different permutation. |
 | `select_k_unstable` | Sorts | **GPU** | `select_k_unstable(k, largest)` | `Kernels/TopK.swift` | For k <= 1024 each threadgroup keeps the best k of its own block and one radix sort orders the survivors; larger k falls back to the full sort. Single key. |
 | `top_k_unstable` | Sorts | **GPU** | `top_k_unstable(k)` | `Kernels/TopK.swift` | `select_k_unstable` with the descending order. |
