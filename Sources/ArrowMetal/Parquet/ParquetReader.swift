@@ -78,6 +78,10 @@ extension ParquetFile {
         let wanted = try selectedFields(options.columns)
         var names: [String] = []
         var columns: [AnyMetalArray] = []
+        // Wrap the bytes this read will touch as one Metal buffer up front. Column chunks are
+        // interleaved by row group, so a single column's chunks span nearly the whole file in a
+        // many-row-group file: wrapping per column would map the same pages once per column.
+        try prewrap(fields: wanted, rowGroups: groups)
         // One open command buffer for the whole read: the decode is a chain of small kernels per column,
         // and a command buffer per kernel would spend more time on round trips than on the GPU. The
         // handful of places that must read a GPU result (a page scan total, an offsets total) flush and
@@ -93,6 +97,24 @@ extension ParquetFile {
             return try MetalRecordBatch(names: [], columns: [])
         }
         return try MetalRecordBatch(names: names, columns: columns)
+    }
+
+    /// Maps the byte span of every column chunk this read will touch, in one `MTLBuffer`.
+    private func prewrap(fields: [ParquetField], rowGroups: [Int]) throws {
+        var lo = Int.max, hi = 0
+        for f in fields {
+            for leaf in f.leaves {
+                for g in rowGroups {
+                    let rg = metadata.rowGroups[g]
+                    guard leaf.index < rg.columns.count else { continue }
+                    let m = rg.columns[leaf.index].meta
+                    lo = Swift.min(lo, Int(m.startOffset))
+                    hi = Swift.max(hi, Int(m.startOffset) + Int(m.totalCompressedSize))
+                }
+            }
+        }
+        guard lo < hi else { return }
+        _ = try buffer(covering: lo..<Swift.min(hi, fileSize))
     }
 
     /// Convenience: read named columns from every row group.

@@ -33,7 +33,7 @@ import arrowmetal as am        # noqa: E402
 COLUMNS = ["id", "qty", "code", "price", "weight", "cat", "ts", "flag"]
 
 
-def build(path, rows, codec, chunk=2_000_000):
+def build(path, rows, codec, chunk=2_000_000, page_size=1 << 20):
     """Writes the fixture in chunks so the generator never holds the whole table in memory."""
     schema = pa.schema([
         ("id", pa.int64()), ("qty", pa.int64()), ("code", pa.int32()),
@@ -42,7 +42,7 @@ def build(path, rows, codec, chunk=2_000_000):
     ])
     cats = np.array(["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"], dtype=object)
     writer = pq.ParquetWriter(path, schema, compression=codec if codec != "none" else None,
-                              use_dictionary=["cat"], data_page_size=1 << 20)
+                              use_dictionary=["cat"], data_page_size=page_size)
     rng = np.random.default_rng(11)
     written = 0
     while written < rows:
@@ -107,6 +107,43 @@ def first_compute(path):
     return out
 
 
+def codec_throughput(directory, rows, page_size):
+    """Decompression throughput per codec, in MB/s of *uncompressed* page bytes.
+
+    One int64 column per codec, so the number isolates the block decoder from everything else: the
+    uncompressed run is the floor (it copies the same bytes with no decoder at all).
+    """
+    import numpy as np
+    print("\n=== decompression throughput, one int64 column of {:,} rows, {} KB pages ===".format(
+        rows, page_size // 1024))
+    print("%-12s %10s %10s %10s %10s" % ("codec", "file MB", "am ms", "am MB/s", "pyarrow ms"))
+    base = None
+    for codec in ("none", "snappy", "lz4", "zstd", "gzip"):
+        path = os.path.join(directory, "codec-%s-%d-%d.parquet" % (codec, rows, page_size))
+        if not os.path.exists(path):
+            t = pa.table({"v": pa.array(np.arange(rows, dtype=np.int64) * 2654435761 % (1 << 40))})
+            try:
+                pq.write_table(t, path, compression=codec if codec != "none" else None,
+                               use_dictionary=False, data_page_size=page_size)
+            except Exception as e:
+                print("%-12s skipped (%s)" % (codec, e))
+                continue
+        raw = rows * 8 / 1e6
+        f = am.ParquetFile(path)
+        best = None
+        for _ in range(3):
+            _, w, _c = timed(lambda: f.read(columns=["v"]))
+            best = w if best is None else min(best, w)
+        _, pw, _ = timed(lambda: pq.read_table(path, columns=["v"]))
+        if codec == "none":
+            base = best
+        note = ""
+        if base is not None and codec != "none" and best > base:
+            note = "  (%.1f MB/s of decode alone)" % (raw / ((best - base) / 1000.0))
+        print("%-12s %10.1f %10.1f %10.0f %10.1f%s" % (
+            codec, os.path.getsize(path) / 1e6, best, raw / (best / 1000.0), pw, note))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", type=int, default=50_000_000)
@@ -114,6 +151,9 @@ def main():
     ap.add_argument("--dir", default=os.path.join(os.sep, "tmp", "arrowmetal-parquet-bench"))
     ap.add_argument("--keep", action="store_true", help="keep the generated files")
     ap.add_argument("--repeat", type=int, default=2)
+    ap.add_argument("--codec-scan", action="store_true",
+                    help="also measure per-codec decompression throughput on one column")
+    ap.add_argument("--page-size", type=int, default=1 << 20)
     args = ap.parse_args()
 
     os.makedirs(args.dir, exist_ok=True)
@@ -125,7 +165,7 @@ def main():
             path = os.path.join(args.dir, "bench-%s-%d.parquet" % (codec, args.rows))
             if not os.path.exists(path):
                 t0 = time.perf_counter()
-                size = build(path, args.rows, codec)
+                size = build(path, args.rows, codec, page_size=args.page_size)
                 print("wrote %s (%.2f GB) in %.1f s" % (os.path.basename(path), size / 1e9,
                                                         time.perf_counter() - t0))
             size = os.path.getsize(path)
@@ -146,6 +186,9 @@ def main():
                     tt = w if tt is None else min(tt, w)
                 print("%-20s %10.0f %10.0f %10.0f %10.0f" % (name, best_w, best_c, mb / (best_w / 1000.0), tt))
                 rows_out.append((codec, name, best_w, best_c, mb / (best_w / 1000.0), tt))
+        if args.codec_scan:
+            for ps in (1 << 20, 1 << 16):
+                codec_throughput(args.dir, min(args.rows, 20_000_000), ps)
     finally:
         if not args.keep:
             shutil.rmtree(args.dir, ignore_errors=True)

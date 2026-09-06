@@ -180,6 +180,17 @@ def main():
     write(ls, "lists__plain_none", compression="none", use_dictionary=False, data_page_size=8192)
     write(ls, "lists__dict_snappy", compression="snappy", use_dictionary=True, data_page_size=8192)
 
+    # Decimals stored as INT32 / INT64 rather than FIXED_LEN_BYTE_ARRAY.
+    decs = flat.select(["dec9", "dec18", "id"])
+    try:
+        write(decs, "decint__plain_none", compression="none", use_dictionary=False,
+              store_decimal_as_integer=True, data_page_size=8192)
+        write(decs, "decint__dict_snappy", compression="snappy", use_dictionary=True,
+              store_decimal_as_integer=True, data_page_size=8192)
+        write(decs, "decint__plain_fixed", compression="none", use_dictionary=False, data_page_size=8192)
+    except TypeError as e:                                    # older pyarrow
+        print("skipping integer decimals: %s" % e)
+
     # Degenerate shapes.
     write(flat.slice(0, 0), "empty__plain_none", compression="none", use_dictionary=False)
     write(pa.table({"x": pa.array([None] * 500, pa.int64()),

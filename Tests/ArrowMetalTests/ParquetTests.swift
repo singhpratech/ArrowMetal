@@ -172,6 +172,8 @@ final class ParquetTests: XCTestCase {
             ("groups", ["plain_none", "dict_snappy"], nil),
             ("strings", ["plain_none", "dict_snappy", "v2_zstd"], nil),
             ("lists", ["plain_none", "dict_snappy"], nil),
+            // The same decimals stored as INT32/INT64 and as FIXED_LEN_BYTE_ARRAY must agree.
+            ("decint", ["plain_fixed", "plain_none", "dict_snappy"], nil),
         ]
         for (family, variants, cols) in families {
             var reference: MetalRecordBatch? = nil

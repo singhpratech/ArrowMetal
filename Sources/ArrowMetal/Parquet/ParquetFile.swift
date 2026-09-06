@@ -104,9 +104,11 @@ public final class ParquetFile: @unchecked Sendable {
         let start = (Swift.max(range.lowerBound, 0) / page) * page
         let end = Swift.min(roundUp(Swift.max(range.upperBound, start + 1), to: page), region.length)
         wrapLock.lock()
-        if let b = wrapped[start], b.byteCount >= end - start {
+        // Any cached wrap that already encloses this range serves it, so overlapping column chunks and
+        // repeated reads of the same column never wrap the same bytes twice.
+        for (s, b) in wrapped where s <= start && s + b.byteCount >= end {
             wrapLock.unlock()
-            return (b, range.lowerBound - start)
+            return (b, range.lowerBound - s)
         }
         wrapLock.unlock()
         let (buf, _) = try MetalArrowBuffer.wrapOrCopy(UnsafeRawPointer(region.base).advanced(by: start),
