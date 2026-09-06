@@ -3,18 +3,19 @@
 Ordered roughly by impact divided by effort. Each item is a self-contained contribution. Open an issue to claim one.
 
 ## Near term (good first contributions)
-- [ ] **Take / gather** kernel (`take(indices:)`), the other half of selection.
-- [ ] **Count / any / all** for boolean arrays on the GPU.
-- [ ] **Cast** between primitive types, including float to int with Arrow's truncation rules.
-- [ ] **Float64 on GPU** via double-float (two-float) arithmetic for sum/min/max/compare, or an explicit
-      "downcast to Float32" opt-in. Today Float64 silently runs on the CPU path.
+- [x] **Take / gather** kernel (`take(indices:)`), the other half of selection.
+- [x] **Count / any / all** for boolean arrays on the GPU.
+- [x] **Cast** between primitive types, including float to int with Arrow's truncation rules.
+- [x] **Float64 on GPU** for compare/min/max/filter/take via order-preserving bit patterns (exact).
+      Still open: Float64 `sum` and arithmetic on the GPU (double-float emulation, or Float32 downcast opt-in).
 - [ ] **Checked arithmetic** (`add_checked` etc.) that reports overflow and division by zero like Arrow.
-- [ ] **Slicing with offsets** without materialising (`offset != 0` currently copies on import).
-- [ ] **NaN semantics** for float min/max matching Arrow's `min_max` (skip NaN vs propagate).
+- [x] **Slicing with offsets** without materialising (`offset != 0` currently copies on import).
+- [x] **NaN semantics** for float min/max matching Arrow's `min_max` (skip NaN vs propagate).
 - [ ] Benchmarks on M1/M2/M3 and on iPhone/iPad; a results table per chip.
 
 ## Medium term
-- [ ] **RecordBatch**: multiple columns, schema, and C Stream / C Device Stream import/export.
+- [x] **RecordBatch**: multiple columns, struct import/export, C Stream import. Open: C Stream export,
+      C Device Stream, nested struct children.
 - [ ] **Hash aggregation** (`group_by` sum/count/min/max) with a GPU hash table in threadgroup memory.
 - [ ] **Sort / argsort** (radix sort on the GPU), then **top-k**.
 - [ ] **Strings** (`utf8`, `large_utf8`, and `utf8_view`): equality, prefix match, length, hashing.

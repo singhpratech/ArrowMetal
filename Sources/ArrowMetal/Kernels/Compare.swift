@@ -19,17 +19,18 @@ extension MetalArray {
     /// Element-wise comparison with a scalar, producing an Arrow boolean array.
     /// Null inputs produce null outputs (validity bitmap is shared zero-copy with the input).
     public func compare(_ op: CompareOp, _ scalar: T) throws -> MetalBooleanArray {
-        guard Dispatch.runsOnGPU(T.self) else { return try CPUReference.compare(self, op, scalar: scalar) }
         try Dispatch.checkLength(length)
         let ctx = context
         let words = BitmapOps.words(bits: length)
         let out = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: length), context: ctx)
-        let src = KernelSource.compare(T: T.mslType)
-        let pso = try Dispatch.pipeline(ctx, family: "cmp", source: src, function: "cmp_scalar_\(op.rawValue)", type: T.mslType)
+        let isDouble = T.self == Double.self
+        let src = isDouble ? KernelSource.compareDouble : KernelSource.compare(T: T.mslType)
+        let pso = try Dispatch.pipeline(ctx, family: "cmp", source: src, function: "cmp_scalar_\(op.rawValue)", type: isDouble ? "double" : T.mslType)
         try ctx.run { enc in
             enc.setComputePipelineState(pso)
             enc.setBuffer(values.mtl, offset: values.offset, index: 0)
-            Dispatch.setScalar(enc, scalar, index: 1)
+            if isDouble { Dispatch.setScalar(enc, Int64(bitPattern: (scalar as! Double).bitPattern), index: 1) }
+            else { Dispatch.setScalar(enc, scalar, index: 1) }
             Dispatch.setUInt(enc, length, index: 2)
             enc.setBuffer(out.mtl, offset: out.offset, index: 3)
             Dispatch.dispatch1D(enc, pso, count: words)
@@ -40,13 +41,13 @@ extension MetalArray {
     /// Element-wise comparison with another array of the same length.
     public func compare(_ op: CompareOp, _ other: MetalArray<T>) throws -> MetalBooleanArray {
         guard other.length == length else { throw ArrowMetalError.lengthMismatch(length, other.length) }
-        guard Dispatch.runsOnGPU(T.self) else { return try CPUReference.compare(self, op, array: other) }
         try Dispatch.checkLength(length)
         let ctx = context
         let words = BitmapOps.words(bits: length)
         let out = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: length), context: ctx)
-        let src = KernelSource.compare(T: T.mslType)
-        let pso = try Dispatch.pipeline(ctx, family: "cmp", source: src, function: "cmp_array_\(op.rawValue)", type: T.mslType)
+        let isDouble = T.self == Double.self
+        let src = isDouble ? KernelSource.compareDouble : KernelSource.compare(T: T.mslType)
+        let pso = try Dispatch.pipeline(ctx, family: "cmp", source: src, function: "cmp_array_\(op.rawValue)", type: isDouble ? "double" : T.mslType)
         try ctx.run { enc in
             enc.setComputePipelineState(pso)
             enc.setBuffer(values.mtl, offset: values.offset, index: 0)

@@ -31,25 +31,29 @@ Arrow layout, plus Accelerate where an equivalent exists. Reproduce with `swift 
 
 | Operation | Implementation | Time (ms) | Throughput (GB/s) |
 |---|---|---:|---:|
-| sum(Int64, 10% nulls) | **Metal** | 1.07 | 375.2 |
-| sum(Int64, 10% nulls) | CPU 1-core null-aware loop | 55.04 | 7.3 |
-| sum(Int64, 10% nulls) | CPU 16-core null-aware loop | 5.01 | 79.9 |
-| min(Int64, 10% nulls) | **Metal** | 1.79 | 222.8 |
-| min(Int64, 10% nulls) | CPU 1-core | 27.78 | 14.4 |
-| compare(Int64 > 0) to bitmap | **Metal** | 1.18 | 339.3 |
-| compare(Int64 > 0) to bitmap | CPU 1-core packed bitmap | 7.54 | 53.0 |
-| filter(Int64, ~45% kept) | **Metal** | 5.36 | 74.6 |
-| filter(Int64, ~45% kept) | CPU 1-core bit-scan loop | 37.64 | 10.6 |
-| compare + filter | **Metal** | 6.37 | 62.8 |
-| compare + filter | Swift `[Int64].filter` | 133.82 | 3.0 |
-| multiply(Int64 * 3) | **Metal** | 6.84 | 116.9 |
-| multiply(Int64 * 3) | CPU 1-core | 123.67 | 6.5 |
-| sum(Float32) | **Metal** | 1.11 | 180.8 |
-| sum(Float32) | Accelerate vDSP | 2.01 | 99.7 |
-| max(Float32) | **Metal** | 0.88 | 226.3 |
-| max(Float32) | Accelerate vDSP | 2.09 | 95.7 |
-| multiply(Float32 * 2.5) | Metal | 3.65 | 109.6 |
-| multiply(Float32 * 2.5) | **Accelerate vDSP** | 3.15 | 127.0 |
+| sum(Int64, 10% nulls) | **Metal** | 1.36 | 294.8 |
+| sum(Int64, 10% nulls) | CPU 1-core null-aware loop | 52.28 | 7.7 |
+| sum(Int64, 10% nulls) | CPU 16-core null-aware loop | 4.74 | 84.4 |
+| min(Int64, 10% nulls) | **Metal** | 1.38 | 290.7 |
+| min(Int64, 10% nulls) | CPU 1-core | 28.34 | 14.1 |
+| compare(Int64 > 0) to bitmap | **Metal** | 1.17 | 342.3 |
+| compare(Int64 > 0) to bitmap | CPU 1-core packed bitmap | 7.43 | 53.8 |
+| filter(Int64, ~45% kept) | **Metal** | 5.12 | 78.1 |
+| filter(Int64, ~45% kept) | CPU 1-core bit-scan loop | 36.74 | 10.9 |
+| take(Int64, 25M random indices) | **Metal** | 8.09 | 61.8 |
+| take(Int64, 25M random indices) | CPU 1-core gather loop | 74.58 | 6.7 |
+| Float64 compare(> 500) + filter | **Metal** (bit-pattern kernels) | 5.36 | 74.6 |
+| Float64 compare(> 500) + filter | Swift `[Double].filter` | 180.81 | 2.2 |
+| cast(Int64 to Float32) | **Metal** | 5.04 | 119.0 |
+| cast(Int64 to Float32) | CPU 1-core loop | 10.46 | 57.4 |
+| multiply(Int64 * 3) | **Metal** | 5.90 | 135.6 |
+| multiply(Int64 * 3) | CPU 1-core | 125.82 | 6.4 |
+| sum(Float32) | **Metal** | 1.00 | 199.3 |
+| sum(Float32) | Accelerate vDSP | 2.04 | 97.9 |
+| max(Float32) | **Metal** | 0.93 | 216.1 |
+| max(Float32) | Accelerate vDSP | 2.02 | 99.1 |
+| multiply(Float32 * 2.5) | Metal | 3.67 | 109.0 |
+| multiply(Float32 * 2.5) | **Accelerate vDSP** | 3.14 | 127.3 |
 
 Takeaways: reductions and comparisons run at memory bandwidth on the GPU and beat 16 CPU cores. Filter is
 about 7x a single core. Pure element-wise arithmetic is bandwidth bound on both sides, so Accelerate ties or
@@ -64,7 +68,16 @@ let prices = try MetalArray<Float>([9.5, nil, 12.0, 3.25])       // nullable, li
 let mask   = try prices.compare(.gt, 5)                          // GPU, Arrow boolean bitmap out
 let picked = try prices.filter(mask)                             // GPU stream compaction
 print(try picked.sum(), try picked.max(), picked.nullCount)      // .float(21.5), 12.0, 0
+
+// Multi-column batches behave like an Arrow RecordBatch.
+let orders = try MetalRecordBatch(names: ["region", "amount"], columns: [.int32(region), .float32(amount)])
+let hits = try orders.filter(try region.compare(.eq, 2).and(try amount.compare(.gt, 100)))
+let sample = try hits.take(try MetalArray<Int32>([0, 5, 9]))
+let window = try hits.slice(offset: 32, length: 1000)             // zero-copy view
 ```
+
+Five end-to-end scenarios (analytics query, feature preparation, Float64 with NaN, C Data Interface
+interop, sliced windows) live in `Sources/ArrowMetalExamples`: `swift run -c release arrowmetal-examples`.
 
 Interop with any Arrow implementation through the C Data Interface:
 
@@ -88,11 +101,16 @@ enough to build and use it. Running the test suite needs Xcode (for XCTest):
 
 - `MetalArrowBuffer`: page-aligned shared-memory buffers, zero-copy wrap of foreign page-aligned memory.
 - `MetalArray<T>` for Int8/16/32/64, UInt8/16/32/64, Float32, Float64; `MetalBooleanArray` with packed bits.
+- `MetalRecordBatch`: named equal-length columns with `filter`, `take`, `slice`, `selecting`.
 - Kernels: `sum`, `min`, `max`, `mean`, `compare` (6 ops, scalar and array), `add/sub/mul/div` (scalar and
-  array), `filter`, boolean `and/or/not`. All null-aware with Arrow semantics.
-- C Data Interface import/export, C Device Data Interface import/export, `MTLBuffer` recovery from our own
-  exports for Metal consumers.
-- Float64 columns run on a CPU path through the same API (Metal has no `double`).
+  array), `filter`, `take` (Int32/Int64/UInt32 indices, bounds checked), `cast`, `slice` (zero-copy when
+  32-aligned), boolean `and/or/not/count/any/all`. All null-aware with Arrow semantics.
+- Float64: Metal has no `double`, so compare, min, max, filter, take and slice run on the GPU using an
+  order-preserving map of the IEEE bit pattern (exact, NaN and signed zero handled); sum and arithmetic run
+  on the CPU through the same API.
+- NaN: `min`/`max` skip NaN and return null if only NaN remains; `sum` propagates NaN; comparisons follow IEEE.
+- C Data Interface import/export for primitive arrays and struct (`+s`) record batches, C Stream Interface
+  import, C Device Data Interface import/export, `MTLBuffer` recovery from our own exports.
 - A CPU reference implementation of every kernel, used as the oracle in tests.
 
 ## Design notes

@@ -44,4 +44,18 @@ enum BitmapOps {
         }
         return out
     }
+
+    static func unpackBits(_ ctx: MetalContext, bits: MetalArrowBuffer, count: Int) throws -> MetalArrowBuffer {
+        let out = try MetalArrowBuffer.allocate(byteCount: count, context: ctx)
+        guard count > 0 else { return out }
+        let pso = try ctx.pipeline(source: KernelSource.bitmap, function: "unpack_bits", cacheKey: "bitmap/unpack_bits")
+        try ctx.run { enc in
+            enc.setComputePipelineState(pso)
+            enc.setBuffer(bits.mtl, offset: bits.offset, index: 0)
+            Dispatch.setUInt(enc, count, index: 1)
+            enc.setBuffer(out.mtl, offset: out.offset, index: 2)
+            Dispatch.dispatch1D(enc, pso, count: count)
+        }
+        return out
+    }
 }

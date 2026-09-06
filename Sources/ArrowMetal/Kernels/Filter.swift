@@ -17,16 +17,16 @@ extension MetalArray {
     /// the block offsets are scanned on the CPU (one entry per 8192 elements).
     public func filter(_ mask: MetalBooleanArray) throws -> MetalArray<T> {
         guard mask.length == length else { throw ArrowMetalError.lengthMismatch(length, mask.length) }
-        guard Dispatch.runsOnGPU(T.self) else { return try CPUReference.filter(self, mask) }
         try Dispatch.checkLength(length)
         let ctx = context
         let sel = try mask.selectionBitmap()
         let words = BitmapOps.words(bits: length)
         let blocks = Swift.max(1, (words + Dispatch.threadgroupSize - 1) / Dispatch.threadgroupSize)
         let blockCounts = try MetalArrowBuffer.allocate(byteCount: blocks * 4, context: ctx)
-        let src = KernelSource.filter(T: T.mslType)
-        let countPSO = try Dispatch.pipeline(ctx, family: "filter", source: src, function: "filter_count", type: T.mslType)
-        let scatterPSO = try Dispatch.pipeline(ctx, family: "filter", source: src, function: "filter_scatter", type: T.mslType)
+        let mslT = Dispatch.moveType(T.self)
+        let src = KernelSource.filter(T: mslT)
+        let countPSO = try Dispatch.pipeline(ctx, family: "filter", source: src, function: "filter_count", type: mslT)
+        let scatterPSO = try Dispatch.pipeline(ctx, family: "filter", source: src, function: "filter_scatter", type: mslT)
         let tg = MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1)
         let grid = MTLSize(width: blocks, height: 1, depth: 1)
 
@@ -70,5 +70,27 @@ extension MetalArray {
         let res = MetalArray<T>(length: outLen, nullCount: 0, validity: outValidity, values: outValues, context: ctx)
         res.recomputeNullCount()
         return res
+    }
+}
+
+extension MetalBooleanArray {
+    /// Arrow `filter` on a boolean array: unpack to bytes, compact, repack.
+    public func filter(_ mask: MetalBooleanArray) throws -> MetalBooleanArray {
+        let bytes = try toUInt8Array()
+        let kept = try bytes.filter(mask)
+        return try MetalBooleanArray.fromUInt8Array(kept)
+    }
+
+    /// One byte (0/1) per element with the same validity (shared, zero-copy).
+    public func toUInt8Array() throws -> MetalArray<UInt8> {
+        let out = try BitmapOps.unpackBits(context, bits: values, count: length)
+        return MetalArray<UInt8>(length: length, nullCount: nullCount, validity: validity, values: out, context: context)
+    }
+
+    /// Inverse of `toUInt8Array`: non-zero bytes become true.
+    public static func fromUInt8Array(_ a: MetalArray<UInt8>) throws -> MetalBooleanArray {
+        let packed = a.length == 0 ? try MetalArrowBuffer.allocate(byteCount: 0, context: a.context)
+                                   : try BitmapOps.packBits(a.context, bytes: a.values, bits: a.length)
+        return MetalBooleanArray(length: a.length, nullCount: a.nullCount, validity: a.validity, values: packed, context: a.context)
     }
 }

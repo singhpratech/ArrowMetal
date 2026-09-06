@@ -30,8 +30,16 @@ enum Dispatch {
         guard n <= Int(UInt32.max) else { throw ArrowMetalError.invalidArrowArray("arrays above 2^32 elements are not supported yet") }
     }
 
-    /// Double has no Metal support; those arrays run on the CPU reference path.
+    /// Metal has no `double`. Arithmetic and sum on Float64 run on the CPU reference path; compare, min, max,
+    /// filter, take and slice run on the GPU by treating the values as raw 64-bit patterns.
     static func runsOnGPU<T: ArrowPrimitive>(_: T.Type) -> Bool { T.self != Double.self }
 
-    static func mslType<T: ArrowPrimitive>(_: T.Type) -> String { T.mslType }
+    /// MSL type used for kernels that only move or order values (filter, take): Float64 becomes `long`.
+    static func moveType<T: ArrowPrimitive>(_: T.Type) -> String { T.self == Double.self ? "long" : T.mslType }
+
+    /// Inverse of the MSL `d_key` order-preserving map.
+    static func doubleFromKey(_ k: Int64) -> Double {
+        let bits = k < 0 ? k ^ 0x7FFF_FFFF_FFFF_FFFF : k
+        return Double(bitPattern: UInt64(bitPattern: bits))
+    }
 }

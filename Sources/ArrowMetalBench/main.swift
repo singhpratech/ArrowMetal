@@ -147,6 +147,31 @@ sec = "multiply(Int64 * 3)"; print("\n" + sec)
 try time("Metal  multiply scalar", bytes: bytesI64 * 2, section: sec) { sink(try colI64.multiply(3)) }
 try time("CPU 1-core  multiply scalar", bytes: bytesI64 * 2, section: sec) { sink(try CPUReference.arithmetic(colI64, .mul, scalar: 3)) }
 
+sec = "take(Int64, 25M random indices)"; print("\n" + sec)
+let takeIdx = try MetalArray<Int32>((0..<(rows / 2)).map { _ in Int32.random(in: 0..<Int32(rows), using: &g) })
+try time("Metal  take", bytes: rows / 2 * (8 + 4 + 8), section: sec) { sink(try colI64.take(takeIdx)) }
+time("CPU 1-core  take (gather loop)", bytes: rows / 2 * (8 + 4 + 8), section: sec) {
+    let p = colI64.valuePointer, ip = takeIdx.valuePointer
+    var out = [Int64](repeating: 0, count: rows / 2)
+    out.withUnsafeMutableBufferPointer { o in for i in 0..<o.count { o[i] = p[Int(ip[i])] } }
+    sink(out)
+}
+
+sec = "Float64: compare(> 500) then filter"; print("\n" + sec)
+let colF64 = try MetalArray<Double>((0..<rows).map { _ in Double.random(in: 0...1000, using: &g) })
+try time("Metal  compare then filter (bit-pattern kernels)", bytes: rows * 8, section: sec) { sink(try colF64.filter(try colF64.compare(.gt, 500))) }
+let f64raw = colF64.toRawArray()
+time("Swift  [Double].filter { $0 > 500 }", bytes: rows * 8, section: sec) { sink(opaque(f64raw).filter { $0 > 500 }) }
+
+sec = "cast(Int64 -> Float32)"; print("\n" + sec)
+try time("Metal  cast", bytes: rows * 12, section: sec) { sink(try colI64.cast(to: Float.self)) }
+time("CPU 1-core  convert loop", bytes: rows * 12, section: sec) {
+    var out = [Float](repeating: 0, count: rows)
+    let src = opaque(i64raw)
+    out.withUnsafeMutableBufferPointer { dst in for i in 0..<rows { dst[i] = Float(src[i]) } }
+    sink(out)
+}
+
 // --- Float32 column, no nulls: compare with vDSP ---
 let f32 = (0..<rows).map { _ in Float.random(in: -1...1, using: &g) }
 let colF32 = try MetalArray<Float>(f32)

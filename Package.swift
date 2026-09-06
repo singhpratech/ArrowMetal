@@ -8,6 +8,7 @@ let package = Package(
         .library(name: "ArrowMetal", targets: ["ArrowMetal"]),
         .library(name: "CArrowABI", targets: ["CArrowABI"]),
         .executable(name: "arrowmetal-bench", targets: ["ArrowMetalBench"]),
+        .executable(name: "arrowmetal-examples", targets: ["ArrowMetalExamples"]),
     ],
     targets: [
         // Verbatim Arrow C Data / C Device / C Stream ABI structs (no dependencies).
@@ -18,6 +19,7 @@ let package = Package(
             linkerSettings: [.linkedFramework("Metal")]
         ),
         .executableTarget(name: "ArrowMetalBench", dependencies: ["ArrowMetal"]),
+        .executableTarget(name: "ArrowMetalExamples", dependencies: ["ArrowMetal", "CArrowABI"]),
         .testTarget(name: "ArrowMetalTests", dependencies: ["ArrowMetal", "CArrowABI"]),
     ]
 )
