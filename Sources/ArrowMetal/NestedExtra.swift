@@ -166,6 +166,14 @@ extension MetalListArray {
         return MetalArray<Int32>(length: m, nullCount: 0, validity: nil, values: out, context: ctx)
     }
 
+    /// Arrow `list_parent_indices` in **int64**, which is the width pyarrow returns.
+    ///
+    /// The same GPU binary search, widened by the GPU cast. `listParentIndices()` keeps the int32 form,
+    /// which is what the list offsets themselves are and what every caller inside this package wants.
+    public func listParentIndices64() throws -> MetalArray<Int64> {
+        try listParentIndices().cast(to: Int64.self)
+    }
+
     /// Arrow `list_slice`: `row[start:stop:step]` for every row.
     ///
     /// `stop == nil` slices to the end of each row. `start` and `step` must be non-negative and `step` at
@@ -391,6 +399,11 @@ extension AnyMetalArray {
         case .map(let m): return try m.entries.listParentIndices()
         default: throw ArrowMetalError.unsupportedType("list_parent_indices needs a list array, got \(arrowFormat)")
         }
+    }
+
+    /// The same in int64, which is what pyarrow's `list_parent_indices` returns.
+    public func listParentIndices64() throws -> MetalArray<Int64> {
+        try listParentIndices().cast(to: Int64.self)
     }
     /// Arrow `list_slice` on a list or map column (a map's entries are sliced as a list).
     public func listSlice(start: Int, stop: Int? = nil, step: Int = 1) throws -> AnyMetalArray {

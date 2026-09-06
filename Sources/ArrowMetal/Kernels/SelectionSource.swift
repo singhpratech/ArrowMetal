@@ -112,16 +112,21 @@ enum SelectionSource {
         if (m > 0x7FF0000000000000ul) b = 0x7FF8000000000000ul; else if (m == 0ul) b = 0ul;
         out[i] = b;
     }
-    // 1 where a new tie group starts. Sorted positions [0, m) hold the values and [m, n) the nulls,
-    // which are one group. Position 0 writes 1, so an *inclusive* scan numbers the groups from 1.
+    // 1 where a new tie group starts. Position 0 writes 1, so an *inclusive* scan numbers the groups
+    // from 1. The nulls are one tie group occupying the half-open block [nullLo, nullHi) of the sorted order —
+    // at the end for null_placement "at_end", at the front for "at_start".
     kernel void sel_marks(device const \(U)* vals [[buffer(0)]], device const int* ord [[buffer(1)]],
-                          device const uint* nPtr [[buffer(2)]], constant uint& m [[buffer(3)]],
-                          device int* marks [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+                          device const uint* nPtr [[buffer(2)]], constant uint& nullLo [[buffer(3)]],
+                          device int* marks [[buffer(4)]], constant uint& nullHi [[buffer(5)]],
+                          uint i [[thread_position_in_grid]]) {
         uint n = *nPtr;
         if (i >= n) return;
+        bool here = (i >= nullLo && i < nullHi);
+        bool prev = (i >= 1u) && (i - 1u >= nullLo && i - 1u < nullHi);
         int f;
         if (i == 0u) f = 1;
-        else if (i >= m) f = (i == m) ? 1 : 0;
+        else if (here != prev) f = 1;
+        else if (here) f = 0;
         else f = (vals[ord[i]] != vals[ord[i - 1u]]) ? 1 : 0;
         marks[i] = f;
     }

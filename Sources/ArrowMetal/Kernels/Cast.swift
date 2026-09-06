@@ -43,7 +43,12 @@ extension ArrowPrimitive {
             let d = v.asDouble
             guard d.isFinite else { return i.init(truncatingIfNeeded: 0) as! Self }
             let t = d.rounded(.towardZero)
-            // Clamp like the Metal conversion effectively does on Apple GPUs.
+            // Clamp like the Metal conversion effectively does on Apple GPUs. This saturates at 64
+            // bits and then truncates, where Arrow saturates at the *target's* width for a four-byte
+            // or wider target — so `float64(1e20) -> int32` is -1 here and Int32.max in Arrow. The
+            // difference is deliberate and pinned by `test_out_of_range_float_to_int_cast_diverges`:
+            // it is the unchecked cast, which C leaves undefined, and `options: .safe` refuses the
+            // row outright rather than choosing between the two answers.
             if t <= -9.3e18 { return i.init(truncatingIfNeeded: Int64.min) as! Self }
             if t >= 1.9e19 { return i.init(truncatingIfNeeded: UInt64.max) as! Self }
             if t >= 9.3e18 { return i.init(truncatingIfNeeded: UInt64(t)) as! Self }

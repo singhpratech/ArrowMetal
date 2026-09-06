@@ -1238,6 +1238,55 @@ int  am_join_element_wise(am_array* const* handles, int64_t count,
 // way, (?<name>...); the Python wrapper rewrites RE2's (?P<name>...).
 int  am_extract_struct(am_array* a, const uint8_t* pattern, int64_t plen, int flags, int span,
                        am_array** out);
+// ---------------------------------------------------------------------------
+// The option-carrying forms
+//
+// Every function below has a plain entry point elsewhere in this header that takes no options; these
+// take the ones Arrow's own options classes carry. The plain forms keep working and keep their
+// defaults, so nothing that already calls them changes.
+//
+// Enumerations, shared by all of them:
+//
+//   null_placement            0 at_end (Arrow's default)   1 at_start
+//   tiebreaker                0 min   1 max   2 first   3 dense
+//   null_matching_behavior    0 match   1 skip   2 emit_null   3 inconclusive
+//   value order               0 first_appearance (Arrow's own)   1 sorted (the cheaper GPU pass)
+//   temporal rounding mode    0 floor   1 ceil   2 round
+//
+// am_cast_ex: Arrow's `cast` with CastOptions. `format` is the target's Arrow C-data format string;
+// `child_formats` is a comma-separated list of the child target formats for a list ("+l") or struct
+// ("+s") target, or NULL for a flat one. `flags` is a bit field in Arrow's own field order:
+//
+//   bit 0  allow_int_overflow      bit 3  allow_decimal_truncate
+//   bit 1  allow_time_truncate     bit 4  allow_float_truncate
+//   bit 2  allow_time_overflow     bit 5  allow_invalid_utf8
+//
+// All zero is Arrow's `safe=true`: one extra read-only GPU pass converts each value back and the call
+// raises on the first row that loses something. All set is `safe=false`, which is what am_cast does.
+//
+// am_round_temporal_ex: floor / ceil / round with the whole RoundTemporalOptions surface. `unit` is
+// one of "nanosecond", "microsecond", "millisecond", "second", "minute", "hour", "day", "week",
+// "month", "quarter", "year"; `flags` is bit 0 week_starts_monday, bit 1 ceil_is_strictly_greater,
+// bit 2 calendar_based_origin.
+//
+// am_dictionary_encode_ex writes the int32 codes into `codes` and the dictionary into `values`; both
+// must be released by the caller.
+int  am_cast_ex(am_array* a, const char* format, const char* child_formats /* or NULL */,
+                uint32_t flags, am_array** out);
+int  am_argsort_ex(am_array* a, int descending, int null_placement, am_array** out);
+int  am_lexsort_ex(am_array** columns, const int* descending /* or NULL */, int64_t count,
+                   int null_placement, am_array** out);
+int  am_partition_nth_ex(am_array* a, int64_t pivot, int null_placement, am_array** out);
+int  am_rank_ex(am_array* a, int tiebreaker, int descending, int null_placement, am_array** out);
+int  am_rank_quantile_ex(am_array* a, int op, int descending, int null_placement, am_array** out);
+int  am_is_in_ex(am_array* a, am_array* set_array, int null_matching_behavior, am_array** out);
+int  am_index_in_ex(am_array* a, am_array* set_array, int null_matching_behavior, am_array** out);
+int  am_unique_ex(am_array* a, int order, am_array** out);
+int  am_value_counts_ex(am_array* a, int order, am_array** out);
+int  am_dictionary_encode_ex(am_array* a, int order, am_array** codes, am_array** values);
+int  am_round_temporal_ex(am_array* a, int mode, const char* unit, int64_t multiple, uint32_t flags,
+                          am_array** out);
+int  am_list_parent_indices64(am_array* a, am_array** out);
 
 #ifdef __cplusplus
 }
