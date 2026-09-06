@@ -28,7 +28,7 @@ extension ArrowPrimitive where Self: FixedWidthInteger {
         case .add: return a &+ b
         case .sub: return a &- b
         case .mul: return a &* b
-        case .div: return b == 0 ? 0 : a / b
+        case .div: return b == 0 ? 0 : a.dividedReportingOverflow(by: b).partialValue
         }
     }
 }

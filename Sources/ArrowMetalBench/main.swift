@@ -193,6 +193,46 @@ time("CPU \(cores)-core compare then filter", bytes: bytesI64, section: sec) {
 }
 time("Swift  [Int64].filter { $0 > 0 } (1 core, no nulls)", bytes: bytesI64, section: sec) { sink(i64raw.filter { $0 > 0 }) }
 
+sec = "fused filter(where Int64 > 0)"; print("\n" + sec)
+try time("Metal  filter(where:) fused predicate", bytes: bytesI64, section: sec) { sink(try colI64.filter(where: .gt, 0)) }
+
+sec = "group-by sum(Int64) by 5 keys"; print("\n" + sec)
+let keys5 = try MetalArray<Int32>((0..<rows).map { _ in Int32.random(in: 0..<5, using: &g) })
+let gb5 = try keys5.groupBy(keyCount: 5)
+try time("Metal  group-by sum (privatised)", bytes: bytesI64 + rows * 4, section: sec) { sink(try gb5.sum(colI64)) }
+time("CPU \(cores)-core group-by sum", bytes: bytesI64 + rows * 4, section: sec) {
+    let p = opaque(colI64).valuePointer, kp = keys5.valuePointer, bm = colI64.validity!.typed(UInt8.self)
+    let parts = parallelChunks(rows) { lo, hi -> [Int64] in
+        var acc = [Int64](repeating: 0, count: 5)
+        for i in lo..<hi where (bm[i >> 3] >> (i & 7)) & 1 == 1 { acc[Int(kp[i])] &+= p[i] }
+        return acc
+    }
+    var total = [Int64](repeating: 0, count: 5)
+    for part in parts { for k in 0..<5 { total[k] &+= part[k] } }
+    sink(total)
+}
+
+sec = "group-by sum(Int64) by 1000 keys"; print("\n" + sec)
+let keys1k = try MetalArray<Int32>((0..<rows).map { _ in Int32.random(in: 0..<1000, using: &g) })
+let gb1k = try keys1k.groupBy(keyCount: 1000)
+try time("Metal  group-by sum (privatised)", bytes: bytesI64 + rows * 4, section: sec) { sink(try gb1k.sum(colI64)) }
+
+sec = "group-by sum(Int64) by 100000 keys"; print("\n" + sec)
+let keys100k = try MetalArray<Int32>((0..<rows).map { _ in Int32.random(in: 0..<100_000, using: &g) })
+let gb100k = try keys100k.groupBy(keyCount: 100_000)
+try time("Metal  group-by sum (device atomics)", bytes: bytesI64 + rows * 4, section: sec) { sink(try gb100k.sum(colI64)) }
+
+sec = "query: sum(amount) where region == 2 and amount > 100 (50M rows)"; print("\n" + sec)
+let amountF = try MetalArray<Float>((0..<rows).map { _ in Float.random(in: 0...500, using: &g) })
+try time("Metal  filter + filter + sum", bytes: rows * (4 + 4), section: sec) {
+    let m = try keys5.compare(.eq, 2).and(try amountF.compare(.gt, 100))
+    sink(try amountF.filter(m).sum())
+}
+time("CPU \(cores)-core fused loop", bytes: rows * (4 + 4), section: sec) {
+    let kp = opaque(keys5).valuePointer, ap = amountF.valuePointer
+    sink(parallel(rows) { lo, hi -> Double in var s: Float = 0; for i in lo..<hi where kp[i] == 2 && ap[i] > 100 { s += ap[i] }; return Double(s) })
+}
+
 sec = "multiply(Int64 * 3)"; print("\n" + sec)
 try time("Metal  multiply scalar", bytes: bytesI64 * 2, section: sec) { sink(try colI64.multiply(3)) }
 let mulOut = UnsafeMutablePointer<Int64>.allocate(capacity: rows)

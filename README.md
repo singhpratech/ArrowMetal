@@ -26,40 +26,56 @@ arrow-swift or anything else that speaks the C Data Interface.
 
 ## Benchmarks
 
-Apple M4 Max, 50,000,000 rows, best of 5, release build. CPU baselines are tight typed Swift loops over the same
-Arrow layout, plus Accelerate where an equivalent exists. Reproduce with `swift run -c release arrowmetal-bench`.
+Apple M4 Max (16 CPU cores), 50,000,000 rows, best of 5, release build. Full history and methodology in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md) and [Benchmarks/README.md](Benchmarks/README.md).
 
-| Operation | Implementation | Time (ms) | Throughput (GB/s) |
-|---|---|---:|---:|
-| sum(Int64, 10% nulls) | **Metal** | 1.36 | 294.8 |
-| sum(Int64, 10% nulls) | CPU 1-core null-aware loop | 52.28 | 7.7 |
-| sum(Int64, 10% nulls) | CPU 16-core null-aware loop | 4.74 | 84.4 |
-| min(Int64, 10% nulls) | **Metal** | 1.38 | 290.7 |
-| min(Int64, 10% nulls) | CPU 1-core | 28.34 | 14.1 |
-| compare(Int64 > 0) to bitmap | **Metal** | 1.17 | 342.3 |
-| compare(Int64 > 0) to bitmap | CPU 1-core packed bitmap | 7.43 | 53.8 |
-| filter(Int64, ~45% kept) | **Metal** | 5.12 | 78.1 |
-| filter(Int64, ~45% kept) | CPU 1-core bit-scan loop | 36.74 | 10.9 |
-| take(Int64, 25M random indices) | **Metal** | 8.09 | 61.8 |
-| take(Int64, 25M random indices) | CPU 1-core gather loop | 74.58 | 6.7 |
-| Float64 compare(> 500) + filter | **Metal** (bit-pattern kernels) | 5.36 | 74.6 |
-| Float64 compare(> 500) + filter | Swift `[Double].filter` | 180.81 | 2.2 |
-| cast(Int64 to Float32) | **Metal** | 5.04 | 119.0 |
-| cast(Int64 to Float32) | CPU 1-core loop | 10.46 | 57.4 |
-| multiply(Int64 * 3) | **Metal** | 5.90 | 135.6 |
-| multiply(Int64 * 3) | CPU 1-core | 125.82 | 6.4 |
-| sum(Float32) | **Metal** | 1.00 | 199.3 |
-| sum(Float32) | Accelerate vDSP | 2.04 | 97.9 |
-| max(Float32) | **Metal** | 0.93 | 216.1 |
-| max(Float32) | Accelerate vDSP | 2.02 | 99.1 |
-| multiply(Float32 * 2.5) | Metal | 3.67 | 109.0 |
-| multiply(Float32 * 2.5) | **Accelerate vDSP** | 3.14 | 127.3 |
+**Called from Python, same in-process data**, against Polars (16 threads), pyarrow.compute and pandas:
 
-Takeaways: reductions and comparisons run at memory bandwidth on the GPU and beat 16 CPU cores. Filter is
-about 7x a single core. Pure element-wise arithmetic is bandwidth bound on both sides, so Accelerate ties or
-wins there; use the GPU when the column is already resident or the operation is part of a larger GPU pipeline.
+| Operation | ArrowMetal | Polars | pyarrow | pandas |
+|---|---:|---:|---:|---:|
+| sum Int64, 10% nulls | **1.05 ms** | 15.78 | 48.26 | 47.75 |
+| filter Int64 > 0 | **3.55** | 22.99 | 211.05 | 271.50 |
+| take 25M random indices | **5.98** | 164.82 | 138.61 | |
+| group-by sum, 1000 keys | **2.05** | 84.65 | 18.73 | |
+| filter two columns + sum | **3.13** | 16.41 (lazy) | | 109.46 (numpy) |
 
-## Quick start
+**Swift, against all 16 CPU cores** (tight typed loops over the same Arrow layout) and Accelerate:
+
+| Operation | Metal | 16-core CPU / Accelerate |
+|---|---:|---:|
+| sum Int64, 10% nulls | **1.40 ms** | 4.89 |
+| min Int64 | **1.34** | 3.73 |
+| compare Int64 > 0 to bitmap | **1.07** | 2.12 |
+| filter Int64 (45% kept) | **2.90** | 3.49 |
+| take 25M random indices | **5.85** | 11.93 |
+| group-by sum, 5 keys | **1.96** | 5.92 |
+| query: filter two columns + sum | **2.33** | 6.36 |
+| multiply Int64 * 3 | **2.13** | 2.26 |
+| cast Int64 to Float32 | 3.14 | **1.80** |
+| sum Float32 | 0.90 | **0.84** (vDSP) |
+| multiply Float32 * 2.5 | 1.72 | **1.63** (vDSP) |
+| Float32 compare + filter | **2.14** | 5.73 |
+
+Takeaways: reductions, comparisons, selection, group-by and query-shaped pipelines beat all 16 CPU cores by
+1.5x to 3x and Polars by 5x to 40x. Pure element-wise arithmetic is memory bound on both sides, so
+Accelerate on 16 cores ties or edges ahead there. Arrays under about a million rows are dominated by the
+fixed cost of a GPU dispatch (see [docs/DESIGN.md](docs/DESIGN.md) for the pipelining plan).
+
+## From Python
+
+```
+swift build -c release --product ArrowMetalC        # .build/release/libArrowMetalC.dylib
+PYTHONPATH=python python -c "import arrowmetal as am; print(am.device_name())"
+```
+```python
+import pyarrow as pa, polars as pl, arrowmetal as am
+col = am.array(pl.Series([1, None, 3, 40]).to_arrow())
+print(col.filter_where(">", 2).sum(), pl.from_arrow(col.filter_where(">", 2).to_arrow()))
+```
+The same C ABI (`include/arrowmetal.h`) serves Rust, Go, C#, R, C++ and C through their Arrow C Data
+Interface bindings. See [python/README.md](python/README.md).
+
+## Quick start (Swift)
 
 ```swift
 import ArrowMetal
@@ -103,8 +119,13 @@ enough to build and use it. Running the test suite needs Xcode (for XCTest):
 - `MetalArray<T>` for Int8/16/32/64, UInt8/16/32/64, Float32, Float64; `MetalBooleanArray` with packed bits.
 - `MetalRecordBatch`: named equal-length columns with `filter`, `take`, `slice`, `selecting`.
 - Kernels: `sum`, `min`, `max`, `mean`, `compare` (6 ops, scalar and array), `add/sub/mul/div` (scalar and
-  array), `filter`, `take` (Int32/Int64/UInt32 indices, bounds checked), `cast`, `slice` (zero-copy when
-  32-aligned), boolean `and/or/not/count/any/all`. All null-aware with Arrow semantics.
+  array, vectorised), `filter` and fused `filter(where:)` (single command buffer, GPU scan), `take`
+  (Int32/Int64/UInt32 indices, bounds checked), `cast`, `slice` (zero-copy when 32-aligned), boolean
+  `and/or/not/count/any/all`. All null-aware with Arrow semantics.
+- `GroupBy` over dense integer keys: `count`, `sum`, `mean`, `min`, `max` (privatised threadgroup tables for
+  up to 1024 keys, device atomics beyond; 64-bit sums via split 32-bit atomics with carry).
+- `libArrowMetalC`: a C ABI over everything above, and a ctypes Python package that speaks the Arrow
+  PyCapsule protocol.
 - Float64: Metal has no `double`, so compare, min, max, filter, take and slice run on the GPU using an
   order-preserving map of the IEEE bit pattern (exact, NaN and signed zero handled); sum and arithmetic run
   on the CPU through the same API.

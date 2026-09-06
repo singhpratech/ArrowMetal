@@ -16,19 +16,18 @@ Ordered roughly by impact divided by effort. Each item is a self-contained contr
 ## Medium term
 - [x] **RecordBatch**: multiple columns, struct import/export, C Stream import. Open: C Stream export,
       C Device Stream, nested struct children.
-- [ ] **Hash aggregation** (`group_by` sum/count/min/max) with a GPU hash table in threadgroup memory.
+- [x] **Group-by** over dense keys (sum/count/min/max/mean). Open: hash group-by for arbitrary keys, 64-bit min/max.
 - [ ] **Sort / argsort** (radix sort on the GPU), then **top-k**.
 - [ ] **Strings** (`utf8`, `large_utf8`, and `utf8_view`): equality, prefix match, length, hashing.
 - [ ] **Dictionary-encoded** arrays: compare and filter on codes without decoding.
-- [ ] **Async API**: return command buffers or Swift `async` results instead of blocking per kernel; fuse
+- [ ] **Async / pipelined API** (see docs/DESIGN.md): return command buffers or Swift `async` results instead of blocking per kernel; fuse
       kernels into one command buffer; expose `MTLSharedEvent` through `sync_event` in the device interface.
 - [ ] **Metal 4** command-encoding path and residency sets for very large columns.
 
 ## Integrations
 - [ ] `ArrowMetalSwiftArrow`: convenience conversion to and from `apache/arrow-swift` arrays.
 - [ ] `ArrowMetalMLX`: zero-copy bridge to `MLXArray` for feeding columns into models.
-- [ ] Python wheel exposing `__arrow_c_array__` / `__arrow_c_device_array__` so pyarrow, Polars and DuckDB can
-      hand columns to the GPU and take results back.
+- [x] Python package over the C ABI with `__arrow_c_array__`. Open: wheel packaging with the dylib inside, `__arrow_c_device_array__`.
 - [ ] A DuckDB or DataFusion user-defined function that offloads a scan+filter+aggregate to ArrowMetal.
 
 ## Project

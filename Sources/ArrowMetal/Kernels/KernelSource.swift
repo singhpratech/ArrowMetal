@@ -174,10 +174,22 @@ enum KernelSource {
     """ }
 
     /// Element-wise arithmetic. Each thread handles 4 elements through vector loads/stores; the tail is scalar.
+    /// Integer division by zero yields 0 (defined here, matching the CPU reference); overflow wraps.
     static func arithmetic(T: String) -> String {
+        let isInt = !["float", "double"].contains(T)
         let ops: [(String, String)] = [("add", "+"), ("sub", "-"), ("mul", "*"), ("div", "/")]
         var s = prelude
         for (name, op) in ops {
+            let vecScalar: String, sclScalar: String, vecArray: String, sclArray: String
+            if name == "div" && isInt {
+                vecScalar = "(scalar == (\(T))0) ? \(T)4(0) : v / scalar"
+                sclScalar = "(scalar == (\(T))0) ? (\(T))0 : a[i] / scalar"
+                vecArray = "select(va / select(vb, \(T)4(1), vb == \(T)4(0)), \(T)4(0), vb == \(T)4(0))"
+                sclArray = "(b[i] == (\(T))0) ? (\(T))0 : a[i] / b[i]"
+            } else {
+                vecScalar = "v \(op) scalar"; sclScalar = "a[i] \(op) scalar"
+                vecArray = "va \(op) vb"; sclArray = "a[i] \(op) b[i]"
+            }
             s += """
             kernel void arith_scalar_\(name)(device const \(T)* a [[buffer(0)]],
                                             constant \(T)& scalar [[buffer(1)]],
@@ -187,9 +199,9 @@ enum KernelSource {
                 uint i = t * 4u;
                 if (i + 4u <= n) {
                     \(T)4 v = *(device const \(T)4*)(a + i);
-                    *(device \(T)4*)(out + i) = v \(op) scalar;
+                    *(device \(T)4*)(out + i) = \(vecScalar);
                 } else {
-                    for (; i < n; i++) out[i] = a[i] \(op) scalar;
+                    for (; i < n; i++) out[i] = \(sclScalar);
                 }
             }
             kernel void arith_array_\(name)(device const \(T)* a [[buffer(0)]],
@@ -201,9 +213,9 @@ enum KernelSource {
                 if (i + 4u <= n) {
                     \(T)4 va = *(device const \(T)4*)(a + i);
                     \(T)4 vb = *(device const \(T)4*)(b + i);
-                    *(device \(T)4*)(out + i) = va \(op) vb;
+                    *(device \(T)4*)(out + i) = \(vecArray);
                 } else {
-                    for (; i < n; i++) out[i] = a[i] \(op) b[i];
+                    for (; i < n; i++) out[i] = \(sclArray);
                 }
             }
 

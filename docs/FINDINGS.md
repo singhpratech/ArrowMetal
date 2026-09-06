@@ -29,3 +29,12 @@ Things learned the hard way. Add to this whenever something surprises you.
 - Memory-bound element-wise kernels run at ~375 GB/s on M4 Max once allocation overhead is removed; the
   16-core CPU reaches ~350 GB/s on the same loops. Reductions and compaction favour the GPU by 2x to 3x.
 - Fusing the predicate into the filter's counting pass avoids materialising a boolean array.
+
+## Round 3 (2026-09-06)
+- Metal integer division by zero returns an unspecified value (observed 1 on M4 Max). ArrowMetal now
+  defines it as 0 in both the GPU kernels and the CPU reference, and `Int.min / -1` wraps instead of trapping.
+- Threadgroup-privatised group-by with 32-bit atomics reaches ~300 GB/s for up to 1024 keys, the same rate
+  as a plain sum: the atomics are not the bottleneck at that key count. Device atomics at 100k keys halve it.
+- Crossing the C boundary from Python costs nothing measurable per call (ctypes overhead is ~10 µs);
+  exporting a result back to pyarrow is zero-copy (3.55 ms vs 3.57 ms with export).
+- Importing pyarrow buffers is one memcpy: pyarrow's allocator is 64-byte aligned, not page aligned.

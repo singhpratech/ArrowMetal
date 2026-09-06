@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0 (2026-09-06)
+- Buffer pool with unzeroed kernel outputs (2-3x faster write-heavy kernels).
+- Filter runs in one command buffer with a GPU scan; fused `filter(where:)` predicate path.
+- Vectorised arithmetic and cast kernels (4 elements per thread).
+- `GroupBy` over dense integer keys: count, sum, mean, min, max; privatised and device-atomic paths.
+- C ABI (`libArrowMetalC`, `include/arrowmetal.h`) and a Python package (`python/arrowmetal`).
+- Scenario matrix, concurrency and pool tests; Polars/pyarrow/pandas and in-process Python benchmarks.
+- Docs: decision log, findings, benchmark history, design and future capability.
+
 ## 0.2.0 (2026-09-06)
 - `take` (gather) with Int32/Int64/UInt32 indices, null indices and GPU bounds checking.
 - `cast` between all primitive types; `slice` with zero-copy views at 32-element alignment.

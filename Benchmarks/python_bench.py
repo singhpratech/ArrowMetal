@@ -77,6 +77,38 @@ sec = "cast(Int64 -> Float32)"; print("\n" + sec)
 bench(sec, "polars  cast", rows * 12, lambda: pl_i64.cast(pl.Float32))
 bench(sec, "pyarrow cast", rows * 12, lambda: pc.cast(arr_i64, pa.float32()))
 
+# ---- group-by and end-to-end query
+keys5 = rng.integers(0, 5, size=rows, dtype=np.int32)
+df = pl.DataFrame({"k": keys5, "x": pl_i64})
+pa_tbl = pa.table({"k": pa.array(keys5), "x": arr_i64})
+pdf = pd.DataFrame({"k": keys5, "x": pd_i64})
+GB = rows * 12
+sec = "group-by sum(Int64) by 5 keys"; print("\n" + sec)
+bench(sec, "polars  group_by sum", GB, lambda: df.group_by("k").agg(pl.col("x").sum()))
+bench(sec, "pyarrow group_by sum", GB, lambda: pa_tbl.group_by("k").aggregate([("x", "sum")]))
+bench(sec, "pandas  groupby sum (arrow-backed)", GB, lambda: pdf.groupby("k")["x"].sum())
+keys1k = rng.integers(0, 1000, size=rows, dtype=np.int32)
+df1k = pl.DataFrame({"k": keys1k, "x": pl_i64}); pa1k = pa.table({"k": pa.array(keys1k), "x": arr_i64})
+sec = "group-by sum(Int64) by 1000 keys"; print("\n" + sec)
+bench(sec, "polars  group_by sum", GB, lambda: df1k.group_by("k").agg(pl.col("x").sum()))
+bench(sec, "pyarrow group_by sum", GB, lambda: pa1k.group_by("k").aggregate([("x", "sum")]))
+keys100k = rng.integers(0, 100_000, size=rows, dtype=np.int32)
+df100k = pl.DataFrame({"k": keys100k, "x": pl_i64}); pa100k = pa.table({"k": pa.array(keys100k), "x": arr_i64})
+sec = "group-by sum(Int64) by 100000 keys"; print("\n" + sec)
+bench(sec, "polars  group_by sum", GB, lambda: df100k.group_by("k").agg(pl.col("x").sum()))
+bench(sec, "pyarrow group_by sum", GB, lambda: pa100k.group_by("k").aggregate([("x", "sum")]))
+
+amount = (rng.random(rows, dtype=np.float32) * 500).astype(np.float32)
+q = pl.DataFrame({"region": keys5, "amount": amount})
+qlazy = q.lazy()
+pq = pd.DataFrame({"region": keys5, "amount": amount})
+QB = rows * 8
+sec = "query: sum(amount) where region == 2 and amount > 100 (50M rows)"; print("\n" + sec)
+bench(sec, "polars  lazy (fused)", QB, lambda: qlazy.filter((pl.col("region") == 2) & (pl.col("amount") > 100)).select(pl.col("amount").sum()).collect())
+bench(sec, "polars  eager", QB, lambda: q.filter((pl.col("region") == 2) & (pl.col("amount") > 100))["amount"].sum())
+bench(sec, "pandas  query", QB, lambda: pq.loc[(pq.region == 2) & (pq.amount > 100), "amount"].sum())
+bench(sec, "numpy   masked sum", QB, lambda: amount[(keys5 == 2) & (amount > 100)].sum())
+
 # ---- Float64 no nulls
 f64 = rng.random(rows) * 1000.0
 arr_f64 = pa.array(f64); pl_f64 = pl.Series(arr_f64); pd_f64 = pd.Series(f64)

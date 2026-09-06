@@ -1,5 +1,31 @@
 # Benchmark history
 
+## 2026-09-06, Apple M4 Max, v0.3: group-by, fused query, and ArrowMetal called from Python
+Swift side (Metal vs 16-core Swift):
+
+| Operation | Metal | 16-core Swift |
+|---|---:|---:|
+| fused filter(where Int64 > 0) | 3.60 ms | 3.49 (count/prefix/scatter) |
+| group-by sum Int64, 5 keys (privatised) | 1.96 | 5.92 |
+| group-by sum Int64, 1000 keys (privatised) | 2.02 | |
+| group-by sum Int64, 100000 keys (device atomics) | 4.02 | |
+| query: sum(amount) where region == 2 and amount > 100 | 2.33 | 6.36 (fused loop) |
+
+Python side, same in-process data, ArrowMetal through the C ABI vs Polars 1.44 (16 threads), pyarrow 25, pandas 3.0:
+
+| Operation | ArrowMetal from Python | Polars | pyarrow.compute | pandas |
+|---|---:|---:|---:|---:|
+| sum Int64, 10% nulls | 1.05 ms | 15.78 | 48.26 | 47.75 |
+| filter Int64 > 0 (fused) | 3.55 | 22.99 | 211.05 | 271.50 |
+| filter + export back to pyarrow | 3.57 | | | |
+| take 25M random indices | 5.98 | 164.82 | 138.61 | |
+| group-by sum, 1000 keys | 2.05 | 84.65 | 18.73 | |
+| query: filter two columns + sum | 3.13 | 16.41 (lazy, fused) | | 109.46 (numpy) |
+
+Importing a 50M-row Int64 column from pyarrow into Metal memory (one copy, pyarrow buffers are not page aligned)
+took about 60 ms; every later operation on it is zero-copy in and out.
+
+
 All runs: best of 5, release build, 50,000,000 rows. Hardware is named per run. Reproduce with
 `swift run -c release arrowmetal-bench` and `python Benchmarks/python_bench.py` (venv with polars, pyarrow, pandas).
 

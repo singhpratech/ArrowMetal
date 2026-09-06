@@ -7,6 +7,8 @@ let package = Package(
     products: [
         .library(name: "ArrowMetal", targets: ["ArrowMetal"]),
         .library(name: "CArrowABI", targets: ["CArrowABI"]),
+        // C ABI as a dynamic library for Python, Rust, Go, C#, R, C++ and C consumers.
+        .library(name: "ArrowMetalC", type: .dynamic, targets: ["ArrowMetalC"]),
         .executable(name: "arrowmetal-bench", targets: ["ArrowMetalBench"]),
         .executable(name: "arrowmetal-examples", targets: ["ArrowMetalExamples"]),
     ],
@@ -18,6 +20,7 @@ let package = Package(
             dependencies: ["CArrowABI"],
             linkerSettings: [.linkedFramework("Metal")]
         ),
+        .target(name: "ArrowMetalC", dependencies: ["ArrowMetal", "CArrowABI"]),
         .executableTarget(name: "ArrowMetalBench", dependencies: ["ArrowMetal"]),
         .executableTarget(name: "ArrowMetalExamples", dependencies: ["ArrowMetal", "CArrowABI"]),
         .testTarget(name: "ArrowMetalTests", dependencies: ["ArrowMetal", "CArrowABI"]),
