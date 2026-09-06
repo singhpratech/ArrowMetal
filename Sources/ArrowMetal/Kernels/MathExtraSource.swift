@@ -11,9 +11,9 @@ import Foundation
 ///     `(u - 1)·x/log(u)` — cannot be used, because this Metal front end folds `log(exp(x))` back to `x`
 ///     and collapses it to the naive form. They are Taylor series near zero and the library call outside.
 ///   * **float64** — values travel as raw `ulong` bit patterns and every step runs through the software
-///     binary64 arithmetic of `DoubleMath` and the transcendentals of `DoubleTranscendental`. These are
-///     therefore *not* the seven-digit `float`-detour results the older float64 transcendentals give;
-///     they carry the full 53-bit significand (measured ulp bounds are on `DoubleTranscendental`).
+///     binary64 arithmetic of `DoubleMath` and the transcendentals of `DoubleTranscendental`, so they
+///     carry the full 53-bit significand rather than the seven digits a `float` detour would leave
+///     (measured ulp bounds are on `DoubleTranscendental`).
 ///   * **integers** — only the rounding family, which Arrow does define on integer columns: `expm1`,
 ///     `log1p`, `logb` and `hypot` need a floating point column here and throw on an integer one, exactly
 ///     as `sqrt` and `ln` already do (Arrow instead promotes to float64; cast first).

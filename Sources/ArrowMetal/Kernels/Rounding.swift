@@ -23,7 +23,8 @@ public enum UnaryMathOp: String, CaseIterable, Sendable {
 
 /// Element-wise binary arithmetic beyond `add`/`sub`/`mul`/`div`.
 public enum BinaryMathOp: String, CaseIterable, Sendable {
-    /// Integers use repeated squaring and wrap; a negative exponent is defined as 0. Floats use `pow`.
+    /// Integers use repeated squaring and wrap; a negative exponent is defined as 0. `float32` uses MSL
+    /// `pow`; `float64` uses the software binary64 `dp_pow` (`Kernels/DoublePower.swift`), within 1 ulp.
     case power
     /// `%` with C remainder semantics: the sign follows the dividend. Integer `x % 0` is defined as 0.
     case modulo
@@ -56,8 +57,9 @@ extension MetalArray {
     /// One element-wise unary math op. Validity is shared with the input, zero-copy: null in, null out.
     ///
     /// On `float64`, `negate`/`abs`/`sign`/`floor`/`ceil`/`round`/`trunc` are exact (bit-pattern work on
-    /// the GPU). `sqrt`/`exp`/`ln`/`log10`/`log2` are evaluated in `float` and widened, so they carry
-    /// about 7 correct significant decimal digits; see `RoundingSource`.
+    /// the GPU), `sqrt` is correctly rounded, and `exp`/`ln`/`log10`/`log2` run in software binary64
+    /// within 1 ulp — see `Kernels/DoublePower.swift`. They are compute bound rather than memory bound,
+    /// which is the price of not evaluating them in `float`.
     public func unaryMath(_ op: UnaryMathOp) throws -> MetalArray<T> {
         if op.requiresFloat { try MathTypes.requireFloat(T.self, op.rawValue) }
         let n = dispatchLength
@@ -154,10 +156,11 @@ extension MetalArray {
         return res
     }
 
-    /// `power` and `modulo` on `float64` would have to run through the `float` path, which is far too
-    /// coarse to be worth shipping; say so instead of returning a bad answer.
+    /// `power` on `float64` runs in software binary64 (`Kernels/DoublePower.swift`). `modulo` still has
+    /// no float64 kernel: it would have to take the `float` detour, which is far too coarse to be worth
+    /// shipping, so say so instead of returning a bad answer.
     private static func requireBinarySupported(_ op: BinaryMathOp) throws {
-        if T.self == Double.self && !op.isMinMax {
+        if T.self == Double.self && op == .modulo {
             throw ArrowMetalError.unsupportedType("\(op.rawValue) is not implemented for float64; cast to float32 first")
         }
     }

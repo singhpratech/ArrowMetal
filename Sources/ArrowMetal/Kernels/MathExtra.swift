@@ -54,9 +54,9 @@ public enum RoundMode: Int, CaseIterable, Sendable {
 /// **Precision.** `float32` uses the MSL library functions (`expm1` and `log1p`, which MSL does not have,
 /// are built from `exp`/`log` with Kahan's correction so that they keep full relative accuracy near
 /// zero). `float64` runs entirely in software binary64 — see `Kernels/DoubleTranscendental.swift` for the
-/// methods and the ulp bounds measured against Foundation. That makes these four functions considerably
-/// more accurate on `float64` than the older `sqrt`/`exp`/`ln`/`log2`/`log10`, which still take the
-/// `float` detour documented on `RoundingSource`; the same machinery could lift those later.
+/// methods and the ulp bounds measured against Foundation. These four were the first float64
+/// transcendentals not to take the `float` detour; `Kernels/DoublePower.swift` has since done the same
+/// for `sqrt`/`exp`/`ln`/`log2`/`log10`/`power`, so the whole family is binary64 now.
 ///
 /// **Integers.** Arrow defines the rounding family on integer columns and it is implemented here, exactly,
 /// on the quotient and remainder (so an `int64` above 2^53 rounds without ever touching a float).

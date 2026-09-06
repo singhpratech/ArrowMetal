@@ -57,6 +57,15 @@ Numerics
   identities), a software binary64 implementation for float64, within 4-5 ulp of the host libm.
 - The remaining element-wise math: `expm1`, `log1p`, `logb`, `hypot`, `round_to_multiple`, `round_binary`
   and `round` with all ten Arrow round modes and any `ndigits`.
+- Float64 `sqrt`/`exp`/`ln`/`log2`/`log10`/`power` (and their `_checked` twins) in real software
+  binary64, not a `float` evaluation widened back: `sqrt` is correctly rounded — bit-identical to
+  Foundation — and the rest are within 1 ulp, measured over 10^6 inputs each across the whole domain.
+  `power` on a float64 column is new; it used to raise. The trade is throughput, stated in
+  `docs/BENCHMARKS.md`: a binary64 logarithm costs about 25x what the seven-digit one did.
+- Software binary64 arithmetic made faster without losing a bit: `clz` normalisation instead of shift
+  loops, four 32x32 partial products instead of an emulated 64x64, and a Newton reciprocal with an exact
+  128-bit remainder correction instead of a 57-step restoring division. Float64 `add`, `multiply` and
+  `divide` now all run at the machine's memory ceiling.
 - Float classification (`is_nan`, `is_finite`, `is_inf`) as raw bit-pattern tests, and the boolean
   operators the bitmap family lacked: `xor`, `and_not`, `and_not_kleene`.
 - Statistical aggregates `skew`, `kurtosis` and `tdigest` (GPU sort, host centroid merge), with grouped

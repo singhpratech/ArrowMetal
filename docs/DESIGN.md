@@ -57,9 +57,48 @@ next kernel (compare, arithmetic, cast, bitmap ops, another filter, a reduction'
 the CPU to know the length. A reduction still syncs once to read its partials.
 
 **Float64 without hardware doubles.** `Kernels/DoubleMath.swift` carries a software IEEE-754 binary64
-(`d_add`, `d_sub`, `d_mul`, `d_div`) over `ulong` bit patterns, correctly rounded. Sum accumulates with
-`d_add`; arithmetic kernels run one element per thread. It is slower than native Float32 math but still
-memory-bound at 50M rows, and it means no Float64 column ever falls back to the CPU.
+(`d_add`, `d_sub`, `d_mul`, `d_div`, `d_sqrt`) over `ulong` bit patterns, correctly rounded. Sum
+accumulates with `d_add`; arithmetic kernels run one element per thread. `d_div` is a Newton reciprocal
+seeded by one hardware `float` division, with the exact 128-bit remainder `N - q·D` settling the last
+bit; `d_sqrt` extracts the root digit by digit in integers. Both are correctly rounded rather than close,
+and `DoubleMathTests` holds them to Swift's own `Double` bit for bit. `add` and `multiply` run at this
+machine's memory ceiling (≈390 GB/s at 50M rows) and `divide` within 15% of it (331 GB/s), so no Float64
+column ever falls back to the CPU and the software arithmetic is all but invisible in a bandwidth-bound
+query.
+
+The transcendentals are a different story, and worth being explicit about. `Kernels/DoubleTranscendental.swift`
+(`expm1`, `log1p`, `logb`, `hypot`, the ten `RoundMode`s) and `Kernels/DoublePower.swift` (`exp`, `ln`,
+`log2`, `log10`, `pow`) evaluate in binary64 from end to end, over that same software arithmetic —
+**not** by narrowing the column to `float`, calling Metal's own library and widening back, which is what
+these kernels used to do for about seven correct significant decimal digits out of sixteen. `pow` is the
+one that sets the bar: a 1-ulp result needs the product `y·log2 x`, which reaches 1024 in magnitude,
+accurate to 2⁻⁶¹ absolutely — more than a double holds — so `log2 x` is carried as an unevaluated hi/lo
+pair whose high part keeps 21 significant bits, and `y` is split the same way so that `y₁·t₁` is an exact
+double. That is fdlibm's layout, and its Remez coefficients and hi/lo constants are reused verbatim; the
+three logarithms fall out of the same reduction, more accurately than a direct series would give them.
+
+Accuracy is measured, not derived. `DoubleTranscendentalTests` compares each function with Foundation
+over 10⁶ random inputs drawn across its whole domain and prints the ulp histogram; these are those
+numbers:
+
+| function | domain sampled                                        | max ulp |
+|----------|-------------------------------------------------------|---------|
+| `sqrt`   | every finite positive bit pattern, subnormals included | **0** (bit-identical) |
+| `exp`    | -745.2 to 709.78, plus the subnormal-result and near-overflow edges | 1 |
+| `ln`     | 5e-324 to 1.8e308, plus near 1 and the subnormals      | 1       |
+| `log2`   | same                                                   | 1       |
+| `log10`  | same                                                   | 1       |
+| `power`  | 10⁶ random pairs, 5·10⁵ negative bases with integer exponents | 1 |
+
+The C99 edge table — `x^0`, `0^y`, `1^y`, `(-1)^int`, infinity and NaN propagation — matches libm bit for
+bit, and the `_checked` twins are the unchecked kernel plus a read-only check pass, so they inherit every
+value and raise at exactly the same boundaries.
+
+The price is throughput, and it is the honest cost of the accuracy. At 50M rows on an M4 Max, the old
+`float`-detour `ln` ran at 250 GB/s because it was memory bound; the binary64 one runs at 10 GB/s because
+it is compute bound on forty-odd software operations per element. That is a 25x throughput loss for nine
+more correct digits, and it is the right trade for a library whose whole claim is that a Float64 column
+means Float64. The float32 kernels are untouched and still take the hardware path.
 
 ### Async
 `MetalContext.batchAsync` is `batch { }` without the wait. It records `body`'s kernels into one command
