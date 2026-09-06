@@ -15,6 +15,7 @@ the divergences the harness found.
 
 Needs a real Metal device and libArrowMetalC.dylib (see python/README.md).
 """
+import decimal
 import math
 import os
 import re
@@ -42,12 +43,81 @@ ARROW_TYPE = {n: pa.type_for_alias("string" if n == "utf8" else n) for n in ALL_
 NUMPY_TYPE = {n: np.dtype(n) for n in NUMERIC}
 _LIMITS = {n: (int(np.iinfo(NUMPY_TYPE[n]).min), int(np.iinfo(NUMPY_TYPE[n]).max)) for n in INTEGER}
 
+# ------------------------------------------------------------------ the extended type matrix
+#
+# Everything ArrowMetal imports beyond the twelve flat primitives above. The names are the matrix's
+# own; ARROW_TYPE maps each to its pyarrow type and the generators below produce it for every shape.
+
+#: A timezone with a DST rule, so assume_timezone / local_timestamp / is_dst have something to do.
+TZ_NAME = "America/New_York"
+TIME_UNITS = ["s", "ms", "us", "ns"]
+#: Ticks in one second, per unit.
+TICKS = {"s": 1, "ms": 10 ** 3, "us": 10 ** 6, "ns": 10 ** 9}
+
+TIMESTAMP_NAIVE = ["ts_" + u for u in TIME_UNITS]
+TIMESTAMP_TZ = ["ts_" + u + "_tz" for u in TIME_UNITS]
+TIMESTAMP_TYPES = TIMESTAMP_NAIVE + TIMESTAMP_TZ
+DATE_TYPES = ["date32", "date64"]
+TIME_TYPES = ["time32_s", "time32_ms", "time64_us", "time64_ns"]
+DURATION_TYPES = ["duration_" + u for u in TIME_UNITS]
+#: Every type that carries a date, and so answers the calendar extractors.
+DATE_LIKE = TIMESTAMP_TYPES + DATE_TYPES
+#: Every temporal type, including the ones that carry no date.
+TEMPORAL_TYPES = TIMESTAMP_TYPES + DATE_TYPES + TIME_TYPES + DURATION_TYPES
+
+#: (precision, scale) pairs: a small one, a mid-range one and Arrow's maximum precision.
+DECIMAL128_TYPES = ["decimal128_9_2", "decimal128_18_6", "decimal128_38_10"]
+SMALL_DECIMAL_TYPES = ["decimal32_9_2", "decimal64_18_4"]
+DECIMAL_TYPES = DECIMAL128_TYPES + SMALL_DECIMAL_TYPES
+NESTED_TYPES = ["list_int64", "list_utf8", "struct", "map"]
+LIST_TYPES = ["list_int64", "list_utf8"]
+OTHER_TYPES = ["float16", "fixed_size_binary", "dict_utf8", "run_end_int64", "null", "mdn_interval"]
+
+EXTENDED_TYPES = (TIMESTAMP_TYPES + DATE_TYPES + TIME_TYPES + DURATION_TYPES +
+                  DECIMAL_TYPES + NESTED_TYPES + OTHER_TYPES)
+#: Every column type the matrix generates, in report order.
+MATRIX_TYPES = ALL_TYPES + EXTENDED_TYPES
+
+
+def _decimal_parts(name):
+    """("decimal128_9_2") -> (128, 9, 2)."""
+    kind, precision, scale = name.split("_")
+    return int(kind[len("decimal"):]), int(precision), int(scale)
+
+
+def _extended_arrow_type(name):
+    if name in TIMESTAMP_TYPES:
+        unit = name.split("_")[1]
+        return pa.timestamp(unit, TZ_NAME if name.endswith("_tz") else None)
+    if name in DURATION_TYPES:
+        return pa.duration(name.split("_")[1])
+    if name in TIME_TYPES:
+        width, unit = name.split("_")
+        return pa.time32(unit) if width == "time32" else pa.time64(unit)
+    if name in DECIMAL_TYPES:
+        bits, precision, scale = _decimal_parts(name)
+        return {32: pa.decimal32, 64: pa.decimal64, 128: pa.decimal128}[bits](precision, scale)
+    return {
+        "date32": pa.date32(), "date64": pa.date64(),
+        "list_int64": pa.list_(pa.int64()), "list_utf8": pa.list_(pa.string()),
+        "struct": pa.struct([("a", pa.int64()), ("b", pa.string())]),
+        "map": pa.map_(pa.string(), pa.int64()),
+        "float16": pa.float16(), "fixed_size_binary": pa.binary(8),
+        "dict_utf8": pa.dictionary(pa.int32(), pa.string()),
+        "run_end_int64": pa.run_end_encoded(pa.int32(), pa.int64()),
+        "null": pa.null(),
+        "mdn_interval": pa.month_day_nano_interval(),
+    }[name]
+
+
+ARROW_TYPE.update({n: _extended_arrow_type(n) for n in EXTENDED_TYPES})
+
 #: Relative tolerance where the two engines legitimately accumulate in a different order.
 FLOAT_TOL = {"float32": 1e-6, "float64": 1e-12}
 
 
 #: pyarrow spells float32 "float" and float64 "double"; map back to the names used here.
-_NAME_OF_TYPE = {ARROW_TYPE[n]: n for n in ALL_TYPES}
+_NAME_OF_TYPE = {ARROW_TYPE[n]: n for n in MATRIX_TYPES}
 
 
 def type_name_of(arr):
@@ -112,7 +182,10 @@ SHAPES = build_shapes()
 
 # ------------------------------------------------------------------ value generators
 
-_UNICODE = ["héllo", "日本語", "naïve", "Ωμέγα", "🙂🙃", "é", "ÅNGSTRÖM", "á"]
+_UNICODE = ["héllo", "日本語", "naïve", "Ωμέγα", "🙂🙃", "é", "ÅNGSTRÖM", "á",
+            # A full-width digit run and a title-case code point: the first is what separates ICU's
+            # `\d` from RE2's, the second a title-case predicate from an upper-case one.
+            "\uff12\uff10\uff12\uff14", "\u01c5ungla"]
 _SHORT_STRINGS = ["", "a", "apple", "banana", "app", "Apple", "  padded  ", "tab\tsep",
                   "line\nbreak", "0", "-1", "null", "aa"] + _UNICODE
 _STRING_POOL = _SHORT_STRINGS + ["x" * 300, "x" * 4096]
@@ -177,6 +250,212 @@ def _values(rng, name, n, flavor):
     return np.clip(base, lo, hi).astype(NUMPY_TYPE[name])
 
 
+# ------------------------------------------------------------------ extended value generators
+#
+# One builder per extended type. Each returns a pyarrow array of `n` rows with the null ratio already
+# applied. Where the type has a numeric payload the nulls go on with `pa.array(values, mask=...)`, so
+# the values stay *under* the validity bitmap exactly as they do for the flat types; the variable-length
+# and nested builders use None rows, which is the only thing pyarrow will build them from.
+
+#: The window the temporal generators draw from: 1900-01-01 to 2100-01-01, in seconds. Wide enough to
+#: cross every leap-year and week-numbering rule, narrow enough that a nanosecond timestamp (which runs
+#: out in 2262) and a nanosecond difference both stay inside int64.
+_EPOCH_LO, _EPOCH_HI = -2_208_988_800, 4_102_444_800
+
+
+def _seconds_of(y, mo, d, h=0, mi=0, s=0):
+    """Seconds from the epoch for a UTC civil time, without importing datetime's timezone rules."""
+    a = (14 - mo) // 12
+    days = (y + 4800 - a) * 365 + (y + 4800 - a) // 4 - (y + 4800 - a) // 100 + (y + 4800 - a) // 400
+    days += (153 * (mo + 12 * a - 3) + 2) // 5 + d - 32045 - 2440588
+    return days * 86400 + h * 3600 + mi * 60 + s
+
+
+#: Instants a temporal kernel is most likely to get wrong, in seconds.
+_SPECIAL_SECONDS = [
+    0, 1, -1, 86399, 86400, -86400,                       # the epoch and the day around it
+    _seconds_of(1900, 1, 1), _seconds_of(2100, 1, 1),     # the ends of the generated window
+    _seconds_of(1969, 12, 31, 23, 59, 59), _seconds_of(2000, 1, 1),
+    _seconds_of(2000, 2, 29), _seconds_of(2024, 2, 29), _seconds_of(2023, 2, 28),
+    _seconds_of(1900, 3, 1), _seconds_of(2024, 12, 31), _seconds_of(2025, 1, 1),
+    _seconds_of(2024, 12, 30), _seconds_of(2021, 1, 1), _seconds_of(2021, 1, 3),
+    _seconds_of(2024, 3, 10, 7), _seconds_of(2024, 11, 3, 6),   # the two US DST transitions
+    _seconds_of(2024, 3, 10, 6, 59, 59), _seconds_of(2024, 11, 3, 5),
+    _seconds_of(2024, 6, 30, 23, 59, 59), _seconds_of(1970, 1, 1, 12),
+]
+
+
+def _temporal_ticks(rng, n, unit, flavor):
+    """int64 tick values for a timestamp column of `unit`."""
+    per_second = TICKS[unit]
+    if flavor == "special":
+        pool = [s * per_second for s in _SPECIAL_SECONDS]
+        pool += [1, -1, per_second - 1, -(per_second - 1)] if per_second > 1 else []
+        idx = rng.integers(0, len(pool), n)
+        return np.array([pool[i] for i in idx], dtype=np.int64)
+    seconds = rng.integers(_EPOCH_LO, _EPOCH_HI, n, dtype=np.int64)
+    sub = rng.integers(0, per_second, n, dtype=np.int64) if per_second > 1 else 0
+    return seconds * per_second + sub
+
+
+def _time_of_day_ticks(rng, n, unit, flavor):
+    """int64 ticks since midnight, the range a time32 / time64 column is defined on."""
+    span = 86400 * TICKS[unit]
+    if flavor == "special":
+        pool = [0, 1, span - 1, span // 2, 3600 * TICKS[unit], 86399 * TICKS[unit]]
+        idx = rng.integers(0, len(pool), n)
+        return np.array([pool[i] for i in idx], dtype=np.int64)
+    return rng.integers(0, span, n, dtype=np.int64)
+
+
+def _duration_ticks(rng, n, unit, flavor):
+    """Durations up to about a month either way -- small enough that adding one to any generated
+    timestamp stays inside the window, so `add_duration` never has to define an overflow."""
+    limit = 30 * 86400 * TICKS[unit]
+    if flavor == "special":
+        pool = [0, 1, -1, limit, -limit, 86400 * TICKS[unit], -(86400 * TICKS[unit]), TICKS[unit]]
+        idx = rng.integers(0, len(pool), n)
+        return np.array([pool[i] for i in idx], dtype=np.int64)
+    return rng.integers(-limit, limit + 1, n, dtype=np.int64)
+
+
+def _decimal_unscaled(rng, n, precision, scale, flavor):
+    """Unscaled integers for a decimal column, as Python ints (10^38 does not fit a numpy dtype)."""
+    limit = 10 ** precision - 1
+    if flavor == "special":
+        pool = [0, 1, -1, limit, -limit, limit - 1, 10 ** scale, -(10 ** scale),
+                5, -5, limit // 2, -(limit // 2)]
+        return [pool[i] for i in rng.integers(0, len(pool), n)]
+    if precision <= 18:
+        return [int(v) for v in rng.integers(-limit, limit + 1, n, dtype=np.int64)]
+    # Above 18 digits numpy cannot hold the range: draw the digits in two halves.
+    hi = rng.integers(0, 10 ** 19, n, dtype=np.uint64)
+    lo = rng.integers(0, 10 ** 19, n, dtype=np.uint64)
+    sign = rng.integers(0, 2, n)
+    return [int(1 - 2 * s) * ((int(a) * 10 ** 19 + int(b)) % (limit + 1))
+            for a, b, s in zip(hi, lo, sign)]
+
+
+def _decimals(rng, n, precision, scale, flavor):
+    import decimal as _decimal
+    with _decimal.localcontext() as ctx:
+        ctx.prec = max(precision + 2, 40)
+        return [_decimal.Decimal(v).scaleb(-scale)
+                for v in _decimal_unscaled(rng, n, precision, scale, flavor)]
+
+
+_FLOAT16_SPECIALS = [0.0, -0.0, 1.0, -1.0, 0.5, math.nan, math.inf, -math.inf,
+                     65504.0, -65504.0, 6.103515625e-05, -6.103515625e-05,
+                     5.960464477539063e-08, -5.960464477539063e-08, 0.0009765625]
+
+_BINARY_SPECIALS = [b"\x00" * 8, b"\xff" * 8, b"abcdefgh", b"ABCDEFGH", b"\x00\x01\x02\x03\x04\x05\x06\x07",
+                    b"        ", b"\x80" * 8, b"01234567"]
+
+_MAP_KEYS = ["k", "j", "", "z", "kk", "é"]
+
+
+def _apply_none(rows, mask):
+    return rows if mask is None else [None if m else v for v, m in zip(rows, mask)]
+
+
+def _extended_array(name, rng, n, flavor, null_ratio):
+    """One generated array of an extended type, nulls applied."""
+    ty = ARROW_TYPE[name]
+    if name == "null":
+        return pa.nulls(n)
+    if name in TIMESTAMP_TYPES:
+        values = _temporal_ticks(rng, n, name.split("_")[1], flavor)
+    elif name in DURATION_TYPES:
+        values = _duration_ticks(rng, n, name.split("_")[1], flavor)
+    elif name in TIME_TYPES:
+        values = _time_of_day_ticks(rng, n, name.split("_")[1], flavor)
+    elif name == "date32":
+        values = _temporal_ticks(rng, n, "s", flavor) // 86400
+    elif name == "date64":
+        values = (_temporal_ticks(rng, n, "s", flavor) // 86400) * 86_400_000
+    elif name == "float16":
+        if flavor == "special":
+            picked = [_FLOAT16_SPECIALS[i] for i in rng.integers(0, len(_FLOAT16_SPECIALS), n)]
+            values = np.array(picked, dtype=np.float16)
+        else:
+            scale = rng.choice(np.array([1.0, 100.0, 0.01]), n)
+            values = (rng.standard_normal(n) * scale).astype(np.float16)
+    else:
+        values = None
+
+    if values is not None:
+        mask = _null_mask(rng, n, null_ratio)
+        if name in TIME_TYPES and name.startswith("time32"):
+            values = values.astype(np.int32)
+        if name == "date32":
+            values = values.astype(np.int32)
+        return pa.array(values, mask=mask, type=ty)
+
+    mask = _null_mask(rng, n, null_ratio)
+    if name in DECIMAL_TYPES:
+        _, precision, scale = _decimal_parts(name)
+        rows = _decimals(rng, n, precision, scale, flavor)
+    elif name == "fixed_size_binary":
+        if flavor == "special":
+            rows = [_BINARY_SPECIALS[i] for i in rng.integers(0, len(_BINARY_SPECIALS), n)]
+        else:
+            raw = rng.integers(0, 256, (n, 8), dtype=np.uint8)
+            rows = [bytes(r) for r in raw]
+    elif name == "mdn_interval":
+        months = rng.integers(-30, 31, n, dtype=np.int32)
+        days = rng.integers(-40, 41, n, dtype=np.int32)
+        nanos = rng.integers(-86_400_000_000_000, 86_400_000_000_000, n, dtype=np.int64)
+        rows = [pa.MonthDayNano([int(a), int(b), int(c)]) for a, b, c in zip(months, days, nanos)]
+    elif name in LIST_TYPES:
+        lengths = rng.integers(0, 5, n)
+        if name == "list_int64":
+            pool = [0, 1, -1, 7, 2 ** 62, -(2 ** 62), 99]
+        else:
+            pool = ["a", "", "bb", "héllo", "日本語", "x" * 40, "Z"]
+        drawn = rng.integers(0, len(pool), int(lengths.sum()) if n else 0)
+        holes = rng.random(len(drawn)) < 0.1
+        cursor, rows = 0, []
+        for length in lengths:
+            item = [None if holes[cursor + k] else pool[drawn[cursor + k]] for k in range(length)]
+            cursor += length
+            rows.append(item)
+    elif name == "struct":
+        a = rng.integers(-1000, 1000, n, dtype=np.int64)
+        pool = ["a", "", "bb", "héllo", "x" * 40]
+        b = rng.integers(0, len(pool), n)
+        holes = rng.random(n) < 0.1
+        rows = [{"a": None if h else int(av), "b": pool[bv]} for av, bv, h in zip(a, b, holes)]
+    elif name == "map":
+        lengths = rng.integers(0, 4, n)
+        drawn = rng.integers(0, len(_MAP_KEYS), int(lengths.sum()) if n else 0)
+        values = rng.integers(-100, 100, len(drawn), dtype=np.int64)
+        cursor, rows = 0, []
+        for length in lengths:
+            item = [(_MAP_KEYS[drawn[cursor + k]], int(values[cursor + k])) for k in range(length)]
+            cursor += length
+            rows.append(item)
+    elif name == "dict_utf8":
+        pool = string_pool(n)
+        rows = [pool[i] for i in rng.integers(0, len(pool), n)]
+    elif name == "run_end_int64":
+        # Runs of 1 to 6 equal values, so the encoding actually compresses and the run boundaries do
+        # not line up with any threadgroup width.
+        rows, cursor = [], 0
+        while cursor < n:
+            length = int(rng.integers(1, 7))
+            rows += [int(rng.integers(-50, 50))] * min(length, n - cursor)
+            cursor += length
+    else:                                                  # pragma: no cover - generator bug
+        raise AssertionError(f"no generator for {name}")
+
+    rows = _apply_none(rows, mask)
+    if name == "dict_utf8":
+        return pa.array(rows, type=pa.string()).dictionary_encode().cast(ty)
+    if name == "run_end_int64":
+        return pc.run_end_encode(pa.array(rows, type=pa.int64()))
+    return pa.array(rows, type=ty)
+
+
 class _ByteBudgetCache:
     """Generated arrays are reused across operations; the budget keeps the 5M datasets from piling up."""
 
@@ -207,8 +486,15 @@ def make_array(name, shape, seed=0):
     if hit is not None:
         return hit
     rng = np.random.default_rng([seed, shape.size, int(shape.null_ratio * 1000), shape.offset,
-                                 len(shape.flavor), ALL_TYPES.index(name)])
+                                 len(shape.flavor), MATRIX_TYPES.index(name)])
     n = shape.size + (2 * shape.offset if shape.flavor == "sliced" else 0)
+    if name in EXTENDED_TYPES:
+        arr = _extended_array(name, rng, n, shape.flavor, shape.null_ratio)
+        if shape.flavor == "sliced" and shape.offset:
+            arr = arr.slice(shape.offset, shape.size)
+        assert len(arr) == shape.size, f"generator produced {len(arr)} rows for {shape.id}"
+        _CACHE.put(key, arr)
+        return arr
     values = _values(rng, name, n, shape.flavor)
     mask = _null_mask(rng, n, shape.null_ratio)
 
@@ -297,7 +583,8 @@ def diff(got, expected, tol=None):
         return None if (got is None and expected is None) else f"got {got!r}, expected {expected!r}"
     if isinstance(got, bool) != isinstance(expected, bool):
         return f"got {got!r}, expected {expected!r}"
-    if isinstance(got, float) or isinstance(expected, float):
+    # np.floating covers float16, which pyarrow hands back as numpy scalars rather than Python floats.
+    if isinstance(got, (float, np.floating)) or isinstance(expected, (float, np.floating)):
         return None if _floats_equal(float(got), float(expected), tol) else \
             f"got {got!r}, expected {expected!r}"
     return None if got == expected else f"got {got!r}, expected {expected!r}"
@@ -1212,6 +1499,1893 @@ def _dictionary_decode(src, shape):
 _register_optional("dictionary_decode", ["utf8"], ["decode"], _dictionary_decode)
 
 
+# ==================================================================== the extended matrix
+#
+# Everything below covers the kernels added after the first round: decimals, the nested types, the
+# regular expressions and string casts, the whole temporal surface, the window and rolling functions,
+# the statistical aggregates, run-end encoding, the remaining Arrow type rows and the trigonometry.
+#
+# The rules are the ones above. pyarrow is the oracle wherever Arrow has a function, with its options
+# spelled out rather than defaulted; where Arrow has none the case says so, names itself in _NO_ORACLE
+# and compares against a Python reference implemented here instead.
+
+#: Operations Arrow has no counterpart for. Each is checked against a reference written in this file
+#: (or against a property, for the hashes); test_no_oracle_operations_are_reported prints the list.
+_NO_ORACLE = {}
+
+
+def _no_oracle(name, why):
+    _NO_ORACLE[name] = why
+    return name
+
+
+def _pylist(arr):
+    return arr.to_pylist() if isinstance(arr, pa.Array) else list(arr)
+
+
+def _valid_positions(src):
+    """The indices of the non-null rows, as a Python list."""
+    return [i for i, v in enumerate(pc.is_valid(src).to_pylist()) if v]
+
+
+# ---- interop and selection over the extended types -------------------
+
+#: Every extended type except the run-end encoded one, whose selection kernels decode rather than
+#: re-encode and which pyarrow has no filter / take kernel for at all (see the `run_end` op).
+SELECTABLE_TYPES = [t for t in EXTENDED_TYPES if t != "run_end_int64"]
+
+
+@op("roundtrip_ext", EXTENDED_TYPES, note="import/export through the Arrow C Data Interface")
+def _roundtrip_ext(src, shape):
+    x = am.array(src)
+    assert len(x) == len(src), f"length changed on import: {len(x)} != {len(src)}"
+    if not pa.types.is_run_end_encoded(src.type):
+        # A run-end encoded array keeps its nulls in the values child, so pyarrow reports null_count 0
+        # for it whatever the data says; ArrowMetal reports the logical count
+        # (test_run_end_null_count_is_logical pins the difference).
+        assert x.null_count == src.null_count, f"null_count {x.null_count} != {src.null_count}"
+    return x.to_arrow(), src
+
+
+@op("filter_ext", SELECTABLE_TYPES)
+def _filter_ext(src, shape):
+    mask = make_array("bool", shape, seed=2)
+    return arrow(am.array(src).filter(am.array(mask))), src.filter(mask)
+
+
+@op("take_ext", SELECTABLE_TYPES)
+def _take_ext(src, shape):
+    n = len(src)
+    if n == 0:
+        idx = pa.array([], pa.int32())
+    else:
+        rng = np.random.default_rng(11)
+        raw = rng.integers(0, n, min(n, 977)).astype(np.int32)
+        idx = pa.array(raw, mask=rng.random(len(raw)) < 0.1, type=pa.int32())
+    return arrow(am.array(src).take(am.array(idx))), src.take(idx)
+
+
+@op("slice_ext", SELECTABLE_TYPES)
+def _slice_ext(src, shape):
+    n = len(src)
+    off = n // 3
+    return arrow(am.array(src).slice(off, n - off)), src.slice(off, n - off)
+
+
+@op("run_end", ["run_end_int64"],
+    note=_no_oracle("run_end", "pyarrow has no filter/take/slice kernel for a run-end encoded array; "
+                               "the reference is the decoded column, put through pyarrow's own kernels"))
+def _run_end(src, shape):
+    """`pc.run_end_encode` is the oracle for the encoding itself. Everything else is compared against
+    the decoded column: ArrowMetal's filter, take and slice on a run-end array *decode* it, which is
+    the one shape pyarrow cannot answer at all (it has no kernel for the type)."""
+    x = am.array(src)
+    decoded = pc.run_end_decode(src)
+    mask = make_array("bool", shape, seed=2)
+    n = len(src)
+    idx = pa.array(np.random.default_rng(11).integers(0, max(n, 1), min(n, 977)).astype(np.int32),
+                   type=pa.int32()) if n else pa.array([], pa.int32())
+    off = n // 3
+    got = [arrow(x.run_end_decode()), arrow(am.array(decoded).run_end_encode()),
+           arrow(x.filter(am.array(mask))), arrow(x.take(am.array(idx))),
+           arrow(x.slice(off, n - off))]
+    expected = [decoded, pc.run_end_encode(decoded),
+                decoded.filter(mask), decoded.take(idx), decoded.slice(off, n - off)]
+    return got, expected
+
+
+# ---- decimals --------------------------------------------------------
+#
+# Every decimal kernel is `am_decimal_op`; the scalar form takes 16 little-endian bytes at the column's
+# own scale. Arrow's own decimal kernels promote the result type (add gives precision p+1, multiply
+# gives p1+p2+1 and scale s1+s2) while ArrowMetal's add and subtract keep the operand type and wrap, so
+# the oracle is cast back to the column type -- the values are identical inside the operand's range,
+# which is where the generator stays.
+
+def _unscaled_magnitude(value):
+    """|unscaled| of a Decimal that came out of a decimal column, without going through the default
+    decimal context (whose 28 digits would round a 38-digit value)."""
+    return int("".join(str(d) for d in value.as_tuple().digits) or "0")
+
+
+def _decimal_scalar_for(name):
+    """A constant every decimal type in the matrix can hold, as a Decimal at that type's scale."""
+    import decimal as _decimal
+    _, _, scale = _decimal_parts(name)
+    return _decimal.Decimal(3).scaleb(-min(scale, 2))
+
+
+def _decimal_arith_oracle(fn, src, other):
+    """pc.add / pc.subtract on decimals widen the precision by one, and refuse a 38-digit column
+    outright because 39 is out of range -- so the oracle runs in decimal256 and is cast back to the
+    column's own type, which is what ArrowMetal's wrapping kernels return."""
+    if src.type.precision >= 38:
+        wide = pa.decimal256(src.type.precision, src.type.scale)
+        result = fn(src.cast(wide), other.cast(wide) if isinstance(other, pa.Array) else
+                    pa.scalar(other.as_py(), wide))
+    else:
+        result = fn(src, other)
+    return result if result.type == src.type else result.cast(src.type, safe=False)
+
+
+def _decimal_fits(src, other, headroom=8):
+    """The rows on which every form of `decimal_arith` stays inside the column's own precision: the
+    sum and difference of the two columns, and the column multiplied by the small integer scalar.
+
+    Past the precision both engines wrap, but not to the same place: ArrowMetal wraps modulo 2^128 (the
+    storage width) and Arrow's unchecked decimal cast wraps modulo 10^precision. Neither is a documented
+    Arrow behaviour, so the matrix stays inside the range and
+    test_decimal_arithmetic_wraps_modulo_two_to_the_128 pins what happens outside it."""
+    limit = 10 ** src.type.precision
+    scaled = 10 ** src.type.scale
+    keep = []
+    for a, b in zip(src.to_pylist(), other.to_pylist()):
+        if a is None or b is None:
+            keep.append(True)
+            continue
+        keep.append(headroom * max(_unscaled_magnitude(a), _unscaled_magnitude(b)) + scaled < limit)
+    mask = pa.array(keep, pa.bool_())
+    return src.filter(mask), other.filter(mask)
+
+
+@op("decimal_compare", DECIMAL128_TYPES)
+def _decimal_compare(src, shape):
+    other = make_array(type_name_of(src), shape, seed=1)
+    scalar = _decimal_scalar_for(type_name_of(src))
+    x, y = am.array(src), am.array(other)
+    got, expected = [], []
+    for symbol, fn in _CMP:
+        got += [arrow(x.compare(symbol, y)), arrow(x.compare(symbol, scalar))]
+        expected += [fn(src, other), fn(src, pa.scalar(scalar, src.type))]
+    return got, expected
+
+
+@op("decimal_arith", DECIMAL128_TYPES,
+    note="add/subtract keep the column type and wrap; pc.add widens the precision, so it is cast back")
+def _decimal_arith(src, shape):
+    name = type_name_of(src)
+    _, precision, scale = _decimal_parts(name)
+    src, other = _decimal_fits(src, make_array(name, shape, seed=1))
+    scalar = _decimal_scalar_for(name)
+    x, y = am.array(src), am.array(other)
+    got = [arrow(x.decimal_add(y)), arrow(x.decimal_sub(y)),
+           arrow(x.decimal_add(scalar)), arrow(x.decimal_sub(scalar))]
+    expected = [_decimal_arith_oracle(pc.add, src, other), _decimal_arith_oracle(pc.subtract, src, other),
+                _decimal_arith_oracle(pc.add, src, pa.scalar(scalar, src.type)),
+                _decimal_arith_oracle(pc.subtract, src, pa.scalar(scalar, src.type))]
+    # multiply widens to precision p1+p2+1: Arrow refuses past 38, so the widest column is compared
+    # only in the scalar form (which keeps the type).
+    if 2 * precision + 1 <= 38:
+        got.append(arrow(x.decimal_mul(y)))
+        expected.append(pc.multiply(src, other))
+    # The int-scalar form keeps the column type; Arrow's multiply widens to p1 + p2 + 1, which is out
+    # of decimal128's range for a 38-digit column, so that oracle runs in decimal256 as well.
+    wide = pa.decimal256(precision, scale)
+    got.append(arrow(x.decimal_mul(7)))
+    expected.append(pc.multiply(src.cast(wide), pa.scalar(7, pa.decimal256(2, 0)))
+                    .cast(src.type, safe=False))
+    return got, expected
+
+
+@op("decimal_unary", DECIMAL128_TYPES, note="pc.sign narrows to int8; ArrowMetal's decimal sign is int32")
+def _decimal_unary(src, shape):
+    x = am.array(src)
+    return ([arrow(x.negate()), arrow(x.abs()), arrow(x.sign())],
+            [pc.negate(src), pc.abs(src), pc.sign(src).cast(pa.int32())])
+
+
+def _decimal_round_targets(precision, scale):
+    """The scales `decimal_round` is asked for: down to 0, one either side of the column's own, and as
+    far up as the widened precision still fits decimal128 (scaling up multiplies, so the result type is
+    `decimal128(precision + target - scale, target)` and 38 is the ceiling)."""
+    return sorted({0, 1, max(scale - 1, 0), scale, min(scale + 2, scale + 38 - precision)})
+
+
+@op("decimal_round", DECIMAL128_TYPES,
+    note="ArrowMetal rescales the column to the target scale; pc.round keeps the input scale, so the "
+         "oracle is cast to the rescaled type")
+def _decimal_round(src, shape):
+    name = type_name_of(src)
+    _, precision, scale = _decimal_parts(name)
+    x = am.array(src)
+    got, expected = [], []
+    for target in _decimal_round_targets(precision, scale):
+        for mode, arrow_mode in [("round", "half_towards_infinity"), ("ceil", "up"),
+                                 ("floor", "down"), ("truncate", "towards_zero")]:
+            result = arrow(x.decimal_round(target, mode))
+            got.append(result)
+            expected.append(pc.round(src, ndigits=target, round_mode=arrow_mode)
+                            .cast(result.type, safe=False))
+    return got, expected
+
+
+@op("decimal_to_float64", DECIMAL128_TYPES,
+    note="ArrowMetal divides the unscaled value by 10^scale; Arrow multiplies by its reciprocal")
+def _decimal_to_float64(src, shape):
+    return arrow(am.array(src).to_float64()), src.cast(pa.float64())
+
+
+@op("decimal_reduce", DECIMAL128_TYPES, note="sum/min/max come back as Decimals, like pc.sum's scalar")
+def _decimal_reduce(src, shape):
+    x = am.array(src)
+    return ([x.sum(), x.min(), x.max()],
+            [pc.sum(src).as_py(), pc.min(src).as_py(), pc.max(src).as_py()])
+
+
+@op("decimal_widen_narrow", SMALL_DECIMAL_TYPES)
+def _decimal_widen_narrow(src, shape):
+    bits, precision, scale = _decimal_parts(type_name_of(src))
+    wide = am.array(src).to_decimal128()
+    narrowed = wide.to_small_decimal(bits, precision)
+    return ([arrow(wide), arrow(narrowed)],
+            [src.cast(pa.decimal128(precision, scale)), src])
+
+
+# ---- nested: list, struct and map ------------------------------------
+
+def _list_oracle_type(src):
+    """A map is a list of struct<key, value>; `pc.list_value_length` has no map kernel, so the map is
+    cast to that equivalent list first (which Arrow does support)."""
+    if pa.types.is_map(src.type):
+        entries = pa.struct([("key", src.type.key_type), ("value", src.type.item_type)])
+        return src.cast(pa.list_(entries))
+    return src
+
+
+@op("list_length", LIST_TYPES + ["map"],
+    note="int32 per-row child count; pc.list_value_length returns int32 for list and has no map kernel")
+def _list_length(src, shape):
+    view = _list_oracle_type(src)
+    return arrow(am.array(src).list_value_length()), pc.list_value_length(view).cast(pa.int32())
+
+
+@op("list_flatten", LIST_TYPES)
+def _list_flatten(src, shape):
+    return arrow(am.array(src).list_flatten()), pc.list_flatten(src)
+
+
+@op("list_element", LIST_TYPES,
+    note="a row shorter than the index is null here and an error in Arrow, so the oracle sees only the "
+         "rows long enough (test_list_element_of_a_short_row_is_null pins the rest)")
+def _list_element(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for index in (0, 1, 3):
+        lengths = pc.fill_null(pc.list_value_length(src), 0)
+        keep = pc.greater(lengths, index)
+        subset = src.filter(keep)
+        got.append(arrow(am.array(subset).list_element(index)) if len(subset) else
+                   pc.list_element(src.slice(0, 0), index))
+        expected.append(pc.list_element(subset, index) if len(subset) else
+                        pc.list_element(src.slice(0, 0), index))
+    del x
+    return got, expected
+
+
+@op("list_parent_indices", LIST_TYPES,
+    note="int32 here, int64 in Arrow -- list offsets are int32 throughout this package")
+def _list_parent_indices(src, shape):
+    return (arrow(am.array(src).list_parent_indices()),
+            pc.list_parent_indices(src).cast(pa.int32()))
+
+
+@op("list_slice", LIST_TYPES,
+    note="pc.list_slice's return_fixed_size_list=False, the variable-length form ArrowMetal produces")
+def _list_slice(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for start, stop, step in [(0, None, 1), (1, None, 1), (0, 2, 1), (1, 3, 1), (0, 4, 2), (2, 3, 1)]:
+        got.append(arrow(x.list_slice(start, stop, step)))
+        expected.append(pc.list_slice(src, start, stop, step, return_fixed_size_list=False))
+    return got, expected
+
+
+@op("struct_field", ["struct"])
+def _struct_field(src, shape):
+    x = am.array(src)
+    assert x.child_count() == 2, f"child_count {x.child_count()} != 2"
+    # struct_field applies the struct's own validity, as pc.struct_field does; child() is the raw
+    # child array, which is pyarrow's StructArray.field().
+    return ([arrow(x.struct_field("a")), arrow(x.struct_field("b")), arrow(x.child(0))],
+            [pc.struct_field(src, "a"), pc.struct_field(src, "b"), src.field(0)])
+
+
+@op("map_lookup", ["map"])
+def _map_lookup(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for key in ("k", "", "absent"):
+        for occurrence in ("first", "last", "all"):
+            got.append(arrow(x.map_lookup(key, occurrence)))
+            expected.append(pc.map_lookup(src, query_key=key, occurrence=occurrence))
+    return got, expected
+
+
+@op("binary_join", ["list_utf8"])
+def _binary_join(src, shape):
+    x = am.array(src)
+    separators = make_array("utf8", shape, seed=3)
+    return ([arrow(x.binary_join("-")), arrow(x.binary_join("")),
+             arrow(x.binary_join(am.array(separators)))],
+            [pc.binary_join(src, "-"), pc.binary_join(src, ""), pc.binary_join(src, separators)])
+
+
+# ---- regular expressions, LIKE and splitting -------------------------
+#
+# ArrowMetal matches with ICU (NSRegularExpression) and pyarrow with RE2. The two agree on the syntax
+# the matrix uses except for one thing: ICU's `\d`, `\w` and `\s` are Unicode-aware and RE2's are ASCII.
+# `\d` is in the pattern list on purpose, and the divergence it produces is finding
+# `regex-icu-unicode-classes`, classified by the data so a column of plain ASCII still has to agree.
+
+#: Patterns exercised by every regex op: literals, anchors, alternation, classes, a quantifier, a
+#: multi-byte literal and one that matches nothing.
+_REGEX_PATTERNS = ["a", "app", "l+", "^a", "[0-9]", "a|b", "a.p", r"\d", "é", "^$", "zzz", "(a)(p)"]
+
+#: Patterns whose meaning is the same in ICU and RE2, for the ops where a template or a split makes the
+#: Unicode classes irrelevant to what is being tested.
+_ASCII_REGEX_PATTERNS = [p for p in _REGEX_PATTERNS if "\\" not in p]
+
+
+@op("regex_match", ["utf8"], note="pc.match_substring_regex / count / find, both engines unanchored")
+def _regex_match(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for pattern in _REGEX_PATTERNS:
+        got += [arrow(x.match_substring_regex(pattern)),
+                arrow(x.count_substring_regex(pattern)),
+                arrow(x.find_substring_regex(pattern))]
+        expected += [pc.match_substring_regex(src, pattern),
+                     pc.count_substring_regex(src, pattern).cast(pa.int32()),
+                     pc.find_substring_regex(src, pattern).cast(pa.int32())]
+    for pattern in ("APP", "É"):
+        got.append(arrow(x.match_substring_regex(pattern, True)))
+        expected.append(pc.match_substring_regex(src, pattern, ignore_case=True))
+    return got, expected
+
+
+@op("regex_replace", ["utf8"],
+    note="ArrowMetal's replacement is an ICU template ($1); pyarrow's is an RE2 one (\\1)")
+def _regex_replace(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for pattern, ours, theirs in [("l+", "L", "L"), ("(a)(p)", "$2$1", r"\2\1"),
+                                  ("[0-9]", "#", "#"), ("zzz", "!", "!"), (r"\d", "D", "D")]:
+        got.append(arrow(x.replace_substring_regex(pattern, ours)))
+        expected.append(pc.replace_substring_regex(src, pattern, theirs))
+    return got, expected
+
+
+def _as_list_array(offsets, values):
+    """The (offsets, values) pair ArrowMetal's split returns, as the list<utf8> Arrow produces."""
+    return pa.ListArray.from_arrays(arrow(offsets), arrow(values))
+
+
+@op("regex_split", ["utf8"], note="pc.split_pattern with its defaults: every occurrence, left to right")
+def _regex_split(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for separator in (" ", "a", "\t", "pp"):
+        got.append(_as_list_array(*x.split_pattern(separator)))
+        expected.append(pc.split_pattern(src, separator))
+    for pattern in ("[0-9]", "l+", "a|b"):
+        got.append(_as_list_array(*x.split_pattern(pattern, regex=True)))
+        expected.append(pc.split_pattern_regex(src, pattern))
+    return got, expected
+
+
+@op("split_whitespace", ["utf8"],
+    note="ArrowMetal splits on runs of whitespace and drops the empty ends, as Python's str.split() "
+         "does; pc.utf8_split_whitespace splits at every whitespace character")
+def _split_whitespace(src, shape):
+    return _as_list_array(*am.array(src).split_whitespace()), pc.utf8_split_whitespace(src)
+
+
+@op("regex_extract", ["utf8"],
+    note="ICU spells a named group (?<n>...) and RE2 (?P<n>...); the groups themselves are compared "
+         "one at a time, since ArrowMetal returns a dict where Arrow returns a struct")
+def _regex_extract(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for ours, theirs, names in [(r"(?<head>a)(?<tail>p+)", r"(?P<head>a)(?P<tail>p+)", ["head", "tail"]),
+                                (r"(?<digits>[0-9]+)", r"(?P<digits>[0-9]+)", ["digits"]),
+                                (r"(?<never>zzz)", r"(?P<never>zzz)", ["never"])]:
+        columns = x.extract_regex(ours)
+        struct = pc.extract_regex(src, theirs)
+        for field in names:
+            got.append(arrow(columns[field]))
+            expected.append(pc.struct_field(struct, field))
+    return got, expected
+
+
+@op("regex_extract_span", ["utf8"], note="byte offsets and lengths, as pc.extract_regex_span's are")
+def _regex_extract_span(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for ours, theirs, names in [(r"(?<head>a)(?<tail>p+)", r"(?P<head>a)(?P<tail>p+)", ["head", "tail"]),
+                                (r"(?<digits>[0-9]+)", r"(?P<digits>[0-9]+)", ["digits"])]:
+        spans = x.extract_regex_span(ours)
+        struct = pc.extract_regex_span(src, theirs)
+        for field in names:
+            # Arrow returns fixed_size_list<int32>[2] per group: [start, length].
+            pair = pc.struct_field(struct, field)
+            flat = pc.list_flatten(pair)
+            valid = pc.is_valid(pair)
+            start, length = spans[field]
+            got += [arrow(start), arrow(length)]
+            expected += [pc.if_else(valid, _every_other(flat, 0, len(pair)), None),
+                         pc.if_else(valid, _every_other(flat, 1, len(pair)), None)]
+    return got, expected
+
+
+def _every_other(flat, offset, rows):
+    """Element `offset` of each 2-element group of a flattened fixed-size list, padded back to `rows`
+    with nulls where the group was absent."""
+    if len(flat) != 2 * rows:
+        # Null rows drop out of list_flatten; rebuild positionally instead.
+        raise Unsupported("extract_regex_span oracle needs every row to have matched")
+    return flat.take(pa.array(list(range(offset, 2 * rows, 2)), pa.int32()))
+
+
+@op("match_like", ["utf8"], note="pc.match_like: % is any run, _ exactly one, backslash escapes both")
+def _match_like(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for pattern in ["a%", "%a", "%a%", "app", "_pp", "a_p%", "%", "_", "", "1\\%0", "%é%"]:
+        got.append(arrow(x.match_like(pattern)))
+        expected.append(pc.match_like(src, pattern))
+    got.append(arrow(x.match_like("APP%", True)))
+    expected.append(pc.match_like(src, "APP%", ignore_case=True))
+    return got, expected
+
+
+# ---- the rest of the Arrow string surface ----------------------------
+
+_STRING_PREDICATES = [
+    ("ascii_is_printable", pc.ascii_is_printable), ("ascii_is_title", pc.ascii_is_title),
+    ("string_is_ascii", pc.string_is_ascii), ("utf8_is_alnum", pc.utf8_is_alnum),
+    ("utf8_is_alpha", pc.utf8_is_alpha), ("utf8_is_decimal", pc.utf8_is_decimal),
+    ("utf8_is_digit", pc.utf8_is_digit), ("utf8_is_lower", pc.utf8_is_lower),
+    ("utf8_is_numeric", pc.utf8_is_numeric), ("utf8_is_printable", pc.utf8_is_printable),
+    ("utf8_is_space", pc.utf8_is_space), ("utf8_is_title", pc.utf8_is_title),
+    ("utf8_is_upper", pc.utf8_is_upper),
+]
+
+
+@op("string_predicates", ["utf8"], note="the thirteen character-class predicates, Unicode included")
+def _string_predicates(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for name, oracle in _STRING_PREDICATES:
+        got.append(arrow(getattr(x, name)()))
+        expected.append(oracle(src))
+    return got, expected
+
+
+@op("string_case_transforms", ["utf8"])
+def _string_case_transforms(src, shape):
+    x = am.array(src)
+    return ([arrow(x.ascii_title()), arrow(x.utf8_capitalize()), arrow(x.utf8_title())],
+            [pc.ascii_title(src), pc.utf8_capitalize(src), pc.utf8_title(src)])
+
+
+@op("string_pad_and_slice", ["utf8"])
+def _string_pad_and_slice(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for width, pad in [(0, " "), (7, " "), (8, "*")]:
+        got.append(arrow(x.utf8_center(width, pad)))
+        expected.append(pc.utf8_center(src, width, padding=pad))
+    for start, stop, replacement in [(1, 3, "--"), (0, 0, "^"), (2, 1, "!"), (-3, -1, "…"), (0, 100, "")]:
+        got += [arrow(x.utf8_replace_slice(start, stop, replacement)),
+                arrow(x.binary_replace_slice(start, stop, replacement))]
+        expected += [pc.utf8_replace_slice(src, start, stop, replacement),
+                     pc.binary_replace_slice(src.cast(pa.binary()), start, stop, replacement)]
+    return got, expected
+
+
+@op("string_trim", ["utf8"], note="the Unicode trims, with and without a character set")
+def _string_trim(src, shape):
+    x = am.array(src)
+    got = [arrow(x.utf8_trim()), arrow(x.utf8_ltrim()), arrow(x.utf8_rtrim())]
+    expected = [pc.utf8_trim_whitespace(src), pc.utf8_ltrim_whitespace(src), pc.utf8_rtrim_whitespace(src)]
+    for characters in ("a", "ap", " \t", "aé", ""):
+        got += [arrow(x.utf8_trim(characters)), arrow(x.utf8_ltrim(characters)),
+                arrow(x.utf8_rtrim(characters))]
+        expected += [pc.utf8_trim(src, characters), pc.utf8_ltrim(src, characters),
+                     pc.utf8_rtrim(src, characters)]
+    return got, expected
+
+
+@op("string_normalize", ["utf8"],
+    note=_no_oracle("string_normalize",
+                    "pyarrow 25.0.1's utf8_normalize ignores its `form` option and always decomposes, "
+                    "so the oracle is Python's own unicodedata "
+                    "(test_pyarrow_utf8_normalize_ignores_its_form_option pins the bug)"))
+def _string_normalize(src, shape):
+    import unicodedata
+    x = am.array(src)
+    got, expected = [], []
+    for form in ("NFC", "NFKC", "NFD", "NFKD"):
+        got.append(arrow(x.utf8_normalize(form)))
+        expected.append(pa.array([None if s is None else unicodedata.normalize(form, s)
+                                  for s in src.to_pylist()], pa.string()))
+    return got, expected
+
+
+@op("string_set_lookup", ["utf8"],
+    note="the GPU string hash table; skip_nulls=True, the mode ArrowMetal implements")
+def _string_set_lookup(src, shape):
+    values = src.slice(0, min(len(src), 5))
+    x = am.array(src)
+    return ([arrow(x.is_in(am.array(values))), arrow(x.index_in(am.array(values)))],
+            [pc.is_in(src, value_set=values, skip_nulls=True),
+             pc.index_in(src, value_set=values, skip_nulls=True).cast(pa.int32())])
+
+
+# ---- utf8 <-> number casts -------------------------------------------
+
+@op("to_strings", INTEGER + ["bool"], note="Arrow's cast(utf8), exact for integers and booleans")
+def _to_strings(src, shape):
+    return arrow(am.array(src).to_strings()), src.cast(pa.string())
+
+
+@op("to_strings_text", FLOATING,
+    note="the text itself: ArrowMetal formats a float the way Swift does, Arrow the way its own "
+         "formatter does -- finding float-text-swift-format")
+def _to_strings_text(src, shape):
+    return arrow(am.array(src).to_strings()), src.cast(pa.string())
+
+
+@op("to_strings_value", FLOATING,
+    note="the number the text denotes, bit-exact: whatever the formatting, the digits have to name "
+         "exactly the float that went in")
+def _to_strings_value(src, shape):
+    """Reads ArrowMetal's own text back with Python's `float`, which is correctly rounded, and compares
+    the result with the input bit for bit. This is the property the formatting divergence must not
+    touch: `-0.0` stays `-0.0`, a subnormal stays that subnormal, and no digit is lost."""
+    name = type_name_of(src)
+    text = arrow(am.array(src).to_strings()).to_pylist()
+    parsed = [None if s is None else (math.nan if s == "nan" else float(s)) for s in text]
+    return pa.array(parsed, type=src.type), src
+
+
+@op("cast_to_string", NUMERIC + ["bool"],
+    note="cast('string') has to be exactly to_strings(), on every type")
+def _cast_to_string(src, shape):
+    x = am.array(src)
+    return arrow(x.cast("string")), arrow(x.to_strings())
+
+
+@op("parse_numbers", NUMERIC + ["bool"],
+    note="the values pyarrow itself formatted, parsed back by both engines")
+def _parse_numbers(src, shape):
+    """Round trip through Arrow's own text: `pc.cast(utf8)` produces the strings, then both engines
+    parse them back. Anything ArrowMetal cannot parse it reports as null and Arrow raises on, which is
+    why the strings come from Arrow rather than from the string generator
+    (test_parse_returns_null_where_pyarrow_raises pins that half)."""
+    name = type_name_of(src)
+    text = src.cast(pa.string())
+    if name in FLOATING:
+        # Arrow prints a float in the shortest round-tripping form, which its own parser reads back
+        # exactly; ArrowMetal's CPU parser is strtof/strtod, so the two agree on every finite value.
+        pass
+    return arrow(am.array(text).parse(name)), text.cast(ARROW_TYPE[name], safe=False)
+
+
+# ---- temporal --------------------------------------------------------
+#
+# Every kernel is compared in UTC, which is what ArrowMetal extracts in; the two timezone functions
+# (assume_timezone / local_timestamp) are the ones that consult the tz database, and they get the
+# timezone columns.
+#
+# `pc.year_month_day` and `pc.iso_calendar` are deliberately *not* used as oracles: in pyarrow 25.0.1
+# they corrupt the heap and crash the process a couple of calls later (see docs/FINDINGS.md). The two
+# struct-valued kernels are compared field by field against the scalar extractors instead, which is a
+# stronger check anyway -- it says the struct agrees with `pc.year`, not merely with another struct.
+
+#: The calendar extractors, on every column that carries a date.
+_CALENDAR_FIELDS = [("year", pc.year), ("month", pc.month), ("day", pc.day),
+                    ("day_of_year", pc.day_of_year), ("quarter", pc.quarter),
+                    ("iso_week", pc.iso_week), ("iso_year", pc.iso_year),
+                    ("us_week", pc.us_week), ("us_year", pc.us_year),
+                    ("is_leap_year", pc.is_leap_year)]
+
+#: The clock extractors. date32 / date64 answer them here (all zero) where Arrow has no kernel at all,
+#: so those two types get their own op below.
+_CLOCK_FIELDS = [("hour", pc.hour), ("minute", pc.minute), ("second", pc.second),
+                 ("millisecond", pc.millisecond), ("microsecond", pc.microsecond),
+                 ("nanosecond", pc.nanosecond), ("subsecond", pc.subsecond)]
+
+
+def _in_the_result_width(result, expected):
+    """The oracle in the result's own integer width.
+
+    ArrowMetal's temporal extractors return **int32** where pyarrow returns int64 -- every value a
+    calendar or clock field can take fits in either, so casting the oracle back compares the numbers
+    without hiding anything, and the width itself is the `temporal_field_types` operation's job
+    (plus test_temporal_extractors_return_int32_where_pyarrow_returns_int64)."""
+    return expected.cast(result.type) if expected.type != result.type else expected
+
+
+@op("temporal_calendar", DATE_LIKE, note="year, month, day, quarter, day_of_year, the two week "
+                                        "numbering pairs and is_leap_year, all in UTC")
+def _temporal_calendar(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for name, oracle in _CALENDAR_FIELDS:
+        result = arrow(getattr(x, name)())
+        got.append(result)
+        expected.append(_in_the_result_width(result, oracle(src)))
+    return got, expected
+
+
+@op("temporal_clock", TIMESTAMP_TYPES + TIME_TYPES)
+def _temporal_clock(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for name, oracle in _CLOCK_FIELDS:
+        result = arrow(getattr(x, name)())
+        got.append(result)
+        expected.append(_in_the_result_width(result, oracle(src)))
+    return got, expected
+
+
+#: The Arrow type each temporal extractor returns here, which is not always pyarrow's. Recorded so a
+#: change of width is a failure rather than something the value comparison quietly absorbs.
+_TEMPORAL_RESULT_TYPES = {
+    "year": pa.int32(), "month": pa.int32(), "day": pa.int32(), "day_of_year": pa.int32(),
+    "quarter": pa.int32(), "iso_week": pa.int32(), "iso_year": pa.int32(),
+    "us_week": pa.int64(), "us_year": pa.int64(), "is_leap_year": pa.bool_(),
+    "hour": pa.int32(), "minute": pa.int32(), "second": pa.int32(), "millisecond": pa.int32(),
+    "microsecond": pa.int32(), "nanosecond": pa.int32(), "subsecond": pa.float64(),
+    "day_of_week": pa.int32(), "week": pa.int64(),
+}
+
+
+@op("temporal_field_types", DATE_LIKE,
+    note=_no_oracle("temporal_field_types",
+                    "the result width is ArrowMetal's own (int32 where pyarrow returns int64), so the "
+                    "reference is the recorded contract in _TEMPORAL_RESULT_TYPES"))
+def _temporal_field_types(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for name, ty in sorted(_TEMPORAL_RESULT_TYPES.items()):
+        got.append(str(arrow(getattr(x, name)()).type))
+        expected.append(str(ty))
+    return got, expected
+
+
+@op("temporal_clock_on_a_date", DATE_TYPES,
+    note=_no_oracle("temporal_clock_on_a_date",
+                    "pyarrow has no hour/minute/second/subsecond kernel for date32 or date64; "
+                    "ArrowMetal answers with the midnight the date names, which the reference asserts"))
+def _temporal_clock_on_a_date(src, shape):
+    """ArrowMetal defines the clock fields on a date column as the clock of the midnight it names, so
+    every one of them is zero where the row is valid and null where it is not. That is the reference."""
+    x = am.array(src)
+    valid = pc.is_valid(src)
+    got, expected = [], []
+    for name, _ in _CLOCK_FIELDS:
+        result = arrow(getattr(x, name)())
+        got.append(result)
+        zero = pa.scalar(0.0 if name == "subsecond" else 0, result.type)
+        expected.append(pc.if_else(valid, zero, pa.scalar(None, result.type)))
+    return got, expected
+
+
+@op("temporal_week_options", DATE_LIKE, note="pc.week with every WeekOptions combination")
+def _temporal_week_options(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for monday in (True, False):
+        for from_zero in (True, False):
+            for fully_in_year in (True, False):
+                got.append(arrow(x.week(monday, from_zero, fully_in_year)))
+                expected.append(pc.week(src, week_starts_monday=monday, count_from_zero=from_zero,
+                                        first_week_is_fully_in_year=fully_in_year))
+    for from_zero in (True, False):
+        for week_start in (1, 3, 7):
+            result = arrow(x.day_of_week(from_zero, week_start))
+            got.append(result)
+            expected.append(_in_the_result_width(
+                result, pc.day_of_week(src, count_from_zero=from_zero, week_start=week_start)))
+    return got, expected
+
+
+@op("temporal_struct", DATE_LIKE,
+    note="iso_calendar and year_month_day compared field by field against the scalar extractors "
+         "(pc.iso_calendar / pc.year_month_day crash pyarrow 25.0.1)")
+def _temporal_struct(src, shape):
+    x = am.array(src)
+    iso, ymd = x.iso_calendar(), x.year_month_day()
+    got = [arrow(iso.struct_field("iso_year")), arrow(iso.struct_field("iso_week")),
+           arrow(iso.struct_field("iso_day_of_week")),
+           arrow(ymd.struct_field("year")), arrow(ymd.struct_field("month")),
+           arrow(ymd.struct_field("day"))]
+    expected = [pc.iso_year(src), pc.iso_week(src),
+                pc.day_of_week(src, count_from_zero=False, week_start=1),
+                pc.year(src), pc.month(src), pc.day(src)]
+    return got, [e.cast(pa.int64()) if e.type != pa.int64() else e for e in expected]
+
+
+@op("temporal_timezone", TIMESTAMP_TZ, note="is_dst and local_timestamp in the column's own zone")
+def _temporal_timezone(src, shape):
+    x = am.array(src)
+    return ([arrow(x.is_dst()), arrow(x.local_timestamp())],
+            [pc.is_dst(src), pc.local_timestamp(src)])
+
+
+@op("assume_timezone", TIMESTAMP_NAIVE,
+    note="pc.assume_timezone with ambiguous / nonexistent spelled out; 'raise' is not compared "
+         "because the generator will hit a DST gap")
+def _assume_timezone(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for zone in (TZ_NAME, "UTC", "Asia/Kolkata", "Australia/Lord_Howe"):
+        for handling in ("earliest", "latest"):
+            got.append(arrow(x.assume_timezone(zone, handling, handling)))
+            expected.append(pc.assume_timezone(src, zone, ambiguous=handling, nonexistent=handling))
+    return got, expected
+
+
+# Rounding. Three things separate the two engines and each has its own operation so that the rest keeps
+# comparing exactly:
+#
+#   * a unit finer than the column's own resolution: ArrowMetal leaves the value alone, Arrow converts
+#     to the finer unit, rounds there and truncates back (finding temporal-round-finer-unit);
+#   * `ceil` of a value already sitting on a *calendar* boundary: ArrowMetal keeps it, Arrow advances
+#     a whole unit -- although for the fixed-length units Arrow keeps it too (finding
+#     temporal-ceil-on-a-calendar-boundary);
+#   * a multiple of months or quarters that does not divide the epoch's own offset: ArrowMetal counts
+#     calendar units from year 0 and Arrow from 1970-01, except for `year`, where Arrow counts from
+#     year 0 as well (finding temporal-calendar-multiple-origin).
+
+_FIXED_ROUND_UNITS = ["nanosecond", "microsecond", "millisecond", "second", "minute", "hour", "day"]
+_CALENDAR_ROUND_UNITS = ["month", "quarter", "year"]
+#: Ticks in one of the fixed-length units, so the matrix can tell which are finer than a column.
+_UNIT_NANOSECONDS = {"nanosecond": 1, "microsecond": 10 ** 3, "millisecond": 10 ** 6,
+                     "second": 10 ** 9, "minute": 60 * 10 ** 9, "hour": 3600 * 10 ** 9,
+                     "day": 86400 * 10 ** 9}
+#: Multiples of a calendar unit that land on the same grid whichever origin is used: `month` needs the
+#: multiple to divide 1970*12 and `quarter` to divide 1970*4.
+_ALIGNED_MULTIPLES = {"month": [1, 2, 3, 4, 5, 6], "quarter": [1, 2, 4, 5], "year": [1, 2, 3, 4, 7]}
+
+
+def _column_nanoseconds(src):
+    """Nanoseconds in one tick of the column, or None when it carries no time at all."""
+    if pa.types.is_date32(src.type):
+        return 86400 * 10 ** 9
+    if pa.types.is_date64(src.type):
+        return 10 ** 6
+    return {"s": 10 ** 9, "ms": 10 ** 6, "us": 10 ** 3, "ns": 1}[src.type.unit]
+
+
+def _round_pairs(src, kind):
+    """(unit, multiple) pairs for one rounding operation.
+
+    `kind` "fixed" keeps the units the column can actually represent, "finer" the ones below its
+    resolution at a multiple that does not divide a whole tick, and "calendar" the month / quarter /
+    year units at multiples both engines put on the same grid."""
+    tick = _column_nanoseconds(src)
+    if kind == "fixed":
+        return [(u, m) for u in _FIXED_ROUND_UNITS for m in (1, 2, 3, 7)
+                if _UNIT_NANOSECONDS[u] >= tick]
+    if kind == "finer":
+        return [(u, m) for u in _FIXED_ROUND_UNITS for m in (3, 7)
+                if _UNIT_NANOSECONDS[u] < tick]
+    return [(u, m) for u in _CALENDAR_ROUND_UNITS for m in _ALIGNED_MULTIPLES[u]]
+
+
+def _rounding_case(src, kinds, modes):
+    x = am.array(src)
+    got, expected = [], []
+    for kind in kinds:
+        for unit, multiple in _round_pairs(src, kind):
+            for mode, oracle in modes:
+                got.append(arrow(getattr(x, mode + "_temporal")(unit, multiple)))
+                expected.append(oracle(src, multiple=multiple, unit=unit))
+    if not got:
+        raise Unsupported(f"no {'/'.join(kinds)} rounding units apply to {src.type}")
+    return got, expected
+
+
+_ROUND_MODES = [("floor", pc.floor_temporal), ("ceil", pc.ceil_temporal),
+                ("round", pc.round_temporal)]
+_FLOOR_AND_ROUND = [m for m in _ROUND_MODES if m[0] != "ceil"]
+
+
+@op("temporal_round", TIMESTAMP_TYPES + DATE_TYPES + TIME_TYPES,
+    note="floor/ceil/round to every unit the column can represent, at multiples 1, 2, 3 and 7")
+def _temporal_round(src, shape):
+    return _rounding_case(src, ["fixed"], _ROUND_MODES)
+
+
+@op("temporal_round_finer", TIMESTAMP_TYPES + DATE_TYPES + TIME_TYPES,
+    note="a unit below the column's own resolution: ArrowMetal is the identity, Arrow converts")
+def _temporal_round_finer(src, shape):
+    return _rounding_case(src, ["finer"], _ROUND_MODES)
+
+
+@op("temporal_round_calendar", DATE_LIKE,
+    note="month, quarter and year, at the multiples both engines put on the same grid")
+def _temporal_round_calendar(src, shape):
+    return _rounding_case(src, ["calendar"], _FLOOR_AND_ROUND)
+
+
+@op("temporal_ceil_calendar", DATE_LIKE,
+    note="ceil of a value already on a month, quarter or year boundary: kept here, advanced in Arrow")
+def _temporal_ceil_calendar(src, shape):
+    return _rounding_case(src, ["calendar"], [m for m in _ROUND_MODES if m[0] == "ceil"])
+
+
+@op("temporal_round_unaligned", DATE_LIKE,
+    note="month x7 and quarter x3: the two origins part company here")
+def _temporal_round_unaligned(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for unit, multiple in [("month", 7), ("month", 11), ("quarter", 3), ("quarter", 7)]:
+        for mode, oracle in _ROUND_MODES:
+            got.append(arrow(getattr(x, mode + "_temporal")(unit, multiple)))
+            expected.append(oracle(src, multiple=multiple, unit=unit))
+    return got, expected
+
+
+@op("temporal_round_duration", DURATION_TYPES,
+    note=_no_oracle("temporal_round_duration",
+                    "pyarrow's floor/ceil/round_temporal have no duration kernel; the reference is "
+                    "integer arithmetic on the tick count, which is what the kernel documents"))
+def _temporal_round_duration(src, shape):
+    """A duration has no calendar, so rounding it is plain integer arithmetic on its ticks. The
+    reference is that arithmetic, done in Python: floor divides toward minus infinity, ceil leaves a
+    value already on a boundary alone, and a half rounds toward plus infinity."""
+    x = am.array(src)
+    tick = _column_nanoseconds(src)
+    got, expected = [], []
+    values = _raw_ticks(src).to_pylist()
+    for unit in _FIXED_ROUND_UNITS:
+        if _UNIT_NANOSECONDS[unit] < tick:
+            continue
+        for multiple in (1, 3):
+            step = (_UNIT_NANOSECONDS[unit] // tick) * multiple
+            for mode in ("floor", "ceil", "round"):
+                got.append(arrow(getattr(x, mode + "_temporal")(unit, multiple)))
+                expected.append(pa.array([None if v is None else _round_ticks(v, step, mode)
+                                          for v in values], type=pa.int64()).cast(src.type,
+                                                                                  safe=False))
+    return got, expected
+
+
+def _raw_ticks(src):
+    """The int64 tick values under a temporal column. `to_pylist` would hand back datetimes, which
+    cannot hold a nanosecond; Arrow's own cast is exact. The 32-bit temporal types have to go through
+    int32 first -- Arrow has no direct cast from time32 or date32 to int64."""
+    if pa.types.is_time32(src.type) or pa.types.is_date32(src.type):
+        return src.cast(pa.int32(), safe=False).cast(pa.int64())
+    return src.cast(pa.int64(), safe=False)
+
+
+def _round_ticks(ticks, step, mode):
+    low = (ticks // step) * step
+    if mode == "floor":
+        return low
+    high = low + step
+    if mode == "ceil":
+        return low if ticks == low else high
+    return high if 2 * (ticks - low) >= step else low
+
+
+# The differences. Every *_between counts boundaries crossed from self to other, both sides truncated
+# to the unit first, so it is not the truncated difference; pyarrow's kernels take two arguments of the
+# same type, which is what the matrix pairs.
+
+_BETWEEN_CALENDAR = [("years_between", pc.years_between), ("quarters_between", pc.quarters_between),
+                     ("days_between", pc.days_between)]
+_BETWEEN_CLOCK = [("hours_between", pc.hours_between), ("minutes_between", pc.minutes_between),
+                  ("seconds_between", pc.seconds_between),
+                  ("milliseconds_between", pc.milliseconds_between),
+                  ("microseconds_between", pc.microseconds_between),
+                  ("nanoseconds_between", pc.nanoseconds_between)]
+
+
+@op("temporal_between", DATE_LIKE)
+def _temporal_between(src, shape):
+    other = make_array(type_name_of(src), shape, seed=1)
+    x, y = am.array(src), am.array(other)
+    got, expected = [], []
+    for name, oracle in _BETWEEN_CALENDAR + _BETWEEN_CLOCK:
+        got.append(arrow(getattr(x, name)(y)))
+        expected.append(oracle(src, other))
+    return got, expected
+
+
+@op("temporal_between_clock", TIME_TYPES)
+def _temporal_between_clock(src, shape):
+    other = make_array(type_name_of(src), shape, seed=1)
+    x, y = am.array(src), am.array(other)
+    got, expected = [], []
+    for name, oracle in _BETWEEN_CLOCK:
+        got.append(arrow(getattr(x, name)(y)))
+        expected.append(oracle(src, other))
+    return got, expected
+
+
+@op("weeks_between", DATE_LIKE, note="pc.weeks_between with week_start spelled out, 1 = Monday")
+def _weeks_between(src, shape):
+    other = make_array(type_name_of(src), shape, seed=1)
+    x, y = am.array(src), am.array(other)
+    got, expected = [], []
+    for week_start in (1, 2, 3, 4, 5, 6, 7):
+        for from_zero in (True, False):
+            got.append(arrow(x.weeks_between(y, count_from_zero=from_zero, week_start=week_start)))
+            expected.append(pc.weeks_between(src, other, count_from_zero=from_zero,
+                                             week_start=week_start))
+    return got, expected
+
+
+@op("months_between", DATE_LIKE,
+    note="pyarrow spells the same quantity month_interval_between and returns an interval; the oracle "
+         "is the difference of year * 12 + month, built from pc.year and pc.month")
+def _months_between(src, shape):
+    other = make_array(type_name_of(src), shape, seed=1)
+
+    def index(a):
+        return pc.add(pc.multiply(pc.year(a).cast(pa.int64()), 12), pc.month(a).cast(pa.int64()))
+
+    return (arrow(am.array(src).months_between(am.array(other))),
+            pc.subtract(index(other), index(src)))
+
+
+@op("interval_between", DATE_LIKE, note="pc.month_day_nano_interval_between, field for field")
+def _interval_between(src, shape):
+    other = make_array(type_name_of(src), shape, seed=1)
+    x, y = am.array(src), am.array(other)
+    return (arrow(x.month_day_nano_interval_between(y)),
+            pc.month_day_nano_interval_between(src, other))
+
+
+@op("interval_layouts", DATE_LIKE,
+    note=_no_oracle("interval_layouts",
+                    "pyarrow 25 has no Python type for interval[month] or interval[day_time], so "
+                    "neither engine's result can be wrapped; the reference is the month_day_nano "
+                    "result, which pyarrow does compute and which the matrix compares against it"))
+def _interval_layouts(src, shape):
+    """The two narrow interval layouts are read through `interval_field`, and checked against the
+    month_day_nano interval the previous operation already compares with Arrow: the month layout must
+    carry the same months, and the day/time layout the same days and the same sub-day part truncated
+    to milliseconds."""
+    other = make_array(type_name_of(src), shape, seed=1)
+    x, y = am.array(src), am.array(other)
+    mdn = x.month_day_nano_interval_between(y)
+    months = x.month_interval_between(y)
+    day_time = x.day_time_interval_between(y)
+    milli = pa.scalar(10 ** 6, pa.int64())
+    reference_nanos = pc.multiply(pc.divide(arrow(mdn.interval_field("nanoseconds")), milli), milli)
+    return ([arrow(months.interval_field("months")),
+             arrow(day_time.interval_field("days")),
+             arrow(day_time.interval_field("nanoseconds"))],
+            [arrow(mdn.interval_field("months")),
+             # The day/time layout carries whole days, not the calendar remainder the month/day/nano
+             # one does; interval_field returns int32, pc.days_between int64.
+             pc.days_between(src, other).cast(pa.int32()),
+             reference_nanos])
+
+
+@op("add_duration", TIMESTAMP_TYPES + TIME_TYPES + DURATION_TYPES,
+    note="a duration column of the same unit, and a scalar tick count; a time-of-day column keeps "
+         "only the rows whose result stays inside the day, which is all pyarrow will answer")
+def _add_duration(src, shape):
+    unit = src.type.unit
+    delta = make_array("duration_" + unit, shape, seed=4)
+    if pa.types.is_time32(src.type) or pa.types.is_time64(src.type):
+        # pc.add refuses a time-of-day outside [0, 86400) rather than wrapping, so the pairs that
+        # would leave the day are dropped (test_time_of_day_addition_wraps_where_pyarrow_raises).
+        span = 86400 * TICKS[unit]
+        ticks = _raw_ticks(src)
+
+        def inside(total):
+            return pc.and_(pc.greater_equal(total, 0), pc.less(total, span))
+
+        # The null rows go too: pc.add validates the values *under* the validity bitmap, which the
+        # generator deliberately fills with real numbers, so a null row whose hidden value would
+        # leave the day makes the oracle raise. Null propagation is covered by every other type here.
+        keep = pc.fill_null(pc.and_(inside(pc.add(ticks, _raw_ticks(delta))),
+                                    inside(pc.add(ticks, pa.scalar(1000, pa.int64())))), False)
+        src, delta = src.filter(keep), delta.filter(keep)
+    x = am.array(src)
+    got = [arrow(x.add_duration(am.array(delta))), arrow(x.add_duration(1000))]
+    expected = [pc.add(src, delta), pc.add(src, pa.scalar(1000, pa.duration(unit)))]
+    return got, expected
+
+
+@op("subtract_temporal", TIMESTAMP_TYPES + DATE_TYPES + TIME_TYPES + DURATION_TYPES,
+    note="pc.subtract of two temporal columns, which yields a duration in the finer resolution")
+def _subtract_temporal(src, shape):
+    other = make_array(type_name_of(src), shape, seed=1)
+    return arrow(am.array(src).subtract_temporal(am.array(other))), pc.subtract(src, other)
+
+
+@op("add_interval", TIMESTAMP_TYPES,
+    note=_no_oracle("add_interval",
+                    "pyarrow 25 has no add(timestamp, month_day_nano_interval) kernel; the days and "
+                    "sub-day part are cross-checked against pc.add of the equivalent duration, and "
+                    "the month part against a Python reference that clamps the day like Arrow does"))
+def _add_interval(src, shape):
+    """The interval column is split in two: the day and nanosecond fields are a plain duration, which
+    Arrow can add, and the month field is calendar arithmetic, whose reference is written out here --
+    the day is clamped to the length of the target month, which is what Arrow's own month addition
+    documents."""
+    interval = make_array("mdn_interval", shape, seed=5)
+    tick = _column_nanoseconds(src)
+    months = arrow(am.array(interval).interval_field("months"))
+    days = arrow(am.array(interval).interval_field("days"))
+    nanos = arrow(am.array(interval).interval_field("nanoseconds"))
+
+    # The day / nanosecond half, as a duration Arrow can add.
+    ticks = pc.add(pc.multiply(days.cast(pa.int64()), 86400 * (10 ** 9 // tick)),
+                   pc.divide(nanos, pa.scalar(tick, pa.int64())))
+    only_time = pc.if_else(pc.equal(months, 0), pa.scalar(True), pa.scalar(False))
+    time_only_rows = pc.fill_null(only_time, False)
+    src_time, ticks_time = src.filter(time_only_rows), ticks.filter(time_only_rows)
+    interval_time = interval.filter(time_only_rows)
+
+    got = [arrow(am.array(src_time).add_interval(am.array(interval_time)))]
+    expected = [pc.add(src_time, ticks_time.cast(pa.duration(src.type.unit)))]
+
+    # The whole column, against the reference.
+    got.append(arrow(am.array(src).add_interval(am.array(interval))))
+    expected.append(_add_interval_reference(src, months, days, nanos, tick))
+    return got, expected
+
+
+def _add_interval_reference(src, months, days, nanos, tick):
+    """`timestamp + month_day_nano_interval`, in Python: the months move the calendar month and clamp
+    the day, then the days and nanoseconds are added as elapsed time."""
+    ticks_per_second = 10 ** 9 // tick
+    out = []
+    for ticks, month, day, nano in zip(_raw_ticks(src).to_pylist(), months.to_pylist(),
+                                       days.to_pylist(), nanos.to_pylist()):
+        if ticks is None or month is None:
+            out.append(None)
+            continue
+        whole_days, rest = divmod(ticks, 86400 * ticks_per_second)
+        y, m, d = _civil_from_days(whole_days)
+        total = (y * 12 + (m - 1)) + month
+        ny, nm = divmod(total, 12)
+        nd = min(d, _days_in_month(ny, nm + 1))
+        shifted = _days_from_civil(ny, nm + 1, nd) * 86400 * ticks_per_second + rest
+        # The sub-day part truncates toward zero when the column is coarser than the interval, which
+        # is not Python's floor division for a negative interval.
+        sub = abs(nano) // tick * (1 if nano >= 0 else -1)
+        out.append(shifted + day * 86400 * ticks_per_second + sub)
+    return pa.array(out, type=pa.int64()).cast(src.type, safe=False)
+
+
+def _civil_from_days(days):
+    days += 719468
+    era = (days if days >= 0 else days - 146096) // 146097
+    doe = days - era * 146097
+    yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
+    y = yoe + era * 400
+    doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+    mp = (5 * doy + 2) // 153
+    d = doy - (153 * mp + 2) // 5 + 1
+    m = mp + 3 if mp < 10 else mp - 9
+    return (y + (1 if m <= 2 else 0), m, d)
+
+
+def _days_from_civil(y, m, d):
+    y -= 1 if m <= 2 else 0
+    era = (y if y >= 0 else y - 399) // 400
+    yoe = y - era * 400
+    doy = (153 * (m + (-3 if m > 2 else 9)) + 2) // 5 + d - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+
+
+def _days_in_month(y, m):
+    if m == 2:
+        leap = (y % 4 == 0 and y % 100 != 0) or y % 400 == 0
+        return 29 if leap else 28
+    return 30 if m in (4, 6, 9, 11) else 31
+
+
+@op("strftime", TIMESTAMP_TYPES + DATE_TYPES,
+    note="pc.strftime in UTC (ArrowMetal formats the instant, never the column's local time), with "
+         "the format spelled out and the locale left at C")
+def _strftime(src, shape):
+    x = am.array(src)
+    # ArrowMetal formats in UTC; pc.strftime formats a zoned column in its own zone, so the oracle
+    # sees the same instants written without a zone. The zone difference itself is finding
+    # `temporal-extract-in-utc`, which `temporal_utc_semantics` covers.
+    naive = _naive_timestamp(src)
+    got, expected = [], []
+    for fmt in ("%Y-%m-%d", "%H:%M", "%j", "%Y", "%Y/%m/%d %H:%M", "%m-%d"):
+        got.append(arrow(x.strftime(fmt)))
+        expected.append(pc.strftime(naive, format=fmt))
+    return got, expected
+
+
+def _naive_timestamp(src):
+    if pa.types.is_date32(src.type) or pa.types.is_date64(src.type):
+        return src.cast(pa.timestamp("s"))
+    return src.cast(pa.timestamp(src.type.unit))
+
+
+@op("strftime_seconds", TIMESTAMP_TYPES + DATE_TYPES,
+    note="a format with %S: Arrow prints the sub-second digits with the seconds, C's strftime (and "
+         "so ArrowMetal's) does not")
+def _strftime_seconds(src, shape):
+    x = am.array(src)
+    naive = _naive_timestamp(src)
+    got, expected = [], []
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%S", "%H:%M:%S"):
+        got.append(arrow(x.strftime(fmt)))
+        expected.append(pc.strftime(naive, format=fmt))
+    return got, expected
+
+
+@op("strptime", ["utf8"], note="pc.strptime with error_is_null=True, the mode ArrowMetal implements")
+def _strptime(src, shape):
+    """The strings come from Arrow's own `strftime` of a generated timestamp column, so the format is
+    guaranteed to be the one being parsed; the generator's own strings go in too, and both engines have
+    to agree that they do not parse."""
+    text = src
+    return (arrow(am.array(text).strptime("%Y-%m-%d %H:%M:%S")),
+            pc.strptime(text, format="%Y-%m-%d %H:%M:%S", unit="us", error_is_null=True))
+
+
+@op("strptime_roundtrip", TIMESTAMP_NAIVE,
+    note="Arrow formats the column, then both engines parse the text back")
+def _strptime_roundtrip(src, shape):
+    text = pc.strftime(src, format="%Y-%m-%d %H:%M:%S")
+    return (arrow(am.array(text).strptime("%Y-%m-%d %H:%M:%S")),
+            pc.strptime(text, format="%Y-%m-%d %H:%M:%S", unit="us", error_is_null=True))
+
+
+@op("cast_unit", TIMESTAMP_TYPES + TIME_TYPES + DURATION_TYPES,
+    note="Arrow's cast between resolutions, safe=False: scaling down truncates")
+def _cast_unit(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for unit in TIME_UNITS:
+        target = _rescaled_type(src.type, unit)
+        if target is None:
+            continue
+        got.append(arrow(x.cast_unit(unit)))
+        expected.append(src.cast(target, safe=False))
+    return got, expected
+
+
+def _rescaled_type(ty, unit):
+    if pa.types.is_timestamp(ty):
+        return pa.timestamp(unit, ty.tz)
+    if pa.types.is_duration(ty):
+        return pa.duration(unit)
+    return pa.time32(unit) if unit in ("s", "ms") else pa.time64(unit)
+
+
+@op("temporal_utc_semantics", TIMESTAMP_TZ,
+    note="ArrowMetal extracts in UTC whatever the column's zone: the oracle is Arrow applied to the "
+         "same instants with the zone stripped, which must agree exactly")
+def _temporal_utc_semantics(src, shape):
+    """The companion to finding `temporal-extract-in-utc`. Arrow reads a zoned timestamp in local
+    time and ArrowMetal in UTC; this case pins that ArrowMetal's answer is exactly Arrow's answer for
+    the same instants written as a naive column, so the divergence is the zone and nothing else."""
+    naive = src.cast(pa.timestamp(src.type.unit))
+    x = am.array(src)
+    got, expected = [], []
+    for name, oracle in _CALENDAR_FIELDS + _CLOCK_FIELDS:
+        result = arrow(getattr(x, name)())
+        got.append(result)
+        expected.append(_in_the_result_width(result, oracle(naive)))
+    for unit, multiple in _round_pairs(src, "fixed"):
+        got.append(arrow(x.floor_temporal(unit, multiple)))
+        expected.append(pc.floor_temporal(naive, multiple=multiple, unit=unit).cast(src.type))
+    return got, expected
+
+
+# ---- window, ranking, shifts and rolling windows ---------------------
+#
+# pyarrow has `rank` with a tiebreaker, which covers row_number ("first"), rank ("min") and dense_rank
+# ("dense"). It has nothing for percent_rank, cume_dist, shift, cumulative_mean or the rolling windows,
+# so those are checked against references written here and named in _NO_ORACLE.
+
+@op("ranking", NUMERIC, note="pc.rank with null_placement='at_end' and the matching tiebreaker")
+def _ranking(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for method, tiebreaker in [("row_number", "first"), ("rank", "min"), ("dense_rank", "dense")]:
+        got.append(arrow(getattr(x, method)()))
+        # null_placement defaults to "at_end", which is where ArrowMetal's ranks put them too.
+        expected.append(pc.rank(src, sort_keys="ascending", tiebreaker=tiebreaker).cast(pa.int32()))
+    return got, expected
+
+
+def _sorted_ranks(src):
+    """(min-rank, count-at-or-below, n) per row, ascending with nulls last as one tie group -- the
+    order every ranking function here uses. Written out so percent_rank and cume_dist, which pyarrow
+    does not have, are compared against something other than themselves."""
+    values = src.to_pylist()
+    n = len(values)
+    order = sorted(range(n), key=lambda i: (values[i] is None, ) if values[i] is None else
+                   (False, _sort_key(values[i])))
+    ranks, cume = [0] * n, [0] * n
+    position = 0
+    while position < n:
+        end = position + 1
+        while end < n and _same_rank(values[order[position]], values[order[end]]):
+            end += 1
+        for k in range(position, end):
+            ranks[order[k]] = position + 1
+            cume[order[k]] = end
+        position = end
+    return ranks, cume, n
+
+
+def _sort_key(value):
+    """Arrow's total order for a value inside one column: NaN after every number."""
+    if isinstance(value, float) and math.isnan(value):
+        return (1, 0.0)
+    return (0, value)
+
+
+def _same_rank(a, b):
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, float) and isinstance(b, float) and math.isnan(a) and math.isnan(b):
+        return True
+    return a == b
+
+
+@op("percent_rank_and_cume_dist", NUMERIC,
+    note=_no_oracle("percent_rank_and_cume_dist",
+                    "pyarrow has no percent_rank or cume_dist; the reference is the SQL definition, "
+                    "computed here from the same ascending-nulls-last order pc.rank uses"))
+def _percent_rank_and_cume_dist(src, shape):
+    x = am.array(src)
+    ranks, cume, n = _sorted_ranks(src)
+    percent = [0.0 if n <= 1 else (r - 1) / (n - 1) for r in ranks]
+    distribution = [c / n for c in cume] if n else []
+    return ([arrow(x.percent_rank()), arrow(x.cume_dist())],
+            [pa.array(percent, pa.float64()), pa.array(distribution, pa.float64())])
+
+
+@op("shift", NUMERIC,
+    note=_no_oracle("shift", "pyarrow has no lag/lead; the reference is the shifted Python list"))
+def _shift(src, shape):
+    x = am.array(src)
+    values = src.to_pylist()
+    n = len(values)
+    got, expected = [], []
+    for by, fill in [(1, None), (2, None), (-1, None), (-3, None), (1, scalar_for(type_name_of(src))),
+                     (0, None)]:
+        got.append(arrow(x.shift(by) if fill is None else x.shift(by, fill)))
+        shifted = [values[i - by] if 0 <= i - by < n else fill for i in range(n)]
+        expected.append(pa.array(shifted, type=src.type))
+    return got, expected
+
+
+def _materialised(src):
+    """The same values with the Arrow offset folded away.
+
+    `pc.pairwise_diff` reads the values buffer without honouring `ArrowArray.offset` in pyarrow 25.0.1,
+    so on a sliced column it answers with the wrong rows entirely; the oracle is given a copy while
+    ArrowMetal still gets the slice, which is what makes the case a test of the offset handling rather
+    than of pyarrow's bug (test_pyarrow_pairwise_diff_ignores_the_array_offset pins it)."""
+    if src.offset == 0:
+        return src
+    return pa.concat_arrays([src.slice(0, 0), src])
+
+
+@op("pairwise_diff", NUMERIC, note="pc.pairwise_diff, the unchecked form: it wraps as ArrowMetal's does")
+def _pairwise_diff(src, shape):
+    x = am.array(src)
+    flat = _materialised(src)
+    got, expected = [], []
+    for period in (1, 2, 5):
+        got.append(arrow(x.pairwise_diff(period)))
+        expected.append(pc.pairwise_diff(flat, period=period))
+    return got, expected
+
+
+def _within_exact_double(src):
+    """A keep-mask that stops the exact running total of an integer column ever leaving 2^53."""
+    running, keep = 0, []
+    for value in src.to_pylist():
+        if value is None:
+            keep.append(True)
+            continue
+        step = running + value
+        if abs(step) > 2 ** 53:
+            keep.append(False)
+        else:
+            running = step
+            keep.append(True)
+    return keep
+
+
+@op("cumulative_mean", NUMERIC,
+    note=_no_oracle("cumulative_mean",
+                    "pyarrow has no cumulative_mean; the reference is the exact running sum over the "
+                    "running count, on the values a double can hold exactly"))
+def _cumulative_mean(src, shape):
+    """The running mean of the non-null values so far.
+
+    The running total is accumulated in `double` by a parallel scan, so the reference is the exact
+    running sum over the running count -- and the input is trimmed to the range where that is a
+    meaningful comparison. A float column loses the values that can overflow a partial sum, exactly as
+    `cumulative_sum` does; an integer column loses the values that would take the running total past
+    2^53, where a double can no longer hold it and the scan's association starts to decide the answer
+    (test_cumulative_mean_accumulates_in_double pins that)."""
+    name = type_name_of(src)
+    if name in FLOATING:
+        filled = pc.fill_null(src, pa.scalar(0.0, src.type))
+        limit = pa.scalar(float(np.finfo(NUMPY_TYPE[name]).max) / max(len(src), 1), src.type)
+        src = src.filter(pc.or_(pc.is_nan(filled), pc.less_equal(pc.abs(filled), limit)))
+    else:
+        src = src.filter(pa.array(_within_exact_double(src), pa.bool_()))
+    x = am.array(src)
+    running, count, reference = 0, 0, []
+    for value in src.to_pylist():
+        if value is None:
+            reference.append(None)
+            continue
+        count += 1
+        running += value
+        reference.append(running / count)
+    tolerance = (FLOAT_TOL.get(name, FLOAT_TOL["float64"]),
+                 float_sum_bound(_drop_nan(src), name) if name in FLOATING else 0.0)
+    return arrow(x.cumulative_mean()), pa.array(reference, pa.float64()), tolerance
+
+
+_ROLLING_WINDOWS = [(1, None), (3, None), (3, 1), (7, 2), (64, None)]
+
+
+@op("rolling_min_max", NUMERIC,
+    note=_no_oracle("rolling_min_max",
+                    "pyarrow has no rolling window; the reference is each window taken as an Arrow "
+                    "slice and reduced with pc.min / pc.max, so only the windowing is this file's"))
+def _rolling_min_max(src, shape):
+    if len(src) > 4000:
+        raise Unsupported("the rolling reference is O(n * window); the smaller shapes cover it")
+    # NaN is dropped for the same reason the scalar min/max drop it: ArrowMetal treats it as missing
+    # all the way and answers ±inf for a window that holds nothing else, where pc.min answers NaN
+    # (test_rolling_min_of_an_all_nan_window pins the difference).
+    src = _drop_nan(src)
+    x = am.array(src)
+    got, expected = [], []
+    for window, min_periods in _ROLLING_WINDOWS:
+        for method, reduce in [("rolling_min", pc.min), ("rolling_max", pc.max)]:
+            got.append(arrow(getattr(x, method)(window, min_periods)))
+            expected.append(_rolling_reference(src, window, min_periods, reduce, method))
+    return got, expected
+
+
+def _finite_only(src, name):
+    """A float column with the values that can make a partial sum overflow taken out: ±inf, NaN, and
+    anything above `type_max / n`. The rolling sum is a difference of prefix sums, so one infinity
+    poisons every later window through `inf - inf`, which no roundoff bound can express."""
+    filled = pc.fill_null(src, pa.scalar(0.0, src.type))
+    limit = pa.scalar(float(np.finfo(NUMPY_TYPE[name]).max) / max(len(src), 1), src.type)
+    return src.filter(pc.and_(pc.invert(pc.is_nan(filled)), pc.less_equal(pc.abs(filled), limit)))
+
+
+@op("rolling_sum", NUMERIC,
+    note=_no_oracle("rolling_sum",
+                    "pyarrow has no rolling window; the reference reduces each window with pc.sum. "
+                    "Integers are exact and wrap in the column's own width; floats get the "
+                    "reductions' roundoff bound, because the kernel is a difference of prefix sums"))
+def _rolling_sum(src, shape):
+    """The rolling sum is a difference of prefix sums, which is what makes it O(n) rather than
+    O(n·window). The error of one window is therefore bounded by the error of the two prefix sums,
+    which is the reductions' own `8·eps·sqrt(n)·Σ|x|`; the values that would make a partial sum
+    overflow come out first (test_rolling_sum_is_a_prefix_sum_difference pins what happens with
+    them in)."""
+    name = type_name_of(src)
+    if len(src) > 4000:
+        raise Unsupported("the rolling reference is O(n * window); the smaller shapes cover it")
+    if name in FLOATING:
+        src = _finite_only(src, name)
+    x = am.array(src)
+    got, expected = [], []
+    for window, min_periods in _ROLLING_WINDOWS:
+        got.append(arrow(x.rolling_sum(window, min_periods)))
+        expected.append(_rolling_reference(src, window, min_periods, pc.sum, "rolling_sum"))
+    tolerance = (FLOAT_TOL[name], float_sum_bound(src, name)) if name in FLOATING else None
+    return got, expected, tolerance
+
+
+@op("rolling_mean", NUMERIC,
+    note=_no_oracle("rolling_mean",
+                    "pyarrow has no rolling window; the reference reduces each window with pc.mean, "
+                    "over the values whose prefix sums a double can hold exactly"))
+def _rolling_mean(src, shape):
+    """Like the rolling sum, but the prefix sums are kept in `double` whatever the column type, so an
+    integer column is trimmed to the values whose running total stays inside 2^53 -- past that the
+    difference of two prefix sums cannot recover the window
+    (test_rolling_mean_accumulates_in_double pins it)."""
+    name = type_name_of(src)
+    if len(src) > 4000:
+        raise Unsupported("the rolling reference is O(n * window); the smaller shapes cover it")
+    src = _finite_only(src, name) if name in FLOATING else \
+        src.filter(pa.array(_within_exact_double(src), pa.bool_()))
+    x = am.array(src)
+    got, expected = [], []
+    for window, min_periods in _ROLLING_WINDOWS:
+        got.append(arrow(x.rolling_mean(window, min_periods)))
+        expected.append(_rolling_reference(src, window, min_periods, pc.mean, "rolling_mean"))
+    bound = float_sum_bound(src, name) if name in FLOATING else 0.0
+    return got, expected, (FLOAT_TOL.get(name, FLOAT_TOL["float64"]), bound)
+
+
+def _rolling_reference(src, window, min_periods, reduce, method):
+    """The trailing window ending at each row, reduced by pyarrow. `min_periods` defaults to the whole
+    window; a shorter window at the start of the column is answered as soon as it holds that many
+    non-null rows, which is what the kernel documents."""
+    needed = window if min_periods is None else min_periods
+    out = []
+    for i in range(len(src)):
+        start = max(0, i + 1 - window)
+        chunk = src.slice(start, i + 1 - start)
+        if len(chunk) - chunk.null_count < needed:
+            out.append(None)
+            continue
+        out.append(reduce(chunk).as_py())
+    if method == "rolling_mean":
+        return pa.array(out, pa.float64())
+    if method == "rolling_sum" and pa.types.is_integer(src.type):
+        # The rolling sum keeps the column's own width and wraps in it, as the element-wise
+        # arithmetic does; pc.sum widens to 64 bits, so the total is folded back here.
+        name = type_name_of(src)
+        return pa.array([None if v is None else _wrap_to_width(v, name) for v in out], type=src.type)
+    return pa.array(out, type=src.type)
+
+
+def _wrap_to_width(value, name):
+    bits = NUMPY_TYPE[name].itemsize * 8
+    value &= (1 << bits) - 1
+    if name in SIGNED and value >= 1 << (bits - 1):
+        value -= 1 << bits
+    return value
+
+
+@op("lexsort", NUMERIC,
+    note="pc.sort_indices over a two-column table, which is what lexsort_indices orders by")
+def _lexsort(src, shape):
+    other = make_array(type_name_of(src), shape, seed=1)
+    keys = pa.table({"a": src, "b": other})
+    got, expected = [], []
+    for descending in ([False, False], [True, False], [False, True], [True, True]):
+        order = [("a", "descending" if descending[0] else "ascending"),
+                 ("b", "descending" if descending[1] else "ascending")]
+        # null_placement defaults to "at_end", which is where both engines put the nulls of every key.
+        got.append(arrow(am.lexsort_indices([am.array(src), am.array(other)], descending)))
+        expected.append(pc.sort_indices(keys, sort_keys=order).cast(pa.int32()))
+    return got, expected
+
+
+# ---- statistical and positional aggregates ---------------------------
+
+@op("product", NUMERIC, note="pc.product; integers wrap in 64 bits in both engines")
+def _product(src, shape):
+    """The generated magnitudes make a product overflow almost at once, so the column is reduced to the
+    values whose running product stays inside int64 / the float range -- past that the two engines
+    associate differently, which `cumulative_prod` already documents."""
+    name = type_name_of(src)
+    trimmed = _trim_for_product(src, name)
+    got = am.array(trimmed).product()
+    expected = pc.product(trimmed).as_py()
+    if name in FLOATING:
+        return got, expected, (FLOAT_TOL[name], 0.0)
+    return got, expected
+
+
+def _trim_for_product(src, name):
+    """The values on which no association of the product can leave the type's normal range.
+
+    `product` is a parallel tree reduction, so the intermediates are sub-products of arbitrary
+    subsets, not the sequential running product; once one of them overflows or underflows the pairing
+    decides the answer, exactly as `cumulative_prod` documents. Tracking `Π max(|v|, 1/|v|)` bounds
+    *every* sub-product between its reciprocal and itself, so staying inside the band makes every
+    association agree (test_product_reassociates_past_the_normal_range pins what happens outside)."""
+    if name in INTEGER:
+        # An integer product wraps in 64 bits in both engines, so only the magnitude of the whole
+        # product has to stay inside the accumulator.
+        values, keep, running = src.to_pylist(), [], 1.0
+        for v in values:
+            if v is None or v == 0:
+                keep.append(True)
+                continue
+            step = running * abs(float(v))
+            if step > 2.0 ** 62:
+                keep.append(False)
+            else:
+                running, _ = step, keep.append(True)
+        return src.filter(pa.array(keep, pa.bool_()))
+    band = 1e30 if name == "float32" else 1e250
+    keep, spread = [], 1.0
+    for v in src.to_pylist():
+        if v is None or v == 0 or not math.isfinite(v):
+            keep.append(True)
+            continue
+        magnitude = abs(float(v))
+        step = spread * max(magnitude, 1.0 / magnitude)
+        if step > band:
+            keep.append(False)
+        else:
+            spread = step
+            keep.append(True)
+    return src.filter(pa.array(keep, pa.bool_()))
+
+
+#: The variance kernel accumulates the two moments on the GPU and subtracts them, which costs it
+#: about six digits against pyarrow's exact two-pass algorithm: measured at 6e-10 relative over the
+#: matrix, and 2e-8 on a float32 column. These are those numbers with two orders of margin.
+_VARIANCE_TOL = {"float32": 1e-6, "float64": 1e-7}
+
+
+@op("variance_and_stddev", NUMERIC,
+    note="pc.variance / pc.stddev with ddof spelled out, to the relative accuracy the kernel states")
+def _variance_and_stddev(src, shape):
+    clean = _finite_only(_drop_nan(src), type_name_of(src)) if type_name_of(src) in FLOATING \
+        else _drop_nan(src)
+    x = am.array(clean)
+    got = [x.variance(0), x.variance(1), x.stddev(0), x.stddev(1)]
+    expected = [pc.variance(clean, ddof=0).as_py(), pc.variance(clean, ddof=1).as_py(),
+                pc.stddev(clean, ddof=0).as_py(), pc.stddev(clean, ddof=1).as_py()]
+    if len(clean) - clean.null_count < 2:
+        got, expected = got[:1] + got[2:3], expected[:1] + expected[2:3]
+    return got, expected, (_VARIANCE_TOL.get(type_name_of(src), 1e-7), 0.0)
+
+
+@op("quantile", NUMERIC, tol="result_float",
+    note="pc.quantile with interpolation='linear', the one ArrowMetal implements")
+def _quantile(src, shape):
+    clean = _drop_nan(src)
+    x = am.array(clean)
+    got, expected = [], []
+    for q in (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0):
+        got.append(x.quantile(q))
+        result = pc.quantile(clean, q=q, interpolation="linear")
+        expected.append(result[0].as_py() if len(result) else None)
+    got.append(x.median())
+    result = pc.quantile(clean, q=0.5, interpolation="linear")
+    expected.append(result[0].as_py() if len(result) else None)
+    return got, expected
+
+
+@op("mode_and_count_distinct", NUMERIC + ["bool"])
+def _mode_and_count_distinct(src, shape):
+    clean = _drop_nan(src)
+    x = am.array(clean)
+    modes = pc.mode(clean, n=1)
+    expected_mode = None if len(modes) == 0 else pc.struct_field(modes, "mode")[0].as_py()
+    expected_count = None if len(modes) == 0 else pc.struct_field(modes, "count")[0].as_py()
+    got = x.mode()
+    return ([None if got is None else got[0], None if got is None else got[1],
+             x.count_distinct()],
+            [expected_mode, expected_count, pc.count_distinct(clean).as_py()])
+
+
+@op("first_last_index_min_max", NUMERIC + ["bool"],
+    note="pc.first / pc.last / pc.index / pc.min_max; the needle is a value from the column itself")
+def _first_last_index_min_max(src, shape):
+    clean = _drop_nan(src)
+    x = am.array(clean)
+    got = [x.first(), x.last(), list(x.min_max())]
+    expected = [pc.first(clean).as_py(), pc.last(clean).as_py(),
+                [pc.min(clean).as_py(), pc.max(clean).as_py()]]
+    needle = _index_needle(clean)
+    if needle is not None:
+        got.append(x.index(needle))
+        expected.append(pc.index(clean, pa.scalar(needle, clean.type)).as_py())
+    return got, expected
+
+
+def _index_needle(clean):
+    """A value from the column that `index()` can carry.
+
+    `MetalArray.index` passes the value through a C `double`, so a 64-bit integer above 2^53 does not
+    survive the trip (test_index_of_a_large_integer_is_rounded_through_a_double pins that). The needle
+    has to round-trip exactly *and* be the only value in the column that rounds to that double, or the
+    comparison would be about the rounding rather than about the search; if no value qualifies, index
+    is left out of this case."""
+    distinct = pc.unique(clean.drop_null()).to_pylist()
+    if not distinct:
+        return None
+    by_double = {}
+    for value in distinct:
+        if isinstance(value, float) and not math.isfinite(value):
+            continue
+        by_double.setdefault(float(value), []).append(value)
+    for value in clean.drop_null().to_pylist()[:64]:
+        if isinstance(value, float) and not math.isfinite(value):
+            continue
+        if float(value) == value and len(by_double.get(float(value), ())) == 1:
+            return value
+    return None
+
+
+@op("any_all", ["bool"], note="pc.any / pc.all with min_count=0, so an empty column is false/true")
+def _any_all(src, shape):
+    x = am.array(src)
+    return ([x.any(), x.all()],
+            [pc.any(src, min_count=0).as_py(), pc.all(src, min_count=0).as_py()])
+
+
+# ---- the remaining type rows ------------------------------------------
+
+@op("float16_casts", ["float16"], note="pc.cast between float16 and float32, both directions")
+def _float16_casts(src, shape):
+    wide = am.array(src).to_float32()
+    return ([arrow(wide), arrow(wide.to_float16())],
+            [src.cast(pa.float32()), src])
+
+
+@op("float16_compute", ["float16"],
+    note="a float16 column widened to float32, computed on and narrowed back, against Arrow doing "
+         "the same -- ArrowMetal never computes in half precision")
+def _float16_compute(src, shape):
+    wide = src.cast(pa.float32())
+    x = am.array(src).to_float32()
+    return ([arrow(x.abs()), arrow(x.negate()), arrow(am.array(src).to_float32().to_float16())],
+            [pc.abs(wide), pc.negate(wide), src])
+
+
+@op("float16_reduce", ["float16"], tol="result_float",
+    note="the reductions run on the widened column in both engines")
+def _float16_reduce(src, shape):
+    clean = _drop_nan(src.cast(pa.float32()))
+    narrow = clean.cast(pa.float16())
+    x = am.array(narrow)
+    return ([x.min(), x.max()], [pc.min(clean).as_py(), pc.max(clean).as_py()])
+
+
+@op("fixed_binary_compare", ["fixed_size_binary"],
+    note="pc.equal / pc.not_equal; ordering comparisons are not defined for the type")
+def _fixed_binary_compare(src, shape):
+    other = make_array("fixed_size_binary", shape, seed=1)
+    x = am.array(src)
+    scalar = b"abcdefgh"
+    return ([arrow(x.fixed_binary_compare("==", am.array(other))),
+             arrow(x.fixed_binary_compare("!=", am.array(other))),
+             arrow(x.fixed_binary_compare("==", scalar))],
+            [pc.equal(src, other), pc.not_equal(src, other),
+             pc.equal(src, pa.scalar(scalar, src.type))])
+
+
+@op("hash64", NUMERIC + ["bool", "fixed_size_binary"],
+    note=_no_oracle("hash64",
+                    "Arrow has no element-wise hash; the properties checked are that nulls stay null, "
+                    "that equal values hash equal and that distinct values do not collide"))
+def _hash64(src, shape):
+    """A hash has no reference value, so the case checks the three things its caller relies on: the
+    output is uint64 with the input's null positions, Arrow-equal values hash equal (which for a float
+    column means `-0.0` hashes as `0.0` and every NaN alike), and the map from distinct value to hash
+    is injective on the generated data."""
+    hashes = arrow(am.array(src).hash64())
+    if hashes.type != pa.uint64():
+        return f"hash type {hashes.type}", "uint64"
+    if not pc.is_null(hashes).equals(pc.is_null(src)):
+        return "null positions differ between input and hashes", "identical null positions"
+    canonical = src
+    if type_name_of(src) in FLOATING:
+        # Arrow calls -0.0 and 0.0 equal and every NaN distinct; the hash canonicalises both, so the
+        # count of distinct values is taken the same way before comparing.
+        filled = pc.fill_null(src, pa.scalar(0.0, src.type))
+        canonical = pc.if_else(pc.is_nan(filled), pa.scalar(math.nan, src.type),
+                               pc.add(src, pa.scalar(0.0, src.type)))
+    pairs = pa.table({"v": canonical, "h": hashes}).filter(pc.is_valid(src))
+    distinct_pairs = pairs.group_by(["v", "h"]).aggregate([([], "count_all")]).num_rows
+    distinct_values = pc.count_distinct(canonical).as_py()
+    distinct_hashes = pc.count_distinct(hashes).as_py()
+    if distinct_pairs != distinct_values:
+        return f"{distinct_values} values produced {distinct_pairs} (value, hash) pairs", \
+               "one hash per value"
+    if distinct_hashes != distinct_values:
+        return f"{distinct_values} values collided onto {distinct_hashes} hashes", "no collisions"
+    return "consistent", "consistent"
+
+
+@op("dictionary_ops", ["dict_utf8"], note="decode is Arrow's cast back to the value type")
+def _dictionary_ops(src, shape):
+    x = am.array(src)
+    return arrow(x.decode()), src.cast(pa.string())
+
+
+@op("null_column", ["null"], note="the null type carries no buffers; filter, take and slice still work")
+def _null_column(src, shape):
+    x = am.array(src)
+    n = len(src)
+    mask = make_array("bool", shape, seed=2)
+    idx = pa.array(np.random.default_rng(11).integers(0, max(n, 1), min(n, 97)).astype(np.int32),
+                   type=pa.int32()) if n else pa.array([], pa.int32())
+    return ([arrow(x.filter(am.array(mask))), arrow(x.take(am.array(idx))), arrow(x.slice(0, n // 2))],
+            [src.filter(mask), src.take(idx), src.slice(0, n // 2)])
+
+
+@op("extension_type", INTEGER,
+    note=_no_oracle("extension_type",
+                    "Arrow has no compute function for extension metadata; the reference is the "
+                    "round trip through pyarrow's own extension registry"))
+def _extension_type(src, shape):
+    """`as_extension_type` writes `ARROW:extension:name` and `:metadata` into the exported schema, so
+    pyarrow rebuilds the extension type when it is registered. The reference is pyarrow's own view of
+    the same array."""
+    tagged = am.array(src).as_extension_type("arrowmetal.differential", b"v1")
+    exported = tagged.to_arrow()
+    return ([tagged.extension_name, tagged.extension_metadata,
+             arrow(tagged.extension_storage()), str(exported.type)],
+            ["arrowmetal.differential", b"v1", src, str(src.type)])
+
+
+# ---- trigonometry, the last boolean operators and the conditionals -----
+
+_TRIG_UNARY = ["sin", "cos", "tan", "asin", "acos", "atan",
+               "sinh", "cosh", "tanh", "asinh", "acosh", "atanh"]
+
+#: The header measures the worst case at 4 ulp (float32) and 5 ulp (float64) against the host libm.
+#: These are those bounds with a margin, as relative tolerances; every special value (NaN, +/-inf,
+#: +/-0 and the domain errors) is compared exactly by the pinned tests instead.
+_TRIG_TOL = {"float32": (1e-6, 0.0), "float64": (1e-14, 0.0)}
+
+
+@op("trig", FLOATING, note="pc.sin ... pc.atanh, to the ulp bound the header states")
+def _trig(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for name in _TRIG_UNARY:
+        got.append(arrow(getattr(x, name)()))
+        expected.append(getattr(pc, name)(src))
+    other = make_array(type_name_of(src), shape, seed=1)
+    got.append(arrow(x.atan2(am.array(other))))
+    expected.append(pc.atan2(src, other))
+    return got, expected, _TRIG_TOL[type_name_of(src)]
+
+
+#: (name, the values the checked form accepts). Everything outside raises in both engines.
+_TRIG_CHECKED = {
+    "sin_checked": lambda a: pc.is_finite(a), "cos_checked": lambda a: pc.is_finite(a),
+    "tan_checked": lambda a: pc.is_finite(a),
+    "asin_checked": lambda a: pc.less_equal(pc.abs(a), 1.0),
+    "acos_checked": lambda a: pc.less_equal(pc.abs(a), 1.0),
+    "acosh_checked": lambda a: pc.greater_equal(a, 1.0),
+    "atanh_checked": lambda a: pc.less(pc.abs(a), 1.0),
+}
+
+
+@op("trig_checked", FLOATING,
+    note="the values inside the domain agree with pyarrow's own _checked kernels; outside it, both "
+         "engines have to raise")
+def _trig_checked(src, shape):
+    x = am.array(src)
+    got, expected = [], []
+    for name, domain in _TRIG_CHECKED.items():
+        filled = pc.fill_null(src, pa.scalar(0.0, src.type))
+        inside = pc.or_(pc.is_nan(filled), pc.fill_null(domain(filled), False))
+        good = src.filter(inside)
+        got.append(arrow(getattr(am.array(good), name)()))
+        expected.append(getattr(pc, name)(good))
+        # And the raising half: on the rows outside the domain both engines must object.
+        bad = src.filter(pc.invert(inside))
+        if len(bad) and bad.null_count < len(bad):
+            got.append(_raises(lambda: getattr(am.array(bad), name)()))
+            expected.append(_raises(lambda: getattr(pc, name)(bad)))
+    return got, expected, _TRIG_TOL[type_name_of(src)]
+
+
+def _raises(call):
+    """True when the call reports a domain error, in either engine's way."""
+    try:
+        call()
+        return False
+    except (am.ArrowMetalError, pa.ArrowInvalid) as exc:
+        if "domain error" not in str(exc):
+            raise
+        return True
+
+
+@op("logical_extras", ["bool"], note="pc.xor / and_not / and_not_kleene")
+def _logical_extras(src, shape):
+    other = make_array("bool", shape, seed=1)
+    x, y = am.array(src), am.array(other)
+    return ([arrow(x.xor(y)), arrow(x.and_not(y)), arrow(x.and_not_kleene(y))],
+            [pc.xor(src, other), pc.and_not(src, other), pc.and_not_kleene(src, other)])
+
+
+@op("float_class", NUMERIC, note="pc.is_nan / is_inf / is_finite, defined on integers too")
+def _float_class(src, shape):
+    x = am.array(src)
+    return ([arrow(x.is_nan()), arrow(x.is_inf()), arrow(x.is_finite())],
+            [pc.is_nan(src), pc.is_inf(src), pc.is_finite(src)])
+
+
+@op("fill_null_direction", NUMERIC + ["bool"],
+    note="pc.fill_null_forward / _backward, on a materialised copy: pyarrow reads a *boolean* "
+         "column's values bitmap without its offset")
+def _fill_null_direction(src, shape):
+    x = am.array(src)
+    flat = _materialised(src)
+    return ([arrow(x.fill_null_forward()), arrow(x.fill_null_backward())],
+            [pc.fill_null_forward(flat), pc.fill_null_backward(flat)])
+
+
+@op("case_when", NUMERIC + ["bool"], note="pc.case_when over a struct of conditions")
+def _case_when(src, shape):
+    first = make_array("bool", shape, seed=2)
+    second = make_array("bool", shape, seed=6)
+    other = make_array(type_name_of(src), shape, seed=1)
+    default = make_array(type_name_of(src), shape, seed=7)
+    got = arrow(am.case_when([am.array(first), am.array(second)],
+                             [am.array(src), am.array(other)], am.array(default)))
+    conditions = pa.StructArray.from_arrays([first, second], ["a", "b"])
+    return got, pc.case_when(conditions, src, other, default)
+
+
+@op("choose", NUMERIC + ["bool"], note="pc.choose; a null index gives a null row in both")
+def _choose(src, shape):
+    other = make_array(type_name_of(src), shape, seed=1)
+    n = len(src)
+    rng = np.random.default_rng(13)
+    raw = rng.integers(0, 2, n).astype(np.int32)
+    idx = pa.array(raw, mask=rng.random(n) < 0.1, type=pa.int32()) if n else pa.array([], pa.int32())
+    return (arrow(am.choose(am.array(idx), [am.array(src), am.array(other)])),
+            pc.choose(idx, src, other))
+
+
+@op("replace_with_mask", NUMERIC + ["bool"])
+def _replace_with_mask(src, shape):
+    mask = make_array("bool", shape, seed=2)
+    needed = pc.sum(pc.cast(pc.fill_null(mask, False), pa.int64())).as_py() or 0
+    replacements = make_array(type_name_of(src), shape, seed=1).slice(0, needed)
+    if len(replacements) < needed:
+        raise Unsupported("not enough replacement values for this mask")
+    # As above: pyarrow's boolean replace_with_mask reads the values bitmap without the offset.
+    return (arrow(am.array(src).replace_with_mask(am.array(mask), am.array(replacements))),
+            pc.replace_with_mask(_materialised(src), _materialised(mask),
+                                 _materialised(replacements)))
+
+
+@op("indices_nonzero", NUMERIC + ["bool"], note="pc.indices_nonzero: -0.0 is zero, every NaN is not")
+def _indices_nonzero(src, shape):
+    return arrow(am.array(src).indices_nonzero()), pc.indices_nonzero(src)
+
+
+@op("coalesce", NUMERIC + ["bool"], note="pc.coalesce over three columns")
+def _coalesce(src, shape):
+    second = make_array(type_name_of(src), shape, seed=1)
+    third = make_array(type_name_of(src), shape, seed=7)
+    return (arrow(am.coalesce(am.array(src), am.array(second), am.array(third))),
+            pc.coalesce(src, second, third))
+
+
+@op("nulls_constructor", ["null"],
+    note=_no_oracle("nulls_constructor", "am.nulls(n) is a constructor, not a compute function; "
+                                         "the reference is pa.nulls(n)"))
+def _nulls_constructor(src, shape):
+    return arrow(am.nulls(len(src))), pa.nulls(len(src))
+
+
 # ------------------------------------------------------------------ the runner
 
 PASS, FAIL, SKIP = "pass", "fail", "skip"
@@ -1290,10 +3464,137 @@ def _prefix_product_leaves_safe_range(src):
     return False
 
 
+def _contains_non_ascii_digit(src):
+    """A code point of category Nd outside ASCII, which ICU's `\\d` matches and RE2's does not.
+    Taken over the distinct values, which is a handful whatever the row count."""
+    import unicodedata
+    for value in pc.unique(src).to_pylist():
+        for ch in value or "":
+            if ord(ch) > 127 and unicodedata.category(ch) == "Nd":
+                return True
+    return False
+
+
+def _anchor_can_match_twice(src):
+    """A row where an anchored pattern matches more than once under RE2's repeated search: RE2
+    re-anchors `^` at the start of each search where ICU anchors it at the start of the input."""
+    counts = pc.count_substring_regex(src, "^a")
+    return bool(pc.max(counts).as_py() or 0) and (pc.max(counts).as_py() or 0) > 1
+
+
+def _has_nulls(src):
+    return src.null_count > 0
+
+
+def _float_text_differs(src):
+    """Arrow's own rendering of the column, compared with what Swift's `description` produces for the
+    same value. Only the two formatters' *shapes* are reproduced here -- an integral value keeping its
+    `.0`, a two-digit exponent, and the exponent threshold -- so a column of values both spell the
+    same way still has to agree."""
+    for value in pc.unique(src).to_pylist():
+        if value is None or not math.isfinite(value):
+            continue
+        if value == int(value) and abs(value) < 1e16:
+            return True                                  # Swift writes 1.0, Arrow writes 1
+        exponent = math.floor(math.log10(abs(value))) if value else 0
+        if abs(value) and (exponent < -4 or exponent >= 16):
+            return True                                  # the two disagree on when to go scientific
+    return False
+
+
+def _decimal_rounding_carries(src):
+    """A value whose rounding to one of the target scales carries into a digit the narrowed precision
+    no longer has, which is where ArrowMetal keeps the value and Arrow's unchecked cast wraps."""
+    precision, scale = src.type.precision, src.type.scale
+    for target in _decimal_round_targets(precision, scale):
+        if target >= scale:
+            continue
+        width = precision - (scale - target)
+        limit = 10 ** width
+        for value in src.to_pylist():
+            if value is None:
+                continue
+            unscaled = _unscaled_magnitude(value)
+            rounded = (unscaled + 10 ** (scale - target) // 2) // 10 ** (scale - target)
+            if rounded >= limit:
+                return True
+    return False
+
+
+def _contains_negative_zero_or_subnormal(src):
+    tiny = float(np.finfo(NUMPY_TYPE[type_name_of(src)]).tiny)
+    for value in src.to_pylist():
+        if value is None or math.isnan(value):
+            continue
+        if value == 0.0 and math.copysign(1.0, value) < 0:
+            return True
+        if 0.0 < abs(value) < tiny:
+            return True
+    return False
+
+
+#: Above this magnitude the software binary64 sin/cos/tan lose their argument reduction; measured at
+#: 2^49, exact below it and NaN from about 2^61.
+_TRIG_REDUCTION_LIMIT = 2.0 ** 49
+
+
+def _needs_large_argument_reduction(src):
+    """A finite float64 argument at or above the reduction limit. ±inf does not count: both engines
+    answer NaN for it, which the pinned tests assert."""
+    if type_name_of(src) != "float64":
+        return False
+    filled = pc.fill_null(src, pa.scalar(0.0, src.type))
+    finite = filled.filter(pc.is_finite(filled))
+    biggest = pc.max(pc.abs(finite)).as_py() if len(finite) else None
+    return biggest is not None and biggest >= _TRIG_REDUCTION_LIMIT
+
+
+def _moments_leave_the_accumulator(src):
+    """The sum of squares of a 64-bit integer column past 2^63, where the variance kernel's own
+    accumulator gives up and answers NaN."""
+    if type_name_of(src) not in ("int64", "uint64"):
+        return False
+    for value in src.to_pylist():
+        if value is not None and abs(int(value)) > 2 ** 40:
+            return True
+    return False
+
+
+def _splits_on_a_whitespace_run(src):
+    """A value with an empty piece under Arrow's whitespace split: an empty string, or one with a
+    leading, trailing or doubled whitespace character."""
+    for value in pc.unique(src).to_pylist():
+        if value is None:
+            continue
+        if value == "" or value[:1].isspace() or value[-1:].isspace():
+            return True
+        if any(a.isspace() and b.isspace() for a, b in zip(value, value[1:])):
+            return True
+    return False
+
+
+#: pyarrow's bundled timezone database stops applying a DST rule after the 32-bit epoch runs out.
+_TZ_CUTOFF_SECONDS = 2 ** 31 - 1
+
+
+def _after_the_2038_cutoff(src):
+    ticks = _raw_ticks(src)
+    per_second = TICKS[src.type.unit] if pa.types.is_timestamp(src.type) else 1
+    biggest = pc.max(ticks).as_py()
+    return biggest is not None and biggest > _TZ_CUTOFF_SECONDS * per_second
+
+
+def _lands_on_a_calendar_boundary(src):
+    """A value that is exactly the first instant of a month, quarter or year -- the only place
+    `ceil_temporal` has to decide whether to advance."""
+    return bool(pc.any(pc.equal(pc.floor_temporal(src, unit="month"), src)).as_py())
+
+
 FINDINGS = [
     Finding("float32-subnormal-ftz",
             "Float32 arithmetic flushes subnormal results and operands to zero",
-            ["arith_scalar", "arith_array"], ["float32"], flavors={"special"}),
+            ["arith_scalar", "arith_array", "pairwise_diff", "trig", "trig_checked"],
+            ["float32"], flavors={"special"}),
     Finding("utf8-case-latin-only",
             "upper/lower map Basic Latin, Latin-1 and Latin Extended-A only; the rest passes through",
             ["upper", "lower"], ["utf8"], data_check=_needs_case_mapping_outside_latin),
@@ -1301,12 +3602,86 @@ FINDINGS = [
             "sign keeps the sign of -0.0 where pyarrow normalises it to 0.0",
             ["sign"], FLOATING, data_check=_contains_negative_zero),
     Finding("negative-zero-set-lookup",
-            "is_in/index_in match -0.0 with 0.0, the total order unique/sort use; Arrow keeps them apart",
-            ["is_in", "index_in"], FLOATING, data_check=_contains_negative_zero),
+            "is_in/index_in/count_distinct match -0.0 with 0.0, the total order unique/sort use; "
+            "Arrow keeps them apart",
+            ["is_in", "index_in", "mode_and_count_distinct"], FLOATING,
+            data_check=_contains_negative_zero),
     Finding("cumulative-prod-reassociation",
             "cumulative_prod is a parallel scan; once a running product overflows or underflows, which "
             "intermediates become inf, 0 or NaN depends on the multiplication order",
             ["cumulative_prod"], FLOATING, data_check=_prefix_product_leaves_safe_range),
+
+    # ---- findings 6 onwards: the kernels added after the first round.
+    Finding("decimal-to-float64-divides",
+            "decimal -> float64 divides the unscaled value by 10^scale (correctly rounded); Arrow "
+            "multiplies by the reciprocal, which is a ulp out",
+            ["decimal_to_float64"], DECIMAL128_TYPES),
+    Finding("decimal-round-carry-past-the-precision",
+            "rounding a decimal to a smaller scale narrows the precision by the digits dropped; a "
+            "value whose rounding carries keeps its full value here and wraps in Arrow's cast",
+            ["decimal_round"], DECIMAL128_TYPES, data_check=_decimal_rounding_carries),
+    Finding("regex-icu-unicode-classes",
+            "ICU's \\d, \\w and \\s are Unicode-aware and RE2's are ASCII, so a full-width digit "
+            "matches here and not in pyarrow",
+            ["regex_match", "regex_replace"], ["utf8"], data_check=_contains_non_ascii_digit),
+    Finding("regex-anchor-in-a-repeated-search",
+            "in a repeated search ICU anchors ^ at the start of the input and RE2 at the start of "
+            "each search, so ^a matches once here and twice there on \"aa\"",
+            ["regex_match"], ["utf8"], data_check=_anchor_can_match_twice),
+    Finding("split-loses-the-null-row",
+            "split returns an (offsets, values) pair with nowhere to put a null row, so a null value "
+            "splits to an empty list where Arrow's list<utf8> keeps the null",
+            ["regex_split", "split_whitespace"], ["utf8"], data_check=_has_nulls),
+    Finding("float-text-swift-format",
+            "float -> utf8 uses Swift's formatting: an integral value keeps its .0, the exponent has "
+            "two digits and the switch to scientific notation happens at a different magnitude",
+            ["to_strings_text"], FLOATING, data_check=_float_text_differs),
+    Finding("temporal-extract-in-utc",
+            "the temporal kernels read a zoned timestamp in UTC; pyarrow reads it in the column's own "
+            "timezone",
+            ["temporal_calendar", "temporal_clock", "temporal_struct", "temporal_week_options",
+             "temporal_round", "temporal_round_calendar", "temporal_ceil_calendar",
+             "temporal_round_finer", "temporal_round_unaligned", "temporal_between",
+             "temporal_between_clock", "weeks_between", "months_between", "interval_between",
+             "interval_layouts", "strftime", "strftime_seconds", "add_interval", "cast_unit"],
+            TIMESTAMP_TZ),
+    Finding("temporal-ceil-on-a-calendar-boundary",
+            "ceil_temporal leaves a value already on a month, quarter or year boundary alone; Arrow "
+            "advances it a whole unit (it does not for the fixed-length units)",
+            ["temporal_ceil_calendar"], DATE_LIKE, data_check=_lands_on_a_calendar_boundary),
+    Finding("temporal-calendar-multiple-origin",
+            "a multiple of months or quarters counts from year 0 here and from 1970-01 in Arrow -- "
+            "Arrow counts years from year 0, so its own three calendar units disagree",
+            ["temporal_round_unaligned"], DATE_LIKE),
+    Finding("temporal-round-finer-unit",
+            "rounding to a unit finer than the column's own resolution is the identity here; Arrow "
+            "converts to the finer unit, rounds there and truncates back",
+            ["temporal_round_finer"], TIMESTAMP_TYPES + DATE_TYPES + TIME_TYPES),
+    Finding("strftime-seconds-carry-the-fraction",
+            "%S prints whole seconds here, as C's strftime does; Arrow appends the sub-second digits",
+            ["strftime_seconds"], TIMESTAMP_TYPES),
+    Finding("timezone-after-2038",
+            "pyarrow's timezone database stops applying a DST rule after the 32-bit epoch; Foundation "
+            "keeps applying it, so the two disagree on every summer instant past 2038",
+            ["assume_timezone", "temporal_timezone"], TIMESTAMP_TYPES,
+            data_check=_after_the_2038_cutoff),
+    Finding("trig-argument-reduction",
+            "the software binary64 sin/cos/tan lose their argument reduction past 2^49 and return NaN "
+            "past about 2^61",
+            ["trig", "trig_checked"], ["float64"], data_check=_needs_large_argument_reduction),
+    Finding("split-whitespace-collapses-runs",
+            "split_whitespace splits on runs of whitespace and drops the empty ends, as Python's "
+            "str.split() does; pc.utf8_split_whitespace splits at every whitespace character",
+            ["split_whitespace"], ["utf8"], data_check=_splits_on_a_whitespace_run),
+    Finding("variance-accumulator-overflow",
+            "variance and stddev accumulate the two moments in a 64-bit accumulator, so a column of "
+            "64-bit integers past 2^40 answers with a wrapped number or NaN where pyarrow answers "
+            "in double",
+            ["variance_and_stddev"], ["int64", "uint64"], data_check=_moments_leave_the_accumulator),
+    Finding("rolling-min-max-zero-and-subnormal",
+            "the rolling min/max scan compares raw values rather than the canonical sort keys, so a "
+            "±0 tie is broken by position and a float32 subnormal reads as zero",
+            ["rolling_min_max"], FLOATING, data_check=_contains_negative_zero_or_subnormal),
 ]
 
 
@@ -1387,17 +3762,15 @@ def test_absent_optional_operations_are_reported():
 #: MetalArray/GroupBy members that no single pyarrow.compute call corresponds to: the accessors, and
 #: the three generic dispatchers whose every op is reached through a named form below.
 _NOT_DIFFERENTIABLE = {"from_arrow", "to_arrow", "null_count", "format", "type", "group_by",
-                       "unary", "binary", "cumulative"}
+                       "unary", "binary", "cumulative",
+                       # the later generic dispatchers: every op of each is reached by name below
+                       "window", "string_predicate", "string_transform"}
 
-#: Methods with no case in this matrix because the generator makes no array they apply to. The
-#: temporal kernels need timestamp/duration/time columns, which are covered by
-#: Tests/ArrowMetalTests/TemporalTests.swift instead; test_methods_outside_the_matrix_are_reported
-#: prints them so the gap stays visible.
-_NO_MATRIX_TYPE = {
-    "year": "timestamp column", "month": "timestamp column", "day": "timestamp column",
-    "day_of_week": "timestamp column", "hour": "timestamp column", "minute": "timestamp column",
-    "second": "timestamp column", "cast_unit": "timestamp/duration/time column",
-}
+#: Methods with no case in this matrix because the generator makes no array they apply to.
+#: Empty since the generator learned the temporal, decimal and nested types: every method on
+#: MetalArray now has a case. test_methods_outside_the_matrix_are_reported prints the list, so a
+#: method that has to be parked here again stays visible.
+_NO_MATRIX_TYPE = {}
 
 #: Method -> the operation that exercises it.
 _COVERED_BY = {
@@ -1416,7 +3789,83 @@ _COVERED_BY = {
     "pad_left": "pad", "pad_right": "pad",
     "count_substring": "substring_search", "find_substring": "substring_search",
     "decode": "dictionary_decode",
+
+    # ---- the extended matrix.
+    "decimal_add": "decimal_arith", "decimal_sub": "decimal_arith", "decimal_mul": "decimal_arith",
+    "to_float64": "decimal_to_float64",
+    "to_decimal128": "decimal_widen_narrow", "to_small_decimal": "decimal_widen_narrow",
+    "list_value_length": "list_length",
+    "child": "struct_field", "child_count": "struct_field",
+    "match_substring_regex": "regex_match", "count_substring_regex": "regex_match",
+    "find_substring_regex": "regex_match", "replace_substring_regex": "regex_replace",
+    "split_pattern": "regex_split", "extract_regex": "regex_extract",
+    "extract_regex_span": "regex_extract_span",
+    "ascii_is_printable": "string_predicates", "ascii_is_title": "string_predicates",
+    "string_is_ascii": "string_predicates", "utf8_is_alnum": "string_predicates",
+    "utf8_is_alpha": "string_predicates", "utf8_is_decimal": "string_predicates",
+    "utf8_is_digit": "string_predicates", "utf8_is_lower": "string_predicates",
+    "utf8_is_numeric": "string_predicates", "utf8_is_printable": "string_predicates",
+    "utf8_is_space": "string_predicates", "utf8_is_title": "string_predicates",
+    "utf8_is_upper": "string_predicates",
+    "ascii_title": "string_case_transforms", "utf8_capitalize": "string_case_transforms",
+    "utf8_title": "string_case_transforms",
+    "utf8_center": "string_pad_and_slice", "utf8_replace_slice": "string_pad_and_slice",
+    "binary_replace_slice": "string_pad_and_slice",
+    "utf8_trim": "string_trim", "utf8_ltrim": "string_trim", "utf8_rtrim": "string_trim",
+    "utf8_normalize": "string_normalize",
+    "parse": "parse_numbers",
+    "year_month_day": "temporal_struct", "iso_calendar": "temporal_struct",
+    "year": "temporal_calendar", "month": "temporal_calendar", "day": "temporal_calendar",
+    "hour": "temporal_clock", "minute": "temporal_clock", "second": "temporal_clock",
+    "day_of_week": "temporal_week_options", "cast_unit": "cast_unit",
+    "quarter": "temporal_calendar", "day_of_year": "temporal_calendar",
+    "iso_week": "temporal_calendar", "iso_year": "temporal_calendar",
+    "is_leap_year": "temporal_calendar", "us_week": "temporal_calendar",
+    "us_year": "temporal_calendar",
+    "millisecond": "temporal_clock", "microsecond": "temporal_clock",
+    "nanosecond": "temporal_clock", "subsecond": "temporal_clock",
+    "week": "temporal_week_options",
+    "is_dst": "temporal_timezone", "local_timestamp": "temporal_timezone",
+    "floor_temporal": "temporal_round", "ceil_temporal": "temporal_round",
+    "round_temporal": "temporal_round",
+    "years_between": "temporal_between", "quarters_between": "temporal_between",
+    "days_between": "temporal_between", "hours_between": "temporal_between",
+    "minutes_between": "temporal_between", "seconds_between": "temporal_between",
+    "milliseconds_between": "temporal_between", "microseconds_between": "temporal_between",
+    "nanoseconds_between": "temporal_between",
+    "month_day_nano_interval_between": "interval_between",
+    "month_interval_between": "interval_layouts",
+    "day_time_interval_between": "interval_layouts", "interval_field": "interval_layouts",
+    "row_number": "ranking", "rank": "ranking", "dense_rank": "ranking",
+    "percent_rank": "percent_rank_and_cume_dist", "cume_dist": "percent_rank_and_cume_dist",
+    "rolling_min": "rolling_min_max", "rolling_max": "rolling_min_max",
+    "variance": "variance_and_stddev", "stddev": "variance_and_stddev",
+    "median": "quantile",
+    "mode": "mode_and_count_distinct", "count_distinct": "mode_and_count_distinct",
+    "first": "first_last_index_min_max", "last": "first_last_index_min_max",
+    "index": "first_last_index_min_max", "min_max": "first_last_index_min_max",
+    "any": "any_all", "all": "any_all",
+    "run_end_encode": "run_end", "run_end_decode": "run_end",
+    "to_float32": "float16_casts", "to_float16": "float16_casts",
+    "extension_name": "extension_type", "extension_metadata": "extension_type",
+    "extension_storage": "extension_type", "as_extension_type": "extension_type",
+    "sin": "trig", "cos": "trig", "tan": "trig", "asin": "trig", "acos": "trig", "atan": "trig",
+    "sinh": "trig", "cosh": "trig", "tanh": "trig", "asinh": "trig", "acosh": "trig",
+    "atanh": "trig", "atan2": "trig",
+    "sin_checked": "trig_checked", "cos_checked": "trig_checked", "tan_checked": "trig_checked",
+    "asin_checked": "trig_checked", "acos_checked": "trig_checked",
+    "acosh_checked": "trig_checked", "atanh_checked": "trig_checked",
+    "xor": "logical_extras", "and_not": "logical_extras", "and_not_kleene": "logical_extras",
+    "is_nan": "float_class", "is_inf": "float_class", "is_finite": "float_class",
+    "fill_null_forward": "fill_null_direction", "fill_null_backward": "fill_null_direction",
 }
+
+
+#: Module-level functions that compute something, and the operation that covers each. The rest of the
+#: module (`array`, `version`, `device_name`, `batch`, `MetalArray`, `GroupBy`, `ArrowMetalError`) is
+#: construction and plumbing rather than a kernel.
+_MODULE_LEVEL = {"coalesce": "coalesce", "case_when": "case_when", "choose": "choose",
+                 "lexsort_indices": "lexsort", "nulls": "nulls_constructor"}
 
 
 def public_api():
@@ -1436,12 +3885,31 @@ def test_every_public_operation_has_a_differential_case():
         "in python/tests/test_differential.py")
 
 
+def test_every_module_level_function_has_a_differential_case():
+    """The same rule for the functions that are not methods: coalesce, case_when, choose,
+    lexsort_indices and nulls."""
+    registered = {o.name for o in OPS}
+    for name, operation in sorted(_MODULE_LEVEL.items()):
+        assert hasattr(am, name), f"arrowmetal.{name} no longer exists"
+        assert operation in registered, f"{name} claims to be covered by a missing op {operation}"
+
+
 def test_methods_outside_the_matrix_are_reported():
     """Not a failure: a record of the methods the generator cannot reach, and why."""
     for name, reason in sorted(_NO_MATRIX_TYPE.items()):
         print(f"outside the matrix: {name} (needs a {reason})")
     assert all(hasattr(am.MetalArray, n) for n in _NO_MATRIX_TYPE), \
         "_NO_MATRIX_TYPE lists a method MetalArray no longer has"
+
+
+def test_no_oracle_operations_are_reported():
+    """Not a failure: the operations pyarrow.compute has no function for, each with the reference
+    this file compares against instead. Printed on every run so the list cannot grow unnoticed."""
+    registered = {o.name for o in OPS}
+    for name, why in sorted(_NO_ORACLE.items()):
+        print(f"no pyarrow oracle: {name} -- {why}")
+        assert name in registered, f"_NO_ORACLE names {name}, which is not a registered operation"
+    assert len(_NO_ORACLE) <= 20, "more operations are drifting out of pyarrow's reach than expected"
 
 
 # ------------------------------------------------------------------ pinned divergences
@@ -1854,3 +4322,460 @@ def test_argsort_is_a_permutation_with_nulls_last_and_values_in_order():
         assert all(not a[i].is_valid for i in idx[valid:])
         assert a.take(pa.array(idx, pa.int32())).to_pylist() == \
             a.take(pc.array_sort_indices(a)).to_pylist()
+
+
+# ------------------------------------------------------------------ the extended matrix's findings
+#
+# One reproduction per open finding added with the extended matrix, plus the pinned tests that say
+# what the two engines *do* agree on around it. The xfail(strict=True) ones start passing -- and the
+# suite starts failing -- the moment a kernel changes its mind.
+
+
+@pytest.mark.xfail(strict=True, reason="decimal-to-float64-divides: ArrowMetal divides the unscaled "
+                                       "value by 10^scale, Arrow multiplies by the reciprocal")
+def test_decimal_to_float64_matches_arrows_cast():
+    a = pa.array([decimal.Decimal("99.99")], pa.decimal128(9, 2))
+    assert pylist(am.array(a).to_float64()) == a.cast(pa.float64()).to_pylist()
+
+
+def test_decimal_to_float64_is_the_correctly_rounded_quotient():
+    """The half of it that is not a matter of taste: ArrowMetal's answer is the nearest double to the
+    exact decimal value, which Arrow's reciprocal multiply is a ulp away from."""
+    a = pa.array([decimal.Decimal("99.99")], pa.decimal128(9, 2))
+    assert pylist(am.array(a).to_float64()) == [9999 / 100]
+    assert a.cast(pa.float64()).to_pylist() != [9999 / 100]
+
+
+@pytest.mark.xfail(strict=True, reason="decimal-round-carry-past-the-precision: rounding up past the "
+                                       "narrowed precision keeps the value here and wraps in Arrow")
+def test_decimal_round_carry_wraps_like_arrows_cast():
+    a = pa.array([decimal.Decimal("9999999.99")], pa.decimal128(9, 2))
+    rounded = am.array(a).decimal_round(0)
+    oracle = pc.round(a, ndigits=0, round_mode="half_towards_infinity")
+    assert pylist(rounded) == oracle.cast(rounded.type, safe=False).to_pylist()
+
+
+def test_decimal_round_narrows_the_precision_by_the_digits_it_drops():
+    a = pa.array([decimal.Decimal("9999999.99"), decimal.Decimal("1.25")], pa.decimal128(9, 2))
+    assert am.array(a).decimal_round(0).type == pa.decimal128(7, 0)
+    assert am.array(a).decimal_round(4).type == pa.decimal128(11, 4)      # scaling up is exact
+    assert pylist(am.array(a).decimal_round(4)) == [decimal.Decimal("9999999.9900"),
+                                                    decimal.Decimal("1.2500")]
+
+
+def test_decimal_arithmetic_wraps_modulo_two_to_the_128():
+    """Why the matrix keeps the decimal operands inside their precision: past it ArrowMetal wraps in
+    the 128-bit storage and Arrow's unchecked cast wraps modulo 10^precision, which is a different
+    number."""
+    with decimal.localcontext() as ctx:
+        ctx.prec = 60
+        limit = decimal.Decimal(10 ** 38 - 1).scaleb(-10)
+        a = pa.array([limit], pa.decimal128(38, 10))
+        total = pylist(am.array(a).decimal_add(am.array(a)))[0]
+        assert int(total.scaleb(10)) == 2 * (10 ** 38 - 1) - 2 ** 128
+    with pytest.raises(pa.ArrowInvalid):
+        pc.add(a, a)                                 # precision 39 is out of decimal128's range
+
+
+def test_decimal_negate_abs_and_sign_reach_the_decimal_kernels():
+    """The dispatch added to `unary()` and `_reduce()`: a decimal column takes am_decimal_op's own
+    negate, abs, sign, sum, min and max, which the primitive entry points reject."""
+    a = pa.array([decimal.Decimal("-1.25"), decimal.Decimal("0.00")], pa.decimal128(9, 2))
+    assert pylist(am.array(a).negate()) == pc.negate(a).to_pylist()
+    assert pylist(am.array(a).abs()) == pc.abs(a).to_pylist()
+    assert pylist(am.array(a).sign()) == pc.sign(a).cast(pa.int32()).to_pylist()
+    assert am.array(a).sum() == pc.sum(a).as_py()
+    assert am.array(a).min() == pc.min(a).as_py() and am.array(a).max() == pc.max(a).as_py()
+
+
+def test_list_element_of_a_short_row_is_null_where_pyarrow_raises():
+    a = pa.array([[1, 2], [], None], pa.list_(pa.int64()))
+    assert pylist(am.array(a).list_element(1)) == [2, None, None]
+    with pytest.raises(pa.ArrowInvalid):
+        pc.list_element(a, 1)
+
+
+def test_list_parent_indices_are_int32_where_pyarrow_returns_int64():
+    a = pa.array([[1, 2], [3]], pa.list_(pa.int64()))
+    got = am.array(a).list_parent_indices()
+    assert got.type == pa.int32() and pc.list_parent_indices(a).type == pa.int64()
+    assert pylist(got) == pc.list_parent_indices(a).to_pylist()
+
+
+def test_run_end_null_count_is_logical():
+    """pyarrow reports null_count 0 for a run-end encoded array whatever its values child says;
+    ArrowMetal reports the number of null rows the column actually has."""
+    encoded = pc.run_end_encode(pa.array([1, None, None], pa.int64()))
+    assert encoded.null_count == 0
+    assert am.array(encoded).null_count == 2
+
+
+def test_run_end_selection_decodes():
+    """filter, take and slice on a run-end column come back flat -- pyarrow has no kernel for the
+    type at all, so there is nothing to re-encode against."""
+    encoded = pc.run_end_encode(pa.array([1, 1, 2], pa.int64()))
+    kept = am.array(encoded).filter(am.array(pa.array([True, False, True])))
+    assert kept.type == pa.int64() and pylist(kept) == [1, 2]
+    with pytest.raises(pa.ArrowNotImplementedError):
+        pc.filter(encoded, pa.array([True, False, True]))
+
+
+@pytest.mark.xfail(strict=True, reason="regex-icu-unicode-classes: ICU's backslash-d matches a "
+                                       "full-width digit, RE2's does not")
+def test_regex_digit_class_is_ascii_only():
+    a = pa.array(["２０２４"], pa.string())
+    assert pylist(am.array(a).match_substring_regex(r"\d")) == \
+        pc.match_substring_regex(a, r"\d").to_pylist()
+
+
+def test_regex_digit_class_agrees_on_ascii():
+    a = pa.array(["2024", "abc", ""], pa.string())
+    assert pylist(am.array(a).match_substring_regex(r"\d")) == \
+        pc.match_substring_regex(a, r"\d").to_pylist() == [True, False, False]
+
+
+@pytest.mark.xfail(strict=True, reason="regex-anchor-in-a-repeated-search: ICU anchors ^ at the "
+                                       "start of the input, RE2 at the start of each search")
+def test_anchored_pattern_counts_once_per_input():
+    a = pa.array(["aa"], pa.string())
+    assert pylist(am.array(a).count_substring_regex("^a")) == \
+        pc.count_substring_regex(a, "^a").cast(pa.int32()).to_pylist()
+
+
+def test_regex_replacement_template_is_icu_not_re2():
+    """ArrowMetal's replacement is an ICU template, so a capture group is `$1`; pyarrow's is RE2's
+    `\\1`. Each engine copies the other's spelling through as literal text."""
+    a = pa.array(["ap"], pa.string())
+    assert pylist(am.array(a).replace_substring_regex("(a)(p)", "$2$1")) == ["pa"]
+    assert pc.replace_substring_regex(a, "(a)(p)", r"\2\1").to_pylist() == ["pa"]
+    assert pylist(am.array(a).replace_substring_regex("(a)(p)", r"\2\1")) == ["21"]
+
+
+@pytest.mark.xfail(strict=True, reason="split-loses-the-null-row: the (offsets, values) pair has "
+                                       "nowhere to put a null row")
+def test_split_keeps_the_null_row():
+    a = pa.array(["a b", None], pa.string())
+    offsets, values = am.array(a).split_pattern(" ")
+    got = pa.ListArray.from_arrays(offsets.to_arrow(), values.to_arrow())
+    assert got.to_pylist() == pc.split_pattern(a, " ").to_pylist()
+
+
+@pytest.mark.xfail(strict=True, reason="split-whitespace-collapses-runs: ArrowMetal splits on runs "
+                                       "and drops the empty ends, as Python's str.split() does")
+def test_split_whitespace_keeps_the_empty_pieces():
+    a = pa.array(["  padded  "], pa.string())
+    offsets, values = am.array(a).split_whitespace()
+    got = pa.ListArray.from_arrays(offsets.to_arrow(), values.to_arrow())
+    assert got.to_pylist() == pc.utf8_split_whitespace(a).to_pylist()
+
+
+def test_split_whitespace_matches_python_str_split():
+    a = pa.array(["  padded  ", "a\t b", ""], pa.string())
+    offsets, values = am.array(a).split_whitespace()
+    got = pa.ListArray.from_arrays(offsets.to_arrow(), values.to_arrow())
+    assert got.to_pylist() == [s.split() for s in a.to_pylist()]
+
+
+def test_pyarrow_utf8_normalize_ignores_its_form_option():
+    """Not our divergence: pyarrow 25.0.1 decomposes whatever `form` says, so the matrix's oracle for
+    utf8_normalize is Python's unicodedata. ArrowMetal agrees with Python."""
+    import unicodedata
+    composed = "héllo"
+    a = pa.array([composed], pa.string())
+    assert pc.utf8_normalize(a, form="NFC").to_pylist() == ["héllo"]
+    assert unicodedata.normalize("NFC", composed) == composed
+    assert pylist(am.array(a).utf8_normalize("NFC")) == [composed]
+
+
+@pytest.mark.xfail(strict=True, reason="float-text-swift-format: Swift keeps the .0 and switches to "
+                                       "scientific notation at a different magnitude")
+def test_float_to_text_matches_arrows_formatter():
+    a = pa.array([1.0, 1.1786107e-06], pa.float64())
+    assert pylist(am.array(a).to_strings()) == a.cast(pa.string()).to_pylist()
+
+
+def test_float_to_text_names_the_same_number():
+    """The property the formatting difference must not touch: every digit string ArrowMetal prints
+    reads back as exactly the float that went in, `-0.0` and the subnormals included."""
+    a = pa.array([1.0, -0.0, 5e-324, 1.7976931348623157e308, 1.1786107e-06], pa.float64())
+    assert [float(s) for s in pylist(am.array(a).to_strings())] == a.to_pylist()
+    assert struct.pack("<d", float(pylist(am.array(a).to_strings())[1])) == struct.pack("<d", -0.0)
+
+
+def test_parse_returns_null_where_pyarrow_raises():
+    a = pa.array(["1", "x", " 8", ""], pa.string())
+    assert pylist(am.array(a).parse("int64")) == [1, None, None, None]
+    with pytest.raises(pa.ArrowInvalid):
+        a.cast(pa.int64(), safe=False)
+
+
+@pytest.mark.xfail(strict=True, reason="temporal-extract-in-utc: ArrowMetal reads a zoned timestamp "
+                                       "in UTC, pyarrow in the column's own timezone")
+def test_temporal_extract_uses_the_columns_timezone():
+    a = pa.array([0], pa.timestamp("s", "America/New_York"))
+    assert pylist(am.array(a).hour()) == pc.hour(a).cast(pa.int32()).to_pylist()
+
+
+def test_temporal_extract_is_arrows_answer_for_the_same_naive_instant():
+    """The zone is the whole of the difference: on the same instants without a zone the two agree."""
+    a = pa.array([0, 1_700_000_000], pa.timestamp("s", "America/New_York"))
+    naive = a.cast(pa.timestamp("s"))
+    assert pylist(am.array(a).hour()) == pc.hour(naive).cast(pa.int32()).to_pylist()
+    assert pylist(am.array(a).year()) == pc.year(naive).cast(pa.int32()).to_pylist()
+
+
+def test_temporal_extractors_return_int32_where_pyarrow_returns_int64():
+    a = pa.array([0], pa.timestamp("s"))
+    assert am.array(a).year().type == pa.int32() and pc.year(a).type == pa.int64()
+    assert am.array(a).us_week().type == pc.us_week(a).type == pa.int64()
+    assert am.array(a).subsecond().type == pc.subsecond(a).type == pa.float64()
+
+
+@pytest.mark.xfail(strict=True, reason="temporal-ceil-on-a-calendar-boundary: ArrowMetal leaves a "
+                                       "value already on a month boundary alone, Arrow advances it")
+def test_ceil_temporal_advances_a_value_on_a_month_boundary():
+    a = pa.array([0], pa.timestamp("s"))
+    assert pylist(am.array(a).ceil_temporal("month")) == \
+        pc.ceil_temporal(a, unit="month").to_pylist()
+
+
+def test_ceil_temporal_keeps_a_value_on_a_fixed_length_boundary_in_both():
+    """Arrow's own calendar and fixed-length units disagree with each other here: a value exactly on
+    a day boundary is left alone by both engines, one exactly on a month boundary is not."""
+    a = pa.array([0], pa.timestamp("s"))
+    assert pylist(am.array(a).ceil_temporal("day")) == pc.ceil_temporal(a, unit="day").to_pylist()
+    assert pc.ceil_temporal(a, unit="month").to_pylist() != a.to_pylist()
+
+
+@pytest.mark.xfail(strict=True, reason="temporal-calendar-multiple-origin: ArrowMetal counts months "
+                                       "and quarters from year 0, Arrow from 1970-01")
+def test_calendar_multiples_share_an_origin():
+    a = pa.array([0], pa.timestamp("s"))
+    assert pylist(am.array(a).floor_temporal("month", 7)) == \
+        pc.floor_temporal(a, multiple=7, unit="month").to_pylist()
+
+
+def test_calendar_multiples_agree_wherever_the_two_origins_do():
+    """The origins coincide whenever the multiple divides 1970 x 12 months (or 1970 x 4 quarters), so
+    every multiple the main rounding operation uses has to agree exactly."""
+    a = pa.array([0, 1_700_000_000], pa.timestamp("s"))
+    for unit, multiple in [("month", 6), ("quarter", 2), ("year", 1)]:
+        assert pylist(am.array(a).floor_temporal(unit, multiple)) == \
+            pc.floor_temporal(a, multiple=multiple, unit=unit).to_pylist()
+    # And Arrow's year unit counts from year 0, like ArrowMetal's -- which is why its own three
+    # calendar units do not agree with each other.
+    assert pc.floor_temporal(a, multiple=3, unit="year").to_pylist()[0].year == 1968
+
+
+@pytest.mark.xfail(strict=True, reason="temporal-round-finer-unit: rounding to a unit below the "
+                                       "column's resolution is the identity here")
+def test_rounding_to_a_finer_unit_converts_like_arrow():
+    a = pa.array([1_700_000_000], pa.timestamp("s"))
+    assert pylist(am.array(a).floor_temporal("nanosecond", 3)) == \
+        pc.floor_temporal(a, multiple=3, unit="nanosecond").to_pylist()
+
+
+def test_rounding_to_a_finer_unit_is_the_identity_at_multiple_one():
+    a = pa.array([1_700_000_000], pa.timestamp("s"))
+    assert pylist(am.array(a).floor_temporal("nanosecond")) == \
+        pc.floor_temporal(a, unit="nanosecond").to_pylist() == a.to_pylist()
+
+
+@pytest.mark.xfail(strict=True, reason="strftime-seconds-carry-the-fraction: Arrow's %S appends the "
+                                       "sub-second digits, C's does not")
+def test_strftime_seconds_carry_the_fraction():
+    a = pa.array([1_700_000_000_123_456], pa.timestamp("us"))
+    assert pylist(am.array(a).strftime("%S")) == pc.strftime(a, format="%S").to_pylist()
+
+
+def test_strftime_agrees_on_every_other_field():
+    a = pa.array([1_700_000_000_123_456], pa.timestamp("us"))
+    for fmt in ("%Y-%m-%d", "%H:%M", "%j", "%Y"):
+        assert pylist(am.array(a).strftime(fmt)) == pc.strftime(a, format=fmt).to_pylist()
+
+
+@pytest.mark.xfail(strict=True, reason="timezone-after-2038: pyarrow's tz database stops applying "
+                                       "the DST rule at the 32-bit epoch")
+def test_assume_timezone_agrees_past_2038():
+    a = pa.array([_seconds_of(2050, 7, 15, 12)], pa.timestamp("s"))
+    assert pylist(am.array(a).assume_timezone(TZ_NAME, "earliest", "earliest")) == \
+        pc.assume_timezone(a, TZ_NAME, ambiguous="earliest", nonexistent="earliest").to_pylist()
+
+
+def test_assume_timezone_agrees_before_2038_and_keeps_the_rule_after():
+    a = pa.array([_seconds_of(2024, 7, 15, 12)], pa.timestamp("s"))
+    assert pylist(am.array(a).assume_timezone(TZ_NAME, "earliest", "earliest")) == \
+        pc.assume_timezone(a, TZ_NAME, ambiguous="earliest", nonexistent="earliest").to_pylist()
+    later = pa.array([_seconds_of(2050, 7, 15, 12)], pa.timestamp("s"))
+    ours = am.array(later).assume_timezone(TZ_NAME, "earliest", "earliest").to_arrow()
+    theirs = pc.assume_timezone(later, TZ_NAME, ambiguous="earliest", nonexistent="earliest")
+    assert ours.cast(pa.int64())[0].as_py() == theirs.cast(pa.int64())[0].as_py() - 3600
+
+
+@pytest.mark.xfail(strict=True, reason="trig-argument-reduction: the software binary64 sin/cos/tan "
+                                       "lose the reduction past 2^49")
+def test_trig_reduces_a_large_argument():
+    a = pa.array([2.0 ** 52 + 0.5], pa.float64())
+    assert pylist(am.array(a).sin())[0] == pytest.approx(pc.sin(a)[0].as_py(), rel=1e-12)
+
+
+def test_trig_agrees_below_the_reduction_limit():
+    a = pa.array([2.0 ** 48 + 0.5, 1e6, 0.5], pa.float64())
+    for got, want in zip(pylist(am.array(a).sin()), pc.sin(a).to_pylist()):
+        assert got == pytest.approx(want, rel=1e-14)
+
+
+def test_trig_special_values_agree_exactly():
+    """The tolerance the matrix gives the trigonometry does not reach these: a signed zero keeps its
+    sign, an infinity is a NaN and a NaN stays a NaN, in both engines."""
+    a = pa.array([0.0, -0.0, math.inf, -math.inf, math.nan], pa.float64())
+    got, want = pylist(am.array(a).sin()), pc.sin(a).to_pylist()
+    assert struct.pack("<d", got[0]) == struct.pack("<d", want[0]) == struct.pack("<d", 0.0)
+    assert struct.pack("<d", got[1]) == struct.pack("<d", want[1]) == struct.pack("<d", -0.0)
+    assert all(math.isnan(v) for v in got[2:]) and all(math.isnan(v) for v in want[2:])
+
+
+def test_checked_trig_raises_in_both_engines_on_a_domain_error():
+    a = pa.array([2.0], pa.float64())
+    with pytest.raises(am.ArrowMetalError, match="domain error"):
+        am.array(a).asin_checked()
+    with pytest.raises(pa.ArrowInvalid, match="domain error"):
+        pc.asin_checked(a)
+    # A NaN is not a domain error in either engine, and a null row is never inspected.
+    b = pa.array([math.nan, None], pa.float64())
+    assert math.isnan(pylist(am.array(b).asin_checked())[0])
+    assert math.isnan(pc.asin_checked(b).to_pylist()[0])
+
+
+@pytest.mark.xfail(strict=True, reason="variance-accumulator-overflow: the moments leave the 64-bit "
+                                       "accumulator, so the answer is a wrapped number or NaN")
+def test_variance_of_a_large_int64_column():
+    """Three copies of one value have variance zero whatever the value is; past 2^40 the sum of
+    squares wraps in the accumulator and the answer stops meaning anything."""
+    a = pa.array([2 ** 62] * 3, pa.int64())
+    assert am.array(a).variance(0) == pc.variance(a, ddof=0).as_py() == 0.0
+
+
+def test_variance_is_accurate_inside_the_accumulator():
+    a = pa.array([1, 2, 3, 4, 5], pa.int64())
+    assert am.array(a).variance(0) == pytest.approx(pc.variance(a, ddof=0).as_py(), rel=1e-12)
+    assert am.array(a).stddev(1) == pytest.approx(pc.stddev(a, ddof=1).as_py(), rel=1e-12)
+
+
+@pytest.mark.xfail(strict=True, reason="rolling-min-max-zero-and-subnormal: the rolling scan breaks "
+                                       "a +/-0 tie by position rather than the way fmin does")
+def test_rolling_min_breaks_a_zero_tie_like_fmin():
+    a = pa.array([0.0, -0.0], pa.float64())
+    assert struct.pack("<d", pylist(am.array(a).rolling_min(2))[1]) == \
+        struct.pack("<d", pc.min(a).as_py())
+
+
+def test_rolling_min_of_an_all_nan_window():
+    """ArrowMetal treats NaN as missing all the way, so a window holding nothing else answers with
+    the scan's identity; pc.min answers NaN. Same disagreement as the scalar min/max."""
+    a = pa.array([math.nan, math.nan], pa.float64())
+    assert pylist(am.array(a).rolling_min(2))[1] == math.inf
+    assert math.isnan(pc.min(a).as_py())
+
+
+def test_rolling_sum_is_a_prefix_sum_difference():
+    """Why the matrix takes the infinities out of a float column first: the rolling sum subtracts two
+    prefix sums, so one infinity reaches every later window through `inf - inf`."""
+    a = pa.array([1.0, math.inf, 2.0, 3.0], pa.float64())
+    got = pylist(am.array(a).rolling_sum(2))
+    assert got[1] == math.inf and math.isnan(got[3])     # the window [2.0, 3.0] is 5.0 in truth
+    assert pylist(am.array(pa.array([1.0, 2.0, 3.0, 4.0], pa.float64())).rolling_sum(2)) == \
+        [None, 3.0, 5.0, 7.0]
+
+
+def test_rolling_mean_accumulates_in_double():
+    """The prefix sums are kept in `double` whatever the column type, so an integer column past 2^53
+    cannot recover the window."""
+    a = pa.array([2 ** 62, 1, 2 ** 62], pa.int64())
+    assert pylist(am.array(a).rolling_mean(1)) == [float(2 ** 62), 0.0, float(2 ** 62)]
+    assert pylist(am.array(pa.array([1, 2, 3], pa.int64())).rolling_mean(1)) == [1.0, 2.0, 3.0]
+
+
+def test_cumulative_mean_accumulates_in_double():
+    a = pa.array([1, 2, 3, 4], pa.int64())
+    assert pylist(am.array(a).cumulative_mean()) == [1.0, 1.5, 2.0, 2.5]
+    big = pa.array([2 ** 63 - 1, 2 ** 63 - 1], pa.int64())
+    assert pylist(am.array(big).cumulative_mean())[1] == float(2 ** 63 - 1)
+
+
+def test_product_reassociates_past_the_normal_range():
+    """Why the matrix keeps the product's operands in a band: the reduction is a tree, so once a
+    sub-product leaves the range the pairing decides the answer."""
+    a = pa.array([1e30, 1e30, 1e-30, 1e-30] * 4, pa.float32())
+    total = am.array(a).product()
+    assert math.isnan(total) or math.isinf(total) or total == 0.0
+    inside = pa.array([1.5, -2.0, 0.25, 4.0], pa.float32())
+    assert am.array(inside).product() == pytest.approx(pc.product(inside).as_py(), rel=1e-6)
+
+
+def test_index_of_a_large_unsigned_value_is_not_found():
+    """`MetalArray.index` takes its needle as a C `double`, so a uint64 value above 2^63 does not
+    survive the trip and the search reports "absent". Why the matrix picks a needle that round-trips
+    exactly and is the only value in the column that does."""
+    a = pa.array([2 ** 64 - 1, 2 ** 64 - 2], pa.uint64())
+    assert am.array(a).index(2 ** 64 - 1) == -1
+    assert pc.index(a, pa.scalar(2 ** 64 - 1, pa.uint64())).as_py() == 0
+    # Inside the range a double can hold exactly, the two agree.
+    b = pa.array([2 ** 62 + 1, 2 ** 62], pa.int64())
+    assert am.array(b).index(2 ** 62) == pc.index(b, pa.scalar(2 ** 62, pa.int64())).as_py() == 1
+
+
+def test_time_of_day_addition_wraps_where_pyarrow_raises():
+    import datetime
+    a = pa.array([1000], pa.time32("ms"))
+    delta = pa.array([-2000], pa.duration("ms"))
+    assert pylist(am.array(a).add_duration(am.array(delta))) == [datetime.time(23, 59, 59)]
+    with pytest.raises(pa.ArrowInvalid):
+        pc.add(a, delta)
+
+
+def test_pyarrow_pairwise_diff_ignores_the_array_offset():
+    """Not our divergence: pyarrow 25.0.1 reads the values buffer of a sliced column without honouring
+    ArrowArray.offset, so the matrix hands its oracle a materialised copy."""
+    full = pa.array([10, 20, 30, 40, 50, 7, 3, 99, 1, 60, 2, 5], pa.int32())
+    sliced = full.slice(5, 6)
+    copy = pa.array(sliced.to_pylist(), pa.int32())
+    assert pylist(am.array(sliced).pairwise_diff()) == pc.pairwise_diff(copy).to_pylist()
+    assert pc.pairwise_diff(sliced).to_pylist() != pc.pairwise_diff(copy).to_pylist()
+
+
+def test_pyarrow_boolean_fill_null_forward_ignores_the_array_offset():
+    """The same bug on a boolean column, for fill_null_forward / _backward and replace_with_mask."""
+    full = pa.array([True, False, None, True, True, False, None, True], pa.bool_())
+    sliced = full.slice(3, 5)
+    copy = pa.array(sliced.to_pylist(), pa.bool_())
+    assert pylist(am.array(sliced).fill_null_forward()) == pc.fill_null_forward(copy).to_pylist()
+    assert pc.fill_null_forward(sliced).to_pylist() != pc.fill_null_forward(copy).to_pylist()
+
+
+def test_hash64_is_deterministic_and_canonicalises_equal_values():
+    """The two properties the matrix's hash64 case rests on, spelled out: the same bytes always hash
+    the same, and values Arrow calls equal hash equal."""
+    a = pa.array([1.0, 2.0, -0.0, 0.0, math.nan, math.nan, None], pa.float64())
+    first, second = pylist(am.array(a).hash64()), pylist(am.array(a).hash64())
+    assert first == second
+    assert first[2] == first[3]                    # -0.0 hashes as 0.0
+    assert first[4] == first[5]                    # every NaN hashes alike
+    assert first[6] is None
+    assert len({first[0], first[1], first[2], first[4]}) == 4
+
+
+def test_float16_never_computes_in_half_precision():
+    a = pa.array(np.array([1.5, 2.5], np.float16), type=pa.float16())
+    widened = am.array(a).to_float32()
+    assert widened.type == pa.float32()
+    assert pylist(widened) == a.cast(pa.float32()).to_pylist()
+    assert pylist(widened.to_float16()) == a.to_pylist()
+
+
+def test_extension_metadata_round_trips_through_pyarrow():
+    a = pa.array([1, 2], pa.int64())
+    tagged = am.array(a).as_extension_type("arrowmetal.pinned", b"v1")
+    assert tagged.extension_name == "arrowmetal.pinned"
+    assert tagged.extension_metadata == b"v1"
+    assert pylist(tagged.extension_storage()) == a.to_pylist()

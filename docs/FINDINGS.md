@@ -73,6 +73,42 @@ Things learned the hard way. Add to this whenever something surprises you.
 - Float64 sum on the GPU accumulates with `d_add` in tree order; per-threadgroup partials are combined on
   the CPU in `Double`. Results differ from a sequential CPU sum only by normal floating-point reordering.
 
+## Round 8 (2026-09-06): the differential matrix over the whole type surface
+
+Extending `python/tests/test_differential.py` to every type ArrowMetal imports (45 columns, 181
+operations, 33,156 cases) turned up three bugs and one crash **in pyarrow 25.0.1**, not in ArrowMetal.
+They are recorded here because the harness has to work around them, and each has a test that fails if a
+later pyarrow fixes it.
+
+- `pc.year_month_day` and `pc.iso_calendar` **corrupt the heap**. The process segfaults a couple of
+  allocations later, in whatever unrelated call happens next — the faulting frame was `Array.nbytes`
+  inside the harness's own array cache, which cost an hour to trace back. Reproducible with pyarrow
+  and numpy alone, no ArrowMetal in the process: build a `timestamp[s]` array with nulls, call
+  `pc.year_month_day`, then a `timestamp[ms]` one, then a `timestamp[us]` one, allocating a small
+  array between each. Mitigation: never call the two struct-valued temporal kernels. The matrix
+  compares `iso_calendar` and `year_month_day` field by field against `pc.iso_year`/`pc.iso_week`/
+  `pc.day_of_week` and `pc.year`/`pc.month`/`pc.day`, which is a stronger check anyway.
+- `pc.utf8_normalize` **ignores its `form` option**: NFC and NFKC come back decomposed, so its NFC is
+  NFD. Python's `unicodedata` and ArrowMetal agree with each other and with the Unicode annex; the
+  matrix uses `unicodedata` as the oracle. Pinned by
+  `test_pyarrow_utf8_normalize_ignores_its_form_option`.
+- `pc.pairwise_diff` **ignores `ArrowArray.offset`**: on a sliced column it reads the values buffer
+  from the start and answers with the wrong rows. Only visible when the values are not an arithmetic
+  progression, which is why it hid for a while. The matrix hands that oracle a materialised copy while
+  ArrowMetal still gets the slice, so the case remains a test of the offset handling.
+- `pc.fill_null_forward`, `pc.fill_null_backward` and `pc.replace_with_mask` have the same offset bug
+  on a **boolean** column (the values bitmap, not the validity one). Same mitigation.
+
+Two things about the harness itself that were not obvious:
+
+- `pc.add` on a `time32`/`time64` column validates the *values under the validity bitmap*, so a null
+  row whose hidden value would leave `[0, 86400)` makes the oracle raise even though the row is null.
+  The generator deliberately puts real numbers under the null bits, so the time-of-day cases have to
+  drop their null rows rather than mask them.
+- A `Decimal` that came out of a 38-digit column cannot be scaled with `Decimal.scaleb` or multiplied
+  by `10 ** scale` under the default decimal context — 28 digits of precision silently round it. Read
+  the unscaled magnitude off `as_tuple().digits` instead.
+
 ## Round 7 (2026-09-06): strings and sort
 - Generated MSL written through a shell heredoc must use `\(K)` (one backslash) for Swift interpolation; a
   doubled backslash reaches the Metal compiler as literal text. Same newline rule as before for `#define`.
