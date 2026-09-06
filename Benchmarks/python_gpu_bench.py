@@ -82,6 +82,79 @@ bench(sec, "ArrowMetal (GPU, batched)", QB, _batched)
 bench(sec, "polars lazy (fused)", QB, lambda: ql.filter((pl.col("region") == 2) & (pl.col("amount") > 100)).select(pl.col("amount").sum()).collect())
 bench(sec, "numpy masked sum", QB, lambda: amount[(region == 2) & (amount > 100)].sum())
 
+# ---- sorting: ArrowMetal's GPU radix sort vs polars, pyarrow and numpy
+sort_i64 = rng.integers(-(2 ** 62), 2 ** 62, size=rows, dtype=np.int64)
+a_i64 = pa.array(sort_i64); g_i64 = am.array(a_i64); p_i64 = pl.Series("x", a_i64)
+sort_f64 = rng.random(rows) * 2e9 - 1e9
+a_f64 = pa.array(sort_f64); g_f64 = am.array(a_f64); p_f64 = pl.Series("x", a_f64)
+
+sec = f"argsort(Int64, {rows} rows, no nulls)"; print("\n" + sec)
+bench(sec, "ArrowMetal (GPU)", rows * 12, lambda: g_i64.argsort())
+bench(sec, "polars arg_sort", rows * 12, lambda: p_i64.arg_sort())
+bench(sec, "pyarrow array_sort_indices", rows * 12, lambda: pc.array_sort_indices(a_i64))
+bench(sec, "numpy argsort", rows * 12, lambda: np.argsort(sort_i64))
+
+sec = f"sort(Float64, {rows} rows, no nulls)"; print("\n" + sec)
+bench(sec, "ArrowMetal (GPU)", rows * 16, lambda: g_f64.sort())
+bench(sec, "ArrowMetal (GPU) + to_arrow()", rows * 16, lambda: g_f64.sort().to_arrow())
+bench(sec, "polars sort", rows * 16, lambda: p_f64.sort())
+bench(sec, "pyarrow sort_indices + take", rows * 16, lambda: pc.take(a_f64, pc.array_sort_indices(a_f64)))
+bench(sec, "numpy sort", rows * 16, lambda: np.sort(sort_f64))
+
+sec = f"top_k(100 of {rows} Int64)"; print("\n" + sec)
+bench(sec, "ArrowMetal (GPU, full sort)", rows * 8, lambda: g_i64.top_k(100))
+bench(sec, "polars top_k", rows * 8, lambda: p_i64.top_k(100))
+bench(sec, "numpy argpartition", rows * 8, lambda: np.argpartition(sort_i64, rows - 100)[rows - 100:])
+
+# ---- strings: 10M utf8 values from 1000 distinct keys
+str_rows = min(rows, 10_000_000)
+distinct = 1000
+regions = ["north", "south", "east", "west"]
+vocab = [f"cust_{i:03d}_{regions[i % 4]}" for i in range(distinct)]
+scodes = rng.integers(0, distinct, size=str_rows, dtype=np.int32)
+arr_str = pa.DictionaryArray.from_arrays(pa.array(scodes), pa.array(vocab)).cast(pa.string())
+t0 = time.perf_counter(); g_str = am.array(arr_str)
+print(f"\nimport {str_rows}-row utf8 column into Metal memory: {(time.perf_counter()-t0)*1000:.1f} ms")
+p_str = pl.Series("s", arr_str)
+SB = arr_str.nbytes
+
+sec = f'string contains("north") over {str_rows} strings (25% hit)'; print("\n" + sec)
+bench(sec, "ArrowMetal (GPU)", SB, lambda: g_str.str_contains("north"))
+bench(sec, "polars str.contains (literal)", SB, lambda: p_str.str.contains("north", literal=True))
+bench(sec, "pyarrow match_substring", SB, lambda: pc.match_substring(arr_str, "north"))
+
+sec = f'string starts_with("cust_1") over {str_rows} strings (10% hit)'; print("\n" + sec)
+bench(sec, "ArrowMetal (GPU)", SB, lambda: g_str.starts_with("cust_1"))
+bench(sec, "polars str.starts_with", SB, lambda: p_str.str.starts_with("cust_1"))
+bench(sec, "pyarrow starts_with", SB, lambda: pc.starts_with(arr_str, "cust_1"))
+
+sec = f'string equals("cust_042_east") over {str_rows} strings'; print("\n" + sec)
+bench(sec, "ArrowMetal (GPU)", SB, lambda: g_str.str_equals("cust_042_east"))
+bench(sec, "polars ==", SB, lambda: p_str == "cust_042_east")
+bench(sec, "pyarrow equal", SB, lambda: pc.equal(arr_str, "cust_042_east"))
+
+sec = f"string filter over {str_rows} strings (~30% kept)"; print("\n" + sec)
+keep = scodes < distinct * 3 // 10
+g_keep = am.array(pa.array(keep)); pa_keep = pa.array(keep); pl_keep = pl.Series(keep)
+bench(sec, "ArrowMetal (GPU)", SB, lambda: g_str.filter(g_keep))
+bench(sec, "polars filter", SB, lambda: p_str.filter(pl_keep))
+bench(sec, "pyarrow filter", SB, lambda: pc.filter(arr_str, pa_keep))
+
+sec = f"dictionary_encode + group-by sum over {str_rows} strings ({distinct} distinct)"; print("\n" + sec)
+str_amount = sort_i64[:str_rows]
+g_amount = am.array(pa.array(str_amount))
+DB = SB + str_rows * 8
+df_str = pl.DataFrame({"s": p_str, "x": str_amount})
+tbl_str = pa.table({"s": arr_str, "x": pa.array(str_amount)})
+def _am_dict_group():
+    codes, uniq = g_str.dictionary_encode()
+    return codes.group_by(len(uniq)).sum(g_amount)
+bench(sec, "ArrowMetal (dictionary_encode on CPU + GPU group-by)", DB, _am_dict_group)
+_codes, _uniq = g_str.dictionary_encode(); _gb = _codes.group_by(len(_uniq))
+bench(sec, "ArrowMetal (GPU group-by on cached codes)", DB, lambda: _gb.sum(g_amount))
+bench(sec, "polars group_by(str) sum", DB, lambda: df_str.group_by("s").agg(pl.col("x").sum()))
+bench(sec, "pyarrow group_by(str) sum", DB, lambda: tbl_str.group_by("s").aggregate([("x", "sum")]))
+
 print("\n\n| Operation | Implementation | Time (ms) | Throughput (GB/s) | CPU time (ms) |\n|---|---|---:|---:|---:|")
 for s, l, ms, gb_, cpu in results:
     print(f"| {s} | {l} | {ms:.2f} | {gb_:.1f} | {cpu:.1f} |")

@@ -59,7 +59,9 @@ for name, extra in [("am_compare_scalar", [ctypes.c_int, _P]), ("am_compare_arra
                     ("am_arith_scalar", [ctypes.c_int, _P]), ("am_arith_array", [ctypes.c_int, _P]),
                     ("am_cast", [ctypes.c_char_p]), ("am_bool_and", [_P]), ("am_bool_or", [_P]), ("am_bool_not", []),
                     ("am_filter", [_P]), ("am_filter_where", [ctypes.c_int, _P]), ("am_take", [_P]),
-                    ("am_slice", [ctypes.c_int64, ctypes.c_int64])]:
+                    ("am_slice", [ctypes.c_int64, ctypes.c_int64]),
+                    ("am_argsort", [ctypes.c_int]), ("am_sort", [ctypes.c_int]),
+                    ("am_top_k", [ctypes.c_int64, ctypes.c_int])]:
     getattr(_lib, name).argtypes = [_P] + extra + [ctypes.POINTER(_P)]
     getattr(_lib, name).restype = ctypes.c_int
 _lib.am_str_unary.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]; _lib.am_str_unary.restype = ctypes.c_int
@@ -224,6 +226,19 @@ class MetalArray:
             indices = MetalArray.from_arrow(pa.array(indices, type=pa.int32()))
         return _call(_lib.am_take, self._h, indices._h)
     def slice(self, offset, length): return _call(_lib.am_slice, self._h, offset, length)
+
+    # ---- sorting (GPU radix sort; stable, nulls last)
+    def argsort(self, descending=False):
+        """Int32 indices that sort the array (Arrow `array_sort_indices`)."""
+        return _call(_lib.am_argsort, self._h, 1 if descending else 0)
+
+    def sort(self, descending=False):
+        """Sorted copy of the array."""
+        return _call(_lib.am_sort, self._h, 1 if descending else 0)
+
+    def top_k(self, k, largest=True):
+        """Int32 indices of the k largest (or smallest) values, in sorted order."""
+        return _call(_lib.am_top_k, self._h, k, 1 if largest else 0)
 
     # ---- strings (utf8)
     def byte_length(self): return _call(_lib.am_str_unary, self._h, 0)

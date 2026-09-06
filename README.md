@@ -47,6 +47,8 @@ Wall time, with the CPU time each call consumed in parentheses:
 | take 25M random indices | **5.86** (0.7) | 163.92 (163.9) | 134.87 (134.9) | |
 | group-by sum, 1000 keys | **1.91** (0.4) | 84.06 (1182.7) | 18.67 (250.8) | |
 | filter two columns + sum, batched | **1.77** (0.5) | 15.81 (26.6, lazy) | | 109.05 (numpy) |
+| sort Float64, 50M rows | **138.03** (0.9) | 148.55 (1213.8) | 6321.34 (6315.9) | 1782.05 (numpy) |
+| string `contains`, 10M utf8 | **1.61** (0.4) | 147.78 (147.8) | 121.91 (121.9) | 122.31 (122.3) |
 
 **Swift, against all 16 CPU cores** (tight typed loops over the same Arrow layout) and Accelerate:
 
@@ -64,9 +66,12 @@ Wall time, with the CPU time each call consumed in parentheses:
 | sum Float32 | 0.90 | **0.84** (vDSP) |
 | multiply Float32 * 2.5 | 1.72 | **1.63** (vDSP) |
 | Float32 compare + filter | **2.14** | 5.73 |
+| sort Float64, 50M rows | **138.52** | 591.97 (chunk sort + merge tree) |
+| string `contains`, 10M utf8 | **1.65** | 17.77 |
 
 Takeaways: reductions, comparisons, selection, group-by and query-shaped pipelines beat all 16 CPU cores by
-1.5x to 3x and Polars by 5x to 40x. Pure element-wise arithmetic is memory bound on both sides, so
+1.5x to 3x and Polars by 5x to 40x. Sorting (GPU LSD radix) is 4.6x all 16 cores; string predicates are the
+widest margin of all, 20x to 90x Polars and pyarrow. Pure element-wise arithmetic is memory bound on both sides, so
 Accelerate on 16 cores ties or edges ahead there. Arrays under about a million rows are dominated by the
 fixed cost of a GPU dispatch (see [docs/DESIGN.md](docs/DESIGN.md) for the pipelining plan).
 

@@ -45,6 +45,11 @@ int  am_filter_where(am_array* a, int op, const void* scalar, am_array** out);
 int  am_take(am_array* a, am_array* indices, am_array** out);
 int  am_slice(am_array* a, int64_t offset, int64_t length, am_array** out);
 
+// Sorting (GPU LSD radix sort; stable, nulls last, NaN after +inf).
+int  am_argsort(am_array* a, int descending, am_array** out);   // int32 indices
+int  am_sort(am_array* a, int descending, am_array** out);      // sorted copy, same type
+int  am_top_k(am_array* a, int64_t k, int largest, am_array** out);  // int32 indices of the k largest/smallest
+
 // Group-by over dense int32/int64 keys in [0, key_count). agg: 0 sum, 1 count(rows), 2 min, 3 max, 4 mean, 5 count(values)
 int  am_group_by(am_array* keys, int64_t key_count, int agg, am_array* values /* may be NULL for count rows */, am_array** out);
 
