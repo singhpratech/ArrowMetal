@@ -386,7 +386,10 @@ extension GroupBy {
         let iota = try MetalArray<Int32>.iota(values.length, context: values.context)
         let masked = MetalArray<Int32>(length: values.length, nullCount: values.nullCount,
                                        validity: values.validity, values: iota.values, context: values.context)
-        return wantFirst ? try min(masked) : try max(masked)
+        // The fused sort-free extremes: one atomic pass and a GPU finalize, so a ten-million-group
+        // `first` never walks the groups on the host.
+        let e = try extrema(masked)
+        return wantFirst ? e.min : e.max
     }
 
     /// Arrow `hash_any` over a boolean column: true for a key with at least one true value, null for a

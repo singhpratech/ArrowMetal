@@ -97,6 +97,8 @@ extension GroupBy {
 
     private func minMax64<T: ArrowPrimitive>(_ values: MetalArray<T>, isMin: Bool, segments s: GroupSegments?) throws -> MetalArray<T> {
         guard T.byteWidth == 8 else { return isMin ? try min(values) : try max(values) }
+        // Sort-free two-pass atomics unless the caller already paid for the sorted order.
+        if s == nil { let e = try extrema(values); return isMin ? e.min : e.max }
         let kind = T.isFloatingPoint ? "double" : (T.minValue < 0 as T ? "signed" : "unsigned")
         let op = SegmentedSource.minMax64(isMin: isMin, kind: kind)
         let (out, valid) = try run(values, op: op, segments: s)

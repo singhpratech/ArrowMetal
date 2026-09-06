@@ -202,9 +202,11 @@ extension MetalArray: GroupedValueOps {
         let unsigned = T.minValue >= 0 as T
         withExtendedLifetime((sums, counts, out)) {
             let d = out.mutableValuePointer, bm = out.validity!.mutableTyped(UInt8.self)
-            for k in 0..<gb.keyCount where counts.valuePointer[k] > 0 && sums.isValid(k) {
-                let total = unsigned ? Double(UInt64(bitPattern: sums.valuePointer[k])) : Double(sums.valuePointer[k])
-                d[k] = total / Double(counts.valuePointer[k])
+            let sp = sums.valuePointer, cp = counts.valuePointer
+            let sv = sums.validity?.typed(UInt8.self)
+            for k in 0..<gb.keyCount where cp[k] > 0 && (sv == nil || Bitmap.isSet(sv!, k)) {
+                let total = unsigned ? Double(UInt64(bitPattern: sp[k])) : Double(sp[k])
+                d[k] = total / Double(cp[k])
                 Bitmap.set(bm, k)
             }
         }

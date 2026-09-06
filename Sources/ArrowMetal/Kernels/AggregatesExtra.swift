@@ -51,10 +51,18 @@ extension GroupBy {
     /// Arrow `hash_min_max`: the smallest and largest non-null value of each key, from **one** read of
     /// the values. NaN is skipped, so a key whose only values are NaN is null, as in Arrow.
     ///
-    /// GPU, segmented: the keys are argsorted once (pass `segments` to share that sort with other
-    /// aggregates) and one threadgroup reduces one key's run, carrying both extremes at the same time.
-    /// Unlike the atomic `min` / `max` this works for 64-bit types too.
+    /// GPU, sort-free: two linear passes of 32-bit atomics over an order-preserving 64-bit key
+    /// (`Kernels/GroupByExtrema.swift`) — the high word's extremes first, then the low word's among the
+    /// rows that hold the winning high word. Unlike the plain atomic `min` / `max` this works for 64-bit
+    /// types too, and unlike the segmented path it replaces there is no argsort of the key column.
+    /// `segments` is accepted for source compatibility and only used by the segmented fallback.
     public func minMax<T: ArrowPrimitive>(_ values: MetalArray<T>, segments s: GroupSegments? = nil)
+        throws -> (min: MetalArray<T>, max: MetalArray<T>) {
+        try extrema(values)
+    }
+
+    /// The segmented `min_max` the atomic path replaced, kept for differential testing.
+    func minMaxSegmented<T: ArrowPrimitive>(_ values: MetalArray<T>, segments s: GroupSegments? = nil)
         throws -> (min: MetalArray<T>, max: MetalArray<T>) {
         guard values.length == keys.length else { throw ArrowMetalError.lengthMismatch(keys.length, values.length) }
         let ctx = values.context
