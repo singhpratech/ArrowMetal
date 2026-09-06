@@ -84,6 +84,23 @@ extension ParquetFile {
         let ctx = context
         let maxDef = leaf.maxDefinition
         let maxRep = leaf.maxRepetition
+        // Writers mark every column `optional` whether or not it contains nulls -- pyarrow always does --
+        // so a column that is in fact dense would otherwise pay for definition levels, ranks, a scatter
+        // and a validity bitmap it does not need. The footer says when that is provably not the case:
+        // every selected chunk reporting `null_count == 0` (or every data page being a v2 page with
+        // `num_nulls == 0`) means every definition level is the maximum, dense positions and row
+        // positions coincide, and the whole level path can be skipped. Set here, used below as
+        // `levelDef`; `maxDef` itself still goes to `pq_page_layout`, which must skip the level bytes.
+        var provablyDense = maxDef > 0 && maxRep == 0 && !needRepetition && !rowGroups.isEmpty
+        if provablyDense {
+            for g in rowGroups {
+                let rg = metadata.rowGroups[g]
+                guard leaf.index < rg.columns.count, rg.columns[leaf.index].meta.statistics?.nullCount == 0 else {
+                    provablyDense = false
+                    break
+                }
+            }
+        }
 
         // ---- 1. page headers
         var dataPages: [ParquetRawPage] = []
@@ -227,14 +244,20 @@ extension ParquetFile {
             }
         }
 
+        // A v2 page states its null count outright, which settles the question even without statistics.
+        if maxDef > 0 && maxRep == 0 && !needRepetition && !provablyDense {
+            provablyDense = dataPages.allSatisfy { $0.header.type == .dataPageV2 && $0.header.numNulls == 0 }
+        }
+        let levelDef = provablyDense ? 0 : maxDef
+
         var defBytes: MetalArrowBuffer? = nil
         var ranks: MetalArrowBuffer? = nil
         var totalNonNull = totalLevels
-        if maxDef > 0 {
+        if levelDef > 0 {
             let db = try MetalArrowBuffer.allocate(byteCount: Swift.max(totalLevels, 1), zeroed: false, context: ctx)
             let rk = try MetalArrowBuffer.allocate(byteCount: Swift.max(totalLevels * 4, 4), zeroed: false, context: ctx)
             try runLevels(ctx, data: pageData, dataOffset: pageDataOffset, pages: pagesBuf, count: infos.count,
-                          bitWidth: bitWidth(of: maxDef), matchLevel: maxDef, which: 0, countSlot: 0,
+                          bitWidth: bitWidth(of: levelDef), matchLevel: levelDef, which: 0, countSlot: 0,
                           levels: db, ranks: rk)
             totalNonNull = try runPageScan(ctx, pages: pagesBuf, count: infos.count, slot: 0)
             defBytes = db
@@ -296,7 +319,7 @@ extension ParquetFile {
         let decoder = ParquetValueDecoder(
             file: self, leaf: leaf, ctx: ctx, pageData: pageData, pageDataOffset: pageDataOffset,
             infos: finished, totalLevels: totalLevels, totalNonNull: totalNonNull,
-            defBytes: defBytes, ranks: ranks, maxDef: maxDef, width: width,
+            defBytes: defBytes, ranks: ranks, maxDef: levelDef, width: width,
             totalDict: totalDict, dictValOffset: dictValOffset, dictValLength: dictValLength,
             dictFixed: dictFixed, dictionaryEncoded: options.dictionaryEncoded)
         let result = try decoder.run()
@@ -306,10 +329,10 @@ extension ParquetFile {
                                    nonNull: totalNonNull, values: result)
         data.defLevels = defBytes
         data.repLevels = repBytes
-        if maxDef > 0, totalNonNull < totalLevels {
+        if levelDef > 0, totalNonNull < totalLevels {
             let bm = try MetalArrowBuffer.allocate(byteCount: Swift.max(Bitmap.byteCount(bits: totalLevels), 4),
                                                    zeroed: true, context: ctx)
-            try runLevelsToBitmap(ctx, levels: defBytes!, n: totalLevels, maxDef: maxDef, out: bm)
+            try runLevelsToBitmap(ctx, levels: defBytes!, n: totalLevels, maxDef: levelDef, out: bm)
             data.validity = bm
             data.nullCount = totalLevels - totalNonNull
         }
