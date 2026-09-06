@@ -1,5 +1,9 @@
 name: CI
-on: [push, pull_request]
+# Hosted runners expose a virtual GPU (correctness tests skip there) and macOS minutes are billed on a
+# private repo, so CI runs only on pull requests or by hand. Real GPU testing happens on Apple silicon locally.
+on:
+  pull_request:
+  workflow_dispatch:
 jobs:
   test:
     runs-on: macos-15
