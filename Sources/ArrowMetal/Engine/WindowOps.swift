@@ -67,8 +67,12 @@ enum WindowOps {
         let inverse = sortCols.isEmpty ? positions : try perm.argsort()
 
         // 2. Partition ids in sorted order, and each row's partition start.
-        var startPerRow = try constant(Int32(0), n, ctx)
-        var endPerRow = try constant(Int32(n - 1), n, ctx)
+        //
+        // With no partitioning the whole input is one partition, so every row's start is 0 and its end
+        // is n - 1; those constant columns are only materialised if the chosen function actually reads
+        // them, because at 50M rows filling one costs more than the window function does.
+        var startPerRow: MetalArray<Int32>! = nil
+        var endPerRow: MetalArray<Int32>! = nil
         var sortedPartitionIds: MetalArray<Int32>? = nil
         var partitionCount = 1
         if !spec.partitionBy.isEmpty {
@@ -83,24 +87,32 @@ enum WindowOps {
             endPerRow = try ends.take(sortedIds)
             sortedPartitionIds = sortedIds
         }
+        func starts() throws -> MetalArray<Int32> {
+            if startPerRow == nil { startPerRow = try constant(0, n, ctx) }
+            return startPerRow
+        }
+        func ends() throws -> MetalArray<Int32> {
+            if endPerRow == nil { endPerRow = try constant(Int32(n - 1), n, ctx) }
+            return endPerRow
+        }
 
         let result: AnyMetalArray
         switch spec.function {
         case .rowNumber:
-            result = .int32(try offsetFrom(positions, startPerRow, ctx))
+            result = .int32(try offsetFrom(positions, try starts(), ctx))
 
         case .rank, .denseRank:
             let tieStart = try tieGroupStarts(input, spec, perm, sortedPartitionIds, positions, partitionCount, ctx)
             if case .rank = spec.function {
-                result = .int32(try offsetFrom(tieStart.starts, startPerRow, ctx))
+                result = .int32(try offsetFrom(tieStart.starts, try starts(), ctx))
             } else {
-                result = .int32(try denseRanks(tieStart.starts, positions, startPerRow, ctx))
+                result = .int32(try denseRanks(tieStart.starts, positions, try starts(), ctx))
             }
 
         case .lag(let c, let k), .lead(let c, let k):
             var delta = k
             if case .lead = spec.function { delta = -k }
-            let idx = try neighbourIndex(positions, startPerRow, endPerRow, delta: delta, ctx)
+            let idx = try neighbourIndex(positions, try starts(), try ends(), delta: delta, ctx)
             result = try columnNamed(c, input).take(perm).take(idx)
 
         case .cumSum(let c), .rollingSum(let c, _), .rollingMean(let c, _),
@@ -111,7 +123,7 @@ enum WindowOps {
                     + "functions run one dispatch per partition and are capped at \(maxPartitionsForSlicedPath)")
             }
             let sorted = try columnNamed(c, input).take(perm)
-            result = try slicedPerPartition(sorted, spec.function, startPerRow, endPerRow,
+            result = try slicedPerPartition(sorted, spec.function, try starts(), try ends(),
                                             partitionCount: partitionCount, n: n, ctx)
 
         case .partitionAggregate:

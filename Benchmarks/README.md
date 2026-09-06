@@ -1,6 +1,6 @@
 # Benchmarks
 
-Four complementary benchmarks. Numbers per chip live in `../docs/BENCHMARKS.md`, and the complete
+Six complementary benchmarks. Numbers per chip live in `../docs/BENCHMARKS.md`, and the complete
 operation-by-operation matrix in `../docs/BENCHMARKS_MATRIX.md`.
 
 | Script | What it measures |
@@ -8,6 +8,8 @@ operation-by-operation matrix in `../docs/BENCHMARKS_MATRIX.md`.
 | `swift run -c release arrowmetal-bench [rows] [iters]` | Metal kernels vs 16-core Swift loops vs Accelerate (all cores). Same process, same buffers. |
 | `python Benchmarks/python_bench.py [rows] [iters]` | Polars, pyarrow.compute, pandas, numpy on data of identical shape (their own memory). |
 | `PYTHONPATH=python python Benchmarks/python_gpu_bench.py [rows] [iters]` | ArrowMetal called **from Python** vs Polars/pyarrow/pandas on the **same in-process data**, including the cost of crossing the C boundary. |
+| `PYTHONPATH=python python Benchmarks/expr_bench.py [rows] [iters]` | The fused expression compiler: one runtime-generated kernel for a whole expression, against the same expression built op by op, Polars, pyarrow, pandas and numpy (see `../docs/EXPR.md`). |
+| `PYTHONPATH=python python Benchmarks/engine_bench.py [rows] [iters]` | The lazy query engine: eight TPC-H-flavoured query shapes at 50M rows (plus a 10M x 1M join, a 50M as-of join and a window over 1000 partitions) against Polars lazy and DuckDB on the same Arrow buffers (see `../docs/ENGINE.md`). |
 | `PYTHONPATH=python python Benchmarks/full_matrix.py [--quick]` | **Every** operation family, against the fastest idiom of each CPU library, with a pass/fail verdict per row. |
 
 ## full_matrix.py: the complete comparison

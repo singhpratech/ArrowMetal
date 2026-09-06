@@ -38,7 +38,7 @@ already dense, windows, limits — and, more importantly, the layer that *decide
 become one kernel, which columns are read at all, where a predicate should run. Without it, a caller
 writing a real query gets one Arrow kernel per operator and a CPU round trip between each.
 
-So the engine is three files of decision plus one of execution:
+So the engine is a plan, three layers of decision over it, and one of execution:
 
 | File | What lives there |
 |---|---|
@@ -319,9 +319,9 @@ the same run: it is what the query cost the machine, next to what it cost the ca
 | **(f)** semi join 10M against a 1 000-row key set | **ArrowMetal lazy** | **3.35** | 1.3 | — |
 | | polars lazy | 5.74 | 42.4 | 1.7x |
 | | duckdb | 7.92 | 9.7 | 2.4x |
-| **(g)** `row_number() over (partition by g order by v)`, 10M rows, 1 000 partitions | **ArrowMetal lazy** | **75.55** | 10.5 | — |
-| | polars lazy | 139.89 | 741.3 | 1.9x |
-| | duckdb | 632.91 | 2301.1 | 8.4x |
+| **(g)** `row_number() over (partition by g order by v)`, 10M rows, 1 000 partitions | **ArrowMetal lazy** | **66.96** | 10.5 | — |
+| | polars lazy | 139.89 | 741.3 | 2.1x |
+| | duckdb | 632.91 | 2301.1 | 9.5x |
 | **(h)** as-of join 50M trades against 1M quotes | **ArrowMetal lazy** | **16.53** | 3.4 | — |
 | | polars | 195.14 | 194.3 | 12x |
 | | duckdb | did not finish | | |
