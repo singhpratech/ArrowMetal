@@ -101,10 +101,26 @@ bench(sec, "polars sort", rows * 16, lambda: p_f64.sort())
 bench(sec, "pyarrow sort_indices + take", rows * 16, lambda: pc.take(a_f64, pc.array_sort_indices(a_f64)))
 bench(sec, "numpy sort", rows * 16, lambda: np.sort(sort_f64))
 
-sec = f"top_k(100 of {rows} Int64)"; print("\n" + sec)
-bench(sec, "ArrowMetal (GPU, full sort)", rows * 8, lambda: g_i64.top_k(100))
-bench(sec, "polars top_k", rows * 8, lambda: p_i64.top_k(100))
-bench(sec, "numpy argpartition", rows * 8, lambda: np.argpartition(sort_i64, rows - 100)[rows - 100:])
+for k in (100, 10_000, 100_000):
+    sec = f"top_k({k} of {rows} Int64)"; print("\n" + sec)
+    bench(sec, "ArrowMetal (GPU radix select)", rows * 8, lambda k=k: g_i64.top_k(k))
+    bench(sec, "pyarrow select_k_unstable", rows * 8,
+          lambda k=k: pc.select_k_unstable(a_i64, k=k, sort_keys=[("", "descending")]))
+    bench(sec, "polars top_k", rows * 8, lambda k=k: p_i64.top_k(k))
+    bench(sec, "numpy argpartition", rows * 8, lambda k=k: np.argpartition(sort_i64, rows - k)[rows - k:])
+
+# quantile wants only the value at one rank, so the same radix select runs with the winners never written.
+sec = f"quantile(0.5 of {rows} Int64)"; print("\n" + sec)
+bench(sec, "ArrowMetal (GPU radix select)", rows * 8, lambda: g_i64.quantile(0.5))
+bench(sec, "pyarrow quantile", rows * 8, lambda: pc.quantile(a_i64, q=0.5))
+bench(sec, "polars median", rows * 8, lambda: p_i64.median())
+bench(sec, "numpy median", rows * 8, lambda: np.median(sort_i64))
+
+sec = f"quantile(0.5 of {rows} Float64)"; print("\n" + sec)
+bench(sec, "ArrowMetal (GPU radix select)", rows * 8, lambda: g_f64.quantile(0.5))
+bench(sec, "pyarrow quantile", rows * 8, lambda: pc.quantile(a_f64, q=0.5))
+bench(sec, "polars median", rows * 8, lambda: p_f64.median())
+bench(sec, "numpy median", rows * 8, lambda: np.median(sort_f64))
 
 # ---- strings: 10M utf8 values from 1000 distinct keys
 str_rows = min(rows, 10_000_000)

@@ -145,8 +145,11 @@ extension MetalArray {
             let loKey = full << UInt64(shift)
             let hiKey = loKey | ((UInt64(1) << UInt64(shift)) - 1)
 
-            if binCount > TopK.candidateCap(k: k) {
-                // Compacting would copy most of the input; narrow another digit in place instead.
+            // Nothing here has to keep k rows, so the budget is a flat one. Over it — a float64 median lands
+            // here, because a double key's top byte is the sign plus seven exponent bits and uniform data
+            // fills only two bins — narrowing another digit in place costs one more read of the column, and
+            // that beats writing tens of millions of keys.
+            if binCount > 1 << 20 {
                 prefix = full; shift -= 8
                 continue
             }

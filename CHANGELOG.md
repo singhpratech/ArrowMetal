@@ -23,8 +23,13 @@ Strings and sorting
   and re-hashed, with the host path as the final fallback); import/export through the C Data Interface
   (large_utf8 narrowed on import).
 - GPU LSD radix sort: `argsort`, `sorted`, `MetalRecordBatch.sorted(by:)`; stable, nulls last, IEEE total order.
-- `topK`: per-threadgroup selection for k <= 1024 (threshold plus a bitonic compaction in threadgroup memory,
-  then one radix sort of the candidates), matching the full sort index for index; the sort path above that.
+- `topK` for any k: a GPU radix select (digit histogram over the order-preserving key, one compaction pass
+  keeping only the rows that can still win, a refinement round, then a bitonic or radix ordering) reads the
+  column twice whatever k is, and matches the full sort index for index. The per-threadgroup selection
+  (threshold plus a bitonic compaction in threadgroup memory) still serves small inputs at k <= 1024, and
+  the sort covers k near n and the case where fewer than k rows are non-null.
+- `kthElement(k, largest:)`: the exact k-th smallest or largest value, by the same selection with the winners
+  counted but never written. `quantile` and `approximateMedian` run on it instead of a full sort.
 
 Temporal, binary and dictionary types
 - `MetalTemporalArray`: date32/date64, time32/time64, timestamp (unit + optional timezone) and duration,

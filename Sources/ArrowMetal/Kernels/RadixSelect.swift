@@ -282,6 +282,11 @@ extension MetalArray {
                 enc.setThreadgroupMemoryLength(roundUp(cap * 4, to: 16), index: 1)
                 enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: tg)
             }
+            ctx.retainUntilFlush(out)
+            // Inside a batch this dispatch is the last thing recorded, and the result's length is known, so
+            // nothing would force it to run before the caller read the indices. Flush here, as the sort path
+            // does, and the answer is always ready when it is returned.
+            try ctx.syncPoint()
             return MetalArray<Int32>(length: k, nullCount: 0, validity: nil, values: out, context: ctx)
         }
         let ord: MetalArray<Int32>
@@ -291,6 +296,8 @@ extension MetalArray {
             ord = try MetalArray<UInt32>(length: m, nullCount: 0, validity: nil, values: outKeys, context: ctx).argsort()
         }
         let rows = MetalArray<UInt32>(length: m, nullCount: 0, validity: nil, values: outRows, context: ctx)
-        return try rows.take(try ord.slice(offset: 0, length: k)).cast(to: Int32.self)
+        let picked = try rows.take(try ord.slice(offset: 0, length: k)).cast(to: Int32.self)
+        try ctx.syncPoint()
+        return picked
     }
 }
