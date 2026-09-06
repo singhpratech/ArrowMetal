@@ -11,6 +11,7 @@ every claim the project makes.
 | [TESTING.md](TESTING.md) | Every test suite, what it covers, and the commands to run it |
 | [BENCHMARKS.md](BENCHMARKS.md) | Every benchmark round with hardware, methodology, wall time and CPU time; the tables the README quotes |
 | [DESIGN.md](DESIGN.md) | How it works: buffers, kernels, batching, GPU-side lengths, software Float64, where the time goes |
+| [EXPR.md](EXPR.md) | Fused expression queries: one runtime-generated kernel for a whole expression DAG, the grammar, how nulls are compiled, the numbers and the limits |
 | [DECISIONS.md](DECISIONS.md) | Why it is built this way, one dated entry per decision |
 | [FINDINGS.md](FINDINGS.md) | Things learned the hard way: toolchain quirks, Metal limits, bugs and their lessons |
 | [../ROADMAP.md](../ROADMAP.md) | What is next and what is open for contributors |
@@ -30,6 +31,7 @@ swift build -c release --product ArrowMetalC && PYTHONPATH=python python -m pyte
 swift run -c release arrowmetal-bench            # Metal vs all CPU cores vs Accelerate, with CPU-ms
 python Benchmarks/python_bench.py                # Polars / pyarrow / pandas on the same data shapes
 PYTHONPATH=python python Benchmarks/python_gpu_bench.py   # ArrowMetal from Python vs Polars, in-process
+PYTHONPATH=python python Benchmarks/expr_bench.py         # fused expression queries vs one kernel per operator
 swift run -c release arrowmetal-examples         # six end-to-end scenarios
 ```
 

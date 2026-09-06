@@ -10,6 +10,7 @@ extern "C" {
 #endif
 
 typedef struct am_array am_array;            // opaque, Metal-resident Arrow array
+typedef struct am_query_result am_query_result;  // opaque, the output of one fused expression query
 
 const char* am_version(void);
 const char* am_device_name(void);
@@ -1073,6 +1074,65 @@ int  am_cumulative_checked(am_array* a, int op, int64_t p1, am_array** out);
 // float detour (about 7 significant digits).
 int  am_math_extra(am_array* a, int op, am_array* b /* or NULL */, const void* scalar /* or NULL */,
                    int64_t p1, am_array** out);
+
+// ---------------------------------------------------------------------------------------------------
+// Fused expression queries (docs/EXPR.md).
+//
+// am_query takes a set of equal-length named columns and one serialised query, compiles the whole
+// expression DAG into a SINGLE runtime-generated Metal kernel, and runs it. The inputs are read once
+// no matter how many operators the expression has; there is no intermediate array per operator.
+//
+// GRAMMAR (an s-expression; whitespace separates, strings are double quoted with \" \\ \n \t escapes).
+//
+//   query   := "(query" filter? group_by? terminal ")"
+//   filter  := "(filter" expr ")"                    -- rows where expr is true and not null
+//   group_by:= "(group_by" INT "\"name\"" expr ")"   -- INT is the key count; keys outside [0,INT) drop
+//   terminal:= "(project" ( "(as \"name\"" expr ")" )+ ")"
+//            | "(aggregate" agg+ ")"
+//   agg     := "(" ("sum"|"min"|"max"|"mean"|"count") "\"name\"" expr? ")"   -- expr optional for count
+//
+//   expr    := "(col \"name\")"
+//            | "(int" INT ")"        -- an untyped integer literal; adapts to the other operand
+//            | "(float" NUM ")"      -- an untyped float literal
+//            | "(i8"|"i16"|"i32"|"i64"|"u8"|"u16"|"u32"|"u64" INT ")"       -- typed integer literal
+//            | "(f32"|"f64" NUM ")"  -- typed float literal
+//            | "(bool" true|false ")" | "(str \"...\")" | "(null" TYPE ")"
+//            | "(" BINOP expr expr ")" | "(" UNOP expr ")"
+//            | "(cast" expr TYPE ")"
+//            | "(if_else" expr expr expr ")" | "(coalesce" expr+ ")" | "(fill_null" expr expr ")"
+//            | "(is_null" expr ")" | "(is_valid" expr ")"
+//            | "(is_in" expr literal+ ")"
+//            | "(str_eq"|"starts_with"|"contains" expr "\"pattern\"" ")"
+//   BINOP   := add sub mul div | eq ne lt le gt ge | and or and_kleene or_kleene
+//            | bit_and bit_or bit_xor shl shr
+//   UNOP    := negate abs sqrt exp ln round not bit_not
+//   TYPE    := i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool str
+//
+// Example: sum(amount) where region == 2 and amount > 100
+//   (query (filter (and (eq (col "region") (int 2)) (gt (col "amount") (int 100))))
+//          (aggregate (sum "total" (col "amount"))))
+//
+// Nulls follow Arrow: an operator is null where any input is null, `and_kleene`/`or_kleene` short
+// circuit, `is_null`/`is_valid`/`is_in` are never null, `if_else` is null when the condition is,
+// `coalesce`/`fill_null` remove nulls. Integer division by zero yields 0 (as elsewhere in this
+// package), `round` puts halves away from zero, and float32/int promotion follows Arrow's own rules
+// (float64 beats everything, float32 beats any integer, mixed signedness widens to a signed type).
+//
+// The result handle owns the output columns and scalars; release it with am_query_result_release.
+// am_query_column hands out a new am_array handle that the caller releases with am_release.
+int  am_query(am_array** columns, const char** names, int64_t n_columns, const char* expr_text,
+              am_query_result** out);
+int64_t     am_query_column_count(am_query_result* r);
+const char* am_query_column_name(am_query_result* r, int64_t i);
+int         am_query_column(am_query_result* r, int64_t i, am_array** out);
+int64_t     am_query_scalar_count(am_query_result* r);
+const char* am_query_scalar_name(am_query_result* r, int64_t i);
+// out_kind: 0 = int64 in out_i64, 1 = uint64 in the same slot, 2 = float64 in out_f64.
+int         am_query_scalar(am_query_result* r, int64_t i, int64_t* out_i64, double* out_f64,
+                            int* out_kind, int* is_null);
+void        am_query_result_release(am_query_result* r);
+// Parses and canonicalises a query without running it (NULL plus am_last_error() on a bad query).
+const char* am_query_canonical(const char* expr_text);
 
 #ifdef __cplusplus
 }
