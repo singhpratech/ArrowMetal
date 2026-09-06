@@ -171,6 +171,47 @@ bench(sec, "ArrowMetal (GPU group-by on cached codes)", DB, lambda: _gb.sum(g_am
 bench(sec, "polars group_by(str) sum", DB, lambda: df_str.group_by("s").agg(pl.col("x").sum()))
 bench(sec, "pyarrow group_by(str) sum", DB, lambda: tbl_str.group_by("s").aggregate([("x", "sum")]))
 
+# ---- distinct-value functions over an int64 column at 1K / 100K / 10M distinct. ArrowMetal runs these
+# on the GPU hash table (Kernels/HashTable.swift) above 65,536 rows, so their cost follows the distinct
+# count rather than the row count; the CPU libraries all use a hash table too, which is why these were
+# the cases where the old sort-based path lost.
+for dv_distinct in (1_000, 100_000, 10_000_000):
+    if dv_distinct > rows:
+        continue
+    dv_n = rng.integers(0, dv_distinct, size=rows, dtype=np.int64) * 7
+    dv_a = pa.array(dv_n)
+    dv_g = am.array(dv_a)
+    dv_p = pl.Series("v", dv_a)
+    dv_d = pd.Series(pd.arrays.ArrowExtensionArray(dv_a))
+    DV = rows * 8
+
+    sec = f"unique(int64) ({dv_distinct} distinct)"; print("\n" + sec)
+    bench(sec, "ArrowMetal (GPU hash table)", DV, lambda _g=dv_g: _g.unique())
+    bench(sec, "polars", DV, lambda _p=dv_p: _p.unique())
+    bench(sec, "pyarrow", DV, lambda _a=dv_a: pc.unique(_a))
+    bench(sec, "pandas (numpy)", DV, lambda _n=dv_n: pd.unique(_n))
+
+    sec = f"value_counts(int64) ({dv_distinct} distinct)"; print("\n" + sec)
+    bench(sec, "ArrowMetal (GPU hash table)", DV, lambda _g=dv_g: _g.value_counts())
+    bench(sec, "polars", DV, lambda _p=dv_p: _p.value_counts())
+    bench(sec, "pyarrow", DV, lambda _a=dv_a: pc.value_counts(_a))
+    bench(sec, "pandas", DV, lambda _d=dv_d: _d.value_counts())
+
+    sec = f"count_distinct(int64) ({dv_distinct} distinct)"; print("\n" + sec)
+    bench(sec, "ArrowMetal (GPU hash table)", DV, lambda _g=dv_g: _g.count_distinct())
+    bench(sec, "polars", DV, lambda _p=dv_p: _p.n_unique())
+    bench(sec, "pyarrow", DV, lambda _a=dv_a: pc.count_distinct(_a))
+    bench(sec, "pandas", DV, lambda _d=dv_d: _d.nunique())
+
+    sec = f"mode(int64) ({dv_distinct} distinct)"; print("\n" + sec)
+    bench(sec, "ArrowMetal (GPU hash table)", DV, lambda _g=dv_g: _g.mode())
+    bench(sec, "polars", DV, lambda _p=dv_p: _p.mode())
+    bench(sec, "pyarrow", DV, lambda _a=dv_a: pc.mode(_a))
+
+    # dictionary_encode over a primitive column is Swift-only: the C ABI has am_str_dictionary_encode
+    # (utf8) and nothing for the primitive form, so it is measured in Sources/ArrowMetalBench/main.swift.
+    del dv_n, dv_a, dv_g, dv_p, dv_d
+
 # ---- group-by over arbitrary keys: utf8 keys and two int32 key columns, at 1K / 100K / 10M distinct.
 # ArrowMetal maps the keys to dense group ids on the GPU, so unlike the dense group-by above there is
 # no dictionary_encode step for the caller to do first; polars and pyarrow are given the same columns.
@@ -210,6 +251,13 @@ for gb_distinct in (1_000, 100_000, 10_000_000):
     bench(sec, "polars group_by(utf8)", KB, lambda _d=df_k: _d.group_by("k").agg(pl.col("x").sum()))
     bench(sec, "pyarrow group_by(utf8)", KB, lambda _t=tbl_k: _t.group_by("k").aggregate([("x", "sum")]))
     print(f"    groups: ArrowMetal {_cached.group_count}, pyarrow {tbl_k.group_by('k').aggregate([]).num_rows}")
+
+    # The stage underneath that group-by, on its own: utf8 -> dense codes plus the distinct values in
+    # first-seen order. ArrowMetal runs the GPU hash table in Kernels/StringHashTable.swift.
+    sec = f"dictionary_encode(utf8) ({gb_distinct} distinct)"
+    print("\n" + sec)
+    bench(sec, "ArrowMetal (GPU hash table)", KB, lambda _g=g_keys: _g.dictionary_encode())
+    bench(sec, "pyarrow dictionary_encode", KB, lambda _a=key_arr: pc.dictionary_encode(_a))
 
     side = max(2, int(np.ceil(np.sqrt(gb_distinct))))
     ka = rng.integers(0, side, size=rows, dtype=np.int32)

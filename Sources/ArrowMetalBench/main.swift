@@ -69,7 +69,12 @@ func cpuSeconds() -> Double {
     return Double(ru.ru_utime.tv_sec) + Double(ru.ru_utime.tv_usec) / 1e6 + Double(ru.ru_stime.tv_sec) + Double(ru.ru_stime.tv_usec) / 1e6
 }
 
+/// `ARROWMETAL_BENCH_ONLY=<substring>` runs only the cases whose section or label contains it, which is
+/// how a single case is measured while tuning a kernel. Unset (the default) runs everything.
+let benchOnly = ProcessInfo.processInfo.environment["ARROWMETAL_BENCH_ONLY"]
+
 func time(_ label: String, bytes: Int, section: String, _ body: () throws -> Void) rethrows {
+    if let only = benchOnly, !section.contains(only), !label.contains(only) { return }
     try body() // warm-up (compiles pipelines)
     var best = Double.infinity
     var bestCPU = Double.infinity
@@ -684,6 +689,7 @@ let gbRows = rows
 let gbAmounts = try colI64.slice(offset: 0, length: gbRows)
 
 for gbDistinct in [1_000, 100_000, 10_000_000] where gbDistinct <= gbRows {
+    if let only = benchOnly, !"group-by sum over \(gbRows) utf8 keys (\(gbDistinct) distinct)".contains(only) { continue }
     let (keyCol, _) = try makeStringKeys(gbRows, distinct: gbDistinct, &g)
     let keyBytes = keyCol.totalBytes + (gbRows + 1) * 4 + gbRows * 8
     sec = "group-by sum over \(gbRows) utf8 keys (\(gbDistinct) distinct)"; print("\n" + sec)
@@ -698,6 +704,14 @@ for gbDistinct in [1_000, 100_000, 10_000_000] where gbDistinct <= gbRows {
     try time("Metal  key mapping only (utf8 -> dense ids)", bytes: keyBytes, section: sec) {
         sink(try GroupByKeys(columns: [.string(keyCol)]).groupCount)
     }
+    // The two utf8 -> dense id strategies side by side: the hash table (shipping, cost scales with the
+    // distinct count) and the argsort of the 64-bit hashes it replaced (cost scales with the row count).
+    try time("Metal  dictionary_encode(utf8), hash table", bytes: keyBytes, section: sec) {
+        sink(try keyCol.dictionaryEncode().unique.length)
+    }
+    try time("Metal  dictionary_encode(utf8), sort path (old)", bytes: keyBytes, section: sec) {
+        sink(try keyCol.dictionaryEncodeSorted().unique.length)
+    }
     time("CPU \(cores)-core hash group-by sum", bytes: keyBytes, section: sec) {
         sink(cpuStringGroupBySum(opaque(keyCol), opaque(gbAmounts)))
     }
@@ -705,6 +719,7 @@ for gbDistinct in [1_000, 100_000, 10_000_000] where gbDistinct <= gbRows {
 }
 
 for gbDistinct in [1_000, 100_000, 10_000_000] where gbDistinct <= gbRows {
+    if let only = benchOnly, !"two int32 columns".contains(only), !"multi-column key fold".contains(only) { continue }
     // Two int32 key columns whose combination has `gbDistinct` distinct values.
     let side = Int32(max(2, Int(Double(gbDistinct).squareRoot().rounded(.up))))
     var ka = [Int32](repeating: 0, count: gbRows), kb = ka
@@ -746,6 +761,42 @@ for gbDistinct in [1_000, 100_000, 10_000_000] where gbDistinct <= gbRows {
             sink(try (try ha.bitwise(.xor, hb)).dictionaryEncode().unique.length)
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// The distinct-value functions over a primitive column (Kernels/HashTable.swift): unique, value_counts,
+// count_distinct, mode and dictionary_encode, at three cardinalities. All five used to argsort every
+// row; the hash table makes them cost what the distinct count costs. `dictionary_encode` on a primitive
+// column has no C entry point, so this is the only place it is measured.
+// ---------------------------------------------------------------------------------------------------
+
+/// All-core CPU count_distinct over an Int64 column: per-core hash sets, merged.
+func cpuCountDistinct(_ a: MetalArray<Int64>) -> Int {
+    let p = a.valuePointer
+    let parts = parallelChunks(a.length) { lo, hi -> Set<Int64> in
+        var s = Set<Int64>(minimumCapacity: 1 << 16)
+        for i in lo..<hi { s.insert(p[i]) }
+        return s
+    }
+    var all = Set<Int64>(minimumCapacity: 1 << 16)
+    for p in parts { all.formUnion(p) }
+    return all.count
+}
+
+for dvDistinct in [1_000, 100_000, 10_000_000] where dvDistinct <= rows {
+    if let only = benchOnly, !"distinct-value ops over \(rows) int64 (\(dvDistinct) distinct)".contains(only) { continue }
+    var raw = [Int64](repeating: 0, count: rows)
+    for i in 0..<rows { raw[i] = Int64.random(in: 0..<Int64(dvDistinct), using: &g) &* 7 }
+    let dvCol = try MetalArray<Int64>(raw)
+    raw = []
+    let dvBytes = rows * 8
+    sec = "distinct-value ops over \(rows) int64 (\(dvDistinct) distinct)"; print("\n" + sec)
+    try time("Metal  unique", bytes: dvBytes, section: sec) { sink(try dvCol.unique().length) }
+    try time("Metal  value_counts", bytes: dvBytes, section: sec) { sink(try dvCol.valueCounts().counts.length) }
+    try time("Metal  count_distinct", bytes: dvBytes, section: sec) { sink(try dvCol.countDistinct()) }
+    try time("Metal  mode", bytes: dvBytes, section: sec) { sink(try dvCol.mode()?.count ?? 0) }
+    try time("Metal  dictionary_encode", bytes: dvBytes, section: sec) { sink(try dvCol.dictionaryEncode().unique.length) }
+    time("CPU \(cores)-core hash count_distinct", bytes: dvBytes, section: sec) { sink(cpuCountDistinct(opaque(dvCol))) }
 }
 
 // Markdown table for the README.

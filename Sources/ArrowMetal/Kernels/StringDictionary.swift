@@ -98,7 +98,18 @@ extension MetalStringArray {
     /// existing string gather. The codes are then relabelled into first-seen order — two argsorts over
     /// the dictionary, which is small — so the result is identical to the host implementation rather
     /// than a relabelling of it.
+    ///
+    /// Since round 8 the work is done by the hash table in `Kernels/StringHashTable.swift`, which costs
+    /// what the *distinct* count costs instead of what the row count costs; this sort path stays as the
+    /// reference the tests compare against and as the fallback when the table is not worth building.
+    /// Both produce the same codes and the same first-seen dictionary.
     public func dictionaryEncodeGPU() throws -> (codes: MetalArray<Int32>, unique: MetalStringArray) {
+        if Self.prefersHashTable(rows: length) { return try dictionaryEncodeHashTable() }
+        return try dictionaryEncodeSorted()
+    }
+
+    /// `dictionary_encode` by argsorting a 64-bit hash of every row: the original GPU path.
+    public func dictionaryEncodeSorted() throws -> (codes: MetalArray<Int32>, unique: MetalStringArray) {
         let n = length
         guard n - nullCount > 0 else {
             // Empty, or every row null: every code is null and there are no uniques.

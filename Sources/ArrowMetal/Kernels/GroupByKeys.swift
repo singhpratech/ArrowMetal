@@ -21,11 +21,16 @@ import Metal
 /// for real key columns (categories, ids, dates, dictionary codes) and it is roughly **20x** faster than
 /// the sort at 50 million rows and a thousand distinct keys.
 ///
+/// **The hash-table path**, for utf8 and binary columns: `Kernels/StringHashTable.swift` hashes every
+/// row to 64 bits, inserts it into an open-addressing table in device memory (equality decided by
+/// comparing the bytes, so a hash collision can never merge two strings), ranks the occupied slots and
+/// relabels them into first-seen order. Its cost scales with the *distinct* count rather than the row
+/// count — 20 ms at 50 million rows and a thousand keys, where the sort it replaced took 200 ms.
+///
 /// **The sort path**, for everything else: `dictionaryEncode()` — normalise floats, argsort, mark run
 /// boundaries by comparing adjacent sorted values, prefix-scan the marks into ranks, scatter the ranks
 /// back to the rows. That is four GPU passes and one radix sort, and it is the same code `unique()` and
-/// `value_counts()` run on. Utf8 and binary columns use the GPU string dictionary (64-bit hash, argsort,
-/// byte-comparison run marks) instead. Floats, decimals and wide-range integers land here.
+/// `value_counts()` run on. Floats, decimals and wide-range integers land here.
 ///
 /// Several columns are folded **pairwise**: dense ids `a` (cardinality `Ka`) and `b` (cardinality `Kb`)
 /// combine into the int64 key `a * Kb + b`, which is injective, and that key is re-encoded to squeeze it
@@ -165,7 +170,9 @@ public final class GroupByKeys {
         case .float64(let a): return try encode(a, ctx)
         case .boolean(let a): return try encode(try a.toUInt8Array(), ctx)
         case .string(let a), .binary(let a):
-            let (codes, unique) = try a.dictionaryEncodeGPU()
+            // The hash table writes the null group's id itself, so there is no `densify` pass here.
+            if MetalStringArray.prefersHashTable(rows: a.length) { return try a.hashTableDenseIds() }
+            let (codes, unique) = try a.dictionaryEncodeSorted()
             return try densify(codes, uniqueCount: unique.length, nullCount: a.nullCount, ctx)
         case .temporal(let t):
             switch t.storage {

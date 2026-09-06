@@ -249,8 +249,16 @@ extension MetalArray {
         }
     }
 
-    /// Arrow `count_distinct` over the non-null values (`mode = "only_valid"`). GPU, through `unique()`.
-    public func countDistinct() throws -> Int { try unique().length }
+    /// Arrow `count_distinct` over the non-null values (`mode = "only_valid"`).
+    ///
+    /// Above `1 << 16` rows this is the GPU hash table's occupied-slot count (`Kernels/HashTable.swift`)
+    /// — the distinct values are never gathered and never ordered, because a count does not need them.
+    /// Smaller inputs go through `unique()`.
+    public func countDistinct() throws -> Int {
+        guard Self.prefersHashTable(rows: length) else { return try unique().length }
+        guard let (groups, _) = try hashGroups() else { return 0 }
+        return groups.groupCount
+    }
 
     // MARK: - first / last / index
 

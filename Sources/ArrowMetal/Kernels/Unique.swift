@@ -39,7 +39,12 @@ extension MetalArray {
     ///
     /// GPU: normalise (floats only), argsort, mark run boundaries, compact the marks with `filter`,
     /// gather with `take`.
+    ///
+    /// Above `1 << 16` rows the distinct values come from the GPU hash table in `Kernels/HashTable.swift`
+    /// instead, which costs what the *distinct* count costs rather than what the row count costs; only
+    /// the `K` distinct values are sorted, so the order and the representatives are unchanged.
     public func unique() throws -> MetalArray<T> {
+        if Self.prefersHashTable(rows: length), let d = try hashDistinct() { return d.values }
         guard let runs = try sortedRuns() else { return try MetalArray<T>([T](), context: context) }
         let (firstIdx, _) = try runStarts(runs)
         return try gatherUnique(firstIdx)
@@ -47,7 +52,13 @@ extension MetalArray {
 
     /// Arrow `value_counts`: the distinct non-null values (ascending, as `unique`) and how many rows
     /// carry each of them. Counts are the differences between adjacent run starts in the sorted order.
+    ///
+    /// Above `1 << 16` rows this runs on the hash table (`Kernels/HashTable.swift`): the counts are then
+    /// a dense-key group-by over the codes rather than the gaps between run starts.
     public func valueCounts() throws -> (values: MetalArray<T>, counts: MetalArray<Int64>) {
+        if Self.prefersHashTable(rows: length), let d = try hashDistinct() {
+            return (d.values, try hashCounts(d))
+        }
         guard let runs = try sortedRuns() else {
             return (try MetalArray<T>([T](), context: context), try MetalArray<Int64>([Int64](), context: context))
         }
@@ -63,9 +74,15 @@ extension MetalArray {
     /// codes are exactly the dense keys `GroupBy` wants. The rank of each sorted position is the
     /// exclusive prefix sum of the run-start marks, scanned on the GPU and scattered back to the
     /// original rows.
+    ///
+    /// Above `1 << 16` rows the codes come from the hash table (`Kernels/HashTable.swift`) rather than a
+    /// sort of every row; they index the same ascending dictionary either way.
     public func dictionaryEncode() throws -> (codes: MetalArray<Int32>, unique: MetalArray<T>) {
         let ctx = context
         let n = length
+        if Self.prefersHashTable(rows: n), let d = try hashDistinct() {
+            return (try hashCodes(d), d.values)
+        }
         guard let runs = try sortedRuns() else {
             // Empty, or every row null: every code is null.
             let buf = try MetalArrowBuffer.allocate(byteCount: n * 4, context: ctx)
