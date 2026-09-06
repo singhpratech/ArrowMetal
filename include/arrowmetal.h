@@ -1074,6 +1074,69 @@ int  am_cumulative_checked(am_array* a, int op, int64_t p1, am_array** out);
 int  am_math_extra(am_array* a, int op, am_array* b /* or NULL */, const void* scalar /* or NULL */,
                    int64_t p1, am_array** out);
 
+// ---------------------------------------------------------------------------------------------------
+// The byte-indexed half of Arrow's string surface (Kernels/StringBytes.swift). Arrow spells the same
+// shape twice: utf8_* counts code points, ascii_* and binary_* count bytes, and these are the byte
+// forms. A `binary` input comes back `binary`, a `utf8` input `utf8`, except for the two ops Arrow
+// itself types as `binary`.
+//
+//  op  name                p1      p2     p3    arg1  result
+//  --  ------------------  ------  -----  ----  ----  --------------------------------------------
+//   0  binary_slice        start   stop   step  -     binary; Python's slice rules over BYTES
+//   1  utf8_slice_codeunits start  stop   step  -     the same over CODE POINTS
+//   2  binary_reverse      -       -      -     -     binary; the bytes reversed
+//   3  ascii_reverse       -       -      -     -     the same, refused on non-ASCII input
+//   4  ascii_lpad          width   -      -     pad   pads to `width` BYTES
+//   5  ascii_rpad          width   -      -     pad   "
+//   6  ascii_center        width   -      -     pad   ", the odd pad byte on the right
+//
+// `flags` bit 0 says a `stop` was given. Without it the slice runs to the end for a positive step and
+// to the beginning for a negative one, which is what Arrow's SliceOptions sentinel bounds mean --
+// pyarrow 25 overflows on that combination for binary_slice and returns garbage; this does not.
+int  am_byte_transform(am_array* a, int op, int64_t p1, int64_t p2, int64_t p3, int flags,
+                       const uint8_t* arg1, int64_t len1, am_array** out);
+
+// ---------------------------------------------------------------------------------------------------
+// Arrow's four splitting functions, as a list<utf8> column (Kernels/StringSplit.swift).
+//
+//  op  name                     separator                        where
+//  --  -----------------------  -------------------------------  ---------------------------------
+//   0  split_pattern            a literal byte string             GPU, three passes and two scans
+//   1  split_pattern_regex      the matches of a regex            CPU (ICU), sharded
+//   2  ascii_split_whitespace   a run of space / \t-\r            GPU
+//   3  utf8_split_whitespace    a run of Unicode whitespace       GPU
+//
+// Every separator makes a boundary, so a leading or trailing separator leaves an empty end piece and
+// the empty string splits to one empty piece -- Arrow's behaviour. max_splits < 0 means every
+// separator; otherwise the first max_splits are used, or the last max_splits when `flags` bit 0
+// (reverse) is set. Bit 1 requests case-insensitive matching, which only op 1 honours; op 1 refuses
+// reverse, as Arrow does. `part` selects the result: 0 the list column, 1 the int32 row offsets,
+// 2 the flat utf8 pieces -- the last two share the list's buffers with no copy.
+int  am_split(am_array* a, int op, const uint8_t* pattern, int64_t plen,
+              int64_t max_splits, int flags, int part, am_array** out);
+
+// ---------------------------------------------------------------------------------------------------
+// Arrow binary_join_element_wise over N columns and one scalar separator, GPU, as a left fold of a
+// two-column join step. null_handling: 0 emit_null (a null anywhere makes the row null), 1 skip (a
+// null column contributes nothing, not even its separator), 2 replace (a null column contributes
+// `repl`).
+//
+// Difference from pyarrow 25.0.1: under `skip`, a row whose columns are ALL null joins to the empty
+// string here. pyarrow drops that row from its output entirely -- its result is shorter than its
+// input -- which is a bug in Arrow's offset bookkeeping, not a semantic this reproduces.
+int  am_join_element_wise(am_array* const* handles, int64_t count,
+                          const uint8_t* sep, int64_t sep_len, int null_handling,
+                          const uint8_t* repl, int64_t repl_len, am_array** out);
+
+// ---------------------------------------------------------------------------------------------------
+// extract_regex (span == 0) and extract_regex_span (span == 1) in Arrow's own shape: a struct column
+// with one field per named capture group -- utf8 for the first, fixed_size_list<int32>[2] holding the
+// group's (start, length) in bytes for the second. A row that does not match and a null row are both
+// a null struct. `flags` bit 0 requests case-insensitive matching. Named groups are spelled ICU's
+// way, (?<name>...); the Python wrapper rewrites RE2's (?P<name>...).
+int  am_extract_struct(am_array* a, const uint8_t* pattern, int64_t plen, int flags, int span,
+                       am_array** out);
+
 #ifdef __cplusplus
 }
 #endif

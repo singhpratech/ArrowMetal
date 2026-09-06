@@ -16,9 +16,9 @@ import Metal
 /// classified identically by the byte rules and by the Unicode tables, so the host only revisits the
 /// rows that second bitmap marks — an all-ASCII column never touches the CPU at all.
 ///
-/// The transforms split **per array**: `utf8_capitalize` and `utf8_title` run the byte kernel when the
-/// whole column is ASCII and the CPU otherwise, because an output length that depends on a Unicode
-/// table cannot be computed in the GPU length pass.
+/// The case transforms and the `utf8_trim*` family split **per row** as well, in
+/// `Kernels/StringUnicode.swift`: an exact GPU table covers every code point at or below U+017F, and
+/// the length kernel declines any row above it so the host can redo just those.
 ///
 /// ## Documented differences from pyarrow
 ///
@@ -41,8 +41,8 @@ import Metal
 ///   categories, with U+0020 (the space) added back. The empty string is printable; every other
 ///   predicate here is false on it.
 ///
-/// Case *mapping* (`utf8_capitalize`, `utf8_title`) uses Unicode's **simple** 1:1 mappings, as
-/// utf8proc does, reconstructed from Swift's full mappings: a full mapping of exactly one scalar is
+/// Case *mapping* (`utf8_upper`, `utf8_lower`, `utf8_swapcase`, `utf8_capitalize`, `utf8_title`) uses
+/// Unicode's **simple** 1:1 mappings, as utf8proc does, reconstructed from Swift's full mappings: a full mapping of exactly one scalar is
 /// the simple mapping, a longer one leaves the code point alone, and U+00DF (ß → ẞ), U+0130 (İ → i)
 /// and the Greek iota-subscript blocks U+1F80–U+1F87 / U+1F90–U+1F97 / U+1FA0–U+1FA7 (which map +8)
 /// are the exceptions where the two disagree. Everything else that Swift would expand to several
@@ -546,7 +546,9 @@ extension MetalStringArray {
         }
         let re = try Self.compileRegex(pattern, ignoreCase: ignoreCase)
         let n = length
-        let candidates = try regexCandidates(pattern, ignoreCase: ignoreCase)
+        let mask = try regexPrefilter(pattern, ignoreCase: ignoreCase)
+        let candidates = mask?.bitsPointer
+        defer { withExtendedLifetime(mask) {} }
         var result: [String: RegexSpan] = [:]
         for name in names {
             var starts = [Int32?](repeating: nil, count: n)
@@ -554,7 +556,7 @@ extension MetalStringArray {
             starts.withUnsafeMutableBufferPointer { sb in
                 lengths.withUnsafeMutableBufferPointer { lb in
                     forEachRowConcurrently { i, s in
-                        if let candidates, !candidates[i] { return }
+                        if let candidates, !Bitmap.isSet(candidates, i) { return }
                         guard let s, let m = re.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) else { return }
                         let r = m.range(withName: name)
                         guard r.location != NSNotFound, let rr = Range(r, in: s) else { return }

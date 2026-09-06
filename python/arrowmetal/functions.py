@@ -38,8 +38,8 @@ import math
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from . import (ArrowMetalError, MetalArray, case_when, choose, group_by, lexsort_indices,
-               make_struct, pivot_wider, random)
+from . import (ArrowMetalError, MetalArray, binary_join_element_wise, case_when, choose, group_by,
+               lexsort_indices, make_struct, pivot_wider, random)
 
 GPU = "gpu"
 CPU = "cpu"
@@ -106,14 +106,15 @@ def _b(method, **defaults):
     return run
 
 
-def _split(method, *positional):
-    """A splitting call. ArrowMetal returns `(offsets, values)`; Arrow returns a list column, so the
-    two are stitched back together here, nulls included."""
+def _split(method, *positional, **defaults):
+    """A splitting call. ArrowMetal now returns a `list<utf8>` column, exactly as Arrow does, so the
+    two answers compare directly. `positional` names the options that go in by position (the
+    pattern); everything else — `max_splits`, `reverse`, `ignore_case` — goes in by keyword."""
     def run(args, options):
-        offsets, values = getattr(_a(args[0]), method)(*[options[p] for p in positional])
-        mask = pc.is_null(args[0]) if isinstance(args[0], pa.Array) else None
-        return pa.ListArray.from_arrays(pa.array(offsets.to_arrow().to_pylist(), type=pa.int32()),
-                                        values.to_arrow(), mask=mask)
+        pos = [options[p] for p in positional]
+        kwargs = dict(defaults)
+        kwargs.update({k: v for k, v in options.items() if k not in positional})
+        return _out(getattr(_a(args[0]), method)(*pos, **kwargs))
     return run
 
 
@@ -360,11 +361,6 @@ def _oracle_keyword(fn, **extra):
     return run
 
 
-def _oracle_extract_regex(args, options):
-    """ArrowMetal takes ICU's `(?<name>...)`; pyarrow takes RE2's `(?P<name>...)`."""
-    return pc.extract_regex(args[0], options["pattern"].replace("(?<", "(?P<"))
-
-
 def _oracle_select_property(args, options):
     """`select_k_unstable` and friends are explicitly *unstable*: two implementations may pick
     different rows out of a tie. The test checks the selected values instead of the row numbers."""
@@ -387,23 +383,6 @@ def _call_case_when(args, options):
 
 def _call_choose(args, options):
     return _out(choose(args[0], args[1]))
-
-
-def _call_extract_regex_span(args, options):
-    """ArrowMetal returns `{group: (start, length)}`; Arrow returns a struct of `[start, length]`
-    pairs. Reshaped here into Arrow's row-wise form so the two can be compared directly."""
-    spans = _a(args[0]).extract_regex_span(options["pattern"])
-    columns = {name: (s.to_arrow().to_pylist(), n.to_arrow().to_pylist()) for name, (s, n) in spans.items()}
-    rows = []
-    for i in range(len(args[0])):
-        row = {name: None if s[i] is None else [s[i], n[i]] for name, (s, n) in columns.items()}
-        rows.append(None if all(v is None for v in row.values()) else row)
-    return rows
-
-
-def _oracle_extract_regex_span(args, options):
-    """pyarrow spells the named groups RE2's way; the span shape is the same otherwise."""
-    return pc.extract_regex_span(args[0], options["pattern"].replace("(?<", "(?P<")).to_pylist()
 
 
 def _oracle_month_interval(args, options):
@@ -779,39 +758,40 @@ _ROWS = [
      "Every byte < 0x80. The empty string is true.", _u("string_is_ascii"), ((_STR_UNI,), {})),
     # The ten `utf8_is_*` predicates split per row: one GPU pass answers every row and, in a second
     # bitmap, reports which rows carry a byte >= 0x80; only those rows are re-decided on the host with
-    # Swift's `Unicode.Scalar.Properties`. An all-ASCII column therefore never leaves the device, and a
-    # column with any non-ASCII content is a mixed GPU/CPU evaluation — which is what `partial` records
-    # here. The answers agree with pyarrow's utf8proc classification (see `UnicodeClass` for the three
-    # rules that had to be reconstructed: cased, whitespace, printable).
-    ("utf8_is_alnum", "StringPredicates", PARTIAL, "Kernels/StringExtra.swift", "utf8_is_alnum()",
+    # Swift's `Unicode.Scalar.Properties`. An all-ASCII column therefore never leaves the device.
+    # Every option Arrow defines is implemented (there are none), so these are `gpu` with the split
+    # stated in the note. The answers agree with pyarrow's utf8proc classification (see `UnicodeClass`
+    # for the three rules that had to be reconstructed: cased, whitespace, printable).
+    ("utf8_is_alnum", "StringPredicates", GPU, "Kernels/StringExtra.swift", "utf8_is_alnum()",
      "Non-empty and every code point a letter or a number. GPU for the rows whose bytes are all "
-     "< 0x80; rows with a byte >= 0x80 are re-decided on the host, sharded over 4096-row chunks.",
+     "< 0x80; the rows with a byte >= 0x80 are re-decided on the host, sharded over 4096-row chunks, "
+     "so an ASCII-only column never leaves the device.",
      _u("utf8_is_alnum"), ((_STR_UNI,), {})),
-    ("utf8_is_alpha", "StringPredicates", PARTIAL, "Kernels/StringExtra.swift", "utf8_is_alpha()",
-     "Non-empty and every code point in an L* category. Same GPU/host split as `utf8_is_alnum`.",
+    ("utf8_is_alpha", "StringPredicates", GPU, "Kernels/StringExtra.swift", "utf8_is_alpha()",
+     "Non-empty and every code point in an L* category. Same per-row GPU/host split as `utf8_is_alnum`.",
      _u("utf8_is_alpha"), ((_STR_UNI,), {})),
-    ("utf8_is_decimal", "StringPredicates", PARTIAL, "Kernels/StringExtra.swift", "utf8_is_decimal()",
+    ("utf8_is_decimal", "StringPredicates", GPU, "Kernels/StringExtra.swift", "utf8_is_decimal()",
      "Non-empty and every code point category Nd. Same GPU/host split.",
      _u("utf8_is_decimal"), ((_STR_UNI,), {})),
-    ("utf8_is_digit", "StringPredicates", PARTIAL, "Kernels/StringExtra.swift", "utf8_is_digit()",
+    ("utf8_is_digit", "StringPredicates", GPU, "Kernels/StringExtra.swift", "utf8_is_digit()",
      "Non-empty and every code point category Nd or No. Same GPU/host split.",
      _u("utf8_is_digit"), ((_STR_UNI,), {})),
-    ("utf8_is_lower", "StringPredicates", PARTIAL, "Kernels/StringExtra.swift", "utf8_is_lower()",
+    ("utf8_is_lower", "StringPredicates", GPU, "Kernels/StringExtra.swift", "utf8_is_lower()",
      "At least one cased code point and no upper-case one. Same GPU/host split.",
      _u("utf8_is_lower"), ((_STR_UNI,), {})),
-    ("utf8_is_numeric", "StringPredicates", PARTIAL, "Kernels/StringExtra.swift", "utf8_is_numeric()",
+    ("utf8_is_numeric", "StringPredicates", GPU, "Kernels/StringExtra.swift", "utf8_is_numeric()",
      "Non-empty and every code point category Nd, Nl or No. Same GPU/host split.",
      _u("utf8_is_numeric"), ((_STR_UNI,), {})),
-    ("utf8_is_printable", "StringPredicates", PARTIAL, "Kernels/StringExtra.swift", "utf8_is_printable()",
+    ("utf8_is_printable", "StringPredicates", GPU, "Kernels/StringExtra.swift", "utf8_is_printable()",
      "No Cc/Cf/Cs/Co/Cn/Zs/Zl/Zp code point, except U+0020; the empty string is true. Same GPU/host "
      "split.", _u("utf8_is_printable"), ((_STR_UNI,), {})),
-    ("utf8_is_space", "StringPredicates", PARTIAL, "Kernels/StringExtra.swift", "utf8_is_space()",
+    ("utf8_is_space", "StringPredicates", GPU, "Kernels/StringExtra.swift", "utf8_is_space()",
      "Non-empty and every code point Unicode whitespace (U+200B deliberately is not). Same GPU/host "
      "split.", _u("utf8_is_space"), ((_STR_UNI,), {})),
-    ("utf8_is_title", "StringPredicates", PARTIAL, "Kernels/StringExtra.swift", "utf8_is_title()",
+    ("utf8_is_title", "StringPredicates", GPU, "Kernels/StringExtra.swift", "utf8_is_title()",
      "At least one cased code point, in title case. Same GPU/host split.",
      _u("utf8_is_title"), ((_STR_UNI,), {})),
-    ("utf8_is_upper", "StringPredicates", PARTIAL, "Kernels/StringExtra.swift", "utf8_is_upper()",
+    ("utf8_is_upper", "StringPredicates", GPU, "Kernels/StringExtra.swift", "utf8_is_upper()",
      "At least one cased code point and no lower-case one. Same GPU/host split.",
      _u("utf8_is_upper"), ((_STR_UNI,), {})),
 
@@ -825,31 +805,29 @@ _ROWS = [
      "Byte-wise `a`-`z` to `A`-`Z`.", _u("ascii_upper"), ((_STR,), {})),
     ("ascii_swapcase", "StringTransforms", GPU, "Kernels/StringTransforms.swift", "swapcase()",
      "Byte-wise ASCII case flip.", _u("ascii_swapcase"), ((_STR,), {})),
-    ("ascii_reverse", "StringTransforms", PARTIAL, "Kernels/StringTransforms.swift", "str_reverse()",
-     "Reverses **code points**, not bytes. Identical to Arrow for ASCII input — which is what "
-     "`ascii_reverse` is defined on — but Arrow's byte reversal of non-ASCII input (which produces "
-     "invalid UTF-8) is not reproduced.", _u("str_reverse"), ((_STR,), {})),
+    ("ascii_reverse", "StringTransforms", GPU, "Kernels/StringBytes.swift", "ascii_reverse()",
+     "Reverses the **bytes**, which on ASCII input is what `ascii_reverse` means. Non-ASCII input is "
+     "refused with `non-ASCII sequence in input`, exactly as pyarrow refuses it rather than emitting "
+     "invalid UTF-8.", _u("ascii_reverse"), ((_STR,), {})),
     ("utf8_reverse", "StringTransforms", GPU, "Kernels/StringTransforms.swift", "str_reverse()",
      "Reverses code points, walking the UTF-8 lead bytes.", _u("str_reverse"), ((_STR,), {})),
-    ("binary_reverse", "StringTransforms", PARTIAL, "Kernels/StringTransforms.swift", "str_reverse()",
-     "Same kernel as `utf8_reverse`, so it reverses code points rather than bytes; equal to Arrow only "
-     "for single-byte content, which is what the check below feeds it. A `binary` column is refused, "
-     "so the input has to be utf8.",
-     _u("str_reverse"), ((_STR,), {}),
-     lambda args, options: pc.binary_reverse(args[0].cast(pa.binary())).cast(pa.string())),
-    ("binary_length", "StringTransforms", PARTIAL, "Sources/ArrowMetal/MetalStringArray.swift", "byte_length()",
-     "The offsets difference; no data read at all. Takes a **utf8** column only — a `binary` column "
-     "is refused, where Arrow's `binary_length` accepts both. The same holds for `binary_repeat` and "
-     "`binary_reverse`; `is_in` / `index_in` / `take` / `filter` / `binary_replace_slice` do accept "
-     "binary.", _u("byte_length"), ((_STR,), {})),
+    ("binary_reverse", "StringTransforms", GPU, "Kernels/StringBytes.swift", "binary_reverse()",
+     "Reverses the **bytes** always, so non-ASCII utf8 content comes back as the invalid UTF-8 Arrow "
+     "produces — which is why the result is typed `binary`. Accepts `binary` and `large_binary` as "
+     "well as `utf8`.",
+     lambda args, options: _out(_a(args[0]).binary_reverse()), ((_BIN,), {}),
+     lambda args, options: pc.binary_reverse(args[0])),
+    ("binary_length", "StringTransforms", GPU, "Sources/ArrowMetal/MetalStringArray.swift", "byte_length()",
+     "The offsets difference; no data read at all. Takes `binary` / `large_binary` as well as `utf8`, "
+     "as Arrow's does.", _u("byte_length"), ((_BIN,), {})),
     ("utf8_length", "StringTransforms", GPU, "Sources/ArrowMetal/MetalStringArray.swift", "char_length()",
      "Counts non-continuation bytes.", _u("char_length"), ((_STR,), {})),
     ("binary_repeat", "StringTransforms", PARTIAL, "Kernels/StringTransforms.swift", "repeat(n)",
-     "Two-pass on the GPU: a length kernel, a scan into offsets, a byte kernel. Two limits: `n` is "
-     "one scalar for the whole column, where Arrow also takes a per-row `num_repeats` array; and the "
-     "input must be utf8, not `binary`.",
+     "Two-pass on the GPU: a length kernel, a scan into offsets, a byte kernel. `binary` and "
+     "`large_binary` are accepted alongside `utf8`. One limit remains: `n` is one scalar for the whole "
+     "column, where Arrow also takes a per-row `num_repeats` array.",
      lambda args, options: _out(_a(args[0]).repeat(options["num_repeats"])),
-     ((_STR,), {"num_repeats": 3}), _oracle_positional("binary_repeat", "num_repeats")),
+     ((_BIN,), {"num_repeats": 3}), _oracle_positional("binary_repeat", "num_repeats")),
     ("replace_substring", "StringTransforms", GPU, "Kernels/StringTransforms.swift",
      "replace(pattern, replacement, max_replacements)",
      "Literal replacement on the GPU, two-pass.",
@@ -858,33 +836,37 @@ _ROWS = [
      ((_STR,), {"pattern": "l", "replacement": "L"})),
     ("replace_substring_regex", "StringTransforms", CPU, "Kernels/Regex.swift",
      "replace_substring_regex(pattern, replacement)",
-     "The regex engine is a backtracker on the host; a literal pattern is routed to the GPU kernel instead.",
+     "The regex engine is a backtracker on the host; a literal pattern is routed to the GPU kernel "
+     "instead, and a pattern with a literal core gets the GPU pre-filter — a row that cannot match "
+     "comes back unchanged without reaching ICU.",
      lambda args, options: _out(_a(args[0]).replace_substring_regex(options["pattern"], options["replacement"])),
      ((_STR,), {"pattern": "l+", "replacement": "L"})),
-    ("utf8_lower", "StringTransforms", PARTIAL, "Kernels/StringTransforms.swift", "lower()",
-     "Simple 1:1 case mapping over Basic Latin, Latin-1 Supplement and Latin Extended-A. Everything "
-     "above U+017F passes through unchanged; there is no Unicode case table on the GPU.",
-     _u("lower"), ((_STR,), {})),
-    ("utf8_upper", "StringTransforms", PARTIAL, "Kernels/StringTransforms.swift", "upper()",
-     "Same coverage as `utf8_lower`. U+00DF, whose full uppercase is `SS`, passes through unchanged.",
-     _u("upper"), ((_STR,), {})),
-    ("utf8_swapcase", "StringTransforms", PARTIAL, "Kernels/StringExtra.swift", "utf8_swapcase()",
-     "Same coverage as `utf8_upper` / `utf8_lower`: Basic Latin, Latin-1 Supplement and Latin "
-     "Extended-A, including the length-changing pairs. U+00DF (which Arrow swaps to U+1E9E) and every "
-     "code point above U+017F pass through unchanged rather than being mangled.",
-     _u("utf8_swapcase"), ((_STR,), {})),
+    ("utf8_lower", "StringTransforms", GPU, "Kernels/StringUnicode.swift", "lower()",
+     "Unicode's **simple** (1:1) lower-case mapping over every script, split per row: the GPU table is "
+     "exact over U+0000-U+017F and any row above that block is mapped on the host, sharded over "
+     "4096-row chunks — non-Latin rows on the CPU. `İ` lower-cases to `i` alone and `Σ` to `σ` in "
+     "every position, which is what utf8proc (and so Arrow) does.",
+     _u("lower"), ((_STR_UNI,), {})),
+    ("utf8_upper", "StringTransforms", GPU, "Kernels/StringUnicode.swift", "upper()",
+     "The same per-row split going the other way. `ß` upper-cases to `ẞ` and `µ` to `Μ` on the GPU; "
+     "`ﬁ` and `ŉ` pass through, because their *full* mappings are two characters long and the simple "
+     "mapping Arrow uses leaves them alone.",
+     _u("upper"), ((_STR_UNI,), {})),
+    ("utf8_swapcase", "StringTransforms", GPU, "Kernels/StringUnicode.swift", "utf8_swapcase()",
+     "The same per-row split. A **titlecase** letter is both upper and lower case for Arrow and so "
+     "stays put: `ǅ` swaps to `ǅ`, while `Ǆ` swaps to `ǆ` and `ǆ` to `Ǆ`.",
+     _u("utf8_swapcase"), ((_STR_UNI,), {})),
     ("ascii_title", "StringTransforms", GPU, "Kernels/StringExtra.swift", "ascii_title()",
      "Byte-wise: the first ASCII letter of every run of ASCII letters is upper-cased and the rest "
      "lower-cased. Bytes >= 0x80 are copied through and end a word, so `\"ünïcödé\"` becomes "
      "`\"üNïCöDé\"` — exactly what Arrow does.", _u("ascii_title"), ((_STR_UNI,), {})),
-    ("utf8_capitalize", "StringTransforms", PARTIAL, "Kernels/StringExtra.swift", "utf8_capitalize()",
+    ("utf8_capitalize", "StringTransforms", GPU, "Kernels/StringUnicode.swift", "utf8_capitalize()",
      "First code point upper-cased, every later one lower-cased, through Unicode's **simple** 1:1 "
-     "mappings as utf8proc uses. GPU (the `ascii_capitalize` kernel) when the whole column is ASCII "
-     "and host-side otherwise — an output length that depends on a Unicode table cannot be computed "
-     "in the GPU length pass.", _u("utf8_capitalize"), ((_STR_UNI,), {})),
-    ("utf8_title", "StringTransforms", PARTIAL, "Kernels/StringExtra.swift", "utf8_title()",
+     "mappings as utf8proc uses. Same per-row split as `utf8_upper`: non-Latin rows on the CPU.",
+     _u("utf8_capitalize"), ((_STR_UNI,), {})),
+    ("utf8_title", "StringTransforms", GPU, "Kernels/StringUnicode.swift", "utf8_title()",
      "The first cased code point of every word upper-cased and the rest lower-cased, a word being a "
-     "maximal run of cased code points. Same per-column GPU/host split as `utf8_capitalize`.",
+     "maximal run of cased code points. Same per-row GPU/host split: non-Latin rows on the CPU.",
      _u("utf8_title"), ((_STR_UNI,), {})),
     ("utf8_normalize", "StringTransforms", CPU, "Kernels/StringExtra.swift", "utf8_normalize(form)",
      "NFC / NFKC / NFD / NFKD through Foundation, on the host: a full Unicode normalisation table in "
@@ -914,33 +896,35 @@ _ROWS = [
                                                    options["stop"], options["replacement"])),
 
     # ---- String padding ----------------------------------------------------
-    ("ascii_lpad", "StringPadding", GPU, "Kernels/StringTransforms.swift", "pad_left(width, pad)",
-     "`width` counts code points and `pad` must be one character; a string already at or over `width` "
-     "is returned unchanged.",
-     lambda args, options: _out(_a(args[0]).pad_left(options["width"], options.get("padding", " "))),
-     ((_STR,), {"width": 8})),
-    ("ascii_rpad", "StringPadding", GPU, "Kernels/StringTransforms.swift", "pad_right(width, pad)",
-     "Mirror of `ascii_lpad`.",
-     lambda args, options: _out(_a(args[0]).pad_right(options["width"], options.get("padding", " "))),
-     ((_STR,), {"width": 8})),
+    ("ascii_lpad", "StringPadding", GPU, "Kernels/StringBytes.swift", "ascii_lpad(width, padding)",
+     "`width` counts **bytes**, which is the whole difference between `ascii_lpad` and `utf8_lpad`: "
+     "`\"héllo\"` is six bytes but five code points, so the ASCII form pads it twice to width 8 and "
+     "the utf8 form three times. `pad` must be one byte; a value already at or over `width` is "
+     "returned unchanged.",
+     lambda args, options: _out(_a(args[0]).ascii_lpad(options["width"], options.get("padding", " "))),
+     ((_STR_UNI,), {"width": 8})),
+    ("ascii_rpad", "StringPadding", GPU, "Kernels/StringBytes.swift", "ascii_rpad(width, padding)",
+     "Mirror of `ascii_lpad`, counting bytes.",
+     lambda args, options: _out(_a(args[0]).ascii_rpad(options["width"], options.get("padding", " "))),
+     ((_STR_UNI,), {"width": 8})),
     ("utf8_lpad", "StringPadding", GPU, "Kernels/StringTransforms.swift", "pad_left(width, pad)",
-     "The same kernel: `width` has always counted code points.",
+     "The code point form: `width` counts characters, so an accent costs one, not two.",
      lambda args, options: _out(_a(args[0]).pad_left(options["width"], options.get("padding", " "))),
-     ((_STR,), {"width": 8})),
+     ((_STR_UNI,), {"width": 8})),
     ("utf8_rpad", "StringPadding", GPU, "Kernels/StringTransforms.swift", "pad_right(width, pad)",
-     "The same kernel as `ascii_rpad`.",
+     "Mirror of `utf8_lpad`.",
      lambda args, options: _out(_a(args[0]).pad_right(options["width"], options.get("padding", " "))),
-     ((_STR,), {"width": 8})),
+     ((_STR_UNI,), {"width": 8})),
     ("utf8_zero_fill", "StringPadding", GPU, "Kernels/StringExtra.swift", "utf8_zero_fill(width, padding)",
      "Left-pads to `width` code points, inserting the padding after a leading `+` or `-`. The content "
      "need not be numeric.",
      lambda args, options: _out(_a(args[0]).utf8_zero_fill(options["width"], options.get("padding", "0"))),
      ((_STR_NUM,), {"width": 5})),
-    ("ascii_center", "StringPadding", PARTIAL, "Kernels/StringExtra.swift", "utf8_center(width, padding)",
-     "The same kernel as `utf8_center`, so `width` counts **code points** where Arrow's ASCII form "
-     "counts bytes — identical on ASCII input, which is what `ascii_center` is defined on.",
-     lambda args, options: _out(_a(args[0]).utf8_center(options["width"], options.get("padding", " "))),
-     ((_STR,), {"width": 8, "padding": "*"}),
+    ("ascii_center", "StringPadding", GPU, "Kernels/StringBytes.swift", "ascii_center(width, padding)",
+     "Pads on both sides to `width` **bytes**, the odd pad byte on the right — the byte-counting twin "
+     "of `utf8_center`.",
+     lambda args, options: _out(_a(args[0]).ascii_center(options["width"], options.get("padding", " "))),
+     ((_STR_UNI,), {"width": 8, "padding": "*"}),
      lambda args, options: pc.ascii_center(args[0], options["width"], options.get("padding", " "))),
     ("utf8_center", "StringPadding", GPU, "Kernels/StringExtra.swift", "utf8_center(width, padding)",
      "Pads on both sides to `width` code points, the odd pad character going on the **right** (`\"a\"` "
@@ -965,86 +949,122 @@ _ROWS = [
     ("ascii_rtrim", "StringTrimming", GPU, "Kernels/StringTransforms.swift", "rtrim(characters)",
      "Trailing bytes only.",
      lambda args, options: _out(_a(args[0]).rtrim(options["characters"])), ((_STR,), {"characters": "Hlo"})),
-    ("utf8_trim_whitespace", "StringTrimming", PARTIAL, "Kernels/StringExtra.swift", "utf8_trim()",
+    ("utf8_trim_whitespace", "StringTrimming", GPU, "Kernels/StringUnicode.swift", "utf8_trim()",
      "Strips the full **Unicode** whitespace class from both ends (Zs/Zl/Zp plus U+0009-U+000D, "
-     "U+001C-U+001F and U+0085; U+200B deliberately is not whitespace). GPU when the column is all "
-     "ASCII — that set restricted to ASCII is a ten-byte set the existing trim kernel handles — and "
-     "host-side otherwise.", _u("utf8_trim"), ((_STR_UNI,), {})),
-    ("utf8_ltrim_whitespace", "StringTrimming", PARTIAL, "Kernels/StringExtra.swift", "utf8_ltrim()",
-     "Leading-only form of `utf8_trim_whitespace`, with the same GPU/host split.",
+     "U+001C-U+001F and U+0085; U+200B deliberately is not whitespace). Split per row: the GPU takes "
+     "the rows whose bytes are all < 0x80, where that class is a ten-byte set, and the host takes the "
+     "rows with a byte >= 0x80 — non-Latin rows on the CPU.",
+     _u("utf8_trim"), ((_STR_UNI,), {})),
+    ("utf8_ltrim_whitespace", "StringTrimming", GPU, "Kernels/StringUnicode.swift", "utf8_ltrim()",
+     "Leading-only form of `utf8_trim_whitespace`, with the same per-row GPU/host split.",
      _u("utf8_ltrim"), ((_STR_UNI,), {})),
-    ("utf8_rtrim_whitespace", "StringTrimming", PARTIAL, "Kernels/StringExtra.swift", "utf8_rtrim()",
-     "Trailing-only form, with the same GPU/host split.", _u("utf8_rtrim"), ((_STR_UNI,), {})),
-    ("utf8_trim", "StringTrimming", PARTIAL, "Kernels/StringExtra.swift", "utf8_trim(characters)",
-     "Strips leading and trailing **code points** that appear in `characters`. An ASCII set runs on "
-     "the GPU (byte-wise trimming can never split a UTF-8 sequence, since every continuation byte is "
-     ">= 0x80); a set with a non-ASCII character runs on the host.",
+    ("utf8_rtrim_whitespace", "StringTrimming", GPU, "Kernels/StringUnicode.swift", "utf8_rtrim()",
+     "Trailing-only form, with the same per-row split.", _u("utf8_rtrim"), ((_STR_UNI,), {})),
+    ("utf8_trim", "StringTrimming", GPU, "Kernels/StringUnicode.swift", "utf8_trim(characters)",
+     "Strips leading and trailing **code points** that appear in `characters`. An all-ASCII set never "
+     "leaves the GPU at all — byte-wise trimming cannot split a UTF-8 sequence, since every "
+     "continuation byte is >= 0x80. A set with a non-ASCII character splits per row: the GPU trims the "
+     "all-ASCII rows with the set's ASCII part, the host trims the rest.",
      lambda args, options: _out(_a(args[0]).utf8_trim(options["characters"])),
      ((_STR_UNI,), {"characters": "éH  "})),
-    ("utf8_ltrim", "StringTrimming", PARTIAL, "Kernels/StringExtra.swift", "utf8_ltrim(characters)",
-     "Leading-only form of `utf8_trim`, with the same GPU/host split.",
+    ("utf8_ltrim", "StringTrimming", GPU, "Kernels/StringUnicode.swift", "utf8_ltrim(characters)",
+     "Leading-only form of `utf8_trim`, with the same per-row GPU/host split.",
      lambda args, options: _out(_a(args[0]).utf8_ltrim(options["characters"])),
      ((_STR_UNI,), {"characters": "éH  "})),
-    ("utf8_rtrim", "StringTrimming", PARTIAL, "Kernels/StringExtra.swift", "utf8_rtrim(characters)",
-     "Trailing-only form, with the same GPU/host split.",
+    ("utf8_rtrim", "StringTrimming", GPU, "Kernels/StringUnicode.swift", "utf8_rtrim(characters)",
+     "Trailing-only form, with the same per-row split.",
      lambda args, options: _out(_a(args[0]).utf8_rtrim(options["characters"])),
      ((_STR_UNI,), {"characters": "éH  "})),
 
     # ---- String splitting --------------------------------------------------
-    ("ascii_split_whitespace", "StringSplitting", PARTIAL, "Kernels/Regex.swift", "split_whitespace()",
-     "Splits on runs of ASCII whitespace, on the host. Two differences from Arrow: leading and "
-     "trailing whitespace produce no empty piece (Arrow emits one at each end, and one for an empty "
-     "string), and the ArrowMetal call returns `(offsets, values)` rather than a list column — the "
-     "registry stitches those into one. `max_splits` and `reverse` are not implemented.",
-     _split("split_whitespace"), ((_STR_WS,), {})),
-    ("utf8_split_whitespace", "StringSplitting", PARTIAL, "Kernels/Regex.swift", "split_whitespace()",
-     "The same host split, with the same dropped end pieces as `ascii_split_whitespace`, and **ASCII** "
-     "whitespace only rather than the Unicode whitespace class.",
-     _split("split_whitespace"), ((_STR_WS,), {})),
-    ("split_pattern", "StringSplitting", CPU, "Kernels/Regex.swift", "split_pattern(pattern)",
-     "Literal split on the host. `max_splits` and `reverse` are not implemented.",
+    ("ascii_split_whitespace", "StringSplitting", GPU, "Kernels/StringSplit.swift",
+     "split_whitespace(unicode=False, max_splits, reverse)",
+     "Splits at every maximal run of ASCII whitespace (the space and `\\t`-`\\r`), on the GPU: three "
+     "passes and two scans — count the pieces of every row, measure them, copy the bytes — returning a "
+     "real `list<utf8>`. Every separator makes a boundary, so a leading or trailing run leaves an "
+     "empty end piece and the empty string splits to one empty piece, as Arrow's does. `max_splits` "
+     "and `reverse` are implemented; the `(offsets, values)` pair is still available as "
+     "`split_whitespace_pair`.",
+     _split("split_whitespace", unicode=False), ((_STR_WS,), {})),
+    ("utf8_split_whitespace", "StringSplitting", GPU, "Kernels/StringSplit.swift",
+     "split_whitespace(unicode=True, max_splits, reverse)",
+     "The same kernel over the full **Unicode** whitespace class — Zs/Zl/Zp plus U+0009-U+000D, "
+     "U+001C-U+001F and U+0085, and not U+200B — which is small enough to spell out in MSL, so this "
+     "stays on the GPU too. Deliberate difference: with `reverse` and a finite `max_splits`, pyarrow "
+     "25.0.1 fails to merge a multi-byte whitespace character with the whitespace beside it "
+     "(`\" \\u3000x\"` split once in reverse gives it `[\" \", \"x\"]`); the runs here stay maximal in "
+     "both directions.",
+     _split("split_whitespace", unicode=True), ((_STR_WS,), {})),
+    ("split_pattern", "StringSplitting", GPU, "Kernels/StringSplit.swift",
+     "split_pattern(pattern, max_splits, reverse)",
+     "The same three-pass GPU splitter with a literal byte separator, returning a `list<utf8>`. "
+     "`max_splits` and `reverse` are implemented; an empty pattern is refused, as in Arrow.",
      _split("split_pattern", "pattern"), ((_STR,), {"pattern": "l"})),
-    ("split_pattern_regex", "StringSplitting", CPU, "Kernels/Regex.swift", "split_pattern(pattern, regex=True)",
-     "The host backtracking engine. `max_splits` and `reverse` are not implemented.",
-     lambda args, options: _split_regex(args, options), ((_STR,), {"pattern": "l+"})),
+    ("split_pattern_regex", "StringSplitting", CPU, "Kernels/Regex.swift",
+     "split_pattern(pattern, regex=True, max_splits)",
+     "The host backtracking engine, returning the same `list<utf8>`. `max_splits` is implemented; "
+     "`reverse` is refused, exactly as Arrow refuses it (\"cannot split in reverse with regex\").",
+     _split("split_pattern", "pattern", regex=True), ((_STR,), {"pattern": "l+"})),
 
     # ---- String extraction / joining / slicing -----------------------------
-    ("extract_regex", "StringExtraction", CPU, "Kernels/Regex.swift", "extract_regex(pattern)",
-     "Named groups on the host, returned as a struct column. ICU spelling `(?<name>...)`; RE2's "
-     "`(?P<name>...)`, which pyarrow uses, is rewritten by the Python wrapper.",
-     lambda args, options: _extract_regex_struct(args, options),
-     ((pa.array(["a1", "b22", None, "zz"]),), {"pattern": r"(?<letter>[a-z])(?<digits>\d+)"}),
-     _oracle_extract_regex),
-    ("extract_regex_span", "StringExtraction", CPU, "Kernels/StringExtra.swift", "extract_regex_span(pattern)",
-     "One `(start, length)` pair of int32 columns per **named** group, counted in bytes as Arrow's "
-     "are; the registry reshapes them into Arrow's row-wise struct. A row that does not match, a null "
-     "row and a group that took part in no alternative are null in both. Host-side throughout (ICU, "
-     "sharded over 4096-row chunks), and ICU's `(?<name>...)` spelling rather than RE2's `(?P<name>...)`.",
-     _call_extract_regex_span,
-     ((_REGEX_IN,), {"pattern": r"(?<letter>[a-z])(?<digits>\d+)"}), _oracle_extract_regex_span),
+    ("extract_regex", "StringExtraction", CPU, "Kernels/StringStructs.swift", "extract_regex_struct(pattern)",
+     "A **struct column** with one `utf8` field per named capture group, which is Arrow's own shape; "
+     "the dictionary-of-columns form stays available as `extract_regex`. A row that does not match "
+     "and a null row are both a null struct. ICU decides the match on the host, but the GPU literal "
+     "pre-filter keeps the rows that cannot match away from it. RE2's `(?P<name>...)` spelling, which "
+     "pyarrow uses, is rewritten to ICU's `(?<name>...)` by the Python wrapper.",
+     lambda args, options: _out(_a(args[0]).extract_regex_struct(options["pattern"])),
+     ((_REGEX_IN,), {"pattern": r"(?P<letter>[a-z])(?P<digits>\d+)"}),
+     _oracle_positional("extract_regex", "pattern")),
+    ("extract_regex_span", "StringExtraction", CPU, "Kernels/StringStructs.swift",
+     "extract_regex_span_struct(pattern)",
+     "The same struct, each field a `fixed_size_list<int32>[2]` holding that group's `(start, length)` "
+     "in **bytes** — exactly pyarrow's type. A row that does not match and a null row are a null "
+     "struct; a group that took part in no alternative is a null list. Host-side (ICU, sharded over "
+     "4096-row chunks) behind the same GPU pre-filter. The `{group: (start, length)}` dictionary form "
+     "stays available as `extract_regex_span`.",
+     lambda args, options: _out(_a(args[0]).extract_regex_span_struct(options["pattern"])),
+     ((_REGEX_IN,), {"pattern": r"(?P<letter>[a-z])(?P<digits>\d+)"}),
+     _oracle_positional("extract_regex_span", "pattern")),
     ("binary_join", "StringJoining", GPU, "Kernels/StringContainment.swift", "binary_join(separator)",
      "Joins the child strings of every row of a `list<utf8>`, two-pass on the GPU. The separator is a "
      "scalar or a per-row column. An empty row joins to the empty string; a null row, a null element "
      "inside a row and a null separator all give a null output row.",
      lambda args, options: _out(_a(args[0]).binary_join(args[1])), ((_LIST_STR, "-"), {}),
      lambda args, options: pc.binary_join(args[0], args[1])),
-    ("binary_join_element_wise", "StringJoining", PARTIAL, "Kernels/StringTransforms.swift",
-     "str_concat(other, separator)",
-     "Two columns and a scalar separator on the GPU. Arrow's N-column form (the last argument being "
-     "the separator column) and its `null_handling` options are not implemented.",
-     lambda args, options: _out(_a(args[0]).str_concat(_a(args[1]), options.get("separator", ""))),
+    ("binary_join_element_wise", "StringJoining", GPU, "Kernels/StringBytes.swift",
+     "binary_join_element_wise(columns, separator, null_handling, null_replacement)",
+     "N columns and a scalar separator, GPU throughout: a left fold of one two-pass join step, so N "
+     "columns cost N-1 passes and the data never leaves the device. All three of Arrow's "
+     "`null_handling` modes are implemented — `emit_null`, `skip` (a null column contributes nothing, "
+     "not even its separator, which the fold keeps honest by leaving the accumulator null until "
+     "something has actually been joined) and `replace`. Deliberate difference: under `skip`, a row "
+     "whose columns are *all* null joins to the empty string here, where pyarrow 25.0.1 drops the row "
+     "from its output entirely and returns an array shorter than its input.",
+     lambda args, options: _out(binary_join_element_wise(
+         list(args), options.get("separator", ""), options.get("null_handling", "emit_null"),
+         options.get("null_replacement", ""))),
      ((_STR, _STR), {"separator": "-"}),
      lambda args, options: pc.binary_join_element_wise(*args, pa.scalar(options["separator"]))),
-    ("utf8_slice_codeunits", "StringSlicing", GPU, "Kernels/StringTransforms.swift",
-     "slice_codeunits(start, stop)",
-     "Code-point slicing, two-pass on the GPU. A negative `start`/`stop` and Arrow's `step` are not "
-     "implemented.",
-     lambda args, options: _out(_a(args[0]).slice_codeunits(options["start"], options.get("stop"))),
-     ((_STR,), {"start": 1, "stop": 4})),
-    ("binary_slice", "StringSlicing", MISSING, "-", "-",
-     "The one Arrow compute name with no implementation here. The slicing kernel counts code points "
-     "and there is no byte-offset variant of it; `binary_replace_slice` does index in bytes, so the "
-     "machinery exists and this is unclaimed rather than out of scope.", None, None),
+    ("utf8_slice_codeunits", "StringSlicing", GPU, "Kernels/StringBytes.swift",
+     "slice_codeunits(start, stop, step)",
+     "Code-point slicing with Python's slice rules, two-pass on the GPU: a negative index counts from "
+     "the end, both ends clamp, and a negative `step` walks backwards — which the byte kernel does in "
+     "one forward walk by filling the output from its end. The cut always lands on a code point "
+     "boundary.",
+     lambda args, options: _out(_a(args[0]).slice_codeunits(options["start"], options.get("stop"),
+                                                            options.get("step", 1))),
+     ((_STR_UNI,), {"start": 1, "stop": 4})),
+    ("binary_slice", "StringSlicing", GPU, "Kernels/StringBytes.swift", "binary_slice(start, stop, step)",
+     "The same slice indexed in **bytes**, which can split a UTF-8 sequence and is why Arrow types the "
+     "result `binary` and refuses a `string` input. Deliberate difference: Arrow's default `stop` is "
+     "`INT64_MAX`, and with a negative `step` pyarrow 25.0.1 overflows on it and reads out of bounds; "
+     "here an absent `stop` means the beginning of the value, which is what the option intends.",
+     lambda args, options: _out(_a(args[0]).binary_slice(options["start"], options.get("stop"),
+                                                         options.get("step", 1))),
+     ((_BIN,), {"start": 1, "stop": 4}),
+     lambda args, options: pc.binary_slice(args[0], options["start"], options.get("stop"),
+                                           options.get("step", 1))),
 
     # ---- Containment / matching -------------------------------------------
     ("count_substring", "Containment", GPU, "Kernels/StringTransforms.swift", "count_substring(pattern)",
@@ -1063,16 +1083,23 @@ _ROWS = [
      "Byte-wise suffix test.",
      lambda args, options: _out(_a(args[0]).ends_with(options["pattern"])), ((_STR,), {"pattern": "lo"})),
     ("count_substring_regex", "Containment", CPU, "Kernels/Regex.swift", "count_substring_regex(pattern)",
-     "Host engine; a literal pattern routes to the GPU counter instead.",
+     "Host engine; a literal pattern routes to the GPU counter instead, and a pattern with a literal "
+     "core gets the GPU pre-filter — the rows that cannot contain that literal answer 0 without "
+     "reaching ICU.",
      lambda args, options: _out(_a(args[0]).count_substring_regex(options["pattern"])), ((_STR,), {"pattern": "l+"})),
     ("find_substring_regex", "Containment", CPU, "Kernels/Regex.swift", "find_substring_regex(pattern)",
-     "Host engine.",
+     "Host engine, behind the same GPU literal pre-filter; a pre-filtered row answers -1.",
      lambda args, options: _out(_a(args[0]).find_substring_regex(options["pattern"])), ((_STR,), {"pattern": "l+"})),
     ("match_substring_regex", "Containment", CPU, "Kernels/Regex.swift", "match_substring_regex(pattern)",
-     "Host engine; literal and `^literal` patterns route to the GPU kernels.",
+     "Host engine; literal and `^literal` patterns route to the GPU kernels outright, and a pattern "
+     "with a literal core gets the GPU pre-filter described in `Kernels/StringLike.swift`.",
      lambda args, options: _out(_a(args[0]).match_substring_regex(options["pattern"])), ((_STR,), {"pattern": "l+"})),
-    ("match_like", "Containment", CPU, "Kernels/Regex.swift", "match_like(pattern)",
-     "SQL LIKE, translated to the host regex engine; a pattern with no metacharacter routes to the GPU.",
+    ("match_like", "Containment", GPU, "Kernels/StringLike.swift", "match_like(pattern)",
+     "SQL LIKE for **every** case-sensitive pattern on the GPU. A pure prefix / suffix / contains / "
+     "equality pattern takes the byte-wise `startsWith` / `endsWith` / `contains` / `equals` kernel; "
+     "anything else — a `_` anywhere, an interior `%`, any mixture — is compiled into a small byte "
+     "program and matched by one thread per row, where `_` and `%` count code points. Only "
+     "`ignore_case` still goes to ICU on the host.",
      lambda args, options: _out(_a(args[0]).match_like(options["pattern"])), ((_STR,), {"pattern": "%ll%"})),
     ("is_in", "Containment", PARTIAL, "Kernels/StringContainment.swift", "is_in(value_set)",
      "GPU throughout: a sorted set plus a binary search per row for primitive and temporal columns, "
@@ -1595,23 +1622,6 @@ _ROWS = [
      _hashk("tdigest", q="q"), ((_GKEY_STR, _GVAL_INT), {"q": 0.5}),
      _oracle_hashk("tdigest", unwrap=True)),
 ]
-def _extract_regex_struct(args, options):
-    """`extract_regex` hands back one column per named group; Arrow hands back a struct column."""
-    groups = _a(args[0]).extract_regex(options["pattern"])
-    names = list(groups)
-    children = [groups[n].to_arrow() for n in names]
-    valid = [all(c[i].is_valid for c in children) for i in range(len(children[0]))]
-    return pa.StructArray.from_arrays(children, names, mask=pa.array([not v for v in valid]))
-
-
-def _split_regex(args, options):
-    """`split_pattern_regex`: the same stitching as `_split`, with the regex flag set."""
-    offsets, values = _a(args[0]).split_pattern(options["pattern"], regex=True)
-    mask = pc.is_null(args[0]) if isinstance(args[0], pa.Array) else None
-    return pa.ListArray.from_arrays(pa.array(offsets.to_arrow().to_pylist(), type=pa.int32()),
-                                    values.to_arrow(), mask=mask)
-
-
 def _coalesce(*arrays):
     """Local import shim so the table can name `coalesce` without a circular import at module load."""
     from . import coalesce as _c

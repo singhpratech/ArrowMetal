@@ -2655,3 +2655,192 @@ MetalArray.hypot = _hypot
 MetalArray.round_to_multiple = _round_to_multiple
 MetalArray.round_binary = _round_binary
 MetalArray.round = _am_round
+# ---- the byte-indexed string functions, the list-returning splitters, N-column
+# binary_join_element_wise and the struct-returning extract_regex / extract_regex_span.
+# Appended rather than written into the class body so this file stays additive.
+# Op numbering is the C ABI contract; see include/arrowmetal.h.
+_lib.am_byte_transform.argtypes = [_P, ctypes.c_int, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                                   ctypes.c_int, ctypes.c_char_p, ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_byte_transform.restype = ctypes.c_int
+_lib.am_split.argtypes = [_P, ctypes.c_int, ctypes.c_char_p, ctypes.c_int64, ctypes.c_int64,
+                          ctypes.c_int, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_split.restype = ctypes.c_int
+_lib.am_join_element_wise.argtypes = [ctypes.POINTER(_P), ctypes.c_int64, ctypes.c_char_p,
+                                      ctypes.c_int64, ctypes.c_int, ctypes.c_char_p, ctypes.c_int64,
+                                      ctypes.POINTER(_P)]
+_lib.am_join_element_wise.restype = ctypes.c_int
+_lib.am_extract_struct.argtypes = [_P, ctypes.c_char_p, ctypes.c_int64, ctypes.c_int, ctypes.c_int,
+                                   ctypes.POINTER(_P)]
+_lib.am_extract_struct.restype = ctypes.c_int
+
+_BYTE_TRANSFORM = {"binary_slice": 0, "utf8_slice_codeunits": 1, "binary_reverse": 2,
+                   "ascii_reverse": 3, "ascii_lpad": 4, "ascii_rpad": 5, "ascii_center": 6}
+_SPLIT = {"split_pattern": 0, "split_pattern_regex": 1,
+          "ascii_split_whitespace": 2, "utf8_split_whitespace": 3}
+_NULL_HANDLING = {"emit_null": 0, "skip": 1, "replace": 2}
+
+
+def _am_byte_transform(self, op, p1=0, p2=None, p3=1, pad=""):
+    """One byte-indexed transform by name; the table is in include/arrowmetal.h."""
+    a1 = pad.encode("utf-8") if isinstance(pad, str) else bytes(pad)
+    flags = 0 if p2 is None else 1
+    return _call(_lib.am_byte_transform, self._h, _BYTE_TRANSFORM[op], int(p1),
+                 0 if p2 is None else int(p2), int(p3), flags, a1, len(a1))
+
+
+def _binary_slice(self, start=0, stop=None, step=1):
+    """Arrow `binary_slice`: value[start:stop:step] indexed in BYTES, with Python's slice rules.
+
+    A negative index counts from the end, both ends clamp, and a negative step walks backwards.
+    `stop=None` means to the end for a positive step and to the beginning for a negative one. The cut
+    is byte-exact, so the result is `binary` even for a utf8 input, as Arrow's is. Always GPU."""
+    return _am_byte_transform(self, "binary_slice", start, stop, step)
+
+
+def _slice_codeunits_step(self, start=0, stop=None, step=1):
+    """Arrow `utf8_slice_codeunits`: the same slice counted in CODE POINTS, so a multi-byte character
+    is never split. `step=-1` reverses. Always GPU."""
+    if step == 1:
+        return _am_string_slice_codeunits(self, start, stop)
+    return _am_byte_transform(self, "utf8_slice_codeunits", start, stop, step)
+
+
+def _binary_reverse(self):
+    """Arrow `binary_reverse`: the BYTES of every value reversed. On non-ASCII utf8 content that is
+    invalid UTF-8 -- exactly what Arrow produces -- so the result is `binary`."""
+    return _am_byte_transform(self, "binary_reverse")
+
+
+def _ascii_reverse(self):
+    """Arrow `ascii_reverse`: the same byte reversal, refused on non-ASCII input as pyarrow refuses
+    it. On ASCII input this equals `str_reverse()` and the result stays utf8."""
+    return _am_byte_transform(self, "ascii_reverse")
+
+
+def _ascii_lpad(self, width, padding=" "):
+    """Arrow `ascii_lpad`: left-pads to `width` BYTES. That is what separates ascii_lpad from
+    utf8_lpad: an accented "hello" is 6 bytes but 5 code points, so the two pad differently."""
+    return _am_byte_transform(self, "ascii_lpad", width, pad=padding)
+
+
+def _ascii_rpad(self, width, padding=" "):
+    """Arrow `ascii_rpad`: right-pads to `width` bytes."""
+    return _am_byte_transform(self, "ascii_rpad", width, pad=padding)
+
+
+def _ascii_center(self, width, padding=" "):
+    """Arrow `ascii_center`: pads both sides to `width` bytes, the odd pad byte on the right."""
+    return _am_byte_transform(self, "ascii_center", width, pad=padding)
+
+
+def _am_split_call(self, op, pattern="", max_splits=-1, reverse=False, ignore_case=False, part=0):
+    p = pattern.encode("utf-8") if isinstance(pattern, str) else bytes(pattern)
+    flags = (1 if reverse else 0) | (2 if ignore_case else 0)
+    return _call(_lib.am_split, self._h, _SPLIT[op], p, len(p), int(max_splits), flags, part)
+
+
+def _split_pattern_list(self, pattern, regex=False, max_splits=-1, reverse=False, ignore_case=False):
+    """Arrow `split_pattern` / `split_pattern_regex`, as a list<utf8> column.
+
+    Every occurrence of the separator makes a boundary, so a value that begins or ends with it gains
+    an empty end piece. `max_splits < 0` means every occurrence; otherwise the first `max_splits` are
+    used, or the last `max_splits` when `reverse` is set. The literal form runs on the GPU; the regex
+    form on the CPU, and it refuses `reverse` exactly as Arrow does."""
+    op = "split_pattern_regex" if regex else "split_pattern"
+    return _am_split_call(self, op, pattern, max_splits, reverse, ignore_case, part=0)
+
+
+def _split_pattern_pair(self, pattern, regex=False, max_splits=-1, reverse=False, ignore_case=False):
+    """`split_pattern` as the flat (offsets, values) pair of the same list<utf8>: row i owns
+    values[offsets[i]:offsets[i + 1]]. The buffers are the list's own, with no copy."""
+    op = "split_pattern_regex" if regex else "split_pattern"
+    return (_am_split_call(self, op, pattern, max_splits, reverse, ignore_case, part=1),
+            _am_split_call(self, op, pattern, max_splits, reverse, ignore_case, part=2))
+
+
+def _split_whitespace_list(self, unicode=False, max_splits=-1, reverse=False):
+    """Arrow `ascii_split_whitespace` (`unicode=False`) and `utf8_split_whitespace`
+    (`unicode=True`), as a list<utf8> column. Both GPU.
+
+    A separator is a maximal RUN of whitespace, so leading and trailing whitespace each leave one
+    empty piece behind and the empty string splits to one empty piece -- Arrow's behaviour, not
+    Python's no-argument str.split(). The ASCII class is the space and \\t-\\r; the Unicode class adds
+    Zs/Zl/Zp, U+001C-U+001F and U+0085, and excludes U+200B."""
+    op = "utf8_split_whitespace" if unicode else "ascii_split_whitespace"
+    return _am_split_call(self, op, "", max_splits, reverse, part=0)
+
+
+def _split_whitespace_pair(self, unicode=False, max_splits=-1, reverse=False):
+    """`split_whitespace` as the flat (offsets, values) pair."""
+    op = "utf8_split_whitespace" if unicode else "ascii_split_whitespace"
+    return (_am_split_call(self, op, "", max_splits, reverse, part=1),
+            _am_split_call(self, op, "", max_splits, reverse, part=2))
+
+
+def _rewrite_named_groups(pattern):
+    """RE2 spells a named group (?P<name>...); ICU, which the host engine uses, spells it (?<name>...).
+    A pyarrow pattern is therefore accepted either way."""
+    return pattern.replace("(?P<", "(?<")
+
+
+def _extract_regex_struct(self, pattern, ignore_case=False):
+    """Arrow `extract_regex` as a struct column with one utf8 field per named capture group.
+
+    A row that does not match and a null row are both a null struct; inside a matching row, a group
+    that took part in no alternative is the empty string. Host-side (ICU), with a GPU literal
+    pre-filter that keeps the rows which cannot match away from the engine."""
+    p = _rewrite_named_groups(pattern).encode("utf-8")
+    return _call(_lib.am_extract_struct, self._h, p, len(p), 1 if ignore_case else 0, 0)
+
+
+def _extract_regex_span_struct(self, pattern, ignore_case=False):
+    """Arrow `extract_regex_span` as a struct column of fixed_size_list<int32>[2] fields, each the
+    group's (start, length) in BYTES. A non-matching row is a null struct, and a group that took part
+    in no alternative a null list."""
+    p = _rewrite_named_groups(pattern).encode("utf-8")
+    return _call(_lib.am_extract_struct, self._h, p, len(p), 1 if ignore_case else 0, 1)
+
+
+def binary_join_element_wise(columns, separator="", null_handling="emit_null", null_replacement=""):
+    """Arrow `binary_join_element_wise`: columns[0] + sep + columns[1] + sep + ... over N columns.
+
+    `null_handling` is Arrow's option -- "emit_null" (a null anywhere makes the row null, the
+    default), "skip" (a null column contributes nothing, not even its separator) or "replace" (a null
+    column contributes `null_replacement`). GPU: a left fold of one two-pass join step, so N columns
+    cost N-1 passes and the data never leaves the device.
+
+    Difference from pyarrow 25.0.1: under "skip", a row whose columns are all null joins to the empty
+    string here; pyarrow drops that row from its output entirely, returning an array shorter than its
+    input, which is a bug in Arrow's offset bookkeeping.
+    """
+    cols = [_as_array(c) for c in columns]
+    if not cols:
+        raise ArrowMetalError("binary_join_element_wise needs at least one column")
+    if null_handling not in _NULL_HANDLING:
+        raise ArrowMetalError('null_handling must be "emit_null", "skip" or "replace", got %r'
+                              % (null_handling,))
+    handles = (_P * len(cols))(*[c._h for c in cols])
+    sep = separator.encode("utf-8") if isinstance(separator, str) else bytes(separator)
+    rep = null_replacement.encode("utf-8") if isinstance(null_replacement, str) else bytes(null_replacement)
+    out = _P()
+    _check(_lib.am_join_element_wise(handles, len(cols), sep, len(sep),
+                                     _NULL_HANDLING[null_handling], rep, len(rep), ctypes.byref(out)))
+    return MetalArray(out)
+
+
+# The code-point slicer that shipped before `step` existed, kept as the step == 1 fast path.
+_am_string_slice_codeunits = MetalArray.slice_codeunits
+
+MetalArray.binary_slice = _binary_slice
+MetalArray.slice_codeunits = _slice_codeunits_step
+MetalArray.binary_reverse = _binary_reverse
+MetalArray.ascii_reverse = _ascii_reverse
+MetalArray.ascii_lpad = _ascii_lpad
+MetalArray.ascii_rpad = _ascii_rpad
+MetalArray.ascii_center = _ascii_center
+MetalArray.split_pattern = _split_pattern_list
+MetalArray.split_pattern_pair = _split_pattern_pair
+MetalArray.split_whitespace = _split_whitespace_list
+MetalArray.split_whitespace_pair = _split_whitespace_pair
+MetalArray.extract_regex_struct = _extract_regex_struct
+MetalArray.extract_regex_span_struct = _extract_regex_span_struct

@@ -143,17 +143,27 @@ extension MetalStringArray {
         return best
     }
 
-    /// The rows a regex could possibly match, as a plain `[Bool]`, or nil when no pre-filter applies.
+    /// The rows a regex could possibly match, as the packed bitmap the GPU produced, or nil when no
+    /// pre-filter applies or when the one that does apply would not pay for itself.
     ///
-    /// Computed with the GPU `contains` kernel, so the scan over the bytes never leaves the device;
-    /// only the one-bit-per-row answer comes back.
-    func regexCandidates(_ pattern: String, ignoreCase: Bool) throws -> [Bool]? {
-        guard !ignoreCase, let literal = Self.requiredLiteral(pattern) else { return nil }
+    /// The scan over the bytes never leaves the device; only the one-bit-per-row answer comes back,
+    /// and it is handed on as a bitmap rather than unpacked, because unpacking ten million rows into
+    /// a `[Bool]` would cost more than the pass it is trying to save.
+    ///
+    /// **The selectivity gate.** A literal every row happens to contain excludes nothing, so the
+    /// filter would be pure overhead — one GPU pass and a branch per row for no rows skipped. The
+    /// popcount of the mask says exactly how many rows survive it, and the filter is kept only when
+    /// it removes at least a quarter of them.
+    func regexPrefilter(_ pattern: String, ignoreCase: Bool) throws -> MetalBooleanArray? {
+        guard !ignoreCase, length > 0, let literal = Self.requiredLiteral(pattern) else { return nil }
         let mask = try matches(.contains, literal)
         try context.syncPoint()
-        return withExtendedLifetime(mask) { () -> [Bool] in
-            let bits = mask.values.typed(UInt8.self)
-            return (0..<length).map { Bitmap.isSet(bits, $0) }
-        }
+        let kept = withExtendedLifetime(mask) { Bitmap.popcount(mask.values.typed(UInt8.self), bits: length) }
+        return kept * 4 <= length * 3 ? mask : nil
     }
+}
+
+extension MetalBooleanArray {
+    /// The packed values bitmap, for a caller that has already synchronised and holds a reference.
+    var bitsPointer: UnsafePointer<UInt8> { values.typed(UInt8.self) }
 }

@@ -590,4 +590,217 @@ final class TextTests: XCTestCase {
         let like = try array.matchLike("%ab%").toArray()
         XCTAssertEqual(like, values.map { s in s.map { $0.contains("ab") } })
     }
+
+    // MARK: - Splitting: options, the list column, and the GPU/host agreement
+
+    /// Strings built to make every splitting edge case common rather than rare: leading and trailing
+    /// separators, runs of them, empty values, ASCII and Unicode whitespace side by side.
+    func splitCorpus(_ n: Int, seed: UInt64) -> [String?] {
+        var g = TextRNG(seed)
+        let pieces = ["a", "bb", "", " ", "  ", "\t", "\n", ",", ",,", "x,y", "\u{3000}", "\u{A0}",
+                      "\u{2003}", "\u{200B}", "é", "日本", "🎉", "\u{1C}", "\u{85}"]
+        var out: [String?] = []
+        for i in 0..<n {
+            if i % 9 == 4 { out.append(nil); continue }
+            var s = ""
+            for _ in 0...Int(g.next() % 5) { s += pieces[Int(g.next() % UInt64(pieces.count))] }
+            out.append(s)
+        }
+        return out
+    }
+
+    /// Reads a `list<utf8>` back as one `[String]` per row (nil for a null row).
+    func listRows(_ list: MetalListArray) throws -> [[String]?] {
+        let (offsets, values) = try list.stringPair()
+        let offs = offsets.toArray().map { Int($0!) }
+        let flat = values.toArray()
+        return (0..<list.length).map { i in
+            guard list.isValid(i) else { return nil }
+            return Array(flat[offs[i]..<offs[i + 1]]).map { $0! }
+        }
+    }
+
+    /// Every splitter against the host oracle, at every size and for every `max_splits` / `reverse`
+    /// combination. The GPU splitter runs three passes over two scans, so a row whose piece count or
+    /// byte count is computed differently in any pass shows up here immediately.
+    func testSplitOptionsMatchTheOracle() throws {
+        try requireRealGPU()
+        for n in Self.sizes {
+            let values = splitCorpus(n, seed: UInt64(n) &+ 821)
+            let array = try MetalStringArray(values)
+            for maxSplits in [-1, 0, 1, 2, 5] {
+                for reverse in [false, true] {
+                    for unicode in [false, true] {
+                        let got = try listRows(try array.splitWhitespace(unicode: unicode,
+                                                                         maxSplits: maxSplits,
+                                                                         reverse: reverse))
+                        let want = values.map { s in
+                            s.map { MetalStringArray.splitWhitespace($0, unicode: unicode,
+                                                                     maxSplits: maxSplits, reverse: reverse) }
+                        }
+                        XCTAssertEqual(got, want,
+                                       "split_whitespace(unicode: \(unicode), max: \(maxSplits), rev: \(reverse)) at n=\(n)")
+                    }
+                    for pattern in [",", ",,", "a", "é"] {
+                        let got = try listRows(try array.splitPattern(pattern, maxSplits: maxSplits,
+                                                                      reverse: reverse))
+                        let want = values.map { s in
+                            s.map { MetalStringArray.split($0, on: pattern, maxSplits: maxSplits,
+                                                           reverse: reverse) }
+                        }
+                        XCTAssertEqual(got, want,
+                                       "split_pattern(\(pattern), max: \(maxSplits), rev: \(reverse)) at n=\(n)")
+                    }
+                }
+            }
+        }
+    }
+
+    /// The exact pieces Arrow produces for the shapes that are easy to get wrong: a separator at each
+    /// end, a run of separators, the empty string, an all-whitespace value, and a null row.
+    func testSplitPinnedAnswers() throws {
+        try requireRealGPU()
+        let a = try MetalStringArray(["  x  ", "a b  c", "", " ", nil, "one", "a\tb\nc", "a\u{1C}b"])
+        XCTAssertEqual(try listRows(try a.splitWhitespace()),
+                       [["", "x", ""], ["a", "b", "c"], [""], ["", ""], nil, ["one"], ["a", "b", "c"],
+                        ["a\u{1C}b"]])
+        // U+001C-U+001F are Unicode whitespace but not ASCII whitespace, so only the utf8 form cuts there.
+        XCTAssertEqual(try listRows(try a.splitWhitespace(unicode: true)).last!, ["a", "b"])
+        XCTAssertEqual(try listRows(try a.splitWhitespace(maxSplits: 1)),
+                       [["", "x  "], ["a", "b  c"], [""], ["", ""], nil, ["one"], ["a", "b\nc"],
+                        ["a\u{1C}b"]])
+        XCTAssertEqual(try listRows(try a.splitWhitespace(maxSplits: 1, reverse: true)),
+                       [["  x", ""], ["a b", "c"], [""], ["", ""], nil, ["one"], ["a\tb", "c"],
+                        ["a\u{1C}b"]])
+        XCTAssertEqual(try listRows(try a.splitWhitespace(maxSplits: 0)),
+                       [["  x  "], ["a b  c"], [""], [" "], nil, ["one"], ["a\tb\nc"], ["a\u{1C}b"]])
+        let b = try MetalStringArray(["allbll", "l", "", "lal", nil, "xx"])
+        XCTAssertEqual(try listRows(try b.splitPattern("l")),
+                       [["a", "", "b", "", ""], ["", ""], [""], ["", "a", ""], nil, ["xx"]])
+        XCTAssertEqual(try listRows(try b.splitPattern("l", maxSplits: 1)),
+                       [["a", "lbll"], ["", ""], [""], ["", "al"], nil, ["xx"]])
+        XCTAssertEqual(try listRows(try b.splitPattern("l", maxSplits: 1, reverse: true)),
+                       [["allbl", ""], ["", ""], [""], ["la", ""], nil, ["xx"]])
+        XCTAssertEqual(try listRows(try b.splitPatternRegex("l+")),
+                       [["a", "b", ""], ["", ""], [""], ["", "a", ""], nil, ["xx"]])
+        XCTAssertEqual(try listRows(try b.splitPatternRegex("l+", maxSplits: 1)),
+                       [["a", "bll"], ["", ""], [""], ["", "al"], nil, ["xx"]])
+    }
+
+    /// The list column is the primary result; the pair is the same buffers seen flat.
+    func testSplitListAndPairAgree() throws {
+        try requireRealGPU()
+        for n in [0, 1, 33, 4097] {
+            let values = splitCorpus(n, seed: UInt64(n) &+ 823)
+            let array = try MetalStringArray(values)
+            let list = try array.splitPattern(",")
+            XCTAssertEqual(list.length, n)
+            XCTAssertEqual(list.arrowFormat, "+l")
+            XCTAssertEqual(list.nullCount, values.filter { $0 == nil }.count)
+            let (offsets, pieces) = try array.splitPatternPair(",")
+            XCTAssertEqual(offsets.toArray(), try list.stringPair().offsets.toArray())
+            XCTAssertEqual(pieces.toArray(), try list.stringPair().values.toArray())
+            // A null row owns no pieces and is a null list row.
+            for i in 0..<n where values[i] == nil {
+                XCTAssertFalse(list.isValid(i))
+                XCTAssertEqual(list.valueRange(i), nil)
+            }
+        }
+    }
+
+    // MARK: - SQL LIKE on the GPU
+
+    /// Every `LIKE` shape, including the ones that used to fall through to ICU, against the anchored
+    /// regex the host engine would have run. The two must agree row for row.
+    func testMatchLikeOnTheGPUMatchesTheEngine() throws {
+        try requireRealGPU()
+        let patterns = ["abc", "abc%", "%abc", "%abc%", "a_c", "_bc", "ab_", "%a_c%", "a%b%c",
+                        "%", "%%", "", "_", "___", "a\\%b", "a\\_b", "\\\\", "%é%", "_é_",
+                        "cust\\_1%", "c_st%1", "日%本", "a%", "%c", "%_%"]
+        for n in Self.sizes {
+            let values = sampleStrings(n, seed: UInt64(n) &+ 901)
+            let array = try MetalStringArray(values)
+            for p in patterns {
+                let tokens = MetalStringArray.parseLike(p)
+                let re = try NSRegularExpression(pattern: MetalStringArray.likeRegex(tokens),
+                                                 options: [.dotMatchesLineSeparators])
+                let expected = values.map { s in s.map { re.firstMatch(in: $0, range: full($0)) != nil } }
+                XCTAssertEqual(try array.matchLike(p).toArray(), expected, "match_like \(p) at n=\(n)")
+            }
+        }
+    }
+
+    /// `_` has to consume one whole character, not one byte, or a multi-byte value would match a
+    /// pattern that should not fit it.
+    func testMatchLikeUnderscoreCountsCodePoints() throws {
+        try requireRealGPU()
+        let a = try MetalStringArray(["é", "ab", "日", "🎉", "aé", ""])
+        XCTAssertEqual(try a.matchLike("_").toArray(), [true, false, true, true, false, false])
+        XCTAssertEqual(try a.matchLike("__").toArray(), [false, true, false, false, true, false])
+        XCTAssertEqual(try a.matchLike("").toArray(), [false, false, false, false, false, true])
+        XCTAssertEqual(try a.matchLike("%_%").toArray(), [true, true, true, true, true, false])
+    }
+
+    // MARK: - The GPU literal pre-filter for the regex functions
+
+    /// The pre-filter must never change an answer: for each pattern, what the analysis claims is a
+    /// required literal really is required, and the four regex functions agree with the engine run
+    /// over every row.
+    func testRegexLiteralPrefilterKeepsAnswersIdentical() throws {
+        try requireRealGPU()
+        let patterns = ["ab", "abc[0-9]+", "\\d{2}-ab-\\d+", "a.c", "(ab|zz)", "ab$", "^abc",
+                        "ab*c", "ab+c", "x?abc", "[a-z]+ab", "ab(c|d)ef", "\\.ab\\.", "a{2,3}bcd",
+                        "cafe\u{301}.", "ab\\b", "(?:ab)cd"]
+        for n in [0, 1, 33, 4097] {
+            let values = sampleStrings(n, seed: UInt64(n) &+ 911)
+            let array = try MetalStringArray(values)
+            for p in patterns {
+                let re = try oracleRegex(p)
+                // The claim itself: a row that matches must contain the literal.
+                if let literal = MetalStringArray.requiredLiteral(p) {
+                    for v in values.compactMap({ $0 })
+                    where re.firstMatch(in: v, range: full(v)) != nil {
+                        XCTAssertTrue(v.contains(literal),
+                                      "\(p) matched \(v.debugDescription) without \(literal.debugDescription)")
+                    }
+                }
+                XCTAssertEqual(try array.matchSubstringRegex(p).toArray(),
+                               values.map { s in s.map { re.firstMatch(in: $0, range: full($0)) != nil } },
+                               "match \(p) at n=\(n)")
+                XCTAssertEqual(try array.countSubstringRegex(p).toArray(),
+                               values.map { s in s.map { Int32(re.numberOfMatches(in: $0, range: full($0))) } },
+                               "count \(p) at n=\(n)")
+                XCTAssertEqual(try array.findSubstringRegex(p).toArray(),
+                               values.map { s in
+                                   s.map { v -> Int32 in
+                                       guard let m = re.firstMatch(in: v, range: full(v)),
+                                             let r = Range(m.range, in: v) else { return -1 }
+                                       return Int32(v.utf8.distance(from: v.utf8.startIndex, to: r.lowerBound))
+                                   }
+                               },
+                               "find \(p) at n=\(n)")
+                XCTAssertEqual(try array.replaceSubstringRegex(p, with: "Z").toArray(),
+                               values.map { s in
+                                   s.map { re.stringByReplacingMatches(in: $0, range: full($0), withTemplate: "Z") }
+                               },
+                               "replace \(p) at n=\(n)")
+            }
+        }
+    }
+
+    /// What the analysis is allowed to claim, spelled out: a top-level alternation, an inline flag
+    /// group and anything inside parentheses give up, and a zero-or-more quantifier drops the
+    /// character it binds to.
+    func testRequiredLiteralAnalysis() throws {
+        XCTAssertEqual(MetalStringArray.requiredLiteral("hello.*world"), "hello")
+        XCTAssertEqual(MetalStringArray.requiredLiteral("\\d{4}-cust-\\d+"), "-cust-")
+        XCTAssertEqual(MetalStringArray.requiredLiteral("[0-9]+abcd"), "abcd")
+        XCTAssertEqual(MetalStringArray.requiredLiteral("ab+cdef"), "cdef")
+        XCTAssertNil(MetalStringArray.requiredLiteral("abc|def"))
+        XCTAssertNil(MetalStringArray.requiredLiteral("(?i)abcdef"))
+        XCTAssertNil(MetalStringArray.requiredLiteral("(abcdef)"))
+        XCTAssertNil(MetalStringArray.requiredLiteral("a.c"))
+        XCTAssertNil(MetalStringArray.requiredLiteral("ab*c"))
+        XCTAssertEqual(MetalStringArray.requiredLiteral("\\.abc\\."), ".abc.")
+    }
 }

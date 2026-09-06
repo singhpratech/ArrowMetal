@@ -580,4 +580,323 @@ final class StringExtraTests: XCTestCase {
             XCTAssertEqual(gotIdx[i], want, "row \(i)")
         }
     }
+
+    // MARK: - Byte-indexed slicing, reversal and padding (Kernels/StringBytes.swift)
+
+    /// Python's slice over an array of units — the semantics Arrow's `binary_slice` and
+    /// `utf8_slice_codeunits` both implement, written here independently of the kernel.
+    static func pySlice<T>(_ units: [T], _ start: Int, _ stop: Int?, _ step: Int) -> [T] {
+        let n = units.count
+        precondition(step != 0)
+        var b: Int, e: Int
+        if step > 0 {
+            b = start < 0 ? Swift.max(n + start, 0) : Swift.min(start, n)
+            e = stop.map { $0 < 0 ? Swift.max(n + $0, 0) : Swift.min($0, n) } ?? n
+            guard b < e else { return [] }
+            return stride(from: b, to: e, by: step).map { units[$0] }
+        }
+        b = start < 0 ? n + start : Swift.min(start, n - 1)
+        if b < -1 { b = -1 }
+        e = stop.map { $0 < 0 ? n + $0 : Swift.min($0, n - 1) } ?? -1
+        if e < -1 { e = -1 }
+        guard b > e else { return [] }
+        return stride(from: b, through: e + 1, by: step).map { units[$0] }
+    }
+
+    static let sliceCases: [(Int, Int?, Int)] = [
+        (0, nil, 1), (1, 4, 1), (-3, nil, 1), (1, -1, 1), (2, 2, 1), (0, 100, 3), (-100, 100, 2),
+        (5, 0, -1), (-1, -5, -2), (-1, nil, -1), (0, nil, -1), (100, -100, -3), (9, 9, 1),
+    ]
+
+    func testBinarySliceMatchesPythonSlicing() throws {
+        try requireRealGPU()
+        for n in Self.sizes {
+            let rows = sample(n, seed: UInt64(n) &+ 301)
+            let a = try MetalStringArray(rows)
+            for (start, stop, step) in Self.sliceCases {
+                let got = try a.binarySlice(start: start, stop: stop, step: step).toByteArrays()
+                let want = rows.map { $0.map { Self.pySlice(Array($0.utf8), start, stop, step) } }
+                XCTAssertEqual(got, want, "binary_slice(\(start), \(String(describing: stop)), \(step)) at n=\(n)")
+            }
+        }
+        XCTAssertThrowsError(try MetalStringArray(["a"]).binarySlice(start: 0, stop: 1, step: 0))
+    }
+
+    func testSliceCodeunitsWithStepMatchesPythonSlicing() throws {
+        try requireRealGPU()
+        for n in Self.sizes {
+            let rows = sample(n, seed: UInt64(n) &+ 307)
+            let a = try MetalStringArray(rows)
+            for (start, stop, step) in Self.sliceCases {
+                let got = try a.sliceCodeunits(start: start, stop: stop, step: step).toArray()
+                let want = rows.map { s -> String? in
+                    s.map { v in
+                        var out = String.UnicodeScalarView()
+                        for u in Self.pySlice(Array(v.unicodeScalars), start, stop, step) { out.append(u) }
+                        return String(out)
+                    }
+                }
+                XCTAssertEqual(got, want, "utf8_slice(\(start), \(String(describing: stop)), \(step)) at n=\(n)")
+            }
+        }
+        XCTAssertThrowsError(try MetalStringArray(["a"]).sliceCodeunits(start: 0, stop: 1, step: 0))
+    }
+
+    /// `binary_reverse` reverses bytes always; `ascii_reverse` does the same but refuses non-ASCII
+    /// input, as pyarrow does rather than emitting invalid UTF-8.
+    func testByteReverseAndAsciiReverse() throws {
+        try requireRealGPU()
+        for n in Self.sizes {
+            let rows = sample(n, seed: UInt64(n) &+ 311)
+            let a = try MetalStringArray(rows)
+            XCTAssertEqual(try a.binaryReverse().toByteArrays(),
+                           rows.map { $0.map { Array($0.utf8).reversed().map { b in b } } },
+                           "binary_reverse at n=\(n)")
+            let ascii = asciiSample(n, seed: UInt64(n) &+ 313)
+            let b = try MetalStringArray(ascii)
+            XCTAssertEqual(try b.asciiReverse().toArray(),
+                           ascii.map { $0.map { String(decoding: Array($0.utf8).reversed(), as: UTF8.self) } },
+                           "ascii_reverse at n=\(n)")
+            // On ASCII the byte reversal and the code point reversal are the same answer.
+            XCTAssertEqual(try b.asciiReverse().toArray(), try b.reverse().toArray())
+        }
+        XCTAssertThrowsError(try MetalStringArray(["é"]).asciiReverse())
+    }
+
+    /// The whole point of the `ascii_*` / `utf8_*` padding pair: one counts bytes, the other counts
+    /// code points, and they only agree on ASCII input.
+    func testAsciiPaddingCountsBytesAndUtf8CountsCodePoints() throws {
+        try requireRealGPU()
+        for n in Self.sizes {
+            let rows = sample(n, seed: UInt64(n) &+ 317)
+            let a = try MetalStringArray(rows)
+            for width in [0, 1, 8, 12] {
+                XCTAssertEqual(try a.asciiLpad(width: width, pad: "*").toArray(),
+                               rows.map { $0.map { Self.padBytes($0, width, "*", left: true, right: false) } },
+                               "ascii_lpad \(width) at n=\(n)")
+                XCTAssertEqual(try a.asciiRpad(width: width, pad: "*").toArray(),
+                               rows.map { $0.map { Self.padBytes($0, width, "*", left: false, right: true) } },
+                               "ascii_rpad \(width) at n=\(n)")
+                XCTAssertEqual(try a.asciiCenter(width: width, pad: "*").toArray(),
+                               rows.map { $0.map { Self.padBytes($0, width, "*", left: true, right: true) } },
+                               "ascii_center \(width) at n=\(n)")
+            }
+        }
+        // Six bytes, five code points: the two forms disagree by exactly one pad character.
+        let one = try MetalStringArray(["héllo"])
+        XCTAssertEqual(try one.asciiLpad(width: 8, pad: "*").toArray(), ["**héllo"])
+        XCTAssertEqual(try one.padLeft(width: 8, pad: "*").toArray(), ["***héllo"])
+        XCTAssertEqual(try one.asciiCenter(width: 8, pad: "*").toArray(), ["*héllo*"])
+        XCTAssertEqual(try one.center(width: 8, pad: "*").toArray(), ["*héllo**"])
+        XCTAssertThrowsError(try one.asciiLpad(width: 8, pad: "é"))
+    }
+
+    static func padBytes(_ s: String, _ width: Int, _ pad: String, left: Bool, right: Bool) -> String {
+        let b = Array(s.utf8), p = Array(pad.utf8)
+        let need = Swift.max(width - b.count, 0)
+        let l = (left && right) ? need / 2 : (left ? need : 0)
+        let r = (left && right) ? need - l : (right ? need : 0)
+        var out: [UInt8] = []
+        for _ in 0..<l { out += p }
+        out += b
+        for _ in 0..<r { out += p }
+        return String(decoding: out, as: UTF8.self)
+    }
+
+    // MARK: - Full Unicode case mapping (Kernels/StringUnicode.swift)
+
+    /// The simple (1:1) mappings, reconstructed from Swift's full ones. Independent of `UnicodeClass`
+    /// so this is an oracle rather than an echo of the implementation.
+    static func simpleUpper(_ u: Unicode.Scalar) -> Unicode.Scalar {
+        if u.value == 0xDF { return Unicode.Scalar(0x1E9E)! }
+        if (0x1F80...0x1F87).contains(u.value) || (0x1F90...0x1F97).contains(u.value)
+            || (0x1FA0...0x1FA7).contains(u.value) { return Unicode.Scalar(u.value + 8)! }
+        let m = u.properties.uppercaseMapping.unicodeScalars
+        return m.count == 1 ? m.first! : u
+    }
+    static func simpleLower(_ u: Unicode.Scalar) -> Unicode.Scalar {
+        if u.value == 0x130 { return Unicode.Scalar(0x69)! }
+        let m = u.properties.lowercaseMapping.unicodeScalars
+        return m.count == 1 ? m.first! : u
+    }
+    static func refCaseMap(_ op: UnicodeTransform, _ s: String) -> String {
+        var out = String.UnicodeScalarView()
+        var first = true, boundary = true
+        for u in s.unicodeScalars {
+            switch op {
+            case .upper: out.append(simpleUpper(u))
+            case .lower: out.append(simpleLower(u))
+            case .swapcase:
+                let up = isUpper(u), lo = isLower(u)
+                out.append(up && lo ? u : (up ? simpleLower(u) : (lo ? simpleUpper(u) : u)))
+            case .capitalize: out.append(first ? simpleUpper(u) : simpleLower(u))
+            case .title:
+                if isCased(u) { out.append(boundary ? simpleUpper(u) : simpleLower(u)); boundary = false }
+                else { out.append(u); boundary = true }
+            default: out.append(u)
+            }
+            first = false
+        }
+        return String(out)
+    }
+
+    /// The per-row GPU/host split has to give the same answer as the host alone, at every size and
+    /// with Latin and non-Latin rows interleaved so both paths land inside one dispatch.
+    func testUnicodeCaseMappingAtEverySize() throws {
+        try requireRealGPU()
+        let ops: [(UnicodeTransform, (MetalStringArray) throws -> MetalStringArray)] = [
+            (.upper, { try $0.utf8Upper() }), (.lower, { try $0.utf8Lower() }),
+            (.swapcase, { try $0.utf8Swapcase() }), (.capitalize, { try $0.utf8Capitalize() }),
+            (.title, { try $0.utf8Title() }),
+        ]
+        for n in Self.sizes {
+            let rows = sample(n, seed: UInt64(n) &+ 401)
+            let a = try MetalStringArray(rows)
+            for (op, call) in ops {
+                XCTAssertEqual(try call(a).toArray(), rows.map { $0.map { Self.refCaseMap(op, $0) } },
+                               "\(op) at n=\(n)")
+            }
+            // The same column with every non-ASCII row removed exercises the pure-GPU path.
+            let ascii = asciiSample(n, seed: UInt64(n) &+ 403)
+            let b = try MetalStringArray(ascii)
+            for (op, call) in ops {
+                XCTAssertEqual(try call(b).toArray(), ascii.map { $0.map { Self.refCaseMap(op, $0) } },
+                               "\(op) ASCII at n=\(n)")
+            }
+        }
+    }
+
+    /// The exact answers pyarrow gives for the code points where a simple mapping and a full one
+    /// differ, and for the titlecase letters that `swapcase` has to leave alone.
+    func testUnicodeCaseMappingPinnedAnswers() throws {
+        try requireRealGPU()
+        let rows = ["Straße", "ǅungla", "Ǆungla", "ǆungla", "ΣΊΣΥΦΟΣ", "σίσυφος", "Привет",
+                    "日本", "ǰ", "ﬁn", "İstanbul", "ﬀ", "ΐ", "ᾈ", "ŉ", "µ", "ĸ", "ſ", "ı", "Ÿ", "ÿ"]
+        let a = try MetalStringArray(rows)
+        XCTAssertEqual(try a.utf8Upper().toArray(),
+                       ["STRAẞE", "ǄUNGLA", "ǄUNGLA", "ǄUNGLA", "ΣΊΣΥΦΟΣ", "ΣΊΣΥΦΟΣ", "ПРИВЕТ",
+                        "日本", "ǰ", "ﬁN", "İSTANBUL", "ﬀ", "ΐ", "ᾈ", "ŉ", "Μ", "ĸ", "S", "I", "Ÿ", "Ÿ"])
+        XCTAssertEqual(try a.utf8Lower().toArray(),
+                       ["straße", "ǆungla", "ǆungla", "ǆungla", "σίσυφοσ", "σίσυφος", "привет",
+                        "日本", "ǰ", "ﬁn", "istanbul", "ﬀ", "ΐ", "ᾀ", "ŉ", "µ", "ĸ", "ſ", "ı", "ÿ", "ÿ"])
+        // A titlecase letter is both upper and lower for Arrow, so swapcase leaves it where it is.
+        XCTAssertEqual(try a.utf8Swapcase().toArray().prefix(4).map { $0! },
+                       ["sTRAẞE", "ǅUNGLA", "ǆUNGLA", "ǄUNGLA"])
+        XCTAssertEqual(try a.utf8Capitalize().toArray().prefix(4).map { $0! },
+                       ["Straße", "Ǆungla", "Ǆungla", "Ǆungla"])
+        // Two bytes in, three out (ß -> ẞ) and two in, one out (ı -> I): both offsets must move.
+        XCTAssertEqual(try MetalStringArray(["ß"]).utf8Upper().totalBytes, 3)
+        XCTAssertEqual(try MetalStringArray(["ı"]).utf8Upper().totalBytes, 1)
+    }
+
+    /// The trims split per row too: an ASCII set never leaves the GPU, a set with a non-ASCII
+    /// character sends only the non-ASCII rows to the host, and both must agree with the oracle.
+    func testUnicodeTrimSplitsPerRow() throws {
+        try requireRealGPU()
+        let sets = ["", "Hlo", "éH  ", "\u{3000}x", "½"]
+        for n in Self.sizes {
+            let rows = sample(n, seed: UInt64(n) &+ 411)
+            let a = try MetalStringArray(rows)
+            XCTAssertEqual(try a.utf8TrimWhitespace().toArray(),
+                           rows.map { $0.map { Self.refTrim($0, left: true, right: true, Self.refIsSpace) } },
+                           "utf8_trim_whitespace at n=\(n)")
+            XCTAssertEqual(try a.utf8LtrimWhitespace().toArray(),
+                           rows.map { $0.map { Self.refTrim($0, left: true, right: false, Self.refIsSpace) } })
+            XCTAssertEqual(try a.utf8RtrimWhitespace().toArray(),
+                           rows.map { $0.map { Self.refTrim($0, left: false, right: true, Self.refIsSpace) } })
+            for set in sets {
+                let members = Set(set.unicodeScalars)
+                XCTAssertEqual(try a.utf8Trim(characters: set).toArray(),
+                               rows.map { $0.map { Self.refTrim($0, left: true, right: true) { members.contains($0) } } },
+                               "utf8_trim \(set.debugDescription) at n=\(n)")
+                XCTAssertEqual(try a.utf8Ltrim(characters: set).toArray(),
+                               rows.map { $0.map { Self.refTrim($0, left: true, right: false) { members.contains($0) } } })
+                XCTAssertEqual(try a.utf8Rtrim(characters: set).toArray(),
+                               rows.map { $0.map { Self.refTrim($0, left: false, right: true) { members.contains($0) } } })
+            }
+        }
+    }
+
+    // MARK: - binary_join_element_wise over N columns
+
+    func testJoinElementWiseNullHandlingAtEverySize() throws {
+        try requireRealGPU()
+        for n in Self.sizes {
+            let cols = (0..<4).map { k in sample(n, seed: UInt64(n) &+ 500 &+ UInt64(k), nullEvery: 3 + k) }
+            let arrays = try cols.map { try MetalStringArray($0) }
+            for width in [1, 2, 3, 4] {
+                let use = Array(arrays.prefix(width)), rows = Array(cols.prefix(width))
+                for (mode, name) in [(JoinNullHandling.emitNull, "emit_null"),
+                                     (.skip, "skip"), (.replace, "replace")] {
+                    let got = try MetalStringArray.joinElementWise(use, separator: "-",
+                                                                   nullHandling: mode,
+                                                                   nullReplacement: "?").toArray()
+                    let want = (0..<n).map { i -> String? in
+                        let cells = rows.map { $0[i] }
+                        switch mode {
+                        case .emitNull:
+                            return cells.contains(where: { $0 == nil }) ? nil
+                                                                        : cells.map { $0! }.joined(separator: "-")
+                        case .skip:
+                            return cells.compactMap { $0 }.joined(separator: "-")
+                        case .replace:
+                            return cells.map { $0 ?? "?" }.joined(separator: "-")
+                        }
+                    }
+                    XCTAssertEqual(got, want, "\(name) over \(width) columns at n=\(n)")
+                }
+            }
+        }
+        XCTAssertThrowsError(try MetalStringArray.joinElementWise([]))
+        XCTAssertThrowsError(try MetalStringArray.joinElementWise([try MetalStringArray(["a"]),
+                                                                   try MetalStringArray(["a", "b"])]))
+    }
+
+    /// An empty separator, an empty replacement and rows that are empty strings rather than nulls:
+    /// the three ways a join can produce zero bytes and still be a valid row.
+    func testJoinElementWiseEmptyCases() throws {
+        try requireRealGPU()
+        let a = try MetalStringArray(["", nil, "x", nil])
+        let b = try MetalStringArray(["", "y", nil, nil])
+        XCTAssertEqual(try MetalStringArray.joinElementWise([a, b], separator: "").toArray(),
+                       ["", nil, nil, nil])
+        XCTAssertEqual(try MetalStringArray.joinElementWise([a, b], separator: "-",
+                                                            nullHandling: .skip).toArray(),
+                       ["-", "y", "x", ""])
+        XCTAssertEqual(try MetalStringArray.joinElementWise([a, b], separator: "-",
+                                                            nullHandling: .replace).toArray(),
+                       ["-", "-y", "x-", "-"])
+        XCTAssertEqual(try MetalStringArray.joinElementWise([a], nullHandling: .replace,
+                                                            nullReplacement: "?").toArray(),
+                       ["", "?", "x", "?"])
+    }
+
+    // MARK: - extract_regex / extract_regex_span as struct columns
+
+    func testExtractRegexStructShape() throws {
+        try requireRealGPU()
+        let rows: [String?] = ["a1", "b22", nil, "zz", "q7x"]
+        let a = try MetalStringArray(rows)
+        let s = try a.extractRegexStruct("(?<letter>[a-z])(?<digits>\\d+)")
+        XCTAssertEqual(s.names, ["letter", "digits"])
+        XCTAssertEqual(s.length, rows.count)
+        XCTAssertEqual((0..<rows.count).map { s.isValid($0) }, [true, true, false, false, true])
+        guard case .string(let letters) = s.children[0], case .string(let digits) = s.children[1] else {
+            return XCTFail("extract_regex struct children should be utf8")
+        }
+        XCTAssertEqual(letters.toArray(), ["a", "b", nil, nil, "q"])
+        XCTAssertEqual(digits.toArray(), ["1", "22", nil, nil, "7"])
+
+        let span = try a.extractRegexSpanStruct("(?<letter>[a-z])(?<digits>\\d+)")
+        XCTAssertEqual(span.names, ["letter", "digits"])
+        XCTAssertEqual((0..<rows.count).map { span.isValid($0) }, [true, true, false, false, true])
+        guard case .list(let letterSpans) = span.children[0] else {
+            return XCTFail("extract_regex_span children should be fixed_size_list<int32>[2]")
+        }
+        XCTAssertEqual(letterSpans.kind, .fixedSize(2))
+        guard case .int32(let flat) = letterSpans.values else { return XCTFail("child should be int32") }
+        XCTAssertEqual(Array(flat.toArray().prefix(4)), [0, 1, 0, 1])   // rows 0 and 1: start 0, length 1
+        XCTAssertFalse(letterSpans.isValid(2))
+        XCTAssertThrowsError(try a.extractRegexStruct("[a-z]"))
+    }
 }

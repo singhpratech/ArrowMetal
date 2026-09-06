@@ -30,11 +30,20 @@ import Metal
 ///   named groups `(?<name>…)`).
 /// * `replaceSubstringRegex` takes an **ICU template**: capture groups are `$1`, `$2`, …, and a
 ///   literal `$` is written `\$`. RE2 (and therefore pyarrow) spells them `\1`, `\2`.
-/// * `extractRegex` returns a dictionary of arrays rather than a struct array, because ArrowMetal has
-///   no struct-typed column. A row that does not match is null in every group; a group that took part
-///   in no alternative is the empty string.
-/// * `splitPattern` / `splitWhitespace` return the `(offsets, values)` pair of an Arrow `list<utf8>`
-///   rather than a list array, for the same reason.
+/// * `extractRegex` returns a dictionary of arrays, which is the convenient thing to hold in Swift;
+///   `extractRegexStruct` (`Kernels/StringStructs.swift`) returns Arrow's own struct column. A row that
+///   does not match is null in every group; a group that took part in no alternative is the empty string.
+///
+/// ## The GPU literal pre-filter
+///
+/// Every host path here first asks `Kernels/StringLike.swift` for a literal run that every match must
+/// contain. When there is one and it is selective enough, the byte-wise `contains` kernel marks the
+/// candidate rows and only those reach ICU; the rest take the answer a non-match implies. The result is
+/// identical either way — see `requiredLiteral(_:)` for exactly what the analysis will and will not
+/// claim.
+///
+/// Splitting has moved to `Kernels/StringSplit.swift`, which returns a real `list<utf8>`; only
+/// `splitPatternRegex` still runs here.
 extension MetalStringArray {
 
     // MARK: - Pattern analysis
@@ -95,16 +104,16 @@ extension MetalStringArray {
 
     /// A boolean result: one bit per row, validity shared with the input.
     ///
-    /// `candidates`, when given, is the GPU pre-filter from ``regexCandidates(_:ignoreCase:)``: a row
-    /// it clears cannot match, so the engine is never asked about it and the bit stays false.
-    private func booleanResult(candidates: [Bool]? = nil,
+    /// `candidates`, when given, is the packed bitmap from ``regexPrefilter(_:ignoreCase:)``: a row
+    /// whose bit is clear cannot match, so the engine is never asked about it and the bit stays false.
+    private func booleanResult(candidates: UnsafePointer<UInt8>? = nil,
                                _ predicate: @escaping (String) -> Bool) throws -> MetalBooleanArray {
         let n = length
         let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(Bitmap.byteCount(bits: n), 1),
                                                 zeroed: true, context: context)
         let bits = out.mutableTyped(UInt8.self)
         forEachRowConcurrently { i, s in
-            if let candidates, !candidates[i] { return }
+            if let candidates, !Bitmap.isSet(candidates, i) { return }
             guard let s, predicate(s) else { return }
             Bitmap.set(bits, i)
         }
@@ -112,13 +121,13 @@ extension MetalStringArray {
     }
 
     /// An int32 result, validity shared with the input. A row the pre-filter clears takes `absent`.
-    private func int32Result(candidates: [Bool]? = nil, absent: Int32 = 0,
+    private func int32Result(candidates: UnsafePointer<UInt8>? = nil, absent: Int32 = 0,
                              _ value: @escaping (String) -> Int32) throws -> MetalArray<Int32> {
         let n = length
         let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(n * 4, 4), zeroed: true, context: context)
         let p = out.mutableTyped(Int32.self)
         forEachRowConcurrently { i, s in
-            if let candidates, !candidates[i] { p[i] = s == nil ? 0 : absent; return }
+            if let candidates, !Bitmap.isSet(candidates, i) { p[i] = s == nil ? 0 : absent; return }
             p[i] = s.map(value) ?? 0
         }
         return MetalArray<Int32>(length: n, nullCount: nullCount, validity: validity, values: out, context: context)
@@ -126,13 +135,13 @@ extension MetalStringArray {
 
     /// A `utf8` result built from one new string per row (nil keeps the row null). A row the
     /// pre-filter clears has no match to rewrite, so it comes back unchanged.
-    private func stringResult(candidates: [Bool]? = nil,
+    private func stringResult(candidates: UnsafePointer<UInt8>? = nil,
                               _ value: @escaping (String) -> String) throws -> MetalStringArray {
         let n = length
         var rows = [String?](repeating: nil, count: n)
         rows.withUnsafeMutableBufferPointer { buf in
             forEachRowConcurrently { i, s in
-                if let candidates, !candidates[i] { buf[i] = s; return }
+                if let candidates, !Bitmap.isSet(candidates, i) { buf[i] = s; return }
                 buf[i] = s.map(value)
             }
         }
@@ -155,9 +164,11 @@ extension MetalStringArray {
             return try matches(pred, literal)
         }
         let re = try Self.compileRegex(pattern, ignoreCase: ignoreCase)
-        let candidates = try regexCandidates(pattern, ignoreCase: ignoreCase)
-        return try booleanResult(candidates: candidates) {
-            re.firstMatch(in: $0, range: Self.fullRange($0)) != nil
+        let mask = try regexPrefilter(pattern, ignoreCase: ignoreCase)
+        return try withExtendedLifetime(mask) {
+            try booleanResult(candidates: mask?.bitsPointer) {
+                re.firstMatch(in: $0, range: Self.fullRange($0)) != nil
+            }
         }
     }
 
@@ -166,9 +177,11 @@ extension MetalStringArray {
     public func countSubstringRegex(_ pattern: String, ignoreCase: Bool = false) throws -> MetalArray<Int32> {
         if !ignoreCase, Self.isRegexLiteral(pattern) { return try countSubstring(pattern) }
         let re = try Self.compileRegex(pattern, ignoreCase: ignoreCase)
-        let candidates = try regexCandidates(pattern, ignoreCase: ignoreCase)
-        return try int32Result(candidates: candidates, absent: 0) {
-            Int32(re.numberOfMatches(in: $0, range: Self.fullRange($0)))
+        let mask = try regexPrefilter(pattern, ignoreCase: ignoreCase)
+        return try withExtendedLifetime(mask) {
+            try int32Result(candidates: mask?.bitsPointer, absent: 0) {
+                Int32(re.numberOfMatches(in: $0, range: Self.fullRange($0)))
+            }
         }
     }
 
@@ -177,11 +190,13 @@ extension MetalStringArray {
     public func findSubstringRegex(_ pattern: String, ignoreCase: Bool = false) throws -> MetalArray<Int32> {
         if !ignoreCase, Self.isRegexLiteral(pattern) { return try findSubstring(pattern) }
         let re = try Self.compileRegex(pattern, ignoreCase: ignoreCase)
-        let candidates = try regexCandidates(pattern, ignoreCase: ignoreCase)
-        return try int32Result(candidates: candidates, absent: -1) { s in
-            guard let m = re.firstMatch(in: s, range: Self.fullRange(s)),
-                  let r = Range(m.range, in: s) else { return -1 }
-            return Self.byteOffset(of: r.lowerBound, in: s)
+        let mask = try regexPrefilter(pattern, ignoreCase: ignoreCase)
+        return try withExtendedLifetime(mask) {
+            try int32Result(candidates: mask?.bitsPointer, absent: -1) { s in
+                guard let m = re.firstMatch(in: s, range: Self.fullRange(s)),
+                      let r = Range(m.range, in: s) else { return -1 }
+                return Self.byteOffset(of: r.lowerBound, in: s)
+            }
         }
     }
 
@@ -199,8 +214,9 @@ extension MetalStringArray {
         }
         let re = try Self.compileRegex(pattern, ignoreCase: ignoreCase)
         let limit = maxReplacements
-        let candidates = try regexCandidates(pattern, ignoreCase: ignoreCase)
-        return try stringResult(candidates: candidates) { s in
+        let mask = try regexPrefilter(pattern, ignoreCase: ignoreCase)
+        return try withExtendedLifetime(mask) {
+        try stringResult(candidates: mask?.bitsPointer) { s in
             var out = ""
             out.reserveCapacity(s.count)
             var last = s.startIndex
@@ -216,6 +232,7 @@ extension MetalStringArray {
             out += s[last...]
             return out
         }
+        }
     }
 
     /// Arrow `extract_regex`, as one `utf8` array per **named** capture group.
@@ -230,13 +247,15 @@ extension MetalStringArray {
         }
         let re = try Self.compileRegex(pattern, ignoreCase: ignoreCase)
         let n = length
-        let candidates = try regexCandidates(pattern, ignoreCase: ignoreCase)
+        let mask = try regexPrefilter(pattern, ignoreCase: ignoreCase)
+        let candidates = mask?.bitsPointer
+        defer { withExtendedLifetime(mask) {} }
         var columns = [[String?]](repeating: [String?](repeating: nil, count: n), count: names.count)
         for k in columns.indices {
             columns[k].withUnsafeMutableBufferPointer { buf in
                 let name = names[k]
                 forEachRowConcurrently { i, s in
-                    if let candidates, !candidates[i] { return }
+                    if let candidates, !Bitmap.isSet(candidates, i) { return }
                     guard let s, let m = re.firstMatch(in: s, range: Self.fullRange(s)) else { return }
                     let r = m.range(withName: name)
                     guard r.location != NSNotFound, let rr = Range(r, in: s) else { buf[i] = ""; return }
