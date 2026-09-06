@@ -11,6 +11,8 @@ public final class MetalStringArray: @unchecked Sendable {
     public let offsets: MetalArrowBuffer
     public let data: MetalArrowBuffer
     public let context: MetalContext
+    /// True when the bytes are Arrow `binary`/`large_binary` rather than utf8: same layout, exported as "z".
+    public var isBinary = false
 
     public init(length: Int, nullCount: Int, validity: MetalArrowBuffer?, offsets: MetalArrowBuffer, data: MetalArrowBuffer, context: MetalContext = .shared) {
         precondition(offsets.byteCount >= (length + 1) * 4)

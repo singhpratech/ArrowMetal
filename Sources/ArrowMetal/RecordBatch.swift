@@ -16,6 +16,9 @@ extension AnyMetalArray {
         case .float64(let a): return a.nullCount
         case .boolean(let a): return a.nullCount
         case .string(let a): return a.nullCount
+        case .temporal(let a): return a.nullCount
+        case .binary(let a): return a.nullCount
+        case .dictionary(let codes, _): return codes.nullCount
         }
     }
 
@@ -34,6 +37,9 @@ extension AnyMetalArray {
         case .float64(let a): return .float64(try a.filter(mask))
         case .boolean(let a): return .boolean(try a.filter(mask))
         case .string(let a): return .string(try a.filter(mask))
+        case .temporal(let a): return .temporal(try a.filter(mask))
+        case .binary(let a): return .binary(markBinary(try a.filter(mask)))
+        case .dictionary(let codes, let values): return .dictionary(codes: try codes.filter(mask), values: values)
         }
     }
 
@@ -51,6 +57,9 @@ extension AnyMetalArray {
         case .float64(let a): return .float64(try a.take(idx))
         case .boolean(let a): return .boolean(try a.take(idx))
         case .string(let a): return .string(try a.take(idx))
+        case .temporal(let a): return .temporal(try a.take(idx))
+        case .binary(let a): return .binary(markBinary(try a.take(idx)))
+        case .dictionary(let codes, let values): return .dictionary(codes: try codes.take(idx), values: values)
         }
     }
 
@@ -68,6 +77,11 @@ extension AnyMetalArray {
         case .float64(let a): return .float64(try a.slice(offset: offset, length: length))
         case .boolean(let a): return .boolean(try a.slice(offset: offset, length: length))
         case .string(let a): return .string(try a.take(try MetalArray<Int32>((offset..<(offset + length)).map { Int32($0) }, context: a.context)))
+        case .temporal(let a): return .temporal(try a.slice(offset: offset, length: length))
+        case .binary(let a):
+            return .binary(markBinary(try a.take(try MetalArray<Int32>((offset..<(offset + length)).map { Int32($0) }, context: a.context))))
+        case .dictionary(let codes, let values):
+            return .dictionary(codes: try codes.slice(offset: offset, length: length), values: values)
         }
     }
 
@@ -78,6 +92,8 @@ extension AnyMetalArray {
     public var asFloat64: MetalArray<Double>? { if case .float64(let a) = self { return a } else { return nil } }
     public var asBoolean: MetalBooleanArray? { if case .boolean(let a) = self { return a } else { return nil } }
     public var asString: MetalStringArray? { if case .string(let a) = self { return a } else { return nil } }
+    public var asTemporal: MetalTemporalArray? { if case .temporal(let a) = self { return a } else { return nil } }
+    public var asBinary: MetalStringArray? { if case .binary(let a) = self { return a } else { return nil } }
 }
 
 /// A set of equal-length named columns: the Metal-resident equivalent of an Arrow RecordBatch.

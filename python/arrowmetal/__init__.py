@@ -68,10 +68,35 @@ _lib.am_str_unary.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]; _lib.am_str
 _lib.am_str_match.argtypes = [_P, ctypes.c_int, ctypes.c_char_p, ctypes.c_int64, ctypes.POINTER(_P)]; _lib.am_str_match.restype = ctypes.c_int
 _lib.am_str_equals_array.argtypes = [_P, _P, ctypes.POINTER(_P)]; _lib.am_str_equals_array.restype = ctypes.c_int
 _lib.am_str_dictionary_encode.argtypes = [_P, ctypes.POINTER(_P), ctypes.POINTER(_P)]; _lib.am_str_dictionary_encode.restype = ctypes.c_int
+_lib.am_temporal_extract.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]; _lib.am_temporal_extract.restype = ctypes.c_int
+_lib.am_temporal_cast_unit.argtypes = [_P, ctypes.c_int, ctypes.POINTER(_P)]; _lib.am_temporal_cast_unit.restype = ctypes.c_int
+_lib.am_dictionary_decode.argtypes = [_P, ctypes.POINTER(_P)]; _lib.am_dictionary_decode.restype = ctypes.c_int
 _lib.am_group_by.argtypes = [_P, ctypes.c_int64, ctypes.c_int, _P, ctypes.POINTER(_P)]
 _lib.am_group_by.restype = ctypes.c_int
 _lib.am_batch_begin.restype = ctypes.c_int
 _lib.am_batch_end.restype = ctypes.c_int
+
+
+_UNITS = {"s": "s", "m": "ms", "u": "us", "n": "ns"}
+_TEMPORAL_FIELDS = {"year": 0, "month": 1, "day": 2, "day_of_week": 3, "hour": 4, "minute": 5, "second": 6}
+
+
+def _temporal_type(fmt):
+    """pyarrow type for an Arrow temporal format string, or None when it is not temporal."""
+    if fmt == "tdD":
+        return pa.date32()
+    if fmt == "tdm":
+        return pa.date64()
+    if len(fmt) >= 3 and fmt[0] == "t" and fmt[2] in _UNITS:
+        unit, kind = _UNITS[fmt[2]], fmt[1]
+        if kind == "t":
+            return pa.time32(unit) if unit in ("s", "ms") else pa.time64(unit)
+        if kind == "D":
+            return pa.duration(unit)
+        if kind == "s" and len(fmt) >= 4 and fmt[3] == ":":
+            tz = fmt[4:]
+            return pa.timestamp(unit, tz or None)
+    return None
 
 
 def version():
@@ -153,9 +178,17 @@ class MetalArray:
 
     @property
     def type(self):
-        return pa.type_for_alias({"c": "int8", "C": "uint8", "s": "int16", "S": "uint16", "i": "int32", "I": "uint32",
-                                  "l": "int64", "L": "uint64", "f": "float32", "g": "float64", "b": "bool",
-                                  "u": "string"}[self.format])
+        fmt = self.format
+        alias = {"c": "int8", "C": "uint8", "s": "int16", "S": "uint16", "i": "int32", "I": "uint32",
+                 "l": "int64", "L": "uint64", "f": "float32", "g": "float64", "b": "bool",
+                 "u": "string", "U": "large_string", "z": "binary", "Z": "large_binary"}.get(fmt)
+        if alias is not None and fmt != "i":
+            return pa.type_for_alias(alias)
+        temporal = _temporal_type(fmt)
+        if temporal is not None:
+            return temporal
+        # "i" is also the index format of a dictionary array; ask the exported schema which one it is.
+        return self.to_arrow().type
 
     def __repr__(self):
         return f"MetalArray({self.type}, len={len(self)}, nulls={self.null_count}, device={device_name()!r})"
@@ -259,6 +292,27 @@ class MetalArray:
         c = _P(); u = _P()
         _check(_lib.am_str_dictionary_encode(self._h, ctypes.byref(c), ctypes.byref(u)))
         return MetalArray(c), MetalArray(u)
+
+    # ---- temporal (date, time, timestamp), extracted in UTC
+    def _temporal(self, field):
+        return _call(_lib.am_temporal_extract, self._h, _TEMPORAL_FIELDS[field])
+
+    def year(self): return self._temporal("year")
+    def month(self): return self._temporal("month")
+    def day(self): return self._temporal("day")
+    def day_of_week(self): return self._temporal("day_of_week")   # Monday = 0 ... Sunday = 6
+    def hour(self): return self._temporal("hour")
+    def minute(self): return self._temporal("minute")
+    def second(self): return self._temporal("second")
+
+    def cast_unit(self, unit):
+        """Rescales a timestamp, duration or time array to 's', 'ms', 'us' or 'ns'."""
+        return _call(_lib.am_temporal_cast_unit, self._h, ["s", "ms", "us", "ns"].index(unit))
+
+    # ---- dictionary-encoded arrays
+    def decode(self):
+        """Materialises a dictionary-encoded array (take of the values by the codes)."""
+        return _call(_lib.am_dictionary_decode, self._h)
 
     # ---- group-by over dense keys in [0, key_count)
     def group_by(self, key_count):

@@ -11,6 +11,12 @@ public enum AnyMetalArray {
     case float32(MetalArray<Float>), float64(MetalArray<Double>)
     case boolean(MetalBooleanArray)
     case string(MetalStringArray)
+    /// date / time / timestamp / duration, an integer array plus its temporal type.
+    case temporal(MetalTemporalArray)
+    /// binary / large_binary: utf8's layout with the bytes left uninterpreted.
+    case binary(MetalStringArray)
+    /// A dictionary-encoded array: int32 codes into `values`.
+    indirect case dictionary(codes: MetalArray<Int32>, values: AnyMetalArray)
 
     public var length: Int {
         switch self {
@@ -26,6 +32,9 @@ public enum AnyMetalArray {
         case .float64(let a): return a.length
         case .boolean(let a): return a.length
         case .string(let a): return a.length
+        case .temporal(let a): return a.length
+        case .binary(let a): return a.length
+        case .dictionary(let codes, _): return codes.length
         }
     }
 
@@ -43,6 +52,10 @@ public enum AnyMetalArray {
         case .float64: return "g"
         case .boolean: return "b"
         case .string: return "u"
+        case .temporal(let a): return a.type.arrowFormat
+        case .binary: return "z"
+        // The C Data Interface puts the index type at the top level of a dictionary schema.
+        case .dictionary: return "i"
         }
     }
 }
@@ -79,10 +92,14 @@ public func importArrowArray(schema: UnsafePointer<ArrowSchema>, array: UnsafeMu
     guard let fmtC = schema.pointee.format else { throw ArrowMetalError.invalidArrowArray("schema.format is null") }
     let fmt = String(cString: fmtC)
     guard array.pointee.release != nil else { throw ArrowMetalError.releasedArray }
+    // The schema decides whether an array is dictionary-encoded; the indices are imported inside.
+    if schema.pointee.dictionary != nil { return try importDictionaryArray(schema: schema, array: array, context: context) }
     guard array.pointee.n_children == 0, array.pointee.dictionary == nil else {
         throw ArrowMetalError.unsupportedType("nested/dictionary arrays are not supported (format \(fmt))")
     }
     if fmt == "u" || fmt == "U" { return try importStringArray(large: fmt == "U", array: array, context: context) }
+    if fmt == "z" || fmt == "Z" { return try importBinaryArray(large: fmt == "Z", array: array, context: context) }
+    if fmt.hasPrefix("t") { return try importTemporalArray(type: try ArrowTemporalType.parse(fmt), array: array, context: context) }
     guard array.pointee.n_buffers == 2, array.pointee.buffers != nil else {
         throw ArrowMetalError.invalidArrowArray("expected 2 buffers for primitive array, got \(array.pointee.n_buffers)")
     }
@@ -144,7 +161,7 @@ public func importArrowArray(schema: UnsafePointer<ArrowSchema>, array: UnsafeMu
 
 /// utf8 / large_utf8 import. Zero-copy for utf8 when page aligned and offset 0; large_utf8 offsets are narrowed
 /// (one pass) when the data is under 2 GB.
-private func importStringArray(large: Bool, array: UnsafeMutablePointer<ArrowArray>, context: MetalContext) throws -> ImportResult {
+func importStringArray(large: Bool, array: UnsafeMutablePointer<ArrowArray>, context: MetalContext) throws -> ImportResult {
     guard array.pointee.n_buffers == 3, array.pointee.buffers != nil else { throw ArrowMetalError.invalidArrowArray("expected 3 buffers for utf8") }
     let owner = ImportedCArray(moving: array)
     let a = owner.array
@@ -371,7 +388,7 @@ extension MetalStringArray {
         fillDevice(out)
     }
     public func exportArrowSchema(name: String = "", into out: UnsafeMutablePointer<ArrowSchema>) {
-        ArrowMetal.exportArrowSchema(format: "u", name: name, into: out)
+        ArrowMetal.exportArrowSchema(format: isBinary ? "z" : "u", name: name, into: out)
     }
 }
 
@@ -390,6 +407,9 @@ extension AnyMetalArray {
         case .float64(let a): a.exportArrowArray(into: out)
         case .boolean(let a): a.exportArrowArray(into: out)
         case .string(let a): a.exportArrowArray(into: out)
+        case .temporal(let a): a.exportArrowArray(into: out)
+        case .binary(let a): a.exportArrowArray(into: out)
+        case .dictionary(let codes, let values): exportDictionaryArray(codes: codes, values: values, into: out)
         }
     }
     public func exportArrowDeviceArray(into out: UnsafeMutablePointer<ArrowDeviceArray>) {
@@ -397,6 +417,11 @@ extension AnyMetalArray {
         fillDevice(out)
     }
     public func exportArrowSchema(name: String = "", into out: UnsafeMutablePointer<ArrowSchema>) {
+        // A dictionary schema carries the value type under `dictionary`; everything else is a flat format.
+        if case .dictionary(_, let values) = self {
+            exportDictionarySchema(values: values, name: name, into: out)
+            return
+        }
         ArrowMetal.exportArrowSchema(format: arrowFormat, name: name, into: out)
     }
 }
