@@ -166,12 +166,11 @@ extension MetalArray: GroupedValueOps {
         case 12: return .list(try gb.distinct(self))
         case 13: return .int64(try gb.countDistinct(self))
         case 16: return try producted(gb)
-        // The grouped variance forms its deviations in Float32, so a Float64 column is cast here rather
-        // than rejected; the header says so, and the precision note applies either way.
-        case 17: return .float64(try narrowed().variance(gb, ddof: 0))
-        case 18: return .float64(try narrowed().variance(gb, ddof: 1))
-        case 19: return .float64(try narrowed().stddev(gb, ddof: 0))
-        case 20: return .float64(try narrowed().stddev(gb, ddof: 1))
+        // The grouped variance now runs in binary64 on the values as they are, Float64 included.
+        case 17: return .float64(try gb.variance(self, ddof: 0))
+        case 18: return .float64(try gb.variance(self, ddof: 1))
+        case 19: return .float64(try gb.stddev(self, ddof: 0))
+        case 20: return .float64(try gb.stddev(self, ddof: 1))
         case 21: return .float64(try gb.approximateMedian(self))
         case 22: return .float64(try gb.quantile(self, p1))
         case 23: return .float64(try gb.skew(self))
@@ -202,9 +201,11 @@ extension MetalArray: GroupedValueOps {
         let unsigned = T.minValue >= 0 as T
         withExtendedLifetime((sums, counts, out)) {
             let d = out.mutableValuePointer, bm = out.validity!.mutableTyped(UInt8.self)
-            for k in 0..<gb.keyCount where counts.valuePointer[k] > 0 && sums.isValid(k) {
-                let total = unsigned ? Double(UInt64(bitPattern: sums.valuePointer[k])) : Double(sums.valuePointer[k])
-                d[k] = total / Double(counts.valuePointer[k])
+            let sp = sums.valuePointer, cp = counts.valuePointer
+            let sv = sums.validity?.typed(UInt8.self)
+            for k in 0..<gb.keyCount where cp[k] > 0 && (sv == nil || Bitmap.isSet(sv!, k)) {
+                let total = unsigned ? Double(UInt64(bitPattern: sp[k])) : Double(sp[k])
+                d[k] = total / Double(cp[k])
                 Bitmap.set(bm, k)
             }
         }

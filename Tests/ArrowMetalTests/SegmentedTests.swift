@@ -149,4 +149,74 @@ final class SegmentedTests: XCTestCase {
         let gb2 = try allNull.groupBy(keyCount: 3)
         XCTAssertEqual(try gb2.sumDouble(try MetalArray<Double>((0..<100).map { Double($0) })).toArray(), [nil, nil, nil])
     }
+
+    /// The counting sort by group id must produce exactly the order the argsort it replaced produced:
+    /// the same rows in each group's run, in the same (ascending, i.e. row) order. Both scatters and the
+    /// argsort fallback are exercised — the group counts below straddle every threshold.
+    func testCountingSortMatchesArgsortOrder() throws {
+        try requireRealGPU()
+        var rng = Rng(s: 0xC0FFEE)
+        for (K, n, skewed) in [(1, 5_000, false), (7, 50_000, false), (997, 200_000, false),
+                               (5_000, 300_000, false), (300_000, 300_000, false),
+                               (200_000, 400_000, true), (64, 1_000, false)] {
+            var keys: [Int32?] = []
+            for i in 0..<n {
+                if skewed && i < n / 2 { keys.append(0); continue }        // one run far too long to fix
+                keys.append(Int.random(in: 0..<20, using: &rng) == 0 ? nil
+                                                                     : Int32.random(in: 0..<Int32(K), using: &rng))
+            }
+            if n > 10 { keys[2] = Int32(K) + 5; keys[3] = -1 }             // out of range: in no group
+            let gb = try MetalArray<Int32>(keys).groupBy(keyCount: K)
+            let fast = try XCTUnwrap(try gb.countingSortOrder() ?? (try gb.argsortSegments()))
+            let slow = try gb.argsortSegments()
+            let label = "K=\(K) n=\(n) skewed=\(skewed)"
+            let fo = fast.ord.valuePointer, so = slow.ord.valuePointer
+            let fs = fast.segStart.typed(UInt32.self), fe = fast.segEnd.typed(UInt32.self)
+            let ss = slow.segStart.typed(UInt32.self), se = slow.segEnd.typed(UInt32.self)
+            var seen = 0
+            for k in 0..<K {
+                let a = (Int(fs[k])..<Int(fe[k])).map { fo[$0] }
+                let b = (Int(ss[k])..<Int(se[k])).map { so[$0] }
+                XCTAssertEqual(a, b, "run of key \(k), \(label)")
+                XCTAssertEqual(a, a.sorted(), "run of key \(k) is not in row order, \(label)")
+                seen += a.count
+            }
+            let expected = keys.filter { $0.map { $0 >= 0 && Int($0) < K } ?? false }.count
+            XCTAssertEqual(seen, expected, "rows placed, \(label)")
+        }
+    }
+
+    /// The sort-free grouped extremes must agree exactly with the segmented reduction they replaced,
+    /// for every element width and both signs, NaN and nulls included.
+    func testExtremaMatchSegmentedMinMax() throws {
+        try requireRealGPU()
+        var rng = Rng(s: 0xBEEF)
+        for K in [1, 3, 1000, 60_000] {
+            let n = 120_000
+            var keys: [Int32?] = [], i64: [Int64?] = [], u64: [UInt64?] = []
+            var f64: [Double?] = [], f32: [Float?] = [], i32: [Int32?] = [], u16: [UInt16?] = []
+            for _ in 0..<n {
+                keys.append(Int.random(in: 0..<20, using: &rng) == 0 ? nil : Int32.random(in: 0..<Int32(K), using: &rng))
+                let drop = Int.random(in: 0..<10, using: &rng) == 0
+                i64.append(drop ? nil : Int64.random(in: Int64.min...Int64.max, using: &rng))
+                u64.append(drop ? nil : UInt64.random(in: 0...UInt64.max, using: &rng))
+                f64.append(drop ? nil : Double.random(in: -1e12...1e12, using: &rng))
+                f32.append(drop ? nil : Float.random(in: -1e6...1e6, using: &rng))
+                i32.append(drop ? nil : Int32.random(in: Int32.min...Int32.max, using: &rng))
+                u16.append(drop ? nil : UInt16.random(in: 0...UInt16.max, using: &rng))
+            }
+            keys[2] = Int32(K) + 5; keys[3] = -1
+            f64[4] = .nan; f32[5] = .nan; f64[6] = .infinity; f32[7] = -.infinity
+            let gb = try MetalArray<Int32>(keys).groupBy(keyCount: K)
+            func compare<T: ArrowPrimitive & Equatable>(_ vals: [T?], _ what: String) throws {
+                let a = try MetalArray<T>(vals)
+                let fast = try gb.extrema(a)
+                let slow = try gb.minMaxSegmented(a)
+                XCTAssertEqual(fast.min.toArray(), slow.min.toArray(), "min \(what) K=\(K)")
+                XCTAssertEqual(fast.max.toArray(), slow.max.toArray(), "max \(what) K=\(K)")
+            }
+            try compare(i64, "int64"); try compare(u64, "uint64"); try compare(f64, "float64")
+            try compare(f32, "float32"); try compare(i32, "int32"); try compare(u16, "uint16")
+        }
+    }
 }

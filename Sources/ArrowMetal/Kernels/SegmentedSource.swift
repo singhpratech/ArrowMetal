@@ -1,11 +1,12 @@
 import Foundation
 
-/// MSL for sort-based *segmented* group-by aggregation.
+/// MSL for *segmented* group-by aggregation over rows already in group order.
 ///
 /// The atomic group-by in `GroupBySource` is limited by what Metal's atomics can express: 32-bit only,
-/// so no 64-bit min/max and no Float64 anything. Sorting the keys removes the need for atomics
-/// altogether — after an argsort every group is one contiguous run of the sorted order, so a
-/// threadgroup can reduce its run privately and write one result. That buys Float64 sums (through the
+/// so no 64-bit min/max and no Float64 anything. Putting the rows in group order removes the need for
+/// atomics altogether — every group is then one contiguous run, so a threadgroup can reduce its run
+/// privately and write one result. That order is a **counting sort by group id**
+/// (`Kernels/GroupOrder.swift`), not a sort of the key column. That buys Float64 sums (through the
 /// software binary64 adder in `DoubleMath`), 64-bit min/max, and means without a host division.
 ///
 /// Three kernels:

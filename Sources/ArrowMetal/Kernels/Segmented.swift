@@ -1,10 +1,11 @@
 import Foundation
 import Metal
 
-/// The sorted key order of a `GroupBy` plus `[start, end)` per key.
+/// The group order of a `GroupBy` plus `[start, end)` per key.
 ///
-/// Building it is the expensive part of a segmented aggregate (one argsort of the keys), so it is a
-/// value the caller can hold and pass to several aggregates.
+/// Building it is the expensive part of a segmented aggregate — a counting sort by group id
+/// (`Kernels/GroupOrder.swift`), or the argsort of the keys when neither counting-sort shape fits — so
+/// it is a value the caller can hold and pass to several aggregates. `GroupBy` also caches it.
 public final class GroupSegments {
     /// Row index of each non-null key, ascending by key (stable, so rows inside a group keep their order).
     let ord: MetalArray<Int32>
@@ -22,16 +23,29 @@ public final class GroupSegments {
 /// Sort-based segmented aggregation for `GroupBy`.
 ///
 /// `GroupBy`'s atomic path is bounded by what Metal's atomics can express: 32-bit only, so no 64-bit
-/// min/max and no Float64 values. This path removes atomics from the aggregation entirely. The keys are
-/// argsorted once, which makes every group one contiguous run of the sorted order; a threadgroup then
-/// reduces one run privately and writes a single result. Float64 arithmetic uses the same software
+/// min/max and no Float64 values. This path removes atomics from the aggregation entirely. The rows are
+/// put in group order once (a counting sort by group id), which makes every group one contiguous run; a
+/// threadgroup then reduces one run privately and writes a single result. Float64 arithmetic uses the same software
 /// binary64 implementation as `sum` (`DoubleMath`), so each addition is correctly rounded.
 ///
 /// Nulls follow Arrow: a null key or a key outside `[0, keyCount)` contributes nothing, null values are
 /// skipped, and a key with no valid value comes back null.
 extension GroupBy {
-    /// Argsorts the keys and marks the run of each key in the sorted order.
+    /// Puts the rows in group order and marks the run of each key.
+    ///
+    /// The keys are already dense ids in `[0, keyCount)`, so this is a **counting sort**
+    /// (`Kernels/GroupOrder.swift`) — one pass over the keys — not the four-pass radix argsort it used
+    /// to be. The argsort stays as the fallback for the shapes the counting sort declines: a group count
+    /// too large for a per-block histogram whose longest run is also too long to re-order cheaply.
     public func segments() throws -> GroupSegments {
+        if let cached = cache.segments { return cached }
+        let s = try countingSortOrder() ?? (try argsortSegments())
+        cache.segments = s
+        return s
+    }
+
+    /// Argsorts the keys and marks the run of each key in the sorted order.
+    func argsortSegments() throws -> GroupSegments {
         try Dispatch.checkLength(keys.length)
         let ctx = keys.context
         let n = keys.length
@@ -97,6 +111,8 @@ extension GroupBy {
 
     private func minMax64<T: ArrowPrimitive>(_ values: MetalArray<T>, isMin: Bool, segments s: GroupSegments?) throws -> MetalArray<T> {
         guard T.byteWidth == 8 else { return isMin ? try min(values) : try max(values) }
+        // Sort-free two-pass atomics unless the caller already paid for the sorted order.
+        if s == nil { let e = try extrema(values); return isMin ? e.min : e.max }
         let kind = T.isFloatingPoint ? "double" : (T.minValue < 0 as T ? "signed" : "unsigned")
         let op = SegmentedSource.minMax64(isMin: isMin, kind: kind)
         let (out, valid) = try run(values, op: op, segments: s)

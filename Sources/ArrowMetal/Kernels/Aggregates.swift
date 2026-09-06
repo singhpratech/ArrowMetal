@@ -388,9 +388,9 @@ extension MetalBooleanArray {
 //
 // | function | how it runs |
 // |---|---|
-// | `hash_first` / `hash_last` | group-by min / max over a row index array, then one `take` — all GPU |
+// | `hash_first` / `hash_last` | the sort-free grouped extremes over a row index array, then one `take` |
 // | `hash_any` / `hash_all` | group-by max / min over the unpacked boolean bytes — all GPU |
-// | `hash_variance` / `hash_stddev` | GPU means, a GPU gather of the mean per row, GPU deviations, GPU sum |
+// | `hash_variance` / `hash_stddev` | two GPU passes in binary64 over the counting-sort order |
 // | `hash_count_distinct` | GPU dictionary encoding of the values, GPU `unique` over packed (key, code) pairs |
 // | `hash_product` | one host pass over the key and value buffers (there is no 64-bit atomic multiply) |
 // | `hash_approximate_median` | **not implemented** — see `approximateMedian` below |
@@ -414,7 +414,10 @@ extension GroupBy {
         let iota = try MetalArray<Int32>.iota(values.length, context: values.context)
         let masked = MetalArray<Int32>(length: values.length, nullCount: values.nullCount,
                                        validity: values.validity, values: iota.values, context: values.context)
-        return wantFirst ? try min(masked) : try max(masked)
+        // The fused sort-free extremes: one atomic pass and a GPU finalize, so a ten-million-group
+        // `first` never walks the groups on the host.
+        let e = try extrema(masked)
+        return wantFirst ? e.min : e.max
     }
 
     /// Arrow `hash_any` over a boolean column: true for a key with at least one true value, null for a
@@ -440,30 +443,15 @@ extension GroupBy {
 
     /// Arrow `hash_variance` per key (`ddof` 0 for the population variance, 1 for the sample one).
     ///
-    /// GPU, in the same two-pass shape as the scalar form: the per-key means come from `sum` and `count`,
-    /// a `take` by the key gathers each row's mean, and the squared deviations are summed per key.
-    /// Deviations are computed in Float32, so expect a relative error around 1e-6; a column whose values
-    /// need more than 24 bits of mantissa should be scaled first.
+    /// GPU, in the same two-pass shape as the scalar form, but in **true binary64**
+    /// (`Kernels/GroupMoments.swift`): the counting sort by group id puts each group's rows together,
+    /// one segmented pass sums the values exactly for the per-group mean, and a second sums the
+    /// deviations and their squares about it. Every addition, multiplication and division goes through
+    /// the software binary64 routines, and the shift correction `sum d^2 - (sum d)^2 / n` removes the
+    /// error in the mean itself, so a Float64 column lands within about 1e-14 relative of Arrow's own
+    /// answer rather than the 1e-5 the Float32 deviations used to cost.
     public func variance<T: ArrowPrimitive>(_ values: MetalArray<T>, ddof: Int = 0) throws -> MetalArray<Double> {
-        guard values.length == keys.length else { throw ArrowMetalError.lengthMismatch(keys.length, values.length) }
-        let counts = try count(values)
-        let means = try meanPerKey(values, counts: counts)
-        let asFloat = try values.cast(to: Float.self)
-        let perRow = try means.take(keys)                                  // null key or empty group -> null
-        let deviation = try asFloat.arithmetic(.sub, perRow)
-        let squares = try deviation.arithmetic(.mul, deviation)
-        let sums = try sumFloat(squares)
-        let out = try MetalArray<Double>.allocate(length: keyCount, withValidity: true, context: values.context)
-        withExtendedLifetime((counts, sums, out)) {
-            let c = counts.valuePointer, s = sums.valuePointer
-            let d = out.mutableValuePointer, valid = out.validity!.mutableTyped(UInt8.self)
-            for k in 0..<keyCount where Int(c[k]) > ddof && sums.isValid(k) {
-                d[k] = s[k] / Double(Int(c[k]) - ddof)
-                Bitmap.set(valid, k)
-            }
-        }
-        out.recomputeNullCount()
-        return out
+        try varianceDouble(values, ddof: ddof)
     }
 
     /// Arrow `hash_stddev` per key: the square root of `variance`.
@@ -472,8 +460,11 @@ extension GroupBy {
         let out = try MetalArray<Double>.allocate(length: keyCount, withValidity: true, context: v.context)
         withExtendedLifetime((v, out)) {
             let s = v.valuePointer
+            let vb = v.validity?.typed(UInt8.self)
             let d = out.mutableValuePointer, valid = out.validity!.mutableTyped(UInt8.self)
-            for k in 0..<keyCount where v.isValid(k) { d[k] = s[k].squareRoot(); Bitmap.set(valid, k) }
+            for k in 0..<keyCount where vb == nil || Bitmap.isSet(vb!, k) {
+                d[k] = s[k].squareRoot(); Bitmap.set(valid, k)
+            }
         }
         out.recomputeNullCount()
         return out

@@ -6,14 +6,14 @@ import Metal
 //
 // | function | how it runs |
 // |---|---|
-// | `hash_min_max` | GPU, fused: one segmented kernel produces both extremes from one read |
+// | `hash_min_max` | GPU, sort-free: two passes of 32-bit atomics over an order-preserving key |
 // | `hash_count_all` | GPU, the existing group-by row count |
 // | `hash_first_last` | GPU, two group-by extremes over a masked row index plus two gathers |
 // | `hash_one` | GPU, a group-by minimum over the row index plus one gather |
 // | `hash_list` | GPU, segmented gather after the stable sort by group id |
 // | `hash_distinct` | GPU, dictionary encode + packed `unique` + segmented gather |
 // | `hash_approximate_median` / `hash_quantile` | GPU sort by (group, value) plus a GPU per-group pick |
-// | `hash_skew` / `hash_kurtosis` | two GPU passes: per-group means, then the 3rd/4th central moments |
+// | `hash_skew` / `hash_kurtosis` | two GPU passes in binary64: per-group means, then the 3rd/4th moments |
 // | `hash_product` | GPU, segmented multiply reduction (was a host pass) |
 // | `hash_pivot_wider` | GPU, one masked `hash_one` per pivot key |
 // | `hash_tdigest` | GPU sort by (group, value), CPU merge of the centroids per group |
@@ -23,8 +23,9 @@ import Metal
 // Precision. The fused `hash_min_max` is exact for every type. `hash_product` wraps in 64 bits for
 // integers exactly as the scalar `product` does, multiplies Float32 in `float` and Float64 through the
 // software binary64 routine, and reassociates across the threads of a group either way. `hash_skew` and
-// `hash_kurtosis` form their deviations in Float32 about a Float64 per-group mean and accumulate in
-// compensated float pairs, so expect a relative error around 1e-5 on well-conditioned data; the scalar
+// `hash_kurtosis` now form their deviations about an **exact** per-group mean and accumulate them in
+// software binary64 (`Kernels/GroupMoments.swift`), so they land near 1e-15 rather than the 1e-5 the
+// Float32 deviations used to cost; the scalar
 // `skew` and `kurtosis` use the same per-type deviation machinery as `variance` (64-bit integer part for
 // integer columns, a two-float mean for Float32, software binary64 for Float64) and land near 1e-7 and
 // 1e-15 respectively. `hash_approximate_median` is **exact**, not a sketch, for the same reason the
@@ -51,10 +52,18 @@ extension GroupBy {
     /// Arrow `hash_min_max`: the smallest and largest non-null value of each key, from **one** read of
     /// the values. NaN is skipped, so a key whose only values are NaN is null, as in Arrow.
     ///
-    /// GPU, segmented: the keys are argsorted once (pass `segments` to share that sort with other
-    /// aggregates) and one threadgroup reduces one key's run, carrying both extremes at the same time.
-    /// Unlike the atomic `min` / `max` this works for 64-bit types too.
+    /// GPU, sort-free: two linear passes of 32-bit atomics over an order-preserving 64-bit key
+    /// (`Kernels/GroupByExtrema.swift`) — the high word's extremes first, then the low word's among the
+    /// rows that hold the winning high word. Unlike the plain atomic `min` / `max` this works for 64-bit
+    /// types too, and unlike the segmented path it replaces there is no argsort of the key column.
+    /// `segments` is accepted for source compatibility and only used by the segmented fallback.
     public func minMax<T: ArrowPrimitive>(_ values: MetalArray<T>, segments s: GroupSegments? = nil)
+        throws -> (min: MetalArray<T>, max: MetalArray<T>) {
+        try extrema(values)
+    }
+
+    /// The segmented `min_max` the atomic path replaced, kept for differential testing.
+    func minMaxSegmented<T: ArrowPrimitive>(_ values: MetalArray<T>, segments s: GroupSegments? = nil)
         throws -> (min: MetalArray<T>, max: MetalArray<T>) {
         guard values.length == keys.length else { throw ArrowMetalError.lengthMismatch(keys.length, values.length) }
         let ctx = values.context
@@ -262,43 +271,21 @@ extension GroupBy {
                                             wantSkew: Bool, segments s: GroupSegments?) throws -> MetalArray<Double> {
         guard values.length == keys.length else { throw ArrowMetalError.lengthMismatch(keys.length, values.length) }
         let ctx = values.context
-        let seg = try s ?? segments()
-        let floats = T.self == Float.self ? (values as! MetalArray<Float>) : try values.cast(to: Float.self)
-        // Pass one: the per-key mean, summed and divided in Float64 on the GPU.
-        let means = try meanFloat(floats, segments: seg)
-        let K = keyCount
-        let meanF = try MetalArrowBuffer.allocate(byteCount: Swift.max(K, 1) * 4, zeroed: false, context: ctx)
-        withExtendedLifetime((means, meanF)) {
-            let p = meanF.mutableTyped(Float.self)
-            for k in 0..<K { p[k] = means.isValid(k) ? Float(means.valuePointer[k]) : 0 }
-        }
-        // Pass two: the three central moments about that mean.
-        let spec = ExtraAggregateSpec.of(Float.self)
-        let sums = try MetalArrowBuffer.allocate(byteCount: Swift.max(K, 1) * 12, zeroed: false, context: ctx)
-        let counts = try MetalArrowBuffer.allocate(byteCount: Swift.max(K, 1) * 4, context: ctx)
-        let pso = try Dispatch.pipeline(ctx, family: "aggextra", source: spec.source,
-                                        function: "gx_seg_moment34", type: spec.key)
-        try ctx.run { enc in
-            enc.setComputePipelineState(pso)
-            ExtraAggregates.bindSegments(enc, seg, floats)
-            enc.setBuffer(meanF.mtl, offset: 0, index: 7)
-            enc.setBuffer(sums.mtl, offset: 0, index: 8)
-            enc.setBuffer(counts.mtl, offset: 0, index: 9)
-            enc.dispatchThreadgroups(MTLSize(width: Swift.max(K, 1), height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1))
-        }
-        ctx.retainUntilFlush(seg.ord); ctx.retainUntilFlush(floats); ctx.retainUntilFlush(meanF)
+        // Both passes in binary64 over the counting-sort order (`Kernels/GroupMoments.swift`), so the
+        // deviations no longer round through Float32.
+        let (sums, counts) = try centralMoments(values)
         try ctx.syncPoint()
+        let K = keyCount
         let out = try MetalArray<Double>.allocate(length: K, withValidity: true, context: ctx)
         withExtendedLifetime((sums, counts, out)) {
-            let s = sums.typed(Float.self), c = counts.typed(UInt32.self)
+            let s = sums.typed(UInt64.self), c = counts.typed(UInt32.self)
             let d = out.mutableValuePointer, bm = out.validity!.mutableTyped(UInt8.self)
             for k in 0..<K {
                 let n = Int(c[k])
-                guard n >= Swift.max(minCount, wantSkew ? 1 : 1) else { continue }
-                let m2 = Double(s[3 * k]) / Double(n)
-                let m3 = Double(s[3 * k + 1]) / Double(n)
-                let m4 = Double(s[3 * k + 2]) / Double(n)
+                guard n >= Swift.max(minCount, 1) else { continue }
+                let m2 = Double(bitPattern: s[3 * k]) / Double(n)
+                let m3 = Double(bitPattern: s[3 * k + 1]) / Double(n)
+                let m4 = Double(bitPattern: s[3 * k + 2]) / Double(n)
                 guard let v = ExtraAggregates.standardise(n: n, m2: m2, m3: m3, m4: m4,
                                                           wantSkew: wantSkew, biased: biased) else { continue }
                 d[k] = v; Bitmap.set(bm, k)

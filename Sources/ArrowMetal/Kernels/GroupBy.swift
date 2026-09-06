@@ -8,6 +8,13 @@ public struct GroupBy<K: ArrowIndex> {
     public let keys: MetalArray<K>
     public let keyCount: Int
 
+    /// Work that depends only on the keys, so several aggregates over one `GroupBy` pay for it once.
+    /// A reference type deliberately: copies of the struct share it.
+    final class Cache {
+        var segments: GroupSegments?
+    }
+    let cache = Cache()
+
     public init(keys: MetalArray<K>, keyCount: Int) throws {
         guard keyCount > 0, keyCount <= Int(UInt32.max) / 4 else { throw ArrowMetalError.invalidArrowArray("keyCount out of range") }
         self.keys = keys
@@ -59,11 +66,16 @@ public struct GroupBy<K: ArrowIndex> {
     public func mean<T: ArrowPrimitive>(_ values: MetalArray<T>) throws -> MetalArray<Double> where T: FixedWidthInteger {
         let s = try sum(values), c = try count(values)
         let res = try MetalArray<Double>.allocate(length: keyCount, withValidity: true, context: values.context)
-        let d = res.mutableValuePointer, v = res.validity!.mutableTyped(UInt8.self)
         let unsigned = T.minValue >= 0
-        for k in 0..<keyCount where c.valuePointer[k] > 0 {
-            let total = unsigned ? Double(UInt64(bitPattern: s.valuePointer[k])) : Double(s.valuePointer[k])
-            d[k] = total / Double(c.valuePointer[k]); Bitmap.set(v, k)
+        withExtendedLifetime((s, c, res)) {
+            // Hoisted out of the loop: `valuePointer` re-resolves the buffer on every access, which at a
+            // group count in the millions costs more than the division.
+            let sp = s.valuePointer, cp = c.valuePointer
+            let d = res.mutableValuePointer, v = res.validity!.mutableTyped(UInt8.self)
+            for k in 0..<keyCount where cp[k] > 0 {
+                let total = unsigned ? Double(UInt64(bitPattern: sp[k])) : Double(sp[k])
+                d[k] = total / Double(cp[k]); Bitmap.set(v, k)
+            }
         }
         res.recomputeNullCount()
         return res
