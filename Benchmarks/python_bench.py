@@ -29,6 +29,16 @@ def bench(section, label, bytes_, fn):
     print(f"  {label:<44} {best*1000:9.2f} ms  {bytes_/best/1e9:7.1f} GB/s  {best_cpu*1000:8.1f} CPU-ms")
     results.append((section, label, best * 1000, bytes_ / best / 1e9, best_cpu * 1000))
 
+def bench_opt(section, label, bytes_, fn):
+    """Like bench, but skips the row if the library does not have the operation."""
+    try:
+        fn()
+    except Exception as e:
+        print(f"  {label:<44} skipped ({type(e).__name__}: {e})")
+        return
+    bench(section, label, bytes_, fn)
+
+
 print(f"Python bench: polars {pl.__version__} ({pl.thread_pool_size()} threads), pyarrow {pa.__version__} "
       f"({pa.cpu_count()} threads), pandas {pd.__version__}; rows={rows}, best of {iters}\n")
 
@@ -144,6 +154,70 @@ sec = "compare(Float32 > 0) then filter"; print("\n" + sec)
 bench(sec, "polars  compare then filter", B4, lambda: pl_f32.filter(pl_f32 > 0))
 bench(sec, "pyarrow compare then filter", B4, lambda: pc.filter(arr_f32, pc.greater(arr_f32, 0)))
 bench(sec, "numpy   boolean index", B4, lambda: f32[f32 > 0])
+
+# ---- sorting (no nulls, same shapes as the Swift benchmark)
+sort_i64 = rng.integers(-(2 ** 62), 2 ** 62, size=rows, dtype=np.int64)
+arr_sort_i64 = pa.array(sort_i64)
+pl_sort_i64 = pl.Series("x", arr_sort_i64)
+sort_f64 = rng.random(rows) * 2e9 - 1e9
+arr_sort_f64 = pa.array(sort_f64)
+pl_sort_f64 = pl.Series("x", arr_sort_f64)
+
+sec = f"argsort(Int64, {rows} rows, no nulls)"; print("\n" + sec)
+bench(sec, "polars  arg_sort", rows * 12, lambda: pl_sort_i64.arg_sort())
+bench_opt(sec, "pyarrow array_sort_indices", rows * 12, lambda: pc.array_sort_indices(arr_sort_i64))
+bench(sec, "numpy   argsort", rows * 12, lambda: np.argsort(sort_i64))
+
+sec = f"sort(Float64, {rows} rows, no nulls)"; print("\n" + sec)
+bench(sec, "polars  sort", rows * 16, lambda: pl_sort_f64.sort())
+bench_opt(sec, "pyarrow sort_indices + take", rows * 16, lambda: pc.take(arr_sort_f64, pc.array_sort_indices(arr_sort_f64)))
+bench(sec, "numpy   sort", rows * 16, lambda: np.sort(sort_f64))
+
+sec = f"top_k(100 of {rows} Int64)"; print("\n" + sec)
+bench(sec, "polars  top_k", rows * 8, lambda: pl_sort_i64.top_k(100))
+bench_opt(sec, "pyarrow select_k_unstable", rows * 8,
+          lambda: pc.select_k_unstable(arr_sort_i64, k=100, sort_keys=[("", "descending")]))
+bench(sec, "numpy   argpartition", rows * 8, lambda: np.argpartition(sort_i64, rows - 100)[rows - 100:])
+
+# ---- strings: 10M utf8 values drawn from 1000 distinct keys, same vocabulary as the Swift benchmark
+str_rows = min(rows, 10_000_000)
+distinct = 1000
+regions = ["north", "south", "east", "west"]
+vocab = [f"cust_{i:03d}_{regions[i % 4]}" for i in range(distinct)]
+scodes = rng.integers(0, distinct, size=str_rows, dtype=np.int32)
+arr_str = pa.DictionaryArray.from_arrays(pa.array(scodes), pa.array(vocab)).cast(pa.string())
+pl_str = pl.Series("s", arr_str)
+pd_str = pd.Series(pd.arrays.ArrowExtensionArray(arr_str))
+SB = arr_str.nbytes
+print(f"\nstrings: {str_rows} utf8 values, {distinct} distinct, {SB // 1_000_000} MB")
+
+sec = f'string contains("north") over {str_rows} strings (25% hit)'; print("\n" + sec)
+bench(sec, "polars  str.contains (literal)", SB, lambda: pl_str.str.contains("north", literal=True))
+bench(sec, "pyarrow match_substring", SB, lambda: pc.match_substring(arr_str, "north"))
+bench(sec, "pandas  str.contains (arrow-backed)", SB, lambda: pd_str.str.contains("north", regex=False))
+
+sec = f'string starts_with("cust_1") over {str_rows} strings (10% hit)'; print("\n" + sec)
+bench(sec, "polars  str.starts_with", SB, lambda: pl_str.str.starts_with("cust_1"))
+bench(sec, "pyarrow starts_with", SB, lambda: pc.starts_with(arr_str, "cust_1"))
+
+sec = f'string equals("cust_042_east") over {str_rows} strings'; print("\n" + sec)
+bench(sec, "polars  ==", SB, lambda: pl_str == "cust_042_east")
+bench(sec, "pyarrow equal", SB, lambda: pc.equal(arr_str, "cust_042_east"))
+
+sec = f"string filter over {str_rows} strings (~30% kept)"; print("\n" + sec)
+str_keep = scodes < distinct * 3 // 10
+pl_keep = pl.Series(str_keep); pa_keep = pa.array(str_keep)
+bench(sec, "polars  filter", SB, lambda: pl_str.filter(pl_keep))
+bench(sec, "pyarrow filter", SB, lambda: pc.filter(arr_str, pa_keep))
+
+sec = f"dictionary_encode + group-by sum over {str_rows} strings ({distinct} distinct)"; print("\n" + sec)
+str_amount = sort_i64[:str_rows]
+DB = SB + str_rows * 8
+df_str = pl.DataFrame({"s": pl_str, "x": str_amount})
+tbl_str = pa.table({"s": arr_str, "x": pa.array(str_amount)})
+bench(sec, "polars  group_by(str) sum", DB, lambda: df_str.group_by("s").agg(pl.col("x").sum()))
+bench(sec, "pyarrow group_by(str) sum", DB, lambda: tbl_str.group_by("s").aggregate([("x", "sum")]))
+bench(sec, "pyarrow dictionary_encode only", SB, lambda: pc.dictionary_encode(arr_str))
 
 print("\n\n| Operation | Implementation | Time (ms) | Throughput (GB/s) | CPU time (ms) |\n|---|---|---:|---:|---:|")
 for s, l, ms, gb, cpu in results:

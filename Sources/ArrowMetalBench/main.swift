@@ -373,6 +373,239 @@ time("CPU \(cores)-core compare then filter", bytes: bytesF32, section: sec) {
     sink(cpuFilterParallel(p, n: rows, sel: cmpOut, into: f32Out))
 }
 
+// ---------------------------------------------------------------------------------------------------
+// Sorting: GPU LSD radix sort vs an all-core CPU sort (chunk sort on every core, then a merge tree whose
+// merges also run in parallel). Both start from the same Arrow buffer and produce the same permutation.
+// ---------------------------------------------------------------------------------------------------
+
+/// Sorts `a[0..<n]` using every core: `cores` chunks sorted in parallel, then a pairwise merge tree.
+/// `scratch` must hold `n` elements; the sorted result always ends up in `a`.
+func parallelSort<T: Comparable>(_ a: UnsafeMutablePointer<T>, _ scratch: UnsafeMutablePointer<T>, _ n: Int) {
+    if n < 2 { return }
+    let chunks = max(1, min(cores, (n + 65_535) / 65_536))
+    let per = (n + chunks - 1) / chunks
+    var bounds = (0...chunks).map { min(n, $0 * per) }
+    let first = bounds
+    DispatchQueue.concurrentPerform(iterations: chunks) { c in
+        let lo = first[c], hi = first[c + 1]
+        if hi > lo { var b = UnsafeMutableBufferPointer(start: a + lo, count: hi - lo); b.sort() }
+    }
+    var src = a, dst = scratch
+    while bounds.count > 2 {
+        let b = bounds
+        let runs = b.count - 1
+        let pairs = (runs + 1) / 2
+        let s = src, d = dst
+        DispatchQueue.concurrentPerform(iterations: pairs) { p in
+            let lo = b[2 * p], mid = b[2 * p + 1], hi = 2 * p + 2 < b.count ? b[2 * p + 2] : n
+            var i = lo, j = mid, k = lo
+            while i < mid && j < hi { if s[j] < s[i] { d[k] = s[j]; j += 1 } else { d[k] = s[i]; i += 1 }; k += 1 }
+            while i < mid { d[k] = s[i]; i += 1; k += 1 }
+            while j < hi { d[k] = s[j]; j += 1; k += 1 }
+        }
+        var next = (0..<pairs).map { b[2 * $0] }
+        next.append(n)
+        bounds = next
+        swap(&src, &dst)
+    }
+    if src != a { a.update(from: src, count: n) }
+}
+
+/// (key, original index) pair; ordering by key then index makes the CPU sort stable like the GPU one.
+struct KeyIndex: Comparable {
+    var key: Int64
+    var idx: Int32
+    static func < (a: KeyIndex, b: KeyIndex) -> Bool { a.key != b.key ? a.key < b.key : a.idx < b.idx }
+}
+
+let sortI64 = try MetalArray<Int64>((0..<rows).map { _ in Int64.random(in: Int64.min...Int64.max, using: &g) })
+let sortF64 = try MetalArray<Double>((0..<rows).map { _ in Double.random(in: -1e9...1e9, using: &g) })
+
+sec = "argsort(Int64, \(rows) rows, no nulls)"; print("\n" + sec)
+try time("Metal  argsort (GPU LSD radix, 8 passes)", bytes: rows * 12, section: sec) { sink(try sortI64.argsort()) }
+let kiA = UnsafeMutablePointer<KeyIndex>.allocate(capacity: rows)
+let kiB = UnsafeMutablePointer<KeyIndex>.allocate(capacity: rows)
+time("CPU \(cores)-core argsort (chunk sort + merge tree)", bytes: rows * 12, section: sec) {
+    let p = opaque(sortI64).valuePointer
+    _ = parallelChunks(rows) { lo, hi in for i in lo..<hi { kiA[i] = KeyIndex(key: p[i], idx: Int32(i)) }; return 0 }
+    parallelSort(kiA, kiB, rows)
+    sink(kiA[rows - 1].idx)
+}
+
+sec = "sort(Float64, \(rows) rows, no nulls)"; print("\n" + sec)
+try time("Metal  sort (radix argsort + take)", bytes: rows * 16, section: sec) { sink(try sortF64.sorted()) }
+let dblA = UnsafeMutablePointer<Double>.allocate(capacity: rows)
+let dblB = UnsafeMutablePointer<Double>.allocate(capacity: rows)
+time("CPU \(cores)-core sort (chunk sort + merge tree)", bytes: rows * 16, section: sec) {
+    dblA.update(from: opaque(sortF64).valuePointer, count: rows)
+    parallelSort(dblA, dblB, rows)
+    sink(dblA[rows - 1])
+}
+time("Swift  [Double].sort() (1 core, introsort)", bytes: rows * 16, section: sec) {
+    dblA.update(from: opaque(sortF64).valuePointer, count: rows)
+    var b = UnsafeMutableBufferPointer(start: dblA, count: rows)
+    b.sort()
+    sink(dblA[rows - 1])
+}
+
+sec = "top_k(100 of \(rows) Int64)"; print("\n" + sec)
+let topKCount = 100
+try time("Metal  top_k (full radix argsort + slice)", bytes: rows * 8, section: sec) { sink(try sortI64.topK(topKCount)) }
+time("CPU \(cores)-core top_k (per-core running top-k)", bytes: rows * 8, section: sec) {
+    let p = opaque(sortI64).valuePointer
+    let parts = parallelChunks(rows) { lo, hi -> [Int64] in
+        var best = [Int64](repeating: Int64.min, count: topKCount)
+        var thr = Int64.min
+        for i in lo..<hi {
+            let v = p[i]
+            if v > thr {
+                var j = 1
+                while j < topKCount && best[j] < v { best[j - 1] = best[j]; j += 1 }
+                best[j - 1] = v
+                thr = best[0]
+            }
+        }
+        return best
+    }
+    sink(parts.flatMap { $0 }.sorted().suffix(topKCount))
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Strings (Arrow utf8): predicates, filter, and dictionary-encoded group-by over 10M values.
+// ---------------------------------------------------------------------------------------------------
+
+let strRows = min(rows, 10_000_000)
+let distinct = 1000
+let regions = ["north", "south", "east", "west"]
+let vocab = (0..<distinct).map { i in "cust_" + String(format: "%03d", i) + "_" + regions[i % 4] }
+var strCodesRaw = [Int32](); strCodesRaw.reserveCapacity(strRows)
+var strVals = [String?](); strVals.reserveCapacity(strRows)
+for _ in 0..<strRows {
+    let c = Int32.random(in: 0..<Int32(distinct), using: &g)
+    strCodesRaw.append(c); strVals.append(vocab[Int(c)])
+}
+let strCol = try MetalStringArray(strVals)
+strVals = []
+let strBytes = strCol.totalBytes + (strRows + 1) * 4
+let sOff = strCol.offsets.typed(Int32.self)
+let sDat = strCol.data.typed(UInt8.self)
+let strBitmap = UnsafeMutablePointer<UInt8>.allocate(capacity: strRows / 8 + 64)
+
+/// All-core CPU string predicate into a packed Arrow bitmap. kind: 0 equals, 1 starts_with, 2 contains.
+func cpuStrPredicate(_ pattern: String, kind: Int) {
+    let pat = Array(pattern.utf8)
+    pat.withUnsafeBufferPointer { pp in
+        let m = pp.count, pb = pp.baseAddress!
+        _ = parallelChunks(strRows) { lo, hi -> Int in
+            var i = lo
+            while i < hi {
+                var b: UInt8 = 0
+                let lim = min(8, hi - i)
+                for j in 0..<lim {
+                    let s = Int(sOff[i + j]), len = Int(sOff[i + j + 1]) - s
+                    var hit = false
+                    if kind == 0 { hit = len == m && memcmp(sDat + s, pb, m) == 0 }
+                    else if kind == 1 { hit = len >= m && memcmp(sDat + s, pb, m) == 0 }
+                    else if len >= m {
+                        var q = s
+                        let last = s + len - m
+                        while q <= last { if memcmp(sDat + q, pb, m) == 0 { hit = true; break }; q += 1 }
+                    }
+                    if hit { b |= 1 << j }
+                }
+                strBitmap[i >> 3] = b
+                i += 8
+            }
+            return 0
+        }
+    }
+}
+
+print("\nstrings: \(strRows) utf8 values, \(distinct) distinct, \(strCol.totalBytes / 1_000_000) MB of bytes")
+
+sec = "string contains(\"north\") over \(strRows) strings (25% hit)"; print("\n" + sec)
+try time("Metal  contains", bytes: strBytes, section: sec) { sink(try strCol.contains("north")) }
+time("CPU \(cores)-core contains (byte scan)", bytes: strBytes, section: sec) { cpuStrPredicate("north", kind: 2); sink(strBitmap[0]) }
+
+sec = "string starts_with(\"cust_1\") over \(strRows) strings (10% hit)"; print("\n" + sec)
+try time("Metal  starts_with", bytes: strBytes, section: sec) { sink(try strCol.startsWith("cust_1")) }
+time("CPU \(cores)-core starts_with", bytes: strBytes, section: sec) { cpuStrPredicate("cust_1", kind: 1); sink(strBitmap[0]) }
+
+sec = "string equals(\"cust_042_east\") over \(strRows) strings"; print("\n" + sec)
+try time("Metal  equals", bytes: strBytes, section: sec) { sink(try strCol.equals("cust_042_east")) }
+time("CPU \(cores)-core equals", bytes: strBytes, section: sec) { cpuStrPredicate("cust_042_east", kind: 0); sink(strBitmap[0]) }
+
+sec = "string filter over \(strRows) strings (~30% kept)"; print("\n" + sec)
+let strCodes = try MetalArray<Int32>(strCodesRaw)
+let strMask = try strCodes.compare(.lt, Int32(distinct * 3 / 10))       // uniform codes: keeps ~30%
+let strSel = try strMask.and(strMask).values
+try time("Metal  filter (scan + gather bytes)", bytes: strBytes, section: sec) { sink(try strCol.filter(strMask)) }
+let fOffOut = UnsafeMutablePointer<Int32>.allocate(capacity: strRows + 1)
+let fDatOut = UnsafeMutablePointer<UInt8>.allocate(capacity: max(1, strCol.totalBytes))
+time("CPU \(cores)-core filter (count, prefix, copy)", bytes: strBytes, section: sec) {
+    let sel = opaque(strSel).typed(UInt8.self)
+    let counts = parallelChunks(strRows) { lo, hi -> (Int, Int) in
+        var r = 0, b = 0
+        var i = lo
+        while i < hi {
+            var byte = sel[i >> 3]
+            if i + 8 > hi { byte &= UInt8((1 << (hi - i)) - 1) }
+            while byte != 0 { let j = byte.trailingZeroBitCount; r += 1; b += Int(sOff[i + j + 1] - sOff[i + j]); byte &= byte - 1 }
+            i += 8
+        }
+        return (r, b)
+    }
+    var rowOff = [Int](), byteOff = [Int](); var ra = 0, ba = 0
+    for (r, b) in counts { rowOff.append(ra); byteOff.append(ba); ra += r; ba += b }
+    let chunks = counts.count
+    let per = ((strRows + chunks - 1) / chunks + 63) / 64 * 64
+    DispatchQueue.concurrentPerform(iterations: chunks) { c in
+        let lo = min(strRows, c * per), hi = min(strRows, (c + 1) * per)
+        var k = rowOff[c], pos = byteOff[c]
+        var i = lo
+        while i < hi {
+            var byte = sel[i >> 3]
+            if i + 8 > hi { byte &= UInt8((1 << (hi - i)) - 1) }
+            while byte != 0 {
+                let j = byte.trailingZeroBitCount
+                let s = Int(sOff[i + j]), len = Int(sOff[i + j + 1]) - s
+                fOffOut[k] = Int32(pos); memcpy(fDatOut + pos, sDat + s, len); pos += len; k += 1
+                byte &= byte - 1
+            }
+            i += 8
+        }
+    }
+    fOffOut[ra] = Int32(ba)
+    sink(ra)
+}
+
+sec = "dictionary_encode + group-by sum over \(strRows) strings (\(distinct) distinct)"; print("\n" + sec)
+let strAmounts = try sortI64.slice(offset: 0, length: strRows)
+let dictBytes = strBytes + strRows * 8
+try time("Metal  dictionary_encode + group-by sum", bytes: dictBytes, section: sec) {
+    let (codes, uniq) = try strCol.dictionaryEncode()
+    sink(try codes.groupBy(keyCount: uniq.length).sum(strAmounts))
+}
+let cachedCodes = try strCol.dictionaryEncode().codes
+let cachedGB = try cachedCodes.groupBy(keyCount: distinct)
+try time("Metal  group-by sum on cached codes (GPU only)", bytes: dictBytes, section: sec) { sink(try cachedGB.sum(strAmounts)) }
+time("CPU \(cores)-core hash dictionary + group-by sum", bytes: dictBytes, section: sec) {
+    let vp = opaque(strAmounts).valuePointer
+    let parts = parallelChunks(strRows) { lo, hi -> [UInt64: Int64] in
+        var acc = [UInt64: Int64](minimumCapacity: 4096)
+        for i in lo..<hi {
+            let s = Int(sOff[i]), e = Int(sOff[i + 1])
+            var h: UInt64 = 0xcbf2_9ce4_8422_2325
+            for q in s..<e { h = (h ^ UInt64(sDat[q])) &* 0x100_0000_01b3 }
+            acc[h, default: 0] &+= vp[i]
+        }
+        return acc
+    }
+    var total = [UInt64: Int64](minimumCapacity: 4096)
+    for part in parts { for (k, v) in part { total[k, default: 0] &+= v } }
+    sink(total.count)
+}
+
 // Markdown table for the README.
 print("\n\n| Operation | Implementation | Time (ms) | Throughput (GB/s) | CPU time (ms) |\n|---|---|---:|---:|---:|")
 for (s, l, ms, gb, cpu) in results { print("| \(s) | \(l) | \(String(format: "%.2f", ms)) | \(String(format: "%.1f", gb)) | \(String(format: "%.1f", cpu)) |") }

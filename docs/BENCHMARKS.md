@@ -1,5 +1,58 @@
 # Benchmark history
 
+## 2026-09-06, Apple M4 Max, round 7: sort and strings
+50M Int64/Float64 rows and 10M utf8 values (1000 distinct keys, `cust_NNN_region`, 130 MB of bytes),
+best of 5, release build. CPU time is process user+system time consumed by the call (all threads).
+
+Swift, Metal vs all 16 CPU cores on the same Arrow buffers:
+
+| Operation | Metal | CPU-ms | 16-core CPU | CPU-ms |
+|---|---:|---:|---:|---:|
+| argsort Int64, 50M | **128.52 ms** | 0.4 | 653.97 (chunk sort + merge tree) | 5017.1 |
+| sort Float64, 50M | **138.52** | 0.9 | 591.97 (chunk sort + merge tree) | 4468.6 |
+| sort Float64, 50M (1 core, for scale) | | | 4283.22 (`[Double].sort()`) | 4276.2 |
+| top_k 100 of 50M Int64 | 128.67 | 0.4 | **1.96** (per-core running top-k) | 25.6 |
+| string `contains("north")`, 10M (25% hit) | **1.65** | 0.4 | 17.77 (byte scan) | 250.0 |
+| string `starts_with("cust_1")`, 10M | **1.75** | 0.4 | 3.10 | 42.7 |
+| string `equals("cust_042_east")`, 10M | **1.13** | 0.4 | 3.81 | 52.4 |
+| string filter, 10M (~30% kept) | 4.72 | 2.4 | **2.74** (count, prefix, copy) | 34.1 |
+| dictionary_encode + group-by sum, 10M | 749.61 | 747.3 | **13.89** (hash dict + group-by) | 184.3 |
+| group-by sum on cached codes (GPU part only) | **1.21** | 0.4 | | |
+
+Called from Python on the same in-process data, against Polars 1.44 (16 threads), pyarrow 25 and numpy 2.5.
+Wall ms, with CPU-ms in parentheses:
+
+| Operation | ArrowMetal | Polars | pyarrow | numpy |
+|---|---:|---:|---:|---:|
+| argsort Int64, 50M | **128.51** (0.5) | 334.27 (3538.1) | 5339.10 (5337.4) | 4675.49 (4672.7) |
+| sort Float64, 50M | **138.03** (0.9) | 148.55 (1213.8) | 6321.34 (6315.9) | 1782.05 (1781.2) |
+| sort Float64 + export to pyarrow | 138.03 (0.9) | | | |
+| top_k 100 of 50M Int64 | 128.38 (0.4) | 68.70 (68.8) | **24.27** (24.3, `select_k_unstable`) | 191.48 (191.5) |
+| string `contains("north")`, 10M | **1.61** (0.4) | 147.78 (147.8) | 121.91 (121.9) | 122.31 (pandas) |
+| string `starts_with("cust_1")`, 10M | **1.46** (0.4) | 36.00 (36.1) | 32.14 (32.1) | |
+| string `equals("cust_042_east")`, 10M | **1.79** (0.4) | 42.24 (42.2) | 36.77 (36.8) | |
+| string filter, 10M (~30% kept) | 5.17 (2.9) | **4.19** (4.2) | 49.70 (49.7) | |
+| dictionary_encode + group-by sum, 10M | 850.04 (847.6) | 40.59 (361.9) | **15.84** (146.2) | |
+| group-by sum on cached codes | **2.13** (0.4) | | | |
+
+Findings:
+- The GPU LSD radix sort is 4.6x faster than 16 CPU cores at 50M Int64 and 2.6x faster than Polars, and it
+  costs the CPU under a millisecond against Polars' 3.5 CPU-seconds. Wall-clock parity with Polars is closer
+  on Float64 (138 vs 149 ms) because the sorted copy adds a gather.
+- String predicates are where the GPU is furthest ahead: 1.1 to 1.8 ms against 32 to 148 ms, i.e. 20x to 90x
+  Polars and pyarrow, at 100 to 155 GB/s over the utf8 data buffer.
+- `top_k` is currently a full argsort plus a slice, so a CPU running top-k selection (which touches each
+  value once and rarely writes) wins by 65x. A partial radix / threadgroup selection kernel is the fix.
+- `dictionaryEncode` still runs on the CPU and allocates per row, which dominates the string group-by
+  (750 ms of the 751). Once codes exist, the GPU group-by over 10M string keys is 1.2 ms, 12x the all-core
+  CPU hash group-by and 13x pyarrow. Hashing on the GPU (`hash32` already exists) is the obvious next step.
+- String `filter` is the one string kernel the CPU still wins (2.7 vs 4.7 ms): the byte gather is
+  short-string dominated, one thread per row copying ~13 bytes.
+
+Reproduce: `swift build -c release && .build/release/arrowmetal-bench 50000000 5`,
+`python Benchmarks/python_bench.py 50000000 5`, `PYTHONPATH=python python Benchmarks/python_gpu_bench.py 50000000 5`.
+
+
 ## 2026-09-06, Apple M4 Max, round 6: CPU time per operation (the "CPU stays free" claim, measured)
 50M rows, best of 5. CPU time is process user+system time consumed by the call (all threads).
 

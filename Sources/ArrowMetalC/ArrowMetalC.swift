@@ -105,6 +105,8 @@ protocol PrimitiveOps {
     func arithArray(_ op: ArithmeticOp, _ other: AnyMetalArray) throws -> AnyMetalArray
     func filterWhere(_ op: CompareOp, _ scalar: UnsafeRawPointer) throws -> AnyMetalArray
     func castTo(_ format: String) throws -> AnyMetalArray
+    func argsort(_ descending: Bool) throws -> MetalArray<Int32>
+    func topK(_ k: Int, _ largest: Bool) throws -> MetalArray<Int32>
 }
 
 extension MetalArray: PrimitiveOps {
@@ -135,6 +137,8 @@ extension MetalArray: PrimitiveOps {
     func arithScalar(_ op: ArithmeticOp, _ scalar: UnsafeRawPointer) throws -> AnyMetalArray { wrap(try arithmetic(op, scalarValue(scalar))) }
     func arithArray(_ op: ArithmeticOp, _ other: AnyMetalArray) throws -> AnyMetalArray { wrap(try arithmetic(op, try same(other))) }
     func filterWhere(_ op: CompareOp, _ scalar: UnsafeRawPointer) throws -> AnyMetalArray { wrap(try filter(where: op, scalarValue(scalar))) }
+    func argsort(_ descending: Bool) throws -> MetalArray<Int32> { try argsort(descending: descending) }
+    func topK(_ k: Int, _ largest: Bool) throws -> MetalArray<Int32> { try topK(k, largest: largest) }
     func castTo(_ format: String) throws -> AnyMetalArray {
         switch format {
         case "c": return .int8(try cast(to: Int8.self))
@@ -275,6 +279,25 @@ public func am_slice(_ a: OpaquePointer?, _ offset: Int64, _ length: Int64, _ ou
     guard let x = handle(a) else { return 2 }
     guard offset >= 0, length >= 0, Int(offset + length) <= x.length else { setError(ArrowMetalError.invalidArrowArray("slice out of range")); return 1 }
     return run(out) { try x.slice(offset: Int(offset), length: Int(length)) }
+}
+/// Indices that sort the array (stable, nulls last). Output is int32.
+@_cdecl("am_argsort")
+public func am_argsort(_ a: OpaquePointer?, _ descending: Int32, _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
+    guard let x = handle(a) else { return 2 }
+    return run(out) { .int32(try withPrimitive(x) { try $0.argsort(descending != 0) }) }
+}
+/// Sorted copy of the array (stable, nulls last). Same element type as the input.
+@_cdecl("am_sort")
+public func am_sort(_ a: OpaquePointer?, _ descending: Int32, _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
+    guard let x = handle(a) else { return 2 }
+    return run(out) { try x.take(try withPrimitive(x) { try $0.argsort(descending != 0) }) }
+}
+/// Indices of the k largest (or smallest) values, in sorted order. Output is int32.
+@_cdecl("am_top_k")
+public func am_top_k(_ a: OpaquePointer?, _ k: Int64, _ largest: Int32, _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
+    guard let x = handle(a) else { return 2 }
+    guard k >= 0 else { setError(ArrowMetalError.invalidArrowArray("top_k needs k >= 0")); return 1 }
+    return run(out) { .int32(try withPrimitive(x) { try $0.topK(Int(k), largest != 0) }) }
 }
 @_cdecl("am_group_by")
 public func am_group_by(_ keys: OpaquePointer?, _ keyCount: Int64, _ agg: Int32, _ values: OpaquePointer?, _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {

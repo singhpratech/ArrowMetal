@@ -13,4 +13,6 @@ Rules we follow so the comparison is fair:
 - CPU baselines use all cores, not one. Single-core numbers are not published.
 - Bytes counted are the bytes each operation must touch (input + output), so GB/s is comparable across rows.
 - Data shapes: Int64 with 10% nulls in [-1000, 1000]; Float32 in [-1, 1]; Float64 in [0, 1000]; keys uniform.
+- Sorting uses separate no-null columns (Int64 over the full range, Float64 in [-1e9, 1e9]).
+- Strings: 10M utf8 values drawn uniformly from 1000 distinct keys shaped `cust_NNN_region` (13 bytes each).
 - Python: a venv with `polars pyarrow pandas numpy` on Python 3.13.
