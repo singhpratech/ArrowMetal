@@ -88,26 +88,65 @@ extension MetalArray {
             }
         }
         try ctx.syncPoint()
-        // valsA holds the sorted original indices (uint32). Nulls: move them last (stable) on the CPU side of the
-        // index array, which is cheap relative to the sort; descending reverses the non-null prefix.
+        // valsA holds the sorted original indices (uint32). The GPU pass leaves the nulls wherever the
+        // key map put them and every NaN in one block after +inf; a host-side stable partition of the
+        // index array then moves both to the end the caller asked for. That partition is O(n) against
+        // the sort's several passes, and it is the same pass the nulls-last path has always run.
+        //
+        // NaN travels with the nulls, not with the values, which is Arrow's rule: a NaN is "greater
+        // than any value" in the same sense a null is, so `at_start` moves both to the front — nulls
+        // first, then the NaNs, then the values. `at_end` needs no move at all, because the radix keys
+        // already leave them in exactly that order.
         let idx = MetalArray<Int32>(length: n, nullCount: 0, validity: nil, values: valsA, context: ctx)
-        guard let bm = validity?.typed(UInt8.self) else { return idx }
-        // A stable partition of the index array moves the nulls to whichever end the caller asked for,
-        // keeping their original row order among themselves (Arrow's stable order for nulls is the input
-        // order, not the order of the bytes that happen to sit under the validity bitmap). This is the
-        // same host-side pass the nulls-last path has always run; `at_start` only changes where the two
-        // blocks are written.
+        let nanCount = nullPlacement == .atStart && T.isFloatingPoint ? nanRowCount() : 0
+        guard validity != nil || nanCount > 0 else { return idx }
+        let bm = validity?.typed(UInt8.self)
+        let values = T.isFloatingPoint && nanCount > 0 ? valuePointer : nil
+
+        func bucket(_ row: Int32) -> Int {
+            if let bm, !Bitmap.isSet(bm, Int(row)) { return 0 }        // null
+            if let values, values[Int(row)] != values[Int(row)] { return 1 }   // NaN
+            return 2                                                   // an ordinary value
+        }
+
         let out = try MetalArrowBuffer.allocate(byteCount: n * 4, zeroed: false, context: ctx)
         let src2 = valsA.typed(Int32.self), dst = out.mutableTyped(Int32.self)
+        // Nulls keep their *input* order among themselves, which is not the order the bytes under the
+        // validity bitmap happened to sort into.
         var nulls: [Int32] = []
         nulls.reserveCapacity(nullCount)
-        for i in 0..<n { let j = src2[i]; if !Bitmap.isSet(bm, Int(j)) { nulls.append(j) } }
+        for i in 0..<n { let j = src2[i]; if bucket(j) == 0 { nulls.append(j) } }
         nulls.sort()
-        var k = nullPlacement == .atStart ? nulls.count : 0
-        for i in 0..<n { let j = src2[i]; if Bitmap.isSet(bm, Int(j)) { dst[k] = j; k += 1 } }
+        var nans: [Int32] = []
+        if nanCount > 0 {
+            nans.reserveCapacity(nanCount)
+            for i in 0..<n { let j = src2[i]; if bucket(j) == 1 { nans.append(j) } }
+        }
+        let front = nullPlacement == .atStart ? nulls.count + nans.count : 0
+        var k = front
+        for i in 0..<n { let j = src2[i]; if bucket(j) == 2 { dst[k] = j; k += 1 } }
         k = nullPlacement == .atStart ? 0 : k
-        for j in nulls { dst[k] = j; k += 1 }
+        if nullPlacement == .atStart {
+            for j in nulls { dst[k] = j; k += 1 }
+            for j in nans { dst[k] = j; k += 1 }
+        } else {
+            for j in nulls { dst[k] = j; k += 1 }
+        }
         return MetalArray<Int32>(length: n, nullCount: 0, validity: nil, values: out, context: ctx)
+    }
+
+    /// How many rows carry a NaN. Only the `at_start` float path asks, and only then does it pay for
+    /// the scan.
+    private func nanRowCount() -> Int {
+        guard T.isFloatingPoint else { return 0 }
+        let p = valuePointer
+        var count = 0
+        if let bm = validity?.typed(UInt8.self) {
+            for i in 0..<length where Bitmap.isSet(bm, i) && p[i] != p[i] { count += 1 }
+        } else {
+            for i in 0..<length where p[i] != p[i] { count += 1 }
+        }
+        return count
     }
 
     /// Sorted copy (nulls at whichever end `nullPlacement` names, `atEnd` by default).

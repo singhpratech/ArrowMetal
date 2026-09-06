@@ -56,11 +56,19 @@ see what the earlier roadmap promised and where it landed.
 - [ ] **`binary` input to the string kernels.** `binary_length`, `binary_repeat` and `binary_reverse` ask
       for `utf8` and refuse a `binary` column, where Arrow accepts both. The layout is identical; only the
       importer check and the char-length kernel are utf8-specific.
-- [ ] **Overflow-erroring casts** (`safe=true`), casts between decimal precisions, and casts between
-      nested types.
-- [ ] **The remaining Arrow options**: `null_placement="at_start"` on the sorts, `rank`'s `max` tiebreaker,
-      `null_matching_behavior` beyond `skip` on `is_in` / `index_in`, `max_splits` and `reverse` on the
-      splits, N-column `binary_join_element_wise`, per-row `num_repeats` on `binary_repeat`.
+- [x] **Overflow-erroring casts** (`safe=true`), casts between decimal precisions, and casts between
+      nested types — `Sources/ArrowMetal/CastOptions.swift` and `CastDispatch.swift`. `safe=true` is one
+      read-only GPU pass that converts each value back and raises on the first row that loses something;
+      `cast(to: format, options:)` is one entry point for numeric, bool, utf8, temporal, decimal, list
+      and struct targets. Still open under it: utf8 → temporal (that is `strptime`) and dictionary,
+      union, run-end and interval targets.
+- [x] **The remaining Arrow options** — `null_placement` on the sorts and the rank family, all four
+      `rank` tiebreakers, `null_matching_behavior` on `is_in` / `index_in`, the distinct-value order on
+      `unique` / `value_counts` / `dictionary_encode`, the whole of `CastOptions` and the whole of
+      `RoundTemporalOptions`. `python/tests/test_options.py` walks the cross product against
+      `pyarrow.compute`. Still open: `max_splits` and `reverse` on the splits, N-column
+      `binary_join_element_wise`, per-row `num_repeats` on `binary_repeat`, and utf8 / binary /
+      dictionary **key columns** for `sort_indices` and `lexsort_indices`.
 - [ ] Benchmarks on M1/M2/M3 and on iPhone/iPad; a results table per chip.
 
 ## Medium term

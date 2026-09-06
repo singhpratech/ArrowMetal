@@ -968,6 +968,9 @@ _lib.am_window.argtypes = [_P, ctypes.c_int, ctypes.c_int64, ctypes.c_int64, _P,
 _lib.am_window.restype = ctypes.c_int
 _lib.am_lexsort.argtypes = [ctypes.POINTER(_P), ctypes.POINTER(ctypes.c_int), ctypes.c_int64, ctypes.POINTER(_P)]
 _lib.am_lexsort.restype = ctypes.c_int
+_lib.am_lexsort_ex.argtypes = [ctypes.POINTER(_P), ctypes.POINTER(ctypes.c_int), ctypes.c_int64,
+                               ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_lexsort_ex.restype = ctypes.c_int
 
 # Op numbering is the C ABI contract; see include/arrowmetal.h.
 _WINDOW = {"row_number": 0, "rank": 1, "dense_rank": 2, "percent_rank": 3, "cume_dist": 4,
@@ -1036,12 +1039,13 @@ for _op in ("rolling_sum", "rolling_min", "rolling_max", "rolling_mean"):
 del _op
 
 
-def lexsort_indices(columns, descending=None):
+def lexsort_indices(columns, descending=None, null_placement="at_end"):
     """Multi-column (lexicographic) sort: int32 indices ordering the rows by each column in turn, the
     first column being the most significant.
 
     `descending` is one flag per column, or None for all ascending. Successive stable GPU radix argsorts
-    from the least significant key upwards; nulls come last in every key, in both directions.
+    from the least significant key upwards. `null_placement` applies to every key, in both directions,
+    as Arrow's does.
 
         idx = am.lexsort_indices([region, revenue], [False, True])
         region.take(idx), revenue.take(idx)
@@ -1055,8 +1059,15 @@ def lexsort_indices(columns, descending=None):
     handles = (_P * len(cols))(*[c._h for c in cols])
     desc = (ctypes.c_int * len(cols))(*[1 if d else 0 for d in flags])
     out = _P()
-    _check(_lib.am_lexsort(handles, desc, len(cols), ctypes.byref(out)))
+    _check(_lib.am_lexsort_ex(handles, desc, len(cols),
+                              0 if null_placement == "at_end" else
+                              (1 if null_placement == "at_start" else _bad_placement(null_placement)),
+                              ctypes.byref(out)))
     return MetalArray(out)
+
+
+def _bad_placement(value):
+    raise ArrowMetalError(f"unknown null_placement {value!r}; expected 'at_end' or 'at_start'")
 # ---- statistical and positional aggregates, run-end encoding (see include/arrowmetal.h)
 _lib.am_reduce_ex.argtypes = [_P, ctypes.c_int, ctypes.c_double, ctypes.POINTER(ctypes.c_int64),
                               ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_int),

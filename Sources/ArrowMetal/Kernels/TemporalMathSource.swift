@@ -57,6 +57,12 @@ enum TemporalMathSource {
     //         kind 1:  0 from 1970-01, 1 from January of the containing year
     //         kind 2:  ignored — a year has no greater calendar unit
     //   flags: bit 0 = ceil_is_strictly_greater
+    //   fineScale: when the unit is *finer* than the array's own tick (rounding a timestamp[s] to
+    //         milliseconds, say), the whole computation happens in those finer units — the value is
+    //         multiplied up, rounded there, and floored back. That is what Arrow does, and it is why
+    //         such a call is not simply the identity: 13:47:33 floored to 7 ms is 13:47:32.998, which
+    //         truncates back to 13:47:32. The step back is a truncation toward zero, not a floor,
+    //         which is what Arrow does. `fineScale` is 1 for every other case.
     //
     // `ceil` leaves a value that already sits on a boundary alone unless bit 0 is set — except on the
     // calendar kinds, where Arrow's own `ceil` always advances a boundary value and its
@@ -90,9 +96,10 @@ enum TemporalMathSource {
                                constant long& originBase [[buffer(8)]],
                                constant long& originPeriod [[buffer(9)]],
                                constant uint& flags [[buffer(10)]],
+                               constant long& fineScale [[buffer(11)]],
                                uint i [[thread_position_in_grid]]) {
         if (i >= *nPtr) return;
-        long v = (long)vals[i];
+        long v = (long)vals[i] * fineScale;
         long lo, hi;
         if (kind == 0u) {
             long base = tm_origin(v, originKind, originBase, originPeriod, ticksPerDay);
@@ -120,7 +127,7 @@ enum TemporalMathSource {
             else if (v != lo) r = hi;
             else r = ((flags & 1u) != 0u) ? hi : lo;
         } else r = (2L * (v - lo) >= (hi - lo)) ? hi : lo;
-        out[i] = (\(T))r;
+        out[i] = (\(T))(fineScale == 1L ? r : (r / fineScale));   // truncates toward zero, as Arrow does
     }
 
     // Calendar fields beyond year / month / day / weekday / hour / minute / second.

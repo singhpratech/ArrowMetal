@@ -280,8 +280,14 @@ def _oracle_count_all(args, options):
     return len(args[0])
 
 
+def _oracle_rank_normal(args, options):
+    """The host inverse CDF and Arrow's differ in the last ulp or two, so compare to a tolerance."""
+    return pc.rank_normal(args[0], **options)
+
+
 def _oracle_sorted_unique(args, options):
-    """ArrowMetal returns unique values ascending; Arrow returns them by first appearance."""
+    """The `order="sorted"` form: ascending and with the nulls dropped, which is the cheaper GPU pass
+    and not what Arrow returns. The default form matches `pc.unique` exactly."""
     return pa.array(sorted(v for v in pc.unique(args[0]).to_pylist() if v is not None))
 
 
@@ -289,6 +295,10 @@ def _oracle_sorted_value_counts(args, options):
     want = pc.value_counts(args[0]).to_pylist()
     rows = sorted(((r["values"], r["counts"]) for r in want if r["values"] is not None))
     return [{"values": v, "counts": c} for v, c in rows]
+
+
+def _oracle_value_counts(args, options):
+    return pc.value_counts(args[0], **options).to_pylist()
 
 
 def _oracle_first_last(args, options):
@@ -1074,17 +1084,20 @@ _ROWS = [
     ("match_like", "Containment", CPU, "Kernels/Regex.swift", "match_like(pattern)",
      "SQL LIKE, translated to the host regex engine; a pattern with no metacharacter routes to the GPU.",
      lambda args, options: _out(_a(args[0]).match_like(options["pattern"])), ((_STR,), {"pattern": "%ll%"})),
-    ("is_in", "Containment", PARTIAL, "Kernels/StringContainment.swift", "is_in(value_set)",
+    ("is_in", "Containment", GPU, "Kernels/SetLookup.swift", "is_in(value_set, null_matching_behavior)",
      "GPU throughout: a sorted set plus a binary search per row for primitive and temporal columns, "
-     "the GPU string hash table for utf8 and binary ones. Nulls in the set are ignored and a null "
-     "element is never in the set, so Arrow's `null_matching_behavior` is fixed at `skip` (pyarrow's "
-     "default); `match` / `emit_null` / `inconclusive` are not implemented.",
-     lambda args, options: _out(_a(args[0]).is_in(options["value_set"])),
+     "the GPU string hash table for utf8 and binary ones. All four of Arrow's "
+     "`null_matching_behavior` values are implemented — `match`, `skip`, `emit_null` and "
+     "`inconclusive` — as a rewrite of the validity bitmap over the kernel's own `skip` answer, since "
+     "the four differ only in what a null row reports. ArrowMetal defaults to `skip`; pyarrow "
+     "defaults to `match`, so the check below passes it.",
+     lambda args, options: _out(_a(args[0]).is_in(options["value_set"], "match")),
      ((_STR,), {"value_set": pa.array(["Hello", "Zz"])})),
-    ("index_in", "Containment", PARTIAL, "Kernels/StringContainment.swift", "index_in(value_set)",
-     "The same two paths, returning the int32 position of the first occurrence in the set and null "
-     "where the element is null or absent. Same `null_matching_behavior` limitation as `is_in`.",
-     lambda args, options: _out(_a(args[0]).index_in(options["value_set"])),
+    ("index_in", "Containment", GPU, "Kernels/SetLookup.swift", "index_in(value_set, null_matching_behavior)",
+     "The same two paths and the same four behaviours, returning the int32 position of the first "
+     "occurrence in the set and null where the element is absent. Only `match` differs from the other "
+     "three for `index_in`: it reports the position of the value set's first null for a null element.",
+     lambda args, options: _out(_a(args[0]).index_in(options["value_set"], "match")),
      ((_STR,), {"value_set": pa.array(["Hello", "Zz"])})),
 
     # ---- Categorizations ---------------------------------------------------
@@ -1130,27 +1143,43 @@ _ROWS = [
      ((pa.array([0, 1, 0, 1, None, 0], type=pa.int32()), [_INT, _INT2]), {}), _oracle_choose),
 
     # ---- Conversions -------------------------------------------------------
-    ("cast", "Conversions", PARTIAL, "Kernels/Cast.swift", "cast(target)",
-     "Numeric to numeric on the GPU (wrapping, C-style, no overflow check), numeric to/from utf8 on "
-     "the GPU, temporal unit changes on the GPU. The float16 and decimal conversions exist but under "
-     "their own names — `to_float32()` / `to_float16()`, `to_decimal128()` / `to_small_decimal()` — "
-     "rather than through `cast()`. Overflow-erroring casts and casts between nested types are not "
-     "implemented.",
-     lambda args, options: _out(_a(args[0]).cast(options["target_type"])),
+    ("cast", "Conversions", GPU, "Sources/ArrowMetal/CastDispatch.swift", "cast(target, safe=..., allow_*=...)",
+     "One entry point for every target, taking Arrow's whole `CastOptions`. Numeric to numeric, "
+     "bool to and from numeric, numeric and temporal to utf8 and utf8 back to numeric, temporal "
+     "resolution changes and the date/timestamp conversions, integer to and from decimal128 and a "
+     "decimal rescale, and `list<T>` -> `list<U>` and struct casts that cast the children and share "
+     "the offsets and bitmaps. `safe=True` adds one read-only GPU pass that converts each value back "
+     "and raises on the first row that does not round-trip, which is exactly the set of losses Arrow "
+     "objects to; each `allow_*` flag turns one class back off. ArrowMetal defaults to `safe=False`, "
+     "where pyarrow defaults to `safe=True`. Two things remain: with `safe=False` an out-of-range "
+     "float -> integer value saturates at 64 bits and truncates where Arrow saturates at the "
+     "target's width (C leaves it undefined; `safe=True` refuses the row rather than choosing), and "
+     "dictionary, union, run-end and interval targets, and utf8 -> temporal (that is `strptime`), "
+     "are refused.",
+     lambda args, options: _out(_a(args[0]).cast(options["target_type"], safe=True)),
      ((_INT,), {"target_type": "float64"})),
-    ("ceil_temporal", "Conversions", GPU, "Kernels/TemporalMath.swift", "ceil_temporal(unit, multiple)",
-     "Integer arithmetic in the value's own resolution, plus the civil-date algorithm for month / "
-     "quarter / year. `calendar_based_origin` and week units are not implemented.",
-     lambda args, options: _out(_a(args[0]).ceil_temporal(options["unit"], options.get("multiple", 1))),
+    ("ceil_temporal", "Conversions", GPU, "Kernels/TemporalMath.swift",
+     "ceil_temporal(unit, multiple, week_starts_monday, ceil_is_strictly_greater, calendar_based_origin)",
+     "As `round_temporal`, with the whole `RoundTemporalOptions` surface. A value already on a "
+     "boundary is left alone unless `ceil_is_strictly_greater` — except on `month`, `quarter` and "
+     "`year`, where Arrow's own ceil always advances a boundary value and the flag makes no "
+     "difference; that quirk is reproduced deliberately.",
+     lambda args, options: _out(_a(args[0]).ceil_temporal(**options)),
      ((_TS,), {"unit": "day"})),
-    ("floor_temporal", "Conversions", GPU, "Kernels/TemporalMath.swift", "floor_temporal(unit, multiple)",
+    ("floor_temporal", "Conversions", GPU, "Kernels/TemporalMath.swift",
+     "floor_temporal(unit, multiple, week_starts_monday, ceil_is_strictly_greater, calendar_based_origin)",
      "As `ceil_temporal`.",
-     lambda args, options: _out(_a(args[0]).floor_temporal(options["unit"], options.get("multiple", 1))),
+     lambda args, options: _out(_a(args[0]).floor_temporal(**options)),
      ((_TS,), {"unit": "day"})),
-    ("round_temporal", "Conversions", PARTIAL, "Kernels/TemporalMath.swift", "round_temporal(unit, multiple)",
-     "As `ceil_temporal`, but an exact half rounds **up** (toward +infinity) where Arrow rounds half "
-     "to even.",
-     lambda args, options: _out(_a(args[0]).round_temporal(options["unit"], options.get("multiple", 1))),
+    ("round_temporal", "Conversions", GPU, "Kernels/TemporalMath.swift",
+     "round_temporal(unit, multiple, week_starts_monday, ceil_is_strictly_greater, calendar_based_origin)",
+     "The whole of Arrow's `RoundTemporalOptions`, in integer arithmetic in the value's own "
+     "resolution plus the civil-date algorithm for the calendar units. An exact half rounds **up** "
+     "(toward +infinity), which is what Arrow does. `week` is a seven-day grid on a Monday or Sunday "
+     "anchor; `calendar_based_origin` starts the grid at the beginning of the value's own "
+     "next-greater calendar unit; the month and quarter grids are anchored at 1970-01 and the year "
+     "grid at year 0, as Arrow anchors them.",
+     lambda args, options: _out(_a(args[0]).round_temporal(**options)),
      ((_TS,), {"unit": "day"})),
     ("run_end_encode", "Conversions", GPU, "Sources/ArrowMetal/RunEndEncoded.swift", "run_end_encode()",
      "Bit equality collapses adjacent values; nulls form runs of their own. Run ends are int32.",
@@ -1309,18 +1338,24 @@ _ROWS = [
      ((), {"n": 64, "initializer": 7}), _oracle_random),
 
     # ---- Associative transforms -------------------------------------------
-    ("unique", "Associative", PARTIAL, "Kernels/Unique.swift", "unique()",
-     "One GPU sort plus a run scan. The values come back **ascending**; Arrow returns them in order of "
-     "first appearance, and nulls are dropped rather than kept.",
-     _u("unique"), ((_INT,), {}), _oracle_sorted_unique),
-    ("value_counts", "Associative", PARTIAL, "Kernels/Unique.swift", "value_counts()",
-     "The same pass, returned as a struct of `values` and `counts`. Ascending order, not first "
-     "appearance; nulls are dropped.",
+    ("unique", "Associative", GPU, "Kernels/UniqueOrder.swift", "unique(order)",
+     "One GPU sort plus a run scan gives the distinct values ascending; `order=\"first_appearance\"` "
+     "(the default, and Arrow's own order) then reorders them with a GPU group-min of the row index "
+     "per distinct value, a stable argsort of those minima and a gather — and, like Arrow, keeps the "
+     "null as one entry at the position of the first null row. `order=\"sorted\"` is the ascending "
+     "pass on its own, nulls dropped, and the cheaper of the two. A utf8 column has no null entry in "
+     "either order: the GPU string dictionary has no slot for one.",
+     _u("unique"), ((_INT,), {})),
+    ("value_counts", "Associative", GPU, "Kernels/UniqueOrder.swift", "value_counts(order)",
+     "The same two orders and the same null handling, returned as a struct of `values` and `counts` "
+     "(int64).",
      lambda args, options: _a(args[0]).value_counts().to_arrow().to_pylist(), ((_INT,), {}),
-     _oracle_sorted_value_counts),
-    ("dictionary_encode", "Associative", GPU, "Kernels/StringDictionary.swift", "dictionary_encode()",
-     "GPU hashing for utf8, a GPU sort for primitives. Returns `(codes, values)` rather than Arrow's "
-     "dictionary-typed array.",
+     _oracle_value_counts),
+    ("dictionary_encode", "Associative", GPU, "Kernels/UniqueOrder.swift", "dictionary_encode(order)",
+     "GPU hashing for utf8, a GPU sort for primitives, then the same first-appearance reordering "
+     "`unique` uses (the default) or the sorted dictionary. Returns `(codes, values)` rather than "
+     "Arrow's dictionary-typed array. The dictionary never holds a null and a null row gets a null "
+     "code, as in Arrow.",
      lambda args, options: _a(args[0]).dictionary_encode()[0].to_arrow(), ((_STR,), {}),
      lambda args, options: pc.dictionary_encode(args[0]).indices),
     ("dictionary_decode", "Associative", GPU, "Sources/ArrowMetal/DictionaryArray.swift", "dictionary_decode()",
@@ -1356,19 +1391,27 @@ _ROWS = [
      ((pa.array([10, 20, 30], type=pa.int64()), pa.array([1, 1, 3], type=pa.int32())), {"max_index": 4})),
 
     # ---- Sorts and partitions ---------------------------------------------
-    ("array_sort_indices", "Sorts", GPU, "Kernels/Sort.swift", "array_sort_indices(descending)",
-     "LSD radix sort, stable, nulls last, total order for floats (NaN after +inf). Arrow's "
-     "`null_placement=\"at_start\"` is not implemented.",
-     lambda args, options: _out(_a(args[0]).array_sort_indices(options.get("order", "ascending") == "descending")),
+    ("array_sort_indices", "Sorts", GPU, "Kernels/Sort.swift", "array_sort_indices(descending, null_placement)",
+     "LSD radix sort, stable, total order for floats (NaN after +inf). Both of Arrow's "
+     "`null_placement` values are implemented, in both directions: the nulls are one block at "
+     "whichever end, moved there by a stable partition of the index array.",
+     lambda args, options: _out(_a(args[0]).array_sort_indices(
+         options.get("order", "ascending") == "descending",
+         options.get("null_placement", "at_end"))),
      ((_INT,), {})),
     ("sort_indices", "Sorts", PARTIAL, "Kernels/MultiSort.swift", "sort_indices() / am.lexsort_indices(cols)",
      "Single key through the radix argsort; multiple keys through `lexsort_indices`, which is "
-     "successive stable argsorts from the least significant key upwards. utf8, binary and dictionary "
-     "key columns are not sortable, and `null_placement=\"at_start\"` is not implemented.",
+     "successive stable argsorts from the least significant key upwards. Both `null_placement` values "
+     "are implemented, and apply to every key as Arrow's do. utf8, binary and dictionary key columns "
+     "are still not sortable, which is what keeps this row `partial`.",
      lambda args, options: _out(_a(args[0]).sort_indices()), ((_INT,), {})),
-    ("partition_nth_indices", "Sorts", PARTIAL, "Kernels/MultiSort.swift", "partition_nth_indices(pivot)",
-     "Answered with the full stable GPU argsort, which satisfies Arrow's contract (the n smallest "
-     "first) but does more work than a true partial partition and returns a different permutation.",
+    ("partition_nth_indices", "Sorts", GPU, "Kernels/PartitionNth.swift",
+     "partition_nth_indices(pivot, null_placement)",
+     "A real selection, not a sort: an MSB-first GPU radix select finds the pivot value in a fixed "
+     "four (32-bit keys) or eight (64-bit) histogram passes, and three GPU stream compactions split "
+     "the row indices around it. O(length). Both `null_placement` values are implemented. The "
+     "permutation is not the sorted one, and Arrow does not promise it is — only the partition "
+     "property, which the check below verifies.",
      lambda args, options: _out(_a(args[0]).partition_nth_indices(options["pivot"])),
      ((_INT,), {"pivot": 3}), _oracle_partition_nth),
     ("select_k_unstable", "Sorts", GPU, "Kernels/TopK.swift", "select_k_unstable(k, largest)",
@@ -1384,22 +1427,27 @@ _ROWS = [
      "`select_k_unstable` with the ascending order.",
      lambda args, options: _out(_a(args[0]).bottom_k_unstable(options["k"])), ((_INT,), {"k": 3}),
      _oracle_select_property),
-    ("rank", "Sorts", PARTIAL, "Kernels/Window.swift", "rank() / dense_rank() / row_number()",
-     "One argsort, run marks, a scan and a scatter back to the original rows. Arrow's `tiebreaker` "
-     "options are separate calls here — `rank()` is `min`, `dense_rank()` is `dense`, `row_number()` "
-     "is `first`; `max` is not implemented, and neither is `null_placement=\"at_start\"`.",
-     _u("rank"), ((_INT,), {}), lambda args, options: pc.rank(args[0], sort_keys="ascending", tiebreaker="min")),
-    ("rank_quantile", "Sorts", PARTIAL, "Kernels/Selection.swift", "rank_quantile()",
+    ("rank", "Sorts", GPU, "Kernels/Window.swift", "rank(sort_keys, null_placement, tiebreaker)",
+     "One argsort, run marks, a scan and a scatter back to the original rows, with Arrow's whole "
+     "option surface: the sort direction, both `null_placement` values and all four tiebreakers "
+     "(`min`, `max`, `first`, `dense`, which are also spelled `rank()`, `max_rank()`, `row_number()` "
+     "and `dense_rank()`). The result never contains nulls.",
+     _u("rank"), ((_INT,), {}),
+     lambda args, options: pc.rank(args[0], sort_keys="ascending", tiebreaker="min")),
+    ("rank_quantile", "Sorts", GPU, "Kernels/Selection.swift", "rank_quantile(sort_keys, null_placement)",
      "(average 1-based rank of the tie group - 0.5) / n, computed on the GPU as (s + e) / (2n) over "
-     "the run's sorted positions. Arrow's `sort_keys` and `null_placement` options are not "
-     "implemented: always one ascending key with nulls at the end.",
+     "the run's sorted positions with the correctly rounded software binary64 divide. Arrow's "
+     "`sort_keys` direction and both `null_placement` values are implemented; the nulls are one tie "
+     "group at whichever end.",
      _u("rank_quantile"), ((_INT,), {})),
-    ("rank_normal", "Sorts", PARTIAL, "Kernels/Selection.swift", "rank_normal(float32=False)",
-     "The normal percent-point function of `rank_quantile`. float64 evaluates the inverse CDF on the "
-     "host with Wichura's AS 241 (about 1e-16 relative) because Metal has no `double` and the software "
-     "binary64 has no log/exp/erfc; `float32=True` runs Acklam plus one Halley refinement entirely on "
-     "the GPU, within about 1e-6. Arrow's option set is not implemented.",
-     _u("rank_normal"), ((_INT,), {})),
+    ("rank_normal", "Sorts", PARTIAL, "Kernels/Selection.swift",
+     "rank_normal(sort_keys, null_placement, float32=False)",
+     "The normal percent-point function of `rank_quantile`, with the same `sort_keys` and "
+     "`null_placement` options. float64 evaluates the inverse CDF **on the host** with Wichura's AS "
+     "241 (about 1e-16 relative) because Metal has no `double` and the software binary64 has no "
+     "log/exp/erfc — that host step is what keeps this row `partial`; `float32=True` runs Acklam plus "
+     "one Halley refinement entirely on the GPU, within about 1e-6.",
+     _u("rank_normal"), ((_INT,), {}), _oracle_rank_normal),
     ("winsorize", "Sorts", GPU, "Kernels/Selection.swift", "winsorize(lower_limit, upper_limit)",
      "One GPU sort for the two nearest quantiles, then a clamp kernel. Nulls stay null and NaNs pass "
      "through, taking part in neither the limits nor the comparison.",
@@ -1434,12 +1482,12 @@ _ROWS = [
      "Metadata only: the children are shared, nothing is copied and no kernel runs.",
      lambda args, options: make_struct(list(args), options["field_names"]).to_arrow(),
      ((_INT, _STR), {"field_names": ["a", "b"]}), _oracle_make_struct),
-    ("list_parent_indices", "Structural", PARTIAL, "Sources/ArrowMetal/NestedExtra.swift", "list_parent_indices()",
-     "GPU, one binary search per child element. Documented difference: the result is **int32** where "
-     "pyarrow's is int64, because list offsets are int32 throughout this package; the values are the "
-     "same, and the check below casts.",
-     _u("list_parent_indices"), ((_LIST,), {}),
-     lambda args, options: pc.list_parent_indices(args[0]).cast(pa.int32())),
+    ("list_parent_indices", "Structural", GPU, "Sources/ArrowMetal/NestedExtra.swift",
+     "list_parent_indices64() / list_parent_indices()",
+     "GPU, one binary search per child element. `list_parent_indices64()` returns int64, the width "
+     "pyarrow returns; `list_parent_indices()` keeps the int32 form, which is what the list offsets "
+     "themselves are and what every caller inside this package wants.",
+     lambda args, options: _out(_a(args[0]).list_parent_indices64()), ((_LIST,), {})),
     ("list_slice", "Structural", GPU, "Sources/ArrowMetal/NestedExtra.swift", "list_slice(start, stop, step)",
      "`row[start:stop:step]` for every row, as a variable-length list. `start` must be >= 0 and "
      "`step` >= 1, as Arrow requires; a null row stays null and a row shorter than `start` becomes "

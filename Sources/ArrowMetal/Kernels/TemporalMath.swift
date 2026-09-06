@@ -155,6 +155,9 @@ extension MetalTemporalArray {
         var originKind = 0
         var originBase: Int64 = 0
         var originPeriod: Int64 = 1
+        /// How many of the unit's own ticks fit in one storage tick, when the unit is finer than the
+        /// storage. 1 everywhere else.
+        var fineScale: Int64 = 1
     }
 
     /// Turns the options into that description, or returns nil when the unit is finer than this
@@ -195,18 +198,29 @@ extension MetalTemporalArray {
             }
         default:
             let ns = unit.nanoseconds!
-            if ns < tick || ns % tick != 0 { return nil }        // finer than the storage: nothing to do
+            // A unit finer than this array's own tick is not a no-op in Arrow: the rounding happens in
+            // the finer unit and the answer is floored back to the storage tick. `fineScale` carries
+            // that widening into the kernel. (`tick % ns == 0` always holds for the sub-day units,
+            // which are all powers of ten of a nanosecond.)
+            let scale = ns < tick ? tick / ns : 1
+            if ns > tick && ns % tick != 0 {
+                throw ArrowMetalError.unsupportedType(
+                    "rounding \(type.arrowFormat) to \(unit.rawValue) has no whole-tick grid")
+            }
             p.kind = 0
-            p.period = (ns / tick) * multiple
+            p.fineScale = scale
+            p.period = scale == 1 ? (ns / tick) * multiple : multiple
             guard calendar else { break }
             if unit == .day {
                 p.originKind = 2                                  // start of the containing month
-            } else if let greater = unit.calendarOriginNanoseconds, greater % tick == 0 {
-                p.originKind = 1
-                p.originPeriod = greater / tick
+            } else if let greater = unit.calendarOriginNanoseconds {
+                // The greater unit measured in whichever units the grid is built from.
+                let period = scale == 1 ? greater / tick : greater / ns
+                if period >= 1 && (scale == 1 ? greater % tick == 0 : greater % ns == 0) {
+                    p.originKind = 1
+                    p.originPeriod = period
+                }
             }
-            // A greater unit finer than the storage tick leaves the origin at the epoch, which is
-            // where every value already sits on that grid, so the answer is the same either way.
         }
         return p
     }
@@ -217,6 +231,10 @@ extension MetalTemporalArray {
             throw ArrowMetalError.invalidArrowArray("temporal rounding needs multiple >= 1, got \(options.multiple)")
         }
         guard let plan = try plan(options) else { return self }
+        // A unit finer than this array's own resolution: Arrow computes the **floor** in the finer unit
+        // and truncates the answer back to the storage tick, whatever mode was asked for — `ceil` and
+        // `round` collapse onto the same answer. Reproduced exactly, quirk and all.
+        let effectiveMode = plan.fineScale > 1 ? 0 : mode
         let ctx = context, n = length
         try Dispatch.checkLength(n)
         let width = type.usesInt64 ? 8 : 4
@@ -226,12 +244,13 @@ extension MetalTemporalArray {
             let vals = values
             var pv = plan.period, tpd = ticksPerDay
             var base = plan.originBase, originPeriod = plan.originPeriod
+            var fineScale = plan.fineScale
             let flags = options.ceilIsStrictlyGreater ? 1 : 0
             try ctx.run { enc in
                 enc.setComputePipelineState(pso)
                 enc.setBuffer(vals.mtl, offset: vals.offset, index: 0)
                 Dispatch.setLength(enc, n, nil, index: 1)
-                Dispatch.setUInt(enc, mode, index: 2)
+                Dispatch.setUInt(enc, effectiveMode, index: 2)
                 Dispatch.setUInt(enc, plan.kind, index: 3)
                 enc.setBytes(&pv, length: 8, index: 4)
                 enc.setBytes(&tpd, length: 8, index: 5)
@@ -240,6 +259,7 @@ extension MetalTemporalArray {
                 enc.setBytes(&base, length: 8, index: 8)
                 enc.setBytes(&originPeriod, length: 8, index: 9)
                 Dispatch.setUInt(enc, flags, index: 10)
+                enc.setBytes(&fineScale, length: 8, index: 11)
                 Dispatch.dispatch1D(enc, pso, count: n)
             }
         }

@@ -66,6 +66,14 @@ private func nullMatching(_ v: Int32) throws -> SetLookupNullMatching {
 
 private func valueOrder(_ v: Int32) -> ValueOrder { v == 1 ? .sorted : .firstAppearance }
 
+/// utf8 and binary share one layout and one set of kernels, so both reach the string hash table.
+private func bytesColumn(_ a: AnyMetalArray) -> MetalStringArray? {
+    switch a {
+    case .string(let s), .binary(let s): return s
+    default: return nil
+    }
+}
+
 // MARK: - cast
 
 /// Arrow `cast` with `CastOptions`. `child_formats` is a comma-separated list of the target formats of
@@ -100,6 +108,25 @@ public func am_partition_nth_ex(_ a: OpaquePointer?, _ pivot: Int64, _ nullPlace
     guard let x = optHandle(a) else { return 2 }
     return optRun(out) {
         .int32(try withOptionPrimitive(x) { try $0.optPartitionNth(Int(pivot), placement(nullPlacement)) })
+    }
+}
+
+/// Multi-key `sort_indices` with `null_placement`, which applies to every key as Arrow's does.
+@_cdecl("am_lexsort_ex")
+public func am_lexsort_ex(_ columns: UnsafeMutablePointer<OpaquePointer?>?,
+                          _ descending: UnsafePointer<Int32>?, _ count: Int64,
+                          _ nullPlacement: Int32,
+                          _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
+    guard let columns, count > 0 else { return 2 }
+    var cols: [AnyMetalArray] = []
+    var desc: [Bool] = []
+    for i in 0..<Int(count) {
+        guard let c = optHandle(columns[i]) else { return 2 }
+        cols.append(c)
+        desc.append(descending.map { $0[i] != 0 } ?? false)
+    }
+    return optRun(out) {
+        .int32(try lexsortIndices(cols, descending: desc, nullPlacement: placement(nullPlacement)))
     }
 }
 
@@ -138,7 +165,7 @@ public func am_is_in_ex(_ a: OpaquePointer?, _ setArray: OpaquePointer?, _ behav
     guard let x = optHandle(a), let s = optHandle(setArray) else { return 2 }
     return optRun(out) {
         let b = try nullMatching(behavior)
-        if case .string(let probe) = x, case .string(let set) = s {
+        if let probe = bytesColumn(x), let set = bytesColumn(s) {
             return .boolean(try probe.isIn(set, nullMatching: b))
         }
         return .boolean(try withOptionPrimitive(x) { try $0.optIsIn(s, b) })
@@ -152,7 +179,7 @@ public func am_index_in_ex(_ a: OpaquePointer?, _ setArray: OpaquePointer?, _ be
     guard let x = optHandle(a), let s = optHandle(setArray) else { return 2 }
     return optRun(out) {
         let b = try nullMatching(behavior)
-        if case .string(let probe) = x, case .string(let set) = s {
+        if let probe = bytesColumn(x), let set = bytesColumn(s) {
             return .int32(try probe.indexIn(set, nullMatching: b))
         }
         return .int32(try withOptionPrimitive(x) { try $0.optIndexIn(s, b) })
@@ -167,7 +194,11 @@ public func am_unique_ex(_ a: OpaquePointer?, _ order: Int32,
                          _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
     guard let x = optHandle(a) else { return 2 }
     return optRun(out) {
-        if case .string(let s) = x { return .string(try s.unique(order: valueOrder(order))) }
+        if let s = bytesColumn(x) {
+            let u = try s.unique(order: valueOrder(order))
+            if case .binary = x { return .binary(u) }
+            return .string(u)
+        }
         return try withOptionPrimitive(x) { try $0.optUnique(valueOrder(order)) }
     }
 }
@@ -179,11 +210,13 @@ public func am_value_counts_ex(_ a: OpaquePointer?, _ order: Int32,
                                _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
     guard let x = optHandle(a) else { return 2 }
     return optRun(out) {
-        if case .string(let s) = x {
+        if let s = bytesColumn(x) {
             let (values, counts) = try s.valueCounts(order: valueOrder(order))
+            var wrapped = AnyMetalArray.string(values)
+            if case .binary = x { wrapped = .binary(values) }
             return .structure(try MetalStructArray(length: values.length, nullCount: 0, validity: nil,
                                                    names: ["values", "counts"],
-                                                   children: [.string(values), .int64(counts)],
+                                                   children: [wrapped, .int64(counts)],
                                                    context: values.context))
         }
         return .structure(try withOptionPrimitive(x) { try $0.optValueCounts(valueOrder(order)) })
@@ -199,21 +232,24 @@ public func am_dictionary_encode_ex(_ a: OpaquePointer?, _ order: Int32,
     guard let x = optHandle(a) else { return 2 }
     do {
         let pair: (AnyMetalArray, AnyMetalArray)
-        if case .string(let s) = x {
+        if let s = bytesColumn(x) {
             let (c, u) = try s.dictionaryEncode()
-            let ordered = order == 1 ? try s.unique(order: .sorted) : u
+            var codes = c
+            var dictionary = u
             if order == 1 {
                 // The sorted dictionary needs the codes recoded through it, which the primitive path
                 // does on the GPU; for utf8 the distinct set is small, so it is done here.
-                let names = u.toArray(), sortedNames = ordered.toArray()
+                dictionary = try s.unique(order: .sorted)
+                let names = u.toArray(), sortedNames = dictionary.toArray()
                 var position: [String: Int32] = [:]
-                for (i, s) in sortedNames.enumerated() { if let s { position[s] = Int32(i) } }
+                for (i, name) in sortedNames.enumerated() { if let name { position[name] = Int32(i) } }
                 let recode = try MetalArray<Int32>(names.map { $0.flatMap { position[$0] } ?? 0 },
                                                    context: s.context)
-                pair = (.int32(try recode.take(c)), .string(ordered))
-            } else {
-                pair = (.int32(c), .string(u))
+                codes = try recode.take(c)
             }
+            var wrapped = AnyMetalArray.string(dictionary)
+            if case .binary = x { wrapped = .binary(dictionary) }
+            pair = (.int32(codes), wrapped)
         } else {
             pair = try withOptionPrimitive(x) { try $0.optDictionaryEncode(valueOrder(order)) }
         }

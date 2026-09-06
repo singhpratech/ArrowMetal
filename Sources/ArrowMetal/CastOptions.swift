@@ -79,12 +79,13 @@ public struct CastOptions: Sendable, Equatable {
     }
 }
 
-/// The round-trip check kernel, generated per source/target pair.
+/// The check kernel, generated per source/target pair. `predicate` is the "this row loses something"
+/// expression `lossPredicate` builds for that pair.
 enum CastCheckSource {
-    static func source(From: String, To: String) -> String { KernelSource.prelude + """
+    static func source(From: String, To: String, predicate: String) -> String { KernelSource.prelude + """
 
-    // Flags the first row whose conversion does not round-trip. `flag` starts at UINT_MAX and only ever
-    // moves down, so the answer does not depend on thread order.
+    // Flags the first row the conversion loses something on. `flag` starts at UINT_MAX and only ever
+    // moves down through an atomic minimum, so the answer does not depend on thread order.
     kernel void cast_check(device const \(From)* a [[buffer(0)]],
                            device const uchar* validity [[buffer(1)]],
                            device const uint* nPtr [[buffer(2)]],
@@ -96,9 +97,8 @@ enum CastCheckSource {
         \(From) v = a[i];
         \(To) t = (\(To))v;
         \(From) back = (\(From))t;
-        // NaN fails this too, because NaN never equals itself — which is the right answer: Arrow refuses
-        // to turn a NaN into an integer.
-        if (!(back == v)) atomic_fetch_min_explicit(flag, i, memory_order_relaxed);
+        (void)t; (void)back;
+        if (\(predicate)) atomic_fetch_min_explicit(flag, i, memory_order_relaxed);
     }
     """ }
 }
@@ -112,10 +112,40 @@ extension MetalArray {
     /// row raises `ArrowMetalError.overflow` naming it.
     public func cast<U: ArrowPrimitive>(to target: U.Type, options: CastOptions) throws -> MetalArray<U> {
         let out = try cast(to: target)
-        if let failure = Self.lossClass(U.self), !options.allows(failure) {
-            try checkRoundTrip(to: U.self, detail: failure.message(from: T.arrowFormat, to: U.arrowFormat))
+        if let failure = Self.lossClass(U.self), !options.allows(failure),
+           let predicate = Self.lossPredicate(U.self) {
+            try check(to: U.self, predicate: predicate,
+                      detail: failure.message(from: T.arrowFormat, to: U.arrowFormat))
         }
         return out
+    }
+
+    /// The MSL expression that is true exactly on a row Arrow would refuse, in terms of `v` (the source
+    /// value), `t` (the converted one) and `back` (the round trip). Nil when nothing can go wrong.
+    ///
+    /// * **int -> int** — the round trip must return the value *and* keep its sign. The sign clause is
+    ///   what catches `int64(-1) -> uint64`, which round-trips bit for bit and is still out of range.
+    /// * **float -> int** — the round trip alone: it catches a fractional part, a value past the
+    ///   integer range (the conversion saturates, so the trip differs), an infinity and a NaN, which
+    ///   never equals itself.
+    /// * **int -> float** — Arrow's rule is not "round-trips" but "inside the contiguous integer range
+    ///   of the float", 2^24 for float32 and 2^53 for float64, so `2^60 + 1` and `2^31` are both
+    ///   refused into float32 even though the second is exactly representable.
+    static func lossPredicate<U: ArrowPrimitive>(_: U.Type) -> String? {
+        if U.self == T.self { return nil }
+        if T.isFloatingPoint && U.isFloatingPoint { return nil }
+        if T.isFloatingPoint { return "!(back == v)" }
+        if U.isFloatingPoint {
+            let limit: Int64 = U.byteWidth == 4 ? 1 << 24 : 1 << 53
+            // A source that cannot reach the limit needs no check at all.
+            if T.byteWidth * 8 - (T.minValue < 0 as T ? 1 : 0) <= (U.byteWidth == 4 ? 24 : 53) { return nil }
+            let hi = "(\(T.mslType))\(limit)"
+            return T.minValue < 0 as T ? "v > \(hi) || v < -\(hi)" : "v > \(hi)"
+        }
+        let sourceSigned = T.minValue < 0 as T, targetSigned = U.minValue < 0 as U
+        if sourceSigned && !targetSigned { return "!(back == v) || v < 0" }
+        if !sourceSigned && targetSigned { return "!(back == v) || t < 0" }
+        return "!(back == v)"
     }
 
     /// Which of Arrow's loss classes this conversion can fall into, or nil when it cannot lose anything
@@ -128,8 +158,8 @@ extension MetalArray {
         return .intOverflow
     }
 
-    /// One read-only pass: convert back and compare. Raises on the first row that does not match.
-    private func checkRoundTrip<U: ArrowPrimitive>(to _: U.Type, detail: String) throws {
+    /// One read-only pass evaluating `predicate`. Raises naming the first row it fires on.
+    private func check<U: ArrowPrimitive>(to _: U.Type, predicate: String, detail: String) throws {
         let n = dispatchLength
         guard n > 0 else { return }
         let ctx = context
@@ -137,15 +167,17 @@ extension MetalArray {
             // Float64 has no native Metal type, so its casts run on the host and so does their check.
             let src = valuePointer
             for i in 0..<length where isValid(i) {
-                let there = U.convert(src[i])
-                if T.convert(there) != src[i] { throw ArrowMetalError.overflow(op: "cast", index: i, detail: detail) }
+                if Self.losesOnHost(src[i], U.self) {
+                    throw ArrowMetalError.overflow(op: "cast", index: i, detail: detail)
+                }
             }
             return
         }
         let flag = try MetalArrowBuffer.allocate(byteCount: 4, zeroed: false, context: ctx)
         flag.mutableTyped(UInt32.self)[0] = .max
         let pso = try Dispatch.pipeline(ctx, family: "cast-check",
-                                        source: CastCheckSource.source(From: T.mslType, To: U.mslType),
+                                        source: CastCheckSource.source(From: T.mslType, To: U.mslType,
+                                                                       predicate: predicate),
                                         function: "cast_check", type: "\(T.mslType)->\(U.mslType)")
         let vld = validity ?? values
         try ctx.run { enc in
@@ -160,6 +192,27 @@ extension MetalArray {
         try ctx.syncPoint()
         let first = flag.typed(UInt32.self)[0]
         if first != .max { throw ArrowMetalError.overflow(op: "cast", index: Int(first), detail: detail) }
+    }
+}
+
+extension MetalArray {
+    /// The same three rules as `lossPredicate`, on the host, for the float64 conversions Metal cannot
+    /// run (it has no `double`).
+    static func losesOnHost<U: ArrowPrimitive>(_ v: T, _: U.Type) -> Bool {
+        if U.self == T.self { return false }
+        if T.isFloatingPoint && U.isFloatingPoint { return false }
+        if T.isFloatingPoint { return T.convert(U.convert(v)) != v }
+        if U.isFloatingPoint {
+            let limit = Double(U.byteWidth == 4 ? Int64(1) << 24 : Int64(1) << 53)
+            let d = v.asDouble
+            return d > limit || d < -limit
+        }
+        let sourceSigned = T.minValue < 0 as T, targetSigned = U.minValue < 0 as U
+        let back = T.convert(U.convert(v))
+        if back != v { return true }
+        if sourceSigned && !targetSigned { return v < 0 as T }
+        if !sourceSigned && targetSigned { return U.convert(v) < 0 as U }
+        return false
     }
 }
 

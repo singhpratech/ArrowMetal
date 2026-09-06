@@ -188,12 +188,28 @@ extension AnyMetalArray {
                                                   values: rescaled.values, context: rescaled.context))
         }
         if case .smallDecimal(let d) = self { return try AnyMetalArray.decimal(try d.toDecimal128()).castToDecimal(target, options) }
-        // From a number: multiply by 10^scale in int64 and reinterpret.
-        let ints = try numericSource().withCastablePrimitive { .int64(try $0.cast(to: Int64.self, options: options)) }.unwrapInt64()
-        var factor: Int64 = 1
+        let source = try numericSource()
+        if case .float64(let f) = source { return .decimal(try Self.decimal(fromFloat: f, target)) }
+        if case .float32(let f) = source {
+            return .decimal(try Self.decimal(fromFloat: try f.cast(to: Double.self), target))
+        }
+        // From an integer: `fromInt64` is the scaling, so nothing is multiplied here.
+        let ints = try source.withCastablePrimitive { .int64(try $0.cast(to: Int64.self, options: options)) }.unwrapInt64()
+        return .decimal(try MetalDecimalArray.fromInt64(ints, type: target))
+    }
+
+    /// A float column as a decimal: the fractional digits the target's scale keeps are the point, so the
+    /// value is scaled *before* it becomes an integer, and the raw result is relabelled with the target
+    /// type rather than scaled a second time.
+    private static func decimal(fromFloat f: MetalArray<Double>,
+                                _ target: ArrowDecimalType) throws -> MetalDecimalArray {
+        var factor = 1.0
         for _ in 0..<target.scale { factor *= 10 }
-        let scaled = factor == 1 ? ints : try ints.arithmetic(.mul, factor)
-        return .decimal(try MetalDecimalArray.fromInt64(scaled, type: target))
+        let scaled = try (factor == 1 ? f : try f.arithmetic(.mul, factor)).cast(to: Int64.self)
+        let raw = try MetalDecimalArray.fromInt64(scaled, type: try ArrowDecimalType(precision: target.precision,
+                                                                                     scale: 0))
+        return try MetalDecimalArray(type: target, length: raw.length, nullCount: raw.nullCount,
+                                     validity: raw.validity, values: raw.values, context: raw.context)
     }
 
     /// Raises naming the first row a rescale would round away.

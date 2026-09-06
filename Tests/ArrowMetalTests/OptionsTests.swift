@@ -478,3 +478,271 @@ extension OptionsTests {
         XCTAssertEqual(counts.toRawArray(), [2, 1, 2])
     }
 }
+
+// MARK: - CastOptions
+
+extension OptionsTests {
+
+    func testCastUncheckedIsUnchanged() throws {
+        try requireRealGPU()
+        let a = try MetalArray<Int64>([300, 5, -1, 0] as [Int64])
+        XCTAssertEqual(try a.cast(to: Int8.self, options: .unsafe).toRawArray(), [44, 5, -1, 0])
+        XCTAssertEqual(try a.cast(to: Int8.self).toRawArray(), [44, 5, -1, 0])
+    }
+
+    func testCastSafeRaisesOnIntegerOverflow() throws {
+        try requireRealGPU()
+        let a = try MetalArray<Int64>([1, 2, 300, 400] as [Int64])
+        XCTAssertThrowsError(try a.cast(to: Int8.self, options: .safe)) { error in
+            guard case ArrowMetalError.overflow(_, let index, _) = error else {
+                return XCTFail("expected an overflow error, got \(error)")
+            }
+            XCTAssertEqual(index, 2, "the message must name the first offending row")
+        }
+        XCTAssertEqual(try a.cast(to: Int16.self, options: .safe).toRawArray(), [1, 2, 300, 400])
+        var allowed = CastOptions.safe
+        allowed.allowIntOverflow = true
+        XCTAssertEqual(try a.cast(to: Int8.self, options: allowed).toRawArray(), [1, 2, 44, -112])
+    }
+
+    func testCastSafeCatchesSignCrossing() throws {
+        try requireRealGPU()
+        // -1 round-trips through uint64 bit for bit and is still out of range, which is why the check
+        // is not the round trip alone.
+        let signed = try MetalArray<Int64>([-1, 1] as [Int64])
+        XCTAssertThrowsError(try signed.cast(to: UInt64.self, options: .safe))
+        XCTAssertEqual(try signed.cast(to: UInt64.self).toRawArray(), [UInt64.max, 1])
+
+        let unsigned = try MetalArray<UInt64>([UInt64.max, 1] as [UInt64])
+        XCTAssertThrowsError(try unsigned.cast(to: Int64.self, options: .safe))
+    }
+
+    func testCastSafeFloatToInt() throws {
+        try requireRealGPU()
+        let exact = try MetalArray<Float>([0, 1, -2, 3] as [Float])
+        XCTAssertEqual(try exact.cast(to: Int32.self, options: .safe).toRawArray(), [0, 1, -2, 3])
+        for bad in [[Float(1.5)], [Float(1e30)], [Float.nan], [Float.infinity]] {
+            let a = try MetalArray<Float>(bad)
+            XCTAssertThrowsError(try a.cast(to: Int32.self, options: .safe), "\(bad)")
+            var allowed = CastOptions.safe
+            allowed.allowFloatTruncate = true
+            XCTAssertNoThrow(try a.cast(to: Int32.self, options: allowed))
+        }
+    }
+
+    func testCastSafeIntToFloatUsesTheContiguousRange() throws {
+        try requireRealGPU()
+        // 2^31 is exactly representable in float32 and Arrow still refuses it: the rule is the
+        // contiguous integer range, 2^24.
+        let a = try MetalArray<Int64>([1 << 31] as [Int64])
+        XCTAssertThrowsError(try a.cast(to: Float.self, options: .safe))
+        XCTAssertNoThrow(try MetalArray<Int64>([1 << 24] as [Int64]).cast(to: Float.self, options: .safe))
+        XCTAssertNoThrow(try a.cast(to: Double.self, options: .safe))
+        // A source too narrow to leave the range never pays for a check.
+        XCTAssertNil(MetalArray<Int16>.lossPredicate(Float.self))
+    }
+
+    func testCastSafeFloatToFloatNeverRaises() throws {
+        try requireRealGPU()
+        let a = try MetalArray<Double>([1e300, -1e300, 0.5] as [Double])
+        let out = try a.cast(to: Float.self, options: .safe).toRawArray()
+        XCTAssertEqual(out[0], .infinity)
+        XCTAssertEqual(out[1], -.infinity)
+        XCTAssertEqual(out[2], 0.5)
+    }
+
+    func testCastSafeSkipsNullRows() throws {
+        try requireRealGPU()
+        // A null row is never evaluated, whatever bytes happen to sit under it.
+        let a = try MetalArray<Int64>([1, nil, 2] as [Int64?])
+        XCTAssertEqual(try a.cast(to: Int8.self, options: .safe).toArray(), [1, nil, 2])
+    }
+
+    func testCastSafeAtEverySize() throws {
+        try requireRealGPU()
+        for n in Self.sizes + [Self.bigSize] {
+            let vals: [Int64?] = (0..<n).map { (i: Int) -> Int64? in i % 11 == 5 ? nil : Int64(i % 100) }
+            let a = try MetalArray<Int64>(vals)
+            XCTAssertEqual(try a.cast(to: Int8.self, options: .safe).toArray().map { $0.map(Int64.init) },
+                           vals, "n=\(n)")
+            guard n > 200 else { continue }
+            // One bad row anywhere in a big array must still be found.
+            var withBad = vals
+            withBad[n - 1] = 300
+            let b = try MetalArray<Int64>(withBad)
+            XCTAssertThrowsError(try b.cast(to: Int8.self, options: .safe), "n=\(n)")
+        }
+    }
+
+    func testCastOptionBits() {
+        XCTAssertEqual(CastOptions.safe.bits, 0)
+        XCTAssertEqual(CastOptions.unsafe.bits, 0b111111)
+        for bits in UInt32(0)...0b111111 {
+            XCTAssertEqual(CastOptions(bits: bits).bits, bits)
+        }
+    }
+
+    func testCastDispatchReachesEveryFamily() throws {
+        try requireRealGPU()
+        let ints = AnyMetalArray.int64(try MetalArray<Int64>([1, 0, nil] as [Int64?]))
+        XCTAssertEqual(try ints.cast(to: "g").arrowFormat, "g")
+        XCTAssertEqual(try ints.cast(to: "b").arrowFormat, "b")
+        XCTAssertEqual(try ints.cast(to: "u").arrowFormat, "u")
+        XCTAssertEqual(try ints.cast(to: "e").arrowFormat, "e")
+        XCTAssertEqual(try ints.cast(to: "tss:").arrowFormat, "tss:")
+        XCTAssertEqual(try ints.cast(to: "d:12,2").arrowFormat, "d:12,2")
+        // An unknown target is refused rather than silently ignored.
+        XCTAssertThrowsError(try ints.cast(to: "+m"))
+    }
+
+    func testCastNestedCastsTheChild() throws {
+        try requireRealGPU()
+        let child = AnyMetalArray.int32(try MetalArray<Int32>([1, 2, 3] as [Int32]))
+        let list = try MetalListArray(counts: [2, nil, 1], values: child)
+        let out = try AnyMetalArray.list(list).cast(to: "+l", childFormats: ["l"])
+        guard case .list(let l) = out else { return XCTFail("expected a list") }
+        XCTAssertEqual(l.values.arrowFormat, "l")
+        XCTAssertEqual(l.length, 3)
+        XCTAssertEqual(l.nullCount, 1)
+        // The offsets and the validity bitmap are shared, not copied.
+        XCTAssertTrue(l.offsets === list.offsets)
+
+        let s = try MetalStructArray(names: ["a", "b"],
+                                     children: [AnyMetalArray.int32(try MetalArray<Int32>([1, 2] as [Int32])),
+                                                AnyMetalArray.float32(try MetalArray<Float>([1.5, 2.5] as [Float]))])
+        let cast = try AnyMetalArray.structure(s).cast(to: "+s", childFormats: ["l", "g"])
+        guard case .structure(let t) = cast else { return XCTFail("expected a struct") }
+        XCTAssertEqual(t.children.map { $0.arrowFormat }, ["l", "g"])
+        XCTAssertEqual(t.names, ["a", "b"])
+    }
+
+    func testCastNestedPropagatesTheChildError() throws {
+        try requireRealGPU()
+        let child = AnyMetalArray.int64(try MetalArray<Int64>([300] as [Int64]))
+        let list = try MetalListArray(counts: [1], values: child)
+        XCTAssertThrowsError(try AnyMetalArray.list(list).cast(to: "+l", options: .safe, childFormats: ["c"]))
+    }
+}
+
+// MARK: - RoundTemporalOptions
+
+extension OptionsTests {
+
+    func timestamps(_ unit: ArrowTemporalUnit = .second) throws -> MetalTemporalArray {
+        // 2024-05-17T13:47:33, 1970-01-01, one second before the epoch, and a leap day.
+        let seconds: [Int64?] = [1_715_953_653, 0, -1, 1_709_247_000, 951_912_000, nil]
+        return try MetalTemporalArray(type: .timestamp(unit, timezone: nil),
+                                      try MetalArray<Int64>(seconds))
+    }
+
+    func testRoundTemporalUnitsIncludeWeek() throws {
+        try requireRealGPU()
+        XCTAssertTrue(TemporalRoundUnit.allCases.contains(.week))
+        XCTAssertEqual(TemporalRoundUnit.allCases.count, 11, "Arrow has eleven units")
+    }
+
+    /// The week grid is anchored on a Monday (or a Sunday) and is a whole number of weeks wide.
+    func testFloorTemporalWeekLandsOnTheRightWeekday() throws {
+        try requireRealGPU()
+        let days: [Int32?] = (0..<40).map { Int32(19_800 + $0) }        // a run of consecutive days
+        let a = try MetalTemporalArray(type: .date32, try MetalArray<Int32>(days))
+        for startsMonday in [true, false] {
+            let opts = RoundTemporalOptions(multiple: 1, unit: .week, weekStartsMonday: startsMonday)
+            let got = try a.floorTemporal(opts).asInt32!.toRawArray()
+            for (i, d) in days.enumerated() {
+                let floored = got[i]
+                XCTAssertLessThanOrEqual(floored, d!, "a floor never exceeds its input")
+                XCTAssertLessThan(d! - floored, 7)
+                // 1970-01-01 was a Thursday, so day 0 mod 7 == 4 counting Monday as 0.
+                let weekday = ((floored % 7) + 7 + 3) % 7
+                XCTAssertEqual(weekday, startsMonday ? 0 : 6, "day \(d!) floored to \(floored)")
+            }
+        }
+    }
+
+    func testRoundTemporalHalvesGoUp() throws {
+        try requireRealGPU()
+        let seconds: [Int64?] = [0, 1, 2, 3, 4, 5, -1, -3]
+        let a = try MetalTemporalArray(type: .timestamp(.second, timezone: nil),
+                                       try MetalArray<Int64>(seconds))
+        let got = try a.roundTemporal(RoundTemporalOptions(multiple: 2, unit: .second)).asInt64!.toRawArray()
+        XCTAssertEqual(got, [0, 2, 2, 4, 4, 6, 0, -2], "an exact half goes toward +infinity")
+    }
+
+    func testCeilIsStrictlyGreater() throws {
+        try requireRealGPU()
+        let seconds: [Int64?] = [0, 3600 * 3, 3600 * 4]
+        let a = try MetalTemporalArray(type: .timestamp(.second, timezone: nil),
+                                       try MetalArray<Int64>(seconds))
+        let plain = RoundTemporalOptions(multiple: 3, unit: .hour)
+        var strict = plain
+        strict.ceilIsStrictlyGreater = true
+        XCTAssertEqual(try a.ceilTemporal(plain).asInt64!.toRawArray(), [0, 3600 * 3, 3600 * 6])
+        XCTAssertEqual(try a.ceilTemporal(strict).asInt64!.toRawArray(), [3600 * 3, 3600 * 6, 3600 * 6])
+    }
+
+    func testCalendarBasedOriginStartsAtTheGreaterUnit() throws {
+        try requireRealGPU()
+        // 2024-05-17T13:47:33 UTC.
+        let a = try MetalTemporalArray(type: .timestamp(.second, timezone: nil),
+                                       try MetalArray<Int64>([1_715_953_653] as [Int64]))
+        var opts = RoundTemporalOptions(multiple: 7, unit: .minute)
+        let epochBased = try a.floorTemporal(opts).asInt64!.toRawArray()[0]
+        opts.calendarBasedOrigin = true
+        let dayBased = try a.floorTemporal(opts).asInt64!.toRawArray()[0]
+        // The calendar form starts the grid at the top of the hour: minute 47 floors to 42.
+        XCTAssertEqual(dayBased % 3600, 42 * 60)
+        XCTAssertNotEqual(epochBased, dayBased)
+    }
+
+    func testRoundTemporalRejectsBadOptions() throws {
+        try requireRealGPU()
+        let a = try timestamps()
+        XCTAssertThrowsError(try a.floorTemporal(RoundTemporalOptions(multiple: 0, unit: .day)))
+        // A calendar unit needs a date, which a time-of-day column does not carry.
+        let t = try MetalTemporalArray(type: .time32(.second), try MetalArray<Int32>([1, 2] as [Int32]))
+        XCTAssertThrowsError(try t.floorTemporal(RoundTemporalOptions(multiple: 1, unit: .month)))
+        XCTAssertThrowsError(try t.floorTemporal(RoundTemporalOptions(multiple: 1, unit: .week)))
+    }
+
+    func testRoundTemporalKeepsNullsAndLength() throws {
+        try requireRealGPU()
+        for unit in TemporalRoundUnit.allCases {
+            let a = try timestamps()
+            let out = try a.floorTemporal(RoundTemporalOptions(multiple: 3, unit: unit))
+            XCTAssertEqual(out.length, a.length, "\(unit)")
+            XCTAssertEqual(out.nullCount, a.nullCount, "\(unit)")
+        }
+    }
+
+    func testRoundTemporalLarge() throws {
+        try requireRealGPU()
+        let n = 200_003
+        let seconds: [Int64?] = (0..<n).map { (i: Int) -> Int64? in i % 9 == 4 ? nil : Int64(i) * 37 }
+        let a = try MetalTemporalArray(type: .timestamp(.second, timezone: nil),
+                                       try MetalArray<Int64>(seconds))
+        let got = try a.floorTemporal(RoundTemporalOptions(multiple: 5, unit: .hour)).asInt64!.toRawArray()
+        for (i, v) in seconds.enumerated() where v != nil {
+            let period: Int64 = 5 * 3600
+            var lo = (v! / period) * period
+            if v! % period != 0 && v! < 0 { lo -= period }
+            XCTAssertEqual(got[i], lo, "row \(i)")
+        }
+    }
+}
+
+// MARK: - list_parent_indices in int64
+
+extension OptionsTests {
+
+    func testListParentIndicesWidths() throws {
+        try requireRealGPU()
+        let child = AnyMetalArray.int64(try MetalArray<Int64>([1, 2, 3, 4, 5, 6] as [Int64]))
+        let list = try MetalListArray(counts: [3, 1, nil, 0, 2], values: child)
+        let narrow = try list.listParentIndices().toRawArray()
+        let wide = try list.listParentIndices64().toRawArray()
+        XCTAssertEqual(narrow, [0, 0, 0, 1, 4, 4])
+        XCTAssertEqual(wide, narrow.map(Int64.init))
+        XCTAssertEqual(try AnyMetalArray.list(list).listParentIndices64().toRawArray(), wide)
+    }
+}
