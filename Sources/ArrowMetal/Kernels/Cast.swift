@@ -12,8 +12,8 @@ extension MetalArray {
         let ctx = context
         let out = try MetalArrowBuffer.allocate(byteCount: n * U.byteWidth, zeroed: false, context: ctx)
         if Dispatch.runsOnGPU(T.self) && Dispatch.runsOnGPU(U.self) {
-            let src = KernelSource.cast(From: T.mslType, To: U.mslType)
-            let pso = try Dispatch.pipeline(ctx, family: "cast", source: src, function: "cast_kernel", type: "\(T.mslType)->\(U.mslType)")
+            let pso = try Dispatch.pipeline(ctx, family: "cast", source: KernelSource.cast(From: T.mslType, To: U.mslType),
+                                            function: "cast_kernel", type: "\(T.mslType)->\(U.mslType)")
             if n > 0 {
                 try ctx.run { enc in
                     enc.setComputePipelineState(pso)

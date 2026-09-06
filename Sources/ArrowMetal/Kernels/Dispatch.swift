@@ -6,8 +6,12 @@ enum Dispatch {
     static let threadgroupSize = 256
 
     /// Pipeline for a type-specialised kernel, keyed by source family + type + function.
-    static func pipeline(_ ctx: MetalContext, family: String, source: String, function: String, type: String) throws -> MTLComputePipelineState {
-        try ctx.pipeline(source: source, function: function, cacheKey: "\(family)/\(type)/\(function)")
+    ///
+    /// `source` is an autoclosure so a cache hit never pays for generating the MSL (see
+    /// `MetalContext.pipeline`). Pass the generator call directly, not a `let` bound above.
+    static func pipeline(_ ctx: MetalContext, family: String, source: @autoclosure () -> String,
+                         function: String, type: String) throws -> MTLComputePipelineState {
+        try ctx.pipeline(source: source(), function: function, cacheKey: "\(family)/\(type)/\(function)")
     }
 
     /// Grid of `count` threads in threadgroups of 256 (bounds checks inside kernels handle the tail).

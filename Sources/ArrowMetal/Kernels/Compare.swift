@@ -25,8 +25,10 @@ extension MetalArray {
         let words = BitmapOps.words(bits: n)
         let out = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: n), zeroed: false, context: ctx)
         let isDouble = T.self == Double.self, isFloat = T.self == Float.self
-        let src = isDouble ? KernelSource.compareDouble : (isFloat ? KernelSource.compareFloat32 : KernelSource.compare(T: T.mslType))
-        let pso = try Dispatch.pipeline(ctx, family: "cmp", source: src, function: "cmp_scalar_\(op.rawValue)", type: isDouble ? "double" : (isFloat ? "float32key" : T.mslType))
+        // Source generated lazily: a warm cache must not pay for the MSL string (see MetalContext.pipeline).
+        let pso = try Dispatch.pipeline(ctx, family: "cmp",
+                                        source: isDouble ? KernelSource.compareDouble : (isFloat ? KernelSource.compareFloat32 : KernelSource.compare(T: T.mslType)),
+                                        function: "cmp_scalar_\(op.rawValue)", type: isDouble ? "double" : (isFloat ? "float32key" : T.mslType))
         try ctx.run { enc in
             enc.setComputePipelineState(pso)
             enc.setBuffer(values.mtl, offset: values.offset, index: 0)
@@ -49,8 +51,9 @@ extension MetalArray {
         let words = BitmapOps.words(bits: n)
         let out = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: n), zeroed: false, context: ctx)
         let isDouble = T.self == Double.self, isFloat = T.self == Float.self
-        let src = isDouble ? KernelSource.compareDouble : (isFloat ? KernelSource.compareFloat32 : KernelSource.compare(T: T.mslType))
-        let pso = try Dispatch.pipeline(ctx, family: "cmp", source: src, function: "cmp_array_\(op.rawValue)", type: isDouble ? "double" : (isFloat ? "float32key" : T.mslType))
+        let pso = try Dispatch.pipeline(ctx, family: "cmp",
+                                        source: isDouble ? KernelSource.compareDouble : (isFloat ? KernelSource.compareFloat32 : KernelSource.compare(T: T.mslType)),
+                                        function: "cmp_array_\(op.rawValue)", type: isDouble ? "double" : (isFloat ? "float32key" : T.mslType))
         try ctx.run { enc in
             enc.setComputePipelineState(pso)
             enc.setBuffer(values.mtl, offset: values.offset, index: 0)

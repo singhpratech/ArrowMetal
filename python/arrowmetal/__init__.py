@@ -2692,3 +2692,46 @@ def _reduce_any(self, op):
 
 MetalArray.unary = _unary_any
 MetalArray._reduce = _reduce_any
+
+
+# --- Dispatch latency (see docs/RESIDENT.md) -------------------------------------------------
+
+_lib.am_resident_mode.argtypes = [ctypes.c_int]; _lib.am_resident_mode.restype = ctypes.c_int
+_lib.am_resident_mode_available.argtypes = []; _lib.am_resident_mode_available.restype = ctypes.c_int
+_lib.am_resident_mode_reason.argtypes = []; _lib.am_resident_mode_reason.restype = ctypes.c_char_p
+_lib.am_low_latency_wait.argtypes = [ctypes.c_int]; _lib.am_low_latency_wait.restype = ctypes.c_int
+_lib.am_spin_microseconds.argtypes = [ctypes.c_int64]; _lib.am_spin_microseconds.restype = ctypes.c_int64
+
+
+def resident_mode(on=True):
+    """Ask for a persistent GPU worker: one long-running kernel spinning on a work queue in unified
+    memory, so a small op costs a memory round trip instead of a command buffer.
+
+    Returns whether it took effect. On Apple silicon that is always False -- a running Metal kernel
+    and the CPU are not cache coherent through shared storage, so a CPU store reaches a spinning
+    kernel only when the line is evicted, measured at 0.4 to 1.4 seconds against a 65 microsecond
+    command-buffer round trip. `resident_mode_reason()` has the detail."""
+    return bool(_lib.am_resident_mode(1 if on else 0))
+
+
+def resident_mode_available():
+    """Whether a persistent GPU worker is available on this device (always False today)."""
+    return bool(_lib.am_resident_mode_available())
+
+
+def resident_mode_reason():
+    """Why resident mode is unavailable, with the measured numbers."""
+    return _lib.am_resident_mode_reason().decode()
+
+
+def low_latency_wait(on=True):
+    """Wait for command buffers on an MTLSharedEvent the CPU polls out of memory rather than calling
+    waitUntilCompleted: about 65 microseconds against 78 per round trip on an M4 Max. On by default.
+    Returns the setting now in force."""
+    return bool(_lib.am_low_latency_wait(1 if on else 0))
+
+
+def spin_microseconds(microseconds=None):
+    """How long the CPU spins before it blocks on a command buffer. 0 blocks immediately, which costs
+    latency but frees the core. Call with no argument to read the current value."""
+    return int(_lib.am_spin_microseconds(-1 if microseconds is None else int(microseconds)))

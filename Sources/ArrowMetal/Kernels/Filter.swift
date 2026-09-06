@@ -58,10 +58,10 @@ extension MetalArray {
         let blockCounts = try MetalArrowBuffer.allocate(byteCount: blocks * 4, zeroed: false, context: ctx)
         let total = try MetalArrowBuffer.allocate(byteCount: 4, zeroed: false, context: ctx)
         let mslT = Dispatch.moveType(T.self)
-        let src = KernelSource.filter(T: mslT)
-        let countPSO = try Dispatch.pipeline(ctx, family: "filter", source: src, function: prepare == nil ? "filter_count" : "filter_pred_count", type: mslT)
-        let scanPSO = try Dispatch.pipeline(ctx, family: "filter", source: src, function: "filter_scan", type: mslT)
-        let scatterPSO = try Dispatch.pipeline(ctx, family: "filter", source: src, function: "filter_scatter", type: mslT)
+        // Generated lazily per call site: three cache lookups, and on a hit none of them builds the MSL.
+        let countPSO = try Dispatch.pipeline(ctx, family: "filter", source: KernelSource.filter(T: mslT), function: prepare == nil ? "filter_count" : "filter_pred_count", type: mslT)
+        let scanPSO = try Dispatch.pipeline(ctx, family: "filter", source: KernelSource.filter(T: mslT), function: "filter_scan", type: mslT)
+        let scatterPSO = try Dispatch.pipeline(ctx, family: "filter", source: KernelSource.filter(T: mslT), function: "filter_scatter", type: mslT)
         let tg = MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1)
         let grid = MTLSize(width: blocks, height: 1, depth: 1)
         // Worst-case sized outputs; they come from the pool so this is cheap.
