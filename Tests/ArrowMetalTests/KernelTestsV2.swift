@@ -5,21 +5,30 @@ import CArrowABI
 final class TakeCastSliceTests: XCTestCase {
     func testTakeWithNullsAndNullIndices() throws {
         for n in [0, 1, 33, 1000, 100_003] {
-            let src = try MetalArray<Int64>((0..<n).map { $0 % 7 == 0 ? nil : Int64($0) })
-            let idxVals: [Int32?] = (0..<(n / 2 + 3)).map { i in i % 5 == 0 ? nil : Int32((i * 31) % max(n, 1)) }
+            var srcVals: [Int64?] = []
+            for i in 0..<n { srcVals.append(i % 7 == 0 ? nil : Int64(i)) }
+            let src = try MetalArray<Int64>(srcVals)
+            var idxVals: [Int32?] = []
+            let modulus = max(n, 1)
+            for i in 0..<(n / 2 + 3) {
+                if i % 5 == 0 { idxVals.append(nil) } else { idxVals.append(Int32((i * 31) % modulus)) }
+            }
             guard n > 0 else {
                 let e = try MetalArray<Int32>([Int32]())
                 XCTAssertEqual(try src.take(e).length, 0); continue
             }
             let idx = try MetalArray<Int32>(idxVals)
             let g = try src.take(idx)
-            let expected: [Int64?] = idxVals.map { $0.flatMap { src[Int($0)] } }
+            var expected: [Int64?] = []
+            for iv in idxVals { if let iv { expected.append(src[Int(iv)]) } else { expected.append(nil) } }
             XCTAssertEqual(g.toArray(), expected, "n=\(n)")
             XCTAssertEqual(g.nullCount, expected.filter { $0 == nil }.count)
             // Int64 indices, no nulls anywhere
-            let plain = try MetalArray<Int64>((0..<n).map { Int64($0) })
-            let idx64 = try MetalArray<Int64>((0..<n).reversed().map { Int64($0) })
-            XCTAssertEqual(try plain.take(idx64).toRawArray(), (0..<n).reversed().map { Int64($0) })
+            let ascending: [Int64] = (0..<n).map { Int64($0) }
+            let descending: [Int64] = ascending.reversed()
+            let plain = try MetalArray<Int64>(ascending)
+            let idx64 = try MetalArray<Int64>(descending)
+            XCTAssertEqual(try plain.take(idx64).toRawArray(), descending)
             XCTAssertNil(try plain.take(idx64).validity)
         }
     }
@@ -57,7 +66,9 @@ final class TakeCastSliceTests: XCTestCase {
 
     func testSliceAlignedIsZeroCopyAndUnalignedCopies() throws {
         let n = 1000
-        let a = try MetalArray<Int32>((0..<n).map { $0 % 3 == 0 ? nil : Int32($0) })
+        var aVals: [Int32?] = []
+        for i in 0..<n { aVals.append(i % 3 == 0 ? nil : Int32(i)) }
+        let a = try MetalArray<Int32>(aVals)
         let s1 = try a.slice(offset: 64, length: 100)
         XCTAssertTrue(s1.values.mtl === a.values.mtl, "aligned slice shares the buffer")
         XCTAssertEqual(s1.toArray(), Array(a.toArray()[64..<164]))
@@ -83,7 +94,8 @@ final class Float64AndBooleanTests: XCTestCase {
     func testFloat64CompareMinMaxFilterOnGPU() throws {
         var g = SystemRandomNumberGenerator()
         for n in [0, 1, 31, 32, 33, 4097, 300_000] {
-            var vals: [Double?] = (0..<n).map { _ in Double.random(in: -1000...1000, using: &g) }
+            var vals: [Double?] = []
+            for _ in 0..<n { vals.append(Double.random(in: -1000...1000, using: &g)) }
             for i in stride(from: 0, to: n, by: 9) { vals[i] = nil }
             if n > 20 { vals[3] = .nan; vals[4] = -0.0; vals[5] = 0.0; vals[6] = .infinity; vals[7] = -.infinity }
             let a = try MetalArray<Double>(vals)
@@ -125,11 +137,17 @@ final class Float64AndBooleanTests: XCTestCase {
     }
 }
 
+func priceValues(_ n: Int) -> [Float?] {
+    var v: [Float?] = []
+    for i in 0..<n { v.append(i % 4 == 0 ? nil : Float(i) * 0.5) }
+    return v
+}
+
 final class RecordBatchTests: XCTestCase {
     func makeBatch(_ n: Int) throws -> MetalRecordBatch {
         try MetalRecordBatch(names: ["id", "price", "qty", "flag", "w"], columns: [
             .int64(try MetalArray<Int64>((0..<n).map { Int64($0) })),
-            .float32(try MetalArray<Float>((0..<n).map { $0 % 4 == 0 ? nil : Float($0) * 0.5 })),
+            .float32(try MetalArray<Float>(priceValues(n))),
             .int32(try MetalArray<Int32>((0..<n).map { Int32($0 % 10) })),
             .boolean(try MetalBooleanArray((0..<n).map { $0 % 2 == 0 })),
             .float64(try MetalArray<Double>((0..<n).map { Double($0) })),
@@ -144,7 +162,8 @@ final class RecordBatchTests: XCTestCase {
         let keptIds = (0..<n).filter { $0 % 10 >= 8 }
         XCTAssertEqual(f.length, keptIds.count)
         XCTAssertEqual(f["id"]!.asInt64!.toRawArray(), keptIds.map { Int64($0) })
-        XCTAssertEqual(f["price"]!.asFloat32!.toArray(), keptIds.map { $0 % 4 == 0 ? nil : Float($0) * 0.5 })
+        let expectedPrices: [Float?] = keptIds.map { i in i % 4 == 0 ? nil : Float(i) * 0.5 }
+        XCTAssertEqual(f["price"]!.asFloat32!.toArray(), expectedPrices)
         XCTAssertEqual(f["flag"]!.asBoolean!.toArray(), keptIds.map { $0 % 2 == 0 })
         XCTAssertEqual(f["w"]!.asFloat64!.toRawArray(), keptIds.map { Double($0) })
         let t = try b.take(try MetalArray<Int32>([5, 0, 9999]))
