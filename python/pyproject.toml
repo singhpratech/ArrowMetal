@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arrowmetal"
+version = "0.1.0"
+description = "Apache Arrow columnar data on Apple silicon GPUs (Metal), from Python"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+keywords = ["arrow", "metal", "gpu", "apple-silicon", "columnar", "pyarrow"]
+dependencies = ["pyarrow>=14"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Swift",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/arrowmetal/ArrowMetal"
+Source = "https://github.com/arrowmetal/ArrowMetal"
+
+[tool.setuptools]
+# The wheel is not pure Python: it carries a compiled arm64 dylib, so it must not
+# be tagged `py3-none-any`. scripts/build_wheel.sh passes the macOS arm64 tags.
+zip-safe = false
+
+[tool.setuptools.packages.find]
+include = ["arrowmetal*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+arrowmetal = ["libArrowMetalC.dylib"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

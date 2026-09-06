@@ -26,3 +26,33 @@ arithmetic use a software IEEE-754 implementation that is bit-exact with the CPU
 around a chain of operations to pay one GPU round trip instead of one per call.
 
 See `Benchmarks/python_gpu_bench.py` for a side-by-side with Polars, pyarrow.compute and pandas on the same data.
+
+## Building a wheel
+
+```
+pip install build                    # the wheel build frontend
+scripts/build_wheel.sh               # -> python/dist/arrowmetal-0.1.0-*-macosx_*_arm64.whl
+```
+
+The script builds `libArrowMetalC.dylib` in release, copies it into `python/arrowmetal/` and runs
+`python -m build --wheel` in `python/`, so the wheel carries the dylib as package data and needs no
+`swift build` at install time. The loader prefers the bundled dylib, then `.build/release`, then
+`.build/debug`, then the usual system prefixes; `$ARROWMETAL_LIB` overrides all of them. The wheel is
+macOS arm64 only: it links Metal and holds an arm64 binary.
+
+## Tests
+
+```
+pip install pytest
+swift build -c release --product ArrowMetalC
+PYTHONPATH=python python -m pytest python/tests -q
+```
+
+`python/tests/test_arrowmetal.py` checks import and round trip for int64/float64/float32/bool/string with
+nulls, reductions, compare/filter/`filter_where`, take, slice, cast, arithmetic (float64 included),
+boolean logic, group-by, the string kernels, `with am.batch():` against the unbatched results, and Polars
+interop. Every result is compared to `pyarrow.compute` or plain Python. Polars tests skip when Polars is
+absent; the suite needs a real Metal device.
+
+Not covered by the group-by kernels today: `min`/`max` on 64-bit values, `mean` on Float32, and Float64
+values for any aggregate. `python/tests` pins those as expected errors so the tests flag it when they land.
