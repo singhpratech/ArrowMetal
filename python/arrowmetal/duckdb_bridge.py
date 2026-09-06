@@ -99,7 +99,8 @@ def duckdb_reader(source, con=None, rows_per_batch=DEFAULT_ROWS_PER_BATCH):
         return pa.RecordBatchReader.from_batches(rel.schema, rel.to_batches(rows_per_batch))
     if isinstance(rel, pa.RecordBatch):
         return pa.RecordBatchReader.from_batches(rel.schema, [rel])
-    for name in ("fetch_record_batch", "fetch_arrow_reader", "to_arrow_reader"):
+    # to_arrow_reader is the current name; the other two are what older DuckDB calls it.
+    for name in ("to_arrow_reader", "fetch_record_batch", "fetch_arrow_reader"):
         fn = getattr(rel, name, None)
         if fn is None:
             continue
