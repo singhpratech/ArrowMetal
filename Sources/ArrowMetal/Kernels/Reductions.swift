@@ -29,13 +29,13 @@ extension MetalArray {
     func finaliseSum(_ partials: MetalArrowBuffer, _ counts: MetalArrowBuffer, _ groups: Int) -> SumResult {
         // The raw pointers below must not outlive the buffer objects (release builds shorten lifetimes).
         return withExtendedLifetime((partials, counts)) {
-            if T.self == Double.self {
-                // Partials are IEEE doubles produced by software d_add on the GPU; combine on the CPU.
+            if T.isFloatingPoint {
+                // Partials are IEEE doubles produced by software d_add on the GPU (Float32 widened exactly); combine on the CPU.
                 let p = partials.typed(UInt64.self)
                 var acc = 0.0
                 for g in 0..<groups { acc += Double(bitPattern: p[g]) }
                 return .float(acc)
-            } else if T.isFloatingPoint {
+            } else if false {
                 let p = partials.typed(Float.self)
                 var acc = 0.0
                 for g in 0..<groups { acc += Double(p[g]) }
@@ -123,6 +123,10 @@ extension MetalArray {
             // Software IEEE double accumulation on raw bit patterns.
             mslT = "long"; acc = "ulong"; minInit = "0"; maxInit = "0"
             load = "(ulong)vals[i]"; combineSum = "d_add(acc, v)"; extraPrelude = DoubleMath.msl
+        } else if T.self == Float.self && fn == "reduce_sum" {
+            // Arrow sums float32 into float64: widen each value exactly and accumulate in software double.
+            mslT = "float"; acc = "ulong"; minInit = "0"; maxInit = "0"
+            load = "d_from_float(vals[i])"; combineSum = "d_add(acc, v)"; extraPrelude = DoubleMath.msl
         } else if T.self == Double.self {
             mslT = "long"; acc = "long"; minInit = "LONG_MAX"; maxInit = "LONG_MIN"
             load = "d_key(vals[i])"; extra = "!d_isnan(vals[i])"

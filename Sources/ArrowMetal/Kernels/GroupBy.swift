@@ -28,6 +28,20 @@ public struct GroupBy<K: ArrowIndex> {
         return finish(Int64.self, out: out, counts: counts, ctx: values.context)
     }
 
+    /// Sum of unsigned 64-bit values per key, kept unsigned (Arrow's hash_sum over uint64 is uint64).
+    public func sumUnsigned(_ values: MetalArray<UInt64>) throws -> MetalArray<UInt64> {
+        try check(values)
+        let (out, counts) = try run(values: values, kind: 1)
+        let res = try MetalArray<UInt64>.allocate(length: keyCount, withValidity: true, context: values.context)
+        withExtendedLifetime((out, counts)) {
+            let o = out.typed(UInt64.self), c = counts.typed(UInt64.self)
+            let d = res.mutableValuePointer, v = res.validity!.mutableTyped(UInt8.self)
+            for k in 0..<keyCount where c[k] > 0 { d[k] = o[k]; Bitmap.set(v, k) }
+        }
+        res.recomputeNullCount()
+        return res
+    }
+
     public func sumFloat(_ values: MetalArray<Float>) throws -> MetalArray<Double> {
         try check(values)
         let (out, counts) = try run(values: values, kind: 2)
@@ -46,7 +60,11 @@ public struct GroupBy<K: ArrowIndex> {
         let s = try sum(values), c = try count(values)
         let res = try MetalArray<Double>.allocate(length: keyCount, withValidity: true, context: values.context)
         let d = res.mutableValuePointer, v = res.validity!.mutableTyped(UInt8.self)
-        for k in 0..<keyCount where c.valuePointer[k] > 0 { d[k] = Double(s.valuePointer[k]) / Double(c.valuePointer[k]); Bitmap.set(v, k) }
+        let unsigned = T.minValue >= 0
+        for k in 0..<keyCount where c.valuePointer[k] > 0 {
+            let total = unsigned ? Double(UInt64(bitPattern: s.valuePointer[k])) : Double(s.valuePointer[k])
+            d[k] = total / Double(c.valuePointer[k]); Bitmap.set(v, k)
+        }
         res.recomputeNullCount()
         return res
     }

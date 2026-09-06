@@ -28,6 +28,9 @@ const char* am_format(am_array* a);          // Arrow format string: c C s S i I
 // Reductions. out_kind: 0 = int64 in out_i64, 1 = uint64 in out_u64 (same slot), 2 = float64 in out_f64.
 // op: 0 sum, 1 min, 2 max, 3 mean. *is_null is set when there is no valid value.
 int  am_reduce(am_array* a, int op, int64_t* out_i64, double* out_f64, int* out_kind, int* is_null);
+// Notes: min/max skip NaN and report is_null when every valid value is NaN (pyarrow returns NaN there).
+// float32 sums accumulate in float64 like Arrow. Float32 arithmetic kernels run in hardware float, which flushes
+// subnormal results to zero on Apple GPUs; comparisons and Float64 math are exact.
 
 // Element-wise. cmp op: 0 eq 1 ne 2 lt 3 le 4 gt 5 ge. arith op: 0 add 1 sub 2 mul 3 div.
 int  am_compare_scalar(am_array* a, int op, const void* scalar, am_array** out);

@@ -84,12 +84,12 @@ enum SortSource {
     kernel void key_from_i32(device const int* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { uint k = (uint)a[i] ^ 0x80000000u; out[i] = inv ? ~k : k; } }
     kernel void key_from_u32(device const uint* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { uint k = a[i]; out[i] = inv ? ~k : k; } }
     kernel void key_from_f32(device const uint* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], uint i [[thread_position_in_grid]]) {
-        if (i >= *nPtr) return; uint b = a[i]; uint k = (b & 0x80000000u) ? ~b : (b | 0x80000000u); out[i] = inv ? ~k : k;
+        if (i >= *nPtr) return; uint b = a[i]; if ((b & 0x7FFFFFFFu) == 0u) b = 0u; uint k = (b & 0x80000000u) ? ~b : (b | 0x80000000u); out[i] = inv ? ~k : k;
     }
     kernel void key_from_i64(device const long* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { ulong k = (ulong)a[i] ^ 0x8000000000000000ul; out[i] = inv ? ~k : k; } }
     kernel void key_from_u64(device const ulong* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { ulong k = a[i]; out[i] = inv ? ~k : k; } }
     kernel void key_from_f64(device const ulong* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], uint i [[thread_position_in_grid]]) {
-        if (i >= *nPtr) return; ulong b = a[i]; ulong k = (b & 0x8000000000000000ul) ? ~b : (b | 0x8000000000000000ul); out[i] = inv ? ~k : k;
+        if (i >= *nPtr) return; ulong b = a[i]; if ((b & 0x7FFFFFFFFFFFFFFFul) == 0ul) b = 0ul; ulong k = (b & 0x8000000000000000ul) ? ~b : (b | 0x8000000000000000ul); out[i] = inv ? ~k : k;
     }
     kernel void iota_u32(device uint* out [[buffer(0)]], device const uint* nPtr [[buffer(1)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) out[i] = i; }
     """ }

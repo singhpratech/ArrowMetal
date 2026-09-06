@@ -24,13 +24,14 @@ extension MetalArray {
         let ctx = context
         let words = BitmapOps.words(bits: n)
         let out = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: n), zeroed: false, context: ctx)
-        let isDouble = T.self == Double.self
-        let src = isDouble ? KernelSource.compareDouble : KernelSource.compare(T: T.mslType)
-        let pso = try Dispatch.pipeline(ctx, family: "cmp", source: src, function: "cmp_scalar_\(op.rawValue)", type: isDouble ? "double" : T.mslType)
+        let isDouble = T.self == Double.self, isFloat = T.self == Float.self
+        let src = isDouble ? KernelSource.compareDouble : (isFloat ? KernelSource.compareFloat32 : KernelSource.compare(T: T.mslType))
+        let pso = try Dispatch.pipeline(ctx, family: "cmp", source: src, function: "cmp_scalar_\(op.rawValue)", type: isDouble ? "double" : (isFloat ? "float32key" : T.mslType))
         try ctx.run { enc in
             enc.setComputePipelineState(pso)
             enc.setBuffer(values.mtl, offset: values.offset, index: 0)
             if isDouble { Dispatch.setScalar(enc, Int64(bitPattern: (scalar as! Double).bitPattern), index: 1) }
+            else if isFloat { Dispatch.setScalar(enc, (scalar as! Float).bitPattern, index: 1) }
             else { Dispatch.setScalar(enc, scalar, index: 1) }
             Dispatch.setLength(enc, n, lengthBuffer, index: 2)
             enc.setBuffer(out.mtl, offset: out.offset, index: 3)
@@ -47,9 +48,9 @@ extension MetalArray {
         let ctx = context
         let words = BitmapOps.words(bits: n)
         let out = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: n), zeroed: false, context: ctx)
-        let isDouble = T.self == Double.self
-        let src = isDouble ? KernelSource.compareDouble : KernelSource.compare(T: T.mslType)
-        let pso = try Dispatch.pipeline(ctx, family: "cmp", source: src, function: "cmp_array_\(op.rawValue)", type: isDouble ? "double" : T.mslType)
+        let isDouble = T.self == Double.self, isFloat = T.self == Float.self
+        let src = isDouble ? KernelSource.compareDouble : (isFloat ? KernelSource.compareFloat32 : KernelSource.compare(T: T.mslType))
+        let pso = try Dispatch.pipeline(ctx, family: "cmp", source: src, function: "cmp_array_\(op.rawValue)", type: isDouble ? "double" : (isFloat ? "float32key" : T.mslType))
         try ctx.run { enc in
             enc.setComputePipelineState(pso)
             enc.setBuffer(values.mtl, offset: values.offset, index: 0)

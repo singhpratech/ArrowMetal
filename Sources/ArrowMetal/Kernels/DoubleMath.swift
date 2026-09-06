@@ -64,6 +64,19 @@ enum DoubleMath {
         if (m == 0ul) return 0ul;
         return d_finish(sa, ea, m);
     }
+    // Exact widening of a float bit pattern to a double bit pattern (subnormals preserved: no float arithmetic).
+    inline ulong d_from_float(float f) {
+        uint b = as_type<uint>(f);
+        ulong s = (ulong)(b >> 31); ulong e = (b >> 23) & 0xFFu; ulong m = b & 0x7FFFFFu;
+        if (e == 0xFFu) return (s << 63) | 0x7FF0000000000000ul | (m ? ((1ul << 51) | (m << 29)) : 0ul);
+        if (e == 0u) {
+            if (m == 0u) return s << 63;
+            long ee = 1; while ((m >> 23) == 0ul) { m <<= 1; ee--; }
+            m &= 0x7FFFFFu;
+            return (s << 63) | ((ulong)(ee - 127 + 1023) << 52) | (m << 29);
+        }
+        return (s << 63) | ((e - 127 + 1023) << 52) | (m << 29);
+    }
     inline ulong d_sub(ulong a, ulong b) { return d_add(a, b ^ 0x8000000000000000ul); }
 
     inline ulong d_mul(ulong a, ulong b) {

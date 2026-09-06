@@ -319,7 +319,7 @@ public func am_group_by(_ keys: OpaquePointer?, _ keyCount: Int64, _ agg: Int32,
             case (0, .int32(let x)): return .int64(try gb.sum(x))
             case (0, .uint32(let x)): return .int64(try gb.sum(x))
             case (0, .int64(let x)): return .int64(try gb.sum(x))
-            case (0, .uint64(let x)): return .int64(try gb.sum(x))
+            case (0, .uint64(let x)): return .uint64(try gb.sumUnsigned(x))
             case (2, _): return try withPrimitive(v) { p in try minMaxErased(gb, p.erased(), isMin: true) }
             case (3, _): return try withPrimitive(v) { p in try minMaxErased(gb, p.erased(), isMin: false) }
             case (4, .int8(let x)): return .float64(try gb.mean(x))

@@ -92,7 +92,11 @@ extension MetalArray {
         let src2 = valsA.typed(Int32.self), dst = out.mutableTyped(Int32.self)
         var k = 0
         for i in 0..<n { let j = src2[i]; if Bitmap.isSet(bm, Int(j)) { dst[k] = j; k += 1 } }
-        for i in 0..<n { let j = src2[i]; if !Bitmap.isSet(bm, Int(j)) { dst[k] = j; k += 1 } }
+        // Null rows: Arrow's stable order is their original order, not the order of the bytes under the bitmap.
+        var nulls: [Int32] = []
+        for i in 0..<n { let j = src2[i]; if !Bitmap.isSet(bm, Int(j)) { nulls.append(j) } }
+        nulls.sort()
+        for j in nulls { dst[k] = j; k += 1 }
         return MetalArray<Int32>(length: n, nullCount: 0, validity: nil, values: out, context: ctx)
     }
 

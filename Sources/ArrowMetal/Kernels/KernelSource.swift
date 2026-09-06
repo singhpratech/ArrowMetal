@@ -160,6 +160,41 @@ enum KernelSource {
         return s
     }()
 
+    /// Comparison kernels for Float32 through order-preserving integer keys: exact on subnormals, which Apple
+    /// GPUs flush to zero in float arithmetic. IEEE semantics for NaN and signed zero.
+    static let compareFloat32: String = {
+        let ops: [(String, String)] = [("eq", "=="), ("ne", "!="), ("lt", "<"), ("le", "<="), ("gt", ">"), ("ge", ">=")]
+        var s = prelude + """
+        inline bool f_isnan32(uint b) { return (b & 0x7FFFFFFFu) > 0x7F800000u; }
+        inline int f_key32(uint b) { if ((b & 0x7FFFFFFFu) == 0u) return 0; int k = (int)b; return k ^ (int)(((uint)(k >> 31)) >> 1); }
+
+        """
+        for (name, op) in ops {
+            let nanResult = name == "ne" ? "true" : "false"
+            s += """
+            inline bool fcmp_\(name)(uint a, uint b) { if (f_isnan32(a) || f_isnan32(b)) return \(nanResult); return f_key32(a) \(op) f_key32(b); }
+            kernel void cmp_scalar_\(name)(device const uint* a [[buffer(0)]], constant uint& scalar [[buffer(1)]],
+                                          device const uint* nPtr [[buffer(2)]], device uint* out [[buffer(3)]], uint w [[thread_position_in_grid]]) {
+                uint n = *nPtr; uint base = w * 32u;
+                if (base >= n) return;
+                uint limit = min(32u, n - base); uint bits = 0;
+                for (uint j = 0; j < limit; j++) { if (fcmp_\(name)(a[base + j], scalar)) bits |= (1u << j); }
+                out[w] = bits;
+            }
+            kernel void cmp_array_\(name)(device const uint* a [[buffer(0)]], device const uint* b [[buffer(1)]],
+                                         device const uint* nPtr [[buffer(2)]], device uint* out [[buffer(3)]], uint w [[thread_position_in_grid]]) {
+                uint n = *nPtr; uint base = w * 32u;
+                if (base >= n) return;
+                uint limit = min(32u, n - base); uint bits = 0;
+                for (uint j = 0; j < limit; j++) { if (fcmp_\(name)(a[base + j], b[base + j])) bits |= (1u << j); }
+                out[w] = bits;
+            }
+
+            """
+        }
+        return s
+    }()
+
     /// Gather (`take`). One thread per output element. Out-of-range indices set the error flag.
     /// flags: bit0 = source has validity, bit1 = indices have validity.
     static func take(T: String, I: String) -> String { prelude + """
