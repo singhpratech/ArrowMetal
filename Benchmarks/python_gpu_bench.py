@@ -155,6 +155,61 @@ bench(sec, "ArrowMetal (GPU group-by on cached codes)", DB, lambda: _gb.sum(g_am
 bench(sec, "polars group_by(str) sum", DB, lambda: df_str.group_by("s").agg(pl.col("x").sum()))
 bench(sec, "pyarrow group_by(str) sum", DB, lambda: tbl_str.group_by("s").aggregate([("x", "sum")]))
 
+# ---- group-by over arbitrary keys: utf8 keys and two int32 key columns, at 1K / 100K / 10M distinct.
+# ArrowMetal maps the keys to dense group ids on the GPU, so unlike the dense group-by above there is
+# no dictionary_encode step for the caller to do first; polars and pyarrow are given the same columns.
+for gb_distinct in (1_000, 100_000, 10_000_000):
+    if gb_distinct > rows:
+        continue
+    codes = rng.integers(0, gb_distinct, size=rows, dtype=np.int32)
+    # Fixed-width 12-byte keys, built once as a pyarrow utf8 array without a Python list round trip.
+    width = 12
+    body = np.char.mod("%011x", codes).astype("S12")
+    offsets = np.arange(rows + 1, dtype=np.int32) * width
+    data = np.frombuffer(body.tobytes(), dtype=np.uint8)
+    key_arr = pa.Array.from_buffers(pa.utf8(), rows, [None, pa.py_buffer(offsets), pa.py_buffer(data)])
+    g_keys = am.array(key_arr)
+    p_keys = pl.Series("k", key_arr)
+    KB = rows * width + (rows + 1) * 4 + rows * 8
+
+    sec = f"group-by sum(Int64) over utf8 keys ({gb_distinct} distinct)"
+    print("\n" + sec)
+    df_k = pl.DataFrame({"k": p_keys, "x": pls})
+    tbl_k = pa.table({"k": key_arr, "x": arr})
+
+    def _am_str_group(_g=g_keys):
+        return am.group_by([_g]).sum(gpu)
+
+    bench(sec, "ArrowMetal (GPU, key mapping included)", KB, _am_str_group)
+    _cached = am.group_by([g_keys])
+    bench(sec, "ArrowMetal (GPU, cached key mapping)", KB, lambda _c=_cached: _c.sum(gpu))
+    bench(sec, "polars group_by(utf8)", KB, lambda _d=df_k: _d.group_by("k").agg(pl.col("x").sum()))
+    bench(sec, "pyarrow group_by(utf8)", KB, lambda _t=tbl_k: _t.group_by("k").aggregate([("x", "sum")]))
+    print(f"    groups: ArrowMetal {_cached.group_count}, pyarrow {tbl_k.group_by('k').aggregate([]).num_rows}")
+
+    side = max(2, int(np.ceil(np.sqrt(gb_distinct))))
+    ka = rng.integers(0, side, size=rows, dtype=np.int32)
+    kb = rng.integers(0, side, size=rows, dtype=np.int32)
+    g_a, g_b = am.array(pa.array(ka)), am.array(pa.array(kb))
+    TB2 = rows * 16
+    sec = f"group-by sum(Int64) over two int32 columns (~{side * side} distinct)"
+    print("\n" + sec)
+    df_2 = pl.DataFrame({"a": ka, "b": kb, "x": pls})
+    tbl_2 = pa.table({"a": pa.array(ka), "b": pa.array(kb), "x": arr})
+
+    def _am_two_group(_a=g_a, _b=g_b):
+        return am.group_by([_a, _b]).sum(gpu)
+
+    bench(sec, "ArrowMetal (GPU, key mapping included)", TB2, _am_two_group)
+    _cached2 = am.group_by([g_a, g_b])
+    bench(sec, "ArrowMetal (GPU, cached key mapping)", TB2, lambda _c=_cached2: _c.sum(gpu))
+    bench(sec, "polars group_by(a, b)", TB2, lambda _d=df_2: _d.group_by(["a", "b"]).agg(pl.col("x").sum()))
+    bench(sec, "pyarrow group_by(a, b)", TB2,
+          lambda _t=tbl_2: _t.group_by(["a", "b"]).aggregate([("x", "sum")]))
+    print(f"    groups: ArrowMetal {_cached2.group_count}, "
+          f"pyarrow {tbl_2.group_by(['a', 'b']).aggregate([]).num_rows}")
+
+
 print("\n\n| Operation | Implementation | Time (ms) | Throughput (GB/s) | CPU time (ms) |\n|---|---|---:|---:|---:|")
 for s, l, ms, gb_, cpu in results:
     print(f"| {s} | {l} | {ms:.2f} | {gb_:.1f} | {cpu:.1f} |")

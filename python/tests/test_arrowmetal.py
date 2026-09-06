@@ -617,3 +617,123 @@ def test_run_end_encoding_round_trips_through_pyarrow():
     imported = am.array(pc.run_end_encode(pa.array([2, 2, None, 3], pa.int64())))
     assert imported.format == "+r"
     assert pylist(imported.run_end_decode()) == [2, 2, None, 3]
+
+
+# ---- group-by over arbitrary key columns, the rest of the grouped aggregates, and the scalar
+# skew / kurtosis / tdigest. Every assertion goes through pyarrow's own group_by as the oracle.
+
+
+def _by_key(gb, result, n_keys=1):
+    """{(key tuple): value} from an ArrowMetal grouped result, so group order never enters a test."""
+    key_cols = [c.to_pylist() for c in gb.keys()]
+    values = result.to_arrow().to_pylist()
+    return {tuple(key_cols[j][g] for j in range(n_keys)): values[g] for g in range(len(values))}
+
+
+def _pyarrow_by_key(table, cols, agg, col="v", ordered=False):
+    grouped = table.group_by(list(cols), use_threads=not ordered)
+    out = grouped.aggregate([(col, agg)])
+    return {tuple(row[c] for c in cols): row[f"{col}_{agg}"] for row in out.to_pylist()}
+
+
+def _group_fixture():
+    keys = ["a", "b", None, "a", "c", "b", "a", None, "c", "b"]
+    years = [2000, 2001, 2000, 2001, None, 2001, 2000, 2000, 2001, 2001]
+    vals = [1.0, 2.0, None, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+    table = pa.table({"k": pa.array(keys, pa.utf8()), "y": pa.array(years, pa.int32()),
+                      "v": pa.array(vals, pa.float64())})
+    return table, am.array(table["k"].combine_chunks()), am.array(table["y"].combine_chunks()), \
+        am.array(table["v"].combine_chunks())
+
+
+def test_group_by_arbitrary_keys_matches_pyarrow():
+    table, g_keys, g_years, g_vals = _group_fixture()
+    gb = am.group_by([g_keys])
+    assert gb.group_count == table.group_by(["k"]).aggregate([]).num_rows
+    assert len(gb.keys()) == 1
+    for agg in ("sum", "mean", "min", "max", "count"):
+        assert _by_key(gb, getattr(gb, agg)(g_vals)) == _pyarrow_by_key(table, ("k",), agg)
+    all_rows = table.group_by(["k"], use_threads=False).aggregate([("v", "count", pc.CountOptions(mode="all"))])
+    assert _by_key(gb, gb.count_all()) == {(r["k"],): r["v_count"] for r in all_rows.to_pylist()}
+    # A single array (not a list) is accepted too.
+    assert am.group_by(g_keys).group_count == gb.group_count
+
+
+def test_group_by_two_key_columns_matches_pyarrow():
+    table, g_keys, g_years, g_vals = _group_fixture()
+    gb = am.group_by([g_keys, g_years])
+    assert gb.group_count == table.group_by(["k", "y"]).aggregate([]).num_rows
+    assert _by_key(gb, gb.sum(g_vals), 2) == _pyarrow_by_key(table, ("k", "y"), "sum")
+    assert _by_key(gb, gb.max(g_vals), 2) == _pyarrow_by_key(table, ("k", "y"), "max")
+
+
+def test_group_by_null_keys_form_their_own_group():
+    table, g_keys, _, g_vals = _group_fixture()
+    gb = am.group_by([g_keys])
+    sums = _by_key(gb, gb.sum(g_vals))
+    assert (None,) in sums
+    assert sums[(None,)] == 8.0
+
+
+def test_grouped_extra_aggregates():
+    table, g_keys, _, g_vals = _group_fixture()
+    gb = am.group_by([g_keys])
+    # min_max and first_last come back as structs.
+    mm = gb.min_max(g_vals).to_arrow()
+    assert mm.type.num_fields == 2 and [f.name for f in mm.type] == ["min", "max"]
+    fl = gb.first_last(g_vals).to_arrow()
+    assert [f.name for f in fl.type] == ["first", "last"]
+    assert _by_key(gb, gb.first(g_vals)) == _pyarrow_by_key(table, ("k",), "first", ordered=True)
+    assert _by_key(gb, gb.last(g_vals)) == _pyarrow_by_key(table, ("k",), "last", ordered=True)
+    assert _by_key(gb, gb.one(g_vals)) == _pyarrow_by_key(table, ("k",), "one", ordered=True)
+    assert _by_key(gb, gb.list(g_vals)) == _pyarrow_by_key(table, ("k",), "list", ordered=True)
+    assert _by_key(gb, gb.count_distinct(g_vals)) == _pyarrow_by_key(table, ("k",), "count_distinct")
+    ours = _by_key(gb, gb.distinct(g_vals))
+    theirs = _pyarrow_by_key(table, ("k",), "distinct", ordered=True)
+    assert {k: sorted(x for x in v if x is not None) for k, v in ours.items()} == \
+           {k: sorted(x for x in v if x is not None) for k, v in theirs.items()}
+    # product runs on the GPU now; ArrowMetal returns float64 for a float column.
+    assert _by_key(gb, gb.product(g_vals)) == _pyarrow_by_key(table, ("k",), "product")
+    # The median is exact here, not a sketch.
+    assert _by_key(gb, gb.approximate_median(g_vals))[("a",)] == 4.0
+    assert _by_key(gb, gb.quantile(g_vals, 0.0))[("a",)] == 1.0
+    assert _by_key(gb, gb.quantile(g_vals, 1.0))[("a",)] == 7.0
+    for name in ("variance", "stddev", "skew", "kurtosis"):
+        assert len(getattr(gb, name)(g_vals)) == gb.group_count
+    assert len(gb.tdigest(g_vals, 0.5)) == gb.group_count
+
+
+def test_grouped_pivot_wider():
+    keys = am.array(pa.array(["g1", "g1", "g2", "g2"], pa.utf8()))
+    pivot = pa.array(["a", "b", "a", "b"], pa.utf8())
+    values = am.array(pa.array([1, 2, 3, 4], pa.int64()))
+    gb = am.group_by([keys])
+    out = gb.pivot_wider(pivot, values, ["a", "b"]).to_arrow()
+    assert [f.name for f in out.type] == ["a", "b"]
+    labels = gb.keys()[0].to_pylist()
+    rows = {labels[i]: out[i].as_py() for i in range(len(out))}
+    assert rows == {"g1": {"a": 1, "b": 2}, "g2": {"a": 3, "b": 4}}
+
+
+def test_group_by_ids_and_dense_fast_path_agree():
+    keys = am.array(pa.array([10, 20, 10, 30, 20], pa.int32()))
+    values = am.array(pa.array([1, 2, 3, 4, 5], pa.int64()))
+    gb = am.group_by([keys])
+    ids = gb.ids().to_arrow().to_pylist()
+    assert len(ids) == 5 and max(ids) == gb.group_count - 1
+    dense = am.array(pa.array(ids, pa.int32())).group_by(gb.group_count)
+    assert dense.sum(values).to_arrow().to_pylist() == gb.sum(values).to_arrow().to_pylist()
+
+
+def test_scalar_skew_kurtosis_and_tdigest():
+    values = pa.array([float(i % 17) + 0.5 * (i % 3) for i in range(5000)], pa.float64())
+    a = am.array(values)
+    assert a.skew() == pytest.approx(pc.skew(values).as_py(), rel=1e-5)
+    assert a.kurtosis() == pytest.approx(pc.kurtosis(values).as_py(), rel=1e-5)
+    assert a.skew(biased=False) == pytest.approx(pc.skew(values, biased=False).as_py(), rel=1e-5)
+    assert a.kurtosis(biased=False) == pytest.approx(pc.kurtosis(values, biased=False).as_py(), rel=1e-5)
+    # tdigest is a sketch; the extremes are exact and the middle is close to the exact quantile.
+    assert a.tdigest(0.0) == pytest.approx(pc.min(values).as_py())
+    assert a.tdigest(1.0) == pytest.approx(pc.max(values).as_py())
+    assert a.tdigest(0.5) == pytest.approx(pc.quantile(values, q=0.5).to_pylist()[0], abs=0.5)
+    assert am.array(pa.array([], pa.float64())).skew() is None
