@@ -1,15 +1,19 @@
 """The Arrow function-name registry, checked against pyarrow.compute name by name.
 
-Three things are asserted here, and the third one is the point of the file:
+Four things are asserted here, and the third one is the point of the file:
 
 1. Every Arrow compute function name exists in the registry — measured against
    ``pyarrow.compute.list_functions()`` itself, so the list cannot drift as Arrow grows.
 2. Every row that claims to work (``gpu`` / ``cpu`` / ``partial``) actually runs through
    :func:`arrowmetal.functions.call_function` on a small array, and its answer matches
-   ``pyarrow.compute`` for at least one input type. A row marked ``pending`` is skipped with its
-   owning feature named — those flip to a real status when that branch merges — and ``missing``
-   rows are asserted *not* to run.
-3. The whole table prints as Markdown, so the maintainer can paste it into ``docs/COVERAGE.md``
+   ``pyarrow.compute`` for at least one input type. A row marked ``pending`` would be skipped with
+   its owning feature named — no row carries that status today — and ``missing`` rows are asserted
+   *not* to run.
+3. A second input is fed to the rows whose claim spans several Arrow **type families**, so
+   "runs on numeric columns" is not asserted from one int64 array: unsigned and float32 numerics,
+   booleans, binary, temporal, dictionary and list inputs each get a pass through the same
+   :func:`call_function` entry point.
+4. The whole table prints as Markdown, so the maintainer can paste it into ``docs/ARROW_FUNCTIONS.md``
    (``python/tests/function_table_report.py`` writes the same thing to stdout).
 
     PYTHONPATH=python python -m pytest python/tests/test_functions.py -q -s
@@ -152,6 +156,73 @@ def test_runnable_row_matches_pyarrow(name):
 
     tol = F.TOLERANCE.get(name, 1e-9)
     assert _close(_py(got), _py(want), tol), f"{name}: ArrowMetal {_py(got)!r} != pyarrow {_py(want)!r}"
+
+
+# ------------------------------------------- (c) a second type family for the rows that claim one
+
+_UINT = pa.array([3, 1, 4, 1, 5, None], type=pa.uint32())
+_UINT2 = pa.array([2, 7, 2, 3, 1, None], type=pa.uint32())
+_F32 = pa.array([3.5, -1.25, 4.0, 0.5, 2.75, None], type=pa.float32())
+_F32B = pa.array([2.0, 3.0, 0.5, 1.5, 2.5, None], type=pa.float32())
+_BOOLC = pa.array([True, False, True, None, False, True])
+_BIN = pa.array([b"abc", b"z", None, b"", b"xy", b"qrst"], type=pa.binary())
+_DATE = pa.array([18000, 19000, None, 0], type=pa.date32())
+_DATE2 = pa.array([18100, 19000, None, 366], type=pa.date32())
+_DICT = pa.array(["a", "b", "a", None, "c", "b"]).dictionary_encode()
+_LIST = pa.array([[1, 2, 3], [4], None, []], type=pa.list_(pa.int64()))
+_MASK = pa.array([True, False, True, None, True, False])
+_IDX32 = pa.array([2, 0, 1, 5, 4, 3], type=pa.int32())
+
+# (Arrow name, args, options, tolerance) — one extra representative input per row, in a type family
+# the row's note claims but the row's own example does not exercise. `tolerance` is None to use the
+# registry's own; a float32 column needs its own number, because a kernel that accumulates or
+# evaluates in `float` is accurate to float32 rather than to the float64 the row's example measures.
+# Everything here goes through the same `call_function` the parametrised test above uses, and is
+# compared against pyarrow the same way.
+_F32_ACCUM = 1e-7        # float32 accumulation (variance, mean) and the float32 transcendentals
+_SECOND_FAMILY = [
+    # unsigned integers
+    ("add", (_UINT, _UINT2), {}, None), ("subtract", (_UINT2, _UINT), {}, None),
+    ("multiply", (_UINT, _UINT2), {}, None), ("sum", (_UINT,), {}, None), ("min", (_UINT,), {}, None),
+    ("max", (_UINT,), {}, None), ("less", (_UINT, _UINT2), {}, None),
+    ("bit_wise_and", (_UINT, _UINT2), {}, None), ("cumulative_sum", (_UINT,), {}, None),
+    ("unique", (_UINT,), {}, None), ("is_finite", (_UINT,), {}, None),
+    ("hash_sum", (_DICT, _UINT), {}, None),
+    # float32
+    ("add", (_F32, _F32B), {}, None), ("abs", (_F32,), {}, None), ("mean", (_F32,), {}, _F32_ACCUM),
+    ("variance", (_F32,), {}, _F32_ACCUM), ("min_max", (_F32,), {}, None),
+    ("sin", (_F32,), {}, _F32_ACCUM), ("is_nan", (_F32,), {}, None), ("round", (_F32,), {}, None),
+    ("array_sort_indices", (_F32,), {}, None), ("cumulative_max", (_F32,), {}, None),
+    # boolean
+    ("count", (_BOOLC,), {}, None), ("filter", (_UINT, _MASK), {}, None),
+    ("fill_null", (_BOOLC,), {"fill_value": False}, None), ("is_null", (_BOOLC,), {}, None),
+    ("indices_nonzero", (_BOOLC,), {}, None),
+    # binary (the two string rows that do take a binary column; see `binary_length`'s note for the
+    # ones that do not)
+    ("is_in", (_BIN,), {"value_set": pa.array([b"z", b"xy"])}, None),
+    ("index_in", (_BIN,), {"value_set": pa.array([b"z", b"xy"])}, None),
+    ("take", (_BIN, _IDX32), {}, None),
+    # temporal (date32 rather than timestamp[us])
+    ("year", (_DATE,), {}, None), ("day_of_year", (_DATE,), {}, None), ("is_leap_year", (_DATE,), {}, None),
+    ("days_between", (_DATE, _DATE2), {}, None), ("years_between", (_DATE, _DATE2), {}, None),
+    ("week", (_DATE,), {}, None), ("iso_calendar", (_DATE,), {}, None),
+    # dictionary and list
+    ("dictionary_decode", (_DICT,), {}, None), ("take", (_DICT, _IDX32), {}, None),
+    ("list_value_length", (_LIST,), {}, None), ("list_flatten", (_LIST,), {}, None),
+    ("list_parent_indices", (_LIST,), {}, None), ("list_slice", (_LIST,), {"start": 0, "stop": 2}, None),
+]
+
+
+@pytest.mark.parametrize("name,args,options,tolerance", _SECOND_FAMILY,
+                         ids=[f"{n}-{a[0].type}" for n, a, _, _ in _SECOND_FAMILY])
+def test_second_type_family_matches_pyarrow(name, args, options, tolerance):
+    rec = F.get_function(name)
+    assert rec.runnable, f"{name} is {rec.status}; it has no second family to check"
+    got = F.call_function(name, args, options)
+    want = rec.oracle(list(args), dict(options)) if rec.oracle is not None else getattr(pc, name)(*args, **options)
+    tol = tolerance if tolerance is not None else F.TOLERANCE.get(name, 1e-9)
+    assert _close(_py(got), _py(want), tol), \
+        f"{name} on {args[0].type}: ArrowMetal {_py(got)!r} != pyarrow {_py(want)!r}"
 
 
 @pytest.mark.parametrize("name", NOT_RUNNABLE)
