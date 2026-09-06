@@ -19,9 +19,9 @@ them so a claim can be checked in one jump.
 | Bit-wise and shifts | 0 | 0 | 0 | 0 | 0 | 6 | 6 |
 | Comparisons | 6 | 0 | 0 | 0 | 0 | 2 | 8 |
 | Logical | 3 | 0 | 0 | 0 | 0 | 3 | 6 |
-| String predicates | 0 | 0 | 0 | 0 | 0 | 3 | 3 |
-| String transforms | 2 | 0 | 0 | 2 | 0 | 10 | 14 |
-| String containment and matching | 5 | 0 | 0 | 2 | 0 | 3 | 10 |
+| String predicates | 1 | 0 | 0 | 0 | 0 | 3 | 4 |
+| String transforms | 9 | 0 | 2 | 1 | 0 | 7 | 19 |
+| String containment and matching | 7 | 0 | 0 | 2 | 0 | 1 | 10 |
 | Temporal | 0 | 0 | 0 | 0 | 1 | 5 | 6 |
 | Conversions and casts | 0 | 1 | 2 | 0 | 1 | 2 | 6 |
 | Selections | 3 | 0 | 1 | 0 | 0 | 1 | 5 |
@@ -31,7 +31,7 @@ them so a claim can be checked in one jump.
 | Associative transforms | 0 | 1 | 0 | 1 | 3 | 0 | 5 |
 | Pairwise and cumulative | 0 | 0 | 0 | 0 | 0 | 5 | 5 |
 | Hashing | 1 | 0 | 0 | 0 | 0 | 1 | 2 |
-| **Total (compute functions)** | **29** | **7** | **15** | **7** | **6** | **87** | **151** |
+| **Total (compute functions)** | **39** | **7** | **17** | **6** | **6** | **82** | **157** |
 | Arrow types (matrix below) | 5 | 0 | 3 | 1 | 6 | 11 | 26 |
 
 Interop uses a separate vocabulary and is counted apart: 6 shipped, 1 partial, 3 planned, 1 in progress
@@ -41,12 +41,14 @@ Interop uses a separate vocabulary and is counted apart: 6 shipped, 1 partial, 3
 `sum`/`min`/`max`/`mean`, the six comparisons, wrapping `add`/`subtract`/`multiply`/`divide`, boolean
 `and`/`or`/`not`, `filter`/`take`/`slice`, numeric `cast`, single-key `sort`/`argsort`/top-k, group-by
 `count`/`sum`/`mean`/`min`/`max` over dense integer keys, `utf8` length/`equals`/`starts_with`/`ends_with`/
-`contains`/murmur3 hash, and Arrow C Data, C Device and C Stream interop for all of them — over `int8/16/32/64`,
-`uint8/16/32/64`, `float32`, `float64`, `bool` and `utf8`, null-aware with Arrow semantics and checked
-against a CPU oracle in the test suite.
+`contains`/`count_substring`/`find_substring`/murmur3 hash, the ASCII case, trim, pad, slice, repeat,
+replace, reverse, join and `ascii_is_*` transforms, and Arrow C Data, C Device and C Stream interop for all
+of them — over `int8/16/32/64`, `uint8/16/32/64`, `float32`, `float64`, `bool` and `utf8`, null-aware with
+Arrow semantics and checked against a CPU oracle in the test suite.
 
 **The scope it does not claim:** decimals; compute over nested types (lists, structs, maps, unions); regex
-and Unicode-table string work (case folding, normalisation, trimming, padding, splitting); window,
+and Unicode-table string work (full case folding beyond Latin-1 Supplement and Latin Extended-A,
+normalisation, Unicode-whitespace trimming, splitting); window,
 cumulative and pairwise functions; temporal component extraction, temporal arithmetic, timezones and
 `strftime`/`strptime`; statistical aggregates (`stddev`, `variance`, `quantile`, `mode`, `tdigest`);
 set lookup (`is_in`, `index_in`); conditional and null-filling structural functions (`if_else`, `case_when`,
@@ -178,29 +180,44 @@ atomics with carry because MSL has no 64-bit atomics.
 
 | Arrow function | Status | Notes |
 |---|---|---|
-| `ascii_is_alnum` / `_alpha` / `_decimal` / `_lower` / `_printable` / `_space` / `_title` / `_upper` | **Not planned** | No roadmap item. |
-| `utf8_is_alnum` / `_alpha` / `_decimal` / `_digit` / `_lower` / `_numeric` / `_printable` / `_space` / `_title` / `_upper` | **Not planned** | No roadmap item; needs Unicode tables in the kernel. |
+| `ascii_is_alnum` / `_alpha` / `_decimal` / `_space` / `_lower` / `_upper` | **GPU** | `Kernels/StringTransforms.swift`: `asciiIsAlnum()`, `asciiIsAlpha()`, `asciiIsDigit()` (Arrow's `_decimal`), `asciiIsSpace()`, `asciiIsLower()`, `asciiIsUpper()` → packed boolean bitmap, one 32-bit word per thread. Python/Arrow semantics: the empty string is false everywhere, and `_lower`/`_upper` need at least one cased ASCII character and none of the opposite case, treating bytes ≥ 0x80 as uncased. Nulls propagate. |
+| `ascii_is_printable` / `ascii_is_title` | **Not planned** | No roadmap item. The six predicates above share one kernel and a seventh case is a two-line addition. |
+| `utf8_is_alnum` / `_alpha` / `_decimal` / `_digit` / `_lower` / `_numeric` / `_printable` / `_space` / `_title` / `_upper` | **Not planned** | No roadmap item; needs Unicode tables in the kernel. The `ascii_*` predicates above are byte-wise and return false for any non-ASCII byte, which is not the same function. |
 | `string_is_ascii` | **Not planned** | No roadmap item. |
 
 ## String transforms
 
 `MetalStringArray` (`Sources/ArrowMetal/MetalStringArray.swift`) is Arrow `utf8`: validity bitmap, int32
-offsets, data bytes. Everything below is byte-wise and case-sensitive.
+offsets, data bytes. Everything below is byte-wise and case-sensitive except where a row says otherwise:
+the `utf8_*` case, slice, pad and reverse rows work in UTF-8 code points.
+
+The transforms in `Kernels/StringTransforms.swift` produce new string arrays whose bytes are
+data-dependent, so each runs the same two-pass shape: one kernel writes the output byte length of every
+row, `exclusiveScanToOffsets` scans those into the Arrow offsets buffer on the GPU, and a second kernel
+writes the bytes. Both passes call one MSL routine (`tf_apply` in `Kernels/StringTransformSource.swift`),
+so a length and the bytes that fill it cannot disagree. The validity bitmap is shared with the input
+zero-copy and a null row emits no bytes. All of them are reachable from Swift, from the C ABI
+(`am_str_transform`, op table in `include/arrowmetal.h`) and from Python.
 
 | Arrow function | Status | Notes |
 |---|---|---|
 | `binary_length` | **GPU** | `byteLength()` → Int32, one thread per string, null in / null out. |
 | `utf8_length` | **GPU** | `charLength()` counts UTF-8 code points. |
-| `ascii_lower` / `ascii_upper` / `utf8_lower` / `utf8_upper` / `*_capitalize` / `*_title` / `*_swapcase` | **Planned** | [ROADMAP → Medium term → Strings](../ROADMAP.md#medium-term) lists "case folding" as open. |
-| `replace_substring_regex` / `extract_regex` / `extract_regex_span` | **Planned** | The same roadmap item lists "regex" as open. Nothing regex-shaped exists today, and a backtracking engine is a poor fit for SIMT — treat this as unclaimed until a design lands. |
-| `ascii_reverse` / `binary_reverse` / `utf8_reverse` | **Not planned** | No roadmap item. |
-| `replace_substring` | **Not planned** | No roadmap item. |
-| `binary_replace_slice` / `utf8_replace_slice` | **Not planned** | No roadmap item. |
-| `binary_slice` / `utf8_slice_codeunits` | **Not planned** | No roadmap item. |
-| `ascii_trim*` / `utf8_trim*` (trim, ltrim, rtrim, `*_whitespace`) | **Not planned** | No roadmap item. |
-| `ascii_center` / `_lpad` / `_rpad`, `utf8_center` / `_lpad` / `_rpad` | **Not planned** | No roadmap item. |
-| `binary_repeat` | **Not planned** | No roadmap item. |
-| `binary_join` / `binary_join_element_wise` | **Not planned** | No roadmap item. |
+| `ascii_lower` / `ascii_upper` / `ascii_swapcase` / `ascii_capitalize` | **GPU** | `asciiLower()`, `asciiUpper()`, `asciiSwapcase()`, `asciiCapitalize()`. Byte-wise over `a`–`z` / `A`–`Z`; every other byte, UTF-8 continuation bytes included, is copied through, so the output is always valid UTF-8 and the same length as the input. |
+| `utf8_lower` / `utf8_upper` | **Partial** | `utf8Lower()` / `utf8Upper()`, GPU, **simple (1:1 code point) case mapping over three blocks only**: Basic Latin; Latin-1 Supplement U+00C0–U+00DE and U+00E0–U+00FE minus U+00D7 (×) and U+00F7 (÷), plus U+00FF ↔ U+0178; and Latin Extended-A U+0100–U+017F in its alternating pairs, with U+0130 (İ) → `i`, U+0131 (ı) → `I` and U+017F (ſ) → `S` — three mappings that shrink a string from two bytes to one, which is why the two-pass shape is not optional. Everything above U+017F is copied through byte-for-byte (Greek, Cyrillic, CJK, emoji). The multi-character expansions Arrow's utf8proc applies are **not** implemented: U+00DF (ß → `SS`), U+0149 (ŉ → `ʼN`) and U+00B5 (µ → U+039C) pass through unchanged. Full Unicode case folding stays on the [ROADMAP](../ROADMAP.md#medium-term). |
+| `utf8_capitalize` / `ascii_title` / `utf8_title` | **Not planned** | No roadmap item. `ascii_capitalize` is covered by the row above; the Unicode form needs the same tables `utf8_upper` stops short of, and the title-case functions need word segmentation on top of that. |
+| `replace_substring_regex` / `extract_regex` / `extract_regex_span` | **Planned** | [ROADMAP → Medium term → Strings](../ROADMAP.md#medium-term) lists "regex" as open. Nothing regex-shaped exists today, and a backtracking engine is a poor fit for SIMT — treat this as unclaimed until a design lands. |
+| `ascii_reverse` / `binary_reverse` / `utf8_reverse` | **GPU** | `reverse()` reverses **code points**, not grapheme clusters: a combining mark or a ZWJ emoji sequence comes back in reverse code point order. That is `utf8_reverse`; `binary_reverse` (byte order) is not exposed separately. |
+| `replace_substring` | **GPU** | `replaceSubstring(_:with:maxReplacements:)`, non-overlapping and left to right, `maxReplacements` < 0 meaning all. Byte-wise, so a multi-byte pattern works. An empty pattern is the identity, matching Foundation's `replacingOccurrences(of: "", with:)` rather than Python's insert-everywhere. |
+| `binary_replace_slice` / `utf8_replace_slice` | **Not planned** | No roadmap item; expressible as `sliceCodeunits` + `concat`. |
+| `binary_slice` / `utf8_slice_codeunits` | **Partial** | `sliceCodeunits(start:stop:)`, GPU, **`step == 1` only** — Arrow's negative and non-unit steps are not implemented. Indices are code points, negative values count from the end, both ends clamp into range, and slices always land on UTF-8 boundaries. `binary_slice` (byte indices) is not exposed separately. |
+| `ascii_trim*` / `ascii_ltrim*` / `ascii_rtrim*` (whitespace and character set) | **GPU** | `trim()`/`ltrim()`/`rtrim()` strip ASCII whitespace (space, `\t`, `\n`, `\v`, `\f`, `\r`); `trim(characters:)`/`ltrim(characters:)`/`rtrim(characters:)` strip any byte in an ASCII set, and reject a non-ASCII set rather than splitting a UTF-8 sequence. Bytes ≥ 0x80 are never trimmed. |
+| `utf8_trim*` (Unicode whitespace / character set) | **Not planned** | No roadmap item: the Unicode whitespace and character classes need the tables `utf8_lower`/`utf8_upper` also stop short of. The ASCII forms above are a different function, not this one. |
+| `ascii_lpad` / `ascii_rpad`, `utf8_lpad` / `utf8_rpad` | **GPU** | `padLeft(width:pad:)` / `padRight(width:pad:)`. `width` counts **code points** (the `utf8_*` behaviour) and `pad` must be exactly one character; strings already at or over `width` are returned unchanged. |
+| `ascii_center` / `utf8_center` | **Not planned** | No roadmap item; the same kernel with the pad split across both ends. |
+| `binary_repeat` | **GPU** | `repeat(_ n:)`, `n == 0` giving empty strings and `n < 0` raising. |
+| `binary_join_element_wise` | **GPU** | `concat(_:separator:)` over two equal-length arrays, one scalar separator. Validities are ANDed on the GPU, so a null on either side gives a null output — Arrow's default `EMIT_NULL` null handling; the `REPLACE`/`SKIP` options are not implemented. |
+| `binary_join` (list of strings) | **Not planned** | Out of scope for 0.1.0: the input is a list array, which ArrowMetal has no type for. |
 | `split_pattern` / `split_pattern_regex` / `ascii_split_whitespace` / `utf8_split_whitespace` | **Not planned** | No roadmap item; the output is a list array, which ArrowMetal has no type for. |
 | `utf8_normalize` | **Not planned** | Out of scope for a GPU kernel library: full Unicode normalisation tables in MSL buy nothing over the CPU. |
 
@@ -215,8 +232,8 @@ offsets, data bytes. Everything below is byte-wise and case-sensitive.
 | `ends_with` | **GPU** | `endsWith(_:)`. |
 | `match_substring_regex` / `match_like` | **Planned** | Regex is listed as open under [ROADMAP → Medium term → Strings](../ROADMAP.md#medium-term). |
 | `count_substring_regex` / `find_substring_regex` | **Planned** | Same roadmap item. |
-| `count_substring` | **Not planned** | No roadmap item. |
-| `find_substring` | **Not planned** | No roadmap item. |
+| `count_substring` | **GPU** | `countSubstring(_:)` → Int32, non-overlapping occurrences, byte-wise and case-sensitive (no `ignore_case`). An empty pattern counts the code point boundaries, `charLength() + 1`, matching Arrow. Nulls propagate. |
+| `find_substring` | **GPU** | `findSubstring(_:)` → Int32, the **byte** offset of the first occurrence or -1 when absent; an empty pattern finds 0. Byte-wise and case-sensitive. Nulls propagate. |
 | `index_in` / `is_in` (strings) | **Not planned** | No roadmap item; see Containment below. |
 
 ## Temporal
@@ -345,7 +362,7 @@ outright.
 | `interval` (month, day_time, month_day_nano) | **Not planned** | No roadmap item. |
 | `binary` / `large_binary` | **In progress** | Concurrent branch this week. The `utf8` layout kernels apply unchanged (byte length, equality, prefix/suffix, hash, filter, take); only the importer and the char-length kernel are utf8-specific. |
 | `fixed_size_binary` | **Not planned** | No roadmap item. |
-| `utf8` | **GPU** | Byte/char length, equals/starts_with/ends_with/contains, murmur3 hash, filter, take, C Data import/export. `dictionary_encode` is CPU. |
+| `utf8` | **GPU** | Byte/char length, equals/starts_with/ends_with/contains, count_substring/find_substring, murmur3 hash, filter, take, C Data import/export, and the transforms that build new string arrays: ASCII and Latin case mapping, trim/ltrim/rtrim, pad, slice, repeat, replace, reverse, element-wise join and the `ascii_is_*` predicates. `dictionary_encode` is CPU. |
 | `large_utf8` | **Partial** | Import only, and only when the data is under 2 GB: 64-bit offsets are narrowed to int32 in one pass. Exports come back out as `utf8`. |
 | `utf8_view` / `binary_view` | **Planned** | [ROADMAP → Medium term → Strings](../ROADMAP.md#medium-term) lists `utf8_view` as open. |
 | `list` / `large_list` / `fixed_size_list` / `list_view` / `large_list_view` | **Not planned** | Out of scope for 0.1.0: ragged nested data needs a different kernel design, and the flat analytics case is not finished yet. |
@@ -380,7 +397,10 @@ outright.
 six comparisons against a scalar or another column; wrapping `add`/`subtract`/`multiply`/`divide`; boolean
 `and`/`or`/`not`; `filter` (including a fused predicate form), `take` and `slice`; numeric `cast`;
 single-key `sort`, `argsort` and top-k; group-by `count`/`sum`/`mean`/`min`/`max` over dense integer keys;
-`utf8` byte and character length, `equals`/`starts_with`/`ends_with`/`contains` and murmur3 hash; and Arrow
+`utf8` byte and character length, `equals`/`starts_with`/`ends_with`/`contains`, `count_substring`,
+`find_substring` and murmur3 hash, plus the string transforms that build new `utf8` arrays — ASCII and
+Latin case mapping, trim, pad, slice, repeat, replace, reverse, element-wise join and the `ascii_is_*`
+predicates; and Arrow
 C Data, C Device and C Stream interop for all of it — every one of them null-aware with Arrow semantics and
 checked element-for-element against a CPU oracle in the test suite. Temporal columns join that sentence when
 the in-progress temporal types land, because they are fixed-width integers underneath and the same kernels
@@ -388,8 +408,10 @@ apply unchanged; they are not part of the claim as published here.
 
 **What it does not claim.** ArrowMetal does not do decimals (`decimal32/64/128/256`); it does not do compute
 over nested types — lists, structs, maps, unions (struct appears only as the record-batch container, and
-there is no compute over struct-typed columns); it does not do regex, Unicode case folding, normalisation,
-trimming, padding, splitting or any other Unicode-table-driven string transform; it does not do window,
+there is no compute over struct-typed columns); it does not do regex, full Unicode case folding beyond the
+Latin-1 Supplement and Latin Extended-A blocks (the multi-character expansions of ß, ŉ and µ are left
+alone), normalisation, Unicode-whitespace trimming, splitting or any other Unicode-table-driven string
+transform; it does not do window,
 cumulative or pairwise functions; it does not do temporal component extraction, temporal arithmetic,
 timezones or `strftime`/`strptime`; it does not do statistical aggregates (`stddev`, `variance`, `quantile`,
 `mode`, `tdigest`, `approximate_median`); it does not do set lookup (`is_in`, `index_in`); it does not do
