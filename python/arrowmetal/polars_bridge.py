@@ -44,6 +44,8 @@ What still costs something
   an M4 Max -- page-table work, not a copy, and one order of magnitude under the ~35 ms a real
   copy of the same bytes takes. See docs/POLARS.md for the measurements.
 """
+import re
+
 import polars as pl
 import pyarrow as pa
 
@@ -58,6 +60,9 @@ from . import (
     query as _am_query,
     version,
 )
+
+# `(col "name")` in a serialised query, with the grammar's \" and \\ escapes.
+_COL_REF = re.compile(r'\(col\s+"((?:[^"\\]|\\.)*)"\s*\)')
 
 __all__ = [
     "from_polars",
@@ -462,13 +467,31 @@ class ArrowMetalFrame:
 
         A `project` or `group_by` query comes back as a `pl.DataFrame`; an `aggregate` query
         comes back as a Python scalar (or a dict of them, for several aggregates).
+
+        Only the columns the query names are imported. That matters: on a frame with a wide
+        string column, importing everything can cost more than the whole query does.
         """
-        columns = from_polars(self._df)
+        columns = {name: from_polars(self._df[name]) for name in self._query_columns(q)}
         res = _am_query(columns, q)
         if isinstance(res, dict) and res and all(isinstance(v, (pa.Array, pa.ChunkedArray))
                                                  for v in res.values()):
             return pl.DataFrame({k: to_polars(v, k) for k, v in res.items()})
         return res
+
+    def _query_columns(self, q):
+        """The frame columns a query reads, in frame order.
+
+        The serialised query names every column it touches as `(col "name")` and the grammar
+        quotes strings with `\\"` and `\\\\` escapes, so one scan over the wire form is an exact
+        answer -- no need to walk the expression tree.
+        """
+        text = q.sexpr() if isinstance(q, (Query, Expr)) else str(q)
+        wanted = set(_COL_REF.findall(text))
+        wanted = {n.replace('\\"', '"').replace("\\\\", "\\") for n in wanted}
+        missing = wanted - set(self._df.columns)
+        if missing:
+            raise ArrowMetalError(f"query names column(s) not in the frame: {sorted(missing)}")
+        return [c for c in self._df.columns if c in wanted]
 
     # -- ordering
     def sort(self, by, *, descending=False) -> pl.DataFrame:

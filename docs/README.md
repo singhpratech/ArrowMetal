@@ -14,6 +14,7 @@ every claim the project makes.
 | [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md) | The complete operation-by-operation comparison against Polars, pyarrow.compute and pandas at 10M and 50M rows, with a verdict per row and a shortfall list of everything below the 3x bar |
 | [DESIGN.md](DESIGN.md) | How it works: buffers, kernels, batching, GPU-side lengths, software Float64, where the time goes |
 | [EXPR.md](EXPR.md) | Fused expression queries: one runtime-generated kernel for a whole expression DAG, the grammar, how nulls are compiled, the numbers and the limits |
+| [POLARS.md](POLARS.md) | Polars on the GPU in three tiers: the zero-copy bridge and `.arrowmetal` namespaces, the Rust expression plugin for lazy plans, and the streaming hand-off — with install, numbers at 10M and 50M rows, and what a real Metal `engine=` backend would need |
 | [DECISIONS.md](DECISIONS.md) | Why it is built this way, one dated entry per decision |
 | [FINDINGS.md](FINDINGS.md) | Things learned the hard way: toolchain quirks, Metal limits, bugs and their lessons |
 | [../ROADMAP.md](../ROADMAP.md) | What is next and what is open for contributors |
@@ -34,6 +35,9 @@ swift run -c release arrowmetal-bench            # Metal vs all CPU cores vs Acc
 python Benchmarks/python_bench.py                # Polars / pyarrow / pandas on the same data shapes
 PYTHONPATH=python python Benchmarks/python_gpu_bench.py   # ArrowMetal from Python vs Polars, in-process
 PYTHONPATH=python python Benchmarks/expr_bench.py         # fused expression queries vs one kernel per operator
+cd polars-plugin && cargo build --release                 # the Polars expression plugin (tier 2)
+PYTHONPATH=python python -m pytest python/tests/test_polars.py -q   # the three Polars tiers
+PYTHONPATH=python python Benchmarks/polars_bench.py       # native Polars vs both Polars tiers
 swift run -c release arrowmetal-examples         # six end-to-end scenarios
 ```
 
