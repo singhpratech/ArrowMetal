@@ -6,72 +6,115 @@ list](https://arrow.apache.org/docs/format/Columnar.html).
 
 Every row below was decided by reading the source in this repository, not by intent. If a row says **GPU**
 there is a Metal kernel behind a public API call; if it says **CPU** the work happens on the host but the
-call exists; if it says anything else, the function is not there today. Rows carry the file that decides
-them so a claim can be checked in one jump.
+call exists; if it says **GPU / CPU** the evaluation is split between the two and the note says where the
+seam is; if it says anything else, the note says what is missing. Rows carry the file that decides them so
+a claim can be checked in one jump.
+
+This file groups Arrow's functions into families and explains each one. The companion page
+[**ARROW_FUNCTIONS.md**](ARROW_FUNCTIONS.md) does the complementary thing: one row per **exact Arrow
+function name**, all 307 of them, generated from a registry that the test suite executes name by name
+against `pyarrow.compute`. Go there for "is `<name>` covered?"; stay here for "how does this family work?".
 
 ## Summary
 
-| Arrow function category | GPU | CPU | Partial | Planned | In progress | Not planned | Rows |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Aggregations — scalar | 19 | 3 | 0 | 0 | 0 | 0 | 22 |
-| Aggregations — grouped (`hash_*`) | 15 | 0 | 0 | 0 | 1 | 0 | 16 |
-| Element-wise arithmetic | 14 | 0 | 5 | 0 | 0 | 0 | 19 |
-| Bit-wise and shifts | 4 | 0 | 2 | 0 | 0 | 0 | 6 |
-| Comparisons | 8 | 0 | 0 | 0 | 0 | 0 | 8 |
-| Logical | 7 | 0 | 0 | 0 | 0 | 0 | 7 |
-| String predicates | 3 | 0 | 0 | 0 | 0 | 0 | 3 |
-| String transforms | 13 | 4 | 3 | 0 | 0 | 0 | 20 |
-| String containment and matching | 8 | 2 | 0 | 0 | 0 | 0 | 10 |
-| Temporal | 5 | 3 | 0 | 0 | 1 | 0 | 9 |
-| Conversions and casts | 0 | 2 | 3 | 0 | 1 | 0 | 6 |
-| Selections | 6 | 0 | 1 | 0 | 0 | 0 | 7 |
-| Containment / set lookup | 3 | 0 | 0 | 0 | 0 | 0 | 3 |
-| Sorts and partitions | 6 | 1 | 4 | 0 | 0 | 0 | 11 |
-| Structural and conditional | 14 | 2 | 0 | 0 | 0 | 0 | 16 |
-| Associative transforms | 3 | 0 | 1 | 0 | 3 | 0 | 7 |
-| Pairwise and cumulative | 6 | 0 | 0 | 0 | 0 | 0 | 6 |
-| Hashing | 2 | 0 | 0 | 0 | 0 | 0 | 2 |
-| **Total (compute functions)** | **136** | **17** | **19** | **0** | **6** | **0** | **178** |
-| Arrow types (matrix below) | 15 | 0 | 7 | 1 | 5 | 0 | 28 |
+| Arrow function category | GPU | GPU / CPU | CPU | Partial | Planned | Rows |
+|---|---:|---:|---:|---:|---:|---:|
+| Aggregations — scalar | 19 | 0 | 3 | 0 | 0 | 22 |
+| Aggregations — grouped (`hash_*`) | 15 | 0 | 0 | 1 | 0 | 16 |
+| Element-wise arithmetic | 14 | 0 | 0 | 5 | 0 | 19 |
+| Bit-wise and shifts | 4 | 0 | 0 | 2 | 0 | 6 |
+| Comparisons | 8 | 0 | 0 | 0 | 0 | 8 |
+| Logical | 7 | 0 | 0 | 0 | 0 | 7 |
+| String predicates | 3 | 1 | 0 | 0 | 0 | 4 |
+| String transforms | 13 | 2 | 4 | 3 | 0 | 22 |
+| String containment and matching | 8 | 0 | 2 | 0 | 0 | 10 |
+| Temporal | 6 | 0 | 3 | 0 | 0 | 9 |
+| Conversions and casts | 1 | 0 | 2 | 3 | 0 | 6 |
+| Selections | 6 | 0 | 0 | 1 | 0 | 7 |
+| Containment / set lookup | 3 | 0 | 0 | 0 | 0 | 3 |
+| Sorts and partitions | 6 | 0 | 1 | 4 | 0 | 11 |
+| Structural and conditional | 14 | 0 | 2 | 0 | 0 | 16 |
+| Associative transforms | 4 | 0 | 0 | 3 | 0 | 7 |
+| Pairwise and cumulative | 6 | 0 | 0 | 0 | 0 | 6 |
+| Hashing | 2 | 0 | 0 | 0 | 0 | 2 |
+| **Total (compute functions)** | **139** | **3** | **17** | **22** | **0** | **181** |
+| Arrow types (matrix below) | 19 | 0 | 0 | 8 | 1 | 28 |
 
 Interop uses a separate vocabulary and is counted apart: 7 shipped, 1 partial, 3 planned
 (11 rows).
 
-**The scope ArrowMetal 0.1.0 claims 100% of:** flat analytics on primitive, boolean and string columns —
-`sum`/`min`/`max`/`mean`, the six comparisons, wrapping `add`/`subtract`/`multiply`/`divide`, boolean
-`and`/`or`/`not`, `filter`/`take`/`slice`, numeric `cast`, single- and multi-key `sort`/`argsort` and a partial-selection top-k, group-by
-`count`/`sum`/`mean`/`min`/`max` over dense integer keys for every primitive value type, `is_null`/`is_valid`/`fill_null`/`drop_null`/
-`if_else`/`coalesce`/`is_in`/`index_in`/`and_kleene`/`or_kleene`, `utf8` length/`equals`/`starts_with`/`ends_with`/
-`contains`/`count_substring`/`find_substring`/murmur3 hash/`dictionary_encode`, the ASCII case, trim, pad, slice, repeat,
-replace, reverse, join and `ascii_is_*` transforms, and Arrow C Data, C Device and C Stream interop for all
-of them — over `int8/16/32/64`, `uint8/16/32/64`, `float32`, `float64`, `bool` and `utf8`, null-aware with
-Arrow semantics and checked against a CPU oracle in the test suite.
+A row here covers a family, so these are not function counts. The by-name numbers are in
+[ARROW_FUNCTIONS.md](ARROW_FUNCTIONS.md): of Arrow v25's 307 compute function names, **306 are reachable**
+— 231 entirely on the GPU, 20 on the host, 55 with a stated limitation — and one, `binary_slice`, is not
+implemented.
 
-**The scope it does not claim:** decimals beyond decimal128 arithmetic and decimal256 selection; compute over
-nested types beyond list/struct access, selection and child navigation;
-Unicode-table string work (full case folding beyond Latin-1 Supplement and Latin Extended-A,
-normalisation, Unicode-whitespace trimming and splitting — the ASCII splits and the regex functions do
-ship, on the CPU); the statistical ranking transforms (`rank_quantile`, `rank_normal`) and the checked
-(overflow-raising) forms of the cumulative and pairwise functions — the ranking, shift, pairwise-difference,
-cumulative and rolling-window families themselves do ship, see Sorts and partitions and Pairwise and
-cumulative; timezones; `tdigest` and `skew`/`kurtosis` (the other statistical aggregates — `stddev`,
-`variance`, `quantile`, `mode`, `count_distinct`, `first`/`last`, `index` — do ship, see Aggregations);
-set lookup over strings; `case_when`, `replace_with_mask` and the forward/backward null fills; checked
-arithmetic and overflow-erroring casts. The long form is at the bottom of this file.
+**The scope ArrowMetal 0.1.0 claims 100% of:** every Arrow compute function name except `binary_slice`,
+over `int8/16/32/64`, `uint8/16/32/64`, `float16/32/64`, `bool`, `utf8`, `binary`, `fixed_size_binary`,
+`decimal32/64/128`, the six temporal types, the three interval layouts, `list` / `struct` / `map` /
+`dictionary` / `run_end_encoded` and extension types — null-aware with Arrow semantics, and checked value
+for value against `pyarrow.compute` in `python/tests/test_functions.py`. Concretely that is: the scalar and
+grouped aggregate families including `skew` / `kurtosis` / `tdigest` and `hash_*` over **arbitrary** key
+columns; unchecked *and* checked (overflow-raising) arithmetic; the full transcendental set — the twelve
+trigonometric and hyperbolic functions, their checked twins, `atan2`, `expm1`, `log1p`, `logb`, `hypot` —
+in software binary64 on the GPU; all ten Arrow round modes with `ndigits`; the complete Unicode string
+surface (the `utf8_is_*` predicates, case and title mapping, centring, slicing, trimming, normalisation,
+regex, `LIKE`, splitting, joining); the whole temporal surface — every extractor, every `*_between`
+difference, the interval differences, `week` with all its options, timezones; window, rank, rolling and
+lexicographic-sort functions; `case_when` / `choose` / `replace_with_mask` / the forward and backward null
+fills; set lookup over strings and binary as well as numerics; nested access, `list_slice`, `map_lookup`,
+`list_parent_indices`; and Arrow C Data, C Device and C Stream interop for all of it.
+
+**The scope it does not claim:** the work that is genuinely on the host and the differences that are
+genuinely differences, both listed by name below and in each row's note.
+
+* **Host-side by design, because the data lives there** — the IANA timezone database (`assume_timezone`,
+  `local_timestamp`, `is_dst`), Unicode normalisation (`utf8_normalize`), the ICU regular-expression engine
+  (`extract_regex`, `extract_regex_span`, `match_substring_regex`, `count_substring_regex`,
+  `find_substring_regex`, `replace_substring_regex`, `match_like`, `split_pattern`, `split_pattern_regex`),
+  `strftime` / `strptime`, the t-digest centroid merge in `tdigest` and `hash_tdigest`, and `pivot_wider`,
+  whose output is one row wide however long the input is. `count`, `count_all`, `true_unless_null` and
+  `make_struct` are "CPU" only in the sense that they read metadata or share buffers and run no kernel at
+  all.
+* **Split between the two** — the ten `utf8_is_*` predicates answer every row on the GPU and re-decide only
+  the rows carrying a byte ≥ 0x80 on the host; `utf8_capitalize` / `utf8_title` and the `utf8_trim*` family
+  run the byte kernel when the column (or the character set) is ASCII and the host implementation
+  otherwise.
+* **Precision** — Metal has no `double` transcendentals, so `exp`, `ln`, `log10`, `log2`, `sqrt`, `power`
+  and their checked twins evaluate in `float` and widen, giving about 1e-7 relative on a float64 column.
+  The grouped moments (`hash_variance`, `hash_stddev`, `hash_skew`, `hash_kurtosis`) form their deviations
+  in float32 about a float64 mean, about 1e-5 relative. Every tolerance is recorded in
+  `arrowmetal.functions.TOLERANCE` and asserted.
+* **Deliberate differences from Arrow** — `unique`, `value_counts` and `hash_distinct` return values
+  ascending rather than in order of first appearance; the group-by order is deterministic but is not
+  pyarrow's first-seen order; `list_parent_indices` returns int32 where Arrow returns int64;
+  `round_temporal` sends an exact half up rather than to even; `cumulative_*` carries the running value
+  across nulls (Arrow's `skip_nulls=True`) where pyarrow's default nulls the rest of the column;
+  `approximate_median` and `hash_approximate_median` are exact rather than sketches;
+  `pyarrow.compute.utf8_normalize` never composes, so its NFC and NFKC differ from this one's.
+* **Options and inputs still unimplemented** — `null_placement="at_start"` on the sorts, `rank`'s `max`
+  tiebreaker, `null_matching_behavior` beyond `skip` on `is_in` / `index_in`, `max_splits` and `reverse` on
+  the splits, Arrow's N-column `binary_join_element_wise`, per-row `num_repeats` on `binary_repeat`,
+  overflow-erroring (`safe=true`) casts and casts between nested types, and a `binary` column where
+  `binary_length` / `binary_repeat` / `binary_reverse` ask for `utf8`.
+* **Not implemented at all** — `binary_slice`, the one Arrow compute name with no answer here. The
+  slicing kernel counts code points and has no byte-offset variant; `binary_replace_slice` does index in
+  bytes, so this is unclaimed rather than out of scope.
+
+The long form is at the bottom of this file.
 
 ## Legend
 
 | Status | Meaning |
 |---|---|
 | **GPU** | A Metal kernel, reachable from the public Swift API, the C ABI, or both. |
+| **GPU / CPU** | Split evaluation: part of the work is a Metal kernel and part runs on the host. The note says where the seam is and what decides it. |
 | **CPU** | Implemented and reachable through the same ArrowMetal API, but the work runs on the host. |
 | **Partial** | Available with a stated limitation; the note says exactly what is missing. |
 | **Planned** | Not implemented; a [ROADMAP](../ROADMAP.md) item covers it (linked in the note). |
-| **In progress** | Being implemented this week on a concurrent branch; not in 0.1.0 as published here. |
-| **Not planned** | Not implemented and not on the roadmap. The note says whether it is out of scope for a GPU kernel library or simply unclaimed. |
 
 Counts in the summary are counts of **rows**. A row covers one Arrow function unless it names several
-(for example the twenty `ascii_is_*` / `utf8_is_*` predicates share one row).
+(for example the twenty `ascii_is_*` / `utf8_is_*` predicates share one row). For counts of *names*, use
+[ARROW_FUNCTIONS.md](ARROW_FUNCTIONS.md), which has exactly one row per Arrow function name.
 
 ## Aggregations — scalar
 
@@ -133,7 +176,7 @@ exactly what the atomic path could not: Float64 sums and means (through the soft
 | `hash_one` / `hash_list` | **GPU** | `GroupBy.one(_:)` returns the **first non-null** value of the key, which is what pyarrow's `hash_one` returns on the same input and is reproducible run to run (Arrow itself does not promise which row); `oneIncludingNull(_:)` is the other reading, the lowest row null included. `list(_:)` builds a `MetalListArray` of every value of the key in row order: the stable sort by key that `segments()` already produces puts each key's rows together and in order, a GPU scan of the per-key counts gives the offsets, and one gather builds the child. `am_group_agg_ex` ops 10 and 11, `one()` / `list()` in Python. **`hash_pivot_wider`** ships alongside them and has no row of its own: `GroupBy.pivotWider(pivotKeys:values:names:)` over a utf8 pivot-key column turns each name into a string-equality mask, intersects it with the values' validity and lets `hash_first` pick the survivor, returning a struct with one field per name (`am_group_pivot_wider` in C, `pivot_wider()` in Python). Arrow raises on duplicate pivot keys within a group; this picks the first. |
 | `hash_approximate_median` / `hash_quantile` / `hash_tdigest` | **GPU** | The segmented sort now exists (`Kernels/AggregatesExtra.swift`): two stable GPU radix argsorts — by value, then by key — leave every key's rows contiguous and ascending by value with its nulls last, and `gx_seg_pick` reads the two values bracketing the requested position. `approximateMedian(_:)` is `quantile(_:0.5)` and is **exact**, not a sketch, so it disagrees with pyarrow's `hash_approximate_median` by pyarrow's own sketch error (measured up to 18.7 on values spanning 1000); it matches an exact per-group median oracle bit for bit. `quantile(_:_:)` takes any q with linear interpolation. `hash_tdigest` is GPU sort + a host centroid merge per key, the grouped form of `tdigest`. `am_group_agg_ex` ops 21, 22 and 25. |
 | Group-by over arbitrary (non-dense) keys | **GPU** | `GroupByKeys` (`Kernels/GroupByKeys.swift`) maps any key column to dense ids `0 ..< groupCount` on the GPU and hands back the key values per group (`groupKeys()`). Supported key types: int8-int64, uint8-uint64, float32/float64 (`-0.0 == 0.0`, all NaNs one group), bool, temporal and date, utf8, binary, dictionary-encoded (its codes are re-encoded, which also drops unused dictionary entries) and decimal128/decimal256 (folded limb by limb). Several key columns fold **pairwise** into the injective 64-bit key `a * Kb + b`, re-encoded after every fold so the cardinality stays bounded by the row count; three and four columns are tested. A null key forms its own group, as in Arrow. Two mappings, cheaper first: a **range path** for integer, boolean, temporal and dictionary columns whose values span at most 2^24 and at most `max(2^16, 4 * rows)` — mark the occupied values, GPU-scan the marks, read each row's rank, no sort at all — and the `dictionaryEncode` **sort path** (argsort, run marks, prefix scan) for floats, decimals, strings and wide-range integers. A fold's composite has a known range, so multi-column keys usually take the range path as well. The hashing alternative to the injective fold was measured at 50M rows and ~100k groups, both composites re-encoded by the same sort: 160.0 ms for the radix combine against 163.9 ms for a 64-bit hash that had not yet paid for its verification pass — and only the injective key has a range known in advance, which is what lets the fold take the range path instead. Group **order** is deterministic but is not pyarrow's first-seen order. `GroupBy(keys: [...])` in Swift with `denseKeyCount:` keeping the old fast path, `am_group_by_keys` / `am_group_by_keys_result` in C, `am.group_by([...])` in Python. |
-| Hash join (Acero, not a compute function) | **In progress** | A concurrent branch is building a GPU hash join this week. Not in 0.1.0 as published here. |
+| Hash join (Acero, not a compute function) | **Partial** | `Kernels/Join.swift`: `hashJoin(left:right:kind:)` builds a GPU hash table over the right key column and probes it with the left, returning the index pairs of every match; `MetalRecordBatch.join(_:on:rightKey:kind:)` turns those into a joined batch with one `take` per column. Inner and left joins, many-to-many, null keys never matching. The key columns must be `int32` or `int64` — dictionary-encode or hash any other key type first — and right/full outer joins are not implemented. |
 
 ## Element-wise arithmetic
 
@@ -196,7 +239,7 @@ and is reachable as `am_binary(op 5)` and `.modulo()` / `__mod__` in Python.
 | `invert` (`not`) | **GPU** | Validity is shared zero-copy with the input. |
 | `xor` | **GPU** | `Kernels/LogicalExtra.swift`, word-wise over the packed bitmaps, one thread per 32-bit output word. Nulls propagate (output validity is the AND of both inputs), matching Arrow's `xor` rather than a Kleene form. `xor(_:)` in Swift, `am_logical` op 0 in C, `xor()` / `^` in Python. |
 | `and_not` | **GPU** | `Kernels/LogicalExtra.swift`: `a AND NOT b`, reusing the existing `bitmap_and_not` word kernel. Nulls propagate. `andNot(_:)` in Swift, `am_logical` op 1 in C, `and_not()` in Python. |
-| `and_kleene` / `or_kleene` | **GPU** | `Kernels/Structural.swift`, one thread per 32-bit word: the value words are `a & b` / `a | b` and the validity word is computed from both operands' validity, so `false AND null` is `false` and `true OR null` is `true`. With no nulls on either side the call falls through to the plain `and` / `or` kernel. `andKleene` / `orKleene` in Swift, `am_and_kleene` / `am_or_kleene` in C, `and_kleene` / `or_kleene` in Python. |
+| `and_kleene` / `or_kleene` | **GPU** | `Kernels/Structural.swift`, one thread per 32-bit word: the value words are `a & b` / `a \| b` and the validity word is computed from both operands' validity, so `false AND null` is `false` and `true OR null` is `true`. With no nulls on either side the call falls through to the plain `and` / `or` kernel. `andKleene` / `orKleene` in Swift, `am_and_kleene` / `am_or_kleene` in C, `and_kleene` / `or_kleene` in Python. |
 | `and_not_kleene` | **GPU** | `Kernels/LogicalExtra.swift`, its own word kernel because `a.andKleene(b.not())` is only correct when `b` has no nulls: the value word is `a & ~b` and the validity word `(a.valid & ~a) \| (b.valid & b) \| (a.valid & b.valid)`, so a valid `false` on the left or a valid `true` on the right gives `false` even when the other side is null. With no nulls anywhere the call falls through to the plain `and_not` kernel. The nine-row truth table is asserted in `ConditionalTests.testAndNotKleeneTruthTable`. `andNotKleene(_:)` in Swift, `am_logical` op 2 in C, `and_not_kleene()` in Python. |
 
 ## String predicates
@@ -274,7 +317,7 @@ zero-copy and a null row emits no bytes. All of them are reachable from Swift, f
 | Rounding: `ceil_temporal`, `floor_temporal`, `round_temporal` | **GPU** | `Kernels/TemporalMath.swift`: `floorTemporal(to:multiple:)`, `ceilTemporal`, `roundTemporal` over `nanosecond` … `day` (integer arithmetic in the value's own resolution; rounding to a unit finer than the storage is the identity) and `month` / `quarter` / `year` (the civil algorithm and its inverse `days_from_civil`, so it needs a column that carries a date). `ceil` leaves a value already on a boundary alone, which is Arrow's `ceil_is_strictly_greater = false`; `round` sends an exact half **up**, toward +infinity. Checked against Foundation's `Calendar` in UTC over 100k random timestamps in `TextTests`. `calendar_based_origin` and week-based units are not implemented. |
 | Timezones: `assume_timezone`, `local_timestamp` | **CPU** | `Sources/ArrowMetal/Timezone.swift`. Both run on the host **by design**: a timezone conversion is a lookup in the IANA tz database, which is host data (Foundation's `TimeZone`) with no GPU-resident form, so the values are converted on the CPU, sharded over `DispatchQueue.concurrentPerform`, with a per-shard cache of the current offset's validity interval (the next DST transition) so a run of nearby timestamps costs one tz lookup rather than one per row. `assumeTimezone(_:ambiguous:nonexistent:)` reads a naive timestamp column as wall-clock times in the zone and returns the instants they name, tagged with it; `localTimestamp()` is the inverse. Neither changes the unit, and the sub-second part rides through untouched. A local time that occurs twice (a DST fall-back) or never (a spring-forward gap) throws by default, which is Arrow's `ambiguous = "raise"` / `nonexistent = "raise"`; `earliest` / `latest` pick the earlier / later instant, and for a gap the last instant before / the first instant after it. IANA names and fixed offsets (`"+02:00"`) are both accepted. `am_assume_timezone` / `am_local_timestamp` in C, `assume_timezone()` / `local_timestamp()` in Python. Checked against `pyarrow.compute` and against Foundation over 400 days in `America/New_York` at all four units. |
 | `strftime` / `strptime` | **CPU** | `Kernels/TemporalMath.swift`. Formatting and parsing against calendar data belong on the host, so both go through the C library with a UTC `tm` (`gmtime_r` + `strftime`, `strptime` + `timegm`) rather than a `DateFormatter` Unicode pattern — the format string is a **C strftime/strptime format**, which is what Arrow takes. `%f` is an ArrowMetal extension expanding to the six-digit fractional second. `strptime` must consume the whole value; a row that does not parse comes back null, or throws with `strict: true`. `strptime` is sharded over `DispatchQueue.concurrentPerform`. No locale and no timezone offsets: UTC only. |
-| Temporal **types** (`date32`, `date64`, `time32`, `time64`, `timestamp`, `duration`) | **In progress** | A concurrent branch is adding temporal type import/export and routing them onto the existing fixed-width integer kernels this week. Not in 0.1.0 as published here: `arrowPrimitiveType(forFormat:)` accepts only `c C s S i I l L f g` today. |
+| Temporal **types** (`date32`, `date64`, `time32`, `time64`, `timestamp`, `duration`) | **GPU** | `Sources/ArrowMetal/Temporal.swift`: all six import and export through the C Data Interface and run on the existing fixed-width integer kernels, with the Arrow unit and timezone carried alongside as metadata. See the Type matrix below for the per-type detail. |
 
 ## Conversions and casts
 
@@ -285,7 +328,7 @@ zero-copy and a null row emits no bytes. All of them are reachable from Swift, f
 | `cast` boolean ↔ integer | **Partial** | `MetalBooleanArray.toUInt8Array()` is a public GPU unpack (bitmap → uint8). The reverse packing exists but is internal. |
 | `cast` string ↔ numeric / temporal | **Partial** | `Kernels/StringCast.swift`. **Integer → string** is GPU (`str_itoa_*`, the same two-pass length/bytes shape as the string transforms), exact for `Int64.min` and `UInt64.max`; **string → integer** is GPU (`str_parse_int`, one thread per 32 rows so the validity word needs no atomics), the whole value matching `[+-]?[0-9]+` with leading zeros allowed and everything else — empty, malformed, out of range, a `-` on an unsigned target — becoming null, which is Arrow's `safe=false`; `strict: true` throws instead. **Float and boolean** conversions are CPU: floats format as the shortest decimal string that round-trips, which differs from Arrow in keeping a `.0` on a whole value and using Swift's exponent form, and parse with Swift's `Double`/`Float` initialiser; booleans are `"true"`/`"false"` out and `"true"`/`"false"`/`"1"`/`"0"` case-insensitively in. **Temporal ↔ string** goes through the `strftime` / `strptime` row above. Reachable as `am_to_strings` / `am_parse` in C and `to_strings()` / `cast("string")` / `parse(type)` in Python. Decimal and the checked (`safe=true`) forms are not implemented. |
 | `cast` to/from decimal | **CPU** | `Sources/ArrowMetal/Decimal.swift`, decimal128 only, one host pass each. `toFloat64()` divides the unscaled 128-bit value by 10^scale; `MetalDecimalArray.fromFloat64(_:type:)` multiplies by 10^scale and rounds halves away from zero, turning a non-finite or out-of-range value into null; `fromInt64(_:type:)` multiplies exactly (wrapping past 128 bits). Both directions carry Double's 53 bits of precision, so a cast through float64 is lossy above 2^53 — deliberately host code, since a kernel would buy nothing over the PCIe-free unified memory. `am_decimal_op` ops 16 and 17, `to_float64()` in Python. Decimal ↔ string and decimal ↔ decimal128-with-another-precision are not implemented (use `round`/`ceil`/`floor`/`truncate` to change scale). |
-| `cast` dictionary | **In progress** | Follows the dictionary type work in flight this week. |
+| `cast` dictionary | **GPU** | Both directions, under their own names rather than through `cast`: `dictionaryEncoded()` (`Kernels/DictionaryCompute.swift`) covers every column type this package has, and `decode()` materialises a dictionary column with one `take`. `am_str_dictionary_encode` / `am_dictionary_decode` in C, `dictionary_encode()` / `dictionary_decode()` in Python. |
 
 ## Selections
 
@@ -350,9 +393,9 @@ zero-copy and a null row emits no bytes. All of them are reachable from Swift, f
 |---|---|---|
 | `dictionary_encode` (utf8) | **GPU** | `Kernels/StringDictionary.swift`. Hash each string, argsort the hashes, mark run boundaries by comparing the full **bytes** of adjacent sorted strings, rank the marks with the same GPU scan `unique()` uses, and gather the dictionary with the string gather. Codes are relabelled into first-seen order, so the result is identical to the host version this replaced — same codes, same dictionary order. Reachable from Swift, the C ABI (`am_str_dictionary_encode`) and Python. 10M strings, 200k distinct: 43 ms against 1.3 s for the host path. |
 | `dictionary_encode` (utf8) collision handling | **GPU** | Rows are grouped by a 64-bit key (two independent murmur3 seeds) and the boundary kernel counts content runs against key runs; equal totals prove every bucket holds one distinct string. A bucket that does not is re-hashed under new seeds, and `MetalStringArray.dictionaryEncodeCPU()` remains as the final fallback, so the result is correct rather than probably correct. |
-| `dictionary_encode` (numeric) | **In progress** | A concurrent branch is adding numeric dictionary encoding this week. Not in 0.1.0 as published here. |
-| `unique` | **In progress** | Same branch: `unique` over numeric columns. |
-| `value_counts` | **In progress** | Same branch: `value_counts` over numeric columns. |
+| `dictionary_encode` (numeric) | **GPU** | `Kernels/Unique.swift` behind `Kernels/DictionaryCompute.swift`: one GPU radix argsort, run marks over the sorted values, a scan into ranks and a scatter back to the rows. Temporal and boolean columns take the same path. |
+| `unique` | **Partial** | `Kernels/Unique.swift`, GPU: the same sort and run scan. The values come back **ascending**, where Arrow returns them in order of first appearance, and nulls are dropped rather than kept. `am_unique` in C, `unique()` in Python. |
+| `value_counts` | **Partial** | The same pass, returned as a `struct<values, counts>` column. Ascending order rather than first appearance, and nulls dropped, exactly as `unique`. `am_value_counts` in C, `value_counts()` in Python. |
 | `dictionary_encode` (temporal, boolean, binary) | **Partial** | `AnyMetalArray.dictionaryEncoded()` (`Kernels/DictionaryCompute.swift`) covers every column type this package has: temporal and boolean columns go through the GPU numeric encoder (the temporal type is carried over to the values), `utf8` and `binary` through the existing host hash map. Returns `.dictionary(codes:values:)` rather than a loose pair. |
 | Dictionary compute without decoding (`compare`, `filter`, `take`, `slice`, `unique`, `value_counts`, `group_by`) | **GPU** | `Kernels/DictionaryCompute.swift`. `dictionaryCompare(_:_:)` compares the dictionary once and gathers the booleans by the codes (`values.length` comparisons plus one gather, not one per row); `filter`/`take`/`slice` touch the codes only and share the values array; `dictionaryUnique()` / `dictionaryValueCounts()` run over the codes and gather once; `dictionaryGroupBy()` hands the codes straight to `GroupBy` as dense keys. String dictionaries compare with `==` and `!=` only. |
 
@@ -397,16 +440,16 @@ outright.
 | `decimal32` / `decimal64` | **GPU** | `ArrowSmallDecimalType` / `MetalSmallDecimalArray` (`TypesExtra.swift`): the unscaled value in an int32 or int64 column, so `filter` / `take` / `slice` are the existing integer kernels and C Data import / export are zero-copy on a page-aligned producer. There are no narrow-decimal kernels by design: `toDecimal128()` is a GPU widening cast (sign extension into two limbs, exact for every value) into `MetalDecimalArray`, where the whole decimal kernel set already lives, and `MetalDecimalArray.narrowed(to:)` is the GPU narrowing cast back, keeping the scale and wrapping when a value does not fit (Arrow's unchecked cast). `am_decimal_widen` / `am_decimal_narrow` in C, `to_decimal128()` / `to_small_decimal()` in Python; round trips checked against real `pa.decimal32` / `pa.decimal64` arrays. |
 | `decimal128` | **GPU** | `Sources/ArrowMetal/Decimal.swift` and `Kernels/DecimalSource.swift`. Elements are Arrow's raw 16-byte little-endian two's-complement unscaled values; every kernel works on two 64-bit limbs, with carries from unsigned compares and `mulhi`/`*` for the products. GPU: the six comparisons (scalar and array, signed 128-bit ordering), `sum`/`min`/`max` (per-thread 128-bit accumulate, threadgroup tree, host combine), `add`/`subtract` (array and scalar), `negate`/`abs`/`sign`, multiply by an int64 scalar and element-wise multiply (Arrow's rule: precision `p1+p2+1`, scale `s1+s2`, rejected when the precision does not fit 38), `round`/`ceil`/`floor`/`truncate` to a target scale (scaling up multiplies, scaling down is a restoring 128-bit long division with the rounding mode applied to the magnitude; halves go away from zero, as this package's float `round` does), and `filter`/`take`/`slice` (the int32 filter compacts an index vector, then a byte-width-generic gather moves the values). Arithmetic wraps modulo 2^128, matching Arrow's unchecked kernels; the two sides of a binary op must share a scale or the call raises rather than rescaling silently. Casts are CPU (see Conversions above). C Data Interface import (zero-copy, offsets and foreign producers handled) and export both work, `am_format` reports `d:p,s`, and `MetalRecordBatch` carries decimal columns through `nullCount`/`filter`/`take`/`slice`/`+s` export. `am_decimal_op` in C (op table in `include/arrowmetal.h`), `am_compare_scalar`/`am_compare_array` for the comparisons, and `decimal_add`/`decimal_sub`/`decimal_mul`/`decimal_round`/`to_float64` plus the `==`/`<`/… operators in Python. Not implemented: divide, `cast` between decimal precisions, group-by, sort and `is_in` over decimal columns, and Arrow IPC (the writer rejects a decimal column with a message). |
 | `decimal256` | **Partial** | Same files, four limbs instead of two: C Data Interface import and export, the six comparisons (a 16-byte scalar is sign-extended to 256 bits), `filter`, `take`, `slice` and `sum` run on 32-byte elements. `min`/`max`, all arithmetic, `sign`, the rounding family and the casts throw `unsupportedType` naming decimal128 rather than computing something wrong. |
-| `date32` / `date64` | **In progress** | Concurrent branch this week; not in 0.1.0 as published here. |
-| `time32` / `time64` | **In progress** | Same branch. |
-| `timestamp` | **In progress** | Same branch. |
-| `duration` | **In progress** | Same branch. |
+| `date32` / `date64` | **GPU** | `MetalTemporalArray` (`Sources/ArrowMetal/Temporal.swift`): `tdD` as int32 days and `tdm` as int64 milliseconds since the epoch, C Data import and export, and every fixed-width kernel (compare, arithmetic, filter, take, slice, sort, group-by) over the underlying integer. The calendar functions are in the Temporal section above. |
+| `time32` / `time64` | **GPU** | Same file: `tts` / `ttm` as int32 and `ttu` / `ttn` as int64 ticks since midnight, with the same kernel set. The fixed-unit `*_between` differences accept them; the calendar-based ones reject them, since they carry no date. |
+| `timestamp` | **GPU** | Same file: `tss` / `tsm` / `tsu` / `tsn` as int64 ticks since the epoch, with the unit and any timezone carried as metadata. Every calendar function reads it as **UTC** — the timezone is never applied — except `is_dst`, `assume_timezone` and `local_timestamp`, which are the three host-side functions in the Temporal section. |
+| `duration` | **GPU** | Same file: `tDs` / `tDm` / `tDu` / `tDn` as int64 ticks, produced by `subtractTemporal(_:)` and consumed by `addDuration(_:)`. Rejected by the calendar extractors and by `subsecond`. |
 | `interval` (month, day_time, month_day_nano) | **GPU** | `ArrowIntervalUnit` / `MetalIntervalArray` (`TypesExtra.swift`): all three layouts — `tiM` (int32 months), `tiD` (int32 days + int32 milliseconds) and `tin` (int32 months + int32 days + int64 nanoseconds) — as raw fixed-width records, with C Data import and export (zero-copy on a page-aligned producer) and `filter` / `take` / `slice` through one record gather parameterised by the byte width. Arithmetic is `MetalTemporalArray.addInterval(_:)`: month arithmetic goes through the civil calendar and **clamps the day to the target month's length** (2024-01-31 + 1 month = 2024-02-29), as Arrow does; days are whole UTC days; the sub-day field is converted to the column's own resolution, truncating toward zero when the column is coarser; and `date32`, whose tick is a whole day, rejects an interval that carries a sub-day part rather than dropping it. **pyarrow has no `add(timestamp, interval)` kernel**, so this one has no pyarrow oracle and is checked against a host civil-calendar oracle instead. **pyarrow 25 also cannot wrap `interval[month]` or `interval[day_time]` arrays in Python at all** (no Array class for those type ids), so `to_arrow()` raises for those two formats and `interval_field("months" / "days" / "nanoseconds")` — `am_interval_field` in C — is the way to read their values; `month_day_nano` round trips through pyarrow normally. `am_add_interval` in C, `add_interval()` in Python. |
-| `binary` / `large_binary` | **In progress** | Concurrent branch this week. The `utf8` layout kernels apply unchanged (byte length, equality, prefix/suffix, hash, filter, take); only the importer and the char-length kernel are utf8-specific. |
+| `binary` / `large_binary` | **Partial** | `z` and `Z` import and export (64-bit offsets narrowed to int32 on import, as `large_utf8`'s are), and `filter` / `take` / `slice` / `is_in` / `index_in` / `binary_replace_slice` run over them unchanged. The rest of the string surface still asks for `utf8` and refuses a binary column — `binary_length`, `binary_repeat` and `binary_reverse` are the ones a caller notices, and their rows in [ARROW_FUNCTIONS.md](ARROW_FUNCTIONS.md) say so. |
 | `fixed_size_binary` | **GPU** | `MetalFixedBinaryArray` (`TypesExtra.swift`): `w:N` as N raw bytes per element, with C Data import and export (zero-copy on a page-aligned producer) and `filter` / `take` / `slice` through the same record gather the interval types use. `compare(.eq / .ne, …)` against a scalar record or another array of the same width is a GPU byte compare, null in / null out, with the array form ANDing the two validity bitmaps; ordering comparisons are not defined for the type and throw. `hash64()` is FNV-1a 64 over each element's bytes — an ArrowMetal extension, not Arrow's `hash64`. `am_fixed_binary_compare` / `am_fixed_binary_hash64` in C, `fixed_binary_compare()` / `hash64()` in Python; the comparison is checked against `pyarrow.compute.equal`. |
 | `utf8` | **GPU** | Byte/char length, equals/starts_with/ends_with/contains, count_substring/find_substring, murmur3 hash, `dictionary_encode` (GPU), filter, take, C Data import/export, and the transforms that build new string arrays: ASCII and Latin case mapping, trim/ltrim/rtrim, pad, slice, repeat, replace, reverse, element-wise join and the `ascii_is_*` predicates, plus GPU integer↔string casts. The regex functions, SQL `LIKE`, splitting and the float/boolean casts are CPU. |
 | `large_utf8` | **Partial** | Import only, and only when the data is under 2 GB: 64-bit offsets are narrowed to int32 in one pass. Exports come back out as `utf8`. |
-| `utf8_view` / `binary_view` | **Planned** | [ROADMAP → Medium term → Strings](../ROADMAP.md#medium-term) lists `utf8_view` as open. |
+| `utf8_view` / `binary_view` | **Planned** | [ROADMAP → Medium term](../ROADMAP.md#medium-term) lists `utf8_view` / `binary_view` import and export as open. |
 | `list` / `large_list` / `fixed_size_list` | **Partial** | `MetalListArray` (`Sources/ArrowMetal/Nested.swift`): C Data import and export of `+l`, `+L` and `+w:N`, `list_value_length` / `list_flatten` / `list_element`, and `filter` / `take` / `slice`. The child is an `AnyMetalArray`, so it may be any supported type including another list, a struct or a map, recursively. Offsets are always int32 in Metal memory: `large_list` offsets are narrowed on import (and come back out as `+l`, as `large_utf8` comes back out as `utf8`), and a `fixed_size_list` materialises the `i * N` offsets its layout implies, so one set of kernels covers all three. `take` recomputes the offsets with the existing GPU scan and expands the selected rows' source ranges into one child index array that the child's own `take` gathers; a `slice` of a variable-length list shares both the offsets buffer and the child. `list_parent_indices` and `list_slice` are in `NestedExtra.swift` (see the compute table above). Not implemented: aggregates or arithmetic over list values. |
 | `list_view` / `large_list_view` | **Partial** | Import only (`Sources/ArrowMetal/NestedExtra.swift`). `+vl` and `+vL` arrive as three buffers — validity, per-row offsets and per-row sizes — with rows that may point anywhere in the child, in any order, overlapping. The importer walks the rows once on the host: when they already lie back to back the contiguous offsets `MetalListArray` needs are the view's own and the producer's child is shared untouched; otherwise the sizes are prefix-summed into fresh offsets and the child is **materialised in that order with one GPU gather** (`list_view_gather` plus the child's own `take`, so the child may be any supported type). `+vL`'s int64 offsets and sizes are narrowed as `large_list`'s are. A null row references nothing, whatever its slots say. **Everything therefore exports as a plain `list` (`+l`)**: ArrowMetal has no view-shaped column, so a round trip through this package flattens a view. |
 | `struct` | **GPU** | `MetalStructArray` (`Nested.swift`) is `+s` as a **column**, not only as the record-batch container: named children of any supported type, its own validity bitmap, arbitrary nesting in either direction (a struct of lists, a list of structs), `structField(_:)`, and `filter` / `take` / `slice` by delegating to the children and gathering the struct's own validity. `importArrowRecordBatch` keeps its top-level meaning and now accepts nested children. No aggregate takes a struct column. |
@@ -424,7 +467,7 @@ outright.
 | C Data Interface export | **Shipped** | Primitive, boolean and `utf8` arrays. |
 | C Device Data Interface import / export | **Shipped** | `ARROW_DEVICE_METAL`; a `sync_event` on import is waited on with an empty command buffer. |
 | C Stream Interface import | **Shipped** | `importArrowArrayStream` drains a stream into record batches. |
-| C Stream Interface export | **Planned** | [ROADMAP → Medium term → RecordBatch](../ROADMAP.md#medium-term): "Open: C Stream export, C Device Stream". |
+| C Stream Interface export | **Planned** | [ROADMAP → Medium term](../ROADMAP.md#medium-term): "C Stream export and C Device Stream, the two interop rows still open". |
 | Record batch as `+s` struct array | **Partial** | Import and export both work; import rejects struct-level nulls, a non-zero offset, and nested children. |
 | `MTLBuffer` recovery from our own exports | **Shipped** | `metalBuffers(of:)` for device arrays this process produced. |
 | Arrow IPC (file and stream) read / write | **Shipped** | `IPC/IPCReader.swift` and `IPC/IPCWriter.swift`, no dependencies: both encapsulations, random access through the file footer, and cross-checked against pyarrow in both directions. Columns keep their logical type — temporal columns read and write as `.temporal`, `binary` / `large_binary` as `.binary`, and dictionary-encoded columns as `.dictionary` through `DictionaryBatch` messages (complete dictionaries only: a delta batch, a replacement for an id, or a batch carrying a different dictionary for a column is refused rather than silently mis-decoded). Compression, view types and run-end encoded columns are not written. |
@@ -434,40 +477,61 @@ outright.
 
 ## What ArrowMetal 0.1.0 claims, and what it does not
 
-**The claim.** ArrowMetal 0.1.0 claims complete, GPU-resident, null-correct coverage of exactly one thing:
-**flat analytics on primitive, boolean and string columns** — that is, over `int8/16/32/64`,
-`uint8/16/32/64`, `float32`, `float64`, `bool` and `utf8`: the reductions `sum`, `min`, `max`, `mean`; the
-six comparisons against a scalar or another column; wrapping `add`/`subtract`/`multiply`/`divide`; boolean
-`and`/`or`/`not`; `filter` (including a fused predicate form), `take` and `slice`; numeric `cast`;
-single- and multi-key `sort`, `argsort` and top-k; group-by `count`/`sum`/`mean`/`min`/`max` over dense integer keys,
-over every primitive value type;
-`is_null`, `is_valid`, `fill_null`, `drop_null`, `if_else`, `coalesce`, `is_in`, `index_in` and the Kleene
-`and_kleene`/`or_kleene`; `utf8` byte and character length, `equals`/`starts_with`/`ends_with`/`contains`,
-`count_substring`, `find_substring`, murmur3 hash and `dictionary_encode`, plus the string transforms that build new `utf8`
-arrays — ASCII and Latin case mapping, trim, pad, slice, repeat, replace, reverse, element-wise join and the
-`ascii_is_*` predicates; and Arrow
-C Data, C Device and C Stream interop for all of it — every one of them null-aware with Arrow semantics and
-checked element-for-element against a CPU oracle in the test suite. Temporal columns join that sentence when
-the in-progress temporal types land, because they are fixed-width integers underneath and the same kernels
-apply unchanged; they are not part of the claim as published here.
+**The claim.** ArrowMetal 0.1.0 answers to **306 of the 307 Apache Arrow v25 compute function names** —
+the 283 in the C++ docs plus the 24 `hash_*` grouped aggregates — over `int8/16/32/64`, `uint8/16/32/64`,
+`float16/32/64`, `bool`, `utf8`, `binary`, `fixed_size_binary`, `decimal32/64/128`, `date32/64`,
+`time32/64`, `timestamp`, `duration`, the three `interval` layouts, `list` / `large_list` /
+`fixed_size_list`, `struct`, `map`, `dictionary`, `run_end_encoded` and extension types. Every one of those
+names is a row in [ARROW_FUNCTIONS.md](ARROW_FUNCTIONS.md) carrying the Swift file behind it, the
+ArrowMetal call that reaches it and the status the test suite measured: **231 gpu**, **20 cpu**, **55
+partial**, **1 missing**. "Measured" is literal — `python/tests/test_functions.py` calls every runnable row
+through `arrowmetal.functions.call_function` and compares the answer to `pyarrow.compute`, with a second
+input in a different type family for the rows whose claim spans several.
 
-**What it does not claim.** ArrowMetal does not do decimals (`decimal32/64/128/256`); it does not do compute
-over nested types — lists, structs, maps, unions (struct appears only as the record-batch container, and
-there is no compute over struct-typed columns); it does not do full Unicode case folding beyond the
-Latin-1 Supplement and Latin Extended-A blocks (the multi-character expansions of ß, ŉ and µ are left
-alone), normalisation, Unicode-whitespace trimming or Unicode splitting — the regex functions, SQL
-`LIKE` and the ASCII splits do ship, on the CPU behind the same API, with a GPU fast path for patterns
-that are really literals; of the window family it does not do `rank_quantile` or `rank_normal`, nor any of the
-checked (overflow-raising) cumulative or pairwise forms — the ranking, shift, pairwise-difference, cumulative and
-rolling-window calls themselves ship; it does not do
-timezones; it does not do statistical aggregates (`stddev`, `variance`, `quantile`,
-`mode`, `tdigest`, `approximate_median`); it does not do set lookup over strings, nor the structural
-functions it has no kernel for (`case_when`, `choose`, `replace_with_mask`, `fill_null_forward`/`_backward`,
-`is_nan`/`is_finite`/`is_inf`); it does not do checked arithmetic or overflow-erroring casts; and it is not a query planner, a SQL engine or a
-tensor library. Several of those are near-term roadmap items rather than refusals — the rows above say which
-is which, one function at a time.
+Underneath that: reductions and the whole scalar aggregate family (`sum` … `quantile`, `mode`,
+`count_distinct`, `first`/`last`, `index`, `skew`, `kurtosis`, `tdigest`); grouped aggregation over
+**arbitrary** key columns, several folded together, with all 24 `hash_*` names; unchecked and checked
+arithmetic; every transcendental Arrow defines, in software binary64 on the GPU; all ten Arrow round
+modes; the complete Unicode string surface; the complete temporal surface including intervals and
+timezones; sorts, top-k, ranks, windows and rolling aggregates; the conditional and null-filling
+transforms; nested access; and Arrow C Data, C Device and C Stream interop for all of it.
+
+**What it does not claim.**
+
+* **One function is missing.** `binary_slice` — the slicing kernel counts code points and has no
+  byte-offset variant. Unclaimed, not out of scope.
+* **Nine functions are host-side because their data is.** The IANA timezone database
+  (`assume_timezone`, `local_timestamp`, `is_dst`), Unicode normalisation (`utf8_normalize`), the ICU
+  regular-expression engine and everything built on it (`extract_regex`, `extract_regex_span`, the four
+  `*_regex` string functions, `match_like`, `split_pattern`, `split_pattern_regex`), `strftime` /
+  `strptime`, the centroid merge in `tdigest` and `hash_tdigest`, and `pivot_wider`. None of these is a
+  missing kernel: a transition table or a Unicode table would have to be uploaded per call, and
+  `pivot_wider`'s output is one row wide however long the input is. Where a fast path exists it is taken —
+  a regex that is really a literal routes to the GPU kernel.
+* **The Unicode predicates and case transforms are split.** The ten `utf8_is_*` predicates answer every
+  row on the GPU and re-decide on the host only the rows carrying a byte ≥ 0x80, so an all-ASCII column
+  never leaves the device; `utf8_capitalize`, `utf8_title` and the `utf8_trim*` family take the byte
+  kernel when the column (or the character set) is ASCII.
+* **Six functions are float32-precise on float64 input.** Metal has no `double` transcendentals, so `exp`,
+  `ln`, `log10`, `log2`, `sqrt` and `power` — and their `_checked` twins — evaluate in `float` and widen,
+  about 1e-7 relative. The trigonometric family, `expm1`, `log1p`, `logb` and `hypot` do *not* have this
+  problem: they run a software binary64 implementation on the GPU, within 5 ulp of the host libm.
+* **A handful of answers deliberately differ from Arrow's**, each stated on its row: ascending `unique` /
+  `value_counts` / `hash_distinct` rather than first-appearance order; a deterministic but not
+  first-seen group order; int32 `list_parent_indices`; `round_temporal` halves going up rather than to
+  even; `cumulative_*` carrying the running value across nulls; exact `approximate_median` where Arrow
+  sketches; and NFC / NFKC composing, where `pyarrow.compute.utf8_normalize` does not.
+* **Some options are still unimplemented**, and the note on each row lists them:
+  `null_placement="at_start"`, `rank`'s `max` tiebreaker, `null_matching_behavior` beyond `skip`,
+  `max_splits` / `reverse` on the splits, N-column `binary_join_element_wise`, per-row `num_repeats`,
+  overflow-erroring casts, casts between nested types, and `binary` input to `binary_length` /
+  `binary_repeat` / `binary_reverse`.
+* **Type-level gaps remain**, in the matrix above rather than in the function list: `decimal256`
+  arithmetic, `utf8_view` / `binary_view`, compute over union values, and aggregates over list values.
+* **It is still not** a query planner, a SQL engine or a tensor library. The one Acero-shaped thing here
+  is a GPU hash join over int32 / int64 keys.
 
 ---
 
-Version 0.1.0. Read alongside [ROADMAP.md](../ROADMAP.md), [DESIGN.md](DESIGN.md) and
-[BENCHMARKS.md](BENCHMARKS.md).
+Version 0.1.0. Read alongside [ARROW_FUNCTIONS.md](ARROW_FUNCTIONS.md), [ROADMAP.md](../ROADMAP.md),
+[DESIGN.md](DESIGN.md) and [BENCHMARKS.md](BENCHMARKS.md).

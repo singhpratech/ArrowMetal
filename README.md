@@ -88,6 +88,31 @@ print(col.filter_where(">", 2).sum(), pl.from_arrow(col.filter_where(">", 2).to_
 with am.batch():                                   # several kernels, one GPU round trip
     total = col.filter((col > 1) & (col < 40)).sum()
 ```
+```python
+from decimal import Decimal
+
+# Group-by over arbitrary key columns — strings here, several columns if you pass several.
+# A null key forms its own group, as in Arrow.
+region = am.array(pa.array(["emea", "apac", "emea", None, "apac"]))
+amount = am.array(pa.array([10.0, 20.0, 30.0, 40.0, 50.0]))
+gb = am.group_by([region])
+dict(zip(gb.keys()[0].to_pylist(), gb.sum(amount).to_arrow().to_pylist()))
+# {'emea': 40.0, 'apac': 70.0, None: 40.0}
+
+# Checked arithmetic raises exactly where the unchecked kernel wraps, naming the row.
+big = am.array(pa.array([2**62, 2**62], type=pa.int64()))
+(big + big).to_arrow()                             # wraps, which is Arrow's unchecked `add`
+big.add_checked(big)                               # ArrowMetalError: add_checked: overflow at index 0
+
+# Regex runs on the host behind the same API; a pattern that is really a literal
+# routes back to the GPU kernel.
+names = am.array(pa.array(["ArrowMetal", "polars", "pyarrow"]))
+names.match_substring_regex("^p").to_arrow()       # [false, true, true]
+
+# decimal128 arithmetic on the GPU; decimal32/64 widen into it and narrow back.
+price = am.array(pa.array([Decimal("19.99"), Decimal("5.01")], type=pa.decimal128(10, 2)))
+price.decimal_add(price).to_arrow()                # [39.98, 10.02]
+```
 The same C ABI (`include/arrowmetal.h`) serves Rust, Go, C#, R, C++ and C through their Arrow C Data
 Interface bindings. See [python/README.md](python/README.md).
 
@@ -172,51 +197,76 @@ let first = try reader.batch(at: 0)
 let stream = try ArrowIPCWriter.encode(batches, format: .stream)   // Data, for sockets or Flight
 ```
 
-Int8 to UInt64, Float32/64, Bool, Utf8, LargeUtf8 and Binary are read into their `MetalArray` types.
+Int8 to UInt64, Float32/64, Bool, Utf8, LargeUtf8 and Binary are read into their `MetalArray` types, and
+dictionary-encoded columns round trip through complete `DictionaryBatch` messages (`isDelta = false`).
 Temporal columns (`date32/64`, `time32/64`, `timestamp`, `duration`) are carried by their storage integer
-array while the logical type stays visible in `reader.schema`. Dictionary encoding, nested types,
-compressed bodies and big-endian data are rejected with a clear error.
+array while the logical type stays visible in `reader.schema`. Nested columns (list, struct, map, union),
+decimals, compressed bodies and big-endian data are rejected with a clear error — IPC is the one place
+those types do not go, and [docs/COVERAGE.md](docs/COVERAGE.md) says so on each row.
 
 ## What is implemented
 
-Function-by-function status against the Apache Arrow compute and type lists, including what runs on the CPU
-and what is not there at all: [docs/COVERAGE.md](docs/COVERAGE.md).
+**306 of Apache Arrow v25's 307 compute function names** — 231 entirely on the GPU, 20 on the host, 55
+with a stated limitation, 1 (`binary_slice`) not implemented. Every one of those names has a row in
+[docs/ARROW_FUNCTIONS.md](docs/ARROW_FUNCTIONS.md) naming the Swift file behind it, the ArrowMetal call
+that reaches it and what it does differently, and that table is generated from a registry the test suite
+*executes*: `python/tests/test_functions.py` calls every runnable row and compares the answer to
+`pyarrow.compute`. [docs/COVERAGE.md](docs/COVERAGE.md) is the same ground arranged by family, with the
+Arrow type matrix and the interop status.
 
 - `MetalArrowBuffer`: page-aligned shared-memory buffers, zero-copy wrap of foreign page-aligned memory.
-- `MetalArray<T>` for Int8/16/32/64, UInt8/16/32/64, Float32, Float64; `MetalBooleanArray` with packed bits.
-- `MetalRecordBatch`: named equal-length columns with `filter`, `take`, `slice`, `selecting`.
-- Kernels: `sum`, `min`, `max`, `mean`, `compare` (6 ops, scalar and array), `add/sub/mul/div` (scalar and
-  array, vectorised — integer division by zero is **defined as 0** here rather than raising, matching the
-  CPU oracle but not Arrow's `divide`), `filter` and fused `filter(where:)` (single command buffer, GPU
-  scan), `take` (Int32/Int64/UInt32 indices, bounds checked), `cast` (GPU across the ten primitives, but a
-  cast with Float64 on either side runs on the host), `slice` (zero-copy when 32-aligned), boolean
-  `and/or/not`. All null-aware with Arrow semantics. Boolean `count`/`any`/`all` are host popcounts over
-  the bitmap, not kernels.
-- Single-key `sort`/`argsort` (GPU LSD radix) and `topK` (GPU per-threadgroup selection for k ≤ 1024, a
-  full argsort above that). The stable partition that moves null rows to the end of a sorted index array
-  is a host pass.
-- `GroupBy` over dense integer keys, in two forms. Atomic tables (privatised in threadgroup memory up to
-  1024 keys, device atomics beyond; 64-bit sums via split 32-bit atomics with carry): `count`, `sum`,
-  `mean`, `min`, `max` — 32-bit-or-narrower values only for min/max, and integer values only for `sum`
-  and `mean`, because Metal's atomics are 32-bit. A sort-based segmented path with no atomics at all
-  (`segments()` once, then any number of aggregates): `sumDouble`, `meanDouble`, `sumFloatAsDouble`,
-  `meanFloat`, and `min64`/`max64` over Int64/UInt64/Float64.
-- `dictionaryEncode` for `utf8` on the GPU: hash, argsort, byte-comparing run boundaries, GPU rank scan
-  and gather; dense Int32 codes plus the dictionary in first-seen order, ready for `GroupBy`.
+- `MetalArray<T>` for Int8/16/32/64, UInt8/16/32/64, Float16/32/64; `MetalBooleanArray` with packed bits;
+  `MetalStringArray` (`utf8`, `binary`), `MetalDecimalArray` (decimal128/256), `MetalSmallDecimalArray`
+  (decimal32/64), `MetalTemporalArray` (`date32/64`, `time32/64`, `timestamp` with timezone, `duration`),
+  `MetalIntervalArray` (all three layouts), `MetalFixedBinaryArray`, `MetalListArray`, `MetalStructArray`,
+  `MetalMapArray`, `MetalUnionArray`, dictionary, run-end-encoded and extension arrays.
+- `MetalRecordBatch`: named equal-length columns with `filter`, `take`, `slice`, `selecting`, plus a GPU
+  hash join over int32/int64 keys (`Kernels/Join.swift`).
+- **Element-wise**: the six comparisons, wrapping and **checked** (overflow-raising) `add`/`subtract`/
+  `multiply`/`divide`/`power`/`negate`/`abs`/`sqrt`/the logarithms/the shifts, `bit_wise_*`, boolean
+  `and`/`or`/`not`/`xor`/`and_not` and the Kleene forms, all ten Arrow round modes with `ndigits`,
+  `min`/`max` element-wise, `is_nan`/`is_finite`/`is_inf`.
+- **Transcendentals**: the twelve trigonometric and hyperbolic functions, their seven `_checked` twins,
+  `atan2`, `expm1`, `log1p`, `logb`, `hypot` — float32 through Metal's library functions, float64 through
+  a software binary64 implementation on the GPU, within 5 ulp of the host libm either way.
+- **Aggregates**: `sum`, `min`, `max`, `mean`, `product`, `variance`, `stddev`, `quantile`, `median`,
+  `mode`, `count_distinct`, `first`/`last`, `index`, `min_max`, `skew`, `kurtosis`, `tdigest`.
+- **Grouped aggregates**: all 24 `hash_*` names over **arbitrary** key columns — integers sparse or
+  negative, floats, booleans, temporal values, `utf8`, `binary`, dictionary and decimal, several columns
+  folded together — mapped to dense ids on the GPU by `GroupByKeys`, with `GroupBy`'s dense-integer fast
+  path kept underneath.
+- **Selection and ordering**: `filter` (including a fused predicate form), `take`, `slice`, `drop_null`,
+  `scatter`, `inverse_permutation`, single- and multi-key `sort_indices` / `lexsort_indices`, `top_k` /
+  `select_k_unstable` (per-threadgroup selection for k ≤ 1024), `partition_nth_indices`, `rank`,
+  `dense_rank`, `row_number`, `rank_quantile`, `rank_normal`, `winsorize`.
+- **Strings**: length, equality, prefix/suffix/containment, `count_substring`, `find_substring`, murmur3
+  hash, `dictionary_encode`, the case and title transforms (ASCII and Unicode), padding and centring,
+  trimming (ASCII and the Unicode whitespace class), slicing, replace-slice, repeat, reverse, joining,
+  `is_in`/`index_in`, and the full `ascii_is_*` / `utf8_is_*` predicate set. The regex family, SQL `LIKE`,
+  splitting, Unicode normalisation and the float/boolean casts run on the host behind the same API, with
+  a GPU fast path for patterns that are really literals.
+- **Temporal**: every extractor (`year` … `nanosecond`, `iso_calendar`, `year_month_day`, `subsecond`,
+  `week` with all its options, `us_week`, `us_year`), `ceil`/`floor`/`round_temporal`, every `*_between`
+  difference including the three interval-valued ones, `add_interval`, `strftime`/`strptime`, and the
+  three timezone functions (`assume_timezone`, `local_timestamp`, `is_dst`) on the host, where the IANA
+  database lives.
+- **Structural and conditional**: `if_else`, `case_when`, `choose`, `coalesce`, `replace_with_mask`,
+  `fill_null`, `fill_null_forward`/`_backward`, `is_null`/`is_valid`/`true_unless_null`,
+  `indices_nonzero`, `make_struct`, `struct_field`, `list_value_length`/`list_flatten`/`list_element`/
+  `list_slice`/`list_parent_indices`, `map_lookup`, `pivot_wider`, `run_end_encode`/`run_end_decode`.
+- **Windows**: `pairwise_diff` (and its checked form), the cumulative family (`sum`, `prod`, `min`, `max`,
+  `mean`, and the checked sums and products), `shift`, and rolling `sum`/`mean`/`min`/`max`.
 - `libArrowMetalC`: a C ABI over everything above, and a ctypes Python package that speaks the Arrow
   PyCapsule protocol.
 - Float64 on the GPU even though Metal has no `double`: compare, min, max, filter, take and slice use an
-  order-preserving map of the IEEE bit pattern; sum, add, subtract, multiply, divide and the segmented
-  group-by sums and means use a software IEEE-754 binary64 implementation on 64-bit integers that is
-  correctly rounded (bit-exact against Swift's `Double` over millions of random and edge-case inputs,
-  subnormals and NaN included). `cast` is the exception: with Float64 on either side it runs on the host.
+  order-preserving map of the IEEE bit pattern; sum, add, subtract, multiply, divide, the segmented
+  group-by sums and means and the whole transcendental family use a software IEEE-754 binary64
+  implementation on 64-bit integers that is correctly rounded (bit-exact against Swift's `Double` over
+  millions of random and edge-case inputs, subnormals and NaN included). `exp`, `ln`, `log10`, `log2`,
+  `sqrt` and `power` are the exception: they evaluate in `float` and widen, about 1e-7 relative.
 - NaN: `min`/`max` skip NaN and return null if only NaN remains; `sum` propagates NaN; comparisons follow IEEE.
-- Temporal types (`date32/64`, `time32/64`, `timestamp` with timezone, `duration`): the integer kernels
-  forwarded unchanged, plus GPU `year/month/day/dayOfWeek/hour/minute/second` in UTC, `toDate32`, `castUnit`.
-- `binary` / `large_binary` (utf8's layout, exported as `z`) and dictionary-encoded arrays (int32 codes plus a
-  value array; filter/take/slice run on the codes, `decode()` materialises with `take`).
-- C Data Interface import/export for primitive arrays and struct (`+s`) record batches, C Stream Interface
-  import, C Device Data Interface import/export, `MTLBuffer` recovery from our own exports.
+- C Data Interface import/export for every type above and for struct (`+s`) record batches, C Stream
+  Interface import, C Device Data Interface import/export, `MTLBuffer` recovery from our own exports.
 - `ArrowIPCReader` / `ArrowIPCWriter`: the Arrow IPC streaming and file formats, including a minimal
   FlatBuffers reader and builder, with no dependencies. Cross-checked against pyarrow in both directions.
 - A CPU reference implementation of every kernel, used as the oracle in tests.

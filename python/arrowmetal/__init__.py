@@ -2054,12 +2054,13 @@ class GroupByKeys:
         return _call(_lib.am_group_by_ids, self._h)
 
     def _agg(self, name, values, p1=0.0):
-        if values is None:
-            handle = None
-        else:
-            handle = (values if isinstance(values, MetalArray) else MetalArray.from_arrow(values))._h
+        # Bind the lifted column to a local: a temporary MetalArray would be released — and its
+        # device handle freed — before `am_group_agg_ex` ever read it.
+        column = None if values is None else (values if isinstance(values, MetalArray)
+                                              else MetalArray.from_arrow(values))
         out = _P()
-        _check(_lib.am_group_agg_ex(self._h, handle, _GROUP_AGG[name], float(p1), ctypes.byref(out)))
+        _check(_lib.am_group_agg_ex(self._h, None if column is None else column._h,
+                                    _GROUP_AGG[name], float(p1), ctypes.byref(out)))
         return MetalArray(out)
 
     def sum(self, values): return self._agg("sum", values)
