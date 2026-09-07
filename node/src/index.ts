@@ -345,11 +345,14 @@ export class MetalArray {
     const A = arrow();
     const e = native.exportArray(this.handle);
     const type = formatToType(e.format);
-    const total = e.offset + e.length;
 
+    // The C Data Interface applies one offset to every buffer; Arrow JS applies Data.offset to the
+    // validity bitmap and to a Bool data buffer only, and expects the numeric data buffer and the
+    // utf8 offsets buffer to be advanced already. So we advance those two here. Still no copy: a
+    // typed-array view over the same external ArrayBuffer, at a different byteOffset.
     const nullBitmap = e.validity === null ? undefined : new Uint8Array(e.validity);
     if (e.format === 'u') {
-      const valueOffsets = new Int32Array(e.offsets!, 0, total + 1);
+      const valueOffsets = new Int32Array(e.offsets!, e.offset * 4, e.length + 1);
       const values = e.data === null ? new Uint8Array(0) : new Uint8Array(e.data);
       return new A.Vector([
         A.makeData({
@@ -376,7 +379,8 @@ export class MetalArray {
       ]);
     }
     const Ctor = TYPED_ARRAY[e.format as Format]!;
-    const values = e.data === null ? new Ctor(0) : new Ctor(e.data, 0, total);
+    const width = FIXED_WIDTH[e.format as Format]!;
+    const values = e.data === null ? new Ctor(0) : new Ctor(e.data, e.offset * width, e.length);
     return new A.Vector([
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       A.makeData({ type, length: e.length, offset: e.offset, nullCount: e.nullCount, nullBitmap, data: values } as any),

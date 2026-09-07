@@ -24,7 +24,7 @@
     "build:native": "node-gyp rebuild",
     "build:ts": "tsc -p tsconfig.json",
     "build": "npm run build:native && npm run build:ts",
-    "test": "npm run build && node --test test/",
+    "test": "npm run build && node --test 'test/*.test.js'",
     "bench": "node bench/bench.mjs"
   },
   "dependencies": {
