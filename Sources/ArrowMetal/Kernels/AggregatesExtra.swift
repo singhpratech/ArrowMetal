@@ -322,6 +322,21 @@ extension GroupBy {
         }
     }
 
+    /// `mean` over any integer element type without the caller naming it, for the type-erased C layer.
+    public func meanErasedInteger<T: ArrowPrimitive>(_ values: MetalArray<T>) throws -> MetalArray<Double> {
+        switch values {
+        case let x as MetalArray<Int8>: return try meanInteger(x)
+        case let x as MetalArray<UInt8>: return try meanInteger(x)
+        case let x as MetalArray<Int16>: return try meanInteger(x)
+        case let x as MetalArray<UInt16>: return try meanInteger(x)
+        case let x as MetalArray<Int32>: return try meanInteger(x)
+        case let x as MetalArray<UInt32>: return try meanInteger(x)
+        case let x as MetalArray<Int64>: return try meanInteger(x)
+        case let x as MetalArray<UInt64>: return try meanInteger(x)
+        default: throw ArrowMetalError.unsupportedType("integer group-by mean over \(T.arrowFormat)")
+        }
+    }
+
     /// `hash_product` over any integer element type, for the type-erased C layer.
     public func productIntErased<T: ArrowPrimitive>(_ values: MetalArray<T>) throws -> MetalArray<Int64> {
         switch values {

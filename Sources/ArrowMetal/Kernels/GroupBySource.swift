@@ -10,6 +10,37 @@ import Foundation
 enum GroupBySource {
     static let maxPrivateKeys = 1024
 
+    /// The per-group division of `hash_mean` over an integer column, from the sums and counts the
+    /// accumulation kernel already produced. One thread per group; `d_div` is correctly rounded, so this
+    /// is the quotient the host loop it replaces computed.
+    static let meanSource: String = KernelSource.prelude + DoubleMath.msl + GroupMomentsSource.intToDouble + """
+
+    // A key is null in a sum exactly when it counted no valid value. Building the bitmap here lets the
+    // accumulator's own 64-bit output buffer be the result column, with no host loop and no copy.
+    kernel void gb_valid_from_counts(device const ulong* counts [[buffer(0)]],
+                                     constant uint& K [[buffer(1)]],
+                                     device uchar* valid [[buffer(2)]],
+                                     uint k [[thread_position_in_grid]]) {
+        if (k >= K) return;
+        valid[k] = counts[k] != 0ul ? 1 : 0;
+    }
+
+    kernel void gb_mean(device const ulong* sums [[buffer(0)]],
+                        device const ulong* counts [[buffer(1)]],
+                        constant uint& K [[buffer(2)]],
+                        constant uint& unsignedSum [[buffer(3)]],
+                        device ulong* out [[buffer(4)]],
+                        device uchar* valid [[buffer(5)]],
+                        uint k [[thread_position_in_grid]]) {
+        if (k >= K) return;
+        ulong c = counts[k];
+        if (c == 0ul) { out[k] = 0ul; valid[k] = 0; return; }
+        ulong s = (unsignedSum != 0u) ? d_from_ulong(sums[k]) : d_from_long((long)sums[k]);
+        out[k] = d_div(s, d_from_ulong(c));
+        valid[k] = 1;
+    }
+    """
+
     /// `T` value MSL type, `KT` key type ("int" or "long"), `kind` one of sum_int, sum_uint, sum_float, count, min_int, max_int, min_uint, max_uint, min_float, max_float
     static func source(T: String, KT: String) -> String {
         var s = KernelSource.prelude + """

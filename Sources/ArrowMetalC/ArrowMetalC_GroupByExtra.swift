@@ -195,22 +195,7 @@ extension MetalArray: GroupedValueOps {
     private func meaned<K: ArrowIndex>(_ gb: GroupBy<K>) throws -> MetalArray<Double> {
         if let f = self as? MetalArray<Float> { return try gb.meanFloat(f) }
         if let d = self as? MetalArray<Double> { return try gb.meanDouble(d) }
-        let sums = try sumInteger(gb)
-        let counts = try gb.count(self)
-        let out = try MetalArray<Double>.allocate(length: gb.keyCount, withValidity: true, context: context)
-        let unsigned = T.minValue >= 0 as T
-        withExtendedLifetime((sums, counts, out)) {
-            let d = out.mutableValuePointer, bm = out.validity!.mutableTyped(UInt8.self)
-            let sp = sums.valuePointer, cp = counts.valuePointer
-            let sv = sums.validity?.typed(UInt8.self)
-            for k in 0..<gb.keyCount where cp[k] > 0 && (sv == nil || Bitmap.isSet(sv!, k)) {
-                let total = unsigned ? Double(UInt64(bitPattern: sp[k])) : Double(sp[k])
-                d[k] = total / Double(cp[k])
-                Bitmap.set(bm, k)
-            }
-        }
-        out.recomputeNullCount()
-        return out
+        return try gb.meanErasedInteger(self)
     }
 
     private func producted<K: ArrowIndex>(_ gb: GroupBy<K>) throws -> AnyMetalArray {

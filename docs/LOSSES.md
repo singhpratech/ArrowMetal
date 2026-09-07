@@ -61,6 +61,41 @@ arithmetic and a float32 accumulator is wrong past a few million rows. The answe
 Arrow; the price is 3–4 GPU instructions per FLOP. At 10M rows the same rows tie pyarrow (1.00x,
 1.02x); against Polars they win by 2.4x; at 100,000 and 10M groups they win by 2.1–4x.
 
+**These two rows are the ones the small-group work below did not fix, and the reason is not the
+arithmetic.** The key-mapping change took 3.8 ms off them (33.5 → 29.7 ms at 50M rows against
+pyarrow's 19.0 in the same script, 0.64x); what is left is the *shape* the software binary64 forces.
+Measured, at 50 million rows and a thousand groups:
+
+| step | cost | the same step with the keys already sorted |
+|---|---:|---:|
+| the counting sort by group id | 10.8 ms | 4.7 ms |
+| the two moment passes over it | 15.3 ms | 7.0 ms |
+| one segmented float64 sum (for scale) | 7.4 ms | 1.7 ms |
+
+Both moment passes read their values through `ord`, the counting sort's permutation, and consecutive
+positions inside a group are about `K` rows apart, so each read pulls a cache line to use eight bytes
+of it. Sorting the key column first makes that permutation nearly the identity and halves the whole
+operation — which is a diagnosis, not a fix, since the input is not sorted.
+
+The obvious fix, and the one this work set out to make, is to drop the sort: privatise the
+accumulators per threadgroup, as `sum` and `count` do. It cannot be done here. A threadgroup-private
+accumulator needs an atomic add, and Metal has 32-bit atomics only, so a binary64 accumulator can only
+be updated by a thread that owns it exclusively — which means one private table per *lane*, not per
+threadgroup. At a thousand groups that is 8 KB a lane, and 32 KB of threadgroup memory holds four of
+them. Every arrangement that fits — one lane owning `g % 32`, or the values shuffled to their owner —
+puts one lane's `d_add` under a mask while the other 31 wait, and pays 32 times the arithmetic. The
+counting sort exists precisely because there are no 64-bit atomics.
+
+What is left is the group count itself. The moment kernels give a whole threadgroup to one group, so a
+thousand groups is a thousand threadgroups, and only a fraction of them are resident at once: the
+resident ones read rows scattered through the column instead of sweeping it. Measured at 50M rows, the
+two moment passes cost 49.1 ms at 10 groups (too few threadgroups to fill the machine), 9.7 ms at 100,
+15.4 ms at 1,000 and 16.1 ms at 4,000 — the wall is between 100 and 1,000 groups, exactly where these
+rows sit. A simdgroup per group instead of a threadgroup would keep every group resident and preserve
+the accumulation order (each lane emulating eight of the 256 logical slots), and the K = 100 figure
+says that is worth about 6 ms of the 15.4. It is not done here, and it would leave the sort's 10.8 ms
+untouched, so the honest ceiling for these two rows on this hardware is around 1.5x pyarrow, not 3x.
+
 ### 4. Grouped min at 1000 groups, 10M rows (1 row)
 
 | operation | rows | ArrowMetal | pyarrow | ratio |
@@ -70,8 +105,11 @@ Arrow; the price is 3–4 GPU instructions per FLOP. At 10M rows the same rows t
 The morning run had this row at 4.64 ms (1.09x), the 50M row of the same operation did not move
 (9.86 ms, 2.06x over pyarrow), and the grouped min/max kernels were not touched between the runs. The
 targeted re-measurement at the end of the page put it back at 4.17 ms (1.22x): the matrix value is
-noise on a 5 ms call. The row stays in this table because the matrix is the record; the operation is
-in the "under 3x" cluster on its merits, with the other grouped aggregates at 1000 groups.
+noise on a 5 ms call. The row stays in this table because the matrix is the record.
+
+Since then the key-mapping change below has taken the operation to **1.66 ms** against pyarrow's 4.62
+in the same script (2.8x), and 5.71 ms against 18.5 at 50M rows (3.2x). The next matrix run should
+remove this row.
 
 ### 5. Regex on the host (1 row)
 
@@ -101,6 +139,13 @@ The full list is in the matrix page under ⚠️. The clusters:
   utf8 key at 1.3–2.2x, two int32 keys at 1.11x (10M rows; 3.8x at 50M), and variance/stddev at
   1.0–2.4x. pyarrow's grouped kernels are memory-bound and 16-thread; the GPU's advantage grows with
   the number of groups (100,000 groups: 3.5–5.5x; 10M groups: 2.9–25x) and with wider values.
+  **Most of this cluster is fixed** (see the last section): the mapping from key values to dense group
+  ids was 6.8 ms of the 8.8 ms `sum` at 50M rows and a thousand groups, because it widened the key
+  column to int64 before it read it twice. Re-measured against pyarrow in the same script, sum/count/
+  mean by int32 key are now 3.1–3.9x at 50M rows and min/max 3.2–3.3x, where they were 1.7–2.0x. Two
+  rows in the cluster do not move and are not touched by that change: `sum by utf8 key` (2.3x at 50M,
+  1.9x at 10M), whose cost is the string hash table in front of the aggregate rather than the group-by,
+  and variance/stddev, which cause 3 above now explains in full.
 - **Memory-bound element-wise kernels against Polars and numpy** — compare, `is_nan`, `abs`,
   `bit_wise_and`, `if_else`, `negate`, `shift_left`, `replace_with_mask`, `drop_null` at 1.1–2.98x.
   Both sides run at unified-memory bandwidth; the GPU's edge is the dispatch overhead it does not pay
@@ -330,3 +375,101 @@ stores; a slice that leaves the offsets pointer misaligned keeps the one-row ker
 | operation | rows | before | after | Polars | pyarrow |
 |---|---:|---:|---:|---:|---:|
 | list_value_length | 10,000,000 | 1.05 ms | **0.35 ms** | 5.19 ms | 0.68 ms |
+
+## The work after the afternoon run: grouped aggregates at a small group count
+
+Measured with `Benchmarks/loss_groupby_small.py`, which is the group-by family of `full_matrix.py`
+alone — its seed, its distributions, its rule (one warm-up, best of five under a 1.2 s budget). The
+two builds ran alternately, one process at a time, two rounds each, on an idle machine; the pool is
+warmed with a sort, a sum and a group-by after every column exists, because warming it before the
+columns are built leaves the first timed row reading twice its settled value. pyarrow was measured in
+the same script and is a little faster there than in the matrix (different draw order, same
+distributions), so the ratios below are the conservative ones.
+
+**Where the time actually went.** At 50 million rows and a thousand groups, `sum by int32 key` was
+8.8 ms, of which the aggregation kernel was 1.9. The other 6.9 ms was the stage in front of it: the
+map from key values to dense ids `0 ..< K`. That stage took the range path — mark which values occur,
+scan the marks, read each row's rank — but it first **widened the key column to int64**, because its
+two kernels were written for `long` only. At 50M int32 keys that is a 400 MB write nothing else needs,
+followed by two passes reading 400 MB where 200 would do: 1.2 GB of the 1.8 GB the mapping moved. The
+kernels are now generated per key element type, the conversion happens in a register, and the rank
+kernel reads the distinct count out of the scan's own last entry so the three dispatches share one
+command buffer instead of needing the host in between. The ids are unchanged, value for value.
+
+| key mapping alone | rows | groups | before | after |
+|---|---:|---:|---:|---:|
+| `am.group_by([int32])` | 10,000,000 | 1,000 | 2.11 ms | **0.91 ms** |
+| | 10,000,000 | 100,000 | 1.98 ms | **0.98 ms** |
+| | 10,000,000 | 10,000,000 | 3.51 ms | **3.20 ms** |
+| | 50,000,000 | 1,000 | 6.82 ms | **3.03 ms** |
+| | 50,000,000 | 100,000 | 9.19 ms | **4.58 ms** |
+| | 50,000,000 | 10,000,000 | 9.98 ms | **9.16 ms** |
+
+Two host loops went with it. `hash_mean` over an integer column ran the whole column twice — once for
+the sum, once for a count the sum kernel had already produced as the thing that decides which keys are
+null — and then divided group by group on the CPU; `hash_sum` copied its own output buffer into a
+fresh column in a second loop. Neither matters at a thousand groups and they were 19 ms of a 68 ms
+mean and 10 ms of a 43 ms sum at ten million. The mean now reuses the counts and divides on the GPU,
+and the sum hands back the accumulator's buffer with a GPU-built bitmap. `d_from_long` /
+`d_from_ulong` round exactly as `Double(Int64)` / `Double(UInt64)` do and `d_div` is correctly
+rounded, so the quotient is bit for bit the host division's — checked over 1,762,240 group means
+across all eight integer element types, 0% and 10% value nulls, five row counts and five group counts,
+with zero differing bit patterns. Putting the accumulation and those finalizing kernels in one command
+buffer rather than three matters too: a command buffer is 100–150 µs whatever it carries, which is
+nothing next to a 50-million-row pass and most of a group-by over a million rows.
+
+| operation, 1,000 groups | rows | before | after | pyarrow | before | after |
+|---|---:|---:|---:|---:|---:|---:|
+| sum by int32 key | 50,000,000 | 8.75 ms | **4.81 ms** | 16.45 ms | 1.88x | **3.42x** |
+| count by int32 key | 50,000,000 | 7.88 ms | **4.05 ms** | 15.58 ms | 1.98x | **3.85x** |
+| mean by int32 key | 50,000,000 | 9.78 ms | **4.80 ms** | 16.55 ms | 1.69x | **3.45x** |
+| min by int32 key | 50,000,000 | 9.80 ms | **5.71 ms** | 18.48 ms | 1.89x | **3.24x** |
+| max by int32 key | 50,000,000 | 9.67 ms | **5.74 ms** | 18.97 ms | 1.96x | **3.30x** |
+| min by key, float64 | 50,000,000 | 9.70 ms | **5.79 ms** | 18.84 ms | 1.94x | **3.25x** |
+| max by key, float64 | 50,000,000 | 9.62 ms | **5.74 ms** | 18.71 ms | 1.94x | **3.26x** |
+| variance by key | 50,000,000 | 33.52 ms | **29.68 ms** | 18.99 ms | 0.57x | 0.64x |
+| stddev by key | 50,000,000 | 33.32 ms | **29.79 ms** | 19.05 ms | 0.57x | 0.64x |
+| sum by utf8 key | 50,000,000 | 18.18 ms | 18.11 ms | 42.14 ms | 2.32x | 2.33x |
+| sum by two int32 keys | 50,000,000 | 5.85 ms | 5.88 ms | 21.21 ms | 3.62x | 3.61x |
+| sum by int32 key | 10,000,000 | 2.78 ms | **1.82 ms** | 4.07 ms | 1.46x | **2.24x** |
+| count by int32 key | 10,000,000 | 2.55 ms | **1.65 ms** | 3.89 ms | 1.53x | **2.35x** |
+| mean by int32 key | 10,000,000 | 3.30 ms | **1.77 ms** | 4.20 ms | 1.27x | **2.37x** |
+| min by int32 key | 10,000,000 | 2.55 ms | **1.66 ms** | 4.62 ms | 1.81x | **2.79x** |
+| max by int32 key | 10,000,000 | 2.57 ms | **1.70 ms** | 4.81 ms | 1.87x | **2.82x** |
+| variance by key | 10,000,000 | 6.35 ms | **5.66 ms** | 5.31 ms | 0.84x | 0.94x |
+
+At 10 million rows the operations are 1.7–1.8 ms and about a fifth of that is the dispatch floor, so
+they sit at 2.2–2.8x rather than 3x for the reason cause 1 gives.
+
+The higher group counts move the same way and nothing there gets slower:
+
+| operation | rows | groups | before | after | pyarrow | after |
+|---|---:|---:|---:|---:|---:|---:|
+| sum by int32 key | 50,000,000 | 100,000 | 11.24 ms | **7.70 ms** | 48.28 ms | **6.3x** |
+| count by int32 key | 50,000,000 | 100,000 | 8.46 ms | **4.96 ms** | 36.24 ms | **7.3x** |
+| mean by int32 key | 50,000,000 | 100,000 | 12.95 ms | **7.70 ms** | 47.41 ms | **6.2x** |
+| min by int32 key | 50,000,000 | 100,000 | 13.47 ms | **9.98 ms** | 52.12 ms | **5.2x** |
+| variance by key | 50,000,000 | 100,000 | 40.08 ms | **36.75 ms** | 136.47 ms | **3.7x** |
+| sum by int32 key | 10,000,000 | 10,000,000 | 13.78 ms | **10.07 ms** | 332.53 ms | **33x** |
+| mean by int32 key | 10,000,000 | 10,000,000 | 28.66 ms | **11.38 ms** | 324.81 ms | **29x** |
+| mean by int32 key | 50,000,000 | 10,000,000 | 83.72 ms | **55.85 ms** | 1,319.80 ms | **24x** |
+| sum by int32 key | 50,000,000 | 10,000,000 | 54.84 ms | **53.31 ms** | 1,321.68 ms | **25x** |
+
+**The shape sweep.** Timings on the rows a benchmark happens to contain say nothing about the shapes
+it does not, so `loss_groupby_small.py --sweep` walks one axis at a time away from a base shape — row
+count 1M / 3M / 10M / 27M / 50M, group count 1 / 2 / 10 / 100 / 1,000 / 1,025 / 5,000 / 20,000 /
+100,000 / 1M / 10M, keys uniform / 90%-in-one-group / sorted, keys with 10% nulls, values int64 and
+float64, values with 10% nulls, and a slice at offset 33 — over sum, count, mean, min, max and
+variance. 220 measurements, both builds, two rounds each. **218 are faster after the change and none
+is slower than main's own spread**: the two that read below 1.0x are `min` and `max` at 3M rows and
+1,000 groups, where main measured 1.42 and 2.49 ms across its two rounds and the new build 1.57 and
+1.62 — the new build's worst is below main's worst, and the comparison picked main's lucky round.
+`--digest` hashes every answer instead of timing it: all 220 are **bit-identical** between the two
+builds.
+
+Two shapes in that sweep are slow on both builds and are worth recording as the next thing to look at,
+because they are the same wall cause 3 describes: a grouped `sum` or `mean` over a **float64** column
+with very few groups runs the segmented path, which gives a whole threadgroup to one group, so 10
+million rows in one group is 35 ms and 90% of the rows in one group is 31 ms, against 4.6 ms for the
+same column spread over a thousand groups. Integer values do not have this shape — they take the
+atomic path — and neither does `min`, `max` or `count`.

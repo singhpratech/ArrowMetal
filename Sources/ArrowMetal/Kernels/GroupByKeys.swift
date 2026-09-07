@@ -274,51 +274,65 @@ public final class GroupByKeys {
     }
 
     /// Dense ids for an int64 column whose values are known to lie in `[lo, lo + span)`.
+    static func rangeEncode(_ a: MetalArray<Int64>, lo: Int64, span: Int, _ ctx: MetalContext)
+        throws -> (MetalArray<Int32>, Int) {
+        try rangeEncodeTyped(a, lo: lo, span: span, ctx)
+    }
+
+    /// Dense ids for an integer column of **any** width whose values lie in `[lo, lo + span)`.
     ///
     /// Marks the occupied values, scans the marks, and reads each row's rank out of the scan. Returns
     /// the ids and their cardinality; null rows take the dedicated last id.
-    static func rangeEncode(_ a: MetalArray<Int64>, lo: Int64, span: Int, _ ctx: MetalContext)
-        throws -> (MetalArray<Int32>, Int) {
+    ///
+    /// The column is read as the type it is. Widening an int32 key column to int64 first — which this
+    /// used to do — wrote 400 MB and then made both remaining passes read 400 MB instead of 200 at 50
+    /// million rows, for a conversion the kernel does in a register. All three dispatches go into one
+    /// command buffer: the rank kernel reads the distinct count out of the scan's last entry, so the
+    /// host does not have to see it in between.
+    static func rangeEncodeTyped<T: ArrowPrimitive>(_ a: MetalArray<T>, lo: Int64, span: Int,
+                                                    _ ctx: MetalContext) throws -> (MetalArray<Int32>, Int) {
         let n = a.length
         let occBuf = try MetalArrowBuffer.allocate(byteCount: span * 4, context: ctx)
         let vv = a.validity ?? a.values
-        let occupy = try ctx.pipeline(source: GroupByKeysSource.source, function: "gk_occupy",
-                                      cacheKey: "groupbykeys/gk_occupy")
-        try ctx.run { enc in
-            enc.setComputePipelineState(occupy)
-            enc.setBuffer(a.values.mtl, offset: a.values.offset, index: 0)
-            enc.setBuffer(vv.mtl, offset: vv.offset, index: 1)
-            Dispatch.setUInt(enc, a.validity == nil ? 0 : 1, index: 2)
-            Dispatch.setScalar(enc, lo, index: 3)
-            Dispatch.setLength(enc, n, nil, index: 4)
-            enc.setBuffer(occBuf.mtl, offset: 0, index: 5)
-            Dispatch.dispatch1D(enc, occupy, count: n)
-        }
-        ctx.retainUntilFlush(a)
-        let occ = MetalArray<Int32>(length: span, nullCount: 0, validity: nil, values: occBuf, context: ctx)
-        let cum = try occ.cumulativeSum()
-        try ctx.syncPoint()
-        let distinct = withExtendedLifetime(cum) { Int(cum.valuePointer[span - 1]) }
-        let cardinality = distinct + (a.nullCount > 0 ? 1 : 0)
+        let src = GroupByKeysSource.rangeSource(T: T.mslType)
+        let occupy = try Dispatch.pipeline(ctx, family: "groupbykeys", source: src,
+                                           function: "gk_occupy", type: T.mslType)
         let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(n, 1) * 4, zeroed: false, context: ctx)
-        if n > 0 {
-            let rank = try ctx.pipeline(source: GroupByKeysSource.source, function: "gk_rank",
-                                        cacheKey: "groupbykeys/gk_rank")
+        var cum: MetalArray<Int32>! = nil
+        try ctx.batch {
+            try ctx.run { enc in
+                enc.setComputePipelineState(occupy)
+                enc.setBuffer(a.values.mtl, offset: a.values.offset, index: 0)
+                enc.setBuffer(vv.mtl, offset: vv.offset, index: 1)
+                Dispatch.setUInt(enc, a.validity == nil ? 0 : 1, index: 2)
+                Dispatch.setScalar(enc, lo, index: 3)
+                Dispatch.setLength(enc, n, nil, index: 4)
+                enc.setBuffer(occBuf.mtl, offset: 0, index: 5)
+                Dispatch.dispatch1D(enc, occupy, count: n)
+            }
+            ctx.retainUntilFlush(a)
+            let occ = MetalArray<Int32>(length: span, nullCount: 0, validity: nil, values: occBuf, context: ctx)
+            cum = try occ.cumulativeSum()
+            guard n > 0 else { return }
+            let rank = try Dispatch.pipeline(ctx, family: "groupbykeys", source: src,
+                                             function: "gk_rank", type: T.mslType)
             try ctx.run { enc in
                 enc.setComputePipelineState(rank)
                 enc.setBuffer(a.values.mtl, offset: a.values.offset, index: 0)
                 enc.setBuffer(vv.mtl, offset: vv.offset, index: 1)
                 Dispatch.setUInt(enc, a.validity == nil ? 0 : 1, index: 2)
                 Dispatch.setScalar(enc, lo, index: 3)
-                Dispatch.setUInt(enc, distinct, index: 4)
+                Dispatch.setUInt(enc, span, index: 4)
                 enc.setBuffer(cum.values.mtl, offset: cum.values.offset, index: 5)
                 Dispatch.setLength(enc, n, nil, index: 6)
                 enc.setBuffer(out.mtl, offset: out.offset, index: 7)
-                Dispatch.dispatch1D(enc, rank, count: n)
+                Dispatch.dispatch1D(enc, rank, count: (n + 3) / 4)
             }
             ctx.retainUntilFlush(a); ctx.retainUntilFlush(cum)
-            try ctx.syncPoint()
         }
+        try ctx.syncPoint()          // a batch opened by the caller still has to reach the GPU
+        let distinct = withExtendedLifetime(cum) { Int(cum.valuePointer[span - 1]) }
+        let cardinality = distinct + (a.nullCount > 0 ? 1 : 0)
         return (MetalArray<Int32>(length: n, nullCount: 0, validity: nil, values: out, context: ctx), cardinality)
     }
 
@@ -338,22 +352,17 @@ public final class GroupByKeys {
         guard let (lo, hi) = try integerRange(integers) else { return nil }
         let span = hi &- lo
         guard span >= 0, span < Int64(Int.max) - 1, rangeIsWorthIt(span: Int(span) + 1, rows: n) else { return nil }
-        let as64 = try castToInt64(integers)
-        return try rangeEncode(as64, lo: lo, span: Int(span) + 1, ctx)
-    }
-
-    /// An integer column as int64, without a copy when it already is one.
-    private static func castToInt64(_ column: AnyMetalArray) throws -> MetalArray<Int64> {
-        switch column {
-        case .int8(let a): return try a.cast(to: Int64.self)
-        case .uint8(let a): return try a.cast(to: Int64.self)
-        case .int16(let a): return try a.cast(to: Int64.self)
-        case .uint16(let a): return try a.cast(to: Int64.self)
-        case .int32(let a): return try a.cast(to: Int64.self)
-        case .uint32(let a): return try a.cast(to: Int64.self)
-        case .int64(let a): return a
-        case .uint64(let a): return try a.cast(to: Int64.self)
-        default: throw ArrowMetalError.unsupportedType("not an integer column: \(column.arrowFormat)")
+        let width = Int(span) + 1
+        switch integers {
+        case .int8(let a): return try rangeEncodeTyped(a, lo: lo, span: width, ctx)
+        case .uint8(let a): return try rangeEncodeTyped(a, lo: lo, span: width, ctx)
+        case .int16(let a): return try rangeEncodeTyped(a, lo: lo, span: width, ctx)
+        case .uint16(let a): return try rangeEncodeTyped(a, lo: lo, span: width, ctx)
+        case .int32(let a): return try rangeEncodeTyped(a, lo: lo, span: width, ctx)
+        case .uint32(let a): return try rangeEncodeTyped(a, lo: lo, span: width, ctx)
+        case .int64(let a): return try rangeEncodeTyped(a, lo: lo, span: width, ctx)
+        case .uint64(let a): return try rangeEncodeTyped(a, lo: lo, span: width, ctx)
+        default: return nil
         }
     }
 

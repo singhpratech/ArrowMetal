@@ -31,8 +31,16 @@ public struct GroupBy<K: ArrowIndex> {
     /// Keys with no valid value are null.
     public func sum<T: ArrowPrimitive>(_ values: MetalArray<T>) throws -> MetalArray<Int64> where T: FixedWidthInteger {
         try check(values)
-        let (out, counts) = try run(values: values, kind: T.minValue < 0 ? 0 : 1)
-        return finish(Int64.self, out: out, counts: counts, ctx: values.context)
+        let ctx = values.context
+        var out: MetalArrowBuffer! = nil, bm: MetalArrowBuffer! = nil
+        try ctx.batch {
+            let (o, counts) = try run(values: values, kind: T.minValue < 0 ? 0 : 1, sync: false)
+            out = o
+            bm = try validityFromCounts(counts, ctx: ctx, sync: false)
+        }
+        let res = MetalArray<Int64>(length: keyCount, nullCount: 0, validity: bm, values: out, context: ctx)
+        res.recomputeNullCount()
+        return res
     }
 
     /// Sum of unsigned 64-bit values per key, kept unsigned (Arrow's hash_sum over uint64 is uint64).
@@ -64,21 +72,47 @@ public struct GroupBy<K: ArrowIndex> {
 
     /// Mean of non-null values per key.
     public func mean<T: ArrowPrimitive>(_ values: MetalArray<T>) throws -> MetalArray<Double> where T: FixedWidthInteger {
-        let s = try sum(values), c = try count(values)
-        let res = try MetalArray<Double>.allocate(length: keyCount, withValidity: true, context: values.context)
+        try meanInteger(values)
+    }
+
+    /// Arrow `hash_mean` over an integer column: **one** pass over the rows, and the division on the GPU.
+    ///
+    /// The accumulation kernel already counts the rows it adds — that is what decides whether a key is
+    /// null — so the second full pass this used to run for `count` was reading the whole column again to
+    /// learn a number it had just been handed. The per-group division was a host loop, which is fine at a
+    /// thousand groups and is 19 ms of the 68 at ten million.
+    ///
+    /// The answer does not move: `d_from_long` / `d_from_ulong` round the sum and the count to binary64
+    /// exactly as `Double(Int64)` and `Double(UInt64)` do, and `d_div` is correctly rounded, so the
+    /// quotient is the one the host division produced.
+    public func meanInteger<T: ArrowPrimitive>(_ values: MetalArray<T>) throws -> MetalArray<Double> where T: FixedWidthInteger {
+        try check(values)
         let unsigned = T.minValue >= 0
-        withExtendedLifetime((s, c, res)) {
-            // Hoisted out of the loop: `valuePointer` re-resolves the buffer on every access, which at a
-            // group count in the millions costs more than the division.
-            let sp = s.valuePointer, cp = c.valuePointer
-            let d = res.mutableValuePointer, v = res.validity!.mutableTyped(UInt8.self)
-            for k in 0..<keyCount where cp[k] > 0 {
-                let total = unsigned ? Double(UInt64(bitPattern: sp[k])) : Double(sp[k])
-                d[k] = total / Double(cp[k]); Bitmap.set(v, k)
+        let ctx = values.context
+        let kc = keyCount
+        let res = try MetalArrowBuffer.allocate(byteCount: Swift.max(kc, 1) * 8, zeroed: false, context: ctx)
+        let validBytes = try MetalArrowBuffer.allocate(byteCount: Swift.max(kc, 1), context: ctx)
+        var bm: MetalArrowBuffer! = nil
+        try ctx.batch {
+            let (out, counts) = try run(values: values, kind: unsigned ? 1 : 0, sync: false)
+            let pso = try Dispatch.pipeline(ctx, family: "groupby", source: GroupBySource.meanSource,
+                                            function: "gb_mean", type: "mean")
+            try ctx.run { enc in
+                enc.setComputePipelineState(pso)
+                enc.setBuffer(out.mtl, offset: 0, index: 0)
+                enc.setBuffer(counts.mtl, offset: 0, index: 1)
+                Dispatch.setUInt(enc, kc, index: 2)
+                Dispatch.setUInt(enc, unsigned ? 1 : 0, index: 3)
+                enc.setBuffer(res.mtl, offset: 0, index: 4)
+                enc.setBuffer(validBytes.mtl, offset: 0, index: 5)
+                Dispatch.dispatch1D(enc, pso, count: kc)
             }
+            ctx.retainUntilFlush(res); ctx.retainUntilFlush(validBytes)
+            bm = try BitmapOps.packBits(ctx, bytes: validBytes, bits: kc)
         }
-        res.recomputeNullCount()
-        return res
+        let a = MetalArray<Double>(length: kc, nullCount: 0, validity: bm, values: res, context: ctx)
+        a.recomputeNullCount()
+        return a
     }
 
     /// Number of non-null values per key.
@@ -124,19 +158,38 @@ public struct GroupBy<K: ArrowIndex> {
         guard values.length == keys.length else { throw ArrowMetalError.lengthMismatch(keys.length, values.length) }
     }
 
-    private func finish(_: Int64.Type, out: MetalArrowBuffer, counts: MetalArrowBuffer, ctx: MetalContext) -> MetalArray<Int64> {
-        let res = try! MetalArray<Int64>.allocate(length: keyCount, withValidity: true, context: ctx)
-        withExtendedLifetime((out, counts)) {
-            let o = out.typed(Int64.self), c = counts.typed(UInt64.self)
-            let d = res.mutableValuePointer, v = res.validity!.mutableTyped(UInt8.self)
-            for k in 0..<keyCount where c[k] > 0 { d[k] = o[k]; Bitmap.set(v, k) }
+    /// The validity bitmap of an aggregate that is null exactly where its key counted no valid value.
+    ///
+    /// The accumulator's 64-bit output buffer *is* the sum column, so this bitmap is all a `sum` has left
+    /// to build. Both used to be settled by a host loop over the keys, which is nothing at a thousand
+    /// groups and 10 ms of a 43 ms `sum` at ten million.
+    func validityFromCounts(_ counts: MetalArrowBuffer, ctx: MetalContext,
+                            sync: Bool = true) throws -> MetalArrowBuffer {
+        let kc = keyCount
+        let validBytes = try MetalArrowBuffer.allocate(byteCount: Swift.max(kc, 1), context: ctx)
+        let pso = try Dispatch.pipeline(ctx, family: "groupby", source: GroupBySource.meanSource,
+                                        function: "gb_valid_from_counts", type: "mean")
+        try ctx.run { enc in
+            enc.setComputePipelineState(pso)
+            enc.setBuffer(counts.mtl, offset: 0, index: 0)
+            Dispatch.setUInt(enc, kc, index: 1)
+            enc.setBuffer(validBytes.mtl, offset: 0, index: 2)
+            Dispatch.dispatch1D(enc, pso, count: kc)
         }
-        res.recomputeNullCount()
-        return res
+        ctx.retainUntilFlush(validBytes); ctx.retainUntilFlush(counts)
+        let bm = try BitmapOps.packBits(ctx, bytes: validBytes, bits: kc)
+        if sync { try ctx.syncPoint() }
+        return bm
     }
 
     /// Runs accumulation (+ finalize) and returns (out[K] as ulong, counts[K] as ulong).
-    private func run<T: ArrowPrimitive>(values: MetalArray<T>, kind: Int, countValues: Bool = false) throws -> (MetalArrowBuffer, MetalArrowBuffer) {
+    ///
+    /// `sync` false leaves the work in whatever command buffer the caller has open, so `sum` and `mean`
+    /// can put the accumulation and their own finalizing kernels in one buffer instead of three. A
+    /// command buffer is 100-150 us on this hardware, which is nothing next to a 50-million-row pass and
+    /// most of a group-by over a million rows.
+    private func run<T: ArrowPrimitive>(values: MetalArray<T>, kind: Int, countValues: Bool = false,
+                                        sync: Bool = true) throws -> (MetalArrowBuffer, MetalArrowBuffer) {
         try Dispatch.checkLength(keys.length)
         let ctx = keys.context
         let n = keys.length
@@ -173,6 +226,7 @@ public struct GroupBy<K: ArrowIndex> {
                 enc.setBuffer(counts.mtl, offset: 0, index: 6)
                 Dispatch.dispatch1D(enc, finPSO, count: K)
             }
+            ctx.retainUntilFlush(partials); ctx.retainUntilFlush(pcounts)
         } else {
             let numTG = Swift.max(1, Swift.min(4096, (n + 4095) / 4096))
             let chunk = (n + numTG - 1) / numTG
@@ -214,8 +268,11 @@ public struct GroupBy<K: ArrowIndex> {
                 enc.setBuffer(counts.mtl, offset: 0, index: 5)
                 Dispatch.dispatch1D(enc, packPSO, count: K)
             }
+            ctx.retainUntilFlush(lo); ctx.retainUntilFlush(hi); ctx.retainUntilFlush(cnt)
         }
-        try ctx.syncPoint()   // results are read on the CPU next
+        ctx.retainUntilFlush(keys); ctx.retainUntilFlush(values)
+        ctx.retainUntilFlush(out); ctx.retainUntilFlush(counts)
+        if sync { try ctx.syncPoint() }   // results are read on the CPU next
         return (out, counts)
     }
 
