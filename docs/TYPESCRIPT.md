@@ -78,9 +78,13 @@ Arrow JS has no C Data Interface export, so the addon builds the `ArrowSchema` a
 structs itself:
 
 * **Wrapped, never copied by this binding.** Every buffer pointer is the V8 backing store's own
-  address (`ArrayBuffer.Data() + byteOffset`). The addon holds a JS reference to each buffer for the
-  whole life of the handle, so ArrowMetal may keep them for as long as it likes. The `ArrowArray`
-  release callback we install only records that ArrowMetal let go.
+  address (`ArrayBuffer.Data() + byteOffset`). The addon holds a JS reference to each producer
+  buffer in the `ArrowArray`'s own `private_data`, and drops it **when ArrowMetal calls the release
+  callback, and at no other time**. That is later than you might expect: on a page-aligned import
+  ArrowMetal wraps the V8 pages with `makeBuffer(bytesNoCopy:)`, and a slice, a group-by or a
+  registered plan source built from that array retains the import, so the pages stay pinned until
+  the last of those is gone. Releasing the *handle* does not unpin them — see
+  [Lifetime](#lifetime) below.
 * **Then ArrowMetal decides.** It wraps those pages when they are page aligned and copies once when
   they are not. `MetalArray#wrappedProducerBuffers` reports which happened, per handle.
 * Buffers involved: the values buffer, the validity bitmap when there are nulls, and the int32
@@ -105,6 +109,25 @@ sharing one refcount. The release callback runs when the last of them is garbage
 `toArrow()` and `toTypedArray()` return views over GPU-resident memory and copy nothing. (`toArray()`
 copies, by construction — it builds a JS array.)
 
+### Lifetime
+
+Who keeps what alive, precisely:
+
+| Object | Pinned until |
+|---|---|
+| The producer's V8 `TypedArray` (import) | ArrowMetal calls the `ArrowArray` release callback — i.e. when the imported array *and everything derived from it* is gone |
+| A `MetalArray` handle | garbage collected, or `release()` |
+| ArrowMetal's own result buffers (export) | the last external `ArrayBuffer` of that result is garbage collected |
+
+The first row is the one with teeth. `col.slice(...)`, `groupBy(col)` and
+`PlanSource.create(name, { col })` all retain the imported array inside ArrowMetal, and on a
+page-aligned import that array *is* the V8 pages. So the JS references must outlive the handle, and
+they do: they live in the `ArrowArray`'s `private_data`, not on the handle. `col.release()` frees
+the handle and nothing else; the derived slice, group-by or plan source keeps reading the right
+bytes. Four tests in `test/lifetime.test.js` drop every JS reference to the source typed array,
+force two collections, allocate 40 more 1M-element arrays over the freed pages, and then read
+through the derived object.
+
 ### Measured: are V8's typed-array buffers page aligned?
 
 Page size 16,384 bytes on this machine. "wrapped" is `wrappedProducerBuffers` — ArrowMetal kept the
@@ -123,7 +146,9 @@ heap and land wherever they land; the 1,000-element `Float64Array` above was not
 copied. The test suite does not pin an address: it pins the consequence. A wrapped import sees a
 later write through the typed array (`sum` changes); a copied one does not.
 
-An `ArrayBuffer` view with a non-zero `byteOffset` is never page aligned and is always copied.
+A view whose `byteOffset` is not a multiple of the page size is never page aligned and is always
+copied. A `byteOffset` that *is* a multiple of the page size, into an already-aligned buffer, still
+lands on a page boundary and is still wrapped.
 
 ## Covered
 
@@ -162,48 +187,64 @@ The C ABI has 220 entry points. This binding wraps the ones above and no others.
 
 ## Timing
 
-One run of `node bench/bench.mjs` on 2026-09-07. Apple M4 Max, macOS, node v24.9.0,
-apache-arrow 21.2.0, ArrowMetal 0.1.0 release. 10,000,000 Int64 rows, no nulls, values `i % 1000`.
+`node bench/spread.mjs` on 2026-09-07. Apple M4 Max, macOS, node v24.9.0, apache-arrow 21.2.0,
+ArrowMetal 0.1.0 release. 10,000,000 Int64 rows, no nulls, values `i % 1000`.
 
-**Method**: one process, one dataset. Each row is warmed up 3 times, then run 5 times; the table
-reports the **best of 5** wall time, `process.hrtime.bigint()` around the call. Every row's answer
-is checked against the plain-loop answer before the table prints. Two ArrowMetal rows: one with the
-column already on the device, one that re-imports the `BigInt64Array` on every call (a page-aligned
-wrap at this size, so no copy) and, for `filter`, wraps the result back as a typed array.
+**Method**: five fresh processes, each building the dataset once, warming each row up 3 times and
+then timing 5 calls (`process.hrtime.bigint()` around the call) and keeping its best. The table
+reports the **min, max and median of those five per-process bests**. Every row's answer is checked
+against the plain-loop answer inside each process before it reports.
+
+The spread is the point. A single process's best-of-5 is not a stable measurement here — an earlier
+one-process run of this same benchmark put `filter` end to end at 8.62 ms, roughly double the
+median below — so anything reported as one number would be over-claiming. Two rows whose ranges
+overlap cannot be ordered by this measurement, and the benchmark prints those pairs itself.
+
+Two ArrowMetal rows: one with the column already on the device, one that re-imports the
+`BigInt64Array` on every call (a page-aligned wrap at this size, so no copy) and, for `filter`,
+wraps the result back as a typed array.
 
 ### `sum` over 10,000,000 Int64 rows (answer 4995000000)
 
-| Method | Best of 5 (ms) | vs fastest |
-|---|---:|---:|
-| ArrowMetal, column already on the device | 0.28 | 1.00x |
-| ArrowMetal, end to end from a JS `BigInt64Array` | 2.04 | 7.34x |
-| plain typed-array loop | 16.55 | 59.59x |
-| Arrow JS, `Vector.get(i)` | 175.21 | 630.92x |
-| Arrow JS, `vector.toArray()` then loop | 16.67 | 60.03x |
+| Method | Min (ms) | Max (ms) | Median (ms) |
+|---|---:|---:|---:|
+| ArrowMetal, column already on the device | 0.27 | 0.36 | 0.30 |
+| ArrowMetal, end to end from a JS `BigInt64Array` | 1.88 | 2.06 | 2.02 |
+| plain typed-array loop | 16.38 | 19.81 | 16.47 |
+| Arrow JS, `Vector.get(i)` | 173.52 | 181.75 | 177.97 |
+| Arrow JS, `vector.toArray()` then loop | 16.35 | 16.66 | 16.43 |
 
 ### `filter x >= 500` over 10,000,000 Int64 rows (5,000,000 kept)
 
-| Method | Best of 5 (ms) | vs fastest |
-|---|---:|---:|
-| ArrowMetal, column already on the device | 3.10 | 1.00x |
-| ArrowMetal, end to end from a JS `BigInt64Array` | 8.62 | 2.78x |
-| plain typed-array loop | 9.77 | 3.15x |
-| Arrow JS, `Vector.get(i)` into a new `Vector` | 184.38 | 59.41x |
+| Method | Min (ms) | Max (ms) | Median (ms) |
+|---|---:|---:|---:|
+| ArrowMetal, column already on the device | 2.12 | 2.32 | 2.16 |
+| ArrowMetal, end to end from a JS `BigInt64Array` | 3.57 | 4.53 | 3.92 |
+| plain typed-array loop | 8.08 | 9.52 | 8.44 |
+| Arrow JS, `Vector.get(i)` into a new `Vector` | 170.57 | 183.74 | 179.41 |
 
-What these say, including the parts that are not flattering:
+The only overlapping pair the benchmark found is `plain typed-array loop` and
+`Arrow JS, vector.toArray() then loop` in the `sum` table, and they overlap because they are the
+same code: `toArray()` on an unsliced `Int64` vector hands back the same `BigInt64Array`.
 
-* **`filter` end to end barely wins.** 8.62 ms against a plain typed-array loop's 9.77 ms: 1.13x.
-  Filter materialises 5,000,000 rows, and that write is most of the work on both sides. If your
-  data starts and ends in a JS typed array and you filter once, ArrowMetal is not worth the call.
-  It pays when the column stays on the device across several operations (3.10 ms there, 3.2x).
-* **`Arrow JS, toArray() then loop` ties the plain loop** at 16.6 ms, because `toArray()` on an
-  unsliced `Int64` vector hands back the same `BigInt64Array`. It *is* the plain loop.
-* **`Vector.get(i)` is 175–184 ms** because Arrow JS allocates a `BigInt` per row. It is in the
+Read it honestly:
+
+* **The two `filter` rows are not measuring the same amount of work.** ArrowMetal's end-to-end row
+  finishes by wrapping the result as a typed-array view — the 5,000,000 output rows are written
+  once by the GPU and never touched again on the host — whereas the plain loop writes 5,000,000
+  `BigInt`s into a JS array as it goes. Some of the 2.2x is the GPU and some of it is that the
+  comparison hands the CPU a materialisation the GPU path does not have to repeat.
+* **`Vector.get(i)` is 170–184 ms** because Arrow JS allocates a `BigInt` per row. It is in the
   table because it is what a naive Arrow JS user writes, not because it is a fair kernel.
-* The 0.28 ms resident `sum` is 80 MB in 0.28 ms, about 285 GB/s — in range for an M4 Max, and not
-  a cached answer: a test mutates the wrapped buffer and watches the sum change.
+* The 0.27–0.36 ms resident `sum` is 80 MB read in about 0.3 ms, roughly 265 GB/s, which is in
+  range for an M4 Max. It is not a cached answer: a test mutates the wrapped buffer and watches the
+  sum change.
+* An earlier single-process run of this benchmark reported `filter` end to end at 8.62 ms against
+  the plain loop's 9.77 ms and called it a 1.13x win. That claim was inside the noise and is
+  withdrawn; this table replaces it.
 
-Numbers are from one machine on one day. `node bench/bench.mjs` re-runs the whole thing.
+Numbers are from one machine on one day. `node bench/spread.mjs` re-runs the whole thing;
+`node bench/bench.mjs` runs a single process and prints tables.
 
 ## Limits
 
@@ -215,13 +256,22 @@ Numbers are from one machine on one day. `node bench/bench.mjs` re-runs the whol
 * **Single-chunk only.** `Table`, `RecordBatch` and chunked `Vector`s are not accepted.
 * **Synchronous.** Every call blocks the event loop for the length of the kernel.
 * **Handles are GC-managed.** A `MetalArray` holds GPU memory until it is collected; call
-  `release()` in a loop that makes many of them.
+  `release()` in a loop that makes many of them. `release()` is safe at any point: it frees the
+  handle only, and anything derived from it keeps working, because the producer's buffers stay
+  pinned until ArrowMetal itself lets go. See [Lifetime](#lifetime).
 * **No prebuilt binary.** `npm install` compiles the addon locally, and the dylib must already
   exist.
+* **Not publishable as it stands.** `binding.gyp` adds `../include` so the addon can include the
+  repository's `arrow_abi.h`; that path is outside the package, so an `npm pack` tarball installs
+  and then fails to compile. The package is therefore marked `"private": true` and the `files`,
+  `os` and `cpu` fields have been removed rather than left as a promise the tarball cannot keep.
+  Publishing needs either a vendored `arrow_abi.h` under `node/` or a prebuilt binary; neither is
+  done here. `main` and `types` are kept, so a local `file:` or `npm link` install resolves.
 
 ## Tests
 
-50 tests, `node:test`, oracles are Apache Arrow JS and plain JS over the same rows.
+58 tests, `node:test`, oracles are Apache Arrow JS and plain JS over the same rows.
+`npm test` sets `NODE_OPTIONS=--expose-gc`, which the lifetime tests need.
 
 ```
 cd node
@@ -230,10 +280,11 @@ ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib npm test
 
 | File | Tests | What it pins |
 |---|---:|---|
-| `test/interop.test.js` | 15 | round trip for all 12 carried types with nulls; sliced, doubly sliced, sliced-with-nulls, sliced utf8 and bool; chunked and unsupported input rejected by message; the alignment table above; wrapped-vs-copied proved by mutating the source buffer; 10,000 import/compute/export cycles |
+| `test/interop.test.js` | 19 | round trip for all 12 carried types with nulls; sliced, doubly sliced, sliced-with-nulls, sliced utf8 and bool; chunked and unsupported input rejected by message; the alignment table above; wrapped-vs-copied proved by mutating the source buffer; short-buffer rejection with byte counts for validity, values, utf8 offsets, utf8 values and bool; type-tagged handles rejected across kinds; an argument-guard rejection never reporting a stale message; 10,000 import/compute/export cycles |
 | `test/reductions.test.js` | 10 | sum/min/max/mean against plain-JS oracles for Int64 and Float64, with nulls, all-null, empty; 1,000,001 rows; Kahan-summed float oracle to 1e-9 relative; validity bitmaps with a known and an unknown null count |
 | `test/compute.test.js` | 18 | all six comparison ops against JS; null masks; filter on empty and at 1,000,001 rows; sort and argsort with nulls last and stable ties; sort at 1,000,001 rows against `Array.prototype.sort`; take, slice, arith, cast; groupBy sum/mean/min/max/count against a JS `Map`, including a null key group and 1,000,001 rows; lexsort |
-| `test/plan.test.js` | 7 | a filter → group_by → sort plan against the same steps in JS; optimized vs unoptimized agree; explain; a plan that does not type-check throws the engine's message |
+| `test/plan.test.js` | 7 | a filter → group_by → sort plan against the same steps in JS; optimized vs unoptimized agree; explain; a plan that does not type-check throws the engine's own message; an out-of-range column named by index and by name |
+| `test/lifetime.test.js` | 4 | a slice, a plan source and a group-by all still read the right bytes after the parent handle is released, every JS reference to the source array dropped, two collections forced and the freed pages trampled; and an exported `Vector` after its handle is released |
 
 Sizes are 0, small, and 1,000,001 — a length that crosses a threadgroup boundary. Nothing above
 10,000,000 elements.

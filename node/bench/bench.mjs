@@ -3,7 +3,11 @@
 // Method: one process, one dataset. Each variant is warmed up 3 times, then run 5 times and the
 // best wall time is reported (process.hrtime.bigint around the call). No number here is estimated.
 //
-//   node bench/bench.mjs
+//   node bench/bench.mjs           tables on stdout
+//   node bench/bench.mjs --json    one JSON object, for bench/spread.mjs
+//
+// One process is not enough for filter: its cost varies enough between processes that a single
+// best-of-5 is inside the noise. bench/spread.mjs runs this file five times and reports the range.
 
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
@@ -15,6 +19,9 @@ const arrowVersion = JSON.parse(
     'utf8',
   ),
 ).version;
+
+const JSON_OUT = process.argv.includes('--json');
+const log = (...a) => { if (!JSON_OUT) console.log(...a); };
 
 const N = 10_000_000;
 const THRESHOLD = 500n;
@@ -42,17 +49,17 @@ for (let i = 0; i < N; i++) values[i] = BigInt(i % 1000);
 
 const vector = A.makeVector(values); // Arrow JS Int64 vector over the same bytes
 
-console.log(`ArrowMetal ${info.version} on ${info.device}`);
-console.log(`node ${process.version}, apache-arrow ${arrowVersion}`);
-console.log(`page size ${info.pageSize}; the 10M BigInt64Array is page aligned: ${isPageAligned(values)}`);
-console.log(`rows ${N.toLocaleString('en-US')}, Int64, no nulls, filter predicate x >= ${THRESHOLD}`);
-console.log('');
+log(`ArrowMetal ${info.version} on ${info.device}`);
+log(`node ${process.version}, apache-arrow ${arrowVersion}`);
+log(`page size ${info.pageSize}; the 10M BigInt64Array is page aligned: ${isPageAligned(values)}`);
+log(`rows ${N.toLocaleString('en-US')}, Int64, no nulls, filter predicate x >= ${THRESHOLD}`);
+log('');
 
 // ---------------------------------------------------------------------------------------------
 // sum
 
 const resident = MetalArray.fromTypedArray(values); // imported once, stays on the device
-console.log(`import wrapped the producer buffers (no copy): ${resident.wrappedProducerBuffers}`);
+log(`import wrapped the producer buffers (no copy): ${resident.wrappedProducerBuffers}`);
 
 const sumRows = [
   best('ArrowMetal, column already on the device', () => resident.sum()),
@@ -119,12 +126,12 @@ for (const r of filterRows) {
 // ---------------------------------------------------------------------------------------------
 
 function table(title, rows) {
-  console.log(`\n${title}`);
-  console.log('| Method | Best of 5 (ms) | vs fastest |');
-  console.log('|---|---:|---:|');
+  log(`\n${title}`);
+  log('| Method | Best of 5 (ms) | vs fastest |');
+  log('|---|---:|---:|');
   const fastest = Math.min(...rows.map((r) => r.ms));
   for (const r of rows) {
-    console.log(`| ${r.label} | ${r.ms.toFixed(2)} | ${(r.ms / fastest).toFixed(2)}x |`);
+    log(`| ${r.label} | ${r.ms.toFixed(2)} | ${(r.ms / fastest).toFixed(2)}x |`);
   }
 }
 
@@ -134,16 +141,30 @@ table(`filter x >= ${THRESHOLD} over ${N.toLocaleString('en-US')} Int64 rows (${
 // ---------------------------------------------------------------------------------------------
 // Alignment survey, for the copy rule in the docs.
 
-console.log('\nV8 typed-array page alignment (page size ' + info.pageSize + ')');
-console.log('| Elements | BigInt64Array aligned | wrapped by ArrowMetal | Float64Array aligned | wrapped |');
-console.log('|---|---|---|---|---|');
+log('\nV8 typed-array page alignment (page size ' + info.pageSize + ')');
+log('| Elements | BigInt64Array aligned | wrapped by ArrowMetal | Float64Array aligned | wrapped |');
+log('|---|---|---|---|---|');
 for (const n of [1_000, 100_000, 1_000_000, 10_000_000]) {
   const a = new BigInt64Array(n);
   const b = new Float64Array(n);
   const ma = MetalArray.fromTypedArray(a);
   const mb = MetalArray.fromTypedArray(b);
-  console.log(
+  log(
     `| ${n.toLocaleString('en-US')} | ${isPageAligned(a)} | ${ma.wrappedProducerBuffers} | ` +
       `${isPageAligned(b)} | ${mb.wrappedProducerBuffers} |`,
+  );
+}
+
+if (JSON_OUT) {
+  process.stdout.write(
+    JSON.stringify({
+      device: info.device,
+      version: info.version,
+      node: process.version,
+      arrow: arrowVersion,
+      rows: N,
+      sum: sumRows.map((r) => ({ label: r.label, ms: r.ms })),
+      filter: filterRows.map((r) => ({ label: r.label, ms: r.ms })),
+    }) + '\n',
   );
 }
