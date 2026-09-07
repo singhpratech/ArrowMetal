@@ -101,6 +101,9 @@ extension MetalStringArray {
         let a1 = try sxArgBuffer(arg1)
         let vb = validity ?? a1                                  // never read when flags bit 0 is clear
         let scratch = try MetalArrowBuffer.allocate(byteCount: 1, zeroed: false, context: ctx)
+        // One word the length kernel sets when ANY row is declined: the host then knows whether it has
+        // anything to do without walking n flag bytes (or allocating n optionals) for an all-GPU column.
+        let declined = try MetalArrowBuffer.allocate(byteCount: 4, zeroed: true, context: ctx)
         var prm = Self.sbParams(op.rawValue, arg1.count, hostOnlyIfNonASCII ? 1 : 0, 0, 0,
                                 validity == nil ? 0 : 1)
 
@@ -117,37 +120,53 @@ extension MetalStringArray {
                 enc.setBuffer(lens.mtl, offset: lens.offset, index: 6)
                 enc.setBuffer(hostRows.mtl, offset: hostRows.offset, index: 7)
                 enc.setBuffer(scratch.mtl, offset: scratch.offset, index: 8)
+                enc.setBuffer(declined.mtl, offset: declined.offset, index: 9)
                 Dispatch.dispatch1D(enc, pLen, count: n)
             }
         }
 
         // The rows the GPU declined, decided on the host and their lengths written into the same
         // buffer the scan is about to read.
-        var hostValues = [String?](repeating: nil, count: n)
+        // Only the declined rows exist on the host: their indices (found by scanning the flag bytes
+        // eight at a time and skipping zero words) and their mapped strings, never an n-sized array.
+        var hostIndex: [Int32] = []
+        var hostValues: [String] = []
         var anyHost = false
         if n > 0 {
             try ctx.syncPoint()
+            anyHost = declined.typed(UInt32.self)[0] != 0
             withExtendedLifetime(self) {
-                let flags = hostRows.typed(UInt8.self)
-                for i in 0..<n where flags[i] != 0 { anyHost = true; break }
                 guard anyHost else { return }
+                let flags = hostRows.typed(UInt8.self)
+                let words = n / 8
+                flags.withMemoryRebound(to: UInt64.self, capacity: Swift.max(words, 1)) { w in
+                    for k in 0..<words where w[k] != 0 {
+                        for i in (k * 8)..<(k * 8 + 8) where flags[i] != 0 { hostIndex.append(Int32(i)) }
+                    }
+                }
+                for i in (words * 8)..<n where flags[i] != 0 { hostIndex.append(Int32(i)) }
+                let m = hostIndex.count
+                hostValues = [String](repeating: "", count: m)
                 let lenPtr = lens.mutableTyped(Int32.self)
                 let o = offsets.typed(Int32.self), d = data.typed(UInt8.self)
-                hostValues.withUnsafeMutableBufferPointer { buf in
-                    let chunk = 4096
-                    let chunks = (n + chunk - 1) / chunk
-                    func work(_ c: Int) {
-                        let lo = c * chunk, hi = Swift.min(lo + chunk, n)
-                        for i in lo..<hi where flags[i] != 0 {
-                            let s = String(decoding: UnsafeBufferPointer(start: d + Int(o[i]),
-                                                                         count: Int(o[i + 1] - o[i])),
-                                           as: UTF8.self)
-                            let v = host(s)
-                            buf[i] = v
-                            lenPtr[i] = Int32(v.utf8.count)
+                hostIndex.withUnsafeBufferPointer { idx in
+                    hostValues.withUnsafeMutableBufferPointer { buf in
+                        let chunk = 4096
+                        let chunks = (m + chunk - 1) / chunk
+                        func work(_ c: Int) {
+                            let lo = c * chunk, hi = Swift.min(lo + chunk, m)
+                            for j in lo..<hi {
+                                let i = Int(idx[j])
+                                let s = String(decoding: UnsafeBufferPointer(start: d + Int(o[i]),
+                                                                             count: Int(o[i + 1] - o[i])),
+                                               as: UTF8.self)
+                                let v = host(s)
+                                buf[j] = v
+                                lenPtr[i] = Int32(v.utf8.count)
+                            }
                         }
+                        if chunks == 1 { work(0) } else { DispatchQueue.concurrentPerform(iterations: chunks, execute: work) }
                     }
-                    if chunks == 1 { work(0) } else { DispatchQueue.concurrentPerform(iterations: chunks, execute: work) }
                 }
             }
         }
@@ -177,21 +196,23 @@ extension MetalStringArray {
             try ctx.syncPoint()
             let outOff = outOffsets.typed(Int32.self)
             let dst = outData.mutableTyped(UInt8.self)
-            hostValues.withUnsafeBufferPointer { buf in
-                let chunk = 4096
-                let chunks = (n + chunk - 1) / chunk
-                func work(_ c: Int) {
-                    let lo = c * chunk, hi = Swift.min(lo + chunk, n)
-                    for i in lo..<hi {
-                        guard let v = buf[i] else { continue }
-                        var p = Int(outOff[i])
-                        for b in v.utf8 { dst[p] = b; p += 1 }
+            let m = hostIndex.count
+            hostIndex.withUnsafeBufferPointer { idx in
+                hostValues.withUnsafeBufferPointer { buf in
+                    let chunk = 4096
+                    let chunks = (m + chunk - 1) / chunk
+                    func work(_ c: Int) {
+                        let lo = c * chunk, hi = Swift.min(lo + chunk, m)
+                        for j in lo..<hi {
+                            var p = Int(outOff[Int(idx[j])])
+                            for b in buf[j].utf8 { dst[p] = b; p += 1 }
+                        }
                     }
+                    if chunks == 1 { work(0) } else { DispatchQueue.concurrentPerform(iterations: chunks, execute: work) }
                 }
-                if chunks == 1 { work(0) } else { DispatchQueue.concurrentPerform(iterations: chunks, execute: work) }
             }
         }
-        for b in [a1, scratch, lens, hostRows] { ctx.retainUntilFlush(b) }
+        for b in [a1, scratch, lens, hostRows, declined] { ctx.retainUntilFlush(b) }
         ctx.retainUntilFlush(self)
         let out = MetalStringArray(length: n, nullCount: nullCount, validity: validity,
                                    offsets: outOffsets, data: outData, context: ctx)

@@ -150,13 +150,14 @@ enum StringUnicodeSource {
                           device const uchar* validity [[buffer(2)]], device const uint* nPtr [[buffer(3)]],
                           constant SuParams& prm [[buffer(4)]], device const uchar* a1 [[buffer(5)]],
                           device int* outLens [[buffer(6)]], device uchar* hostRows [[buffer(7)]],
-                          device uchar* scratch [[buffer(8)]], uint i [[thread_position_in_grid]]) {
+                          device uchar* scratch [[buffer(8)]], device atomic_uint* declined [[buffer(9)]],
+                          uint i [[thread_position_in_grid]]) {
         if (i >= *nPtr) return;
         hostRows[i] = 0;
         if ((prm.flags & 1u) != 0u && !bit_get(validity, i)) { outLens[i] = 0; return; }
         int start = offsets[i], len = offsets[i + 1] - start;
         int r = su_apply(data, start, len, a1, prm.n1, prm.op, prm.p1, scratch, 0, false);
-        if (r < 0) { outLens[i] = 0; hostRows[i] = 1; return; }
+        if (r < 0) { outLens[i] = 0; hostRows[i] = 1; atomic_store_explicit(declined, 1u, memory_order_relaxed); return; }
         outLens[i] = r;
     }
     // Pass 2: the bytes, for the rows the GPU claimed in pass 1.
