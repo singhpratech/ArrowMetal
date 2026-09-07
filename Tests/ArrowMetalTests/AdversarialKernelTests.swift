@@ -58,7 +58,7 @@ final class AdversarialKernelTests: XCTestCase {
         xs.append(nil)
         xs.append("")
         let a = try MetalStringArray(xs, context: .shared)
-        try repeatedlyEqual(60, "string unique") { try a.unique().toArray() }
+        try repeatedlyEqual(100, "string unique") { try a.unique().toArray() }
     }
 
     func testStringValueCountsIsDeterministic() throws {
@@ -66,7 +66,7 @@ final class AdversarialKernelTests: XCTestCase {
         var xs: [String?] = []
         for i in 0..<3000 { for _ in 0..<(i % 3 + 1) { xs.append("k\u{0}\(i)") } }
         let a = try MetalStringArray(xs, context: .shared)
-        try repeatedlyEqual(40, "string value_counts") { () -> [String] in
+        try repeatedlyEqual(100, "string value_counts") { () -> [String] in
             let (v, c) = try a.valueCounts()
             return zip(v.toArray(), c.toRawArray()).map { "\($0 ?? "<null>")=\($1)" }
         }
@@ -89,7 +89,7 @@ final class AdversarialKernelTests: XCTestCase {
         let n = 1 << 16
         let vals = (0..<n).map { Int64($0 % 997) }
         let a = try MetalArray<Int64>(vals, context: .shared)
-        try repeatedlyEqual(30, "int64 dictionary_encode") { () -> [Int32] in
+        try repeatedlyEqual(100, "int64 dictionary_encode") { () -> [Int32] in
             let (codes, _) = try a.dictionaryEncode()
             return codes.toRawArray()
         }
@@ -100,7 +100,7 @@ final class AdversarialKernelTests: XCTestCase {
         try requireRealGPU()
         let n = 1 << 17
         let a = try MetalArray<Int32>([Int32](repeating: 7, count: n), context: .shared)
-        try repeatedlyEqual(40, "topK all-equal") { try a.topK(1000, largest: true).toRawArray() }
+        try repeatedlyEqual(200, "topK all-equal") { try a.topK(1000, largest: true).toRawArray() }
     }
 
     func testQuantileIsDeterministic() throws {
@@ -123,7 +123,7 @@ final class AdversarialKernelTests: XCTestCase {
         let vals = try MetalArray<Int64>((0..<n).map { Int64(($0 &* 2654435761) % 1_000_003) - 500_000 },
                                          context: .shared)
         let gb = try keys.groupBy(keyCount: K)
-        try repeatedlyEqual(30, "grouped extrema") { () -> [Int64] in
+        try repeatedlyEqual(200, "grouped extrema") { () -> [Int64] in
             let (mn, mx) = try gb.extrema(vals)
             return mn.toRawArray() + mx.toRawArray()
         }
@@ -137,7 +137,7 @@ final class AdversarialKernelTests: XCTestCase {
         let keys = try MetalArray<Int32>((0..<n).map { Int32($0 % K) }, context: .shared)
         let vals = try MetalArray<Double>((0..<n).map { Double(($0 &* 7919) % 1000) }, context: .shared)
         let gb = try keys.groupBy(keyCount: K)
-        try repeatedlyEqual(25, "grouped variance") { try gb.varianceDouble(vals, ddof: 1).toArray() }
+        try repeatedlyEqual(100, "grouped variance") { try gb.varianceDouble(vals, ddof: 1).toArray() }
     }
 
     // MARK: - boundaries
