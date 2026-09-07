@@ -58,6 +58,11 @@ func genFloat64(n int) []float64 {
 	return v
 }
 
+func newInt64BuilderWith(t *testing.T, mem memory.Allocator) *array.Int64Builder {
+	t.Helper()
+	return array.NewInt64Builder(mem)
+}
+
 func buildInt64(t *testing.T, vals []int64, valid []bool) arrow.Array {
 	t.Helper()
 	b := array.NewInt64Builder(mem)

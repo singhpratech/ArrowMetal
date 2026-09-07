@@ -194,8 +194,8 @@ the rows.
 
 ## What is covered
 
-Every item below has at least one test in `go/arrowmetal`; the oracle is named. 38 test functions,
-125 cases counting subtests, all green.
+Every item below has at least one test in `go/arrowmetal`; the oracle is named. 42 test functions,
+131 cases counting subtests, all green.
 
 | Surface | Go API | Oracle |
 |---|---|---|
@@ -216,6 +216,9 @@ Every item below has at least one test in `go/arrowmetal`; the oracle is named. 
 | Errors | `*arrowmetal.Error` | a length mismatch and a bad plan both carry `am_last_error()` text |
 | Allocator | `PageAlignedAllocator` | alignment at 1M and 10M, allocate/reallocate/free bookkeeping, a full round trip |
 | Handle lifecycle | `Release` | repeated import of one `arrow.Array`; a long-lived handle alongside short-lived ones; a released handle errors rather than crashing |
+| Leaks | the whole chain | 2,000 import/compare/filter/export/release round trips at 200k rows; the process's high-water RSS has to stay inside 64 MB of the baseline (it grows about 2.6 MB) |
+| The loader | `Init`, `LibraryPath` | a child process with `ARROWMETAL_LIB` pointing at nothing, and a child with nothing set in an empty directory: the error has to name the variable, the paths and the `swift build` line |
+| Docs | the example in this file | compiled and run as `Example()`, so it cannot drift from the API |
 
 Sizes are at or below 10M elements throughout.
 

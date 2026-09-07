@@ -83,14 +83,33 @@ func candidates() []string {
 	return out
 }
 
-// shortDlErr keeps a dlopen failure to one readable line. dyld appends every fallback path it tried
-// after ", tried:", which is a screenful per candidate and says nothing the path in front of it does not.
+// shortDlErr keeps a dlopen failure to one readable line.
+//
+// dyld's message is "dlopen(<path>, <flags>): tried: '<path>' (<reason>), '<fallback>' (<reason>), ..."
+// — a screenful per candidate, listing prefixed variants of a path the caller can already see. The
+// path is printed alongside this, so all that is wanted is the reason.
 func shortDlErr(s string) string {
-	if i := strings.Index(s, ", tried:"); i >= 0 {
-		s = s[:i]
-	}
 	if i := strings.Index(s, "): "); i >= 0 {
-		s = s[i+3:]
+		s = s[i+3:] // drop the "dlopen(<path>, <flags>): " prefix
+	}
+	// Keep the parenthesised reason for the first entry, which is the path that was actually asked
+	// for; the rest are dyld's own prefixed variants of it. The reason can itself contain
+	// parentheses ("(have 'x86_64', need 'arm64')"), so match them rather than scanning for ", ".
+	if strings.HasPrefix(s, "tried:") {
+		if i := strings.Index(s, "' ("); i >= 0 {
+			rest := s[i+len("' ("):]
+			depth := 1
+			for j := 0; j < len(rest); j++ {
+				switch rest[j] {
+				case '(':
+					depth++
+				case ')':
+					if depth--; depth == 0 {
+						return strings.TrimSpace(rest[:j])
+					}
+				}
+			}
+		}
 	}
 	return strings.TrimSpace(s)
 }
