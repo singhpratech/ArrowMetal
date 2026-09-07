@@ -224,7 +224,24 @@ export class MetalArray {
     }
     const length = (values as unknown as { length: number }).length;
     const validity = options.validity ?? null;
+    // -1 is the C Data Interface's "unknown"; ArrowMetal counts the bitmap itself.
     const nullCount = options.nullCount ?? (validity === null ? 0 : -1);
+    if (!Number.isInteger(nullCount) || nullCount < -1) {
+      throw new Error(
+        `ArrowMetal (Node): nullCount must be a non-negative integer or -1 for unknown, got ${nullCount}.`,
+      );
+    }
+    if (nullCount > length) {
+      throw new Error(
+        `ArrowMetal (Node): nullCount ${nullCount} is larger than the ${length} rows in the array.`,
+      );
+    }
+    if (nullCount > 0 && validity === null) {
+      throw new Error(
+        `ArrowMetal (Node): nullCount is ${nullCount} but no validity bitmap was given; ` +
+          'nulls need one. Pass { validity } alongside it, or leave nullCount at 0.',
+      );
+    }
     return new MetalArray(native.importArray(format, length, 0, nullCount, validity, values, null));
   }
 

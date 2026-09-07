@@ -166,7 +166,10 @@ lands on a page boundary and is still wrapped.
 | Query engine | `PlanSource.create`, `runPlan`, `explainPlan`, `PlanResult#column` | `am_plan_source_create`, `am_plan_run`, `am_plan_explain` |
 | Diagnostics | `info`, `bufferAddress`, `isPageAligned`, `wrappedProducerBuffers` | — |
 
-Errors from ArrowMetal are thrown as JS `Error`s carrying the `am_last_error()` message verbatim.
+Errors from ArrowMetal are thrown as JS `Error`s carrying the `am_last_error()` message verbatim,
+except argument-guard rejections (return code 2), which carry the binding's own message: the C
+ABI's guards return 2 without setting `am_last_error`, so reading it there would report the
+previous call's failure.
 Handles are freed by the garbage collector; `release()` frees one now.
 
 ## Not covered
@@ -270,7 +273,7 @@ Numbers are from one machine on one day. `node bench/spread.mjs` re-runs the who
 
 ## Tests
 
-58 tests, `node:test`, oracles are Apache Arrow JS and plain JS over the same rows.
+62 tests, `node:test`, oracles are Apache Arrow JS and plain JS over the same rows.
 `npm test` sets `NODE_OPTIONS=--expose-gc`, which the lifetime tests need.
 
 ```
@@ -280,11 +283,12 @@ ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib npm test
 
 | File | Tests | What it pins |
 |---|---:|---|
-| `test/interop.test.js` | 19 | round trip for all 12 carried types with nulls; sliced, doubly sliced, sliced-with-nulls, sliced utf8 and bool; chunked and unsupported input rejected by message; the alignment table above; wrapped-vs-copied proved by mutating the source buffer; short-buffer rejection with byte counts for validity, values, utf8 offsets, utf8 values and bool; type-tagged handles rejected across kinds; an argument-guard rejection never reporting a stale message; 10,000 import/compute/export cycles |
+| `test/interop.test.js` | 21 | round trip for all 12 carried types with nulls; sliced, doubly sliced, sliced-with-nulls, sliced utf8 and bool; chunked and unsupported input rejected by message; the alignment table above; wrapped-vs-copied proved by mutating the source buffer; short-buffer rejection with byte counts for validity, values, utf8 offsets, utf8 values and bool; utf8 offsets that decrease or start below zero, named by index; impossible `nullCount`s; type-tagged handles rejected across kinds; an argument-guard rejection never reporting a stale message; 10,000 import/compute/export cycles |
 | `test/reductions.test.js` | 10 | sum/min/max/mean against plain-JS oracles for Int64 and Float64, with nulls, all-null, empty; 1,000,001 rows; Kahan-summed float oracle to 1e-9 relative; validity bitmaps with a known and an unknown null count |
 | `test/compute.test.js` | 18 | all six comparison ops against JS; null masks; filter on empty and at 1,000,001 rows; sort and argsort with nulls last and stable ties; sort at 1,000,001 rows against `Array.prototype.sort`; take, slice, arith, cast; groupBy sum/mean/min/max/count against a JS `Map`, including a null key group and 1,000,001 rows; lexsort |
 | `test/plan.test.js` | 7 | a filter → group_by → sort plan against the same steps in JS; optimized vs unoptimized agree; explain; a plan that does not type-check throws the engine's own message; an out-of-range column named by index and by name |
 | `test/lifetime.test.js` | 4 | a slice, a plan source and a group-by all still read the right bytes after the parent handle is released, every JS reference to the source array dropped, two collections forced and the freed pages trampled; and an exported `Vector` after its handle is released |
+| `test/workers.test.js` | 2 | four `worker_threads` workers importing, deriving and releasing concurrently, each answering correctly; and workers that exit with references still parked, so the env cleanup hook has to drain them |
 
 Sizes are 0, small, and 1,000,001 — a length that crosses a threadgroup boundary. Nothing above
 10,000,000 elements.

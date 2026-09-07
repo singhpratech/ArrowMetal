@@ -1,0 +1,10 @@
+# Machine-specific build output: the compiled .node is built by node-gyp at install time and must
+# never be shipped. (The package is marked private and is not publishable as it stands -- see the
+# Packaging section of README.md -- but this keeps `npm pack` honest if that changes.)
+build/
+node_modules/
+dist/
+
+# Local development leftovers
+*.log
+.DS_Store

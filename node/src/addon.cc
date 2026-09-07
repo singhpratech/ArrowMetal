@@ -109,7 +109,12 @@ bool fileExists(const std::string& p) {
 
 // Resolves and dlopens the dylib. Order: $ARROWMETAL_LIB, then ../.build/release relative to the
 // package directory that JavaScript hands us.
+std::mutex gLoadMutex;
+
+// The dylib is process-wide (one dlopen serves every env), but the check-then-set below must not
+// race when two worker threads first touch the addon at the same time.
 void loadLibrary(const std::string& packageDir) {
+  std::lock_guard<std::mutex> lock(gLoadMutex);
   if (g.handle != nullptr) return;
 
   const char* env = getenv("ARROWMETAL_LIB");
@@ -232,18 +237,64 @@ int elementWidth(const char* f) {
 
 // References to V8 TypedArrays that ArrowMetal has just let go of, waiting to be destroyed on the
 // JS thread. napi_delete_reference is not safe from an arbitrary thread, and an ArrowArray release
-// callback may in principle run from one, so the callback parks the references here and the next
-// N-API entry point drains them. See drainPending().
-std::mutex gPendingMutex;
-std::vector<Napi::Reference<Napi::Value>> gPending;
+// callback may in principle run from one, so the callback parks the references and the next N-API
+// entry point on that env drains them.
+//
+// The queue is per-env, not per-process: an napi_ref belongs to the env that made it, so under
+// worker_threads a global queue would let worker B delete worker A's references on the wrong
+// thread. Each env gets its own AddonData through napi_set_instance_data, and ImportPriv holds a
+// shared_ptr to the one that owns its references, so a release callback always finds the right
+// queue even if the env has already gone away.
+struct AddonData {
+  std::mutex mutex;
+  std::vector<Napi::Reference<Napi::Value>> pending;
+  // Cleared by the env cleanup hook. Once false, references are suppressed rather than parked:
+  // calling napi_delete_reference after the env is torn down is undefined.
+  bool envAlive = true;
 
-void drainPending() {
+  ~AddonData() {
+    // Belt and braces: nothing may run napi_delete_reference during static destruction.
+    for (auto& r : pending) r.SuppressDestruct();
+    pending.clear();
+  }
+};
+
+// What napi_set_instance_data owns. Holding a shared_ptr means a late release callback parks into
+// a live AddonData even after the env's instance data has been finalized.
+struct InstanceHolder {
+  std::shared_ptr<AddonData> data;
+};
+
+std::shared_ptr<AddonData> addonData(const Napi::Env& env) {
+  auto* holder = env.GetInstanceData<InstanceHolder>();
+  return holder != nullptr ? holder->data : nullptr;
+}
+
+void drainPending(const Napi::Env& env) {
+  auto data = addonData(env);
+  if (!data) return;
   std::vector<Napi::Reference<Napi::Value>> local;
   {
-    std::lock_guard<std::mutex> lock(gPendingMutex);
-    local.swap(gPending);
+    std::lock_guard<std::mutex> lock(data->mutex);
+    local.swap(data->pending);
   }
-  local.clear();  // ~Reference runs here, on the JS thread
+  local.clear();  // ~Reference runs here, on this env's own thread
+}
+
+// Runs while the env is still usable, so the references can be deleted properly. The hook owns its
+// own shared_ptr rather than reaching through the instance data, so it does not matter whether the
+// hook or the instance-data finalizer runs first.
+void envCleanup(void* arg) {
+  std::unique_ptr<std::shared_ptr<AddonData>> owned(static_cast<std::shared_ptr<AddonData>*>(arg));
+  if (!owned || !*owned) return;
+  AddonData* data = owned->get();
+  std::vector<Napi::Reference<Napi::Value>> local;
+  {
+    std::lock_guard<std::mutex> lock(data->mutex);
+    local.swap(data->pending);
+    data->envAlive = false;
+  }
+  local.clear();
 }
 
 // Private data of an ArrowArray we build over JS memory.
@@ -259,6 +310,8 @@ void drainPending() {
 struct ImportPriv {
   const void* buffers[3];
   std::vector<Napi::Reference<Napi::Value>> keepAlive;
+  // The env whose references those are, so the release callback parks them in the right queue.
+  std::shared_ptr<AddonData> owner;
   // Shared with the importing frame, because priv itself may be gone by the time we want to read
   // it: a copying import calls release before am_import returns.
   std::shared_ptr<std::atomic<bool>> released;
@@ -270,9 +323,17 @@ void importArrayRelease(struct ArrowArray* a) {
   a->private_data = nullptr;
   if (priv == nullptr) return;
   if (priv->released) priv->released->store(true);
-  {
-    std::lock_guard<std::mutex> lock(gPendingMutex);
-    for (auto& r : priv->keepAlive) gPending.push_back(std::move(r));
+  if (priv->owner) {
+    std::lock_guard<std::mutex> lock(priv->owner->mutex);
+    if (priv->owner->envAlive) {
+      for (auto& r : priv->keepAlive) priv->owner->pending.push_back(std::move(r));
+    } else {
+      // The env is gone; deleting the references would be undefined, so let them leak with the
+      // env rather than reach into a torn-down runtime.
+      for (auto& r : priv->keepAlive) r.SuppressDestruct();
+    }
+  } else {
+    for (auto& r : priv->keepAlive) r.SuppressDestruct();
   }
   delete priv;
 }
@@ -494,6 +555,7 @@ Napi::Value ImportArray(const Napi::CallbackInfo& info) {
   // it is set if and only if ArrowMetal actually ran the release callback.
   auto releasedFlag = std::make_shared<std::atomic<bool>>(false);
   priv->released = releasedFlag;
+  priv->owner = addonData(env);
 
   // Every buffer is checked against the size the Arrow layout requires for `rows` rows. Without
   // this a short validity bitmap (one byte for 64 rows, say) reads past the end of the V8 view and
@@ -522,17 +584,27 @@ Napi::Value ImportArray(const Napi::CallbackInfo& info) {
     addBuffer(0, info[4], "validity", bitmapBytes);
     if (width == -2) {
       addBuffer(1, info[6], "utf8 offsets", (rows + 1) * 4);
-      // The values buffer must reach the last offset, which we can only know once the offsets
-      // buffer has been checked.
+      // Arrow requires the offsets to start at or above 0 and never decrease. A violation would
+      // make the values-buffer size check below meaningless and hand the kernels a negative
+      // length, so it is rejected here with the index that broke it.
       int64_t neededBytes = 0;
-      if (priv->buffers[1] != nullptr && rows >= 0) {
+      if (priv->buffers[1] != nullptr) {
         const int32_t* offs = static_cast<const int32_t*>(priv->buffers[1]);
-        const int32_t last = offs[rows];
-        if (last < 0) {
-          throw Napi::Error::New(env, "ArrowMetal (Node): the utf8 offsets buffer ends at " +
-                                          std::to_string(last) + ", which is negative.");
+        if (offs[0] < 0) {
+          throw Napi::Error::New(env, "ArrowMetal (Node): utf8 offsets[0] is " +
+                                          std::to_string(offs[0]) + "; Arrow offsets start at 0 "
+                                          "or above.");
         }
-        neededBytes = last;
+        for (int64_t i = 0; i < rows; i++) {
+          if (offs[i + 1] < offs[i]) {
+            throw Napi::Error::New(
+                env, "ArrowMetal (Node): utf8 offsets must not decrease, but offsets[" +
+                         std::to_string(i + 1) + "] is " + std::to_string(offs[i + 1]) +
+                         " after offsets[" + std::to_string(i) + "] = " + std::to_string(offs[i]) +
+                         ".");
+          }
+        }
+        neededBytes = offs[rows];
       }
       addBuffer(2, info[5], "utf8 values", neededBytes);
     } else if (width == -1) {
@@ -678,7 +750,7 @@ Napi::Value ReleaseArray(const Napi::CallbackInfo& info) {
     g.am_release(h->p);
     h->p = nullptr;
   }
-  drainPending();
+  drainPending(env);
   return env.Undefined();
 }
 
@@ -972,11 +1044,15 @@ Napi::Value BufferAddress(const Napi::CallbackInfo& info) {
 // on it after a release callback fired.
 template <Napi::Value (*Fn)(const Napi::CallbackInfo&)>
 Napi::Value Entry(const Napi::CallbackInfo& info) {
-  drainPending();
+  drainPending(info.Env());
   return Fn(info);
 }
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
+  auto data = std::make_shared<AddonData>();
+  env.SetInstanceData(new InstanceHolder{data});
+  napi_add_env_cleanup_hook(env, envCleanup, new std::shared_ptr<AddonData>(data));
+
   exports.Set("load", Napi::Function::New(env, Entry<Load>));
   exports.Set("importArray", Napi::Function::New(env, Entry<ImportArray>));
   exports.Set("importRetained", Napi::Function::New(env, Entry<ImportRetained>));

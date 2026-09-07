@@ -149,6 +149,49 @@ test('a buffer shorter than the Arrow layout requires is rejected with the byte 
   );
 });
 
+test('utf8 offsets that decrease or start below zero are rejected, naming the index', () => {
+  assert.throws(
+    () => native.importArray('u', 3, 0, 0, null, new Uint8Array(8), new Int32Array([0, 2, 1, 4])),
+    /utf8 offsets must not decrease, but offsets\[2\] is 1 after offsets\[1\] = 2/,
+  );
+  assert.throws(
+    () => native.importArray('u', 2, 0, 0, null, new Uint8Array(8), new Int32Array([-1, 0, 1])),
+    /utf8 offsets\[0\] is -1; Arrow offsets start at 0 or above/,
+  );
+  // The check runs over offset + length, not length alone.
+  assert.throws(
+    () => native.importArray('u', 2, 1, 0, null, new Uint8Array(8), new Int32Array([0, 1, 0, 2])),
+    /offsets\[2\] is 0 after offsets\[1\] = 1/,
+  );
+  // A flat, non-decreasing run is fine (empty strings).
+  const ok = native.importArray('u', 3, 0, 0, null, new Uint8Array(2), new Int32Array([0, 1, 1, 2]));
+  assert.equal(native.length(ok), 3);
+});
+
+test('an impossible nullCount is rejected before it reaches the ABI', () => {
+  const v = new BigInt64Array(8);
+  assert.throws(
+    () => MetalArray.fromTypedArray(v, { validity: new Uint8Array(1), nullCount: 9 }),
+    /nullCount 9 is larger than the 8 rows in the array/,
+  );
+  assert.throws(
+    () => MetalArray.fromTypedArray(v, { nullCount: 3 }),
+    /nullCount is 3 but no validity bitmap was given/,
+  );
+  assert.throws(
+    () => MetalArray.fromTypedArray(v, { validity: new Uint8Array(1), nullCount: -2 }),
+    /nullCount must be a non-negative integer or -1 for unknown, got -2/,
+  );
+  assert.throws(
+    () => MetalArray.fromTypedArray(v, { validity: new Uint8Array(1), nullCount: 1.5 }),
+    /nullCount must be a non-negative integer or -1 for unknown, got 1.5/,
+  );
+  // nullCount equal to the row count is legal: every row null.
+  const allNull = MetalArray.fromTypedArray(v, { validity: new Uint8Array(1), nullCount: 8 });
+  assert.equal(allNull.nullCount, 8);
+  assert.equal(allNull.sum(), null);
+});
+
 test('a buffer exactly the required size is accepted', () => {
   const ok = native.importArray('l', 64, 0, 0, new Uint8Array(8).fill(0xff), new BigInt64Array(64).fill(2n), null);
   assert.equal(native.reduce(ok, 0), 128n);
