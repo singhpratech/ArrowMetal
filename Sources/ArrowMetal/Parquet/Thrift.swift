@@ -54,7 +54,10 @@ struct ThriftReader {
     // MARK: primitives
 
     @inline(__always) mutating func byte() throws -> UInt8 {
-        guard pos < bytes.count else { throw ParquetError.truncated("byte at \(pos) of \(bytes.count)") }
+        // `pos` can start negative: a column chunk's `data_page_offset` is a signed thrift i64 that a
+        // corrupt footer can make negative, and `UnsafeRawBufferPointer`'s subscript is unchecked in a
+        // release build, so an unguarded negative index reads memory in front of the mapping.
+        guard pos >= 0, pos < bytes.count else { throw ParquetError.truncated("byte at \(pos) of \(bytes.count)") }
         defer { pos += 1 }
         return bytes[pos]
     }
@@ -72,21 +75,33 @@ struct ThriftReader {
         throw ParquetError.malformed("varint longer than 10 bytes at \(pos)")
     }
 
+    /// A varint used as a count or a byte length. Anything that cannot be a position inside `bytes` is
+    /// malformed, and saying so is the whole point: `Int(someUInt64)` *traps* on overflow, so a corrupt
+    /// footer claiming a 2^63-byte string would take the process down instead of raising an error.
+    @inline(__always) mutating func varintCount(_ what: @autoclosure () -> String) throws -> Int {
+        let u = try varint()
+        guard u <= UInt64(bytes.count) else {
+            throw ParquetError.malformed("\(what()) of \(u) exceeds the \(bytes.count) bytes available")
+        }
+        return Int(u)
+    }
+
     @inline(__always) mutating func zigzag() throws -> Int64 {
         let u = try varint()
         return Int64(bitPattern: (u >> 1)) ^ -Int64(bitPattern: u & 1)
     }
 
     mutating func double() throws -> Double {
-        guard pos + 8 <= bytes.count else { throw ParquetError.truncated("double at \(pos)") }
+        guard pos >= 0, pos + 8 <= bytes.count else { throw ParquetError.truncated("double at \(pos)") }
         defer { pos += 8 }
         return Double(bitPattern: bytes.loadUnaligned(fromByteOffset: pos, as: UInt64.self))
     }
 
     /// Binary/string payload, returned as a range into the underlying bytes (no copy).
     mutating func binaryRange() throws -> Range<Int> {
-        let n = Int(try varint())
-        guard n >= 0, pos + n <= bytes.count else { throw ParquetError.truncated("binary of \(n) bytes at \(pos)") }
+        let at = pos
+        let n = try varintCount("binary at \(at)")
+        guard pos >= 0, pos + n <= bytes.count else { throw ParquetError.truncated("binary of \(n) bytes at \(pos)") }
         defer { pos += n }
         return pos..<(pos + n)
     }
@@ -103,7 +118,14 @@ struct ThriftReader {
 
     // MARK: structs
 
-    mutating func pushStruct() {
+    /// Deepest struct nesting accepted. `parquet.thrift` nests a handful of levels; anything past this
+    /// is a crafted footer, and following it would recurse `skip` until the stack runs out.
+    static let maxDepth = 200
+
+    mutating func pushStruct() throws {
+        guard idStack.count < ThriftReader.maxDepth else {
+            throw ParquetError.malformed("thrift struct nesting deeper than \(ThriftReader.maxDepth) at \(pos)")
+        }
         idStack.append(lastFieldID)
         lastFieldID = 0
     }
@@ -134,18 +156,19 @@ struct ThriftReader {
     mutating func listHeader() throws -> (count: Int, type: TCType) {
         let b = try byte()
         var n = Int(b >> 4)
-        if n == 15 { n = Int(try varint()) }
+        let at = pos
+        if n == 15 { n = try varintCount("thrift list at \(at)") }
         guard let t = TCType(rawValue: b & 0x0F) else {
             throw ParquetError.malformed("thrift list element type \(b & 0x0F)")
         }
-        guard n >= 0, n <= bytes.count else { throw ParquetError.malformed("thrift list of \(n) elements") }
+        guard n <= bytes.count else { throw ParquetError.malformed("thrift list of \(n) elements") }
         return (n, t)
     }
 
     /// Reads a struct, calling `field` for every field it contains. `field` returns true when it consumed
     /// the value; when it returns false the value is skipped.
     mutating func readStruct(_ field: (inout ThriftReader, Int16, TCType) throws -> Bool) throws {
-        pushStruct()
+        try pushStruct()
         while let f = try nextField() {
             if !(try field(&self, f.id, f.type)) { try skip(f.type) }
         }
@@ -194,7 +217,8 @@ struct ThriftReader {
             let h = try listHeader()
             for _ in 0..<h.count { try skip(h.type) }
         case .map:
-            let n = Int(try varint())
+            let mapAt = pos
+            let n = try varintCount("thrift map at \(mapAt)")
             if n > 0 {
                 let kv = try byte()
                 guard let kt = TCType(rawValue: kv >> 4), let vt = TCType(rawValue: kv & 0x0F) else {
@@ -203,7 +227,7 @@ struct ThriftReader {
                 for _ in 0..<n { try skip(kt); try skip(vt) }
             }
         case .structure:
-            pushStruct()
+            try pushStruct()
             while let f = try nextField() { try skip(f.type) }
             popStruct()
         }

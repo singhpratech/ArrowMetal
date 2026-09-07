@@ -607,6 +607,10 @@ enum ParquetDecodeSource {
             if (at + 4u > end) { valOffset[pg.nonNullOffset + j] = at; valLength[pg.nonNullOffset + j] = 0u; continue; }
             uint L = pq_le32(data, at);
             at += 4u;
+            // A corrupt page can hold any 32-bit length. Clamping to what is left of the page keeps
+            // `at` monotone and inside the page, so the gather below never reads or writes out of
+            // bounds and never spins for 2^32 iterations on one thread.
+            L = min(L, end - at);
             valOffset[pg.nonNullOffset + j] = at;
             valLength[pg.nonNullOffset + j] = L;
             at += L;
@@ -723,6 +727,9 @@ enum ParquetDecodeSource {
             if (at + 4u > end) { valOffset[base + j] = at; valLength[base + j] = 0u; continue; }
             uint L = pq_le32(data, at);
             at += 4u;
+            // Same clamp as `pq_plain_bytes_scan`: a corrupt dictionary page must not be able to point
+            // the gather at 4 GiB of memory outside the page buffer.
+            L = min(L, end - at);
             valOffset[base + j] = at; valLength[base + j] = L;
             at += L;
         }
