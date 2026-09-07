@@ -42,6 +42,32 @@ public final class ExternalSortOperator: StreamOperator {
     private let context: MetalContext
     private var deleteRuns: Bool
 
+    // MARK: `ORDER BY ... LIMIT n` — top-n, not a sort
+    //
+    // With a limit the answer is n rows, so nothing ever has to spill: the running n rows stay
+    // Metal-resident and each batch folds into them on the GPU thread. That is exactly the argument
+    // the bounded fan-in already used — the global first n are inside the union of each part's first
+    // n — applied one batch earlier, where it is worth a thousand times more: a run was a whole
+    // million-row batch written to disk and read back, and now there are no runs at all.
+    //
+    // Pruning: once n rows are resident, the n-th row's *first* key bounds anything that can still
+    // enter. `>=` keeps the rows that tie it, which is what makes this exact for a multi-key sort
+    // too — a row tying on the first key can still win on the second.
+
+    /// The running first n rows, in sort order. Only used when `limit` is set.
+    private var running: MetalRecordBatch?
+    /// The n-th row's first key, or null while fewer than n rows are resident (or that key is null,
+    /// in which case nulls are still in play and nothing can be pruned).
+    private var threshold: StreamValue = .null
+    /// Set false to measure the unpruned path against the pruned one.
+    public var pruning = true
+    /// Batches in which no row passed the threshold.
+    public private(set) var prunedBatches = 0
+    /// Rows that survived the threshold and were sorted.
+    public private(set) var candidateRows = 0
+    /// True when this sort answers as a resident top-n instead of spilling runs.
+    public var usesTopN: Bool { limit != nil }
+
     public init(keys: [Key], sink: StreamSink, scratch: URL, limit: Int? = nil,
                 deleteRuns: Bool = true, context: MetalContext = .shared) throws {
         self.keys = keys
@@ -55,18 +81,64 @@ public final class ExternalSortOperator: StreamOperator {
 
     public func process(_ batch: MetalRecordBatch) throws -> Any? {
         guard batch.length > 0 else { return nil }
-        let sorted: MetalRecordBatch
+        if let n = limit, n > 0 { try foldTopN(batch, n); return nil }
+        let sorted = try sortWhole(batch)
+        _ = sorted.length
+        return sorted
+    }
+
+    /// A whole batch in sort order.
+    private func sortWhole(_ batch: MetalRecordBatch) throws -> MetalRecordBatch {
         if keys.count == 1 {
             guard let c = batch[keys[0].column] else {
                 throw ArrowMetalError.invalidArrowArray("no column named \(keys[0].column)")
             }
-            sorted = try batch.take(try argsortAny(c, descending: keys[0].descending))
-        } else {
-            sorted = try batch.sorted(by: keys.map { (column: $0.column, descending: $0.descending) })
+            return try batch.take(try argsortAny(c, descending: keys[0].descending))
         }
-        _ = sorted.length
-        return sorted
+        return try batch.sorted(by: keys.map { (column: $0.column, descending: $0.descending) })
     }
+
+    /// The first `n` rows of `batch` in the sort's own total order.
+    ///
+    /// For a single key the GPU top-k selection replaces the full radix sort: it returns *exactly*
+    /// the first k indices `argsort` would (same order-preserving key, same tie-break by row index),
+    /// so this is a cheaper way to compute the same prefix, not a different answer.
+    private func sortedHead(_ batch: MetalRecordBatch, _ n: Int) throws -> MetalRecordBatch {
+        if keys.count == 1, batch.length > n, let c = batch[keys[0].column],
+           let idx = try topKIndicesIfSupported(c, k: n, largest: keys[0].descending) {
+            return try batch.take(idx)
+        }
+        let sorted = try sortWhole(batch)
+        return sorted.length > n ? try sorted.slice(offset: 0, length: n) : sorted
+    }
+
+    /// Folds one batch into the resident first n rows, on the GPU thread.
+    private func foldTopN(_ batch: MetalRecordBatch, _ n: Int) throws {
+        let ctx = batch.firstContext ?? context
+        var work = batch
+        if pruning, !threshold.isNull, let c = batch[keys[0].column],
+           let m = try topNThresholdMask(c, threshold, largest: keys[0].descending) {
+            guard let idx = try survivorIndices(m) else { prunedBatches += 1; return }
+            work = try batch.take(idx)
+        }
+        guard work.length > 0 else { prunedBatches += 1; return }
+        candidateRows += work.length
+
+        let head = try sortedHead(work, n)
+        // `concatColumns` copies inside unified memory on the host, so the head's kernels must have
+        // run before it reads them.
+        try ctx.syncPoint()
+        if let r = running {
+            running = try sortedHead(try concatBatches([r, head]), n)
+            try ctx.syncPoint()
+        } else {
+            running = head
+        }
+        threshold = pruning ? try residentThreshold(running, column: keys[0].column, n: n) : .null
+    }
+
+    /// The run spill is host I/O over batches `process` has already flushed; no command buffer.
+    public var mergeUsesGPU: Bool { false }
 
     public func merge(_ partial: Any) throws {
         guard let b = partial as? MetalRecordBatch, b.length > 0 else { return }
@@ -79,6 +151,15 @@ public final class ExternalSortOperator: StreamOperator {
     }
 
     public func finish() throws -> StreamResult {
+        if usesTopN {
+            var written = 0
+            if let r = running, r.length > 0 { try sink.write(r); written = r.length }
+            try sink.finish()
+            var res = StreamResult()
+            res.rowsOut = written
+            if let c = sink as? CollectingSink { res.batch = try c.table() }
+            return res
+        }
         var intermediates: [URL] = []
         defer {
             if deleteRuns { for u in runURLs { try? FileManager.default.removeItem(at: u) } }

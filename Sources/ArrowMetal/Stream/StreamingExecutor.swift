@@ -93,6 +93,17 @@ public protocol StreamOperator: AnyObject {
     func merge(_ partial: Any) throws
     /// The finished answer.
     func finish() throws -> StreamResult
+    /// True when `merge` records Metal kernels, so the executor wraps the whole merge in **one**
+    /// command buffer. `MetalContext.currentBatch` is thread local and the merge runs on its own
+    /// thread, so without this every dispatch inside a merge is its own commit-and-wait round trip:
+    /// a top-k merge of 200 rows was a concat, a select and a gather over every column — twenty
+    /// round trips for microseconds of work. Operators whose merge is pure host arithmetic return
+    /// false, so they do not pay for an empty command buffer per batch.
+    var mergeUsesGPU: Bool { get }
+}
+
+public extension StreamOperator {
+    var mergeUsesGPU: Bool { true }
 }
 
 // MARK: - The executor
@@ -130,7 +141,14 @@ public final class StreamingExecutor {
                 lock.broadcast()
                 lock.unlock()
                 let m0 = machNow()
-                do { try op.merge(p) } catch {
+                // One command buffer for the whole merge, not one per kernel. The merge thread has no
+                // open batch of its own (`currentBatch` is thread local), so an unbatched merge paid a
+                // commit-and-wait round trip *per dispatch* — a top-k merge of 200 rows is a concat,
+                // a select and a gather over every column, twenty round trips for microseconds of work.
+                do {
+                    if op.mergeUsesGPU { try self.context.batch { try op.merge(p) } }
+                    else { try op.merge(p) }
+                } catch {
                     lock.lock()
                     if mergeError == nil { mergeError = error }
                     producerDone = true
@@ -285,6 +303,9 @@ public final class FilterProjectOperator: StreamOperator {
         return out
     }
 
+    /// The sink writes bytes the GPU stage has already flushed; no command buffer.
+    public var mergeUsesGPU: Bool { false }
+
     public func merge(_ partial: Any) throws {
         guard let b = partial as? MetalRecordBatch else { return }
         rows += b.length
@@ -438,6 +459,9 @@ public final class StreamAggregateOperator: StreamOperator {
         return r
     }
 
+    /// Scalars and a register array: pure host arithmetic, no command buffer needed.
+    public var mergeUsesGPU: Bool { false }
+
     /// The merged sketch of a `count_distinct_approx` aggregate, for callers that want the error bound.
     public func sketch(_ name: String) -> HLLSketch? { sketches[name] }
 }
@@ -534,6 +558,10 @@ public final class StreamGroupByOperator: StreamOperator {
 
     /// True while the dense global table is on the GPU (it turns false after a spill).
     public var usesGPUState: Bool { denseKeyCount != nil && !spilled }
+
+    /// Only the dense path's merge records kernels (the element-wise folds into the GPU state); the
+    /// host table's merge is pure host arithmetic over values `process` already read back.
+    public var mergeUsesGPU: Bool { usesGPUState }
 
     public func process(_ batch: MetalRecordBatch) throws -> Any? {
         context = batch.firstContext ?? .shared
@@ -1257,65 +1285,22 @@ func elementwiseMinMax(_ a: AnyMetalArray?, _ b: AnyMetalArray, isMin: Bool) thr
 }
 
 // MARK: - Streaming top-k
-
-/// Streaming top-k: the k best rows of the whole dataset, by merging per-batch top-k results.
-///
-/// The k best rows of a union are always inside the union of each part's k best, so each batch's
-/// contribution is at most k rows. The running candidate set therefore never exceeds 2k rows: the
-/// merge concatenates the new k with the running k and re-runs the GPU top-k on those 2k rows.
-/// Exact, and the state is O(k) whatever the dataset's size.
-public final class StreamTopKOperator: StreamOperator {
-    public let column: String
-    public let k: Int
-    public let largest: Bool
-    public let filter: Expr?
-    private var running: MetalRecordBatch?
-
-    public init(column: String, k: Int, largest: Bool = true, filter: Expr? = nil) {
-        self.column = column
-        self.k = Swift.max(0, k)
-        self.largest = largest
-        self.filter = filter
-    }
-
-    public func process(_ batch: MetalRecordBatch) throws -> Any? {
-        var work = batch
-        if let f = filter {
-            work = try streamFilterProject(batch, filter: f, projections: nil,
-                                           context: batch.firstContext ?? .shared)
-        }
-        guard work.length > 0, k > 0 else { return nil }
-        let out = try topKRows(work, column: column, k: k, largest: largest)
-        _ = out.length
-        return out
-    }
-
-    public func merge(_ partial: Any) throws {
-        guard let b = partial as? MetalRecordBatch else { return }
-        guard let r = running else { running = b; return }
-        let combined = try concatBatches([r, b])
-        running = try topKRows(combined, column: column, k: k, largest: largest)
-    }
-
-    public func finish() throws -> StreamResult {
-        var r = StreamResult()
-        r.batch = running
-        r.rowsOut = running?.length ?? 0
-        return r
-    }
-}
+//
+// `StreamTopKOperator` lives in `StreamTopN.swift`, with the threshold pruning it shares with the
+// `ORDER BY ... LIMIT n` path.
 
 /// The k best rows of a batch by one column, in ranked order.
 func topKRows(_ batch: MetalRecordBatch, column: String, k: Int, largest: Bool) throws -> MetalRecordBatch {
     guard let c = batch[column] else { throw ArrowMetalError.invalidArrowArray("no column named \(column)") }
     let n = batch.length
-    if n <= k {
-        // Fewer rows than k: order them all, so the merge sees a ranked prefix either way.
-        let idx = try argsortAny(c, descending: largest)
+    if n > k, let idx = try topKIndicesIfSupported(c, k: k, largest: largest) {
         return try batch.take(idx)
     }
-    let idx = try topKIndices(c, k: k, largest: largest)
-    return try batch.take(idx)
+    // Fewer rows than k, or a column the selection kernel has no key for (`utf8`, `binary`, boolean):
+    // order them all and keep the prefix, so the caller always sees a ranked result.
+    let idx = try argsortAny(c, descending: largest)
+    let ranked = try batch.take(idx)
+    return ranked.length > k ? try ranked.slice(offset: 0, length: k) : ranked
 }
 
 func topKIndices(_ c: AnyMetalArray, k: Int, largest: Bool) throws -> MetalArray<Int32> {

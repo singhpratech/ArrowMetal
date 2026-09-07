@@ -215,6 +215,9 @@ final class LazyProjectOperator: StreamOperator {
         return out
     }
 
+    /// The sink writes bytes the GPU stage has already flushed; no command buffer.
+    var mergeUsesGPU: Bool { false }
+
     func merge(_ partial: Any) throws {
         guard let b = partial as? MetalRecordBatch else { return }
         rows += b.length

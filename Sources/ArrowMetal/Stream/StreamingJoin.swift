@@ -45,6 +45,9 @@ public final class BroadcastJoinOperator: StreamOperator {
         return out
     }
 
+    /// The sink writes bytes the GPU stage has already flushed; no command buffer.
+    public var mergeUsesGPU: Bool { false }
+
     public func merge(_ partial: Any) throws {
         guard let b = partial as? MetalRecordBatch else { return }
         rows += b.length

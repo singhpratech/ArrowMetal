@@ -208,6 +208,9 @@ public final class StreamQuantileOperator: StreamOperator {
         return try gpuDigest(col, compression: compression)
     }
 
+    /// Two centroid lists merged on the host; no kernel, so no command buffer.
+    public var mergeUsesGPU: Bool { false }
+
     public func merge(_ partial: Any) throws {
         guard let d = partial as? StreamDigest else { return }
         digest.merge(d)
