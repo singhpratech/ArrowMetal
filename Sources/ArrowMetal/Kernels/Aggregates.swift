@@ -435,7 +435,7 @@ extension MetalBooleanArray {
 // | `hash_first` / `hash_last` | the sort-free grouped extremes over a row index array, then one `take` |
 // | `hash_any` / `hash_all` | group-by max / min over the unpacked boolean bytes — all GPU |
 // | `hash_variance` / `hash_stddev` | two GPU passes in binary64 over the counting-sort order |
-// | `hash_count_distinct` | GPU dictionary encoding of the values, GPU `unique` over packed (key, code) pairs |
+// | `hash_count_distinct` | GPU hash **set** over the (key, value) pair, then a histogram of the occupied slots |
 // | `hash_product` | one host pass over the key and value buffers (there is no 64-bit atomic multiply) |
 // | `hash_approximate_median` | **not implemented** — see `approximateMedian` below |
 

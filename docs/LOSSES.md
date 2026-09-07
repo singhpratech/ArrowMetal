@@ -157,3 +157,64 @@ in `upper`/`lower`/`trim` (3.7 ms → 54 ms at 10M rows) introduced with full-Un
 the hybrid GPU/host driver allocated and walked an n-sized host array even when no row needed the
 host. That is fixed in the commit that adds this page (`upper` 4.6 ms, `trim` 3.0 ms at 10M rows,
 results identical to pyarrow) and the matrix row will be re-measured in the next full run.
+
+## Fixed since the matrix
+
+Four of the rows above have been fixed and will leave this page when the matrix is next run. The
+tables are still the matrix's, so they still show the old numbers; the numbers below were measured
+with `Benchmarks/loss_bench.py` — the same generated columns, the same library idioms and the same
+rule as `full_matrix.py` (one warm-up, best of five) — with the before and after runs interleaved on
+one machine, the "before" being the previous build loaded through `ARROWMETAL_LIB`.
+
+**`count_distinct` by key** (cause 3) — a GPU hash **set** over the (key, value) pair replaces the
+dictionary encoding, the packed int64 column and the `unique()` over it. One insert pass over the
+rows, then one pass over the table's occupied slots, each of which is one distinct pair and increments
+its group's count. Answers identical to the previous implementation over 162 shapes (float64 / float32
+/ int32 values, NaN, ±0.0, inf, 0–100% nulls, 0 to 300k rows, 1 to 997 groups).
+
+| operation | rows | before | after | Polars | pyarrow |
+|---|---:|---:|---:|---:|---:|
+| count_distinct by key (1000 groups) | 10,000,000 | 122.6 ms | **8.6 ms** | 27.1 ms | 325 ms |
+| count_distinct by key (1000 groups) | 50,000,000 | 703 ms | **45.3 ms** | 160 ms | 1,876 ms |
+| count_distinct by key (100000 groups) | 10,000,000 | 123.1 ms | **8.6 ms** | 31.8 ms | 372 ms |
+| count_distinct by key (100000 groups) | 50,000,000 | 704 ms | **45.5 ms** | 154 ms | 1,998 ms |
+| count_distinct by key (10M groups) | 10,000,000 | 125.6 ms | **11.7 ms** | 83.5 ms | 661 ms |
+| count_distinct by key (10M groups) | 50,000,000 | 710 ms | **60.5 ms** | 418 ms | 3,235 ms |
+
+**`tdigest`** (cause 4) — the host walk is gone, and so is the centroid merge it was doing, because
+there was never anything to merge. This digest scales its weight limit by the weight seen *so far*
+rather than by the column's final weight, and the k1 scale function's inverse is bounded by 1, so the
+limit never reaches the next value's weight and every centroid holds exactly one value — at any
+compression, for any column length. The digest of a sorted column is therefore the sorted column, and
+`TDigest.quantile` over unit centroids has a closed form (`TDigest.sortedQuantile`, held against the
+walk itself by `TDigestTests`). The nulls are also compacted away before the sort, because sorting a
+column that carries a validity bitmap costs three times sorting the same values without one. The
+answer is unchanged to the last bit.
+
+| operation | rows | before | after | pyarrow |
+|---|---:|---:|---:|---:|
+| tdigest(float64, q=0.5) | 10,000,000 | 653 ms | **28.7 ms** | 198–246 ms |
+| tdigest(float64, q=0.5) | 50,000,000 | 3,082 ms | **151 ms** | 1,070 ms |
+
+**Two-key group-by** (cause 8) — several integer key columns whose ranges multiply out to at most
+2^24 (and at most the row count) are packed into one key in a single pass instead of being folded
+pairwise through three range encodings and two materialised int64 columns. The dense ids are the
+fold's own, value for value, so the group order is unchanged.
+
+| operation | rows | before | after | Polars | pyarrow |
+|---|---:|---:|---:|---:|---:|
+| sum by two int32 keys (~1024 groups) | 10,000,000 | 6.6–7.2 ms | **2.2–4.9 ms** | 32.3 ms | 5.8 ms |
+| sum by two int32 keys (~1024 groups) | 50,000,000 | 22.3 ms | **6.2 ms** | 168 ms | 22.2 ms |
+
+The 10M row is the one number here that a second job on the machine moves: the operation is now short
+enough that GPU contention shows up in it, and the single-key row next to it (untouched code) moved
+2.8 ms → 5.6 ms across the same runs. At 50M, where the runs were stable, it is 3.6x pyarrow.
+
+**`list_value_length`** (cause 9) — one thread per row read every offset twice and stored four bytes
+at a time, which measured 70 GB/s of real traffic where the element-wise arithmetic kernels next door
+(the same 80 MB, 4-wide vectors) run at 225 GB/s. Eight rows per thread through vector loads and
+stores; a slice that leaves the offsets pointer misaligned keeps the one-row kernel.
+
+| operation | rows | before | after | Polars | pyarrow |
+|---|---:|---:|---:|---:|---:|
+| list_value_length | 10,000,000 | 1.05 ms | **0.35 ms** | 5.19 ms | 0.68 ms |

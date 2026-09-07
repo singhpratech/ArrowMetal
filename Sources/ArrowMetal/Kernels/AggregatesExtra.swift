@@ -18,7 +18,7 @@ import Metal
 // | `hash_pivot_wider` | GPU, one masked `hash_one` per pivot key |
 // | `hash_tdigest` | GPU sort by (group, value), CPU merge of the centroids per group |
 // | `skew` / `kurtosis` | two GPU passes, the same shape as the scalar `variance` |
-// | `tdigest` | GPU sort, CPU merge of the centroids |
+// | `tdigest` | GPU sort; the digest of a sorted column is the column, so the quantile is read out of it |
 //
 // Precision. The fused `hash_min_max` is exact for every type. `hash_product` wraps in 64 bits for
 // integers exactly as the scalar `product` does, multiplies Float32 in `float` and Float64 through the
