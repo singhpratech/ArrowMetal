@@ -412,3 +412,80 @@ def test_extension_results_join_like_any_table(ext_con):
         select count(*) from arrowmetal_group_by('t', 'k', 'v') g join t on t.k = g.key
     """).fetchone()[0]
     assert got == ext_con.sql("select count(*) from t").fetchone()[0]
+
+
+# ---------------------------------------------------------------------------------------------------
+# Regression tests from the pre-release integration review.
+# ---------------------------------------------------------------------------------------------------
+
+def test_streaming_refuses_a_column_that_is_not_there(con):
+    """`columns=` used to hand back the *last* column of the batch for a name that is not in it.
+
+    `RecordBatch.schema.get_field_index(name)` answers -1 for an unknown name and
+    `record_batch.column(-1)` is the last column, so a typo in an aggregate's column name summed a
+    different column and said nothing. Every path that takes `columns=` goes through here.
+    """
+    make_table(con, 5_000)
+    with pytest.raises(am.ArrowMetalError, match="no column"):
+        list(am.duckdb_batches(con.sql("select k, v from t"), columns=["amuont"]))
+    with pytest.raises(am.ArrowMetalError, match="no column"):
+        am.duckdb_aggregate(con.sql("select k, v from t"), {"total": ("sum", "amuont")})
+    # the spelled-right form is unaffected
+    got = am.duckdb_aggregate(con.sql("select k, v from t"), {"total": ("sum", "v")})
+    assert got["total"] == con.sql("select sum(v) from t").fetchone()[0]
+
+
+def test_streaming_count_of_nothing_is_zero(con):
+    """SQL's `count` over no rows is 0, and `count_distinct` here already answered 0; `count`
+    answered None, because its accumulator started at None and no batch ever ran."""
+    make_table(con, 1_000)
+    empty = con.sql("select k, v from t where v < 0")
+    got = am.duckdb_aggregate(empty, {"n": ("count", "v"), "d": ("count_distinct", "v"),
+                                      "total": ("sum", "v"), "lo": ("min", "v"),
+                                      "avg": ("mean", "v")})
+    assert got["n"] == 0
+    assert got["d"] == 0
+    # sum/min/mean of nothing stay NULL, which is what SQL says too
+    assert (got["total"], got["lo"], got["avg"]) == (None, None, None)
+    assert con.sql("select count(v), sum(v), min(v), avg(v) from t where v < 0").fetchone() \
+        == (got["n"], got["total"], got["lo"], got["avg"])
+
+
+def test_to_duckdb_takes_the_scalars_a_reduction_actually_returns(con):
+    """`arrow_table` recognised a scalar by `isinstance(value, (int, float, bool))`, so a numpy
+    scalar (`np.int64`, what a numpy-backed reduction hands back) and a plain string both fell
+    through to `pa.array(value)` and raised `TypeError: not iterable`."""
+    import numpy as np
+    rel = am.to_duckdb(con, "scalars", {"n": np.int64(7), "f": np.float64(1.5),
+                                        "label": "total", "nothing": None, "plain": 3})
+    assert rel.fetchall() == [(7, 1.5, "total", None, 3)]
+
+
+def test_streaming_group_by_key_order_is_the_gpu_group_order(con):
+    """`duckdb_group_by` said "ordered by first appearance". The order is the per-batch group-by's
+    own: ascending by key for a numeric key, whatever the rows came in as."""
+    con.execute("create table go as select * from (values (5, 1), (1, 2), (3, 3)) v(k, x)")
+    got = am.duckdb_group_by(con.sql("select k, x from go"), "k", {"total": ("sum", "x")})
+    assert got.column("k").to_pylist() == [1, 3, 5]
+    assert got.column("total").to_pylist() == [2, 3, 1]
+
+
+def test_the_public_c_header_compiles():
+    """The published header once declared `am_plan_source` twice, as a typedef and as a function --
+    "redefinition as a different kind of symbol" in both C and C++, so no C consumer could compile it
+    and this repository's own DuckDB extension never built (every `@extension` test skipped). The
+    function is `am_plan_source_create` now; this keeps the header compiling as C."""
+    import shutil
+    import subprocess
+    import tempfile
+    cc = shutil.which("cc") or shutil.which("clang")
+    if cc is None:
+        pytest.skip("no C compiler on PATH")
+    header = os.path.join(REPO, "include")
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "include_only.c")
+        with open(src, "w") as fh:
+            fh.write('#include "arrowmetal.h"\nint main(void) { return 0; }\n')
+        out = subprocess.run([cc, "-fsyntax-only", "-I", header, src],
+                             capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr

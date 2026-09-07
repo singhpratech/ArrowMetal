@@ -317,9 +317,10 @@ single-pass float operation stays in pandas there.
 - **`merge` is the `validate="m:1"` inner join.** Duplicate or null keys on the right frame, and any
   outer/left/right join, fall back. A many-to-many join needs a GPU expansion the C ABI does not have
   yet.
-- **`str.upper`/`str.lower` are ASCII-guarded.** The GPU kernels cover ASCII, Latin-1 Supplement and
-  Latin Extended-A; accel mode checks for pure ASCII on the GPU and falls back otherwise, so it never
-  returns a different string than pandas would.
+- **`str.upper`/`str.lower` are ASCII-guarded in accel mode.** The kernels implement Unicode's simple
+  1:1 mapping over every script, but pandas applies the *full* mapping (`ß` → `SS`), so accel mode
+  checks for pure ASCII on the GPU and falls back otherwise; it never returns a different string
+  than pandas would. The `.am` accessor runs the simple mapping on anything.
 - **`str.contains` with a real regex falls back.** A literal pattern runs on the GPU.
 - **Float reductions add in a different order.** A GPU tree reduction is not bit-identical to
   pandas' pairwise sum; expect agreement to about 1e-12 relative, not to the last bit.
@@ -339,7 +340,10 @@ single-pass float operation stays in pandas there.
   whichever `__getitem__` CPython first saw — an interpreter-level artifact of repeatedly rewriting a
   dunder. Use `accel.disabled()` to turn the layer off for a block instead.
 - **Threads.** The wrappers are re-entrancy-guarded per thread, but the GPU queue underneath is a
-  single device queue; several Python threads calling into it will serialise.
+  single device queue; several Python threads calling into it will serialise. `disabled()`,
+  `set_threshold()` and `route_all()` are **process-wide**, not per thread: while one thread is
+  inside a `disabled()` block every thread runs in pandas. The answers do not change — only where
+  the work happens, and those calls land in neither `stats().gpu` nor `stats().cpu`.
 
 ## Tests
 

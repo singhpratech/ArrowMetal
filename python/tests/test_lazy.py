@@ -554,3 +554,114 @@ def test_optimized_and_unoptimized_agree(sales):
     q = (am.scan(sales).select(am.col("region").alias("r"), am.col("qty").alias("q"))
          .filter(am.col("r") == 4).sort("q"))
     approx(rows(q.collect(optimize=True), sort=False), rows(q.collect(optimize=False), sort=False))
+
+
+# --------------------------------------------------------------------------------------------------
+# 49-53: what the Python side costs on top of the engine
+
+
+def _count_imports(monkeypatch):
+    """Collects every array `lazy.py` imports into Metal memory."""
+    seen = []
+    real = am.MetalArray.from_arrow.__func__
+
+    def counting(cls, obj):
+        seen.append(obj)
+        return real(cls, obj)
+
+    monkeypatch.setattr(am.MetalArray, "from_arrow", classmethod(counting))
+    return seen
+
+
+def test_scan_imports_each_column_once(monkeypatch):
+    t = pa.table({"a": pa.array([1, 2, 3], pa.int32()), "b": pa.array([4.0, 5.0, 6.0])})
+    seen = _count_imports(monkeypatch)
+    for _ in range(3):
+        am.scan(t).select("a", "b").collect()
+    assert len(seen) == 2, f"{len(seen)} imports for 2 columns over 3 collects"
+
+
+def test_scan_imports_only_the_columns_the_plan_reads(sales):
+    # `sales` has region, amount, qty, name and day; this query names two of them.
+    src = am.lazy._source_for(sales)
+    src._cols.clear()
+    am.scan(sales).filter(am.col("qty") > 10).group_by("region").agg(am.agg.count("n")).collect()
+    assert sorted(src._cols) == ["qty", "region"], sorted(src._cols)
+
+
+def test_scan_imports_every_column_when_the_plan_may_read_any(sales):
+    # A plan that ends in a filter still carries the whole schema out, so nothing can be pruned.
+    src = am.lazy._source_for(sales)
+    src._cols.clear()
+    am.scan(sales).filter(am.col("qty") > 10).collect()
+    assert sorted(src._cols) == sorted(sales.column_names), sorted(src._cols)
+
+
+def test_columns_and_warmup_do_not_import_the_table(sales):
+    src = am.lazy._source_for(sales)
+    src._cols.clear()
+    q = am.scan(sales).select("region", "qty")
+    assert q.columns == ["region", "qty"]
+    q.warmup()
+    assert src._cols == {}, "a schema check or a warm-up imported a whole column"
+
+
+def test_bare_count_still_sees_the_rows(sales):
+    # The plan names no source column, so pruning has to keep one anyway: no columns, no rows.
+    got = am.scan(sales).agg(am.agg.count("n")).collect()
+    assert rows(got) == [(sales.num_rows,)]
+    got = am.scan(sales).filter(am.col("qty") > 10).agg(am.agg.count("n")).collect()
+    want = pl.from_arrow(sales).lazy().filter(pl.col("qty") > 10).select(pl.len().alias("n")).collect()
+    approx(rows(got), rows(want))
+
+
+def test_rescanning_a_changed_dict_sees_the_change():
+    d = {"a": pa.array([1, 2, 3], pa.int32())}
+    assert rows(am.scan(d).select("a").collect()) == [(1,), (2,), (3,)]
+    d["a"] = pa.array([7, 8, 9], pa.int32())
+    assert rows(am.scan(d).select("a").collect()) == [(7,), (8,), (9,)]
+
+
+def test_rescanning_a_mutated_polars_frame_sees_the_change():
+    df = pl.DataFrame({"a": [1, 2, 3]})
+    assert am.scan(df).columns == ["a"]
+    df.insert_column(1, pl.Series("b", [4, 5, 6]))          # polars mutates in place
+    assert am.scan(df).columns == ["a", "b"]
+    assert rows(am.scan(df).select("b").collect()) == [(4,), (5,), (6,)]
+
+
+def test_python_path_costs_almost_nothing_over_the_resident_path():
+    """A warm `collect()` over a pyarrow Table costs no more than one over GPU-resident arrays.
+
+    The bound is what separates "the Python side hands the plan over" from "the Python side is doing
+    work". Before the imports were cached, scanning a table cost ~6 ms more per collect at 20M rows
+    than scanning the same columns already in Metal memory, and the buffer churn that caused cost
+    ~9 ms more again. 3 ms at 2M rows is far inside that and far outside the run-to-run spread of a
+    busy machine, which measured under 0.8 ms.
+    """
+    import time
+
+    n = 2_000_000
+    rng = random.Random(5)
+    region = pa.array([rng.randrange(200) for _ in range(n)], pa.int32())
+    amount = pa.array([rng.randrange(1000) for _ in range(n)], pa.int64())
+    table = pa.table({"region": region, "amount": amount})
+    resident = {"region": am.array(region), "amount": am.array(amount)}
+
+    def collect(source):
+        return (am.scan(source).filter(am.col("amount") > 100)
+                .group_by(am.col("region")).agg(am.agg.sum(am.col("amount")).alias("total"))
+                .sort("total", descending=True).limit(5).collect())
+
+    def best(source, iters=9):
+        collect(source)                                # warm the imports and the pipeline cache
+        out = float("inf")
+        for _ in range(iters):
+            t0 = time.perf_counter()
+            collect(source)
+            out = min(out, time.perf_counter() - t0)
+        return out * 1000
+
+    approx(rows(collect(table)), rows(collect(resident)))
+    gpu, python = best(resident), best(table)
+    assert python < gpu + 3.0, f"python path {python:.2f} ms vs resident path {gpu:.2f} ms"

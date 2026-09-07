@@ -22,12 +22,15 @@ An Arrow-backed column is passed through untouched, so a NaN stays a NaN and a n
 Importing this module registers the accessors; it is safe to import twice.
 """
 
+import re as _re
+
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 
-from . import (ArrowMetalError, MetalArray, group_by as _am_group_by,
-               lexsort_indices as _am_lexsort, query as _am_query, _as_pa_array)
+from . import (ArrowMetalError, Expr as _Expr, MetalArray, Query as _Query,
+               group_by as _am_group_by, lexsort_indices as _am_lexsort, query as _am_query,
+               _as_pa_array)
 
 __all__ = ["from_pandas", "to_pandas", "to_arrow", "zero_copy_report", "Conversion",
            "SeriesAccessor", "DataFrameAccessor", "register", "GPUGroupBy"]
@@ -417,6 +420,30 @@ def str_op(col, op, pattern=None):
     raise ArrowMetalError(f"no GPU kernel for str.{op}")
 
 
+#: `(col "name")` in a serialised query, with the grammar's \" and \\ escapes. The same scan
+#: `polars_bridge._COL_REF` does: the wire form names every column the query touches, so one pass
+#: over it answers exactly which columns have to be lifted -- no walking the expression tree.
+_COL_REF = _re.compile(r'\(col\s+"((?:[^"\\]|\\.)*)"\s*\)')
+
+
+def _query_columns(q, available):
+    """The frame columns `q` reads, in frame order.
+
+    Lifting a column costs a page map and can fail outright (an object or struct column is not
+    something the expression compiler reads), so a query must not pay for columns it never names.
+    A query that names nothing at all falls back to every column, which is the only thing that can
+    give the kernel a row count.
+    """
+    text = q.sexpr() if isinstance(q, (_Query, _Expr)) else str(q)
+    wanted = {n.replace('\\"', '"').replace("\\\\", "\\") for n in _COL_REF.findall(text)}
+    if not wanted:
+        return list(available)
+    missing = wanted - set(available)
+    if missing:
+        raise ArrowMetalError(f"query names column(s) not in the frame: {sorted(missing)}")
+    return [c for c in available if c in wanted]
+
+
 _COMPARE = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
 
 
@@ -611,9 +638,11 @@ class DataFrameAccessor:
 
             df.am.query(am.filter(am.col("x") > 3).sum(am.col("y")))
 
-        Columns are lifted zero-copy where the dtype allows. Column results come back as an
-        Arrow-backed DataFrame; scalar results come back as Python scalars."""
-        cols = {c: _metal(self._df[c]) for c in self._df.columns}
+        Only the columns the query names are lifted, zero-copy where the dtype allows: a frame that
+        also carries an object or struct column the expression compiler cannot read is fine as long
+        as the query does not name it. Column results come back as an Arrow-backed DataFrame;
+        scalar results come back as Python scalars."""
+        cols = {c: _metal(self._df[c]) for c in _query_columns(q, self._df.columns)}
         out = _am_query(cols, q)
         if isinstance(out, dict) and out and all(isinstance(v, (pa.Array, pa.ChunkedArray))
                                                  for v in out.values()):

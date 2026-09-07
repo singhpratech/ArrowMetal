@@ -139,7 +139,14 @@ public final class ParquetFile: @unchecked Sendable {
         var fields: [ParquetField] = []
 
         /// Recursive descent; returns the field for the subtree rooted at `elements[i]`.
+        ///
+        /// `num_children` comes straight out of the footer, so it can claim more children than the
+        /// schema list holds. Every index is checked here rather than trusting it: an unchecked
+        /// `elements[i]` on a crafted file is a bounds trap, which takes the process down.
         func node(_ i: Int, def: Int, rep: Int, path: [String]) throws -> ParquetField {
+            guard i >= 0, i < elements.count else {
+                throw ParquetError.malformed("schema element \(i) is outside 0..<\(elements.count)")
+            }
             let e = elements[i]
             var d = def, rp = rep
             switch e.repetition {
@@ -150,13 +157,24 @@ public final class ParquetFile: @unchecked Sendable {
             let myPath = path + [e.name]
             if e.numChildren == 0 {
                 guard let t = e.type else { throw ParquetError.malformed("leaf \(e.name) has no physical type") }
+                // `type_length` is the value width for FIXED_LEN_BYTE_ARRAY and multiplies every
+                // buffer size downstream, so a negative or absurd one has to stop here rather than
+                // overflow an allocation. Real ones are tiny: 16 for UUID, at most 32 for a decimal.
+                if t == .fixedLenByteArray {
+                    guard e.typeLength > 0, e.typeLength <= (1 << 20) else {
+                        throw ParquetError.malformed(
+                            "FIXED_LEN_BYTE_ARRAY column \(e.name) declares a length of \(e.typeLength)")
+                    }
+                }
                 let leaf = ParquetLeaf(index: leaves.count, element: e, physical: t, path: myPath,
                                        maxDefinition: d, maxRepetition: rp)
                 leaves.append(leaf)
                 return ParquetField(name: e.name, kind: .leaf(leaf), nullable: e.repetition == .optional)
             }
             var children: [ParquetField] = []
-            for _ in 0..<e.numChildren {
+            // `num_children` is a signed thrift i32: a negative one would make `0..<n` a range with a
+            // reversed bound, which is a trap, not an error.
+            for _ in 0..<Swift.max(e.numChildren, 0) {
                 let c = index
                 index += 1
                 children.append(try node(c, def: d, rep: rp, path: myPath))
@@ -181,7 +199,7 @@ public final class ParquetFile: @unchecked Sendable {
         }
 
         let root = elements[0]
-        for _ in 0..<root.numChildren {
+        for _ in 0..<Swift.max(root.numChildren, 0) {
             let c = index
             index += 1
             fields.append(try node(c, def: 0, rep: 0, path: []))

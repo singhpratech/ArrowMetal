@@ -70,8 +70,8 @@ public enum StreamValue: Hashable, Comparable, @unchecked Sendable {
 // MARK: - Reading a Metal column out to host values
 
 extension AnyMetalArray {
-    /// Copies this column out to host values. Only used on the *small* results the GPU hands the merge
-    /// stage (group keys, top-k rows, sort-run rows), never on a whole streamed batch.
+    /// Copies this column out to host values. Only used on the *small* results the GPU hands the
+    /// merge stage (group keys, top-k rows, sort-run rows), never on a whole streamed batch.
     public func streamValues() throws -> [StreamValue] {
         switch self {
         case .int8(let a): return a.toArray().map { $0.map { .int(Int64($0)) } ?? .null }
@@ -99,6 +99,8 @@ extension AnyMetalArray {
         }
     }
 
+    // `dictionaryDecoded()` is defined in Engine/Concat.swift and shared with the engine.
+
     /// Rebuilds a column of this column's own type from host values.
     public func rebuild(_ vals: [StreamValue], context: MetalContext? = nil) throws -> AnyMetalArray {
         let ctx = context ?? anyContext
@@ -113,18 +115,31 @@ extension AnyMetalArray {
             switch v { case .string(let s): return s; case .bytes(let b): return String(decoding: b, as: UTF8.self)
             case .int(let x): return String(x); case .double(let x): return String(x); default: return nil } } }
         switch self {
-        case .int8: return .int8(try MetalArray<Int8>(ints().map { $0.map { Int8(truncatingIfNeeded: $0) } }, context: ctx))
-        case .int16: return .int16(try MetalArray<Int16>(ints().map { $0.map { Int16(truncatingIfNeeded: $0) } }, context: ctx))
-        case .int32: return .int32(try MetalArray<Int32>(ints().map { $0.map { Int32(truncatingIfNeeded: $0) } }, context: ctx))
-        case .int64: return .int64(try MetalArray<Int64>(ints(), context: ctx))
-        case .uint8: return .uint8(try MetalArray<UInt8>(uints().map { $0.map { UInt8(truncatingIfNeeded: $0) } }, context: ctx))
-        case .uint16: return .uint16(try MetalArray<UInt16>(uints().map { $0.map { UInt16(truncatingIfNeeded: $0) } }, context: ctx))
-        case .uint32: return .uint32(try MetalArray<UInt32>(uints().map { $0.map { UInt32(truncatingIfNeeded: $0) } }, context: ctx))
-        case .uint64: return .uint64(try MetalArray<UInt64>(uints(), context: ctx))
-        case .float32: return .float32(try MetalArray<Float>(dbls().map { $0.map { Float($0) } }, context: ctx))
-        case .float64: return .float64(try MetalArray<Double>(dbls(), context: ctx))
+        case .int8:
+            return .int8(try MetalArray<Int8>(ints().map { $0.map { Int8(truncatingIfNeeded: $0) } }, context: ctx))
+        case .int16:
+            return .int16(try MetalArray<Int16>(ints().map { $0.map { Int16(truncatingIfNeeded: $0) } }, context: ctx))
+        case .int32:
+            return .int32(try MetalArray<Int32>(ints().map { $0.map { Int32(truncatingIfNeeded: $0) } }, context: ctx))
+        case .int64:
+            return .int64(try MetalArray<Int64>(ints(), context: ctx))
+        case .uint8:
+            return .uint8(try MetalArray<UInt8>(uints().map { $0.map { UInt8(truncatingIfNeeded: $0) } }, context: ctx))
+        case .uint16:
+            return .uint16(try MetalArray<UInt16>(uints().map { $0.map { UInt16(truncatingIfNeeded: $0) } }, context: ctx))
+        case .uint32:
+            return .uint32(try MetalArray<UInt32>(uints().map { $0.map { UInt32(truncatingIfNeeded: $0) } }, context: ctx))
+        case .uint64:
+            return .uint64(try MetalArray<UInt64>(uints(), context: ctx))
+        case .float32:
+            return .float32(try MetalArray<Float>(dbls().map { $0.map { Float($0) } }, context: ctx))
+        case .float64:
+            return .float64(try MetalArray<Double>(dbls(), context: ctx))
         case .boolean:
-            let bits = vals.map { v -> Bool? in if case .bool(let b) = v { return b } else if let d = v.asDouble { return d != 0 } else { return nil } }
+            let bits = vals.map { v -> Bool? in
+                if case .bool(let b) = v { return b }
+                return v.asDouble.map { $0 != 0 }
+            }
             return .boolean(try makeBooleanArray(bits, context: ctx))
         case .string: return .string(try MetalStringArray(strs(), context: ctx))
         case .binary:
@@ -162,20 +177,22 @@ public func makeBooleanArray(_ vals: [Bool?], context: MetalContext = .shared) t
 public func concatColumns(_ cols: [AnyMetalArray]) throws -> AnyMetalArray {
     guard let head = cols.first else { throw ArrowMetalError.invalidArrowArray("concat of no columns") }
     if cols.count == 1 { return head }
+    // One `case` per physical layout. `same(_:_:_:)` unwraps every column as the head's type or
+    // reports the mismatch, so a concat of mixed types fails naming the type it expected.
     switch head {
-    case .int8: return .int8(try concatPrimitive(cols.map { try pick($0, "int8") { if case .int8(let a) = $0 { return a }; return nil } }))
-    case .int16: return .int16(try concatPrimitive(cols.map { try pick($0, "int16") { if case .int16(let a) = $0 { return a }; return nil } }))
-    case .int32: return .int32(try concatPrimitive(cols.map { try pick($0, "int32") { if case .int32(let a) = $0 { return a }; return nil } }))
-    case .int64: return .int64(try concatPrimitive(cols.map { try pick($0, "int64") { if case .int64(let a) = $0 { return a }; return nil } }))
-    case .uint8: return .uint8(try concatPrimitive(cols.map { try pick($0, "uint8") { if case .uint8(let a) = $0 { return a }; return nil } }))
-    case .uint16: return .uint16(try concatPrimitive(cols.map { try pick($0, "uint16") { if case .uint16(let a) = $0 { return a }; return nil } }))
-    case .uint32: return .uint32(try concatPrimitive(cols.map { try pick($0, "uint32") { if case .uint32(let a) = $0 { return a }; return nil } }))
-    case .uint64: return .uint64(try concatPrimitive(cols.map { try pick($0, "uint64") { if case .uint64(let a) = $0 { return a }; return nil } }))
-    case .float32: return .float32(try concatPrimitive(cols.map { try pick($0, "float32") { if case .float32(let a) = $0 { return a }; return nil } }))
-    case .float64: return .float64(try concatPrimitive(cols.map { try pick($0, "float64") { if case .float64(let a) = $0 { return a }; return nil } }))
-    case .boolean: return .boolean(try concatBoolean(cols.map { try pick($0, "bool") { if case .boolean(let a) = $0 { return a }; return nil } }))
-    case .string: return .string(try concatStrings(cols.map { try pick($0, "utf8") { if case .string(let a) = $0 { return a }; return nil } }, binary: false))
-    case .binary: return .binary(try concatStrings(cols.map { try pick($0, "binary") { if case .binary(let a) = $0 { return a }; return nil } }, binary: true))
+    case .int8: return .int8(try concatPrimitive(cols.map { try same($0, "int8", asInt8) }))
+    case .int16: return .int16(try concatPrimitive(cols.map { try same($0, "int16", asInt16) }))
+    case .int32: return .int32(try concatPrimitive(cols.map { try same($0, "int32", asInt32) }))
+    case .int64: return .int64(try concatPrimitive(cols.map { try same($0, "int64", asInt64) }))
+    case .uint8: return .uint8(try concatPrimitive(cols.map { try same($0, "uint8", asUInt8) }))
+    case .uint16: return .uint16(try concatPrimitive(cols.map { try same($0, "uint16", asUInt16) }))
+    case .uint32: return .uint32(try concatPrimitive(cols.map { try same($0, "uint32", asUInt32) }))
+    case .uint64: return .uint64(try concatPrimitive(cols.map { try same($0, "uint64", asUInt64) }))
+    case .float32: return .float32(try concatPrimitive(cols.map { try same($0, "float32", asF32) }))
+    case .float64: return .float64(try concatPrimitive(cols.map { try same($0, "float64", asF64) }))
+    case .boolean: return .boolean(try concatBoolean(cols.map { try same($0, "bool", asBool) }))
+    case .string: return .string(try concatStrings(cols.map { try same($0, "utf8", asUtf8) }, binary: false))
+    case .binary: return .binary(try concatStrings(cols.map { try same($0, "binary", asBytes) }, binary: true))
     case .temporal(let ht):
         let tt = ht.type
         var i32: [MetalArray<Int32>] = [], i64: [MetalArray<Int64>] = []
@@ -208,10 +225,27 @@ public func concatBatches(_ batches: [MetalRecordBatch]) throws -> MetalRecordBa
     return try MetalRecordBatch(names: head.names, columns: cols)
 }
 
-private func pick<T>(_ c: AnyMetalArray, _ what: String, _ f: (AnyMetalArray) -> T?) throws -> T {
-    guard let v = f(c) else { throw ArrowMetalError.unsupportedType("concat expected \(what), got \(c.arrowFormat)") }
+private func same<T>(_ c: AnyMetalArray, _ what: String, _ f: (AnyMetalArray) -> T?) throws -> T {
+    guard let v = f(c) else {
+        throw ArrowMetalError.unsupportedType("concat expected \(what), got \(c.arrowFormat)")
+    }
     return v
 }
+
+// One unwrapper per physical layout, so the `concatColumns` switch above stays one line per case.
+private func asInt8(_ c: AnyMetalArray) -> MetalArray<Int8>? { if case .int8(let a) = c { return a }; return nil }
+private func asInt16(_ c: AnyMetalArray) -> MetalArray<Int16>? { if case .int16(let a) = c { return a }; return nil }
+private func asInt32(_ c: AnyMetalArray) -> MetalArray<Int32>? { if case .int32(let a) = c { return a }; return nil }
+private func asInt64(_ c: AnyMetalArray) -> MetalArray<Int64>? { if case .int64(let a) = c { return a }; return nil }
+private func asUInt8(_ c: AnyMetalArray) -> MetalArray<UInt8>? { if case .uint8(let a) = c { return a }; return nil }
+private func asUInt16(_ c: AnyMetalArray) -> MetalArray<UInt16>? { if case .uint16(let a) = c { return a }; return nil }
+private func asUInt32(_ c: AnyMetalArray) -> MetalArray<UInt32>? { if case .uint32(let a) = c { return a }; return nil }
+private func asUInt64(_ c: AnyMetalArray) -> MetalArray<UInt64>? { if case .uint64(let a) = c { return a }; return nil }
+private func asF32(_ c: AnyMetalArray) -> MetalArray<Float>? { if case .float32(let a) = c { return a }; return nil }
+private func asF64(_ c: AnyMetalArray) -> MetalArray<Double>? { if case .float64(let a) = c { return a }; return nil }
+private func asBool(_ c: AnyMetalArray) -> MetalBooleanArray? { if case .boolean(let a) = c { return a }; return nil }
+private func asUtf8(_ c: AnyMetalArray) -> MetalStringArray? { if case .string(let a) = c { return a }; return nil }
+private func asBytes(_ c: AnyMetalArray) -> MetalStringArray? { if case .binary(let a) = c { return a }; return nil }
 
 func concatPrimitive<T: ArrowPrimitive>(_ arrays: [MetalArray<T>]) throws -> MetalArray<T> {
     guard let head = arrays.first else { throw ArrowMetalError.invalidArrowArray("concat of no arrays") }

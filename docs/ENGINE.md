@@ -83,12 +83,12 @@ Every rule preserves the result exactly — same rows, same nulls. `explain()` l
 
 | Rule | What it does |
 |---|---|
-| `constant_folding` | evaluates literal-only subtrees, collapses `and(true, x)`, `x * 1`, `not(not x)`, dead `coalesce` arms |
+| `constant_folding` | evaluates literal-only subtrees, collapses `and(true, x)`, `x * 1`, `not(not x)`, dead `coalesce` arms. Only the **Kleene** forms absorb a literal (`and_kleene(false, x)` → `false`): plain `and`/`or` propagate nulls, so `and(false, null)` is null and does not fold. `if_else(c, a, a)` does not fold either — Arrow's `if_else` is null wherever `c` is |
 | `filter_fusion` | `filter(filter(x, a), b)` → `filter(x, and(a, b))`: one compaction pipeline instead of two |
 | `predicate_pushdown` | moves each conjunct as far down as it can go: through projections (substituting the projected expression), through `with_columns`, below sorts, below a group-by when it only touches key columns, into each side of a join where the join kind allows, into every branch of a concat, and below an explode |
 | `projection_pruning` | works out what each node's parent actually needs and narrows the scan to those columns; drops projection and window outputs nothing reads |
-| `expression_cse` | drops duplicate outputs with the same canonical text (the fused kernel's own CSE only sees one query at a time) |
-| `join_reorder` | an inner join is commutative and `hashJoin` builds its table from the **right** side, so the smaller estimated input is put there; a projection on top restores the caller's column order |
+| `expression_cse` | drops duplicate `with_columns` outputs with the same canonical text (the fused kernel's own CSE only sees one query at a time). `select` is left alone: it names its outputs positionally, so a repeated one really is a repeated column |
+| `join_reorder` | an inner join is commutative and `hashJoin` builds its table from the **right** side, so the smaller estimated input is put there; a projection on top restores the caller's column order. The swap permutes the rows, so it only fires below a sort, a whole-input reduction or a group-by — never where "Row order" below is still observable |
 
 Two rules are deliberately absent. A filter is **not** pushed below a `limit`, because that changes
 which rows survive. A filter is **not** pushed below a `window`, because a window function's value
@@ -186,6 +186,58 @@ next dispatch: `GroupByKeys` (the number of groups), the hash join (the number o
 selection, and `explode` and `slice` (which read offsets). `flush(reopen: true)` commits, waits and
 reopens the batch at each, so batching resumes immediately afterwards. Intermediate buffers come from
 and go back to `MetalContext.pool`, which parks rather than recycles while a batch is open.
+
+## Getting the data in
+
+An engine that runs a query in 10 ms can lose 100 ms getting to it, and this one did. `am.scan(table)`
+handed the plan its columns as `pyarrow` arrays and `collect()` imported every one of them into Metal
+memory, on every run. At 20M rows that was 6 ms of `makeBuffer(bytesNoCopy:)` and page residency per
+call — and worse, the allocation and teardown of a fresh 240 MB import each time churned the buffer
+pool, so a query whose kernels take 10 ms took 25.
+
+So the Python side imports once. `am.scan()` imports nothing at all; the first `collect()` imports the
+columns the plan reads and caches them on the object it scanned, keyed by identity and held by a
+weak reference, so the cache dies with the table and a second scan of the same table costs nothing. An
+imported `MetalArray` owns the Arrow C Data Interface release callback of the array it came from, so it
+keeps the producer's buffers alive by itself; caching it is safe even after the `pyarrow.Array` is
+gone. A chunked column is rechunked on first use rather than on the way into every query.
+
+Which columns get imported is worked out from the plan text before the plan is sent, so a 200-column
+table scanned for two of them imports two. It is the same question `projection_pruning` answers in the
+optimizer, asked one step earlier — the optimizer can only prune columns that are already on the GPU.
+The Python answer is deliberately conservative: a superset is always safe, and anything it does not
+recognise (a renaming join, an escaped column name, a hand-built plan node) means "every column".
+`am.scan(table, columns=[...])` names them by hand for the cases it gives up on.
+
+`LazyFrame.columns` and `LazyFrame.warmup()` register a *prefix* of each source, taken before the
+import, so neither touches the whole table. `explain()` is the exception: it registers every column and
+every row, because the `n/m columns` it prints and the cardinalities that pick a join order are
+statements about the real table.
+
+That leaves the one cost that cannot be cached away: the first `collect()` in a process generates and
+compiles MSL for the kernels its plan lowers to. For the query below that is ~45 ms of a 76 ms cold
+run; every later run finds them in `MetalContext`'s pipeline cache. `q.warmup()` runs the plan over
+4096 rows per source to move that cost off the first real query.
+
+M4 Max, 20M rows, `filter(amount > 100).group_by(region).agg(sum(amount)).sort(total, desc).limit(5)`
+over a two-column `pyarrow.Table`, `time.perf_counter` around each stage of a warm `collect()`:
+
+| stage | before | after |
+|---|---:|---:|
+| `am.scan(table)` | 0.02 ms | 0.01 ms |
+| building the operators | 0.05 ms | 0.02 ms |
+| `plan_json()` (325 bytes) | 0.03 ms | 0.01 ms |
+| importing + registering the sources | 6.22 ms | 0.02 ms |
+| `am_plan_run` | 16.39 ms | 10.14 ms |
+| materialising the result | 0.12 ms | 0.07 ms |
+| **total** | **22.85 ms** | **10.28 ms** |
+| first `collect()` in a fresh process | 92 ms | 76 ms |
+
+The `am_plan_run` column moved because the import churn was making the kernels slower, not because the
+kernels changed: parsing and optimizing the plan is 0.24 ms of it, and the Python side around it is
+now 0.14 ms. Measured against the same query over columns already resident in Metal memory, scanning a
+`pyarrow.Table` costs +0.05 ms at 2M rows and −0.12 ms at 50M — inside the noise.
+`python/tests/test_lazy.py` holds that bound at 3 ms.
 
 ## The join matrix
 
@@ -288,7 +340,7 @@ wrapper, because a plan is a tree of records with optional fields.
 | `window` | `input`, `specs`: `[{name, fn, column?, n?, partition_by?, order_by?}, …]` |
 | `explode` | `input`, `columns` |
 
-Over the C ABI the tables are registered once (`am_plan_source`, which takes the `am_array` handles the
+Over the C ABI the tables are registered once (`am_plan_source_create`, which takes the `am_array` handles the
 caller already holds) and the plan text carries no data, so the same text can be re-run against new
 sources and `am_plan_explain` can print a plan without touching the GPU. `include/arrowmetal.h` carries
 the same grammar for C consumers.
@@ -378,9 +430,13 @@ for these shapes is between 1M and 5M rows.
   sizes with null keys on both sides, multi-column and `utf8` keys, the as-of join in all three
   strategies with partitions and a tolerance and against an oracle at 4097 × 1301 rows, the window
   functions, `concat`, `explode`, batched execution, and optimized-vs-unoptimized equivalence.
-- `python/tests/test_lazy.py` — 48 queries against Polars lazy, pyarrow and DuckDB on the same data,
+- `python/tests/test_lazy.py` — 56 queries against Polars lazy, pyarrow and DuckDB on the same data,
   including TPC-H shapes (filter + group-by + sort + limit; join + aggregate; window over partition;
-  as-of join on timestamps).
+  as-of join on timestamps), plus what the Python side costs: that a column is imported once however
+  often it is scanned, that a query importing two of five columns imports two and one that can read
+  any imports all, that a schema check and a warm-up import none, that rescanning a changed dict or a
+  mutated Polars frame sees the change, and that a warm `collect()` over a `pyarrow.Table` stays
+  within 3 ms of the same query over GPU-resident arrays.
 
 ```
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter EngineTests

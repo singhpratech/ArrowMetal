@@ -13,8 +13,8 @@ it and compares, so a kernel that is wrong in an unanticipated way still fails.
 |---|---|
 | Files | `python/tests/test_differential.py` (the harness), `python/tests/differential_report.py` (the runner) |
 | Oracle | `pyarrow.compute` 25.0.1, plus a reference written in the harness for the 16 operations Arrow has no function for |
-| Cases in the default matrix | 33,156 — 181 operations x 45 column types x 27 datasets — about 160 s on an M4 Max; more with `DIFF_LARGE=1` |
-| Result at 0.1.0 | 30,570 pass, 1,677 fail across 21 documented divergences, 909 skip (kernels not implemented), **0 unclassified** |
+| Cases in the default matrix | 39,069 — 212 operations x 45 column types x 27 datasets — about 220 s on an M4 Max; more with `DIFF_LARGE=1` |
+| Result at 0.1.0 | 36,460 pass, 1,592 fail across 24 documented divergences, 1,017 skip (kernels not implemented), **0 unclassified** |
 
 ## Method
 
@@ -178,9 +178,12 @@ suite notices if either engine changes its mind.
 | the replacement template in `replace_substring_regex` | ICU's: `$1`, `$2` | RE2's: `\1`, `\2` | `test_regex_replacement_template_is_icu_not_re2` |
 | `index`'s needle on a `uint64` value above 2^63 | not found: the needle crosses the C ABI as a `double` | found | `test_index_of_a_large_unsigned_value_is_not_found` |
 | `min`/`max` of an all-NaN *rolling window* | the scan's identity, ±inf | NaN, as `pc.min` does | `test_rolling_min_of_an_all_nan_window` |
+| `negate_checked` on an unsigned column | raises for every non-zero value — the negation does not fit | no unsigned kernel at all: `ArrowNotImplementedError` | `test_negate_checked_refuses_an_unsigned_column_pyarrow_has_no_kernel_for` |
+| an overflow, a zero divisor or a negative integer power in the `_checked` family | raises `ArrowMetalError`, naming the first offending row | raises `ArrowInvalid` — identical, and the matrix compares the objections as well as the answers | `test_checked_arithmetic_raises_where_the_unchecked_form_wraps` |
+| `unique`/`value_counts` of a null string row | dropped: the GPU string dictionary has no slot for a null (every other type keeps it, as Arrow does) | kept, as one entry | `test_unique_drops_the_null_row_of_a_string_column` |
 | decimal `+`/`-`/`*` past the column's precision | wraps modulo 2^128, the storage width | `pc.add` refuses precision 39 outright; its unchecked cast wraps modulo 10^precision | `test_decimal_arithmetic_wraps_modulo_two_to_the_128` |
 
-Three of the divergences the harness turned up are **pyarrow's**, not ArrowMetal's. They are recorded
+Five of the divergences the harness turned up are **pyarrow's**, not ArrowMetal's. They are recorded
 here because the matrix has to work around them, and each has a test that fails if pyarrow fixes it:
 
 | Case | pyarrow 25.0.1 | Correct | Test |
@@ -188,6 +191,8 @@ here because the matrix has to work around them, and each has a test that fails 
 | `pc.utf8_normalize` | decomposes whatever `form` says — its NFC is NFD | ArrowMetal and Python's `unicodedata` agree | `test_pyarrow_utf8_normalize_ignores_its_form_option` |
 | `pc.pairwise_diff` on a sliced column | reads the values buffer without `ArrowArray.offset` | ArrowMetal honours the offset; the matrix hands the oracle a materialised copy | `test_pyarrow_pairwise_diff_ignores_the_array_offset` |
 | `pc.fill_null_forward`/`_backward`/`replace_with_mask` on a sliced **boolean** column | the same offset bug | same | `test_pyarrow_boolean_fill_null_forward_ignores_the_array_offset` |
+| `pc.winsorize` on a sliced column | the same offset bug — it answers with the *wrong rows* null, and puts values where the input has nulls | ArrowMetal honours the offset; the matrix hands the oracle a materialised copy | `test_pyarrow_winsorize_ignores_the_array_offset` |
+| `pc.binary_slice` with its own default `stop` | `sys.maxsize` overflows the output-size arithmetic: `ArrowInvalid: Negative buffer resize` | the matrix names an explicit stop past every generated value | `test_pyarrow_binary_slice_overflows_on_its_own_default_stop` |
 
 And one is a crash rather than a wrong answer: `pc.year_month_day` and `pc.iso_calendar` corrupt the
 heap in pyarrow 25.0.1 and segfault the process a couple of allocations later, so the matrix never
@@ -212,38 +217,41 @@ stays in the input — it poisons every later element in both engines
 
 ## Open findings
 
-Twenty-one divergences the harness found that are not bugs but are not free choices either: each is a
+Twenty-two divergences the harness found that are not bugs but are not free choices either: each is a
 place where a kernel's own consistency was preferred to Arrow's answer, or where a documented limit of
-the GPU path shows through. Together they account for all 1,677 failing cases. Each has an entry in
+the GPU path shows through. (A finding whose title starts with `BUG:` is a real bug parked so the gate
+stays green while it is open; the two the coverage pass found are fixed and listed under "Findings that
+were fixed".) Together they account for every failing case. Each has an entry in
 `FINDINGS` in `test_differential.py`, so the matrix groups the affected cells under the finding instead
 of burying them, and an `xfail(strict=True)` reproduction, so the suite turns red the moment a kernel
-changes its mind. Fourteen of them are classified *by the data* — a `data_check` that looks at the
+changes its mind. Eighteen of them are classified *by the data* — a `data_check` that looks at the
 generated values — so a dataset that does not actually contain the triggering value still has to agree
 exactly.
 
 | # | Finding | Cases | Cells |
 |---|---|---|---|
 | 1 | `float32-subnormal-ftz` | 19 | 5 |
-| 2 | `utf8-case-latin-only` | 30 | 2 |
-| 3 | `sign-of-negative-zero` | 8 | 2 |
-| 4 | `negative-zero-set-lookup` | 14 | 4 |
-| 5 | `cumulative-prod-reassociation` | 12 | 2 |
-| 6 | `decimal-to-float64-divides` | 38 | 3 |
-| 7 | `decimal-round-carry-past-the-precision` | 12 | 3 |
-| 8 | `regex-icu-unicode-classes` | 28 | 2 |
-| 9 | `regex-anchor-in-a-repeated-search` | 15 | 1 |
-| 10 | `split-loses-the-null-row` | 31 | 2 |
-| 11 | `split-whitespace-collapses-runs` | 19 | 1 |
-| 12 | `float-text-swift-format` | 35 | 2 |
-| 13 | `temporal-extract-in-utc` | 977 | 58 |
-| 14 | `temporal-ceil-on-a-calendar-boundary` | 45 | 6 |
-| 15 | `temporal-calendar-multiple-origin` | 113 | 6 |
-| 16 | `temporal-round-finer-unit` | 141 | 8 |
-| 17 | `strftime-seconds-carry-the-fraction` | 57 | 3 |
-| 18 | `timezone-after-2038` | 96 | 8 |
-| 19 | `trig-argument-reduction` | 8 | 2 |
-| 20 | `variance-accumulator-overflow` | 8 | 2 |
-| 21 | `rolling-min-max-zero-and-subnormal` | 5 | 2 |
+| 2 | `sign-of-negative-zero` | 8 | 2 |
+| 3 | `negative-zero-set-lookup` | 14 | 4 |
+| 4 | `cumulative-prod-reassociation` | 12 | 2 |
+| 5 | `decimal-to-float64-divides` | 38 | 3 |
+| 6 | `decimal-round-carry-past-the-precision` | 12 | 3 |
+| 7 | `regex-icu-unicode-classes` | 28 | 2 |
+| 8 | `regex-anchor-in-a-repeated-search` | 15 | 1 |
+| 9 | `split-loses-the-null-row` | 31 | 2 |
+| 10 | `split-whitespace-trailing-run` | 14 | 1 |
+| 11 | `float-text-swift-format` | 35 | 2 |
+| 12 | `temporal-extract-in-utc` | 977 | 58 |
+| 13 | `strftime-seconds-carry-the-fraction` | 57 | 3 |
+| 14 | `timezone-after-2038` | 96 | 8 |
+| 15 | `trig-argument-reduction` | 8 | 2 |
+| 16 | `variance-accumulator-overflow` | 8 | 2 |
+| 17 | `rolling-min-max-zero-and-subnormal` | 5 | 2 |
+| 18 | `unique-drops-the-null-string` | 36 | 2 |
+| 19 | `logb-of-zero-against-a-small-base` | 4 | 1 |
+| 20 | `round-scales-before-it-rounds` | 19 | 2 |
+| 21 | `high-moment-accumulator-overflow` | 14 | 4 |
+| 22 | `winsorize-negative-zero-limit` | 2 | 1 |
 
 ### 1. Float32 arithmetic flushes subnormals to zero
 
@@ -271,29 +279,7 @@ element-wise `min`/`max` decide the subnormal and signed-zero cases from the bit
 
 Reproduction: `test_float32_arithmetic_keeps_subnormal_results`.
 
-### 2. `upper` and `lower` map Latin only
-
-*18 failing cases: `upper/utf8`, `lower/utf8`, every dataset whose strings need a mapping outside the
-covered blocks.*
-
-`am_str_transform` ops 2 and 3 implement the simple (1:1 code point) case mappings of Basic Latin, Latin-1
-Supplement and Latin Extended-A, including the ones that change the byte length (`ſ` → `S`, `İ`/`ı`).
-Everything above U+017F is copied through, and the multi-character expansions (`ß` → `SS`, `ŉ`, `µ`) are
-not applied. pyarrow uses full Unicode.
-
-```python
-a = pa.array(["Ωμέγα", "ÅNGSTRÖM"], pa.string())
-am.array(a).upper().to_arrow()      # ['Ωμέγα', 'ÅNGSTRÖM']   <- the Greek passes through
-pc.utf8_upper(a)                    # ['ΩΜΈΓΑ', 'ÅNGSTRÖM']
-```
-
-A full case table is a data-size decision rather than a kernel one, and it is out of scope at 0.1.0 — the
-header says so. The finding is classified *by the data*: a dataset counts under it only if it actually
-contains a code point outside the covered blocks, so a regression inside them still shows up as a new
-divergence. Reproductions: `test_case_mapping_covers_all_of_unicode` (xfail) and
-`test_case_mapping_inside_latin_extended_a_matches_pyarrow` (the blocks that must agree exactly).
-
-### 3. `sign` keeps the sign of `-0.0`
+### 2. `sign` keeps the sign of `-0.0`
 
 *8 failing cases: `sign/float32`, `sign/float64`, the datasets containing a negative zero.*
 
@@ -310,7 +296,7 @@ Keeping the operand is the documented behaviour (`include/arrowmetal.h`) and the
 information; the two engines agree on every other value, NaN included. Reproduction:
 `test_sign_of_negative_zero_matches_pyarrow`.
 
-### 4. `is_in` and `index_in` treat `-0.0` and `0.0` as one value
+### 3. `is_in` and `index_in` treat `-0.0` and `0.0` as one value
 
 *6 failing cases: `is_in/float64`, `index_in/float64`, the datasets containing a negative zero.*
 
@@ -329,7 +315,7 @@ Matching Arrow here would mean `is_in` disagreeing with `unique`, `dictionary_en
 many distinct values a column has, which is the worse of the two inconsistencies. Reproductions:
 `test_is_in_separates_negative_zero_from_zero` (xfail) and `test_is_in_matches_nan_to_nan_in_both`.
 
-### 5. `cumulative_prod` reassociates, so overflow and underflow land differently
+### 4. `cumulative_prod` reassociates, so overflow and underflow land differently
 
 *`cumulative_prod/float32` and `cumulative_prod/float64`, the datasets whose running product leaves the
 normal range.*
@@ -352,7 +338,7 @@ The finding is classified by the data (`_prefix_product_leaves_safe_range`): a d
 its sequential running product gets within 2^40 of overflow or of the smallest normal. Reproduction:
 `test_cumulative_prod_matches_arrow_past_overflow` (xfail).
 
-### 6. `decimal` → `float64` divides where Arrow multiplies by the reciprocal
+### 5. `decimal` → `float64` divides where Arrow multiplies by the reciprocal
 
 *38 failing cases: `decimal_to_float64` on all three decimal128 columns.*
 
@@ -370,7 +356,7 @@ The kernel's answer is the better one, and changing it to reproduce Arrow's roun
 introducing an error on purpose. Reproductions: `test_decimal_to_float64_matches_arrows_cast` (xfail)
 and `test_decimal_to_float64_is_the_correctly_rounded_quotient`.
 
-### 7. Rounding a decimal down narrows the precision, and a carry can outgrow it
+### 6. Rounding a decimal down narrows the precision, and a carry can outgrow it
 
 *12 failing cases: `decimal_round` on the three decimal128 columns, the `special` flavor.*
 
@@ -391,7 +377,7 @@ is not a number anyone wants. Classified by the data (`_decimal_rounding_carries
 `test_decimal_round_carry_wraps_like_arrows_cast` (xfail) and
 `test_decimal_round_narrows_the_precision_by_the_digits_it_drops`.
 
-### 8. ICU's `\d`, `\w` and `\s` are Unicode-aware; RE2's are ASCII
+### 7. ICU's `\d`, `\w` and `\s` are Unicode-aware; RE2's are ASCII
 
 *28 failing cases: `regex_match` and `regex_replace` on `utf8`, the datasets containing a full-width
 digit.*
@@ -411,7 +397,7 @@ the data — a column has to contain a non-ASCII code point of category Nd to co
 column of plain ASCII still has to agree, which `test_regex_digit_class_agrees_on_ascii` asserts.
 Reproduction: `test_regex_digit_class_is_ascii_only` (xfail).
 
-### 9. `^` in a repeated search anchors to the input, not to the search
+### 8. `^` in a repeated search anchors to the input, not to the search
 
 *15 failing cases: `regex_match` on `utf8`, the datasets with a row an anchored pattern can match twice.*
 
@@ -427,7 +413,7 @@ pc.count_substring_regex(a, "^a")                     # [2]
 
 Reproduction: `test_anchored_pattern_counts_once_per_input` (xfail).
 
-### 10. `split` has nowhere to put a null row
+### 9. `split` has nowhere to put a null row
 
 *31 failing cases: `regex_split` and `split_whitespace` on `utf8`, every dataset with a null.*
 
@@ -446,24 +432,31 @@ Giving the pair a third array for the validity would be a list type in all but n
 needs the distinction has `is_null()`. Classified by the data (the column has to have a null).
 Reproduction: `test_split_keeps_the_null_row` (xfail).
 
-### 11. `split_whitespace` collapses runs, as `str.split()` does
+### 10. `split_whitespace` gives one empty piece for a trailing run, Arrow gives two
 
-*19 failing cases: `split_whitespace` on `utf8`, the datasets with an empty string or a leading,
-trailing or doubled space.*
+*14 failing cases: `split_whitespace` (the `unicode=True` path) on `utf8`, on the datasets with a value
+whose trailing whitespace run is two or more characters long.*
 
-`am_regex` ops 7 and 8 split on *runs* of ASCII whitespace and drop the empty pieces at either end,
-which is what Python's `str.split()` with no argument does and what the header documents. Arrow's
-`utf8_split_whitespace` splits at every whitespace character and keeps the empty pieces.
+Both engines treat a run of whitespace as one separator and keep the empty pieces at either end:
+`"  padded"` is `['', 'padded']` in both, `" "` is `['', '']` in both. Arrow's `utf8_split_whitespace`
+is asymmetric on its own — a trailing run of two or more characters produces *two* empty pieces — while
+Arrow's `ascii_split_whitespace` produces one, and so does ArrowMetal in both modes. The Unicode flag
+lines up with Arrow's pair: `split_whitespace(unicode=True)` is compared with `utf8_split_whitespace`
+(U+3000 and U+00A0 separate) and the default with `ascii_split_whitespace`, whose cell passes.
 
 ```python
-a = pa.array(["  padded  "], pa.string())
-# ArrowMetal: ['padded']        pyarrow: ['', 'padded', '', '']
+a = pa.array(["padded  "], pa.string())
+am.array(a).split_whitespace(unicode=True).to_arrow()   # [['padded', '']]
+pc.utf8_split_whitespace(a)                             # [['padded', '', '']]
+pc.ascii_split_whitespace(a)                            # [['padded', '']]   <- Arrow's own ASCII variant agrees
 ```
 
-Reproductions: `test_split_whitespace_keeps_the_empty_pieces` (xfail) and
-`test_split_whitespace_matches_python_str_split`.
+Classified by the data (`_ends_with_a_whitespace_run`). Reproductions:
+`test_split_whitespace_trailing_run_matches_arrow` (xfail),
+`test_ascii_split_whitespace_trailing_run_matches_arrows_ascii_variant` and
+`test_split_whitespace_agrees_with_arrow_away_from_a_trailing_run`.
 
-### 12. `float` → `utf8` uses Swift's formatting
+### 11. `float` → `utf8` uses Swift's formatting
 
 *35 failing cases: `to_strings_text` on `float32` and `float64`.*
 
@@ -483,7 +476,7 @@ bit**, `-0.0`, the subnormals and `DBL_MAX` included, and it passes everywhere. 
 finding, classified by the data (`_float_text_differs`). Reproductions:
 `test_float_to_text_matches_arrows_formatter` (xfail) and `test_float_to_text_names_the_same_number`.
 
-### 13. The temporal kernels read a zoned timestamp in UTC
+### 12. The temporal kernels read a zoned timestamp in UTC
 
 *977 failing cases across 58 cells: every temporal operation on the four `timestamp[…, tz]` columns.*
 
@@ -507,72 +500,7 @@ it passes everywhere. The zone is therefore the whole of the difference, which i
 `test_temporal_extract_is_arrows_answer_for_the_same_naive_instant` asserts. Reproduction:
 `test_temporal_extract_uses_the_columns_timezone` (xfail).
 
-### 14. `ceil_temporal` leaves a value already on a calendar boundary alone
-
-*45 failing cases: `temporal_ceil_calendar` on the timestamp and date columns whose data lands exactly
-on a month boundary.*
-
-`temporal_round` implements `ceil` as "the smallest multiple at or above the value", which is Arrow's
-own `ceil_is_strictly_greater = false` and what its *fixed-length* units do. Arrow's calendar units
-behave differently from Arrow's own fixed-length ones: a value exactly on a month, quarter or year
-boundary is advanced a whole unit.
-
-```python
-a = pa.array([0], pa.timestamp("s"))                 # 1970-01-01T00:00:00, on every boundary
-am.array(a).ceil_temporal("month").to_arrow()        # [1970-01-01]
-pc.ceil_temporal(a, unit="month")                    # [1970-02-01]
-pc.ceil_temporal(a, unit="day")                      # [1970-01-01]   <- Arrow's own day unit agrees
-```
-
-Matching Arrow would mean `ceil` meaning one thing for days and another for months. Classified by the
-data (`_lands_on_a_calendar_boundary`). Reproductions:
-`test_ceil_temporal_advances_a_value_on_a_month_boundary` (xfail) and
-`test_ceil_temporal_keeps_a_value_on_a_fixed_length_boundary_in_both`.
-
-### 15. A multiple of months or quarters counts from year 0, not from 1970
-
-*113 failing cases: `temporal_round_unaligned` on every date-carrying column.*
-
-`temporal_round`'s calendar path converts the value to an absolute month index, `y * 12 + (m − 1)`, and
-floors that to a multiple of `p` — an origin of year 0. Arrow counts months and quarters from
-1970-01 — but counts *years* from year 0, so its own three calendar units do not agree with each other.
-
-```python
-a = pa.array([0], pa.timestamp("s"))
-am.array(a).floor_temporal("month", 7).to_arrow()      # [1969-12-01]  (23640 months, floor to 7)
-pc.floor_temporal(a, multiple=7, unit="month")         # [1970-01-01]  (0 months since the epoch)
-pc.floor_temporal(a, multiple=3, unit="year")          # [1968-01-01]  <- year 0 origin, like ours
-```
-
-The two origins coincide whenever the multiple divides `1970 × 12` months (or `1970 × 4` quarters),
-which is every multiple `temporal_round_calendar` uses — 1, 2, 3, 4, 5 and 6 months, 1, 2, 4 and 5
-quarters, 1, 2, 3, 4 and 7 years — and those cells pass exactly. The unaligned multiples (`month × 7`,
-`month × 11`, `quarter × 3`, `quarter × 7`) are gathered into one operation of their own so the finding
-cannot mask a regression in the aligned ones. Reproductions:
-`test_calendar_multiples_share_an_origin` (xfail) and
-`test_calendar_multiples_agree_wherever_the_two_origins_do`.
-
-### 16. Rounding to a unit finer than the column's resolution is the identity
-
-*141 failing cases: `temporal_round_finer` on every temporal column, at a multiple that does not divide
-a whole tick.*
-
-`roundTemporal` returns the column unchanged when the requested unit is finer than its storage — there
-is nothing below a tick to round to. Arrow converts the value to the finer unit, rounds there, and
-truncates back, which on a second-resolution column can move the value by nearly a whole second.
-
-```python
-a = pa.array([1_700_000_000], pa.timestamp("s"))
-am.array(a).floor_temporal("nanosecond", 3).to_arrow()      # [2023-11-14 22:13:20]
-pc.floor_temporal(a, multiple=3, unit="nanosecond")         # [2023-11-14 22:13:19]
-```
-
-At `multiple = 1` the two agree, because a whole tick is a multiple of one nanosecond — which
-`test_rounding_to_a_finer_unit_is_the_identity_at_multiple_one` asserts, and which is why only the
-multiples above one are in this operation. Reproduction:
-`test_rounding_to_a_finer_unit_converts_like_arrow` (xfail).
-
-### 17. `%S` prints whole seconds
+### 13. `%S` prints whole seconds
 
 *57 failing cases: `strftime_seconds` on the sub-second timestamp columns.*
 
@@ -590,7 +518,7 @@ that silently changes width with the column's unit is not something a C format s
 other field agrees (`test_strftime_agrees_on_every_other_field`), which is why the `%S` formats are an
 operation of their own. Reproduction: `test_strftime_seconds_carry_the_fraction` (xfail).
 
-### 18. pyarrow's timezone database stops transitioning at 2038
+### 14. pyarrow's timezone database stops transitioning at 2038
 
 *96 failing cases: `assume_timezone` and `temporal_timezone` on the datasets reaching past 2038.*
 
@@ -609,7 +537,7 @@ Before 2038 the two agree everywhere in the matrix, which
 after it. Classified by the data (`_after_the_2038_cutoff`). Reproduction:
 `test_assume_timezone_agrees_past_2038` (xfail).
 
-### 19. The software binary64 trigonometry loses its argument reduction past 2^49
+### 15. The software binary64 trigonometry loses its argument reduction past 2^49
 
 *8 failing cases: `trig` and `trig_checked` on `float64`, the datasets containing a value at or above
 2^49.*
@@ -629,7 +557,7 @@ the limit instead. Float32 is unaffected — it runs Metal's own functions, whic
 the whole range. Classified by the data. Reproductions: `test_trig_reduces_a_large_argument` (xfail)
 and `test_trig_agrees_below_the_reduction_limit`.
 
-### 20. `variance` and `stddev` accumulate the moments in 64 bits
+### 16. `variance` and `stddev` accumulate the moments in 64 bits
 
 *8 failing cases: `variance_and_stddev` on `int64` and `uint64`, the `special` flavor.*
 
@@ -648,7 +576,7 @@ the matrix gives it (see *Tolerances* above) and what `test_variance_is_accurate
 asserts. Classified by the data (`_moments_leave_the_accumulator`). Reproduction:
 `test_variance_of_a_large_int64_column` (xfail).
 
-### 21. The rolling `min`/`max` scan compares raw values
+### 17. The rolling `min`/`max` scan compares raw values
 
 *5 failing cases: `rolling_min_max` on the float columns containing a negative zero or a float32
 subnormal.*
@@ -668,9 +596,110 @@ rather than fixed because the rolling kernels are the newest in the package and 
 their next revision. Classified by the data. Reproduction:
 `test_rolling_min_breaks_a_zero_tie_like_fmin` (xfail).
 
+### 18. `unique` and `value_counts` drop the null row of a string column
+
+*36 failing cases: `unique/utf8`, `value_counts/utf8`, the datasets containing a null.*
+
+Both orders of `unique()` and `value_counts()` go through the GPU string dictionary, which has one slot
+per distinct **string** and none for a null, so a null row leaves no entry behind. Arrow keeps the null as
+an entry of its own, at the position of the first null row. Every other type agrees with Arrow exactly —
+this is a property of the string path, not of the operation.
+
+```python
+a = pa.array(["a", None, "a"], pa.string())
+am.array(a).unique().to_arrow()          # ["a"]
+pc.unique(a)                             # ["a", null]
+
+n = pa.array([1, None, 1], pa.int32())
+am.array(n).unique().to_arrow()          # [1, null]   -- the same as pc.unique
+```
+
+The counts of the values that *are* there are exact, and so is their order. Classified by the data (a
+column with no null still has to agree). Reproduction: `test_unique_drops_the_null_row_of_a_string_column`.
+
+### 19. `logb` of zero against a base below one is `+inf`
+
+*4 failing cases: `math_extra/float64`, the datasets containing a zero.*
+
+`logb(x, base)` is `ln(x) / ln(base)` throughout, which is what the header documents. With a base below
+one, `ln(base)` is negative, so `ln(0) / ln(base)` is `-inf / -something` = `+inf` — the mathematically
+correct limit of `log_b(0)` for `b < 1`. Arrow special-cases a zero argument and answers `-inf` whatever
+the base:
+
+```python
+values = pa.array([0.0], pa.float64())
+bases  = pa.array([0.5], pa.float64())
+am.array(values).logb(am.array(bases)).to_arrow()   # [inf]
+pc.logb(values, bases)                              # [-inf]
+
+am.array(values).logb(am.array(pa.array([2.0])))    # [-inf]   -- above one the two agree
+```
+
+Only the zero argument is affected, and only against a base in `(0, 1)`; every other pair agrees to the
+family's 5-ulp bound. Classified by the data. Reproduction:
+`test_logb_of_zero_against_a_small_base_is_positive_infinity`.
+
+### 20. `round` with `ndigits` scales before it rounds
+
+*19 failing cases: `round_extra/float32`, `round_extra/float64`, the datasets holding a value the scaling
+cannot carry.*
+
+`round(x, n)`, `round_to_multiple(x, m)` and `round_binary(x, n)` are all `round_int(x / step) * step`,
+evaluated in the column's own precision — which is what `include/arrowmetal.h` documents. Two kinds of
+argument do not survive that: one whose scaled product needs more significant digits than the type holds,
+and one so small that the scaling underflows. Arrow reaches the same answers a different way and returns
+such a value unchanged.
+
+```python
+a = pa.array([-421591.21875], pa.float32())          # 8 significant digits after x100
+am.array(a).round(2, "down").to_arrow()              # [-421591.1875]
+pc.round(a, ndigits=2, round_mode="down")            # [-421591.21875]
+```
+
+Inside the digits the type can carry — which is every value the `random` flavor generates — the ten round
+modes agree exactly, `round_binary`'s per-row `ndigits` included. Classified by the data. Reproduction:
+`test_round_with_ndigits_scales_before_it_rounds`.
+
+### 21. `skew` and `kurtosis` share the variance kernel's moment accumulator
+
+*14 failing cases: `skew_kurtosis` on `int32`, `int64`, `uint32` and `uint64`, the `special` flavor.*
+
+The third and fourth standardised moments are built on the same GPU accumulator finding 16 describes for
+`variance`/`stddev`, and they raise their input to the third and fourth power on the way. A column holding
+a value at the top of a 32- or 64-bit integer type leaves that accumulator, and the kernel answers **null**
+— no answer — rather than a wrapped number. pyarrow accumulates in double and answers.
+
+```python
+a = pa.array([2 ** 63 - 1, -(2 ** 63), 1, 0, 7], pa.int64())
+am.array(a).skew()          # None
+pc.skew(a).as_py()          # 1.74e-55
+```
+
+Answering null is the safer of the two failure modes, and every column inside the range agrees with
+pyarrow to 1e-5 absolute (measured worst deviation over the matrix: 4.6e-7). Classified by the data.
+Reproduction: `test_skew_and_kurtosis_share_the_variance_accumulator`.
+
+### 22. `winsorize` clamps to the `-0.0` of a zero tie
+
+*2 failing cases: `winsorize/float32`, the datasets containing a negative zero.*
+
+`winsorize` takes its two limits out of the sorted values — Arrow's *nearest* quantile, not an interpolated
+one. `-0.0` and `0.0` are one tie group in every sort order both engines use, so which of the pair becomes
+the limit is not defined by either; ArrowMetal picks the `-0.0` and Arrow the `0.0`. The clamped values are
+therefore equal as *numbers* and differ only in the sign bit.
+
+```python
+a = pa.array([1.0, -0.0, 0.0, -1.0, 2.0, -2.0], pa.float32())
+am.array(a).winsorize(0.5, 0.5).to_arrow()               # [-0.0, -0.0, 0.0, -0.0, -0.0, -0.0]
+pc.winsorize(a, lower_limit=0.5, upper_limit=0.5)        # [ 0.0, -0.0, 0.0,  0.0,  0.0,  0.0]
+```
+
+The harness compares floats bit-exactly, which is why this shows at all. Classified by the data.
+Reproduction: `test_winsorize_clamps_to_the_negative_zero_of_a_zero_tie`.
+
 ## Findings that were fixed
 
-The five bugs the first run of this matrix reported are closed. The reproductions stayed, as plain
+The five bugs the first run of this matrix reported are closed, and four of the original twenty-one findings were closed by later kernel work (full-Unicode case mapping, and the three calendar-rounding corners). The reproductions stayed, as plain
 assertions, so the suite notices a relapse.
 
 | Was | Now | Test |
@@ -681,6 +710,12 @@ assertions, so the suite notices a relapse.
 | Grouped `sum` over UInt64 came back as Int64 | the aggregate keeps the value type | `test_group_by_sum_over_uint64_stays_unsigned` |
 | Float32 comparison treated subnormal operands as zero | comparisons are exact, on bit keys; only arithmetic still flushes | `test_float32_comparison_distinguishes_subnormals_from_zero` |
 | `top_k` put row 0 first about once in 900 calls: every thread read the candidate count from a relaxed threadgroup atomic, one simdgroup could see a newer value, and the sentinel padding then left holes that sorted ahead of the real candidates | the count is broadcast through a plain threadgroup variable between barriers, and the buffer starts full of sentinels | `TopKTests.testStressAgainstCPUOracle` (`ARROWMETAL_STRESS=1` for the long run) |
+| `upper`/`lower` mapped Basic Latin, Latin-1 and Latin Extended-A only; everything above U+017F passed through | the GPU table covers U+0000–U+017F and any row holding a code point above it is mapped on the host with Unicode's simple mapping, so Greek, Cyrillic, Turkish dotted I and astral scripts agree with pyarrow | `test_case_mapping_covers_all_of_unicode` |
+| `ceil_temporal` left a value already on a month, quarter or year boundary alone; Arrow advances it a whole unit | the calendar units advance, the fixed-length units keep the value, as Arrow's do | `test_ceil_temporal_advances_a_value_on_a_month_boundary` |
+| a multiple of months or quarters counted from year 0; Arrow counts from 1970-01 | months and quarters count from 1970-01 (years from year 0, as Arrow's do) | `test_calendar_multiples_share_an_origin` |
+| rounding to a unit finer than the column's resolution was the identity; Arrow converts, rounds and truncates back | the value is converted to the finer unit, rounded there and truncated back | `test_rounding_to_a_finer_unit_converts_like_arrow` |
+| a `uint64` `winsorize` poisoned every later `float64` one in the process: the clamp pipeline was cached under its MSL type alone, and both types travel as `ulong` | the cache key carries the value kind as well as the type | `test_winsorize_on_float64_survives_a_uint64_call` |
+| `unique`/`value_counts`/`dictionary_encode` with `order="sorted"` put every non-ASCII string after every ASCII one (Swift's canonical `String <`), while `sort()` orders by UTF-8 bytes | the sorted string pass orders by UTF-8 bytes | `test_sorted_unique_uses_the_columns_own_sort_order` |
 
 Four more turned up while closing those, and were fixed here rather than written down:
 
@@ -701,7 +736,7 @@ Four more turned up while closing those, and were fixed here rather than written
 
 ## What passed
 
-Everything else — 30,570 of the 33,156 cases — on all 27 datasets per cell:
+Everything else — 36,460 of the 39,069 cases — on all 27 datasets per cell:
 
 - **Import/export round trip** for all 45 types, including every sliced offset, all-null and empty arrays,
   4096-byte strings and multi-byte UTF-8, 38-digit decimals, nested lists with nulls inside the rows,
@@ -768,6 +803,29 @@ Everything else — 30,570 of the 33,156 cases — on all 27 datasets per cell:
   `fixed_size_binary` equality against an array and a scalar, `hash64`'s determinism, canonicalisation
   and injectivity, the dictionary decode, the `null` column, the interval fields and the extension-type
   metadata round trip.
+- **The `_checked` family** `add`, `subtract`, `multiply`, `divide`, `power`, `shift_left`,
+  `shift_right`, `logb`, `negate`, `abs`, `sqrt`, `ln`, `log10`, `log2` and `log1p`, plus the two
+  cumulative forms and `pairwise_diff_checked` — compared *both ways*: the answers on the rows that fit
+  the column's type, and the objection itself on the rows that do not, which both engines have to raise.
+- **The remaining element-wise math** `expm1`, `log1p`, `logb` (scalar and column base), `hypot`,
+  `round_to_multiple`, `round_binary` and `round(ndigits, mode)` over all ten Arrow round modes.
+- **The Arrow-named selection kernels** `array_filter`, `array_take`, `array_sort_indices` and
+  `sort_indices` in both directions with the nulls at either end, `invert`, `scatter` on all twelve flat
+  types, `inverse_permutation` with duplicates, nulls and an explicit `max_index`, and the three unstable
+  selections (`top_k_unstable`, `bottom_k_unstable`, `select_k_unstable`) and `partition_nth_indices`
+  compared as value multisets, since neither engine defines which of a tied pair it picks.
+- **The associative transforms** `unique` and `value_counts` in both orders, `count_all`,
+  `true_unless_null`, `first_last` with `skip_nulls` both ways and `list_parent_indices64`.
+- **The statistical aggregates Arrow names** `skew` and `kurtosis` biased and unbiased, `tdigest` at five
+  quantiles (against pyarrow's own sketch, to 5% of the column's range), `winsorize` at four limit pairs,
+  and `rank_quantile`/`rank_normal` in both directions with the nulls at either end.
+- **The byte-indexed string transforms** `ascii_lpad`/`ascii_rpad`/`ascii_center` (which count bytes)
+  against `utf8_lpad`/`utf8_rpad` (which count code points), `utf8_swapcase`, `ascii_swapcase`,
+  `utf8_zero_fill`, `binary_slice` at eight start/stop/step triples, `binary_reverse`, and `ascii_reverse`
+  — which both engines refuse on non-ASCII input. The struct-valued `extract_regex_struct` and
+  `extract_regex_span_struct`, and the flat `(offsets, values)` split pairs.
+- **Timezone metadata** `to_timezone` to UTC, to a named zone and to none, against Arrow's own cast, and
+  `utc_offset` against the seconds `pc.local_timestamp` moves the instant by.
 - **Trigonometry** all twelve functions plus `atan2` on both float types, the seven `_checked` twins
   agreeing in-domain and *both raising* out of it, `xor`/`and_not`/`and_not_kleene`,
   `is_nan`/`is_inf`/`is_finite` on integers as well as floats, `fill_null_forward`/`_backward`,
@@ -797,6 +855,13 @@ means the values *and* the Arrow type have to match.
 | Temporal arithmetic | `temporal_between`, `temporal_between_clock`, `weeks_between`, `months_between`, `interval_between`, `interval_layouts`, `add_duration`, `subtract_temporal`, `add_interval`, `cast_unit`, `strftime`, `strftime_seconds`, `strptime`, `strptime_roundtrip` | the temporal columns, `utf8` | the nine `pc.*_between`, `pc.weeks_between` with `week_start` 1–7, `pc.month_day_nano_interval_between`, `pc.add`, `pc.subtract`, `Array.cast`, `pc.strftime`, `pc.strptime(error_is_null=True)` | exact |
 | Timezones | `temporal_timezone`, `assume_timezone` | the 4 zoned and 4 naive timestamp columns | `pc.is_dst`, `pc.local_timestamp`, `pc.assume_timezone` in four zones x two ambiguity modes | exact |
 | The rest of the type matrix | `float16_casts`, `float16_compute`, `float16_reduce`, `fixed_binary_compare`, `hash64`, `dictionary_ops`, `dictionary_encode`, `dictionary_decode`, `run_end`, `extension_type`, `nulls_constructor` | `float16`, `fixed_size_binary`, `dict<utf8>`, run-end, `null`, the numerics | `Array.cast`, `pc.equal`/`not_equal`, `pc.run_end_encode`/`decode`; the hash by its properties | exact |
+| Checked arithmetic | `arith_checked`, `power_checked`, `shift_checked`, `unary_checked`, `log_checked`, `cumulative_checked` | the 10 numeric (integers only for `power`, `shift` and the cumulative forms) | `pc.add_checked`…`pc.log1p_checked`, on the rows that fit; the *objection* on the rows that do not, which both engines have to raise | exact, except the logarithms' 1e-6 |
+| The rest of the element-wise math | `math_extra`, `round_extra` | `float32`, `float64` | `pc.expm1`, `pc.log1p`, `pc.logb`, `pc.hypot`, `pc.round_to_multiple`, `pc.round_binary`, `pc.round(ndigits, round_mode)` over all ten modes | relative 1e-6 (float32) / 1e-13 (float64) — the header's 5-ulp bound for this family |
+| Associative transforms | `unique`, `value_counts`, `true_unless_null`, `first_last`, `list_parent_indices64` | all 12 flat types, the two list columns | `pc.unique`, `pc.value_counts`, `pc.true_unless_null`, `pc.first_last`, `pc.list_parent_indices`; the sorted order against the same distinct values sorted | exact |
+| Arrow-named selection | `sort_indices`, `array_selection`, `invert`, `scatter`, `permutation`, `select_k_unstable`, `partition_nth_indices` | all 12 flat types (numeric for the permutations) | `pc.array_sort_indices`/`sort_indices` with `null_placement`, `Array.filter`/`take`, `pc.invert`, `pc.scatter`, `pc.inverse_permutation`, `pc.select_k_unstable`, `pc.partition_nth_indices` | exact — except the unstable selections, compared as sorted value multisets, which is what both engines actually define |
+| Arrow-named aggregates | `skew_kurtosis`, `tdigest`, `winsorize`, `rank_quantile_and_normal` | the 10 numeric | `pc.skew`/`kurtosis` biased and unbiased, `pc.tdigest`, `pc.winsorize`, `pc.rank_quantile`/`rank_normal` in both directions and both null placements | 1e-5 for the moments; 5% of the column's range for the t-digest sketch; 1e-12 for the ranks |
+| Byte-indexed strings | `ascii_pad`, `swapcase_and_zero_fill`, `byte_transforms`, `extract_regex_structs`, `split_pairs` | `utf8` | `pc.ascii_lpad`/`ascii_rpad`/`ascii_center`/`utf8_lpad`/`utf8_rpad`, `pc.utf8_swapcase`/`ascii_swapcase`/`utf8_zero_fill`, `pc.binary_slice`/`binary_reverse`/`ascii_reverse`, `pc.extract_regex[_span]`; the split pairs against the list-valued forms | exact |
+| Timezone metadata | `timezone_metadata` | the 8 timestamp columns | `Array.cast` between timezones; `utc_offset` against the difference `pc.local_timestamp` leaves behind | exact |
 | Group-by | `group_by_count`, `_count_values`, `_sum`, `_min`, `_max`, `_mean` | the 10 numeric | `pa.Table.group_by(...).aggregate(...)` | exact for the integers, the reductions' bound for the floats |
 
 ## Reading the report

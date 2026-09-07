@@ -133,7 +133,15 @@ def set_threshold(rows):
 
 
 class disabled:
-    """`with am.pandas_accel.disabled(): ...` — run a block in plain pandas."""
+    """`with am.pandas_accel.disabled(): ...` — run a block in plain pandas.
+
+    **Process-wide, not per thread.** It flips `config.enabled`, which every patched method reads,
+    so while one thread is inside the block *every* thread runs in pandas. The answers are the same
+    either way — this only moves where the work happens — but a `disabled()` block held around
+    something slow will quietly de-accelerate the rest of the program for its duration, and those
+    calls appear in neither `stats().gpu` nor `stats().cpu` (only in `stats().intercepted`). Nesting
+    is fine; the outer block's state is restored, not `True`.
+    """
 
     def __enter__(self):
         self._was = config.enabled

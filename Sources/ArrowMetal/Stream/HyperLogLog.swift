@@ -210,7 +210,8 @@ private func addToHLL(_ column: AnyMetalArray, precision p: Int,
     case .uint64(let a): try hllPrimitive(a, "ulong", "vals[gid]", p, registers, ctx)
     // -0.0 and 0.0 are the same value: normalise the bit pattern before hashing.
     case .float32(let a): try hllPrimitive(a, "float", "(ulong)as_type<uint>(vals[gid] + 0.0f)", p, registers, ctx)
-    case .float64(let a): try hllPrimitive(a, "ulong", "(vals[gid] == 0x8000000000000000UL ? 0UL : vals[gid])", p, registers, ctx)
+    case .float64(let a):
+        try hllPrimitive(a, "ulong", "(vals[gid] == 0x8000000000000000UL ? 0UL : vals[gid])", p, registers, ctx)
     case .boolean(let a):
         // A boolean column has at most three distinct values; unpack to bytes and hash those.
         try hllPrimitive(try a.toUInt8Array(), "uchar", "(ulong)(vals[gid] != 0 ? 1 : 0)", p, registers, ctx)

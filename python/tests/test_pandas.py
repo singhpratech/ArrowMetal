@@ -789,3 +789,118 @@ def test_index_is_preserved(frames):
     both(s, lambda x: x.sort_values(kind="stable") if False else x.nlargest(5))
     both(s, lambda x: x[x > 0])
     both(df, lambda d: d[d["i"] > 0])
+
+
+# ---------------------------------------------------------------------------------------------
+# Regression tests from the pre-release integration review.
+# ---------------------------------------------------------------------------------------------
+
+def test_query_lifts_only_the_columns_it_names():
+    """`df.am.query` used to lift *every* column of the frame onto the GPU.
+
+    So a query over two numeric columns failed on any frame that also carried a column the
+    expression compiler cannot read -- an object column, a struct, a period -- even though the
+    query never named it. The Polars twin has always read the `(col "name")` references out of the
+    serialised query and lifted only those (`test_query_imports_only_the_columns_it_names`); this
+    is the same rule for pandas.
+    """
+    df = pd.DataFrame({"x": [1, 2, 3], "y": [4.0, 5.0, 6.0],
+                       "junk": pd.Series([{"a": 1}, {"a": 2}, {"a": 3}], dtype=object)})
+    got = df.am.query(am.filter(am.col("x") > 1).sum(am.col("x")))
+    assert got == 5
+    # a query that names the unreadable column still says so
+    with pytest.raises(am.ArrowMetalError):
+        df.am.query(am.filter(am.col("junk") > 1).sum(am.col("x")))
+    # and a query naming a column that is not in the frame at all is a clear error, not a KeyError
+    with pytest.raises(am.ArrowMetalError, match="not in the frame"):
+        df.am.query(am.filter(am.col("nope") > 1).sum(am.col("x")))
+
+
+def test_import_works_with_none_of_the_three_libraries_installed():
+    """`import arrowmetal` must not need polars, pandas or duckdb, and must still work after.
+
+    Run in a subprocess with a meta-path finder that refuses all three, which is what a machine
+    without them looks like -- this session has all three imported, so nothing in-process can
+    answer the question. Also pins two properties of the `_LAZY_HOOKS` chain: the lazy names are in
+    `dir()` even when unreachable, and `from arrowmetal import *` does **not** carry them (there is
+    no `__all__`, and adding one would make `import *` try to resolve every optional bridge and so
+    fail on exactly the machine this test is about).
+    """
+    import subprocess
+    program = r"""
+import sys
+BLOCKED = {"polars", "pandas", "duckdb"}
+class Blocker:
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] in BLOCKED:
+            raise ImportError("blocked: " + name)
+        return None
+import pyarrow as pa                       # a real install has this before the block matters
+sys.meta_path.insert(0, Blocker())
+import arrowmetal as am
+assert am.version()
+assert am.MetalArray.from_arrow(pa.array([1, 2, 3])).sum() == 6
+for name in ("from_polars", "from_pandas", "polars_bridge", "pandas_bridge"):
+    assert name in dir(am), name
+    try:
+        getattr(am, name)
+        raise SystemExit("%s resolved with its library blocked" % name)
+    except ImportError:
+        pass
+assert am.from_duckdb is not None          # duckdb's bridge module needs no duckdb to import
+ns = {}
+exec("from arrowmetal import *", ns)
+assert "query" in ns and "MetalArray" in ns
+assert "from_polars" not in ns and "from_pandas" not in ns
+print("ok")
+"""
+    env = dict(os.environ,
+               PYTHONPATH=os.path.dirname(os.path.dirname(os.path.abspath(am.__file__))))
+    out = subprocess.run([os.sys.executable, "-c", program],
+                         capture_output=True, text=True, env=env)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "ok" in out.stdout
+
+
+def test_disabled_is_process_wide_not_per_thread():
+    """`disabled()` flips a module global, so it turns the layer off for *every* thread.
+
+    The answers do not change -- this only moves where the work runs -- but it is a footgun worth
+    pinning: a `disabled()` block held around something slow de-accelerates the whole process for
+    its duration, and the calls it diverts land in neither `stats().gpu` nor `stats().cpu`.
+    docs/PANDAS.md says so; this makes it fail loudly if it ever becomes thread-local by accident.
+    """
+    import threading
+    s = pd.Series(np.arange(100, dtype=np.int64))
+    inside, released = threading.Event(), threading.Event()
+    seen = {}
+
+    def holder():
+        with accel.disabled():
+            inside.set()
+            released.wait(10)
+
+    def worker():
+        assert inside.wait(10)
+        accel.reset_stats()
+        seen["value"] = s.sum()
+        seen["gpu"] = accel.stats().gpu_calls
+        seen["cpu"] = accel.stats().cpu_calls
+        seen["intercepted"] = accel.stats().intercepted
+        released.set()
+
+    with accelerated():
+        threads = [threading.Thread(target=holder), threading.Thread(target=worker)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(15)
+
+        assert seen["value"] == s.sum(), "the answer must be right either way"
+        assert seen["gpu"] == 0, "another thread's disabled() block did not reach this thread"
+        assert seen["cpu"] == 0, "a disabled call is not recorded as a fallback"
+        assert seen["intercepted"] >= 1
+
+        accel.reset_stats()                  # and only for the duration of that block
+        s.sum()
+        assert accel.stats().gpu_calls == 1

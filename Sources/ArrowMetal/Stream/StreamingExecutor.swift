@@ -1287,7 +1287,9 @@ public final class StreamGroupByOperator: StreamOperator {
 
     private func aggregateColumn(_ a: StreamAggregate, _ vals: [StreamValue]) throws -> AnyMetalArray {
         switch a.op {
-        case .count: return .int64(try MetalArray<Int64>(vals.map { if case .int(let x) = $0 { return x } else { return 0 } }, context: context))
+        case .count:
+            return .int64(try MetalArray<Int64>(vals.map { if case .int(let x) = $0 { return x } else { return 0 } },
+                                                context: context))
         case .mean, .variance, .stddev:
             return .float64(try MetalArray<Double>(vals.map { $0.isNull ? nil : $0.asDouble }, context: context))
         default:
@@ -1296,12 +1298,19 @@ public final class StreamGroupByOperator: StreamOperator {
                 return .float64(try MetalArray<Double>(vals.map { $0.isNull ? nil : $0.asDouble }, context: context))
             }
             if vals.contains(where: { if case .uint = $0 { return true }; return false }) {
-                return .uint64(try MetalArray<UInt64>(vals.map { if case .uint(let x) = $0 { return x } else if case .int(let x) = $0 { return UInt64(bitPattern: x) } else { return nil } }, context: context))
+                let out: [UInt64?] = vals.map {
+                    if case .uint(let x) = $0 { return x }
+                    if case .int(let x) = $0 { return UInt64(bitPattern: x) }
+                    return nil
+                }
+                return .uint64(try MetalArray<UInt64>(out, context: context))
             }
             if vals.contains(where: { if case .string = $0 { return true }; return false }) {
-                return .string(try MetalStringArray(vals.map { if case .string(let s) = $0 { return s } else { return nil } }, context: context))
+                let out: [String?] = vals.map { if case .string(let s) = $0 { return s } else { return nil } }
+                return .string(try MetalStringArray(out, context: context))
             }
-            return .int64(try MetalArray<Int64>(vals.map { if case .int(let x) = $0 { return x } else { return nil } }, context: context))
+            return .int64(try MetalArray<Int64>(vals.map { if case .int(let x) = $0 { return x } else { return nil } },
+                                                context: context))
         }
     }
 }

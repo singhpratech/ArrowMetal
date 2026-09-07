@@ -166,12 +166,15 @@ def _data_buffer_address(arr):
 
 
 def zero_copy_report(obj):
-    """`(source_address, metal_address, same)` for one Series or pyarrow array.
+    """`(source_address, metal_address, same)` for one Series or pyarrow array, or
+    `{column: (source, metal, same)}` for a `pl.DataFrame`.
 
     `same` is True when ArrowMetal mapped the producer's own pages rather than copying them.
     Small arrays are often copied (their allocation is not page aligned), which is why the check
     is worth running on the size you actually care about.
     """
+    if isinstance(obj, pl.DataFrame):
+        return {name: zero_copy_report(obj[name]) for name in obj.columns}
     arr = _series_to_arrow(obj) if isinstance(obj, pl.Series) else obj
     src = _data_buffer_address(arr)
     m = MetalArray.from_arrow(arr)
@@ -180,8 +183,12 @@ def zero_copy_report(obj):
 
 
 def zero_copy(obj):
-    """True when importing `obj` into Metal memory copies nothing. See `zero_copy_report`."""
-    return zero_copy_report(obj)[2]
+    """True when importing `obj` into Metal memory copies nothing -- for a DataFrame, when every
+    column does. See `zero_copy_report`."""
+    report = zero_copy_report(obj)
+    if isinstance(report, dict):
+        return all(entry[2] for entry in report.values())
+    return report[2]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -256,8 +263,12 @@ class ArrowMetalSeries:
         return self._back(m.filter(from_polars(mask)))
 
     def unique(self) -> pl.Series:
-        """The distinct non-null values, **ascending** (Polars' `unique()` does not promise an
-        order; `unique(maintain_order=True)` gives first-seen instead)."""
+        """The distinct values in **first-seen** order, which is what Polars'
+        `unique(maintain_order=True)` gives (plain `unique()` promises no order at all).
+
+        A null is a value here: it comes back once, in the position it was first seen, rather than
+        being dropped. Sort or `drop_nulls()` the result if you want either of those.
+        """
         return self._back(self._m().unique())
 
     # -- element-wise
@@ -358,6 +369,9 @@ class GpuGroupBy:
         The aggregate name is one of: sum, mean, min, max, count, len, n_unique, first, last,
         median, std, var, product, any, all. `len` counts rows and takes no column, so pass
         `n=("", "len")` or `n=(None, "len")`.
+
+        An output may not be named after a key column: the result carries the keys first, so that
+        would overwrite them with the aggregate rather than produce two columns.
         """
         spec = {}
         for a in args:
@@ -367,6 +381,12 @@ class GpuGroupBy:
         spec.update(named)
         if not spec:
             raise ArrowMetalError("agg() needs at least one aggregate")
+        shadowed = [alias for alias in spec if alias in self._keys]
+        if shadowed:
+            raise ArrowMetalError(
+                f"agg: output name(s) {shadowed} collide with the key column(s) {self._keys}; "
+                "the result carries the keys first, so this would replace them with the "
+                "aggregate. Give the aggregate another name.")
 
         out = self._key_frame()
         for alias, item in spec.items():
@@ -417,6 +437,10 @@ class GpuGroupBy:
 
     def quantile(self, column, q):
         """Exact per-group quantile with linear interpolation."""
+        if column in self._keys:
+            raise ArrowMetalError(
+                f"quantile: {column!r} is a key column of this group-by; the result carries the "
+                "keys first, so the quantile would replace them.")
         out = self._key_frame()
         out[column] = to_polars(self._gb.quantile(self._column(column), q), column)
         return pl.DataFrame(out)

@@ -123,7 +123,8 @@ public func graceHashJoin(left: BatchSource, right: BatchSource,
     try rightSink.finish()
     stats.partitionNanos = nanos(since: pt)
     for u in leftSink.urls + rightSink.urls {
-        stats.spilledBytes += ((try? FileManager.default.attributesOfItem(atPath: u.path))?[.size] as? NSNumber)?.int64Value ?? 0
+        let attrs = try? FileManager.default.attributesOfItem(atPath: u.path)
+        stats.spilledBytes += (attrs?[.size] as? NSNumber)?.int64Value ?? 0
     }
 
     let jt = machNow()

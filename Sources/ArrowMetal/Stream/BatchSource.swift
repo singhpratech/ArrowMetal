@@ -158,7 +158,8 @@ public final class IPCDirectorySource: BatchSource {
     public init(directory: URL, extensions: Set<String> = ["arrow", "arrows", "ipc", "feather"],
                 context: MetalContext = .shared) throws {
         let fm = FileManager.default
-        let entries = try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey])
+        let entries = try fm.contentsOfDirectory(at: directory,
+                                                 includingPropertiesForKeys: [.fileSizeKey])
         self.urls = entries.filter { extensions.contains($0.pathExtension.lowercased()) }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
         guard !urls.isEmpty else {
@@ -175,7 +176,9 @@ public final class IPCDirectorySource: BatchSource {
         self.urls = files
         self.context = context
         var t: Int64 = 0
-        for u in files { t += ((try? FileManager.default.attributesOfItem(atPath: u.path))?[.size] as? NSNumber)?.int64Value ?? 0 }
+        for u in files {
+            t += ((try? FileManager.default.attributesOfItem(atPath: u.path))?[.size] as? NSNumber)?.int64Value ?? 0
+        }
         self.total = t
     }
 

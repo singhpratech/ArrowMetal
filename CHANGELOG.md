@@ -114,8 +114,52 @@ Arrow function coverage
   283 in the C++ docs plus the 24 `hash_*` — each carrying its status, Swift file, ArrowMetal call, note,
   an executable call adapter under Arrow's own option names and a `pyarrow.compute` oracle. `list_functions()`
   and `call_function()` mirror pyarrow's introspection API.
-- `docs/ARROW_FUNCTIONS.md`, generated from that registry, is the by-name coverage page: 231 gpu, 20 cpu,
-  55 partial, 1 missing (`binary_slice`), 0 pending.
+- `docs/ARROW_FUNCTIONS.md`, generated from that registry, is the by-name coverage page: 283 gpu, 17 cpu,
+  7 partial, 0 missing, 0 planned — all 307 names.
+
+Fused expression compiler and lazy query engine
+- Expression compiler (`Sources/ArrowMetal/Expr`, docs/EXPR.md): a whole Arrow compute expression — arithmetic,
+  comparisons, null logic, casts, string predicates — lowered to one runtime-generated MSL kernel, so the
+  inputs are read once and the outputs written once; `batch.query(query().filter(...).sum(...))` in Swift,
+  `am.query(table, am.filter(pred).sum(am.col("x")))` in Python. Filter + aggregate, project and dense-key
+  group-by fuse into one dispatch; a five-operator expression at 50M rows goes from five kernels to one.
+- Lazy query engine (`Sources/ArrowMetal/Engine`, docs/ENGINE.md): `am.scan(table).filter().group_by().agg()
+  .sort().limit().collect()` and the Swift `LazyFrame`; an optimizer (predicate pushdown, projection pruning,
+  filter fusion, constant folding, expression CSE, join type-check, `explain()`), inner/left/right/outer/
+  semi/anti joins on one or several keys incl. utf8, `join_asof` with by-keys and tolerance, window
+  functions, `unique`, `explode`, `concat`; the plan runs inside one Metal command buffer. A JSON plan
+  grammar over the C ABI (`am_plan_source_create`, `am_plan_run`) for other front ends.
+
+Parquet on the GPU
+- A Parquet reader whose column data never passes through the CPU (docs/PARQUET.md): the host parses only
+  the Thrift footer and page headers; decompression (Snappy, LZ4, LZ4_RAW), definition levels, RLE /
+  dictionary indices, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY and BYTE_STREAM_SPLIT
+  decode as Metal kernels straight into shared-memory Arrow arrays. ZSTD/GZIP/BROTLI pages decompress on
+  the host. Row-group and column selection, nested lists; a small host-side writer for round trips.
+  `am.read_parquet(path)` in Python, `ParquetReader` in Swift.
+
+Out-of-core streaming
+- A streaming executor for datasets larger than memory (docs/STREAMING.md): Arrow IPC files/directories
+  (parallel readers with readahead and backpressure) or any Arrow C Stream flow through the GPU one
+  record batch at a time; filter/project to a sink, sum/count/min/max/mean/variance, group-by with the
+  state resident on the GPU, top-k, sort with a bounded k-way merge, broadcast and grace hash joins,
+  a HyperLogLog `count_distinct_approx` (0.007 % error on 570M rows) and a t-digest quantile. On a 30 GB
+  IPC directory: filter + sum in 0.53 s (ties Polars), count-distinct 7x faster than Polars at a third of
+  the memory; top-k, sort + limit and joins are slower than Polars/DuckDB and say so in §9.
+
+Integrations
+- Polars (docs/POLARS.md): a zero-copy bridge with `.arrowmetal` namespaces on Series/DataFrame/LazyFrame,
+  a Rust expression plugin (`polars-plugin/`) that runs inside a lazy plan, and a streaming hand-off.
+- DuckDB (docs/DUCKDB.md): a zero-copy Python bridge (`duckdb_aggregate`, `duckdb_group_by`, streaming
+  `duckdb_batches`) and a loadable C-API extension (`duckdb-extension/`) exposing the kernels as SQL
+  functions; the extension matches DuckDB's answers and is not yet a speedup (2048-row vectors).
+- pandas (docs/PANDAS.md): an `.am` accessor on Series/DataFrame, and an opt-in accel mode that patches a
+  documented set of pandas methods, routes to the GPU only when dtype, size and arguments qualify, and
+  restores the originals exactly on `uninstall()`.
+- `import arrowmetal` imports none of the three; each bridge loads on first use through one chained
+  PEP 562 hook (`_LAZY_HOOKS`).
+- The public C header compiles as C and C++ (a typedef/function name clash, `am_plan_source`, blocked
+  every C consumer including the DuckDB extension until the reviewer caught it).
 
 Bindings
 - libArrowMetalC C ABI (include/arrowmetal.h) and python/arrowmetal ctypes package (Arrow PyCapsule protocol).
@@ -124,17 +168,42 @@ Fixed
 - `GroupByKeys._agg` in the Python package took the device handle of a temporary `MetalArray` that was
   released before the C call read it, segfaulting every grouped aggregate whose values arrived as a
   pyarrow array rather than a `MetalArray`.
+- Found by the pre-release review pass, each with a regression test:
+  - Expression compiler: an untyped literal that did not fit the other operand was truncated to it
+    (`int8 > 200` was true for every row, `uint8 == -1` matched 255); a float literal against an integer
+    column was truncated to an integer. Both now widen the pair, also in `if_else`/`fill_null`/`coalesce`/`is_in`.
+  - Optimizer: constant folding absorbed a literal into the null-propagating `and`/`or` (only the Kleene
+    forms may); `if_else(c, a, a)` dropped the condition's nulls; folding `Int64.min / -1` and
+    `abs(Int64.min)` trapped the process; expression CSE deduplicated `select` outputs by name;
+    `join_reorder` permuted rows where the order is observable (now only below a sort, a reduction or a
+    group-by). `am_plan_explain`/`am_plan_run` leaked autoreleased objects when called from Python.
+  - Parquet: nine ways a corrupt file could hang, trap or read out of bounds (unbounded BYTE_ARRAY
+    lengths, varint overflow traps, unbounded Thrift nesting, unchecked schema cursors, negative offsets
+    and sizes in footer and page headers, oversized dictionaries and FLBA lengths) now error; an explicit
+    empty projection returned every column.
+  - Kernels: `lexsort` ignored `null_placement` on a utf8/binary key; the regex pre-filter claimed a
+    literal no-match for three pattern shapes; `partition_nth_indices` left a NaN behind when nulls
+    moved to the front.
+  - Integrations: an unknown column name in the DuckDB streaming helpers silently used the last column;
+    a Polars aggregate alias equal to a key replaced the keys; `df.am.query` lifted every column of the
+    frame; `zero_copy_report` failed on a Polars DataFrame; `count` over an empty DuckDB stream was
+    None; numpy scalars and strings were refused by `arrow_table`.
+  - The public C header declared `am_plan_source` as both a typedef and a function; no C consumer
+    (including the DuckDB extension) could compile it.
 
 Quality
-- CPU reference for every kernel; 26 tests including a scenario matrix over every type, null density, size
+- CPU reference for every kernel; 630 XCTest cases in release including a scenario matrix over every type, null density, size
   and sliced input; concurrency and pool tests; CI on hosted Apple silicon in debug and release.
 - `python/tests/test_functions.py` executes the Arrow-name registry: every runnable row is called through
   `call_function` and compared to `pyarrow.compute`, with a second input in a different Arrow type family
   for the rows whose claim spans several, and float tolerances recorded per row in `functions.TOLERANCE`.
   It found that `binary_length`, `binary_repeat` and `binary_reverse` refuse a `binary` column.
-- Differential matrix against `pyarrow.compute` (docs/EVALUATION.md): 13,176 cases per run, 0 unclassified
+- Differential matrix against `pyarrow.compute` (docs/EVALUATION.md): 33,183 cases per run over 45 column types, 0 unclassified
   divergences. Fixed from its findings: stable null order in argsort and top_k, the -0.0 tie in the sort
   keys (top_k included, which had its own key mapping), NaN kept at the end of a descending sort, float32
   sums in software double, unsigned group-by sums, exact float32 comparison, float32 `sign`/`ceil`/`floor`/
   `trunc`/`round` and element-wise `min`/`max` on subnormals and signed zeros.
 - Benchmarks: Swift vs all-core CPU vs Accelerate; Polars/pyarrow/pandas; ArrowMetal from Python in-process; latency mode.
+- Adversarial review pass before release (four independent reviewers over the integrations, the engine and
+  expression compiler, the GPU kernels, and the C ABI and Parquet reader): every finding carries a
+  regression test; the fixes are the "Fixed" bullets above and the entries in docs/EVALUATION.md.

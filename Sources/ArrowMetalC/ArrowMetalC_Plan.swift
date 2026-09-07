@@ -4,7 +4,7 @@ import ArrowMetal
 
 // The lazy query engine over the C ABI.
 //
-// A caller registers its tables once (`am_plan_source`, which takes the column handles it already
+// A caller registers its tables once (`am_plan_source_create`, which takes the column handles it already
 // holds), then sends a plan as JSON (`docs/ENGINE.md` and `Sources/ArrowMetal/Engine/PlanJSON.swift`
 // carry the grammar). The plan is type-checked, optimized and run, and the result comes back as a
 // handle whose columns are ordinary `am_*` array handles.
@@ -49,8 +49,8 @@ final class PlanResultBox {
 }
 
 /// Registers a table the plan can `scan` by name. Column handles are retained by the source.
-@_cdecl("am_plan_source")
-public func am_plan_source(_ name: UnsafePointer<CChar>?,
+@_cdecl("am_plan_source_create")
+public func am_plan_source_create(_ name: UnsafePointer<CChar>?,
                            _ columns: UnsafeMutablePointer<OpaquePointer?>?,
                            _ names: UnsafeMutablePointer<UnsafePointer<CChar>?>?,
                            _ nColumns: Int64,
@@ -97,13 +97,18 @@ public func am_plan_run(_ planText: UnsafePointer<CChar>?,
                         _ optimize: Int32,
                         _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
     guard let planText, let out, nSources >= 0, let map = collectSources(sources, nSources) else { return 2 }
-    do {
-        let batch = try PlanJSON.run(String(cString: planText), sources: map, optimize: optimize != 0)
-        out.pointee = OpaquePointer(Unmanaged.passRetained(PlanResultBox(batch)).toOpaque())
-        return 0
-    } catch {
-        setPlanError(error)
-        return 1
+    // A caller that never returns to a run loop — a Python `for` loop, say — never drains the
+    // autorelease pool, so every Metal object a query autoreleases would live until the process
+    // exits. Draining here keeps a long run of small queries flat instead of growing ~2.5 KB a query.
+    return autoreleasepool {
+        do {
+            let batch = try PlanJSON.run(String(cString: planText), sources: map, optimize: optimize != 0)
+            out.pointee = OpaquePointer(Unmanaged.passRetained(PlanResultBox(batch)).toOpaque())
+            return 0
+        } catch {
+            setPlanError(error)
+            return 1
+        }
     }
 }
 
@@ -115,16 +120,18 @@ public func am_plan_explain(_ planText: UnsafePointer<CChar>?,
                             _ nSources: Int64,
                             _ optimize: Int32) -> UnsafePointer<CChar>? {
     guard let planText, nSources >= 0, let map = collectSources(sources, nSources) else { return nil }
-    do {
-        let text = try PlanJSON.explain(String(cString: planText), sources: map, optimize: optimize != 0)
-        let key = "ArrowMetalC.planExplain"
-        if let old = Thread.current.threadDictionary[key] as? UnsafeMutablePointer<CChar> { free(old) }
-        let c = strdup(text)!
-        Thread.current.threadDictionary[key] = c
-        return UnsafePointer(c)
-    } catch {
-        setPlanError(error)
-        return nil
+    return autoreleasepool {
+        do {
+            let text = try PlanJSON.explain(String(cString: planText), sources: map, optimize: optimize != 0)
+            let key = "ArrowMetalC.planExplain"
+            if let old = Thread.current.threadDictionary[key] as? UnsafeMutablePointer<CChar> { free(old) }
+            let c = strdup(text)!
+            Thread.current.threadDictionary[key] = c
+            return UnsafePointer(c)
+        } catch {
+            setPlanError(error)
+            return nil
+        }
     }
 }
 
