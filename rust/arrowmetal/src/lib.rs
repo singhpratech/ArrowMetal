@@ -27,31 +27,39 @@
 //!
 //! Going out ([`Array::to_arrow`]) is always copy-free: ArrowMetal's own buffers are `MTLBuffer`s in
 //! shared memory, and it hands their pointers straight to the C Data Interface with a release
-//! callback, so arrow-rs reads the GPU's memory in place.
+//! callback, so arrow-rs reads the GPU's memory in place. Measured, values **and** validity bitmap:
+//! every exported buffer was page aligned at every size tested.
 //!
-//! Going in ([`Array::from_arrow`]) is copy-free only when every buffer pointer is page aligned,
-//! because that is what `MTLDevice.makeBuffer(bytesNoCopy:)` requires; otherwise ArrowMetal copies
-//! each buffer once into a Metal buffer. A page here is 16 KiB on Apple silicon.
+//! Going in ([`Array::from_arrow`]) is copy-free only when a buffer pointer is page aligned, because
+//! that is what `MTLDevice.makeBuffer(bytesNoCopy:)` requires; otherwise ArrowMetal copies that
+//! buffer once. A page here is 16 KiB on Apple silicon. The decision is **per buffer**, so a
+//! nullable column can have its values wrapped and its bitmap copied.
 //!
 //! Whether an arrow-rs array clears that bar is a property of the *allocator*, not of arrow-rs, so
-//! it is measured rather than assumed. `tests/copy_rule.rs` samples 32 allocations at each of six
-//! sizes through both of arrow-rs's allocation paths and prints what it finds; on macOS 26.6.2 / arm64
-//! with the system allocator, in this repository's run:
+//! it is measured rather than assumed. `tests/copy_rule.rs` exports through `arrow::ffi` and reads
+//! the pointers `am_import` actually receives, 32 allocations at each of six sizes; on
+//! macOS 26.6.2 / arm64 with the system allocator, in this repository's run:
 //!
-//! | Values buffer | Page aligned, out of 32 |
-//! |---|---|
-//! | 128 B (16 int64) | 0–1 |
-//! | 4 KiB (512 int64) | 8 |
-//! | 64 KiB (8,192 int64) and above | 32 |
+//! | Column length | Values buffer page aligned | Validity bitmap page aligned |
+//! |---|---|---|
+//! | 16 | 1/32 | 0/32 |
+//! | 512 | 8/32 | 0/32 |
+//! | 8,192 | 32/32 | 2/32 |
+//! | 131,072 and above | 32/32 | 32/32 |
 //!
-//! So in practice: **a column of a few thousand rows or more imports copy-free, and a very small one
-//! is copied.** That is the system allocator handing back page-aligned memory once a request is
-//! large enough to be served by `mmap`; it is not guaranteed, and a custom global allocator or
-//! another platform can change it. Re-run `cargo test --test copy_rule -- --nocapture` to see the
-//! table for your own machine.
+//! So in practice: **values are wrapped from a few thousand rows up; a nullable column of fewer than
+//! roughly 130,000 rows normally has its validity bitmap copied.** That copy is small — a bitmap is
+//! one bit per row, so about 16 KB at the point it stops happening — but it is a copy, and the
+//! earlier version of this note missed it entirely by measuring `ArrayData::buffers()`, which
+//! excludes the null buffer.
+//!
+//! The pattern is just the system allocator handing back page-aligned memory once a request is large
+//! enough to be served by `mmap`; the bitmap is eight times smaller than the values, so it crosses
+//! that threshold eight times later. None of it is guaranteed — a custom global allocator or another
+//! platform can change it. Re-run `cargo test --test copy_rule -- --nocapture` for your own machine.
 //!
 //! An array that came *out* of ArrowMetal and is sent back in is recognised and re-imported without
-//! a copy whatever its alignment.
+//! a copy in either buffer, whatever the original alignment was.
 //!
 //! Neither direction copies for a slice: an Arrow `offset` is carried on the handle rather than
 //! applied, so `array.slice(7, n)` imports the same buffers the unsliced array would.
@@ -68,19 +76,24 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+use std::cell::RefCell;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fmt;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 
 use arrow::array::{make_array, Array as ArrowArrayTrait, ArrayRef};
+use arrow::datatypes::DataType;
 use arrow::ffi::{from_ffi, to_ffi, FFI_ArrowArray, FFI_ArrowSchema};
 
 use arrowmetal_sys as sys;
 use sys::ffi;
 
-/// The directory the dylib was linked from, baked in at build time.
-pub const LIB_DIR: &str = env!("ARROWMETAL_LIB_DIR");
+/// The directory `libArrowMetalC.dylib` was linked from, baked in at build time.
+///
+/// This is the resolved output of the search in `arrowmetal-sys/build.rs`, not the `ARROWMETAL_LIB`
+/// or `ARROWMETAL_LIB_DIR` you may have set to steer it.
+pub const LIB_DIR: &str = env!("ARROWMETAL_LINKED_LIB_DIR");
 
 // =================================================================================================
 // Errors
@@ -173,7 +186,14 @@ mod sealed {
 /// The C ABI reads `sizeof(element type)` bytes through a `void*`, so passing an `i32` scalar to an
 /// `Int64Array` would read four bytes past the end of the value. Every entry point on this trait
 /// therefore checks [`FORMAT`](NativeType::FORMAT) against the array's own Arrow format string first
-/// and returns an error on a mismatch, which is what makes those calls safe.
+/// and returns an error on a mismatch.
+///
+/// That check is only as good as `am_format`, and there is one Arrow type for which `am_format`
+/// does **not** describe what the kernels compute on: a dictionary-encoded array reports its *index*
+/// type (`"i"`) while every kernel decodes the dictionary and operates on the *value* type. A
+/// 4-byte scalar would then be accepted for a `Dictionary(Int32, Float64)` column whose kernel reads
+/// 8 bytes. [`Array::from_arrow`] therefore refuses dictionary arrays outright, which is what keeps
+/// the sentence above true for everything this crate accepts. See [`Array::from_arrow`].
 pub trait NativeType: Copy + sealed::Sealed {
     /// The Arrow C Data Interface format string for this type.
     const FORMAT: &'static str;
@@ -319,6 +339,27 @@ impl Array {
     /// copy rule](crate#the-copy-rule). A sliced array (`offset != 0`) imports without copying: the
     /// offset rides on the handle.
     ///
+    /// # Dictionary arrays are refused
+    ///
+    /// A `DataType::Dictionary` array is rejected with an error rather than imported. The ABI's
+    /// `am_format` reports a dictionary's *index* type (`"i"`), but every ArrowMetal kernel decodes
+    /// the dictionary first and computes on the *value* type. This crate type-checks scalar operands
+    /// against `am_format`, so importing one would let a 4-byte `i32` scalar through to a kernel
+    /// reading 8 bytes off a `Dictionary(Int32, Float64)` column — an out-of-bounds read reachable
+    /// from safe Rust, and a wrong answer besides.
+    ///
+    /// This is a limitation of the C ABI, not of the Arrow type: the kernels themselves handle
+    /// dictionaries correctly. Until `am_format` reports the compute type, decode first:
+    ///
+    /// ```no_run
+    /// # use arrow::array::{ArrayRef, Int64Array};
+    /// # use arrow::datatypes::DataType;
+    /// # let dict: ArrayRef = std::sync::Arc::new(Int64Array::from(vec![1i64]));
+    /// let decoded = arrow::compute::cast(dict.as_ref(), &DataType::Float64)?;
+    /// let gpu = arrowmetal::Array::from_arrow(decoded.as_ref())?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
     /// ```no_run
     /// use arrow::array::Int64Array;
     /// let a = Int64Array::from(vec![1i64, 2, 3]);
@@ -327,6 +368,17 @@ impl Array {
     /// # Ok::<(), arrowmetal::Error>(())
     /// ```
     pub fn from_arrow(array: &dyn ArrowArrayTrait) -> Result<Self> {
+        // See the section above: `am_format` would lie about this array's element type, and the
+        // scalar type check that keeps `compare_scalar` and friends sound is built on `am_format`.
+        if let DataType::Dictionary(key, value) = array.data_type() {
+            return Err(Error::new(format!(
+                "dictionary-encoded arrays are not accepted (this array is \
+                 Dictionary({key}, {value})): ArrowMetal's am_format reports a dictionary's index \
+                 type while its kernels compute on the value type, so a scalar operand cannot be \
+                 type-checked against it. Decode first, e.g. \
+                 `arrow::compute::cast(&array, &DataType::{value})`."
+            )));
+        }
         let (ffi_array, ffi_schema) = to_ffi(&array.to_data())?;
         // `am_import` moves the array: on success it nulls `release` in our struct, so the drop
         // below is a no-op. On failure `release` may still be set, and the drop frees the export.
@@ -893,16 +945,42 @@ pub fn explain_plan(plan_json: &str, sources: &[&Source], optimize: bool) -> Res
 /// round trip per kernel.
 ///
 /// The batch is closed even if `body` panics.
+///
+/// # Errors
+///
+/// `am_batch_end` commits the command buffer and reports a non-zero code when the GPU work failed —
+/// the whole batch's failure surfaces there, not at the individual calls, because those only
+/// enqueued. That failure is returned as an `Err` **even though `body` already produced a value**,
+/// so a batch that comes back `Ok` is a batch whose GPU work committed successfully. Values computed
+/// inside a failed batch are discarded, as they must be: the kernels behind them did not run.
+///
+/// The close itself happens in a `Drop`, which cannot fail, so the guard records the code and this
+/// function reads it once the closure has returned and the guard has run.
 pub fn batch<T>(body: impl FnOnce() -> T) -> Result<T> {
     check(unsafe { ffi::am_batch_begin() }, "am_batch_begin")?;
 
-    /// Closes the batch on the way out, panic or not.
-    struct Guard;
-    impl Drop for Guard {
+    /// Closes the batch on the way out, panic or not, and records what `am_batch_end` said.
+    struct Guard<'a>(&'a RefCell<Option<Error>>);
+    impl Drop for Guard<'_> {
         fn drop(&mut self) {
-            unsafe { ffi::am_batch_end() };
+            let rc = unsafe { ffi::am_batch_end() };
+            if rc != 0 {
+                // `am_last_error` is thread-local and the next call on this thread overwrites it,
+                // so it is read here rather than after the guard has gone out of scope.
+                *self.0.borrow_mut() = Some(Error::last("am_batch_end"));
+            }
         }
     }
-    let _guard = Guard;
-    Ok(body())
+
+    let failure: RefCell<Option<Error>> = RefCell::new(None);
+    // The guard must be dropped -- and so must have run `am_batch_end` and recorded its code --
+    // before `failure` is read, which is what this inner scope is for.
+    let value = {
+        let _guard = Guard(&failure);
+        body()
+    };
+    match failure.into_inner() {
+        Some(e) => Err(e),
+        None => Ok(value),
+    }
 }

@@ -23,3 +23,6 @@ arrow = { version = "59", default-features = false, features = ["ffi"] }
 # The oracle: arrow-rs's own compute kernels, on the same data.
 arrow = { version = "59", default-features = false, features = ["ffi"] }
 rand = "0.9"
+# Compile-time trait assertions, so "handles are !Send" is checked by the compiler rather than
+# asserted in a comment.
+static_assertions = "1.1"

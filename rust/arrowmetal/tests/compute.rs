@@ -14,10 +14,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array as _, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, Scalar as ArrowScalar,
+    Array as _, ArrayRef, BooleanArray, DictionaryArray, Float64Array, Int32Array, Int64Array,
+    Scalar as ArrowScalar,
 };
 use arrow::compute::kernels::cmp;
 use arrow::compute::{filter, sort, take, SortOptions};
+use arrow::datatypes::Int32Type;
 use arrowmetal::{group_by, Agg, Array, CompareOp, Scalar};
 
 use common::{arc, close, float64, int64, LENGTHS};
@@ -675,14 +677,61 @@ fn cast_matches_arrow() {
     assert_eq!(&got, &want);
 }
 
-/// Handles are `!Send`: this is a compile-time property, asserted here so a future change that made
-/// `Array` `Send` would fail a test rather than silently allow a cross-thread handle.
+/// Handles must stay `!Send` and `!Sync`: the ABI's error slot and its command-buffer batching are
+/// both thread-local, so a handle belongs to the thread that made it.
+///
+/// These are real compile-time assertions — `assert_not_impl_any!` fails to compile if the type ever
+/// gains the trait — not a runtime check and not a comment. The `assert_impl_all!` line is the
+/// control: it proves the macro can see `Send` when it is there.
 #[test]
-fn handles_are_not_send() {
-    fn is_send<T: Send>() {}
-    // Uncommenting either line must fail to compile:
-    //   is_send::<Array>();
-    //   is_send::<arrowmetal::GroupBy>();
-    is_send::<Arc<Int64Array>>(); // a control that does compile
-    let _ = is_send::<i64>;
+fn handles_are_not_send_or_sync() {
+    use static_assertions::{assert_impl_all, assert_not_impl_any};
+
+    assert_not_impl_any!(Array: Send, Sync);
+    assert_not_impl_any!(arrowmetal::GroupBy: Send, Sync);
+    assert_not_impl_any!(arrowmetal::Source: Send, Sync);
+    assert_not_impl_any!(arrowmetal::PlanResult: Send, Sync);
+
+    assert_impl_all!(Arc<Int64Array>: Send, Sync);
+    // `Error` carries only a String, so it may cross threads; that is deliberate.
+    assert_impl_all!(arrowmetal::Error: Send, Sync);
+}
+
+/// A dictionary-encoded array must be refused by `from_arrow`, not imported.
+///
+/// The ABI's `am_format` reports a dictionary's *index* type (`"i"`) while every kernel decodes the
+/// dictionary and computes on the *value* type. This crate's scalar type check reads `am_format`, so
+/// importing one would let a 4-byte `i32` scalar reach a kernel reading 8 bytes off a
+/// `Dictionary(Int32, Float64)` column — unsound from safe Rust, and a wrong answer besides
+/// (`compare_scalar(Lt, 2i32)` returned `[false, false, false]` where arrow-rs says
+/// `[true, false, false]`). Rejecting at the door is what keeps the type check honest.
+#[test]
+fn dictionary_arrays_are_refused_at_import() {
+    let values = Float64Array::from(vec![1.0, 5.0, 9.0]);
+    let keys = Int32Array::from(vec![0, 1, 2]);
+    let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap();
+
+    let err = Array::from_arrow(&dict).unwrap_err();
+    assert!(
+        err.message().contains("dictionary-encoded arrays are not accepted"),
+        "unexpected message: {err}"
+    );
+    assert!(err.message().contains("Dictionary(Int32, Float64)"), "{err}");
+
+    // The documented way through: decode, then import. The decoded column type-checks correctly,
+    // and a 4-byte scalar is now refused for what is a Float64 column.
+    let decoded = arrow::compute::cast(&dict, &arrow::datatypes::DataType::Float64).unwrap();
+    let gpu = Array::from_arrow(decoded.as_ref()).unwrap();
+    assert_eq!(gpu.format(), "g");
+    assert!(gpu.compare_scalar(CompareOp::Lt, 2i32).is_err());
+
+    // And the answer is arrow-rs's.
+    let want = cmp::lt(
+        decoded.as_any().downcast_ref::<Float64Array>().unwrap(),
+        &ArrowScalar::new(&Float64Array::from(vec![2.0f64])),
+    )
+    .unwrap();
+    let got = gpu.compare_scalar(CompareOp::Lt, 2.0f64).unwrap().to_arrow().unwrap();
+    assert_eq!(got.as_ref(), &want as &dyn arrow::array::Array);
+    assert_eq!(want.values().iter().collect::<Vec<_>>(), vec![true, false, false]);
 }
