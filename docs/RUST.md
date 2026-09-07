@@ -188,11 +188,28 @@ error slot and its command-buffer batching are both thread-local. Use one set of
 
 ### One divergence from arrow-rs, found and pinned
 
-`min` / `max` on a float column containing NaN. ArrowMetal skips NaN in both, and reports "no valid
-value" when every valid element is NaN — the header's rule, and pyarrow's. **arrow-rs's `max`
-propagates NaN instead** (its `min` skips it). `tests/compute.rs::nan_handling_diverges_from_arrow_rs_and_is_pinned`
-asserts both sides and fails if either moves. With no NaN in the data the two agree exactly, which is
-what every other reduction test relies on.
+`min` / `max` on a float column containing NaN. The two libraries use different, each internally
+consistent, rules — neither is a bug:
+
+| Input (float64) | ArrowMetal | arrow-rs 59.3 | pyarrow |
+|---|---|---|---|
+| `[NaN, 2.0, null, -1.0, NaN]` — `min` | `-1.0` | `-1.0` | `-1.0` |
+| the same — `max` | `2.0` | `NaN` | `2.0` |
+| `[NaN, NaN]` — `min` and `max` | null | `NaN` | `NaN` |
+
+**arrow-rs orders NaN at the top of a total order.** Both `min` and `max` say so in the same
+sentence — *"For floating point arrays any NaN values are considered to be greater than any other
+non-null value"* (`arrow_arith::aggregate`, 59.3.0) — so `min` returns the smallest non-NaN and
+`max` returns NaN. That was reported as [apache/arrow-rs#101](https://github.com/apache/arrow-rs/issues/101)
+and closed as intended behaviour in 2022.
+
+**ArrowMetal skips NaN in both**, the way it skips a null, and reports "no valid value" when every
+valid element is NaN. That follows Arrow C++ / pyarrow on the mixed case; on an all-NaN column
+pyarrow returns NaN where ArrowMetal returns null, which the C header already documents.
+
+`tests/compute.rs::nan_handling_diverges_from_arrow_rs_and_is_pinned` asserts all three columns above
+and fails if any of them moves. With no NaN in the data the two agree exactly, which is what every
+other reduction test relies on.
 
 ---
 

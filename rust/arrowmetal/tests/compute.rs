@@ -164,9 +164,21 @@ fn float64_reductions_match_arrow() {
 }
 
 /// NaN in `min` / `max` is the one place the two libraries disagree, so it is pinned rather than
-/// compared. The header's rule is that both skip NaN and report "no valid value" when every valid
-/// element is NaN, which is pyarrow's `skip_nulls` behaviour. arrow-rs's `max` propagates NaN
-/// instead (its `min` skips it). This test records both sides; `docs/RUST.md` lists the divergence.
+/// compared.
+///
+/// The two rules are each self-consistent and neither is a bug:
+///
+/// * **arrow-rs** puts NaN at the top of a total order. Both `min` and `max` document it in the same
+///   sentence -- "For floating point arrays any NaN values are considered to be greater than any
+///   other non-null value" (`arrow_arith::aggregate`, 59.3.0) -- so `min` returns the smallest
+///   non-NaN and `max` returns NaN. This was reported as apache/arrow-rs#101 and closed as
+///   intended behaviour in 2022.
+/// * **ArrowMetal** skips NaN in both, the way it skips a null, and reports "no valid value" when
+///   every valid element is NaN. That follows Arrow C++ / pyarrow, which also skips NaN -- though
+///   pyarrow returns NaN rather than null for an all-NaN column, so ArrowMetal differs from it in
+///   that case too.
+///
+/// `docs/RUST.md` carries the same note.
 #[test]
 fn nan_handling_diverges_from_arrow_rs_and_is_pinned() {
     let mixed =
@@ -177,18 +189,21 @@ fn nan_handling_diverges_from_arrow_rs_and_is_pinned() {
     assert_eq!(gpu.min().unwrap().map(Scalar::as_f64), Some(-1.0));
     assert_eq!(gpu.max().unwrap().map(Scalar::as_f64), Some(2.0));
 
-    // arrow-rs on the same data: `min` agrees, `max` returns NaN.
+    // arrow-rs, NaN ordered greatest: `min` agrees here by coincidence, `max` returns NaN.
     assert_eq!(arrow::compute::min(&mixed), Some(-1.0));
     assert!(
         arrow::compute::max(&mixed).is_some_and(f64::is_nan),
-        "arrow-rs's max stopped propagating NaN; re-check the divergence note in docs/RUST.md"
+        "arrow-rs stopped ordering NaN greatest; re-check the divergence note in docs/RUST.md"
     );
 
-    // Every valid value NaN: ArrowMetal reports no valid value. (pyarrow returns NaN here too.)
+    // Every valid value NaN: ArrowMetal reports no valid value, arrow-rs returns NaN from both
+    // (NaN is simply the greatest and the least element present).
     let all_nan = Float64Array::from(vec![Some(f64::NAN), Some(f64::NAN)]);
     let gpu = Array::from_arrow(&all_nan).unwrap();
     assert_eq!(gpu.min().unwrap(), None);
     assert_eq!(gpu.max().unwrap(), None);
+    assert!(arrow::compute::min(&all_nan).is_some_and(f64::is_nan));
+    assert!(arrow::compute::max(&all_nan).is_some_and(f64::is_nan));
 
     // With no NaN anywhere the two libraries agree exactly, which is what the sweep above relies on.
     let clean = Float64Array::from(vec![Some(3.0), None, Some(-4.5), Some(0.0)]);
