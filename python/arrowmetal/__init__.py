@@ -46,6 +46,8 @@ _lib.am_device_name.restype = ctypes.c_char_p
 _lib.am_last_error.restype = ctypes.c_char_p
 _lib.am_format.restype = ctypes.c_char_p
 _lib.am_format.argtypes = [_P]
+_lib.am_compute_format.restype = ctypes.c_char_p
+_lib.am_compute_format.argtypes = [_P]
 _lib.am_length.restype = ctypes.c_int64
 _lib.am_length.argtypes = [_P]
 _lib.am_null_count.restype = ctypes.c_int64
@@ -247,12 +249,9 @@ class MetalArray:
         return f"MetalArray({self.type}, len={len(self)}, nulls={self.null_count}, device={device_name()!r})"
 
     def _scalar(self, v):
-        fmt = self.format
-        # A dictionary-encoded column reports its *index* format ("i"), but the kernels that take a
-        # scalar decode it to its values first, so the scalar has to be packed as one of those values.
-        # Among "i" arrays only a dictionary has a child, which is cheaper to ask than the Arrow type.
-        if fmt == "i" and _lib.am_child_count(self._h) == 1:
-            fmt = self.child(0).format
+        # The kernels decode a dictionary before computing, so the scalar is packed to the values'
+        # width, which is what am_compute_format reports (am_format reports the index type).
+        fmt = _lib.am_compute_format(self._h).decode()
         # A decimal scalar is 16 little-endian bytes, which is what am_compare_scalar expects for "d:p,s".
         if fmt.startswith("d:"):
             return _decimal_scalar(v, _decimal_scale(fmt))

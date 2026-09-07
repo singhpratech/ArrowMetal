@@ -25,6 +25,11 @@ void am_release(am_array* a);
 int64_t     am_length(am_array* a);
 int64_t     am_null_count(am_array* a);
 const char* am_format(am_array* a);          // Arrow format string: c C s S i I l L f g b u z t... d:p,s
+// The format the scalar-taking kernels compute on. am_format reports the C Data Interface's top-level
+// format, which for a dictionary array is its index type ("i", "c", ...); the kernels decode a
+// dictionary before computing, so a scalar operand must be packed to am_compute_format's width, not
+// am_format's. Identical to am_format for every non-dictionary array.
+const char* am_compute_format(am_array* a);
 
 // Reductions. out_kind: 0 = int64 in out_i64, 1 = uint64 in out_u64 (same slot), 2 = float64 in out_f64.
 // op: 0 sum, 1 min, 2 max, 3 mean. *is_null is set when there is no valid value.
