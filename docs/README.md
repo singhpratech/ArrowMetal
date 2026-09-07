@@ -13,6 +13,7 @@ every claim the project makes.
 | [BENCHMARKS.md](BENCHMARKS.md) | Every benchmark round with hardware, methodology, wall time and CPU time; the tables the README quotes |
 | [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md) | The complete operation-by-operation comparison against Polars, pyarrow.compute and pandas at 10M and 50M rows, with a verdict per row and a shortfall list of everything below the 3x bar |
 | [DESIGN.md](DESIGN.md) | How it works: buffers, kernels, batching, GPU-side lengths, software Float64, where the time goes |
+| [PANDAS.md](PANDAS.md) | pandas on the GPU: the `.am` accessor and the zero-code-change accel mode, what routes to the GPU and when, the zero-copy and null rules, the numbers and the limits |
 | [EXPR.md](EXPR.md) | Fused expression queries: one runtime-generated kernel for a whole expression DAG, the grammar, how nulls are compiled, the numbers and the limits |
 | [ENGINE.md](ENGINE.md) | The lazy query engine: the logical plan, the optimizer rules with `explain()` examples, fusion planning, the full join matrix (multi-key, utf8, outer, semi/anti, as-of), window functions, the plan grammar, the numbers and the limits |
 | [POLARS.md](POLARS.md) | Polars on the GPU in three tiers: the zero-copy bridge and `.arrowmetal` namespaces, the Rust expression plugin for lazy plans, and the streaming hand-off — with install, numbers at 10M and 50M rows, and what a real Metal `engine=` backend would need |
@@ -41,6 +42,7 @@ PYTHONPATH=python python Benchmarks/engine_bench.py       # the lazy query engin
 cd polars-plugin && cargo build --release                 # the Polars expression plugin (tier 2)
 PYTHONPATH=python python -m pytest python/tests/test_polars.py -q   # the three Polars tiers
 PYTHONPATH=python python Benchmarks/polars_bench.py       # native Polars vs both Polars tiers
+PYTHONPATH=python python Benchmarks/pandas_bench.py       # plain pandas vs the .am accessor vs accel mode
 swift run -c release arrowmetal-examples         # six end-to-end scenarios
 ```
 

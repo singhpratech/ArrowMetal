@@ -3948,7 +3948,7 @@ def _load_polars_bridge():
     g["from_polars"] = _pb.from_polars
     g["to_polars"] = _pb.to_polars
     g["zero_copy"] = _pb.zero_copy
-    g["zero_copy_report"] = _pb.zero_copy_report
+    g["_polars_zero_copy_report"] = _pb.zero_copy_report
     g["register_polars"] = _pb.register_namespaces
     return _pb
 
@@ -4033,3 +4033,59 @@ def _duckdb_getattr(name):
 
 
 _LAZY_HOOKS.append((_duckdb_getattr, lambda: list(_DUCKDB_EXPORTS) + ["duckdb_bridge"]))
+
+
+# ---- pandas: the `.am` accessor, zero-copy conversion, and the zero-code-change accel mode.
+# Imported lazily so that `import arrowmetal` never requires pandas. See docs/PANDAS.md.
+_PANDAS_EXPORTS = {"from_pandas": "pandas_bridge", "to_pandas": "pandas_bridge",
+                   "zero_copy_report": "pandas_bridge", "pandas_bridge": None, "pandas_accel": None}
+
+
+def _pandas_getattr(name):
+    """`am.from_pandas` / `am.to_pandas` / `am.pandas_bridge` / `am.pandas_accel` on first use."""
+    where = _PANDAS_EXPORTS.get(name, ...)
+    if where is ...:
+        raise AttributeError(name)
+    import importlib
+    mod = importlib.import_module(f"{__name__}.{where or name}")
+    value = mod if where is None else getattr(mod, name)
+    globals()[name] = value
+    return value
+
+
+# Every lazy bridge registers here rather than defining its own module `__getattr__`: a second
+# definition would replace the first and silently disable the bridges that came before it.
+try:
+    _LAZY_HOOKS
+except NameError:
+    _LAZY_HOOKS = []
+
+    def __getattr__(name):
+        for _hook, _names in _LAZY_HOOKS:
+            try:
+                return _hook(name)
+            except AttributeError:
+                continue
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    def __dir__():
+        names = list(globals())
+        for _hook, _names in _LAZY_HOOKS:
+            names += list(_names())
+        return sorted(set(names))
+
+_LAZY_HOOKS.append((_pandas_getattr, lambda: list(_PANDAS_EXPORTS)))
+
+# ---- zero_copy_report is exported by both the Polars and the pandas bridge; dispatch on the argument
+# so `am.zero_copy_report(x)` answers for either library regardless of which bridge loaded first.
+def zero_copy_report(obj):
+    """Whether `obj` (a Polars Series/DataFrame or a pandas Series/DataFrame) reaches Metal without a
+    copy, and why not when it does not. Dispatches to the bridge that owns the type."""
+    mod = type(obj).__module__ or ""
+    if mod.startswith("pandas"):
+        import importlib
+        return importlib.import_module(__name__ + ".pandas_bridge").zero_copy_report(obj)
+    if mod.startswith("polars"):
+        _load_polars_bridge()
+        return globals()["_polars_zero_copy_report"](obj)
+    raise ArrowMetalError(f"zero_copy_report: expected a Polars or pandas Series/DataFrame, got {type(obj).__name__}")
