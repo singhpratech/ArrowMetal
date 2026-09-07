@@ -70,8 +70,8 @@ extension AnyMetalArray {
             }
         // utf8 and binary sort byte-wise on the GPU (`Kernels/StringSort.swift`), which is the order
         // Arrow defines for them.
-        case .string(let a): return try a.argsort(descending: descending)
-        case .binary(let a): return try a.argsort(descending: descending)
+        case .string(let a): return try a.argsort(descending: descending, nullPlacement: nullPlacement)
+        case .binary(let a): return try a.argsort(descending: descending, nullPlacement: nullPlacement)
         case .dictionary, .runEndEncoded, .decimal, .list, .structure, .map, .union:
             throw ArrowMetalError.unsupportedType("sort by \(arrowFormat) is not implemented")
         // float16 sorts through the float32 widening; the rest have no order-preserving GPU key.
