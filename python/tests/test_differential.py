@@ -4382,22 +4382,6 @@ def _contains_a_zero(src):
     return any(v == 0.0 for v in src.to_pylist() if v is not None)
 
 
-def _sorted_unique_interleaves_ascii(src):
-    """A utf8 column whose distinct values, in UTF-8 byte order, interleave ASCII and non-ASCII ones.
-
-    That is exactly when the byte order and the order `unique(order="sorted")` produces differ: the
-    sorted pass puts every non-ASCII value after every ASCII one whatever the bytes say."""
-    ordered = sorted((v for v in pc.unique(src).to_pylist() if v is not None),
-                     key=lambda s: s.encode())
-    seen_non_ascii = False
-    for value in ordered:
-        if not value.isascii():
-            seen_non_ascii = True
-        elif seen_non_ascii:
-            return True
-    return False
-
-
 def _round_scaling_cannot_carry_the_value(src):
     """A value `round_int(x * 10^n) / 10^n` cannot carry: one whose scaled product needs more
     significant digits than the type holds, and one so small that the scaling underflows to zero."""
@@ -4516,19 +4500,10 @@ FINDINGS = [
             ["skew_kurtosis"], INTEGER, data_check=_reaches_the_integer_extremes),
     # Listed before the ±0 finding so a float64 winsorize cell is attributed to the bug rather than
     # to the sign of zero, which only decides the float32 cells.
-    Finding("BUG:winsorize-uint64-poisons-float64",
-            "a winsorize on a uint64 column makes every later float64 winsorize in the process answer "
-            "with limits it never computed; the cell is left failing on purpose",
-            ["winsorize"], ["float64"]),
     Finding("winsorize-negative-zero-limit",
             "the winsorize limits are picked out of the sorted values, where -0.0 and 0.0 are one tie "
             "group; ArrowMetal clamps to the -0.0 of that pair and Arrow to the 0.0",
             ["winsorize"], FLOATING, data_check=_contains_negative_zero),
-    Finding("BUG:sorted-unique-order-is-not-the-sort-order",
-            "unique/value_counts with order=\"sorted\" put every non-ASCII value after every ASCII "
-            "one, where the column's own sort() orders by UTF-8 bytes; the cell is left failing on "
-            "purpose",
-            ["unique", "value_counts"], ["utf8"], data_check=_sorted_unique_interleaves_ascii),
 ]
 
 
@@ -5763,12 +5738,10 @@ def test_winsorize_clamps_to_the_negative_zero_of_a_zero_tie():
     assert got == expected                            # equal as numbers, not as bits
 
 
-@pytest.mark.xfail(strict=True, reason="BUG:winsorize-uint64-poisons-float64: the first float64 "
-                                       "winsorize after a uint64 one answers with limits it never "
-                                       "computed")
 def test_winsorize_on_float64_survives_a_uint64_call():
-    """NOTE: this test poisons the float64 winsorize path for the rest of the process, which is the
-    bug. It sits at the end of the file so nothing else runs after it."""
+    """Once a bug: the clamp pipeline was cached under its MSL type alone, and uint64 and float64 both
+    travel as `ulong`, so the first float64 winsorize after a uint64 one ran the integer clamp over
+    binary64 patterns. The cache key carries the kind now."""
     shape = Shape(33, 0.0, "random")
     unsigned, doubles = make_array("uint64", shape), make_array("float64", shape)
     for lower, upper in [(0.0, 1.0), (0.05, 0.95), (0.25, 0.75), (0.5, 0.5)]:
@@ -5776,14 +5749,20 @@ def test_winsorize_on_float64_survives_a_uint64_call():
     assert pylist(am.array(doubles).winsorize(0.0, 1.0)) == doubles.to_pylist()
 
 
-@pytest.mark.xfail(strict=True, reason="BUG:sorted-unique-order-is-not-the-sort-order: "
-                                       "unique(order='sorted') puts every non-ASCII value after "
-                                       "every ASCII one, where sort() orders by UTF-8 bytes")
 def test_sorted_unique_uses_the_columns_own_sort_order():
-    a = pa.array(["b", "á"], pa.string())        # b'b' and b'a\xcc\x81'
-    assert pylist(am.array(a).sort()) == ["á", "b"] == \
-        a.take(pc.array_sort_indices(a)).to_pylist()
-    assert pylist(am.array(a).unique("sorted")) == ["á", "b"]
+    """Once a bug: the host ordering behind the sorted unique/value_counts/dictionary_encode used
+    Swift's Unicode-canonical `<`, which put every non-ASCII value after every ASCII one; it orders by
+    UTF-8 bytes now, like sort() and Arrow."""
+    a = pa.array(["b", "á", "ab", "a", "é", "z", "\x00", "B"], pa.string())   # "á" is U+0061 U+0301
+    expected = a.take(pc.array_sort_indices(a)).to_pylist()
+    assert pylist(am.array(a).sort()) == expected
+    assert pylist(am.array(a).unique("sorted")) == expected
+    counted = arrow(am.array(a).value_counts("sorted"))
+    assert pc.struct_field(counted, "values").to_pylist() == expected
+    assert pc.struct_field(counted, "counts").to_pylist() == [1] * len(expected)
+    codes, dictionary = am.array(a).dictionary_encode("sorted")
+    assert pylist(dictionary) == expected
+    assert [expected[c] for c in pylist(codes)] == a.to_pylist()
 
 
 def test_unique_drops_the_null_row_of_a_string_column():

@@ -158,6 +158,13 @@ extension MetalArray {
 }
 
 extension MetalStringArray {
+    /// Byte-wise UTF-8 order, which is what the GPU sort and Arrow's sort use; a null sorts as empty.
+    /// Swift's `String <` compares canonically equivalent forms as equal and orders by scalar value
+    /// after normalisation, which puts "a\u{301}" after "b".
+    static func utf8Less(_ a: String?, _ b: String?) -> Bool {
+        (a ?? "").utf8.lexicographicallyPrecedes((b ?? "").utf8)
+    }
+
     /// Arrow `unique` over utf8, in whichever order.
     ///
     /// The GPU string dictionary (`Kernels/StringDictionary.swift`) already produces its distinct values
@@ -167,8 +174,9 @@ extension MetalStringArray {
     public func unique(order: ValueOrder = .firstAppearance) throws -> MetalStringArray {
         let (_, values) = try dictionaryEncode()
         guard order == .sorted else { return values }
-        // There is no order-preserving GPU key for utf8, so the (small) distinct set is ordered here.
-        let sorted = values.toArray().sorted { ($0 ?? "") < ($1 ?? "") }
+        // There is no order-preserving GPU key for utf8, so the (small) distinct set is ordered here --
+        // by UTF-8 bytes, the order `sort()` and Arrow use, not Swift's Unicode-canonical `<`.
+        let sorted = values.toArray().sorted(by: MetalStringArray.utf8Less)
         return try MetalStringArray(sorted, context: context)
     }
 
@@ -183,7 +191,7 @@ extension MetalStringArray {
         // The distinct strings are ordered on the host — no order-preserving GPU key for utf8 — and the
         // counts follow through the existing gather.
         let strings = values.toArray()
-        let positions = strings.indices.sorted { (strings[$0] ?? "") < (strings[$1] ?? "") }
+        let positions = strings.indices.sorted { MetalStringArray.utf8Less(strings[$0], strings[$1]) }
         let perm = try MetalArray<Int32>(positions.map { Int32($0) }, context: context)
         return (try values.take(perm), try counts.take(perm))
     }

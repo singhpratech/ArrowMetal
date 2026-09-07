@@ -217,11 +217,11 @@ stays in the input — it poisons every later element in both engines
 
 ## Open findings
 
-Twenty-four divergences the harness found. Twenty-two are not bugs but are not free choices either: each is a
+Twenty-two divergences the harness found that are not bugs but are not free choices either: each is a
 place where a kernel's own consistency was preferred to Arrow's answer, or where a documented limit of
-the GPU path shows through. The last two are real bugs, kept here with a `BUG:` prefix so the gate
-stays green while they are open and so they cannot be mistaken for decisions. Together they account
-for all 1,592 failing cases. Each has an entry in
+the GPU path shows through. (A finding whose title starts with `BUG:` is a real bug parked so the gate
+stays green while it is open; the two the coverage pass found are fixed and listed under "Findings that
+were fixed".) Together they account for every failing case. Each has an entry in
 `FINDINGS` in `test_differential.py`, so the matrix groups the affected cells under the finding instead
 of burying them, and an `xfail(strict=True)` reproduction, so the suite turns red the moment a kernel
 changes its mind. Eighteen of them are classified *by the data* — a `data_check` that looks at the
@@ -252,8 +252,6 @@ exactly.
 | 20 | `round-scales-before-it-rounds` | 19 | 2 |
 | 21 | `high-moment-accumulator-overflow` | 14 | 4 |
 | 22 | `winsorize-negative-zero-limit` | 2 | 1 |
-| 23 | `BUG:winsorize-uint64-poisons-float64` | 15 | 1 |
-| 24 | `BUG:sorted-unique-order-is-not-the-sort-order` | 36 | 2 |
 
 ### 1. Float32 arithmetic flushes subnormals to zero
 
@@ -699,50 +697,6 @@ pc.winsorize(a, lower_limit=0.5, upper_limit=0.5)        # [ 0.0, -0.0, 0.0,  0.
 The harness compares floats bit-exactly, which is why this shows at all. Classified by the data.
 Reproduction: `test_winsorize_clamps_to_the_negative_zero_of_a_zero_tie`.
 
-### 23. BUG: a `uint64` `winsorize` poisons the `float64` one
-
-*15 failing cases: `winsorize/float64`, every dataset.*
-
-**This one is a bug, not a decision.** Once `winsorize` has run on a `uint64` column, every later
-`float64` `winsorize` in the same process answers with limits it never computed — including
-`winsorize(0.0, 1.0)`, which is the identity by definition. Neither call is wrong on its own: `uint64`
-alone is right, `float64` alone is right, and no other pair of types triggers it.
-
-```python
-u = make_array("uint64",  Shape(33, 0.0, "random"))
-f = make_array("float64", Shape(33, 0.0, "random"))
-for lower, upper in [(0.0, 1.0), (0.05, 0.95), (0.25, 0.75), (0.5, 0.5)]:
-    am.array(u).winsorize(lower, upper).to_arrow()       # correct, and poisons what follows
-
-am.array(f).winsorize(0.0, 1.0).to_arrow()[0]            # -1950714.42  (the column's minimum)
-f[0]                                                     #    776352.55
-```
-
-It is registered as a finding only so the gate stays green while it is open; the cells are left failing on
-purpose and the `BUG:` prefix marks it. Reproduction:
-`test_winsorize_on_float64_survives_a_uint64_call` (xfail, and it poisons the process, so it sits last in
-the file).
-
-### 24. BUG: `unique(order="sorted")` is not the column's own sort order
-
-*36 failing cases: `unique/utf8`, `value_counts/utf8`, the datasets whose distinct values interleave ASCII
-and non-ASCII in UTF-8 byte order.*
-
-**This one is a bug too.** `sort()` and `argsort()` order strings by UTF-8 bytes and agree with pyarrow
-everywhere in the matrix. The sorted pass behind `unique(order="sorted")`, `value_counts(order="sorted")`
-and `dictionary_encode(order="sorted")` puts every non-ASCII value *after* every ASCII one instead,
-whatever the bytes say — so the same column has two different "ascending" orders.
-
-```python
-a = pa.array(["b", "á"], pa.string())      # b"b" and b"a\xcc\x81" -- "á" is U+0061 U+0301
-am.array(a).sort().to_arrow()              # ["á", "b"]   -- byte order, and pyarrow's
-am.array(a).unique("sorted").to_arrow()    # ["b", "á"]
-```
-
-The default order (`"first_appearance"`, Arrow's own) is unaffected and agrees exactly. Classified by the
-data: a column whose distinct values do not interleave the two classes has to agree. Reproduction:
-`test_sorted_unique_uses_the_columns_own_sort_order` (xfail).
-
 ## Findings that were fixed
 
 The five bugs the first run of this matrix reported are closed, and four of the original twenty-one findings were closed by later kernel work (full-Unicode case mapping, and the three calendar-rounding corners). The reproductions stayed, as plain
@@ -760,6 +714,8 @@ assertions, so the suite notices a relapse.
 | `ceil_temporal` left a value already on a month, quarter or year boundary alone; Arrow advances it a whole unit | the calendar units advance, the fixed-length units keep the value, as Arrow's do | `test_ceil_temporal_advances_a_value_on_a_month_boundary` |
 | a multiple of months or quarters counted from year 0; Arrow counts from 1970-01 | months and quarters count from 1970-01 (years from year 0, as Arrow's do) | `test_calendar_multiples_share_an_origin` |
 | rounding to a unit finer than the column's resolution was the identity; Arrow converts, rounds and truncates back | the value is converted to the finer unit, rounded there and truncated back | `test_rounding_to_a_finer_unit_converts_like_arrow` |
+| a `uint64` `winsorize` poisoned every later `float64` one in the process: the clamp pipeline was cached under its MSL type alone, and both types travel as `ulong` | the cache key carries the value kind as well as the type | `test_winsorize_on_float64_survives_a_uint64_call` |
+| `unique`/`value_counts`/`dictionary_encode` with `order="sorted"` put every non-ASCII string after every ASCII one (Swift's canonical `String <`), while `sort()` orders by UTF-8 bytes | the sorted string pass orders by UTF-8 bytes | `test_sorted_unique_uses_the_columns_own_sort_order` |
 
 Four more turned up while closing those, and were fixed here rather than written down:
 

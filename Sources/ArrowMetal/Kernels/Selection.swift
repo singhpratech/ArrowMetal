@@ -147,7 +147,10 @@ extension MetalArray {
         // Metal has no `double`: a float64 column travels through the clamp as raw binary64 patterns.
         let mslT = T.self == Double.self ? "ulong" : T.mslType
         let src = SelectionSource.clamp(V: mslT, kind: kind)
-        let pso = try Dispatch.pipeline(ctx, family: "selection-clamp", source: src, function: "sel_clamp", type: mslT)
+        // The cache key must carry the kind as well as the MSL type: uint64 and float64 both travel as
+        // `ulong`, and the integer clamp must never be handed a binary64 pattern (or the reverse).
+        let pso = try Dispatch.pipeline(ctx, family: "selection-clamp", source: src, function: "sel_clamp",
+                                        type: "\(mslT)-\(kind)")
         let out = try MetalArrowBuffer.allocate(byteCount: n * T.byteWidth, zeroed: false, context: ctx)
         try ctx.run { enc in
             enc.setComputePipelineState(pso)
