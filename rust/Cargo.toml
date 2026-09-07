@@ -1,0 +1,18 @@
+# The Rust binding for ArrowMetal: a raw -sys crate over include/arrowmetal.h and a safe crate on top.
+#
+# Its own workspace, separate from polars-plugin/, so a Rust user can clone the repo and run
+# `cargo test` in rust/ without pulling in Polars and pyo3.
+[workspace]
+resolver = "2"
+members = ["arrowmetal-sys", "arrowmetal"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/singhpratech/ArrowMetal"
+rust-version = "1.85"
+
+[profile.bench]
+inherits = "release"
+lto = "thin"
