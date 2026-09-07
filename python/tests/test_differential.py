@@ -4730,8 +4730,11 @@ def public_api():
 def test_every_public_operation_has_a_differential_case():
     """Fails when a method is added to MetalArray or GroupBy without a case here, so the harness
     cannot silently fall behind the library."""
+    registered = {o.name for o in OPS}
+    dangling = sorted(f"{k} -> {v}" for k, v in _COVERED_BY.items() if v not in registered)
+    assert not dangling, "_COVERED_BY points at ops that do not exist: " + ", ".join(dangling)
     known = _NOT_DIFFERENTIABLE | set(_COVERED_BY) | set(_NO_MATRIX_TYPE) | \
-        {o.name for o in OPS} | {n for n, _ in ABSENT}
+        registered | {n for n, _ in ABSENT}
     missing = sorted(n for n in public_api() if n not in known)
     assert not missing, (
         "no differential case for: " + ", ".join(missing) +
