@@ -7,6 +7,7 @@ pushed. Numbers are from the last gated run of `main` (0.1.0, unreleased) on an 
 |---|---|---|
 | Swift suites (`Tests/ArrowMetalTests`) | 764 tests in 60 files, run in release | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
 | Python suites (`python/tests`) | 2,460 collected cases over the ctypes API and the three integrations | `pyarrow.compute`, Polars, DuckDB, pandas |
+| Rust suites (`rust/arrowmetal/tests`) | 48 tests over the safe crate, run in release, plus 4 `no_run` doc-tests (compiled, not executed) | `arrow::compute` (arrow-rs 59) on the same data; a `HashMap` fold where arrow-rs has no kernel; `include/arrowmetal.h` re-parsed for the ABI signatures ([RUST.md](RUST.md)) |
 | Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | 39,069 generated cases, 45 column types, every public operation | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
 | TypeScript suites (`node/test`) | 62 tests in 6 files over the N-API addon | Apache Arrow JS 21.2.0 and plain JS over the same rows ([TYPESCRIPT.md](TYPESCRIPT.md)) |
 | Adversarial review pass | four independent reviewers plus a coverage pass before release | each finding carries a regression test |
@@ -21,7 +22,11 @@ swift test -c release                                   # release is required: a
 PYTHONPATH=python python -m pytest python/tests -q      # all Python suites, including the differential file
 PYTHONPATH=python python python/tests/differential_report.py   # the matrix as one report; exit 0 = nothing unclassified
 (cd node && npm install && npm test)                    # TypeScript: builds the addon, then 62 node:test cases
+(cd rust && cargo test --release)                       # the Rust binding, against arrow-rs's own kernels
 ```
+
+The Rust suite finds `libArrowMetalC.dylib` in `.build/release` on its own; from outside the
+repository, set `ARROWMETAL_LIB` to the dylib's full path.
 
 Tests that need a real GPU skip on virtual Metal devices (`requireRealGPU()`), so a hosted CI runner
 exercises the host paths only; the numbers above are from a physical Mac.
@@ -102,6 +107,7 @@ Every merge to `main` runs, on a quiet machine, in this order, and pushes only i
 3. `differential_report.py` exits 0: 0 unclassified divergences.
 4. `pytest python/tests` (every suite): 0 failures; xfails must be strict and tied to a finding.
 5. The standalone tests in `test_differential.py`: 0 failures.
+6. `cd rust && cargo test --release`: 48 tests and 4 compile-only doc-tests, 0 failures.
 
 A benchmark comparison is never part of the gate, because timings on a loaded machine are noise; the
 benchmark matrix is rerun on an idle machine before its numbers are published.

@@ -19,10 +19,11 @@ __pycache__/
 *.py[co]
 .pytest_cache/
 
-# Rust plugin build artefacts (the workspace target, and any per-crate one)
+# Rust build artefacts (the workspace target, and any per-crate one)
 polars-plugin/**/target/
 
 # Node binding build artefacts
 node/node_modules/
 node/build/
 node/dist/
+rust/**/target/

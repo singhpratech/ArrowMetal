@@ -1,0 +1,28 @@
+[package]
+name = "arrowmetal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Apache Arrow compute on Apple silicon GPUs, for arrow-rs"
+keywords = ["arrow", "metal", "gpu", "apple-silicon"]
+categories = ["api-bindings"]
+publish = false
+build = "build.rs"
+
+[lib]
+name = "arrowmetal"
+path = "src/lib.rs"
+
+[dependencies]
+arrowmetal-sys = { path = "../arrowmetal-sys", version = "0.1.0" }
+arrow = { version = "59", default-features = false, features = ["ffi"] }
+
+[dev-dependencies]
+# The oracle: arrow-rs's own compute kernels, on the same data.
+arrow = { version = "59", default-features = false, features = ["ffi"] }
+rand = "0.9"
+# Compile-time trait assertions, so "handles are !Send" is checked by the compiler rather than
+# asserted in a comment.
+static_assertions = "1.1"
