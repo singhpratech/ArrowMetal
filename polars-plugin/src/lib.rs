@@ -241,11 +241,45 @@ fn arrowmetal_lower(inputs: &[Series]) -> PolarsResult<Series> {
 struct ArithKwargs {
     /// "add", "sub", "mul" or "div".
     op: String,
-    value: f64,
+    /// An integer operand, as its exact decimal digits. A string rather than a number because the
+    /// kwargs cross as a pickled Python dict and `f64` is the only numeric form every pickle
+    /// implementation agrees on -- and `f64` is exactly what loses the low bits of anything past
+    /// 2^53, which is the bug this field exists to avoid. `None` when the user passed a float.
+    #[serde(default)]
+    int_value: Option<String>,
+    /// The operand as an `f64`: the value itself when the user passed a float, or the rounded
+    /// stand-in for an integer (a float column takes it; an integer column refuses it). `None`
+    /// only for an integer too large to be a finite `f64` at all.
+    #[serde(default)]
+    value: Option<f64>,
+}
+
+impl ArithKwargs {
+    /// The operand in the form `scalar_bytes` needs, keeping "the user wrote an integer" and "the
+    /// user wrote a float" apart -- an integer column accepts only the first, exactly as
+    /// `struct.pack("q", ...)` does for the tier-1 bridge.
+    fn scalar(&self) -> PolarsResult<bridge::ScalarArg> {
+        match self.int_value.as_deref() {
+            Some(digits) => Ok(match digits.parse::<i128>() {
+                Ok(i) => bridge::ScalarArg::Int(i),
+                // Past i128: only a float column has any chance, and only if it is finite.
+                Err(_) => bridge::ScalarArg::WideInt(self.value.ok_or_else(|| {
+                    polars_err!(InvalidOperation:
+                        "arrowmetal: integer scalar {digits} is too large for any column type")
+                })?),
+            }),
+            None => Ok(bridge::ScalarArg::Float(self.value.ok_or_else(|| {
+                polars_err!(InvalidOperation: "arrowmetal: arithmetic needs a scalar value")
+            })?)),
+        }
+    }
 }
 
 /// Arithmetic against a scalar, on the GPU. The result keeps the column's own type, which is
 /// Arrow's unchecked behaviour: integer arithmetic wraps and integer division by zero yields 0.
+///
+/// The *operand* is not unchecked: one the column's type cannot hold exactly is an error, which is
+/// what the tier-1 bridge does (`struct.pack` raises), not a saturated or truncated value.
 #[polars_expr(output_type_func=same_output)]
 fn arrowmetal_arith_scalar(inputs: &[Series], kwargs: ArithKwargs) -> PolarsResult<Series> {
     let s = &inputs[0];
@@ -256,7 +290,7 @@ fn arrowmetal_arith_scalar(inputs: &[Series], kwargs: ArithKwargs) -> PolarsResu
         "div" => 3,
         other => polars_bail!(InvalidOperation: "arrowmetal: unknown arithmetic op {other:?}"),
     };
-    let bytes = scalar_bytes(s.dtype(), kwargs.value)?;
+    let bytes = scalar_bytes(s.dtype(), kwargs.scalar()?)?;
     let a = to_metal(s)?;
     let out = unsafe { a.arith_scalar(op, bytes.as_ptr() as *const std::ffi::c_void) }
         .map_err(amerr)?;

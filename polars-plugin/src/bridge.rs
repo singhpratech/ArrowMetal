@@ -76,24 +76,87 @@ pub fn from_metal(a: &am::Array, name: &str) -> PolarsResult<Series> {
     Series::from_arrow(PlSmallStr::from_str(name), array)
 }
 
+/// A scalar operand as it arrived from Python, before it is narrowed to a column's element type.
+///
+/// Keeping the integer/float distinction (and the exact integer digits) is the whole point. The
+/// tier-1 bridge builds the same 8 bytes with `struct.pack(code, v)`
+/// (`python/arrowmetal/__init__.py`), and `struct.pack` **refuses** a scalar the column's type
+/// cannot hold exactly: `struct.pack("b", 1000)` and `struct.pack("B", -1)` raise, and so does a
+/// float against any of the integer codes. Rust's `as` does the opposite -- it saturates
+/// out-of-range floats and truncates integers bit-wise -- so an `f64`-only operand would silently
+/// turn `add(1000)` on an `Int8` column into `add(127)` and `add(-1)` on a `UInt8` column into a
+/// no-op. It would also drop the low bits of any integer past 2^53. Hence this enum.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ScalarArg {
+    /// An exact integer. `i128` covers the whole of `i64` and `u64`.
+    Int(i128),
+    /// An integer too large even for `i128`, carrying the `f64` it rounds to. Only a float column
+    /// can take one -- `struct.pack("q", 2**200)` raises, `struct.pack("d", 2**200)` does not.
+    WideInt(f64),
+    /// A float.
+    Float(f64),
+}
+
+impl ScalarArg {
+    fn as_f64(self) -> f64 {
+        match self {
+            ScalarArg::Int(i) => i as f64,
+            ScalarArg::WideInt(f) | ScalarArg::Float(f) => f,
+        }
+    }
+
+    /// The exact integer, or the error `struct.pack` would have raised in tier 1.
+    fn integer(self, dtype: &DataType) -> PolarsResult<i128> {
+        match self {
+            ScalarArg::Int(i) => Ok(i),
+            ScalarArg::WideInt(f) => polars_bail!(InvalidOperation:
+                "arrowmetal: scalar {f:e} is out of range for a {dtype:?} column"),
+            ScalarArg::Float(f) => polars_bail!(InvalidOperation:
+                "arrowmetal: a {dtype:?} column takes an integer scalar, got {f}"),
+        }
+    }
+}
+
+/// The inclusive value range and byte width of an integer dtype: exactly what `struct.pack`'s
+/// `"b"`/`"B"`/`"h"`/`"H"`/`"i"`/`"I"`/`"q"`/`"Q"` codes enforce for the tier-1 bridge.
+fn int_range(dtype: &DataType) -> Option<(usize, i128, i128)> {
+    Some(match dtype {
+        DataType::Int8 => (1, i8::MIN as i128, i8::MAX as i128),
+        DataType::Int16 => (2, i16::MIN as i128, i16::MAX as i128),
+        DataType::Int32 => (4, i32::MIN as i128, i32::MAX as i128),
+        DataType::Int64 => (8, i64::MIN as i128, i64::MAX as i128),
+        DataType::UInt8 => (1, 0, u8::MAX as i128),
+        DataType::UInt16 => (2, 0, u16::MAX as i128),
+        DataType::UInt32 => (4, 0, u32::MAX as i128),
+        DataType::UInt64 => (8, 0, u64::MAX as i128),
+        _ => return None,
+    })
+}
+
 /// The little-endian bytes of `v` at the width of `dtype`, ready to hand to `am_compare_scalar` /
 /// `am_arith_scalar`, which read a pointer to one value of the array's element type.
 ///
 /// Only 8 bytes are ever needed: the C ABI's scalar forms cover the primitive types, and the
 /// decimal path (16 bytes) is not exposed by this plugin.
-pub fn scalar_bytes(dtype: &DataType, v: f64) -> PolarsResult<[u8; 8]> {
+///
+/// A scalar the column's type cannot hold is an error, not a silently narrowed value -- see
+/// `ScalarArg`. "Integers wrap" in the docs is about the *arithmetic*: `127i8 + 1 == -128` is the
+/// kernel's answer and stays so. It never meant that the operand itself may be out of range.
+pub fn scalar_bytes(dtype: &DataType, v: ScalarArg) -> PolarsResult<[u8; 8]> {
     let mut b = [0u8; 8];
+    if let Some((width, lo, hi)) = int_range(dtype) {
+        let i = v.integer(dtype)?;
+        polars_ensure!(i >= lo && i <= hi, InvalidOperation:
+            "arrowmetal: scalar {i} is out of range for a {dtype:?} column ({lo} to {hi})");
+        // Two's complement: the low `width` bytes of the i128 are the value at that width.
+        b[..width].copy_from_slice(&i.to_le_bytes()[..width]);
+        return Ok(b);
+    }
     match dtype {
-        DataType::Int8 => b[..1].copy_from_slice(&(v as i8).to_le_bytes()),
-        DataType::Int16 => b[..2].copy_from_slice(&(v as i16).to_le_bytes()),
-        DataType::Int32 => b[..4].copy_from_slice(&(v as i32).to_le_bytes()),
-        DataType::Int64 => b[..8].copy_from_slice(&(v as i64).to_le_bytes()),
-        DataType::UInt8 => b[..1].copy_from_slice(&(v as u8).to_le_bytes()),
-        DataType::UInt16 => b[..2].copy_from_slice(&(v as u16).to_le_bytes()),
-        DataType::UInt32 => b[..4].copy_from_slice(&(v as u32).to_le_bytes()),
-        DataType::UInt64 => b[..8].copy_from_slice(&(v as u64).to_le_bytes()),
-        DataType::Float32 => b[..4].copy_from_slice(&(v as f32).to_le_bytes()),
-        DataType::Float64 => b[..8].copy_from_slice(&v.to_le_bytes()),
+        // f64 -> f32 rounds, and overflows to an infinity, which is what `struct.pack("f", 1e300)`
+        // gives the tier-1 bridge.
+        DataType::Float32 => b[..4].copy_from_slice(&(v.as_f64() as f32).to_le_bytes()),
+        DataType::Float64 => b[..8].copy_from_slice(&v.as_f64().to_le_bytes()),
         other => {
             polars_bail!(InvalidOperation: "arrowmetal: no scalar form for dtype {other:?}")
         },

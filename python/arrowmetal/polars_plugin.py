@@ -173,12 +173,38 @@ class ArrowMetalExpr:
         return _call("arrowmetal_lower", self._expr, is_elementwise=True)
 
     def _arith(self, op, value):
-        return _call("arrowmetal_arith_scalar", self._expr,
-                     kwargs={"op": op, "value": float(value)}, is_elementwise=True)
+        """Sends the scalar across without a float round trip.
+
+        `float(value)` loses the low bits of any integer past 2^53, so `add(2**60 + 1)` used to
+        add `2**60` -- neither what Polars' own `pl.col("x") + (2**60 + 1)` does nor what the
+        tier-1 bridge does. An integer therefore travels as its exact decimal digits and only a
+        float travels as `value`; the Rust side narrows either one to the column's element type
+        and refuses what will not fit, the same call `struct.pack` refuses in tier 1.
+        """
+        kwargs = {"op": op, "int_value": None, "value": None}
+        try:
+            exact = value.__index__()       # int, bool, numpy integer, ...
+        except (AttributeError, TypeError):
+            exact = None
+        if exact is None:
+            kwargs["value"] = float(value)
+        else:
+            kwargs["int_value"] = str(exact)
+            try:
+                kwargs["value"] = float(exact)
+            except OverflowError:
+                pass                        # past f64 entirely; no column type can take it
+        return _call("arrowmetal_arith_scalar", self._expr, kwargs=kwargs, is_elementwise=True)
 
     def add(self, value) -> pl.Expr:
         """Arithmetic against a scalar, keeping the column's own type: integers wrap and integer
-        division by zero yields 0, which is Arrow's unchecked behaviour (Polars raises)."""
+        division by zero yields 0, which is Arrow's unchecked behaviour (Polars raises).
+
+        Wrapping is about the *arithmetic*, not the operand. A scalar the column's type cannot
+        hold -- `add(1000)` on an Int8 column, `add(-1)` on a UInt8 one, `add(1.5)` on any integer
+        one -- raises, which is what the tier-1 bridge does; it is never silently clamped to 127,
+        to 0, or truncated to 1.
+        """
         return self._arith("add", value)
 
     def sub(self, value) -> pl.Expr:
