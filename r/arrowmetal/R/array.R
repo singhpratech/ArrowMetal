@@ -2,7 +2,8 @@
 #'
 #' Imports an Arrow array through the Arrow C Data Interface and returns an ArrowMetal handle.
 #' Anything the `arrow` package can turn into an [arrow::Array] is accepted; an
-#' [arrow::ChunkedArray] is combined first, and an `am_array` is returned unchanged.
+#' [arrow::ChunkedArray] has its chunks concatenated first, and an `am_array` is returned
+#' unchanged.
 #'
 #' The transfer is copy-free when the producer's buffers are page aligned and one copy otherwise.
 #' Use [am_buffer_alignment()] to see which case a given array falls into.
@@ -27,13 +28,12 @@ am_array <- function(x, type = NULL) {
   .Call(C_am_import, schema_ptr, array_ptr)
 }
 
+# arrow's own generic already turns an Array, ChunkedArray (concatenating the chunks), Scalar,
+# data frame or plain R vector into one Array, so let it do the work rather than reimplementing it.
+# ChunkedArray has no $combine_chunks() method in arrow 25.0.0.
 as_input_array <- function(x, type = NULL) {
-  if (inherits(x, "ChunkedArray")) x <- x$combine_chunks()
-  if (inherits(x, "Array")) {
-    if (!is.null(type)) x <- x$cast(type) else return(x)
-    return(x)
-  }
-  if (is.null(type)) arrow::Array$create(x) else arrow::Array$create(x, type = type)
+  if (is_am_array(x)) return(as_arrow_array(x, type = type))
+  arrow::as_arrow_array(x, type = type)
 }
 
 #' Is this an ArrowMetal handle?
@@ -47,30 +47,23 @@ check_am <- function(x, what = "x") {
   x
 }
 
-#' Move a column back to the `arrow` package
-#'
-#' Exports an ArrowMetal handle through the Arrow C Data Interface. This direction is always
-#' copy-free: the resulting [arrow::Array] points at the Metal buffers and keeps them alive.
-#'
-#' @param x An `am_array`, or anything with a method.
-#' @param ... Unused.
-#' @return An [arrow::Array].
-#' @export
-as_arrow_array <- function(x, ...) UseMethod("as_arrow_array")
-
-#' @rdname as_arrow_array
-#' @export
-as_arrow_array.am_array <- function(x, ...) {
+# Move a column back to the arrow package.
+#
+# This is a METHOD on arrow's own exported `as_arrow_array` generic (formals x, ..., type = NULL),
+# not a new generic: defining a second generic of that name would mask arrow's and break its eight
+# methods, or be masked by it and never dispatch, depending on library() order.
+#
+# Exporting an ArrowMetal handle is always copy-free: the resulting arrow Array points at the Metal
+# buffers and keeps them alive through its release callback.
+as_arrow_array.am_array <- function(x, ..., type = NULL) {
   am_require()
   array_ptr <- .Call(C_alloc_arrow_array)
   schema_ptr <- .Call(C_alloc_arrow_schema)
   .Call(C_am_export, x, schema_ptr, array_ptr)
-  arrow::Array$import_from_c(array_ptr, schema_ptr)
+  out <- arrow::Array$import_from_c(array_ptr, schema_ptr)
+  if (!is.null(type)) out <- out$cast(type)
+  out
 }
-
-#' @rdname as_arrow_array
-#' @export
-as_arrow_array.default <- function(x, ...) as_input_array(x, NULL)
 
 #' Number of elements
 #' @param x An `am_array`.

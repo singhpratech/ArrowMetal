@@ -1,22 +1,37 @@
 .am <- new.env(parent = emptyenv())
 
+AM_RELATIVE_CANDIDATE <- file.path("..", "..", ".build", "release", "libArrowMetalC.dylib")
+
 am_lib_candidates <- function() {
   out <- character()
   env <- Sys.getenv("ARROWMETAL_LIB", "")
   if (nzchar(env)) out <- c(out, env)
   recorded <- .Call(C_am_default_lib_path)
   if (!is.null(recorded)) out <- c(out, recorded)
-  # ../../.build/release/libArrowMetalC.dylib relative to the package source directory, which is
-  # where it sits in a checkout of the repository.
-  out <- c(out, file.path("..", "..", ".build", "release", "libArrowMetalC.dylib"))
+  # Last resort: ../../.build/release/libArrowMetalC.dylib resolved against the WORKING DIRECTORY,
+  # which finds the dylib when R was started from r/arrowmetal/ in a checkout. `configure` records
+  # the path relative to the package *source* at install time, which is the candidate above.
+  out <- c(out, AM_RELATIVE_CANDIDATE)
   unique(out)
 }
 
+# `tried` is what each candidate that exists reported. The message always names all three places
+# the loader looks, including the ones that contributed no candidate at all, so a user who set
+# nothing still learns what to set.
 am_load_message <- function(tried) {
+  env <- Sys.getenv("ARROWMETAL_LIB", "")
+  recorded <- .Call(C_am_default_lib_path)
   paste0(
     "ArrowMetal: could not open libArrowMetalC.dylib.\n",
-    "Set ARROWMETAL_LIB to its absolute path, or build it in the repository so that\n",
-    "../../.build/release/libArrowMetalC.dylib exists relative to r/arrowmetal/.\n",
+    "Looked in three places, in order:\n",
+    "  1. $ARROWMETAL_LIB -- ",
+    if (nzchar(env)) paste0("set to ", env) else "not set; set it to the dylib's absolute path",
+    "\n  2. the path ./configure recorded at install time -- ",
+    if (!is.null(recorded)) recorded else
+      paste0("nothing was recorded (there was no ", AM_RELATIVE_CANDIDATE,
+             " next to the package source when it was installed)"),
+    "\n  3. ", AM_RELATIVE_CANDIDATE, " relative to the working directory (",
+    getwd(), ")\n",
     "Tried:\n", paste0("  - ", tried, collapse = "\n")
   )
 }

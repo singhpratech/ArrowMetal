@@ -8,7 +8,7 @@ pushed. Numbers are from the last gated run of `main` (0.1.0, unreleased) on an 
 | Swift suites (`Tests/ArrowMetalTests`) | 764 tests in 60 files, run in release | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
 | Python suites (`python/tests`) | 2,460 collected cases over the ctypes API and the three integrations | `pyarrow.compute`, Polars, DuckDB, pandas |
 | Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | 39,069 generated cases, 45 column types, every public operation | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
-| R suites (`r/arrowmetal/tests/testthat`) | 179 tests over the 34 ABI entry points the R binding wraps | base R and the `arrow` R package's own kernels on the same data ([R.md](R.md)) |
+| R suites (`r/arrowmetal/tests/testthat`) | 266 tests over the 34 ABI entry points the R binding wraps | base R and the `arrow` R package's own kernels on the same data ([R.md](R.md)) |
 | Adversarial review pass | four independent reviewers plus a coverage pass before release | each finding carries a regression test |
 | Benchmarks (`Benchmarks/`) | 339 operation-and-size rows over 173 operations, against four CPU libraries; streaming and engine benches | measured, never estimated ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md)) |
 

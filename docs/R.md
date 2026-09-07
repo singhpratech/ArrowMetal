@@ -93,47 +93,60 @@ that means for arrow R, measured with `am_buffer_alignment()` (page size 16,384 
 arrow R **borrows** an R double or integer vector instead of copying it — `Array$create(x)` twice
 on the same `x` returns the identical buffer address — and R's vector data starts 48 bytes past a
 `malloc` block that is page aligned at these sizes, because R's vector header is 48 bytes on
-64-bit. So a float64 or int32 column that came from an R vector takes the copying path in; an
-int64 column, a validity bitmap, a cast result, a string column and anything read from a file take
-the copy-free path.
+64-bit. So **at 1M and 10M elements** a float64 or int32 column that came from an R vector takes
+the copying path in, while an int64 column, a validity bitmap, a cast result, a string column and
+anything read from a file take the copy-free path.
 
-The copy costs **1.51 ms for 80 MB** (10M float64), about 53 GB/s.
+That size qualifier matters: a buffer is page aligned only when it is large enough for arrow to
+give it its own allocation instead of a slice of a pool. Spot-checked, an int64 or string column is
+page aligned from about a thousand elements and a validity bitmap from about a hundred thousand (a
+bitmap for a thousand rows is 125 bytes); at `n = 3` nothing is aligned at all — int64 values
+landed at offset 128 in the page, string buffers at 256 and 384, a validity bitmap at 192. Small
+columns always take the copying path, at a cost too small to measure.
+
+The copy costs **1.42 ms (median) for 80 MB** (10M float64), about 56 GB/s.
 
 ## Timing
 
-10,000,000 float64, no nulls. One warm-up call of each expression, then
-`microbenchmark(times = 5)`; the figure is the **minimum** wall time of the five. "resident" means
-the column is already an `am_array`, "import" means the timing starts from an `arrow::Array` and
-includes the transfer. All variants were checked to produce the same answer in the same script.
+10,000,000 float64, no nulls.
+
+**Method:** **5 fresh R processes**, each building its own data, calling every expression once as a
+warm-up, then `microbenchmark(times = 20)` — 100 timed runs per method in five independent
+processes. The tables give the **minimum across all 100** and the **median of the five per-process
+medians**. A single best-of-5 inside one process is not stable at this size: an earlier run of that
+shape put resident `filter` at 1.22 ms, which does not reproduce, so the median is the number to
+quote and the minimum is the floor. "resident" means the column is already an `am_array`, "import"
+means the timing starts from an `arrow::Array` and includes the transfer. All variants were checked
+to produce the same answer in the same script.
 
 `sum`:
 
-| Method | Best of 5 | vs base R |
+| Method | min | median |
 |---|---:|---:|
-| `arrow::call_function("sum", a)` | **1.20 ms** | 10.4× |
-| `am_sum(h)` resident | 1.39 ms | 9.0× |
-| `am_sum(a)` import + sum | 3.58 ms | 3.5× |
-| `sum(x)` base R | 12.54 ms | 1.0× |
+| `am_sum(h)` resident | **0.86 ms** | 1.40 ms |
+| `arrow::call_function("sum", a)` | 1.14 ms | **1.26 ms** |
+| `am_sum(a)` import + sum | 2.05 ms | 3.29 ms |
+| `sum(x)` base R | 11.18 ms | 11.96 ms |
 
-**ArrowMetal loses `sum`.** 1.39 ms against arrow's 1.20 ms resident (1.16× slower), 3.58 ms
-against 1.20 ms with the import counted (3.0× slower). A sum is one pass over 80 MB with no
-arithmetic to speak of, so it is bounded by memory bandwidth the 16-thread CPU kernel already
-saturates.
+**ArrowMetal loses `sum`**: on the median, **1.11× slower** than arrow resident and **2.6× slower**
+with the import counted. On its single fastest run it edges arrow (0.86 ms against 1.14 ms), but
+that does not hold across processes. A sum is one pass over 80 MB with no arithmetic to speak of,
+so it is bounded by memory bandwidth the 16-thread CPU kernel already saturates.
 
 `filter` (`x > 0.5`, about 5M rows out):
 
-| Method | Best of 5 | vs base R |
+| Method | min | median |
 |---|---:|---:|
-| `am_filter(h, am_compare(h, ">", 0.5))` resident | **1.22 ms** | 32.7× |
-| `am_filter(a, am_compare(a, ">", 0.5))` import + filter | 4.20 ms | 9.5× |
-| `arrow` `greater` then `filter` | 24.15 ms | 1.7× |
-| `x[x > 0.5]` base R | 40.03 ms | 1.0× |
+| `am_filter(h, am_compare(h, ">", 0.5))` resident | **0.78 ms** | **1.51 ms** |
+| `am_filter(a, am_compare(a, ">", 0.5))` import + filter | 3.74 ms | 4.65 ms |
+| `arrow` `greater` then `filter` | 21.29 ms | 22.40 ms |
+| `x[x > 0.5]` base R | 36.62 ms | 39.34 ms |
 
-ArrowMetal wins `filter` 19.8× against arrow resident, 5.8× including the import.
+ArrowMetal wins `filter` **14.9× against arrow resident and 4.8× including the import**, on the
+medians.
 
-arrow's kernels are multi-threaded and base R's are not, so "vs base R" is not a per-core figure.
-Timings on a loaded machine are noise; this ran once, on an idle machine, and has not been
-re-measured.
+arrow's kernels are multi-threaded and base R's are not, so a comparison against base R is not a
+per-core figure. Timings on a loaded machine are noise; these ran on an idle machine.
 
 ## Covered
 
@@ -148,8 +161,9 @@ re-measured.
 | Query engine | `am_plan_source()`, `am_plan_run()`, `am_plan_explain()` — the full JSON plan grammar |
 | Environment | `am_available()`, `am_load_error()`, `am_lib_path()`, `am_version()`, `am_device_name()`, `am_buffer_alignment()` |
 
-Types exercised by the tests: float64, float32, int32, int64, boolean, utf8, and sliced views of
-any of them.
+Types exercised by the tests: float64, float32, int32, int64, boolean and utf8; sliced views of
+float64, boolean and utf8 at offsets 0, 1 and 3, plus a slice of a slice and selection on a sliced
+column; and multi-chunk, single-chunk and empty ChunkedArrays.
 
 ## Not covered
 
@@ -181,7 +195,17 @@ There is also no dplyr backend and no `RecordBatch`/`Table` surface: everything 
 - **The `arrow` package is a hard dependency.** It builds every column and reads every result
   back; `am_array(c(1, 2, 3))` calls `arrow::Array$create()` for you.
 - **Zero-based indices** in `am_argsort()`, `am_take()` and `am_slice()`, following Arrow rather
-  than R. `am_argsort(x)` matches `order(x, na.last = TRUE) - 1L`.
+  than R. `am_argsort(x)` matches `order(x, na.last = TRUE) - 1L`. `am_take()` rejects a
+  fractional index or one outside `[0, 2^31)` with an error rather than coercing it to `NA`.
+- **`as_arrow_array()` is `arrow`'s own generic.** `arrow` exports
+  `as_arrow_array(x, ..., type = NULL)` with eight methods; this package registers a ninth for
+  `am_array` and re-exports the generic unchanged, rather than defining a second one. A second
+  generic of that name would mask arrow's (breaking its methods) or be masked by it (never
+  dispatching for `am_array`), depending on the order the packages are attached.
+- **An `NA` scalar in `am_compare()`** returns an all-null boolean mask, matching base R
+  (`c(1, 5) > NA`) and `arrow`'s `greater` kernel. The ABI scalar is a raw value with no validity
+  flag, so this case is resolved in R and never reaches the GPU. `NaN` is a value, not a null, and
+  does go to the kernel.
 - **Group order is not first-seen order**: ascending by key for numeric, boolean, temporal and
   decimal columns (nulls last), first-seen for strings and binary, lexicographic in column order
   for several columns. Label rows with `$keys()`.
@@ -191,7 +215,7 @@ There is also no dplyr backend and no `RecordBatch`/`Table` surface: everything 
 
 ## Tests
 
-179 testthat tests, all passing, against base R and against `arrow`'s own kernels on the same
+266 testthat tests, all passing, against base R and against `arrow`'s own kernels on the same
 data: nulls, all-null and empty columns, sliced input at three offsets, lengths of 1, 33, 1024,
 65537 and 1,000,001 (crossing a threadgroup boundary), one group per row and one group for
 everything, int64 above 2^53, float32 accumulation, and every documented error path.

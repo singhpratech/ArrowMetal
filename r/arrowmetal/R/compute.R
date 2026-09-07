@@ -14,10 +14,13 @@ reduce_result <- function(r, integer64) {
   }
   if (!requireNamespace("bit64", quietly = TRUE))
     stop("integer64 = TRUE needs the bit64 package", call. = FALSE)
+  # NA_real_ reclassed as integer64 is that double's bit pattern read as an integer, i.e. garbage;
+  # bit64 has its own NA whose bit pattern is the int64 NA sentinel.
+  if (is_null) return(bit64::NA_integer64_)
   if (kind == 1L)
     warning("ArrowMetal: an unsigned 64-bit result is being returned as a signed bit64::integer64.",
             call. = FALSE)
-  v <- if (is_null) NA_real_ else r[[3]]
+  v <- r[[3]]
   class(v) <- "integer64"
   v
 }
@@ -85,8 +88,18 @@ am_compare <- function(x, op, y) {
          " (expected one of ==, !=, <, <=, >, >=)", call. = FALSE)
   }
   code <- unname(code)
-  if (is_am_array(y) || inherits(y, "Array") || length(y) > 1L) {
+  if (is_am_array(y) || inherits(y, "Array") || inherits(y, "ChunkedArray") || length(y) > 1L) {
     return(.Call(C_am_compare_array, x, code, am_array(y)))
+  }
+  if (length(y) != 1L)
+    stop("`y` must be a length-1 scalar or a column the same length as `x`", call. = FALSE)
+  # The ABI scalar is a raw value with no validity flag, so an NA scalar cannot be handed to the
+  # kernel: every comparison with a null is null, which is what base R and arrow both give.
+  if (is.na(y) && !(is.double(y) && is.nan(y)))
+    return(am_array(arrow::Array$create(rep(NA, length(x)), type = arrow::bool())))
+  if (!is.numeric(y) && !is.logical(y) && !inherits(y, "integer64")) {
+    stop("scalar operations need a numeric array and a numeric scalar; got a scalar of type '",
+         typeof(y), "'", call. = FALSE)
   }
   .Call(C_am_compare_scalar, x, code, y, scalar_format(x))
 }
@@ -120,8 +133,17 @@ am_filter <- function(x, mask) {
 #' @export
 am_take <- function(x, indices) {
   am_require()
-  if (!is_am_array(indices) && !inherits(indices, "Array"))
+  if (!is_am_array(indices) && !inherits(indices, "Array") && !inherits(indices, "ChunkedArray")) {
+    if (!is.numeric(indices))
+      stop("`indices` must be numeric, an arrow Array or an am_array", call. = FALSE)
+    # as.integer() silently turns anything outside int32 into NA with a warning; refuse instead.
+    bad <- !is.na(indices) & (indices > .Machine$integer.max | indices < 0 | indices != trunc(indices))
+    if (any(bad)) {
+      stop("`indices` must be whole numbers in [0, ", .Machine$integer.max, "]; ",
+           "offending value: ", format(indices[which(bad)[1]], scientific = FALSE), call. = FALSE)
+    }
     indices <- arrow::Array$create(as.integer(indices))
+  }
   .Call(C_am_take, am_array(x), am_array(indices))
 }
 

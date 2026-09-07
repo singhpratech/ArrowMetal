@@ -198,12 +198,14 @@ SEXP C_am_default_lib_path(void) {
 
 SEXP C_am_version(void) {
   require_lib();
-  return Rf_mkString(p_am_version());
+  const char *s = p_am_version(); /* declared returning a pointer, so never assume it is non-NULL */
+  return Rf_mkString(s ? s : "");
 }
 
 SEXP C_am_device_name(void) {
   require_lib();
-  return Rf_mkString(p_am_device_name());
+  const char *s = p_am_device_name();
+  return Rf_mkString(s ? s : "");
 }
 
 /* ------------------------------------------------------------------ interop */
@@ -471,6 +473,10 @@ SEXP C_am_plan_source_create(SEXP name, SEXP handles, SEXP names) {
   require_lib();
   R_xlen_t n = Rf_xlength(handles);
   if (n < 1) Rf_error("ArrowMetal: a plan source needs at least one column");
+  if (TYPEOF(names) != STRSXP || Rf_xlength(names) != n) {
+    Rf_error("ArrowMetal: %lld column handles but %lld names",
+             (long long)n, (long long)Rf_xlength(names));
+  }
   am_array **cols = (am_array **)R_alloc(n, sizeof(am_array *));
   const char **cn = (const char **)R_alloc(n, sizeof(char *));
   for (R_xlen_t i = 0; i < n; i++) {

@@ -53,56 +53,71 @@ The mechanism: arrow R **borrows** an R double or integer vector rather than cop
 `Array$create(x)` twice on the same `x` gives the identical buffer address — and R's vector data
 starts 48 bytes past a `malloc` block that is itself page aligned at these sizes, because R's
 vector header is 48 bytes on 64-bit. Anything arrow allocates for itself (an int64 column, which R
-cannot hold; a validity bitmap; a cast result; string buffers) lands page aligned.
+cannot hold; a validity bitmap; a cast result; string buffers) gets its own large allocation and
+lands page aligned.
 
-So: **a double or int32 column that came from an R vector is copied on the way in; an int64
-column, a validity bitmap, a cast result, a string column and anything read from a file are not.**
-The copy is measured below at 1.51 ms for 80 MB.
+So, **at the 1M and 10M sizes measured here**: a double or int32 column that came from an R vector
+is copied on the way in; an int64 column, a validity bitmap, a cast result, a string column and
+anything read from a file are not.
+
+The size qualifier is load-bearing. A buffer only lands page aligned when it is big enough for
+arrow to give it its own allocation rather than a slice of a pool. Spot-checked: an int64 or string
+column is page aligned from about a thousand elements, a validity bitmap from about a hundred
+thousand (a bitmap for a thousand rows is 125 bytes), and at `n = 3` **nothing** is page aligned —
+int64 values landed at offset 128, string buffers at 256 and 384, a validity bitmap at 192. Small
+columns always take the copying path, which costs nothing worth measuring at that size.
+
+The copy is measured below at 1.42 ms (median) for 80 MB.
 
 ## Measured timing
 
-One run, this session. Apple M4 Max (16 cores, 64 GB unified memory), macOS 26.6.2, R 4.5.3,
-arrow 25.0.0, ArrowMetal 0.1.0. 10,000,000 float64, no nulls, one warm-up call of every
-expression, then `microbenchmark(times = 5)`; the number is the **minimum** wall time of the five.
-"resident" means the column is already an `am_array`; "import" means the timing starts from an
-`arrow::Array` and includes the transfer.
+Apple M4 Max (16 cores, 64 GB unified memory), macOS 26.6.2, R 4.5.3, arrow 25.0.0,
+ArrowMetal 0.1.0, idle machine. 10,000,000 float64, no nulls.
+
+**Method:** **5 fresh R processes**, each building its own data, calling every expression once as a
+warm-up, then `microbenchmark(times = 20)`. Reported below are the **minimum across all 100 runs**
+and the **median of the 5 per-process medians**. A single best-of-5 in one process is not stable
+here — an earlier such run put resident `filter` at 1.22 ms, which does not reproduce — so the
+median is the number to quote and the minimum is the floor. "resident" means the column is already
+an `am_array`; "import" means the timing starts from an `arrow::Array` and includes the transfer.
 
 ### `sum`
 
-| Method | Best of 5 | vs base R |
+| Method | min | median |
 |---|---:|---:|
-| `arrow::call_function("sum", a)` | **1.20 ms** | 10.4× |
-| `am_sum(h)` — resident | 1.39 ms | 9.0× |
-| `am_sum(a)` — import + sum | 3.58 ms | 3.5× |
-| `sum(x)` — base R double vector | 12.54 ms | 1.0× |
+| `am_sum(h)` — resident | **0.86 ms** | 1.40 ms |
+| `arrow::call_function("sum", a)` | 1.14 ms | **1.26 ms** |
+| `am_sum(a)` — import + sum | 2.05 ms | 3.29 ms |
+| `sum(x)` — base R double vector | 11.18 ms | 11.96 ms |
 
-**ArrowMetal loses `sum` to arrow's own CPU kernel**: 1.39 ms against 1.20 ms with the column
-already on the GPU (1.16× slower), and 3.58 ms against 1.20 ms once the import is counted
-(3.0× slower). A sum is one pass over 80 MB and nothing else, so it is bounded by memory
-bandwidth that the CPU already saturates with 16 threads; there is no arithmetic for the GPU to
-win back.
+**ArrowMetal loses `sum` to arrow's own CPU kernel.** On the median it is **1.11× slower**
+resident and **2.6× slower** once the import is counted. (On its single best run it edges arrow —
+0.86 ms against 1.14 ms — but that does not hold up across processes, which is exactly why the
+median is quoted.) A sum is one pass over 80 MB and nothing else, so it is bounded by memory
+bandwidth the 16-thread CPU kernel already saturates; there is no arithmetic for the GPU to win
+back.
 
 ### `filter` (`x > 0.5`, ~5M rows out)
 
-| Method | Best of 5 | vs base R |
+| Method | min | median |
 |---|---:|---:|
-| `am_filter(h, am_compare(h, ">", 0.5))` — resident | **1.22 ms** | 32.7× |
-| `am_filter(a, am_compare(a, ">", 0.5))` — import + filter | 4.20 ms | 9.5× |
-| `arrow` `greater` then `filter` | 24.15 ms | 1.7× |
-| `x[x > 0.5]` — base R | 40.03 ms | 1.0× |
+| `am_filter(h, am_compare(h, ">", 0.5))` — resident | **0.78 ms** | **1.51 ms** |
+| `am_filter(a, am_compare(a, ">", 0.5))` — import + filter | 3.74 ms | 4.65 ms |
+| `arrow` `greater` then `filter` | 21.29 ms | 22.40 ms |
+| `x[x > 0.5]` — base R | 36.62 ms | 39.34 ms |
 
-ArrowMetal wins `filter` by 19.8× against arrow with the column resident and by 5.8× including
-the import. All four produce the same answer (checked in the same script: identical sum, identical
-output length).
+ArrowMetal wins `filter` by **14.9× against arrow with the column resident and 4.8× including the
+import**, on the medians. All four produce the same answer (checked in the same script: identical
+sum, identical output length).
 
 ### Import alone
 
-`am_array(a)` on the same 10M float64 arrow Array: **1.51 ms**, the copying path described above
-(80 MB, about 53 GB/s).
+`am_array(a)` on the same 10M float64 arrow Array: **1.31 ms min, 1.42 ms median** — the copying
+path described above (80 MB, about 56 GB/s at the median).
 
-Method note: `arrow`'s CPU kernels are multi-threaded and base R's are not, so the "vs base R"
-column is not a per-core comparison. Timings on a loaded machine are noise; this ran on an
-otherwise idle Mac and has not been re-measured since.
+Method note: `arrow`'s CPU kernels are multi-threaded and base R's are not, so a comparison against
+base R is not a per-core figure. Timings on a loaded machine are noise; these ran on an otherwise
+idle Mac.
 
 ## Limits
 
@@ -112,13 +127,18 @@ otherwise idle Mac and has not been re-measured since.
 - **`arrow` is required**, and is how every column is built and read back. There is no path from a
   plain R vector to the GPU that does not go through an `arrow::Array` (`am_array(c(1,2,3))` calls
   `Array$create` for you).
-- **Zero-based indices.** `am_argsort()` and `am_take()` use Arrow's convention, not R's.
+- **Zero-based indices.** `am_argsort()` and `am_take()` use Arrow's convention, not R's. An index
+  outside `[0, 2^31)`, or a fractional one, is an error rather than a silent `NA`.
+- **`as_arrow_array()` is `arrow`'s generic**, not a new one: the package registers a method on it
+  and re-exports it, so dispatch works whichever order the two packages are attached in.
+- **An `NA` scalar** in `am_compare()` gives an all-null mask, as base R and arrow do. The ABI
+  scalar carries no validity flag, so this is handled in R rather than on the GPU.
 - **macOS on Apple silicon only**, and the Swift core is a separate `libArrowMetalC.dylib` that is
   not shipped inside this package.
 
 ## Tests
 
-179 testthat tests, all passing, comparing against base R and against `arrow`'s own kernels on the
+266 testthat tests, all passing, comparing against base R and against `arrow`'s own kernels on the
 same data: nulls, all-null and empty columns, sliced input, lengths of 1, 33, 1024, 65537 and
 1,000,001 (crossing a threadgroup boundary), int64 above 2^53, float32, strings and booleans, and
 every error path. `R CMD check --no-manual` is clean: 0 errors, 0 warnings, 0 notes.

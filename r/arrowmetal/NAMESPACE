@@ -23,11 +23,15 @@ export(am_sort)
 export(am_sum)
 export(am_take)
 export(am_version)
-export(as_arrow_array)
 export(is_am_array)
 
-S3method(as_arrow_array, am_array)
-S3method(as_arrow_array, default)
+# arrow already exports an `as_arrow_array(x, ..., type = NULL)` generic with eight methods. Add a
+# method to it rather than a second generic, and re-export the generic itself (the identical
+# object, so nothing is masked either way round) so `library(arrowmetal)` alone is enough.
+importFrom(arrow, as_arrow_array)
+export(as_arrow_array)
+S3method(arrow::as_arrow_array, am_array)
+
 S3method(length, am_array)
 S3method(print, am_array)
 S3method(print, am_groupby)

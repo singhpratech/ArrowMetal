@@ -28,9 +28,10 @@ int32, \code{"b"} boolean, \code{"u"} string).
 }
 \description{
 Imports an Arrow array through the Arrow C Data Interface and returns an ArrowMetal handle.
-Anything the \code{arrow} package can turn into an \code{Array} is accepted; a
-\code{ChunkedArray} is combined first, and an \code{am_array} is returned unchanged.
-\code{length()} on the handle gives the number of elements.
+Anything \pkg{arrow}'s own \code{\link[arrow]{as_arrow_array}} generic accepts is accepted here:
+an \code{Array}, a \code{ChunkedArray} (its chunks are concatenated), a \code{Scalar}, a data
+frame, or a plain R vector. An \code{am_array} is returned unchanged. \code{length()} on the
+handle gives the number of elements.
 }
 \details{
 The transfer is copy-free when the producer's buffers are page aligned and one copy otherwise.
