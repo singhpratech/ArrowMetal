@@ -399,6 +399,21 @@ func resolveJoinSide(_ name: String, probeNames: [String], buildNames: [String])
         "no column named \(name) on either side of the join (probe: \(probeNames), build: \(buildNames))")
 }
 
+/// The probe-side columns a fused plan actually reads: the join key plus whatever sits on the probe
+/// side of the aggregates (and, for the grouped form, of the keys). Duplicates removed, order kept.
+///
+/// A filtered join is otherwise paying to gather every column of every surviving row, when the
+/// answer needs two of them — and one of the columns it gathers is often a utf8 one, which is the
+/// most expensive gather in the library.
+func probeSideColumns(_ probeKey: String, _ sides: [JoinSide]) -> [String] {
+    var out = [probeKey]
+    for s in sides {
+        guard case .probe(let n) = s, !n.isEmpty, !out.contains(n) else { continue }
+        out.append(n)
+    }
+    return out
+}
+
 // MARK: - The fused operator
 
 /// Broadcast join followed by a whole-dataset aggregate, fused into one kernel per batch.
@@ -425,6 +440,8 @@ public final class BroadcastJoinAggregateOperator: StreamOperator {
     private var buildColumns: [FusedJoinColumn?] = []
     private var probePSO: MTLComputePipelineState?
     private var foldPSO: MTLComputePipelineState?
+    /// The probe-side columns the kernel reads: the filter projects down to exactly these.
+    private var probeColumns: [String] = []
     private var signature = ""
     private var probeRows = 0
     private var matchedBatches = 0
@@ -502,6 +519,10 @@ public final class BroadcastJoinAggregateOperator: StreamOperator {
         sides = newSides
         slots = newSlots
         buildColumns = newBuild
+        // The filter's output is projected down to exactly what the probe kernel reads. A filtered
+        // join used to gather *every* column of the surviving rows — including a utf8 one, the most
+        // expensive kind of gather there is — and then read two of them.
+        probeColumns = probeSideColumns(probeKey, newSides)
         signature = table.keyType + "|" + newSlots.map(\.signature).joined(separator: ",")
         let src = JoinAggregateSource.source(KT: table.keyType, slots: newSlots)
         probePSO = try Dispatch.pipeline(context, family: "joinagg", source: src, function: "jfa_probe", type: signature)
@@ -509,15 +530,21 @@ public final class BroadcastJoinAggregateOperator: StreamOperator {
     }
 
     public func process(_ batch: MetalRecordBatch) throws -> Any? {
+        // The plan is fixed against the *unfiltered* batch, because the projection the filter writes
+        // is decided by which columns the plan turns out to read.
+        if slots == nil {
+            guard batch.length > 0 else { return nil }
+            try prepare(batch)
+        }
         var work = batch
         if let f = filter {
-            work = try streamFilterProject(batch, filter: f, projections: nil,
+            work = try streamFilterProject(batch, filter: f,
+                                           projections: probeColumns.map { ($0, Expr.column($0)) },
                                            context: batch.firstContext ?? context)
         }
         let n = work.length
         guard n > 0 else { return nil }
         try Dispatch.checkLength(n)
-        if slots == nil { try prepare(work) }
         guard let slots, let probePSO, let foldPSO else { return nil }
 
         guard let pk = work[probeKey] else {
@@ -657,8 +684,8 @@ public final class BroadcastJoinGroupByOperator: StreamOperator {
     public let filter: Expr?
     private let context: MetalContext
     private let inner: StreamGroupByOperator
-    private var sides: [JoinSide] = []
-    private var aggSides: [JoinSide?] = []
+    /// The probe-side columns the plan reads; nil until the first batch fixes them.
+    private var probeColumns: [String]?
 
     public init(build: MetalRecordBatch, probeKey: String, buildKey: String, keys: [String],
                 aggregates: [StreamAggregate], kind: JoinKind = .inner, filter: Expr? = nil,
@@ -692,9 +719,18 @@ public final class BroadcastJoinGroupByOperator: StreamOperator {
     }
 
     public func process(_ batch: MetalRecordBatch) throws -> Any? {
+        if probeColumns == nil {
+            guard batch.length > 0 else { return nil }
+            var s: [JoinSide] = []
+            for n in keys + aggregates.compactMap(\.column) {
+                s.append(try resolveJoinSide(n, probeNames: batch.names, buildNames: build.names))
+            }
+            probeColumns = probeSideColumns(probeKey, s)
+        }
         var work = batch
-        if let f = filter {
-            work = try streamFilterProject(batch, filter: f, projections: nil,
+        if let f = filter, let cols = probeColumns {
+            // Only the probe-side keys and values reach the join; nothing else is gathered.
+            work = try streamFilterProject(batch, filter: f, projections: cols.map { ($0, Expr.column($0)) },
                                            context: batch.firstContext ?? context)
         }
         guard work.length > 0 else { return nil }

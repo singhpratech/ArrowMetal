@@ -58,9 +58,9 @@ HLL_PRECISION = 14
 SAMPLE_REGIONS = (0, 1, 7, 42, 500, 999)   # the groups the cross-check compares value by value
 
 WORKLOADS = ["filter_sum", "groupby_1k", "groupby_10m", "topk", "count_distinct",
-             "sort_limit", "broadcast_join"]
+             "sort_limit", "broadcast_join", "broadcast_join_unfused"]
 ENGINES = ["arrowmetal", "polars", "duckdb", "pyarrow"]
-CHECKED = ("filter_sum", "groupby_1k", "topk", "sort_limit")
+CHECKED = ("filter_sum", "groupby_1k", "topk", "sort_limit", "broadcast_join")
 
 WORKLOAD_DESC = {
     "filter_sum": "sum(amount) where region < 100",
@@ -70,6 +70,8 @@ WORKLOAD_DESC = {
     "count_distinct": "distinct count of id (approximate where the engine has a sketch)",
     "sort_limit": f"order by amount desc limit {SORT_LIMIT}",
     "broadcast_join": f"join a {DIM_ROWS}-row dimension on region (region < {JOIN_CUTOFF}), then sum",
+    "broadcast_join_unfused": ("the same join, ArrowMetal only, with the joined rows materialised "
+                               "and summed by the caller (what the fused cell replaces)"),
 }
 
 RESULT_MARK = "__RESULT__ "
@@ -406,24 +408,31 @@ def am_sort_limit(ctx):
 
 
 def am_broadcast_join(ctx):
+    """The fused plan: the probe, the gather of the build-side `weight` and both sums happen in one
+    Metal kernel per batch, and the running answer never leaves the GPU. No joined row is built."""
     am, s = am_stream(ctx)
-    joined = s.filter(am.col("region") < JOIN_CUTOFF).join(
-        dim_table(), on="region", right_on="region", how="inner", broadcast=True)
-    if isinstance(joined, pa.Table):
-        total = num(pc.sum(joined["amount"]).as_py())
-        weight = num(pc.sum(joined["weight"]).as_py())
-    else:
-        total = weight = 0.0
-        reader = joined.to_reader() if hasattr(joined, "to_reader") else joined
-        for batch in reader:                   # a sink-shaped join result is folded in one pass
-            total += float(pc.sum(batch["amount"]).as_py() or 0.0)
-            weight += float(pc.sum(batch["weight"]).as_py() or 0.0)
+    r = (s.filter(am.col("region") < JOIN_CUTOFF)
+         .join(dim_table(), on="region", right_on="region", how="inner", broadcast=True)
+         .agg([("sum", "amount", "total"), ("sum", "weight", "weight")]))
+    return [num(r["total"]), num(r["weight"])], am_stats(s)
+
+
+def am_broadcast_join_unfused(ctx):
+    """The plan the fused cell replaces: every matched pair is gathered into a record batch carrying
+    both sides' columns, the rows come back to Python, and the caller sums them. Kept so the
+    before/after of the fusion is visible in the same table, on the same data, in the same run."""
+    am, s = am_stream(ctx)
+    joined = (s.filter(am.col("region") < JOIN_CUTOFF)
+              .join(dim_table(), on="region", right_on="region", how="inner", broadcast=True)
+              .collect())
+    total = num(pc.sum(joined["amount"]).as_py())
+    weight = num(pc.sum(joined["weight"]).as_py())
     return [total, weight], am_stats(s)
 
 
 AM = dict(filter_sum=am_filter_sum, groupby_1k=am_groupby_1k, groupby_10m=am_groupby_10m,
           topk=am_topk, count_distinct=am_count_distinct, sort_limit=am_sort_limit,
-          broadcast_join=am_broadcast_join)
+          broadcast_join=am_broadcast_join, broadcast_join_unfused=am_broadcast_join_unfused)
 
 
 # ---------------------------------------------------------------- Polars
@@ -786,7 +795,15 @@ def run_one(engine, workload, data_dir, args):
     """The child process: one engine, one workload, one JSON line on stdout."""
     manifest = load_manifest(data_dir)
     ctx = Ctx(data_dir, manifest, args)
-    fn = IMPLS[engine][workload]
+    fn = IMPLS[engine].get(workload)
+    if fn is None:
+        # Not every workload exists for every engine: `broadcast_join_unfused` is an ArrowMetal
+        # before/after and has no CPU counterpart. Record the gap rather than crashing the run.
+        record = dict(status="skipped", reason=f"{engine} has no {workload} cell")
+        record.update(engine=engine, workload=workload, version=engine_version(engine))
+        sys.stdout.write(RESULT_MARK + json.dumps(record, default=str) + "\n")
+        sys.stdout.flush()
+        return
     try:
         record = measure(lambda: fn(ctx))
     except BaseException as exc:               # BaseException so a MemoryError is recorded, not raised
