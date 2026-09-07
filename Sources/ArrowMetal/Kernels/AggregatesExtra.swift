@@ -480,9 +480,9 @@ extension MetalArray {
     public func tdigest(_ qs: [Double], delta: Double = 100, bufferSize: Int = 500) throws -> [Double?] {
         let m = validCount
         guard m > 0 else { return qs.map { _ in nil } }
-        // The digest only ever sees the valid values, and sorting a column that carries a validity
-        // bitmap costs three times sorting one that does not (117 ms against 39 ms at 10M float64), so
-        // the nulls are compacted out first — one filter pass — rather than sorted to the end.
+        // The digest only ever sees the valid values. The sort now partitions nulls out itself, so the
+        // two paths are close; compacting first still wins at high null ratios because it also halves
+        // the output buffer (the numbers are in `TDigestGPU.strippedOfNulls` and docs/LOSSES.md).
         let sortedValues = try TDigestGPU.strippedOfNulls(self).sorted()
         let valid = Swift.min(m, sortedValues.length)
         return withExtendedLifetime(sortedValues) { () -> [Double?] in
