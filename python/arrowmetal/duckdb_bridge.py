@@ -189,6 +189,21 @@ def _as_arrow(value):
     return pa.array(value)
 
 
+def _is_scalar(value):
+    """True for the one-row values `arrow_table` wraps in a length-1 column.
+
+    Not `isinstance(value, (int, float, bool))`: a numpy scalar (what a numpy-backed reduction
+    hands back) is none of those, and neither is a string, and both used to fall through to
+    `pa.array(value)` and raise "not iterable".
+    """
+    if value is None or isinstance(value, (str, bytes)):
+        return True
+    if isinstance(value, (MetalArray, pa.Array, pa.ChunkedArray)):
+        return False
+    # A scalar is anything with no length: int, float, bool, Decimal, datetime, np.int64, ...
+    return not hasattr(value, "__len__") and not hasattr(value, "__arrow_c_array__")
+
+
 def arrow_table(arrays, names=None):
     """A ``pyarrow.Table`` from ArrowMetal output: a dict, a list of arrays plus `names`, a Table.
 
@@ -207,7 +222,7 @@ def arrow_table(arrays, names=None):
         items = list(zip(names, seq))
     cols, out_names = [], []
     for name, value in items:
-        if isinstance(value, (int, float, bool)) or value is None:
+        if _is_scalar(value):
             cols.append(pa.array([value]))
         else:
             cols.append(_as_arrow(value))
@@ -283,8 +298,17 @@ def duckdb_batches(source, con=None, rows_per_batch=DEFAULT_ROWS_PER_BATCH, on_u
     reader = duckdb_reader(source, con, rows_per_batch)
     for record_batch in reader:
         names = list(record_batch.schema.names) if columns is None else list(columns)
-        yield {name: _lift(record_batch.column(record_batch.schema.get_field_index(name)),
-                           on_unsupported) for name in names}
+        batch = {}
+        for name in names:
+            # get_field_index answers -1 for a name that is not there, and column(-1) is the LAST
+            # column: a mistyped `columns=` entry used to come back full of another column's data.
+            index = record_batch.schema.get_field_index(name)
+            if index < 0:
+                raise ArrowMetalError(
+                    f"no column {name!r} in this result; it has "
+                    f"{sorted(record_batch.schema.names)}")
+            batch[name] = _lift(record_batch.column(index), on_unsupported)
+        yield batch
 
 
 # Which streaming aggregates are exact when merged from per-batch partials, and how they merge.
@@ -364,6 +388,10 @@ def duckdb_aggregate(source, aggs, con=None, rows_per_batch=DEFAULT_ROWS_PER_BAT
             out[name] = None if not counts[name] else sums[name] / counts[name]
         elif op == "count_distinct":
             out[name] = len(distinct[name])
+        elif op == "count":
+            # count of nothing is 0, not NULL -- SQL's rule, and the one count_distinct follows
+            # here. sum/min/max of nothing stay NULL, which is SQL's rule for those.
+            out[name] = state[name] or 0
         else:
             out[name] = state[name]
     return out
@@ -377,8 +405,12 @@ def duckdb_group_by(source, keys, aggs, con=None, rows_per_batch=DEFAULT_ROWS_PE
     GPU hash aggregate, and merging two partials for the same key is the same associative operator
     again (mean once more being total sum over total count).
 
-    Returns a ``pyarrow.Table`` with one row per distinct key combination, ordered by first
-    appearance. Host memory is proportional to the number of distinct keys, not to the table.
+    Returns a ``pyarrow.Table`` with one row per distinct key combination. The order is the order
+    the per-batch GPU group-by produced the keys in -- ascending by key for numeric, boolean,
+    temporal and decimal keys, first-seen for utf8 and binary -- with any key a later batch sees
+    for the first time appended after the ones already seen. It is **not** the order the rows
+    arrived in, and it is not DuckDB's; `ORDER BY` the result if you need one.
+    Host memory is proportional to the number of distinct keys, not to the table.
 
         am.duckdb_group_by(rel, "region", {"total": ("sum", "amount"), "n": ("count", "amount")})
     """

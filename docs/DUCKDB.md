@@ -33,7 +33,7 @@ answers exactly, and is **not currently a speedup**; §4 says why, in detail, wi
 | You write | Python around SQL | SQL only |
 | Install | `pip install duckdb`, nothing else | build a `.duckdb_extension`, connect with `allow_unsigned_extensions` |
 | Data crossing | zero-copy where DuckDB returns one chunk | DataChunks assembled into one buffer (a copy) |
-| Types | everything DuckDB emits, including strings, decimals, lists, structs, maps | numeric, boolean, date, timestamp |
+| Types | everything DuckDB emits, including strings, decimals, lists, structs, maps | the fixed-width numeric types, `DATE`, `TIMESTAMP` |
 | Speed | **faster than DuckDB** on high-cardinality group-by, string matching, fused filter+aggregate | **slower than DuckDB** today, see §4 |
 | Larger than memory | yes, `am.duckdb_batches` | no |
 
@@ -253,6 +253,12 @@ can win in.
 Every function's answer matches DuckDB's own SQL exactly, nulls included -
 `python/tests/test_duckdb.py` checks each one against the equivalent query on the same connection.
 
+**Those checks are skipped right now.** `include/arrowmetal.h` declares `am_plan_source` as both a
+typedef and a function, so the public C header does not compile and `duckdb-extension/build.sh`
+fails; with no `build/arrowmetal.duckdb_extension` the `@extension` tests skip rather than fail.
+`test_the_public_c_header_compiles` is the standing xfail for it. Tier 1 does not go through the
+header and is unaffected.
+
 And it is slower than just writing the SQL:
 
 | 10M rows | DuckDB SQL | extension |
@@ -410,8 +416,16 @@ many keys and string matching are compute-heavy per byte; `sum` is not.
 **Tier 2**
 
 - Slower than DuckDB today (§4).
-- Numeric, boolean, `DATE` and `TIMESTAMP` columns only. `VARCHAR`, `DECIMAL` and the nested types
-  are refused by name at bind time with a message pointing here. The bridge handles all of them.
+- **The extension does not currently build**: `include/arrowmetal.h` declares `am_plan_source` as
+  both a typedef and a function, which is a redefinition error in C and C++, so the public header
+  does not compile at all. Until that is renamed, `duckdb-extension/build.sh` fails and every
+  `@extension` test in `python/tests/test_duckdb.py` skips. Tier 1 is unaffected -- it goes through
+  ctypes, not the header.
+- The eight integer widths, `FLOAT`, `DOUBLE`, `DATE` and `TIMESTAMP` only -- exactly what
+  `arrow_format_for` in `duckdb-extension/src/arrowmetal_extension.cpp` lists. `BOOLEAN` is **not**
+  among them despite what an earlier draft of this table said; nor are `VARCHAR`, `DECIMAL`, `TIME`,
+  `TIMESTAMPTZ`, `HUGEINT` or the nested types. All of them are refused by name at bind time with a
+  message pointing here, and the bridge handles every one.
 - The table functions take a **table or view name**, not a subquery - DuckDB's C table-function API
   has no way to accept a relation. A Python-registered relation (`con.register(...)`) is
   connection-local and the extension's own connection cannot see it; `CREATE VIEW` first.
