@@ -40,38 +40,6 @@ enum GroupByKeysSource {
         out[i] = (long)a[i] * (long)K + (long)b[i];
     }
 
-    // The two kernels of the RANGE fast path, which skips the sort entirely when an integer key column
-    // spans a small enough range: mark which values occur, prefix-scan the marks, and read each row's
-    // rank out of the scan. That is three linear passes over the rows and one scan over the range,
-    // against the radix sort the general path would otherwise run.
-    kernel void gk_occupy(device const long* vals [[buffer(0)]],
-                          device const uchar* validity [[buffer(1)]],
-                          constant uint& hasValidity [[buffer(2)]],
-                          constant long& lo [[buffer(3)]],
-                          device const uint* nPtr [[buffer(4)]],
-                          device int* occ [[buffer(5)]],
-                          uint i [[thread_position_in_grid]]) {
-        if (i >= *nPtr) return;
-        if (hasValidity != 0u && !bit_get(validity, i)) return;
-        occ[(uint)(vals[i] - lo)] = 1;
-    }
-
-    // `cum` is the INCLUSIVE scan of the occupancy marks, so `cum[v - lo] - 1` is the dense rank of v
-    // among the values that actually occur. A null row takes the dedicated `nullId`.
-    kernel void gk_rank(device const long* vals [[buffer(0)]],
-                        device const uchar* validity [[buffer(1)]],
-                        constant uint& hasValidity [[buffer(2)]],
-                        constant long& lo [[buffer(3)]],
-                        constant uint& nullId [[buffer(4)]],
-                        device const int* cum [[buffer(5)]],
-                        device const uint* nPtr [[buffer(6)]],
-                        device int* out [[buffer(7)]],
-                        uint i [[thread_position_in_grid]]) {
-        if (i >= *nPtr) return;
-        if (hasValidity != 0u && !bit_get(validity, i)) { out[i] = (int)nullId; return; }
-        out[i] = cum[(uint)(vals[i] - lo)] - 1;
-    }
-
     // Row indices 0, 1, ... n - 1, so a 50M-row group-by never pays for a host loop.
     kernel void gk_iota(device const uint* nPtr [[buffer(0)]], device int* out [[buffer(1)]],
                         uint i [[thread_position_in_grid]]) {
@@ -89,4 +57,59 @@ enum GroupByKeysSource {
         out[i] = vals[i * limbs + which];
     }
     """
+
+    /// The two kernels of the RANGE fast path, which skips the sort entirely when an integer key column
+    /// spans a small enough range: mark which values occur, prefix-scan the marks, and read each row's
+    /// rank out of the scan. That is two linear passes over the rows and one scan over the range, against
+    /// the radix sort the general path would otherwise run.
+    ///
+    /// **Generated per key element type.** The pair used to be `long`-only, so an int32, int16 or bool key
+    /// column — which is what a real key column almost always is — was widened to int64 first: a whole
+    /// extra pass that wrote twice what it read, and then two passes that read the wide copy instead of
+    /// the narrow original. At 50 million int32 keys that cast plus the widened reads was 1.2 GB of the
+    /// 1.8 GB the mapping moved. Reading the column as it is costs one `(long)` conversion per row in
+    /// registers and nothing in memory.
+    ///
+    /// `nullId` is read from the scan's own last entry rather than passed in, so the occupancy pass, the
+    /// scan and the rank pass go into **one** command buffer: the host no longer has to see the distinct
+    /// count before it can encode the ranks.
+    static func rangeSource(T: String) -> String {
+        KernelSource.prelude + """
+
+        kernel void gk_occupy(device const \(T)* vals [[buffer(0)]],
+                              device const uchar* validity [[buffer(1)]],
+                              constant uint& hasValidity [[buffer(2)]],
+                              constant long& lo [[buffer(3)]],
+                              device const uint* nPtr [[buffer(4)]],
+                              device int* occ [[buffer(5)]],
+                              uint i [[thread_position_in_grid]]) {
+            if (i >= *nPtr) return;
+            if (hasValidity != 0u && !bit_get(validity, i)) return;
+            occ[(uint)((long)vals[i] - lo)] = 1;
+        }
+
+        // `cum` is the INCLUSIVE scan of the occupancy marks, so `cum[v - lo] - 1` is the dense rank of v
+        // among the values that actually occur, and `cum[span - 1]` is the number of values that occur —
+        // the id a null row takes. Four rows per thread; the tail past the last whole four is scalar.
+        kernel void gk_rank(device const \(T)* vals [[buffer(0)]],
+                            device const uchar* validity [[buffer(1)]],
+                            constant uint& hasValidity [[buffer(2)]],
+                            constant long& lo [[buffer(3)]],
+                            constant uint& span [[buffer(4)]],
+                            device const int* cum [[buffer(5)]],
+                            device const uint* nPtr [[buffer(6)]],
+                            device int* out [[buffer(7)]],
+                            uint t [[thread_position_in_grid]]) {
+            uint n = *nPtr;
+            int nullId = cum[span - 1u];
+            uint i = t * 4u;
+            if (i >= n) return;
+            uint e = min(i + 4u, n);
+            for (; i < e; i++) {
+                if (hasValidity != 0u && !bit_get(validity, i)) { out[i] = nullId; continue; }
+                out[i] = cum[(uint)((long)vals[i] - lo)] - 1;
+            }
+        }
+        """
+    }
 }
