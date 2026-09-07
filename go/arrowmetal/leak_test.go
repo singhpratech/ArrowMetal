@@ -2,36 +2,44 @@ package arrowmetal_test
 
 import (
 	"runtime"
-	"syscall"
 	"testing"
 
 	am "github.com/singhpratech/ArrowMetal/go/arrowmetal"
+	"github.com/singhpratech/ArrowMetal/go/arrowmetal/internal/memstat"
 )
 
-// maxRSS is the process's high-water resident set in bytes. On Darwin ru_maxrss is already in bytes
-// (it is in kilobytes on Linux, which this binding does not target).
-func maxRSS(t *testing.T) int64 {
+func footprint(t *testing.T) int64 {
 	t.Helper()
-	var ru syscall.Rusage
-	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
-		t.Skipf("getrusage: %v", err)
+	v, err := memstat.PhysFootprint()
+	if err != nil {
+		t.Skipf("cannot read the process footprint: %v", err)
 	}
-	return int64(ru.Maxrss)
+	return int64(v)
 }
 
 // TestNoLeakOverManyRoundTrips runs a full import/compare/filter/export/release cycle a few thousand
-// times and checks that the process's high-water memory stops growing.
+// times and requires the process's footprint to come back to where it started.
 //
-// A missed release anywhere in that chain leaks a whole column per iteration, which at this size
-// would be gigabytes; the C Data Interface retain/release pairing is the easiest thing in this
-// binding to get wrong and the hardest to notice, because a leak is not an error.
+// What this can catch: anything that is allocated once per iteration and never freed — a missed
+// Release on any of the four handles, a Pinner that is never unpinned, a C struct that is never
+// freed, an ArrowArray whose release callback is never called. The budget below is small enough that
+// leaking even the smallest of the four handles (the boolean mask, ~25 KB of payload but a
+// page-rounded Metal buffer and an ArrowMetal box behind it) fails the test.
+//
+// What it cannot catch: a leak that is bounded — a fixed-size cache, or one allocation per distinct
+// array rather than per call — and anything freed lazily by Metal's own pooling.
+//
+// The measure is TASK_VM_INFO.phys_footprint (see internal/memstat), which is current usage rather
+// than a high-water mark. ru_maxrss is unusable here: it only rises, and by the time this test runs
+// the rest of the suite has already pushed the peak into the hundreds of megabytes, so a leak has to
+// exceed that peak before it can even be seen.
 func TestNoLeakOverManyRoundTrips(t *testing.T) {
 	requireLib(t)
 	if testing.Short() {
 		t.Skip("long")
 	}
 	const (
-		n     = 200_000 // 1.6 MB of int64 per iteration
+		n     = 200_000 // 1.6 MB of int64 values plus a 25 KB validity bitmap per iteration
 		iters = 2000
 	)
 	alloc := am.NewPageAlignedAllocator()
@@ -72,22 +80,25 @@ func TestNoLeakOverManyRoundTrips(t *testing.T) {
 		runOnce()
 	}
 	runtime.GC()
-	before := maxRSS(t)
+	before := footprint(t)
 
 	for i := 0; i < iters; i++ {
 		runOnce()
 	}
 	runtime.GC()
-	after := maxRSS(t)
+	after := footprint(t)
 
 	grew := after - before
-	// Leaking one 1.6 MB column per iteration would be about 3.2 GB; the measured growth is a couple
-	// of megabytes. 64 MB of headroom absorbs Metal's own pooling and Go's heap while still catching
-	// a leak of more than about 32 KB per round trip.
-	const budget = 64 << 20
-	t.Logf("max RSS %d -> %d bytes over %d round trips (grew %d)", before, after, iters, grew)
+	// Sized against the smallest thing a single missed Release would leak. The mask is a boolean
+	// array over 200,000 rows: 25 KB of bits, rounded up to a 16 KiB page by Metal, so at least
+	// 32 KB per iteration, or 64 MB over the run. 16 MB is a quarter of that and still leaves room
+	// for Metal's pooling and Go's heap, which together move by a couple of megabytes.
+	const budget = 16 << 20
+	t.Logf("phys_footprint %.1f MB -> %.1f MB over %d round trips (grew %.1f MB, budget %d MB)",
+		float64(before)/(1<<20), float64(after)/(1<<20), iters,
+		float64(grew)/(1<<20), budget>>20)
 	if grew > budget {
-		t.Fatalf("max RSS grew by %d bytes over %d round trips, budget %d: something is not being released",
+		t.Fatalf("footprint grew by %d bytes over %d round trips, budget %d: something is not being released",
 			grew, iters, budget)
 	}
 	if got := alloc.AllocatedBytes(); got <= 0 {
