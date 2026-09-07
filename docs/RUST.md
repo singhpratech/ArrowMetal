@@ -233,8 +233,10 @@ let gpu = arrowmetal::Array::from_arrow(decoded.as_ref())?;   // now type-checks
 ```
 
 This is a limitation of the C ABI, not of the Arrow type — the kernels handle dictionaries correctly,
-and Swift and Python callers use them. It is an ABI defect on ArrowMetal's side (`am_format` should
-report the compute type) and is tracked to be fixed there; until it is, refusing the type is what
+and Swift and Python callers use them. It is an ABI defect on ArrowMetal's side: `am_format` reports
+the C Data Interface's top-level format, which for a dictionary is its index type. The fix is a new
+entry point, `am_compute_format`, which reports the type the kernels compute on; it lands with its own
+gate, and the next crate change accepts dictionaries through it. Until then, refusing the type is what
 keeps the sentence above true for everything this crate accepts.
 `tests/compute.rs::dictionary_arrays_are_refused_at_import` pins the rejection and the decode path.
 
