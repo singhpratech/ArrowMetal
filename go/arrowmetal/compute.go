@@ -150,107 +150,179 @@ func (o CmpOp) String() string {
 	return fmt.Sprintf("CmpOp(%d)", int(o))
 }
 
+// arrowTypeName spells out an Arrow C Data Interface format string for error messages.
+func arrowTypeName(format string) string {
+	switch format {
+	case "c":
+		return "int8"
+	case "C":
+		return "uint8"
+	case "s":
+		return "int16"
+	case "S":
+		return "uint16"
+	case "i":
+		return "int32"
+	case "I":
+		return "uint32"
+	case "l":
+		return "int64"
+	case "L":
+		return "uint64"
+	case "f":
+		return "float32"
+	case "g":
+		return "float64"
+	case "b":
+		return "boolean"
+	}
+	return "format " + format
+}
+
 // scalarBytes writes v into freshly malloc'd C memory in the element type named by the Arrow format
 // string, which is what the ABI expects for every `const void* scalar` argument. The caller frees it.
+//
+// The value is range-checked against the element type first. The ABI takes a bare `const void*` and
+// reads it as the column's own type, so an unchecked int64(1000) against an int8 column would be
+// truncated to -24 and compared against that, silently and wrongly.
 func scalarBytes(format string, v any) (unsafe.Pointer, error) {
-	fail := func() (unsafe.Pointer, error) {
-		return nil, fmt.Errorf("arrowmetal: scalar of Go type %T does not fit an array of Arrow type %q", v, format)
+	typeErr := func() (unsafe.Pointer, error) {
+		return nil, fmt.Errorf("arrowmetal: a scalar of Go type %T cannot be compared against an "+
+			"array of Arrow type %q (%s)", v, format, arrowTypeName(format))
 	}
-	// A Go int is offered to every integer width; anything else has to match exactly.
-	asInt := func() (int64, bool) {
-		switch x := v.(type) {
-		case int:
-			return int64(x), true
-		case int8:
-			return int64(x), true
-		case int16:
-			return int64(x), true
-		case int32:
-			return int64(x), true
-		case int64:
-			return x, true
-		case uint8:
-			return int64(x), true
-		case uint16:
-			return int64(x), true
-		case uint32:
-			return int64(x), true
-		case uint64:
-			return int64(x), true
-		}
-		return 0, false
+	rangeErr := func() (unsafe.Pointer, error) {
+		return nil, fmt.Errorf("arrowmetal: scalar %v does not fit an array of Arrow type %q (%s)",
+			v, format, arrowTypeName(format))
 	}
-	asFloat := func() (float64, bool) {
-		switch x := v.(type) {
-		case float32:
-			return float64(x), true
-		case float64:
-			return x, true
-		case int:
-			return float64(x), true
-		case int64:
-			return float64(x), true
-		}
-		return 0, false
+
+	// Classify the Go value once. A Go `int` is offered to every width; the rest keep their kind, so
+	// that a uint64 above MaxInt64 is not quietly reinterpreted as a negative number.
+	var (
+		si   int64
+		ui   uint64
+		fl   float64
+		bv   bool
+		isSI bool
+		isUI bool
+		isFl bool
+		isBv bool
+	)
+	switch x := v.(type) {
+	case int:
+		si, isSI = int64(x), true
+	case int8:
+		si, isSI = int64(x), true
+	case int16:
+		si, isSI = int64(x), true
+	case int32:
+		si, isSI = int64(x), true
+	case int64:
+		si, isSI = x, true
+	case uint:
+		ui, isUI = uint64(x), true
+	case uint8:
+		ui, isUI = uint64(x), true
+	case uint16:
+		ui, isUI = uint64(x), true
+	case uint32:
+		ui, isUI = uint64(x), true
+	case uint64:
+		ui, isUI = x, true
+	case float32:
+		fl, isFl = float64(x), true
+	case float64:
+		fl, isFl = x, true
+	case bool:
+		bv, isBv = x, true
 	}
+
 	alloc := func(n C.size_t) unsafe.Pointer { return C.calloc(1, n) }
 
 	switch format {
-	case "c", "C": // int8, uint8
-		n, ok := asInt()
-		if !ok {
-			return fail()
+	case "c", "C", "s", "S", "i", "I", "l", "L":
+		bits := map[string]uint{"c": 8, "C": 8, "s": 16, "S": 16, "i": 32, "I": 32, "l": 64, "L": 64}[format]
+		isSigned := format == "c" || format == "s" || format == "i" || format == "l"
+
+		var out uint64 // the bits to store, already narrowed
+		if isSigned {
+			lo, hi := int64(-1)<<(bits-1), int64(1)<<(bits-1)-1
+			switch {
+			case isSI:
+				if si < lo || si > hi {
+					return rangeErr()
+				}
+				out = uint64(si)
+			case isUI:
+				if ui > uint64(hi) {
+					return rangeErr()
+				}
+				out = ui
+			default:
+				return typeErr()
+			}
+		} else {
+			hi := ^uint64(0) >> (64 - bits)
+			switch {
+			case isUI:
+				if ui > hi {
+					return rangeErr()
+				}
+				out = ui
+			case isSI:
+				if si < 0 || uint64(si) > hi {
+					return rangeErr()
+				}
+				out = uint64(si)
+			default:
+				return typeErr()
+			}
 		}
-		p := alloc(1)
-		*(*uint8)(p) = uint8(n)
-		return p, nil
-	case "s", "S": // int16, uint16
-		n, ok := asInt()
-		if !ok {
-			return fail()
+
+		p := alloc(C.size_t(bits / 8))
+		switch bits {
+		case 8:
+			*(*uint8)(p) = uint8(out)
+		case 16:
+			*(*uint16)(p) = uint16(out)
+		case 32:
+			*(*uint32)(p) = uint32(out)
+		default:
+			*(*uint64)(p) = out
 		}
-		p := alloc(2)
-		*(*uint16)(p) = uint16(n)
 		return p, nil
-	case "i", "I": // int32, uint32
-		n, ok := asInt()
-		if !ok {
-			return fail()
+
+	case "f", "g": // float32, float64
+		var x float64
+		switch {
+		case isFl:
+			x = fl
+		case isSI:
+			x = float64(si)
+		case isUI:
+			x = float64(ui)
+		default:
+			return typeErr()
 		}
-		p := alloc(4)
-		*(*uint32)(p) = uint32(n)
-		return p, nil
-	case "l", "L": // int64, uint64
-		n, ok := asInt()
-		if !ok {
-			return fail()
-		}
-		p := alloc(8)
-		*(*uint64)(p) = uint64(n)
-		return p, nil
-	case "f": // float32
-		x, ok := asFloat()
-		if !ok {
-			return fail()
-		}
-		p := alloc(4)
-		*(*float32)(p) = float32(x)
-		return p, nil
-	case "g": // float64
-		x, ok := asFloat()
-		if !ok {
-			return fail()
+		if format == "f" {
+			// A finite value too large for float32 would become ±Inf, which is a different
+			// comparison from the one the caller asked for.
+			if !math.IsInf(x, 0) && !math.IsNaN(x) && math.Abs(x) > math.MaxFloat32 {
+				return rangeErr()
+			}
+			p := alloc(4)
+			*(*float32)(p) = float32(x)
+			return p, nil
 		}
 		p := alloc(8)
 		*(*float64)(p) = x
 		return p, nil
+
 	case "b": // boolean: one byte, non-zero is true
-		b, ok := v.(bool)
-		if !ok {
-			return fail()
+		if !isBv {
+			return typeErr()
 		}
 		p := alloc(1)
-		if b {
+		if bv {
 			*(*uint8)(p) = 1
 		}
 		return p, nil
@@ -258,9 +330,12 @@ func scalarBytes(format string, v any) (unsafe.Pointer, error) {
 	return nil, fmt.Errorf("arrowmetal: scalar comparison is not wrapped for Arrow type %q", format)
 }
 
-// CompareScalar compares every element against v and returns a boolean mask. v must be a Go value of
-// the array's element type (an untyped integer constant or a plain `int` works for any integer width).
-// Nulls in the input stay null in the mask, as they do in Arrow.
+// CompareScalar compares every element against v and returns a boolean mask.
+//
+// v may be any Go numeric type (or bool for a boolean column); it is range-checked against the
+// column's element type and a value that does not fit is an error naming both, never a truncation.
+// A plain `int` therefore works for any integer width as long as the value fits. Nulls in the input
+// stay null in the mask, as they do in Arrow.
 func (a *Array) CompareScalar(op CmpOp, v any) (*Array, error) {
 	h, err := a.ptr()
 	if err != nil {

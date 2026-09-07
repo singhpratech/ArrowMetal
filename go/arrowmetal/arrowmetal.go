@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -221,6 +222,11 @@ func call(op string, fn func() C.int) error {
 // but GPU memory should not wait for the garbage collector.
 type Array struct {
 	h *C.am_array
+
+	// pin holds the source array's Go-heap buffers in place for as long as ArrowMetal may be
+	// reading them. Only an Array produced by Import has one; a result computed on the GPU lives
+	// in Metal memory and has nothing to pin. See Import.
+	pin *runtime.Pinner
 }
 
 func wrap(h *C.am_array) *Array {
@@ -236,6 +242,11 @@ func (a *Array) Release() {
 	}
 	C.amx_release(a.h)
 	a.h = nil
+	// Unpin only after am_release: ArrowMetal may have been borrowing those very bytes.
+	if a.pin != nil {
+		a.pin.Unpin()
+		a.pin = nil
+	}
 	runtime.SetFinalizer(a, nil)
 }
 
@@ -276,6 +287,42 @@ func (a *Array) Format() string {
 	return C.GoString(C.amx_format(a.h))
 }
 
+// pinBuffers pins every buffer byte that cdata.ExportArrowArray will publish to C, so that storing
+// those addresses into C memory is legal rather than merely lucky.
+//
+// arrow-go writes `&buf.Bytes()[0]` straight into a malloc'd buffer array (cdata_exports.go:388).
+// When the buffer came from the Go heap — which it does with the default allocator — that is an
+// unpinned Go pointer stored into non-Go memory, which the cgo pointer rules forbid and
+// GOEXPERIMENT=cgocheck2 throws on. Pinning first satisfies the rule (runtime/cgocheck.go:52
+// exempts pinned pointers) and, incidentally, makes the "Go's collector does not move heap objects
+// today" assumption unnecessary. This is apache/arrow-go#70, closed upstream without the default
+// path being made legal.
+//
+// Pin silently ignores anything outside the Go heap, so a buffer from PageAlignedAllocator (C
+// memory) costs nothing here and needs nothing.
+func pinBuffers(p *runtime.Pinner, d arrow.ArrayData) {
+	// An array with no dictionary returns a nil *array.Data boxed in a non-nil interface, so the
+	// plain `d == nil` test is not enough; anything callable would panic on it.
+	if d == nil {
+		return
+	}
+	if v := reflect.ValueOf(d); v.Kind() == reflect.Ptr && v.IsNil() {
+		return
+	}
+	for _, b := range d.Buffers() {
+		if b == nil {
+			continue
+		}
+		if bs := b.Bytes(); len(bs) > 0 {
+			p.Pin(&bs[0])
+		}
+	}
+	for _, c := range d.Children() {
+		pinBuffers(p, c)
+	}
+	pinBuffers(p, d.Dictionary())
+}
+
 // Import moves an arrow.Array into ArrowMetal through the Arrow C Data Interface.
 //
 // The copy rule, exactly as the Swift core states it: copy-free out always; copy-free in when the
@@ -283,6 +330,8 @@ func (a *Array) Format() string {
 // MTLBuffer(bytesNoCopy:) only when the buffer's start address is a multiple of PageSize(); otherwise
 // it copies the bytes into a page-aligned Metal buffer. Arrow Go's default allocator does not
 // guarantee page alignment — see PageAlignedAllocator and docs/GO.md for what was measured.
+// PageAlignedAllocator is the answer to alignment, not to legality: an array from any allocator can
+// be imported safely, because Import pins the buffers it hands to C (see pinBuffers).
 //
 // The returned Array holds a reference on the source array's buffers until it is released, so the
 // arrow.Array stays alive for as long as the handle does.
@@ -298,6 +347,9 @@ func Import(arr arrow.Array) (*Array, error) {
 	defer C.free(unsafe.Pointer(cs))
 	defer C.free(unsafe.Pointer(ca))
 
+	pin := new(runtime.Pinner)
+	pinBuffers(pin, arr.Data())
+
 	cdata.ExportArrowArray(arr,
 		cdata.ArrayFromPtr(uintptr(unsafe.Pointer(ca))),
 		cdata.SchemaFromPtr(uintptr(unsafe.Pointer(cs))))
@@ -311,9 +363,12 @@ func Import(arr arrow.Array) (*Array, error) {
 		if ca.release != nil {
 			cdata.ReleaseCArrowArray(cdata.ArrayFromPtr(uintptr(unsafe.Pointer(ca))))
 		}
+		pin.Unpin()
 		return nil, err
 	}
-	return wrap(h), nil
+	out := wrap(h)
+	out.pin = pin
+	return out, nil
 }
 
 // Export hands the array back to Arrow Go through the C Data Interface. No element bytes are copied:
