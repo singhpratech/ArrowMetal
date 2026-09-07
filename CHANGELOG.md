@@ -194,6 +194,9 @@ Integrations
 
 Bindings
 - libArrowMetalC C ABI (include/arrowmetal.h) and python/arrowmetal ctypes package (Arrow PyCapsule protocol).
+- `python/build_wheel.sh` packages that ctypes package as a macOS arm64 wheel with the dylib bundled in
+  `arrowmetal/_lib/`, so an install needs no Swift toolchain; extras `polars`, `duckdb`, `pandas`, `test`.
+  The publication steps are in docs/RELEASE.md; the wheel is not on PyPI yet.
 
 Fixed
 - `GroupByKeys._agg` in the Python package took the device handle of a temporary `MetalArray` that was

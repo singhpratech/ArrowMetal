@@ -89,16 +89,32 @@ fixed cost of a GPU dispatch (see [docs/DESIGN.md](docs/DESIGN.md) for the pipel
 
 ## From Python
 
+Two ways to install, both from this checkout. ArrowMetal is **not on PyPI yet**: publishing 0.1.0 is a
+release-time step the maintainer performs, and [docs/RELEASE.md](docs/RELEASE.md) is the checklist for it.
+
 ```
+# From source (needs the Swift toolchain)
 swift build -c release --product ArrowMetalC        # .build/release/libArrowMetalC.dylib
 PYTHONPATH=python python -c "import arrowmetal as am; print(am.device_name())"
+
+# From a wheel that carries the dylib (no Swift toolchain at install time)
+pip install build && scripts/build_wheel.sh         # or python/build_wheel.sh, if the dylib is built
+pip install python/dist/arrowmetal-0.1.0-*.whl      # macOS arm64 only, pyarrow comes with it
+python -c "import arrowmetal as am; print(am.device_name())"
 ```
 ```python
-import pyarrow as pa, polars as pl, arrowmetal as am
-col = am.array(pl.Series([1, None, 3, 40]).to_arrow())
-print(col.filter_where(">", 2).sum(), pl.from_arrow(col.filter_where(">", 2).to_arrow()))
+import pyarrow as pa, arrowmetal as am               # pyarrow is the only import dependency
+col = am.array(pa.array([1, None, 3, 40]))
+print(col.filter_where(">", 2).sum())              # 43, computed on the GPU
 with am.batch():                                   # several kernels, one GPU round trip
     total = col.filter((col > 1) & (col < 40)).sum()
+```
+With the `polars` extra installed (`pip install 'arrowmetal[polars]'`, or just `pip install polars`), a Polars
+Series crosses the same way:
+```python
+import polars as pl
+col = am.array(pl.Series([1, None, 3, 40]).to_arrow())
+print(pl.from_arrow(col.filter_where(">", 2).to_arrow()))
 ```
 ```python
 from decimal import Decimal

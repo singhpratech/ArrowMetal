@@ -4,7 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arrowmetal"
-version = "0.1.0"
+# Single source of truth: `__version__` in arrowmetal/__init__.py. Nothing else states a version.
+dynamic = ["version"]
 description = "Apache Arrow columnar data on Apple silicon GPUs (Metal), from Python"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,17 +29,25 @@ classifiers = [
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
-# The Polars bridge and the .arrowmetal namespaces (docs/POLARS.md). Not a hard dependency:
-# `import arrowmetal` never imports Polars, and the bridge module loads on first use.
+# None of these are hard dependencies: `import arrowmetal` imports only pyarrow, and each bridge
+# module loads its dataframe library on first use.
+# The Polars bridge and the .arrowmetal namespaces (docs/POLARS.md).
 polars = ["polars>=1.0"]
+# The DuckDB bridge: replacement scans and the Arrow hand-off (docs/DUCKDB.md).
+duckdb = ["duckdb>=1.0"]
+# The pandas bridge, the .am accessor and accel mode (docs/PANDAS.md).
+pandas = ["pandas>=2.0"]
 
 [project.urls]
 Homepage = "https://github.com/singhpratech/ArrowMetal"
 Source = "https://github.com/singhpratech/ArrowMetal"
 
+[tool.setuptools.dynamic]
+version = { attr = "arrowmetal.__version__" }
+
 [tool.setuptools]
-# The wheel is not pure Python: it carries a compiled arm64 dylib, so it must not
-# be tagged `py3-none-any`. scripts/build_wheel.sh passes the macOS arm64 tags.
+# The wheel is not pure Python: it carries a compiled arm64 dylib, so it must not be tagged
+# `py3-none-any`. python/build_wheel.sh passes the macOS arm64 platform tag.
 zip-safe = false
 
 [tool.setuptools.packages.find]
@@ -46,7 +55,8 @@ include = ["arrowmetal*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-arrowmetal = ["libArrowMetalC.dylib"]
+# build_wheel.sh copies .build/release/libArrowMetalC.dylib here before building.
+arrowmetal = ["_lib/*.dylib"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

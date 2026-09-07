@@ -29,7 +29,32 @@ test or the CSV a claim comes from.
 | [../CHANGELOG.md](../CHANGELOG.md) | What is in the (unreleased) 0.1.0 |
 | [../Benchmarks/README.md](../Benchmarks/README.md) | The three benchmark programs and the fairness rules |
 | [../python/README.md](../python/README.md) | The Python package: install, wheel build, usage |
+| [RELEASE.md](RELEASE.md) | The ordered checklist for cutting and publishing 0.1.0: tags, the wheel, PyPI, the plugin crate, the docs to re-verify |
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | How to add a kernel, test it, and benchmark it |
+
+## Installing
+
+Nothing here is published yet — no PyPI package, no crates.io crate, no tagged Swift release. Both install
+routes go through this checkout, and [RELEASE.md](RELEASE.md) is what turns them into published artefacts.
+
+```
+# Swift: add the package by path or git URL in Package.swift, then
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c release
+
+# Python from source
+swift build -c release --product ArrowMetalC
+PYTHONPATH=python python -c "import arrowmetal as am; print(am.device_name())"
+
+# Python from a wheel that bundles the dylib (macOS 14+, arm64)
+pip install build && scripts/build_wheel.sh          # or python/build_wheel.sh, if the dylib is built
+pip install python/dist/arrowmetal-0.1.0-*.whl
+pip install 'python/dist/arrowmetal-0.1.0-*.whl[polars,duckdb,pandas]'   # optional bridges
+```
+
+The package finds `libArrowMetalC.dylib` in one of three places, in order: `$ARROWMETAL_LIB`, which pins
+one specific build and wins over everything (the A/B benchmark scripts and the merge gate rely on that),
+then the copy bundled inside the wheel (`arrowmetal/_lib/`), then a development build in `.build/release`
+beside a source checkout. See [../python/README.md](../python/README.md).
 
 ## Reproducing everything
 
