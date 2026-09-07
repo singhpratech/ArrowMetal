@@ -11,7 +11,7 @@ Things learned the hard way. Add to this whenever something surprises you.
 
 ## Toolchain
 - XCTest is not in the Command Line Tools. Run tests with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`.
-- Swift 6.3.3 miscompiled a `withUnsafeBytes` closure inside a throwing generic convenience init under `-O`
+- Swift 6.3.3 miscompiles a `withUnsafeBytes` closure inside a generic `throws` function under `-O` when the caller is in another module: the closure clobbers the error register around an Objective-C message send, so the function reports a phantom error and the caller crashes retaining it (swiftlang/swift#90477, open). `MetalArray.init(_:)` uses a plain element loop instead; the Metal-free reproducer is in UPSTREAM.md
   (release-only crash on entry). Rewritten as a loop. Always run `swift test -c release`.
 - GitHub `macos-15` runners ship Xcode 16.4 / Swift 6.1, which refuses to type-check dense closures that
   Swift 6.3 accepts. Keep test expressions simple.
