@@ -271,8 +271,6 @@ extension MetalArray {
         let pso = try ctx.pipeline(source: SortSource.source(K: keyType), function: mapFn,
                                    cacheKey: "sort/\(keyType)/\(SortSource.digitBits)/\(mapFn)")
         let out = try MetalArrowBuffer.allocate(byteCount: n * (wide ? 8 : 4), zeroed: false, context: ctx)
-        // The map's -0.0 / NaN report is only of use to `sorted()`; the split reads the keys themselves.
-        let flags = try MetalArrowBuffer.allocate(byteCount: 4, zeroed: true, context: ctx)
         try withExtendedLifetime(keepAlive) {
             try ctx.run { enc in
                 enc.setComputePipelineState(pso)
@@ -280,7 +278,10 @@ extension MetalArray {
                 Dispatch.setLength(enc, n, nil, index: 1)
                 enc.setBuffer(out.mtl, offset: out.offset, index: 2)
                 Dispatch.setUInt(enc, 0, index: 3)               // ascending; the split handles direction
-                enc.setBuffer(flags.mtl, offset: flags.offset, index: 4)
+                // The map's -0.0 / NaN report is only of use to `sorted()`; the split reads the keys
+                // themselves, so it asks for no flags and the kernel never touches the pointer.
+                enc.setBuffer(out.mtl, offset: out.offset, index: 4)
+                Dispatch.setUInt(enc, 0, index: 5)
                 Dispatch.dispatch1D(enc, pso, count: n)
             }
             ctx.retainUntilFlush(self)

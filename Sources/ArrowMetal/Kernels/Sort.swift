@@ -171,13 +171,23 @@ extension MetalArray {
         // Small inputs keep the old rule instead — a 20k-element argsort (the size top-k's final
         // ordering lands on) must not run on five threadgroups — so the block halves until there are at
         // least 64 of them, and never holds fewer than 4096 elements.
-        var elemsPerBlock = Swift.max(4096, ((n + 127) / 128 + 255) / 256 * 256)
-        while elemsPerBlock > 256 && (n + elemsPerBlock - 1) / elemsPerBlock < 64 { elemsPerBlock >>= 1 }
-        let blocks = (n + elemsPerBlock - 1) / elemsPerBlock
-        let counts = try MetalArrowBuffer.allocate(byteCount: radix * blocks * 4, zeroed: false, context: ctx)
-        let spanOr = try MetalArrowBuffer.allocate(byteCount: blocks * kb, zeroed: false, context: ctx)
-        let spanAnd = try MetalArrowBuffer.allocate(byteCount: blocks * kb, zeroed: false, context: ctx)
-        let flagBuf = try MetalArrowBuffer.allocate(byteCount: 4, zeroed: true, context: ctx)
+        func blockPlan(_ rows: Int) -> (elemsPerBlock: Int, blocks: Int) {
+            var e = Swift.max(4096, ((rows + 127) / 128 + 255) / 256 * 256)
+            while e > 256 && (rows + e - 1) / e < 64 { e >>= 1 }
+            return (e, Swift.max(1, (rows + e - 1) / e))
+        }
+        let (elemsPerBlock, blocks) = blockPlan(n)
+        // The passes may be re-planned around a shorter value block below, and a shorter block can want
+        // *more* threadgroups, not fewer (the rule halves the block until there are at least 64 of them).
+        // `blockPlan` never asks for more than 128 either way, so the tables are sized for that.
+        let tableBlocks = Swift.max(blocks, 128)
+        let counts = try MetalArrowBuffer.allocate(byteCount: radix * tableBlocks * 4, zeroed: false, context: ctx)
+        let spanOr = try MetalArrowBuffer.allocate(byteCount: tableBlocks * kb, zeroed: false, context: ctx)
+        let spanAnd = try MetalArrowBuffer.allocate(byteCount: tableBlocks * kb, zeroed: false, context: ctx)
+        // Only `sorted()` on a float column has any use for the -0.0 / NaN report; nothing else pays for
+        // the buffer, and the kernel does not touch the pointer when `wantFlags` is 0.
+        let wantFlags = keysWanted && T.isFloatingPoint
+        let flagBuf = wantFlags ? try MetalArrowBuffer.allocate(byteCount: 4, zeroed: true, context: ctx) : counts
         // The partition's own tables: three counters per block and the three bucket totals, which are
         // what the sort's element count comes from when the nulls have been taken out.
         let partCounts = usePartition ? try MetalArrowBuffer.allocate(byteCount: 3 * blocks * 4, zeroed: false, context: ctx) : nil
@@ -214,7 +224,17 @@ extension MetalArray {
             enc.setBuffer(mapKeys.mtl, offset: mapKeys.offset, index: 2)
             Dispatch.setUInt(enc, descending ? 1 : 0, index: 3)
             enc.setBuffer(flagBuf.mtl, offset: flagBuf.offset, index: 4)
+            Dispatch.setUInt(enc, wantFlags ? 1 : 0, index: 5)
             Dispatch.dispatch1D(enc, mapPSO, count: n)
+            enc.memoryBarrier(scope: .buffers)
+        }
+        /// The row numbers the payload starts from, when the partition has not already written them.
+        func encodeIota(_ enc: MTLComputeCommandEncoder, _ vals: MetalArrowBuffer) throws {
+            let iotaPSO = try p("iota_u32")
+            enc.setComputePipelineState(iotaPSO)
+            enc.setBuffer(vals.mtl, offset: vals.offset, index: 0)
+            Dispatch.setLength(enc, n, nil, index: 1)
+            Dispatch.dispatch1D(enc, iotaPSO, count: n)
             enc.memoryBarrier(scope: .buffers)
         }
         /// The stable three-way partition, when there is anything to take out of the sort.
@@ -243,7 +263,8 @@ extension MetalArray {
             enc.dispatchThreadgroups(blockGrid, threadsPerThreadgroup: tg)
             enc.memoryBarrier(scope: .buffers)
         }
-        func encodeHistogram(_ enc: MTLComputeCommandEncoder, keys: MetalArrowBuffer, shift: Int) {
+        func encodeHistogram(_ enc: MTLComputeCommandEncoder, keys: MetalArrowBuffer, shift: Int,
+                             elemsPerBlock: Int, blocks: Int) {
             enc.setComputePipelineState(histPSO)
             enc.setBuffer(keys.mtl, offset: keys.offset, index: 0)
             Dispatch.setLength(enc, n, countBuf, index: 1)
@@ -253,7 +274,7 @@ extension MetalArray {
             enc.setBuffer(counts.mtl, offset: counts.offset, index: 5)
             enc.setBuffer(spanOr.mtl, offset: spanOr.offset, index: 6)
             enc.setBuffer(spanAnd.mtl, offset: spanAnd.offset, index: 7)
-            enc.dispatchThreadgroups(blockGrid, threadsPerThreadgroup: tg)
+            enc.dispatchThreadgroups(MTLSize(width: blocks, height: 1, depth: 1), threadsPerThreadgroup: tg)
             enc.memoryBarrier(scope: .buffers)
         }
 
@@ -290,7 +311,10 @@ extension MetalArray {
                 try ctx.run { enc in
                     encodeMap(enc)
                     if usePartition { try encodePartition(enc, orderA: orderA!, orderB: orderB!, keysOut: partKeys!) }
-                    encodeHistogram(enc, keys: keysA, shift: 0)
+                    // A caller that asked for the permutation is certainly carrying the payload, so its
+                    // row numbers go in this command buffer rather than waiting for the next one.
+                    if wantOrder && !usePartition { try encodeIota(enc, orderA!) }
+                    encodeHistogram(enc, keys: keysA, shift: 0, elemsPerBlock: elemsPerBlock, blocks: blocks)
                 }
                 try ctx.syncPoint()
                 measured = true
@@ -327,28 +351,31 @@ extension MetalArray {
         }
         var valsA = orderA, valsB = orderB
         var resultOrder = orderA
+        // The passes run over the value block, not the column: with the nulls taken out, blocks sized
+        // for the whole column would leave that fraction of the GPU idle (at 50% nulls, half of it).
+        // What it costs is the pass-0 histogram, which can then no longer be the analysis's own.
+        var (passElems, passBlocks) = measured && mValue < n ? blockPlan(mValue) : (elemsPerBlock, blocks)
+        if passBlocks > tableBlocks { (passElems, passBlocks) = (elemsPerBlock, blocks) }
+        let sameLayout = passBlocks == blocks && passElems == elemsPerBlock
+        let passGrid = MTLSize(width: passBlocks, height: 1, depth: 1)
         try withExtendedLifetime(tmpKeep) {
             try ctx.run { enc in
                 if !analyse {
                     encodeMap(enc)
                     if usePartition { try encodePartition(enc, orderA: orderA!, orderB: orderB!, keysOut: partKeys!) }
                 }
-                if carryPayload && !usePartition {
-                    let iotaPSO = try p("iota_u32")
-                    enc.setComputePipelineState(iotaPSO)
-                    enc.setBuffer(valsA!.mtl, offset: valsA!.offset, index: 0)
-                    Dispatch.setLength(enc, n, countBuf, index: 1)
-                    Dispatch.dispatch1D(enc, iotaPSO, count: n)
-                    enc.memoryBarrier(scope: .buffers)
-                }
+                if carryPayload && !usePartition && !(analyse && wantOrder) { try encodeIota(enc, valsA!) }
                 let scatPSO = try p(carryPayload ? "radix_scatter" : "radix_scatter_nk")
                 for (i, pass) in activePasses.enumerated() {
                     // The histogram of digit 0 is already in `counts` when the analysis ran it and pass 0
                     // survived; every other pass needs its own, over the keys the previous pass produced.
-                    if !(analyse && i == 0 && pass == 0) { encodeHistogram(enc, keys: keysA, shift: pass * bits) }
+                    if !(analyse && sameLayout && i == 0 && pass == 0) {
+                        encodeHistogram(enc, keys: keysA, shift: pass * bits,
+                                        elemsPerBlock: passElems, blocks: passBlocks)
+                    }
                     enc.setComputePipelineState(scanPSO)
                     enc.setBuffer(counts.mtl, offset: counts.offset, index: 0)
-                    Dispatch.setUInt(enc, radix * blocks, index: 1)
+                    Dispatch.setUInt(enc, radix * passBlocks, index: 1)
                     enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: tg)
                     enc.memoryBarrier(scope: .buffers)
                     enc.setComputePipelineState(scatPSO)
@@ -356,12 +383,12 @@ extension MetalArray {
                     enc.setBuffer((valsA ?? keysA).mtl, offset: (valsA ?? keysA).offset, index: 1)
                     Dispatch.setLength(enc, n, countBuf, index: 2)
                     Dispatch.setUInt(enc, pass * bits, index: 3)
-                    Dispatch.setUInt(enc, elemsPerBlock, index: 4)
-                    Dispatch.setUInt(enc, blocks, index: 5)
+                    Dispatch.setUInt(enc, passElems, index: 4)
+                    Dispatch.setUInt(enc, passBlocks, index: 5)
                     enc.setBuffer(counts.mtl, offset: counts.offset, index: 6)
                     enc.setBuffer(keysB.mtl, offset: keysB.offset, index: 7)
                     enc.setBuffer((valsB ?? keysB).mtl, offset: (valsB ?? keysB).offset, index: 8)
-                    enc.dispatchThreadgroups(blockGrid, threadsPerThreadgroup: tg)
+                    enc.dispatchThreadgroups(passGrid, threadsPerThreadgroup: tg)
                     enc.memoryBarrier(scope: .buffers)
                     swap(&keysA, &keysB)
                     if carryPayload { swap(&valsA, &valsB); resultOrder = valsA }

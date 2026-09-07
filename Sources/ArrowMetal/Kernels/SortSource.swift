@@ -115,12 +115,22 @@ enum SortSource {
     // The float kernels also report, in `flags`, whether the column holds a -0.0 (bit 0) or a NaN (bit 1):
     // those are the only two values the map is not injective on, so a column with neither can have its
     // sorted keys turned straight back into sorted values instead of gathering them (see `sorted()`).
-    // One `simd_ballot` pair and at most one atomic per SIMD group; the keys are already loaded.
+    // Only `sorted()` asks (`wantFlags`), so `argsort` pays nothing at all for it; when it does ask, the
+    // report is one `simd_ballot` pair and at most one atomic per SIMD group — and the atomic is skipped
+    // once the bit is already set, or a column of nothing but -0.0 would serialise n/32 read-modify-writes
+    // on one word.
     #define KEY_FLAG_NEGZERO 1u
     #define KEY_FLAG_NAN 2u
-    kernel void key_from_i32(device const int* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { uint k = (uint)a[i] ^ 0x80000000u; out[i] = inv ? ~k : k; } }
-    kernel void key_from_u32(device const uint* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { uint k = a[i]; out[i] = inv ? ~k : k; } }
-    kernel void key_from_f32(device const uint* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]],
+    inline void key_report(device atomic_uint* flags, bool negZero, bool nan, uint wantFlags, uint lane) {
+        if (!wantFlags) return;
+        uint f = ((uint)((simd_vote::vote_t)simd_ballot(negZero)) ? KEY_FLAG_NEGZERO : 0u)
+               | ((uint)((simd_vote::vote_t)simd_ballot(nan)) ? KEY_FLAG_NAN : 0u);
+        if (f != 0u && lane == 0u && (atomic_load_explicit(flags, memory_order_relaxed) & f) != f)
+            atomic_fetch_or_explicit(flags, f, memory_order_relaxed);
+    }
+    kernel void key_from_i32(device const int* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]], constant uint& wantFlags [[buffer(5)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { uint k = (uint)a[i] ^ 0x80000000u; out[i] = inv ? ~k : k; } }
+    kernel void key_from_u32(device const uint* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]], constant uint& wantFlags [[buffer(5)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { uint k = a[i]; out[i] = inv ? ~k : k; } }
+    kernel void key_from_f32(device const uint* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]], constant uint& wantFlags [[buffer(5)]],
                              uint i [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
         bool active = i < *nPtr;
         uint b = active ? a[i] : 0u;
@@ -131,13 +141,11 @@ enum SortSource {
         /* NaN stays at the end when the order is reversed, next to the nulls, as in Arrow. UINT_MAX is
            free: only a NaN can map to key 0, so only a NaN can invert to UINT_MAX. */
         if (active) out[i] = inv ? (nan ? 0xFFFFFFFFu : ~k) : k;
-        uint f = ((uint)((simd_vote::vote_t)simd_ballot(negZero)) ? KEY_FLAG_NEGZERO : 0u)
-               | ((uint)((simd_vote::vote_t)simd_ballot(nan)) ? KEY_FLAG_NAN : 0u);
-        if (f != 0u && lane == 0u) atomic_fetch_or_explicit(flags, f, memory_order_relaxed);
+        key_report(flags, negZero, nan, wantFlags, lane);
     }
-    kernel void key_from_i64(device const long* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { ulong k = (ulong)a[i] ^ 0x8000000000000000ul; out[i] = inv ? ~k : k; } }
-    kernel void key_from_u64(device const ulong* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { ulong k = a[i]; out[i] = inv ? ~k : k; } }
-    kernel void key_from_f64(device const ulong* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]],
+    kernel void key_from_i64(device const long* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]], constant uint& wantFlags [[buffer(5)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { ulong k = (ulong)a[i] ^ 0x8000000000000000ul; out[i] = inv ? ~k : k; } }
+    kernel void key_from_u64(device const ulong* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]], constant uint& wantFlags [[buffer(5)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { ulong k = a[i]; out[i] = inv ? ~k : k; } }
+    kernel void key_from_f64(device const ulong* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]], constant uint& wantFlags [[buffer(5)]],
                              uint i [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
         bool active = i < *nPtr;
         ulong b = active ? a[i] : 0ul;
@@ -146,9 +154,7 @@ enum SortSource {
         if ((b & 0x7FFFFFFFFFFFFFFFul) == 0ul) b = 0ul; if (nan) b = 0x7FF0000000000001ul;
         ulong k = (b & 0x8000000000000000ul) ? ~b : (b | 0x8000000000000000ul);
         if (active) out[i] = inv ? (nan ? 0xFFFFFFFFFFFFFFFFul : ~k) : k;
-        uint f = ((uint)((simd_vote::vote_t)simd_ballot(negZero)) ? KEY_FLAG_NEGZERO : 0u)
-               | ((uint)((simd_vote::vote_t)simd_ballot(nan)) ? KEY_FLAG_NAN : 0u);
-        if (f != 0u && lane == 0u) atomic_fetch_or_explicit(flags, f, memory_order_relaxed);
+        key_report(flags, negZero, nan, wantFlags, lane);
     }
     kernel void iota_u32(device uint* out [[buffer(0)]], device const uint* nPtr [[buffer(1)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) out[i] = i; }
 
