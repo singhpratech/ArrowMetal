@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "GPU expressions for Polars lazy plans, backed by ArrowMetal on Apple silicon"
-repository = "https://github.com/arrowmetal/ArrowMetal"
+repository = "https://github.com/singhpratech/ArrowMetal"
 publish = false
 
 [lib]

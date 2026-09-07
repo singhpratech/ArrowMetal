@@ -33,8 +33,8 @@ test = ["pytest>=7"]
 polars = ["polars>=1.0"]
 
 [project.urls]
-Homepage = "https://github.com/arrowmetal/ArrowMetal"
-Source = "https://github.com/arrowmetal/ArrowMetal"
+Homepage = "https://github.com/singhpratech/ArrowMetal"
+Source = "https://github.com/singhpratech/ArrowMetal"
 
 [tool.setuptools]
 # The wheel is not pure Python: it carries a compiled arm64 dylib, so it must not
