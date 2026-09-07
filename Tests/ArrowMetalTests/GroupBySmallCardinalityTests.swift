@@ -176,8 +176,9 @@ final class GroupBySmallCardinalityTests: XCTestCase {
             let sliceVals = try valColumn.slice(offset: offset, length: length)
             let gbk = try GroupByKeys(columns: [.int32(sliceKeys)])
             let sums = try gbk.groupBy.sum(sliceVals)
-            let standalone = try GroupByKeys(columns: [.int32(try MetalArray<Int32>(Array(keys[offset..<(offset + length)])))])
-            let standaloneSums = try standalone.groupBy.sum(try MetalArray<Int64>(Array(vals[offset..<(offset + length)])))
+            let rows = offset..<(offset + length)
+            let standalone = try GroupByKeys(columns: [.int32(try MetalArray<Int32>(Array(keys[rows])))])
+            let standaloneSums = try standalone.groupBy.sum(try MetalArray<Int64>(Array(vals[rows])))
             XCTAssertEqual(gbk.groupCount, standalone.groupCount, "offset \(offset)")
             XCTAssertEqual(sums.toArray(), standaloneSums.toArray(), "offset \(offset)")
         }

@@ -11,6 +11,11 @@ Core
 - GroupBy over dense integer keys: count, sum, mean, min, max (privatised and device-atomic paths), plus a
   sort-based segmented path with no atomics — sumDouble/meanDouble/sumFloatAsDouble/meanFloat and
   min64/max64 — which covers the Float64 and 64-bit min/max cases 32-bit atomics cannot express.
+- The key-value-to-dense-id mapping reads an integer key column as the type it is rather than widening it
+  to int64 first, and its three dispatches share one command buffer; `hash_mean` reuses the counts the
+  accumulation already produced and divides on the GPU, and `hash_sum` returns the accumulator's own
+  buffer with a GPU-built validity bitmap instead of a host loop. Same ids, same answers to the bit;
+  2.0x off `sum`/`mean` by int32 key at 50M rows and a thousand groups (docs/LOSSES.md).
 - MetalRecordBatch with filter/take/slice/selecting; struct (+s) C Data import/export; ArrowArrayStream import.
 - Batched execution (`MetalContext.batch { }`) and its non-blocking form: `batchAsync` (Swift `async`
   and completion-handler), with `MetalArray.sumAsync`/`meanAsync` for scalars, so the calling thread is
