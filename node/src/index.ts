@@ -489,7 +489,16 @@ export function groupBy(keys: MetalArray | MetalArray[]): GroupBy {
 
 /** Int32 indices ordering the rows by each column in turn, the first column most significant. */
 export function lexsort(columns: MetalArray[], descending?: boolean[]): MetalArray {
+  if (columns.length === 0) {
+    throw new Error('ArrowMetal (Node): lexsort needs at least one column, got an empty list.');
+  }
   const desc = descending ?? columns.map(() => false);
+  if (desc.length !== columns.length) {
+    throw new Error(
+      `ArrowMetal (Node): lexsort got ${columns.length} columns but ${desc.length} ` +
+        'descending flags; pass one per column or omit them entirely.',
+    );
+  }
   return new MetalArray(native.lexsort(columns.map((c) => c.handle), desc));
 }
 
@@ -511,6 +520,11 @@ export class PlanSource {
   /** Registers `columns` under `name`; ArrowMetal retains the handles. */
   static create(name: string, columns: Record<string, MetalArray>): PlanSource {
     const names = Object.keys(columns);
+    if (names.length === 0) {
+      throw new Error(
+        `ArrowMetal (Node): plan source "${name}" needs at least one column, got none.`,
+      );
+    }
     return new PlanSource(
       native.planSourceCreate(name, names.map((n) => columns[n].handle), names),
       name,
@@ -536,9 +550,10 @@ export class PlanResult {
   /** A result column, by index or by name. */
   column(which: number | string): MetalArray {
     const i = typeof which === 'number' ? which : this.names.indexOf(which);
-    if (i < 0) {
+    if (i < 0 || i >= this.names.length || !Number.isInteger(i)) {
       throw new Error(
-        `ArrowMetal (Node): no column "${String(which)}" in the result; have ${this.names.join(', ')}.`,
+        `ArrowMetal (Node): no column ${JSON.stringify(which)} in the result; it has ` +
+          `${this.names.length} columns: ${this.names.join(', ')}.`,
       );
     }
     return new MetalArray(native.planColumn(this.handle, i));

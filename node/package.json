@@ -3,29 +3,19 @@
   "version": "0.1.0",
   "description": "Apache Arrow compute on Apple silicon GPUs, from Node.js",
   "license": "Apache-2.0",
+  "private": true,
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "engines": {
     "node": ">=20"
   },
-  "os": [
-    "darwin"
-  ],
-  "cpu": [
-    "arm64"
-  ],
-  "files": [
-    "dist",
-    "src",
-    "binding.gyp",
-    "README.md"
-  ],
   "scripts": {
     "build:native": "node-gyp rebuild",
     "build:ts": "tsc -p tsconfig.json",
     "build": "npm run build:native && npm run build:ts",
-    "test": "npm run build && node --test 'test/*.test.js'",
-    "bench": "node bench/bench.mjs"
+    "test": "npm run build && NODE_OPTIONS=--expose-gc node --test 'test/*.test.js'",
+    "bench": "node bench/bench.mjs",
+    "bench:spread": "node bench/spread.mjs"
   },
   "dependencies": {
     "node-addon-api": "^8.9.2"

@@ -2,7 +2,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const A = require('apache-arrow');
-const { MetalArray, info, isPageAligned, bufferAddress } = require('../dist/index.js');
+const { MetalArray, PlanSource, lexsort, info, isPageAligned, bufferAddress } = require('../dist/index.js');
+const { native } = require('../dist/native.js');
 
 test('the loader reports the dylib it bound to', () => {
   assert.ok(info.path.endsWith('libArrowMetalC.dylib'), info.path);
@@ -81,10 +82,76 @@ test('an unsupported Arrow type is rejected by name', () => {
   assert.throws(() => MetalArray.fromArrow(v), /is not carried by this binding/);
 });
 
-test('an ArrowMetal error surfaces as a JS Error carrying am_last_error', () => {
+test('an ArrowMetal error surfaces as a JS Error carrying am_last_error verbatim', () => {
   const a = MetalArray.fromTypedArray(new BigInt64Array([1n, 2n, 3n]));
   const b = MetalArray.fromTypedArray(new BigInt64Array([1n, 2n]));
-  assert.throws(() => a.compareWith('==', b), (e) => e instanceof Error && e.message.length > 0);
+  assert.throws(() => a.compareWith('==', b), /Array length mismatch: 3 vs 2/);
+});
+
+test('an argument-guard rejection (rc 2) never reports a previous call\'s message', () => {
+  // The C ABI's guards return 2 without setting am_last_error, so reading it there would report
+  // whatever the last failing call left behind. Provoke a real error first, then a guard.
+  const a = MetalArray.fromTypedArray(new BigInt64Array([1n, 2n, 3n]));
+  const b = MetalArray.fromTypedArray(new BigInt64Array([1n, 2n]));
+  assert.throws(() => a.compareWith('==', b), /Array length mismatch/);
+  for (const [what, fn] of [
+    ['lexsort([])', () => lexsort([])],
+    ['PlanSource.create with no columns', () => PlanSource.create('empty', {})],
+  ]) {
+    assert.throws(fn, (e) => {
+      assert.ok(!/Array length mismatch/.test(e.message), `${what} leaked a stale message`);
+      assert.match(e.message, /ArrowMetal \(Node\)/);
+      return true;
+    });
+  }
+});
+
+test('handles of one kind are rejected where another is expected', () => {
+  const a = MetalArray.fromTypedArray(new BigInt64Array([1n, 2n, 3n]));
+  const source = PlanSource.create('t', { x: a });
+  // Reach past the typed API and hand the raw externals to the wrong entry points.
+  assert.throws(() => native.filter(a.handle, source.handle), /expected an array handle/);
+  assert.throws(() => native.groupCount(a.handle), /expected a group-by handle/);
+  assert.throws(() => native.planColumn(source.handle, 0), /expected a plan result handle/);
+  assert.throws(() => native.length({}), /expected an array handle/);
+});
+
+test('a buffer shorter than the Arrow layout requires is rejected with the byte counts', () => {
+  // A one-byte validity bitmap for 64 rows would read seven bytes past the view.
+  assert.throws(
+    () => MetalArray.fromTypedArray(new BigInt64Array(64), { validity: new Uint8Array(1) }),
+    /the validity buffer is 1 bytes but Arrow format "l" needs at least 8 for offset 0 plus 64 rows/,
+  );
+  // A values buffer shorter than offset + length.
+  assert.throws(
+    () => native.importArray('l', 64, 0, 0, null, new BigInt64Array(8), null),
+    /the values buffer is 64 bytes but Arrow format "l" needs at least 512/,
+  );
+  // offset + length, not length alone.
+  assert.throws(
+    () => native.importArray('g', 4, 4, 0, null, new Float64Array(4), null),
+    /the values buffer is 32 bytes but Arrow format "g" needs at least 64 for offset 4 plus 4 rows/,
+  );
+  // A utf8 offsets buffer needs rows + 1 entries.
+  assert.throws(
+    () => native.importArray('u', 4, 0, 0, null, new Uint8Array(16), new Int32Array(4)),
+    /the utf8 offsets buffer is 16 bytes but Arrow format "u" needs at least 20/,
+  );
+  // A utf8 values buffer must reach the last offset.
+  assert.throws(
+    () => native.importArray('u', 2, 0, 0, null, new Uint8Array(3), new Int32Array([0, 2, 9])),
+    /the utf8 values buffer is 3 bytes but Arrow format "u" needs at least 9/,
+  );
+  // A boolean data buffer is a bitmap, so it is sized in bits.
+  assert.throws(
+    () => native.importArray('b', 64, 0, 0, null, new Uint8Array(2), null),
+    /the boolean values buffer is 2 bytes but Arrow format "b" needs at least 8/,
+  );
+});
+
+test('a buffer exactly the required size is accepted', () => {
+  const ok = native.importArray('l', 64, 0, 0, new Uint8Array(8).fill(0xff), new BigInt64Array(64).fill(2n), null);
+  assert.equal(native.reduce(ok, 0), 128n);
 });
 
 test('exported buffers wrap ArrowMetal memory, not a copy of it', () => {

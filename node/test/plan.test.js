@@ -65,13 +65,19 @@ test('explain returns the logical and physical plans', () => {
 });
 
 test('a plan that does not type-check throws with the engine message', () => {
-  const bad = { op: 'scan', source: 'nosuchtable' };
-  assert.throws(() => runPlan(bad, [source()]), (e) => e instanceof Error && e.message.length > 0);
+  assert.throws(() => runPlan({ op: 'scan', source: 'nosuchtable' }, [source()]),
+    /unknown source "nosuchtable"/);
+  assert.throws(() => runPlan({ op: 'filter', predicate: '(gt (col "nope") (int 1))',
+    input: { op: 'scan', source: 'sales' } }, [source()]), /nope/);
 });
 
-test('asking for a column that is not in the result names it', () => {
+test('asking for a column that is not in the result names it, by name or by index', () => {
   const r = runPlan(PLAN, [source()]);
-  assert.throws(() => r.column('nope'), /no column "nope"/);
+  assert.throws(() => r.column('nope'), /no column "nope" in the result; it has 2 columns: region, total/);
+  assert.throws(() => r.column(99), /no column 99 in the result; it has 2 columns/);
+  assert.throws(() => r.column(-1), /no column -1 in the result/);
+  // And never a stale message from an earlier failure.
+  assert.throws(() => r.column(99), (e) => !/unknown source/.test(e.message));
 });
 
 test('a select plan with an expression', () => {

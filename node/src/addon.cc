@@ -7,11 +7,18 @@
 //
 // Ownership rules, which the TypeScript layer relies on:
 //   * Import wraps the producer's bytes; it never copies on this side. The ArrowArray we hand to
-//     am_import points straight at the V8 backing store. We hold a JS reference to every buffer for
-//     the whole life of the handle, and our release callback only records that ArrowMetal let go.
+//     am_import points straight at the V8 backing store. We hold a JS reference to every producer
+//     buffer in the ArrowArray's own private_data (ImportPriv), and those references live exactly
+//     as long as ArrowMetal holds the array -- they are dropped by the ArrowArray release callback
+//     and by nothing else. Releasing the *handle* does not drop them: on a page-aligned import
+//     ArrowMetal wraps the V8 pages with makeBuffer(bytesNoCopy:), and a slice, a group-by or a
+//     registered plan source built from that array retains the import, so the pages must stay
+//     reachable from JS after the original handle is gone.
 //   * Export wraps the ArrowMetal result; it never copies on this side either. Each output buffer
 //     becomes an external ArrayBuffer whose finalizer decrements a refcount; the ArrowArray's own
 //     release runs when the last one is collected.
+//   * Every handle we hand to JS is an External carrying a napi type tag, so passing a plan source
+//     where an array is expected throws instead of being reinterpreted.
 
 #include <napi.h>
 
@@ -19,6 +26,8 @@
 #include <unistd.h>
 #include <atomic>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -179,11 +188,22 @@ void requireLoaded(const Napi::Env& env) {
   }
 }
 
+// Turns a non-zero return code into a JS exception.
+//
+// rc 2 is the C ABI's argument guard: the Swift side rejects the call before it starts and does
+// NOT set am_last_error, so reading it there reports whatever the previous call on this thread left
+// behind. We give rc 2 its own message rather than a stale one.
 void check(const Napi::Env& env, int rc) {
-  if (rc != 0) {
-    const char* e = g.am_last_error();
-    throw Napi::Error::New(env, e != nullptr && *e != 0 ? e : "ArrowMetal: unknown error");
+  if (rc == 0) return;
+  if (rc == 2) {
+    throw Napi::Error::New(
+        env,
+        "ArrowMetal: the call was rejected by an argument guard (rc 2) — a null handle, an empty "
+        "column list, or an index out of range. The C ABI sets no message for this case, so there "
+        "is nothing more specific to report.");
   }
+  const char* e = g.am_last_error();
+  throw Napi::Error::New(env, e != nullptr && *e != 0 ? e : "ArrowMetal: unknown error");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -210,34 +230,64 @@ int elementWidth(const char* f) {
 // Handles
 // ---------------------------------------------------------------------------------------------
 
-// Private data of an ArrowArray we build over JS memory. Freed by our own release callback.
+// References to V8 TypedArrays that ArrowMetal has just let go of, waiting to be destroyed on the
+// JS thread. napi_delete_reference is not safe from an arbitrary thread, and an ArrowArray release
+// callback may in principle run from one, so the callback parks the references here and the next
+// N-API entry point drains them. See drainPending().
+std::mutex gPendingMutex;
+std::vector<Napi::Reference<Napi::Value>> gPending;
+
+void drainPending() {
+  std::vector<Napi::Reference<Napi::Value>> local;
+  {
+    std::lock_guard<std::mutex> lock(gPendingMutex);
+    local.swap(gPending);
+  }
+  local.clear();  // ~Reference runs here, on the JS thread
+}
+
+// Private data of an ArrowArray we build over JS memory.
+//
+// This owns the JS references that pin the producer's TypedArrays, and it is freed by our own
+// release callback and by nothing else. That is the whole point: on a page-aligned import
+// ArrowMetal wraps the V8 pages with makeBuffer(bytesNoCopy:), and objects derived from the
+// imported array — a slice, a group-by, a registered plan source — keep those pages alive through
+// their own retain of the imported array. So the producer's buffers must stay reachable from JS
+// until ArrowMetal calls release, which is exactly when the last of those derived objects is gone.
+// Dropping the references when the *handle* is released instead would leave the GPU reading freed
+// V8 memory.
 struct ImportPriv {
   const void* buffers[3];
-  std::atomic<bool> released{false};
+  std::vector<Napi::Reference<Napi::Value>> keepAlive;
+  // Shared with the importing frame, because priv itself may be gone by the time we want to read
+  // it: a copying import calls release before am_import returns.
+  std::shared_ptr<std::atomic<bool>> released;
 };
 
 void importArrayRelease(struct ArrowArray* a) {
   auto* priv = static_cast<ImportPriv*>(a->private_data);
-  if (priv != nullptr) priv->released.store(true);
   a->release = nullptr;
+  a->private_data = nullptr;
+  if (priv == nullptr) return;
+  if (priv->released) priv->released->store(true);
+  {
+    std::lock_guard<std::mutex> lock(gPendingMutex);
+    for (auto& r : priv->keepAlive) gPending.push_back(std::move(r));
+  }
+  delete priv;
 }
 
 void importSchemaRelease(struct ArrowSchema* s) { s->release = nullptr; }
 
 struct ArrayHandle {
   am_array* p = nullptr;
-  // Buffers imported from JS stay reachable for the whole life of the handle, so ArrowMetal can
-  // hold them zero-copy for as long as it likes.
-  std::vector<Napi::Reference<Napi::Value>> keepAlive;
-  ImportPriv* priv = nullptr;  // non-null only for imported arrays
-  bool retained = false;       // ArrowMetal kept our buffers rather than releasing them at import
+  // No keepAlive here. The producer's buffers are pinned by ImportPriv, which outlives this handle
+  // whenever ArrowMetal still holds the imported array through a derived object.
+  bool retained = false;  // ArrowMetal kept our buffers rather than releasing them at import
 
   ~ArrayHandle() {
     if (p != nullptr) g.am_release(p);
     p = nullptr;
-    keepAlive.clear();
-    delete priv;
-    priv = nullptr;
   }
 };
 
@@ -262,20 +312,48 @@ struct PlanResultHandle {
   }
 };
 
+// Type tags, so an External of one kind passed where another is expected throws instead of being
+// reinterpreted. Every handle we hand to JS carries one; every unwrap checks it.
+const napi_type_tag kArrayTag = {0x9a1f4c2d7b3e4051ULL, 0xa7c6d8e920f14b35ULL};
+const napi_type_tag kGroupByTag = {0x4d2b8e1f60a34c77ULL, 0xb3f5178c9d2e4a60ULL};
+const napi_type_tag kPlanSourceTag = {0x1c7e35a8f4b9426dULL, 0x8e50d63b2af7194cULL};
+const napi_type_tag kPlanResultTag = {0x76b04e93c1d8452aULL, 0x2f9ac514e07b638dULL};
+
 template <typename T>
 void finalizeHandle(Napi::Env, T* h) {
   delete h;
 }
 
+template <typename T>
+Napi::Value wrapHandle(Napi::Env env, T* h, const napi_type_tag& tag) {
+  Napi::External<T> ext = Napi::External<T>::New(env, h, finalizeHandle<T>);
+  ext.TypeTag(&tag);
+  return ext;
+}
+
+template <typename T>
+T* unwrapTagged(const Napi::Env& env, const Napi::Value& v, const napi_type_tag& tag,
+                const char* what) {
+  if (!v.IsExternal()) {
+    throw Napi::TypeError::New(env, std::string("ArrowMetal: expected ") + what +
+                                        ", got a different kind of value");
+  }
+  Napi::External<T> ext = v.As<Napi::External<T>>();
+  if (!ext.CheckTypeTag(&tag)) {
+    throw Napi::TypeError::New(env, std::string("ArrowMetal: expected ") + what +
+                                        ", got a handle of a different kind");
+  }
+  return ext.Data();
+}
+
 Napi::Value wrapArray(Napi::Env env, am_array* p) {
   auto* h = new ArrayHandle();
   h->p = p;
-  return Napi::External<ArrayHandle>::New(env, h, finalizeHandle<ArrayHandle>);
+  return wrapHandle(env, h, kArrayTag);
 }
 
 ArrayHandle* unwrapArray(const Napi::Env& env, const Napi::Value& v) {
-  if (!v.IsExternal()) throw Napi::TypeError::New(env, "ArrowMetal: expected an array handle");
-  auto* h = v.As<Napi::External<ArrayHandle>>().Data();
+  auto* h = unwrapTagged<ArrayHandle>(env, v, kArrayTag, "an array handle");
   if (h == nullptr || h->p == nullptr) {
     throw Napi::Error::New(env, "ArrowMetal: array handle is released");
   }
@@ -403,27 +481,64 @@ Napi::Value ImportArray(const Napi::CallbackInfo& info) {
                  "\" is not carried by this binding. Supported: c C s S i I l L f g b u.");
   }
 
-  auto* priv = new ImportPriv();
-  std::vector<Napi::Reference<Napi::Value>> keep;
+  if (length < 0 || offset < 0) {
+    throw Napi::Error::New(env, "ArrowMetal (Node): length and offset must be >= 0, got length " +
+                                    std::to_string(length) + " and offset " +
+                                    std::to_string(offset) + ".");
+  }
+  const int64_t rows = offset + length;  // the C Data Interface addresses rows [offset, offset+length)
 
-  auto addBuffer = [&](int slot, const Napi::Value& v) {
+  auto* priv = new ImportPriv();
+  // am_import moves the ArrowArray, which per the C Data Interface nulls our copy's release pointer
+  // whether it wrapped the buffers or copied them. This flag is the only way to tell the two apart:
+  // it is set if and only if ArrowMetal actually ran the release callback.
+  auto releasedFlag = std::make_shared<std::atomic<bool>>(false);
+  priv->released = releasedFlag;
+
+  // Every buffer is checked against the size the Arrow layout requires for `rows` rows. Without
+  // this a short validity bitmap (one byte for 64 rows, say) reads past the end of the V8 view and
+  // the answer depends on whatever V8 put next to it.
+  auto addBuffer = [&](int slot, const Napi::Value& v, const char* name, int64_t needed) {
     if (v.IsNull() || v.IsUndefined()) {
       priv->buffers[slot] = nullptr;
       return;
     }
     size_t len = 0;
-    priv->buffers[slot] = viewBase(env, v, &len);
-    keep.push_back(Napi::Reference<Napi::Value>::New(v, 1));
+    uint8_t* base = viewBase(env, v, &len);
+    if (static_cast<int64_t>(len) < needed) {
+      throw Napi::Error::New(
+          env, std::string("ArrowMetal (Node): the ") + name + " buffer is " + std::to_string(len) +
+                   " bytes but Arrow format \"" + format + "\" needs at least " +
+                   std::to_string(needed) + " for offset " + std::to_string(offset) + " plus " +
+                   std::to_string(length) + " rows.");
+    }
+    priv->buffers[slot] = base;
+    priv->keepAlive.push_back(Napi::Reference<Napi::Value>::New(v, 1));
   };
 
+  const int64_t bitmapBytes = (rows + 7) / 8;
   int64_t nBuffers = (width == -2) ? 3 : 2;
   try {
-    addBuffer(0, info[4]);  // validity bitmap
+    addBuffer(0, info[4], "validity", bitmapBytes);
     if (width == -2) {
-      addBuffer(1, info[6]);  // int32 offsets
-      addBuffer(2, info[5]);  // utf8 bytes
+      addBuffer(1, info[6], "utf8 offsets", (rows + 1) * 4);
+      // The values buffer must reach the last offset, which we can only know once the offsets
+      // buffer has been checked.
+      int64_t neededBytes = 0;
+      if (priv->buffers[1] != nullptr && rows >= 0) {
+        const int32_t* offs = static_cast<const int32_t*>(priv->buffers[1]);
+        const int32_t last = offs[rows];
+        if (last < 0) {
+          throw Napi::Error::New(env, "ArrowMetal (Node): the utf8 offsets buffer ends at " +
+                                          std::to_string(last) + ", which is negative.");
+        }
+        neededBytes = last;
+      }
+      addBuffer(2, info[5], "utf8 values", neededBytes);
+    } else if (width == -1) {
+      addBuffer(1, info[5], "boolean values", bitmapBytes);
     } else {
-      addBuffer(1, info[5]);  // values
+      addBuffer(1, info[5], "values", rows * width);
     }
   } catch (...) {
     delete priv;
@@ -457,18 +572,18 @@ Napi::Value ImportArray(const Napi::CallbackInfo& info) {
   int rc = g.am_import(&schema, &array, &out);
   if (schema.release != nullptr) schema.release(&schema);
   if (rc != 0) {
+    // importArrayRelease frees priv and parks the JS references; if it already ran, array.release
+    // is null and priv is gone. Either way there is nothing left for us to delete.
     if (array.release != nullptr) array.release(&array);
-    delete priv;
+    if (rc == 2) check(env, rc);
     const char* e = g.am_last_error();
     throw Napi::Error::New(env, e != nullptr && *e != 0 ? e : "ArrowMetal: am_import failed");
   }
 
   auto* h = new ArrayHandle();
   h->p = out;
-  h->priv = priv;
-  h->keepAlive = std::move(keep);
-  h->retained = !priv->released.load();
-  return Napi::External<ArrayHandle>::New(env, h, finalizeHandle<ArrayHandle>);
+  h->retained = !releasedFlag->load();
+  return wrapHandle(env, h, kArrayTag);
 }
 
 Napi::Value ImportRetained(const Napi::CallbackInfo& info) {
@@ -555,13 +670,15 @@ Napi::Value ArrayFormat(const Napi::CallbackInfo& info) {
 
 Napi::Value ReleaseArray(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  if (!info[0].IsExternal()) return env.Undefined();
-  auto* h = info[0].As<Napi::External<ArrayHandle>>().Data();
+  auto* h = unwrapTagged<ArrayHandle>(env, info[0], kArrayTag, "an array handle");
   if (h != nullptr && h->p != nullptr) {
+    // Releases only the handle. The producer's buffers stay pinned until ArrowMetal calls the
+    // ArrowArray release callback, which may be much later: a slice, a group-by or a registered
+    // plan source built from this array retains the import.
     g.am_release(h->p);
     h->p = nullptr;
-    h->keepAlive.clear();
   }
+  drainPending();
   return env.Undefined();
 }
 
@@ -704,12 +821,11 @@ Napi::Value GroupByKeys(const Napi::CallbackInfo& info) {
   check(env, g.am_group_by_keys(ptrs.data(), static_cast<int64_t>(ptrs.size()), &gb));
   auto* h = new GroupByHandle();
   h->p = gb;
-  return Napi::External<GroupByHandle>::New(env, h, finalizeHandle<GroupByHandle>);
+  return wrapHandle(env, h, kGroupByTag);
 }
 
 GroupByHandle* unwrapGroupBy(const Napi::Env& env, const Napi::Value& v) {
-  if (!v.IsExternal()) throw Napi::TypeError::New(env, "ArrowMetal: expected a group-by handle");
-  auto* h = v.As<Napi::External<GroupByHandle>>().Data();
+  auto* h = unwrapTagged<GroupByHandle>(env, v, kGroupByTag, "a group-by handle");
   if (h == nullptr || h->p == nullptr) throw Napi::Error::New(env, "ArrowMetal: group-by released");
   return h;
 }
@@ -760,7 +876,7 @@ Napi::Value PlanSourceCreate(const Napi::CallbackInfo& info) {
                                      static_cast<int64_t>(ptrs.size()), &src));
   auto* h = new PlanSourceHandle();
   h->p = src;
-  return Napi::External<PlanSourceHandle>::New(env, h, finalizeHandle<PlanSourceHandle>);
+  return wrapHandle(env, h, kPlanSourceTag);
 }
 
 std::vector<am_plan_source*> unwrapSources(const Napi::Env& env, const Napi::Value& v) {
@@ -768,8 +884,11 @@ std::vector<am_plan_source*> unwrapSources(const Napi::Env& env, const Napi::Val
   std::vector<am_plan_source*> out;
   for (uint32_t i = 0; i < arr.Length(); i++) {
     Napi::Value e = arr.Get(i);
-    if (!e.IsExternal()) throw Napi::TypeError::New(env, "ArrowMetal: expected a plan source");
-    out.push_back(e.As<Napi::External<PlanSourceHandle>>().Data()->p);
+    auto* h = unwrapTagged<PlanSourceHandle>(env, e, kPlanSourceTag, "a plan source handle");
+    if (h == nullptr || h->p == nullptr) {
+      throw Napi::Error::New(env, "ArrowMetal: plan source released");
+    }
+    out.push_back(h->p);
   }
   return out;
 }
@@ -785,7 +904,7 @@ Napi::Value PlanRun(const Napi::CallbackInfo& info) {
                            optimize, &r));
   auto* h = new PlanResultHandle();
   h->p = r;
-  return Napi::External<PlanResultHandle>::New(env, h, finalizeHandle<PlanResultHandle>);
+  return wrapHandle(env, h, kPlanResultTag);
 }
 
 Napi::Value PlanExplain(const Napi::CallbackInfo& info) {
@@ -804,8 +923,7 @@ Napi::Value PlanExplain(const Napi::CallbackInfo& info) {
 }
 
 PlanResultHandle* unwrapResult(const Napi::Env& env, const Napi::Value& v) {
-  if (!v.IsExternal()) throw Napi::TypeError::New(env, "ArrowMetal: expected a plan result");
-  auto* h = v.As<Napi::External<PlanResultHandle>>().Data();
+  auto* h = unwrapTagged<PlanResultHandle>(env, v, kPlanResultTag, "a plan result handle");
   if (h == nullptr || h->p == nullptr) throw Napi::Error::New(env, "ArrowMetal: result released");
   return h;
 }
@@ -849,37 +967,46 @@ Napi::Value BufferAddress(const Napi::CallbackInfo& info) {
   return Napi::BigInt::New(env, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p)));
 }
 
+// Every N-API entry point drains the references ArrowMetal parked when it released an imported
+// array. ~Reference must run on the JS thread, and this is the first place we are guaranteed to be
+// on it after a release callback fired.
+template <Napi::Value (*Fn)(const Napi::CallbackInfo&)>
+Napi::Value Entry(const Napi::CallbackInfo& info) {
+  drainPending();
+  return Fn(info);
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
-  exports.Set("load", Napi::Function::New(env, Load));
-  exports.Set("importArray", Napi::Function::New(env, ImportArray));
-  exports.Set("importRetained", Napi::Function::New(env, ImportRetained));
-  exports.Set("exportArray", Napi::Function::New(env, ExportArray));
-  exports.Set("length", Napi::Function::New(env, ArrayLength));
-  exports.Set("nullCount", Napi::Function::New(env, ArrayNullCount));
-  exports.Set("format", Napi::Function::New(env, ArrayFormat));
-  exports.Set("release", Napi::Function::New(env, ReleaseArray));
-  exports.Set("reduce", Napi::Function::New(env, Reduce));
-  exports.Set("compareScalar", Napi::Function::New(env, CompareScalar));
-  exports.Set("compareArray", Napi::Function::New(env, CompareArray));
-  exports.Set("arithScalar", Napi::Function::New(env, ArithScalar));
-  exports.Set("cast", Napi::Function::New(env, Cast));
-  exports.Set("filter", Napi::Function::New(env, Filter));
-  exports.Set("take", Napi::Function::New(env, Take));
-  exports.Set("slice", Napi::Function::New(env, Slice));
-  exports.Set("argsort", Napi::Function::New(env, Argsort));
-  exports.Set("sort", Napi::Function::New(env, Sort));
-  exports.Set("lexsort", Napi::Function::New(env, Lexsort));
-  exports.Set("groupByKeys", Napi::Function::New(env, GroupByKeys));
-  exports.Set("groupCount", Napi::Function::New(env, GroupCount));
-  exports.Set("groupKeysResult", Napi::Function::New(env, GroupKeysResult));
-  exports.Set("groupAgg", Napi::Function::New(env, GroupAgg));
-  exports.Set("planSourceCreate", Napi::Function::New(env, PlanSourceCreate));
-  exports.Set("planRun", Napi::Function::New(env, PlanRun));
-  exports.Set("planExplain", Napi::Function::New(env, PlanExplain));
-  exports.Set("planResultInfo", Napi::Function::New(env, PlanResultInfo));
-  exports.Set("planColumn", Napi::Function::New(env, PlanColumn));
-  exports.Set("lastError", Napi::Function::New(env, LastError));
-  exports.Set("bufferAddress", Napi::Function::New(env, BufferAddress));
+  exports.Set("load", Napi::Function::New(env, Entry<Load>));
+  exports.Set("importArray", Napi::Function::New(env, Entry<ImportArray>));
+  exports.Set("importRetained", Napi::Function::New(env, Entry<ImportRetained>));
+  exports.Set("exportArray", Napi::Function::New(env, Entry<ExportArray>));
+  exports.Set("length", Napi::Function::New(env, Entry<ArrayLength>));
+  exports.Set("nullCount", Napi::Function::New(env, Entry<ArrayNullCount>));
+  exports.Set("format", Napi::Function::New(env, Entry<ArrayFormat>));
+  exports.Set("release", Napi::Function::New(env, Entry<ReleaseArray>));
+  exports.Set("reduce", Napi::Function::New(env, Entry<Reduce>));
+  exports.Set("compareScalar", Napi::Function::New(env, Entry<CompareScalar>));
+  exports.Set("compareArray", Napi::Function::New(env, Entry<CompareArray>));
+  exports.Set("arithScalar", Napi::Function::New(env, Entry<ArithScalar>));
+  exports.Set("cast", Napi::Function::New(env, Entry<Cast>));
+  exports.Set("filter", Napi::Function::New(env, Entry<Filter>));
+  exports.Set("take", Napi::Function::New(env, Entry<Take>));
+  exports.Set("slice", Napi::Function::New(env, Entry<Slice>));
+  exports.Set("argsort", Napi::Function::New(env, Entry<Argsort>));
+  exports.Set("sort", Napi::Function::New(env, Entry<Sort>));
+  exports.Set("lexsort", Napi::Function::New(env, Entry<Lexsort>));
+  exports.Set("groupByKeys", Napi::Function::New(env, Entry<GroupByKeys>));
+  exports.Set("groupCount", Napi::Function::New(env, Entry<GroupCount>));
+  exports.Set("groupKeysResult", Napi::Function::New(env, Entry<GroupKeysResult>));
+  exports.Set("groupAgg", Napi::Function::New(env, Entry<GroupAgg>));
+  exports.Set("planSourceCreate", Napi::Function::New(env, Entry<PlanSourceCreate>));
+  exports.Set("planRun", Napi::Function::New(env, Entry<PlanRun>));
+  exports.Set("planExplain", Napi::Function::New(env, Entry<PlanExplain>));
+  exports.Set("planResultInfo", Napi::Function::New(env, Entry<PlanResultInfo>));
+  exports.Set("planColumn", Napi::Function::New(env, Entry<PlanColumn>));
+  exports.Set("lastError", Napi::Function::New(env, Entry<LastError>));
+  exports.Set("bufferAddress", Napi::Function::New(env, Entry<BufferAddress>));
   return exports;
 }
 
