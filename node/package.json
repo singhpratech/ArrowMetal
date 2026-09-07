@@ -1,0 +1,42 @@
+{
+  "name": "arrowmetal",
+  "version": "0.1.0",
+  "description": "Apache Arrow compute on Apple silicon GPUs, from Node.js",
+  "license": "Apache-2.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "engines": {
+    "node": ">=20"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "dist",
+    "src",
+    "binding.gyp",
+    "README.md"
+  ],
+  "scripts": {
+    "build:native": "node-gyp rebuild",
+    "build:ts": "tsc -p tsconfig.json",
+    "build": "npm run build:native && npm run build:ts",
+    "test": "npm run build && node --test test/",
+    "bench": "node bench/bench.mjs"
+  },
+  "dependencies": {
+    "node-addon-api": "^8.9.2"
+  },
+  "peerDependencies": {
+    "apache-arrow": ">=17"
+  },
+  "devDependencies": {
+    "@types/node": "^26.5.0",
+    "apache-arrow": "^21.2.0",
+    "node-gyp": "^13.0.2",
+    "typescript": "^5.9.3"
+  }
+}
