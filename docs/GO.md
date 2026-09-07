@@ -194,8 +194,8 @@ the rows.
 
 ## What is covered
 
-Every item below has at least one test in `go/arrowmetal`; the oracle is named. 42 test functions,
-131 cases counting subtests, all green.
+Every item below has at least one test in `go/arrowmetal`; the oracle is named. 43 test functions,
+132 cases counting subtests, all green.
 
 | Surface | Go API | Oracle |
 |---|---|---|

@@ -34,7 +34,7 @@ cd go/arrowmetal
 ARROWMETAL_LIB=$PWD/../../.build/release/libArrowMetalC.dylib go test ./...
 ```
 
-42 test functions, 131 cases with subtests. Every wrapped operation is checked against Arrow Go's
+43 test functions, 132 cases with subtests. Every wrapped operation is checked against Arrow Go's
 own compute where arrow-go has the function, and against a plain Go loop where it does not
 (arrow-go's compute package registers no aggregate function at all — no `sum`, `mean` or `min_max`).
 Lengths 0, 1, 1000 and 1,000,001; nulls at several densities; sliced input at offsets 1 through 1000.
