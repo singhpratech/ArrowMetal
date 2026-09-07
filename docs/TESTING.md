@@ -10,6 +10,7 @@ pushed. Numbers are from the last gated run of `main` (0.1.0, unreleased) on an 
 | Rust suites (`rust/arrowmetal/tests`) | 48 tests over the safe crate, run in release, plus 4 `no_run` doc-tests (compiled, not executed) | `arrow::compute` (arrow-rs 59) on the same data; a `HashMap` fold where arrow-rs has no kernel; `include/arrowmetal.h` re-parsed for the ABI signatures ([RUST.md](RUST.md)) |
 | Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | 39,069 generated cases, 45 column types, every public operation | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
 | TypeScript suites (`node/test`) | 62 tests in 6 files over the N-API addon | Apache Arrow JS 21.2.0 and plain JS over the same rows ([TYPESCRIPT.md](TYPESCRIPT.md)) |
+| Go binding (`go/arrowmetal`) | 46 test functions, 177 cases with subtests, run twice (plain and under `GOEXPERIMENT=cgocheck2`) | `arrow-go/v18`'s own `compute` where it has the function, plain Go loops where it does not ([GO.md](GO.md)) |
 | Adversarial review pass | four independent reviewers plus a coverage pass before release | each finding carries a regression test |
 | Benchmarks (`Benchmarks/`) | 339 operation-and-size rows over 173 operations, against four CPU libraries; streaming and engine benches | measured, never estimated ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md)) |
 
@@ -23,6 +24,8 @@ PYTHONPATH=python python -m pytest python/tests -q      # all Python suites, inc
 PYTHONPATH=python python python/tests/differential_report.py   # the matrix as one report; exit 0 = nothing unclassified
 (cd node && npm install && npm test)                    # TypeScript: builds the addon, then 62 node:test cases
 (cd rust && cargo test --release)                       # the Rust binding, against arrow-rs's own kernels
+(cd go/arrowmetal && ARROWMETAL_LIB=$PWD/../../.build/release/libArrowMetalC.dylib go test ./...)  # the Go binding
+(cd go/arrowmetal && ARROWMETAL_LIB=$PWD/../../.build/release/libArrowMetalC.dylib GOEXPERIMENT=cgocheck2 go test -count=1 ./...)  # and with the cgo pointer checker
 ```
 
 The Rust suite finds `libArrowMetalC.dylib` in `.build/release` on its own; from outside the

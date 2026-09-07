@@ -1,0 +1,534 @@
+package arrowmetal
+
+/*
+#cgo CFLAGS: -I${SRCDIR}
+#include <stdlib.h>
+#include <string.h>
+#include "amshim.h"
+*/
+import "C"
+
+import (
+	"fmt"
+	"math"
+	"runtime"
+	"unsafe"
+)
+
+// ScalarKind says which field of a Scalar the ABI filled in.
+type ScalarKind int
+
+const (
+	KindInt64   ScalarKind = 0
+	KindUint64  ScalarKind = 1
+	KindFloat64 ScalarKind = 2
+)
+
+// Scalar is the result of a reduction. Valid is false when there was no value to answer with, which
+// is Arrow's null: an empty array, or an array whose every element is null.
+type Scalar struct {
+	Kind  ScalarKind
+	Valid bool
+
+	i int64   // int64 or uint64 (reinterpreted) result
+	f float64 // float64 result
+}
+
+// Int64 returns the value as an int64 whatever kind it is.
+func (s Scalar) Int64() int64 {
+	switch s.Kind {
+	case KindFloat64:
+		return int64(s.f)
+	default:
+		return s.i
+	}
+}
+
+// Uint64 returns the value as a uint64 whatever kind it is.
+func (s Scalar) Uint64() uint64 {
+	switch s.Kind {
+	case KindFloat64:
+		return uint64(s.f)
+	default:
+		return uint64(s.i)
+	}
+}
+
+// Float64 returns the value as a float64 whatever kind it is. An invalid scalar is NaN.
+func (s Scalar) Float64() float64 {
+	if !s.Valid {
+		return math.NaN()
+	}
+	switch s.Kind {
+	case KindFloat64:
+		return s.f
+	case KindUint64:
+		return float64(uint64(s.i))
+	default:
+		return float64(s.i)
+	}
+}
+
+func (s Scalar) String() string {
+	if !s.Valid {
+		return "null"
+	}
+	switch s.Kind {
+	case KindFloat64:
+		return fmt.Sprintf("%v", s.f)
+	case KindUint64:
+		return fmt.Sprintf("%v", uint64(s.i))
+	default:
+		return fmt.Sprintf("%v", s.i)
+	}
+}
+
+const (
+	opSum  = 0
+	opMin  = 1
+	opMax  = 2
+	opMean = 3
+)
+
+func (a *Array) reduce(name string, op C.int) (Scalar, error) {
+	h, err := a.ptr()
+	if err != nil {
+		return Scalar{}, err
+	}
+	defer runtime.KeepAlive(a)
+	var oi C.int64_t
+	var of C.double
+	var kind, isNull C.int
+	if err := call(name, func() C.int {
+		return C.amx_reduce(h, op, &oi, &of, &kind, &isNull)
+	}); err != nil {
+		return Scalar{}, err
+	}
+	return Scalar{Kind: ScalarKind(kind), Valid: isNull == 0, i: int64(oi), f: float64(of)}, nil
+}
+
+// Sum is Arrow's `sum`: nulls are skipped, and an all-null or empty array gives an invalid Scalar.
+// Integer columns accumulate in 64 bits and wrap; float32 accumulates in float64, as Arrow does.
+func (a *Array) Sum() (Scalar, error) { return a.reduce("am_reduce(sum)", opSum) }
+
+// Min is Arrow's `min`. NaN is skipped; an all-NaN column reports invalid.
+func (a *Array) Min() (Scalar, error) { return a.reduce("am_reduce(min)", opMin) }
+
+// Max is Arrow's `max`, with the same NaN rule as Min.
+func (a *Array) Max() (Scalar, error) { return a.reduce("am_reduce(max)", opMax) }
+
+// Mean is Arrow's `mean`: the float64 average of the non-null values.
+func (a *Array) Mean() (Scalar, error) { return a.reduce("am_reduce(mean)", opMean) }
+
+// CmpOp selects a comparison for CompareScalar and CompareArray.
+type CmpOp int
+
+const (
+	Eq CmpOp = 0
+	Ne CmpOp = 1
+	Lt CmpOp = 2
+	Le CmpOp = 3
+	Gt CmpOp = 4
+	Ge CmpOp = 5
+)
+
+func (o CmpOp) String() string {
+	switch o {
+	case Eq:
+		return "eq"
+	case Ne:
+		return "ne"
+	case Lt:
+		return "lt"
+	case Le:
+		return "le"
+	case Gt:
+		return "gt"
+	case Ge:
+		return "ge"
+	}
+	return fmt.Sprintf("CmpOp(%d)", int(o))
+}
+
+// arrowTypeName spells out an Arrow C Data Interface format string for error messages.
+func arrowTypeName(format string) string {
+	switch format {
+	case "c":
+		return "int8"
+	case "C":
+		return "uint8"
+	case "s":
+		return "int16"
+	case "S":
+		return "uint16"
+	case "i":
+		return "int32"
+	case "I":
+		return "uint32"
+	case "l":
+		return "int64"
+	case "L":
+		return "uint64"
+	case "f":
+		return "float32"
+	case "g":
+		return "float64"
+	case "b":
+		return "boolean"
+	}
+	return "format " + format
+}
+
+// scalarBytes writes v into freshly malloc'd C memory in the element type named by the Arrow format
+// string, which is what the ABI expects for every `const void* scalar` argument. The caller frees it.
+//
+// The value is range-checked against the element type first. The ABI takes a bare `const void*` and
+// reads it as the column's own type, so an unchecked int64(1000) against an int8 column would be
+// truncated to -24 and compared against that, silently and wrongly.
+func scalarBytes(format string, v any) (unsafe.Pointer, error) {
+	typeErr := func() (unsafe.Pointer, error) {
+		return nil, fmt.Errorf("arrowmetal: a scalar of Go type %T cannot be compared against an "+
+			"array of Arrow type %q (%s)", v, format, arrowTypeName(format))
+	}
+	rangeErr := func() (unsafe.Pointer, error) {
+		return nil, fmt.Errorf("arrowmetal: scalar %v does not fit an array of Arrow type %q (%s)",
+			v, format, arrowTypeName(format))
+	}
+
+	// Classify the Go value once. A Go `int` is offered to every width; the rest keep their kind, so
+	// that a uint64 above MaxInt64 is not quietly reinterpreted as a negative number.
+	var (
+		si   int64
+		ui   uint64
+		fl   float64
+		bv   bool
+		isSI bool
+		isUI bool
+		isFl bool
+		isBv bool
+	)
+	switch x := v.(type) {
+	case int:
+		si, isSI = int64(x), true
+	case int8:
+		si, isSI = int64(x), true
+	case int16:
+		si, isSI = int64(x), true
+	case int32:
+		si, isSI = int64(x), true
+	case int64:
+		si, isSI = x, true
+	case uint:
+		ui, isUI = uint64(x), true
+	case uint8:
+		ui, isUI = uint64(x), true
+	case uint16:
+		ui, isUI = uint64(x), true
+	case uint32:
+		ui, isUI = uint64(x), true
+	case uint64:
+		ui, isUI = x, true
+	case float32:
+		fl, isFl = float64(x), true
+	case float64:
+		fl, isFl = x, true
+	case bool:
+		bv, isBv = x, true
+	}
+
+	alloc := func(n C.size_t) unsafe.Pointer { return C.calloc(1, n) }
+
+	switch format {
+	case "c", "C", "s", "S", "i", "I", "l", "L":
+		bits := map[string]uint{"c": 8, "C": 8, "s": 16, "S": 16, "i": 32, "I": 32, "l": 64, "L": 64}[format]
+		isSigned := format == "c" || format == "s" || format == "i" || format == "l"
+
+		var out uint64 // the bits to store, already narrowed
+		if isSigned {
+			lo, hi := int64(-1)<<(bits-1), int64(1)<<(bits-1)-1
+			switch {
+			case isSI:
+				if si < lo || si > hi {
+					return rangeErr()
+				}
+				out = uint64(si)
+			case isUI:
+				if ui > uint64(hi) {
+					return rangeErr()
+				}
+				out = ui
+			default:
+				return typeErr()
+			}
+		} else {
+			hi := ^uint64(0) >> (64 - bits)
+			switch {
+			case isUI:
+				if ui > hi {
+					return rangeErr()
+				}
+				out = ui
+			case isSI:
+				if si < 0 || uint64(si) > hi {
+					return rangeErr()
+				}
+				out = uint64(si)
+			default:
+				return typeErr()
+			}
+		}
+
+		p := alloc(C.size_t(bits / 8))
+		switch bits {
+		case 8:
+			*(*uint8)(p) = uint8(out)
+		case 16:
+			*(*uint16)(p) = uint16(out)
+		case 32:
+			*(*uint32)(p) = uint32(out)
+		default:
+			*(*uint64)(p) = out
+		}
+		return p, nil
+
+	case "f", "g": // float32, float64
+		// Ordinary rounding is fine and expected: 0.1 against a float32 column compares against
+		// float32(0.1), which is what every Arrow implementation does. What is refused here is a
+		// conversion that changes the *class* of the value — a finite number becoming infinite or
+		// zero, or an integer landing on a different integer — because then the comparison answers
+		// about a value the caller never named.
+		// Every integer up to the mantissa width is exact; past it, consecutive integers share a
+		// float and the scalar would land on a neighbour. The limit is stated rather than
+		// round-tripped through a conversion, because float-to-int conversion is undefined in Go
+		// once the value leaves the integer type's range.
+		exactInts := int64(1) << 53 // float64
+		if format == "f" {
+			exactInts = int64(1) << 24 // float32
+		}
+		var x float64
+		switch {
+		case isFl:
+			x = fl
+		case isSI:
+			if si > exactInts || si < -exactInts {
+				return rangeErr()
+			}
+			x = float64(si)
+		case isUI:
+			if ui > uint64(exactInts) {
+				return rangeErr()
+			}
+			x = float64(ui)
+		default:
+			return typeErr()
+		}
+		if format == "f" {
+			f32 := float32(x)
+			if !math.IsInf(x, 0) && !math.IsNaN(x) {
+				// Overflow: a finite value too large for float32 becomes ±Inf.
+				if math.IsInf(float64(f32), 0) {
+					return rangeErr()
+				}
+				// Underflow: a non-zero value too small for float32 becomes 0, so `Eq 5e-46` would
+				// silently ask about zero and match every zero in the column.
+				if f32 == 0 && x != 0 {
+					return rangeErr()
+				}
+			}
+			p := alloc(4)
+			*(*float32)(p) = f32
+			return p, nil
+		}
+		p := alloc(8)
+		*(*float64)(p) = x
+		return p, nil
+
+	case "b": // boolean: one byte, non-zero is true
+		if !isBv {
+			return typeErr()
+		}
+		p := alloc(1)
+		if bv {
+			*(*uint8)(p) = 1
+		}
+		return p, nil
+	}
+	return nil, fmt.Errorf("arrowmetal: scalar comparison is not wrapped for Arrow type %q", format)
+}
+
+// CompareScalar compares every element against v and returns a boolean mask.
+//
+// v may be any Go numeric type (or bool for a boolean column); it is range-checked against the
+// column's element type and a value that does not fit is an error naming both, never a truncation.
+// A plain `int` therefore works for any integer width as long as the value fits. Nulls in the input
+// stay null in the mask, as they do in Arrow.
+func (a *Array) CompareScalar(op CmpOp, v any) (*Array, error) {
+	h, err := a.ptr()
+	if err != nil {
+		return nil, err
+	}
+	defer runtime.KeepAlive(a)
+	sp, err := scalarBytes(a.Format(), v)
+	if err != nil {
+		return nil, err
+	}
+	defer C.free(sp)
+	var out *C.am_array
+	if err := call("am_compare_scalar("+op.String()+")", func() C.int {
+		return C.amx_compare_scalar(h, C.int(op), sp, &out)
+	}); err != nil {
+		return nil, err
+	}
+	return wrap(out), nil
+}
+
+// CompareArray compares two arrays of the same type and length element by element.
+func (a *Array) CompareArray(op CmpOp, b *Array) (*Array, error) {
+	h, err := a.ptr()
+	if err != nil {
+		return nil, err
+	}
+	defer runtime.KeepAlive(a)
+	hb, err := b.ptr()
+	if err != nil {
+		return nil, err
+	}
+	defer runtime.KeepAlive(b)
+	var out *C.am_array
+	if err := call("am_compare_array("+op.String()+")", func() C.int {
+		return C.amx_compare_array(h, C.int(op), hb, &out)
+	}); err != nil {
+		return nil, err
+	}
+	return wrap(out), nil
+}
+
+// Filter keeps the elements where mask is true. mask must be a boolean array of the same length; a
+// null in the mask drops the element, which is Arrow's "drop" null-selection behaviour.
+func (a *Array) Filter(mask *Array) (*Array, error) {
+	h, err := a.ptr()
+	if err != nil {
+		return nil, err
+	}
+	defer runtime.KeepAlive(a)
+	hm, err := mask.ptr()
+	if err != nil {
+		return nil, err
+	}
+	defer runtime.KeepAlive(mask)
+	var out *C.am_array
+	if err := call("am_filter", func() C.int { return C.amx_filter(h, hm, &out) }); err != nil {
+		return nil, err
+	}
+	return wrap(out), nil
+}
+
+// Take gathers a[i] for each i in indices, which must be an int32 array. A null index gives a null
+// element.
+func (a *Array) Take(indices *Array) (*Array, error) {
+	h, err := a.ptr()
+	if err != nil {
+		return nil, err
+	}
+	defer runtime.KeepAlive(a)
+	hi, err := indices.ptr()
+	if err != nil {
+		return nil, err
+	}
+	defer runtime.KeepAlive(indices)
+	var out *C.am_array
+	if err := call("am_take", func() C.int { return C.amx_take(h, hi, &out) }); err != nil {
+		return nil, err
+	}
+	return wrap(out), nil
+}
+
+// Argsort returns the int32 indices that order the array. The sort is stable, nulls come last, and
+// NaN sorts after +Inf — in both directions: descending does not mirror nulls and NaN to the front.
+func (a *Array) Argsort(descending bool) (*Array, error) {
+	h, err := a.ptr()
+	if err != nil {
+		return nil, err
+	}
+	defer runtime.KeepAlive(a)
+	var out *C.am_array
+	if err := call("am_argsort", func() C.int { return C.amx_argsort(h, cbool(descending), &out) }); err != nil {
+		return nil, err
+	}
+	return wrap(out), nil
+}
+
+// Sort returns a sorted copy of the array, with the ordering Argsort documents.
+func (a *Array) Sort(descending bool) (*Array, error) {
+	h, err := a.ptr()
+	if err != nil {
+		return nil, err
+	}
+	defer runtime.KeepAlive(a)
+	var out *C.am_array
+	if err := call("am_sort", func() C.int { return C.amx_sort(h, cbool(descending), &out) }); err != nil {
+		return nil, err
+	}
+	return wrap(out), nil
+}
+
+// Lexsort returns the int32 indices ordering the rows by each column in turn, the first column being
+// the most significant. descending may be nil for all-ascending, otherwise one entry per column.
+func Lexsort(columns []*Array, descending []bool) (*Array, error) {
+	if err := Init(); err != nil {
+		return nil, err
+	}
+	if len(columns) == 0 {
+		return nil, fmt.Errorf("arrowmetal: Lexsort needs at least one column")
+	}
+	if descending != nil && len(descending) != len(columns) {
+		return nil, fmt.Errorf("arrowmetal: Lexsort: %d columns but %d descending flags",
+			len(columns), len(descending))
+	}
+	hs, free, err := handleVec(columns)
+	if err != nil {
+		return nil, err
+	}
+	defer free()
+	defer runtime.KeepAlive(columns)
+	var dp *C.int
+	if descending != nil {
+		d := (*C.int)(C.calloc(C.size_t(len(descending)), C.sizeof_int))
+		defer C.free(unsafe.Pointer(d))
+		ds := unsafe.Slice(d, len(descending))
+		for i, v := range descending {
+			ds[i] = cbool(v)
+		}
+		dp = d
+	}
+	var out *C.am_array
+	if err := call("am_lexsort", func() C.int {
+		return C.amx_lexsort(hs, dp, C.int64_t(len(columns)), &out)
+	}); err != nil {
+		return nil, err
+	}
+	return wrap(out), nil
+}
+
+func cbool(b bool) C.int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// handleVec copies the handles into a C array, which is what the ABI's `am_array**` arguments want.
+func handleVec(arrays []*Array) (**C.am_array, func(), error) {
+	n := len(arrays)
+	p := (**C.am_array)(C.calloc(C.size_t(n), C.size_t(unsafe.Sizeof((*C.am_array)(nil)))))
+	s := unsafe.Slice(p, n)
+	for i, a := range arrays {
+		h, err := a.ptr()
+		if err != nil {
+			C.free(unsafe.Pointer(p))
+			return nil, nil, fmt.Errorf("arrowmetal: column %d: %w", i, err)
+		}
+		s[i] = h
+	}
+	return p, func() { C.free(unsafe.Pointer(p)) }, nil
+}
