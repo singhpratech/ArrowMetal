@@ -154,17 +154,42 @@ extension MetalArray {
             nullIdx = try rows.filter(try isNull())
         }
 
-        // Where does output position `pivot` land? nil means "inside the null block", where any
-        // arrangement of the values is already correct.
+        // A NaN travels with the nulls, not with the values: Arrow's `PartitionNthToIndices` sends
+        // both to `null_placement`'s end, and `argsort` above does the same. `.atEnd` needs no move —
+        // the ascending keys already leave the NaNs at the tail of the value block, just before the
+        // nulls — so only `.atStart` pays for the scan, and only for a float column.
+        var nanIdx: MetalArray<Int32>? = nil
+        var nans = 0
+        if nullPlacement == .atStart, T.isFloatingPoint {
+            var nanRows: [Int32] = [], valueRows: [Int32] = []
+            withExtendedLifetime(self) {
+                let p = valuePointer, bm = validity?.typed(UInt8.self)
+                for i in 0..<n {
+                    if let bm, !Bitmap.isSet(bm, i) { continue }
+                    if p[i] != p[i] { nanRows.append(Int32(i)) } else { valueRows.append(Int32(i)) }
+                }
+            }
+            if !nanRows.isEmpty {
+                nans = nanRows.count
+                nanIdx = try MetalArray<Int32>(nanRows, context: ctx)
+                validIdx = try MetalArray<Int32>(valueRows, context: ctx)
+            }
+        }
+        let values = m - nans
+
+        // Where does output position `pivot` land? nil means "inside the null (or NaN) block", where
+        // any arrangement of the values is already correct.
         let rank: Int?
         switch nullPlacement {
         case .atEnd: rank = pivot < m ? pivot : nil
-        case .atStart: rank = (pivot >= nulls && pivot - nulls < m) ? pivot - nulls : nil
+        case .atStart:
+            let front = nulls + nans
+            rank = (pivot >= front && pivot - front < values) ? pivot - front : nil
         }
 
         var blocks: [MetalArray<Int32>]
         if let rank {
-            let selKeys = nulls > 0 ? try keys.take(validIdx) : keys
+            let selKeys = (nulls > 0 || nans > 0) ? try keys.take(validIdx) : keys
             let threshold = try PartitionNth.select(selKeys, rank: rank)
             let lower = try validIdx.filter(try selKeys.compare(.lt, threshold))
             let equal = try validIdx.filter(try selKeys.compare(.eq, threshold))
@@ -173,6 +198,8 @@ extension MetalArray {
         } else {
             blocks = [validIdx]
         }
+        // Front to back for `.atStart`: nulls, then the NaNs, then the values — `argsort`'s own order.
+        if let nanIdx { blocks.insert(nanIdx, at: 0) }
         if let nullIdx {
             if nullPlacement == .atStart { blocks.insert(nullIdx, at: 0) } else { blocks.append(nullIdx) }
         }
