@@ -339,7 +339,10 @@ single-pass float operation stays in pandas there.
   whichever `__getitem__` CPython first saw — an interpreter-level artifact of repeatedly rewriting a
   dunder. Use `accel.disabled()` to turn the layer off for a block instead.
 - **Threads.** The wrappers are re-entrancy-guarded per thread, but the GPU queue underneath is a
-  single device queue; several Python threads calling into it will serialise.
+  single device queue; several Python threads calling into it will serialise. `disabled()`,
+  `set_threshold()` and `route_all()` are **process-wide**, not per thread: while one thread is
+  inside a `disabled()` block every thread runs in pandas. The answers do not change — only where
+  the work happens, and those calls land in neither `stats().gpu` nor `stats().cpu`.
 
 ## Tests
 
