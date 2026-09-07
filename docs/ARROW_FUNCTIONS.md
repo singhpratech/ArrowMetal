@@ -47,11 +47,14 @@ if it says `gpu`, `cpu` or `partial`, a test called it this run.
 | **Pending** | Reserved for a name landing on an unmerged branch. No row carries it today. |
 
 Precision is recorded, not glossed. Three families of float difference exist and the note on each row
-names the one that applies: a float32 evaluation of a float64 column (about 1e-7 relative — Metal has
-no `double` transcendentals, so `exp`, the plain logarithms, `sqrt` and `power` widen a `float`
-result); the software binary64 routines (within 5 ulp of the host libm — the trigonometric family,
-`expm1`, `log1p`, `logb`, `hypot`); and the grouped moments, whose deviations are formed in float32
-about a float64 mean (about 1e-5 relative).
+names the one that applies. **float32 columns** run Metal's own library functions, measured at 3-4 ulp
+against the host libm for the trigonometric and hyperbolic families (`expm1` is the outlier, ~4 ulp for
+small |x| and ~16 at |x| ~ 20, where it inherits MSL `exp`). **float64 columns** run software binary64 on the GPU rather than a widened
+`float`: `sqrt` and the four arithmetic operations are correctly rounded, `exp` / `ln` / `log2` /
+`log10` / `power` measure 1 ulp over 10^6 inputs each against a 2-ulp bound the tests assert, and the
+trigonometric family, `expm1`, `log1p`, `logb` and `hypot` are within 5. **The grouped moments**
+(`hash_variance`, `hash_stddev`, `hash_skew`, `hash_kurtosis`) form their deviations about the group
+mean in binary64 too — worst relative error 1.9e-16 on the adversarial case in `docs/DESIGN.md`.
 
 ## Regenerating this file
 

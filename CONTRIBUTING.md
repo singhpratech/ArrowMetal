@@ -3,15 +3,17 @@
 Thanks for looking. This project is small enough to hold in your head; please keep it that way.
 
 ## Ground rules
-- Every kernel has a CPU reference in `Sources/ArrowMetal/CPUReference.swift` and a test that compares the
-  GPU result to it across sizes 0, 1, word boundaries (31/32/33), threadgroup boundaries (255/256/257,
-  8191/8192/8193) and something large. Add both when you add a kernel.
+- Every kernel is tested against a CPU oracle — the plain-Swift implementations in
+  `Sources/ArrowMetal/CPUReference.swift`, a hand-computed vector, or a `pyarrow.compute` answer pinned
+  as a literal — across sizes 0, 1, word boundaries (31/32/33), threadgroup boundaries (255/256/257,
+  8191/8192/8193) and something large. Add both the oracle and the test when you add a kernel.
 - Follow Arrow semantics (nulls, wrapping arithmetic, bit order). When Arrow has a documented behaviour,
   match it; when it does not, document what you chose.
-- Kernels are MSL strings in `Sources/ArrowMetal/Kernels/KernelSource.swift`, generated per element type.
+- Kernels are MSL strings in the `*Source.swift` files under `Sources/ArrowMetal/Kernels/`
+  (`KernelSource.swift` holds the element-wise family; there are 47 of them), generated per element type.
   Keep them readable; a slower obvious kernel beats a clever one until a benchmark says otherwise.
 - Run `swift test` in **both** debug and release (`swift test -c release`). We have already hit one
-  release-only miscompile (see the comment in `MetalArray.init(_:[T])`).
+  release-only miscompile (see the comment at `Sources/ArrowMetal/MetalArray.swift:283`).
 - Run `swift run -c release arrowmetal-bench` before and after a performance change and paste both tables in
   the PR.
 
@@ -28,7 +30,8 @@ XCTest needs Xcode; the library itself builds with Command Line Tools only.
 GitHub's hosted Apple silicon runners expose an "Apple Paravirtual device" whose Metal compiler fails
 sporadically, so GPU tests are skipped there (`requireRealGPU()`), and CI proves the build, interop and CPU
 paths only. Run the full suite on a real Mac before merging; set `ARROWMETAL_FORCE_GPU_TESTS=1` to run GPU
-tests on a virtual device anyway.
+tests on a virtual device anyway. `.github/workflows/ci.yml` therefore runs on pull requests and by hand
+(`workflow_dispatch`), not on every push.
 
 ## Debugging GPU kernels
 - `ARROWMETAL_DEBUG_SHADERS=1` dumps the generated MSL and the full compiler log when a shader or pipeline fails.
@@ -37,4 +40,5 @@ tests on a virtual device anyway.
   `KernelSource.<family>(T:)` to see it.
 
 ## Pull requests
-Small and focused. One kernel or one feature per PR. Update `ROADMAP.md` if you finish an item.
+Small and focused. One kernel or one feature per PR. Update [docs/ROADMAP.md](docs/ROADMAP.md) if you
+finish an item.

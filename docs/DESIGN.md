@@ -15,13 +15,20 @@ Swift apps ───────────────────────
                                        Metal shared-memory buffers (page aligned, unified memory)
 ```
 - **Buffers** are the Arrow columnar layout verbatim: validity bitmap + values (+ offsets later). The same bytes
-  serve CPU consumers (C Data Interface) and GPU kernels (C Device Interface) with no copies.
+  serve CPU consumers (C Data Interface) and GPU kernels (C Device Interface): copy-free out always, and
+  copy-free in when the producer's buffers are page aligned — one copy otherwise, which the importer
+  reports (`ImportResult.zeroCopy`).
 - **Kernels** never assume a length multiple of anything: every buffer is padded to a page so trailing
   32-bit bitmap words are readable; kernels bounds-check the last word/element.
 - **Nulls** ride along as bitmaps. Element-wise ops share the input's validity buffer (zero-copy); binary ops
   AND the two bitmaps on the GPU; compaction repacks.
 
 ## Where the time goes today (M4 Max, 50M rows)
+
+Source: `swift run -c release arrowmetal-bench`, recorded 2026-09-06 on the Apple M4 Max (16 cores,
+64 GB unified memory, Darwin 25.6.0) that every table on this page was measured on; the dated rounds
+are in [BENCHMARKS.md](BENCHMARKS.md).
+
 | Kernel | Passes over data | Achieved | Bound |
 |---|---|---:|---|
 | sum / min / max | 1 read | 290-375 GB/s | memory |
@@ -80,7 +87,7 @@ order, same null semantics (a null key still forms its own group, id `K`) — wh
 `Tests/ArrowMetalTests/StringHashTableTests.swift` asserts, case by case, against both the host hash map
 and the old path.
 
-### Measured (M4 Max, 50M rows, 12-byte utf8 keys, best of 5)
+### Measured (M4 Max, 50M rows, 12-byte utf8 keys, best of 5), 2026-09-06
 
 Group-by sum over a utf8 key column, key mapping included. Metal from Swift; Polars 1.44 (16 threads),
 pyarrow 25 and the 16-core Swift hash group-by on the same buffers.
@@ -133,7 +140,7 @@ The threshold is `1 << 16` rows: below it the sort is a handful of small passes 
 round trips do not pay for themselves. `ARROWMETAL_NO_HASH=1` forces the sort path in a shipping binary,
 which is how the before column below was measured.
 
-M4 Max, 50M `int64` rows, Swift, best of 3:
+M4 Max, 50M `int64` rows, Swift, best of 3, 2026-09-06 (the "before" column with `ARROWMETAL_NO_HASH=1`):
 
 | function | distinct | before (sort) | **after (hash table)** |
 |---|---|---:|---:|
@@ -143,7 +150,8 @@ M4 Max, 50M `int64` rows, Swift, best of 3:
 | `mode` | 1,000 / 100k / 10M | 142.2 / 199.7 / 278.0 | **13.9 / 17.9 / 121.6** |
 | `dictionary_encode` | 1,000 / 100k / 10M | 162.3 / 295.5 / 277.2 | **12.8 / 16.5 / 108.2** |
 
-Against the CPU libraries on the same buffers, called from Python (50M rows, best of 3, ms):
+Against the CPU libraries on the same buffers, called from Python through
+`Benchmarks/python_gpu_bench.py` (M4 Max, 50M rows, best of 3, ms, 2026-09-06):
 
 | function | distinct | ArrowMetal | Polars | pyarrow | vs the best of them |
 |---|---|---:|---:|---:|---:|
@@ -217,7 +225,7 @@ off. The Float32 deviations this replaced cost about 1e-5.
 Finalizers write the output column and its validity **on the GPU**. A Swift loop over the group count is
 invisible at a thousand groups and is the whole cost at ten million.
 
-### Before and after (Apple M4 Max, best of five, 10M rows, one `group_by` per call)
+### Before and after (Apple M4 Max, best of five, 10M rows, one `group_by` per call), 2026-09-06
 
 | grouped aggregate | groups | before | after | change |
 |---|---:|---:|---:|---:|
@@ -278,9 +286,10 @@ accumulates with `d_add`; arithmetic kernels run one element per thread. `d_div`
 seeded by one hardware `float` division, with the exact 128-bit remainder `N - q·D` settling the last
 bit; `d_sqrt` extracts the root digit by digit in integers. Both are correctly rounded rather than close,
 and `DoubleMathTests` holds them to Swift's own `Double` bit for bit. `add` and `multiply` run at this
-machine's memory ceiling (≈390 GB/s at 50M rows) and `divide` within 15% of it (331 GB/s), so no Float64
-column ever falls back to the CPU and the software arithmetic is all but invisible in a bandwidth-bound
-query.
+machine's memory ceiling (≈390 GB/s at 50M rows) and `divide` within 15% of it (331 GB/s), so the
+software arithmetic is all but invisible in a bandwidth-bound query. `cast` is the one float64 path that
+still runs on the host, and `modulo` is the one binary operator with no float64 kernel — both say so in
+[COVERAGE.md](COVERAGE.md).
 
 The transcendentals are a different story, and worth being explicit about. `Kernels/DoubleTranscendental.swift`
 (`expm1`, `log1p`, `logb`, `hypot`, the ten `RoundMode`s) and `Kernels/DoublePower.swift` (`exp`, `ln`,
@@ -295,11 +304,13 @@ three logarithms fall out of the same reduction, more accurately than a direct s
 
 Accuracy is measured, not derived. `DoubleTranscendentalTests` compares each function with Foundation
 over 10⁶ random inputs drawn across its whole domain and prints the ulp histogram; these are those
-numbers:
+numbers, measured 2026-09-06. The **measured** column is what the run reports; the test asserts a
+2-ulp bound on everything but `sqrt`, which it holds to bit equality, so a regression of one ulp shows
+up as a changed number here before it fails the suite.
 
 | function | domain sampled                                        | max ulp |
 |----------|-------------------------------------------------------|---------|
-| `sqrt`   | every finite positive bit pattern, subnormals included | **0** (bit-identical) |
+| `sqrt`   | 10⁶ random positive bit patterns drawn uniformly over the exponent range as well as the significand — subnormals, 1e-320 and 1e308 included — plus the perfect squares, their neighbours, every binade and the subnormal range in `testSqrtIsCorrectlyRoundedOnAdversarialInputs` | **0** (bit-identical) |
 | `exp`    | -745.2 to 709.78, plus the subnormal-result and near-overflow edges | 1 |
 | `ln`     | 5e-324 to 1.8e308, plus near 1 and the subnormals      | 1       |
 | `log2`   | same                                                   | 1       |
@@ -423,7 +434,7 @@ The crossover at 2^19 rows is where radix select's two passes plus one host read
 selection dispatch. Below it the per-threadgroup kernel is one command buffer; above it, it is bandwidth that
 matters and radix select reads the column at close to peak.
 
-### Numbers (M4 Max, 50M rows, best of 5)
+### Numbers (M4 Max, 50M rows, best of 5), 2026-09-06
 
 Called from Python on the same in-process data (`PYTHONPATH=python python Benchmarks/python_gpu_bench.py
 50000000 5`), against pyarrow 25, Polars 1.44 (16 threads) and numpy 2.5. Wall ms.
@@ -455,23 +466,35 @@ The radix sort's block size is also now adaptive below ~256k rows: a fixed 4096 
 ~256k rows are unaffected, so the 50M argsort is unchanged.
 
 ## Roadmap for "no room left"
-1. **Pipelined execution** (above). Biggest win for query-shaped work and for Python callers.
-2. **Fused expressions**: `filter(where:)` already fuses predicate + compaction. Next: `sum(where:)`,
-   `groupBy.sum(where:)`, arithmetic chains compiled into one kernel from an expression tree.
+
+This is the throughput list this page keeps; the project roadmap is [ROADMAP.md](ROADMAP.md). Four of
+the items it opened with have since landed and are struck through rather than deleted, so a reader can
+see what the design note predicted and where it went.
+
+1. **Pipelined execution** (above). Biggest win for query-shaped work and for Python callers. Still open.
+2. ~~**Fused expressions**~~ — done: `Sources/ArrowMetal/Expr` compiles a whole expression DAG into one
+   runtime-generated MSL kernel, and filter + aggregate, project and dense-key group-by fuse into one
+   dispatch ([EXPR.md](EXPR.md)).
 3. **Reductions with vector loads** (`long4`) and tuned threadgroup counts per chip family.
 4. **Filter in two passes** instead of four: compute selection + per-block counts in one kernel, then
    scatter with in-kernel decoupled look-back scan.
-5. **Strings** (`utf8`, `utf8_view`): equality, prefix, length, hash; dictionary encoding on the GPU so
-   group-by over strings maps to the dense-key path.
-6. **Sort / top-k**: radix sort on 32/64-bit keys with payload; argsort for record batches.
+5. ~~**Strings**~~ — done for `utf8` / `binary`: equality, prefix, length, hash and GPU dictionary
+   encoding, so group-by over strings maps to the dense-key path (above). `utf8_view` / `binary_view`
+   are the part still open, and are on [ROADMAP.md](ROADMAP.md#types-and-interop).
+6. ~~**Sort / top-k**~~ — done: the LSD radix sort on 32/64-bit keys with payload, `MetalRecordBatch
+   .sorted(by:)`, and the radix select above.
 7. **Hash group-by** for arbitrary keys (open addressing in device memory), feeding the same aggregators.
    Done for `utf8` / `binary` keys (above); the same table would replace the sort for float and
    wide-range integer keys, which still argsort.
-8. **Float64 sum/arithmetic** on the GPU via double-float (two `float`) arithmetic, or opt-in Float32.
+8. ~~**Float64 sum/arithmetic** on the GPU~~ — done, but not the way this line guessed: software
+   IEEE-754 binary64 (`Kernels/DoubleMath.swift`) rather than double-float or opt-in Float32, because
+   an approximate float64 would have been a support burden forever ([DECISIONS.md](DECISIONS.md)).
 9. **Binary archives** (`MTLBinaryArchive`) so the first call does not pay ~100 ms of shader compilation.
 10. **Metal 4** command encoding and residency sets for very large resident datasets.
-11. **iOS/visionOS**: the library already targets iOS 17+; add a demo app and thermal-aware sizing.
-12. **Chip matrix**: publish benchmarks for M1/M2/M3/M4 base, Pro, Max, Ultra and A17/A18.
+11. **iOS/visionOS**: the library already targets iOS 17+ (`Package.swift`); add a demo app and
+    thermal-aware sizing. Nothing has been measured on an iPhone or iPad.
+12. **Chip matrix**: publish benchmarks for M1/M2/M3/M4 base, Pro, Max, Ultra and A17/A18. Every number
+    in this repository is from one M4 Max.
 
 ## Non-goals
 - Not a query planner or SQL engine. It is the compute layer that DuckDB, DataFusion, Polars plugins or
