@@ -182,6 +182,11 @@ Fixed
   rows.
 - `list_value_length` ran at 70 GB/s: one thread per row read every offset twice and stored four bytes at
   a time. Eight rows per thread through vector loads and stores, 1.05 ms -> 0.35 ms at 10M rows.
+- `partition_nth_indices` split the column around the selected key with three `compare` + `filter`
+  compactions and a concatenation: seven command buffers, and two of its steps ran on the host — the row
+  numbers it compacted were filled by a CPU loop and the output was allocated zeroed, a write and a
+  memset over 40 MB at 10M rows. One stable counting sort over five buckets in a single command buffer
+  instead, 5.13 ms -> 3.02 ms at 10M rows and 19.8 ms -> 12.3 ms at 50M.
 - Found by the pre-release review pass, each with a regression test:
   - Expression compiler: an untyped literal that did not fit the other operand was truncated to it
     (`int8 > 200` was true for every row, `uint8 == -1` matched 255); a float literal against an integer

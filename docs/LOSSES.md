@@ -161,10 +161,36 @@ The re-measurement (`full_matrix.py --families sort,group-by,chains --sizes 1000
 
 Every grouped and chained row went back to its morning value, so those were noise; the two-key row's
 10M value is the noisiest of all (2.2–6.3 ms across four runs) and its 50M value is stable at 6.0 ms.
-**One regression is real:** `partition_nth_indices` at 10M rows costs 8.1 ms where it cost 4.9 ms
-before the radix-sort change, reproduced twice, while its 50M row is unchanged at 19.8 ms. It is still
-7x over pyarrow, but the project's rule is that a change may not make any other row slower, so it is
-open and being fixed; the row will be re-measured with the fix.
+
+**The `partition_nth_indices` row was not a regression, and the investigation of it found a real cost
+anyway.** Running the two builds alternately in one process each with `Benchmarks/loss_partition_nth.py`
+— full_matrix's columns, seed and rule, with the row measured where the matrix measures it, last in the
+sort family — the radix-sort commit moves it by nothing: 5.20 → 5.08 ms at 10M and 19.97 → 19.74 ms at
+50M. What the 4.9 against 8.1 actually tracked is *what ran before it*. `partition_nth_indices` allocated
+about 280 MB of scratch per call out of the context's buffer pool, and in a fresh process with nothing in
+front of it the pool had none of that to give: measured first in the process it cost 7.7–8.0 ms on
+**both** builds, and measured after any operation that had already allocated the big buffers it cost
+4.9–5.2 ms on both. The afternoon matrix and the re-measurement run put different work in front of the
+row, and that is the whole of the difference.
+
+The cost the investigation did find is that the operation was doing far too much work for what it is.
+The split around the selected key was three `compare` + `filter` compactions of an index array,
+concatenated afterwards — seven command buffers, three reads of the keys, three worst-case index
+arrays — and two of its steps never touched the GPU at all: the row numbers it compacted were filled by
+a host loop and the output it concatenated into was allocated zeroed, a single-threaded write and a
+memset over 40 MB at 10M rows. It is now one stable counting sort over five buckets (null, NaN, below
+the key, equal, above) in a single command buffer, and the pool sensitivity mostly goes with it:
+
+| operation | rows | before | after |
+|---|---:|---:|---:|
+| partition_nth_indices (n/2), int64 | 10,000,000 | 5.13 ms | 3.02 ms |
+| partition_nth_indices (n/2), int64 | 50,000,000 | 19.84 ms | 12.27 ms |
+| the same, measured first in a fresh process | 10,000,000 | 7.9 ms | 5.5 ms |
+
+Both builds alternated over two rounds, best of five after a warm-up, idle machine. No other row of the
+sort family moves: argsort int64 7.84 → 7.80 ms at 10M and 39.0 → 39.0 at 50M, sort float64 9.74 → 9.68
+and 49.3 → 49.4, top_k (k=100) 1.06 → 0.96 and 2.59 → 2.62, select_k_unstable 1.03 → 0.96 and
+2.63 → 2.65, lexsort 7.14 → 7.14 and 37.4 → 37.4.
 
 ## The work between the two runs, as it was designed and measured
 
