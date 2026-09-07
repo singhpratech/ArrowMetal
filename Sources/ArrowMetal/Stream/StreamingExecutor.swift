@@ -614,12 +614,23 @@ public final class StreamGroupByOperator: StreamOperator {
             if a.op == .count && a.column == nil { continue }
             guard let c else { return false }
             switch a.op {
-            case .count: continue
-            case .sum, .mean: if widen64(c) == nil { return false }
+            // `count(col)` needs the column's validity, which the accumulate reads out of the widened
+            // payload — unless the column has no nulls at all, when counting rows is counting values.
+            case .count: if c.nullCount != 0 && !canWiden64(c) { return false }
+            case .sum, .mean: if !canWiden64(c) { return false }
             default: return false
             }
         }
         return true
+    }
+
+    /// Whether `widen64` has a 64-bit integer payload for this column type. A type test only: it must
+    /// not record a cast, because it runs on every batch to choose a path.
+    private func canWiden64(_ c: AnyMetalArray) -> Bool {
+        switch c {
+        case .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .temporal: return true
+        default: return false
+        }
     }
 
     /// An integer or temporal value column as the 64-bit payload the row-level accumulate adds, in
@@ -845,6 +856,7 @@ public final class StreamGroupByOperator: StreamOperator {
     ///   distinct slots with no atomics. That is the path a float64 sum takes, and it still never
     ///   sorts the key column: the resident table is the dictionary.
     private func mergeRows(_ r: ResidentRowPartial) throws {
+        guard r.keys.length > 0 else { return }
         let table = try residentTableForMerge()
         if r.atomic {
             var rows: [StreamGroupTable.RowAggregate] = []
@@ -854,8 +866,10 @@ public final class StreamGroupByOperator: StreamOperator {
                 case .count where a.column == nil:
                     spec.count = .allRows
                 case .count:
-                    spec.count = .nonNullValues
-                    spec.column = widen64(c!)
+                    // `rowAtomicEligible` let this through either because the column widens (so its
+                    // validity comes along) or because it has no nulls, when every row is a value.
+                    if let w = widen64(c!) { spec.count = .nonNullValues; spec.column = w }
+                    else { spec.count = .allRows }
                 case .sum, .mean:
                     spec.count = .nonNullValues
                     let w = widen64(c!)

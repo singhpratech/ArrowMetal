@@ -297,6 +297,42 @@ final class StreamGroupProbeTests: XCTestCase {
                        try run(bs, Self.floatAggs, .distinct), "skewed run")
     }
 
+    /// `count(col)` over columns the atomic accumulate cannot widen — a nullable string, a float64 —
+    /// still has to count Arrow's way. A column with no nulls counts every row; one with nulls that
+    /// does not widen sends the batch down the dense branch instead.
+    func testCountOverColumnsTheAtomicPathCannotWiden() throws {
+        try requireRealGPU()
+        var batches: [MetalRecordBatch] = []
+        for b in 0..<12 {
+            let n = 4_000
+            var keys: [Int64?] = [], amounts: [Double?] = [], labels: [String?] = [], solid: [Double?] = []
+            for i in 0..<n {
+                let g = b * n + i
+                keys.append(g % 37 == 5 ? nil : Int64(g &* 2_654_435_761))
+                amounts.append(g % 5 == 1 ? nil : Double(g) * 0.5)
+                labels.append(g % 3 == 2 ? nil : "label-\(g % 97)")
+                solid.append(Double(g))                       // never null
+            }
+            batches.append(try MetalRecordBatch(names: ["key", "amount", "label", "solid"], columns: [
+                .int64(try MetalArray<Int64>(keys)),
+                .float64(try MetalArray<Double>(amounts)),
+                .string(try MetalStringArray(labels)),
+                .float64(try MetalArray<Double>(solid)),
+            ]))
+        }
+        let aggs = [StreamAggregate(.count, "amount", name: "ca"),
+                    StreamAggregate(.count, "label", name: "cl"),
+                    StreamAggregate(.count, "solid", name: "cs"),
+                    StreamAggregate(.count, nil, name: "n")]
+        let host = try run(batches, aggs, .host)
+        try expectSame(try run(batches, aggs, .rowAtomic), host, "count over unwidenable columns")
+        try expectSame(try run(batches, aggs, .rowDense), host, "count over unwidenable columns, dense")
+        // The same aggregates over a column with no nulls at all take the atomic branch.
+        let solidOnly = [StreamAggregate(.count, "solid", name: "cs"), StreamAggregate(.count, nil, name: "n")]
+        try expectSame(try run(batches, solidOnly, .rowAtomic),
+                       try run(batches, solidOnly, .host), "count over a column with no nulls")
+    }
+
     // MARK: - The chooser
 
     /// A dense key column keeps the per-batch encoding; a sparse one takes the row path. Both are

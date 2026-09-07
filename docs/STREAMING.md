@@ -141,7 +141,7 @@ the source of record, Parquet arrives through `scan_arrow(pyarrow.dataset(...))`
 | `variance`, `stddev` | **exact** | decomposed to `sum(x)`, `sum(x·x)` in float64 and `count`, all in one fused kernel | combine | 3 scalars |
 | `count_distinct_approx` | **approximate** — relative standard error `1.04 / sqrt(2^p)`: 0.81 % at the default p = 14, 0.41 % at p = 16 | a new HyperLogLog kernel: one `atomic_fetch_max` per row into a `2^p`-register table | element-wise max of two register arrays | `2^p` bytes (16 KB at p = 14), whatever the dataset's size |
 | `group_by` (dense integer key) | **exact** | `GroupBy` per batch, then element-wise `add` / `min` / `max` folds the batch result into the **GPU-resident** global table | none | `K` accumulators per aggregate on the GPU; spills to the host table above `gpuStateBudgetBytes` (512 MB default) |
-| `group_by` (one integer key, `sum` / `count` / `mean`) | **exact** | `GroupByKeys` per batch, then three kernels fold that batch's group list into the **GPU-resident** hash table (§4.1) | **none** | one slot per distinct key on the GPU |
+| `group_by` (one integer key, `sum` / `count` / `mean`) | **exact** | a dense key encodes per batch and folds into the **GPU-resident** hash table; a **sparse** one skips the encoding entirely — one thread per row probes and inserts into that table directly (§4.1) | **none** | one slot per distinct key on the GPU |
 | `group_by` (any other key or aggregate) | **exact** | `GroupByKeys` turns the key columns into dense ids on the GPU, then the aggregates | fold one row per group into a host table sharded by key hash across `mergeShards` threads | one entry per **distinct group**, not per row |
 | `top_k` | **exact** | one comparison kernel rejects the batch against the running k-th value (§4.2); survivors go through the GPU top-k and are folded into the **GPU-resident** k rows | **none** | k rows on the GPU |
 | `quantile` | **approximate** — see §6 | one radix argsort plus one gather per batch; only `compression` values reach the host | merge two weighted centroid lists and re-compress | ≤ `compression` centroids (1000 default) |
@@ -165,7 +165,7 @@ The fused Expr compiler evaluates every expression into a fixed-width register, 
   still compiles into one fused kernel, producing a boolean mask; that mask drives the GPU `filter`,
   which carries *any* column type, and only the computed outputs go back through the compiler.
 
-### Streaming group-by: two global tables
+### Streaming group-by: three global tables
 
 * **Dense integer key** (`denseKeyCount` given, one key column already inside `[0, K)`): the global
   table lives on the **GPU** as one accumulator array per aggregate, `K` entries wide. Each batch runs
@@ -174,12 +174,16 @@ The fused Expr compiler evaluates every expression into a fixed-width register, 
   `K * aggregates * 16` bytes exceeds `gpuStateBudgetBytes` the state **spills to the host table**,
   and partials recorded before the spill are folded into it, so a 10-million-key group-by still runs
   inside a fixed GPU budget.
-* **Arbitrary keys**: `GroupByKeys` (which turns any key columns into dense ids on the GPU) plus the
-  aggregates give one row per group — typically thousands of rows for a batch of millions. The merge
-  folds those rows into a host dictionary keyed by the key value itself. Exact, order independent,
-  and its size is the number of distinct groups.
+* **One integer key** with `sum` / `count` / `mean`: the **resident hash table** of §4.1, on the GPU
+  for the whole scan. A dense key encodes per batch and folds one row per group into it; a sparse one
+  skips the encoding and puts the rows in directly.
+* **Anything else** (several key columns, a string or float key, `min` / `max` / `variance`):
+  `GroupByKeys` (which turns any key columns into dense ids on the GPU) plus the aggregates give one
+  row per group — typically thousands of rows for a batch of millions. The merge folds those rows into
+  a host dictionary keyed by the key value itself. Exact, order independent, and its size is the
+  number of distinct groups.
 
-Both paths return the groups in ascending key order, so the result is deterministic across batch
+Every path returns the groups in ascending key order, so the result is deterministic across batch
 layouts and runs. (This differs from pyarrow, which returns first-seen order; sort both sides before
 comparing.)
 
@@ -188,29 +192,96 @@ comparing.)
 `Sources/ArrowMetal/Stream/StreamGroupTable.swift`. For **one integer key** with `sum` / `count` /
 `mean` aggregates, the global table is an open-addressing hash table in device memory that lives for
 the whole scan: one slot per distinct key, and per aggregate a 64-bit sum and a 64-bit count. Ten
-million groups with one aggregate is about 560 MB at a load factor of one half. Nothing crosses to
+million groups with one aggregate is about 940 MB at a load factor of one third. Nothing crosses to
 the host until `finish()`.
 
-Metal has no 64-bit atomics and only guarantees `memory_order_relaxed`, so the usual "claim the slot,
-then publish the key" handshake is not safe — a reader can see a claimed slot before the key beside it
-is visible. `Kernels/HashTable.swift` avoids that by storing `row + 1` in the atomic and reading the
-key out of an array nothing writes, which a *persistent* table cannot do. The way out is the shape of
-the input: the table is probed with a batch's **distinct group keys**, never with its rows, so every
-key in a dispatch is different, and the work splits into three:
+#### Publishing a 64-bit key with 32-bit atomics
 
-1. `sgt_lookup` — read-only against a table nothing is writing. Keys already present get their slot.
-2. `sgt_insert` — runs only for the keys step 1 proved absent, so it never compares keys at all: it
-   claims the first empty slot on its probe chain with a 32-bit compare-exchange. A thread walking
-   over a slot another thread claimed in the same dispatch is walking over a *different* key, which is
-   what linear probing wants it to do, so a stale read is never consulted. A slot only ever goes from
-   empty to occupied, so no later lookup's probe chain is ever broken.
-3. `sgt_accumulate` — distinct keys mean distinct slots, so this needs no atomics either, and the
-   float64 sum uses the correctly-rounded software adder `d_add`.
+Metal has no 64-bit atomics — checked, not assumed: on this M4 Max `atomic_ulong` has no
+`compare_exchange`, no `fetch_add` and no `fetch_max` — and only guarantees `memory_order_relaxed` on
+the 32-bit ones. So the usual "claim the slot, then publish the key beside it" handshake is not safe:
+nothing orders the key's store against the claim, and a reader that sees a claimed slot may read a
+key that is not there yet. `Kernels/HashTable.swift` avoids that by storing `row + 1` in the atomic
+and reading the key out of an array nothing writes, which a *persistent* table cannot do.
 
-Growth doubles the table and rehashes on the GPU under the same claim rule. `min` / `max` /
-`variance`, multi-column keys and non-integer keys keep the host table, and the tests check the
-resident path against it bit for bit — including a null-key group, all-null groups, duplicate keys,
-empty batches and four integer key widths.
+This table publishes the key **through** the atomics instead. A slot is three 32-bit words holding
+the key's 64 bits split 22 / 21 / 21, each stored as `field + 1`, so **0 means "not written"** and
+every one of the 2^64 keys maps to three non-zero words. There is no reserved sentinel value, and so
+no key a caller may not use — `0`, `-1`, `Int64.min` and `Int64.max` are ordinary keys, and the tests
+say so. Each word is written with `compare_exchange(0 -> field + 1)`, which gives three properties:
+
+* a word only ever goes from 0 to its final value, and never changes again;
+* a thread accepts a slot only when **all three** words equal its own fields, and because those words
+  are immutable once set, that decision is permanent and every thread agrees with it;
+* a thread that mismatches any word walks on, which is what linear probing wants it to do.
+
+The case a naive scheme gets wrong — two threads with the same key racing on one empty slot —
+resolves without a spin (which can deadlock a divergent SIMD group) and without a duplicate slot: the
+loser's compare-exchange fails *with the winner's value*, which is its own field, so it reads the
+failure as a match and stops on the same slot. Two threads with different keys resolve the same way,
+because the loser sees a value that is not its field and walks on. A thread that wins word 0 and then
+loses word 1 to another key leaves a slot some other thread completes — the thread that won a word is
+still inside its own probe step and goes on to write the rest — so no slot is left half written when
+a dispatch ends.
+
+Nothing in that argument needs an ordering Metal does not give, and nothing needs the keys in a
+dispatch to be distinct. So one thread per **row** is safe, which is what removes the per-batch dense
+encoding from a sparse, high-cardinality scan.
+
+#### Three ways in
+
+| Path | When | Per batch |
+| --- | --- | --- |
+| **distinct keys** | the key column is dense enough for `GroupByKeys`' range scan (a thousand regions, a date column, dictionary codes) | `GroupByKeys` gives one row per group, one insert dispatch places them, one accumulate folds them |
+| **rows, atomic** | sparse key, and every aggregate is a `count` or an **integer** `sum` / `mean` | one thread per row inserts, one thread per row folds itself into its slot |
+| **rows, dense ids** | sparse key with a **float64** or float32 sum in it | the insert also stamps a batch-local id onto every slot it touched; the batch's aggregates then run on the ordinary `GroupBy` and fold into distinct slots |
+
+The chooser is one min/max over the key column per batch: a span small enough for
+`GroupByKeys.rangeIsWorthIt` keeps the per-batch encoding, because a thousand groups fit in
+threadgroup memory and beat a million atomic adds landing on a thousand slots; anything sparser goes
+row-level. Both give the same answer, so it is only ever a choice of plan.
+
+**The atomic accumulate** builds a 64-bit add out of two 32-bit ones: add the low word, take the
+carry out of it into the high word. That is exactly two's-complement 64-bit addition, so it wraps
+like `Int64` does, and being plain integer addition it is **independent of the order the rows reach a
+slot in**. Counts and integer sums are therefore bit-identical to the per-batch path and to the host
+table, run after run, whatever the batch layout — which the tests assert at cardinalities 1, 1k, 100k
+and 2M.
+
+**A float64 sum cannot take that path.** There is no 64-bit atomic to compare-exchange a double into,
+and no emulation of one rounds a binary64 addition correctly or reproducibly. It takes the dense-id
+branch instead, which still never sorts the key column — the resident table *is* the dictionary — and
+keeps the correctly-rounded software adder `d_add`. The batch-local id is assigned by whichever
+thread first swaps this batch's stamp into a slot, so exactly one thread per slot per batch assigns
+one, and the ids are read back in a **later** dispatch, after the barrier that makes them visible.
+The cost is two `uint` arrays the size of the table (about 270 MB at ten million groups), allocated
+only when that branch is used.
+
+**The per-group float64 sum is one thread per group**, not the one *threadgroup* per group the
+segmented reduction gives it: at a million groups of one row that was 256 threads per row, and three
+quarters of the batch. Its answer has to match the old one bit for bit, because a binary64 sum
+depends on the order it was added in and the host table is checked against it — and it does, because
+the shape of that reduction is fixed. Every butterfly step whose stride is at or above the run length
+does nothing, so a run of `L` rows only uses the first `P` lanes (`P` the power of two at or above
+`L`); and the butterfly over `P` lanes is the balanced tree whose leaves, left to right, are the
+lanes in **bit-reversed** order. Walking the lanes in that order and merging equal-rank partial
+results on a stack of at most nine rebuilds the same tree, including the rule that an empty
+accumulator is replaced rather than added to. O(L) per group, same additions, same order. Runs long
+enough that one thread each is the wrong shape keep the threadgroup version; the mean run length
+decides, and since both give the same bits it is only a choice of dispatch.
+
+#### Growth
+
+Growth doubles the table and rehashes on the GPU under the same claim rule, and the row path checks
+the load factor *after* its insert, when the number of new keys is known: the pre-emptive growth is
+sized by what the last batch added, and a batch that outruns it grows the table and re-runs the
+insert, which finds the keys that did land already present and claims the rest. Being wrong about the
+estimate costs one extra pass, never an answer.
+
+`min` / `max` / `variance`, multi-column keys and non-integer keys keep the host table, and the tests
+check every resident path against it bit for bit — a null-key group, all-null groups, duplicate keys
+per batch, empty and ragged batches, growth across the rehash threshold, keys at both ends of the
+int64 range, and three integer key widths.
 
 Both fold the same per-batch partials in the same order, one with Swift's `+` and one with `d_add`,
 so the float64 sums agree to the last bit.
@@ -336,7 +407,58 @@ The machine has 64 GB of RAM and the dataset is 30 GB, so after the first pass i
 cache: the GB/s figures are memory bandwidth as much as SSD bandwidth, and they are the same for
 every engine.
 
-### The current measurement: 8 GB, before and after the resident-state work
+### The row-level group-by: 4 GB, before and after
+
+Measured on a **4.03 GB** run of the same generator (`--size-gb 4`: 76,000,000 rows, 4 files, 76
+batches of 1M rows) with `readers = 2`, best of three **interleaved A/B rounds** — before, after,
+then the reference engines, three times round, one cell process at a time, same dataset and same page
+cache, and only the loaded library changes between "before" and "after". "before" is the per-batch
+dense encoding of the previous section; "after" is the row-level path of §4.1.
+
+| Workload | before | **after** | Polars | DuckDB | RSS before | **RSS after** | Polars RSS | DuckDB RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| group by `bigkey` -> sum (10M groups) | 2,117 | **620** | 398 | 645 | 4.05 GB | 4.74 GB | 2.89 GB | 4.62 GB |
+| group by `region` -> sum, count (1k groups) | 255 | **199** | 110 | 246 | 2.33 GB | 2.36 GB | 1.96 GB | 0.87 GB |
+
+`groupby_10m` is **3.4x** faster and now **beats DuckDB**; it was 5.3x behind Polars and is 1.6x
+behind. `groupby_1k` never goes near the row path — a thousand contiguous values is exactly the shape
+the range encoding is for — and its 22 % is the distinct-key insert becoming one dispatch instead of
+the two it used to be.
+
+Where the batch's time went, per stage, at 76 batches:
+
+| Stage | before | after |
+| --- | ---: | ---: |
+| read (two reader threads) | 0.39 s | 0.42 s |
+| GPU stage | 2.10 s | 0.28 s |
+| merge stage | 0.29 s | 0.51 s |
+| merge stall (GPU stage waiting on the merge queue) | 0.00 s | 0.22 s |
+
+The work moved rather than only shrank: the resident table can only be touched from the merge stage,
+so the insert, the aggregates and the fold all run there now and the GPU stage is left with the read
+and the filter. Total GPU-side work went from 2.39 s to 0.79 s. What remains in the merge is the
+insert of a million rows into a 33-million-slot table, the batch's `GroupBy`, and the fold.
+
+Two intermediate points, measured the same way on the same dataset, showing what each half bought:
+
+| `group by bigkey` | wall | merge stage |
+| --- | ---: | ---: |
+| per-batch encoding (before) | 2,117 ms | 0.29 s |
+| row-level, dense ids, segmented sum | 1,523 ms | 1.47 s |
+| row-level, dense ids, one thread per group | **620 ms** | 0.51 s |
+| the same query as `count(*)` (atomic path) | 456 ms | 0.31 s |
+| the same query as `sum(qty)`, int32 (atomic path) | **330 ms** | 0.22 s |
+
+The last two lines are the point of the atomic path: with an integer aggregate the batch never builds
+dense ids, never sorts anything and never runs a second kernel over its groups, and the whole query
+is read-bound. A float64 sum pays for the dense ids and the per-group reduction because Metal has no
+64-bit atomic to fold a double with.
+
+**Peak RSS rises by 0.69 GB** on `groupby_10m`, and that is the price of the dense-id branch: two
+`uint` arrays the size of the table (2 x 134 MB at 33.5 M slots) plus the batch's segment arrays. The
+atomic path allocates neither. Nothing else in the table moved.
+
+### The earlier measurement: 8 GB, before and after the resident-state work
 
 The 30 GB table this section used to carry is kept below, because it is the size at which the read
 stops being the limit. The current numbers are from an **8.06 GB** run of the same generator
@@ -392,14 +514,13 @@ stays flat at 2.3 to 2.5 GB over 8 GB of data.
   threads moving 8 GB against Polars reading the same directory with every core at 51 GB/s. The
   30 GB numbers below, taken with `readers = 8`, are what the same operators look like once the read
   is not the limit.
-* **`groupby_10m` is still 5.5x behind Polars**, and the reason is now precisely located: the merge
-  is 0.34 s, but the **GPU stage is 4.0 s**, and essentially all of it is the *per-batch*
+* **`groupby_10m` was still 5.5x behind Polars at this point**, and the reason was precisely located:
+  the merge was 0.34 s, but the **GPU stage was 4.0 s**, and essentially all of it was the *per-batch*
   `GroupByKeys` that turns a million int64 keys into dense ids. `bigkey` spans ten million values
-  over a million-row batch, too sparse for the range-encoding path, so every batch pays a full radix
+  over a million-row batch, too sparse for the range-encoding path, so every batch paid a full radix
   sort of its key column plus an atomic group-by min to pick each group's representative row — with a
-  host loop over that batch's ~950,000 groups inside it. Removing it means giving the resident table
-  its own **row-level** probe; §4.1 explains why the current two-phase insert cannot do that (it
-  relies on every key in a dispatch being distinct, which rows are not), and that is the next step.
+  host loop over that batch's ~950,000 groups inside it. That is what the row-level path of §4.1
+  removed; the 4 GB table above is the result.
 * **`groupby_1k`, `topk`, `sort_limit` and the join are within 2x to 3x** of Polars and DuckDB, and
   are read- or fixed-cost-bound rather than dominated by any one stage.
 * **The broadcast join is unchanged** because the benchmark streams its joined rows back to Python
@@ -507,14 +628,30 @@ same queries run at 1.2 GB of RSS (and two to five times slower). The genuinely 
   column for a whole stream is the only form the writer emits, which an incremental sink cannot
   promise.
 * **A `Stream` is single use**: a terminal consumes the source. Open a new scan for a second question.
-* **A group-by over ten million groups is 5.5x slower than Polars** (§9). The merge is gone; what
-  remains is the *per-batch* dense-id encoding, which for a key too sparse to range-encode is a full
-  radix sort of the key column plus a host loop over that batch's groups. A row-level probe straight
-  into the resident table would remove it and is not implemented.
+* **A group-by over ten million groups is 1.6x slower than Polars** (§9), down from 5.3x. The rows go
+  straight into the resident table now, so there is no per-batch encoding left to remove; what is
+  left is the insert itself, the batch's `GroupBy` and the fold, all in the merge stage, which the
+  GPU stage then waits 0.22 s on. Splitting the resident table into shards a batch could insert into
+  from more than one stage is not implemented.
+* **A float64 sum cannot use the row-level atomic accumulate**, because Metal has no 64-bit atomic
+  (`atomic_ulong` has no compare-exchange, `fetch_add` or `fetch_max` on this hardware) and no
+  emulation of one rounds a binary64 addition correctly. It takes the dense-id branch of §4.1
+  instead, which costs a second pass over the batch's groups and two `uint` arrays the size of the
+  table. Counts and integer sums skip all of that; on the same query and dataset that is 330 ms
+  against 620 ms.
+* **The row-level path's float64 sum is deterministic but not associative-order-free**: a group's
+  rows are added in a fixed order that depends on how the batches fell, so the same dataset read with
+  a different `batch_rows` can differ in the last bits, exactly as the per-batch path always could.
+  Integer sums and counts have no such dependence — they are 64-bit integer adds and commute — so
+  they are bit-identical across paths, batch layouts and runs. There is no non-deterministic option
+  to turn on.
 * **The resident group table takes one integer key and `sum` / `count` / `mean`.** `min` / `max`
   (they would need a per-slot atomic minimum), `variance` (a third accumulator), multi-column keys
   and non-integer keys all keep the host table, which is exact but folds one row per group per batch
   on the CPU.
+* **The dense-id branch costs about 270 MB at ten million groups** — two `uint` arrays the size of
+  the table — which is why `groupby_10m`'s peak RSS rises by 0.69 GB. Packing the batch stamp and the
+  dense id into one word is possible and is not implemented.
 * **A broadcast join writes rows, it does not aggregate them.** `join(...).sum(...)` streams the
   joined rows out and sums them in the caller; fusing the aggregate into the probe so the output
   never leaves the GPU is not implemented.
