@@ -3743,8 +3743,9 @@ def _math_extra(src, shape):
     return got, expected, tolerance
 
 
-_ROUND_MODES = ["down", "up", "towards_zero", "towards_infinity", "half_down", "half_up",
-                "half_towards_zero", "half_towards_infinity", "half_to_even", "half_to_odd"]
+#: Arrow's ten RoundMode names, in Arrow's own order.
+_ARROW_ROUND_MODES = ["down", "up", "towards_zero", "towards_infinity", "half_down", "half_up",
+                      "half_towards_zero", "half_towards_infinity", "half_to_even", "half_to_odd"]
 
 
 @op("round_extra", FLOATING,
@@ -3760,7 +3761,7 @@ def _round_extra(src, shape):
     digits = pa.array(np.tile(np.array([0, 1, 2, -1], np.int32), len(base) // 4 + 1)[:len(base)],
                       pa.int32())
     got, expected = [], []
-    for mode in _ROUND_MODES:
+    for mode in _ARROW_ROUND_MODES:
         got += [arrow(x.round_to_multiple(0.5, mode)), arrow(x.round_binary(am.array(digits), mode)),
                 arrow(x.round(2, mode))]
         expected += [pc.round_to_multiple(base, multiple=0.5, round_mode=mode),
