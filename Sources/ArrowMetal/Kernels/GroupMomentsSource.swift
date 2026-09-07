@@ -32,11 +32,10 @@ enum GroupMomentsSource {
         return (T.mslType, "d_from_ulong((ulong)vals[i])", "u\(T.byteWidth * 8)")
     }
 
-    static func source(valueType: String, load: String) -> String {
-        KernelSource.prelude + DoubleMath.msl + """
+    /// Exact-or-correctly-rounded 64-bit integer to binary64. `d_from_ucount` in SegmentedSource
+    /// truncates; a variance over int64 — and a mean over one — needs the rounding.
+    static let intToDouble = """
 
-        // Exact-or-correctly-rounded integer to binary64. `d_from_ucount` in SegmentedSource truncates;
-        // a variance over int64 needs the rounding.
         inline ulong d_from_ulong(ulong v) {
             if (v == 0ul) return 0ul;
             uint p = 63u;
@@ -63,6 +62,11 @@ enum GroupMomentsSource {
             ulong b = d_from_ulong(a);
             return (v < 0) ? (b | 0x8000000000000000ul) : b;
         }
+
+        """
+
+    static func source(valueType: String, load: String) -> String {
+        KernelSource.prelude + DoubleMath.msl + intToDouble + """
 
         #define GM_ARGS device const uint* segStart [[buffer(0)]], \\
                         device const uint* segEnd [[buffer(1)]], \\
