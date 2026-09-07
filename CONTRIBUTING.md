@@ -16,6 +16,8 @@ Thanks for looking. This project is small enough to hold in your head; please ke
   release-only miscompile (see the comment at `Sources/ArrowMetal/MetalArray.swift:283`).
 - Run `swift run -c release arrowmetal-bench` before and after a performance change and paste both tables in
   the PR.
+- Run the binding suites when you touch the C ABI: `PYTHONPATH=python python -m pytest python/tests -q`
+  and, for the Node binding, `(cd node && npm install && npm test)` — see [docs/TESTING.md](docs/TESTING.md).
 
 ## Setup
 ```

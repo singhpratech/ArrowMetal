@@ -95,6 +95,17 @@ test('float64 sum at 1,000,001 rows agrees with a Kahan-summed oracle to 1e-9 re
   assert.ok(Math.abs(m.sum() - sum) / sum < 1e-9, `${m.sum()} vs ${sum}`);
 });
 
+test('fromTypedArray takes an Arrow validity bitmap, with or without a null count', () => {
+  const v = new BigInt64Array([10n, 999n, 30n]);
+  const bitmap = new Uint8Array([0b101]); // rows 0 and 2 valid, row 1 null
+  const unknown = MetalArray.fromTypedArray(v, { validity: bitmap }); // null_count = -1
+  assert.equal(unknown.nullCount, 1);
+  assert.equal(unknown.sum(), 40n);
+  assert.deepEqual([...unknown.toArrow()], [10n, null, 30n]);
+  const known = MetalArray.fromTypedArray(v, { validity: bitmap, nullCount: 1 });
+  assert.equal(known.sum(), 40n);
+});
+
 test('uint64 sums answer with a BigInt', () => {
   const m = MetalArray.fromTypedArray(new BigUint64Array([1n, 2n, 3n]));
   assert.equal(m.format, 'L');

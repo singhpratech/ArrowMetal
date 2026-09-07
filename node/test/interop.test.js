@@ -123,6 +123,28 @@ test('a small typed array is not always page aligned, and is then copied', () =>
   assert.ok(sawUnaligned, 'expected at least one unaligned small allocation out of 64');
 });
 
+test('a wrapped import really is the same memory: mutating the JS buffer changes the answer', () => {
+  // The sharpest statement of "copy-free in": at 1M elements the backing store is page aligned,
+  // ArrowMetal wraps it, and a later write through the typed array is visible to the kernel.
+  const v = new BigInt64Array(1_000_000).fill(1n);
+  const m = MetalArray.fromTypedArray(v);
+  assert.equal(m.wrappedProducerBuffers, true);
+  assert.equal(m.sum(), 1_000_000n);
+  v[0] = 1000n;
+  assert.equal(m.sum(), 1_000_999n);
+});
+
+test('an unaligned import is a copy: mutating the JS buffer does not change the answer', () => {
+  const base = new ArrayBuffer(8 * 34);
+  const v = new BigInt64Array(base, 8, 33).fill(1n); // byteOffset 8, so never page aligned
+  assert.equal(isPageAligned(v), false);
+  const m = MetalArray.fromTypedArray(v);
+  assert.equal(m.wrappedProducerBuffers, false);
+  assert.equal(m.sum(), 33n);
+  v[0] = 100n;
+  assert.equal(m.sum(), 33n);
+});
+
 test('10,000 import/compute/export cycles do not crash', () => {
   // The export path hands out external ArrayBuffers whose finalizers release the ArrowMetal
   // allocation. This churns them hard enough that a mistake there shows up as a crash.
