@@ -211,6 +211,20 @@ def test_to_reader_is_a_lazy_pyarrow_reader(ipc_dir, table):
     assert batches > 1
 
 
+def test_parallel_readers_give_the_same_answers(ipc_dir, table):
+    """readers > 1 reads several files at once; the batch order changes, the answers do not."""
+    serial = am.scan_ipc(str(ipc_dir), readers=1).aggregate([("sum", "amount", "s"),
+                                                             ("count", None, "n")])
+    parallel = am.scan_ipc(str(ipc_dir), readers=4).aggregate([("sum", "amount", "s"),
+                                                               ("count", None, "n")])
+    assert parallel["n"] == serial["n"] == table.num_rows
+    assert parallel["s"] == pytest.approx(serial["s"], rel=1e-12)
+
+    a = am.scan_ipc(str(ipc_dir), readers=4).group_by("label").agg([("sum", "value", "s")])
+    b = am.scan_ipc(str(ipc_dir), readers=1).group_by("label").agg([("sum", "value", "s")])
+    assert a.sort_by("label").to_pydict() == b.sort_by("label").to_pydict()
+
+
 def test_scan_arrow_from_a_pyarrow_dataset(tmp_path, table):
     ds = pytest.importorskip("pyarrow.dataset")
     path = tmp_path / "ds"
