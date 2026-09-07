@@ -84,8 +84,29 @@ at most 8 GB (`MetalContext(poolLimitBytes:)`).
 | `IPCFileSource` | one Arrow IPC file | Memory mapped. Body buffers are borrowed without a copy where the file's layout allows; Arrow only guarantees 8-byte body alignment, so a buffer that does not start on a page boundary is copied into shared memory instead. Readahead with `fcntl(F_RDADVISE)` on a second descriptor plus `F_RDAHEAD`, which warms the unified buffer cache ahead of the read cursor. |
 | `IPCDirectorySource` | a directory of them | Sorted by filename, opened lazily one at a time, so a directory larger than memory never has more than one file mapped. |
 | `CStreamSource` | any `ArrowArrayStream` | A pyarrow `RecordBatchReader`, a `pyarrow.dataset` scanner (so **Parquet, CSV and partitioned datasets work today** through pyarrow's readers), a Polars `LazyFrame`, DuckDB — anything that speaks the Arrow C Stream ABI. Buffers are imported zero-copy when page aligned. |
+| `ParallelIPCSource` | a directory, several files at once | `readers` threads, each with its own `IPCFileSource` and its own files, feeding one bounded queue. **Batch order is not preserved** — see below. |
 | `ChunkedTableSource` | batches already in Metal memory | For tests and in-memory tables. |
-| `PrefetchingSource` | wraps any of the above | Stage one of the pipeline. |
+| `PrefetchingSource` | wraps any of the above | Stage one of the pipeline, one thread. |
+
+### One reader thread is not enough
+
+`PrefetchingSource` hides the read behind the GPU, but it is still *one* thread doing the mapping and
+the import. One core copies at roughly 10 GB/s; Polars and DuckDB scan the same directory at 44 to
+72 GB/s because they read it with every core. `ParallelIPCSource` closes that gap: it hands each of
+`readers` threads its own files, so the read stage scales with cores.
+
+The cost is batch **order**. Batches arrive interleaved across files, in whatever order the threads
+finish. Every operator here is order independent — aggregates, the HLL sketch, group-by, top-k, the
+external sort's run generation, both joins — so the only thing that needs `readers: 1` is a
+`filter -> sink_ipc` (or `to_reader`) that must preserve the source's row order.
+
+```python
+am.scan_ipc("/data/events", readers=8).group_by("region").agg([("sum", "amount", "t")])
+```
+
+```swift
+try StreamQuery(ipc: "/data/events", readers: 8)
+```
 
 A GPU Parquet reader lives in `Sources/ArrowMetal/Parquet/` and is developed separately; until it is
 the source of record, Parquet arrives through `scan_arrow(pyarrow.dataset(...))`.
@@ -176,6 +197,13 @@ to give a GPU: at 20 runs the whole merge is one comparison of 20 heap entries p
 
 So no column data is ever rebuilt value by value on the host, and memory during the merge is one
 batch per run plus one output batch. `ORDER BY ... LIMIT n` stops the merge at n rows.
+
+Runs are merged with a **bounded fan-in**. 570 batches means 570 runs, and opening them all at once
+would want 570 file descriptors and 570 resident batches; instead the merge runs in passes of at most
+`mergeFanIn` (32 by default), writing intermediate runs and deleting their inputs as it goes, so both
+stay constant however many runs there are. A `limit` is applied to *every* pass — the global first n
+rows are always inside the union of each group's first n — which is what makes `ORDER BY ... LIMIT`
+cheap over hundreds of runs.
 
 Sort keys use the GPU radix sort for numeric, boolean and temporal columns. `utf8` and `binary`
 columns have no order-preserving GPU key yet, so they fall back to a host sort of the string values
@@ -301,6 +329,8 @@ right plan at a few thousand keys and the crossover is around a million.
 
 ## 10. Limits
 
+* **`readers > 1` does not preserve batch order**, so a row-order-preserving `sink_ipc` or
+  `to_reader` needs `readers: 1` (the default).
 * **Sort keys** on `utf8` / `binary` columns fall back to a host sort per batch. Numeric, boolean and
   temporal keys use the GPU radix sort.
 * **`count_distinct_approx` is a whole-dataset aggregate**, not a per-group one; a per-group HLL would

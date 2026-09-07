@@ -338,11 +338,12 @@ class Ctx:
         self.bytes = manifest["bytes"]
         self.files = part_files(data_dir)
         self.prefetch = args.prefetch
+        self.readers = args.readers
 
 
 def am_stream(ctx):
     import arrowmetal as am
-    return am, am.scan_ipc(ctx.data_dir, prefetch=ctx.prefetch)
+    return am, am.scan_ipc(ctx.data_dir, prefetch=ctx.prefetch, readers=ctx.readers)
 
 
 def am_stats(stream):
@@ -798,7 +799,8 @@ def run_one(engine, workload, data_dir, args):
 def child_command(engine, workload, data_dir, args):
     cmd = [sys.executable, os.path.abspath(__file__), "--data-dir", data_dir,
            "--run-one", engine, workload, "--reuse", "--keep",
-           "--batch-rows", str(args.batch_rows), "--prefetch", str(args.prefetch)]
+           "--batch-rows", str(args.batch_rows), "--prefetch", str(args.prefetch),
+           "--readers", str(args.readers)]
     return cmd
 
 
@@ -931,6 +933,9 @@ def main():
     ap.add_argument("--json", dest="json_out", default=None, help="write the raw numbers here")
     ap.add_argument("--timeout", type=float, default=900.0, help="seconds per measurement")
     ap.add_argument("--prefetch", type=int, default=3, help="ArrowMetal scan prefetch depth")
+    ap.add_argument("--readers", type=int, default=1,
+                    help="ArrowMetal reader threads over the directory (>1 does not preserve batch "
+                         "order, which none of these workloads needs)")
     ap.add_argument("--ipc-format", choices=("stream", "file"), default="stream",
                     help="IPC framing to write; 'file' adds a footer for scanners that need one")
     ap.add_argument("--run-one", nargs=2, metavar=("ENGINE", "WORKLOAD"), default=None,
