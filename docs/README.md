@@ -48,9 +48,10 @@ pip install python/dist/arrowmetal-0.1.0-*.whl
 pip install 'python/dist/arrowmetal-0.1.0-*.whl[polars,duckdb,pandas]'   # optional bridges
 ```
 
-The installed package finds `libArrowMetalC.dylib` in one of three places, in order: bundled inside the
-wheel (`arrowmetal/_lib/`), then `$ARROWMETAL_LIB`, then a development build in `.build/release` beside a
-source checkout. See [../python/README.md](../python/README.md).
+The package finds `libArrowMetalC.dylib` in one of three places, in order: `$ARROWMETAL_LIB`, which pins
+one specific build and wins over everything (the A/B benchmark scripts and the merge gate rely on that),
+then the copy bundled inside the wheel (`arrowmetal/_lib/`), then a development build in `.build/release`
+beside a source checkout. See [../python/README.md](../python/README.md).
 
 ## Reproducing everything
 

@@ -69,8 +69,11 @@ overrides the platform tag.
 
 `arrowmetal` looks for `libArrowMetalC.dylib` in this order:
 
-1. **Bundled in the installed package**, `arrowmetal/_lib/libArrowMetalC.dylib` — what a wheel install has.
-2. **`$ARROWMETAL_LIB`**, the full path to a dylib.
+1. **`$ARROWMETAL_LIB`**, the full path to a dylib. It wins over everything else, because pinning one
+   specific build is exactly what the A/B benchmark scripts and the merge gate use it for — a stale
+   `arrowmetal/_lib/` left behind by a wheel build in the same checkout must not shadow it. Setting it to
+   a path that does not exist is an error, not a silent fall-back to some other dylib.
+2. **Bundled in the installed package**, `arrowmetal/_lib/libArrowMetalC.dylib` — what a wheel install has.
 3. **The development build**, `.build/release/libArrowMetalC.dylib` beside a source checkout
    (then `.build/debug`, then `/usr/local/lib` and `/opt/homebrew/lib`).
 
