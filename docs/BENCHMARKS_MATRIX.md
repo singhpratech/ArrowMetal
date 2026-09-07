@@ -519,7 +519,7 @@ Sorted by how far short of the 3x bar the row is (worst first). ❌ means a CPU 
 | mean by int32 key (10000000 groups) | 10,000,000 | 2.94x | 27.40 | polars | 80.54 | 4.38 | 1.49 | The dense key mapping (`am_group_by_keys`) is rebuilt on every call and, at low cardinality, costs more than the aggregation itself; the CPU libraries' hash table over a thousand keys sits in L2. Reusing one `am.group_by([...])` object across aggregates (as Benchmarks/python_gpu_bench.py does) removes that part. |
 | negate (int64) | 10,000,000 | 2.98x | 0.902 | pyarrow | 2.69 | 177 | 59.5 | Memory-bound tie: ArrowMetal 177 GB/s vs pyarrow 59.5 GB/s, both within reach of the ~400 GB/s unified-memory ceiling; there is no 3x available to either side on this operation. |
 
-77 of 339 measured operations are below the 3x bar.
+77 of 339 measured rows are below the 3x bar (62 between 1x and 3x, 15 slower).
 
 ## Reproducing
 

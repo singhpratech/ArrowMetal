@@ -49,7 +49,7 @@ let cheap = try prices.filter(try prices.compare(.lt, 100))
 print("  below 100: \(cheap.length) rows, min=\(String(format: "%.3f", try prices.min()!)) max=\(String(format: "%.3f", try prices.max()!)) (NaN skipped), sum=\(String(format: "%.1f", try cheap.sum()!.asDouble))   [\(ms(t0))]")
 
 // ---------------------------------------------------------------------------------------------
-print("\nScenario 4: interop through the Arrow C Data Interface (zero-copy both ways)")
+print("\nScenario 4: interop through the Arrow C Data Interface (copy-free out; copy-free in when the buffers are page aligned)")
 t0 = DispatchTime.now()
 var schema = ArrowSchema(); var carr = ArrowArray()
 hits.exportArrowSchema(name: "hits", into: &schema)      // hand the filtered batch to any Arrow library...

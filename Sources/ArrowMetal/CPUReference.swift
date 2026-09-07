@@ -1,6 +1,6 @@
 import Foundation
 
-/// Straightforward CPU implementations of every kernel. Used for Float64 columns (Metal has no
+/// Straightforward CPU implementations of the kernels tested through this file. Used for Float64 columns (Metal has no
 /// double type) and as the oracle in tests. Deliberately simple and obviously correct.
 public enum CPUReference {
     /// Iterates valid indices efficiently: whole bytes of the validity bitmap are tested at once.

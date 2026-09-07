@@ -16,7 +16,7 @@ This is the only roadmap: the older `../ROADMAP.md` now points here.
   a first-class input to every kernel turns slices, concatenations and shifts into pointers.
 - **A GPU regular-expression engine.** A compiled automaton kernel behind the existing pre-filter, so a
   real regex stops being the one string operation that runs on the host.
-- **Faster correct doubles.** `ln` is measured at 1 ulp and `sin` at 2, and they run 1.04x to 2.06x
+- **Faster correct doubles.** `ln` is measured at 1 ulp and `sin` at 2, and they run 1.04x to 1.99x
   over the CPU (`days_between` 1.04-1.47x); a better range reduction or polynomial is a direct path
   to 3x.
 - **Float64 sum and mean with very few groups** take the one-threadgroup-per-group segmented path

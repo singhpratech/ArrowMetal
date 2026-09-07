@@ -86,8 +86,8 @@ genuinely differences, both listed by name below and in each row's note.
 * **Precision** — Metal has no `double` at all, so every float64 transcendental is software binary64 on
   the GPU. `sqrt` is correctly rounded; `exp`, `ln`, `log10`, `log2` and `power` (and their checked twins)
   are within 1 ulp, measured over 10^6 inputs per function. The grouped moments (`hash_variance`,
-  `hash_stddev`, `hash_skew`, `hash_kurtosis`) form their deviations in float32 about a float64 mean,
-  about 1e-5 relative — they are the only float32-precise answers left. Every tolerance is recorded in
+  `hash_stddev`, `hash_skew`, `hash_kurtosis`) form their deviations in software binary64 about a float64 mean and agree with Arrow to about 6e-10
+  relative (2e-8 on float32 input), the moment accumulator's stated accuracy, not to the last bit. Every tolerance is recorded in
   `arrowmetal.functions.TOLERANCE` and asserted.
 * **Deliberate differences from Arrow** — `hash_distinct` returns values ascending rather than in
   order of first appearance, and the group-by order is deterministic but is not pyarrow's first-seen
