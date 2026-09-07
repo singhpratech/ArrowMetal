@@ -24,6 +24,16 @@ the workaround can be removed.
 Nothing found in pandas, numpy, Polars or DuckDB is their defect: the costs the matrix measures there are
 crossings and idioms, not bugs.
 
+## Checked and found not to be a defect
+
+Kept so the same question is not asked twice.
+
+| Project | What looked like a limitation | Why it is not one |
+|---|---|---|
+| arrow-rs 59.3 | `max` of a float column with NaN returns NaN while `min` returns the smallest non-NaN | Its documented total order puts NaN above every value ([apache/arrow-rs#101](https://github.com/apache/arrow-rs/issues/101), closed 2022); pyarrow and ArrowMetal skip NaN instead. A cross-implementation divergence, pinned by `rust/arrowmetal/tests/compute.rs` and tabled in [RUST.md](RUST.md) |
+| arrow-rs 59.3 | values buffers are page aligned only from about 64 KiB upward | That is the macOS allocator's `mmap` threshold, not arrow-rs; measured in `rust/arrowmetal/tests/copy_rule.rs`, which prints the table for the reader's machine |
+| cargo 1.95 | a build script's `rustc-link-arg` does not reach dependents, so the safe crate needs its own three-line build.rs for the rpath | By design ([rust-lang/cargo#9554](https://github.com/rust-lang/cargo/issues/9554), closed after an FCP); the `DEP_<links>_` mechanism is the sanctioned route and is what the crate uses |
+
 ## Where each report goes
 
 | Project | Route | Public tracker |
