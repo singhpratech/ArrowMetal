@@ -87,6 +87,25 @@ extension AnyMetalArray {
         }
     }
 
+    /// The sorted values of whichever concrete array this is, in `argsortIndices`' order.
+    ///
+    /// The six types that have a direct order-preserving key take `MetalArray.sorted()`, which rebuilds
+    /// the values out of the sort's own keys instead of gathering them through the permutation; every
+    /// other type still gathers.
+    public func sortedValues(descending: Bool = false,
+                             nullPlacement: NullPlacement = .atEnd) throws -> AnyMetalArray {
+        switch self {
+        case .int32(let a): return .int32(try a.sorted(descending: descending, nullPlacement: nullPlacement))
+        case .uint32(let a): return .uint32(try a.sorted(descending: descending, nullPlacement: nullPlacement))
+        case .int64(let a): return .int64(try a.sorted(descending: descending, nullPlacement: nullPlacement))
+        case .uint64(let a): return .uint64(try a.sorted(descending: descending, nullPlacement: nullPlacement))
+        case .float32(let a): return .float32(try a.sorted(descending: descending, nullPlacement: nullPlacement))
+        case .float64(let a): return .float64(try a.sorted(descending: descending, nullPlacement: nullPlacement))
+        default:
+            return try take(try argsortIndices(descending: descending, nullPlacement: nullPlacement))
+        }
+    }
+
     /// The Metal context whichever concrete array this is lives in.
     var metalContext: MetalContext {
         switch self {

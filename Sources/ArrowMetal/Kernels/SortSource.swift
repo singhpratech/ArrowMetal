@@ -104,7 +104,197 @@ enum SortSource {
     // which measured as roughly two thirds of the whole sort. `peerCount` holds counts of at most 32, so
     // a byte each is enough, and every entry a chunk sets is cleared by the same lane that set it, which
     // keeps the 2048-digit table off the critical path.
-    kernel void radix_scatter(device const \(K)* keys [[buffer(0)]], device const uint* vals [[buffer(1)]],
+    //
+    // Two variants: `radix_scatter` moves the uint payload with the key, `radix_scatter_nk` moves the key
+    // alone. A sort whose answer is the sorted *values* rather than the permutation does not need the
+    // payload at all (see `sorted()`), and dropping it takes each pass from 24 to 16 bytes an element.
+    \(scatter(K: K, name: "radix_scatter", payload: true))
+    \(scatter(K: K, name: "radix_scatter_nk", payload: false))
+    // Order-preserving key mappings; `inv` flips the order (descending) while keeping the sort stable.
+    //
+    // The float kernels also report, in `flags`, whether the column holds a -0.0 (bit 0) or a NaN (bit 1):
+    // those are the only two values the map is not injective on, so a column with neither can have its
+    // sorted keys turned straight back into sorted values instead of gathering them (see `sorted()`).
+    // One `simd_ballot` pair and at most one atomic per SIMD group; the keys are already loaded.
+    #define KEY_FLAG_NEGZERO 1u
+    #define KEY_FLAG_NAN 2u
+    kernel void key_from_i32(device const int* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { uint k = (uint)a[i] ^ 0x80000000u; out[i] = inv ? ~k : k; } }
+    kernel void key_from_u32(device const uint* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { uint k = a[i]; out[i] = inv ? ~k : k; } }
+    kernel void key_from_f32(device const uint* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]],
+                             uint i [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+        bool active = i < *nPtr;
+        uint b = active ? a[i] : 0u;
+        bool negZero = active && b == 0x80000000u;
+        bool nan = active && (b & 0x7FFFFFFFu) > 0x7F800000u;
+        if ((b & 0x7FFFFFFFu) == 0u) b = 0u; if (nan) b = 0x7F800001u; /* -0 == +0; every NaN is one value after +inf */
+        uint k = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+        /* NaN stays at the end when the order is reversed, next to the nulls, as in Arrow. UINT_MAX is
+           free: only a NaN can map to key 0, so only a NaN can invert to UINT_MAX. */
+        if (active) out[i] = inv ? (nan ? 0xFFFFFFFFu : ~k) : k;
+        uint f = ((uint)((simd_vote::vote_t)simd_ballot(negZero)) ? KEY_FLAG_NEGZERO : 0u)
+               | ((uint)((simd_vote::vote_t)simd_ballot(nan)) ? KEY_FLAG_NAN : 0u);
+        if (f != 0u && lane == 0u) atomic_fetch_or_explicit(flags, f, memory_order_relaxed);
+    }
+    kernel void key_from_i64(device const long* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { ulong k = (ulong)a[i] ^ 0x8000000000000000ul; out[i] = inv ? ~k : k; } }
+    kernel void key_from_u64(device const ulong* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { ulong k = a[i]; out[i] = inv ? ~k : k; } }
+    kernel void key_from_f64(device const ulong* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]],
+                             uint i [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+        bool active = i < *nPtr;
+        ulong b = active ? a[i] : 0ul;
+        bool negZero = active && b == 0x8000000000000000ul;
+        bool nan = active && (b & 0x7FFFFFFFFFFFFFFFul) > 0x7FF0000000000000ul;
+        if ((b & 0x7FFFFFFFFFFFFFFFul) == 0ul) b = 0ul; if (nan) b = 0x7FF0000000000001ul;
+        ulong k = (b & 0x8000000000000000ul) ? ~b : (b | 0x8000000000000000ul);
+        if (active) out[i] = inv ? (nan ? 0xFFFFFFFFFFFFFFFFul : ~k) : k;
+        uint f = ((uint)((simd_vote::vote_t)simd_ballot(negZero)) ? KEY_FLAG_NEGZERO : 0u)
+               | ((uint)((simd_vote::vote_t)simd_ballot(nan)) ? KEY_FLAG_NAN : 0u);
+        if (f != 0u && lane == 0u) atomic_fetch_or_explicit(flags, f, memory_order_relaxed);
+    }
+    kernel void iota_u32(device uint* out [[buffer(0)]], device const uint* nPtr [[buffer(1)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) out[i] = i; }
+
+    // The inverse of the key map: sorted keys back to sorted values, written at `dstBase`. `mode` picks
+    // which map to undo (0 signed integer, 1 unsigned, 2 float); `inv` undoes a descending sort's flip.
+    // Only reached when the map is injective over the column's values, which the flags above decide.
+    kernel void unkey(device const \(K)* keys [[buffer(0)]], constant uint& count [[buffer(1)]],
+                      constant uint& inv [[buffer(2)]], constant uint& mode [[buffer(3)]],
+                      constant uint& dstBase [[buffer(4)]], device \(K)* out [[buffer(5)]],
+                      uint i [[thread_position_in_grid]]) {
+        if (i >= count) return;
+        \(K) msb = ((\(K))1) << (\(K))(sizeof(\(K)) * 8u - 1u);
+        \(K) k = keys[i];
+        if (inv) k = ~k;
+        \(K) v = mode == 0u ? (k ^ msb) : (mode == 1u ? k : ((k & msb) ? (k ^ msb) : ~k));
+        out[dstBase + i] = v;
+    }
+    // Output positions `[lo, hi)` that the inverse map cannot reconstruct — the null block, and the runs
+    // of -0.0/+0.0 and of NaN, whose keys are shared by values with different bits — are copied from the
+    // source through the sorted row numbers instead. A gather, but over those rows only.
+    kernel void gather_range(device const \(K)* src [[buffer(0)]], device const int* order [[buffer(1)]],
+                             constant uint& lo [[buffer(2)]], constant uint& hi [[buffer(3)]],
+                             device \(K)* out [[buffer(4)]], uint t [[thread_position_in_grid]]) {
+        uint i = lo + t;
+        if (i >= hi) return;
+        out[i] = src[(uint)order[i]];
+    }
+
+    // A stable three-way partition of the row numbers — values, NaNs, nulls — in whichever order the
+    // caller's `nullPlacement` wants them, with the value bucket's keys compacted alongside. It runs
+    // *before* the radix sort, so the sort sees only the rows it has to order: the nulls keep their input
+    // order by construction (the partition is stable) instead of being lifted out of the sorted array by
+    // a host pass, and the sort itself is over the non-null rows only.
+    //
+    // `slotOf` packs the three destination buckets four bits each, category-indexed: value 0, NaN 1,
+    // null 2.
+    #define PART_SLOTS 3u
+    inline uint part_slot(\(K) key, uint i, device const uchar* validity, uint hasValidity,
+                          \(K) nanKey, uint hasNaN, uint slotOf) {
+        uint cat = (hasValidity && !bit_get(validity, i)) ? 2u : ((hasNaN && key == nanKey) ? 1u : 0u);
+        return (slotOf >> (4u * cat)) & 0xFu;
+    }
+    #define PART_SLOT_OF(i) part_slot(keys[i], i, validity, hasValidity, nanKey, hasNaN, slotOf)
+
+    kernel void part_count(device const \(K)* keys [[buffer(0)]], device const uint* nPtr [[buffer(1)]],
+                           device const uchar* validity [[buffer(2)]], constant uint& hasValidity [[buffer(3)]],
+                           constant \(K)& nanKey [[buffer(4)]], constant uint& hasNaN [[buffer(5)]],
+                           constant uint& slotOf [[buffer(6)]], constant uint& elemsPerBlock [[buffer(7)]],
+                           constant uint& blocks [[buffer(8)]], device uint* counts [[buffer(9)]],
+                           uint lid [[thread_index_in_threadgroup]], uint tgid [[threadgroup_position_in_grid]],
+                           uint sgid [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+        threadgroup uint tot[PART_SLOTS * SIMDS];
+        uint n = *nPtr, start = tgid * elemsPerBlock, end = min(n, start + elemsPerBlock);
+        uint c0 = 0u, c1 = 0u, c2 = 0u;
+        for (uint i = start + lid; i < end; i += TG) {
+            uint s = PART_SLOT_OF(i);
+            c0 += s == 0u; c1 += s == 1u; c2 += s == 2u;
+        }
+        uint s0 = simd_sum(c0), s1 = simd_sum(c1), s2 = simd_sum(c2);
+        if (lane == 0u) { tot[0u * SIMDS + sgid] = s0; tot[1u * SIMDS + sgid] = s1; tot[2u * SIMDS + sgid] = s2; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < PART_SLOTS) {
+            uint sum = 0u;
+            for (uint g = 0u; g < SIMDS; g++) sum += tot[lid * SIMDS + g];
+            counts[lid * blocks + tgid] = sum;
+        }
+    }
+    // Exclusive scan over the slot-major counts table, single thread (3 * blocks entries, a few hundred),
+    // leaving each bucket's total in `sizes`.
+    kernel void part_scan(device uint* counts [[buffer(0)]], constant uint& blocks [[buffer(1)]],
+                          device uint* sizes [[buffer(2)]], uint lid [[thread_index_in_threadgroup]]) {
+        if (lid != 0u) return;
+        uint run = 0u;
+        for (uint s = 0u; s < PART_SLOTS; s++) {
+            uint t = 0u;
+            for (uint b = 0u; b < blocks; b++) { uint c = counts[s * blocks + b]; counts[s * blocks + b] = run; run += c; t += c; }
+            sizes[s] = t;
+        }
+    }
+    // The scatter, ranked inside a SIMD group with three ballots (the same trick the radix scatter uses).
+    // The value bucket also writes its key into the compacted key array the sort will run on; the other
+    // two buckets write their row numbers into *both* ping-pong buffers, so whichever one the sort's
+    // passes finish in already carries them.
+    // `.atStart` asked for `[nulls][NaNs][values]`; the partition always writes `[values][NaNs][nulls]`
+    // so that the sort's element range starts at zero and needs no offset the host would have to read
+    // back. This moves the three blocks into place afterwards, taking their sizes off the GPU.
+    kernel void part_arrange(device const int* in [[buffer(0)]], device const uint* sizes [[buffer(1)]],
+                             device const uint* nPtr [[buffer(2)]], device int* out [[buffer(3)]],
+                             uint i [[thread_position_in_grid]]) {
+        if (i >= *nPtr) return;
+        uint mv = sizes[0], mn = sizes[1], mz = sizes[2];
+        out[i] = i < mz ? in[mv + mn + i] : (i < mz + mn ? in[mv + (i - mz)] : in[i - mz - mn]);
+    }
+    kernel void part_scatter(device const \(K)* keys [[buffer(0)]], device const uint* nPtr [[buffer(1)]],
+                             device const uchar* validity [[buffer(2)]], constant uint& hasValidity [[buffer(3)]],
+                             constant \(K)& nanKey [[buffer(4)]], constant uint& hasNaN [[buffer(5)]],
+                             constant uint& slotOf [[buffer(6)]], constant uint& elemsPerBlock [[buffer(7)]],
+                             constant uint& blocks [[buffer(8)]], device const uint* offsets [[buffer(9)]],
+                             constant uint& valueSlot [[buffer(10)]], device int* outA [[buffer(11)]],
+                             device int* outB [[buffer(12)]], device \(K)* outKeys [[buffer(13)]],
+                             uint lid [[thread_index_in_threadgroup]], uint tgid [[threadgroup_position_in_grid]],
+                             uint sgid [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+        threadgroup uint base[PART_SLOTS];
+        threadgroup uint simdCount[PART_SLOTS * SIMDS];
+        if (lid < PART_SLOTS) base[lid] = offsets[lid * blocks + tgid];
+        for (uint j = lid; j < PART_SLOTS * SIMDS; j += TG) simdCount[j] = 0u;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint valueBase = offsets[valueSlot * blocks];      // where the value bucket starts in the output
+        uint n = *nPtr, start = tgid * elemsPerBlock, end = min(n, start + elemsPerBlock);
+        for (uint chunk = start; chunk < end; chunk += TG) {
+            uint i = chunk + lid;
+            bool active = i < end;
+            \(K) key = active ? keys[i] : (\(K))0;
+            uint s = active ? PART_SLOT_OF(i) : 0u;
+            uint b0 = (uint)((simd_vote::vote_t)simd_ballot(active && s == 0u));
+            uint b1 = (uint)((simd_vote::vote_t)simd_ballot(active && s == 1u));
+            uint b2 = (uint)((simd_vote::vote_t)simd_ballot(active && s == 2u));
+            uint peers = s == 0u ? b0 : (s == 1u ? b1 : b2);
+            uint rank = popcount(peers & ((1u << lane) - 1u));
+            bool leader = active && rank == 0u;
+            if (leader) simdCount[s * SIMDS + sgid] = popcount(peers);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint before = 0u, total = 0u;
+            if (active) {
+                for (uint g = 0u; g < SIMDS; g++) {
+                    uint c = simdCount[s * SIMDS + g];
+                    before += (g < sgid) ? c : 0u;
+                    total += c;
+                }
+                uint pos = base[s] + before + rank;
+                if (s == valueSlot) { outA[pos] = (int)i; outKeys[pos - valueBase] = key; }
+                else { outA[pos] = (int)i; outB[pos] = (int)i; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (leader) {
+                simdCount[s * SIMDS + sgid] = 0u;
+                if (before == 0u) base[s] += total;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    """ }
+
+    /// The stable scatter, with (`radix_scatter`) or without (`radix_scatter_nk`) the uint payload.
+    private static func scatter(K: String, name: String, payload: Bool) -> String { """
+    kernel void \(name)(device const \(K)* keys [[buffer(0)]], device const uint* vals [[buffer(1)]],
                               device const uint* nPtr [[buffer(2)]], constant uint& shift [[buffer(3)]],
                               constant uint& elemsPerBlock [[buffer(4)]], constant uint& blocks [[buffer(5)]],
                               device const uint* offsets [[buffer(6)]],
@@ -121,7 +311,7 @@ enum SortSource {
             uint i = chunk + lid;
             bool active = i < end;
             \(K) key = active ? keys[i] : (\(K))0;
-            uint val = active ? vals[i] : 0u;
+            \(payload ? "uint val = active ? vals[i] : 0u;" : "")
             uint d = (uint)((key >> shift) & DIGIT_MASK);
             // The lanes of this SIMD group that are inside the block, then those of them holding this
             // digit. `simd_ballot` must be reached by every lane, so the mask is arithmetic, not a vote.
@@ -145,7 +335,7 @@ enum SortSource {
                 }
                 uint pos = base[d] + before + rank;
                 outKeys[pos] = key;
-                outVals[pos] = val;
+                \(payload ? "outVals[pos] = val;" : "")
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (leader) {
@@ -155,22 +345,5 @@ enum SortSource {
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
-    // Order-preserving key mappings.
-    // Order-preserving key mappings; `inv` flips the order (descending) while keeping the sort stable.
-    kernel void key_from_i32(device const int* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { uint k = (uint)a[i] ^ 0x80000000u; out[i] = inv ? ~k : k; } }
-    kernel void key_from_u32(device const uint* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { uint k = a[i]; out[i] = inv ? ~k : k; } }
-    kernel void key_from_f32(device const uint* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], uint i [[thread_position_in_grid]]) {
-        if (i >= *nPtr) return; uint b = a[i]; if ((b & 0x7FFFFFFFu) == 0u) b = 0u; bool nan = (b & 0x7FFFFFFFu) > 0x7F800000u; if (nan) b = 0x7F800001u; /* -0 == +0; every NaN is one value after +inf */ uint k = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
-        /* NaN stays at the end when the order is reversed, next to the nulls, as in Arrow. UINT_MAX is
-           free: only a NaN can map to key 0, so only a NaN can invert to UINT_MAX. */
-        out[i] = inv ? (nan ? 0xFFFFFFFFu : ~k) : k;
-    }
-    kernel void key_from_i64(device const long* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { ulong k = (ulong)a[i] ^ 0x8000000000000000ul; out[i] = inv ? ~k : k; } }
-    kernel void key_from_u64(device const ulong* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { ulong k = a[i]; out[i] = inv ? ~k : k; } }
-    kernel void key_from_f64(device const ulong* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], uint i [[thread_position_in_grid]]) {
-        if (i >= *nPtr) return; ulong b = a[i]; if ((b & 0x7FFFFFFFFFFFFFFFul) == 0ul) b = 0ul; bool nan = (b & 0x7FFFFFFFFFFFFFFFul) > 0x7FF0000000000000ul; if (nan) b = 0x7FF0000000000001ul; ulong k = (b & 0x8000000000000000ul) ? ~b : (b | 0x8000000000000000ul);
-        out[i] = inv ? (nan ? 0xFFFFFFFFFFFFFFFFul : ~k) : k;
-    }
-    kernel void iota_u32(device uint* out [[buffer(0)]], device const uint* nPtr [[buffer(1)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) out[i] = i; }
     """ }
 }

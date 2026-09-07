@@ -323,7 +323,7 @@ public func am_sort(_ a: OpaquePointer?, _ descending: Int32, _ out: UnsafeMutab
     guard let x = handle(a) else { return 2 }
     return run(out) {
         let v = try x.decodedIfDictionary()
-        return try v.take(try v.argsortIndices(descending: descending != 0))
+        return try v.sortedValues(descending: descending != 0)
     }
 }
 /// Indices of the k largest (or smallest) values, in sorted order. Output is int32.
