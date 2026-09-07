@@ -59,6 +59,7 @@ to yet; the by-family status of every one of them is in [COVERAGE.md](COVERAGE.m
 
 ## Integrations
 
+- **Plan errors carry the right kind.** `am_plan_run` reports an engine type-check failure (an unknown column, say) as `Invalid ArrowArray: ...`; the message is right and the prefix is wrong. One enum case in the C shim.
 - **`am_import_ex` with a copy report.** `am_import` discards the Swift side's `ImportResult.zeroCopy`, so a binding cannot tell its caller whether the import wrapped or copied; the Rust and Node bindings infer it from pointer alignment. One extra out-parameter on a new entry point, kept ABI-compatible.
 - **arrow-swift and MLX:** `ArrowMetalSwiftArrow`, conversion to and from `apache/arrow-swift` arrays,
   and `ArrowMetalMLX`, a bridge to `MLXArray` for feeding columns into models. Neither target exists
