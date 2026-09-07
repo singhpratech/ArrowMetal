@@ -2,7 +2,7 @@
 
 Datasets larger than memory, answered on the Apple GPU. The rows flow from disk through the GPU one
 record batch at a time; the CPU never touches a value column. Only the *answer* grows with the input,
-so a 100 GB question runs in a few GB of RAM on a 64 GB machine.
+so RAM tracks the answer rather than the scan: measured to 30 GB on a 64 GB machine, with the resident state a few hundred megabytes.
 
 ```swift
 let rows = try StreamQuery(ipc: "/data/events")
