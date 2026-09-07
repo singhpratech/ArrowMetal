@@ -1394,3 +1394,44 @@ def test_scalar_skew_kurtosis_and_tdigest():
     assert a.tdigest(1.0) == pytest.approx(pc.max(values).as_py())
     assert a.tdigest(0.5) == pytest.approx(pc.quantile(values, q=0.5).to_pylist()[0], abs=0.5)
     assert am.array(pa.array([], pa.float64())).skew() is None
+
+
+def test_shift_view_is_the_same_answer_without_the_copy():
+    """`shift(view=True)` returns a two-chunk pyarrow.ChunkedArray sharing the input's buffers.
+
+    The values, the nulls and the order have to match the contiguous form exactly at every shift the
+    contiguous form accepts -- lag, lead, zero, a fill value, and shifts at or past the length -- so the
+    only difference between the two is where the bytes live."""
+    import numpy as np
+    for n in (0, 1, 2, 7, 31, 32, 33, 255, 256, 257, 1000):
+        values = [None if i % 5 == 0 else i - 500 for i in range(n)]
+        for src in (pa.array(values, pa.int64()),
+                    pa.array([0 if v is None else v for v in values], pa.int64())):
+            a = am.array(src)
+            for by in (0, 1, 2, 5, -1, -3, n, n + 1, -n, -(n + 1)):
+                for fill in (None, 7):
+                    want = a.shift(by, fill).to_arrow()
+                    view = a.shift(by, fill, view=True)
+                    assert isinstance(view, pa.ChunkedArray)
+                    assert view.type == src.type
+                    assert len(view) == n
+                    assert view.combine_chunks().equals(want), f"n={n} by={by} fill={fill}"
+    del np
+
+
+def test_shift_view_shares_the_input_buffers_and_outlives_it():
+    """Zero-copy means zero-copy: the chunked view keeps the device memory alive on its own, and the
+    slice chunk starts at the same address the input's values do (offset by the lead, for a lead)."""
+    import gc
+    src = pa.array(list(range(1000)), pa.int64())
+    a = am.array(src)
+    base = a.to_arrow().buffers()[1].address
+    lag = a.shift(1, view=True)
+    lead = a.shift(-1, view=True)
+    assert lag.chunk(1).buffers()[1].address == base
+    assert lead.chunk(0).buffers()[1].address == base
+    assert lead.chunk(0).offset == 1
+    del a, src
+    gc.collect()
+    assert lag.combine_chunks().to_pylist()[:3] == [None, 0, 1]
+    assert lead.combine_chunks().to_pylist()[-3:] == [998, 999, None]
