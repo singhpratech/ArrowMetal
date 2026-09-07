@@ -433,11 +433,13 @@ operations: 312 rows. The two builds are loaded into **one** process there and m
 case by case, because a build measured in its own process is measured at a different minute and at 1M
 rows the difference between two minutes is larger than the difference between the two builds.
 
-Every `sort` row is faster, from 1.02x to 265x. Every `argsort` row on a column with nulls is faster,
-from 2.6x to 278x. Every `argsort` row without nulls is unchanged to within 1% at 10M rows and above.
-Seven rows at 1M and 3M read 0.92–0.97x; the same sweep run with the *same* build on both sides
-produces rows at 0.88–0.96x, so that band is the harness, not the change. Nothing at 10M, 27M or 50M
-is slower.
+Every `sort` row at 10M rows and above is faster — 1.09x to 265x — and at 1M and 3M the range is
+0.99x to 143x, the 0.99x being an all-equal int32 column where 0.589 ms became 0.592. Every `argsort`
+row on a column with nulls is faster, from 2.6x to 278x. Every `argsort` row without nulls is
+unchanged to within 2% at 10M rows and above, which is what the code says it should be: that path is
+untouched. Seven rows at 1M and 3M read 0.92–0.97x; the same sweep run with the *same* build on both
+sides produces rows at 0.88–0.96x, so that band is the harness, not the change. Nothing at 10M, 27M
+or 50M is slower.
 
 | operation, 50M rows | shape | before | after |
 |---|---|---:|---:|
