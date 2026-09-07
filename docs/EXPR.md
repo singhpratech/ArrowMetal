@@ -140,6 +140,14 @@ An **untyped literal** (`col("x") > 100`, `(int 100)`) takes the type of the oth
 numeric, so comparing a `float32` column with `100` stays in `float32`. Pin a literal with
 `Expr.typedInt(100, .int32)` / `am.lit(100, "int32")` when you want a specific width.
 
+It takes the other operand's type only when it **fits** there; a literal that does not fit widens the
+pair instead of being truncated to it, because truncating would silently answer a different question.
+An integer literal outside the column's range promotes as if it carried its own smallest type
+(`int8_column > 200` compares in `int16`, not against `(char)200 == -56`; `uint8_column == -1` compares
+in `int16` and is false everywhere), and a **floating** literal against an integer column promotes the
+pair to `float64` under rule 1 (`int64_column >= 2.5` really does compare against 2.5). The same rule
+applies inside `if_else`, `fill_null`, `coalesce` and `is_in`.
+
 `sqrt`, `exp` and `ln` on an integer column promote to `float64`, as Arrow's do. `round` puts halves
 **away from zero** (Arrow's `half_towards_infinity`), matching ArrowMetal's existing `round`.
 

@@ -11,8 +11,8 @@ import Foundation
 // | filter fusion | `filter(filter(x, a), b)` -> `filter(x, and(a, b))` | one compaction pipeline instead of two |
 // | predicate pushdown | moves conjuncts below projections, sorts, group-bys, joins, unions | a GPU sort or hash join costs far more per row than a predicate |
 // | projection pruning | narrows scans and drops unused projection outputs | fewer columns is fewer bytes, and this engine is memory bound |
-// | expression CSE | drops duplicate outputs with the same canonical text | the kernel's own CSE only sees one query at a time |
-// | join reordering | puts the smaller estimated side on the build side of an inner join | the build side is the one that goes in the hash table |
+// | expression CSE | drops duplicate `with_columns` outputs with the same canonical text | the kernel's own CSE only sees one query at a time |
+// | join reordering | puts the smaller estimated side on the build side of an inner join, where the row order is not observable | the build side is the one that goes in the hash table |
 // | fusion planning | marks maximal element-wise + filter + aggregate regions | one kernel per region instead of one per operator |
 //
 // Fusion planning is not in this file — it is the physical planner's job (`PhysicalPlan.swift`),
