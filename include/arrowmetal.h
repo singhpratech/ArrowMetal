@@ -1403,6 +1403,10 @@ int am_parquet_read(am_parquet_file* f, const char** columns, int64_t n_columns,
                     am_parquet_batch** out);
 
 // Projection, row-group selection, statistics pushdown and the dictionary switch in one call.
+// A projection may name a column twice, and a file may have two columns of one name: the batch is
+// positional, so am_parquet_batch_column_name can repeat a name and every column is reachable.
+// Every non-zero return of an am_parquet_* function (and every -1 from one returning a count) sets
+// am_last_error() to a message naming that function and the argument it rejected.
 // `filters` is a semicolon-separated list of `name<op><literal>` with op one of == != < <= > >= and the
 // literal an integer, a float, or a double-quoted string; row groups whose footer statistics cannot
 // contain a match are never read. `dictionary` non-zero keeps a dictionary-encoded column encoded.

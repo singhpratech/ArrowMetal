@@ -230,8 +230,8 @@ let batch = try f.read(ParquetReadOptions(
 
 ```python
 cols = am.read_parquet("trades.parquet", columns=["price", "qty"],
-                       filters=[("price", ">", 100)], dictionary=False)
-total = cols["price"].sum()          # already on the GPU
+                       filters=[("price", ">", 100)])
+total = cols["price"].sum()          # already on the GPU, dictionary-encoded or not
 
 # Across several queries, keep the handle: mapping the file is a per-open cost.
 f = am.ParquetFile("trades.parquet")
@@ -389,6 +389,10 @@ ARROWMETAL_PARQUET_BIG=1 PYTHONPATH=python python -m pytest python/tests/test_pa
 ## Limits
 
 - **Struct and map columns** are not reassembled; read struct leaves by dotted path.
+- **Duplicate column names are kept, not merged.** `read` hands back a `ColumnSet` — a dict that is
+  positional underneath — so `read_parquet(path, columns=["a", "a"])` returns both columns and a file
+  with two columns of the same name reads both of them. Indexing by name gives the first; `names`,
+  `columns`, `items()` and iteration walk all of them in order.
 - **Nested lists** (`list<list<T>>`) are not assembled — one level of repetition only.
 - **`BIT_PACKED`** (the deprecated level encoding) and **LZO** are rejected.
 - **Encrypted files** are not supported.
@@ -409,9 +413,15 @@ ARROWMETAL_PARQUET_BIG=1 PYTHONPATH=python python -m pytest python/tests/test_pa
 - **`decimal256` (precision above 38) is rejected**, as is any Arrow type ArrowMetal does not carry.
 - **A `null`-typed column reads as an all-null `int32`**, because Parquet has no physical null type and
   the Arrow `null` annotation lives in the metadata this reader ignores.
-- **Reductions do not accept a dictionary array**, and `read_parquet` returns dictionary-encoded columns
-  encoded by default: pass `dictionary=False` (as `read_parquet_table` does) before calling `sum`, `min`
-  or any other kernel on such a column.
+- **A dictionary-encoded column decodes itself where the kernels cannot use the codes.** `read_parquet`
+  returns dictionary-encoded columns encoded (`dictionary=False`, which `read_parquet_table` passes,
+  materialises them instead), and the entry points that need the values rather than the codes decode
+  once on the way in: the reductions and statistical aggregates, arithmetic, comparison, `cast`, the
+  sorts and `top_k`, and the element-wise maths kernels. The decode is a GPU `take` of the values by
+  the codes, so it costs one pass; `dictionary=False` at read time is still the cheaper way to run
+  many operations over the same column. The one thing that does not decode for you is the fused
+  expression compiler behind `am.query` / `am.plan`, which reads flat columns only: hand it a column
+  read with `dictionary=False`.
 - **`PLAIN` `BYTE_ARRAY` pages are walked by one thread each** to find the value boundaries — the format
   gives no other option — so a byte-array column with a handful of very large pages has less parallelism
   than a wide one.
