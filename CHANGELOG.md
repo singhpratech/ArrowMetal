@@ -190,6 +190,13 @@ Fixed
     None; numpy scalars and strings were refused by `arrow_table`.
   - The public C header declared `am_plan_source` as both a typedef and a function; no C consumer
     (including the DuckDB extension) could compile it.
+  - Polars tier-2 plugin (its 8 tests had only ever skipped, because nobody had built the Rust
+    library): the scalar operand of `.add/.sub/.mul/.truediv` crossed as an `f64` and was narrowed
+    with Rust `as`, which saturates and truncates instead of refusing — `add(1000)` on an Int8
+    column silently became `add(127)`, `add(-1)` on a UInt8 one a no-op, `add(1.5)` on Int64
+    `add(1)`, and any integer past 2^53 lost its low bits (`add(2**60 + 1)` added `2**60`). The
+    operand now travels exactly and is range-checked against the column dtype, which is what the
+    tier-1 bridge's `struct.pack` does.
 
 Quality
 - CPU reference for every kernel; 630 XCTest cases in release including a scenario matrix over every type, null density, size

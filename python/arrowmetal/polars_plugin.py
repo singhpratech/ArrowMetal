@@ -20,8 +20,9 @@ The Rust crate lives in `polars-plugin/`. From the repository root:
     cd polars-plugin && cargo build --release             # -> target/release/libarrowmetal_polars.dylib
 
 `cargo build` is enough -- the plugin is a plain `cdylib` that Polars `dlopen`s, not a Python
-extension module, so `maturin` is optional. `maturin develop --release` also works and drops the
-same library into the active virtualenv; either way `_plugin_path()` finds it.
+extension module, so `maturin` is not needed and the maturin layout below is untested (the crate
+has no pyproject.toml). `plugin_path()` finds `polars-plugin/target/release/` on its own, and
+`ARROWMETAL_POLARS_PLUGIN` overrides the search.
 
 The crate pins `polars` 0.55.1 / `pyo3-polars` 0.28, the Rust crates py-polars 1.44.x is built
 from. Polars checks the plugin ABI when it loads the library and refuses a mismatched pair with

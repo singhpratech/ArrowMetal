@@ -32,11 +32,18 @@ export PYTHONPATH=python          # or: pip install ./python
 cd polars-plugin && cargo build --release && cd ..
 ```
 
-That is the whole build. `cargo build --release` is enough for the plugin -- it is a plain
-`cdylib` that Polars `dlopen`s, not a Python extension module, so `maturin` is optional.
-`maturin develop --release` works too and drops the same library into the active virtualenv;
-either way `arrowmetal.polars_plugin.plugin_path()` finds it, and `ARROWMETAL_POLARS_PLUGIN`
-overrides the search.
+That is the whole build, and both halves are checked: on an M4 Max the Swift product takes about
+70 s and the cargo release build about 80 s from an empty `target/`, with no other flags and no
+`DYLD_LIBRARY_PATH`. `cargo build --release` is enough for the plugin -- it is a plain `cdylib`
+that Polars `dlopen`s, not a Python extension module, so `maturin` is optional, and
+`arrowmetal.polars_plugin.plugin_path()` finds `polars-plugin/target/release/` on its own.
+`ARROWMETAL_POLARS_PLUGIN` overrides the search.
+
+`maturin develop --release` is the **untested** path: `polars-plugin/` has no `pyproject.toml`,
+and `plugin_path()` looks for a maturin install at
+`<sys.path>/arrowmetal_polars/libarrowmetal_polars.dylib`, which is not the layout maturin
+produces for a `cdylib` crate. Use `cargo build --release`, or set `ARROWMETAL_POLARS_PLUGIN` to
+whatever you did build.
 
 The plugin's `build.rs` links `libArrowMetalC.dylib` by **rpath**. The dylib's install name is
 `@rpath/libArrowMetalC.dylib`, so `polars-plugin/arrowmetal-sys/build.rs` finds the directory
@@ -50,7 +57,10 @@ Cargo passes a build script's link arguments only to the crate that owns it.
 
 `polars-plugin/Cargo.toml` pins `polars` 0.55.1 and `pyo3-polars` 0.28.0. Those are the Rust
 crates **py-polars 1.44.x** is built from: the polars workspace at tag `py-1.44.1` carries
-`version = "0.55.1"`, and pyo3-polars 0.28 is the release that depends on `polars ^0.55.1`.
+`version = "0.55.1"`, and pyo3-polars 0.28 is the release that depends on `polars ^0.55.1`. The
+requirement is a caret, so `Cargo.lock` currently resolves polars 0.55.2 and `polars-ffi` 0.55.2;
+the ABI check is on `polars_ffi`'s major/minor, so that patch bump loads against py-polars 1.44.1
+without complaint.
 
 Polars checks the plugin ABI when it loads the library (`_polars_plugin_get_version`, which
 returns `polars_ffi`'s major/minor packed into a `u32`) and refuses a mismatched pair with
@@ -110,8 +120,10 @@ df.arrowmetal.to_metal() / .device()
 lf.arrowmetal.collect_gpu(query_or_callable)
 ```
 
-Results come back as Polars objects. Scalar reductions come back as Python scalars, exactly as
-`pl.Series.sum()` does.
+Results come back as Polars objects. Scalar reductions come back as Python scalars, as
+`pl.Series.sum()` does -- with one difference, in both tier 1 and tier 2: the sum of an **empty or
+all-null** column is `None`, where `pl.Series.sum()` answers `0`. `am_reduce` has nothing to add
+up and says so; `min`, `max` and `mean` are `None` on both sides.
 
 Grouped aggregates available through `.agg`: `sum`, `mean`, `min`, `max`, `count`, `len`,
 `n_unique`, `first`, `last`, `median`, `std`, `var`, `product`, `any`, `all`, plus
@@ -190,6 +202,42 @@ point of the tier -- tier 1 needs a materialised frame, tier 2 does not.
 
 `.filter_sum` is the shape that pays for itself: one GPU compaction plus one reduction, with the
 filtered column never crossing back into Polars.
+
+### What tier 2 accepts
+
+Narrower than the bridge, and not the same list as the "Types" paragraph under Limits -- that one
+is about what *round-trips*, which is a tier-1 and tier-3 question.
+
+| Expression | Dtypes |
+|---|---|
+| `.sum()` / `.min()` / `.max()` / `.mean()` / `.filter_sum()` / `.top_k()` / `.add` … / `.group_by_sum()` | Int8/16/32/64, UInt8/16/32/64, Float32/64 -- nothing else |
+| `.hash64()` | those, plus Boolean, Date, Datetime, Duration, Time and String |
+| `.contains` / `.starts_with` / `.ends_with` / `.upper` / `.lower` | String |
+
+Everything else -- Boolean, the temporal types, Binary, Categorical, Enum, Decimal, List, Struct,
+Null -- raises a Polars `ComputeError` whose message starts `arrowmetal:`. Nothing panics through
+pyo3. **Categorical and Enum are the one place tier 2 is genuinely behind tier 1**: the Python
+bridge recodes Polars' `dictionary<uint32>` index buffer to int32 for the GPU, and
+`polars-plugin/src/bridge.rs` does not, so a Categorical column reaches the kernel as-is and is
+refused with "dictionary indices must be int32 or int64". Decimal is the other: `am_decimal_op`
+backs `s.arrowmetal.sum()` in tier 1, and the plugin does not reach for it.
+
+### The scalar in `.add` / `.sub` / `.mul` / `.truediv`
+
+"Integers wrap" is about the **arithmetic**: `127 + 1` is `-128` on an Int8 column, and integer
+division by zero is 0. It is not about the **operand**. A scalar the column's type cannot hold
+exactly is an error, the same call the tier-1 bridge makes (it packs the scalar with
+`struct.pack` at the column's own width, and `struct.pack` raises):
+
+```python
+pl.col("i8").arrowmetal.add(1000)      # raises: 1000 is out of range for an Int8 column
+pl.col("u8").arrowmetal.add(-1)        # raises: -1 is out of range for a UInt8 column
+pl.col("i64").arrowmetal.add(1.5)      # raises: an integer column takes an integer scalar
+pl.col("i64").arrowmetal.add(2**60+1)  # exact -- the scalar does not go through an f64
+```
+
+A float column takes either an integer or a float, and an operand too large for Float32 becomes an
+infinity, which is what `struct.pack("f", 1e300)` gives tier 1.
 
 ### `group_by_sum`, and what the plugin API cannot do
 
@@ -372,7 +420,9 @@ from 4096 distinct values.
 
 ## Limits
 
-**Types.** Every dtype Polars and Arrow share round-trips: all signed and unsigned integer widths,
+**Types.** This paragraph is about what the **bridge** round-trips, which is a tier-1 and tier-3
+question; tier 2's expressions accept a shorter list, set out in "What tier 2 accepts" above.
+Every dtype Polars and Arrow share round-trips: all signed and unsigned integer widths,
 Float32/64, Boolean, Date, Datetime (all units), Time, Duration, String, Binary. `Categorical` and
 `Enum` also work, but Polars encodes them as `dictionary<uint32>` and `dictionary<uint8>` while
 ArrowMetal wants int32 or int64 indices, so the bridge recodes the index buffer -- 4 bytes a row,
@@ -398,7 +448,10 @@ so U+00DF becomes `ẞ` where Polars' `str.to_uppercase()` gives `SS`, and `ﬁ`
 `contains` / `starts_with` / `ends_with` are literal, not regex.
 
 **Arithmetic.** `.add/.sub/.mul/.truediv` in tier 2 keep the column's own type and follow Arrow's
-*unchecked* rules: integers wrap, and integer division by zero yields 0 where Polars raises.
+*unchecked* rules for the operation: integers wrap, and integer division by zero yields 0 where
+Polars raises. The **operand** is checked -- one the column's type cannot hold raises rather than
+being clamped or truncated, and an integer operand is exact past 2^53. See "The scalar in `.add`"
+above.
 
 **Joins.** GPU path only for a single-column inner or left join against a unique right key;
 everything else falls back to Polars (or raises with `allow_cpu_fallback=False`).
@@ -419,7 +472,7 @@ version.
 ## Tests
 
 ```
-PYTHONPATH=python python -m pytest python/tests/test_polars.py -q     # 66 tests
+PYTHONPATH=python python -m pytest python/tests/test_polars.py -q     # 90 tests
 cd polars-plugin/arrowmetal-sys && cargo test --release               # 10 tests
 ```
 
@@ -428,4 +481,11 @@ all-null and chunked), the namespace methods against native Polars at five sizes
 100,003 rows, the plugin expressions inside lazy plans, the join against `pl.DataFrame.join`,
 zero-copy assertions on buffer addresses, and 50M-row timings as assertions with bounds generous
 enough not to flake. The plugin tests skip when the Rust library has not been built, so a
-checkout without a Rust toolchain still runs green.
+checkout without a Rust toolchain still runs green -- **build it before you trust a green run**,
+or 28 of the 90 are skips (`62 passed, 28 skipped`).
+
+The tier-2 block at the end of the file is the adversarial pass: the scalar operand against the
+tier-1 bridge, nulls against native Polars, a sliced Series and a two-chunk one, an empty frame,
+an all-set validity bitmap with no nulls, the twelve dtypes the numeric expressions refuse (each
+one a Polars error carrying ArrowMetal's wording, never a pyo3 panic), and the expression inside
+`group_by().agg()` and inside `collect(engine="streaming")`.

@@ -867,4 +867,5 @@ def test_plugin_runs_inside_group_by_agg_and_a_streaming_plan():
             .with_columns(pl.col("s").arrowmetal.upper().alias("up"))
             .collect(engine="streaming")["up"].to_list() == ["C", "D", "E"])
     assert (df.lazy().group_by("k").agg(pl.col("v").arrowmetal.sum().alias("total"))
-            .sort("k").collect(engine="streaming").to_dicts() == want.select("k", "total").to_dicts())
+            .sort("k").collect(engine="streaming").to_dicts()
+            == want.select("k", "total").to_dicts())
