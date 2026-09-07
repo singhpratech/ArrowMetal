@@ -16,6 +16,11 @@ Thanks for looking. This project is small enough to hold in your head; please ke
   release-only miscompile (see the comment at `Sources/ArrowMetal/MetalArray.swift:283`).
 - Run `swift run -c release arrowmetal-bench` before and after a performance change and paste both tables in
   the PR.
+- Run the binding suites when you touch them: `PYTHONPATH=python python -m pytest python/tests -q` for
+  Python, and for R
+  `ARROWMETAL_LIB=$PWD/.build/release/libArrowMetalC.dylib Rscript -e 'testthat::test_local("r/arrowmetal")'`
+  (see [docs/R.md](docs/R.md); `r/arrowmetal/src/arrowmetal.h` is a copy of `include/arrowmetal.h` and a test
+  fails when it goes stale).
 
 ## Setup
 ```

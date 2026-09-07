@@ -8,6 +8,7 @@ pushed. Numbers are from the last gated run of `main` (0.1.0, unreleased) on an 
 | Swift suites (`Tests/ArrowMetalTests`) | 764 tests in 60 files, run in release | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
 | Python suites (`python/tests`) | 2,460 collected cases over the ctypes API and the three integrations | `pyarrow.compute`, Polars, DuckDB, pandas |
 | Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | 39,069 generated cases, 45 column types, every public operation | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
+| R suites (`r/arrowmetal/tests/testthat`) | 179 tests over the 34 ABI entry points the R binding wraps | base R and the `arrow` R package's own kernels on the same data ([R.md](R.md)) |
 | Adversarial review pass | four independent reviewers plus a coverage pass before release | each finding carries a regression test |
 | Benchmarks (`Benchmarks/`) | 339 operation-and-size rows over 173 operations, against four CPU libraries; streaming and engine benches | measured, never estimated ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md)) |
 
@@ -19,7 +20,14 @@ swift build -c release
 swift test -c release                                   # release is required: a release-only miscompile has bitten this project once
 PYTHONPATH=python python -m pytest python/tests -q      # all Python suites, including the differential file
 PYTHONPATH=python python python/tests/differential_report.py   # the matrix as one report; exit 0 = nothing unclassified
+ARROWMETAL_LIB=$PWD/.build/release/libArrowMetalC.dylib \
+  Rscript -e 'testthat::test_local("r/arrowmetal")'            # the R binding
 ```
+
+The R suite needs R with `arrow` and `testthat`; `R CMD INSTALL r/arrowmetal` first, or point
+`ARROWMETAL_LIB` at the dylib as above. On a conda-built R whose `Makeconf` names a compiler that
+is not on `PATH`, put `CC = clang` in `~/.R/Makevars` before installing. `R CMD check --no-manual`
+on the built tarball is the fuller gate and is clean (0 errors, 0 warnings, 0 notes).
 
 Tests that need a real GPU skip on virtual Metal devices (`requireRealGPU()`), so a hosted CI runner
 exercises the host paths only; the numbers above are from a physical Mac.
