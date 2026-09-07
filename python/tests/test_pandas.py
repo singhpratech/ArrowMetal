@@ -860,3 +860,47 @@ print("ok")
                          capture_output=True, text=True, env=env)
     assert out.returncode == 0, out.stdout + out.stderr
     assert "ok" in out.stdout
+
+
+def test_disabled_is_process_wide_not_per_thread():
+    """`disabled()` flips a module global, so it turns the layer off for *every* thread.
+
+    The answers do not change -- this only moves where the work runs -- but it is a footgun worth
+    pinning: a `disabled()` block held around something slow de-accelerates the whole process for
+    its duration, and the calls it diverts land in neither `stats().gpu` nor `stats().cpu`.
+    docs/PANDAS.md says so; this makes it fail loudly if it ever becomes thread-local by accident.
+    """
+    import threading
+    s = pd.Series(np.arange(100, dtype=np.int64))
+    inside, released = threading.Event(), threading.Event()
+    seen = {}
+
+    def holder():
+        with accel.disabled():
+            inside.set()
+            released.wait(10)
+
+    def worker():
+        assert inside.wait(10)
+        accel.reset_stats()
+        seen["value"] = s.sum()
+        seen["gpu"] = accel.stats().gpu_calls
+        seen["cpu"] = accel.stats().cpu_calls
+        seen["intercepted"] = accel.stats().intercepted
+        released.set()
+
+    with accelerated():
+        threads = [threading.Thread(target=holder), threading.Thread(target=worker)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(15)
+
+        assert seen["value"] == s.sum(), "the answer must be right either way"
+        assert seen["gpu"] == 0, "another thread's disabled() block did not reach this thread"
+        assert seen["cpu"] == 0, "a disabled call is not recorded as a fallback"
+        assert seen["intercepted"] >= 1
+
+        accel.reset_stats()                  # and only for the duration of that block
+        s.sum()
+        assert accel.stats().gpu_calls == 1
