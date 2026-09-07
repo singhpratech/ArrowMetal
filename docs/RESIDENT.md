@@ -1,4 +1,4 @@
-# The resident GPU worker: why it cannot exist on Apple silicon, and what took its place
+# The resident GPU worker: why it does not work on Apple silicon today, and what took its place
 
 Every unbatched ArrowMetal call is one command buffer, and a command-buffer round trip on an M4 Max
 costs about 65 µs of which the GPU runs for 1.5. Below roughly 100k rows that fixed cost is the whole

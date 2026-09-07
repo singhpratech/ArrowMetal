@@ -13,7 +13,7 @@ Run time 29.4 minutes; raw numbers in `Benchmarks/results/full_matrix_2026-09-07
 - `--` in a library column means that library has no equivalent operation (the reason is in the CSV's `note` column); `err` means the call raised, and the message is in the CSV. Nothing is skipped silently.
 - Bandwidth (GB/s) is bytes touched (input + output) over wall time. Where ArrowMetal and the best baseline are both near the machine's ~400 GB/s unified-memory ceiling the operation is memory-bound and no ratio above ~1.5x is available to either side.
 
-**339 operations measured.** 247 at or above 3x (✅), 62 between 1x and 3x (⚠️), 15 slower than the fastest CPU library (❌), of which 0 are operations ArrowMetal does not have at all (the call raised). 72% of the surface meets the bar.
+**339 rows measured, over 173 operations** (13 measured at one size, 154 at two, 6 at three). 247 at or above 3x (✅), 62 between 1x and 3x (⚠️), 15 slower than the fastest CPU library (❌) — none of them a call that raised — and 15 with no CPU equivalent to compare against (—). 73% of the measured rows meet the bar.
 
 ## reductions
 

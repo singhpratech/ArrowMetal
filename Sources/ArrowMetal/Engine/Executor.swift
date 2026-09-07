@@ -9,10 +9,11 @@ import Foundation
 // (`docs/DESIGN.md`, "Lengths flow on the GPU"), so a filter feeding a projection feeding another
 // filter never returns to the CPU.
 //
-// Four operators are unavoidable sync points, because the CPU has to know a count before it can size
+// Five operators are unavoidable sync points, because the CPU has to know a count before it can size
 // the next dispatch: `GroupByKeys` (the number of groups), the hash join (the number of pairs), the
-// top-k selection and `explode` (the total child length). `MetalContext.flush(reopen: true)` commits,
-// waits and reopens the batch at each of those, so batching resumes immediately afterwards.
+// top-k selection, `explode` (the total child length) and `slice` (a CPU-side view of rows that must
+// already exist). `MetalContext.flush(reopen: true)` commits, waits and reopens the batch at each of
+// those, so batching resumes immediately afterwards.
 //
 // Buffers come from and go back to `MetalContext.pool`, which parks rather than recycles while a batch
 // is open, so an intermediate's memory is reused by the next operator of the same shape without ever

@@ -3,7 +3,7 @@
 Things learned the hard way. Add to this whenever something surprises you.
 
 ## Ecosystem research (2026-09-06)
-- `apache/arrow-swift` v21: types, IPC, Flight, C Data Interface. No compute kernels, nothing Metal. ~32 stars.
+- `apache/arrow-swift` v21: types, IPC, Flight, C Data Interface. No compute kernels, nothing Metal.
 - `arrow-nanoarrow` device extension: C wrapper for `ARROW_DEVICE_METAL` buffers, no compute.
 - cuDF: CUDA only. MLX: unified-memory tensors, zero-copy `MTLBuffer` access, no nulls or columnar semantics.
 - A DuckDB extension with Metal aggregates exists (gpudb); it does not use Arrow buffers.
@@ -36,7 +36,7 @@ Things learned the hard way. Add to this whenever something surprises you.
 - Threadgroup-privatised group-by with 32-bit atomics reaches ~300 GB/s for up to 1024 keys, the same rate
   as a plain sum: the atomics are not the bottleneck at that key count. Device atomics at 100k keys halve it.
 - Crossing the C boundary from Python costs nothing measurable per call (ctypes overhead is ~10 µs);
-  exporting a result back to pyarrow is zero-copy (3.55 ms vs 3.57 ms with export).
+  exporting a result back to pyarrow costs nothing measurable (3.55 ms vs 3.57 ms with export).
 - Importing pyarrow buffers is one memcpy: pyarrow's allocator is 64-byte aligned, not page aligned.
 
 ## Round 4 (2026-09-06)
@@ -76,7 +76,8 @@ Things learned the hard way. Add to this whenever something surprises you.
 ## Round 8 (2026-09-06): the differential matrix over the whole type surface
 
 Extending `python/tests/test_differential.py` to every type ArrowMetal imports (45 columns, 181
-operations, 33,156 cases) turned up three bugs and one crash **in pyarrow 25.0.1**, not in ArrowMetal.
+operations, 33,156 cases at the time; 212 operations and 39,069 cases today) turned up three bugs and one
+crash **in pyarrow 25.0.1**, not in ArrowMetal.
 They are recorded here because the harness has to work around them, and each has a test that fails if a
 later pyarrow fixes it.
 

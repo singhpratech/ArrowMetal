@@ -5,11 +5,11 @@ pushed. Numbers are from the last gated run of `main` (0.1.0, unreleased) on an 
 
 | Layer | Size | Oracle |
 |---|---|---|
-| Swift suites (`Tests/ArrowMetalTests`) | 756 tests in 60 files, run in release | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
-| Python suites (`python/tests`) | 2,460 tests over the ctypes API and the three integrations | `pyarrow.compute`, Polars, DuckDB, pandas |
+| Swift suites (`Tests/ArrowMetalTests`) | 764 tests in 60 files, run in release | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
+| Python suites (`python/tests`) | 2,460 collected cases over the ctypes API and the three integrations | `pyarrow.compute`, Polars, DuckDB, pandas |
 | Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | 39,069 generated cases, 45 column types, every public operation | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
 | Adversarial review pass | four independent reviewers plus a coverage pass before release | each finding carries a regression test |
-| Benchmarks (`Benchmarks/`) | 339 operations × 2 sizes × 3 CPU libraries; streaming and engine benches | measured, never estimated ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md)) |
+| Benchmarks (`Benchmarks/`) | 339 operation-and-size rows over 173 operations, against four CPU libraries; streaming and engine benches | measured, never estimated ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md)) |
 
 Run everything:
 
@@ -26,8 +26,8 @@ exercises the host paths only; the numbers above are from a physical Mac.
 
 ## 1. Swift suites
 
-Every GPU kernel has a CPU reference (`Sources/ArrowMetal/CPUReference.swift` and per-suite oracles) and
-is compared against it across types, sizes, null densities and input shapes. Sizes are chosen to cross
+A CPU reference sits behind the kernels (`Sources/ArrowMetal/CPUReference.swift` and per-suite oracles) and
+each is compared against it across types, sizes, null densities and input shapes. Sizes are chosen to cross
 every threadgroup and simdgroup boundary (0, 1, 31, 32, 33, 1023, 1024, 1025, 65535, 65536, 65537, and
 odd lengths above a million), null ratios are 0, 0.3 and 1.0, and every selection entry point is run on
 a sliced input at offsets 1, 7, 31, 32, 33, 63 and 64 against the same rows built standalone.
@@ -49,7 +49,10 @@ a sliced input at offsets 1, 7, 31, 32, 33, 63 and 64 against the same rows buil
 
 ## 2. Python suites
 
-| File | Tests | Compares against |
+The column below counts `def test_*` functions. The 2,460 in the table at the top of this page is what
+pytest *collects*, which is larger because a parametrised function collects once per parameter set.
+
+| File | Test functions | Compares against |
 |---|---|---|
 | `test_arrowmetal.py` | 114 | `pyarrow.compute` and plain Python over the ctypes API, zero-copy import/export, the wheel loader |
 | `test_options.py`, `test_checked.py`, `test_strings_extra.py`, `test_float64_math.py` | 113 | option surfaces (null placement, tiebreakers, cast safety, rounding), checked arithmetic, string kernels, binary64 math |
