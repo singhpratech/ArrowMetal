@@ -789,3 +789,28 @@ def test_index_is_preserved(frames):
     both(s, lambda x: x.sort_values(kind="stable") if False else x.nlargest(5))
     both(s, lambda x: x[x > 0])
     both(df, lambda d: d[d["i"] > 0])
+
+
+# ---------------------------------------------------------------------------------------------
+# Regression tests from the pre-release integration review.
+# ---------------------------------------------------------------------------------------------
+
+def test_query_lifts_only_the_columns_it_names():
+    """`df.am.query` used to lift *every* column of the frame onto the GPU.
+
+    So a query over two numeric columns failed on any frame that also carried a column the
+    expression compiler cannot read -- an object column, a struct, a period -- even though the
+    query never named it. The Polars twin has always read the `(col "name")` references out of the
+    serialised query and lifted only those (`test_query_imports_only_the_columns_it_names`); this
+    is the same rule for pandas.
+    """
+    df = pd.DataFrame({"x": [1, 2, 3], "y": [4.0, 5.0, 6.0],
+                       "junk": pd.Series([{"a": 1}, {"a": 2}, {"a": 3}], dtype=object)})
+    got = df.am.query(am.filter(am.col("x") > 1).sum(am.col("x")))
+    assert got == 5
+    # a query that names the unreadable column still says so
+    with pytest.raises(am.ArrowMetalError):
+        df.am.query(am.filter(am.col("junk") > 1).sum(am.col("x")))
+    # and a query naming a column that is not in the frame at all is a clear error, not a KeyError
+    with pytest.raises(am.ArrowMetalError, match="not in the frame"):
+        df.am.query(am.filter(am.col("nope") > 1).sum(am.col("x")))
