@@ -421,7 +421,8 @@ is at least as fast, it stays, and `Kernels/TDigestGPU.swift` records both numbe
 7.85 ms at 10M and 39.3 → 39.3 at 50M, float64 8.02 → 7.99 and 39.9 → 40.1. So do `lexsort`
 (7.19 → 7.11 at 10M, 37.5 → 37.5 at 50M), `partition_nth_indices` (3.04 → 3.07 and 12.2 → 12.3) and
 `select_k_unstable` (1.18 → 0.95 and 2.53 → 2.55). `top_k` reads 1.24 → 0.97 ms at 10M and
-2.54 → 2.65 at 50M, which is noise on a 2.5 ms call in a kernel this work did not touch.
+2.54 → 2.65 at 50M; the 50M row is noise on a 2.5 ms call in a kernel this work did not touch, and
+measuring the two builds alternately in one process puts their medians at 2.677 and 2.683 ms.
 
 ### The shape sweep
 
