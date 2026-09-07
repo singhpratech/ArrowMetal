@@ -3,11 +3,32 @@
 Apache Arrow arrays on the Apple silicon GPU, from Python. A ctypes wrapper over `libArrowMetalC.dylib`;
 input and output go through the Arrow C Data Interface, so it composes with pyarrow, Polars, pandas and DuckDB.
 
+## Install
+
+Two ways, both from this repository. ArrowMetal is not on PyPI yet — publishing 0.1.0 is a release-time
+step the maintainer performs, and the checklist for it is [docs/RELEASE.md](../docs/RELEASE.md).
+
+**From source**, the development path. Needs the Swift toolchain:
+
 ```
 swift build -c release --product ArrowMetalC          # builds .build/release/libArrowMetalC.dylib
 pip install pyarrow
 PYTHONPATH=python python -c "import arrowmetal as am; print(am.device_name())"
 ```
+
+**From a wheel**, which carries the dylib and needs no Swift toolchain at install time:
+
+```
+pip install build                                     # the wheel build frontend, once
+scripts/build_wheel.sh                                # swift build, then the wheel
+pip install python/dist/arrowmetal-0.1.0-*.whl        # pyarrow comes with it
+pip install 'python/dist/arrowmetal-0.1.0-*.whl[polars,duckdb,pandas]'   # optional bridges
+python -c "import arrowmetal as am; print(am.device_name())"
+```
+
+The wheel is `arrowmetal-0.1.0-py3-none-macosx_14_0_arm64.whl`, about 2.7 MB. It is macOS arm64 only:
+it links Metal and holds an arm64 binary. Extras `polars`, `duckdb`, `pandas` and `test` pull in the
+libraries the corresponding bridges and the test suite want; none of them are needed to `import arrowmetal`.
 
 ```python
 import pyarrow as pa, polars as pl, arrowmetal as am
@@ -31,14 +52,29 @@ See `Benchmarks/python_gpu_bench.py` for a side-by-side with Polars, pyarrow.com
 
 ```
 pip install build                    # the wheel build frontend
-scripts/build_wheel.sh               # -> python/dist/arrowmetal-0.1.0-*-macosx_*_arm64.whl
+scripts/build_wheel.sh               # swift build, then the wheel
+python/build_wheel.sh                # just the wheel, when .build/release/libArrowMetalC.dylib exists
 ```
 
-The script builds `libArrowMetalC.dylib` in release, copies it into `python/arrowmetal/` and runs
-`python -m build --wheel` in `python/`, so the wheel carries the dylib as package data and needs no
-`swift build` at install time. The loader prefers the bundled dylib, then `.build/release`, then
-`.build/debug`, then the usual system prefixes; `$ARROWMETAL_LIB` overrides all of them. The wheel is
-macOS arm64 only: it links Metal and holds an arm64 binary.
+`python/build_wheel.sh` copies `.build/release/libArrowMetalC.dylib` into `python/arrowmetal/_lib/`,
+runs `python -m build --wheel` in `python/` with the platform tag `macosx_14_0_arm64`, checks that the
+dylib really is inside the archive, and prints the wheel's path and size.
+`scripts/build_wheel.sh` is the same thing with `swift build -c release --product ArrowMetalC` in front.
+The version comes from one place, `__version__` in `arrowmetal/__init__.py`; `pyproject.toml` reads it.
+
+`ARROWMETAL_DYLIB` points the script at a dylib somewhere other than `.build/release`, and `PLAT_TAG`
+overrides the platform tag.
+
+### Where the dylib is found
+
+`arrowmetal` looks for `libArrowMetalC.dylib` in this order:
+
+1. **Bundled in the installed package**, `arrowmetal/_lib/libArrowMetalC.dylib` — what a wheel install has.
+2. **`$ARROWMETAL_LIB`**, the full path to a dylib.
+3. **The development build**, `.build/release/libArrowMetalC.dylib` beside a source checkout
+   (then `.build/debug`, then `/usr/local/lib` and `/opt/homebrew/lib`).
+
+When none of the three exists the import fails with an `OSError` that names all three and how to satisfy each.
 
 ## Tests
 

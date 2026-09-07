@@ -77,9 +77,18 @@ fixed cost of a GPU dispatch (see [docs/DESIGN.md](docs/DESIGN.md) for the pipel
 
 ## From Python
 
+Two ways to install, both from this checkout. ArrowMetal is **not on PyPI yet**: publishing 0.1.0 is a
+release-time step the maintainer performs, and [docs/RELEASE.md](docs/RELEASE.md) is the checklist for it.
+
 ```
+# From source (needs the Swift toolchain)
 swift build -c release --product ArrowMetalC        # .build/release/libArrowMetalC.dylib
 PYTHONPATH=python python -c "import arrowmetal as am; print(am.device_name())"
+
+# From a wheel that carries the dylib (no Swift toolchain at install time)
+pip install build && scripts/build_wheel.sh         # or python/build_wheel.sh, if the dylib is built
+pip install python/dist/arrowmetal-0.1.0-*.whl      # macOS arm64 only, pyarrow comes with it
+python -c "import arrowmetal as am; print(am.device_name())"
 ```
 ```python
 import pyarrow as pa, polars as pl, arrowmetal as am
