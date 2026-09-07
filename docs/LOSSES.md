@@ -1,4 +1,4 @@
-# Where ArrowMetal loses, and why
+# Where ArrowMetal needs to improve, and why
 
 The project's bar is 3x over the fastest of Polars, pyarrow and pandas/numpy on every operation at
 scale. This page is the honest remainder: every measured row from the full matrix
