@@ -194,9 +194,11 @@ here because the matrix has to work around them, and each has a test that fails 
 | `pc.winsorize` on a sliced column | the same offset bug — it answers with the *wrong rows* null, and puts values where the input has nulls | ArrowMetal honours the offset; the matrix hands the oracle a materialised copy | `test_pyarrow_winsorize_ignores_the_array_offset` |
 | `pc.binary_slice` with its own default `stop` | `sys.maxsize` overflows the output-size arithmetic: `ArrowInvalid: Negative buffer resize` | the matrix names an explicit stop past every generated value | `test_pyarrow_binary_slice_overflows_on_its_own_default_stop` |
 
-And one is a crash rather than a wrong answer: `pc.year_month_day` and `pc.iso_calendar` corrupt the
-heap in pyarrow 25.0.1 and segfault the process a couple of allocations later, so the matrix never
-calls them — `temporal_struct` compares the two struct-valued kernels field by field against
+And one was a crash rather than a wrong answer: in the first run of this matrix `pc.year_month_day` and
+`pc.iso_calendar` corrupted the heap in pyarrow 25.0.1 and the process segfaulted a couple of allocations
+later. A deliberate attempt to reproduce it on 2026-09-07 (the same recipe, thousands of iterations, every
+timestamp unit, under guard malloc) did not crash, so it is recorded as observed once and unexplained, not
+as a confirmed bug, and the matrix still never calls them — `temporal_struct` compares the two struct-valued kernels field by field against
 `pc.year`/`pc.month`/`pc.day` and `pc.iso_year`/`pc.iso_week`/`pc.day_of_week` instead, which is a
 stronger check anyway. See `docs/FINDINGS.md`.
 

@@ -61,7 +61,7 @@ paying row-count prices for distinct-count work.
    are (a *row* sample would not: it sees the frequent keys and misses the rest). The estimate only sizes
    the real table, and being wrong costs a retry, never a wrong answer.
 3. **Build** the table with three slots per estimated distinct value: linear probing, `slots[s] = row + 1`
-   so every atomic stays 32-bit (Metal has no 64-bit atomics), and the key of an occupied slot is the
+   so every atomic stays 32-bit (Metal has no 64-bit atomic add; it has 64-bit atomic min and max only, see UPSTREAM.md), and the key of an occupied slot is the
    string of row `slots[s] - 1`. Equality is decided by **comparing the bytes** of the candidate against
    that representative, the same rule `is_in` uses, so a 64-bit hash collision costs one extra probe and
    can never merge two different strings. Each row also records the slot it landed in and folds itself
@@ -184,7 +184,7 @@ three shapes, and the point of the current design is that **none of them sorts t
 **Atomic accumulation** (`Kernels/GroupBy.swift`, `GroupBySource.swift`) is one linear pass. For
 `K <= 1024` each threadgroup keeps a private table in threadgroup memory and merges it into the device
 table once; above that the updates go straight to device memory. 64-bit sums are a pair of 32-bit atomic
-adds with an explicit carry, because Metal has no 64-bit atomic.
+adds with an explicit carry, because Metal has no 64-bit atomic add (only min and max, UPSTREAM.md).
 
 **Sort-free extremes** (`Kernels/GroupByExtrema.swift`) is how `min`, `max` and `hash_min_max` avoid the
 missing 64-bit atomic. Every element type maps order-preservingly into a 64-bit unsigned key. Pass one

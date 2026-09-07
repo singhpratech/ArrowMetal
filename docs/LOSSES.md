@@ -85,7 +85,7 @@ be updated by a thread that owns it exclusively — which means one private tabl
 threadgroup. At a thousand groups that is 8 KB a lane, and 32 KB of threadgroup memory holds four of
 them. Every arrangement that fits — one lane owning `g % 32`, or the values shuffled to their owner —
 puts one lane's `d_add` under a mask while the other 31 wait, and pays 32 times the arithmetic. The
-counting sort exists precisely because there are no 64-bit atomics.
+counting sort exists precisely because there is no 64-bit atomic add (the shading language exposes 64-bit atomic min and max only; UPSTREAM.md).
 
 What is left is the group count itself. The moment kernels give a whole threadgroup to one group, so a
 thousand groups is a thousand threadgroups, and only a fraction of them are resident at once: the

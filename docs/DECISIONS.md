@@ -43,7 +43,7 @@ Kernel outputs that are fully written skip zeroing.
 
 ## 2026-09-06: Reductions without atomics
 Each threadgroup writes a partial; the host (or a scan kernel) finalises. Deterministic float sums, works for
-64-bit integers (Apple GPUs expose no 64-bit atomics from MSL).
+64-bit integers (the Metal Shading Language exposes no 64-bit atomic add on Apple GPUs; only 64-bit atomic min and max, measured on an M4 Max, see [UPSTREAM.md](UPSTREAM.md)).
 
 ## 2026-09-06: Float64 on the GPU: bit-pattern ordering plus software IEEE-754
 Metal has no `double`. Compare, min, max, filter, take and slice treat Float64 as `long` with an
