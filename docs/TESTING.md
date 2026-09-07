@@ -8,6 +8,7 @@ pushed. Numbers are from the last gated run of `main` (0.1.0, unreleased) on an 
 | Swift suites (`Tests/ArrowMetalTests`) | 764 tests in 60 files, run in release | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
 | Python suites (`python/tests`) | 2,460 collected cases over the ctypes API and the three integrations | `pyarrow.compute`, Polars, DuckDB, pandas |
 | Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | 39,069 generated cases, 45 column types, every public operation | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
+| Go binding (`go/arrowmetal`) | 38 test functions, 125 cases with subtests | `arrow-go/v18`'s own `compute` where it has the function, plain Go loops where it does not ([GO.md](GO.md)) |
 | Adversarial review pass | four independent reviewers plus a coverage pass before release | each finding carries a regression test |
 | Benchmarks (`Benchmarks/`) | 339 operation-and-size rows over 173 operations, against four CPU libraries; streaming and engine benches | measured, never estimated ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md)) |
 
@@ -19,6 +20,7 @@ swift build -c release
 swift test -c release                                   # release is required: a release-only miscompile has bitten this project once
 PYTHONPATH=python python -m pytest python/tests -q      # all Python suites, including the differential file
 PYTHONPATH=python python python/tests/differential_report.py   # the matrix as one report; exit 0 = nothing unclassified
+(cd go/arrowmetal && ARROWMETAL_LIB=$PWD/../../.build/release/libArrowMetalC.dylib go test ./...)  # the Go binding
 ```
 
 Tests that need a real GPU skip on virtual Metal devices (`requireRealGPU()`), so a hosted CI runner
