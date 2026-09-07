@@ -4078,6 +4078,13 @@ def _swapcase_and_zero_fill(src, shape):
     return got, expected
 
 
+#: "To the end of the value" for pc.binary_slice. Its own default (sys.maxsize) overflows the output
+#: size arithmetic in pyarrow 25.0.1 and raises "Negative buffer resize"
+#: (test_pyarrow_binary_slice_overflows_on_its_own_default_stop pins it), so the oracle names a stop
+#: that is past every generated value and still fits an int32.
+_PAST_THE_END = 2 ** 31 - 1
+
+
 @op("byte_transforms", ["utf8"],
     note="pc.binary_slice and pc.binary_reverse, which index BYTES and return binary, and "
          "pc.ascii_reverse, which both engines refuse on non-ASCII input")
@@ -4088,8 +4095,13 @@ def _byte_transforms(src, shape):
     for start, stop, step in [(0, None, 1), (1, 3, 1), (2, None, 1), (-3, None, 1), (0, -1, 1),
                               (5, 2, 1), (0, None, -1), (1, 6, 2)]:
         got.append(arrow(x.binary_slice(start, stop, step)))
-        expected.append(pc.binary_slice(binary, start, stop, step) if stop is not None
-                        else pc.binary_slice(binary, start, step=step))
+        if stop is None:
+            # A negative step already walks to the beginning under pyarrow's own default stop; only
+            # the forward unbounded slice needs the substitute.
+            expected.append(pc.binary_slice(binary, start, _PAST_THE_END, step) if step > 0
+                            else pc.binary_slice(binary, start, step=step))
+        else:
+            expected.append(pc.binary_slice(binary, start, stop, step))
     got.append(arrow(x.binary_reverse()))
     expected.append(pc.binary_reverse(binary))
     # ascii_reverse: both engines refuse a value that is not ASCII, so the rows are split.
@@ -4347,6 +4359,61 @@ def _after_the_2038_cutoff(src):
     return biggest is not None and biggest > _TZ_CUTOFF_SECONDS * per_second
 
 
+def _reaches_the_integer_extremes(src):
+    """An integer column holding a value of 2^31 or more in magnitude.
+
+    That is where the moment accumulator the variance, skew and kurtosis kernels share loses its
+    centred sums: the third and fourth powers of such a value leave every fixed-width accumulator,
+    and the kernel answers null rather than a wrapped number. The generated `random` columns stay
+    under 2^21, so only the `special` flavor reaches it."""
+    if type_name_of(src) not in INTEGER:
+        return False
+    for value in src.to_pylist():
+        if value is not None and abs(int(value)) >= 2 ** 31:
+            return True
+    return False
+
+
+def _contains_a_zero(src):
+    """A zero in the column, which is where `logb` and Arrow's own special case for the logarithm of
+    zero can point in opposite directions (the base column of the same shape holds values below one
+    throughout, so a zero here is enough to trigger it)."""
+    return any(v == 0.0 for v in src.to_pylist() if v is not None)
+
+
+def _sorted_unique_interleaves_ascii(src):
+    """A utf8 column whose distinct values, in UTF-8 byte order, interleave ASCII and non-ASCII ones.
+
+    That is exactly when the byte order and the order `unique(order="sorted")` produces differ: the
+    sorted pass puts every non-ASCII value after every ASCII one whatever the bytes say."""
+    ordered = sorted((v for v in pc.unique(src).to_pylist() if v is not None),
+                     key=lambda s: s.encode())
+    seen_non_ascii = False
+    for value in ordered:
+        if not value.isascii():
+            seen_non_ascii = True
+        elif seen_non_ascii:
+            return True
+    return False
+
+
+def _round_scaling_cannot_carry_the_value(src):
+    """A value `round_int(x * 10^n) / 10^n` cannot carry: one whose scaled product needs more
+    significant digits than the type holds, and one so small that the scaling underflows to zero."""
+    name = type_name_of(src)
+    mantissa = 2.0 ** 24 if name == "float32" else 2.0 ** 53
+    tiny = float(np.finfo(NUMPY_TYPE[name]).tiny)
+    for value in src.to_pylist():
+        if value is None or not math.isfinite(value):
+            continue
+        magnitude = abs(float(value))
+        if magnitude * 100.0 >= mantissa:
+            return True
+        if 0.0 < magnitude <= tiny * 10.0:
+            return True
+    return False
+
+
 FINDINGS = [
     Finding("float32-subnormal-ftz",
             "Float32 arithmetic flushes subnormal results and operands to zero",
@@ -4357,9 +4424,9 @@ FINDINGS = [
             "sign keeps the sign of -0.0 where pyarrow normalises it to 0.0",
             ["sign"], FLOATING, data_check=_contains_negative_zero),
     Finding("negative-zero-set-lookup",
-            "is_in/index_in/count_distinct match -0.0 with 0.0, the total order unique/sort use; "
-            "Arrow keeps them apart",
-            ["is_in", "index_in", "mode_and_count_distinct"], FLOATING,
+            "is_in/index_in/count_distinct/unique/value_counts match -0.0 with 0.0, the total order "
+            "unique/sort use; Arrow keeps them apart",
+            ["is_in", "index_in", "mode_and_count_distinct", "unique", "value_counts"], FLOATING,
             data_check=_contains_negative_zero),
     Finding("cumulative-prod-reassociation",
             "cumulative_prod is a parallel scan; once a running product overflows or underflows, which "
@@ -4386,7 +4453,7 @@ FINDINGS = [
     Finding("split-loses-the-null-row",
             "split returns an (offsets, values) pair with nowhere to put a null row, so a null value "
             "splits to an empty list where Arrow's list<utf8> keeps the null",
-            ["regex_split", "split_whitespace"], ["utf8"], data_check=_has_nulls),
+            ["regex_split", "split_whitespace", "split_pairs"], ["utf8"], data_check=_has_nulls),
     Finding("float-text-swift-format",
             "float -> utf8 uses Swift's formatting: an integral value keeps its .0, the exponent has "
             "two digits and the switch to scientific notation happens at a different magnitude",
@@ -4406,7 +4473,7 @@ FINDINGS = [
     Finding("timezone-after-2038",
             "pyarrow's timezone database stops applying a DST rule after the 32-bit epoch; Foundation "
             "keeps applying it, so the two disagree on every summer instant past 2038",
-            ["assume_timezone", "temporal_timezone"], TIMESTAMP_TYPES,
+            ["assume_timezone", "temporal_timezone", "timezone_metadata"], TIMESTAMP_TYPES,
             data_check=_after_the_2038_cutoff),
     Finding("trig-argument-reduction",
             "the software binary64 sin/cos/tan lose their argument reduction past 2^49 and return NaN "
@@ -4426,6 +4493,41 @@ FINDINGS = [
             "the rolling min/max scan compares raw values rather than the canonical sort keys, so a "
             "±0 tie is broken by position and a float32 subnormal reads as zero",
             ["rolling_min_max"], FLOATING, data_check=_contains_negative_zero_or_subnormal),
+
+    # ---- findings 21 onwards: the Arrow-named surface added last.
+    Finding("unique-drops-the-null-string",
+            "unique/value_counts keep the null as an entry of their own for every type except utf8, "
+            "where the GPU string dictionary has no slot for one and the null row is dropped",
+            ["unique", "value_counts"], ["utf8"], data_check=_has_nulls),
+    Finding("logb-of-zero-against-a-small-base",
+            "logb is ln(x)/ln(base) throughout, so the logarithm of zero against a base below one is "
+            "+inf here; Arrow answers -inf for a zero argument whatever the base",
+            ["math_extra"], FLOATING, data_check=_contains_a_zero),
+    Finding("round-scales-before-it-rounds",
+            "round(ndigits), round_to_multiple and round_binary are round_int(x / step) * step, so a "
+            "value whose scaled product needs more significant digits than the type holds -- or one "
+            "the scaling underflows -- comes back perturbed where Arrow returns it unchanged",
+            ["round_extra"], FLOATING, data_check=_round_scaling_cannot_carry_the_value),
+    Finding("high-moment-accumulator-overflow",
+            "skew and kurtosis share the variance kernel's moment accumulator, so an integer column "
+            "holding a value at the top of a 32- or 64-bit type answers null where pyarrow answers "
+            "in double",
+            ["skew_kurtosis"], INTEGER, data_check=_reaches_the_integer_extremes),
+    # Listed before the ±0 finding so a float64 winsorize cell is attributed to the bug rather than
+    # to the sign of zero, which only decides the float32 cells.
+    Finding("BUG:winsorize-uint64-poisons-float64",
+            "a winsorize on a uint64 column makes every later float64 winsorize in the process answer "
+            "with limits it never computed; the cell is left failing on purpose",
+            ["winsorize"], ["float64"]),
+    Finding("winsorize-negative-zero-limit",
+            "the winsorize limits are picked out of the sorted values, where -0.0 and 0.0 are one tie "
+            "group; ArrowMetal clamps to the -0.0 of that pair and Arrow to the 0.0",
+            ["winsorize"], FLOATING, data_check=_contains_negative_zero),
+    Finding("BUG:sorted-unique-order-is-not-the-sort-order",
+            "unique/value_counts with order=\"sorted\" put every non-ASCII value after every ASCII "
+            "one, where the column's own sort() orders by UTF-8 bytes; the cell is left failing on "
+            "purpose",
+            ["unique", "value_counts"], ["utf8"], data_check=_sorted_unique_interleaves_ascii),
 ]
 
 
@@ -5573,3 +5675,145 @@ def test_extension_metadata_round_trips_through_pyarrow():
     assert tagged.extension_name == "arrowmetal.pinned"
     assert tagged.extension_metadata == b"v1"
     assert pylist(tagged.extension_storage()) == a.to_pylist()
+
+
+# ------------------------------------------------------------------ the Arrow-named surface's
+# pinned divergences and reproductions
+#
+# One reproduction per finding added with that surface, plus the two pyarrow bugs its oracles have to
+# work around.
+
+
+def test_checked_arithmetic_raises_where_the_unchecked_form_wraps():
+    """Both engines object to the same overflow, and to the same divide by zero."""
+    a = pa.array([2 ** 31 - 1], pa.int32())
+    assert pylist(am.array(a).arith("+", 1)) == [-2 ** 31]
+    with pytest.raises(am.ArrowMetalError, match="overflow"):
+        am.array(a).add_checked(1)
+    with pytest.raises(pa.ArrowInvalid):
+        pc.add_checked(a, pa.scalar(1, pa.int32()))
+    with pytest.raises(am.ArrowMetalError, match="divide by zero"):
+        am.array(a).divide_checked(am.array(pa.array([0], pa.int32())))
+    with pytest.raises(pa.ArrowInvalid, match="divide by zero"):
+        pc.divide_checked(a, pa.array([0], pa.int32()))
+
+
+def test_negate_checked_refuses_an_unsigned_column_pyarrow_has_no_kernel_for():
+    """ArrowMetal defines negate_checked on an unsigned column -- every non-zero value overflows --
+    where pyarrow has no unsigned kernel at all, which is why the matrix compares only abs_checked
+    there."""
+    a = pa.array([1, 2], pa.uint16())
+    with pytest.raises(am.ArrowMetalError, match="overflow"):
+        am.array(a).negate_checked()
+    with pytest.raises(pa.ArrowNotImplementedError):
+        pc.negate_checked(a)
+    zero = pa.array([0, 0], pa.uint16())
+    assert pylist(am.array(zero).negate_checked()) == [0, 0]
+
+
+def test_logb_of_zero_against_a_small_base_is_positive_infinity():
+    """logb is ln(x) / ln(base) throughout: with a base below one, ln(base) is negative and the
+    logarithm of zero comes out +inf. Arrow answers -inf for a zero argument whatever the base."""
+    values = pa.array([0.0], pa.float64())
+    bases = pa.array([0.5], pa.float64())
+    assert pylist(am.array(values).logb(am.array(bases))) == [math.inf]
+    assert pc.logb(values, bases).to_pylist() == [-math.inf]
+    # Above one the two agree, which is the case the matrix is mostly made of.
+    big = pa.array([2.0], pa.float64())
+    assert pylist(am.array(values).logb(am.array(big))) == pc.logb(values, big).to_pylist()
+
+
+def test_round_with_ndigits_scales_before_it_rounds():
+    """round(x, n) is round_int(x * 10^n) / 10^n, so a float32 value whose scaled product needs more
+    significant digits than a float32 holds comes back perturbed; Arrow returns it unchanged."""
+    a = pa.array([-421591.21875], pa.float32())
+    assert pylist(am.array(a).round(2, "down")) == [-421591.1875]
+    assert pc.round(a, ndigits=2, round_mode="down").to_pylist() == [-421591.21875]
+    # Inside the digits a float32 can carry, the two agree exactly.
+    small = pa.array([1.25, -2.5, 0.125], pa.float32())
+    for mode in ("down", "up", "half_to_even", "half_towards_infinity"):
+        assert pylist(am.array(small).round(2, mode)) == \
+            pc.round(small, ndigits=2, round_mode=mode).to_pylist()
+
+
+def test_skew_and_kurtosis_share_the_variance_accumulator():
+    """At the top of a 64-bit integer type the moment accumulator gives up and answers null, where
+    pyarrow answers in double -- the same place test_variance_of_a_large_int64_column records."""
+    big = pa.array([2 ** 63 - 1, -(2 ** 63), 1, 0, 7], pa.int64())
+    assert am.array(big).skew() is None
+    assert am.array(big).kurtosis() is None
+    assert isinstance(pc.skew(big).as_py(), float)
+    assert isinstance(pc.kurtosis(big).as_py(), float)
+    small = pa.array([1, 2, 3, 10], pa.int64())
+    assert am.array(small).skew() == pytest.approx(pc.skew(small).as_py(), rel=1e-9)
+
+
+def test_winsorize_clamps_to_the_negative_zero_of_a_zero_tie():
+    """-0.0 and 0.0 are one tie group in every sort order, so which of them becomes the quantile is
+    not defined by either engine; ArrowMetal takes the -0.0 and Arrow the 0.0. The two answers are
+    equal as numbers and differ only in the sign bit."""
+    a = pa.array([1.0, -0.0, 0.0, -1.0, 2.0, -2.0], pa.float32())
+    got = pylist(am.array(a).winsorize(0.5, 0.5))
+    expected = pc.winsorize(a, lower_limit=0.5, upper_limit=0.5).to_pylist()
+    # Every value clamps to the median, which is the -0.0 of the tie here and the 0.0 there; the two
+    # rows already holding a zero keep their own sign in both engines.
+    assert [math.copysign(1.0, v) for v in got] == [-1.0, -1.0, 1.0, -1.0, -1.0, -1.0]
+    assert [math.copysign(1.0, v) for v in expected] == [1.0, -1.0, 1.0, 1.0, 1.0, 1.0]
+    assert got == expected                            # equal as numbers, not as bits
+
+
+@pytest.mark.xfail(strict=True, reason="BUG:winsorize-uint64-poisons-float64: the first float64 "
+                                       "winsorize after a uint64 one answers with limits it never "
+                                       "computed")
+def test_winsorize_on_float64_survives_a_uint64_call():
+    """NOTE: this test poisons the float64 winsorize path for the rest of the process, which is the
+    bug. It sits at the end of the file so nothing else runs after it."""
+    shape = Shape(33, 0.0, "random")
+    unsigned, doubles = make_array("uint64", shape), make_array("float64", shape)
+    for lower, upper in [(0.0, 1.0), (0.05, 0.95), (0.25, 0.75), (0.5, 0.5)]:
+        am.array(unsigned).winsorize(lower, upper).to_arrow()
+    assert pylist(am.array(doubles).winsorize(0.0, 1.0)) == doubles.to_pylist()
+
+
+@pytest.mark.xfail(strict=True, reason="BUG:sorted-unique-order-is-not-the-sort-order: "
+                                       "unique(order='sorted') puts every non-ASCII value after "
+                                       "every ASCII one, where sort() orders by UTF-8 bytes")
+def test_sorted_unique_uses_the_columns_own_sort_order():
+    a = pa.array(["b", "á"], pa.string())        # b'b' and b'a\xcc\x81'
+    assert pylist(am.array(a).sort()) == ["á", "b"] == \
+        a.take(pc.array_sort_indices(a)).to_pylist()
+    assert pylist(am.array(a).unique("sorted")) == ["á", "b"]
+
+
+def test_unique_drops_the_null_row_of_a_string_column():
+    """The GPU string dictionary has no slot for a null, so a null row leaves no entry behind; for
+    every other type unique keeps the null exactly as Arrow does."""
+    strings = pa.array(["a", None, "a"], pa.string())
+    assert pylist(am.array(strings).unique()) == ["a"]
+    assert pc.unique(strings).to_pylist() == ["a", None]
+    numbers = pa.array([1, None, 1], pa.int32())
+    assert pylist(am.array(numbers).unique()) == pc.unique(numbers).to_pylist() == [1, None]
+
+
+def test_pyarrow_winsorize_ignores_the_array_offset():
+    """Not our divergence: pyarrow 25.0.1 reads a sliced column's validity bitmap without honouring
+    ArrowArray.offset, so it answers with the wrong rows null. The matrix gives the oracle a
+    materialised copy and ArrowMetal the slice."""
+    flat = pa.array([1.0, 2.0, None, 4.0, None, 6.0, 7.0, 8.0], pa.float64())
+    sliced = flat.slice(2, 5)
+    assert pylist(am.array(sliced).winsorize(0.0, 1.0)) == sliced.to_pylist()
+    assert pc.winsorize(sliced, lower_limit=0.0, upper_limit=1.0).to_pylist() != sliced.to_pylist()
+    materialised = pa.concat_arrays([flat.slice(0, 0), sliced])
+    assert pc.winsorize(materialised, lower_limit=0.0, upper_limit=1.0).to_pylist() == \
+        sliced.to_pylist()
+
+
+def test_pyarrow_binary_slice_overflows_on_its_own_default_stop():
+    """Not our divergence: pc.binary_slice's default stop (sys.maxsize) overflows the output size
+    arithmetic in pyarrow 25.0.1. The matrix names an explicit stop past every generated value."""
+    b = pa.array([b"abcdef", b"x" * 300], pa.binary())
+    with pytest.raises(pa.ArrowInvalid, match="Negative buffer resize"):
+        pc.binary_slice(b, 1)
+    assert pc.binary_slice(b, 1, _PAST_THE_END).to_pylist() == [b"bcdef", b"x" * 299]
+    assert pylist(am.array(pa.array(["abcdef", "x" * 300], pa.string())).binary_slice(1)) == \
+        [b"bcdef", b"x" * 299]
