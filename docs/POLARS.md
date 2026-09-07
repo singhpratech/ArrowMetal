@@ -12,8 +12,9 @@ relative to the Polars plan**:
 | 2. Expression plugin | Inside a Polars lazy plan | `pl.col("v").arrowmetal.sum()` | a Rust build |
 | 3. Streaming hand-off | Polars runs the plan, ArrowMetal finishes it | `lf.arrowmetal.collect_gpu(q)` | Python only |
 
-All three move data over the Arrow C Data Interface, which for a Polars column of any real size
-means **no copy at all** -- the GPU reads the buffer Polars already owns. The evidence is below.
+All three move data over the Arrow C Data Interface. For a single-chunk numeric Polars column that
+is **no copy at all** -- the GPU reads the buffer Polars already owns. Strings, Categoricals and
+multi-chunk Series each cost one conversion pass -- see Limits. The evidence is below.
 
 ---
 
@@ -377,7 +378,7 @@ from 4096 distinct values.
 |---|---|---|---|---|
 | `sum(Int64)` | 5.8 ms / 5.8 CPU-ms | 11.7 ms (0.5x) | 11.2 ms (0.5x) | 1.0 ms (5.8x) |
 | `filter(k == 2) + sum(v)` | 5.4 ms / 12.0 CPU-ms | 16.4 ms (0.3x) | 12.8 ms (0.4x) | 1.7 ms (3.2x) |
-| group-by `sum(v)` by 1000 keys | 112.6 ms / 1081 CPU-ms | 27.6 ms (4.1x) | 25.6 ms (4.4x) | 2.3 ms (49x) |
+| group-by `sum(v)` by 1000 keys | 112.6 ms / 1081 CPU-ms | 27.6 ms (4.1x) | 25.6 ms (4.4x) | 2.3 ms, aggregate only, group ids cached |
 | `top_k(100)` | 71.0 ms / 71.2 CPU-ms | 20.9 ms (3.4x) | 20.2 ms (3.5x) | 11.3 ms (6.3x) |
 | string `contains` (literal) | 710.1 ms / 710 CPU-ms | 334.2 ms (2.1x) | 290.7 ms (2.4x) | 8.5 ms (84x) |
 
@@ -387,15 +388,20 @@ from 4096 distinct values.
 |---|---|---|---|---|
 | `sum(Int64)` | 0.9 ms | 2.6 ms (0.4x) | 2.7 ms (0.4x) | 0.3 ms (3.3x) |
 | `filter(k == 2) + sum(v)` | 2.3 ms | 3.6 ms (0.6x) | 3.2 ms (0.7x) | 0.6 ms (3.6x) |
-| group-by `sum(v)` by 1000 keys | 29.7 ms / 203 CPU-ms | 8.4 ms (3.5x) | 9.4 ms (3.2x) | 1.1 ms (27x) |
+| group-by `sum(v)` by 1000 keys | 29.7 ms / 203 CPU-ms | 8.4 ms (3.5x) | 9.4 ms (3.2x) | 1.1 ms, aggregate only, group ids cached |
 | `top_k(100)` | 14.4 ms | 8.8 ms (1.6x) | 8.6 ms (1.7x) | 5.8 ms (2.5x) |
 | string `contains` (literal) | 150.3 ms | 73.6 ms (2.0x) | 63.5 ms (2.4x) | 1.9 ms (80x) |
 
 ### Reading the table
 
 * **"GPU-resident"** is the same kernel with the column already in Metal memory -- the import is
-  outside the timed region. It is what a pipeline that stays on the GPU sees, and it is the
-  column that shows what the kernels are actually worth.
+  outside the timed region, and, for the group-by rows, the `am.group_by([k])` key-mapping pass as
+  well: those rows time the aggregate only. It is what a pipeline that stays on the GPU sees, and it
+  is the column that shows what the kernels are actually worth.
+* **The group-by row is not a like-for-like ratio against Polars**, whose 112.6 ms includes its whole
+  hash group-by. The comparable end-to-end figure is in the benchmark matrix: `sum by int32 key
+  (1000 groups)` at 50M rows is **8.83 ms against Polars' 81.92 ms, 9.3x**
+  (`Benchmarks/results/full_matrix_2026-09-07.csv`), and 2.66 ms against 20.65 ms, 7.8x, at 10M.
 * **The hand-off is the whole difference** between the middle columns and the right one. At 50M
   rows the import is 5.7 ms and the export 0.01 ms. Every tier-1 and tier-2 row pays it once per
   call, so a single `sum` loses to Polars and a group-by wins by 4x.

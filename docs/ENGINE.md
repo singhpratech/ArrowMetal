@@ -1,8 +1,8 @@
 # The query engine
 
 A lazy, optimizing query engine that runs on the GPU: `filter`, `select`, `group_by`, `sort`, `join`,
-`join_asof`, window functions, `unique`, `explode` and `concat`, planned as a whole and executed inside
-one Metal command buffer.
+`join_asof`, window functions, `unique`, `explode` and `concat`, planned as a whole and executed in as
+few Metal command buffers as the sync points below allow — usually one.
 
 ```python
 import arrowmetal as am
@@ -79,7 +79,8 @@ partition.
 
 ## The optimizer
 
-Every rule preserves the result exactly — same rows, same nulls. `explain()` lists the ones that fired.
+Every rule preserves the result's rows and nulls exactly; `join_reorder` alone permutes row *order*,
+and only fires where that order is unobservable. `explain()` lists the ones that fired.
 
 | Rule | What it does |
 |---|---|
@@ -181,7 +182,7 @@ in a device buffer and the next kernel binds that buffer instead of a CPU-known 
 (`docs/DESIGN.md`, "Lengths flow on the GPU"), so a filter feeding a projection feeding another filter
 never returns to the CPU.
 
-Four operators are unavoidable sync points, because the CPU has to know a count before it can size the
+Five operators are unavoidable sync points, because the CPU has to know a count before it can size the
 next dispatch: `GroupByKeys` (the number of groups), the hash join (the number of pairs), the top-k
 selection, and `explode` and `slice` (which read offsets). `flush(reopen: true)` commits, waits and
 reopens the batch at each, so batching resumes immediately afterwards. Intermediate buffers come from
@@ -376,7 +377,7 @@ the same run: it is what the query cost the machine, next to what it cost the ca
 | | duckdb | 632.91 | 2301.1 | 9.5x |
 | **(h)** as-of join 50M trades against 1M quotes | **ArrowMetal lazy** | **16.53** | 3.4 | — |
 | | polars | 195.14 | 194.3 | 12x |
-| | duckdb | did not finish | | |
+| | duckdb | not finished in 600 s (off by default; set `AM_BENCH_DUCKDB_ASOF=1`) | | |
 
 Reading it: the widest margins are where the operator count is high relative to the bytes moved — (d)
 is six operators over four columns and 44x, (a) is a filter plus a reduction and 6.5x — and where the

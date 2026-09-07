@@ -1,11 +1,13 @@
 # Parquet on the GPU
 
 ArrowMetal reads Apache Parquet with Metal compute kernels: from file bytes to Arrow arrays in shared
-memory, with the CPU never reading a byte of column data. Decompression, definition levels, dictionary
-indices, the delta encodings and `BYTE_STREAM_SPLIT` are all kernels. The host parses the Thrift footer
-and the per-page Thrift headers — metadata, not data — and everything after that runs on the GPU.
+memory, with the CPU reading column data only for the ZSTD, GZIP and BROTLI codecs, which are
+decompressed on the host straight into the shared buffer the GPU decoders read. Snappy and LZ4
+decompression, definition levels, dictionary indices, the delta encodings and `BYTE_STREAM_SPLIT` are
+all kernels. The host parses the Thrift footer and the per-page Thrift headers — metadata, not data —
+and everything after that runs on the GPU.
 
-cuDF does this for NVIDIA. As far as we know nothing did it for Metal.
+cuDF does this for NVIDIA.
 
 - `Sources/ArrowMetal/Parquet/Thrift.swift` — a hand-rolled Thrift compact-protocol reader and writer, in
   the spirit of the FlatBuffers reader in `IPC/FlatBuffers.swift`: no code generator, no runtime, just the
@@ -239,10 +241,11 @@ for day in days:
     px = f.read(columns=["price"], filters=[("day", "==", day)])["price"]
 ```
 
-Only the requested column chunks are ever touched — their pages are never even faulted in. `filters` is
-evaluated against the footer's `min_value` / `max_value` statistics per row group; a row group whose range
-cannot contain a match is skipped without reading a page. Pushdown is row-group granular, so the result is
-a superset of the matching rows: follow it with `filter` (or a fused `am.query`) to get exactly the rows.
+Only the requested column chunks are ever touched — the other columns' pages are never even faulted
+in. `filters` is evaluated against the footer's `min_value` / `max_value` statistics per row group; a
+row group whose range cannot contain a match is skipped without reading a page. Pushdown is row-group
+granular, so the result is a superset of the matching rows: follow it with `filter` (or a fused
+`am.query`) to get exactly the rows.
 `ParquetFile.selectedRowGroups(_:)` / `ParquetFile.selected_row_groups(...)` report what a filter keeps
 without reading anything.
 
@@ -273,7 +276,7 @@ which is the smallest query anyone actually runs.
 | none | polars | 84 | 861 | 26592 | 28 |
 | none | pandas | 317 | 1245 | 7030 | 134 |
 
-ArrowMetal is 1.4-3.6x behind Polars and pyarrow on wall time and **4-9x ahead on CPU time**: the decode is
+ArrowMetal is 1.3-4.2x behind Polars and pyarrow on wall time and **3-9x ahead on CPU time**: the decode is
 work the host never does. The `ttfc` column above re-opens the file for every query, which is the wrong
 way to hold a 2 GB file and costs ArrowMetal the most, because mapping it and handing its pages to Metal
 is a per-open cost the CPU readers do not have. Keep the handle, which is what a query engine does:
@@ -290,7 +293,7 @@ is a per-open cost the CPU readers do not have. Keep the handle, which is what a
 | none | pyarrow.ParquetFile | 57 | 7 |
 
 That is the shape a query actually has — open once, project a column, compute — and it is a 6-9x win on
-the read plus a 2-3x win on the reduction, because the values are already in GPU memory when the
+the read plus a 2-4x win on the reduction, because the values are already in GPU memory when the
 reduction starts. 400 MB decoded in 7 ms is 57 GB/s.
 
 ### Decompression on its own
@@ -322,14 +325,14 @@ PYTHONPATH=python python Benchmarks/parquet_bench.py --rows 50000000 --codecs sn
 ### What the numbers say
 
 - **CPU time is the headline.** Reading the whole 50 M-row table costs the host 217-262 ms of CPU against
-  951-2253 ms for the CPU readers. The decode is compute the process never does, so the cores stay free
+  861-2253 ms for the CPU readers. The decode is compute the process never does, so the cores stay free
   for whatever else is running.
 - **The arrays land in GPU memory already.** Summing the column ArrowMetal just decoded takes 2-3 ms; the
   CPU readers pay 7-8 ms *and* had to materialise the array first. There is no import step, because the
   decode wrote into Metal shared memory in the first place.
 - **Opening the file is a real per-open cost, so do not re-open it.** Mapping a 2 GB file and handing its
-  pages to Metal costs ~17 ms per gigabyte plus the minor faults of a fresh mapping — around 230 ms for
-  this file, which is most of the `ttfc` column. Holding the `ParquetFile` across queries, which is what
+  pages to Metal costs ~17 ms per gigabyte, and the minor faults of a fresh mapping cost more again;
+  together they are most of the `ttfc` column. Holding the `ParquetFile` across queries, which is what
   a query engine does, removes all of it and turns the same read into 7-16 ms.
 - **Snappy on *compressible* data is the weak spot, and the reason is structural.** An LZ77 token stream
   is serial, so a page is decoded by one SIMD group, and the cost scales with the number of *tokens*, not
@@ -356,7 +359,8 @@ writing is not the part of Parquet that needed a GPU.
   `time32`, `time64`, `timestamp`. Dictionary columns are materialised first. Decimals, lists, structs and
   the other nested types are not written.
 
-Files it writes are read back byte-identically by ArrowMetal *and* by pyarrow — `ParquetWriterTests` and
+Files it writes read back with identical values, nulls and types under ArrowMetal *and* pyarrow — over
+int64, float64, string, bool and timestamp columns, uncompressed and Snappy; `ParquetWriterTests` and
 `python/tests/test_parquet.py::test_writer_round_trip` check both directions.
 
 ## Correctness
