@@ -766,6 +766,273 @@ final class StreamTests: XCTestCase {
         let b2 = AnyMetalArray.boolean(try makeBooleanArray([false, true]))
         XCTAssertEqual(try concatColumns([b1, b2]).asBoolean?.toArray(), [true, nil, false, false, true])
     }
+    // MARK: - the resident GPU state, against the implementation it replaces
+
+    /// A key column with duplicates and nulls, and a value column with nulls: the shapes the resident
+    /// table has to agree with the host table on.
+    struct KeyRow {
+        var key: Int64?
+        var amount: Double?
+        var qty: Int32
+    }
+
+    static func keyRows(_ n: Int, keys: Int, nullEvery: Int = 13) -> [KeyRow] {
+        (0..<n).map { i in
+            KeyRow(key: i % nullEvery == 5 ? nil : Int64((i &* 2654435761) % keys),
+                   amount: i % 7 == 2 ? nil : Double((i &* 48271) % 10_007) / 7.0,
+                   qty: Int32(i % 97))
+        }
+    }
+
+    static func keyBatch(_ rows: [KeyRow]) throws -> MetalRecordBatch {
+        try MetalRecordBatch(names: ["key", "amount", "qty"], columns: [
+            .int64(try MetalArray<Int64>(rows.map { $0.key })),
+            .float64(try MetalArray<Double>(rows.map { $0.amount })),
+            .int32(try MetalArray<Int32>(rows.map { Optional($0.qty) })),
+        ])
+    }
+
+    static func keyBatches(_ rows: [KeyRow], sizes: [Int]) throws -> [MetalRecordBatch] {
+        var out: [MetalRecordBatch] = []
+        var i = 0
+        for s in sizes {
+            let take = Swift.max(0, Swift.min(s, rows.count - i))
+            out.append(try keyBatch(Array(rows[i..<(i + take)])))
+            i += take
+        }
+        if i < rows.count { out.append(try keyBatch(Array(rows[i...]))) }
+        return out
+    }
+
+    private func groupByBoth(_ bs: [MetalRecordBatch], _ aggs: [StreamAggregate])
+        throws -> (MetalRecordBatch, MetalRecordBatch) {
+        let residentOp = StreamGroupByOperator(keys: ["key"], aggregates: aggs)
+        let resident = try StreamingExecutor(source: ChunkedTableSource(bs)).run(residentOp)
+        XCTAssertTrue(residentOp.usesResidentTable,
+                      "an integer key with sum/count aggregates is the resident path")
+        let hostOp = StreamGroupByOperator(keys: ["key"], aggregates: aggs)
+        hostOp.residentTable = false
+        let host = try StreamingExecutor(source: ChunkedTableSource(bs)).run(hostOp)
+        return (try XCTUnwrap(resident.batch), try XCTUnwrap(host.batch))
+    }
+
+    /// The GPU-resident group table against the host table it replaces, row for row and bit for bit:
+    /// duplicate keys, a null-key group, all-null groups, empty batches and a ragged tail.
+    func testResidentGroupTableMatchesTheHostTable() throws {
+        try requireRealGPU()
+        let aggs = [StreamAggregate(.sum, "amount", name: "s"),
+                    StreamAggregate(.count, nil, name: "c"),
+                    StreamAggregate(.count, "amount", name: "cv"),
+                    StreamAggregate(.sum, "qty", name: "sq"),
+                    StreamAggregate(.mean, "amount", name: "avg")]
+        for (n, keys) in [(1, 1), (5_000, 37), (60_000, 4_001), (120_000, 90_000)] {
+            let rows = Self.keyRows(n, keys: keys)
+            let bs = try Self.keyBatches(rows, sizes: Self.raggedSizes(n, batchRows: 900))
+            let (a, b) = try groupByBoth(bs, aggs)
+            XCTAssertEqual(a.length, b.length, "n=\(n) keys=\(keys)")
+            XCTAssertEqual(a.names, b.names)
+            XCTAssertEqual(try XCTUnwrap(a["key"]?.asInt64).toArray(),
+                           try XCTUnwrap(b["key"]?.asInt64).toArray(), "keys differ at n=\(n)")
+            XCTAssertEqual(try XCTUnwrap(a["c"]?.asInt64).toArray(),
+                           try XCTUnwrap(b["c"]?.asInt64).toArray(), "count differs at n=\(n)")
+            XCTAssertEqual(try XCTUnwrap(a["cv"]?.asInt64).toArray(),
+                           try XCTUnwrap(b["cv"]?.asInt64).toArray(), "count(col) differs at n=\(n)")
+            XCTAssertEqual(try XCTUnwrap(a["sq"]?.asInt64).toArray(),
+                           try XCTUnwrap(b["sq"]?.asInt64).toArray(), "int sum differs at n=\(n)")
+            // Both fold the same per-batch partials in the same order — one with Swift's `+`, one with
+            // the correctly-rounded software adder — so the float64 sums agree to the last bit.
+            let sa = try XCTUnwrap(a["s"]?.asFloat64).toArray()
+            let sb = try XCTUnwrap(b["s"]?.asFloat64).toArray()
+            XCTAssertEqual(sa.count, sb.count)
+            for i in 0..<sa.count {
+                XCTAssertEqual(sa[i]?.bitPattern, sb[i]?.bitPattern, "sum row \(i), n=\(n)")
+            }
+            let ma = try XCTUnwrap(a["avg"]?.asFloat64).toArray()
+            let mb = try XCTUnwrap(b["avg"]?.asFloat64).toArray()
+            for i in 0..<ma.count {
+                XCTAssertEqual(ma[i]?.bitPattern, mb[i]?.bitPattern, "mean row \(i), n=\(n)")
+            }
+        }
+    }
+
+    /// The resident table grows and rehashes when the key space outruns it, without losing a group.
+    func testResidentGroupTableRehashesWithoutLosingGroups() throws {
+        try requireRealGPU()
+        let n = 200_000
+        let rows = (0..<n).map { KeyRow(key: Int64($0), amount: Double($0), qty: 1) }
+        let bs = try Self.keyBatches(rows, sizes: Array(repeating: 4_096, count: 60))
+        let (a, b) = try groupByBoth(bs, [StreamAggregate(.sum, "amount", name: "s"),
+                                          StreamAggregate(.count, nil, name: "c")])
+        XCTAssertEqual(a.length, n)
+        XCTAssertEqual(a.length, b.length)
+        XCTAssertEqual(try XCTUnwrap(a["key"]?.asInt64).toArray(),
+                       try XCTUnwrap(b["key"]?.asInt64).toArray())
+        let sa = try XCTUnwrap(a["s"]?.asFloat64).toArray()
+        for i in 0..<n { XCTAssertEqual(sa[i], Double(i)) }
+    }
+
+    /// Every integer key type the resident path accepts, against the host table.
+    func testResidentGroupTableAcrossIntegerKeyTypes() throws {
+        try requireRealGPU()
+        let n = 20_000
+        let base = Self.keyRows(n, keys: 251)
+        let plain = try Self.keyBatches(base, sizes: Self.raggedSizes(n, batchRows: 700))
+        for cast in ["int16", "int32", "uint32", "uint64"] {
+            let bs: [MetalRecordBatch] = try plain.map { b in
+                let k = try XCTUnwrap(b["key"]?.asInt64)
+                let narrowed: AnyMetalArray
+                switch cast {
+                case "int16": narrowed = .int16(try k.cast(to: Int16.self))
+                case "int32": narrowed = .int32(try k.cast(to: Int32.self))
+                case "uint32": narrowed = .uint32(try k.cast(to: UInt32.self))
+                default: narrowed = .uint64(try k.cast(to: UInt64.self))
+                }
+                return try MetalRecordBatch(names: b.names,
+                                            columns: [narrowed, b.columns[1], b.columns[2]])
+            }
+            let aggs = [StreamAggregate(.sum, "amount", name: "s"),
+                        StreamAggregate(.count, nil, name: "c")]
+            let (got, want) = try groupByBoth(bs, aggs)
+            XCTAssertEqual(got.length, want.length, "\(cast)")
+            XCTAssertEqual(got["key"]?.arrowFormat, want["key"]?.arrowFormat, "\(cast)")
+            let ga = try XCTUnwrap(got["s"]?.asFloat64).toArray()
+            let wa = try XCTUnwrap(want["s"]?.asFloat64).toArray()
+            XCTAssertEqual(ga.count, wa.count, "\(cast)")
+            for i in 0..<ga.count { XCTAssertEqual(ga[i]?.bitPattern, wa[i]?.bitPattern, "\(cast) row \(i)") }
+            XCTAssertEqual(try XCTUnwrap(got["c"]?.asInt64).toArray(),
+                           try XCTUnwrap(want["c"]?.asInt64).toArray(), "\(cast)")
+        }
+    }
+
+    // MARK: - threshold pruning
+
+    /// Threshold-pruned top-k against the same operator with pruning off: identical rows, including
+    /// ties at the k-th value and batches in which nothing survives.
+    func testTopKPruningMatchesTheUnprunedSelection() throws {
+        try requireRealGPU()
+        // Front-loaded on purpose: the first batch holds the largest values, so later batches are
+        // pruned away entirely, and there are many ties exactly at the k-th value.
+        let n = 60_000
+        func topAmount(_ i: Int) -> Double? {
+            if i < 500 { return 1000.0 - Double(i % 5) }
+            if i % 23 == 0 { return nil }
+            return Double((i &* 48271) % 900)
+        }
+        var rows: [KeyRow] = []
+        rows.reserveCapacity(n)
+        for i in 0..<n { rows.append(KeyRow(key: Int64(i), amount: topAmount(i), qty: Int32(i % 31))) }
+        let bs = try Self.keyBatches(rows, sizes: Self.raggedSizes(n, batchRows: 1_100))
+        for k in [1, 10, 100] {
+            let pruned = StreamTopKOperator(column: "amount", k: k)
+            let a = try XCTUnwrap(try StreamingExecutor(source: ChunkedTableSource(bs)).run(pruned).batch)
+            let plainOp = StreamTopKOperator(column: "amount", k: k)
+            plainOp.pruning = false
+            let b = try XCTUnwrap(try StreamingExecutor(source: ChunkedTableSource(bs)).run(plainOp).batch)
+            XCTAssertGreaterThan(pruned.prunedBatches, 0, "k=\(k): the point is that batches drop out")
+            XCTAssertEqual(a.length, k)
+            XCTAssertEqual(a.length, b.length)
+            for name in ["key", "amount", "qty"] {
+                let x: [StreamValue] = try XCTUnwrap(a[name]).streamValues()
+                let y: [StreamValue] = try XCTUnwrap(b[name]).streamValues()
+                XCTAssertEqual(x, y, "k=\(k) column \(name)")
+            }
+        }
+    }
+
+    /// Smallest-first pruning, over a column that is mostly null after the first batch.
+    func testTopKSmallestPruningMatchesTheUnprunedSelection() throws {
+        try requireRealGPU()
+        let n = 30_000
+        func smallAmount(_ i: Int) -> Double? {
+            if i < 200 { return Double(i) }
+            if i % 5 == 0 { return nil }
+            return Double(1_000 + i)
+        }
+        var rows: [KeyRow] = []
+        rows.reserveCapacity(n)
+        for i in 0..<n { rows.append(KeyRow(key: Int64(i), amount: smallAmount(i), qty: Int32(i % 17))) }
+        let bs = try Self.keyBatches(rows, sizes: Self.raggedSizes(n, batchRows: 900))
+        let pruned = StreamTopKOperator(column: "amount", k: 50, largest: false)
+        let a = try XCTUnwrap(try StreamingExecutor(source: ChunkedTableSource(bs)).run(pruned).batch)
+        let plainOp = StreamTopKOperator(column: "amount", k: 50, largest: false)
+        plainOp.pruning = false
+        let b = try XCTUnwrap(try StreamingExecutor(source: ChunkedTableSource(bs)).run(plainOp).batch)
+        XCTAssertGreaterThan(pruned.prunedBatches, 0)
+        let amountA: [StreamValue] = try XCTUnwrap(a["amount"]).streamValues()
+        let amountB: [StreamValue] = try XCTUnwrap(b["amount"]).streamValues()
+        XCTAssertEqual(amountA, amountB)
+        let keyA: [StreamValue] = try XCTUnwrap(a["key"]).streamValues()
+        let keyB: [StreamValue] = try XCTUnwrap(b["key"]).streamValues()
+        XCTAssertEqual(keyA, keyB)
+    }
+
+    /// `ORDER BY ... LIMIT n` answers as a resident top-n and spills no runs, and its rows are the
+    /// external sort's own first n — same order, same tie-breaking, nulls in the same place.
+    func testOrderByLimitTopNMatchesTheSortedOracle() throws {
+        try requireRealGPU()
+        let n = 40_000
+        func sortAmount(_ i: Int) -> Double? {
+            if i < 300 { return 500.0 - Double(i % 4) }
+            if i % 19 == 0 { return nil }
+            return Double(i % 400)
+        }
+        var rows: [KeyRow] = []
+        rows.reserveCapacity(n)
+        for i in 0..<n { rows.append(KeyRow(key: Int64(i), amount: sortAmount(i), qty: Int32(i % 11))) }
+        let bs = try Self.keyBatches(rows, sizes: Self.raggedSizes(n, batchRows: 1_000))
+        for (limit, desc) in [(1, true), (25, true), (1_000, false)] {
+            let sink = CollectingSink()
+            let op = try ExternalSortOperator(keys: [.init("amount", descending: desc)], sink: sink,
+                                              scratch: scratch.appendingPathComponent("topn-\(limit)-\(desc)"),
+                                              limit: limit)
+            _ = try StreamingExecutor(source: ChunkedTableSource(bs)).run(op)
+            XCTAssertEqual(op.runCount, 0, "a limited sort spills nothing")
+            XCTAssertLessThan(op.candidateRows, n, "the threshold should reject most rows")
+            // Descending, the first batch already holds every large value, so later batches lose
+            // every row they have. Ascending, small values keep arriving, so batches only shrink.
+            if desc { XCTAssertGreaterThan(op.prunedBatches, 0, "limit=\(limit)") }
+            let got = try XCTUnwrap(try sink.table())
+
+            // Oracle: the whole dataset in the order `argsort` puts it in, nulls last.
+            var order = Array(0..<n)
+            order.sort { i, j in
+                let x = rows[i].amount, y = rows[j].amount
+                if x == y { return i < j }
+                guard let x else { return false }
+                guard let y else { return true }
+                return desc ? x > y : x < y
+            }
+            let want = Array(order.prefix(limit))
+            XCTAssertEqual(got.length, want.count, "limit=\(limit) desc=\(desc)")
+            let keys = try XCTUnwrap(got["key"]?.asInt64).toArray()
+            for (i, w) in want.enumerated() { XCTAssertEqual(keys[i], Int64(w), "row \(i) limit=\(limit)") }
+        }
+    }
+
+    /// A two-key limited sort: the prune keeps the rows that tie on the first key, so the second key
+    /// still decides between them.
+    func testOrderByLimitTopNWithTwoKeys() throws {
+        try requireRealGPU()
+        let n = 20_000
+        // `qty` has four values, so every row ties five thousand others on the first key.
+        let rows = (0..<n).map { KeyRow(key: Int64($0), amount: Double($0 % 977), qty: Int32($0 % 4)) }
+        let bs = try Self.keyBatches(rows, sizes: Self.raggedSizes(n, batchRows: 700))
+        let sink = CollectingSink()
+        let op = try ExternalSortOperator(
+            keys: [.init("qty", descending: true), .init("amount", descending: false)],
+            sink: sink, scratch: scratch.appendingPathComponent("topn2"), limit: 40)
+        _ = try StreamingExecutor(source: ChunkedTableSource(bs)).run(op)
+        let got = try XCTUnwrap(try sink.table())
+        var order = Array(0..<n)
+        order.sort { i, j in
+            if rows[i].qty != rows[j].qty { return rows[i].qty > rows[j].qty }
+            if rows[i].amount != rows[j].amount { return (rows[i].amount ?? 0) < (rows[j].amount ?? 0) }
+            return i < j
+        }
+        let keys = try XCTUnwrap(got["key"]?.asInt64).toArray()
+        XCTAssertEqual(got.length, 40)
+        for i in 0..<40 { XCTAssertEqual(keys[i], Int64(order[i]), "row \(i)") }
+    }
 }
 
 private func XCTAssertEqual(_ a: Int, _ b: Int, accuracy: Int, file: StaticString = #filePath, line: UInt = #line) {
