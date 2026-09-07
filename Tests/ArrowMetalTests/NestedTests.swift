@@ -777,3 +777,44 @@ final class NestedKernelTests: XCTestCase {
         XCTAssertEqual(got, idx.map { model[Int($0)] })
     }
 }
+
+// MARK: - list_value_length, wide and narrow
+
+extension NestedTests {
+    /// `list_value_length` writes the same bytes whether it takes the eight-rows-per-thread kernel or
+    /// the one-row one. The wide kernel needs the offsets pointer 16-byte aligned, which a slice at a
+    /// row that is not a multiple of four breaks, so both paths are exercised here at every length
+    /// around a multiple of eight, plus the 0-row, 1-row and all-null cases.
+    func testListValueLengthWideAndSliced() throws {
+        try requireRealGPU()
+        for n in [0, 1, 2, 7, 8, 9, 33, 4097, 100_003] {
+            let counts: [Int?] = (0..<n).map { i in i % 11 == 3 ? nil : (i % 5) }
+            let total = counts.reduce(0) { $0 + ($1 ?? 0) }
+            let child = try MetalArray<Int32>((0..<total).map { Int32($0) })
+            let list = try MetalListArray(counts: counts, values: .int32(child))
+            XCTAssertEqual(try list.listValueLength().toArray(), counts.map { $0.map(Int32.init) },
+                           "whole array, \(n) rows")
+            // Every slice offset 0...5 covers both the aligned (0, 4) and the unaligned cases.
+            for off in 0..<Swift.min(n, 6) {
+                let s = try list.slice(offset: off, length: n - off)
+                XCTAssertEqual(try s.listValueLength().toArray(),
+                               counts[off...].map { $0.map(Int32.init) },
+                               "slice from \(off) of \(n) rows")
+            }
+        }
+    }
+
+    /// An all-null list column and a single-row one: the lengths are still the offsets difference, and
+    /// the validity bitmap is the input's.
+    func testListValueLengthAllNullAndSingleRow() throws {
+        try requireRealGPU()
+        let allNull = try MetalListArray(counts: [Int?](repeating: nil, count: 40),
+                                         values: .int32(try MetalArray<Int32>([Int32]())))
+        let lens = try allNull.listValueLength()
+        XCTAssertEqual(lens.nullCount, 40)
+        XCTAssertEqual(lens.toArray(), [Int32?](repeating: nil, count: 40))
+
+        let one = try MetalListArray(counts: [3], values: .int32(try MetalArray<Int32>([1, 2, 3])))
+        XCTAssertEqual(try one.listValueLength().toArray(), [3])
+    }
+}
