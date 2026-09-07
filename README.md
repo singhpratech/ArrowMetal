@@ -91,11 +91,18 @@ pip install python/dist/arrowmetal-0.1.0-*.whl      # macOS arm64 only, pyarrow 
 python -c "import arrowmetal as am; print(am.device_name())"
 ```
 ```python
-import pyarrow as pa, polars as pl, arrowmetal as am
-col = am.array(pl.Series([1, None, 3, 40]).to_arrow())
-print(col.filter_where(">", 2).sum(), pl.from_arrow(col.filter_where(">", 2).to_arrow()))
+import pyarrow as pa, arrowmetal as am               # pyarrow is the only import dependency
+col = am.array(pa.array([1, None, 3, 40]))
+print(col.filter_where(">", 2).sum())              # 43, computed on the GPU
 with am.batch():                                   # several kernels, one GPU round trip
     total = col.filter((col > 1) & (col < 40)).sum()
+```
+With the `polars` extra installed (`pip install 'arrowmetal[polars]'`, or just `pip install polars`), a Polars
+Series crosses the same way:
+```python
+import polars as pl
+col = am.array(pl.Series([1, None, 3, 40]).to_arrow())
+print(pl.from_arrow(col.filter_where(">", 2).to_arrow()))
 ```
 ```python
 from decimal import Decimal

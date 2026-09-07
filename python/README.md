@@ -26,20 +26,29 @@ pip install 'python/dist/arrowmetal-0.1.0-*.whl[polars,duckdb,pandas]'   # optio
 python -c "import arrowmetal as am; print(am.device_name())"
 ```
 
-The wheel is `arrowmetal-0.1.0-py3-none-macosx_14_0_arm64.whl`, about 2.7 MB. It is macOS arm64 only:
+The wheel is `arrowmetal-0.1.0-py3-none-macosx_14_0_arm64.whl`; the build script prints its size. It is macOS arm64 only:
 it links Metal and holds an arm64 binary. Extras `polars`, `duckdb`, `pandas` and `test` pull in the
 libraries the corresponding bridges and the test suite want; none of them are needed to `import arrowmetal`.
 
-```python
-import pyarrow as pa, polars as pl, arrowmetal as am
+The first thing to run needs nothing beyond the wheel itself (pyarrow comes with it):
 
-s = pl.Series([1, None, 3, 40])
-col = am.array(s.to_arrow())            # one copy in (Polars buffers are not page aligned); results are zero-copy out
-big = col.filter_where(">", 2)          # GPU
-print(big.sum(), pl.from_arrow(big.to_arrow()))
+```python
+import pyarrow as pa, arrowmetal as am
+
+col = am.array(pa.array([1, None, 3, 40]))     # one copy in (pyarrow buffers are not page aligned); results are zero-copy out
+big = col.filter_where(">", 2)                 # GPU
+print(big.sum(), big.to_arrow())               # 43  [3, 40]
 
 keys = am.array(pa.array([0, 1, 0, 2], pa.int32()))
-print(keys.group_by(3).sum(col).to_arrow())
+print(keys.group_by(3).sum(col).to_arrow())    # [4, null, 40]
+```
+
+With the `polars` extra (or any installed Polars), a Series crosses through Arrow the same way:
+
+```python
+import polars as pl
+col = am.array(pl.Series([1, None, 3, 40]).to_arrow())
+print(pl.from_arrow(col.filter_where(">", 2).to_arrow()))
 ```
 
 Float64 columns (NumPy's and pandas' default) run entirely on the GPU: compare, filter, take, sum and

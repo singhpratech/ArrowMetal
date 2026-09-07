@@ -95,7 +95,7 @@ git switch --detach v0.1.0
 scripts/build_wheel.sh                  # swift build -c release, then python/build_wheel.sh
 ```
 
-This produces `python/dist/arrowmetal-0.1.0-py3-none-macosx_14_0_arm64.whl` (about 2.7 MB) with
+This produces `python/dist/arrowmetal-0.1.0-py3-none-macosx_14_0_arm64.whl` (the script prints its size) with
 `libArrowMetalC.dylib` bundled at `arrowmetal/_lib/`. Check it before uploading:
 
 ```
