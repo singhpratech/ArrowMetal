@@ -18,6 +18,7 @@ every claim the project makes.
 | [ENGINE.md](ENGINE.md) | The lazy query engine: the logical plan, the optimizer rules with `explain()` examples, fusion planning, the full join matrix (multi-key, utf8, outer, semi/anti, as-of), window functions, the plan grammar, the numbers and the limits |
 | [POLARS.md](POLARS.md) | Polars on the GPU in three tiers: the zero-copy bridge and `.arrowmetal` namespaces, the Rust expression plugin for lazy plans, and the streaming hand-off — with install, numbers at 10M and 50M rows, and what a real Metal `engine=` backend would need |
 | [DUCKDB.md](DUCKDB.md) | Using ArrowMetal from DuckDB: the zero-copy Python bridge, the loadable SQL extension, streaming tables larger than memory, and an honest account of which shapes the GPU wins and which it loses |
+| [STREAMING.md](STREAMING.md) | Out-of-core streaming execution: datasets larger than memory flowing from disk through the GPU, the three-stage pipeline and its measured overlap, every streaming operator with exact-or-approximate marked, and the buffer budget |
 | [DECISIONS.md](DECISIONS.md) | Why it is built this way, one dated entry per decision |
 | [FINDINGS.md](FINDINGS.md) | Things learned the hard way: toolchain quirks, Metal limits, bugs and their lessons |
 | [../ROADMAP.md](../ROADMAP.md) | What is next and what is open for contributors |
@@ -43,6 +44,8 @@ cd polars-plugin && cargo build --release                 # the Polars expressio
 PYTHONPATH=python python -m pytest python/tests/test_polars.py -q   # the three Polars tiers
 PYTHONPATH=python python Benchmarks/polars_bench.py       # native Polars vs both Polars tiers
 PYTHONPATH=python python Benchmarks/pandas_bench.py       # plain pandas vs the .am accessor vs accel mode
+PYTHONPATH=python python Benchmarks/streaming_bench.py --data-dir /tmp/am-stream --size-gb 30
+                                                 # out-of-core streaming vs Polars, DuckDB and pyarrow.dataset
 swift run -c release arrowmetal-examples         # six end-to-end scenarios
 ```
 
