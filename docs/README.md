@@ -10,6 +10,7 @@ test or the CSV a claim comes from.
 | [ARROW_FUNCTIONS.md](ARROW_FUNCTIONS.md) | Coverage of Apache Arrow compute by **exact name**: all 307 v25 function names, one row each, generated from a registry the test suite executes against `pyarrow.compute` |
 | [COVERAGE.md](COVERAGE.md) | The same ground by **family**, with the Arrow type matrix and interop: which functions and types are supported, and how (GPU, GPU/CPU, CPU, partial) |
 | [EVALUATION.md](EVALUATION.md) | How correctness is checked: CPU oracles, the scenario matrix, bit-exact IEEE-754 tests, and the differential harness against pyarrow.compute, with open findings |
+| [UPSTREAM.md](UPSTREAM.md) | What the matrix found in other projects (pyarrow, the Arrow tz database, Apple Metal), the test behind each finding, and where every upstream report stands |
 | [TESTING.md](TESTING.md) | Every test suite, what it covers, and the commands to run it |
 | [BENCHMARKS.md](BENCHMARKS.md) | Every benchmark round with hardware, methodology, wall time and CPU time; the tables the README quotes |
 | [LOSSES.md](LOSSES.md) | Every row of the matrix still short of the 3x bar, slower rows first, grouped by the measured cause (dispatch floor, copy vs view, sort-based distinct, software binary64, host regex), plus the rows under the 3x bar and what changed since the previous matrix |
