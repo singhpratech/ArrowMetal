@@ -141,10 +141,12 @@ the source of record, Parquet arrives through `scan_arrow(pyarrow.dataset(...))`
 | `variance`, `stddev` | **exact** | decomposed to `sum(x)`, `sum(x·x)` in float64 and `count`, all in one fused kernel | combine | 3 scalars |
 | `count_distinct_approx` | **approximate** — relative standard error `1.04 / sqrt(2^p)`: 0.81 % at the default p = 14, 0.41 % at p = 16 | a new HyperLogLog kernel: one `atomic_fetch_max` per row into a `2^p`-register table | element-wise max of two register arrays | `2^p` bytes (16 KB at p = 14), whatever the dataset's size |
 | `group_by` (dense integer key) | **exact** | `GroupBy` per batch, then element-wise `add` / `min` / `max` folds the batch result into the **GPU-resident** global table | none | `K` accumulators per aggregate on the GPU; spills to the host table above `gpuStateBudgetBytes` (512 MB default) |
-| `group_by` (arbitrary keys, any type, any number) | **exact** | `GroupByKeys` turns the key columns into dense ids on the GPU, then the aggregates | fold one row per group into a host table sharded by key hash across `mergeShards` threads | one entry per **distinct group**, not per row |
-| `top_k` | **exact** | per-batch GPU top-k, then a GPU top-k over the 2k candidates | `concat` of two k-row batches | ≤ 2k rows |
+| `group_by` (one integer key, `sum` / `count` / `mean`) | **exact** | `GroupByKeys` per batch, then three kernels fold that batch's group list into the **GPU-resident** hash table (§4.1) | **none** | one slot per distinct key on the GPU |
+| `group_by` (any other key or aggregate) | **exact** | `GroupByKeys` turns the key columns into dense ids on the GPU, then the aggregates | fold one row per group into a host table sharded by key hash across `mergeShards` threads | one entry per **distinct group**, not per row |
+| `top_k` | **exact** | one comparison kernel rejects the batch against the running k-th value (§4.2); survivors go through the GPU top-k and are folded into the **GPU-resident** k rows | **none** | k rows on the GPU |
 | `quantile` | **approximate** — see §6 | one radix argsort plus one gather per batch; only `compression` values reach the host | merge two weighted centroid lists and re-compress | ≤ `compression` centroids (1000 default) |
-| `sort` (external) | **exact** | one radix argsort per batch; each output chunk is assembled with `take` | **the k-way merge is on the CPU** (see §5) | one batch per run + one output batch |
+| `sort` with `limit n` | **exact** | top-n, not a sort: the same threshold prune, then the GPU top-k selection over the survivors (§5) | **none** | n rows on the GPU; **nothing spills** |
+| `sort` (external, no limit) | **exact** | one radix argsort per batch; each output chunk is assembled with `take` | **the k-way merge is on the CPU** (see §5) | one batch per run + one output batch |
 | `join` (broadcast) | **exact** | the existing GPU hash join per probe batch | writing the sink | the build side, in memory |
 | `join` (grace hash) | **exact** | partition on the GPU, then the GPU hash join per partition | writing the partition files | one partition pair at a time |
 
@@ -181,6 +183,57 @@ Both paths return the groups in ascending key order, so the result is determinis
 layouts and runs. (This differs from pyarrow, which returns first-seen order; sort both sides before
 comparing.)
 
+### 4.1 The resident group table
+
+`Sources/ArrowMetal/Stream/StreamGroupTable.swift`. For **one integer key** with `sum` / `count` /
+`mean` aggregates, the global table is an open-addressing hash table in device memory that lives for
+the whole scan: one slot per distinct key, and per aggregate a 64-bit sum and a 64-bit count. Ten
+million groups with one aggregate is about 560 MB at a load factor of one half. Nothing crosses to
+the host until `finish()`.
+
+Metal has no 64-bit atomics and only guarantees `memory_order_relaxed`, so the usual "claim the slot,
+then publish the key" handshake is not safe — a reader can see a claimed slot before the key beside it
+is visible. `Kernels/HashTable.swift` avoids that by storing `row + 1` in the atomic and reading the
+key out of an array nothing writes, which a *persistent* table cannot do. The way out is the shape of
+the input: the table is probed with a batch's **distinct group keys**, never with its rows, so every
+key in a dispatch is different, and the work splits into three:
+
+1. `sgt_lookup` — read-only against a table nothing is writing. Keys already present get their slot.
+2. `sgt_insert` — runs only for the keys step 1 proved absent, so it never compares keys at all: it
+   claims the first empty slot on its probe chain with a 32-bit compare-exchange. A thread walking
+   over a slot another thread claimed in the same dispatch is walking over a *different* key, which is
+   what linear probing wants it to do, so a stale read is never consulted. A slot only ever goes from
+   empty to occupied, so no later lookup's probe chain is ever broken.
+3. `sgt_accumulate` — distinct keys mean distinct slots, so this needs no atomics either, and the
+   float64 sum uses the correctly-rounded software adder `d_add`.
+
+Growth doubles the table and rehashes on the GPU under the same claim rule. `min` / `max` /
+`variance`, multi-column keys and non-integer keys keep the host table, and the tests check the
+resident path against it bit for bit — including a null-key group, all-null groups, duplicate keys,
+empty batches and four integer key widths.
+
+Both fold the same per-batch partials in the same order, one with Swift's `+` and one with `d_add`,
+so the float64 sums agree to the last bit.
+
+### 4.2 Threshold pruning
+
+Once a top-k (or an `ORDER BY ... LIMIT n`) has k rows resident, the k-th value is a lower bound on
+anything that can still enter the answer. Every later batch therefore starts with **one comparison
+kernel over the key column**; the rows that pass are gathered — usually none, or a handful — and only
+they reach the selection and the fold. The expected number of survivors in batch *i* of a scan for
+the top k is `k / i`, so the work per batch collapses to a single pass over one column.
+
+Two details make it exact rather than merely close:
+
+* The comparison is `>=`, not `>`. A row that *ties* the running k-th value can still be the row the
+  total order picks (`topK` breaks ties by row index), and for a multi-key sort it can still win on
+  the second key. Keeping ties is what makes the pruned answer *the* answer.
+* A threshold is only taken when the k-th row's key is **non-null**. Nulls sort last, so once k
+  non-null rows are resident no null row can displace one; while fewer than k are, nothing is pruned.
+
+The fold runs on the GPU thread rather than the merge thread, which leaves the merge stage idle *and*
+means the threshold the next batch prunes with is always the newest one.
+
 ---
 
 ## 5. External sort
@@ -196,7 +249,16 @@ to give a GPU: at 20 runs the whole merge is one comparison of 20 heap entries p
 2. **one permutation `take`** puts them back in merged order.
 
 So no column data is ever rebuilt value by value on the host, and memory during the merge is one
-batch per run plus one output batch. `ORDER BY ... LIMIT n` stops the merge at n rows.
+batch per run plus one output batch.
+
+**`ORDER BY ... LIMIT n` never gets here.** With a limit the answer is n rows, so nothing has to
+spill: the running n rows stay Metal-resident and each batch folds into them on the GPU thread, under
+the threshold prune of §4.2. That is the same argument the bounded fan-in below already used — the
+global first n are inside the union of each part's first n — applied one batch earlier, where it is
+worth a thousand times more: a run used to be a whole million-row batch written to disk and read
+back, and now there are no runs at all. A single-key head uses the GPU top-k selection, which returns
+*exactly* the first n indices `argsort` would (same order-preserving key, same tie-break by row
+index), so it is a cheaper way to compute the same prefix and not a different answer.
 
 Runs are merged with a **bounded fan-in**. 570 batches means 570 runs, and opening them all at once
 would want 570 file descriptors and 570 resident batches; instead the merge runs in passes of at most
@@ -274,13 +336,83 @@ The machine has 64 GB of RAM and the dataset is 30 GB, so after the first pass i
 cache: the GB/s figures are memory bandwidth as much as SSD bandwidth, and they are the same for
 every engine.
 
-### Against Polars and DuckDB
+### The current measurement: 8 GB, before and after the resident-state work
 
-Wall-clock milliseconds, then peak RSS. ArrowMetal runs with `readers=8`; Polars uses
-`scan_ipc(...).collect(engine="streaming")`, DuckDB queries the directory through a
-`pyarrow.dataset`. Every cell finished within memory.
+The 30 GB table this section used to carry is kept below, because it is the size at which the read
+stops being the limit. The current numbers are from an **8.06 GB** run of the same generator
+(`--size-gb 8`: 152,000,000 rows, 8 files, 152 batches of 1M rows) with `readers = 2`, best of three
+**interleaved A/B rounds** in which only the loaded library changes — same benchmark script, same
+dataset, same page cache, one cell process at a time. "before" is main; "after" is §4.1, §4.2 and §5.
+Wall-clock milliseconds, then peak RSS.
 
-| Workload | ArrowMetal | Polars | DuckDB | ArrowMetal RSS | Polars RSS | DuckDB RSS |
+| Workload | before | **after** | Polars | DuckDB | RSS before | RSS after | Polars RSS | DuckDB RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `sum(amount) where region < 100` | 325 | 324 | **158** | 230 | 2.30 GB | 2.30 GB | 1.86 GB | 0.97 GB |
+| group by `region` -> sum, count (1k groups) | 509 | 513 | **164** | 268 | 2.52 GB | 2.52 GB | 2.26 GB | 1.08 GB |
+| group by `bigkey` -> sum (10M groups) | 7,629 | **4,110** | 743 | 864 | 5.14 GB | 4.14 GB | 5.31 GB | 8.04 GB |
+| top 100 by `amount` | 527 | **386** | 176 | 240 | 2.51 GB | 2.51 GB | 1.79 GB | 0.81 GB |
+| `count_distinct(id)` | 329 | 331 | 694 | **223** | 2.30 GB | 2.30 GB | 4.78 GB | 0.79 GB |
+| order by `amount` desc limit 1000 | 2,297 | **524** | 177 | 241 | 3.85 GB | 2.52 GB | 2.91 GB | 0.83 GB |
+| broadcast join + sum | 564 | 562 | 281 | 244 | 2.47 GB | 2.48 GB | 2.15 GB | 0.95 GB |
+
+`sort_limit` is **4.4x** faster and spills no runs at all (peak RSS falls by 1.3 GB with them),
+`groupby_10m` is **1.86x** faster on a gigabyte less memory, `topk` is **1.4x** faster. `filter_sum`
+and `count_distinct` are unchanged within noise, which is the point: they were already right.
+
+The four cross-checked workloads (`filter_sum`, `groupby_1k`, `topk`, `sort_limit`) are compared
+against Polars' answer with a 1e-9 relative tolerance on float sums, and all four pass.
+
+### Where the pipeline's time goes now
+
+`overlap` is (read + gpu + merge) / wall: 1.0 for a serial pipeline, and above that by however much
+the stages actually ran at the same time. With `readers = 2` the read column is the sum across both
+reader threads, so it can exceed wall on its own. The stall columns are the GPU stage waiting: for a
+batch the readers had not finished, and for the merge queue to drain.
+
+| Workload | Overlap | Read (s) | GPU (s) | Merge (s) before | **Merge (s) after** | Read stall (s) | Merge stall (s) | Wall (s) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `filter_sum` | 2.19x | 0.57 | 0.09 | 0.00 | 0.00 | 0.21 | 0.00 | 0.32 |
+| `groupby_1k` | 2.58x | 0.56 | 0.48 | 0.30 | **0.22** | 0.02 | 0.00 | 0.51 |
+| `groupby_10m` | 1.24x | 0.72 | 4.01 | 2.35 | **0.34** | 0.01 | 0.00 | 4.11 |
+| `topk` | 2.60x | 0.60 | 0.34 | 0.48 | **0.00** | 0.03 | 0.00 | 0.39 |
+| `count_distinct` | 2.19x | 0.57 | 0.09 | 0.00 | 0.00 | 0.21 | 0.00 | 0.33 |
+| `sort_limit` | 2.13x | 0.57 | 0.49 | 1.19 | **0.00** | 0.01 | 0.00 | 0.52 |
+| `broadcast_join` | 2.42x | 0.62 | 0.29 | 0.00 | 0.00 | 0.02 | 0.00 | 0.56 |
+
+**The merge stage is zero on every operator that had one**, which was the point: nothing folds a
+batch's answer on the host any more except the host group-by table (§4), and that table is only
+reached by the keys and aggregates the resident one does not take. **The merge stall is 0.00 s
+everywhere**, so the bounded queue between the GPU stage and the merge never fills, and peak RSS
+stays flat at 2.3 to 2.5 GB over 8 GB of data.
+
+**Where we still lose, and why.**
+
+* **`filter_sum` and `count_distinct` are read-bound at `readers = 2`.** Their GPU stage is 0.09 s of
+  a 0.32 s wall and the read stall is 0.21 s of it, so what is being measured there is two reader
+  threads moving 8 GB against Polars reading the same directory with every core at 51 GB/s. The
+  30 GB numbers below, taken with `readers = 8`, are what the same operators look like once the read
+  is not the limit.
+* **`groupby_10m` is still 5.5x behind Polars**, and the reason is now precisely located: the merge
+  is 0.34 s, but the **GPU stage is 4.0 s**, and essentially all of it is the *per-batch*
+  `GroupByKeys` that turns a million int64 keys into dense ids. `bigkey` spans ten million values
+  over a million-row batch, too sparse for the range-encoding path, so every batch pays a full radix
+  sort of its key column plus an atomic group-by min to pick each group's representative row — with a
+  host loop over that batch's ~950,000 groups inside it. Removing it means giving the resident table
+  its own **row-level** probe; §4.1 explains why the current two-phase insert cannot do that (it
+  relies on every key in a dispatch being distinct, which rows are not), and that is the next step.
+* **`groupby_1k`, `topk`, `sort_limit` and the join are within 2x to 3x** of Polars and DuckDB, and
+  are read- or fixed-cost-bound rather than dominated by any one stage.
+* **The broadcast join is unchanged** because the benchmark streams its joined rows back to Python
+  and sums them there. Fusing the aggregate into the probe, so the join's output never leaves the
+  GPU, is not implemented.
+
+### The earlier 30 GB measurement
+
+Kept because 30 GB with `readers = 8` is the size at which the read stops being the limit and the
+per-batch work shows through. Same M4 Max, a **30.21 GB** directory: 570,000,000 rows, 30 files, 570
+batches of 1M rows.
+
+| Workload | ArrowMetal (before) | Polars | DuckDB | ArrowMetal RSS | Polars RSS | DuckDB RSS |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `sum(amount) where region < 100` | **527** | 515 | 418 | 8.9 GB | 2.0 GB | 1.1 GB |
 | group by `region` -> sum, count (1k groups) | 1,765 | **554** | 625 | 9.5 GB | 3.1 GB | 1.3 GB |
@@ -290,39 +422,32 @@ Wall-clock milliseconds, then peak RSS. ArrowMetal runs with `readers=8`; Polars
 | order by `amount` desc limit 1000 | 11,121 | 642 | **567** | 9.3 GB | 2.7 GB | 0.9 GB |
 | broadcast join + sum | 1,807 | 764 | **423** | 9.2 GB | 2.3 GB | 1.1 GB |
 
+The resident top-n and threshold pruning of §4.2 and §5 were measured once on that dataset before it
+was deleted, in a single interleaved A/B round with `readers = 8`, printed to a tenth of a second:
+
+| Workload | before | after |
+| --- | ---: | ---: |
+| top 100 by `amount` | 4.7 s | **0.8 s** |
+| order by `amount` desc limit 1000 | 11.2 s | **1.1 s** |
+| group by `region` (1k groups) | 1.3 s | 1.0 s |
+| `sum(amount) where region < 100` | 0.5 s | 0.5 s |
+| `count_distinct(id)` | 0.5 s | 0.5 s |
+| broadcast join + sum | 1.7 s | 1.6 s |
+
+At that size **top-k and `ORDER BY ... LIMIT` overtake both Polars and DuckDB** — 0.8 s against 0.587
+and 0.544, 1.1 s against 0.642 and 0.567 — because 30 GB is where the per-batch work, not the read,
+was the limit. The resident group table (§4.1) landed after that run, so `groupby_10m` was not
+re-measured at 30 GB; its 8 GB improvement is in the table above.
+
 pyarrow.dataset (measured in a separate single-reader run, so not comparable cell by cell) finished
 `groupby_10m` in 557 s and **timed out at 900 s on `count_distinct`**.
 
-**Read the wins and the losses honestly.**
-
-* **`filter_sum` ties Polars** at 57 GB/s — a whole-dataset filtered aggregate over 570 million rows
-  in half a second, with the CPU doing nothing but reading bytes.
 * **`count_distinct_approx` beats Polars by 7x** (532 ms against 3,825 ms) *and* uses half a
   gigabyte where Polars uses 17. DuckDB's sketch is faster still, but its answer is **12.4 % off**
   against ArrowMetal's **0.007 %** — DuckDB's `approx_count_distinct` is tuned for a much smaller
   sketch. Against an exact count this is the operator where streaming on a GPU clearly pays.
-* **Top-k, sort+limit and the joins lose**, by 3x to 17x. The reason is visible in the pipeline table
-  below: these are the workloads where the *GPU stage plus the merge stage* is the bottleneck, not
-  the read, and a Metal command buffer per batch has a fixed cost that 570 batches multiply out.
-  Polars and DuckDB are also simply very good at these.
-* **`groupby_10m` is 5x behind** but uses half of DuckDB's memory. See §4 for what the merge does and
-  where the remaining time goes.
-
-### The ArrowMetal pipeline on each workload
-
-`overlap` is (read + gpu + merge) / wall: 1.0 for a serial pipeline, and above that by however much
-the stages actually ran at the same time. With `readers = 8` the read column is the sum across the
-eight reader threads, so it can exceed wall on its own.
-
-| Workload | Overlap | Read (s) | GPU (s) | Merge (s) | Wall (s) |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `filter_sum` | 7.72x | 3.52 | 0.29 | 0.00 | 0.53 |
-| `groupby_1k` | 3.82x | 3.48 | 1.71 | 1.43 | 1.77 |
-| `groupby_10m` | 1.47x | 3.79 | 16.50 | 8.88 | 19.95 |
-| `topk` | 4.14x | 9.42 | 3.24 | 3.91 | 4.06 |
-| `count_distinct` | 7.70x | 3.55 | 0.29 | 0.01 | 0.53 |
-| `sort_limit` | 1.20x | 4.60 | 3.88 | 4.84 | 11.12 |
-| `broadcast_join` | 3.45x | 3.85 | 1.24 | 0.00 | 1.81 |
+* **`filter_sum` ties Polars** at 57 GB/s — a whole-dataset filtered aggregate over 570 million rows
+  in half a second, with the CPU doing nothing but reading bytes.
 
 ### Accuracy of the two approximate operators
 
@@ -364,6 +489,9 @@ same queries run at 1.2 GB of RSS (and two to five times slower). The genuinely 
 
 * **`readers > 1` does not preserve batch order**, so a row-order-preserving `sink_ipc` or
   `to_reader` needs `readers: 1` (the default).
+* **Threshold pruning is exact but not free of assumptions**: it compares against the running n-th
+  value with `>=`, which needs a comparison kernel for the key column's type. Types without one
+  (`utf8`, `binary`, boolean, decimals) simply run unpruned — correct, just not faster.
 * **Sort keys** on `utf8` / `binary` columns fall back to a host sort per batch. Numeric, boolean and
   temporal keys use the GPU radix sort.
 * **`count_distinct_approx` is a whole-dataset aggregate**, not a per-group one; a per-group HLL would
@@ -379,10 +507,19 @@ same queries run at 1.2 GB of RSS (and two to five times slower). The genuinely 
   column for a whole stream is the only form the writer emits, which an incremental sink cannot
   promise.
 * **A `Stream` is single use**: a terminal consumes the source. Open a new scan for a second question.
-* **Top-k, sort+limit and the joins are 3x to 17x slower than Polars and DuckDB** on a warm 30 GB
-  dataset (§9). Those are the workloads where the GPU stage and the merge dominate rather than the
-  read, and one Metal command buffer per batch has a fixed cost that 570 batches multiply out;
-  a larger `batch_rows` amortises it, at the cost of memory per batch.
+* **A group-by over ten million groups is 5.5x slower than Polars** (§9). The merge is gone; what
+  remains is the *per-batch* dense-id encoding, which for a key too sparse to range-encode is a full
+  radix sort of the key column plus a host loop over that batch's groups. A row-level probe straight
+  into the resident table would remove it and is not implemented.
+* **The resident group table takes one integer key and `sum` / `count` / `mean`.** `min` / `max`
+  (they would need a per-slot atomic minimum), `variance` (a third accumulator), multi-column keys
+  and non-integer keys all keep the host table, which is exact but folds one row per group per batch
+  on the CPU.
+* **A broadcast join writes rows, it does not aggregate them.** `join(...).sum(...)` streams the
+  joined rows out and sums them in the caller; fusing the aggregate into the probe so the output
+  never leaves the GPU is not implemented.
+* **Each batch is one Metal command buffer, not several.** The fixed cost per batch is paid once per
+  batch; a larger `batch_rows` amortises it, at the cost of memory per batch.
 * **`readers > 1` raises peak RSS by roughly `readers` x the part-file size**, because that many
   files are mapped at once. Those pages are reclaimable page cache, not anonymous memory, but they
   do show up in `ru_maxrss`.
