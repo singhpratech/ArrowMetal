@@ -129,8 +129,9 @@ def to_arrow(obj):
         kind = "categorical" if isinstance(values, pd.Categorical) else "pandas masked extension array"
         return Conversion(arr, False, f"{kind} -> Arrow, one copy", dtype)
 
-    # 3. numpy-backed. Integers and booleans without nulls can still come across without a copy;
-    #    floats and datetimes need NaN/NaT -> null, which builds a validity bitmap.
+    # 3. numpy-backed. Integers without nulls come across without a copy; booleans cost one pass
+    #    because Arrow packs them to one bit per value; floats and datetimes need NaN/NaT -> null,
+    #    which builds a validity bitmap.
     np_arr = np.asarray(values)
     from_pandas = np_arr.dtype.kind in "fMmO"
     arr = _as_pa_array(pa.array(np_arr, from_pandas=from_pandas))

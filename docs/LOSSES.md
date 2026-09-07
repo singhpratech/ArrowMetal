@@ -133,8 +133,9 @@ is measurement noise.
 The full list is in the matrix page under ⚠️. The clusters:
 
 - **Software binary64 math** — `ln` 1.06–1.08x, `sin` 1.98–1.99x, `days_between` 1.04–1.11x,
-  `sqrt` at 10M rows 1.83x (3.13x at 50M, where the dispatch floor no longer shows). Correct to 1 ulp
-  (4–5 ulp for trigonometry); the CPU has hardware doubles and the GPU does not. These will not reach
+  `sqrt` at 10M rows 1.83x (3.13x at 50M, where the dispatch floor no longer shows). Within 2 ulp of the host libm
+  for `exp`, `ln`, `log2`, `log10` and `power` (the test bound), `sqrt` correctly rounded, 4–5 ulp for
+  trigonometry; the CPU has hardware doubles and the GPU does not. These will not reach
   3x without a different numerical contract.
 - **Grouped aggregates against pyarrow at 1000 groups** — sum/count/min/max/mean by int32, float64 and
   utf8 key at 1.3–2.2x, two int32 keys at 1.11x (10M rows; 3.8x at 50M), and variance/stddev at
