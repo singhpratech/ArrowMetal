@@ -98,52 +98,81 @@ the copying path in, while an int64 column, a validity bitmap, a cast result, a 
 anything read from a file take the copy-free path.
 
 That size qualifier matters: a buffer is page aligned only when it is large enough for arrow to
-give it its own allocation instead of a slice of a pool. Spot-checked, an int64 or string column is
-page aligned from about a thousand elements and a validity bitmap from about a hundred thousand (a
-bitmap for a thousand rows is 125 bytes); at `n = 3` nothing is aligned at all — int64 values
-landed at offset 128 in the page, string buffers at 256 and 384, a validity bitmap at 192. Small
-columns always take the copying path, at a cost too small to measure.
+give it its own allocation instead of a slice of a pool, so **a small column's buffers are not page
+aligned and take the copying path** whatever their type. Where the changeover happens is allocator
+behaviour — it differs by type and is not monotone in `n` — so no threshold is quoted here. The
+table above is what was measured, at 1M and 10M; for anything else, run `am_buffer_alignment()` on
+your own data rather than inferring. At small sizes the copy costs nothing worth measuring.
 
-The copy costs **1.42 ms (median) for 80 MB** (10M float64), about 56 GB/s.
+The copy costs **1.39 ms (median) for 80 MB** (10M float64), about 57 GB/s.
 
 ## Timing
 
 10,000,000 float64, no nulls.
 
-**Method:** **5 fresh R processes**, each building its own data, calling every expression once as a
-warm-up, then `microbenchmark(times = 20)` — 100 timed runs per method in five independent
-processes. The tables give the **minimum across all 100** and the **median of the five per-process
-medians**. A single best-of-5 inside one process is not stable at this size: an earlier run of that
-shape put resident `filter` at 1.22 ms, which does not reproduce, so the median is the number to
-quote and the minimum is the floor. "resident" means the column is already an `am_array`, "import"
-means the timing starts from an `arrow::Array` and includes the transfer. All variants were checked
-to produce the same answer in the same script.
+**Method.** The benchmark is committed at `r/arrowmetal/inst/bench/timing.R` with its driver
+`run.R`, so the table below can be re-derived rather than taken on trust:
+
+```sh
+ARROWMETAL_LIB=$PWD/.build/release/libArrowMetalC.dylib \
+  Rscript r/arrowmetal/inst/bench/run.R 5 2
+```
+
+**2 replicates × 5 fresh R processes × `microbenchmark(times = 20)`**, each process building its
+own data. Every expression is timed **two ways**, because they disagree by enough to move a
+headline:
+
+- **isolated** — each expression in its *own* `microbenchmark()` call, after one warm-up call of
+  that expression. The most favourable measurement.
+- **interleaved** — all expressions in *one* `microbenchmark()` call, so the runs are shuffled and
+  each expression meets the cache and buffer-pool state the others leave behind. The conservative
+  measurement, and the right one for a table whose rows are compared with each other.
+
+`min` is the fastest of all 200 runs, `median` the median of the 10 per-process medians.
+"resident" means the column is already an `am_array`, "import" means the timing starts from an
+`arrow::Array` and includes the transfer. All variants were checked to give the same answer in the
+same script.
 
 `sum`:
 
-| Method | min | median |
+| Method | isolated min / median | interleaved min / median |
 |---|---:|---:|
-| `am_sum(h)` resident | **0.86 ms** | 1.40 ms |
-| `arrow::call_function("sum", a)` | 1.14 ms | **1.26 ms** |
-| `am_sum(a)` import + sum | 2.05 ms | 3.29 ms |
-| `sum(x)` base R | 11.18 ms | 11.96 ms |
+| `am_sum(h)` resident | 0.52 / 0.82 ms | 1.37 / 1.70 ms |
+| `arrow::call_function("sum", a)` | 1.09 / 1.16 ms | 1.12 / 1.31 ms |
+| `am_sum(a)` import + sum | 3.29 / 6.36 ms | 2.75 / 3.20 ms |
+| `sum(x)` base R | 11.15 / 11.60 ms | 11.15 / 11.61 ms |
 
-**ArrowMetal loses `sum`**: on the median, **1.11× slower** than arrow resident and **2.6× slower**
-with the import counted. On its single fastest run it edges arrow (0.86 ms against 1.14 ms), but
-that does not hold across processes. A sum is one pass over 80 MB with no arithmetic to speak of,
-so it is bounded by memory bandwidth the 16-thread CPU kernel already saturates.
+**Resident `sum` is not separable from arrow's, and no verdict is claimed for it.** It measures
+between **0.6 and 1.4 ms depending on the process**: the per-process medians were 0.57, 0.59, 0.60,
+0.60, 0.78 in one replicate and 0.86, 1.38, 1.38, 1.39, 1.54 in the next, while arrow stayed tight
+at 1.14–1.27 across all ten. One replicate makes ArrowMetal look twice as fast, the next makes it
+look slower; the honest reading is that the two are the same speed to within the noise of this
+measurement.
+
+**`sum` including the import is a reproducible loss**: 3.20 ms against arrow's 1.31 ms interleaved,
+**2.4× slower**, in every replicate. A sum is one bandwidth-bound pass over 80 MB with no
+arithmetic to hide the transfer behind.
 
 `filter` (`x > 0.5`, about 5M rows out):
 
-| Method | min | median |
+| Method | isolated min / median | interleaved min / median |
 |---|---:|---:|
-| `am_filter(h, am_compare(h, ">", 0.5))` resident | **0.78 ms** | **1.51 ms** |
-| `am_filter(a, am_compare(a, ">", 0.5))` import + filter | 3.74 ms | 4.65 ms |
-| `arrow` `greater` then `filter` | 21.29 ms | 22.40 ms |
-| `x[x > 0.5]` base R | 36.62 ms | 39.34 ms |
+| `am_filter(h, am_compare(h, ">", 0.5))` resident | 1.09 / 1.19 ms | 1.12 / 1.58 ms |
+| `am_filter(a, am_compare(a, ">", 0.5))` import + filter | 4.19 / 11.79 ms | 3.95 / 4.49 ms |
+| `arrow` `greater` then `filter` | 20.80 / 22.27 ms | 20.84 / 21.92 ms |
+| `x[x > 0.5]` base R | 36.12 / 37.57 ms | 34.79 / 37.88 ms |
 
-ArrowMetal wins `filter` **14.9× against arrow resident and 4.8× including the import**, on the
-medians.
+ArrowMetal wins `filter` clearly, but **the multiple depends on how it is measured**: about **14×**
+against arrow resident and about **4.9×** including the import, on the conservative interleaved
+medians. The resident row ranges 1.12–1.64 ms across processes here and independent runs on the
+same machine have put it above 2 ms, which would make it nearer 9×. Treat it as **roughly an order
+of magnitude, not a precise multiple**.
+
+The `import` rows are the one place isolated timing is *worse* than interleaved (11.79 ms against
+4.49 ms for filter): twenty imports back to back give the buffer pool no chance to recycle.
+
+`am_array()` alone on the same column: **1.32 ms min, 1.39 ms median** interleaved (80 MB, about
+57 GB/s).
 
 arrow's kernels are multi-threaded and base R's are not, so a comparison against base R is not a
 per-core figure. Timings on a loaded machine are noise; these ran on an idle machine.
