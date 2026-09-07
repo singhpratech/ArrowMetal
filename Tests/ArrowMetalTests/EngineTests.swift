@@ -188,11 +188,19 @@ final class EngineTests: XCTestCase {
         for i in 0..<50 { small.append(Int32(i)) }
         let l = try MetalRecordBatch(names: ["k"], columns: [try ints(small)])
         let r = try MetalRecordBatch(names: ["k", "v"], columns: [try ints(big), try ints(big)])
-        let f = frame(l, "small").join(frame(r, "big"), on: ["k"], how: .inner)
-        let text = try f.explain()
+        let joined = frame(l, "small").join(frame(r, "big"), on: ["k"], how: .inner)
+
+        // Swapping the sides permutes the rows, and docs/ENGINE.md promises an inner join keeps
+        // probe (left) order — so the rule only fires where nothing above can see the order.
+        let bare = try joined.explain()
+        XCTAssertFalse(bare.contains("join_reorder"), bare)
+
+        let grouped = joined.groupBy(["k"], [ExprAggregate(.sum, col("v"), name: "total")])
+        let text = try grouped.explain()
         XCTAssertTrue(text.contains("join_reorder"), text)
         // The column order the caller asked for is restored by a projection on top.
-        XCTAssertEqual(try f.schema().names, ["k", "v"])
+        XCTAssertEqual(try joined.schema().names, ["k", "v"])
+        XCTAssertEqual(try grouped.schema().names, ["k", "total"])
     }
 
     // MARK: - 3. filter + project against an oracle

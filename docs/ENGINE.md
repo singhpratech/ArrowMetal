@@ -83,12 +83,12 @@ Every rule preserves the result exactly — same rows, same nulls. `explain()` l
 
 | Rule | What it does |
 |---|---|
-| `constant_folding` | evaluates literal-only subtrees, collapses `and(true, x)`, `x * 1`, `not(not x)`, dead `coalesce` arms |
+| `constant_folding` | evaluates literal-only subtrees, collapses `and(true, x)`, `x * 1`, `not(not x)`, dead `coalesce` arms. Only the **Kleene** forms absorb a literal (`and_kleene(false, x)` → `false`): plain `and`/`or` propagate nulls, so `and(false, null)` is null and does not fold. `if_else(c, a, a)` does not fold either — Arrow's `if_else` is null wherever `c` is |
 | `filter_fusion` | `filter(filter(x, a), b)` → `filter(x, and(a, b))`: one compaction pipeline instead of two |
 | `predicate_pushdown` | moves each conjunct as far down as it can go: through projections (substituting the projected expression), through `with_columns`, below sorts, below a group-by when it only touches key columns, into each side of a join where the join kind allows, into every branch of a concat, and below an explode |
 | `projection_pruning` | works out what each node's parent actually needs and narrows the scan to those columns; drops projection and window outputs nothing reads |
-| `expression_cse` | drops duplicate outputs with the same canonical text (the fused kernel's own CSE only sees one query at a time) |
-| `join_reorder` | an inner join is commutative and `hashJoin` builds its table from the **right** side, so the smaller estimated input is put there; a projection on top restores the caller's column order |
+| `expression_cse` | drops duplicate `with_columns` outputs with the same canonical text (the fused kernel's own CSE only sees one query at a time). `select` is left alone: it names its outputs positionally, so a repeated one really is a repeated column |
+| `join_reorder` | an inner join is commutative and `hashJoin` builds its table from the **right** side, so the smaller estimated input is put there; a projection on top restores the caller's column order. The swap permutes the rows, so it only fires below a sort, a whole-input reduction or a group-by — never where "Row order" below is still observable |
 
 Two rules are deliberately absent. A filter is **not** pushed below a `limit`, because that changes
 which rows survive. A filter is **not** pushed below a `window`, because a window function's value
