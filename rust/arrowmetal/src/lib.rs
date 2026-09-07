@@ -33,13 +33,25 @@
 //! because that is what `MTLDevice.makeBuffer(bytesNoCopy:)` requires; otherwise ArrowMetal copies
 //! each buffer once into a Metal buffer. A page here is 16 KiB on Apple silicon.
 //!
-//! **arrow-rs allocates to a 64-byte alignment, not a page**, so an array arrow-rs built itself is
-//! normally copied on the way in. (`arrow_buffer::alloc::ALIGNMENT` is 64; the test
-//! `copy_rule::arrow_rs_buffer_alignment` in `tests/copy_rule.rs` measures the real pointers and
-//! prints what it found, and is the source of that sentence.) A 64-byte-aligned allocation lands on a
-//! page boundary only by luck, so treat the input side as "one copy" unless you allocated the buffers
-//! yourself with `mmap` or `posix_memalign(16384, ..)`. An array that came *out* of ArrowMetal and is
-//! sent back in is recognised and re-imported without a copy whatever its alignment.
+//! Whether an arrow-rs array clears that bar is a property of the *allocator*, not of arrow-rs, so
+//! it is measured rather than assumed. `tests/copy_rule.rs` samples 32 allocations at each of six
+//! sizes through both of arrow-rs's allocation paths and prints what it finds; on macOS 26.6.2 / arm64
+//! with the system allocator, in this repository's run:
+//!
+//! | Values buffer | Page aligned, out of 32 |
+//! |---|---|
+//! | 128 B (16 int64) | 0–1 |
+//! | 4 KiB (512 int64) | 8 |
+//! | 64 KiB (8,192 int64) and above | 32 |
+//!
+//! So in practice: **a column of a few thousand rows or more imports copy-free, and a very small one
+//! is copied.** That is the system allocator handing back page-aligned memory once a request is
+//! large enough to be served by `mmap`; it is not guaranteed, and a custom global allocator or
+//! another platform can change it. Re-run `cargo test --test copy_rule -- --nocapture` to see the
+//! table for your own machine.
+//!
+//! An array that came *out* of ArrowMetal and is sent back in is recognised and re-imported without
+//! a copy whatever its alignment.
 //!
 //! Neither direction copies for a slice: an Arrow `offset` is carried on the handle rather than
 //! applied, so `array.slice(7, n)` imports the same buffers the unsliced array would.
