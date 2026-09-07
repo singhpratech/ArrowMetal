@@ -165,8 +165,8 @@ trip. Choose `PageAlignedAllocator` when you want the copy avoided, not to make 
 
 Less than you would expect, because at 76 MB the copy is not the dominant cost of crossing the
 boundary; setting up the Metal buffer is. From the table below: importing 10M int64 rows takes
-1.23 ms when the buffer can be borrowed and 1.52 ms when it must be copied — the copy adds about
-0.3 ms to a 1.5 ms operation, roughly 20%. Export is 1.0 µs, three orders of magnitude cheaper,
+1.13 ms when the buffer can be borrowed and 1.41 ms when it must be copied — the copy adds about
+0.3 ms to a 1.4 ms operation, roughly 20%. Export is 917 ns, three orders of magnitude cheaper,
 which is what "copy-free out always" buys.
 
 **There is no way to ask the library whether a given import copied.** The Swift core computes it
@@ -186,38 +186,38 @@ the rows.
 
 | Op | Method | Best of 5 | Notes |
 |---|---|---:|---|
-| Import | arrow-go → ArrowMetal, page-aligned buffer | **1.23 ms** | borrowed, no copy |
-| Import | arrow-go → ArrowMetal, buffer 64 B past a page | **1.52 ms** | one copy of 76 MB |
-| Import | arrow-go → ArrowMetal, `memory.NewGoAllocator` | **1.57 ms** | this run's buffer was 8192 B past a page |
-| Export | ArrowMetal → arrow-go | **1.0 µs** | always copy-free |
-| Sum | plain Go loop over `[]int64` | 2.73 ms | |
-| Sum | Arrow Go `arrow/math` (NEON) | 1.34 ms | arrow-go registers no `sum` compute function |
-| Sum | **ArrowMetal, array already resident** | **280 µs** | 4.8× the Arrow Go kernel |
-| Sum | ArrowMetal, end to end from a page-aligned `arrow.Array` | 2.25 ms | **slower than Arrow Go** |
-| Sum | ArrowMetal, end to end with a copying import | 1.95 ms | **slower than Arrow Go** |
-| Filter | plain Go loop (one fused pass into a `[]int64`) | 33.13 ms | |
-| Filter | Arrow Go compute (`greater` then `filter`) | 54.79 ms | |
-| Filter | **ArrowMetal, array already resident** | **1.54 ms** | 35× Arrow Go compute, 21× the Go loop |
-| Filter | ArrowMetal, end to end from a page-aligned `arrow.Array` | 3.38 ms | 16× Arrow Go compute |
-| Filter | ArrowMetal, end to end with a copying import | 3.01 ms | 18× Arrow Go compute |
+| Import | arrow-go → ArrowMetal, page-aligned buffer | **1.13 ms** | borrowed, no copy |
+| Import | arrow-go → ArrowMetal, buffer 64 B past a page | **1.41 ms** | one copy of 76 MB |
+| Import | arrow-go → ArrowMetal, `memory.NewGoAllocator` | **1.40 ms** | this run's buffer was 8192 B past a page |
+| Export | ArrowMetal → arrow-go | **917 ns** | always copy-free |
+| Sum | plain Go loop over `[]int64` | 2.46 ms | |
+| Sum | Arrow Go `arrow/math` (NEON) | 1.16 ms | arrow-go registers no `sum` compute function |
+| Sum | **ArrowMetal, array already resident** | **296 µs** | 3.9× the Arrow Go kernel |
+| Sum | ArrowMetal, end to end from a page-aligned `arrow.Array` | 2.22 ms | **slower than Arrow Go** |
+| Sum | ArrowMetal, end to end with a copying import | 1.87 ms | **slower than Arrow Go** |
+| Filter | plain Go loop (one fused pass into a `[]int64`) | 29.18 ms | |
+| Filter | Arrow Go compute (`greater` then `filter`) | 48.93 ms | |
+| Filter | **ArrowMetal, array already resident** | **1.51 ms** | 32× Arrow Go compute, 19× the Go loop |
+| Filter | ArrowMetal, end to end from a page-aligned `arrow.Array` | 3.22 ms | 15× Arrow Go compute |
+| Filter | ArrowMetal, end to end with a copying import | 2.98 ms | 16× Arrow Go compute |
 
 ### Reading this honestly
 
-- **ArrowMetal loses at Sum end to end.** 2.25 ms against Arrow Go's 1.34 ms. A single 76 MB sum is
-  a memory-bandwidth problem that the CPU is already good at, and the ~1.3 ms of import overhead is
-  most of the ArrowMetal number. Only when the array is already on the GPU does Sum win, 280 µs
-  against 1.34 ms. If your program's shape is "load an arrow-go array, sum it once, throw it away",
+- **ArrowMetal loses at Sum end to end.** 2.22 ms against Arrow Go's 1.16 ms. A single 76 MB sum is
+  a memory-bandwidth problem that the CPU is already good at, and the ~1.2 ms of import overhead is
+  most of the ArrowMetal number. Only when the array is already on the GPU does Sum win, 296 µs
+  against 1.16 ms. If your program's shape is "load an arrow-go array, sum it once, throw it away",
   this binding is the wrong tool.
-- **ArrowMetal wins at Filter, in every shape.** Even paying import and export on every call, 3.38 ms
-  against 54.79 ms is 16×; resident it is 35×. Filter does more work per byte than Sum and the
+- **ArrowMetal wins at Filter, in every shape.** Even paying import and export on every call, 3.22 ms
+  against 48.93 ms is 15×; resident it is 32×. Filter does more work per byte than Sum and the
   fixed cost stops dominating.
 - The end-to-end rows with a copying import came out *faster* than the page-aligned ones in this
-  run (1.95 vs 2.25 ms for Sum, 3.01 vs 3.38 ms for Filter), which is the opposite of what the
-  Import rows say. The gap is about 0.4 ms either way, the same size as the copy itself, and it is
-  run-to-run noise from Metal's buffer allocation. The defensible statement is the narrow one: at
-  76 MB, borrowing saves about 0.3 ms of a 1.5 ms import, and end to end that saving is inside the
-  noise. It is not a reason to change allocators on its own; the reason to use
-  `PageAlignedAllocator` is that it does not put Go heap pointers in C's hands.
+  run (1.87 vs 2.22 ms for Sum, 2.98 vs 3.22 ms for Filter), which is the opposite of what the
+  Import rows say. The gap is a few tenths of a millisecond either way, the same size as the copy
+  itself, and it is run-to-run noise from Metal's buffer allocation. The defensible statement is the
+  narrow one: at 76 MB, borrowing saves about 0.3 ms of a 1.4 ms import, and end to end that saving
+  is inside the noise. It is not on its own a reason to change allocators — and it is not a
+  correctness reason either, since `Import` pins whatever it is given.
 - `arrow/math.Int64.Sum` ignores nulls, and the data here has none. It is the fastest thing arrow-go
   has for this and it is what the Sum row compares against, because **arrow-go's compute package
   registers no aggregate function at all** — no `sum`, `mean` or `min_max` in its registry.

@@ -58,26 +58,26 @@ untimed warm-up**. ArrowMetal 0.1.0, Go 1.27.1, arrow-go v18.7.0. Reproduce with
 
 | Op | Method | Best of 5 |
 |---|---|---:|
-| Import | arrow-go → ArrowMetal, page-aligned buffer (borrowed) | 1.23 ms |
-| Import | arrow-go → ArrowMetal, buffer 64 B past a page (one copy) | 1.52 ms |
-| Import | arrow-go → ArrowMetal, `memory.NewGoAllocator` | 1.57 ms |
-| Export | ArrowMetal → arrow-go (always copy-free) | 1.0 µs |
-| Sum | plain Go loop | 2.73 ms |
-| Sum | Arrow Go `arrow/math` (NEON) | **1.34 ms** |
-| Sum | ArrowMetal, array already resident | **280 µs** |
-| Sum | ArrowMetal, end to end from an `arrow.Array` | 2.25 ms |
-| Filter | plain Go loop | 33.13 ms |
-| Filter | Arrow Go compute (`greater` then `filter`) | 54.79 ms |
-| Filter | ArrowMetal, array already resident | **1.54 ms** |
-| Filter | ArrowMetal, end to end from an `arrow.Array` | **3.38 ms** |
+| Import | arrow-go → ArrowMetal, page-aligned buffer (borrowed) | 1.13 ms |
+| Import | arrow-go → ArrowMetal, buffer 64 B past a page (one copy) | 1.41 ms |
+| Import | arrow-go → ArrowMetal, `memory.NewGoAllocator` | 1.40 ms |
+| Export | ArrowMetal → arrow-go (always copy-free) | 917 ns |
+| Sum | plain Go loop | 2.46 ms |
+| Sum | Arrow Go `arrow/math` (NEON) | **1.16 ms** |
+| Sum | ArrowMetal, array already resident | **296 µs** |
+| Sum | ArrowMetal, end to end from an `arrow.Array` | 2.22 ms |
+| Filter | plain Go loop | 29.18 ms |
+| Filter | Arrow Go compute (`greater` then `filter`) | 48.93 ms |
+| Filter | ArrowMetal, array already resident | **1.51 ms** |
+| Filter | ArrowMetal, end to end from an `arrow.Array` | **3.22 ms** |
 
-**ArrowMetal loses at Sum end to end**: 2.25 ms against Arrow Go's 1.34 ms. Summing 76 MB once is a
-bandwidth problem the CPU already handles well, and about 1.3 ms of the ArrowMetal number is the
-import. Resident, the same sum is 280 µs — 4.8× faster than arrow-go. If the shape of your program
+**ArrowMetal loses at Sum end to end**: 2.22 ms against Arrow Go's 1.16 ms. Summing 76 MB once is a
+bandwidth problem the CPU already handles well, and about 1.2 ms of the ArrowMetal number is the
+import. Resident, the same sum is 296 µs — 3.9× faster than arrow-go. If the shape of your program
 is "load an array, sum it once, drop it", this is the wrong tool.
 
-**ArrowMetal wins at Filter in every shape**: 3.38 ms end to end against 54.79 ms is 16×, and 1.54 ms
-resident is 35×. Filter does enough work per byte that the fixed cost stops dominating.
+**ArrowMetal wins at Filter in every shape**: 3.22 ms end to end against 48.93 ms is 15×, and 1.51 ms
+resident is 32×. Filter does enough work per byte that the fixed cost stops dominating.
 
 `arrow/math.Int64.Sum` ignores nulls and the data here has none; it is the fastest sum arrow-go
 offers, which is why it is the comparison. The plain Go filter writes a `[]int64` rather than
