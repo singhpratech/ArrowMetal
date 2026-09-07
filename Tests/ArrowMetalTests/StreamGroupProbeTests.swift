@@ -264,6 +264,39 @@ final class StreamGroupProbeTests: XCTestCase {
         }
     }
 
+    /// The float64 sum on the row path is a one-thread-per-group emulation of the segmented
+    /// reduction, so it has to reproduce that reduction's *order*, not merely its value. These shapes
+    /// are the ones where an order slip would show: runs of one, of two, of three (where the
+    /// butterfly pairs lanes 0 and 2 before lane 1), runs with a null in the middle (an empty lane is
+    /// replaced, not added to), and a skewed key whose hot group runs past the 256 lanes and folds
+    /// several rows into each of them.
+    func testFloatSumOrderMatchesTheSegmentedReduction() throws {
+        try requireRealGPU()
+        for runLength in [1, 2, 3, 4, 5, 7, 8, 9, 17, 33, 64] {
+            var rows: [Row] = []
+            for g in 0..<3_000 {
+                for r in 0..<runLength {
+                    // Values chosen so the order of the additions changes the last bits: a large one
+                    // first and small ones after it round away, in the other order they do not.
+                    let v: Double? = (r % 5 == 3) ? nil
+                        : (r == 0 ? 1e16 : Double(r) * 0.1 + Double(g % 7))
+                    rows.append(Row(key: Int64(g &* 8_675_309), amount: v, qty: Int32(r)))
+                }
+            }
+            let bs = try Self.batches(rows, batchRows: 3_000 * runLength)
+            try expectSame(try run(bs, Self.floatAggs, .rowDense),
+                           try run(bs, Self.floatAggs, .distinct), "run length \(runLength)")
+        }
+        // Skew: one group far past 256 rows alongside thousands of singletons, so the run is folded
+        // lane by lane and only then reduced.
+        var rows: [Row] = []
+        for r in 0..<4_000 { rows.append(Row(key: 42, amount: r == 0 ? 1e16 : Double(r) * 0.5, qty: 1)) }
+        for g in 1..<60_000 { rows.append(Row(key: Int64(g &* 1_000_003), amount: Double(g) * 0.25, qty: 1)) }
+        let bs = try Self.batches(rows, batchRows: 64_000)
+        try expectSame(try run(bs, Self.floatAggs, .rowDense),
+                       try run(bs, Self.floatAggs, .distinct), "skewed run")
+    }
+
     // MARK: - The chooser
 
     /// A dense key column keeps the per-batch encoding; a sparse one takes the row path. Both are

@@ -286,6 +286,79 @@ enum StreamGroupTableSource {
         cnts[s] = oldCnts[j];
     }
 
+    // One group per **thread**, for the float64 sum of a batch with very many small groups.
+    //
+    // The segmented reduction this replaces gives each group a whole threadgroup: at a million groups
+    // of one row that is 256 threads per row, and it is what a sparse key spends its time on. But its
+    // answer has to be reproduced *bit for bit*, because a binary64 sum depends on the order it was
+    // added in and the host table is checked against it.
+    //
+    // It is reproducible because the shape of that reduction is fixed. Lane `l` folds the run's rows
+    // at positions l, l + 256, l + 512 … in order, and the lanes then combine in the butterfly
+    // `shared[i] = combine(shared[i], shared[i + w])` for w = 128, 64 … 1, in which an empty
+    // accumulator is replaced rather than added to. Two facts make that a serial loop:
+    //
+    // * every step with `w >= L` does nothing (the right-hand lane is always empty), so a run of `L`
+    //   rows only ever uses the first `P` lanes, `P` the power of two at or above `L`;
+    // * the butterfly over `P` lanes is the balanced tree whose leaves, left to right, are the lanes
+    //   in **bit-reversed** order — so walking the lanes in that order and merging equal-rank partial
+    //   results on a stack of at most nine entries rebuilds exactly the same tree.
+    //
+    // So the whole thing costs O(L) per group in one thread, with the same additions in the same
+    // order as the threadgroup that used to do it.
+    kernel void sgt_seg_sum_f64(device const uint* segStart [[buffer(0)]],
+                                device const uint* segEnd [[buffer(1)]],
+                                device const int* ord [[buffer(2)]],
+                                device const ulong* vals [[buffer(3)]],
+                                device const uchar* validity [[buffer(4)]],
+                                device const uint* nPtr [[buffer(5)]],
+                                constant uint& hasValidity [[buffer(6)]],
+                                device ulong* out [[buffer(7)]],
+                                device uchar* validBytes [[buffer(8)]],
+                                device long* cnts [[buffer(9)]],
+                                uint k [[thread_position_in_grid]]) {
+        if (k >= *nPtr) return;
+        uint s = segStart[k], e = segEnd[k];
+        out[k] = 0ul; validBytes[k] = 0; cnts[k] = 0;
+        if (e <= s) return;
+        uint L = e - s;
+        uint bits = 0u, P = 1u;
+        while (P < L && P < 256u) { P <<= 1; bits += 1u; }
+
+        ulong stackAcc[9];
+        uint stackCnt[9], stackRank[9];
+        uint top = 0u;
+        for (uint t = 0u; t < P; ++t) {
+            uint lane = 0u;                       // the low `bits` bits of t, reversed
+            for (uint b = 0u; b < bits; ++b) lane |= ((t >> b) & 1u) << (bits - 1u - b);
+            ulong acc = 0ul;
+            uint cnt = 0u;
+            for (uint i = s + lane; i < e; i += 256u) {
+                uint row = (uint)ord[i];
+                if (hasValidity != 0u && !bit_get(validity, row)) continue;
+                ulong v = vals[row];
+                acc = cnt ? d_add(acc, v) : v;
+                cnt++;
+            }
+            uint rank = 0u;
+            while (top > 0u && stackRank[top - 1u] == rank) {
+                ulong a = stackAcc[top - 1u];
+                uint ca = stackCnt[top - 1u];
+                if (cnt == 0u) acc = a;
+                else if (ca != 0u) acc = d_add(a, acc);
+                cnt += ca;
+                top -= 1u;
+                rank += 1u;
+            }
+            stackAcc[top] = acc; stackCnt[top] = cnt; stackRank[top] = rank; top += 1u;
+        }
+        // `P` is a power of two and exactly `P` leaves went in, so the stack collapsed to one.
+        if (stackCnt[0] == 0u) return;
+        out[k] = stackAcc[0];
+        validBytes[k] = 1;
+        cnts[k] = (long)stackCnt[0];
+    }
+
     // The finished table, slot by slot: the key and whether the slot is occupied.
     kernel void sgt_extract(device const uint* W [[buffer(0)]],
                             device const uint* nPtr [[buffer(1)]],
@@ -734,6 +807,54 @@ final class StreamGroupTable {
         }
         return (allKeys, mergedSums, mergedCounts)
     }
+}
+
+/// The per-group float64 sum of a batch, and the non-null count that comes out of the same pass.
+///
+/// Bit-identical to `GroupBy.sumDouble` — the kernel reproduces that reduction's exact order — but
+/// one thread per group instead of one threadgroup, which is what a batch with a million groups of
+/// one row needs. Returns nil when the runs are long enough that a threadgroup each is the better
+/// shape; both give the same answer, so this is only a choice of dispatch.
+///
+/// The `sum` also folds in the count Arrow needs to null an all-null group, so a streaming `sum` no
+/// longer pays for a second pass over the rows to count them.
+func residentSegmentedSumDouble(_ values: MetalArray<Double>, _ gb: GroupBy<Int32>)
+    throws -> (sum: MetalArray<Double>, count: MetalArray<Int64>)? {
+    let ctx = values.context
+    let k = gb.keyCount
+    // One thread walks its whole run, so very long runs want the threadgroup shape back. The mean run
+    // is what decides it: a sparse key's runs are one or two rows, which is the case this exists for.
+    guard k > 0, gb.keys.length <= 64 * k else { return nil }
+    let seg = try gb.segments()
+    let out = try MetalArrowBuffer.allocate(byteCount: k * 8, zeroed: false, context: ctx)
+    let validBytes = try MetalArrowBuffer.allocate(byteCount: Swift.max(k, 1), context: ctx)
+    let cnts = try MetalArrowBuffer.allocate(byteCount: k * 8, zeroed: false, context: ctx)
+    let pso = try Dispatch.pipeline(ctx, family: "streamgrouptable", source: StreamGroupTableSource.msl,
+                                    function: "sgt_seg_sum_f64", type: "shared")
+    let vv = values.validity
+    try ctx.run { enc in
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(seg.segStart.mtl, offset: seg.segStart.offset, index: 0)
+        enc.setBuffer(seg.segEnd.mtl, offset: seg.segEnd.offset, index: 1)
+        let o = seg.ord.length > 0 ? seg.ord.values : seg.segStart
+        enc.setBuffer(o.mtl, offset: o.offset, index: 2)
+        enc.setBuffer(values.values.mtl, offset: values.values.offset, index: 3)
+        let v = vv ?? values.values
+        enc.setBuffer(v.mtl, offset: v.offset, index: 4)
+        Dispatch.setLength(enc, k, nil, index: 5)
+        Dispatch.setUInt(enc, vv == nil ? 0 : 1, index: 6)
+        enc.setBuffer(out.mtl, offset: out.offset, index: 7)
+        enc.setBuffer(validBytes.mtl, offset: validBytes.offset, index: 8)
+        enc.setBuffer(cnts.mtl, offset: cnts.offset, index: 9)
+        Dispatch.dispatch1D(enc, pso, count: k)
+    }
+    ctx.retainUntilFlush(seg.ord)
+    ctx.retainUntilFlush(values)
+    let bitmap = try BitmapOps.packBits(ctx, bytes: validBytes, bits: k)
+    try ctx.syncPoint()
+    let sum = MetalArray<Double>(length: k, nullCount: 0, validity: bitmap, values: out, context: ctx)
+    sum.recomputeNullCount()
+    return (sum, MetalArray<Int64>(length: k, nullCount: 0, validity: nil, values: cnts, context: ctx))
 }
 
 /// A copy of `a` whose rows are null wherever `live` is false, which is how a group with no non-null

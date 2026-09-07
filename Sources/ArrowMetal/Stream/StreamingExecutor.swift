@@ -883,8 +883,14 @@ public final class StreamGroupByOperator: StreamOperator {
             case .count:
                 vals.append(nil); cnts.append(try countValid(c!, gb)); kinds.append(.none)
             case .sum, .mean:
-                let s = try groupSum(c!, gb)
-                vals.append(s); cnts.append(try countValid(c!, gb)); kinds.append(sumKind(s))
+                // A float64 sum is the reason this branch exists, and with a million groups of one row
+                // the ordinary segmented reduction spends a whole threadgroup on each of them.
+                if case .float64(let d) = c!, let r = try residentSegmentedSumDouble(d, gb) {
+                    vals.append(.float64(r.sum)); cnts.append(r.count); kinds.append(.double)
+                } else {
+                    let s = try groupSum(c!, gb)
+                    vals.append(s); cnts.append(try countValid(c!, gb)); kinds.append(sumKind(s))
+                }
             default:
                 throw ArrowMetalError.unsupportedType("\(a.op.rawValue) in a row-level streaming group-by")
             }
