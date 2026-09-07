@@ -139,7 +139,14 @@ public final class ParquetFile: @unchecked Sendable {
         var fields: [ParquetField] = []
 
         /// Recursive descent; returns the field for the subtree rooted at `elements[i]`.
+        ///
+        /// `num_children` comes straight out of the footer, so it can claim more children than the
+        /// schema list holds. Every index is checked here rather than trusting it: an unchecked
+        /// `elements[i]` on a crafted file is a bounds trap, which takes the process down.
         func node(_ i: Int, def: Int, rep: Int, path: [String]) throws -> ParquetField {
+            guard i >= 0, i < elements.count else {
+                throw ParquetError.malformed("schema element \(i) is outside 0..<\(elements.count)")
+            }
             let e = elements[i]
             var d = def, rp = rep
             switch e.repetition {
@@ -156,7 +163,9 @@ public final class ParquetFile: @unchecked Sendable {
                 return ParquetField(name: e.name, kind: .leaf(leaf), nullable: e.repetition == .optional)
             }
             var children: [ParquetField] = []
-            for _ in 0..<e.numChildren {
+            // `num_children` is a signed thrift i32: a negative one would make `0..<n` a range with a
+            // reversed bound, which is a trap, not an error.
+            for _ in 0..<Swift.max(e.numChildren, 0) {
                 let c = index
                 index += 1
                 children.append(try node(c, def: d, rep: rp, path: myPath))
@@ -181,7 +190,7 @@ public final class ParquetFile: @unchecked Sendable {
         }
 
         let root = elements[0]
-        for _ in 0..<root.numChildren {
+        for _ in 0..<Swift.max(root.numChildren, 0) {
             let c = index
             index += 1
             fields.append(try node(c, def: 0, rep: 0, path: []))

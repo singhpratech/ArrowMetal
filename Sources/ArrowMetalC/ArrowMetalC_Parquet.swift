@@ -152,9 +152,13 @@ public func am_parquet_read_ex(_ f: OpaquePointer?, _ columns: UnsafePointer<Uns
                                _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
     guard let file = pqFile(f), let out else { return 2 }
     do {
+        // A NULL `columns` means "every column"; a non-NULL one means "exactly these", including none of
+        // them. Folding the two together made `read(columns=[])` silently return the whole table.
         var names: [String]? = nil
-        if let columns, nColumns > 0 {
-            names = (0..<Int(nColumns)).compactMap { columns[$0].map { String(cString: $0) } }
+        if let columns {
+            names = (0..<Int(Swift.max(nColumns, 0))).compactMap { columns[$0].map { String(cString: $0) } }
+        } else if nColumns > 0 {
+            throw ParquetError.malformed("am_parquet_read_ex: \(nColumns) column names requested but the array is NULL")
         }
         var groups: [Int]? = nil
         if let rowGroups, nRowGroups > 0 {
