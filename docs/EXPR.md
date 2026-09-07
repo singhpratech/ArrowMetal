@@ -61,8 +61,10 @@ The emitter walks the tree once, bottom up, and appends straight-line MSL to one
 - **Float64** has no hardware support on Apple GPUs, so it travels as a raw 64-bit pattern in a `ulong`
   and goes through the correctly rounded software binary64 of `Kernels/DoubleMath.swift`
   (`d_add`/`d_sub`/`d_mul`/`d_div`) and the transcendentals of `Kernels/DoubleTranscendental.swift`.
-  Results are **bit identical** to Swift's `Double`, which `ExprTests.testFloat64ArithmeticIsBitExact`
-  asserts on bit patterns and `test_expr.py` asserts against pyarrow.
+  `d_add`/`d_sub`/`d_mul`/`d_div` and `d_sqrt` are correctly rounded, so those results are **bit
+  identical** to Swift's `Double` — `ExprTests.testFloat64ArithmeticIsBitExact` asserts add, sub, mul,
+  div, negate, abs and round on bit patterns, and `test_expr.py` asserts against pyarrow. The
+  transcendentals are bounded to 1-2 ulp, not correctly rounded.
 - **Pipeline caching.** A compiled query is cached on the canonical query text plus the referenced
   columns' types and nullability, and the pipeline itself on a hash of the generated source (the same
   process-wide cache every other kernel uses). Running the same shape again costs one dictionary
@@ -220,8 +222,9 @@ partials). Crossover against Polars for these shapes is around 1M rows.
 
 Where fusion wins most is where the operator count is highest relative to the bytes moved: (b) is 1.5×
 the batched op-by-op chain, (d) is 1.8×, and (a) is 1.2× — while (c), which is compaction bound rather
-than operator bound, is a wash. Against a CPU engine the margin is 8× to 62×, at a twentieth to a
-thousandth of the CPU time.
+than operator bound, is a wash. Against the CPU engines in these tables — Polars, pyarrow and pandas —
+the margin is 4× to 62×, at a sixtieth to a two-thousandth of the CPU time; against numpy it is 2.6×
+to 70×.
 
 ## Limits
 

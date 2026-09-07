@@ -57,8 +57,9 @@ row stays here; a caller who wants Polars' answer has it.
 | stddev by key (1000 groups) | 50,000,000 | 34.1 ms | 26.2 ms | 0.77x |
 
 The grouped moments accumulate in software IEEE-754 binary64, because Apple GPUs have no double
-arithmetic and a float32 accumulator is wrong past a few million rows. The answer is bit-exact against
-Arrow; the price is 3–4 GPU instructions per FLOP. At 10M rows the same rows tie pyarrow (1.00x,
+arithmetic and a float32 accumulator is wrong past a few million rows. The answer agrees with Arrow to
+about 6e-10 relative (2e-8 on float32) — the moment accumulator's own stated accuracy — not to the
+last bit; the price is 3–4 GPU instructions per FLOP. At 10M rows the same rows tie pyarrow (1.00x,
 1.02x); against Polars they win by 2.4x; at 100,000 and 10M groups they win by 2.1–4x.
 
 **These two rows are the ones the small-group work below did not fix, and the reason is not the
@@ -131,7 +132,7 @@ is measurement noise.
 
 The full list is in the matrix page under ⚠️. The clusters:
 
-- **Software binary64 math** — `ln` 1.06–1.33x, `sin` 1.98–2.06x, `days_between` 1.04–1.47x,
+- **Software binary64 math** — `ln` 1.06–1.08x, `sin` 1.98–1.99x, `days_between` 1.04–1.11x,
   `sqrt` at 10M rows 1.83x (3.13x at 50M, where the dispatch floor no longer shows). Correct to 1 ulp
   (4–5 ulp for trigonometry); the CPU has hardware doubles and the GPU does not. These will not reach
   3x without a different numerical contract.
@@ -143,9 +144,10 @@ The full list is in the matrix page under ⚠️. The clusters:
   ids was 6.8 ms of the 8.8 ms `sum` at 50M rows and a thousand groups, because it widened the key
   column to int64 before it read it twice. Re-measured against pyarrow in the same script, sum/count/
   mean by int32 key are now 3.1–3.9x at 50M rows and min/max 3.2–3.3x, where they were 1.7–2.0x. Two
-  rows in the cluster do not move and are not touched by that change: `sum by utf8 key` (2.3x at 50M,
-  1.9x at 10M), whose cost is the string hash table in front of the aggregate rather than the group-by,
-  and variance/stddev, which cause 3 above now explains in full.
+  rows in the cluster do not move and are not touched by that change: `sum by utf8 key` (2.0x at 50M
+  and 1.7x at 10M in the matrix; 2.3x in `loss_groupby_small.py`), whose cost is the string hash table
+  in front of the aggregate rather than the group-by, and variance/stddev, which cause 3 above now
+  explains in full.
 - **Memory-bound element-wise kernels against Polars and numpy** — compare, `is_nan`, `abs`,
   `bit_wise_and`, `if_else`, `negate`, `shift_left`, `replace_with_mask`, `drop_null` at 1.1–2.98x.
   Both sides run at unified-memory bandwidth; the GPU's edge is the dispatch overhead it does not pay
@@ -173,8 +175,8 @@ slower. The wins are the two changes recorded in the next section:
 | count_distinct by key (10M groups) | 50,000,000 | 715 ms | 61.0 ms | 401 ms (Polars) | 6.6x |
 | tdigest(float64, q=0.5) | 50,000,000 | 2,836 ms | 48.5 ms | 1,061 ms (pyarrow) | 21.9x |
 | sum by two int32 keys (~1024 groups) | 50,000,000 | 22.7 ms | 6.0 ms | 22.9 ms (pyarrow) | 3.8x |
-| argsort int64 | 50,000,000 | 142 ms | 39.2 ms | 301 ms (Polars) | 7.7x |
-| argsort float64 | 50,000,000 | 143 ms | 40.0 ms | 429 ms (Polars) | 10.8x |
+| argsort int64 | 50,000,000 | 128 ms | 39.2 ms | 301 ms (Polars) | 7.7x |
+| argsort float64 | 50,000,000 | 129 ms | 40.0 ms | 429 ms (Polars) | 10.8x |
 | lexsort (2 int32 keys) | 50,000,000 | 149 ms | 37.4 ms | 912 ms (Polars) | 24x |
 | argsort utf8 | 10,000,000 | 60.8 ms | 13.7 ms | 234 ms (Polars) | 17x |
 | sort float64 | 50,000,000 | 139 ms | 49.6 ms | 132 ms (Polars) | 2.67x |
@@ -182,12 +184,13 @@ slower. The wins are the two changes recorded in the next section:
 | upper / lower / trim | 10,000,000 | 52–55 ms | 5.2–5.4 ms | 139–173 ms (pyarrow / pandas) | 27–32x |
 | list_value_length | 10,000,000 | 1.12 ms | 0.37 ms | 0.71 ms (pyarrow) | 1.9x |
 
-The 13 slower rows are all at 10M rows and none is above 1.7x, while the 50M row of the same
-operation is unchanged in every case (`partition_nth_indices` 4.9 → 8.0 ms at 10M against 19.8 ms
-unchanged at 50M; `max by int32 key` 2.65 → 3.85 ms against 9.87 ms unchanged; the rest are 1.1–1.5x
-on values of 1–4 ms in kernels the two changes did not touch: LIKE, floor_temporal, coalesce,
-fill_null_forward). That is the signature of run-to-run noise on short calls, not of a regression, and
-the targeted re-measurement below settles it.
+Ten of the 13 slower rows are at 10M rows, one at 1M (`to_strings`, 1.21x) and two at 50M (`min` and
+`mean` of int64 with 10% nulls, 1.16x and 1.11x on calls of about a millisecond); none is above 1.7x.
+Where the slower row is at 10M, the 50M row of the same operation is unchanged (`partition_nth_indices`
+4.9 → 8.0 ms at 10M against 19.8 ms unchanged at 50M; `max by int32 key` 2.65 → 3.85 ms against
+9.87 ms unchanged; the rest are 1.1–1.5x on values of 1–4 ms in kernels the two changes did not touch:
+LIKE, floor_temporal, coalesce, fill_null_forward). That is the signature of run-to-run noise on
+short calls, not of a regression, and the targeted re-measurement below settles it.
 
 The re-measurement (`full_matrix.py --families sort,group-by,chains --sizes 10000000`, idle machine,
 5.5 minutes, kept as `private` data and summarised here):
@@ -460,7 +463,8 @@ it does not, so `loss_groupby_small.py --sweep` walks one axis at a time away fr
 count 1M / 3M / 10M / 27M / 50M, group count 1 / 2 / 10 / 100 / 1,000 / 1,025 / 5,000 / 20,000 /
 100,000 / 1M / 10M, keys uniform / 90%-in-one-group / sorted, keys with 10% nulls, values int64 and
 float64, values with 10% nulls, and a slice at offset 33 — over sum, count, mean, min, max and
-variance. 220 measurements, both builds, two rounds each. **218 are faster after the change and none
+variance. 220 measurements, both builds, two rounds each (sweep output not committed; rerun
+`Benchmarks/loss_groupby_small.py --sweep` to reproduce). **218 are faster after the change and none
 is slower than main's own spread**: the two that read below 1.0x are `min` and `max` at 3M rows and
 1,000 groups, where main measured 1.42 and 2.49 ms across its two rounds and the new build 1.57 and
 1.62 — the new build's worst is below main's worst, and the comparison picked main's lucky round.

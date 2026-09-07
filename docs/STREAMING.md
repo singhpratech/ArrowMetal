@@ -1,8 +1,11 @@
 # Out-of-core streaming execution
 
 Datasets larger than memory, answered on the Apple GPU. The rows flow from disk through the GPU one
-record batch at a time; the CPU never touches a value column. Only the *answer* grows with the input,
-so RAM tracks the answer rather than the scan: measured to 30 GB on a 64 GB machine, with the resident state a few hundred megabytes.
+record batch at a time; the CPU touches value columns only where §5 and §10 say it does: a `utf8` sort
+key and the external sort's k-way merge. Only the *answer* grows with the input, so RAM tracks the
+answer rather than the scan: measured to 30 GB on a 64 GB machine, where the private running state
+ranges from a few scalars to a 940 MB group table (§4.1) and peak RSS is dominated by mapped file
+pages (§9).
 
 ```swift
 let rows = try StreamQuery(ipc: "/data/events")
@@ -91,14 +94,15 @@ at most 8 GB (`MetalContext(poolLimitBytes:)`).
 ### One reader thread is not enough
 
 `PrefetchingSource` hides the read behind the GPU, but it is still *one* thread doing the mapping and
-the import. One core copies at roughly 10 GB/s; Polars and DuckDB scan the same directory at 44 to
-72 GB/s because they read it with every core. `ParallelIPCSource` closes that gap: it hands each of
+the import. One core copies at roughly 10 GB/s; Polars and DuckDB scan the same directory at roughly
+50-60 GB/s because they read it with every core. `ParallelIPCSource` closes that gap: it hands each of
 `readers` threads its own files, so the read stage scales with cores.
 
 The cost is batch **order**. Batches arrive interleaved across files, in whatever order the threads
-finish. Every operator here is order independent — aggregates, the HLL sketch, group-by, top-k, the
-external sort's run generation, both joins — so the only thing that needs `readers: 1` is a
-`filter -> sink_ipc` (or `to_reader`) that must preserve the source's row order.
+finish. Every operator here is order independent in its *answer* — aggregates, the HLL sketch, group-by,
+top-k, the external sort's run generation, both joins — though a float64 sum's last bits depend on
+batch order (§10). So the only thing that needs `readers: 1` is a `filter -> sink_ipc` (or
+`to_reader`) that must preserve the source's row order.
 
 ```python
 am.scan_ipc("/data/events", readers=8).group_by("region").agg([("sum", "amount", "t")])
@@ -135,7 +139,7 @@ the source of record, Parquet arrives through `scan_arrow(pyarrow.dataset(...))`
 
 | Operator | Exact or approximate | GPU work | Host work | Running state |
 | --- | --- | --- | --- | --- |
-| `filter` / `project` → sink | **exact** | the predicate and every projection compile into **one** fused kernel per batch (`docs/EXPR.md`) | writing the sink | none |
+| `filter` / `project` → sink | **exact** | the predicate and every **numeric** projection compile into one fused kernel per batch (`docs/EXPR.md`); a string, temporal or decimal output takes the two-step path below | writing the sink | none |
 | `sum`, `count`, `min`, `max` | **exact** | one fused aggregate kernel per batch | one scalar combine per batch | a few scalars |
 | `mean` | **exact** | decomposed to `sum` + `count` on the GPU | combine, divide once at the end | 2 scalars |
 | `variance`, `stddev` | **exact** | decomposed to `sum(x)`, `sum(x·x)` in float64 and `count`, all in one fused kernel | combine | 3 scalars |
@@ -660,18 +664,19 @@ was deleted, in a single interleaved A/B round with `readers = 8`, printed to a 
 | `count_distinct(id)` | 0.5 s | 0.5 s |
 | broadcast join + sum | 1.7 s | 1.6 s |
 
-At that size **top-k and `ORDER BY ... LIMIT` overtake both Polars and DuckDB** — 0.8 s against 0.587
-and 0.544, 1.1 s against 0.642 and 0.567 — because 30 GB is where the per-batch work, not the read,
-was the limit. The resident group table (§4.1) landed after that run, so `groupby_10m` was not
-re-measured at 30 GB; its 8 GB improvement is in the table above.
+At that size **top-k and `ORDER BY ... LIMIT` come within 1.4x-1.9x of Polars and DuckDB** — 0.8 s
+against 0.587 and 0.544, 1.1 s against 0.642 and 0.567 — down from 4.7 s and 11.2 s, because 30 GB is
+where the per-batch work, not the read, was the limit. The resident group table (§4.1) landed after
+that run, so `groupby_10m` was not re-measured at 30 GB; its 8 GB improvement is in the table above.
 
 pyarrow.dataset (measured in a separate single-reader run, so not comparable cell by cell) finished
 `groupby_10m` in 557 s and **timed out at 900 s on `count_distinct`**.
 
-* **`count_distinct_approx` beats Polars by 7x** (532 ms against 3,825 ms) *and* uses half a
-  gigabyte where Polars uses 17. DuckDB's sketch is faster still, but its answer is **12.4 % off**
-  against ArrowMetal's **0.007 %** — DuckDB's `approx_count_distinct` is tuned for a much smaller
-  sketch. Against an exact count this is the operator where streaming on a GPU clearly pays.
+* **`count_distinct_approx` beats Polars by 7x** (532 ms against 3,825 ms) at 8.8 GB of peak RSS
+  against Polars' 17.0 GB, and its own running state is a 16 KB sketch. DuckDB's sketch is faster
+  still, but its answer is **12.4 % off** against ArrowMetal's **0.007 %** — DuckDB's
+  `approx_count_distinct` is tuned for a much smaller sketch. Against an exact count this is the
+  operator where streaming on a GPU clearly pays.
 * **`filter_sum` ties Polars** at 57 GB/s — a whole-dataset filtered aggregate over 570 million rows
   in half a second, with the CPU doing nothing but reading bytes.
 
@@ -764,9 +769,6 @@ same queries run at 1.2 GB of RSS (and two to five times slower). The genuinely 
 * **The dense-id branch costs about 270 MB at ten million groups** — two `uint` arrays the size of
   the table — which is why `groupby_10m`'s peak RSS rises by 0.69 GB. Packing the batch stamp and the
   dense id into one word is possible and is not implemented.
-* **A broadcast join writes rows, it does not aggregate them.** `join(...).sum(...)` streams the
-  joined rows out and sums them in the caller; fusing the aggregate into the probe so the output
-  never leaves the GPU is not implemented.
 * **Each batch is one Metal command buffer, not several.** The fixed cost per batch is paid once per
   batch; a larger `batch_rows` amortises it, at the cost of memory per batch.
 * **`readers > 1` raises peak RSS by roughly `readers` x the part-file size**, because that many

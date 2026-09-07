@@ -7,14 +7,17 @@ already sitting in your Mac.
 
 Those are complementary, and they meet for free. DuckDB hands results out over the Arrow C Data
 interface; ArrowMetal takes Arrow buffers in. On Apple silicon the CPU and GPU share one physical
-memory pool, so ArrowMetal's import does not copy anything - it wraps DuckDB's own pages in a Metal
-buffer. The address on the far side is the same address. `python/tests/test_duckdb.py` asserts it.
+memory pool, so `am_import` copies nothing - it wraps DuckDB's own pages in a Metal buffer. The
+address on the far side is the same address. `python/tests/test_duckdb.py` asserts it. Getting to one
+contiguous chunk does copy when DuckDB returns many; see §5.
 
 **The honest summary, before anything else.** The Python bridge is real and it wins on the shapes it
-should win on: a 100,000-key group-by is **24x** faster than DuckDB's, a string `LIKE` scan **21x**,
-both at 50M rows. It loses on shapes DuckDB is already excellent at - a plain `sum` over a column is
-memory-bound and DuckDB does it while it scans. The loadable extension works, matches DuckDB's
-answers exactly, and is **not currently a speedup**; §4 says why, in detail, without softening it.
+should win on: a 100,000-key group-by is **24x** faster than DuckDB's once the column and its group
+ids are already on the GPU (**1.2x** for a single cold query), and a string `LIKE` scan **21x**
+resident (**0.7x** cold), both at 50M rows. It loses on shapes DuckDB is already excellent at - a
+plain `sum` over a column is memory-bound and DuckDB does it while it scans. The loadable extension
+works, matches DuckDB's answers exactly, and is **not currently a speedup**; §4 says why, in detail,
+without softening it.
 
 - [1. Which tier you want](#1-which-tier-you-want)
 - [2. Install](#2-install)
@@ -116,10 +119,10 @@ cols = am.from_duckdb(con.sql("select region, amount from sales where placed_at 
 result, or any pyarrow table or stream. Columns whose type ArrowMetal cannot lift are left as
 pyarrow arrays in the same dict; pass `on_unsupported="raise"` to be told instead.
 
-Every type DuckDB emits round-trips - `test_every_duckdb_type_round_trips` checks all 25 of them:
-every integer width and signedness, both floats, `VARCHAR`, `BLOB`, `DATE`, `TIME`, `TIMESTAMP`,
-`TIMESTAMPTZ`, `INTERVAL`, `DECIMAL(10,2)`, `DECIMAL(38,2)`, `HUGEINT`, `UUID`, `LIST`, `STRUCT` and
-`MAP`.
+`test_every_duckdb_type_round_trips` checks 25 of DuckDB's types: every integer width and signedness,
+both floats, `VARCHAR`, `BLOB`, `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMPTZ`, `INTERVAL`,
+`DECIMAL(10,2)`, `DECIMAL(38,2)`, `HUGEINT`, `LIST`, `STRUCT` and `MAP`. `UUID` is checked as its
+`VARCHAR` rendering; the native type is not exercised.
 
 ### Push results back
 
@@ -253,11 +256,10 @@ can win in.
 Every function's answer matches DuckDB's own SQL exactly, nulls included -
 `python/tests/test_duckdb.py` checks each one against the equivalent query on the same connection.
 
-**Those checks are skipped right now.** `include/arrowmetal.h` declares `am_plan_source` as both a
-typedef and a function, so the public C header does not compile and `duckdb-extension/build.sh`
-fails; with no `build/arrowmetal.duckdb_extension` the `@extension` tests skip rather than fail.
-`test_the_public_c_header_compiles` is the standing xfail for it. Tier 1 does not go through the
-header and is unaffected.
+**The header compiles**: `am_plan_source` is the typedef and `am_plan_source_create` the function.
+`test_the_public_c_header_compiles` compiles the public header as C on every run; the `@extension`
+tests skip only when the extension has not been built. Tier 1 does not go through the header and is
+unaffected either way.
 
 And it is slower than just writing the SQL:
 
@@ -380,8 +382,10 @@ anything. Reach for the GPU when the aggregate is the expensive part, not the sc
 
 **Worth it**
 
-- High-cardinality group-by. 100,000 keys at 50M rows: 24x, at a fortieth of the CPU time.
-- String matching over a large column. `LIKE '%...%'` at 50M rows: 21x.
+- High-cardinality group-by over a resident column. 100,000 keys at 50M rows: 24x, at a fortieth of
+  the CPU time; a single cold query, crossing included, is 1.2x.
+- String matching over a column you are keeping resident. `LIKE '%...%'` at 50M rows: 21x resident;
+  a single cold query is 0.7x.
 - Several operations over one dataset. The crossing is paid once; every kernel after that is free of
   it. This is the single biggest lever - `from_duckdb` once, then loop.
 - Anything where you want the cores back. The GPU group-by uses 0.9 CPU-ms where DuckDB uses 1,169.
@@ -416,11 +420,6 @@ many keys and string matching are compute-heavy per byte; `sum` is not.
 **Tier 2**
 
 - Slower than DuckDB today (§4).
-- **The extension does not currently build**: `include/arrowmetal.h` declares `am_plan_source` as
-  both a typedef and a function, which is a redefinition error in C and C++, so the public header
-  does not compile at all. Until that is renamed, `duckdb-extension/build.sh` fails and every
-  `@extension` test in `python/tests/test_duckdb.py` skips. Tier 1 is unaffected -- it goes through
-  ctypes, not the header.
 - The eight integer widths, `FLOAT`, `DOUBLE`, `DATE` and `TIMESTAMP` only -- exactly what
   `arrow_format_for` in `duckdb-extension/src/arrowmetal_extension.cpp` lists. `BOOLEAN` is **not**
   among them despite what an earlier draft of this table said; nor are `VARCHAR`, `DECIMAL`, `TIME`,

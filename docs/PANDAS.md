@@ -4,13 +4,16 @@ ArrowMetal gives pandas two ways onto the GPU, and you pick how much of your cod
 
 | Tier | You write | What it does | Falls back? |
 |---|---|---|---|
-| **1. Accessor** | `s.am.sum()`, `df.am.groupby("k").sum("v")` | Explicit. Always runs on the GPU. Results come back Arrow-backed, so they go straight out again with no copy. | No — an unsupported dtype raises, so you always know where the work ran. |
+| **1. Accessor** | `s.am.sum()`, `df.am.groupby("k").sum("v")` | Explicit. Always dispatched to the GPU, with a documented per-row host fallback for the Unicode case transforms on non-Latin rows. Results come back Arrow-backed, so they go straight out again with no copy. | No — an unsupported dtype raises, so you always know where the work ran. |
 | **2. Accel mode** | `import arrowmetal.pandas_accel; arrowmetal.pandas_accel.install()` then **unchanged pandas** | Patches a documented set of pandas methods. Routes to the GPU only when the dtype, the size and the arguments all qualify. | Yes — always, silently, with the reason in `stats()`. |
 
 Both live in the same package and can be used together.
 
-```
-pip install arrowmetal          # macOS arm64; pandas is not a hard dependency
+```bash
+# macOS arm64. pandas is not a hard dependency.
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+    swift build -c release --product ArrowMetalC
+export PYTHONPATH=python
 ```
 
 `import arrowmetal` never imports pandas: the bridge is loaded the first time you touch
@@ -95,9 +98,9 @@ A call is routed to the GPU only when **all four** hold:
 4. **the operation is worth it** — see the next section. Five reductions, `abs` and the scalar
    comparisons are intercepted but deliberately left to pandas.
 
-Everything else runs in pandas, unchanged. **Any exception inside the GPU path is caught, recorded
-in `stats()`, and the original pandas method is run instead.** The accel layer is never the reason
-a program fails.
+Everything else runs in pandas, unchanged. **Any `Exception` inside the GPU path is caught, recorded
+in `stats()`, and the original pandas method is run instead**, so a GPU failure does not surface as a
+program failure. The one exception is repeated `install()`/`uninstall()` cycling — see Limits.
 
 ### Why some operations are intercepted but not routed
 
@@ -127,7 +130,8 @@ accel.route_all()          # route everything anyway
 accel.ROW_FACTOR["sum"] = 1
 ```
 
-The `.am` accessor has no such table: it always runs on the GPU, and `s.am.to_metal()` gives you the
+The `.am` accessor has no such table: it always dispatches to the GPU — bar the per-row host fallback
+the Unicode case transforms take on non-Latin rows — and `s.am.to_metal()` gives you the
 mapped column so that a chain of operations pays the map once. Nothing about correctness changes
 either way — only where the work runs.
 
@@ -203,7 +207,8 @@ handed over.
 | `pd.ArrowDtype` / `int64[pyarrow]`, one chunk | **none** | the Arrow buffers are handed straight over |
 | pandas 3 default `str` dtype (`ArrowStringArray`) | **none** | same — it is a `large_string` Arrow array |
 | Arrow-backed but split into several chunks | one | combined once into a contiguous array; reported as `"...split into N chunks; combined once"` |
-| numpy `int*`/`uint*`/`bool` | **none** | pyarrow adopts the numpy buffer; there is no validity bitmap to build |
+| numpy `int*`/`uint*` | **none** | pyarrow adopts the numpy buffer; there is no validity bitmap to build |
+| numpy `bool` | one | Arrow packs booleans to one bit per value, so the buffer cannot be adopted |
 | numpy `float*`, `datetime64` | values none, validity one pass | the values buffer is adopted, and one pass builds the validity bitmap from the NaNs/NaTs |
 | `Int64`, `Float64`, `boolean`, `string` (masked nullable) | one | pandas keeps values and mask in two arrays; Arrow needs a bitmap |
 | `Categorical` | one | becomes an Arrow dictionary array, indices widened to int32 |
