@@ -915,7 +915,7 @@ int  am_group_pivot_wider(am_groupby* gb, am_array* pivot_keys, am_array* values
 //  --  ------------------------  --------------  ---------------------------------------------------
 //   0  skew                      -               biased (population), Arrow's default
 //   1  kurtosis                  -               excess kurtosis, biased
-//   2  tdigest                   q in [0, 1]     GPU sort + a single host centroid merge, delta = 100
+//   2  tdigest                   q in [0, 1]     GPU sort, read straight out of it, delta = 100
 //   3  skew (sample-corrected)   -               the unbiased G1
 //   4  kurtosis (sample)         -               the unbiased G2
 //

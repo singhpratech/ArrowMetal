@@ -87,6 +87,19 @@ public final class GroupByKeys {
         }
         try Dispatch.checkLength(n)
         let ctx = try GroupByKeys.contextOf(head)
+        // Several integer key columns whose ranges multiply out small enough are packed into one key in
+        // a single pass instead of folded pairwise (`Kernels/GroupByKeysDense.swift`). The ids it hands
+        // back are the fold's own, value for value; it is the same key order arrived at with one range
+        // encoding instead of three.
+        if let fused = try GroupByKeysDense.ids(columns, ctx) {
+            self.columns = columns
+            self.ids = fused.0
+            self.groupCount = fused.1
+            self.rows = n
+            self.context = ctx
+            self.groupBy = try GroupBy(keys: fused.0, keyCount: Swift.max(fused.1, 1))
+            return
+        }
         var (ids, K) = try GroupByKeys.denseIds(head, ctx)
         for c in columns.dropFirst() {
             let (ids2, K2) = try GroupByKeys.denseIds(c, ctx)

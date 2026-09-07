@@ -2304,7 +2304,7 @@ def _kurtosis(self, biased=True):
 
 
 def _tdigest(self, q=0.5):
-    """Arrow `tdigest`: the t-digest estimate of quantile q (GPU sort, one host centroid merge, delta 100).
+    """Arrow `tdigest`: the t-digest estimate of quantile q (GPU sort, delta 100).
 
     A sketch, so it agrees with pyarrow.compute.tdigest to within the sketch's own error rather than
     exactly; q = 0 and q = 1 are the exact minimum and maximum. `quantile()` is the exact answer."""

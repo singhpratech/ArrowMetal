@@ -18,7 +18,7 @@ import Metal
 // | `hash_pivot_wider` | GPU, one masked `hash_one` per pivot key |
 // | `hash_tdigest` | GPU sort by (group, value), CPU merge of the centroids per group |
 // | `skew` / `kurtosis` | two GPU passes, the same shape as the scalar `variance` |
-// | `tdigest` | GPU sort, CPU merge of the centroids |
+// | `tdigest` | GPU sort; the digest of a sorted column is the column, so the quantile is read out of it |
 //
 // Precision. The fused `hash_min_max` is exact for every type. `hash_product` wraps in 64 bits for
 // integers exactly as the scalar `product` does, multiplies Float32 in `float` and Float64 through the
@@ -457,17 +457,31 @@ extension MetalArray {
     }
 
     /// Several quantiles from the same digest, which costs one sort rather than one per quantile.
+    ///
+    /// The digest of a sorted stream of unit weights holds one value per centroid, whatever the
+    /// compression (`Kernels/TDigestGPU.swift` derives it), so it is the sorted column itself and the
+    /// quantile is read out of it directly rather than by walking ten million values through
+    /// `TDigest.add`. Bit-identical to that walk; `ARROWMETAL_TDIGEST_WALK=1` runs it instead.
     public func tdigest(_ qs: [Double], delta: Double = 100, bufferSize: Int = 500) throws -> [Double?] {
         let m = validCount
         guard m > 0 else { return qs.map { _ in nil } }
-        let sortedValues = try sorted()
-        let digest = withExtendedLifetime(sortedValues) { () -> TDigest in
-            var d = TDigest(delta: delta)
+        // The digest only ever sees the valid values, and sorting a column that carries a validity
+        // bitmap costs three times sorting one that does not (117 ms against 39 ms at 10M float64), so
+        // the nulls are compacted out first — one filter pass — rather than sorted to the end.
+        let sortedValues = try TDigestGPU.strippedOfNulls(self).sorted()
+        let valid = Swift.min(m, sortedValues.length)
+        return withExtendedLifetime(sortedValues) { () -> [Double?] in
             let p = sortedValues.valuePointer
-            for i in 0..<m { d.add(p[i].asDouble) }
-            return d
+            if TDigestGPU.walkEveryValue {
+                var d = TDigest(delta: delta)
+                for i in 0..<valid { d.add(p[i].asDouble) }
+                return qs.map { d.quantile($0) }
+            }
+            // NaN is skipped by `add` without being counted, and the sort puts every NaN after every
+            // value, so the digest is built from the leading `count` values.
+            let count = MetalArray<T>.nonNaNPrefix(sortedValues, valid)
+            return qs.map { TDigest.sortedQuantile($0, count: count) { p[$0].asDouble } }
         }
-        return qs.map { digest.quantile($0) }
     }
 }
 
@@ -769,6 +783,45 @@ struct TDigest {
     /// The k1 scale function and its inverse.
     private func k(_ q: Double) -> Double { delta * (asin(2 * q - 1) / Double.pi + 0.5) }
     private func q(_ kk: Double) -> Double { (sin((kk / delta - 0.5) * Double.pi) + 1) / 2 }
+
+    /// `quantile(target)` of the digest a sorted stream of `count` unit weights builds, read straight
+    /// out of the sorted values instead of out of a materialised centroid array.
+    ///
+    /// Every centroid of that digest holds exactly one value — see the derivation in
+    /// `Kernels/TDigestGPU.swift`: `weightLimit` is scaled by the weight seen *so far*, and the scale
+    /// function's inverse is bounded by 1, so the limit never reaches the next value's weight. With
+    /// unit weights the walk in `quantile` above lands on centroid `ceil(index) - 1` and the
+    /// interpolation reads at most two neighbouring values, so this is that function transcribed term
+    /// for term with `centroids[i].mean` replaced by `value(i)` and every weight by 1.
+    ///
+    /// `value` reads the sorted, non-null, non-NaN values; `count` is how many there are.
+    static func sortedQuantile(_ target: Double, count: Int, value: (Int) -> Double) -> Double? {
+        guard count > 0 else { return nil }
+        let totalWeight = Double(count)
+        let minimum = value(0), maximum = value(count - 1)
+        if target <= 0 { return minimum }
+        if target >= 1 { return maximum }
+        let index = target * totalWeight
+        if index <= 1 { return minimum }
+        if index >= totalWeight - 1 { return maximum }
+        // The walk accumulates one unit per centroid and stops at the first `index <= weightSum`.
+        var ci = Int((index - 1).rounded(.up))
+        ci = Swift.min(Swift.max(ci, 0), count - 1)
+        var diff = index + 0.5 - Double(ci + 1)
+        if abs(diff) < 0.5 { return value(ci) }
+        var left = ci, right = ci
+        if diff > 0 {
+            if right == count - 1 { return lerp(value(right), maximum, diff / 0.5) }
+            right += 1
+        } else {
+            if left == 0 { return lerp(minimum, value(0), index / 0.5) }
+            left -= 1
+            diff += 1
+        }
+        return lerp(value(left), value(right), diff)
+    }
+
+    private static func lerp(_ a: Double, _ b: Double, _ t: Double) -> Double { a + (b - a) * t }
 
     /// Adds one value of the sorted stream. `totalWeight` is not known up front, so the limit is scaled
     /// by the weight seen so far — which for a sorted single pass is the same digest a two-pass merge

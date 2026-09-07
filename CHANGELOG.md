@@ -80,6 +80,12 @@ Grouped aggregation and windows
   `hash_first`/`hash_last`/`hash_first_last`, `hash_one`, `hash_list`, `hash_distinct`,
   `hash_approximate_median` and `hash_quantile` (exact, from a segmented sort), `hash_product`,
   `hash_variance`/`hash_stddev`, `hash_skew`/`hash_kurtosis`, `hash_tdigest` and `hash_pivot_wider`.
+- `hash_count_distinct` is a GPU hash **set** over the (key, value) pair — one insert pass over the rows,
+  then a histogram over the group ids of the occupied slots — instead of a dictionary encoding, a packed
+  int64 column and a `unique()` over it. 8.6 ms at 10M rows and 45 ms at 50M, whatever the cardinality.
+- Several integer key columns whose ranges multiply out to at most 2^24 (and at most the row count) are
+  packed into one key in a single pass instead of folded pairwise through a range encoding each. The
+  dense ids are the fold's own, value for value, so the group order is unchanged.
 - Window and ordering functions: `rank`, `dense_rank`, `row_number`, `rank_quantile`, `rank_normal`,
   `winsorize`, `shift`, rolling `sum`/`mean`/`min`/`max`, `cumulative_prod`/`cumulative_mean`,
   `pairwise_diff`, multi-column `lexsort_indices`, `partition_nth_indices`, `inverse_permutation`,
@@ -168,6 +174,14 @@ Fixed
 - `GroupByKeys._agg` in the Python package took the device handle of a temporary `MetalArray` that was
   released before the C call read it, segfaulting every grouped aggregate whose values arrived as a
   pyarrow array rather than a `MetalArray`.
+- `tdigest` built its digest by walking every value on the host. That walk never merged anything: the
+  weight limit is scaled by the weight seen so far rather than by the column's final weight, and the k1
+  scale function's inverse is bounded by 1, so every centroid holds exactly one value at any
+  compression. The digest of a sorted column is that column, so the quantile is read out of it directly
+  and the nulls are compacted away before the sort. Same answer to the last bit, 653 ms -> 29 ms at 10M
+  rows.
+- `list_value_length` ran at 70 GB/s: one thread per row read every offset twice and stored four bytes at
+  a time. Eight rows per thread through vector loads and stores, 1.05 ms -> 0.35 ms at 10M rows.
 - Found by the pre-release review pass, each with a regression test:
   - Expression compiler: an untyped literal that did not fit the other operand was truncated to it
     (`int8 > 200` was true for every row, `uint8 == -1` matched 255); a float literal against an integer

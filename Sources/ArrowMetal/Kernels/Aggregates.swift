@@ -435,7 +435,7 @@ extension MetalBooleanArray {
 // | `hash_first` / `hash_last` | the sort-free grouped extremes over a row index array, then one `take` |
 // | `hash_any` / `hash_all` | group-by max / min over the unpacked boolean bytes — all GPU |
 // | `hash_variance` / `hash_stddev` | two GPU passes in binary64 over the counting-sort order |
-// | `hash_count_distinct` | GPU dictionary encoding of the values, GPU `unique` over packed (key, code) pairs |
+// | `hash_count_distinct` | GPU hash **set** over the (key, value) pair, then a histogram of the occupied slots |
 // | `hash_product` | one host pass over the key and value buffers (there is no 64-bit atomic multiply) |
 // | `hash_approximate_median` | **not implemented** — see `approximateMedian` below |
 
@@ -550,11 +550,19 @@ extension GroupBy {
 
     /// Arrow `hash_count_distinct`: distinct non-null values per key.
     ///
-    /// GPU: the values are dictionary encoded (sort + run marks + scan), each row becomes the packed
-    /// key `key * uniqueCount + code`, `unique()` collapses repeats, and a group-by count over the
-    /// unpacked keys counts what is left. Rows with a null key or a null value are dropped first.
+    /// GPU: a hash **set** over the (key, value) pair (`Kernels/GroupCountDistinct.swift`) — one insert
+    /// pass over the rows, then one pass over the table's occupied slots, each of which is one distinct
+    /// pair and increments its group's count. Rows with a null key, a null value or a key outside
+    /// `[0, keyCount)` are never inserted.
+    ///
+    /// `ARROWMETAL_NO_HASH=1` falls back to the packed-key path this replaced: dictionary-encode the
+    /// values, pack each row into `key * uniqueCount + code`, `unique()` the packed column and count
+    /// what is left per key. Both give the same answer — the set's value key is the normalisation
+    /// `dictionaryEncode()` already applies, so all NaNs are one value and `-0.0` is `0.0` either way —
+    /// and the fallback is how the before/after numbers were measured in one binary.
     public func countDistinct<T: ArrowPrimitive>(_ values: MetalArray<T>) throws -> MetalArray<Int64> {
         guard values.length == keys.length else { throw ArrowMetalError.lengthMismatch(keys.length, values.length) }
+        if let hashed = try countDistinctHashed(values) { return hashed }
         let ctx = values.context
         let (codes, unique) = try values.dictionaryEncode()
         let width = Int64(Swift.max(unique.length, 1))
