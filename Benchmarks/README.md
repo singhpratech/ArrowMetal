@@ -40,20 +40,32 @@ Extra fairness rules this script follows on top of the ones below:
 - Each baseline uses that library's fastest eager idiom: Polars lazy where it fuses, pyarrow.compute kernels
   rather than table wrappers, pandas vectorised (arrow-backed when the column has nulls, numpy-backed
   when it does not, since that is what pandas is fastest with). No Python loops in any baseline.
-- **Every CPU library is measured twice: eager, and in its most parallel idiom.** The eager idioms above
-  turn out to use about one core on most operations however many threads the pool has -- `Series.sum()`
-  and `pc.add(...)` simply do not fan out -- so each one is measured again through `pl.LazyFrame`
-  (`polars-lazy`, in-memory or streaming engine) and through Acero over the same values in 16 record
-  batches (`pyarrow-threaded`, `to_table(use_threads=True)`, or `pa.Table.group_by` over a 16-chunk
-  table). These land in the CSV as their own library rows with the idiom named in the `note` column;
-  the default rows are unchanged, and "fastest CPU" in the report is the best of all of them.
-  pandas has no parallel idiom for anything measured here (single-threaded kernels; numexpr, its one
-  threaded path, is not installed), and that is recorded as a `pandas-parallel` row saying so.
+- **Every CPU library is measured twice: eager, and in its most parallel idiom.** What the cores table
+  shows about the eager idioms is not one number: they use about one core on the element-wise rows and
+  the whole-column reductions -- `Series.sum()` and `pc.add(...)` do not fan out however many threads
+  the pool has -- and several cores on group-by, sort and join, where the library reaches its own
+  parallel machinery unprompted (pyarrow's eager group-by rows sit near six cores, because Acero splits
+  even a single chunk into several ExecBatches). So each operation is measured again through
+  `pl.LazyFrame` (`polars-lazy`, in-memory or streaming engine) and through Acero over the same values
+  in one record batch per hardware thread (`pyarrow-threaded`, `to_table(use_threads=True)`, or
+  `pa.Table.group_by` over that chunked table). These land in the CSV as their own library rows with
+  the idiom named in the `note` column; the default rows are unchanged, and "fastest CPU" in the report
+  is the best of all of them. pandas gets a `pandas-parallel` row recording why it has none: its kernels
+  are single-threaded by design, and its two threaded paths -- numexpr behind `pd.eval`, and the numba
+  engine with `parallel=True` behind `rolling`, `groupby.agg`/`transform` and `apply` -- are looked up
+  at run time and named in the note, present or absent.
+- The pyarrow plan's source table carries only the columns the operation reads. An Acero filter node
+  emits its whole input schema, so a wider source would materialise columns the eager `pc.filter` row
+  never touches, and the parallel row would be handicapped rather than helped.
 - `--verify` runs every operation once instead of timing it and asserts each parallel idiom returns the
-  same answer as its library's default idiom (floats within 1e-9 relative, since a threaded reduction
-  adds in a different order; a grouped result is compared as a set of rows).
+  same answer as its library's default idiom, within 1e-9 relative for floats (a threaded reduction adds
+  in a different order); a grouped result is compared as a set of rows. Two comparisons are deliberately
+  skipped and reported as such: t-digest, whose sketch depends on how the values were partitioned, and
+  pyarrow's threaded grouped `list`, whose element order inside a group follows batch arrival.
 - `--cores`, and `full_matrix_<date>_cores.txt` written next to every results CSV, report cpu_ms/wall_ms
-  -- the cores actually used -- per library and idiom, overall and per family.
+  -- the cores actually used -- per library and idiom, overall and per family. ArrowMetal's own number
+  there is host CPU time only: the thread that encodes the command buffer and waits on it. GPU execution
+  time is not in it, and neither clock counts it.
 - A single call that takes longer than the per-measurement budget is repeated fewer times (never fewer
   than twice), so one six-second sort does not cost a minute of the run. The count is in the CSV.
 - numpy rows carry the same values without a validity bitmap, because numpy has no null representation.

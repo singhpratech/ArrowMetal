@@ -244,9 +244,11 @@ Quality
 - Benchmarks: Swift vs all-core CPU vs Accelerate; Polars/pyarrow/pandas; ArrowMetal from Python in-process; latency mode.
 - `Benchmarks/full_matrix.py` measures every CPU library twice: the plain eager idiom and the most parallel idiom
   that library has for the same answer (`polars-lazy` through `pl.LazyFrame` on the in-memory or streaming engine,
-  `pyarrow-threaded` through an Acero plan over 16 record batches), because the eager idioms use about one core
-  whatever the pool size. `--verify` asserts the two answer identically; `--cores` and `full_matrix_<date>_cores.txt`
-  report cpu_ms/wall_ms per idiom; "fastest CPU" in the report is the best of every idiom, named.
+  `pyarrow-threaded` through an Acero plan over one record batch per hardware thread), because the eager idioms use
+  about one core on the element-wise and reduction rows whatever the pool size. `--verify` asserts the two answer
+  the same within 1e-9 relative, reporting the comparisons deliberately skipped (t-digest's partition-dependent
+  sketch, pyarrow's threaded grouped `list`) separately; `--cores` and `full_matrix_<date>_cores.txt` report
+  cpu_ms/wall_ms per idiom; "fastest CPU" in the report is the best of every idiom, named.
 - Adversarial review pass before release (four independent reviewers over the integrations, the engine and
   expression compiler, the GPU kernels, and the C ABI and Parquet reader): every finding carries a
   regression test; the fixes are the "Fixed" bullets above and the entries in docs/EVALUATION.md.

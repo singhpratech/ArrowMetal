@@ -22,25 +22,30 @@ Methodology (the same rules as Benchmarks/README.md):
   it; pandas an Arrow-backed Series when the column has nulls (the only faithful representation) and
   a numpy-backed one when it has none (pandas' fastest idiom); numpy stands in where pandas has no
   vectorised equivalent. No Python loops anywhere in a baseline.
-- **Two idioms per CPU library.** The plain eager idiom above uses one core for most operations,
-  because that is what `Series.sum()` or `pc.add(...)` does however many threads the pool has. So
-  every operation is also measured with the most parallel idiom that library offers for the same
-  answer, recorded as its own library row: `polars-lazy` (the same expression through
-  `pl.LazyFrame`, collected on the in-memory or the streaming engine) and `pyarrow-threaded`
-  (an Acero plan over the same values split into 16 record batches, `to_table(use_threads=True)`,
-  or `pa.Table.group_by` over a 16-chunk table). The `note` column names the idiom on every such
-  row. pandas has no parallel idiom for any operation here — its kernels are single-threaded by
-  design and numexpr, the one threaded path it has (element-wise arithmetic through `pd.eval`), is
-  not installed in this environment — so a `pandas-parallel` row is recorded saying exactly that
-  rather than silently leaving the question open. The default rows are untouched; the parallel rows
-  are additions, and "fastest CPU" in the report is the best of every idiom of every library.
+- **Two idioms per CPU library.** The plain eager idiom above uses about one core on the
+  element-wise and whole-column reductions -- that is what `Series.sum()` and `pc.add(...)` do
+  however many threads the pool has -- and several on group-by, sort and join, where the library
+  reaches its own parallel machinery on its own. So every operation is also measured with the most
+  parallel idiom that library offers for the same answer, recorded as its own library row:
+  `polars-lazy` (the same expression through `pl.LazyFrame`, collected on the in-memory or the
+  streaming engine) and `pyarrow-threaded` (an Acero plan over the same values split into one
+  record batch per hardware thread, `to_table(use_threads=True)`, or `pa.Table.group_by` over that
+  chunked table). The `note` column names the idiom on every such row. pandas gets a
+  `pandas-parallel` row recording why it has none: its kernels are single-threaded by design, and
+  its two threaded paths -- numexpr, behind `pd.eval`, and the numba engine with `parallel=True`
+  behind `rolling` / `groupby.agg` / `apply` -- are looked up with `importlib.util.find_spec` at
+  run time and named in the note, present or absent. The default rows are untouched; the parallel
+  rows are additions, and "fastest CPU" in the report is the best of every idiom of every library.
 - `--verify` runs every operation once instead of timing it and asserts that each parallel idiom
-  returns the same answer as that library's default idiom (floats within 1e-9 relative, since a
-  threaded reduction sums in a different order).
+  returns the same answer as that library's default idiom, within 1e-9 relative for floats (a
+  threaded reduction sums in a different order). It reports the comparisons it deliberately does
+  not make -- t-digest, whose sketch depends on the partitioning, and pyarrow's threaded grouped
+  `list`, whose element order inside a group follows batch arrival -- separately from the rows
+  that have no parallel idiom at all.
 - Bytes counted are the bytes the operation must touch (input + output), so GB/s is comparable.
 - An operation ArrowMetal does not have, or that raises, is recorded as an error row, never skipped.
 """
-import argparse, csv, datetime, decimal, gc, math, os, resource, statistics, sys, time
+import argparse, csv, datetime, decimal, gc, importlib.util, math, os, resource, statistics, sys, time
 
 import numpy as np
 import pyarrow as pa
@@ -163,14 +168,43 @@ def case(family, op, rows, nbytes, impls, notes=None, parallel=None, compare=Non
 # idiom each library offers that does: a polars LazyFrame collected on the in-memory or streaming
 # engine, and an Acero plan over the values split into one record batch per core.
 
-NCHUNK = 16                       # one record batch per CPU core on this machine
+# One record batch per hardware thread, so an Acero plan can hand every worker some rows.
+NCHUNK = pa.cpu_count() or os.cpu_count() or 8
 
 PAR_LIBS = ("polars-lazy", "pyarrow-threaded", "pandas-parallel", "numpy-parallel")
 
+
+def _installed(name):
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _pandas_no_parallel():
+    """Why pandas has no parallel row, checked against this interpreter rather than asserted.
+
+    pandas has two threaded paths, and neither is a general idiom: numexpr, which `pd.eval` /
+    `DataFrame.eval` use for element-wise arithmetic on large frames, and the numba engine with
+    `parallel=True`, which `rolling`, `groupby.agg` / `transform` and `apply` accept. Both are
+    optional dependencies; if one is present the note says so, because then the gap is this
+    harness' and not pandas'.
+    """
+    have = [n for n in ("numexpr", "numba") if _installed(n)]
+    paths = ("its two threaded paths are numexpr (element-wise arithmetic through pd.eval / "
+             "DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / "
+             "transform, apply)")
+    if not have:
+        return ("pandas has no parallel idiom here: its kernels are single-threaded by design and "
+                f"{paths}, neither of which is installed in this environment")
+    return ("pandas has no parallel idiom recorded for this operation: its kernels are "
+            f"single-threaded by design and {paths}; {' and '.join(have)} "
+            f"{'is' if len(have) == 1 else 'are'} installed here, so a threaded pandas idiom for "
+            "the operations that path covers should be added to this harness")
+
+
 NO_PARALLEL = {
-    "pandas": "pandas has no parallel idiom: its kernels are single-threaded by design, and "
-              "numexpr (its one threaded path, element-wise arithmetic via pd.eval) is not "
-              "installed in this environment",
+    "pandas": _pandas_no_parallel(),
     "numpy": "numpy has no parallel idiom: its ufuncs are single-threaded",
 }
 
@@ -215,14 +249,31 @@ class Par:
 
     def __init__(self, **cols):
         self._cols = cols
-        self._tbl = None
+        self._ch = {}
+        self._tbls = {}
         self._lf = None
+
+    def _chunked(self, name):
+        if name not in self._ch:
+            self._ch[name] = chunked(self._cols[name])
+        return self._ch[name]
+
+    def table(self, cols=None):
+        """The source table, optionally narrowed to `cols`.
+
+        An Acero *filter* node passes its whole input schema through, so a plan whose source
+        carries columns the operation does not read materialises them for every surviving row --
+        work the eager `pc.filter` row never does. Narrowing the source is what keeps the two
+        idioms doing the same amount of work; the chunked arrays are shared, so it is free.
+        """
+        key = tuple(cols) if cols is not None else tuple(self._cols)
+        if key not in self._tbls:
+            self._tbls[key] = pa.table({k: self._chunked(k) for k in key})
+        return self._tbls[key]
 
     @property
     def tbl(self):
-        if self._tbl is None:
-            self._tbl = pa.table({k: chunked(v) for k, v in self._cols.items()})
-        return self._tbl
+        return self.table()
 
     @property
     def lf(self):
@@ -230,8 +281,8 @@ class Par:
             self._lf = pl.LazyFrame({k: pl.Series(k, v) for k, v in self._cols.items()})
         return self._lf
 
-    def _src(self):
-        return ac.Declaration("table_source", ac.TableSourceNodeOptions(self.tbl))
+    def _src(self, cols=None):
+        return ac.Declaration("table_source", ac.TableSourceNodeOptions(self.table(cols)))
 
     # -- polars ------------------------------------------------------------
     def _pl(self, build, streaming, shape):
@@ -291,8 +342,11 @@ class Par:
         """A grouped aggregate: polars lazy group_by, pa.Table.group_by over a chunked table.
 
         The default pyarrow group-by rows already call `pa.Table.group_by`, which is Acero with
-        `use_threads=True` -- but over a single-chunk table, which is one record batch and so one
-        thread. Chunking the same values into `NCHUNK` batches is what actually fans it out.
+        `use_threads=True`, and Acero's table_source node slices even a single chunk into several
+        ExecBatches -- so those rows are already partly threaded (a median of about 6 cores in the
+        cores table, against 1.0 for the eager element-wise and reduction rows). Handing it one
+        chunk per hardware thread simply gives it more to hand out: measured on this machine, a
+        one-chunk group-by keeps about 3.8 cores busy and a `NCHUNK`-chunk one about 9.1.
         """
         out = {}
         if pl_expr is not None:
@@ -307,8 +361,15 @@ class Par:
                      f"{NCHUNK}-chunk table, {pa.cpu_count()} threads")
         return out
 
-    def filter_(self, pl_expr=None, pa_pred=None, pa_out=None, streaming=True):
-        """A filter: polars streaming engine, Acero filter node feeding a projection."""
+    def filter_(self, pl_expr=None, pa_pred=None, pa_out=None, streaming=True, cols=None):
+        """A filter: polars streaming engine, Acero filter node feeding a projection.
+
+        `cols` names the columns the pyarrow plan may see; pass exactly the ones the predicate and
+        the output read. Acero's filter node emits its whole input schema, so anything else in the
+        source would be materialised for every surviving row and the parallel row would be doing
+        strictly more work than the `pc.filter` row it is compared with. (polars needs no such
+        care: its optimiser pushes the projection below the filter.)
+        """
         out = {}
         if pl_expr is not None:
             keep, sel = pl_expr
@@ -318,25 +379,29 @@ class Par:
         if pa_pred is not None:
             outs = list(pa_out) if isinstance(pa_out, (list, tuple)) else [pa_out]
             names = [f"r{i}" for i in range(len(outs))]
+            width = len(cols) if cols is not None else len(self._cols)
             out["pyarrow-threaded"] = (
                 _plan(lambda: ac.Declaration.from_sequence(
-                    [self._src(),
+                    [self._src(cols),
                      ac.Declaration("filter", ac.FilterNodeOptions(pa_pred)),
                      ac.Declaration("project", ac.ProjectNodeOptions(outs, names))])),
-                f"parallel idiom: Acero filter + project nodes over {NCHUNK} record batches, "
-                f"to_table(use_threads=True), {pa.cpu_count()} threads")
+                f"parallel idiom: Acero filter + project nodes over {NCHUNK} record batches of "
+                f"the {width} column(s) this operation reads, to_table(use_threads=True), "
+                f"{pa.cpu_count()} threads")
         return out
 
     def polars(self, build, streaming, shape):
         """An arbitrary lazy plan over these columns, for a chain that no shape above covers."""
         return {"polars-lazy": self._pl(build, streaming, shape)}
 
-    def acero(self, nodes, what):
+    def acero(self, nodes, what, cols=None):
         """An arbitrary Acero plan over these columns; `nodes()` returns the nodes after the source
-        (called on first use, so a bad expression becomes an error row rather than an abort)."""
+        (called on first use, so a bad expression becomes an error row rather than an abort).
+        `cols` narrows the source the way `filter_` does, for a plan that starts with a filter."""
         return {"pyarrow-threaded": (
-            _plan(lambda: ac.Declaration.from_sequence([self._src()] + list(nodes()))),
-            f"parallel idiom: Acero {what} over {NCHUNK} record batches, "
+            _plan(lambda: ac.Declaration.from_sequence([self._src(cols)] + list(nodes()))),
+            f"parallel idiom: Acero {what} over {NCHUNK} record batches of "
+            f"{len(cols) if cols is not None else len(self._cols)} column(s), "
             f"to_table(use_threads=True), {pa.cpu_count()} threads")}
 
     def vector(self, pl_expr=None, streaming=False, pa_sort=None):
@@ -367,7 +432,8 @@ UNORDERED = {"polars-lazy": "unordered", "pyarrow-threaded": "unordered"}
 # ---------------------------------------------------------------- answer verification
 
 VERIFY = False
-VERIFY_STATS = {"pass": 0, "fail": 0, "skip": 0, "error": 0}
+VERIFY_STATS = {"pass": 0, "fail": 0, "no_idiom": 0, "skipped": 0, "error": 0}
+VERIFY_SKIPPED = []      # (family, op, library): comparisons deliberately not made, and why
 VERIFY_FAILURES = []
 
 
@@ -414,7 +480,7 @@ def _flat(x, out):
         out.append(np.asarray(x.to_list(), dtype=object))
         return
     if isinstance(x, np.ndarray):
-        out.append(x if x.dtype == object else x)
+        out.append(x)
         return
     if isinstance(x, list):
         out.append(np.asarray(x, dtype=object))
@@ -471,8 +537,8 @@ def verify_case(family, op, rows, impls, parallel, compare):
     """Run each idiom once and assert every parallel row answers exactly what its default row does."""
     base = {}
     for lib, fn in parallel.items():
-        if fn is None:
-            VERIFY_STATS["skip"] += 1
+        if fn is None:                       # this library has no parallel idiom for this row
+            VERIFY_STATS["no_idiom"] += 1
             continue
         root = lib.split("-")[0]
         try:
@@ -485,7 +551,7 @@ def verify_case(family, op, rows, impls, parallel, compare):
             state, want = base[root]
             if state != "ok":
                 print(f"  SKIP {family}/{op} {lib}: no default {root} row to compare against")
-                VERIFY_STATS["skip"] += 1
+                VERIFY_STATS["no_idiom"] += 1
                 continue
             got = _cols(fn())
         except Exception as exc:
@@ -495,8 +561,9 @@ def verify_case(family, op, rows, impls, parallel, compare):
             VERIFY_STATS["error"] += 1
             continue
         mode = compare.get(lib, "exact")
-        if mode == "skip":
-            VERIFY_STATS["skip"] += 1
+        if mode == "skip":                   # a real answer, deliberately not compared: see the note
+            VERIFY_STATS["skipped"] += 1
+            VERIFY_SKIPPED.append((family, op, lib))
             continue
         if mode == "unordered":
             want, got = _reorder(want), _reorder(got)
@@ -1094,13 +1161,15 @@ def family_select(d, n):
         "polars": lambda: i.p.filter(m30.p),
         "pyarrow": lambda: pc.filter(i.a, m30.a),
         "pandas": lambda: i.d[m30.d]},
-        parallel=ps.filter_((pl.col("m30"), pl.col("x")), pc.field("m30"), pc.field("x")))
+        parallel=ps.filter_((pl.col("m30"), pl.col("x")), pc.field("m30"), pc.field("x"),
+                            cols=("x", "m30")))
     case(f, "filter int64 (90% kept)", n, int(n * 8 * 1.9), {
         "arrowmetal": lambda: i.g.filter(m90.g),
         "polars": lambda: i.p.filter(m90.p),
         "pyarrow": lambda: pc.filter(i.a, m90.a),
         "pandas": lambda: i.d[m90.d]},
-        parallel=ps.filter_((pl.col("m90"), pl.col("x")), pc.field("m90"), pc.field("x")))
+        parallel=ps.filter_((pl.col("m90"), pl.col("x")), pc.field("m90"), pc.field("x"),
+                            cols=("x", "m90")))
     case(f, "take (n/2 random indices)", n, n // 2 * 20, {
         "arrowmetal": lambda: i.g.take(idx.g),
         "polars": lambda: i.p.gather(idx.p),
@@ -1115,7 +1184,7 @@ def family_select(d, n):
         "pyarrow": lambda: pc.drop_null(i.a),
         "pandas": lambda: i.d.dropna()},
         parallel=ps.filter_((pl.col("x").is_not_null(), pl.col("x")),
-                            pc.is_valid(pc.field("x")), pc.field("x")))
+                            pc.is_valid(pc.field("x")), pc.field("x"), cols=("x",)))
     NOTHING = ("a zero-copy view: the call changes an offset and a length, so there is nothing "
                "to spread over cores in any idiom")
     case(f, "slice (zero-copy view)", n, 0, {
@@ -1132,10 +1201,15 @@ def family_select(d, n):
         "pyarrow": lambda: pc.replace_with_mask(ib.a, m30.a, repl.a),
         "pandas": lambda: ib.d.mask(m30.d, 0)},
         notes={"polars": "no replace_with_mask; zip_with against a full zero column",
-               "pandas": "Series.mask with a scalar (no positional replacement list)"},
+               "pandas": "Series.mask with a scalar (no positional replacement list)",
+               "pyarrow-threaded": "`replace_with_mask` itself is a vector function with no Acero "
+                                   "project node, but every replacement here is the same zero, so "
+                                   "if_else over the same mask is the byte-identical answer and "
+                                   "does have one"},
         parallel={**ps.project(pl.when(pl.col("m30")).then(pl.lit(0, pl.Int64))
-                                 .otherwise(pl.col("b"))),
-                  **par_none(NO_ACERO_VECTOR, ["pyarrow-threaded"])})
+                                 .otherwise(pl.col("b")),
+                               pc.if_else(pc.field("m30"), pa.scalar(0, pa.int64()),
+                                          pc.field("b")))})
     case(f, "indices_nonzero (bool)", n, n * 9, {
         "arrowmetal": lambda: m30.g.indices_nonzero(),
         "polars": lambda: m30.p.arg_true(),
@@ -1189,7 +1263,8 @@ def family_sort(d, n, sd):
         "pyarrow": lambda: pc.take(ff.a, pc.array_sort_indices(ff.a)),
         "numpy": lambda: np.sort(ff.n)},
         parallel=pff.vector(pl.col("x").sort(), pa_sort=[("x", "ascending")]))
-    NO_ACERO_TOPK = "Acero has no top-k node; pc.select_k_unstable is the only idiom"
+    NO_ACERO_TOPK = ("pyarrow exposes no top-k node in Acero; pc.select_k_unstable is the "
+                     "only idiom")
     case(f, "top_k (k=100, int64)", n, n * 8, {
         "arrowmetal": lambda: ii.g.top_k(100),
         "polars": lambda: ii.p.top_k(100),
@@ -1929,7 +2004,8 @@ def family_chains(d, n):
                 ac.Declaration("filter", ac.FilterNodeOptions(
                     (pc.field("region") == 2) & (pc.field("amount") > 100.0))),
                 ac.Declaration("aggregate", ac.AggregateNodeOptions(
-                    [("amount", "sum", None, "s")]))], "filter + aggregate nodes")})
+                    [("amount", "sum", None, "s")]))], "filter + aggregate nodes",
+                cols=("region", "amount"))})
     case(f, "filter two columns + sum [batched]", n, B, {
         "arrowmetal": q1_batched,
         "polars": None, "pyarrow": None, "pandas": None},
@@ -1963,7 +2039,7 @@ def family_chains(d, n):
                 ac.Declaration("filter", ac.FilterNodeOptions(pc.equal(pc.field("region"), 2))),
                 ac.Declaration("aggregate", ac.AggregateNodeOptions(
                     [("amount", "hash_sum", None, "s")], keys=["k"]))],
-                "filter + hash aggregate nodes")},
+                "filter + hash aggregate nodes", cols=("region", "amount", "k"))},
         compare=UNORDERED)
     case(f, "group-by after filter [batched]", n, n * 20, {
         "arrowmetal": q2_batched,
@@ -2041,7 +2117,7 @@ def family_small(sizes):
             "pyarrow": lambda: pc.filter(a, pc.greater(a, 0)),
             "pandas": lambda: dser[dser > 0]},
             parallel=psm.filter_((pl.col("x") > 0, pl.col("x")),
-                                 pc.greater(pc.field("x"), 0), pc.field("x")))
+                                 pc.greater(pc.field("x"), 0), pc.field("x"), cols=("x",)))
 
         def filter_batched():
             with am.batch():
@@ -2130,11 +2206,15 @@ def cpu_cell(r):
     return f"{fmt_ms(r['wall_ms'])} / {fmt_ms(r['cpu_ms'])}" + (f" ({c:.1f}c)" if c else "")
 
 
-def cores_summary(rows):
+def cores_summary(rows, context=False):
     """Per library and idiom, the median and max of cpu_ms/wall_ms over every measured row.
 
     This is the number the claim "on all cores" has to be checked against: 1.0 means the idiom ran
     on one core whatever the thread pool's size.
+
+    `context` adds this process's machine and thread-pool sizes to the header. Only a run that has
+    just measured the rows may pass it: `--cores <csv>` reads a CSV that may have been measured on
+    another machine, with other pool sizes, and must not caption it with this one's.
     """
     per = {}
     per_fam = {}
@@ -2147,19 +2227,28 @@ def cores_summary(rows):
     order = [lib for lib in ("arrowmetal",) + CPU_LIBS if lib in per]
     order += sorted(k for k in per if k not in order)
     out = []
-    out.append("Cores actually used, per library and idiom (cpu_ms / wall_ms over every measured "
-               f"row; {os.uname().sysname} {os.uname().release}, {NCHUNK} cores, "
-               f"polars {pl.thread_pool_size()} threads, pyarrow {pa.cpu_count()} threads)")
+    out.append("Cores actually used, per library and idiom: cpu_ms / wall_ms over every measured "
+               "row of this CSV.")
+    if context:
+        out.append(f"Measured on {os.uname().sysname} {os.uname().release}, "
+                   f"{os.cpu_count()} logical CPUs, polars {pl.thread_pool_size()} threads, "
+                   f"pyarrow {pa.cpu_count()} threads, Acero fed {NCHUNK} record batches.")
     out.append("")
-    out.append(f"{'library / idiom':<20} {'rows':>6} {'median':>8} {'mean':>8} {'max':>8} "
-               f"{'>2 cores':>9}")
-    out.append("-" * 64)
+    out.append(f"{'library / idiom':<20}{'rows':>7}{'median':>9}{'mean':>9}{'max':>9}"
+               f"{'rows >2':>9}{'%':>6}")
+    out.append("-" * 69)
     for lib in order:
         v = per[lib]
         many = sum(1 for x in v if x > 2.0)
-        out.append(f"{lib:<20} {len(v):>6} {statistics.median(v):>8.2f} "
-                   f"{statistics.fmean(v):>8.2f} {max(v):>8.2f} "
-                   f"{many:>5} {100 * many // len(v):>3}%")
+        out.append(f"{lib:<20}{len(v):>7}{statistics.median(v):>9.2f}"
+                   f"{statistics.fmean(v):>9.2f}{max(v):>9.2f}"
+                   f"{many:>9}{round(100 * many / len(v)):>5}%")
+    if "arrowmetal" in per:
+        out.append("")
+        out.append("arrowmetal's number is host CPU time only -- the thread encoding the command "
+                   "buffer and")
+        out.append("waiting on it. Time the GPU spends executing is not counted in it, by either "
+                   "side's clock.")
     out.append("")
     out.append("By family (median cores)")
     out.append("")
@@ -2228,16 +2317,19 @@ def build_report(csv_path, elapsed_s):
     lines.append("- **Every CPU library gets two columns: its plain eager idiom and its most parallel "
                  "idiom.** `polars-lazy` is the same expression through `pl.LazyFrame`, collected on "
                  "the in-memory or the streaming engine; `pyarrow-threaded` is an Acero plan over the "
-                 "same values split into 16 record batches with `to_table(use_threads=True)`, or "
-                 "`pa.Table.group_by` over a 16-chunk table. The `note` column of every such CSV row "
-                 "names the exact idiom. This exists because the eager idioms use about one core on "
-                 "most operations however many threads the pool has, and a comparison against one core "
-                 "is not the comparison this project wants to make.")
-    lines.append("- pandas has no parallel idiom for any operation here: its kernels are "
-                 "single-threaded by design, and numexpr — the one threaded path it has, element-wise "
-                 "arithmetic through `pd.eval` — is not installed in this environment. numpy's ufuncs "
-                 "are single-threaded too. Both are recorded as `pandas-parallel` / `numpy-parallel` "
-                 "rows saying so, rather than left out.")
+                 f"same values split into {NCHUNK} record batches with `to_table(use_threads=True)`, or "
+                 f"`pa.Table.group_by` over that {NCHUNK}-chunk table. The `note` column of every such "
+                 "CSV row names the exact idiom. This exists because the eager idioms use about one "
+                 "core on the element-wise and whole-column reduction rows however many threads the "
+                 "pool has — see the cores table below for where that is and is not true — and a "
+                 "comparison against one core is not the comparison this project wants to make.")
+    lines.append("- pandas has no parallel idiom recorded for any operation here. Its kernels are "
+                 "single-threaded by design, and its two threaded paths are numexpr (element-wise "
+                 "arithmetic through `pd.eval` / `DataFrame.eval`) and the numba engine with "
+                 "`parallel=True` (`rolling`, `groupby.agg` / `transform`, `apply`); which of them "
+                 "this run found installed is written into every `pandas-parallel` row's note. "
+                 "numpy's ufuncs are single-threaded. Both are recorded as `pandas-parallel` / "
+                 "`numpy-parallel` rows saying so, rather than left out.")
     lines.append("- **ratio** is the fastest CPU idiom's wall time divided by ArrowMetal's, taken "
                  "across *all* the idioms of all the libraries; the **fastest CPU** column names the "
                  "idiom that won. The verdict is the project's own bar: ✅ at or above 3x, "
@@ -2306,12 +2398,28 @@ def build_report(csv_path, elapsed_s):
     tally = {"OK": 0, "WARN": 0, "FAIL": 0, "n/a": 0}
     for v in verdicts:
         tally[v] = tally.get(v, 0) + 1
+    # _ORDER is one entry per (family, op, rows): a row of the table, not an operation. Most
+    # operations are measured at two sizes, so the two counts differ and the sentence says which
+    # is which; the percentage is of rows, rounded rather than floored.
+    n_rows = len(_ORDER)
+    ops = {(fam, op) for fam, op, _rws in _ORDER}
+    sizes_per_op = {}
+    for fam, op, _rws in _ORDER:
+        sizes_per_op[(fam, op)] = sizes_per_op.get((fam, op), 0) + 1
+    spread = {}
+    for count in sizes_per_op.values():
+        spread[count] = spread.get(count, 0) + 1
+    WORD = {1: "one size", 2: "two", 3: "three", 4: "four", 5: "five"}
+    at = ", ".join(f"{n} measured at {WORD.get(k, k)}" if i == 0 else f"{n} at {WORD.get(k, k)}"
+                   for i, (k, n) in enumerate(sorted(spread.items())))
     lines[summary_at] = (
-        f"**{len(_ORDER)} operations measured.** "
+        f"**{n_rows} rows measured, over {len(ops)} operations** ({at}). "
         f"{tally['OK']} at or above 3x (✅), {tally['WARN']} between 1x and 3x (⚠️), "
-        f"{tally['FAIL']} slower than the fastest CPU library (❌), of which {errors} are operations "
-        f"ArrowMetal does not have at all (the call raised). "
-        f"{tally['OK'] * 100 // max(len(_ORDER), 1)}% of the surface meets the bar.\n")
+        f"{tally['FAIL']} slower than the fastest CPU idiom (❌)"
+        + (f" — of which {errors} a call that raised" if errors else " — none of them a call that "
+           "raised")
+        + f" — and {tally['n/a']} with no CPU equivalent to compare against (—). "
+        f"{round(tally['OK'] * 100 / max(n_rows, 1))}% of the measured rows meet the bar.\n")
 
     # ---- the Swift / vDSP baselines, copied
     lines.append("## The 16-core Swift / vDSP baselines (copied from docs/BENCHMARKS.md)")
@@ -2353,7 +2461,7 @@ def build_report(csv_path, elapsed_s):
             f"| {key[1]} | {key[2]:,} | {fmt_ratio(ratio)} | {fmt_ms(amr['wall_ms'])} | {best_lib} | "
             f"{fmt_ms(best_wall)} | {fmt_gbs(amr['gbs'])} | {fmt_gbs(b['gbs'])} | {cause} |")
     lines.append("")
-    lines.append(f"{len(shortfalls)} of {len(_ORDER)} measured operations are below the 3x bar.")
+    lines.append(f"{len(shortfalls)} of {len(_ORDER)} measured rows are below the 3x bar.")
     lines.append("")
     lines.append("## How many cores each idiom actually used")
     lines.append("")
@@ -2600,18 +2708,24 @@ def main():
         with open(md_path, "w") as fh:
             fh.write(report)
         print(f"rebuilt {md_path} from {args.report_from}; "
-              f"{len(shortfalls)} of {len(_ORDER)} operations below 3x")
+              f"{len(shortfalls)} of {len(_ORDER)} rows below 3x")
         return
 
+    # --verify checks answers, not speed, so one middling size is the whole job; 1M rows is big
+    # enough to exercise every chunk boundary and small enough to run in a couple of minutes.
     if args.sizes:
         sizes = [int(s) for s in args.sizes.split(",")]
+    elif VERIFY:
+        sizes = [1_000_000]
     elif args.quick:
         sizes = [1_000_000]
     else:
         sizes = [10_000_000, 50_000_000]
     str_sizes = ([int(s) for s in args.str_sizes.split(",")] if args.str_sizes
+                 else sizes if VERIFY
                  else [1_000_000] if args.quick else [1_000_000, 10_000_000])
     small_sizes = ([int(s) for s in args.small_sizes.split(",")] if args.small_sizes
+                   else [1_000, min(100_000, max(sizes))] if VERIFY
                    else [1_000, 100_000] if args.quick else [1_000, 100_000, 1_000_000])
     wanted = set(args.families.split(",")) if args.families else None
 
@@ -2670,11 +2784,14 @@ def main():
 
     if VERIFY:
         s = VERIFY_STATS
-        print(f"\n===== --verify: {s['pass']} parallel idioms match their default idiom, "
-              f"{s['fail']} differ, {s['error']} raised, {s['skip']} not comparable "
-              f"({elapsed:.0f}s) =====")
+        print(f"\n===== --verify: {s['pass']} parallel idioms answer their default idiom within "
+              f"1e-9 relative, {s['fail']} differ, {s['error']} raised, "
+              f"{s['skipped']} comparisons deliberately skipped, "
+              f"{s['no_idiom']} rows with no parallel idiom to compare ({elapsed:.0f}s) =====")
+        for fam, op, lib in VERIFY_SKIPPED:
+            print(f"  skipped  {fam:<14} {op:<40} {lib}")
         for fam, op, rws, lib, why in VERIFY_FAILURES:
-            print(f"  {fam:<14} {op:<40} {rws:>9,} {lib:<18} {why}")
+            print(f"  DIFFERS  {fam:<14} {op:<40} {rws:>9,} {lib:<18} {why}")
         return 0 if not VERIFY_FAILURES else 1
 
     results_dir = os.path.join(ROOT, "Benchmarks", "results")
@@ -2693,7 +2810,7 @@ def main():
                         r["iters"], r["status"], r["note"]])
     print(f"\nwrote {csv_path} ({len(ROWS)} rows, {elapsed / 60:.1f} min)")
 
-    cores_txt = cores_summary(ROWS)
+    cores_txt = cores_summary(ROWS, context=True)
     cores_path = csv_path[:-4] + "_cores.txt"
     with open(cores_path, "w") as fh:
         fh.write(cores_txt + "\n")
@@ -2707,7 +2824,7 @@ def main():
                    else os.path.join(ROOT, "docs", "BENCHMARKS_MATRIX.md"))
         with open(md_path, "w") as fh:
             fh.write(report)
-        print(f"wrote {md_path}; {len(shortfalls)} of {len(_ORDER)} operations below 3x")
+        print(f"wrote {md_path}; {len(shortfalls)} of {len(_ORDER)} rows below 3x")
 
 
 if __name__ == "__main__":
