@@ -5,11 +5,11 @@ pushed. Numbers are from the last gated run of `main` (0.1.0, unreleased) on an 
 
 | Layer | Size | Oracle |
 |---|---|---|
-| Swift suites (`Tests/ArrowMetalTests`) | 695 tests in 50 files, run in release | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
-| Python suites (`python/tests`) | 2,402 tests over the ctypes API and the three integrations | `pyarrow.compute`, Polars, DuckDB, pandas |
+| Swift suites (`Tests/ArrowMetalTests`) | 756 tests in 60 files, run in release | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
+| Python suites (`python/tests`) | 2,460 tests over the ctypes API and the three integrations | `pyarrow.compute`, Polars, DuckDB, pandas |
 | Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | 39,069 generated cases, 45 column types, every public operation | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
 | Adversarial review pass | four independent reviewers plus a coverage pass before release | each finding carries a regression test |
-| Benchmarks (`Benchmarks/`) | 299 operations × 2 sizes × 3 CPU libraries; streaming and engine benches | measured, never estimated ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md)) |
+| Benchmarks (`Benchmarks/`) | 339 operations × 2 sizes × 3 CPU libraries; streaming and engine benches | measured, never estimated ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md)) |
 
 Run everything:
 
@@ -51,13 +51,13 @@ a sliced input at offsets 1, 7, 31, 32, 33, 63 and 64 against the same rows buil
 
 | File | Tests | Compares against |
 |---|---|---|
-| `test_arrowmetal.py` | 112 | `pyarrow.compute` and plain Python over the ctypes API, zero-copy import/export, the wheel loader |
+| `test_arrowmetal.py` | 114 | `pyarrow.compute` and plain Python over the ctypes API, zero-copy import/export, the wheel loader |
 | `test_options.py`, `test_checked.py`, `test_strings_extra.py`, `test_float64_math.py` | 113 | option surfaces (null placement, tiebreakers, cast safety, rounding), checked arithmetic, string kernels, binary64 math |
 | `test_functions.py` | 8 | executes every runnable row of the Arrow-name registry through `call_function` against `pyarrow.compute`, with a second input in another type family where the claim spans several |
 | `test_expr.py`, `test_lazy.py`, `test_lazy_optimizer.py`, `test_lazy_memory.py` | 84 | fused expressions and lazy plans against Polars and pyarrow; the optimizer against the unoptimized plan; RSS over 30,000 queries |
-| `test_parquet.py`, `test_parquet_robustness.py` | 24 | `pyarrow.parquet.read_table` on generated files; fuzzed and damaged files |
-| `test_stream.py` | 22 | streaming results against pyarrow and Polars, including a 2 GB IPC directory generated at test time |
-| `test_polars.py` | 44 | the bridge and namespaces against native Polars; the 8 Rust-plugin tests run when `polars-plugin/` is built |
+| `test_parquet.py`, `test_parquet_robustness.py` | 31 | `pyarrow.parquet.read_table` on generated files; fuzzed and damaged files |
+| `test_stream.py` | 27 | streaming results against pyarrow and Polars, including a 2 GB IPC directory generated at test time |
+| `test_polars.py` | 53 | the bridge and namespaces against native Polars; the 8 Rust-plugin tests run when `polars-plugin/` is built |
 | `test_duckdb.py` | 38 | the bridge against DuckDB SQL; the 11 extension tests run when `duckdb-extension/build.sh` has produced the extension, and one test compiles the public C header as C |
 | `test_pandas.py` | 72 | the accessor and accel mode against plain pandas across five null-carrying dtype flavours; `install()`/`uninstall()` restore every patched slot |
 | `test_differential.py` (standalone part) | 100 plus 17 documented xfails | one test per finding and per fixed finding, plus the guards that every public operation and every module-level function has a matrix case |

@@ -226,7 +226,7 @@ Quality
   `call_function` and compared to `pyarrow.compute`, with a second input in a different Arrow type family
   for the rows whose claim spans several, and float tolerances recorded per row in `functions.TOLERANCE`.
   It found that `binary_length`, `binary_repeat` and `binary_reverse` refuse a `binary` column.
-- Differential matrix against `pyarrow.compute` (docs/EVALUATION.md): 33,183 cases per run over 45 column types, 0 unclassified
+- Differential matrix against `pyarrow.compute` (docs/EVALUATION.md): 39,069 cases per run over 45 column types, 0 unclassified
   divergences. Fixed from its findings: stable null order in argsort and top_k, the -0.0 tie in the sort
   keys (top_k included, which had its own key mapping), NaN kept at the end of a descending sort, float32
   sums in software double, unsigned group-by sums, exact float32 comparison, float32 `sign`/`ceil`/`floor`/

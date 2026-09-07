@@ -7,22 +7,23 @@ M4 Max, 16 cores, 64 GB) where ArrowMetal is **slower** than a CPU library, grou
 cause, followed by the rows that win by less than 3x. Nothing here is rounded in ArrowMetal's favour;
 a row leaves this page only when a rerun of the matrix moves it.
 
-Of 946 comparisons in the matrix: 781 at or above 3x, 115 faster but under 3x, 50 slower than the
-CPU library. The 50 fall into nine causes.
+Of 946 comparisons in the matrix: 822 at or above 3x, 93 faster but under 3x, 31 slower than the
+CPU library. The 31 fall into six causes. The morning run of the same day
+(`full_matrix_2026-09-07-am.csv`) had 50 slower and 115 under 3x; what moved is at the end of the page.
 
 ## Slower than the CPU library
 
-### 1. The dispatch floor below a million rows (17 rows)
+### 1. The dispatch floor below a million rows (19 rows)
 
 | operation | rows | ArrowMetal | fastest CPU | ratio |
 |---|---:|---:|---:|---:|
 | sum(int64) | 1,000 | 0.14 ms | 0.00 ms (Polars) | 0.00x |
 | sum(int64) | 100,000 | 0.15 ms | 0.01 ms (Polars) | 0.05x |
-| sum(int64) | 1,000,000 | 0.22 ms | 0.08 ms (Polars) | 0.35x |
+| sum(int64) | 1,000,000 | 0.22 ms | 0.07 ms (pyarrow) | 0.31x |
 | filter(int64 > 0) | 1,000 | 0.18 ms | 0.00 ms (Polars) | 0.02x |
-| filter(int64 > 0) | 100,000 | 0.18 ms | 0.03 ms (Polars) | 0.15x |
-| group-by sum (1000 keys) | 1,000 | 0.81 ms | 0.08 ms (pandas) | 0.09x |
-| group-by sum (1000 keys) | 100,000 | 0.91 ms | 0.35 ms (pandas) | 0.38x |
+| filter(int64 > 0) | 100,000 | 0.18 ms | 0.03 ms (Polars) | 0.17x |
+| group-by sum (1000 keys) | 1,000 | 0.80 ms | 0.08 ms (pandas) | 0.09x |
+| group-by sum (1000 keys) | 100,000 | 0.93 ms | 0.35 ms (pandas) | 0.38x |
 
 A Metal dispatch costs 60–140 µs before the first byte is touched: command-buffer creation,
 encoding, commit and the completion wait. A CPU library sums a thousand integers in a fraction of a
@@ -33,140 +34,147 @@ expression tree), and the lazy engine (one command buffer for a whole plan) — 
 break-even point down, none of which remove the floor. The persistent-kernel approach that would
 remove it is impossible on this hardware ([RESIDENT.md](RESIDENT.md)).
 
-### 2. `shift` is a copy here and a view in Polars (4 rows)
+### 2. `shift` as a copy (4 rows)
 
 | operation | rows | ArrowMetal | Polars | pandas | ratio |
 |---|---:|---:|---:|---:|---:|
-| shift (lag 1, int64) | 10,000,000 | 2.34 ms | 0.04 ms | 0.05 ms | 0.02x |
-| shift (lag 1, int64) | 50,000,000 | 3.59 ms | 0.05 ms | 0.15 ms | 0.01x |
+| shift (lag 1, int64) | 10,000,000 | 2.30 ms | 0.05 ms | 0.05 ms | 0.02x |
+| shift (lag 1, int64) | 50,000,000 | 3.63 ms | 0.05 ms | 0.15 ms | 0.01x |
 
-ArrowMetal's `shift` writes a new column: 800 MB moved at 50M rows, at memory bandwidth. Polars
-answers with a two-chunk view (a null chunk in front of a slice of the original) and copies nothing;
-pandas reuses its block. A view is the right answer and needs a chunked array representation, which
-`MetalArray` does not have; the engine's `concat` is the closest thing today. Until then this row is a
-genuine 50–70x loss whenever the caller does not need a contiguous result.
+The matrix measures the default `shift`, which writes a new contiguous column: 813 MB moved at 50M
+rows at 226 GB/s, which is this machine's bandwidth, so the kernel is not the problem. Polars answers
+with a two-chunk view (a null chunk in front of a slice of the original) and copies nothing. Since the
+morning run `shift(by, fill, view=True)` returns exactly that — a `pyarrow.ChunkedArray` over the same
+device memory, 0.04 ms at 10M rows — and it is opt-in because the chunked form is not a `MetalArray`
+and cannot re-enter a kernel without being combined. The matrix keeps measuring the default, so the
+row stays here; a caller who wants Polars' answer has it.
 
-### 3. `count_distinct` by key (6 rows)
-
-| operation | rows | ArrowMetal | Polars | ratio |
-|---|---:|---:|---:|---:|
-| count_distinct by key (1000 groups) | 10,000,000 | 124 ms | 26 ms | 0.21x |
-| count_distinct by key (1000 groups) | 50,000,000 | 708 ms | 154 ms | 0.22x |
-| count_distinct by key (100000 groups) | 10,000,000 | 124 ms | 31 ms | 0.25x |
-| count_distinct by key (100000 groups) | 50,000,000 | 706 ms | 146 ms | 0.21x |
-| count_distinct by key (10M groups) | 10,000,000 | 127 ms | 79 ms | 0.62x |
-| count_distinct by key (10M groups) | 50,000,000 | 715 ms | 420 ms | 0.59x |
-
-The grouped distinct count sorts the (key, value) pairs and counts runs — a 128-bit radix sort at
-50M rows. Polars hashes each (key, value) pair into a per-group set. A GPU hash set over the packed
-pair (the generic 64-bit `HashTable` already exists; it needs a two-word key) would replace the sort.
-It still beats pyarrow by 2.6–2.9x on the same rows; the loss is to Polars only.
-
-### 4. `tdigest` (2 rows)
+### 3. Grouped variance and stddev in software binary64 (2 rows)
 
 | operation | rows | ArrowMetal | pyarrow | ratio |
 |---|---:|---:|---:|---:|
-| tdigest(float64, q=0.5) | 10,000,000 | 557 ms | 207 ms | 0.37x |
-| tdigest(float64, q=0.5) | 50,000,000 | 2,836 ms | 1,053 ms | 0.37x |
-
-The t-digest is built on the host from a GPU sort (0.14 GB/s says so). The sort-free `quantile`
-next to it runs 158x faster than pyarrow, so a caller who wants a quantile should use `quantile`;
-`tdigest` exists for callers who want the sketch itself. A GPU-side centroid merge is the fix.
-
-### 5. Grouped variance and stddev in software binary64 (4 rows)
-
-| operation | rows | ArrowMetal | pyarrow | ratio |
-|---|---:|---:|---:|---:|
-| variance by key (1000 groups) | 50,000,000 | 34.2 ms | 25.9 ms | 0.76x |
-| stddev by key (1000 groups) | 50,000,000 | 34.2 ms | 25.3 ms | 0.74x |
-| stddev by key (1000 groups) | 10,000,000 | 6.4 ms | 6.4 ms | 0.99x |
+| variance by key (1000 groups) | 50,000,000 | 34.1 ms | 26.4 ms | 0.78x |
+| stddev by key (1000 groups) | 50,000,000 | 34.1 ms | 26.2 ms | 0.77x |
 
 The grouped moments accumulate in software IEEE-754 binary64, because Apple GPUs have no double
 arithmetic and a float32 accumulator is wrong past a few million rows. The answer is bit-exact against
-Arrow; the price is 3–4 GPU instructions per FLOP. Against Polars the same rows win by 2.3–2.4x.
+Arrow; the price is 3–4 GPU instructions per FLOP. At 10M rows the same rows tie pyarrow (1.00x,
+1.02x); against Polars they win by 2.4x; at 100,000 and 10M groups they win by 2.1–4x.
 
-### 6. Float64 `sqrt` and `sort` (4 rows)
-
-| operation | rows | ArrowMetal | fastest CPU | ratio |
-|---|---:|---:|---:|---:|
-| sqrt (float64) | 10,000,000 | 2.72 ms | 2.39 ms (numpy / pyarrow) | 0.88x |
-| sqrt (float64) | 50,000,000 | 12.7 ms | 11.7 ms (pyarrow) | 0.92x |
-| sort float64 | 10,000,000 | 29.7 ms | 26.1 ms (Polars) | 0.88x |
-| sort float64 | 50,000,000 | 139 ms | 133 ms (Polars) | 0.95x |
-
-`sqrt` is correctly rounded software binary64 (a hardware `rsqrt` seed and Newton steps in emulated
-double); the previous float32-evaluated version was 4x faster and wrong in the last bits, and the
-project chose correct. The float64 sort is an 8-pass LSD radix sort over the order-preserving key;
-Polars' multi-threaded sort is within 5–12% of it. Fewer, wider digits (six 11-bit passes) is the
-known next step.
-
-### 7. Regex on the host (1 row)
-
-| operation | rows | ArrowMetal | Polars | ratio |
-|---|---:|---:|---:|---:|
-| match_substring_regex (real regex) | 1,000,000 | 19.8 ms | 17.8 ms | 0.90x |
-
-A real regex runs on the CPU (RE2-equivalent semantics through Foundation), behind a GPU pre-filter
-that clears rows that cannot match. At 10M rows the pre-filter wins 1.06x over Polars and 2x over
-pyarrow; at 1M rows the host regex dominates. LIKE patterns and literal substrings are GPU kernels and
-win by 20–1300x; only a genuine regex takes this path.
-
-### 8. Two-key group-by (2 rows)
+### 4. Grouped min at 1000 groups, 10M rows (1 row)
 
 | operation | rows | ArrowMetal | pyarrow | ratio |
 |---|---:|---:|---:|---:|
-| sum by two int32 keys (~1024 groups) | 10,000,000 | 6.26 ms | 5.68 ms | 0.91x |
-| sum by two int32 keys (~1024 groups) | 50,000,000 | 22.7 ms | 22.2 ms | 0.98x |
+| min by int32 key (1000 groups) | 10,000,000 | 5.77 ms | 5.05 ms | 0.87x |
 
-Two keys go through the general hashed-keys path even when both are small integers whose packed
-64-bit value would be a dense key for the fast path (2.7 ms at 10M rows for one int32 key). Packing
-narrow key pairs is a small, known change. Against Polars the same rows win by 4–5x.
+The morning run had this row at 4.64 ms (1.09x), the 50M row of the same operation did not move
+(9.86 ms, 2.06x over pyarrow), and the grouped min/max kernels were not touched between the runs. The
+targeted re-measurement at the end of the page put it back at 4.17 ms (1.22x): the matrix value is
+noise on a 5 ms call. The row stays in this table because the matrix is the record; the operation is
+in the "under 3x" cluster on its merits, with the other grouped aggregates at 1000 groups.
 
-### 9. Noise and small absolute values (10 rows)
+### 5. Regex on the host (1 row)
+
+| operation | rows | ArrowMetal | Polars | ratio |
+|---|---:|---:|---:|---:|
+| match_substring_regex (real regex) | 1,000,000 | 18.9 ms | 17.4 ms | 0.92x |
+
+A real regex runs on the CPU (RE2-equivalent semantics through Foundation), behind a GPU pre-filter
+that clears rows that cannot match. At 10M rows the pre-filter wins 1.15x over Polars and 2.2x over
+pyarrow; at 1M rows the host regex dominates. LIKE patterns and literal substrings are GPU kernels and
+win by 7–87x; only a genuine regex takes this path.
+
+### 6. Noise on zero-cost rows (4 rows)
 
 `slice (zero-copy view)` reads 0.00 ms for every library — all are pointer arithmetic, and the ratio
-is measurement noise. `list_value_length` at 10M rows is 1.12 ms against 0.71 ms: an offsets
-difference that should run at bandwidth and does not yet; it is a real, small loss.
+is measurement noise.
 
-## Faster, but under the 3x bar (115 rows)
+## Faster, but under the 3x bar (93 rows)
 
 The full list is in the matrix page under ⚠️. The clusters:
 
-- **Software binary64 math** — `ln` 1.06–1.33x, `sin` 1.96–2.07x, `days_between` 1.04–1.41x,
-  `sqrt` 1.9–2.2x against Polars. Correct to 1 ulp (4–5 ulp for trigonometry); the CPU has hardware
-  doubles and the GPU does not. These will not reach 3x without a different numerical contract.
-- **Grouped aggregates against pyarrow at 1000 groups** — sum/count/min/max/mean by int32 key at
-  1.1–2.2x. pyarrow's grouped kernels are memory-bound and 16-thread; the GPU's advantage grows with
-  the number of groups (10M groups: 92–96x) and with wider values.
-- **Memory-bound element-wise kernels against Polars** — compare, `is_nan`, `abs`, `bit_wise_and`,
-  `if_else`, `replace_with_mask` at 1.2–2.7x. Both sides run at unified-memory bandwidth; the GPU's
-  edge is the dispatch overhead it does not pay per thread. Fusing them into one expression
-  (`am.query`) is where the 3x comes from, not from the single kernel.
-- **Sorting and argsort** at 1.8–2.8x over Polars.
-- **Host-assisted strings** — `trim`, `lower`, `upper` at 1M rows (1.8–2.2x; the dispatch floor
-  again — at 10M rows they win 2.5x–26x), `parse` 1.4–2.7x, real regex 1.7–2.1x.
-- **Joins** at 2.6–3.0x over pyarrow, 3–8x over Polars.
+- **Software binary64 math** — `ln` 1.06–1.33x, `sin` 1.98–2.06x, `days_between` 1.04–1.47x,
+  `sqrt` at 10M rows 1.83x (3.13x at 50M, where the dispatch floor no longer shows). Correct to 1 ulp
+  (4–5 ulp for trigonometry); the CPU has hardware doubles and the GPU does not. These will not reach
+  3x without a different numerical contract.
+- **Grouped aggregates against pyarrow at 1000 groups** — sum/count/min/max/mean by int32, float64 and
+  utf8 key at 1.3–2.2x, two int32 keys at 1.11x (10M rows; 3.8x at 50M), and variance/stddev at
+  1.0–2.4x. pyarrow's grouped kernels are memory-bound and 16-thread; the GPU's advantage grows with
+  the number of groups (100,000 groups: 3.5–5.5x; 10M groups: 2.9–25x) and with wider values.
+- **Memory-bound element-wise kernels against Polars and numpy** — compare, `is_nan`, `abs`,
+  `bit_wise_and`, `if_else`, `negate`, `shift_left`, `replace_with_mask`, `drop_null` at 1.1–2.98x.
+  Both sides run at unified-memory bandwidth; the GPU's edge is the dispatch overhead it does not pay
+  per thread. Fusing them into one expression (`am.query`) is where the 3x comes from, not from the
+  single kernel; even so `filter two columns + sum` at 10M rows is 2.2x over Polars (6x at 50M).
+- **`sort float64`** at 2.67x over Polars, both sizes. `argsort` of the same column is 10x; the
+  difference is the `take` that materialises the sorted values (a random 8-byte gather). Inverting
+  the sort key in place of the gather is the costed next step (below).
+- **Joins** at 2.7–2.8x over pyarrow for the materialised inner join (the index-only join and the
+  left outer join are 3.0–3.8x).
+- **Host-assisted strings** — `parse` 1.4–2.7x, real regex 1.2–2.2x.
+- **Small dictionaries** — `unique`, `value_counts`, `dictionary_encode` and `mode` on 1000-distinct
+  columns at 1.9–2.5x over pandas/pyarrow at 10M rows (4x at 50M).
+- **`list_value_length`** at 1.9–2.1x: 80 MB in 0.37 ms is bandwidth plus the dispatch floor.
+- **The latency family at 1M rows** — 1.0–2.1x, the floor again.
 
-## What changed since the previous matrix
+## What changed since the morning run
 
-Compared with `full_matrix_2026-09-06.csv` on the same machine: 132 rows faster, 27 slower. The large
-wins came from the review wave (assume_timezone 2,900x, LIKE with `_` 1,300x, split 600x, strftime
-170x, quantile 158x, grouped min/max at 10M groups 95x, count_distinct 70x). The slower rows are the
-binary64 transcendental and sqrt change (correct at the cost of throughput, above), and a regression
-in `upper`/`lower`/`trim` (3.7 ms → 54 ms at 10M rows) introduced with full-Unicode case mapping:
-the hybrid GPU/host driver allocated and walked an n-sized host array even when no row needed the
-host. That is fixed in the commit that adds this page (`upper` 4.6 ms, `trim` 3.0 ms at 10M rows,
-results identical to pyarrow) and the matrix row will be re-measured in the next full run.
+Compared with `full_matrix_2026-09-07-am.csv` on the same machine, 54 rows are faster and 13 read
+slower. The wins are the two changes recorded in the next section:
 
-## Fixed since the matrix
+| operation | rows | morning | afternoon | fastest CPU now | ratio now |
+|---|---:|---:|---:|---:|---:|
+| count_distinct by key (1000 groups) | 50,000,000 | 708 ms | 45.7 ms | 156 ms (Polars) | 3.4x |
+| count_distinct by key (10M groups) | 50,000,000 | 715 ms | 61.0 ms | 401 ms (Polars) | 6.6x |
+| tdigest(float64, q=0.5) | 50,000,000 | 2,836 ms | 48.5 ms | 1,061 ms (pyarrow) | 21.9x |
+| sum by two int32 keys (~1024 groups) | 50,000,000 | 22.7 ms | 6.0 ms | 22.9 ms (pyarrow) | 3.8x |
+| argsort int64 | 50,000,000 | 142 ms | 39.2 ms | 301 ms (Polars) | 7.7x |
+| argsort float64 | 50,000,000 | 143 ms | 40.0 ms | 429 ms (Polars) | 10.8x |
+| lexsort (2 int32 keys) | 50,000,000 | 149 ms | 37.4 ms | 912 ms (Polars) | 24x |
+| argsort utf8 | 10,000,000 | 60.8 ms | 13.7 ms | 234 ms (Polars) | 17x |
+| sort float64 | 50,000,000 | 139 ms | 49.6 ms | 132 ms (Polars) | 2.67x |
+| sqrt (float64) | 50,000,000 | 12.7 ms | 3.95 ms | 12.4 ms (numpy) | 3.1x |
+| upper / lower / trim | 10,000,000 | 52–55 ms | 5.2–5.4 ms | 139–173 ms (pyarrow / pandas) | 27–32x |
+| list_value_length | 10,000,000 | 1.12 ms | 0.37 ms | 0.71 ms (pyarrow) | 1.9x |
 
-Eight of the causes above have been worked on since the 2026-09-07 matrix, on the same idle M4 Max.
-The matrix tables above are the record of that run and are not edited; the rows below will move when
-the matrix is next run in full. Each number here comes from a per-operation script that uses
-`full_matrix.py`'s columns, seed and rule (one warm-up, best of five), with the before and after
-builds run alternately in separate processes.
+The 13 slower rows are all at 10M rows and none is above 1.7x, while the 50M row of the same
+operation is unchanged in every case (`partition_nth_indices` 4.9 → 8.0 ms at 10M against 19.8 ms
+unchanged at 50M; `max by int32 key` 2.65 → 3.85 ms against 9.87 ms unchanged; the rest are 1.1–1.5x
+on values of 1–4 ms in kernels the two changes did not touch: LIKE, floor_temporal, coalesce,
+fill_null_forward). That is the signature of run-to-run noise on short calls, not of a regression, and
+the targeted re-measurement below settles it.
 
-### Sort, sqrt and shift (causes 2 and 6)
+The re-measurement (`full_matrix.py --families sort,group-by,chains --sizes 10000000`, idle machine,
+5.5 minutes, kept as `private` data and summarised here):
+
+| operation, 10M rows | morning | afternoon matrix | re-measured | fastest CPU | ratio |
+|---|---:|---:|---:|---:|---:|
+| compare + filter + take | 0.98 ms | 1.52 ms | 0.99 ms | 7.33 ms (Polars) | 7.4x |
+| max by int32 key (1000 groups) | 2.65 ms | 3.85 ms | 2.76 ms | 5.07 ms (pyarrow) | 1.8x |
+| min by int32 key (1000 groups) | 4.64 ms | 5.77 ms | 4.17 ms | 5.08 ms (pyarrow) | 1.2x |
+| mean by int32 key (100000 groups) | 3.50 ms | 4.11 ms | 3.46 ms | 15.8 ms (pyarrow) | 4.6x |
+| sum by two int32 keys (~1024 groups) | 6.26 ms | 5.10 ms | 2.24 ms | 5.67 ms (pyarrow) | 2.5x |
+| sort float64 | 29.7 ms | 9.73 ms | 9.63 ms | 28.1 ms (Polars) | 2.9x |
+| argsort int64 | 27.7 ms | 7.86 ms | 7.76 ms | 56.5 ms (Polars) | 7.3x |
+| count_distinct by key (1000 groups) | 124 ms | 7.96 ms | 8.26 ms | 27.2 ms (Polars) | 3.3x |
+| **partition_nth_indices (n/2)** | **4.90 ms** | **7.97 ms** | **8.09 ms** | 56.8 ms (pyarrow) | 7.0x |
+
+Every grouped and chained row went back to its morning value, so those were noise; the two-key row's
+10M value is the noisiest of all (2.2–6.3 ms across four runs) and its 50M value is stable at 6.0 ms.
+**One regression is real:** `partition_nth_indices` at 10M rows costs 8.1 ms where it cost 4.9 ms
+before the radix-sort change, reproduced twice, while its 50M row is unchanged at 19.8 ms. It is still
+7x over pyarrow, but the project's rule is that a change may not make any other row slower, so it is
+open and being fixed; the row will be re-measured with the fix.
+
+## The work between the two runs, as it was designed and measured
+
+This is the record of the two changes that separate the morning run from the afternoon run, written
+by the people who made them, with the numbers they measured at the time. Each number comes from a
+per-operation script that uses `full_matrix.py`'s columns, seed and rule (one warm-up, best of five),
+with the before and after builds run alternately in separate processes; the matrix rows above are the
+authoritative re-measurement and agree with these to within a few per cent.
+
+### Sort, sqrt and shift
 
 Measured with `Benchmarks/loss_sort_shift_sqrt.py`.
 
@@ -239,7 +247,7 @@ The 50M view costs 0.154 ms rather than the 0.003 ms the pointer arithmetic take
 `pa.chunked_array` settles the slice's null count — a popcount over 50M validity bits. A column with no
 nulls does not pay it. That is pyarrow's accounting, not a copy.
 
-### count_distinct by key, tdigest, two-key group-by and list lengths (causes 3, 4, 8 and 9)
+### count_distinct by key, tdigest, two-key group-by and list lengths
 
 Measured with `Benchmarks/loss_bench.py`, the "before" being the previous build loaded through
 `ARROWMETAL_LIB`.
