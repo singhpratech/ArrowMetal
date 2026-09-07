@@ -549,6 +549,12 @@ public final class StreamGroupByOperator: StreamOperator {
     private var spilled = false
     private var context: MetalContext = .shared
 
+    /// The GPU-resident table for the arbitrary-key path. Set false to force the host table (the A/B
+    /// the streaming tests use to prove the two agree row for row).
+    public var residentTable = true
+    private var resident: StreamGroupTable?
+    private var residentKeyTemplate: AnyMetalArray?
+
     public init(keys: [String], aggregates: [StreamAggregate], filter: Expr? = nil, denseKeyCount: Int? = nil) {
         self.keyColumns = keys
         self.aggregates = aggregates
@@ -559,9 +565,20 @@ public final class StreamGroupByOperator: StreamOperator {
     /// True while the dense global table is on the GPU (it turns false after a spill).
     public var usesGPUState: Bool { denseKeyCount != nil && !spilled }
 
-    /// Only the dense path's merge records kernels (the element-wise folds into the GPU state); the
-    /// host table's merge is pure host arithmetic over values `process` already read back.
-    public var mergeUsesGPU: Bool { usesGPUState }
+    /// True when the arbitrary-key path keeps its global table on the GPU: one integer key column, no
+    /// dense key count, and every aggregate expressible as a running (sum, count) pair.
+    ///
+    /// `min` / `max` would need a per-slot atomic minimum the table does not have, and `variance` a
+    /// third accumulator; both keep the host table, which is exact for every key type and every
+    /// aggregate and is what the resident path is checked against.
+    public var usesResidentTable: Bool {
+        residentTable && denseKeyCount == nil && keyColumns.count == 1
+            && aggregates.allSatisfy { $0.op == .sum || $0.op == .count || $0.op == .mean }
+    }
+
+    /// Both GPU-state paths fold with kernels; the host table's merge is pure host arithmetic over
+    /// values `process` already read back.
+    public var mergeUsesGPU: Bool { usesGPUState || resident != nil }
 
     public func process(_ batch: MetalRecordBatch) throws -> Any? {
         context = batch.firstContext ?? .shared
@@ -589,6 +606,24 @@ public final class StreamGroupByOperator: StreamOperator {
                 partials.append(try densePartial(a, gb, work))
             }
             return DensePartial(parts: partials)
+        }
+
+        // Arbitrary path with an integer key: the global table stays on the GPU, so this batch's one
+        // row per group never crosses to the host at all.
+        if usesResidentTable, integerKeyWidth(keyCols[0]) != nil {
+            let gk = try GroupByKeys(columns: keyCols)
+            guard gk.groupCount > 0 else { return nil }
+            if residentKeyTemplate == nil { residentKeyTemplate = keyCols[0] }
+            let groupKeys = try int64Keys(try gk.trim(try gk.groupKeys()[0]))
+            var vals: [AnyMetalArray?] = [], cnts: [MetalArray<Int64>?] = []
+            var kinds: [StreamGroupTable.SumKind] = []
+            for a in aggregates {
+                let (v, c, _) = try hostPartial(a, gk, work)
+                vals.append(v)
+                cnts.append(c.flatMap { if case .int64(let x) = $0 { return x } else { return nil } })
+                kinds.append(sumKind(v))
+            }
+            return ResidentPartial(keys: groupKeys, values: vals, counts: cnts, kinds: kinds)
         }
 
         // Arbitrary path: dense ids on the GPU, one row per group to the host.
@@ -701,9 +736,83 @@ public final class StreamGroupByOperator: StreamOperator {
     }
 
     public func merge(_ partial: Any) throws {
+        if let r = partial as? ResidentPartial {
+            if resident == nil {
+                resident = try StreamGroupTable(context: context, aggregateCount: aggregates.count)
+            }
+            try resident!.fold(groupKeys: r.keys, values: r.values, groupCounts: r.counts, kinds: r.kinds)
+            return
+        }
         if let d = partial as? DensePartial { try mergeDense(d); return }
         guard let h = partial as? HostPartial else { return }
         try mergeHost(h)
+    }
+
+    /// One batch's per-group results, still on the GPU, on their way into the resident table.
+    final class ResidentPartial {
+        let keys: MetalArray<Int64>
+        let values: [AnyMetalArray?]
+        let counts: [MetalArray<Int64>?]
+        let kinds: [StreamGroupTable.SumKind]
+        init(keys: MetalArray<Int64>, values: [AnyMetalArray?], counts: [MetalArray<Int64>?],
+             kinds: [StreamGroupTable.SumKind]) {
+            self.keys = keys; self.values = values; self.counts = counts; self.kinds = kinds
+        }
+    }
+
+    private func sumKind(_ v: AnyMetalArray?) -> StreamGroupTable.SumKind {
+        switch v {
+        case .some(.int64): return .int
+        case .some(.uint64): return .uint
+        case .some(.float64): return .double
+        default: return .none
+        }
+    }
+
+    /// The byte width of an integer key column, or nil when the key is not a plain integer.
+    private func integerKeyWidth(_ c: AnyMetalArray) -> Int? {
+        switch c {
+        case .int8, .uint8: return 1
+        case .int16, .uint16: return 2
+        case .int32, .uint32: return 4
+        case .int64, .uint64: return 8
+        default: return nil
+        }
+    }
+
+    /// An integer key column as int64. Unsigned keys are reinterpreted rather than converted, which
+    /// stays injective for the whole uint64 range; `finish` reverses it.
+    private func int64Keys(_ c: AnyMetalArray) throws -> MetalArray<Int64> {
+        switch c {
+        case .int8(let a): return try a.cast(to: Int64.self)
+        case .int16(let a): return try a.cast(to: Int64.self)
+        case .int32(let a): return try a.cast(to: Int64.self)
+        case .int64(let a): return a
+        case .uint8(let a): return try a.cast(to: Int64.self)
+        case .uint16(let a): return try a.cast(to: Int64.self)
+        case .uint32(let a): return try a.cast(to: Int64.self)
+        case .uint64(let a):
+            return MetalArray<Int64>(length: a.length, nullCount: a.nullCount, validity: a.validity,
+                                     values: a.values, context: a.context)
+        default: throw ArrowMetalError.unsupportedType("resident group table needs an integer key")
+        }
+    }
+
+    /// The reverse of `int64Keys`, back to the key column's own type.
+    private func keyColumnLike(_ template: AnyMetalArray, _ k: MetalArray<Int64>) throws -> AnyMetalArray {
+        switch template {
+        case .int8: return .int8(try k.cast(to: Int8.self))
+        case .int16: return .int16(try k.cast(to: Int16.self))
+        case .int32: return .int32(try k.cast(to: Int32.self))
+        case .int64: return .int64(k)
+        case .uint8: return .uint8(try k.cast(to: UInt8.self))
+        case .uint16: return .uint16(try k.cast(to: UInt16.self))
+        case .uint32: return .uint32(try k.cast(to: UInt32.self))
+        case .uint64:
+            return .uint64(MetalArray<UInt64>(length: k.length, nullCount: k.nullCount,
+                                              validity: k.validity, values: k.values, context: k.context))
+        default: return .int64(k)
+        }
     }
 
     private func mergeDense(_ d: DensePartial) throws {
@@ -1026,13 +1135,49 @@ public final class StreamGroupByOperator: StreamOperator {
 
     public func finish() throws -> StreamResult {
         var r = StreamResult()
-        if usesGPUState, !denseSum.isEmpty {
+        if let table = resident {
+            r.batch = try residentResultBatch(table)
+        } else if usesGPUState, !denseSum.isEmpty {
             r.batch = try denseResultBatch()
         } else {
             r.batch = try hostResultBatch()
         }
         r.rowsOut = r.batch?.length ?? 0
         return r
+    }
+
+    /// The resident table read out as a record batch, key column first, in ascending key order with
+    /// the null key's group last - the same order the host table produces.
+    private func residentResultBatch(_ table: StreamGroupTable) throws -> MetalRecordBatch {
+        let (keys, sums, counts) = try table.readOut()
+        let order = try keys.argsort(descending: false)
+        let template = residentKeyTemplate ?? .int64(keys)
+        var names = keyColumns
+        var cols: [AnyMetalArray] = [try keyColumnLike(template, try keys.take(order))]
+        for (i, a) in aggregates.enumerated() {
+            names.append(a.name)
+            let c = try counts[i].take(order)
+            switch a.op {
+            case .count:
+                cols.append(.int64(c))
+            case .sum:
+                // Arrow's `sum` of an all-null group is null, which is what a zero count means here.
+                cols.append(try maskByCount(try sums[i].take(order), c))
+            case .mean:
+                let s = try toDouble(try sums[i].take(order))
+                let n = try c.cast(to: Double.self)
+                cols.append(try maskByCount(.float64(try s.divide(n)), c))
+            default:
+                throw ArrowMetalError.unsupportedType("\(a.op.rawValue) in a resident streaming group-by")
+            }
+        }
+        return try MetalRecordBatch(names: names, columns: cols)
+    }
+
+    /// Nulls out the groups whose count is zero, as Arrow's `sum` and `mean` do.
+    private func maskByCount(_ v: AnyMetalArray, _ counts: MetalArray<Int64>) throws -> AnyMetalArray {
+        let live = try counts.compare(.gt, 0)
+        return try nullingWhereFalse(v, live)
     }
 
     /// The GPU-resident dense state read out as a record batch, key column first.
