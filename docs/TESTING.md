@@ -109,8 +109,11 @@ for strings): one warm-up call, then best-of-5 wall time under a per-measurement
 process user+system delta so a 16-thread CPU kernel shows about 16× its wall time; every library gets
 the same values (pyarrow the Arrow array, Polars a Series built from it, pandas an Arrow-backed Series
 when nulls are present and a numpy-backed one otherwise); an operation ArrowMetal lacks is an error row,
-never a skip. The streaming bench runs every (workload, engine) cell in its own subprocess so peak RSS
-is that engine's alone. Results land in `Benchmarks/results/*.csv` and are rendered into
+never a skip. One measured caveat: the first operation in a family that asks the buffer pool for
+hundreds of megabytes can read up to 60% slow while the pool is cold (`partition_nth_indices` measured
+7.9 ms first in a fresh process and 5.1 ms after any large operation, on the same build), so a row that
+moves between runs is re-measured in place before it is called a regression. The streaming bench runs
+every (workload, engine) cell in its own subprocess so peak RSS is that engine's alone. Results land in `Benchmarks/results/*.csv` and are rendered into
 [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md); losses stay in the table.
 
 ## 7. Hardware and toolchain of the published numbers
