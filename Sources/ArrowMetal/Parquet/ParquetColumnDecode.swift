@@ -52,6 +52,11 @@ extension ParquetFile {
     /// Walks a column chunk's page headers. Only Thrift headers are read here; no column bytes.
     func pageHeaders(of chunk: ParquetColumnMetadata, rowGroup: Int) throws -> (dict: ParquetRawPage?, data: [ParquetRawPage]) {
         var at = Int(chunk.startOffset)
+        // `data_page_offset` and `dictionary_page_offset` are signed i64 in the footer: a corrupt one
+        // is negative or past the end, and either way it must not become a read position.
+        guard at >= 0, at < fileSize else {
+            throw ParquetError.malformed("column chunk starts at \(at), outside the \(fileSize)-byte file")
+        }
         let limit = chunk.totalCompressedSize > 0
             ? Swift.min(at + Int(chunk.totalCompressedSize), fileSize) : fileSize
         var seen: Int64 = 0
@@ -63,6 +68,18 @@ extension ParquetFile {
             let body = r.pos
             guard h.compressedSize >= 0, body + Int(h.compressedSize) <= fileSize else {
                 throw ParquetError.truncated("page at \(at) claims \(h.compressedSize) bytes")
+            }
+            // Every one of these is a signed thrift i32 that the decode below narrows to UInt32 to
+            // build a page descriptor, and `UInt32(negative)` is a trap, not an error. A page header
+            // that is negative anywhere is malformed; say so here, once, rather than on the way in.
+            guard h.uncompressedSize >= 0, h.numValues >= 0, h.dictNumValues >= 0,
+                  h.defLevelsByteLength >= 0, h.repLevelsByteLength >= 0,
+                  Int(h.defLevelsByteLength) + Int(h.repLevelsByteLength) <= Int(h.compressedSize),
+                  Int(h.defLevelsByteLength) + Int(h.repLevelsByteLength) <= Int(h.uncompressedSize) else {
+                throw ParquetError.malformed(
+                    "page at \(at) has a negative or inconsistent header (uncompressed \(h.uncompressedSize), "
+                    + "values \(h.numValues), dict values \(h.dictNumValues), levels "
+                    + "\(h.repLevelsByteLength)+\(h.defLevelsByteLength) of \(h.compressedSize))")
             }
             let page = ParquetRawPage(header: h, bodyOffset: body, rowGroup: rowGroup)
             switch h.type {
@@ -121,6 +138,11 @@ extension ParquetFile {
             }
             let (d, pages) = try pageHeaders(of: meta, rowGroup: g)
             if let d {
+                // Dictionary bases are 32-bit in the page descriptor, and every dictionary buffer is
+                // sized `totalDict * width`: both need `totalDict` to stay inside UInt32.
+                guard totalDict + Int(d.header.dictNumValues) <= Int(UInt32.max) else {
+                    throw ParquetError.malformed("dictionary of \(totalDict) + \(d.header.dictNumValues) entries")
+                }
                 dictBaseOf[g] = UInt32(totalDict)
                 dictCountOf[g] = Int(d.header.dictNumValues)
                 totalDict += Int(d.header.dictNumValues)

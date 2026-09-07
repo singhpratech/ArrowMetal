@@ -54,7 +54,10 @@ struct ThriftReader {
     // MARK: primitives
 
     @inline(__always) mutating func byte() throws -> UInt8 {
-        guard pos < bytes.count else { throw ParquetError.truncated("byte at \(pos) of \(bytes.count)") }
+        // `pos` can start negative: a column chunk's `data_page_offset` is a signed thrift i64 that a
+        // corrupt footer can make negative, and `UnsafeRawBufferPointer`'s subscript is unchecked in a
+        // release build, so an unguarded negative index reads memory in front of the mapping.
+        guard pos >= 0, pos < bytes.count else { throw ParquetError.truncated("byte at \(pos) of \(bytes.count)") }
         defer { pos += 1 }
         return bytes[pos]
     }
@@ -89,7 +92,7 @@ struct ThriftReader {
     }
 
     mutating func double() throws -> Double {
-        guard pos + 8 <= bytes.count else { throw ParquetError.truncated("double at \(pos)") }
+        guard pos >= 0, pos + 8 <= bytes.count else { throw ParquetError.truncated("double at \(pos)") }
         defer { pos += 8 }
         return Double(bitPattern: bytes.loadUnaligned(fromByteOffset: pos, as: UInt64.self))
     }
@@ -98,7 +101,7 @@ struct ThriftReader {
     mutating func binaryRange() throws -> Range<Int> {
         let at = pos
         let n = try varintCount("binary at \(at)")
-        guard pos + n <= bytes.count else { throw ParquetError.truncated("binary of \(n) bytes at \(pos)") }
+        guard pos >= 0, pos + n <= bytes.count else { throw ParquetError.truncated("binary of \(n) bytes at \(pos)") }
         defer { pos += n }
         return pos..<(pos + n)
     }

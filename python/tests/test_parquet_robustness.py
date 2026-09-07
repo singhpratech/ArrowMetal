@@ -264,6 +264,7 @@ def test_damaged_files_never_crash_the_process(workdir):
     assert r.returncode == 0 and "ALL-DONE" in r.stdout, (
         "crashed (rc=%d) on %s: %s" % (r.returncode, seen[-1] if seen else "?",
                                        "\n".join(r.stderr.strip().splitlines()[-3:])))
+    assert len(seen) == len([f for f in os.listdir(d) if f.endswith(".parquet")])
 
 
 # --------------------------------------------------------------------------------------------

@@ -157,6 +157,15 @@ public final class ParquetFile: @unchecked Sendable {
             let myPath = path + [e.name]
             if e.numChildren == 0 {
                 guard let t = e.type else { throw ParquetError.malformed("leaf \(e.name) has no physical type") }
+                // `type_length` is the value width for FIXED_LEN_BYTE_ARRAY and multiplies every
+                // buffer size downstream, so a negative or absurd one has to stop here rather than
+                // overflow an allocation. Real ones are tiny: 16 for UUID, at most 32 for a decimal.
+                if t == .fixedLenByteArray {
+                    guard e.typeLength > 0, e.typeLength <= (1 << 20) else {
+                        throw ParquetError.malformed(
+                            "FIXED_LEN_BYTE_ARRAY column \(e.name) declares a length of \(e.typeLength)")
+                    }
+                }
                 let leaf = ParquetLeaf(index: leaves.count, element: e, physical: t, path: myPath,
                                        maxDefinition: d, maxRepetition: rp)
                 leaves.append(leaf)
