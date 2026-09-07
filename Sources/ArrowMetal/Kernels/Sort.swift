@@ -180,17 +180,19 @@ extension MetalArray {
             return (e, Swift.max(1, (rows + e - 1) / e))
         }
         let (elemsPerBlock, blocks) = blockPlan(n)
-        // The passes may be re-planned around a shorter value block below, and a shorter block can want
-        // *more* threadgroups, not fewer (the rule halves the block until there are at least 64 of them).
-        // `blockPlan` never asks for more than 128 either way, so the tables are sized for that.
-        let tableBlocks = Swift.max(blocks, 128)
+        // The passes are re-planned around a shorter value block when the partition takes rows out, and
+        // a shorter block can want *more* threadgroups, not fewer (the rule halves the block until there
+        // are at least 64 of them). `blockPlan` never asks for more than 127 whatever the row count, so
+        // the tables are sized for 128 — but only when a re-plan is possible at all.
+        let tableBlocks = usePartition ? Swift.max(blocks, 128) : blocks
         let counts = try MetalArrowBuffer.allocate(byteCount: radix * tableBlocks * 4, zeroed: false, context: ctx)
         let spanOr = try MetalArrowBuffer.allocate(byteCount: tableBlocks * kb, zeroed: false, context: ctx)
         let spanAnd = try MetalArrowBuffer.allocate(byteCount: tableBlocks * kb, zeroed: false, context: ctx)
-        // Only `sorted()` on a float column has any use for the -0.0 / NaN report; nothing else pays for
-        // the buffer, and the kernel does not touch the pointer when `wantFlags` is 0.
+        // Only `sorted()` on a float column has any use for the -0.0 / NaN report, and the kernel does
+        // not touch the pointer when `wantFlags` is 0 — but it gets a scratch buffer of its own either
+        // way, so that no kernel ever holds two differently-typed device pointers into one allocation.
         let wantFlags = keysWanted && T.isFloatingPoint
-        let flagBuf = wantFlags ? try MetalArrowBuffer.allocate(byteCount: 4, zeroed: true, context: ctx) : counts
+        let flagBuf = try MetalArrowBuffer.allocate(byteCount: 4, zeroed: true, context: ctx)
         // The partition's own tables: three counters per block and the three bucket totals, which are
         // what the sort's element count comes from when the nulls have been taken out.
         let partCounts = usePartition ? try MetalArrowBuffer.allocate(byteCount: 3 * blocks * 4, zeroed: false, context: ctx) : nil
@@ -321,8 +323,6 @@ extension MetalArray {
                 }
                 try ctx.syncPoint()
                 measured = true
-                // Only when it was asked for: with `wantFlags` off the kernel writes nothing and the
-                // binding is the counts table, whose first entry is a digit count, not a flag word.
                 if wantFlags { flags = withExtendedLifetime(flagBuf) { flagBuf.typed(UInt32.self)[0] } }
                 if let sizes {
                     withExtendedLifetime(sizes) {

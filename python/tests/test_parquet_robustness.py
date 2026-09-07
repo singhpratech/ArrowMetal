@@ -403,6 +403,10 @@ def test_every_entry_point_that_needs_values_decodes_a_dictionary(workdir):
     `am_arith_array`, `am_cast` / `am_cast_ex`, `am_filter_where`, `am_argsort` / `am_argsort_ex`,
     `am_sort`, `am_top_k` and the maths kernels (`am_unary`, `am_binary`, `am_cumulative`) all decode
     first, so every one of them answers what the materialised column answers.
+
+    `sort` (`am_sort_ex`) is the one that decodes only to *order*: it gathers the codes, so it answers
+    the same values in a dictionary of its own rather than a decoded column. `test_options.py`'s
+    `test_sort_keeps_the_input_type` pins that; here only the values are compared.
     """
     values, col = _dictionary_column(workdir)
     plain = am.array(values)

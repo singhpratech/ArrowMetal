@@ -188,15 +188,19 @@ Fixed
   sort's own keys are an order-preserving map of the values that is a bijection except on -0.0 and NaN,
   so the sorted values are inverted straight out of the sorted keys — and the sort then drops the
   row-number payload it only carried for the gather. A column that does hold a -0.0 or a NaN copies back
-  only the runs they occupy. `sort float64` 9.71 -> 6.75 ms at 10M rows and 49.6 -> 32.2 ms at 50M;
-  `sort int64` 9.50 -> 6.41 and 48.8 -> 30.7. The Python `MetalArray.sort` reaches it through the new
-  `am_sort_ex`; it used to be `take(argsort())` in the ctypes package and never called this path.
+  only the runs they occupy. `sort float64` 9.59 -> 6.50 ms at 10M rows and 50.3 -> 31.9 ms at 50M;
+  `sort int64` 9.39 -> 6.14 and 49.4 -> 30.6. The Python `MetalArray.sort` reaches it through the new
+  `am_sort_ex`; it used to be `take(argsort())` in the ctypes package and never called this path, and
+  it keeps returning the input's type, a dictionary column included.
 - Sorting a column with a validity bitmap lifted the nulls out of the finished permutation on the *host*:
   three passes over the whole index array and a sort of the null row numbers, which cost an order of
   magnitude more than the GPU sort it followed. A stable three-way partition (values, NaNs, nulls) now
   runs before the sort instead, so the nulls never enter it and keep their input order by construction,
   and the passes are planned around the value block rather than the column. `sort float64` with 10%
-  nulls 126 -> 7.2 ms at 10M rows and 678 -> 33.7 ms at 50M; with 50% nulls at 50M, 3,358 -> 23.4 ms.
+  nulls 139.7 -> 6.84 ms at 10M rows and 725.9 -> 33.7 ms at 50M; with 50% nulls at 50M, 3,436 -> 22.9
+  ms. (Every figure in these two bullets and in the matching section of docs/LOSSES.md comes from one
+  set of runs, recorded with the scripts that produced it; the 10% rows and the plain sorts are the
+  matrix-conditions harness, the 50% row is the shape sweep, and LOSSES names the file for each.)
 - `partition_nth_indices` split the column around the selected key with three `compare` + `filter`
   compactions and a concatenation: seven command buffers, and two of its steps ran on the host — the row
   numbers it compacted were filled by a CPU loop and the output was allocated zeroed, a write and a

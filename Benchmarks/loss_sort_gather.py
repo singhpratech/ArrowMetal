@@ -164,6 +164,8 @@ def main():
     ap.add_argument("--baseline", help="PYTHON_DIR:DYLIB of a second build, measured alternately")
     ap.add_argument("--baseline-tag", default="before")
     ap.add_argument("--rounds", type=int, default=2, help="alternating rounds per case")
+    ap.add_argument("--polars", action="store_true",
+                    help="also time Polars on the four sort rows (matrix mode), for the ratio")
     ap.add_argument("--csv")
     args = ap.parse_args()
     rows = args.rows or ([10_000_000, 50_000_000] if args.mode == "matrix"
@@ -204,6 +206,21 @@ def main():
                      for tag, mod in engines}
             for op in cases[engines[-1][0]]:
                 measure(op, "matrix", n, {tag: cases[tag][op] for tag, _ in engines})
+            if args.polars:
+                # The CPU side of the four rows the ratio is claimed on, measured here rather than
+                # quoted from a matrix run. Polars is resident while ArrowMetal is timed above, so
+                # both columns are a little pessimistic; the ratio is the honest part.
+                import polars as pl
+                s_f64, s_i64 = pl.Series(arrays["f64"]), pl.Series(arrays["i64"])
+                for op, fn in [("sort float64", lambda: s_f64.sort()),
+                               ("sort int64", lambda: s_i64.sort()),
+                               ("argsort float64", lambda: s_f64.arg_sort()),
+                               ("argsort int64", lambda: s_i64.arg_sort())]:
+                    wall, iters = best_of(fn)
+                    print(f"{'polars':<7} {op:<28} {'matrix':<20} {n:>11,} {wall:9.3f} ms", flush=True)
+                    out.append(dict(tag="polars", mode=args.mode, op=op, shape="matrix", rows=n,
+                                    wall_ms=round(wall, 3), iters=iters))
+                del s_f64, s_i64
             del cases, arrays
         else:
             rng = np.random.default_rng(SEED)
