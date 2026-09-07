@@ -182,8 +182,9 @@ extension MetalArray {
         let (elemsPerBlock, blocks) = blockPlan(n)
         // The passes are re-planned around a shorter value block when the partition takes rows out, and
         // a shorter block can want *more* threadgroups, not fewer (the rule halves the block until there
-        // are at least 64 of them). `blockPlan` never asks for more than 127 whatever the row count, so
-        // the tables are sized for 128 — but only when a re-plan is possible at all.
+        // are at least 64 of them). `blockPlan` never asks for more than 128 whatever the row count —
+        // 128 exactly, at 520,193 rows — so the tables are sized for that, but only when a re-plan is
+        // possible at all; the assignment below falls back to this layout if one ever wanted more.
         let tableBlocks = usePartition ? Swift.max(blocks, 128) : blocks
         let counts = try MetalArrowBuffer.allocate(byteCount: radix * tableBlocks * 4, zeroed: false, context: ctx)
         let spanOr = try MetalArrowBuffer.allocate(byteCount: tableBlocks * kb, zeroed: false, context: ctx)
