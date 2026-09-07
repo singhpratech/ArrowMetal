@@ -7,7 +7,10 @@ let package = Package(
     products: [
         .library(name: "ArrowMetal", targets: ["ArrowMetal"]),
         .library(name: "CArrowABI", targets: ["CArrowABI"]),
-        // C ABI as a dynamic library for Python, Rust, Go, C#, R, C++ and C consumers.
+        // C ABI as a dynamic library, for C and C++ and for any language with a C FFI. It takes and
+        // returns Arrow C Data Interface structs, which are copy-free out and copy-free in when the
+        // producer's buffers are page aligned (one copy otherwise). Python and Rust bindings over it
+        // live in this repository (python/, polars-plugin/); Go, C#, R and the rest are on the roadmap.
         .library(name: "ArrowMetalC", type: .dynamic, targets: ["ArrowMetalC"]),
         .executable(name: "arrowmetal-bench", targets: ["ArrowMetalBench"]),
         .executable(name: "arrowmetal-examples", targets: ["ArrowMetalExamples"]),

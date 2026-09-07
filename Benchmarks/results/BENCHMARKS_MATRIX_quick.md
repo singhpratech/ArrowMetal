@@ -6,6 +6,12 @@ ArrowMetal 0.1.0 on `Apple M4 Max` against Polars 1.44.1 (16 threads), pyarrow 2
 
 Run time 0.6 minutes; raw numbers in `Benchmarks/results/full_matrix_2026-09-06_quick.csv`.
 
+**This is the 1M-row smoke run, kept as a record.** The comparison to read is
+[docs/BENCHMARKS_MATRIX.md](../../docs/BENCHMARKS_MATRIX.md), the full 2026-09-07 run at 10M and 50M
+rows. At a million rows most operations are still paying the fixed cost of a dispatch, so the verdicts
+below are far worse than the full run's, and two operations that raised here — `argsort utf8` and
+`dictionary_encode (int32)` — run in the 2026-09-07 matrix.
+
 ## How to read this
 
 - Every number is the best wall time of up to five calls after one warm-up, with the process CPU time (all threads) of that same call beside it. A slow call is repeated fewer times, never fewer than twice; the CSV records the count.
@@ -13,7 +19,7 @@ Run time 0.6 minutes; raw numbers in `Benchmarks/results/full_matrix_2026-09-06_
 - `--` in a library column means that library has no equivalent operation (the reason is in the CSV's `note` column); `err` means the call raised, and the message is in the CSV. Nothing is skipped silently.
 - Bandwidth (GB/s) is bytes touched (input + output) over wall time. Where ArrowMetal and the best baseline are both near the machine's ~400 GB/s unified-memory ceiling the operation is memory-bound and no ratio above ~1.5x is available to either side.
 
-**146 operations measured.** 32 at or above 3x (✅), 43 between 1x and 3x (⚠️), 62 slower than the fastest CPU library (❌), of which 2 are operations ArrowMetal does not have at all (the call raised). 21% of the surface meets the bar.
+**146 measurements.** 137 of them have a CPU baseline and carry a verdict: 32 at or above 3x (✅), 43 between 1x and 3x (⚠️), 62 slower than the fastest CPU library (❌), of which 2 are operations ArrowMetal did not have at all in this run (the call raised). 23% of the 137 meet the bar. The other 9 are the `[batched]` rows, which no CPU library has an equivalent for and which are therefore scored `—`, not counted.
 
 ## reductions
 
@@ -354,7 +360,7 @@ Sorted by how far short of the 3x bar the row is (worst first). ❌ means a CPU 
 | list_flatten | 1,000,000 | 2.56x | 0.001 | pyarrow | 0.002 | 66736 | 26037 | Nested kernels are one thread per row over an offsets buffer; the CPU equivalents are often metadata-only (a zero-copy child view) and so cannot be beaten by any amount of bandwidth. |
 | lexsort (2 int32 keys) | 1,000,000 | 2.92x | 4.50 | polars | 13.17 | 3.55 | 1.21 | Not yet diagnosed from the kernel; the ArrowMetal path is doing more passes over the column than the CPU library's fused one. |
 
-105 of 146 measured operations are below the 3x bar.
+105 of the 137 scored measurements are below the 3x bar.
 
 ## Reproducing
 

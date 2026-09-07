@@ -8,7 +8,8 @@ single unreleased 0.1.0 heading and in docs/BENCHMARKS.md as numbered rounds.
 
 ## 2026-09-06: Batched execution with lazy materialisation instead of futures
 A per-thread open command buffer with sync-on-read keeps the synchronous API (every method still returns a
-real array) while removing the ~120 µs round trip between chained kernels. Futures would have changed every
+real array) while removing the round trip between chained kernels — measured at ~116 µs for an empty
+kernel on an M4 Max, round 4 in docs/BENCHMARKS.md. Futures would have changed every
 signature. Cost: a reduction inside a batch still syncs; filter results carry a worst-case buffer until read.
 
 ## 2026-09-06: One C ABI, thin idiomatic wrappers per language
@@ -36,7 +37,8 @@ templates specialised per element type and cached per pipeline. Cost: ~100 ms fi
 ## 2026-09-06: Page-aligned, pooled buffers via `posix_memalign` + `makeBuffer(bytesNoCopy:)`
 Metal sub-allocates small `makeBuffer(length:)` buffers from a heap, so they are not page aligned and cannot
 be re-wrapped zero-copy by another Metal consumer. Own allocation guarantees alignment. A size-bucketed pool
-avoids mmap and page-fault costs on repeated allocations, which cut element-wise kernel times by 2x to 3x.
+avoids mmap and page-fault costs on repeated allocations, which cut element-wise kernel times by 2x to 3x
+(round 2 in docs/BENCHMARKS.md, Apple M4 Max, 2026-09-06).
 Kernel outputs that are fully written skip zeroing.
 
 ## 2026-09-06: Reductions without atomics
@@ -45,8 +47,11 @@ Each threadgroup writes a partial; the host (or a scan kernel) finalises. Determ
 
 ## 2026-09-06: Float64 on the GPU: bit-pattern ordering plus software IEEE-754
 Metal has no `double`. Compare, min, max, filter, take and slice treat Float64 as `long` with an
-order-preserving key (NaN and signed zero handled). Sum, add, subtract, multiply and divide use a software
-binary64 implementation on 64-bit integers, correctly rounded and bit-exact against the CPU. Chosen over
+order-preserving key (NaN and signed zero handled). Add, subtract, multiply and divide use a software
+binary64 implementation on 64-bit integers, correctly rounded and bit-exact against Swift's `Double`;
+`sum` uses the same adder but reassociates over threadgroups, so it is exact to a tolerance rather than
+bit for bit. `sqrt` is correctly rounded too; the transcendentals measure 1 ulp against a 2-ulp asserted
+bound and the trigonometric family 5. Chosen over
 double-float (two `float`) emulation because Float64 is the default numeric type in Python and an
 approximate result there would be a support burden forever.
 

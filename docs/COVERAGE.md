@@ -121,7 +121,7 @@ The long form is at the bottom of this file.
 | **GPU / CPU** | Split evaluation: part of the work is a Metal kernel and part runs on the host. The note says where the seam is and what decides it. |
 | **CPU** | Implemented and reachable through the same ArrowMetal API, but the work runs on the host. |
 | **Partial** | Available with a stated limitation; the note says exactly what is missing. |
-| **Planned** | Not implemented; a [ROADMAP](../ROADMAP.md) item covers it (linked in the note). |
+| **Planned** | Not implemented; a [ROADMAP](ROADMAP.md) item covers it (linked in the note). |
 
 Counts in the summary are counts of **rows**. A row covers one Arrow function unless it names several
 (for example the twenty `ascii_is_*` / `utf8_is_*` predicates share one row). For counts of *names*, use
@@ -460,7 +460,7 @@ outright.
 | `fixed_size_binary` | **GPU** | `MetalFixedBinaryArray` (`TypesExtra.swift`): `w:N` as N raw bytes per element, with C Data import and export (zero-copy on a page-aligned producer) and `filter` / `take` / `slice` through the same record gather the interval types use. `compare(.eq / .ne, …)` against a scalar record or another array of the same width is a GPU byte compare, null in / null out, with the array form ANDing the two validity bitmaps; ordering comparisons are not defined for the type and throw. `hash64()` is FNV-1a 64 over each element's bytes — an ArrowMetal extension, not Arrow's `hash64`. `am_fixed_binary_compare` / `am_fixed_binary_hash64` in C, `fixed_binary_compare()` / `hash64()` in Python; the comparison is checked against `pyarrow.compute.equal`. |
 | `utf8` | **GPU** | Byte/char length, equals/starts_with/ends_with/contains, count_substring/find_substring, murmur3 hash, `dictionary_encode` (GPU), filter, take, C Data import/export, and the transforms that build new string arrays: ASCII and Latin case mapping, trim/ltrim/rtrim, pad, slice, repeat, replace, reverse, element-wise join and the `ascii_is_*` predicates, plus GPU integer↔string casts. The regex functions, SQL `LIKE`, splitting and the float/boolean casts are CPU. |
 | `large_utf8` | **Partial** | Import only, and only when the data is under 2 GB: 64-bit offsets are narrowed to int32 in one pass. Exports come back out as `utf8`. |
-| `utf8_view` / `binary_view` | **Planned** | [ROADMAP → Medium term](../ROADMAP.md#medium-term) lists `utf8_view` / `binary_view` import and export as open. |
+| `utf8_view` / `binary_view` | **Planned** | [ROADMAP → Types and interop](ROADMAP.md#types-and-interop) lists `utf8_view` / `binary_view` import and export as open. |
 | `list` / `large_list` / `fixed_size_list` | **Partial** | `MetalListArray` (`Sources/ArrowMetal/Nested.swift`): C Data import and export of `+l`, `+L` and `+w:N`, `list_value_length` / `list_flatten` / `list_element`, and `filter` / `take` / `slice`. The child is an `AnyMetalArray`, so it may be any supported type including another list, a struct or a map, recursively. Offsets are always int32 in Metal memory: `large_list` offsets are narrowed on import (and come back out as `+l`, as `large_utf8` comes back out as `utf8`), and a `fixed_size_list` materialises the `i * N` offsets its layout implies, so one set of kernels covers all three. `take` recomputes the offsets with the existing GPU scan and expands the selected rows' source ranges into one child index array that the child's own `take` gathers; a `slice` of a variable-length list shares both the offsets buffer and the child. `list_parent_indices` and `list_slice` are in `NestedExtra.swift` (see the compute table above). Not implemented: aggregates or arithmetic over list values. |
 | `list_view` / `large_list_view` | **Partial** | Import only (`Sources/ArrowMetal/NestedExtra.swift`). `+vl` and `+vL` arrive as three buffers — validity, per-row offsets and per-row sizes — with rows that may point anywhere in the child, in any order, overlapping. The importer walks the rows once on the host: when they already lie back to back the contiguous offsets `MetalListArray` needs are the view's own and the producer's child is shared untouched; otherwise the sizes are prefix-summed into fresh offsets and the child is **materialised in that order with one GPU gather** (`list_view_gather` plus the child's own `take`, so the child may be any supported type). `+vL`'s int64 offsets and sizes are narrowed as `large_list`'s are. A null row references nothing, whatever its slots say. **Everything therefore exports as a plain `list` (`+l`)**: ArrowMetal has no view-shaped column, so a round trip through this package flattens a view. |
 | `struct` | **GPU** | `MetalStructArray` (`Nested.swift`) is `+s` as a **column**, not only as the record-batch container: named children of any supported type, its own validity bitmap, arbitrary nesting in either direction (a struct of lists, a list of structs), `structField(_:)`, and `filter` / `take` / `slice` by delegating to the children and gathering the struct's own validity. `importArrowRecordBatch` keeps its top-level meaning and now accepts nested children. No aggregate takes a struct column. |
@@ -478,13 +478,14 @@ outright.
 | C Data Interface export | **Shipped** | Primitive, boolean and `utf8` arrays. |
 | C Device Data Interface import / export | **Shipped** | `ARROW_DEVICE_METAL`; a `sync_event` on import is waited on with an empty command buffer. |
 | C Stream Interface import | **Shipped** | `importArrowArrayStream` drains a stream into record batches. |
-| C Stream Interface export | **Planned** | [ROADMAP → Medium term](../ROADMAP.md#medium-term): "C Stream export and C Device Stream, the two interop rows still open". |
+| C Stream Interface export | **Shipped** | `am_stream_export_c` (`include/arrowmetal.h`) hands a streaming query out as an `ArrowArrayStream`, over `StreamQuery.exportArrowArrayStream`. The **C Device Stream** (`ArrowDeviceArrayStream`) is the row still open: [ROADMAP → Types and interop](ROADMAP.md#types-and-interop). |
 | Record batch as `+s` struct array | **Partial** | Import and export both work; import rejects struct-level nulls, a non-zero offset, and nested children. |
 | `MTLBuffer` recovery from our own exports | **Shipped** | `metalBuffers(of:)` for device arrays this process produced. |
 | Arrow IPC (file and stream) read / write | **Shipped** | `IPC/IPCReader.swift` and `IPC/IPCWriter.swift`, no dependencies: both encapsulations, random access through the file footer, and cross-checked against pyarrow in both directions. Columns keep their logical type — temporal columns read and write as `.temporal`, `binary` / `large_binary` as `.binary`, and dictionary-encoded columns as `.dictionary` through `DictionaryBatch` messages (complete dictionaries only: a delta batch, a replacement for an id, or a batch carrying a different dictionary for a column is refused rather than silently mis-decoded). Compression, view types and run-end encoded columns are not written. |
 | Python: PyCapsule `__arrow_c_array__` | **Shipped** | `python/arrowmetal/__init__.py` over the C ABI. |
-| Python: `__arrow_c_device_array__`, wheel with the dylib inside | **Planned** | [ROADMAP → Integrations](../ROADMAP.md#integrations). |
-| arrow-swift and MLX bridges, DuckDB/DataFusion UDF | **Planned** | [ROADMAP → Integrations](../ROADMAP.md#integrations). |
+| Python: wheel with the dylib inside | **Shipped, unpublished** | `scripts/build_wheel.sh` copies `libArrowMetalC.dylib` into the package and builds a `macosx_*_arm64` wheel. It is not on PyPI yet: [ROADMAP → Release mechanics](ROADMAP.md#release-mechanics). |
+| Python: `__arrow_c_device_array__` | **Planned** | Only `__arrow_c_array__` is defined today. [ROADMAP → Types and interop](ROADMAP.md#types-and-interop). |
+| arrow-swift and MLX bridges, DuckDB/DataFusion UDF | **Planned** | [ROADMAP → Integrations](ROADMAP.md#integrations). |
 
 ## What ArrowMetal 0.1.0 claims, and what it does not
 
@@ -558,5 +559,5 @@ transforms; nested access; and Arrow C Data, C Device and C Stream interop for a
 
 ---
 
-Version 0.1.0. Read alongside [ARROW_FUNCTIONS.md](ARROW_FUNCTIONS.md), [ROADMAP.md](../ROADMAP.md),
+Version 0.1.0. Read alongside [ARROW_FUNCTIONS.md](ARROW_FUNCTIONS.md), [ROADMAP.md](ROADMAP.md),
 [DESIGN.md](DESIGN.md) and [BENCHMARKS.md](BENCHMARKS.md).

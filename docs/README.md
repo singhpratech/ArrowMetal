@@ -1,7 +1,8 @@
 # ArrowMetal documentation
 
-Start here. Everything in this folder is written so that someone who has never seen the code can verify
-every claim the project makes.
+Start here. Everything in this folder is written so that someone who has never seen the code can check
+the claims against the source, the tests and the recorded benchmark runs: each page names the file, the
+test or the CSV a claim comes from.
 
 | Read this | To learn |
 |---|---|
@@ -19,11 +20,11 @@ every claim the project makes.
 | [EXPR.md](EXPR.md) | Fused expression queries: one runtime-generated kernel for a whole expression DAG, the grammar, how nulls are compiled, the numbers and the limits |
 | [ENGINE.md](ENGINE.md) | The lazy query engine: the logical plan, the optimizer rules with `explain()` examples, fusion planning, the full join matrix (multi-key, utf8, outer, semi/anti, as-of), window functions, the plan grammar, the numbers and the limits |
 | [POLARS.md](POLARS.md) | Polars on the GPU in three tiers: the zero-copy bridge and `.arrowmetal` namespaces, the Rust expression plugin for lazy plans, and the streaming hand-off — with install, numbers at 10M and 50M rows, and what a real Metal `engine=` backend would need |
-| [DUCKDB.md](DUCKDB.md) | Using ArrowMetal from DuckDB: the zero-copy Python bridge, the loadable SQL extension, streaming tables larger than memory, and an honest account of which shapes the GPU wins and which it loses |
+| [DUCKDB.md](DUCKDB.md) | Using ArrowMetal from DuckDB: the Python bridge (copy-free where DuckDB returns one chunk), the loadable SQL extension, streaming tables larger than memory, and an honest account of which shapes the GPU wins and which it loses |
 | [STREAMING.md](STREAMING.md) | Out-of-core streaming execution: datasets larger than memory flowing from disk through the GPU, the three-stage pipeline and its measured overlap, every streaming operator with exact-or-approximate marked, and the buffer budget |
 | [DECISIONS.md](DECISIONS.md) | Why it is built this way, one dated entry per decision |
 | [FINDINGS.md](FINDINGS.md) | Things learned the hard way: toolchain quirks, Metal limits, bugs and their lessons |
-| [../ROADMAP.md](../ROADMAP.md) | What is next and what is open for contributors |
+| [ROADMAP.md](ROADMAP.md) | What is next and what is open for contributors |
 | [../CHANGELOG.md](../CHANGELOG.md) | What is in the (unreleased) 0.1.0 |
 | [../Benchmarks/README.md](../Benchmarks/README.md) | The three benchmark programs and the fairness rules |
 | [../python/README.md](../python/README.md) | The Python package: install, wheel build, usage |
@@ -31,7 +32,7 @@ every claim the project makes.
 
 ## Reproducing everything
 
-All of it runs on any Apple silicon Mac with Xcode installed:
+All of it runs on an Apple silicon Mac on macOS 14 or later (the package's floor) with Xcode installed:
 
 ```
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test               # Swift suite, debug

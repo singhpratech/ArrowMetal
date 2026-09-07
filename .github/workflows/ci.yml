@@ -1,6 +1,9 @@
 name: CI
-# Hosted runners expose a virtual GPU (correctness tests skip there) and macOS minutes are billed on a
-# private repo, so CI runs only on pull requests or by hand. Real GPU testing happens on Apple silicon locally.
+# GitHub's hosted Apple silicon runners expose an "Apple Paravirtual device": the GPU is virtual, so the
+# correctness tests skip there (requireRealGPU()) and this job proves the build, the interop and the CPU
+# paths only. The bench step below runs on that virtual device and its numbers are never published --
+# every benchmark table in the repository was measured on real Apple silicon. Real GPU testing happens
+# locally; the job runs on pull requests and by hand rather than on every push.
 on:
   pull_request:
   workflow_dispatch:
