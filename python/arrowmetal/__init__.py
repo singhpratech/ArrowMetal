@@ -248,6 +248,11 @@ class MetalArray:
 
     def _scalar(self, v):
         fmt = self.format
+        # A dictionary-encoded column reports its *index* format ("i"), but the kernels that take a
+        # scalar decode it to its values first, so the scalar has to be packed as one of those values.
+        # Among "i" arrays only a dictionary has a child, which is cheaper to ask than the Arrow type.
+        if fmt == "i" and _lib.am_child_count(self._h) == 1:
+            fmt = self.child(0).format
         # A decimal scalar is 16 little-endian bytes, which is what am_compare_scalar expects for "d:p,s".
         if fmt.startswith("d:"):
             return _decimal_scalar(v, _decimal_scale(fmt))
@@ -4160,6 +4165,82 @@ def _filter_text(filters):
     return ";".join(parts).encode()
 
 
+class ColumnSet(dict):
+    """The columns one Parquet read produced, in the order they were read.
+
+    It reads like the `{name: MetalArray}` mapping it replaces -- `cols["price"]`, `for name in cols`,
+    `cols.items()`, `dict(cols)`, `== {}` -- but underneath it is positional, so a projection that names
+    a column twice, or a file that has two columns of the same name, keeps both of them, the way
+    `pyarrow.parquet.read_table(columns=[...])` does:
+
+        cols = am.read_parquet(path, columns=["a", "a"])
+        len(cols)            # 2
+        cols.names           # ["a", "a"]
+        cols[0], cols[1]     # both columns, by position
+        cols["a"]            # the first one, by name
+
+    The mapping half keeps the first column of each name, which is what indexing by name gives you;
+    `names`, `columns`, `items()` and iteration are the positional truth and repeat a duplicated name.
+    """
+
+    __slots__ = ("_pairs",)
+
+    def __init__(self, pairs=()):
+        super().__init__()
+        self._pairs = [(str(n), c) for n, c in pairs]
+        for n, c in self._pairs:
+            if n not in self:
+                dict.__setitem__(self, n, c)
+
+    @property
+    def names(self):
+        """Every column name, in read order, duplicates included."""
+        return [n for n, _ in self._pairs]
+
+    @property
+    def columns(self):
+        """Every column, in read order."""
+        return [c for _, c in self._pairs]
+
+    @property
+    def pairs(self):
+        """`[(name, column), ...]` in read order."""
+        return list(self._pairs)
+
+    def column(self, i):
+        """The i-th column, by position."""
+        return self._pairs[i][1]
+
+    def columns_named(self, name):
+        """Every column with this name, in read order (empty when there is none)."""
+        return [c for n, c in self._pairs if n == name]
+
+    def __len__(self):
+        return len(self._pairs)
+
+    def __iter__(self):
+        return iter(self.names)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._pairs[key][1]
+        if isinstance(key, slice):
+            return ColumnSet(self._pairs[key])
+        return dict.__getitem__(self, key)
+
+    def keys(self):
+        return self.names
+
+    def values(self):
+        return self.columns
+
+    def items(self):
+        return list(self._pairs)
+
+    def __repr__(self):
+        return "ColumnSet(%s)" % ", ".join("%r: %s" % (n, type(c).__name__) for n, c in self._pairs)
+
+
 class ParquetFile:
     """A mapped Parquet file. Nothing but the footer is read until a column is asked for."""
 
@@ -4226,7 +4307,8 @@ class ParquetFile:
         return [int(buf[i]) for i in range(int(n))]
 
     def read(self, columns=None, row_groups=None, filters=None, dictionary=True):
-        """Decodes on the GPU and returns `{name: MetalArray}` in file order."""
+        """Decodes on the GPU and returns a `ColumnSet` -- a `{name: MetalArray}` mapping that is
+        positional underneath, so a projection naming a column twice keeps both."""
         names = None
         n_names = 0
         if columns is not None:
@@ -4243,13 +4325,13 @@ class ParquetFile:
         _check(_lib.am_parquet_read_ex(self._h, names, n_names, groups, n_groups,
                                        _filter_text(filters), 1 if dictionary else 0, ctypes.byref(out)))
         try:
-            result = {}
+            pairs = []
             for i in range(_lib.am_parquet_batch_columns(out)):
                 name = _lib.am_parquet_batch_column_name(out, i).decode()
                 h = _P()
                 _check(_lib.am_parquet_batch_column(out, i, ctypes.byref(h)))
-                result[name] = MetalArray(h)
-            return result
+                pairs.append((name, MetalArray(h)))
+            return ColumnSet(pairs)
         finally:
             _lib.am_parquet_batch_release(out)
 
@@ -4259,18 +4341,21 @@ class ParquetFile:
         `dictionary` defaults to False here so the Table's types match `pyarrow.parquet.read_table`;
         pass True to keep dictionary-encoded columns encoded."""
         cols = self.read(columns=columns, row_groups=row_groups, filters=filters, dictionary=dictionary)
-        if not cols:
+        if not len(cols):
             return pa.table({})
-        return pa.table({k: v.to_arrow() for k, v in cols.items()})
+        # Positional, so a projection naming a column twice gives a Table with both, as pyarrow does.
+        return pa.table([c.to_arrow() for c in cols.columns], names=cols.names)
 
 
 def read_parquet(path, columns=None, row_groups=None, filters=None, dictionary=True):
-    """Reads a Parquet file on the GPU and returns `{name: MetalArray}`.
+    """Reads a Parquet file on the GPU and returns a `ColumnSet` (a `{name: MetalArray}` mapping that
+    keeps its columns positionally, so a name asked for twice comes back twice).
 
     `columns` projects (only the requested column chunks are ever touched), `row_groups` selects by
     index, and `filters` is a list of `(column, op, value)` triples evaluated against the footer's
     min/max statistics, so whole row groups that cannot match are never read. `dictionary=False`
-    materialises dictionary-encoded columns instead of returning them dictionary encoded.
+    materialises dictionary-encoded columns instead of returning them dictionary encoded; either way
+    the compute functions accept the column, decoding a dictionary for you when they must.
 
         import arrowmetal as am
         cols = am.read_parquet("trades.parquet", columns=["price", "qty"],

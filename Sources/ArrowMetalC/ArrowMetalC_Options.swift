@@ -86,7 +86,8 @@ public func am_cast_ex(_ a: OpaquePointer?, _ format: UnsafePointer<CChar>?,
     let target = String(cString: format)
     let kids: [String] = childFormats.map { String(cString: $0) }
         .map { $0.isEmpty ? [] : $0.split(separator: ",").map(String.init) } ?? []
-    return optRun(out) { try x.cast(to: target, options: CastOptions(bits: flags), childFormats: kids) }
+    // A dictionary column casts as the values it stands for, the way Arrow's cast does.
+    return optRun(out) { try x.decodedIfDictionary().cast(to: target, options: CastOptions(bits: flags), childFormats: kids) }
 }
 
 // MARK: - sorts
@@ -97,7 +98,9 @@ public func am_argsort_ex(_ a: OpaquePointer?, _ descending: Int32, _ nullPlacem
                           _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
     guard let x = optHandle(a) else { return 2 }
     return optRun(out) {
-        .int32(try x.argsortIndices(descending: descending != 0, nullPlacement: placement(nullPlacement)))
+        // Sorting a dictionary column orders it by its values; the codes carry no order of their own.
+        .int32(try x.decodedIfDictionary().argsortIndices(descending: descending != 0,
+                                                          nullPlacement: placement(nullPlacement)))
     }
 }
 

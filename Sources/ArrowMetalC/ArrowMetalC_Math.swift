@@ -100,7 +100,8 @@ private func withMath<R>(_ a: AnyMetalArray, _ body: (any MathOps) throws -> R) 
         case .int32(let x): return try body(x)
         case .int64(let x): return try body(x)
         }
-    case .dictionary: throw ArrowMetalError.unsupportedType("decode the dictionary array first")
+    // A dictionary column stands for its values and the maths kernels cannot run on codes: decode once.
+    case .dictionary: return try withMath(try a.decodedIfDictionary(), body)
     case .decimal(let d): throw ArrowMetalError.unsupportedType("\(d.type) columns use am_decimal_op, not this entry point")
     case .list, .structure, .map, .union:
         throw ArrowMetalError.unsupportedType("operation needs a primitive array, got \(a.arrowFormat)")
@@ -129,7 +130,7 @@ public func am_binary(_ a: OpaquePointer?, _ op: Int32, _ b: OpaquePointer?, _ s
     guard let x = handle(a) else { return 2 }
     if let b {
         guard let y = handle(b) else { return 2 }
-        return run(out) { try withMath(x) { try $0.amBinaryArray(op, y) } }
+        return run(out) { try withMath(x) { try $0.amBinaryArray(op, try y.decodedIfDictionary()) } }
     }
     guard let scalar else { return 2 }
     return run(out) { try withMath(x) { try $0.amBinaryScalar(op, scalar) } }

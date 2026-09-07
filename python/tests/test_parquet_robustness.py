@@ -305,22 +305,77 @@ def test_unknown_column_and_row_group_raise(workdir):
             f.read(row_groups=[5])
 
 
-@pytest.mark.xfail(strict=True, reason="REVIEW: ParquetFile.read returns a dict, so a column named "
-                                       "twice collapses to one entry instead of being read twice "
-                                       "or rejected")
 def test_duplicate_projection_names(workdir):
     path = _write(workdir, "dup.parquet", pa.table({"a": pa.array([1, 2, 3], pa.int64())}))
     with am.ParquetFile(path) as f:
         assert f.read_table(columns=["a", "a"]).column_names == ["a", "a"]
 
 
-# --------------------------------------------------------------------------------------------
-# Two contracts the docs state that the code does not keep.
+def test_duplicate_projection_reads_the_column_twice(workdir):
+    """`read` is positional underneath, so a name asked for twice comes back twice, as pyarrow does."""
+    path = _write(workdir, "dup2.parquet", pa.table({
+        "a": pa.array([1, 2, 3], pa.int64()),
+        "b": pa.array(["x", "y", "z"]),
+    }))
+    with am.ParquetFile(path) as f:
+        cols = f.read(columns=["a", "b", "a"])
+        assert len(cols) == 3
+        assert cols.names == ["a", "b", "a"]
+        assert list(cols) == ["a", "b", "a"]
+        assert [n for n, _ in cols.items()] == ["a", "b", "a"]
+        assert cols[0].to_arrow().to_pylist() == [1, 2, 3]
+        assert cols[2].to_arrow().to_pylist() == [1, 2, 3]
+        assert cols["a"].to_arrow().to_pylist() == [1, 2, 3]      # by name: the first one
+        assert len(cols.columns_named("a")) == 2
+        assert f.read_table(columns=["a", "b", "a"]).column_names == ["a", "b", "a"]
+    # Same through the module-level entry point.
+    assert am.read_parquet(path, columns=["a", "a"]).names == ["a", "a"]
+    assert am.read_parquet_table(path, columns=["a", "a"]).column_names == ["a", "a"]
 
-@pytest.mark.xfail(strict=True, reason="REVIEW: read_parquet defaults to dictionary=True, and no "
-                                       "reduction accepts a dictionary array, so the documented "
-                                       "`am.read_parquet(p)['price'].sum()` raises on any column "
-                                       "pyarrow dictionary-encoded (which is its default)")
+
+def test_a_file_with_two_columns_of_the_same_name_reads_both(workdir):
+    """pyarrow will write one, and dropping the second silently would lose data."""
+    table = pa.table([pa.array([1, 2, 3], pa.int64()), pa.array([4, 5, 6], pa.int64())],
+                     names=["a", "a"])
+    path = _write(workdir, "dupfile.parquet", table)
+    with am.ParquetFile(path) as f:
+        assert f.column_names == ["a", "a"]
+        cols = f.read()
+        assert len(cols) == 2
+        assert cols.names == ["a", "a"]
+        assert cols[0].to_arrow().to_pylist() == [1, 2, 3]
+        assert cols[1].to_arrow().to_pylist() == [4, 5, 6]
+        t = f.read_table()
+        assert t.column_names == ["a", "a"]
+        assert t.column(1).to_pylist() == [4, 5, 6]
+
+
+def test_column_set_still_behaves_like_the_mapping_it_replaces(workdir):
+    """Everything that worked when `read` returned a plain dict keeps working."""
+    path = _write(workdir, "mapping.parquet", pa.table({
+        "a": pa.array([1, 2, 3], pa.int64()),
+        "b": pa.array([1.5, 2.5, 3.5]),
+    }))
+    cols = am.read_parquet(path)
+    assert isinstance(cols, dict)
+    assert set(cols) == {"a", "b"} and len(cols) == 2
+    assert "a" in cols and "zz" not in cols
+    assert cols.get("zz") is None
+    assert sorted(dict(cols)) == ["a", "b"]
+    assert list(cols.values())[0] is cols["a"]
+    with pytest.raises(KeyError):
+        cols["zz"]
+    # A dict of arrays is what query() and write_parquet() take. (The fused expression compiler still
+    # wants materialised columns, which is why this reads with dictionary=False; see docs/PARQUET.md.)
+    plain = am.read_parquet(path, dictionary=False)
+    assert am.query(plain, am.Query().aggregate([("sum", "s", am.col("a"))])) == 6
+    out = am.write_parquet(plain, os.path.join(workdir, "mapping-out.parquet"))
+    assert pq.read_table(out).column_names == ["a", "b"]
+
+
+# --------------------------------------------------------------------------------------------
+# Two contracts the docs state that the code did not keep.
+
 def test_reduction_on_a_dictionary_encoded_column(workdir):
     """The example in `read_parquet`'s docstring and in docs/PARQUET.md, run as written."""
     path = _write(workdir, "dictred.parquet",
@@ -330,10 +385,72 @@ def test_reduction_on_a_dictionary_encoded_column(workdir):
     assert cols["price"].sum() == sum(float(i % 97) for i in range(20000))
 
 
-@pytest.mark.xfail(strict=True, reason="REVIEW: the argument-validation paths return 2 without "
-                                       "calling setError, so am_last_error() still holds an "
-                                       "unrelated earlier failure and the caller is told the wrong "
-                                       "thing")
+def _dictionary_column(workdir, name="dictops.parquet"):
+    """A float column pyarrow dictionary-encoded, read back still encoded (the default)."""
+    values = [float(i % 7) for i in range(4096)]
+    path = _write(workdir, name, pa.table({"v": pa.array(values, pa.float64())}),
+                  compression="snappy", use_dictionary=True)
+    col = am.read_parquet(path, columns=["v"], dictionary=True)["v"]
+    assert pa.types.is_dictionary(col.type), "not dictionary encoded: %s" % col.type
+    return values, col
+
+
+def test_every_entry_point_that_needs_values_decodes_a_dictionary(workdir):
+    """One dictionary-encoded column through each C entry point that cannot work on the codes.
+
+    The oracle is the same column materialised: `am_reduce` (sum/min/max/mean), `am_reduce_ex` (the
+    statistical aggregates), `am_compare_scalar`, `am_compare_array`, `am_arith_scalar`,
+    `am_arith_array`, `am_cast` / `am_cast_ex`, `am_filter_where`, `am_argsort` / `am_argsort_ex`,
+    `am_sort`, `am_top_k` and the maths kernels (`am_unary`, `am_binary`, `am_cumulative`) all decode
+    first, so every one of them answers what the materialised column answers.
+    """
+    values, col = _dictionary_column(workdir)
+    plain = am.array(values)
+    listed = lambda a: a.to_arrow().to_pylist()
+
+    assert col.sum() == plain.sum() == pytest.approx(sum(values))        # am_reduce
+    assert col.min() == plain.min() and col.max() == plain.max()
+    assert col.mean() == pytest.approx(plain.mean())
+    assert col.stddev() == pytest.approx(plain.stddev())                 # am_reduce_ex
+    assert col.quantile(0.5) == pytest.approx(plain.quantile(0.5))
+    assert col.mode() == plain.mode()
+
+    # am_compare_scalar / am_compare_array, with the dictionary on either side.
+    assert listed(col > 3.0) == listed(plain > 3.0)
+    assert listed(col == plain) == [True] * len(values)
+    assert listed(plain == col) == [True] * len(values)
+    assert listed(col != plain) == [False] * len(values)
+    assert listed(col + 1.0) == listed(plain + 1.0)                      # am_arith_scalar
+    assert listed(col + plain) == listed(plain + plain)                  # am_arith_array
+    assert listed(plain * col) == listed(plain * plain)
+    assert listed(col.cast("int64")) == listed(plain.cast("int64"))      # am_cast_ex
+    assert listed(col.filter_where(">", 5.0)) == listed(plain.filter_where(">", 5.0))
+    assert listed(col.filter(col > 5.0)) == listed(plain.filter(plain > 5.0))
+    assert listed(col.argsort()) == listed(plain.argsort())              # am_argsort_ex
+    assert listed(col.argsort(null_placement="at_start")) == \
+        listed(plain.argsort(null_placement="at_start"))
+    assert listed(col.sort()) == sorted(values)
+    # `argsort` / `sort` are the _ex spellings; the plain entry points decode too.
+    from arrowmetal import _call, _lib
+    assert listed(_call(_lib.am_argsort, col._h, 0)) == listed(plain.argsort())    # am_argsort
+    assert listed(_call(_lib.am_sort, col._h, 0)) == sorted(values)                # am_sort
+    assert listed(col.top_k(3)) == listed(plain.top_k(3))                # am_top_k
+    assert listed(col.abs()) == listed(plain.abs())                      # am_unary
+    assert listed(col.power(2.0)) == listed(plain.power(2.0))            # am_binary (scalar)
+    assert listed(col.power(plain)) == listed(plain.power(plain))        # am_binary (array)
+    assert listed(col.cumulative_sum()) == listed(plain.cumulative_sum())  # am_cumulative
+
+
+def test_a_dictionary_string_column_is_still_a_dictionary(workdir):
+    """Decoding happens only where the codes cannot be used; string kernels keep the encoding."""
+    path = _write(workdir, "dictstr.parquet",
+                  pa.table({"s": pa.array(["aa", "bb", "aa", "cc"] * 64)}),
+                  compression="snappy", use_dictionary=True)
+    col = am.read_parquet(path, columns=["s"], dictionary=True)["s"]
+    assert pa.types.is_dictionary(col.type)
+    assert col.to_arrow().to_pylist() == ["aa", "bb", "aa", "cc"] * 64
+
+
 def test_argument_errors_set_an_error_message(workdir):
     """`return 2` must leave a message behind, or the C caller reads a stale one."""
     import ctypes
@@ -350,3 +467,108 @@ def test_argument_errors_set_an_error_message(workdir):
         message = (_lib.am_last_error() or b"").decode()
         assert "no column named nope" not in message, "stale message: %r" % message
         assert message, "no message at all for a NULL out-pointer"
+
+
+def test_every_parquet_entry_point_names_the_argument_it_rejected(workdir):
+    """Each `am_parquet_*` failure path names its own function and the argument at fault.
+
+    The message is what the Python layer raises, so a NULL or out-of-range argument has to overwrite
+    the thread-local slot rather than leave whatever failed last in it.
+    """
+    import ctypes
+    from arrowmetal import _lib, _P
+
+    path = _write(workdir, "argerr.parquet", pa.table({"a": pa.array([1, 2, 3], pa.int64())}))
+    names = (ctypes.c_char_p * 1)(b"a")
+    groups = (ctypes.c_int64 * 1)(0)
+    out = _P()
+
+    def seed_an_unrelated_failure(f):
+        """Leave a message about a different call in the thread-local slot."""
+        with pytest.raises(am.ArrowMetalError):
+            f.read(columns=["nope"])
+        assert "no column named nope" in (_lib.am_last_error() or b"").decode()
+
+    def check(f, name, expect, call):
+        seed_an_unrelated_failure(f)
+        rc = call()
+        assert rc in (-1, 2), "%s: expected a failure, got rc=%r" % (name, rc)
+        message = (_lib.am_last_error() or b"").decode()
+        assert "no column named nope" not in message, "%s: stale message %r" % (name, message)
+        assert name in message, "%s: message does not name the function: %r" % (name, message)
+        for word in expect:
+            assert word in message, "%s: message does not name %r: %r" % (name, word, message)
+
+    with am.ParquetFile(path) as f:
+        cases = [
+            # am_parquet_open
+            ("am_parquet_open", ["path"], lambda: _lib.am_parquet_open(None, ctypes.byref(out))),
+            ("am_parquet_open", ["out"], lambda: _lib.am_parquet_open(str(path).encode(), None)),
+            # am_parquet_read_ex, one case per argument it validates
+            ("am_parquet_read_ex", ["f"],
+             lambda: _lib.am_parquet_read_ex(None, names, 1, None, 0, None, 1, ctypes.byref(out))),
+            ("am_parquet_read_ex", ["out"],
+             lambda: _lib.am_parquet_read_ex(f._h, names, 1, None, 0, None, 1, None)),
+            ("am_parquet_read_ex", ["n_columns"],
+             lambda: _lib.am_parquet_read_ex(f._h, names, -1, None, 0, None, 1, ctypes.byref(out))),
+            ("am_parquet_read_ex", ["columns", "n_columns"],
+             lambda: _lib.am_parquet_read_ex(f._h, None, 2, None, 0, None, 1, ctypes.byref(out))),
+            ("am_parquet_read_ex", ["n_row_groups"],
+             lambda: _lib.am_parquet_read_ex(f._h, names, 1, groups, -1, None, 1, ctypes.byref(out))),
+            ("am_parquet_read_ex", ["row_groups", "n_row_groups"],
+             lambda: _lib.am_parquet_read_ex(f._h, names, 1, None, 1, None, 1, ctypes.byref(out))),
+            # am_parquet_selected_row_groups
+            ("am_parquet_selected_row_groups", ["f"],
+             lambda: _lib.am_parquet_selected_row_groups(None, None, None, 0)),
+            ("am_parquet_selected_row_groups", ["cap"],
+             lambda: _lib.am_parquet_selected_row_groups(f._h, None, None, -1)),
+            ("am_parquet_selected_row_groups", ["out", "cap"],
+             lambda: _lib.am_parquet_selected_row_groups(f._h, None, None, 4)),
+            # the file accessors, whose -1 is a failure like any other
+            ("am_parquet_num_rows", ["f"], lambda: _lib.am_parquet_num_rows(None)),
+            ("am_parquet_num_row_groups", ["f"], lambda: _lib.am_parquet_num_row_groups(None)),
+            ("am_parquet_num_columns", ["f"], lambda: _lib.am_parquet_num_columns(None)),
+            ("am_parquet_row_group_rows", ["f"], lambda: _lib.am_parquet_row_group_rows(None, 0)),
+            ("am_parquet_row_group_rows", ["row group 7"],
+             lambda: _lib.am_parquet_row_group_rows(f._h, 7)),
+            # the batch accessors
+            ("am_parquet_batch_columns", ["b"], lambda: _lib.am_parquet_batch_columns(None)),
+            ("am_parquet_batch_rows", ["b"], lambda: _lib.am_parquet_batch_rows(None)),
+            ("am_parquet_batch_column", ["b"],
+             lambda: _lib.am_parquet_batch_column(None, 0, ctypes.byref(out))),
+        ]
+        for name, expect, call in cases:
+            check(f, name, expect, call)
+
+        # A live batch, for the two am_parquet_batch_column cases that need one.
+        batch = _P()
+        assert _lib.am_parquet_read_ex(f._h, names, 1, None, 0, None, 1, ctypes.byref(batch)) == 0
+        try:
+            check(f, "am_parquet_batch_column", ["out"],
+                  lambda: _lib.am_parquet_batch_column(batch, 0, None))
+            check(f, "am_parquet_batch_column", ["column index 9"],
+                  lambda: _lib.am_parquet_batch_column(batch, 9, ctypes.byref(out)))
+        finally:
+            _lib.am_parquet_batch_release(batch)
+
+        # The writer half of the ABI validates the same way.
+        one = am.array([1, 2, 3])
+        handles = (_P * 1)(one._h)
+        wnames = (ctypes.c_char_p * 1)(b"a")
+        target = os.path.join(workdir, "argerr-out.parquet").encode()
+        for expect, call in [
+            (["path"], lambda: _lib.am_parquet_write(None, handles, wnames, 1, b"none", 0, 0)),
+            (["columns"], lambda: _lib.am_parquet_write(target, None, wnames, 1, b"none", 0, 0)),
+            (["names"], lambda: _lib.am_parquet_write(target, handles, None, 1, b"none", 0, 0)),
+            (["n_columns"], lambda: _lib.am_parquet_write(target, handles, wnames, 0, b"none", 0, 0)),
+        ]:
+            check(f, "am_parquet_write", expect, call)
+
+
+def test_a_bad_filter_string_is_reported_not_ignored(workdir):
+    """`selected_row_groups` used to swallow a filter it could not parse and keep every row group."""
+    path = _write(workdir, "badfilter.parquet", pa.table({"a": pa.array([1, 2, 3], pa.int64())}))
+    with am.ParquetFile(path) as f:
+        with pytest.raises(am.ArrowMetalError) as e:
+            f.selected_row_groups("a is 3")
+        assert "comparison operator" in str(e.value)

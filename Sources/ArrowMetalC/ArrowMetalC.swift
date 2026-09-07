@@ -92,7 +92,11 @@ private func withPrimitive<R>(_ a: AnyMetalArray, _ body: (any PrimitiveOps) thr
     case .float64(let x): return try body(x)
     case .boolean: throw ArrowMetalError.unsupportedType("operation needs a primitive array, got boolean")
     case .string: throw ArrowMetalError.unsupportedType("operation needs a primitive array, got utf8")
-    case .temporal, .binary, .dictionary, .decimal, .list, .structure, .map, .union, .runEndEncoded:
+    // A dictionary-encoded column stands for its values, and none of these operations can work on the
+    // codes, so decode once and carry on. That is what makes `read_parquet(p)["price"].sum()` run on a
+    // column pyarrow dictionary-encoded.
+    case .dictionary: return try withPrimitive(try a.decodedIfDictionary(), body)
+    case .temporal, .binary, .decimal, .list, .structure, .map, .union, .runEndEncoded:
         throw ArrowMetalError.unsupportedType("operation needs a primitive array, got \(a.arrowFormat)")
     // float16 computes through its float32 widening; the narrow decimals through decimal128.
     case .float16(let x): return try body(try x.toFloat32())
@@ -242,7 +246,7 @@ public func am_compare_array(_ a: OpaquePointer?, _ op: Int32, _ b: OpaquePointe
             return .boolean(try d.compare(try cmpOp(op), e))
         }
     }
-    return run(out) { .boolean(try withPrimitive(x) { try $0.compareArray(try cmpOp(op), y) }) }
+    return run(out) { .boolean(try withPrimitive(x) { try $0.compareArray(try cmpOp(op), try y.decodedIfDictionary()) }) }
 }
 @_cdecl("am_arith_scalar")
 public func am_arith_scalar(_ a: OpaquePointer?, _ op: Int32, _ scalar: UnsafeRawPointer?, _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
@@ -252,7 +256,7 @@ public func am_arith_scalar(_ a: OpaquePointer?, _ op: Int32, _ scalar: UnsafeRa
 @_cdecl("am_arith_array")
 public func am_arith_array(_ a: OpaquePointer?, _ op: Int32, _ b: OpaquePointer?, _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
     guard let x = handle(a), let y = handle(b) else { return 2 }
-    return run(out) { try withPrimitive(x) { try $0.arithArray(try arithOp(op), y) } }
+    return run(out) { try withPrimitive(x) { try $0.arithArray(try arithOp(op), try y.decodedIfDictionary()) } }
 }
 @_cdecl("am_cast")
 public func am_cast(_ a: OpaquePointer?, _ format: UnsafePointer<CChar>?, _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
@@ -310,13 +314,17 @@ public func am_slice(_ a: OpaquePointer?, _ offset: Int64, _ length: Int64, _ ou
 @_cdecl("am_argsort")
 public func am_argsort(_ a: OpaquePointer?, _ descending: Int32, _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
     guard let x = handle(a) else { return 2 }
-    return run(out) { .int32(try x.argsortIndices(descending: descending != 0)) }
+    // A dictionary column sorts by its values; its codes carry no order of their own.
+    return run(out) { .int32(try x.decodedIfDictionary().argsortIndices(descending: descending != 0)) }
 }
 /// Sorted copy of the array (stable, nulls last). Same element type as the input.
 @_cdecl("am_sort")
 public func am_sort(_ a: OpaquePointer?, _ descending: Int32, _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
     guard let x = handle(a) else { return 2 }
-    return run(out) { try x.take(try x.argsortIndices(descending: descending != 0)) }
+    return run(out) {
+        let v = try x.decodedIfDictionary()
+        return try v.take(try v.argsortIndices(descending: descending != 0))
+    }
 }
 /// Indices of the k largest (or smallest) values, in sorted order. Output is int32.
 @_cdecl("am_top_k")

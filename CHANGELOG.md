@@ -180,7 +180,14 @@ Fixed
   - Parquet: nine ways a corrupt file could hang, trap or read out of bounds (unbounded BYTE_ARRAY
     lengths, varint overflow traps, unbounded Thrift nesting, unchecked schema cursors, negative offsets
     and sizes in footer and page headers, oversized dictionaries and FLBA lengths) now error; an explicit
-    empty projection returned every column.
+    empty projection returned every column. A projection naming a column twice (and a file with two
+    columns of one name) lost one of them, because the Python read returned a plain dict; it now returns
+    a positional `ColumnSet`. A dictionary-encoded column — what `read_parquet` returns by default —
+    was refused by every reduction, arithmetic, comparison, cast and sort entry point, so the documented
+    `read_parquet(p)["price"].sum()` raised; those entry points now decode the codes on the way in. The
+    argument-validation paths returned 2 without setting the error string, so `am_last_error()` handed
+    the caller an unrelated earlier failure; every non-zero return now names the function and the
+    argument, and a filter string `selected_row_groups` could not parse is reported instead of dropped.
   - Kernels: `lexsort` ignored `null_placement` on a utf8/binary key; the regex pre-filter claimed a
     literal no-match for three pattern shapes; `partition_nth_indices` left a NaN behind when nulls
     moved to the front.
