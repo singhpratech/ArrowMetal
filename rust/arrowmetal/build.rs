@@ -11,5 +11,8 @@ fn main() {
     let dir = std::env::var("DEP_ARROWMETALC_LIB_DIR")
         .expect("arrowmetal-sys did not publish DEP_ARROWMETALC_LIB_DIR; its build script failed");
     println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
-    println!("cargo:rustc-env=ARROWMETAL_LIB_DIR={dir}");
+    // Deliberately not named ARROWMETAL_LIB_DIR: that is a user-facing *input* to the search in
+    // arrowmetal-sys/build.rs, and a compile-time env of the same name reads confusingly in
+    // `env!(..)` and shadows the input's meaning for anyone grepping. This is the resolved output.
+    println!("cargo:rustc-env=ARROWMETAL_LINKED_LIB_DIR={dir}");
 }

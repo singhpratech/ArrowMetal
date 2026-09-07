@@ -189,18 +189,6 @@ pub mod ffi {
             b: *mut am_array,
             out: *mut *mut am_array,
         ) -> c_int;
-        pub fn am_arith_scalar(
-            a: *mut am_array,
-            op: c_int,
-            scalar: *const c_void,
-            out: *mut *mut am_array,
-        ) -> c_int;
-        pub fn am_arith_array(
-            a: *mut am_array,
-            op: c_int,
-            b: *mut am_array,
-            out: *mut *mut am_array,
-        ) -> c_int;
         pub fn am_cast(a: *mut am_array, format: *const c_char, out: *mut *mut am_array) -> c_int;
 
         // -- selection --------------------------------------------------------------------------

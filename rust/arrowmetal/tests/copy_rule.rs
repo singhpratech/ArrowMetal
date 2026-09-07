@@ -25,8 +25,19 @@ fn alignment_of(p: *const u8) -> usize {
     1usize << addr.trailing_zeros().min(usize::BITS - 1)
 }
 
-fn buffer_alignments(a: &dyn arrow::array::Array) -> Vec<usize> {
-    a.to_data().buffers().iter().map(|b| alignment_of(b.as_ptr())).collect()
+/// The alignment of every buffer **as ArrowMetal will see it**, validity bitmap included.
+///
+/// `ArrayData::buffers()` is the wrong thing to measure: it excludes the null bitmap, which lives in
+/// `ArrayData::nulls()` and is buffer 0 of the C Data Interface array. An earlier version of this
+/// file used it and therefore never looked at validity at all. Exporting through `arrow::ffi` and
+/// reading `FFI_ArrowArray::buffer(i)` gives exactly the pointers `am_import` receives, in the
+/// order it receives them, so there is nothing left to get wrong.
+///
+/// Index 0 is the validity bitmap for a primitive array (null when the array has no nulls) and
+/// index 1 the values.
+fn ffi_buffer_alignments(a: &dyn arrow::array::Array) -> Vec<usize> {
+    let (ffi_array, _schema) = arrow::ffi::to_ffi(&a.to_data()).expect("to_ffi");
+    (0..ffi_array.num_buffers()).map(|i| alignment_of(ffi_array.buffer(i))).collect()
 }
 
 /// arrow-rs builds a values buffer two different ways, and they do not use the same allocator.
@@ -63,70 +74,108 @@ fn arrow_rs_buffer_page_alignment_by_size_and_path() {
     const TRIALS: usize = 32;
     let sizes: &[usize] = &[16, 512, 8_192, 131_072, 1_250_000, 10_000_000];
 
-    println!("\narrow-rs values-buffer alignment, {TRIALS} allocations each (page = {PAGE} B)");
-    println!("| elements | bytes | path | page aligned | min alignment seen |");
+    println!("\narrow-rs buffer alignment as exported through the C Data Interface,");
+    println!("{TRIALS} allocations each (page = {PAGE} B). A copied buffer is one that is not");
+    println!("page aligned. `Collected` arrays carry a validity bitmap; `FromVec` ones do not.");
+    println!("| elements | values bytes | path | values page aligned | validity page aligned |");
     println!("|---|---|---|---|---|");
 
-    let mut small_miss = false;
+    let mut small_values_miss = false;
     let mut large_from_vec_page_aligned = 0usize;
+    let mut validity_rows: Vec<(usize, usize)> = Vec::new();
 
     for &path in &[Path::FromVec, Path::Collected] {
         for &n in sizes {
             let mut live = Vec::with_capacity(TRIALS); // hold them so no two reuse one address
-            let mut aligned = 0usize;
-            let mut min_seen = usize::MAX;
+            let mut values_aligned = 0usize;
+            let mut validity_aligned = 0usize;
+            let mut validity_present = 0usize;
             for t in 0..TRIALS {
                 let a = build(path, n, t as i64);
-                // Buffer 0 of a `Collected` array is the validity bitmap; the values buffer is the
-                // last one either way, and it is the big one the copy rule turns on.
-                let als = buffer_alignments(a.as_ref());
-                let values_alignment = *als.last().unwrap();
-                min_seen = min_seen.min(values_alignment);
-                if values_alignment % PAGE == 0 {
-                    aligned += 1;
+                let als = ffi_buffer_alignments(a.as_ref());
+                // Buffer 0 is validity (0 when absent), buffer 1 the values.
+                let validity = als.first().copied().unwrap_or(0);
+                let values = als.get(1).copied().unwrap_or(0);
+                if values != 0 && values % PAGE == 0 {
+                    values_aligned += 1;
+                }
+                if validity != 0 {
+                    validity_present += 1;
+                    if validity % PAGE == 0 {
+                        validity_aligned += 1;
+                    }
                 }
                 live.push(a);
             }
-            println!(
-                "| {n} | {} | {path:?} | {aligned}/{TRIALS} | {min_seen} |",
-                n * 8
-            );
-            if n <= 512 && aligned < TRIALS {
-                small_miss = true;
+            let validity_cell = if validity_present == 0 {
+                "no validity buffer".to_string()
+            } else {
+                format!("{validity_aligned}/{validity_present}")
+            };
+            println!("| {n} | {} | {path:?} | {values_aligned}/{TRIALS} | {validity_cell} |", n * 8);
+
+            if n <= 512 && values_aligned < TRIALS {
+                small_values_miss = true;
             }
             if n == 10_000_000 && matches!(path, Path::FromVec) {
-                large_from_vec_page_aligned = aligned;
+                large_from_vec_page_aligned = values_aligned;
+            }
+            if validity_present > 0 {
+                validity_rows.push((n, validity_aligned));
             }
             drop(live);
         }
     }
 
     assert!(
-        small_miss,
-        "every small arrow-rs buffer was page aligned on this machine; the copy path in \
+        small_values_miss,
+        "every small arrow-rs values buffer was page aligned on this machine; the copy path in \
          `am_import` is then never exercised by these tests and docs/RUST.md needs re-measuring"
     );
     println!(
-        "\n10M-element Int64Array::from(Vec): {large_from_vec_page_aligned}/{TRIALS} page aligned \
-         -- this is the size the benchmark imports, so its import cost follows from this row"
+        "\n10M-element Int64Array::from(Vec): {large_from_vec_page_aligned}/{TRIALS} values page \
+         aligned -- this is the size the benchmark imports, so its import cost follows from this row"
+    );
+    println!("validity bitmaps, page aligned out of {TRIALS}: {validity_rows:?}");
+    println!(
+        "A validity bitmap is n/8 bytes, so it reaches the allocator's page-granted sizes far later \
+         than the values buffer does: a nullable column of well under ~130k rows normally has its \
+         bitmap copied (about a kilobyte) while its values stay wrapped."
     );
 }
 
 /// Copy-free out: an array ArrowMetal exported is backed by an `MTLBuffer` in shared memory, whose
 /// contents pointer is page aligned. That is both the evidence for "copy-free out" and the reason an
 /// exported array re-imports without a copy whatever the original alignment was.
+///
+/// Every input here has nulls, so **both** buffers are exercised — the validity bitmap as well as
+/// the values. That matters: the bitmap is the buffer arrow-rs is least likely to hand over page
+/// aligned on the way in, so the fact that ArrowMetal always hands it back aligned is what makes an
+/// ArrowMetal-to-ArrowMetal hop free in both buffers.
 #[test]
 fn arrowmetal_exported_buffers_are_page_aligned() {
     for n in [1usize, 1000, 100_001, 1_000_001] {
         let a: ArrayRef = Arc::new(
             (0..n as i64).map(|i| if i % 5 == 0 { None } else { Some(i) }).collect::<Int64Array>(),
         );
+        assert!(a.null_count() > 0, "n={n}: this test needs a validity bitmap to measure");
+
         let out = arrowmetal::Array::from_arrow(a.as_ref()).unwrap().to_arrow().unwrap();
 
-        let alignments = buffer_alignments(out.as_ref());
-        println!("n={n}: ArrowMetal exported buffer alignments {alignments:?} (page = {PAGE})");
-        for al in &alignments {
-            assert_eq!(al % PAGE, 0, "n={n}: an exported buffer was aligned to only {al} bytes");
+        let alignments = ffi_buffer_alignments(out.as_ref());
+        println!(
+            "n={n}: ArrowMetal exported buffer alignments [validity, values] = {alignments:?} \
+             (page = {PAGE})"
+        );
+        assert_eq!(alignments.len(), 2, "n={n}: expected a validity and a values buffer");
+        for (i, al) in alignments.iter().enumerate() {
+            let which = if i == 0 { "validity" } else { "values" };
+            assert_ne!(*al, 0, "n={n}: the {which} buffer was null on export");
+            assert_eq!(
+                al % PAGE,
+                0,
+                "n={n}: the exported {which} buffer was aligned to only {al} bytes"
+            );
         }
     }
 }
