@@ -2,6 +2,10 @@
 
 ## 2026-09-06, Apple M4 Max, round 8: what real binary64 costs
 
+> **Superseded by the 2026-09-07 matrix** — `sqrt` is now 3.95 ms at 50M rows, 3.1x the fastest CPU
+> library (`Benchmarks/results/full_matrix_2026-09-07.csv`), so re-running the reproduce line below will
+> not produce the table that follows it. Kept for the before/after of removing the float detour.
+
 50M Float64 rows, best of 5, release build, against numpy 2.5, pyarrow 25 and Polars 1.44 on the same
 data. Reproduce with `PYTHONPATH=python python Benchmarks/float64_math_bench.py`.
 
@@ -22,10 +26,11 @@ correctly rounded, the rest within 1 ulp. Here is the bill.
 
 Read that honestly: the old kernels were memory bound at 250 GB/s because they were doing float32 work on
 float64 data. The new ones are compute bound on forty-odd software binary64 operations per element, and a
-logarithm costs 25x more than it used to. It still beats every CPU library on the same machine, but by
-1.1-2x rather than by the 25x the old `ln` would have shown — and the old `ln`'s answer was wrong in the
-ninth digit. The float32 kernels are untouched and still run at 200-240 GB/s (`ln` on float32: 1.7 ms,
-45x the fastest CPU), so a column that does not need sixteen digits should not be float64.
+logarithm costs 25x more than it used to. It still matches or beats every CPU library on the same machine,
+by 1.0-2x rather than by the 25x the old `ln` would have shown — `sqrt` is an exact tie — and the old
+`ln`'s answer was wrong in the ninth digit. The float32 kernels are untouched and still run at
+200-240 GB/s (`ln` on float32: 1.7 ms, 45x the fastest CPU), so a column that does not need sixteen
+digits should not be float64.
 
 Two arithmetic ops moved the other way in the same round, from reworking `DoubleMath` itself — `clz`
 normalisation instead of shift loops, four 32x32 partial products instead of an emulated 64x64, and a
@@ -94,11 +99,15 @@ Findings:
   on Float64 (138 vs 149 ms) because the sorted copy adds a gather.
 - String predicates are where the GPU is furthest ahead: 1.1 to 1.8 ms against 32 to 148 ms, i.e. 20x to 90x
   Polars and pyarrow, at 100 to 155 GB/s over the utf8 data buffer.
-- `top_k` is currently a full argsort plus a slice, so a CPU running top-k selection (which touches each
-  value once and rarely writes) wins by 65x. A partial radix / threadgroup selection kernel is the fix.
-- `dictionaryEncode` still runs on the CPU and allocates per row, which dominates the string group-by
-  (750 ms of the 751). Once codes exist, the GPU group-by over 10M string keys is 1.2 ms, 12x the all-core
-  CPU hash group-by and 13x pyarrow. Hashing on the GPU (`hash32` already exists) is the obvious next step.
+- *As of 2026-09-06, since fixed:* `top_k` was a full argsort plus a slice, so a CPU running top-k
+  selection (which touches each value once and rarely writes) won by 65x. A partial radix / threadgroup
+  selection kernel was the fix. In the 2026-09-07 matrix `top_k (k=100, int64)` at 50M rows is 2.68 ms
+  against pyarrow's 24.00 ms, an 8.9x win.
+- *As of 2026-09-06, since fixed:* `dictionaryEncode` ran on the CPU and allocated per row, which
+  dominated the string group-by (750 ms of the 751). Once codes existed, the GPU group-by over 10M string
+  keys was 1.2 ms, 12x the all-core CPU hash group-by and 13x pyarrow. Hashing moved onto the GPU; in the
+  2026-09-07 matrix `dictionary_encode (utf8)` at 10M rows is 5.38 ms against 113.71 ms for the fastest
+  CPU library (Polars), a 21.1x win.
 - String `filter` is the one string kernel the CPU still wins (2.7 vs 4.7 ms): the byte gather is
   short-string dominated, one thread per row copying ~13 bytes.
 
@@ -134,8 +143,9 @@ Reproduce: `swift build -c release && .build/release/arrowmetal-bench 50000000 5
 A GPU query costs the CPU well under a millisecond; the same work on the CPU costs 50 to 1200
 CPU-milliseconds, which is time the rest of the application does not get.
 
-Float64 sum, add, sub, mul, div now run on the GPU through software IEEE-754 (bit-exact; see round 6 in
-docs/FINDINGS.md).
+Float64 add, sub, mul and div now run on the GPU through software IEEE-754 and are bit-exact against
+Swift's `Double`; `sum` accumulates in tree order, so it differs from a sequential CPU sum by reordering
+only (see round 6 in docs/FINDINGS.md).
 
 
 ## 2026-09-06, Apple M4 Max, round 5: lengths flow on the GPU

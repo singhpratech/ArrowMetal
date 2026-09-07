@@ -14,8 +14,9 @@ the measured state behind each item is in [LOSSES.md](LOSSES.md) and the benchma
   a first-class input to every kernel turns slices, concatenations and shifts into pointers.
 - **A GPU regular-expression engine.** A compiled automaton kernel behind the existing pre-filter, so a
   real regex stops being the one string operation that runs on the host.
-- **Faster correct doubles.** `ln`, `sin` and `days_between` are correct to 1 ulp and 1.1x to 2x over
-  the CPU; a better range reduction or polynomial is a direct path to 3x.
+- **Faster correct doubles.** `ln`, `sin` and `days_between` are correct to 2 ulp and only 1.04x to 1.99x
+  over the fastest CPU library in the 2026-09-07 matrix; a better range reduction or polynomial is a
+  direct path to 3x.
 - **Float64 sum and mean with very few groups** take the one-threadgroup-per-group segmented path
   (35 ms for 10M rows in one group against 4.6 ms at a thousand); a work-stealing split is the fix.
 

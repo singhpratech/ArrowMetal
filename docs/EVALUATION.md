@@ -13,7 +13,7 @@ it and compares, so a kernel that is wrong in an unanticipated way still fails.
 |---|---|
 | Files | `python/tests/test_differential.py` (the harness), `python/tests/differential_report.py` (the runner) |
 | Oracle | `pyarrow.compute` 25.0.1, plus a reference written in the harness for the 16 operations Arrow has no function for |
-| Cases in the default matrix | 39,069 — 212 operations x 45 column types x 27 datasets — about 220 s on an M4 Max; more with `DIFF_LARGE=1` |
+| Cases in the default matrix | 39,069 — 212 operations over 45 column types, 1,447 applicable (operation, type) cells x 27 datasets — about 220 s on an M4 Max; more with `DIFF_LARGE=1` |
 | Result at 0.1.0 | 36,486 pass, 1,566 fail across 22 documented divergences, 1,017 skip (an operation that does not apply to a type), **0 unclassified** |
 
 ## Method
@@ -167,7 +167,7 @@ suite notices if either engine changes its mind.
 | A null in `is_in`'s value set | ignored; a null element never matches, so the result has no nulls — Arrow's `skip_nulls=True` | the same with `skip_nulls=True`; its default matches null to null | `test_is_in_never_matches_a_null_where_arrow_matches_null_to_null` |
 | Empty pattern in `replace` | the identity | `pc.replace_substring` does not terminate on an empty pattern — the harness must never call it with one | `test_empty_replace_pattern_is_the_identity` |
 | Empty pattern in `count_substring` | code points + 1 | bytes + 1 | `test_empty_pattern_counts_code_points_where_arrow_counts_bytes` |
-| `float64` `sqrt`/`exp`/`ln`/`log10`/`log2`/`power` | software IEEE-754 binary64 on the GPU: `sqrt` correctly rounded, the others within 1 ulp of libm over the whole double range (was: evaluated in `float`, fixed 2026-09-06) | evaluated in double | `test_float64_transcendentals_are_true_binary64` |
+| `float64` `sqrt`/`exp`/`ln`/`log10`/`log2`/`power` | software IEEE-754 binary64 on the GPU: `sqrt` correctly rounded, the others measured at a worst case of 1 ulp of libm over 10^6 inputs per function and asserted within 2 (was: evaluated in `float`, fixed 2026-09-06) | evaluated in double | `test_float64_transcendentals_are_true_binary64` |
 | `list_element` on a row shorter than the index | null | raises `ArrowInvalid` for the whole column | `test_list_element_of_a_short_row_is_null_where_pyarrow_raises` |
 | `parse` of a string that is not a number | null | `cast` raises, even with `safe=False` | `test_parse_returns_null_where_pyarrow_raises` |
 | adding a duration to a time of day past midnight | wraps inside the day | raises: the result is outside `[0, 86400)` | `test_time_of_day_addition_wraps_where_pyarrow_raises` |
@@ -221,7 +221,8 @@ Twenty-two divergences the harness found that are not bugs but are not free choi
 place where a kernel's own consistency was preferred to Arrow's answer, or where a documented limit of
 the GPU path shows through. (A finding whose title starts with `BUG:` is a real bug parked so the gate
 stays green while it is open; the two the coverage pass found are fixed and listed under "Findings that
-were fixed".) Together they account for every failing case. Each has an entry in
+were fixed".) Together they account for all 1,566 failing cases; a cell matched by two findings appears
+under both, so the Cases column below sums to more than 1,566. Each has an entry in
 `FINDINGS` in `test_differential.py`, so the matrix groups the affected cells under the finding instead
 of burying them, and an `xfail(strict=True)` reproduction, so the suite turns red the moment a kernel
 changes its mind. Eighteen of them are classified *by the data* — a `data_check` that looks at the
@@ -230,32 +231,41 @@ exactly.
 
 | # | Finding | Cases | Cells |
 |---|---|---|---|
-| 1 | `float32-subnormal-ftz` | 19 | 5 |
+| 1 | `float32-subnormal-ftz` | 42 | 8 |
 | 2 | `sign-of-negative-zero` | 8 | 2 |
-| 3 | `negative-zero-set-lookup` | 14 | 4 |
+| 3 | `negative-zero-set-lookup` | 30 | 8 |
 | 4 | `cumulative-prod-reassociation` | 12 | 2 |
 | 5 | `decimal-to-float64-divides` | 38 | 3 |
 | 6 | `decimal-round-carry-past-the-precision` | 12 | 3 |
 | 7 | `regex-icu-unicode-classes` | 28 | 2 |
 | 8 | `regex-anchor-in-a-repeated-search` | 15 | 1 |
-| 9 | `split-loses-the-null-row` | 31 | 2 |
+| 9 | `split-loses-the-null-row` | 26 | 2 |
 | 10 | `split-whitespace-trailing-run` | 14 | 1 |
 | 11 | `float-text-swift-format` | 35 | 2 |
-| 12 | `temporal-extract-in-utc` | 977 | 58 |
+| 12 | `temporal-extract-in-utc` | 1,064 | 63 |
 | 13 | `strftime-seconds-carry-the-fraction` | 57 | 3 |
-| 14 | `timezone-after-2038` | 96 | 8 |
+| 14 | `timezone-after-2038` | 144 | 12 |
 | 15 | `trig-argument-reduction` | 8 | 2 |
 | 16 | `variance-accumulator-overflow` | 8 | 2 |
 | 17 | `rolling-min-max-zero-and-subnormal` | 5 | 2 |
-| 18 | `unique-drops-the-null-string` | 36 | 2 |
+| 18 | `unique-drops-the-null-string` | 24 | 2 |
 | 19 | `logb-of-zero-against-a-small-base` | 4 | 1 |
 | 20 | `round-scales-before-it-rounds` | 19 | 2 |
 | 21 | `high-moment-accumulator-overflow` | 14 | 4 |
-| 22 | `winsorize-negative-zero-limit` | 2 | 1 |
+| 22 | `winsorize-negative-zero-limit` | 3 | 2 |
+| | **Total** | **1,610** | **129** |
+
+The counts are the gated `differential_report.py` run of 2026-09-07. The column totals exceed the headline
+1,566 cases and the 126 distinct cells because
+`differential_report.py` counts a cell whole under every finding that claims it, and three cells are
+claimed twice: `round_extra/float32` (findings 1 and 20), `regex_match/utf8` (7 and 8) and
+`split_whitespace/utf8` (9 and 10). That double counting is the 44-case, 3-cell difference.
 
 ### 1. Float32 arithmetic flushes subnormals to zero
 
-*8 failing cases: `arith_scalar/float32`, `arith_array/float32`, `special` flavor.*
+*42 failing cases across 8 cells: `arith_array/float32`, `arith_checked/float32`, `arith_scalar/float32`,
+`math_extra/float32`, `pairwise_diff/float32`, `round_extra/float32`, `trig/float32`,
+`trig_checked/float32`, the `special` flavor.*
 
 Metal's default math mode is flush-to-zero and denormals-are-zero. The Float32 **arithmetic** kernels
 inherit it, so a subnormal result becomes `0.0` and a subnormal operand contributes nothing — while
@@ -298,7 +308,8 @@ information; the two engines agree on every other value, NaN included. Reproduct
 
 ### 3. `is_in` and `index_in` treat `-0.0` and `0.0` as one value
 
-*6 failing cases: `is_in/float64`, `index_in/float64`, the datasets containing a negative zero.*
+*30 failing cases across 8 cells: `is_in/float64`, `index_in/float64`, `unique`, `value_counts` and
+`mode_and_count_distinct` on `float32` and `float64`, the datasets containing a negative zero.*
 
 The set lookup is a binary search over `unique()`, which orders values by the same total order the radix
 sort uses: every NaN is one value, and `-0.0` is `0.0`. Arrow's hash lookup keeps the two zeros apart (it
@@ -415,7 +426,7 @@ Reproduction: `test_anchored_pattern_counts_once_per_input` (xfail).
 
 ### 9. `split` has nowhere to put a null row
 
-*31 failing cases: `regex_split` and `split_whitespace` on `utf8`, every dataset with a null.*
+*26 failing cases: `split_pairs` and `split_whitespace` on `utf8`, every dataset with a null.*
 
 ArrowMetal has no list type, so `split_pattern` and `split_whitespace` return the `(offsets, values)`
 pair of an Arrow `list<utf8>` instead — and a pair of flat arrays has no validity bitmap for the rows.
@@ -478,7 +489,7 @@ finding, classified by the data (`_float_text_differs`). Reproductions:
 
 ### 12. The temporal kernels read a zoned timestamp in UTC
 
-*977 failing cases across 58 cells: every temporal operation on the four `timestamp[…, tz]` columns.*
+*1,064 failing cases across 63 cells: every temporal operation on the four `timestamp[…, tz]` columns.*
 
 `am_temporal_extract`, `am_temporal_math` and `am_temporal_extra` all work on the instant, in UTC,
 whatever timezone the column's type carries — which is what the class documents ("extracted in UTC").
@@ -520,7 +531,8 @@ operation of their own. Reproduction: `test_strftime_seconds_carry_the_fraction`
 
 ### 14. pyarrow's timezone database stops transitioning at 2038
 
-*96 failing cases: `assume_timezone` and `temporal_timezone` on the datasets reaching past 2038.*
+*144 failing cases across 12 cells: `assume_timezone`, `temporal_timezone` and `timezone_metadata` on the
+datasets reaching past 2038.*
 
 This one is pyarrow's, not ours, but it is a divergence the matrix has to carry: Arrow's bundled tz
 database stops applying a DST rule once the 32-bit epoch runs out, so every summer instant after
@@ -598,7 +610,7 @@ their next revision. Classified by the data. Reproduction:
 
 ### 18. `unique` and `value_counts` drop the null row of a string column
 
-*36 failing cases: `unique/utf8`, `value_counts/utf8`, the datasets containing a null.*
+*24 failing cases: `unique/utf8`, `value_counts/utf8`, the datasets containing a null.*
 
 Both orders of `unique()` and `value_counts()` go through the GPU string dictionary, which has one slot
 per distinct **string** and none for a null, so a null row leaves no entry behind. Arrow keeps the null as
@@ -681,7 +693,7 @@ Reproduction: `test_skew_and_kurtosis_share_the_variance_accumulator`.
 
 ### 22. `winsorize` clamps to the `-0.0` of a zero tie
 
-*2 failing cases: `winsorize/float32`, the datasets containing a negative zero.*
+*3 failing cases: `winsorize/float32` and `winsorize/float64`, the datasets containing a negative zero.*
 
 `winsorize` takes its two limits out of the sorted values — Arrow's *nearest* quantile, not an interpolated
 one. `-0.0` and `0.0` are one tie group in every sort order both engines use, so which of the pair becomes
@@ -736,7 +748,7 @@ Four more turned up while closing those, and were fixed here rather than written
 
 ## What passed
 
-Everything else — 36,460 of the 39,069 cases — on all 27 datasets per cell:
+Everything else — 36,486 of the 39,069 cases — on all 27 datasets per cell:
 
 - **Import/export round trip** for all 45 types, including every sliced offset, all-null and empty arrays,
   4096-byte strings and multi-byte UTF-8, 38-digit decimals, nested lists with nulls inside the rows,

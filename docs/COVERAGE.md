@@ -45,10 +45,11 @@ Interop uses a separate vocabulary and is counted apart: 7 shipped, 1 partial, 3
 
 A row here covers a family, so these are not function counts. The by-name numbers are in
 [ARROW_FUNCTIONS.md](ARROW_FUNCTIONS.md): of Arrow v25's 307 compute function names, **all 307 are
-reachable** — 277 entirely on the GPU, 13 on the host, 17 with a stated limitation, and none missing.
+reachable** — 283 entirely on the GPU, 17 on the host, 7 with a stated limitation, and none missing.
 
-**The scope ArrowMetal 0.1.0 claims 100% of:** every Arrow compute function name,
-over `int8/16/32/64`, `uint8/16/32/64`, `float16/32/64`, `bool`, `utf8`, `binary`, `fixed_size_binary`,
+**The scope ArrowMetal 0.1.0 answers to, name by name:** every Arrow compute function name — 7 of them
+with a stated limitation — over `int8/16/32/64`, `uint8/16/32/64`, `float16/32/64`, `bool`, `utf8`,
+`binary`, `fixed_size_binary`,
 `decimal32/64/128`, the six temporal types, the three interval layouts, `list` / `struct` / `map` /
 `dictionary` / `run_end_encoded` and extension types — null-aware with Arrow semantics, and checked value
 for value against `pyarrow.compute` in `python/tests/test_functions.py`. Concretely that is: the scalar and
@@ -487,14 +488,14 @@ outright.
 
 ## What ArrowMetal 0.1.0 claims, and what it does not
 
-**The claim.** ArrowMetal 0.1.0 answers to **306 of the 307 Apache Arrow v25 compute function names** —
+**The claim.** ArrowMetal 0.1.0 answers to **all 307 of the Apache Arrow v25 compute function names** —
 the 283 in the C++ docs plus the 24 `hash_*` grouped aggregates — over `int8/16/32/64`, `uint8/16/32/64`,
 `float16/32/64`, `bool`, `utf8`, `binary`, `fixed_size_binary`, `decimal32/64/128`, `date32/64`,
 `time32/64`, `timestamp`, `duration`, the three `interval` layouts, `list` / `large_list` /
 `fixed_size_list`, `struct`, `map`, `dictionary`, `run_end_encoded` and extension types. Every one of those
 names is a row in [ARROW_FUNCTIONS.md](ARROW_FUNCTIONS.md) carrying the Swift file behind it, the
 ArrowMetal call that reaches it and the status the test suite measured: **283 gpu**, **17 cpu**, **7
-partial**, **1 missing**. "Measured" is literal — `python/tests/test_functions.py` calls every runnable row
+partial**, **0 missing**. "Measured" is literal — `python/tests/test_functions.py` calls every runnable row
 through `arrowmetal.functions.call_function` and compares the answer to `pyarrow.compute`, with a second
 input in a different type family for the rows whose claim spans several.
 

@@ -1,6 +1,6 @@
 # ArrowMetal
 
-**Apache Arrow columnar data on Apple silicon GPUs.** Zero-copy, unified-memory, Metal-accelerated kernels that
+**Apache Arrow columnar data on Apple silicon GPUs.** Unified-memory, Metal-accelerated kernels that
 understand Arrow's layout natively: validity bitmaps, packed booleans, the C Data Interface and the
 C Device Data Interface (`ARROW_DEVICE_METAL`).
 
@@ -10,16 +10,19 @@ C Device Data Interface (`ARROW_DEVICE_METAL`).
 ## The pitch in one paragraph
 
 Every array is Arrow layout in memory the GPU already shares, so there is nothing to upload. Reductions,
-filters, gathers and group-by run on the GPU 1.5x to 3x faster than all 16 CPU cores and 5x to 40x faster
-than Polars, and while they run the CPU is free for the rest of the application: the benchmark tables
+filters, gathers and group-by run on the GPU 1.2x to 3.5x faster than all 16 CPU cores and 7x to 29x faster
+than Polars in the tables below — the full distribution over all 339 measured rows, wider in both
+directions, is in [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MATRIX.md) — and while they run the CPU is
+free for the rest of the application: the benchmark tables
 report CPU time per operation next to wall time. Chains of operations share one GPU round trip. The whole
 thing is reachable from Swift, Python, and any language with Arrow bindings through one C ABI.
 
 ## Why this exists
 
 Apple silicon has one physical memory shared by CPU and GPU. An Arrow buffer placed in a `MTLBuffer` with
-`storageModeShared` is *simultaneously* a valid CPU Arrow buffer and a valid GPU buffer. No upload, no download,
-no copies. Nothing in the Arrow ecosystem took advantage of that:
+`storageModeShared` is *simultaneously* a valid CPU Arrow buffer and a valid GPU buffer. No upload and no
+download: a page-aligned producer's buffers are used in place, and a buffer that is not page aligned is
+copied once on the way in. No Arrow project we surveyed took advantage of that:
 
 | Project | What it has | What it lacks |
 |---|---|---|
@@ -34,23 +37,29 @@ arrow-swift or anything else that speaks the C Data Interface.
 
 ## Benchmarks
 
-Apple M4 Max (16 CPU cores), 50,000,000 rows, best of 5, release build. Full history and methodology in
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md) and [Benchmarks/README.md](Benchmarks/README.md).
+Apple M4 Max (16 CPU cores), 50,000,000 rows (10,000,000 for the string row), best of up to five calls
+after a warm-up, release build. Full history and methodology in [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
+and [Benchmarks/README.md](Benchmarks/README.md).
 
 **Called from Python, same in-process data**, against Polars (16 threads), pyarrow.compute and pandas.
-Wall time, with the CPU time each call consumed in parentheses:
+Every row below is taken from `Benchmarks/results/full_matrix_2026-09-07.csv`, the raw output behind
+[docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MATRIX.md). Wall time, with the CPU time each call consumed in
+parentheses:
 
 | Operation | ArrowMetal | Polars | pyarrow | pandas |
 |---|---:|---:|---:|---:|
-| sum Int64, 10% nulls | **1.07 ms** (0.4 CPU-ms) | 15.65 (15.6) | 48.76 (48.7) | 47.86 (47.8) |
-| filter Int64 > 0 | **3.59** (0.7) | 22.79 (22.7) | 211.89 (211.8) | 270.10 (270.1) |
-| take 25M random indices | **5.86** (0.7) | 163.92 (163.9) | 134.87 (134.9) | |
-| group-by sum, 1000 keys | **1.91** (0.4) | 84.06 (1182.7) | 18.67 (250.8) | |
-| filter two columns + sum, batched | **1.77** (0.5) | 15.81 (26.6, lazy) | | 109.05 (numpy) |
-| sort Float64, 50M rows | **138.03** (0.9) | 148.55 (1213.8) | 6321.34 (6315.9) | 1782.05 (numpy) |
-| string `contains`, 10M utf8 | **1.61** (0.4) | 147.78 (147.8) | 121.91 (121.9) | 122.31 (122.3) |
+| sum Int64, 10% nulls | **1.07 ms** (0.4 CPU-ms) | 15.61 (15.6) | 51.79 (51.8) | 51.54 (51.5) |
+| filter Int64 (30% kept) | **2.31** (0.7) | 17.33 (17.3) | 125.10 (125.1) | 160.10 (160.1) |
+| take 25M random indices | **5.89** (0.7) | 169.08 (169.1) | 141.96 (142.0) | 170.64 (170.6) |
+| group-by sum, 1000 keys | **8.83** (2.1) | 81.92 (1170.4) | 18.81 (242.8) | 224.77 (224.8) |
+| filter two columns + sum | **3.54** (1.8) | 21.12 (34.5) | 63.02 (63.0) | 113.57 (113.6, numpy) |
+| sort Float64, 50M rows | **49.59** (1.3) | 132.40 (1282.9) | 6038.91 (6038.4) | 1761.55 (1761.4, numpy) |
+| string `contains`, 10M utf8 | **1.65** (0.4) | 143.91 (143.9) | 126.19 (126.2) | 123.39 (123.4) |
 
-**Swift, against all 16 CPU cores** (tight typed loops over the same Arrow layout) and Accelerate:
+**Swift, against all 16 CPU cores** (tight typed loops over the same Arrow layout) and Accelerate. These
+are the Swift-level baselines of rounds 6 and 7 in [docs/BENCHMARKS.md](docs/BENCHMARKS.md), measured
+2026-09-06 and not re-measured since — the sort row in particular predates the sort work the 2026-09-07
+matrix above measures:
 
 | Operation | Metal | 16-core CPU / Accelerate |
 |---|---:|---:|
@@ -70,8 +79,11 @@ Wall time, with the CPU time each call consumed in parentheses:
 | string `contains`, 10M utf8 | **1.65** | 17.77 |
 
 Takeaways: reductions, comparisons, selection, group-by and query-shaped pipelines beat all 16 CPU cores by
-1.5x to 3x and Polars by 5x to 40x. Sorting (GPU LSD radix) is 4.6x all 16 cores; string predicates are the
-widest margin of all, 20x to 90x Polars and pyarrow. Pure element-wise arithmetic is memory bound on both sides, so
+1.2x to 3.5x and Polars by 6x to 29x in the two tables above; across all 339 rows of the matrix the spread is
+wider both ways. Sorting (GPU LSD radix) is 4.3x all 16 cores; string predicates are the widest margin of
+all — `contains` above is 87x Polars, and across the matrix's string family the predicates run 19x to 147x
+against Polars and pyarrow at 10M rows, the one exception being a pattern that is a real regex rather than
+a literal, at 1.1x. Pure element-wise arithmetic is memory bound on both sides, so
 Accelerate on 16 cores ties or edges ahead there. Arrays under about a million rows are dominated by the
 fixed cost of a GPU dispatch (see [docs/DESIGN.md](docs/DESIGN.md) for the pipelining plan).
 
@@ -207,7 +219,7 @@ those types do not go, and [docs/COVERAGE.md](docs/COVERAGE.md) says so on each 
 ## What is implemented
 
 **307 of Apache Arrow v25's 307 compute function names** — 283 entirely on the GPU, 17 on the host, 7
-with a stated limitation, 1 (`binary_slice`) not implemented. Every one of those names has a row in
+with a stated limitation, none missing. Every one of those names has a row in
 [docs/ARROW_FUNCTIONS.md](docs/ARROW_FUNCTIONS.md) naming the Swift file behind it, the ArrowMetal call
 that reaches it and what it does differently, and that table is generated from a registry the test suite
 *executes*: `python/tests/test_functions.py` calls every runnable row and compares the answer to
@@ -228,7 +240,8 @@ Arrow type matrix and the interop status.
   `min`/`max` element-wise, `is_nan`/`is_finite`/`is_inf`.
 - **Transcendentals**: the twelve trigonometric and hyperbolic functions, their seven `_checked` twins,
   `atan2`, `expm1`, `log1p`, `logb`, `hypot` — float32 through Metal's library functions, float64 through
-  a software binary64 implementation on the GPU, within 5 ulp of the host libm either way.
+  a software binary64 implementation on the GPU; measured worst case 5 ulp (`tan`) on float64 and 4 on
+  float32 — the per-function table is in [docs/COVERAGE.md](docs/COVERAGE.md).
 - **Aggregates**: `sum`, `min`, `max`, `mean`, `product`, `variance`, `stddev`, `quantile`, `median`,
   `mode`, `count_distinct`, `first`/`last`, `index`, `min_max`, `skew`, `kurtosis`, `tdigest`.
 - **Grouped aggregates**: all 24 `hash_*` names over **arbitrary** key columns — integers sparse or
@@ -261,15 +274,16 @@ Arrow type matrix and the interop status.
 - Float64 on the GPU even though Metal has no `double`: compare, min, max, filter, take and slice use an
   order-preserving map of the IEEE bit pattern; sum, add, subtract, multiply, divide, the segmented
   group-by sums and means and the whole transcendental family use a software IEEE-754 binary64
-  implementation on 64-bit integers that is correctly rounded (bit-exact against Swift's `Double` over
-  millions of random and edge-case inputs, subnormals and NaN included). `exp`, `ln`, `log10`, `log2`,
-  `sqrt` and `power` are the exception: they evaluate in `float` and widen, about 1e-7 relative.
+  implementation on 64-bit integers. The arithmetic (`+ − × ÷`, sums and grouped sums) is bit-exact
+  against Swift's `Double` over millions of random and edge-case inputs, subnormals and NaN included.
+  `sqrt` is correctly rounded; `exp`, `ln`, `log10`, `log2` and `power` measure a worst case of 1 ulp
+  against libm and are asserted within 2; the trigonometric and hyperbolic families are within 5.
 - NaN: `min`/`max` skip NaN and return null if only NaN remains; `sum` propagates NaN; comparisons follow IEEE.
 - C Data Interface import/export for every type above and for struct (`+s`) record batches, C Stream
   Interface import, C Device Data Interface import/export, `MTLBuffer` recovery from our own exports.
 - `ArrowIPCReader` / `ArrowIPCWriter`: the Arrow IPC streaming and file formats, including a minimal
   FlatBuffers reader and builder, with no dependencies. Cross-checked against pyarrow in both directions.
-- A CPU reference implementation of every kernel, used as the oracle in tests.
+- A CPU reference implementation behind the kernels, used as the oracle in tests.
 
 ## Design notes
 
