@@ -106,6 +106,8 @@ private func aggregates(_ a: AnyMetalArray) throws -> any ExtendedAggregates {
     case .temporal(let t):
         // Temporal aggregates run on the storage integers, which is what the values are.
         switch t.storage { case .int32(let x): return x; case .int64(let x): return x }
+    // A dictionary column stands for its values, and none of these aggregates can run on the codes.
+    case .dictionary: return try aggregates(try a.decodedIfDictionary())
     default:
         throw ArrowMetalError.unsupportedType("am_reduce_ex needs a primitive, temporal or boolean array, got \(a.arrowFormat)")
     }

@@ -3,6 +3,13 @@ import ArrowMetal
 
 // The writer half of the Parquet C ABI. See docs/PARQUET.md for the subset it covers.
 
+/// Argument-validation failure: leave a message naming the function and the argument behind, so
+/// `am_last_error()` never hands the caller an unrelated earlier failure.
+private func pqWriteBadArgument(_ detail: String) -> Int32 {
+    Thread.current.threadDictionary["ArrowMetalC.lastError"] = "am_parquet_write: \(detail)"
+    return 2
+}
+
 @_cdecl("am_parquet_write")
 public func am_parquet_write(_ path: UnsafePointer<CChar>?,
                              _ columns: UnsafePointer<OpaquePointer?>?,
@@ -11,12 +18,18 @@ public func am_parquet_write(_ path: UnsafePointer<CChar>?,
                              _ compression: UnsafePointer<CChar>?,
                              _ dictionary: Int32,
                              _ rowGroupSize: Int64) -> Int32 {
-    guard let path, let columns, let names, nColumns > 0 else { return 2 }
+    guard let path else { return pqWriteBadArgument("`path` is NULL") }
+    guard let columns else { return pqWriteBadArgument("`columns` is NULL") }
+    guard let names else { return pqWriteBadArgument("`names` is NULL") }
+    guard nColumns > 0 else {
+        return pqWriteBadArgument("`n_columns` is \(nColumns); a file needs at least one column")
+    }
     do {
         var arrays: [AnyMetalArray] = []
         var columnNames: [String] = []
         for i in 0..<Int(nColumns) {
-            guard let h = columns[i], let n = names[i] else { return 2 }
+            guard let h = columns[i] else { return pqWriteBadArgument("`columns`[\(i)] is NULL") }
+            guard let n = names[i] else { return pqWriteBadArgument("`names`[\(i)] is NULL") }
             arrays.append(Unmanaged<Box>.fromOpaque(UnsafeRawPointer(h)).takeUnretainedValue().a)
             columnNames.append(String(cString: n))
         }

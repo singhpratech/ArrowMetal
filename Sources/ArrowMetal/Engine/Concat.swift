@@ -224,3 +224,21 @@ public func concatRecordBatches(_ batches: [MetalRecordBatch]) throws -> MetalRe
     }
     return try MetalRecordBatch(names: head.names, columns: cols)
 }
+
+extension AnyMetalArray {
+    /// The values a dictionary-encoded column stands for, materialised; every other column unchanged.
+    ///
+    /// The C ABI entry points that take a *value* column and have no way to work on the codes
+    /// (reductions, arithmetic, comparison, casts, the maths kernels) call this first, so a column read
+    /// out of a Parquet file dictionary-encoded behaves like the column it encodes. An extension type
+    /// wrapping a dictionary keeps its extension identity around the decoded storage.
+    public func decodedIfDictionary() throws -> AnyMetalArray {
+        switch self {
+        case .dictionary: return try dictionaryDecoded()
+        case .extended(let e):
+            if case .dictionary = e.storage { return try e.storage.dictionaryDecoded().markingExtension(like: e) }
+            return self
+        default: return self
+        }
+    }
+}
