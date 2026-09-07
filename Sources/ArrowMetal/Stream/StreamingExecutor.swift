@@ -576,9 +576,68 @@ public final class StreamGroupByOperator: StreamOperator {
             && aggregates.allSatisfy { $0.op == .sum || $0.op == .count || $0.op == .mean }
     }
 
+    /// Whether a sparse key may take the **row-level** resident path — one thread per row into the
+    /// global table, no per-batch dense encoding at all. Set false to force the per-batch encoding
+    /// (the A/B the tests use to prove the two agree bit for bit).
+    public var residentRowLevel = true
+    /// Takes the row-level path even for a key the per-batch encoding handles well. Only the tests
+    /// set it: it is how the two paths are compared at the cardinalities the chooser would never
+    /// send down the row path.
+    public var residentRowLevelForced = false
+    /// Set false to send an integer-only query down the row path's dense-id branch instead of its
+    /// atomic one — the third leg of the same differential test.
+    public var residentRowLevelAtomic = true
+
     /// Both GPU-state paths fold with kernels; the host table's merge is pure host arithmetic over
     /// values `process` already read back.
-    public var mergeUsesGPU: Bool { usesGPUState || resident != nil }
+    public var mergeUsesGPU: Bool { usesGPUState || resident != nil || usesResidentTable }
+
+    /// Whether this batch's key column is cheap to turn into dense ids on its own — an integer
+    /// column whose values span a small enough range for `GroupByKeys`' scan (no sort at all).
+    ///
+    /// That is exactly the shape the per-batch path is good at: a thousand groups over a million rows
+    /// become a thousand accumulators in threadgroup memory, where the row-level path would instead
+    /// send a million atomic adds at a thousand slots. The sparse key is the other way round — a
+    /// million distinct values per batch, one row each — and that is the one the row path takes.
+    private func keyIsCheaplyDense(_ c: AnyMetalArray) throws -> Bool {
+        guard let r = try GroupByKeys.integerRange(c) else { return false }
+        let span = r.hi >= r.lo ? Int(truncatingIfNeeded: r.hi &- r.lo) &+ 1 : 0
+        return span > 0 && GroupByKeys.rangeIsWorthIt(span: span, rows: c.length)
+    }
+
+    /// Whether every aggregate can be folded by the row-level **atomic** accumulate: counts and
+    /// integer sums, which two 32-bit atomic adds with a carry compute exactly and in any order.
+    /// A float64 sum cannot — Metal has no 64-bit atomic and no emulation of one rounds a binary64
+    /// addition correctly — so a query with one takes the dense-id row path instead.
+    private func rowAtomicEligible(_ columns: [AnyMetalArray?]) -> Bool {
+        for (a, c) in zip(aggregates, columns) {
+            if a.op == .count && a.column == nil { continue }
+            guard let c else { return false }
+            switch a.op {
+            case .count: continue
+            case .sum, .mean: if widen64(c) == nil { return false }
+            default: return false
+            }
+        }
+        return true
+    }
+
+    /// An integer or temporal value column as the 64-bit payload the row-level accumulate adds, in
+    /// the width Arrow's `sum` produces; nil for anything a 64-bit integer cannot hold exactly.
+    private func widen64(_ c: AnyMetalArray) -> AnyMetalArray? {
+        switch c {
+        case .int64: return c
+        case .uint64: return c
+        case .int8(let a): return (try? a.cast(to: Int64.self)).map { .int64($0) }
+        case .int16(let a): return (try? a.cast(to: Int64.self)).map { .int64($0) }
+        case .int32(let a): return (try? a.cast(to: Int64.self)).map { .int64($0) }
+        case .uint8(let a): return (try? a.cast(to: Int64.self)).map { .int64($0) }
+        case .uint16(let a): return (try? a.cast(to: Int64.self)).map { .int64($0) }
+        case .uint32(let a): return (try? a.cast(to: Int64.self)).map { .int64($0) }
+        case .temporal(let t): return (try? t.int64Values()).map { .int64($0) }
+        default: return nil
+        }
+    }
 
     public func process(_ batch: MetalRecordBatch) throws -> Any? {
         context = batch.firstContext ?? .shared
@@ -611,6 +670,15 @@ public final class StreamGroupByOperator: StreamOperator {
         // Arbitrary path with an integer key: the global table stays on the GPU, so this batch's one
         // row per group never crosses to the host at all.
         if usesResidentTable, integerKeyWidth(keyCols[0]) != nil {
+            // Sparse, high-cardinality key: hand the merge the batch's **rows** and let the resident
+            // table do the encoding itself (§4.1). Nothing here sorts or groups anything.
+            if try residentRowLevel && (residentRowLevelForced || !keyIsCheaplyDense(keyCols[0])) {
+                if residentKeyTemplate == nil { residentKeyTemplate = keyCols[0] }
+                var cols: [AnyMetalArray?] = []
+                for a in aggregates { cols.append(a.column.flatMap { work[$0] }) }
+                return ResidentRowPartial(keys: try int64Keys(keyCols[0]), columns: cols,
+                                          atomic: residentRowLevelAtomic && rowAtomicEligible(cols))
+            }
             let gk = try GroupByKeys(columns: keyCols)
             guard gk.groupCount > 0 else { return nil }
             if residentKeyTemplate == nil { residentKeyTemplate = keyCols[0] }
@@ -737,15 +805,92 @@ public final class StreamGroupByOperator: StreamOperator {
 
     public func merge(_ partial: Any) throws {
         if let r = partial as? ResidentPartial {
-            if resident == nil {
-                resident = try StreamGroupTable(context: context, aggregateCount: aggregates.count)
-            }
-            try resident!.fold(groupKeys: r.keys, values: r.values, groupCounts: r.counts, kinds: r.kinds)
+            try residentTableForMerge().fold(groupKeys: r.keys, values: r.values, groupCounts: r.counts,
+                                             kinds: r.kinds)
             return
         }
+        if let r = partial as? ResidentRowPartial { try mergeRows(r); return }
         if let d = partial as? DensePartial { try mergeDense(d); return }
         guard let h = partial as? HostPartial else { return }
         try mergeHost(h)
+    }
+
+    private func residentTableForMerge() throws -> StreamGroupTable {
+        if let r = resident { return r }
+        let r = try StreamGroupTable(context: context, aggregateCount: aggregates.count)
+        resident = r
+        return r
+    }
+
+    /// One batch's **rows**, on their way into the resident table: the table does the key encoding
+    /// itself, so nothing here has been sorted or grouped.
+    final class ResidentRowPartial {
+        let keys: MetalArray<Int64>
+        /// Per aggregate, the value column as it came off the batch (nil for `count(*)`).
+        let columns: [AnyMetalArray?]
+        /// True when every aggregate is a count or an integer sum, which the atomic accumulate does
+        /// straight from the rows; false sends the batch through the dense-id pass instead.
+        let atomic: Bool
+        init(keys: MetalArray<Int64>, columns: [AnyMetalArray?], atomic: Bool) {
+            self.keys = keys; self.columns = columns; self.atomic = atomic
+        }
+    }
+
+    /// Folds one batch of rows into the resident table.
+    ///
+    /// * **atomic** — one thread per row inserts its key, one thread per row folds itself into that
+    ///   slot with 64-bit atomic adds built out of two 32-bit ones. Counts and integer sums only.
+    /// * **dense** — the insert pass also stamps a batch-local dense id onto every slot it touched,
+    ///   so the batch's aggregates run on the ordinary `GroupBy` and the per-group results fold into
+    ///   distinct slots with no atomics. That is the path a float64 sum takes, and it still never
+    ///   sorts the key column: the resident table is the dictionary.
+    private func mergeRows(_ r: ResidentRowPartial) throws {
+        let table = try residentTableForMerge()
+        if r.atomic {
+            var rows: [StreamGroupTable.RowAggregate] = []
+            for (a, c) in zip(aggregates, r.columns) {
+                var spec = StreamGroupTable.RowAggregate()
+                switch a.op {
+                case .count where a.column == nil:
+                    spec.count = .allRows
+                case .count:
+                    spec.count = .nonNullValues
+                    spec.column = widen64(c!)
+                case .sum, .mean:
+                    spec.count = .nonNullValues
+                    let w = widen64(c!)
+                    spec.column = w
+                    spec.sums = true
+                    spec.kind = sumKind(w)
+                default:
+                    throw ArrowMetalError.unsupportedType("\(a.op.rawValue) in a row-level streaming group-by")
+                }
+                rows.append(spec)
+            }
+            try table.foldRows(keys: r.keys, aggregates: rows)
+            return
+        }
+
+        let (ids, groupCount, slotOfDense) = try table.denseIdsForRows(keys: r.keys)
+        guard groupCount > 0 else { return }
+        let gb = try GroupBy(keys: ids, keyCount: groupCount)
+        var vals: [AnyMetalArray?] = [], cnts: [MetalArray<Int64>?] = []
+        var kinds: [StreamGroupTable.SumKind] = []
+        for (a, c) in zip(aggregates, r.columns) {
+            switch a.op {
+            case .count where a.column == nil:
+                vals.append(nil); cnts.append(try gb.count()); kinds.append(.none)
+            case .count:
+                vals.append(nil); cnts.append(try countValid(c!, gb)); kinds.append(.none)
+            case .sum, .mean:
+                let s = try groupSum(c!, gb)
+                vals.append(s); cnts.append(try countValid(c!, gb)); kinds.append(sumKind(s))
+            default:
+                throw ArrowMetalError.unsupportedType("\(a.op.rawValue) in a row-level streaming group-by")
+            }
+        }
+        try table.fold(slotOfDense: slotOfDense, groupCount: groupCount, values: vals,
+                       groupCounts: cnts, kinds: kinds)
     }
 
     /// One batch's per-group results, still on the GPU, on their way into the resident table.
