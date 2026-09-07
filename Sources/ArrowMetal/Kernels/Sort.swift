@@ -358,14 +358,21 @@ extension MetalArray {
         if passBlocks > tableBlocks { (passElems, passBlocks) = (elemsPerBlock, blocks) }
         let sameLayout = passBlocks == blocks && passElems == elemsPerBlock
         let passGrid = MTLSize(width: passBlocks, height: 1, depth: 1)
+        let needIota = carryPayload && !usePartition && !(analyse && wantOrder)
+        let needArrange = usePartition && nullPlacement == .atStart
+        // A column whose every digit is constant — one repeated value, or one the analysis found nothing
+        // varying in — has no pass left to run, and then this second command buffer would be empty. It
+        // costs 60-140 µs to commit one, so it is not committed.
+        let anyWork = !analyse || needIota || !activePasses.isEmpty || needArrange
         try withExtendedLifetime(tmpKeep) {
+            if !anyWork { return }
             try ctx.run { enc in
                 if !analyse {
                     encodeMap(enc)
                     if usePartition { try encodePartition(enc, orderA: orderA!, orderB: orderB!, keysOut: partKeys!) }
                 }
-                if carryPayload && !usePartition && !(analyse && wantOrder) { try encodeIota(enc, valsA!) }
-                let scatPSO = try p(carryPayload ? "radix_scatter" : "radix_scatter_nk")
+                if needIota { try encodeIota(enc, valsA!) }
+                let scatPSO = activePasses.isEmpty ? nil : try p(carryPayload ? "radix_scatter" : "radix_scatter_nk")
                 for (i, pass) in activePasses.enumerated() {
                     // The histogram of digit 0 is already in `counts` when the analysis ran it and pass 0
                     // survived; every other pass needs its own, over the keys the previous pass produced.
@@ -378,7 +385,7 @@ extension MetalArray {
                     Dispatch.setUInt(enc, radix * passBlocks, index: 1)
                     enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: tg)
                     enc.memoryBarrier(scope: .buffers)
-                    enc.setComputePipelineState(scatPSO)
+                    enc.setComputePipelineState(scatPSO!)
                     enc.setBuffer(keysA.mtl, offset: keysA.offset, index: 0)
                     enc.setBuffer((valsA ?? keysA).mtl, offset: (valsA ?? keysA).offset, index: 1)
                     Dispatch.setLength(enc, n, countBuf, index: 2)
@@ -396,7 +403,7 @@ extension MetalArray {
                 // `.atStart` is the one arrangement the partition cannot write directly: it lays the
                 // blocks out value-first so the sort always runs on `[0, valueCount)`, and this moves the
                 // three blocks into the order the caller asked for.
-                if usePartition && nullPlacement == .atStart, let ord = resultOrder {
+                if needArrange, let ord = resultOrder {
                     let arrangePSO = try p("part_arrange")
                     let dst = ord === orderA! ? orderB! : orderA!
                     enc.setComputePipelineState(arrangePSO)
