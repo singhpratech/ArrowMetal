@@ -92,7 +92,9 @@ final class ExprEmitter {
             if op.isComparison || op.isLogical { return .boolean }
             let ta = try typeOf(a), tb = try typeOf(b)
             if ta == nil && tb == nil { return nil }
-            return try promote(ta ?? tb!, tb ?? ta!, op: op.rawValue)
+            if ta == nil { return try adaptLiteral(a, to: tb!) }
+            if tb == nil { return try adaptLiteral(b, to: ta!) }
+            return try promote(ta!, tb!, op: op.rawValue)
         case .unary(let op, let a):
             switch op {
             case .not: return .boolean
@@ -105,16 +107,22 @@ final class ExprEmitter {
         case .ifElse(_, let a, let b):
             let ta = try typeOf(a), tb = try typeOf(b)
             if ta == nil && tb == nil { return nil }
-            if ta == nil || tb == nil { return ta ?? tb }
+            if ta == nil { return try adaptLiteral(a, to: tb!) }
+            if tb == nil { return try adaptLiteral(b, to: ta!) }
             return try promote(ta!, tb!, op: "if_else")
         case .coalesce(let xs):
             var t: ExprType? = nil
             for x in xs { if let xt = try typeOf(x) { t = t == nil ? xt : try promote(t!, xt, op: "coalesce") } }
+            if var acc = t {
+                for x in xs where try typeOf(x) == nil { acc = try adaptLiteral(x, to: acc) }
+                return acc
+            }
             return t
         case .fillNull(let a, let b):
             let ta = try typeOf(a), tb = try typeOf(b)
             if ta == nil && tb == nil { return nil }
-            if ta == nil || tb == nil { return ta ?? tb }
+            if ta == nil { return try adaptLiteral(a, to: tb!) }
+            if tb == nil { return try adaptLiteral(b, to: ta!) }
             return try promote(ta!, tb!, op: "fill_null")
         case .isNull, .isValid, .isIn, .stringMatch: return .boolean
         }
@@ -141,6 +149,58 @@ final class ExprEmitter {
         case 32: return .int32
         default: return .int64
         }
+    }
+
+    /// The type an **untyped** literal gives a binary node whose other operand is `other`.
+    ///
+    /// The literal normally just takes `other` — that is what keeps `float32_column > 100` in
+    /// float32. It cannot when the literal does not fit: truncating it to the column's width would
+    /// silently answer a different question (`int8_column > 200` would compare against `(char)200`,
+    /// i.e. `-56`, and report true for every row). So a literal that does not fit widens the pair the
+    /// same way `promote` would if the literal carried its own smallest type, and a floating literal
+    /// against an integer column promotes the pair to float64, as rule 1 of `docs/EXPR.md` says.
+    func adaptLiteral(_ e: Expr, to other: ExprType) throws -> ExprType {
+        switch e {
+        case .double:
+            guard other.isNumeric else { return other }
+            return other.isFloat ? other : .float64
+        case .int(let v):
+            guard other.isInteger else { return other }
+            if ExprEmitter.literalFits(v, other) { return other }
+            return try promote(other, ExprEmitter.smallestIntType(v, unsigned: !other.isSigned), op: "literal")
+        default:
+            return other
+        }
+    }
+
+    /// True when `v` is representable in `t`.
+    static func literalFits(_ v: Int64, _ t: ExprType) -> Bool {
+        switch t {
+        case .int8: return v >= -128 && v <= 127
+        case .int16: return v >= -32_768 && v <= 32_767
+        case .int32: return v >= -2_147_483_648 && v <= 2_147_483_647
+        case .int64: return true
+        case .uint8: return v >= 0 && v <= 255
+        case .uint16: return v >= 0 && v <= 65_535
+        case .uint32: return v >= 0 && v <= 4_294_967_295
+        case .uint64: return v >= 0
+        default: return true
+        }
+    }
+
+    /// The narrowest integer type holding `v`, preferring unsigned when the other operand is unsigned
+    /// and `v` is not negative (so `uint8_column == 256` stays unsigned instead of jumping to int16).
+    static func smallestIntType(_ v: Int64, unsigned: Bool) -> ExprType {
+        if unsigned && v >= 0 {
+            if v <= 255 { return .uint8 }
+            if v <= 65_535 { return .uint16 }
+            if v <= 4_294_967_295 { return .uint32 }
+            return .uint64
+        }
+        if v >= -128 && v <= 127 { return .int8 }
+        if v >= -32_768 && v <= 32_767 { return .int16 }
+        if v >= -2_147_483_648 && v <= 2_147_483_647 { return .int32 }
+        return .int64
     }
 
     // MARK: lowering
@@ -240,10 +300,21 @@ final class ExprEmitter {
 
         case .isIn(let a, let set):
             guard !set.isEmpty else { return define(.boolean, "false", "true") }
-            let s = try emit(a)
+            var s = try emit(a)
             guard s.type.isNumeric || s.type == .boolean else {
                 throw ExprError.unsupported("is_in needs a numeric or boolean column, got \(s.type.rawValue)")
             }
+            // A value in the set that does not fit the column's type widens the comparison, exactly as
+            // it does for a binary operator; without this `int8_column.is_in([200])` would look for -56.
+            var setType = s.type
+            for lit in set {
+                if let lt = try typeOf(lit) {
+                    if lt.isNumeric && setType.isNumeric { setType = try promote(setType, lt, op: "is_in") }
+                } else {
+                    setType = try adaptLiteral(lit, to: setType)
+                }
+            }
+            s = try convert(s, to: setType)
             var tests: [String] = []
             for lit in set {
                 let l = try emit(lit, as: s.type)
@@ -291,7 +362,8 @@ final class ExprEmitter {
         let ta = try typeOf(a), tb = try typeOf(b)
         var t: ExprType
         if ta == nil && tb == nil { t = hint?.isNumeric == true ? hint! : .int64 }
-        else if ta == nil { t = tb! } else if tb == nil { t = ta! }
+        else if ta == nil { t = try adaptLiteral(a, to: tb!) }
+        else if tb == nil { t = try adaptLiteral(b, to: ta!) }
         else { t = try promote(ta!, tb!, op: op.rawValue) }
         if op.isBitwise && !t.isInteger {
             throw ExprError.unsupported("\(op.rawValue) needs integer operands, got \(t.rawValue)")

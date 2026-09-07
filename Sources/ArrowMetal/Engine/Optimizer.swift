@@ -124,16 +124,23 @@ public struct Optimizer {
         switch e {
         case .binary(let op, let a0, let b0):
             let a = foldExpr(a0), b = foldExpr(b0)
+            // `and` / `or` propagate nulls; only their Kleene forms let a literal absorb the other
+            // side. `false and null` is *null* under `and`, so folding it to `false` would change a
+            // projection's result (a filter cannot tell the two apart, but `select` can).
             if op == .and || op == .andKleene {
-                if case .bool(false) = a { return .bool(false) }
-                if case .bool(false) = b { return .bool(false) }
+                if op.isKleene {
+                    if case .bool(false) = a { return .bool(false) }
+                    if case .bool(false) = b { return .bool(false) }
+                }
                 if case .bool(true) = a { return b }
                 if case .bool(true) = b { return a }
                 if a == b { return a }
             }
             if op == .or || op == .orKleene {
-                if case .bool(true) = a { return .bool(true) }
-                if case .bool(true) = b { return .bool(true) }
+                if op.isKleene {
+                    if case .bool(true) = a { return .bool(true) }
+                    if case .bool(true) = b { return .bool(true) }
+                }
                 if case .bool(false) = a { return b }
                 if case .bool(false) = b { return a }
                 if a == b { return a }
@@ -143,7 +150,8 @@ public struct Optimizer {
                 case .add: return .int(x &+ y)
                 case .sub: return .int(x &- y)
                 case .mul: return .int(x &* y)
-                case .div: return y == 0 ? .int(0) : .int(x / y)
+                // `Int64.min / -1` overflows; the GPU wraps rather than trapping, so fold the same way.
+                case .div: return y == 0 ? .int(0) : .int(x.dividedReportingOverflow(by: y).partialValue)
                 case .eq: return .bool(x == y)
                 case .ne: return .bool(x != y)
                 case .lt: return .bool(x < y)
@@ -180,7 +188,8 @@ public struct Optimizer {
             let a = foldExpr(a0)
             if op == .not, case .bool(let v) = a { return .bool(!v) }
             if op == .negate, let x = intLiteral(a) { return .int(0 &- x) }
-            if op == .abs, let x = intLiteral(a) { return .int(x < 0 ? -x : x) }
+            // `-Int64.min` overflows; the GPU's `abs` wraps to Int64.min, so fold the same way.
+            if op == .abs, let x = intLiteral(a) { return .int(x < 0 ? (0 &- x) : x) }
             if op == .not, case .unary(.not, let inner) = a { return inner }
             return .unary(op, a)
 
@@ -194,7 +203,8 @@ public struct Optimizer {
             let c = foldExpr(c0), a = foldExpr(a0), b = foldExpr(b0)
             if case .bool(true) = c { return a }
             if case .bool(false) = c { return b }
-            if a == b { return a }
+            // `if_else(c, a, a)` is *not* `a`: Arrow's if_else is null wherever the condition is null,
+            // and nothing here knows whether `c` can be. Only a literal condition folds away.
             return .ifElse(c, a, b)
 
         case .coalesce(let xs):
@@ -468,10 +478,10 @@ public struct Optimizer {
             return out
         }
         switch p {
-        case .project(let c, let ps):
-            let d = dedupe(ps)
-            if d.count < ps.count { note("expression_cse"); return .project(c, d) }
-            return p
+        // `project` is *not* deduplicated: it names its output columns positionally, so
+        // `select(col("a").alias("x"), col("a").alias("x"))` really is two columns and dropping one
+        // would give the optimized plan a narrower schema than the unoptimized one. `with_columns`
+        // does merge by name (its schema replaces a repeated name in place), so it can be.
         case .withColumns(let c, let ps):
             let d = dedupe(ps)
             if d.count < ps.count { note("expression_cse"); return .withColumns(c, d) }
