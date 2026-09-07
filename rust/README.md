@@ -32,14 +32,14 @@ cargo test --release
 ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib cargo test --release
 ```
 
-`cargo test --release` runs 44 tests, plus 4 doc-tests that are **`no_run`: they are compiled and
+`cargo test --release` runs 48 tests, plus 4 doc-tests that are **`no_run`: they are compiled and
 type-checked, not executed** (they would need a GPU inside a doctest binary). Release matters: this
 project has hit one release-only miscompile on the Swift side, and the sweeps run at 1,000,001
 elements, which is slow to build and run unoptimised.
 
 | File | Tests | Oracle |
 |---|---|---|
-| `arrowmetal/tests/compute.rs` | 29 | `arrow::compute` on the same array — `sum`/`min`/`max`, the six comparisons, `filter`, `sort`, `take`, `slice`, `cast`. `group_by` has no counterpart in the `arrow` crate (hash aggregation lives in DataFusion), so its oracle is a plain `HashMap` fold. |
+| `arrowmetal/tests/compute.rs` | 33 | `arrow::compute` on the same array — `sum`/`min`/`max`, the six comparisons, `filter`, `sort`, `take`, `slice`, `cast`. `group_by` has no counterpart in the `arrow` crate (hash aggregation lives in DataFusion), so its oracle is a plain `HashMap` fold. |
 | `arrowmetal/tests/plan.rs` | 7 | the same plans assembled by hand from arrow-rs kernels |
 | `arrowmetal/tests/copy_rule.rs` | 4 | measured pointer alignments, not assumptions — the pointers `am_import` actually receives, read back out of an `arrow::ffi` export |
 | `arrowmetal/tests/signatures.rs` | 2 | `include/arrowmetal.h`, re-parsed at test time |

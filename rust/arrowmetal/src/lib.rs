@@ -76,7 +76,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fmt;
 use std::marker::PhantomData;
@@ -194,6 +194,27 @@ mod sealed {
 /// 4-byte scalar would then be accepted for a `Dictionary(Int32, Float64)` column whose kernel reads
 /// 8 bytes. [`Array::from_arrow`] therefore refuses dictionary arrays outright, which is what keeps
 /// the sentence above true for everything this crate accepts. See [`Array::from_arrow`].
+///
+/// # Do not reopen this without fixing `am_format` first
+///
+/// Refusing at [`Array::from_arrow`] works only because that is the **sole** way an [`Array`] handle
+/// is made from outside. A dictionary can still sit *inside* an accepted array — a
+/// `Struct{d: Dictionary(Int32, Float64)}` imports fine — and is harmless today only because nothing
+/// in this crate can pull the child out into a handle of its own: the struct's own `am_format` is
+/// `"+s"`, which no `NativeType` matches, so every scalar entry point refuses it.
+///
+/// Wrapping any of these ABI entry points would hand back a bare dictionary handle reporting `"i"`
+/// and reopen the hole, so each needs `am_format` fixed first (or its own guard):
+///
+/// * `am_child` — child `i` of a struct, list, map or dictionary.
+/// * `am_struct_field` — a struct field by name.
+/// * `am_dictionary_decode` — materialises a dictionary; its *output* is safe, but it takes a
+///   dictionary handle, which today cannot be built.
+/// * `am_list_flatten` — a list's child values, which may themselves be dictionary-encoded.
+/// * `am_cast_ex` — casts *to* a dictionary type via its child-format argument.
+///
+/// `tests/compute.rs::a_nested_dictionary_is_unreachable_from_the_safe_surface` pins the property
+/// this argument rests on.
 pub trait NativeType: Copy + sealed::Sealed {
     /// The Arrow C Data Interface format string for this type.
     const FORMAT: &'static str;
@@ -938,6 +959,14 @@ pub fn explain_plan(plan_json: &str, sources: &[&Source], optimize: bool) -> Res
 // Batching
 // =================================================================================================
 
+thread_local! {
+    /// How many [`batch`] scopes are open on this thread.
+    ///
+    /// Thread-local because the ABI's batching is: `am_batch_begin` opens a command buffer for the
+    /// calling thread only. Counting is what makes nested `batch` calls safe — see [`batch`].
+    static BATCH_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
 /// Runs `body` with every ArrowMetal call on this thread appended to one GPU command buffer.
 ///
 /// The GPU runs once at the end of the scope, or earlier at the first call that must read a result
@@ -946,28 +975,58 @@ pub fn explain_plan(plan_json: &str, sources: &[&Source], optimize: bool) -> Res
 ///
 /// The batch is closed even if `body` panics.
 ///
+/// # Nesting
+///
+/// `batch` calls nest safely: only the outermost one opens and commits a batch, and only it can
+/// report an end-of-batch error. An inner call runs its body inside the batch that is already open
+/// and always returns `Ok`.
+///
+/// That has to be counted here rather than left to the ABI. `am_batch_begin` is a no-op when a batch
+/// is already open, but `am_batch_end` closes **whatever is open**, without regard to nesting — so
+/// an inner scope's guard would commit the outer scope's batch and every call in the rest of the
+/// outer body would run unbatched, silently and with no error anywhere. A thread-local depth counter
+/// is what prevents that.
+///
 /// # Errors
 ///
-/// `am_batch_end` commits the command buffer and reports a non-zero code when the GPU work failed —
-/// the whole batch's failure surfaces there, not at the individual calls, because those only
-/// enqueued. That failure is returned as an `Err` **even though `body` already produced a value**,
-/// so a batch that comes back `Ok` is a batch whose GPU work committed successfully. Values computed
-/// inside a failed batch are discarded, as they must be: the kernels behind them did not run.
+/// `am_batch_end` commits the command buffer and reports a non-zero code when the GPU work failed.
+/// A batch defers most validation, so this is where a failure normally surfaces: `take` with an
+/// out-of-range index, for instance, returns `Err` immediately when unbatched but returns `Ok` inside
+/// a batch and fails the whole batch at the end.
+///
+/// That failure is returned as an `Err` **even though `body` already produced a value**, so a batch
+/// that comes back `Ok` is one whose GPU work committed successfully. The value is discarded — not
+/// because nothing ran, but because there is no way to know **how much** ran: a call that must read
+/// a result back (a reduction, an export) forces a mid-batch flush, so some kernels in a failed batch
+/// have executed and some have not, and the ABI does not say where the line fell.
 ///
 /// The close itself happens in a `Drop`, which cannot fail, so the guard records the code and this
 /// function reads it once the closure has returned and the guard has run.
 pub fn batch<T>(body: impl FnOnce() -> T) -> Result<T> {
-    check(unsafe { ffi::am_batch_begin() }, "am_batch_begin")?;
+    // Only the outermost scope talks to the ABI; see the "Nesting" section above.
+    let outermost = BATCH_DEPTH.with(|d| d.get() == 0);
+    if outermost {
+        check(unsafe { ffi::am_batch_begin() }, "am_batch_begin")?;
+    }
+    BATCH_DEPTH.with(|d| d.set(d.get() + 1));
 
-    /// Closes the batch on the way out, panic or not, and records what `am_batch_end` said.
-    struct Guard<'a>(&'a RefCell<Option<Error>>);
+    /// Leaves the batch on the way out, panic or not, and — if this was the outermost scope —
+    /// commits it and records what `am_batch_end` said.
+    struct Guard<'a> {
+        failure: &'a RefCell<Option<Error>>,
+        outermost: bool,
+    }
     impl Drop for Guard<'_> {
         fn drop(&mut self) {
+            BATCH_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            if !self.outermost {
+                return;
+            }
             let rc = unsafe { ffi::am_batch_end() };
             if rc != 0 {
                 // `am_last_error` is thread-local and the next call on this thread overwrites it,
                 // so it is read here rather than after the guard has gone out of scope.
-                *self.0.borrow_mut() = Some(Error::last("am_batch_end"));
+                *self.failure.borrow_mut() = Some(Error::last("am_batch_end"));
             }
         }
     }
@@ -976,7 +1035,7 @@ pub fn batch<T>(body: impl FnOnce() -> T) -> Result<T> {
     // The guard must be dropped -- and so must have run `am_batch_end` and recorded its code --
     // before `failure` is read, which is what this inner scope is for.
     let value = {
-        let _guard = Guard(&failure);
+        let _guard = Guard { failure: &failure, outermost };
         body()
     };
     match failure.into_inner() {

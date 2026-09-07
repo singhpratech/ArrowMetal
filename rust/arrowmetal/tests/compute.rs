@@ -15,11 +15,11 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array as _, ArrayRef, BooleanArray, DictionaryArray, Float64Array, Int32Array, Int64Array,
-    Scalar as ArrowScalar,
+    Scalar as ArrowScalar, StructArray,
 };
 use arrow::compute::kernels::cmp;
 use arrow::compute::{filter, sort, take, SortOptions};
-use arrow::datatypes::Int32Type;
+use arrow::datatypes::{Field, Int32Type};
 use arrowmetal::{group_by, Agg, Array, CompareOp, Scalar};
 
 use common::{arc, close, float64, int64, LENGTHS};
@@ -653,6 +653,92 @@ fn a_batched_chain_equals_an_unbatched_one() {
     assert_eq!(batched.and_then(Scalar::as_i64), want);
 }
 
+/// A batch defers validation, so a bad operation inside one succeeds at the call and fails the whole
+/// batch at the end. This pins that route, and is the mechanism the nesting test below relies on.
+#[test]
+fn a_failure_inside_a_batch_surfaces_at_the_end() {
+    let a = Int64Array::from(vec![1i64, 2, 3]);
+    let out_of_range = Int32Array::from(vec![0, 1, 999_999]);
+    let ga = Array::from_arrow(&a).unwrap();
+    let gi = Array::from_arrow(&out_of_range).unwrap();
+
+    // Unbatched, the same take fails at the call.
+    let unbatched = ga.take(&gi);
+    assert!(unbatched.is_err(), "expected an immediate error when unbatched");
+    assert!(unbatched.unwrap_err().message().contains("out of range"));
+
+    // Batched, it succeeds at the call and the batch reports the failure.
+    let mut took_ok = false;
+    let batched = arrowmetal::batch(|| {
+        took_ok = ga.take(&gi).is_ok();
+    });
+    assert!(took_ok, "inside a batch the take should be deferred, not validated at the call");
+    let err = batched.unwrap_err();
+    assert!(err.message().starts_with("am_batch_end:"), "{err}");
+
+    // The thread is usable afterwards.
+    assert_eq!(ga.sum().unwrap(), Some(Scalar::Int64(6)));
+}
+
+/// Nested `batch` calls must not collapse the outer batch.
+///
+/// `am_batch_begin` is a no-op when a batch is already open, but `am_batch_end` closes whatever is
+/// open regardless of nesting — so without a depth counter the inner scope's guard commits the outer
+/// scope's batch and the rest of the outer body runs unbatched, silently.
+///
+/// The discriminator is deferral, not timing: a failing `take` issued **after** the inner batch
+/// returns must still be deferred (so it returns `Ok` at the call) and must fail the *outer* batch.
+/// If the inner scope had closed the batch, that same take would have been validated immediately and
+/// returned `Err` inside the closure, and the outer batch would have come back `Ok`.
+#[test]
+fn a_nested_batch_keeps_the_outer_one_open() {
+    let a = Int64Array::from(vec![1i64, 2, 3]);
+    let out_of_range = Int32Array::from(vec![0, 1, 999_999]);
+    let ga = Array::from_arrow(&a).unwrap();
+    let gi = Array::from_arrow(&out_of_range).unwrap();
+
+    let mut inner_ok = false;
+    let mut took_ok = false;
+    let outer = arrowmetal::batch(|| {
+        // An inner batch does no ABI work and always succeeds.
+        inner_ok = arrowmetal::batch(|| ()).is_ok();
+        // Issued after the inner scope has ended: still deferred, so the outer batch is still open.
+        took_ok = ga.take(&gi).is_ok();
+    });
+
+    assert!(inner_ok, "the inner batch should return Ok");
+    assert!(
+        took_ok,
+        "the take was validated at the call, so the inner batch had already closed the outer one"
+    );
+    let err = outer.unwrap_err();
+    assert!(err.message().starts_with("am_batch_end:"), "{err}");
+
+    // Depth is back to zero: a fresh batch still works.
+    assert!(arrowmetal::batch(|| ga.sum().unwrap()).unwrap() == Some(Scalar::Int64(6)));
+}
+
+/// Three levels deep, and a panic in the middle, must still leave the depth counter at zero.
+#[test]
+fn batch_depth_unwinds_correctly_on_panic() {
+    let a = Int64Array::from(vec![1i64, 2, 3]);
+    let ga = Array::from_arrow(&a).unwrap();
+
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = arrowmetal::batch(|| {
+            let _ = arrowmetal::batch(|| {
+                let _ = arrowmetal::batch(|| panic!("boom"));
+            });
+        });
+    }));
+    assert!(r.is_err());
+
+    // If any level had leaked its depth, this batch would never commit and the sum would be stale
+    // or the call would hang on an uncommitted buffer.
+    assert_eq!(arrowmetal::batch(|| ga.sum().unwrap()).unwrap(), Some(Scalar::Int64(6)));
+    assert_eq!(ga.sum().unwrap(), Some(Scalar::Int64(6)));
+}
+
 /// A panic inside a batch must still close it, or every later call on this thread is appended to a
 /// command buffer nobody commits.
 #[test]
@@ -734,4 +820,43 @@ fn dictionary_arrays_are_refused_at_import() {
     let got = gpu.compare_scalar(CompareOp::Lt, 2.0f64).unwrap().to_arrow().unwrap();
     assert_eq!(got.as_ref(), &want as &dyn arrow::array::Array);
     assert_eq!(want.values().iter().collect::<Vec<_>>(), vec![true, false, false]);
+}
+
+/// Refusing dictionaries at `from_arrow` closes the hole only if a dictionary nested inside an
+/// accepted array cannot be pulled out into a handle of its own.
+///
+/// A `Struct{d: Dictionary(Int32, Float64)}` imports fine — nested types go through the C Data
+/// Interface unchanged — and is harmless only because the struct handle reports `"+s"`, which no
+/// `NativeType` matches, so every scalar entry point refuses it. This test pins that, and is the
+/// property the "do not reopen this" note on `NativeType` rests on: wrapping `am_child`,
+/// `am_struct_field`, `am_dictionary_decode`, `am_list_flatten` or `am_cast_ex` would hand back a
+/// bare dictionary handle reporting `"i"` and reopen the hole.
+#[test]
+fn a_nested_dictionary_is_unreachable_from_the_safe_surface() {
+    let values = Float64Array::from(vec![1.0, 5.0, 9.0]);
+    let keys = Int32Array::from(vec![0, 1, 2]);
+    let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap();
+
+    let field = Arc::new(Field::new("d", dict.data_type().clone(), true));
+    let st = StructArray::from(vec![(field, Arc::new(dict) as ArrayRef)]);
+
+    let gpu = Array::from_arrow(&st).expect("a struct carrying a dictionary should import");
+    assert_eq!(gpu.len(), 3);
+
+    // The handle must never report a format any `NativeType` claims. `"+s"` is what it does report;
+    // the assertion is on the property, not the spelling, so this still holds if the string changes.
+    let format = gpu.format();
+    for scalar_format in ["c", "C", "s", "S", "i", "I", "l", "L", "f", "g"] {
+        assert_ne!(
+            format, scalar_format,
+            "a struct wrapping a dictionary reported the scalar format {scalar_format:?}; a scalar \
+             operand would now be accepted for it"
+        );
+    }
+
+    // Every scalar width is refused, so no scalar can reach the dictionary's kernel.
+    assert!(gpu.compare_scalar(CompareOp::Lt, 2i32).is_err());
+    assert!(gpu.compare_scalar(CompareOp::Lt, 2i64).is_err());
+    assert!(gpu.compare_scalar(CompareOp::Lt, 2.0f64).is_err());
+    assert!(gpu.compare_scalar(CompareOp::Lt, 2.0f32).is_err());
 }

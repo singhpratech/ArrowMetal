@@ -159,13 +159,22 @@ buffer sliced out of an arena can all change it. Run `cargo test --test copy_rul
 Copy-free is not free: at 10M int64 rows the import still cost **1.11 ms**, which is Metal mapping
 80 MB of pages into the GPU's address space. See the timing below.
 
-Two more facts, both tested:
+Two more claims, **inferred rather than tested**:
 
 * **A slice does not cost a copy either way.** An Arrow `offset` is carried on the handle rather than
-  applied, so `array.slice(7, n)` imports the same buffers the unsliced array would.
+  applied, so `array.slice(7, n)` should import the same buffers the unsliced array would.
 * **An array that came out of ArrowMetal and goes back in is never copied in either buffer**,
   whatever the original alignment: ArrowMetal recognises its own exported buffers and shares the
   `MTLBuffer` objects directly.
+
+Both follow from reading `Sources/ArrowMetal/CInterop.swift` plus the alignment measurement above,
+and both have tests behind their *observable* halves — a sliced array round-trips exactly
+(`round_trip_of_a_sliced_array`, `a_slice_survives_the_round_trip`), and an ArrowMetal export is
+always page aligned, which is the precondition for the no-copy path
+(`arrowmetal_exported_buffers_are_page_aligned`). But **whether a given import actually copied is not
+observable through the C ABI**: the Swift side computes an `ImportResult.zeroCopy` flag and
+`am_import` discards it. Until the ABI reports it — an `am_import_ex` with an `int* out_zero_copy`
+would do — these two are arguments, not measurements, and are labelled as such.
 
 ---
 
@@ -187,7 +196,7 @@ data, at lengths 0, 1, 33, 1024, 1025, 100,001 and 1,000,001, with and without n
 | `cast` | `am_cast` | `arrow::compute::cast` |
 | `group_by(keys)` with `sum`, `min`, `max`, `mean`, `count`, `count_all`; `keys(i)`, `ids()`, `agg_raw` | `am_group_by_keys`, `am_group_agg_ex` | a plain `HashMap` fold — arrow-rs's `arrow` crate has no hash aggregation (it lives in DataFusion) |
 | `Source`, `run_plan`, `explain_plan`, `PlanResult` | `am_plan_source_create`, `am_plan_run`, `am_plan_explain`, `am_plan_column*` | the same plan assembled by hand from arrow-rs kernels |
-| `batch(\|\| …)` | `am_batch_begin` / `am_batch_end` | the same chain unbatched, and arrow's answer |
+| `batch(\|\| …)` | `am_batch_begin` / `am_batch_end` | the same chain unbatched, and arrow's answer; plus deferred-failure, nesting and panic-unwind cases |
 
 Element types: **Int64 and Float64** are swept against arrow-rs. Boolean arrays are exercised as
 comparison output and filter masks, and Int32 as sort indices. Every other Arrow type the ABI
@@ -262,10 +271,11 @@ every other reduction test relies on.
 
 ## What is not wrapped
 
-`include/arrowmetal.h` has 220 entry points. `arrowmetal-sys` declares 37 of them and the safe crate
-covers the list above. Everything below is reachable from Swift, Python and the C ABI, and **not**
-from this crate. There is no technical obstacle to any of it; it is unwrapped because it is untested
-here, and an untested wrapper is not a shipped one.
+`include/arrowmetal.h` has 220 entry points. `arrowmetal-sys` declares 35 of them — every one called
+by the safe crate, none declared and unused — and the safe crate covers the list above. Everything
+below is reachable from Swift, Python and the C ABI, and **not** from this crate. There is no
+technical obstacle to any of it; it is unwrapped because it is untested here, and an untested wrapper
+is not a shipped one.
 
 | ABI area | Entry points |
 |---|---|
@@ -347,11 +357,18 @@ reduction is a loss.
   thread-local.
 * **No `RecordBatch` type.** Columns go across one at a time. The plan runner's `Source` takes a
   named set of columns, which is the closest thing here to a table.
-* **`arrowmetal-sys` declares 37 of the ABI's 220 entry points**, and the safe crate covers fewer.
+* **`arrowmetal-sys` declares 35 of the ABI's 220 entry points**, and every one of them is called by the safe crate (nothing is declared and unused).
   The table above lists what is missing.
 * **The crates are not published.** `publish = false` on both; use a path or git dependency.
 * **`arrow` is pinned to major version 59.** The C Data Interface structs are ABI-stable, so a
   different arrow-rs major would very likely work, but it is not tested here.
+* **A batch defers validation.** Inside `batch(|| …)` an operation that would fail — `take` with an
+  out-of-range index, say — returns `Ok` at the call and fails the whole batch at the end, which
+  `batch` reports as an `Err`. The value the closure produced is discarded: a readback (a reduction,
+  an export) forces a mid-batch flush, so some kernels in a failed batch have run and some have not,
+  and the ABI does not say where the line fell. Nested `batch` calls are safe — only the outermost
+  opens and commits one — but that is counted in this crate, not in the ABI: `am_batch_end` closes
+  whatever is open regardless of nesting.
 * **No async.** Every call is synchronous: outside a batch each one commits its command buffer and
   waits. The ABI has an async path (`Sources/ArrowMetal/Async.swift`); this crate does not use it.
 
@@ -362,5 +379,5 @@ cd rust
 ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib cargo test --release
 ```
 
-44 tests, plus 4 `no_run` doc-tests (compiled, not executed), all green as of this writing. What each file compares against is in
+48 tests, plus 4 `no_run` doc-tests (compiled, not executed), all green as of this writing. What each file compares against is in
 [`rust/README.md`](../rust/README.md) and in [TESTING.md](TESTING.md).
