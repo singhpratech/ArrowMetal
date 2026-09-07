@@ -18,7 +18,11 @@ Usage:
 measures the two alternately, case by case: a build measured in its own process is measured at a
 different minute, and at 1M rows the difference between two minutes on a shared machine is larger
 than the difference between the two builds. Each library gets its own Metal context and its own
-buffer pool, and every case warms both before either is timed.
+buffer pool, and every case warms both before either is timed. Passing the *same* build on both
+sides is how the harness's own noise floor was measured (at 1M rows it reaches 12%).
+
+Without `--baseline` one build runs per process, which is how full_matrix measures and what the
+matrix-comparable numbers come from; run the two tags one after the other, never at the same time.
 
 Prints one line per (op, shape, rows, build) and, with `--csv`, appends them to a CSV. Never run two
 of these at once: the numbers move by a factor on a busy GPU.
