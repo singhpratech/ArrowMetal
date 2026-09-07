@@ -4302,3 +4302,15 @@ def write_parquet(data, path, compression="snappy", use_dictionary=True, row_gro
                                  (compression or "none").encode(), 1 if use_dictionary else 0,
                                  int(row_group_size)))
     return str(path)
+
+
+# ---- out-of-core streaming execution (python/arrowmetal/stream.py, docs/STREAMING.md)
+#
+# Everything above works on arrays and batches that fit in memory. `am.scan_ipc(...)` and
+# `am.scan_arrow(...)` answer the same questions over datasets that do not: the rows flow from disk
+# through the GPU one batch at a time, with the read of batch i + 1, the kernels on batch i and the
+# merge of batch i - 1's result all in flight at once. Only the answer grows with the input.
+#
+# Imported last so `stream.py` can use the names defined above (`_lib`, `Expr`, `MetalArray`, ...).
+from . import stream                                                       # noqa: E402
+from .stream import Stream, GroupedStream, scan_ipc, scan_arrow, scan_table  # noqa: E402,F401

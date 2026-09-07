@@ -1425,6 +1425,98 @@ void        am_parquet_batch_release(am_parquet_batch* b);
 int am_parquet_write(const char* path, am_array** columns, const char** names, int64_t n_columns,
                      const char* compression, int dictionary, int64_t row_group_size);
 
+// ---------------------------------------------------------------------------------------------------
+// Out-of-core streaming execution (docs/STREAMING.md).
+//
+// A stream handle is a source of Arrow record batches -- an IPC file, a directory of them, or any
+// producer that speaks the Arrow C Stream ABI (pyarrow's RecordBatchReader and dataset scanners, so
+// Parquet and CSV arrive this way; Polars; DuckDB) -- plus the filter and projection built on it.
+// A terminal call runs a three-stage pipeline: the reader thread maps and imports batch i + 1 while
+// the GPU runs batch i and the merge thread folds batch i - 1's small result into the running state.
+// Memory is one batch in flight plus the answer, so a 100 GB dataset answers in a few GB of RAM.
+//
+// The handle is single-use per terminal: a terminal consumes the source. Release it with
+// am_stream_release, and every result handle with am_stream_result_release. Errors are reported by a
+// non-zero return (or NULL) plus am_stream_last_error().
+typedef struct am_stream am_stream;
+typedef struct am_stream_result am_stream_result;
+
+// Streaming aggregate op codes:
+//   0 sum   1 count   2 min   3 max   4 mean   5 variance   6 stddev   7 count_distinct_approx
+// sum/count/min/max/mean/variance/stddev are EXACT (each is decomposed into pieces a batch can
+// produce independently and a merge can combine); count_distinct_approx is a GPU HyperLogLog sketch
+// merged across batches, with a relative standard error of 1.04 / sqrt(2^precision).
+// A column of NULL is only valid for count (which then counts rows).
+
+const char* am_stream_last_error(void);
+
+// Opens an Arrow IPC file or a directory of them. prefetch_depth batches are read ahead on their own
+// thread (3 is a good default; 0 disables prefetching). readers > 1 reads that many files of a
+// directory at once, which scales the read stage with cores; batch order is then NOT preserved, so
+// use readers = 1 when the output must keep the source's row order.
+am_stream* am_stream_open_ipc(const char* path, int prefetch_depth, int readers);
+// Takes ownership of a foreign ArrowArrayStream and streams its batches.
+am_stream* am_stream_from_c_stream(struct ArrowArrayStream* in, int prefetch_depth);
+void       am_stream_release(am_stream* s);
+
+// Building the query. expr_text is the s-expression of docs/EXPR.md ("(gt (col \"x\") (int 3))").
+int am_stream_filter(am_stream* s, const char* expr_text);
+int am_stream_select(am_stream* s, const char** names, int64_t n);
+int am_stream_project(am_stream* s, const char** names, const char** expr_texts, int64_t n);
+// Called once per batch with (batches, rows, bytes_read, total_bytes, user). Pass NULL to clear.
+typedef void (*am_stream_progress_fn)(int64_t batches, int64_t rows, int64_t bytes_read,
+                                      int64_t total_bytes, void* user);
+int am_stream_set_progress(am_stream* s, am_stream_progress_fn fn, void* user);
+
+// Terminals. Each runs the pipeline once and fills *out with a result handle.
+//
+// am_stream_query takes a whole "(query ...)" s-expression: a project terminal streams rows (to
+// sink_path as an Arrow IPC stream file, or collected into the result's columns when sink_path is
+// NULL), an aggregate terminal streams the aggregates and returns scalars.
+int am_stream_query(am_stream* s, const char* query_text, const char* sink_path, am_stream_result** out);
+int am_stream_aggregate(am_stream* s, const int* ops, const char** columns, const char** names,
+                        int64_t n, int hll_precision, int ddof, am_stream_result** out);
+// Streaming group-by with a persistent aggregate state. dense_key_count > 0 promises one integer key
+// column already inside [0, dense_key_count) and keeps the global table on the GPU; 0 uses the
+// arbitrary-key path (any type, any number of key columns) with the global table on the host.
+int am_stream_group_by(am_stream* s, const char** keys, int64_t n_keys,
+                       const int* ops, const char** columns, const char** names, int64_t n_aggs,
+                       int64_t dense_key_count, int ddof, am_stream_result** out);
+int am_stream_top_k(am_stream* s, const char* column, int64_t k, int largest, am_stream_result** out);
+// Approximate quantiles from a GPU digest merged across batches (compression 0 means 1000).
+int am_stream_quantiles(am_stream* s, const char* column, const double* qs, int64_t n_q,
+                        int64_t compression, am_stream_result** out);
+// External sort: one sorted run per batch under scratch_dir, then a k-way merge. limit 0 means all.
+int am_stream_sort(am_stream* s, const char** columns, const int* descending, int64_t n_keys,
+                   int64_t limit, const char* scratch_dir, const char* sink_path, am_stream_result** out);
+int am_stream_sink_ipc(am_stream* s, const char* path, am_stream_result** out);
+// kind: 0 inner, 1 left.
+int am_stream_join_broadcast(am_stream* s, struct ArrowArrayStream* build, const char* probe_key,
+                             const char* build_key, int kind, const char* sink_path,
+                             am_stream_result** out);
+int am_stream_join_grace(am_stream* left, am_stream* right, const char* left_key, const char* right_key,
+                         int kind, int64_t partitions, const char* scratch_dir, const char* sink_path,
+                         am_stream_result** out);
+// Exports the filtered and projected rows as an Arrow C Stream: get_next pulls exactly one batch
+// through the whole pipeline, so pyarrow or Polars can consume an out-of-core query lazily.
+int am_stream_export_c(am_stream* s, struct ArrowArrayStream* out);
+
+// Results.
+int64_t     am_stream_result_column_count(am_stream_result* r);
+const char* am_stream_result_column_name(am_stream_result* r, int64_t i);
+int         am_stream_result_column(am_stream_result* r, int64_t i, am_array** out);
+int64_t     am_stream_result_scalar_count(am_stream_result* r);
+const char* am_stream_result_scalar_name(am_stream_result* r, int64_t i);
+// out_kind: 0 = int64 in out_i64, 1 = uint64 in the same slot, 2 = float64 in out_f64.
+int         am_stream_result_scalar(am_stream_result* r, int64_t i, int64_t* out_i64, double* out_f64,
+                                    int* out_kind, int* is_null);
+int64_t     am_stream_result_rows_out(am_stream_result* r);
+// Pipeline statistics. overlap is (read + gpu + merge) / wall: 1.0 serial, up to 3.0 fully overlapped.
+int         am_stream_result_stats(am_stream_result* r, int64_t* batches, int64_t* rows,
+                                   int64_t* bytes_read, double* wall_s, double* read_s,
+                                   double* gpu_s, double* merge_s, double* overlap);
+void        am_stream_result_release(am_stream_result* r);
+
 #ifdef __cplusplus
 }
 #endif
