@@ -593,3 +593,278 @@ def test_unique_is_first_seen_and_keeps_nulls():
     rng = np.random.default_rng(0)
     big = pl.Series("x", rng.integers(0, 10, 200_000))
     assert big.arrowmetal.unique().to_list() == list(dict.fromkeys(big.to_list()))
+
+
+# ---------------------------------------------------------------------------------------------
+# Tier 2, adversarial: the plugin against the tier-1 bridge and against native Polars.
+#
+# The eight tests above only ever ran once the Rust library was built, which nobody had done, so
+# everything below is the first pass over the plugin with the dylib actually loaded.
+# ---------------------------------------------------------------------------------------------
+
+_DUNDER = {"add": "__add__", "sub": "__sub__", "mul": "__mul__", "truediv": "__truediv__"}
+
+
+def t1_arith(series, op, value):
+    """The tier-1 bridge's answer for the same scalar arithmetic, as a list."""
+    out = getattr(am.from_polars(series), _DUNDER[op])(value)
+    return am.to_polars(out, series.name).to_list()
+
+
+def t2_arith(series, op, value):
+    """The tier-2 plugin's answer, inside a lazy plan."""
+    return (pl.DataFrame({series.name: series}).lazy()
+            .select(getattr(pl.col(series.name).arrowmetal, op)(value))
+            .collect().to_series().to_list())
+
+
+@needs_plugin
+def test_plugin_scalar_arithmetic_is_exact_past_2_to_the_53():
+    """`_arith` sent `float(value)`, so an Int64 operand lost its low bits before the kernel saw
+    it: `add(2**60 + 1)` added `2**60`. The scalar now crosses as exact decimal digits."""
+    for dtype, value in [(pl.Int64, 2 ** 60 + 1), (pl.Int64, -(2 ** 60) - 1),
+                         (pl.UInt64, 2 ** 63 + 5), (pl.UInt64, 2 ** 64 - 1)]:
+        s = pl.Series("x", [10, 20], dtype=dtype)
+        assert t2_arith(s, "add", value) == t1_arith(s, "add", value), (dtype, value)
+        assert t2_arith(s, "add", value) == (s + value).to_list(), (dtype, value)
+    # ... and the exact digits survive a multiplication too, where a float would round.
+    s = pl.Series("x", [3], dtype=pl.Int64)
+    assert t2_arith(s, "mul", 3 ** 33) == t1_arith(s, "mul", 3 ** 33) == [3 * 3 ** 33]
+
+
+@needs_plugin
+def test_plugin_refuses_a_scalar_the_column_type_cannot_hold():
+    """`scalar_bytes` narrowed with Rust `as`, which saturates floats and truncates integers, so
+    `add(1000)` on Int8 quietly became `add(127)`, `add(-1)` on UInt8 a no-op, and `add(1.5)` on
+    Int64 `add(1)`. The tier-1 bridge packs the scalar with `struct.pack` at the column's own
+    width and raises on all three; the plugin now answers the same way.
+
+    "Integers wrap" in docs/POLARS.md is about the arithmetic, not the operand: 127 + 1 is still
+    -128 on an Int8 column.
+    """
+    refused = [
+        (pl.Series("x", [1, 2, 127], dtype=pl.Int8), "add", 1000),
+        (pl.Series("x", [1, 2, 127], dtype=pl.Int8), "sub", -200),
+        (pl.Series("x", [1, 2, 250], dtype=pl.UInt8), "add", -1),
+        (pl.Series("x", [1, 2], dtype=pl.UInt32), "mul", -1),
+        (pl.Series("x", [10, 20], dtype=pl.Int64), "add", 1.5),
+        (pl.Series("x", [10, 20], dtype=pl.Int32), "mul", 3.9),
+        (pl.Series("x", [10, 20], dtype=pl.Int64), "add", 2 ** 64),
+        (pl.Series("x", [10, 20], dtype=pl.UInt64), "add", 2 ** 200),
+    ]
+    for s, op, value in refused:
+        with pytest.raises(Exception):                       # struct.error
+            t1_arith(s, op, value)
+        with pytest.raises(Exception, match="arrowmetal"):
+            t2_arith(s, op, value)
+
+    # What the two tiers do accept, they agree on -- including the wrap the docs promise.
+    assert t2_arith(pl.Series("x", [1, 2, 127], dtype=pl.Int8), "add", 1) == [2, 3, -128]
+    assert t1_arith(pl.Series("x", [1, 2, 127], dtype=pl.Int8), "add", 1) == [2, 3, -128]
+    assert t2_arith(pl.Series("x", [0], dtype=pl.UInt8), "sub", 1) == [255]
+    # A float column takes an integer, and an f32 overflow becomes an infinity in both tiers.
+    f32 = pl.Series("x", [1.0, 2.0], dtype=pl.Float32)
+    assert t2_arith(f32, "mul", 1e300) == t1_arith(f32, "mul", 1e300) == [float("inf")] * 2
+    f64 = pl.Series("x", [1.0], dtype=pl.Float64)
+    assert t2_arith(f64, "add", 2 ** 70) == t1_arith(f64, "add", 2 ** 70) == [float(2 ** 70)]
+    # A dtype with no scalar form is an error in both, not a wrong answer.
+    with pytest.raises(Exception, match="arrowmetal"):
+        t2_arith(pl.Series("x", [True, False]), "add", 1)
+
+
+@needs_plugin
+def test_plugin_null_handling_matches_native_polars():
+    df = pl.DataFrame({"v": [1, None, 3, None, 5],
+                       "f": [1.0, None, 3.0, 4.0, None],
+                       "s": ["ab", None, "cd", "ab", None]})
+    got = df.lazy().select(
+        pl.col("v").arrowmetal.sum().alias("sum"),
+        pl.col("v").arrowmetal.min().alias("min"),
+        pl.col("v").arrowmetal.max().alias("max"),
+        pl.col("f").arrowmetal.mean().alias("mean"),
+    ).collect()
+    assert got["sum"][0] == df["v"].sum()
+    assert got["min"][0] == df["v"].min()
+    assert got["max"][0] == df["v"].max()
+    assert got["mean"][0] == pytest.approx(df["f"].mean())
+
+    ew = df.lazy().select(
+        pl.col("v").arrowmetal.add(1).alias("plus"),
+        pl.col("s").arrowmetal.upper().alias("up"),
+        pl.col("s").arrowmetal.contains("a").alias("has"),
+        pl.col("v").arrowmetal.hash64().alias("h"),
+    ).collect()
+    assert ew["plus"].to_list() == (df["v"] + 1).to_list()
+    assert ew["up"].to_list() == df["s"].str.to_uppercase().to_list()
+    assert ew["has"].to_list() == df["s"].str.contains("a", literal=True).to_list()
+    assert ew["h"].null_count() == df["v"].null_count()          # a null hashes to null
+
+    total = df.lazy().select(
+        pl.col("v").arrowmetal.filter_sum(pl.col("f") > 2.0)).collect().item()
+    assert total == df.filter(pl.col("f") > 2.0)["v"].sum()
+
+    grouped = (df.lazy()
+               .select(pl.col("s").arrowmetal.group_by_sum(pl.col("v")).alias("g"))
+               .collect().unnest("g").sort("s", nulls_last=True))
+    want = df.group_by("s").agg(pl.col("v").sum()).sort("s", nulls_last=True)
+    assert grouped.to_dicts() == want.to_dicts()                 # the null key is its own group
+
+
+@needs_plugin
+def test_plugin_sum_of_an_empty_or_all_null_column_is_null_where_polars_says_zero():
+    """`am_reduce` has nothing to add up and answers null; `pl.Series.sum()` answers 0. Both tiers
+    do this -- it is Arrow's rule, not a plugin bug -- but docs/POLARS.md said scalar reductions
+    come back "exactly as `pl.Series.sum()` does", which is untrue in this one case."""
+    for s in [pl.Series("v", [], dtype=pl.Int64), pl.Series("v", [None, None], dtype=pl.Int64)]:
+        got = pl.DataFrame({"v": s}).lazy().select(pl.col("v").arrowmetal.sum()).collect().item()
+        assert got is None
+        assert s.sum() == 0                                      # what Polars answers
+        assert s.arrowmetal.sum() is None                        # tier 1 agrees with tier 2
+        # min/mean are null on both sides, so only sum diverges.
+        assert pl.DataFrame({"v": s}).lazy().select(
+            pl.col("v").arrowmetal.min()).collect().item() is None
+        assert s.min() is None
+
+
+@needs_plugin
+def test_plugin_handles_a_sliced_and_a_chunked_series():
+    """`to_metal` rechunks, and a Polars slice is an offset into a shared buffer. Both have to
+    reach the kernel as the rows the plan actually selected."""
+    df = pl.DataFrame({"v": list(range(20)), "s": [f"r{i}" for i in range(20)]})
+
+    sl = df.slice(3)
+    got = sl.lazy().select(
+        pl.col("v").arrowmetal.sum().alias("sum"),
+        pl.col("v").arrowmetal.max().alias("max"),
+    ).collect()
+    assert got["sum"][0] == sl["v"].sum() == sum(range(3, 20))
+    assert got["max"][0] == 19
+    assert (sl.lazy().select(pl.col("v").arrowmetal.add(1)).collect()["v"].to_list()
+            == (sl["v"] + 1).to_list())
+    assert (sl.lazy().select(pl.col("s").arrowmetal.upper()).collect()["s"].to_list()
+            == sl["s"].str.to_uppercase().to_list())
+
+    cat = pl.concat([df.slice(0, 7), df.slice(7)], rechunk=False)
+    assert cat["v"].n_chunks() == 2
+    assert cat.lazy().select(pl.col("v").arrowmetal.sum()).collect().item() == cat["v"].sum()
+    assert (cat.lazy().select(pl.col("s").arrowmetal.upper()).collect()["s"].to_list()
+            == cat["s"].str.to_uppercase().to_list())
+    assert (sorted(cat.lazy().select(pl.col("v").arrowmetal.top_k(4)).collect()["v"].to_list())
+            == sorted(cat["v"].top_k(4).to_list()))
+
+
+@needs_plugin
+def test_plugin_on_an_empty_frame():
+    """Nothing here may crash or return the wrong length; `changes_length` expressions answer 0
+    rows and `returns_scalar` ones answer one null."""
+    e = pl.DataFrame({"v": pl.Series("v", [], dtype=pl.Int64),
+                      "s": pl.Series("s", [], dtype=pl.String)})
+    empty = e.lazy().select(
+        pl.col("v").arrowmetal.add(1).alias("plus"),
+        pl.col("v").arrowmetal.hash64().alias("h"),
+        pl.col("s").arrowmetal.upper().alias("up"),
+        pl.col("s").arrowmetal.contains("a").alias("has"),
+    ).collect()
+    assert empty.height == 0
+    assert empty.schema["plus"] == pl.Int64 and empty.schema["h"] == pl.UInt64
+    assert e.lazy().select(pl.col("v").arrowmetal.top_k(3)).collect().height == 0
+    assert e.lazy().select(
+        pl.col("s").arrowmetal.group_by_sum(pl.col("v")).alias("g")).collect().height == 0
+    assert e.lazy().select(
+        pl.col("v").arrowmetal.filter_sum(pl.col("s") == "a")).collect().item() is None
+    assert e.lazy().select(pl.col("v").arrowmetal.mean()).collect().item() is None
+
+
+@needs_plugin
+def test_plugin_accepts_a_validity_bitmap_with_no_nulls():
+    """An all-set validity buffer is the shape `fill_null` and `filter` leave behind: null_count 0
+    but a bitmap still attached, which a kernel that only checks `null_count` could mis-read."""
+    s = pl.Series("v", [1, 2, None, 4]).fill_null(9)
+    arrow = s.to_arrow()
+    chunk = arrow.combine_chunks() if isinstance(arrow, pa.ChunkedArray) else arrow
+    assert chunk.buffers()[0] is not None and s.null_count() == 0
+    df = pl.DataFrame({"v": s})
+    assert df.lazy().select(pl.col("v").arrowmetal.sum()).collect().item() == s.sum() == 16
+    assert (df.lazy().select(pl.col("v").arrowmetal.add(1)).collect()["v"].to_list()
+            == (s + 1).to_list())
+    assert df.lazy().select(pl.col("v").arrowmetal.hash64()).collect()["v"].null_count() == 0
+
+
+@needs_plugin
+@pytest.mark.parametrize("dtype_name, series", [
+    ("Boolean", pl.Series("x", [True, False])),
+    ("Date", pl.Series("x", [1, 2], dtype=pl.Int32).cast(pl.Date)),
+    ("Datetime", pl.Series("x", [1, 2], dtype=pl.Int64).cast(pl.Datetime("us"))),
+    ("Duration", pl.Series("x", [1, 2], dtype=pl.Int64).cast(pl.Duration("us"))),
+    ("Time", pl.Series("x", [1, 2], dtype=pl.Int64).cast(pl.Time)),
+    ("String", pl.Series("x", ["a", "b"])),
+    ("Binary", pl.Series("x", [b"a", b"b"])),
+    ("Categorical", pl.Series("x", ["a", "b"], dtype=pl.Categorical)),
+    ("List", pl.Series("x", [[1, 2], [3]])),
+    ("Struct", pl.Series("x", [{"a": 1}, {"a": 2}])),
+    ("Decimal", pl.Series("x", ["1.5", "2.5"]).cast(pl.Decimal(10, 2))),
+    ("Null", pl.Series("x", [None, None], dtype=pl.Null)),
+])
+def test_plugin_refuses_an_unsupported_dtype_with_an_error_not_a_panic(dtype_name, series):
+    """The numeric tier-2 expressions take the eight integer widths and Float32/64 and nothing
+    else -- narrower than the dtypes the *bridge* round-trips, which is what docs/POLARS.md's
+    "Types" paragraph is about. What matters is that every refusal is a Polars error carrying
+    ArrowMetal's wording: a Rust panic crossing pyo3 would be a finding.
+    """
+    df = pl.DataFrame({"x": series})
+    exprs = [pl.col("x").arrowmetal.sum(), pl.col("x").arrowmetal.min(),
+             pl.col("x").arrowmetal.top_k(1), pl.col("x").arrowmetal.add(1),
+             pl.col("x").arrowmetal.group_by_sum(pl.col("x")).alias("g")]
+    if dtype_name != "String":
+        exprs.append(pl.col("x").arrowmetal.upper())
+    for expr in exprs:
+        with pytest.raises(Exception, match="arrowmetal") as exc:
+            df.lazy().select(expr).collect()
+        assert "panicked" not in str(exc.value), (dtype_name, str(exc.value)[:200])
+        assert type(exc.value).__name__ != "PanicException", dtype_name
+
+    # `hash64` is the one that reaches further: it takes every fixed-width dtype, temporal and
+    # boolean included, and refuses the rest the same way.
+    fixed_width = dtype_name in {"Boolean", "Date", "Datetime", "Duration", "Time", "String"}
+    if fixed_width:
+        assert df.lazy().select(
+            pl.col("x").arrowmetal.hash64()).collect()["x"].dtype == pl.UInt64
+    else:
+        with pytest.raises(Exception, match="arrowmetal"):
+            df.lazy().select(pl.col("x").arrowmetal.hash64()).collect()
+
+
+@needs_plugin
+def test_plugin_runs_inside_group_by_agg_and_a_streaming_plan():
+    """docs/POLARS.md claims both: the expression is called once per group inside `.agg(...)`, and
+    it survives `collect(engine="streaming")` in a `with_columns`."""
+    df = pl.DataFrame({"k": [1, 1, 2, 2, 2],
+                       "v": [1, 2, 3, 4, 5],
+                       "s": ["a", "b", "c", "d", "e"]})
+
+    agg = (df.lazy().group_by("k")
+           .agg(pl.col("v").arrowmetal.sum().alias("total"),
+                pl.col("v").arrowmetal.min().alias("lo"),
+                pl.col("v").arrowmetal.max().alias("hi"))
+           .sort("k").collect())
+    want = (df.group_by("k")
+            .agg(pl.col("v").sum().alias("total"),
+                 pl.col("v").min().alias("lo"),
+                 pl.col("v").max().alias("hi"))
+            .sort("k"))
+    assert agg.to_dicts() == want.to_dicts()
+
+    streamed = (df.lazy()
+                .with_columns(pl.col("v").arrowmetal.add(10).alias("plus"),
+                              pl.col("s").arrowmetal.upper().alias("up"))
+                .collect(engine="streaming"))
+    assert streamed["plus"].to_list() == (df["v"] + 10).to_list()
+    assert streamed["up"].to_list() == df["s"].str.to_uppercase().to_list()
+
+    assert df.lazy().select(
+        pl.col("v").arrowmetal.sum()).collect(engine="streaming").item() == df["v"].sum()
+    assert (df.lazy().filter(pl.col("k") == 2)
+            .with_columns(pl.col("s").arrowmetal.upper().alias("up"))
+            .collect(engine="streaming")["up"].to_list() == ["C", "D", "E"])
+    assert (df.lazy().group_by("k").agg(pl.col("v").arrowmetal.sum().alias("total"))
+            .sort("k").collect(engine="streaming").to_dicts() == want.select("k", "total").to_dicts())
