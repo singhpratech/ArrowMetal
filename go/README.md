@@ -39,7 +39,7 @@ ARROWMETAL_LIB=$PWD/../../.build/release/libArrowMetalC.dylib go test ./...
 GOEXPERIMENT=cgocheck2 ARROWMETAL_LIB=$PWD/../../.build/release/libArrowMetalC.dylib go test -count=1 ./...
 ```
 
-45 test functions, 164 cases with subtests, run both ways. Every wrapped operation is checked
+46 test functions, 177 cases with subtests, run both ways. Every wrapped operation is checked
 against Arrow Go's own compute where arrow-go has the function, and against a plain Go loop where it
 does not (arrow-go's compute package registers no aggregate function at all — no `sum`, `mean` or
 `min_max`). Lengths 0, 1, 1000 and 1,000,001; nulls at several densities, in keys as well as values;

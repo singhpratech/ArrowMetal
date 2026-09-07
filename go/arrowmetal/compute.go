@@ -292,25 +292,51 @@ func scalarBytes(format string, v any) (unsafe.Pointer, error) {
 		return p, nil
 
 	case "f", "g": // float32, float64
+		// Ordinary rounding is fine and expected: 0.1 against a float32 column compares against
+		// float32(0.1), which is what every Arrow implementation does. What is refused here is a
+		// conversion that changes the *class* of the value — a finite number becoming infinite or
+		// zero, or an integer landing on a different integer — because then the comparison answers
+		// about a value the caller never named.
+		// Every integer up to the mantissa width is exact; past it, consecutive integers share a
+		// float and the scalar would land on a neighbour. The limit is stated rather than
+		// round-tripped through a conversion, because float-to-int conversion is undefined in Go
+		// once the value leaves the integer type's range.
+		exactInts := int64(1) << 53 // float64
+		if format == "f" {
+			exactInts = int64(1) << 24 // float32
+		}
 		var x float64
 		switch {
 		case isFl:
 			x = fl
 		case isSI:
+			if si > exactInts || si < -exactInts {
+				return rangeErr()
+			}
 			x = float64(si)
 		case isUI:
+			if ui > uint64(exactInts) {
+				return rangeErr()
+			}
 			x = float64(ui)
 		default:
 			return typeErr()
 		}
 		if format == "f" {
-			// A finite value too large for float32 would become ±Inf, which is a different
-			// comparison from the one the caller asked for.
-			if !math.IsInf(x, 0) && !math.IsNaN(x) && math.Abs(x) > math.MaxFloat32 {
-				return rangeErr()
+			f32 := float32(x)
+			if !math.IsInf(x, 0) && !math.IsNaN(x) {
+				// Overflow: a finite value too large for float32 becomes ±Inf.
+				if math.IsInf(float64(f32), 0) {
+					return rangeErr()
+				}
+				// Underflow: a non-zero value too small for float32 becomes 0, so `Eq 5e-46` would
+				// silently ask about zero and match every zero in the column.
+				if f32 == 0 && x != 0 {
+					return rangeErr()
+				}
 			}
 			p := alloc(4)
-			*(*float32)(p) = float32(x)
+			*(*float32)(p) = f32
 			return p, nil
 		}
 		p := alloc(8)

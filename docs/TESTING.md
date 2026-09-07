@@ -8,7 +8,7 @@ pushed. Numbers are from the last gated run of `main` (0.1.0, unreleased) on an 
 | Swift suites (`Tests/ArrowMetalTests`) | 764 tests in 60 files, run in release | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
 | Python suites (`python/tests`) | 2,460 collected cases over the ctypes API and the three integrations | `pyarrow.compute`, Polars, DuckDB, pandas |
 | Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | 39,069 generated cases, 45 column types, every public operation | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
-| Go binding (`go/arrowmetal`) | 45 test functions, 164 cases with subtests, run twice (plain and under `GOEXPERIMENT=cgocheck2`) | `arrow-go/v18`'s own `compute` where it has the function, plain Go loops where it does not ([GO.md](GO.md)) |
+| Go binding (`go/arrowmetal`) | 46 test functions, 177 cases with subtests, run twice (plain and under `GOEXPERIMENT=cgocheck2`) | `arrow-go/v18`'s own `compute` where it has the function, plain Go loops where it does not ([GO.md](GO.md)) |
 | Adversarial review pass | four independent reviewers plus a coverage pass before release | each finding carries a regression test |
 | Benchmarks (`Benchmarks/`) | 339 operation-and-size rows over 173 operations, against four CPU libraries; streaming and engine benches | measured, never estimated ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md)) |
 

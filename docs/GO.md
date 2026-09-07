@@ -230,8 +230,8 @@ the rows.
 
 ## What is covered
 
-Every item below has at least one test in `go/arrowmetal`; the oracle is named. 45 test functions,
-164 cases counting subtests, all green.
+Every item below has at least one test in `go/arrowmetal`; the oracle is named. 46 test functions,
+177 cases counting subtests, all green.
 
 | Surface | Go API | Oracle |
 |---|---|---|
@@ -240,7 +240,7 @@ Every item below has at least one test in `go/arrowmetal`; the oracle is named. 
 | Sum, Min, Max, Mean | `(*Array).Sum/Min/Max/Mean` | plain Go loops (arrow-go has no aggregates); Int64 and Float64, with and without nulls |
 | Null and NaN rules | the same | all-null and empty arrays report an invalid `Scalar`; min/max skip NaN; an all-NaN column is null |
 | Compare against a scalar | `(*Array).CompareScalar` | `compute.CallFunction("equal"/"not_equal"/"less"/"less_equal"/"greater"/"greater_equal")`, all six, with nulls |
-| Scalar range checking | the same | a scalar outside the column's element type is an error, at both edges of int8, uint8 and float32; the values that do fit agree with a Go loop |
+| Scalar range checking | the same | 27 cases: integer overflow at both edges of int8 and uint8, float32 overflow and underflow, integers past 2^24 and 2^53, ordinary rounding still allowed; the values that do fit agree with a Go loop |
 | Compare two arrays | `(*Array).CompareArray` | length-mismatch error path |
 | Filter | `(*Array).Filter` | `compute.FilterArray` with `SelectionDropNulls` |
 | Take | `(*Array).Take` | `compute.TakeArray`, including null indices |
@@ -255,7 +255,7 @@ Every item below has at least one test in `go/arrowmetal`; the oracle is named. 
 | Allocator alignment | the Go heap's shape | every Go-heap offset past a page is 0 or 8192 and nothing else, at 1M and 10M, 20 trials each |
 | cgo pointer rules | `Import` | the whole suite again under `GOEXPERIMENT=cgocheck2`; removing the pin makes it die on the first round trip |
 | Handle lifecycle | `Release` | repeated import of one `arrow.Array`; a long-lived handle alongside short-lived ones; a released handle errors rather than crashing |
-| Leaks | the whole chain | 2,000 import/compare/filter/export/release round trips at 200k rows; `TASK_VM_INFO.phys_footprint` has to stay inside 16 MB of the baseline (it grows about 2.5 MB, and leaking just the mask handle grows 35 MB) |
+| Leaks | the whole chain | 2,000 import/compare/filter/export/release round trips at 200k rows, in a child process so the baseline is its own; `TASK_VM_INFO.phys_footprint` has to stay inside 16 MB (it grows about 2.3 MB, and leaking just the mask handle grows 35 MB — checked in the shipped test order) |
 | The loader | `Init`, `LibraryPath` | a child process with `ARROWMETAL_LIB` pointing at nothing, and a child with nothing set in an empty directory: the error has to name the variable, the paths and the `swift build` line |
 | Docs | the example in this file | compiled and run as `Example()`, so it cannot drift from the API |
 
@@ -309,16 +309,28 @@ Adding any of these is mechanical: a prototype in `amshim.h`, a pointer and a fo
   call, which is tens of nanoseconds against kernels measured in hundreds of microseconds.
 - **Release your handles.** A finalizer is set as a backstop, but GPU memory should not wait for the
   garbage collector, and the finalizer runs at an unpredictable time.
-- **Go heap buffers stay pinned for the life of the handle.** Importing an array built with Arrow
-  Go's default allocator hands C a pointer into the Go heap that ArrowMetal keeps until the handle
-  is released, so `Import` pins those buffers and `Release` unpins them (see
+- **Go heap buffers stay pinned for the life of the handle — and only that long.** Importing an
+  array built with Arrow Go's default allocator hands C a pointer into the Go heap that ArrowMetal
+  keeps until the handle is released, so `Import` pins those buffers and `Release` unpins them (see
   [Go pointers, cgo, and why pinning is not optional](#go-pointers-cgo-and-why-pinning-is-not-optional)).
   Pinned objects cannot be moved or freed, so a handle you forget to release holds its source
-  buffers as well as its GPU memory.
-- **Scalar comparison covers the primitive types only.** `CompareScalar` accepts a Go value for
-  int8…int64, uint8…uint64, float32, float64 and bool, range-checked against the column's element
-  type: `int64(1000)` against an int8 column is an error naming both, not a silent −24. A string,
-  decimal or temporal scalar returns an error naming the Arrow format string rather than guessing.
+  buffers as well as its GPU memory. The converse is the open edge: an `arrow.Array` you exported
+  from a borrowed Go-heap import still names those bytes after `Release` has unpinned them — they
+  stay *alive*, through arrow-go's own reference chain, but they are no longer *pinned*, so the
+  binding is back to relying on Go's collector not moving heap objects for as long as that exported
+  array lives. Pinning does not close that window. Importing from `PageAlignedAllocator` does, since
+  C memory is never the collector's to move.
+- **Scalar comparison covers the primitive types only, and refuses a scalar it cannot represent.**
+  `CompareScalar` accepts a Go value for int8…int64, uint8…uint64, float32, float64 and bool,
+  range-checked against the column's element type. Refused, with an error naming the value and the
+  Arrow type: an integer outside the column's width (`int64(1000)` against int8 is an error, not a
+  silent −24); a finite float too large for the column (`1e300` against float32, which would become
+  `+Inf`); a non-zero float too small for it (`5e-46` against float32, which would become `0` and
+  match every zero in the column); and an integer past the mantissa width, 2^24 for float32 and
+  2^53 for float64, which would land on a neighbouring value. Ordinary rounding is *not* refused:
+  `0.1` against a float32 column compares against `float32(0.1)`, as it does in every Arrow
+  implementation. A string, decimal or temporal scalar returns an error naming the Arrow format
+  string rather than guessing.
 - **The vendored headers can drift.** `go/arrowmetal/include/arrowmetal.h` and `arrow_abi.h` are
   copies of the repository's `include/`, because a Go module can only see files inside its own
   directory. `TestHeadersMatchRepository` compares them when it is run inside a checkout and skips

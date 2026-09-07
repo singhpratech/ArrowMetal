@@ -37,6 +37,12 @@ func TestCompareScalarRangeCheck(t *testing.T) {
 		b.AppendValues([]float32{-1, 0, 1}, nil)
 		return b.NewArray()
 	}
+	f64Arr := func() arrow.Array {
+		b := array.NewFloat64Builder(mem)
+		defer b.Release()
+		b.AppendValues([]float64{-1, 0, 1}, nil)
+		return b.NewArray()
+	}
 
 	for _, tc := range []struct {
 		name   string
@@ -58,6 +64,23 @@ func TestCompareScalarRangeCheck(t *testing.T) {
 		{"float32 vs -1e300", f32Arr, -1e300, false},
 		{"float32 vs 1e30", f32Arr, 1e30, true},
 		{"float32 vs +Inf", f32Arr, math.Inf(1), true},
+		// Underflow is as wrong as overflow: float32(5e-46) is 0, so an unchecked Eq would ask
+		// about zero and match every zero in the column.
+		{"float32 vs 5e-46", f32Arr, 5e-46, false},
+		{"float32 vs -5e-46", f32Arr, -5e-46, false},
+		{"float32 vs the smallest float32 subnormal", f32Arr, 1.4e-45, true},
+		{"float32 vs 0", f32Arr, 0.0, true},
+		// Ordinary rounding stays allowed: float32(0.1) != 0.1, but that is what every Arrow
+		// implementation compares against.
+		{"float32 vs 0.1", f32Arr, 0.1, true},
+		// Integers past the mantissa width would land on a neighbouring float.
+		{"float32 vs 1<<24", f32Arr, int64(1) << 24, true},
+		{"float32 vs 1<<24 + 1", f32Arr, int64(1)<<24 + 1, false},
+		{"float64 vs 1<<53", f64Arr, int64(1) << 53, true},
+		{"float64 vs 1<<53 + 1", f64Arr, int64(1)<<53 + 1, false},
+		{"float64 vs int64 max", f64Arr, int64(math.MaxInt64), false},
+		{"float64 vs uint64 max", f64Arr, uint64(math.MaxUint64), false},
+		{"float64 vs 5e-46", f64Arr, 5e-46, true}, // float64 names it exactly
 		{"int8 vs a string", int8Arr, "nope", false},
 		{"int8 vs a bool", int8Arr, true, false},
 	} {
@@ -89,6 +112,32 @@ func TestCompareScalarRangeCheck(t *testing.T) {
 			t.Logf("%v", err)
 		})
 	}
+}
+
+// TestCompareScalarUnderflowIsNotZero is the reproducer for the float32 underflow case, kept
+// separate because the wrong answer was not a crash but a plausible-looking mask.
+//
+// float32(5e-46) is 0, so before the check `Eq 5e-46` against [0, 1e-30, 1] answered
+// [true false false] — it matched the zero, having quietly become a comparison against zero.
+func TestCompareScalarUnderflowIsNotZero(t *testing.T) {
+	requireLib(t)
+	b := array.NewFloat32Builder(mem)
+	defer b.Release()
+	b.AppendValues([]float32{0, 1e-30, 1}, nil)
+	src := b.NewArray()
+	defer src.Release()
+	h := importArr(t, src)
+
+	out, err := h.CompareScalar(am.Eq, 5e-46)
+	if out != nil {
+		defer out.Release()
+	}
+	if err == nil {
+		got, _ := boolsOf(t, exportArr(t, out))
+		t.Fatalf("CompareScalar(Eq, 5e-46) on a float32 column returned %v; "+
+			"the scalar underflows to zero and must be refused", got)
+	}
+	t.Logf("%v", err)
 }
 
 // TestCompareScalarBoundariesAgreeWithGo checks that the values which do fit are compared correctly
