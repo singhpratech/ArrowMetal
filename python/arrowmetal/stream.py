@@ -26,7 +26,8 @@ import pyarrow as pa
 
 from . import _lib, _P, _check, ArrowMetalError, MetalArray, Expr, _as_expr
 
-__all__ = ["scan_ipc", "scan_arrow", "scan_table", "Stream", "GroupedStream"]
+__all__ = ["scan_ipc", "scan_arrow", "scan_table", "Stream", "GroupedStream", "JoinedStream",
+           "JoinedGroupedStream"]
 
 # Aggregate op codes: the C ABI contract (see include/arrowmetal.h).
 _STREAM_AGG = {"sum": 0, "count": 1, "min": 2, "max": 3, "mean": 4,
@@ -96,6 +97,19 @@ _lib.am_stream_join_broadcast.restype = ctypes.c_int
 _lib.am_stream_join_grace.argtypes = [_S, _S, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int,
                                       ctypes.c_int64, ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(_R)]
 _lib.am_stream_join_grace.restype = ctypes.c_int
+# Fused broadcast join + aggregate: the joined rows are never materialised.
+_lib.am_stream_join_aggregate.argtypes = [_S, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+                                          ctypes.c_int, ctypes.POINTER(ctypes.c_int),
+                                          ctypes.POINTER(ctypes.c_char_p),
+                                          ctypes.POINTER(ctypes.c_char_p), ctypes.c_int64,
+                                          ctypes.POINTER(_R)]
+_lib.am_stream_join_aggregate.restype = ctypes.c_int
+_lib.am_stream_join_group_by.argtypes = [_S, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+                                         ctypes.c_int, ctypes.POINTER(ctypes.c_char_p), ctypes.c_int64,
+                                         ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_char_p),
+                                         ctypes.POINTER(ctypes.c_char_p), ctypes.c_int64,
+                                         ctypes.c_int64, ctypes.c_int, ctypes.POINTER(_R)]
+_lib.am_stream_join_group_by.restype = ctypes.c_int
 _lib.am_stream_export_c.argtypes = [_S, ctypes.c_void_p]
 _lib.am_stream_export_c.restype = ctypes.c_int
 
@@ -412,25 +426,178 @@ class Stream:
         hash of the key into Arrow IPC files under `scratch`, then joined partition by partition, so
         neither side ever has to fit. `other` must then be another `Stream`.
 
-        Returns a pyarrow.Table, or the run's statistics when `sink` names an IPC file."""
+        Returns a `JoinedStream` waiting for its terminal: `.collect()` streams the joined rows out
+        and hands back a pyarrow.Table (what this call used to return directly), while `.sum(...)`,
+        `.agg(...)` and `.group_by(...).agg(...)` **fuse the aggregate into the probe** so the joined
+        rows are never built at all. Passing `sink` runs the join straight away, as before, and
+        returns the run's statistics."""
         right_on = right_on or on
         kind = _JOIN_KIND.get(how)
         if kind is None:
             raise ArrowMetalError(f"unsupported join type {how!r}; use 'inner' or 'left'")
-        if broadcast:
-            build = _export_c_stream(other)
-            r = self._terminal(lambda out: _lib.am_stream_join_broadcast(
-                self._h, ctypes.addressof(build), on.encode(), right_on.encode(), kind,
+        j = JoinedStream(self, other, on, right_on, kind, how, broadcast, partitions, scratch)
+        if sink is not None:
+            return j.sink_ipc(sink)
+        return j
+
+
+class JoinedStream:
+    """`stream.join(other, on=...)`: a join waiting for its terminal.
+
+    Two plans hang off this object, and which one runs is decided by the terminal:
+
+    * `.collect()` / `.sink_ipc(path)` — the **unfused** plan. Every matched pair is gathered into a
+      record batch carrying every column of both sides, and those rows are written out.
+    * `.sum(col)` / `.agg(specs)` / `.group_by(keys).agg(specs)` — the **fused** plan. The probe, the
+      gather of the build-side value and the accumulate happen in one Metal kernel per batch, the
+      running answer stays on the GPU for the whole scan, and no joined row is ever materialised.
+
+    The fused plan is a broadcast inner join: `broadcast=False` (grace hash) and `how="left"` have
+    no fused form and raise rather than answer with a different number."""
+
+    def __init__(self, stream, other, on, right_on, kind, how, broadcast, partitions, scratch):
+        self._stream = stream
+        self._other = other
+        self._on = on
+        self._right_on = right_on
+        self._kind = kind
+        self._how = how
+        self._broadcast = broadcast
+        self._partitions = partitions
+        self._scratch = scratch
+
+    def __repr__(self):
+        return (f"JoinedStream({self._stream!r}, on={self._on!r}, right_on={self._right_on!r}, "
+                f"how={self._how!r}, broadcast={self._broadcast})")
+
+    # ---- unfused: the joined rows are written out
+
+    def _run(self, sink=None):
+        s = self._stream
+        if self._broadcast:
+            build = _export_c_stream(self._other)
+            return s._terminal(lambda out: _lib.am_stream_join_broadcast(
+                s._h, ctypes.addressof(build), self._on.encode(), self._right_on.encode(), self._kind,
                 None if sink is None else str(sink).encode(), out))
-        else:
-            if not isinstance(other, Stream):
-                other = scan_arrow(other)
-            other._consumed = True
-            r = self._terminal(lambda out: _lib.am_stream_join_grace(
-                self._h, other._h, on.encode(), right_on.encode(), kind, partitions,
-                None if scratch is None else str(scratch).encode(),
-                None if sink is None else str(sink).encode(), out))
-        return self.stats if sink is not None else r.table()
+        other = self._other
+        if not isinstance(other, Stream):
+            other = scan_arrow(other)
+        other._consumed = True
+        return s._terminal(lambda out: _lib.am_stream_join_grace(
+            s._h, other._h, self._on.encode(), self._right_on.encode(), self._kind, self._partitions,
+            None if self._scratch is None else str(self._scratch).encode(),
+            None if sink is None else str(sink).encode(), out))
+
+    def collect(self):
+        """The joined rows as one pyarrow.Table. Only for results known to be small."""
+        return self._run().table()
+
+    def sink_ipc(self, path):
+        """Stream the joined rows into an Arrow IPC stream file; returns the run's statistics."""
+        self._run(sink=path)
+        return self._stream.stats
+
+    # ---- fused: the joined rows never exist
+
+    def _require_fusable(self):
+        if not self._broadcast:
+            raise ArrowMetalError(
+                "a fused join + aggregate needs a broadcast join; a grace hash join writes its "
+                "partitions to disk and has no fused form. Use broadcast=True, or "
+                "join(...).sink_ipc(path) and aggregate the file.")
+        if self._kind != 0:
+            raise ArrowMetalError(
+                f"a fused join + aggregate is implemented for inner joins only, not {self._how!r}; "
+                "a left join followed by an aggregate would have to count unmatched probe rows and "
+                "is not implemented. Use join(...).collect() and aggregate the result.")
+
+    @staticmethod
+    def _op_codes(specs):
+        specs = [tuple(s) for s in specs]
+        ops = (ctypes.c_int * max(len(specs), 1))()
+        for i, (op, _, _) in enumerate(specs):
+            if op not in _STREAM_AGG:
+                raise ArrowMetalError(f"unknown streaming aggregate {op!r}")
+            ops[i] = _STREAM_AGG[op]
+        return specs, ops
+
+    def agg(self, specs):
+        """Whole-dataset aggregates over the joined rows, accumulated inside the probe kernel.
+
+        `specs` is a list of (op, column, name) with `column` None for `count`. A column name is
+        resolved against the probe side first and then the build side, so `("sum", "weight", "w")`
+        reaches a build-side column; a build column shadowed by a probe column of the same name is
+        reachable as `name_right`, matching the materialising join's output names.
+
+        sum, count, min, max and mean are implemented; variance, stddev and count_distinct_approx
+        raise rather than silently falling back."""
+        self._require_fusable()
+        specs, ops = self._op_codes(specs)
+        cols = _c_strings([c for _, c, _ in specs])
+        names = _c_strings([n for _, _, n in specs])
+        s = self._stream
+        build = _export_c_stream(self._other)
+        r = s._terminal(lambda out: _lib.am_stream_join_aggregate(
+            s._h, ctypes.addressof(build), self._on.encode(), self._right_on.encode(), self._kind,
+            ops, cols, names, len(specs), out))
+        return r.scalars()
+
+    def sum(self, column):
+        return self.agg([("sum", column, "sum")])["sum"]
+
+    def count(self):
+        return self.agg([("count", None, "count")])["count"]
+
+    def mean(self, column):
+        return self.agg([("mean", column, "mean")])["mean"]
+
+    def min(self, column):
+        return self.agg([("min", column, "min")])["min"]
+
+    def max(self, column):
+        return self.agg([("max", column, "max")])["max"]
+
+    def group_by(self, keys, dense_key_count=0):
+        """Group the joined rows. A key may name a column of either side."""
+        if isinstance(keys, str):
+            keys = [keys]
+        return JoinedGroupedStream(self, list(keys), dense_key_count)
+
+    @property
+    def stats(self):
+        return self._stream.stats
+
+
+class JoinedGroupedStream:
+    """`stream.join(...).group_by(keys)`: waiting for `.agg(...)`."""
+
+    def __init__(self, join, keys, dense_key_count=0):
+        self._join = join
+        self._keys = keys
+        self._dense = dense_key_count
+
+    def agg(self, specs, ddof=0):
+        """One row per group, key columns first, in ascending key order.
+
+        Only the key columns and the aggregated values of the matched pairs are gathered — never the
+        joined batch — and they are folded into the streaming group-by's global table."""
+        self._join._require_fusable()
+        specs, ops = JoinedStream._op_codes(specs)
+        keys = _c_strings(self._keys)
+        cols = _c_strings([c for _, c, _ in specs])
+        names = _c_strings([n for _, _, n in specs])
+        j, s = self._join, self._join._stream
+        build = _export_c_stream(j._other)
+        r = s._terminal(lambda out: _lib.am_stream_join_group_by(
+            s._h, ctypes.addressof(build), j._on.encode(), j._right_on.encode(), j._kind,
+            keys, len(self._keys), ops, cols, names, len(specs), self._dense, ddof, out))
+        return r.table()
+
+    def count(self, name="count"):
+        return self.agg([("count", None, name)])
+
+    def sum(self, column, name=None):
+        return self.agg([("sum", column, name or f"sum_{column}")])
 
 
 class GroupedStream:

@@ -1526,6 +1526,24 @@ void        am_stream_result_release(am_stream_result* r);
 // readers had not finished, and seconds it spent waiting for the merge queue to drain.
 int         am_stream_result_stalls(am_stream_result* r, double* read_stall_s, double* merge_stall_s);
 
+// Fused broadcast join + aggregate: the joined rows are never materialised. The build side is
+// drained from `build` into one device-resident hash table, and every probe batch runs a single
+// kernel that probes it, gathers the build-side value and accumulates, with the running answer
+// staying on the GPU for the whole scan. A value column name is resolved against the probe side
+// first and then the build side (a build column shadowed by a probe column of the same name is
+// reachable as `name_right`, as in the materialising join's output). Aggregate op codes are the
+// ones above; sum, count, min, max and mean are implemented, and columns[i] may be NULL for count.
+// kind: 0 inner. kind 1 (left) returns an error rather than a wrong number.
+int am_stream_join_aggregate(am_stream* s, struct ArrowArrayStream* build, const char* probe_key,
+                             const char* build_key, int kind, const int* ops, const char** columns,
+                             const char** names, int64_t n_aggs, am_stream_result** out);
+// The same join followed by a streaming group-by. A key may name a column of either side; only the
+// key columns and the aggregated values of the matched pairs are gathered.
+int am_stream_join_group_by(am_stream* s, struct ArrowArrayStream* build, const char* probe_key,
+                            const char* build_key, int kind, const char** keys, int64_t n_keys,
+                            const int* ops, const char** columns, const char** names, int64_t n_aggs,
+                            int64_t dense_key_count, int ddof, am_stream_result** out);
+
 #ifdef __cplusplus
 }
 #endif

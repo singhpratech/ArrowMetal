@@ -4399,4 +4399,5 @@ def write_parquet(data, path, compression="snappy", use_dictionary=True, row_gro
 #
 # Imported last so `stream.py` can use the names defined above (`_lib`, `Expr`, `MetalArray`, ...).
 from . import stream                                                       # noqa: E402
-from .stream import Stream, GroupedStream, scan_ipc, scan_arrow, scan_table  # noqa: E402,F401
+from .stream import (Stream, GroupedStream, JoinedStream, JoinedGroupedStream,  # noqa: E402,F401
+                     scan_ipc, scan_arrow, scan_table)
