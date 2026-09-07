@@ -1435,3 +1435,17 @@ def test_shift_view_shares_the_input_buffers_and_outlives_it():
     gc.collect()
     assert lag.combine_chunks().to_pylist()[:3] == [None, 0, 1]
     assert lead.combine_chunks().to_pylist()[-3:] == [998, 999, None]
+
+
+def test_compute_format_of_a_dictionary_is_its_values_format():
+    """am_format reports a dictionary's index type; the scalar kernels compute on its values, and
+    am_compute_format says so. A float64 scalar against a dictionary<int32, float64> column must be
+    packed to eight bytes, not four (a Rust binding found the four-byte packing accepted and wrong)."""
+    d = pa.array([1.5, 2.5, 3.5]).dictionary_encode()
+    col = am.array(d)
+    assert col.format == "i"
+    assert am._lib.am_compute_format(col._h).decode() == "g"
+    assert col.compare(">", 2.0).to_arrow().to_pylist() == [False, True, True]
+    assert col.filter_where(">", 2.0).to_arrow().to_pylist() == [2.5, 3.5]
+    plain = am.array(pa.array([1, 2, 3], pa.int64()))
+    assert am._lib.am_compute_format(plain._h).decode() == plain.format == "l"

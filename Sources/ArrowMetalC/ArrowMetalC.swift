@@ -76,6 +76,21 @@ public func am_export_device(_ a: OpaquePointer?, _ schema: UnsafeMutablePointer
     return UnsafePointer(c)
 }
 
+/// The format the scalar-taking kernels compute on: a dictionary column's *values* format, and
+/// `am_format` for everything else. `am_format` reports the C Data Interface's top-level format, which
+/// for a dictionary is its index type, while every kernel decodes the dictionary first; a scalar operand
+/// packed to the index width would be read at the value width.
+@_cdecl("am_compute_format") public func am_compute_format(_ a: OpaquePointer?) -> UnsafePointer<CChar>? {
+    guard let x = handle(a) else { return nil }
+    var v = x
+    while case .dictionary(_, let values) = v { v = values }
+    formatLock.lock(); defer { formatLock.unlock() }
+    if let c = formatCache[v.arrowFormat] { return UnsafePointer(c) }
+    let c = strdup(v.arrowFormat)!
+    formatCache[v.arrowFormat] = c
+    return UnsafePointer(c)
+}
+
 // MARK: - Generic dispatch helpers
 
 private func withPrimitive<R>(_ a: AnyMetalArray, _ body: (any PrimitiveOps) throws -> R) throws -> R {
