@@ -11,6 +11,10 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c release 
 go get github.com/singhpratech/ArrowMetal/go/arrowmetal
 ```
 
+The `go get` line works once the repository is public and carries a `go/arrowmetal/vX.Y.Z` tag; the
+module sits in a subdirectory, so the proxy wants the tag prefixed with that path. Until then, use a
+`replace` directive against a checkout, or work inside `go/arrowmetal`.
+
 ```go
 b := array.NewInt64Builder(am.NewPageAlignedAllocator())
 b.AppendValues([]int64{5, 3, 9, 1}, []bool{true, true, false, true})
@@ -32,12 +36,19 @@ it finds nothing the error names the variable, every path it tried, and the `swi
 ```bash
 cd go/arrowmetal
 ARROWMETAL_LIB=$PWD/../../.build/release/libArrowMetalC.dylib go test ./...
+GOEXPERIMENT=cgocheck2 ARROWMETAL_LIB=$PWD/../../.build/release/libArrowMetalC.dylib go test -count=1 ./...
 ```
 
-43 test functions, 132 cases with subtests. Every wrapped operation is checked against Arrow Go's
-own compute where arrow-go has the function, and against a plain Go loop where it does not
-(arrow-go's compute package registers no aggregate function at all — no `sum`, `mean` or `min_max`).
-Lengths 0, 1, 1000 and 1,000,001; nulls at several densities; sliced input at offsets 1 through 1000.
+45 test functions, 164 cases with subtests, run both ways. Every wrapped operation is checked
+against Arrow Go's own compute where arrow-go has the function, and against a plain Go loop where it
+does not (arrow-go's compute package registers no aggregate function at all — no `sum`, `mean` or
+`min_max`). Lengths 0, 1, 1000 and 1,000,001; nulls at several densities, in keys as well as values;
+sliced input at offsets 1 through 1000.
+
+The second run arms cgo's pointer checker. `Import` pins the buffers it hands to C, because
+arrow-go's `cdata` publishes Go-heap pointers into C memory by default
+([apache/arrow-go#70](https://github.com/apache/arrow-go/issues/70)) and that is what cgocheck2
+catches — see [docs/GO.md](../docs/GO.md#go-pointers-cgo-and-why-pinning-is-not-optional).
 
 ## Timing
 

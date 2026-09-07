@@ -27,20 +27,36 @@ func bufferAddr(a arrow.Array) uintptr {
 // TestAllocatorAlignment is the measurement behind the copy rule in docs/GO.md: does Arrow Go's
 // default allocator hand ArrowMetal a page-aligned buffer, at 1M and 10M elements?
 //
-// Copy-free import needs the buffer's start address to be a multiple of the page size
-// (16 KiB on Apple silicon); ArrowMetal copies the bytes into a page-aligned Metal buffer otherwise.
-// The test asserts nothing about the Go allocator's answer — it has no alignment contract to assert —
-// it records it, and it does assert that PageAlignedAllocator delivers what it promises.
+// Copy-free import needs the buffer's start address to be a multiple of the page size (16 KiB on
+// Apple silicon); ArrowMetal copies the bytes into a page-aligned Metal buffer otherwise.
+//
+// What this test asserts is the *shape* of the answer, not a hit rate. Every offset a Go-heap
+// buffer produces is a multiple of 8192 — Go's own page — so it is page aligned when that multiple
+// happens to be even and 8192 bytes short when it is odd. Which one you get depends on the state of
+// the heap: across fresh runs of this same test the count at 10M swung between 5/20 and 15/20, so a
+// fraction here would be noise dressed up as a property. The invariant is what gets asserted; the
+// count is logged for the record.
+//
+// PageAlignedAllocator, by contrast, has a contract, and that is asserted exactly.
 func TestAllocatorAlignment(t *testing.T) {
 	requireLib(t)
 	page := uintptr(am.PageSize())
 
+	// docs/GO.md says memory.DefaultAllocator *is* the Go allocator unless the program is built
+	// with the `mallocator` tag. Pin that rather than asserting it in prose.
+	if _, ok := memory.DefaultAllocator.(*memory.GoAllocator); !ok {
+		t.Logf("memory.DefaultAllocator is %T, not *memory.GoAllocator; "+
+			"docs/GO.md's claim about the default allocator needs revisiting", memory.DefaultAllocator)
+	}
+
 	type row struct {
-		alloc   string
-		n       int
-		aligned int
-		trials  int
-		offsets []uintptr
+		alloc      string
+		goHeap     bool
+		n          int
+		aligned    int
+		trials     int
+		offsets    []uintptr
+		distinctOK bool
 	}
 	var rows []row
 
@@ -51,14 +67,14 @@ func TestAllocatorAlignment(t *testing.T) {
 			vals[i] = int64(i)
 		}
 		for _, a := range []struct {
-			name string
-			mem  memory.Allocator
+			name   string
+			mem    memory.Allocator
+			goHeap bool
 		}{
-			{"memory.NewGoAllocator (arrow-go default)", memory.NewGoAllocator()},
-			{"memory.DefaultAllocator", memory.DefaultAllocator},
-			{"arrowmetal.PageAlignedAllocator", am.NewPageAlignedAllocator()},
+			{"memory.NewGoAllocator (== memory.DefaultAllocator)", memory.NewGoAllocator(), true},
+			{"arrowmetal.PageAlignedAllocator", am.NewPageAlignedAllocator(), false},
 		} {
-			r := row{alloc: a.name, n: n, trials: trials}
+			r := row{alloc: a.name, goHeap: a.goHeap, n: n, trials: trials, distinctOK: true}
 			for i := 0; i < trials; i++ {
 				b := array.NewInt64Builder(a.mem)
 				b.AppendValues(vals, nil)
@@ -77,10 +93,23 @@ func TestAllocatorAlignment(t *testing.T) {
 
 	t.Logf("page size: %d bytes", page)
 	for _, r := range rows {
-		t.Logf("%-42s n=%-10d page-aligned %d/%d  (offsets mod page: %v)",
+		t.Logf("%-50s n=%-10d page-aligned %d/%d this run  (offsets mod page: %v)",
 			r.alloc, r.n, r.aligned, r.trials, r.offsets)
-		if r.alloc == "arrowmetal.PageAlignedAllocator" && r.aligned != r.trials {
-			t.Fatalf("PageAlignedAllocator produced an unaligned buffer: %v", r.offsets)
+
+		if !r.goHeap {
+			if r.aligned != r.trials {
+				t.Fatalf("PageAlignedAllocator produced an unaligned buffer: %v", r.offsets)
+			}
+			continue
+		}
+		// The reproducible claim: a Go-heap buffer is aligned to Go's 8 KiB page, so its offset
+		// past a 16 KiB page is only ever 0 or 8192 — never 64, never 4096.
+		half := page / 2
+		for i, off := range r.offsets {
+			if off != 0 && off != half {
+				t.Fatalf("%s n=%d trial %d: offset %d past a %d-byte page; expected only 0 or %d "+
+					"(Go's heap aligns large spans to %d)", r.alloc, r.n, i, off, page, half, half)
+			}
 		}
 	}
 }

@@ -16,9 +16,11 @@ Thanks for looking. This project is small enough to hold in your head; please ke
   release-only miscompile (see the comment at `Sources/ArrowMetal/MetalArray.swift:283`).
 - Run the binding suites when you touch the C ABI or `include/arrowmetal.h`:
   `PYTHONPATH=python python -m pytest python/tests -q` and, from `go/arrowmetal`,
-  `ARROWMETAL_LIB=$PWD/../../.build/release/libArrowMetalC.dylib go test ./...`. The Go module
-  compiles against a copy of the header under `go/arrowmetal/include/`; if you change the real one,
-  copy it across (`TestHeadersMatchRepository` tells you so).
+  `ARROWMETAL_LIB=$PWD/../../.build/release/libArrowMetalC.dylib go test ./...` — then once more
+  with `GOEXPERIMENT=cgocheck2`, which is where a Go pointer handed to C without being pinned turns
+  into a hard failure instead of luck. The Go module compiles against a copy of the header under
+  `go/arrowmetal/include/`; if you change the real one, copy it across
+  (`TestHeadersMatchRepository` tells you so).
 - Run `swift run -c release arrowmetal-bench` before and after a performance change and paste both tables in
   the PR.
 
