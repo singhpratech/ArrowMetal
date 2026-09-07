@@ -40,9 +40,13 @@ opens, the package still loads and every compute call raises an error listing al
 why each failed; `am_available()`, `am_load_error()` and `am_lib_path()` report the same thing
 without raising.
 
-The R in `private/toolchains/renv` is a conda build whose `Makeconf` names a compiler that is not
-on `PATH`, so `R CMD INSTALL` there needs `CC = clang` in `~/.R/Makevars` (see
-[TESTING.md](TESTING.md)).
+A conda-built R names its own compiler in `Makeconf` (here
+`arm64-apple-darwin20.0.0-clang`), which lives in the environment's `bin` but is only on `PATH`
+once the environment is activated. Calling such an R by absolute path without activating it fails
+with `sh: arm64-apple-darwin20.0.0-clang: command not found`. Either put that `bin` on `PATH`, or
+set `CC = clang` in `~/.R/Makevars` to use Xcode's clang instead; the shim compiles clean under
+both (conda LLVM 23.1.0 and Apple clang 21.0.0), and the only non-standard C it uses is
+`__typeof__`, which both provide.
 
 ## Example
 

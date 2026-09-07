@@ -25,9 +25,10 @@ ARROWMETAL_LIB=$PWD/.build/release/libArrowMetalC.dylib \
 ```
 
 The R suite needs R with `arrow` and `testthat`; `R CMD INSTALL r/arrowmetal` first, or point
-`ARROWMETAL_LIB` at the dylib as above. On a conda-built R whose `Makeconf` names a compiler that
-is not on `PATH`, put `CC = clang` in `~/.R/Makevars` before installing. `R CMD check --no-manual`
-on the built tarball is the fuller gate and is clean (0 errors, 0 warnings, 0 notes).
+`ARROWMETAL_LIB` at the dylib as above. A conda-built R names its own compiler in `Makeconf`, so
+activate the environment (or put its `bin` on `PATH`) before installing; setting `CC = clang` in
+`~/.R/Makevars` to use Xcode's clang works too. `R CMD check --no-manual` on the built tarball is
+the fuller gate and is clean (0 errors, 0 warnings, 0 notes).
 
 Tests that need a real GPU skip on virtual Metal devices (`requireRealGPU()`), so a hosted CI runner
 exercises the host paths only; the numbers above are from a physical Mac.

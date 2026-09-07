@@ -8,6 +8,8 @@
  * include/ headers (tests/testthat/test-header-copy.R checks that when the repo is present).
  * Every entry point is called through a pointer whose type comes from the real prototype with
  * __typeof__, so a signature change in the header is a compile error here rather than a crash.
+ * __typeof__ is the one non-standard C used here; both Apple clang and the conda-forge LLVM this
+ * has been built with provide it, and the package is macOS-only anyway.
  */
 
 #include <R.h>
