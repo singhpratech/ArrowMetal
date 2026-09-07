@@ -1371,6 +1371,60 @@ int  am_join(am_array* left_keys, am_array* right_keys, int join_type,
 // gives a null code. am_str_dictionary_encode is the utf8-only spelling of the same call.
 int  am_dictionary_encode(am_array* a, am_array** out_codes, am_array** out_values);
 
+
+// ---------------------------------------------------------------------------------------------------
+// Parquet, decoded on the GPU (docs/PARQUET.md)
+//
+// am_parquet_open maps the file and parses its footer; nothing else is read yet. A read decodes the
+// requested columns straight into Metal shared memory: decompression (SNAPPY, LZ4, LZ4_RAW on the GPU;
+// ZSTD, GZIP, BROTLI on the host), definition levels, dictionary indices, the delta encodings and
+// BYTE_STREAM_SPLIT all run as compute kernels, and the CPU never reads a byte of column data -- only
+// the Thrift footer and page headers.
+typedef struct am_parquet_file am_parquet_file;      // opaque, one mapped Parquet file
+typedef struct am_parquet_batch am_parquet_batch;    // opaque, one set of decoded columns
+
+int   am_parquet_open(const char* path, am_parquet_file** out);
+void  am_parquet_close(am_parquet_file* f);
+
+int64_t     am_parquet_num_rows(am_parquet_file* f);
+int64_t     am_parquet_num_row_groups(am_parquet_file* f);
+int64_t     am_parquet_row_group_rows(am_parquet_file* f, int64_t row_group);
+int64_t     am_parquet_num_columns(am_parquet_file* f);
+const char* am_parquet_column_name(am_parquet_file* f, int64_t i);
+// The Parquet physical type plus its logical annotation ("INT64", "BYTE_ARRAY/STRING", "list<INT64>").
+const char* am_parquet_column_type(am_parquet_file* f, int64_t i);
+// Compression codec and encodings actually used for one column chunk, for reporting.
+const char* am_parquet_codec(am_parquet_file* f, int64_t row_group, int64_t column);
+const char* am_parquet_encodings(am_parquet_file* f, int64_t row_group, int64_t column);
+
+// Reads `columns` (NULL/0 for all) from one row group, or from every row group when row_group is -1.
+int am_parquet_read(am_parquet_file* f, const char** columns, int64_t n_columns, int64_t row_group,
+                    am_parquet_batch** out);
+
+// Projection, row-group selection, statistics pushdown and the dictionary switch in one call.
+// `filters` is a semicolon-separated list of `name<op><literal>` with op one of == != < <= > >= and the
+// literal an integer, a float, or a double-quoted string; row groups whose footer statistics cannot
+// contain a match are never read. `dictionary` non-zero keeps a dictionary-encoded column encoded.
+int am_parquet_read_ex(am_parquet_file* f, const char** columns, int64_t n_columns,
+                       const int64_t* row_groups, int64_t n_row_groups,
+                       const char* filters, int dictionary, am_parquet_batch** out);
+
+// Row groups a filter set keeps, without reading them. Returns the count and fills up to `cap` indices.
+int64_t am_parquet_selected_row_groups(am_parquet_file* f, const char* filters, int64_t* out, int64_t cap);
+
+int64_t     am_parquet_batch_columns(am_parquet_batch* b);
+int64_t     am_parquet_batch_rows(am_parquet_batch* b);
+const char* am_parquet_batch_column_name(am_parquet_batch* b, int64_t i);
+// Hands out a new am_array handle; release it with am_release.
+int         am_parquet_batch_column(am_parquet_batch* b, int64_t i, am_array** out);
+void        am_parquet_batch_release(am_parquet_batch* b);
+
+// Writes a Parquet file from a set of named columns. `compression` is "none" or "snappy";
+// `dictionary` non-zero dictionary-encodes string and binary columns. See docs/PARQUET.md for the
+// (deliberately small) subset the writer covers.
+int am_parquet_write(const char* path, am_array** columns, const char** names, int64_t n_columns,
+                     const char* compression, int dictionary, int64_t row_group_size);
+
 #ifdef __cplusplus
 }
 #endif

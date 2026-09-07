@@ -4089,3 +4089,216 @@ def zero_copy_report(obj):
         _load_polars_bridge()
         return globals()["_polars_zero_copy_report"](obj)
     raise ArrowMetalError(f"zero_copy_report: expected a Polars or pandas Series/DataFrame, got {type(obj).__name__}")
+
+
+# ---------------------------------------------------------------------------------------------------
+# Parquet, decoded on the GPU (docs/PARQUET.md)
+#
+# `am.read_parquet(path)` maps the file, parses its footer on the CPU, and decodes the column bytes with
+# Metal compute kernels straight into shared memory. The arrays that come back are ordinary MetalArrays,
+# so they feed the GPU functions in this module without a copy -- and `.to_arrow()` hands them to pyarrow
+# without a copy either.
+
+_lib.am_parquet_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(_P)]
+_lib.am_parquet_open.restype = ctypes.c_int
+_lib.am_parquet_close.argtypes = [_P]
+for _n in ("am_parquet_num_rows", "am_parquet_num_row_groups", "am_parquet_num_columns"):
+    getattr(_lib, _n).argtypes = [_P]
+    getattr(_lib, _n).restype = ctypes.c_int64
+_lib.am_parquet_row_group_rows.argtypes = [_P, ctypes.c_int64]
+_lib.am_parquet_row_group_rows.restype = ctypes.c_int64
+for _n in ("am_parquet_column_name", "am_parquet_column_type"):
+    getattr(_lib, _n).argtypes = [_P, ctypes.c_int64]
+    getattr(_lib, _n).restype = ctypes.c_char_p
+for _n in ("am_parquet_codec", "am_parquet_encodings"):
+    getattr(_lib, _n).argtypes = [_P, ctypes.c_int64, ctypes.c_int64]
+    getattr(_lib, _n).restype = ctypes.c_char_p
+_lib.am_parquet_read.argtypes = [_P, ctypes.POINTER(ctypes.c_char_p), ctypes.c_int64, ctypes.c_int64,
+                                 ctypes.POINTER(_P)]
+_lib.am_parquet_read.restype = ctypes.c_int
+_lib.am_parquet_read_ex.argtypes = [_P, ctypes.POINTER(ctypes.c_char_p), ctypes.c_int64,
+                                    ctypes.POINTER(ctypes.c_int64), ctypes.c_int64,
+                                    ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_parquet_read_ex.restype = ctypes.c_int
+_lib.am_parquet_selected_row_groups.argtypes = [_P, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int64), ctypes.c_int64]
+_lib.am_parquet_selected_row_groups.restype = ctypes.c_int64
+_lib.am_parquet_batch_columns.argtypes = [_P]
+_lib.am_parquet_batch_columns.restype = ctypes.c_int64
+_lib.am_parquet_batch_rows.argtypes = [_P]
+_lib.am_parquet_batch_rows.restype = ctypes.c_int64
+_lib.am_parquet_batch_column_name.argtypes = [_P, ctypes.c_int64]
+_lib.am_parquet_batch_column_name.restype = ctypes.c_char_p
+_lib.am_parquet_batch_column.argtypes = [_P, ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_parquet_batch_column.restype = ctypes.c_int
+_lib.am_parquet_batch_release.argtypes = [_P]
+_lib.am_parquet_write.argtypes = [ctypes.c_char_p, ctypes.POINTER(_P), ctypes.POINTER(ctypes.c_char_p),
+                                  ctypes.c_int64, ctypes.c_char_p, ctypes.c_int, ctypes.c_int64]
+_lib.am_parquet_write.restype = ctypes.c_int
+
+
+def _filter_text(filters):
+    """`[("x", ">", 3), ("s", "==", "a")]` -> the ABI's `x>3;s=="a"` text."""
+    if not filters:
+        return None
+    if isinstance(filters, str):
+        return filters.encode()
+    parts = []
+    for f in filters:
+        if len(f) != 3:
+            raise ArrowMetalError("a filter is (column, op, value); got %r" % (f,))
+        col, op, val = f
+        if op not in ("==", "!=", "<", "<=", ">", ">="):
+            raise ArrowMetalError("filter op must be one of == != < <= > >=; got %r" % (op,))
+        if isinstance(val, str):
+            lit = '"%s"' % val
+        elif isinstance(val, bool):
+            lit = "1" if val else "0"
+        else:
+            lit = repr(val)
+        parts.append("%s%s%s" % (col, op, lit))
+    return ";".join(parts).encode()
+
+
+class ParquetFile:
+    """A mapped Parquet file. Nothing but the footer is read until a column is asked for."""
+
+    def __init__(self, path):
+        self._h = _P()
+        _check(_lib.am_parquet_open(str(path).encode(), ctypes.byref(self._h)))
+        self.path = str(path)
+
+    def __del__(self):
+        h = getattr(self, "_h", None)
+        if h:
+            _lib.am_parquet_close(h)
+            self._h = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.__del__()
+        return False
+
+    def __repr__(self):
+        return "ParquetFile(%r, rows=%d, row_groups=%d, columns=%d)" % (
+            self.path, self.num_rows, self.num_row_groups, len(self.column_names))
+
+    @property
+    def num_rows(self):
+        return _lib.am_parquet_num_rows(self._h)
+
+    @property
+    def num_row_groups(self):
+        return _lib.am_parquet_num_row_groups(self._h)
+
+    def row_group_rows(self, i):
+        return _lib.am_parquet_row_group_rows(self._h, i)
+
+    @property
+    def column_names(self):
+        return [_lib.am_parquet_column_name(self._h, i).decode()
+                for i in range(_lib.am_parquet_num_columns(self._h))]
+
+    @property
+    def column_types(self):
+        """Parquet physical type plus logical annotation per column, for reporting."""
+        return [_lib.am_parquet_column_type(self._h, i).decode()
+                for i in range(_lib.am_parquet_num_columns(self._h))]
+
+    def codec(self, row_group=0, column=0):
+        c = _lib.am_parquet_codec(self._h, row_group, column)
+        return c.decode() if c else None
+
+    def encodings(self, row_group=0, column=0):
+        e = _lib.am_parquet_encodings(self._h, row_group, column)
+        return e.decode().split(",") if e else []
+
+    def selected_row_groups(self, filters=None):
+        """Row groups a filter set keeps, judged from the footer statistics alone."""
+        text = _filter_text(filters)
+        n = _lib.am_parquet_selected_row_groups(self._h, text, None, 0)
+        if n < 0:
+            _check(1)
+        buf = (ctypes.c_int64 * max(int(n), 1))()
+        _lib.am_parquet_selected_row_groups(self._h, text, buf, n)
+        return [int(buf[i]) for i in range(int(n))]
+
+    def read(self, columns=None, row_groups=None, filters=None, dictionary=True):
+        """Decodes on the GPU and returns `{name: MetalArray}` in file order."""
+        names = None
+        n_names = 0
+        if columns is not None:
+            columns = list(columns)
+            names = (ctypes.c_char_p * max(len(columns), 1))(*[c.encode() for c in columns])
+            n_names = len(columns)
+        groups = None
+        n_groups = 0
+        if row_groups is not None:
+            row_groups = list(row_groups)
+            groups = (ctypes.c_int64 * max(len(row_groups), 1))(*[int(g) for g in row_groups])
+            n_groups = len(row_groups)
+        out = _P()
+        _check(_lib.am_parquet_read_ex(self._h, names, n_names, groups, n_groups,
+                                       _filter_text(filters), 1 if dictionary else 0, ctypes.byref(out)))
+        try:
+            result = {}
+            for i in range(_lib.am_parquet_batch_columns(out)):
+                name = _lib.am_parquet_batch_column_name(out, i).decode()
+                h = _P()
+                _check(_lib.am_parquet_batch_column(out, i, ctypes.byref(h)))
+                result[name] = MetalArray(h)
+            return result
+        finally:
+            _lib.am_parquet_batch_release(out)
+
+    def read_table(self, columns=None, row_groups=None, filters=None, dictionary=False):
+        """The same read, exported as a `pyarrow.Table` (zero copy: pyarrow keeps the Metal buffers).
+
+        `dictionary` defaults to False here so the Table's types match `pyarrow.parquet.read_table`;
+        pass True to keep dictionary-encoded columns encoded."""
+        cols = self.read(columns=columns, row_groups=row_groups, filters=filters, dictionary=dictionary)
+        if not cols:
+            return pa.table({})
+        return pa.table({k: v.to_arrow() for k, v in cols.items()})
+
+
+def read_parquet(path, columns=None, row_groups=None, filters=None, dictionary=True):
+    """Reads a Parquet file on the GPU and returns `{name: MetalArray}`.
+
+    `columns` projects (only the requested column chunks are ever touched), `row_groups` selects by
+    index, and `filters` is a list of `(column, op, value)` triples evaluated against the footer's
+    min/max statistics, so whole row groups that cannot match are never read. `dictionary=False`
+    materialises dictionary-encoded columns instead of returning them dictionary encoded.
+
+        import arrowmetal as am
+        cols = am.read_parquet("trades.parquet", columns=["price", "qty"],
+                               filters=[("price", ">", 100)])
+        total = cols["price"].sum()          # already on the GPU; no import step
+    """
+    with ParquetFile(path) as f:
+        return f.read(columns=columns, row_groups=row_groups, filters=filters, dictionary=dictionary)
+
+
+def read_parquet_table(path, columns=None, row_groups=None, filters=None, dictionary=False):
+    """`read_parquet` exported as a `pyarrow.Table`."""
+    with ParquetFile(path) as f:
+        return f.read_table(columns=columns, row_groups=row_groups, filters=filters, dictionary=dictionary)
+
+
+def write_parquet(data, path, compression="snappy", use_dictionary=True, row_group_size=1 << 20):
+    """Writes a Parquet file from a dict of arrays, a pyarrow Table/RecordBatch, or a Polars DataFrame.
+
+    The writer is deliberately small: PLAIN and RLE_DICTIONARY, uncompressed or Snappy, one data page per
+    column chunk. It exists so ArrowMetal can round-trip its own output; for everything else pyarrow's
+    writer is the better tool. See docs/PARQUET.md for the supported types.
+    """
+    names, arrays = _query_columns(data)
+    handles = [a if isinstance(a, MetalArray) else MetalArray.from_arrow(a) for a in arrays]
+    n = len(handles)
+    harr = (_P * max(n, 1))(*[h._h for h in handles])
+    narr = (ctypes.c_char_p * max(n, 1))(*[nm.encode() for nm in names])
+    _check(_lib.am_parquet_write(str(path).encode(), harr, narr, n,
+                                 (compression or "none").encode(), 1 if use_dictionary else 0,
+                                 int(row_group_size)))
+    return str(path)
