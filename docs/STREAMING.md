@@ -148,6 +148,8 @@ the source of record, Parquet arrives through `scan_arrow(pyarrow.dataset(...))`
 | `sort` with `limit n` | **exact** | top-n, not a sort: the same threshold prune, then the GPU top-k selection over the survivors (§5) | **none** | n rows on the GPU; **nothing spills** |
 | `sort` (external, no limit) | **exact** | one radix argsort per batch; each output chunk is assembled with `take` | **the k-way merge is on the CPU** (see §5) | one batch per run + one output batch |
 | `join` (broadcast) | **exact** | the existing GPU hash join per probe batch | writing the sink | the build side, in memory |
+| `join` (broadcast) + `sum` / `count` / `min` / `max` / `mean` | **exact** | one kernel probes, gathers the build-side value and accumulates (§8.1); the build table is built once for the scan | **none** | the build table plus two 64-bit words per aggregate, on the GPU |
+| `join` (broadcast) + `group_by` | **exact** | the hash join, then a gather of the key and value columns of the matched pairs only, into the resident group table (§4.1) | as the group-by's own path | the build table plus the group table |
 | `join` (grace hash) | **exact** | partition on the GPU, then the GPU hash join per partition | writing the partition files | one partition pair at a time |
 
 Null handling follows Arrow throughout: a null key forms its own group, `count(expr)` counts non-null
@@ -321,6 +323,75 @@ split into 17 chunks. The estimator is the standard one with linear counting bel
 Join keys are int32 or int64 on both sides, which is what the GPU hash join takes. Null keys never
 match.
 
+### 8.1 A join followed by an aggregate is one kernel
+
+`Sources/ArrowMetal/Stream/StreamJoinAggregate.swift`.
+
+A `join -> sum` used to be two operators with a whole joined table between them: every probe batch
+ran the hash join, gathered **every column of both sides** into a new record batch, wrote it to a
+sink, and the caller summed the rows it got back. The joined rows are the largest thing in that
+pipeline and **none of them is the answer**.
+
+```swift
+try StreamQuery(ipc: path).filter(col("region") < 50)
+    .join(dim, on: "region", buildKey: "region")
+    .sum("amount")
+```
+
+```python
+am.scan_ipc(path).filter(am.col("region") < 50).join(dim, on="region") \
+  .agg([("sum", "amount", "total"), ("sum", "weight", "w")])
+```
+
+The terminal picks the plan. `.sink` / `.collect` still stream the joined rows out; `.sum`,
+`.aggregate` and `.groupBy` fuse:
+
+1. **The build table is built once.** `MetalRecordBatch.join` builds its hash table per call, which
+   for a streamed join is per *batch*. The build side does not change across a scan, so
+   `BroadcastBuildTable` builds it at construction with the same `hj_clear` / `hj_build` kernels and
+   every probe batch reads it.
+2. **The filter projects down to what the kernel reads** — the join key plus the probe-side value
+   columns. A filtered join used to gather every column of the surviving rows, including a utf8 one.
+3. **`jfa_probe` probes, gathers and accumulates in one kernel.** One thread per probe row walks its
+   bucket chain and, for each match, reads the aggregate's value — from the probe row it is standing
+   on, or from the build row the chain points at — and folds it into thread registers. A threadgroup
+   tree reduction turns 256 of those into one partial per accumulator, and `jfa_fold` folds the
+   partials into a **device-resident** accumulator pair that lives for the whole scan. Nothing
+   proportional to the number of matches is allocated, nothing is gathered, and nothing crosses to
+   the host until `finish()` reads sixteen bytes per aggregate. **The merge stage does nothing.**
+
+Every accumulator is a raw `ulong` — a signed sum, an unsigned sum, or an IEEE-754 binary64 bit
+pattern folded by the correctly-rounded software adder `d_add`, since Metal has neither a `double`
+type nor a 64-bit atomic. The kernel is generated per (key type, aggregate list) and unrolled, so
+there is no per-aggregate branch in the probe loop. A slot's *count* doubles as its "is empty" flag,
+which is what makes `min` / `max` free of a per-type sentinel and an all-null input come out as null
+rather than as an infinity.
+
+`sum`, `count`, `min`, `max` and `mean` fuse; up to seven of them at once (Metal binds 31 buffers and
+the probe itself needs nine). A column name is resolved against the probe side first and then the
+build side, so `sum("weight")` reaches a build-side column; a build column shadowed by a probe column
+of the same name is reachable as `name_right`, matching the materialising join's output names.
+
+**The grouped form** (`join(...).groupBy(keys, aggs)`) keeps the join's index pairs, because a
+per-group accumulator needs a table probed once per matched *pair*, and the resident group table's
+race-free insert relies on every key in a dispatch being distinct (§4.1), which rows are not. It
+gathers **only the key columns and the aggregated values** of the matched pairs — two or three
+columns, never the joined batch's eight — and folds those into the ordinary streaming group-by, whose
+global table is already resident. A key may come from either side: a probe-side key is gathered with
+the left index array, a build-side key with the right one.
+
+Semantics are the inner join's and match Polars and DuckDB: duplicate build keys multiply rows, a
+null key on either side never matches, and a probe row with no match contributes nothing. **A left
+join followed by an aggregate raises**, naming what to use instead, rather than returning a number
+that counts unmatched rows wrongly; so do `variance`, `stddev`, `count_distinct_approx`, a grace hash
+join, and a non-numeric value column.
+
+`Tests/ArrowMetalTests/StreamJoinFusionTests.swift` checks the fused answer against the in-memory
+join followed by the in-memory aggregate — bit for bit for integer aggregates, within one ulp per
+element for float64 sums — over duplicate build keys, null keys on both sides, empty batches, a batch
+with no matches at all, a build side of one row and of a million, a group-by key from each side, and
+int32 and int64 keys.
+
 ---
 
 ## 9. Numbers
@@ -404,7 +475,40 @@ stays flat at 2.3 to 2.5 GB over 8 GB of data.
   are read- or fixed-cost-bound rather than dominated by any one stage.
 * **The broadcast join is unchanged** because the benchmark streams its joined rows back to Python
   and sums them there. Fusing the aggregate into the probe, so the join's output never leaves the
-  GPU, is not implemented.
+  GPU, is measured separately below.
+
+### The fused join + aggregate, measured
+
+A separate 4.03 GB run (`--size-gb 4 --ipc-format file`: 76,000,000 rows, 4 files, 76 batches of 1M
+rows) with `readers = 2`, best of **three interleaved rounds**, one cell process at a time. Both
+sides are the same binary over the same dataset in the same run: `broadcast_join_unfused` is the old
+plan (gather every matched pair into a record batch, collect it, sum it in Python) and
+`broadcast_join` is the fused one (§8.1). Both compute `sum(amount)` from the probe side and
+`sum(weight)` from the build side after `region < 50`, and both agree with Polars to the last two
+digits of a double (the benchmark's own cross-check passes on every round).
+
+| Cell | Wall | Peak RSS | GPU stage | Merge stage | Read stage | Read stall |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `broadcast_join` **unfused** | 379 ms | 2,462 MB | 0.14 s | 0.00 s | 0.325 s | 0.03 s |
+| `broadcast_join` **fused** | **336 ms** | **2,283 MB** | **0.04 s** | 0.00 s | 0.315 s | 0.13 s |
+| Polars | 233 ms | 1,836 MB | | | | |
+| DuckDB | 229 ms | 862 MB | | | | |
+
+**The GPU stage is 3.7x smaller** — 0.14 s to 0.04 s — which is what the fusion actually did: the
+gather of every column of every matched pair is gone, and so is the joined batch. Peak RSS falls by
+180 MB and host CPU by 170 ms (698 to 529 ms), because nothing is collected and nothing is summed in
+Python. (The fused GPU stage measures between 0.04 and 0.09 s across rounds; the spread is the
+one-off compile of the generated kernel on the first batch, which the unfused path does not pay
+because its kernels are already in the pipeline cache. The unfused stage is 0.14 to 0.15 s in every
+round.)
+
+**The wall clock only moves from 379 ms to 336 ms, and it still loses to Polars and DuckDB, because
+at `readers = 2` this cell is read-bound.** The read stage is 0.315 s of a 0.336 s wall and the GPU
+stage waits 0.13 s of it for a batch the two reader threads had not finished: what is being measured
+is two threads moving 4 GB against Polars reading the same directory with every core. One
+supplementary round at `readers = 4` shows the operator with the read out of the way — **359 ms
+unfused to 264 ms fused, a 1.36x speed-up** (GPU 0.147 s to 0.043 s), which brings it within 13 % of
+DuckDB's 229 ms; the cost is peak RSS, 4.4 to 4.9 GB, because four part files are mapped at once.
 
 ### The earlier 30 GB measurement
 
@@ -515,9 +619,13 @@ same queries run at 1.2 GB of RSS (and two to five times slower). The genuinely 
   (they would need a per-slot atomic minimum), `variance` (a third accumulator), multi-column keys
   and non-integer keys all keep the host table, which is exact but folds one row per group per batch
   on the CPU.
-* **A broadcast join writes rows, it does not aggregate them.** `join(...).sum(...)` streams the
-  joined rows out and sums them in the caller; fusing the aggregate into the probe so the output
-  never leaves the GPU is not implemented.
+* **A fused join + aggregate is an inner broadcast join only.** `join(...).sum(...)` and
+  `join(...).groupBy(...)` fuse (§8.1); a **left** join followed by an aggregate raises, because it
+  would have to count unmatched probe rows and that is not implemented, and so does a **grace hash**
+  join, which writes its partitions to disk and has no fused form. Both name the plan to use
+  instead. `variance` / `stddev` / `count_distinct_approx` and non-numeric value columns raise too.
+* **A fused aggregate takes at most seven aggregates.** Metal binds 31 buffers and the probe needs
+  nine of them, three per aggregate after that.
 * **Each batch is one Metal command buffer, not several.** The fixed cost per batch is paid once per
   batch; a larger `batch_rows` amortises it, at the cost of memory per batch.
 * **`readers > 1` raises peak RSS by roughly `readers` x the part-file size**, because that many
@@ -525,6 +633,8 @@ same queries run at 1.2 GB of RSS (and two to five times slower). The genuinely 
   do show up in `ru_maxrss`.
 * **`am_stream_query` supports filter + project and filter + aggregate**; a grouped query goes through
   `am_stream_group_by`, because the Expr compiler's `group_by` takes a dense integer key and the
-  streaming group-by takes arbitrary key columns.
+  streaming group-by takes arbitrary key columns. A *joined* query has no s-expression form either:
+  it goes through `am_stream_join_aggregate` / `am_stream_join_group_by`, which take the build side
+  as an Arrow C Stream.
 * Arrays above 2³² rows are still refused (`Dispatch.checkLength`), which bounds one *batch*, not a
   dataset.

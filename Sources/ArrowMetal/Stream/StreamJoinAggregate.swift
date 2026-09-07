@@ -135,17 +135,26 @@ enum JoinAggregateSource {
         for (a, s) in slots.enumerated() {
             decls += "    ulong a\(a) = 0ul; ulong c\(a) = 0ul;\n"
             let idx = s.fromBuild ? "bi" : "i"
+            let valid = "!(hm\(a) && !bit_get(m\(a), idx))"
+            let vSlot = "partials[tgid * \(width)u + \(2 * a)u]"
+            let cSlot = "partials[tgid * \(width)u + \(2 * a + 1)u]"
+            let pv = "partials[b * \(width)u + \(2 * a)u]"
+            let pc = "partials[b * \(width)u + \(2 * a + 1)u]"
+            // Reducing the threadgroup and folding a partial in are the same combine, so the tree
+            // reduction below is written once and reused by both kernels.
+            let tree = combine(s, dv: "sv[lid]", dc: "sc[lid]", sv: "sv[lid + st]", sc: "sc[lid + st]")
             if !s.readsValue {
-                bodies += "                { c\(a) += 1ul; }\n"                 // count(*): every matched pair
+                bodies += "                { c\(a) += 1ul; }\n"     // count(*): every matched pair
             } else if s.op == .count {
-                bodies += "                { uint idx = \(idx); if (!(hm\(a) && !bit_get(m\(a), idx))) c\(a) += 1ul; }\n"
+                bodies += "                { uint idx = \(idx); if (\(valid)) c\(a) += 1ul; }\n"
             } else {
+                let fold = combine(s, dv: "a\(a)", dc: "c\(a)", sv: "vv", sc: "1ul")
                 bodies += """
                                 {
                                     uint idx = \(idx);
-                                    if (!(hm\(a) && !bit_get(m\(a), idx))) {
+                                    if (\(valid)) {
                                         ulong vv = \(load(s, index: a));
-                                        if (\(include(s))) { \(combine(s, dv: "a\(a)", dc: "c\(a)", sv: "vv", sc: "1ul")) }
+                                        if (\(include(s))) { \(fold) }
                                     }
                                 }
 
@@ -156,24 +165,24 @@ enum JoinAggregateSource {
                 sv[lid] = a\(a); sc[lid] = c\(a);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 for (uint st = TG / 2u; st > 0u; st >>= 1u) {
-                    if (lid < st) { \(combine(s, dv: "sv[lid]", dc: "sc[lid]", sv: "sv[lid + st]", sc: "sc[lid + st]")) }
+                    if (lid < st) { \(tree) }
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
-                if (lid == 0u) { partials[tgid * \(width)u + \(2 * a)u] = sv[0]; partials[tgid * \(width)u + \(2 * a + 1)u] = sc[0]; }
+                if (lid == 0u) { \(vSlot) = sv[0]; \(cSlot) = sc[0]; }
 
             """
             folds += """
                 {
                     ulong a = 0ul, c = 0ul;
                     for (uint b = lid; b < blocks; b += TG) {
-                        ulong pv = partials[b * \(width)u + \(2 * a)u], pc = partials[b * \(width)u + \(2 * a + 1)u];
+                        ulong pv = \(pv), pc = \(pc);
                         \(combine(s, dv: "a", dc: "c", sv: "pv", sc: "pc"))
                     }
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                     sv[lid] = a; sc[lid] = c;
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                     for (uint st = TG / 2u; st > 0u; st >>= 1u) {
-                        if (lid < st) { \(combine(s, dv: "sv[lid]", dc: "sc[lid]", sv: "sv[lid + st]", sc: "sc[lid + st]")) }
+                        if (lid < st) { \(tree) }
                         threadgroup_barrier(mem_flags::mem_threadgroup);
                     }
                     if (lid == 0u) {
@@ -188,7 +197,9 @@ enum JoinAggregateSource {
 
         return KernelSource.prelude + DoubleMath.msl + """
 
-        inline uint jfa_mix(uint h) { h ^= h >> 16; h *= 0x85ebca6bu; h ^= h >> 13; h *= 0xc2b2ae35u; h ^= h >> 16; return h; }
+        inline uint jfa_mix(uint h) {
+            h ^= h >> 16; h *= 0x85ebca6bu; h ^= h >> 13; h *= 0xc2b2ae35u; h ^= h >> 16; return h;
+        }
         inline uint jfa_hash(\(KT) k) { \(hash) }
 
         // Head of the chain of build rows whose key is `k` (0 when the key is absent). The table is
@@ -345,20 +356,25 @@ struct FusedJoinColumn {
 /// same software binary64 accumulator, so a fused sum of a float32 column is computed in double.
 func fusedJoinColumn(_ a: AnyMetalArray, _ name: String) throws -> FusedJoinColumn {
     func unsupported() -> Error {
-        ArrowMetalError.unsupportedType(
-            "a fused join aggregate over \(name) (\(a.arrowFormat)): the value column must be an integer or float")
+        ArrowMetalError.unsupportedType("a fused join aggregate over \(name) (\(a.arrowFormat)): "
+                                        + "the value column must be an integer or float")
+    }
+    func of<T: ArrowPrimitive>(_ c: MetalArray<T>, _ t: String,
+                               _ k: JoinAggregateSource.Kind) -> FusedJoinColumn {
+        FusedJoinColumn(values: c.values, validity: c.validity, elementType: t, kind: k,
+                        length: c.length, owner: c)
     }
     switch a {
-    case .int8(let c): return FusedJoinColumn(values: c.values, validity: c.validity, elementType: "char", kind: .int64, length: c.length, owner: c)
-    case .int16(let c): return FusedJoinColumn(values: c.values, validity: c.validity, elementType: "short", kind: .int64, length: c.length, owner: c)
-    case .int32(let c): return FusedJoinColumn(values: c.values, validity: c.validity, elementType: "int", kind: .int64, length: c.length, owner: c)
-    case .int64(let c): return FusedJoinColumn(values: c.values, validity: c.validity, elementType: "long", kind: .int64, length: c.length, owner: c)
-    case .uint8(let c): return FusedJoinColumn(values: c.values, validity: c.validity, elementType: "uchar", kind: .uint64, length: c.length, owner: c)
-    case .uint16(let c): return FusedJoinColumn(values: c.values, validity: c.validity, elementType: "ushort", kind: .uint64, length: c.length, owner: c)
-    case .uint32(let c): return FusedJoinColumn(values: c.values, validity: c.validity, elementType: "uint", kind: .uint64, length: c.length, owner: c)
-    case .uint64(let c): return FusedJoinColumn(values: c.values, validity: c.validity, elementType: "ulong", kind: .uint64, length: c.length, owner: c)
-    case .float32(let c): return FusedJoinColumn(values: c.values, validity: c.validity, elementType: "float", kind: .double, length: c.length, owner: c)
-    case .float64(let c): return FusedJoinColumn(values: c.values, validity: c.validity, elementType: "ulong", kind: .double, length: c.length, owner: c)
+    case .int8(let c): return of(c, "char", .int64)
+    case .int16(let c): return of(c, "short", .int64)
+    case .int32(let c): return of(c, "int", .int64)
+    case .int64(let c): return of(c, "long", .int64)
+    case .uint8(let c): return of(c, "uchar", .uint64)
+    case .uint16(let c): return of(c, "ushort", .uint64)
+    case .uint32(let c): return of(c, "uint", .uint64)
+    case .uint64(let c): return of(c, "ulong", .uint64)
+    case .float32(let c): return of(c, "float", .double)
+    case .float64(let c): return of(c, "ulong", .double)
     case .boolean: throw unsupported()
     case .string: throw unsupported()
     case .temporal: throw unsupported()
@@ -525,8 +541,10 @@ public final class BroadcastJoinAggregateOperator: StreamOperator {
         probeColumns = probeSideColumns(probeKey, newSides)
         signature = table.keyType + "|" + newSlots.map(\.signature).joined(separator: ",")
         let src = JoinAggregateSource.source(KT: table.keyType, slots: newSlots)
-        probePSO = try Dispatch.pipeline(context, family: "joinagg", source: src, function: "jfa_probe", type: signature)
-        foldPSO = try Dispatch.pipeline(context, family: "joinagg", source: src, function: "jfa_fold", type: signature)
+        probePSO = try Dispatch.pipeline(context, family: "joinagg", source: src,
+                                         function: "jfa_probe", type: signature)
+        foldPSO = try Dispatch.pipeline(context, family: "joinagg", source: src,
+                                        function: "jfa_fold", type: signature)
     }
 
     public func process(_ batch: MetalRecordBatch) throws -> Any? {
@@ -600,8 +618,8 @@ public final class BroadcastJoinAggregateOperator: StreamOperator {
             enc.setBuffer(partials.mtl, offset: 0, index: 0)
             Dispatch.setUInt(enc, blocks, index: 1)
             enc.setBuffer(state.mtl, offset: 0, index: 2)
-            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1))
+            let tg = MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: tg)
         }
         context.retainUntilFlush(partials)
         context.retainUntilFlush(state)
