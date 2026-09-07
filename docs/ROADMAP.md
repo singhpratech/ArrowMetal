@@ -39,8 +39,16 @@ the measured state behind each item is in [LOSSES.md](LOSSES.md) and the benchma
 
 ## Languages
 
-- A Rust crate over `include/arrowmetal.h` (the Polars plugin already uses the ABI from Rust).
-- Go, Java, C#, Julia and R through each language's FFI: the header needs nothing language-specific.
+In the order they matter for analytics and ML work on a Mac:
+
+- **Python** ships. **Swift** ships.
+- **Rust:** a crate over `include/arrowmetal.h`; the Polars plugin already uses the ABI from Rust.
+- **R:** a package over the same header, exchanging columns with the `arrow` R package through the
+  C Data Interface, so nothing is copied on the way in.
+- **TypeScript / JavaScript:** a Node binding with N-API, exchanging columns with Apache Arrow JS through
+  the C Data Interface, for the tooling around analytics and ML that is written in TypeScript. The
+  browser is out of scope: Metal is not there.
+- **Go, Java, C#, Julia** through each language's FFI: the header needs nothing language-specific.
 - Per-language timings of one operation from each binding, measured, on the site.
 
 ## Release mechanics
