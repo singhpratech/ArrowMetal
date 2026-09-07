@@ -7,7 +7,7 @@ pushed. Numbers are from the last gated run of `main` (0.1.0, unreleased) on an 
 |---|---|---|
 | Swift suites (`Tests/ArrowMetalTests`) | 764 tests in 60 files, run in release | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
 | Python suites (`python/tests`) | 2,460 collected cases over the ctypes API and the three integrations | `pyarrow.compute`, Polars, DuckDB, pandas |
-| Rust suites (`rust/arrowmetal/tests`) | 43 tests and 3 doc-tests over the safe crate, run in release | `arrow::compute` (arrow-rs 59) on the same data; a `HashMap` fold where arrow-rs has no kernel; `include/arrowmetal.h` re-parsed for the ABI signatures ([RUST.md](RUST.md)) |
+| Rust suites (`rust/arrowmetal/tests`) | 44 tests over the safe crate, run in release, plus 4 `no_run` doc-tests (compiled, not executed) | `arrow::compute` (arrow-rs 59) on the same data; a `HashMap` fold where arrow-rs has no kernel; `include/arrowmetal.h` re-parsed for the ABI signatures ([RUST.md](RUST.md)) |
 | Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | 39,069 generated cases, 45 column types, every public operation | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
 | Adversarial review pass | four independent reviewers plus a coverage pass before release | each finding carries a regression test |
 | Benchmarks (`Benchmarks/`) | 339 operation-and-size rows over 173 operations, against four CPU libraries; streaming and engine benches | measured, never estimated ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md)) |
@@ -105,7 +105,7 @@ Every merge to `main` runs, on a quiet machine, in this order, and pushes only i
 3. `differential_report.py` exits 0: 0 unclassified divergences.
 4. `pytest python/tests` (every suite): 0 failures; xfails must be strict and tied to a finding.
 5. The standalone tests in `test_differential.py`: 0 failures.
-6. `cd rust && cargo test --release`: 43 tests and 3 doc-tests, 0 failures.
+6. `cd rust && cargo test --release`: 44 tests and 4 compile-only doc-tests, 0 failures.
 
 A benchmark comparison is never part of the gate, because timings on a loaded machine are noise; the
 benchmark matrix is rerun on an idle machine before its numbers are published.

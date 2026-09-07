@@ -84,26 +84,28 @@ so it is compiled by every `cargo build --examples`. Run it with
 `sum of everything: Some(Int64(42))`.
 
 ```rust
-use std::sync::Arc;
-use arrow::array::{ArrayRef, Int64Array};
+use arrow::array::Int64Array;
 use arrowmetal::{group_by, Array, CompareOp};
 
 fn main() -> Result<(), arrowmetal::Error> {
-    let region: ArrayRef = Arc::new(Int64Array::from(vec![0i64, 1, 0, 2, 1]));
-    let amount: ArrayRef = Arc::new(Int64Array::from(vec![Some(10i64), Some(20), None, Some(5), Some(7)]));
+    let region = Int64Array::from(vec![0i64, 1, 0, 2, 1]);
+    let amount = Int64Array::from(vec![Some(10i64), Some(20), None, Some(5), Some(7)]);
 
-    let region = Array::from_arrow(region.as_ref())?;   // to the GPU
-    let amount = Array::from_arrow(amount.as_ref())?;
+    let region = Array::from_arrow(&region)?;   // to the GPU
+    let amount = Array::from_arrow(&amount)?;
 
     let big = amount.compare_scalar(CompareOp::Gt, 5i64)?;   // boolean mask
     let kept_amount = amount.filter(&big)?;                  // 10, 20, 7
     let kept_region = region.filter(&big)?;
 
     let gb = group_by(&[&kept_region])?;
-    let totals: ArrayRef = gb.sum(&kept_amount)?.to_arrow()?;  // back to arrow-rs
-    let keys: ArrayRef = gb.keys(0)?.to_arrow()?;
+    let totals = gb.sum(&kept_amount)?.to_arrow()?;          // back to arrow-rs
+    let keys = gb.keys(0)?.to_arrow()?;
 
-    println!("{} groups: {keys:?} -> {totals:?}", gb.group_count());
+    let ints = |a: &dyn arrow::array::Array| -> Vec<i64> {
+        a.as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()
+    };
+    println!("{} groups: {:?} -> {:?}", gb.group_count(), ints(&keys), ints(&totals));
     println!("sum of everything: {:?}", amount.sum()?);
     Ok(())
 }
@@ -116,31 +118,43 @@ fn main() -> Result<(), arrowmetal::Error> {
 **Copy-free out always; copy-free in when the producer's buffers are page aligned, one copy
 otherwise.**
 
+The decision is made **per buffer**, so a nullable column can have its values wrapped and its
+validity bitmap copied. That case is common; see the table.
+
 Out ([`Array::to_arrow`]) is always copy-free. ArrowMetal's buffers are `MTLBuffer`s in shared
 memory; it hands their pointers straight to the C Data Interface with a release callback, and
-arrow-rs reads the GPU's memory in place. Measured: an exported buffer's pointer was page aligned in
-every case (`tests/copy_rule.rs::arrowmetal_exported_buffers_are_page_aligned`), and the export call
-itself took 0.001 ms for a 10M-row column.
+arrow-rs reads the GPU's memory in place. Measured over inputs that all carry nulls, so both buffers
+are exercised: the exported **values and validity** pointers were page aligned in every case
+(`tests/copy_rule.rs::arrowmetal_exported_buffers_are_page_aligned`), and the export call itself took
+0.001 ms for a 10M-row column.
 
-In ([`Array::from_arrow`]) is copy-free only when every buffer pointer is aligned to a **16 KiB
-page**, because that is what `MTLDevice.makeBuffer(bytesNoCopy:)` requires; otherwise each buffer is
-copied once. Whether an arrow-rs array clears that bar is a property of the *allocator*, not of
-arrow-rs, so it is measured rather than assumed. 32 allocations at each size, through both of
-arrow-rs's allocation paths (`Int64Array::from(Vec)`, which adopts the `Vec`'s own allocation, and a
-collected iterator, which fills an arrow-buffer `MutableBuffer`):
+In ([`Array::from_arrow`]) is copy-free only when the buffer pointer is aligned to a **16 KiB page**,
+because that is what `MTLDevice.makeBuffer(bytesNoCopy:)` requires; otherwise that buffer is copied
+once. Whether an arrow-rs array clears the bar is a property of the *allocator*, not of arrow-rs, so
+it is measured rather than assumed. 32 allocations at each size, exported through `arrow::ffi` and
+read back as the pointers `am_import` actually receives:
 
-| Values buffer | Page aligned, out of 32 |
-|---|---|
-| 128 B (16 int64) | 0 (`from(Vec)`), 1 (collected) |
-| 4 KiB (512 int64) | 8, 8 |
-| 64 KiB (8,192 int64) | 32, 32 |
-| 1 MiB, 10 MB, 80 MB | 32, 32 |
+| Column length | Values bytes | Values page aligned | Validity bitmap page aligned |
+|---|---|---|---|
+| 16 | 128 B | 1/32 | 0/32 |
+| 512 | 4 KiB | 8/32 | 0/32 |
+| 8,192 | 64 KiB | 32/32 | 2/32 |
+| 131,072 | 1 MiB | 32/32 | 32/32 |
+| 1,250,000 | 10 MB | 32/32 | 32/32 |
+| 10,000,000 | 80 MB | 32/32 | 32/32 |
 
-So in practice **a column of a few thousand rows or more imports copy-free, and a very small one is
-copied**: the system allocator serves a large enough request with `mmap` and hands back page-aligned
-memory. That is not a guarantee — a custom global allocator, a different macOS, or a buffer sliced
-out of an arena can all change it. Run `cargo test --test copy_rule -- --nocapture` in `rust/` to
-print the table for your own machine.
+So in practice:
+
+* **Values are wrapped from a few thousand rows up**, and copied below that.
+* **A nullable column of fewer than roughly 130,000 rows normally has its validity bitmap copied**,
+  even when its values are wrapped. The bitmap is one bit per row, so the copy is about a kilobyte at
+  8,192 rows and about 16 KB at the point it stops happening — small, but real.
+
+Both are the system allocator serving a large enough request with `mmap` and handing back
+page-aligned memory. The bitmap is eight times smaller than the values, so it crosses that threshold
+eight times later. None of it is a guarantee — a custom global allocator, a different macOS, or a
+buffer sliced out of an arena can all change it. Run `cargo test --test copy_rule -- --nocapture` in
+`rust/` to print the table for your own machine.
 
 Copy-free is not free: at 10M int64 rows the import still cost **1.11 ms**, which is Metal mapping
 80 MB of pages into the GPU's address space. See the timing below.
@@ -149,8 +163,9 @@ Two more facts, both tested:
 
 * **A slice does not cost a copy either way.** An Arrow `offset` is carried on the handle rather than
   applied, so `array.slice(7, n)` imports the same buffers the unsliced array would.
-* **An array that came out of ArrowMetal and goes back in is never copied**, whatever its alignment:
-  ArrowMetal recognises its own exported buffers and shares the `MTLBuffer` objects directly.
+* **An array that came out of ArrowMetal and goes back in is never copied in either buffer**,
+  whatever the original alignment: ArrowMetal recognises its own exported buffers and shares the
+  `MTLBuffer` objects directly.
 
 ---
 
@@ -180,11 +195,39 @@ supports reaches the GPU through the same entry points but has **no test in this
 and Python suites cover them ([TESTING.md](TESTING.md)).
 
 Errors are `Result<T, arrowmetal::Error>`, and the message is `am_last_error()`'s, read on the spot
-because that slot is thread-local. A scalar of the wrong width is refused before the pointer reaches
-the ABI: `compare_scalar(Gt, 1i32)` on an `Int64Array` is an `Err`, not an out-of-bounds read.
+because that slot is thread-local.
 
 Handles (`Array`, `GroupBy`, `Source`, `PlanResult`) are `!Send` and `!Sync` on purpose: the ABI's
 error slot and its command-buffer batching are both thread-local. Use one set of handles per thread.
+That is asserted at compile time (`assert_not_impl_any!`), not just documented.
+
+### Scalar operands, and the one type that is refused
+
+The ABI reads `sizeof(element type)` bytes through a `void*`, so a scalar of the wrong width would be
+an out-of-bounds read. Every scalar entry point therefore checks the Rust type against the array's
+own `am_format` string first: `compare_scalar(Gt, 1i32)` on an `Int64Array` is an `Err`, not a read
+off the end.
+
+That check is only as good as `am_format`, and there is exactly one Arrow type for which `am_format`
+does not describe what the kernels compute on. **A dictionary-encoded array reports its *index* type
+(`"i"`) while every kernel decodes the dictionary and computes on the *value* type.** A 4-byte `i32`
+scalar would be accepted for a `Dictionary(Int32, Float64)` column whose kernel then reads 8 bytes —
+unsound from safe Rust, and wrong besides (`compare_scalar(Lt, 2i32)` returns `[false, false, false]`
+where arrow-rs says `[true, false, false]`, and the *correct* `2.0f64` scalar is rejected).
+
+**`Array::from_arrow` therefore refuses `DataType::Dictionary` outright**, with an error naming the
+key and value types and telling you to decode first:
+
+```rust
+let decoded = arrow::compute::cast(&dict, &DataType::Float64)?;
+let gpu = arrowmetal::Array::from_arrow(decoded.as_ref())?;   // now type-checks correctly
+```
+
+This is a limitation of the C ABI, not of the Arrow type — the kernels handle dictionaries correctly,
+and Swift and Python callers use them. It is an ABI defect on ArrowMetal's side (`am_format` should
+report the compute type) and is tracked to be fixed there; until it is, refusing the type is what
+keeps the sentence above true for everything this crate accepts.
+`tests/compute.rs::dictionary_arrays_are_refused_at_import` pins the rejection and the decode path.
 
 ### One divergence from arrow-rs, found and pinned
 
@@ -207,9 +250,13 @@ and closed as intended behaviour in 2022.
 valid element is NaN. That follows Arrow C++ / pyarrow on the mixed case; on an all-NaN column
 pyarrow returns NaN where ArrowMetal returns null, which the C header already documents.
 
-`tests/compute.rs::nan_handling_diverges_from_arrow_rs_and_is_pinned` asserts all three columns above
-and fails if any of them moves. With no NaN in the data the two agree exactly, which is what every
-other reduction test relies on.
+`tests/compute.rs::nan_handling_diverges_from_arrow_rs_and_is_pinned` asserts the **ArrowMetal and
+arrow-rs columns** and fails if either moves. The pyarrow column is not asserted from Rust — pyarrow
+is not a dependency of this crate; it is pinned in the Python suite, by
+`test_nan_is_skipped_by_min_and_max_in_both` and
+`test_all_nan_min_max_is_null_in_arrowmetal_and_nan_in_pyarrow` in
+`python/tests/test_differential.py`. With no NaN in the data the two agree exactly, which is what
+every other reduction test relies on.
 
 ---
 
@@ -228,6 +275,7 @@ here, and an untested wrapper is not a shipped one.
 | Decimals | `am_decimal_op`, `am_decimal_widen`, `am_decimal_narrow` |
 | Nested types (list, struct, map, union) | `am_list_value_length`, `am_list_flatten`, `am_list_element`, `am_list_slice`, `am_list_parent_indices`, `am_list_parent_indices64`, `am_struct_field`, `am_make_struct`, `am_child`, `am_child_count`, `am_map_lookup` |
 | Element-wise arithmetic and math | `am_arith_scalar`, `am_arith_array`, `am_unary`, `am_binary`, `am_trig`, `am_logical`, `am_float_class`, `am_math_extra`, `am_unary_checked`, `am_binary_checked`, `am_cumulative`, `am_cumulative_checked` |
+| Selection and casting variants of what *is* wrapped | `am_filter_where` (fused compare + filter), `am_group_by` (the dense-key group-by; `am_group_by_keys` + `am_group_agg_ex` are wrapped instead), `am_cast_ex` (cast with child formats and a safety flag) |
 | Boolean and Kleene logic | `am_bool_and`, `am_bool_or`, `am_bool_not`, `am_and_kleene`, `am_or_kleene` |
 | Structural and conditional | `am_is_null`, `am_is_valid`, `am_fill_null`, `am_fill_null_direction`, `am_drop_null`, `am_if_else`, `am_coalesce`, `am_case_when`, `am_choose`, `am_replace_with_mask`, `am_indices_nonzero`, `am_true_unless_null` |
 | Set lookup and hashing | `am_is_in`, `am_index_in`, `am_is_in_ex`, `am_index_in_ex`, `am_hash64`, `am_fixed_binary_hash64`, `am_fixed_binary_compare` |
@@ -273,8 +321,10 @@ number is a complete GPU round trip, not an enqueue. Source:
 
 * **kernel** — the GPU call on an array already imported, mask already on the GPU. This is what each
   step of a longer chain costs.
-* **end to end** — import from arrow-rs, run, export back. What *one* operation on an arrow-rs array
-  costs. Supporting numbers: import 1.11 ms, export 0.000 ms.
+* **end to end** — what *one* operation on an arrow-rs array costs, import included. What that covers
+  differs by row: the `sum` row is import + the reduction and has **no export**, because a reduction
+  returns a scalar through out-parameters rather than an array; the compare + `filter` row is
+  import + compare + filter + `to_arrow`. Supporting numbers: import 1.11 ms, export 0.000 ms.
 
 **Where ArrowMetal loses.** A single `sum` on an arrow-rs array is **2.3× slower** than
 `arrow::compute::sum`: 2.11 ms against 0.91 ms. The kernel is 3.3× faster; the loss is entirely the
@@ -312,5 +362,5 @@ cd rust
 ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib cargo test --release
 ```
 
-43 tests and 3 doc-tests, all green as of this writing. What each file compares against is in
+44 tests, plus 4 `no_run` doc-tests (compiled, not executed), all green as of this writing. What each file compares against is in
 [`rust/README.md`](../rust/README.md) and in [TESTING.md](TESTING.md).

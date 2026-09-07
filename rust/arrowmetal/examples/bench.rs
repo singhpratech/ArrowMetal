@@ -23,9 +23,16 @@
 //! * **arrow-rs** -- `arrow::compute::sum` / `arrow::compute::filter`.
 //! * **ArrowMetal, kernel** -- the GPU call on an array already imported, mask already on the GPU.
 //!   This is what a chain of several operations pays per step.
-//! * **ArrowMetal, end to end** -- import from arrow-rs, run, export back. This is what a single
-//!   operation on an arrow-rs array costs, and it carries the one copy in (see the copy rule:
-//!   arrow-rs allocates to 64 bytes, not to a page).
+//! * **ArrowMetal, end to end** -- what a single operation on an arrow-rs array costs, import
+//!   included. Exactly what that covers differs by row, so each says: the `sum` row is import + the
+//!   reduction and has **no export** (a reduction hands back a scalar through out-parameters, not an
+//!   array), while the compare + `filter` row is import + compare + filter + `to_arrow`.
+//!
+//!   At this size the import is **copy-free**, not a copy: the values buffer comes back page
+//!   aligned, which is what `makeBuffer(bytesNoCopy:)` needs. The report prints the alignment it
+//!   measured next to the import time so the two are read together. The cost is Metal mapping 80 MB
+//!   of pages into the GPU's address space. (`tests/copy_rule.rs` has the alignment-by-size table;
+//!   below about 4 KiB a buffer usually is copied.)
 
 use std::hint::black_box;
 use std::sync::Arc;
