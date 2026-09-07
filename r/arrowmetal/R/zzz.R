@@ -4,12 +4,8 @@ am_lib_candidates <- function() {
   out <- character()
   env <- Sys.getenv("ARROWMETAL_LIB", "")
   if (nzchar(env)) out <- c(out, env)
-  recorded <- system.file("arrowmetal_lib_path", package = "arrowmetal")
-  if (nzchar(recorded)) {
-    p <- trimws(readLines(recorded, warn = FALSE))
-    p <- p[nzchar(p)]
-    if (length(p)) out <- c(out, p[1])
-  }
+  recorded <- .Call(C_am_default_lib_path)
+  if (!is.null(recorded)) out <- c(out, recorded)
   # ../../.build/release/libArrowMetalC.dylib relative to the package source directory, which is
   # where it sits in a checkout of the repository.
   out <- c(out, file.path("..", "..", ".build", "release", "libArrowMetalC.dylib"))

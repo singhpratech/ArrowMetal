@@ -2,11 +2,13 @@
 # takes its function-pointer types from those prototypes with __typeof__, so a stale copy would
 # compile against the wrong ABI. When the test runs from a checkout, check the copies are current.
 
-repo_include <- function() {
+repo_root <- function() {
   d <- normalizePath(".", mustWork = FALSE)
-  for (i in 1:8) {
-    cand <- file.path(d, "include", "arrowmetal.h")
-    if (file.exists(cand)) return(dirname(cand))
+  for (i in 1:10) {
+    if (file.exists(file.path(d, "include", "arrowmetal.h")) &&
+        dir.exists(file.path(d, "r", "arrowmetal", "src"))) {
+      return(d)
+    }
     parent <- dirname(d)
     if (identical(parent, d)) break
     d <- parent
@@ -14,16 +16,11 @@ repo_include <- function() {
   NULL
 }
 
-pkg_src <- function() {
-  for (p in c("../../src", "../../../src", "src")) if (dir.exists(p)) return(normalizePath(p))
-  NULL
-}
-
 test_that("the vendored C headers match the repository's include/", {
-  inc <- repo_include()
-  src <- pkg_src()
-  skip_if(is.null(inc), "not running from a checkout of the repository")
-  skip_if(is.null(src), "package src/ not available (installed package, not the source tree)")
+  root <- repo_root()
+  skip_if(is.null(root), "not running from a checkout of the repository")
+  inc <- file.path(root, "include")
+  src <- file.path(root, "r", "arrowmetal", "src")
   for (h in c("arrowmetal.h", "arrow_abi.h")) {
     expect_equal(
       tools::md5sum(file.path(src, h))[[1]],

@@ -113,6 +113,17 @@ test_that("errors from the C ABI reach R as R errors with the ArrowMetal message
   expect_error(am_compare(am_array(c(1, 2)), "~=", 1), "unknown comparison operator")
 })
 
+test_that("the loader looks in both documented places and says so when it fails", {
+  cands <- arrowmetal:::am_lib_candidates()
+  expect_true(any(grepl("\\.build/release/libArrowMetalC\\.dylib$", cands)))
+  withr_env <- Sys.getenv("ARROWMETAL_LIB", "")
+  if (nzchar(withr_env)) expect_true(withr_env %in% cands)
+  msg <- arrowmetal:::am_load_message(c("/nowhere/libArrowMetalC.dylib (not found)"))
+  expect_match(msg, "ARROWMETAL_LIB")
+  expect_match(msg, "\\.\\./\\.\\./\\.build/release/libArrowMetalC\\.dylib")
+  expect_match(msg, "/nowhere/libArrowMetalC\\.dylib")
+})
+
 test_that("print methods say something useful", {
   skip_without_gpu()
   expect_output(print(am_array(c(1, 2, NA))), "am_array g len=3 nulls=1")
