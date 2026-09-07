@@ -470,22 +470,11 @@ def test_streaming_group_by_key_order_is_the_gpu_group_order(con):
     assert got.column("total").to_pylist() == [2, 3, 1]
 
 
-@pytest.mark.xfail(strict=True,
-                   reason="REVIEW: include/arrowmetal.h declares am_plan_source as both a typedef "
-                          "and a function, so the public C header does not compile and the DuckDB "
-                          "extension cannot be built")
 def test_the_public_c_header_compiles():
-    """include/arrowmetal.h declares `am_plan_source` twice, as a typedef and as a function:
-
-        typedef struct am_plan_source_t am_plan_source;
-        int  am_plan_source(const char* name, ...);
-
-    That is "redefinition as a different kind of symbol" in both C and C++, so *no* C consumer of
-    the published header can compile -- including this repository's own DuckDB extension, which is
-    why every `@extension` test in this file skips. Rename one of the two (the struct handle is the
-    one the docs call `am_plan_source`, so the function wants to be `am_plan_source_create`) and
-    drop this marker.
-    """
+    """The published header once declared `am_plan_source` twice, as a typedef and as a function --
+    "redefinition as a different kind of symbol" in both C and C++, so no C consumer could compile it
+    and this repository's own DuckDB extension never built (every `@extension` test skipped). The
+    function is `am_plan_source_create` now; this keeps the header compiling as C."""
     import shutil
     import subprocess
     import tempfile
