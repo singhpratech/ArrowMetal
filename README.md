@@ -12,7 +12,7 @@ C Device Data Interface (`ARROW_DEVICE_METAL`).
 Every array is Arrow layout in memory the GPU already shares, so there is nothing to upload. Gathers,
 group-by, sorts and string scans run on the GPU 3.8x to 24x faster than the fastest CPU idiom in the
 table below — and that baseline is each library's *most parallel* idiom, Polars' lazy engine and
-pyarrow's Acero, using eleven to fifteen of the sixteen cores. While they run the CPU is free for the
+pyarrow's Acero, using a median of eleven of the sixteen cores, and up to fifteen. While they run the CPU is free for the
 rest of the application: every table here reports CPU time per operation next to wall time, and the
 same rows cost 26 to 1,284 CPU-ms on the other side against one or two here. Chains of operations
 share one GPU round trip. The whole thing is reachable from Swift, Python, and any language with Arrow
@@ -69,7 +69,7 @@ first seven are:
 | shift (lag 1, int64) | 50,000,000 | 3.58 (0.9) | Polars lazy | 0.03 (0) | 2.2 | 0.01x |
 
 **Swift, against all 16 CPU cores** (tight typed loops over the same Arrow layout) and Accelerate. These
-are the Swift-level baselines of rounds 6 and 7 in [docs/BENCHMARKS.md](docs/BENCHMARKS.md), measured
+are the Swift-level baselines of rounds 2, 3 and 7 in [docs/BENCHMARKS.md](docs/BENCHMARKS.md), measured
 2026-09-06 and not re-measured since — the sort row in particular predates the sort work the 2026-09-07
 matrix above measures:
 
@@ -94,7 +94,7 @@ Takeaways, all against the fastest idiom of any CPU library. **Where the GPU win
 not on effort:** gathers (`take`, 24.2x), multi-key and high-cardinality group-by (`lexsort` 24.0x,
 `sum by int32 key` 3.8x at a thousand groups and 6.3x at a hundred thousand), sorts (`argsort int64`
 7.7x, `sort float64` 4.1x) and GPU string predicates (`contains` 7.0x at 10M rows; the family's GPU
-predicates run 1.6x to 7.0x against Polars lazy and Acero). The group-by family is 65 of 84 rows at or
+predicates run 1.6x to 7.0x against Polars lazy and Acero at ten million rows). The group-by family is 65 of 84 rows at or
 above 3x. **Where it does not, it mostly ties:** a single pass that reads one column and writes one is
 memory bound on both sides, and eleven to fifteen cores reach the same unified memory the GPU does, so
 there is no 3x on that shape for anybody.
@@ -105,8 +105,10 @@ them: 17 element-wise and 11 compare+select rows that are bandwidth ties, 13 str
 at a million rows, where the fixed cost per call is the operation; seven of those ten are wins at ten
 million), 10
 temporal rows where a calendar conversion is arithmetic per element rather than bytes per second, the
-9 latency rows that exist to measure the dispatch floor, and the software binary64 transcendentals,
-which cost forty-odd emulated operations per element on a GPU with no double hardware. Every one of
+9 latency rows that exist to measure the dispatch floor, the software binary64 transcendentals,
+which cost forty-odd emulated operations per element on a GPU with no double hardware, and 17 more
+spread across chains, sort, decimal, reductions, window and group-by — including `shift (lag 1)` at
+0.01x, the worst non-latency loss in the matrix. Every one of
 them is listed with its cause and with what would change it in [docs/LOSSES.md](docs/LOSSES.md), and
 [docs/DESIGN.md](docs/DESIGN.md) has the pipelining plan for the dispatch floor.
 
@@ -164,8 +166,22 @@ names.match_substring_regex("^p").to_arrow()       # [false, true, true]
 price = am.array(pa.array([Decimal("19.99"), Decimal("5.01")], type=pa.decimal128(10, 2)))
 price.decimal_add(price).to_arrow()                # [39.98, 10.02]
 ```
-The same C ABI (`include/arrowmetal.h`) serves Rust, Go, C#, R, C++ and C through their Arrow C Data
-Interface bindings. See [python/README.md](python/README.md).
+See [python/README.md](python/README.md).
+
+## Bindings
+
+Four language bindings over the same C ABI (`include/arrowmetal.h`) ship in this repository, each
+exchanging columns through the Arrow C Data Interface and each with its own test suite:
+
+| Binding | Where | Tests | Doc |
+|---|---|---|---|
+| Rust | `rust/arrowmetal`, `rust/arrowmetal-sys` | 48 tests plus 4 `no_run` doc-tests | [docs/RUST.md](docs/RUST.md) |
+| Go | `go/arrowmetal` | 46 test functions | [docs/GO.md](docs/GO.md) |
+| TypeScript / JavaScript | `node/` (N-API addon) | 62 tests | [docs/TYPESCRIPT.md](docs/TYPESCRIPT.md) |
+| R | `r/arrowmetal` | 266 expectations across 64 `test_that` blocks | [docs/R.md](docs/R.md) |
+
+C and C++ callers use the header directly. Java, C# and Julia are on the
+[roadmap](docs/ROADMAP.md).
 
 ## Quick start (Swift)
 
@@ -210,8 +226,8 @@ ctx.batchAsync({ try amount.filter(where: .gt, 100) }) { result in
 }
 ```
 
-Five end-to-end scenarios (analytics query, feature preparation, Float64 with NaN, C Data Interface
-interop, sliced windows) live in `Sources/ArrowMetalExamples`: `swift run -c release arrowmetal-examples`.
+Six end-to-end scenarios (analytics query, feature preparation, Float64 with NaN, C Data Interface
+interop, sliced windows, one batched command buffer) live in `Sources/ArrowMetalExamples`: `swift run -c release arrowmetal-examples`.
 
 Interop with any Arrow implementation through the C Data Interface:
 
@@ -289,7 +305,7 @@ Arrow type matrix and the interop status.
   path kept underneath.
 - **Selection and ordering**: `filter` (including a fused predicate form), `take`, `slice`, `drop_null`,
   `scatter`, `inverse_permutation`, single- and multi-key `sort_indices` / `lexsort_indices`, `top_k` /
-  `select_k_unstable` (per-threadgroup selection for k ≤ 1024), `partition_nth_indices`, `rank`,
+  `select_k_unstable` (a GPU radix select for any k, with a per-threadgroup path at k ≤ 1024), `partition_nth_indices`, `rank`,
   `dense_rank`, `row_number`, `rank_quantile`, `rank_normal`, `winsorize`.
 - **Strings**: length, equality, prefix/suffix/containment, `count_substring`, `find_substring`, murmur3
   hash, `dictionary_encode`, the case and title transforms (ASCII and Unicode), padding and centring,
@@ -313,8 +329,10 @@ Arrow type matrix and the interop status.
 - Float64 on the GPU even though Metal has no `double`: compare, min, max, filter, take and slice use an
   order-preserving map of the IEEE bit pattern; sum, add, subtract, multiply, divide, the segmented
   group-by sums and means and the whole transcendental family use a software IEEE-754 binary64
-  implementation on 64-bit integers. The arithmetic (`+ − × ÷`, sums and grouped sums) is bit-exact
-  against Swift's `Double` over millions of random and edge-case inputs, subnormals and NaN included.
+  implementation on 64-bit integers. The arithmetic (`+ − × ÷`) is bit-exact
+  against Swift's `Double` over millions of random and edge-case inputs, subnormals and NaN included;
+  `sum` and the grouped sums use the same adder but reassociate over threadgroups, so they are checked
+  to a tolerance.
   `sqrt` is correctly rounded; `exp`, `ln`, `log10`, `log2` and `power` measure a worst case of 1 ulp
   against libm and are asserted within 2; the trigonometric and hyperbolic families are within 5.
 - NaN: `min`/`max` skip NaN and return null if only NaN remains; `sum` propagates NaN; comparisons follow IEEE.

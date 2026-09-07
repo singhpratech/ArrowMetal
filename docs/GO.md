@@ -177,9 +177,9 @@ report it either and the table above measures alignment in Go instead.
 
 ## Timing
 
-10M Int64 rows (76 MB), no nulls, one M4 Max, one process, wall clock, **best of 5 timed runs after
-one untimed warm-up**. Reproduce with `go run ./cmd/amtiming` from `go/arrowmetal`; the source of
-every row is [`cmd/amtiming/main.go`](../go/arrowmetal/cmd/amtiming/main.go).
+10M Int64 rows (76 MB, i.e. MiB — 80 MB decimal), no nulls, one M4 Max, one process, wall clock,
+**best of 5 timed runs after one untimed warm-up**. Reproduce with `go run ./cmd/amtiming` from
+`go/arrowmetal`; the source of every row is [`cmd/amtiming/main.go`](../go/arrowmetal/cmd/amtiming/main.go).
 
 ArrowMetal 0.1.0, Go 1.27.1, arrow-go v18.7.0. The filter predicate is `x > 0` and keeps 50.0% of
 the rows.
@@ -202,6 +202,9 @@ the rows.
 | Filter | ArrowMetal, end to end with a copying import | 2.98 ms | 16× Arrow Go compute |
 
 ### Reading this honestly
+
+arrow-go's compute is single-threaded and ArrowMetal's kernels run on the whole GPU, so the multiples
+above are not per-core figures.
 
 - **ArrowMetal loses at Sum end to end.** 2.22 ms against Arrow Go's 1.16 ms. A single 76 MB sum is
   a memory-bandwidth problem that the CPU is already good at, and the ~1.2 ms of import overhead is
@@ -240,7 +243,7 @@ Every item below has at least one test in `go/arrowmetal`; the oracle is named. 
 | Sum, Min, Max, Mean | `(*Array).Sum/Min/Max/Mean` | plain Go loops (arrow-go has no aggregates); Int64 and Float64, with and without nulls |
 | Null and NaN rules | the same | all-null and empty arrays report an invalid `Scalar`; min/max skip NaN; an all-NaN column is null |
 | Compare against a scalar | `(*Array).CompareScalar` | `compute.CallFunction("equal"/"not_equal"/"less"/"less_equal"/"greater"/"greater_equal")`, all six, with nulls |
-| Scalar range checking | the same | 27 cases: integer overflow at both edges of int8 and uint8, float32 overflow and underflow, integers past 2^24 and 2^53, ordinary rounding still allowed; the values that do fit agree with a Go loop |
+| Scalar range checking | the same | 28 cases: integer overflow at both edges of int8 and uint8, float32 overflow and underflow, integers past 2^24 and 2^53, ordinary rounding still allowed, plus a string and a bool scalar rejected by Arrow format string; the values that do fit agree with a Go loop |
 | Compare two arrays | `(*Array).CompareArray` | length-mismatch error path |
 | Filter | `(*Array).Filter` | `compute.FilterArray` with `SelectionDropNulls` |
 | Take | `(*Array).Take` | `compute.TakeArray`, including null indices |
@@ -255,7 +258,7 @@ Every item below has at least one test in `go/arrowmetal`; the oracle is named. 
 | Allocator alignment | the Go heap's shape | every Go-heap offset past a page is 0 or 8192 and nothing else, at 1M and 10M, 20 trials each |
 | cgo pointer rules | `Import` | the whole suite again under `GOEXPERIMENT=cgocheck2`; removing the pin makes it die on the first round trip |
 | Handle lifecycle | `Release` | repeated import of one `arrow.Array`; a long-lived handle alongside short-lived ones; a released handle errors rather than crashing |
-| Leaks | the whole chain | 2,000 import/compare/filter/export/release round trips at 200k rows, in a child process so the baseline is its own; `TASK_VM_INFO.phys_footprint` has to stay inside 16 MB (it grows about 2.3 MB, and leaking just the mask handle grows 35 MB — checked in the shipped test order) |
+| Leaks | the whole chain | 2,000 import/compare/filter/export/release round trips at 200k rows, in a child process so the baseline is its own; `TASK_VM_INFO.phys_footprint` has to stay inside 16 MB (it grows a few MB, and leaking just the mask handle grows 35 MB — checked in the shipped test order) |
 | The loader | `Init`, `LibraryPath` | a child process with `ARROWMETAL_LIB` pointing at nothing, and a child with nothing set in an empty directory: the error has to name the variable, the paths and the `swift build` line |
 | Docs | the example in this file | compiled and run as `Example()`, so it cannot drift from the API |
 
@@ -265,7 +268,7 @@ Sizes are at or below 10M elements throughout.
 
 ## What is not wrapped
 
-The C ABI has 220 entry points; this binding resolves 33 of them. Not wrapped, and not tested from
+The C ABI has 222 entry points; this binding resolves 33 of them. Not wrapped, and not tested from
 Go:
 
 - **Arithmetic and math**: `am_arith_scalar`, `am_arith_array`, `am_unary`, `am_binary`,
@@ -286,8 +289,7 @@ Go:
   call inside it pinned to one OS thread, which the current one-call-at-a-time pinning does not give
   you across calls.
 - **Whole subsystems**: Parquet (`am_parquet_*`), streaming (`am_stream_*`), the device interface
-  (`am_import_device` / `am_export_device`), joins in index form (`am_hash_join`), sources built
-  from an `ArrowArrayStream`.
+  (`am_import_device` / `am_export_device`), joins (`am_join`).
 - `arrow.RecordBatch` and `arrow.Table` go in only one at a time, column by column. `PlanResult` can
   produce a `RecordBatch`; nothing consumes one.
 

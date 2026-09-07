@@ -77,7 +77,7 @@ so a "kernel" number is a complete GPU round trip, not an enqueue. The source is
 | Operation, 10M Int64 | arrow-rs | ArrowMetal, kernel | ArrowMetal, end to end |
 |---|---|---|---|
 | `sum` | 0.91 ms | **0.28 ms** | 2.11 ms |
-| `filter`, mask already built | 3.55 ms | **0.64 ms** | — |
+| `filter` (mask ready) | 3.55 ms | **0.64 ms** | — |
 | compare + `filter` | 4.58 ms | — | **2.97 ms** |
 
 * **kernel** — the GPU call on an array already imported, mask already on the GPU. This is what each
@@ -94,9 +94,9 @@ table above: 0.91 / 0.30 / 2.14 for `sum`, 3.59 / 0.66 for `filter`, 4.62 / 2.97
 ### Where ArrowMetal loses
 
 **A single `sum` on an arrow-rs array is 2.3× slower than arrow-rs**: 2.11 ms against 0.91 ms. The
-kernel itself is 3.3× *faster* (0.28 ms); the loss is entirely the cost of handing 80 MB to Metal —
-1.11 ms for the import measured on its own, and the remaining ~0.7 ms in handle setup and the GPU's
-first touch of the newly mapped pages.
+kernel itself is 3.3× *faster* (0.28 ms); the loss is entirely the cost of handing 80 MB (decimal
+MB; 76 MiB) to Metal — 1.11 ms for the import measured on its own, and the remaining ~0.7 ms in
+handle setup and the GPU's first touch of the newly mapped pages.
 
 That import is copy-free at this size: the values buffer came back aligned to 4 MiB, well past the
 16 KiB page `makeBuffer(bytesNoCopy:)` needs. So the 1.1 ms is Metal mapping pages into the GPU's

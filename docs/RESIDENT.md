@@ -1,10 +1,11 @@
 # The resident GPU worker: why it does not work on Apple silicon today, and what took its place
 
 Every unbatched ArrowMetal call is one command buffer, and a command-buffer round trip on an M4 Max
-costs about 65 µs of which the GPU runs for 1.5. Below roughly 100k rows that fixed cost is the whole
-story, and one CPU core wins. The obvious escape is a **resident worker**: keep one compute dispatch
-alive whose threadgroups spin on a ring buffer of op descriptors in unified memory, so submitting an
-op is a store and collecting a result is a load. No encode, no commit, no completion notification.
+costs about 65 µs of which the GPU runs for 1.7 (1.5 at best). Below roughly a million rows one CPU
+core wins, and below 100k the fixed cost is the whole story. The obvious escape is a **resident
+worker**: keep one compute dispatch alive whose threadgroups spin on a ring buffer of op descriptors
+in unified memory, so submitting an op is a store and collecting a result is a load. No encode, no
+commit, no completion notification.
 
 It does not work on this platform. This document records the experiments, the numbers, and the
 latency work that replaced it.
@@ -82,8 +83,9 @@ There is no architectural fix available:
 - `MTLBuffer.didModifyRange` does not apply: it is a managed-storage operation, and shared storage on
   Apple silicon has no such hint. There is no `synchronize` that can run mid-dispatch.
 
-**Conclusion: a persistent spinning worker cannot be built on Apple silicon Metal.** The memory model
-simply does not promise CPU/GPU coherence inside a dispatch, and no qualifier delivers it in practice.
+**Conclusion: no MSL qualifier available today delivers the coherence a persistent spinning worker
+needs, so it cannot be built on this platform as it stands.** The memory model simply does not promise
+CPU/GPU coherence inside a dispatch, and no qualifier delivers it in practice.
 
 `ResidentMode.available` is `false`, `MetalContext.setResidentMode(true)` returns `false`, and
 `am_resident_mode(1)` returns `0`. Nothing silently pretends otherwise.

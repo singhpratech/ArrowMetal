@@ -14,7 +14,7 @@ test or the CSV a claim comes from.
 | [TESTING.md](TESTING.md) | Every test suite, what it covers, and the commands to run it |
 | [BENCHMARKS.md](BENCHMARKS.md) | Every benchmark round with hardware, methodology, wall time and CPU time; the tables the README quotes |
 | [LOSSES.md](LOSSES.md) | Every row of the matrix still short of the 3x bar, slower rows first, grouped by the measured cause (dispatch floor, copy vs view, sort-based distinct, software binary64, host regex), plus the rows under the 3x bar and what changed since the previous matrix |
-| [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md) | The complete operation-by-operation comparison against Polars, pyarrow.compute and pandas at 10M and 50M rows, with a verdict per row and a shortfall list of everything below the 3x bar |
+| [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md) | The complete operation-by-operation comparison against Polars, pyarrow, pandas and numpy in both their eager and most-parallel idioms, at 1k to 50M rows, with a verdict per row and a shortfall list of everything below the 3x bar |
 | [DESIGN.md](DESIGN.md) | How it works: buffers, kernels, batching, GPU-side lengths, software Float64, where the time goes |
 | [PANDAS.md](PANDAS.md) | pandas on the GPU: the `.am` accessor and the zero-code-change accel mode, what routes to the GPU and when, the zero-copy and null rules, the numbers and the limits |
 | [NUMPY.md](NUMPY.md) | numpy on the GPU through pyarrow: which dtypes cross without a copy (asserted by `test_numpy.py`), NaN-as-value semantics, the matrix rows measured against numpy, and the NEP 18 step that is ours to take |
@@ -31,7 +31,7 @@ test or the CSV a claim comes from.
 | [FINDINGS.md](FINDINGS.md) | Things learned the hard way: toolchain quirks, Metal limits, bugs and their lessons |
 | [ROADMAP.md](ROADMAP.md) | What is next and what is open for contributors |
 | [../CHANGELOG.md](../CHANGELOG.md) | What is in the (unreleased) 0.1.0 |
-| [../Benchmarks/README.md](../Benchmarks/README.md) | The three benchmark programs and the fairness rules |
+| [../Benchmarks/README.md](../Benchmarks/README.md) | The six benchmark programs and the fairness rules |
 | [../python/README.md](../python/README.md) | The Python package: install, wheel build, usage |
 | [RELEASE.md](RELEASE.md) | The ordered checklist for cutting and publishing 0.1.0: tags, the wheel, PyPI, the plugin crate, the docs to re-verify |
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | How to add a kernel, test it, and benchmark it |

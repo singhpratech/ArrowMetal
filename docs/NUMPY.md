@@ -3,7 +3,11 @@
 How a numpy array reaches the GPU, what crosses without a copy and what does not, what the benchmark
 matrix measures against numpy, and the one step that would let existing numpy code run on Metal. Every
 number here is from `Benchmarks/results/full_matrix_2026-09-07.csv` or from `python/tests/test_numpy.py`,
-which asserts each claim in the first two sections on every run.
+which asserts each claim in the first two sections on every run. That CSV is the **eager** run, and the
+numpy rows quoted below are numpy's plain eager idiom; the published baseline is the parallel run in
+`Benchmarks/results/full_matrix_2026-09-07-parallel.csv`, which measures each CPU library's most
+parallel idiom too (numpy has none, so its `numpy-parallel` column is empty), and
+[BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md) and [LOSSES.md](LOSSES.md) are written against it.
 
 ## 1. The crossing
 

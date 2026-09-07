@@ -217,10 +217,10 @@ is about what *round-trips*, which is a tier-1 and tier-3 question.
 
 Everything else -- Boolean, the temporal types, Binary, Categorical, Enum, Decimal, List, Struct,
 Null -- raises a Polars `ComputeError` whose message starts `arrowmetal:`. Nothing panics through
-pyo3. **Categorical and Enum are the one place tier 2 is genuinely behind tier 1**: the Python
+pyo3. **There are two places tier 2 is genuinely behind tier 1.** Categorical and Enum: the Python
 bridge recodes Polars' `dictionary<uint32>` index buffer to int32 for the GPU, and
 `polars-plugin/src/bridge.rs` does not, so a Categorical column reaches the kernel as-is and is
-refused with "dictionary indices must be int32 or int64". Decimal is the other: `am_decimal_op`
+refused with "dictionary indices must be int32 or int64". And Decimal: `am_decimal_op`
 backs `s.arrowmetal.sum()` in tier 1, and the plugin does not reach for it.
 
 ### The scalar in `.add` / `.sub` / `.mul` / `.truediv`
@@ -361,7 +361,7 @@ idea: Polars owns the plan, ArrowMetal owns one pass over the result.
 
 ## Numbers
 
-Apple M4 Max, macOS 15, polars 1.44.1 (16 threads), pyarrow 25.0.1, ArrowMetal 0.1.0. Best of 5
+Apple M4 Max, macOS 26.6.2, polars 1.44.1 (16 threads), pyarrow 25.0.1, ArrowMetal 0.1.0. Best of 5
 runs after a warm-up, one process, one data set. Reproduce with:
 
 ```
@@ -394,14 +394,20 @@ from 4096 distinct values.
 
 ### Reading the table
 
+* **The "Polars" column is Polars' eager idiom**, which is what `Benchmarks/polars_bench.py` measures
+  and what `Benchmarks/results/full_matrix_2026-09-07.csv` records. The published baseline is the
+  parallel run, `Benchmarks/results/full_matrix_2026-09-07-parallel.csv`, which adds Polars' lazy
+  engine (`polars-lazy`, a median of 11.5 of the 16 cores); ratios there are lower on the rows where
+  the lazy engine parallelises. [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md) has both.
 * **"GPU-resident"** is the same kernel with the column already in Metal memory -- the import is
   outside the timed region, and, for the group-by rows, the `am.group_by([k])` key-mapping pass as
   well: those rows time the aggregate only. It is what a pipeline that stays on the GPU sees, and it
   is the column that shows what the kernels are actually worth.
 * **The group-by row is not a like-for-like ratio against Polars**, whose 112.6 ms includes its whole
   hash group-by. The comparable end-to-end figure is in the benchmark matrix: `sum by int32 key
-  (1000 groups)` at 50M rows is **8.83 ms against Polars' 81.92 ms, 9.3x**
-  (`Benchmarks/results/full_matrix_2026-09-07.csv`), and 2.66 ms against 20.65 ms, 7.8x, at 10M.
+  (1000 groups)` at 50M rows is **4.89 ms against Polars lazy's 81.93 ms, 16.8x**
+  (`Benchmarks/results/full_matrix_2026-09-07-parallel.csv`), and 1.73 ms against 20.24 ms, 11.7x, at
+  10M.
 * **The hand-off is the whole difference** between the middle columns and the right one. At 50M
   rows the import is 5.7 ms and the export 0.01 ms. Every tier-1 and tier-2 row pays it once per
   call, so a single `sum` loses to Polars and a group-by wins by 4x.

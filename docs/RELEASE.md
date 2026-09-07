@@ -103,7 +103,7 @@ twine check python/dist/*.whl
 unzip -l python/dist/*.whl | grep _lib          # the dylib must be in the archive
 python -m venv /tmp/am-wheel && /tmp/am-wheel/bin/pip install python/dist/*.whl
 cd /tmp && /tmp/am-wheel/bin/python -c "import arrowmetal as am; print(am.device_name())"
-cd - && /tmp/am-wheel/bin/pip install 'python/dist/arrowmetal-0.1.0-*.whl[polars,duckdb,pandas]'
+cd - && /tmp/am-wheel/bin/pip install "$(echo python/dist/arrowmetal-0.1.0-*.whl)[polars,duckdb,pandas]"
 ```
 
 Then upload:
@@ -162,7 +162,7 @@ URLs the release refers to.
 2. Update every URL that names the old path, then commit:
    ```
    grep -rn 'github.com' README.md CHANGELOG.md CONTRIBUTING.md docs/ python/ Package.swift \
-       polars-plugin/ duckdb-extension/ .github/ | grep -v Binary
+       polars-plugin/ duckdb-extension/ rust/ go/ node/ r/ .github/ | grep -v Binary
    ```
    `python/pyproject.toml` carries `[project.urls] Homepage` and `Source`; a changed URL there needs a
    re-upload to be visible on PyPI, so prefer settling the organisation name *before* step 4 if possible.

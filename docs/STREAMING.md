@@ -203,12 +203,13 @@ the host until `finish()`.
 
 #### Publishing a 64-bit key with 32-bit atomics
 
-Metal has no 64-bit atomics — checked, not assumed: on this M4 Max `atomic_ulong` has no
-`compare_exchange`, no `fetch_add` and no `fetch_max` — and only guarantees `memory_order_relaxed` on
-the 32-bit ones. So the usual "claim the slot, then publish the key beside it" handshake is not safe:
-nothing orders the key's store against the claim, and a reader that sees a claimed slot may read a
-key that is not there yet. `Kernels/HashTable.swift` avoids that by storing `row + 1` in the atomic
-and reading the key out of an array nothing writes, which a *persistent* table cannot do.
+Metal has no 64-bit atomic add or compare-exchange — checked, not assumed: on this M4 Max
+`atomic_ulong` admits only `fetch_min` and `fetch_max` on device memory — and only guarantees
+`memory_order_relaxed` on the 32-bit ones. So the usual "claim the slot, then publish the key beside
+it" handshake is not safe: nothing orders the key's store against the claim, and a reader that sees a
+claimed slot may read a key that is not there yet. `Kernels/HashTable.swift` avoids that by storing
+`row + 1` in the atomic and reading the key out of an array nothing writes, which a *persistent* table
+cannot do.
 
 This table publishes the key **through** the atomics instead. A slot is three 32-bit words holding
 the key's 64 bits split 22 / 21 / 21, each stored as `field + 1`, so **0 means "not written"** and
@@ -437,7 +438,7 @@ The terminal picks the plan. `.sink` / `.collect` still stream the joined rows o
 
 Every accumulator is a raw `ulong` — a signed sum, an unsigned sum, or an IEEE-754 binary64 bit
 pattern folded by the correctly-rounded software adder `d_add`, since Metal has neither a `double`
-type nor a 64-bit atomic. The kernel is generated per (key type, aggregate list) and unrolled, so
+type nor a 64-bit atomic add. The kernel is generated per (key type, aggregate list) and unrolled, so
 there is no per-aggregate branch in the probe loop. A slot's *count* doubles as its "is empty" flag,
 which is what makes `min` / `max` free of a per-type sentinel and an all-null input come out as null
 rather than as an infinity.
@@ -530,7 +531,7 @@ dense ids, never sorts anything and never runs a second kernel over its groups, 
 is read-bound. A float64 sum pays for the dense ids and the per-group reduction because Metal has no
 64-bit atomic to fold a double with.
 
-**Peak RSS rises by 0.69 GB** on `groupby_10m`, and that is the price of the dense-id branch: two
+**Peak RSS rises by 0.62 GB** on `groupby_10m`, and that is the price of the dense-id branch: two
 `uint` arrays the size of the table (2 x 134 MB at 33.5 M slots) plus the batch's segment arrays. The
 atomic path allocates neither. Nothing else in the table moved.
 
@@ -562,10 +563,10 @@ against Polars' answer with a 1e-9 relative tolerance on float sums, and all fou
 
 ### Where the pipeline's time goes now
 
-`overlap` is (read + gpu + merge) / wall: 1.0 for a serial pipeline, and above that by however much
-the stages actually ran at the same time. With `readers = 2` the read column is the sum across both
-reader threads, so it can exceed wall on its own. The stall columns are the GPU stage waiting: for a
-batch the readers had not finished, and for the merge queue to drain.
+`overlap` is 1.0 for a serial pipeline, and above that by however much the stages actually ran at the
+same time. With `readers = 2` the read column is the sum across both reader threads, so it can exceed
+wall on its own. The stall columns are the GPU stage waiting: for a batch the readers had not
+finished, and for the merge queue to drain.
 
 | Workload | Overlap | Read (s) | GPU (s) | Merge (s) before | **Merge (s) after** | Read stall (s) | Merge stall (s) | Wall (s) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -597,7 +598,7 @@ stays flat at 2.3 to 2.5 GB over 8 GB of data.
   sort of its key column plus an atomic group-by min to pick each group's representative row — with a
   host loop over that batch's ~950,000 groups inside it. That is what the row-level path of §4.1
   removed; the 4 GB table above is the result.
-* **`groupby_1k`, `topk`, `sort_limit` and the join are within 2x to 3x** of Polars and DuckDB, and
+* **`groupby_1k`, `topk`, `sort_limit` and the join are within 2x to 3.2x** of Polars and DuckDB, and
   are read- or fixed-cost-bound rather than dominated by any one stage.
 * **The broadcast join is unchanged** because the benchmark streams its joined rows back to Python
   and sums them there. Fusing the aggregate into the probe, so the join's output never leaves the
@@ -620,7 +621,7 @@ digits of a double (the benchmark's own cross-check passes on every round).
 | Polars | 233 ms | 1,836 MB | | | | |
 | DuckDB | 229 ms | 862 MB | | | | |
 
-**The GPU stage is 3.7x smaller** — 0.14 s to 0.04 s — which is what the fusion actually did: the
+**The GPU stage is 3.5x smaller** — 0.14 s to 0.04 s — which is what the fusion actually did: the
 gather of every column of every matched pair is gone, and so is the joined batch. Peak RSS falls by
 180 MB and host CPU by 170 ms (698 to 529 ms), because nothing is collected and nothing is summed in
 Python. (The fused GPU stage measures between 0.04 and 0.09 s across rounds; the spread is the
@@ -633,8 +634,8 @@ at `readers = 2` this cell is read-bound.** The read stage is 0.315 s of a 0.336
 stage waits 0.13 s of it for a batch the two reader threads had not finished: what is being measured
 is two threads moving 4 GB against Polars reading the same directory with every core. One
 supplementary round at `readers = 4` shows the operator with the read out of the way — **359 ms
-unfused to 264 ms fused, a 1.36x speed-up** (GPU 0.147 s to 0.043 s), which brings it within 13 % of
-DuckDB's 229 ms; the cost is peak RSS, 4.4 to 4.9 GB, because four part files are mapped at once.
+unfused to 264 ms fused, a 1.36x speed-up** (GPU 0.147 s to 0.043 s), which brings it to within 15 %
+of DuckDB's 229 ms; the cost is peak RSS, 4.4 to 4.9 GB, because four part files are mapped at once.
 
 ### The earlier 30 GB measurement
 
@@ -744,7 +745,7 @@ same queries run at 1.2 GB of RSS (and two to five times slower). The genuinely 
   GPU stage then waits 0.22 s on. Splitting the resident table into shards a batch could insert into
   from more than one stage is not implemented.
 * **A float64 sum cannot use the row-level atomic accumulate**, because Metal has no 64-bit atomic
-  (`atomic_ulong` has no compare-exchange, `fetch_add` or `fetch_max` on this hardware) and no
+  add or compare-exchange (`atomic_ulong` offers only `fetch_min`/`fetch_max`) and no
   emulation of one rounds a binary64 addition correctly. It takes the dense-id branch of §4.1
   instead, which costs a second pass over the batch's groups and two `uint` arrays the size of the
   table. Counts and integer sums skip all of that; on the same query and dataset that is 330 ms
@@ -767,7 +768,7 @@ same queries run at 1.2 GB of RSS (and two to five times slower). The genuinely 
 * **A fused aggregate takes at most seven aggregates.** Metal binds 31 buffers and the probe needs
   nine of them, three per aggregate after that.
 * **The dense-id branch costs about 270 MB at ten million groups** — two `uint` arrays the size of
-  the table — which is why `groupby_10m`'s peak RSS rises by 0.69 GB. Packing the batch stamp and the
+  the table — which is why `groupby_10m`'s peak RSS rises by 0.62 GB. Packing the batch stamp and the
   dense id into one word is possible and is not implemented.
 * **Each batch is one Metal command buffer, not several.** The fixed cost per batch is paid once per
   batch; a larger `batch_rows` amortises it, at the cost of memory per batch.

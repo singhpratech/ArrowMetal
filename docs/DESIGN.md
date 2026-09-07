@@ -110,7 +110,7 @@ of the distinct strings:
 At a thousand keys the whole table is 4096 slots — 16 KB — so every probe is a cache hit and the pass is
 memory-bound on the key bytes. At ten million the table is 32 M slots (128 MB) and the cost becomes the
 random slot access, which is why the win narrows from 10x to 2x. The 1000- and 100k-key cases are now
-**2.9x and 7.2x faster than pyarrow**, against 5.4x and 1.7x *slower* before, and they cost the CPU about
+**2.9x and 7.2x faster than pyarrow**, against 3.5x and 1.2x *slower* before, and they cost the CPU about
 4 ms against pyarrow's 700-2000.
 
 Integer, boolean, temporal and dictionary key columns still take the range path (~22 ms at 50M rows);
@@ -245,25 +245,25 @@ invisible at a thousand groups and is the whole cost at ten million.
 | list | 100,000 | 20.8 ms | 11.6 ms | 1.8x |
 | sum | any | unchanged (already the atomic path) | | |
 | count | any | unchanged | | |
-| count_distinct | any | unchanged — still two full radix sorts | | |
+| count_distinct | any | GPU hash set over `(group, value)` ([LOSSES.md](LOSSES.md)) | | |
 
-At 50M rows, against the fastest of Polars / pyarrow / pandas: min 2.5x / 3.9x / 5.5x at 1k / 100k / 10M
-groups, where it was 0.25x / 0.56x / 0.21x; variance 0.71x / 3.3x / 4.9x, where it was 0.05x at 100k;
-`first` 5.9x / 6.0x / 5.2x; `list` 10.2x / 8.1x / 5.2x. Two caveats on those ratios. At a **thousand**
-groups every grouped aggregate lands near 2.5x, `sum` and `count` included, because a fresh
-`group_by([...])` spends about 7 ms of the 10 ms rebuilding the dense key mapping — reuse the object and
-the aggregate itself is 3 ms. And **`count_distinct` is the remaining shortfall** (0.55x): it still
-dictionary-encodes the values with one radix sort and collapses the packed `(group, code)` pairs with
-another, where the CPU libraries keep a hash set per group. A segmented sort of the values inside each
-group's counting-sort run, or a per-group hash, is the fix — but the sort of the *key* column is gone
+At 50M rows, against the fastest idiom of Polars / pyarrow / pandas
+(`Benchmarks/results/full_matrix_2026-09-07-parallel.csv`): min 3.32x / 4.93x / 4.57x at 1k / 100k / 10M
+groups, where it was 0.25x / 0.56x / 0.21x; variance 0.96x / 2.52x / 4.06x, where it was 0.05x at 100k;
+`first` 7.95x / 5.81x / 5.12x; `list` 10.85x / 9.72x / 5.70x. Two caveats on those ratios. At a
+**thousand** groups every numeric grouped aggregate lands near 3.3x to 4.1x, `sum` and `count` included,
+because a fresh `group_by([...])` spends about 7 ms of the 10 ms rebuilding the dense key mapping — reuse
+the object and the aggregate itself is 3 ms. And `count_distinct` by key was the remaining shortfall and
+is now 3.4x to 7.2x the fastest CPU idiom ([LOSSES.md](LOSSES.md)) — the sort of the *key* column is gone
 from every aggregate.
 
 ## Latency (small inputs)
-Measured floor on M4 Max: an empty kernel with encode + commit + wait costs ~116 µs; ten kernels in one
-command buffer cost ~100 µs in total. So the fixed cost is the round trip, not the kernel, and the only lever
-is fewer round trips.
+Measured floor on M4 Max: an empty kernel with encode + commit + wait costs about 60-70 µs measured
+([RESIDENT.md](RESIDENT.md)), 110-230 µs as an all-in per-call floor in the matrix's latency family; ten
+kernels in one command buffer cost ~100 µs in total. So the fixed cost is the round trip, not the kernel,
+and the only lever is fewer round trips.
 
-Unbatched, every public call is one command buffer (~140-170 µs fixed). `filter` already fuses its three
+Unbatched, every public call is one command buffer. `filter` already fuses its three
 kernels into one command buffer with a GPU scan.
 
 **Batched execution** (`MetalContext.batch { }`, `am_batch_begin/end` in C, `with am.batch():` in Python):
@@ -286,7 +286,7 @@ accumulates with `d_add`; arithmetic kernels run one element per thread. `d_div`
 seeded by one hardware `float` division, with the exact 128-bit remainder `N - q·D` settling the last
 bit; `d_sqrt` extracts the root digit by digit in integers. Both are correctly rounded rather than close,
 and `DoubleMathTests` holds them to Swift's own `Double` bit for bit. `add` and `multiply` run at this
-machine's memory ceiling (≈390 GB/s at 50M rows) and `divide` within 15% of it (331 GB/s), so the
+~390 GB/s these single-pass rows reach at 50M rows and `divide` within 15% of it (331 GB/s), so the
 software arithmetic is all but invisible in a bandwidth-bound query. `cast` is the one float64 path that
 still runs on the host, and `modulo` is the one binary operator with no float64 kernel — both say so in
 [COVERAGE.md](COVERAGE.md).
@@ -306,7 +306,8 @@ Accuracy is measured, not derived. `DoubleTranscendentalTests` compares each fun
 over 10⁶ random inputs drawn across its whole domain and prints the ulp histogram; these are those
 numbers, measured 2026-09-06. The **measured** column is what the run reports; the test asserts a
 2-ulp bound on everything but `sqrt`, which it holds to bit equality, so a regression of one ulp shows
-up as a changed number here before it fails the suite.
+up as a changed number here before it fails the suite. The trigonometric family is a separate kernel and
+a separate budget: measured 2-5 ulp against a 6-ulp assertion (`TrigTests`, [COVERAGE.md](COVERAGE.md)).
 
 | function | domain sampled                                        | max ulp |
 |----------|-------------------------------------------------------|---------|

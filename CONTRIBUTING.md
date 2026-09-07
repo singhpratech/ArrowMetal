@@ -5,8 +5,9 @@ Thanks for looking. This project is small enough to hold in your head; please ke
 ## Ground rules
 - Every kernel is tested against a CPU oracle — the plain-Swift implementations in
   `Sources/ArrowMetal/CPUReference.swift`, a hand-computed vector, or a `pyarrow.compute` answer pinned
-  as a literal — across sizes 0, 1, word boundaries (31/32/33), threadgroup boundaries (255/256/257,
-  8191/8192/8193) and something large. Add both the oracle and the test when you add a kernel.
+  as a literal — across sizes 0, 1, word boundaries (31/32/33), threadgroup and simdgroup boundaries
+  (255/256/257 and 8191/8192/8193 in some suites, 1023/1024/1025 and 65535/65536/65537 in others; both
+  sets occur, and [docs/TESTING.md](docs/TESTING.md) lists the second) and something large. Add both the oracle and the test when you add a kernel.
 - Follow Arrow semantics (nulls, wrapping arithmetic, bit order). When Arrow has a documented behaviour,
   match it; when it does not, document what you chose.
 - Kernels are MSL strings in the `*Source.swift` files under `Sources/ArrowMetal/Kernels/`

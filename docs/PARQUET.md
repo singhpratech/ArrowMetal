@@ -276,7 +276,7 @@ which is the smallest query anyone actually runs.
 | none | polars | 84 | 861 | 26592 | 28 |
 | none | pandas | 317 | 1245 | 7030 | 134 |
 
-ArrowMetal is 1.3-4.2x behind Polars and pyarrow on wall time and **3-9x ahead on CPU time**: the decode is
+ArrowMetal is 1.3-4.2x behind Polars and pyarrow on wall time and **3.3-8.7x ahead on CPU time**: the decode is
 work the host never does. The `ttfc` column above re-opens the file for every query, which is the wrong
 way to hold a 2 GB file and costs ArrowMetal the most, because mapping it and handing its pages to Metal
 is a per-open cost the CPU readers do not have. Keep the handle, which is what a query engine does:
@@ -424,7 +424,7 @@ ARROWMETAL_PARQUET_BIG=1 PYTHONPATH=python python -m pytest python/tests/test_pa
   sorts and `top_k`, and the element-wise maths kernels. The decode is a GPU `take` of the values by
   the codes, so it costs one pass; `dictionary=False` at read time is still the cheaper way to run
   many operations over the same column. The one thing that does not decode for you is the fused
-  expression compiler behind `am.query` / `am.plan`, which reads flat columns only: hand it a column
+  expression compiler behind `am.query` / `am.scan(...)`, which reads flat columns only: hand it a column
   read with `dictionary=False`.
 - **`PLAIN` `BYTE_ARRAY` pages are walked by one thread each** to find the value boundaries — the format
   gives no other option — so a byte-array column with a handful of very large pages has less parallelism

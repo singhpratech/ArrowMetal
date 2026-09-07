@@ -2148,7 +2148,7 @@ SWIFT_BASELINE = [
     # (family, op, rows, metal_ms, cpu16_ms, cpu16_cpu_ms, source)
     ("sort", "argsort int64", 50_000_000, 128.52, 653.97, 5017.1, "round 7"),
     ("sort", "sort float64", 50_000_000, 138.52, 591.97, 4468.6, "round 7"),
-    ("sort", "top_k (k=100, int64)", 50_000_000, 128.67, 1.96, 25.6, "round 7"),
+    ("sort", "top_k (k=100, int64)", 50_000_000, 128.67, 1.96, 25.6, "round 7; superseded, the sort table above measures 2.67 ms"),
     ("strings", 'contains("north")', 10_000_000, 1.65, 17.77, 250.0, "round 7"),
     ("strings", 'starts_with("cust_1")', 10_000_000, 1.75, 3.10, 42.7, "round 7"),
     ("reductions", "sum(int64, 10% nulls)", 50_000_000, 1.07, 4.87, 66.6, "round 6"),
@@ -2338,7 +2338,7 @@ def build_report(csv_path, elapsed_s):
                  "parallel idiom for it (the reason is in the CSV's `note` column); `err` means the "
                  "call raised, and the message is in the CSV. Nothing is skipped silently.")
     lines.append("- Bandwidth (GB/s) is bytes touched (input + output) over wall time. Where ArrowMetal "
-                 "and the best baseline are both near the machine's ~400 GB/s unified-memory ceiling the "
+                 "and the best baseline are both near the ~400 GB/s the single-pass rows of this matrix reach the "
                  "operation is memory-bound and no ratio above ~1.5x is available to either side.")
     lines.append("")
     summary_at = len(lines)          # the verdict tally is filled in once every row is scored
@@ -2634,16 +2634,16 @@ def diagnose(key, ratio, best_lib, amr, row):
     # memory-bound tie?
     b = row.get(best_lib) if best_lib else None
     if amr and amr.get("gbs") and b and b.get("gbs"):
-        # Anything far above the machine's ~400 GB/s ceiling is not moving the data at all.
+        # Anything far above the ~400 GB/s the single-pass rows reach is not moving the data at all.
         if b["gbs"] > 800:
             return (f"The baseline is not moving the data: {best_lib} reports "
-                    f"{fmt_gbs(b['gbs'])} GB/s, far above this machine's ~400 GB/s ceiling, so it "
+                    f"{fmt_gbs(b['gbs'])} GB/s, far above the ~400 GB/s a single pass over the data reaches, so it "
                     "returns a view or a metadata change rather than a materialised column, while "
                     "ArrowMetal materialises the result.")
         if 50 < amr["gbs"] <= 800 and 50 < b["gbs"] <= 800:
             return (f"Memory-bound tie: ArrowMetal {fmt_gbs(amr['gbs'])} GB/s vs {best_lib} "
-                    f"{fmt_gbs(b['gbs'])} GB/s, both within reach of the ~400 GB/s unified-memory "
-                    "ceiling; there is no 3x available to either side on this operation.")
+                    f"{fmt_gbs(b['gbs'])} GB/s, both within reach of the ~400 GB/s the single-pass rows "
+                    "reach; there is no 3x available to either side on this operation.")
     if amr and amr["wall_ms"] < 0.5:
         return ("Under half a millisecond: the ~150 us dispatch floor is a large share of the "
                 "measurement.")

@@ -5,13 +5,13 @@ pushed. Numbers are from the last gated run of `main` (0.1.0, unreleased) on an 
 
 | Layer | Size | Oracle |
 |---|---|---|
-| Swift suites (`Tests/ArrowMetalTests`) | 764 tests in 60 files, run in release | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
-| Python suites (`python/tests`) | 2,460 collected cases over the ctypes API and the three integrations | `pyarrow.compute`, Polars, DuckDB, pandas |
+| Swift suites (`Tests/ArrowMetalTests`) | 769 tests in 61 files, run in release (all 769 executed, 7 skipped, in the last gated run) | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
+| Python suites (`python/tests`) | 2,473 collected cases over the ctypes API and the three integrations (2,452 passed and 21 skipped in the last gate, `private/keep/2026-09-07/final_gate.log`) | `pyarrow.compute`, Polars, DuckDB, pandas |
 | Rust suites (`rust/arrowmetal/tests`) | 48 tests over the safe crate, run in release, plus 4 `no_run` doc-tests (compiled, not executed) | `arrow::compute` (arrow-rs 59) on the same data; a `HashMap` fold where arrow-rs has no kernel; `include/arrowmetal.h` re-parsed for the ABI signatures ([RUST.md](RUST.md)) |
 | Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | 39,069 generated cases, 45 column types, every public operation | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
 | TypeScript suites (`node/test`) | 62 tests in 6 files over the N-API addon | Apache Arrow JS 21.2.0 and plain JS over the same rows ([TYPESCRIPT.md](TYPESCRIPT.md)) |
-| Go binding (`go/arrowmetal`) | 46 test functions, 177 cases with subtests, run twice (plain and under `GOEXPERIMENT=cgocheck2`) | `arrow-go/v18`'s own `compute` where it has the function, plain Go loops where it does not ([GO.md](GO.md)) |
-| R suites (`r/arrowmetal/tests/testthat`) | 266 tests over the 34 ABI entry points the R binding wraps | base R and the `arrow` R package's own kernels on the same data ([R.md](R.md)) |
+| Go binding (`go/arrowmetal`) | 46 test functions, 177 subtests as the runner counted them in the last gate (`private/keep/2026-09-07/final_gate.log`, `ok github.com/singhpratech/ArrowMetal/go/arrowmetal` under `GOEXPERIMENT=cgocheck2`), run twice (plain and under the cgo pointer checker) | `arrow-go/v18`'s own `compute` where it has the function, plain Go loops where it does not ([GO.md](GO.md)) |
+| R suites (`r/arrowmetal/tests/testthat`) | 64 `test_that()` blocks over the 34 ABI entry points the R binding wraps; 266 expectations passed and 0 failed in the last gate (`private/keep/2026-09-07/final_gate.log`) | base R and the `arrow` R package's own kernels on the same data ([R.md](R.md)) |
 | Adversarial review pass | four independent reviewers plus a coverage pass before release | each finding carries a regression test |
 | Benchmarks (`Benchmarks/`) | 339 operation-and-size rows over 173 operations, against four CPU libraries in two idioms each — the plain eager one and the most parallel one that library has for the same answer (`polars-lazy`, `pyarrow-threaded`); streaming and engine benches | measured, never estimated; the baseline is the fastest idiom of any library, and against it 145 rows are at or above 3x, 102 between 1x and 3x, 77 slower and 15 without a CPU equivalent ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md), [LOSSES.md](LOSSES.md)) |
 
@@ -27,19 +27,19 @@ PYTHONPATH=python python python/tests/differential_report.py   # the matrix as o
 (cd rust && cargo test --release)                       # the Rust binding, against arrow-rs's own kernels
 (cd go/arrowmetal && ARROWMETAL_LIB=$PWD/../../.build/release/libArrowMetalC.dylib go test ./...)  # the Go binding
 (cd go/arrowmetal && ARROWMETAL_LIB=$PWD/../../.build/release/libArrowMetalC.dylib GOEXPERIMENT=cgocheck2 go test -count=1 ./...)  # and with the cgo pointer checker
+ARROWMETAL_LIB=$PWD/.build/release/libArrowMetalC.dylib \
+  Rscript -e 'testthat::test_local("r/arrowmetal")'            # the R binding
 ```
 
 The Rust suite finds `libArrowMetalC.dylib` in `.build/release` on its own; from outside the
 repository, set `ARROWMETAL_LIB` to the dylib's full path.
-ARROWMETAL_LIB=$PWD/.build/release/libArrowMetalC.dylib \
-  Rscript -e 'testthat::test_local("r/arrowmetal")'            # the R binding
-```
 
 The R suite needs R with `arrow` and `testthat`; `R CMD INSTALL r/arrowmetal` first, or point
 `ARROWMETAL_LIB` at the dylib as above. A conda-built R names its own compiler in `Makeconf`, so
 activate the environment (or put its `bin` on `PATH`) before installing; setting `CC = clang` in
 `~/.R/Makevars` to use Xcode's clang works too. `R CMD check --no-manual` on the built tarball is
-the fuller gate and is clean (0 errors, 0 warnings, 0 notes).
+the fuller gate; the run recorded in `private/keep/2026-09-07/final_gate.log` is the testthat suite
+(266 passed, 0 failed), not `R CMD check`, so no `R CMD check` result is claimed here.
 
 Tests that need a real GPU skip on virtual Metal devices (`requireRealGPU()`), so a hosted CI runner
 exercises the host paths only; the numbers above are from a physical Mac.
@@ -61,7 +61,7 @@ a sliced input at offsets 1, 7, 31, 32, 33, 63 and 64 against the same rows buil
 | Strings | StringTests, StringExtraTests, StringTransformTests, TextTests, RegexPrefilterTests | lengths, predicates, MurmurHash3 vectors, LIKE with every wildcard shape, split, full-Unicode case mapping including byte-length changes, the regex pre-filter's literal claims |
 | Temporal | TemporalTests, TemporalExtraTests, OptionsTests | calendar fields, rounding with every RoundTemporalOptions flag, timezone transitions, strftime/strptime |
 | Execution model | BatchTests, AsyncTests, ResidentTests, AdversarialStringAndBatchTests | batched chains equal unbatched, a throwing body leaves no batch open, results readable after commit, four workers over two contexts; the persistent-kernel negative result |
-| Interop | CInteropTests, IPCTests, RecordBatchTests | C Data / C Device / C Stream import and export with offsets and release callbacks, IPC round trips, struct and stream import |
+| Interop | ArrowMetalTests, KernelTestsV2, SliceOffsetTests, NestedTests, IPCTests | C Data / C Device / C Stream import and export with offsets and release callbacks, IPC round trips, struct and stream import |
 | Expression compiler and engine | ExprTests, ExprLiteralTypeTests, EngineTests, JoinTests | fused expressions against the unfused kernels, literal promotion, every optimizer rule against the unoptimized plan, six join kinds and as-of against a dictionary oracle |
 | Parquet | ParquetTests, ParquetWriterTests | pyarrow-written fixtures across encodings and compressions, damaged files that must error rather than trap |
 | Streaming | StreamTests | every streaming operator against the in-memory answer at 1–120 batches with ragged and empty batches, HyperLogLog within 3σ, external sort over 120 runs, grace join against the in-memory join |
@@ -69,13 +69,13 @@ a sliced input at offsets 1, 7, 31, 32, 33, 63 and 64 against the same rows buil
 
 ## 2. Python suites
 
-The column below counts `def test_*` functions. The 2,460 in the table at the top of this page is what
+The column below counts `def test_*` functions. The 2,473 in the table at the top of this page is what
 pytest *collects*, which is larger because a parametrised function collects once per parameter set.
 
 | File | Test functions | Compares against |
 |---|---|---|
-| `test_arrowmetal.py` | 114 | `pyarrow.compute` and plain Python over the ctypes API, zero-copy import/export, the wheel loader |
-| `test_options.py`, `test_checked.py`, `test_strings_extra.py`, `test_float64_math.py` | 113 | option surfaces (null placement, tiebreakers, cast safety, rounding), checked arithmetic, string kernels, binary64 math |
+| `test_arrowmetal.py` | 115 | `pyarrow.compute` and plain Python over the ctypes API, zero-copy import/export, the wheel loader |
+| `test_options.py`, `test_checked.py`, `test_strings_extra.py`, `test_float64_math.py` | 114 | option surfaces (null placement, tiebreakers, cast safety, rounding), checked arithmetic, string kernels, binary64 math |
 | `test_functions.py` | 8 | executes every runnable row of the Arrow-name registry through `call_function` against `pyarrow.compute`, with a second input in another type family where the claim spans several |
 | `test_expr.py`, `test_lazy.py`, `test_lazy_optimizer.py`, `test_lazy_memory.py` | 84 | fused expressions and lazy plans against Polars and pyarrow; the optimizer against the unoptimized plan; RSS over 30,000 queries |
 | `test_parquet.py`, `test_parquet_robustness.py` | 31 | `pyarrow.parquet.read_table` on generated files; fuzzed and damaged files |
@@ -83,7 +83,8 @@ pytest *collects*, which is larger because a parametrised function collects once
 | `test_polars.py` | 53 | the bridge and namespaces against native Polars; the 8 Rust-plugin tests run when `polars-plugin/` is built |
 | `test_duckdb.py` | 38 | the bridge against DuckDB SQL; the 11 extension tests run when `duckdb-extension/build.sh` has produced the extension, and one test compiles the public C header as C |
 | `test_pandas.py` | 72 | the accessor and accel mode against plain pandas across five null-carrying dtype flavours; `install()`/`uninstall()` restore every patched slot |
-| `test_differential.py` (standalone part) | 100 plus 17 documented xfails | one test per finding and per fixed finding, plus the guards that every public operation and every module-level function has a matrix case |
+| `test_numpy.py` | 6 | the numpy bridge: which dtypes cross without a copy, NaN as a value, and float64 arithmetic against numpy bit for bit ([NUMPY.md](NUMPY.md)) |
+| `test_differential.py` (standalone part) | 96 plus 17 documented xfails | one test per finding and per fixed finding, plus the guards that every public operation and every module-level function has a matrix case |
 
 ## 3. The differential matrix
 

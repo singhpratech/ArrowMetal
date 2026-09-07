@@ -20,8 +20,9 @@ Things learned the hard way. Add to this whenever something surprises you.
 - `posix_memalign` memory is not zero for small blocks (recycled heap); only fresh mmap pages are zero.
 
 ## Metal
-- Apple M4 Max: 32 KB threadgroup memory, SIMD width 32, unified memory, no 64-bit atomics from MSL
-  (`atomic_ulong` fetch_add/max fail to compile). 64-bit sums use split 32-bit atomics with carry.
+- Apple M4 Max: 32 KB threadgroup memory, SIMD width 32, unified memory, no 64-bit atomic add from MSL
+  (`atomic_ulong` fetch_add fails to compile; min and max do). 64-bit sums use split 32-bit atomics
+  with carry.
 - Runtime `makeLibrary(source:)` works without the `metal` toolchain. Errors carry line numbers of the
   generated source.
 - `makeBuffer(length:)` buffers are heap sub-allocated and not page aligned; `bytesNoCopy` requires page
@@ -73,22 +74,20 @@ Things learned the hard way. Add to this whenever something surprises you.
 - Float64 sum on the GPU accumulates with `d_add` in tree order; per-threadgroup partials are combined on
   the CPU in `Double`. Results differ from a sequential CPU sum only by normal floating-point reordering.
 
-## Round 8 (2026-09-06): the differential matrix over the whole type surface
+## Round 8b (2026-09-06): the differential matrix over the whole type surface
 
 Extending `python/tests/test_differential.py` to every type ArrowMetal imports (45 columns, 181
-operations, 33,156 cases at the time; 212 operations and 39,069 cases today) turned up three bugs and one
-crash **in pyarrow 25.0.1**, not in ArrowMetal.
+operations, 33,156 cases at the time; 212 operations and 39,069 cases today) turned up three bugs and
+one unreproduced crash **in pyarrow 25.0.1**, not in ArrowMetal.
 They are recorded here because the harness has to work around them, and each has a test that fails if a
 later pyarrow fixes it.
 
-- `pc.year_month_day` and `pc.iso_calendar` **corrupt the heap**. The process segfaults a couple of
-  allocations later, in whatever unrelated call happens next — the faulting frame was `Array.nbytes`
-  inside the harness's own array cache, which cost an hour to trace back. Reproducible with pyarrow
-  and numpy alone, no ArrowMetal in the process: build a `timestamp[s]` array with nulls, call
-  `pc.year_month_day`, then a `timestamp[ms]` one, then a `timestamp[us]` one, allocating a small
-  array between each. Mitigation: never call the two struct-valued temporal kernels. The matrix
-  compares `iso_calendar` and `year_month_day` field by field against `pc.iso_year`/`pc.iso_week`/
-  `pc.day_of_week` and `pc.year`/`pc.month`/`pc.day`, which is a stronger check anyway.
+- A **single unreproduced segfault** was observed a few allocations after `pc.year_month_day` on a
+  `timestamp[s]` array with nulls; it has not recurred. It landed in whatever unrelated call happened
+  next — the faulting frame was `Array.nbytes` inside the harness's own array cache, which cost an
+  hour to trace back. Out of caution the matrix does not use the two struct-valued temporal kernels as
+  oracles: it compares `iso_calendar` and `year_month_day` field by field against `pc.iso_year`/
+  `pc.iso_week`/`pc.day_of_week` and `pc.year`/`pc.month`/`pc.day`, which is a stronger check anyway.
 - `pc.utf8_normalize` **ignores its `form` option**: NFC and NFKC come back decomposed, so its NFC is
   NFD. Python's `unicodedata` and ArrowMetal agree with each other and with the Unicode annex; the
   matrix uses `unicodedata` as the oracle. Pinned by
@@ -96,7 +95,8 @@ later pyarrow fixes it.
 - `pc.pairwise_diff` **ignores `ArrowArray.offset`**: on a sliced column it reads the values buffer
   from the start and answers with the wrong rows. Only visible when the values are not an arithmetic
   progression, which is why it hid for a while. The matrix hands that oracle a materialised copy while
-  ArrowMetal still gets the slice, so the case remains a test of the offset handling.
+  ArrowMetal still gets the slice, so the case remains a test of the offset handling. Fixed upstream in
+  pyarrow 26.0.0; the workaround stays only while 25.0.1 is the pinned version.
 - `pc.fill_null_forward`, `pc.fill_null_backward` and `pc.replace_with_mask` have the same offset bug
   on a **boolean** column (the values bitmap, not the validity one). Same mitigation.
 

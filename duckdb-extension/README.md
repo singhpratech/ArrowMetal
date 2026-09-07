@@ -47,7 +47,7 @@ SELECT * FROM arrowmetal_query('t', '(query (aggregate (sum "total" (col "v"))))
 plan that would produce columns is refused, with a message pointing at `arrowmetal_group_by` or the
 Python bridge.
 
-## Two things to know before you use it
+## Three things to know before you use it
 
 - **It is correct and it is slower than the plain SQL.** The 11 `@extension` tests in
   `python/tests/test_duckdb.py` compare its answers with DuckDB's, nulls included, and they match; but

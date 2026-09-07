@@ -8,7 +8,7 @@ single unreleased 0.1.0 heading and in docs/BENCHMARKS.md as numbered rounds.
 
 ## 2026-09-06: Batched execution with lazy materialisation instead of futures
 A per-thread open command buffer with sync-on-read keeps the synchronous API (every method still returns a
-real array) while removing the round trip between chained kernels — measured at ~116 µs for an empty
+real array) while removing the round trip between chained kernels — measured at 60–70 µs for an empty round trip today ([RESIDENT.md](RESIDENT.md); ~116 µs in round 4) and 110–230 µs per call in the matrix's latency family, for an empty
 kernel on an M4 Max, round 4 in docs/BENCHMARKS.md. Futures would have changed every
 signature. Cost: a reduction inside a batch still syncs; filter results carry a worst-case buffer until read.
 

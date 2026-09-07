@@ -15,8 +15,8 @@ Core
   to int64 first, and its three dispatches share one command buffer; `hash_mean` reuses the counts the
   accumulation already produced and divides on the GPU, and `hash_sum` returns the accumulator's own
   buffer with a GPU-built validity bitmap instead of a host loop. Same ids, same answers to the bit;
-  `sum` by int32 key at 50M rows and a thousand groups went 8.75 -> 4.81 ms and `mean` 9.78 -> 4.80
-  (docs/LOSSES.md).
+  `sum` by int32 key at 50M rows and a thousand groups went 8.75 -> 4.81 ms and `mean` 9.78 -> 4.80 in
+  the A/B run recorded in docs/LOSSES.md; the published matrix reads 4.89 and 4.91 ms for those cells.
 - MetalRecordBatch with filter/take/slice/selecting; struct (+s) C Data import/export; ArrowArrayStream import.
 - Batched execution (`MetalContext.batch { }`) and its non-blocking form: `batchAsync` (Swift `async`
   and completion-handler), with `MetalArray.sumAsync`/`meanAsync` for scalars, so the calling thread is
@@ -81,7 +81,7 @@ Numerics
 - Software binary64 arithmetic made faster without losing a bit: `clz` normalisation instead of shift
   loops, four 32x32 partial products instead of an emulated 64x64, and a Newton reciprocal with an exact
   128-bit remainder correction instead of a 57-step restoring division. Float64 `add` and `multiply`
-  now run at this machine's memory ceiling (about 390 GB/s at 50M rows) and `divide` within 15% of it
+  now run at about 390 GB/s at 50M rows, the fastest these single-pass float64 rows reach, and `divide` within 15% of it
   (331 GB/s) — docs/DESIGN.md.
 - Float classification (`is_nan`, `is_finite`, `is_inf`) as raw bit-pattern tests, and the boolean
   operators the bitmap family lacked: `xor`, `and_not`, `and_not_kleene`.
@@ -99,8 +99,8 @@ Grouped aggregation and windows
   `hash_variance`/`hash_stddev`, `hash_skew`/`hash_kurtosis`, `hash_tdigest` and `hash_pivot_wider`.
 - `hash_count_distinct` is a GPU hash **set** over the (key, value) pair — one insert pass over the rows,
   then a histogram over the group ids of the occupied slots — instead of a dictionary encoding, a packed
-  int64 column and a `unique()` over it. 8.6 ms at 10M rows and 45.3 ms at 50M for a thousand groups,
-  and 8.6 ms at 10M for a hundred thousand — 60.5 ms at 50M rows and ten million groups is the worst
+  int64 column and a `unique()` over it. 7.1 ms at 10M rows and 41.8 ms at 50M for a thousand groups,
+  and 7.3 ms at 10M for a hundred thousand — 60.7 ms at 50M rows and ten million groups is the worst
   case (docs/LOSSES.md).
 - Several integer key columns whose ranges multiply out to at most 2^24 (and at most the row count) are
   packed into one key in a single pass instead of folded pairwise through a range encoding each. The
@@ -194,6 +194,10 @@ Integrations
 
 Bindings
 - libArrowMetalC C ABI (include/arrowmetal.h) and python/arrowmetal ctypes package (Arrow PyCapsule protocol).
+- Four language bindings over that ABI, each with its own suite: `rust/` (`arrowmetal` + `arrowmetal-sys`,
+  48 tests and 4 `no_run` doc-tests, docs/RUST.md), `go/arrowmetal` (46 test functions, docs/GO.md),
+  `node/` (N-API addon, 62 tests, docs/TYPESCRIPT.md) and `r/arrowmetal` (266 testthat expectations over
+  the 34 header entry points it wraps, docs/R.md).
 - `python/build_wheel.sh` packages that ctypes package as a macOS arm64 wheel with the dylib bundled in
   `arrowmetal/_lib/`, so an install needs no Swift toolchain; extras `polars`, `duckdb`, `pandas`, `test`.
   The publication steps are in docs/RELEASE.md; the wheel is not on PyPI yet.
@@ -272,14 +276,16 @@ Fixed
 
 Quality
 - A CPU oracle behind every kernel test — `Sources/ArrowMetal/CPUReference.swift`, a hand-computed
-  vector, or a pyarrow 25.0.1 answer pinned as a literal; 756 XCTest cases in 60 files, run in release, including a scenario
+  vector, or a pyarrow 25.0.1 answer pinned as a literal; 769 XCTest cases in 61 files, run in release
+  (all 769 executed, 7 skipped, in the last gated run), including a scenario
   matrix over every type, null density, size and sliced input; concurrency and pool tests (docs/TESTING.md).
   CI on GitHub's hosted Apple silicon runs the suite in debug and release, but its GPU is virtual, so the
   GPU tests skip there and only the build, interop and CPU paths are proved (CONTRIBUTING.md).
 - `python/tests/test_functions.py` executes the Arrow-name registry: every runnable row is called through
   `call_function` and compared to `pyarrow.compute`, with a second input in a different Arrow type family
   for the rows whose claim spans several, and float tolerances recorded per row in `functions.TOLERANCE`.
-  It found that `binary_length`, `binary_repeat` and `binary_reverse` refuse a `binary` column.
+  It found that `binary_length`, `binary_repeat` and `binary_reverse` refuse a `binary` column — all
+  three now accept `binary` and `large_binary`.
 - Differential matrix against `pyarrow.compute` (docs/EVALUATION.md): 39,069 cases per run over 45 column types, 0 unclassified
   divergences. Fixed from its findings: stable null order in argsort and top_k, the -0.0 tie in the sort
   keys (top_k included, which had its own key mapping), NaN kept at the end of a descending sort, float32

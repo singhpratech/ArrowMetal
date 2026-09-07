@@ -578,7 +578,7 @@ _ROWS = [
      "As `add_checked`.", _b("subtract_checked"), ((_INT, _INT2), {})),
     ("expm1", "Arithmetic", GPU, "Kernels/MathExtra.swift", "expm1()",
      "exp(x) - 1, accurate for small x, through the software binary64 routine on a float64 column "
-     "(within about 5 ulp of the host libm). Float columns only, as in Arrow.",
+     "(measured <= 2 ulp against the host libm over 10^6 inputs). Float columns only, as in Arrow.",
      _u("expm1"), ((_FLT2,), {})),
     ("hypot", "Arithmetic", GPU, "Kernels/MathExtra.swift", "hypot(other)",
      "sqrt(x^2 + y^2), scaled so a large or tiny pair neither overflows nor underflows on the way. An "
@@ -636,7 +636,7 @@ _ROWS = [
     ("ln", "Logarithmic", GPU, "Kernels/Rounding.swift", "ln()",
      "Metal's `log` on float32; on float64 the software binary64 of `Kernels/DoublePower.swift`, which "
      "carries log2(x) as an unevaluated hi/lo pair and scales it by a split ln 2 so the leading product "
-     "is exact. Measured **1 ulp** against Foundation over 10^6 inputs from 5e-324 to 1e308, plus "
+     "is exact. Measured **1 ulp** against Foundation over 10^6 inputs from 5e-324 to 1.8e308, plus "
      "passes concentrated near 1 and over the subnormals.", _u("ln"), ((_FLT_POS,), {})),
     ("log10", "Logarithmic", GPU, "Kernels/Rounding.swift", "log10()",
      "Metal's `log10` on float32; on float64 the same software binary64 reduction as `ln`, scaled by a "
@@ -1135,8 +1135,8 @@ _ROWS = [
      "the GPU string hash table for utf8 and binary ones. All four of Arrow's "
      "`null_matching_behavior` values are implemented — `match`, `skip`, `emit_null` and "
      "`inconclusive` — as a rewrite of the validity bitmap over the kernel's own `skip` answer, since "
-     "the four differ only in what a null row reports. ArrowMetal defaults to `skip`; pyarrow "
-     "defaults to `match`, so the check below passes it.",
+     "the four differ only in what a null row reports. ArrowMetal defaults to `skip`; pyarrow 25 "
+     "exposes only `skip_nulls` (default `False`, i.e. `match`), so the check below passes `match`.",
      lambda args, options: _out(_a(args[0]).is_in(options["value_set"], "match")),
      ((_STR,), {"value_set": pa.array(["Hello", "Zz"])})),
     ("index_in", "Containment", GPU, "Kernels/SetLookup.swift", "index_in(value_set, null_matching_behavior)",
@@ -1190,7 +1190,7 @@ _ROWS = [
 
     # ---- Conversions -------------------------------------------------------
     ("cast", "Conversions", GPU, "Sources/ArrowMetal/CastDispatch.swift", "cast(target, safe=..., allow_*=...)",
-     "One entry point for every target, taking Arrow's whole `CastOptions`. Numeric to numeric, "
+     "One entry point for every supported target, taking Arrow's whole `CastOptions`. Numeric to numeric, "
      "bool to and from numeric, numeric and temporal to utf8 and utf8 back to numeric, temporal "
      "resolution changes and the date/timestamp conversions, integer to and from decimal128 and a "
      "decimal rescale, and `list<T>` -> `list<U>` and struct casts that cast the children and share "

@@ -7,18 +7,19 @@ This is the only roadmap: the older `../ROADMAP.md` now points here.
 
 ## Kernels
 
-- **Grouped moments at a few groups.** Variance and stddev at a thousand groups are 0.64x of pyarrow at
-  50M rows because Metal has no 64-bit atomics and the software-binary64 accumulators cannot be
-  privatised per threadgroup. A simdgroup-per-group accumulator is costed at about 6 ms of the 15.
+- **Grouped moments at a few groups.** Variance at a thousand groups is 0.96x of pyarrow at 50M rows
+  (0.78x of it in the eager baseline), and stddev 1.24x of the fastest parallel idiom, because Metal
+  has no 64-bit atomics and the software-binary64 accumulators cannot be privatised per threadgroup.
+  A simdgroup-per-group accumulator is costed at about 6 ms of the 30.
 - **The float64 sort's last gather.** Sorting values by inverting the sort key instead of gathering
   through the permutation; in progress.
 - **A chunked `MetalArray`.** `shift(view=True)` already returns a two-chunk view; making chunked arrays
   a first-class input to every kernel turns slices, concatenations and shifts into pointers.
 - **A GPU regular-expression engine.** A compiled automaton kernel behind the existing pre-filter, so a
   real regex stops being the one string operation that runs on the host.
-- **Faster correct doubles.** `ln` is measured at 1 ulp and `sin` at 2, and they run 1.04x to 1.99x
-  over the CPU (`days_between` 1.04-1.47x); a better range reduction or polynomial is a direct path
-  to 3x.
+- **Faster correct doubles.** `ln` is measured at 1 ulp and `sin` at 2, and they run 0.10x to 0.17x of
+  the fastest parallel CPU idiom (1.04x-1.99x of the eager one), `days_between` included; a better
+  range reduction or polynomial is a direct path to 3x.
 - **Float64 sum and mean with very few groups** take the one-threadgroup-per-group segmented path
   (35 ms for 10M rows in one group against 4.6 ms at a thousand); a work-stealing split is the fix.
 
@@ -78,15 +79,15 @@ to yet; the by-family status of every one of them is in [COVERAGE.md](COVERAGE.m
 
 In the order they matter for analytics and ML work on a Mac:
 
-- **Python** ships. **Swift** ships.
-- **Rust:** a crate over `include/arrowmetal.h`; the Polars plugin already uses the ABI from Rust.
-- **R:** a package over the same header, exchanging columns with the `arrow` R package through the
-  C Data Interface, so nothing is copied on the way in.
-- **TypeScript / JavaScript:** a Node binding with N-API, exchanging columns with Apache Arrow JS through
-  the C Data Interface, for the tooling around analytics and ML that is written in TypeScript. The
-  browser is out of scope: Metal is not there.
-- **Go, Java, C#, Julia** through each language's FFI: the header needs nothing language-specific.
-- Per-language timings of one operation from each binding, measured, on the site.
+- **Python** ships. **Swift** ships. **Rust** (`rust/arrowmetal` over `include/arrowmetal.h`, which the
+  Polars plugin already uses), **R** (`r/arrowmetal`, exchanging columns with the `arrow` R package
+  through the C Data Interface), **TypeScript / JavaScript** (`node/`, an N-API addon over Apache
+  Arrow JS) and **Go** (`go/arrowmetal`, cgo over the same header) ship too, each with its own test
+  suite ([RUST.md](RUST.md), [R.md](R.md), [TYPESCRIPT.md](TYPESCRIPT.md), [GO.md](GO.md)). The browser
+  is out of scope: Metal is not there.
+- **Java, C#, Julia** through each language's FFI: the header needs nothing language-specific.
+- Per-language timings of one operation from each binding, measured, on the site (the per-binding
+  tables already exist in `docs/`).
 
 ## Release mechanics
 

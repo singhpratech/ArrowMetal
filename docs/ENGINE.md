@@ -176,7 +176,9 @@ compiler already defines what it can do:
 ## Execution
 
 The whole tree runs inside one `MetalContext.batch { }`, so every kernel goes into one command buffer
-and the ~150 µs round trip is paid once for the query rather than once per operator. Where an
+and the round trip — about 60-70 µs measured ([RESIDENT.md](RESIDENT.md)), 110-230 µs as an all-in
+per-call floor in the matrix's latency family — is paid once for the query rather than once per
+operator. Where an
 operator's *length* is decided by the GPU — a filter — the result is a pending array whose length lives
 in a device buffer and the next kernel binds that buffer instead of a CPU-known count
 (`docs/DESIGN.md`, "Lengths flow on the GPU"), so a filter feeding a projection feeding another filter
@@ -404,10 +406,10 @@ for these shapes is between 1M and 5M rows.
   is an error naming the column and its Arrow format.
 - **`min` and `max` in a whole-table aggregate come back at the input's width** but through a 64-bit
   scalar, so a `uint64` maximum above `Int64.max` is not representable.
-- **Group-by aggregate types.** The one-kernel group-by path is bounded by the 32-bit atomics MSL
-  offers (`sum`/`mean` over any integer or `float32`, `min`/`max` over a 32-bit-or-narrower integer or
-  `float32`). Anything else — a `float64` sum, a 64-bit `min` — silently takes `GroupBy`'s own
-  per-aggregate kernels instead, which `explain()` says.
+- **Group-by aggregate types.** The one-kernel group-by path is limited to the aggregates 32-bit
+  atomics support (MSL has no 64-bit atomic add): `sum`/`mean` over any integer or `float32`,
+  `min`/`max` over a 32-bit-or-narrower integer or `float32`. Anything else — a `float64` sum, a
+  64-bit `min` — silently takes `GroupBy`'s own per-aggregate kernels instead, which `explain()` says.
 - **Group order is not Polars'.** `GroupByKeys` emits groups ascending by key for numeric, boolean,
   temporal and decimal keys and in first-seen order for `utf8`; pyarrow and Polars use first-seen for
   everything. Sort both sides before comparing.

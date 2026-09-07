@@ -144,6 +144,9 @@ Read it honestly:
   Arrow JS user writes, not a fair kernel.
 * The 0.27–0.36 ms resident `sum` is 80 MB in about 0.3 ms, roughly 265 GB/s, in range for an
   M4 Max. Not a cached answer: a test mutates the wrapped buffer and the sum changes.
+* **No row here is a loss.** On these two operations at this size ArrowMetal wins every comparison;
+  a small array will lose to the plain loop, because the per-call overhead is fixed and there is
+  nothing for the GPU to amortise it over. That crossover is not measured here.
 * An earlier single-process run put `filter` end to end at 8.62 ms against 9.77 ms and called it a
   1.13x win. That was inside the noise; the claim is withdrawn and this table replaces it.
 

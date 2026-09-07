@@ -2122,10 +2122,11 @@ def _parse_numbers(src, shape):
 # (assume_timezone / local_timestamp) are the ones that consult the tz database, and they get the
 # timezone columns.
 #
-# `pc.year_month_day` and `pc.iso_calendar` are deliberately *not* used as oracles: in pyarrow 25.0.1
-# they corrupt the heap and crash the process a couple of calls later (see docs/FINDINGS.md). The two
-# struct-valued kernels are compared field by field against the scalar extractors instead, which is a
-# stronger check anyway -- it says the struct agrees with `pc.year`, not merely with another struct.
+# `pc.year_month_day` and `pc.iso_calendar` are deliberately *not* used as oracles: a single
+# unreproduced segfault was observed a few allocations after `pc.year_month_day` under pyarrow 25.0.1
+# and has not recurred (see docs/FINDINGS.md), so out of caution the two struct-valued kernels are
+# compared field by field against the scalar extractors instead, which is a stronger check anyway --
+# it says the struct agrees with `pc.year`, not merely with another struct.
 
 #: The calendar extractors, on every column that carries a date.
 _CALENDAR_FIELDS = [("year", pc.year), ("month", pc.month), ("day", pc.day),
@@ -2238,7 +2239,7 @@ def _temporal_week_options(src, shape):
 
 @op("temporal_struct", DATE_LIKE,
     note="iso_calendar and year_month_day compared field by field against the scalar extractors "
-         "(pc.iso_calendar / pc.year_month_day crash pyarrow 25.0.1)")
+         "(one unreproduced segfault after pc.year_month_day on pyarrow 25.0.1)")
 def _temporal_struct(src, shape):
     x = am.array(src)
     iso, ymd = x.iso_calendar(), x.year_month_day()

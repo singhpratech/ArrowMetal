@@ -42,7 +42,7 @@ df.am.query(am.filter(am.col("price") > 100).sum(am.col("size")))   # one fused 
 
 | Method | Notes |
 |---|---|
-| `sum` `min` `max` `mean` `product` `median` `any` `all` | `sum` of an empty or all-null column is `0`, as in pandas |
+| `sum` `min` `max` `mean` `product` `median` `any` `all` | `sum` of an empty or all-null column is `0`, as in pandas — each bridge follows its own host library, so the Polars bridge answers `None` there ([POLARS.md](POLARS.md)) |
 | `std(ddof=1)` `var(ddof=1)` `count()` `nunique(dropna=True)` | |
 | `value_counts(sort, ascending, dropna)` | counts descending, ties in first-seen order — pandas' own order |
 | `sort_values(ascending)` | stable, nulls last; the index is taken along |
@@ -105,8 +105,10 @@ program failure. The one exception is repeated `install()`/`uninstall()` cycling
 ### Why some operations are intercepted but not routed
 
 Handing a pandas column to Metal is zero-copy — the GPU reads the very bytes pandas holds, and
-`am.zero_copy_report` proves it by address — but it is not *free*: the pages have to be mapped into
-the device's address space once. On an M4 Max, for a 50M-row (400 MB) `int64[pyarrow]` column:
+`am.zero_copy_report` proves it by address — when the buffer is page aligned, which it is for every
+allocation at these sizes; a small unaligned buffer costs one copy. But it is not *free*: the pages
+have to be mapped into the device's address space once. On an M4 Max, for a 50M-row (400 MB)
+`int64[pyarrow]` column:
 
 | Step | Time |
 |---|---|
@@ -201,6 +203,9 @@ handed over.
 {'zero_copy': True, 'reason': 'Arrow-backed pandas column, buffers shared',
  'dtype': 'int64[pyarrow]', 'arrow_type': 'int64'}
 ```
+
+The "none" rows are copy-free when the buffer is page aligned, which it is for every allocation at these
+sizes; a small unaligned buffer costs one copy.
 
 | pandas column | Copy? | Why |
 |---|---|---|

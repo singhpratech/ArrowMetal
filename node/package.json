@@ -4,6 +4,11 @@
   "description": "Apache Arrow compute on Apple silicon GPUs, from Node.js",
   "license": "Apache-2.0",
   "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/singhpratech/ArrowMetal.git",
+    "directory": "node"
+  },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "engines": {

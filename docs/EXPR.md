@@ -88,7 +88,7 @@ intermediate. The predicate is compiled into the counting pass, so no boolean ar
 
 Group-by privatises a table of `keyCount × aggregates` slots in threadgroup memory while that fits in
 2048 slots (24 KB of the 32 KB budget); above that it uses device-wide atomics, as `Kernels/GroupBy.swift`
-does. Sums are 64-bit through a lo/hi carry pair, because MSL has no 64-bit atomics.
+does. Sums are 64-bit through a lo/hi carry pair, because MSL has no 64-bit atomic add.
 
 ## The grammar
 
@@ -214,9 +214,11 @@ At **100 000 rows** the fixed cost dominates and the GPU is the wrong tool:
 | | ArrowMetal op-by-op (batched) | 0.62 |
 | | polars lazy | 0.12 |
 
-Reading the small-input row: the command-buffer round trip is ~0.15 ms and it is paid once per query
-however many operators the expression has — that is what fusion buys at the low end. What it cannot
-buy back is the round trip itself, nor the cost of allocating and first-touching a fresh output buffer
+Reading the small-input row: the command-buffer round trip is about 60-70 µs measured
+([RESIDENT.md](RESIDENT.md)), 110-230 µs as an all-in per-call floor in the matrix's latency family,
+and it is paid once per query however many operators the expression has — that is what fusion buys at
+the low end. What it cannot buy back is the round trip itself, nor the cost of allocating and
+first-touching a fresh output buffer
 (the reason the float64 *project* costs more than the *aggregate*, which only writes threadgroup
 partials). Crossover against Polars for these shapes is around 1M rows.
 
@@ -236,7 +238,8 @@ to 70×.
   the column and its Arrow format. Extension columns are read through their storage.
 - **Group-by needs a dense integer key** in `[0, keyCount)`, exactly like `GroupBy`. Hash the keys with
   `GroupByKeys` first if they are not dense.
-- **Group-by aggregate types** are limited by the 32-bit atomics MSL offers: `sum`/`mean` accept any
+- **Group-by aggregate types** are limited to the aggregates 32-bit atomics support (MSL has no
+  64-bit atomic add): `sum`/`mean` accept any
   integer or `float32` (not `float64` — cast first); `min`/`max` accept a 32-bit or narrower integer or
   `float32`. Both errors name the aggregate and say what to cast.
 - **`is_in` takes a small literal set** and expands to a chain of comparisons; it is not a hash lookup,

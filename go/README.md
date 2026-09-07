@@ -28,8 +28,9 @@ out, err := kept.Export()               // back to arrow-go, no copy
 ```
 
 The binding `dlopen`s `libArrowMetalC.dylib`: `$ARROWMETAL_LIB` (the full path to the file) first,
-then `.build/release/` at up to three levels above the working directory and above the binary. When
-it finds nothing the error names the variable, every path it tried, and the `swift build` line.
+then `.build/release/` at up to three levels above the working directory and above the binary, and,
+last, bare `libArrowMetalC.dylib` for dyld to resolve. When it finds nothing the error names the
+variable, every path it tried, and the `swift build` line.
 
 ## Test
 
@@ -52,9 +53,9 @@ catches — see [docs/GO.md](../docs/GO.md#go-pointers-cgo-and-why-pinning-is-no
 
 ## Timing
 
-10M Int64 rows (76 MB), no nulls, M4 Max, one process, wall clock, **best of 5 timed runs after one
-untimed warm-up**. ArrowMetal 0.1.0, Go 1.27.1, arrow-go v18.7.0. Reproduce with
-`go run ./cmd/amtiming`. The filter predicate is `x > 0`, keeping 50.0% of the rows.
+10M Int64 rows (76 MB, i.e. MiB — 80 MB decimal), no nulls, M4 Max, one process, wall clock,
+**best of 5 timed runs after one untimed warm-up**. ArrowMetal 0.1.0, Go 1.27.1, arrow-go v18.7.0.
+Reproduce with `go run ./cmd/amtiming`. The filter predicate is `x > 0`, keeping 50.0% of the rows.
 
 | Op | Method | Best of 5 |
 |---|---|---:|

@@ -78,7 +78,7 @@ If you move the dylib after building, set `DYLD_LIBRARY_PATH` or rebuild.
 
 ## Example
 
-This is [`rust/arrowmetal/examples/quickstart.rs`](../rust/arrowmetal/examples/quickstart.rs) verbatim,
+This is the body of [`rust/arrowmetal/examples/quickstart.rs`](../rust/arrowmetal/examples/quickstart.rs),
 so it is compiled by every `cargo build --examples`. Run it with
 `cargo run --release --example quickstart`; it prints `2 groups: [0, 1] -> [10, 27]` and
 `sum of everything: Some(Int64(42))`.
@@ -126,7 +126,7 @@ memory; it hands their pointers straight to the C Data Interface with a release 
 arrow-rs reads the GPU's memory in place. Measured over inputs that all carry nulls, so both buffers
 are exercised: the exported **values and validity** pointers were page aligned in every case
 (`tests/copy_rule.rs::arrowmetal_exported_buffers_are_page_aligned`), and the export call itself took
-0.001 ms for a 10M-row column.
+0.001 ms (median) for a 10M-row column.
 
 In ([`Array::from_arrow`]) is copy-free only when the buffer pointer is aligned to a **16 KiB page**,
 because that is what `MTLDevice.makeBuffer(bytesNoCopy:)` requires; otherwise that buffer is copied
@@ -234,10 +234,11 @@ let gpu = arrowmetal::Array::from_arrow(decoded.as_ref())?;   // now type-checks
 
 This is a limitation of the C ABI, not of the Arrow type — the kernels handle dictionaries correctly,
 and Swift and Python callers use them. It is an ABI defect on ArrowMetal's side: `am_format` reports
-the C Data Interface's top-level format, which for a dictionary is its index type. The fix is a new
-entry point, `am_compute_format`, which reports the type the kernels compute on; it lands with its own
-gate, and the next crate change accepts dictionaries through it. Until then, refusing the type is what
-keeps the sentence above true for everything this crate accepts.
+the C Data Interface's top-level format, which for a dictionary is its index type. The entry point
+that reports the type the kernels compute on exists (`am_compute_format`,
+[`include/arrowmetal.h:32`](../include/arrowmetal.h)); this crate does not use it yet, so it still
+refuses dictionaries. Until it does, refusing the type is what keeps the sentence above true for
+everything this crate accepts.
 `tests/compute.rs::dictionary_arrays_are_refused_at_import` pins the rejection and the decode path.
 
 ### One divergence from arrow-rs, found and pinned
@@ -273,7 +274,7 @@ every other reduction test relies on.
 
 ## What is not wrapped
 
-`include/arrowmetal.h` has 220 entry points. `arrowmetal-sys` declares 35 of them — every one called
+`include/arrowmetal.h` has 222 entry points. `arrowmetal-sys` declares 35 of them — every one called
 by the safe crate, none declared and unused — and the safe crate covers the list above. Everything
 below is reachable from Swift, Python and the C ABI, and **not** from this crate. There is no
 technical obstacle to any of it; it is unwrapped because it is untested here, and an untested wrapper
@@ -291,7 +292,7 @@ is not a shipped one.
 | Boolean and Kleene logic | `am_bool_and`, `am_bool_or`, `am_bool_not`, `am_and_kleene`, `am_or_kleene` |
 | Structural and conditional | `am_is_null`, `am_is_valid`, `am_fill_null`, `am_fill_null_direction`, `am_drop_null`, `am_if_else`, `am_coalesce`, `am_case_when`, `am_choose`, `am_replace_with_mask`, `am_indices_nonzero`, `am_true_unless_null` |
 | Set lookup and hashing | `am_is_in`, `am_index_in`, `am_is_in_ex`, `am_index_in_ex`, `am_hash64`, `am_fixed_binary_hash64`, `am_fixed_binary_compare` |
-| Sorting and selection beyond `sort`/`argsort` | `am_top_k`, `am_lexsort`, `am_lexsort_ex`, `am_argsort_ex`, `am_partition_nth_indices`, `am_partition_nth_ex`, `am_rank`, `am_rank_ex`, `am_rank_quantile_ex`, `am_inverse_permutation`, `am_scatter` |
+| Sorting and selection beyond `sort`/`argsort` | `am_sort_ex`, `am_top_k`, `am_lexsort`, `am_lexsort_ex`, `am_argsort_ex`, `am_partition_nth_indices`, `am_partition_nth_ex`, `am_rank`, `am_rank_ex`, `am_rank_quantile_ex`, `am_inverse_permutation`, `am_scatter` |
 | Window functions and rolling | `am_window` |
 | The rest of the aggregates | `am_reduce_ex`, `am_reduce_ex2`, `am_count_all`, `am_first_last`, `am_winsorize`, `am_group_pivot_wider`, `am_pivot_wider` |
 | Dictionaries, run-end, uniqueness | `am_dictionary_encode`, `am_dictionary_encode_ex`, `am_dictionary_decode`, `am_run_end_encode`, `am_run_end_decode`, `am_unique`, `am_unique_ex`, `am_value_counts`, `am_value_counts_ex` |
@@ -301,6 +302,7 @@ is not a shipped one.
 | The streaming engine | all 30 `am_stream_*` entry points |
 | Device interop | `am_import_device`, `am_export_device` (CPU `am_import`/`am_export` are wrapped) |
 | Extension types, float16, null arrays, random | `am_extension_*`, `am_cast_float16`, `am_null_array`, `am_random` |
+| Type introspection | `am_compute_format` (the type the kernels compute on, which for a dictionary is its value type) |
 | Execution-mode knobs | `am_resident_mode`, `am_resident_mode_available`, `am_resident_mode_reason`, `am_low_latency_wait`, `am_spin_microseconds` |
 
 Wrapping any of them is mechanical: add the `extern "C"` line to `arrowmetal-sys/src/lib.rs`, the
@@ -317,7 +319,11 @@ One run, 2026-09-07, Apple M4 Max, macOS 26.6.2, `rustc 1.95.0`, arrow-rs 59.3.0
 **Method.** One 10,000,000-element `Int64Array` of pseudo-random values in `[-1_000_000, 1_000_000)`,
 no nulls, built once and shared by every row. Filter predicate `x > 0`, which keeps 5,000,125 of the
 10,000,000 rows (50.0%). `std::time::Instant` around the call, wall time, single-threaded, nothing
-subtracted, `std::hint::black_box` on every input and result. Three untimed warm-up iterations, then
+subtracted, `std::hint::black_box` on every input and result. "Single-threaded" describes the harness:
+it spawns no threads and pins nothing, and arrow-rs's kernels ran with their default parallelism,
+which for `sum` and `filter` is none — `arrow-arith` and `arrow-select` depend on no thread pool and
+these are single-threaded, autovectorised kernels, so arrow-rs got everything it has here.
+Three untimed warm-up iterations, then
 five timed ones; the table is the **best of the five** (medians were within a few percent, and are in
 [`rust/README.md`](../rust/README.md)). Both libraries' answers are asserted equal before anything is
 timed. Outside a batch every ArrowMetal call commits its command buffer and waits, so a "kernel"
@@ -328,7 +334,7 @@ number is a complete GPU round trip, not an enqueue. Source:
 | Operation, 10M Int64 | arrow-rs | ArrowMetal, kernel | ArrowMetal, end to end |
 |---|---|---|---|
 | `sum` | 0.91 ms | **0.28 ms** | 2.11 ms |
-| `filter`, mask already built | 3.55 ms | **0.64 ms** | — |
+| `filter` (mask ready) | 3.55 ms | **0.64 ms** | — |
 | compare + `filter` | 4.58 ms | — | **2.97 ms** |
 
 * **kernel** — the GPU call on an array already imported, mask already on the GPU. This is what each
@@ -336,12 +342,13 @@ number is a complete GPU round trip, not an enqueue. Source:
 * **end to end** — what *one* operation on an arrow-rs array costs, import included. What that covers
   differs by row: the `sum` row is import + the reduction and has **no export**, because a reduction
   returns a scalar through out-parameters rather than an array; the compare + `filter` row is
-  import + compare + filter + `to_arrow`. Supporting numbers: import 1.11 ms, export 0.000 ms.
+  import + compare + filter + `to_arrow`. Supporting numbers (best of 5): import 1.11 ms,
+  export 0.000 ms.
 
 **Where ArrowMetal loses.** A single `sum` on an arrow-rs array is **2.3× slower** than
 `arrow::compute::sum`: 2.11 ms against 0.91 ms. The kernel is 3.3× faster; the loss is entirely the
-1.11 ms it takes to hand 80 MB to Metal, plus about 0.7 ms of handle setup and first-touch. The
-import is copy-free at this size (the values buffer came back aligned to 4 MiB), so that is page
+1.11 ms it takes to hand 80 MB (decimal MB; 76 MiB) to Metal, plus about 0.7 ms of handle setup and
+first-touch. The import is copy-free at this size (the values buffer came back aligned to 4 MiB), so that is page
 mapping, not a `memcpy` — and it is still 1.1 ms that one cheap kernel does not earn back.
 
 The break-even is roughly "more than one pass over the data": `compare + filter` is two passes and
@@ -352,15 +359,16 @@ reduction is a loss.
 
 ## Limits
 
-* **Apple silicon only.** `arrowmetal-sys/build.rs` refuses to build anywhere else.
+* **Apple silicon only.** `arrowmetal-sys/build.rs` refuses any non-macOS target; on Intel macOS it
+  fails at the dylib search instead.
 * **Two element types are tested against arrow-rs**: Int64 and Float64, plus Boolean masks and Int32
   indices. Anything else works through the same entry points but is untested from Rust.
 * **One thread per handle set.** Handles are `!Send` and `!Sync`; `am_last_error` and batching are
   thread-local.
 * **No `RecordBatch` type.** Columns go across one at a time. The plan runner's `Source` takes a
   named set of columns, which is the closest thing here to a table.
-* **`arrowmetal-sys` declares 35 of the ABI's 220 entry points**, and every one of them is called by the safe crate (nothing is declared and unused).
-  The table above lists what is missing.
+* **`arrowmetal-sys` declares 35 of the ABI's 222 entry points**, and every one of them is called by
+  the safe crate (nothing is declared and unused). The table above lists what is missing.
 * **The crates are not published.** `publish = false` on both; use a path or git dependency.
 * **`arrow` is pinned to major version 59.** The C Data Interface structs are ABI-stable, so a
   different arrow-rs major would very likely work, but it is not tested here.

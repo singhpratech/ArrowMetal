@@ -14,6 +14,8 @@ row by row, so a status here has been executed against pyarrow.compute rather th
 """
 import sys
 
+import pyarrow.compute as pc
+
 from arrowmetal import functions as F
 
 _INTRO = """# Apache Arrow compute functions, one row per name
@@ -21,9 +23,11 @@ _INTRO = """# Apache Arrow compute functions, one row per name
 <!-- Generated. Do not edit by hand: regenerate with
      PYTHONPATH=python python python/tests/function_table_report.py --page > docs/ARROW_FUNCTIONS.md -->
 
-Every Apache Arrow v25 compute function name — the {total} of them, being the {docs} in the
-[C++ compute function list](https://arrow.apache.org/docs/cpp/compute.html) plus the {hashes}
-`hash_*` grouped aggregates `pyarrow` registers — with what ArrowMetal 0.1.0 does about it.
+Every [Arrow v25](https://arrow.apache.org/docs/cpp/compute.html) compute function name except
+pyarrow's two internal meta-functions — {total} of them: the {listed} `pc.list_functions()` reports,
+less `index_in_meta_binary` and `is_in_meta_binary`, plus the three names pyarrow exposes only as
+Python wrappers (`fill_null`, `top_k_unstable`, `bottom_k_unstable`); {hashes} are `hash_*` grouped
+aggregates — with what ArrowMetal 0.1.0 does about it.
 
 This is the by-name page. [COVERAGE.md](COVERAGE.md) is the by-family page: it groups these functions
 and explains how each family works, with the Arrow **type** matrix and the interop status alongside.
@@ -32,15 +36,16 @@ Come here to answer "is `<name>` covered, and how?"; go there for "how does this
 ## How the table is produced
 
 `python/arrowmetal/functions.py` holds a registry with exactly one entry per Arrow name. Each entry
-carries the status, the Swift file that implements it, the ArrowMetal call that reaches it, a note,
-and two executable pieces: a **call adapter** that runs the function through ArrowMetal under Arrow's
-own argument and option names, and an **oracle** that produces the answer `pyarrow.compute` gives for
-the same input.
+carries the status, the Swift file that implements it, the ArrowMetal call that reaches it, a note, a
+**call adapter** that runs the function through ArrowMetal under Arrow's own argument and option
+names, and, for the {oracles} names where pyarrow's answer needs shaping, an **oracle** that produces
+the answer to compare against. The rest compare against `getattr(pc, name)` directly.
 
 `python/tests/test_functions.py` then does four things, and the third is the point:
 
-1. asserts the registry covers every name `pyarrow.compute.list_functions()` reports, so the list
-   cannot drift as Arrow grows, and invents none of its own;
+1. asserts the registry covers every name `pyarrow.compute.list_functions()` reports apart from two
+   internal meta-functions, so the list cannot drift as Arrow grows, and adds only the three Arrow
+   names pyarrow exposes as Python wrappers;
 2. asserts every row is well formed — a status from the vocabulary below, a note, and, for a row that
    claims to work, a call, an example input and a named source file;
 3. **runs** every `gpu` / `cpu` / `partial` row through `arrowmetal.functions.call_function` and
@@ -52,15 +57,15 @@ the same input.
 4. asserts that a `missing` row raises rather than quietly doing something.
 
 So a status here is a measurement, not an intention. Nothing in this table is reachable-in-principle:
-if it says `gpu`, `cpu` or `partial`, a test called it this run.
+if it says `gpu`, `cpu` or `partial`, a test in `python/tests/test_functions.py` calls it.
 
 ## What the statuses mean
 
 | Status | Meaning |
 |---|---|
 | **GPU** | A Metal kernel does the work. Host code sets up buffers and reads the answer back, nothing more. |
-| **CPU** | Implemented and reachable through the ArrowMetal API, but the work happens on the host. Every row here says *why* the host is the right place — a timezone database, a Unicode table, an ICU regex, or an output that is one row wide however long the input is. |
-| **Partial** | Reachable, with a stated limitation. Three different things wear this label and each note says which: (a) an option or an input type Arrow supports and this does not; (b) an answer that deliberately differs from Arrow's — group order, ascending `unique`, an int32 where Arrow returns int64; (c) an evaluation genuinely split between the GPU and the host, of which the ten `utf8_is_*` predicates are the clearest case: they answer every row on the GPU and re-decide on the CPU only the rows carrying a byte >= 0x80. |
+| **CPU** | Implemented and reachable through the ArrowMetal API, but the work happens on the host. Every row here says *why* the host is the right place — a Unicode table, an ICU regex, an output one row wide however long the input, or a metadata-only result that runs no kernel. |
+| **Partial** | Reachable, with a stated limitation. Three different things wear this label and each note says which: (a) an option or an input type Arrow supports and this does not; (b) an answer that deliberately differs from Arrow's — `tdigest` and `hash_tdigest` return one q where Arrow returns a list; (c) an evaluation genuinely split between the GPU and the host: `rank_normal`, whose inverse CDF runs on the host, and `hash_tdigest`, whose centroid merge does. |
 | **Missing** | Not implemented. The note says why. |
 | **Pending** | Reserved for a name landing on an unmerged branch. No row carries it today. |
 
@@ -70,7 +75,9 @@ against the host libm for the trigonometric and hyperbolic families (`expm1` is 
 small |x| and ~16 at |x| ~ 20, where it inherits MSL `exp`). **float64 columns** run software binary64 on the GPU rather than a widened
 `float`: `sqrt` and the four arithmetic operations are correctly rounded, `exp` / `ln` / `log2` /
 `log10` / `power` measure 1 ulp over 10^6 inputs each against a 2-ulp bound the tests assert, and the
-trigonometric family, `expm1`, `log1p`, `logb` and `hypot` are within 5. **The grouped moments**
+trigonometric family, `expm1`, `log1p`, `logb` and `hypot` are within 5 ulp over 10^6 random arguments
+each (the trigonometric assertion is 6 ulp); `sin`/`cos`/`tan` degrade to 7 ulp at |x| ~ 5e13.
+**The grouped moments**
 (`hash_variance`, `hash_stddev`, `hash_skew`, `hash_kurtosis`) form their deviations about the group
 mean in binary64 too — worst relative error 1.9e-16 on the adversarial case in `docs/DESIGN.md`.
 
@@ -98,7 +105,9 @@ def page():
     counts = F.status_counts()["Total"]
     hashes = sum(1 for n in F.list_functions() if n.startswith("hash_"))
     total = len(F.list_functions())
-    out = [_INTRO.format(total=total, docs=total - hashes, hashes=hashes)]
+    listed = len(pc.list_functions())
+    oracles = sum(1 for n in F.list_functions() if F._REGISTRY[n].oracle is not None)
+    out = [_INTRO.format(total=total, listed=listed, hashes=hashes, oracles=oracles)]
     out.append(F.summary_markdown())
     out.append("")
     out.append(f"Totals: **{counts.get(F.GPU, 0)} gpu**, **{counts.get(F.CPU, 0)} cpu**, "

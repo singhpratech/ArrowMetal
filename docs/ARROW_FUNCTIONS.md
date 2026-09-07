@@ -3,9 +3,11 @@
 <!-- Generated. Do not edit by hand: regenerate with
      PYTHONPATH=python python python/tests/function_table_report.py --page > docs/ARROW_FUNCTIONS.md -->
 
-Every Apache Arrow v25 compute function name — the 307 of them, being the 283 in the
-[C++ compute function list](https://arrow.apache.org/docs/cpp/compute.html) plus the 24
-`hash_*` grouped aggregates `pyarrow` registers — with what ArrowMetal 0.1.0 does about it.
+Every [Arrow v25](https://arrow.apache.org/docs/cpp/compute.html) compute function name except
+pyarrow's two internal meta-functions — 307 of them: the 306 `pc.list_functions()` reports,
+less `index_in_meta_binary` and `is_in_meta_binary`, plus the three names pyarrow exposes only as
+Python wrappers (`fill_null`, `top_k_unstable`, `bottom_k_unstable`); 24 are `hash_*` grouped
+aggregates — with what ArrowMetal 0.1.0 does about it.
 
 This is the by-name page. [COVERAGE.md](COVERAGE.md) is the by-family page: it groups these functions
 and explains how each family works, with the Arrow **type** matrix and the interop status alongside.
@@ -14,15 +16,16 @@ Come here to answer "is `<name>` covered, and how?"; go there for "how does this
 ## How the table is produced
 
 `python/arrowmetal/functions.py` holds a registry with exactly one entry per Arrow name. Each entry
-carries the status, the Swift file that implements it, the ArrowMetal call that reaches it, a note,
-and two executable pieces: a **call adapter** that runs the function through ArrowMetal under Arrow's
-own argument and option names, and an **oracle** that produces the answer `pyarrow.compute` gives for
-the same input.
+carries the status, the Swift file that implements it, the ArrowMetal call that reaches it, a note, a
+**call adapter** that runs the function through ArrowMetal under Arrow's own argument and option
+names, and, for the 65 names where pyarrow's answer needs shaping, an **oracle** that produces
+the answer to compare against. The rest compare against `getattr(pc, name)` directly.
 
 `python/tests/test_functions.py` then does four things, and the third is the point:
 
-1. asserts the registry covers every name `pyarrow.compute.list_functions()` reports, so the list
-   cannot drift as Arrow grows, and invents none of its own;
+1. asserts the registry covers every name `pyarrow.compute.list_functions()` reports apart from two
+   internal meta-functions, so the list cannot drift as Arrow grows, and adds only the three Arrow
+   names pyarrow exposes as Python wrappers;
 2. asserts every row is well formed — a status from the vocabulary below, a note, and, for a row that
    claims to work, a call, an example input and a named source file;
 3. **runs** every `gpu` / `cpu` / `partial` row through `arrowmetal.functions.call_function` and
@@ -34,15 +37,15 @@ the same input.
 4. asserts that a `missing` row raises rather than quietly doing something.
 
 So a status here is a measurement, not an intention. Nothing in this table is reachable-in-principle:
-if it says `gpu`, `cpu` or `partial`, a test called it this run.
+if it says `gpu`, `cpu` or `partial`, a test in `python/tests/test_functions.py` calls it.
 
 ## What the statuses mean
 
 | Status | Meaning |
 |---|---|
 | **GPU** | A Metal kernel does the work. Host code sets up buffers and reads the answer back, nothing more. |
-| **CPU** | Implemented and reachable through the ArrowMetal API, but the work happens on the host. Every row here says *why* the host is the right place — a timezone database, a Unicode table, an ICU regex, or an output that is one row wide however long the input is. |
-| **Partial** | Reachable, with a stated limitation. Three different things wear this label and each note says which: (a) an option or an input type Arrow supports and this does not; (b) an answer that deliberately differs from Arrow's — group order, ascending `unique`, an int32 where Arrow returns int64; (c) an evaluation genuinely split between the GPU and the host, of which the ten `utf8_is_*` predicates are the clearest case: they answer every row on the GPU and re-decide on the CPU only the rows carrying a byte >= 0x80. |
+| **CPU** | Implemented and reachable through the ArrowMetal API, but the work happens on the host. Every row here says *why* the host is the right place — a Unicode table, an ICU regex, an output one row wide however long the input, or a metadata-only result that runs no kernel. |
+| **Partial** | Reachable, with a stated limitation. Three different things wear this label and each note says which: (a) an option or an input type Arrow supports and this does not; (b) an answer that deliberately differs from Arrow's — `tdigest` and `hash_tdigest` return one q where Arrow returns a list; (c) an evaluation genuinely split between the GPU and the host: `rank_normal`, whose inverse CDF runs on the host, and `hash_tdigest`, whose centroid merge does. |
 | **Missing** | Not implemented. The note says why. |
 | **Pending** | Reserved for a name landing on an unmerged branch. No row carries it today. |
 
@@ -52,7 +55,9 @@ against the host libm for the trigonometric and hyperbolic families (`expm1` is 
 small |x| and ~16 at |x| ~ 20, where it inherits MSL `exp`). **float64 columns** run software binary64 on the GPU rather than a widened
 `float`: `sqrt` and the four arithmetic operations are correctly rounded, `exp` / `ln` / `log2` /
 `log10` / `power` measure 1 ulp over 10^6 inputs each against a 2-ulp bound the tests assert, and the
-trigonometric family, `expm1`, `log1p`, `logb` and `hypot` are within 5. **The grouped moments**
+trigonometric family, `expm1`, `log1p`, `logb` and `hypot` are within 5 ulp over 10^6 random arguments
+each (the trigonometric assertion is 6 ulp); `sin`/`cos`/`tan` degrade to 7 ulp at |x| ~ 5e13.
+**The grouped moments**
 (`hash_variance`, `hash_stddev`, `hash_skew`, `hash_kurtosis`) form their deviations about the group
 mean in binary64 too — worst relative error 1.9e-16 on the adversarial case in `docs/DESIGN.md`.
 
@@ -157,7 +162,7 @@ Totals: **283 gpu**, **17 cpu**, **7 partial**, **0 missing**, **0 pending** ove
 | `power_checked` | Arithmetic | **GPU** | `power_checked(other)` | `Kernels/Checked.swift` | Raises for a negative integer exponent and for any repeated-squaring step that would wrap. A float column never raises, as in Arrow, and is bit-identical to the unchecked `power` — so on float64 it is the same 1-ulp software binary64 answer. |
 | `sqrt_checked` | Arithmetic | **GPU** | `sqrt_checked()` | `Kernels/Checked.swift` | Raises `square root of negative number`; NaN, -0.0 and +inf do not raise. Bit-identical to the unchecked `sqrt`, and so correctly rounded on a float64 column too. |
 | `subtract_checked` | Arithmetic | **GPU** | `subtract_checked(other)` | `Kernels/Checked.swift` | As `add_checked`. |
-| `expm1` | Arithmetic | **GPU** | `expm1()` | `Kernels/MathExtra.swift` | exp(x) - 1, accurate for small x, through the software binary64 routine on a float64 column (within about 5 ulp of the host libm). Float columns only, as in Arrow. |
+| `expm1` | Arithmetic | **GPU** | `expm1()` | `Kernels/MathExtra.swift` | exp(x) - 1, accurate for small x, through the software binary64 routine on a float64 column (measured <= 2 ulp against the host libm over 10^6 inputs). Float columns only, as in Arrow. |
 | `hypot` | Arithmetic | **GPU** | `hypot(other)` | `Kernels/MathExtra.swift` | sqrt(x^2 + y^2), scaled so a large or tiny pair neither overflows nor underflows on the way. An infinite operand gives inf even opposite a NaN, as IEEE-754 prescribes. |
 | `bit_wise_and` | Bitwise | **GPU** | `bitwise_and(other)` | `Kernels/Bitwise.swift` | One thread per element. |
 | `bit_wise_not` | Bitwise | **GPU** | `bitwise_not()` | `Kernels/Bitwise.swift` | One thread per element. |
@@ -173,7 +178,7 @@ Totals: **283 gpu**, **17 cpu**, **7 partial**, **0 missing**, **0 pending** ove
 | `round` | Rounding | **GPU** | `round(ndigits, mode)` | `Kernels/MathExtra.swift` | All ten Arrow round modes and any `ndigits`, evaluated as round_int(x * 10^ndigits) / 10^ndigits. `round()` with no argument keeps its historical meaning (halves away from zero); passing either option selects Arrow's kernel, whose defaults are ndigits=0 and half_to_even. |
 | `round_binary` | Rounding | **GPU** | `round_binary(ndigits, mode)` | `Kernels/MathExtra.swift` | `round` with one `ndigits` per row, from an int32 column. Null wherever either column is. |
 | `round_to_multiple` | Rounding | **GPU** | `round_to_multiple(multiple, mode)` | `Kernels/MathExtra.swift` | round_int(x / multiple) * multiple, for any positive scalar multiple and any Arrow round mode. |
-| `ln` | Logarithmic | **GPU** | `ln()` | `Kernels/Rounding.swift` | Metal's `log` on float32; on float64 the software binary64 of `Kernels/DoublePower.swift`, which carries log2(x) as an unevaluated hi/lo pair and scales it by a split ln 2 so the leading product is exact. Measured **1 ulp** against Foundation over 10^6 inputs from 5e-324 to 1e308, plus passes concentrated near 1 and over the subnormals. |
+| `ln` | Logarithmic | **GPU** | `ln()` | `Kernels/Rounding.swift` | Metal's `log` on float32; on float64 the software binary64 of `Kernels/DoublePower.swift`, which carries log2(x) as an unevaluated hi/lo pair and scales it by a split ln 2 so the leading product is exact. Measured **1 ulp** against Foundation over 10^6 inputs from 5e-324 to 1.8e308, plus passes concentrated near 1 and over the subnormals. |
 | `log10` | Logarithmic | **GPU** | `log10()` | `Kernels/Rounding.swift` | Metal's `log10` on float32; on float64 the same software binary64 reduction as `ln`, scaled by a split log10 2 instead. Measured **1 ulp** over 10^6 inputs. |
 | `log2` | Logarithmic | **GPU** | `log2()` | `Kernels/Rounding.swift` | Metal's `log2` on float32; on float64 the software binary64 reduction rounded once, so an exact power of two comes back exactly. Measured **1 ulp** over 10^6 inputs. |
 | `ln_checked` | Logarithmic | **GPU** | `ln_checked()` | `Kernels/Checked.swift` | Raises `logarithm of zero` / `logarithm of negative number` — the boundary is exact, so +5e-324 passes and -5e-324 does not, and NaN and +inf never raise. Bit-identical to the unchecked `ln`, and so the same 1-ulp software binary64 answer on a float64 column. |
@@ -297,7 +302,7 @@ Totals: **283 gpu**, **17 cpu**, **7 partial**, **0 missing**, **0 pending** ove
 | `find_substring_regex` | Containment | **CPU** | `find_substring_regex(pattern)` | `Kernels/Regex.swift` | Host engine, behind the same GPU literal pre-filter; a pre-filtered row answers -1. |
 | `match_substring_regex` | Containment | **CPU** | `match_substring_regex(pattern)` | `Kernels/Regex.swift` | Host engine; literal and `^literal` patterns route to the GPU kernels outright, and a pattern with a literal core gets the GPU pre-filter described in `Kernels/StringLike.swift`. |
 | `match_like` | Containment | **GPU** | `match_like(pattern)` | `Kernels/StringLike.swift` | SQL LIKE for **every** case-sensitive pattern on the GPU. A pure prefix / suffix / contains / equality pattern takes the byte-wise `startsWith` / `endsWith` / `contains` / `equals` kernel; anything else — a `_` anywhere, an interior `%`, any mixture — is compiled into a small byte program and matched by one thread per row, where `_` and `%` count code points. Only `ignore_case` still goes to ICU on the host. |
-| `is_in` | Containment | **GPU** | `is_in(value_set, null_matching_behavior)` | `Kernels/SetLookup.swift` | GPU throughout: a sorted set plus a binary search per row for primitive and temporal columns, the GPU string hash table for utf8 and binary ones. All four of Arrow's `null_matching_behavior` values are implemented — `match`, `skip`, `emit_null` and `inconclusive` — as a rewrite of the validity bitmap over the kernel's own `skip` answer, since the four differ only in what a null row reports. ArrowMetal defaults to `skip`; pyarrow defaults to `match`, so the check below passes it. |
+| `is_in` | Containment | **GPU** | `is_in(value_set, null_matching_behavior)` | `Kernels/SetLookup.swift` | GPU throughout: a sorted set plus a binary search per row for primitive and temporal columns, the GPU string hash table for utf8 and binary ones. All four of Arrow's `null_matching_behavior` values are implemented — `match`, `skip`, `emit_null` and `inconclusive` — as a rewrite of the validity bitmap over the kernel's own `skip` answer, since the four differ only in what a null row reports. ArrowMetal defaults to `skip`; pyarrow 25 exposes only `skip_nulls` (default `False`, i.e. `match`), so the check below passes `match`. |
 | `index_in` | Containment | **GPU** | `index_in(value_set, null_matching_behavior)` | `Kernels/SetLookup.swift` | The same two paths and the same four behaviours, returning the int32 position of the first occurrence in the set and null where the element is absent. Only `match` differs from the other three for `index_in`: it reports the position of the value set's first null for a null element. |
 | `is_null` | Categorizations | **GPU** | `is_null()` | `Kernels/Structural.swift` | The validity bitmap inverted on the GPU. Arrow's `nan_is_null` is not implemented. |
 | `is_valid` | Categorizations | **GPU** | `is_valid()` | `Kernels/Structural.swift` | The validity bitmap copied out as a boolean column. |
@@ -310,7 +315,7 @@ Totals: **283 gpu**, **17 cpu**, **7 partial**, **0 missing**, **0 pending** ove
 | `coalesce` | Selecting | **GPU** | `am.coalesce(*arrays)` | `Kernels/Structural.swift` | First non-null across the inputs, one thread per element. |
 | `case_when` | Selecting | **GPU** | `am.case_when(conds, values, default)` | `Kernels/Conditional.swift` | A fold of the existing `if_else` kernel, one GPU pass per branch. A **null condition counts as false** and the row falls through, as in Arrow. ArrowMetal takes the conditions as a list of boolean columns where Arrow takes one struct column of them. |
 | `choose` | Selecting | **GPU** | `am.choose(indices, values)` | `Kernels/Conditional.swift` | `values[indices[i]][i]`, element-wise, as the same fold. A null index gives a null output and an index outside [0, len(values)) raises, as in Arrow. |
-| `cast` | Conversions | **GPU** | `cast(target, safe=..., allow_*=...)` | `Sources/ArrowMetal/CastDispatch.swift` | One entry point for every target, taking Arrow's whole `CastOptions`. Numeric to numeric, bool to and from numeric, numeric and temporal to utf8 and utf8 back to numeric, temporal resolution changes and the date/timestamp conversions, integer to and from decimal128 and a decimal rescale, and `list<T>` -> `list<U>` and struct casts that cast the children and share the offsets and bitmaps. `safe=True` adds one read-only GPU pass that converts each value back and raises on the first row that does not round-trip, which is exactly the set of losses Arrow objects to; each `allow_*` flag turns one class back off. ArrowMetal defaults to `safe=False`, where pyarrow defaults to `safe=True`. Two things remain: with `safe=False` an out-of-range float -> integer value saturates at 64 bits and truncates where Arrow saturates at the target's width (C leaves it undefined; `safe=True` refuses the row rather than choosing), and dictionary, union, run-end and interval targets, and utf8 -> temporal (that is `strptime`), are refused. |
+| `cast` | Conversions | **GPU** | `cast(target, safe=..., allow_*=...)` | `Sources/ArrowMetal/CastDispatch.swift` | One entry point for every supported target, taking Arrow's whole `CastOptions`. Numeric to numeric, bool to and from numeric, numeric and temporal to utf8 and utf8 back to numeric, temporal resolution changes and the date/timestamp conversions, integer to and from decimal128 and a decimal rescale, and `list<T>` -> `list<U>` and struct casts that cast the children and share the offsets and bitmaps. `safe=True` adds one read-only GPU pass that converts each value back and raises on the first row that does not round-trip, which is exactly the set of losses Arrow objects to; each `allow_*` flag turns one class back off. ArrowMetal defaults to `safe=False`, where pyarrow defaults to `safe=True`. Two things remain: with `safe=False` an out-of-range float -> integer value saturates at 64 bits and truncates where Arrow saturates at the target's width (C leaves it undefined; `safe=True` refuses the row rather than choosing), and dictionary, union, run-end and interval targets, and utf8 -> temporal (that is `strptime`), are refused. |
 | `ceil_temporal` | Conversions | **GPU** | `ceil_temporal(unit, multiple, week_starts_monday, ceil_is_strictly_greater, calendar_based_origin)` | `Kernels/TemporalMath.swift` | As `round_temporal`, with the whole `RoundTemporalOptions` surface. A value already on a boundary is left alone unless `ceil_is_strictly_greater` — except on `month`, `quarter` and `year`, where Arrow's own ceil always advances a boundary value and the flag makes no difference; that quirk is reproduced deliberately. |
 | `floor_temporal` | Conversions | **GPU** | `floor_temporal(unit, multiple, week_starts_monday, ceil_is_strictly_greater, calendar_based_origin)` | `Kernels/TemporalMath.swift` | As `ceil_temporal`. |
 | `round_temporal` | Conversions | **GPU** | `round_temporal(unit, multiple, week_starts_monday, ceil_is_strictly_greater, calendar_based_origin)` | `Kernels/TemporalMath.swift` | The whole of Arrow's `RoundTemporalOptions`, in integer arithmetic in the value's own resolution plus the civil-date algorithm for the calendar units. An exact half rounds **up** (toward +infinity), which is what Arrow does. `week` is a seven-day grid on a Monday or Sunday anchor; `calendar_based_origin` starts the grid at the beginning of the value's own next-greater calendar unit; the month and quarter grids are anchored at 1970-01 and the year grid at year 0, as Arrow anchors them. |

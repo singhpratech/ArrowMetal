@@ -28,8 +28,9 @@ gets its `tiebreaker`, `pc.week` its three `WeekOptions` flags, `pc.round` its `
 `pc.quantile` its `interpolation`, `pc.assume_timezone` its `ambiguous`/`nonexistent`, `pc.is_in` its
 `skip_nulls`, `pc.list_slice` its `return_fixed_size_list`.
 
-**Where Arrow has no function.** Sixteen operations have no `pyarrow.compute` counterpart at all. Each
-names itself in `_NO_ORACLE`, `test_no_oracle_operations_are_reported` prints the list on every run, and
+**Where Arrow has no function.** Seventeen operations have no `pyarrow.compute` counterpart at all.
+Sixteen name themselves in `_NO_ORACLE` and `str_hash32` states it in its own `@op` note;
+`test_no_oracle_operations_are_reported` prints the `_NO_ORACLE` list on every run, and
 each is compared against a reference written out in the harness rather than against nothing:
 
 | Operation | Reference |
@@ -110,7 +111,7 @@ all (`sqrt(100000)·2^-24 ≈ 2e-5` on its own).
 
 **Not-implemented versus wrong.** An `ArrowMetalError` whose message matches a known gap ("Unsupported
 Arrow type", "group-by min/max needs a 32-bit or narrower type", …) is a *skip*; any other error, or a
-wrong answer, is a *failure*. The 909 skips in the default run are:
+wrong answer, is a *failure*. The 1,017 skips in the default run are:
 
 - the group-by combinations the kernels do not cover — `min`/`max` on 64-bit values, `mean` on Float32,
   and any aggregate over Float64, the same set `test_arrowmetal.py` pins as expected errors;
@@ -713,7 +714,7 @@ Reproduction: `test_winsorize_clamps_to_the_negative_zero_of_a_zero_tie`.
 
 ## Findings that were fixed
 
-The five bugs the first run of this matrix reported are closed, and four of the original twenty-one findings were closed by later kernel work (full-Unicode case mapping, and the three calendar-rounding corners). The reproductions stayed, as plain
+The five bugs the first run of this matrix reported are closed, and four of the original twenty-one findings were closed by later kernel work (full-Unicode case mapping, and the three calendar-rounding corners); three more bugs were found and fixed while closing them (the `top_k` relaxed-atomic race, the `winsorize` pipeline-cache collision and the `order="sorted"` string order), which is why the table below has twelve rows. The reproductions stayed, as plain
 assertions, so the suite notices a relapse.
 
 | Was | Now | Test |

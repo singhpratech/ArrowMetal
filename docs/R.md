@@ -13,7 +13,8 @@ unified memory), macOS 26.6.2, R 4.5.3, arrow 25.0.0, ArrowMetal 0.1.0.
 You need the dylib first:
 
 ```sh
-swift build -c release          # produces .build/release/libArrowMetalC.dylib
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  swift build -c release --product ArrowMetalC   # produces .build/release/libArrowMetalC.dylib
 ```
 
 Then either:
@@ -104,7 +105,7 @@ behaviour — it differs by type and is not monotone in `n` — so no threshold 
 table above is what was measured, at 1M and 10M; for anything else, run `am_buffer_alignment()` on
 your own data rather than inferring. At small sizes the copy costs nothing worth measuring.
 
-The copy costs **1.39 ms (median) for 80 MB** (10M float64), about 57 GB/s.
+The copy costs **1.39 ms (median) for 80 MB** (10M float64; decimal MB, 76 MiB), about 57 GB/s.
 
 ## Timing
 
@@ -143,14 +144,15 @@ same script.
 | `sum(x)` base R | 11.15 / 11.60 ms | 11.15 / 11.61 ms |
 
 **Resident `sum` is not separable from arrow's, and no verdict is claimed for it.** It measures
-between **0.6 and 1.4 ms depending on the process**: the per-process medians were 0.57, 0.59, 0.60,
-0.60, 0.78 in one replicate and 0.86, 1.38, 1.38, 1.39, 1.54 in the next, while arrow stayed tight
-at 1.14–1.27 across all ten. One replicate makes ArrowMetal look twice as fast, the next makes it
-look slower; the honest reading is that the two are the same speed to within the noise of this
+between **0.57 and 1.54 ms depending on the process**. In the isolated mode: the per-process medians
+were 0.57, 0.59, 0.60, 0.60, 0.78 in one replicate and 0.86, 1.38, 1.38, 1.39, 1.54 in the next,
+while arrow stayed tight at 1.14–1.27 across all ten. One replicate makes ArrowMetal look twice as
+fast, the next makes it look slower; the honest reading is that the two are the same speed to within the noise of this
 measurement.
 
 **`sum` including the import is a reproducible loss**: 3.20 ms against arrow's 1.31 ms interleaved,
-**2.4× slower**, in every replicate. A sum is one bandwidth-bound pass over 80 MB with no
+**2.4× slower**, in every replicate. A sum is one bandwidth-bound pass over 80 MB (decimal MB;
+76 MiB) with no
 arithmetic to hide the transfer behind.
 
 `filter` (`x > 0.5`, about 5M rows out):
@@ -196,7 +198,7 @@ column; and multi-chunk, single-chunk and empty ChunkedArrays.
 
 ## Not covered
 
-The binding resolves 34 of the ABI's 200-plus entry points. Not wrapped, and reachable only from
+The binding resolves 34 of the ABI's 222 entry points. Not wrapped, and reachable only from
 Python or Swift for now:
 
 - arithmetic (`am_arith_*`, `am_unary`, `am_binary`, checked variants), casts (`am_cast`),
@@ -244,11 +246,12 @@ There is also no dplyr backend and no `RecordBatch`/`Table` surface: everything 
 
 ## Tests
 
-266 testthat tests, all passing, against base R and against `arrow`'s own kernels on the same
-data: nulls, all-null and empty columns, sliced input at three offsets, lengths of 1, 33, 1024,
-65537 and 1,000,001 (crossing a threadgroup boundary), one group per row and one group for
+65 `test_that()` blocks, 266 passing expectations, against base R and against `arrow`'s own
+kernels on the same data: nulls, all-null and empty columns, sliced input at three offsets, lengths
+of 1, 33, 1024, 65537 and 1,000,001 (crossing a threadgroup boundary), one group per row and one group for
 everything, int64 above 2^53, float32 accumulation, and every documented error path.
-`R CMD check --no-manual` is clean: 0 errors, 0 warnings, 0 notes.
+`R CMD build r/arrowmetal && R CMD check --no-manual arrowmetal_0.1.0.tar.gz` is clean: 0 errors,
+0 warnings, 0 notes.
 
 ```sh
 ARROWMETAL_LIB=$PWD/.build/release/libArrowMetalC.dylib \

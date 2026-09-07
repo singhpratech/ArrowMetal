@@ -103,7 +103,8 @@ checked strictly: an `osx_arm64` build will not load into an `osx_amd64` DuckDB.
 
 ## 3. Tier 1: the Python bridge
 
-`python/arrowmetal/duckdb_bridge.py`. Six entry points, all reachable straight off `am`.
+`python/arrowmetal/duckdb_bridge.py`. Eight entry points, all reachable straight off `am`; six of
+them are below.
 
 ### Pull a result onto the GPU
 
@@ -120,7 +121,7 @@ result, or any pyarrow table or stream. Columns whose type ArrowMetal cannot lif
 pyarrow arrays in the same dict; pass `on_unsupported="raise"` to be told instead.
 
 `test_every_duckdb_type_round_trips` checks 25 of DuckDB's types: every integer width and signedness,
-both floats, `VARCHAR`, `BLOB`, `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMPTZ`, `INTERVAL`,
+both floats, `BOOLEAN`, `VARCHAR`, `BLOB`, `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMPTZ`, `INTERVAL`,
 `DECIMAL(10,2)`, `DECIMAL(38,2)`, `HUGEINT`, `LIST`, `STRUCT` and `MAP`. `UUID` is checked as its
 `VARCHAR` rendering; the native type is not exercised.
 
@@ -382,7 +383,7 @@ anything. Reach for the GPU when the aggregate is the expensive part, not the sc
 
 **Worth it**
 
-- High-cardinality group-by over a resident column. 100,000 keys at 50M rows: 24x, at a fortieth of
+- High-cardinality group-by over a resident column. 100,000 keys at 50M rows: 24x, at a thousandth of
   the CPU time; a single cold query, crossing included, is 1.2x.
 - String matching over a column you are keeping resident. `LIKE '%...%'` at 50M rows: 21x resident;
   a single cold query is 0.7x.
@@ -396,7 +397,9 @@ anything. Reach for the GPU when the aggregate is the expensive part, not the sc
 - A single `sum`/`avg` over one column, whether from memory or Parquet. Memory-bound, and DuckDB
   does it while scanning.
 - Sorting. DuckDB's parallel sort beats the GPU radix sort at these sizes (0.5x).
-- Small data. Below a few million rows the ~150 µs dispatch latency is most of the time; use
+- Small data. Below a few million rows the dispatch latency is most of the time — about 60-70 µs
+  measured ([RESIDENT.md](RESIDENT.md)), 110-230 µs as an all-in per-call floor in the matrix's
+  latency family; use
   `am.batch()` to amortise it, or do not bother.
 - Anything the extension can do, if speed is the reason. See §4.
 

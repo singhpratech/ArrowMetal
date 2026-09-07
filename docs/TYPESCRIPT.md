@@ -174,7 +174,7 @@ Handles are freed by the garbage collector; `release()` frees one now.
 
 ## Not covered
 
-The C ABI has 220 entry points. This binding wraps the ones above and no others. Not wrapped:
+The C ABI has 222 entry points. This binding wraps the ones above and no others. Not wrapped:
 
 * strings beyond `utf8` import/export — no `am_str_unary`, `am_str_match`, `am_str_transform`,
   `am_regex`, `am_to_strings`, `am_parse`
@@ -242,6 +242,9 @@ Read it honestly:
 * The 0.27–0.36 ms resident `sum` is 80 MB read in about 0.3 ms, roughly 265 GB/s, which is in
   range for an M4 Max. It is not a cached answer: a test mutates the wrapped buffer and watches the
   sum change.
+* **There is no row here where ArrowMetal loses.** On these two operations at this size it wins
+  every comparison; a small array will lose to the plain loop, because the per-call overhead is
+  fixed and there is nothing for the GPU to amortise it over. That crossover is not measured here.
 * An earlier single-process run of this benchmark reported `filter` end to end at 8.62 ms against
   the plain loop's 9.77 ms and called it a 1.13x win. That claim was inside the noise and is
   withdrawn; this table replaces it.
@@ -253,8 +256,9 @@ Numbers are from one machine on one day. `node bench/spread.mjs` re-runs the who
 
 * **macOS on Apple silicon, in Node.** No browser, no WASM, no Intel, no Linux.
 * **int64 is `BigInt`.** `sum`, `min`, `max` on an Int64 or Uint64 column return a `BigInt`;
-  `mean` always returns a `number`. Scalars passed to `compare` / `arith` on an int64 column must
-  be `BigInt`s (`amount.gt(60n)`, not `amount.gt(60)`) — a `number` is accepted and truncated.
+  `mean` always returns a `number`. Scalars passed to `compare` / `arith` on an int64 column should
+  be `BigInt`s (`amount.gt(60n)`, not `amount.gt(60)`); a `number` is accepted and truncated toward
+  zero.
   Arrow JS's `Int64` vectors are `BigInt64Array`-backed, which matches.
 * **Single-chunk only.** `Table`, `RecordBatch` and chunked `Vector`s are not accepted.
 * **Synchronous.** Every call blocks the event loop for the length of the kernel.

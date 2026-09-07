@@ -73,7 +73,7 @@ Newton reciprocal with an exact remainder correction instead of a 57-step restor
 | `multiply` (float64) | 4.6 ms | **3.1 ms** | 260.9 | 390.8 | 2.32x -> **3.46x** |
 | `add` (float64) | 3.1 ms | 3.1 ms | 390.1 | 388.4 | 3.33x |
 
-`multiply` and `add` now sit exactly at this machine's memory ceiling and `divide` is within 15% of it,
+`multiply` and `add` now sit at the ~390 GB/s these single-pass float64 rows reach and `divide` is within 15% of it,
 so the software arithmetic has all but stopped being visible. Both rewrites stay correctly rounded —
 `DoubleMathTests` compares them with Swift's `Double` bit for bit.
 
@@ -132,13 +132,13 @@ Findings:
   Polars and pyarrow, at 100 to 155 GB/s over the utf8 data buffer.
 - *As of 2026-09-06, since fixed:* `top_k` was a full argsort plus a slice, so a CPU running top-k
   selection (which touches each value once and rarely writes) won by 65x. A partial radix / threadgroup
-  selection kernel was the fix. In the 2026-09-07 matrix `top_k (k=100, int64)` at 50M rows is 2.68 ms
-  against pyarrow's 24.00 ms, an 8.9x win.
+  selection kernel was the fix. In the 2026-09-07 matrix `top_k (k=100, int64)` at 50M rows is 2.67 ms
+  against pyarrow's 24.00 ms, a 9.0x win.
 - *As of 2026-09-06, since fixed:* `dictionaryEncode` ran on the CPU and allocated per row, which
   dominated the string group-by (750 ms of the 751). Once codes existed, the GPU group-by over 10M string
   keys was 1.2 ms, 12x the all-core CPU hash group-by and 13x pyarrow. Hashing moved onto the GPU; in the
-  2026-09-07 matrix `dictionary_encode (utf8)` at 10M rows is 5.38 ms against 113.71 ms for the fastest
-  CPU library (Polars), a 21.1x win.
+  2026-09-07 matrix `dictionary_encode (utf8)` at 10M rows is 5.65 ms against 113.44 ms for the fastest
+  CPU idiom (Polars lazy), a 20.1x win.
 - String `filter` is the one string kernel the CPU still wins (2.7 vs 4.7 ms): the byte gather is
   short-string dominated, one thread per row copying ~13 bytes.
 

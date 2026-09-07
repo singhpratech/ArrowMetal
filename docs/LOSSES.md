@@ -34,7 +34,7 @@ place — their `note` column says so, and the log is
 over a column in unified memory is a fast, well-engineered thing to be, and on a single pass over a
 single column it reaches the same memory the GPU reads at close to the same rate. Most of the 77 are
 that: a bandwidth tie, where neither side has a 3x to give. The rest are fixed cost — a Metal command
-buffer is 140–170 µs whatever it carries, so below about a million rows the dispatch is the
+buffer is 110–230 µs whatever it carries (the matrix's latency family, 2026-09-07 parallel run), so below about a million rows the dispatch is the
 operation — plus three operations that genuinely do more arithmetic per element than hardware doubles
 do, one that never reaches the GPU at all, and the rows where the CPU library returns a view and
 ArrowMetal materialises a column. None of these is a row where the CPU is doing something slowly. They are the rows where
@@ -62,8 +62,8 @@ change that.
 | slice_codeunits [5:10] | 1,000,000 | 1.27 ms | pyarrow Acero 0.86 ms | 11.0 | 0.68x |
 | split_pattern("_") | 1,000,000 | 3.36 ms | pyarrow Acero 2.40 ms | 11.3 | 0.72x |
 
-A Metal dispatch costs 140–170 µs of command-buffer creation, encoding, commit and completion wait
-before the first byte is touched ([DESIGN.md](DESIGN.md): an empty kernel is ~116 µs), and the
+A Metal dispatch costs 110–230 µs of command-buffer creation, encoding, commit and completion wait
+before the first byte is touched ([RESIDENT.md](RESIDENT.md): an empty round trip is 60–70 µs; round 4 measured ~116 µs), and the
 cheapest dispatch in this CSV — `sum(int64)` over a thousand values — is 0.11 ms, which is that floor
 and nothing else. Nine of these rows are the latency family, which exists to measure exactly this.
 
@@ -116,7 +116,7 @@ engines that call us, where one dispatch carries a whole query rather than one o
 This is the largest group and the least dramatic one. Every row is a single pass that reads one or two
 columns and writes one, and both sides are moving the same bytes through the same memory controller:
 `sqrt` at 50M rows is 204 GB/s on the GPU against Polars lazy's 234, `drop_null` at 50M is 181 GB/s
-against 199, both within reach of this machine's ~400 GB/s unified-memory ceiling. Twelve to fifteen
+against 199, both within reach of the ~390-400 GB/s these single-pass rows reach. Twelve to fifteen
 cores get there too, and when they do the ratio is a coin toss decided by the dispatch cost on one
 side and the thread-pool wake-up on the other. There is no 3x on this shape for anybody.
 [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md) prints the two bandwidths side by side for every one of
@@ -195,11 +195,11 @@ alternations — would take the common cases off the host fallback one shape at 
 |---|---:|---:|---|---:|---:|
 | shift (lag 1, int64) | 10,000,000 | 2.37 ms | Polars lazy 0.03 ms | 2.2 | 0.01x |
 | shift (lag 1, int64) | 50,000,000 | 3.58 ms | Polars lazy 0.03 ms | 2.2 | 0.01x |
-| slice (zero-copy view) | 10,000,000 | 0.00 ms | pyarrow 0.00 ms | 0.0 | 0.40x |
+| slice (zero-copy view) | 10,000,000 | 0.00 ms | Polars 0.00 ms | 0.0 | 0.40x |
 | slice (zero-copy view) | 50,000,000 | 0.00 ms | Polars 0.00 ms | 0.0 | 0.33x |
 
 These two rows are not a computation contest. The matrix measures the default `shift`, which writes a
-new contiguous column: 813 MB moved at 50M rows in 3.58 ms is 223 GB/s, this machine's bandwidth, so
+new contiguous column: 800 MB moved at 50M rows in 3.58 ms is 223 GB/s, so
 the kernel is not the problem. Polars answers with a two-chunk view — a null chunk in front of a slice
 of the original — and copies nothing; the parallel CSV records it at 27,826 GB/s, which is how you can
 tell from the numbers alone that no data moved. `slice` is pointer arithmetic on every side and the
@@ -230,7 +230,7 @@ pointers too. It is the single change that would retire this cause, and it is a 
 
 Extracting a calendar field is a civil-from-days conversion per element — a few dozen integer
 operations, the same on both sides — so these rows are compute bound, not bandwidth bound: ArrowMetal
-runs 22.4 GB/s on `year` at 50M rows against this machine's ~400 GB/s ceiling. When an operation is
+runs 22.4 GB/s on `year` at 50M rows against the ~390-400 GB/s these single-pass rows reach. When an operation is
 arithmetic per element rather than bytes per second, the GPU's advantage is its lane count alone, and
 thirteen to fourteen cores through Acero close it. Against the eager idioms the same rows were
 comfortable wins — `year` at 50M was 7.0x in `full_matrix_2026-09-07.csv` — and against Acero they are
@@ -352,12 +352,13 @@ the fact. The sort section at the end is measured against `private/results/sort_
 and stands on its own data.
 
 Of 946 comparisons in that eager matrix: 822 at or above 3x, 93 faster but under 3x, 31 slower than
-the fastest eager CPU library. The 31 fall into six causes. The morning run of the same day
+some eager CPU library (against the *fastest* eager library the count is 15). The 31 fall into six
+causes. The morning run of the same day
 (`full_matrix_2026-09-07-am.csv`) had 50 slower and 115 under 3x; what moved is at the end of the page.
 
 ### Slower than the eager CPU library
 
-#### 1. The dispatch floor below a million rows (19 rows)
+#### 1. The dispatch floor below a million rows (19 comparisons)
 
 | operation | rows | ArrowMetal | fastest CPU | ratio |
 |---|---:|---:|---:|---:|
@@ -369,8 +370,8 @@ the fastest eager CPU library. The 31 fall into six causes. The morning run of t
 | group-by sum (1000 keys) | 1,000 | 0.80 ms | 0.08 ms (pandas) | 0.09x |
 | group-by sum (1000 keys) | 100,000 | 0.93 ms | 0.35 ms (pandas) | 0.38x |
 
-A Metal dispatch costs 60–140 µs before the first byte is touched: command-buffer creation,
-encoding, commit and the completion wait. A CPU library sums a thousand integers in a fraction of a
+A Metal dispatch costs 110–230 µs before the first byte is touched: command-buffer creation,
+encoding, commit and the completion wait.[^round4floor] A CPU library sums a thousand integers in a fraction of a
 microsecond. Below about a million rows the GPU cannot win a single operation, and this page will
 always carry these rows. What helps: batching several operations into one command buffer
 (`MetalContext.batch`, 8–32% off per call), the fused expression compiler (one dispatch for a whole
@@ -378,22 +379,27 @@ expression tree), and the lazy engine (one command buffer for a whole plan) — 
 break-even point down, none of which remove the floor. The persistent-kernel approach that would
 remove it is impossible on this hardware ([RESIDENT.md](RESIDENT.md)).
 
-#### 2. `shift` as a copy (4 rows)
+[^round4floor]: This section previously read 60–140 µs, the range taken from the round-4 latency
+    measurements in [BENCHMARKS.md](BENCHMARKS.md) (empty kernel encode + commit + wait, ~116 µs; the
+    per-call GPU sum and filter costs there are 136–167 µs at small sizes). 110–230 µs is the figure
+    the rest of this page and [DESIGN.md](DESIGN.md) use, and it is the one that applies here.
+
+#### 2. `shift` as a copy (4 comparisons)
 
 | operation | rows | ArrowMetal | Polars | pandas | ratio |
 |---|---:|---:|---:|---:|---:|
 | shift (lag 1, int64) | 10,000,000 | 2.30 ms | 0.05 ms | 0.05 ms | 0.02x |
 | shift (lag 1, int64) | 50,000,000 | 3.63 ms | 0.05 ms | 0.15 ms | 0.01x |
 
-The matrix measures the default `shift`, which writes a new contiguous column: 813 MB moved at 50M
-rows at 226 GB/s, which is this machine's bandwidth, so the kernel is not the problem. Polars answers
+The matrix measures the default `shift`, which writes a new contiguous column: 800 MB moved at 50M
+rows at 220 GB/s, so the kernel is not the problem. Polars answers
 with a two-chunk view (a null chunk in front of a slice of the original) and copies nothing. Since the
 morning run `shift(by, fill, view=True)` returns exactly that — a `pyarrow.ChunkedArray` over the same
 device memory, 0.04 ms at 10M rows — and it is opt-in because the chunked form is not a `MetalArray`
 and cannot re-enter a kernel without being combined. The matrix keeps measuring the default, so the
 row stays here; a caller who wants Polars' answer has it.
 
-#### 3. Grouped variance and stddev in software binary64 (2 rows)
+#### 3. Grouped variance and stddev in software binary64 (2 comparisons)
 
 | operation | rows | ArrowMetal | pyarrow | ratio |
 |---|---:|---:|---:|---:|
@@ -441,7 +447,7 @@ the accumulation order (each lane emulating eight of the 256 logical slots), and
 says that is worth about 6 ms of the 15.4. It is not done here, and it would leave the sort's 10.8 ms
 untouched, so the honest ceiling for these two rows on this hardware is around 1.5x pyarrow, not 3x.
 
-#### 4. Grouped min at 1000 groups, 10M rows (1 row)
+#### 4. Grouped min at 1000 groups, 10M rows (1 comparison)
 
 | operation | rows | ArrowMetal | pyarrow | ratio |
 |---|---:|---:|---:|---:|
@@ -456,7 +462,7 @@ Since then the key-mapping change below has taken the operation to **1.66 ms** a
 in the same script (2.8x), and 5.71 ms against 18.5 at 50M rows (3.2x). The next matrix run should
 remove this row.
 
-#### 5. Regex on the host (1 row)
+#### 5. Regex on the host (1 comparison)
 
 | operation | rows | ArrowMetal | Polars | ratio |
 |---|---:|---:|---:|---:|
@@ -467,12 +473,12 @@ that clears rows that cannot match. At 10M rows the pre-filter wins 1.15x over P
 pyarrow; at 1M rows the host regex dominates. LIKE patterns and literal substrings are GPU kernels and
 win by 7–87x; only a genuine regex takes this path.
 
-#### 6. Noise on zero-cost rows (4 rows)
+#### 6. Noise on zero-cost rows (4 comparisons)
 
 `slice (zero-copy view)` reads 0.00 ms for every library — all are pointer arithmetic, and the ratio
 is measurement noise.
 
-### Faster, but under the 3x bar (93 rows)
+### Faster, but under the 3x bar (93 comparisons)
 
 The full list is in the matrix page under ⚠️. The clusters:
 
@@ -514,8 +520,9 @@ The full list is in the matrix page under ⚠️. The clusters:
 
 ### What changed since the morning run
 
-Compared with `full_matrix_2026-09-07-am.csv` on the same machine, 54 rows are faster and 13 read
-slower. The wins are the two changes recorded in the next section:
+Compared with `full_matrix_2026-09-07-am.csv` on the same machine, 55 rows are faster and 15 read
+slower — counting a row as moved when its ArrowMetal wall time changed by more than 10%, over the
+339 rows the two runs share (`full_matrix_2026-09-07.csv`). The wins are the two changes recorded in the next section:
 
 | operation | rows | morning | afternoon | fastest CPU now | ratio now |
 |---|---:|---:|---:|---:|---:|
@@ -657,7 +664,7 @@ the key kernel does not raise yet. That is the next step, and unlike the last on
 (It was taken; the last section of this page is what it measured.)
 
 **`shift`.** The copy is unchanged and is still the default, because it was never the thing that was
-wrong: 3.6 ms for the 813 MB it touches at 50M rows is 226 GB/s, this machine's bandwidth and rather
+wrong: 3.6 ms for the 800 MB it touches at 50M rows is 220 GB/s, rather
 more than the sqrt kernel next to it reaches, so a better kernel would still be fifty times slower than
 a pointer. What was missing was the option not to copy. `shift(by, fill, view=True)` in Python returns
 a `pyarrow.ChunkedArray` of two chunks — |by| rows of `fill` or of nulls in front, and a slice of the
@@ -767,7 +774,7 @@ and the sum hands back the accumulator's buffer with a GPU-built bitmap. `d_from
 rounded, so the quotient is bit for bit the host division's — checked over 1,762,240 group means
 across all eight integer element types, 0% and 10% value nulls, five row counts and five group counts,
 with zero differing bit patterns. Putting the accumulation and those finalizing kernels in one command
-buffer rather than three matters too: a command buffer is 100–150 µs whatever it carries, which is
+buffer rather than three matters too: a command buffer is 110–230 µs whatever it carries, which is
 nothing next to a 50-million-row pass and most of a group-by over a million rows.
 
 | operation, 1,000 groups | rows | before | after | pyarrow | before | after |
@@ -859,7 +866,7 @@ A column that *does* hold a -0.0 or a NaN still gets its answer from the keys, a
 positions the inverse cannot produce are copied back through the sorted row numbers: the run of zeros,
 the run of NaNs, the null block. Each is contiguous — they share a key — and each is found by a binary
 search over the sorted keys. Those columns keep the payload, so they win less: in the sweep at 50M rows
-they are 1.14x and 1.15x where the same column without them is 1.35–1.56x.
+they are 1.14x and 1.15x where the same column without them is 1.34–1.56x.
 
 | operation | rows | before | after | before | after |
 |---|---:|---:|---:|---:|---:|

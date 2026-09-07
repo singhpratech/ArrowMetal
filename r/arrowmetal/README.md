@@ -26,7 +26,7 @@ Full documentation, including installation, is in [`docs/R.md`](../../docs/R.md)
 | Query engine | `am_plan_source()`, `am_plan_run()`, `am_plan_explain()` |
 | Environment | `am_available()`, `am_load_error()`, `am_lib_path()`, `am_version()`, `am_device_name()`, `am_buffer_alignment()` |
 
-This binding resolves 34 of the C ABI's 200-plus entry points. Everything not in the table above —
+This binding resolves 34 of the C ABI's 222 entry points. Everything not in the table above —
 string kernels, temporal kernels, casts, arithmetic, joins, Parquet, the streaming engine — is
 reachable from Python or Swift but not yet from R.
 
@@ -105,15 +105,15 @@ enough to move a headline:
 | `am_sum(a)` — import + sum | 3.29 / 6.36 ms | 2.75 / 3.20 ms |
 | `sum(x)` — base R double vector | 11.15 / 11.60 ms | 11.15 / 11.61 ms |
 
-**Resident `sum` is not separable from arrow's.** It measures anywhere from **0.6 to 1.4 ms
-depending on the process** — the per-process medians came out 0.57, 0.59, 0.60, 0.60, 0.78 in one
-replicate and 0.86, 1.38, 1.38, 1.39, 1.54 in the next, straddling arrow's, which is tight at 1.14
-to 1.27 across all ten. So it lands either side of arrow's 1.24 ms depending on which replicate you
-run, and **no win or loss should be claimed for that row.**
+**Resident `sum` is not separable from arrow's.** It measures anywhere from **0.57 to 1.54 ms
+depending on the process**. In the isolated mode: the per-process medians came out 0.57, 0.59, 0.60,
+0.60, 0.78 in one replicate and 0.86, 1.38, 1.38, 1.39, 1.54 in the next, straddling arrow's, which
+is tight at 1.14 to 1.27 across all ten. So it lands either side of arrow's 1.16 ms isolated median
+depending on which replicate you run, and **no win or loss should be claimed for that row.**
 
 **`sum` including the import does reproduce as a loss**: 3.20 ms against arrow's 1.31 ms
-interleaved, **2.4× slower**, in every replicate. A sum is one bandwidth-bound pass over 80 MB with
-no arithmetic to hide the transfer behind.
+interleaved, **2.4× slower**, in every replicate. A sum is one bandwidth-bound pass over 80 MB
+(decimal MB; 76 MiB) with no arithmetic to hide the transfer behind.
 
 ### `filter` (`x > 0.5`, ~5M rows out)
 
@@ -164,10 +164,12 @@ idle Mac.
 
 ## Tests
 
-266 testthat tests, all passing, comparing against base R and against `arrow`'s own kernels on the
-same data: nulls, all-null and empty columns, sliced input, lengths of 1, 33, 1024, 65537 and
-1,000,001 (crossing a threadgroup boundary), int64 above 2^53, float32, strings and booleans, and
-every error path. `R CMD check --no-manual` is clean: 0 errors, 0 warnings, 0 notes.
+65 `test_that()` blocks, 266 passing expectations, comparing against base R and against `arrow`'s
+own kernels on the same data: nulls, all-null and empty columns, sliced input, lengths of 1, 33,
+1024, 65537 and 1,000,001 (crossing a threadgroup boundary), int64 above 2^53, float32, strings and
+booleans, and every error path.
+`R CMD build r/arrowmetal && R CMD check --no-manual arrowmetal_0.1.0.tar.gz` is clean: 0 errors,
+0 warnings, 0 notes.
 
 ```
 ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib Rscript -e 'testthat::test_local("r/arrowmetal")'

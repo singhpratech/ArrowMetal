@@ -1013,8 +1013,9 @@ def test_iso_calendar_and_year_month_day_match_pyarrow():
     assert got.to_arrow().type == expected.type
     assert got.to_arrow().to_pylist() == expected.to_pylist()
 
-    # pyarrow 25.0.1's own `year_month_day` kernel segfaults on arrays of this size, so the oracle
-    # here is its year / month / day kernels, which compute exactly the same three fields.
+    # A single unreproduced segfault was once seen a few allocations after pyarrow 25.0.1's own
+    # `year_month_day`, so out of caution the oracle here is its year / month / day kernels, which
+    # compute exactly the same three fields.
     ymd = col.year_month_day()
     assert ymd.format == "+s"
     assert ymd.to_arrow().type == pa.struct([("year", pa.int64()), ("month", pa.int64()),
