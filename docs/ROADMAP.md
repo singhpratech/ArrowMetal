@@ -33,7 +33,7 @@ the measured state behind each item is in [LOSSES.md](LOSSES.md) and the benchma
 - **DuckDB:** an optimizer rule that pushes scan, filter and aggregate down into the extension. Needs
   DuckDB.
 - **pandas:** a stable extension-array hook for compute kernels, so the accelerator stops patching.
-- **Apache Arrow:** an upstream conformance test for `ARROW_DEVICE_METAL`.
+- **Apache Arrow:** a round-trip test between ArrowMetal and nanoarrow's experimental Metal device implementation (memory only today), so the two agree on `ARROW_DEVICE_METAL`.
 - **DataFusion, Ibis, Lance, Hugging Face datasets, MLX:** one operator, one backend, one scan, one
   map step, one zero-copy handoff, respectively.
 
