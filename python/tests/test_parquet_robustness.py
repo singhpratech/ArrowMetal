@@ -312,3 +312,41 @@ def test_duplicate_projection_names(workdir):
     path = _write(workdir, "dup.parquet", pa.table({"a": pa.array([1, 2, 3], pa.int64())}))
     with am.ParquetFile(path) as f:
         assert f.read_table(columns=["a", "a"]).column_names == ["a", "a"]
+
+
+# --------------------------------------------------------------------------------------------
+# Two contracts the docs state that the code does not keep.
+
+@pytest.mark.xfail(strict=True, reason="REVIEW: read_parquet defaults to dictionary=True, and no "
+                                       "reduction accepts a dictionary array, so the documented "
+                                       "`am.read_parquet(p)['price'].sum()` raises on any column "
+                                       "pyarrow dictionary-encoded (which is its default)")
+def test_reduction_on_a_dictionary_encoded_column(workdir):
+    """The example in `read_parquet`'s docstring and in docs/PARQUET.md, run as written."""
+    path = _write(workdir, "dictred.parquet",
+                  pa.table({"price": pa.array([float(i % 97) for i in range(20000)], pa.float64())}),
+                  compression="snappy", use_dictionary=True)
+    cols = am.read_parquet(path, columns=["price"])
+    assert cols["price"].sum() == sum(float(i % 97) for i in range(20000))
+
+
+@pytest.mark.xfail(strict=True, reason="REVIEW: the argument-validation paths return 2 without "
+                                       "calling setError, so am_last_error() still holds an "
+                                       "unrelated earlier failure and the caller is told the wrong "
+                                       "thing")
+def test_argument_errors_set_an_error_message(workdir):
+    """`return 2` must leave a message behind, or the C caller reads a stale one."""
+    import ctypes
+    from arrowmetal import _lib, _P
+
+    path = _write(workdir, "errmsg.parquet", pa.table({"a": pa.array([1, 2, 3], pa.int64())}))
+    with am.ParquetFile(path) as f:
+        # Seed the thread-local slot with an unrelated failure.
+        with pytest.raises(am.ArrowMetalError):
+            f.read(columns=["nope"])
+        # Now fail on a NULL out-pointer, which is a different failure entirely.
+        rc = _lib.am_parquet_read_ex(f._h, None, 0, None, 0, None, 1, None)
+        assert rc != 0
+        message = (_lib.am_last_error() or b"").decode()
+        assert "no column named nope" not in message, "stale message: %r" % message
+        assert message, "no message at all for a NULL out-pointer"

@@ -137,6 +137,9 @@ real pages have tens of thousands of small tokens rather than a few large ones. 
   token reads only the input and skips the barrier.
 
 Per-block status codes are written back so corrupt input becomes an error instead of silently wrong data.
+A page that decompresses to nonsense is a separate question: the value decoders clamp what they read to
+the page they were given (a `BYTE_ARRAY` length field, for instance), so damaged bytes produce wrong
+*values* but never an out-of-bounds access and never an unbounded loop.
 
 `ZSTD`, `GZIP` and `BROTLI` are decompressed on the host, straight into the shared-memory buffer the GPU
 decoders read, with pages spread across cores by `DispatchQueue.concurrentPerform`. GZIP and BROTLI go
@@ -227,7 +230,7 @@ let batch = try f.read(ParquetReadOptions(
 
 ```python
 cols = am.read_parquet("trades.parquet", columns=["price", "qty"],
-                       filters=[("price", ">", 100)])
+                       filters=[("price", ">", 100)], dictionary=False)
 total = cols["price"].sum()          # already on the GPU
 
 # Across several queries, keep the handle: mapping the file is a per-open cost.
@@ -366,9 +369,13 @@ Files it writes are read back byte-identically by ArrowMetal *and* by pyarrow �
   for element**, which checks the encodings against each other, plus known-value, type, list, statistics
   and projection tests.
 - `python/tests/test_parquet.py` reads **every fixture twice** — once on the GPU, once with
-  `pyarrow.parquet` — and asserts the values, nulls and types are identical: 91 checks over the fixture
+  `pyarrow.parquet` — and asserts the values, nulls and types are identical: 88 checks over the fixture
   set, plus projection, row-group selection, statistics pushdown, dictionary output, struct leaves and a
   50 M-row round trip behind `ARROWMETAL_PARQUET_BIG=1`.
+- `python/tests/test_parquet_robustness.py` damages a file two hundred ways — truncation, a broken magic,
+  a footer length larger than the file, single-byte damage in the footer and in the pages, a hand-built
+  footer nesting Thrift structs 60,000 deep, a 2^64 length, a `num_children` past the schema — and
+  requires every one of them to raise rather than crash, hang or read outside the mapping.
 - `ParquetWriterTests` and the Python writer test close the round trip.
 
 ```
@@ -393,6 +400,18 @@ ARROWMETAL_PARQUET_BIG=1 PYTHONPATH=python python -m pytest python/tests/test_pa
   `min_value`/`max_value` are absent (they use a signed byte order that is wrong for strings, which is why
   Parquet deprecated them).
 - **ZSTD needs libzstd** installed; see above.
+- **A timestamp column's time zone is not recovered.** Parquet records only `isAdjustedToUTC`, so an
+  adjusted column comes back as `timestamp[unit, tz=UTC]` where `pyarrow.parquet.read_table` reads the
+  original zone out of the file's `ARROW:schema` key/value metadata, which this reader ignores. The
+  instants are identical; the type differs for any zone other than UTC.
+- **`large_string`, `large_binary` and `large_list` come back 32-bit.** ArrowMetal narrows 64-bit offsets
+  everywhere, so a column pyarrow reads as `large_string` reads here as `string`, with the same values.
+- **`decimal256` (precision above 38) is rejected**, as is any Arrow type ArrowMetal does not carry.
+- **A `null`-typed column reads as an all-null `int32`**, because Parquet has no physical null type and
+  the Arrow `null` annotation lives in the metadata this reader ignores.
+- **Reductions do not accept a dictionary array**, and `read_parquet` returns dictionary-encoded columns
+  encoded by default: pass `dictionary=False` (as `read_parquet_table` does) before calling `sum`, `min`
+  or any other kernel on such a column.
 - **`PLAIN` `BYTE_ARRAY` pages are walked by one thread each** to find the value boundaries — the format
   gives no other option — so a byte-array column with a handful of very large pages has less parallelism
   than a wide one.
