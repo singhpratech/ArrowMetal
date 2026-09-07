@@ -10,11 +10,14 @@ private/
 # Local benchmark outputs
 Benchmarks/results/local/
 .claude/
-# Python build artifacts (the dylib is copied in by scripts/build_wheel.sh)
+# Python build artifacts (the dylib is copied in by python/build_wheel.sh)
+python/arrowmetal/_lib/
 python/arrowmetal/libArrowMetalC.dylib
 python/dist/
 python/build/
 python/*.egg-info/
+# Throwaway virtualenvs used to test a built wheel
+.venv*/
 __pycache__/
 *.py[co]
 .pytest_cache/

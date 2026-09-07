@@ -20,23 +20,48 @@ _AGG = {"sum": 0, "count": 1, "min": 2, "max": 3, "mean": 4, "count_values": 5}
 _STRUCT = {"c": "b", "C": "B", "s": "h", "S": "H", "i": "i", "I": "I", "l": "q", "L": "Q", "f": "f", "g": "d"}
 
 
-def _find_library():
-    env = os.environ.get("ARROWMETAL_LIB")
-    if env:
-        return env
+_LIB_NAME = "libArrowMetalC.dylib"
+
+
+def _library_candidates():
+    """Where libArrowMetalC.dylib is looked for, in order.
+
+    1. The copy bundled inside the wheel (`arrowmetal/_lib/`), so an installed package is
+       self-contained and needs no Swift toolchain.
+    2. `$ARROWMETAL_LIB`, an explicit full path to a dylib.
+    3. The development build in `.build/release` next to a source checkout (then `.build/debug`,
+       then the usual system prefixes).
+    """
     here = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.join(here, "libArrowMetalC.dylib"),
-        os.path.join(here, "..", "..", ".build", "release", "libArrowMetalC.dylib"),
-        os.path.join(here, "..", "..", ".build", "debug", "libArrowMetalC.dylib"),
-        "/usr/local/lib/libArrowMetalC.dylib",
-        "/opt/homebrew/lib/libArrowMetalC.dylib",
+    root = os.path.join(here, "..", "..")
+    env = os.environ.get("ARROWMETAL_LIB")
+    return [
+        ("bundled in the wheel", os.path.join(here, "_lib", _LIB_NAME)),
+        # The pre-0.1 layout kept the bundled dylib in the package root; still honoured.
+        ("bundled in the wheel", os.path.join(here, _LIB_NAME)),
+        ("$ARROWMETAL_LIB", env),
+        ("development build", os.path.join(root, ".build", "release", _LIB_NAME)),
+        ("development build", os.path.join(root, ".build", "debug", _LIB_NAME)),
+        ("system prefix", "/usr/local/lib/" + _LIB_NAME),
+        ("system prefix", "/opt/homebrew/lib/" + _LIB_NAME),
     ]
-    for c in candidates:
-        if os.path.exists(c):
-            return c
-    raise OSError("libArrowMetalC.dylib not found; build with `swift build -c release --product ArrowMetalC` "
-                  "or set ARROWMETAL_LIB")
+
+
+def _find_library():
+    for _, path in _library_candidates():
+        if path and os.path.exists(path):
+            return path
+    raise OSError(
+        "arrowmetal: {} not found. Looked, in order, for\n"
+        "  1. the copy bundled in the installed package (arrowmetal/_lib/{}) -- "
+        "install a wheel built by python/build_wheel.sh to get one;\n"
+        "  2. $ARROWMETAL_LIB, which is {} -- set it to the full path of a dylib;\n"
+        "  3. the development build .build/release/{} beside a source checkout -- "
+        "build one with `swift build -c release --product ArrowMetalC`.".format(
+            _LIB_NAME, _LIB_NAME,
+            "unset" if not os.environ.get("ARROWMETAL_LIB")
+            else "set to " + os.environ["ARROWMETAL_LIB"] + ", which does not exist",
+            _LIB_NAME))
 
 
 _lib = ctypes.CDLL(_find_library())
