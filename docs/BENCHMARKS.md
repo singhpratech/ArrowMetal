@@ -1,10 +1,41 @@
 # Benchmark history
 
+## 2026-09-07, Apple M4 Max, round 9: the parallel baseline
+
+The matrix now measures every CPU library **twice**: its plain eager idiom, and the most parallel
+idiom it has for the same answer — `polars-lazy` is the same expression through `pl.LazyFrame`
+collected on the in-memory or the streaming engine, `pyarrow-threaded` is an Acero plan over the same
+values split into 16 record batches. pandas has no parallel idiom and says so in its own row; numpy's
+ufuncs are single-threaded and say the same. "Fastest CPU" is now the best wall time of *all* of those
+idioms, and the `note` column of each CSV row names the exact idiom that was run.
+
+The reason is in `Benchmarks/results/full_matrix_2026-09-07-parallel_cores.txt`, which reports
+`cpu_ms / wall_ms` per idiom over every measured row: the eager idioms use a median of **1.0 core** on
+most families however many threads their pool has, while Polars lazy uses a median of **11.5** and
+pyarrow through Acero **11.1**. A comparison against one core is not the comparison this project wants
+to make.
+
+Against that baseline, of **339 measured rows: 145 at or above 3x, 102 between 1x and 3x, 77 slower
+than the fastest CPU idiom, 15 with no CPU equivalent.** Against the eager idioms alone, the same
+build had 247 rows at or above 3x, 62 between, 15 slower and 15 without an equivalent
+(`Benchmarks/results/full_matrix_2026-09-07.csv`). Both CSVs are kept. The 77 slower rows are grouped
+by measured cause, with what would change each one, in [LOSSES.md](LOSSES.md); the row-by-row tables
+are in [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md).
+
+Ten ArrowMetal rows that a regression check flagged against the eager run were re-measured on a
+quieter machine and eight of them spliced back into the parallel CSV in place; those rows say so in
+their `note` column.
+
+Reproduce with `PYTHONPATH=python python Benchmarks/full_matrix.py` (add `--cores` for the cores
+table, `--verify` to assert the eager and parallel idioms return the same answer).
+
 ## 2026-09-06, Apple M4 Max, round 8: what real binary64 costs
 
-> **Superseded by the 2026-09-07 matrix** — `sqrt` is now 3.95 ms at 50M rows, 3.1x the fastest CPU
-> library (`Benchmarks/results/full_matrix_2026-09-07.csv`), so re-running the reproduce line below will
-> not produce the table that follows it. Kept for the before/after of removing the float detour.
+> **Superseded by the 2026-09-07 matrix** — `sqrt` is now 3.92 ms at 50M rows, which is 3.2x the
+> fastest *eager* CPU library and 0.87x the fastest parallel one (Polars lazy at 3.42 ms on 12.7
+> cores; `Benchmarks/results/full_matrix_2026-09-07-parallel.csv`), so re-running the reproduce line
+> below will not produce the table that follows it. Kept for the before/after of removing the float
+> detour.
 
 50M Float64 rows, best of 5, release build, against numpy 2.5, pyarrow 25 and Polars 1.44 on the same
 data. Reproduce with `PYTHONPATH=python python Benchmarks/float64_math_bench.py`.

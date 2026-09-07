@@ -293,6 +293,15 @@ Quality
   the same within 1e-9 relative, reporting the comparisons deliberately skipped (t-digest's partition-dependent
   sketch, pyarrow's threaded grouped `list`) separately; `--cores` and `full_matrix_<date>_cores.txt` report
   cpu_ms/wall_ms per idiom; "fastest CPU" in the report is the best of every idiom, named.
+- 2026-09-07: the published baseline is now that parallel one (`Benchmarks/results/full_matrix_2026-09-07-parallel.csv`,
+  cores per idiom in `full_matrix_2026-09-07-parallel_cores.txt`: Polars lazy a median of 11.5 cores, pyarrow through
+  Acero 11.1, the eager idioms 1.0 on most families). Of 339 measured rows: **145 at or above 3x, 102 between 1x and
+  3x, 77 slower than the fastest CPU idiom, 15 with no CPU equivalent** — against the eager idioms alone the same
+  build read 247 / 62 / 15 / 15, and that CSV (`full_matrix_2026-09-07.csv`) is kept. Ten ArrowMetal rows a
+  regression check flagged were re-measured on a quieter machine and eight spliced in place, each saying so in its
+  `note`. docs/BENCHMARKS_MATRIX.md, docs/BENCHMARKS.md, docs/LOSSES.md and the README are written against the
+  parallel baseline; the 77 slower rows are grouped by measured cause in docs/LOSSES.md, each with what would
+  change it.
 - Adversarial review pass before release (four independent reviewers over the integrations, the engine and
   expression compiler, the GPU kernels, and the C ABI and Parquet reader): every finding carries a
   regression test; the fixes are the "Fixed" bullets above and the entries in docs/EVALUATION.md.

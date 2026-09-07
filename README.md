@@ -9,13 +9,16 @@ C Device Data Interface (`ARROW_DEVICE_METAL`).
 
 ## The pitch in one paragraph
 
-Every array is Arrow layout in memory the GPU already shares, so there is nothing to upload. Reductions,
-filters, gathers and group-by run on the GPU 1.2x to 3.5x faster than all 16 CPU cores and 7x to 29x faster
-than Polars in the tables below — the full distribution over all 339 measured rows, wider in both
-directions, is in [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MATRIX.md) — and while they run the CPU is
-free for the rest of the application: the benchmark tables
-report CPU time per operation next to wall time. Chains of operations share one GPU round trip. The whole
-thing is reachable from Swift, Python, and any language with Arrow bindings through one C ABI.
+Every array is Arrow layout in memory the GPU already shares, so there is nothing to upload. Gathers,
+group-by, sorts and string scans run on the GPU 3.8x to 24x faster than the fastest CPU idiom in the
+table below — and that baseline is each library's *most parallel* idiom, Polars' lazy engine and
+pyarrow's Acero, using eleven to fifteen of the sixteen cores. While they run the CPU is free for the
+rest of the application: every table here reports CPU time per operation next to wall time, and the
+same rows cost 26 to 1,284 CPU-ms on the other side against one or two here. Chains of operations
+share one GPU round trip. The whole thing is reachable from Swift, Python, and any language with Arrow
+bindings through one C ABI. The full distribution over all 339 measured rows — including the 77 that
+are still slower — is in [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MATRIX.md) and
+[docs/LOSSES.md](docs/LOSSES.md).
 
 ## Why this exists
 
@@ -41,20 +44,29 @@ Apple M4 Max (16 CPU cores), 50,000,000 rows (10,000,000 for the string row), be
 after a warm-up, release build. Full history and methodology in [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
 and [Benchmarks/README.md](Benchmarks/README.md).
 
-**Called from Python, same in-process data**, against Polars (16 threads), pyarrow.compute and pandas.
-Every row below is taken from `Benchmarks/results/full_matrix_2026-09-07.csv`, the raw output behind
-[docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MATRIX.md). Wall time, with the CPU time each call consumed in
-parentheses:
+**Called from Python, same in-process data.** Every CPU library is measured twice — its plain eager
+idiom, and the most parallel idiom it has for the same answer: `polars-lazy` through `pl.LazyFrame` on
+the in-memory or streaming engine, `pyarrow-threaded` through an Acero plan over 16 record batches
+(pandas has no parallel idiom; numpy's ufuncs are single-threaded). The baseline below is the **fastest
+of all of them**, named, with the cores that call actually used (its CPU-ms over its wall ms). Every
+row is taken from `Benchmarks/results/full_matrix_2026-09-07-parallel.csv`, the raw output behind
+[docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MATRIX.md); the eager-only run of the same build is kept
+beside it as `full_matrix_2026-09-07.csv`. Wall time in milliseconds, with the CPU time each call
+consumed in parentheses. The last three rows are losses, and they are here for the same reason the
+first seven are:
 
-| Operation | ArrowMetal | Polars | pyarrow | pandas |
-|---|---:|---:|---:|---:|
-| sum Int64, 10% nulls | **1.07 ms** (0.4 CPU-ms) | 15.61 (15.6) | 51.79 (51.8) | 51.54 (51.5) |
-| filter Int64 (30% kept) | **2.31** (0.7) | 17.33 (17.3) | 125.10 (125.1) | 160.10 (160.1) |
-| take 25M random indices | **5.89** (0.7) | 169.08 (169.1) | 141.96 (142.0) | 170.64 (170.6) |
-| group-by sum, 1000 keys | **8.83** (2.1) | 81.92 (1170.4) | 18.81 (242.8) | 224.77 (224.8) |
-| filter two columns + sum | **3.54** (1.8) | 21.12 (34.5) | 63.02 (63.0) | 113.57 (113.6, numpy) |
-| sort Float64, 50M rows | **49.59** (1.3) | 132.40 (1282.9) | 6038.91 (6038.4) | 1761.55 (1761.4, numpy) |
-| string `contains`, 10M utf8 | **1.65** (0.4) | 143.91 (143.9) | 126.19 (126.2) | 123.39 (123.4) |
+| Operation | Rows | ArrowMetal ms (CPU-ms) | fastest CPU idiom | its ms (CPU-ms) | its cores | speedup |
+|---|---:|---:|---|---:|---:|---:|
+| sum int64, 10% nulls | 50,000,000 | 1.11 (0.4) | Polars lazy | 2.30 (26) | 11.1 | 2.1x |
+| filter int64 (30% kept) | 50,000,000 | 2.23 (0.7) | Polars lazy | 2.85 (36) | 12.6 | 1.3x |
+| take 25M random indices | 50,000,000 | 5.90 (0.8) | pyarrow | 143 (143) | 1.0 | **24.2x** |
+| group-by sum, 1000 keys | 50,000,000 | 4.89 (1.2) | pyarrow Acero | 18.45 (250) | 13.6 | **3.8x** |
+| filter two columns + sum | 50,000,000 | 3.53 (1.7) | Polars lazy | 2.92 (41) | 13.9 | 0.83x |
+| sort float64 | 50,000,000 | 32.12 (1.3) | Polars | 133 (1,284) | 9.7 | **4.1x** |
+| string contains, literal | 10,000,000 | 1.64 (0.4) | Polars lazy | 11.47 (173) | 15.0 | **7.0x** |
+| ln (float64) | 50,000,000 | 81.31 (0.5) | Polars lazy | 8.46 (120) | 14.2 | 0.10x |
+| temporal year | 50,000,000 | 26.82 (0.4) | pyarrow Acero | 17.91 (246) | 13.7 | 0.67x |
+| shift (lag 1, int64) | 50,000,000 | 3.58 (0.9) | Polars lazy | 0.03 (0) | 2.2 | 0.01x |
 
 **Swift, against all 16 CPU cores** (tight typed loops over the same Arrow layout) and Accelerate. These
 are the Swift-level baselines of rounds 6 and 7 in [docs/BENCHMARKS.md](docs/BENCHMARKS.md), measured
@@ -78,14 +90,25 @@ matrix above measures:
 | sort Float64, 50M rows | **138.52** | 591.97 (chunk sort + merge tree) |
 | string `contains`, 10M utf8 | **1.65** | 17.77 |
 
-Takeaways: reductions, comparisons, selection, group-by and query-shaped pipelines beat all 16 CPU cores by
-1.2x to 3.5x and Polars by 6x to 29x in the two tables above; across all 339 rows of the matrix the spread is
-wider both ways. Sorting (GPU LSD radix) is 4.3x all 16 cores; string predicates are the widest margin of
-all — `contains` above is 87x Polars, and across the matrix's string family the predicates run 19x to 147x
-against Polars and pyarrow at 10M rows, the one exception being a pattern that is a real regex rather than
-a literal, at 1.1x. Pure element-wise arithmetic is memory bound on both sides, so
-Accelerate on 16 cores ties or edges ahead there. Arrays under about a million rows are dominated by the
-fixed cost of a GPU dispatch (see [docs/DESIGN.md](docs/DESIGN.md) for the pipelining plan).
+Takeaways, all against the fastest idiom of any CPU library. **Where the GPU wins it wins on shape,
+not on effort:** gathers (`take`, 24.2x), multi-key and high-cardinality group-by (`lexsort` 24.0x,
+`sum by int32 key` 3.8x at a thousand groups and 6.3x at a hundred thousand), sorts (`argsort int64`
+7.7x, `sort float64` 4.1x) and GPU string predicates (`contains` 7.0x at 10M rows; the family's GPU
+predicates run 1.6x to 7.0x against Polars lazy and Acero). The group-by family is 65 of 84 rows at or
+above 3x. **Where it does not, it mostly ties:** a single pass that reads one column and writes one is
+memory bound on both sides, and eleven to fifteen cores reach the same unified memory the GPU does, so
+there is no 3x on that shape for anybody.
+
+**Across all 339 rows the verdicts are 145 at or above 3x, 102 between 1x and 3x, 77 slower than the
+fastest CPU idiom, and 15 with no CPU equivalent.** The 77 are concentrated where you would expect
+them: 17 element-wise and 11 compare+select rows that are bandwidth ties, 13 string rows (ten of them
+at a million rows, where the fixed cost per call is the operation; seven of those ten are wins at ten
+million), 10
+temporal rows where a calendar conversion is arithmetic per element rather than bytes per second, the
+9 latency rows that exist to measure the dispatch floor, and the software binary64 transcendentals,
+which cost forty-odd emulated operations per element on a GPU with no double hardware. Every one of
+them is listed with its cause and with what would change it in [docs/LOSSES.md](docs/LOSSES.md), and
+[docs/DESIGN.md](docs/DESIGN.md) has the pipelining plan for the dispatch floor.
 
 ## From Python
 
