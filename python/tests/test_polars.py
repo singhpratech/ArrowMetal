@@ -545,3 +545,51 @@ def test_50m_sum_matches_polars(big_series):
     expected = BIG * (BIG - 1) // 2
     assert big_series.arrowmetal.sum() == expected
     assert big_series.sum() == expected
+
+
+# ---------------------------------------------------------------------------------------------
+# Regression tests from the pre-release integration review.
+# ---------------------------------------------------------------------------------------------
+
+def test_group_by_agg_alias_may_not_shadow_a_key():
+    """An aggregate named after a key column used to overwrite the key silently.
+
+    `agg` builds `out = self._key_frame()` and then assigns `out[alias]`, so an `alias` equal to a
+    key name replaced the key values with the aggregate: the caller got a frame of the right shape
+    whose "key" column was not keys at all, with no error anywhere.
+    """
+    df = pl.DataFrame({"k": [1, 1, 2], "v": [10, 20, 30]})
+    with pytest.raises(am.ArrowMetalError, match="key column"):
+        df.arrowmetal.group_by("k").agg(k=("v", "sum"))
+    with pytest.raises(am.ArrowMetalError, match="key column"):
+        df.arrowmetal.group_by("k").sum("k", "v")
+    out = df.arrowmetal.group_by("k").agg(total=("v", "sum"))
+    assert out.columns == ["k", "total"]
+    assert out["k"].to_list() == [1, 2]
+    assert out["total"].to_list() == [30, 30]
+
+
+def test_zero_copy_report_answers_for_a_dataframe():
+    """`am.zero_copy_report` documents "a Polars Series/DataFrame"; the DataFrame half raised
+    AttributeError("'DataFrame' object has no attribute 'buffers'")."""
+    df = pl.DataFrame({"a": np.arange(1 << 20, dtype=np.int64),
+                       "b": np.arange(1 << 20, dtype=np.float64)})
+    report = am.zero_copy_report(df)
+    assert set(report) == {"a", "b"}
+    for name, (src, dst, same) in report.items():
+        assert src is not None and dst is not None, name
+        assert same is (src == dst)
+    assert am.zero_copy(df) is all(v[2] for v in report.values())
+    src, dst, same = am.zero_copy_report(df["a"])       # the Series form is unchanged
+    assert same is (src == dst)
+
+
+def test_unique_is_first_seen_and_keeps_nulls():
+    """docs/POLARS.md promised `unique()` was "ascending" and the docstring said "non-null". It is
+    neither: `am_unique` answers in first-seen order and carries a null through."""
+    s = pl.Series("x", [3, 1, None, 3, 2])
+    assert s.arrowmetal.unique().to_list() == [3, 1, None, 2]
+    assert pl.Series("s", ["z", "a", "z", "m"]).arrowmetal.unique().to_list() == ["z", "a", "m"]
+    rng = np.random.default_rng(0)
+    big = pl.Series("x", rng.integers(0, 10, 200_000))
+    assert big.arrowmetal.unique().to_list() == list(dict.fromkeys(big.to_list()))

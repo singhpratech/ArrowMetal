@@ -126,7 +126,7 @@ aggregate after that reuses it, so `.agg(...)` with six outputs costs **one** gr
 | `top_k` / `bottom_k` | `am_top_k` + `am_take` | GPU radix sort |
 | `sort` / `arg_sort` | `am_sort` / `am_argsort` | stable, nulls last, NaN after +inf |
 | `filter` | `am_filter` | GPU stream compaction |
-| `unique` | `am_unique` | **ascending**, where Polars makes no order promise |
+| `unique` | `am_unique` | **first-seen** order, nulls kept; Polars' plain `unique()` promises no order |
 | `hash64` | `am_hash64` (strings: `am_str_unary` kind 2) | Arrow-equal values hash equal |
 | `contains` / `starts_with` / `ends_with` | `am_str_match` | literal, not regex |
 | `upper` / `lower` | `am_str_transform` 2/3 | simple 1:1 case mapping, see limits |
@@ -376,7 +376,9 @@ from 4096 distinct values.
 Float32/64, Boolean, Date, Datetime (all units), Time, Duration, String, Binary. `Categorical` and
 `Enum` also work, but Polars encodes them as `dictionary<uint32>` and `dictionary<uint8>` while
 ArrowMetal wants int32 or int64 indices, so the bridge recodes the index buffer -- 4 bytes a row,
-values untouched. Nested types (`List`, `Struct`, `Array`) and `Object` are not bridged.
+values untouched. An `Enum` comes back from `to_polars` as a `Categorical`: the dictionary crosses,
+the fact that its value set was closed does not. `List` and `Struct` cross and round-trip, but only
+the structural kernels operate on them -- you cannot sum or group by one. `Object` is not bridged.
 
 **Chunking.** ArrowMetal takes one Arrow array. A multi-chunk Series is rechunked once, which does
 copy; `am.from_polars(s, rechunk=False)` raises instead, so the copy is never silent.
@@ -384,8 +386,10 @@ copy; `am.from_polars(s, rechunk=False)` raises instead, so the copy is never si
 **Order.** Group order is ArrowMetal's, not Polars': ascending by key for numeric, boolean,
 temporal and decimal keys, first-seen for utf8 and binary, lexicographic in column order for
 several keys. Polars' `group_by` promises no order at all, so sort both sides before comparing.
-`s.arrowmetal.unique()` is ascending. Sorts put nulls last in **both** directions, where Polars'
-ascending default is nulls first -- pass `nulls_last=True` when comparing.
+`s.arrowmetal.unique()` is **first-seen**, the order Polars' `unique(maintain_order=True)` gives,
+and it keeps a null as one of the distinct values rather than dropping it. Sorts put nulls last in
+**both** directions, where Polars' ascending default is nulls first -- pass `nulls_last=True` when
+comparing.
 
 **Strings.** `upper`/`lower` are the simple 1:1 case mapping over Basic Latin, Latin-1 Supplement
 and Latin Extended-A. Everything above U+017F passes through unchanged and the multi-character
