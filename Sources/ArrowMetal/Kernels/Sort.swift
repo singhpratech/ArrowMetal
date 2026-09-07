@@ -7,7 +7,9 @@ extension MetalArray {
     /// `descending` picks the direction and `nullPlacement` decides whether the null rows sit after every
     /// value (Arrow's default) or before every one of them; the two are independent, exactly as in Arrow,
     /// so nulls stay at the chosen end in both directions. NaN sorts after +inf (total order). Runs an
-    /// LSD radix sort on the GPU (4 passes for 32-bit, 8 for 64-bit).
+    /// LSD radix sort on the GPU over 8-bit digits: four passes for a 32-bit key, eight for a 64-bit
+    /// one, minus any pass whose digit is the same in every row, which is an identity permutation and
+    /// is dropped (see below).
     public func argsort(descending: Bool = false,
                         nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
         try Dispatch.checkLength(length)
@@ -16,8 +18,10 @@ extension MetalArray {
         if n == 0 { return try MetalArray<Int32>([Int32](), context: ctx) }
         let wide = T.byteWidth == 8
         let keyType = wide ? "ulong" : "uint"
+        let bits = SortSource.digitBits
+        let radix = 1 << bits
         let src = SortSource.source(K: keyType)
-        func p(_ f: String) throws -> MTLComputePipelineState { try ctx.pipeline(source: src, function: f, cacheKey: "sort/\(keyType)/\(f)") }
+        func p(_ f: String) throws -> MTLComputePipelineState { try ctx.pipeline(source: src, function: f, cacheKey: "sort/\(keyType)/\(bits)/\(f)") }
         // Narrow types widen to 32-bit keys; the mapping kernel expects the source width, so cast first.
         let mapFn: String
         let source: MetalArrowBuffer
@@ -38,17 +42,26 @@ extension MetalArray {
         var keysB = try MetalArrowBuffer.allocate(byteCount: n * kb, zeroed: false, context: ctx)
         var valsA = try MetalArrowBuffer.allocate(byteCount: n * 4, zeroed: false, context: ctx)
         var valsB = try MetalArrowBuffer.allocate(byteCount: n * 4, zeroed: false, context: ctx)
-        // A fixed 4096 elements per block leaves a small sort on a handful of threadgroups: a 20k-element
-        // argsort (the size top-k's final ordering lands on) would run on five. Halve the block until there
-        // are at least 64 of them; inputs above ~256k are unaffected.
-        var elemsPerBlock = 4096
+        // Each block reads and writes `radix` entries of the counts table on every pass, at a stride of
+        // `blocks`, and the scan below is a *single* threadgroup over `radix * blocks` entries, so both
+        // fixed costs fall as blocks get bigger and fewer; against that, too few blocks leaves GPU cores
+        // idle. The scatter is memory bound, which pushes the balance a long way towards fewer: at 50M
+        // int64 rows argsort measures 37.7 ms at 128 blocks, 49.0 ms at 256 and 55.8 ms at 2048.
+        // Small inputs keep the old rule instead — a 20k-element argsort (the size top-k's final
+        // ordering lands on) must not run on five threadgroups — so the block halves until there are at
+        // least 64 of them, and never holds fewer than 4096 elements.
+        var elemsPerBlock = Swift.max(4096, ((n + 127) / 128 + 255) / 256 * 256)
         while elemsPerBlock > 256 && (n + elemsPerBlock - 1) / elemsPerBlock < 64 { elemsPerBlock >>= 1 }
         let blocks = (n + elemsPerBlock - 1) / elemsPerBlock
-        let counts = try MetalArrowBuffer.allocate(byteCount: 256 * blocks * 4, zeroed: false, context: ctx)
+        let counts = try MetalArrowBuffer.allocate(byteCount: radix * blocks * 4, zeroed: false, context: ctx)
+        let spanOr = try MetalArrowBuffer.allocate(byteCount: blocks * kb, zeroed: false, context: ctx)
+        let spanAnd = try MetalArrowBuffer.allocate(byteCount: blocks * kb, zeroed: false, context: ctx)
         let tg = MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1)
         let mapPSO = try p(mapFn), iotaPSO = try p("iota_u32"), histPSO = try p("radix_histogram"), scanPSO = try p("radix_scan"), scatPSO = try p("radix_scatter")
-        let passes = wide ? 8 : 4
-        try ctx.run { enc in
+        let passes = ((wide ? 64 : 32) + bits - 1) / bits
+        let blockGrid = MTLSize(width: blocks, height: 1, depth: 1)
+
+        func encodeMap(_ enc: MTLComputeCommandEncoder) {
             enc.setComputePipelineState(mapPSO)
             enc.setBuffer(source.mtl, offset: source.offset, index: 0)
             Dispatch.setLength(enc, n, nil, index: 1)
@@ -60,35 +73,78 @@ extension MetalArray {
             Dispatch.setLength(enc, n, nil, index: 1)
             Dispatch.dispatch1D(enc, iotaPSO, count: n)
             enc.memoryBarrier(scope: .buffers)
-            for pass in 0..<passes {
-                let shift = pass * 8
-                enc.setComputePipelineState(histPSO)
-                enc.setBuffer(keysA.mtl, offset: 0, index: 0)
-                Dispatch.setLength(enc, n, nil, index: 1)
-                Dispatch.setUInt(enc, shift, index: 2)
-                Dispatch.setUInt(enc, elemsPerBlock, index: 3)
-                Dispatch.setUInt(enc, blocks, index: 4)
-                enc.setBuffer(counts.mtl, offset: 0, index: 5)
-                enc.dispatchThreadgroups(MTLSize(width: blocks, height: 1, depth: 1), threadsPerThreadgroup: tg)
-                enc.memoryBarrier(scope: .buffers)
-                enc.setComputePipelineState(scanPSO)
-                enc.setBuffer(counts.mtl, offset: 0, index: 0)
-                Dispatch.setUInt(enc, 256 * blocks, index: 1)
-                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: tg)
-                enc.memoryBarrier(scope: .buffers)
-                enc.setComputePipelineState(scatPSO)
-                enc.setBuffer(keysA.mtl, offset: 0, index: 0)
-                enc.setBuffer(valsA.mtl, offset: 0, index: 1)
-                Dispatch.setLength(enc, n, nil, index: 2)
-                Dispatch.setUInt(enc, shift, index: 3)
-                Dispatch.setUInt(enc, elemsPerBlock, index: 4)
-                Dispatch.setUInt(enc, blocks, index: 5)
-                enc.setBuffer(counts.mtl, offset: 0, index: 6)
-                enc.setBuffer(keysB.mtl, offset: 0, index: 7)
-                enc.setBuffer(valsB.mtl, offset: 0, index: 8)
-                enc.dispatchThreadgroups(MTLSize(width: blocks, height: 1, depth: 1), threadsPerThreadgroup: tg)
-                enc.memoryBarrier(scope: .buffers)
-                swap(&keysA, &keysB); swap(&valsA, &valsB)
+        }
+        func encodeHistogram(_ enc: MTLComputeCommandEncoder, shift: Int) {
+            enc.setComputePipelineState(histPSO)
+            enc.setBuffer(keysA.mtl, offset: 0, index: 0)
+            Dispatch.setLength(enc, n, nil, index: 1)
+            Dispatch.setUInt(enc, shift, index: 2)
+            Dispatch.setUInt(enc, elemsPerBlock, index: 3)
+            Dispatch.setUInt(enc, blocks, index: 4)
+            enc.setBuffer(counts.mtl, offset: 0, index: 5)
+            enc.setBuffer(spanOr.mtl, offset: 0, index: 6)
+            enc.setBuffer(spanAnd.mtl, offset: 0, index: 7)
+            enc.dispatchThreadgroups(blockGrid, threadsPerThreadgroup: tg)
+            enc.memoryBarrier(scope: .buffers)
+        }
+        func encodeScanAndScatter(_ enc: MTLComputeCommandEncoder, shift: Int) {
+            enc.setComputePipelineState(scanPSO)
+            enc.setBuffer(counts.mtl, offset: 0, index: 0)
+            Dispatch.setUInt(enc, radix * blocks, index: 1)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: tg)
+            enc.memoryBarrier(scope: .buffers)
+            enc.setComputePipelineState(scatPSO)
+            enc.setBuffer(keysA.mtl, offset: 0, index: 0)
+            enc.setBuffer(valsA.mtl, offset: 0, index: 1)
+            Dispatch.setLength(enc, n, nil, index: 2)
+            Dispatch.setUInt(enc, shift, index: 3)
+            Dispatch.setUInt(enc, elemsPerBlock, index: 4)
+            Dispatch.setUInt(enc, blocks, index: 5)
+            enc.setBuffer(counts.mtl, offset: 0, index: 6)
+            enc.setBuffer(keysB.mtl, offset: 0, index: 7)
+            enc.setBuffer(valsB.mtl, offset: 0, index: 8)
+            enc.dispatchThreadgroups(blockGrid, threadsPerThreadgroup: tg)
+            enc.memoryBarrier(scope: .buffers)
+            swap(&keysA, &keysB); swap(&valsA, &valsB)
+        }
+
+        // A pass whose digit is the same in every row is the identity permutation — the sort is stable,
+        // so equal digits keep their order — and can be dropped entirely. The first histogram reports
+        // the bitwise OR and AND of the keys along with its counts, and `or ^ and` is exactly the set of
+        // bits that differ somewhere in the column, so one readback names every skippable pass at once.
+        // A narrow range (sorted-ish data, small integers, a column of one repeated value) can lose most
+        // of the passes this way. The readback costs a command-buffer boundary, so inputs small enough
+        // for that to matter keep the whole sort in one buffer and run every pass.
+        var activePasses = Array(0..<passes)
+        let analyse = n >= 1 << 18
+        if analyse {
+            try ctx.run { enc in
+                encodeMap(enc)
+                encodeHistogram(enc, shift: 0)
+            }
+            try ctx.syncPoint()
+            var differing: UInt64 = 0
+            withExtendedLifetime((spanOr, spanAnd)) {
+                var o: UInt64 = 0, a: UInt64 = .max
+                if wide {
+                    let po = spanOr.typed(UInt64.self), pa = spanAnd.typed(UInt64.self)
+                    for b in 0..<blocks { o |= po[b]; a &= pa[b] }
+                } else {
+                    let po = spanOr.typed(UInt32.self), pa = spanAnd.typed(UInt32.self)
+                    for b in 0..<blocks { o |= UInt64(po[b]); a &= UInt64(pa[b]) }
+                }
+                differing = o ^ a
+            }
+            let mask = UInt64(radix - 1)
+            activePasses = (0..<passes).filter { (differing >> UInt64($0 * bits)) & mask != 0 }
+        }
+        try ctx.run { enc in
+            if !analyse { encodeMap(enc) }
+            for (i, pass) in activePasses.enumerated() {
+                // The histogram of digit 0 is already in `counts` when the analysis ran it and pass 0
+                // survived; every other pass needs its own, over the keys the previous pass produced.
+                if !(analyse && i == 0 && pass == 0) { encodeHistogram(enc, shift: pass * bits) }
+                encodeScanAndScatter(enc, shift: pass * bits)
             }
         }
         try ctx.syncPoint()
