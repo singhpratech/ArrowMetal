@@ -13,8 +13,11 @@ import XCTest
 /// registry, so a regression in either direction shows up as a diff there.
 ///
 /// `sqrt` is held to a stricter standard than the rest: **bit-identical** to `Foundation.sqrt`, which
-/// is IEEE-754's correctly rounded square root. `d_sqrt` extracts the root digit by digit in integers,
-/// so there is no approximation left to be off by.
+/// is IEEE-754's correctly rounded square root. `d_sqrt` refines a hardware `rsqrt` seed in fixed
+/// point and then settles the last bit against the *exact* 128-bit remainder, so the answer is the
+/// correctly rounded one by construction rather than by being close enough — and
+/// `testSqrtIsCorrectlyRoundedOnAdversarialInputs` aims at the inputs where "close enough" would show:
+/// perfect squares, the values on either side of them, every binade, and the subnormal range.
 final class DoubleTranscendentalTests: XCTestCase {
 
     /// 0 and 1 are the degenerate cases, 33 straddles a bitmap word, 4097 crosses several
@@ -366,6 +369,74 @@ final class DoubleTranscendentalTests: XCTestCase {
         XCTAssertEqual(try base.powerChecked(expo).toRawArray().map(\.bitPattern),
                        try base.power(expo).toRawArray().map(\.bitPattern), "power_checked is bit-identical")
         XCTAssertNoThrow(try base.powerChecked(2.0))
+    }
+
+    /// The inputs an approximation-plus-correction square root gets wrong when the correction is one
+    /// step short: exact squares (where the remainder is zero and the guard bit must not round up), the
+    /// doubles either side of them, every binade from the subnormals to the top of the range, and the
+    /// whole subnormal ladder. All bit-identical to `Foundation.sqrt`, which is correctly rounded.
+    func testSqrtIsCorrectlyRoundedOnAdversarialInputs() throws {
+        try requireRealGPU()
+        var xs: [Double] = []
+
+        // Perfect squares of every size, and their neighbours in both directions.
+        for k in 0..<1024 {
+            let r = Double(k) * 1_000_003.0 + 1.0
+            let sq = r * r
+            if sq.isFinite { xs += [sq, sq.nextUp, sq.nextDown] }
+        }
+        for e in -60...60 {
+            let r = Double(sign: .plus, exponent: e, significand: 1.0)
+            let sq = r * r
+            xs += [sq, sq.nextUp, sq.nextDown]
+        }
+
+        // Every binade: one power of two, and the doubles either side of it. The exponent's parity is
+        // what decides whether the significand absorbs a factor of two, so both parities matter.
+        for e in -1074...1023 {
+            let p = Double(sign: .plus, exponent: e, significand: 1.0)
+            guard p.isFinite, p > 0 else { continue }
+            xs += [p, p.nextUp, p.nextDown]
+        }
+
+        // The subnormal ladder, top and bottom, plus the boundary with the normals.
+        var sub = Double.leastNonzeroMagnitude
+        for _ in 0..<64 { xs.append(sub); sub = sub.nextUp }
+        var top = Double.leastNormalMagnitude
+        for _ in 0..<64 { xs.append(top); top = top.nextDown }
+        xs += [.leastNormalMagnitude, .leastNormalMagnitude.nextUp, .greatestFiniteMagnitude,
+               .greatestFiniteMagnitude.nextDown, 0, 1, 4, 9, 16, 0.25, 2, 0.5]
+
+        // Random significands over the whole exponent range, so no binade goes unvisited.
+        var rng = SeededRNG(0x5017_ADD5)
+        for _ in 0..<200_000 {
+            let x = Double(bitPattern: rng.next() & 0x7FFF_FFFF_FFFF_FFFF)
+            if x.isNaN || x.isInfinite { continue }
+            xs.append(x)
+        }
+
+        let got = try MetalArray<Double>(xs).sqrt().toRawArray()
+        var mismatches = 0, firstBad = -1
+        for i in 0..<xs.count where got[i].bitPattern != Foundation.sqrt(xs[i]).bitPattern {
+            mismatches += 1
+            if firstBad < 0 { firstBad = i }
+        }
+        XCTAssertEqual(mismatches, 0, firstBad < 0 ? "" :
+            "\(mismatches) of \(xs.count); first at x = \(xs[firstBad]) "
+            + "(bits \(String(xs[firstBad].bitPattern, radix: 16))): "
+            + "got \(got[firstBad]), want \(Foundation.sqrt(xs[firstBad]))")
+
+        // The results the IEEE-754 rules pin exactly, whatever the algorithm.
+        let pinned: [Double] = [0, -0.0, 1, 4, 9, 1e300, .infinity, .leastNonzeroMagnitude]
+        let out = try MetalArray<Double>(pinned).sqrt().toRawArray()
+        XCTAssertEqual(out.map(\.bitPattern), pinned.map { Foundation.sqrt($0).bitPattern })
+        XCTAssertEqual(out[1].bitPattern, (-0.0 as Double).bitPattern, "sqrt(-0) is -0")
+
+        // Negatives are NaN at every magnitude, the subnormal one included; a NaN stays a NaN.
+        let neg = try MetalArray<Double>([-1, -1e-320, -Double.leastNonzeroMagnitude,
+                                          -Double.greatestFiniteMagnitude, -.infinity, .nan])
+            .sqrt().toRawArray()
+        for (i, v) in neg.enumerated() { XCTAssertTrue(v.isNaN, "negative or NaN input \(i) -> \(v)") }
     }
 
     /// `modulo` is the one float64 binary op still missing, and it must say so rather than answer badly.
