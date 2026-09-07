@@ -71,6 +71,27 @@ enum HashTable {
                        build: (_ slots: MetalArrowBuffer, _ slotCount: Int, _ sampleMask: Int,
                                _ maxProbe: Int, _ slotOf: MetalArrowBuffer?,
                                _ firstOfSlot: MetalArrowBuffer?) throws -> Bool) throws -> HashGroups {
+        let t = try sizedBuild(ctx: ctx, rows: rows, nonNull: nonNull, initialSlots: initialSlots,
+                               wantSlotOf: true, wantFirstOfSlot: true, build: build)
+        let slotOf = t.slotOf!, firstOfSlot = t.firstOfSlot!
+        let (cum, groupCount) = try occupancy(ctx: ctx, slots: t.slots, count: t.slotCount)
+        let firstSlotOrder = try compact(ctx: ctx, slots: t.slots, firstOfSlot: firstOfSlot, cum: cum,
+                                         slotCount: t.slotCount, groupCount: groupCount)
+        return HashGroups(slotOf: slotOf, cum: cum, groupCount: groupCount, firstSlotOrder: firstSlotOrder)
+    }
+
+    /// Sizes a table for `nonNull` insertions and runs `build` on it, growing and retrying until every
+    /// row found a slot. This is the half of `groups` that has nothing to do with ranking, and it is
+    /// separate because a caller that only wants a *set* — `hash_count_distinct` over a (group, value)
+    /// pair — needs neither `slotOf` (one int per row) nor `firstOfSlot` (one per slot), and does not
+    /// want the occupancy scan over a table that may hold two slots per row.
+    static func sizedBuild(ctx: MetalContext, rows: Int, nonNull: Int, initialSlots: Int? = nil,
+                           wantSlotOf: Bool, wantFirstOfSlot: Bool,
+                           build: (_ slots: MetalArrowBuffer, _ slotCount: Int, _ sampleMask: Int,
+                                   _ maxProbe: Int, _ slotOf: MetalArrowBuffer?,
+                                   _ firstOfSlot: MetalArrowBuffer?) throws -> Bool)
+        throws -> (slots: MetalArrowBuffer, slotCount: Int,
+                   slotOf: MetalArrowBuffer?, firstOfSlot: MetalArrowBuffer?) {
         // Largest table we would ever build: at least two slots per non-null row, so an insert into it
         // always finds a free slot and the last attempt cannot fail.
         var cap = 1024
@@ -100,24 +121,24 @@ enum HashTable {
         while slotCount < 3 * estimate && slotCount < cap { slotCount <<= 1 }
         slotCount = Swift.min(slotCount, cap)
 
-        let slotOf = try MetalArrowBuffer.allocate(byteCount: Swift.max(rows, 1) * 4, zeroed: false, context: ctx)
+        let slotOf = wantSlotOf
+            ? try MetalArrowBuffer.allocate(byteCount: Swift.max(rows, 1) * 4, zeroed: false, context: ctx) : nil
         var slots: MetalArrowBuffer
-        var firstOfSlot: MetalArrowBuffer
+        var firstOfSlot: MetalArrowBuffer?
         while true {
             let last = slotCount >= cap
             slots = try MetalArrowBuffer.allocate(byteCount: slotCount * 4, zeroed: false, context: ctx)
-            firstOfSlot = try MetalArrowBuffer.allocate(byteCount: slotCount * 4, zeroed: false, context: ctx)
+            firstOfSlot = wantFirstOfSlot
+                ? try MetalArrowBuffer.allocate(byteCount: slotCount * 4, zeroed: false, context: ctx) : nil
             if try !build(slots, slotCount, 0, last ? Int(UInt32.max) : 96, slotOf, firstOfSlot) { break }
             // The estimate was low and the probe chains grew past the budget. Retry with a bigger table;
             // the last attempt has two slots per row and no budget, so this terminates.
             slotCount = Swift.min(slotCount << 3, cap)
         }
-        ctx.retainUntilFlush(slots); ctx.retainUntilFlush(firstOfSlot); ctx.retainUntilFlush(slotOf)
-
-        let (cum, groupCount) = try occupancy(ctx: ctx, slots: slots, count: slotCount)
-        let firstSlotOrder = try compact(ctx: ctx, slots: slots, firstOfSlot: firstOfSlot, cum: cum,
-                                         slotCount: slotCount, groupCount: groupCount)
-        return HashGroups(slotOf: slotOf, cum: cum, groupCount: groupCount, firstSlotOrder: firstSlotOrder)
+        ctx.retainUntilFlush(slots)
+        if let firstOfSlot { ctx.retainUntilFlush(firstOfSlot) }
+        if let slotOf { ctx.retainUntilFlush(slotOf) }
+        return (slots, slotCount, slotOf, firstOfSlot)
     }
 
     /// Clears a table and runs an insert kernel over it. The caller binds the key-specific arguments in
