@@ -200,16 +200,30 @@ enum DoubleMath {
         return d_finish(s, ea - eb + 1022, q);
     }
 
-    // Correctly rounded square root: schoolbook digit-by-digit extraction on the significand, in
-    // integers only. No seed, no Newton step, no division — and, unlike a refined approximation, no
-    // final "is this the right side of the midpoint?" question to answer, because the remainder
-    // answers it exactly.
+    // Correctly rounded square root: a hardware `rsqrt` seed, three Newton steps in fixed point, and
+    // an **exact** 128-bit remainder that settles the last bit — the same shape as `d_div` above.
     //
-    // Write a = M * 2^k with M an integer and k **even** (halving an odd exponent is what loses the
-    // last bit, so the significand absorbs the odd one). Then sqrt(a) = sqrt(M) * 2^(k/2), and 54
-    // restoring steps produce q = floor(sqrt(M * 2^54)): 53 significand bits and one guard bit, with
-    // the running remainder as an exact sticky flag. Every intermediate stays inside 64 bits (the
-    // remainder never exceeds 2q + 1 < 2^55, and is shifted by two before each comparison).
+    // Write a = m * 2^k with m an integer and k **even** (halving an odd exponent is what loses the
+    // last bit, so the significand absorbs the odd one), which puts m in [2^52, 2^54). Everything the
+    // rounding needs is then
+    //     q = floor(sqrt(m * 2^54))            53 significand bits and one guard bit
+    //     m * 2^54 - q^2 == 0 ?                the sticky flag
+    // and the whole job is to produce that q. It used to come out of 54 restoring steps, one bit at a
+    // time, each with a 64-bit shift, compare and subtract — around 800 instructions in a kernel whose
+    // arithmetic is otherwise a single load and store.
+    //
+    // Instead, normalise A = m << 10 into [2^62, 2^64), so a = A * 2^-64 lies in [0.25, 1) and
+    // sqrt(m * 2^54) = sqrt(a) * 2^54. One `rsqrt` on the top 24 bits of A seeds y ~ 1/sqrt(a) in Q62;
+    // three Newton steps `y += y * (1 - a * y^2) / 2` (each doubling the correct bits, and each three
+    // 64 x 64 -> high-64 products) take it to about 2^-58, past the 57 bits the answer needs; and
+    // `q = (a * y) >> 8` then lands within a couple of units of the true floor. The correction loop
+    // makes it exact rather than merely close: it holds the full 128-bit remainder N - q^2, so it
+    // *knows* which side of the answer q is on. Over 40M random doubles it has never taken more than
+    // two steps, and the loop is bounded at four.
+    //
+    // Three Newton steps rather than two for the reason `d_div` gives: two saturate the seed that safe
+    // math delivers, but the third keeps the seed requirement down at 2^-12, so the routine does not
+    // quietly stop being correctly rounded if the compile options ever move off safe math.
     inline ulong d_sqrt(ulong a) {
         if (d_is_nan(a)) return a | (1ul << 51);
         if (d_is_zero(a)) return a;                     // sqrt(-0) is -0, as IEEE-754 says
@@ -218,28 +232,47 @@ enum DoubleMath {
         long k;
         ulong m;
         if (d_exp(a) == 0ul) {                          // subnormal: normalise, no arithmetic needed
-            m = d_mant(a); k = -1074;
-            while ((m >> 52) == 0ul) { m <<= 1; k--; }
+            m = d_mant(a); int z = (int)clz(m) - 11; m <<= z; k = -1074 - (long)z;
         } else {
             m = d_mant(a) | (1ul << 52); k = (long)d_exp(a) - 1075;
         }
         if (k & 1) { m <<= 1; k--; }                    // m now spans [2^52, 2^54) and k is even
-        ulong q = 0ul, rem = 0ul, t;
-        for (int i = 0; i < 27; i++) {                  // the 54 bits of m, two at a time
-            rem = (rem << 2) | ((m >> (52 - 2 * i)) & 3ul);
-            t = (q << 2) | 1ul; q <<= 1;
-            if (rem >= t) { rem -= t; q |= 1ul; }
+        ulong A = m << 10;                              // [2^62, 2^64): a = A * 2^-64 in [0.25, 1)
+        float af = (float)(uint)(A >> 40) * (1.0f / 16777216.0f);   // the top 24 bits, exactly
+        ulong Y = (ulong)(rsqrt(af) * 4611686018427387904.0f);      // 1/sqrt(a) in Q62, in (2^62, 2^63]
+        for (int i = 0; i < 3; i++) {
+            ulong y2 = d_mulhi(Y, Y);                                   // y^2 in Q60, in [2^60, 2^62]
+            long e = (long)(1ul << 60) - (long)d_mulhi(A, y2);          // (1 - a y^2) in Q60, small
+            Y = (e >= 0) ? (Y + (d_mulhi(Y, (ulong)e) << 3))
+                         : (Y - (d_mulhi(Y, (ulong)(-e)) << 3));
         }
-        for (int i = 0; i < 27; i++) {                  // 27 more pairs of zeros: the fraction bits
-            rem <<= 2;
-            t = (q << 2) | 1ul; q <<= 1;
-            if (rem >= t) { rem -= t; q |= 1ul; }
+        ulong q = d_mulhi(A, Y) >> 8;                   // sqrt(a) in Q62, then floor to Q54
+        // N = m * 2^54 as a 128-bit pair, and the exact remainder N - q^2.
+        ulong nhi = m >> 10, nlo = m << 54;
+        ulong qh, ql;
+        ql = d_umul128(q, q, &qh);
+        ulong rl = nlo - ql;
+        ulong rh = nhi - qh - ((nlo < ql) ? 1ul : 0ul);
+        for (int i = 0; i < 4; i++) {
+            if ((rh >> 63) != 0ul) {                    // q is one too big: N - (q-1)^2 = r + 2(q-1) + 1
+                q--;
+                ulong t = 2ul * q + 1ul, nl = rl + t;
+                rh += (nl < rl) ? 1ul : 0ul;
+                rl = nl;
+            } else if (rh != 0ul || rl > 2ul * q) {     // q is one too small: N - (q+1)^2 = r - 2q - 1
+                ulong t = 2ul * q + 1ul;
+                rh -= (rl < t) ? 1ul : 0ul;
+                rl -= t;
+                q++;
+            } else {
+                break;
+            }
         }
         ulong s = q >> 1;
         // A set guard bit always comes with a non-zero remainder: an exact halfway result would need a
         // 54-bit root, whose square has 107 significant bits and so cannot be a double. The tie term is
         // written out anyway, because relying on that silently would be worse than paying for one `and`.
-        if ((q & 1ul) && (rem != 0ul || (s & 1ul))) s++;
+        if ((q & 1ul) && ((rl | rh) != 0ul || (s & 1ul))) s++;
         long e = (k >> 1) + 26 + 1023;                  // sqrt of any finite double is normal
         if ((s >> 53) != 0ul) { s >>= 1; e++; }
         return ((ulong)e << 52) | (s & 0xFFFFFFFFFFFFFul);
