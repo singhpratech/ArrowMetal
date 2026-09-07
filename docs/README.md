@@ -18,6 +18,10 @@ test or the CSV a claim comes from.
 | [DESIGN.md](DESIGN.md) | How it works: buffers, kernels, batching, GPU-side lengths, software Float64, where the time goes |
 | [PANDAS.md](PANDAS.md) | pandas on the GPU: the `.am` accessor and the zero-code-change accel mode, what routes to the GPU and when, the zero-copy and null rules, the numbers and the limits |
 | [NUMPY.md](NUMPY.md) | numpy on the GPU through pyarrow: which dtypes cross without a copy (asserted by `test_numpy.py`), NaN-as-value semantics, the matrix rows measured against numpy, and the NEP 18 step that is ours to take |
+| [RUST.md](RUST.md) | The Rust crate over the C ABI: install, the copy rule as measured, what is wrapped and what is not, the timing table with its method |
+| [GO.md](GO.md) | The Go module: cgo shim, pinning, the alignment finding, what is wrapped, the timing table |
+| [TYPESCRIPT.md](TYPESCRIPT.md) | The Node addon and TypeScript API: Arrow JS interop, lifetimes, the copy rule, timings |
+| [R.md](R.md) | The R package: arrow R interop, int64 through bit64, the timing table with both measurement modes |
 | [EXPR.md](EXPR.md) | Fused expression queries: one runtime-generated kernel for a whole expression DAG, the grammar, how nulls are compiled, the numbers and the limits |
 | [ENGINE.md](ENGINE.md) | The lazy query engine: the logical plan, the optimizer rules with `explain()` examples, fusion planning, the full join matrix (multi-key, utf8, outer, semi/anti, as-of), window functions, the plan grammar, the numbers and the limits |
 | [POLARS.md](POLARS.md) | Polars on the GPU in three tiers: the zero-copy bridge and `.arrowmetal` namespaces, the Rust expression plugin for lazy plans, and the streaming hand-off — with install, numbers at 10M and 50M rows, and what a real Metal `engine=` backend would need |
