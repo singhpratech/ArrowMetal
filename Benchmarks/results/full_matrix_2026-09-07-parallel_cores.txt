@@ -1,0 +1,34 @@
+Cores actually used, per library and idiom: cpu_ms / wall_ms over every measured row of this CSV.
+Measured on Darwin 25.6.0, 16 logical CPUs, polars 16 threads, pyarrow 16 threads, Acero fed 16 record batches.
+
+library / idiom        rows   median     mean      max  rows >2     %
+---------------------------------------------------------------------
+arrowmetal              343     0.32     0.54    15.56        8    2%
+polars                  316     1.00     4.78    14.85      119   38%
+pyarrow                 320     1.00     2.63    15.05       76   24%
+pandas                  282     1.00     1.00     1.50        0    0%
+numpy                    40     1.00     1.00     1.00        0    0%
+polars-lazy             314    11.52     9.87    15.61      266   85%
+pyarrow-threaded        268    11.09    10.07    15.44      260   97%
+
+arrowmetal's number is host CPU time only -- the thread encoding the command buffer and
+waiting on it. Time the GPU spends executing is not counted in it, by either side's clock.
+
+By family (median cores)
+
+family                  arrowmetal            polars           pyarrow            pandas             numpy       polars-lazy  pyarrow-threaded
+----------------------------------------------------------------------------------------------------------------------------------------------
+reductions                    0.42              1.00              1.00              1.00                --              1.02             12.42
+element-wise                  0.27              1.00              1.00              1.00              1.00             12.29             11.29
+compare+select                0.37              1.00              1.00              1.00              1.00             10.39             11.39
+sort                          0.32              6.34              1.00              1.00              1.00              6.31             10.85
+group-by                      0.24             12.85              5.79              1.00                --             12.97              6.33
+temporal                      0.12              1.00              1.00              1.00                --             14.96             12.61
+window                        0.20              1.00              1.00              1.00                --              1.00                --
+decimal                       0.21              1.00              1.00              1.00                --             14.05             12.59
+nested                        1.79              1.00              1.00              1.00                --              7.04             10.61
+chains                        0.38              1.67              1.00              1.00              1.00             11.02             12.64
+join                          0.17              9.49             14.47              1.00                --              9.29             14.51
+strings                       0.44              1.00              1.00              1.00                --             11.89             11.29
+latency                       1.26              1.11              1.03              1.01                --              5.71              3.78
+
