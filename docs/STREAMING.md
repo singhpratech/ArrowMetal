@@ -417,35 +417,36 @@ dense encoding of the previous section; "after" is the row-level path of §4.1.
 
 | Workload | before | **after** | Polars | DuckDB | RSS before | **RSS after** | Polars RSS | DuckDB RSS |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| group by `bigkey` -> sum (10M groups) | 2,117 | **620** | 398 | 645 | 4.05 GB | 4.74 GB | 2.89 GB | 4.62 GB |
-| group by `region` -> sum, count (1k groups) | 255 | **199** | 110 | 246 | 2.33 GB | 2.36 GB | 1.96 GB | 0.87 GB |
+| group by `bigkey` -> sum (10M groups) | 2,156 | **614** | 393 | 638 | 4.12 GB | 4.74 GB | 2.90 GB | 4.63 GB |
+| group by `region` -> sum, count (1k groups) | 199 | 200 | 106 | 240 | 2.30 GB | 2.32 GB | 2.32 GB | 0.86 GB |
 
-`groupby_10m` is **3.4x** faster and now **beats DuckDB**; it was 5.3x behind Polars and is 1.6x
-behind. `groupby_1k` never goes near the row path — a thousand contiguous values is exactly the shape
-the range encoding is for — and its 22 % is the distinct-key insert becoming one dispatch instead of
-the two it used to be.
+`groupby_10m` is **3.5x** faster and now **beats DuckDB**; it was 5.5x behind Polars and is 1.6x
+behind. `groupby_1k` is unchanged to the millisecond, which is the point of the chooser: a thousand
+contiguous values is exactly the shape the range encoding is for, the row path is never taken, and
+nothing about that workload moved.
 
 Where the batch's time went, per stage, at 76 batches:
 
 | Stage | before | after |
 | --- | ---: | ---: |
-| read (two reader threads) | 0.39 s | 0.42 s |
-| GPU stage | 2.10 s | 0.28 s |
-| merge stage | 0.29 s | 0.51 s |
+| read (two reader threads) | 0.40 s | 0.43 s |
+| GPU stage | 2.05 s | 0.27 s |
+| merge stage | 0.23 s | 0.50 s |
 | merge stall (GPU stage waiting on the merge queue) | 0.00 s | 0.22 s |
+| overlap | 1.26x | 2.07x |
 
 The work moved rather than only shrank: the resident table can only be touched from the merge stage,
 so the insert, the aggregates and the fold all run there now and the GPU stage is left with the read
-and the filter. Total GPU-side work went from 2.39 s to 0.79 s. What remains in the merge is the
+and the filter. Total GPU-side work went from 2.28 s to 0.77 s. What remains in the merge is the
 insert of a million rows into a 33-million-slot table, the batch's `GroupBy`, and the fold.
 
 Two intermediate points, measured the same way on the same dataset, showing what each half bought:
 
 | `group by bigkey` | wall | merge stage |
 | --- | ---: | ---: |
-| per-batch encoding (before) | 2,117 ms | 0.29 s |
+| per-batch encoding (before) | 2,156 ms | 0.23 s |
 | row-level, dense ids, segmented sum | 1,523 ms | 1.47 s |
-| row-level, dense ids, one thread per group | **620 ms** | 0.51 s |
+| row-level, dense ids, one thread per group | **614 ms** | 0.50 s |
 | the same query as `count(*)` (atomic path) | 456 ms | 0.31 s |
 | the same query as `sum(qty)`, int32 (atomic path) | **330 ms** | 0.22 s |
 
@@ -628,7 +629,7 @@ same queries run at 1.2 GB of RSS (and two to five times slower). The genuinely 
   column for a whole stream is the only form the writer emits, which an incremental sink cannot
   promise.
 * **A `Stream` is single use**: a terminal consumes the source. Open a new scan for a second question.
-* **A group-by over ten million groups is 1.6x slower than Polars** (§9), down from 5.3x. The rows go
+* **A group-by over ten million groups is 1.6x slower than Polars** (§9), down from 5.5x. The rows go
   straight into the resident table now, so there is no per-batch encoding left to remove; what is
   left is the insert itself, the batch's `GroupBy` and the fold, all in the merge stage, which the
   GPU stage then waits 0.22 s on. Splitting the resident table into shards a batch could insert into
@@ -638,7 +639,7 @@ same queries run at 1.2 GB of RSS (and two to five times slower). The genuinely 
   emulation of one rounds a binary64 addition correctly. It takes the dense-id branch of §4.1
   instead, which costs a second pass over the batch's groups and two `uint` arrays the size of the
   table. Counts and integer sums skip all of that; on the same query and dataset that is 330 ms
-  against 620 ms.
+  against 614 ms.
 * **The row-level path's float64 sum is deterministic but not associative-order-free**: a group's
   rows are added in a fixed order that depends on how the batches fell, so the same dataset read with
   a different `batch_rows` can differ in the last bits, exactly as the per-batch path always could.
