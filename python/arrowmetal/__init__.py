@@ -3544,6 +3544,8 @@ _lib.am_cast_ex.argtypes = [_P, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint3
 _lib.am_cast_ex.restype = ctypes.c_int
 _lib.am_argsort_ex.argtypes = [_P, ctypes.c_int, ctypes.c_int, ctypes.POINTER(_P)]
 _lib.am_argsort_ex.restype = ctypes.c_int
+_lib.am_sort_ex.argtypes = [_P, ctypes.c_int, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_sort_ex.restype = ctypes.c_int
 _lib.am_partition_nth_ex.argtypes = [_P, ctypes.c_int64, ctypes.c_int, ctypes.POINTER(_P)]
 _lib.am_partition_nth_ex.restype = ctypes.c_int
 _lib.am_rank_ex.argtypes = [_P, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(_P)]
@@ -3893,8 +3895,13 @@ MetalArray.list_parent_indices64 = _list_parent_indices64
 
 
 def _sort_ex(self, descending=False, null_placement="at_end"):
-    """A sorted copy: `take` of `argsort`, with the same options."""
-    return self.take(self.argsort(descending=descending, null_placement=null_placement))
+    """A sorted copy, in `argsort`'s order and with the same options.
+
+    Numeric columns do not gather: the radix sort's own keys are turned back into the values (see
+    `MetalArray.sorted` in Swift), which is a sequential write where `take` was a random one. Types
+    without an order-preserving key still take `take(argsort())`."""
+    return _call(_lib.am_sort_ex, self._h, 1 if descending else 0,
+                 _index_of(NULL_PLACEMENT, null_placement, "null_placement"))
 
 
 MetalArray.sort = _sort_ex

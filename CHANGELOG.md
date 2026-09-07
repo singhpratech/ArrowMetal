@@ -30,6 +30,9 @@ Strings and sorting
   (large_utf8 narrowed on import).
 - GPU LSD radix sort: `argsort`, `sorted`, `MetalRecordBatch.sorted(by:)`; stable, nulls last by default
   (`null_placement` puts them at either end), IEEE total order.
+- GPU LSD radix sort: `argsort`, `sorted`, `MetalRecordBatch.sorted(by:)`; stable, nulls last, IEEE total order.
+  The nulls are partitioned out before the sort rather than lifted out of the permutation afterwards, and
+  `sorted()` rebuilds the values from the sort's own keys instead of gathering them through it.
 - `topK` for any k: a GPU radix select (digit histogram over the order-preserving key, one compaction pass
   keeping only the rows that can still win, a refinement round, then a bitonic or radix ordering) reads the
   column twice whatever k is, and matches the full sort index for index. The per-threadgroup selection
@@ -204,6 +207,24 @@ Fixed
   rows.
 - `list_value_length` ran at 70 GB/s: one thread per row read every offset twice and stored four bytes at
   a time. Eight rows per thread through vector loads and stores, 1.05 ms -> 0.35 ms at 10M rows.
+- `sorted()` was `take(argsort())`, and the gather was most of what it cost above the sort. The radix
+  sort's own keys are an order-preserving map of the values that is a bijection except on -0.0 and NaN,
+  so the sorted values are inverted straight out of the sorted keys — and the sort then drops the
+  row-number payload it only carried for the gather. A column that does hold a -0.0 or a NaN copies back
+  only the runs they occupy. `sort float64` 9.585 -> 6.503 ms at 10M rows and 50.281 -> 31.948 ms at 50M;
+  `sort int64` 9.390 -> 6.142 and 49.409 -> 30.626. The Python `MetalArray.sort` reaches it through the new
+  `am_sort_ex`; it used to be `take(argsort())` in the ctypes package and never called this path, and
+  it keeps returning the input's type, a dictionary column included.
+- Sorting a column with a validity bitmap lifted the nulls out of the finished permutation on the *host*:
+  three passes over the whole index array and a sort of the null row numbers, which cost an order of
+  magnitude more than the GPU sort it followed. A stable three-way partition (values, NaNs, nulls) now
+  runs before the sort instead, so the nulls never enter it and keep their input order by construction,
+  and the passes are planned around the value block rather than the column. `sort float64` with 10%
+  nulls 139.745 -> 6.837 ms at 10M rows and 725.935 -> 33.669 ms at 50M; with 50% nulls at 50M,
+  3,436.130 -> 22.879 ms. (Every figure in these two bullets and in the matching section of
+  docs/LOSSES.md comes from one set of runs, recorded with the scripts that produced it: the 10% rows
+  and the plain sorts from the matrix-conditions harness, the 50% row from the shape sweep. LOSSES
+  names the file each one is in.)
 - `partition_nth_indices` split the column around the selected key with three `compare` + `filter`
   compactions and a concatenation: seven command buffers, and two of its steps ran on the host — the row
   numbers it compacted were filled by a CPU loop and the output was allocated zeroed, a write and a

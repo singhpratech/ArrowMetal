@@ -63,11 +63,19 @@ enum TDigestGPU {
 
     /// The column with its nulls compacted away and no validity bitmap left behind.
     ///
-    /// Sorting a nullable column is three times the work of sorting the same values without a bitmap
-    /// (117 ms against 39 ms at 10M float64), and the digest never looks at the nulls — `sorted()` puts
-    /// them past `validCount` and the walk stops there. Dropping them first is one filter pass, and it
-    /// leaves the very same sequence of values: `filter` is stable, so equal keys keep their relative
-    /// order and the sorted result is identical element for element.
+    /// This was worth an order of magnitude when the null rows were lifted out of the finished
+    /// permutation on the host. The sort now partitions them out before it starts, so the two are
+    /// close, and which is ahead depends on how many nulls there are: at 1% and 10% the sort of the
+    /// column itself wins by 7-10%, and at 50% the compaction wins by 10-12%, because it also halves
+    /// the output buffer and the pass over it (10M float64, 50% null: 5.137 ms sorting the column
+    /// against 4.604 ms compacting first; 50M: 22.802 against 20.687). The compaction stays, for the
+    /// half-null case and because the digest never looks at the nulls anyway — `sorted()` puts them
+    /// past `validCount` and the walk stops there. It leaves the very same sequence of values:
+    /// `filter` is stable, so equal keys keep their relative order and the sorted result is identical
+    /// element for element.
+    ///
+    /// The numbers are the "tdigest workaround" paragraph of `docs/LOSSES.md`, which names the file
+    /// they were recorded in.
     static func strippedOfNulls<T: ArrowPrimitive>(_ a: MetalArray<T>) throws -> MetalArray<T> {
         guard a.nullCount > 0 else { return a }
         let d = try a.dropNull()

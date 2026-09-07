@@ -104,6 +104,20 @@ public func am_argsort_ex(_ a: OpaquePointer?, _ descending: Int32, _ nullPlacem
     }
 }
 
+/// A sorted copy with `null_placement`: `argsort`'s order, but the values, not the permutation.
+///
+/// Not `take(argsort(...))` for the six types with a direct order-preserving key — those rebuild the
+/// values out of the sort's own keys (see `MetalArray.sorted`). The output has the input's type, a
+/// dictionary column included: it orders by the values its codes point at and comes back a dictionary.
+@_cdecl("am_sort_ex")
+public func am_sort_ex(_ a: OpaquePointer?, _ descending: Int32, _ nullPlacement: Int32,
+                       _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
+    guard let x = optHandle(a) else { return 2 }
+    return optRun(out) {
+        try x.sortedValues(descending: descending != 0, nullPlacement: placement(nullPlacement))
+    }
+}
+
 /// Arrow `partition_nth_indices` with `null_placement`. A GPU radix select, not a sort.
 @_cdecl("am_partition_nth_ex")
 public func am_partition_nth_ex(_ a: OpaquePointer?, _ pivot: Int64, _ nullPlacement: Int32,

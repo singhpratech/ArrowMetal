@@ -87,6 +87,34 @@ extension AnyMetalArray {
         }
     }
 
+    /// The sorted values of whichever concrete array this is, in `argsortIndices`' order and of the
+    /// same type as this one.
+    ///
+    /// The six types that have a direct order-preserving key take `MetalArray.sorted()`, which rebuilds
+    /// the values out of the sort's own keys instead of gathering them through the permutation; every
+    /// other type still gathers. A dictionary column orders by the values its codes point at but comes
+    /// back a dictionary: the codes are gathered and the value array is left alone, which is what
+    /// `take` of `argsort` has always done for it.
+    public func sortedValues(descending: Bool = false,
+                             nullPlacement: NullPlacement = .atEnd) throws -> AnyMetalArray {
+        switch self {
+        case .int32(let a): return .int32(try a.sorted(descending: descending, nullPlacement: nullPlacement))
+        case .uint32(let a): return .uint32(try a.sorted(descending: descending, nullPlacement: nullPlacement))
+        case .int64(let a): return .int64(try a.sorted(descending: descending, nullPlacement: nullPlacement))
+        case .uint64(let a): return .uint64(try a.sorted(descending: descending, nullPlacement: nullPlacement))
+        case .float32(let a): return .float32(try a.sorted(descending: descending, nullPlacement: nullPlacement))
+        case .float64(let a): return .float64(try a.sorted(descending: descending, nullPlacement: nullPlacement))
+        case .dictionary:
+            // The codes carry no order of their own, so the permutation comes from the decoded column;
+            // the gather then runs on the codes, so the dictionary survives.
+            let order = try decodedIfDictionary().argsortIndices(descending: descending,
+                                                                nullPlacement: nullPlacement)
+            return try take(order)
+        default:
+            return try take(try argsortIndices(descending: descending, nullPlacement: nullPlacement))
+        }
+    }
+
     /// The Metal context whichever concrete array this is lives in.
     var metalContext: MetalContext {
         switch self {

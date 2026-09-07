@@ -154,9 +154,12 @@ The full list is in the matrix page under ⚠️. The clusters:
   Both sides run at unified-memory bandwidth; the GPU's edge is the dispatch overhead it does not pay
   per thread. Fusing them into one expression (`am.query`) is where the 3x comes from, not from the
   single kernel; even so `filter two columns + sum` at 10M rows is 2.2x over Polars (6x at 50M).
-- **`sort float64`** at 2.67x over Polars, both sizes. `argsort` of the same column is 10x; the
-  difference is the `take` that materialises the sorted values (a random 8-byte gather). Inverting
-  the sort key in place of the gather is the costed next step (below).
+- **`sort float64`** at 2.67x over Polars, both sizes, in the matrix. `argsort` of the same column is
+  10x; the difference was the `take` that materialised the sorted values (a random 8-byte gather).
+  That gather is gone — the sorted values now come out of the sort's own keys — and the row is
+  **6.503 ms at 10M and 31.948 ms at 50M** when measured on its own (the last section of this page),
+  which is 4.01x and 4.14x against the Polars figures in this matrix's own column. It stays in this
+  list until a rerun of the matrix moves it, which is the rule this page keeps.
 - **Joins** at 2.7–2.8x over pyarrow for the materialised inner join (the index-only join and the
   left outer join are 3.0–3.8x).
 - **Host-assisted strings** — `parse` 1.4–2.7x, real regex 1.2–2.2x.
@@ -307,6 +310,7 @@ gather pulls a whole cache line per element. The sorted *keys* are already sitti
 buffer and the key map is a bijection for every value except -0.0 and NaN, so inverting them instead of
 gathering would remove that 9.4 ms — for a column with no nulls, no NaN and no -0.0, which needs a flag
 the key kernel does not raise yet. That is the next step, and unlike the last one it has been costed.
+(It was taken; the last section of this page is what it measured.)
 
 **`shift`.** The copy is unchanged and is still the default, because it was never the thing that was
 wrong: 3.6 ms for the 813 MB it touches at 50M rows is 226 GB/s, this machine's bandwidth and rather
@@ -478,3 +482,149 @@ with very few groups runs the segmented path, which gives a whole threadgroup to
 million rows in one group is 35 ms and 90% of the rows in one group is 31 ms, against 4.6 ms for the
 same column spread over a thousand groups. Integer values do not have this shape — they take the
 atomic path — and neither does `min`, `max` or `count`.
+## After the afternoon run: `sorted()` stops gathering, and the nulls stop being a host pass
+
+Measured with `Benchmarks/loss_sort_gather.py`, the before build (`main` at `86bd495`) loaded through
+`ARROWMETAL_LIB` and its own ctypes package through `ARROWMETAL_PYTHON` — the change adds an entry
+point, so the old package has to come with the old library. full_matrix's rule throughout: its seed,
+its column builders, one warm-up, best of five. **Every figure below is in
+`private/results/sort_gather_2026-09-07/`**, whose `README.md` says which file backs which row; the
+whole directory was re-measured on the build this branch ships, so nothing is quoted from an
+intermediate one.
+
+Two harnesses, and it matters which is which. **Matrix mode** runs one build per process, which is how
+`full_matrix.py` measures, and the tables in the next two sections are its (`matrix_table.txt`, best of
+two before-runs and two after-runs). The **shape sweep** loads both builds into one process and
+alternates them case by case, which is the only way its 1M-row rows say anything; every sweep figure is
+labelled as such and comes from `sweep_table.txt`.
+
+### The gather
+
+`sorted()` was `take(argsort())`. The radix sort maps every value to an order-preserving unsigned key,
+and that map is a bijection on every value except two: -0.0 shares +0.0's key (so that the two tie,
+which is what Arrow's order asks for) and every NaN payload shares one key. So for a column with
+neither, the sorted values *are* the sorted keys, read backwards through the map — a sequential read
+and a sequential write where the gather was a random 8-byte one that pulled a cache line per element.
+
+The key kernel now says which, in a flag word it fills from two `simd_ballot`s while it has the values
+loaded anyway; `argsort` does not ask for it and pays nothing. And once the values no longer come out
+of the permutation, the sort does not have to carry the permutation: dropping the uint payload takes
+every pass from 24 bytes an element to 16, which is worth more than the gather was.
+
+A column that *does* hold a -0.0 or a NaN still gets its answer from the keys, and only the output
+positions the inverse cannot produce are copied back through the sorted row numbers: the run of zeros,
+the run of NaNs, the null block. Each is contiguous — they share a key — and each is found by a binary
+search over the sorted keys. Those columns keep the payload, so they win less: in the sweep at 50M rows
+they are 1.14x and 1.15x where the same column without them is 1.35–1.56x.
+
+| operation | rows | before | after | before | after |
+|---|---:|---:|---:|---:|---:|
+| sort float64 | 10,000,000 | 9.585 ms | **6.503 ms** | 3.19x Polars | **4.70x Polars** |
+| sort float64 | 50,000,000 | 50.281 ms | **31.948 ms** | 2.86x | **4.51x** |
+| sort int64 | 10,000,000 | 9.390 ms | **6.142 ms** | 3.35x | **5.11x** |
+| sort int64 | 50,000,000 | 49.409 ms | **30.626 ms** | 3.40x | **5.48x** |
+
+The Polars column is measured by the same script (`--polars`, recorded in `matrix.log`) in the same
+processes as the `after` rows, so ArrowMetal's own numbers there are if anything a little pessimistic:
+sort float64 30.551 ms at 10M and 143.964 ms at 50M, sort int64 31.413 ms and 167.743 ms. The
+afternoon matrix's own Polars column is faster — 26.1 ms and 132.4 ms for float64, on a machine with
+nothing else resident — and against *those* the two float64 rows are 4.01x and 4.14x. Either
+accounting puts `sort float64` past the 3x bar at both sizes, which is what this work was for.
+
+### The nulls
+
+Sorting a column that carries a validity bitmap cost an order of magnitude more than sorting the same
+values without one — 139.7 ms against 9.6 ms at 10M float64 rows, and 725.9 ms against 50.3 ms at 50M.
+None of that was the GPU. The null rows went through the sort with whatever bytes sat under their
+bitmap, and a **host** pass then lifted them back out of the finished permutation: three loops over
+the whole index array plus a `sort()` of the null row numbers, because a null's place among the other
+nulls is its input position, not wherever its garbage key landed.
+
+The nulls do not enter the sort at all now. A stable three-way partition — values, NaNs when
+`.atStart` wants them separated, nulls — runs first and compacts the value block's keys as it goes, so
+the sort runs over the value block alone and the nulls keep their input order by construction, which
+is the order Arrow asks for. Three kernels: a per-block bucket count, a scan, and a scatter that ranks
+a chunk's rows against its own SIMD group with three ballots, the same trick the radix scatter uses.
+The passes are then planned around the value block rather than the column, which is what the 50% rows
+below are: blocks sized for the column would leave half the GPU idle.
+
+| operation | rows | nulls | before | after | source |
+|---|---:|---:|---:|---:|---|
+| sort float64 | 10,000,000 | 10% | 139.745 ms | **6.837 ms** | matrix |
+| sort float64 | 50,000,000 | 10% | 725.935 ms | **33.669 ms** | matrix |
+| argsort float64 | 10,000,000 | 10% | 138.795 ms | **7.654 ms** | matrix |
+| argsort float64 | 50,000,000 | 10% | 711.053 ms | **39.225 ms** | matrix |
+| sort float64 | 50,000,000 | 1% | 187.955 ms | **36.189 ms** | sweep |
+| sort float64 | 50,000,000 | 50% | 3,436.130 ms | **22.879 ms** | sweep |
+| argsort int32 | 50,000,000 | 50% | 3,401.301 ms | **11.938 ms** | sweep |
+
+The old cost grew with the null count because the host `sort()` of the null row numbers did; that is
+why the 50% rows are three seconds. Every caller of `argsort` gets this, not only `sort`: `unique`,
+`value_counts`, `rank`, the window functions, `lexsort` and the dictionary paths all sort nullable
+columns.
+
+**`.atStart` also stops being a host pass.** Placing the nulls (and, on a float column, the NaNs) at
+the front used to scan every value on the CPU to count the NaNs before it could decide anything. The
+partition does that work on the GPU now, and it runs on any float column asked for `.atStart` whether
+or not it holds a NaN — so the worst case for it is a clean column, where it has nothing to separate.
+Measured on a clean 50M float64 column, both builds alternating in one process (`atstart.txt`): `sort`
+64.07 → 36.81 ms and `argsort` 53.96 → 44.58 ms, so even the empty partition is well ahead of the host
+scan it replaced. It is not free — `argsort` `.atEnd` on the same column is 40.75 ms, so the partition
+costs about 4 ms at 50M rows — but there is nothing to gate it on: whether a NaN exists is not known
+until the keys have been mapped, which is the same command buffer the partition has to be encoded in.
+With 1% of the rows NaN the same two calls go 542.3 → 47.6 ms and 524.6 → 50.1 ms.
+
+**The tdigest workaround stays.** `tdigest` compacts the nulls out with `drop_null` before sorting,
+which was worth an order of magnitude and is now worth 10–12% — but only at 50% nulls, where dropping
+them also halves the output buffer and the pass over it (10M float64: 5.14 ms sorting the column
+against 4.60 ms compacting first; 50M: 22.80 against 20.69, `tdigest_vs_dropnull.txt`). At 1% and 10%
+nulls the general path is now the faster of the two by 7–10% (10M: 7.63 against 8.41 and 7.16 against
+7.64; 50M: 36.38 against 40.01 and 34.20 against 36.54). Since the rule was to remove the workaround
+only if the general path is at least as fast, it stays, and `Kernels/TDigestGPU.swift` records the
+same numbers.
+
+### What did not move
+
+`argsort` of a column with no nulls is the same code as before and measures the same: int64 7.82 →
+7.73 ms at 10M and 39.8 → 39.5 at 50M, float64 7.98 → 7.95 and 40.6 → 40.3. So does `lexsort`
+(6.86 → 6.66 at 10M, 37.4 → 37.3 at 50M). `partition_nth_indices` reads 2.91 → 2.51 ms at 10M and
+11.67 → 11.65 at 50M, `top_k` 1.78 → 0.79 and 2.52 → 2.48, `select_k_unstable` 1.69 → 0.77 and
+2.51 → 2.46; the three of them share the radix select, which this work did not touch, and their 10M
+rows are the pool-sensitivity `partition_nth_indices` already has a paragraph about further up this
+page rather than anything new.
+
+### The shape sweep
+
+The matrix's columns are one shape. Every claim above was re-taken over five sizes (1M, 3M, 10M, 27M,
+50M) × 29 columns — eleven shapes on float64 (random, sorted, reverse-sorted, all-equal,
+1000-distinct, with -0.0, with NaN, 1% / 10% / 50% nulls, and a slice at offset 33) and nine each on
+int64 and int32, the two float-special shapes not applying to them — × two operations: **290 measured
+cases**. The two builds are loaded into **one** process there and measured alternately, case by case,
+because a build measured in its own process is measured at a different minute and at 1M rows the
+difference between two minutes is larger than the difference between the two builds.
+
+Every `sort` row at 3M rows and above is faster: 1.02x to 285x. At 1M the range is 0.99x to 38x, the
+0.99x being the two float64 columns that hold a -0.0 or a NaN, where 1.858 ms became 1.878 and
+1.677 became 1.701 — at that size the fix-up's extra command buffer eats the win. Every `argsort` row
+on a column with nulls is faster, from 1.76x to 301x. Every `argsort` row without nulls is unchanged
+to within 1% at 10M rows and above, which is what the code says it should be: that path is untouched.
+Two rows read below 0.97x, both `argsort` of a 1000-distinct column at 1M rows: int32 0.642 → 0.756
+ms and int64 0.433 → 0.456 ms. The same sweep run with the **same build on both sides** —
+`noise_control_table.txt`, the harness measuring itself — produces ten such rows, down to 0.86x and
+including one at 50M, so that band is the harness and not the change. **Nothing at 10M, 27M or 50M
+is slower.**
+
+| operation, 50M rows | shape | before | after |
+|---|---|---:|---:|
+| sort float64 | random | 50.308 ms | **32.301 ms** |
+| sort float64 | sorted | 43.615 ms | **32.298 ms** |
+| sort float64 | reverse-sorted | 43.265 ms | **32.244 ms** |
+| sort float64 | all-equal | 8.962 ms | **7.579 ms** |
+| sort float64 | 1000-distinct | 26.418 ms | **17.413 ms** |
+| sort float64 | with -0.0 | 50.309 ms | **44.241 ms** |
+| sort float64 | with NaN | 50.903 ms | **44.438 ms** |
+| sort float64 | sliced at offset 33 | 50.541 ms | **32.395 ms** |
+| sort int64 | random | 48.277 ms | **31.511 ms** |
+| sort int32 | random | 24.166 ms | **14.017 ms** |
+| argsort float64 | random | 40.707 ms | 41.210 ms |
+| argsort int64 | random | 38.780 ms | 38.804 ms |

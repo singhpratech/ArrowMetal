@@ -1275,6 +1275,7 @@ int  am_extract_struct(am_array* a, const uint8_t* pattern, int64_t plen, int fl
 int  am_cast_ex(am_array* a, const char* format, const char* child_formats /* or NULL */,
                 uint32_t flags, am_array** out);
 int  am_argsort_ex(am_array* a, int descending, int null_placement, am_array** out);
+int  am_sort_ex(am_array* a, int descending, int null_placement, am_array** out);
 int  am_lexsort_ex(am_array** columns, const int* descending /* or NULL */, int64_t count,
                    int null_placement, am_array** out);
 int  am_partition_nth_ex(am_array* a, int64_t pivot, int null_placement, am_array** out);

@@ -83,6 +83,31 @@ def test_sort_copy_null_placement(placement, descending):
     assert got == pc.take(v, idx).to_pylist()
 
 
+@pytest.mark.parametrize("descending", [False, True])
+def test_sort_keeps_the_input_type(descending):
+    """`sort` returns the type it was given, a dictionary column included.
+
+    A dictionary orders by the values its codes point at, but the gather runs on the codes, so the
+    answer is a dictionary of the same value array — not the decoded column."""
+    words = pa.array(["pear", None, "fig", "apple", "fig", "damson"] * 40).dictionary_encode()
+    got = am.MetalArray.from_arrow(words).sort(descending=descending)
+    assert got.type == words.type, "a dictionary column must not decode on the way through sort"
+    out = got.to_arrow()
+    assert out.dictionary.to_pylist() == words.dictionary.to_pylist(), "the value array is untouched"
+    idx = pc.array_sort_indices(words, order="descending" if descending else "ascending")
+    assert out.to_pylist() == pc.take(words, idx).to_pylist()
+
+    for col in (pa.array([3, None, 1, 2] * 50, type=pa.int64()),
+                pa.array([1.5, None, -0.0, 2.5] * 50, type=pa.float64()),
+                pa.array(["b", None, "a", "c"] * 50),
+                pa.array([b"b", None, b"a"] * 50, type=pa.binary()),
+                pa.array([True, None, False] * 50)):
+        s = am.MetalArray.from_arrow(col).sort(descending=descending)
+        assert s.type == am.MetalArray.from_arrow(col).type, f"{col.type} changed type"
+        want = pc.take(col, pc.array_sort_indices(col, order="descending" if descending else "ascending"))
+        assert s.to_arrow().to_pylist() == want.to_pylist()
+
+
 @pytest.mark.parametrize("placement", PLACEMENTS)
 def test_lexsort_null_placement(placement):
     n = 300
