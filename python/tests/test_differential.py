@@ -1882,6 +1882,11 @@ def _regex_replace(src, shape):
     return got, expected
 
 
+def _split_result(r):
+    """A split result whatever its shape: one list MetalArray, or the older (offsets, values) pair."""
+    return _as_list_array(*r) if isinstance(r, tuple) else _as_list_array(r)
+
+
 def _as_list_array(*parts):
     """A split result as the list<utf8> Arrow produces: either the list array ArrowMetal now returns
     (one MetalArray of format "+l") or the older (offsets, values) pair."""
@@ -1905,10 +1910,18 @@ def _regex_split(src, shape):
 
 
 @op("split_whitespace", ["utf8"],
-    note="ArrowMetal splits on runs of whitespace and drops the empty ends, as Python's str.split() "
-         "does; pc.utf8_split_whitespace splits at every whitespace character")
+    note="unicode=True against pc.utf8_split_whitespace: a run of whitespace is one separator in both, "
+         "except that a trailing run of two or more characters yields one empty piece here and two "
+         "in Arrow's Unicode variant (finding split-whitespace-trailing-run)")
 def _split_whitespace(src, shape):
-    return _as_list_array(am.array(src).split_whitespace()), pc.utf8_split_whitespace(src)
+    return _as_list_array(am.array(src).split_whitespace(unicode=True)), pc.utf8_split_whitespace(src)
+
+
+@op("ascii_split_whitespace", ["utf8"],
+    note="the default (ASCII) split against pc.ascii_split_whitespace, which gives one empty piece "
+         "for a trailing run, as ArrowMetal does")
+def _ascii_split_whitespace(src, shape):
+    return _as_list_array(am.array(src).split_whitespace()), pc.ascii_split_whitespace(src)
 
 
 @op("regex_extract", ["utf8"],
@@ -2259,17 +2272,17 @@ def _assume_timezone(src, shape):
     return got, expected
 
 
-# Rounding. Three things separate the two engines and each has its own operation so that the rest keeps
-# comparing exactly:
+# Rounding. Three corners once separated the two engines and each keeps its own operation so that a
+# relapse shows up on its own row rather than inside the main rounding cell:
 #
-#   * a unit finer than the column's own resolution: ArrowMetal leaves the value alone, Arrow converts
-#     to the finer unit, rounds there and truncates back (finding temporal-round-finer-unit);
-#   * `ceil` of a value already sitting on a *calendar* boundary: ArrowMetal keeps it, Arrow advances
-#     a whole unit -- although for the fixed-length units Arrow keeps it too (finding
-#     temporal-ceil-on-a-calendar-boundary);
-#   * a multiple of months or quarters that does not divide the epoch's own offset: ArrowMetal counts
-#     calendar units from year 0 and Arrow from 1970-01, except for `year`, where Arrow counts from
-#     year 0 as well (finding temporal-calendar-multiple-origin).
+#   * a unit finer than the column's own resolution (`temporal_round_finer`): Arrow converts to the
+#     finer unit, rounds there and truncates back, and so does ArrowMetal now;
+#   * `ceil` of a value already sitting on a *calendar* boundary (`temporal_ceil_calendar`): Arrow
+#     advances a whole month/quarter/year (but keeps a value on a fixed-length boundary), and so does
+#     ArrowMetal now;
+#   * a multiple of months or quarters that does not divide the epoch's own offset
+#     (`temporal_round_unaligned`): both count from 1970-01 now (and years from year 0, as Arrow does).
+# All three were findings in the first runs (see docs/EVALUATION.md, "Findings that were fixed").
 
 _FIXED_ROUND_UNITS = ["nanosecond", "microsecond", "millisecond", "second", "minute", "hour", "day"]
 _CALENDAR_ROUND_UNITS = ["month", "quarter", "year"]
@@ -3437,21 +3450,6 @@ class Finding:
         return self.data_check is None or self.data_check(make_array(type_name, shape))
 
 
-#: The case mappings ArrowMetal deliberately does not implement (see include/arrowmetal.h): anything
-#: cased above Latin Extended-A, and the three multi-character expansions inside it.
-_MULTI_CHAR_CASE = {"ß", "ŉ", "µ"}       # ß -> SS, ŉ -> ʼN, µ -> Μ
-
-
-def _needs_case_mapping_outside_latin(src):
-    for s in src.to_pylist():
-        for ch in s or "":
-            if ch in _MULTI_CHAR_CASE:
-                return True
-            if ord(ch) > 0x17F and (ch.upper() != ch or ch.lower() != ch):
-                return True
-    return False
-
-
 def _contains_negative_zero(src):
     return any(v == 0.0 and math.copysign(1.0, v) < 0 for v in src.to_pylist() if v is not None)
 
@@ -3571,15 +3569,12 @@ def _moments_leave_the_accumulator(src):
     return False
 
 
-def _splits_on_a_whitespace_run(src):
-    """A value with an empty piece under Arrow's whitespace split: an empty string, or one with a
-    leading, trailing or doubled whitespace character."""
+def _ends_with_a_whitespace_run(src):
+    """A value whose trailing whitespace run is two or more characters long -- the one place the
+    Unicode splits still disagree (`" "` gives `['', '']` in both; `"  "` gives three pieces in Arrow's
+    utf8_split_whitespace, two in its ascii_split_whitespace and here)."""
     for value in pc.unique(src).to_pylist():
-        if value is None:
-            continue
-        if value == "" or value[:1].isspace() or value[-1:].isspace():
-            return True
-        if any(a.isspace() and b.isspace() for a, b in zip(value, value[1:])):
+        if value is not None and len(value) >= 2 and value[-1:].isspace() and value[-2:-1].isspace():
             return True
     return False
 
@@ -3595,20 +3590,11 @@ def _after_the_2038_cutoff(src):
     return biggest is not None and biggest > _TZ_CUTOFF_SECONDS * per_second
 
 
-def _lands_on_a_calendar_boundary(src):
-    """A value that is exactly the first instant of a month, quarter or year -- the only place
-    `ceil_temporal` has to decide whether to advance."""
-    return bool(pc.any(pc.equal(pc.floor_temporal(src, unit="month"), src)).as_py())
-
-
 FINDINGS = [
     Finding("float32-subnormal-ftz",
             "Float32 arithmetic flushes subnormal results and operands to zero",
             ["arith_scalar", "arith_array", "pairwise_diff", "trig", "trig_checked"],
             ["float32"], flavors={"special"}),
-    Finding("utf8-case-latin-only",
-            "upper/lower map Basic Latin, Latin-1 and Latin Extended-A only; the rest passes through",
-            ["upper", "lower"], ["utf8"], data_check=_needs_case_mapping_outside_latin),
     Finding("sign-of-negative-zero",
             "sign keeps the sign of -0.0 where pyarrow normalises it to 0.0",
             ["sign"], FLOATING, data_check=_contains_negative_zero),
@@ -3656,18 +3642,6 @@ FINDINGS = [
              "temporal_between_clock", "weeks_between", "months_between", "interval_between",
              "interval_layouts", "strftime", "strftime_seconds", "add_interval", "cast_unit"],
             TIMESTAMP_TZ),
-    Finding("temporal-ceil-on-a-calendar-boundary",
-            "ceil_temporal leaves a value already on a month, quarter or year boundary alone; Arrow "
-            "advances it a whole unit (it does not for the fixed-length units)",
-            ["temporal_ceil_calendar"], DATE_LIKE, data_check=_lands_on_a_calendar_boundary),
-    Finding("temporal-calendar-multiple-origin",
-            "a multiple of months or quarters counts from year 0 here and from 1970-01 in Arrow -- "
-            "Arrow counts years from year 0, so its own three calendar units disagree",
-            ["temporal_round_unaligned"], DATE_LIKE),
-    Finding("temporal-round-finer-unit",
-            "rounding to a unit finer than the column's own resolution is the identity here; Arrow "
-            "converts to the finer unit, rounds there and truncates back",
-            ["temporal_round_finer"], TIMESTAMP_TYPES + DATE_TYPES + TIME_TYPES),
     Finding("strftime-seconds-carry-the-fraction",
             "%S prints whole seconds here, as C's strftime does; Arrow appends the sub-second digits",
             ["strftime_seconds"], TIMESTAMP_TYPES),
@@ -3680,10 +3654,11 @@ FINDINGS = [
             "the software binary64 sin/cos/tan lose their argument reduction past 2^49 and return NaN "
             "past about 2^61",
             ["trig", "trig_checked"], ["float64"], data_check=_needs_large_argument_reduction),
-    Finding("split-whitespace-collapses-runs",
-            "split_whitespace splits on runs of whitespace and drops the empty ends, as Python's "
-            "str.split() does; pc.utf8_split_whitespace splits at every whitespace character",
-            ["split_whitespace"], ["utf8"], data_check=_splits_on_a_whitespace_run),
+    Finding("split-whitespace-trailing-run",
+            "a trailing run of two or more whitespace characters yields one empty piece here and two "
+            "in Arrow's utf8_split_whitespace (its ascii_split_whitespace gives one, as here)",
+            ["split_whitespace"], ["utf8"],
+            data_check=_ends_with_a_whitespace_run),
     Finding("variance-accumulator-overflow",
             "variance and stddev accumulate the two moments in a 64-bit accumulator, so a column of "
             "64-bit integers past 2^40 answers with a wrapped number or NaN where pyarrow answers "
@@ -4265,10 +4240,11 @@ def test_sign_of_negative_zero_matches_pyarrow():
         struct.pack("<d", pc.sign(a).to_pylist()[0])
 
 
-@pytest.mark.xfail(strict=True, reason="utf8-case-latin-only: upper/lower cover Basic Latin, Latin-1 "
-                                       "Supplement and Latin Extended-A; other code points pass through")
 def test_case_mapping_covers_all_of_unicode():
-    a = pa.array(["Ωμέγα"], pa.string())
+    """Once a finding (utf8-case-latin-only): the GPU table covers U+0000-U+017F and every row holding
+    a code point above it is mapped on the host, so Greek, Cyrillic and the rest agree with pyarrow."""
+    a = pa.array(["Ωμέγα", "ΣΊΣΥΦΟΣ", "ığdır", "𐐀", "ß", "ﬁ"], pa.string())
+    assert pylist(am.array(a).lower()) == pc.utf8_lower(a).to_pylist()
     assert pylist(am.array(a).upper()) == pc.utf8_upper(a).to_pylist()
 
 
@@ -4477,20 +4453,31 @@ def test_split_keeps_the_null_row():
     assert got.to_pylist() == pc.split_pattern(a, " ").to_pylist()
 
 
-@pytest.mark.xfail(strict=True, reason="split-whitespace-collapses-runs: ArrowMetal splits on runs "
-                                       "and drops the empty ends, as Python's str.split() does")
-def test_split_whitespace_keeps_the_empty_pieces():
-    a = pa.array(["  padded  "], pa.string())
-    offsets, values = am.array(a).split_whitespace()
-    got = pa.ListArray.from_arrays(offsets.to_arrow(), values.to_arrow())
+@pytest.mark.xfail(strict=True, reason="split-whitespace-trailing-run: a trailing run of two or more "
+                                       "whitespace characters is one empty piece here, two in Arrow's "
+                                       "utf8_split_whitespace")
+def test_split_whitespace_trailing_run_matches_arrow():
+    a = pa.array(["padded  "], pa.string())
+    got = _split_result(am.array(a).split_whitespace(unicode=True))
+    assert got.to_pylist() == pc.utf8_split_whitespace(a).to_pylist()     # [['padded', '', '']]
+
+
+def test_ascii_split_whitespace_trailing_run_matches_arrows_ascii_variant():
+    """Arrow's two whitespace splits disagree with each other on a trailing run; ArrowMetal gives one
+    empty piece in both modes, which is what pc.ascii_split_whitespace does."""
+    a = pa.array(["padded  ", "  "], pa.string())
+    got = _split_result(am.array(a).split_whitespace())
+    assert got.to_pylist() == pc.ascii_split_whitespace(a).to_pylist() == [["padded", ""], ["", ""]]
+
+
+def test_split_whitespace_agrees_with_arrow_away_from_a_trailing_run():
+    """Leading runs, inner runs, a single trailing character, empty and all-blank one-character
+    values, and Unicode whitespace under unicode=True all match Arrow piece for piece."""
+    a = pa.array(["  padded", "a\t  b", "y ", "", " ", "x\u3000y", "a\xa0b", None], pa.string())
+    got = _split_result(am.array(a).split_whitespace(unicode=True))
     assert got.to_pylist() == pc.utf8_split_whitespace(a).to_pylist()
-
-
-def test_split_whitespace_matches_python_str_split():
-    a = pa.array(["  padded  ", "a\t b", ""], pa.string())
-    offsets, values = am.array(a).split_whitespace()
-    got = pa.ListArray.from_arrays(offsets.to_arrow(), values.to_arrow())
-    assert got.to_pylist() == [s.split() for s in a.to_pylist()]
+    got = _split_result(am.array(a).split_whitespace())
+    assert got.to_pylist() == pc.ascii_split_whitespace(a).to_pylist()
 
 
 def test_pyarrow_utf8_normalize_ignores_its_form_option():
@@ -4548,10 +4535,10 @@ def test_temporal_extractors_return_int32_where_pyarrow_returns_int64():
     assert am.array(a).subsecond().type == pc.subsecond(a).type == pa.float64()
 
 
-@pytest.mark.xfail(strict=True, reason="temporal-ceil-on-a-calendar-boundary: ArrowMetal leaves a "
-                                       "value already on a month boundary alone, Arrow advances it")
 def test_ceil_temporal_advances_a_value_on_a_month_boundary():
-    a = pa.array([0], pa.timestamp("s"))
+    """Once a finding (temporal-ceil-on-a-calendar-boundary): a value already on a month boundary is
+    now advanced a whole unit, as Arrow's calendar units do."""
+    a = pa.array([0, 951782400], pa.timestamp("s"))
     assert pylist(am.array(a).ceil_temporal("month")) == \
         pc.ceil_temporal(a, unit="month").to_pylist()
 
@@ -4564,10 +4551,10 @@ def test_ceil_temporal_keeps_a_value_on_a_fixed_length_boundary_in_both():
     assert pc.ceil_temporal(a, unit="month").to_pylist() != a.to_pylist()
 
 
-@pytest.mark.xfail(strict=True, reason="temporal-calendar-multiple-origin: ArrowMetal counts months "
-                                       "and quarters from year 0, Arrow from 1970-01")
 def test_calendar_multiples_share_an_origin():
-    a = pa.array([0], pa.timestamp("s"))
+    """Once a finding (temporal-calendar-multiple-origin): months and quarters now count from 1970-01,
+    as Arrow's do."""
+    a = pa.array([0, 1_700_000_000, -86400 * 400], pa.timestamp("s"))
     assert pylist(am.array(a).floor_temporal("month", 7)) == \
         pc.floor_temporal(a, multiple=7, unit="month").to_pylist()
 
@@ -4584,10 +4571,10 @@ def test_calendar_multiples_agree_wherever_the_two_origins_do():
     assert pc.floor_temporal(a, multiple=3, unit="year").to_pylist()[0].year == 1968
 
 
-@pytest.mark.xfail(strict=True, reason="temporal-round-finer-unit: rounding to a unit below the "
-                                       "column's resolution is the identity here")
 def test_rounding_to_a_finer_unit_converts_like_arrow():
-    a = pa.array([1_700_000_000], pa.timestamp("s"))
+    """Once a finding (temporal-round-finer-unit): rounding to a unit below the column's resolution
+    now converts, rounds and truncates back, as Arrow does."""
+    a = pa.array([1_700_000_000, 0, -1], pa.timestamp("s"))
     assert pylist(am.array(a).floor_temporal("nanosecond", 3)) == \
         pc.floor_temporal(a, multiple=3, unit="nanosecond").to_pylist()
 

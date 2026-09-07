@@ -59,8 +59,8 @@ def _bind(ns):
     _ArrowMetalError = ns["ArrowMetalError"]
     _query_columns = ns["query_columns"]
 
-    _lib.am_plan_source.argtypes = [ctypes.c_char_p, _P, _P, ctypes.c_int64, ctypes.POINTER(_P)]
-    _lib.am_plan_source.restype = ctypes.c_int
+    _lib.am_plan_source_create.argtypes = [ctypes.c_char_p, _P, _P, ctypes.c_int64, ctypes.POINTER(_P)]
+    _lib.am_plan_source_create.restype = ctypes.c_int
     _lib.am_plan_source_release.argtypes = [_P]
     _lib.am_plan_run.argtypes = [ctypes.c_char_p, _P, ctypes.c_int64, ctypes.c_int, ctypes.POINTER(_P)]
     _lib.am_plan_run.restype = ctypes.c_int
@@ -613,7 +613,7 @@ class LazyFrame:
             harr = (_P * max(n, 1))(*[c._h for c in cols])
             narr = (ctypes.c_char_p * max(n, 1))(*[nm.encode() for nm in names])
             out = _P()
-            _check(_lib.am_plan_source(name.encode(), harr, narr, n, ctypes.byref(out)))
+            _check(_lib.am_plan_source_create(name.encode(), harr, narr, n, ctypes.byref(out)))
             handles.append(out)
             boxes.append(cols)                     # keep the imported columns alive
         return handles, boxes

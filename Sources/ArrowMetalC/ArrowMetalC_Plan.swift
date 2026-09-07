@@ -4,7 +4,7 @@ import ArrowMetal
 
 // The lazy query engine over the C ABI.
 //
-// A caller registers its tables once (`am_plan_source`, which takes the column handles it already
+// A caller registers its tables once (`am_plan_source_create`, which takes the column handles it already
 // holds), then sends a plan as JSON (`docs/ENGINE.md` and `Sources/ArrowMetal/Engine/PlanJSON.swift`
 // carry the grammar). The plan is type-checked, optimized and run, and the result comes back as a
 // handle whose columns are ordinary `am_*` array handles.
@@ -49,8 +49,8 @@ final class PlanResultBox {
 }
 
 /// Registers a table the plan can `scan` by name. Column handles are retained by the source.
-@_cdecl("am_plan_source")
-public func am_plan_source(_ name: UnsafePointer<CChar>?,
+@_cdecl("am_plan_source_create")
+public func am_plan_source_create(_ name: UnsafePointer<CChar>?,
                            _ columns: UnsafeMutablePointer<OpaquePointer?>?,
                            _ names: UnsafeMutablePointer<UnsafePointer<CChar>?>?,
                            _ nColumns: Int64,

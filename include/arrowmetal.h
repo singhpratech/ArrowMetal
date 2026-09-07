@@ -116,11 +116,12 @@ int  am_dictionary_decode(am_array* a, am_array** out);
 //  24  ascii_is_upper           -                                          bool    >= 1 uppercase, no lowercase
 //  25  ascii_is_lower           -                                          bool    >= 1 lowercase, no uppercase
 //
-// Case mapping coverage for ops 2 and 3: simple (1:1 code point) mapping over Basic Latin, Latin-1 Supplement
-// (U+00C0-U+00FE minus the x and / signs, plus U+00FF <-> U+0178) and Latin Extended-A (U+0100-U+017F,
-// including U+0130/U+0131 and U+017F -> S, which change the byte length). Everything above U+017F is copied
-// through unchanged, and the multi-character expansions are not applied: U+00DF (ss), U+0149 and U+00B5 stay
-// as they are. Full Unicode case folding and normalisation are out of scope.
+// Case mapping coverage for ops 2 and 3: Unicode's simple (1:1 code point) mapping over every script, the
+// same table utf8proc and therefore Arrow use. The GPU table is exact over U+0000-U+017F (Basic Latin,
+// Latin-1 Supplement, Latin Extended-A, including the length-changing entries U+00DF, U+0130, U+0131, U+017F
+// and U+00B5); any row holding a code point above U+017F is mapped on the host, split per row, so an
+// all-Latin column never touches the CPU. Simple, not full: multi-character expansions (U+FB01, U+0149) stay
+// put, as they do in Arrow. Case folding and normalisation are separate ops.
 int  am_str_transform(am_array* a, int op, const uint8_t* arg1, int64_t len1,
                       const uint8_t* arg2, int64_t len2, int64_t p1, int64_t p2, am_array** out);
 
@@ -284,7 +285,7 @@ int  am_child(am_array* a, int64_t i, am_array** out);
 //   4  match_like                  pattern = SQL LIKE (% and _)          bool    \ escapes % _ \
 //   5  split_pattern values        pattern = literal separator           utf8    the flattened pieces
 //   6  split_pattern offsets       pattern = literal separator           int32   n+1 list offsets
-//   7  split_whitespace values     -                                     utf8    runs of ASCII space
+//   7  split_whitespace values     -                                     utf8    a whitespace run is one separator; empty ends kept
 //   8  split_whitespace offsets    -                                     int32   n+1 list offsets
 //   9  extract_regex               pattern, repl = group name            utf8    one named group;
 //                                                                                null where no match
@@ -1291,7 +1292,7 @@ int  am_list_parent_indices64(am_array* a, am_array** out);
 // ---------------------------------------------------------------------------------------------------
 // The lazy query engine: a whole plan in one call (docs/ENGINE.md).
 //
-// Register the tables the plan reads once with am_plan_source (it takes am_array handles you already
+// Register the tables the plan reads once with am_plan_source_create (it takes am_array handles you already
 // hold and retains them), then send the plan as JSON. The engine type-checks it, optimizes it
 // (predicate pushdown, projection pruning, filter fusion, constant folding, expression CSE, join
 // reordering), lowers it to physical operators with maximal fused Metal kernels, and runs the whole
@@ -1337,8 +1338,8 @@ int  am_list_parent_indices64(am_array* a, am_array** out);
 typedef struct am_plan_source_t am_plan_source;
 typedef struct am_plan_result_t am_plan_result;
 
-int  am_plan_source(const char* name, am_array** columns, const char** names, int64_t n_columns,
-                    am_plan_source** out);
+int  am_plan_source_create(const char* name, am_array** columns, const char** names,
+                           int64_t n_columns, am_plan_source** out);
 void am_plan_source_release(am_plan_source* s);
 int  am_plan_run(const char* plan_json, am_plan_source** sources, int64_t n_sources, int optimize,
                  am_plan_result** out);

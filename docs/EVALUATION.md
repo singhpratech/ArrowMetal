@@ -212,38 +212,34 @@ stays in the input — it poisons every later element in both engines
 
 ## Open findings
 
-Twenty-one divergences the harness found that are not bugs but are not free choices either: each is a
+Seventeen divergences the harness found that are not bugs but are not free choices either: each is a
 place where a kernel's own consistency was preferred to Arrow's answer, or where a documented limit of
 the GPU path shows through. Together they account for all 1,677 failing cases. Each has an entry in
 `FINDINGS` in `test_differential.py`, so the matrix groups the affected cells under the finding instead
 of burying them, and an `xfail(strict=True)` reproduction, so the suite turns red the moment a kernel
-changes its mind. Fourteen of them are classified *by the data* — a `data_check` that looks at the
+changes its mind. Thirteen of them are classified *by the data* — a `data_check` that looks at the
 generated values — so a dataset that does not actually contain the triggering value still has to agree
 exactly.
 
 | # | Finding | Cases | Cells |
 |---|---|---|---|
 | 1 | `float32-subnormal-ftz` | 19 | 5 |
-| 2 | `utf8-case-latin-only` | 30 | 2 |
-| 3 | `sign-of-negative-zero` | 8 | 2 |
-| 4 | `negative-zero-set-lookup` | 14 | 4 |
-| 5 | `cumulative-prod-reassociation` | 12 | 2 |
-| 6 | `decimal-to-float64-divides` | 38 | 3 |
-| 7 | `decimal-round-carry-past-the-precision` | 12 | 3 |
-| 8 | `regex-icu-unicode-classes` | 28 | 2 |
-| 9 | `regex-anchor-in-a-repeated-search` | 15 | 1 |
-| 10 | `split-loses-the-null-row` | 31 | 2 |
-| 11 | `split-whitespace-collapses-runs` | 19 | 1 |
-| 12 | `float-text-swift-format` | 35 | 2 |
-| 13 | `temporal-extract-in-utc` | 977 | 58 |
-| 14 | `temporal-ceil-on-a-calendar-boundary` | 45 | 6 |
-| 15 | `temporal-calendar-multiple-origin` | 113 | 6 |
-| 16 | `temporal-round-finer-unit` | 141 | 8 |
-| 17 | `strftime-seconds-carry-the-fraction` | 57 | 3 |
-| 18 | `timezone-after-2038` | 96 | 8 |
-| 19 | `trig-argument-reduction` | 8 | 2 |
-| 20 | `variance-accumulator-overflow` | 8 | 2 |
-| 21 | `rolling-min-max-zero-and-subnormal` | 5 | 2 |
+| 2 | `sign-of-negative-zero` | 8 | 2 |
+| 3 | `negative-zero-set-lookup` | 14 | 4 |
+| 4 | `cumulative-prod-reassociation` | 12 | 2 |
+| 5 | `decimal-to-float64-divides` | 38 | 3 |
+| 6 | `decimal-round-carry-past-the-precision` | 12 | 3 |
+| 7 | `regex-icu-unicode-classes` | 28 | 2 |
+| 8 | `regex-anchor-in-a-repeated-search` | 15 | 1 |
+| 9 | `split-loses-the-null-row` | 31 | 2 |
+| 10 | `split-whitespace-trailing-run` | 14 | 1 |
+| 11 | `float-text-swift-format` | 35 | 2 |
+| 12 | `temporal-extract-in-utc` | 977 | 58 |
+| 13 | `strftime-seconds-carry-the-fraction` | 57 | 3 |
+| 14 | `timezone-after-2038` | 96 | 8 |
+| 15 | `trig-argument-reduction` | 8 | 2 |
+| 16 | `variance-accumulator-overflow` | 8 | 2 |
+| 17 | `rolling-min-max-zero-and-subnormal` | 5 | 2 |
 
 ### 1. Float32 arithmetic flushes subnormals to zero
 
@@ -271,29 +267,7 @@ element-wise `min`/`max` decide the subnormal and signed-zero cases from the bit
 
 Reproduction: `test_float32_arithmetic_keeps_subnormal_results`.
 
-### 2. `upper` and `lower` map Latin only
-
-*18 failing cases: `upper/utf8`, `lower/utf8`, every dataset whose strings need a mapping outside the
-covered blocks.*
-
-`am_str_transform` ops 2 and 3 implement the simple (1:1 code point) case mappings of Basic Latin, Latin-1
-Supplement and Latin Extended-A, including the ones that change the byte length (`ſ` → `S`, `İ`/`ı`).
-Everything above U+017F is copied through, and the multi-character expansions (`ß` → `SS`, `ŉ`, `µ`) are
-not applied. pyarrow uses full Unicode.
-
-```python
-a = pa.array(["Ωμέγα", "ÅNGSTRÖM"], pa.string())
-am.array(a).upper().to_arrow()      # ['Ωμέγα', 'ÅNGSTRÖM']   <- the Greek passes through
-pc.utf8_upper(a)                    # ['ΩΜΈΓΑ', 'ÅNGSTRÖM']
-```
-
-A full case table is a data-size decision rather than a kernel one, and it is out of scope at 0.1.0 — the
-header says so. The finding is classified *by the data*: a dataset counts under it only if it actually
-contains a code point outside the covered blocks, so a regression inside them still shows up as a new
-divergence. Reproductions: `test_case_mapping_covers_all_of_unicode` (xfail) and
-`test_case_mapping_inside_latin_extended_a_matches_pyarrow` (the blocks that must agree exactly).
-
-### 3. `sign` keeps the sign of `-0.0`
+### 2. `sign` keeps the sign of `-0.0`
 
 *8 failing cases: `sign/float32`, `sign/float64`, the datasets containing a negative zero.*
 
@@ -310,7 +284,7 @@ Keeping the operand is the documented behaviour (`include/arrowmetal.h`) and the
 information; the two engines agree on every other value, NaN included. Reproduction:
 `test_sign_of_negative_zero_matches_pyarrow`.
 
-### 4. `is_in` and `index_in` treat `-0.0` and `0.0` as one value
+### 3. `is_in` and `index_in` treat `-0.0` and `0.0` as one value
 
 *6 failing cases: `is_in/float64`, `index_in/float64`, the datasets containing a negative zero.*
 
@@ -329,7 +303,7 @@ Matching Arrow here would mean `is_in` disagreeing with `unique`, `dictionary_en
 many distinct values a column has, which is the worse of the two inconsistencies. Reproductions:
 `test_is_in_separates_negative_zero_from_zero` (xfail) and `test_is_in_matches_nan_to_nan_in_both`.
 
-### 5. `cumulative_prod` reassociates, so overflow and underflow land differently
+### 4. `cumulative_prod` reassociates, so overflow and underflow land differently
 
 *`cumulative_prod/float32` and `cumulative_prod/float64`, the datasets whose running product leaves the
 normal range.*
@@ -352,7 +326,7 @@ The finding is classified by the data (`_prefix_product_leaves_safe_range`): a d
 its sequential running product gets within 2^40 of overflow or of the smallest normal. Reproduction:
 `test_cumulative_prod_matches_arrow_past_overflow` (xfail).
 
-### 6. `decimal` → `float64` divides where Arrow multiplies by the reciprocal
+### 5. `decimal` → `float64` divides where Arrow multiplies by the reciprocal
 
 *38 failing cases: `decimal_to_float64` on all three decimal128 columns.*
 
@@ -370,7 +344,7 @@ The kernel's answer is the better one, and changing it to reproduce Arrow's roun
 introducing an error on purpose. Reproductions: `test_decimal_to_float64_matches_arrows_cast` (xfail)
 and `test_decimal_to_float64_is_the_correctly_rounded_quotient`.
 
-### 7. Rounding a decimal down narrows the precision, and a carry can outgrow it
+### 6. Rounding a decimal down narrows the precision, and a carry can outgrow it
 
 *12 failing cases: `decimal_round` on the three decimal128 columns, the `special` flavor.*
 
@@ -391,7 +365,7 @@ is not a number anyone wants. Classified by the data (`_decimal_rounding_carries
 `test_decimal_round_carry_wraps_like_arrows_cast` (xfail) and
 `test_decimal_round_narrows_the_precision_by_the_digits_it_drops`.
 
-### 8. ICU's `\d`, `\w` and `\s` are Unicode-aware; RE2's are ASCII
+### 7. ICU's `\d`, `\w` and `\s` are Unicode-aware; RE2's are ASCII
 
 *28 failing cases: `regex_match` and `regex_replace` on `utf8`, the datasets containing a full-width
 digit.*
@@ -411,7 +385,7 @@ the data — a column has to contain a non-ASCII code point of category Nd to co
 column of plain ASCII still has to agree, which `test_regex_digit_class_agrees_on_ascii` asserts.
 Reproduction: `test_regex_digit_class_is_ascii_only` (xfail).
 
-### 9. `^` in a repeated search anchors to the input, not to the search
+### 8. `^` in a repeated search anchors to the input, not to the search
 
 *15 failing cases: `regex_match` on `utf8`, the datasets with a row an anchored pattern can match twice.*
 
@@ -427,7 +401,7 @@ pc.count_substring_regex(a, "^a")                     # [2]
 
 Reproduction: `test_anchored_pattern_counts_once_per_input` (xfail).
 
-### 10. `split` has nowhere to put a null row
+### 9. `split` has nowhere to put a null row
 
 *31 failing cases: `regex_split` and `split_whitespace` on `utf8`, every dataset with a null.*
 
@@ -446,24 +420,31 @@ Giving the pair a third array for the validity would be a list type in all but n
 needs the distinction has `is_null()`. Classified by the data (the column has to have a null).
 Reproduction: `test_split_keeps_the_null_row` (xfail).
 
-### 11. `split_whitespace` collapses runs, as `str.split()` does
+### 10. `split_whitespace` gives one empty piece for a trailing run, Arrow gives two
 
-*19 failing cases: `split_whitespace` on `utf8`, the datasets with an empty string or a leading,
-trailing or doubled space.*
+*14 failing cases: `split_whitespace` (the `unicode=True` path) on `utf8`, on the datasets with a value
+whose trailing whitespace run is two or more characters long.*
 
-`am_regex` ops 7 and 8 split on *runs* of ASCII whitespace and drop the empty pieces at either end,
-which is what Python's `str.split()` with no argument does and what the header documents. Arrow's
-`utf8_split_whitespace` splits at every whitespace character and keeps the empty pieces.
+Both engines treat a run of whitespace as one separator and keep the empty pieces at either end:
+`"  padded"` is `['', 'padded']` in both, `" "` is `['', '']` in both. Arrow's `utf8_split_whitespace`
+is asymmetric on its own — a trailing run of two or more characters produces *two* empty pieces — while
+Arrow's `ascii_split_whitespace` produces one, and so does ArrowMetal in both modes. The Unicode flag
+lines up with Arrow's pair: `split_whitespace(unicode=True)` is compared with `utf8_split_whitespace`
+(U+3000 and U+00A0 separate) and the default with `ascii_split_whitespace`, whose cell passes.
 
 ```python
-a = pa.array(["  padded  "], pa.string())
-# ArrowMetal: ['padded']        pyarrow: ['', 'padded', '', '']
+a = pa.array(["padded  "], pa.string())
+am.array(a).split_whitespace(unicode=True).to_arrow()   # [['padded', '']]
+pc.utf8_split_whitespace(a)                             # [['padded', '', '']]
+pc.ascii_split_whitespace(a)                            # [['padded', '']]   <- Arrow's own ASCII variant agrees
 ```
 
-Reproductions: `test_split_whitespace_keeps_the_empty_pieces` (xfail) and
-`test_split_whitespace_matches_python_str_split`.
+Classified by the data (`_ends_with_a_whitespace_run`). Reproductions:
+`test_split_whitespace_trailing_run_matches_arrow` (xfail),
+`test_ascii_split_whitespace_trailing_run_matches_arrows_ascii_variant` and
+`test_split_whitespace_agrees_with_arrow_away_from_a_trailing_run`.
 
-### 12. `float` → `utf8` uses Swift's formatting
+### 11. `float` → `utf8` uses Swift's formatting
 
 *35 failing cases: `to_strings_text` on `float32` and `float64`.*
 
@@ -483,7 +464,7 @@ bit**, `-0.0`, the subnormals and `DBL_MAX` included, and it passes everywhere. 
 finding, classified by the data (`_float_text_differs`). Reproductions:
 `test_float_to_text_matches_arrows_formatter` (xfail) and `test_float_to_text_names_the_same_number`.
 
-### 13. The temporal kernels read a zoned timestamp in UTC
+### 12. The temporal kernels read a zoned timestamp in UTC
 
 *977 failing cases across 58 cells: every temporal operation on the four `timestamp[…, tz]` columns.*
 
@@ -507,72 +488,7 @@ it passes everywhere. The zone is therefore the whole of the difference, which i
 `test_temporal_extract_is_arrows_answer_for_the_same_naive_instant` asserts. Reproduction:
 `test_temporal_extract_uses_the_columns_timezone` (xfail).
 
-### 14. `ceil_temporal` leaves a value already on a calendar boundary alone
-
-*45 failing cases: `temporal_ceil_calendar` on the timestamp and date columns whose data lands exactly
-on a month boundary.*
-
-`temporal_round` implements `ceil` as "the smallest multiple at or above the value", which is Arrow's
-own `ceil_is_strictly_greater = false` and what its *fixed-length* units do. Arrow's calendar units
-behave differently from Arrow's own fixed-length ones: a value exactly on a month, quarter or year
-boundary is advanced a whole unit.
-
-```python
-a = pa.array([0], pa.timestamp("s"))                 # 1970-01-01T00:00:00, on every boundary
-am.array(a).ceil_temporal("month").to_arrow()        # [1970-01-01]
-pc.ceil_temporal(a, unit="month")                    # [1970-02-01]
-pc.ceil_temporal(a, unit="day")                      # [1970-01-01]   <- Arrow's own day unit agrees
-```
-
-Matching Arrow would mean `ceil` meaning one thing for days and another for months. Classified by the
-data (`_lands_on_a_calendar_boundary`). Reproductions:
-`test_ceil_temporal_advances_a_value_on_a_month_boundary` (xfail) and
-`test_ceil_temporal_keeps_a_value_on_a_fixed_length_boundary_in_both`.
-
-### 15. A multiple of months or quarters counts from year 0, not from 1970
-
-*113 failing cases: `temporal_round_unaligned` on every date-carrying column.*
-
-`temporal_round`'s calendar path converts the value to an absolute month index, `y * 12 + (m − 1)`, and
-floors that to a multiple of `p` — an origin of year 0. Arrow counts months and quarters from
-1970-01 — but counts *years* from year 0, so its own three calendar units do not agree with each other.
-
-```python
-a = pa.array([0], pa.timestamp("s"))
-am.array(a).floor_temporal("month", 7).to_arrow()      # [1969-12-01]  (23640 months, floor to 7)
-pc.floor_temporal(a, multiple=7, unit="month")         # [1970-01-01]  (0 months since the epoch)
-pc.floor_temporal(a, multiple=3, unit="year")          # [1968-01-01]  <- year 0 origin, like ours
-```
-
-The two origins coincide whenever the multiple divides `1970 × 12` months (or `1970 × 4` quarters),
-which is every multiple `temporal_round_calendar` uses — 1, 2, 3, 4, 5 and 6 months, 1, 2, 4 and 5
-quarters, 1, 2, 3, 4 and 7 years — and those cells pass exactly. The unaligned multiples (`month × 7`,
-`month × 11`, `quarter × 3`, `quarter × 7`) are gathered into one operation of their own so the finding
-cannot mask a regression in the aligned ones. Reproductions:
-`test_calendar_multiples_share_an_origin` (xfail) and
-`test_calendar_multiples_agree_wherever_the_two_origins_do`.
-
-### 16. Rounding to a unit finer than the column's resolution is the identity
-
-*141 failing cases: `temporal_round_finer` on every temporal column, at a multiple that does not divide
-a whole tick.*
-
-`roundTemporal` returns the column unchanged when the requested unit is finer than its storage — there
-is nothing below a tick to round to. Arrow converts the value to the finer unit, rounds there, and
-truncates back, which on a second-resolution column can move the value by nearly a whole second.
-
-```python
-a = pa.array([1_700_000_000], pa.timestamp("s"))
-am.array(a).floor_temporal("nanosecond", 3).to_arrow()      # [2023-11-14 22:13:20]
-pc.floor_temporal(a, multiple=3, unit="nanosecond")         # [2023-11-14 22:13:19]
-```
-
-At `multiple = 1` the two agree, because a whole tick is a multiple of one nanosecond — which
-`test_rounding_to_a_finer_unit_is_the_identity_at_multiple_one` asserts, and which is why only the
-multiples above one are in this operation. Reproduction:
-`test_rounding_to_a_finer_unit_converts_like_arrow` (xfail).
-
-### 17. `%S` prints whole seconds
+### 13. `%S` prints whole seconds
 
 *57 failing cases: `strftime_seconds` on the sub-second timestamp columns.*
 
@@ -590,7 +506,7 @@ that silently changes width with the column's unit is not something a C format s
 other field agrees (`test_strftime_agrees_on_every_other_field`), which is why the `%S` formats are an
 operation of their own. Reproduction: `test_strftime_seconds_carry_the_fraction` (xfail).
 
-### 18. pyarrow's timezone database stops transitioning at 2038
+### 14. pyarrow's timezone database stops transitioning at 2038
 
 *96 failing cases: `assume_timezone` and `temporal_timezone` on the datasets reaching past 2038.*
 
@@ -609,7 +525,7 @@ Before 2038 the two agree everywhere in the matrix, which
 after it. Classified by the data (`_after_the_2038_cutoff`). Reproduction:
 `test_assume_timezone_agrees_past_2038` (xfail).
 
-### 19. The software binary64 trigonometry loses its argument reduction past 2^49
+### 15. The software binary64 trigonometry loses its argument reduction past 2^49
 
 *8 failing cases: `trig` and `trig_checked` on `float64`, the datasets containing a value at or above
 2^49.*
@@ -629,7 +545,7 @@ the limit instead. Float32 is unaffected — it runs Metal's own functions, whic
 the whole range. Classified by the data. Reproductions: `test_trig_reduces_a_large_argument` (xfail)
 and `test_trig_agrees_below_the_reduction_limit`.
 
-### 20. `variance` and `stddev` accumulate the moments in 64 bits
+### 16. `variance` and `stddev` accumulate the moments in 64 bits
 
 *8 failing cases: `variance_and_stddev` on `int64` and `uint64`, the `special` flavor.*
 
@@ -648,7 +564,7 @@ the matrix gives it (see *Tolerances* above) and what `test_variance_is_accurate
 asserts. Classified by the data (`_moments_leave_the_accumulator`). Reproduction:
 `test_variance_of_a_large_int64_column` (xfail).
 
-### 21. The rolling `min`/`max` scan compares raw values
+### 17. The rolling `min`/`max` scan compares raw values
 
 *5 failing cases: `rolling_min_max` on the float columns containing a negative zero or a float32
 subnormal.*
@@ -670,7 +586,7 @@ their next revision. Classified by the data. Reproduction:
 
 ## Findings that were fixed
 
-The five bugs the first run of this matrix reported are closed. The reproductions stayed, as plain
+The five bugs the first run of this matrix reported are closed, and four of the original twenty-one findings were closed by later kernel work (full-Unicode case mapping, and the three calendar-rounding corners). The reproductions stayed, as plain
 assertions, so the suite notices a relapse.
 
 | Was | Now | Test |
@@ -681,6 +597,10 @@ assertions, so the suite notices a relapse.
 | Grouped `sum` over UInt64 came back as Int64 | the aggregate keeps the value type | `test_group_by_sum_over_uint64_stays_unsigned` |
 | Float32 comparison treated subnormal operands as zero | comparisons are exact, on bit keys; only arithmetic still flushes | `test_float32_comparison_distinguishes_subnormals_from_zero` |
 | `top_k` put row 0 first about once in 900 calls: every thread read the candidate count from a relaxed threadgroup atomic, one simdgroup could see a newer value, and the sentinel padding then left holes that sorted ahead of the real candidates | the count is broadcast through a plain threadgroup variable between barriers, and the buffer starts full of sentinels | `TopKTests.testStressAgainstCPUOracle` (`ARROWMETAL_STRESS=1` for the long run) |
+| `upper`/`lower` mapped Basic Latin, Latin-1 and Latin Extended-A only; everything above U+017F passed through | the GPU table covers U+0000–U+017F and any row holding a code point above it is mapped on the host with Unicode's simple mapping, so Greek, Cyrillic, Turkish dotted I and astral scripts agree with pyarrow | `test_case_mapping_covers_all_of_unicode` |
+| `ceil_temporal` left a value already on a month, quarter or year boundary alone; Arrow advances it a whole unit | the calendar units advance, the fixed-length units keep the value, as Arrow's do | `test_ceil_temporal_advances_a_value_on_a_month_boundary` |
+| a multiple of months or quarters counted from year 0; Arrow counts from 1970-01 | months and quarters count from 1970-01 (years from year 0, as Arrow's do) | `test_calendar_multiples_share_an_origin` |
+| rounding to a unit finer than the column's resolution was the identity; Arrow converts, rounds and truncates back | the value is converted to the finer unit, rounded there and truncated back | `test_rounding_to_a_finer_unit_converts_like_arrow` |
 
 Four more turned up while closing those, and were fixed here rather than written down:
 

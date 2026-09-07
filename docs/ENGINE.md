@@ -340,7 +340,7 @@ wrapper, because a plan is a tree of records with optional fields.
 | `window` | `input`, `specs`: `[{name, fn, column?, n?, partition_by?, order_by?}, …]` |
 | `explode` | `input`, `columns` |
 
-Over the C ABI the tables are registered once (`am_plan_source`, which takes the `am_array` handles the
+Over the C ABI the tables are registered once (`am_plan_source_create`, which takes the `am_array` handles the
 caller already holds) and the plan text carries no data, so the same text can be re-run against new
 sources and `am_plan_explain` can print a plan without touching the GPU. `include/arrowmetal.h` carries
 the same grammar for C consumers.
