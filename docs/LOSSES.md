@@ -459,12 +459,13 @@ difference between two minutes is larger than the difference between the two bui
 Every `sort` row at 3M rows and above is faster: 1.02x to 285x. At 1M the range is 0.99x to 38x, the
 0.99x being the two float64 columns that hold a -0.0 or a NaN, where 1.858 ms became 1.878 and
 1.677 became 1.701 — at that size the fix-up's extra command buffer eats the win. Every `argsort` row
-on a column with nulls is faster, from 1.76x to 301x. Every `argsort` row without nulls is unchanged to within 1%
-at 10M rows and above, which is what the code says it should be: that path is untouched. Two rows read
-below 0.97x, both `argsort` of a 1000-distinct column at 1M rows (0.85x and 0.95x, which is 0.11 ms
-and 0.02 ms). The same sweep run with the **same build on both sides** — `noise_control_table.txt`,
-the harness measuring itself — produces ten such rows, down to 0.86x and including one at 50M, so that
-band is the harness and not the change. **Nothing at 10M, 27M or 50M is slower.**
+on a column with nulls is faster, from 1.76x to 301x. Every `argsort` row without nulls is unchanged
+to within 1% at 10M rows and above, which is what the code says it should be: that path is untouched.
+Two rows read below 0.97x, both `argsort` of a 1000-distinct column at 1M rows: int32 0.642 → 0.756
+ms and int64 0.433 → 0.456 ms. The same sweep run with the **same build on both sides** —
+`noise_control_table.txt`, the harness measuring itself — produces ten such rows, down to 0.86x and
+including one at 50M, so that band is the harness and not the change. **Nothing at 10M, 27M or 50M
+is slower.**
 
 | operation, 50M rows | shape | before | after |
 |---|---|---:|---:|
