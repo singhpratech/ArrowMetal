@@ -391,9 +391,10 @@ and it keeps a null as one of the distinct values rather than dropping it. Sorts
 **both** directions, where Polars' ascending default is nulls first -- pass `nulls_last=True` when
 comparing.
 
-**Strings.** `upper`/`lower` are the simple 1:1 case mapping over Basic Latin, Latin-1 Supplement
-and Latin Extended-A. Everything above U+017F passes through unchanged and the multi-character
-expansions are not applied: U+00DF stays `ß` where Polars' `str.to_uppercase()` gives `SS`.
+**Strings.** `upper`/`lower` are Unicode's simple 1:1 case mapping over every script (the GPU
+table covers U+0000–U+017F exactly; a row holding anything above is mapped on the host), so Greek
+and Cyrillic come back mapped. Simple, not full: the multi-character expansions are not applied,
+so U+00DF becomes `ẞ` where Polars' `str.to_uppercase()` gives `SS`, and `ﬁ` stays put.
 `contains` / `starts_with` / `ends_with` are literal, not regex.
 
 **Arithmetic.** `.add/.sub/.mul/.truediv` in tier 2 keep the column's own type and follow Arrow's

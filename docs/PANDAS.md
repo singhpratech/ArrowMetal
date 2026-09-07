@@ -317,9 +317,10 @@ single-pass float operation stays in pandas there.
 - **`merge` is the `validate="m:1"` inner join.** Duplicate or null keys on the right frame, and any
   outer/left/right join, fall back. A many-to-many join needs a GPU expansion the C ABI does not have
   yet.
-- **`str.upper`/`str.lower` are ASCII-guarded.** The GPU kernels cover ASCII, Latin-1 Supplement and
-  Latin Extended-A; accel mode checks for pure ASCII on the GPU and falls back otherwise, so it never
-  returns a different string than pandas would.
+- **`str.upper`/`str.lower` are ASCII-guarded in accel mode.** The kernels implement Unicode's simple
+  1:1 mapping over every script, but pandas applies the *full* mapping (`ß` → `SS`), so accel mode
+  checks for pure ASCII on the GPU and falls back otherwise; it never returns a different string
+  than pandas would. The `.am` accessor runs the simple mapping on anything.
 - **`str.contains` with a real regex falls back.** A literal pattern runs on the GPU.
 - **Float reductions add in a different order.** A GPU tree reduction is not bit-identical to
   pandas' pairwise sum; expect agreement to about 1e-12 relative, not to the last bit.
