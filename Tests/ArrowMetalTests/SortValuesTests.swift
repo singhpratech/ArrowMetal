@@ -98,6 +98,12 @@ final class SortValuesTests: XCTestCase {
         try check("half -0.0 half 0.0", (0..<n).map { $0 % 2 == 0 ? -0.0 : 0.0 })
         try check("all null", [Double?](repeating: nil, count: n))
         try check("one value, rest null", (0..<n).map { $0 == 7 ? 1.5 : nil })
+        // More than half the output is the null block, but the value block still has to come out of
+        // the keys: the row numbers over it are the partition's, not the sort's, unless the sort was
+        // carrying them.
+        var rng = RNG(0x8A1F_0000)
+        try check("more than half null, no specials",
+                  (0..<n).map { i in i % 2 == 0 ? nil : Double(rng.next() % 1_000_003) })
     }
 
     /// float32 takes the 32-bit key and the same inverse.

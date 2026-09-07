@@ -9,8 +9,11 @@ extension MetalArray {
     /// whenever the run was analysed (see `argsort`). `keys` holds the sorted keys of the value block
     /// alone: key `j` belongs to output position `valueStart + j`.
     struct SortRun {
-        /// Row numbers in the caller's arrangement, or nil when the sort carried no payload.
+        /// Row numbers in the caller's arrangement. The null and NaN blocks are always the partition's
+        /// own and always right; the value block is only in sorted order when the sort carried the
+        /// payload through its passes, which `orderIsSorted` says.
         var order: MetalArrowBuffer?
+        var orderIsSorted: Bool
         /// Sorted keys of the value block.
         var keys: MetalArrowBuffer
         /// Whether the block boundaries and `flags` below were read back (only when `analyse` ran).
@@ -318,7 +321,9 @@ extension MetalArray {
                 }
                 try ctx.syncPoint()
                 measured = true
-                flags = withExtendedLifetime(flagBuf) { flagBuf.typed(UInt32.self)[0] }
+                // Only when it was asked for: with `wantFlags` off the kernel writes nothing and the
+                // binding is the counts table, whose first entry is a digit count, not a flag word.
+                if wantFlags { flags = withExtendedLifetime(flagBuf) { flagBuf.typed(UInt32.self)[0] } }
                 if let sizes {
                     withExtendedLifetime(sizes) {
                         let s = sizes.typed(UInt32.self)
@@ -422,7 +427,7 @@ extension MetalArray {
 
         let valueStart = nullPlacement == .atStart ? mNull + mNaN : 0
         let nullStart = nullPlacement == .atStart ? 0 : mValue + mNaN
-        return SortRun(order: resultOrder, keys: keysA, measured: measured,
+        return SortRun(order: resultOrder, orderIsSorted: carryPayload, keys: keysA, measured: measured,
                        valueStart: valueStart, valueCount: mValue, nullStart: nullStart, nullCount: mNull,
                        flags: flags)
     }
@@ -485,7 +490,9 @@ extension MetalArray {
         // what `take` used to do; the sort has already carried the row numbers, so do exactly that.
         let fixed = ranges.reduce(0) { $0 + ($1.1 - $1.0) }
         var invert = true
-        if fixed * 2 > n { ranges = [(0, n)]; invert = false }
+        // Only when the row numbers over the value block are the sorted ones: without the payload the
+        // partition's are still in input order there, and only the null and NaN blocks may be read.
+        if fixed * 2 > n && run.orderIsSorted { ranges = [(0, n)]; invert = false }
         if !ranges.isEmpty && run.order == nil { return nil }
 
         let out = try MetalArrowBuffer.allocate(byteCount: n * T.byteWidth, zeroed: false, context: ctx)
