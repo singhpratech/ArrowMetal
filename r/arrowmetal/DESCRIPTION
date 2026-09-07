@@ -1,0 +1,21 @@
+Package: arrowmetal
+Type: Package
+Title: Apache Arrow Compute on Apple Silicon GPUs
+Version: 0.1.0
+Authors@R: person("ArrowMetal", "contributors", role = c("aut", "cre"),
+                  email = "noreply@arrowmetal.dev")
+Description: An R binding for ArrowMetal, which runs Apache Arrow compute
+    kernels on Apple silicon GPUs through Metal. Columns cross between the
+    'arrow' R package and the GPU through the Arrow C Data Interface, without
+    a copy when the producer's buffers are page aligned. The Swift core ships
+    as a separate dynamic library, opened at package load; set ARROWMETAL_LIB
+    to point at it.
+License: Apache License (>= 2)
+Encoding: UTF-8
+Depends: R (>= 4.1)
+Imports: arrow (>= 14.0.0)
+Suggests: testthat (>= 3.0.0), bit64, jsonlite, microbenchmark
+OS_type: unix
+SystemRequirements: macOS on Apple silicon, libArrowMetalC.dylib
+RoxygenNote: none
+Config/testthat/edition: 3

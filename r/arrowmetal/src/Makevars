@@ -1,0 +1,2 @@
+# The dylib is opened with dlopen at run time, so nothing is linked here.
+PKG_CPPFLAGS = -I.

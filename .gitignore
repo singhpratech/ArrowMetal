@@ -30,3 +30,9 @@ node/node_modules/
 node/build/
 node/dist/
 rust/**/target/
+# R package build artefacts
+r/arrowmetal/src/*.o
+r/arrowmetal/src/*.so
+r/arrowmetal.Rcheck/
+r/*.tar.gz
+r/arrowmetal/src/lib_path.h
