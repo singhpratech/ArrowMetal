@@ -14,6 +14,11 @@ Thanks for looking. This project is small enough to hold in your head; please ke
   Keep them readable; a slower obvious kernel beats a clever one until a benchmark says otherwise.
 - Run `swift test` in **both** debug and release (`swift test -c release`). We have already hit one
   release-only miscompile (see the comment at `Sources/ArrowMetal/MetalArray.swift:283`).
+- Run the binding suites too, and in release: `PYTHONPATH=python python -m pytest python/tests -q`
+  and `cd rust && cargo test --release`. The Rust suite compares against arrow-rs's own compute
+  kernels on the same data; if you touch `include/arrowmetal.h`, `rust/arrowmetal/tests/signatures.rs`
+  will tell you whether `rust/arrowmetal-sys` still matches it. Full list in
+  [docs/TESTING.md](docs/TESTING.md).
 - Run `swift run -c release arrowmetal-bench` before and after a performance change and paste both tables in
   the PR.
 

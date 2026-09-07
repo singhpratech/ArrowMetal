@@ -1,0 +1,299 @@
+# ArrowMetal for Rust users
+
+[arrow-rs](https://docs.rs/arrow) is where Rust keeps Arrow-shaped data. This document is how you
+point that data at the GPU.
+
+Two crates live in [`rust/`](../rust):
+
+| Crate | What it is |
+|---|---|
+| `arrowmetal-sys` | Raw `extern "C"` declarations over [`include/arrowmetal.h`](../include/arrowmetal.h), plus the `build.rs` that finds and links `libArrowMetalC.dylib`. |
+| `arrowmetal` | The safe crate. An `arrow::array::ArrayRef` goes in, an `ArrayRef` comes out; every failure is a `Result` carrying `am_last_error()`'s message. |
+
+Neither is published to crates.io yet (`publish = false`), so both are used by path or by git.
+
+Everything below was run in this repository on 2026-09-07 on an Apple M4 Max, macOS 26.6.2,
+`rustc 1.95.0`, arrow-rs 59.3.0, ArrowMetal 0.1.0. **No number on this page was not measured in that
+session.**
+
+---
+
+## Install
+
+ArrowMetal is a Metal library. It needs an **Apple silicon Mac**; there is no other target.
+
+```bash
+# 1. Build the GPU library. This is the only non-cargo step.
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+    swift build -c release --product ArrowMetalC
+```
+
+That produces `.build/release/libArrowMetalC.dylib`. Then, in your own crate:
+
+```toml
+# Cargo.toml
+[dependencies]
+arrow = "59"
+arrowmetal = { path = "../ArrowMetal/rust/arrowmetal" }
+# or, once you have a checkout somewhere fixed:
+# arrowmetal = { git = "https://github.com/singhpratech/ArrowMetal", branch = "main" }
+```
+
+and build with the dylib's location known:
+
+```bash
+ARROWMETAL_LIB=/path/to/ArrowMetal/.build/release/libArrowMetalC.dylib cargo build --release
+```
+
+### Finding the dylib
+
+`arrowmetal-sys/build.rs` searches, first hit wins:
+
+1. `$ARROWMETAL_LIB` — the full path to the dylib. This is the one to set.
+2. `$ARROWMETAL_LIB_DIR` — a directory holding it.
+3. `<repo>/.build/release`, then `<repo>/.build/debug` — a SwiftPM build in the ArrowMetal checkout.
+4. `/usr/local/lib`, `/opt/homebrew/lib`.
+
+Anything else is a hard build error naming every path it looked in and the `swift build` line, rather
+than a link that succeeds and a `dyld` failure at run time.
+
+The dylib's install name is `@rpath/libArrowMetalC.dylib`, so the directory that was found is baked
+into your binary as an `LC_RPATH` entry. **You do not need `DYLD_LIBRARY_PATH` at run time.** Because
+Cargo hands a build script's link arguments only to the crate that owns it, `arrowmetal-sys`
+republishes that directory through its `links = "ArrowMetalC"` key (`DEP_ARROWMETALC_LIB_DIR`) and
+`arrowmetal/build.rs` repeats the `-rpath` for its own binaries, examples and tests. A crate that
+depends on `arrowmetal` and builds a binary should do the same:
+
+```rust
+// your-crate/build.rs
+fn main() {
+    let dir = std::env::var("DEP_ARROWMETALC_LIB_DIR").unwrap();
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
+}
+```
+
+If you move the dylib after building, set `DYLD_LIBRARY_PATH` or rebuild.
+
+---
+
+## Example
+
+This is [`rust/arrowmetal/examples/quickstart.rs`](../rust/arrowmetal/examples/quickstart.rs) verbatim,
+so it is compiled by every `cargo build --examples`. Run it with
+`cargo run --release --example quickstart`; it prints `2 groups: [0, 1] -> [10, 27]` and
+`sum of everything: Some(Int64(42))`.
+
+```rust
+use std::sync::Arc;
+use arrow::array::{ArrayRef, Int64Array};
+use arrowmetal::{group_by, Array, CompareOp};
+
+fn main() -> Result<(), arrowmetal::Error> {
+    let region: ArrayRef = Arc::new(Int64Array::from(vec![0i64, 1, 0, 2, 1]));
+    let amount: ArrayRef = Arc::new(Int64Array::from(vec![Some(10i64), Some(20), None, Some(5), Some(7)]));
+
+    let region = Array::from_arrow(region.as_ref())?;   // to the GPU
+    let amount = Array::from_arrow(amount.as_ref())?;
+
+    let big = amount.compare_scalar(CompareOp::Gt, 5i64)?;   // boolean mask
+    let kept_amount = amount.filter(&big)?;                  // 10, 20, 7
+    let kept_region = region.filter(&big)?;
+
+    let gb = group_by(&[&kept_region])?;
+    let totals: ArrayRef = gb.sum(&kept_amount)?.to_arrow()?;  // back to arrow-rs
+    let keys: ArrayRef = gb.keys(0)?.to_arrow()?;
+
+    println!("{} groups: {keys:?} -> {totals:?}", gb.group_count());
+    println!("sum of everything: {:?}", amount.sum()?);
+    Ok(())
+}
+```
+
+---
+
+## The copy rule
+
+**Copy-free out always; copy-free in when the producer's buffers are page aligned, one copy
+otherwise.**
+
+Out ([`Array::to_arrow`]) is always copy-free. ArrowMetal's buffers are `MTLBuffer`s in shared
+memory; it hands their pointers straight to the C Data Interface with a release callback, and
+arrow-rs reads the GPU's memory in place. Measured: an exported buffer's pointer was page aligned in
+every case (`tests/copy_rule.rs::arrowmetal_exported_buffers_are_page_aligned`), and the export call
+itself took 0.001 ms for a 10M-row column.
+
+In ([`Array::from_arrow`]) is copy-free only when every buffer pointer is aligned to a **16 KiB
+page**, because that is what `MTLDevice.makeBuffer(bytesNoCopy:)` requires; otherwise each buffer is
+copied once. Whether an arrow-rs array clears that bar is a property of the *allocator*, not of
+arrow-rs, so it is measured rather than assumed. 32 allocations at each size, through both of
+arrow-rs's allocation paths (`Int64Array::from(Vec)`, which adopts the `Vec`'s own allocation, and a
+collected iterator, which fills an arrow-buffer `MutableBuffer`):
+
+| Values buffer | Page aligned, out of 32 |
+|---|---|
+| 128 B (16 int64) | 0 (`from(Vec)`), 1 (collected) |
+| 4 KiB (512 int64) | 8, 8 |
+| 64 KiB (8,192 int64) | 32, 32 |
+| 1 MiB, 10 MB, 80 MB | 32, 32 |
+
+So in practice **a column of a few thousand rows or more imports copy-free, and a very small one is
+copied**: the system allocator serves a large enough request with `mmap` and hands back page-aligned
+memory. That is not a guarantee — a custom global allocator, a different macOS, or a buffer sliced
+out of an arena can all change it. Run `cargo test --test copy_rule -- --nocapture` in `rust/` to
+print the table for your own machine.
+
+Copy-free is not free: at 10M int64 rows the import still cost **1.11 ms**, which is Metal mapping
+80 MB of pages into the GPU's address space. See the timing below.
+
+Two more facts, both tested:
+
+* **A slice does not cost a copy either way.** An Arrow `offset` is carried on the handle rather than
+  applied, so `array.slice(7, n)` imports the same buffers the unsliced array would.
+* **An array that came out of ArrowMetal and goes back in is never copied**, whatever its alignment:
+  ArrowMetal recognises its own exported buffers and shares the `MTLBuffer` objects directly.
+
+---
+
+## What is covered
+
+Each row is backed by a test in `rust/arrowmetal/tests/` against arrow-rs's own kernel on the same
+data, at lengths 0, 1, 33, 1024, 1025, 100,001 and 1,000,001, with and without nulls.
+
+| Rust | ArrowMetal ABI | Oracle |
+|---|---|---|
+| `Array::from_arrow` / `to_arrow` | `am_import` / `am_export` | round trip equals the input, including sliced arrays |
+| `len`, `null_count`, `format` | `am_length`, `am_null_count`, `am_format` | `arrow::array::Array` |
+| `sum`, `min`, `max`, `mean` | `am_reduce` | `arrow::compute::{sum, min, max}`; `mean` against arrow's exact sum over the valid count |
+| `compare_scalar`, `compare` (6 ops) | `am_compare_scalar`, `am_compare_array` | `arrow::compute::kernels::cmp` |
+| `filter` | `am_filter` | `arrow::compute::filter`, including a mask with nulls |
+| `take` | `am_take` | `arrow::compute::take`, with repeated, out-of-order and null indices |
+| `slice` | `am_slice` | `arrow::array::Array::slice` |
+| `sort`, `argsort` | `am_sort`, `am_argsort` | `arrow::compute::sort` with `nulls_first: false` |
+| `cast` | `am_cast` | `arrow::compute::cast` |
+| `group_by(keys)` with `sum`, `min`, `max`, `mean`, `count`, `count_all`; `keys(i)`, `ids()`, `agg_raw` | `am_group_by_keys`, `am_group_agg_ex` | a plain `HashMap` fold — arrow-rs's `arrow` crate has no hash aggregation (it lives in DataFusion) |
+| `Source`, `run_plan`, `explain_plan`, `PlanResult` | `am_plan_source_create`, `am_plan_run`, `am_plan_explain`, `am_plan_column*` | the same plan assembled by hand from arrow-rs kernels |
+| `batch(\|\| …)` | `am_batch_begin` / `am_batch_end` | the same chain unbatched, and arrow's answer |
+
+Element types: **Int64 and Float64** are swept against arrow-rs. Boolean arrays are exercised as
+comparison output and filter masks, and Int32 as sort indices. Every other Arrow type the ABI
+supports reaches the GPU through the same entry points but has **no test in this crate** — the Swift
+and Python suites cover them ([TESTING.md](TESTING.md)).
+
+Errors are `Result<T, arrowmetal::Error>`, and the message is `am_last_error()`'s, read on the spot
+because that slot is thread-local. A scalar of the wrong width is refused before the pointer reaches
+the ABI: `compare_scalar(Gt, 1i32)` on an `Int64Array` is an `Err`, not an out-of-bounds read.
+
+Handles (`Array`, `GroupBy`, `Source`, `PlanResult`) are `!Send` and `!Sync` on purpose: the ABI's
+error slot and its command-buffer batching are both thread-local. Use one set of handles per thread.
+
+### One divergence from arrow-rs, found and pinned
+
+`min` / `max` on a float column containing NaN. ArrowMetal skips NaN in both, and reports "no valid
+value" when every valid element is NaN — the header's rule, and pyarrow's. **arrow-rs's `max`
+propagates NaN instead** (its `min` skips it). `tests/compute.rs::nan_handling_diverges_from_arrow_rs_and_is_pinned`
+asserts both sides and fails if either moves. With no NaN in the data the two agree exactly, which is
+what every other reduction test relies on.
+
+---
+
+## What is not wrapped
+
+`include/arrowmetal.h` has 220 entry points. `arrowmetal-sys` declares 37 of them and the safe crate
+covers the list above. Everything below is reachable from Swift, Python and the C ABI, and **not**
+from this crate. There is no technical obstacle to any of it; it is unwrapped because it is untested
+here, and an untested wrapper is not a shipped one.
+
+| ABI area | Entry points |
+|---|---|
+| Strings | `am_str_unary`, `am_str_match`, `am_str_transform`, `am_str_concat`, `am_str_equals_array`, `am_str_dictionary_encode`, `am_string_predicate`, `am_string_transform`, `am_string_is_in`, `am_string_index_in`, `am_str_extra`, `am_to_strings`, `am_parse`, `am_byte_transform`, `am_binary_join`, `am_join_element_wise` |
+| Regex, LIKE, splitting | `am_regex`, `am_split`, `am_extract_struct` |
+| Temporal | `am_temporal_extract`, `am_temporal_cast_unit`, `am_temporal_math`, `am_temporal_extra`, `am_round_temporal_ex`, `am_assume_timezone`, `am_local_timestamp`, `am_utc_offset`, `am_to_timezone`, `am_add_interval`, `am_interval_between`, `am_interval_field` |
+| Decimals | `am_decimal_op`, `am_decimal_widen`, `am_decimal_narrow` |
+| Nested types (list, struct, map, union) | `am_list_value_length`, `am_list_flatten`, `am_list_element`, `am_list_slice`, `am_list_parent_indices`, `am_list_parent_indices64`, `am_struct_field`, `am_make_struct`, `am_child`, `am_child_count`, `am_map_lookup` |
+| Element-wise arithmetic and math | `am_arith_scalar`, `am_arith_array`, `am_unary`, `am_binary`, `am_trig`, `am_logical`, `am_float_class`, `am_math_extra`, `am_unary_checked`, `am_binary_checked`, `am_cumulative`, `am_cumulative_checked` |
+| Boolean and Kleene logic | `am_bool_and`, `am_bool_or`, `am_bool_not`, `am_and_kleene`, `am_or_kleene` |
+| Structural and conditional | `am_is_null`, `am_is_valid`, `am_fill_null`, `am_fill_null_direction`, `am_drop_null`, `am_if_else`, `am_coalesce`, `am_case_when`, `am_choose`, `am_replace_with_mask`, `am_indices_nonzero`, `am_true_unless_null` |
+| Set lookup and hashing | `am_is_in`, `am_index_in`, `am_is_in_ex`, `am_index_in_ex`, `am_hash64`, `am_fixed_binary_hash64`, `am_fixed_binary_compare` |
+| Sorting and selection beyond `sort`/`argsort` | `am_top_k`, `am_lexsort`, `am_lexsort_ex`, `am_argsort_ex`, `am_partition_nth_indices`, `am_partition_nth_ex`, `am_rank`, `am_rank_ex`, `am_rank_quantile_ex`, `am_inverse_permutation`, `am_scatter` |
+| Window functions and rolling | `am_window` |
+| The rest of the aggregates | `am_reduce_ex`, `am_reduce_ex2`, `am_count_all`, `am_first_last`, `am_winsorize`, `am_group_pivot_wider`, `am_pivot_wider` |
+| Dictionaries, run-end, uniqueness | `am_dictionary_encode`, `am_dictionary_encode_ex`, `am_dictionary_decode`, `am_run_end_encode`, `am_run_end_decode`, `am_unique`, `am_unique_ex`, `am_value_counts`, `am_value_counts_ex` |
+| Joins | `am_join` |
+| The fused expression query runner | `am_query`, `am_query_column*`, `am_query_scalar*`, `am_query_canonical` |
+| Parquet | `am_parquet_open`, `am_parquet_read`, `am_parquet_read_ex`, `am_parquet_write` and the 15 metadata accessors |
+| The streaming engine | all 30 `am_stream_*` entry points |
+| Device interop | `am_import_device`, `am_export_device` (CPU `am_import`/`am_export` are wrapped) |
+| Extension types, float16, null arrays, random | `am_extension_*`, `am_cast_float16`, `am_null_array`, `am_random` |
+| Execution-mode knobs | `am_resident_mode`, `am_resident_mode_available`, `am_resident_mode_reason`, `am_low_latency_wait`, `am_spin_microseconds` |
+
+Wrapping any of them is mechanical: add the `extern "C"` line to `arrowmetal-sys/src/lib.rs`, the
+method to `arrowmetal/src/lib.rs`, and a test to `arrowmetal/tests/compute.rs` against arrow-rs (or a
+hand oracle where arrow-rs has no counterpart). `tests/signatures.rs` will check the new declaration
+against the header on the next `cargo test`.
+
+---
+
+## The measured timing
+
+One run, 2026-09-07, Apple M4 Max, macOS 26.6.2, `rustc 1.95.0`, arrow-rs 59.3.0, ArrowMetal 0.1.0.
+
+**Method.** One 10,000,000-element `Int64Array` of pseudo-random values in `[-1_000_000, 1_000_000)`,
+no nulls, built once and shared by every row. Filter predicate `x > 0`, which keeps 5,000,125 of the
+10,000,000 rows (50.0%). `std::time::Instant` around the call, wall time, single-threaded, nothing
+subtracted, `std::hint::black_box` on every input and result. Three untimed warm-up iterations, then
+five timed ones; the table is the **best of the five** (medians were within a few percent, and are in
+[`rust/README.md`](../rust/README.md)). Both libraries' answers are asserted equal before anything is
+timed. Outside a batch every ArrowMetal call commits its command buffer and waits, so a "kernel"
+number is a complete GPU round trip, not an enqueue. Source:
+[`rust/arrowmetal/examples/bench.rs`](../rust/arrowmetal/examples/bench.rs); reproduce with
+`cargo run --release --example bench` in `rust/`.
+
+| Operation, 10M Int64 | arrow-rs | ArrowMetal, kernel | ArrowMetal, end to end |
+|---|---|---|---|
+| `sum` | 0.91 ms | **0.28 ms** | 2.11 ms |
+| `filter`, mask already built | 3.55 ms | **0.64 ms** | — |
+| compare + `filter` | 4.58 ms | — | **2.97 ms** |
+
+* **kernel** — the GPU call on an array already imported, mask already on the GPU. This is what each
+  step of a longer chain costs.
+* **end to end** — import from arrow-rs, run, export back. What *one* operation on an arrow-rs array
+  costs. Supporting numbers: import 1.11 ms, export 0.000 ms.
+
+**Where ArrowMetal loses.** A single `sum` on an arrow-rs array is **2.3× slower** than
+`arrow::compute::sum`: 2.11 ms against 0.91 ms. The kernel is 3.3× faster; the loss is entirely the
+1.11 ms it takes to hand 80 MB to Metal, plus about 0.7 ms of handle setup and first-touch. The
+import is copy-free at this size (the values buffer came back aligned to 4 MiB), so that is page
+mapping, not a `memcpy` — and it is still 1.1 ms that one cheap kernel does not earn back.
+
+The break-even is roughly "more than one pass over the data": `compare + filter` is two passes and
+ArrowMetal is already 1.5× faster end to end. **Import once, chain, export once.** Wrapping a single
+reduction is a loss.
+
+---
+
+## Limits
+
+* **Apple silicon only.** `arrowmetal-sys/build.rs` refuses to build anywhere else.
+* **Two element types are tested against arrow-rs**: Int64 and Float64, plus Boolean masks and Int32
+  indices. Anything else works through the same entry points but is untested from Rust.
+* **One thread per handle set.** Handles are `!Send` and `!Sync`; `am_last_error` and batching are
+  thread-local.
+* **No `RecordBatch` type.** Columns go across one at a time. The plan runner's `Source` takes a
+  named set of columns, which is the closest thing here to a table.
+* **`arrowmetal-sys` declares 37 of the ABI's 220 entry points**, and the safe crate covers fewer.
+  The table above lists what is missing.
+* **The crates are not published.** `publish = false` on both; use a path or git dependency.
+* **`arrow` is pinned to major version 59.** The C Data Interface structs are ABI-stable, so a
+  different arrow-rs major would very likely work, but it is not tested here.
+* **No async.** Every call is synchronous: outside a batch each one commits its command buffer and
+  waits. The ABI has an async path (`Sources/ArrowMetal/Async.swift`); this crate does not use it.
+
+## Testing
+
+```bash
+cd rust
+ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib cargo test --release
+```
+
+43 tests and 3 doc-tests, all green as of this writing. What each file compares against is in
+[`rust/README.md`](../rust/README.md) and in [TESTING.md](TESTING.md).
