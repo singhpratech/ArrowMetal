@@ -480,3 +480,69 @@ public func am_stream_result_stalls(_ r: OpaquePointer?,
     mergeStall?.pointee = Double(s.mergeStallNanos) / 1e9
     return 0
 }
+
+// MARK: - Fused broadcast join + aggregate
+
+/// Broadcast join with the aggregate fused into the probe: the joined rows are never materialised.
+///
+/// `build` is drained into memory once and turned into a device-resident hash table; every probe
+/// batch runs one kernel that walks that table and accumulates, and the running answer stays on the
+/// GPU for the whole scan. A value column is resolved against the probe side first and then the
+/// build side (a shadowed build column is reachable as `name_right`). Inner joins only: `kind = 1`
+/// returns an error rather than a wrong number.
+@_cdecl("am_stream_join_aggregate")
+public func am_stream_join_aggregate(_ s: OpaquePointer?, _ build: UnsafeMutablePointer<ArrowArrayStream>?,
+                                     _ probeKey: UnsafePointer<CChar>?, _ buildKey: UnsafePointer<CChar>?,
+                                     _ kind: Int32,
+                                     _ ops: UnsafeMutablePointer<Int32>?,
+                                     _ columns: UnsafeMutablePointer<UnsafePointer<CChar>?>?,
+                                     _ names: UnsafeMutablePointer<UnsafePointer<CChar>?>?, _ n: Int64,
+                                     _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
+    guard let b = streamBox(s), let build, let probeKey, let buildKey, let ops, let names, let out,
+          n > 0, let ns = cstrings(names, n) else { return 2 }
+    return runTerminal(out) {
+        var specs: [StreamAggregate] = []
+        for i in 0..<Int(n) {
+            guard let op = aggregateOp(ops[i]) else {
+                throw ArrowMetalError.unsupportedType("unknown streaming aggregate op \(ops[i])")
+            }
+            specs.append(StreamAggregate(op, columns?[i].map { String(cString: $0) }, name: ns[i]))
+        }
+        let buildBatch = try loadBuildSide(try CStreamSource(build))
+        return try b.query.join(buildBatch, on: String(cString: probeKey),
+                                buildKey: String(cString: buildKey),
+                                kind: kind == 1 ? .left : .inner).aggregate(specs)
+    }
+}
+
+/// Broadcast join followed by a streaming group-by. Keys may name a column of either side; only the
+/// key columns and the aggregated values of the matched pairs are gathered, never the joined batch.
+@_cdecl("am_stream_join_group_by")
+public func am_stream_join_group_by(_ s: OpaquePointer?, _ build: UnsafeMutablePointer<ArrowArrayStream>?,
+                                    _ probeKey: UnsafePointer<CChar>?, _ buildKey: UnsafePointer<CChar>?,
+                                    _ kind: Int32,
+                                    _ keys: UnsafeMutablePointer<UnsafePointer<CChar>?>?, _ nKeys: Int64,
+                                    _ ops: UnsafeMutablePointer<Int32>?,
+                                    _ columns: UnsafeMutablePointer<UnsafePointer<CChar>?>?,
+                                    _ names: UnsafeMutablePointer<UnsafePointer<CChar>?>?, _ nAggs: Int64,
+                                    _ denseKeyCount: Int64, _ ddof: Int32,
+                                    _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
+    guard let b = streamBox(s), let build, let probeKey, let buildKey, let ops, let names, let out,
+          nKeys > 0, nAggs > 0, let ks = cstrings(keys, nKeys),
+          let ns = cstrings(names, nAggs) else { return 2 }
+    return runTerminal(out) {
+        var specs: [StreamAggregate] = []
+        for i in 0..<Int(nAggs) {
+            guard let op = aggregateOp(ops[i]) else {
+                throw ArrowMetalError.unsupportedType("unknown streaming aggregate op \(ops[i])")
+            }
+            specs.append(StreamAggregate(op, columns?[i].map { String(cString: $0) }, name: ns[i]))
+        }
+        let buildBatch = try loadBuildSide(try CStreamSource(build))
+        return try b.query.join(buildBatch, on: String(cString: probeKey),
+                                buildKey: String(cString: buildKey),
+                                kind: kind == 1 ? .left : .inner)
+            .groupBy(ks, specs, denseKeyCount: denseKeyCount > 0 ? Int(denseKeyCount) : nil,
+                     ddof: Int(ddof))
+    }
+}

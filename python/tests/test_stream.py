@@ -244,7 +244,7 @@ def test_scan_arrow_from_a_record_batch_reader(table):
 def test_broadcast_join_matches_pyarrow(ipc_dir, table):
     dim = pa.table({"region": pa.array(np.arange(137, dtype=np.int32)),
                     "weight": pa.array(np.arange(137, dtype=np.int64) * 10)})
-    out = scan(ipc_dir).join(dim, on="region", how="inner", broadcast=True)
+    out = scan(ipc_dir).join(dim, on="region", how="inner", broadcast=True).collect()
     want = table.join(dim, keys="region", join_type="inner")
     assert out.num_rows == want.num_rows
     got = sorted(zip(out["id"].to_pylist(), out["weight"].to_pylist()))
@@ -259,12 +259,65 @@ def test_grace_join_equals_a_broadcast_join(tmp_path, ipc_dir, table):
     with pa.ipc.new_stream(dim_path, dim.schema) as w:
         w.write_table(dim)
     out = scan(ipc_dir).join(am.scan_ipc(str(dim_path)), on="region", how="inner",
-                             broadcast=False, partitions=8, scratch=str(tmp_path / "grace"))
+                             broadcast=False, partitions=8,
+                             scratch=str(tmp_path / "grace")).collect()
     want = table.join(dim, keys="region", join_type="inner")
     assert out.num_rows == want.num_rows
     got = sorted(zip(out["id"].to_pylist(), out["weight"].to_pylist()))
     exp = sorted(zip(want["id"].to_pylist(), want["weight"].to_pylist()))
     assert got == exp
+
+
+def _dim():
+    return pa.table({"region": pa.array(np.arange(137, dtype=np.int32)),
+                     "weight": pa.array(np.arange(137, dtype=np.int64) * 10)})
+
+
+def test_fused_join_aggregate_matches_the_unfused_join(ipc_dir, table):
+    dim = _dim()
+    want = table.join(dim, keys="region", join_type="inner")
+    got = scan(ipc_dir).join(dim, on="region").agg([("sum", "amount", "total"),
+                                                    ("sum", "weight", "w"),
+                                                    ("count", None, "n"),
+                                                    ("max", "amount", "mx")])
+    assert got["n"] == want.num_rows
+    assert got["w"] == pc.sum(want["weight"]).as_py()
+    assert got["total"] == pytest.approx(pc.sum(want["amount"]).as_py(), rel=1e-12)
+    assert got["mx"] == pytest.approx(pc.max(want["amount"]).as_py(), rel=1e-15)
+    # Nothing is folded on the host: the joined rows never leave the GPU.
+    assert scan(ipc_dir).join(dim, on="region").sum("amount") == pytest.approx(got["total"], rel=1e-12)
+
+
+def test_fused_join_group_by_matches_the_unfused_join(ipc_dir, table):
+    dim = _dim()
+    joined = table.join(dim, keys="region", join_type="inner")
+    got = scan(ipc_dir).join(dim, on="region").group_by("region").agg(
+        [("sum", "amount", "total"), ("count", None, "n")])
+    want = joined.group_by("region").aggregate([("amount", "sum"), ([], "count_all")])
+    assert got.num_rows == want.num_rows
+    a = dict(zip(got["region"].to_pylist(), got["n"].to_pylist()))
+    b = dict(zip(want["region"].to_pylist(), want["count_all"].to_pylist()))
+    assert a == b
+
+
+def test_fused_join_group_by_a_build_side_key(ipc_dir, table):
+    # `weight` only exists on the build side; grouping on it must still work.
+    dim = _dim()
+    got = scan(ipc_dir).join(dim, on="region").group_by("weight").agg([("count", None, "n")])
+    joined = table.join(dim, keys="region", join_type="inner")
+    want = joined.group_by("weight").aggregate([([], "count_all")])
+    assert dict(zip(got["weight"].to_pylist(), got["n"].to_pylist())) == \
+        dict(zip(want["weight"].to_pylist(), want["count_all"].to_pylist()))
+
+
+def test_left_join_plus_aggregate_raises(ipc_dir):
+    with pytest.raises(am.ArrowMetalError, match="inner"):
+        scan(ipc_dir).join(_dim(), on="region", how="left").sum("amount")
+
+
+def test_grace_join_plus_aggregate_raises(ipc_dir):
+    with pytest.raises(am.ArrowMetalError, match="broadcast"):
+        scan(ipc_dir).join(_dim(), on="region", broadcast=False).sum("amount")
 
 
 def test_progress_callback_sees_every_batch(ipc_dir):
