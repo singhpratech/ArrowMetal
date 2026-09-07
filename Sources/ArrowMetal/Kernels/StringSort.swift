@@ -26,8 +26,10 @@ import Metal
 
 extension MetalStringArray {
     /// Arrow `array_sort_indices` for utf8 / binary: int32 indices putting the rows in byte-wise
-    /// lexicographic order, stable, nulls last (in both directions, as Arrow specifies).
-    public func argsort(descending: Bool = false) throws -> MetalArray<Int32> {
+    /// lexicographic order, stable, with the null rows at whichever end `nullPlacement` names (past the
+    /// values in both directions, as Arrow specifies).
+    public func argsort(descending: Bool = false,
+                        nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
         let n = length
         let ctx = context
         try Dispatch.checkLength(n)
@@ -44,12 +46,13 @@ extension MetalStringArray {
         }
         let idx = try perm ?? MetalArray<Int32>.iota(n, context: ctx)
         guard nullCount > 0, let v = validity else { return idx }
-        return try Self.nullsLast(idx, validity: v, context: ctx)
+        return try Self.partitionNulls(idx, validity: v, placement: nullPlacement, context: ctx)
     }
 
     /// The rows in byte-wise lexicographic order (`argsort` then `take`).
-    public func sorted(descending: Bool = false) throws -> MetalStringArray {
-        let res = try take(try argsort(descending: descending))
+    public func sorted(descending: Bool = false,
+                       nullPlacement: NullPlacement = .atEnd) throws -> MetalStringArray {
+        let res = try take(try argsort(descending: descending, nullPlacement: nullPlacement))
         res.isBinary = isBinary
         return res
     }
@@ -85,20 +88,24 @@ extension MetalStringArray {
         return MetalArray<UInt64>(length: n, nullCount: 0, validity: nil, values: out, context: ctx)
     }
 
-    /// Stable partition of an index array that moves the null rows to the end, keeping the valid rows in
-    /// the order the sort left them and the null rows in row order — Arrow's `null_placement = "at_end"`.
-    static func nullsLast(_ idx: MetalArray<Int32>, validity: MetalArrowBuffer,
-                          context: MetalContext) throws -> MetalArray<Int32> {
+    /// Stable partition of an index array that moves the null rows to `placement`'s end, keeping the
+    /// valid rows in the order the sort left them and the null rows in row order — Arrow's
+    /// `null_placement`. `.atEnd` is Arrow's default; `.atStart` is what `lexsortIndices` passes down
+    /// when the caller asked for it, and dropping it here is what made a utf8 key ignore the option.
+    static func partitionNulls(_ idx: MetalArray<Int32>, validity: MetalArrowBuffer,
+                               placement: NullPlacement,
+                               context: MetalContext) throws -> MetalArray<Int32> {
         let n = idx.length
         let out = try MetalArrowBuffer.allocate(byteCount: n * 4, zeroed: false, context: context)
         return try withExtendedLifetime((idx, validity, out)) { () -> MetalArray<Int32> in
             let bm = validity.typed(UInt8.self)
             let src = idx.valuePointer, dst = out.mutableTyped(Int32.self)
-            var k = 0
-            for i in 0..<n { let j = src[i]; if Bitmap.isSet(bm, Int(j)) { dst[k] = j; k += 1 } }
             var nulls: [Int32] = []
             for i in 0..<n { let j = src[i]; if !Bitmap.isSet(bm, Int(j)) { nulls.append(j) } }
             nulls.sort()
+            var k = placement == .atStart ? nulls.count : 0
+            for i in 0..<n { let j = src[i]; if Bitmap.isSet(bm, Int(j)) { dst[k] = j; k += 1 } }
+            k = placement == .atStart ? 0 : n - nulls.count
             for j in nulls { dst[k] = j; k += 1 }
             return MetalArray<Int32>(length: n, nullCount: 0, validity: nil, values: out, context: context)
         }
