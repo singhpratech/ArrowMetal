@@ -18,9 +18,19 @@ the workaround can be removed.
 | Apple Metal | the Feature Set Tables say the Apple9 family has "the full set of 64-bit atomic operations", but the shading-language headers admit `device ulong` only for atomic min and max: no 64-bit add, compare-exchange, load or store compile, whatever language version is asked for (measured on an M4 Max, macOS 26.6.2). Grouped sums and hash tables carry 32-bit workarounds because of it | [DECISIONS.md](DECISIONS.md), [DESIGN.md](DESIGN.md); the probe is attached to the draft report | Feedback Assistant, not yet filed, draft ready | open |
 | Apple Metal | `makeComputePipelineState` fails sporadically on the "Apple Paravirtual device" GitHub-hosted runners expose | retry in `MetalContext.pipeline`; no public report found | Feedback Assistant, not yet filed; needs a CI log with the failure text first | open |
 | Apple Metal | a persistent GPU worker polling shared memory cannot be made to work: CPU/GPU coherence and the driver's submit-and-notify floor | [RESIDENT.md](RESIDENT.md), two measured probes | Feedback Assistant, not yet filed, draft in progress | open |
+| Swift 6.3.3 | a `withUnsafeBytes` closure inside a throwing generic convenience init miscompiled under `-O` (crash on entry, release builds only) | the plain-loop workaround in `MetalArray.init(_:)`, [FINDINGS.md](FINDINGS.md) | github.com/swiftlang/swift, not yet filed; a minimal reproducer is being built | open, reproducer needed |
 
 Nothing found in pandas, numpy, Polars or DuckDB is their defect: the costs the matrix measures there are
 crossings and idioms, not bugs.
+
+## Where each report goes
+
+| Project | Route | Public tracker |
+|---|---|---|
+| Apache Arrow (pyarrow, the vendored date library) | GitHub issues, and a pull request when the fix is ours | github.com/apache/arrow |
+| Swift compiler | GitHub issues, pull requests welcome | github.com/swiftlang/swift |
+| Apple Metal, the shading language, the driver | Feedback Assistant (private; the FB number is what goes in the Report column), the Apple Developer Forums for a public thread, a Developer Technical Support incident or a WWDC lab for a conversation | none: Metal is not open source and has no public issue tracker |
+| Apple's open-source projects that touch this work (MLX, Swift packages) | GitHub, like any other project | github.com/ml-explore/mlx, github.com/apple |
 
 ## How a row moves
 
