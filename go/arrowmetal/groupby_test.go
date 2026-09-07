@@ -17,96 +17,137 @@ func TestGroupBySumAgainstGo(t *testing.T) {
 	requireLib(t)
 	for _, n := range []int{1, 1000, 1000001} {
 		for _, groups := range []int64{1, 7, 1000} {
-			t.Run(fmt.Sprintf("n=%d/groups=%d", n, groups), func(t *testing.T) {
-				raw := genInt64(n)
-				keys := make([]int64, n)
-				vals := make([]int64, n)
-				for i := range keys {
-					k := raw[i] % groups
-					if k < 0 {
-						k += groups
+			// nullKeys says whether the key column carries nulls as well as the value column. A
+			// null key is its own group, so it moves the group count and the key column that comes
+			// back, not only the aggregate.
+			for _, nullKeys := range []bool{false, true} {
+				name := fmt.Sprintf("n=%d/groups=%d/nullKeys=%v", n, groups, nullKeys)
+				t.Run(name, func(t *testing.T) {
+					raw := genInt64(n)
+					keys := make([]int64, n)
+					vals := make([]int64, n)
+					for i := range keys {
+						k := raw[i] % groups
+						if k < 0 {
+							k += groups
+						}
+						keys[i] = k
+						vals[i] = raw[i] % 10000
 					}
-					keys[i] = k
-					vals[i] = raw[i] % 10000
-				}
-				keyValid := nullEvery(n, 13) // nulls in the values, not the keys
-				ka := buildInt64(t, keys, nil)
-				defer ka.Release()
-				va := buildInt64(t, vals, keyValid)
-				defer va.Release()
-
-				g, err := am.NewGroupBy(importArr(t, ka))
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer g.Release()
-
-				// Plain Go oracle.
-				wantSum := map[int64]int64{}
-				wantCount := map[int64]int64{}
-				wantRows := map[int64]int64{}
-				for i := range keys {
-					wantRows[keys[i]]++
-					if keyValid == nil || keyValid[i] {
-						wantSum[keys[i]] += vals[i]
-						wantCount[keys[i]]++
+					valueValid := nullEvery(n, 13)
+					var keyValid []bool
+					if nullKeys {
+						keyValid = nullEvery(n, 17)
 					}
-				}
-				if got, want := g.NumGroups(), int64(len(wantRows)); got != want {
-					t.Fatalf("NumGroups() = %d, want %d", got, want)
-				}
+					ka := buildInt64(t, keys, keyValid)
+					defer ka.Release()
+					va := buildInt64(t, vals, valueValid)
+					defer va.Release()
 
-				keyOut, err := g.Key(0)
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer keyOut.Release()
-				gotKeys, _ := int64sOf(t, exportArr(t, keyOut))
-				for i := 1; i < len(gotKeys); i++ {
-					if gotKeys[i-1] >= gotKeys[i] {
-						t.Fatalf("group keys are not ascending and distinct at %d: %v", i, gotKeys[i-1:i+1])
+					g, err := am.NewGroupBy(importArr(t, ka))
+					if err != nil {
+						t.Fatal(err)
 					}
-				}
+					defer g.Release()
 
-				sumOut, err := g.Sum(importArr(t, va))
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer sumOut.Release()
-				gotSums, _ := int64sOf(t, exportArr(t, sumOut))
-				if len(gotSums) != len(gotKeys) {
-					t.Fatalf("%d sums for %d groups", len(gotSums), len(gotKeys))
-				}
-				for i, k := range gotKeys {
-					if gotSums[i] != wantSum[k] {
-						t.Fatalf("group %d (key %d): sum = %d, want %d", i, k, gotSums[i], wantSum[k])
+					// Plain Go oracle. A null key is labelled nullGroup, which no real key can take
+					// because the keys are all in [0, groups).
+					const nullGroup = int64(-1)
+					groupOf := func(i int) int64 {
+						if keyValid != nil && !keyValid[i] {
+							return nullGroup
+						}
+						return keys[i]
 					}
-				}
+					wantSum := map[int64]int64{}
+					wantCount := map[int64]int64{}
+					wantRows := map[int64]int64{}
+					for i := range keys {
+						gid := groupOf(i)
+						wantRows[gid]++
+						if valueValid[i] {
+							wantSum[gid] += vals[i]
+							wantCount[gid]++
+						}
+					}
+					if got, want := g.NumGroups(), int64(len(wantRows)); got != want {
+						t.Fatalf("NumGroups() = %d, want %d", got, want)
+					}
 
-				cntOut, err := g.Count(importArr(t, va))
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer cntOut.Release()
-				gotCounts, _ := int64sOf(t, exportArr(t, cntOut))
-				for i, k := range gotKeys {
-					if gotCounts[i] != wantCount[k] {
-						t.Fatalf("group %d (key %d): count = %d, want %d", i, k, gotCounts[i], wantCount[k])
+					keyOut, err := g.Key(0)
+					if err != nil {
+						t.Fatal(err)
 					}
-				}
+					defer keyOut.Release()
+					rawKeys, keyOutValid := int64sOf(t, exportArr(t, keyOut))
+					// Label each result row the way the oracle labels an input row.
+					gotKeys := make([]int64, len(rawKeys))
+					for i := range rawKeys {
+						gotKeys[i] = nullGroup
+						if keyOutValid[i] {
+							gotKeys[i] = rawKeys[i]
+						}
+					}
+					// Ascending by key, nulls last, every group distinct.
+					seenNull := false
+					for i := range gotKeys {
+						if gotKeys[i] == nullGroup {
+							if i != len(gotKeys)-1 {
+								t.Fatalf("the null-key group is at row %d of %d, expected last",
+									i, len(gotKeys))
+							}
+							seenNull = true
+							continue
+						}
+						if i > 0 && gotKeys[i] <= gotKeys[i-1] {
+							t.Fatalf("group keys are not ascending and distinct at %d: %d then %d",
+								i, gotKeys[i-1], gotKeys[i])
+						}
+					}
+					if seenNull != nullKeys {
+						t.Fatalf("a null-key group is present = %v, want %v", seenNull, nullKeys)
+					}
 
-				rowsOut, err := g.CountAll()
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer rowsOut.Release()
-				gotRows, _ := int64sOf(t, exportArr(t, rowsOut))
-				for i, k := range gotKeys {
-					if gotRows[i] != wantRows[k] {
-						t.Fatalf("group %d (key %d): rows = %d, want %d", i, k, gotRows[i], wantRows[k])
+					sumOut, err := g.Sum(importArr(t, va))
+					if err != nil {
+						t.Fatal(err)
 					}
-				}
-			})
+					defer sumOut.Release()
+					gotSums, _ := int64sOf(t, exportArr(t, sumOut))
+					if len(gotSums) != len(gotKeys) {
+						t.Fatalf("%d sums for %d groups", len(gotSums), len(gotKeys))
+					}
+					for i, k := range gotKeys {
+						if gotSums[i] != wantSum[k] {
+							t.Fatalf("group %d (key %d): sum = %d, want %d", i, k, gotSums[i], wantSum[k])
+						}
+					}
+
+					cntOut, err := g.Count(importArr(t, va))
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer cntOut.Release()
+					gotCounts, _ := int64sOf(t, exportArr(t, cntOut))
+					for i, k := range gotKeys {
+						if gotCounts[i] != wantCount[k] {
+							t.Fatalf("group %d (key %d): count = %d, want %d", i, k, gotCounts[i], wantCount[k])
+						}
+					}
+
+					rowsOut, err := g.CountAll()
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer rowsOut.Release()
+					gotRows, _ := int64sOf(t, exportArr(t, rowsOut))
+					for i, k := range gotKeys {
+						if gotRows[i] != wantRows[k] {
+							t.Fatalf("group %d (key %d): rows = %d, want %d", i, k, gotRows[i], wantRows[k])
+						}
+					}
+				})
+			}
 		}
 	}
 }

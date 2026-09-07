@@ -123,6 +123,18 @@ func TestPlanRecordBatch(t *testing.T) {
 	if rb.Schema().Field(0).Name != "region" || rb.Schema().Field(1).Name != "total" {
 		t.Fatalf("schema = %v", rb.Schema())
 	}
+	// Nullability is read off each column rather than asserted: neither result column here can
+	// contain a null (every group has a key and a sum), so both must come back non-nullable.
+	for i := 0; i < int(rb.NumCols()); i++ {
+		f := rb.Schema().Field(i)
+		if got, want := f.Nullable, rb.Column(i).NullN() != 0; got != want {
+			t.Fatalf("field %q Nullable = %v but the column has %d nulls",
+				f.Name, got, rb.Column(i).NullN())
+		}
+		if f.Nullable {
+			t.Fatalf("field %q is marked nullable but no group can be null here", f.Name)
+		}
+	}
 
 	want := map[int64]int64{}
 	for i := range region {

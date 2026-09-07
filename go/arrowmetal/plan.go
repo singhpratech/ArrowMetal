@@ -232,7 +232,10 @@ func (r *PlanResult) RecordBatch() (arrow.RecordBatch, error) {
 			return nil, err
 		}
 		cols = append(cols, a)
-		fields[i] = arrow.Field{Name: r.ColumnName(i), Type: a.DataType(), Nullable: true}
+		// The ABI carries no nullability flag, so the column itself is the only evidence: a column
+		// that came back with nulls is nullable, one that did not is not. NullN can report -1 for
+		// "not computed", which counts as nullable rather than claiming otherwise.
+		fields[i] = arrow.Field{Name: r.ColumnName(i), Type: a.DataType(), Nullable: a.NullN() != 0}
 	}
 	rb := array.NewRecordBatch(arrow.NewSchema(fields, nil), cols, r.NumRows())
 	for _, c := range cols {

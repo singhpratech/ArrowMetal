@@ -38,16 +38,20 @@ func nullEvery(n, k int) []bool {
 	return v
 }
 
-func genInt64(n int) []int64 {
+// genInt64Seed is a cheap deterministic spread with both signs and repeats, so sorts and group-bys
+// see ties. Different seeds give independent streams, which matters wherever a test needs two
+// columns that are not functions of each other.
+func genInt64Seed(n int, seed int64) []int64 {
 	v := make([]int64, n)
-	// A cheap deterministic spread with both signs and repeats, so sorts and group-bys see ties.
-	x := int64(1)
+	x := seed
 	for i := range v {
 		x = (x*6364136223846793005 + 1442695040888963407)
 		v[i] = x >> 40 // ~24 bits, signed
 	}
 	return v
 }
+
+func genInt64(n int) []int64 { return genInt64Seed(n, 1) }
 
 func genFloat64(n int) []float64 {
 	src := genInt64(n)

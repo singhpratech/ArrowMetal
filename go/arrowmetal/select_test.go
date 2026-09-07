@@ -271,8 +271,10 @@ func TestArgsortAgainstArrowGo(t *testing.T) {
 func TestLexsort(t *testing.T) {
 	requireLib(t)
 	const n = 100000
-	a := genInt64(n)
-	b := genInt64(n)
+	// Two independent streams: with one generator the minor key would be a function of the major
+	// one, so ties in the major key would never actually exercise the minor comparison.
+	a := genInt64Seed(n, 1)
+	b := genInt64Seed(n, 0x5eed)
 	for i := range a {
 		a[i] %= 10 // a few distinct values in the major key, so the minor key decides most rows
 		b[i] %= 1000
