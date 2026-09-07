@@ -14,7 +14,7 @@ it and compares, so a kernel that is wrong in an unanticipated way still fails.
 | Files | `python/tests/test_differential.py` (the harness), `python/tests/differential_report.py` (the runner) |
 | Oracle | `pyarrow.compute` 25.0.1, plus a reference written in the harness for the 16 operations Arrow has no function for |
 | Cases in the default matrix | 39,069 — 212 operations x 45 column types x 27 datasets — about 220 s on an M4 Max; more with `DIFF_LARGE=1` |
-| Result at 0.1.0 | 36,460 pass, 1,592 fail across 24 documented divergences, 1,017 skip (kernels not implemented), **0 unclassified** |
+| Result at 0.1.0 | 36,486 pass, 1,566 fail across 22 documented divergences, 1,017 skip (an operation that does not apply to a type), **0 unclassified** |
 
 ## Method
 
