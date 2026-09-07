@@ -1518,6 +1518,10 @@ int         am_stream_result_stats(am_stream_result* r, int64_t* batches, int64_
                                    double* gpu_s, double* merge_s, double* overlap);
 void        am_stream_result_release(am_stream_result* r);
 
+// Backpressure of the streaming pipeline: seconds the GPU stage spent waiting for a batch the
+// readers had not finished, and seconds it spent waiting for the merge queue to drain.
+int         am_stream_result_stalls(am_stream_result* r, double* read_stall_s, double* merge_stall_s);
+
 #ifdef __cplusplus
 }
 #endif

@@ -857,8 +857,9 @@ def report(records, ctx_bytes, rows, engines, workloads, checks):
                   f"{fmt(r['peak_rss_mb'], '.0f')} | yes | {check} |")
         print()
     print("## ArrowMetal pipeline\n")
-    print("| Workload | Overlap | Batches | Rows | Read (s) | GPU (s) | Merge (s) | Read GB/s |")
-    print("|---|---:|---:|---:|---:|---:|---:|---:|")
+    print("| Workload | Overlap | Batches | Rows | Read (s) | GPU (s) | Merge (s) | "
+          "Read stall (s) | Merge stall (s) | Read GB/s |")
+    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for workload in workloads:
         r = records.get((workload, "arrowmetal"))
         if r is None or r["status"] != "ok":
@@ -868,7 +869,8 @@ def report(records, ctx_bytes, rows, engines, workloads, checks):
         read_gbs = (s.get("bytes_read", 0) / read_s / 1e9) if read_s else None
         print(f"| {workload} | {fmt(s.get('overlap'), '.2f')} | {s.get('batches', '-')} | "
               f"{s.get('rows', '-')} | {fmt(s.get('read_s'), '.2f')} | {fmt(s.get('gpu_s'), '.2f')} | "
-              f"{fmt(s.get('merge_s'), '.2f')} | {fmt(read_gbs, '.2f')} |")
+              f"{fmt(s.get('merge_s'), '.2f')} | {fmt(s.get('read_stall_s'), '.2f')} | "
+              f"{fmt(s.get('merge_stall_s'), '.2f')} | {fmt(read_gbs, '.2f')} |")
     print()
 
 

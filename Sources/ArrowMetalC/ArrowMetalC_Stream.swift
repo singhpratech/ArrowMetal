@@ -466,3 +466,17 @@ public func am_stream_result_release(_ r: OpaquePointer?) {
     guard let r else { return }
     Unmanaged<StreamResultBox>.fromOpaque(UnsafeRawPointer(r)).release()
 }
+
+/// Backpressure: how long the GPU stage waited for a batch the readers had not finished, and how
+/// long it waited for the merge queue to drain. Both near zero means neither stage is starving the
+/// other and the bounded queues never became the bottleneck.
+@_cdecl("am_stream_result_stalls")
+public func am_stream_result_stalls(_ r: OpaquePointer?,
+                                    _ readStall: UnsafeMutablePointer<Double>?,
+                                    _ mergeStall: UnsafeMutablePointer<Double>?) -> Int32 {
+    guard let b = resultBox(r) else { return 2 }
+    let s = b.result.stats
+    readStall?.pointee = Double(s.readStallNanos) / 1e9
+    mergeStall?.pointee = Double(s.mergeStallNanos) / 1e9
+    return 0
+}

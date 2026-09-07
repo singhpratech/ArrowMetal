@@ -118,6 +118,12 @@ _lib.am_stream_result_rows_out.restype = ctypes.c_int64
 _lib.am_stream_result_stats.argtypes = [_R] + [ctypes.POINTER(ctypes.c_int64)] * 3 + \
                                        [ctypes.POINTER(ctypes.c_double)] * 5
 _lib.am_stream_result_stats.restype = ctypes.c_int
+# Optional: a library built before the stall counters existed still loads.
+_am_stream_result_stalls = getattr(_lib, "am_stream_result_stalls", None)
+if _am_stream_result_stalls is not None:
+    _am_stream_result_stalls.argtypes = [_R, ctypes.POINTER(ctypes.c_double),
+                                         ctypes.POINTER(ctypes.c_double)]
+    _am_stream_result_stalls.restype = ctypes.c_int
 _lib.am_stream_result_release.argtypes = [_R]
 
 
@@ -189,9 +195,17 @@ class _Result:
         _check_stream(_lib.am_stream_result_stats(self._h, ctypes.byref(b), ctypes.byref(r), ctypes.byref(by),
                                                   ctypes.byref(wall), ctypes.byref(read), ctypes.byref(gpu),
                                                   ctypes.byref(merge), ctypes.byref(overlap)))
+        # Backpressure. Both queues are bounded, so a stall is the only thing that says which stage is
+        # the limit: read_stall_s is the GPU stage waiting for a batch the readers had not finished,
+        # merge_stall_s is it waiting for the merge queue to drain.
+        read_stall, merge_stall = ctypes.c_double(), ctypes.c_double()
+        if _am_stream_result_stalls is not None:
+            _check_stream(_am_stream_result_stalls(self._h, ctypes.byref(read_stall),
+                                                   ctypes.byref(merge_stall)))
         wall_s = wall.value
         return {"batches": b.value, "rows": r.value, "bytes_read": by.value,
                 "wall_s": wall_s, "read_s": read.value, "gpu_s": gpu.value, "merge_s": merge.value,
+                "read_stall_s": read_stall.value, "merge_stall_s": merge_stall.value,
                 "overlap": overlap.value,
                 "gb_per_s": (by.value / 1e9 / wall_s) if wall_s > 0 else 0.0}
 
@@ -549,3 +563,4 @@ def scan_table(table, batch_rows=1 << 20):
     else:
         reader = _as_reader(table)
     return scan_arrow(reader)
+
