@@ -157,3 +157,80 @@ in `upper`/`lower`/`trim` (3.7 ms → 54 ms at 10M rows) introduced with full-Un
 the hybrid GPU/host driver allocated and walked an n-sized host array even when no row needed the
 host. That is fixed in the commit that adds this page (`upper` 4.6 ms, `trim` 3.0 ms at 10M rows,
 results identical to pyarrow) and the matrix row will be re-measured in the next full run.
+
+## Fixed since the matrix
+
+Four of the rows above have been re-measured on the same idle M4 Max after the work described here.
+The numbers are from `Benchmarks/loss_sort_shift_sqrt.py`, which uses `full_matrix.py`'s columns, seed
+and rule (one warm-up, best of five), run before and after alternately in separate processes. The
+matrix tables above are the record of the 2026-09-07 run and are not edited; these rows will move when
+the matrix is next run in full.
+
+| operation | rows | before | after | fastest CPU | before | after |
+|---|---:|---:|---:|---|---:|---:|
+| sqrt (float64) | 10,000,000 | 2.67 ms | **1.36 ms** | 2.53 ms (numpy) | 0.95x | **1.86x** |
+| sqrt (float64) | 50,000,000 | 12.96 ms | **3.89 ms** | 12.54 ms (numpy) | 1.03x | **3.23x** |
+| sort float64 | 10,000,000 | 32.3 ms | **9.42 ms** | 30.1 ms (Polars) | 1.09x | **3.20x** |
+| sort float64 | 50,000,000 | 154.6 ms | **49.2 ms** | 141.8 ms (Polars) | 1.95x | **2.88x** |
+| argsort int64 | 10,000,000 | 27.8 ms | **7.68 ms** | 57.2 ms (Polars) | 2.21x | **7.45x** |
+| argsort int64 | 50,000,000 | 142.1 ms | **39.0 ms** | 302.6 ms (Polars) | 5.23x | **7.76x** |
+| argsort float64 | 10,000,000 | 28.1 ms | **7.93 ms** | 82.3 ms (Polars) | 3.15x | **10.4x** |
+| argsort float64 | 50,000,000 | 143.3 ms | **39.8 ms** | 445.1 ms (Polars) | 6.85x | **11.2x** |
+| shift (lag 1, int64), `view=True` | 10,000,000 | — | **0.037 ms** | 0.033 ms (Polars) | — | **0.91x** |
+| shift (lag 1, int64), `view=True` | 50,000,000 | — | **0.154 ms** | 0.034 ms (Polars) | — | **0.22x** |
+
+(The CPU figures on the 50M rows of the "before" pass ran while a second process was resident and came
+out 2–3x slower than the matrix's; the CPU column above therefore quotes the quiet "after" pass, which
+agrees with the matrix to within a few per cent. ArrowMetal's own before-numbers agree with the matrix
+in both passes.)
+
+**`sqrt`.** Still correctly rounded — bit-identical to `Foundation.sqrt`, and to numpy and Python's
+`math.sqrt` over 10.6M values covering the subnormals, every binade, both sides of exact squares, ±0,
+±inf, NaN and negatives. The 54-step restoring extraction is gone; in its place is a hardware `rsqrt`
+seed, three Newton steps on the reciprocal square root in Q62 fixed point, and the exact 128-bit
+remainder `N - q²` to settle the last bit, which is the same shape `d_div` has used since it stopped
+being a long division. At 50M rows the kernel now moves its 800 MB at 206 GB/s, so what is left is
+bandwidth, not arithmetic. At 10M rows it is 1.86x rather than 3x for the ordinary reason: 1.36 ms is
+close enough to the dispatch floor that the fixed cost shows.
+
+**The radix sort.** Three changes, in order of what they were worth. The stable scatter used to find an
+element's rank among the earlier elements of its 256-element chunk carrying the same digit by *walking
+the chunk* — a 256-iteration loop per element for the rank and a second one per digit for the chunk
+totals, about 1,500 instructions an element per pass, which was roughly two thirds of the whole sort.
+It is now eight `simd_ballot`s to isolate the lanes of the SIMD group holding the same digit, a
+popcount for the rank, and a byte per (SIMD group, digit) so the groups of a chunk add up across.
+Blocks then became far bigger and fewer — about 128 rather than n/4096 — because each block loads and
+clears the whole bin table on every pass and the digit scan is a single threadgroup over
+`radix × blocks` entries; the scatter is memory bound and does not miss the parallelism. Last, a pass
+whose digit is the same in every row is an identity permutation (the sort is stable) and is now
+dropped: the first histogram reports the bitwise OR and AND of the keys next to its counts, and
+`or ^ and` names every skippable pass at once, so a small-range, sorted-ish or single-valued column
+loses most of its passes. Every permutation is unchanged — checked against `pc.array_sort_indices` over
+21 lengths × 2 directions × 2 null placements × 10 key shapes.
+
+The "fewer, wider digits" line above was the wrong guess, and it was measured rather than assumed away:
+eleven bits do take a 64-bit key in six passes instead of eight, but a 2048-bin scatter needs 24 KB of
+threadgroup memory against 3 KB, and the occupancy that costs is worth more than the two passes it
+saves. Argsort of 50M int64, same code, digit width only: 8 bits 37.7 ms, 10 bits 84.3 ms, 11 bits
+96.3 ms; 12 bits does not fit in threadgroup memory at all.
+
+`sort float64` reaches 2.9x rather than 3x, and the remainder is not the sort: it is `take`. `sorted()`
+is `take(argsort())`, and the gather costs 9.4 ms of the 49.2 at 50M rows because a random 8-byte
+gather pulls a whole cache line per element. The sorted *keys* are already sitting in the sort's own
+buffer and the key map is a bijection for every value except -0.0 and NaN, so inverting them instead of
+gathering would remove that 9.4 ms — for a column with no nulls, no NaN and no -0.0, which needs a flag
+the key kernel does not raise yet. That is the next step, and unlike the last one it has been costed.
+
+**`shift`.** The copy is unchanged and is still the default, because it was never the thing that was
+wrong: 3.6 ms for the 813 MB it touches at 50M rows is 226 GB/s, this machine's bandwidth and rather
+more than the sqrt kernel next to it reaches, so a better kernel would still be fifty times slower than
+a pointer. What was missing was the option not to copy. `shift(by, fill, view=True)` in Python returns
+a `pyarrow.ChunkedArray` of two chunks — |by| rows of `fill` or of nulls in front, and a slice of the
+input behind, still pointing at the same device memory — and moves nothing, which is exactly the answer
+Polars gives. It is opt-in rather than the default because the chunked form is not a `MetalArray` and
+cannot go back into an ArrowMetal kernel without being combined first, which costs the copy that was
+just avoided; `MetalArray` still has no chunked representation, and that has not changed.
+
+The 50M view costs 0.154 ms rather than the 0.003 ms the pointer arithmetic takes, because
+`pa.chunked_array` settles the slice's null count — a popcount over 50M validity bits. A column with no
+nulls does not pay it. That is pyarrow's accounting, not a copy.
