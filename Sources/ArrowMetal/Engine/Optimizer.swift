@@ -498,9 +498,16 @@ public struct Optimizer {
     ///
     /// Only applied when the two schemas share no column names outside the keys, because a shared name
     /// is renamed by the join's suffix and the rename would follow the swap.
-    private mutating func reorderJoins(_ plan: LogicalPlan) -> LogicalPlan {
+    ///
+    /// A swap is a permutation of the rows, and `docs/ENGINE.md` promises an inner join keeps probe
+    /// (left) order — so it only fires where nothing above can observe the order: under a sort, a
+    /// whole-input reduction or a group-by (whose aggregates are all order independent). Under a
+    /// `limit`, a `distinct`, a `window`, another join or a `union`, the order is part of the answer
+    /// and the join stays as written.
+    private mutating func reorderJoins(_ plan: LogicalPlan, orderMatters: Bool = true) -> LogicalPlan {
         guard enabled("join_reorder") else { return plan }
-        let p = plan.mappingChildren { reorderJoins($0) }
+        let p = reorderJoinsInChildren(plan, orderMatters: orderMatters)
+        guard !orderMatters else { return p }
         guard case .join(let l, let r, let spec) = p, spec.how == .inner,
               let before = try? p.schema(), let ls = try? l.schema(), let rs = try? r.schema()
         else { return p }
@@ -512,6 +519,26 @@ public struct Optimizer {
         let swapped = LogicalPlan.join(r, l, JoinSpec(leftOn: spec.rightOn, rightOn: spec.leftOn,
                                                      how: .inner, suffix: spec.suffix))
         return .project(swapped, before.names.map { NamedExpr($0, .column($0)) })
+    }
+
+    /// Recurses into the children, saying for each whether this node can observe their row order.
+    private mutating func reorderJoinsInChildren(_ plan: LogicalPlan, orderMatters: Bool) -> LogicalPlan {
+        switch plan {
+        // These discard their input's order outright.
+        case .sort(let c, let k): return .sort(reorderJoins(c, orderMatters: false), k)
+        case .aggregate(let c, let a): return .aggregate(reorderJoins(c, orderMatters: false), a)
+        case .groupAggregate(let c, let k, let a):
+            // Every `ExprAggregate.Op` (count/sum/min/max/mean) is order independent, and the engine
+            // does not promise an order for the groups themselves.
+            return .groupAggregate(reorderJoins(c, orderMatters: false), keys: k, aggregates: a)
+        // These pass their input's order straight through, so they inherit the question.
+        case .filter(let c, let e): return .filter(reorderJoins(c, orderMatters: orderMatters), e)
+        case .project(let c, let ps): return .project(reorderJoins(c, orderMatters: orderMatters), ps)
+        case .withColumns(let c, let ps): return .withColumns(reorderJoins(c, orderMatters: orderMatters), ps)
+        // Everything else reads the order itself (head, first-occurrence, lag, probe side, concat),
+        // so its children's order is always observable.
+        default: return plan.mappingChildren { reorderJoins($0, orderMatters: true) }
+        }
     }
 }
 
