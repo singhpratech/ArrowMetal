@@ -21,3 +21,10 @@ __pycache__/
 
 # Rust plugin build artefacts (the workspace target, and any per-crate one)
 polars-plugin/**/target/
+
+# R package build artefacts
+r/arrowmetal/src/*.o
+r/arrowmetal/src/*.so
+r/arrowmetal/inst/arrowmetal_lib_path
+r/arrowmetal.Rcheck/
+r/*.tar.gz

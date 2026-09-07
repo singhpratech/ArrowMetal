@@ -1,0 +1,18 @@
+#!/bin/sh
+# Records the absolute path of the in-tree dylib so an installed package can find it without
+# ARROWMETAL_LIB. The package installs and loads fine when this finds nothing; the error at first
+# use then names both ARROWMETAL_LIB and the relative path that was tried.
+set -e
+SRC=`pwd`
+CAND="$SRC/../../.build/release/libArrowMetalC.dylib"
+mkdir -p inst
+if [ -f "$CAND" ]; then
+  # Resolve ../.. without requiring GNU realpath.
+  ABS=`cd "$SRC/../../.build/release" && pwd`/libArrowMetalC.dylib
+  echo "$ABS" > inst/arrowmetal_lib_path
+  echo "arrowmetal: recorded dylib at $ABS"
+else
+  rm -f inst/arrowmetal_lib_path
+  echo "arrowmetal: no dylib at $CAND; set ARROWMETAL_LIB at run time"
+fi
+exit 0
