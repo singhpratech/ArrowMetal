@@ -814,3 +814,49 @@ def test_query_lifts_only_the_columns_it_names():
     # and a query naming a column that is not in the frame at all is a clear error, not a KeyError
     with pytest.raises(am.ArrowMetalError, match="not in the frame"):
         df.am.query(am.filter(am.col("nope") > 1).sum(am.col("x")))
+
+
+def test_import_works_with_none_of_the_three_libraries_installed():
+    """`import arrowmetal` must not need polars, pandas or duckdb, and must still work after.
+
+    Run in a subprocess with a meta-path finder that refuses all three, which is what a machine
+    without them looks like -- this session has all three imported, so nothing in-process can
+    answer the question. Also pins two properties of the `_LAZY_HOOKS` chain: the lazy names are in
+    `dir()` even when unreachable, and `from arrowmetal import *` does **not** carry them (there is
+    no `__all__`, and adding one would make `import *` try to resolve every optional bridge and so
+    fail on exactly the machine this test is about).
+    """
+    import subprocess
+    program = r"""
+import sys
+BLOCKED = {"polars", "pandas", "duckdb"}
+class Blocker:
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] in BLOCKED:
+            raise ImportError("blocked: " + name)
+        return None
+import pyarrow as pa                       # a real install has this before the block matters
+sys.meta_path.insert(0, Blocker())
+import arrowmetal as am
+assert am.version()
+assert am.MetalArray.from_arrow(pa.array([1, 2, 3])).sum() == 6
+for name in ("from_polars", "from_pandas", "polars_bridge", "pandas_bridge"):
+    assert name in dir(am), name
+    try:
+        getattr(am, name)
+        raise SystemExit("%s resolved with its library blocked" % name)
+    except ImportError:
+        pass
+assert am.from_duckdb is not None          # duckdb's bridge module needs no duckdb to import
+ns = {}
+exec("from arrowmetal import *", ns)
+assert "query" in ns and "MetalArray" in ns
+assert "from_polars" not in ns and "from_pandas" not in ns
+print("ok")
+"""
+    env = dict(os.environ,
+               PYTHONPATH=os.path.dirname(os.path.dirname(os.path.abspath(am.__file__))))
+    out = subprocess.run([os.sys.executable, "-c", program],
+                         capture_output=True, text=True, env=env)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "ok" in out.stdout
