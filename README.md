@@ -4,7 +4,7 @@
 understand Arrow's layout natively: validity bitmaps, packed booleans, the C Data Interface and the
 C Device Data Interface (`ARROW_DEVICE_METAL`).
 
-> Status: v0.1, early and small on purpose. The core works, is tested against a CPU oracle, and is fast.
+> Status: 0.1.0, unreleased, early and small on purpose. The core works, is tested against pyarrow and a CPU oracle, and is measured on every operation, with the rows it loses published beside the ones it wins.
 > Everything on the [roadmap](docs/ROADMAP.md) is up for grabs.
 
 ## The pitch in one paragraph
