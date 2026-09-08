@@ -101,8 +101,8 @@ def build(md_path, token, ours=("singhpratech",)):
                 community += 1
         for ev in paged(f"{API}/repos/{owner}/{repo}/issues/{num}/timeline?per_page=100", token):
             at, actor, t = ev.get("created_at"), (ev.get("actor") or {}).get("login"), ev.get("event")
-            if actor in mine:
-                continue
+            if actor in mine and t != "cross-referenced":
+                continue        # our own labels/closes are not project-side activity; our own fix PRs are shown
             if t in ("labeled", "unlabeled"):
                 events.append({"type": t, "at": at, "actor": actor, "label": ev["label"]["name"]})
             elif t in ("closed", "reopened"):
@@ -111,8 +111,10 @@ def build(md_path, token, ours=("singhpratech",)):
             elif t == "cross-referenced" and ev.get("source", {}).get("issue", {}).get("pull_request") \
                     and ev["source"]["issue"].get("repository", {}).get("full_name", "").lower() == f"{owner}/{repo}".lower():
                 src = ev["source"]["issue"]
-                events.append({"type": "pull_request", "at": at, "actor": (src.get("user") or {}).get("login"), "title": src["title"],
-                               "url": src["html_url"], "state": "merged" if src.get("pull_request", {}).get("merged_at") else src["state"]})
+                pr_author = (src.get("user") or {}).get("login")
+                events.append({"type": "pull_request", "at": at, "actor": pr_author, "title": src["title"],
+                               "url": src["html_url"], "state": "merged" if src.get("pull_request", {}).get("merged_at") else src["state"],
+                               "by_reporter": pr_author in mine})
             elif t == "referenced" and ev.get("commit_id"):
                 events.append({"type": "commit", "at": at, "actor": actor, "url": f"https://github.com/{owner}/{repo}/commit/{ev['commit_id']}"})
             elif t == "milestoned":
@@ -138,7 +140,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--md", default="docs/UPSTREAM.md")
     ap.add_argument("--out", default="upstream/status.json")
-    ap.add_argument("--reporter", default="singhpratech", help="our GitHub login(s), comma separated; their comments are counted, not shown")
+    ap.add_argument("--reporter", default="singhpratech", help="our GitHub login(s), comma separated; their comments are counted, not shown; their fix pull requests are shown")
     a = ap.parse_args()
     data = build(a.md, os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"), tuple(a.reporter.split(",")))
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
