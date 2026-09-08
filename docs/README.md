@@ -18,6 +18,8 @@ test or the CSV a claim comes from.
 | [DESIGN.md](DESIGN.md) | How it works: buffers, kernels, batching, GPU-side lengths, software Float64, where the time goes |
 | [PANDAS.md](PANDAS.md) | pandas on the GPU: the `.am` accessor and the zero-code-change accel mode, what routes to the GPU and when, the zero-copy and null rules, the numbers and the limits |
 | [NUMPY.md](NUMPY.md) | numpy on the GPU through pyarrow: which dtypes cross without a copy (asserted by `test_numpy.py`), NaN-as-value semantics, the matrix rows measured against numpy, and the NEP 18 step that is ours to take |
+| [SWIFT.md](SWIFT.md) | The native Swift API: install, the types, the copy rule, tests and where its numbers live |
+| [C.md](C.md) | The C ABI: build the dylib, the handle and error conventions, an example, what the header covers |
 | [RUST.md](RUST.md) | The Rust crate over the C ABI: install, the copy rule as measured, what is wrapped and what is not, the timing table with its method |
 | [GO.md](GO.md) | The Go module: cgo shim, pinning, the alignment finding, what is wrapped, the timing table |
 | [TYPESCRIPT.md](TYPESCRIPT.md) | The Node addon and TypeScript API: Arrow JS interop, lifetimes, the copy rule, timings |
