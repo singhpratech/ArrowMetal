@@ -245,7 +245,7 @@ Reading the tables:
 * **On these two operations at this size ArrowMetal is ahead in every row.** The small-array
   crossover is not measured here.
 
-Numbers are from one machine on one day. `node bench/spread.mjs` re-runs the whole thing;
+Numbers are from an M4 Max on 2026-09-07. `node bench/spread.mjs` re-runs the whole thing;
 `node bench/bench.mjs` runs a single process and prints tables.
 
 ## Limits
