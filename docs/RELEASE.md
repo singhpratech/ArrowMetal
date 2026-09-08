@@ -24,11 +24,15 @@ swift build -c release --product ArrowMetalC
 PYTHONPATH=python python -m pytest python/tests -q
 ```
 
-Confirm the version is stated in exactly one place and reads `0.1.0`:
+Confirm the Python version is stated in exactly one place and reads `0.1.0`, and that every binding's
+own manifest agrees:
 
 ```
 grep -rn '__version__' python/arrowmetal/__init__.py       # the single source
 grep -n 'version' python/pyproject.toml                    # must be `dynamic`, reading the above
+grep -nE '0\.1\.0' rust/Cargo.toml rust/arrowmetal/Cargo.toml polars-plugin/Cargo.toml \
+    polars-plugin/arrowmetal-sys/Cargo.toml node/package.json r/arrowmetal/DESCRIPTION \
+    duckdb-extension/CMakeLists.txt duckdb-extension/build.sh   # all must read 0.1.0
 grep -rn '0\.1\.0' README.md CHANGELOG.md docs/*.md | head # narrative mentions only
 ```
 
@@ -62,6 +66,10 @@ successful PyPI upload, replace the account-wide token with a project-scoped one
 
 `CHANGELOG.md` opens with `## 0.1.0`. Confirm nothing above that heading names a later version, leave
 the content alone, and commit if anything changed. No date: the repository does not date its entries.
+
+`python/README.md` is the PyPI long description (`readme = "README.md"` in `python/pyproject.toml`):
+its Install section must not say the package is unpublished, and its links must be absolute URLs,
+because PyPI does not rewrite relative ones.
 
 ```
 git add CHANGELOG.md && git commit -m "0.1.0"
@@ -211,7 +219,7 @@ and goes stale on their schedule, not ours.
 
 ## 8b. Publish the website
 
-The site ships as one static page plus its icon set. It is published to GitHub Pages from the `gh-pages`
+The site is one static page plus its icon set. It is published to GitHub Pages from the `gh-pages`
 branch by a script kept outside the repository (`private/tools/publish_pages.sh`), which rebuilds both site
 outputs from the current sources, refuses to run on a dirty `main` or on a page containing a personal
 address, adds the `CNAME` for the domain and force-pushes the standalone build. Run it after step 8, and

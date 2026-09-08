@@ -5,8 +5,8 @@ input and output go through the Arrow C Data Interface, so it composes with pyar
 
 ## Install
 
-Two ways, both from this repository. ArrowMetal is not on PyPI yet — publishing 0.1.0 is a release-time
-step the maintainer performs, and the checklist for it is [docs/RELEASE.md](../docs/RELEASE.md).
+Two ways: `pip install arrowmetal` (macOS 14 or later on Apple silicon; the wheel bundles
+`libArrowMetalC.dylib`, and pyarrow is its only dependency), or from this repository.
 
 **From source**, the development path. Needs the Swift toolchain:
 
@@ -116,7 +116,7 @@ values for any aggregate. `python/tests` pins those as expected errors so the te
 
 ## Polars
 
-Three tiers, all in this repository — see [docs/POLARS.md](../docs/POLARS.md):
+Three tiers, all in this repository — see [docs/POLARS.md](https://github.com/singhpratech/ArrowMetal/blob/main/docs/POLARS.md):
 
 ```python
 import polars as pl, arrowmetal as am
