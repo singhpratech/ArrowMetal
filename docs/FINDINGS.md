@@ -4,42 +4,138 @@ Things learned the hard way. Add to this whenever something surprises you.
 
 ## Round 10 (2026-09-08): arrow-go's span iterator, found while designing its aggregates
 
-Arrow Go's `compute` package has no aggregate functions (apache/arrow-go#1296). The maintainer
-asked for them, so a design note and a prototype of `sum`, `mean`, `min_max`, `min`, `max`,
-`count`, `any` and `all` were written against arrow-go main and the C++ kernels' semantics, then
-put through the same treatment as this project's own kernels: three independent reviews of the
-note against the C++ and Go sources, a review of the code, and a differential fuzz against pyarrow
-built from the same C++ commit (31,760 cases across the twelve input types, plain, sliced,
-chunked and scalar, under every `skip_nulls`/`min_count` combination, compared bit for bit).
+**TL;DR**
 
-**What the reviews corrected in the note before it went anywhere.** `mean` of an empty input with
-`min_count=0` is NaN for numeric and boolean inputs and 0.0 for the null type, not 0; `min_max`
-returns NaN only when every non-null value is NaN; three functions listed as follow-ups were not
-scalar aggregates at all (`mode` and `quantile` are vector functions in C++, `tdigest` returns an
-array); and the package already had two precedents for the options question the note asked.
+- Arrow Go's `compute` package has no aggregate functions ([apache/arrow-go#1296](https://github.com/apache/arrow-go/issues/1296)). The maintainer asked for them; a design note with a tested prototype of `sum`, `mean`, `min_max`, `min`, `max`, `count`, `any` and `all` is [on the issue](https://github.com/apache/arrow-go/issues/1296#issuecomment-5593008436).
+- Reviewing that prototype the way this project reviews its own kernels found a bug in arrow-go itself: `ArraySpan.SetSlice` carries a stale null count into the next slice, so `and_kleene` and `or_kleene` return `false` where the answer is null once `ExecCtx.ChunkSize` is below the input length, on main and in v18.7.0. Reported as [#1305](https://github.com/apache/arrow-go/issues/1305), fixed by [#1306](https://github.com/apache/arrow-go/pull/1306).
+- Two more things the C++ reference does that a straightforward Go port gets wrong: C's `fmin`/`fmax` rank -0.0 below +0.0, and float sums are pairwise, not a left fold.
+- Two documentation pull requests from the same day, [#1302](https://github.com/apache/arrow-go/pull/1302) and [#1303](https://github.com/apache/arrow-go/pull/1303), were merged within hours.
 
-**What the fuzz found in the prototype.** One divergence in 31,760 cases: signed zeros. C's `fmin`
-and `fmax`, which the C++ kernels use, rank -0.0 below +0.0, so pyarrow returns `min` -0.0 and
-`max` +0.0 whenever both appear; the Go helpers kept the first zero seen. Fixed with an explicit
-branch and a test; the rerun matched on every case. Float `sum` and `mean` needed the C++ pairwise
-summation ported exactly to match pyarrow bit for bit; a plain loop differs in the fifteenth significant digit
-at 100,001 values (75247.35643756675 against pyarrow's 75247.35643756694).
+### The setting
 
-**What the code review found in arrow-go itself.** With `ExecCtx.ChunkSize` below the input
-length, every prototype kernel returned wrong answers, and so do two kernels on arrow-go main
-today: `and_kleene` and `or_kleene` return `false` where the answer is null at chunk sizes 1 and 2.
-`ArraySpan.SetSlice` carries a cached null count into the next slice, which is only right while the
-count describes the whole array; a kernel that calls `UpdateNullCount()` on the span the executor
-reuses stores the slice's count, and the following slices are then treated as all valid or all
-null. The C++ `ArraySpan::SetSlice` never carries a count when a validity bitmap is present. The
-prototype's kernels count each span from its bitmap and never write to the shared span, with a
-test at chunk sizes 1 to 65; the arrow-go bug is reported with a reproducer, and the fix, a one-line
-change to `SetSlice` with a chunk-size test that makes the whole compute suite pass, is
-singhpratech's pull request, [apache/arrow-go#1306](https://github.com/apache/arrow-go/pull/1306)
-(issue [#1305](https://github.com/apache/arrow-go/issues/1305); tracked in [UPSTREAM.md](UPSTREAM.md)).
+`compute.GetFunctionRegistry()` in arrow-go v18.7.0 holds 85 functions, none of aggregate kind
+(89 on main: 76 scalar, 8 vector, 5 meta). `FuncScalarAgg` exists as a kind; `execInternal`
+returns `ErrNotImplemented` for it. The Go binding here therefore uses plain loops as its reference
+for reductions ([GO.md](GO.md)). The maintainer's reply to the report was that the kernels had been
+on his list for a long time and he would love to see them; the design note was promised before
+any code, so the interface would be one he wants to maintain.
 
-Logs, scripts and raw outputs of every run above are kept with the release records; the tracker
-row names the files.
+### Research steps
+
+1. Read the C++ `ScalarAggregateKernel` (`kernel.h`), the executor (`exec.cc`), the options
+   (`api_aggregate.h`) and the kernels (`aggregate_basic.cc`, `aggregate_basic.inc.cc`,
+   `aggregate_internal.h`) at f251bc3, and the Go `compute` package at 67ef40b, and write the design.
+2. Three independent reviews of the note: one testing every row of the semantics table against
+   pyarrow built from that C++ commit, one checking every Go identifier and compiling the
+   proposed constraint change in a worktree, one reading it as the maintainer would.
+3. Build the prototype from the corrected note, run arrow-go's own lint under the Go version it
+   pins, and cross-check every expected test value against pyarrow.
+4. Attack the code: sliced inputs at bitmap-hostile offsets, forced small `ChunkSize`, executor pool
+   reuse, the race detector, a checked allocator on every call, bad options and input kinds.
+5. Differential fuzz: 31,760 cases across the twelve input types, plain, sliced, chunked and scalar,
+   under every `skip_nulls`/`min_count` combination, compared bit for bit with pyarrow.
+6. Fix what was found, rerun everything, and only then post.
+
+### Finding 1: the note's own errors, caught before posting
+
+| The note said | What C++ does (pyarrow from the same commit agrees) |
+|---|---|
+| `mean` of an empty input follows the same rule as `sum` (0 with `min_count=0`) | NaN for numeric and boolean inputs, 0.0 for the null type |
+| in `min_max`, NaN never wins | true against a value; when every non-null value is NaN the result is NaN, because the state starts at NaN |
+| `mode`, `quantile` and `tdigest` are scalar aggregates for later | `mode` and `quantile` are vector functions; `tdigest` returns an array, so a scalar-returning Finalize cannot implement it |
+| no other options type in the package inverts a field for the zero value | `ArithmeticOptions.NoCheckOverflow` does, and `TakeOptions` uses a constructor |
+
+### Finding 2: signed zeros in `min`, `max` and `min_max`
+
+One divergence in the first 31,760 fuzz cases, 2,884 times, all the same cause. C's `fmin` and
+`fmax`, which the C++ kernels use, order -0.0 below +0.0, so pyarrow returns `min` -0.0 and `max`
++0.0 whenever both appear, in any order. A comparison-based port keeps whichever zero came first:
+
+```go
+// before: b < a is false for (-0.0, +0.0), so the incumbent stays
+case b < a:
+    return b
+// after: the sign is observable, so it is a case of its own
+case b < a:
+    return b
+case b == 0 && a == 0 && math.Signbit(float64(b)):
+    return b
+```
+
+After the fix the rerun matched on every case.
+
+### Finding 3: float sums are pairwise
+
+C++ `SumArray` sums floats pairwise in blocks of sixteen, the same algorithm numpy uses, and
+`mean` accumulates in float64 for every input type. A plain left fold over 100,001 values gives
+75247.35643756675 where pyarrow gives 75247.35643756694; the port of the pairwise loop matches bit
+for bit, and the test that proves it is in the prototype.
+
+### Finding 4: `ArraySpan.SetSlice` carries a stale null count
+
+Every prototype kernel returned wrong answers once `ExecCtx.ChunkSize` was smaller than the input:
+`count` of 339 valid values in 493 gave 193 at chunk size 1, 490 at 2, 467 at 4. The cause is not
+in the kernels. `iterateExecSpans` reuses one `ArraySpan` per argument and advances it with
+`SetSlice`, which on main reads:
+
+```go
+if a.Type.ID() != arrow.NULL {
+    if a.Nulls != 0 {
+        if a.Nulls == a.Len {
+            a.Nulls = length          // "all null" carries over
+        } else {
+            a.Nulls = array.UnknownNullCount
+        }
+    }                                 // "no nulls" carries over too
+} else {
+    a.Nulls = length
+}
+```
+
+That is right only while `Nulls` describes the whole array. A kernel that calls
+`UpdateNullCount()` on the shared span stores the current slice's count; the next `SetSlice` then
+treats the following slice as all valid or all null. Two kernels on main do exactly that, and the
+reproducer shows it without any new code:
+
+| ChunkSize | `and_kleene([T, null, T, null, F, T, null, T], [null, T, T, F, null, null, T, T])` |
+|---|---|
+| default | `[null null true false false null null true]` |
+| 1 | `[null false true false false null false true]` |
+| 2 | `[null null true false false false false true]` |
+| 3 and above | correct |
+
+`or_kleene` fails the same way; the `SetSlice` code is identical in v18.7.0. The C++
+`ArraySpan::SetSlice` never carries a count when a validity bitmap is present, and the fix is that
+rule:
+
+```go
+if a.Type.ID() != arrow.NULL {
+    if a.Nulls != 0 || len(a.Buffers[0].Buf) != 0 {
+        a.Nulls = array.UnknownNullCount
+    }
+} else {
+    a.Nulls = length
+}
+```
+
+With it, both Kleene kernels pass at every chunk size and the whole compute suite still passes.
+The prototype's kernels, independently of that fix, count each span from its bitmap and never
+write to the shared span, with a test at chunk sizes 1 to 65.
+
+### What shipped, and what is open
+
+- Merged the same day: [#1302](https://github.com/apache/arrow-go/pull/1302) (allocator alignment and
+  which allocator to use when C keeps a buffer, closing [#1297](https://github.com/apache/arrow-go/issues/1297))
+  and [#1303](https://github.com/apache/arrow-go/pull/1303) (what the compute registry holds).
+- Open: the design note on [#1296](https://github.com/apache/arrow-go/issues/1296) with two questions
+  for the maintainer; [#1305](https://github.com/apache/arrow-go/issues/1305) with its fix
+  [#1306](https://github.com/apache/arrow-go/pull/1306) by singhpratech. The aggregate branch is pushed
+  once the interface is agreed.
+- Status of each is on the [Upstream tracker](UPSTREAM.md) and updates itself from arrow-go's tracker.
+
+Logs, scripts and raw outputs of every run above (the audit reports, the build and lint log, the
+fuzz fixtures and results, the reproducer and its output on both commits) are kept with the
+release records.
 
 ## Ecosystem research (2026-09-06)
 - `apache/arrow-swift` v21: types, IPC, Flight, C Data Interface. No compute kernels, nothing Metal.
