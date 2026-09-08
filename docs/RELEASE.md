@@ -133,6 +133,23 @@ gh release create v0.1.0 python/dist/arrowmetal-0.1.0-py3-none-macosx_14_0_arm64
     --title "ArrowMetal 0.1.0" --notes-file <(sed -n '/^## 0.1.0/,/^## /p' CHANGELOG.md)
 ```
 
+## 5b. Badges
+
+The README carries no badges until the things they point at exist. Once steps 4 and 5 are done and
+the repository is public, add one row under the title, in this order, and nothing that does not
+resolve on the day it is added:
+
+```
+[![CI](https://github.com/singhpratech/ArrowMetal/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/singhpratech/ArrowMetal/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/arrowmetal)](https://pypi.org/project/arrowmetal/)
+[![Go Reference](https://pkg.go.dev/badge/github.com/singhpratech/ArrowMetal/go/arrowmetal.svg)](https://pkg.go.dev/github.com/singhpratech/ArrowMetal/go/arrowmetal)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+```
+
+The CI badge shows the last run on `main`; the workflow runs on pull requests and by hand, so
+dispatch it once on the release commit (`gh workflow run ci.yml --ref main`) and wait for green
+before adding the badge. A crates.io or npm badge is added only when step 6 publishes those.
+
 ## 6. The Polars plugin crate — after the release, not during it
 
 `polars-plugin/` is a Rust `cdylib` whose `build.rs` links `libArrowMetalC.dylib` by rpath from a local

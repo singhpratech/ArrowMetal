@@ -25,7 +25,14 @@ final class StringTests: XCTestCase {
         XCTAssertEqual(try a.contains("").toArray(), sample.map { $0.map { _ in true } })
         XCTAssertEqual(try a.equals("").toArray(), sample.map { $0.map { $0.isEmpty } })
         let b = try MetalStringArray(sample.reversed())
-        XCTAssertEqual(try a.equals(b).toArray(), zip(sample, sample.reversed()).map { x, y in (x == nil || y == nil) ? nil : x == y })
+        // Spelled out with explicit types: the one-line closure form is fine for Swift 6.3 but the
+        // 6.1 compiler on the CI runner gives up type-checking it ("unable to type-check this
+        // expression in reasonable time").
+        let expectedEquals: [Bool?] = zip(sample, sample.reversed()).map { (x: String?, y: String?) -> Bool? in
+            guard let x, let y else { return nil }
+            return x == y
+        }
+        XCTAssertEqual(try a.equals(b).toArray(), expectedEquals)
         // large: 200k strings, word boundaries
         let big: [String?] = (0..<200_003).map { $0 % 17 == 0 ? nil : "row\($0 % 1000)" }
         let ba = try MetalStringArray(big)
