@@ -47,6 +47,16 @@ echo "==> bundling $(basename "$SRC") into python/arrowmetal/_lib/"
 mkdir -p "$DEST"
 cp "$SRC" "$DEST/libArrowMetalC.dylib"
 
+# SwiftPM bakes the build machine's toolchain directory in as an LC_RPATH entry. Nothing the dylib
+# links is resolved through it (the Swift runtime is linked by absolute /usr/lib/swift paths), so
+# drop every rpath under /Applications or /Users and re-sign, or the wheel carries a path from the
+# machine it was built on. Editing the load commands invalidates the signature, and an arm64 dylib
+# with a broken signature does not load, so the ad-hoc re-sign is not optional.
+for rp in $(otool -l "$DEST/libArrowMetalC.dylib" | awk '/LC_RPATH/{f=1} f&&/path /{print $2; f=0}' | grep -E '^/(Applications|Users)/' || true); do
+    install_name_tool -delete_rpath "$rp" "$DEST/libArrowMetalC.dylib"
+done
+codesign --force --sign - "$DEST/libArrowMetalC.dylib" 2>/dev/null
+
 # A stale copy from the pre-0.1 layout would ship twice and shadow the new one.
 rm -f "$HERE/arrowmetal/libArrowMetalC.dylib"
 rm -rf "$HERE/build" "$HERE/dist"

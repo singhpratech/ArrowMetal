@@ -144,6 +144,17 @@ one, and neither exists yet. Until then the plugin is built from this repository
 cd polars-plugin && cargo build --release
 ```
 
+Two things to settle before any crate is published. There are two crates named `arrowmetal-sys`
+in this repository, `rust/arrowmetal-sys` (the binding's, 296 lines of declarations) and
+`polars-plugin/arrowmetal-sys` (the plugin's, 718); crates.io can hold one crate of that name, so
+the plugin must depend on the binding's crate, or its copy must be renamed, before either goes
+up. And every crate carries `publish = false` today, which `cargo publish` refuses; flip it only on
+the crate being published.
+
+The Node package (`node/`) is `"private": true` and is not published to npm at 0.1.0 for the same
+reason as the crates: the addon links a dylib built from this checkout. `npm pack --dry-run` lists
+what a later publication would carry.
+
 When it is ready, the order is `cargo publish --dry-run`, then reserving the crate name, then
 `cargo publish` — and the crate version tracks the dylib ABI it was built against, so it cannot be
 published ahead of a tagged 0.1.0.
