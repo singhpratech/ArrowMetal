@@ -8,7 +8,7 @@ the workaround can be removed.
 
 | Project | Finding | Our evidence | Report | Status |
 |---|---|---|---|---|
-| pyarrow 25.0.1 | `pc.utf8_normalize` decomposes whatever `form` says (its NFC output is NFD) | `test_pyarrow_utf8_normalize_ignores_its_form_option` | not yet filed; no existing report found | open, reproduced 2026-09-07, draft ready |
+| pyarrow 25.0.1 | `pc.utf8_normalize` decomposes whatever `form` says (its NFC output is NFD) | `test_pyarrow_utf8_normalize_ignores_its_form_option` | filed 2026-09-08: [apache/arrow#51225](https://github.com/apache/arrow/issues/51225) | filed, open |
 | pyarrow 25.0.1 | `pc.pairwise_diff` on a sliced array ignores `ArrowArray.offset` | `test_pyarrow_pairwise_diff_ignores_the_array_offset` | reported by others: [apache/arrow#50524](https://github.com/apache/arrow/issues/50524), fixed by [#50858](https://github.com/apache/arrow/pull/50858) | fixed in 26.0.0; the test retires when the venv moves to 26 |
 | pyarrow 25.0.1 | `pc.fill_null_forward`, `pc.fill_null_backward`, `pc.replace_with_mask` on a sliced boolean array ignore the offset | `test_pyarrow_boolean_fill_null_forward_ignores_the_array_offset` | filed 2026-09-08: [apache/arrow#51223](https://github.com/apache/arrow/issues/51223); distinct from [#45086](https://github.com/apache/arrow/issues/45086) (chunked-output sizing, fixed in 26.0.0) | filed, open |
 | pyarrow 25.0.1 | `pc.winsorize` on a sliced array nulls the wrong rows and places values where the input has nulls | `test_pyarrow_winsorize_ignores_the_array_offset` | filed 2026-09-08: [apache/arrow#51224](https://github.com/apache/arrow/issues/51224) | filed, open |
