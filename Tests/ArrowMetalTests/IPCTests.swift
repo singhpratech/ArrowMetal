@@ -408,8 +408,11 @@ final class IPCTests: XCTestCase {
             XCTAssertEqual(batches.map(\.length), [5, 6, 7])
             for (b, batch) in batches.enumerated() {
                 let n = 5 + b
-                XCTAssertEqual(batch["ints"]!.asInt64!.toArray(),
-                               (0..<n).map { $0 % 2 == 1 ? nil : Int64(b * 100 + $0) })
+                let expectedInts: [Int64?] = (0..<n).map { (i: Int) -> Int64? in
+                    if i % 2 == 1 { return nil }
+                    return Int64(b * 100 + i)
+                }
+                XCTAssertEqual(batch["ints"]!.asInt64!.toArray(), expectedInts)
                 XCTAssertEqual(batch["ints"]!.nullCount, n / 2)
                 XCTAssertEqual(batch["floats"]!.asFloat64!.toArray(), (0..<n).map { Double($0) * 0.5 + Double(b) })
                 XCTAssertEqual(batch["text"]!.asString!.toArray(),

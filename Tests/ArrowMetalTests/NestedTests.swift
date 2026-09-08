@@ -595,7 +595,10 @@ final class NestedKernelTests: XCTestCase {
         (0..<n).map { i in
             if i % 7 == 3 { return nil }
             let len = i % 4
-            return (0..<len).map { k in (i + k) % 5 == 0 ? nil : Int64(i * 10 + k) }
+            return (0..<len).map { (k: Int) -> Int64? in
+                if (i + k) % 5 == 0 { return nil }
+                return Int64(i * 10 + k)
+            }
         }
     }
 

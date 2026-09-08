@@ -197,7 +197,10 @@ final class HashTableTests: XCTestCase {
     func testForcedGrowthRetry() throws {
         try requireRealGPU()
         let n = 200_003
-        let vals: [Int64?] = (0..<n).map { i in i % 31 == 7 ? nil : Int64(i % 100_000) &* 3 }
+        let vals: [Int64?] = (0..<n).map { (i: Int) -> Int64? in
+            if i % 31 == 7 { return nil }
+            return Int64(i % 100_000) &* 3
+        }
         let a = try MetalArray<Int64>(vals)
         let (expValues, _) = oracle(vals)
         // 1024 slots for ~100k distinct keys: three growth steps of eight before the table is big enough.
