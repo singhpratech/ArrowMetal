@@ -67,8 +67,7 @@ of all of them**, named, with the cores that call used (its CPU-ms over its wall
 row is taken from `Benchmarks/results/full_matrix_2026-09-07-parallel.csv`, the raw output behind
 [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MATRIX.md); the eager-only run of the same build is kept
 beside it as `full_matrix_2026-09-07.csv`. Wall time in milliseconds, with the CPU time each call
-consumed in parentheses. The last three rows are ones where the CPU idiom is ahead, on the same footing as
-the seven above:
+consumed in parentheses. The last three rows are ones where the CPU idiom is ahead:
 
 | Operation | Rows | ArrowMetal ms (CPU-ms) | fastest CPU idiom | its ms (CPU-ms) | its cores | speedup |
 |---|---:|---:|---|---:|---:|---:|
