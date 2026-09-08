@@ -1,0 +1,44 @@
+# Refreshes upstream/status.json on the gh-pages branch: what the projects we reported to have done
+# with each report (their comments, labels, pull requests, closes), read from GitHub with the default
+# token. The website fetches that one file; nothing on the page talks to api.github.com. Only the
+# JSON is written; the site's HTML is never touched here.
+name: upstream-status
+on:
+  schedule:
+    - cron: "23 5,17 * * *"   # twice a day, 05:23 and 17:23 UTC
+  workflow_dispatch:
+permissions:
+  contents: write
+  issues: read
+concurrency:
+  group: upstream-status
+  cancel-in-progress: true
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/scripts/upstream_status.py
+            docs/UPSTREAM.md
+      - uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: site
+      - name: Build status.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/upstream_status.py --md docs/UPSTREAM.md --out site/upstream/status.json
+      - name: Commit if the tracked state changed
+        working-directory: site
+        run: |
+          git add -N upstream/status.json
+          if git diff --quiet -I'"as_of"' -- upstream/status.json; then
+            echo "no change in report status"; exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add upstream/status.json
+          git commit -m "upstream status: $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push
