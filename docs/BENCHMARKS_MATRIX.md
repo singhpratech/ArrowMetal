@@ -8,14 +8,15 @@ Run time 34.0 minutes; raw numbers in `Benchmarks/results/full_matrix_2026-09-07
 
 ## How to read this
 
-- Every number is the best wall time of up to five calls after one warm-up, with the process CPU time (all threads) of that same call beside it, and then **the cores that call actually used** (cpu-ms / wall-ms). A slow call is repeated fewer times, never fewer than twice; the CSV records the count.
+- Every number is the best wall time of up to five calls after one warm-up, with the process CPU time (all threads) of that same call beside it, and then **the cores that call used** (cpu-ms / wall-ms). A slow call is repeated fewer times, never fewer than twice; the CSV records the count.
 - **Every CPU library gets two columns: its plain eager idiom and its most parallel idiom.** `polars-lazy` is the same expression through `pl.LazyFrame`, collected on the in-memory or the streaming engine; `pyarrow-threaded` is an Acero plan over the same values split into 16 record batches with `to_table(use_threads=True)`, or `pa.Table.group_by` over that 16-chunk table. The `note` column of every such CSV row names the exact idiom. This exists because the eager idioms use about one core on the element-wise and whole-column reduction rows however many threads the pool has — see the cores table below for where that is and is not true — and a comparison against one core is not the comparison this project wants to make.
-- pandas has no parallel idiom recorded for any operation here. Its kernels are single-threaded by design, and its two threaded paths are numexpr (element-wise arithmetic through `pd.eval` / `DataFrame.eval`) and the numba engine with `parallel=True` (`rolling`, `groupby.agg` / `transform`, `apply`); which of them this run found installed is written into every `pandas-parallel` row's note. numpy's ufuncs are single-threaded. Both are recorded as `pandas-parallel` / `numpy-parallel` rows saying so, rather than left out.
-- **ratio** is the fastest CPU idiom's wall time divided by ArrowMetal's, taken across *all* the idioms of all the libraries; the **fastest CPU** column names the idiom that won. The verdict is the project's own bar: ✅ at or above 3x, ⚠️ between 1x and 3x, ❌ slower than the fastest CPU idiom.
-- `--` in a library column means that library has no equivalent operation, or no parallel idiom for it (the reason is in the CSV's `note` column); `err` means the call raised, and the message is in the CSV. Nothing is skipped silently.
+- pandas' threaded paths, numexpr and numba, were not installed for this run (numexpr is element-wise arithmetic through `pd.eval` / `DataFrame.eval`; the numba engine with `parallel=True` is `rolling`, `groupby.agg` / `transform`, `apply`), so pandas is measured in its eager idiom and every `pandas-parallel` row's note says so. numpy's ufuncs are single-threaded. Both are recorded as `pandas-parallel` / `numpy-parallel` rows saying so, rather than left out.
+- **ratio** is the fastest CPU idiom's wall time divided by ArrowMetal's, taken across *all* the idioms of all the libraries; the **fastest CPU** column names the idiom that won. The verdict is the project's own bar: ✅ at or above 3x, ⚠️ between 1x and 3x, ❌ to improve: the fastest CPU idiom is ahead.
+- `--` in a library column means that library has no equivalent operation, or the matrix has not measured a threaded idiom for it (the reason is in the CSV's `note` column); `err` means the call raised, and the message is in the CSV. Nothing is skipped silently.
+- 1,883 timed records, 1,860 rows: the nested family at 10,000,000 rows was measured twice and the later pass is shown.
 - Bandwidth (GB/s) is bytes touched (input + output) over wall time. Where ArrowMetal and the best baseline are both near the ~400 GB/s the single-pass rows of this matrix reach the operation is memory-bound and no ratio above ~1.5x is available to either side.
 
-**339 rows measured, over 173 operations** (13 measured at one size, 154 at two, 6 at three). 145 at or above 3x (✅), 102 between 1x and 3x (⚠️), 77 slower than the fastest CPU idiom (❌) — none of them a call that raised — and 15 with no CPU equivalent to compare against (—). 43% of the measured rows meet the bar.
+**339 rows measured, over 173 operations** (13 measured at one size, 154 at two, 6 at three). 145 at or above 3x (✅), 102 between 1x and 3x (⚠️), 77 to improve, where the fastest CPU idiom is ahead (❌) — none of them a call that raised — and 15 with no CPU equivalent to compare against (—). 43% of the measured rows meet the bar. Four of the 145 — `any` and `all` at 10M and 50M rows — are host CPU scans rather than GPU passes: the kernel stops at the first decisive bit without a dispatch ([COVERAGE.md](COVERAGE.md)), so their ratio depends on where that bit is.
 
 ## reductions
 
@@ -437,9 +438,9 @@ These are **not** re-measured here. They are the numbers already recorded in `do
 | take (n/2 random indices) | 50,000,000 | 5.91 | 11.75 / 154.6 | docs/BENCHMARKS.md round 6 |
 | filter two columns + sum | 50,000,000 | 1.75 | 6.27 / 86.5 | docs/BENCHMARKS.md round 6 |
 
-## SHORTFALL: every row that is not at 3x
+## Rows under the 3x bar
 
-Sorted by how far short of the 3x bar the row is (worst first). ❌ means some CPU idiom is faster than ArrowMetal outright. The baseline here is the fastest of every idiom of every CPU library, named in its own column.
+Sorted by distance from the 3x bar, furthest first. ❌ means the fastest CPU idiom is ahead of ArrowMetal on that row. The baseline here is the fastest of every idiom of every CPU library, named in its own column.
 
 | op | rows | ratio | ArrowMetal ms | fastest CPU idiom | baseline ms | AM GB/s | baseline GB/s | likely cause |
 |---|---:|---:|---:|---|---:|---:|---:|---|
@@ -625,7 +626,7 @@ Sorted by how far short of the 3x bar the row is (worst first). ❌ means some C
 
 179 of 339 measured rows are below the 3x bar.
 
-## How many cores each idiom actually used
+## How many cores each idiom used
 
 cpu_ms / wall_ms for every measured row, per library and idiom. 1.00 means the idiom ran on one core, whatever the size of the thread pool. This is the table that decides whether "on all cores" is a true sentence about a given row.
 
@@ -670,8 +671,10 @@ latency                       1.26              1.11              1.03          
 ```
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   swift build -c release --product ArrowMetalC
-PYTHONPATH=python python Benchmarks/full_matrix.py            # full run
-PYTHONPATH=python python Benchmarks/full_matrix.py --quick    # 1M-row smoke
-PYTHONPATH=python python Benchmarks/full_matrix.py --verify \
-    --sizes 1000000    # assert every parallel idiom answers what its default does
+# full run
+PYTHONPATH=python python Benchmarks/full_matrix.py
+# 1M-row smoke
+PYTHONPATH=python python Benchmarks/full_matrix.py --quick
+# assert every parallel idiom answers what its default does
+PYTHONPATH=python python Benchmarks/full_matrix.py --verify --sizes 1000000
 ```

@@ -14,7 +14,7 @@ test or the CSV a claim comes from.
 | [TESTING.md](TESTING.md) | Every test suite, what it covers, and the commands to run it |
 | [BENCHMARKS.md](BENCHMARKS.md) | Every benchmark round with hardware, methodology, wall time and CPU time; the tables the README quotes |
 | [TO_IMPROVE.md](TO_IMPROVE.md) | Every row of the matrix short of the 3x bar, the rows where the CPU idiom is ahead first, grouped by the measured cause (dispatch floor, copy vs view, sort-based distinct, software binary64, host regex), plus the rows under the 3x bar and what changed since the previous matrix |
-| [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md) | The complete operation-by-operation comparison against Polars, pyarrow, pandas and numpy in both their eager and most-parallel idioms, at 1k to 50M rows, with a verdict per row and a shortfall list of everything below the 3x bar |
+| [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md) | The complete operation-by-operation comparison against Polars, pyarrow, pandas and numpy in both their eager and most-parallel idioms, at 1k to 50M rows, with a verdict per row and a list of everything below the 3x bar |
 | [DESIGN.md](DESIGN.md) | How it works: buffers, kernels, batching, GPU-side lengths, software Float64, where the time goes |
 | [PANDAS.md](PANDAS.md) | pandas on the GPU: the `.am` accessor and the zero-code-change accel mode, what routes to the GPU and when, the zero-copy and null rules, the numbers and the limits |
 | [NUMPY.md](NUMPY.md) | numpy on the GPU through pyarrow: which dtypes cross without a copy (asserted by `test_numpy.py`), NaN-as-value semantics, the matrix rows measured against numpy, and the NEP 18 step that is ours to take |
@@ -27,12 +27,12 @@ test or the CSV a claim comes from.
 | [EXPR.md](EXPR.md) | Fused expression queries: one runtime-generated kernel for a whole expression DAG, the grammar, how nulls are compiled, the numbers and the limits |
 | [ENGINE.md](ENGINE.md) | The lazy query engine: the logical plan, the optimizer rules with `explain()` examples, fusion planning, the full join matrix (multi-key, utf8, outer, semi/anti, as-of), window functions, the plan grammar, the numbers and the limits |
 | [POLARS.md](POLARS.md) | Polars on the GPU in three tiers: the zero-copy bridge and `.arrowmetal` namespaces, the Rust expression plugin for lazy plans, and the streaming hand-off — with install, numbers at 10M and 50M rows, and what a real Metal `engine=` backend would need |
-| [DUCKDB.md](DUCKDB.md) | Using ArrowMetal from DuckDB: the Python bridge (copy-free where DuckDB returns one chunk), the loadable SQL extension, streaming tables larger than memory, and an honest account of which shapes the GPU wins and which it loses |
+| [DUCKDB.md](DUCKDB.md) | Using ArrowMetal from DuckDB: the Python bridge (copy-free where DuckDB returns one chunk), the loadable SQL extension, streaming tables larger than memory, and which shapes the GPU is ahead on and which it is not |
 | [STREAMING.md](STREAMING.md) | Out-of-core streaming execution: datasets larger than memory flowing from disk through the GPU, the three-stage pipeline and its measured overlap, every streaming operator with exact-or-approximate marked, and the buffer budget |
 | [DECISIONS.md](DECISIONS.md) | Why it is built this way, one dated entry per decision |
 | [FINDINGS.md](FINDINGS.md) | Things learned the hard way: toolchain quirks, Metal limits, bugs and their lessons |
 | [ROADMAP.md](ROADMAP.md) | What is next and what is open for contributors |
-| [../CHANGELOG.md](../CHANGELOG.md) | What is in the (unreleased) 0.1.0 |
+| [../CHANGELOG.md](../CHANGELOG.md) | What is in 0.1.0 |
 | [../Benchmarks/README.md](../Benchmarks/README.md) | The six benchmark programs and the fairness rules |
 | [../python/README.md](../python/README.md) | The Python package: install, wheel build, usage |
 | [RELEASE.md](RELEASE.md) | The ordered checklist for cutting and publishing 0.1.0: tags, the wheel, PyPI, the plugin crate, the docs to re-verify |

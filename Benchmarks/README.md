@@ -23,8 +23,8 @@ against Polars, pyarrow.compute and pandas (numpy where pandas has no vectorised
 - Sizes: 10M and 50M rows, 1M and 10M for string columns, plus 1k / 100k / 1M for the latency floor.
 - Output: `Benchmarks/results/full_matrix_<date>.csv` (family, op, rows, library, wall_ms, cpu_ms,
   GB/s, iterations, status, note) and `docs/BENCHMARKS_MATRIX.md`, which adds the ratio against the
-  fastest baseline per row, a verdict (✅ at or above 3x, ⚠️ 1-3x, ❌ slower) and a SHORTFALL section
-  listing every row below 3x with the most likely cause, worst first.
+  fastest baseline per row, a verdict (✅ at or above 3x, ⚠️ 1-3x, `to improve` where the fastest CPU idiom is ahead) and a section
+  listing every row below 3x with the most likely cause, furthest from the bar first.
 - `--quick` runs the same matrix at 1M rows in a few minutes and writes into `Benchmarks/results/`
   instead of `docs/`. Use it while editing the script; the full run takes roughly half an hour.
 - `--families`, `--sizes`, `--iters` and `--budget` narrow a run while investigating one operation.
@@ -63,7 +63,7 @@ Extra fairness rules this script follows on top of the ones below:
   skipped and reported as such: t-digest, whose sketch depends on how the values were partitioned, and
   pyarrow's threaded grouped `list`, whose element order inside a group follows batch arrival.
 - `--cores`, and `full_matrix_<date>_cores.txt` written next to every results CSV, report cpu_ms/wall_ms
-  -- the cores actually used -- per library and idiom, overall and per family. ArrowMetal's own number
+  -- the cores used -- per library and idiom, overall and per family. ArrowMetal's own number
   there is host CPU time only: the thread that encodes the command buffer and waits on it. GPU execution
   time is not in it, and neither clock counts it.
 - A single call that takes longer than the per-measurement budget is repeated fewer times (never fewer
@@ -75,7 +75,7 @@ Rules we follow so the comparison is fair:
 - CPU baselines are handed every core the machine has (Polars and pyarrow both run 16-thread pools here;
   no pool is limited). Whether a given idiom *uses* them is a property of the idiom, not of the harness,
   so `full_matrix.py` measures each library's most parallel idiom alongside its eager one and publishes
-  cpu_ms/wall_ms -- the cores each row actually used -- for every row. Nothing is quoted as "on all
+  cpu_ms/wall_ms -- the cores each row used -- for every row. Nothing is quoted as "on all
   cores" that the CSV does not show running on them.
 - Bytes counted are the bytes each operation must touch (input + output), so GB/s is comparable across rows.
 - Data shapes: Int64 with 10% nulls in [-1000, 1000]; Float32 in [-1, 1]; Float64 in [0, 1000]; keys uniform.

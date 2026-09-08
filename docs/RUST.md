@@ -132,7 +132,7 @@ In ([`Array::from_arrow`]) is copy-free only when the buffer pointer is aligned 
 because that is what `MTLDevice.makeBuffer(bytesNoCopy:)` requires; otherwise that buffer is copied
 once. Whether an arrow-rs array clears the bar is a property of the *allocator*, not of arrow-rs, so
 it is measured rather than assumed. 32 allocations at each size, exported through `arrow::ffi` and
-read back as the pointers `am_import` actually receives:
+read back as the pointers `am_import` receives:
 
 | Column length | Values bytes | Values page aligned | Validity bitmap page aligned |
 |---|---|---|---|
@@ -171,7 +171,7 @@ Both follow from reading `Sources/ArrowMetal/CInterop.swift` plus the alignment 
 and both have tests behind their *observable* halves — a sliced array round-trips exactly
 (`round_trip_of_a_sliced_array`, `a_slice_survives_the_round_trip`), and an ArrowMetal export is
 always page aligned, which is the precondition for the no-copy path
-(`arrowmetal_exported_buffers_are_page_aligned`). But **whether a given import actually copied is not
+(`arrowmetal_exported_buffers_are_page_aligned`). But **whether a given import copied is not
 observable through the C ABI**: the Swift side computes an `ImportResult.zeroCopy` flag and
 `am_import` discards it. Until the ABI reports it — an `am_import_ex` with an `int* out_zero_copy`
 would do — these two are arguments, not measurements, and are labelled as such.
@@ -278,7 +278,7 @@ every other reduction test relies on.
 by the safe crate, none declared and unused — and the safe crate covers the list above. Everything
 below is reachable from Swift, Python and the C ABI, and **not** from this crate. There is no
 technical obstacle to any of it; it is unwrapped because it is untested here, and an untested wrapper
-is not a shipped one.
+does not go into 0.1.0.
 
 | ABI area | Entry points |
 |---|---|
@@ -345,15 +345,15 @@ number is a complete GPU round trip, not an enqueue. Source:
   import + compare + filter + `to_arrow`. Supporting numbers (best of 5): import 1.11 ms,
   export 0.000 ms.
 
-**Where ArrowMetal loses.** A single `sum` on an arrow-rs array is **2.3× slower** than
-`arrow::compute::sum`: 2.11 ms against 0.91 ms. The kernel is 3.3× faster; the loss is entirely the
+**Where arrow-rs is ahead.** On a single `sum` over an arrow-rs array, `arrow::compute::sum` is ahead by
+**2.3×**: 0.91 ms against ArrowMetal's 2.11 ms. The kernel is 3.3× faster; the gap is entirely the
 1.11 ms it takes to hand 80 MB (decimal MB; 76 MiB) to Metal, plus about 0.7 ms of handle setup and
 first-touch. The import is copy-free at this size (the values buffer came back aligned to 4 MiB), so that is page
 mapping, not a `memcpy` — and it is still 1.1 ms that one cheap kernel does not earn back.
 
 The break-even is roughly "more than one pass over the data": `compare + filter` is two passes and
-ArrowMetal is already 1.5× faster end to end. **Import once, chain, export once.** Wrapping a single
-reduction is a loss.
+ArrowMetal is already 1.5× faster end to end. **Import once, chain, export once.** A single wrapped
+reduction does not earn its import back.
 
 ---
 

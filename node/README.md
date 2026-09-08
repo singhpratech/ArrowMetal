@@ -132,7 +132,7 @@ ranges overlap.
 | plain typed-array loop | 8.08 | 9.52 | 8.44 |
 | Arrow JS, `Vector.get(i)` into a new `Vector` | 170.57 | 183.74 | 179.41 |
 
-Read it honestly:
+Reading the tables:
 
 * **The two `filter` rows do not do the same amount of work.** ArrowMetal's end-to-end row finishes
   by wrapping the result as a typed-array view — the 5,000,000 output rows are written once by the
@@ -144,9 +144,9 @@ Read it honestly:
   Arrow JS user writes, not a fair kernel.
 * The 0.27–0.36 ms resident `sum` is 80 MB in about 0.3 ms, roughly 265 GB/s, in range for an
   M4 Max. Not a cached answer: a test mutates the wrapped buffer and the sum changes.
-* **No row here is a loss.** On these two operations at this size ArrowMetal wins every comparison;
-  a small array will lose to the plain loop, because the per-call overhead is fixed and there is
-  nothing for the GPU to amortise it over. That crossover is not measured here.
+* **On these two operations at this size ArrowMetal is ahead in every row.** The measured pair is
+  the end-to-end `sum` at 2.02 ms median against the plain loop's 16.47, and the end-to-end
+  `filter` at 3.92 against 8.44. The small-array crossover is not measured here.
 * An earlier single-process run put `filter` end to end at 8.62 ms against 9.77 ms and called it a
   1.13x win. That was inside the noise; the claim is withdrawn and this table replaces it.
 

@@ -109,9 +109,9 @@ of the distinct strings:
 
 At a thousand keys the whole table is 4096 slots — 16 KB — so every probe is a cache hit and the pass is
 memory-bound on the key bytes. At ten million the table is 32 M slots (128 MB) and the cost becomes the
-random slot access, which is why the win narrows from 10x to 2x. The 1000- and 100k-key cases are now
-**2.9x and 7.2x faster than pyarrow**, against 3.5x and 1.2x *slower* before, and they cost the CPU about
-4 ms against pyarrow's 700-2000.
+random slot access, which is why the margin narrows from 10x to 2x. The 1000- and 100k-key cases are now
+**2.8x and 7.2x faster than pyarrow**, where the sort path had been 3.5x and 1.2x *behind* it, and they
+cost the CPU about 4 ms against pyarrow's 700-2000.
 
 Integer, boolean, temporal and dictionary key columns still take the range path (~22 ms at 50M rows);
 they never enter the hash table when they are group-by keys.
@@ -120,8 +120,8 @@ they never enter the hash table when they are group-by keys.
 
 `unique`, `value_counts`, `count_distinct`, `mode` and `dictionary_encode` over a **primitive** column had
 the same problem for the same reason: all five began with an argsort of every row, so all five cost the
-same whatever the cardinality, and all five lost to CPU libraries that use a hash table (0.11x to 0.71x
-of pyarrow/Polars/pandas at 10M rows before this change). `Kernels/HashTable.swift` is the string table
+same whatever the cardinality, and all five were behind the CPU libraries that use a hash table (0.11x to
+0.71x of pyarrow/Polars/pandas at 10M rows before this change). `Kernels/HashTable.swift` is the string table
 with the byte comparison removed — the key *is* the 64-bit value, so equality on it is exact — and the
 estimate, the growth retry, the rank scan and the id pass are literally the same code.
 
@@ -137,7 +137,7 @@ Because the table keeps the lowest row per slot, first-appearance order is avail
 over the rows — which is what an `order:` option would want.
 
 The threshold is `1 << 16` rows: below it the sort is a handful of small passes and the table's extra
-round trips do not pay for themselves. `ARROWMETAL_NO_HASH=1` forces the sort path in a shipping binary,
+round trips do not pay for themselves. `ARROWMETAL_NO_HASH=1` forces the sort path in a release build,
 which is how the before column below was measured.
 
 M4 Max, 50M `int64` rows, Swift, best of 3, 2026-09-06 (the "before" column with `ARROWMETAL_NO_HASH=1`):
@@ -151,31 +151,32 @@ M4 Max, 50M `int64` rows, Swift, best of 3, 2026-09-06 (the "before" column with
 | `dictionary_encode` | 1,000 / 100k / 10M | 162.3 / 295.5 / 277.2 | **12.8 / 16.5 / 108.2** |
 
 Against the CPU libraries on the same buffers, called from Python through
-`Benchmarks/python_gpu_bench.py` (M4 Max, 50M rows, best of 3, ms, 2026-09-06):
+`Benchmarks/python_gpu_bench.py` (M4 Max, 50M rows, wall ms), from
+`Benchmarks/results/python_gpu_bench_50000000_2026-09-07.txt`:
 
-| function | distinct | ArrowMetal | Polars | pyarrow | vs the best of them |
-|---|---|---:|---:|---:|---:|
-| `unique` | 1,000 | 12.2 | 120.9 | 97.2 | **7.9x** |
-| | 100,000 | 14.1 | 141.8 | 89.8 | **6.4x** |
-| | 10,000,000 | 91.1 | 191.3 | 715.1 | 2.1x |
-| `value_counts` | 1,000 | 14.1 | 130.6 | 154.5 | **9.2x** |
-| | 100,000 | 17.6 | 340.1 | 221.4 | **12.6x** |
-| | 10,000,000 | 113.6 | 1781.0 | 1620.0 | **14.3x** |
-| `count_distinct` | 1,000 | 9.7 | 121.0 | 91.4 | **9.4x** |
-| | 100,000 | 9.8 | 137.1 | 90.4 | **9.2x** |
-| | 10,000,000 | 41.8 | 183.8 | 798.3 | **4.4x** |
-| `mode` | 1,000 | 27.7 | 85.1 | 23.2 | 0.8x |
-| | 100,000 | 35.1 | 93.6 | 583.0 | 2.7x |
-| | 10,000,000 | 247.1 | 494.3 | 1107.3 | 2.0x |
+| function | distinct | ArrowMetal | Polars | pyarrow | pandas | vs the best of them |
+|---|---|---:|---:|---:|---:|---:|
+| `unique` | 1,000 | 15.97 | 111.03 | 85.34 | 75.20 | **4.7x** |
+| | 100,000 | 19.00 | 123.60 | 77.98 | 82.21 | **4.1x** |
+| | 10,000,000 | 100.55 | 165.92 | 658.25 | 620.09 | 1.7x |
+| `value_counts` | 1,000 | 17.10 | 116.33 | 139.61 | 140.09 | **6.8x** |
+| | 100,000 | 20.49 | 320.30 | 192.25 | 194.27 | **9.4x** |
+| | 10,000,000 | 109.78 | 1532.52 | 1446.67 | 1496.30 | **13.2x** |
+| `count_distinct` | 1,000 | 9.59 | 116.06 | 81.68 | 85.50 | **8.5x** |
+| | 100,000 | 9.83 | 119.60 | 71.23 | 76.89 | **7.2x** |
+| | 10,000,000 | 41.29 | 150.05 | 714.21 | 657.65 | **3.6x** |
+| `mode` | 1,000 | 26.52 | 58.67 | 21.49 | — | 0.8x |
+| | 100,000 | 30.36 | 70.99 | 549.52 | — | 2.3x |
+| | 10,000,000 | 166.28 | 383.45 | 988.16 | — | 2.3x |
 
-Two cases are worth being honest about. `unique` at ten million distinct is only 2.1x Polars because
-ArrowMetal orders its output and Polars does not: 30 of those 91 ms are the argsort of the ten million
-distinct values, which a hash-order `unique` would not pay. And `mode` is measured through a Python
-binding that computes it **twice** (`_mode` in `python/arrowmetal/__init__.py` calls the reduction once
-for the value and again for the count) — the Swift figures are 13.9 / 17.9 / 121.6 ms, i.e. 1.7x / 32.6x /
-9.1x pyarrow. At 1,000 distinct pyarrow's `mode` is genuinely fast because the values span a narrow range
-and it counts into a direct-indexed table rather than a hash map; the same range trick already exists here
-in `GroupByKeys.rangeIds` and is the obvious next step for these five functions.
+Two rows need a note. `unique` at ten million distinct is 1.7x Polars because ArrowMetal orders its
+output and Polars does not: part of its 100.55 ms is the argsort of the ten million distinct values,
+which a hash-order `unique` would not pay. And `mode` is measured through a Python binding that
+computes it **twice** (`_mode` in `python/arrowmetal/__init__.py` calls the reduction once for the
+value and again for the count), so its row carries two reductions. At
+1,000 distinct pyarrow's `mode` is ahead because the values span a narrow range and it counts into a
+direct-indexed table rather than a hash map; the same range trick already exists here in
+`GroupByKeys.rangeIds` and is the obvious next step for these five functions.
 ## Group-by
 
 Dense group ids `0 ..< K` come out of `GroupByKeys`; everything below aggregates over them. There are
@@ -195,7 +196,7 @@ answer is exact. Types four bytes wide or narrower skip pass one — their whole
 `first` / `last` ride the same kernel over a masked row index.
 
 **Counting sort by group id** (`Kernels/GroupOrder.swift`, `GroupOrderSource.swift`) replaces the argsort
-for the aggregates that genuinely need each group's rows together — `list`, `distinct`, `product`, the
+for the aggregates that need each group's rows together — `list`, `distinct`, `product`, the
 central moments, the order statistics. Histogram, scan, scatter: one pass over the keys rather than four
 over keys and payload. Two scatters share the scan:
 
@@ -218,7 +219,7 @@ algorithm over that ordering in **true binary64**: an exact `d_add` sum for the 
 sums of `d = x - mean` and `d^2` (and `d^3`, `d^4`) about it, finished as
 `m2 = (sum d^2 - (sum d)^2 / n) / (n - ddof)`. Shifting first is what makes it accurate — `sum x^2 -
 (sum x)^2 / n` cancels catastrophically on data far from zero — and the `(sum d)^2 / n` term removes the
-error in the mean itself. On 200k float64 values offset to 1e9 in 997 groups, the worst relative error
+error in the mean itself. On 200k float64 values offset to 1e9 in 997 groups, the largest relative error
 against an exact rational reference is **1.9e-16**; pyarrow's own answer on the same input is 2.5e-10
 off. The Float32 deviations this replaced cost about 1e-5.
 
@@ -276,7 +277,7 @@ pool parks returned buffers instead of recycling them, so pending GPU work can n
 buffer. Per-thread batches; nested `batch` calls join the outer one.
 
 **Lengths flow on the GPU.** Every kernel takes its element count as `device const uint* nPtr`. A pending
-filter result binds the GPU-written total as that pointer and is dispatched at its worst-case size, so the
+filter result binds the GPU-written total as that pointer and is dispatched at its maximum possible size, so the
 next kernel (compare, arithmetic, cast, bitmap ops, another filter, a reduction's partial pass) never needs
 the CPU to know the length. A reduction still syncs once to read its partials.
 
@@ -322,9 +323,9 @@ The C99 edge table — `x^0`, `0^y`, `1^y`, `(-1)^int`, infinity and NaN propaga
 bit, and the `_checked` twins are the unchecked kernel plus a read-only check pass, so they inherit every
 value and raise at exactly the same boundaries.
 
-The price is throughput, and it is the honest cost of the accuracy. At 50M rows on an M4 Max, the old
+The price is throughput, and it is the cost of the accuracy. At 50M rows on an M4 Max, the old
 `float`-detour `ln` ran at 250 GB/s because it was memory bound; the binary64 one runs at 10 GB/s because
-it is compute bound on forty-odd software operations per element. That is a 25x throughput loss for nine
+it is compute bound on forty-odd software operations per element. That is a 25x drop in throughput for nine
 more correct digits, and it is the right trade for a library whose whole claim is that a Float64 column
 means Float64. The float32 kernels are untouched and still take the hardware path.
 
@@ -435,32 +436,33 @@ The crossover at 2^19 rows is where radix select's two passes plus one host read
 selection dispatch. Below it the per-threadgroup kernel is one command buffer; above it, it is bandwidth that
 matters and radix select reads the column at close to peak.
 
-### Numbers (M4 Max, 50M rows, best of 5), 2026-09-06
+### Numbers (M4 Max, 50M rows)
 
 Called from Python on the same in-process data (`PYTHONPATH=python python Benchmarks/python_gpu_bench.py
-50000000 5`), against pyarrow 25, Polars 1.44 (16 threads) and numpy 2.5. Wall ms.
+50000000 5`), against pyarrow 25, Polars 1.44 (16 threads) and numpy 2.5. Wall ms, from
+`Benchmarks/results/python_gpu_bench_50000000_2026-09-07.txt`. Before radix select, `top_k(10 000)`,
+`top_k(100 000)` and both quantiles ran a full argsort or sort of the column.
 
-| Operation (50M rows) | before | **after** | pyarrow | Polars | numpy |
-|---|---:|---:|---:|---:|---:|
-| `top_k(100)`, Int64 | 8.42 (threadgroup select) | **4.68** | 24.85 `select_k_unstable` | 63.81 | 192.87 `argpartition` |
-| `top_k(10 000)`, Int64 | 139.6 (full argsort) | **4.22** | 37.04 | 63.23 | 192.92 |
-| `top_k(100 000)`, Int64 | 139.6 (full argsort) | **4.04** | 193.14 | 62.58 | 194.36 |
-| `quantile(0.5)`, Int64 | 139.4 (full sort) | **4.48** | 307.33 | 67.66 `median` | 313.34 `median` |
-| `quantile(0.5)`, Float64 | 138.0 (full sort) | **2.69** | 387.05 | 132.00 `median` | 396.31 `median` |
+| Operation (50M rows) | **ArrowMetal** | pyarrow | Polars | numpy |
+|---|---:|---:|---:|---:|
+| `top_k(100)`, Int64 | **2.65** | 24.59 `select_k_unstable` | 67.35 | 183.58 `argpartition` |
+| `top_k(10 000)`, Int64 | **3.02** | 34.78 | 62.06 | 182.37 |
+| `top_k(100 000)`, Int64 | **3.16** | 154.78 | 61.29 | 183.50 |
+| `quantile(0.5)`, Int64 | **2.56** | 275.87 | 70.09 `median` | 280.94 `median` |
+| `quantile(0.5)`, Float64 | **2.27** | 353.04 | 126.01 `median` | 362.31 `median` |
 
-That is 5.3x / 8.8x / 47.8x pyarrow's `select_k_unstable` at the three k, and 69x / 144x pyarrow's
-`quantile`. The target was 3x. `top_k` is now flat in k, because k only changes how many of the compacted
+That is 9.3x / 11.5x / 49.0x pyarrow's `select_k_unstable` at the three k, and 108x / 156x pyarrow's
+`quantile`. The target was 3x. `top_k` is flat in k, because k only changes how many of the compacted
 candidates the final ordering has to sort, not how much of the column is read — while pyarrow's heap-based
-`select_k_unstable` degrades from 25 ms to 193 ms over the same range.
+`select_k_unstable` goes from 24.6 ms to 154.8 ms over the same range.
 
-The column is read twice, so the useful bandwidth figure is 2 x 400 MB over the wall time: 171 / 190 / 198
-GB/s for the three top-k, against 423 GB/s for a bare `sum` over the same column and a device peak of ~546
-GB/s. The gap is the mid-flight readback — the host reads 256 counts to pick the bin, so the two passes
-cannot share a command buffer — plus the final ordering, which is a few hundred microseconds at k = 100 and
-a couple of milliseconds at k = 100 000.
+The column is read twice, so the useful bandwidth figure is 2 x 400 MB over the wall time: 302 / 265 / 253
+GB/s for the three top-k, against a device peak of ~546 GB/s. The gap is the mid-flight readback — the host
+reads 256 counts to pick the bin, so the two passes cannot share a command buffer — plus the final ordering,
+which grows with k.
 
-The CPU stays free throughout: 1.7-1.9 CPU-ms for the top-k calls and 0.9-1.4 for the quantiles, against
-25-396 CPU-ms for every CPU library on the same question.
+The CPU stays free throughout: 1.4-1.8 CPU-ms for the top-k calls and 0.9-1.2 for the quantiles, against
+24.6-362.3 CPU-ms for the CPU libraries on the same questions (pyarrow, Polars and numpy; `Benchmarks/results/python_gpu_bench_50000000_2026-09-07.txt`, rows 259-278).
 
 The radix sort's block size is also now adaptive below ~256k rows: a fixed 4096 elements per block left a
 20k-element sort — the size top-k's final ordering lands on — running on five threadgroups. Inputs above
@@ -472,7 +474,7 @@ This is the throughput list this page keeps; the project roadmap is [ROADMAP.md]
 the items it opened with have since landed and are struck through rather than deleted, so a reader can
 see what the design note predicted and where it went.
 
-1. **Pipelined execution** (above). Biggest win for query-shaped work and for Python callers. Still open.
+1. **Pipelined execution** (above). The largest gain for query-shaped work and for Python callers. Still open.
 2. ~~**Fused expressions**~~ — done: `Sources/ArrowMetal/Expr` compiles a whole expression DAG into one
    runtime-generated MSL kernel, and filter + aggregate, project and dense-key group-by fuse into one
    dispatch ([EXPR.md](EXPR.md)).

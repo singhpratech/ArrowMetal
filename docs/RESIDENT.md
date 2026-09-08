@@ -105,7 +105,7 @@ handler) is unnecessary — but it is also moot. The GPU is fully occupied for t
 unavailable to anything else, which makes a minutes-long spin a liability rather than a design.
 
 
-## 4. Where the 65 µs actually goes
+## 4. Where the 65 µs goes
 
 With the worker ruled out, the question becomes how much of ArrowMetal's per-call cost is Metal's and
 how much is ours. Per-call stages for an empty (`nop`) kernel, 500 calls, µs:
@@ -192,7 +192,7 @@ Three changes, all on the ordinary path. Nothing new is enabled by default that 
 
 3. **A spin that polls instead of timing itself.** The old spin called `DispatchTime.now()` on every
    iteration; the profile put **60% of the call's CPU samples inside `dispatch_time` →
-   `mach_absolute_time`, against 4% actually reading `MTLCommandBuffer.status`**. It now reads
+   `mach_absolute_time`, against 4% reading `MTLCommandBuffer.status`**. It now reads
    `mach_absolute_time()` directly and only once per 64 polls.
 
 The 20% and 60% figures come from `sample(1)` on a tight `col.sum()` loop; throughput on that loop

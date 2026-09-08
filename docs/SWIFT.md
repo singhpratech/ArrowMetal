@@ -1,7 +1,7 @@
 # Swift
 
-The native API. The Python package, the C ABI and every other binding call these types; nothing is
-faster to reach the kernels than calling them here. Everything on this page is in
+The native API. The Python package, the C ABI and every other binding call these types. Everything
+on this page is in
 [README.md](../README.md), `Sources/ArrowMetalExamples/main.swift` or the tests under
 `Tests/ArrowMetalTests`, and the numbers are the ones those cite.
 

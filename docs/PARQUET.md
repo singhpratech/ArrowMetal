@@ -162,7 +162,7 @@ wrong data; that is the documented host fallback.
 | `PLAIN_DICTIONARY`, `RLE_DICTIONARY` | all | **GPU** | returns an Arrow dictionary array, or materialised values with `dictionaryEncoded: false` |
 | `DELTA_BINARY_PACKED` | `INT32`, `INT64` | **GPU** | thread 0 parses block headers, all threads unpack their miniblock deltas, a log-step threadgroup scan turns deltas into values |
 | `DELTA_LENGTH_BYTE_ARRAY` | `BYTE_ARRAY` | **GPU** | delta-packed lengths, then one prefix sum and one gather |
-| `DELTA_BYTE_ARRAY` | `BYTE_ARRAY` | **GPU** | prefix and suffix lengths delta-packed; the prefix chain is genuinely serial, so one threadgroup walks its page's values in order while all 256 threads move each value's bytes |
+| `DELTA_BYTE_ARRAY` | `BYTE_ARRAY` | **GPU** | prefix and suffix lengths delta-packed; the prefix chain is serial, so one threadgroup walks its page's values in order while all 256 threads move each value's bytes |
 | `BYTE_STREAM_SPLIT` | `FLOAT`, `DOUBLE`, `FIXED_LEN_BYTE_ARRAY` | **GPU** | byte *k* of value *j* is at plane *k*, slot *j* |
 | `BIT_PACKED` (deprecated level encoding) | levels | — | rejected with `ParquetError.unsupported`; no writer has emitted it since 2015 |
 
@@ -233,7 +233,8 @@ let batch = try f.read(ParquetReadOptions(
 ```python
 cols = am.read_parquet("trades.parquet", columns=["price", "qty"],
                        filters=[("price", ">", 100)])
-total = cols["price"].sum()          # already on the GPU, dictionary-encoded or not
+# already on the GPU, dictionary-encoded or not
+total = cols["price"].sum()
 
 # Across several queries, keep the handle: mapping the file is a per-open cost.
 f = am.ParquetFile("trades.parquet")
@@ -340,7 +341,7 @@ PYTHONPATH=python python Benchmarks/parquet_bench.py --rows 50000000 --codecs sn
   400 MB of random doubles, comes back in 11 ms. A page full of short matches costs a token each, and an
   LCG-generated `int64` column decodes at 2-5 GB/s where the uncompressed path does 14-40 GB/s. Smaller
   pages help a little (the table above) but do not change the shape of it: this is the one part of
-  Parquet that a GPU is structurally bad at, and it is honest to say so.
+  Parquet that a GPU is structurally bad at; the GPU decode is behind the CPU path there.
 - **Where the GPU is unambiguously ahead is the uncompressed and dictionary paths**, which is also where
   a GPU-resident analytics stack wants to be: 40 GB/s for a plain `int64` column, and a dictionary column
   that comes back as an Arrow dictionary array without materialising a single string.

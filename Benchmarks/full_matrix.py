@@ -45,6 +45,7 @@ Methodology (the same rules as Benchmarks/README.md):
 - Bytes counted are the bytes the operation must touch (input + output), so GB/s is comparable.
 - An operation ArrowMetal does not have, or that raises, is recorded as an error row, never skipped.
 """
+import re
 import argparse, csv, datetime, decimal, gc, importlib.util, math, os, resource, statistics, sys, time
 
 import numpy as np
@@ -162,7 +163,7 @@ def case(family, op, rows, nbytes, impls, notes=None, parallel=None, compare=Non
 
 # ---------------------------------------------------------------- the parallel idioms
 #
-# The claim this exists to make honest: a CPU baseline is only "on all cores" if the idiom it was
+# What this exists to establish: a CPU baseline is only "on all cores" if the idiom it was
 # written in actually fans out. `pl.Series.sum()` and `pyarrow.compute.add(...)` do not, however
 # many threads the pool has. These helpers build, for the same values and the same answer, the
 # idiom each library offers that does: a polars LazyFrame collected on the in-memory or streaming
@@ -1917,9 +1918,18 @@ def family_decimal(d, n):
         parallel=pdec.project(pl.col("x").round(2), pc.round(pc.field("x"), ndigits=2)))
 
 
+_NESTED_SIZES_DONE = set()
+
+
 def family_nested(d, n):
     f = "nested"
     m = min(n, 10_000_000)
+    # The family caps its size, so two requested sizes above the cap would measure the same 10M
+    # rows twice; run each capped size once per invocation.
+    if m in _NESTED_SIZES_DONE:
+        print(f"  nested: {m:,} rows already measured in this run, skipped for {n:,}")
+        return
+    _NESTED_SIZES_DONE.add(m)
     rng = np.random.default_rng(SEED + 3)
     per_row = 4
     child = rng.integers(0, 1000, size=m * per_row, dtype=np.int64)
@@ -2269,6 +2279,23 @@ def cores_summary(rows, context=False):
     return "\n".join(out)
 
 
+def _host_scan_note(verdicts):
+    """`any` and `all` stop at the first decisive bit on the host (docs/COVERAGE.md), so their ratio
+    is a property of the data, not of a GPU pass; the summary says so when they are in the run."""
+    keys = [k for k in _ORDER if re.match(r"(any|all)\b", k[1])]
+    ok = sum(1 for k, v in zip(_ORDER, verdicts) if k in keys and v == "OK")
+    if not ok:
+        return ""
+    total_ok = sum(1 for v in verdicts if v == "OK")
+    sizes = sorted({k[2] for k in keys})
+    WORD = {1: "One", 2: "Two", 3: "Three", 4: "Four", 5: "Five", 6: "Six", 7: "Seven", 8: "Eight"}
+    return (f" {WORD.get(ok, ok)} of the {total_ok} — `any` and `all` at "
+            + " and ".join(f"{n // 1_000_000}M" if n % 1_000_000 == 0 else f"{n:,}" for n in sizes)
+            + " rows — are host CPU scans rather than GPU passes: the kernel stops at the first "
+            "decisive bit without a dispatch ([COVERAGE.md](COVERAGE.md)), so their ratio depends on "
+            "where that bit is.")
+
+
 def verdict(ratio):
     if ratio is None:
         return "n/a"
@@ -2276,10 +2303,10 @@ def verdict(ratio):
         return "OK"
     if ratio >= 1.0:
         return "WARN"
-    return "FAIL"
+    return "to improve"
 
 
-VERDICT_MARK = {"OK": "✅", "WARN": "⚠️", "FAIL": "❌", "n/a": "—"}
+VERDICT_MARK = {"OK": "✅", "WARN": "⚠️", "to improve": "❌", "n/a": "—"}
 
 
 def build_report(csv_path, elapsed_s):
@@ -2312,7 +2339,7 @@ def build_report(csv_path, elapsed_s):
     lines.append("")
     lines.append("- Every number is the best wall time of up to five calls after one warm-up, with the "
                  "process CPU time (all threads) of that same call beside it, and then **the cores that "
-                 "call actually used** (cpu-ms / wall-ms). A slow call is repeated fewer times, never "
+                 "call used** (cpu-ms / wall-ms). A slow call is repeated fewer times, never "
                  "fewer than twice; the CSV records the count.")
     lines.append("- **Every CPU library gets two columns: its plain eager idiom and its most parallel "
                  "idiom.** `polars-lazy` is the same expression through `pl.LazyFrame`, collected on "
@@ -2323,20 +2350,34 @@ def build_report(csv_path, elapsed_s):
                  "core on the element-wise and whole-column reduction rows however many threads the "
                  "pool has — see the cores table below for where that is and is not true — and a "
                  "comparison against one core is not the comparison this project wants to make.")
-    lines.append("- pandas has no parallel idiom recorded for any operation here. Its kernels are "
-                 "single-threaded by design, and its two threaded paths are numexpr (element-wise "
-                 "arithmetic through `pd.eval` / `DataFrame.eval`) and the numba engine with "
-                 "`parallel=True` (`rolling`, `groupby.agg` / `transform`, `apply`); which of them "
-                 "this run found installed is written into every `pandas-parallel` row's note. "
-                 "numpy's ufuncs are single-threaded. Both are recorded as `pandas-parallel` / "
-                 "`numpy-parallel` rows saying so, rather than left out.")
+    lines.append("- pandas' threaded paths, numexpr and numba, were not installed for this run "
+                 "(numexpr is element-wise arithmetic through `pd.eval` / `DataFrame.eval`; the "
+                 "numba engine with `parallel=True` is `rolling`, `groupby.agg` / `transform`, "
+                 "`apply`), so pandas is measured in its eager idiom and every `pandas-parallel` "
+                 "row's note says so. numpy's ufuncs are single-threaded. Both are recorded as "
+                 "`pandas-parallel` / `numpy-parallel` rows saying so, rather than left out.")
     lines.append("- **ratio** is the fastest CPU idiom's wall time divided by ArrowMetal's, taken "
                  "across *all* the idioms of all the libraries; the **fastest CPU** column names the "
                  "idiom that won. The verdict is the project's own bar: ✅ at or above 3x, "
-                 "⚠️ between 1x and 3x, ❌ slower than the fastest CPU idiom.")
-    lines.append("- `--` in a library column means that library has no equivalent operation, or no "
-                 "parallel idiom for it (the reason is in the CSV's `note` column); `err` means the "
+                 "⚠️ between 1x and 3x, ❌ to improve: the fastest CPU idiom is ahead.")
+    lines.append("- `--` in a library column means that library has no equivalent operation, or the "
+                 "matrix has not measured a threaded idiom for it (the reason is in the CSV's `note` "
+                 "column); `err` means the "
                  "call raised, and the message is in the CSV. Nothing is skipped silently.")
+    # A family that caps its size (nested, at 10M) used to be measured once per requested size;
+    # the CSV then carries the same (family, op, rows, library) key twice. by_key keeps the later
+    # record, and the count says so.
+    _timed = [r for r in ROWS if r["wall_ms"] is not None]
+    _seen, _dup = set(), set()
+    for r in ROWS:
+        k = (r["family"], r["op"], r["rows"], r["library"])
+        (_dup if k in _seen else _seen).add(k)
+    if _dup:
+        _fams = ", ".join(sorted({k[0] for k in _dup}))
+        _sizes = ", ".join(f"{n:,}" for n in sorted({k[2] for k in _dup}))
+        lines.append(f"- {len(_timed):,} timed records, "
+                     f"{len({(r['family'], r['op'], r['rows'], r['library']) for r in _timed}):,} rows: "
+                     f"the {_fams} family at {_sizes} rows was measured twice and the later pass is shown.")
     lines.append("- Bandwidth (GB/s) is bytes touched (input + output) over wall time. Where ArrowMetal "
                  "and the best baseline are both near the ~400 GB/s the single-pass rows of this matrix reach the "
                  "operation is memory-bound and no ratio above ~1.5x is available to either side.")
@@ -2377,7 +2418,7 @@ def build_report(csv_path, elapsed_s):
             if amr is None or amr["status"] != "ok":
                 am_cell = "err" if (amr and amr["status"] == "error") else "--"
                 am_gbs = "--"
-                ratio, vd = None, "FAIL" if amr and amr["status"] == "error" else "n/a"
+                ratio, vd = None, "to improve" if amr and amr["status"] == "error" else "n/a"
                 if amr and amr["status"] == "error":
                     shortfalls.append((key, None, best_lib, best_wall, amr, row))
                     errors += 1
@@ -2386,7 +2427,7 @@ def build_report(csv_path, elapsed_s):
                 am_gbs = fmt_gbs(amr["gbs"])
                 ratio = (best_wall / amr["wall_ms"]) if best_wall else None
                 vd = verdict(ratio)
-                if vd in ("WARN", "FAIL"):
+                if vd in ("WARN", "to improve"):
                     shortfalls.append((key, ratio, best_lib, best_wall, amr, row))
             verdicts.append(vd)
             lines.append(
@@ -2395,7 +2436,7 @@ def build_report(csv_path, elapsed_s):
                 + f" | {best_lib or '--'} | {fmt_ratio(ratio)} | {VERDICT_MARK[vd]} |")
         lines.append("")
 
-    tally = {"OK": 0, "WARN": 0, "FAIL": 0, "n/a": 0}
+    tally = {"OK": 0, "WARN": 0, "to improve": 0, "n/a": 0}
     for v in verdicts:
         tally[v] = tally.get(v, 0) + 1
     # _ORDER is one entry per (family, op, rows): a row of the table, not an operation. Most
@@ -2415,11 +2456,12 @@ def build_report(csv_path, elapsed_s):
     lines[summary_at] = (
         f"**{n_rows} rows measured, over {len(ops)} operations** ({at}). "
         f"{tally['OK']} at or above 3x (✅), {tally['WARN']} between 1x and 3x (⚠️), "
-        f"{tally['FAIL']} slower than the fastest CPU idiom (❌)"
+        f"{tally['to improve']} to improve, where the fastest CPU idiom is ahead (❌)"
         + (f" — of which {errors} a call that raised" if errors else " — none of them a call that "
            "raised")
         + f" — and {tally['n/a']} with no CPU equivalent to compare against (—). "
-        f"{round(tally['OK'] * 100 / max(n_rows, 1))}% of the measured rows meet the bar.\n")
+        f"{round(tally['OK'] * 100 / max(n_rows, 1))}% of the measured rows meet the bar."
+        + _host_scan_note(verdicts) + "\n")
 
     # ---- the Swift / vDSP baselines, copied
     lines.append("## The 16-core Swift / vDSP baselines (copied from docs/BENCHMARKS.md)")
@@ -2437,10 +2479,10 @@ def build_report(csv_path, elapsed_s):
     lines.append("")
 
     # ---- shortfalls
-    lines.append("## SHORTFALL: every row that is not at 3x")
+    lines.append("## Rows under the 3x bar")
     lines.append("")
-    lines.append("Sorted by how far short of the 3x bar the row is (worst first). "
-                 "❌ means some CPU idiom is faster than ArrowMetal outright. The baseline here is "
+    lines.append("Sorted by distance from the 3x bar, furthest first. "
+                 "❌ means the fastest CPU idiom is ahead of ArrowMetal on that row. The baseline here is "
                  "the fastest of every idiom of every CPU library, named in its own column.")
     lines.append("")
     lines.append("| op | rows | ratio | ArrowMetal ms | fastest CPU idiom | baseline ms | "
@@ -2463,7 +2505,7 @@ def build_report(csv_path, elapsed_s):
     lines.append("")
     lines.append(f"{len(shortfalls)} of {len(_ORDER)} measured rows are below the 3x bar.")
     lines.append("")
-    lines.append("## How many cores each idiom actually used")
+    lines.append("## How many cores each idiom used")
     lines.append("")
     lines.append("cpu_ms / wall_ms for every measured row, per library and idiom. 1.00 means the "
                  "idiom ran on one core, whatever the size of the thread pool. This is the table "
@@ -2478,10 +2520,12 @@ def build_report(csv_path, elapsed_s):
     lines.append("```")
     lines.append("DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \\")
     lines.append("  swift build -c release --product ArrowMetalC")
-    lines.append("PYTHONPATH=python python Benchmarks/full_matrix.py            # full run")
-    lines.append("PYTHONPATH=python python Benchmarks/full_matrix.py --quick    # 1M-row smoke")
-    lines.append("PYTHONPATH=python python Benchmarks/full_matrix.py --verify \\")
-    lines.append("    --sizes 1000000    # assert every parallel idiom answers what its default does")
+    lines.append("# full run")
+    lines.append("PYTHONPATH=python python Benchmarks/full_matrix.py")
+    lines.append("# 1M-row smoke")
+    lines.append("PYTHONPATH=python python Benchmarks/full_matrix.py --quick")
+    lines.append("# assert every parallel idiom answers what its default does")
+    lines.append("PYTHONPATH=python python Benchmarks/full_matrix.py --verify --sizes 1000000")
     lines.append("```")
     lines.append("")
     return "\n".join(lines), shortfalls

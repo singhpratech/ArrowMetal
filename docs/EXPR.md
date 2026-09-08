@@ -222,7 +222,7 @@ first-touching a fresh output buffer
 (the reason the float64 *project* costs more than the *aggregate*, which only writes threadgroup
 partials). Crossover against Polars for these shapes is around 1M rows.
 
-Where fusion wins most is where the operator count is highest relative to the bytes moved: (b) is 1.5×
+Where fusion gains most is where the operator count is highest relative to the bytes moved: (b) is 1.5×
 the batched op-by-op chain, (d) is 1.8×, and (a) is 1.2× — while (c), which is compaction bound rather
 than operator bound, is a wash. Against the CPU engines in these tables — Polars, pyarrow and pandas —
 the margin is 4× to 62×, at a sixtieth to a two-thousandth of the CPU time; against numpy it is 2.6×

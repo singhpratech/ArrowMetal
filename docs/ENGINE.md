@@ -87,7 +87,7 @@ and only fires where that order is unobservable. `explain()` lists the ones that
 | `constant_folding` | evaluates literal-only subtrees, collapses `and(true, x)`, `x * 1`, `not(not x)`, dead `coalesce` arms. Only the **Kleene** forms absorb a literal (`and_kleene(false, x)` → `false`): plain `and`/`or` propagate nulls, so `and(false, null)` is null and does not fold. `if_else(c, a, a)` does not fold either — Arrow's `if_else` is null wherever `c` is |
 | `filter_fusion` | `filter(filter(x, a), b)` → `filter(x, and(a, b))`: one compaction pipeline instead of two |
 | `predicate_pushdown` | moves each conjunct as far down as it can go: through projections (substituting the projected expression), through `with_columns`, below sorts, below a group-by when it only touches key columns, into each side of a join where the join kind allows, into every branch of a concat, and below an explode |
-| `projection_pruning` | works out what each node's parent actually needs and narrows the scan to those columns; drops projection and window outputs nothing reads |
+| `projection_pruning` | works out what each node's parent needs and narrows the scan to those columns; drops projection and window outputs nothing reads |
 | `expression_cse` | drops duplicate `with_columns` outputs with the same canonical text (the fused kernel's own CSE only sees one query at a time). `select` is left alone: it names its outputs positionally, so a repeated one really is a repeated column |
 | `join_reorder` | an inner join is commutative and `hashJoin` builds its table from the **right** side, so the smaller estimated input is put there; a projection on top restores the caller's column order. The swap permutes the rows, so it only fires below a sort, a whole-input reduction or a group-by — never where "Row order" below is still observable |
 
@@ -192,7 +192,7 @@ and go back to `MetalContext.pool`, which parks rather than recycles while a bat
 
 ## Getting the data in
 
-An engine that runs a query in 10 ms can lose 100 ms getting to it, and this one did. `am.scan(table)`
+An engine that runs a query in 10 ms can spend longer than that getting to it, and this one did. `am.scan(table)`
 handed the plan its columns as `pyarrow` arrays and `collect()` imported every one of them into Metal
 memory, on every run. At 20M rows that was 6 ms of `makeBuffer(bytesNoCopy:)` and page residency per
 call — and worse, the allocation and teardown of a fresh 240 MB import each time churned the buffer
@@ -236,7 +236,7 @@ over a two-column `pyarrow.Table`, `time.perf_counter` around each stage of a wa
 | **total** | **22.85 ms** | **10.28 ms** |
 | first `collect()` in a fresh process | 92 ms | 76 ms |
 
-The `am_plan_run` column moved because the import churn was making the kernels slower, not because the
+The `am_plan_run` column moved because the import churn was adding to the kernels' time, not because the
 kernels changed: parsing and optimizing the plan is 0.24 ms of it, and the Python side around it is
 now 0.14 ms. Measured against the same query over columns already resident in Metal memory, scanning a
 `pyarrow.Table` costs +0.05 ms at 2M rows and −0.12 ms at 50M — inside the noise.
@@ -385,7 +385,7 @@ the same run: it is what the query cost the machine, next to what it cost the ca
 Reading it: the widest margins are where the operator count is high relative to the bytes moved — (d)
 is six operators over four columns and 42x, (a) is a filter plus a reduction and 7.1x — and where the
 work is a scan the GPU does in one pass, like (h)'s binary search. The narrowest is (f), where Polars
-is actually **ahead** — 3.06 ms against ArrowMetal's 3.50 — because the case is bound by writing 10M
+is **ahead** — 3.06 ms against ArrowMetal's 3.50 — because the case is bound by writing 10M
 output rows rather than by compute; (b) at 2.4x is the next narrowest.
 
 The CPU column is the other half of the story: ArrowMetal's queries cost the machine 0.6 to 5.2 ms of

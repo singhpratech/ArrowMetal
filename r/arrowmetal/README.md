@@ -90,7 +90,7 @@ enough to move a headline:
   that expression. The most favourable measurement.
 - **interleaved** — every expression in *one* `microbenchmark()` call, so the runs are shuffled
   together and each expression meets the cache and buffer-pool state the others leave behind. The
-  conservative measurement, and the honest one for a table whose rows are compared with each other.
+  conservative measurement, and the one the table below uses, since its rows are compared with each other.
 
 `min` is the fastest of all 200 runs; `median` is the median of the 10 per-process medians.
 "resident" means the column is already an `am_array`; "import" means the timing starts from an
@@ -164,7 +164,7 @@ idle Mac.
 
 ## Tests
 
-65 `test_that()` blocks, 266 passing expectations, comparing against base R and against `arrow`'s
+64 `test_that()` blocks in the sources (65 as testthat runs them: the one in test-dispatch.R runs once per attach order), 266 expectations, comparing against base R and against `arrow`'s
 own kernels on the same data: nulls, all-null and empty columns, sliced input, lengths of 1, 33,
 1024, 65537 and 1,000,001 (crossing a threadgroup boundary), int64 above 2^53, float32, strings and
 booleans, and every error path.

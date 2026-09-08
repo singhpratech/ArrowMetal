@@ -203,8 +203,8 @@ the host until `finish()`.
 
 #### Publishing a 64-bit key with 32-bit atomics
 
-Metal has no 64-bit atomic add or compare-exchange — checked, not assumed: on this M4 Max
-`atomic_ulong` admits only `fetch_min` and `fetch_max` on device memory — and only guarantees
+Metal has no 64-bit atomic add or compare-exchange — checked on this M4 Max: `atomic_ulong` admits
+only `fetch_min` and `fetch_max` on device memory — and only guarantees
 `memory_order_relaxed` on the 32-bit ones. So the usual "claim the slot, then publish the key beside
 it" handshake is not safe: nothing orders the key's store against the claim, and a reader that sees a
 claimed slot may read a key that is not there yet. `Kernels/HashTable.swift` avoids that by storing
@@ -359,7 +359,7 @@ which is associative and order independent.
 Per batch the GPU does the work: sort the non-null values with the radix argsort, then gather
 `compression` sample points with one `take`. **The sample positions are not uniform in rank** — they
 follow the inverse of the t-digest k1 scale function `k(q) = (C / 2π) · asin(2q − 1)`, which packs
-samples into the tails, where a uniform sample is worst. The merge re-compresses under the same scale
+samples into the tails, where a uniform sample is least accurate. The merge re-compresses under the same scale
 function, so a centroid near q = 0.99 keeps far less weight than one near q = 0.5.
 
 A centroid covering rank interval `[r0, r1)` answers any quantile inside it with rank error at most
@@ -496,7 +496,7 @@ dense encoding of the previous section; "after" is the row-level path of §4.1.
 | group by `bigkey` -> sum (10M groups) | 2,156 | **614** | 393 | 638 | 4.12 GB | 4.74 GB | 2.90 GB | 4.63 GB |
 | group by `region` -> sum, count (1k groups) | 199 | 200 | 106 | 240 | 2.30 GB | 2.32 GB | 2.32 GB | 0.86 GB |
 
-`groupby_10m` is **3.5x** faster and now **beats DuckDB**; it was 5.5x behind Polars and is 1.6x
+`groupby_10m` is **3.5x** faster and is now ahead of DuckDB; it was 5.5x behind Polars and is 1.6x
 behind. `groupby_1k` is unchanged to the millisecond, which is the point of the chooser: a thousand
 contiguous values is exactly the shape the range encoding is for, the row path is never taken, and
 nothing about that workload moved.
@@ -563,7 +563,7 @@ against Polars' answer with a 1e-9 relative tolerance on float sums, and all fou
 
 ### Where the pipeline's time goes now
 
-`overlap` is 1.0 for a serial pipeline, and above that by however much the stages actually ran at the
+`overlap` is 1.0 for a serial pipeline, and above that by however much the stages ran at the
 same time. With `readers = 2` the read column is the sum across both reader threads, so it can exceed
 wall on its own. The stall columns are the GPU stage waiting: for a batch the readers had not
 finished, and for the merge queue to drain.
@@ -584,7 +584,7 @@ reached by the keys and aggregates the resident one does not take. **The merge s
 everywhere**, so the bounded queue between the GPU stage and the merge never fills, and peak RSS
 stays flat at 2.3 to 2.5 GB over 8 GB of data.
 
-**Where we still lose, and why.**
+**Where the CPU engines are ahead, and why.**
 
 * **`filter_sum` and `count_distinct` are read-bound at `readers = 2`.** Their GPU stage is 0.09 s of
   a 0.32 s wall and the read stall is 0.21 s of it, so what is being measured there is two reader
@@ -621,7 +621,7 @@ digits of a double (the benchmark's own cross-check passes on every round).
 | Polars | 233 ms | 1,836 MB | | | | |
 | DuckDB | 229 ms | 862 MB | | | | |
 
-**The GPU stage is 3.5x smaller** — 0.14 s to 0.04 s — which is what the fusion actually did: the
+**The GPU stage is 3.5x smaller** — 0.14 s to 0.04 s — which is what the fusion did: the
 gather of every column of every matched pair is gone, and so is the joined batch. Peak RSS falls by
 180 MB and host CPU by 170 ms (698 to 529 ms), because nothing is collected and nothing is summed in
 Python. (The fused GPU stage measures between 0.04 and 0.09 s across rounds; the spread is the
@@ -629,7 +629,7 @@ one-off compile of the generated kernel on the first batch, which the unfused pa
 because its kernels are already in the pipeline cache. The unfused stage is 0.14 to 0.15 s in every
 round.)
 
-**The wall clock only moves from 379 ms to 336 ms, and it still loses to Polars and DuckDB, because
+**The wall clock only moves from 379 ms to 336 ms, and Polars and DuckDB are still ahead, because
 at `readers = 2` this cell is read-bound.** The read stage is 0.315 s of a 0.336 s wall and the GPU
 stage waits 0.13 s of it for a batch the two reader threads had not finished: what is being measured
 is two threads moving 4 GB against Polars reading the same directory with every core. One
@@ -667,13 +667,13 @@ was deleted, in a single interleaved A/B round with `readers = 8`, printed to a 
 
 At that size **top-k and `ORDER BY ... LIMIT` come within 1.4x-1.9x of Polars and DuckDB** — 0.8 s
 against 0.587 and 0.544, 1.1 s against 0.642 and 0.567 — down from 4.7 s and 11.2 s, because 30 GB is
-where the per-batch work, not the read, was the limit. The resident group table (§4.1) landed after
-that run, so `groupby_10m` was not re-measured at 30 GB; its 8 GB improvement is in the table above.
+where the per-batch work, not the read, was the limit. The 30 GB run predates the resident group
+table (§4.1); `groupby_10m` with that table is measured at 8 GB and 4 GB in the tables above.
 
 pyarrow.dataset (measured in a separate single-reader run, so not comparable cell by cell) finished
 `groupby_10m` in 557 s and **timed out at 900 s on `count_distinct`**.
 
-* **`count_distinct_approx` beats Polars by 7x** (532 ms against 3,825 ms) at 8.8 GB of peak RSS
+* **`count_distinct_approx` is 7x Polars** (532 ms against 3,825 ms) at 8.8 GB of peak RSS
   against Polars' 17.0 GB, and its own running state is a 16 KB sketch. DuckDB's sketch is faster
   still, but its answer is **12.4 % off** against ArrowMetal's **0.007 %** — DuckDB's
   `approx_count_distinct` is tuned for a much smaller sketch. Against an exact count this is the
@@ -714,7 +714,7 @@ ArrowMetal's peak RSS at `readers = 8` is around 9 GB against Polars' 2 GB, and 
 difference is **mapped file pages**: eight readers hold eight ~1 GB part files mapped at once, and
 `ru_maxrss` counts those. They are page cache, not anonymous memory — the kernel reclaims them under
 pressure — but the number is real and it is the price of the parallel read. With `readers = 1` the
-same queries run at 1.2 GB of RSS (and two to five times slower). The genuinely private state is what
+same queries run at 1.2 GB of RSS (and take two to five times as long). The private state is what
 §4 lists: a few scalars, a 16 KB sketch, k rows, or the group table.
 
 ## 10. Limits
@@ -730,8 +730,8 @@ same queries run at 1.2 GB of RSS (and two to five times slower). The genuinely 
   need one sketch per group and is not implemented.
 * **`variance` / `stddev` are not available in the dense-key GPU group-by path** (they need a third
   accumulator array); the arbitrary-key path has them.
-* **Grace join keys must be integers.** Strings would need the GPU string hash table another agent
-  owns.
+* **Grace join keys must be integers.** Strings would need the GPU string hash table
+  (`Kernels/StringHashTable.swift`) wired into the partitioner, which is not done.
 * **The IPC sink writes the stream encapsulation**, not the random-access file format: the file
   footer's block index cannot be built incrementally without reaching into `IPCWriter`. Every reader
   that matters (pyarrow, Polars, this package) reads it.
@@ -739,7 +739,7 @@ same queries run at 1.2 GB of RSS (and two to five times slower). The genuinely 
   column for a whole stream is the only form the writer emits, which an incremental sink cannot
   promise.
 * **A `Stream` is single use**: a terminal consumes the source. Open a new scan for a second question.
-* **A group-by over ten million groups is 1.6x slower than Polars** (§9), down from 5.5x. The rows go
+* **A group-by over ten million groups is 1.6x behind Polars** (§9), down from 5.5x. The rows go
   straight into the resident table now, so there is no per-batch encoding left to remove; what is
   left is the insert itself, the batch's `GroupBy` and the fold, all in the merge stage, which the
   GPU stage then waits 0.22 s on. Splitting the resident table into shards a batch could insert into

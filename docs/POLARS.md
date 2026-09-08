@@ -3,7 +3,7 @@
 Polars is the reason most people on an Apple silicon Mac have Arrow-shaped data in memory at all.
 This document is how you point that data at the GPU.
 
-There are three tiers, all shipping in this repository, and they differ in **where the GPU sits
+There are three tiers, all in 0.1.0, and they differ in **where the GPU sits
 relative to the Polars plan**:
 
 | Tier | Where the GPU runs | What you write | Needs |
@@ -35,8 +35,7 @@ cd polars-plugin && cargo build --release && cd ..
 
 That is the whole build, and both halves are checked: on an M4 Max the Swift product and the cargo
 release build both go through from an empty `target/`, with no other flags and no
-`DYLD_LIBRARY_PATH`. (Build times are not measured by any recorded benchmark run, so none are
-quoted here.) `cargo build --release` is enough for the plugin -- it is a plain `cdylib`
+`DYLD_LIBRARY_PATH`. `cargo build --release` is enough for the plugin -- it is a plain `cdylib`
 that Polars `dlopen`s, not a Python extension module, so `maturin` is optional, and
 `arrowmetal.polars_plugin.plugin_path()` finds `polars-plugin/target/release/` on its own.
 `ARROWMETAL_POLARS_PLUGIN` overrides the search.
@@ -132,7 +131,7 @@ Grouped aggregates available through `.agg`: `sum`, `mean`, `min`, `max`, `count
 `gb.quantile(column, q)`. One `am_group_by_keys` pass builds the dense group ids and every
 aggregate after that reuses it, so `.agg(...)` with six outputs costs **one** group-by.
 
-### What each tier-1 method actually runs
+### What each tier-1 method runs
 
 | Method | ArrowMetal entry point | Note |
 |---|---|---|
@@ -152,8 +151,8 @@ aggregate after that reuses it, so `.agg(...)` with six outputs costs **one** gr
 
 ### The join
 
-ArrowMetal publishes no join kernel, so `df.arrowmetal.join` is built out of the ones it does
-have. `am_index_in` finds, for every left key, the row of the right key column it matches;
+The bridge does not call the C ABI's `am_join` hash join yet; `df.arrowmetal.join` is built out of
+two other kernels. `am_index_in` finds, for every left key, the row of the right key column it matches;
 `am_take` and `am_filter` then gather both sides. That is a complete **inner** or **left** join
 whenever the **right key is unique** -- the usual dimension-table shape -- and the whole thing,
 uniqueness check included (one `am_group_by_keys`: as many groups as rows means every key is
@@ -218,7 +217,7 @@ is about what *round-trips*, which is a tier-1 and tier-3 question.
 
 Everything else -- Boolean, the temporal types, Binary, Categorical, Enum, Decimal, List, Struct,
 Null -- raises a Polars `ComputeError` whose message starts `arrowmetal:`. Nothing panics through
-pyo3. **There are two places tier 2 is genuinely behind tier 1.** Categorical and Enum: the Python
+pyo3. **There are two places tier 2 is behind tier 1.** Categorical and Enum: the Python
 bridge recodes Polars' `dictionary<uint32>` index buffer to int32 for the GPU, and
 `polars-plugin/src/bridge.rs` does not, so a Categorical column reaches the kernel as-is and is
 refused with "dictionary indices must be int32 or int64". And Decimal: `am_decimal_op`
@@ -353,10 +352,11 @@ So a Metal backend is **not** blocked on Polars adding an API -- the API is ther
 
 The pieces ArrowMetal would need for step 3 already exist: `am_query` compiles a whole filter +
 projection + aggregate DAG into one Metal kernel and is a close match for a Polars `SELECT` node,
-`am_group_by_keys` + `am_group_agg_ex` cover the aggregate nodes, `am_lexsort` covers sort, and
-the scan nodes stay with Polars. The missing pieces are a join kernel and an IR translator with
-an honest unsupported-node list. Until then, `collect_gpu` is the honest version of the same
-idea: Polars owns the plan, ArrowMetal owns one pass over the result.
+`am_group_by_keys` + `am_group_agg_ex` cover the aggregate nodes, `am_lexsort` covers sort, the
+engine's join matrix ([ENGINE.md](ENGINE.md)) covers the join nodes, and the scan nodes stay with
+Polars. The missing piece is the IR translator itself, with an explicit unsupported-node list.
+Until then, `collect_gpu` is the same idea in its explicit form: Polars owns the plan, ArrowMetal
+owns one pass over the result.
 
 ---
 
@@ -371,7 +371,8 @@ PYTHONPATH=python python Benchmarks/polars_bench.py 50000000 5
 ```
 
 Columns: `k` Int32 with 1000 distinct values, `v` Int64, `amount` Float64, `name` String drawn
-from 4096 distinct values.
+from 4096 distinct values. The "Polars" column is Polars' eager idiom; the lazy engine and
+pyarrow's Acero are on the Compare tab and in the benchmark matrix.
 
 ### 50M rows
 
@@ -383,9 +384,6 @@ from 4096 distinct values.
 | `top_k(100)` | 60.0 ms / 60.1 CPU-ms | 18.2 ms (3.3x) | 18.0 ms (3.3x) | 10.5 ms (5.7x) |
 | string `contains` (literal) | 634.1 ms / 634.0 CPU-ms | 290.7 ms (2.2x) | 272.8 ms (2.3x) | 7.1 ms (89.3x) |
 
-The 10M-row table that used to sit here was not re-measured on 2026-09-07 -- the rerun covered
-50M rows only -- so it has been removed rather than carried forward unrecorded.
-
 ### Reading the table
 
 * **The "Polars" column is Polars' eager idiom**, which is what `Benchmarks/polars_bench.py` measures
@@ -396,17 +394,18 @@ The 10M-row table that used to sit here was not re-measured on 2026-09-07 -- the
 * **"GPU-resident"** is the same kernel with the column already in Metal memory -- the import is
   outside the timed region, and, for the group-by rows, the `am.group_by([k])` key-mapping pass as
   well: those rows time the aggregate only. It is what a pipeline that stays on the GPU sees, and it
-  is the column that shows what the kernels are actually worth.
+  is the column that shows what the kernels are worth.
 * **The group-by row is not a like-for-like ratio against Polars**, whose 79.3 ms includes its whole
   hash group-by. The comparable end-to-end figure is in the benchmark matrix: `sum by int32 key
   (1000 groups)` at 50M rows is **4.89 ms against Polars lazy's 81.93 ms, 16.8x**
   (`Benchmarks/results/full_matrix_2026-09-07-parallel.csv`), and 1.73 ms against 20.24 ms, 11.7x, at
-  10M.
+  10M. The fastest CPU idiom on that row is pyarrow's Acero (`pyarrow-threaded`), 18.45 ms at 50M,
+  which puts the ratio at 3.8x.
 * **The hand-off is the whole difference** between the middle columns and the right one. At 50M
-  rows the import is 5.25 ms and the export 0.01 ms, and the run records the import as a genuine
-  no-copy -- the Polars source buffer and the Metal buffer are the same address (`zero copy: ...
-  -> SAME`). Every tier-1 and tier-2 row pays it once per call, so a single `sum` loses to Polars
-  and a group-by wins by 4x.
+  rows the import is 5.25 ms and the export 0.01 ms, and the run records the import as a no-copy
+  -- the Polars source buffer and the Metal buffer are the same address (`zero copy: ...
+  -> SAME`). Every tier-1 and tier-2 row pays it once per call, so on a single `sum` Polars is
+  ahead, and a group-by is 4x.
 * **CPU-ms is the other half of the story.** The 50M group-by costs Polars 1121 CPU-ms across 16
   threads; ArrowMetal costs 14.0 CPU-ms end to end and 0.4 CPU-ms resident. On a laptop that is
   battery, and on a shared box it is 16 cores left free for something else.

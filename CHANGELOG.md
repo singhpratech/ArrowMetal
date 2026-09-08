@@ -1,7 +1,7 @@
 # Changelog
 
-## 0.1.0 (unreleased, in development)
-Everything below ships together as the first public release.
+## 0.1.0
+Everything below is in 0.1.0, the first public release.
 
 Core
 - Metal shared-memory Arrow buffers (page aligned, pooled) and primitive/boolean arrays.
@@ -230,7 +230,7 @@ Fixed
   nulls 139.745 -> 6.837 ms at 10M rows and 725.935 -> 33.669 ms at 50M; with 50% nulls at 50M,
   3,436.130 -> 22.879 ms. (Every figure in these two bullets and in the matching section of
   docs/TO_IMPROVE.md comes from one set of runs, recorded with the scripts that produced it: the 10% rows
-  and the plain sorts from the matrix-conditions harness, the 50% row from the shape sweep. LOSSES
+  and the plain sorts from the matrix-conditions harness, the 50% row from the shape sweep. TO_IMPROVE.md
   names the file each one is in.)
 - `partition_nth_indices` split the column around the selected key with three `compare` + `filter`
   compactions and a concatenation: seven command buffers, and two of its steps ran on the host — the row

@@ -23,8 +23,8 @@ is now slightly ahead of ArrowMetal on engine case (f) (3.06 ms against 3.50).
 The matrix now measures every CPU library **twice**: its plain eager idiom, and the most parallel
 idiom it has for the same answer — `polars-lazy` is the same expression through `pl.LazyFrame`
 collected on the in-memory or the streaming engine, `pyarrow-threaded` is an Acero plan over the same
-values split into 16 record batches. pandas has no parallel idiom and says so in its own row; numpy's
-ufuncs are single-threaded and say the same. "Fastest CPU" is now the best wall time of *all* of those
+values split into 16 record batches. pandas' threaded paths, numexpr and numba, were not installed for this run, and its
+`pandas-parallel` rows say so; numpy's ufuncs are single-threaded and its rows say the same. "Fastest CPU" is now the best wall time of *all* of those
 idioms, and the `note` column of each CSV row names the exact idiom that was run.
 
 The reason is in `Benchmarks/results/full_matrix_2026-09-07-parallel_cores.txt`, which reports
@@ -33,10 +33,10 @@ most families however many threads their pool has, while Polars lazy uses a medi
 pyarrow through Acero **11.1**. A comparison against one core is not the comparison this project wants
 to make.
 
-Against that baseline, of **339 measured rows: 145 at or above 3x, 102 between 1x and 3x, 77 slower
-than the fastest CPU idiom, 15 with no CPU equivalent.** Against the eager idioms alone, the same
-build had 247 rows at or above 3x, 62 between, 15 slower and 15 without an equivalent
-(`Benchmarks/results/full_matrix_2026-09-07.csv`). Both CSVs are kept. The 77 slower rows are grouped
+Against that baseline, of **339 measured rows: 145 at or above 3x, 102 between 1x and 3x, 77 to improve,
+where the fastest CPU idiom is ahead, 15 with no CPU equivalent.** Against the eager idioms alone, the same
+build had 247 rows at or above 3x, 62 between, 15 where an eager library was ahead and 15 without an equivalent
+(`Benchmarks/results/full_matrix_2026-09-07.csv`). Both CSVs are kept. The 77 rows to improve are grouped
 by measured cause, with what would change each one, in [TO_IMPROVE.md](TO_IMPROVE.md); the row-by-row tables
 are in [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md).
 
@@ -73,7 +73,7 @@ correctly rounded, the rest within 1 ulp. Here is the bill.
 | `power(x, 2.5)` | *not implemented* | 120.9 ms | 6.6 | 242.7 (pyarrow) | 2.01x |
 | `power(x, y)` | *not implemented* | 123.8 ms | 9.7 | 238.8 (numpy) | 1.93x |
 
-Read that honestly: the old kernels were memory bound at 250 GB/s because they were doing float32 work on
+The old kernels were memory bound at 250 GB/s because they were doing float32 work on
 float64 data. The new ones are compute bound on forty-odd software binary64 operations per element, and a
 logarithm costs 25x more than it used to. It still matches or beats every CPU library on the same machine,
 by 1.0-2x rather than by the 25x the old `ln` would have shown — `sqrt` is an exact tie — and the old
@@ -97,7 +97,7 @@ so the software arithmetic has all but stopped being visible. Both rewrites stay
 
 `divide` measured 3.2 ms (377 GB/s, 3.26x) with **two** Newton steps, which is provably enough while
 `MetalContext` compiles with `mathMode = .safe`: that makes the `float` seed correctly rounded and good
-to 2^-22, and two steps saturate the 63 bits the reciprocal holds. The shipped code takes a third step
+to 2^-22, and two steps saturate the 63 bits the reciprocal holds. The code in 0.1.0 takes a third step
 and pays 0.4 ms for it, because the two-step version is only correct *given a compile flag set in another
 file* — under fast math the seed would be looser, the quotient would land further than the single
 correction step covers, and `d_div` would quietly stop being correctly rounded. 0.4 ms on an operation
@@ -157,7 +157,7 @@ Findings:
   keys was 1.2 ms, 12x the all-core CPU hash group-by and 13x pyarrow. Hashing moved onto the GPU; in the
   2026-09-07 matrix `dictionary_encode (utf8)` at 10M rows is 5.65 ms against 113.44 ms for the fastest
   CPU idiom (Polars lazy), a 20.1x win.
-- String `filter` is the one string kernel the CPU still wins (2.7 vs 4.7 ms): the byte gather is
+- String `filter` is the one string kernel where the CPU idiom is ahead (2.7 vs 4.7 ms): the byte gather is
   short-string dominated, one thread per row copying ~13 bytes.
 
 Reproduce: `swift build -c release && .build/release/arrowmetal-bench 50000000 5`,

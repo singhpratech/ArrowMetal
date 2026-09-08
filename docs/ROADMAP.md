@@ -79,10 +79,10 @@ to yet; the by-family status of every one of them is in [COVERAGE.md](COVERAGE.m
 
 In the order they matter for analytics and ML work on a Mac:
 
-- **Python** ships. **Swift** ships. **Rust** (`rust/arrowmetal` over `include/arrowmetal.h`, which the
+- **Python** and **Swift** are in 0.1.0. **Rust** (`rust/arrowmetal` over `include/arrowmetal.h`, which the
   Polars plugin already uses), **R** (`r/arrowmetal`, exchanging columns with the `arrow` R package
   through the C Data Interface), **TypeScript / JavaScript** (`node/`, an N-API addon over Apache
-  Arrow JS) and **Go** (`go/arrowmetal`, cgo over the same header) ship too, each with its own test
+  Arrow JS) and **Go** (`go/arrowmetal`, cgo over the same header) are in 0.1.0 too, each with its own test
   suite ([RUST.md](RUST.md), [R.md](R.md), [TYPESCRIPT.md](TYPESCRIPT.md), [GO.md](GO.md)). The browser
   is out of scope: Metal is not there.
 - **Java, C#, Julia** through each language's FFI: the header needs nothing language-specific.

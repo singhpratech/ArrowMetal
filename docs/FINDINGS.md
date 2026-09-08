@@ -13,13 +13,13 @@ Things learned the hard way. Add to this whenever something surprises you.
 - XCTest is not in the Command Line Tools. Run tests with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`.
 - Swift 6.3.3 miscompiles a `withUnsafeBytes` closure inside a generic `throws` function under `-O` when the caller is in another module: the closure clobbers the error register around an Objective-C message send, so the function reports a phantom error and the caller crashes retaining it (swiftlang/swift#90477, open). `MetalArray.init(_:)` uses a plain element loop instead; the Metal-free reproducer is in UPSTREAM.md
   (release-only crash on entry). Rewritten as a loop. Always run `swift test -c release`.
-- GitHub `macos-15` runners ship Xcode 16.4 / Swift 6.1, which refuses to type-check dense closures that
+- GitHub `macos-15` runners come with Xcode 16.4 / Swift 6.1, which refuses to type-check dense closures that
   Swift 6.3 accepts. Keep test expressions simple.
 - Swift release builds shorten object lifetimes to last use: a raw pointer taken from a buffer object can
   outlive the object. Use `withExtendedLifetime` or the closure accessors.
 - `posix_memalign` memory is not zero for small blocks (recycled heap); only fresh mmap pages are zero.
 
-## Metal
+## Metal: what the M4 Max gives a kernel
 - Apple M4 Max: 32 KB threadgroup memory, SIMD width 32, unified memory, no 64-bit atomic add from MSL
   (`atomic_ulong` fetch_add fails to compile; min and max do). 64-bit sums use split 32-bit atomics
   with carry.
@@ -31,7 +31,7 @@ Things learned the hard way. Add to this whenever something surprises you.
   16-core CPU reaches ~350 GB/s on the same loops. Reductions and compaction favour the GPU by 2x to 3x.
 - Fusing the predicate into the filter's counting pass avoids materialising a boolean array.
 
-## Round 3 (2026-09-06)
+## Round 3 (2026-09-06): integer division by zero, and the group-by atomics
 - Metal integer division by zero returns an unspecified value (observed 1 on M4 Max). ArrowMetal now
   defines it as 0 in both the GPU kernels and the CPU reference, and `Int.min / -1` wraps instead of trapping.
 - Threadgroup-privatised group-by with 32-bit atomics reaches ~300 GB/s for up to 1024 keys, the same rate
@@ -40,7 +40,7 @@ Things learned the hard way. Add to this whenever something surprises you.
   exporting a result back to pyarrow costs nothing measurable (3.55 ms vs 3.57 ms with export).
 - Importing pyarrow buffers is one memcpy: pyarrow's allocator is 64-byte aligned, not page aligned.
 
-## Round 4 (2026-09-06)
+## Round 4 (2026-09-06): the paravirtual GPU on GitHub runners
 - GitHub's `macos-15` Apple silicon runners expose an "Apple Paravirtual device" GPU with 3 CPU cores:
   ~16 GB/s for a sum. Use CI for correctness only; never publish its numbers.
 - The paravirtual GPU failed `makeComputePipelineState` for kernels that pass on M4 Max (round 3 push).
@@ -50,7 +50,7 @@ Things learned the hard way. Add to this whenever something surprises you.
 - A `sum()` on a batched filter result still costs a second round trip because the reduction needs the
   filtered length on the CPU. Next: kernels read `n` from a device buffer so pending lengths flow on the GPU.
 
-## Round 5 (2026-09-06)
+## Round 5 (2026-09-06): pipeline creation on the paravirtual GPU, and lengths that stay on the device
 - With full compiler logs enabled, the paravirtual GPU on GitHub runners fails `makeComputePipelineState`
   for arbitrary trivial kernels (`bitmap_not`, `cast_kernel`) with no diagnostic while identical kernels
   pass in the same run. It is the virtual Metal stack, not a construct. Mitigation: one retry on pipeline

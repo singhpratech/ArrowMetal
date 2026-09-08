@@ -9,7 +9,7 @@ it and compares, so a kernel that is wrong in an unanticipated way still fails.
     PYTHONPATH=python python python/tests/differential_report.py       # the matrix, as a table
     PYTHONPATH=python python -m pytest python/tests/test_differential.py -q
 
-| | |
+| What | Detail |
 |---|---|
 | Files | `python/tests/test_differential.py` (the harness), `python/tests/differential_report.py` (the runner) |
 | Oracle | `pyarrow.compute` 25.0.1, plus a reference written in the harness for the 16 operations Arrow has no function for |
@@ -229,7 +229,7 @@ under both, so the Cases column below sums to more than 1,566. Each has an entry
 `FINDINGS` in `test_differential.py`, so the matrix groups the affected cells under the finding instead
 of burying them, and an `xfail(strict=True)` reproduction, so the suite turns red the moment a kernel
 changes its mind. Eighteen of them are classified *by the data* — a `data_check` that looks at the
-generated values — so a dataset that does not actually contain the triggering value still has to agree
+generated values — so a dataset that does not contain the triggering value still has to agree
 exactly.
 
 | # | Finding | Cases | Cells |
@@ -552,7 +552,7 @@ Before 2038 the two agree everywhere in the matrix, which
 after it. Classified by the data (`_after_the_2038_cutoff`). Reproduction:
 `test_assume_timezone_agrees_past_2038` (xfail).
 
-### 15. The software binary64 trigonometry loses its argument reduction past 2^49
+### 15. The software binary64 trigonometry's argument reduction drifts past 2^49
 
 *8 failing cases: `trig` and `trig_checked` on `float64`, the datasets containing a value at or above
 2^49.*

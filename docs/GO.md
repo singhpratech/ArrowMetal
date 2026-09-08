@@ -161,7 +161,7 @@ The consequence for you: **any allocator is safe**, including the default. The s
 `GOEXPERIMENT=cgocheck2` as well as normally, and removing the pin makes it fail on the first round
 trip. Choose `PageAlignedAllocator` when you want the copy avoided, not to make the code legal.
 
-### What the copy actually costs — measured
+### What the copy costs, measured
 
 Less than you would expect, because at 76 MB the copy is not the dominant cost of crossing the
 boundary; setting up the Metal buffer is. From the table below: importing 10M int64 rows takes
@@ -193,25 +193,25 @@ the rows.
 | Sum | plain Go loop over `[]int64` | 2.46 ms | |
 | Sum | Arrow Go `arrow/math` (NEON) | 1.16 ms | arrow-go registers no `sum` compute function |
 | Sum | **ArrowMetal, array already resident** | **296 µs** | 3.9× the Arrow Go kernel |
-| Sum | ArrowMetal, end to end from a page-aligned `arrow.Array` | 2.22 ms | **slower than Arrow Go** |
-| Sum | ArrowMetal, end to end with a copying import | 1.87 ms | **slower than Arrow Go** |
+| Sum | ArrowMetal, end to end from a page-aligned `arrow.Array` | 2.22 ms | **Arrow Go is ahead** |
+| Sum | ArrowMetal, end to end with a copying import | 1.87 ms | **Arrow Go is ahead** |
 | Filter | plain Go loop (one fused pass into a `[]int64`) | 29.18 ms | |
 | Filter | Arrow Go compute (`greater` then `filter`) | 48.93 ms | |
 | Filter | **ArrowMetal, array already resident** | **1.51 ms** | 32× Arrow Go compute, 19× the Go loop |
 | Filter | ArrowMetal, end to end from a page-aligned `arrow.Array` | 3.22 ms | 15× Arrow Go compute |
 | Filter | ArrowMetal, end to end with a copying import | 2.98 ms | 16× Arrow Go compute |
 
-### Reading this honestly
+### Reading this table
 
 arrow-go's compute is single-threaded and ArrowMetal's kernels run on the whole GPU, so the multiples
 above are not per-core figures.
 
-- **ArrowMetal loses at Sum end to end.** 2.22 ms against Arrow Go's 1.16 ms. A single 76 MB sum is
+- **Arrow Go is ahead at Sum end to end.** 2.22 ms against Arrow Go's 1.16 ms. A single 76 MB sum is
   a memory-bandwidth problem that the CPU is already good at, and the ~1.2 ms of import overhead is
-  most of the ArrowMetal number. Only when the array is already on the GPU does Sum win, 296 µs
+  most of the ArrowMetal number. Only when the array is already on the GPU is ArrowMetal ahead on Sum, 296 µs
   against 1.16 ms. If your program's shape is "load an arrow-go array, sum it once, throw it away",
   this binding is the wrong tool.
-- **ArrowMetal wins at Filter, in every shape.** Even paying import and export on every call, 3.22 ms
+- **ArrowMetal is ahead at Filter, in every shape.** Even paying import and export on every call, 3.22 ms
   against 48.93 ms is 15×; resident it is 32×. Filter does more work per byte than Sum and the
   fixed cost stops dominating.
 - The end-to-end rows with a copying import came out *faster* than the page-aligned ones in this
@@ -233,7 +233,7 @@ above are not per-core figures.
 
 ## What is covered
 
-Every item below has at least one test in `go/arrowmetal`; the oracle is named. 46 test functions,
+Every item below has at least one test in `go/arrowmetal`; the oracle is named. 45 test functions and one `Example`, 46 runnable;
 177 cases counting subtests, all green.
 
 | Surface | Go API | Oracle |
@@ -258,7 +258,7 @@ Every item below has at least one test in `go/arrowmetal`; the oracle is named. 
 | Allocator alignment | the Go heap's shape | every Go-heap offset past a page is 0 or 8192 and nothing else, at 1M and 10M, 20 trials each |
 | cgo pointer rules | `Import` | the whole suite again under `GOEXPERIMENT=cgocheck2`; removing the pin makes it die on the first round trip |
 | Handle lifecycle | `Release` | repeated import of one `arrow.Array`; a long-lived handle alongside short-lived ones; a released handle errors rather than crashing |
-| Leaks | the whole chain | 2,000 import/compare/filter/export/release round trips at 200k rows, in a child process so the baseline is its own; `TASK_VM_INFO.phys_footprint` has to stay inside 16 MB (it grows a few MB, and leaking just the mask handle grows 35 MB — checked in the shipped test order) |
+| Leaks | the whole chain | 2,000 import/compare/filter/export/release round trips at 200k rows, in a child process so the baseline is its own; `TASK_VM_INFO.phys_footprint` has to stay inside 16 MB (it grows a few MB, and leaking just the mask handle grows 35 MB — checked in the test order in 0.1.0) |
 | The loader | `Init`, `LibraryPath` | a child process with `ARROWMETAL_LIB` pointing at nothing, and a child with nothing set in an empty directory: the error has to name the variable, the paths and the `swift build` line |
 | Docs | the example in this file | compiled and run as `Example()`, so it cannot drift from the API |
 

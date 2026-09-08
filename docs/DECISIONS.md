@@ -4,7 +4,7 @@ Architecture and product decisions, newest first. Each entry says what was decid
 
 ## 2026-09-06: Version stays 0.1.0 until the public launch
 Everything built before going public is one release. Internal rounds are tracked in the changelog under a
-single unreleased 0.1.0 heading and in docs/BENCHMARKS.md as numbered rounds.
+single 0.1.0 heading and in docs/BENCHMARKS.md as numbered rounds.
 
 ## 2026-09-06: Batched execution with lazy materialisation instead of futures
 A per-thread open command buffer with sync-on-read keeps the synchronous API (every method still returns a

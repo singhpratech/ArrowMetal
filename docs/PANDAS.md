@@ -118,7 +118,7 @@ have to be mapped into the device's address space once. On an M4 Max, for a 50M-
 | `Series.sum()` in pandas | 4.9 ms |
 
 The kernel is 4.6x faster than pandas. The map is not, and one `sum` cannot amortise it. So the
-shipped routing table leaves alone every operation that reads each byte once and writes at most one
+default routing table leaves alone every operation that reads each byte once and writes at most one
 byte back — `sum`, `min`, `max`, `mean`, `count`, `abs`, and the six scalar comparisons — and routes
 the ones that do enough per byte to pay for the map many times over: sorts, hash group-bys, merges,
 string scans, `round`, `isin`, `nunique`, `value_counts`, boolean-mask selection.
@@ -189,7 +189,7 @@ exception text), and `intercepted`, the total number of calls that reached a pat
 
 ---
 
-## Zero-copy: what actually happens
+## Zero-copy: what happens
 
 `Series.array._pa_array` is a `pyarrow.ChunkedArray` for any Arrow-backed pandas column. The bridge
 takes its single chunk and hands those buffers to Metal — the same bytes, no copy. Apple silicon's
@@ -256,9 +256,9 @@ Measured with `PYTHONPATH=python python Benchmarks/pandas_bench.py <rows> <iters
 M4 Max, pandas 3.0.5 / pyarrow 25.0.1 / Python 3.13, best of five, on the same in-process frame.
 The accessor and accel rows include the conversion the dtype forces, the map into Metal, the GPU
 work, and the trip back into a pandas object — nothing is pre-converted or cached between
-iterations, so these are the numbers a pandas user actually gets, not kernel times.
+iterations, so these are the numbers a pandas user gets, not kernel times.
 
-`routes to` is where accel mode sent the call with the shipped table; the `accessor` column is
+`routes to` is where accel mode sent the call with the default table; the `accessor` column is
 always the GPU, so it also shows what those operations would cost if you routed them.
 
 ### Arrow-backed frame (`pd.ArrowDtype`, what `read_parquet(dtype_backend="pyarrow")` gives you)
@@ -284,7 +284,7 @@ always the GPU, so it also shows what those operations would cost if you routed 
 ### numpy-backed frame (plain `pd.DataFrame({...})`)
 
 Every column has to be converted to Arrow first, and pandas' numpy kernels are much faster than its
-pyarrow ones, so the same operations win by less — and `round`/`isin` are left to pandas here.
+pyarrow ones, so the speedups are smaller — and `round`/`isin` are left to pandas here.
 
 | Operation | 10M pandas | 10M accessor | 10M accel | 10M accel x | 50M pandas | 50M accessor | 50M accel | 50M accel x | routes to |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|

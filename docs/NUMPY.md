@@ -23,7 +23,7 @@ r = col.sqrt()                          # GPU, software IEEE-754 binary64
 y = r.to_arrow().to_numpy(zero_copy_only=True)   # no copy out either
 ```
 
-Two things make this copy-free, and both are checked rather than assumed:
+Two things make this copy-free, and both are checked:
 
 - `pa.array(x)` adopts the numpy buffer for integer and float dtypes: the Arrow array's data buffer has
   the numpy array's address.
@@ -87,11 +87,12 @@ M4 Max (numpy 2.5.3, the eager idiom, best of up to five calls after a warm-up; 
 | element-wise | sqrt (float64) | 50,000,000 | 12.3 (1.0) | 3.951 (0.1) | 3.1x |
 | element-wise | sin (float64) | 50,000,000 | 301.7 (1.0) | 150.2 (0.0) | 2.0x |
 | element-wise | ln (float64) | 50,000,000 | 87.3 (1.0) | 81.2 (0.0) | 1.1x |
-Two readings. numpy runs every one of these on one core, which is the honest shape of the comparison:
-this is one CPU core against the GPU, and the crossing is free because the memory is shared; a 16-thread
-CPU library is the other comparison, and it is on the same Compare tab. And the transcendentals are the
-narrow rows: `ln` at 1.1x and `sin` at 2.0x are software binary64 on a GPU with no double hardware against
-a vectorised libm, and they are listed in [TO_IMPROVE.md](TO_IMPROVE.md) as open work.
+
+Two readings. numpy runs every one of these on one core, so this is one CPU core against the GPU, with
+the crossing free because the memory is shared; a 16-thread CPU library is the other comparison, and it
+is on the same Compare tab. The transcendentals are the narrow rows: `ln` at 1.1x and `sin` at 2.0x are
+software binary64 on a GPU with no double hardware against a vectorised libm, and they are listed in
+[TO_IMPROVE.md](TO_IMPROVE.md) as open work.
 
 ## 4. The step that would matter, and it is ours to take
 
@@ -99,7 +100,7 @@ numpy already dispatches. Since numpy 1.17, an array type that implements `__arr
 answers `np.sum(x)`, `np.sort(x)`, `np.where(...)` and the rest on its own memory, and numpy calls it
 instead of its own kernel. An ArrowMetal array type that implements it would let existing numpy code run
 on the GPU with no import changed; the hook on numpy's side has been there for years. It is on the
-roadmap ([ROADMAP.md](ROADMAP.md)); nothing here claims it exists.
+roadmap ([ROADMAP.md](ROADMAP.md)) and is not in 0.1.0.
 
 ## 5. Limits
 

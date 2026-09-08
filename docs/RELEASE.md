@@ -1,7 +1,7 @@
 # Releasing 0.1.0
 
-The ordered checklist for turning this checkout into published artefacts. Nothing here has been done
-yet: 0.1.0 is unreleased, there is no PyPI package, no crates.io crate and no tagged Swift version.
+The ordered checklist for turning this checkout into published artefacts. 0.1.0 is not yet on PyPI,
+crates.io or a tagged Swift version.
 Every step is the maintainer's to run; the repository itself never publishes anything.
 
 **The version number stays `0.1.0` throughout.** It is not bumped by any step below, and it is not
@@ -60,8 +60,8 @@ successful PyPI upload, replace the account-wide token with a project-scoped one
 
 ## 2. Freeze the changelog
 
-`CHANGELOG.md` opens with `## 0.1.0 (unreleased, in development)`. Drop the parenthetical, leave the
-content alone, and commit. No date: the repository does not date its entries.
+`CHANGELOG.md` opens with `## 0.1.0`. Confirm nothing above that heading names a later version, leave
+the content alone, and commit if anything changed. No date: the repository does not date its entries.
 
 ```
 git add CHANGELOG.md && git commit -m "0.1.0"
@@ -246,6 +246,6 @@ Never publish numbers from a GitHub-hosted runner: its GPU is virtual.
 ## 10. After the release
 
 - Leave the version at `0.1.0`. The next version number is chosen when there is something to put in it.
-- Reopen `CHANGELOG.md` with a new unreleased section only when the first post-release change lands.
+- Reopen `CHANGELOG.md` with a new in-development section only when the first post-release change lands.
 - Watch the PyPI project page for the platform tag: `pip install arrowmetal` on Intel macOS, Linux or
   Windows must fail with "no matching distribution", not install something that cannot import.

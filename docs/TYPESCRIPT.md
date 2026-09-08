@@ -1,11 +1,11 @@
 # TypeScript / Node.js
 
 ArrowMetal from TypeScript: an N-API addon over the one C ABI (`include/arrowmetal.h`), an Arrow
-C Data Interface bridge to and from Apache Arrow JS, and a typed API shipped with `.d.ts`. The
+C Data Interface bridge to and from Apache Arrow JS, and a typed API with `.d.ts`. The
 package lives in [`node/`](../node); this page is the whole contract.
 
 Every number on this page was measured on 2026-09-07 on an Apple M4 Max, macOS, node v24.9.0,
-apache-arrow 21.2.0, ArrowMetal 0.1.0 built `-c release`. Nothing here is estimated.
+apache-arrow 21.2.0, ArrowMetal 0.1.0 built `-c release`.
 
 **The browser is out of scope.** There is no Metal in a browser, and this package loads a `.dylib`
 through `dlopen`. It is macOS on Apple silicon, in Node, or nothing. There is no WASM fallback and
@@ -230,7 +230,7 @@ The only overlapping pair the benchmark found is `plain typed-array loop` and
 `Arrow JS, vector.toArray() then loop` in the `sum` table, and they overlap because they are the
 same code: `toArray()` on an unsliced `Int64` vector hands back the same `BigInt64Array`.
 
-Read it honestly:
+Reading the tables:
 
 * **The two `filter` rows are not measuring the same amount of work.** ArrowMetal's end-to-end row
   finishes by wrapping the result as a typed-array view — the 5,000,000 output rows are written
@@ -242,12 +242,8 @@ Read it honestly:
 * The 0.27–0.36 ms resident `sum` is 80 MB read in about 0.3 ms, roughly 265 GB/s, which is in
   range for an M4 Max. It is not a cached answer: a test mutates the wrapped buffer and watches the
   sum change.
-* **There is no row here where ArrowMetal loses.** On these two operations at this size it wins
-  every comparison; a small array will lose to the plain loop, because the per-call overhead is
-  fixed and there is nothing for the GPU to amortise it over. That crossover is not measured here.
-* An earlier single-process run of this benchmark reported `filter` end to end at 8.62 ms against
-  the plain loop's 9.77 ms and called it a 1.13x win. That claim was inside the noise and is
-  withdrawn; this table replaces it.
+* **On these two operations at this size ArrowMetal is ahead in every row.** The small-array
+  crossover is not measured here.
 
 Numbers are from one machine on one day. `node bench/spread.mjs` re-runs the whole thing;
 `node bench/bench.mjs` runs a single process and prints tables.

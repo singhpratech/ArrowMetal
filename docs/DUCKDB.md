@@ -11,13 +11,12 @@ memory pool, so `am_import` copies nothing - it wraps DuckDB's own pages in a Me
 address on the far side is the same address. `python/tests/test_duckdb.py` asserts it. Getting to one
 contiguous chunk does copy when DuckDB returns many; see §5.
 
-**The honest summary, before anything else.** The Python bridge is real and it wins on the shapes it
-should win on: a 100,000-key group-by is **16x** faster than DuckDB's once the column and its group
-ids are already on the GPU (**1.1x** for a single cold query), and a string `LIKE` scan **9.3x**
-resident (**0.6x** cold), both at 50M rows. It loses on shapes DuckDB is already excellent at - a
-plain `sum` over a column is memory-bound and DuckDB does it while it scans. The loadable extension
-works, matches DuckDB's answers exactly, and is **not currently a speedup**; §4 says why, in detail,
-without softening it.
+**The summary.** The Python bridge, at 50M rows: a 100,000-key group-by is **16x** faster than
+DuckDB's once the column and its group ids are already on the GPU (**1.1x** for a single cold
+query), and a string `LIKE` scan is **9.3x** resident (**0.6x** cold). DuckDB is ahead on a plain
+`sum` over a column, which is memory-bound and which DuckDB does while it scans. The loadable
+extension works and matches DuckDB's answers exactly; it is **not currently a speedup**, and §4 says
+why.
 
 - [1. Which tier you want](#1-which-tier-you-want)
 - [2. Install](#2-install)
@@ -37,7 +36,7 @@ without softening it.
 | Install | `pip install duckdb`, nothing else | build a `.duckdb_extension`, connect with `allow_unsigned_extensions` |
 | Data crossing | zero-copy where DuckDB returns one chunk | DataChunks assembled into one buffer (a copy) |
 | Types | everything DuckDB emits, including strings, decimals, lists, structs, maps | the fixed-width numeric types, `DATE`, `TIMESTAMP` |
-| Speed | **faster than DuckDB** on high-cardinality group-by, string matching, fused filter+aggregate | **slower than DuckDB** today, see §4 |
+| Speed | resident: 16.0x on 100k-key group-by, 9.3x on `LIKE`, 2.2x on sort; one-shot (crossing included): 1.1x, 0.6x, 0.7x (§5) | **behind DuckDB** in 0.1.0, see §4 |
 | Larger than memory | yes, `am.duckdb_batches` | no |
 
 If you are reading this to make something faster: **use tier 1**. Tier 2 exists because "call it from
@@ -157,7 +156,7 @@ rel.order("total desc").limit(10).show()
 ```
 
 **DuckDB does the scan, the predicate and the join. ArrowMetal does the aggregate.** That is the
-whole idea, and it is the arrangement that actually pays: the join is a planning problem DuckDB is
+whole idea, and it is the arrangement that pays: the join is a planning problem DuckDB is
 good at, and the group-by over the join's output is a throughput problem the GPU is good at.
 
 ### A fused query over a DuckDB result
@@ -248,11 +247,11 @@ otherwise would silently corrupt large integer totals.
 
 Aggregate *functions* - `SELECT am_sum(x) FROM t` - are deliberately **not** registered even though
 `duckdb_create_aggregate_function` exists. DuckDB would call them once per 2048-row DataChunk, and a
-2048-row GPU dispatch is all latency and no work; it would be slower than the CPU and it would look
-like ArrowMetal's fault. Table functions get the whole column at once, which is the only shape a GPU
-can win in.
+2048-row GPU dispatch is all latency and no work; the CPU would be ahead and it would look like
+ArrowMetal's fault. Table functions get the whole column at once, which is the only shape where a GPU
+dispatch amortises.
 
-### It is correct, and it is slower
+### It is correct, and DuckDB's own SQL is ahead of it
 
 Every function's answer matches DuckDB's own SQL exactly, nulls included -
 `python/tests/test_duckdb.py` checks each one against the equivalent query on the same connection.
@@ -262,7 +261,7 @@ Every function's answer matches DuckDB's own SQL exactly, nulls included -
 tests skip only when the extension has not been built. Tier 1 does not go through the header and is
 unaffected either way.
 
-And it is slower than just writing the SQL:
+And plain SQL is ahead of it:
 
 | 10M rows | DuckDB SQL | extension |
 |---|---:|---:|
@@ -281,8 +280,8 @@ And it is slower than just writing the SQL:
 (The group-by rows compute all four aggregates at once, which is what `arrowmetal_group_by` returns,
 so they are not comparable to the single-`sum` group-by in §5.)
 
-The kernels are not the problem - the same GPU group-by from the Python bridge runs in 4.5 ms at 50M
-rows, against these hundreds. Three things in the extension's path are:
+The same GPU group-by from the Python bridge runs in 4.5 ms at 50M rows, against these hundreds, so
+the time is in the extension's path. Three things account for it:
 
 1. **The DataChunk assembly is single-threaded.** DuckDB emits ~2048-row chunks and one ArrowMetal
    array is one contiguous buffer, so the extension memcpys chunk after chunk on one thread while
@@ -324,9 +323,6 @@ that they agree before it reports a time.
 | `count(s like '%user1%')` | 47.4 | 718.5 | 5.1 | 0.4 | 84.7 | **9.3x** | 0.6x |
 | `avg(f)` | 2.8 | 40.8 | 2.5 | 0.4 | 42.8 | **1.1x** | 0.1x |
 
-The 10M-row table that used to sit here was not re-measured on 2026-09-07 -- the rerun covered 50M
-rows only -- so it has been removed rather than carried forward unrecorded.
-
 Look at the CPU-ms columns as well as the wall-ms. DuckDB's 100k-key group-by at 50M rows costs
 1,056 CPU-ms to produce 71.4 ms of wall time - it is using about fifteen cores. The GPU's costs 0.6
 CPU-ms. If anything else on the machine wants those cores, that difference is the real one.
@@ -343,7 +339,7 @@ am_import             5.7 ms   (buffer shared, not copied - the pointer is uncha
 total                52.1 ms
 ```
 
-The Metal import is genuinely free; **`combine_chunks` is the largest single item**. It is the price
+The Metal import copies nothing; **`combine_chunks` is the largest single item**. It is the price
 of ArrowMetal wanting one contiguous array per column and DuckDB producing many. `am.duckdb_batches`
 avoids it entirely by keeping the chunks separate. Streaming a sum through the GPU one record batch
 at a time, never materialising the column:
@@ -354,13 +350,13 @@ at a time, never materialising the column:
 | 1,048,576 | 67.5 | 78.9 |
 | 4,194,304 | 76.1 | 76.0 |
 
-All three are exact. Note that on this run the streaming path (67.5 ms at its best batch size) is
-*slower* than the whole-table crossing (52.1 ms): the crossing got much cheaper than it used to be,
-so streaming is now a memory-footprint argument rather than a speed one.
+All three are exact. On this run the whole-table crossing (52.1 ms) is ahead of the streaming path
+(67.5 ms at its best batch size), so streaming is a memory-footprint argument rather than a speed
+one.
 
-This is also why the "one-shot" column above is mostly below 1.0x: for a single operation, the
-crossing dominates and DuckDB was going to win anyway. The GPU pays off when you do several things
-to one dataset, or one expensive thing.
+This is also why the "one-shot" column above is mostly below 1.0x: for a single operation the
+crossing dominates, and DuckDB is ahead. The GPU pays off when you do several things to one dataset,
+or one expensive thing.
 
 ### 50M rows out of Parquet
 
@@ -374,11 +370,9 @@ am.duckdb_aggregate(con.sql("select amount from read_parquet('big.parquet')"),
                     {"total": ("sum", "amount")}, rows_per_batch=1 << 22)
 ```
 
-All three give `1249999975000000`. **DuckDB wins this one**, and it is not close: a single sum over a
-Parquet file is exactly the case where DuckDB aggregates during the scan and never materialises
-anything. Reach for the GPU when the aggregate is the expensive part, not the scan. (The timings
-that used to annotate these three lines are not produced by `duckdb_bench.py` and were **not
-re-measured** on 2026-09-07, so they have been dropped.)
+All three give `1249999975000000`. **DuckDB is ahead here**: a single sum over a Parquet file is
+exactly the case where DuckDB aggregates during the scan and never materialises anything. Reach for
+the GPU when the aggregate is the expensive part, not the scan.
 
 ---
 
@@ -409,7 +403,7 @@ re-measured** on 2026-09-07, so they have been dropped.)
   `am.batch()` to amortise it, or do not bother.
 - Anything the extension can do, if speed is the reason. See §4.
 
-**The rule of thumb**: the GPU wins when the compute is large relative to the bytes. Group-by with
+**The rule of thumb**: the GPU is ahead when the compute is large relative to the bytes. Group-by with
 many keys and string matching are compute-heavy per byte; `sum` is not.
 
 ---
@@ -428,10 +422,10 @@ many keys and string matching are compute-heavy per byte; `sum` is not.
 
 **Tier 2**
 
-- Slower than DuckDB today (§4).
+- Behind DuckDB's own SQL in 0.1.0 (§4).
 - The eight integer widths, `FLOAT`, `DOUBLE`, `DATE` and `TIMESTAMP` only -- exactly what
   `arrow_format_for` in `duckdb-extension/src/arrowmetal_extension.cpp` lists. `BOOLEAN` is **not**
-  among them despite what an earlier draft of this table said; nor are `VARCHAR`, `DECIMAL`, `TIME`,
+  among them; nor are `VARCHAR`, `DECIMAL`, `TIME`,
   `TIMESTAMPTZ`, `HUGEINT` or the nested types. All of them are refused by name at bind time with a
   message pointing here, and the bridge handles every one.
 - The table functions take a **table or view name**, not a subquery - DuckDB's C table-function API

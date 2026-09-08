@@ -1,7 +1,7 @@
 # Testing
 
 How ArrowMetal is tested, what each layer compares against, and what "green" means before anything is
-pushed. Numbers are from the last gated run of `main` (0.1.0, unreleased) on an M4 Max.
+pushed. Numbers are from the last gated run of `main` (0.1.0) on an M4 Max.
 
 | Layer | Size | Oracle |
 |---|---|---|
@@ -10,25 +10,33 @@ pushed. Numbers are from the last gated run of `main` (0.1.0, unreleased) on an 
 | Rust suites (`rust/arrowmetal/tests`) | 48 tests over the safe crate, run in release, plus 4 `no_run` doc-tests (compiled, not executed) | `arrow::compute` (arrow-rs 59) on the same data; a `HashMap` fold where arrow-rs has no kernel; `include/arrowmetal.h` re-parsed for the ABI signatures ([RUST.md](RUST.md)) |
 | Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | 39,069 generated cases, 45 column types, every public operation | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
 | TypeScript suites (`node/test`) | 62 tests in 6 files over the N-API addon | Apache Arrow JS 21.2.0 and plain JS over the same rows ([TYPESCRIPT.md](TYPESCRIPT.md)) |
-| Go binding (`go/arrowmetal`) | 46 test functions, 177 subtests as the runner counted them in the last gate (`private/keep/2026-09-07/final_gate.log`, `ok github.com/singhpratech/ArrowMetal/go/arrowmetal` under `GOEXPERIMENT=cgocheck2`), run twice (plain and under the cgo pointer checker) | `arrow-go/v18`'s own `compute` where it has the function, plain Go loops where it does not ([GO.md](GO.md)) |
-| R suites (`r/arrowmetal/tests/testthat`) | 64 `test_that()` blocks over the 34 ABI entry points the R binding wraps; 266 expectations passed and 0 failed in the last gate (`private/keep/2026-09-07/final_gate.log`) | base R and the `arrow` R package's own kernels on the same data ([R.md](R.md)) |
+| Go binding (`go/arrowmetal`) | 45 test functions and one `Example`, 46 runnable; 177 subtests as the runner counted them in the last gate (`private/keep/2026-09-07/final_gate.log`, `ok github.com/singhpratech/ArrowMetal/go/arrowmetal` under `GOEXPERIMENT=cgocheck2`), run twice (plain and under the cgo pointer checker) | `arrow-go/v18`'s own `compute` where it has the function, plain Go loops where it does not ([GO.md](GO.md)) |
+| R suites (`r/arrowmetal/tests/testthat`) | 64 `test_that()` blocks in the sources (65 as testthat runs them: the one in test-dispatch.R runs once per attach order), 266 expectations (0 failed in the last gate, `private/keep/2026-09-07/final_gate.log`), over the 34 ABI entry points the R binding wraps | base R and the `arrow` R package's own kernels on the same data ([R.md](R.md)) |
 | Adversarial review pass | four independent reviewers plus a coverage pass before release | each finding carries a regression test |
-| Benchmarks (`Benchmarks/`) | 339 operation-and-size rows over 173 operations, against four CPU libraries in two idioms each — the plain eager one and the most parallel one that library has for the same answer (`polars-lazy`, `pyarrow-threaded`); streaming and engine benches | measured, never estimated; the baseline is the fastest idiom of any library, and against it 145 rows are at or above 3x, 102 between 1x and 3x, 77 slower and 15 without a CPU equivalent ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md), [TO_IMPROVE.md](TO_IMPROVE.md)) |
+| Benchmarks (`Benchmarks/`) | 339 operation-and-size rows over 173 operations, against four CPU libraries in two idioms each — the plain eager one and the most parallel one that library has for the same answer (`polars-lazy`, `pyarrow-threaded`); streaming and engine benches | measured, never estimated; the baseline is the fastest idiom of any library, and against it 145 rows are at or above 3x, 102 between 1x and 3x, 77 to improve, where the fastest CPU idiom is ahead, and 15 without a CPU equivalent ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md), [TO_IMPROVE.md](TO_IMPROVE.md)) |
 
 Run everything:
 
 ```
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 swift build -c release
-swift test -c release                                   # release is required: a release-only miscompile has bitten this project once
-PYTHONPATH=python python -m pytest python/tests -q      # all Python suites, including the differential file
-PYTHONPATH=python python python/tests/differential_report.py   # the matrix as one report; exit 0 = nothing unclassified
-(cd node && npm install && npm test)                    # TypeScript: builds the addon, then 62 node:test cases
-(cd rust && cargo test --release)                       # the Rust binding, against arrow-rs's own kernels
-(cd go/arrowmetal && ARROWMETAL_LIB=$PWD/../../.build/release/libArrowMetalC.dylib go test ./...)  # the Go binding
-(cd go/arrowmetal && ARROWMETAL_LIB=$PWD/../../.build/release/libArrowMetalC.dylib GOEXPERIMENT=cgocheck2 go test -count=1 ./...)  # and with the cgo pointer checker
+# release is required: a release-only miscompile has bitten this project once
+swift test -c release
+# all Python suites, including the differential file
+PYTHONPATH=python python -m pytest python/tests -q
+# the matrix as one report; exit 0 = nothing unclassified
+PYTHONPATH=python python python/tests/differential_report.py
+# TypeScript: builds the addon, then 62 node:test cases
+(cd node && npm install && npm test)
+# the Rust binding, against arrow-rs's own kernels
+(cd rust && cargo test --release)
+# the Go binding
+(cd go/arrowmetal && ARROWMETAL_LIB=$PWD/../../.build/release/libArrowMetalC.dylib go test ./...)
+# and with the cgo pointer checker
+(cd go/arrowmetal && ARROWMETAL_LIB=$PWD/../../.build/release/libArrowMetalC.dylib GOEXPERIMENT=cgocheck2 go test -count=1 ./...)
+# the R binding
 ARROWMETAL_LIB=$PWD/.build/release/libArrowMetalC.dylib \
-  Rscript -e 'testthat::test_local("r/arrowmetal")'            # the R binding
+  Rscript -e 'testthat::test_local("r/arrowmetal")'
 ```
 
 The Rust suite finds `libArrowMetalC.dylib` in `.build/release` on its own; from outside the

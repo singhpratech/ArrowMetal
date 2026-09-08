@@ -12,7 +12,8 @@ step the maintainer performs, and the checklist for it is [docs/RELEASE.md](../d
 
 ```
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-  swift build -c release --product ArrowMetalC        # builds .build/release/libArrowMetalC.dylib
+  swift build -c release --product ArrowMetalC
+# that builds .build/release/libArrowMetalC.dylib
 pip install pyarrow
 PYTHONPATH=python python -c "import arrowmetal as am; print(am.device_name())"
 ```
@@ -20,10 +21,14 @@ PYTHONPATH=python python -c "import arrowmetal as am; print(am.device_name())"
 **From a wheel**, which carries the dylib and needs no Swift toolchain at install time:
 
 ```
-pip install build                                     # the wheel build frontend, once
-scripts/build_wheel.sh                                # swift build, then the wheel
-pip install python/dist/arrowmetal-0.1.0-*.whl        # pyarrow comes with it
-pip install "$(echo python/dist/arrowmetal-0.1.0-*.whl)[polars,duckdb,pandas]"   # optional bridges
+# the wheel build frontend, once
+pip install build
+# swift build, then the wheel
+scripts/build_wheel.sh
+# pyarrow comes with it
+pip install python/dist/arrowmetal-0.1.0-*.whl
+# optional bridges
+pip install "$(echo python/dist/arrowmetal-0.1.0-*.whl)[polars,duckdb,pandas]"
 python -c "import arrowmetal as am; print(am.device_name())"
 ```
 
@@ -36,7 +41,9 @@ The first thing to run needs nothing beyond the wheel itself (pyarrow comes with
 ```python
 import pyarrow as pa, arrowmetal as am
 
-col = am.array(pa.array([1, None, 3, 40]))     # this small array is copied in; large pyarrow buffers are page aligned and are borrowed; out is zero-copy
+# this small array is copied in; large pyarrow buffers are page aligned
+# and are borrowed; out is zero-copy
+col = am.array(pa.array([1, None, 3, 40]))
 big = col.filter_where(">", 2)                 # GPU
 print(big.sum(), big.to_arrow())               # 43  [3, 40]
 
@@ -63,7 +70,8 @@ See `Benchmarks/python_gpu_bench.py` for a side-by-side with Polars, pyarrow.com
 ```
 pip install build                    # the wheel build frontend
 scripts/build_wheel.sh               # swift build, then the wheel
-python/build_wheel.sh                # just the wheel, when .build/release/libArrowMetalC.dylib exists
+# just the wheel, when .build/release/libArrowMetalC.dylib exists
+python/build_wheel.sh
 ```
 
 `python/build_wheel.sh` copies `.build/release/libArrowMetalC.dylib` into `python/arrowmetal/_lib/`,
@@ -108,15 +116,19 @@ values for any aggregate. `python/tests` pins those as expected errors so the te
 
 ## Polars
 
-Three tiers, all shipping in this repository — see [docs/POLARS.md](../docs/POLARS.md):
+Three tiers, all in this repository — see [docs/POLARS.md](../docs/POLARS.md):
 
 ```python
 import polars as pl, arrowmetal as am
 
-am.from_polars(df)                              # -> dict[str, MetalArray], zero copy
-df.arrowmetal.group_by("k").sum("v")            # tier 1: the GPU around Polars
-pl.col("v").arrowmetal.sum()                    # tier 2: inside a lazy plan (needs the Rust plugin)
-lf.arrowmetal.collect_gpu(query)                # tier 3: Polars runs the plan, the GPU finishes it
+# -> dict[str, MetalArray], zero copy
+am.from_polars(df)
+# tier 1: the GPU around Polars
+df.arrowmetal.group_by("k").sum("v")
+# tier 2: inside a lazy plan (needs the Rust plugin)
+pl.col("v").arrowmetal.sum()
+# tier 3: Polars runs the plan, the GPU finishes it
+lf.arrowmetal.collect_gpu(query)
 ```
 
 `import arrowmetal` still does not import Polars: the bridge loads on first use (or at import when

@@ -147,13 +147,12 @@ same script.
 between **0.57 and 1.54 ms depending on the process**. In the isolated mode: the per-process medians
 were 0.57, 0.59, 0.60, 0.60, 0.78 in one replicate and 0.86, 1.38, 1.38, 1.39, 1.54 in the next,
 while arrow stayed tight at 1.14–1.27 across all ten. One replicate makes ArrowMetal look twice as
-fast, the next makes it look slower; the honest reading is that the two are the same speed to within the noise of this
+fast, the next makes it look the other way; the two are the same speed to within the noise of this
 measurement.
 
-**`sum` including the import is a reproducible loss**: 3.20 ms against arrow's 1.31 ms interleaved,
-**2.4× slower**, in every replicate. A sum is one bandwidth-bound pass over 80 MB (decimal MB;
-76 MiB) with no
-arithmetic to hide the transfer behind.
+**`sum` including the import is a row where arrow is ahead, in every replicate**: 3.20 ms against
+arrow's 1.31 ms interleaved, **2.4×**. A sum is one bandwidth-bound pass over 80 MB (decimal MB;
+76 MiB) with no arithmetic to hide the transfer behind.
 
 `filter` (`x > 0.5`, about 5M rows out):
 
@@ -164,7 +163,7 @@ arithmetic to hide the transfer behind.
 | `arrow` `greater` then `filter` | 20.80 / 22.27 ms | 20.84 / 21.92 ms |
 | `x[x > 0.5]` base R | 36.12 / 37.57 ms | 34.79 / 37.88 ms |
 
-ArrowMetal wins `filter` clearly, but **the multiple depends on how it is measured**: about **14×**
+ArrowMetal is ahead on `filter`, but **the multiple depends on how it is measured**: about **14×**
 against arrow resident and about **4.9×** including the import, on the conservative interleaved
 medians. The resident row ranges 1.12–1.64 ms across processes here and independent runs on the
 same machine have put it above 2 ms, which would make it nearer 9×. Treat it as **roughly an order
@@ -242,11 +241,11 @@ There is also no dplyr backend and no `RecordBatch`/`Table` surface: everything 
   for several columns. Label rows with `$keys()`.
 - **Sorts put nulls and `NaN` last in both directions**, so a descending sort is not the exact
   reverse of an ascending one.
-- **macOS on Apple silicon only.** The dylib is not shipped inside the package.
+- **macOS on Apple silicon only.** The dylib is not included in the package.
 
 ## Tests
 
-65 `test_that()` blocks, 266 passing expectations, against base R and against `arrow`'s own
+64 `test_that()` blocks in the sources (65 as testthat runs them: the one in test-dispatch.R runs once per attach order), 266 expectations, against base R and against `arrow`'s own
 kernels on the same data: nulls, all-null and empty columns, sliced input at three offsets, lengths
 of 1, 33, 1024, 65537 and 1,000,001 (crossing a threadgroup boundary), one group per row and one group for
 everything, int64 above 2^53, float32 accumulation, and every documented error path.

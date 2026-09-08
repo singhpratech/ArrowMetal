@@ -7,17 +7,16 @@ C Device Data Interface (`ARROW_DEVICE_METAL`).
 ## The pitch in one paragraph
 
 Every array is Arrow layout in memory the GPU already shares, so there is nothing to upload. Gathers,
-group-by, sorts and string scans run on the GPU 3.8x to 24x faster than the fastest CPU idiom in the
-table below — and that baseline is each library's *most parallel* idiom, Polars' lazy engine and
-pyarrow's Acero, using a median of eleven of the sixteen cores, and up to fifteen. While they run the CPU is free for the
-rest of the application: every table here reports CPU time per operation next to wall time, and the
+group-by, sorts and string scans run on the GPU 3.8x to 24.2x faster than the fastest CPU idiom in the
+table below. That idiom is Polars' lazy engine or pyarrow's Acero, using a median of eleven of the
+sixteen cores and up to fifteen. While they run the CPU is free for the rest of the application: every table here reports CPU time per operation next to wall time, and the
 same rows cost 26 to 1,284 CPU-ms on the other side against one or two here. Chains of operations
 share one GPU round trip. The whole thing is reachable from Swift, Python, and any language with Arrow
-bindings through one C ABI. The full distribution over all 339 measured rows — including the 77 that
+bindings through one C ABI. The full distribution over all 339 measured rows — including the 77 where
 the CPU idiom is ahead — is in [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MATRIX.md) and
 [docs/TO_IMPROVE.md](docs/TO_IMPROVE.md).
 
-## Measured, not claimed
+## What was measured
 
 - **339 benchmark rows over 173 operations against four CPU libraries at their most parallel idiom** —
   Polars' lazy engine, pyarrow's Acero, pandas and numpy on an idle M4 Max, with the cores each call
@@ -28,7 +27,7 @@ the CPU idiom is ahead — is in [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MAT
   stated limitation. The table is generated from a registry the test suite executes against
   `pyarrow.compute`. [`docs/ARROW_FUNCTIONS.md`](docs/ARROW_FUNCTIONS.md)
 - **39,069 differential cases against pyarrow over 45 column types**, 769 Swift tests against a CPU
-  oracle and 2,452 Python cases, all run in release before anything is pushed.
+  oracle and 2,452 Python cases, all run in release.
   [`docs/TESTING.md`](docs/TESTING.md)
 - **Seven languages on one C ABI** — Swift, Python, C, Rust, Go, TypeScript and R, each binding with its
   own suite against that language's Arrow library. [`docs/README.md`](docs/README.md)
@@ -64,12 +63,12 @@ and [Benchmarks/README.md](Benchmarks/README.md).
 idiom, and the most parallel idiom it has for the same answer: `polars-lazy` through `pl.LazyFrame` on
 the in-memory or streaming engine, `pyarrow-threaded` through an Acero plan over 16 record batches
 (pandas' threaded paths, numexpr and numba, were not installed for this run; numpy's ufuncs are single-threaded). The baseline below is the **fastest
-of all of them**, named, with the cores that call actually used (its CPU-ms over its wall ms). Every
+of all of them**, named, with the cores that call used (its CPU-ms over its wall ms). Every
 row is taken from `Benchmarks/results/full_matrix_2026-09-07-parallel.csv`, the raw output behind
 [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MATRIX.md); the eager-only run of the same build is kept
 beside it as `full_matrix_2026-09-07.csv`. Wall time in milliseconds, with the CPU time each call
-consumed in parentheses. The last three rows are ones the CPU idiom wins, on the same footing as the
-seven above:
+consumed in parentheses. The last three rows are ones where the CPU idiom is ahead, on the same footing as
+the seven above:
 
 | Operation | Rows | ArrowMetal ms (CPU-ms) | fastest CPU idiom | its ms (CPU-ms) | its cores | speedup |
 |---|---:|---:|---|---:|---:|---:|
@@ -86,8 +85,7 @@ seven above:
 
 **Swift, against all 16 CPU cores** (tight typed loops over the same Arrow layout) and Accelerate. These
 are the Swift-level baselines of rounds 2, 3 and 7 in [docs/BENCHMARKS.md](docs/BENCHMARKS.md), measured
-2026-09-06 and not re-measured since — the sort row in particular predates the sort work the 2026-09-07
-matrix above measures:
+2026-09-06; the sort row predates the 2026-09-07 sort rewrite that the matrix above measures:
 
 | Operation | Metal | 16-core CPU / Accelerate |
 |---|---:|---:|
@@ -106,27 +104,23 @@ matrix above measures:
 | sort Float64, 50M rows | **138.52** | 591.97 (chunk sort + merge tree) |
 | string `contains`, 10M utf8 | **1.65** | 17.77 |
 
-Takeaways, all against the fastest idiom of any CPU library. **Where the GPU wins it wins on shape,
-not on effort:** gathers (`take`, 24.2x), multi-key and high-cardinality group-by (`lexsort` 24.0x,
+Takeaways, all against the fastest idiom of any CPU library. **The rows at or above 3x are gathers,
+group-by, sorts and GPU string predicates:** gathers (`take`, 24.2x), multi-key and high-cardinality group-by (`lexsort` 24.0x,
 `sum by int32 key` 3.8x at a thousand groups and 6.3x at a hundred thousand), sorts (`argsort int64`
 7.7x, `sort float64` 4.1x) and GPU string predicates (`contains` 7.0x at 10M rows; the family's GPU
 predicates run 1.6x to 7.0x against Polars lazy and Acero at ten million rows). The group-by family is 65 of 84 rows at or
-above 3x. **Where it does not, it mostly ties:** a single pass that reads one column and writes one is
-memory bound on both sides, and eleven to fifteen cores reach the same unified memory the GPU does, so
-there is no 3x on that shape for anybody.
+above 3x. **A single pass that reads one column and writes one is memory bound on both sides:** eleven
+to fifteen cores reach the same unified memory the GPU does.
 
 **Across all 339 rows the verdicts are 145 at or above 3x, 102 between 1x and 3x, 77 where the
-fastest CPU idiom is ahead, and 15 with no CPU equivalent.** The 77 are concentrated where you would expect
-them: 17 element-wise and 11 compare+select rows that are bandwidth ties, 13 string rows (ten of them
-at a million rows, where the fixed cost per call is the operation; seven of those ten are wins at ten
-million), 10
-temporal rows where a calendar conversion is arithmetic per element rather than bytes per second, the
-9 latency rows that exist to measure the dispatch floor, the software binary64 transcendentals,
-which cost forty-odd emulated operations per element on a GPU with no double hardware, and 17 more
-spread across chains, sort, decimal, reductions, window and group-by — including `shift (lag 1)` at
-0.01x, the widest gap in the matrix outside the latency rows. Every one of
-them is listed with its cause and with what would change it in [docs/TO_IMPROVE.md](docs/TO_IMPROVE.md), and
-[docs/DESIGN.md](docs/DESIGN.md) has the pipelining plan for the dispatch floor.
+fastest CPU idiom is ahead, and 15 with no CPU equivalent.** The 77 by measured cause, as
+[docs/TO_IMPROVE.md](docs/TO_IMPROVE.md) groups them: 16 at a million rows and below, where the dispatch
+floor is the operation; 28 memory-bound single passes; 6 software binary64 transcendentals and calendar
+arithmetic; 2 regular expressions matched on the host; 4 where the CPU library returns a view and
+ArrowMetal materialises a column; 8 temporal extractions; 4 `unique` and `value_counts` rows against a
+threaded hash aggregation; 1 grouped moment; 4 string conversions with variable-length output; and 4
+whole-query chains against a streaming engine. `shift (lag 1)` at 0.01x is the lowest ratio in the matrix outside the latency family. Every one of them is listed with its cause and with what would change it in
+[docs/TO_IMPROVE.md](docs/TO_IMPROVE.md), and [docs/DESIGN.md](docs/DESIGN.md) has the pipelining plan for the dispatch floor.
 
 ## From Python
 
@@ -192,9 +186,9 @@ exchanging columns through the Arrow C Data Interface and each with its own test
 | Binding | Where | Tests | Doc |
 |---|---|---|---|
 | Rust | `rust/arrowmetal`, `rust/arrowmetal-sys` | 48 tests plus 4 `no_run` doc-tests | [docs/RUST.md](docs/RUST.md) |
-| Go | `go/arrowmetal` | 46 test functions | [docs/GO.md](docs/GO.md) |
+| Go | `go/arrowmetal` | 45 test functions and one example, 46 runnable | [docs/GO.md](docs/GO.md) |
 | TypeScript / JavaScript | `node/` (N-API addon) | 62 tests | [docs/TYPESCRIPT.md](docs/TYPESCRIPT.md) |
-| R | `r/arrowmetal` | 266 expectations across 64 `test_that` blocks | [docs/R.md](docs/R.md) |
+| R | `r/arrowmetal` | 64 `test_that()` blocks in the sources (65 as testthat runs them: the one in test-dispatch.R runs once per attach order), 266 expectations | [docs/R.md](docs/R.md) |
 
 C and C++ callers use the header directly. Java, C# and Julia are on the
 [roadmap](docs/ROADMAP.md).
