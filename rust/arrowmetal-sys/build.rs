@@ -48,6 +48,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ARROWMETAL_LIB");
     println!("cargo:rerun-if-env-changed=ARROWMETAL_LIB_DIR");
 
+    // docs.rs builds the crate on a Linux host with no dylib: the declarations document themselves,
+    // so emit no link directives there and let the build succeed.
+    if std::env::var_os("DOCS_RS").is_some() {
+        return;
+    }
+
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         panic!(
             "arrowmetal-sys only builds on macOS: ArrowMetal is a Metal library and \

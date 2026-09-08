@@ -1,8 +1,15 @@
 # ArrowMetal
 
+[![CI](https://github.com/singhpratech/ArrowMetal/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/singhpratech/ArrowMetal/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/arrowmetal)](https://pypi.org/project/arrowmetal/)
+[![Go Reference](https://pkg.go.dev/badge/github.com/singhpratech/ArrowMetal/go/arrowmetal.svg)](https://pkg.go.dev/github.com/singhpratech/ArrowMetal/go/arrowmetal)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
 **Apache Arrow columnar data on Apple silicon GPUs.** Unified-memory, Metal-accelerated kernels that
 understand Arrow's layout natively: validity bitmaps, packed booleans, the C Data Interface and the
 C Device Data Interface (`ARROW_DEVICE_METAL`).
+
+Site and docs: <https://arrowmetal.org> · Python: `pip install arrowmetal` · Release: [v0.1.0](https://github.com/singhpratech/ArrowMetal/releases/tag/v0.1.0)
 
 ## The pitch in one paragraph
 

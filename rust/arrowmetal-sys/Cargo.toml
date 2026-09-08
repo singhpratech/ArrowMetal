@@ -6,7 +6,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Raw FFI declarations for libArrowMetalC, ArrowMetal's C ABI (include/arrowmetal.h)"
-publish = false
+readme = "../README.md"
+homepage = "https://arrowmetal.org"
+documentation = "https://github.com/singhpratech/ArrowMetal/blob/main/docs/RUST.md"
+keywords = ["arrow", "metal", "gpu", "apple-silicon", "ffi"]
+categories = ["external-ffi-bindings"]
 # `links` lets build.rs publish `cargo:lib_dir=...` to dependents as DEP_ARROWMETALC_LIB_DIR.
 links = "ArrowMetalC"
 build = "build.rs"
@@ -16,3 +20,6 @@ name = "arrowmetal_sys"
 path = "src/lib.rs"
 
 [dependencies]
+
+[package.metadata.docs.rs]
+targets = ["aarch64-apple-darwin"]
