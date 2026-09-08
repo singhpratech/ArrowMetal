@@ -13,8 +13,7 @@ Two crates live in [`rust/`](../rust):
 Neither is published to crates.io yet (`publish = false`), so both are used by path or by git.
 
 Everything below was run in this repository on 2026-09-07 on an Apple M4 Max, macOS 26.6.2,
-`rustc 1.95.0`, arrow-rs 59.3.0, ArrowMetal 0.1.0. **No number on this page was not measured in that
-session.**
+`rustc 1.95.0`, arrow-rs 59.3.0, ArrowMetal 0.1.0.
 
 ---
 
@@ -389,5 +388,6 @@ cd rust
 ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib cargo test --release
 ```
 
-48 tests, plus 4 `no_run` doc-tests (compiled, not executed), all green as of this writing. What each file compares against is in
+48 tests, plus 4 `no_run` doc-tests (compiled, not executed); 0 failures in the last gated run
+(`private/keep/2026-09-07/final_gate.log`). What each file compares against is in
 [`rust/README.md`](../rust/README.md) and in [TESTING.md](TESTING.md).

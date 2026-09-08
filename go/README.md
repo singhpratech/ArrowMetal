@@ -40,7 +40,7 @@ ARROWMETAL_LIB=$PWD/../../.build/release/libArrowMetalC.dylib go test ./...
 GOEXPERIMENT=cgocheck2 ARROWMETAL_LIB=$PWD/../../.build/release/libArrowMetalC.dylib go test -count=1 ./...
 ```
 
-46 test functions, 177 cases with subtests, run both ways. Every wrapped operation is checked
+45 test functions and one `Example`, 46 runnable; 177 cases with subtests, run both ways. Every wrapped operation is checked
 against Arrow Go's own compute where arrow-go has the function, and against a plain Go loop where it
 does not (arrow-go's compute package registers no aggregate function at all — no `sum`, `mean` or
 `min_max`). Lengths 0, 1, 1000 and 1,000,001; nulls at several densities, in keys as well as values;
@@ -72,12 +72,12 @@ Reproduce with `go run ./cmd/amtiming`. The filter predicate is `x > 0`, keeping
 | Filter | ArrowMetal, array already resident | **1.51 ms** |
 | Filter | ArrowMetal, end to end from an `arrow.Array` | **3.22 ms** |
 
-**ArrowMetal loses at Sum end to end**: 2.22 ms against Arrow Go's 1.16 ms. Summing 76 MB once is a
+**Arrow Go is ahead at Sum end to end**: 1.16 ms against ArrowMetal's 2.22 ms. Summing 76 MB once is a
 bandwidth problem the CPU already handles well, and about 1.2 ms of the ArrowMetal number is the
 import. Resident, the same sum is 296 µs — 3.9× faster than arrow-go. If the shape of your program
 is "load an array, sum it once, drop it", this is the wrong tool.
 
-**ArrowMetal wins at Filter in every shape**: 3.22 ms end to end against 48.93 ms is 15×, and 1.51 ms
+**ArrowMetal is ahead at Filter in every shape**: 3.22 ms end to end against 48.93 ms is 15×, and 1.51 ms
 resident is 32×. Filter does enough work per byte that the fixed cost stops dominating.
 
 `arrow/math.Int64.Sum` ignores nulls and the data here has none; it is the fastest sum arrow-go

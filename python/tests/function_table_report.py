@@ -52,7 +52,7 @@ the answer to compare against. The rest compare against `getattr(pc, name)` dire
    compares the result to `pyarrow.compute`, value for value, with a second input in a different
    Arrow type family for the rows whose claim spans several. Float comparisons use the tolerance
    recorded for that row in `arrowmetal.functions.TOLERANCE`; where an answer legitimately differs
-   from Arrow's, the row carries an oracle that checks the property Arrow actually specifies, and the
+   from Arrow's, the row carries an oracle that checks the property Arrow specifies, and the
    note says what the difference is;
 4. asserts that a `missing` row raises rather than quietly doing something.
 
@@ -65,7 +65,7 @@ if it says `gpu`, `cpu` or `partial`, a test in `python/tests/test_functions.py`
 |---|---|
 | **GPU** | A Metal kernel does the work. Host code sets up buffers and reads the answer back, nothing more. |
 | **CPU** | Implemented and reachable through the ArrowMetal API, but the work happens on the host. Every row here says *why* the host is the right place — a Unicode table, an ICU regex, an output one row wide however long the input, or a metadata-only result that runs no kernel. |
-| **Partial** | Reachable, with a stated limitation. Three different things wear this label and each note says which: (a) an option or an input type Arrow supports and this does not; (b) an answer that deliberately differs from Arrow's — `tdigest` and `hash_tdigest` return one q where Arrow returns a list; (c) an evaluation genuinely split between the GPU and the host: `rank_normal`, whose inverse CDF runs on the host, and `hash_tdigest`, whose centroid merge does. |
+| **Partial** | Reachable, with a stated limitation. Three different things wear this label and each note says which: (a) an option or an input type Arrow supports and this does not; (b) an answer that deliberately differs from Arrow's — `tdigest` and `hash_tdigest` return one q where Arrow returns a list; (c) an evaluation split between the GPU and the host: `rank_normal`, whose inverse CDF runs on the host, and `hash_tdigest`, whose centroid merge does. |
 | **Missing** | Not implemented. The note says why. |
 | **Pending** | Reserved for a name landing on an unmerged branch. No row carries it today. |
 

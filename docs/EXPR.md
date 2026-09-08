@@ -215,8 +215,8 @@ At **100 000 rows** the fixed cost dominates and the GPU is the wrong tool:
 | | polars lazy | 0.12 |
 
 Reading the small-input row: the command-buffer round trip is about 60-70 µs measured
-([RESIDENT.md](RESIDENT.md)), 110-230 µs as an all-in per-call floor in the matrix's latency family,
-and it is paid once per query however many operators the expression has — that is what fusion buys at
+([RESIDENT.md](RESIDENT.md)), 110-160 µs per call for sum and filter at 1,000 rows in the matrix's
+latency family, and it is paid once per query however many operators the expression has — that is what fusion buys at
 the low end. What it cannot buy back is the round trip itself, nor the cost of allocating and
 first-touching a fresh output buffer
 (the reason the float64 *project* costs more than the *aggregate*, which only writes threadgroup
@@ -225,8 +225,8 @@ partials). Crossover against Polars for these shapes is around 1M rows.
 Where fusion gains most is where the operator count is highest relative to the bytes moved: (b) is 1.5×
 the batched op-by-op chain, (d) is 1.8×, and (a) is 1.2× — while (c), which is compaction bound rather
 than operator bound, is a wash. Against the CPU engines in these tables — Polars, pyarrow and pandas —
-the margin is 4× to 62×, at a sixtieth to a two-thousandth of the CPU time; against numpy it is 2.6×
-to 70×.
+the margin is 4× to 62×, at a sixtieth to a twenty-four-hundredth of the CPU time; against numpy it is 2.6×
+to 71×.
 
 ## Limits
 

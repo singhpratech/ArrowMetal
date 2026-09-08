@@ -91,10 +91,10 @@ Supporting numbers, best of five: import 1.110 ms, export 0.000 ms (0.001 ms med
 table above: 0.91 / 0.30 / 2.14 for `sum`, 3.59 / 0.66 for `filter`, 4.62 / 2.97 for compare +
 `filter` — within a few percent of the bests, so the run was not noisy.
 
-### Where ArrowMetal loses
+### Where arrow-rs is ahead
 
-**A single `sum` on an arrow-rs array is 2.3× slower than arrow-rs**: 2.11 ms against 0.91 ms. The
-kernel itself is 3.3× *faster* (0.28 ms); the loss is entirely the cost of handing 80 MB (decimal
+**On a single `sum` over an arrow-rs array, `arrow::compute::sum` is ahead by 2.3×**: 0.91 ms against
+2.11 ms. The kernel itself is 3.3× *faster* (0.28 ms); the gap is entirely the cost of handing 80 MB (decimal
 MB; 76 MiB) to Metal — 1.11 ms for the import measured on its own, and the remaining ~0.7 ms in
 handle setup and the GPU's first touch of the newly mapped pages.
 
@@ -106,7 +106,7 @@ The break-even is roughly "more than one pass over the data". `compare + filter`
 ArrowMetal is already 1.5× faster end to end (2.97 ms against 4.58 ms), and every further operation on
 the same imported handle costs the kernel column, not the end-to-end column.
 
-So: import once, chain, export once. Wrapping a single reduction is a loss.
+So: import once, chain, export once. A single wrapped reduction does not earn its import back.
 
 ## Layout
 

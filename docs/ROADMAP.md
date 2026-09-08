@@ -11,8 +11,6 @@ This is the only roadmap: the older `../ROADMAP.md` now points here.
   (0.78x of it in the eager baseline), and stddev 1.24x of the fastest parallel idiom, because Metal
   has no 64-bit atomics and the software-binary64 accumulators cannot be privatised per threadgroup.
   A simdgroup-per-group accumulator is costed at about 6 ms of the 30.
-- **The float64 sort's last gather.** Sorting values by inverting the sort key instead of gathering
-  through the permutation; in progress.
 - **A chunked `MetalArray`.** `shift(view=True)` already returns a two-chunk view; making chunked arrays
   a first-class input to every kernel turns slices, concatenations and shifts into pointers.
 - **A GPU regular-expression engine.** A compiled automaton kernel behind the existing pre-filter, so a

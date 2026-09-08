@@ -2574,7 +2574,8 @@ CAUSE_HINTS = [
      "`partition_nth_indices` is documented as the full stable argsort; there is no partial-partition "
      "kernel yet."),
     (lambda fam, op: fam == "latency",
-     "Below the ~150 us dispatch floor: encode + commit + wait dominates the kernel. Batching removes "
+     "Below the 110-160 us dispatch floor (the latency family's sum and filter rows at 1,000 rows): "
+     "encode + commit + wait dominates the kernel. Batching removes "
      "most of it, but a single small call cannot beat an in-cache CPU loop."),
     (lambda fam, op: fam == "reductions" and ("first" in op or "last" in op or "any" in op or "all" in op),
      "Answered by a short-circuiting host scan of the bitmap in shared memory (no dispatch at all), so "
@@ -2613,8 +2614,8 @@ CAUSE_HINTS = [
      "`rank` is the full GPU argsort plus a segmented scan, so it inherits the radix sort's traffic; "
      "see the sort family above."),
     (lambda fam, op: "replace_with_mask" in op,
-     "Three passes: the mask's prefix sum, a gather of the replacements, then the merge. pyarrow "
-     "fuses them into one streaming pass over the column."),
+     "Three passes: the mask's prefix sum, a gather of the replacements, then the merge. The Polars "
+     "lazy idiom (`when/then/otherwise` over the mask) is one streaming pass over the column."),
     (lambda fam, op: fam == "chains" and "group-by" in op,
      "The chain's group-by rebuilds the dense key mapping after the filter, which is most of the "
      "measured time; the filter and the aggregate themselves are each well inside the bar."),
@@ -2645,7 +2646,7 @@ CAUSE_HINTS = [
      "`sort`; that is several times the column in traffic, so it is bandwidth-bound where Polars' "
      "multi-threaded pattern-defeating sort touches the data far fewer times. Wider digits, or an "
      "in-threadgroup first pass, is the lever."),
-    (lambda fam, op: op.startswith(("sin", "cos", "tan", "divide")) and "float64" in op,
+    (lambda fam, op: op.startswith(("sin", "cos", "tan", "ln", "divide")) and "float64" in op,
      "Metal has no `double`: float64 transcendentals and division run ArrowMetal's **software "
      "binary64** (Sources/ArrowMetal/Kernels/DoubleTranscendental.swift), tens of integer instructions "
      "per element against one vectorised hardware instruction on the CPU. Compute-bound, not "
@@ -2689,8 +2690,8 @@ def diagnose(key, ratio, best_lib, amr, row):
                     f"{fmt_gbs(b['gbs'])} GB/s, both within reach of the ~400 GB/s the single-pass rows "
                     "reach; there is no 3x available to either side on this operation.")
     if amr and amr["wall_ms"] < 0.5:
-        return ("Under half a millisecond: the ~150 us dispatch floor is a large share of the "
-                "measurement.")
+        return ("Under half a millisecond: the 110-160 us dispatch floor (the latency family's sum "
+                "and filter rows at 1,000 rows) is a large share of the measurement.")
     return ("Not yet diagnosed from the kernel; the ArrowMetal path is doing more passes over the "
             "column than the CPU library's fused one.")
 

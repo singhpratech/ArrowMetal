@@ -109,10 +109,10 @@ enough to move a headline:
 depending on the process**. In the isolated mode: the per-process medians came out 0.57, 0.59, 0.60,
 0.60, 0.78 in one replicate and 0.86, 1.38, 1.38, 1.39, 1.54 in the next, straddling arrow's, which
 is tight at 1.14 to 1.27 across all ten. So it lands either side of arrow's 1.16 ms isolated median
-depending on which replicate you run, and **no win or loss should be claimed for that row.**
+depending on which replicate you run, and **no verdict is claimed for that row.**
 
-**`sum` including the import does reproduce as a loss**: 3.20 ms against arrow's 1.31 ms
-interleaved, **2.4× slower**, in every replicate. A sum is one bandwidth-bound pass over 80 MB
+**`sum` including the import is a row where arrow is ahead, in every replicate**: 3.20 ms against
+arrow's 1.31 ms interleaved, **2.4×**. A sum is one bandwidth-bound pass over 80 MB
 (decimal MB; 76 MiB) with no arithmetic to hide the transfer behind.
 
 ### `filter` (`x > 0.5`, ~5M rows out)
@@ -124,7 +124,7 @@ interleaved, **2.4× slower**, in every replicate. A sum is one bandwidth-bound 
 | `arrow` `greater` then `filter` | 20.80 / 22.27 ms | 20.84 / 21.92 ms |
 | `x[x > 0.5]` — base R | 36.12 / 37.57 ms | 34.79 / 37.88 ms |
 
-ArrowMetal wins `filter` clearly, but **the exact multiple depends on how you measure**: on the
+ArrowMetal is ahead on `filter`, but **the exact multiple depends on how you measure**: on the
 conservative interleaved medians it is **about 14× against arrow resident and about 4.9× including
 the import**. The resident row alone ranges 1.12–1.64 ms across processes here, and independent
 runs on the same machine have put it above 2 ms, which would make it nearer 9×. Read it as
@@ -160,7 +160,7 @@ idle Mac.
 - **An `NA` scalar** in `am_compare()` gives an all-null mask, as base R and arrow do. The ABI
   scalar carries no validity flag, so this is handled in R rather than on the GPU.
 - **macOS on Apple silicon only**, and the Swift core is a separate `libArrowMetalC.dylib` that is
-  not shipped inside this package.
+  not bundled inside this package.
 
 ## Tests
 

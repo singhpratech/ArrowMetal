@@ -10,7 +10,7 @@ Every array is Arrow layout in memory the GPU already shares, so there is nothin
 group-by, sorts and string scans run on the GPU 3.8x to 24.2x faster than the fastest CPU idiom in the
 table below. That idiom is Polars' lazy engine or pyarrow's Acero, using a median of eleven of the
 sixteen cores and up to fifteen. While they run the CPU is free for the rest of the application: every table here reports CPU time per operation next to wall time, and the
-same rows cost 26 to 1,284 CPU-ms on the other side against one or two here. Chains of operations
+same rows cost 26 to 1,284 CPU-ms on the other side (the `shift` view apart, at 0.06) against 0.4 to 1.7 here. Chains of operations
 share one GPU round trip. The whole thing is reachable from Swift, Python, and any language with Arrow
 bindings through one C ABI. The full distribution over all 339 measured rows — including the 77 where
 the CPU idiom is ahead — is in [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MATRIX.md) and
@@ -27,13 +27,13 @@ the CPU idiom is ahead — is in [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MAT
   stated limitation. The table is generated from a registry the test suite executes against
   `pyarrow.compute`. [`docs/ARROW_FUNCTIONS.md`](docs/ARROW_FUNCTIONS.md)
 - **39,069 differential cases against pyarrow over 45 column types**, 769 Swift tests against a CPU
-  oracle and 2,452 Python cases, all run in release.
+  oracle and 2,473 Python cases (2,452 passed, 21 skipped), all run in release.
   [`docs/TESTING.md`](docs/TESTING.md)
 - **Seven languages on one C ABI** — Swift, Python, C, Rust, Go, TypeScript and R, each binding with its
   own suite against that language's Arrow library. [`docs/README.md`](docs/README.md)
-- **17 findings in other projects, each with a reproduction in this repository** — pyarrow, Apple
-  Metal, the Arrow JS, R and Go libraries, and the Swift compiler — tracked with where each report
-  stands. [`docs/UPSTREAM.md`](docs/UPSTREAM.md)
+- **17 findings in other projects** — pyarrow, Apple Metal, the Arrow JS, R and Go libraries, and the
+  Swift compiler — each with the evidence behind it and where its report stands.
+  [`docs/UPSTREAM.md`](docs/UPSTREAM.md)
 
 ## Why this exists
 
@@ -106,8 +106,9 @@ are the Swift-level baselines of rounds 2, 3 and 7 in [docs/BENCHMARKS.md](docs/
 Takeaways, all against the fastest idiom of any CPU library. **The rows at or above 3x are gathers,
 group-by, sorts and GPU string predicates:** gathers (`take`, 24.2x), multi-key and high-cardinality group-by (`lexsort` 24.0x,
 `sum by int32 key` 3.8x at a thousand groups and 6.3x at a hundred thousand), sorts (`argsort int64`
-7.7x, `sort float64` 4.1x) and GPU string predicates (`contains` 7.0x at 10M rows; the family's GPU
-predicates run 1.6x to 7.0x against Polars lazy and Acero at ten million rows). The group-by family is 65 of 84 rows at or
+7.7x, `sort float64` 4.1x) and GPU string predicates (`contains` 7.0x at 10M rows; the four GPU
+predicates measured at ten million rows — `match_like` on a pure prefix, `contains`, `starts_with` and
+`match_substring_regex` on a literal — run 1.6x to 7.0x against Polars lazy and Acero). The group-by family is 65 of 84 rows at or
 above 3x. **A single pass that reads one column and writes one is memory bound on both sides:** eleven
 to fifteen cores reach the same unified memory the GPU does.
 
@@ -179,7 +180,7 @@ See [python/README.md](python/README.md).
 
 ## Bindings
 
-Four language bindings over the same C ABI (`include/arrowmetal.h`) ship in this repository, each
+Four language bindings over the same C ABI (`include/arrowmetal.h`) are in 0.1.0, in this repository, each
 exchanging columns through the Arrow C Data Interface and each with its own test suite:
 
 | Binding | Where | Tests | Doc |

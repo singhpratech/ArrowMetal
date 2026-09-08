@@ -320,7 +320,7 @@ Page size, same column at 5 M rows (40 MB of values), MB/s of decoded output:
 Reproduce with:
 
 ```
-PYTHONPATH=python python Benchmarks/parquet_bench.py --rows 50000000 --codecs snappy,lz4,none --codec-scan
+PYTHONPATH=python python Benchmarks/parquet_bench.py --rows 50000000 --codecs snappy,lz4,none --codec-scan --repeat 3
 ```
 
 ### What the numbers say

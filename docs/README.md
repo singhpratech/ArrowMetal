@@ -10,10 +10,10 @@ test or the CSV a claim comes from.
 | [ARROW_FUNCTIONS.md](ARROW_FUNCTIONS.md) | Coverage of Apache Arrow compute by **exact name**: all 307 v25 function names, one row each, generated from a registry the test suite executes against `pyarrow.compute` |
 | [COVERAGE.md](COVERAGE.md) | The same ground by **family**, with the Arrow type matrix and interop: which functions and types are supported, and how (GPU, GPU/CPU, CPU, partial) |
 | [EVALUATION.md](EVALUATION.md) | How correctness is checked: CPU oracles, the scenario matrix, bit-exact IEEE-754 tests, and the differential harness against pyarrow.compute, with open findings |
-| [UPSTREAM.md](UPSTREAM.md) | What the matrix found in other projects (pyarrow, the Arrow tz database, Apple Metal), the test behind each finding, and where every upstream report stands |
+| [UPSTREAM.md](UPSTREAM.md) | What the matrix and the bindings found in other projects (pyarrow, the Arrow tz database, Apple Metal, the Arrow JS, R and Go libraries, the Swift compiler), the test behind each finding, and where every upstream report stands |
 | [TESTING.md](TESTING.md) | Every test suite, what it covers, and the commands to run it |
 | [BENCHMARKS.md](BENCHMARKS.md) | Every benchmark round with hardware, methodology, wall time and CPU time; the tables the README quotes |
-| [TO_IMPROVE.md](TO_IMPROVE.md) | Every row of the matrix short of the 3x bar, the rows where the CPU idiom is ahead first, grouped by the measured cause (dispatch floor, copy vs view, sort-based distinct, software binary64, host regex), plus the rows under the 3x bar and what changed since the previous matrix |
+| [TO_IMPROVE.md](TO_IMPROVE.md) | Every row of the matrix short of the 3x bar, the rows where the CPU idiom is ahead first, grouped by the measured cause (ten sections: dispatch floor, memory-bound single passes, software binary64, host regex, CPU views, temporal extraction, `unique` and `value_counts`, grouped moments, variable-length string output, whole-query chains), plus the rows under the 3x bar and what changed since the previous matrix |
 | [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md) | The complete operation-by-operation comparison against Polars, pyarrow, pandas and numpy in both their eager and most-parallel idioms, at 1k to 50M rows, with a verdict per row and a list of everything below the 3x bar |
 | [DESIGN.md](DESIGN.md) | How it works: buffers, kernels, batching, GPU-side lengths, software Float64, where the time goes |
 | [PANDAS.md](PANDAS.md) | pandas on the GPU: the `.am` accessor and the zero-code-change accel mode, what routes to the GPU and when, the zero-copy and null rules, the numbers and the limits |
@@ -31,17 +31,18 @@ test or the CSV a claim comes from.
 | [STREAMING.md](STREAMING.md) | Out-of-core streaming execution: datasets larger than memory flowing from disk through the GPU, the three-stage pipeline and its measured overlap, every streaming operator with exact-or-approximate marked, and the buffer budget |
 | [DECISIONS.md](DECISIONS.md) | Why it is built this way, one dated entry per decision |
 | [FINDINGS.md](FINDINGS.md) | Things learned the hard way: toolchain quirks, Metal limits, bugs and their lessons |
+| [RESIDENT.md](RESIDENT.md) | The resident-kernel experiment: where the ~65 µs per command buffer goes, and the two measured probes showing a persistent GPU worker polling shared memory does not beat it |
 | [ROADMAP.md](ROADMAP.md) | What is next and what is open for contributors |
 | [../CHANGELOG.md](../CHANGELOG.md) | What is in 0.1.0 |
-| [../Benchmarks/README.md](../Benchmarks/README.md) | The six benchmark programs and the fairness rules |
+| [../Benchmarks/README.md](../Benchmarks/README.md) | The benchmark programs and the fairness rules |
 | [../python/README.md](../python/README.md) | The Python package: install, wheel build, usage |
 | [RELEASE.md](RELEASE.md) | The ordered checklist for cutting and publishing 0.1.0: tags, the wheel, PyPI, the plugin crate, the docs to re-verify |
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | How to add a kernel, test it, and benchmark it |
 
 ## Installing
 
-Nothing here is published yet — no PyPI package, no crates.io crate, no tagged Swift release. Both install
-routes go through this checkout, and [RELEASE.md](RELEASE.md) is what turns them into published artefacts.
+Both install routes go through this checkout; [RELEASE.md](RELEASE.md) is the checklist that puts 0.1.0 on
+PyPI, crates.io and a Swift tag.
 
 ```
 # Swift: add the package by path or git URL in Package.swift, then

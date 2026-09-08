@@ -23,13 +23,13 @@ Status vocabulary, deliberately strict:
     Not implemented. The note says why (out of scope, or simply unclaimed).
 ``pending``
     Reserved for a name whose implementation is landing on a branch that has not merged. **No row
-    carries this status today**; it stays in the vocabulary so a work-in-progress name has somewhere
-    honest to sit rather than being called ``missing``.
+    carries this status today**; it stays in the vocabulary so a work-in-progress name has a status of its own
+    rather than being called ``missing``.
 
 The mixed rows are the ones worth reading twice. ``partial`` covers three different things, and each
 note says which one applies: an option or an input type Arrow supports and this does not; a result
 that deliberately differs from Arrow's (group order, ascending ``unique``, an int32 where Arrow
-returns int64); or an evaluation that is genuinely split between the GPU and the host — the Unicode
+returns int64); or an evaluation split between the GPU and the host — the Unicode
 string predicates, which fall back to the CPU only for the rows carrying a byte >= 0x80, are the
 clearest example.
 """
@@ -1066,8 +1066,8 @@ _ROWS = [
      "N columns and a scalar separator, GPU throughout: a left fold of one two-pass join step, so N "
      "columns cost N-1 passes and the data never leaves the device. All three of Arrow's "
      "`null_handling` modes are implemented — `emit_null`, `skip` (a null column contributes nothing, "
-     "not even its separator, which the fold keeps honest by leaving the accumulator null until "
-     "something has actually been joined) and `replace`. Deliberate difference: under `skip`, a row "
+     "not even its separator, the fold leaves the accumulator null until something has been joined) "
+     "and `replace`. Deliberate difference: under `skip`, a row "
      "whose columns are *all* null joins to the empty string here, where pyarrow 25.0.1 drops the row "
      "from its output entirely and returns an array shorter than its input.",
      lambda args, options: _out(binary_join_element_wise(

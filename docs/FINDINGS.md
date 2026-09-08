@@ -11,8 +11,7 @@ Things learned the hard way. Add to this whenever something surprises you.
 
 ## Toolchain
 - XCTest is not in the Command Line Tools. Run tests with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`.
-- Swift 6.3.3 miscompiles a `withUnsafeBytes` closure inside a generic `throws` function under `-O` when the caller is in another module: the closure clobbers the error register around an Objective-C message send, so the function reports a phantom error and the caller crashes retaining it (swiftlang/swift#90477, open). `MetalArray.init(_:)` uses a plain element loop instead; the Metal-free reproducer is in UPSTREAM.md
-  (release-only crash on entry). Rewritten as a loop. Always run `swift test -c release`.
+- Swift 6.3.3 miscompiles a `withUnsafeBytes` closure inside a generic `throws` function under `-O` when the caller is in another module: the closure clobbers the error register around an Objective-C message send, so the function reports a phantom error and the caller crashes retaining it (swiftlang/swift#90477, open). `MetalArray.init(_:)` uses a plain element loop instead; the Metal-free reproducer is in UPSTREAM.md. Always run `swift test -c release`.
 - GitHub `macos-15` runners come with Xcode 16.4 / Swift 6.1, which refuses to type-check dense closures that
   Swift 6.3 accepts. Keep test expressions simple.
 - Swift release builds shorten object lifetimes to last use: a raw pointer taken from a buffer object can
@@ -48,7 +47,7 @@ Things learned the hard way. Add to this whenever something surprises you.
 - `makeCommandBufferWithUnretainedReferences` plus a spin-wait did not measurably reduce per-call latency;
   the ~120 µs floor is the round trip. Batching is what works: chains pay it once.
 - A `sum()` on a batched filter result still costs a second round trip because the reduction needs the
-  filtered length on the CPU. Next: kernels read `n` from a device buffer so pending lengths flow on the GPU.
+  filtered length on the CPU. Done in Round 5 below: kernels read `n` from a device buffer so pending lengths flow on the GPU.
 
 ## Round 5 (2026-09-06): pipeline creation on the paravirtual GPU, and lengths that stay on the device
 - With full compiler logs enabled, the paravirtual GPU on GitHub runners fails `makeComputePipelineState`
@@ -206,7 +205,8 @@ bin size, and therefore the final sort, depends entirely on the key distribution
 key is the sign plus seven exponent bits, so a column of uniform doubles concentrates in a handful of bins
 rather than spreading over 256, and the bin holding the wanted rank can be a large fraction of the column.
 When it is over the compaction budget the search narrows another digit over the column instead, one more full
-pass — which is why the same 50M Float64 median measures anywhere between 2.7 and 3.9 ms depending on exactly
-where the rank lands, while Int64 keys are stable. Raising the budget so the big bin gets compacted instead is
-faster still, but a 25M-row bin needs 300 MB of scratch for a 400 MB column, and a median already 100x faster
-than pyarrow is not worth a 75% memory overhead.
+pass — which is why the same 50M Float64 median varies from run to run depending on exactly where the rank
+lands, while Int64 keys are stable. Raising the budget so the big bin gets compacted instead is
+faster still, but a 25M-row bin needs 300 MB of scratch for a 400 MB column, and a median already 80x faster
+than pyarrow (4.61 ms against 368.88 ms at 50M rows, `Benchmarks/results/full_matrix_2026-09-07-parallel.csv`)
+is not worth a 75% memory overhead.

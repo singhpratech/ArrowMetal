@@ -260,7 +260,7 @@ from every aggregate.
 
 ## Latency (small inputs)
 Measured floor on M4 Max: an empty kernel with encode + commit + wait costs about 60-70 µs measured
-([RESIDENT.md](RESIDENT.md)), 110-230 µs as an all-in per-call floor in the matrix's latency family; ten
+([RESIDENT.md](RESIDENT.md)), 110-160 µs per call for `sum` and `filter` at 1,000 rows in the matrix's latency family; ten
 kernels in one command buffer cost ~100 µs in total. So the fixed cost is the round trip, not the kernel,
 and the only lever is fewer round trips.
 

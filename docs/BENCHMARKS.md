@@ -34,8 +34,8 @@ pyarrow through Acero **11.1**. A comparison against one core is not the compari
 to make.
 
 Against that baseline, of **339 measured rows: 145 at or above 3x, 102 between 1x and 3x, 77 to improve,
-where the fastest CPU idiom is ahead, 15 with no CPU equivalent.** Against the eager idioms alone, the same
-build had 247 rows at or above 3x, 62 between, 15 where an eager library was ahead and 15 without an equivalent
+where the fastest CPU idiom is ahead, 15 with no CPU equivalent.** Against the eager idioms alone, the morning run
+of the same day (09:44, before the sort-gather change) had 247 rows at or above 3x, 62 between, 15 where an eager library was ahead and 15 without an equivalent
 (`Benchmarks/results/full_matrix_2026-09-07.csv`). Both CSVs are kept. The 77 rows to improve are grouped
 by measured cause, with what would change each one, in [TO_IMPROVE.md](TO_IMPROVE.md); the row-by-row tables
 are in [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md).

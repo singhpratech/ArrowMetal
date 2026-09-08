@@ -419,7 +419,7 @@ pyarrow's Acero are on the Compare tab and in the benchmark matrix.
 | | Use it when |
 |---|---|
 | Tier 1, one call | The kernel is expensive relative to 400 MB of page mapping: group-by, sort, top-k, string search. Not a bare `sum`. |
-| Tier 1, resident | You run several kernels over the same column. `to_metal()` once, then everything is 1-10 ms. |
+| Tier 1, resident | You run several kernels over the same column. `to_metal()` once, then every kernel in the table above is 0.8-10.5 ms. |
 | Tier 2 | The GPU op belongs inside a plan you want Polars to keep optimising -- scans, pushdown, and lazy composition still apply. |
 | Tier 3 | Polars should do the IO and the reshaping and ArrowMetal should do one heavy pass at the end. |
 

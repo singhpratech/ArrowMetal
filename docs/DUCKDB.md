@@ -15,7 +15,7 @@ contiguous chunk does copy when DuckDB returns many; see §5.
 DuckDB's once the column and its group ids are already on the GPU (**1.1x** for a single cold
 query), and a string `LIKE` scan is **9.3x** resident (**0.6x** cold). DuckDB is ahead on a plain
 `sum` over a column, which is memory-bound and which DuckDB does while it scans. The loadable
-extension works and matches DuckDB's answers exactly; it is **not currently a speedup**, and §4 says
+extension works and matches DuckDB's answers exactly; it is **behind DuckDB's own SQL in 0.1.0**, and §4 says
 why.
 
 - [1. Which tier you want](#1-which-tier-you-want)
@@ -102,8 +102,8 @@ checked strictly: an `osx_arm64` build will not load into an `osx_amd64` DuckDB.
 
 ## 3. Tier 1: the Python bridge
 
-`python/arrowmetal/duckdb_bridge.py`. Eight entry points, all reachable straight off `am`; six of
-them are below.
+`python/arrowmetal/duckdb_bridge.py`. Nine entry points, all reachable straight off `am`; six of
+them are below, and the other three are `duckdb_reader`, `duckdb_table` and `duckdb_is_zero_copy`.
 
 ### Pull a result onto the GPU
 
@@ -261,27 +261,11 @@ Every function's answer matches DuckDB's own SQL exactly, nulls included -
 tests skip only when the extension has not been built. Tier 1 does not go through the header and is
 unaffected either way.
 
-And plain SQL is ahead of it:
+And plain SQL is ahead of it. The extension's timings are not recorded: `Benchmarks/duckdb_bench.py` measures the Python bridge only, and
+`python/tests/test_duckdb.py` checks the extension's answers without timing them.
 
-| 10M rows | DuckDB SQL | extension |
-|---|---:|---:|
-| `sum, count, min, max, avg` | 2.4 ms | 15.5 ms |
-| group-by, 100k keys | 92.8 ms | 124.8 ms |
-| `order by v desc limit 100` | 2.8 ms | 15.6 ms |
-| full sort | 11.5 ms | 77.1 ms |
-
-| 50M rows | DuckDB SQL | extension |
-|---|---:|---:|
-| `sum, count, min, max, avg` | 9.0 ms | 86.5 ms |
-| group-by, 100k keys | 197.8 ms | 434.1 ms |
-| `order by v desc limit 100` | 7.2 ms | 105.9 ms |
-| full sort | 64.0 ms | 540.4 ms |
-
-(The group-by rows compute all four aggregates at once, which is what `arrowmetal_group_by` returns,
-so they are not comparable to the single-`sum` group-by in §5.)
-
-The same GPU group-by from the Python bridge runs in 4.5 ms at 50M rows, against these hundreds, so
-the time is in the extension's path. Three things account for it:
+The same GPU group-by from the Python bridge runs in 4.5 ms at 50M rows (§5), so the time is in the
+extension's path. Three things account for it:
 
 1. **The DataChunk assembly is single-threaded.** DuckDB emits ~2048-row chunks and one ArrowMetal
    array is one contiguous buffer, so the extension memcpys chunk after chunk on one thread while
@@ -398,8 +382,8 @@ the GPU when the aggregate is the expensive part, not the scan.
 - Sorting from cold. The GPU radix sort is ahead of DuckDB's parallel sort on a resident column
   (2.2x) but behind once the crossing is included (0.7x one-shot).
 - Small data. Below a few million rows the dispatch latency is most of the time — about 60-70 µs
-  measured ([RESIDENT.md](RESIDENT.md)), 110-230 µs as an all-in per-call floor in the matrix's
-  latency family; use
+  measured ([RESIDENT.md](RESIDENT.md)), 110-160 µs per call for sum and filter at 1,000 rows in the
+  matrix's latency family; use
   `am.batch()` to amortise it, or do not bother.
 - Anything the extension can do, if speed is the reason. See §4.
 

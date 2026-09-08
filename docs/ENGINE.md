@@ -176,8 +176,8 @@ compiler already defines what it can do:
 ## Execution
 
 The whole tree runs inside one `MetalContext.batch { }`, so every kernel goes into one command buffer
-and the round trip — about 60-70 µs measured ([RESIDENT.md](RESIDENT.md)), 110-230 µs as an all-in
-per-call floor in the matrix's latency family — is paid once for the query rather than once per
+and the round trip — about 60-70 µs measured ([RESIDENT.md](RESIDENT.md)), 110-160 µs per call for sum
+and filter at 1,000 rows in the matrix's latency family — is paid once for the query rather than once per
 operator. Where an
 operator's *length* is decided by the GPU — a filter — the result is a pending array whose length lives
 in a device buffer and the next kernel binds that buffer instead of a CPU-known count
@@ -218,29 +218,13 @@ every row, because the `n/m columns` it prints and the cardinalities that pick a
 statements about the real table.
 
 That leaves the one cost that cannot be cached away: the first `collect()` in a process generates and
-compiles MSL for the kernels its plan lowers to. For the query below that is ~45 ms of a 76 ms cold
-run; every later run finds them in `MetalContext`'s pipeline cache. `q.warmup()` runs the plan over
-4096 rows per source to move that cost off the first real query.
+compiles MSL for the kernels its plan lowers to; every later run finds them in `MetalContext`'s pipeline
+cache. `q.warmup()` runs the plan over 4096 rows per source to move that cost off the first real query.
 
-M4 Max, 20M rows, `filter(amount > 100).group_by(region).agg(sum(amount)).sort(total, desc).limit(5)`
-over a two-column `pyarrow.Table`, `time.perf_counter` around each stage of a warm `collect()`:
-
-| stage | before | after |
-|---|---:|---:|
-| `am.scan(table)` | 0.02 ms | 0.01 ms |
-| building the operators | 0.05 ms | 0.02 ms |
-| `plan_json()` (325 bytes) | 0.03 ms | 0.01 ms |
-| importing + registering the sources | 6.22 ms | 0.02 ms |
-| `am_plan_run` | 16.39 ms | 10.14 ms |
-| materialising the result | 0.12 ms | 0.07 ms |
-| **total** | **22.85 ms** | **10.28 ms** |
-| first `collect()` in a fresh process | 92 ms | 76 ms |
-
-The `am_plan_run` column moved because the import churn was adding to the kernels' time, not because the
-kernels changed: parsing and optimizing the plan is 0.24 ms of it, and the Python side around it is
-now 0.14 ms. Measured against the same query over columns already resident in Metal memory, scanning a
-`pyarrow.Table` costs +0.05 ms at 2M rows and −0.12 ms at 50M — inside the noise.
-`python/tests/test_lazy.py` holds that bound at 3 ms.
+With the import cached, a warm `collect()` over a `pyarrow.Table` does the same work as the same query
+over columns already resident in Metal memory, plus the Python side around `am_plan_run`: `am.scan`,
+building the operators, `plan_json()` and materialising the result. `python/tests/test_lazy.py` holds
+the `pyarrow.Table` case within 3 ms of the resident one; per-stage timings are not recorded.
 
 ## The join matrix
 
@@ -383,7 +367,7 @@ the same run: it is what the query cost the machine, next to what it cost the ca
 | | duckdb | not run (off by default; set `AM_BENCH_DUCKDB_ASOF=1`) | | |
 
 Reading it: the widest margins are where the operator count is high relative to the bytes moved — (d)
-is six operators over four columns and 42x, (a) is a filter plus a reduction and 7.1x — and where the
+is six operators over three columns and 42x, (a) is a filter plus a reduction and 7.1x — and where the
 work is a scan the GPU does in one pass, like (h)'s binary search. The narrowest is (f), where Polars
 is **ahead** — 3.06 ms against ArrowMetal's 3.50 — because the case is bound by writing 10M
 output rows rather than by compute; (b) at 2.4x is the next narrowest.
@@ -395,8 +379,8 @@ doing.
 
 Below about 1M rows the fixed cost dominates and the GPU is the wrong tool; at 2M rows on the same
 machine (`Benchmarks/results/engine_bench_2000000_2026-09-07.txt`) (a) is 0.57 ms against Polars'
-0.63 ms and (f) is 2.52 ms against Polars' 1.23 ms. The crossover for these shapes is between 1M and
-5M rows.
+0.63 ms and (f) is 2.52 ms against Polars' 1.23 ms; at that size (a), (c), (d), (e), (g) and (h) are
+ahead of Polars and (b) and (f) are behind, and (f) is behind at 50M as well.
 
 
 ## Limits

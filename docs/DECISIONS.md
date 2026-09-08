@@ -8,8 +8,8 @@ single 0.1.0 heading and in docs/BENCHMARKS.md as numbered rounds.
 
 ## 2026-09-06: Batched execution with lazy materialisation instead of futures
 A per-thread open command buffer with sync-on-read keeps the synchronous API (every method still returns a
-real array) while removing the round trip between chained kernels — measured at 60–70 µs for an empty round trip today ([RESIDENT.md](RESIDENT.md); ~116 µs in round 4) and 110–230 µs per call in the matrix's latency family, for an empty
-kernel on an M4 Max, round 4 in docs/BENCHMARKS.md. Futures would have changed every
+real array) while removing the round trip between chained kernels — measured at about 65 µs for an empty round trip today ([RESIDENT.md](RESIDENT.md); 116 µs in round 4 of docs/BENCHMARKS.md), and per call in the matrix's latency family 110–230 µs for `sum` and `filter` at 1k to 1M rows and
+400–1,080 µs for group-by sum at a thousand keys (docs/TO_IMPROVE.md §1). Futures would have changed every
 signature. Cost: a reduction inside a batch still syncs; filter results carry a worst-case buffer until read.
 
 ## 2026-09-06: One C ABI, thin idiomatic wrappers per language
@@ -37,8 +37,9 @@ templates specialised per element type and cached per pipeline. Cost: ~100 ms fi
 ## 2026-09-06: Page-aligned, pooled buffers via `posix_memalign` + `makeBuffer(bytesNoCopy:)`
 Metal sub-allocates small `makeBuffer(length:)` buffers from a heap, so they are not page aligned and cannot
 be re-wrapped zero-copy by another Metal consumer. Own allocation guarantees alignment. A size-bucketed pool
-avoids mmap and page-fault costs on repeated allocations, which cut element-wise kernel times by 2x to 3x
-(round 2 in docs/BENCHMARKS.md, Apple M4 Max, 2026-09-06).
+avoids mmap and page-fault costs on repeated allocations, which cut the write-heavy kernels' times between round 1
+and round 2 in docs/BENCHMARKS.md (Apple M4 Max, 2026-09-06): multiply 6.84 → 2.13 ms, filter 5.36 → 2.90,
+cast 5.04 → 3.14, take 8.09 → 5.85.
 Kernel outputs that are fully written skip zeroing.
 
 ## 2026-09-06: Reductions without atomics

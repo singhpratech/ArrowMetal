@@ -202,7 +202,8 @@ went from 108,781 to 168,190 iterations in 12 s (110 µs → 71 µs per op).
 ## 6. Measured per-op latency
 
 Same standalone harness against the release library, median of 200, quiet machine. "before" is
-`main` at cffdf50; "after" is this branch.
+the library with `lowLatencyWait = false` and the eager MSL string build; "after" is 0.1.0.
+`ARROWMETAL_LOW_LATENCY=0` reproduces the event-wait half only; the lazy MSL build has no runtime switch.
 
 | rows | op | before | after | Δ | 1 CPU core | 16 CPU cores |
 |---:|---|---:|---:|---:|---:|---:|

@@ -30,7 +30,6 @@ Strings and sorting
   (large_utf8 narrowed on import).
 - GPU LSD radix sort: `argsort`, `sorted`, `MetalRecordBatch.sorted(by:)`; stable, nulls last by default
   (`null_placement` puts them at either end), IEEE total order.
-- GPU LSD radix sort: `argsort`, `sorted`, `MetalRecordBatch.sorted(by:)`; stable, nulls last, IEEE total order.
   The nulls are partitioned out before the sort rather than lifted out of the permutation afterwards, and
   `sorted()` rebuilds the values from the sort's own keys instead of gathering them through it.
 - `topK` for any k: a GPU radix select (digit histogram over the order-preserving key, one compaction pass
@@ -172,7 +171,7 @@ Out-of-core streaming
   a HyperLogLog `count_distinct_approx` (0.0073 % error on 570M rows) and a t-digest quantile. On a
   30.21 GB IPC directory: filter + sum in 0.53 s (ties Polars' 0.515), the approximate count-distinct
   7.2x faster than Polars (0.532 s against 3.825) on 8.8 GB of peak RSS against Polars' 17.0; top-k,
-  sort + limit and joins are slower than Polars and DuckDB and say so in §9.
+  sort + limit and joins are rows where Polars and DuckDB are ahead, and §9 says so.
 
 Integrations
 - Polars (docs/POLARS.md): a zero-copy bridge with `.arrowmetal` namespaces on Series/DataFrame/LazyFrame,
@@ -195,12 +194,12 @@ Integrations
 Bindings
 - libArrowMetalC C ABI (include/arrowmetal.h) and python/arrowmetal ctypes package (Arrow PyCapsule protocol).
 - Four language bindings over that ABI, each with its own suite: `rust/` (`arrowmetal` + `arrowmetal-sys`,
-  48 tests and 4 `no_run` doc-tests, docs/RUST.md), `go/arrowmetal` (46 test functions, docs/GO.md),
+  48 tests and 4 `no_run` doc-tests, docs/RUST.md), `go/arrowmetal` (45 test functions and one runnable example, docs/GO.md),
   `node/` (N-API addon, 62 tests, docs/TYPESCRIPT.md) and `r/arrowmetal` (266 testthat expectations over
   the 34 header entry points it wraps, docs/R.md).
 - `python/build_wheel.sh` packages that ctypes package as a macOS arm64 wheel with the dylib bundled in
   `arrowmetal/_lib/`, so an install needs no Swift toolchain; extras `polars`, `duckdb`, `pandas`, `test`.
-  The publication steps are in docs/RELEASE.md; the wheel is not on PyPI yet.
+  The publication steps are in docs/RELEASE.md (step 4 is the PyPI upload).
 
 Fixed
 - `GroupByKeys._agg` in the Python package took the device handle of a temporary `MetalArray` that was
@@ -302,7 +301,7 @@ Quality
 - 2026-09-07: the published baseline is now that parallel one (`Benchmarks/results/full_matrix_2026-09-07-parallel.csv`,
   cores per idiom in `full_matrix_2026-09-07-parallel_cores.txt`: Polars lazy a median of 11.5 cores, pyarrow through
   Acero 11.1, the eager idioms 1.0 on most families). Of 339 measured rows: **145 at or above 3x, 102 between 1x and
-  3x, 77 slower than the fastest CPU idiom, 15 with no CPU equivalent** — against the eager idioms alone the same
+  3x, 77 where the fastest CPU idiom is ahead, 15 with no CPU equivalent** — against the eager idioms alone the same
   build read 247 / 62 / 15 / 15, and that CSV (`full_matrix_2026-09-07.csv`) is kept. Ten ArrowMetal rows a
   regression check flagged were re-measured on a quieter machine and eight spliced in place, each saying so in its
   `note`. docs/BENCHMARKS_MATRIX.md, docs/BENCHMARKS.md, docs/TO_IMPROVE.md and the README are written against the

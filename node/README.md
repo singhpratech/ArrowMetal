@@ -147,8 +147,8 @@ Reading the tables:
 * **On these two operations at this size ArrowMetal is ahead in every row.** The measured pair is
   the end-to-end `sum` at 2.02 ms median against the plain loop's 16.47, and the end-to-end
   `filter` at 3.92 against 8.44. The small-array crossover is not measured here.
-* An earlier single-process run put `filter` end to end at 8.62 ms against 9.77 ms and called it a
-  1.13x win. That was inside the noise; the claim is withdrawn and this table replaces it.
+* A single process's best-of-5 is not a stable measurement here, which is why the table reports the
+  spread over five processes.
 
 Numbers are from one machine on one day. `node bench/spread.mjs` re-runs it.
 

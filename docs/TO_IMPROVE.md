@@ -33,7 +33,7 @@ place — their `note` column says so, and the log is
 over a column in unified memory is a fast, well-engineered thing to be, and on a single pass over a
 single column it reaches the same memory the GPU reads at close to the same rate. 28 of the 77 are
 that: a memory-bound single pass, where neither side has a 3x to give. 16 more are fixed cost — a Metal command
-buffer costs 110–230 µs as a per-call floor (the matrix's latency family, 2026-09-07 parallel run), so below about a million rows the dispatch is the
+buffer costs 110–160 µs per call for sum and filter at 1,000 rows (the matrix's latency family, 2026-09-07 parallel run), so below about a million rows the dispatch is the
 operation. The other 33 are three operations that do more arithmetic per element than hardware doubles
 do, one that never reaches the GPU at all, the rows where the CPU library returns a view and
 ArrowMetal materialises a column, and the causes named below. They are the rows where
@@ -61,8 +61,9 @@ change that.
 | slice_codeunits [5:10] | 1,000,000 | 1.27 ms | pyarrow Acero 0.86 ms | 11.0 | 0.68x |
 | split_pattern("_") | 1,000,000 | 3.36 ms | pyarrow Acero 2.40 ms | 11.3 | 0.72x |
 
-A Metal dispatch costs 110–230 µs of command-buffer creation, encoding, commit and completion wait
-before the first byte is touched ([RESIDENT.md](RESIDENT.md): an empty round trip is 60–70 µs; round 4 measured ~116 µs), and the
+A Metal dispatch costs 110–160 µs of command-buffer creation, encoding, commit and completion wait
+before the first byte is touched (sum and filter at 1,000 rows in the matrix's latency family;
+[RESIDENT.md](RESIDENT.md): an empty round trip is 60–70 µs; round 4 measured ~116 µs), and the
 cheapest dispatch in this CSV — `sum(int64)` over a thousand values — is 0.11 ms, which is that floor
 and nothing else. Nine of these rows are the latency family, which exists to measure exactly this.
 
@@ -123,7 +124,8 @@ these rows.
 
 Two rows in the table are further behind than the rest and the matrix names why:
 `replace_with_mask` at 0.36–0.39x is three passes here — the mask's prefix sum, a gather of the
-replacements, then the merge — where pyarrow fuses them into one streaming pass over the column.
+replacements, then the merge — where the Polars lazy idiom (`when/then/otherwise` over the mask) is
+one streaming pass over the column.
 `power (float32 ** 2)` is 0.44x at 10M (74.8 GB/s against the CPU idiom's 170) and 0.95x at 50M
 (210 against 220).
 
@@ -369,7 +371,7 @@ causes. The morning run of the same day
 | group-by sum (1000 keys) | 1,000 | 0.80 ms | 0.08 ms (pandas) | 0.09x |
 | group-by sum (1000 keys) | 100,000 | 0.93 ms | 0.35 ms (pandas) | 0.38x |
 
-A Metal dispatch costs 110–230 µs before the first byte is touched: command-buffer creation,
+A Metal dispatch costs 110–160 µs before the first byte is touched: command-buffer creation,
 encoding, commit and the completion wait.[^round4floor] A CPU library sums a thousand integers in a fraction of a
 microsecond. Below about a million rows the GPU cannot win a single operation, and this page will
 always carry these rows. What helps: batching several operations into one command buffer
@@ -380,8 +382,9 @@ remove it is impossible on this hardware ([RESIDENT.md](RESIDENT.md)).
 
 [^round4floor]: This section previously read 60–140 µs, the range taken from the round-4 latency
     measurements in [BENCHMARKS.md](BENCHMARKS.md) (empty kernel encode + commit + wait, ~116 µs; the
-    per-call GPU sum and filter costs there are 136–167 µs at small sizes). 110–230 µs is the figure
-    the rest of this page and [DESIGN.md](DESIGN.md) use, and it is the one that applies here.
+    per-call GPU sum and filter costs there are 136–167 µs at small sizes). 110–160 µs (sum and filter at
+    1,000 rows in the matrix's latency family, 2026-09-07 parallel run) is the figure the rest of this
+    page uses, and it is the one that applies here.
 
 #### 2. `shift` as a copy (4 comparisons)
 
@@ -503,7 +506,7 @@ The full list is in the matrix page under ⚠️. The clusters:
   Both sides run at unified-memory bandwidth; the GPU's edge is the dispatch overhead it does not pay
   per thread. Fusing them into one expression (`am.query`) is where the 3x comes from, not from the
   single kernel; even so `filter two columns + sum` at 10M rows is 2.2x over Polars (6x at 50M).
-- **`sort float64`** at 2.67x over Polars, both sizes, in the matrix. `argsort` of the same column is
+- **`sort float64`** at 2.7x over Polars, both sizes, in the matrix. `argsort` of the same column is
   10x; the difference was the `take` that materialised the sorted values (a random 8-byte gather).
   That gather is gone — the sorted values now come out of the sort's own keys — and the row is
   **6.503 ms at 10M and 31.948 ms at 50M** when measured on its own (the last section of this page),
@@ -530,7 +533,7 @@ slower — counting a row as moved when its ArrowMetal wall time changed by more
 | tdigest(float64, q=0.5) | 50,000,000 | 2,836 ms | 48.5 ms | 1,061 ms (pyarrow) | 21.9x |
 | sum by two int32 keys (~1024 groups) | 50,000,000 | 22.7 ms | 6.0 ms | 22.9 ms (pyarrow) | 3.8x |
 | argsort int64 | 50,000,000 | 128 ms | 39.2 ms | 301 ms (Polars) | 7.7x |
-| argsort float64 | 50,000,000 | 129 ms | 40.0 ms | 429 ms (Polars) | 10.8x |
+| argsort float64 | 50,000,000 | 129 ms | 40.0 ms | 429 ms (Polars) | 10.7x |
 | lexsort (2 int32 keys) | 50,000,000 | 149 ms | 37.4 ms | 912 ms (Polars) | 24x |
 | argsort utf8 | 10,000,000 | 60.8 ms | 13.7 ms | 234 ms (Polars) | 17x |
 | sort float64 | 50,000,000 | 139 ms | 49.6 ms | 132 ms (Polars) | 2.67x |
@@ -538,8 +541,9 @@ slower — counting a row as moved when its ArrowMetal wall time changed by more
 | upper / lower / trim | 10,000,000 | 52–55 ms | 5.2–5.4 ms | 139–173 ms (pyarrow / pandas) | 27–32x |
 | list_value_length | 10,000,000 | 1.12 ms | 0.37 ms | 0.71 ms (pyarrow) | 1.9x |
 
-Ten of the 13 slower rows are at 10M rows, one at 1M (`to_strings`, 1.21x) and two at 50M (`min` and
-`mean` of int64 with 10% nulls, 1.16x and 1.11x on calls of about a millisecond); none is above 1.7x.
+Ten of the 15 slower rows are at 10M rows, one at 1M (`to_strings`, 1.21x), two at 50M (`min` and
+`mean` of int64 with 10% nulls, 1.16x and 1.11x on calls of about a millisecond) and two are `any` and
+`all` of bool at 50M, 0.0012 → 0.0014 ms; none is above 1.7x.
 Where the slower row is at 10M, the 50M row of the same operation is unchanged (`partition_nth_indices`
 4.9 → 8.0 ms at 10M against 19.8 ms unchanged at 50M; `max by int32 key` 2.65 → 3.85 ms against
 9.87 ms unchanged; the rest are 1.1–1.5x on values of 1–4 ms in kernels the two changes did not touch:
@@ -648,7 +652,7 @@ dropped: the first histogram reports the bitwise OR and AND of the keys next to 
 loses most of its passes. Every permutation is unchanged — checked against `pc.array_sort_indices` over
 21 lengths × 2 directions × 2 null placements × 10 key shapes.
 
-The "fewer, wider digits" line above was the wrong guess, and it was measured rather than assumed away:
+The "fewer, wider digits" line above was the wrong guess, and the measurement says so:
 eleven bits do take a 64-bit key in six passes instead of eight, but a 2048-bin scatter needs 24 KB of
 threadgroup memory against 3 KB, and the occupancy that costs is worth more than the two passes it
 saves. Argsort of 50M int64, same code, digit width only: 8 bits 37.7 ms, 10 bits 84.3 ms, 11 bits
@@ -664,7 +668,7 @@ the key kernel does not raise yet. That is the next step, and unlike the last on
 
 **`shift`.** The copy is unchanged and is still the default, because it was never the thing that was
 wrong: 3.6 ms for the 800 MB it touches at 50M rows is 220 GB/s, rather
-more than the sqrt kernel next to it reaches, so a better kernel would still be fifty times slower than
+more than the sqrt kernel next to it reaches, so a better kernel would still be fifty times behind
 a pointer. What was missing was the option not to copy. `shift(by, fill, view=True)` in Python returns
 a `pyarrow.ChunkedArray` of two chunks — |by| rows of `fill` or of nulls in front, and a slice of the
 input behind, still pointing at the same device memory — and moves nothing, which is exactly the answer
@@ -773,7 +777,7 @@ and the sum hands back the accumulator's buffer with a GPU-built bitmap. `d_from
 rounded, so the quotient is bit for bit the host division's — checked over 1,762,240 group means
 across all eight integer element types, 0% and 10% value nulls, five row counts and five group counts,
 with zero differing bit patterns. Putting the accumulation and those finalizing kernels in one command
-buffer rather than three matters too: a command buffer is 110–230 µs before it does any work, which is
+buffer rather than three matters too: a command buffer is 110–160 µs before it does any work, which is
 nothing next to a 50-million-row pass and most of a group-by over a million rows.
 
 | operation, 1,000 groups | rows | before | after | pyarrow | before | after |
