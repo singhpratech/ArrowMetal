@@ -39,7 +39,7 @@ the CPU idiom is ahead — is in [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MAT
   [`docs/TESTING.md`](docs/TESTING.md)
 - **Seven languages on one C ABI** — Swift, Python, C, Rust, Go, TypeScript and R, each binding with its
   own suite against that language's Arrow library. [`docs/README.md`](docs/README.md)
-- **17 findings in other projects** — pyarrow, Apple Metal, the Arrow JS, R and Go libraries, and the
+- **18 findings in other projects** — pyarrow, Apple Metal, the Arrow JS, R and Go libraries, and the
   Swift compiler — each with the evidence behind it and where its report stands.
   [`docs/UPSTREAM.md`](docs/UPSTREAM.md)
 

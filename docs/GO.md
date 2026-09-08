@@ -229,6 +229,13 @@ above are not per-core figures.
   has for this and it is what the Sum row compares against, because **arrow-go's compute package
   registers no aggregate function at all** — no `sum`, `mean` or `min_max` in its registry.
   `TestArrowGoHasNoAggregates` records this and will log a nudge if a later release adds them.
+  Reported as [apache/arrow-go#1296](https://github.com/apache/arrow-go/issues/1296); the
+  maintainer asked for the kernels, and a design note with a tested prototype of `sum`, `mean`,
+  `min_max`, `min`, `max`, `count`, `any` and `all` is on that issue (the research behind it is
+  Round 10 in [FINDINGS.md](FINDINGS.md)). Two documentation pull requests from the same work,
+  [#1302](https://github.com/apache/arrow-go/pull/1302) on allocator alignment and
+  [#1303](https://github.com/apache/arrow-go/pull/1303) on what the compute registry holds, were
+  merged the day they were opened.
 - The plain Go filter loop writes into a `[]int64` rather than building an `arrow.Array`, so it is
   doing strictly less work than the other two Filter rows. It is included because it is what a Go
   programmer writes when they have not reached for Arrow yet.
