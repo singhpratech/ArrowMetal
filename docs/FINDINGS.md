@@ -718,12 +718,7 @@ Importing pyarrow buffers is one memcpy: pyarrow's allocator is 64-byte aligned,
 - Division by zero defined as 0 in the GPU kernels and the CPU reference; `Int.min / -1` wraps.
 - The threadgroup-privatised group-by.
 
-## Background
-
-Reference material rather than investigations: what the ecosystem offers, what the toolchain does,
-and what the hardware gives a kernel.
-
-### Ecosystem research (2026-09-06)
+## Ecosystem research (2026-09-06)
 
 **TL;DR**
 
@@ -743,7 +738,7 @@ and what the hardware gives a kernel.
 - The Arrow C Device Data Interface defines `ARROW_DEVICE_METAL = 8` and expects `MTLEvent*` as
   `sync_event`.
 
-### Toolchain
+## Toolchain
 
 **TL;DR**
 
@@ -776,7 +771,7 @@ and what the hardware gives a kernel.
 - `posix_memalign` memory is not zero for small blocks (recycled heap); only fresh mmap pages are
   zero.
 
-### Metal: what the M4 Max gives a kernel
+## Metal: what the M4 Max gives a kernel
 
 **TL;DR**
 
