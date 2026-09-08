@@ -74,7 +74,7 @@ enum TDigestGPU {
     /// `filter` is stable, so equal keys keep their relative order and the sorted result is identical
     /// element for element.
     ///
-    /// The numbers are the "tdigest workaround" paragraph of `docs/LOSSES.md`, which names the file
+    /// The numbers are the "tdigest workaround" paragraph of `docs/TO_IMPROVE.md`, which names the file
     /// they were recorded in.
     static func strippedOfNulls<T: ArrowPrimitive>(_ a: MetalArray<T>) throws -> MetalArray<T> {
         guard a.nullCount > 0 else { return a }

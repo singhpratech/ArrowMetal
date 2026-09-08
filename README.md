@@ -4,9 +4,6 @@
 understand Arrow's layout natively: validity bitmaps, packed booleans, the C Data Interface and the
 C Device Data Interface (`ARROW_DEVICE_METAL`).
 
-> Status: 0.1.0. The core works, is tested against pyarrow on 39,069 differential cases and a CPU oracle, and is benchmarked on every operation.
-> Everything on the [roadmap](docs/ROADMAP.md) is up for grabs.
-
 ## The pitch in one paragraph
 
 Every array is Arrow layout in memory the GPU already shares, so there is nothing to upload. Gathers,
@@ -17,8 +14,27 @@ rest of the application: every table here reports CPU time per operation next to
 same rows cost 26 to 1,284 CPU-ms on the other side against one or two here. Chains of operations
 share one GPU round trip. The whole thing is reachable from Swift, Python, and any language with Arrow
 bindings through one C ABI. The full distribution over all 339 measured rows — including the 77 that
-are still slower — is in [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MATRIX.md) and
-[docs/LOSSES.md](docs/LOSSES.md).
+the CPU idiom is ahead — is in [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MATRIX.md) and
+[docs/TO_IMPROVE.md](docs/TO_IMPROVE.md).
+
+## Measured, not claimed
+
+- **339 benchmark rows over 173 operations against four CPU libraries at their most parallel idiom** —
+  Polars' lazy engine, pyarrow's Acero, pandas and numpy on an idle M4 Max, with the cores each call
+  used recorded beside it. 145 rows at or above 3x, 102 between 1x and 3x, 77 where the CPU idiom is
+  ahead, 15 with no CPU equivalent; each of the 77 has its cause written down.
+  [`docs/BENCHMARKS_MATRIX.md`](docs/BENCHMARKS_MATRIX.md), [`docs/TO_IMPROVE.md`](docs/TO_IMPROVE.md)
+- **307 of Apache Arrow v25's 307 compute function names** — 283 on the GPU, 17 on the host, 7 with a
+  stated limitation. The table is generated from a registry the test suite executes against
+  `pyarrow.compute`. [`docs/ARROW_FUNCTIONS.md`](docs/ARROW_FUNCTIONS.md)
+- **39,069 differential cases against pyarrow over 45 column types**, 769 Swift tests against a CPU
+  oracle and 2,452 Python cases, all run in release before anything is pushed.
+  [`docs/TESTING.md`](docs/TESTING.md)
+- **Seven languages on one C ABI** — Swift, Python, C, Rust, Go, TypeScript and R, each binding with its
+  own suite against that language's Arrow library. [`docs/README.md`](docs/README.md)
+- **17 findings in other projects, each with a reproduction in this repository** — pyarrow, Apple
+  Metal, the Arrow JS, R and Go libraries, and the Swift compiler — tracked with where each report
+  stands. [`docs/UPSTREAM.md`](docs/UPSTREAM.md)
 
 ## Why this exists
 
@@ -47,13 +63,13 @@ and [Benchmarks/README.md](Benchmarks/README.md).
 **Called from Python, same in-process data.** Every CPU library is measured twice — its plain eager
 idiom, and the most parallel idiom it has for the same answer: `polars-lazy` through `pl.LazyFrame` on
 the in-memory or streaming engine, `pyarrow-threaded` through an Acero plan over 16 record batches
-(pandas has no parallel idiom; numpy's ufuncs are single-threaded). The baseline below is the **fastest
+(pandas' threaded paths, numexpr and numba, were not installed for this run; numpy's ufuncs are single-threaded). The baseline below is the **fastest
 of all of them**, named, with the cores that call actually used (its CPU-ms over its wall ms). Every
 row is taken from `Benchmarks/results/full_matrix_2026-09-07-parallel.csv`, the raw output behind
 [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MATRIX.md); the eager-only run of the same build is kept
 beside it as `full_matrix_2026-09-07.csv`. Wall time in milliseconds, with the CPU time each call
-consumed in parentheses. The last three rows are losses, and they are here for the same reason the
-first seven are:
+consumed in parentheses. The last three rows are ones the CPU idiom wins, on the same footing as the
+seven above:
 
 | Operation | Rows | ArrowMetal ms (CPU-ms) | fastest CPU idiom | its ms (CPU-ms) | its cores | speedup |
 |---|---:|---:|---|---:|---:|---:|
@@ -99,8 +115,8 @@ above 3x. **Where it does not, it mostly ties:** a single pass that reads one co
 memory bound on both sides, and eleven to fifteen cores reach the same unified memory the GPU does, so
 there is no 3x on that shape for anybody.
 
-**Across all 339 rows the verdicts are 145 at or above 3x, 102 between 1x and 3x, 77 slower than the
-fastest CPU idiom, and 15 with no CPU equivalent.** The 77 are concentrated where you would expect
+**Across all 339 rows the verdicts are 145 at or above 3x, 102 between 1x and 3x, 77 where the
+fastest CPU idiom is ahead, and 15 with no CPU equivalent.** The 77 are concentrated where you would expect
 them: 17 element-wise and 11 compare+select rows that are bandwidth ties, 13 string rows (ten of them
 at a million rows, where the fixed cost per call is the operation; seven of those ten are wins at ten
 million), 10
@@ -108,14 +124,14 @@ temporal rows where a calendar conversion is arithmetic per element rather than 
 9 latency rows that exist to measure the dispatch floor, the software binary64 transcendentals,
 which cost forty-odd emulated operations per element on a GPU with no double hardware, and 17 more
 spread across chains, sort, decimal, reductions, window and group-by — including `shift (lag 1)` at
-0.01x, the worst non-latency loss in the matrix. Every one of
-them is listed with its cause and with what would change it in [docs/LOSSES.md](docs/LOSSES.md), and
+0.01x, the widest gap in the matrix outside the latency rows. Every one of
+them is listed with its cause and with what would change it in [docs/TO_IMPROVE.md](docs/TO_IMPROVE.md), and
 [docs/DESIGN.md](docs/DESIGN.md) has the pipelining plan for the dispatch floor.
 
 ## From Python
 
-Two ways to install, both from this checkout. ArrowMetal is **not on PyPI yet**: publishing 0.1.0 is a
-release-time step the maintainer performs, and [docs/RELEASE.md](docs/RELEASE.md) is the checklist for it.
+Two ways to install, both from this checkout; the PyPI upload of 0.1.0 is step 4 of
+[docs/RELEASE.md](docs/RELEASE.md).
 
 ```
 # From source (needs the Swift toolchain)

@@ -1,4 +1,4 @@
-"""Per-operation timings for the four rows this branch attacks in docs/LOSSES.md.
+"""Per-operation timings for the four rows this branch attacks in docs/TO_IMPROVE.md.
 
 `full_matrix.py` measures 946 comparisons and needs the machine to itself for half an hour. This
 script measures one operation at a time, with the same methodology (one warm-up, best of five, the

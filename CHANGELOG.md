@@ -16,7 +16,7 @@ Core
   accumulation already produced and divides on the GPU, and `hash_sum` returns the accumulator's own
   buffer with a GPU-built validity bitmap instead of a host loop. Same ids, same answers to the bit;
   `sum` by int32 key at 50M rows and a thousand groups went 8.75 -> 4.81 ms and `mean` 9.78 -> 4.80 in
-  the A/B run recorded in docs/LOSSES.md; the published matrix reads 4.89 and 4.91 ms for those cells.
+  the A/B run recorded in docs/TO_IMPROVE.md; the published matrix reads 4.89 and 4.91 ms for those cells.
 - MetalRecordBatch with filter/take/slice/selecting; struct (+s) C Data import/export; ArrowArrayStream import.
 - Batched execution (`MetalContext.batch { }`) and its non-blocking form: `batchAsync` (Swift `async`
   and completion-handler), with `MetalArray.sumAsync`/`meanAsync` for scalars, so the calling thread is
@@ -101,7 +101,7 @@ Grouped aggregation and windows
   then a histogram over the group ids of the occupied slots — instead of a dictionary encoding, a packed
   int64 column and a `unique()` over it. 7.1 ms at 10M rows and 41.8 ms at 50M for a thousand groups,
   and 7.3 ms at 10M for a hundred thousand — 60.7 ms at 50M rows and ten million groups is the worst
-  case (docs/LOSSES.md).
+  case (docs/TO_IMPROVE.md).
 - Several integer key columns whose ranges multiply out to at most 2^24 (and at most the row count) are
   packed into one key in a single pass instead of folded pairwise through a range encoding each. The
   dense ids are the fold's own, value for value, so the group order is unchanged.
@@ -229,7 +229,7 @@ Fixed
   and the passes are planned around the value block rather than the column. `sort float64` with 10%
   nulls 139.745 -> 6.837 ms at 10M rows and 725.935 -> 33.669 ms at 50M; with 50% nulls at 50M,
   3,436.130 -> 22.879 ms. (Every figure in these two bullets and in the matching section of
-  docs/LOSSES.md comes from one set of runs, recorded with the scripts that produced it: the 10% rows
+  docs/TO_IMPROVE.md comes from one set of runs, recorded with the scripts that produced it: the 10% rows
   and the plain sorts from the matrix-conditions harness, the 50% row from the shape sweep. LOSSES
   names the file each one is in.)
 - `partition_nth_indices` split the column around the selected key with three `compare` + `filter`
@@ -305,8 +305,8 @@ Quality
   3x, 77 slower than the fastest CPU idiom, 15 with no CPU equivalent** — against the eager idioms alone the same
   build read 247 / 62 / 15 / 15, and that CSV (`full_matrix_2026-09-07.csv`) is kept. Ten ArrowMetal rows a
   regression check flagged were re-measured on a quieter machine and eight spliced in place, each saying so in its
-  `note`. docs/BENCHMARKS_MATRIX.md, docs/BENCHMARKS.md, docs/LOSSES.md and the README are written against the
-  parallel baseline; the 77 slower rows are grouped by measured cause in docs/LOSSES.md, each with what would
+  `note`. docs/BENCHMARKS_MATRIX.md, docs/BENCHMARKS.md, docs/TO_IMPROVE.md and the README are written against the
+  parallel baseline; the 77 rows to improve are grouped by measured cause in docs/TO_IMPROVE.md, each with what would
   change it.
 - Adversarial review pass before release (four independent reviewers over the integrations, the engine and
   expression compiler, the GPU kernels, and the C ABI and Parquet reader): every finding carries a

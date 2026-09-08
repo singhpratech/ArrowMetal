@@ -7,7 +7,7 @@ which asserts each claim in the first two sections on every run. That CSV is the
 numpy rows quoted below are numpy's plain eager idiom; the published baseline is the parallel run in
 `Benchmarks/results/full_matrix_2026-09-07-parallel.csv`, which measures each CPU library's most
 parallel idiom too (numpy has none, so its `numpy-parallel` column is empty), and
-[BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md) and [LOSSES.md](LOSSES.md) are written against it.
+[BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md) and [TO_IMPROVE.md](TO_IMPROVE.md) are written against it.
 
 ## 1. The crossing
 
@@ -91,7 +91,7 @@ Two readings. numpy runs every one of these on one core, which is the honest sha
 this is one CPU core against the GPU, and the crossing is free because the memory is shared; a 16-thread
 CPU library is the other comparison, and it is on the same Compare tab. And the transcendentals are the
 narrow rows: `ln` at 1.1x and `sin` at 2.0x are software binary64 on a GPU with no double hardware against
-a vectorised libm, and they are listed in [LOSSES.md](LOSSES.md) as open work.
+a vectorised libm, and they are listed in [TO_IMPROVE.md](TO_IMPROVE.md) as open work.
 
 ## 4. The step that would matter, and it is ours to take
 

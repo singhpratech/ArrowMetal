@@ -350,49 +350,53 @@ the same grammar for C consumers.
 
 ## Numbers
 
-M4 Max, 50 M rows, best of 5, in process, against Polars 1.44 lazy (16 threads) and DuckDB 1.5
-(16 threads) on the same Arrow buffers. `Benchmarks/engine_bench.py`. "CPU ms" is process CPU time over
+M4 Max, 50 M rows, best of 5, in process, against Polars 1.44.1 lazy (16 threads) and DuckDB 1.5.5
+(16 threads) on the same Arrow buffers. `Benchmarks/engine_bench.py`; recorded in
+`Benchmarks/results/engine_bench_50000000_2026-09-07.txt`. "CPU ms" is process CPU time over
 the same run: it is what the query cost the machine, next to what it cost the caller in latency.
 
 | case | implementation | wall ms | CPU ms | vs ArrowMetal |
 |---|---|---:|---:|---:|
-| **(a)** `sum(amount), count(*)` where `region < 20 and qty > 10` | **ArrowMetal lazy** | **2.54** | 1.0 | — |
-| | polars lazy | 16.41 | 26.4 | 6.5x |
-| | duckdb | 194.79 | 197.9 | 77x |
-| **(b)** group-by 200 keys, `sum` + `count`, order by total desc limit 10 | **ArrowMetal lazy** | **15.11** | 4.2 | — |
-| | polars lazy | 43.04 | 211.6 | 2.8x |
-| | duckdb | 702.05 | 992.0 | 46x |
-| **(c)** group-by `(region, sub)`, 10 000 groups, `mean` + `max` | **ArrowMetal lazy** | **129.01** | 7.4 | — |
-| | polars lazy | 256.76 | 2464.0 | 2.0x |
-| | duckdb | 583.10 | 1164.9 | 4.5x |
-| **(d)** `(amount*2 + qty) / (region + 1) - qty`, then filter | **ArrowMetal lazy (1 fused kernel)** | **4.82** | 0.8 | — |
-| | polars lazy | 210.59 | 210.5 | 44x |
-| | duckdb | 351.14 | 353.2 | 73x |
-| **(e)** inner join 10M x 1M on int64, then `sum` | **ArrowMetal lazy** | **6.44** | 1.2 | — |
-| | polars lazy | 30.95 | 234.7 | 4.8x |
-| | duckdb | 191.97 | 361.2 | 30x |
-| **(f)** semi join 10M against a 1 000-row key set | **ArrowMetal lazy** | **3.35** | 1.3 | — |
-| | polars lazy | 5.74 | 42.4 | 1.7x |
-| | duckdb | 7.92 | 9.7 | 2.4x |
-| **(g)** `row_number() over (partition by g order by v)`, 10M rows, 1 000 partitions | **ArrowMetal lazy** | **66.96** | 10.5 | — |
-| | polars lazy | 139.89 | 741.3 | 2.1x |
-| | duckdb | 632.91 | 2301.1 | 9.5x |
-| **(h)** as-of join 50M trades against 1M quotes | **ArrowMetal lazy** | **16.53** | 3.4 | — |
-| | polars | 195.14 | 194.3 | 12x |
-| | duckdb | not finished in 600 s (off by default; set `AM_BENCH_DUCKDB_ASOF=1`) | | |
+| **(a)** `sum(amount), count(*)` where `region < 20 and qty > 10` | **ArrowMetal lazy** | **2.19** | 0.6 | — |
+| | polars lazy | 15.60 | 24.9 | 7.1x |
+| | duckdb | 171.28 | 174.5 | 78x |
+| **(b)** group-by 200 keys, `sum` + `count`, order by total desc limit 10 | **ArrowMetal lazy** | **11.80** | 3.5 | — |
+| | polars lazy | 28.56 | 171.3 | 2.4x |
+| | duckdb | 602.71 | 850.0 | 51x |
+| **(c)** group-by `(region, sub)`, 10 000 groups, `mean` + `max` | **ArrowMetal lazy** | **18.58** | 3.5 | — |
+| | polars lazy | 201.17 | 2305.4 | 11x |
+| | duckdb | 469.87 | 940.9 | 25x |
+| **(d)** `(amount*2 + qty) / (region + 1) - qty`, then filter | **ArrowMetal lazy (1 fused kernel)** | **4.72** | 0.6 | — |
+| | polars lazy | 198.97 | 199.0 | 42x |
+| | duckdb | 307.42 | 310.4 | 65x |
+| **(e)** inner join 10M x 1M on int64, then `sum` | **ArrowMetal lazy** | **6.27** | 1.0 | — |
+| | polars lazy | 22.40 | 194.2 | 3.6x |
+| | duckdb | 127.34 | 241.5 | 20x |
+| **(f)** semi join 10M against a 1 000-row key set | **ArrowMetal lazy** | **3.50** | 1.3 | — |
+| | polars lazy | 3.06 | 33.6 | 0.9x |
+| | duckdb | 5.59 | 7.1 | 1.6x |
+| **(g)** `row_number() over (partition by g order by v)`, 10M rows, 1 000 partitions | **ArrowMetal lazy** | **17.24** | 5.2 | — |
+| | polars lazy | 101.34 | 644.4 | 5.9x |
+| | duckdb | 440.32 | 1727.4 | 26x |
+| **(h)** as-of join 50M trades against 1M quotes | **ArrowMetal lazy** | **13.27** | 2.9 | — |
+| | polars | 152.76 | 152.9 | 12x |
+| | duckdb | not run (off by default; set `AM_BENCH_DUCKDB_ASOF=1`) | | |
 
 Reading it: the widest margins are where the operator count is high relative to the bytes moved — (d)
-is six operators over four columns and 44x, (a) is a filter plus a reduction and 6.5x — and where the
-work is a scan the GPU does in one pass, like (h)'s binary search. The narrowest are (f), which is
-bound by writing 10M output rows, and (c), where 10 000 groups times two aggregates is atomics bound.
+is six operators over four columns and 42x, (a) is a filter plus a reduction and 7.1x — and where the
+work is a scan the GPU does in one pass, like (h)'s binary search. The narrowest is (f), where Polars
+is actually **ahead** — 3.06 ms against ArrowMetal's 3.50 — because the case is bound by writing 10M
+output rows rather than by compute; (b) at 2.4x is the next narrowest.
 
-The CPU column is the other half of the story: ArrowMetal's queries cost the machine 1 to 10 ms of CPU
-where Polars spends 26 to 2464 ms and DuckDB 10 to 2301 ms across 16 threads. A query that costs 7 CPU-ms
-instead of 2.5 CPU-seconds leaves the cores free for whatever else the process is doing.
+The CPU column is the other half of the story: ArrowMetal's queries cost the machine 0.6 to 5.2 ms of
+CPU where Polars spends 24.9 to 2305.4 ms and DuckDB 7.1 to 1727.4 ms across 16 threads. Case (c) at
+3.5 CPU-ms instead of Polars' 2.3 CPU-seconds leaves the cores free for whatever else the process is
+doing.
 
 Below about 1M rows the fixed cost dominates and the GPU is the wrong tool; at 2M rows on the same
-machine (a) is 0.59 ms against Polars' 0.81 ms and (f) is 3.58 ms against Polars' 1.15 ms. The crossover
-for these shapes is between 1M and 5M rows.
+machine (`Benchmarks/results/engine_bench_2000000_2026-09-07.txt`) (a) is 0.57 ms against Polars'
+0.63 ms and (f) is 2.52 ms against Polars' 1.23 ms. The crossover for these shapes is between 1M and
+5M rows.
 
 
 ## Limits

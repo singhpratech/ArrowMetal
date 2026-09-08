@@ -174,7 +174,7 @@ The marketing site is built from a working directory that is deliberately git-ig
 this repository. Its facts file separates figures the build script computes from the repository on every
 build from figures typed by hand; the build script prints the hand-typed ones as a **RELEASE CHECK** list
 precisely so that they get re-verified at a release. Run the site build, read that list, and confirm every
-figure on it against the document it cites — the benchmark matrix, the coverage tables, the losses list —
+figure on it against the document it cites — the benchmark matrix, the coverage tables, the to-improve list —
 before the site goes live. Any figure that no longer matches gets corrected in the facts file, never in the
 page templates.
 
@@ -204,7 +204,7 @@ repository is public. The claude.ai preview is a separate copy and is never the 
 ## 9. Numbers to re-run before announcing
 
 Benchmark tables name the machine they were measured on, and the README quotes them. Re-run on the
-release machine and update `docs/BENCHMARKS.md`, `docs/BENCHMARKS_MATRIX.md` and `docs/LOSSES.md` if any
+release machine and update `docs/BENCHMARKS.md`, `docs/BENCHMARKS_MATRIX.md` and `docs/TO_IMPROVE.md` if any
 headline moved:
 
 ```

@@ -1,7 +1,7 @@
 # Roadmap
 
 What comes after 0.1.0, in the order it is likely to happen. Everything here is open to a contributor;
-the measured state behind each item is in [LOSSES.md](LOSSES.md) and the benchmark matrix.
+the measured state behind each item is in [TO_IMPROVE.md](TO_IMPROVE.md) and the benchmark matrix.
 
 This is the only roadmap: the older `../ROADMAP.md` now points here.
 

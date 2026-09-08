@@ -13,7 +13,7 @@ pushed. Numbers are from the last gated run of `main` (0.1.0, unreleased) on an 
 | Go binding (`go/arrowmetal`) | 46 test functions, 177 subtests as the runner counted them in the last gate (`private/keep/2026-09-07/final_gate.log`, `ok github.com/singhpratech/ArrowMetal/go/arrowmetal` under `GOEXPERIMENT=cgocheck2`), run twice (plain and under the cgo pointer checker) | `arrow-go/v18`'s own `compute` where it has the function, plain Go loops where it does not ([GO.md](GO.md)) |
 | R suites (`r/arrowmetal/tests/testthat`) | 64 `test_that()` blocks over the 34 ABI entry points the R binding wraps; 266 expectations passed and 0 failed in the last gate (`private/keep/2026-09-07/final_gate.log`) | base R and the `arrow` R package's own kernels on the same data ([R.md](R.md)) |
 | Adversarial review pass | four independent reviewers plus a coverage pass before release | each finding carries a regression test |
-| Benchmarks (`Benchmarks/`) | 339 operation-and-size rows over 173 operations, against four CPU libraries in two idioms each — the plain eager one and the most parallel one that library has for the same answer (`polars-lazy`, `pyarrow-threaded`); streaming and engine benches | measured, never estimated; the baseline is the fastest idiom of any library, and against it 145 rows are at or above 3x, 102 between 1x and 3x, 77 slower and 15 without a CPU equivalent ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md), [LOSSES.md](LOSSES.md)) |
+| Benchmarks (`Benchmarks/`) | 339 operation-and-size rows over 173 operations, against four CPU libraries in two idioms each — the plain eager one and the most parallel one that library has for the same answer (`polars-lazy`, `pyarrow-threaded`); streaming and engine benches | measured, never estimated; the baseline is the fastest idiom of any library, and against it 145 rows are at or above 3x, 102 between 1x and 3x, 77 slower and 15 without a CPU equivalent ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md), [TO_IMPROVE.md](TO_IMPROVE.md)) |
 
 Run everything:
 
@@ -139,7 +139,7 @@ hundreds of megabytes can read up to 60% slow while the pool is cold (`partition
 7.9 ms first in a fresh process and 5.1 ms after any large operation, on the same build), so a row that
 moves between runs is re-measured in place before it is called a regression. The streaming bench runs
 every (workload, engine) cell in its own subprocess so peak RSS is that engine's alone. Results land in `Benchmarks/results/*.csv` and are rendered into
-[BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md); losses stay in the table.
+[BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md); rows to improve stay in the table.
 
 ## 7. Hardware and toolchain of the published numbers
 

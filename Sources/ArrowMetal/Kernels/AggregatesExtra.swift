@@ -482,7 +482,7 @@ extension MetalArray {
         guard m > 0 else { return qs.map { _ in nil } }
         // The digest only ever sees the valid values. The sort now partitions nulls out itself, so the
         // two paths are close; compacting first still wins at high null ratios because it also halves
-        // the output buffer (the numbers are in `TDigestGPU.strippedOfNulls` and docs/LOSSES.md).
+        // the output buffer (the numbers are in `TDigestGPU.strippedOfNulls` and docs/TO_IMPROVE.md).
         let sortedValues = try TDigestGPU.strippedOfNulls(self).sorted()
         let valid = Swift.min(m, sortedValues.length)
         return withExtendedLifetime(sortedValues) { () -> [Double?] in

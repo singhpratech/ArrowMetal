@@ -1,14 +1,14 @@
 # Where ArrowMetal needs to improve, and why
 
 The project's bar is 3x over the fastest CPU idiom on every operation at scale. This page is the
-honest remainder: every measured row of the full matrix where ArrowMetal is **slower** than a CPU
-library, grouped by the measured cause. Nothing here is rounded in ArrowMetal's favour; a row leaves
+remainder: every measured row of the full matrix where a CPU library is ahead of ArrowMetal,
+grouped by the measured cause. Nothing here is rounded in ArrowMetal's favour; a row leaves
 this page only when a rerun of the matrix moves it.
 
 The matrix now measures every CPU library twice: its plain eager idiom, and the most parallel idiom
 it has for the same answer — `polars-lazy` is the same expression through `pl.LazyFrame` collected on
 the in-memory or the streaming engine, `pyarrow-threaded` is an Acero plan over the same values split
-into 16 record batches (pandas has no parallel idiom and says so in its own row). "Fastest CPU" is the
+into 16 record batches (pandas' threaded paths, numexpr and numba, were not installed for this run, and its row says so). "Fastest CPU" is the
 best wall time of *all* of those idioms. That is the baseline this page is written against:
 `Benchmarks/results/full_matrix_2026-09-07-parallel.csv` ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md),
 idle M4 Max, 16 cores, 64 GB), with the cores each idiom actually used in
@@ -16,7 +16,7 @@ idle M4 Max, 16 cores, 64 GB), with the cores each idiom actually used in
 and 11.1 for pyarrow through Acero, against 1.0 for the eager idioms on most families.
 
 **Against the parallel idioms, of 339 measured rows: 145 at or above 3x, 102 faster but under 3x, 77
-slower than the fastest CPU idiom, and 15 with no CPU equivalent.** The 77 are the first section
+to improve, where the fastest CPU idiom is ahead, and 15 with no CPU equivalent.** The 77 are the first section
 below, grouped into ten causes. The sections after them are this page as it stood against each
 library's *eager* idiom, kept as history.
 

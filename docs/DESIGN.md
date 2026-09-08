@@ -245,7 +245,7 @@ invisible at a thousand groups and is the whole cost at ten million.
 | list | 100,000 | 20.8 ms | 11.6 ms | 1.8x |
 | sum | any | unchanged (already the atomic path) | | |
 | count | any | unchanged | | |
-| count_distinct | any | GPU hash set over `(group, value)` ([LOSSES.md](LOSSES.md)) | | |
+| count_distinct | any | GPU hash set over `(group, value)` ([TO_IMPROVE.md](TO_IMPROVE.md)) | | |
 
 At 50M rows, against the fastest idiom of Polars / pyarrow / pandas
 (`Benchmarks/results/full_matrix_2026-09-07-parallel.csv`): min 3.32x / 4.93x / 4.57x at 1k / 100k / 10M
@@ -254,7 +254,7 @@ groups, where it was 0.25x / 0.56x / 0.21x; variance 0.96x / 2.52x / 4.06x, wher
 **thousand** groups every numeric grouped aggregate lands near 3.3x to 4.1x, `sum` and `count` included,
 because a fresh `group_by([...])` spends about 7 ms of the 10 ms rebuilding the dense key mapping — reuse
 the object and the aggregate itself is 3 ms. And `count_distinct` by key was the remaining shortfall and
-is now 3.4x to 7.2x the fastest CPU idiom ([LOSSES.md](LOSSES.md)) — the sort of the *key* column is gone
+is now 3.4x to 7.2x the fastest CPU idiom ([TO_IMPROVE.md](TO_IMPROVE.md)) — the sort of the *key* column is gone
 from every aggregate.
 
 ## Latency (small inputs)

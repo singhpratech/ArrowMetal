@@ -33,9 +33,10 @@ export PYTHONPATH=python          # or: pip install ./python
 cd polars-plugin && cargo build --release && cd ..
 ```
 
-That is the whole build, and both halves are checked: on an M4 Max the Swift product takes about
-70 s and the cargo release build about 80 s from an empty `target/`, with no other flags and no
-`DYLD_LIBRARY_PATH`. `cargo build --release` is enough for the plugin -- it is a plain `cdylib`
+That is the whole build, and both halves are checked: on an M4 Max the Swift product and the cargo
+release build both go through from an empty `target/`, with no other flags and no
+`DYLD_LIBRARY_PATH`. (Build times are not measured by any recorded benchmark run, so none are
+quoted here.) `cargo build --release` is enough for the plugin -- it is a plain `cdylib`
 that Polars `dlopen`s, not a Python extension module, so `maturin` is optional, and
 `arrowmetal.polars_plugin.plugin_path()` finds `polars-plugin/target/release/` on its own.
 `ARROWMETAL_POLARS_PLUGIN` overrides the search.
@@ -275,7 +276,7 @@ side `mem::forget`s its copy, exactly as the Python binding does after `_export_
 
 Strings go through `CompatLevel::oldest()` -- Arrow `LargeUtf8`, not the `Utf8View` layout Polars
 uses natively -- because ArrowMetal's kernels read offsets plus bytes. That conversion is the
-plugin's only copy, and it is why the string rows below are 2x rather than 80x.
+plugin's only copy, and it is why the string rows below are 2.2x rather than 89x.
 
 `arrowmetal-sys` is a hand-written transcription of the header, not bindgen output: the surface
 is small, the header is stable, and a checked-in file needs no libclang on the build machine.
@@ -362,11 +363,11 @@ idea: Polars owns the plan, ArrowMetal owns one pass over the result.
 ## Numbers
 
 Apple M4 Max, macOS 26.6.2, polars 1.44.1 (16 threads), pyarrow 25.0.1, ArrowMetal 0.1.0. Best of 5
-runs after a warm-up, one process, one data set. Reproduce with:
+runs after a warm-up, one process, one data set. Every figure below is from
+`Benchmarks/results/polars_bench_50000000_2026-09-07.txt`. Reproduce with:
 
 ```
 PYTHONPATH=python python Benchmarks/polars_bench.py 50000000 5
-PYTHONPATH=python python Benchmarks/polars_bench.py 10000000 5
 ```
 
 Columns: `k` Int32 with 1000 distinct values, `v` Int64, `amount` Float64, `name` String drawn
@@ -376,26 +377,19 @@ from 4096 distinct values.
 
 | Operation | Polars | tier 1 namespace | tier 2 plugin | GPU-resident |
 |---|---|---|---|---|
-| `sum(Int64)` | 5.8 ms / 5.8 CPU-ms | 11.7 ms (0.5x) | 11.2 ms (0.5x) | 1.0 ms (5.8x) |
-| `filter(k == 2) + sum(v)` | 5.4 ms / 12.0 CPU-ms | 16.4 ms (0.3x) | 12.8 ms (0.4x) | 1.7 ms (3.2x) |
-| group-by `sum(v)` by 1000 keys | 112.6 ms / 1081 CPU-ms | 27.6 ms (4.1x) | 25.6 ms (4.4x) | 2.3 ms, aggregate only, group ids cached |
-| `top_k(100)` | 71.0 ms / 71.2 CPU-ms | 20.9 ms (3.4x) | 20.2 ms (3.5x) | 11.3 ms (6.3x) |
-| string `contains` (literal) | 710.1 ms / 710 CPU-ms | 334.2 ms (2.1x) | 290.7 ms (2.4x) | 8.5 ms (84x) |
+| `sum(Int64)` | 4.1 ms / 4.1 CPU-ms | 10.1 ms (0.4x) | 8.5 ms (0.5x) | 1.1 ms (3.8x) |
+| `filter(k == 2) + sum(v)` | 4.3 ms / 9.4 CPU-ms | 13.9 ms (0.3x) | 11.8 ms (0.4x) | 0.8 ms (5.1x) |
+| group-by `sum(v)` by 1000 keys | 79.3 ms / 1121 CPU-ms | 20.1 ms (4.0x) | 19.7 ms (4.0x) | 1.9 ms, aggregate only, group ids cached |
+| `top_k(100)` | 60.0 ms / 60.1 CPU-ms | 18.2 ms (3.3x) | 18.0 ms (3.3x) | 10.5 ms (5.7x) |
+| string `contains` (literal) | 634.1 ms / 634.0 CPU-ms | 290.7 ms (2.2x) | 272.8 ms (2.3x) | 7.1 ms (89.3x) |
 
-### 10M rows
-
-| Operation | Polars | tier 1 namespace | tier 2 plugin | GPU-resident |
-|---|---|---|---|---|
-| `sum(Int64)` | 0.9 ms | 2.6 ms (0.4x) | 2.7 ms (0.4x) | 0.3 ms (3.3x) |
-| `filter(k == 2) + sum(v)` | 2.3 ms | 3.6 ms (0.6x) | 3.2 ms (0.7x) | 0.6 ms (3.6x) |
-| group-by `sum(v)` by 1000 keys | 29.7 ms / 203 CPU-ms | 8.4 ms (3.5x) | 9.4 ms (3.2x) | 1.1 ms, aggregate only, group ids cached |
-| `top_k(100)` | 14.4 ms | 8.8 ms (1.6x) | 8.6 ms (1.7x) | 5.8 ms (2.5x) |
-| string `contains` (literal) | 150.3 ms | 73.6 ms (2.0x) | 63.5 ms (2.4x) | 1.9 ms (80x) |
+The 10M-row table that used to sit here was not re-measured on 2026-09-07 -- the rerun covered
+50M rows only -- so it has been removed rather than carried forward unrecorded.
 
 ### Reading the table
 
 * **The "Polars" column is Polars' eager idiom**, which is what `Benchmarks/polars_bench.py` measures
-  and what `Benchmarks/results/full_matrix_2026-09-07.csv` records. The published baseline is the
+  and what `Benchmarks/results/polars_bench_50000000_2026-09-07.txt` records. The published baseline is the
   parallel run, `Benchmarks/results/full_matrix_2026-09-07-parallel.csv`, which adds Polars' lazy
   engine (`polars-lazy`, a median of 11.5 of the 16 cores); ratios there are lower on the rows where
   the lazy engine parallelises. [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md) has both.
@@ -403,18 +397,20 @@ from 4096 distinct values.
   outside the timed region, and, for the group-by rows, the `am.group_by([k])` key-mapping pass as
   well: those rows time the aggregate only. It is what a pipeline that stays on the GPU sees, and it
   is the column that shows what the kernels are actually worth.
-* **The group-by row is not a like-for-like ratio against Polars**, whose 112.6 ms includes its whole
+* **The group-by row is not a like-for-like ratio against Polars**, whose 79.3 ms includes its whole
   hash group-by. The comparable end-to-end figure is in the benchmark matrix: `sum by int32 key
   (1000 groups)` at 50M rows is **4.89 ms against Polars lazy's 81.93 ms, 16.8x**
   (`Benchmarks/results/full_matrix_2026-09-07-parallel.csv`), and 1.73 ms against 20.24 ms, 11.7x, at
   10M.
 * **The hand-off is the whole difference** between the middle columns and the right one. At 50M
-  rows the import is 5.7 ms and the export 0.01 ms. Every tier-1 and tier-2 row pays it once per
-  call, so a single `sum` loses to Polars and a group-by wins by 4x.
-* **CPU-ms is the other half of the story.** The 50M group-by costs Polars 1081 CPU-ms across 16
-  threads; ArrowMetal costs 16 CPU-ms end to end and 0.4 CPU-ms resident. On a laptop that is
+  rows the import is 5.25 ms and the export 0.01 ms, and the run records the import as a genuine
+  no-copy -- the Polars source buffer and the Metal buffer are the same address (`zero copy: ...
+  -> SAME`). Every tier-1 and tier-2 row pays it once per call, so a single `sum` loses to Polars
+  and a group-by wins by 4x.
+* **CPU-ms is the other half of the story.** The 50M group-by costs Polars 1121 CPU-ms across 16
+  threads; ArrowMetal costs 14.0 CPU-ms end to end and 0.4 CPU-ms resident. On a laptop that is
   battery, and on a shared box it is 16 cores left free for something else.
-* **Strings** are the exception in both directions: 84x resident, 2x through the bridge. Polars
+* **Strings** are the exception in both directions: 89x resident, 2.2x through the bridge. Polars
   stores strings as `Utf8View` and ArrowMetal reads offsets + bytes, so the conversion is a real
   copy, and at 50M rows it dominates. Keeping a string column resident (`s.arrowmetal.to_metal()`)
   pays for itself immediately.

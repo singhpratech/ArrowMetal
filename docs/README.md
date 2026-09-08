@@ -13,7 +13,7 @@ test or the CSV a claim comes from.
 | [UPSTREAM.md](UPSTREAM.md) | What the matrix found in other projects (pyarrow, the Arrow tz database, Apple Metal), the test behind each finding, and where every upstream report stands |
 | [TESTING.md](TESTING.md) | Every test suite, what it covers, and the commands to run it |
 | [BENCHMARKS.md](BENCHMARKS.md) | Every benchmark round with hardware, methodology, wall time and CPU time; the tables the README quotes |
-| [LOSSES.md](LOSSES.md) | Every row of the matrix still short of the 3x bar, slower rows first, grouped by the measured cause (dispatch floor, copy vs view, sort-based distinct, software binary64, host regex), plus the rows under the 3x bar and what changed since the previous matrix |
+| [TO_IMPROVE.md](TO_IMPROVE.md) | Every row of the matrix short of the 3x bar, the rows where the CPU idiom is ahead first, grouped by the measured cause (dispatch floor, copy vs view, sort-based distinct, software binary64, host regex), plus the rows under the 3x bar and what changed since the previous matrix |
 | [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md) | The complete operation-by-operation comparison against Polars, pyarrow, pandas and numpy in both their eager and most-parallel idioms, at 1k to 50M rows, with a verdict per row and a shortfall list of everything below the 3x bar |
 | [DESIGN.md](DESIGN.md) | How it works: buffers, kernels, batching, GPU-side lengths, software Float64, where the time goes |
 | [PANDAS.md](PANDAS.md) | pandas on the GPU: the `.am` accessor and the zero-code-change accel mode, what routes to the GPU and when, the zero-copy and null rules, the numbers and the limits |

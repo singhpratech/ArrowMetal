@@ -1,5 +1,23 @@
 # Benchmark history
 
+## 2026-09-07, Apple M4 Max, round 10: the integration benchmarks rerun and recorded
+
+The four integration benchmark scripts were rerun and their complete stdout recorded as tracked
+files, so every figure in [POLARS.md](POLARS.md), [DUCKDB.md](DUCKDB.md) and [ENGINE.md](ENGINE.md)
+now traces to one of them:
+
+- `Benchmarks/results/polars_bench_50000000_2026-09-07.txt`
+- `Benchmarks/results/duckdb_bench_50000000_2026-09-07.txt`
+- `Benchmarks/results/engine_bench_50000000_2026-09-07.txt`
+- `Benchmarks/results/engine_bench_2000000_2026-09-07.txt`
+- `Benchmarks/results/python_gpu_bench_50000000_2026-09-07.txt`
+
+Only 50M rows was rerun for `polars_bench` and `duckdb_bench`, so the 10M-row tables those two
+documents carried were removed rather than kept unrecorded. Three results moved enough to change the
+prose: DuckDB's crossing is now 52.1 ms rather than the ~286 ms an earlier run showed, the GPU sort
+is ahead of DuckDB's parallel sort on a resident column (2.2x, was 0.5x), and Polars' lazy semi join
+is now slightly ahead of ArrowMetal on engine case (f) (3.06 ms against 3.50).
+
 ## 2026-09-07, Apple M4 Max, round 9: the parallel baseline
 
 The matrix now measures every CPU library **twice**: its plain eager idiom, and the most parallel
@@ -19,7 +37,7 @@ Against that baseline, of **339 measured rows: 145 at or above 3x, 102 between 1
 than the fastest CPU idiom, 15 with no CPU equivalent.** Against the eager idioms alone, the same
 build had 247 rows at or above 3x, 62 between, 15 slower and 15 without an equivalent
 (`Benchmarks/results/full_matrix_2026-09-07.csv`). Both CSVs are kept. The 77 slower rows are grouped
-by measured cause, with what would change each one, in [LOSSES.md](LOSSES.md); the row-by-row tables
+by measured cause, with what would change each one, in [TO_IMPROVE.md](TO_IMPROVE.md); the row-by-row tables
 are in [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md).
 
 Ten ArrowMetal rows that a regression check flagged against the eager run were re-measured on a
