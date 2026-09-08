@@ -5,13 +5,13 @@ pushed. Numbers are from the last gated run of `main` (0.1.0) on an M4 Max.
 
 | Layer | Size | Oracle |
 |---|---|---|
-| Swift suites (`Tests/ArrowMetalTests`) | 769 tests in 61 files, run in release (all 769 executed, 7 skipped, in the last gated run) | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
-| Python suites (`python/tests`) | 2,473 collected cases over the ctypes API and the three integrations (2,452 passed and 21 skipped in the last gate, `private/keep/2026-09-07/final_gate.log`) | `pyarrow.compute`, Polars, DuckDB, pandas |
+| Swift suites (`Tests/ArrowMetalTests`) | 769 tests in 61 files, run in release (all 769 executed, 3 skipped in the last gated run: the three opt-in throughput measurements) | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
+| Python suites (`python/tests`) | 2,473 collected cases over the ctypes API and the three integrations (2,452 passed and 21 skipped in the last gate, `private/keep/2026-09-08/final_gate_b2dc7fa.log`) | `pyarrow.compute`, Polars, DuckDB, pandas |
 | Rust suites (`rust/arrowmetal/tests`, `rust/arrowmetal-sys`) | 48 tests, 46 in the safe crate against arrow-rs plus 2 in `arrowmetal-sys` over the raw ABI, run in release, plus 4 `no_run` doc-tests (compiled, not executed) | `arrow::compute` (arrow-rs 59) on the same data; a `HashMap` fold where arrow-rs has no kernel; `include/arrowmetal.h` re-parsed for the ABI signatures ([RUST.md](RUST.md)) |
 | Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | 39,069 generated cases, 45 column types, every public operation | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
 | TypeScript suites (`node/test`) | 62 tests in 6 files over the N-API addon | Apache Arrow JS 21.2.0 and plain JS over the same rows ([TYPESCRIPT.md](TYPESCRIPT.md)) |
-| Go binding (`go/arrowmetal`) | 45 test functions and one `Example`, 46 runnable; 177 subtests as `go test -v` counted them (`private/keep/2026-09-07/final_audit_C.md`, line 51; the gate log `private/keep/2026-09-07/final_gate.log` records only the package's `ok` line under `GOEXPERIMENT=cgocheck2`), run twice (plain and under the cgo pointer checker) | `arrow-go/v18`'s own `compute` where it has the function, plain Go loops where it does not ([GO.md](GO.md)) |
-| R suites (`r/arrowmetal/tests/testthat`) | 64 `test_that()` blocks in the sources (65 as testthat runs them: the one in test-dispatch.R runs once per attach order), 266 expectations (0 failed in the last gate, `private/keep/2026-09-07/final_gate.log`), over the 34 ABI entry points the R binding wraps | base R and the `arrow` R package's own kernels on the same data ([R.md](R.md)) |
+| Go binding (`go/arrowmetal`) | 45 test functions and one `Example`, 46 runnable; 177 subtests as `go test -v` counted them (`private/keep/2026-09-07/final_audit_C.md`, line 51; the gate log `private/keep/2026-09-08/final_gate_b2dc7fa.log` records only the package's `ok` line under `GOEXPERIMENT=cgocheck2`), run twice (plain and under the cgo pointer checker) | `arrow-go/v18`'s own `compute` where it has the function, plain Go loops where it does not ([GO.md](GO.md)) |
+| R suites (`r/arrowmetal/tests/testthat`) | 64 `test_that()` blocks in the sources (65 as testthat runs them: the one in test-dispatch.R runs once per attach order), 266 expectations (0 failed in the last gate, `private/keep/2026-09-08/final_gate_b2dc7fa.log`), over the 34 ABI entry points the R binding wraps | base R and the `arrow` R package's own kernels on the same data ([R.md](R.md)) |
 | Adversarial review pass | four independent reviewers plus a coverage pass before release | each finding carries a regression test |
 | Benchmarks (`Benchmarks/`) | 339 operation-and-size rows over 173 operations, against four CPU libraries in two idioms each — the plain eager one and the most parallel one that library has for the same answer (`polars-lazy`, `pyarrow-threaded`); streaming and engine benches | measured, never estimated; the baseline is the fastest idiom of any library, and against it 145 rows are at or above 3x, 102 between 1x and 3x, 77 to improve, where the fastest CPU idiom is ahead, and 15 without a CPU equivalent ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md), [TO_IMPROVE.md](TO_IMPROVE.md)) |
 
@@ -46,7 +46,7 @@ The R suite needs R with `arrow` and `testthat`; `R CMD INSTALL r/arrowmetal` fi
 `ARROWMETAL_LIB` at the dylib as above. A conda-built R names its own compiler in `Makeconf`, so
 activate the environment (or put its `bin` on `PATH`) before installing; setting `CC = clang` in
 `~/.R/Makevars` to use Xcode's clang works too. `R CMD check --no-manual` on the built tarball is
-the fuller gate; the run recorded in `private/keep/2026-09-07/final_gate.log` is the testthat suite
+the fuller gate; the run recorded in `private/keep/2026-09-08/final_gate_b2dc7fa.log` is the testthat suite
 (266 passed, 0 failed), not `R CMD check`, so no `R CMD check` result is claimed here.
 
 Tests that need a real GPU skip on virtual Metal devices (`requireRealGPU()`), so a hosted CI runner
@@ -134,7 +134,7 @@ only if all pass:
 4. `pytest python/tests` (every suite): 0 failures; xfails must be strict and tied to a finding.
 5. The standalone tests in `test_differential.py`: 0 failures.
 
-Before a release the binding suites run as well and are recorded in `private/keep/2026-09-07/final_gate.log`:
+Before a release the binding suites run as well and are recorded in `private/keep/2026-09-08/final_gate_b2dc7fa.log`:
 
 6. `cd rust && cargo test --release`: 48 tests and 4 compile-only doc-tests, 0 failures.
 7. `go test` plain and under `GOEXPERIMENT=cgocheck2`.
