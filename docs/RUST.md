@@ -33,16 +33,19 @@ That produces `.build/release/libArrowMetalC.dylib`. Then, in your own crate:
 # Cargo.toml
 [dependencies]
 arrow = "59"
-arrowmetal = { path = "../ArrowMetal/rust/arrowmetal" }
-# or, once you have a checkout somewhere fixed:
-# arrowmetal = { git = "https://github.com/singhpratech/ArrowMetal", branch = "main" }
+arrowmetal = "0.1.0"          # crates.io; or { path = "../ArrowMetal/rust/arrowmetal" } from a checkout
 ```
 
 and build with the dylib's location known:
 
 ```bash
-ARROWMETAL_LIB=/path/to/ArrowMetal/.build/release/libArrowMetalC.dylib cargo build --release
+ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib cargo build --release
 ```
+
+The dylib comes from the `swift build` above, or from the Python wheel: `pip install arrowmetal`
+places it at `site-packages/arrowmetal/_lib/libArrowMetalC.dylib`, and the crates were checked
+against that copy (a scratch crate depending on `arrowmetal = "0.1.0"` from crates.io, built with
+`ARROWMETAL_LIB` pointing at the wheel's dylib, prints `0.1.0 on Apple M4 Max`).
 
 ### Finding the dylib
 
@@ -57,7 +60,9 @@ Anything else is a hard build error naming every path it looked in and the `swif
 than a link that succeeds and a `dyld` failure at run time.
 
 The dylib's install name is `@rpath/libArrowMetalC.dylib`, so the directory that was found is baked
-into your binary as an `LC_RPATH` entry. **You do not need `DYLD_LIBRARY_PATH` at run time.** Because
+into `arrowmetal`'s own binaries, examples and tests as an `LC_RPATH` entry. **Your binary needs the
+same entry, and then no `DYLD_LIBRARY_PATH` at run time:** without it the link succeeds and `dyld`
+reports `no LC_RPATH's found` on launch (measured with the published crate). Because
 Cargo hands a build script's link arguments only to the crate that owns it, `arrowmetal-sys`
 republishes that directory through its `links = "ArrowMetalC"` key (`DEP_ARROWMETALC_LIB_DIR`) and
 `arrowmetal/build.rs` repeats the `-rpath` for its own binaries, examples and tests. A crate that
@@ -66,12 +71,25 @@ depends on `arrowmetal` and builds a binary should do the same:
 ```rust
 // your-crate/build.rs
 fn main() {
-    let dir = std::env::var("DEP_ARROWMETALC_LIB_DIR").unwrap();
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
+    // DEP_ARROWMETALC_LIB_DIR is visible only to crates that depend on arrowmetal-sys directly,
+    // so read the same variable the build searched with.
+    println!("cargo:rerun-if-env-changed=ARROWMETAL_LIB");
+    if let Ok(lib) = std::env::var("ARROWMETAL_LIB") {
+        if let Some(dir) = std::path::Path::new(&lib).parent() {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
+        }
+    }
 }
 ```
 
-If you move the dylib after building, set `DYLD_LIBRARY_PATH` or rebuild.
+Without a build script, one environment variable at build time does the same:
+
+```bash
+RUSTFLAGS="-C link-arg=-Wl,-rpath,$(dirname "$ARROWMETAL_LIB")" cargo build --release
+```
+
+Both were run against the published `arrowmetal = "0.1.0"` and the wheel's dylib; the binary then
+starts from any directory. If you move the dylib after building, set `DYLD_LIBRARY_PATH` or rebuild.
 
 ---
 

@@ -9,7 +9,7 @@
 understand Arrow's layout natively: validity bitmaps, packed booleans, the C Data Interface and the
 C Device Data Interface (`ARROW_DEVICE_METAL`).
 
-Site and docs: <https://arrowmetal.org> · Python: `pip install arrowmetal` · Release: [v0.1.0](https://github.com/singhpratech/ArrowMetal/releases/tag/v0.1.0)
+Site and docs: <https://arrowmetal.org> · Python: `pip install arrowmetal` · Rust: `arrowmetal = "0.1.0"` · Release: [v0.1.0](https://github.com/singhpratech/ArrowMetal/releases/tag/v0.1.0)
 
 ## The pitch in one paragraph
 
@@ -192,7 +192,7 @@ exchanging columns through the Arrow C Data Interface and each with its own test
 
 | Binding | Where | Tests | Doc |
 |---|---|---|---|
-| Rust | `rust/arrowmetal`, `rust/arrowmetal-sys` | 48 tests plus 4 `no_run` doc-tests | [docs/RUST.md](docs/RUST.md) |
+| Rust | `rust/arrowmetal`, `rust/arrowmetal-sys`; [crates.io](https://crates.io/crates/arrowmetal) | 48 tests plus 4 `no_run` doc-tests | [docs/RUST.md](docs/RUST.md) |
 | Go | `go/arrowmetal` | 45 test functions and one example, 46 runnable | [docs/GO.md](docs/GO.md) |
 | TypeScript / JavaScript | `node/` (N-API addon) | 62 tests | [docs/TYPESCRIPT.md](docs/TYPESCRIPT.md) |
 | R | `r/arrowmetal` | 64 `test_that()` blocks in the sources (65 as testthat runs them: the one in test-dispatch.R runs once per attach order), 266 expectations | [docs/R.md](docs/R.md) |

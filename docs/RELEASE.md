@@ -158,34 +158,27 @@ The CI badge shows the last run on `main`; the workflow runs on pull requests an
 dispatch it once on the release commit (`gh workflow run ci.yml --ref main`) and wait for green
 before adding the badge. A crates.io or npm badge is added only when step 6 publishes those.
 
-## 6. The Polars plugin crate — after the release, not during it
+## 6. The crates, and the Polars plugin crate
 
-`polars-plugin/` is a Rust `cdylib` whose `build.rs` links `libArrowMetalC.dylib` by rpath from a local
-Swift build. crates.io publication is therefore **deferred**: a crate downloaded from crates.io has no
-Swift checkout to link against, so it needs either a vendored prebuilt dylib or a `build.rs` that fetches
-one, and neither exists yet. Until then the plugin is built from this repository:
+`arrowmetal-sys` and `arrowmetal` are on crates.io at 0.1.0, published from the `v0.1.0` tag in that
+order (`cargo publish -p arrowmetal-sys`, then `-p arrowmetal`, each with `ARROWMETAL_LIB` set so the
+packaging build finds the dylib; docs.rs builds skip the search). The crates link the dylib the user
+already has, from the wheel or a Swift build, and [RUST.md](RUST.md) says how a binary carries the
+run-time path. Checked after publication: a scratch crate outside the repository depending on
+`arrowmetal = "0.1.0"` and pointed at the wheel's dylib prints `0.1.0 on Apple M4 Max`.
+
+`polars-plugin/` is a Rust `cdylib` that Polars loads by path; it carries its own copy of
+`arrowmetal-sys` under the same name, so it stays `publish = false` and is built from the repository:
 
 ```
 cd polars-plugin && cargo build --release
 ```
 
-Two things to settle before any crate is published. There are two crates named `arrowmetal-sys`
-in this repository, `rust/arrowmetal-sys` (the binding's, 296 lines of declarations) and
-`polars-plugin/arrowmetal-sys` (the plugin's, 718); crates.io can hold one crate of that name, so
-the plugin must depend on the binding's crate, or its copy must be renamed, before either goes
-up. And every crate carries `publish = false` today, which `cargo publish` refuses; flip it only on
-the crate being published.
-
-The Node package (`node/`) is `"private": true` and is not published to npm at 0.1.0 for the same
-reason as the crates: the addon links a dylib built from this checkout. `npm pack --dry-run` lists
-what a later publication would carry.
-
-When it is ready, the order is `cargo publish --dry-run`, then reserving the crate name, then
-`cargo publish` — and the crate version tracks the dylib ABI it was built against, so it cannot be
-published ahead of a tagged 0.1.0.
-
 The DuckDB extension (`duckdb-extension/`) is in the same position: it is built from the repository and
 is not distributed through the DuckDB community extensions repository yet.
+
+The Node package (`node/`) is `"private": true` and is not published to npm at 0.1.0: the addon links
+the dylib built from this checkout. `npm pack --dry-run` lists what a later publication would carry.
 
 ## 7. The GitHub organisation rename
 
