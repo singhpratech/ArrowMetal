@@ -7,6 +7,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow/memory/mallocator"
 	am "github.com/singhpratech/ArrowMetal/go/arrowmetal"
 )
 
@@ -162,6 +163,59 @@ func TestPageAlignedAllocatorRoundTrip(t *testing.T) {
 	}
 	if alloc.AllocatedBytes() <= 0 {
 		t.Fatalf("AllocatedBytes() = %d while an array is alive", alloc.AllocatedBytes())
+	}
+}
+
+// TestMallocatorAtPageAlignmentIsCopyFree covers the route arrow-go itself provides for C handoff:
+// memory/mallocator is libc memory, outside the Go heap, and takes an alignment. At the page size it
+// meets ArrowMetal's copy rule exactly as PageAlignedAllocator does, so a program can use either.
+func TestMallocatorAtPageAlignmentIsCopyFree(t *testing.T) {
+	requireLib(t)
+	alloc := mallocator.NewMallocatorWithAlignment(am.PageSize())
+	const n = 1000001
+	vals := genInt64(n)
+	valid := nullEvery(n, 7)
+
+	aligned := 0
+	for i := 0; i < 20; i++ {
+		b := array.NewInt64Builder(alloc)
+		b.AppendValues(vals, valid)
+		src := b.NewArray()
+		if bufferAddr(src)%uintptr(am.PageSize()) == 0 {
+			aligned++
+		}
+		src.Release()
+		b.Release()
+	}
+	if aligned != 20 {
+		t.Fatalf("mallocator at alignment %d: %d/20 page-aligned buffers", am.PageSize(), aligned)
+	}
+
+	b := array.NewInt64Builder(alloc)
+	b.AppendValues(vals, valid)
+	src := b.NewArray()
+	b.Release()
+	defer src.Release()
+	h := importArr(t, src)
+	s, err := h.Sum()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want int64
+	for i := range vals {
+		if valid[i] {
+			want += vals[i]
+		}
+	}
+	if s.Int64() != want {
+		t.Fatalf("Sum = %d, want %d", s.Int64(), want)
+	}
+	out := exportArr(t, h)
+	gotV, gotValid := int64sOf(t, out)
+	for i := range gotV {
+		if gotValid[i] != valid[i] || (valid[i] && gotV[i] != vals[i]) {
+			t.Fatalf("element %d: got (%d, valid=%v), want (%d, valid=%v)", i, gotV[i], gotValid[i], vals[i], valid[i])
+		}
 	}
 }
 

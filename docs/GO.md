@@ -148,8 +148,12 @@ With the default allocator that address is in the Go heap, so this is an unpinne
 into non-Go memory — which the [cgo pointer rules](https://pkg.go.dev/cmd/cgo#hdr-Passing_pointers)
 forbid, and which `GOEXPERIMENT=cgocheck2` turns into a hard `fatal error: unpinned Go pointer stored
 into non-Go memory`. This is [apache/arrow-go#70](https://github.com/apache/arrow-go/issues/70),
-closed upstream without the default path being made legal; arrow-go's own advice is to use
-`CgoArrowAllocator`, which needs the `ccalloc` build tag and a C++ Arrow install.
+closed upstream without the default path being made legal. arrow-go's own answer is C memory:
+`memory/mallocator` (libc `malloc`, no build tag needed to use it, `NewMallocatorWithAlignment(n)`
+for a chosen power-of-two alignment) and, for programs linked against C++ Arrow, `CgoArrowAllocator`
+behind the `ccalloc` build tag. A `mallocator` buffer at alignment 16384 is page aligned and outside
+the Go heap, so it satisfies both the cgo rules and ArrowMetal's copy rule; `PageAlignedAllocator`
+is the same idea in forty lines, kept so the binding has no build-tag story to tell.
 
 `Import` therefore pins every buffer it publishes with [`runtime.Pinner`](https://pkg.go.dev/runtime#Pinner)
 (Go 1.21+) before handing anything to C, and keeps the `Pinner` inside the returned `Array` until
