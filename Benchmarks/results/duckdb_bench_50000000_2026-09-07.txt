@@ -1,0 +1,28 @@
+ArrowMetal 0.1.0 on Apple M4 Max; DuckDB 1.5.5; pyarrow 25.0.1; rows=50,000,000; best of 5
+
+building the table in DuckDB ... 2.8 s
+
+Getting one BIGINT column out of DuckDB and onto the GPU
+  to_arrow_table       19.7 ms   (407 chunks, 406 MB)
+  combine_chunks       26.6 ms   (15.3 GB/s - a real copy)
+  am_import             5.7 ms   (buffer shared, not copied: True)
+  total                52.1 ms
+
+  operation                                 duckdb    cpu-ms       gpu    cpu-ms   gpu+cross  resident  one-shot
+  --------------------------------------------------------------------------------------------------------------
+  filter(v > n) then sum                       1.1      13.7       3.1       0.8        42.8      0.4x      0.0x
+  filter(v > n) then sum, fused query          1.1      13.6       1.1       0.4        40.6      1.0x      0.0x
+  group-by sum, 1k keys                        7.6     112.2       2.1       0.6        68.8      3.6x      0.1x
+  group-by sum, 100k keys                     71.4    1056.2       4.5       0.6        65.9     16.0x      1.1x
+  top_k(v, 100)                                5.7      12.2       9.7       3.4        54.1      0.6x      0.1x
+  sort(v) ascending                           39.2     570.4      17.6       1.4        57.3      2.2x      0.7x
+  count(s like '%user1%')                     47.4     718.5       5.1       0.4        84.7      9.3x      0.6x
+  avg(f)                                       2.8      40.8       2.5       0.4        42.8      1.1x      0.1x
+
+Streaming a sum through the GPU one record batch at a time (never materialised whole)
+    262,144 rows/batch       98.7 ms wall      114.1 CPU-ms  exact
+  1,048,576 rows/batch       67.5 ms wall       78.9 CPU-ms  exact
+  4,194,304 rows/batch       76.1 ms wall       76.0 CPU-ms  exact
+
+Columns are best-of-5 wall ms. 'resident' is duckdb/gpu with the data already on the GPU;
+'one-shot' is duckdb/(gpu + crossing), which is what a single cold query costs.

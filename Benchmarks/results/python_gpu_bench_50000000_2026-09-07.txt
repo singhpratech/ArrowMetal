@@ -1,0 +1,369 @@
+ArrowMetal 0.1.0 on Apple M4 Max vs polars 1.44.1 (16 threads), pyarrow 25.0.1, pandas 3.0.5; rows=50000000
+
+import 50M-row int64 column into Metal memory: 6.0 ms
+
+sum(Int64, 10% nulls)
+  ArrowMetal (GPU)                                  1.03 ms    388.4 GB/s       0.4 CPU-ms
+  polars                                           16.03 ms     25.0 GB/s      16.0 CPU-ms
+  pyarrow.compute                                  48.04 ms      8.3 GB/s      48.0 CPU-ms
+  pandas (arrow-backed)                            49.52 ms      8.1 GB/s      49.5 CPU-ms
+
+filter(Int64 > 0) -> compacted
+  ArrowMetal (GPU, fused predicate)                 3.56 ms    112.5 GB/s       0.7 CPU-ms
+  ArrowMetal (GPU) + to_arrow()                     3.63 ms    110.3 GB/s       0.8 CPU-ms
+  polars                                           22.99 ms     17.4 GB/s      23.0 CPU-ms
+  pyarrow.compute                                 214.57 ms      1.9 GB/s     214.6 CPU-ms
+  pandas (arrow-backed)                           270.30 ms      1.5 GB/s     270.2 CPU-ms
+
+take(25M random indices)
+  ArrowMetal (GPU)                                  5.89 ms     84.8 GB/s       0.7 CPU-ms
+  polars gather                                   166.12 ms      3.0 GB/s     166.1 CPU-ms
+  pyarrow.compute take                            137.17 ms      3.6 GB/s     137.2 CPU-ms
+
+group-by sum(Int64) by 1000 keys
+  ArrowMetal (GPU)                                  1.95 ms    307.3 GB/s       0.4 CPU-ms
+  polars group_by                                  88.58 ms      6.8 GB/s    1116.2 CPU-ms
+  pyarrow group_by                                 18.81 ms     31.9 GB/s     252.1 CPU-ms
+
+query: sum(amount) where region == 2 and amount > 100
+  ArrowMetal (GPU)                                  2.51 ms    159.5 GB/s       1.7 CPU-ms
+  ArrowMetal (GPU, batched)                         2.02 ms    197.6 GB/s       0.5 CPU-ms
+  polars lazy (fused)                              16.21 ms     24.7 GB/s      27.5 CPU-ms
+  numpy masked sum                                110.51 ms      3.6 GB/s     110.4 CPU-ms
+
+argsort(Int64, 50000000 rows, no nulls)
+  ArrowMetal (GPU)                                 39.30 ms     15.3 GB/s       0.9 CPU-ms
+  polars arg_sort                                 305.00 ms      2.0 GB/s    3556.5 CPU-ms
+  pyarrow array_sort_indices                     5168.77 ms      0.1 GB/s    5166.0 CPU-ms
+  numpy argsort                                  4356.33 ms      0.1 GB/s    4353.5 CPU-ms
+
+sort(Float64, 50000000 rows, no nulls)
+  ArrowMetal (GPU)                                 32.20 ms     24.8 GB/s       1.3 CPU-ms
+  ArrowMetal (GPU) + to_arrow()                    32.24 ms     24.8 GB/s       1.2 CPU-ms
+  polars sort                                     142.57 ms      5.6 GB/s    1269.2 CPU-ms
+  pyarrow sort_indices + take                    6105.75 ms      0.1 GB/s    6102.3 CPU-ms
+  numpy sort                                     1718.13 ms      0.5 GB/s    1717.9 CPU-ms
+
+top_k(100 of 50000000 Int64)
+  ArrowMetal (GPU radix select)                     2.65 ms    150.9 GB/s       1.4 CPU-ms
+  pyarrow select_k_unstable                        24.59 ms     16.3 GB/s      24.6 CPU-ms
+  polars top_k                                     67.35 ms      5.9 GB/s      67.4 CPU-ms
+  numpy argpartition                              183.58 ms      2.2 GB/s     183.5 CPU-ms
+
+top_k(10000 of 50000000 Int64)
+  ArrowMetal (GPU radix select)                     3.02 ms    132.5 GB/s       1.8 CPU-ms
+  pyarrow select_k_unstable                        34.78 ms     11.5 GB/s      34.8 CPU-ms
+  polars top_k                                     62.06 ms      6.4 GB/s      62.1 CPU-ms
+  numpy argpartition                              182.37 ms      2.2 GB/s     182.4 CPU-ms
+
+top_k(100000 of 50000000 Int64)
+  ArrowMetal (GPU radix select)                     3.16 ms    126.7 GB/s       1.8 CPU-ms
+  pyarrow select_k_unstable                       154.78 ms      2.6 GB/s     154.8 CPU-ms
+  polars top_k                                     61.29 ms      6.5 GB/s      61.4 CPU-ms
+  numpy argpartition                              183.50 ms      2.2 GB/s     183.5 CPU-ms
+
+quantile(0.5 of 50000000 Int64)
+  ArrowMetal (GPU radix select)                     2.56 ms    156.1 GB/s       1.2 CPU-ms
+  pyarrow quantile                                275.87 ms      1.4 GB/s     275.8 CPU-ms
+  polars median                                    70.09 ms      5.7 GB/s      70.1 CPU-ms
+  numpy median                                    280.94 ms      1.4 GB/s     280.9 CPU-ms
+
+quantile(0.5 of 50000000 Float64)
+  ArrowMetal (GPU radix select)                     2.27 ms    176.0 GB/s       0.9 CPU-ms
+  pyarrow quantile                                353.04 ms      1.1 GB/s     353.1 CPU-ms
+  polars median                                   126.01 ms      3.2 GB/s     126.0 CPU-ms
+  numpy median                                    362.31 ms      1.1 GB/s     362.3 CPU-ms
+
+import 10000000-row utf8 column into Metal memory: 2.8 ms
+
+string contains("north") over 10000000 strings (25% hit)
+  ArrowMetal (GPU)                                  1.62 ms    108.5 GB/s       0.4 CPU-ms
+  polars str.contains (literal)                   143.60 ms      1.2 GB/s     143.7 CPU-ms
+  pyarrow match_substring                         123.27 ms      1.4 GB/s     123.3 CPU-ms
+
+string starts_with("cust_1") over 10000000 strings (10% hit)
+  ArrowMetal (GPU)                                  1.33 ms    132.1 GB/s       0.4 CPU-ms
+  polars str.starts_with                           35.43 ms      5.0 GB/s      35.5 CPU-ms
+  pyarrow starts_with                              30.46 ms      5.8 GB/s      30.5 CPU-ms
+
+string equals("cust_042_east") over 10000000 strings
+  ArrowMetal (GPU)                                  1.36 ms    129.8 GB/s       0.4 CPU-ms
+  polars ==                                        40.15 ms      4.4 GB/s      40.1 CPU-ms
+  pyarrow equal                                    34.50 ms      5.1 GB/s      34.5 CPU-ms
+
+string filter over 10000000 strings (~30% kept)
+  ArrowMetal (GPU)                                  5.76 ms     30.6 GB/s       3.3 CPU-ms
+  polars filter                                     4.54 ms     38.8 GB/s       4.5 CPU-ms
+  pyarrow filter                                   48.30 ms      3.6 GB/s      48.3 CPU-ms
+
+dictionary_encode + group-by sum over 10000000 strings (1000 distinct)
+  ArrowMetal (dictionary_encode on CPU + GPU group-by)      6.45 ms     39.7 GB/s       4.4 CPU-ms
+  ArrowMetal (GPU group-by on cached codes)         0.85 ms    300.0 GB/s       0.4 CPU-ms
+  polars group_by(str) sum                         33.20 ms      7.7 GB/s     357.7 CPU-ms
+  pyarrow group_by(str) sum                        14.72 ms     17.4 GB/s     136.2 CPU-ms
+
+unique(int64) (1000 distinct)
+  ArrowMetal (GPU hash table)                      15.97 ms     25.0 GB/s       6.4 CPU-ms
+  polars                                          111.03 ms      3.6 GB/s     472.3 CPU-ms
+  pyarrow                                          85.34 ms      4.7 GB/s      85.3 CPU-ms
+  pandas (numpy)                                   75.20 ms      5.3 GB/s      75.2 CPU-ms
+
+value_counts(int64) (1000 distinct)
+  ArrowMetal (GPU hash table)                      17.10 ms     23.4 GB/s       6.8 CPU-ms
+  polars                                          116.33 ms      3.4 GB/s     116.3 CPU-ms
+  pyarrow                                         139.61 ms      2.9 GB/s     139.6 CPU-ms
+  pandas                                          140.09 ms      2.9 GB/s     140.1 CPU-ms
+
+count_distinct(int64) (1000 distinct)
+  ArrowMetal (GPU hash table)                       9.59 ms     41.7 GB/s       2.2 CPU-ms
+  polars                                          116.06 ms      3.4 GB/s     479.2 CPU-ms
+  pyarrow                                          81.68 ms      4.9 GB/s      81.7 CPU-ms
+  pandas                                           85.50 ms      4.7 GB/s      85.5 CPU-ms
+
+mode(int64) (1000 distinct)
+  ArrowMetal (GPU hash table)                      26.52 ms     15.1 GB/s       8.0 CPU-ms
+  polars                                           58.67 ms      6.8 GB/s     765.9 CPU-ms
+  pyarrow                                          21.49 ms     18.6 GB/s      21.5 CPU-ms
+
+unique(int64) (100000 distinct)
+  ArrowMetal (GPU hash table)                      19.00 ms     21.1 GB/s       7.2 CPU-ms
+  polars                                          123.60 ms      3.2 GB/s     734.1 CPU-ms
+  pyarrow                                          77.98 ms      5.1 GB/s      78.0 CPU-ms
+  pandas (numpy)                                   82.21 ms      4.9 GB/s      82.2 CPU-ms
+
+value_counts(int64) (100000 distinct)
+  ArrowMetal (GPU hash table)                      20.49 ms     19.5 GB/s       7.6 CPU-ms
+  polars                                          320.30 ms      1.2 GB/s     323.3 CPU-ms
+  pyarrow                                         192.25 ms      2.1 GB/s     192.2 CPU-ms
+  pandas                                          194.27 ms      2.1 GB/s     194.2 CPU-ms
+
+count_distinct(int64) (100000 distinct)
+  ArrowMetal (GPU hash table)                       9.83 ms     40.7 GB/s       2.4 CPU-ms
+  polars                                          119.60 ms      3.3 GB/s     732.9 CPU-ms
+  pyarrow                                          71.23 ms      5.6 GB/s      71.2 CPU-ms
+  pandas                                           76.89 ms      5.2 GB/s      76.9 CPU-ms
+
+mode(int64) (100000 distinct)
+  ArrowMetal (GPU hash table)                      30.36 ms     13.2 GB/s       9.0 CPU-ms
+  polars                                           70.99 ms      5.6 GB/s     950.7 CPU-ms
+  pyarrow                                         549.52 ms      0.7 GB/s     549.5 CPU-ms
+
+unique(int64) (10000000 distinct)
+  ArrowMetal (GPU hash table)                     100.55 ms      4.0 GB/s      14.7 CPU-ms
+  polars                                          165.92 ms      2.4 GB/s    1265.8 CPU-ms
+  pyarrow                                         658.25 ms      0.6 GB/s     658.2 CPU-ms
+  pandas (numpy)                                  620.09 ms      0.6 GB/s     620.0 CPU-ms
+
+value_counts(int64) (10000000 distinct)
+  ArrowMetal (GPU hash table)                     109.78 ms      3.6 GB/s      16.4 CPU-ms
+  polars                                         1532.52 ms      0.3 GB/s    1669.5 CPU-ms
+  pyarrow                                        1446.67 ms      0.3 GB/s    1446.5 CPU-ms
+  pandas                                         1496.30 ms      0.3 GB/s    1496.2 CPU-ms
+
+count_distinct(int64) (10000000 distinct)
+  ArrowMetal (GPU hash table)                      41.29 ms      9.7 GB/s       3.0 CPU-ms
+  polars                                          150.05 ms      2.7 GB/s    1255.1 CPU-ms
+  pyarrow                                         714.21 ms      0.6 GB/s     714.2 CPU-ms
+  pandas                                          657.65 ms      0.6 GB/s     657.6 CPU-ms
+
+mode(int64) (10000000 distinct)
+  ArrowMetal (GPU hash table)                     166.28 ms      2.4 GB/s      31.1 CPU-ms
+  polars                                          383.45 ms      1.0 GB/s    3767.0 CPU-ms
+  pyarrow                                         988.16 ms      0.4 GB/s     988.1 CPU-ms
+
+group-by sum(Int64) over utf8 keys (1000 distinct)
+  ArrowMetal (GPU, key mapping included)           18.30 ms     65.6 GB/s       3.7 CPU-ms
+  ArrowMetal (GPU, cached key mapping)              1.88 ms    639.8 GB/s       0.4 CPU-ms
+  polars group_by(utf8)                           147.41 ms      8.1 GB/s    1835.5 CPU-ms
+  pyarrow group_by(utf8)                           37.16 ms     32.3 GB/s     509.2 CPU-ms
+    groups: ArrowMetal 1000, pyarrow 1000
+
+dictionary_encode(utf8) (1000 distinct)
+  ArrowMetal (GPU hash table)                      18.54 ms     64.7 GB/s       4.1 CPU-ms
+  pyarrow dictionary_encode                       354.65 ms      3.4 GB/s     354.6 CPU-ms
+
+group-by sum(Int64) over two int32 columns (~1024 distinct)
+  ArrowMetal (GPU, key mapping included)            6.07 ms    131.8 GB/s       2.2 CPU-ms
+  ArrowMetal (GPU, cached key mapping)              1.86 ms    430.7 GB/s       0.4 CPU-ms
+  polars group_by(a, b)                           170.25 ms      4.7 GB/s    2124.7 CPU-ms
+  pyarrow group_by(a, b)                           22.00 ms     36.4 GB/s     296.3 CPU-ms
+    groups: ArrowMetal 1024, pyarrow 1024
+
+group-by sum(Int64) over utf8 keys (100000 distinct)
+  ArrowMetal (GPU, key mapping included)           23.89 ms     50.2 GB/s       4.1 CPU-ms
+  ArrowMetal (GPU, cached key mapping)              3.93 ms    305.3 GB/s       0.4 CPU-ms
+  polars group_by(utf8)                           170.90 ms      7.0 GB/s    2216.2 CPU-ms
+  pyarrow group_by(utf8)                          135.55 ms      8.9 GB/s    1701.9 CPU-ms
+    groups: ArrowMetal 100000, pyarrow 100000
+
+dictionary_encode(utf8) (100000 distinct)
+  ArrowMetal (GPU hash table)                      22.07 ms     54.4 GB/s       4.4 CPU-ms
+  pyarrow dictionary_encode                       511.74 ms      2.3 GB/s     511.6 CPU-ms
+
+group-by sum(Int64) over two int32 columns (~100489 distinct)
+  ArrowMetal (GPU, key mapping included)            8.36 ms     95.7 GB/s       2.2 CPU-ms
+  ArrowMetal (GPU, cached key mapping)              3.89 ms    205.7 GB/s       0.4 CPU-ms
+  polars group_by(a, b)                           189.59 ms      4.2 GB/s    2468.5 CPU-ms
+  pyarrow group_by(a, b)                           53.39 ms     15.0 GB/s     611.2 CPU-ms
+    groups: ArrowMetal 100489, pyarrow 100489
+
+group-by sum(Int64) over utf8 keys (10000000 distinct)
+  ArrowMetal (GPU, key mapping included)          126.77 ms      9.5 GB/s       7.3 CPU-ms
+  ArrowMetal (GPU, cached key mapping)             28.52 ms     42.1 GB/s       1.0 CPU-ms
+  polars group_by(utf8)                           538.46 ms      2.2 GB/s    7291.2 CPU-ms
+  pyarrow group_by(utf8)                         2910.84 ms      0.4 GB/s    6404.6 CPU-ms
+    groups: ArrowMetal 9932404, pyarrow 9932404
+
+dictionary_encode(utf8) (10000000 distinct)
+  ArrowMetal (GPU hash table)                     103.19 ms     11.6 GB/s       7.1 CPU-ms
+  pyarrow dictionary_encode                      3539.48 ms      0.3 GB/s    3538.3 CPU-ms
+
+group-by sum(Int64) over two int32 columns (~10004569 distinct)
+  ArrowMetal (GPU, key mapping included)           47.69 ms     16.8 GB/s       3.4 CPU-ms
+  ArrowMetal (GPU, cached key mapping)             35.84 ms     22.3 GB/s       1.1 CPU-ms
+  polars group_by(a, b)                           555.37 ms      1.4 GB/s    7667.7 CPU-ms
+  pyarrow group_by(a, b)                         1390.16 ms      0.6 GB/s    3869.4 CPU-ms
+    groups: ArrowMetal 9936984, pyarrow 9936984
+
+
+| Operation | Implementation | Time (ms) | Throughput (GB/s) | CPU time (ms) |
+|---|---|---:|---:|---:|
+| sum(Int64, 10% nulls) | ArrowMetal (GPU) | 1.03 | 388.4 | 0.4 |
+| sum(Int64, 10% nulls) | polars | 16.03 | 25.0 | 16.0 |
+| sum(Int64, 10% nulls) | pyarrow.compute | 48.04 | 8.3 | 48.0 |
+| sum(Int64, 10% nulls) | pandas (arrow-backed) | 49.52 | 8.1 | 49.5 |
+| filter(Int64 > 0) -> compacted | ArrowMetal (GPU, fused predicate) | 3.56 | 112.5 | 0.7 |
+| filter(Int64 > 0) -> compacted | ArrowMetal (GPU) + to_arrow() | 3.63 | 110.3 | 0.8 |
+| filter(Int64 > 0) -> compacted | polars | 22.99 | 17.4 | 23.0 |
+| filter(Int64 > 0) -> compacted | pyarrow.compute | 214.57 | 1.9 | 214.6 |
+| filter(Int64 > 0) -> compacted | pandas (arrow-backed) | 270.30 | 1.5 | 270.2 |
+| take(25M random indices) | ArrowMetal (GPU) | 5.89 | 84.8 | 0.7 |
+| take(25M random indices) | polars gather | 166.12 | 3.0 | 166.1 |
+| take(25M random indices) | pyarrow.compute take | 137.17 | 3.6 | 137.2 |
+| group-by sum(Int64) by 1000 keys | ArrowMetal (GPU) | 1.95 | 307.3 | 0.4 |
+| group-by sum(Int64) by 1000 keys | polars group_by | 88.58 | 6.8 | 1116.2 |
+| group-by sum(Int64) by 1000 keys | pyarrow group_by | 18.81 | 31.9 | 252.1 |
+| query: sum(amount) where region == 2 and amount > 100 | ArrowMetal (GPU) | 2.51 | 159.5 | 1.7 |
+| query: sum(amount) where region == 2 and amount > 100 | ArrowMetal (GPU, batched) | 2.02 | 197.6 | 0.5 |
+| query: sum(amount) where region == 2 and amount > 100 | polars lazy (fused) | 16.21 | 24.7 | 27.5 |
+| query: sum(amount) where region == 2 and amount > 100 | numpy masked sum | 110.51 | 3.6 | 110.4 |
+| argsort(Int64, 50000000 rows, no nulls) | ArrowMetal (GPU) | 39.30 | 15.3 | 0.9 |
+| argsort(Int64, 50000000 rows, no nulls) | polars arg_sort | 305.00 | 2.0 | 3556.5 |
+| argsort(Int64, 50000000 rows, no nulls) | pyarrow array_sort_indices | 5168.77 | 0.1 | 5166.0 |
+| argsort(Int64, 50000000 rows, no nulls) | numpy argsort | 4356.33 | 0.1 | 4353.5 |
+| sort(Float64, 50000000 rows, no nulls) | ArrowMetal (GPU) | 32.20 | 24.8 | 1.3 |
+| sort(Float64, 50000000 rows, no nulls) | ArrowMetal (GPU) + to_arrow() | 32.24 | 24.8 | 1.2 |
+| sort(Float64, 50000000 rows, no nulls) | polars sort | 142.57 | 5.6 | 1269.2 |
+| sort(Float64, 50000000 rows, no nulls) | pyarrow sort_indices + take | 6105.75 | 0.1 | 6102.3 |
+| sort(Float64, 50000000 rows, no nulls) | numpy sort | 1718.13 | 0.5 | 1717.9 |
+| top_k(100 of 50000000 Int64) | ArrowMetal (GPU radix select) | 2.65 | 150.9 | 1.4 |
+| top_k(100 of 50000000 Int64) | pyarrow select_k_unstable | 24.59 | 16.3 | 24.6 |
+| top_k(100 of 50000000 Int64) | polars top_k | 67.35 | 5.9 | 67.4 |
+| top_k(100 of 50000000 Int64) | numpy argpartition | 183.58 | 2.2 | 183.5 |
+| top_k(10000 of 50000000 Int64) | ArrowMetal (GPU radix select) | 3.02 | 132.5 | 1.8 |
+| top_k(10000 of 50000000 Int64) | pyarrow select_k_unstable | 34.78 | 11.5 | 34.8 |
+| top_k(10000 of 50000000 Int64) | polars top_k | 62.06 | 6.4 | 62.1 |
+| top_k(10000 of 50000000 Int64) | numpy argpartition | 182.37 | 2.2 | 182.4 |
+| top_k(100000 of 50000000 Int64) | ArrowMetal (GPU radix select) | 3.16 | 126.7 | 1.8 |
+| top_k(100000 of 50000000 Int64) | pyarrow select_k_unstable | 154.78 | 2.6 | 154.8 |
+| top_k(100000 of 50000000 Int64) | polars top_k | 61.29 | 6.5 | 61.4 |
+| top_k(100000 of 50000000 Int64) | numpy argpartition | 183.50 | 2.2 | 183.5 |
+| quantile(0.5 of 50000000 Int64) | ArrowMetal (GPU radix select) | 2.56 | 156.1 | 1.2 |
+| quantile(0.5 of 50000000 Int64) | pyarrow quantile | 275.87 | 1.4 | 275.8 |
+| quantile(0.5 of 50000000 Int64) | polars median | 70.09 | 5.7 | 70.1 |
+| quantile(0.5 of 50000000 Int64) | numpy median | 280.94 | 1.4 | 280.9 |
+| quantile(0.5 of 50000000 Float64) | ArrowMetal (GPU radix select) | 2.27 | 176.0 | 0.9 |
+| quantile(0.5 of 50000000 Float64) | pyarrow quantile | 353.04 | 1.1 | 353.1 |
+| quantile(0.5 of 50000000 Float64) | polars median | 126.01 | 3.2 | 126.0 |
+| quantile(0.5 of 50000000 Float64) | numpy median | 362.31 | 1.1 | 362.3 |
+| string contains("north") over 10000000 strings (25% hit) | ArrowMetal (GPU) | 1.62 | 108.5 | 0.4 |
+| string contains("north") over 10000000 strings (25% hit) | polars str.contains (literal) | 143.60 | 1.2 | 143.7 |
+| string contains("north") over 10000000 strings (25% hit) | pyarrow match_substring | 123.27 | 1.4 | 123.3 |
+| string starts_with("cust_1") over 10000000 strings (10% hit) | ArrowMetal (GPU) | 1.33 | 132.1 | 0.4 |
+| string starts_with("cust_1") over 10000000 strings (10% hit) | polars str.starts_with | 35.43 | 5.0 | 35.5 |
+| string starts_with("cust_1") over 10000000 strings (10% hit) | pyarrow starts_with | 30.46 | 5.8 | 30.5 |
+| string equals("cust_042_east") over 10000000 strings | ArrowMetal (GPU) | 1.36 | 129.8 | 0.4 |
+| string equals("cust_042_east") over 10000000 strings | polars == | 40.15 | 4.4 | 40.1 |
+| string equals("cust_042_east") over 10000000 strings | pyarrow equal | 34.50 | 5.1 | 34.5 |
+| string filter over 10000000 strings (~30% kept) | ArrowMetal (GPU) | 5.76 | 30.6 | 3.3 |
+| string filter over 10000000 strings (~30% kept) | polars filter | 4.54 | 38.8 | 4.5 |
+| string filter over 10000000 strings (~30% kept) | pyarrow filter | 48.30 | 3.6 | 48.3 |
+| dictionary_encode + group-by sum over 10000000 strings (1000 distinct) | ArrowMetal (dictionary_encode on CPU + GPU group-by) | 6.45 | 39.7 | 4.4 |
+| dictionary_encode + group-by sum over 10000000 strings (1000 distinct) | ArrowMetal (GPU group-by on cached codes) | 0.85 | 300.0 | 0.4 |
+| dictionary_encode + group-by sum over 10000000 strings (1000 distinct) | polars group_by(str) sum | 33.20 | 7.7 | 357.7 |
+| dictionary_encode + group-by sum over 10000000 strings (1000 distinct) | pyarrow group_by(str) sum | 14.72 | 17.4 | 136.2 |
+| unique(int64) (1000 distinct) | ArrowMetal (GPU hash table) | 15.97 | 25.0 | 6.4 |
+| unique(int64) (1000 distinct) | polars | 111.03 | 3.6 | 472.3 |
+| unique(int64) (1000 distinct) | pyarrow | 85.34 | 4.7 | 85.3 |
+| unique(int64) (1000 distinct) | pandas (numpy) | 75.20 | 5.3 | 75.2 |
+| value_counts(int64) (1000 distinct) | ArrowMetal (GPU hash table) | 17.10 | 23.4 | 6.8 |
+| value_counts(int64) (1000 distinct) | polars | 116.33 | 3.4 | 116.3 |
+| value_counts(int64) (1000 distinct) | pyarrow | 139.61 | 2.9 | 139.6 |
+| value_counts(int64) (1000 distinct) | pandas | 140.09 | 2.9 | 140.1 |
+| count_distinct(int64) (1000 distinct) | ArrowMetal (GPU hash table) | 9.59 | 41.7 | 2.2 |
+| count_distinct(int64) (1000 distinct) | polars | 116.06 | 3.4 | 479.2 |
+| count_distinct(int64) (1000 distinct) | pyarrow | 81.68 | 4.9 | 81.7 |
+| count_distinct(int64) (1000 distinct) | pandas | 85.50 | 4.7 | 85.5 |
+| mode(int64) (1000 distinct) | ArrowMetal (GPU hash table) | 26.52 | 15.1 | 8.0 |
+| mode(int64) (1000 distinct) | polars | 58.67 | 6.8 | 765.9 |
+| mode(int64) (1000 distinct) | pyarrow | 21.49 | 18.6 | 21.5 |
+| unique(int64) (100000 distinct) | ArrowMetal (GPU hash table) | 19.00 | 21.1 | 7.2 |
+| unique(int64) (100000 distinct) | polars | 123.60 | 3.2 | 734.1 |
+| unique(int64) (100000 distinct) | pyarrow | 77.98 | 5.1 | 78.0 |
+| unique(int64) (100000 distinct) | pandas (numpy) | 82.21 | 4.9 | 82.2 |
+| value_counts(int64) (100000 distinct) | ArrowMetal (GPU hash table) | 20.49 | 19.5 | 7.6 |
+| value_counts(int64) (100000 distinct) | polars | 320.30 | 1.2 | 323.3 |
+| value_counts(int64) (100000 distinct) | pyarrow | 192.25 | 2.1 | 192.2 |
+| value_counts(int64) (100000 distinct) | pandas | 194.27 | 2.1 | 194.2 |
+| count_distinct(int64) (100000 distinct) | ArrowMetal (GPU hash table) | 9.83 | 40.7 | 2.4 |
+| count_distinct(int64) (100000 distinct) | polars | 119.60 | 3.3 | 732.9 |
+| count_distinct(int64) (100000 distinct) | pyarrow | 71.23 | 5.6 | 71.2 |
+| count_distinct(int64) (100000 distinct) | pandas | 76.89 | 5.2 | 76.9 |
+| mode(int64) (100000 distinct) | ArrowMetal (GPU hash table) | 30.36 | 13.2 | 9.0 |
+| mode(int64) (100000 distinct) | polars | 70.99 | 5.6 | 950.7 |
+| mode(int64) (100000 distinct) | pyarrow | 549.52 | 0.7 | 549.5 |
+| unique(int64) (10000000 distinct) | ArrowMetal (GPU hash table) | 100.55 | 4.0 | 14.7 |
+| unique(int64) (10000000 distinct) | polars | 165.92 | 2.4 | 1265.8 |
+| unique(int64) (10000000 distinct) | pyarrow | 658.25 | 0.6 | 658.2 |
+| unique(int64) (10000000 distinct) | pandas (numpy) | 620.09 | 0.6 | 620.0 |
+| value_counts(int64) (10000000 distinct) | ArrowMetal (GPU hash table) | 109.78 | 3.6 | 16.4 |
+| value_counts(int64) (10000000 distinct) | polars | 1532.52 | 0.3 | 1669.5 |
+| value_counts(int64) (10000000 distinct) | pyarrow | 1446.67 | 0.3 | 1446.5 |
+| value_counts(int64) (10000000 distinct) | pandas | 1496.30 | 0.3 | 1496.2 |
+| count_distinct(int64) (10000000 distinct) | ArrowMetal (GPU hash table) | 41.29 | 9.7 | 3.0 |
+| count_distinct(int64) (10000000 distinct) | polars | 150.05 | 2.7 | 1255.1 |
+| count_distinct(int64) (10000000 distinct) | pyarrow | 714.21 | 0.6 | 714.2 |
+| count_distinct(int64) (10000000 distinct) | pandas | 657.65 | 0.6 | 657.6 |
+| mode(int64) (10000000 distinct) | ArrowMetal (GPU hash table) | 166.28 | 2.4 | 31.1 |
+| mode(int64) (10000000 distinct) | polars | 383.45 | 1.0 | 3767.0 |
+| mode(int64) (10000000 distinct) | pyarrow | 988.16 | 0.4 | 988.1 |
+| group-by sum(Int64) over utf8 keys (1000 distinct) | ArrowMetal (GPU, key mapping included) | 18.30 | 65.6 | 3.7 |
+| group-by sum(Int64) over utf8 keys (1000 distinct) | ArrowMetal (GPU, cached key mapping) | 1.88 | 639.8 | 0.4 |
+| group-by sum(Int64) over utf8 keys (1000 distinct) | polars group_by(utf8) | 147.41 | 8.1 | 1835.5 |
+| group-by sum(Int64) over utf8 keys (1000 distinct) | pyarrow group_by(utf8) | 37.16 | 32.3 | 509.2 |
+| dictionary_encode(utf8) (1000 distinct) | ArrowMetal (GPU hash table) | 18.54 | 64.7 | 4.1 |
+| dictionary_encode(utf8) (1000 distinct) | pyarrow dictionary_encode | 354.65 | 3.4 | 354.6 |
+| group-by sum(Int64) over two int32 columns (~1024 distinct) | ArrowMetal (GPU, key mapping included) | 6.07 | 131.8 | 2.2 |
+| group-by sum(Int64) over two int32 columns (~1024 distinct) | ArrowMetal (GPU, cached key mapping) | 1.86 | 430.7 | 0.4 |
+| group-by sum(Int64) over two int32 columns (~1024 distinct) | polars group_by(a, b) | 170.25 | 4.7 | 2124.7 |
+| group-by sum(Int64) over two int32 columns (~1024 distinct) | pyarrow group_by(a, b) | 22.00 | 36.4 | 296.3 |
+| group-by sum(Int64) over utf8 keys (100000 distinct) | ArrowMetal (GPU, key mapping included) | 23.89 | 50.2 | 4.1 |
+| group-by sum(Int64) over utf8 keys (100000 distinct) | ArrowMetal (GPU, cached key mapping) | 3.93 | 305.3 | 0.4 |
+| group-by sum(Int64) over utf8 keys (100000 distinct) | polars group_by(utf8) | 170.90 | 7.0 | 2216.2 |
+| group-by sum(Int64) over utf8 keys (100000 distinct) | pyarrow group_by(utf8) | 135.55 | 8.9 | 1701.9 |
+| dictionary_encode(utf8) (100000 distinct) | ArrowMetal (GPU hash table) | 22.07 | 54.4 | 4.4 |
+| dictionary_encode(utf8) (100000 distinct) | pyarrow dictionary_encode | 511.74 | 2.3 | 511.6 |
+| group-by sum(Int64) over two int32 columns (~100489 distinct) | ArrowMetal (GPU, key mapping included) | 8.36 | 95.7 | 2.2 |
+| group-by sum(Int64) over two int32 columns (~100489 distinct) | ArrowMetal (GPU, cached key mapping) | 3.89 | 205.7 | 0.4 |
+| group-by sum(Int64) over two int32 columns (~100489 distinct) | polars group_by(a, b) | 189.59 | 4.2 | 2468.5 |
+| group-by sum(Int64) over two int32 columns (~100489 distinct) | pyarrow group_by(a, b) | 53.39 | 15.0 | 611.2 |
+| group-by sum(Int64) over utf8 keys (10000000 distinct) | ArrowMetal (GPU, key mapping included) | 126.77 | 9.5 | 7.3 |
+| group-by sum(Int64) over utf8 keys (10000000 distinct) | ArrowMetal (GPU, cached key mapping) | 28.52 | 42.1 | 1.0 |
+| group-by sum(Int64) over utf8 keys (10000000 distinct) | polars group_by(utf8) | 538.46 | 2.2 | 7291.2 |
+| group-by sum(Int64) over utf8 keys (10000000 distinct) | pyarrow group_by(utf8) | 2910.84 | 0.4 | 6404.6 |
+| dictionary_encode(utf8) (10000000 distinct) | ArrowMetal (GPU hash table) | 103.19 | 11.6 | 7.1 |
+| dictionary_encode(utf8) (10000000 distinct) | pyarrow dictionary_encode | 3539.48 | 0.3 | 3538.3 |
+| group-by sum(Int64) over two int32 columns (~10004569 distinct) | ArrowMetal (GPU, key mapping included) | 47.69 | 16.8 | 3.4 |
+| group-by sum(Int64) over two int32 columns (~10004569 distinct) | ArrowMetal (GPU, cached key mapping) | 35.84 | 22.3 | 1.1 |
+| group-by sum(Int64) over two int32 columns (~10004569 distinct) | polars group_by(a, b) | 555.37 | 1.4 | 7667.7 |
+| group-by sum(Int64) over two int32 columns (~10004569 distinct) | pyarrow group_by(a, b) | 1390.16 | 0.6 | 3869.4 |

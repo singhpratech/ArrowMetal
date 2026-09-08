@@ -1,0 +1,66 @@
+ArrowMetal 0.1.0 on Apple M4 Max vs polars 1.44.1 (16 threads), pyarrow 25.0.1, duckdb 1.5.5; rows=2,000,000, best of 5
+
+(a) sum(amount), count(*) where region < 20 and qty > 10
+  ArrowMetal lazy                                   0.57 ms         0.5 CPU-ms
+  polars lazy                                       0.63 ms         1.2 CPU-ms
+  duckdb                                            7.11 ms         7.9 CPU-ms
+
+(b) group-by 200 keys: sum, count; order by total desc limit 10
+  ArrowMetal lazy                                   4.11 ms         3.1 CPU-ms
+  polars lazy                                       2.36 ms        18.9 CPU-ms
+  duckdb                                           25.68 ms        39.2 CPU-ms
+
+(c) group-by (region, sub): 10 000 groups, mean + max
+  ArrowMetal lazy                                   3.38 ms         3.1 CPU-ms
+  polars lazy                                       6.97 ms        78.9 CPU-ms
+  duckdb                                           20.28 ms        42.1 CPU-ms
+
+(d) with_columns((amount*2 + qty) / (region + 1) - qty) then filter
+  ArrowMetal lazy (1 fused kernel)                  0.75 ms         0.6 CPU-ms
+  polars lazy                                       5.92 ms         6.0 CPU-ms
+  duckdb                                           12.37 ms        15.5 CPU-ms
+
+(e) inner join 2,000,000 x 1,000,000 on int64, then sum
+  ArrowMetal lazy                                   2.12 ms         1.0 CPU-ms
+  polars lazy                                       8.02 ms        56.6 CPU-ms
+  duckdb                                           36.40 ms        66.9 CPU-ms
+
+(f) semi join 2,000,000 against a 1 000-row key set
+  ArrowMetal lazy                                   2.52 ms         1.2 CPU-ms
+  polars lazy                                       1.23 ms        13.1 CPU-ms
+  duckdb                                            1.64 ms         3.6 CPU-ms
+
+(g) row_number() over (partition by g order by v), 2,000,000 rows, 1 000 partitions
+  ArrowMetal lazy                                   4.71 ms         4.1 CPU-ms
+  polars lazy                                      15.35 ms       113.6 CPU-ms
+  duckdb                                           94.39 ms       379.8 CPU-ms
+
+(h) as-of join 2,000,000 trades against 1,000,000 quotes
+  ArrowMetal lazy                                   1.97 ms         1.9 CPU-ms
+  polars                                            6.92 ms        10.3 CPU-ms
+
+| case | implementation | wall ms | CPU ms |
+|---|---|---:|---:|
+| (a) sum(amount), count(*) where region < 20 and qty > 10 | ArrowMetal lazy | 0.57 | 0.5 |
+|  | polars lazy | 0.63 | 1.2 |
+|  | duckdb | 7.11 | 7.9 |
+| (b) group-by 200 keys: sum, count; order by total desc limit 10 | ArrowMetal lazy | 4.11 | 3.1 |
+|  | polars lazy | 2.36 | 18.9 |
+|  | duckdb | 25.68 | 39.2 |
+| (c) group-by (region, sub): 10 000 groups, mean + max | ArrowMetal lazy | 3.38 | 3.1 |
+|  | polars lazy | 6.97 | 78.9 |
+|  | duckdb | 20.28 | 42.1 |
+| (d) with_columns((amount*2 + qty) / (region + 1) - qty) then filter | ArrowMetal lazy (1 fused kernel) | 0.75 | 0.6 |
+|  | polars lazy | 5.92 | 6.0 |
+|  | duckdb | 12.37 | 15.5 |
+| (e) inner join 2,000,000 x 1,000,000 on int64, then sum | ArrowMetal lazy | 2.12 | 1.0 |
+|  | polars lazy | 8.02 | 56.6 |
+|  | duckdb | 36.40 | 66.9 |
+| (f) semi join 2,000,000 against a 1 000-row key set | ArrowMetal lazy | 2.52 | 1.2 |
+|  | polars lazy | 1.23 | 13.1 |
+|  | duckdb | 1.64 | 3.6 |
+| (g) row_number() over (partition by g order by v), 2,000,000 rows, 1 000 partitions | ArrowMetal lazy | 4.71 | 4.1 |
+|  | polars lazy | 15.35 | 113.6 |
+|  | duckdb | 94.39 | 379.8 |
+| (h) as-of join 2,000,000 trades against 1,000,000 quotes | ArrowMetal lazy | 1.97 | 1.9 |
+|  | polars | 6.92 | 10.3 |

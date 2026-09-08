@@ -181,6 +181,26 @@ page templates.
 The same applies to the comparison table of other projects: it is sourced from each project's public docs
 and goes stale on their schedule, not ours.
 
+## 8b. Publish the website
+
+The site ships as one static page plus its icon set. It is published to GitHub Pages from the `gh-pages`
+branch by a script kept outside the repository (`private/tools/publish_pages.sh`), which rebuilds both site
+outputs from the current sources, refuses to run on a dirty `main` or on a page containing a personal
+address, adds the `CNAME` for the domain and force-pushes the standalone build. Run it after step 8, and
+once only per release state:
+
+```
+private/tools/publish_pages.sh arrowmetal.org
+```
+
+The first time, set the repository's Pages settings by hand: source "Deploy from a branch", branch
+`gh-pages`, folder `/`, custom domain `arrowmetal.org`, "Enforce HTTPS" on; point the domain's DNS at
+GitHub Pages (four A records to `185.199.108.153` … `.111.153`, and `www` as a CNAME to the account's
+`github.io` host). Then open the published page and check, in this order: the tab icon is the ArrowMetal
+mark; every tab renders on first arrival; the Compare table fits at a normal window width; a doc page
+shows its "On this page" list; dark mode shows amber links; the footer links resolve now that the
+repository is public. The claude.ai preview is a separate copy and is never the deployed page.
+
 ## 9. Numbers to re-run before announcing
 
 Benchmark tables name the machine they were measured on, and the README quotes them. Re-run on the
