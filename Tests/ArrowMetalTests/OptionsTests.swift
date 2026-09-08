@@ -677,8 +677,8 @@ extension OptionsTests {
         let plain = RoundTemporalOptions(multiple: 3, unit: .hour)
         var strict = plain
         strict.ceilIsStrictlyGreater = true
-        XCTAssertEqual(try a.ceilTemporal(plain).asInt64!.toRawArray(), [0, 3600 * 3, 3600 * 6])
-        XCTAssertEqual(try a.ceilTemporal(strict).asInt64!.toRawArray(), [3600 * 3, 3600 * 6, 3600 * 6])
+        XCTAssertEqual(try a.ceilTemporal(plain).asInt64!.toRawArray(), [0, 10_800, 21_600])
+        XCTAssertEqual(try a.ceilTemporal(strict).asInt64!.toRawArray(), [10_800, 21_600, 21_600])
     }
 
     func testCalendarBasedOriginStartsAtTheGreaterUnit() throws {

@@ -479,7 +479,7 @@ final class TextTests: XCTestCase {
     func testSubsecondComponents() throws {
         try requireRealGPU()
         let ns = try MetalTemporalArray(type: .timestamp(.nano, timezone: nil),
-                                        [123_456_789, 1_000_000_000 + 987_654_321, -1, nil])
+                                        [123_456_789, 1_987_654_321, -1, nil])
         XCTAssertEqual(try ns.millisecond().toArray(), [123, 987, 999, nil])
         XCTAssertEqual(try ns.microsecond().toArray(), [456, 654, 999, nil])
         XCTAssertEqual(try ns.nanosecond().toArray(), [789, 321, 999, nil])
@@ -507,7 +507,7 @@ final class TextTests: XCTestCase {
 
         let d32 = try MetalTemporalArray(type: .date32, [Int64(10), 20])
         let d32b = try MetalTemporalArray(type: .date32, [Int64(7), 25])
-        XCTAssertEqual(try d32.subtractTemporal(d32b).toArray(), [3 * 86_400, -5 * 86_400])
+        XCTAssertEqual(try d32.subtractTemporal(d32b).toArray(), [259_200, -432_000])   // 3 and -5 days in seconds
         XCTAssertThrowsError(try d32.addDuration(dur.slice(offset: 0, length: 2)))
     }
 
@@ -517,7 +517,7 @@ final class TextTests: XCTestCase {
         let a = try MetalTemporalArray(type: .timestamp(.second, timezone: nil),
                                        [1_614_902_340, 0, nil, 86_400])
         let b = try MetalTemporalArray(type: .timestamp(.second, timezone: nil),
-                                       [1_614_902_460, 86_400 * 3, 5, 0])
+                                       [1_614_902_460, 259_200, 5, 0])
         XCTAssertEqual(try a.daysBetween(b).toArray(), [1, 3, nil, -1])
     }
 

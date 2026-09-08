@@ -777,10 +777,10 @@ final class StreamTests: XCTestCase {
     }
 
     static func keyRows(_ n: Int, keys: Int, nullEvery: Int = 13) -> [KeyRow] {
-        (0..<n).map { i in
-            KeyRow(key: i % nullEvery == 5 ? nil : Int64((i &* 2654435761) % keys),
-                   amount: i % 7 == 2 ? nil : Double((i &* 48271) % 10_007) / 7.0,
-                   qty: Int32(i % 97))
+        (0..<n).map { (i: Int) -> KeyRow in
+            let key: Int64? = i % nullEvery == 5 ? nil : Int64((i &* 2654435761) % keys)
+            let amount: Double? = i % 7 == 2 ? nil : Double((i &* 48271) % 10_007) / 7.0
+            return KeyRow(key: key, amount: amount, qty: Int32(i % 97))
         }
     }
 

@@ -666,7 +666,11 @@ final class TypesExtraTests: XCTestCase {
             let per = unit.perSecond
             // Noon UTC on 400 consecutive days: never inside a DST transition in New York.
             let base: Int64 = 1_672_574_400                                   // 2023-01-01T12:00:00Z
-            let instants: [Int64?] = (0..<400).map { $0 % 17 == 3 ? nil : (base + Int64($0) * 86_400) * per }
+            let instants: [Int64?] = (0..<400).map { (i: Int) -> Int64? in
+                if i % 17 == 3 { return nil }
+                let day: Int64 = base + Int64(i) * 86_400
+                return day * per
+            }
             let ts = try MetalTemporalArray(type: .timestamp(unit, timezone: tz), instants)
             let local = try ts.localTimestamp()
             XCTAssertEqual(local.type, .timestamp(unit, timezone: nil))
