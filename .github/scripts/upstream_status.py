@@ -3,9 +3,10 @@
 Reads the report links out of docs/UPSTREAM.md (the `Report` column of the tracker table), asks
 GitHub for each issue's state, the project side's comments (accounts with an OWNER, MEMBER,
 COLLABORATOR or CONTRIBUTOR association), label changes, close and reopen events, and pull requests
-in the project's own repository that reference the issue. The reporter's own comments are counted
-but not shown. The result is one JSON file the website fetches; nothing on the page talks to
-api.github.com. Feedback Assistant reports have no public state and are not in the file.
+in the project's own repository that reference the issue. Each such pull request (and a report that
+is itself a pull request) is followed too: project-side reviews and comments on it count as activity
+on the report, one event per review pass. The reporter's own comments are counted but not shown.
+The result is one JSON file the website fetches; nothing on the page talks to api.github.com. Feedback Assistant reports have no public state and are not in the file.
 
 Usage: GITHUB_TOKEN=... upstream_status.py [--md docs/UPSTREAM.md] [--out upstream/status.json]
 """
@@ -68,6 +69,44 @@ def report_rows(md_path):
             break   # the first link in the cell is our report; the rest are related issues
 
 
+def is_ours_or_bot(user, mine):
+    login = (user or {}).get("login") or ""
+    return not login or login in mine or (user or {}).get("type") == "Bot" or login.endswith("[bot]")
+
+
+def pr_activity(owner, repo, num, token, mine, with_comments):
+    """Project-side reviews (and, unless the caller already read them, comments) on a pull request.
+    Review submissions by one person within half an hour are one event: a review pass."""
+    pr_url = f"https://github.com/{owner}/{repo}/pull/{num}"
+    inline = {}
+    for c in paged(f"{API}/repos/{owner}/{repo}/pulls/{num}/comments?per_page=100", token):
+        inline.setdefault(c.get("pull_request_review_id"), []).append(c)
+    passes = []
+    for rv in sorted(paged(f"{API}/repos/{owner}/{repo}/pulls/{num}/reviews?per_page=100", token), key=lambda r: r.get("submitted_at") or ""):
+        if is_ours_or_bot(rv.get("user"), mine) or rv.get("author_association", "NONE") not in PROJECT_SIDE:
+            continue
+        notes = inline.get(rv["id"], [])
+        ev = {"type": "review", "at": rv.get("submitted_at"), "actor": rv["user"]["login"], "association": rv["author_association"].lower(),
+              "state": (rv.get("state") or "commented").lower(), "text": clean(rv.get("body")) or (clean(notes[0]["body"]) if notes else ""),
+              "inline": len(notes), "url": rv.get("html_url") or pr_url, "pr": pr_url}
+        prev = passes[-1] if passes else None
+        if prev and prev["actor"] == ev["actor"] and ev["at"] and prev["at"] and \
+                (dt.datetime.fromisoformat(ev["at"].replace("Z", "+00:00")) - dt.datetime.fromisoformat(prev["at"].replace("Z", "+00:00"))).total_seconds() <= 1800:
+            prev["inline"] += ev["inline"]
+            prev["text"] = prev["text"] or ev["text"]
+            if ev["state"] in ("approved", "changes_requested"):
+                prev["state"] = ev["state"]
+            continue
+        passes.append(ev)
+    if with_comments:
+        for c in paged(f"{API}/repos/{owner}/{repo}/issues/{num}/comments?per_page=100", token):
+            if is_ours_or_bot(c.get("user"), mine) or c.get("author_association", "NONE") not in PROJECT_SIDE:
+                continue
+            passes.append({"type": "pr_comment", "at": c["created_at"], "actor": c["user"]["login"], "association": c["author_association"].lower(),
+                           "text": clean(c["body"]), "url": c["html_url"], "pr": pr_url})
+    return passes
+
+
 def clean(text):
     text = re.sub(r"```.*?```", "[code]", text or "", flags=re.S)
     text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
@@ -119,6 +158,14 @@ def build(md_path, token, ours=("singhpratech",)):
                 events.append({"type": "commit", "at": at, "actor": actor, "url": f"https://github.com/{owner}/{repo}/commit/{ev['commit_id']}"})
             elif t == "milestoned":
                 events.append({"type": "milestoned", "at": at, "actor": actor, "milestone": (ev.get("milestone") or {}).get("title")})
+        followed = [(owner, repo, num, False)] if kind == "pull" else []      # a report that is a PR: its comments are read above
+        for ev in events:
+            if ev["type"] == "pull_request":
+                m = re.match(r"https://github\.com/([^/]+)/([^/]+)/pull/(\d+)", ev["url"] or "")
+                if m:
+                    followed.append((m.group(1), m.group(2), m.group(3), True))
+        for o, r, n, with_comments in dict.fromkeys(followed):
+            events.extend(pr_activity(o, r, n, token, mine, with_comments))
         events.sort(key=lambda e: e.get("at") or "")
         last = max([e.get("at") for e in events if e.get("at")] + [issue.get("closed_at") or ""] + [""])
         state = "open" if issue["state"] == "open" else {"completed": "fixed", "not_planned": "closed (not planned)",
