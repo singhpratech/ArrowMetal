@@ -1,0 +1,898 @@
+{
+ "as_of": "2026-09-10T16:20:25Z",
+ "window_days": 14,
+ "count": 14,
+ "with_project_activity": 13,
+ "fixed": 3,
+ "items": [
+  {
+   "project": "pyarrow 25.0.1",
+   "finding": "`pc.utf8_normalize` decomposes whatever `form` says (its NFC output is NFD)",
+   "repo": "apache/arrow",
+   "number": 51225,
+   "url": "https://github.com/apache/arrow/issues/51225",
+   "kind": "issue",
+   "title": "[Python][C++] utf8_normalize ignores its `form` option: NFC and NFKC output is decomposed",
+   "reporter": "singhpratech",
+   "reported": "2026-09-08",
+   "state": "fixed",
+   "closed_at": "2026-09-10T16:02:52Z",
+   "labels": [
+    "Component: C++"
+   ],
+   "reactions": 0,
+   "maintainer_events": [
+    {
+     "type": "pull_request",
+     "at": "2026-09-08T13:11:53Z",
+     "actor": "singhpratech",
+     "title": "GH-51225: [C++] utf8_normalize: compose for NFC and NFKC",
+     "url": "https://github.com/apache/arrow/pull/51237",
+     "state": "merged",
+     "by_reporter": true
+    },
+    {
+     "type": "review",
+     "at": "2026-09-08T13:30:46Z",
+     "actor": "raulcd",
+     "association": "member",
+     "state": "commented",
+     "text": "This is not a critical fix, can you update the description.",
+     "inline": 1,
+     "url": "https://github.com/apache/arrow/pull/51237#pullrequestreview-5142356515",
+     "pr": "https://github.com/apache/arrow/pull/51237"
+    },
+    {
+     "type": "review",
+     "at": "2026-09-10T09:20:01Z",
+     "actor": "pitrou",
+     "association": "member",
+     "state": "commented",
+     "text": "I think keeping the bytes values make it clearer what the test is doing (and prevent the mistake that is being fixed here :-)).",
+     "inline": 3,
+     "url": "https://github.com/apache/arrow/pull/51237#pullrequestreview-5165220115",
+     "pr": "https://github.com/apache/arrow/pull/51237"
+    },
+    {
+     "type": "review",
+     "at": "2026-09-10T15:09:23Z",
+     "actor": "pitrou",
+     "association": "member",
+     "state": "approved",
+     "text": "Oh, that's interesting indeed. Thanks for the example. [code]",
+     "inline": 1,
+     "url": "https://github.com/apache/arrow/pull/51237#pullrequestreview-5168856567",
+     "pr": "https://github.com/apache/arrow/pull/51237"
+    },
+    {
+     "type": "pr_comment",
+     "at": "2026-09-10T15:11:21Z",
+     "actor": "pitrou",
+     "association": "member",
+     "text": "Nit: I've literal-quoted @Santoshkumarpuppala in the PR description to avoid spurious GH notifications when commits propagate (merges, etc.).",
+     "url": "https://github.com/apache/arrow/pull/51237#issuecomment-5620925991",
+     "pr": "https://github.com/apache/arrow/pull/51237"
+    },
+    {
+     "type": "commit",
+     "at": "2026-09-10T16:02:26Z",
+     "actor": "pitrou",
+     "url": "https://github.com/apache/arrow/commit/79e074ace3a7c4ca26f211dfd84a1984ad53c362"
+    },
+    {
+     "type": "labeled",
+     "at": "2026-09-10T16:02:44Z",
+     "actor": "pitrou",
+     "label": "Component: C++"
+    },
+    {
+     "type": "milestoned",
+     "at": "2026-09-10T16:02:50Z",
+     "actor": "pitrou",
+     "milestone": "26.0.0"
+    },
+    {
+     "type": "comment",
+     "at": "2026-09-10T16:02:51Z",
+     "actor": "pitrou",
+     "association": "member",
+     "text": "Issue resolved by pull request 51237 https://github.com/apache/arrow/pull/51237",
+     "url": "https://github.com/apache/arrow/issues/51225#issuecomment-5621660020"
+    },
+    {
+     "type": "closed",
+     "at": "2026-09-10T16:02:52Z",
+     "actor": "pitrou",
+     "reason": null,
+     "commit": null
+    }
+   ],
+   "reporter_comments": 2,
+   "community_comments": 1,
+   "last_activity": "2026-09-10T16:02:52Z",
+   "pulse": true
+  },
+  {
+   "project": "pyarrow 25.0.1",
+   "finding": "`pc.pairwise_diff` on a sliced array ignores `ArrowArray.offset`",
+   "repo": "apache/arrow",
+   "number": 50524,
+   "url": "https://github.com/apache/arrow/issues/50524",
+   "kind": "reported by others",
+   "title": "[C++][Python] pairwise_diff ignores array offsets for sliced inputs",
+   "reporter": "hsusul",
+   "reported": "2026-07-16",
+   "state": "fixed",
+   "closed_at": "2026-08-25T13:46:41Z",
+   "labels": [
+    "Component: C++"
+   ],
+   "reactions": 0,
+   "maintainer_events": [
+    {
+     "type": "comment",
+     "at": "2026-07-28T12:24:43Z",
+     "actor": "Alb3e3",
+     "association": "contributor",
+     "text": "Is anyone actively working on this? You mentioned on Jul 16 that you had a small C++ fix with focused regression coverage scoped out — if you're still planning to send it, please go ahead; I don't want to duplicate your work. If you'd rather hand it off, I'm happy to pick it up. …",
+     "url": "https://github.com/apache/arrow/issues/50524#issuecomment-5104105821"
+    },
+    {
+     "type": "pull_request",
+     "at": "2026-08-13T10:16:55Z",
+     "actor": "Krishnanand-G",
+     "title": "GH-50524: [C++] Honor array offset in pairwise_diff",
+     "url": "https://github.com/apache/arrow/pull/50858",
+     "state": "merged",
+     "by_reporter": false
+    },
+    {
+     "type": "review",
+     "at": "2026-08-13T18:14:38Z",
+     "actor": "uros-b",
+     "association": "member",
+     "state": "approved",
+     "text": "",
+     "inline": 0,
+     "url": "https://github.com/apache/arrow/pull/50858#pullrequestreview-4930247439",
+     "pr": "https://github.com/apache/arrow/pull/50858"
+    },
+    {
+     "type": "pr_comment",
+     "at": "2026-08-13T18:14:50Z",
+     "actor": "uros-b",
+     "association": "member",
+     "text": "LGTM",
+     "url": "https://github.com/apache/arrow/pull/50858#issuecomment-5284648907",
+     "pr": "https://github.com/apache/arrow/pull/50858"
+    },
+    {
+     "type": "pr_comment",
+     "at": "2026-08-18T08:34:08Z",
+     "actor": "Krishnanand-G",
+     "association": "contributor",
+     "text": "I checked the ARM64 macOS failures. ARM64 macOS 14 C++: `arrow-s3fs-test` timed out at 300s (two retries). `arrow-compute-vector-test` passed (4.56s), including `vector_pairwise_test.cc`. ARM64 macOS GLib & Ruby: the build died in vendored google-cloud-cpp (`absl::visit` marked d…",
+     "url": "https://github.com/apache/arrow/pull/50858#issuecomment-5325682897",
+     "pr": "https://github.com/apache/arrow/pull/50858"
+    },
+    {
+     "type": "pr_comment",
+     "at": "2026-08-21T07:05:58Z",
+     "actor": "Krishnanand-G",
+     "association": "contributor",
+     "text": "This has @uros-b's LGTM and the two ARM64 macOS failures are unrelated (S3 test timeout + google-cloud-cpp Werror on deprecated absl::visit — both green on ARM64 Ubuntu and AMD64 macOS). Could a committer add the component labels to #50524 and merge this?",
+     "url": "https://github.com/apache/arrow/pull/50858#issuecomment-5366369858",
+     "pr": "https://github.com/apache/arrow/pull/50858"
+    },
+    {
+     "type": "labeled",
+     "at": "2026-08-25T13:35:24Z",
+     "actor": "pitrou",
+     "label": "Component: C++"
+    },
+    {
+     "type": "review",
+     "at": "2026-08-25T13:45:53Z",
+     "actor": "pitrou",
+     "association": "member",
+     "state": "approved",
+     "text": "Thanks for the fix @Krishnanand-G ! This looks good to me.",
+     "inline": 0,
+     "url": "https://github.com/apache/arrow/pull/50858#pullrequestreview-5019648546",
+     "pr": "https://github.com/apache/arrow/pull/50858"
+    },
+    {
+     "type": "commit",
+     "at": "2026-08-25T13:46:19Z",
+     "actor": "pitrou",
+     "url": "https://github.com/apache/arrow/commit/a2a9dce9d8fbcb822fbb54a52efc2f52d1bb6516"
+    },
+    {
+     "type": "milestoned",
+     "at": "2026-08-25T13:46:39Z",
+     "actor": "pitrou",
+     "milestone": "26.0.0"
+    },
+    {
+     "type": "comment",
+     "at": "2026-08-25T13:46:41Z",
+     "actor": "pitrou",
+     "association": "member",
+     "text": "Issue resolved by pull request 50858 https://github.com/apache/arrow/pull/50858",
+     "url": "https://github.com/apache/arrow/issues/50524#issuecomment-5411326615"
+    },
+    {
+     "type": "closed",
+     "at": "2026-08-25T13:46:41Z",
+     "actor": "pitrou",
+     "reason": null,
+     "commit": null
+    }
+   ],
+   "reporter_comments": 1,
+   "community_comments": 0,
+   "last_activity": "2026-08-25T13:46:41Z",
+   "pulse": false
+  },
+  {
+   "project": "pyarrow 25.0.1",
+   "finding": "`pc.fill_null_forward`, `pc.fill_null_backward`, `pc.replace_with_mask` on a sliced boolean array ignore the offset",
+   "repo": "apache/arrow",
+   "number": 51223,
+   "url": "https://github.com/apache/arrow/issues/51223",
+   "kind": "issue",
+   "title": "[C++] fill_null_forward, fill_null_backward and replace_with_mask read the wrong bits on a sliced boolean array",
+   "reporter": "singhpratech",
+   "reported": "2026-09-08",
+   "state": "open",
+   "closed_at": null,
+   "labels": [],
+   "reactions": 0,
+   "maintainer_events": [
+    {
+     "type": "commit",
+     "at": "2026-09-08T15:39:33Z",
+     "actor": "A-makarim",
+     "url": "https://github.com/apache/arrow/commit/2e8791f7b3c481aa2c3d9144b9f7f3b8ed1ced49"
+    },
+    {
+     "type": "pull_request",
+     "at": "2026-09-08T16:17:40Z",
+     "actor": "A-makarim",
+     "title": "GH-51223: [C++] Fix copying sliced boolean arrays",
+     "url": "https://github.com/apache/arrow/pull/51240",
+     "state": "open",
+     "by_reporter": false
+    },
+    {
+     "type": "commit",
+     "at": "2026-09-09T22:55:26Z",
+     "actor": "A-makarim",
+     "url": "https://github.com/apache/arrow/commit/efb7d1ffbdf6dd7dedb553d90f6c38d5b758415a"
+    }
+   ],
+   "reporter_comments": 0,
+   "community_comments": 1,
+   "last_activity": "2026-09-09T22:55:26Z",
+   "pulse": true
+  },
+  {
+   "project": "pyarrow 25.0.1",
+   "finding": "`pc.winsorize` on a sliced array nulls the wrong rows and places values where the input has nulls",
+   "repo": "apache/arrow",
+   "number": 51224,
+   "url": "https://github.com/apache/arrow/issues/51224",
+   "kind": "issue",
+   "title": "[C++] winsorize on a sliced array ignores the offset: wrong rows come out null",
+   "reporter": "singhpratech",
+   "reported": "2026-09-08",
+   "state": "open",
+   "closed_at": null,
+   "labels": [],
+   "reactions": 0,
+   "maintainer_events": [
+    {
+     "type": "pull_request",
+     "at": "2026-09-09T01:05:43Z",
+     "actor": "1fanwang",
+     "title": "GH-51224: [C++] Keep the correct nulls when winsorizing a sliced array",
+     "url": "https://github.com/apache/arrow/pull/51251",
+     "state": "open",
+     "by_reporter": false
+    },
+    {
+     "type": "commit",
+     "at": "2026-09-09T07:28:16Z",
+     "actor": "1fanwang",
+     "url": "https://github.com/apache/arrow/commit/f75624f7495cfa82208276225d0bb133e29b20b3"
+    },
+    {
+     "type": "review",
+     "at": "2026-09-09T07:28:27Z",
+     "actor": "1fanwang",
+     "association": "contributor",
+     "state": "commented",
+     "text": "Done in https://github.com/apache/arrow/commit/f75624f7495cfa82208276225d0bb133e29b20b3.",
+     "inline": 1,
+     "url": "https://github.com/apache/arrow/pull/51251#pullrequestreview-5151105927",
+     "pr": "https://github.com/apache/arrow/pull/51251"
+    },
+    {
+     "type": "commit",
+     "at": "2026-09-09T08:13:50Z",
+     "actor": "1fanwang",
+     "url": "https://github.com/apache/arrow/commit/31bb7291231452c6aa26bf7348524c4679a5e1de"
+    },
+    {
+     "type": "commit",
+     "at": "2026-09-09T08:17:56Z",
+     "actor": "1fanwang",
+     "url": "https://github.com/apache/arrow/commit/c0882dbed77501a7d91fb41d47ae0fa29ffad459"
+    },
+    {
+     "type": "review",
+     "at": "2026-09-09T08:18:08Z",
+     "actor": "1fanwang",
+     "association": "contributor",
+     "state": "commented",
+     "text": "Done in https://github.com/apache/arrow/commit/c0882dbed77501a7d91fb41d47ae0fa29ffad459. Confirmed against `ExecChunked`, which seeds the output from `chunk->data()->Copy()`, so a sliced chunk carried its offset into buffers built for the slice alone. `TestWinsorize.SlicedChunked…",
+     "inline": 1,
+     "url": "https://github.com/apache/arrow/pull/51251#pullrequestreview-5151581075",
+     "pr": "https://github.com/apache/arrow/pull/51251"
+    }
+   ],
+   "reporter_comments": 0,
+   "community_comments": 0,
+   "last_activity": "2026-09-09T08:18:08Z",
+   "pulse": true
+  },
+  {
+   "project": "pyarrow 25.0.1",
+   "finding": "`pc.binary_slice` with its own default `stop` raises `ArrowInvalid: Negative buffer resize`",
+   "repo": "apache/arrow",
+   "number": 51222,
+   "url": "https://github.com/apache/arrow/issues/51222",
+   "kind": "issue",
+   "title": "[C++] binary_slice with its default `stop` raises \"Negative buffer resize\"",
+   "reporter": "singhpratech",
+   "reported": "2026-09-08",
+   "state": "open",
+   "closed_at": null,
+   "labels": [],
+   "reactions": 0,
+   "maintainer_events": [],
+   "reporter_comments": 1,
+   "community_comments": 0,
+   "last_activity": null,
+   "pulse": false
+  },
+  {
+   "project": "Arrow (vendored date library)",
+   "finding": "DST rules stop being applied after the last tabulated transition (2037), so a summer instant in 2050 gets the winter offset, on a fat TZif file",
+   "repo": "apache/arrow",
+   "number": 36110,
+   "url": "https://github.com/apache/arrow/issues/36110",
+   "kind": "reported by others",
+   "title": "[C++][Python] Wrong result when converting time zones after 2038",
+   "reporter": "MarcoGorelli",
+   "reported": "2023-06-15",
+   "state": "open",
+   "closed_at": null,
+   "labels": [
+    "Type: bug",
+    "Component: Python"
+   ],
+   "reactions": 0,
+   "maintainer_events": [
+    {
+     "type": "labeled",
+     "at": "2023-06-15T19:16:34Z",
+     "actor": "github-actions[bot]",
+     "label": "Component: Python"
+    },
+    {
+     "type": "comment",
+     "at": "2023-06-15T21:03:20Z",
+     "actor": "jorisvandenbossche",
+     "association": "member",
+     "text": "So essentially there is a difference between \"localizing\" it on the python side (using the python object's tzinfo to get the utc value), or doing it with arrow's kernel: [code] In principle we expect that those two give the same result, but they don't: [code] While one possible e…",
+     "url": "https://github.com/apache/arrow/issues/36110#issuecomment-1593720795"
+    },
+    {
+     "type": "comment",
+     "at": "2023-06-15T21:12:43Z",
+     "actor": "jorisvandenbossche",
+     "association": "member",
+     "text": "Also within python, pytz and zoneinfo give a different result for me: [code] And I think typically pytz includes its own copy of the tz database, so yet another version. pytz exposes the underlying information of the zone: [code] So it seems that the information here goes up to 2…",
+     "url": "https://github.com/apache/arrow/issues/36110#issuecomment-1593730847"
+    },
+    {
+     "type": "comment",
+     "at": "2023-06-16T08:02:23Z",
+     "actor": "jorisvandenbossche",
+     "association": "member",
+     "text": "Digging a little bit further: it's partly due to a different timezone database, but mostly due to a different way of \"interpolating\" into the future (i.e. the offset data in the database only go until a certain time, so the question is which UTC offset to use for a datetime after…",
+     "url": "https://github.com/apache/arrow/issues/36110#issuecomment-1594279063"
+    },
+    {
+     "type": "comment",
+     "at": "2023-06-16T15:57:55Z",
+     "actor": "jorisvandenbossche",
+     "association": "member",
+     "text": "> For reference, same with chrono-tz Just to ensure I understand correctly: it shows \"2058-10-27T00:00:00BST\", but the fact that it shows \"BST\" indicates it is the same \"2058-10-26 23:00:00+00:00\" result as with zoneinfo? (given that you indicate both have the same behaviour) > s…",
+     "url": "https://github.com/apache/arrow/issues/36110#issuecomment-1594909401"
+    }
+   ],
+   "reporter_comments": 4,
+   "community_comments": 0,
+   "last_activity": "2023-06-16T15:57:55Z",
+   "pulse": false
+  },
+  {
+   "project": "Apache Arrow JS",
+   "finding": "no C Data Interface export or import in the JavaScript library, so the Node binding builds the `ArrowArray`/`ArrowSchema` structs itself from a `Vector`'s buffers; and `Data.slice` advances the values and offsets buffers but not the validity bitmap, leaving the row offset in `Data.offset`, which a C Data consumer must undo",
+   "repo": "apache/arrow-js",
+   "number": 88,
+   "url": "https://github.com/apache/arrow-js/issues/88",
+   "kind": "reported by others",
+   "title": "[JS] Implement C Data Interface",
+   "reporter": "asfimport",
+   "reported": "2022-09-04",
+   "state": "open",
+   "closed_at": null,
+   "labels": [
+    "Type: enhancement"
+   ],
+   "reactions": 1,
+   "maintainer_events": [
+    {
+     "type": "comment",
+     "at": "2023-07-03T15:41:10Z",
+     "actor": "kylebarron",
+     "association": "member",
+     "text": "Posting here as well as the linked apache/arrow-js#82, I cleaned up my prototype from last year and published an 0.1 release to NPM: https://github.com/kylebarron/arrow-js-ffi",
+     "url": "https://github.com/apache/arrow-js/issues/88#issuecomment-2910719982"
+    }
+   ],
+   "reporter_comments": 6,
+   "community_comments": 0,
+   "last_activity": "2023-07-03T15:41:10Z",
+   "pulse": false
+  },
+  {
+   "project": "arrow R 25.0.0",
+   "finding": "the C Data Interface entry points (`Array$export_to_c`, `Array$import_from_c`) exist but the only allocators for the structs they take (`allocate_arrow_array()`, `allocate_arrow_schema()`) are unexported and none of the four has an Rd topic (133 topics, none matching import/export), so a third-party package must use `:::` or allocate the structs in its own C",
+   "repo": "apache/arrow",
+   "number": 39793,
+   "url": "https://github.com/apache/arrow/issues/39793",
+   "kind": "reported by others",
+   "title": "[R] Export functions for low-level pointer operations",
+   "reporter": "eitsupi",
+   "reported": "2024-01-25",
+   "state": "open",
+   "closed_at": null,
+   "labels": [
+    "Type: enhancement",
+    "Component: R",
+    "Status: needs champion"
+   ],
+   "reactions": 0,
+   "maintainer_events": [
+    {
+     "type": "labeled",
+     "at": "2024-01-25T11:57:49Z",
+     "actor": "github-actions[bot]",
+     "label": "Component: R"
+    },
+    {
+     "type": "labeled",
+     "at": "2025-11-18T11:24:10Z",
+     "actor": "github-actions[bot]",
+     "label": "Status: stale-warning"
+    },
+    {
+     "type": "unlabeled",
+     "at": "2025-11-25T15:45:59Z",
+     "actor": "thisisnic",
+     "label": "Status: stale-warning"
+    },
+    {
+     "type": "labeled",
+     "at": "2025-11-25T15:45:59Z",
+     "actor": "thisisnic",
+     "label": "Status: needs champion"
+    },
+    {
+     "type": "comment",
+     "at": "2025-11-25T15:46:28Z",
+     "actor": "thisisnic",
+     "association": "member",
+     "text": "@eitsupi Are you interested in making a PR for this or shall I leave it as \"needs champion\" for now?",
+     "url": "https://github.com/apache/arrow/issues/39793#issuecomment-3576320611"
+    },
+    {
+     "type": "pull_request",
+     "at": "2026-09-08T12:36:08Z",
+     "actor": "singhpratech",
+     "title": "GH-39793: [R] Export the C Data Interface allocators and document $export_to_c() / $import_from_c()",
+     "url": "https://github.com/apache/arrow/pull/51236",
+     "state": "open",
+     "by_reporter": true
+    }
+   ],
+   "reporter_comments": 3,
+   "community_comments": 0,
+   "last_activity": "2026-09-08T12:36:08Z",
+   "pulse": true
+  },
+  {
+   "project": "arrow R 25.0.0",
+   "finding": "`Array$create()` on an R double or integer vector borrows R's memory, whose data begins 48 bytes into a page-aligned allocation, so the values buffer sits at offset 48 mod 64: below the columnar spec's recommended 64-byte alignment and below the page alignment a GPU consumer needs, invisible to R users; measured 20/20 at 1M and 10M (`am_buffer_alignment()`)",
+   "repo": "apache/arrow",
+   "number": 51227,
+   "url": "https://github.com/apache/arrow/issues/51227",
+   "kind": "issue",
+   "title": "[R] Array$create() on a double or integer vector borrows R's memory, so the values buffer sits at offset 48 mod 64, below the columnar format's recommended alignment",
+   "reporter": "singhpratech",
+   "reported": "2026-09-08",
+   "state": "closed (not planned)",
+   "closed_at": "2026-09-08T09:41:43Z",
+   "labels": [],
+   "reactions": 0,
+   "maintainer_events": [
+    {
+     "type": "comment",
+     "at": "2026-09-08T09:41:43Z",
+     "actor": "thisisnic",
+     "association": "member",
+     "text": "Behaviour is as expected, and I'm not spending time/energy engaging with AI-generated complex issues. No docs updates needed as this is deep in Arrow internals. Feel free to add a comment within the code if you end up working on that other PR.",
+     "url": "https://github.com/apache/arrow/issues/51227#issuecomment-5582906638"
+    },
+    {
+     "type": "closed",
+     "at": "2026-09-08T09:41:43Z",
+     "actor": "thisisnic",
+     "reason": "not_planned",
+     "commit": null
+    },
+    {
+     "type": "pull_request",
+     "at": "2026-09-08T12:36:08Z",
+     "actor": "singhpratech",
+     "title": "GH-39793: [R] Export the C Data Interface allocators and document $export_to_c() / $import_from_c()",
+     "url": "https://github.com/apache/arrow/pull/51236",
+     "state": "open",
+     "by_reporter": true
+    }
+   ],
+   "reporter_comments": 0,
+   "community_comments": 0,
+   "last_activity": "2026-09-08T12:36:08Z",
+   "pulse": true
+  },
+  {
+   "project": "Apache Arrow Go v18.7.0",
+   "finding": "the `compute` package registers 85 scalar and vector functions and no aggregate at all (no `sum`, `mean`, `min_max`, `count`, no `hash_*`), and its package doc does not say so; every reduction and group-by oracle in the Go binding had to be a plain Go loop",
+   "repo": "apache/arrow-go",
+   "number": 1296,
+   "url": "https://github.com/apache/arrow-go/issues/1296",
+   "kind": "issue",
+   "title": "[Compute] The registry holds no aggregate functions (no sum, mean, min_max, count, hash_*), and the package documentation does not say so",
+   "reporter": "singhpratech",
+   "reported": "2026-09-08",
+   "state": "open",
+   "closed_at": null,
+   "labels": [],
+   "reactions": 0,
+   "maintainer_events": [
+    {
+     "type": "comment",
+     "at": "2026-09-08T16:47:14Z",
+     "actor": "zeroshade",
+     "association": "member",
+     "text": "The aggregate functions have been on my todo list for a long while but I haven't gotten to them. I'd love to see these kernels get implemented in the compute package! If you want to contribute the docs/comments updates that would also be welcome. Thanks!",
+     "url": "https://github.com/apache/arrow-go/issues/1296#issuecomment-5588690578"
+    },
+    {
+     "type": "pull_request",
+     "at": "2026-09-08T18:12:19Z",
+     "actor": "singhpratech",
+     "title": "docs(compute): state which function kinds the registry implements",
+     "url": "https://github.com/apache/arrow-go/pull/1303",
+     "state": "merged",
+     "by_reporter": true
+    },
+    {
+     "type": "review",
+     "at": "2026-09-08T18:22:01Z",
+     "actor": "zeroshade",
+     "association": "member",
+     "state": "approved",
+     "text": "LGTM, just one comment",
+     "inline": 1,
+     "url": "https://github.com/apache/arrow-go/pull/1303#pullrequestreview-5145450068",
+     "pr": "https://github.com/apache/arrow-go/pull/1303"
+    },
+    {
+     "type": "comment",
+     "at": "2026-09-08T18:59:57Z",
+     "actor": "zeroshade",
+     "association": "member",
+     "text": "Sounds good, looking forward to it!",
+     "url": "https://github.com/apache/arrow-go/issues/1296#issuecomment-5590299261"
+    },
+    {
+     "type": "commit",
+     "at": "2026-09-08T19:18:29Z",
+     "actor": "zeroshade",
+     "url": "https://github.com/apache/arrow-go/commit/e7b1e355c6f2b895e090d9ed71b0506b453f1311"
+    }
+   ],
+   "reporter_comments": 2,
+   "community_comments": 0,
+   "last_activity": "2026-09-08T19:18:29Z",
+   "pulse": true
+  },
+  {
+   "project": "Apache Arrow Go v18.7.0",
+   "finding": "no allocator promises an alignment: `NewGoAllocator` buffers inherit Go's 8 KiB spans, so a buffer starts at offset 0 or 8192 within a 16 KiB page and page-aligned import is a coin flip whose odds depend on heap fragmentation (measured between 5/20 and 15/20 across runs); `memory/mallocator` (libc, `NewMallocatorWithAlignment`) does give a chosen alignment, which the report as first written missed, so the remaining ask is the documentation. Related and already closed: [apache/arrow-go#70](https://github.com/apache/arrow-go/issues/70) (the C Data Interface storing unpinned Go pointers, which `runtime.Pinner` addresses)",
+   "repo": "apache/arrow-go",
+   "number": 1297,
+   "url": "https://github.com/apache/arrow-go/issues/1297",
+   "kind": "issue",
+   "title": "[Memory] No allocator documents an alignment: NewGoAllocator buffers land at offset 0 or 8192 within a 16 KiB page, so page-aligned handoff to C is chance",
+   "reporter": "singhpratech",
+   "reported": "2026-09-08",
+   "state": "fixed",
+   "closed_at": "2026-09-08T19:18:38Z",
+   "labels": [
+    "documentation",
+    "Type: enhancement",
+    "good-first-issue"
+   ],
+   "reactions": 0,
+   "maintainer_events": [
+    {
+     "type": "comment",
+     "at": "2026-09-08T04:13:54Z",
+     "actor": "lidavidm",
+     "association": "member",
+     "text": "I believe it's not safe to share a Go-allocated buffer with C anyways (at least persistently, without pinning). https://pkg.go.dev/cmd/cgo#hdr-Passing_pointers As the referenced issue states, you should use mallocator for this, or you would need an allocator that also pins buffer…",
+     "url": "https://github.com/apache/arrow-go/issues/1297#issuecomment-5579080928"
+    },
+    {
+     "type": "comment",
+     "at": "2026-09-08T16:44:24Z",
+     "actor": "zeroshade",
+     "association": "member",
+     "text": "> If a short paragraph in the memory package doc, pointing at mallocator and NewMallocatorWithAlignment for buffers that C will keep, would be welcome, I am glad to open a pull request; otherwise please feel free to close this. It would absolutely be welcome! Please do!",
+     "url": "https://github.com/apache/arrow-go/issues/1297#issuecomment-5588655786"
+    },
+    {
+     "type": "labeled",
+     "at": "2026-09-08T16:44:42Z",
+     "actor": "zeroshade",
+     "label": "documentation"
+    },
+    {
+     "type": "labeled",
+     "at": "2026-09-08T16:44:42Z",
+     "actor": "zeroshade",
+     "label": "Type: enhancement"
+    },
+    {
+     "type": "labeled",
+     "at": "2026-09-08T16:44:42Z",
+     "actor": "zeroshade",
+     "label": "good-first-issue"
+    },
+    {
+     "type": "pull_request",
+     "at": "2026-09-08T18:07:43Z",
+     "actor": "singhpratech",
+     "title": "docs(arrow/memory): document allocator alignment and which allocator to use when C retains buffers",
+     "url": "https://github.com/apache/arrow-go/pull/1302",
+     "state": "merged",
+     "by_reporter": true
+    },
+    {
+     "type": "review",
+     "at": "2026-09-08T18:20:06Z",
+     "actor": "zeroshade",
+     "association": "member",
+     "state": "approved",
+     "text": "",
+     "inline": 0,
+     "url": "https://github.com/apache/arrow-go/pull/1302#pullrequestreview-5145429906",
+     "pr": "https://github.com/apache/arrow-go/pull/1302"
+    },
+    {
+     "type": "pr_comment",
+     "at": "2026-09-08T18:20:17Z",
+     "actor": "zeroshade",
+     "association": "member",
+     "text": "Thanks for this!",
+     "url": "https://github.com/apache/arrow-go/pull/1302#issuecomment-5589820851",
+     "pr": "https://github.com/apache/arrow-go/pull/1302"
+    },
+    {
+     "type": "commit",
+     "at": "2026-09-08T19:18:38Z",
+     "actor": "zeroshade",
+     "url": "https://github.com/apache/arrow-go/commit/281776d9292c5229c48c336bca3af4d339369cce"
+    },
+    {
+     "type": "closed",
+     "at": "2026-09-08T19:18:38Z",
+     "actor": "zeroshade",
+     "reason": null,
+     "commit": null
+    }
+   ],
+   "reporter_comments": 2,
+   "community_comments": 0,
+   "last_activity": "2026-09-08T19:18:38Z",
+   "pulse": true
+  },
+  {
+   "project": "Apache Arrow Go v18.7.0",
+   "finding": "`compute.NewDatumWithoutOwning` returns the same `Datum` type as an owning datum, so an over-release compiles and frees buffers under a live array with no error; its doc comment is truncated (`datum.go:278`, \"convenience function.+-\")",
+   "repo": "apache/arrow-go",
+   "number": 1298,
+   "url": "https://github.com/apache/arrow-go/issues/1298",
+   "kind": "issue",
+   "title": "[Compute] NewDatumWithoutOwning returns an ordinary Datum, so Release() on it frees the caller's array with no error; its doc comment is also truncated",
+   "reporter": "singhpratech",
+   "reported": "2026-09-08",
+   "state": "open",
+   "closed_at": null,
+   "labels": [
+    "Type: enhancement",
+    "good-first-issue",
+    "Type: usage"
+   ],
+   "reactions": 0,
+   "maintainer_events": [
+    {
+     "type": "labeled",
+     "at": "2026-09-08T16:40:11Z",
+     "actor": "zeroshade",
+     "label": "Type: enhancement"
+    },
+    {
+     "type": "labeled",
+     "at": "2026-09-08T16:40:11Z",
+     "actor": "zeroshade",
+     "label": "good-first-issue"
+    },
+    {
+     "type": "labeled",
+     "at": "2026-09-08T16:40:11Z",
+     "actor": "zeroshade",
+     "label": "Type: usage"
+    }
+   ],
+   "reporter_comments": 0,
+   "community_comments": 0,
+   "last_activity": "2026-09-08T16:40:11Z",
+   "pulse": true
+  },
+  {
+   "project": "Apache Arrow Go v18.7.0",
+   "finding": "`and_kleene` and `or_kleene` return `false` where the answer is null when `ExecCtx.ChunkSize` is below the input length (same code on main 281776d): `ArraySpan.SetSlice` carries a cached null count into the next slice, and the Kleene kernels write the slice's count into the shared span",
+   "repo": "apache/arrow-go",
+   "number": 1305,
+   "url": "https://github.com/apache/arrow-go/issues/1305",
+   "kind": "issue",
+   "title": "[Compute] and_kleene / or_kleene return wrong values when ExecCtx.ChunkSize is smaller than the input: ArraySpan.SetSlice carries a stale cached null count into the next slice",
+   "reporter": "singhpratech",
+   "reported": "2026-09-08",
+   "state": "open",
+   "closed_at": null,
+   "labels": [],
+   "reactions": 0,
+   "maintainer_events": [
+    {
+     "type": "pull_request",
+     "at": "2026-09-08T23:01:42Z",
+     "actor": "singhpratech",
+     "title": "fix(compute/exec): do not carry a cached null count across ArraySpan.SetSlice",
+     "url": "https://github.com/apache/arrow-go/pull/1306",
+     "state": "open",
+     "by_reporter": true
+    }
+   ],
+   "reporter_comments": 0,
+   "community_comments": 0,
+   "last_activity": "2026-09-08T23:01:42Z",
+   "pulse": true
+  },
+  {
+   "project": "Swift 6.3.3",
+   "finding": "in a generic `throws` function compiled at `-O` in its own module, the closure passed to `withUnsafeBytes` uses the error register x21 as scratch around an Objective-C message send and exits by tail-calling `memmove` without restoring it, so a function with no reachable `throw` reports a phantom error and the program crashes retaining it. ArrowMetal's array initialiser hit it and carries a plain-loop workaround",
+   "repo": "swiftlang/swift",
+   "number": 90477,
+   "url": "https://github.com/swiftlang/swift/issues/90477",
+   "kind": "reported by others",
+   "title": "arm64 -O miscompile: x21 (Swift error register) not restored on tail-call-to-memmove success exit of a generic throwing func → phantom throw → SIGSEGV",
+   "reporter": "Getz-AI",
+   "reported": "2026-07-07",
+   "state": "open",
+   "closed_at": null,
+   "labels": [],
+   "reactions": 0,
+   "maintainer_events": [
+    {
+     "type": "commit",
+     "at": "2026-08-06T22:40:10Z",
+     "actor": "hjyamauchi",
+     "url": "https://github.com/swiftlang/swift/commit/3558bec5b61c01859188792ec3996b68cb169a52"
+    },
+    {
+     "type": "commit",
+     "at": "2026-08-06T22:45:37Z",
+     "actor": "hjyamauchi",
+     "url": "https://github.com/swiftlang/swift/commit/5e17297ad8010b897c535a5c6506df0410b0c0ac"
+    },
+    {
+     "type": "commit",
+     "at": "2026-08-06T23:44:03Z",
+     "actor": "hjyamauchi",
+     "url": "https://github.com/swiftlang/swift/commit/bc2745218000822559a1b2b2eab66b1f32f4df73"
+    },
+    {
+     "type": "commit",
+     "at": "2026-08-07T19:04:51Z",
+     "actor": "hjyamauchi",
+     "url": "https://github.com/swiftlang/swift/commit/9137acd8c2b3739968e9169217bb017d86a35ec6"
+    },
+    {
+     "type": "commit",
+     "at": "2026-08-07T20:35:38Z",
+     "actor": "hjyamauchi",
+     "url": "https://github.com/swiftlang/swift/commit/8f9778dd1626eeafaa0bddfed5faa11010ff5046"
+    },
+    {
+     "type": "commit",
+     "at": "2026-08-07T20:58:28Z",
+     "actor": "llvm-sync[bot]",
+     "url": "https://github.com/swiftlang/swift/commit/02d35e6d2ca13c5dfe43772e6f289b9663a3290f"
+    },
+    {
+     "type": "commit",
+     "at": "2026-08-07T21:16:19Z",
+     "actor": "llvm-upstreamsync[bot]",
+     "url": "https://github.com/swiftlang/swift/commit/a1022c39534b1509f51db95eb9dae78f87f2a617"
+    },
+    {
+     "type": "commit",
+     "at": "2026-08-09T18:00:26Z",
+     "actor": "hjyamauchi",
+     "url": "https://github.com/swiftlang/swift/commit/a0e790aedd280b6f6004771edc2580f527fa4b22"
+    },
+    {
+     "type": "commit",
+     "at": "2026-08-10T17:29:53Z",
+     "actor": "Gerolf-Apple",
+     "url": "https://github.com/swiftlang/swift/commit/395a606e0240882bb227cd35524f9a13b96a5930"
+    },
+    {
+     "type": "commit",
+     "at": "2026-08-10T19:08:11Z",
+     "actor": "hjyamauchi",
+     "url": "https://github.com/swiftlang/swift/commit/68f4ed977d6cba23ba63ee25f1e89a88b5265dfb"
+    },
+    {
+     "type": "commit",
+     "at": "2026-08-16T21:20:57Z",
+     "actor": "zhangweize9-cyber",
+     "url": "https://github.com/swiftlang/swift/commit/19fe134f1916c0f79fd084d455c31b665f7e5d99"
+    }
+   ],
+   "reporter_comments": 1,
+   "community_comments": 0,
+   "last_activity": "2026-08-16T21:20:57Z",
+   "pulse": false
+  }
+ ]
+}
