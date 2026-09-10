@@ -633,9 +633,9 @@ class ArrowMetalFrame:
 class ArrowMetalLazy:
     """`lf.arrowmetal.collect_gpu(...)` -- the streaming hand-off.
 
-    Polars' own `engine="gpu"` hook is cuDF-only today (see docs/POLARS.md for what a Metal
-    backend would have to implement), so the hand-off is explicit: Polars runs the plan, then
-    ArrowMetal runs one GPU pass over the collected frame.
+    Polars' post-optimisation callback hook has one backend today, cuDF (see docs/POLARS.md
+    for what a Metal backend has to implement on it), so the hand-off here is explicit: Polars
+    runs the plan, then ArrowMetal runs one GPU pass over the collected frame.
     """
 
     def __init__(self, lf: pl.LazyFrame):

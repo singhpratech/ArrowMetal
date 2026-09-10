@@ -334,12 +334,18 @@ So a Metal backend is **not** blocked on Polars adding an API -- the API is ther
 `MetalEngine` would have to do:
 
 1. Subclass `_LocalEngine` (or `Engine`) and give it a `name`. The name is passed to Rust as
-   `ldf.collect(self.name, callback)`, and Rust only knows the four in `SUPPORTED_ENGINE_NAMES`,
-   so today a third-party backend has to answer `"gpu"` to get the post-optimisation callback
-   invoked at all. A first-class Metal backend wants either a fifth name or a Rust-side
-   "call the callback for any unknown engine" rule; that is the one genuine upstream change.
+   `ldf.collect(self.name, callback)`, and Rust only knows the four in `SUPPORTED_ENGINE_NAMES`
+   (a fifth string raises `ValueError`). When a callback is supplied, Rust invokes it for any
+   known name, `"in-memory"` and `"streaming"` included (checked on 1.44.1), and an `Engine`
+   object passed to `collect(engine=...)` bypasses the Python-side name check. So a third-party
+   backend can run today by passing `"in-memory"` to Rust and reporting itself through
+   `plan_engine`; what it cannot do is carry its own name through Rust, so `explain` and the
+   callback's error message (`'cuda' conversion failed`) name the wrong engine. That naming
+   is the one upstream change worth asking for; it is not a blocker.
 2. Return a `PostOptCallback` from `_post_opt_callback`. It receives the `NodeTraverser` sitting
-   on the optimised IR plus an optional node id, and returns `None` -- it works by mutation.
+   on the optimised IR plus a second argument that is `None` in a plain `collect` (the
+   type alias calls it `int | None`; it is a timing value, not a node id), and returns `None`
+   -- it works by mutation.
 3. Walk the IR with `get_node` / `set_node` / `get_inputs` / `view_current_node` /
    `view_expression`, translating each node it recognises. Every node it does not recognise is
    where the backend must decide between falling back (leave the node alone) and raising
