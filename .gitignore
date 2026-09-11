@@ -35,4 +35,4 @@ r/arrowmetal/src/*.o
 r/arrowmetal/src/*.so
 r/arrowmetal.Rcheck/
 r/*.tar.gz
-r/arrowmetal/src/lib_path.h
+r/arrowmetal/src/lib_path*.h
