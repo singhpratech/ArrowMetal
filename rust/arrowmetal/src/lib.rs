@@ -92,7 +92,7 @@ use sys::ffi;
 /// The directory `libArrowMetalC.dylib` was linked from, baked in at build time.
 ///
 /// This is the resolved output of the search in `arrowmetal-sys/build.rs`, not the `ARROWMETAL_LIB`
-/// or `ARROWMETAL_LIB_DIR` you may have set to steer it.
+/// or `ARROWMETAL_LIB_DIR` you may have set to steer it. Empty on docs.rs, where nothing is linked.
 pub const LIB_DIR: &str = env!("ARROWMETAL_LINKED_LIB_DIR");
 
 // =================================================================================================

@@ -49,8 +49,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ARROWMETAL_LIB_DIR");
 
     // docs.rs builds the crate on a Linux host with no dylib: the declarations document themselves,
-    // so emit no link directives there and let the build succeed.
+    // so emit no link directives there. The two values dependents read at compile time still have
+    // to exist, or `env!` fails and rustdoc stops (that is what broke the 0.1.0 docs build), so they
+    // are published empty.
     if std::env::var_os("DOCS_RS").is_some() {
+        println!("cargo:lib_dir=");
+        println!("cargo:rustc-env=ARROWMETAL_SYS_LIB_DIR=");
         return;
     }
 

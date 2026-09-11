@@ -10,7 +10,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=DEP_ARROWMETALC_LIB_DIR");
     let dir = std::env::var("DEP_ARROWMETALC_LIB_DIR")
         .expect("arrowmetal-sys did not publish DEP_ARROWMETALC_LIB_DIR; its build script failed");
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
+    // On docs.rs arrowmetal-sys publishes an empty directory because there is no dylib; nothing is
+    // linked there, so no rpath either. The env below is still set so `env!` has something to read.
+    if !dir.is_empty() {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
+    }
     // Deliberately not named ARROWMETAL_LIB_DIR: that is a user-facing *input* to the search in
     // arrowmetal-sys/build.rs, and a compile-time env of the same name reads confusingly in
     // `env!(..)` and shadows the input's meaning for anyone grepping. This is the resolved output.

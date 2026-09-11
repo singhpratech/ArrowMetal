@@ -27,7 +27,8 @@
 
 use std::ffi::{c_char, c_int, c_void};
 
-/// The directory `build.rs` linked against, baked in for diagnostics.
+/// The directory `build.rs` linked against, baked in for diagnostics. Empty on docs.rs, where
+/// nothing is linked.
 pub const LIB_DIR: &str = env!("ARROWMETAL_SYS_LIB_DIR");
 
 // -------------------------------------------------------------------------------------------------
