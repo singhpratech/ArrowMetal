@@ -10,7 +10,7 @@ Two crates live in [`rust/`](../rust):
 | `arrowmetal-sys` | Raw `extern "C"` declarations over [`include/arrowmetal.h`](../include/arrowmetal.h), plus the `build.rs` that finds and links `libArrowMetalC.dylib`. |
 | `arrowmetal` | The safe crate. An `arrow::array::ArrayRef` goes in, an `ArrayRef` comes out; every failure is a `Result` carrying `am_last_error()`'s message. |
 
-Neither is published to crates.io yet (`publish = false`), so both are used by path or by git.
+Both are on crates.io at 0.1.0; a path or git dependency on a checkout works too.
 
 Everything below was run in this repository on 2026-09-07 on an Apple M4 Max, macOS 26.6.2,
 `rustc 1.95.0`, arrow-rs 59.3.0, ArrowMetal 0.1.0.
@@ -386,7 +386,10 @@ reduction does not earn its import back.
   named set of columns, which is the closest thing here to a table.
 * **`arrowmetal-sys` declares 35 of the ABI's 222 entry points**, and every one of them is called by
   the safe crate (nothing is declared and unused). The table above lists what is missing.
-* **The crates are not published.** `publish = false` on both; use a path or git dependency.
+* **The docs.rs build of 0.1.0 failed.** Under `DOCS_RS` the `-sys` build script returns before it
+  emits anything, so the `env!("ARROWMETAL_SYS_LIB_DIR")` and `env!("ARROWMETAL_LINKED_LIB_DIR")`
+  lookups in the two crates have nothing to read and rustdoc stops. The documentation for 0.1.0 is
+  this file and the crate-level comment in `rust/arrowmetal/src/lib.rs`.
 * **`arrow` is pinned to major version 59.** The C Data Interface structs are ABI-stable, so a
   different arrow-rs major would very likely work, but it is not tested here.
 * **A batch defers validation.** Inside `batch(|| …)` an operation that would fail — `take` with an
