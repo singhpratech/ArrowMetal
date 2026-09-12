@@ -375,6 +375,8 @@ Arrow type matrix and the interop status.
 
 See [ROADMAP.md](ROADMAP.md) for what is next and [CONTRIBUTING.md](CONTRIBUTING.md) to get involved.
 
+Questions, and timings from Macs we have not measured: [Discord](https://discord.gg/MEH7QQABUR) or a GitHub issue, whichever you prefer.
+
 ## License
 
 Apache License 2.0. Apache Arrow is a trademark of the Apache Software Foundation; this project is
