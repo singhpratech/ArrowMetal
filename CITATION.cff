@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use this project in research or commercial work, please cite it as below."
+title: "ArrowMetal: Apache Arrow compute on Apple silicon GPUs via Metal"
+type: software
+authors:
+  - name: singhpratech
+repository-code: "https://github.com/singhpratech/ArrowMetal"
+url: "https://arrowmetal.org"
+license: Apache-2.0
+version: 0.1.0
+date-released: 2026-09-08

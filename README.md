@@ -379,6 +379,15 @@ See [ROADMAP.md](ROADMAP.md) for what is next and [CONTRIBUTING.md](CONTRIBUTING
 
 Questions, and timings from Macs we have not measured: [Discord](https://discord.gg/MEH7QQABUR) or a GitHub issue, whichever you prefer.
 
+## Citing
+
+If you use this project in research or commercial work:
+
+```
+ArrowMetal: Apache Arrow compute on Apple silicon GPUs via Metal.
+2026. https://github.com/singhpratech/ArrowMetal
+```
+
 ## License
 
 Apache License 2.0. Apache Arrow is a trademark of the Apache Software Foundation; this project is
