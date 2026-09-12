@@ -65,7 +65,9 @@ arrow-swift or anything else that speaks the C Data Interface.
 
 Apple M4 Max (16 CPU cores), 50,000,000 rows (10,000,000 for the string row), best of up to five calls
 after a warm-up, release build. Full history and methodology in [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
-and [Benchmarks/README.md](Benchmarks/README.md).
+and [Benchmarks/README.md](Benchmarks/README.md). Every number here is from that one machine. If you have
+another Apple silicon Mac, the output of `swift run -c release arrowmetal-bench 10000000 5`, posted on
+[Discord](https://discord.gg/MEH7QQABUR) or in an issue, is new information.
 
 **Called from Python, same in-process data.** Every CPU library is measured twice — its plain eager
 idiom, and the most parallel idiom it has for the same answer: `polars-lazy` through `pl.LazyFrame` on
