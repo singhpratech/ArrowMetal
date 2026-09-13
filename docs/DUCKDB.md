@@ -432,7 +432,7 @@ What the table says:
 - **DuckDB is the fastest CPU engine on low-cardinality group-by and on multi-key sort**, and it is
   a long way ahead of Polars on both: 9.0 ms against Polars' 81.9 for `sum by int32 key` at 1,000
   groups and 50M rows, 265 ms against 903 for `lexsort`. Against DuckDB those two ArrowMetal rows are
-  1.8x and 7.0x, where the matrix, whose fastest CPU idiom is Polars or Acero, shows 16.8x and 24.0x.
+  1.8x and 7.0x, where the matrix shows 3.8x (against Acero; 16.8x against Polars) and 24.0x.
   At 10M rows and 1,000 groups the margin is 1.2x. This is the honest group-by story: the GPU is ahead
   by 3x or more from 100,000 groups upward and roughly even with DuckDB at a thousand groups.
 - **DuckDB does not win every CPU row.** At 100,000 groups Acero is faster than DuckDB (46.4 ms

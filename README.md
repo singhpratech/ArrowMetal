@@ -136,7 +136,7 @@ whole-query chains against a streaming engine. `shift (lag 1)` at 0.01x is the l
 measured on 2026-09-12 on the matrix's sort, group-by, filter and sum rows with the same data and protocol
 ([docs/DUCKDB.md](docs/DUCKDB.md), `Benchmarks/duckdb_matrix.py`), is the fastest CPU engine on
 low-cardinality group-by and multi-key sort: against it, `sum by int32 key` at 1,000 groups and 50M rows is
-1.8x rather than the 16.8x the matrix shows against Polars, and `lexsort` is 7.0x rather than 24.0x. From
+1.8x rather than the 3.8x the matrix shows against Acero, and `lexsort` is 7.0x rather than 24.0x. From
 100,000 groups upward, and on every sort, ArrowMetal stays 3x or more ahead of DuckDB, at 1 to 2 CPU-ms
 against DuckDB's 135 to 4,350.
 
