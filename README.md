@@ -132,6 +132,14 @@ threaded hash aggregation; 1 grouped moment; 4 string conversions with variable-
 whole-query chains against a streaming engine. `shift (lag 1)` at 0.01x is the lowest ratio in the matrix outside the latency family. Every one of them is listed with its cause and with what would change it in
 [docs/TO_IMPROVE.md](docs/TO_IMPROVE.md), and [docs/DESIGN.md](docs/DESIGN.md) has the pipelining plan for the dispatch floor.
 
+**DuckDB on the same rows.** The matrix's CPU libraries are Polars, pyarrow and pandas. DuckDB 1.5.5,
+measured on 2026-09-12 on the matrix's sort, group-by, filter and sum rows with the same data and protocol
+([docs/DUCKDB.md](docs/DUCKDB.md), `Benchmarks/duckdb_matrix.py`), is the fastest CPU engine on
+low-cardinality group-by and multi-key sort: against it, `sum by int32 key` at 1,000 groups and 50M rows is
+1.8x rather than the 16.8x the matrix shows against Polars, and `lexsort` is 7.0x rather than 24.0x. From
+100,000 groups upward, and on every sort, ArrowMetal stays 3x or more ahead of DuckDB, at 1 to 2 CPU-ms
+against DuckDB's 135 to 4,350.
+
 ## From Python
 
 Two ways to install, both from this checkout; the PyPI upload of 0.1.0 is step 4 of

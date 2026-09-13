@@ -358,6 +358,102 @@ All three give `1249999975000000`. **DuckDB is ahead here**: a single sum over a
 exactly the case where DuckDB aggregates during the scan and never materialises anything. Reach for
 the GPU when the aggregate is the expensive part, not the scan.
 
+### The matrix rows, DuckDB alongside
+
+[BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md) has no DuckDB column, because DuckDB is a query engine
+rather than an array library: the comparison needs a table, a query, and a decision about where the
+result lands. `Benchmarks/duckdb_matrix.py` makes those decisions explicit and measures DuckDB on the
+matrix's sort, group-by, filter and sum rows, with the matrix's own generators, sizes and best-of-five
+protocol, in four idioms: the same SQL over a registered Arrow table in one chunk and in sixteen
+batches, and over a native DuckDB table with the result exported to Arrow or kept in a DuckDB temp
+table. Every result asserts its row count. Reproduce with:
+
+```
+PYTHONPATH=python python Benchmarks/duckdb_matrix.py 10000000 50000000
+python Benchmarks/duckdb_matrix.py --report Benchmarks/results/duckdb_matrix_2026-09-12.csv
+```
+
+DuckDB rows measured 2026-09-12: duckdb 1.5.5, threads=16, preserve_insertion_order=True, pyarrow 25.0.1, python 3.13.9, Apple M4 Max, macOS 26.6.2, loadavg at start 2.5, 2026-09-12T23:34:30.
+ArrowMetal, Polars and pyarrow are the published 2026-09-07 matrix rows (`Benchmarks/results/full_matrix_2026-09-07-parallel.csv`), not re-measured. Wall ms, best of up to 5 after one warm-up, process CPU ms in brackets. "Best" is the faster of a library's eager and parallel idioms. The last column is the fastest CPU number on the row, any library or idiom, over ArrowMetal.
+
+| family | op | rows | ArrowMetal | Polars best | pyarrow best | DuckDB native, to Arrow | DuckDB native, stays in DuckDB | DuckDB Arrow scan, 16 batches | DuckDB Arrow scan, 1 chunk | fastest CPU / ArrowMetal |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| reductions | sum(int64, 10% nulls) | 10,000,000 | 0.30 (0) | 0.57 (6) | 1.29 (14) | 1.07 (15) | 1.08 (14) | 1.90 (18) | 12.0 | 1.9x |
+| compare+select | filter int64 (30% kept) | 10,000,000 | 0.78 (1) | 0.65 (6) | 5.33 (60) | 35.9 (53) | 8.52 (88) | 39.9 (73) | 42.4 | 0.8x |
+| sort | argsort int64 | 10,000,000 | 7.81 (1) | 57.6 (655) | 841.2 (841) | 212.7 (647) | 52.3 (674) | 248.6 (688) | 403.7 | 6.7x |
+| sort | argsort float64 | 10,000,000 | 8.11 (1) | 78.6 (1,004) | 984.1 (983) | 231.4 (725) | 60.1 (767) | 266.2 (779) | 460.0 | 7.4x |
+| sort | sort float64 | 10,000,000 | 6.85 (1) | 26.2 (250) | 1,006.5 (1,006) | 204.9 (628) | 54.6 (718) | 223.6 (669) | 410.9 | 3.8x |
+| sort | lexsort (2 int32 keys) | 10,000,000 | 7.29 (2) | 111.4 (1,217) | 1,122.7 (1,122) | 197.5 (635) | 49.9 (660) | 264.6 (893) | 625.9 | 6.8x |
+| group-by | sum by int32 key (1000 groups) | 10,000,000 | 1.73 (1) | 20.2 (242) | 4.61 (51) | 2.09 (28) | 2.11 (27) | 7.67 (80) | 53.7 | 1.2x |
+| group-by | mean by int32 key (1000 groups) | 10,000,000 | 2.21 (1) | 20.3 (232) | 4.63 (51) | 2.36 (33) | 2.36 (32) | 8.31 (79) | 55.2 | 1.1x |
+| group-by | count by int32 key (1000 groups) | 10,000,000 | 1.52 (1) | 21.2 (166) | 4.43 (48) | 2.14 (25) | 2.03 (26) | 6.70 (72) | 48.4 | 1.3x |
+| group-by | sum by two int32 keys (~1024 groups) | 10,000,000 | 2.19 (2) | 34.0 (385) | 5.50 (60) | 3.04 (41) | 2.98 (40) | 9.25 (100) | 69.5 | 1.4x |
+| group-by | sum by int32 key (100000 groups) | 10,000,000 | 1.95 (1) | 22.7 (275) | 16.4 (98) | 20.5 (292) | 21.0 (295) | 29.3 (357) | 116.4 | 8.4x |
+| group-by | mean by int32 key (100000 groups) | 10,000,000 | 2.48 (1) | 23.3 (284) | 16.2 (98) | 24.1 (345) | 24.3 (344) | 29.4 (351) | 112.0 | 6.6x |
+| group-by | count by int32 key (100000 groups) | 10,000,000 | 1.96 (1) | 27.4 (208) | 13.0 (81) | 19.8 (279) | 19.9 (282) | 23.3 (287) | 90.1 | 6.6x |
+| group-by | sum by int32 key (10000000 groups) | 10,000,000 | 9.46 (2) | 69.5 (942) | 312.4 (627) | 187.4 (815) | 38.0 (524) | 178.0 (880) | 278.4 | 4.0x |
+| reductions | sum(int64, 10% nulls) | 50,000,000 | 1.11 (0) | 2.30 (26) | 5.09 (66) | 4.40 (65) | 4.67 (64) | 7.26 (77) | 58.9 | 2.1x |
+| compare+select | filter int64 (30% kept) | 50,000,000 | 2.23 (1) | 2.85 (36) | 22.6 (298) | 186.8 (242) | 32.1 (416) | 204.8 (337) | 216.3 | 1.3x |
+| sort | argsort int64 | 50,000,000 | 39.1 (1) | 302.0 (3,574) | 5,196.8 (5,196) | 1,525.2 (3,954) | 320.7 (4,340) | 1,471.2 (4,009) | 2,082.6 | 7.7x |
+| sort | argsort float64 | 50,000,000 | 39.9 (1) | 420.1 (5,531) | 5,885.3 (5,885) | 1,403.5 (3,854) | 344.0 (4,349) | 1,479.2 (4,014) | 2,358.4 | 8.6x |
+| sort | sort float64 | 50,000,000 | 32.1 (1) | 132.9 (1,284) | 6,044.5 (6,044) | 1,308.4 (3,377) | 293.5 (3,866) | 1,248.9 (3,483) | 2,038.2 | 4.1x |
+| sort | lexsort (2 int32 keys) | 50,000,000 | 37.6 (2) | 902.9 (9,948) | 7,773.5 (7,773) | 1,253.8 (3,088) | 264.9 (3,532) | 1,557.7 (4,595) | 3,378.6 | 7.0x |
+| group-by | sum by int32 key (1000 groups) | 50,000,000 | 4.89 (1) | 81.9 (1,186) | 18.5 (250) | 9.00 (135) | 9.07 (135) | 26.2 (357) | 262.6 | 1.8x |
+| group-by | mean by int32 key (1000 groups) | 50,000,000 | 4.91 (1) | 81.5 (1,180) | 18.6 (251) | 10.1 (151) | 10.5 (159) | 30.4 (350) | 265.5 | 2.0x |
+| group-by | count by int32 key (1000 groups) | 50,000,000 | 4.23 (1) | 89.0 (810) | 17.4 (235) | 8.35 (126) | 8.37 (126) | 25.6 (318) | 241.0 | 2.0x |
+| group-by | sum by two int32 keys (~1024 groups) | 50,000,000 | 5.91 (2) | 164.2 (2,216) | 23.9 (322) | 13.9 (199) | 14.0 (201) | 37.3 (434) | 344.6 | 2.3x |
+| group-by | sum by int32 key (100000 groups) | 50,000,000 | 7.41 (1) | 99.4 (1,461) | 46.4 (542) | 76.1 (1,087) | 75.9 (1,130) | 92.3 (1,248) | 444.2 | 6.3x |
+| group-by | mean by int32 key (100000 groups) | 50,000,000 | 7.39 (1) | 99.2 (1,458) | 47.0 (540) | 86.5 (1,277) | 85.5 (1,291) | 93.9 (1,290) | 445.1 | 6.4x |
+| group-by | count by int32 key (100000 groups) | 50,000,000 | 4.92 (1) | 120.7 (1,060) | 38.3 (421) | 64.9 (974) | 67.2 (992) | 70.8 (937) | 400.0 | 7.8x |
+| group-by | sum by int32 key (10000000 groups) | 50,000,000 | 46.1 (2) | 321.7 (4,585) | 1,303.3 (3,682) | 324.4 (2,356) | 148.6 (2,210) | 360.1 (2,712) | 1,371.0 | 3.2x |
+| sort | sort utf8 | 1,000,000 | - | - | - | 25.8 (84) | 11.3 (98) | 30.6 (104) | 70.4 | - |
+| sort | sort utf8 | 10,000,000 | 23.0 (7) | 133.1 (1,326) | 1,864.9 (1,865) | 295.0 (852) | 79.4 (1,063) | 345.7 (926) | 723.7 | 3.5x |
+
+SQL per operation, over the native table; the Arrow-scan idioms run the same text over the registered Arrow table, and the stays-in-DuckDB idiom wraps it in `CREATE OR REPLACE TEMP TABLE r AS`:
+
+- sum(int64, 10% nulls): `SELECT sum(x) FROM tn` (DuckDB sum(BIGINT) returns HUGEINT)
+- filter int64 (30% kept): `SELECT x FROM tn WHERE m`
+- argsort int64: `SELECT i FROM tn ORDER BY x` (DuckDB has no argsort)
+- argsort float64: `SELECT i FROM tn ORDER BY x` (DuckDB has no argsort)
+- sort float64: `SELECT x FROM tn ORDER BY x`
+- lexsort (2 int32 keys): `SELECT i FROM tn ORDER BY a, b` (DuckDB has no argsort)
+- sum by int32 key (1000 groups): `SELECT k, sum(x) FROM tn GROUP BY k`
+- mean by int32 key (1000 groups): `SELECT k, avg(x) FROM tn GROUP BY k`
+- count by int32 key (1000 groups): `SELECT k, count(x) FROM tn GROUP BY k`
+- sum by two int32 keys (~1024 groups): `SELECT a, b, sum(x) FROM tn GROUP BY a, b`
+- sum by int32 key (100000 groups): `SELECT k, sum(x) FROM tn GROUP BY k`
+- mean by int32 key (100000 groups): `SELECT k, avg(x) FROM tn GROUP BY k`
+- count by int32 key (100000 groups): `SELECT k, count(x) FROM tn GROUP BY k`
+- sum by int32 key (10000000 groups): `SELECT k, sum(x) FROM tn GROUP BY k`
+- sort utf8: `SELECT s FROM tn ORDER BY s`
+
+What the table says:
+
+- **DuckDB is the fastest CPU engine on low-cardinality group-by and on multi-key sort**, and it is
+  a long way ahead of Polars on both: 9.0 ms against Polars' 81.9 for `sum by int32 key` at 1,000
+  groups and 50M rows, 265 ms against 903 for `lexsort`. Against DuckDB those two ArrowMetal rows are
+  1.8x and 7.0x, where the matrix, whose fastest CPU idiom is Polars or Acero, shows 16.8x and 24.0x.
+  At 10M rows and 1,000 groups the margin is 1.2x. This is the honest group-by story: the GPU is ahead
+  by 3x or more from 100,000 groups upward and roughly even with DuckDB at a thousand groups.
+- **DuckDB does not win every CPU row.** At 100,000 groups Acero is faster than DuckDB (46.4 ms
+  against 75.9 at 50M rows), on `sort float64` Polars is (133 against 294), and on the filter and the
+  plain sum Polars lazy is the fastest CPU idiom by a wide margin. The fastest-CPU column picks the
+  winner per row.
+- **Exporting the result to Arrow is a large part of DuckDB's wall time on wide results.** Sorting 50M
+  float64 takes 294 ms inside DuckDB and 1,308 ms delivered as an Arrow table; the argsorts add about
+  1.1 to 1.2 s the same way. A Python caller pays that; ArrowMetal's result is already an Arrow buffer. For a
+  group-by result of a thousand rows the two idioms are the same.
+- **The CPU-time gap does not narrow.** DuckDB's 1,000-group sum at 50M rows costs 135 CPU-ms across
+  about fifteen cores, its sorts 3,100 to 4,350; the ArrowMetal rows cost 1.2 to 2.4 CPU-ms.
+- **A registered Arrow table in one chunk scans on two cores.** That idiom is 1.2x slower than the
+  native table on the filter and 29x slower on the 1,000-group sum. Register a chunked table, or
+  create a DuckDB table, before benchmarking DuckDB over Arrow data.
+
+Two things to carry with the numbers. The ArrowMetal, Polars and pyarrow rows were measured on
+2026-09-07 and the DuckDB rows on 2026-09-12, on the same machine with the same protocol, so the
+day differs. And the `sort` row in the 50M table above (39.2 ms) sorts `v = i`, a column that is
+already in order; on uniform random float64 of the same size DuckDB's sort takes 294 ms.
+
 ---
 
 ## 6. When this is worth it, and when it is not

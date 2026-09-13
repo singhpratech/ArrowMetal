@@ -1,6 +1,6 @@
 # Benchmarks
 
-Six complementary benchmarks. Numbers per chip live in `../docs/BENCHMARKS.md`, and the complete
+Seven complementary benchmarks. Numbers per chip live in `../docs/BENCHMARKS.md`, and the complete
 operation-by-operation matrix in `../docs/BENCHMARKS_MATRIX.md`.
 
 | Script | What it measures |
@@ -11,6 +11,7 @@ operation-by-operation matrix in `../docs/BENCHMARKS_MATRIX.md`.
 | `PYTHONPATH=python python Benchmarks/expr_bench.py [rows] [iters]` | The fused expression compiler: one runtime-generated kernel for a whole expression, against the same expression built op by op, Polars, pyarrow, pandas and numpy (see `../docs/EXPR.md`). |
 | `PYTHONPATH=python python Benchmarks/engine_bench.py [rows] [iters]` | The lazy query engine: eight TPC-H-flavoured query shapes at 50M rows (plus a 10M x 1M join, a 50M as-of join and a window over 1000 partitions) against Polars lazy and DuckDB on the same Arrow buffers (see `../docs/ENGINE.md`). |
 | `PYTHONPATH=python python Benchmarks/full_matrix.py [--quick]` | **Every** operation family, against both the eager and the most parallel idiom of each CPU library, with a pass/fail verdict per row and the cores each idiom used. |
+| `PYTHONPATH=python python Benchmarks/duckdb_matrix.py [rows ...]` | DuckDB on the matrix's sort, group-by, filter and sum rows, same generators and protocol, four idioms (Arrow scan in one chunk and in sixteen batches; native table exported to Arrow and kept in DuckDB); `--report <csv>` joins it with the published matrix rows (see `../docs/DUCKDB.md`). |
 
 ## full_matrix.py: the complete comparison
 
