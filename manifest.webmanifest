@@ -1,0 +1,12 @@
+{
+  "name": "ArrowMetal",
+  "short_name": "ArrowMetal",
+  "description": "Apache Arrow compute on the Apple silicon GPU",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ],
+  "theme_color": "#1B2430",
+  "background_color": "#F6F1F1",
+  "display": "browser"
+}
