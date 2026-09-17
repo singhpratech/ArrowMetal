@@ -1,0 +1,27 @@
+Cores actually used, per library and idiom: cpu_ms / wall_ms over every measured row of this CSV.
+Measured on Darwin 25.6.0, 16 logical CPUs, polars 16 threads, pyarrow 16 threads, Acero fed 16 record batches.
+
+library / idiom        rows   median     mean      max  rows >2     %
+---------------------------------------------------------------------
+arrowmetal              543     1.20     1.07    15.40        4    1%
+polars                  513     1.17     3.96    14.44      190   37%
+pyarrow                 538     1.01     1.35     9.26       36    7%
+pandas                  444     1.00     1.01     1.21        0    0%
+numpy                    89     1.00     1.11     4.36        3    3%
+polars-lazy             509     4.74     6.16    15.36      415   82%
+pyarrow-threaded        443     4.08     5.51    12.37      430   97%
+
+arrowmetal's number is host CPU time only -- the thread encoding the command buffer and
+waiting on it. Time the GPU spends executing is not counted in it, by either side's clock.
+
+By family (median cores)
+
+family                  arrowmetal            polars           pyarrow            pandas             numpy       polars-lazy  pyarrow-threaded
+----------------------------------------------------------------------------------------------------------------------------------------------
+reductions                    1.23              1.03              1.01              1.00                --              1.06              3.23
+element-wise                  1.29              1.03              1.00              1.00              1.00              2.88              4.07
+compare+select                1.29              1.01              1.01              1.00              1.02              2.55              4.58
+sort                          1.00              5.74              1.00              1.00              1.00              5.06              2.96
+group-by                      0.97             10.57              1.08              1.00                --             10.77              3.29
+strings                       1.14              1.01              1.00              1.00                --              6.26              7.34
+

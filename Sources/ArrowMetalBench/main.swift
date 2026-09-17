@@ -9,7 +9,8 @@ import ArrowMetal
 // Usage: arrowmetal-bench [rows] [iterations]
 
 let latencyMode = CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "latency"
-let rows = CommandLine.arguments.count > 1 && !latencyMode ? Int(CommandLine.arguments[1])! : 50_000_000
+let crossoverMode = CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "crossover"
+let rows = CommandLine.arguments.count > 1 && !latencyMode && !crossoverMode ? Int(CommandLine.arguments[1])! : 50_000_000
 let iters = CommandLine.arguments.count > 2 ? Int(CommandLine.arguments[2])! : 5
 let cores = ProcessInfo.processInfo.activeProcessorCount
 
@@ -24,6 +25,14 @@ func cpuMinInt64(_ a: MetalArray<Int64>) -> Int64 {
     let bm = v.typed(UInt8.self)
     var m = Int64.max
     for i in 0..<a.length where (bm[i >> 3] >> (i & 7)) & 1 == 1 { m = min(m, p[i]) }
+    return m
+}
+func cpuMaxInt64(_ a: MetalArray<Int64>) -> Int64 {
+    let p = a.valuePointer
+    guard let v = a.validity else { var m = Int64.min; for i in 0..<a.length { m = max(m, p[i]) }; return m }
+    let bm = v.typed(UInt8.self)
+    var m = Int64.min
+    for i in 0..<a.length where (bm[i >> 3] >> (i & 7)) & 1 == 1 { m = max(m, p[i]) }
     return m
 }
 /// compare(a > s) into a packed bitmap, one byte (8 elements) at a time.
@@ -185,6 +194,92 @@ if latencyMode {
         out.deallocate()
     }
     print("\nFixed cost per GPU call is the small-row number; the crossover with one CPU core is where the columns meet.")
+    exit(0)
+}
+
+// `arrowmetal-bench crossover`: the router's calibration data. For each operation the router can
+// route, the GPU path against the CPU path it would route to (`CPUReference`, the single-core loops
+// that are the oracle in the tests and would become the live CPU path), plus the all-core loop above
+// as the bound a threaded CPU path could reach. Emits CSV on stdout: one row per (op, rows, path),
+// best-of wall and CPU microseconds. Sizes match the crossover sweep in Benchmarks/crossover.py.
+if crossoverMode {
+    let sizes = [1_000, 10_000, 100_000, 1_000_000, 10_000_000, 50_000_000]
+    print("# ArrowMetal crossover on \(ctx.device.name), \(cores) CPU cores, best of up to \(max(iters, 20)) (\(iters) at 10M rows and above), 10% nulls, \(ISO8601DateFormatter().string(from: Date()))")
+    print("op,rows,path,wall_us,cpu_us,iterations")
+    func best(_ n: Int, _ body: () throws -> Void) rethrows -> (Double, Double, Int) {
+        try body()
+        let reps = n >= 10_000_000 ? iters : max(iters, 20)
+        var b = Double.infinity, bc = Double.infinity
+        for _ in 0..<reps {
+            let c0 = cpuSeconds()
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            try body()
+            let w = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e3
+            let c = (cpuSeconds() - c0) * 1e6
+            if w < b { b = w; bc = c }
+        }
+        return (b, bc, reps)
+    }
+    func row(_ op: String, _ n: Int, _ path: String, _ r: (Double, Double, Int)) {
+        print(String(format: "%@,%d,%@,%.1f,%.1f,%d", op as NSString, n, path as NSString, r.0, r.1, r.2))
+    }
+    for n in sizes {
+        var gen = SystemRandomNumberGenerator()
+        var vals: [Int64?] = []; vals.reserveCapacity(n)
+        for _ in 0..<n { vals.append(Int.random(in: 0..<10, using: &gen) == 0 ? nil : Int64.random(in: -1000...1000, using: &gen)) }
+        let col = try MetalArray<Int64>(vals)
+        let keys = try MetalArray<Int32>((0..<n).map { _ in Int32.random(in: 0..<1000, using: &gen) })
+        let mask = try col.compare(.gt, 0)
+
+        // Three CPU paths per operation where they exist: `cpu-1core` is the tight typed loop this file
+        // already uses as its single-core baseline (what the router's CPU path would be), `cpu-ref` is
+        // `CPUReference` (the tests' oracle: a closure per element, kept here to show why it cannot be
+        // the live path), `cpu-allcores` the same tight loop on every core.
+        let cmpOut = UnsafeMutablePointer<UInt8>.allocate(capacity: n / 8 + 64)
+        let addOut = UnsafeMutablePointer<Int64>.allocate(capacity: n)
+        let filtOut = UnsafeMutablePointer<Int64>.allocate(capacity: n)
+        let selBits = try mask.and(mask).values
+        defer { cmpOut.deallocate(); addOut.deallocate(); filtOut.deallocate() }
+
+        row("sum(int64)", n, "gpu", try best(n) { sink(try col.sum()) })
+        row("sum(int64)", n, "cpu-1core", best(n) { sink(cpuSumInt64(opaque(col), 0, n)) })
+        row("sum(int64)", n, "cpu-ref", best(n) { sink(CPUReference.sum(opaque(col))) })
+        row("sum(int64)", n, "cpu-allcores", best(n) { sink(parallel(n) { cpuSumInt64(col, $0, $1) }) })
+        row("min(int64)", n, "gpu", try best(n) { sink(try col.min()) })
+        row("min(int64)", n, "cpu-1core", best(n) { sink(cpuMinInt64(opaque(col))) })
+        row("min(int64)", n, "cpu-ref", best(n) { sink(CPUReference.min(opaque(col))) })
+        row("max(int64)", n, "gpu", try best(n) { sink(try col.max()) })
+        row("max(int64)", n, "cpu-1core", best(n) { sink(cpuMaxInt64(opaque(col))) })
+        row("max(int64)", n, "cpu-ref", best(n) { sink(CPUReference.max(opaque(col))) })
+
+        // compare and arithmetic with a scalar: one pass, one output array (validity carried over).
+        row("compare(int64 > 0)", n, "gpu", try best(n) { sink(try col.compare(.gt, 0)) })
+        row("compare(int64 > 0)", n, "cpu-1core", best(n) { cpuCompareGt(opaque(col), 0, into: cmpOut); sink(cmpOut[0]) })
+        row("compare(int64 > 0)", n, "cpu-ref", try best(n) { sink(try CPUReference.compare(opaque(col), .gt, scalar: 0)) })
+        row("add(int64, 1)", n, "gpu", try best(n) { sink(try col.arithmetic(.add, 1)) })
+        row("add(int64, 1)", n, "cpu-1core", best(n) { let p = opaque(col).valuePointer; for i in 0..<n { addOut[i] = p[i] &+ 1 }; sink(addOut[0]) })
+        row("add(int64, 1)", n, "cpu-ref", try best(n) { sink(try CPUReference.arithmetic(opaque(col), .add, scalar: 1)) })
+
+        // filter by a precomputed mask (the mask's own cost is the compare row above).
+        row("filter(int64, mask)", n, "gpu", try best(n) { sink(try col.filter(mask)) })
+        row("filter(int64, mask)", n, "cpu-1core", best(n) { sink(cpuFilterInt64(opaque(col), sel: selBits.typed(UInt8.self), into: filtOut)) })
+        row("filter(int64, mask)", n, "cpu-ref", try best(n) { sink(try CPUReference.filter(opaque(col), mask)) })
+
+        // group-by sum at 1,000 keys: GPU (build + sum) vs a candidate single-core dictionary loop,
+        // which is the CPU path the design note proposes and does not exist in the engine yet.
+        row("group-by sum (1000 keys)", n, "gpu", try best(n) { let gb = try keys.groupBy(keyCount: 1000); sink(try gb.sum(col)) })
+        row("group-by sum (1000 keys)", n, "cpu-candidate", best(n) {
+            let a = opaque(col); let p = a.valuePointer; let k = opaque(keys).valuePointer
+            var sums = [Int64](repeating: 0, count: 1000)
+            if let v = a.validity {
+                let bm = v.typed(UInt8.self)
+                for i in 0..<n where (bm[i >> 3] >> (i & 7)) & 1 == 1 { sums[Int(k[i])] &+= p[i] }
+            } else {
+                for i in 0..<n { sums[Int(k[i])] &+= p[i] }
+            }
+            sink(sums)
+        })
+    }
     exit(0)
 }
 

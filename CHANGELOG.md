@@ -310,3 +310,7 @@ Quality
 - Adversarial review pass before release (four independent reviewers over the integrations, the engine and
   expression compiler, the GPU kernels, and the C ABI and Parquet reader): every finding carries a
   regression test; the fixes are the "Fixed" bullets above and the entries in docs/EVALUATION.md.
+- The crossover table (docs/CROSSOVER.md, `Benchmarks/crossover.py`, `arrowmetal-bench crossover`): a size sweep of
+  the matrix from a thousand rows to fifty million over six families, and the GPU kernel timed against the
+  single-core loop a CPU/GPU router would run instead, so the row count from which the GPU path is ahead is
+  stated per operation instead of bracketed. Measured 2026-09-17; the router itself is not implemented.

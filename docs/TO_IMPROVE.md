@@ -72,6 +72,8 @@ pass and a bytes pass, and at a million short strings that fixed cost is most of
 of them is ahead at ten million rows in the same CSV — `upper` 2.87x, `lower` 2.91x,
 `slice_codeunits` 2.50x, `split_pattern` 2.45x, `is_alpha` 2.20x, `trim` 2.14x, `is_in` 1.48x — so
 the break-even is between one and ten million, not somewhere past the sizes measured.
+[CROSSOVER.md](CROSSOVER.md) now measures that break-even directly, per operation, with a size sweep
+from a thousand rows to fifty million.
 
 **What would change it.** Nothing removes the floor on this hardware; the persistent-kernel approach
 that would is impossible here ([RESIDENT.md](RESIDENT.md)). What moves the break-even down is putting

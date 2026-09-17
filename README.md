@@ -131,6 +131,8 @@ ArrowMetal materialises a column; 8 temporal extractions; 4 `unique` and `value_
 threaded hash aggregation; 1 grouped moment; 4 string conversions with variable-length output; and 4
 whole-query chains against a streaming engine. `shift (lag 1)` at 0.01x is the lowest ratio in the matrix outside the latency family. Every one of them is listed with its cause and with what would change it in
 [docs/TO_IMPROVE.md](docs/TO_IMPROVE.md), and [docs/DESIGN.md](docs/DESIGN.md) has the pipelining plan for the dispatch floor.
+[docs/CROSSOVER.md](docs/CROSSOVER.md) states the other side of the floor: from what row count the GPU path
+is ahead, per operation and per family, measured with a size sweep from a thousand rows to fifty million.
 
 **DuckDB on the same rows.** The matrix's CPU libraries are Polars, pyarrow and pandas. DuckDB 1.5.5,
 measured on 2026-09-12 on the matrix's sort, group-by, filter and sum rows with the same data and protocol

@@ -1,6 +1,6 @@
 # Benchmarks
 
-Seven complementary benchmarks. Numbers per chip live in `../docs/BENCHMARKS.md`, and the complete
+Eight complementary benchmarks. Numbers per chip live in `../docs/BENCHMARKS.md`, and the complete
 operation-by-operation matrix in `../docs/BENCHMARKS_MATRIX.md`.
 
 | Script | What it measures |
@@ -12,6 +12,7 @@ operation-by-operation matrix in `../docs/BENCHMARKS_MATRIX.md`.
 | `PYTHONPATH=python python Benchmarks/engine_bench.py [rows] [iters]` | The lazy query engine: eight TPC-H-flavoured query shapes at 50M rows (plus a 10M x 1M join, a 50M as-of join and a window over 1000 partitions) against Polars lazy and DuckDB on the same Arrow buffers (see `../docs/ENGINE.md`). |
 | `PYTHONPATH=python python Benchmarks/full_matrix.py [--quick]` | **Every** operation family, against both the eager and the most parallel idiom of each CPU library, with a pass/fail verdict per row and the cores each idiom used. |
 | `PYTHONPATH=python python Benchmarks/duckdb_matrix.py [rows ...]` | DuckDB on the matrix's sort, group-by, filter and sum rows, same generators and protocol, four idioms (Arrow scan in one chunk and in sixteen batches; native table exported to Arrow and kept in DuckDB); `--report <csv>` joins it with the published matrix rows (see `../docs/DUCKDB.md`). |
+| `PYTHONPATH=python python Benchmarks/crossover.py --sweep <sweep csv> --matrix <matrix csv> --bench <bench csv>` | The crossover table: from what row count the GPU path is ahead, per operation and per family. `--sweep` is a `full_matrix.py --sizes 1000,10000,100000,1000000,10000000` run, `--matrix` supplies the 50M rows, `--bench` is `arrowmetal-bench crossover` (GPU kernel against the CPU loop the router would run). Writes `results/crossover_<date>.csv`, `results/router_<date>.json` and `../docs/CROSSOVER.md`. |
 
 ## full_matrix.py: the complete comparison
 
