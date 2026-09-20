@@ -2,6 +2,25 @@
 
 Things learned the hard way. Add to this whenever something surprises you.
 
+## Round 11 (2026-09-20): the three Metal findings reported to Apple
+
+**TL;DR**
+
+- The three findings this log had accumulated about Metal itself went to Apple through Feedback
+  Assistant on 2026-09-20: the 64-bit atomics the Feature Set Tables promise and the shading language
+  refuses (FB24858110), pipeline creation failing sporadically on the "Apple Paravirtual device" of
+  GitHub's hosted runners, rounds 4 and 5 below (FB24858160), and the persistent-kernel coherence
+  result of [RESIDENT.md](RESIDENT.md), filed as a suggestion for a system-scope primitive
+  (FB24858235). Feedback Assistant is private, so [APPLE_REPORTS.md](APPLE_REPORTS.md) is the readable
+  record of what each report says, what was measured and what was asked.
+- Re-running the probes before filing changed one report. The coherence probe, which on 2026-09-08 had
+  seen no CPU store at all under any qualifier, saw 24 of 433 under `coherent(device)` in one of three
+  runs that day, a single store in another and none in the third. "Never" became "sporadic and
+  unbounded", which is the more accurate claim and the harder one to dismiss.
+- The paravirtual report's draft quoted an error code that appears in neither attached CI log; it was
+  replaced by what the logs show, "Compilation failed" with an empty userInfo. Verifying every sentence
+  of a report against its own attachments before filing is the rule, and it caught two drifts.
+
 ## Round 10 (2026-09-08): arrow-go's span iterator, found while designing its aggregates
 
 **TL;DR**
