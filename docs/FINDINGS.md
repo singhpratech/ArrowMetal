@@ -2,24 +2,99 @@
 
 Things learned the hard way. Add to this whenever something surprises you.
 
-## Round 11 (2026-09-20): the three Metal findings reported to Apple
+## Round 11 (2026-09-20): The three Metal findings reported to Apple
 
 **TL;DR**
 
-- The three findings this log had accumulated about Metal itself went to Apple through Feedback
-  Assistant on 2026-09-20: the 64-bit atomics the Feature Set Tables promise and the shading language
-  refuses (FB24858110), pipeline creation failing sporadically on the "Apple Paravirtual device" of
-  GitHub's hosted runners, rounds 4 and 5 below (FB24858160), and the persistent-kernel coherence
-  result of [RESIDENT.md](RESIDENT.md), filed as a suggestion for a system-scope primitive
-  (FB24858235). Feedback Assistant is private, so [APPLE_REPORTS.md](APPLE_REPORTS.md) is the readable
-  record of what each report says, what was measured and what was asked.
-- Re-running the probes before filing changed one report. The coherence probe, which on 2026-09-08 had
-  seen no CPU store at all under any qualifier, saw 24 of 433 under `coherent(device)` in one of three
-  runs that day, a single store in another and none in the third. "Never" became "sporadic and
-  unbounded", which is the more accurate claim and the harder one to dismiss.
-- The paravirtual report's draft quoted an error code that appears in neither attached CI log; it was
-  replaced by what the logs show, "Compilation failed" with an empty userInfo. Verifying every sentence
-  of a report against its own attachments before filing is the rule, and it caught two drifts.
+- Metal has no public issue tracker, so the three findings this log had accumulated about Metal itself
+  went to Apple through Feedback Assistant on 2026-09-20. Feedback Assistant is private, so this entry
+  and [APPLE_REPORTS.md](APPLE_REPORTS.md) are the readable record; the rows move in
+  [UPSTREAM.md](UPSTREAM.md) when Apple answers.
+- FB24858110: the Feature Set Tables promise "the full set of 64-bit atomic operations" on Apple9; the
+  shading language compiles exactly two, min and max. FB24858160: pipeline creation fails at random on
+  the "Apple Paravirtual device" of GitHub's macOS runners, 110 times in one test process. FB24858235: a
+  running kernel sees CPU stores to shared memory only sporadically, so a persistent GPU worker cannot
+  be built; filed as a suggestion for a system-scope primitive.
+- Re-verifying each report against its own attachments before filing changed two of them. The rule
+  held: nothing was sent that the attachments do not show.
+
+### 1. 64-bit atomics: the documentation and the compiler disagree (FB24858110)
+
+Apple's Metal Feature Set Tables list 64-bit atomics for the Apple9 family, which the M4 series belongs
+to, and say in a footnote that "the full set of 64-bit atomic operations is supported on all platforms
+starting with Apple9". On an M4 Max the compiler accepts exactly two 64-bit atomic operations, on device
+memory only: `atomic_min_explicit` and `atomic_max_explicit` on `device atomic_ulong`, void-returning,
+relaxed order. Fetch-add, fetch-sub, the value-returning min and max, exchange, compare-exchange, load
+and store are all compile errors at every language version from 3.1 to 4.0, and there is no signed
+`atomic_long`. The shipped header and the shading-language specification's own table of 64-bit atomic
+functions agree with the compiler, not with the Feature Set Tables. A 64-bit add cannot be built from
+parts either, because there is no 64-bit compare-exchange to loop on.
+
+Measured with a short Swift program that compiles one tiny kernel per operation at three language
+versions and prints each verdict, then runs the two that compile over ten million elements and checks
+the results. It was run again on the day of filing with the same outcome as two weeks earlier.
+
+What it costs here: every 64-bit accumulation carries a workaround. An int64 sum per group is a split
+32-bit add with an explicit carry; a hash table publishes a 32-bit row index because a 64-bit key cannot
+be published atomically; grouped variance and standard deviation, which accumulate in software binary64,
+run a counting sort by group first because they cannot use per-group atomic accumulators. On the
+matrix's 50-million-row, 1,000-group rows the grouped sum, where the carry trick suffices, is 3.8x ahead
+of pyarrow's threaded engine; grouped variance, which cannot use it, is level with it.
+
+Asked: on Apple9, the operations the footnote already claims; failing that, a per-family statement of
+which `ulong` operations exist, in place of "the full set".
+
+### 2. Pipeline creation fails at random on GitHub's virtual GPU (FB24858160)
+
+On GitHub-hosted macOS runners the Metal device is an "Apple Paravirtual device". Compiling a shader
+library from source succeeds every time; creating a compute pipeline for a function from that library
+then fails sporadically with the text "Compilation failed" and nothing else, for ordinary kernels that
+succeed on the same runner image in other runs and in the same process moments later. Rounds 4 and 5
+below are where this was first met.
+
+Measured from two complete CI logs on runner image macos-15-arm64 20260829.0321.1 with Xcode 16.4. In
+the first run one test process saw 110 pipeline-creation failures across 23 distinct kernels and no
+library-compilation failure, the most frequent a filter kernel, 64 times. In the second the engine
+retried each creation once after 20 ms and skipped GPU tests on virtual devices; the test step passed
+by creating few pipelines, and the benchmark step, which still created them, failed on a group-by
+kernel even with the retry. On real Apple silicon the same source has never produced one such failure.
+
+What it costs: GPU code cannot be validated on GitHub-hosted macOS runners. CI here proves the build,
+the language interop and the CPU paths; every GPU test and benchmark runs on local hardware.
+
+Asked: deterministic pipeline creation for a function from a library the same device just compiled; or
+an error that names the unsupported construct and a device property that reports the limitation before
+any work is submitted.
+
+### 3. A running kernel cannot reliably see CPU stores to shared memory (FB24858235)
+
+Small operations are dominated by the fixed cost of a dispatch, about 60 microseconds of submission and
+completion notification on this machine. The standard escape elsewhere is a persistent worker: one
+long-running kernel spinning on a ring of work descriptors in shared memory, so that submitting work is
+a CPU store. That needs a CPU store to become visible to a running kernel within a bounded time.
+
+Measured with a standalone program that compiles one kernel per memory qualifier the shading language
+offers, from plain pointers through `volatile`, `coherent(device)`, device-scope atomics and
+device-memory barriers; one threadgroup spins on a doorbell word in a shared-storage buffer for three
+seconds while the CPU increments it every 5 ms. Five runs across three days: in one, no store was seen
+under any qualifier; in another, 24 of 433 under one qualifier and a handful under others, the first
+after 160 ms or more; in another, a single store of 598. The behaviour is consistent with visibility
+arriving only when a cache line happens to be evicted, which nothing in the language can request.
+`coherent(device)` is the widest scope the language has and there is no synchronisation call that can
+run mid-dispatch. The full study is [RESIDENT.md](RESIDENT.md).
+
+Asked: a system-scope coherence primitive with a stated visibility bound; or a documented, explicitly
+costed way for a running kernel to observe CPU stores without a command-buffer boundary; or, failing
+both, a documented submit-and-notify path under 20 microseconds, which removes the motive.
+
+### What changed before filing
+
+Re-running the coherence probe, which on 2026-09-08 had seen no CPU store at all under any qualifier,
+saw 24 of 433 in one of three runs that day, a single store in another and none in the third. "Never"
+became "sporadic and unbounded": the more accurate claim, and the harder one to dismiss. The paravirtual
+draft quoted an error code that appears in neither attached CI log; it was replaced by what the logs
+show, "Compilation failed" with an empty userInfo. Verifying every sentence of a report against its
+own attachments caught both.
 
 ## Round 10 (2026-09-08): arrow-go's span iterator, found while designing its aggregates
 
