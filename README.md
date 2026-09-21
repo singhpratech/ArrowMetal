@@ -295,18 +295,19 @@ let stream = try ArrowIPCWriter.encode(batches, format: .stream)   // Data, for 
 ```
 
 Int8 to UInt64, Float32/64, Bool, Utf8, LargeUtf8 and Binary are read into their `MetalArray` types, and
-dictionary-encoded columns round trip through complete `DictionaryBatch` messages (`isDelta = false`).
-Temporal columns (`date32/64`, `time32/64`, `timestamp`, `duration`) are carried by their storage integer
-array while the logical type stays visible in `reader.schema`.
+dictionary-encoded columns round trip through `DictionaryBatch` messages. Temporal columns (`date32/64`,
+`time32/64`, `timestamp`, `duration`) are carried by their storage integer array while the logical type
+stays visible in `reader.schema`.
 
-The **writer** takes every type this package can hold, nested children and all: decimals, `float16`,
+Both directions take every type this package can hold, nested children and all: decimals, `float16`,
 `fixed_size_binary`, the three interval units, `null`, list / large list / fixed-size list, struct, map,
 dense and sparse unions, run-end encoded columns and extension types. pyarrow reads each one back with
-the right type and the right values. The **reader** is narrower — it builds the flat types and
-dictionaries, and rejects nested, decimal and the other layouts with a message naming the column — so a
-column of one of those types goes out to pyarrow rather than round tripping through this package.
-Compressed bodies and big-endian data are rejected by both; [docs/COVERAGE.md](docs/COVERAGE.md) says
-which direction each type is covered in.
+the right type and the right values, and every file pyarrow writes for one of them reads back with
+pyarrow's values. The reader also decompresses LZ4_FRAME and ZSTD bodies (ZSTD through libzstd, as the
+Parquet reader does, with a clear error when it is not installed), and follows message order for
+dictionaries, so a stream may replace a dictionary part way through or extend it with a delta. The
+writer emits uncompressed bodies only. Big-endian data and the view types are rejected by both;
+[docs/COVERAGE.md](docs/COVERAGE.md) says what each type is covered by.
 
 ## What is implemented
 

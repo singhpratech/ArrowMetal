@@ -139,10 +139,29 @@ Temporal, timezones and the rest of the type matrix
   Arrow's pre-order with the type metadata the spec prescribes — decimal precision/scale/bitWidth, the
   list child field, a map's `entries` struct with `keysSorted` and a non-nullable key, struct and union
   child names, union mode and typeIds, the interval unit — and pyarrow 25 reads each one back with the
-  right type and the right values from both the file and the stream encapsulation. The IPC *reader* is
-  unchanged and still refuses these types with a message naming the column. A sliced utf8, binary or list
-  column now rebases its offsets and writes only the bytes and child elements its own rows cover, instead
-  of the prefix it shares with its parent.
+  right type and the right values from both the file and the stream encapsulation. A sliced utf8, binary
+  or list column now rebases its offsets and writes only the bytes and child elements its own rows cover,
+  instead of the prefix it shares with its parent.
+- The Arrow IPC reader builds every one of those types too. It walks a batch's field nodes and buffers in
+  the pre-order the spec defines, recursing into children, so `list`/`large_list`/`fixed_size_list`,
+  `struct`, `map`, both unions and run-end encoding come back as the engine's own nested arrays, and
+  decimal32/64/128/256, `fixed_size_binary`, `float16`, the three interval units and `null` come back as
+  theirs; 64-bit offsets are narrowed to the 32-bit ones the engine stores, with a clear error above 2 GB.
+  Every file pyarrow 25 writes for a type the engine can hold now reads back with pyarrow's values, in
+  both encapsulations.
+- The IPC reader decompresses **LZ4_FRAME and ZSTD** bodies, per buffer, including the -1 marker for a
+  buffer a writer left uncompressed, in record batches and dictionary batches alike. ZSTD goes through
+  the same `dlopen` of libzstd the Parquet reader uses and names the missing library rather than
+  returning wrong data; LZ4 frames are decoded into one contiguous output, so linked blocks decode as
+  well as independent ones. The writer still emits uncompressed bodies only.
+- IPC dictionaries follow message position: a dictionary applies to the batches after it, so a stream may
+  replace one part way through or extend it with a delta, while the file format — which indexes every
+  dictionary in its footer — still refuses a replacement. Reading batches out of order replays the
+  dictionary messages from the first.
+- Three IPC reader fixes: a batch whose field nodes or buffers are not all consumed is rejected as
+  malformed rather than read with the surplus ignored; a field is classified by its type before it is
+  judged for having children, so an unsupported type is named for what it is; and dictionary
+  materialisation no longer reads every `DictionaryBatch` in the source on the first batch read.
 
 Arrow function coverage
 - `arrowmetal.functions`: a registry with one entry per Arrow v25 compute function name — all 307, the
