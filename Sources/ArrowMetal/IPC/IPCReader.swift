@@ -33,6 +33,14 @@ public enum ArrowIPCIntervalUnit: Int16, Sendable, CustomStringConvertible {
         case .monthDayNano: return 16
         }
     }
+    /// The engine's spelling of the same unit, which calls `interval[year_month]` `months`.
+    var arrayUnit: ArrowIntervalUnit {
+        switch self {
+        case .yearMonth: return .months
+        case .dayTime: return .dayTime
+        case .monthDayNano: return .monthDayNano
+        }
+    }
 }
 
 /// Whether a union stores one slot per row in every child (sparse) or packs each child (dense).
@@ -50,7 +58,7 @@ enum ArrowIPCStorage: Equatable {
     /// Variable width: validity bitmap + offsets + data. `large` selects 64-bit offsets.
     case varBinary(large: Bool)
     /// A layout whose values live in child field nodes (list, struct, map, union, run-end encoded) or in
-    /// no buffer at all (`null`). The writer flattens these; the reader does not build them.
+    /// no buffer at all (`null`). `buffers` counts only the field's own buffers, its children aside.
     case nested(buffers: Int)
 
     /// Number of Arrow buffers a field of this storage contributes to a record batch, its children aside.
@@ -282,6 +290,23 @@ struct ArrowIPCMessageRef {
     let bodyLength: Int
 }
 
+/// Arrow's `CompressionType`: how the buffers of a message body were compressed.
+enum ArrowIPCCodec: UInt8 {
+    case lz4Frame = 0, zstd = 1
+    var name: String { self == .lz4Frame ? "LZ4_FRAME" : "ZSTD" }
+}
+
+/// What one scan of the source found: its encapsulation, its schema and where every message lives.
+struct ArrowIPCScan {
+    let format: ArrowIPCFormat
+    let schema: ArrowIPCSchema
+    let messages: [ArrowIPCMessageRef]
+    let dictionaries: [ArrowIPCMessageRef]
+    /// For each record batch, how many dictionary messages precede it. A dictionary applies to the
+    /// batches that follow it, which is what lets a stream replace or extend one part way through.
+    let dictionariesBefore: [Int]
+}
+
 /// Retains the source `Data` for as long as any buffer borrowed from it is alive.
 final class ArrowIPCSourceHolder {
     let data: Data
@@ -312,8 +337,12 @@ public final class ArrowIPCReader {
     private let messages: [ArrowIPCMessageRef]
     /// `DictionaryBatch` messages, in the order they appear (stream) or the footer lists them (file).
     private let dictionaryMessages: [ArrowIPCMessageRef]
-    /// Dictionary values by id, materialised once on the first batch read.
+    /// For each record batch, how many of those messages precede it.
+    private let dictionariesBefore: [Int]
+    /// Dictionary values by id, for the dictionary messages applied so far.
     private var dictionaries: [Int64: AnyMetalArray] = [:]
+    /// How many dictionary messages `dictionaries` reflects, counting from the first.
+    private var appliedDictionaries = 0
     private let context: MetalContext
     /// Borrow mapped pages instead of copying when they happen to be page aligned.
     private let allowZeroCopy: Bool
@@ -344,6 +373,7 @@ public final class ArrowIPCReader {
         self.schema = parsed.schema
         self.messages = parsed.messages
         self.dictionaryMessages = parsed.dictionaries
+        self.dictionariesBefore = parsed.dictionariesBefore
     }
 
     /// Reads every record batch.
@@ -361,7 +391,8 @@ public final class ArrowIPCReader {
             let meta = try FBBuf(raw, from: ref.metadataOffset, count: ref.metadataLength)
             let message = try meta.root()
             guard let header = try message.table(2) else { throw ArrowIPCError.malformed("message has no header") }
-            return try buildBatch(header: header, raw: raw, bodyOffset: ref.bodyOffset, bodyLength: ref.bodyLength)
+            return try buildBatch(header: header, raw: raw, bodyOffset: ref.bodyOffset, bodyLength: ref.bodyLength,
+                                  dictionaryCount: dictionariesBefore[index])
         }
     }
 
@@ -373,17 +404,13 @@ public final class ArrowIPCReader {
         return true
     }
 
-    private static func scan(_ raw: UnsafeRawBufferPointer)
-        throws -> (format: ArrowIPCFormat, schema: ArrowIPCSchema, messages: [ArrowIPCMessageRef],
-                   dictionaries: [ArrowIPCMessageRef]) {
+    private static func scan(_ raw: UnsafeRawBufferPointer) throws -> ArrowIPCScan {
         guard raw.count >= 8 else { throw ArrowIPCError.notArrowIPC }
         if hasPrefix(raw, arrowFileMagic, at: 0) { return try scanFile(raw) }
         return try scanStream(raw)
     }
 
-    private static func scanFile(_ raw: UnsafeRawBufferPointer)
-        throws -> (format: ArrowIPCFormat, schema: ArrowIPCSchema, messages: [ArrowIPCMessageRef],
-                   dictionaries: [ArrowIPCMessageRef]) {
+    private static func scanFile(_ raw: UnsafeRawBufferPointer) throws -> ArrowIPCScan {
         let n = raw.count
         guard n >= 8 + 10, hasPrefix(raw, arrowFileMagicTail, at: n - 6) else {
             throw ArrowIPCError.malformed("file does not end with the ARROW1 magic")
@@ -426,16 +453,18 @@ public final class ArrowIPCReader {
                 messages.append(msg.ref)
             }
         }
-        return (.file, schema, messages, dictionaries)
+        // In the file format every dictionary is in scope for every batch: the footer indexes them all,
+        // and the format forbids replacing one, so message order carries no meaning here.
+        return ArrowIPCScan(format: .file, schema: schema, messages: messages, dictionaries: dictionaries,
+                            dictionariesBefore: Array(repeating: dictionaries.count, count: messages.count))
     }
 
-    private static func scanStream(_ raw: UnsafeRawBufferPointer)
-        throws -> (format: ArrowIPCFormat, schema: ArrowIPCSchema, messages: [ArrowIPCMessageRef],
-                   dictionaries: [ArrowIPCMessageRef]) {
+    private static func scanStream(_ raw: UnsafeRawBufferPointer) throws -> ArrowIPCScan {
         var pos = 0
         var schema: ArrowIPCSchema? = nil
         var messages: [ArrowIPCMessageRef] = []
         var dictionaries: [ArrowIPCMessageRef] = []
+        var dictionariesBefore: [Int] = []
         while pos < raw.count {
             guard let m = try message(raw, at: pos) else { break }     // end-of-stream marker
             switch m.headerType {
@@ -447,6 +476,7 @@ public final class ArrowIPCReader {
             case FBMessageHeader.recordBatch.rawValue:
                 guard schema != nil else { throw ArrowIPCError.malformed("record batch before the schema message") }
                 messages.append(m.ref)
+                dictionariesBefore.append(dictionaries.count)
             case FBMessageHeader.dictionaryBatch.rawValue:
                 guard schema != nil else { throw ArrowIPCError.malformed("dictionary batch before the schema message") }
                 dictionaries.append(m.ref)
@@ -458,7 +488,8 @@ public final class ArrowIPCReader {
             pos = m.next
         }
         guard let schema else { throw ArrowIPCError.notArrowIPC }
-        return (.stream, schema, messages, dictionaries)
+        return ArrowIPCScan(format: .stream, schema: schema, messages: messages, dictionaries: dictionaries,
+                            dictionariesBefore: dictionariesBefore)
     }
 
     /// Decodes one encapsulated message header at `pos`. Returns nil at the end-of-stream marker.
@@ -506,9 +537,8 @@ public final class ArrowIPCReader {
         let name = try field.string(0) ?? ""
         let nullable = try field.bool(1)
         let encoding = try field.table(4)
-        if let children = try field.vector(5), children.count > 0 {
-            throw ArrowIPCError.unsupported("nested column '\(name)'")
-        }
+        // The type is classified before its children are judged, so a type this reader does not handle
+        // is named for what it is rather than for merely having children.
         let kindCode = try field.uint8(2)
         guard let kind = FBTypeKind(rawValue: kindCode) else {
             throw ArrowIPCError.malformed("unknown type code \(kindCode) for column '\(name)'")
@@ -516,7 +546,12 @@ public final class ArrowIPCReader {
         guard let type = try field.table(3) else {
             throw ArrowIPCError.malformed("column '\(name)' has no type table")
         }
-        let valueType = try parseType(kind, type, column: name)
+        var children: [ArrowIPCField] = []
+        if let vec = try field.vector(5) {
+            children.reserveCapacity(vec.count)
+            for i in 0..<vec.count { children.append(try parseField(vec.table(i))) }
+        }
+        let valueType = try parseType(kind, type, children: children, column: name)
         guard let encoding else { return ArrowIPCField(name: name, type: valueType, nullable: nullable) }
         // DictionaryEncoding { id: long; indexType: Int; isOrdered: bool; dictionaryKind: short }
         let id = try encoding.int64(0)
@@ -532,10 +567,18 @@ public final class ArrowIPCReader {
                              nullable: nullable, dictionaryID: id)
     }
 
-    private static func parseType(_ kind: FBTypeKind, _ type: FBTable, column: String) throws -> ArrowIPCType {
+    private static func parseType(_ kind: FBTypeKind, _ type: FBTable, children: [ArrowIPCField],
+                                  column: String) throws -> ArrowIPCType {
         func unit(_ raw: Int16) throws -> ArrowIPCTimeUnit {
             guard let u = ArrowIPCTimeUnit(rawValue: raw) else { throw ArrowIPCError.malformed("bad time unit \(raw)") }
             return u
+        }
+        /// The single child a list-shaped type has.
+        func item() throws -> ArrowIPCField {
+            guard children.count == 1 else {
+                throw ArrowIPCError.malformed("\(kind.name) column '\(column)' has \(children.count) children, not 1")
+            }
+            return children[0]
         }
         switch kind {
         case .int:
@@ -549,7 +592,8 @@ public final class ArrowIPCReader {
             switch try type.int16(0) {
             case fbPrecisionSingle: return .float(bits: 32)
             case fbPrecisionDouble: return .float(bits: 64)
-            default: throw ArrowIPCError.unsupported("half precision floats (column '\(column)')")
+            case fbPrecisionHalf: return .float16
+            default: throw ArrowIPCError.malformed("bad float precision for column '\(column)'")
             }
         case .bool: return .bool
         case .utf8: return .utf8
@@ -567,6 +611,60 @@ public final class ArrowIPCReader {
             return .timestamp(u, timezone: (tz?.isEmpty ?? true) ? nil : tz)
         case .duration:
             return .duration(try unit(type.int16(0, default: fbDateUnitMillisecond)))
+        case .null: return .null
+        case .decimal:
+            // Decimal { precision: int; scale: int; bitWidth: int = 128 }
+            let bits = Int(try type.int32(2, default: 128))
+            guard [32, 64, 128, 256].contains(bits) else {
+                throw ArrowIPCError.unsupported("decimal\(bits) (column '\(column)')")
+            }
+            return .decimal(precision: Int(try type.int32(0)), scale: Int(try type.int32(1)), bits: bits)
+        case .fixedSizeBinary:
+            let width = Int(try type.int32(0))
+            guard width >= 0 else { throw ArrowIPCError.malformed("negative fixed_size_binary width for column '\(column)'") }
+            return .fixedSizeBinary(byteWidth: width)
+        case .interval:
+            let raw = try type.int16(0, default: 0)
+            guard let u = ArrowIPCIntervalUnit(rawValue: raw) else {
+                throw ArrowIPCError.malformed("bad interval unit \(raw) for column '\(column)'")
+            }
+            return .interval(u)
+        case .list: return .list(try item())
+        case .largeList: return .largeList(try item())
+        case .fixedSizeList:
+            let size = Int(try type.int32(0))
+            guard size >= 0 else { throw ArrowIPCError.malformed("negative fixed_size_list width for column '\(column)'") }
+            return .fixedSizeList(try item(), size: size)
+        case .structKind: return .structure(children)
+        case .map:
+            let entries = try item()
+            guard case .structure(let fields) = entries.type, fields.count == 2 else {
+                throw ArrowIPCError.malformed("map column '\(column)' has a child that is not a struct of two fields")
+            }
+            return .map(entries: entries, keysSorted: try type.bool(0))
+        case .union:
+            // Union { mode: UnionMode; typeIds: [int] }; an absent vector means 0, 1, ... in child order.
+            let raw = try type.int16(0, default: 0)
+            guard let mode = ArrowIPCUnionMode(rawValue: raw) else {
+                throw ArrowIPCError.malformed("bad union mode \(raw) for column '\(column)'")
+            }
+            var ids: [Int32] = (0..<children.count).map(Int32.init)
+            if let vec = try type.vector(1) {
+                guard vec.count == children.count else {
+                    throw ArrowIPCError.malformed(
+                        "union column '\(column)' declares \(vec.count) type ids for \(children.count) children")
+                }
+                ids = try (0..<vec.count).map { try vec.int32($0) }
+            }
+            for id in ids where Int8(exactly: id) == nil {
+                throw ArrowIPCError.malformed("union column '\(column)' has a type id (\(id)) outside a byte")
+            }
+            return .union(mode: mode, typeIDs: ids, children: children)
+        case .runEndEncoded:
+            guard children.count == 2 else {
+                throw ArrowIPCError.malformed("run-end encoded column '\(column)' needs run_ends and values children")
+            }
+            return .runEndEncoded(runEnds: children[0], values: children[1])
         default:
             throw ArrowIPCError.unsupported("\(kind.name) columns (column '\(column)')")
         }
@@ -574,16 +672,28 @@ public final class ArrowIPCReader {
 
     // MARK: record batch
 
-    private struct BodyBuffer {
-        let offset: Int
+    /// The `RecordBatch` table's own fields: logical length, field nodes, buffer ranges and the codec
+    /// its buffers were compressed with. Shared by record batch and dictionary batch messages (a
+    /// dictionary batch wraps a record batch).
+    private struct RecordBatchParts {
         let length: Int
+        let nodes: [(length: Int, nullCount: Int)]
+        let buffers: [ArrowIPCBodyBuffer]
+        let codec: ArrowIPCCodec?
     }
 
-    /// The `RecordBatch` table's own fields: logical length, field nodes and buffer ranges.
-    /// Shared by record batch and dictionary batch messages (a dictionary batch wraps a record batch).
-    private func recordBatchParts(header: FBTable, bodyLength: Int)
-        throws -> (length: Int, nodes: [(length: Int, nullCount: Int)], buffers: [BodyBuffer]) {
-        if try header.field(3) != nil { throw ArrowIPCError.unsupported("compressed record batch bodies") }
+    private func recordBatchParts(header: FBTable, bodyLength: Int) throws -> RecordBatchParts {
+        var codec: ArrowIPCCodec? = nil
+        if let compression = try header.table(3) {
+            // BodyCompression { codec: CompressionType; method: BodyCompressionMethod }
+            let raw = try compression.uint8(0)
+            guard let c = ArrowIPCCodec(rawValue: raw) else {
+                throw ArrowIPCError.unsupported("body compression codec \(raw)")
+            }
+            let method = try compression.uint8(1)
+            guard method == 0 else { throw ArrowIPCError.unsupported("body compression method \(method)") }
+            codec = c
+        }
         if let variadic = try header.vector(4), variadic.count > 0 {
             throw ArrowIPCError.unsupported("variadic buffers (view types)")
         }
@@ -599,7 +709,7 @@ public final class ArrowIPCReader {
                               Int(try header.buf.load(Int64.self, at: p + 8))))
             }
         }
-        var buffers: [BodyBuffer] = []
+        var buffers: [ArrowIPCBodyBuffer] = []
         if let vec = try header.vector(2) {
             buffers.reserveCapacity(vec.count)
             for i in 0..<vec.count {
@@ -610,53 +720,120 @@ public final class ArrowIPCReader {
                 guard off >= 0, len >= 0, off + len <= bodyLength else {
                     throw ArrowIPCError.malformed("buffer \(i) (\(off)..<\(off + len)) escapes the \(bodyLength) byte body")
                 }
-                buffers.append(BodyBuffer(offset: off, length: len))
+                buffers.append(ArrowIPCBodyBuffer(offset: off, length: len))
             }
         }
-        return (length, nodes, buffers)
+        return RecordBatchParts(length: length, nodes: nodes, buffers: buffers, codec: codec)
     }
 
-    private func buildBatch(header: FBTable, raw: UnsafeRawBufferPointer,
-                            bodyOffset: Int, bodyLength: Int) throws -> MetalRecordBatch {
-        let (length, nodes, buffers) = try recordBatchParts(header: header, bodyLength: bodyLength)
-        guard nodes.count == schema.fields.count else {
-            throw ArrowIPCError.malformed("record batch has \(nodes.count) field nodes for \(schema.fields.count) columns")
-        }
+    private func buildBatch(header: FBTable, raw: UnsafeRawBufferPointer, bodyOffset: Int, bodyLength: Int,
+                            dictionaryCount: Int) throws -> MetalRecordBatch {
+        let parts = try recordBatchParts(header: header, bodyLength: bodyLength)
+        let length = parts.length
 
         lastBatchWasZeroCopy = false
         borrowedAny = false
-        try materialiseDictionaries(raw: raw)
+        try materialiseDictionaries(upTo: dictionaryCount, raw: raw)
+        let body = try messageBody(parts, raw: raw, bodyOffset: bodyOffset)
+        let cursor = ArrowIPCCursor(nodes: parts.nodes, body: body)
         var columns: [AnyMetalArray] = []
         columns.reserveCapacity(schema.fields.count)
-        var next = 0
-        for (i, field) in schema.fields.enumerated() {
-            let need = field.type.storage.bufferCount
-            guard next + need <= buffers.count else {
-                throw ArrowIPCError.malformed("record batch is missing buffers for column '\(field.name)'")
+        for field in schema.fields {
+            let column = try buildColumn(field: field, cursor: cursor)
+            // Only a nested child may have a length of its own; every top-level column is the batch's.
+            guard column.length == length else {
+                throw ArrowIPCError.malformed("column '\(field.name)' has \(column.length) values in a \(length) row batch")
             }
-            let slice = Array(buffers[next..<(next + need)])
-            next += need
-            let node = nodes[i]
-            // Only nested children may have a length of their own, and those are rejected in the schema.
-            guard node.length == length else {
-                throw ArrowIPCError.malformed("column '\(field.name)' has \(node.length) values in a \(length) row batch")
-            }
-            columns.append(try buildColumn(field: field, length: length, nullCount: node.nullCount,
-                                           buffers: slice, raw: raw, bodyOffset: bodyOffset))
+            columns.append(column)
+        }
+        // Everything the message declared must have been used: a batch with a field node or a buffer the
+        // schema does not account for is malformed, not a batch with something extra to ignore.
+        guard cursor.nodeIndex == parts.nodes.count else {
+            throw ArrowIPCError.malformed(
+                "record batch declares \(parts.nodes.count) field nodes but the schema uses \(cursor.nodeIndex)")
+        }
+        guard cursor.bufferIndex == parts.buffers.count else {
+            throw ArrowIPCError.malformed(
+                "record batch declares \(parts.buffers.count) buffers but the schema uses \(cursor.bufferIndex)")
         }
         lastBatchWasZeroCopy = borrowedAny
         return try MetalRecordBatch(names: schema.fields.map(\.name), columns: columns)
     }
 
-    /// Copies (or borrows) `need` bytes of the body into Metal shared memory.
-    private func take(_ buffer: BodyBuffer, need: Int, raw: UnsafeRawBufferPointer,
-                      bodyOffset: Int) throws -> MetalArrowBuffer {
-        guard need > 0 else { return try MetalArrowBuffer.allocate(byteCount: 0, context: context) }
-        guard buffer.length >= need else {
-            throw ArrowIPCError.malformed("buffer holds \(buffer.length) bytes where \(need) are needed")
+    // MARK: message body
+
+    /// Wraps a message body, decompressing every buffer first when the message declared a codec.
+    private func messageBody(_ parts: RecordBatchParts, raw: UnsafeRawBufferPointer,
+                             bodyOffset: Int) throws -> ArrowIPCMessageBody {
+        guard let codec = parts.codec else {
+            return ArrowIPCMessageBody(raw: raw, offset: bodyOffset, buffers: parts.buffers, plain: nil)
         }
+        return ArrowIPCMessageBody(raw: raw, offset: bodyOffset, buffers: parts.buffers,
+                                   plain: try decompress(codec, parts.buffers, raw: raw, bodyOffset: bodyOffset))
+    }
+
+    /// Arrow compresses a body one buffer at a time: an 8-byte little-endian uncompressed length, then the
+    /// codec's own bytes — or, when that length is -1, the uncompressed bytes themselves (which is what a
+    /// writer emits for a buffer compression would not shrink). A zero-length buffer carries no prefix.
+    private func decompress(_ codec: ArrowIPCCodec, _ buffers: [ArrowIPCBodyBuffer],
+                            raw: UnsafeRawBufferPointer, bodyOffset: Int) throws -> [MetalArrowBuffer] {
         guard let base = raw.baseAddress else { throw ArrowIPCError.truncated("empty source") }
-        let src = base.advanced(by: bodyOffset + buffer.offset)
+        if codec == .zstd && !Zstd.isAvailable {
+            throw ArrowIPCError.unsupported(
+                "ZSTD body compression needs libzstd, which macOS does not ship and this SDK's Compression "
+                + "framework does not implement. Install it (brew install zstd) or point ARROWMETAL_ZSTD at libzstd.1.dylib.")
+        }
+        return try buffers.enumerated().map { i, b in
+            guard b.length > 0 else { return try MetalArrowBuffer.allocate(byteCount: 0, context: context) }
+            guard b.length >= 8 else {
+                throw ArrowIPCError.malformed("compressed buffer \(i) is \(b.length) bytes, too short for a length prefix")
+            }
+            let src = base.advanced(by: bodyOffset + b.offset)
+            let declared = Int64(littleEndian: src.loadUnaligned(as: Int64.self))
+            let payload = src.advanced(by: 8)
+            let payloadLength = b.length - 8
+            if declared < 0 {
+                return try MetalArrowBuffer.copy(from: payload, byteCount: payloadLength, context: context)
+            }
+            guard declared <= Int64(Int.max) else {
+                throw ArrowIPCError.malformed("compressed buffer \(i) claims \(declared) uncompressed bytes")
+            }
+            let want = Int(declared)
+            let out = try MetalArrowBuffer.allocate(byteCount: want, zeroed: false, context: context)
+            guard want > 0 else { return out }
+            let inPtr = payload.assumingMemoryBound(to: UInt8.self)
+            let outPtr = out.mutableTyped(UInt8.self)
+            let produced: Int
+            switch codec {
+            case .lz4Frame:
+                produced = try ArrowIPCLZ4.decodeFrame(inPtr, payloadLength, outPtr, want)
+            case .zstd:
+                do { produced = try Zstd.decompress(inPtr, payloadLength, outPtr, want) }
+                catch { throw ArrowIPCError.malformed("ZSTD buffer \(i) failed to decompress") }
+            }
+            guard produced == want else {
+                throw ArrowIPCError.malformed("\(codec.name) buffer \(i) produced \(produced) of \(want) bytes")
+            }
+            return out
+        }
+    }
+
+    /// Bytes available in buffer `i`, after decompression when the body was compressed.
+    private func byteCount(_ body: ArrowIPCMessageBody, _ i: Int) -> Int {
+        body.plain?[i].byteCount ?? body.buffers[i].length
+    }
+
+    /// Copies (or borrows) `need` bytes of buffer `i` into Metal shared memory.
+    private func take(_ body: ArrowIPCMessageBody, _ i: Int, need: Int, what: String) throws -> MetalArrowBuffer {
+        guard need > 0 else { return try MetalArrowBuffer.allocate(byteCount: 0, context: context) }
+        let have = byteCount(body, i)
+        guard have >= need else {
+            throw ArrowIPCError.malformed("\(what) holds \(have) bytes where \(need) are needed")
+        }
+        // A decompressed buffer is already in shared memory and nobody else holds it: view, do not copy.
+        if let plain = body.plain { return plain[i].view(byteOffset: 0, byteCount: need) }
+        guard let base = body.raw.baseAddress else { throw ArrowIPCError.truncated("empty source") }
+        let src = base.advanced(by: body.offset + body.buffers[i].offset)
         if allowZeroCopy {
             let (buf, zeroCopy) = try MetalArrowBuffer.wrapOrCopy(src, byteCount: need, keepAlive: holder, context: context)
             if zeroCopy { borrowedAny = true }
@@ -665,48 +842,230 @@ public final class ArrowIPCReader {
         return try MetalArrowBuffer.copy(from: src, byteCount: need, context: context)
     }
 
-    private func buildColumn(field: ArrowIPCField, length: Int, nullCount: Int, buffers: [BodyBuffer],
-                             raw: UnsafeRawBufferPointer, bodyOffset: Int) throws -> AnyMetalArray {
+    /// The first byte of buffer `i`. The paths that narrow 64-bit offsets read it directly.
+    private func pointer(_ body: ArrowIPCMessageBody, _ i: Int) throws -> UnsafeRawPointer {
+        if let plain = body.plain { return plain[i].contents }
+        guard let base = body.raw.baseAddress else { throw ArrowIPCError.truncated("empty source") }
+        return base.advanced(by: body.offset + body.buffers[i].offset)
+    }
+
+    // MARK: columns
+
+    /// Builds one field, consuming its field node and buffers and then, recursively, its children's.
+    ///
+    /// This is the pre-order the IPC specification defines: a field's own node and buffers come first,
+    /// each child's whole subtree after. A dictionary-encoded field is the one exception — the record
+    /// batch carries only its codes, and its children (if the value type has any) travel in the
+    /// `DictionaryBatch` message instead.
+    private func buildColumn(field: ArrowIPCField, cursor: ArrowIPCCursor) throws -> AnyMetalArray {
+        let name = field.name
+        let node = try cursor.node(name)
+        let length = node.length
+        guard length >= 0 else { throw ArrowIPCError.malformed("column '\(name)' has a negative length") }
         // null_count == -1 means "unknown": recompute it from the bitmap.
-        let nulls = nullCount < 0 ? -1 : nullCount
-        func validity() throws -> MetalArrowBuffer? {
+        let nulls = node.nullCount < 0 ? -1 : node.nullCount
+        let slots = try cursor.buffers(field.type.storage.bufferCount, name)
+        let body = cursor.body
+
+        func validity(_ slot: Int) throws -> MetalArrowBuffer? {
             guard nulls != 0 else { return nil }
             let bytes = Bitmap.byteCount(bits: length)
             guard bytes > 0 else { return nil }
-            guard buffers[0].length >= bytes else {
-                if nulls > 0 { throw ArrowIPCError.malformed("column '\(field.name)' declares \(nulls) nulls but has no validity bitmap") }
+            guard byteCount(body, slot) >= bytes else {
+                if nulls > 0 {
+                    throw ArrowIPCError.malformed("column '\(name)' declares \(nulls) nulls but has no validity bitmap")
+                }
                 return nil
             }
-            return try take(buffers[0], need: bytes, raw: raw, bodyOffset: bodyOffset)
+            return try take(body, slot, need: bytes, what: "the validity bitmap of column '\(name)'")
+        }
+
+        switch field.type {
+        case .null:
+            // The null type has no buffers at all, and every one of its values is null.
+            return .null(MetalNullArray(length: length, context: context))
+
+        case .list(let item), .largeList(let item):
+            var large = false
+            if case .largeList = field.type { large = true }
+            let bitmap = try validity(slots[0])
+            let offsets = try listOffsets(body, slot: slots[1], length: length, large: large, name: name)
+            let child = try buildColumn(field: item, cursor: cursor)
+            return .list(try makeList(length: length, nulls: nulls, validity: bitmap, offsets: offsets,
+                                      child: child, kind: .variable, fieldName: item.name, name: name))
+
+        case .fixedSizeList(let item, let size):
+            let bitmap = try validity(slots[0])
+            let child = try buildColumn(field: item, cursor: cursor)
+            // A fixed-size list has no offsets buffer; the engine materialises the ones its layout implies.
+            let offsets = try MetalArrowBuffer.allocate(byteCount: (length + 1) * 4, zeroed: false, context: context)
+            let p = offsets.mutableTyped(Int32.self)
+            for i in 0...length { p[i] = Int32(i * size) }
+            return .list(try makeList(length: length, nulls: nulls, validity: bitmap, offsets: offsets,
+                                      child: child, kind: .fixedSize(size), fieldName: item.name, name: name))
+
+        case .structure(let fields):
+            let bitmap = try validity(slots[0])
+            let children = try fields.map { try buildColumn(field: $0, cursor: cursor) }
+            for (child, f) in zip(children, fields) where child.length < length {
+                throw ArrowIPCError.malformed(
+                    "struct column '\(name)' is \(length) rows but its field '\(f.name)' has \(child.length)")
+            }
+            let s = try MetalStructArray(length: length, nullCount: 0, validity: bitmap, names: fields.map(\.name),
+                                         children: children, context: context)
+            if nulls < 0 { s.recomputeNullCount() } else { s.nullCount = nulls }
+            return .structure(s)
+
+        case .map(let entries, let keysSorted):
+            let bitmap = try validity(slots[0])
+            let offsets = try listOffsets(body, slot: slots[1], length: length, large: false, name: name)
+            let child = try buildColumn(field: entries, cursor: cursor)
+            guard case .structure = child else {
+                throw ArrowIPCError.malformed("map column '\(name)' has a child that is not a struct")
+            }
+            let list = try makeList(length: length, nulls: nulls, validity: bitmap, offsets: offsets,
+                                    child: child, kind: .variable, fieldName: entries.name, name: name)
+            return .map(try MetalMapArray(entries: list, keysSorted: keysSorted))
+
+        case .union(let mode, let typeIDs, let children):
+            // A union carries no validity bitmap of its own: null-ness lives in its children.
+            let ids = try take(body, slots[0], need: length, what: "the type ids of column '\(name)'")
+            let typeIds = MetalArray<Int8>(length: length, nullCount: 0, validity: nil, values: ids, context: context)
+            var offsets: MetalArray<Int32>? = nil
+            if mode == .dense {
+                let b = try take(body, slots[1], need: length * 4, what: "the offsets of column '\(name)'")
+                offsets = MetalArray<Int32>(length: length, nullCount: 0, validity: nil, values: b, context: context)
+            }
+            let kids = try children.map { try buildColumn(field: $0, cursor: cursor) }
+            let codes = typeIDs.map { Int8(truncatingIfNeeded: $0) }
+            let u = try MetalUnionArray(mode: mode == .dense ? .dense : .sparse, length: length, typeIds: typeIds,
+                                        offsets: offsets, typeCodes: codes, names: children.map(\.name),
+                                        children: kids, context: context)
+            return .union(u)
+
+        case .runEndEncoded(let endsField, let valuesField):
+            // No buffers of its own: the node carries the logical length, the children everything else.
+            let ends = try buildColumn(field: endsField, cursor: cursor)
+            let values = try buildColumn(field: valuesField, cursor: cursor)
+            let runEnds = try narrowToInt32(ends, what: "run ends", column: name)
+            guard values.length >= runEnds.length else {
+                throw ArrowIPCError.malformed(
+                    "run-end encoded column '\(name)' has \(runEnds.length) run ends for \(values.length) values")
+            }
+            guard runEndLogicalLength(runEnds) == length else {
+                throw ArrowIPCError.malformed(
+                    "run-end encoded column '\(name)' declares \(length) rows but its runs cover \(runEndLogicalLength(runEnds))")
+            }
+            return .runEndEncoded(runEnds: runEnds, values: values)
+
+        default:
+            return try buildFlatColumn(field: field, length: length, nulls: nulls, slots: slots, body: body,
+                                       validity: try validity(slots[0]))
+        }
+    }
+
+    /// A list array plus the checks the engine's own invariants need.
+    private func makeList(length: Int, nulls: Int, validity: MetalArrowBuffer?, offsets: MetalArrowBuffer,
+                          child: AnyMetalArray, kind: ArrowListKind, fieldName: String,
+                          name: String) throws -> MetalListArray {
+        let list = MetalListArray(length: length, nullCount: 0, validity: validity, offsets: offsets,
+                                  values: child, kind: kind, fieldName: fieldName, context: context)
+        if nulls < 0 { list.recomputeNullCount() } else { list.setNullCount(nulls) }
+        let range = list.childRange
+        guard range.lowerBound >= 0, range.upperBound >= range.lowerBound, range.upperBound <= child.length else {
+            throw ArrowIPCError.malformed(
+                "column '\(name)' covers child elements \(range.lowerBound)..<\(range.upperBound) of a \(child.length) element child")
+        }
+        return list
+    }
+
+    /// The int32 offsets of a list-shaped field. 64-bit offsets are narrowed, as `large_utf8`'s are.
+    private func listOffsets(_ body: ArrowIPCMessageBody, slot: Int, length: Int, large: Bool,
+                             name: String) throws -> MetalArrowBuffer {
+        let need = (length + 1) * (large ? 8 : 4)
+        if byteCount(body, slot) < need {
+            // pyarrow writes no offsets at all for an empty column; every offset is then zero.
+            guard length == 0 else { throw ArrowIPCError.malformed("column '\(name)' has a short offsets buffer") }
+            return try MetalArrowBuffer.allocate(byteCount: 4, zeroed: true, context: context)
+        }
+        guard large else { return try take(body, slot, need: need, what: "the offsets of column '\(name)'") }
+        let src = try pointer(body, slot)
+        let out = try MetalArrowBuffer.allocate(byteCount: (length + 1) * 4, zeroed: false, context: context)
+        let dst = out.mutableTyped(Int32.self)
+        for i in 0...length {
+            let v = src.loadUnaligned(fromByteOffset: i * 8, as: Int64.self)
+            guard v >= 0, v <= Int64(Int32.max) else {
+                throw ArrowIPCError.unsupported("64-bit offsets over 2 GB (column '\(name)')")
+            }
+            dst[i] = Int32(v)
+        }
+        return out
+    }
+
+    /// Every type whose values are in its own buffers: the primitives, bool, utf8 / binary, the
+    /// temporal types, the decimals, `float16`, `fixed_size_binary`, `interval`, and dictionary codes.
+    private func buildFlatColumn(field: ArrowIPCField, length: Int, nulls: Int, slots: [Int],
+                                 body: ArrowIPCMessageBody,
+                                 validity bitmap: MetalArrowBuffer?) throws -> AnyMetalArray {
+        let name = field.name
+        func values(_ width: Int) throws -> MetalArrowBuffer {
+            try take(body, slots[1], need: length * width, what: "the values of column '\(name)'")
+        }
+        func make<T: ArrowPrimitive>(_: T.Type, _ buffer: MetalArrowBuffer) -> MetalArray<T> {
+            let a = MetalArray<T>(length: length, nullCount: 0, validity: bitmap, values: buffer, context: context)
+            if nulls < 0 { a.recomputeNullCount() } else { a.nullCount = nulls }
+            return a
+        }
+
+        // The types whose array class is not a MetalArray, but whose layout is still validity + values.
+        switch field.type {
+        case .decimal(let precision, let scale, let bits):
+            let buffer = try values(bits / 8)
+            if bits == 128 || bits == 256 {
+                let a = MetalDecimalArray(type: try ArrowDecimalType(precision: precision, scale: scale, bitWidth: bits),
+                                          length: length, nullCount: 0, validity: bitmap, values: buffer, context: context)
+                if nulls < 0 { a.recomputeNullCount() } else { a.setNullCount(nulls) }
+                return .decimal(a)
+            }
+            let t = try ArrowSmallDecimalType(precision: precision, scale: scale, bitWidth: bits)
+            let a = bits == 32
+                ? try MetalSmallDecimalArray(type: t, make(Int32.self, buffer))
+                : try MetalSmallDecimalArray(type: t, make(Int64.self, buffer))
+            return .smallDecimal(a)
+        case .fixedSizeBinary(let width):
+            let a = MetalFixedBinaryArray(byteWidth: width, length: length, nullCount: 0, validity: bitmap,
+                                          values: try values(width), context: context)
+            if nulls < 0 { a.recomputeNullCount() } else { a.setNullCount(nulls) }
+            return .fixedBinary(a)
+        case .float16:
+            return .float16(MetalFloat16Array(bits: make(UInt16.self, try values(2))))
+        case .interval(let unit):
+            let a = MetalIntervalArray(unit: unit.arrayUnit, length: length, nullCount: 0, validity: bitmap,
+                                       values: try values(unit.byteWidth), context: context)
+            if nulls < 0 { a.recomputeNullCount() } else { a.setNullCount(nulls) }
+            return .interval(a)
+        default: break
         }
 
         switch field.type.storage {
-        // Nested and null columns are written but not read back: `parseSchema` already refused them, so
-        // this only guards the dictionary path, which reaches `buildColumn` with a value type of its own.
         case .nested:
-            throw ArrowIPCError.unsupported("\(field.type) columns (column '\(field.name)')")
+            throw ArrowIPCError.malformed("column '\(name)' is \(field.type), which has no buffers of its own")
 
         case .fixedWidth(let width):
-            let bitmap = try validity()
-            let values = try take(buffers[1], need: length * width, raw: raw, bodyOffset: bodyOffset)
-            func make<T: ArrowPrimitive>(_: T.Type) -> MetalArray<T> {
-                let a = MetalArray<T>(length: length, nullCount: 0, validity: bitmap, values: values, context: context)
-                if nulls < 0 { a.recomputeNullCount() } else { a.nullCount = nulls }
-                return a
-            }
+            let buffer = try values(width)
             var flat: AnyMetalArray
             switch field.type.physicalType {
-            case .int(bits: 8, signed: true): flat = .int8(make(Int8.self))
-            case .int(bits: 8, signed: false): flat = .uint8(make(UInt8.self))
-            case .int(bits: 16, signed: true): flat = .int16(make(Int16.self))
-            case .int(bits: 16, signed: false): flat = .uint16(make(UInt16.self))
-            case .int(bits: 32, signed: true): flat = .int32(make(Int32.self))
-            case .int(bits: 32, signed: false): flat = .uint32(make(UInt32.self))
-            case .int(bits: 64, signed: true): flat = .int64(make(Int64.self))
-            case .int(bits: 64, signed: false): flat = .uint64(make(UInt64.self))
-            case .float(bits: 32): flat = .float32(make(Float.self))
-            case .float(bits: 64): flat = .float64(make(Double.self))
-            default: throw ArrowIPCError.unsupported("\(field.type) columns (column '\(field.name)')")
+            case .int(bits: 8, signed: true): flat = .int8(make(Int8.self, buffer))
+            case .int(bits: 8, signed: false): flat = .uint8(make(UInt8.self, buffer))
+            case .int(bits: 16, signed: true): flat = .int16(make(Int16.self, buffer))
+            case .int(bits: 16, signed: false): flat = .uint16(make(UInt16.self, buffer))
+            case .int(bits: 32, signed: true): flat = .int32(make(Int32.self, buffer))
+            case .int(bits: 32, signed: false): flat = .uint32(make(UInt32.self, buffer))
+            case .int(bits: 64, signed: true): flat = .int64(make(Int64.self, buffer))
+            case .int(bits: 64, signed: false): flat = .uint64(make(UInt64.self, buffer))
+            case .float(bits: 32): flat = .float32(make(Float.self, buffer))
+            case .float(bits: 64): flat = .float64(make(Double.self, buffer))
+            default: throw ArrowIPCError.unsupported("\(field.type) columns (column '\(name)')")
             }
             // date / time / timestamp / duration keep their logical type: the storage integers are
             // wrapped in a MetalTemporalArray, so `column.asTemporal` round trips.
@@ -714,46 +1073,44 @@ public final class ArrowIPCReader {
                 switch flat {
                 case .int32(let a): return .temporal(try MetalTemporalArray(type: t, a))
                 case .int64(let a): return .temporal(try MetalTemporalArray(type: t, a))
-                default: throw ArrowIPCError.malformed("column '\(field.name)' has the wrong storage for \(field.type)")
+                default: throw ArrowIPCError.malformed("column '\(name)' has the wrong storage for \(field.type)")
                 }
             }
             // A dictionary-encoded column: the record batch holds the codes, the values came in a
             // dictionary batch. Codes are narrowed to int32, as everywhere else in ArrowMetal.
             if case .dictionary = field.type {
                 guard let id = field.dictionaryID, let values = dictionaries[id] else {
-                    throw ArrowIPCError.malformed("column '\(field.name)' has no dictionary batch")
+                    throw ArrowIPCError.malformed("column '\(name)' has no dictionary batch")
                 }
-                return .dictionary(codes: try codes(from: flat, column: field.name), values: values)
+                return .dictionary(codes: try narrowToInt32(flat, what: "dictionary indices", column: name),
+                                   values: values)
             }
             return flat
 
         case .bits:
-            let bitmap = try validity()
-            let values = try take(buffers[1], need: Bitmap.byteCount(bits: length),
-                                  raw: raw, bodyOffset: bodyOffset)
-            let a = MetalBooleanArray(length: length, nullCount: 0, validity: bitmap, values: values, context: context)
+            let buffer = try take(body, slots[1], need: Bitmap.byteCount(bits: length),
+                                  what: "the values of column '\(name)'")
+            let a = MetalBooleanArray(length: length, nullCount: 0, validity: bitmap, values: buffer, context: context)
             if nulls < 0 { a.recomputeNullCount() } else { a.nullCount = nulls }
             return .boolean(a)
 
         case .varBinary(let large):
-            let bitmap = try validity()
             let offsets: MetalArrowBuffer
             let total: Int
             if large {
                 // Narrow 64-bit offsets; MetalStringArray always stores 32-bit ones.
-                guard let base = raw.baseAddress else { throw ArrowIPCError.truncated("empty source") }
                 let need = (length + 1) * 8
-                guard buffers[1].length >= need || length == 0 else {
-                    throw ArrowIPCError.malformed("column '\(field.name)' has a short offsets buffer")
+                guard byteCount(body, slots[1]) >= need || length == 0 else {
+                    throw ArrowIPCError.malformed("column '\(name)' has a short offsets buffer")
                 }
                 let out = try MetalArrowBuffer.allocate(byteCount: (length + 1) * 4, zeroed: true, context: context)
-                if buffers[1].length >= need {
-                    let src = base.advanced(by: bodyOffset + buffers[1].offset)
+                if byteCount(body, slots[1]) >= need {
+                    let src = try pointer(body, slots[1])
                     let dst = out.mutableTyped(Int32.self)
                     for i in 0...length {
                         let v = src.loadUnaligned(fromByteOffset: i * 8, as: Int64.self)
                         guard v >= 0, v <= Int64(Int32.max) else {
-                            throw ArrowIPCError.unsupported("large binary column '\(field.name)' over 2 GB")
+                            throw ArrowIPCError.unsupported("large binary column '\(name)' over 2 GB")
                         }
                         dst[i] = Int32(v)
                     }
@@ -762,19 +1119,19 @@ public final class ArrowIPCReader {
                 total = Int(out.typed(Int32.self)[length])
             } else {
                 let need = (length + 1) * 4
-                if buffers[1].length >= need {
-                    offsets = try take(buffers[1], need: need, raw: raw, bodyOffset: bodyOffset)
+                if byteCount(body, slots[1]) >= need {
+                    offsets = try take(body, slots[1], need: need, what: "the offsets of column '\(name)'")
                 } else if length == 0 {
                     offsets = try MetalArrowBuffer.allocate(byteCount: need, zeroed: true, context: context)
                 } else {
-                    throw ArrowIPCError.malformed("column '\(field.name)' has a short offsets buffer")
+                    throw ArrowIPCError.malformed("column '\(name)' has a short offsets buffer")
                 }
                 total = Int(offsets.typed(Int32.self)[length])
             }
-            guard total >= 0 else { throw ArrowIPCError.malformed("column '\(field.name)' has a negative final offset") }
+            guard total >= 0 else { throw ArrowIPCError.malformed("column '\(name)' has a negative final offset") }
             let bytes: MetalArrowBuffer = total == 0
                 ? try MetalArrowBuffer.allocate(byteCount: 0, context: context)
-                : try take(buffers[2], need: total, raw: raw, bodyOffset: bodyOffset)
+                : try take(body, slots[2], need: total, what: "the bytes of column '\(name)'")
             let a = MetalStringArray(length: length, nullCount: 0, validity: bitmap,
                                      offsets: offsets, data: bytes, context: context)
             if nulls < 0 { a.recomputeNullCount() } else { a.setNullCount(nulls) }
@@ -786,8 +1143,8 @@ public final class ArrowIPCReader {
         }
     }
 
-    /// Narrows a code column of any integer width to the int32 codes `AnyMetalArray.dictionary` holds.
-    private func codes(from flat: AnyMetalArray, column: String) throws -> MetalArray<Int32> {
+    /// Narrows an integer column of any width to the int32 array dictionary codes and run ends are held in.
+    private func narrowToInt32(_ flat: AnyMetalArray, what: String, column: String) throws -> MetalArray<Int32> {
         switch flat {
         case .int32(let a): return a
         case .int8(let a): return try a.cast(to: Int32.self)
@@ -797,44 +1154,209 @@ public final class ArrowIPCReader {
         case .uint32(let a): return try a.cast(to: Int32.self)
         case .int64(let a): return try a.cast(to: Int32.self)
         case .uint64(let a): return try a.cast(to: Int32.self)
-        default: throw ArrowIPCError.malformed("dictionary indices of column '\(column)' are not integers")
+        default: throw ArrowIPCError.malformed("the \(what) of column '\(column)' are not integers")
         }
     }
 
-    /// Reads every `DictionaryBatch` message once, on the first batch read.
+    // MARK: dictionaries
+
+    /// Applies the first `count` `DictionaryBatch` messages, in the order the source carries them.
     ///
-    /// Only complete dictionaries are supported: a delta batch (`isDelta = true`) is rejected, and a
-    /// replacement for an id that is already known is rejected too.
-    private func materialiseDictionaries(raw: UnsafeRawBufferPointer) throws {
-        guard dictionaries.count < dictionaryMessages.count else { return }
-        for ref in dictionaryMessages {
-            let meta = try FBBuf(raw, from: ref.metadataOffset, count: ref.metadataLength)
-            guard let header = try meta.root().table(2) else {
-                throw ArrowIPCError.malformed("dictionary batch has no header")
-            }
-            // DictionaryBatch { id: long; data: RecordBatch; isDelta: bool }
-            let id = try header.int64(0)
-            guard try header.bool(2) == false else {
-                throw ArrowIPCError.unsupported("delta dictionary batches (isDelta = true)")
-            }
-            guard let data = try header.table(1) else {
-                throw ArrowIPCError.malformed("dictionary batch \(id) has no record batch")
-            }
-            guard let field = schema.fields.first(where: { $0.dictionaryID == id }),
-                  let valueType = field.type.dictionaryValueType else {
-                throw ArrowIPCError.malformed("dictionary batch \(id) matches no column")
-            }
-            if dictionaries[id] != nil {
-                throw ArrowIPCError.unsupported("a replacement dictionary for id \(id)")
-            }
-            let valueField = ArrowIPCField(name: field.name + ".dictionary", type: valueType, nullable: true)
-            let (length, nodes, buffers) = try recordBatchParts(header: data, bodyLength: ref.bodyLength)
-            guard nodes.count == 1, buffers.count >= valueType.storage.bufferCount else {
-                throw ArrowIPCError.malformed("dictionary batch \(id) has \(nodes.count) field nodes")
-            }
-            dictionaries[id] = try buildColumn(field: valueField, length: length, nullCount: nodes[0].nullCount,
-                                               buffers: Array(buffers[0..<valueType.storage.bufferCount]),
-                                               raw: raw, bodyOffset: ref.bodyOffset)
+    /// A dictionary applies to the batches that follow it, so a stream may replace one part way through
+    /// or extend it with a delta. Reading batches out of order can ask for fewer messages than are
+    /// already applied; the walk then starts again from the first one.
+    private func materialiseDictionaries(upTo count: Int, raw: UnsafeRawBufferPointer) throws {
+        if appliedDictionaries > count {
+            dictionaries.removeAll()
+            appliedDictionaries = 0
         }
+        while appliedDictionaries < count {
+            try applyDictionary(dictionaryMessages[appliedDictionaries], raw: raw)
+            appliedDictionaries += 1
+        }
+    }
+
+    private func applyDictionary(_ ref: ArrowIPCMessageRef, raw: UnsafeRawBufferPointer) throws {
+        let meta = try FBBuf(raw, from: ref.metadataOffset, count: ref.metadataLength)
+        guard let header = try meta.root().table(2) else {
+            throw ArrowIPCError.malformed("dictionary batch has no header")
+        }
+        // DictionaryBatch { id: long; data: RecordBatch; isDelta: bool }
+        let id = try header.int64(0)
+        let isDelta = try header.bool(2)
+        guard let data = try header.table(1) else {
+            throw ArrowIPCError.malformed("dictionary batch \(id) has no record batch")
+        }
+        guard let field = schema.fields.first(where: { $0.dictionaryID == id }),
+              let valueType = field.type.dictionaryValueType else {
+            throw ArrowIPCError.malformed("dictionary batch \(id) matches no column")
+        }
+        // The file format indexes every dictionary in its footer, so a batch anywhere in the file may
+        // use any of them and a replacement would be ambiguous; the spec forbids one.
+        if !isDelta, dictionaries[id] != nil, format == .file {
+            throw ArrowIPCError.malformed("dictionary id \(id) is defined twice in a file, which replaces nothing")
+        }
+        if isDelta, dictionaries[id] == nil {
+            throw ArrowIPCError.malformed("delta dictionary batch \(id) has no dictionary to extend")
+        }
+        let valueField = ArrowIPCField(name: field.name + ".dictionary", type: valueType, nullable: true)
+        let parts = try recordBatchParts(header: data, bodyLength: ref.bodyLength)
+        let body = try messageBody(parts, raw: raw, bodyOffset: ref.bodyOffset)
+        let cursor = ArrowIPCCursor(nodes: parts.nodes, body: body)
+        let values = try buildColumn(field: valueField, cursor: cursor)
+        guard values.length == parts.length else {
+            throw ArrowIPCError.malformed("dictionary batch \(id) declares \(parts.length) values but holds \(values.length)")
+        }
+        guard cursor.nodeIndex == parts.nodes.count, cursor.bufferIndex == parts.buffers.count else {
+            throw ArrowIPCError.malformed(
+                "dictionary batch \(id) declares field nodes or buffers a \(valueType) dictionary does not use")
+        }
+        // A delta appends to the dictionary in force; anything else replaces it for the batches that follow.
+        if isDelta, let old = dictionaries[id] {
+            dictionaries[id] = try concatMetalArrays([old, values])
+        } else {
+            dictionaries[id] = values
+        }
+    }
+}
+
+// MARK: - Message body
+
+/// One Arrow buffer's place in a message body.
+struct ArrowIPCBodyBuffer {
+    let offset: Int
+    let length: Int
+}
+
+/// Where a message's Arrow buffers are: in the body itself, or — when the body declared a codec — in
+/// one freshly decompressed shared-memory buffer per declared buffer.
+struct ArrowIPCMessageBody {
+    let raw: UnsafeRawBufferPointer
+    let offset: Int
+    let buffers: [ArrowIPCBodyBuffer]
+    let plain: [MetalArrowBuffer]?
+}
+
+/// The position of a pre-order walk through one message's field nodes and Arrow buffers.
+final class ArrowIPCCursor {
+    let nodes: [(length: Int, nullCount: Int)]
+    let body: ArrowIPCMessageBody
+    private(set) var nodeIndex = 0
+    private(set) var bufferIndex = 0
+
+    init(nodes: [(length: Int, nullCount: Int)], body: ArrowIPCMessageBody) {
+        self.nodes = nodes
+        self.body = body
+    }
+
+    /// The next field node, which belongs to `name`.
+    func node(_ name: String) throws -> (length: Int, nullCount: Int) {
+        guard nodeIndex < nodes.count else {
+            throw ArrowIPCError.malformed("the batch has no field node for column '\(name)'")
+        }
+        defer { nodeIndex += 1 }
+        return nodes[nodeIndex]
+    }
+
+    /// The indices of the next `count` Arrow buffers, which belong to `name`.
+    func buffers(_ count: Int, _ name: String) throws -> [Int] {
+        guard bufferIndex + count <= body.buffers.count else {
+            throw ArrowIPCError.malformed("the batch is missing buffers for column '\(name)'")
+        }
+        defer { bufferIndex += count }
+        return Array(bufferIndex..<(bufferIndex + count))
+    }
+}
+
+// MARK: - LZ4 frame
+
+/// The LZ4 frame format, which is what Arrow's `LZ4_FRAME` body compression wraps its blocks in.
+///
+/// Every block decodes into one contiguous output, so a frame written with linked blocks (the LZ4
+/// default, and what Arrow C++ writes) decodes as well as one with independent blocks: a match that
+/// reaches back past the block boundary still finds bytes this decoder has already written.
+enum ArrowIPCLZ4 {
+    private static let magic: UInt32 = 0x184D_2204
+
+    /// Decodes a whole frame into `dst`, returning how many bytes it produced.
+    static func decodeFrame(_ src: UnsafePointer<UInt8>, _ srcLength: Int,
+                            _ dst: UnsafeMutablePointer<UInt8>, _ dstLength: Int) throws -> Int {
+        func word(_ at: Int) throws -> UInt32 {
+            guard at + 4 <= srcLength else { throw ArrowIPCError.truncated("an LZ4 frame block header") }
+            return UInt32(src[at]) | UInt32(src[at + 1]) << 8 | UInt32(src[at + 2]) << 16 | UInt32(src[at + 3]) << 24
+        }
+        guard srcLength >= 7, try word(0) == magic else {
+            throw ArrowIPCError.malformed("a compressed buffer does not start with the LZ4 frame magic")
+        }
+        let flg = src[4], bd = src[5]
+        _ = bd
+        guard flg >> 6 == 1 else { throw ArrowIPCError.unsupported("LZ4 frame version \(flg >> 6)") }
+        guard flg & 0x02 == 0 else { throw ArrowIPCError.malformed("an LZ4 frame with a reserved flag set") }
+        var p = 6
+        if flg & 0x08 != 0 { p += 8 }                       // content size
+        if flg & 0x01 != 0 { p += 4 }                       // dictionary id
+        p += 1                                              // header checksum
+        let blockChecksum = flg & 0x10 != 0
+        var out = 0
+        while true {
+            let header = try word(p)
+            p += 4
+            if header == 0 { break }                        // end mark
+            let size = Int(header & 0x7FFF_FFFF)
+            guard size >= 0, p + size <= srcLength else { throw ArrowIPCError.truncated("an LZ4 frame block") }
+            if header & 0x8000_0000 != 0 {                  // stored uncompressed
+                guard out + size <= dstLength else { throw ArrowIPCError.malformed("an LZ4 frame overruns its output") }
+                if size > 0 { memcpy(dst + out, src + p, size) }
+                out += size
+            } else {
+                out += try decodeBlock(src + p, size, dst, dstLength, out)
+            }
+            p += size
+            if blockChecksum { p += 4 }
+        }
+        return out
+    }
+
+    /// One raw LZ4 block, appended to `dst` at `start`. Matches may reach back before `start`.
+    private static func decodeBlock(_ src: UnsafePointer<UInt8>, _ n: Int, _ dst: UnsafeMutablePointer<UInt8>,
+                                    _ capacity: Int, _ start: Int) throws -> Int {
+        var i = 0, o = start
+        func extend(_ base: Int) throws -> Int {
+            var value = base
+            while true {
+                guard i < n else { throw ArrowIPCError.truncated("an LZ4 length") }
+                let b = src[i]
+                i += 1
+                value += Int(b)
+                if b != 255 { return value }
+            }
+        }
+        while i < n {
+            let token = src[i]
+            i += 1
+            var literals = Int(token >> 4)
+            if literals == 15 { literals = try extend(literals) }
+            guard i + literals <= n else { throw ArrowIPCError.truncated("LZ4 literals") }
+            guard o + literals <= capacity else { throw ArrowIPCError.malformed("an LZ4 block overruns its output") }
+            if literals > 0 { memcpy(dst + o, src + i, literals); i += literals; o += literals }
+            // The last sequence of a block is literals only.
+            if i == n { break }
+            guard i + 2 <= n else { throw ArrowIPCError.truncated("an LZ4 match offset") }
+            let offset = Int(src[i]) | Int(src[i + 1]) << 8
+            i += 2
+            guard offset > 0, o - offset >= 0 else { throw ArrowIPCError.malformed("an LZ4 match reaches before the output") }
+            var match = Int(token & 0x0F)
+            if match == 15 { match = try extend(match) }
+            match += 4
+            guard o + match <= capacity else { throw ArrowIPCError.malformed("an LZ4 match overruns its output") }
+            // Byte at a time: a match whose offset is shorter than its length repeats a pattern.
+            var from = o - offset
+            for _ in 0..<match {
+                dst[o] = dst[from]
+                o += 1
+                from += 1
+            }
+        }
+        return o - start
     }
 }

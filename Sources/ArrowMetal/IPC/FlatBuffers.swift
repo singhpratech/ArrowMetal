@@ -149,6 +149,11 @@ struct FBVector {
         guard p + stride <= buf.bytes.count else { throw ArrowIPCError.truncated("struct element \(i)") }
         return p
     }
+    /// Element `i` of a vector of 32-bit integers (Arrow's `Union.typeIds`).
+    func int32(_ i: Int) throws -> Int32 {
+        guard i >= 0, i < count else { throw ArrowIPCError.malformed("vector index \(i) of \(count)") }
+        return try buf.load(Int32.self, at: start + 4 * i)
+    }
     /// Element `i` of a vector of 64-bit integers.
     func int64(_ i: Int) throws -> Int64 {
         guard i >= 0, i < count else { throw ArrowIPCError.malformed("vector index \(i) of \(count)") }
