@@ -132,6 +132,17 @@ Temporal, timezones and the rest of the type matrix
 - Conditional transforms: `case_when`, `choose`, `replace_with_mask`, `fill_null_forward`/`_backward`,
   `indices_nonzero`, `make_struct`, `pivot_wider`, and a 64-bit element-wise `hash64` (`am_hash64`, plus
   an FNV-1a form for `fixed_size_binary`) — an ArrowMetal extension, not one of the 307 Arrow names.
+- The Arrow IPC writer takes every one of these types, nested children recursively: decimal32/64/128/256,
+  `float16`, `fixed_size_binary`, the three interval units, `null`, `list`/`large_list`/`fixed_size_list`,
+  `struct`, `map`, dense and sparse unions, run-end encoded columns and extension types (whose
+  `ARROW:extension:*` keys ride in the field's `custom_metadata`). Field nodes and buffers are written in
+  Arrow's pre-order with the type metadata the spec prescribes — decimal precision/scale/bitWidth, the
+  list child field, a map's `entries` struct with `keysSorted` and a non-nullable key, struct and union
+  child names, union mode and typeIds, the interval unit — and pyarrow 25 reads each one back with the
+  right type and the right values from both the file and the stream encapsulation. The IPC *reader* is
+  unchanged and still refuses these types with a message naming the column. A sliced utf8, binary or list
+  column now rebases its offsets and writes only the bytes and child elements its own rows cover, instead
+  of the prefix it shares with its parent.
 
 Arrow function coverage
 - `arrowmetal.functions`: a registry with one entry per Arrow v25 compute function name — all 307, the

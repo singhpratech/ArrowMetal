@@ -40,8 +40,10 @@ to yet; the by-family status of every one of them is in [COVERAGE.md](COVERAGE.m
   compute something wrong (`Sources/ArrowMetal/Decimal.swift`).
 - **Compute over union values**, which a type-id-dispatched layout makes awkward for the uniform-thread
   model, and **aggregates over list values**. Both are import, export and selection only today.
-- **Arrow IPC for nested and decimal columns**, and compressed bodies — the reader and writer refuse
-  all three by name rather than mis-decoding them.
+- **Arrow IPC *reading* of nested, decimal and the other non-flat columns.** The writer emits every type
+  this package holds and pyarrow reads them back; the reader still builds only the flat types plus
+  dictionaries and refuses the rest by name rather than mis-decoding them. **Compressed bodies** are
+  refused in both directions.
 - **The C Device Stream** (`ArrowDeviceArrayStream`, declared in `arrow_abi.h` and referenced nowhere
   else) and **`__arrow_c_device_array__`** in the Python package, which exports only
   `__arrow_c_array__`. Plain C Stream import and export both work (`am_stream_from_c_stream`,

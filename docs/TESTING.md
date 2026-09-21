@@ -5,7 +5,7 @@ pushed. Numbers are from the last gated run of `main` (0.1.0) on an M4 Max.
 
 | Layer | Size | Oracle |
 |---|---|---|
-| Swift suites (`Tests/ArrowMetalTests`) | 769 tests in 61 files, run in release (all 769 executed, 3 skipped in the last gated run: the three opt-in throughput measurements) | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
+| Swift suites (`Tests/ArrowMetalTests`) | 775 tests in 61 files, run in release (all 775 executed, 3 skipped in the last gated run: the three opt-in throughput measurements) | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
 | Python suites (`python/tests`) | 2,473 collected cases over the ctypes API and the three integrations (2,452 passed and 21 skipped in the last gate, `private/keep/2026-09-08/final_gate_b2dc7fa.log`) | `pyarrow.compute`, Polars, DuckDB, pandas |
 | Rust suites (`rust/arrowmetal/tests`, `rust/arrowmetal-sys`) | 48 tests, 46 in the safe crate against arrow-rs plus 2 in `arrowmetal-sys` over the raw ABI, run in release, plus 4 `no_run` doc-tests (compiled, not executed) | `arrow::compute` (arrow-rs 59) on the same data; a `HashMap` fold where arrow-rs has no kernel; `include/arrowmetal.h` re-parsed for the ABI signatures ([RUST.md](RUST.md)) |
 | Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | 39,069 generated cases, 45 column types, every public operation | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
@@ -69,7 +69,7 @@ a sliced input at offsets 1, 7, 31, 32, 33, 63 and 64 against the same rows buil
 | Strings | StringTests, StringExtraTests, StringTransformTests, TextTests, RegexPrefilterTests | lengths, predicates, MurmurHash3 vectors, LIKE with every wildcard shape, split, full-Unicode case mapping including byte-length changes, the regex pre-filter's literal claims |
 | Temporal | TemporalTests, TemporalExtraTests, OptionsTests | calendar fields, rounding with every RoundTemporalOptions flag, timezone transitions, strftime/strptime |
 | Execution model | BatchTests, AsyncTests, ResidentTests, AdversarialStringAndBatchTests | batched chains equal unbatched, a throwing body leaves no batch open, results readable after commit, four workers over two contexts; the persistent-kernel negative result |
-| Interop | ArrowMetalTests, KernelTestsV2, SliceOffsetTests, NestedTests, IPCTests | C Data / C Device / C Stream import and export with offsets and release callbacks, IPC round trips, struct and stream import |
+| Interop | ArrowMetalTests, KernelTestsV2, SliceOffsetTests, NestedTests, IPCTests | C Data / C Device / C Stream import and export with offsets and release callbacks, IPC round trips, struct and stream import; every type the IPC writer emits — decimals, float16, fixed-size binary, the three interval units, null, the three list layouts, struct, map, both unions, run-end encoded and extension columns — written from ArrowMetal and read back by pyarrow in both encapsulations, with nulls, empty arrays, sliced inputs and nested nulls |
 | Expression compiler and engine | ExprTests, ExprLiteralTypeTests, EngineTests, JoinTests | fused expressions against the unfused kernels, literal promotion, every optimizer rule against the unoptimized plan, six join kinds and as-of against a dictionary oracle |
 | Parquet | ParquetTests, ParquetWriterTests | pyarrow-written fixtures across encodings and compressions, damaged files that must error rather than trap |
 | Streaming | StreamTests | every streaming operator against the in-memory answer at 1–120 batches with ragged and empty batches, HyperLogLog within 3σ, external sort over 120 runs, grace join against the in-memory join |
@@ -127,7 +127,7 @@ only if all pass:
 
 1. `swift build -c release` with no errors.
 2. `swift test -c release`: every test, 0 failures (the skips on a physical Mac are the opt-in measurements
-   behind `ARROWMETAL_IPC_THROUGHPUT`, `ARROWMETAL_LATENCY_BENCH` and `ARROWMETAL_UNIQUE_BENCH`, and the four
+   behind `ARROWMETAL_IPC_THROUGHPUT`, `ARROWMETAL_LATENCY_BENCH` and `ARROWMETAL_UNIQUE_BENCH`, and the nine
    pyarrow cross-checks in `IPCTests` when no python with pyarrow is found; on a virtual Metal device
    `requireRealGPU()` skips the GPU-only suites as well).
 3. `differential_report.py` exits 0: 0 unclassified divergences.

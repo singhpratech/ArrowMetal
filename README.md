@@ -297,9 +297,16 @@ let stream = try ArrowIPCWriter.encode(batches, format: .stream)   // Data, for 
 Int8 to UInt64, Float32/64, Bool, Utf8, LargeUtf8 and Binary are read into their `MetalArray` types, and
 dictionary-encoded columns round trip through complete `DictionaryBatch` messages (`isDelta = false`).
 Temporal columns (`date32/64`, `time32/64`, `timestamp`, `duration`) are carried by their storage integer
-array while the logical type stays visible in `reader.schema`. Nested columns (list, struct, map, union),
-decimals, compressed bodies and big-endian data are rejected with a clear error — IPC is the one place
-those types do not go, and [docs/COVERAGE.md](docs/COVERAGE.md) says so on each row.
+array while the logical type stays visible in `reader.schema`.
+
+The **writer** takes every type this package can hold, nested children and all: decimals, `float16`,
+`fixed_size_binary`, the three interval units, `null`, list / large list / fixed-size list, struct, map,
+dense and sparse unions, run-end encoded columns and extension types. pyarrow reads each one back with
+the right type and the right values. The **reader** is narrower — it builds the flat types and
+dictionaries, and rejects nested, decimal and the other layouts with a message naming the column — so a
+column of one of those types goes out to pyarrow rather than round tripping through this package.
+Compressed bodies and big-endian data are rejected by both; [docs/COVERAGE.md](docs/COVERAGE.md) says
+which direction each type is covered in.
 
 ## What is implemented
 
