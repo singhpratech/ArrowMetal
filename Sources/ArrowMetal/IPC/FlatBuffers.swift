@@ -287,12 +287,22 @@ final class FBBuilder {
         return offset
     }
 
-    func createString(_ s: String) -> Int {
-        let utf8 = Array(s.utf8)
-        prep(4, utf8.count + 1)
+    func createString(_ s: String) -> Int { createString(bytes: Array(s.utf8)) }
+
+    /// The same, for bytes that are not necessarily UTF-8 — `ARROW:extension:metadata` is a byte blob
+    /// stored in a FlatBuffers string field.
+    func createString(bytes: [UInt8]) -> Int {
+        prep(4, bytes.count + 1)
         place(UInt8(0))                     // FlatBuffers strings are null terminated
-        utf8.withUnsafeBytes { placeBytes($0) }
-        return endVector(utf8.count)
+        bytes.withUnsafeBytes { placeBytes($0) }
+        return endVector(bytes.count)
+    }
+
+    /// A vector of 32-bit integers (Arrow's `Union.typeIds`).
+    func createInt32Vector(_ values: [Int32]) -> Int {
+        startVector(elementSize: 4, count: values.count, alignment: 4)
+        for v in values.reversed() { place(v) }
+        return endVector(values.count)
     }
 
     /// A vector of references to already-written tables or strings.
@@ -364,6 +374,7 @@ let fbMetadataVersionV5: Int16 = 4
 /// FlatBuffers `Precision`: HALF, SINGLE, DOUBLE.
 let fbPrecisionSingle: Int16 = 1
 let fbPrecisionDouble: Int16 = 2
+let fbPrecisionHalf: Int16 = 0
 /// `DateUnit`: DAY, MILLISECOND (default MILLISECOND).
 let fbDateUnitDay: Int16 = 0
 let fbDateUnitMillisecond: Int16 = 1

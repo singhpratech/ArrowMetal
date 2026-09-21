@@ -32,17 +32,68 @@ extension AnyMetalArray {
         // A dictionary column writes int32 codes into the record batch and its values into a
         // DictionaryBatch message (see ArrowIPCWriter.encode).
         case .dictionary(_, let values): return .dictionary(index: .int(bits: 32, signed: true), value: values.ipcType)
-        // Arrow IPC has no decimal type in this package yet. The value is a placeholder: `recordBatchMessage`
-        // rejects decimal columns before it is ever written to a message.
-        case .decimal: return .binary
-        // Nested columns have no IPC type here: the writer rejects them before this value is used.
-        case .list, .structure, .map, .union: return .binary
-        // Run-end encoding has no IPC support here: the writer rejects such a column and asks for a decode.
-        case .runEndEncoded(_, let values): return values.ipcType
-        // Likewise for the type-matrix additions in TypesExtra.swift; the writer rejects them too.
-        case .null, .float16, .smallDecimal, .interval, .fixedBinary: return .binary
+        case .decimal(let a): return .decimal(precision: a.type.precision, scale: a.type.scale, bits: a.type.bitWidth)
+        case .smallDecimal(let a): return .decimal(precision: a.type.precision, scale: a.type.scale, bits: a.type.bitWidth)
+        case .list(let a):
+            let item = ArrowIPCField(column: a.values, name: a.fieldName)
+            if case .fixedSize(let n) = a.kind { return .fixedSizeList(item, size: n) }
+            // `large_list` offsets are narrowed to int32 on import, so a list writes `list` unless an
+            // explicit schema asks for `large_list`.
+            return .list(item)
+        case .structure(let a):
+            return .structure(zip(a.names, a.children).map { ArrowIPCField(column: $0.1, name: $0.0) })
+        case .map(let a):
+            let s = a.entryStruct
+            // Arrow requires the entries struct and its key to be non-nullable.
+            let entries = ArrowIPCField(name: a.entries.fieldName, nullable: false, type: .structure([
+                ArrowIPCField(column: s.children[0], name: s.names[0], nullable: false),
+                ArrowIPCField(column: s.children[1], name: s.names[1]),
+            ]))
+            return .map(entries: entries, keysSorted: a.keysSorted)
+        case .union(let a):
+            return .union(mode: a.mode == .dense ? .dense : .sparse,
+                          typeIDs: a.typeCodes.map(Int32.init),
+                          children: zip(a.names, a.children).map { ArrowIPCField(column: $0.1, name: $0.0) })
+        case .runEndEncoded(_, let values):
+            return .runEndEncoded(runEnds: ArrowIPCField(name: "run_ends", nullable: false,
+                                                         type: .int(bits: 32, signed: true)),
+                                  values: ArrowIPCField(column: values, name: "values"))
+        case .null: return .null
+        case .float16: return .float16
+        case .interval(let a): return .interval(a.unit.ipcUnit)
+        case .fixedBinary(let a): return .fixedSizeBinary(byteWidth: a.byteWidth)
+        // An extension type writes its storage type; the extension keys ride in the field's metadata.
         case .extended(let a): return a.storage.ipcType
         }
+    }
+}
+
+extension ArrowIntervalUnit {
+    /// The IPC metadata's `IntervalUnit`, which spells `interval[month]` "year_month".
+    var ipcUnit: ArrowIPCIntervalUnit {
+        switch self {
+        case .months: return .yearMonth
+        case .dayTime: return .dayTime
+        case .monthDayNano: return .monthDayNano
+        }
+    }
+}
+
+extension ArrowIPCField {
+    /// The field a column writes itself as: its own logical type, plus the `ARROW:extension:*` keys when
+    /// it is an extension array (a consumer that knows the type rebuilds it, one that does not sees the
+    /// storage type and the metadata).
+    init(column: AnyMetalArray, name: String, nullable: Bool = true) {
+        var metadata: [(key: String, value: [UInt8])] = []
+        if case .extended(let e) = column {
+            metadata = e.exportMetadata().pairs.map { (key: $0.key, value: $0.value) }
+        }
+        self.init(name: name, type: column.ipcType, nullable: nullable, dictionaryID: nil, metadata: metadata)
+    }
+
+    /// A field with no column behind it (a child Arrow names itself, or an explicit schema's own field).
+    init(name: String, nullable: Bool, type: ArrowIPCType) {
+        self.init(name: name, type: type, nullable: nullable)
     }
 }
 
@@ -56,9 +107,13 @@ extension AnyMetalArray {
 /// Columns carry their own logical type: `.temporal` writes `date32` / `timestamp` / ..., `.binary`
 /// writes `binary`, and `.dictionary` writes int32 codes plus one `DictionaryBatch` per column (a
 /// complete dictionary, never a delta, and one per column for the whole file or stream).
+/// Every type this package can hold is written, nested children recursively: decimals, `float16`,
+/// `fixed_size_binary`, the three interval units, `null`, list / large list / fixed-size list, struct,
+/// map, dense and sparse unions, run-end encoded columns, and extension types (whose `ARROW:extension:*`
+/// keys travel in the field's metadata).
 /// Pass an explicit `schema` to write a type a column's own storage does not name — `large_utf8`,
-/// `large_binary`, or a temporal type over a plain integer column; the storage of each column must
-/// match the physical layout of the type it is given. Run-end encoded columns are refused: decode first.
+/// `large_binary`, `large_list`, or a temporal type over a plain integer column; the storage of each
+/// column must match the physical layout of the type it is given.
 public enum ArrowIPCWriter {
 
     /// Encodes `batches` as Arrow IPC bytes.
@@ -127,16 +182,20 @@ public enum ArrowIPCWriter {
                 throw ArrowIPCError.malformed("cannot derive a schema from an empty batch list; pass one explicitly")
             }
             return ArrowIPCSchema(fields: zip(first.names, first.columns).enumerated().map { i, pair in
-                let type = pair.1.ipcType
+                let field = ArrowIPCField(column: pair.1, name: pair.0)
                 // Dictionary columns need an id to tie them to their DictionaryBatch; the column index does.
-                if case .dictionary = type { return ArrowIPCField(name: pair.0, type: type, nullable: true, dictionaryID: Int64(i)) }
-                return ArrowIPCField(name: pair.0, type: type, nullable: true)
+                if case .dictionary = field.type {
+                    return ArrowIPCField(name: field.name, type: field.type, nullable: true,
+                                         dictionaryID: Int64(i), metadata: field.metadata)
+                }
+                return field
             })
         }()
         // An explicit schema may name a dictionary column without giving it an id; the column index does.
         let resolved = ArrowIPCSchema(fields: schema.fields.enumerated().map { i, field in
             if case .dictionary = field.type, field.dictionaryID == nil {
-                return ArrowIPCField(name: field.name, type: field.type, nullable: field.nullable, dictionaryID: Int64(i))
+                return ArrowIPCField(name: field.name, type: field.type, nullable: field.nullable,
+                                     dictionaryID: Int64(i), metadata: field.metadata)
             }
             return field
         })
@@ -163,6 +222,33 @@ public enum ArrowIPCWriter {
         }
         if case .varBinary = type.storage {
             switch column { case .string, .binary: return true; default: break }
+        }
+        // Nested layouts match on shape, not on the names an explicit schema gives the children.
+        switch column {
+        case .list(let a):
+            switch type {
+            case .list(let f), .largeList(let f): return a.kind == .variable && compatible(a.values, f.type)
+            case .fixedSizeList(let f, let n): return a.kind == .fixedSize(n) && compatible(a.values, f.type)
+            default: return false
+            }
+        case .structure(let a):
+            guard case .structure(let fields) = type, fields.count == a.children.count else { return false }
+            return zip(a.children, fields).allSatisfy { compatible($0.0, $0.1.type) }
+        case .map(let a):
+            guard case .map(let entries, _) = type, case .structure(let fields) = entries.type,
+                  fields.count == 2 else { return false }
+            let s = a.entryStruct
+            return compatible(s.children[0], fields[0].type) && compatible(s.children[1], fields[1].type)
+        case .union(let a):
+            guard case .union(let mode, let ids, let fields) = type, fields.count == a.children.count,
+                  ids == a.typeCodes.map(Int32.init), (mode == .dense) == (a.mode == .dense) else { return false }
+            return zip(a.children, fields).allSatisfy { compatible($0.0, $0.1.type) }
+        case .runEndEncoded(_, let values):
+            guard case .runEndEncoded(_, let v) = type else { return false }
+            return compatible(values, v.type)
+        case .extended(let a):
+            return compatible(a.storage, type)
+        default: break
         }
         return column.ipcType == type.physicalType || column.ipcType.physicalType == type.physicalType
     }
@@ -238,8 +324,24 @@ public enum ArrowIPCWriter {
     // MARK: metadata tables
 
     /// Writes one `Field` table and returns its offset.
+    ///
+    /// Everything the table refers to — its name, its children, its type and its metadata — is written
+    /// first: a FlatBuffers table may only point at bytes that are already in the buffer.
     private static func field(_ b: FBBuilder, _ f: ArrowIPCField) -> Int {
         let nameOffset = b.createString(f.name)
+        // Children, depth first, so that a nested field's whole subtree precedes it.
+        let childOffsets = f.type.children.map { field(b, $0) }
+        let childrenVector = childOffsets.isEmpty ? 0 : b.createOffsetVector(childOffsets)
+        // KeyValue { key: string; value: string }
+        let metadataOffsets = f.metadata.map { pair -> Int in
+            let key = b.createString(pair.key)
+            let value = b.createString(bytes: pair.value)
+            b.startObject(2)
+            b.addOffset(id: 0, key)
+            b.addOffset(id: 1, value)
+            return b.endObject()
+        }
+        let metadataVector = metadataOffsets.isEmpty ? 0 : b.createOffsetVector(metadataOffsets)
         // A dictionary field carries the *value* type in the union and the index type under `dictionary`.
         let (kind, typeOffset) = type(b, f.type)
         var encodingOffset = 0
@@ -263,6 +365,8 @@ public enum ArrowIPCWriter {
         b.addScalar(id: 2, kind.rawValue, default: FBTypeKind.none.rawValue)
         b.addOffset(id: 3, typeOffset)
         b.addOffset(id: 4, encodingOffset)
+        b.addOffset(id: 5, childrenVector)
+        b.addOffset(id: 6, metadataVector)
         return b.endObject()
     }
 
@@ -310,6 +414,47 @@ public enum ArrowIPCWriter {
             return (.duration, b.endObject())
         case .dictionary(_, let value):
             return type(b, value)
+        case .null: return empty(.null)
+        case .float16:
+            // FloatingPoint { precision: Precision }; HALF is the schema default, so it is omitted.
+            b.startObject(1)
+            b.addScalar(id: 0, fbPrecisionHalf, default: 0)
+            return (.floatingPoint, b.endObject())
+        case .decimal(let precision, let scale, let bits):
+            // Decimal { precision: int; scale: int; bitWidth: int = 128 }
+            b.startObject(3)
+            b.addScalar(id: 0, Int32(precision), default: 0)
+            b.addScalar(id: 1, Int32(scale), default: 0)
+            b.addScalar(id: 2, Int32(bits), default: 128)
+            return (.decimal, b.endObject())
+        case .fixedSizeBinary(let width):
+            b.startObject(1)
+            b.addScalar(id: 0, Int32(width), default: 0)
+            return (.fixedSizeBinary, b.endObject())
+        case .interval(let unit):
+            // Interval { unit: IntervalUnit }; YEAR_MONTH is the default.
+            b.startObject(1)
+            b.addScalar(id: 0, unit.rawValue, default: Int16(0))
+            return (.interval, b.endObject())
+        case .list: return empty(.list)
+        case .largeList: return empty(.largeList)
+        case .fixedSizeList(_, let size):
+            b.startObject(1)
+            b.addScalar(id: 0, Int32(size), default: 0)
+            return (.fixedSizeList, b.endObject())
+        case .structure: return empty(.structKind)
+        case .map(_, let keysSorted):
+            b.startObject(1)
+            b.addScalar(id: 0, keysSorted, default: false)
+            return (.map, b.endObject())
+        case .union(let mode, let typeIDs, _):
+            // Union { mode: UnionMode; typeIds: [int] }; the vector is written before the table.
+            let ids = b.createInt32Vector(typeIDs)
+            b.startObject(2)
+            b.addScalar(id: 0, mode.rawValue, default: Int16(0))
+            b.addOffset(id: 1, ids)
+            return (.union, b.endObject())
+        case .runEndEncoded: return empty(.runEndEncoded)
         }
     }
 
@@ -388,15 +533,17 @@ public enum ArrowIPCWriter {
         }
     }
 
+    /// One `FieldNode`: the logical length of a field and how many of its values are null.
+    private typealias FieldNode = (length: Int64, nullCount: Int64)
+
     private static func recordBatchMessage(_ batch: MetalRecordBatch,
                                            schema: ArrowIPCSchema) throws -> (metadata: [UInt8], body: Data) {
         var body = Body()
-        var nodes: [(length: Int64, nullCount: Int64)] = []
+        var nodes: [FieldNode] = []
         body.data.reserveCapacity(estimatedSize([batch]))
 
         for (i, column) in batch.columns.enumerated() {
-            nodes.append((Int64(column.length), Int64(column.nullCount)))
-            try appendColumn(&body, column, type: schema.fields[i].type)
+            try appendColumn(&body, &nodes, column, type: schema.fields[i].type, name: schema.fields[i].name)
         }
 
         let b = FBBuilder()
@@ -420,63 +567,202 @@ public enum ArrowIPCWriter {
         return (message(b, header: header, kind: .recordBatch, bodyLength: body.data.count), body.data)
     }
 
-    /// Appends one column's Arrow buffers to the message body, in the order the type prescribes.
+    /// Appends one column's field node and Arrow buffers to the message body, then its children, which is
+    /// the pre-order Arrow IPC prescribes: a field's own node and buffers first, each child's subtree after.
+    ///
     /// A dictionary column contributes its *codes*; the values travel in a dictionary batch.
-    private static func appendColumn(_ body: inout Body, _ column: AnyMetalArray, type: ArrowIPCType) throws {
+    private static func appendColumn(_ body: inout Body, _ nodes: inout [FieldNode], _ column: AnyMetalArray,
+                                     type: ArrowIPCType, name: String) throws {
+        func push(_ length: Int, _ nullCount: Int) { nodes.append((Int64(length), Int64(nullCount))) }
         switch column {
-        case .int8(let a): append(&body, a, width: 1)
-        case .uint8(let a): append(&body, a, width: 1)
-        case .int16(let a): append(&body, a, width: 2)
-        case .uint16(let a): append(&body, a, width: 2)
-        case .int32(let a): append(&body, a, width: 4)
-        case .uint32(let a): append(&body, a, width: 4)
-        case .int64(let a): append(&body, a, width: 8)
-        case .uint64(let a): append(&body, a, width: 8)
-        case .float32(let a): append(&body, a, width: 4)
-        case .float64(let a): append(&body, a, width: 8)
+        case .int8(let a): push(a.length, a.nullCount); append(&body, a, width: 1)
+        case .uint8(let a): push(a.length, a.nullCount); append(&body, a, width: 1)
+        case .int16(let a): push(a.length, a.nullCount); append(&body, a, width: 2)
+        case .uint16(let a): push(a.length, a.nullCount); append(&body, a, width: 2)
+        case .int32(let a): push(a.length, a.nullCount); append(&body, a, width: 4)
+        case .uint32(let a): push(a.length, a.nullCount); append(&body, a, width: 4)
+        case .int64(let a): push(a.length, a.nullCount); append(&body, a, width: 8)
+        case .uint64(let a): push(a.length, a.nullCount); append(&body, a, width: 8)
+        case .float32(let a): push(a.length, a.nullCount); append(&body, a, width: 4)
+        case .float64(let a): push(a.length, a.nullCount); append(&body, a, width: 8)
         case .boolean(let a):
+            push(a.length, a.nullCount)
             body.addValidity(a.validity, nullCount: a.nullCount, length: a.length)
             body.add(a.values.contents, byteCount: Bitmap.byteCount(bits: a.length))
         case .temporal(let t):
+            push(t.length, t.nullCount)
             switch t.storage {
             case .int32(let a): append(&body, a, width: 4)
             case .int64(let a): append(&body, a, width: 8)
             }
         case .dictionary(let codes, _):
+            push(codes.length, codes.nullCount)
             append(&body, codes, width: 4)
-        case .runEndEncoded:
-            throw ArrowIPCError.unsupported("run-end encoded columns are not written; call runEndDecode() on the column first")
         case .decimal(let a):
-            throw ArrowIPCError.unsupported("decimal columns (\(a.type)) are not written to Arrow IPC yet; export them through the C Data Interface")
-        case .list, .structure, .map, .union:
-            throw ArrowIPCError.unsupported("nested columns (list, struct, map, union) are not written to IPC yet")
-        case .null, .float16, .smallDecimal, .interval, .fixedBinary, .extended:
-            throw ArrowIPCError.unsupported("\(column.arrowFormat) columns are not written to Arrow IPC yet; export them through the C Data Interface")
+            push(a.length, a.nullCount)
+            appendFixedWidth(&body, validity: a.validity, nullCount: a.nullCount, length: a.length,
+                             values: a.values, width: a.type.byteWidth)
+        case .smallDecimal(let a):
+            push(a.length, a.nullCount)
+            appendFixedWidth(&body, validity: a.validity, nullCount: a.nullCount, length: a.length,
+                             values: a.values, width: a.type.byteWidth)
+        case .float16(let a):
+            push(a.length, a.nullCount)
+            append(&body, a.bits, width: 2)
+        case .interval(let a):
+            push(a.length, a.nullCount)
+            appendFixedWidth(&body, validity: a.validity, nullCount: a.nullCount, length: a.length,
+                             values: a.values, width: a.unit.byteWidth)
+        case .fixedBinary(let a):
+            push(a.length, a.nullCount)
+            appendFixedWidth(&body, validity: a.validity, nullCount: a.nullCount, length: a.length,
+                             values: a.values, width: a.byteWidth)
+        case .null(let a):
+            // The null type has no buffers at all, and every one of its values is null.
+            push(a.length, a.length)
         case .string(let a), .binary(let a):
-            body.addValidity(a.validity, nullCount: a.nullCount, length: a.length)
-            if case .varBinary(true) = type.storage {
-                // Widen the 32-bit offsets this package stores to the 64-bit ones large_* needs.
-                let source = a.offsets.typed(Int32.self)
-                var wide = [Int64](repeating: 0, count: a.length + 1)
-                for j in 0...a.length { wide[j] = Int64(source[j]) }
-                wide.withUnsafeBytes { body.add($0.baseAddress, byteCount: $0.count) }
-            } else {
-                body.add(a.offsets.contents, byteCount: (a.length + 1) * 4)
+            push(a.length, a.nullCount)
+            var large = false
+            if case .varBinary(true) = type.storage { large = true }
+            appendVarBinary(&body, a, large: large)
+        case .list(let a):
+            try appendList(&body, &nodes, a, type: type, name: name)
+        case .map(let a):
+            guard case .map(let entries, _) = type else {
+                throw ArrowIPCError.malformed("column '\(name)' is a map but the schema says \(type)")
             }
-            body.add(a.data.contents, byteCount: a.totalBytes)
+            // A map is a list of entry structs; nothing else about the layout differs.
+            try appendListBuffers(&body, &nodes, a.entries, child: entries, large: false, fixed: nil, name: name)
+        case .structure(let a):
+            guard case .structure(let fields) = type, fields.count == a.children.count else {
+                throw ArrowIPCError.malformed("column '\(name)' is a struct of \(a.children.count) fields but the schema says \(type)")
+            }
+            push(a.length, a.nullCount)
+            body.addValidity(a.validity, nullCount: a.nullCount, length: a.length)
+            for (child, field) in zip(a.children, fields) {
+                try appendColumn(&body, &nodes, try trimmed(child, to: a.length), type: field.type, name: field.name)
+            }
+        case .union(let a):
+            guard case .union(let mode, _, let fields) = type, fields.count == a.children.count,
+                  (mode == .dense) == (a.mode == .dense) else {
+                throw ArrowIPCError.malformed("column '\(name)' is a \(a.mode) union of \(a.children.count) children but the schema says \(type)")
+            }
+            // A union has no validity bitmap: null-ness lives in the children.
+            push(a.length, 0)
+            body.add(a.typeIds.values.contents, byteCount: a.length)
+            if let offsets = a.offsets { body.add(offsets.values.contents, byteCount: a.length * 4) }
+            for (child, field) in zip(a.children, fields) {
+                // A sparse union's children are as long as the union; a dense union's are their own length.
+                let c = mode == .sparse ? try trimmed(child, to: a.length) : child
+                try appendColumn(&body, &nodes, c, type: field.type, name: field.name)
+            }
+        case .runEndEncoded(let runEnds, let values):
+            guard case .runEndEncoded(let endsField, let valuesField) = type else {
+                throw ArrowIPCError.malformed("column '\(name)' is run-end encoded but the schema says \(type)")
+            }
+            guard values.length >= runEnds.length else {
+                throw ArrowIPCError.malformed("run-end encoded column '\(name)' has \(runEnds.length) run ends for \(values.length) values")
+            }
+            // No buffers of its own: the logical length in the node, and everything else in the children.
+            push(runEndLogicalLength(runEnds), 0)
+            try appendColumn(&body, &nodes, .int32(runEnds), type: endsField.type, name: endsField.name)
+            try appendColumn(&body, &nodes, try trimmed(values, to: runEnds.length), type: valuesField.type,
+                             name: valuesField.name)
+        case .extended(let a):
+            // An extension column writes its storage; the extension keys are in the field's metadata.
+            try appendColumn(&body, &nodes, a.storage, type: type, name: name)
         }
+    }
+
+    /// A child narrowed to the `length` its parent covers. Children may be longer than their parent —
+    /// a sliced struct keeps whichever children it was built from — and IPC has no array offset.
+    private static func trimmed(_ column: AnyMetalArray, to length: Int) throws -> AnyMetalArray {
+        column.length == length ? column : try column.slice(offset: 0, length: length)
+    }
+
+    private static func appendFixedWidth(_ body: inout Body, validity: MetalArrowBuffer?, nullCount: Int,
+                                         length: Int, values: MetalArrowBuffer, width: Int) {
+        body.addValidity(validity, nullCount: nullCount, length: length)
+        body.add(values.contents, byteCount: length * width)
+    }
+
+    /// A utf8 / binary column's offsets and bytes, rebased so that the first offset is zero: a sliced
+    /// column writes only the bytes its own rows use, never the prefix it happens to share.
+    private static func appendVarBinary(_ body: inout Body, _ a: MetalStringArray, large: Bool) {
+        body.addValidity(a.validity, nullCount: a.nullCount, length: a.length)
+        let source = a.offsets.typed(Int32.self)
+        let base = Int(source[0]), end = Int(source[a.length])
+        if large {
+            // Widen the 32-bit offsets this package stores to the 64-bit ones large_* needs.
+            var wide = [Int64](repeating: 0, count: a.length + 1)
+            for j in 0...a.length { wide[j] = Int64(Int(source[j]) - base) }
+            wide.withUnsafeBytes { body.add($0.baseAddress, byteCount: $0.count) }
+        } else if base == 0 {
+            body.add(a.offsets.contents, byteCount: (a.length + 1) * 4)
+        } else {
+            var rebased = [Int32](repeating: 0, count: a.length + 1)
+            for j in 0...a.length { rebased[j] = source[j] - Int32(base) }
+            rebased.withUnsafeBytes { body.add($0.baseAddress, byteCount: $0.count) }
+        }
+        body.add(end > base ? a.data.contents.advanced(by: base) : nil, byteCount: end - base)
+    }
+
+    private static func appendList(_ body: inout Body, _ nodes: inout [FieldNode], _ a: MetalListArray,
+                                   type: ArrowIPCType, name: String) throws {
+        switch type {
+        case .list(let item):
+            try appendListBuffers(&body, &nodes, a, child: item, large: false, fixed: nil, name: name)
+        case .largeList(let item):
+            try appendListBuffers(&body, &nodes, a, child: item, large: true, fixed: nil, name: name)
+        case .fixedSizeList(let item, let size):
+            try appendListBuffers(&body, &nodes, a, child: item, large: false, fixed: size, name: name)
+        default:
+            throw ArrowIPCError.malformed("column '\(name)' is a list but the schema says \(type)")
+        }
+    }
+
+    /// The list layout: validity, offsets rebased to zero (none for a fixed-size list), then the child
+    /// restricted to the range the rows actually cover.
+    private static func appendListBuffers(_ body: inout Body, _ nodes: inout [FieldNode], _ a: MetalListArray,
+                                          child: ArrowIPCField, large: Bool, fixed: Int?, name: String) throws {
+        nodes.append((Int64(a.length), Int64(a.nullCount)))
+        body.addValidity(a.validity, nullCount: a.nullCount, length: a.length)
+        let source = a.offsets.typed(Int32.self)
+        let base = Int(source[0]), end = Int(source[a.length])
+        if let width = fixed {
+            // A fixed_size_list has no offsets buffer: `offsets[i] == offsets[0] + i * N` is its invariant.
+            guard end - base == a.length * width else {
+                throw ArrowIPCError.malformed(
+                    "fixed_size_list column '\(name)' covers \(end - base) child elements, not \(a.length * width)")
+            }
+        } else if large {
+            var wide = [Int64](repeating: 0, count: a.length + 1)
+            for j in 0...a.length { wide[j] = Int64(Int(source[j]) - base) }
+            wide.withUnsafeBytes { body.add($0.baseAddress, byteCount: $0.count) }
+        } else if base == 0 {
+            body.add(a.offsets.contents, byteCount: (a.length + 1) * 4)
+        } else {
+            var rebased = [Int32](repeating: 0, count: a.length + 1)
+            for j in 0...a.length { rebased[j] = source[j] - Int32(base) }
+            rebased.withUnsafeBytes { body.add($0.baseAddress, byteCount: $0.count) }
+        }
+        let values = base == 0 && end == a.values.length ? a.values : try a.values.slice(offset: base, length: end - base)
+        try appendColumn(&body, &nodes, values, type: child.type, name: child.name)
     }
 
     /// A `DictionaryBatch` message: one complete dictionary (`isDelta = false`) for id `id`.
     private static func dictionaryBatchMessage(_ values: AnyMetalArray, type: ArrowIPCType,
                                                id: Int64) throws -> (metadata: [UInt8], body: Data) {
         var body = Body()
-        try appendColumn(&body, values, type: type)
+        var nodes: [FieldNode] = []
+        try appendColumn(&body, &nodes, values, type: type, name: "dictionary")
         let b = FBBuilder()
-        b.startVector(elementSize: fbFieldNodeStride, count: 1, alignment: 8)
-        b.place(Int64(values.nullCount))
-        b.place(Int64(values.length))
-        let nodesVector = b.endVector(1)
+        b.startVector(elementSize: fbFieldNodeStride, count: nodes.count, alignment: 8)
+        for node in nodes.reversed() {
+            b.place(node.nullCount)
+            b.place(node.length)
+        }
+        let nodesVector = b.endVector(nodes.count)
         b.startVector(elementSize: fbBufferStride, count: body.buffers.count, alignment: 8)
         for buffer in body.buffers.reversed() {
             b.place(buffer.length)

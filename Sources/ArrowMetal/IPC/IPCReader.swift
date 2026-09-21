@@ -15,6 +15,32 @@ public enum ArrowIPCTimeUnit: Int16, Sendable, CustomStringConvertible {
     }
 }
 
+/// Unit of Arrow's `interval` type, in the order `Schema.fbs` gives them.
+public enum ArrowIPCIntervalUnit: Int16, Sendable, CustomStringConvertible {
+    case yearMonth = 0, dayTime = 1, monthDayNano = 2
+    public var description: String {
+        switch self {
+        case .yearMonth: return "year_month"
+        case .dayTime: return "day_time"
+        case .monthDayNano: return "month_day_nano"
+        }
+    }
+    /// Bytes per element of the values buffer.
+    var byteWidth: Int {
+        switch self {
+        case .yearMonth: return 4
+        case .dayTime: return 8
+        case .monthDayNano: return 16
+        }
+    }
+}
+
+/// Whether a union stores one slot per row in every child (sparse) or packs each child (dense).
+public enum ArrowIPCUnionMode: Int16, Sendable, CustomStringConvertible {
+    case sparse = 0, dense = 1
+    public var description: String { self == .sparse ? "sparse" : "dense" }
+}
+
 /// How an Arrow array of a given logical type is laid out in memory.
 enum ArrowIPCStorage: Equatable {
     /// Fixed-width values: validity bitmap + values buffer.
@@ -23,12 +49,16 @@ enum ArrowIPCStorage: Equatable {
     case bits
     /// Variable width: validity bitmap + offsets + data. `large` selects 64-bit offsets.
     case varBinary(large: Bool)
+    /// A layout whose values live in child field nodes (list, struct, map, union, run-end encoded) or in
+    /// no buffer at all (`null`). The writer flattens these; the reader does not build them.
+    case nested(buffers: Int)
 
-    /// Number of Arrow buffers a field of this storage contributes to a record batch.
+    /// Number of Arrow buffers a field of this storage contributes to a record batch, its children aside.
     var bufferCount: Int {
         switch self {
         case .fixedWidth, .bits: return 2
         case .varBinary: return 3
+        case .nested(let n): return n
         }
     }
 }
@@ -57,6 +87,30 @@ public enum ArrowIPCType: Equatable, Sendable, CustomStringConvertible {
     /// A dictionary-encoded column: `index` is the type of the codes stored in the record batch,
     /// `value` the type of the dictionary itself (which travels in a separate `DictionaryBatch`).
     indirect case dictionary(index: ArrowIPCType, value: ArrowIPCType)
+    /// The Arrow `null` type: a length, every element null, and no buffers at all.
+    case null
+    /// `float16`: IEEE-754 binary16 bit patterns.
+    case float16
+    /// `decimal32` / `decimal64` / `decimal128` / `decimal256`; `bits` is the storage width.
+    case decimal(precision: Int, scale: Int, bits: Int)
+    /// `fixed_size_binary`: `byteWidth` raw bytes per element, no offsets.
+    case fixedSizeBinary(byteWidth: Int)
+    /// `interval[year_month]` / `[day_time]` / `[month_day_nano]`.
+    case interval(ArrowIPCIntervalUnit)
+    /// `list`: validity + int32 offsets over one child field (Arrow names it "item").
+    indirect case list(ArrowIPCField)
+    /// `large_list`: the same with 64-bit offsets.
+    indirect case largeList(ArrowIPCField)
+    /// `fixed_size_list`: validity only, every row covering exactly `size` child elements.
+    indirect case fixedSizeList(ArrowIPCField, size: Int)
+    /// `struct`: validity only, one child field per member.
+    indirect case structure([ArrowIPCField])
+    /// `map`: a list whose child is a non-nullable `entries` struct of `key` and `value`.
+    indirect case map(entries: ArrowIPCField, keysSorted: Bool)
+    /// `union`: type ids (plus offsets when dense) and one child field per variant.
+    indirect case union(mode: ArrowIPCUnionMode, typeIDs: [Int32], children: [ArrowIPCField])
+    /// `run_end_encoded`: no buffers, a `run_ends` child and a `values` child.
+    indirect case runEndEncoded(runEnds: ArrowIPCField, values: ArrowIPCField)
 
     public var description: String {
         switch self {
@@ -74,6 +128,33 @@ public enum ArrowIPCType: Equatable, Sendable, CustomStringConvertible {
         case .timestamp(let u, let tz): return "timestamp[\(u)\(tz.map { ", tz=\($0)" } ?? "")]"
         case .duration(let u): return "duration[\(u)]"
         case .dictionary(let i, let v): return "dictionary<\(i), \(v)>"
+        case .null: return "null"
+        case .float16: return "float16"
+        case .decimal(let p, let s, let b): return "decimal\(b)(\(p), \(s))"
+        case .fixedSizeBinary(let w): return "fixed_size_binary[\(w)]"
+        case .interval(let u): return "interval[\(u)]"
+        case .list(let f): return "list<\(f.name): \(f.type)>"
+        case .largeList(let f): return "large_list<\(f.name): \(f.type)>"
+        case .fixedSizeList(let f, let n): return "fixed_size_list<\(f.name): \(f.type)>[\(n)]"
+        case .structure(let fs): return "struct<\(fs.map { "\($0.name): \($0.type)" }.joined(separator: ", "))>"
+        case .map(let e, let sorted):
+            guard case .structure(let fs) = e.type, fs.count == 2 else { return "map" }
+            return "map<\(fs[0].type), \(fs[1].type)\(sorted ? ", keys_sorted" : "")>"
+        case .union(let mode, _, let fs):
+            return "\(mode)_union<\(fs.map { "\($0.name): \($0.type)" }.joined(separator: ", "))>"
+        case .runEndEncoded(let r, let v): return "run_end_encoded<\(r.type), \(v.type)>"
+        }
+    }
+
+    /// The child fields the schema carries for this type, in the order Arrow writes them.
+    var children: [ArrowIPCField] {
+        switch self {
+        case .list(let f), .largeList(let f), .fixedSizeList(let f, _), .map(let f, _): return [f]
+        case .structure(let fs), .union(_, _, let fs): return fs
+        case .runEndEncoded(let r, let v): return [r, v]
+        // A dictionary field carries the value type's children; the index type has none.
+        case .dictionary(_, let value): return value.children
+        default: return []
         }
     }
 
@@ -100,6 +181,18 @@ public enum ArrowIPCType: Equatable, Sendable, CustomStringConvertible {
         case .date32, .time32: return .fixedWidth(bytes: 4)
         case .date64, .time64, .timestamp, .duration: return .fixedWidth(bytes: 8)
         case .dictionary(let index, _): return index.storage
+        case .float16: return .fixedWidth(bytes: 2)
+        case .decimal(_, _, let bits): return .fixedWidth(bytes: bits / 8)
+        case .fixedSizeBinary(let w): return .fixedWidth(bytes: w)
+        case .interval(let u): return .fixedWidth(bytes: u.byteWidth)
+        // Validity plus offsets; the values live in the child field node.
+        case .list, .largeList, .map: return .nested(buffers: 2)
+        // Validity only: a fixed-size list's offsets are implied and a struct has none.
+        case .fixedSizeList, .structure: return .nested(buffers: 1)
+        // Type ids, plus the offsets a dense union needs. A union carries no validity bitmap.
+        case .union(let mode, _, _): return .nested(buffers: mode == .dense ? 2 : 1)
+        // Neither of these has a buffer of its own.
+        case .null, .runEndEncoded: return .nested(buffers: 0)
         }
     }
 
@@ -139,11 +232,22 @@ public struct ArrowIPCField: Equatable, Sendable {
     /// The dictionary id that ties a dictionary-encoded column to its `DictionaryBatch` message.
     /// Nil for every other column; the writer assigns one per dictionary column when it derives a schema.
     public let dictionaryID: Int64?
-    public init(name: String, type: ArrowIPCType, nullable: Bool = true, dictionaryID: Int64? = nil) {
+    /// The field's `custom_metadata`, in order. An extension column carries `ARROW:extension:name` and
+    /// `ARROW:extension:metadata` here, which is what lets a consumer rebuild the extension type.
+    public let metadata: [(key: String, value: [UInt8])]
+    public init(name: String, type: ArrowIPCType, nullable: Bool = true, dictionaryID: Int64? = nil,
+                metadata: [(key: String, value: [UInt8])] = []) {
         self.name = name
         self.type = type
         self.nullable = nullable
         self.dictionaryID = dictionaryID
+        self.metadata = metadata
+    }
+
+    public static func == (a: ArrowIPCField, b: ArrowIPCField) -> Bool {
+        a.name == b.name && a.type == b.type && a.nullable == b.nullable && a.dictionaryID == b.dictionaryID
+            && a.metadata.count == b.metadata.count
+            && zip(a.metadata, b.metadata).allSatisfy { $0.key == $1.key && $0.value == $1.value }
     }
 }
 
@@ -577,6 +681,11 @@ public final class ArrowIPCReader {
         }
 
         switch field.type.storage {
+        // Nested and null columns are written but not read back: `parseSchema` already refused them, so
+        // this only guards the dictionary path, which reaches `buildColumn` with a value type of its own.
+        case .nested:
+            throw ArrowIPCError.unsupported("\(field.type) columns (column '\(field.name)')")
+
         case .fixedWidth(let width):
             let bitmap = try validity()
             let values = try take(buffers[1], need: length * width, raw: raw, bodyOffset: bodyOffset)
