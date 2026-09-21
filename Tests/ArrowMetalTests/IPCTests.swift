@@ -659,6 +659,9 @@ final class IPCTests: XCTestCase {
             assert table.column("person").to_pylist() == [{"n": 10, "s": "one"}, None, {"n": None, "s": "three"}, {"n": 40, "s": None}]
 
             assert f("lookup").type == pa.map_(pa.string(), pa.int32()), (label, f("lookup").type)
+            # Arrow's own names for a map's children, whatever the list child was called here.
+            assert f("lookup").type.key_field.name == "key" and f("lookup").type.item_field.name == "value"
+            assert not f("lookup").type.key_field.nullable
             assert table.column("lookup").to_pylist() == [[("a", 1), ("b", None)], None, [("c", 3)], [("d", 4)]]
 
             dense = f("dense").type

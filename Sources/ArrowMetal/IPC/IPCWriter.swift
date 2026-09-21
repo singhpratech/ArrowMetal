@@ -44,8 +44,8 @@ extension AnyMetalArray {
             return .structure(zip(a.names, a.children).map { ArrowIPCField(column: $0.1, name: $0.0) })
         case .map(let a):
             let s = a.entryStruct
-            // Arrow requires the entries struct and its key to be non-nullable.
-            let entries = ArrowIPCField(name: a.entries.fieldName, nullable: false, type: .structure([
+            // Arrow names a map's child "entries", and requires it and its key to be non-nullable.
+            let entries = ArrowIPCField(name: "entries", nullable: false, type: .structure([
                 ArrowIPCField(column: s.children[0], name: s.names[0], nullable: false),
                 ArrowIPCField(column: s.children[1], name: s.names[1]),
             ]))
