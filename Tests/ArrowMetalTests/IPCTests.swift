@@ -98,6 +98,58 @@ final class IPCTests: XCTestCase {
         }
     }
 
+    /// A canonical text form of every value in a column, nested children included, so that two columns
+    /// of any type compare value by value in one assertion.
+    private func render(_ column: AnyMetalArray) -> String {
+        (0..<column.length).map { renderValue(column, $0) }.joined(separator: ", ")
+    }
+
+    private func renderValue(_ c: AnyMetalArray, _ i: Int) -> String {
+        func hex(_ bytes: [UInt8]?) -> String {
+            bytes.map { $0.map { String(format: "%02x", $0) }.joined() } ?? "null"
+        }
+        switch c {
+        case .int8(let a): return a[i].map { "\($0)" } ?? "null"
+        case .uint8(let a): return a[i].map { "\($0)" } ?? "null"
+        case .int16(let a): return a[i].map { "\($0)" } ?? "null"
+        case .uint16(let a): return a[i].map { "\($0)" } ?? "null"
+        case .int32(let a): return a[i].map { "\($0)" } ?? "null"
+        case .uint32(let a): return a[i].map { "\($0)" } ?? "null"
+        case .int64(let a): return a[i].map { "\($0)" } ?? "null"
+        case .uint64(let a): return a[i].map { "\($0)" } ?? "null"
+        case .float32(let a): return a[i].map { "\($0)" } ?? "null"
+        case .float64(let a): return a[i].map { "\($0)" } ?? "null"
+        case .boolean(let a): return a[i].map { "\($0)" } ?? "null"
+        case .string(let a): return a[i].map { "\"\($0)\"" } ?? "null"
+        case .binary(let a): return hex(a.bytes(at: i))
+        case .temporal(let a): return a[i].map { "\($0)" } ?? "null"
+        case .decimal(let a): return a[i].map { "\($0)" } ?? "null"
+        case .smallDecimal(let a): return a[i].map { "\($0)" } ?? "null"
+        case .float16(let a): return a[i].map { "\($0)" } ?? "null"
+        case .fixedBinary(let a): return hex(a.bytes(at: i))
+        case .interval(let a): return a[i].map { "\($0)" } ?? "null"
+        case .null: return "null"
+        case .dictionary(let codes, let values): return codes[i].map { renderValue(values, Int($0)) } ?? "null"
+        case .list(let a):
+            guard let r = a.valueRange(i) else { return "null" }
+            return "[" + r.map { renderValue(a.values, $0) }.joined(separator: ", ") + "]"
+        case .structure(let a):
+            guard a.isValid(i) else { return "null" }
+            return "{" + zip(a.names, a.children).map { "\($0.0): \(renderValue($0.1, i))" }.joined(separator: ", ") + "}"
+        case .map(let a):
+            guard let r = a.valueRange(i) else { return "null" }
+            return "{" + r.map { "\(renderValue(a.keys, $0)): \(renderValue(a.items, $0))" }.joined(separator: ", ") + "}"
+        case .union(let a):
+            guard let where_ = a.location(i) else { return "?" }
+            return "\(a.names[where_.child])=\(renderValue(a.children[where_.child], where_.index))"
+        case .runEndEncoded(let runEnds, let values):
+            var run = 0
+            while run < runEnds.length, Int(runEnds[run] ?? 0) <= i { run += 1 }
+            return run < runEnds.length ? renderValue(values, run) : "?"
+        case .extended(let a): return renderValue(a.storage, i)
+        }
+    }
+
     private func temporaryFile(_ ext: String = "arrow") -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("arrowmetal-ipc-\(UUID().uuidString).\(ext)")
     }
@@ -903,24 +955,303 @@ final class IPCTests: XCTestCase {
         XCTAssertEqual(try runPython(script, [url.path]).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
     }
 
-    /// The reader has not grown with the writer: a file carrying a type it cannot build is refused with
-    /// a message naming the column, never read as something else.
-    func testOurReaderStillRefusesTheTypesItCannotBuild() throws {
+    /// Everything the writer emits, the reader builds again: the whole type matrix round trips through
+    /// our own reader in both encapsulations, column by column and value by value.
+    func testTheWholeTypeMatrixRoundTripsThroughOurReader() throws {
         let batch = try typeMatrixBatch()
-        for (i, name) in batch.names.enumerated() where name != "tagged" {
-            let one = try MetalRecordBatch(names: [name], columns: [batch.columns[i]])
-            let data = try ArrowIPCWriter.encode([one], format: .file)
-            XCTAssertThrowsError(try ArrowIPCReader(data: data), name) { error in
-                guard let e = error as? ArrowIPCError, case .unsupported(let message) = e else {
-                    return XCTFail("column '\(name)' failed with \(error)")
-                }
-                XCTAssertTrue(message.contains(name), "column '\(name)': \(message)")
+        let schema = typeMatrixSchema(batch)
+        for format in [ArrowIPCFormat.file, .stream] {
+            let reader = try ArrowIPCReader(data: try ArrowIPCWriter.encode([batch], schema: schema, format: format))
+            XCTAssertEqual(reader.schema.names, batch.names, "\(format)")
+            let back = try reader.batch(at: 0)
+            XCTAssertEqual(back.length, batch.length, "\(format)")
+            for (i, name) in batch.names.enumerated() {
+                XCTAssertEqual(render(back.columns[i]), render(batch.columns[i]), "column '\(name)' (\(format))")
+            }
+            // `large_list` offsets are narrowed on the way in, so "biglist" comes back as a plain list.
+            XCTAssertEqual(reader.schema["grid"]?.type, .fixedSizeList(ArrowIPCField(name: "item", type: .float(bits: 64)), size: 3))
+            XCTAssertEqual(reader.schema["nothing"]?.type, .null)
+            XCTAssertEqual(reader.schema["dec256"]?.type, .decimal(precision: 40, scale: 2, bits: 256))
+            XCTAssertEqual(back["nothing"]?.length, 4)
+            XCTAssertEqual(back["nothing"]?.nullCount, 4)
+        }
+    }
+
+    /// The nested layouts as pyarrow writes them, with every shape of null a reader can get wrong: a
+    /// null row, an empty row, a null element inside a row, a null struct whose children are not null,
+    /// and a null map.
+    func testWeReadNestedColumnsPyarrowWrites() throws {
+        _ = try requirePython()
+        let fileURL = temporaryFile()
+        let streamURL = temporaryFile("arrows")
+        defer {
+            try? FileManager.default.removeItem(at: fileURL)
+            try? FileManager.default.removeItem(at: streamURL)
+        }
+        let script = """
+        import sys, pyarrow as pa
+        lists = pa.array([[1, None, 3], [], None, [4]], type=pa.list_(pa.int32()))
+        big = pa.array([["a"], None, [], ["b", None]], type=pa.large_list(pa.string()))
+        grid = pa.array([[1.5, 2.5], None, [3.5, 4.5], [None, 6.5]], type=pa.list_(pa.float64(), 2))
+        people = pa.array([{"n": 1, "s": "one"}, None, {"n": None, "s": "three"}, {"n": 4, "s": None}],
+                          type=pa.struct([("n", pa.int64()), ("s", pa.string())]))
+        # A struct whose stored children are not null where the struct itself is.
+        people = pa.StructArray.from_arrays(
+            [pa.array([1, 2, None, 4], type=pa.int64()), pa.array(["one", "two", "three", None])],
+            names=["n", "s"], mask=pa.array([False, True, False, False]))
+        lookup = pa.array([[("a", 1), ("b", None)], [], None, [("c", 3)]],
+                          type=pa.map_(pa.string(), pa.int32()))
+        deep = pa.array([[[1, 2], None], [], None, [[]]], type=pa.list_(pa.list_(pa.int64())))
+        batch = pa.record_batch([lists, big, grid, people, lookup, deep],
+                                names=["lists", "big", "grid", "people", "lookup", "deep"])
+        with pa.ipc.new_file(sys.argv[1], batch.schema) as w:
+            w.write_batch(batch)
+        with pa.ipc.new_stream(sys.argv[2], batch.schema) as w:
+            w.write_batch(batch)
+        print("ok")
+        """
+        XCTAssertEqual(try runPython(script, [fileURL.path, streamURL.path]).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
+
+        for url in [fileURL, streamURL] {
+            let reader = try ArrowIPCReader(url: url)
+            XCTAssertEqual(reader.schema.names, ["lists", "big", "grid", "people", "lookup", "deep"])
+            let batch = try reader.batch(at: 0)
+            XCTAssertEqual(batch.length, 4)
+            XCTAssertEqual(render(try XCTUnwrap(batch["lists"])), "[1, null, 3], [], null, [4]")
+            XCTAssertEqual(render(try XCTUnwrap(batch["big"])), "[\"a\"], null, [], [\"b\", null]")
+            XCTAssertEqual(render(try XCTUnwrap(batch["grid"])), "[1.5, 2.5], null, [3.5, 4.5], [null, 6.5]")
+            XCTAssertEqual(render(try XCTUnwrap(batch["people"])),
+                           "{n: 1, s: \"one\"}, null, {n: null, s: \"three\"}, {n: 4, s: null}")
+            XCTAssertEqual(render(try XCTUnwrap(batch["lookup"])),
+                           "{\"a\": 1, \"b\": null}, {}, null, {\"c\": 3}")
+            XCTAssertEqual(render(try XCTUnwrap(batch["deep"])), "[[1, 2], null], [], null, [[]]")
+            // The struct's own nulls do not erase the children pyarrow stored under them.
+            let people = try XCTUnwrap(batch["people"]?.asStruct)
+            XCTAssertEqual(people.nullCount, 1)
+            XCTAssertEqual(people.children[0].asInt64?.toArray(), [1, 2, nil, 4])
+            XCTAssertEqual(try XCTUnwrap(batch["lookup"]?.asMap).keys.asString?.toArray(), ["a", "b", "c"])
+        }
+    }
+
+    /// The flat types the reader used to refuse, as pyarrow writes them: the four decimal widths,
+    /// `fixed_size_binary`, `float16`, `null`, `interval[month_day_nano]`, both unions and run-end
+    /// encoding.
+    func testWeReadTheRemainingTypesPyarrowWrites() throws {
+        _ = try requirePython()
+        let fileURL = temporaryFile()
+        let streamURL = temporaryFile("arrows")
+        defer {
+            try? FileManager.default.removeItem(at: fileURL)
+            try? FileManager.default.removeItem(at: streamURL)
+        }
+        let script = """
+        import sys, pyarrow as pa
+        from decimal import Decimal
+        d128 = pa.array([Decimal("1.234"), None, Decimal("-56.789")], type=pa.decimal128(18, 3))
+        d256 = pa.array([Decimal("0.01"), Decimal("-2.00"), None], type=pa.decimal256(40, 2))
+        d32 = pa.array([Decimal("1.23"), None, Decimal("-4.56")], type=pa.decimal32(9, 2))
+        d64 = pa.array([Decimal("123.4567"), None, Decimal("-0.0089")], type=pa.decimal64(18, 4))
+        fixed = pa.array([b"abc", None, b"xyz"], type=pa.binary(3))
+        half = pa.array([1.5, None, -2.25], type=pa.float16())
+        nothing = pa.nulls(3)
+        span = pa.array([pa.MonthDayNano([1, 2, 3]), None, pa.MonthDayNano([-4, -5, -6])],
+                        type=pa.month_day_nano_interval())
+        dense = pa.UnionArray.from_dense(pa.array([0, 1, 0], type=pa.int8()),
+                                         pa.array([0, 0, 1], type=pa.int32()),
+                                         [pa.array([10, None], type=pa.int32()), pa.array(["x"])],
+                                         ["ints", "text"])
+        sparse = pa.UnionArray.from_sparse(pa.array([0, 1, 1], type=pa.int8()),
+                                           [pa.array([1, 2, 3], type=pa.int32()),
+                                            pa.array(["p", "q", None])],
+                                           ["ints", "text"])
+        runs = pa.RunEndEncodedArray.from_arrays(pa.array([2, 3], type=pa.int32()),
+                                                 pa.array(["aa", None]))
+        batch = pa.record_batch([d128, d256, d32, d64, fixed, half, nothing, span, dense, sparse, runs],
+                                names=["d128", "d256", "d32", "d64", "fixed", "half", "nothing",
+                                       "span", "dense", "sparse", "runs"])
+        with pa.ipc.new_file(sys.argv[1], batch.schema) as w:
+            w.write_batch(batch)
+        with pa.ipc.new_stream(sys.argv[2], batch.schema) as w:
+            w.write_batch(batch)
+        print("ok")
+        """
+        XCTAssertEqual(try runPython(script, [fileURL.path, streamURL.path]).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
+
+        for url in [fileURL, streamURL] {
+            let reader = try ArrowIPCReader(url: url)
+            XCTAssertEqual(reader.schema["d128"]?.type, .decimal(precision: 18, scale: 3, bits: 128))
+            XCTAssertEqual(reader.schema["d256"]?.type, .decimal(precision: 40, scale: 2, bits: 256))
+            XCTAssertEqual(reader.schema["d32"]?.type, .decimal(precision: 9, scale: 2, bits: 32))
+            XCTAssertEqual(reader.schema["d64"]?.type, .decimal(precision: 18, scale: 4, bits: 64))
+            XCTAssertEqual(reader.schema["fixed"]?.type, .fixedSizeBinary(byteWidth: 3))
+            XCTAssertEqual(reader.schema["half"]?.type, .float16)
+            XCTAssertEqual(reader.schema["nothing"]?.type, .null)
+            XCTAssertEqual(reader.schema["span"]?.type, .interval(.monthDayNano))
+            let batch = try reader.batch(at: 0)
+            // The unscaled integers are what the engine holds; pyarrow's scale is in the type.
+            XCTAssertEqual(try XCTUnwrap(batch["d128"]?.asDecimal).toArray().map { $0?.description },
+                           ["1234", nil, "-56789"])
+            XCTAssertEqual(try XCTUnwrap(batch["d256"]?.asDecimal).toArray().map { $0?.description },
+                           ["1", "-200", nil])
+            XCTAssertEqual(render(try XCTUnwrap(batch["d32"])), "123, null, -456")
+            XCTAssertEqual(render(try XCTUnwrap(batch["d64"])), "1234567, null, -89")
+            XCTAssertEqual(try XCTUnwrap(batch["fixed"]?.asFixedBinary).toByteArrays(),
+                           [Array("abc".utf8), nil, Array("xyz".utf8)])
+            XCTAssertEqual(try XCTUnwrap(batch["half"]?.asFloat16).toArray(), [1.5, nil, -2.25])
+            XCTAssertEqual(batch["nothing"]?.length, 3)
+            XCTAssertEqual(batch["nothing"]?.nullCount, 3)
+            XCTAssertEqual(try XCTUnwrap(batch["span"]?.asInterval).toArray(),
+                           [ArrowInterval(months: 1, days: 2, nanoseconds: 3), nil,
+                            ArrowInterval(months: -4, days: -5, nanoseconds: -6)])
+            XCTAssertEqual(render(try XCTUnwrap(batch["dense"])), "ints=10, text=\"x\", ints=null")
+            XCTAssertEqual(render(try XCTUnwrap(batch["sparse"])), "ints=1, text=\"q\", text=null")
+            XCTAssertEqual(render(try XCTUnwrap(batch["runs"])), "\"aa\", \"aa\", null")
+        }
+    }
+
+    /// LZ4_FRAME and ZSTD body compression, in both encapsulations. The values must be exactly the ones
+    /// the same data has uncompressed, including the buffers a writer leaves uncompressed (the -1 marker).
+    func testWeReadCompressedBodies() throws {
+        _ = try requirePython()
+        for codec in ["lz4", "zstd"] {
+            let fileURL = temporaryFile()
+            let streamURL = temporaryFile("arrows")
+            defer {
+                try? FileManager.default.removeItem(at: fileURL)
+                try? FileManager.default.removeItem(at: streamURL)
+            }
+            let script = """
+            import sys, pyarrow as pa
+            n = 4096
+            ints = pa.array([None if i % 7 == 0 else i for i in range(n)], type=pa.int64())
+            text = pa.array(["row-%d" % (i % 97) for i in range(n)])
+            tiny = pa.array([i % 2 == 0 for i in range(n)], type=pa.bool_())
+            nested = pa.array([[i, i + 1] for i in range(n)], type=pa.list_(pa.int32()))
+            batch = pa.record_batch([ints, text, tiny, nested], names=["ints", "text", "tiny", "nested"])
+            opts = pa.ipc.IpcWriteOptions(compression="\(codec)")
+            with pa.ipc.new_file(sys.argv[1], batch.schema, options=opts) as w:
+                w.write_batch(batch)
+            with pa.ipc.new_stream(sys.argv[2], batch.schema, options=opts) as w:
+                w.write_batch(batch)
+            print("ok")
+            """
+            XCTAssertEqual(try runPython(script, [fileURL.path, streamURL.path]).trimmingCharacters(in: .whitespacesAndNewlines),
+                           "ok", codec)
+            if codec == "zstd" && !Zstd.isAvailable { throw XCTSkip("libzstd is not installed") }
+            for url in [fileURL, streamURL] {
+                let reader = try ArrowIPCReader(url: url)
+                let batch = try reader.batch(at: 0)
+                // A compressed buffer is decompressed into fresh memory, never borrowed from the map.
+                XCTAssertFalse(reader.lastBatchWasZeroCopy, codec)
+                XCTAssertEqual(batch.length, 4096, codec)
+                XCTAssertEqual(try XCTUnwrap(batch["ints"]?.asInt64).toArray(),
+                               (0..<4096).map { $0 % 7 == 0 ? nil : Int64($0) }, codec)
+                XCTAssertEqual(try XCTUnwrap(batch["text"]?.asString).toArray(),
+                               (0..<4096).map { "row-\($0 % 97)" }, codec)
+                XCTAssertEqual(try XCTUnwrap(batch["tiny"]?.asBoolean).toArray(),
+                               (0..<4096).map { $0 % 2 == 0 }, codec)
+                let lists = try XCTUnwrap(batch["nested"]?.asList)
+                XCTAssertEqual(lists.length, 4096, codec)
+                XCTAssertEqual(render(AnyMetalArray.list(try lists.slice(offset: 4093, length: 3))),
+                               "[4093, 4094], [4094, 4095], [4095, 4096]", codec)
             }
         }
-        // An extension column is its storage type plus metadata, so that one does read back.
-        let tagged = try MetalRecordBatch(names: ["tagged"], columns: [batch.columns[batch.names.count - 1]])
-        let back = try ArrowIPCReader(data: try ArrowIPCWriter.encode([tagged], format: .file)).batch(at: 0)
-        XCTAssertEqual(back["tagged"]?.asInt64?.toArray(), [7, nil, 9, 11])
+    }
+
+    /// A stream may replace a dictionary part way through: the batches before the second
+    /// `DictionaryBatch` use the first dictionary and the ones after it use the second.
+    func testWeReadADictionaryReplacementInAStream() throws {
+        _ = try requirePython()
+        let url = temporaryFile("arrows")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let script = """
+        import sys, pyarrow as pa
+        t = pa.dictionary(pa.int32(), pa.string())
+        first = pa.record_batch([pa.array(["a", "b", "a"]).dictionary_encode().cast(t)], names=["k"])
+        second = pa.record_batch([pa.array(["x", "y", "x"]).dictionary_encode().cast(t)], names=["k"])
+        with pa.ipc.new_stream(sys.argv[1], first.schema) as w:
+            w.write_batch(first)
+            w.write_batch(second)
+        print("ok")
+        """
+        XCTAssertEqual(try runPython(script, [url.path]).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
+        let reader = try ArrowIPCReader(url: url)
+        XCTAssertEqual(reader.batchCount, 2)
+        XCTAssertEqual(try reader.batch(at: 0)["k"]?.decode().asString?.toArray(), ["a", "b", "a"])
+        XCTAssertEqual(try reader.batch(at: 1)["k"]?.decode().asString?.toArray(), ["x", "y", "x"])
+        // Random access backwards has to put the first dictionary back.
+        XCTAssertEqual(try reader.batch(at: 0)["k"]?.decode().asString?.toArray(), ["a", "b", "a"])
+    }
+
+    /// A delta dictionary appends to the one in force rather than replacing it.
+    func testWeReadADeltaDictionary() throws {
+        _ = try requirePython()
+        let url = temporaryFile("arrows")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let script = """
+        import sys, pyarrow as pa
+        t = pa.dictionary(pa.int32(), pa.string())
+        first = pa.record_batch([pa.array(["a", "b"]).dictionary_encode().cast(t)], names=["k"])
+        second = pa.record_batch([pa.array(["a", "b", "c"]).dictionary_encode().cast(t)], names=["k"])
+        opts = pa.ipc.IpcWriteOptions(emit_dictionary_deltas=True)
+        with pa.ipc.new_stream(sys.argv[1], first.schema, options=opts) as w:
+            w.write_batch(first)
+            w.write_batch(second)
+        print("ok")
+        """
+        XCTAssertEqual(try runPython(script, [url.path]).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
+        let reader = try ArrowIPCReader(url: url)
+        XCTAssertEqual(reader.batchCount, 2)
+        XCTAssertEqual(try reader.batch(at: 0)["k"]?.decode().asString?.toArray(), ["a", "b"])
+        let second = try XCTUnwrap(try reader.batch(at: 1)["k"]?.asDictionary)
+        XCTAssertEqual(second.values.asString?.toArray(), ["a", "b", "c"])
+        XCTAssertEqual(try reader.batch(at: 1)["k"]?.decode().asString?.toArray(), ["a", "b", "c"])
+    }
+
+    /// A batch that declares a buffer the schema does not account for is malformed, not a batch with
+    /// something spare to ignore. The stream here carries a one `int32` column schema (two buffers) and
+    /// a body written for a `utf8` column of the same name (three).
+    func testABatchWithAnUndeclaredBufferIsRejected() throws {
+        let intSchema = ArrowIPCSchema(fields: [ArrowIPCField(name: "a", type: .int(bits: 32, signed: true))])
+        let schemaOnly = try ArrowIPCWriter.encode([], schema: intSchema, format: .stream)
+        let strings = try MetalRecordBatch(names: ["a"], columns: [.string(try MetalStringArray(["x", "yy"]))])
+        let stringStream = try ArrowIPCWriter.encode([strings], format: .stream)
+        // Skip the string stream's own schema message: continuation, length, metadata, no body.
+        let metadataLength = Int(stringStream.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 4, as: Int32.self) })
+        var spliced = schemaOnly.dropLast(8)                       // everything but the end-of-stream marker
+        spliced.append(stringStream.dropFirst(8 + metadataLength))
+        let reader = try ArrowIPCReader(data: Data(spliced))
+        XCTAssertEqual(reader.batchCount, 1)
+        XCTAssertThrowsError(try reader.batch(at: 0)) { error in
+            guard let e = error as? ArrowIPCError, case .malformed(let message) = e else {
+                return XCTFail("expected a malformed error, got \(error)")
+            }
+            XCTAssertTrue(message.contains("3 buffers"), message)
+        }
+    }
+
+    /// A mapped file whose buffer happens to land on a page boundary is still borrowed rather than
+    /// copied. Arrow pads bodies to 8 bytes only, so the alignment has to be arranged: the padding
+    /// column's bytes shift the `int64` values buffer through every residue until one lands on a page.
+    func testMappedFilesStillBorrowPageAlignedBuffers() throws {
+        let url = temporaryFile()
+        defer { try? FileManager.default.removeItem(at: url) }
+        var borrowedAt: Int? = nil
+        for pad in stride(from: 0, through: 16384, by: 8) {
+            let batch = try MetalRecordBatch(names: ["pad", "a"], columns: [
+                .string(try MetalStringArray([String(repeating: "x", count: pad)] + Array(repeating: "", count: 8999))),
+                .int64(try MetalArray<Int64>((0..<9000).map { Int64($0) })),
+            ])
+            try ArrowIPCWriter.write([batch], to: url)
+            let reader = try ArrowIPCReader(url: url)
+            let back = try reader.batch(at: 0)
+            guard reader.lastBatchWasZeroCopy else { continue }
+            XCTAssertTrue(try XCTUnwrap(back["a"]?.asInt64).values.isBorrowed)
+            XCTAssertEqual(try XCTUnwrap(back["a"]?.asInt64).toArray(), (0..<9000).map { Int64($0) })
+            borrowedAt = pad
+            break
+        }
+        XCTAssertNotNil(borrowedAt, "no mapped batch borrowed a buffer; the zero-copy path is gone")
     }
 
     /// Reads a 1 GB file and reports throughput. Off by default; set ARROWMETAL_IPC_THROUGHPUT=1.
