@@ -4603,6 +4603,11 @@ def read_csv(path, *, read_options=None, parse_options=None, convert_options=Non
         cols = am.read_csv("trades.csv", include_columns=["price", "qty"])
         total = cols["price"].sum()          # already on the GPU
     """
+    if not isinstance(path, (str, bytes, os.PathLike)):
+        raise NotImplementedError("am.read_csv reads a file path; got %s" % type(path).__name__)
+    if os.fspath(path).lower().endswith((".gz", ".bz2", ".lz4", ".zst", ".br")):
+        # pyarrow decompresses these by extension; this reader parses the bytes as they are.
+        raise NotImplementedError("am.read_csv reads uncompressed files only; got %s" % os.fspath(path))
     o = _csv_resolve(read_options, parse_options, convert_options, dict(
         skip_rows=skip_rows, skip_rows_after_names=skip_rows_after_names, column_names=column_names,
         autogenerate_column_names=autogenerate_column_names, delimiter=delimiter, quote_char=quote_char,

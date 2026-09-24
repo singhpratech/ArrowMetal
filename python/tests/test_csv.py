@@ -5,6 +5,7 @@ tables are identical -- names, types, validity, and values (floats bit for bit) 
 messages are identical (pyarrow's serial reader, whose ragged-row message carries the row number).
 pyarrow always runs with `newlines_in_values=True`, which is the grammar ArrowMetal parses.
 """
+import io
 import os
 import random
 
@@ -345,6 +346,25 @@ def test_unsupported_options_raise(tmp_csv):
         am.read_csv(path, convert_options=C(auto_dict_encode=True))
     with pytest.raises(NotImplementedError):
         am.read_csv(path, parse_options=P(ignore_empty_lines=False))
+    with pytest.raises(NotImplementedError):
+        am.read_csv(path, read_options=R(encoding="latin1"))
+    with pytest.raises(NotImplementedError):
+        am.read_csv(path, parse_options=P(invalid_row_handler=lambda row: "skip"))
+    for t in (pa.decimal128(10, 2), pa.large_string(), pa.dictionary(pa.int32(), pa.string())):
+        with pytest.raises(NotImplementedError):
+            am.read_csv(path, column_types={"a": t})
+    with pytest.raises(NotImplementedError):
+        am.read_csv(io.BytesIO(b"a\n1\n"))
+
+
+def test_compressed_extensions_are_refused(tmp_path):
+    """pyarrow decompresses .gz / .bz2 / .lz4 / .zst / .br by extension; this reader refuses them."""
+    import gzip
+    p = tmp_path / "t.csv.gz"
+    p.write_bytes(gzip.compress(b"a\n1\n"))
+    assert pc.read_csv(str(p)).column("a").to_pylist() == [1]
+    with pytest.raises(NotImplementedError, match="uncompressed"):
+        am.read_csv(str(p))
 
 
 def test_autogenerate_with_names_is_an_error(tmp_csv):
@@ -522,7 +542,8 @@ def test_wide_file(tmp_csv):
 def test_larger_mixed_file(tmp_csv):
     rng = random.Random(11)
     kinds = ["int", "float", "bool", "date", "ts", "str", "float", "int"]
-    check(tmp_csv(_gen_csv(rng, 20000, kinds)))
+    got = check(tmp_csv(_gen_csv(rng, 20000, kinds)))
+    assert all(c.num_chunks == 1 for c in got.columns)
 
 
 def test_polars_and_duckdb_written_files(tmp_path):

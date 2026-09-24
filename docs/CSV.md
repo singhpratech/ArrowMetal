@@ -267,11 +267,13 @@ have pyarrow's names and win over the option objects.
   `test_quoted_newline_across_pyarrow_blocks` shows both.
 - **The ragged-row and conversion errors always carry `Row #N`**, which is the message pyarrow's serial
   reader (`use_threads=False`) gives; its threaded reader leaves the row number out.
-- **The table comes back as one chunk per column**, where pyarrow chunks by block; the values are equal.
+- **The table comes back with one chunk per column**, where pyarrow's has one chunk per block it read; the
+  tests compare values, not chunking.
 - **Not supported yet**, each raising `NotImplementedError` from Python rather than reading differently:
   `escape_char`, `ignore_empty_lines=False`, `timestamp_parsers`, `auto_dict_encode`, an `encoding` other
   than UTF-8, `invalid_row_handler`, and `column_types` outside the list above (decimals, dictionaries,
-  the large types).
+  the large types). The input is a file path; pyarrow also takes file objects, and decompresses a path
+  ending in `.gz`, `.bz2`, `.lz4`, `.zst` or `.br`, which `am.read_csv` refuses (`test_compressed_extensions_are_refused`).
 
 ## Tests
 
