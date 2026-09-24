@@ -49,7 +49,7 @@ enum CSVSource {
         uint nBlocks;
         uint delim;
         uint quote;          // 256 when quoting is off
-        uint pad0;
+        uint base;           // dataStart rounded down to 16: block b starts at base + b * blockBytes
         uint pad1;
         uint trans[4];       // per byte class: next state of each of the 5 states, 3 bits apiece
         uint emit[4];        // per byte class: 5-bit mask of the states that emit a boundary on it
@@ -66,13 +66,36 @@ enum CSVSource {
         return 0u;
     }
 
+    // Visits the bytes [from, to) of `data` in order as `ch`, sixteen per load where the position is
+    // 16-byte aligned (block starts are, except the first block's, when blockBytes is a multiple of 16).
+    #define CSV_FOR_BYTES(from, to, ...) \\
+        for (uint pos = (from); pos < (to); ) { \\
+            if ((pos & 15u) == 0u && pos + 16u <= (to)) { \\
+                uint4 v16 = *(device const uint4*)(data + pos); \\
+                for (uint q = 0u; q < 16u; q++, pos++) { \\
+                    uint ch = (v16[q >> 2] >> ((q & 3u) * 8u)) & 0xFFu; \\
+                    __VA_ARGS__ \\
+                } \\
+            } else { \\
+                uint ch = data[pos]; \\
+                __VA_ARGS__ \\
+                pos++; \\
+            } \\
+        }
+
+    inline uint2 csv_block(uint b, constant CsvScan& P) {
+        uint lo = max(P.dataStart, P.base + b * P.blockBytes);
+        uint hi = min(P.base + (b + 1u) * P.blockBytes, P.dataEnd);
+        return uint2(lo, max(lo, hi));
+    }
+
     kernel void csv_summarize(device const uchar* data [[buffer(0)]],
                               constant CsvScan& P [[buffer(1)]],
                               device BlockSum* out [[buffer(2)]],
                               uint b [[thread_position_in_grid]]) {
         if (b >= P.nBlocks) return;
-        uint lo = P.dataStart + b * P.blockBytes;
-        uint hi = min(lo + P.blockBytes, P.dataEnd);
+        uint2 span = csv_block(b, P);
+        uint lo = span.x, hi = span.y;
         uint s0 = 0u, s1 = 1u, s2 = 2u, s3 = 3u, s4 = 4u;
         uint c0 = 0u, c1 = 0u, c2 = 0u, c3 = 0u, c4 = 0u;
         // All five runs until they have collapsed onto at most two states (in practice: the first
@@ -81,16 +104,17 @@ enum CSVSource {
         bool merged = false;
         uint a = 0u, bb = 0u;
         while (i < hi) {
-            uint stop = min(i + 16u, hi);
-            for (; i < stop; i++) {
-                uint k = csv_class(data[i], P);
+            uint stop = min((i + 16u) & ~15u, hi);
+            CSV_FOR_BYTES(i, stop, {
+                uint k = csv_class((uchar)ch, P);
                 uint t = P.trans[k], e = P.emit[k];
                 c0 += (e >> s0) & 1u; s0 = (t >> (3u * s0)) & 7u;
                 c1 += (e >> s1) & 1u; s1 = (t >> (3u * s1)) & 7u;
                 c2 += (e >> s2) & 1u; s2 = (t >> (3u * s2)) & 7u;
                 c3 += (e >> s3) & 1u; s3 = (t >> (3u * s3)) & 7u;
                 c4 += (e >> s4) & 1u; s4 = (t >> (3u * s4)) & 7u;
-            }
+            })
+            i = stop;
             a = s0; bb = s0;
             bool two = true;
             uint ss[4] = {s1, s2, s3, s4};
@@ -102,12 +126,12 @@ enum CSVSource {
         // ... then only the (at most) two distinct runs, each standing for the runs that share its state.
         if (merged && i < hi) {
             uint sa = a, sb = bb, ca = 0u, cb = 0u;
-            for (; i < hi; i++) {
-                uint k = csv_class(data[i], P);
+            CSV_FOR_BYTES(i, hi, {
+                uint k = csv_class((uchar)ch, P);
                 uint t = P.trans[k], e = P.emit[k];
                 ca += (e >> sa) & 1u; sa = (t >> (3u * sa)) & 7u;
                 cb += (e >> sb) & 1u; sb = (t >> (3u * sb)) & 7u;
-            }
+            })
             if (s0 == a) { c0 += ca; s0 = sa; } else { c0 += cb; s0 = sb; }
             if (s1 == a) { c1 += ca; s1 = sa; } else { c1 += cb; s1 = sb; }
             if (s2 == a) { c2 += ca; s2 = sa; } else { c2 += cb; s2 = sb; }
@@ -224,13 +248,12 @@ enum CSVSource {
             off += p.cnt[st];
             st = (p.ends >> (3u * st)) & 7u;
         }
-        uint lo = P.dataStart + b * P.blockBytes;
-        uint hi = min(lo + P.blockBytes, P.dataEnd);
-        for (uint i = lo; i < hi; i++) {
-            uint k = csv_class(data[i], P);
-            if ((P.emit[k] >> st) & 1u) events[off++] = i | (k == 1u ? 0u : 0x80000000u);
+        uint2 span = csv_block(b, P);
+        CSV_FOR_BYTES(span.x, span.y, {
+            uint k = csv_class((uchar)ch, P);
+            if ((P.emit[k] >> st) & 1u) events[off++] = pos | (k == 1u ? 0u : 0x80000000u);
             st = (P.trans[k] >> (3u * st)) & 7u;
-        }
+        })
     }
 
     // ------------------------------------------------------------------ columns
