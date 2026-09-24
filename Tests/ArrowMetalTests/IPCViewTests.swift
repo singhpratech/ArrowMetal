@@ -236,6 +236,45 @@ final class IPCViewTests: XCTestCase {
         XCTAssertEqual(try runPython(check, [scriptFile.path] + outputs.map(\.path)), "ok")
     }
 
+    /// Batches past one 64K-row block, which the reader materialises on several cores at once: strings
+    /// of every length class (empty, inline, short and long out-of-line, null) across block edges, and an
+    /// out-of-order list view whose gather indices are written block by block.
+    func testLargeViewBatchesSpanSeveralBlocks() throws {
+        let input = temporaryFile("arrows"), output = temporaryFile()
+        defer { for u in [input, output] { try? FileManager.default.removeItem(at: u) } }
+        let script = """
+        import sys, numpy as np, pyarrow as pa
+        n = 200_003
+        lengths = [0, 3, 12, 13, 31, 32, 33, 200]
+        sv = pa.array([None if i % 11 == 5 else (("%07d" % i) * 40)[:lengths[(i * 7) % 8]] for i in range(n)],
+                      pa.string_view())
+        rng = np.random.default_rng(3)
+        sizes = rng.integers(0, 6, n).astype(np.int32)
+        offsets = rng.integers(0, 500_000 - 6, n).astype(np.int32)
+        lv = pa.ListViewArray.from_arrays(pa.array(offsets), pa.array(sizes), pa.array(np.arange(500_000, dtype=np.int64)),
+                                          mask=pa.array([i % 13 == 0 for i in range(n)]))
+        batch = pa.record_batch([sv, lv], names=["sv", "lv"])
+        with pa.ipc.new_stream(sys.argv[1], batch.schema) as w:
+            w.write_batch(batch)
+        print("ok")
+        """
+        XCTAssertEqual(try runPython(script, [input.path]), "ok")
+        let batches = try ArrowIPCReader(url: input).readAll()
+        XCTAssertEqual(batches.map(\.length), [200_003])
+        try ArrowIPCWriter.write(batches, to: output)
+        let check = """
+        import sys, pyarrow as pa
+        src = pa.ipc.open_stream(sys.argv[1]).read_all()
+        got = pa.ipc.open_file(sys.argv[2]).read_all()
+        assert got.column("sv").type == pa.string()
+        assert got.column("sv").equals(src.column("sv").cast(pa.string()))
+        assert got.column("lv").type == pa.list_(pa.int64())
+        assert got.column("lv").to_pylist() == src.column("lv").to_pylist()
+        print("ok")
+        """
+        XCTAssertEqual(try runPython(check, [input.path, output.path]), "ok")
+    }
+
     /// The writer never writes a view type, even when the schema it is handed names one.
     func testViewTypesInAnExplicitSchemaWriteClassicTypes() throws {
         let batch = try MetalRecordBatch(names: ["s"], columns: [.string(try MetalStringArray(["a", nil, "bcd"]))])

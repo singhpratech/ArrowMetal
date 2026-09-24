@@ -1177,70 +1177,124 @@ public final class ArrowIPCReader {
 
     /// Materialises a `utf8_view` / `binary_view` column into the offsets-plus-data layout.
     ///
-    /// A tight CPU pass: one walk over the 16-byte views turns lengths into int32 offsets (checking
-    /// every out-of-line view against the data buffer it names), then one copy per non-empty row moves
-    /// the bytes from the view itself (12 bytes or fewer) or from its data buffer. A null row
-    /// contributes no bytes whatever its view says. The engine has no GPU kernel that reads views.
+    /// A tight CPU pass, sharded over the cores in blocks of 64K rows. The first walk over the 16-byte
+    /// views turns lengths into int32 offsets (checking every out-of-line view against the data buffer
+    /// it names); the second copies the bytes: a fixed 12-byte move for an inline view, whole words for
+    /// a short out-of-line one and a `memcpy` for any other. A null row contributes no bytes whatever
+    /// its view says. The engine has no GPU kernel that reads views, and the views and data buffers of
+    /// a mapped file are not GPU-visible memory until copied.
     private func materialiseViews(_ body: ArrowIPCMessageBody, views slot: Int, data dataSlots: [Int], length: Int,
                                   nulls: Int, validity: MetalArrowBuffer?, name: String) throws -> MetalStringArray {
         let offsets = try MetalArrowBuffer.allocate(byteCount: (length + 1) * 4, zeroed: false, context: context)
         let o = offsets.mutableTyped(Int32.self)
         o[0] = 0
-        var total = 0
-        var views: UnsafeRawPointer? = nil
-        var buffers: [(start: UnsafeRawPointer?, count: Int)] = []
-        if length > 0 {
-            let have = byteCount(body, slot)
-            guard have >= length * 16 else {
-                throw ArrowIPCError.malformed("view column '\(name)' holds \(have) bytes of views where \(length * 16) are needed")
-            }
-            let v = try pointer(body, slot)
-            views = v
-            buffers = try dataSlots.map { i in
-                let n = byteCount(body, i)
-                return (n > 0 ? try pointer(body, i) : nil, n)
-            }
-            let valid = validity?.typed(UInt8.self)
-            for i in 0..<length {
-                if let valid, !Bitmap.isSet(valid, i) { o[i + 1] = Int32(total); continue }
-                let at = i * 16
-                let n = Int(v.loadUnaligned(fromByteOffset: at, as: Int32.self))
-                guard n >= 0 else { throw ArrowIPCError.malformed("view \(i) of column '\(name)' has a negative length") }
-                if n > 12 {
-                    let b = Int(v.loadUnaligned(fromByteOffset: at + 8, as: Int32.self))
-                    let off = Int(v.loadUnaligned(fromByteOffset: at + 12, as: Int32.self))
-                    guard b >= 0, b < buffers.count, off >= 0, off + n <= buffers[b].count else {
-                        throw ArrowIPCError.malformed(
-                            "view \(i) of column '\(name)' points at bytes \(off)..<\(off + n) of data buffer \(b), "
-                            + "outside the buffers the batch holds")
-                    }
-                }
-                total += n
-                guard total <= Int(Int32.max) else {
-                    throw ArrowIPCError.unsupported(
-                        "view column '\(name)' over 2 GB: the engine's utf8 and binary arrays have 32-bit offsets")
-                }
-                o[i + 1] = Int32(total)
+        guard length > 0 else {
+            return MetalStringArray(length: 0, nullCount: 0, validity: nil, offsets: offsets,
+                                    data: try MetalArrowBuffer.allocate(byteCount: 0, context: context), context: context)
+        }
+        let have = byteCount(body, slot)
+        guard have >= length * 16 else {
+            throw ArrowIPCError.malformed("view column '\(name)' holds \(have) bytes of views where \(length * 16) are needed")
+        }
+        let v = try pointer(body, slot)
+        let starts: [UnsafeRawPointer?] = try dataSlots.map { byteCount(body, $0) > 0 ? try pointer(body, $0) : nil }
+        let sizes: [Int] = dataSlots.map { byteCount(body, $0) }
+        let valid = validity?.typed(UInt8.self)
+        let block = 1 << 16
+        let blocks = (length + block - 1) / block
+        func each(_ body: (Int, Range<Int>) -> Void) {
+            if blocks == 1 { return body(0, 0..<length) }
+            DispatchQueue.concurrentPerform(iterations: blocks) { k in
+                body(k, (k * block)..<Swift.min(length, (k + 1) * block))
             }
         }
-        let data = try MetalArrowBuffer.allocate(byteCount: total, zeroed: false, context: context)
-        if total > 0, let v = views {
-            let d = data.mutableTyped(UInt8.self)
-            for i in 0..<length {
-                let start = Int(o[i]), n = Int(o[i + 1]) - start
+
+        // Pass 1: each block's lengths to offsets relative to the block, then every block moved to its
+        // place. `failures` keeps the first bad view of each block.
+        var blockTotals = [Int](repeating: 0, count: blocks)
+        var failures = [ArrowIPCError?](repeating: nil, count: blocks)
+        blockTotals.withUnsafeMutableBufferPointer { totals in
+            failures.withUnsafeMutableBufferPointer { errors in
+                each { k, rows in
+                    var total = 0
+                    for i in rows {
+                        let at = i &* 16
+                        var n = Int(v.loadUnaligned(fromByteOffset: at, as: Int32.self))
+                        if let valid, !Bitmap.isSet(valid, i) {
+                            n = 0
+                        } else if n > 12 {
+                            let b = Int(v.loadUnaligned(fromByteOffset: at + 8, as: Int32.self))
+                            let off = Int(v.loadUnaligned(fromByteOffset: at + 12, as: Int32.self))
+                            guard b >= 0, b < sizes.count, off >= 0, off + n <= sizes[b] else {
+                                errors[k] = .malformed(
+                                    "view \(i) of column '\(name)' points at bytes \(off)..<\(off + n) of data buffer \(b), "
+                                    + "outside the buffers the batch holds")
+                                return
+                            }
+                        } else if n < 0 {
+                            errors[k] = .malformed("view \(i) of column '\(name)' has a negative length")
+                            return
+                        }
+                        total &+= n
+                        o[i + 1] = Int32(truncatingIfNeeded: total)
+                    }
+                    totals[k] = total
+                }
+            }
+        }
+        if let first = failures.first(where: { $0 != nil }) { throw first! }
+        var bases = [Int](repeating: 0, count: blocks)
+        var total = 0
+        for k in 0..<blocks { bases[k] = total; total += blockTotals[k] }
+        guard total <= Int(Int32.max) else {
+            throw ArrowIPCError.unsupported(
+                "view column '\(name)' over 2 GB: the engine's utf8 and binary arrays have 32-bit offsets")
+        }
+        if blocks > 1 {
+            each { k, rows in
+                let base = Int32(bases[k])
+                if base != 0 { for i in rows { o[i + 1] &+= base } }
+            }
+        }
+
+        // Pass 2: the bytes. Short rows move whole words; whatever lands past a row's end is overwritten
+        // by the next row of the same block, so the last row of every block is copied exactly, and the
+        // 32 spare bytes at the end of the buffer are never needed.
+        let data = try MetalArrowBuffer.allocate(byteCount: total + 32, zeroed: false, context: context)
+        let d = data.mutableTyped(UInt8.self)
+        let raw = UnsafeMutableRawPointer(d)
+        each { _, rows in
+            for i in rows {
+                let start = Int(o[i]), n = Int(o[i + 1]) &- start
                 guard n > 0 else { continue }
-                let at = i * 16
+                let at = i &* 16
+                let last = i == rows.upperBound - 1
+                let src: UnsafeRawPointer
+                let readable: Int
                 if n <= 12 {
-                    memcpy(d + start, v.advanced(by: at + 4), n)
+                    src = v.advanced(by: at + 4)
+                    readable = 12
                 } else {
                     let b = Int(v.loadUnaligned(fromByteOffset: at + 8, as: Int32.self))
                     let off = Int(v.loadUnaligned(fromByteOffset: at + 12, as: Int32.self))
-                    memcpy(d + start, buffers[b].start!.advanced(by: off), n)
+                    src = starts[b]!.advanced(by: off)
+                    readable = sizes[b] - off
+                }
+                if !last && n <= 12 {
+                    raw.storeBytes(of: src.loadUnaligned(as: UInt64.self), toByteOffset: start, as: UInt64.self)
+                    raw.storeBytes(of: src.loadUnaligned(fromByteOffset: 8, as: UInt32.self), toByteOffset: start + 8, as: UInt32.self)
+                } else if !last && n <= 32 && readable >= 32 {
+                    for w in stride(from: 0, to: n, by: 8) {
+                        raw.storeBytes(of: src.loadUnaligned(fromByteOffset: w, as: UInt64.self),
+                                       toByteOffset: start + w, as: UInt64.self)
+                    }
+                } else {
+                    memcpy(d + start, src, n)
                 }
             }
         }
-        let a = MetalStringArray(length: length, nullCount: 0, validity: validity, offsets: offsets, data: data,
-                                 context: context)
+        let a = MetalStringArray(length: length, nullCount: 0, validity: validity, offsets: offsets,
+                                 data: data.view(byteOffset: 0, byteCount: total), context: context)
         if nulls < 0 { a.recomputeNullCount() } else { a.setNullCount(nulls) }
         return a
     }
@@ -1251,69 +1305,41 @@ public final class ArrowIPCReader {
     /// One CPU pass over the offsets and sizes checks every row against the child and decides between two
     /// cases. When the valid, non-empty rows are already consecutive and in order (what a `list` cast to
     /// `list_view` gives), the offsets are derived and the child is used as it is, with no copy.
-    /// Otherwise the rows are gathered from the child with the engine's `take`, which is a GPU gather
-    /// for primitive and string children. A null row contributes no child elements whatever its size says.
+    /// Otherwise a second pass, sharded over the cores, writes the child index of every element and the
+    /// rows are gathered from the child with the engine's `take`, a GPU gather for primitive and string
+    /// children. A
+    /// null row contributes no child elements whatever its size says.
     private func materialiseListView(_ body: ArrowIPCMessageBody, offsets offsetSlot: Int, sizes sizeSlot: Int,
                                      large: Bool, length: Int, nulls: Int, validity: MetalArrowBuffer?,
                                      child: AnyMetalArray, fieldName: String, name: String) throws -> MetalListArray {
-        let width = large ? 8 : 4
         let out = try MetalArrowBuffer.allocate(byteCount: (length + 1) * 4, zeroed: false, context: context)
         let o = out.mutableTyped(Int32.self)
         o[0] = 0
         var values = child
         if length > 0 {
+            let width = large ? 8 : 4
             for (slot, what) in [(offsetSlot, "offsets"), (sizeSlot, "sizes")] where byteCount(body, slot) < length * width {
                 throw ArrowIPCError.malformed("list view column '\(name)' has a short \(what) buffer")
             }
-            let offs = try pointer(body, offsetSlot), sizes = try pointer(body, sizeSlot)
-            func load(_ p: UnsafeRawPointer, _ i: Int) -> Int64 {
-                large ? p.loadUnaligned(fromByteOffset: i * 8, as: Int64.self)
-                      : Int64(p.loadUnaligned(fromByteOffset: i * 4, as: Int32.self))
-            }
-            let valid = validity?.typed(UInt8.self)
-            var starts = [Int](repeating: 0, count: length)
-            var contiguous = true
-            var next: Int? = nil          // where the next non-empty row must start to keep the child consecutive
-            var base = 0, total = 0
-            for i in 0..<length {
-                var size = 0
-                if valid.map({ Bitmap.isSet($0, i) }) ?? true {
-                    let off64 = load(offs, i), size64 = load(sizes, i)
-                    guard off64 >= 0, size64 >= 0 else {
-                        throw ArrowIPCError.malformed("row \(i) of list view column '\(name)' has a negative offset or size")
-                    }
-                    guard off64 <= Int64(Int32.max), size64 <= Int64(Int32.max) else {
-                        throw ArrowIPCError.unsupported("64-bit offsets over 2 GB (column '\(name)')")
-                    }
-                    let start = Int(off64)
-                    size = Int(size64)
-                    guard start + size <= child.length else {
-                        throw ArrowIPCError.malformed(
-                            "row \(i) of list view column '\(name)' covers child elements \(start)..<\(start + size) "
-                            + "of a \(child.length) element child")
-                    }
-                    starts[i] = start
-                    if size > 0 {
-                        if let n = next { if start != n { contiguous = false } } else { base = start }
-                        next = start + size
-                    }
-                }
-                total += size
-                guard total <= Int(Int32.max) else {
-                    throw ArrowIPCError.unsupported("64-bit offsets over 2 GB (column '\(name)')")
-                }
-                o[i + 1] = Int32(total)
-            }
-            if contiguous {
-                // Every non-empty row starts where the previous one ended: point the offsets into the child.
-                if base > 0 { for i in 0...length { o[i] += Int32(base) } }
-            } else {
+            let offs = try pointer(body, offsetSlot), lens = try pointer(body, sizeSlot)
+            let gather = large
+                ? try listViewOffsets(Int64.self, offs, lens, o, length: length, validity: validity, child: child.length, name: name)
+                : try listViewOffsets(Int32.self, offs, lens, o, length: length, validity: validity, child: child.length, name: name)
+            if gather {
+                let total = Int(o[length])
                 let indices = try MetalArrowBuffer.allocate(byteCount: Swift.max(total, 1) * 4, zeroed: false,
                                                             context: context)
                 let p = indices.mutableTyped(Int32.self)
-                for i in 0..<length {
-                    let from = Int(o[i]), n = Int(o[i + 1]) - from
-                    for k in 0..<n { p[from + k] = Int32(starts[i] + k) }
+                // Rows write disjoint ranges of the index buffer, so blocks of rows run on all cores.
+                let block = 1 << 16
+                DispatchQueue.concurrentPerform(iterations: (length + block - 1) / block) { b in
+                    for i in (b * block)..<Swift.min(length, (b + 1) * block) {
+                        let from = Int(o[i]), n = Int(o[i + 1]) &- from
+                        guard n > 0 else { continue }
+                        let start = large ? Int(offs.loadUnaligned(fromByteOffset: i &* 8, as: Int64.self))
+                                          : Int(offs.loadUnaligned(fromByteOffset: i &* 4, as: Int32.self))
+                        for k in 0..<n { p[from &+ k] = Int32(truncatingIfNeeded: start &+ k) }
+                    }
                 }
                 let idx = MetalArray<Int32>(length: total, nullCount: 0, validity: nil, values: indices, context: context)
                 values = try child.take(idx)
@@ -1321,6 +1347,45 @@ public final class ArrowIPCReader {
         }
         return try makeList(length: length, nulls: nulls, validity: validity, offsets: out, child: values,
                             kind: .variable, fieldName: fieldName, name: name)
+    }
+
+    /// The first pass of `materialiseListView`: writes the list offsets of the rows' sizes into `o` and
+    /// returns whether the child has to be gathered (false when the rows are consecutive and in order,
+    /// in which case `o` already points into the child as it is).
+    private func listViewOffsets<T: FixedWidthInteger & SignedInteger>(
+        _: T.Type, _ offs: UnsafeRawPointer, _ lens: UnsafeRawPointer, _ o: UnsafeMutablePointer<Int32>,
+        length: Int, validity: MetalArrowBuffer?, child childLength: Int, name: String) throws -> Bool {
+        let w = MemoryLayout<T>.size
+        let valid = validity?.typed(UInt8.self)
+        var contiguous = true
+        var next = -1             // where the next non-empty row must start to keep the child consecutive
+        var base = 0, total = 0
+        for i in 0..<length {
+            if let valid, !Bitmap.isSet(valid, i) { o[i + 1] = Int32(truncatingIfNeeded: total); continue }
+            let start = Int(offs.loadUnaligned(fromByteOffset: i &* w, as: T.self))
+            let size = Int(lens.loadUnaligned(fromByteOffset: i &* w, as: T.self))
+            guard start >= 0, size >= 0 else {
+                throw ArrowIPCError.malformed("row \(i) of list view column '\(name)' has a negative offset or size")
+            }
+            guard start <= Int(Int32.max), size <= Int(Int32.max) else {
+                throw ArrowIPCError.unsupported("64-bit offsets over 2 GB (column '\(name)')")
+            }
+            guard start + size <= childLength else {
+                throw ArrowIPCError.malformed(
+                    "row \(i) of list view column '\(name)' covers child elements \(start)..<\(start + size) "
+                    + "of a \(childLength) element child")
+            }
+            if size > 0 {
+                if next < 0 { base = start } else if start != next { contiguous = false }
+                next = start + size
+            }
+            total &+= size
+            o[i + 1] = Int32(truncatingIfNeeded: total)
+        }
+        guard total <= Int(Int32.max) else { throw ArrowIPCError.unsupported("64-bit offsets over 2 GB (column '\(name)')") }
+        // Consecutive rows: point the offsets at the child as it is.
+        if contiguous, base > 0 { for i in 0...length { o[i] &+= Int32(base) } }
+        return !contiguous
     }
 
     /// Every type whose values are in its own buffers: the primitives, bool, utf8 / binary, the
