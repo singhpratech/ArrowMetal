@@ -237,8 +237,8 @@ final class IPCViewTests: XCTestCase {
     }
 
     /// Batches past one 64K-row block, which the reader materialises on several cores at once: strings
-    /// of every length class (empty, inline, short and long out-of-line, null) across block edges, and an
-    /// out-of-order list view whose gather indices are written block by block.
+    /// of every length class (empty, inline, short and long out-of-line, null), blocks that end in
+    /// empty and null rows, and an out-of-order list view whose gather indices are written block by block.
     func testLargeViewBatchesSpanSeveralBlocks() throws {
         let input = temporaryFile("arrows"), output = temporaryFile()
         defer { for u in [input, output] { try? FileManager.default.removeItem(at: u) } }
@@ -246,8 +246,12 @@ final class IPCViewTests: XCTestCase {
         import sys, numpy as np, pyarrow as pa
         n = 200_003
         lengths = [0, 3, 12, 13, 31, 32, 33, 200]
-        sv = pa.array([None if i % 11 == 5 else (("%07d" % i) * 40)[:lengths[(i * 7) % 8]] for i in range(n)],
-                      pa.string_view())
+        def text(i):
+            # The last rows of each 64K block are empty or null, so a block's last bytes belong to a short row.
+            if i % 65536 >= 65533:
+                return [None, "", "ab"][i % 3]
+            return None if i % 11 == 5 else (("%07d" % i) * 40)[:lengths[(i * 7) % 8]]
+        sv = pa.array([text(i) for i in range(n)], pa.string_view())
         rng = np.random.default_rng(3)
         sizes = rng.integers(0, 6, n).astype(np.int32)
         offsets = rng.integers(0, 500_000 - 6, n).astype(np.int32)

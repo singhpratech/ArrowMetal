@@ -29,23 +29,26 @@ import pyarrow as pa
 import arrowmetal as am
 
 
-def layouts(rows, rng):
+LAYOUTS = ["string", "string_view", "list_int64", "list_view_int64_in_order", "list_view_int64_shuffled"]
+
+
+def batch_arrays(rows, rng):
+    """One batch of every layout over the same values. Each batch owns its child, so a list view file
+    holds exactly the child elements its rows cover, as the list file does."""
     words = np.array(["w%07d" % i for i in range(1000)] + ["a much longer string value %06d" % i for i in range(1000)])
-    text = pa.array(words[rng.integers(0, len(words), rows)])
+    text = pa.array(words[rng.integers(0, len(words), rows)].tolist(), pa.string())
     sizes = rng.integers(0, 8, rows).astype(np.int32)
     offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int32)
     child = pa.array(rng.integers(0, 1 << 40, int(offsets[-1])), pa.int64())
-    lists = pa.ListArray.from_arrays(pa.array(offsets), child)
-    in_order = pa.ListViewArray.from_arrays(pa.array(offsets[:-1]), pa.array(sizes), child)
     perm = rng.permutation(rows)
-    shuffled = pa.ListViewArray.from_arrays(pa.array(offsets[:-1][perm]), pa.array(sizes[perm]), child)
-    return [
-        ("string", text),
-        ("string_view", text.cast(pa.string_view())),
-        ("list_int64", lists),
-        ("list_view_int64_in_order", in_order),
-        ("list_view_int64_shuffled", shuffled),
-    ]
+    return {
+        "string": text,
+        "string_view": text.cast(pa.string_view()),
+        "list_int64": pa.ListArray.from_arrays(pa.array(offsets), child),
+        "list_view_int64_in_order": pa.ListViewArray.from_arrays(pa.array(offsets[:-1]), pa.array(sizes), child),
+        "list_view_int64_shuffled": pa.ListViewArray.from_arrays(pa.array(offsets[:-1][perm]),
+                                                                 pa.array(sizes[perm]), child),
+    }
 
 
 def ours_read(path):
@@ -71,12 +74,18 @@ def main():
     rng = np.random.default_rng(42)
     rows_out = []
     with tempfile.TemporaryDirectory() as tmp:
-        for name, array in layouts(args.rows, rng):
+        writers = {}
+        for start in range(0, args.rows, args.batch_rows):
+            arrays = batch_arrays(min(args.batch_rows, args.rows - start), rng)
+            for name in LAYOUTS:
+                batch = pa.record_batch([arrays[name]], names=["c"])
+                if name not in writers:
+                    writers[name] = pa.ipc.new_file(os.path.join(tmp, name + ".arrow"), batch.schema)
+                writers[name].write_batch(batch)
+        for w in writers.values():
+            w.close()
+        for name in LAYOUTS:
             path = os.path.join(tmp, name + ".arrow")
-            table = pa.table({"c": array})
-            with pa.ipc.new_file(path, table.schema) as w:
-                for b in table.to_batches(max_chunksize=args.batch_rows):
-                    w.write_batch(b)
             size = os.path.getsize(path)
             assert ours_read(path) == args.rows, name
             ours = best(lambda: ours_read(path), args.iters)

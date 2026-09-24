@@ -1257,33 +1257,34 @@ public final class ArrowIPCReader {
             }
         }
 
-        // Pass 2: the bytes. Short rows move whole words; whatever lands past a row's end is overwritten
-        // by the next row of the same block, so the last row of every block is copied exactly, and the
-        // 32 spare bytes at the end of the buffer are never needed.
-        let data = try MetalArrowBuffer.allocate(byteCount: total + 32, zeroed: false, context: context)
+        // Pass 2: the bytes. A short row moves whole words when they fit before the end of its block's
+        // bytes: whatever lands past the row's end is then overwritten by a later row of the same block,
+        // on the same thread, and never reaches another block's rows. Anything else is a `memcpy`.
+        let data = try MetalArrowBuffer.allocate(byteCount: total, zeroed: false, context: context)
         let d = data.mutableTyped(UInt8.self)
         let raw = UnsafeMutableRawPointer(d)
         each { _, rows in
+            let blockEnd = Int(o[rows.upperBound])
             for i in rows {
                 let start = Int(o[i]), n = Int(o[i + 1]) &- start
                 guard n > 0 else { continue }
                 let at = i &* 16
-                let last = i == rows.upperBound - 1
-                let src: UnsafeRawPointer
-                let readable: Int
                 if n <= 12 {
-                    src = v.advanced(by: at + 4)
-                    readable = 12
-                } else {
-                    let b = Int(v.loadUnaligned(fromByteOffset: at + 8, as: Int32.self))
-                    let off = Int(v.loadUnaligned(fromByteOffset: at + 12, as: Int32.self))
-                    src = starts[b]!.advanced(by: off)
-                    readable = sizes[b] - off
+                    let src = v.advanced(by: at + 4)
+                    if start + 12 <= blockEnd {
+                        raw.storeBytes(of: src.loadUnaligned(as: UInt64.self), toByteOffset: start, as: UInt64.self)
+                        raw.storeBytes(of: src.loadUnaligned(fromByteOffset: 8, as: UInt32.self),
+                                       toByteOffset: start + 8, as: UInt32.self)
+                    } else {
+                        memcpy(d + start, src, n)
+                    }
+                    continue
                 }
-                if !last && n <= 12 {
-                    raw.storeBytes(of: src.loadUnaligned(as: UInt64.self), toByteOffset: start, as: UInt64.self)
-                    raw.storeBytes(of: src.loadUnaligned(fromByteOffset: 8, as: UInt32.self), toByteOffset: start + 8, as: UInt32.self)
-                } else if !last && n <= 32 && readable >= 32 {
+                let b = Int(v.loadUnaligned(fromByteOffset: at + 8, as: Int32.self))
+                let off = Int(v.loadUnaligned(fromByteOffset: at + 12, as: Int32.self))
+                let src = starts[b]!.advanced(by: off)
+                let words = (n + 7) & ~7
+                if n <= 32 && start + words <= blockEnd && off + words <= sizes[b] {
                     for w in stride(from: 0, to: n, by: 8) {
                         raw.storeBytes(of: src.loadUnaligned(fromByteOffset: w, as: UInt64.self),
                                        toByteOffset: start + w, as: UInt64.self)
@@ -1294,7 +1295,7 @@ public final class ArrowIPCReader {
             }
         }
         let a = MetalStringArray(length: length, nullCount: 0, validity: validity, offsets: offsets,
-                                 data: data.view(byteOffset: 0, byteCount: total), context: context)
+                                 data: data, context: context)
         if nulls < 0 { a.recomputeNullCount() } else { a.setNullCount(nulls) }
         return a
     }
