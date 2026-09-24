@@ -202,7 +202,7 @@ is a case in `python/tests/test_csv.py`.
 | Floats | one optional `+` or `-`; `digits[.digits]` / `.digits` with an optional exponent; `inf`, `infinity`, `nan`, `nan(chars)` in any case; spaces and tabs trimmed; no hex; `nan` is null by default because it is in `null_values`, while `NAN` is a NaN; NaN is the quiet NaN with the sign given |
 | Dates and times | `YYYY-MM-DD` validated (`2021-02-29` is a string); `hh:mm` and `hh:mm:ss` are time32[s], a fraction makes the column a string; spaces and tabs trimmed |
 | Timestamps | not trimmed; `YYYY-MM-DD` alone counts; seconds 60 and hour 24 are rejected; a fraction (up to 9 digits) makes it timestamp[ns], provided the value fits in int64 nanoseconds as Arrow computes it (whole seconds scaled first, then the fraction added: 1677-09-21 00:12:44 through 2262-04-11 23:47:16.854775807, so 1677-09-21 00:12:43.145224192 is outside), and a fractional value outside that range makes the column a string; without a fraction the column is timestamp[s] for any year; a forced timestamp[ns] column raises `invalid value` for a value outside the range; an offset or `Z` makes it UTC with the offset applied; naive and zoned values together are a string column |
-| Structure | ragged rows raise `CSV parse error: Row #N: Expected w columns, got m: <row>`, N counting skipped lines and records, not empty lines, and `<row>` the row's text when it is at most 100 bytes, otherwise its first 96 bytes and ` ...`; a header with no newline after it raises `Empty CSV file or block: cannot infer number of columns`; an empty file raises `Empty CSV file`; a BOM is skipped |
+| Structure | ragged rows raise `CSV parse error: Row #N: Expected w columns, got m: <row>`, N counting skipped lines and records, not empty lines, and `<row>` the row's text when it is at most 100 bytes, otherwise its first 96 bytes and ` ...` (a row that runs to the end of the file inside an open quote is quoted without its last line terminator, `\n`, `\r` or `\r\n`); a header with no newline after it raises `Empty CSV file or block: cannot infer number of columns`; an empty file raises `Empty CSV file`; a BOM is skipped |
 | `skip_rows` | whole lines by their terminators, quotes ignored, empty lines counted; a line with no terminator cannot be skipped |
 | `skip_rows_after_names` | rows after the header, skipped without a width check (`a,b` then `1,2,3` is skipped, not an error); a quoted newline stays inside its row; an empty line counts as one of the skipped rows; row numbers in later errors count the skipped rows |
 | `delimiter` equal to `quote_char` | accepted; the delimiter wins and no field is quoted, the same table as `quote_char=False` |
@@ -270,7 +270,12 @@ have pyarrow's names and win over the option objects.
 Column names and error messages can hold NUL bytes (a header field `a\0`, an error quoting the value
 `1\0`). The C ABI hands both out as NUL-terminated strings and also gives their byte length,
 `am_csv_batch_column_name_length` and `am_csv_last_error(&length)`; Python reads them by length, so they
-arrive whole (`test_nul_bytes_in_names_and_messages`).
+arrive whole (`test_nul_bytes_in_names_and_messages`). Option strings go in the same way: each string
+array in `am_csv_options` has a `*_lengths` array beside it (NULL means NUL-terminated strings), and Python
+fills them, so `include_columns=["a\0b"]`, a `column_types` key, `column_names`, `null_values`,
+`true_values` and `false_values` holding a NUL byte match as they do in pyarrow
+(`test_nul_bytes_in_option_strings`, `test_c_option_lengths`). A NUL `delimiter`, `quote_char` or
+`decimal_point` is refused, as pyarrow refuses it (`test_nul_option_characters_are_refused`).
 
 ## Differences from pyarrow
 
@@ -295,7 +300,8 @@ arrive whole (`test_nul_bytes_in_names_and_messages`).
   than UTF-8, `invalid_row_handler`, and every `column_types` type outside the list above, among them
   decimal, dictionary, date64, duration, float16, large_string and large_binary (pyarrow reads all of
   these except float16, for which it raises its own `ArrowNotImplementedError`). The input is a file
-  path; pyarrow also takes file objects, and decompresses a path ending in `.gz`, `.bz2`, `.lz4`, `.zst` or `.br`, which `am.read_csv` refuses (`test_compressed_extensions_are_refused`).
+  path given as `str` or `os.PathLike` (a bytes path is refused, as pyarrow refuses it:
+  `test_bytes_path_is_refused`); pyarrow also takes file objects, and decompresses a path ending in `.gz`, `.bz2`, `.lz4`, `.zst` or `.br`, which `am.read_csv` refuses (`test_compressed_extensions_are_refused`).
 
 ## Tests
 

@@ -245,6 +245,20 @@ CASES = [
     ("ragged_row_long", "a\n1\n" + "x" * 300 + ",1\n"),
     ("ragged_row_cut_in_a_character", "a\n1\n" + "x" + "\u00e9" * 60 + ",1\n"),
     ("ragged_row_binary", bytes(range(256))),
+    # A row that runs to the end of the file inside an open quote: pyarrow's message leaves out exactly
+    # one line terminator ("\n", "\r" or "\r\n") from the end of the row text.
+    ("ragged_open_quote_at_eof_lf", 'a,b\n1,2,"x\n'),
+    ("ragged_open_quote_at_eof_crlf", 'a,b\n1,2,"x\r\n'),
+    ("ragged_open_quote_at_eof_cr", 'a,b\n1,2,"x\r'),
+    ("ragged_open_quote_at_eof_lf_cr", 'a,b\n1,2,"x\n\r'),
+    ("ragged_open_quote_at_eof_cr_cr", 'a,b\n1,2,"x\r\r'),
+    ("ragged_open_quote_at_eof_blank_lines", 'a,b\n1,2,"x\n\n\n'),
+    ("ragged_open_quote_at_eof_crlf_twice", 'a,b\n1,2,"x\r\n\r\n'),
+    ("ragged_open_quote_at_eof_no_newline", 'a,b\n1,2,"x'),
+    ("short_open_quote_at_eof", 'a,b\n"1\n'),
+    ("ragged_open_quote_at_eof_100_bytes", 'a,b\n1,2,"' + "y" * 95 + "\n"),
+    ("ragged_open_quote_at_eof_100_bytes_crlf", 'a,b\n1,2,"' + "y" * 95 + "\r\n"),
+    ("ragged_open_quote_at_eof_101_bytes", 'a,b\n1,2,"' + "y" * 96 + "\n"),
 ]
 
 
@@ -395,6 +409,95 @@ def test_nul_bytes_in_names_and_messages(tmp_csv):
     check(tmp_csv(b"a\n1\n2,\x003\n"))
     t = am.read_csv_table(tmp_csv(b"x\x00y,b\n1,2\n"))
     assert t.schema.names == ["x\x00y", "b"]
+
+
+NUL_OPTION_CASES = [
+    ("include_columns", b"a\x00b,c\n1,2\n", dict(convert_options=C(include_columns=["a\x00b"]))),
+    ("column_types", b"a\x00b,c\n1,2\n", dict(convert_options=C(column_types={"a\x00b": pa.string()}))),
+    ("null_values", b"a\nx\x00y\n1\n", dict(convert_options=C(null_values=["x\x00y"]))),
+    ("null_values_prefix_only", b"a\nx\n1\n", dict(convert_options=C(null_values=["x\x00y"]))),
+    ("true_values", b"a\nt\x00\nfalse\n", dict(convert_options=C(true_values=["t\x00"]))),
+    ("false_values", b"a\nf\x00\ntrue\n", dict(convert_options=C(false_values=["f\x00"]))),
+    ("column_names", b"1,2\n", dict(read_options=R(column_names=["a\x00b", "c"]))),
+    ("include_missing", b"a,c\n1,2\n", dict(convert_options=C(include_columns=["a\x00b"],
+                                                                 include_missing_columns=True))),
+]
+
+
+@pytest.mark.parametrize("name,data,kw", NUL_OPTION_CASES, ids=[c[0] for c in NUL_OPTION_CASES])
+def test_nul_bytes_in_option_strings(tmp_csv, name, data, kw):
+    """Option strings travel to the reader with their byte lengths, so a NUL byte inside one is part of
+    the name or value, as in pyarrow."""
+    check(tmp_csv(data), **kw)
+
+
+def test_nul_option_characters_are_refused(tmp_csv):
+    """pyarrow refuses NUL as the delimiter, quote character or decimal point ("Expecting an ASCII
+    character"); so does this reader, in Python and at the C ABI."""
+    import ctypes
+    path = tmp_csv(b"a\x001\n")
+    for key in ("delimiter", "quote_char"):
+        with pytest.raises(ValueError, match="Expecting an ASCII character"):
+            P(**{key: "\x00"})
+        with pytest.raises(ValueError, match="other than NUL"):
+            am.read_csv(path, **{key: "\x00"})
+    with pytest.raises(ValueError, match="Expecting an ASCII character"):
+        C(decimal_point="\x00")
+    with pytest.raises(ValueError, match="other than NUL"):
+        am.read_csv(path, decimal_point="\x00")
+    for field in ("delimiter", "quote_char", "decimal_point"):
+        o = am._CsvOptions()
+        am._lib.am_csv_options_init(ctypes.byref(o))
+        setattr(o, field, 0)
+        h = am._P()
+        assert am._lib.am_csv_open(path.encode(), ctypes.byref(o), ctypes.byref(h)) != 0
+        assert b"other than NUL" in am._lib.am_last_error()
+
+
+def test_c_option_lengths(tmp_csv):
+    """At the C ABI a NULL length array means NUL-terminated strings; a negative length is refused."""
+    import ctypes
+    path = tmp_csv(b"a\x00b,a\n1,2\n")
+    names = (ctypes.c_char_p * 1)(b"a\x00b")
+    for lengths, expect in ((None, "a"), ((ctypes.c_int64 * 1)(3), "a\x00b")):
+        o = am._CsvOptions()
+        am._lib.am_csv_options_init(ctypes.byref(o))
+        o.include_columns, o.n_include_columns = names, 1
+        if lengths is not None:
+            o.include_columns_lengths = lengths
+        h = am._P()
+        assert am._lib.am_csv_open(path.encode(), ctypes.byref(o), ctypes.byref(h)) == 0
+        b = am._P()
+        assert am._lib.am_csv_read(h, ctypes.byref(b)) == 0
+        am._lib.am_csv_close(h)
+        n = am._lib.am_csv_batch_column_name_length(b, 0)
+        assert am._lib.am_csv_batch_columns(b) == 1
+        assert ctypes.string_at(am._lib.am_csv_batch_column_name(b, 0), n).decode() == expect
+        am._lib.am_csv_batch_release(b)
+    o = am._CsvOptions()
+    am._lib.am_csv_options_init(ctypes.byref(o))
+    o.include_columns, o.n_include_columns = names, 1
+    o.include_columns_lengths = (ctypes.c_int64 * 1)(-1)
+    h = am._P()
+    assert am._lib.am_csv_open(path.encode(), ctypes.byref(o), ctypes.byref(h)) != 0
+    assert b"include_columns_lengths`[0] is -1" in am._lib.am_last_error()
+
+
+def test_bytes_path_is_refused(tmp_csv):
+    """pyarrow refuses a bytes path; so does am.read_csv, with a message saying what it takes."""
+    path = tmp_csv("a\n1\n")
+    with pytest.raises(TypeError):
+        pc.read_csv(path.encode())
+    with pytest.raises(NotImplementedError, match="str or os.PathLike; got bytes"):
+        am.read_csv(path.encode())
+
+    class BytesPath:
+        def __fspath__(self):
+            return path.encode()
+    with pytest.raises(NotImplementedError, match="str or os.PathLike; got bytes"):
+        am.read_csv(BytesPath())
+    import pathlib
+    assert am.read_csv_table(pathlib.Path(path)).column("a").to_pylist() == [1]
 
 
 @pytest.mark.parametrize("data,kw", [

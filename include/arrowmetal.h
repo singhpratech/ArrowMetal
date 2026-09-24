@@ -1662,10 +1662,20 @@ typedef struct am_csv_options {
     int32_t check_utf8;                         // 1: an inferred column that is not UTF-8 is binary
     int32_t file_access;                        // 0: pread into a Metal buffer; 1: mmap, no copy
     int64_t scan_block_bytes;                   // 0: the default (bytes per GPU thread in the scan)
+    // Byte lengths of the strings above, for names and values that hold NUL bytes. NULL (the default):
+    // every string of that array is NUL-terminated. Otherwise element i is the byte length of string i,
+    // which then need not be NUL-terminated. column_type_formats are always NUL-terminated.
+    const int64_t* column_names_lengths;
+    const int64_t* include_columns_lengths;
+    const int64_t* column_type_names_lengths;
+    const int64_t* null_values_lengths;
+    const int64_t* true_values_lengths;
+    const int64_t* false_values_lengths;
 } am_csv_options;
 
 void    am_csv_options_init(am_csv_options* options);
-// `options` may be NULL for the defaults. The strings are copied; the caller keeps ownership.
+// `options` may be NULL for the defaults. The strings (and length arrays) are copied; the caller keeps
+// ownership. delimiter, quote_char and decimal_point must be ASCII characters other than NUL.
 int     am_csv_open(const char* path, const am_csv_options* options, am_csv_reader** out);
 void    am_csv_close(am_csv_reader* r);
 int     am_csv_read(am_csv_reader* r, am_csv_batch** out);

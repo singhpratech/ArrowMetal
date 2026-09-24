@@ -931,7 +931,10 @@ def _am_to_strings(self):
 
 def _am_parse(self, target, strict=False):
     """Arrow `cast` from utf8 to a numeric or boolean type. Integers parse on the GPU: the whole
-    value must match [+-]?[0-9]+. A value that does not parse is null, or an error when strict."""
+    value must match [+-]?[0-9]+. Floats parse on the GPU too, bit-identical to Swift's Float / Double
+    initialiser (decimal and exponent forms, inf, nan); the values the GPU cannot decide exactly (hex
+    floats, NaN payloads, ...) are parsed on the CPU with that initialiser. Booleans parse on the CPU.
+    A value that does not parse is null, or an error when strict."""
     name = target if isinstance(target, str) else str(target)
     fmt = name if len(name) == 1 and name in "cCsSiIlLfgb" else _PARSE_FORMATS.get(name)
     if fmt is None:
@@ -4607,6 +4610,12 @@ class _CsvOptions(ctypes.Structure):
         ("strings_can_be_null", ctypes.c_int32), ("quoted_strings_can_be_null", ctypes.c_int32),
         ("check_utf8", ctypes.c_int32), ("file_access", ctypes.c_int32),
         ("scan_block_bytes", ctypes.c_int64),
+        ("column_names_lengths", ctypes.POINTER(ctypes.c_int64)),
+        ("include_columns_lengths", ctypes.POINTER(ctypes.c_int64)),
+        ("column_type_names_lengths", ctypes.POINTER(ctypes.c_int64)),
+        ("null_values_lengths", ctypes.POINTER(ctypes.c_int64)),
+        ("true_values_lengths", ctypes.POINTER(ctypes.c_int64)),
+        ("false_values_lengths", ctypes.POINTER(ctypes.c_int64)),
     ]
 
 
@@ -4703,16 +4712,21 @@ def _csv_resolve(read_options, parse_options, convert_options, kw):
 
 
 def _csv_char(value, name):
-    if not isinstance(value, str) or len(value) != 1 or ord(value) > 127:
-        raise ValueError("am.read_csv: %s must be a single ASCII character, got %r" % (name, value))
+    # pyarrow refuses NUL here too ("Expecting an ASCII character").
+    if not isinstance(value, str) or len(value) != 1 or not 0 < ord(value) <= 127:
+        raise ValueError("am.read_csv: %s must be a single ASCII character other than NUL, got %r"
+                         % (name, value))
     return ord(value)
 
 
 def _csv_strings(values):
+    """The strings as a C array plus their byte lengths, so a value holding a NUL byte arrives whole."""
     if values is None:
-        return None, 0
+        return None, None, 0
     values = [str(v).encode() for v in values]
-    return (ctypes.c_char_p * max(len(values), 1))(*values), len(values)
+    n = max(len(values), 1)
+    return ((ctypes.c_char_p * n)(*values), (ctypes.c_int64 * n)(*[len(v) for v in values]),
+            len(values))
 
 
 def read_csv(path, *, read_options=None, parse_options=None, convert_options=None,
@@ -4737,11 +4751,14 @@ def read_csv(path, *, read_options=None, parse_options=None, convert_options=Non
         cols = am.read_csv("trades.csv", include_columns=["price", "qty"])
         total = cols["price"].sum()          # already on the GPU
     """
-    if not isinstance(path, (str, bytes, os.PathLike)):
-        raise NotImplementedError("am.read_csv reads a file path; got %s" % type(path).__name__)
-    if os.fspath(path).lower().endswith((".gz", ".bz2", ".lz4", ".zst", ".br")):
+    fspath = os.fspath(path) if isinstance(path, (str, os.PathLike)) else None
+    if not isinstance(fspath, str):
+        # pyarrow refuses bytes paths too.
+        raise NotImplementedError("am.read_csv reads a file path given as str or os.PathLike; got %s"
+                                  % type(fspath if isinstance(path, os.PathLike) else path).__name__)
+    if fspath.lower().endswith((".gz", ".bz2", ".lz4", ".zst", ".br")):
         # pyarrow decompresses these by extension; this reader parses the bytes as they are.
-        raise NotImplementedError("am.read_csv reads uncompressed files only; got %s" % os.fspath(path))
+        raise NotImplementedError("am.read_csv reads uncompressed files only; got %s" % fspath)
     o = _csv_resolve(read_options, parse_options, convert_options, dict(
         skip_rows=skip_rows, skip_rows_after_names=skip_rows_after_names, column_names=column_names,
         autogenerate_column_names=autogenerate_column_names, delimiter=delimiter, quote_char=quote_char,
@@ -4762,13 +4779,13 @@ def read_csv(path, *, read_options=None, parse_options=None, convert_options=Non
     c.autogenerate_column_names = 1 if o["autogenerate_column_names"] else 0
     c.include_missing_columns = 1 if o["include_missing_columns"] else 0
     keep = []
-    arr, n = _csv_strings(o["column_names"])
-    keep.append(arr)
-    c.column_names, c.n_column_names = arr, n
+    arr, lens, n = _csv_strings(o["column_names"])
+    keep += [arr, lens]
+    c.column_names, c.column_names_lengths, c.n_column_names = arr, lens, n
     inc = o["include_columns"]
-    arr, n = _csv_strings(list(inc) if inc else None)
-    keep.append(arr)
-    c.include_columns, c.n_include_columns = arr, n
+    arr, lens, n = _csv_strings(list(inc) if inc else None)
+    keep += [arr, lens]
+    c.include_columns, c.include_columns_lengths, c.n_include_columns = arr, lens, n
     types = o["column_types"]
     if types is None:
         types = {}
@@ -4776,14 +4793,16 @@ def read_csv(path, *, read_options=None, parse_options=None, convert_options=Non
         types = {f.name: f.type for f in types}
     elif isinstance(types, (list, tuple)):
         types = dict(types)
-    names_arr, n = _csv_strings(list(types.keys()))
-    fmts_arr, _ = _csv_strings([_csv_type_format(t) for t in types.values()])
-    keep += [names_arr, fmts_arr]
+    names_arr, names_lens, n = _csv_strings(list(types.keys()))
+    fmts_arr, _, _ = _csv_strings([_csv_type_format(t) for t in types.values()])
+    keep += [names_arr, names_lens, fmts_arr]
     c.column_type_names, c.column_type_formats, c.n_column_types = names_arr, fmts_arr, n
+    c.column_type_names_lengths = names_lens
     for key in ("null_values", "true_values", "false_values"):
-        arr, n = _csv_strings(o[key])
-        keep.append(arr)
+        arr, lens, n = _csv_strings(o[key])
+        keep += [arr, lens]
         setattr(c, key, arr)
+        setattr(c, key + "_lengths", lens)
         setattr(c, "n_" + key, n)
     c.strings_can_be_null = 1 if o["strings_can_be_null"] else 0
     c.quoted_strings_can_be_null = 1 if o["quoted_strings_can_be_null"] else 0
@@ -4794,7 +4813,7 @@ def read_csv(path, *, read_options=None, parse_options=None, convert_options=Non
     c.file_access = 0 if o["file_access"] == "read" else 1
 
     reader = _P()
-    _csv_check(_lib.am_csv_open(os.fspath(path).encode(), ctypes.byref(c), ctypes.byref(reader)))
+    _csv_check(_lib.am_csv_open(os.fsencode(fspath), ctypes.byref(c), ctypes.byref(reader)))
     try:
         out = _P()
         _csv_check(_lib.am_csv_read(reader, ctypes.byref(out)))

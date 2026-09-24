@@ -385,6 +385,33 @@ final class CSVReaderTests: XCTestCase {
         }
     }
 
+    /// A ragged row that runs to the end of the file inside an open quote: the message leaves out one
+    /// line terminator from the end of the row text, as pyarrow's does (messages probed with pyarrow 25).
+    func testRaggedRowInAnOpenQuoteAtEOFDropsOneTerminator() throws {
+        let cases: [(String, String)] = [
+            ("a,b\n1,2,\"x\n", "got 3: 1,2,\"x"),
+            ("a,b\n1,2,\"x\r\n", "got 3: 1,2,\"x"),
+            ("a,b\n1,2,\"x\r", "got 3: 1,2,\"x"),
+            ("a,b\n1,2,\"x\n\r", "got 3: 1,2,\"x\n"),
+            ("a,b\n1,2,\"x\n\n\n", "got 3: 1,2,\"x\n\n"),
+            ("a,b\n1,2,\"x\r\n\r\n", "got 3: 1,2,\"x\r\n"),
+            ("a,b\n1,2,\"x", "got 3: 1,2,\"x"),
+            ("a,b\n\"1\n", "got 1: \"1"),
+        ]
+        for (text, tail) in cases {
+            for block in [1, 3, 4096] {
+                XCTAssertThrowsError(try read(text) { $0.scanBlockBytes = block }) {
+                    XCTAssertEqual("\($0)", "CSV parse error: Row #2: Expected 2 columns, \(tail)", text.debugDescription)
+                }
+            }
+        }
+        // The 100-byte cut applies to the text without that terminator.
+        let row = "1,2,\"" + String(repeating: "y", count: 95)
+        XCTAssertThrowsError(try read("a,b\n\(row)\r\n")) {
+            XCTAssertEqual("\($0)", "CSV parse error: Row #2: Expected 2 columns, got 3: \(row)")
+        }
+    }
+
     /// A quote character equal to the delimiter never opens a quote, as in pyarrow.
     func testDelimiterEqualToQuoteChar() throws {
         let b = try read("a\"b\n1\"2\n") { $0.delimiter = UInt8(ascii: "\""); $0.quoteChar = UInt8(ascii: "\"") }

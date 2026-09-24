@@ -35,6 +35,12 @@ struct AMCSVOptions {
     var checkUTF8: Int32
     var fileAccess: Int32
     var scanBlockBytes: Int64
+    var columnNamesLengths: UnsafePointer<Int64>?
+    var includeColumnsLengths: UnsafePointer<Int64>?
+    var columnTypeNamesLengths: UnsafePointer<Int64>?
+    var nullValuesLengths: UnsafePointer<Int64>?
+    var trueValuesLengths: UnsafePointer<Int64>?
+    var falseValuesLengths: UnsafePointer<Int64>?
 }
 
 private final class CSVReaderBox { let r: CSVReader; init(_ r: CSVReader) { self.r = r } }
@@ -88,10 +94,15 @@ public func am_csv_options_init(_ o: UnsafeMutableRawPointer?) {
         columnNames: nil, nColumnNames: 0, includeColumns: nil, nIncludeColumns: 0,
         columnTypeNames: nil, columnTypeFormats: nil, nColumnTypes: 0,
         nullValues: nil, nNullValues: 0, trueValues: nil, nTrueValues: 0, falseValues: nil, nFalseValues: 0,
-        stringsCanBeNull: 0, quotedStringsCanBeNull: 1, checkUTF8: 1, fileAccess: 0, scanBlockBytes: 0)
+        stringsCanBeNull: 0, quotedStringsCanBeNull: 1, checkUTF8: 1, fileAccess: 0, scanBlockBytes: 0,
+        columnNamesLengths: nil, includeColumnsLengths: nil, columnTypeNamesLengths: nil,
+        nullValuesLengths: nil, trueValuesLengths: nil, falseValuesLengths: nil)
 }
 
-private func strings(_ p: UnsafePointer<UnsafePointer<CChar>?>?, _ n: Int64, _ what: String) throws -> [String]? {
+/// The `n` strings at `p`: NUL-terminated when `lengths` is NULL, otherwise `lengths[i]` bytes each
+/// (so a name or value may hold NUL bytes).
+private func strings(_ p: UnsafePointer<UnsafePointer<CChar>?>?, _ n: Int64, _ what: String,
+                     lengths: UnsafePointer<Int64>? = nil) throws -> [String]? {
     guard let p else {
         if n != 0 { throw CSVError.invalidOptions("am_csv_open: `\(what)` is NULL but its count is \(n)") }
         return nil
@@ -99,12 +110,19 @@ private func strings(_ p: UnsafePointer<UnsafePointer<CChar>?>?, _ n: Int64, _ w
     guard n >= 0 else { throw CSVError.invalidOptions("am_csv_open: the count of `\(what)` is \(n), which is negative") }
     return try (0..<Int(n)).map { i in
         guard let s = p[i] else { throw CSVError.invalidOptions("am_csv_open: `\(what)`[\(i)] is NULL") }
-        return String(cString: s)
+        guard let lengths else { return String(cString: s) }
+        let len = lengths[i]
+        guard len >= 0 else {
+            throw CSVError.invalidOptions("am_csv_open: `\(what)_lengths`[\(i)] is \(len), which is negative")
+        }
+        return String(decoding: UnsafeRawBufferPointer(start: s, count: Int(len)), as: UTF8.self)
     }
 }
 
 private func byte(_ v: Int32, _ what: String) throws -> UInt8 {
-    guard v >= 0 && v <= 127 else { throw CSVError.invalidOptions("am_csv_open: `\(what)` must be an ASCII character, got \(v)") }
+    guard v > 0 && v <= 127 else {
+        throw CSVError.invalidOptions("am_csv_open: `\(what)` must be an ASCII character other than NUL, got \(v)")
+    }
     return UInt8(v)
 }
 
@@ -118,9 +136,10 @@ func csvOptions(_ c: AMCSVOptions) throws -> CSVReadOptions {
     o.skipRowsAfterNames = Int(c.skipRowsAfterNames)
     o.autogenerateColumnNames = c.autogenerateColumnNames != 0
     o.includeMissingColumns = c.includeMissingColumns != 0
-    o.columnNames = try strings(c.columnNames, c.nColumnNames, "column_names")
-    o.includeColumns = try strings(c.includeColumns, c.nIncludeColumns, "include_columns")
-    let tn = try strings(c.columnTypeNames, c.nColumnTypes, "column_type_names") ?? []
+    o.columnNames = try strings(c.columnNames, c.nColumnNames, "column_names", lengths: c.columnNamesLengths)
+    o.includeColumns = try strings(c.includeColumns, c.nIncludeColumns, "include_columns", lengths: c.includeColumnsLengths)
+    let tn = try strings(c.columnTypeNames, c.nColumnTypes, "column_type_names",
+                             lengths: c.columnTypeNamesLengths) ?? []
     let tf = try strings(c.columnTypeFormats, c.nColumnTypes, "column_type_formats") ?? []
     guard tn.count == tf.count else { throw CSVError.invalidOptions("am_csv_open: column_type_names and column_type_formats differ in length") }
     for (n, f) in zip(tn, tf) {
@@ -129,9 +148,9 @@ func csvOptions(_ c: AMCSVOptions) throws -> CSVReadOptions {
         }
         o.columnTypes[n] = t
     }
-    if let v = try strings(c.nullValues, c.nNullValues, "null_values") { o.nullValues = v }
-    if let v = try strings(c.trueValues, c.nTrueValues, "true_values") { o.trueValues = v }
-    if let v = try strings(c.falseValues, c.nFalseValues, "false_values") { o.falseValues = v }
+    if let v = try strings(c.nullValues, c.nNullValues, "null_values", lengths: c.nullValuesLengths) { o.nullValues = v }
+    if let v = try strings(c.trueValues, c.nTrueValues, "true_values", lengths: c.trueValuesLengths) { o.trueValues = v }
+    if let v = try strings(c.falseValues, c.nFalseValues, "false_values", lengths: c.falseValuesLengths) { o.falseValues = v }
     o.stringsCanBeNull = c.stringsCanBeNull != 0
     o.quotedStringsCanBeNull = c.quotedStringsCanBeNull != 0
     o.checkUTF8 = c.checkUTF8 != 0

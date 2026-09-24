@@ -265,7 +265,14 @@ public final class CSVReader: @unchecked Sendable {
             var kEnd = k0
             while kEnd < s.count - 1, (ev[kEnd] >> 31) == 0 { kEnd += 1 }
             let start = rawSpan(ev, k0, bytes, dataStart: dataStart).0
-            let end = Swift.max(start, Int(ev[kEnd] & 0x7FFF_FFFF))
+            var end = Swift.max(start, Int(ev[kEnd] & 0x7FFF_FFFF))
+            // A row that runs to the end of the file inside an open quote keeps the file's last line
+            // terminators in its text; pyarrow's message leaves out exactly one ("\n", "\r" or "\r\n").
+            // Only an open quote lets a record end at the end of the file on a terminator byte.
+            if end == fileSize && end > start {
+                if bytes[end - 1] == 0x0A { end -= 1; if end > start && bytes[end - 1] == 0x0D { end -= 1 } }
+                else if bytes[end - 1] == 0x0D { end -= 1 }
+            }
             // pyarrow quotes at most 100 bytes of the row: longer rows are cut to 96 bytes and " ...".
             let text = end - start > 100
                 ? String(decoding: bytes[start..<(start + 96)], as: UTF8.self) + " ..."

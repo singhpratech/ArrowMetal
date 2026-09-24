@@ -294,6 +294,11 @@ CSV on the GPU
   counts empty lines, as pyarrow does; ragged-row errors quote at most 100 bytes of the row, as pyarrow's
   do; `delimiter` equal to `quote_char` is accepted; `am_csv_batch_column_name_length` and
   `am_csv_last_error` carry names and messages that hold NUL bytes.
+- CSV reader second-round fixes: a ragged row that runs to the end of the file inside an open quote is
+  quoted without its last line terminator, as pyarrow quotes it; option strings (`include_columns`,
+  `column_types` names, `column_names`, `null_values`, `true_values`, `false_values`) travel with their
+  byte lengths (`am_csv_options.*_lengths`), so a NUL byte inside one matches as in pyarrow; a NUL
+  `delimiter`, `quote_char` or `decimal_point` and a bytes path are refused, as pyarrow refuses them.
 
 Out-of-core streaming
 - A streaming executor for datasets larger than memory (docs/STREAMING.md): Arrow IPC files/directories
