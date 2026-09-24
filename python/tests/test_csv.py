@@ -367,6 +367,57 @@ def test_compressed_extensions_are_refused(tmp_path):
         am.read_csv(str(p))
 
 
+def test_c_options_struct_layout_matches_the_header(tmp_path):
+    """`am_csv_options` as a C compiler lays it out equals the ctypes mirror Python passes (the Swift
+    mirror is checked against the same ctypes struct by `test_options_init_writes_every_field`)."""
+    import shutil
+    import subprocess
+    cc = shutil.which("cc") or shutil.which("clang")
+    if cc is None:
+        pytest.skip("no C compiler on PATH")
+    repo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+    fields = [name for name, _ in am._CsvOptions._fields_]
+    src = tmp_path / "layout.c"
+    src.write_text('#include <stdio.h>\n#include <stddef.h>\n#include "arrowmetal.h"\nint main(void) {\n'
+                   '  printf("%zu\\n", sizeof(am_csv_options));\n'
+                   + "".join('  printf("%%zu\\n", offsetof(am_csv_options, %s));\n' % f for f in fields)
+                   + "  return 0;\n}\n")
+    exe = tmp_path / "layout"
+    cc_out = subprocess.run([cc, "-I", os.path.join(repo, "include"), str(src), "-o", str(exe)],
+                            capture_output=True, text=True)
+    assert cc_out.returncode == 0, cc_out.stderr
+    got = [int(x) for x in subprocess.run([str(exe)], capture_output=True, text=True).stdout.split()]
+    import ctypes
+    assert got[0] == ctypes.sizeof(am._CsvOptions)
+    assert got[1:] == [getattr(am._CsvOptions, f).offset for f in fields]
+
+
+def test_options_init_writes_every_field():
+    """am_csv_options_init (Swift) fills a struct pre-filled with garbage: every field of the ctypes
+    mirror must come back as its documented default, so Swift writes each field where C and Python
+    expect it."""
+    import ctypes
+    o = am._CsvOptions()
+    ctypes.memset(ctypes.byref(o), 0xAB, ctypes.sizeof(o))
+    am._lib.am_csv_options_init(ctypes.byref(o))
+    expected = dict(delimiter=ord(","), quote_char=ord('"'), double_quote=1, decimal_point=ord("."),
+                    skip_rows=0, skip_rows_after_names=0, autogenerate_column_names=0,
+                    include_missing_columns=0, n_column_names=0, n_include_columns=0, n_column_types=0,
+                    n_null_values=0, n_true_values=0, n_false_values=0, strings_can_be_null=0,
+                    quoted_strings_can_be_null=1, check_utf8=1, file_access=0, scan_block_bytes=0)
+    for name, value in expected.items():
+        assert getattr(o, name) == value, name
+    for name in ("column_names", "include_columns", "column_type_names", "column_type_formats",
+                 "null_values", "true_values", "false_values"):
+        assert not getattr(o, name), name
+    # An out-of-range value in the last int32 field is read by Swift and rejected.
+    o.file_access = 2
+    h = am._P()
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_csv.py")
+    assert am._lib.am_csv_open(path.encode(), ctypes.byref(o), ctypes.byref(h)) != 0
+    assert b"file_access" in am._lib.am_last_error()
+
+
 def test_autogenerate_with_names_is_an_error(tmp_csv):
     path = tmp_csv("1,2\n")
     with pytest.raises(am.ArrowMetalError, match="autogenerate_column_names cannot be true"):
