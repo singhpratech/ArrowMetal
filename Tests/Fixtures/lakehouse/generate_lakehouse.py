@@ -485,8 +485,22 @@ def position_deletes(cat):
     json.dump(meta, open(out, "w"), indent=1)
 
 
+def nfd_row_groups():
+    """parquet/nfd_strings.parquet: 60 rows in three row groups of 20, column `s` holding decomposed
+    (NFD) strings such as "e\u0301 07" -- byte-wise they sort before "f", while Swift's `String` order
+    puts them after it. LakehouseTests uses it to check that row-group pruning of string filters
+    follows the byte order the row filter uses. Deterministic; needs only pyarrow."""
+    out = os.path.join(HERE, "parquet")
+    os.makedirs(out, exist_ok=True)
+    s = ["e\u0301 %02d" % i for i in range(40)] + ["g %02d" % i for i in range(20)]
+    t = pa.table({"id": pa.array(range(60), pa.int64()), "s": pa.array(s, pa.string())})
+    pq.write_table(t, os.path.join(out, "nfd_strings.parquet"), row_group_size=20, compression="none",
+                   use_dictionary=False)
+
+
 def main():
     cases = []
+    nfd_row_groups()
     delta_tables(cases)
     iceberg_tables(cases)
     import deltalake

@@ -67,13 +67,16 @@ private func lhRead(_ function: String, _ path: UnsafePointer<CChar>?,
     }
 }
 
-/// Reads a Delta Lake table. `version` < 0 reads the latest version.
+/// Reads a Delta Lake table. `version` -1 reads the latest version; any other negative version is an error.
 @_cdecl("am_delta_read")
 public func am_delta_read(_ path: UnsafePointer<CChar>?, _ version: Int64,
                           _ columns: UnsafePointer<UnsafePointer<CChar>?>?, _ nColumns: Int64,
                           _ filters: UnsafePointer<CChar>?, _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
     lhRead("am_delta_read", path, columns, nColumns, filters, out) { p, cols, flt in
-        try DeltaTable(path: p).scan(version: version >= 0 ? version : nil, columns: cols, filters: flt)
+        guard version >= -1 else {
+            throw LakehouseError.invalidArgument("version \(version); a Delta version is 0 or more, or -1 for the latest")
+        }
+        return try DeltaTable(path: p).scan(version: version >= 0 ? version : nil, columns: cols, filters: flt)
     }
 }
 

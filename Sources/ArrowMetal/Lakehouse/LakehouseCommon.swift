@@ -162,24 +162,20 @@ enum LakeScalar: Sendable, Equatable {
 
     /// Orders an integer against a double without rounding the integer.
     private static func exactCompare(_ i: Int64, _ d: Double) -> Int? {
-        if d >= 9.3e18 { return -1 }
-        if d <= -9.3e18 { return 1 }
+        // Every Int64 is below 2^63 and at or above -2^63; inside that range `floor(d)` converts exactly.
+        if d >= 0x1p63 { return -1 }
+        if d < -0x1p63 { return 1 }
         let f = d.rounded(.down)
         let fi = Int64(f)
         if i < fi { return -1 }
         if i > fi { return 1 }
         return f == d ? 0 : -1
     }
+}
 
-    var filterValue: ParquetFilter.Value? {
-        switch self {
-        case .int(let v): return .int(v)
-        case .double(let v): return .double(v)
-        case .string(let v): return .string(v)
-        case .bool(let v): return .int(v ? 1 : 0)
-        case .bytes, .decimal: return nil
-        }
-    }
+extension Character {
+    /// "0" through "9" and nothing else (`isNumber` also accepts "½", "१" and the like).
+    var isASCIIDigit: Bool { asciiValue.map { $0 >= 48 && $0 <= 57 } ?? false }
 }
 
 extension CompareOp {
@@ -246,7 +242,11 @@ func lakeRangeMayMatch(_ op: CompareOp, lo: LakeScalar?, hi: LakeScalar?, litera
 // MARK: - Literals
 
 enum LakeTime {
-    /// Days since 1970-01-01 for a proleptic Gregorian date.
+    /// The years a date or timestamp literal may name: wide enough for every date32 value, narrow
+    /// enough that no day or microsecond arithmetic below can overflow before it is checked.
+    static let yearRange = -5_000_000...5_000_000
+
+    /// Days since 1970-01-01 for a proleptic Gregorian date (`year` within `yearRange`).
     static func days(year: Int, month: Int, day: Int) -> Int64 {
         // Howard Hinnant's days_from_civil.
         let y = month <= 2 ? year - 1 : year
@@ -277,8 +277,9 @@ enum LakeTime {
         let t = s.trimmingCharacters(in: .whitespaces)
         let parts = t.split(separator: "-", omittingEmptySubsequences: false)
         // A leading minus would split into an empty first part; years before 0 are not supported here.
-        guard parts.count == 3, let y = Int(parts[0]), let m = Int(parts[1]), let d = Int(parts[2]),
-              (1...12).contains(m), (1...31).contains(d) else { return nil }
+        guard parts.count == 3, parts.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isASCIIDigit) }),
+              let y = Int(parts[0]), let m = Int(parts[1]), let d = Int(parts[2]),
+              yearRange.contains(y), (1...12).contains(m), (1...31).contains(d) else { return nil }
         return days(year: y, month: m, day: d)
     }
 
@@ -302,28 +303,38 @@ enum LakeTime {
             let sign = tail.first
             if sign == "+" || sign == "-" {
                 let hm = tail.dropFirst().split(separator: ":")
-                if hm.count == 2, let h = Int64(hm[0]), let m = Int64(hm[1]) {
+                if hm.count == 2, hm.allSatisfy({ $0.count == 2 && $0.allSatisfy(\.isASCIIDigit) }),
+                   let h = Int64(hm[0]), let m = Int64(hm[1]) {
                     offsetSeconds = (h * 3600 + m * 60) * (sign == "-" ? -1 : 1)
                     t.removeLast(6)
                 }
             }
         }
-        let hms = t.split(separator: ":")
-        guard hms.count == 3, let h = Int64(hms[0]), let mi = Int64(hms[1]) else { return nil }
+        let hms = t.split(separator: ":", omittingEmptySubsequences: false)
+        guard hms.count == 3 else { return nil }
         let secParts = hms[2].split(separator: ".", omittingEmptySubsequences: false)
-        guard let sec = Int64(secParts[0]) else { return nil }
+        guard secParts.count <= 2 else { return nil }
+        // Two-digit hour, minute and second fields, so the arithmetic below stays small.
+        for part in [hms[0], hms[1], secParts[0]] {
+            guard part.count == 2, part.allSatisfy(\.isASCIIDigit) else { return nil }
+        }
+        guard let h = Int64(hms[0]), let mi = Int64(hms[1]), let sec = Int64(secParts[0]) else { return nil }
         var frac: Int64 = 0
         if secParts.count == 2 {
             var digits = String(secParts[1])
-            guard digits.allSatisfy({ $0.isNumber }), !digits.isEmpty else { return nil }
+            guard digits.allSatisfy(\.isASCIIDigit), !digits.isEmpty else { return nil }
             let want = unitsPerSecond == 1_000_000_000 ? 9 : 6
             if digits.count > want { digits = String(digits.prefix(want)) }
             while digits.count < want { digits += "0" }
             frac = Int64(digits) ?? 0
             if unitsPerSecond != 1_000_000_000 && unitsPerSecond != 1_000_000 { return nil }
         }
+        // `day` is bounded by `yearRange`, so the seconds cannot overflow; the scaling to micro- or
+        // nanoseconds can, and a literal outside the column's range is refused.
         let seconds = day * 86400 + h * 3600 + mi * 60 + sec - offsetSeconds
-        return seconds * unitsPerSecond + frac
+        let (scaled, o1) = seconds.multipliedReportingOverflow(by: unitsPerSecond)
+        let (total, o2) = scaled.addingReportingOverflow(frac)
+        return (o1 || o2) ? nil : total
     }
 
     /// Parses a decimal literal ("12.340", "-5", "1e3" is not accepted) into an unscaled value at `scale`.
@@ -335,17 +346,21 @@ enum LakeTime {
         guard parts.count <= 2, !t.isEmpty else { return nil }
         let whole = String(parts[0])
         var frac = parts.count == 2 ? String(parts[1]) : ""
-        guard (whole + frac).allSatisfy({ $0.isNumber }), !(whole + frac).isEmpty else { return nil }
+        // ASCII digits only: `Character.isNumber` also accepts "½" and other scripts' digits.
+        guard (whole + frac).allSatisfy(\.isASCIIDigit), !(whole + frac).isEmpty, scale >= 0, scale <= 76 else { return nil }
         // Digits beyond the scale must be zero for the literal to be representable exactly.
         if frac.count > scale {
             guard frac.dropFirst(scale).allSatisfy({ $0 == "0" }) else { return nil }
             frac = String(frac.prefix(scale))
         }
         while frac.count < scale { frac += "0" }
+        // A decimal128 holds at most 38 significant digits; a longer literal does not fit any column.
+        let digits = (whole + frac).drop { $0 == "0" }
+        guard digits.count <= 38 else { return nil }
         var acc = ArrowDecimal128(0)
         let ten = ArrowDecimal128(10)
-        for ch in whole + frac {
-            acc = acc * ten + ArrowDecimal128(Int64(ch.wholeNumberValue!))
+        for ch in digits {
+            acc = acc * ten + ArrowDecimal128(Int64(ch.asciiValue! - 48))
         }
         return negative ? ArrowDecimal128(0) - acc : acc
     }
@@ -395,9 +410,11 @@ func lakeLiteral(_ v: ParquetFilter.Value, for field: LakehouseField) throws -> 
         }
     case .date:
         switch v {
-        case .int(let i): return .int(i)
+        case .int(let i):
+            guard Int32(exactly: i) != nil else { throw bad() }
+            return .int(i)
         case .string(let s):
-            guard let d = LakeTime.parseDate(s) else { throw bad() }
+            guard let d = LakeTime.parseDate(s), Int32(exactly: d) != nil else { throw bad() }
             return .int(d)
         case .double: throw bad()
         }
@@ -503,7 +520,11 @@ enum LakeColumns {
             case .none: return 0
             case .int(let i)?: return i
             case .bool(let b)?: return b ? 1 : 0
-            case .double(let d)? where d == d.rounded(): return Int64(d)
+            case .double(let d)?:
+                guard let i = Int64(exactly: d) else {
+                    throw LakehouseError.malformed("value \(d) for \(type) column \(column) is not an integer in range")
+                }
+                return i
             default: throw LakehouseError.malformed("value \(String(describing: value)) for \(type) column \(column)")
             }
         }
@@ -642,7 +663,7 @@ enum LakeRowFilter {
         case .uint64(let a): return try integerMask(a, op, literal)
         case .float32(let a):
             guard let d = double(literal) else { throw typeError(column, c, literal) }
-            return try a.compare(op, Float(d))
+            return try float32Mask(a, op, d)
         case .float64(let a):
             guard let d = double(literal) else { throw typeError(column, c, literal) }
             return try a.compare(op, d)
@@ -696,8 +717,10 @@ enum LakeRowFilter {
         case .int(let i): k = i
         case .double(let d):
             if d.isNaN { return try constantMask(a, op == .ne) }
-            if d >= 9.3e18 { return try constantMask(a, op == .lt || op == .le || op == .ne) }
-            if d <= -9.3e18 { return try constantMask(a, op == .gt || op == .ge || op == .ne) }
+            // Beyond the Int64 range every value is below (or above) the literal; inside it the
+            // rounded literal converts exactly.
+            if d >= 0x1p63 { return try constantMask(a, op == .lt || op == .le || op == .ne) }
+            if d < -0x1p63 { return try constantMask(a, op == .gt || op == .ge || op == .ne) }
             if d == d.rounded() { k = Int64(d) }
             else {
                 switch op {
@@ -722,6 +745,21 @@ enum LakeRowFilter {
         if tooBig { return try constantMask(a, op == .lt || op == .le || op == .ne) }
         if tooSmall { return try constantMask(a, op == .gt || op == .ge || op == .ne) }
         return try a.compare(op, T(k))
+    }
+
+    /// A float32 column against a double literal, compared as the exact values (as pyarrow does, by
+    /// widening the column): the literal is rounded to its nearest float and, when that changes it, the
+    /// comparison is rewritten so no float lies between the two.
+    private static func float32Mask(_ a: MetalArray<Float>, _ op: CompareOp, _ d: Double) throws -> MetalBooleanArray {
+        let f = Float(d)
+        if d.isNaN || Double(f) == d { return try a.compare(op, f) }
+        let above = Double(f) > d        // f is the nearest float above d (or +inf), else the one below
+        switch op {
+        case .eq: return try constantMask(a, false)
+        case .ne: return try constantMask(a, true)
+        case .lt, .le: return try a.compare(above ? .lt : .le, f)
+        case .gt, .ge: return try a.compare(above ? .ge : .gt, f)
+        }
     }
 
     /// Every valid row `answer`, every null row null.
@@ -790,7 +828,7 @@ enum LakeDataFile {
     /// whole row groups by the footer statistics first; `rowFilters` index into `fields`.
     static func read(path: String, fields: [LakehouseField],
                      resolve: (ParquetFile) throws -> [LakeColumnSource],
-                     rowGroupFilters: (ParquetFile) -> [ParquetFilter],
+                     rowGroupFilters: (ParquetFile) -> [(column: String, filter: LakeFilter)],
                      rowFilters: [(column: Int, op: CompareOp, literal: LakeScalar)],
                      context: MetalContext = .shared) throws -> MetalRecordBatch {
         let file: ParquetFile
@@ -799,9 +837,8 @@ enum LakeDataFile {
         let sources = try resolve(file)
         var wanted: [String] = []
         for s in sources { if case .parquet(let n) = s, !wanted.contains(n) { wanted.append(n) } }
-        // Row-group pruning only for filters on columns the file actually has.
-        let rgFilters = rowGroupFilters(file).filter { f in file.fields.contains { $0.name == f.column } }
-        let opts = ParquetReadOptions(columns: wanted, rowGroups: nil, dictionaryEncoded: false, filters: rgFilters)
+        let (rgFilters, rowGroups) = rowGroupPlan(file, rowGroupFilters(file))
+        let opts = ParquetReadOptions(columns: wanted, rowGroups: rowGroups, dictionaryEncoded: false, filters: rgFilters)
         let n: Int
         var read: MetalRecordBatch? = nil
         if wanted.isEmpty {
@@ -826,6 +863,68 @@ enum LakeDataFile {
         }
         let batch = try MetalRecordBatch(names: fields.map { $0.name }, columns: cols)
         return try LakeRowFilter.apply(batch, rowFilters, names: fields.map { $0.name })
+    }
+
+    /// How the filters prune `file`'s row groups by the footer statistics. Only comparisons the
+    /// statistics decide exactly as the row filter does are used, so pruning never drops a matching row:
+    ///
+    /// - string and binary filters are decided here, byte-wise on `min_value` / `max_value` (the row
+    ///   filter's order); the Parquet reader's own filter orders strings by Swift `String` comparison,
+    ///   which puts a decomposed "é" after "f";
+    /// - an integer column's double literal only when it is below 2^53 in magnitude, where the reader's
+    ///   integer-to-double conversion is exact;
+    /// - a timestamp only when the file stores the table's unit;
+    /// - floats never under `!=` (a NaN matches it and statistics do not count NaNs).
+    ///
+    /// Filters on columns the file does not have at the top level are skipped.
+    static func rowGroupPlan(_ file: ParquetFile, _ filters: [(column: String, filter: LakeFilter)])
+        -> (parquet: [ParquetFilter], rowGroups: [Int]?) {
+        var parquet: [ParquetFilter] = []
+        var byteFilters: [(leaf: ParquetLeaf, op: CompareOp, literal: [UInt8])] = []
+        for (name, f) in filters {
+            // The Parquet filter takes the first leaf whose dotted path *or* last name matches; use it only
+            // when that leaf is the top-level column itself.
+            guard file.fields.contains(where: { $0.name == name }),
+                  let leaf = file.leaves.first(where: { $0.dottedPath == name || $0.name == name }),
+                  leaf.dottedPath == name else { continue }
+            let value: ParquetFilter.Value?
+            switch (f.field.type, f.literal) {
+            case (.string, .string(let x)), (.binary, .string(let x)):
+                if leaf.physical == .byteArray { byteFilters.append((leaf, f.op, Array(x.utf8))) }
+                continue
+            case (.string, .bytes(let b)), (.binary, .bytes(let b)):
+                if leaf.physical == .byteArray { byteFilters.append((leaf, f.op, b)) }
+                continue
+            case (.int8, .int(let i)), (.int16, .int(let i)), (.int32, .int(let i)), (.int64, .int(let i)):
+                if case .integer(_, false) = leaf.logicalType { value = nil } else { value = .int(i) }
+            case (.int8, .double(let d)), (.int16, .double(let d)), (.int32, .double(let d)), (.int64, .double(let d)):
+                if case .integer(_, false) = leaf.logicalType { value = nil }
+                else { value = d.magnitude < 0x1p53 ? .double(d) : nil }
+            case (.date, .int(let i)):
+                value = leaf.logicalType == .date ? .int(i) : nil
+            case (.timestamp(let ns, _), .int(let i)):
+                if case .timestamp(_, let unit) = leaf.logicalType, leaf.physical == .int64, unit == (ns ? .nanos : .micros) {
+                    value = .int(i)
+                } else { value = nil }
+            case (.float32, .double(let d)), (.float64, .double(let d)):
+                value = f.op == .ne ? nil : .double(d)
+            case (.boolean, .bool(let b)):
+                value = leaf.physical == .boolean ? .int(b ? 1 : 0) : nil
+            default:
+                value = nil
+            }
+            if let value { parquet.append(ParquetFilter(column: name, op: ParquetFilter.Op(f.op), value: value)) }
+        }
+        guard !byteFilters.isEmpty else { return (parquet, nil) }
+        let groups = file.metadata.rowGroups.indices.filter { g in
+            let rg = file.metadata.rowGroups[g]
+            return byteFilters.allSatisfy { bf in
+                guard bf.leaf.index < rg.columns.count, let st = rg.columns[bf.leaf.index].meta.statistics,
+                      let lo = st.minValue, let hi = st.maxValue else { return true }
+                return lakeRangeMayMatch(bf.op, lo: .bytes(lo), hi: .bytes(hi), literal: .bytes(bf.literal))
+            }
+        }
+        return (parquet, Array(groups))
     }
 
     /// Concatenates one column's per-file parts. Decimal and fixed-width binary columns (which the

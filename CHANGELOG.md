@@ -202,6 +202,13 @@ Parquet on the GPU
   reader features (deletion vectors, column mapping `id`, Iceberg delete files, unknown features) are
   refused with an error naming them. Checked against `deltalake` 1.6.5 and pyiceberg 0.12.0
   (`LakehouseTests`, `python/tests/test_lakehouse.py`); `Benchmarks/lakehouse_bench.py` for timings.
+- Lakehouse reads: a Delta empty-string partition value reads as null for every type, as the protocol
+  and `deltalake` have it; string row-group pruning is byte-wise, the row filter's order, so decomposed
+  strings are no longer pruned away; Iceberg data-file paths are opened as written (pyiceberg's
+  `grp=x%3Dy` directories); a float32 column compares with a double literal exactly, as pyarrow does.
+  Filter literals at the edges of their types (doubles past the Int64 range, huge years, non-ASCII digits,
+  decimals over 38 digits) and malformed Avro manifests or Delta `partitionValues` are answers or errors,
+  never a crash or a hang; a negative Delta version other than -1 (C) is an error.
 
 Out-of-core streaming
 - A streaming executor for datasets larger than memory (docs/STREAMING.md): Arrow IPC files/directories

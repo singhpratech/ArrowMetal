@@ -499,4 +499,226 @@ final class LakehouseTests: XCTestCase {
         XCTAssertEqual(dec.asDecimal?.toArray(), [ArrowDecimal128(-5)])
         XCTAssertThrowsError(try LakeColumns.constant(.int8, .int(300), length: 1, column: "c"))
     }
+
+    // MARK: - review findings: literals and metadata that used to trap, and wrong-row cases
+
+    /// Filter literals at the edges of their types are answers or errors, never a trap.
+    func testFilterLiteralsAtTypeEdges() throws {
+        // Doubles between Int64.max and the old 9.3e18 guard (and their negatives).
+        XCTAssertEqual(LakeScalar.compare(.int(.max), .double(9.25e18)), -1)
+        XCTAssertEqual(LakeScalar.compare(.int(.min), .double(-9.25e18)), 1)
+        XCTAssertEqual(LakeScalar.compare(.int(.max), .double(0x1p63)), -1)
+        XCTAssertEqual(LakeScalar.compare(.int(.min), .double(-0x1p63)), 0)
+        let a = AnyMetalArray.int64(try MetalArray<Int64>([1, nil, .max, .min]))
+        XCTAssertEqual(try LakeRowFilter.mask(a, .gt, .double(9.25e18), column: "a").toArray(), [false, nil, false, false])
+        XCTAssertEqual(try LakeRowFilter.mask(a, .lt, .double(9.25e18), column: "a").toArray(), [true, nil, true, true])
+        XCTAssertEqual(try LakeRowFilter.mask(a, .ge, .double(-9.25e18), column: "a").toArray(), [true, nil, true, true])
+        XCTAssertEqual(try LakeRowFilter.mask(a, .gt, .double(9.2233720368547748e18), column: "a").toArray(), [false, nil, true, false])
+        let i32 = AnyMetalArray.int32(try MetalArray<Int32>([1, 2]))
+        XCTAssertEqual(try LakeRowFilter.mask(i32, .lt, .double(9.25e18), column: "q").toArray(), [true, true])
+        let t = try DeltaTable(path: try fixture("delta/basic"))
+        XCTAssertEqual(try t.read(filters: [ParquetFilter(column: "id", op: .gt, value: .double(9.25e18))]).length, 0)
+        XCTAssertEqual(try t.read(filters: [ParquetFilter(column: "id", op: .lt, value: .double(-9.25e18))]).length, 0)
+        XCTAssertEqual(try t.read(filters: [ParquetFilter(column: "id", op: .lt, value: .double(9.25e18))]).length,
+                       try t.read().length)
+        // Huge years, Unicode numerics, too many digits: errors naming the column.
+        XCTAssertNil(LakeTime.parseDate("100000000000000000-01-01"))
+        XCTAssertNil(LakeTime.parseDate("5000001-01-01"))
+        XCTAssertNil(LakeTime.parseDate("२०२४-01-01"))
+        XCTAssertNil(LakeTime.parseTimestamp("2024-01-01 99999999999:00:00", unitsPerSecond: 1_000_000))
+        XCTAssertNil(LakeTime.parseTimestamp("2024-01-01 00:00:00.１", unitsPerSecond: 1_000_000))
+        XCTAssertNil(LakeTime.parseDecimal("½", scale: 2))
+        XCTAssertNil(LakeTime.parseDecimal("१", scale: 2))
+        XCTAssertNil(LakeTime.parseDecimal(String(repeating: "9", count: 200), scale: 2))
+        XCTAssertNil(LakeTime.parseDecimal(String(repeating: "9", count: 37), scale: 2))     // 39 digits at scale 2
+        var nines = ArrowDecimal128(0)
+        for _ in 0..<38 { nines = nines * ArrowDecimal128(10) + ArrowDecimal128(9) }
+        XCTAssertEqual(LakeTime.parseDecimal(String(repeating: "9", count: 36) + ".99", scale: 2), nines)
+        XCTAssertEqual(LakeTime.parseDecimal("000000000000000000000000000000000000000001.5", scale: 1), ArrowDecimal128(15))
+        for (column, literal) in [("day", "100000000000000000-01-01"), ("price", "½"), ("price", "१"),
+                                  ("price", String(repeating: "9", count: 200)), ("ts", "2024-01-01 99999999999:00:00")] {
+            XCTAssertThrowsError(try t.read(filters: [ParquetFilter(column: column, op: .gt, value: .string(literal))]), literal) { e in
+                XCTAssert("\(e)".contains("does not fit column \(column)"), "\(e)")
+            }
+        }
+        XCTAssertThrowsError(try t.read(filters: [ParquetFilter(column: "day", op: .gt, value: .int(1 << 40))])) { e in
+            XCTAssert("\(e)".contains("does not fit column day"), "\(e)")
+        }
+        // Transform projection with literals at the ends of the range.
+        let f = LakehouseField(name: "x", type: .int64, nullable: true, id: 1)
+        let tr = IcebergPartitionField(sourceId: 1, fieldId: 1000, name: "x_trunc", transform: "truncate[10]")
+        XCTAssertNil(IcebergTable.project(LakeFilter(field: f, op: .lt, literal: .int(.min)), tr))
+        XCTAssertEqual(IcebergTable.project(LakeFilter(field: f, op: .lt, literal: .int(.max)), tr)?.1, .int(.max - 7))
+        let ts = LakehouseField(name: "t", type: .timestamp(nanos: false, utc: true), nullable: true, id: 2)
+        let hour = IcebergPartitionField(sourceId: 2, fieldId: 1001, name: "t_hour", transform: "hour")
+        XCTAssertEqual(IcebergTable.project(LakeFilter(field: ts, op: .ge, literal: .int(.min)), hour)?.1,
+                       .int(Int64.min / 3_600_000_000 - 1))
+        let year = IcebergPartitionField(sourceId: 2, fieldId: 1002, name: "t_year", transform: "year")
+        XCTAssertNotNil(IcebergTable.project(LakeFilter(field: ts, op: .ge, literal: .int(.max)), year))
+        XCTAssertNotNil(IcebergTable.project(LakeFilter(field: ts, op: .le, literal: .int(.min)), year))
+    }
+
+    /// A float32 column compared with a double literal is the exact comparison (pyarrow widens the column).
+    func testFloat32ComparesExactly() throws {
+        let a = AnyMetalArray.float32(try MetalArray<Float>([0.1, 0.2, nil, .nan]))
+        func sel(_ op: CompareOp, _ d: Double) throws -> [Bool?] { try LakeRowFilter.mask(a, op, .double(d), column: "f").toArray() }
+        XCTAssertEqual(try sel(.eq, 0.1), [false, false, nil, false])          // 0.1f is 0.10000000149...
+        XCTAssertEqual(try sel(.gt, 0.1), [true, true, nil, false])
+        XCTAssertEqual(try sel(.le, 0.1), [false, false, nil, false])
+        XCTAssertEqual(try sel(.ne, 0.1), [true, true, nil, true])
+        XCTAssertEqual(try sel(.eq, Double(Float(0.1))), [true, false, nil, false])
+        XCTAssertEqual(try sel(.lt, 1e300), [true, true, nil, false])
+        XCTAssertEqual(try sel(.gt, -1e300), [true, true, nil, false])
+        // Delta statistics written as the shortest text of the float round back to it.
+        XCTAssertEqual(DeltaSnapshot.statScalar(NSNumber(value: 0.1), .float32), .double(Double(Float(0.1))))
+    }
+
+    /// Hand-crafted Avro containers that used to trap, recurse or loop are errors.
+    func testAvroMalformedContainersAreErrors() throws {
+        func zz(_ v: Int64) -> [UInt8] {
+            var u = UInt64(bitPattern: (v << 1) ^ (v >> 63))
+            var out: [UInt8] = []
+            while u >= 0x80 { out.append(UInt8(u & 0x7F) | 0x80); u >>= 7 }
+            out.append(UInt8(u))
+            return out
+        }
+        func str(_ s: String) -> [UInt8] { zz(Int64(s.utf8.count)) + Array(s.utf8) }
+        let sync = [UInt8](repeating: 0xAB, count: 16)
+        func container(_ schema: String, _ block: [UInt8]) -> [UInt8] {
+            [0x4F, 0x62, 0x6A, 0x01] + zz(2) + str("avro.schema") + str(schema) + str("avro.codec") + str("null")
+                + zz(0) + sync + block + sync
+        }
+        let rec = #"{"type":"record","name":"r","fields":[{"name":"a","type":"long"}]}"#
+        let cases: [(String, [UInt8], String)] = [
+            ("block size near Int64.max", container(rec, zz(1) + zz(.max)), "runs past the end"),
+            ("self-recursive record", container(#"{"type":"record","name":"r","fields":[{"name":"a","type":"r"}]}"#, zz(1) + zz(1) + [0]),
+             "nest deeper"),
+            ("huge block count, zero-width schema", container(#""null""#, zz(.max) + zz(0)), "records in 0 bytes"),
+            ("array count Int64.min", container(#"{"type":"array","items":"long"}"#,
+                                                zz(1) + zz(Int64(zz(.min).count + 1)) + zz(.min) + zz(0)),
+             "array block count"),
+        ]
+        for (name, bytes, message) in cases {
+            XCTAssertThrowsError(try AvroFile(bytes: bytes), name) { e in
+                XCTAssert("\(e)".contains(message), "\(name): \(e)")
+            }
+        }
+        // A recursive type through a union (a linked list) still decodes.
+        let list = #"{"type":"record","name":"node","fields":[{"name":"v","type":"long"},{"name":"next","type":["null","node"]}]}"#
+        let node = zz(2) + zz(1) + zz(3) + zz(0)          // v 2, next -> (v 3, next null)
+        let f = try AvroFile(bytes: container(list, zz(1) + zz(Int64(node.count)) + node))
+        XCTAssertEqual(f.records.count, 1)
+        XCTAssertEqual(f.records[0]["next"]?["v"], .long(3))
+    }
+
+    /// A table whose data files are the `delta/basic` commit-0 file, partitioned by a string column.
+    private func deltaWithPartitions(_ values: [Any], extra: [String: Any] = [:]) throws -> URL {
+        let tmp = try tempDir()
+        let src = try fixture("delta/basic") + "/part-00000-adeae1f2-b155-4c85-a2ab-acee5b343388-c000.snappy.parquet"
+        let base = try DeltaTable(path: try fixture("delta/basic")).snapshot(version: 0)
+        var schema = try JSONSerialization.jsonObject(with: Data(base.metadata.schemaString.utf8)) as! [String: Any]
+        var fields = schema["fields"] as! [[String: Any]]
+        fields.append(["name": "grp", "type": "string", "nullable": true, "metadata": [String: Any]()])
+        schema["fields"] = fields
+        let schemaString = String(decoding: try JSONSerialization.data(withJSONObject: schema), as: UTF8.self)
+        var actions: [[String: Any]] = [
+            ["protocol": ["minReaderVersion": 1, "minWriterVersion": 2]],
+            ["metaData": ["id": "t", "format": ["provider": "parquet", "options": [String: Any]()],
+                          "schemaString": schemaString, "partitionColumns": ["grp"], "configuration": [String: Any]()]],
+        ]
+        for (i, v) in values.enumerated() {
+            let rel = "f\(i).parquet"
+            try FileManager.default.copyItem(atPath: src, toPath: tmp.appendingPathComponent(rel).path)
+            var add: [String: Any] = ["path": rel, "partitionValues": ["grp": v], "size": 1, "modificationTime": 0, "dataChange": true]
+            for (k, x) in extra { add[k] = x }
+            actions.append(["add": add])
+        }
+        try writeCommit(tmp, 0, actions)
+        return tmp
+    }
+
+    /// The Delta protocol serializes a null partition value as the empty string, for strings too.
+    func testDeltaEmptyStringPartitionIsNull() throws {
+        XCTAssertNil(try DeltaTable.partitionScalar("", .string, column: "g"))
+        XCTAssertNil(try DeltaTable.partitionScalar("", .binary, column: "g"))
+        let dir = try deltaWithPartitions(["", "a", NSNull()])
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let t = try DeltaTable(path: dir.path)
+        let all = try t.read(columns: ["id", "grp"])
+        XCTAssertEqual(all.length, 90)
+        let grp = try XCTUnwrap(all.columns[1].asString).toArray()
+        XCTAssertEqual(grp.filter { $0 == nil }.count, 60)
+        XCTAssertEqual(grp.filter { $0 == "a" }.count, 30)
+        XCTAssertEqual(try t.read(filters: [ParquetFilter(column: "grp", op: .eq, value: .string(""))]).length, 0)
+        XCTAssertEqual(try t.read(filters: [ParquetFilter(column: "grp", op: .ne, value: .string("b"))]).length, 30)
+        XCTAssertEqual(try t.read(filters: [ParquetFilter(column: "grp", op: .lt, value: .string("b"))]).length, 30)
+    }
+
+    /// `partitionValues` that is not an object of strings and nulls is malformed, not "no partitions".
+    func testDeltaMalformedPartitionValues() throws {
+        for bad in [["x"] as Any, 5 as Any] {
+            let dir = try deltaWithPartitions(["a"], extra: ["partitionValues": bad])
+            defer { try? FileManager.default.removeItem(at: dir) }
+            XCTAssertThrowsError(try DeltaTable(path: dir.path).read()) { e in
+                XCTAssert("\(e)".contains("partitionValues of f0.parquet"), "\(e)")
+            }
+        }
+        let dir = try deltaWithPartitions([7])
+        defer { try? FileManager.default.removeItem(at: dir) }
+        XCTAssertThrowsError(try DeltaTable(path: dir.path).read()) { e in
+            XCTAssert("\(e)".contains("is not a string or null"), "\(e)")
+        }
+    }
+
+    /// Row-group pruning of a string filter uses the row filter's byte order. `nfd_strings.parquet`
+    /// holds decomposed "é" strings, byte-wise below "f" and above it in Swift's `String` order.
+    func testStringRowGroupPruningIsByteWise() throws {
+        let path = try fixture("parquet/nfd_strings.parquet")
+        let file = try ParquetFile(path: path)
+        XCTAssertEqual(file.metadata.rowGroups.count, 3)
+        let s = LakehouseField(name: "s", type: .string, nullable: true)
+        func groups(_ op: CompareOp, _ lit: String) -> [Int]? {
+            LakeDataFile.rowGroupPlan(file, [(column: "s", filter: LakeFilter(field: s, op: op, literal: .string(lit)))]).rowGroups
+        }
+        XCTAssertEqual(groups(.lt, "f"), [0, 1])
+        XCTAssertEqual(groups(.gt, "f"), [2])
+        XCTAssertEqual(groups(.eq, "e\u{301} 25"), [1])
+        XCTAssertEqual(LakeDataFile.rowGroupPlan(file, [(column: "s", filter: LakeFilter(field: s, op: .lt, literal: .string("f")))]).parquet.count, 0)
+        // Through a Delta table over the same file: every decomposed row survives `s < "f"`.
+        let tmp = try tempDir()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        try FileManager.default.copyItem(atPath: path, toPath: tmp.appendingPathComponent("p.parquet").path)
+        let schema = #"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},{"name":"s","type":"string","nullable":true,"metadata":{}}]}"#
+        try writeCommit(tmp, 0, [["protocol": ["minReaderVersion": 1, "minWriterVersion": 2]],
+                                 ["metaData": ["id": "t", "format": ["provider": "parquet"], "schemaString": schema,
+                                               "partitionColumns": [String](), "configuration": [String: Any]()]],
+                                 ["add": ["path": "p.parquet", "partitionValues": [String: Any](), "size": 1,
+                                          "modificationTime": 0, "dataChange": true]]])
+        let t = try DeltaTable(path: tmp.path)
+        XCTAssertEqual(try t.read(filters: [ParquetFilter(column: "s", op: .lt, value: .string("f"))]).length, 40)
+        XCTAssertEqual(try t.read(filters: [ParquetFilter(column: "s", op: .le, value: .string("f"))]).length, 40)
+        XCTAssertEqual(try t.read(filters: [ParquetFilter(column: "s", op: .gt, value: .string("f"))]).length, 20)
+    }
+
+    /// Iceberg paths are used as written first: pyiceberg puts `grp=x%3Dy` on disk literally.
+    func testIcebergPathsAreNotPercentDecodedFirst() throws {
+        let tmp = try tempDir()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let t = tmp.appendingPathComponent("t")
+        try FileManager.default.copyItem(atPath: try fixture("iceberg/v1_plain"), toPath: t.path)
+        let table = try IcebergTable(path: t.path)
+        let loc = table.location.hasSuffix("/") ? String(table.location.dropLast()) : table.location
+        for name in ["grp=x%3Dy", "grp=%C3%BC", "plain"] {
+            let dir = t.appendingPathComponent("data").appendingPathComponent(name)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            FileManager.default.createFile(atPath: dir.appendingPathComponent("f.parquet").path, contents: Data([1]))
+            XCTAssertEqual(try table.resolve(loc + "/data/" + name + "/f.parquet"),
+                           t.path + "/data/" + name + "/f.parquet")
+        }
+        // A writer that recorded an encoded URI for a decoded directory still resolves.
+        let decoded = t.appendingPathComponent("data").appendingPathComponent("a b")
+        try FileManager.default.createDirectory(at: decoded, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: decoded.appendingPathComponent("f.parquet").path, contents: Data([1]))
+        XCTAssertEqual(try table.resolve(loc + "/data/a%20b/f.parquet"), t.path + "/data/a b/f.parquet")
+    }
 }

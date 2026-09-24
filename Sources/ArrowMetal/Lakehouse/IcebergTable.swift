@@ -169,7 +169,7 @@ public final class IcebergTable: @unchecked Sendable {
         var best: (Int, String)? = nil
         for n in names where n.hasSuffix(".metadata.json") && !n.hasSuffix(".gz.metadata.json") {
             var v: Int? = nil
-            if n.hasPrefix("v") { v = Int(n.dropFirst().prefix { $0.isNumber }) }
+            if n.hasPrefix("v") { v = Int(n.dropFirst().prefix { $0.isASCIIDigit }) }
             else if let dash = n.firstIndex(of: "-") { v = Int(n[..<dash]) }
             guard let v else { continue }
             if best == nil || v > best!.0 { best = (v, n) }
@@ -278,10 +278,22 @@ public final class IcebergTable: @unchecked Sendable {
         while loc.hasSuffix("/") && loc.count > 1 { loc.removeLast() }
         let path = strip(p)
         if !loc.isEmpty, path.hasPrefix(loc + "/") {
+            // Iceberg paths are locations, not URIs: a writer that escapes a partition value
+            // (pyiceberg writes `grp=x%3Dy`) puts that text on disk. The path is used as written; the
+            // percent-decoded form is only a fallback for writers that recorded an encoded URI.
             let rel = String(path.dropFirst(loc.count + 1))
-            return LakePath.join(tableRoot, rel.removingPercentEncoding ?? rel)
+            let asWritten = LakePath.join(tableRoot, rel)
+            if LakePath.exists(asWritten) { return asWritten }
+            if let decoded = rel.removingPercentEncoding, decoded != rel, LakePath.exists(LakePath.join(tableRoot, decoded)) {
+                return LakePath.join(tableRoot, decoded)
+            }
+            return asWritten
         }
-        return try LakePath.local(p)
+        if p.hasPrefix("/") || !p.contains(":") { return p }
+        let local = try LakePath.local(p)
+        if LakePath.exists(local) { return local }
+        let raw = strip(p)
+        return LakePath.exists(raw) ? raw : local
     }
 
     // MARK: Planning
@@ -541,7 +553,11 @@ public final class IcebergTable: @unchecked Sendable {
         }
         let perSecond: Int64
         if case .timestamp(let ns, _) = f.field.type { perSecond = ns ? 1_000_000_000 : 1_000_000 } else { perSecond = 0 }
-        func floorDiv(_ a: Int64, _ b: Int64) -> Int64 { a >= 0 ? a / b : -((-a + b - 1) / b) }
+        // Floor division for b > 0 that cannot overflow (Int64.min included).
+        func floorDiv(_ a: Int64, _ b: Int64) -> Int64 {
+            let q = a / b
+            return (a % b != 0 && a < 0) ? q - 1 : q
+        }
         func days() -> Int64? {
             guard case .int(let v) = f.literal else { return nil }
             if f.field.type == .date { return v }
@@ -555,7 +571,8 @@ public final class IcebergTable: @unchecked Sendable {
             guard perSecond > 0, case .int(let v) = f.literal else { return nil }
             return (op, .int(floorDiv(v, 3600 * perSecond)))
         case "year", "month":
-            guard let d = days() else { return nil }
+            // Beyond a few million years the transform is not worth computing; do not prune.
+            guard let d = days(), d.magnitude <= 1 << 31 else { return nil }
             let c = LakeTime.civil(d)
             let y = Int64(c.year - 1970)
             return (op, .int(t == "year" ? y : y * 12 + Int64(c.month - 1)))
@@ -563,7 +580,11 @@ public final class IcebergTable: @unchecked Sendable {
             if t.hasPrefix("truncate["), t.hasSuffix("]"), let w = Int64(t.dropFirst(9).dropLast()), w > 0 {
                 switch f.literal {
                 case .int(let v) where f.field.type.isInteger:
-                    return (op, .int(v - (((v % w) + w) % w)))
+                    // v - ((v % w) + w) % w, without overflowing near the ends of the Int64 range.
+                    let r = v % w
+                    let rem = r < 0 ? r + w : r          // r is in (-w, w), so r + w cannot overflow
+                    let (t, o) = v.subtractingReportingOverflow(rem)
+                    return o ? nil : (op, .int(t))
                 case .string(let s):
                     return (op, .string(String(String.UnicodeScalarView(s.unicodeScalars.prefix(Int(w))))))
                 default: return nil
@@ -682,13 +703,8 @@ public final class IcebergTable: @unchecked Sendable {
             }, rowGroupFilters: { pf in
                 let byId = Self.parquetNamesById(pf, nameMapping: nameMapping)
                 return resolved.compactMap { f in
-                    guard let id = f.field.id, let n = byId[id], let v = f.literal.filterValue else { return nil }
-                    switch f.field.type {
-                    case .int32, .int64, .float32, .float64, .string, .date, .boolean, .timestamp: break
-                    default: return nil
-                    }
-                    if f.op == .ne, f.field.type == .float32 || f.field.type == .float64 { return nil }
-                    return ParquetFilter(column: n, op: ParquetFilter.Op(f.op), value: v)
+                    guard let id = f.field.id, let n = byId[id] else { return nil }
+                    return (column: n, filter: f)
                 }
             }, rowFilters: rowFilters, context: context)
         }

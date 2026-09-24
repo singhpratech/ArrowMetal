@@ -54,15 +54,42 @@ rows, as `deltalake`'s `to_pyarrow_table(filters=...)` and pyiceberg's `scan(row
 This differs from `read_parquet`, whose filters only skip row groups.
 
 A null never matches, including under `!=` (SQL and Arrow semantics); NaN is unequal to everything, so
-it matches `!=` and nothing else. Literals are read in the column's type: an integer column compared with
-`2.5` behaves as the exact comparison (`> 2.5` is `>= 3`), a literal outside an integer column's range
-matches everything or nothing as the comparison says, a date literal is a `datetime.date` or
-`"YYYY-MM-DD"`, a timestamp literal is a `datetime.datetime` (converted to UTC when it carries a zone, taken
-as UTC when it does not) or an ISO 8601 string, a decimal literal is an integer, a `decimal.Decimal` or a
-string that is exact at the column's scale. A literal that does not fit its column is an error naming both
-(`test_filter_literals`, `testRowFilterSemantics`, `testDeltaUnknownColumnAndBadLiteral`).
+it matches `!=` and nothing else, as in pyarrow. Literals are read in the column's type and compared as
+exact values, as pyarrow compares them:
+
+- an integer column compared with `2.5` behaves as `>= 3` for `> 2.5`; a literal outside the column's
+  range, including doubles beyond the Int64 range such as `9.25e18`, matches everything or nothing as the
+  comparison says (`testFilterLiteralsAtTypeEdges`, `test_filter_literals_at_type_edges`);
+- a float32 column compared with a double literal is the exact comparison: `0.1` as a float32 is
+  0.10000000149..., so it is `> 0.1` and not `== 0.1` (`testFloat32ComparesExactly`,
+  `test_float32_filters_compare_exactly`);
+- a date literal is a `datetime.date` or `"YYYY-MM-DD"` (ASCII digits, a year from 0 to 5,000,000, a
+  value that fits date32); a timestamp literal is a `datetime.datetime` (converted to UTC when it carries
+  a zone, taken as UTC when it does not) or an ISO 8601 string with two-digit hour, minute and second
+  fields that fits the column's unit;
+- a decimal literal is an integer, a `decimal.Decimal` or a string of ASCII digits that is exact at the
+  column's scale and has at most 38 significant digits;
+- a `bytes` literal (for a binary column) is passed through the filter text as UTF-8, so it must be valid
+  UTF-8 without `"`, `;` or NUL; other bytes are refused with an error saying so. The same holds for string
+  literals. A column name or literal containing an operator that the filter text would split at first
+  (`("s", "<", "a==b")`) is refused rather than read as a different filter
+  (`test_filter_text_that_would_change_meaning_is_refused`).
+
+A literal that does not fit its column is an error naming both, never a crash (`test_filter_literals`,
+`testRowFilterSemantics`, `testDeltaUnknownColumnAndBadLiteral`, `testFilterLiteralsAtTypeEdges`).
 String comparisons are byte-wise UTF-8 and run on the CPU over the unified-memory buffers; the other types
-compare on the GPU.
+compare on the GPU. Row groups are pruned by the same order: the readers decide string and binary
+row-group pruning themselves, byte-wise on the footer's `min_value` / `max_value`, so a decomposed "é"
+(which byte-wise sorts below "f") is kept for `< "f"` (`testStringRowGroupPruningIsByteWise`,
+`test_delta_decomposed_strings_survive_row_group_pruning`). Numeric, date, timestamp and boolean filters
+use the Parquet reader's row-group filter, only where its comparison is exact (an integer column's double
+literal below 2^53 in magnitude; a timestamp stored in the table's unit; floats never under `!=`).
+
+Malformed metadata is an error naming the file, never a crash or a hang: Avro blocks whose sizes or counts
+run past the data, records that contain themselves with nothing optional in between, a Delta
+`partitionValues` that is not an object of strings and nulls (`testAvroMalformedContainersAreErrors`,
+`test_malformed_manifest_list_is_an_error`, `testDeltaMalformedPartitionValues`). `version` is 0 or more
+(`None` reads the latest; in C, -1).
 
 ## Delta Lake
 
@@ -72,7 +99,7 @@ compare on the GPU.
 | Single-file checkpoints, read with the GPU Parquet reader (the `map` and `list` columns of the checkpoint included) | Yes | `testCheckpointAgreesWithLogReplay` |
 | Multi-part checkpoints (`N.checkpoint.P.T.parquet`) | Yes | the `multipart` fixture in `expected.json` |
 | Time travel to any version reconstructable from the log | Yes; a version whose commits were cleaned up and that no checkpoint covers is an error saying so | `testLogCleanup` |
-| Partition values of every primitive type, null partitions | Yes | `partitioned` (null partition), `by_day` (date partition) |
+| Partition values of every primitive type, null partitions | Yes; an empty partition value is null for every type, strings included, as the protocol specifies and `deltalake` reads it | `partitioned` (null partition), `by_day` (date partition), `testDeltaEmptyStringPartitionIsNull`, `test_delta_empty_string_partition_is_null` |
 | Schema evolution: columns added later read as null from older files | Yes | `evolution` |
 | Column mapping `none` and `name` (renamed columns, physical names in files and partition values) | Yes | `column_mapping`, `testDeltaColumnMappingUsesPhysicalNames` |
 | Partition pruning and per-file statistics pruning | Yes; the counters are in `stats` | `testDeltaPruning`, `test_generated_delta_pruning_counters` |
@@ -82,8 +109,10 @@ compare on the GPU.
 | Files on remote storage (`s3://` and other schemes) | Rejected with an error naming the scheme; local paths and `file:` URIs are read | `testNestedColumnsAndRemotePaths` |
 | Change data feed, `_last_checkpoint` hints, log compaction files | Not used; the log directory listing is the source of truth | |
 
-Timestamp statistics are written at millisecond precision and string statistics may be truncated, so file
-pruning skips timestamp columns and strings of 32 characters or more; the row filter still applies.
+File pruning by the per-file statistics uses integer, float, date and string columns. Timestamp
+statistics are written at millisecond precision and string statistics may be truncated, so timestamp
+columns and strings of 32 characters or more are not used; boolean, decimal and binary statistics are not
+used either. The row filter still applies to every column.
 
 ## Apache Iceberg
 
@@ -97,6 +126,7 @@ pruning skips timestamp columns and strings of 32 characters or more; the row fi
 | Files without field ids, through `schema.name-mapping.default` | Yes | `transforms`, `by_day` (files registered with `add_files`) |
 | Manifest pruning by partition summaries, file pruning by partition tuples and column bounds | identity, `year`, `month`, `day`, `hour`, `truncate[W]` partitions; `bucket[N]` and `void` partitions are read and not pruned | `testIcebergPruning`, `testIcebergTransformProjection`, `test_generated_iceberg_pruning_counters` |
 | Relocated tables: paths under the recorded `location` are re-rooted where the metadata was found | Yes | the committed fixtures record relative locations and are read from any working directory |
+| Paths as written: pyiceberg writes the directory of partition value `x=y` as `grp=x%3Dy` and records that path; it is opened as written, and the percent-decoded path is tried only when that does not exist | Yes | `testIcebergPathsAreNotPercentDecodedFirst`, `test_iceberg_partition_values_that_need_escaping` |
 | Position and equality delete files (v2) | Rejected with an error naming the kind and a delete file | `testIcebergRejectsDeleteFiles` |
 | gzip-compressed metadata files | Rejected with an error | `testNestedColumnsAndRemotePaths` |
 | Nested columns | Rejected when projected, as for Delta | `testNestedColumnsAndRemotePaths` |
@@ -105,8 +135,16 @@ pruning skips timestamp columns and strings of 32 characters or more; the row fi
 
 Checked by `python/tests/test_lakehouse.py`:
 
-- Types match `deltalake` column for column. pyiceberg returns `large_string` for some string columns;
-  ArrowMetal returns `string` (`test_iceberg_fixtures_match_pyiceberg`).
+- Types match `deltalake` column for column. pyiceberg returns `large_string` and `large_binary` for some
+  string and binary columns; ArrowMetal returns `string` and `binary` (`test_iceberg_fixtures_match_pyiceberg`,
+  `test_iceberg_partition_values_that_need_escaping`, which has a binary column).
+- A projection comes back in the order the columns were asked for; pyiceberg's `selected_fields` returns
+  them in schema order (`test_iceberg_partition_values_that_need_escaping`).
+- Float comparisons follow pyarrow. `deltalake` 1.6.5 agrees on every number but also returns the NaN row
+  for some ordering comparisons on a float32 column (`> 0.1`, `< 1e300`); pyiceberg 0.12.0 rounds a double
+  literal to float32 before comparing, so its `f > 0.1` leaves out the rows holding `0.1` as a float32,
+  which ArrowMetal and pyarrow return (`test_float32_filters_compare_exactly`,
+  `test_float32_literal_rounding_differs_from_pyiceberg`).
 - pyiceberg binds a time-travel scan's row filter against the current schema, so a column renamed after
   the snapshot is not found under its old name; ArrowMetal resolves filters in the snapshot's schema, like
   its projection (`test_time_travel_filters_use_the_snapshot_schema`). pyiceberg also refuses a float
@@ -114,9 +152,14 @@ Checked by `python/tests/test_lakehouse.py`:
   (`test_generated_iceberg_filters`).
 - `deltalake` 1.6.5 and polars 1.44.1 return nulls for every mapped column of the column-mapping fixture
   (Parquet files with physical names and field ids, partition values keyed by physical name, as the Delta
-  protocol specifies); the reference for that table is the pyarrow data it was written from
-  (`test_column_mapping_reference_readers_return_nulls`, `test_column_mapping_reads_the_source_data`).
-  The fixture is written by hand: pyarrow data files and JSON commits.
+  protocol specifies). DuckDB 1.5.5's `delta_scan` reads the mapped data columns (`id`, `total`) exactly
+  as ArrowMetal does, which checks the file-level mapping, and returns null for the mapped partition column
+  `region`, which ArrowMetal fills from `partitionValues` keyed by the physical name. No independent reader
+  confirms that partition keying; it follows the protocol text, and the reference for that column is the
+  pyarrow data the table was written from (`test_column_mapping_reference_readers_return_nulls`,
+  `test_column_mapping_duckdb_reads_data_columns_not_the_partition`,
+  `test_column_mapping_reads_the_source_data`). The fixture is written by hand: pyarrow data files and
+  JSON commits.
 - Row order is not defined by either format; every comparison sorts.
 
 ## Tests and fixtures
@@ -124,8 +167,9 @@ Checked by `python/tests/test_lakehouse.py`:
 `Tests/Fixtures/lakehouse/generate_lakehouse.py` writes the fixture tables with `deltalake` 1.6.5 and
 pyiceberg 0.12.0 (the SQL catalog on SQLite, pyarrow 25.0.1): several commits, appends, deletes,
 predicate overwrites, a checkpoint, a multi-part checkpoint, partitions of several types, schema evolution,
-a hand-written column-mapping table, three tables with reader features the reader refuses, and an Iceberg
-table whose last snapshot adds a position delete file. It also writes `expected.json`: the rows the
+a hand-written column-mapping table, three tables with reader features the reader refuses, an Iceberg
+table whose last snapshot adds a position delete file, and `parquet/nfd_strings.parquet` (decomposed
+strings in three row groups, for the byte-wise row-group pruning test). It also writes `expected.json`: the rows the
 reference readers return for 62 reads, which `LakehouseTests.swift` replays. `python/tests/test_lakehouse.py`
 replays the same file, compares the committed tables with the reference readers live, and generates larger
 tables (thousands of rows, many files, a checkpoint, deletes, schema evolution) to compare every filter

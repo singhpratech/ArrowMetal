@@ -4506,10 +4506,15 @@ _lib.am_lakehouse_batch_stats.restype = ctypes.c_int
 _lib.am_lakehouse_batch_release.argtypes = [_P]
 
 
+_LAKEHOUSE_OPS = ("==", "!=", "<=", ">=", "<", ">")    # the order the ABI's filter parser tries them in
+
+
 def _lakehouse_filter_text(filters):
     """`[("x", ">", 3), ("d", ">=", datetime.date(2024, 1, 1))]` -> the ABI's filter text. Dates and
     datetimes become ISO 8601 string literals, which the reader parses against the column's type (a
-    naive datetime is taken as UTC)."""
+    naive datetime is taken as UTC). A `bytes` literal (for a binary column) is passed as its UTF-8 text,
+    so it must be valid UTF-8; a filter the text form cannot carry exactly is an error, never a
+    different filter."""
     if not filters:
         return None
     if isinstance(filters, str):
@@ -4528,9 +4533,18 @@ def _lakehouse_filter_text(filters):
             lit = '"%s"' % val.isoformat()
         elif isinstance(val, _dt.date):
             lit = '"%s"' % val.isoformat()
+        elif isinstance(val, (bytes, bytearray)):
+            try:
+                text = bytes(val).decode("utf-8")
+            except UnicodeDecodeError:
+                raise ArrowMetalError("a bytes filter literal must be valid UTF-8 (the filter text carries it "
+                                      "as a string); got %r" % (bytes(val),))
+            if '"' in text or ";" in text or "\0" in text:
+                raise ArrowMetalError("a bytes filter literal cannot contain '\"', ';' or NUL; got %r" % (bytes(val),))
+            lit = '"%s"' % text
         elif isinstance(val, str):
-            if '"' in val or ";" in val:
-                raise ArrowMetalError("a string filter literal cannot contain '\"' or ';'; got %r" % (val,))
+            if '"' in val or ";" in val or "\0" in val:
+                raise ArrowMetalError("a string filter literal cannot contain '\"', ';' or NUL; got %r" % (val,))
             lit = '"%s"' % val
         elif isinstance(val, bool):
             lit = "1" if val else "0"
@@ -4545,7 +4559,19 @@ def _lakehouse_filter_text(filters):
                     raise TypeError
             except TypeError:
                 raise ArrowMetalError("unsupported filter literal %r for column %r" % (val, col))
-        parts.append("%s%s%s" % (col, op, lit))
+        if not isinstance(col, str) or not col or col.strip() != col or any(c in col for c in ';"\0'):
+            raise ArrowMetalError("filter column name %r cannot be written as filter text" % (col,))
+        text = "%s%s%s" % (col, op, lit)
+        # The parser splits at the first operator it finds, trying them in `_LAKEHOUSE_OPS` order; refuse
+        # a column name or literal that would move the split (`("s", "<", "a==b")`).
+        for cand in _LAKEHOUSE_OPS:
+            at = text.find(cand)
+            if at >= 0:
+                if (at, cand) != (len(col), op):
+                    raise ArrowMetalError("filter %r cannot be written as filter text: the operator %r inside "
+                                          "the column name or literal would be read first" % ((col, op, val), cand))
+                break
+        parts.append(text)
     return ";".join(parts).encode()
 
 
@@ -4598,6 +4624,8 @@ def read_delta(path, version=None, columns=None, filters=None, with_stats=False)
         cols = am.read_delta("events", version=3, columns=["user", "amount"],
                              filters=[("day", ">=", datetime.date(2024, 1, 1))])
     """
+    if version is not None and int(version) < 0:
+        raise ArrowMetalError("version must be 0 or more (None reads the latest); got %r" % (version,))
     names, n = _lakehouse_columns(columns)
     out = _P()
     _check(_lib.am_delta_read(str(path).encode(), -1 if version is None else int(version), names, n,

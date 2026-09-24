@@ -127,10 +127,9 @@ def test_delta_fixtures_match_deltalake(name):
     path = os.path.join(FIXTURES, "delta", name)
     ref = dl.DeltaTable(path)
     for v in range(ref.version() + 1):
-        try:
-            expected = dl.DeltaTable(path, version=v).to_pyarrow_table()
-        except Exception:        # versions below a multi-part checkpoint are still readable by both
-            continue
+        # Every version is compared; a version deltalake cannot read fails the test rather than
+        # dropping out of the comparison.
+        expected = dl.DeltaTable(path, version=v).to_pyarrow_table()
         got = am.read_delta_table(path, version=v)
         assert got.schema == expected.schema, (name, v)
         assert normalise(got) == normalise(expected), (name, v)
@@ -149,13 +148,20 @@ def test_iceberg_fixtures_match_pyiceberg(name, monkeypatch):
         got = am.read_iceberg_table(os.path.join(FIXTURES, meta), snapshot_id=s.snapshot_id)
         assert got.column_names == expected.column_names
         for f_got, f_exp in zip(got.schema, expected.schema):
-            if pa.types.is_large_string(f_exp.type):
-                # pyiceberg returns large_string for some string columns; ArrowMetal returns string.
-                assert f_got.type == pa.string()
-            else:
-                assert f_got.type == f_exp.type, (name, f_got, f_exp)
+            assert_iceberg_type(f_got.type, f_exp.type, (name, f_got, f_exp))
         assert normalise(got) == normalise(expected), (name, s.snapshot_id)
     assert am.iceberg_current_snapshot(os.path.join(FIXTURES, "iceberg", name)) == static.metadata.current_snapshot_id
+
+
+def assert_iceberg_type(got, expected, where=None):
+    """pyiceberg returns large_string / large_binary for some string and binary columns; ArrowMetal
+    returns string / binary. Every other type must match exactly."""
+    if pa.types.is_large_string(expected):
+        assert got == pa.string(), where
+    elif pa.types.is_large_binary(expected):
+        assert got == pa.binary(), where
+    else:
+        assert got == expected, where
 
 
 # ---- generated tables, larger, filtered every way
@@ -429,3 +435,274 @@ def test_c_abi_argument_errors():
     assert b"`path` is NULL" in lib.am_last_error()
     assert lib.am_iceberg_read(b"x", 0, 0, None, 3, None, ctypes.byref(out)) == 2
     assert b"`columns` is NULL but `n_columns` is 3" in lib.am_last_error()
+
+
+
+# ---- review findings: values the first fixtures did not cover, and inputs that used to crash
+
+NFD_E = "e\u0301"          # "é" decomposed, as macOS file names store it: byte-wise below "f"
+
+
+@needs_delta
+def test_delta_empty_string_partition_is_null(tmp_path):
+    """The Delta protocol writes a null partition value as "" for every type; deltalake reads it as
+    null, and so does ArrowMetal."""
+    p = str(tmp_path / "t")
+    grp = ["", "a", None, "x=y", "ü"]
+    t = pa.table({"id": pa.array(range(50), pa.int64()), "grp": pa.array([grp[i % 5] for i in range(50)])})
+    dl.write_deltalake(p, t, partition_by=["grp"])
+    log = open(sorted(glob.glob(p + "/_delta_log/*.json"))[0]).read()
+    assert '"grp":""' in log.replace(" ", "")        # the empty partition value is in the log
+    got = am.read_delta_table(p)
+    assert normalise(got) == normalise(dl.DeltaTable(p).to_pyarrow_table())
+    assert got["grp"].null_count == 20
+    for flt in [[("grp", "==", "")], [("grp", "!=", "a")], [("grp", "<", "b")], [("grp", ">=", "")]]:
+        expected = dl.DeltaTable(p).to_pyarrow_table(filters=flt)
+        assert normalise(am.read_delta_table(p, filters=flt)) == normalise(expected), flt
+
+
+@needs_delta
+def test_delta_decomposed_strings_survive_row_group_pruning(tmp_path):
+    from deltalake import WriterProperties
+    p = str(tmp_path / "t")
+    s = ["%s%02d" % (NFD_E, i) for i in range(100)] + ["g%02d" % i for i in range(20)]
+    t = pa.table({"id": pa.array(range(120), pa.int64()), "s": s})
+    dl.write_deltalake(p, t, writer_properties=WriterProperties(max_row_group_size=16))
+    for flt in [[("s", "<", "f")], [("s", "<=", "f")], [("s", ">", "f")], [("s", ">=", NFD_E + "50")],
+                [("s", "==", NFD_E + "07")], [("s", "!=", NFD_E + "07")]]:
+        expected = dl.DeltaTable(p).to_pyarrow_table(filters=flt)
+        got = am.read_delta_table(p, filters=flt)
+        assert normalise(got) == normalise(expected), flt
+    assert am.read_delta_table(p, filters=[("s", "<", "f")]).num_rows == 100
+
+
+def iceberg_catalog(tmp_path):
+    from pyiceberg.catalog.sql import SqlCatalog
+    cat = SqlCatalog("t", uri="sqlite:///%s" % (tmp_path / "cat.db"), warehouse="file://%s" % tmp_path)
+    cat.create_namespace("ns")
+    return cat
+
+
+@needs_iceberg
+def test_iceberg_partition_values_that_need_escaping(tmp_path):
+    """pyiceberg writes the directory of partition value "x=y" as `grp=x%3Dy` and records that path;
+    the reader opens it as written. The table also has a binary column and decomposed strings in small
+    row groups."""
+    cat = iceberg_catalog(tmp_path)
+    grp = ["x=y", "ü", "a b", "plain", NFD_E]
+    n = 200
+    t = pa.table({
+        "id": pa.array(range(n), pa.int64()),
+        "grp": pa.array([grp[i % 5] for i in range(n)]),
+        "s": pa.array(["%s%03d" % (NFD_E, i) if i % 4 else "g%03d" % i for i in range(n)]),
+        "bin": pa.array([bytes([i % 3, 0x61, 0x62]) if i % 7 else None for i in range(n)], pa.binary()),
+    })
+    tbl = cat.create_table("ns.t", schema=t.schema, properties={"write.parquet.row-group-limit": "8"})
+    with tbl.update_spec() as u:
+        u.add_identity("grp")
+    tbl.append(t)
+    tbl = cat.load_table("ns.t")
+    tbl.append(t.slice(0, 50))
+    tbl = cat.load_table("ns.t")
+    dirs = {os.path.basename(d) for d in glob.glob(str(tmp_path / "ns" / "t" / "data" / "*"))}
+    assert "grp=x%3Dy" in dirs and "grp=%C3%BC" in dirs
+    meta = tbl.metadata_location
+    static = StaticTable.from_metadata(meta)
+    for snap in static.metadata.snapshots:
+        expected = static.scan(snapshot_id=snap.snapshot_id).to_arrow()
+        got = am.read_iceberg_table(meta, snapshot_id=snap.snapshot_id)
+        assert got.column_names == expected.column_names
+        for f_got, f_exp in zip(got.schema, expected.schema):
+            assert_iceberg_type(f_got.type, f_exp.type, (f_got, f_exp))
+        assert normalise(got) == normalise(expected), snap.snapshot_id
+    from pyiceberg.expressions import EqualTo, GreaterThan, LessThan, LessThanOrEqual, NotEqualTo
+    for flt, expr in [([("grp", "==", "x=y")], EqualTo("grp", "x=y")), ([("grp", "!=", "ü")], NotEqualTo("grp", "ü")),
+                      ([("s", "<", "f")], LessThan("s", "f")), ([("s", "<=", "f")], LessThanOrEqual("s", "f")),
+                      ([("s", ">", "f")], GreaterThan("s", "f")), ([("grp", "<", "f")], LessThan("grp", "f"))]:
+        expected = static.scan(row_filter=expr).to_arrow()
+        got = am.read_iceberg_table(meta, filters=flt)
+        assert normalise(got) == normalise(expected), flt
+    # A bytes literal that is valid UTF-8 filters a binary column; one that is not is refused by name.
+    full = static.scan().to_arrow()
+    got = am.read_iceberg_table(meta, filters=[("bin", "==", b"\x01ab")])
+    assert normalise(got) == normalise(full.filter(pc.equal(full["bin"], pa.scalar(b"\x01ab", pa.large_binary()))))
+    with pytest.raises(am.ArrowMetalError, match="must be valid UTF-8"):
+        am.read_iceberg(meta, filters=[("bin", "==", b"\x01\x00\xff")])
+    # Projection: ArrowMetal returns the columns in the order asked for, pyiceberg in schema order.
+    got = am.read_iceberg_table(meta, columns=["s", "id"])
+    assert got.column_names == ["s", "id"]
+    assert static.scan(selected_fields=("s", "id")).to_arrow().column_names == ["id", "s"]
+    assert normalise(got) == normalise(full.select(["s", "id"]))
+
+
+PA_OPS = {"==": pc.equal, "!=": pc.not_equal, "<": pc.less, "<=": pc.less_equal, ">": pc.greater,
+          ">=": pc.greater_equal}
+
+
+# The comparisons for which deltalake 1.6.5 also returns a NaN row (docs/LAKEHOUSE.md).
+DELTALAKE_NAN_ROWS = {(">", 0.1), (">=", 0.10000000149011612), ("<", 1e300), (">", -1e300)}
+
+
+@needs_delta
+def test_float32_filters_compare_exactly(tmp_path):
+    """A float32 column against a double literal is the exact comparison, as pyarrow does (it widens the
+    column). deltalake agrees on the numbers but also returns the NaN row for some ordering comparisons;
+    pyiceberg rounds the literal to float32 first."""
+    p = str(tmp_path / "t")
+    t = pa.table({"f": pa.array([0.1, 0.2, 0.5, None, float("nan")], pa.float32())})
+    dl.write_deltalake(p, t)
+    dl.write_deltalake(p, pa.table({"f": pa.array([0.1], pa.float32())}), mode="append")
+    full = dl.DeltaTable(p).to_pyarrow_table()
+    for col, op, lit in [("f", "==", 0.1), ("f", ">", 0.1), ("f", "<=", 0.1), ("f", "!=", 0.1),
+                         ("f", ">=", 0.10000000149011612), ("f", "<", 0.5), ("f", "<", 1e300), ("f", ">", -1e300)]:
+        got = am.read_delta_table(p, filters=[(col, op, lit)])
+        assert normalise(got) == normalise(full.filter(PA_OPS[op](full["f"], lit))), (op, lit)
+        reference = dl.DeltaTable(p).to_pyarrow_table(filters=[(col, op, lit)])
+        if op != "!=":
+            # deltalake returns the NaN row for some ordering comparisons (the ones recorded below);
+            # the numbers agree.
+            nan_rows = pc.sum(pc.is_nan(reference["f"])).as_py() or 0
+            assert nan_rows == (1 if (op, lit) in DELTALAKE_NAN_ROWS else 0), (op, lit)
+            reference = reference.filter(pc.invert(pc.is_nan(reference["f"])))
+        assert normalise(got) == normalise(reference), (op, lit)
+    assert am.read_delta_table(p, filters=[("f", ">", 0.1)]).num_rows == 4        # both 0.1f rows, 0.2, 0.5
+
+
+@needs_iceberg
+def test_float32_literal_rounding_differs_from_pyiceberg(tmp_path):
+    cat = iceberg_catalog(tmp_path)
+    t = pa.table({"f": pa.array([0.1, 0.2, 0.5, None], pa.float32())})
+    tbl = cat.create_table("ns.t", schema=t.schema)
+    tbl.append(t)
+    meta = cat.load_table("ns.t").metadata_location
+    from pyiceberg.expressions import GreaterThan
+    ref = StaticTable.from_metadata(meta).scan(row_filter=GreaterThan("f", 0.1)).to_arrow()
+    assert ref.num_rows == 2                        # pyiceberg: 0.1 rounded to 0.1f, which is not > 0.1f
+    got = am.read_iceberg_table(meta, filters=[("f", ">", 0.1)])
+    assert normalise(got) == normalise(t.filter(pc.greater(t["f"], 0.1)))
+    assert got.num_rows == 3                        # exact: 0.1f is 0.10000000149... > 0.1
+
+
+def test_filter_text_that_would_change_meaning_is_refused():
+    path = os.path.join(FIXTURES, "delta", "basic")
+    with pytest.raises(am.ArrowMetalError, match="would be read first"):
+        am.read_delta(path, filters=[("name", "<", "a==b")])
+    with pytest.raises(am.ArrowMetalError, match="version must be 0 or more"):
+        am.read_delta(path, version=-5)
+    lib = am._lib
+    out = ctypes.c_void_p()
+    assert lib.am_delta_read(path.encode(), -5, None, 0, None, ctypes.byref(out)) == 1
+    assert b"version -5" in lib.am_last_error()
+
+
+def run_isolated(code, timeout=120):
+    """Runs `code` in a fresh interpreter, so a crash is a failed test rather than a dead suite."""
+    import subprocess
+    import sys
+    env = dict(os.environ, PYTHONPATH=os.path.join(ROOT, "python"))
+    return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=timeout,
+                          cwd=ROOT, env=env)
+
+
+EDGE_LITERALS = [
+    ("delta/basic", "id", ">", 9.25e18, 0),
+    ("delta/basic", "id", "<", -9.25e18, 0),
+    ("delta/basic", "qty", "<", 9.25e18, None),       # None: every non-null qty
+    ("iceberg/v2_partitioned", "id", ">", 9.25e18, 0),
+    ("delta/basic", "day", ">", "100000000000000000-01-01", "does not fit column day"),
+    ("delta/basic", "ts", ">", "2024-01-01 99999999999:00:00", "does not fit column ts"),
+    ("delta/basic", "price", ">", "\u00bd", "does not fit column price"),
+    ("delta/basic", "price", ">", "\u0967", "does not fit column price"),
+    ("delta/basic", "price", ">", "9" * 200, "does not fit column price"),
+]
+
+
+@pytest.mark.parametrize("table,col,op,lit,want", EDGE_LITERALS, ids=[repr(e[1:4]) for e in EDGE_LITERALS])
+def test_filter_literals_at_type_edges(table, col, op, lit, want):
+    fn = "read_delta_table" if table.startswith("delta") else "read_iceberg_table"
+    code = ("import arrowmetal as am\ntry:\n    print(am.%s(%r, filters=[(%r, %r, %r)]).num_rows)\n"
+            "except am.ArrowMetalError as e:\n    print('ERROR', e)\n"
+            % (fn, os.path.join(FIXTURES, table), col, op, lit))
+    r = run_isolated(code)
+    assert r.returncode == 0, (r.returncode, r.stderr[-500:])
+    out = r.stdout.strip()
+    if isinstance(want, str):
+        assert out.startswith("ERROR") and want in out, out
+    elif want is None:
+        base = am.read_delta_table(os.path.join(FIXTURES, table))
+        assert out == str(len(base[col]) - base[col].null_count)
+    else:
+        assert out == str(want)
+
+
+def _zz(v):
+    u = ((v << 1) ^ (v >> 63)) & 0xFFFFFFFFFFFFFFFF
+    out = bytearray()
+    while u >= 0x80:
+        out.append((u & 0x7F) | 0x80)
+        u >>= 7
+    out.append(u)
+    return bytes(out)
+
+
+def _avro(schema, block):
+    def s(x):
+        b = x.encode()
+        return _zz(len(b)) + b
+    sync = b"\xab" * 16
+    return b"Obj\x01" + _zz(2) + s("avro.schema") + s(schema) + s("avro.codec") + s("null") + _zz(0) + sync + block + sync
+
+
+MALFORMED_AVRO = {
+    "block size near Int64.max": ('{"type":"record","name":"r","fields":[{"name":"a","type":"long"}]}',
+                                  _zz(1) + _zz(2 ** 63 - 1)),
+    "self-recursive record": ('{"type":"record","name":"r","fields":[{"name":"a","type":"r"}]}', _zz(1) + _zz(1) + b"\x00"),
+    "huge block count, null schema": ('"null"', _zz(2 ** 63 - 1) + _zz(0)),
+    "array count Int64.min": ('{"type":"array","items":"long"}', _zz(1) + _zz(11) + _zz(-2 ** 63) + _zz(0)),
+}
+
+
+@pytest.mark.parametrize("name", sorted(MALFORMED_AVRO))
+def test_malformed_manifest_list_is_an_error(tmp_path, name):
+    schema, block = MALFORMED_AVRO[name]
+    dst = tmp_path / "iceberg" / "v1_plain"
+    shutil.copytree(os.path.join(FIXTURES, "iceberg", "v1_plain"), dst)
+    meta = json.load(open(sorted(glob.glob(str(dst / "metadata" / "*.metadata.json")))[-1]))
+    listing = tmp_path / meta["snapshots"][-1]["manifest-list"]
+    listing.write_bytes(_avro(schema, block))
+    code = ("import arrowmetal as am\ntry:\n    am.read_iceberg(%r)\n    print('READ')\n"
+            "except am.ArrowMetalError as e:\n    print('ERROR', e)\n" % str(dst))
+    r = run_isolated(code, timeout=60)
+    assert r.returncode == 0, (r.returncode, r.stderr[-500:])
+    assert r.stdout.startswith("ERROR") and "manifest list" in r.stdout, r.stdout
+
+
+def test_delta_malformed_partition_values_are_errors(tmp_path):
+    dst = tmp_path / "by_day"
+    shutil.copytree(os.path.join(FIXTURES, "delta", "by_day"), dst)
+    last = sorted(glob.glob(str(dst / "_delta_log" / "*.json")))[-1]
+    text = open(last).read()
+    assert '"partitionValues":{' in text
+    open(last, "w").write(text.replace('"partitionValues":{', '"partitionValues":[{').replace('},"size"', '}],"size"'))
+    with pytest.raises(am.ArrowMetalError, match="is not a JSON object"):
+        am.read_delta(str(dst))
+
+
+def test_column_mapping_duckdb_reads_data_columns_not_the_partition():
+    """DuckDB's delta_scan reads the mapped data columns of the column-mapping fixture exactly as
+    ArrowMetal does, and returns null for the mapped partition column (docs/LAKEHOUSE.md)."""
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect(config={"autoinstall_known_extensions": False, "autoload_known_extensions": False})
+    try:
+        con.execute("LOAD delta")
+    except Exception as e:           # pragma: no cover - depends on the local extension cache
+        pytest.skip("DuckDB's delta extension does not load offline: %s" % str(e).splitlines()[0])
+    path = os.path.join(FIXTURES, "delta", "column_mapping")
+    ref = con.execute("SELECT * FROM delta_scan('%s')" % path).arrow()
+    if hasattr(ref, "read_all"):
+        ref = ref.read_all()
+    got = am.read_delta_table(path)
+    assert ref.column_names == got.column_names == ["id", "region", "total"]
+    assert normalise(got.select(["id", "total"])) == normalise(ref.select(["id", "total"]))
+    assert ref["region"].null_count == ref.num_rows
+    assert got["region"].null_count == 0

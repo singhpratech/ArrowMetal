@@ -1565,7 +1565,8 @@ int am_stream_join_group_by(am_stream* s, struct ArrowArrayStream* build, const 
 // reader features; Iceberg delete files) fail with an error naming the feature.
 typedef struct am_lakehouse_batch am_lakehouse_batch;   // opaque
 
-// Delta Lake: `path` is the table directory (holding _delta_log/). `version` < 0 reads the latest.
+// Delta Lake: `path` is the table directory (holding _delta_log/). `version` -1 reads the latest; any
+// other negative version is an error.
 int     am_delta_read(const char* path, int64_t version, const char** columns, int64_t n_columns,
                       const char* filters, am_lakehouse_batch** out);
 int64_t am_delta_latest_version(const char* path);          // -1 on error

@@ -114,7 +114,7 @@ public final class DeltaTable: @unchecked Sendable {
         var out = LogListing()
         var parts: [Int64: [Int: [Int: String]]] = [:]     // version -> total parts -> part -> name
         for n in names {
-            guard n.count > 20, let v = Int64(n.prefix(20)), n.prefix(20).allSatisfy({ $0.isNumber }) else { continue }
+            guard n.count > 20, let v = Int64(n.prefix(20)), n.prefix(20).allSatisfy(\.isASCIIDigit) else { continue }
             let rest = n.dropFirst(20)
             if rest == ".json" { out.commits[v] = n; continue }
             if rest == ".checkpoint.parquet" { out.checkpoints[v] = [n]; continue }
@@ -269,8 +269,19 @@ public final class DeltaTable: @unchecked Sendable {
     static func addFile(_ a: [String: Any], where loc: String) throws -> DeltaAddFile {
         guard let p = a["path"] as? String else { throw LakehouseError.malformed("add without a path in \(loc)") }
         var pv: [String: String?] = [:]
-        if let m = a["partitionValues"] as? [String: Any] {
-            for (k, v) in m { pv[k] = v as? String }
+        switch a["partitionValues"] {
+        case nil, is NSNull: break
+        case let m as [String: Any]:
+            for (k, v) in m {
+                switch v {
+                case let s as String: pv[k] = .some(s)
+                case is NSNull: pv[k] = .some(nil)
+                default:
+                    throw LakehouseError.malformed("partition value \(v) of \(k) for \(p) in \(loc) is not a string or null")
+                }
+            }
+        default:
+            throw LakehouseError.malformed("partitionValues of \(p) in \(loc) is not a JSON object")
         }
         let dv = a["deletionVector"]
         return DeltaAddFile(path: p, partitionValues: pv, size: (a["size"] as? NSNumber)?.int64Value ?? 0,
@@ -402,17 +413,22 @@ public final class DeltaTable: @unchecked Sendable {
         return .nested("unknown")
     }
 
-    /// A partition value string (Delta's partition value serialization) as a scalar of `type`.
+    /// A partition value string (Delta's partition value serialization) as a scalar of `type`. The
+    /// protocol serializes a null partition value as null or as the empty string, for every type
+    /// (strings included), which is how `deltalake` and DuckDB read it.
     static func partitionScalar(_ s: String?, _ type: LakehouseType, column: String) throws -> LakeScalar? {
-        guard let s else { return nil }
-        if s.isEmpty && type != .string { return nil }
+        guard let s, !s.isEmpty else { return nil }
         func bad() -> LakehouseError { .malformed("partition value \"\(s)\" of column \(column) is not a \(type)") }
         switch type {
         case .string: return .string(s)
         case .int8, .int16, .int32, .int64:
             guard let i = Int64(s) else { throw bad() }
             return .int(i)
-        case .float32, .float64:
+        case .float32:
+            // The value the column holds is the float nearest the text.
+            guard let d = Double(s) else { throw bad() }
+            return .double(Double(Float(d)))
+        case .float64:
             guard let d = Double(s) else { throw bad() }
             return .double(d)
         case .boolean:
@@ -509,15 +525,21 @@ extension DeltaSnapshot {
         return true
     }
 
-    /// A statistics value as a scalar, or nil when it is absent or not safe to prune on (timestamps are
-    /// written at millisecond precision; long strings may be truncated).
+    /// A statistics value as a scalar, or nil when it is absent or not safe to prune on: timestamps are
+    /// written at millisecond precision and long strings may be truncated; boolean, decimal, binary and
+    /// the other types are not used for pruning.
     static func statScalar(_ v: Any?, _ type: LakehouseType) -> LakeScalar? {
         guard let v, !(v is NSNull) else { return nil }
         switch type {
         case .int8, .int16, .int32, .int64:
             guard let n = v as? NSNumber, CFNumberIsFloatType(n) == false else { return nil }
             return .int(n.int64Value)
-        case .float32, .float64:
+        case .float32:
+            // Writers print a float32 bound either exactly or as the shortest text that rounds back to
+            // it; rounding to the nearest float recovers the value either way.
+            guard let n = v as? NSNumber else { return nil }
+            return .double(Double(Float(n.doubleValue)))
+        case .float64:
             guard let n = v as? NSNumber else { return nil }
             return .double(n.doubleValue)
         case .string:
@@ -560,15 +582,7 @@ extension DeltaSnapshot {
             if idx == nil { fields.append(f.field); idx = fields.count - 1 }
             rowFilters.append((idx!, f.op, f.literal))
         }
-        let rowGroupFilters: [ParquetFilter] = resolved.compactMap { f in
-            guard !parts.contains(f.field.name), let v = f.literal.filterValue else { return nil }
-            switch f.field.type {
-            case .int8, .int16, .int32, .int64, .float32, .float64, .string, .date, .boolean: break
-            default: return nil
-            }
-            if f.op == .ne, f.field.type == .float32 || f.field.type == .float64 { return nil }
-            return ParquetFilter(column: f.field.physicalName, op: ParquetFilter.Op(f.op), value: v)
-        }
+        let rowGroupFilters = resolved.filter { !parts.contains($0.field.name) }.map { (column: $0.field.physicalName, filter: $0) }
         let (selected, stats) = try plan(resolved)
         let root = tablePath
         let batches = try LakeDataFile.readAll(count: selected.count) { [fields] i in

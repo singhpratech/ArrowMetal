@@ -191,6 +191,11 @@ struct AvroDecoder {
     let bytes: [UInt8]
     var pos: Int
     let names: [String: AvroSchema]
+    /// Current nesting of `decode` calls. A schema whose records nest deeper than `maxDepth` (in
+    /// practice a record that contains itself without an array, map or union in between, which no
+    /// finite value satisfies) is refused instead of recursing until the stack runs out.
+    private var depth = 0
+    static let maxDepth = 256
 
     init(_ bytes: [UInt8], names: [String: AvroSchema], at pos: Int = 0) {
         self.bytes = bytes
@@ -221,7 +226,8 @@ struct AvroDecoder {
     }
 
     mutating func take(_ n: Int) throws -> [UInt8] {
-        guard n >= 0, pos + n <= bytes.count else {
+        // `n <= count - pos` rather than `pos + n <= count`: a length near Int.max must not overflow.
+        guard n >= 0, n <= bytes.count - pos else {
             throw AvroError.malformed("length \(n) at byte \(pos) runs past the end (\(bytes.count) bytes)")
         }
         defer { pos += n }
@@ -235,6 +241,16 @@ struct AvroDecoder {
     }
 
     mutating func decode(_ s: AvroSchema) throws -> AvroValue {
+        depth += 1
+        defer { depth -= 1 }
+        guard depth <= Self.maxDepth else {
+            throw AvroError.malformed("values nest deeper than \(Self.maxDepth) levels at byte \(pos) "
+                                      + "(a record that contains itself with nothing optional in between?)")
+        }
+        return try decodeValue(s)
+    }
+
+    private mutating func decodeValue(_ s: AvroSchema) throws -> AvroValue {
         switch s {
         case .null: return .null
         case .boolean: return .boolean(try byte() != 0)
@@ -265,7 +281,11 @@ struct AvroDecoder {
             while true {
                 var count = try long()
                 if count == 0 { break }
-                if count < 0 { count = -count; _ = try long() }     // block byte size, unused
+                if count < 0 {                                   // negated count, then the block byte size
+                    guard count != .min else { throw AvroError.malformed("array block count \(count)") }
+                    count = -count
+                    _ = try long()
+                }
                 guard count <= Int64(bytes.count - pos) + 1 else { throw AvroError.malformed("array block of \(count) items") }
                 for _ in 0..<count { out.append(try decode(items)) }
             }
@@ -275,7 +295,11 @@ struct AvroDecoder {
             while true {
                 var count = try long()
                 if count == 0 { break }
-                if count < 0 { count = -count; _ = try long() }
+                if count < 0 {
+                    guard count != .min else { throw AvroError.malformed("map block count \(count)") }
+                    count = -count
+                    _ = try long()
+                }
                 guard count <= Int64(bytes.count - pos) + 1 else { throw AvroError.malformed("map block of \(count) entries") }
                 for _ in 0..<count {
                     let k = String(decoding: try lengthPrefixed(), as: UTF8.self)
@@ -302,6 +326,9 @@ struct AvroDecoder {
 
 /// An Avro object container file, fully decoded.
 public struct AvroFile: Sendable {
+    /// The most records a block may declare beyond its byte count (records that encode to no bytes).
+    static let maxZeroWidthRecords: Int64 = 1 << 20
+
     /// Header metadata (`avro.schema`, `avro.codec`, and anything the writer added, e.g. Iceberg's
     /// `format-version`, `partition-spec`, `schema`).
     public let metadata: [String: String]
@@ -348,6 +375,11 @@ public struct AvroFile: Sendable {
             case "deflate": block = try AvroCodecs.inflateRaw(raw)
             case "snappy": block = try AvroCodecs.snappyBlock(raw)
             default: block = raw
+            }
+            // A record takes at least one byte unless its schema encodes to nothing (a bare `null`,
+            // an empty record); cap the count so a corrupt header cannot loop for ever or exhaust memory.
+            guard count <= Swift.max(Int64(block.count), AvroFile.maxZeroWidthRecords) else {
+                throw AvroError.malformed("\(source): block of \(count) records in \(block.count) bytes")
             }
             var b = AvroDecoder(block, names: names)
             for _ in 0..<count { records.append(try b.decode(schema)) }
@@ -421,7 +453,7 @@ enum AvroCodecs {
         }
         let total = try varint()
         var out = [UInt8]()
-        out.reserveCapacity(total)
+        out.reserveCapacity(Swift.min(total, 64 << 20))      // the preamble is not trusted for a huge allocation
         func need(_ n: Int) throws {
             guard pos + n <= src.count else { throw AvroError.malformed("snappy data truncated") }
         }
