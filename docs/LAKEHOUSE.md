@@ -77,8 +77,10 @@ exact values, as pyarrow compares them:
 
 A literal that does not fit its column is an error naming both, never a crash (`test_filter_literals`,
 `testRowFilterSemantics`, `testDeltaUnknownColumnAndBadLiteral`, `testFilterLiteralsAtTypeEdges`).
-String comparisons are byte-wise UTF-8 and run on the CPU over the unified-memory buffers; the other types
-compare on the GPU. Row groups are pruned by the same order: the readers decide string and binary
+Integer, float, temporal and decimal columns compare on the GPU; string, binary and boolean columns compare
+on the CPU over the unified-memory buffers, strings and binary byte-wise, and a comparison whose answer is
+known without the data (a literal outside the column's range, a NaN literal) is a constant mask built on the
+CPU. Row groups are pruned by the same order: the readers decide string and binary
 row-group pruning themselves, byte-wise on the footer's `min_value` / `max_value`, so a decomposed "é"
 (which byte-wise sorts below "f") is kept for `< "f"` (`testStringRowGroupPruningIsByteWise`,
 `test_delta_decomposed_strings_survive_row_group_pruning`). Numeric, date, timestamp and boolean filters
@@ -87,8 +89,13 @@ literal below 2^53 in magnitude; a timestamp stored in the table's unit; floats 
 
 Malformed metadata is an error naming the file, never a crash or a hang: Avro blocks whose sizes or counts
 run past the data, records that contain themselves with nothing optional in between, a Delta
-`partitionValues` that is not an object of strings and nulls (`testAvroMalformedContainersAreErrors`,
-`test_malformed_manifest_list_is_an_error`, `testDeltaMalformedPartitionValues`). `version` is 0 or more
+`partitionValues` that is not an object of strings and nulls, a Delta reader protocol 3 whose
+`readerFeatures` is missing or not a list of strings, an Iceberg snapshot with neither a `manifest-list` nor
+`manifests`, and a data file that holds none of the table's columns (a Delta table without column mapping,
+or an Iceberg file without field ids in a table without a name mapping) instead of rows of nulls
+(`testAvroMalformedContainersAreErrors`, `test_malformed_manifest_list_is_an_error`,
+`testDeltaMalformedPartitionValues`, `testDeltaReaderFeaturesMustBeAListOfStrings`,
+`testIcebergSnapshotWithoutManifestsIsAnError`, `testDataFilesWithoutTheTableColumnsAreErrors`). `version` is 0 or more
 (`None` reads the latest; in C, -1).
 
 ## Delta Lake
@@ -102,7 +109,7 @@ run past the data, records that contain themselves with nothing optional in betw
 | Partition values of every primitive type, null partitions | Yes; an empty partition value is null for every type, strings included, as the protocol specifies and `deltalake` reads it | `partitioned` (null partition), `by_day` (date partition), `testDeltaEmptyStringPartitionIsNull`, `test_delta_empty_string_partition_is_null` |
 | Schema evolution: columns added later read as null from older files | Yes | `evolution` |
 | Column mapping `none` and `name` (renamed columns, physical names in files and partition values) | Yes | `column_mapping`, `testDeltaColumnMappingUsesPhysicalNames` |
-| Partition pruning and per-file statistics pruning | Yes; the counters are in `stats` | `testDeltaPruning`, `test_generated_delta_pruning_counters` |
+| Partition pruning and per-file statistics pruning | Yes; the counters are in `stats`. A NaN float partition value is kept for `!=` only | `testDeltaPruning`, `test_generated_delta_pruning_counters`, `testDeltaNaNPartitionMatchesNotEqual`, `test_delta_nan_partition_matches_not_equal` |
 | Reader protocol versions 1 to 3; reader features `columnMapping`, `timestampNtz`, `vacuumProtocolCheck` | Yes | `testDeltaReaderFeaturesItImplements` |
 | Deletion vectors, column mapping mode `id`, any other reader feature (type widening, v2 checkpoints, variant, unknown names) | Rejected with an error naming the feature | `testDeltaRejectsUnsupportedFeaturesByName`, `test_delta_errors_name_the_feature` |
 | Nested columns (struct, array, map) | Rejected when projected, with an error naming the column; project the other columns | `testNestedColumnsAndRemotePaths` |
@@ -150,6 +157,11 @@ Checked by `python/tests/test_lakehouse.py`:
   its projection (`test_time_travel_filters_use_the_snapshot_schema`). pyiceberg also refuses a float
   literal against an integer column; ArrowMetal compares exactly, as pyarrow does
   (`test_generated_iceberg_filters`).
+- pyiceberg 0.12.0 returns every row, nulls included, for a comparison it can decide without the data:
+  `!=` on a column added after some files were written returns those files' null-filled rows, and a
+  literal beyond the column's range (`i32 < 2**63 - 1`, `f32 < 1e308`) returns the null and NaN rows.
+  ArrowMetal keeps its rule (a null never matches; NaN matches only `!=`) and returns the rows pyarrow's
+  filter returns (`test_null_rows_under_always_true_filters_differ_from_pyiceberg`).
 - `deltalake` 1.6.5 and polars 1.44.1 return nulls for every mapped column of the column-mapping fixture
   (Parquet files with physical names and field ids, partition values keyed by physical name, as the Delta
   protocol specifies). DuckDB 1.5.5's `delta_scan` reads the mapped data columns (`id`, `total`) exactly
@@ -183,8 +195,6 @@ against `deltalake`, pyiceberg, polars (`scan_delta`, `scan_iceberg`) and DuckDB
 `deltalake` 1.6.5, pyiceberg 0.12.0, polars 1.44.1 and DuckDB 1.5.5 with its extensions from the local
 extension cache. That run,
 `Benchmarks/results/lakehouse_2026-09-23_provisional.csv`, was taken while other work shared the machine
-and the GPU; it is provisional. On it, the CPU readers are ahead on every read. Timing the phases of
-those reads put the time in the per-file Parquet decode, not in the metadata or the concatenation. Files
-are decoded several at a time, each thread with its own command buffer; the per-file decode itself (a chain
-of small kernels with CPU round trips in between) is the part to improve, and belongs to the Parquet
-reader ([PARQUET.md](PARQUET.md)).
+and the GPU; it is provisional. On it, the CPU readers are ahead on every read. The benchmark times whole
+reads; data files are decoded several at a time by the GPU Parquet reader ([PARQUET.md](PARQUET.md)), each
+thread with its own command buffer.

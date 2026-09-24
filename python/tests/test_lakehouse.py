@@ -706,3 +706,49 @@ def test_column_mapping_duckdb_reads_data_columns_not_the_partition():
     assert normalise(got.select(["id", "total"])) == normalise(ref.select(["id", "total"]))
     assert ref["region"].null_count == ref.num_rows
     assert got["region"].null_count == 0
+
+
+@needs_delta
+@pytest.mark.parametrize("op", ["==", "!=", "<", "<=", ">", ">="])
+def test_delta_nan_partition_matches_not_equal(tmp_path, op):
+    """A float partition value of NaN (deltalake writes `fp=NaN`) is unequal to every literal: the file is
+    kept for `!=` and pruned for every other comparison, as deltalake and pyarrow filter it."""
+    p = str(tmp_path / "t")
+    src = pa.table({"id": pa.array([1, 2, 3], pa.int64()), "fp": pa.array([1.0, float("nan"), 2.0])})
+    dl.write_deltalake(p, src, partition_by=["fp"])
+    got = am.read_delta_table(p, filters=[("fp", op, 1.0)])
+    ref = dl.DeltaTable(p).to_pyarrow_table(filters=[("fp", op, 1.0)])
+    assert sorted(got["id"].to_pylist()) == sorted(ref["id"].to_pylist())
+    if op == "!=":
+        assert sorted(got["id"].to_pylist()) == [2, 3]
+
+
+@needs_iceberg
+def test_null_rows_under_always_true_filters_differ_from_pyiceberg(tmp_path):
+    """pyiceberg 0.12.0 turns a comparison it can decide without the data into "every row", nulls
+    included: `!=` on a column that older files predate returns those files' null-filled rows, and a
+    literal beyond the column's range returns the null and NaN rows. ArrowMetal keeps its null rule (a
+    null never matches, NaN matches only `!=`) and returns what pyarrow's filter does (docs/LAKEHOUSE.md)."""
+    from pyiceberg.expressions import LessThan, NotEqualTo
+    from pyiceberg.types import StringType
+    cat = iceberg_catalog(tmp_path)
+    t1 = pa.table({"id": pa.array([1, 2, 3], pa.int64()), "i": pa.array([1, None, 3], pa.int32()),
+                   "f": pa.array([1.0, None, float("nan")], pa.float32())})
+    tbl = cat.create_table("ns.t", schema=t1.schema)
+    tbl.append(t1)
+    with tbl.update_schema() as u:
+        u.add_column("note", StringType())
+    t2 = pa.table({"id": pa.array([4, 5, 6], pa.int64()), "i": pa.array([4, 5, None], pa.int32()),
+                   "f": pa.array([2.0, 3.0, None], pa.float32()), "note": pa.array(["n0", "n1", None])})
+    cat.load_table("ns.t").append(t2)
+    meta = cat.load_table("ns.t").metadata_location
+    full = pa.concat_tables([t1.append_column("note", pa.nulls(3, pa.string())), t2])
+    cases = [(("note", "!=", "n0"), NotEqualTo("note", "n0"), pc.not_equal(full["note"], "n0"), [1, 2, 3, 5]),
+             (("i", "<", 2 ** 63 - 1), LessThan("i", 2 ** 63 - 1), pc.less(full["i"], 2 ** 63 - 1), [1, 2, 3, 4, 5, 6]),
+             (("f", "<", 1e308), LessThan("f", 1e308), pc.less(full["f"].cast(pa.float64()), 1e308), [1, 2, 3, 4, 5, 6])]
+    for flt, expr, mask, pyiceberg_ids in cases:
+        got = sorted(am.read_iceberg_table(meta, filters=[flt])["id"].to_pylist())
+        assert got == sorted(full.filter(mask)["id"].to_pylist()), flt
+        ref = sorted(StaticTable.from_metadata(meta).scan(row_filter=expr).to_arrow()["id"].to_pylist())
+        assert ref == pyiceberg_ids, flt
+        assert got != ref, flt

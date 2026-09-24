@@ -221,6 +221,10 @@ Parquet on the GPU
   Filter literals at the edges of their types (doubles past the Int64 range, huge years, non-ASCII digits,
   decimals over 38 digits) and malformed Avro manifests or Delta `partitionValues` are answers or errors,
   never a crash or a hang; a negative Delta version other than -1 (C) is an error.
+- Lakehouse reads: a NaN Delta float partition is kept for `!=` (it was pruned for every comparison); a
+  Delta reader protocol 3 whose `readerFeatures` is missing or not a list of strings, an Iceberg snapshot
+  with neither a manifest list nor manifests, and a data file holding none of the table's columns are
+  errors instead of reads.
 
 Out-of-core streaming
 - A streaming executor for datasets larger than memory (docs/STREAMING.md): Arrow IPC files/directories

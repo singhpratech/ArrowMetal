@@ -225,7 +225,11 @@ public final class DeltaTable: @unchecked Sendable {
             throw LakehouseError.unsupportedFeature("reader protocol version \(p.minReaderVersion) (table \(table)); versions 1 to 3 are read")
         }
         if p.minReaderVersion == 3 {
-            for f in p.readerFeatures ?? [] where !supportedReaderFeatures.contains(f) {
+            guard let features = p.readerFeatures else {
+                throw LakehouseError.malformed("reader protocol version 3 without protocol.readerFeatures (table \(table)); "
+                                               + "version 3 requires the list")
+            }
+            for f in features where !supportedReaderFeatures.contains(f) {
                 throw LakehouseError.unsupportedFeature("\(f) (a reader feature of table \(table); supported: "
                                                         + supportedReaderFeatures.sorted().joined(separator: ", ") + ")")
             }
@@ -259,9 +263,17 @@ public final class DeltaTable: @unchecked Sendable {
                       let w = (p["minWriterVersion"] as? NSNumber)?.intValue else {
                     throw LakehouseError.malformed("protocol action without versions in commit \(version)")
                 }
+                func featureList(_ key: String) throws -> [String]? {
+                    switch p[key] {
+                    case nil, is NSNull: return nil
+                    case let list as [String]: return list
+                    default:
+                        throw LakehouseError.malformed("protocol.\(key) in commit \(version) is not a list of strings")
+                    }
+                }
                 protocolAction = DeltaProtocol(minReaderVersion: r, minWriterVersion: w,
-                                               readerFeatures: p["readerFeatures"] as? [String],
-                                               writerFeatures: p["writerFeatures"] as? [String])
+                                               readerFeatures: try featureList("readerFeatures"),
+                                               writerFeatures: try featureList("writerFeatures"))
             }
         }
     }
@@ -485,7 +497,15 @@ extension DeltaSnapshot {
             for flt in filters where parts.contains(flt.field.name) {
                 let raw = f.partitionValues[flt.field.physicalName] ?? nil
                 let v = try DeltaTable.partitionScalar(raw, flt.field.type, column: flt.field.name)
-                guard let v, let c = LakeScalar.compare(v, flt.literal), flt.op.holds(c) else {
+                // A null partition value matches no comparison. A value that cannot be ordered against
+                // the literal (a NaN on either side) is unequal to it, so it matches `!=` only.
+                let keep: Bool
+                if let v {
+                    if let c = LakeScalar.compare(v, flt.literal) { keep = flt.op.holds(c) } else { keep = flt.op == .ne }
+                } else {
+                    keep = false
+                }
+                if !keep {
                     stats.filesPrunedByPartition += 1
                     continue outer
                 }
@@ -585,12 +605,20 @@ extension DeltaSnapshot {
         let rowGroupFilters = resolved.filter { !parts.contains($0.field.name) }.map { (column: $0.field.physicalName, filter: $0) }
         let (selected, stats) = try plan(resolved)
         let root = tablePath
+        // Without column mapping a column cannot be dropped, so every data file holds at least one of the
+        // table's data columns; a file holding none of them is not a data file of this table.
+        let dataColumns = columnMappingMode == "none"
+            ? schema.filter { !parts.contains($0.name) }.map { $0.physicalName } : []
         let batches = try LakeDataFile.readAll(count: selected.count) { [fields] i in
             let file = selected[i]
             let local = try LakePath.local(file.path.contains("://") || file.path.hasPrefix("file:") ? file.path
                                            : LakePath.join(root, file.path.removingPercentEncoding ?? file.path))
             return try LakeDataFile.read(path: local, fields: fields, resolve: { pf in
-                try fields.map { f -> LakeColumnSource in
+                if !dataColumns.isEmpty, !pf.fields.contains(where: { dataColumns.contains($0.name) }) {
+                    throw LakehouseError.malformed("data file \(local) holds none of the table's columns ("
+                                                   + dataColumns.joined(separator: ", ") + ")")
+                }
+                return try fields.map { f -> LakeColumnSource in
                     if parts.contains(f.name) {
                         let raw = file.partitionValues[f.physicalName] ?? nil
                         return .constant(try DeltaTable.partitionScalar(raw, f.type, column: f.name))

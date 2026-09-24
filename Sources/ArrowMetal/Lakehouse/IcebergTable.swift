@@ -332,6 +332,8 @@ public final class IcebergTable: @unchecked Sendable {
             }
         } else if let list = snap.manifests {
             manifests = list.map { ManifestRef(path: $0, specId: -1, content: 0, partitions: nil) }
+        } else {
+            throw LakehouseError.malformed("snapshot \(sid) of \(metadataPath) has neither a manifest-list nor manifests")
         }
 
         // Delete files change which rows are live; reading around them would return deleted rows.
@@ -689,6 +691,10 @@ public final class IcebergTable: @unchecked Sendable {
             let local = try self.resolve(df.path)
             let spec = specs.first { $0.specId == df.specId }
             return try LakeDataFile.read(path: local, fields: fields, resolve: { pf in
+                if nameMapping.isEmpty, !pf.fields.isEmpty, !Self.hasFieldIds(pf) {
+                    throw LakehouseError.malformed("data file \(local) has no field ids and the table \(self.metadataPath) "
+                                                   + "has no schema.name-mapping.default")
+                }
                 let byId = Self.parquetNamesById(pf, nameMapping: nameMapping)
                 return fields.map { f -> LakeColumnSource in
                     if let id = f.id, let n = byId[id] { return .parquet(n) }
@@ -737,6 +743,24 @@ public final class IcebergTable: @unchecked Sendable {
             for e in topLevel { if let id = nameMapping[e.name] { out[id] = e.name } }
         }
         return out
+    }
+
+    /// Whether any top-level column of the file carries an Iceberg field id.
+    static func hasFieldIds(_ pf: ParquetFile) -> Bool {
+        let els = pf.metadata.schema
+        var index = 1
+        func skip() {
+            guard index < els.count else { return }
+            let e = els[index]
+            index += 1
+            for _ in 0..<Swift.max(e.numChildren, 0) { skip() }
+        }
+        for _ in 0..<Swift.max(els.first?.numChildren ?? 0, 0) {
+            guard index < els.count else { break }
+            if els[index].fieldID != nil { return true }
+            skip()
+        }
+        return false
     }
 
     /// `schema.name-mapping.default`: `[{"field-id": 1, "names": ["id", "old_id"]}, ...]` as name -> id.

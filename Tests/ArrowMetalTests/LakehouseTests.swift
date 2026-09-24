@@ -612,13 +612,13 @@ final class LakehouseTests: XCTestCase {
     }
 
     /// A table whose data files are the `delta/basic` commit-0 file, partitioned by a string column.
-    private func deltaWithPartitions(_ values: [Any], extra: [String: Any] = [:]) throws -> URL {
+    private func deltaWithPartitions(_ values: [Any], type: String = "string", extra: [String: Any] = [:]) throws -> URL {
         let tmp = try tempDir()
         let src = try fixture("delta/basic") + "/part-00000-adeae1f2-b155-4c85-a2ab-acee5b343388-c000.snappy.parquet"
         let base = try DeltaTable(path: try fixture("delta/basic")).snapshot(version: 0)
         var schema = try JSONSerialization.jsonObject(with: Data(base.metadata.schemaString.utf8)) as! [String: Any]
         var fields = schema["fields"] as! [[String: Any]]
-        fields.append(["name": "grp", "type": "string", "nullable": true, "metadata": [String: Any]()])
+        fields.append(["name": "grp", "type": type, "nullable": true, "metadata": [String: Any]()])
         schema["fields"] = fields
         let schemaString = String(decoding: try JSONSerialization.data(withJSONObject: schema), as: UTF8.self)
         var actions: [[String: Any]] = [
@@ -720,5 +720,110 @@ final class LakehouseTests: XCTestCase {
         try FileManager.default.createDirectory(at: decoded, withIntermediateDirectories: true)
         FileManager.default.createFile(atPath: decoded.appendingPathComponent("f.parquet").path, contents: Data([1]))
         XCTAssertEqual(try table.resolve(loc + "/data/a%20b/f.parquet"), t.path + "/data/a b/f.parquet")
+    }
+
+    /// A NaN partition value is unequal to every literal: kept for `!=`, pruned for the other comparisons.
+    func testDeltaNaNPartitionMatchesNotEqual() throws {
+        let dir = try deltaWithPartitions(["1.0", "NaN", "2.0"], type: "double")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let t = try DeltaTable(path: dir.path)
+        func count(_ op: ParquetFilter.Op, _ v: Double) throws -> Int {
+            try t.read(filters: [ParquetFilter(column: "grp", op: op, value: .double(v))]).length
+        }
+        XCTAssertEqual(try count(.ne, 1.0), 60)
+        XCTAssertEqual(try count(.eq, 1.0), 30)
+        XCTAssertEqual(try count(.lt, 5.0), 60)
+        XCTAssertEqual(try count(.ge, 1.0), 60)
+        XCTAssertEqual(try count(.gt, 1.0), 30)
+        XCTAssertEqual(try count(.ne, .nan), 90)
+        XCTAssertEqual(try count(.eq, .nan), 0)
+        let scan = try t.scan(filters: [ParquetFilter(column: "grp", op: .ne, value: .double(1.0))])
+        XCTAssertEqual(scan.stats.filesPrunedByPartition, 1)
+    }
+
+    /// Reader protocol 3 requires `readerFeatures` as a list of strings; anything else is malformed, so
+    /// the feature check cannot be skipped by a list written another way.
+    func testDeltaReaderFeaturesMustBeAListOfStrings() throws {
+        let tmp = try tempDir()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let bad: [(Any?, String)] = [("deletionVectors", "is not a list of strings"), ([1, 2], "is not a list of strings"),
+                                     (["a": 1], "is not a list of strings"), (nil, "without protocol.readerFeatures"),
+                                     (NSNull(), "without protocol.readerFeatures")]
+        for (i, (features, message)) in bad.enumerated() {
+            let t = tmp.appendingPathComponent("t\(i)")
+            try FileManager.default.copyItem(atPath: try fixture("delta/basic"), toPath: t.path)
+            var p: [String: Any] = ["minReaderVersion": 3, "minWriterVersion": 7]
+            if let features { p["readerFeatures"] = features }
+            try writeCommit(t, 5, [["protocol": p]])
+            XCTAssertThrowsError(try DeltaTable(path: t.path).read(), "\(String(describing: features))") { e in
+                guard case LakehouseError.malformed(let m) = e else { return XCTFail("\(e)") }
+                XCTAssert(m.contains(message), m)
+            }
+        }
+        // A reader protocol below 3 needs no list.
+        let t = tmp.appendingPathComponent("v1")
+        try FileManager.default.copyItem(atPath: try fixture("delta/basic"), toPath: t.path)
+        try writeCommit(t, 5, [["protocol": ["minReaderVersion": 1, "minWriterVersion": 2]]])
+        XCTAssertEqual(try DeltaTable(path: t.path).read().length, 50)
+    }
+
+    /// A snapshot with neither a manifest list nor a manifests list is malformed, not an empty table.
+    func testIcebergSnapshotWithoutManifestsIsAnError() throws {
+        let tmp = try tempDir()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let t = tmp.appendingPathComponent("t")
+        try FileManager.default.copyItem(atPath: try fixture("iceberg/v2_partitioned"), toPath: t.path)
+        let before = try IcebergTable(path: t.path).read().length
+        XCTAssertGreaterThan(before, 0)
+        let metaDir = t.appendingPathComponent("metadata")
+        let newest = try FileManager.default.contentsOfDirectory(atPath: metaDir.path)
+            .filter { $0.hasSuffix(".metadata.json") }.sorted().last!
+        let url = metaDir.appendingPathComponent(newest)
+        var meta = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+        meta["snapshots"] = (meta["snapshots"] as! [[String: Any]]).map { s in
+            var s = s
+            s["manifest-list"] = nil
+            return s
+        }
+        try JSONSerialization.data(withJSONObject: meta).write(to: url)
+        XCTAssertThrowsError(try IcebergTable(path: url.path).read()) { e in
+            guard case LakehouseError.malformed(let m) = e else { return XCTFail("\(e)") }
+            XCTAssert(m.contains("neither a manifest-list nor manifests") && m.contains(newest), m)
+        }
+    }
+
+    /// A data file that holds none of the table's columns is not read as rows of nulls: in Delta without
+    /// column mapping (where no column can be dropped), and in Iceberg for a file without field ids in a
+    /// table without a name mapping (pyiceberg refuses it too).
+    func testDataFilesWithoutTheTableColumnsAreErrors() throws {
+        let tmp = try tempDir()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let d = tmp.appendingPathComponent("d")
+        try FileManager.default.copyItem(atPath: try fixture("delta/basic"), toPath: d.path)
+        let fm = FileManager.default
+        let checkpoint = try fm.contentsOfDirectory(atPath: d.appendingPathComponent("_delta_log").path)
+            .first { $0.hasSuffix(".checkpoint.parquet") }!
+        for f in try fm.contentsOfDirectory(atPath: d.path) where f.hasSuffix(".parquet") {
+            try fm.removeItem(at: d.appendingPathComponent(f))
+            try fm.copyItem(at: d.appendingPathComponent("_delta_log").appendingPathComponent(checkpoint),
+                            to: d.appendingPathComponent(f))
+        }
+        XCTAssertThrowsError(try DeltaTable(path: d.path).read()) { e in
+            XCTAssert("\(e)".contains("holds none of the table's columns"), "\(e)")
+        }
+        let ice = tmp.appendingPathComponent("i")
+        try fm.copyItem(atPath: try fixture("iceberg/v2_partitioned"), toPath: ice.path)
+        let noIds = try fixture("parquet/nfd_strings.parquet")
+        let data = fm.enumerator(atPath: ice.appendingPathComponent("data").path)!.compactMap { $0 as? String }
+            .filter { $0.hasSuffix(".parquet") }
+        XCTAssertFalse(data.isEmpty)
+        for f in data {
+            let u = ice.appendingPathComponent("data").appendingPathComponent(f)
+            try fm.removeItem(at: u)
+            try fm.copyItem(atPath: noIds, toPath: u.path)
+        }
+        XCTAssertThrowsError(try IcebergTable(path: ice.path).read()) { e in
+            XCTAssert("\(e)".contains("has no field ids"), "\(e)")
+        }
     }
 }
