@@ -60,11 +60,14 @@
 #include "arrowmetal.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <chrono>
 #include <cstring>
 #include <deque>
 #include <mutex>
 #include <sys/mman.h>
+#include <thread>
+#include <unordered_map>
 
 namespace duckdb {
 namespace arrowmetal_rewrite {
@@ -90,9 +93,33 @@ struct Crossovers {
 	static constexpr int64_t GROUP_UTF8 = 10000000;
 };
 
+//===--------------------------------------------------------------------===//
+// Measured floors. The router's crossovers compare kernels on data already in GPU memory; here the
+// rows first have to be gathered out of DuckDB's scan, and DuckDB's own aggregate is fast. So 'auto'
+// also requires the query's shape class to have been measured faster than DuckDB's operators, from
+// the row count below, in Benchmarks/duckdb_rewrite_bench.py
+// (Benchmarks/results/duckdb_rewrite_2026-09-23_provisional.csv). A class with no floor here was not
+// measured faster at 1M, 10M or 50M rows and is never rewritten in 'auto'. The effective threshold is
+// the larger of the two. These are from a provisional run on a shared machine; they are revisited
+// with the quiet rerun.
+//===--------------------------------------------------------------------===//
+struct Measured {
+	// Ungrouped, with two or more of SUM/MIN/MAX/AVG, or one DuckDB keeps in a 128-bit state.
+	static constexpr int64_t UNGROUPED = 10000000;
+	// Integer key within the fused group-by's range, DuckDB estimating 100k groups or more.
+	static constexpr int64_t DENSE_MANY_GROUPS = 10000000;
+	// Integer key within the fused group-by's range, fewer groups, three or more of SUM/MIN/MAX/AVG.
+	static constexpr int64_t DENSE_FEW_GROUPS = 50000000;
+};
+
 // The fused group-by keeps one slot per key value; above this span the hash group-by is used instead.
 // At 10M rows a 1M-key fused group-by ran in about half the hash group-by's time.
 static constexpr int64_t DENSE_KEY_SPAN = int64_t(1) << 20;
+// A group-by is streamed only when its key range is at most this, which keeps the host-side merge of
+// the per-block partials to a direct-indexed array.
+static constexpr int64_t STREAM_KEY_SPAN = 65536;
+// Rows per block of a streamed plan, unless SET arrowmetal_rewrite_block_rows says otherwise.
+static constexpr int64_t DEFAULT_BLOCK_ROWS = int64_t(1) << 22;
 // Slots the fused group-by keeps in threadgroup memory (ExprCompiler.gbMaxPrivateSlots).
 static constexpr int64_t FUSED_PRIVATE_SLOTS = 2048;
 // The GPU kernels index rows with 32-bit integers, and a 32-bit value summed over fewer than 2^31
@@ -162,7 +189,7 @@ static void RecordRun(int64_t id, const string &path, int64_t rows, int64_t grou
 
 // One GPU at a time: ArrowMetal serialises on the device anyway, and holding this keeps two queries'
 // command buffers from interleaving.
-static std::mutex g_gpu_lock;
+static std::recursive_mutex g_gpu_lock;
 
 // ARROWMETAL_REWRITE_TRACE=1 prints the time since `start` at each Finalize step to stderr.
 static void Trace(const char *step, std::chrono::steady_clock::time_point start) {
@@ -278,6 +305,9 @@ struct Spec {
 	vector<AggSpec> aggs;
 	vector<LogicalType> result_types; // key (if any), then one per aggregate
 	int64_t decision_id = 0;
+	// Streamed plans aggregate block by block while DuckDB scans (see "Blocks").
+	bool stream = false;
+	idx_t block_rows = 0;
 };
 
 //===--------------------------------------------------------------------===//
@@ -415,49 +445,13 @@ static void ReturnSlab(unique_ptr<Slab> slab) {
 			}
 		}
 	}
-	// `evicted` is destroyed here, outside the lock.
+	// Releasing an evicted slab's arrays is an ArrowMetal call, so it happens under the GPU lock (and not
+	// under the pool's).
+	if (!evicted.empty()) {
+		std::lock_guard<std::recursive_mutex> gpu(g_gpu_lock);
+		evicted.clear();
+	}
 }
-
-struct ColumnStore {
-	Kind kind = Kind::I64;
-	idx_t width = 8;
-	unique_ptr<Slab> slab; // fixed width
-	Region data;           // STR: the UTF-8 bytes
-	Region offsets;        // STR: int64 offsets, rows + 1 of them
-	Region bits;           // STR: the validity bitmap
-	// Where the gather writes, in the slab or the regions. The bitmap starts all-valid; a NULL clears
-	// its bit.
-	uint64_t *validity = nullptr;
-	uint8_t *values = nullptr;
-	int64_t *offsets_ptr = nullptr;
-	std::atomic<int64_t> nulls {0};
-	size_t byte_capacity = 0; // STR only
-	size_t bytes_used = 0;    // STR only, guarded by the reservation lock
-
-	void Allocate(idx_t rows, size_t bytes) {
-		if (kind == Kind::STR) {
-			const size_t bitmap_bytes = ((rows + 64) / 64) * 8;
-			bits.Allocate(bitmap_bytes);
-			std::memset(bits.ptr, 0xFF, bitmap_bytes);
-			offsets.Allocate((rows + 1) * sizeof(int64_t));
-			data.Allocate(bytes);
-			byte_capacity = data.bytes;
-			validity = reinterpret_cast<uint64_t *>(bits.ptr);
-			values = data.ptr;
-			offsets_ptr = reinterpret_cast<int64_t *>(offsets.ptr);
-		} else {
-			slab = TakeSlab(kind, rows);
-			validity = slab->validity;
-			values = slab->values;
-		}
-	}
-	~ColumnStore() {
-		if (slab) {
-			slab->bitmap_dirty = nulls.load() > 0;
-			ReturnSlab(std::move(slab));
-		}
-	}
-};
 
 static inline void ClearBit(uint64_t *bitmap, idx_t row) {
 	__atomic_fetch_and(&bitmap[row >> 6], ~(uint64_t(1) << (row & 63)), __ATOMIC_RELAXED);
@@ -468,80 +462,171 @@ static inline void ClearBit(uint64_t *bitmap, idx_t row) {
 static constexpr size_t STRING_BYTES_PER_ROW = 64;
 
 //===--------------------------------------------------------------------===//
-// The sink's global state: the gathered columns and, after Finalize, the result
+// Blocks: where the gathered rows live
 //
-// Rows are appended at positions reserved per chunk. Fixed-width plans reserve with one atomic add
-// and copy without any lock. Plans with a string key reserve rows and bytes together under a mutex,
-// so that the offsets stay in row order. The regions are sized for the most rows the source can
-// produce; a chunk that does not fit (a prepared statement run after the table grew, say) is kept in
-// `overflow` and appended at Finalize.
+// Every gathered input is stored in blocks of `block_rows` rows, one buffer per input: a Slab for a
+// fixed-width column, plain mappings for the string key. Each chunk reserves a run of global row
+// positions, and row r lives in block r / block_rows at offset r % block_rows.
+//
+// A streamed plan (an ungrouped aggregate, or a group-by whose integer key DuckDB's statistics put in
+// a small range) uses blocks of arrowmetal_rewrite_block_rows rows and hands each block to a GPU
+// worker thread the moment its last row lands, so the GPU aggregates while DuckDB is still scanning;
+// Finalize then only has the last, partly filled block left, and merges the per-block partial
+// results on the host. Every other plan (a string key, a wide key range, 64-bit MIN/MAX under a
+// GROUP BY) needs all rows in one array for ArrowMetal's hash group-by, so it uses a single block sized
+// for the whole input.
 //===--------------------------------------------------------------------===//
-class RewriteGlobalState : public GlobalSinkState {
-public:
-	RewriteGlobalState(ClientContext &context, const Spec &spec, idx_t capacity_rows)
-	    : overflow_types(spec.input_types), result(context, spec.result_types) {
-		columns.reserve(spec.input_kinds.size());
-		for (auto kind : spec.input_kinds) {
-			auto column = make_uniq<ColumnStore>();
-			column->kind = kind;
-			column->width = KindWidth(kind);
-			has_strings = has_strings || kind == Kind::STR;
-			columns.push_back(std::move(column));
+struct BlockColumn {
+	Kind kind = Kind::I64;
+	unique_ptr<Slab> slab; // fixed width
+	Region data;           // STR: the UTF-8 bytes
+	Region offsets;        // STR: int64 offsets, rows + 1 of them
+	Region bits;           // STR: the validity bitmap
+	// Where the gather writes. The bitmap starts all-valid; a NULL clears its bit.
+	uint64_t *validity = nullptr;
+	uint8_t *values = nullptr;
+	int64_t *offsets_ptr = nullptr;
+	std::atomic<int64_t> nulls {0};
+	size_t byte_capacity = 0; // STR only
+	size_t bytes_used = 0;    // STR only, guarded by the reservation lock
+	idx_t capacity = 0;       // rows
+
+	BlockColumn(Kind kind_p, idx_t rows, size_t bytes) : kind(kind_p) {
+		if (kind == Kind::STR) {
+			const size_t bitmap_bytes = ((rows + 64) / 64) * 8;
+			bits.Allocate(bitmap_bytes);
+			std::memset(bits.ptr, 0xFF, bitmap_bytes);
+			offsets.Allocate((rows + 1) * sizeof(int64_t));
+			data.Allocate(bytes);
+			byte_capacity = data.bytes;
+			validity = reinterpret_cast<uint64_t *>(bits.ptr);
+			values = data.ptr;
+			offsets_ptr = reinterpret_cast<int64_t *>(offsets.ptr);
+			capacity = rows;
+		} else {
+			slab = TakeSlab(kind, rows);
+			validity = slab->validity;
+			values = slab->values;
+			capacity = slab->capacity;
 		}
-		capacity = capacity_rows < STANDARD_VECTOR_SIZE ? STANDARD_VECTOR_SIZE : capacity_rows;
-		for (auto &column : columns) {
-			column->Allocate(capacity, capacity * STRING_BYTES_PER_ROW + (1 << 20));
+	}
+	~BlockColumn() {
+		if (slab) {
+			slab->bitmap_dirty = nulls.load() > 0;
+			ReturnSlab(std::move(slab));
 		}
-		// A pooled slab may hold more rows than asked for; use all of it.
-		if (!has_strings) {
-			idx_t smallest = DConstants::INVALID_INDEX;
+	}
+};
+
+struct Block {
+	idx_t index = 0;
+	idx_t capacity = 0; // rows
+	vector<unique_ptr<BlockColumn>> columns;
+	std::atomic<idx_t> filled {0};
+	// The integer key's range over the block's valid keys (min > max while none has been seen).
+	std::atomic<int64_t> key_min {NumericLimits<int64_t>::Maximum()};
+	std::atomic<int64_t> key_max {NumericLimits<int64_t>::Minimum()};
+	bool processed = false; // touched only by the worker, then by Finalize after the worker has stopped
+
+	// `exact`: the block holds exactly `rows` rows (a streamed plan's blocks). Otherwise it may hold as
+	// many as the smallest of its buffers does, since a pooled slab can be larger than asked for.
+	Block(const vector<Kind> &kinds, idx_t index_p, idx_t rows, bool exact) : index(index_p), capacity(rows) {
+		for (auto kind : kinds) {
+			columns.push_back(make_uniq<BlockColumn>(kind, rows, rows * STRING_BYTES_PER_ROW + (1 << 20)));
+		}
+		if (!exact && !columns.empty()) {
+			capacity = columns[0]->capacity;
 			for (auto &column : columns) {
-				smallest = MinValue<idx_t>(smallest, column->slab->capacity);
+				capacity = MinValue<idx_t>(capacity, column->capacity);
 			}
-			capacity = smallest;
 		}
 	}
 
-	// Rows [0, RegionRows()) of the regions hold data.
+	void NoteKeys(int64_t lo, int64_t hi) {
+		int64_t current = key_min.load(std::memory_order_relaxed);
+		while (lo < current && !key_min.compare_exchange_weak(current, lo, std::memory_order_relaxed)) {
+		}
+		current = key_max.load(std::memory_order_relaxed);
+		while (hi > current && !key_max.compare_exchange_weak(current, hi, std::memory_order_relaxed)) {
+		}
+	}
+	bool HasKeys() const {
+		return key_min.load() <= key_max.load();
+	}
+};
+
+struct StreamAccumulator;
+
+class RewriteGlobalState : public GlobalSinkState {
+public:
+	RewriteGlobalState(ClientContext &context, const Spec &spec_p, idx_t capacity_rows);
+	~RewriteGlobalState() override;
+
+	// The block holding global row positions [b * block_rows, (b + 1) * block_rows), created on first use.
+	Block &GetBlock(idx_t b) {
+		Block *block = directory[b].load(std::memory_order_acquire);
+		if (block) {
+			return *block;
+		}
+		std::lock_guard<std::mutex> guard(alloc_lock);
+		block = directory[b].load(std::memory_order_acquire);
+		if (!block) {
+			blocks.push_back(make_uniq<Block>(spec.input_kinds, b, block_rows, true));
+			block = blocks.back().get();
+			directory[b].store(block, std::memory_order_release);
+		}
+		return *block;
+	}
+
+	// Rows [0, RegionRows()) of the blocks hold data; anything else is in `overflow`.
 	idx_t RegionRows() const {
 		if (has_strings) {
 			return locked_rows;
 		}
+		const idx_t limit = max_blocks * block_rows;
 		const idx_t total = reserved.load();
-		if (total <= capacity) {
+		if (total <= limit) {
 			return total;
 		}
 		const idx_t hole = hole_start.load();
-		return hole < capacity ? hole : capacity;
+		return hole < limit ? hole : limit;
 	}
 
-	vector<unique_ptr<ColumnStore>> columns;
-	idx_t capacity = 0;
+	void Enqueue(Block &block);
+	void StopWorker();
+	void WorkerLoop();
+
+	const Spec &spec;
+	bool stream = false;
 	bool has_strings = false;
-	std::atomic<idx_t> reserved {0};                              // fixed-width plans
-	std::atomic<idx_t> hole_start {DConstants::INVALID_INDEX};    // a reservation that straddled capacity
-	std::mutex reserve_lock;                                      // string plans
-	idx_t locked_rows = 0;                                        // string plans, guarded by reserve_lock
+	idx_t block_rows = 0;
+	idx_t max_blocks = 0;
+	unique_ptr<std::atomic<Block *>[]> directory;
+	std::mutex alloc_lock;
+	vector<unique_ptr<Block>> blocks;
+
+	std::atomic<idx_t> reserved {0};                           // fixed-width plans
+	std::atomic<idx_t> hole_start {DConstants::INVALID_INDEX}; // a reservation that ran past the blocks
+	std::mutex reserve_lock;                                   // string plans
+	idx_t locked_rows = 0;                                     // string plans, guarded by reserve_lock
 
 	std::mutex overflow_lock;
 	vector<LogicalType> overflow_types;
 	unique_ptr<ColumnDataCollection> overflow;
 
-	// The group key's range, for choosing the fused dense group-by. Guarded by key_lock.
-	std::mutex key_lock;
-	bool key_seen = false;
-	int64_t key_min = 0;
-	int64_t key_max = 0;
+	// The GPU worker of a streamed plan.
+	std::mutex queue_lock;
+	std::condition_variable queue_cv;
+	std::deque<Block *> queue;
+	bool closing = false;
+	bool worker_started = false;
+	std::thread worker;
+	string worker_error;
+	idx_t streamed_blocks = 0; // blocks the worker finished
+	unique_ptr<StreamAccumulator> accumulator;
 
 	ColumnDataCollection result;
 	int64_t groups = 0;
-};
-
-class RewriteLocalState : public LocalSinkState {
-public:
-	bool key_seen = false;
-	int64_t key_min = 0;
-	int64_t key_max = 0;
 };
 
 class RewriteSourceState : public GlobalSourceState {
@@ -554,24 +639,24 @@ public:
 // Gathering one chunk
 //===--------------------------------------------------------------------===//
 template <class T>
-static void GatherFixed(const UnifiedVectorFormat &format, idx_t count, T *target) {
+static void GatherFixed(const UnifiedVectorFormat &format, idx_t first, idx_t count, T *target) {
 	auto source = reinterpret_cast<const T *>(format.data); // raw bytes: the width is all that matters here
 	if (!format.sel->IsSet()) {
-		std::memcpy(target, source, count * sizeof(T));
+		std::memcpy(target, source + first, count * sizeof(T));
 		return;
 	}
 	for (idx_t i = 0; i < count; i++) {
-		target[i] = source[format.sel->get_index(i)];
+		target[i] = source[format.sel->get_index(first + i)];
 	}
 }
 
+// The valid keys' range among rows [first, first + count) of the chunk; false when all are NULL.
 template <class T>
-static void KeyRange(const UnifiedVectorFormat &format, idx_t count, RewriteLocalState &local) {
-	auto source = reinterpret_cast<const T *>(format.data); // raw bytes: the width is all that matters here
-	bool seen = local.key_seen;
-	int64_t lo = local.key_min, hi = local.key_max;
+static bool KeyRangeOf(const UnifiedVectorFormat &format, idx_t first, idx_t count, int64_t &lo, int64_t &hi) {
+	auto source = reinterpret_cast<const T *>(format.data);
+	bool seen = false;
 	const bool all_valid = format.validity.AllValid();
-	for (idx_t i = 0; i < count; i++) {
+	for (idx_t i = first; i < first + count; i++) {
 		const idx_t index = format.sel->get_index(i);
 		if (!all_valid && !format.validity.RowIsValid(index)) {
 			continue;
@@ -585,9 +670,88 @@ static void KeyRange(const UnifiedVectorFormat &format, idx_t count, RewriteLoca
 			hi = v > hi ? v : hi;
 		}
 	}
-	local.key_seen = seen;
-	local.key_min = lo;
-	local.key_max = hi;
+	return seen;
+}
+
+static void NoteKeyRange(Block &block, Kind kind, const UnifiedVectorFormat &format, idx_t first, idx_t count) {
+	int64_t lo = 0, hi = 0;
+	bool seen = false;
+	switch (kind) {
+	case Kind::I8: seen = KeyRangeOf<int8_t>(format, first, count, lo, hi); break;
+	case Kind::I16: seen = KeyRangeOf<int16_t>(format, first, count, lo, hi); break;
+	case Kind::I32: seen = KeyRangeOf<int32_t>(format, first, count, lo, hi); break;
+	case Kind::I64: seen = KeyRangeOf<int64_t>(format, first, count, lo, hi); break;
+	case Kind::U8: seen = KeyRangeOf<uint8_t>(format, first, count, lo, hi); break;
+	case Kind::U16: seen = KeyRangeOf<uint16_t>(format, first, count, lo, hi); break;
+	case Kind::U32: seen = KeyRangeOf<uint32_t>(format, first, count, lo, hi); break;
+	default: return; // U64 and strings never take the fused group-by
+	}
+	if (seen) {
+		block.NoteKeys(lo, hi);
+	}
+}
+
+// Copies rows [first, first + count) of the chunk into `column` at rows [row0, row0 + count); a string
+// column's bytes go at byte0.
+static void CopyRows(BlockColumn &column, const UnifiedVectorFormat &format, idx_t first, idx_t count, idx_t row0,
+                     size_t byte0) {
+	if (!format.validity.AllValid()) {
+		int64_t nulls = 0;
+		for (idx_t i = 0; i < count; i++) {
+			if (!format.validity.RowIsValid(format.sel->get_index(first + i))) {
+				ClearBit(column.validity, row0 + i);
+				nulls++;
+			}
+		}
+		if (nulls) {
+			column.nulls.fetch_add(nulls, std::memory_order_relaxed);
+		}
+	}
+	switch (column.kind) {
+	case Kind::I8:
+	case Kind::U8:
+		GatherFixed<uint8_t>(format, first, count, column.values + row0);
+		break;
+	case Kind::I16:
+	case Kind::U16:
+		GatherFixed<uint16_t>(format, first, count, reinterpret_cast<uint16_t *>(column.values) + row0);
+		break;
+	case Kind::I32:
+	case Kind::U32:
+		GatherFixed<uint32_t>(format, first, count, reinterpret_cast<uint32_t *>(column.values) + row0);
+		break;
+	case Kind::I64:
+	case Kind::U64:
+		GatherFixed<uint64_t>(format, first, count, reinterpret_cast<uint64_t *>(column.values) + row0);
+		break;
+	case Kind::STR: {
+		auto strings = UnifiedVectorFormat::GetData<string_t>(format);
+		size_t at = byte0;
+		for (idx_t i = 0; i < count; i++) {
+			column.offsets_ptr[row0 + i] = static_cast<int64_t>(at);
+			const idx_t index = format.sel->get_index(first + i);
+			if (format.validity.RowIsValid(index)) {
+				const auto &s = strings[index];
+				const auto size = s.GetSize();
+				std::memcpy(column.values + at, s.GetData(), size);
+				at += size;
+			}
+		}
+		break;
+	}
+	}
+}
+
+static size_t StringBytes(const UnifiedVectorFormat &format, idx_t count) {
+	size_t bytes = 0;
+	auto strings = UnifiedVectorFormat::GetData<string_t>(format);
+	for (idx_t i = 0; i < count; i++) {
+		const idx_t index = format.sel->get_index(i);
+		if (format.validity.RowIsValid(index)) {
+			bytes += strings[index].GetSize();
+		}
+	}
+	return bytes;
 }
 
 //===--------------------------------------------------------------------===//
@@ -619,7 +783,7 @@ public:
 			aggs += (i ? "\n" : "") + spec.aggs[i].name;
 		}
 		result["Aggregates"] = aggs;
-		result["Engine"] = "ArrowMetal (Metal GPU)";
+		result["Engine"] = spec.stream ? "ArrowMetal (Metal GPU), streamed in blocks" : "ArrowMetal (Metal GPU)";
 		SetEstimatedCardinality(result, estimated_cardinality);
 		return result;
 	}
@@ -638,79 +802,85 @@ public:
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
 		return make_uniq<RewriteGlobalState>(context, spec, capacity_rows);
 	}
-	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override {
-		return make_uniq<RewriteLocalState>();
-	}
 
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
 		auto &gstate = input.global_state.Cast<RewriteGlobalState>();
-		auto &lstate = input.local_state.Cast<RewriteLocalState>();
 		const idx_t count = chunk.size();
 		if (count == 0) {
 			return SinkResultType::NEED_MORE_INPUT;
 		}
 		const idx_t ncols = child_columns.size();
 		vector<UnifiedVectorFormat> formats(ncols);
-		size_t string_bytes = 0;
 		for (idx_t c = 0; c < ncols; c++) {
 			chunk.data[child_columns[c]].ToUnifiedFormat(count, formats[c]);
-			if (spec.input_kinds[c] == Kind::STR) {
-				auto strings = UnifiedVectorFormat::GetData<string_t>(formats[c]);
-				for (idx_t i = 0; i < count; i++) {
-					const idx_t index = formats[c].sel->get_index(i);
-					if (formats[c].validity.RowIsValid(index)) {
-						string_bytes += strings[index].GetSize();
-					}
-				}
-			}
-		}
-		if (spec.has_key && spec.input_kinds[0] != Kind::STR && spec.input_kinds[0] != Kind::U64) {
-			switch (spec.input_kinds[0]) {
-			case Kind::I8: KeyRange<int8_t>(formats[0], count, lstate); break;
-			case Kind::I16: KeyRange<int16_t>(formats[0], count, lstate); break;
-			case Kind::I32: KeyRange<int32_t>(formats[0], count, lstate); break;
-			case Kind::I64: KeyRange<int64_t>(formats[0], count, lstate); break;
-			case Kind::U8: KeyRange<uint8_t>(formats[0], count, lstate); break;
-			case Kind::U16: KeyRange<uint16_t>(formats[0], count, lstate); break;
-			case Kind::U32: KeyRange<uint32_t>(formats[0], count, lstate); break;
-			default: break;
-			}
 		}
 
-		idx_t row0 = 0;
-		size_t byte0 = 0;
-		bool fits = false;
-		if (!gstate.has_strings) {
-			row0 = gstate.reserved.fetch_add(count, std::memory_order_relaxed);
-			fits = row0 + count <= gstate.capacity;
-			if (!fits && row0 < gstate.capacity) {
+		if (gstate.has_strings) {
+			// Rows and bytes are reserved together, so the offsets stay in row order.
+			const size_t string_bytes = StringBytes(formats[0], count);
+			Block &block = *gstate.blocks[0];
+			auto &strings = *block.columns[0];
+			idx_t row0 = 0;
+			size_t byte0 = 0;
+			bool fits;
+			{
+				std::lock_guard<std::mutex> guard(gstate.reserve_lock);
+				fits = gstate.locked_rows + count <= block.capacity &&
+				       strings.bytes_used + string_bytes <= strings.byte_capacity;
+				if (fits) {
+					row0 = gstate.locked_rows;
+					byte0 = strings.bytes_used;
+					gstate.locked_rows += count;
+					strings.bytes_used += string_bytes;
+				}
+			}
+			if (fits) {
+				for (idx_t c = 0; c < ncols; c++) {
+					CopyRows(*block.columns[c], formats[c], 0, count, row0, byte0);
+				}
+				return SinkResultType::NEED_MORE_INPUT;
+			}
+			return KeepAside(context, gstate, chunk);
+		}
+
+		const idx_t row0 = gstate.reserved.fetch_add(count, std::memory_order_relaxed);
+		const idx_t limit = gstate.max_blocks * gstate.block_rows;
+		if (row0 + count > limit) {
+			if (row0 < limit) {
 				gstate.hole_start.store(row0);
 			}
-		} else {
-			std::lock_guard<std::mutex> guard(gstate.reserve_lock);
-			auto &strings = *gstate.columns[0];
-			fits = gstate.locked_rows + count <= gstate.capacity &&
-			       strings.bytes_used + string_bytes <= strings.byte_capacity;
-			if (fits) {
-				row0 = gstate.locked_rows;
-				byte0 = strings.bytes_used;
-				gstate.locked_rows += count;
-				strings.bytes_used += string_bytes;
-			}
+			return KeepAside(context, gstate, chunk);
 		}
-		if (fits) {
+		const bool keyed = spec.has_key;
+		for (idx_t done = 0; done < count;) {
+			const idx_t row = row0 + done;
+			Block &block = gstate.GetBlock(row / gstate.block_rows);
+			const idx_t at = row % gstate.block_rows;
+			const idx_t n = MinValue<idx_t>(count - done, gstate.block_rows - at);
 			for (idx_t c = 0; c < ncols; c++) {
-				CopyColumn(*gstate.columns[c], formats[c], count, row0, byte0);
+				CopyRows(*block.columns[c], formats[c], done, n, at, 0);
 			}
-			return SinkResultType::NEED_MORE_INPUT;
+			if (keyed) {
+				NoteKeyRange(block, spec.input_kinds[0], formats[0], done, n);
+			}
+			// The thread that writes a block's last row hands the block to the GPU.
+			if (block.filled.fetch_add(n, std::memory_order_acq_rel) + n == gstate.block_rows && gstate.stream) {
+				gstate.Enqueue(block);
+			}
+			done += n;
 		}
-		// Past the regions: keep the chunk's gathered columns aside for Finalize.
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+
+	// A chunk past the blocks (a prepared statement run after the table grew, say): its gathered columns
+	// wait in a ColumnDataCollection for Finalize.
+	SinkResultType KeepAside(ExecutionContext &context, RewriteGlobalState &gstate, DataChunk &chunk) const {
 		DataChunk kept;
 		kept.InitializeEmpty(gstate.overflow_types);
-		for (idx_t c = 0; c < ncols; c++) {
+		for (idx_t c = 0; c < child_columns.size(); c++) {
 			kept.data[c].Reference(chunk.data[child_columns[c]]);
 		}
-		kept.SetCardinality(count);
+		kept.SetCardinality(chunk.size());
 		std::lock_guard<std::mutex> guard(gstate.overflow_lock);
 		if (!gstate.overflow) {
 			gstate.overflow = make_uniq<ColumnDataCollection>(context.client, gstate.overflow_types);
@@ -719,69 +889,7 @@ public:
 		return SinkResultType::NEED_MORE_INPUT;
 	}
 
-	static void CopyColumn(ColumnStore &column, const UnifiedVectorFormat &format, idx_t count, idx_t row0,
-	                       size_t byte0) {
-		auto *bitmap = column.validity;
-		int64_t nulls = 0;
-		if (!format.validity.AllValid()) {
-			for (idx_t i = 0; i < count; i++) {
-				if (!format.validity.RowIsValid(format.sel->get_index(i))) {
-					ClearBit(bitmap, row0 + i);
-					nulls++;
-				}
-			}
-			column.nulls.fetch_add(nulls, std::memory_order_relaxed);
-		}
-		switch (column.kind) {
-		case Kind::I8:
-		case Kind::U8:
-			GatherFixed<uint8_t>(format, count, column.values + row0);
-			break;
-		case Kind::I16:
-		case Kind::U16:
-			GatherFixed<uint16_t>(format, count, reinterpret_cast<uint16_t *>(column.values) + row0);
-			break;
-		case Kind::I32:
-		case Kind::U32:
-			GatherFixed<uint32_t>(format, count, reinterpret_cast<uint32_t *>(column.values) + row0);
-			break;
-		case Kind::I64:
-		case Kind::U64:
-			GatherFixed<uint64_t>(format, count, reinterpret_cast<uint64_t *>(column.values) + row0);
-			break;
-		case Kind::STR: {
-			auto strings = UnifiedVectorFormat::GetData<string_t>(format);
-			auto *offsets = column.offsets_ptr;
-			size_t at = byte0;
-			for (idx_t i = 0; i < count; i++) {
-				offsets[row0 + i] = static_cast<int64_t>(at);
-				const idx_t index = format.sel->get_index(i);
-				if (format.validity.RowIsValid(index)) {
-					const auto &s = strings[index];
-					const auto size = s.GetSize();
-					std::memcpy(column.values + at, s.GetData(), size);
-					at += size;
-				}
-			}
-			break;
-		}
-		}
-	}
-
 	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override {
-		auto &gstate = input.global_state.Cast<RewriteGlobalState>();
-		auto &lstate = input.local_state.Cast<RewriteLocalState>();
-		if (lstate.key_seen) {
-			std::lock_guard<std::mutex> guard(gstate.key_lock);
-			if (!gstate.key_seen) {
-				gstate.key_min = lstate.key_min;
-				gstate.key_max = lstate.key_max;
-				gstate.key_seen = true;
-			} else {
-				gstate.key_min = lstate.key_min < gstate.key_min ? lstate.key_min : gstate.key_min;
-				gstate.key_max = lstate.key_max > gstate.key_max ? lstate.key_max : gstate.key_max;
-			}
-		}
 		return SinkCombineResultType::FINISHED;
 	}
 
@@ -891,7 +999,7 @@ static am_array *ImportBuffers(Kind kind, int64_t length, int64_t null_count, co
 
 // The first `rows` of a gathered column as an ArrowMetal array. A fixed-width column is a slice of
 // its slab's long-lived import (made on the slab's first use); a string column is imported fresh.
-static am_array *ImportColumn(ColumnStore &column, idx_t rows) {
+static am_array *ImportColumn(BlockColumn &column, idx_t rows) {
 	const int64_t nulls = column.nulls.load();
 	if (column.kind == Kind::STR) {
 		column.offsets_ptr[rows] = static_cast<int64_t>(column.bytes_used);
@@ -1107,6 +1215,7 @@ struct Groups {
 	HostColumn key;                      // the group key per group (grouped queries)
 	vector<vector<int64_t>> slot;        // [need][group]
 	vector<bool> slot_unsigned;          // [need]
+	vector<vector<__int128>> wide;       // [need][group]: merged sums, when the plan was streamed
 };
 
 struct QueryResultHolder {
@@ -1344,6 +1453,9 @@ static hugeint_t ToHuge(__int128 v) {
 }
 
 static __int128 SlotSum(const Groups &groups, idx_t slot, idx_t g) {
+	if (slot < groups.wide.size() && !groups.wide[slot].empty()) {
+		return groups.wide[slot][g];
+	}
 	return groups.slot_unsigned[slot] ? __int128(static_cast<uint64_t>(groups.slot[slot][g]))
 	                                  : __int128(groups.slot[slot][g]);
 }
@@ -1461,11 +1573,366 @@ static void WriteResult(const Spec &spec, const vector<AggSlots> &slots, const G
 	}
 }
 
-// The rare path: some chunks did not fit the regions. Moves everything into regions large enough for
-// all of it - the rows already gathered, then the overflow chunks - so the GPU still sees one array per
-// column.
+//===--------------------------------------------------------------------===//
+// Running the plan over one block
+//===--------------------------------------------------------------------===//
+struct Arrays {
+	vector<am_array *> ptrs;
+	~Arrays() {
+		for (auto h : ptrs) {
+			if (h) {
+				am_release(h);
+			}
+		}
+	}
+};
+
+// The GPU half over rows [0, rows) of `block`: every need of `plan` into `groups`. Returns the path taken.
+static string RunBlock(const Spec &spec, Block &block, idx_t rows, const Plan &plan, Groups &groups) {
+	Arrays columns;
+	for (auto &column : block.columns) {
+		columns.ptrs.push_back(ImportColumn(*column, rows));
+	}
+	if (!spec.has_key) {
+		RunScalarQuery(columns.ptrs, "(query (aggregate" + AggregateList(plan) + "))", plan, groups);
+		return "fused aggregate";
+	}
+	const Kind key_kind = spec.input_kinds[0];
+	const bool integral = key_kind != Kind::STR && key_kind != Kind::U64;
+	if (integral && !block.HasKeys()) {
+		// Every key is NULL: one group.
+		RunScalarQuery(columns.ptrs, "(query (aggregate" + AggregateList(plan) + "))", plan, groups);
+		groups.key.format = KindFormat(key_kind);
+		groups.key.values.assign(1, 0);
+		groups.key.valid.assign(1, 0);
+		return "fused aggregate (every key NULL)";
+	}
+	// The span in unsigned arithmetic: key_max - key_min can exceed INT64_MAX.
+	const int64_t key_min = block.key_min.load(), key_max = block.key_max.load();
+	bool dense = integral && uint64_t(key_max) - uint64_t(key_min) < uint64_t(DENSE_KEY_SPAN);
+	// The fused group-by keeps MIN and MAX in 32-bit atomics.
+	for (auto &need : plan.needs) {
+		if ((need.need == Need::MIN || need.need == Need::MAX) && KindWidth(spec.input_kinds[need.input]) > 4) {
+			dense = false;
+		}
+	}
+	if (dense) {
+		RunDense(columns.ptrs, plan, key_min, key_max - key_min + 1, block.columns[0]->nulls.load(), key_kind, groups);
+		return "fused dense group-by";
+	}
+	RunHash(columns.ptrs, plan, groups);
+	return "hash group-by";
+}
+
+static vector<bool> Nullable(const Block &block) {
+	vector<bool> nullable;
+	for (auto &column : block.columns) {
+		nullable.push_back(column->nulls.load() > 0);
+	}
+	return nullable;
+}
+
+static bool IsExtreme(Need need) {
+	return need == Need::MIN || need == Need::MAX;
+}
+
+//===--------------------------------------------------------------------===//
+// Streaming: per-block partial results, merged on the host
+//
+// Every partial merges exactly: counts and sums add (sums in 128 bits, so a streamed plan has no row
+// limit), MIN and MAX take the extreme of the blocks that saw a value, and a group is keyed by its key
+// value, with the NULL key as one more group. A block's own plan may drop a COUNT over a column that
+// held no NULL in that block; the merge reads the block's row count in its place.
+//===--------------------------------------------------------------------===//
+struct StreamAccumulator {
+	explicit StreamAccumulator(const Spec &spec_p) : spec(spec_p) {
+		const vector<bool> all(spec.input_kinds.size(), true);
+		slots = PlanNeeds(spec, all, plan);
+		const idx_t n = plan.needs.size();
+		sums.resize(n);
+		extremes.resize(n);
+		seen.resize(n);
+		is_unsigned.assign(n, false);
+		count_of.assign(n, 0);
+		for (idx_t l = 0; l < n; l++) {
+			const auto &need = plan.needs[l];
+			if (need.need != Need::ROWS && need.need != Need::COUNT) {
+				for (idx_t c = 0; c < n; c++) {
+					if (plan.needs[c] == NeedKey {Need::COUNT, need.input}) {
+						count_of[l] = c;
+					}
+				}
+			}
+		}
+	}
+
+	const Spec &spec;
+	Plan plan; // every value input treated as nullable, so every COUNT is there
+	vector<AggSlots> slots;
+	vector<idx_t> count_of; // a value need's COUNT over the same input
+	vector<int64_t> keys;
+	vector<uint8_t> key_valid;
+	int64_t dense_base = 0;
+	vector<uint32_t> dense; // key - dense_base -> group, while the keys stay in a small range
+	bool sparse_mode = false;
+	std::unordered_map<int64_t, uint32_t> sparse;
+	uint32_t null_group = NumericLimits<uint32_t>::Maximum();
+	vector<vector<__int128>> sums;    // ROWS, COUNT, SUM, SUM_HI, SUM_LO
+	vector<vector<int64_t>> extremes; // MIN, MAX
+	vector<vector<uint8_t>> seen;     // MIN, MAX
+	vector<bool> is_unsigned;
+	string path;
+	idx_t merged_blocks = 0;
+
+	uint32_t AddGroup(bool valid, int64_t key) {
+		const uint32_t g = uint32_t(keys.size());
+		keys.push_back(key);
+		key_valid.push_back(valid ? 1 : 0);
+		for (idx_t l = 0; l < plan.needs.size(); l++) {
+			if (IsExtreme(plan.needs[l].need)) {
+				extremes[l].push_back(0);
+				seen[l].push_back(0);
+			} else {
+				sums[l].push_back(0);
+			}
+		}
+		return g;
+	}
+
+	uint32_t GroupFor(bool valid, int64_t key) {
+		constexpr uint32_t NONE = NumericLimits<uint32_t>::Maximum();
+		if (!spec.has_key) {
+			return keys.empty() ? AddGroup(true, 0) : 0;
+		}
+		if (!valid) {
+			if (null_group == NONE) {
+				null_group = AddGroup(false, 0);
+			}
+			return null_group;
+		}
+		if (!sparse_mode) {
+			if (dense.empty()) {
+				dense_base = key;
+				dense.assign(1, NONE);
+			}
+			const __int128 top = __int128(dense_base) + __int128(dense.size()) - 1;
+			if (key < dense_base || __int128(key) > top) {
+				const __int128 lo = key < dense_base ? __int128(key) : __int128(dense_base);
+				const __int128 hi = __int128(key) > top ? __int128(key) : top;
+				if (hi - lo < __int128(4 * DENSE_KEY_SPAN)) {
+					vector<uint32_t> grown(size_t(hi - lo + 1), NONE);
+					std::memcpy(grown.data() + size_t(__int128(dense_base) - lo), dense.data(),
+					            dense.size() * sizeof(uint32_t));
+					dense.swap(grown);
+					dense_base = int64_t(lo);
+				} else {
+					for (idx_t i = 0; i < dense.size(); i++) {
+						if (dense[i] != NONE) {
+							sparse[int64_t(__int128(dense_base) + __int128(i))] = dense[i];
+						}
+					}
+					dense.clear();
+					sparse_mode = true;
+				}
+			}
+			if (!sparse_mode) {
+				auto &slot = dense[size_t(__int128(key) - __int128(dense_base))];
+				if (slot == NONE) {
+					slot = AddGroup(true, key);
+				}
+				return slot;
+			}
+		}
+		auto entry = sparse.find(key);
+		if (entry != sparse.end()) {
+			return entry->second;
+		}
+		const uint32_t g = AddGroup(true, key);
+		sparse.emplace(key, g);
+		return g;
+	}
+
+	void Merge(const Groups &groups, const Plan &block_plan, const vector<bool> &nullable) {
+		const idx_t n = plan.needs.size();
+		vector<idx_t> src(n, 0);
+		for (idx_t l = 0; l < n; l++) {
+			const auto &need = plan.needs[l];
+			if (need.need == Need::COUNT && !nullable[need.input]) {
+				continue; // the block's row count stands in
+			}
+			bool found = false;
+			for (idx_t b = 0; b < block_plan.needs.size(); b++) {
+				if (block_plan.needs[b] == need) {
+					src[l] = b;
+					found = true;
+				}
+			}
+			if (!found) {
+				throw InternalException("arrowmetal_rewrite: a block's plan lacks a need");
+			}
+		}
+		for (idx_t i = 0; i < groups.count; i++) {
+			const bool valid = !spec.has_key || groups.key.valid[i];
+			const uint32_t g = GroupFor(valid, valid && spec.has_key ? groups.key.values[i] : 0);
+			for (idx_t l = 0; l < n; l++) {
+				const auto need = plan.needs[l].need;
+				const idx_t s = src[l];
+				const int64_t v = groups.slot[s][i];
+				if (need == Need::ROWS || need == Need::COUNT) {
+					sums[l][g] += v;
+					continue;
+				}
+				// A value need counts only where this block had a value of that input in this group.
+				if (groups.slot[src[count_of[l]]][i] <= 0) {
+					continue;
+				}
+				const bool uns = groups.slot_unsigned[s];
+				if (!IsExtreme(need)) {
+					sums[l][g] += uns ? __int128(uint64_t(v)) : __int128(v);
+					continue;
+				}
+				is_unsigned[l] = uns;
+				if (!seen[l][g]) {
+					extremes[l][g] = v;
+					seen[l][g] = 1;
+				} else {
+					const bool better = need == Need::MIN ? (uns ? uint64_t(v) < uint64_t(extremes[l][g]) : v < extremes[l][g])
+					                                     : (uns ? uint64_t(v) > uint64_t(extremes[l][g]) : v > extremes[l][g]);
+					if (better) {
+						extremes[l][g] = v;
+					}
+				}
+			}
+		}
+		merged_blocks++;
+	}
+
+	void Finish(Groups &out) {
+		if (!spec.has_key && keys.empty()) {
+			AddGroup(true, 0); // no rows at all: one row, counts 0, everything else NULL
+		}
+		const idx_t n = plan.needs.size();
+		out.count = keys.size();
+		if (spec.has_key) {
+			out.key.format = KindFormat(spec.input_kinds[0]);
+			out.key.values = keys;
+			out.key.valid = key_valid;
+		}
+		out.slot.assign(n, vector<int64_t>());
+		out.wide.assign(n, vector<__int128>());
+		out.slot_unsigned = is_unsigned;
+		for (idx_t l = 0; l < n; l++) {
+			const auto need = plan.needs[l].need;
+			if (IsExtreme(need)) {
+				out.slot[l] = extremes[l];
+			} else if (need == Need::ROWS || need == Need::COUNT) {
+				out.slot[l].resize(out.count);
+				for (idx_t g = 0; g < out.count; g++) {
+					out.slot[l][g] = int64_t(sums[l][g]);
+				}
+			} else {
+				out.wide[l] = sums[l];
+			}
+		}
+	}
+};
+
+// Runs one block through the GPU and merges its partial result. The block's buffers go back to the slab
+// pool at once, so a streamed plan holds only the blocks being filled or waiting.
+static void ProcessBlock(RewriteGlobalState &gstate, Block &block, idx_t rows) {
+	std::lock_guard<std::recursive_mutex> gpu(g_gpu_lock);
+	const auto nullable = Nullable(block);
+	Plan plan;
+	PlanNeeds(gstate.spec, nullable, plan);
+	Groups groups;
+	groups.slot.resize(plan.needs.size());
+	groups.slot_unsigned.assign(plan.needs.size(), false);
+	gstate.accumulator->path = RunBlock(gstate.spec, block, rows, plan, groups);
+	gstate.accumulator->Merge(groups, plan, nullable);
+	block.processed = true;
+	block.columns.clear();
+}
+
+RewriteGlobalState::RewriteGlobalState(ClientContext &context, const Spec &spec_p, idx_t capacity_rows)
+    : spec(spec_p), stream(spec_p.stream), overflow_types(spec_p.input_types), result(context, spec_p.result_types) {
+	for (auto kind : spec.input_kinds) {
+		has_strings = has_strings || kind == Kind::STR;
+	}
+	capacity_rows = MaxValue<idx_t>(capacity_rows, STANDARD_VECTOR_SIZE);
+	if (stream) {
+		// Blocks of the configured size, or one block when the whole input is smaller than that.
+		block_rows = MinValue<idx_t>(spec.block_rows, (capacity_rows + 63) / 64 * 64);
+		max_blocks = capacity_rows / block_rows + 1024;
+		directory = unique_ptr<std::atomic<Block *>[]>(new std::atomic<Block *>[max_blocks]);
+		for (idx_t b = 0; b < max_blocks; b++) {
+			directory[b].store(nullptr);
+		}
+		accumulator = make_uniq<StreamAccumulator>(spec);
+	} else {
+		max_blocks = 1;
+		directory = unique_ptr<std::atomic<Block *>[]>(new std::atomic<Block *>[1]);
+		blocks.push_back(make_uniq<Block>(spec.input_kinds, 0, capacity_rows, false));
+		block_rows = blocks[0]->capacity;
+		directory[0].store(blocks[0].get());
+	}
+}
+
+RewriteGlobalState::~RewriteGlobalState() {
+	StopWorker();
+}
+
+void RewriteGlobalState::Enqueue(Block &block) {
+	std::lock_guard<std::mutex> guard(queue_lock);
+	if (!worker_started) {
+		worker = std::thread([this]() { WorkerLoop(); });
+		worker_started = true;
+	}
+	queue.push_back(&block);
+	queue_cv.notify_one();
+}
+
+void RewriteGlobalState::StopWorker() {
+	{
+		std::lock_guard<std::mutex> guard(queue_lock);
+		closing = true;
+	}
+	queue_cv.notify_all();
+	if (worker_started && worker.joinable()) {
+		worker.join();
+	}
+}
+
+void RewriteGlobalState::WorkerLoop() {
+	while (true) {
+		Block *block = nullptr;
+		{
+			std::unique_lock<std::mutex> guard(queue_lock);
+			queue_cv.wait(guard, [this]() { return closing || !queue.empty(); });
+			if (queue.empty()) {
+				return;
+			}
+			block = queue.front();
+			queue.pop_front();
+		}
+		if (!worker_error.empty()) {
+			continue; // Finalize reports the first error
+		}
+		try {
+			ProcessBlock(*this, *block, block_rows);
+			streamed_blocks++;
+		} catch (std::exception &e) {
+			ErrorData error(e);
+			worker_error = error.RawMessage();
+		}
+	}
+}
+
+// The rare path of a single-block plan: some chunks did not fit. Moves everything into a block large
+// enough for all of it - the rows already gathered, then the kept-aside chunks - so the GPU still sees
+// one array per column.
 static void AppendOverflow(RewriteGlobalState &gstate) {
 	auto &overflow = *gstate.overflow;
+	auto &old = *gstate.blocks[0];
 	const idx_t kept = gstate.RegionRows();
 	const idx_t total = kept + overflow.Count();
 	size_t extra_bytes = 0;
@@ -1473,64 +1940,91 @@ static void AppendOverflow(RewriteGlobalState &gstate) {
 		for (auto &chunk : overflow.Chunks()) {
 			UnifiedVectorFormat format;
 			chunk.data[0].ToUnifiedFormat(chunk.size(), format);
-			auto strings = UnifiedVectorFormat::GetData<string_t>(format);
-			for (idx_t i = 0; i < chunk.size(); i++) {
-				const idx_t index = format.sel->get_index(i);
-				if (format.validity.RowIsValid(index)) {
-					extra_bytes += strings[index].GetSize();
-				}
-			}
+			extra_bytes += StringBytes(format, chunk.size());
 		}
 	}
-	vector<unique_ptr<ColumnStore>> grown;
-	for (auto &old : gstate.columns) {
-		auto column = make_uniq<ColumnStore>();
-		column->kind = old->kind;
-		column->width = old->width;
-		column->Allocate(total, old->bytes_used + extra_bytes + 1);
-		std::memcpy(column->validity, old->validity, ((kept + 63) / 64) * 8);
-		if (column->kind == Kind::STR) {
-			std::memcpy(column->offsets_ptr, old->offsets_ptr, kept * sizeof(int64_t));
-			std::memcpy(column->values, old->values, old->bytes_used);
-			column->bytes_used = old->bytes_used;
-		} else {
-			std::memcpy(column->values, old->values, kept * column->width);
-		}
-		column->nulls.store(old->nulls.load());
-		grown.push_back(std::move(column));
-	}
-	// Bits past `kept` in the last copied word belong to rows that were never written; set them valid.
-	for (auto &column : grown) {
-		auto *bitmap = column->validity;
+	auto grown = make_uniq<Block>(vector<Kind>(), 0, total, false);
+	for (auto &column : old.columns) {
+		auto fresh = make_uniq<BlockColumn>(column->kind, total, column->bytes_used + extra_bytes + 1);
+		std::memcpy(fresh->validity, column->validity, ((kept + 63) / 64) * 8);
+		// Bits past `kept` in the last copied word belong to rows never written; mark them valid.
 		if (kept % 64) {
-			bitmap[kept / 64] |= ~((uint64_t(1) << (kept % 64)) - 1);
+			fresh->validity[kept / 64] |= ~((uint64_t(1) << (kept % 64)) - 1);
 		}
+		if (column->kind == Kind::STR) {
+			std::memcpy(fresh->offsets_ptr, column->offsets_ptr, kept * sizeof(int64_t));
+			std::memcpy(fresh->values, column->values, column->bytes_used);
+			fresh->bytes_used = column->bytes_used;
+		} else {
+			std::memcpy(fresh->values, column->values, kept * KindWidth(column->kind));
+		}
+		fresh->nulls.store(column->nulls.load());
+		grown->columns.push_back(std::move(fresh));
 	}
+	grown->capacity = total;
+	grown->key_min.store(old.key_min.load());
+	grown->key_max.store(old.key_max.load());
 	idx_t row = kept;
 	for (auto &chunk : overflow.Chunks()) {
 		const idx_t count = chunk.size();
-		for (idx_t c = 0; c < grown.size(); c++) {
+		for (idx_t c = 0; c < grown->columns.size(); c++) {
 			UnifiedVectorFormat format;
 			chunk.data[c].ToUnifiedFormat(count, format);
-			size_t byte0 = grown[c]->bytes_used;
-			if (grown[c]->kind == Kind::STR) {
-				auto strings = UnifiedVectorFormat::GetData<string_t>(format);
-				for (idx_t i = 0; i < count; i++) {
-					const idx_t index = format.sel->get_index(i);
-					if (format.validity.RowIsValid(index)) {
-						grown[c]->bytes_used += strings[index].GetSize();
-					}
-				}
+			auto &column = *grown->columns[c];
+			const size_t byte0 = column.bytes_used;
+			if (column.kind == Kind::STR) {
+				column.bytes_used += StringBytes(format, count);
 			}
-			PhysicalArrowMetalAggregate::CopyColumn(*grown[c], format, count, row, byte0);
+			CopyRows(column, format, 0, count, row, byte0);
+			if (c == 0 && gstate.spec.has_key) {
+				NoteKeyRange(*grown, column.kind, format, 0, count);
+			}
 		}
 		row += count;
 	}
-	gstate.columns = std::move(grown);
-	gstate.capacity = total;
+	gstate.blocks[0] = std::move(grown);
+	gstate.directory[0].store(gstate.blocks[0].get());
+	gstate.block_rows = total;
 	gstate.reserved.store(total);
 	gstate.hole_start.store(DConstants::INVALID_INDEX);
 	gstate.locked_rows = total;
+	gstate.overflow.reset();
+}
+
+// The rare path of a streamed plan: rows past the last block run through fresh blocks here.
+static void StreamOverflow(RewriteGlobalState &gstate) {
+	unique_ptr<Block> block;
+	idx_t filled = 0;
+	const idx_t size = gstate.block_rows;
+	for (auto &chunk : gstate.overflow->Chunks()) {
+		const idx_t count = chunk.size();
+		vector<UnifiedVectorFormat> formats(chunk.ColumnCount());
+		for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
+			chunk.data[c].ToUnifiedFormat(count, formats[c]);
+		}
+		for (idx_t done = 0; done < count;) {
+			if (!block) {
+				block = make_uniq<Block>(gstate.spec.input_kinds, 0, size, true);
+				filled = 0;
+			}
+			const idx_t n = MinValue<idx_t>(count - done, size - filled);
+			for (idx_t c = 0; c < formats.size(); c++) {
+				CopyRows(*block->columns[c], formats[c], done, n, filled, 0);
+			}
+			if (gstate.spec.has_key) {
+				NoteKeyRange(*block, gstate.spec.input_kinds[0], formats[0], done, n);
+			}
+			filled += n;
+			done += n;
+			if (filled == size) {
+				ProcessBlock(gstate, *block, filled);
+				block.reset();
+			}
+		}
+	}
+	if (block && filled) {
+		ProcessBlock(gstate, *block, filled);
+	}
 	gstate.overflow.reset();
 }
 
@@ -1539,83 +2033,63 @@ SinkFinalizeType PhysicalArrowMetalAggregate::Finalize(Pipeline &pipeline, Event
 	auto &gstate = input.global_state.Cast<RewriteGlobalState>();
 	const auto started = std::chrono::steady_clock::now();
 	const idx_t overflowed = gstate.overflow ? gstate.overflow->Count() : 0;
-	if (overflowed > 0) {
-		AppendOverflow(gstate);
-	}
-	const idx_t rows = gstate.RegionRows();
-	if (int64_t(rows) > MAX_ROWS) {
-		throw InvalidInputException("arrowmetal_rewrite: %llu rows reached the aggregate, more than the GPU path "
-		                            "takes (2^31 - 1); SET arrowmetal_rewrite = 'off' for this query",
-		                            (unsigned long long)rows);
-	}
-
-	Plan plan;
-	vector<bool> nullable;
-	for (auto &column : gstate.columns) {
-		nullable.push_back(column->nulls.load() > 0);
-	}
-	auto slots = PlanNeeds(spec, nullable, plan);
 	Groups groups;
-	groups.slot.resize(plan.needs.size());
-	groups.slot_unsigned.assign(plan.needs.size(), false);
+	vector<AggSlots> slots;
 	string path;
+	idx_t rows = 0;
 
-	if (rows == 0) {
-		// No input: an ungrouped aggregate still answers one row (counts 0, everything else NULL), a
-		// grouped one answers none.
-		path = "empty";
-		if (!spec.has_key) {
-			groups.count = 1;
-			for (idx_t n = 0; n < plan.needs.size(); n++) {
-				groups.slot[n].assign(1, 0);
+	if (gstate.stream) {
+		gstate.StopWorker();
+		if (!gstate.worker_error.empty()) {
+			throw InvalidInputException(gstate.worker_error);
+		}
+		Trace("worker", started);
+		rows = gstate.RegionRows();
+		const idx_t nblocks = (rows + gstate.block_rows - 1) / gstate.block_rows;
+		for (idx_t b = 0; b < nblocks; b++) {
+			Block *block = gstate.directory[b].load();
+			if (block && !block->processed) {
+				ProcessBlock(gstate, *block, MinValue<idx_t>(gstate.block_rows, rows - b * gstate.block_rows));
 			}
 		}
+		if (overflowed > 0) {
+			StreamOverflow(gstate);
+			rows += overflowed;
+		}
+		auto &acc = *gstate.accumulator;
+		acc.Finish(groups);
+		slots = acc.slots;
+		path = (acc.path.empty() ? string("empty") : acc.path) + ", streamed in " + to_string(acc.merged_blocks) +
+		       (acc.merged_blocks == 1 ? " block" : " blocks") + ", " + to_string(gstate.streamed_blocks) +
+		       " handed to the GPU as they filled";
 	} else {
-		std::lock_guard<std::mutex> gpu(g_gpu_lock);
-		vector<am_array *> columns;
-		struct Releaser {
-			vector<am_array *> &c;
-			~Releaser() {
-				for (auto h : c) {
-					if (h) {
-						am_release(h);
-					}
-				}
-			}
-		} releaser {columns};
-		for (auto &column : gstate.columns) {
-			columns.push_back(ImportColumn(*column, rows));
+		if (overflowed > 0) {
+			AppendOverflow(gstate);
 		}
-		Trace("import", started);
-		if (!spec.has_key) {
-			path = "fused aggregate";
-			RunScalarQuery(columns, "(query (aggregate" + AggregateList(plan) + "))", plan, groups);
-		} else {
-			const Kind key_kind = spec.input_kinds[0];
-			// The span in unsigned arithmetic: key_max - key_min can exceed INT64_MAX.
-			const uint64_t span = uint64_t(gstate.key_max) - uint64_t(gstate.key_min);
-			bool dense = key_kind != Kind::STR && key_kind != Kind::U64 && gstate.key_seen &&
-			             span < uint64_t(DENSE_KEY_SPAN);
-			// The fused group-by keeps MIN and MAX in 32-bit atomics.
-			for (auto &need : plan.needs) {
-				if ((need.need == Need::MIN || need.need == Need::MAX) && KindWidth(spec.input_kinds[need.input]) > 4) {
-					dense = false;
+		rows = gstate.RegionRows();
+		if (int64_t(rows) > MAX_ROWS) {
+			throw InvalidInputException("arrowmetal_rewrite: %llu rows reached the aggregate, more than the GPU "
+			                            "path takes (2^31 - 1); SET arrowmetal_rewrite = 'off' for this query",
+			                            (unsigned long long)rows);
+		}
+		Block &block = *gstate.blocks[0];
+		Plan plan;
+		slots = PlanNeeds(spec, Nullable(block), plan);
+		groups.slot.resize(plan.needs.size());
+		groups.slot_unsigned.assign(plan.needs.size(), false);
+		if (rows == 0) {
+			// No input: an ungrouped aggregate still answers one row (counts 0, everything else NULL), a
+			// grouped one answers none.
+			path = "empty";
+			if (!spec.has_key) {
+				groups.count = 1;
+				for (idx_t n = 0; n < plan.needs.size(); n++) {
+					groups.slot[n].assign(1, 0);
 				}
 			}
-			if (dense) {
-				path = "fused dense group-by";
-				RunDense(columns, plan, gstate.key_min, gstate.key_max - gstate.key_min + 1,
-				         gstate.columns[0]->nulls.load(), key_kind, groups);
-			} else if (!gstate.key_seen && key_kind != Kind::STR && key_kind != Kind::U64) {
-				// Every key is NULL: one group.
-				path = "fused aggregate (all keys NULL)";
-				RunScalarQuery(columns, "(query (aggregate" + AggregateList(plan) + "))", plan, groups);
-				groups.key.values.assign(1, 0);
-				groups.key.valid.assign(1, 0);
-			} else {
-				path = "hash group-by";
-				RunHash(columns, plan, groups);
-			}
+		} else {
+			std::lock_guard<std::recursive_mutex> gpu(g_gpu_lock);
+			path = RunBlock(spec, block, rows, plan, groups);
 		}
 	}
 	Trace("gpu", started);
@@ -1628,8 +2102,11 @@ SinkFinalizeType PhysicalArrowMetalAggregate::Finalize(Pipeline &pipeline, Event
 	const double ms =
 	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
 	RecordRun(spec.decision_id, path, int64_t(rows), int64_t(groups.count), ms);
-	// The gathered columns are no longer needed; free them before the result is scanned.
-	gstate.columns.clear();
+	// The gathered columns are no longer needed; hand them back before the result is scanned.
+	{
+		std::lock_guard<std::recursive_mutex> gpu(g_gpu_lock);
+		gstate.blocks.clear();
+	}
 	return SinkFinalizeType::READY;
 }
 
@@ -1714,7 +2191,30 @@ struct Candidate {
 	int64_t threshold = 0;
 	int64_t input_rows = -1;
 	string shape;
+	string shape_class;
+	int64_t measured_floor = -1; // -1: the class was not measured faster at any size
 };
+
+// max - min of a key column's statistics, or -1 when DuckDB has none.
+static int64_t StatsSpan(const BaseStatistics &stats, Kind kind) {
+	if (!NumericStats::HasMinMax(stats)) {
+		return -1;
+	}
+	__int128 lo = 0, hi = 0;
+	auto min = NumericStats::Min(stats), max = NumericStats::Max(stats);
+	switch (kind) {
+	case Kind::I8: lo = min.GetValueUnsafe<int8_t>(); hi = max.GetValueUnsafe<int8_t>(); break;
+	case Kind::I16: lo = min.GetValueUnsafe<int16_t>(); hi = max.GetValueUnsafe<int16_t>(); break;
+	case Kind::I32: lo = min.GetValueUnsafe<int32_t>(); hi = max.GetValueUnsafe<int32_t>(); break;
+	case Kind::I64: lo = min.GetValueUnsafe<int64_t>(); hi = max.GetValueUnsafe<int64_t>(); break;
+	case Kind::U8: lo = min.GetValueUnsafe<uint8_t>(); hi = max.GetValueUnsafe<uint8_t>(); break;
+	case Kind::U16: lo = min.GetValueUnsafe<uint16_t>(); hi = max.GetValueUnsafe<uint16_t>(); break;
+	case Kind::U32: lo = min.GetValueUnsafe<uint32_t>(); hi = max.GetValueUnsafe<uint32_t>(); break;
+	default: return -1;
+	}
+	const __int128 span = hi - lo;
+	return span < 0 || span > __int128(INT64_MAX) ? -1 : int64_t(span);
+}
 
 // Finds (or adds) the gathered input for a column binding; returns its index.
 static idx_t InputFor(Candidate &c, BoundColumnRefExpression &ref, Kind kind, const LogicalType &type) {
@@ -1927,7 +2427,25 @@ static void Analyse(ClientContext &context, LogicalAggregate &aggr, Candidate &c
 	                                               : int64_t(child.EstimateCardinality(context));
 	c.input_rows = rows;
 	c.shape = get.function.name + " -> " + c.shape;
-	if (rows > MAX_ROWS || int64_t(stats->estimated_cardinality) > MAX_ROWS) {
+
+	// The key's range from DuckDB's statistics, when it has them.
+	int64_t span = -1;
+	if (spec.has_key && !string_key && !aggr.group_stats.empty() && aggr.group_stats[0]) {
+		span = StatsSpan(*aggr.group_stats[0], spec.input_kinds[0]);
+	}
+	// Streamed (see "Blocks"): an ungrouped aggregate, or a group-by whose integer key the statistics put
+	// in a small range and whose MIN/MAX fit the fused group-by's 32-bit slots.
+	bool wide_extreme = false;
+	for (auto &agg : spec.aggs) {
+		if ((agg.op == AggOp::MIN || agg.op == AggOp::MAX) && KindWidth(spec.input_kinds[agg.input]) > 4) {
+			wide_extreme = true;
+		}
+	}
+	spec.stream = !spec.has_key || (!string_key && spec.input_kinds[0] != Kind::U64 && span >= 0 &&
+	                                span < STREAM_KEY_SPAN && !wide_extreme);
+	// A streamed plan works on one block at a time and sums across blocks in 128 bits; the others hand
+	// ArrowMetal the whole input as one array.
+	if (!spec.stream && (rows > MAX_ROWS || int64_t(stats->estimated_cardinality) > MAX_ROWS)) {
 		c.reason = "more rows than the GPU path takes (2^31 - 1)";
 		return;
 	}
@@ -1940,6 +2458,57 @@ static void Analyse(ClientContext &context, LogicalAggregate &aggr, Candidate &c
 		threshold = MaxValue<int64_t>(threshold, CrossoverFor(agg.op, spec.has_key, string_key, many_groups));
 	}
 	c.threshold = threshold;
+
+	// The measured half of the gate: the shape classes the provisional benchmark found faster than
+	// DuckDB's own operators, and from how many rows (see `Measured`).
+	idx_t kernels = 0;
+	bool hugeint_state = false;
+	for (auto &agg : spec.aggs) {
+		if (agg.op == AggOp::SUM || agg.op == AggOp::AVG || agg.op == AggOp::MIN || agg.op == AggOp::MAX) {
+			kernels++;
+		}
+		// DuckDB accumulates these in 128 bits: sum over INTEGER/BIGINT it could not prove fits in 64
+		// bits, and avg over INTEGER/BIGINT always.
+		if ((agg.op == AggOp::SUM && !agg.proven_no_overflow && agg.semantic_bits >= 32) ||
+		    (agg.op == AggOp::AVG && agg.semantic_bits >= 32)) {
+			hugeint_state = true;
+		}
+	}
+	if (!spec.has_key) {
+		if (hugeint_state || kernels >= 2) {
+			c.shape_class = "ungrouped";
+			c.measured_floor = Measured::UNGROUPED;
+		} else {
+			c.shape_class = "ungrouped, one aggregate with a 64-bit state";
+		}
+	} else if (string_key) {
+		c.shape_class = "VARCHAR key";
+	} else {
+		const bool dense = spec.input_kinds[0] != Kind::U64 && span >= 0 && span < DENSE_KEY_SPAN;
+		if (!dense) {
+			c.shape_class = "integer key over too wide a range for the fused group-by";
+		} else if (many_groups) {
+			c.shape_class = "fused group-by, 100k or more groups";
+			c.measured_floor = Measured::DENSE_MANY_GROUPS;
+		} else if (kernels >= 3) {
+			c.shape_class = "fused group-by, three or more aggregates";
+			c.measured_floor = Measured::DENSE_FEW_GROUPS;
+		} else {
+			c.shape_class = "fused group-by, fewer than 100k groups and fewer than three aggregates";
+		}
+	}
+}
+
+// SET arrowmetal_rewrite_block_rows: rows per block of a streamed plan, rounded to a multiple of 64.
+static idx_t BlockRows(ClientContext &context) {
+	Value value;
+	int64_t rows = DEFAULT_BLOCK_ROWS;
+	if (context.TryGetCurrentSetting("arrowmetal_rewrite_block_rows", value) && !value.IsNull()) {
+		rows = value.GetValue<int64_t>();
+	}
+	rows = MaxValue<int64_t>(rows, 2048);
+	rows = MinValue<int64_t>(rows, int64_t(1) << 30);
+	return idx_t(rows + 63) / 64 * 64;
 }
 
 static void VisitPlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &op, Mode mode) {
@@ -1955,9 +2524,17 @@ static void VisitPlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 	Decision d;
 	d.shape = c.shape;
 	d.input_rows = c.input_rows;
-	d.threshold_rows = c.threshold;
-	if (c.reason.empty() && mode == Mode::AUTO && c.input_rows < c.threshold) {
-		c.reason = "below the crossover";
+	// The auto threshold: the router's crossover and the class's measured floor, whichever is larger;
+	// NULL in the log when the class has no measured floor.
+	d.threshold_rows = c.measured_floor < 0 ? -1 : MaxValue<int64_t>(c.threshold, c.measured_floor);
+	if (c.reason.empty() && mode == Mode::AUTO) {
+		if (c.measured_floor < 0) {
+			c.reason = "not measured faster than DuckDB: " + c.shape_class;
+		} else if (c.input_rows < c.threshold) {
+			c.reason = "below the crossover: " + c.shape_class;
+		} else if (c.input_rows < c.measured_floor) {
+			c.reason = "below the measured floor: " + c.shape_class;
+		}
 	}
 	if (!c.reason.empty()) {
 		d.decision = "kept";
@@ -1966,7 +2543,8 @@ static void VisitPlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 		return;
 	}
 	d.decision = "rewritten";
-	d.reason = mode == Mode::FORCE ? "forced" : "at or above the crossover";
+	d.reason = mode == Mode::FORCE ? "forced" : "at or above the threshold: " + c.shape_class;
+	c.spec.block_rows = BlockRows(input.context);
 	c.spec.decision_id = Record(d);
 
 	// Capacity: the most rows the source can hand over, so the sink rarely has to grow.
@@ -2049,6 +2627,9 @@ static void Load(ExtensionLoader &loader) {
 	config.AddExtensionOption("arrowmetal_rewrite",
 	                          "ArrowMetal aggregate rewrite: 'auto' (at or above the crossover), 'off', or 'force'",
 	                          LogicalType::VARCHAR, Value("auto"));
+	config.AddExtensionOption("arrowmetal_rewrite_block_rows",
+	                          "ArrowMetal aggregate rewrite: rows per block when a plan is streamed to the GPU",
+	                          LogicalType::BIGINT, Value::BIGINT(DEFAULT_BLOCK_ROWS));
 	OptimizerExtension extension;
 	extension.optimize_function = Optimize;
 	OptimizerExtension::Register(config, extension);

@@ -33,6 +33,7 @@ CREATE OR REPLACE TABLE t AS SELECT
     'key_' || (hash(i) % 1000)::VARCHAR                           AS kstr,
     'customer segment ' || (hash(i) % 1000)::VARCHAR || ' of the table' AS klong,
     ((hash(i) % 1000)::BIGINT * 1000003 + i % 3)                   AS kwide,
+    (hash(i + 3) % 1000000)::BIGINT * 1000003                     AS kwide1m,
     (hash(i * 3) % 1000000000)::BIGINT                            AS v,
     (hash(i * 5)::HUGEINT - 9223372036854775808)::BIGINT          AS vfull,
     (i % 1000)::INTEGER                                           AS w,
@@ -57,6 +58,7 @@ QUERIES = [
     ("grouped", "1k short VARCHAR keys: sum, count", "SELECT kstr, sum(v), count(*) FROM t GROUP BY kstr"),
     ("grouped", "1k long VARCHAR keys: sum, count", "SELECT klong, sum(v), count(*) FROM t GROUP BY klong"),
     ("grouped", "~3k wide BIGINT keys: sum", "SELECT kwide, sum(v) FROM t GROUP BY kwide"),
+    ("grouped", "~1M wide BIGINT keys: sum, count", "SELECT kwide1m, sum(v), count(*) FROM t GROUP BY kwide1m"),
 ]
 
 
@@ -121,7 +123,8 @@ def main():
             row = dict(family=family, op=op, rows=n, duckdb_ms=round(duck[0], 3), duckdb_cpu_ms=round(duck[1], 1),
                        rewrite_ms=round(gpu[0], 3), rewrite_cpu_ms=round(gpu[1], 1),
                        speedup=round(duck[0] / gpu[0], 2), path=path, gpu_ms=round(gpu_ms, 3),
-                       auto=decision, auto_reason=reason, sql=sql)
+                       auto=decision, shape_class=reason.split(": ", 1)[1] if ": " in reason else "",
+                       auto_reason=reason, sql=sql)
             rows_out.append(row)
             print(f"{n:>10,d} {op:52s} duckdb {duck[0]:8.2f} ms  rewrite {gpu[0]:8.2f} ms  "
                   f"x{duck[0] / gpu[0]:5.2f}  auto={decision:9s}  {path}", flush=True)

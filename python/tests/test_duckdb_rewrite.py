@@ -35,17 +35,22 @@ pytestmark = pytest.mark.skipif(not os.path.exists(EXTENSION),
 OPERATOR = "ARROWMETAL_AGGREGATE"
 
 
-def connect(threads=None):
+def connect(threads=None, block_rows=None):
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
     con.execute(f"LOAD '{EXTENSION}'")
     if threads:
         con.execute(f"SET threads = {threads}")
+    if block_rows:
+        con.execute(f"SET arrowmetal_rewrite_block_rows = {block_rows}")
     return con
 
 
-@pytest.fixture
-def con():
-    connection = connect()
+# Every test that takes `con` runs twice: with the default block size, where these small tables fit in
+# one block, and with 2,048-row blocks, where a streamed plan (ungrouped, or a narrow integer key) is
+# cut into many blocks that the GPU worker aggregates while the scan runs and Finalize merges.
+@pytest.fixture(params=[None, 2048], ids=["one-block", "streamed"])
+def con(request):
+    connection = connect(block_rows=request.param)
     yield connection
     connection.close()
 
@@ -256,9 +261,10 @@ def test_the_aggregate_inside_a_larger_query(con):
     check(con, "SELECT (SELECT max(v0) FROM t) - (SELECT min(v0) FROM t)")
 
 
+@pytest.mark.parametrize("block_rows", [None, 65536], ids=["one-block", "streamed"])
 @pytest.mark.parametrize("threads", [1, 4, 16])
-def test_thread_counts(threads):
-    con = connect(threads)
+def test_thread_counts(threads, block_rows):
+    con = connect(threads, block_rows)
     make(con, 500_000, "(hash(i) % 1000)::INTEGER",
          [value_sql("BIGINT", 16), value_sql("INTEGER", 17, null_pct=25)])
     check(con, "SELECT k, sum(v0), count(v1), min(v1), max(v1), avg(v0) FROM t GROUP BY k")
@@ -310,11 +316,39 @@ def test_unsupported_shapes_are_left_alone(con, sql, reason):
 def test_auto_leaves_a_table_below_the_crossover_alone(con):
     make(con, 10_000, "(i % 10)::INTEGER", [value_sql("BIGINT", 21)])
     con.execute("SET arrowmetal_rewrite = 'auto'")
-    sql = "SELECT k, sum(v0) FROM t GROUP BY k"
+    sql = "SELECT k, sum(v0), min(v0), max(v0) FROM t GROUP BY k"
     assert OPERATOR not in plan(con, sql)
     decision = last_decision(con)
-    assert decision[1] == "kept" and decision[2] == "below the crossover"
-    assert decision[4] == 10_000 and decision[5] == 10_000_000
+    assert decision[1] == "kept" and decision[2] == "below the crossover: fused group-by, three or more aggregates"
+    # The router's 10M crossover for a 1,000-group sum, and the 50M measured floor for this class.
+    assert decision[4] == 10_000 and decision[5] == 50_000_000
+
+
+def test_auto_never_rewrites_a_class_not_measured_faster(con):
+    make(con, 10_000, "(i % 10)::INTEGER", [value_sql("BIGINT", 21)])
+    make(con, 10_000, "'a longer VARCHAR group key ' || (i % 10)::VARCHAR", [value_sql("BIGINT", 21)], name="s")
+    con.execute("SET arrowmetal_rewrite = 'auto'")
+    for sql in ["SELECT k, sum(v0) FROM t GROUP BY k", "SELECT max(v0) FROM t",
+                "SELECT k, min(v0), max(v0), avg(v0) FROM s GROUP BY k"]:
+        assert OPERATOR not in plan(con, sql)
+        decision = last_decision(con)
+        assert decision[1] == "kept" and decision[2].startswith("not measured faster than DuckDB"), decision
+        assert decision[5] is None
+
+
+def test_auto_rewrites_at_scale(con):
+    """At 10M rows 'auto' takes the many-groups and the ungrouped classes, and still matches DuckDB."""
+    con.execute("CREATE TABLE big AS SELECT (hash(i) % 200000)::INTEGER k, "
+                "(hash(i * 3) % 1000000000)::BIGINT v, (hash(i * 5)::HUGEINT - 9223372036854775808)::BIGINT f "
+                "FROM range(10000000) r(i)")
+    con.execute("SET arrowmetal_rewrite = 'auto'")
+    for sql in ["SELECT k, sum(v), count(*) FROM big GROUP BY k", "SELECT sum(f), avg(f) FROM big"]:
+        assert OPERATOR in plan(con, sql), sql
+        assert last_decision(con)[2].startswith("at or above the threshold")
+        got = sorted(con.sql(sql).fetchall(), key=sort_key)
+        con.execute("SET arrowmetal_rewrite = 'off'")
+        assert got == sorted(con.sql(sql).fetchall(), key=sort_key)
+        con.execute("SET arrowmetal_rewrite = 'auto'")
 
 
 def test_auto_is_the_default_and_off_turns_it_off(con):
@@ -337,7 +371,14 @@ def test_the_decision_log_records_the_run(con):
     assert names == ["id", "decision", "reason", "shape", "input_rows", "threshold_rows", "path",
                      "rows_seen", "groups", "gpu_ms"]
     assert row[1] == "rewritten" and row[2] == "forced"
-    assert row[6] == "fused dense group-by" and row[7] == 20_000 and row[8] == 10 and row[9] > 0
+    assert row[6].startswith("fused dense group-by, streamed in") and row[7] == 20_000 and row[8] == 10
+    assert row[9] > 0
+    blocks, handed = map(int, re.search(r"streamed in (\d+) blocks?, (\d+) handed", row[6]).groups())
+    if con.sql("SELECT current_setting('arrowmetal_rewrite_block_rows')").fetchone()[0] == 2048:
+        # 20,000 rows are nine full 2,048-row blocks, each handed over as it filled, and a partial tenth.
+        assert (blocks, handed) == (10, 9)
+    else:
+        assert (blocks, handed) == (1, 0)
     assert "seq_scan" in row[3] and "GROUP BY" in row[3]
 
 
@@ -362,26 +403,47 @@ def test_crossovers_match_the_router_sweep():
 # ---------------------------------------------------------------------------------------------------
 
 def test_a_prepared_statement_after_the_table_grew(con):
-    # The gather buffers are sized from the table at planning time; rows added afterwards go through
-    # the overflow path and must still all be counted.
-    make(con, 20_000, "(i % 10)::INTEGER", [value_sql("INTEGER", 24)])
+    # A single-block plan (a BIGINT MIN under GROUP BY needs the hash group-by's whole-input array) sizes
+    # its block from the table at planning time; rows added afterwards go through the overflow path. A
+    # streamed plan (the ungrouped one) just takes more blocks. Every row must be counted either way.
+    make(con, 20_000, "(i % 10)::INTEGER", [value_sql("BIGINT", 24)])
     con.execute("SET arrowmetal_rewrite = 'force'")
     start = con.sql("SELECT coalesce(max(id), 0) FROM arrowmetal_rewrites()").fetchone()[0]
     con.execute("PREPARE p AS SELECT k, sum(v0), count(*), min(v0) FROM t GROUP BY k")
     con.execute("PREPARE q AS SELECT sum(v0), count(*), max(v0) FROM t")
     first = sorted(con.execute("EXECUTE p").fetchall())
-    con.execute(f"INSERT INTO t SELECT (i % 13)::INTEGER, {value_sql('INTEGER', 25)} FROM range(150000) r(i)")
+    con.execute(f"INSERT INTO t SELECT (i % 13)::INTEGER, {value_sql('BIGINT', 25)} FROM range(150000) r(i)")
     grown_p = sorted(con.execute("EXECUTE p").fetchall())
     grown_q = con.execute("EXECUTE q").fetchall()
     # One decision per plan; its run columns describe the plan's latest execution.
     # (The log is the process's, shared by every connection, hence the id filter.)
     runs = con.sql(f"SELECT path, rows_seen FROM arrowmetal_rewrites() WHERE id > {start} ORDER BY id").fetchall()
     assert len(runs) == 2
-    assert all("rows past the reserved buffers" in path and seen == 170_000 for path, seen in runs), runs
+    assert re.fullmatch(r"hash group-by \(\d+ rows past the reserved buffers\)", runs[0][0]), runs
+    assert "streamed in" in runs[1][0], runs
+    assert runs[0][1] == runs[1][1] == 170_000
     con.execute("SET arrowmetal_rewrite = 'off'")
     assert grown_p == sorted(con.sql("SELECT k, sum(v0), count(*), min(v0) FROM t GROUP BY k").fetchall())
     assert grown_q == con.sql("SELECT sum(v0), count(*), max(v0) FROM t").fetchall()
     assert grown_p != first
+
+
+def test_a_streamed_plan_past_its_block_directory():
+    # A streamed plan keeps room for 1,024 blocks beyond the planned input; with 2,048-row blocks a
+    # 20,000-row table planned once can take about 2.1M more rows before the rest is kept aside and
+    # run through fresh blocks in Finalize.
+    con = connect(block_rows=2048)
+    make(con, 20_000, "(i % 10)::INTEGER", [value_sql("BIGINT", 30)])
+    con.execute("SET arrowmetal_rewrite = 'force'")
+    start = con.sql("SELECT coalesce(max(id), 0) FROM arrowmetal_rewrites()").fetchone()[0]
+    con.execute("PREPARE q AS SELECT k, sum(v0), count(v0), avg(v0), count(*) FROM t GROUP BY k")
+    con.execute(f"INSERT INTO t SELECT (i % 10)::INTEGER, {value_sql('BIGINT', 31)} FROM range(2300000) r(i)")
+    got = sorted(con.execute("EXECUTE q").fetchall())
+    path, seen = con.sql(f"SELECT path, rows_seen FROM arrowmetal_rewrites() WHERE id > {start}").fetchone()
+    assert "rows past the reserved buffers" in path and "streamed in" in path and seen == 2_320_000, path
+    con.execute("SET arrowmetal_rewrite = 'off'")
+    assert got == sorted(con.sql("SELECT k, sum(v0), count(v0), avg(v0), count(*) FROM t GROUP BY k").fetchall())
+    con.close()
 
 
 def test_string_keys_past_the_reserved_bytes(con):
