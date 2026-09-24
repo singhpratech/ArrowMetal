@@ -13,9 +13,9 @@ duckdb/extension-ci-tools writes:
     field 8   32 bytes   unused
     field 7   32 bytes   unused
     field 6   32 bytes   unused
-    field 5   32 bytes   ABI type          "C_STRUCT" for a C-API extension
+    field 5   32 bytes   ABI type          "C_STRUCT" for a C-API extension, "CPP" for a C++ one
     field 4   32 bytes   extension version
-    field 3   32 bytes   DuckDB version    -- for C_STRUCT this is the *C API* version, e.g. v1.2.0
+    field 3   32 bytes   DuckDB version    -- for C_STRUCT the *C API* version (v1.2.0), for CPP the exact release (v1.5.5)
     field 2   32 bytes   platform          e.g. osx_arm64
     field 1   32 bytes   the literal "4"   the marker that identifies a DuckDB extension at all
     signature 256 bytes  zero, i.e. unsigned
@@ -60,7 +60,7 @@ def main():
     parser.add_argument("-o", "--out-file", required=True, help="the .duckdb_extension to write")
     parser.add_argument("-p", "--duckdb-platform", required=True, help="e.g. osx_arm64")
     parser.add_argument("-dv", "--duckdb-version", required=True,
-                        help="the C API version for a C_STRUCT extension, e.g. v1.2.0")
+                        help="the C API version for a C_STRUCT extension (v1.2.0), the DuckDB release for a CPP one (v1.5.5)")
     parser.add_argument("-ev", "--extension-version", required=True)
     parser.add_argument("--abi-type", default="C_STRUCT")
     args = parser.parse_args()
@@ -78,8 +78,9 @@ def main():
         handle.write(field("4"))                         # field 1, the DuckDB extension marker
         handle.write(b"\x00" * 256)                      # unsigned
 
+    against = "C API" if args.abi_type == "C_STRUCT" else "DuckDB"
     print(f"wrote {args.out_file}: {args.abi_type} extension {args.extension_version} "
-          f"for {args.duckdb_platform}, C API {args.duckdb_version}")
+          f"for {args.duckdb_platform}, {against} {args.duckdb_version}")
 
 
 if __name__ == "__main__":

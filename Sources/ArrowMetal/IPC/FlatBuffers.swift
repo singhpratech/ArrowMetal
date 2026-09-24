@@ -63,6 +63,13 @@ struct FBBuf {
         return String(decoding: raw, as: UTF8.self)
     }
 
+    /// The raw bytes of a FlatBuffers string, which Arrow also uses for byte blobs (`KeyValue.value`).
+    func stringBytes(at pos: Int) throws -> [UInt8] {
+        let n = Int(try load(UInt32.self, at: pos))
+        guard n >= 0, pos + 4 + n <= bytes.count else { throw ArrowIPCError.truncated("string of \(n) bytes at \(pos)") }
+        return Array(bytes[(pos + 4)..<(pos + 4 + n)])
+    }
+
     /// The buffer's root table.
     func root() throws -> FBTable { try FBTable(self, at: indirect(0)) }
 }
@@ -117,6 +124,10 @@ struct FBTable {
     func string(_ id: Int) throws -> String? {
         guard let p = try field(id) else { return nil }
         return try buf.string(at: buf.indirect(p))
+    }
+    func stringBytes(_ id: Int) throws -> [UInt8]? {
+        guard let p = try field(id) else { return nil }
+        return try buf.stringBytes(at: buf.indirect(p))
     }
     func table(_ id: Int) throws -> FBTable? {
         guard let p = try field(id) else { return nil }
