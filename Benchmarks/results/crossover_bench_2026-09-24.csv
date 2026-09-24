@@ -1,0 +1,128 @@
+# ArrowMetal crossover on Apple M4 Max, 16 CPU cores, best of up to 20 (5 at 10M rows and above), 10% nulls, 2026-09-24T22:54:48Z
+op,rows,path,wall_us,cpu_us,iterations
+sum(int64),1000,gpu,114.7,155.0,20
+sum(int64),1000,cpu-1core,0.6,1.0,20
+sum(int64),1000,cpu-ref,4.2,5.0,20
+sum(int64),1000,cpu-allcores,1.9,2.0,20
+min(int64),1000,gpu,103.9,145.0,20
+min(int64),1000,cpu-1core,0.6,2.0,20
+min(int64),1000,cpu-ref,9.0,9.0,20
+max(int64),1000,gpu,111.7,150.0,20
+max(int64),1000,cpu-1core,0.5,1.0,20
+max(int64),1000,cpu-ref,8.2,9.0,20
+compare(int64 > 0),1000,gpu,110.2,149.0,20
+compare(int64 > 0),1000,cpu-1core,0.2,0.0,20
+compare(int64 > 0),1000,cpu-ref,38.2,38.0,20
+add(int64, 1),1000,gpu,100.0,137.0,20
+add(int64, 1),1000,cpu-1core,0.1,0.0,20
+add(int64, 1),1000,cpu-ref,2.8,3.0,20
+filter(int64, mask),1000,gpu,346.7,449.0,20
+filter(int64, mask),1000,cpu-1core,0.3,2.0,20
+filter(int64, mask),1000,cpu-ref,48.5,48.0,20
+group-by sum (1000 keys),1000,gpu,142.8,181.0,20
+group-by sum (1000 keys),1000,cpu-candidate,1.0,1.0,20
+sum(int64),10000,gpu,106.2,142.0,20
+sum(int64),10000,cpu-1core,4.9,6.0,20
+sum(int64),10000,cpu-ref,36.7,37.0,20
+sum(int64),10000,cpu-allcores,8.9,9.0,20
+min(int64),10000,gpu,105.8,146.0,20
+min(int64),10000,cpu-1core,4.5,5.0,20
+min(int64),10000,cpu-ref,73.4,74.0,20
+max(int64),10000,gpu,115.5,153.0,20
+max(int64),10000,cpu-1core,4.0,4.0,20
+max(int64),10000,cpu-ref,70.1,70.0,20
+compare(int64 > 0),10000,gpu,117.8,158.0,20
+compare(int64 > 0),10000,cpu-1core,1.4,2.0,20
+compare(int64 > 0),10000,cpu-ref,313.4,314.0,20
+add(int64, 1),10000,gpu,106.9,147.0,20
+add(int64, 1),10000,cpu-1core,0.8,2.0,20
+add(int64, 1),10000,cpu-ref,21.4,21.0,20
+filter(int64, mask),10000,gpu,370.5,494.0,20
+filter(int64, mask),10000,cpu-1core,2.3,2.0,20
+filter(int64, mask),10000,cpu-ref,396.8,397.0,20
+group-by sum (1000 keys),10000,gpu,177.1,218.0,20
+group-by sum (1000 keys),10000,cpu-candidate,9.6,9.0,20
+sum(int64),100000,gpu,128.2,170.0,20
+sum(int64),100000,cpu-1core,55.8,56.0,20
+sum(int64),100000,cpu-ref,355.0,356.0,20
+sum(int64),100000,cpu-allcores,47.2,139.0,20
+min(int64),100000,gpu,127.7,164.0,20
+min(int64),100000,cpu-1core,40.0,40.0,20
+min(int64),100000,cpu-ref,728.7,729.0,20
+max(int64),100000,gpu,124.0,162.0,20
+max(int64),100000,cpu-1core,40.0,40.0,20
+max(int64),100000,cpu-ref,702.6,703.0,20
+compare(int64 > 0),100000,gpu,116.7,155.0,20
+compare(int64 > 0),100000,cpu-1core,13.8,14.0,20
+compare(int64 > 0),100000,cpu-ref,3162.1,3163.0,20
+add(int64, 1),100000,gpu,110.3,147.0,20
+add(int64, 1),100000,cpu-1core,11.8,12.0,20
+add(int64, 1),100000,cpu-ref,203.5,205.0,20
+filter(int64, mask),100000,gpu,365.5,478.0,20
+filter(int64, mask),100000,cpu-1core,29.1,31.0,20
+filter(int64, mask),100000,cpu-ref,3877.0,3877.0,20
+group-by sum (1000 keys),100000,gpu,211.4,257.0,20
+group-by sum (1000 keys),100000,cpu-candidate,107.9,108.0,20
+sum(int64),1000000,gpu,197.1,236.0,20
+sum(int64),1000000,cpu-1core,992.8,993.0,20
+sum(int64),1000000,cpu-ref,3649.5,3651.0,20
+sum(int64),1000000,cpu-allcores,126.7,1538.0,20
+min(int64),1000000,gpu,263.1,311.0,20
+min(int64),1000000,cpu-1core,557.1,558.0,20
+min(int64),1000000,cpu-ref,7222.3,7224.0,20
+max(int64),1000000,gpu,274.5,316.0,20
+max(int64),1000000,cpu-1core,514.4,514.0,20
+max(int64),1000000,cpu-ref,7015.5,7016.0,20
+compare(int64 > 0),1000000,gpu,145.2,188.0,20
+compare(int64 > 0),1000000,cpu-1core,154.4,156.0,20
+compare(int64 > 0),1000000,cpu-ref,31637.9,31630.0,20
+add(int64, 1),1000000,gpu,168.8,206.0,20
+add(int64, 1),1000000,cpu-1core,132.2,132.0,20
+add(int64, 1),1000000,cpu-ref,2259.6,2260.0,20
+filter(int64, mask),1000000,gpu,416.8,534.0,20
+filter(int64, mask),1000000,cpu-1core,731.4,731.0,20
+filter(int64, mask),1000000,cpu-ref,38287.8,38279.0,20
+group-by sum (1000 keys),1000000,gpu,555.8,365.0,20
+group-by sum (1000 keys),1000000,cpu-candidate,1103.9,1104.0,20
+sum(int64),10000000,gpu,297.9,334.0,5
+sum(int64),10000000,cpu-1core,11304.3,11305.0,5
+sum(int64),10000000,cpu-ref,36810.7,36811.0,5
+sum(int64),10000000,cpu-allcores,963.4,13377.0,5
+min(int64),10000000,gpu,417.7,472.0,5
+min(int64),10000000,cpu-1core,6174.2,6174.0,5
+min(int64),10000000,cpu-ref,74113.0,74113.0,5
+max(int64),10000000,gpu,492.0,496.0,5
+max(int64),10000000,cpu-1core,5994.9,5996.0,5
+max(int64),10000000,cpu-ref,70529.5,70523.0,5
+compare(int64 > 0),10000000,gpu,468.4,366.0,5
+compare(int64 > 0),10000000,cpu-1core,1550.4,1552.0,5
+compare(int64 > 0),10000000,cpu-ref,319107.8,319137.0,5
+add(int64, 1),10000000,gpu,505.6,361.0,5
+add(int64, 1),10000000,cpu-1core,1323.9,1328.0,5
+add(int64, 1),10000000,cpu-ref,22596.3,22597.0,5
+filter(int64, mask),10000000,gpu,1126.1,820.0,5
+filter(int64, mask),10000000,cpu-1core,7841.5,7843.0,5
+filter(int64, mask),10000000,cpu-ref,383901.4,383902.0,5
+group-by sum (1000 keys),10000000,gpu,1160.9,415.0,5
+group-by sum (1000 keys),10000000,cpu-candidate,11144.0,11143.0,5
+sum(int64),50000000,gpu,1040.7,381.0,5
+sum(int64),50000000,cpu-1core,55651.6,55645.0,5
+sum(int64),50000000,cpu-ref,185025.1,185019.0,5
+sum(int64),50000000,cpu-allcores,4700.2,63903.0,5
+min(int64),50000000,gpu,1199.4,557.0,5
+min(int64),50000000,cpu-1core,30238.5,30202.0,5
+min(int64),50000000,cpu-ref,370969.6,370956.0,5
+max(int64),50000000,gpu,1248.6,550.0,5
+max(int64),50000000,cpu-1core,30310.4,30311.0,5
+max(int64),50000000,cpu-ref,360775.2,360737.0,5
+compare(int64 > 0),50000000,gpu,1232.2,401.0,5
+compare(int64 > 0),50000000,cpu-1core,7970.1,7970.0,5
+compare(int64 > 0),50000000,cpu-ref,1596614.6,1596513.0,5
+add(int64, 1),50000000,gpu,2094.2,409.0,5
+add(int64, 1),50000000,cpu-1core,6896.1,6897.0,5
+add(int64, 1),50000000,cpu-ref,115789.0,115779.0,5
+filter(int64, mask),50000000,gpu,3104.6,1001.0,5
+filter(int64, mask),50000000,cpu-1core,39464.9,39465.0,5
+filter(int64, mask),50000000,cpu-ref,1924741.8,1924600.0,5
+group-by sum (1000 keys),50000000,gpu,2188.3,397.0,5
+group-by sum (1000 keys),50000000,cpu-candidate,51770.9,51771.0,5
