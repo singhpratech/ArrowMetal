@@ -568,3 +568,29 @@ def test_a_value_absent_but_within_the_statistics_is_ruled_out():
     st = f.last_read_stats
     assert st["row_groups_skipped_by_statistics"] == 3 and st["row_groups_skipped_by_bloom_filter"] == 1
     assert t.num_rows == 0
+
+
+# ------------------------------------------------------------------ larger files, written here
+
+def test_repeated_columns_past_one_allocation_page():
+    """Tens of thousands of level entries per column, several list and nested columns in one read.
+    Repetition levels used to be decoded with a 4-byte scratch rank buffer that the kernel wrote a rank
+    per level into -- harmless up to the 16 KB allocation padding (4,096 levels), memory corruption
+    past it. This read has 120,000+ levels per repeated column."""
+    import numpy as np
+    n = 40_000
+    i = np.arange(n)
+    table = pa.table({
+        "l": pa.array([None if k % 13 == 0 else list(range(k % 5)) for k in range(n)], pa.list_(pa.int64())),
+        "ll": pa.array([None if k % 17 == 0 else [[k] * (k % 3), []] for k in range(n)],
+                       pa.list_(pa.list_(pa.int32()))),
+        "m": pa.array([[("k%d" % (k % 7), k)] * (k % 4) for k in range(n)], pa.map_(pa.string(), pa.int64())),
+        "s": pa.array([None if k % 11 == 0 else {"a": int(k), "b": "v%d" % k} for k in range(n)],
+                      pa.struct([("a", pa.int64()), ("b", pa.string())])),
+        "x": pa.array(i, pa.int64()),
+    })
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "big-nested.parquet")
+        pq.write_table(table, path, compression="snappy", row_group_size=15_000)
+        for _ in range(3):
+            assert_same_table(am.read_parquet_table(path), pq.read_table(path))

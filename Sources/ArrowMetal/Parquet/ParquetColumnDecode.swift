@@ -323,10 +323,13 @@ extension ParquetFile {
         var repBytes: MetalArrowBuffer? = nil
         if needRepetition && maxRep > 0 {
             let rb = try MetalArrowBuffer.allocate(byteCount: Swift.max(totalLevels, 1), zeroed: true, context: ctx)
-            let dummy = try MetalArrowBuffer.allocate(byteCount: 4, context: ctx)
+            // `pq_decode_levels` writes a rank for every level it decodes, so the scratch rank buffer
+            // needs a slot per level. (It was once 4 bytes, which is fine up to the 16 KB allocation
+            // padding -- 4,096 levels -- and past that wrote over whatever memory followed.)
+            let scratchRanks = try MetalArrowBuffer.allocate(byteCount: Swift.max(totalLevels * 4, 4), zeroed: false, context: ctx)
             try runLevels(ctx, data: pageData, dataOffset: pageDataOffset, pages: pagesBuf, count: infos.count,
                           bitWidth: bitWidth(of: maxRep), matchLevel: 0, which: 1, countSlot: 2,
-                          levels: rb, ranks: dummy)
+                          levels: rb, ranks: scratchRanks)
             repBytes = rb
         }
 

@@ -215,6 +215,11 @@ Parquet on the GPU
 - Parquet split-block bloom filters (pyarrow's `bloom_filter_options`, DuckDB's): an `==` filter drops
   the row groups whose bloom filter rules its literal out, before any page is read; `useBloomFilters` /
   `use_bloom_filters` / `am_parquet_set_bloom_filters` turn it off (`ParquetBloomFilterTests`).
+- Parquet repetition levels were decoded with a 4-byte scratch buffer for the per-level ranks the kernel
+  writes, so a list column with more than 4,096 level entries in one read wrote past that buffer into
+  host memory (the allocation is `posix_memalign` memory wrapped for the GPU); the scratch buffer now
+  has a slot per level. `test_parquet_nested.py::test_repeated_columns_past_one_allocation_page` fails
+  without the fix and passes with it.
 - A one-level Parquet list column read from row groups that a filter removed entirely now comes back
   empty instead of raising "a list column must have definition levels".
 
