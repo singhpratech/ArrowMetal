@@ -17,6 +17,12 @@ shipped RouterCPU loops. The step is the first size from which the GPU was at le
 every larger size in the file. This is the input to regenerate the table from once a quiet run of
 router_check.py exists.
 
+`multiply` gets its own row. The 2026-09-17 sweep timed `add` only, and a 64-bit integer multiply
+costs the CPU more per element than an add, so the arithmetic row does not carry over to it. The
+multiply row is fitted the same way from the `multiply(int64, 3)` rows of a router_check.py CSV
+(`--multiply-from`, default Benchmarks/results/router_check_2026-09-23_provisional.csv; with
+`--from-check` the same file), whose CPU side is the shipped RouterCPU loop.
+
 The step alone would send every size between the last CPU-wins point and the first GPU-wins point to
 the CPU, however close the GPU already is. So the table is fitted once, offline, as the router section
 of docs/DESIGN.md describes: inside that bracket both paths are taken as straight lines between the
@@ -31,6 +37,7 @@ Usage:
                                                            # (regenerated from the source it names)
     python Benchmarks/router_table.py --json Benchmarks/results/router_<date>.json
     python Benchmarks/router_table.py --from-check Benchmarks/results/router_check_<date>.csv
+    python Benchmarks/router_table.py --multiply-from Benchmarks/results/router_check_<date>.csv
 """
 import argparse
 import json
@@ -42,6 +49,8 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_JSON = os.path.join(ROOT, "Benchmarks", "results", "router_2026-09-17.json")
+DEFAULT_MULTIPLY = os.path.join(ROOT, "Benchmarks", "results", "router_check_2026-09-23_provisional.csv")
+MULTIPLY_LABEL = "multiply(int64, 3)"
 OUT = os.path.join(ROOT, "Sources", "ArrowMetal", "Router", "RouterTable.swift")
 
 # Bench label -> (RoutedOp case, CPU path label in the bench CSV). The order is the C ABI op number.
@@ -130,7 +139,7 @@ def entries_from_json(json_path):
     return entries, rel, source, cpu_side
 
 
-def entries_from_check(csv_path):
+def load_check(csv_path):
     header, bench, sizes = "", {}, set()
     with open(csv_path) as fh:
         lines = fh.read().splitlines()
@@ -142,11 +151,25 @@ def entries_from_check(csv_path):
         sizes.add(n)
         bench[(row["op"], n, "gpu")] = float(row["gpu_us"])
         bench[(row["op"], n, "cpu")] = float(row["cpu_us"])
+    return header, bench, sorted(sizes)
+
+
+def multiply_entry(csv_path):
+    """(label, step, crossover, bracket low, points, relative path, check header) for the multiply row."""
+    header, bench, sizes = load_check(csv_path)
+    if not any(k[0] == MULTIPLY_LABEL for k in bench):
+        raise SystemExit(f"{MULTIPLY_LABEL}: not in {csv_path}")
+    cross, step, lo, pts = fit(MULTIPLY_LABEL, "cpu", None, sizes, bench)
+    return MULTIPLY_LABEL, step, cross, lo, pts, os.path.relpath(csv_path, ROOT), header
+
+
+def entries_from_check(csv_path):
+    header, bench, sizes = load_check(csv_path)
     entries = []
     for label, case, _ in OPS:
         if not any(k[0] == label for k in bench):
             raise SystemExit(f"{label}: not in {csv_path}")
-        cross, step, lo, pts = fit(label, "cpu", None, sorted(sizes), bench)
+        cross, step, lo, pts = fit(label, "cpu", None, sizes, bench)
         entries.append((label, case, step, cross, lo, pts))
     rel = os.path.relpath(csv_path, ROOT)
     source = [
@@ -161,11 +184,21 @@ def entries_from_check(csv_path):
     return entries, rel, source, cpu_side
 
 
-def generate(path):
+def generate(path, multiply_path=None):
     if path.endswith(".csv"):
         entries, rel, source, cpu_side = entries_from_check(path)
+        multiply_path = path
     else:
         entries, rel, source, cpu_side = entries_from_json(path)
+        multiply_path = multiply_path or DEFAULT_MULTIPLY
+    m_label, m_step, m_cross, m_lo, m_pts, m_rel, m_header = multiply_entry(multiply_path)
+    if m_rel != rel:
+        source = source + [
+            "//",
+            "// The multiply row comes from " + m_rel + ",",
+            "// since the sweep above timed add only. Its CPU side is the shipped RouterCPU multiply loop,",
+            "// timed by Benchmarks/router_check.py. Check header: " + m_header,
+        ]
     out = source + [
         "",
         "/// The router's crossover table: per routed operation, the row count from which the GPU path",
@@ -195,15 +228,24 @@ def generate(path):
             "        switch op {"]
     for label, case, step, cross, lo, pts in entries:
         out.append(f"        case .{case}: return {lo}")
-    out += ["        }", "    }", "}"]
+    m_pt = "; ".join(f"{n:,} rows: GPU {g:g} us, CPU {c:g} us" for n, g, c in m_pts)
+    out += ["        }", "    }", "",
+            "    /// Results file the multiply row was fitted from (a router_check.py CSV).",
+            f"    static let multiplySource = \"{m_rel}\"",
+            "",
+            "    /// `multiply`'s own crossover: the arithmetic row above was measured on add (subtract follows it).",
+            f"    static let multiplyCrossoverRows = {m_cross}   // {m_label}; {m_pt}",
+            f"    static let multiplyMeasuredStepRows = {m_step}",
+            f"    static let multiplyBracketLowRows = {m_lo}",
+            "}"]
     return "\n".join(out) + "\n"
 
 
-def committed_source(out_path):
-    """The results file a committed table names in `static let source`, or None."""
+def committed_source(out_path, name="source"):
+    """The results file a committed table names in `static let <name>`, or None."""
     try:
         with open(out_path) as fh:
-            m = re.search(r'static let source = "([^"]+)"', fh.read())
+            m = re.search(r'static let ' + name + r' = "([^"]+)"', fh.read())
     except FileNotFoundError:
         return None
     return os.path.join(ROOT, m.group(1)) if m else None
@@ -215,14 +257,21 @@ def main():
     src.add_argument("--json", help="router_<date>.json from Benchmarks/crossover.py (default: " +
                      os.path.relpath(DEFAULT_JSON, ROOT) + ")")
     src.add_argument("--from-check", help="router_check_<date>.csv from Benchmarks/router_check.py")
+    ap.add_argument("--multiply-from", help="with --json: router_check_<date>.csv to fit the multiply row from "
+                    "(default: " + os.path.relpath(DEFAULT_MULTIPLY, ROOT) + ")")
     ap.add_argument("--out", default=OUT)
     ap.add_argument("--check", action="store_true",
                     help="compare with the committed table (regenerated from the source it names) instead of writing")
     args = ap.parse_args()
+    if args.from_check and args.multiply_from:
+        ap.error("--multiply-from goes with --json; --from-check fits every row from its own file")
     path = args.json or args.from_check
+    multiply = args.multiply_from
     if path is None:
         path = (committed_source(args.out) if args.check else None) or DEFAULT_JSON
-    text = generate(os.path.abspath(path))
+    if multiply is None and args.check and not args.from_check:
+        multiply = committed_source(args.out, "multiplySource")
+    text = generate(os.path.abspath(path), os.path.abspath(multiply) if multiply else None)
     if args.check:
         try:
             with open(args.out) as fh:

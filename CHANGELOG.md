@@ -28,10 +28,11 @@ Core
   output on both paths (float sums reproduce the GPU's summation order bit for bit). The crossover table
   is generated from `Benchmarks/results/router_2026-09-17.json` by `Benchmarks/router_table.py`, whose
   CPU side is the bench's single-core loops rather than the router's own; `router_table.py --from-check`
-  fits it from a `Benchmarks/router_check.py` run of the shipped loops instead. The group-by sum is
-  routed for uint64 values kept unsigned (`GroupBy.sumUnsigned`) as well. A batch
-  always keeps the GPU, and so does `auto` for float columns and `multiply`, which have no measured
-  crossover yet. `Benchmarks/router_check.py` times each routed operation under gpu, cpu and auto. `ARROWMETAL_ROUTER=auto|gpu|cpu`, `Router.mode` / `Router.withMode` in Swift,
+  fits it from a `Benchmarks/router_check.py` run of the shipped loops instead. `multiply` has its own
+  row, fitted from the RouterCPU multiply loop in `Benchmarks/results/router_check_2026-09-23_provisional.csv`
+  (the sweep timed `add` only). The group-by sum is routed for uint64 values kept unsigned
+  (`GroupBy.sumUnsigned`) as well. A batch always keeps the GPU, and so does `auto` for float columns,
+  which have no measured crossover yet. `Benchmarks/router_check.py` times each routed operation under gpu, cpu and auto. `ARROWMETAL_ROUTER=auto|gpu|cpu`, `Router.mode` / `Router.withMode` in Swift,
   `am_router_*` in C, and `am.set_router`, `with am.router(...)`, `am.last_route()` in Python
   (docs/DESIGN.md, "CPU/GPU router").
 - The Swift and Python test harnesses and `python/tests/differential_report.py` pin the router to the

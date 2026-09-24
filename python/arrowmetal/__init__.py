@@ -4865,6 +4865,7 @@ _lib.am_router_last.restype = ctypes.c_int
 _lib.am_router_last_reason.argtypes = []; _lib.am_router_last_reason.restype = ctypes.c_char_p
 _lib.am_router_clear_last.argtypes = []; _lib.am_router_clear_last.restype = None
 _lib.am_router_crossover.argtypes = [ctypes.c_int]; _lib.am_router_crossover.restype = ctypes.c_int64
+_lib.am_router_multiply_crossover.argtypes = []; _lib.am_router_multiply_crossover.restype = ctypes.c_int64
 
 
 class RouteDecision(tuple):
@@ -4940,5 +4941,8 @@ def clear_last_route():
 
 
 def router_crossovers():
-    """{op: rows} from the shipped crossover table: below `rows`, `auto` runs the CPU loop."""
-    return {name: _lib.am_router_crossover(i) for i, name in enumerate(_ROUTER_OPS)}
+    """{op: rows} from the shipped crossover table: below `rows`, `auto` runs the CPU loop on an
+    integer column. "arithmetic" is the add/subtract row; "multiply" is multiply's own row."""
+    table = {name: _lib.am_router_crossover(i) for i, name in enumerate(_ROUTER_OPS)}
+    table["multiply"] = _lib.am_router_multiply_crossover()
+    return table

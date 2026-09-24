@@ -344,12 +344,50 @@ final class RouterTests: XCTestCase {
         _ = try Router.withMode(.auto) { try f.sum() }
         XCTAssertEqual(Router.lastDecision?.path, .gpu)
         XCTAssertEqual(Router.lastDecision?.reason, .notMeasuredForType("float64"))
-        // The arithmetic row was measured on add: subtract follows it, multiply has no measured crossover.
+        // The arithmetic row was measured on add and subtract follows it; multiply has its own row.
+        let addRow = Router.crossoverRows(.arithmetic)
+        XCTAssertEqual(Router.crossoverRows(arithmetic: .add), addRow)
+        XCTAssertEqual(Router.crossoverRows(arithmetic: .sub), addRow)
+        XCTAssertNil(Router.crossoverRows(arithmetic: .div))
         _ = try small.subtract(1)
         XCTAssertEqual(Router.lastDecision?.path, .cpu)
+        XCTAssertEqual(Router.lastDecision?.reason, .belowCrossover(crossover: addRow))
+        let mul = try XCTUnwrap(Router.crossoverRows(arithmetic: .mul))
+        XCTAssertEqual(mul, RouterTable.multiplyCrossoverRows)
+        XCTAssertGreaterThan(mul, RouterTable.multiplyBracketLowRows, "multiply fitted inside its bracket")
+        XCTAssertLessThanOrEqual(mul, RouterTable.multiplyMeasuredStepRows, "multiply fitted inside its bracket")
         _ = try small.multiply(2)
-        XCTAssertEqual(Router.lastDecision?.path, .gpu)
-        XCTAssertEqual(Router.lastDecision?.reason, .notMeasuredForType("multiply"))
+        XCTAssertEqual(Router.lastDecision?.path, .cpu)
+        XCTAssertEqual(Router.lastDecision?.reason, .belowCrossover(crossover: mul))
+        _ = try small.multiply(small)
+        XCTAssertEqual(Router.lastDecision?.path, .cpu)
+    }
+
+    /// Multiply under `auto` switches at its own row, not at the add/subtract row.
+    func testAutoMultiplyUsesItsOwnRow() throws {
+        let mul = try XCTUnwrap(Router.crossoverRows(arithmetic: .mul))
+        for n in [mul - 1, mul] {
+            let a = try MetalArray<Int64>((0..<n).map { Int64($0 % 1000) - 500 })
+            let out = try Router.withMode(.auto) { try a.multiply(3) }
+            let d = try XCTUnwrap(Router.lastDecision)
+            XCTAssertEqual(d.op, .arithmetic)
+            XCTAssertEqual(d.rows, n)
+            if n < mul {
+                XCTAssertEqual(d.path, .cpu); XCTAssertEqual(d.reason, .belowCrossover(crossover: mul))
+            } else {
+                XCTAssertEqual(d.path, .gpu); XCTAssertEqual(d.reason, .atOrAboveCrossover(crossover: mul))
+            }
+            let gpu = try Router.withMode(.gpu) { try a.multiply(3) }
+            XCTAssertEqual(try out.toArray(), try gpu.toArray())
+        }
+        // Int32 columns use the same row (integer widths share the int64 rows).
+        let small = try MetalArray<Int32>([1, 2, 3])
+        _ = try Router.withMode(.auto) { try small.multiply(2) }
+        XCTAssertEqual(Router.lastDecision?.reason, .belowCrossover(crossover: mul))
+        // Float64 has no measured crossover: auto keeps it on the GPU.
+        let f = try MetalArray<Double>([1, 2, 3])
+        _ = try Router.withMode(.auto) { try f.multiply(2) }
+        XCTAssertEqual(Router.lastDecision?.reason, .notMeasuredForType("float64"))
     }
 
     func testAutoAtScaleRunsTheGPU() throws {

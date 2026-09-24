@@ -7,6 +7,10 @@
 // before Sources/ArrowMetal/Router/RouterCPU.swift existed, not the RouterCPU loops the router
 // runs. Regenerate from a quiet run of the shipped loops with
 // `Benchmarks/router_table.py --from-check Benchmarks/results/router_check_<date>.csv`.
+//
+// The multiply row comes from Benchmarks/results/router_check_2026-09-23_provisional.csv,
+// since the sweep above timed add only. Its CPU side is the shipped RouterCPU multiply loop,
+// timed by Benchmarks/router_check.py. Check header: ArrowMetal router check on Apple M4 Max, 16 CPU cores, Apple M4 Max, best of 20 (5 at 3M rows and above), int64 with 10% nulls, Python binding on resident arrays, 2026-09-24T05:01:47Z; provisional: other build lanes were running on this machine and GPU
 
 /// The router's crossover table: per routed operation, the row count from which the GPU path
 /// was measured at least as fast as a single-core CPU loop of the 2026-09-17 bench (not the RouterCPU loops; see the header).
@@ -54,4 +58,12 @@ enum RouterTable {
         case .groupBySum: return 100000
         }
     }
+
+    /// Results file the multiply row was fitted from (a router_check.py CSV).
+    static let multiplySource = "Benchmarks/results/router_check_2026-09-23_provisional.csv"
+
+    /// `multiply`'s own crossover: the arithmetic row above was measured on add (subtract follows it).
+    static let multiplyCrossoverRows = 525060   // multiply(int64, 3); 300,000 rows: GPU 122.8 us, CPU 82 us; 1,000,000 rows: GPU 180.1 us, CPU 266.2 us
+    static let multiplyMeasuredStepRows = 1000000
+    static let multiplyBracketLowRows = 300000
 }

@@ -202,9 +202,11 @@ def main():
     L.append("Two questions, two tables. The first is the one a caller asks: from what row count is "
              "ArrowMetal at or ahead of the fastest CPU idiom the matrix knows (Polars eager and lazy, "
              "pyarrow and Acero on 16 batches, pandas, numpy), at every larger size measured? The second is "
-             "the one the engine's router asks: from what row count is the GPU kernel faster than the "
-             "single-core Swift loop the router would run instead? A row \"not reached\" means ArrowMetal "
-             "was still behind at the largest size measured.\n")
+             "the one the engine's router asks: from what row count is the GPU kernel faster than a "
+             "single-core Swift loop? That loop is the bench's own (`cpu-1core`, `cpu-candidate` for the "
+             "group-by, in `Sources/ArrowMetalBench/main.swift`), not the router's shipped CPU loops in "
+             "`Sources/ArrowMetal/Router/RouterCPU.swift`, which `Benchmarks/router_check.py` times. "
+             "A row \"not reached\" means ArrowMetal was still behind at the largest size measured.\n")
     L.append("## Per family, against the fastest CPU idiom\n")
     L.append("| family | operations | reach the crossover | earliest | median | latest |")
     L.append("|---|---:|---:|---:|---:|---:|")

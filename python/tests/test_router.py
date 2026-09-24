@@ -144,7 +144,11 @@ def test_last_route_and_reasons():
         am.array(pa.array([1.0, 2.0])).max()
         assert am.last_route().reason == "no measured crossover for float64"
         small.arith("*", 2)
-        assert am.last_route().reason == "no measured crossover for multiply"
+        d = am.last_route()
+        assert (d.op, d.path) == ("arithmetic", "cpu")
+        assert d.reason == f"below the {am.router_crossovers()['multiply']}-row crossover"
+        small.arith("-", 2)
+        assert am.last_route().reason == f"below the {am.router_crossovers()['arithmetic']}-row crossover"
         am.array(pa.array([1.0, 2.0], type=pa.float32())).min()
         assert am.last_route().path == "gpu" and am.last_route().reason.startswith("no alternative")
         with am.batch():
@@ -200,6 +204,7 @@ def test_table_matches_the_results_file():
     src = open(os.path.join(ROOT, "Sources", "ArrowMetal", "Router", "RouterTable.swift")).read()
     body = src.split("static func crossoverRows", 1)[1].split("static func", 1)[0]
     table = dict(re.findall(r"case \.(\w+): return (\d+)", body))
+    table["multiply"] = re.search(r"static let multiplyCrossoverRows = (\d+)", src).group(1)
     names = {"groupBySum": "group_by_sum"}
     assert {names.get(k, k): int(v) for k, v in table.items()} == am.router_crossovers()
 
@@ -280,6 +285,37 @@ def test_table_from_router_check(tmp_path):
         assert low[case] < cross[case] <= step[case], case
         assert timings[low[case]][0] > timings[low[case]][1], case          # CPU ahead at the bracket's low end
         assert all(g <= c for n, (g, c) in timings.items() if n >= step[case]), case
+    assert 'static let multiplySource = "Benchmarks/results/router_check_2026-09-23_provisional.csv"' in text
+    assert "The multiply row comes from" not in text                        # same file as the rest
     # --check follows the source the table names.
     subprocess.run([sys.executable, os.path.join(ROOT, "Benchmarks", "router_table.py"), "--check",
                     "--out", str(out)], check=True, capture_output=True)
+
+
+def test_multiply_has_its_own_row():
+    """multiply is routed under auto by its own crossover, fitted inside the bracket the router check
+    measured for the RouterCPU multiply loop (the 2026-09-17 sweep timed add only)."""
+    import csv
+    src = open(os.path.join(ROOT, "Sources", "ArrowMetal", "Router", "RouterTable.swift")).read()
+    source = re.search(r'static let multiplySource = "([^"]+)"', src).group(1)
+    low = int(re.search(r"static let multiplyBracketLowRows = (\d+)", src).group(1))
+    step = int(re.search(r"static let multiplyMeasuredStepRows = (\d+)", src).group(1))
+    mul = am.router_crossovers()["multiply"]
+    assert low < mul <= step
+    with open(os.path.join(ROOT, source)) as fh:
+        rows = [r for r in csv.DictReader(line for line in fh if not line.startswith("#"))
+                if r["op"] == "multiply(int64, 3)"]
+    timings = {int(r["rows"]): (float(r["gpu_us"]), float(r["cpu_us"])) for r in rows}
+    assert timings[low][0] > timings[low][1]                               # CPU ahead at the low end
+    assert all(g <= c for n, (g, c) in timings.items() if n >= step)       # GPU ahead from the step
+    for n in (1_000, mul - 1, mul):
+        vals = np.arange(n, dtype=np.int64) % 1000 - 500
+        a = am.array(pa.array(vals))
+        with am.router("auto"):
+            out = a.arith("*", 3)
+        d = am.last_route()
+        assert np.array_equal(out.to_arrow().to_numpy(), vals * 3)             # oracle
+        assert (d.op, d.rows) == ("arithmetic", n)
+        assert d.path == ("cpu" if n < mul else "gpu"), (n, d)
+        with am.router("gpu"):
+            same(out, a.arith("*", 3))

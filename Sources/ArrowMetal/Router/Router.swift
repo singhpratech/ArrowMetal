@@ -141,8 +141,19 @@ public enum Router {
     /// Forgets this thread's last decision.
     public static func clearLastDecision() { threadState.last = nil }
 
-    /// The crossover the table holds for `op`, in rows.
+    /// The crossover the table holds for `op`, in rows. For `.arithmetic` this is the add/subtract
+    /// row; `crossoverRows(arithmetic:)` gives the row a particular arithmetic operation uses.
     public static func crossoverRows(_ op: RoutedOp) -> Int { RouterTable.crossoverRows(op) }
+
+    /// The crossover `auto` uses for one arithmetic operation: multiply has its own row, add and
+    /// subtract share the arithmetic row. Divide is not routed and returns nil.
+    public static func crossoverRows(arithmetic op: ArithmeticOp) -> Int? {
+        switch op {
+        case .add, .sub: return RouterTable.crossoverRows(.arithmetic)
+        case .mul: return RouterTable.multiplyCrossoverRows
+        case .div: return nil
+        }
+    }
 
     // MARK: the decision
 
@@ -151,9 +162,11 @@ public enum Router {
     @inline(__always) static func measured<T: ArrowPrimitive>(_: T.Type) -> Bool { !T.isFloatingPoint }
 
     /// The decision for one call. `cpuPath` is nil when a CPU loop exists for this input, or the reason
-    /// it does not. `pending` and `batching` describe the input and the calling thread.
+    /// it does not. `pending` and `batching` describe the input and the calling thread. `crossover`
+    /// replaces the table's row for `op` (multiply's own row).
     static func decide(_ op: RoutedOp, rows: Int, cpuPath unavailable: String?, measured: Bool,
-                       pending: Bool, batching: @autoclosure () -> Bool, typeName: @autoclosure () -> String) -> RouteDecision {
+                       pending: Bool, batching: @autoclosure () -> Bool, typeName: @autoclosure () -> String,
+                       crossover: Int? = nil) -> RouteDecision {
         let st = threadState
         let d: RouteDecision
         if let why = unavailable {
@@ -172,7 +185,7 @@ public enum Router {
             } else if !measured {
                 d = RouteDecision(op: op, path: .gpu, reason: .notMeasuredForType(typeName()), rows: rows)
             } else {
-                let c = RouterTable.crossoverRows(op)
+                let c = crossover ?? RouterTable.crossoverRows(op)
                 d = rows < c ? RouteDecision(op: op, path: .cpu, reason: .belowCrossover(crossover: c), rows: rows)
                              : RouteDecision(op: op, path: .gpu, reason: .atOrAboveCrossover(crossover: c), rows: rows)
             }
@@ -194,15 +207,14 @@ public enum Router {
                pending: a.pending || b.pending, batching: a.context.isBatching, typeName: typeName(T.self))
     }
 
-    /// Decisions for arithmetic. The table's row was measured on `add`; `subtract` costs the same per
-    /// element, while a 64-bit integer multiply is slower on the CPU than an add, so `multiply` has no
-    /// measured crossover and `auto` keeps it on the GPU.
+    /// Decisions for arithmetic. The table's arithmetic row was measured on `add`, and `subtract` costs
+    /// the same per element. A 64-bit integer multiply costs the CPU more than an add, so `multiply`
+    /// uses its own row (`crossoverRows(arithmetic: .mul)`), fitted from the shipped multiply loop.
     static func decideArithmetic<T: ArrowPrimitive>(_ a: MetalArray<T>, _ b: MetalArray<T>?, _ op: ArithmeticOp) -> RouteDecision {
-        let isMeasured = measured(T.self) && op != .mul
-        return decide(.arithmetic, rows: a.pending ? a.capacityLength : a.knownLength,
-                      cpuPath: RouterCPU.arithmeticUnavailable(T.self, op), measured: isMeasured,
-                      pending: a.pending || (b?.pending ?? false), batching: a.context.isBatching,
-                      typeName: op == .mul && measured(T.self) ? "multiply" : typeName(T.self))
+        decide(.arithmetic, rows: a.pending ? a.capacityLength : a.knownLength,
+               cpuPath: RouterCPU.arithmeticUnavailable(T.self, op), measured: measured(T.self),
+               pending: a.pending || (b?.pending ?? false), batching: a.context.isBatching,
+               typeName: typeName(T.self), crossover: crossoverRows(arithmetic: op))
     }
 
     /// Decision for `filter(mask)`.

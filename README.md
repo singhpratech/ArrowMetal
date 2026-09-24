@@ -133,7 +133,7 @@ whole-query chains against a streaming engine. `shift (lag 1)` at 0.01x is the l
 [docs/TO_IMPROVE.md](docs/TO_IMPROVE.md), and [docs/DESIGN.md](docs/DESIGN.md) has the pipelining plan for the dispatch floor.
 [docs/CROSSOVER.md](docs/CROSSOVER.md) states the other side of the floor: from what row count the GPU path
 is ahead, per operation and per family, measured with a size sweep from a thousand rows to fifty million.
-Below the router's crossover in that document (the GPU kernel against a single-core CPU loop, not against a CPU library), seven operations (sum, min, max, compare, add/subtract/multiply, filter, group-by sum) take a byte-identical single-core CPU path instead; `ARROWMETAL_ROUTER=gpu` turns that off ([docs/DESIGN.md](docs/DESIGN.md#cpugpu-router)).
+Below the router's crossover in that document (the GPU kernel against a single-core CPU loop, not against a CPU library), seven operations (sum, min, max, compare, add/subtract/multiply, filter, group-by sum) take a byte-identical single-core CPU path on integer columns instead; `ARROWMETAL_ROUTER=gpu` turns that off ([docs/DESIGN.md](docs/DESIGN.md#cpugpu-router)).
 
 **DuckDB on the same rows.** The matrix's CPU libraries are Polars, pyarrow and pandas. DuckDB 1.5.5,
 measured on 2026-09-12 on the matrix's sort, group-by, filter and sum rows with the same data and protocol

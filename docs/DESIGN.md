@@ -398,9 +398,9 @@ in `Sources/ArrowMetal/Router/`.
 6. *Mode `auto`* (the default) looks the operation up in the crossover table: below the crossover the CPU
    loop runs, at or above it the GPU. The table was measured on int64 columns; integer columns of every
    width use those rows, and floating-point columns, which have no measured crossover, stay on the GPU.
-   The arithmetic row was measured on `add`; `subtract` uses it, while `multiply`, whose 64-bit integer
-   form costs more per element on the CPU than an add, has no measured crossover and stays on the GPU
-   under `auto` (`ARROWMETAL_ROUTER=cpu` and the per-call override still reach its CPU loop).
+   The arithmetic row was measured on `add`, and `subtract` uses it. `multiply`, whose 64-bit integer
+   form costs more per element on the CPU than an add, has its own row (`Router.crossoverRows(arithmetic:
+   .mul)`), fitted from the shipped multiply loop (below).
 
 The router does not adjust for residency: every routed call starts from Metal-shared buffers (an
 imported column is mapped before the operation is called), which is the state the table was measured
@@ -414,13 +414,20 @@ writes `Sources/ArrowMetal/Router/RouterTable.swift`, a Swift literal, so there 
 load. The step alone would send every size between the last swept size where the CPU was ahead and the
 first where the GPU was ahead to the CPU, so the script fits the crossover once, offline: inside that
 bracket both paths are taken as straight lines between the two measured points and the crossover is
-where they meet. It never leaves the measured bracket. `router_table.py --check` fails when the
+where they meet. It never leaves the measured bracket. The sweep timed `add` only, so the multiply row is
+fitted the same way from the `multiply(int64, 3)` rows of a `router_check.py` CSV
+(`router_table.py --multiply-from`, by default `Benchmarks/results/router_check_2026-09-23_provisional.csv`),
+whose CPU side is the RouterCPU multiply loop; it is refitted with the rest of the table from the quiet
+rerun. `router_table.py --check` fails when the
 committed table no longer matches the results file, and `python/tests/test_router.py` runs it. The
-values are in the generated file, in `Router.crossoverRows(_:)` from Swift, `am_router_crossover` from C
-and `am.router_crossovers()` from Python. `Benchmarks/router_check.py` times every routed operation
-under `gpu`, `cpu` and `auto` and says whether `auto` picked the faster path; its latest output is
-`Benchmarks/results/router_check_2026-09-23_provisional.csv`, a provisional run taken while other builds
-were using the machine, to be replaced by a quiet rerun.
+values are in the generated file, in `Router.crossoverRows(_:)` and `Router.crossoverRows(arithmetic:)`
+from Swift, `am_router_crossover` and `am_router_multiply_crossover` from C and `am.router_crossovers()`
+from Python. `Benchmarks/router_check.py` times every routed operation
+under `gpu`, `cpu` and `auto` and says whether `auto` picked the faster path. Two provisional runs, both
+taken while other builds were using the machine, are committed: `router_check_2026-09-23_provisional.csv`,
+the run the multiply row was fitted from (taken before that row existed, so its `auto` column keeps
+multiply on the GPU), and `router_check_2026-09-24_provisional.csv`, the same check against the shipped
+table. Both are to be replaced by a quiet rerun.
 
 *What the table's CPU side is.* The committed table comes from the 2026-09-17 sweep, whose CPU side is
 the bench's own single-core loops in `Sources/ArrowMetalBench/main.swift` (`cpu-1core`, and

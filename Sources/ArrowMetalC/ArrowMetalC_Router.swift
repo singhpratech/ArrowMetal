@@ -73,3 +73,9 @@ public func am_router_crossover(_ op: Int32) -> Int64 {
     guard op >= 0, Int(op) < RoutedOp.allCases.count else { return -1 }
     return Int64(Router.crossoverRows(RoutedOp.allCases[Int(op)]))
 }
+
+/// The crossover `auto` uses for multiply, in rows (op 4, arithmetic, is the add/subtract row).
+@_cdecl("am_router_multiply_crossover")
+public func am_router_multiply_crossover() -> Int64 {
+    Int64(Router.crossoverRows(arithmetic: .mul)!)
+}
