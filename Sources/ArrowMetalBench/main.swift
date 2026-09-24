@@ -161,6 +161,9 @@ func cpuFilterParallel<T>(_ p: UnsafePointer<T>, n: Int, sel: UnsafePointer<UInt
 }
 
 let ctx = MetalContext.shared
+// The bench times the GPU kernels against CPU baselines, so the router stays on the GPU unless
+// ARROWMETAL_ROUTER says otherwise (small inputs would otherwise take the router's CPU path).
+if Router.environmentMode == nil { Router.mode = .gpu }
 if ctx.isVirtualDevice {
     print("ArrowMetal bench: virtual Metal device (\(ctx.device.name)) detected; benchmarks need real Apple silicon. Skipping.")
     exit(0)

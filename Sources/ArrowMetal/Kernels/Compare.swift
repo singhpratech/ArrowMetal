@@ -19,6 +19,7 @@ extension MetalArray {
     /// Element-wise comparison with a scalar, producing an Arrow boolean array.
     /// Null inputs produce null outputs (validity bitmap is shared zero-copy with the input).
     public func compare(_ op: CompareOp, _ scalar: T) throws -> MetalBooleanArray {
+        if Router.decide(.compare, self).isCPU { return try RouterCPU.compare(self, op, scalar) }
         let n = dispatchLength
         try Dispatch.checkLength(n)
         let ctx = context
@@ -45,6 +46,7 @@ extension MetalArray {
     /// Element-wise comparison with another array of the same length.
     public func compare(_ op: CompareOp, _ other: MetalArray<T>) throws -> MetalBooleanArray {
         try checkSameLength(other)
+        if Router.decide(.compare, self, other).isCPU { return try RouterCPU.compare(self, op, other) }
         let n = dispatchLength
         try Dispatch.checkLength(n)
         let ctx = context

@@ -9,6 +9,7 @@ extension MetalArray {
     /// Element-wise arithmetic with a scalar. Integer overflow wraps; integer division by zero is unspecified
     /// (the GPU does not trap), matching Arrow's non-checked kernels only for overflow.
     public func arithmetic(_ op: ArithmeticOp, _ scalar: T) throws -> MetalArray<T> {
+        if Router.decide(.arithmetic, self, cpuPath: RouterCPU.arithmeticUnavailable(T.self, op)).isCPU { return try RouterCPU.arithmetic(self, op, scalar) }
         let n = dispatchLength
         try Dispatch.checkLength(n)
         let ctx = context
@@ -31,6 +32,7 @@ extension MetalArray {
     /// Element-wise arithmetic with another array. Output validity is the AND of both inputs.
     public func arithmetic(_ op: ArithmeticOp, _ other: MetalArray<T>) throws -> MetalArray<T> {
         try checkSameLength(other)
+        if Router.decide(.arithmetic, self, other, cpuPath: RouterCPU.arithmeticUnavailable(T.self, op)).isCPU { return try RouterCPU.arithmetic(self, op, other) }
         let n = dispatchLength
         try Dispatch.checkLength(n)
         let ctx = context

@@ -1550,6 +1550,29 @@ int am_stream_join_group_by(am_stream* s, struct ArrowArrayStream* build, const 
                             const int* ops, const char** columns, const char** names, int64_t n_aggs,
                             int64_t dense_key_count, int ddof, am_stream_result** out);
 
+// ---- CPU/GPU router (docs/DESIGN.md, "CPU/GPU router")
+//
+// sum, min, max, compare, add/subtract/multiply, filter and the low-cardinality group-by sum
+// (at most 1024 keys) choose per call between the GPU kernel and a single-threaded CPU loop that
+// produces byte-identical Arrow output. The choice is a lookup in a crossover table generated from
+// Benchmarks/results/router_2026-09-17.json by Benchmarks/router_table.py. Inside a batch
+// (am_batch_begin) and for inputs whose length the open batch is still deciding, the GPU always runs.
+// Modes: 0 auto (the table), 1 gpu, 2 cpu (the CPU loop wherever one exists). The process mode starts
+// from the environment variable ARROWMETAL_ROUTER=auto|gpu|cpu; a per-thread override takes precedence.
+// Paths: 0 gpu, 1 cpu. Ops: 0 sum, 1 min, 2 max, 3 compare, 4 arithmetic, 5 filter, 6 group-by sum.
+int         am_router_set_mode(int mode);            // 0, or 2 for an unknown mode
+int         am_router_get_mode(void);
+int         am_router_set_thread_mode(int mode);     // -1 clears the calling thread's override
+int         am_router_get_thread_mode(void);         // -1 when no override is set
+// The last decision on the calling thread: 1 with the out-parameters filled (any may be NULL), or 0
+// when no routed operation ran on this thread since the last clear.
+int         am_router_last(int* op, int* path, int64_t* rows);
+// The last decision's reason as text, NULL when there is none. Thread-local; valid until the next
+// call of this function on the same thread.
+const char* am_router_last_reason(void);
+void        am_router_clear_last(void);
+int64_t     am_router_crossover(int op);             // rows; -1 for an unknown op
+
 #ifdef __cplusplus
 }
 #endif

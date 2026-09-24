@@ -4473,3 +4473,101 @@ def write_parquet(data, path, compression="snappy", use_dictionary=True, row_gro
 from . import stream                                                       # noqa: E402
 from .stream import (Stream, GroupedStream, JoinedStream, JoinedGroupedStream,  # noqa: E402,F401
                      scan_ipc, scan_arrow, scan_table)
+
+
+# ---- CPU/GPU router (docs/DESIGN.md, "CPU/GPU router"; include/arrowmetal.h)
+#
+# sum, min, max, compare, add/subtract/multiply, filter and the low-cardinality group-by sum choose
+# per call between the GPU kernel and a single-threaded CPU loop with byte-identical output, by a
+# crossover table measured on this hardware. `ARROWMETAL_ROUTER=auto|gpu|cpu` sets the process mode
+# at load; `set_router` changes it; `with router("cpu"):` overrides it on the calling thread; and
+# `last_route()` says where the last routed operation on this thread ran and why.
+_ROUTER_MODES = {"auto": 0, "gpu": 1, "cpu": 2}
+_ROUTER_MODE_NAMES = {v: k for k, v in _ROUTER_MODES.items()}
+_ROUTER_OPS = ("sum", "min", "max", "compare", "arithmetic", "filter", "group_by_sum")
+_lib.am_router_set_mode.argtypes = [ctypes.c_int]; _lib.am_router_set_mode.restype = ctypes.c_int
+_lib.am_router_get_mode.argtypes = []; _lib.am_router_get_mode.restype = ctypes.c_int
+_lib.am_router_set_thread_mode.argtypes = [ctypes.c_int]; _lib.am_router_set_thread_mode.restype = ctypes.c_int
+_lib.am_router_get_thread_mode.argtypes = []; _lib.am_router_get_thread_mode.restype = ctypes.c_int
+_lib.am_router_last.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int64)]
+_lib.am_router_last.restype = ctypes.c_int
+_lib.am_router_last_reason.argtypes = []; _lib.am_router_last_reason.restype = ctypes.c_char_p
+_lib.am_router_clear_last.argtypes = []; _lib.am_router_clear_last.restype = None
+_lib.am_router_crossover.argtypes = [ctypes.c_int]; _lib.am_router_crossover.restype = ctypes.c_int64
+
+
+class RouteDecision(tuple):
+    """Where a routed operation ran: `op`, `path` ("gpu" or "cpu"), `reason` (text) and `rows`."""
+    __slots__ = ()
+    _fields = ("op", "path", "reason", "rows")
+
+    def __new__(cls, op, path, reason, rows):
+        return tuple.__new__(cls, (op, path, reason, rows))
+
+    op = property(lambda self: self[0])
+    path = property(lambda self: self[1])
+    reason = property(lambda self: self[2])
+    rows = property(lambda self: self[3])
+
+    def __repr__(self):
+        return f"RouteDecision(op={self.op!r}, path={self.path!r}, reason={self.reason!r}, rows={self.rows})"
+
+
+def _router_mode_code(mode):
+    code = _ROUTER_MODES.get(str(mode).lower())
+    if code is None:
+        raise ValueError(f"router mode must be one of {sorted(_ROUTER_MODES)}, got {mode!r}")
+    return code
+
+
+def set_router(mode):
+    """Sets the process-wide router mode: "auto" (the crossover table), "gpu" or "cpu"."""
+    _check(_lib.am_router_set_mode(_router_mode_code(mode)))
+
+
+def get_router():
+    """The process-wide router mode ("auto" unless ARROWMETAL_ROUTER or `set_router` said otherwise)."""
+    return _ROUTER_MODE_NAMES[_lib.am_router_get_mode()]
+
+
+class router:
+    """Context manager: routes the calling thread's operations with `mode` ("auto", "gpu" or "cpu"),
+    restoring the previous override on exit.
+
+        with am.router("cpu"):
+            s = col.sum()
+        am.last_route()      # RouteDecision(op='sum', path='cpu', reason='forced cpu by ...', rows=...)
+    """
+
+    def __init__(self, mode):
+        self._code = _router_mode_code(mode)
+        self._saved = []
+
+    def __enter__(self):
+        self._saved.append(_lib.am_router_get_thread_mode())
+        _check(_lib.am_router_set_thread_mode(self._code))
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        _check(_lib.am_router_set_thread_mode(self._saved.pop()))
+        return False
+
+
+def last_route():
+    """The last routing decision on the calling thread as a `RouteDecision`, or None."""
+    op, path, rows = ctypes.c_int(), ctypes.c_int(), ctypes.c_int64()
+    if not _lib.am_router_last(ctypes.byref(op), ctypes.byref(path), ctypes.byref(rows)):
+        return None
+    reason = _lib.am_router_last_reason()
+    return RouteDecision(_ROUTER_OPS[op.value], "cpu" if path.value else "gpu",
+                         reason.decode() if reason else "", rows.value)
+
+
+def clear_last_route():
+    """Forgets the calling thread's last routing decision."""
+    _lib.am_router_clear_last()
+
+
+def router_crossovers():
+    """{op: rows} from the shipped crossover table: below `rows`, `auto` runs the CPU loop."""
+    return {name: _lib.am_router_crossover(i) for i, name in enumerate(_ROUTER_OPS)}

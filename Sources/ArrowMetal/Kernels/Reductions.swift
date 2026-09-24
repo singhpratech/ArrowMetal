@@ -19,6 +19,7 @@ extension MetalArray {
     /// Integer sums are exact (Int64/UInt64 accumulation, wrapping on overflow like Arrow's `sum`).
     /// Float32 sums accumulate per-thread in float and finalise in double.
     public func sum() throws -> SumResult? {
+        if Router.decide(.sum, self).isCPU { return RouterCPU.sum(self) }
         if !pending && validCount == 0 { return nil }
         let (partials, counts, groups) = try runReduction("reduce_sum")
         if validCount == 0 { return nil }   // (now synced) all-null after a pending filter
@@ -56,6 +57,7 @@ extension MetalArray {
 
     /// Minimum non-null value, or nil if none.
     public func min() throws -> T? {
+        if Router.decide(.min, self, cpuPath: RouterCPU.minMaxUnavailable(T.self)).isCPU { return RouterCPU.minMax(self, isMin: true) }
         if !pending && validCount == 0 { return nil }
         let (partials, counts, groups) = try runReduction("reduce_min")
         if validCount == 0 { return nil }
@@ -64,6 +66,7 @@ extension MetalArray {
 
     /// Maximum non-null value, or nil if none.
     public func max() throws -> T? {
+        if Router.decide(.max, self, cpuPath: RouterCPU.minMaxUnavailable(T.self)).isCPU { return RouterCPU.minMax(self, isMin: false) }
         if !pending && validCount == 0 { return nil }
         let (partials, counts, groups) = try runReduction("reduce_max")
         if validCount == 0 { return nil }

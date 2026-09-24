@@ -42,8 +42,9 @@ enum Dispatch {
         guard n <= Int(UInt32.max) else { throw ArrowMetalError.invalidArrowArray("arrays above 2^32 elements are not supported yet") }
     }
 
-    /// Metal has no `double`. Arithmetic and sum on Float64 run on the CPU reference path; compare, min, max,
-    /// filter, take and slice run on the GPU by treating the values as raw 64-bit patterns.
+    /// Metal has no `double`. False for Float64 only; the numeric cast and the Float64 overflow check use it to
+    /// take their host loop. Arithmetic and sum on Float64 run on the GPU through software binary64
+    /// (`DoubleMath`); compare, min, max, filter, take and slice treat the values as raw 64-bit patterns.
     static func runsOnGPU<T: ArrowPrimitive>(_: T.Type) -> Bool { T.self != Double.self }
 
     /// MSL type used for kernels that only move or order values (filter, take): Float64 becomes `long`.

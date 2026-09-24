@@ -31,6 +31,7 @@ public struct GroupBy<K: ArrowIndex> {
     /// Keys with no valid value are null.
     public func sum<T: ArrowPrimitive>(_ values: MetalArray<T>) throws -> MetalArray<Int64> where T: FixedWidthInteger {
         try check(values)
+        if Router.decideGroupBySum(keys: keys, values: values, keyCount: keyCount).isCPU { return try RouterCPU.groupBySum(keys: keys, keyCount: keyCount, values: values) }
         let ctx = values.context
         var out: MetalArrowBuffer! = nil, bm: MetalArrowBuffer! = nil
         try ctx.batch {

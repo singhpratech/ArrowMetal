@@ -17,6 +17,7 @@ extension MetalArray {
     /// the block offsets are scanned on the CPU (one entry per 8192 elements).
     public func filter(_ mask: MetalBooleanArray) throws -> MetalArray<T> {
         try checkSameLength(mask)
+        if Router.decide(.filter, self, mask: mask).isCPU { return try RouterCPU.filter(self, mask) }
         let sel = try mask.selectionBitmap()
         return try compact(selection: sel, prepare: nil)
     }
@@ -25,6 +26,7 @@ extension MetalArray {
     /// boolean array is materialised. Equivalent to `filter(compare(op, scalar))`.
     public func filter(where op: CompareOp, _ scalar: T) throws -> MetalArray<T> {
         if T.self == Double.self { return try filter(try compare(op, scalar)) }
+        if Router.decide(.filter, self, cpuPath: RouterCPU.filterWhereUnavailable(T.self)).isCPU { return try RouterCPU.filterWhere(self, op, scalar) }
         let ctx = context
         let sel = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: dispatchLength), zeroed: false, context: ctx)
         let opIndex = UInt32(CompareOp.allCases.firstIndex(of: op)!)
