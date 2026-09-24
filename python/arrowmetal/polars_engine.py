@@ -168,6 +168,15 @@ def _unq(s):
 _COL_REF = re.compile(r'\(col "((?:[^"\\]|\\.)*)"\)')
 
 
+def _reciprocal(value, code):
+    """`1 / value` rounded as Polars computes it for a scalar divisor: in `code`'s precision, with
+    IEEE results for zero, infinities and NaN."""
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        if code == "f32":
+            return float(np.float32(1.0) / np.float32(value))
+        return float(np.float64(1.0) / np.float64(value))
+
+
 def _num_lit(value, code):
     """A typed literal, or None when `value` is not exactly representable in `code`."""
     if value is None:
@@ -339,12 +348,30 @@ class _Translator:
         self.report = report
         self.subs = {}                  # node id -> _Sub
         self.hidden = 0
+        self.names = set()              # every column name in the plan, so a helper avoids them
 
     # -- helpers
 
+    def collect_names(self, root):
+        """Gathers the column names of every node under `root`, so `_hidden` never picks a name
+        the frame already uses."""
+        nt, seen, todo = self.nt, set(), [root]
+        while todo:
+            n = todo.pop()
+            if n in seen:
+                continue
+            seen.add(n)
+            nt.set_node(n)
+            self.names.update(nt.get_schema())
+            todo.extend(nt.get_inputs())
+
     def _hidden(self, what):
-        self.hidden += 1
-        return f"{_HIDDEN}{what}{self.hidden}"
+        while True:
+            self.hidden += 1
+            name = f"{_HIDDEN}{what}{self.hidden}"
+            if name not in self.names:
+                self.names.add(name)
+                return name
 
     def _fallback(self, n, kind, reason):
         self.report.fallbacks.append(f"{kind}#{n}: {reason}")
@@ -412,6 +439,10 @@ class _Translator:
         names = list(node.projection) if node.projection is not None else list(df.columns)
         cols = {}
         for name in names:
+            if "\x00" in name:
+                # Polars' own Arrow export panics on a NUL in a column name.
+                raise _Unsupported(f"column name {name!r} holds a NUL byte, which Polars cannot "
+                                   "export to Arrow")
             s = df.get_column(name)
             if not _carryable(s.dtype):
                 raise _Unsupported(f"column {name!r} has dtype {s.dtype}, which the Metal plan "
@@ -703,9 +734,9 @@ class _Translator:
                 if e.options:                           # include nulls: the group's row count
                     aggs.append(["count", name, ""])
                     fix.append((name, "i64", want, "count"))
-                elif keys and arg.code == "f64":
-                    # ArrowMetal's group-by will not read Float64 values even to count them; the
-                    # validity bits summed per group are the same count.
+                elif keys and arg.code in ("f64", "bool"):
+                    # ArrowMetal's group-by will not read Float64 or Boolean values even to count
+                    # them; the validity bits summed per group are the same count.
                     aggs.append(["sum", name, f"(cast (is_valid {arg.s}) u32)"])
                     fix.append((name, "u64", want, "zero"))
                 else:
@@ -920,6 +951,19 @@ class _Translator:
             else:
                 l2, r2 = self._to(l, want), self._to(r, want)
             am = "div" if name == "TrueDivide" else _ARITH[name]
+            if name == "TrueDivide" and not r2.has_col:
+                # Polars divides by a scalar as a multiply by its reciprocal, `x * (1 / c)` in the
+                # result type, which is not always the correctly rounded `x / c`; the same product
+                # here gives Polars' bits. A scalar that is not a plain literal stays with Polars.
+                if not r2.is_lit:
+                    raise _Unsupported("true division by a scalar expression")
+                if r2.lit is not None:
+                    am = "mul"
+                    r2 = _E(f"(f64 {repr(_reciprocal(r2.lit, want))})", "f64", False,
+                            dtype=pl.Float64, lit=None, is_lit=True, has_col=False)
+                    if want == "f64":
+                        return _E(f"(mul {l2.s} {r2.s})", want, nullable, dtype=_dtype_of(want),
+                                  has_col=has_col)
             if want == "f32":
                 # The GPU's float ALUs flush subnormals to zero; Polars does not. Binary64 (software,
                 # correctly rounded) and one rounding back gives the correctly rounded Float32
@@ -1063,10 +1107,18 @@ class _Translator:
                 return _E(acc, "bool", x.nullable, dtype=pl.Boolean, has_col=True)
             if x.code is None or x.code == "bool" or x.is_lit:
                 raise _Unsupported(f"is_in over {x.dtype}")
+            # Polars matches floats in its total order, so a NaN in the list matches a NaN row;
+            # ArrowMetal's is_in compares with IEEE equality, where NaN matches nothing. `(ne x x)`
+            # is "x is NaN" and stands in for the NaN values.
+            has_nan = _is_float(x.code) and any(isinstance(v, float) and v != v for v in values)
+            values = [v for v in values if not (isinstance(v, float) and v != v)]
             lits = [s for s in (_num_lit(v, x.code) for v in values) if s is not None]
-            if not lits:
+            if not lits and not has_nan:
                 raise _Unsupported("is_in values not representable in the column's type")
-            s = f"(is_in {x.s} {' '.join(lits)})"
+            terms = ([f"(is_in {x.s} {' '.join(lits)})"] if lits else [])
+            if has_nan:
+                terms.insert(0, f"(ne {x.s} {x.s})")
+            s = terms[0] if len(terms) == 1 else f"(or {terms[0]} {terms[1]})"
             if x.nullable:        # Polars: is_in of a null is null; ArrowMetal says false
                 s = f"(if_else (is_valid {x.s}) {s} (null bool))"
             return _E(s, "bool", x.nullable, dtype=pl.Boolean, has_col=True)
@@ -1349,6 +1401,12 @@ def _validate(sub, schema):
         verdict = None
     except ArrowMetalError as e:
         verdict = str(e).splitlines()[0] if str(e) else type(e).__name__
+    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        raise
+    except BaseException as e:      # noqa: BLE001 -- a Polars export panic (pyo3 PanicException)
+        # is a BaseException; the plan falls back instead of failing the query.
+        text = str(e).splitlines()[0] if str(e) else ""
+        verdict = f"the export to ArrowMetal failed: {type(e).__name__}: {text}"
     if had_rows:
         if len(_validated) >= _VALIDATED_MAX:
             _validated.clear()
@@ -1408,6 +1466,7 @@ def execute_with_metal(nt, duration_since_start, *, config):
                       stacklevel=2)
     tr = _Translator(nt, report)
     try:
+        tr.collect_names(root)
         tr.walk(root)
     finally:
         nt.set_node(root)

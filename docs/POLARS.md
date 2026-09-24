@@ -439,19 +439,20 @@ Read from the installed package and checked by `python/tests/test_polars_engine.
 | Expression | ArrowMetal |
 |---|---|
 | column, alias, typed literal (a Null literal takes the type it meets) | `(col ...)`, the literal at Polars' own dtype |
-| `+ - *`, true division | `add sub mul div`, each operand cast to the result dtype Polars' `get_dtype` gives; Float32 goes through binary64 (below) |
+| `+ - *`, true division | `add sub mul div`, each operand cast to the result dtype Polars' `get_dtype` gives; a literal divisor as `mul` by its reciprocal, which is how Polars divides by a scalar (below); Float32 goes through binary64 (below) |
 | `== != < <= > >=` | `eq ne lt le gt ge`; floats in Polars' total order; String against a literal by `str_eq` (`==`, `!=` only) |
 | `&`, `\|`, `^`, `~` | `and_kleene`, `or_kleene`, `ne` of the two as integers for Boolean xor, `bit_and`/`bit_or`/`bit_xor` on integers, `not`/`bit_not` |
 | `when/then/otherwise` | `if_else`, a null condition taking the `otherwise` branch |
 | `cast` | only casts that cannot fail or lose a value (integer widening, unsigned to a wider signed type, integers to Float64, 8/16-bit integers to Float32, Float32 to Float64, Boolean to numbers) |
 | `is_null`, `is_not_null`, `fill_null` | `is_null`, `is_valid`, `fill_null` |
-| `is_in` a literal list of 1 to 64 values | `is_in` (numbers) or `str_eq` terms (strings), null for a null input |
+| `is_in` a literal list of 1 to 64 values | `is_in` (numbers) or `str_eq` terms (strings), null for a null input; a NaN in the list matches NaN rows, as in Polars' total order (`(ne x x)`) |
 | `str.starts_with`, `str.contains(literal=True)` or a pattern without regex characters | `starts_with`, `contains` |
-| `sum min max mean count len` | the plan's aggregates, with the fix-ups below |
+| `sum min max mean count len` | the plan's aggregates, with the fix-ups below (`min`/`max` of a Boolean stay with Polars; a per-group `count` of a Float64 or Boolean column is a sum of validity bits) |
 
 Everything else -- `%`, `//`, `eq_missing`, `str.ends_with`, regex, windows (`over`), `rank`,
-`median`, an expression over an aggregate, a String-valued output, a narrowing or fallible cast --
-falls back, and the report says which one. Categorical, Enum, Decimal, List, Struct, Null, Binary
+`median`, an expression over an aggregate, a String-valued output, a narrowing or fallible cast,
+true division by a scalar that is not a plain literal, a column name holding a NUL byte (Polars'
+own Arrow export panics on one) -- falls back, and the report says which one. Categorical, Enum, Decimal, List, Struct, Null, Binary
 and Object columns in a subtree's input keep the whole subtree on Polars.
 
 ### Where the answers would differ, and what the engine emits instead
@@ -460,20 +461,26 @@ Each line is a differential case in `test_polars_engine.py`, run against Polars 
 
 * **Float comparisons.** Polars compares floats in a total order: NaN equals NaN and is greater than
   every number, and -0.0 equals 0.0. The engine adds the NaN terms (`(ne x x)` is "x is NaN") so the
-  fused comparison gives Polars' answer, nulls included.
+  fused comparison gives Polars' answer, nulls included. `is_in` matches the same way: a NaN in the
+  value list becomes an `(ne x x)` term, since ArrowMetal's `is_in` compares with IEEE equality.
 * **Float32 arithmetic.** The GPU's float adds, multiplies and divides flush subnormals to zero,
   which Polars does not. The engine computes Float32 `+ - * /` in ArrowMetal's correctly rounded
   software binary64 and rounds once back to Float32, which is the correctly rounded Float32 result
-  for these four operations, subnormals included. Float64 arithmetic is already exact.
+  for these four operations, subnormals included. Float64 `+ - * /` is correctly rounded in both.
+* **Division by a scalar.** Polars divides a column by a scalar as `x * (1 / c)`, with the
+  reciprocal rounded in the result type; that differs from the correctly rounded `x / c` by one ulp
+  in about a third of Float64 rows. The engine emits the same multiply, so the bits match Polars'
+  (`test_true_division_by_a_literal_is_polars_reciprocal_multiply`, which also checks zero, infinite,
+  NaN, subnormal and null divisors). A column divisor is a true division in both.
 * **Aggregates.** A `sum` over no values is 0 in Polars (ArrowMetal: null) and gets a `fill_null`; a
   `min`/`max` over only NaN is NaN in Polars (ArrowMetal: null over a whole frame, an infinity per
   group), so the engine counts the non-null and non-NaN values and decides from the two; a `mean` of
   an Int64/UInt64 column is taken over the values cast to Float64, because ArrowMetal's integer mean
   sums in 64-bit integers and wraps on extreme values where Polars does not; every result is cast
   to Polars' dtype (UInt32 counts, the Int32 sum of an Int32 column, Float32 of a Float32, UInt32
-  for the sum of a Boolean). A per-group `count` of a Float64 column is the sum of its validity bits,
-  because ArrowMetal's group-by will not read Float64 values even to count them, and `min`/`max` of
-  a Float64 column per group stays with Polars for the same reason.
+  for the sum of a Boolean). A per-group `count` of a Float64 or Boolean column is the sum of its
+  validity bits, because ArrowMetal's group-by will not read those values even to count them, and
+  `min`/`max` of a Float64 column per group stays with Polars for the same reason.
 * **Sort order.** ArrowMetal puts nulls last in both directions and a NaN after the numbers in a
   descending sort; Polars' default is nulls first and NaN above every number. The engine adds a
   validity key or a NaN key in front where it needs one.

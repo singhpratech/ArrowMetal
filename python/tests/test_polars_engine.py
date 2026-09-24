@@ -413,6 +413,44 @@ def test_a_plan_metal_rejects_falls_back_at_translation(monkeypatch):
     assert not eng.last_report.taken
 
 
+def test_a_polars_export_panic_falls_back_instead_of_failing(monkeypatch):
+    """pyo3's PanicException derives from BaseException, not Exception; a panic while exporting
+    the input to ArrowMetal is a rejection like any other."""
+    class Panic(BaseException):
+        pass
+
+    lf = pl.LazyFrame({"v": [1, 2, 3]}).sort("v", descending=True)
+
+    def panic(plan, leaves, rows=None):
+        raise Panic("synthetic panic")
+
+    monkeypatch.setattr(pe, "_run_plan", panic)
+    pe._validated.clear()
+    try:
+        eng = check_fallback(lf, "Panic: synthetic panic", order=True)
+    finally:
+        pe._validated.clear()
+    assert not eng.last_report.taken
+
+
+def test_a_nul_in_a_column_name_falls_back():
+    """Polars' own `to_arrow` panics on a NUL in a column name; plain `collect` does not export,
+    so the engine leaves such a frame to Polars."""
+    df = pl.DataFrame({"a\x00b": [3, 1, 2], "v": [1, 2, 3]})
+    check_fallback(df.lazy().sort("v"), "NUL byte", order=True)
+
+
+def test_helper_columns_never_take_a_user_column_name():
+    """The sort's helper columns (`__arrowmetal_valid1`, `__arrowmetal_nan2`, ...) skip names the
+    frame already uses, so such a frame still runs on Metal."""
+    df = pl.DataFrame({"a": [1.0, None, float("nan"), 3.0], "__arrowmetal_valid1": [1, 2, 3, 4],
+                       "__arrowmetal_nan2": [5, 6, 7, 8], "__arrowmetal_key3": [9, 9, 9, 9]})
+    eng = check(df.lazy().sort("a", descending=True), kinds=["Sort"], order=True)
+    assert '"__arrowmetal_valid2"' in eng.last_report.taken[0]["plan"]
+    check(df.lazy().with_columns((pl.col("a") * 2.0).alias("b")).sort("b"), kinds=["Sort"],
+          order=True)
+
+
 def test_a_translator_bug_falls_back_instead_of_failing(monkeypatch):
     def boom(self, *a, **k):
         raise KeyError("synthetic")
@@ -497,6 +535,52 @@ def test_is_in(dtype, shape):
     lf = df.lazy().select(pl.col("a").is_in(pl.Series(vals, dtype=PL_DTYPE[dtype])).alias("i"),
                           pl.col("k").is_in([1, 3, None]).alias("j"), pl.col("k"))
     check(lf, kinds=["Select"], order=True)
+
+
+def test_is_in_matches_a_nan_in_the_list():
+    """Polars matches floats in its total order, so a NaN in the list matches a NaN row (either
+    sign); ArrowMetal's is_in alone would compare with IEEE equality, where NaN matches nothing."""
+    nan, inf = float("nan"), float("inf")
+    for dt in (pl.Float32, pl.Float64):
+        df = pl.DataFrame({"f": [nan, 1.0, inf, -0.0, 0.0, None, 2.0, -nan]}, schema={"f": dt})
+        for vals in ([nan, 1.0], [nan], [-nan], [inf, nan, None], [nan, -inf], [0.0], [-0.0, 2.0]):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                lf = df.lazy().select(pl.col("f").is_in(pl.Series(vals, dtype=dt)).alias("i"),
+                                      pl.col("f").is_in(vals).alias("j"))
+                eng = check(lf, kinds=["Select"], order=True)
+            if any(v is not None and v != v for v in vals):
+                assert "(ne " in eng.last_report.taken[0]["plan"]
+
+
+def test_true_division_by_a_literal_is_polars_reciprocal_multiply():
+    """Polars divides by a scalar as `x * (1 / c)`, which differs from the correctly rounded `x / c`
+    by one ulp in about a third of the rows; the engine emits the same product, so the bits match.
+    A column divisor stays a true division, which is what Polars computes there."""
+    rng = np.random.default_rng(11)
+    n = 100_003
+    x = rng.standard_normal(n)
+    x[::97] = np.nan
+    df = pl.DataFrame({"q": rng.integers(0, 10**9, n), "x": x, "f": x.astype(np.float32),
+                       "i": rng.integers(-10**6, 10**6, n), "i8": rng.integers(-100, 100, n)
+                       .astype(np.int8)}).with_columns(
+        pl.when(pl.col("q") % 11 == 0).then(None).otherwise(pl.col("x")).alias("xn"))
+    ieee = x / 3.0
+    off = int((df.select(pl.col("x") / 3.0)["x"].to_numpy() != ieee)[~np.isnan(x)].sum())
+    assert 0.30 < off / n < 0.37, off           # "about a third of Float64 rows" (docs/POLARS.md)
+    for c in ("x", "f", "i", "i8", "xn"):
+        exprs = [(pl.col(c) / d).alias(f"{c}/{d}")
+                 for d in (3.0, 7, 0.1, 1e-310, 0.0, -0.0, float("inf"), float("nan"), -2.5)]
+        exprs += [(pl.col(c) / pl.lit(3.0, dtype=pl.Float32)).alias(f"{c}/f32"),
+                  (pl.col(c) / pl.lit(None, dtype=pl.Float64)).alias(f"{c}/null"),
+                  (pl.col(c) / pl.col("x")).alias(f"{c}/x")]
+        if c != "f":    # `3.0 / Float32`: Polars says Float64 in its schema, returns Float32
+            exprs.append((3.0 / pl.col(c)).alias(f"3/{c}"))
+        eng = check(df.lazy().select(exprs), kinds=["Select"], order=True)
+        assert "(mul " in eng.last_report.taken[0]["plan"]
+    # The shape the default engine takes: a large sort carrying the quotient.
+    check(df.lazy().with_columns((pl.col("x") / 3.0).alias("y")).sort("q"), kinds=["Sort"],
+          order=True)
 
 
 LOSSLESS = {"int8": [pl.Int16, pl.Int64, pl.Float64, pl.Float32], "int16": [pl.Int32, pl.Float32],
@@ -700,6 +784,16 @@ def test_aggregate_schema_contract():
     assert got.schema["s_i8"] == pl.Int64 and got.schema["c"] == pl.UInt32
     assert got.schema["s_f32"] == pl.Float32 and got.schema["s_b"] == pl.UInt32
     assert got.schema["s_i32"] == pl.Int32 and got["s_i32"][0] == df["i32"].sum()
+
+
+def test_count_of_a_boolean_per_group():
+    """ArrowMetal's group-by does not read a Boolean even to count it; the engine counts the
+    validity bits instead, as for Float64."""
+    df = pl.DataFrame({"k": [1, 1, 2, 2, 3, None], "g": [True, None, False, None, None, True]})
+    eng = check(df.lazy().group_by("k").agg(pl.col("g").count().alias("c"), pl.len()),
+                kinds=["GroupBy"])
+    assert "is_valid" in eng.last_report.taken[0]["plan"]
+    check(df.lazy().select(pl.col("g").count()), kinds=["Select"])
 
 
 def test_sum_over_nothing_is_zero_and_max_over_only_nan_is_nan():

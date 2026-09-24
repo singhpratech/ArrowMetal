@@ -221,8 +221,8 @@ Integrations
   expressions and dtypes -- into ArrowMetal
   plans and runs them on the GPU through Polars' post-optimisation callback, leaving every other node
   to Polars; `engine.last_report` says what ran where and why. Results are Polars' own (float total
-  order, Kleene logic, Polars' aggregate dtypes and empty-group answers, Float32 arithmetic without
-  subnormal flushing), checked by `python/tests/test_polars_engine.py` against Polars across sizes,
+  order, `is_in` matching NaN, Kleene logic, Polars' aggregate dtypes and empty-group answers, Float32
+  arithmetic without subnormal flushing, division by a literal as Polars' reciprocal multiply), checked by `python/tests/test_polars_engine.py` against Polars across sizes,
   null ratios, dtypes and chunked and sliced frames. By default it takes the shapes the provisional
   benchmark (`Benchmarks/polars_engine_bench.py`) measured ahead of both Polars engines -- full sorts
   from 1M rows -- and `shapes="all"` takes everything it can translate. Imports of Polars columns are
