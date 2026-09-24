@@ -16,6 +16,10 @@ cuDF does this for NVIDIA.
 - `Sources/ArrowMetal/Parquet/ParquetFile.swift` — the mapped file and the schema tree.
 - `Sources/ArrowMetal/Parquet/ParquetReader.swift`, `ParquetColumnDecode.swift`, `ParquetValueDecode.swift`,
   `ParquetTypeMap.swift`, `ParquetList.swift` — the read pipeline.
+- `Sources/ArrowMetal/Parquet/ParquetNested.swift` — structs, maps and lists at any depth, from their leaves.
+- `Sources/ArrowMetal/Parquet/ParquetArrowSchema.swift` — the stored `ARROW:schema` and what it restores.
+- `Sources/ArrowMetal/Parquet/ParquetPageIndex.swift`, `ParquetBloomFilter.swift` — page-level skipping
+  with the column and offset indexes, and row-group skipping with bloom filters.
 - `Sources/ArrowMetal/Kernels/DecompressSource.swift` / `Decompress.swift` — Snappy and LZ4 on the GPU.
 - `Sources/ArrowMetal/Kernels/ParquetDecodeSource.swift` — every decoding kernel.
 - `Sources/ArrowMetal/Parquet/ParquetWriter.swift` — a small host-side writer, for round trips.
@@ -403,6 +407,16 @@ Reproduce with:
 
 ```
 PYTHONPATH=python python Benchmarks/parquet_bench.py --rows 50000000 --codecs snappy,lz4,none --codec-scan --repeat 3
+```
+
+Nested reads — a struct, a list, a list of lists, a map and a list of structs, at 1 M and 10 M rows,
+against pyarrow, Polars and DuckDB — have their own script. Its first run is a provisional smoke run
+recorded while other work shared the GPU, in
+`Benchmarks/results/parquet_nested_2026-09-23_provisional.csv`; the published numbers will come from a
+quiet rerun:
+
+```
+PYTHONPATH=python python Benchmarks/parquet_nested_bench.py --rows 1000000,10000000 --repeat 3 --out results.csv
 ```
 
 ### What the numbers say
