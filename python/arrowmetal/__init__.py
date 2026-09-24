@@ -4735,3 +4735,27 @@ def _duckdb_rewrite_getattr(name):
 
 
 _LAZY_HOOKS.append((_duckdb_rewrite_getattr, lambda: list(_DUCKDB_REWRITE_EXPORTS)))
+
+
+# ---------------------------------------------------------------------------------------------------
+# Polars engine, tier 4 of docs/POLARS.md (python/arrowmetal/polars_engine.py), imported lazily.
+#
+# `lf.collect(engine=am.MetalEngine())` runs the parts of a Polars lazy plan that ArrowMetal can run
+# on the GPU and leaves the rest to Polars; `engine.last_report` says which ran where. Like the other
+# Polars tiers it is loaded on first touch, so `import arrowmetal` still never imports Polars.
+# ---------------------------------------------------------------------------------------------------
+_POLARS_ENGINE_EXPORTS = ("MetalEngine", "MetalPlanReport", "polars_engine")
+
+
+def _polars_engine_getattr(name):
+    if name not in _POLARS_ENGINE_EXPORTS:
+        raise AttributeError(name)
+    import importlib
+    mod = importlib.import_module(__name__ + ".polars_engine")
+    globals()["polars_engine"] = mod
+    globals()["MetalEngine"] = mod.MetalEngine
+    globals()["MetalPlanReport"] = mod.MetalPlanReport
+    return globals()[name]
+
+
+_LAZY_HOOKS.append((_polars_engine_getattr, lambda: list(_POLARS_ENGINE_EXPORTS)))

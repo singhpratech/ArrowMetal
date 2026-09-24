@@ -3,7 +3,7 @@
 Polars is the reason most people on an Apple silicon Mac have Arrow-shaped data in memory at all.
 This document is how you point that data at the GPU.
 
-There are three tiers, all in 0.1.0, and they differ in **where the GPU sits
+There are four tiers, all in 0.1.0, and they differ in **where the GPU sits
 relative to the Polars plan**:
 
 | Tier | Where the GPU runs | What you write | Needs |
@@ -11,8 +11,9 @@ relative to the Polars plan**:
 | 1. Bridge and namespaces | Around Polars: you hand a collected frame over | `df.arrowmetal.group_by("k").sum("v")` | Python only |
 | 2. Expression plugin | Inside a Polars lazy plan | `pl.col("v").arrowmetal.sum()` | a Rust build |
 | 3. Streaming hand-off | Polars runs the plan, ArrowMetal finishes it | `lf.arrowmetal.collect_gpu(q)` | Python only |
+| 4. `MetalEngine` | In place of whole subtrees of the optimised Polars plan | `lf.collect(engine=am.MetalEngine())` | Python only |
 
-All three move data over the Arrow C Data Interface. For a single-chunk numeric Polars column that
+All four move data over the Arrow C Data Interface. For a single-chunk numeric Polars column that
 is **no copy at all** -- the GPU reads the buffer Polars already owns. Strings, Categoricals and
 multi-chunk Series each cost one conversion pass -- see Limits. The evidence is below.
 
@@ -285,7 +286,7 @@ error path).
 
 ---
 
-## Tier 3 -- the streaming hand-off, and what a real Metal backend would need
+## Tier 3 -- the streaming hand-off, and Polars' engine hook
 
 ```python
 lf = pl.scan_parquet("trades/*.parquet").filter(pl.col("day") == "2026-09-01")
@@ -298,8 +299,8 @@ lf.arrowmetal.collect_gpu()                     # just lf.collect()
 `collect_gpu` collects the Polars plan and then runs one ArrowMetal pass over the result. Its
 `engine=` and any other keyword go straight to `LazyFrame.collect`, so the Polars half can still
 use the streaming engine: projection pushdown, predicate pushdown and `slice` all happen before a
-single byte reaches the GPU. It is an explicit hand-off, and it is explicit because Polars'
-engine hook is not open to us yet. Here is exactly why.
+single byte reaches the GPU. It is an explicit hand-off. Polars' own `engine=` hook is the other
+way in, and tier 4 uses it; this section is what the hook is, read from the installed package.
 
 ### The `engine=` hook, as it stands in polars 1.44.1
 
@@ -352,21 +353,304 @@ So a Metal backend is **not** blocked on Polars adding an API -- the API is ther
    (`raise_on_fail`, which `GPUEngine` exposes as a config flag).
 4. Replace the translated subtree with `set_udf(callable)`: the callable is what Polars will
    execute for that node, and it must return a Polars `DataFrame`. This is the seam through
-   which ArrowMetal would return `am.to_polars(...)`.
+   which tier 4 returns its results.
 5. Handle the schema contract exactly: `get_schema()` and `get_dtype()` give the dtypes Polars
-   will assume downstream, so a backend that widens an integer sum has to cast back.
+   will assume downstream, so a backend that widens an integer sum has to cast back. Polars does
+   **not check** what the replacement returns: a frame with a wrong dtype is accepted and the wrong
+   dtype propagates, so the backend has to assert its own output.
 
-The pieces ArrowMetal would need for step 3 already exist: `am_query` compiles a whole filter +
-projection + aggregate DAG into one Metal kernel and is a close match for a Polars `SELECT` node,
-`am_group_by_keys` + `am_group_agg_ex` cover the aggregate nodes, `am_lexsort` covers sort, the
-engine's join matrix ([ENGINE.md](ENGINE.md)) covers the join nodes, and the scan nodes stay with
-Polars. The missing piece is the IR translator itself, with an explicit unsupported-node list.
-Until then, `collect_gpu` is the same idea in its explicit form: Polars owns the plan, ArrowMetal
-owns one pass over the result.
+That translator is tier 4, below. `collect_gpu` stays the explicit form of the same idea: Polars
+owns the plan, ArrowMetal owns one pass over the result.
+
+---
+
+## Tier 4 -- `MetalEngine`, a Polars engine
+
+```python
+import polars as pl
+import arrowmetal as am
+
+engine = am.MetalEngine()
+df = lf.collect(engine=engine)      # the same frame lf.collect() returns
+print(engine.last_report)           # which nodes ran on Metal, and why the rest did not
+```
+
+`MetalEngine` is `python/arrowmetal/polars_engine.py`. Polars optimises the plan as it always does
+and hands the optimised IR to the engine's post-optimisation callback. The callback walks every
+node and expression, translates the subtrees it can into an ArrowMetal plan (the grammar in
+[ENGINE.md](ENGINE.md)), and replaces each one with a function that runs that plan on the GPU and
+returns a Polars `DataFrame`. Everything it does not take stays with Polars' in-memory engine,
+which also runs whatever sits above a replaced subtree. Every plan collects; the most that can
+happen is that nothing moves, and then the answer is plain Polars'.
+
+`import arrowmetal` still does not import Polars: `am.MetalEngine` loads the module on first touch,
+like the other three tiers.
+
+### How it plugs into Polars 1.44.1
+
+Read from the installed package and checked by `python/tests/test_polars_engine.py`:
+
+* `lf.collect(engine=<an Engine object>)` passes the object through unchanged, so no Polars change
+  is needed. The name the engine gives Rust is `"in-memory"`: Rust accepts only its four engine
+  names, and with a callback supplied it runs the callback for any of them; the in-memory engine is
+  also what runs every node the callback leaves. `engine.name` is `"in-memory"`, `engine.plan_engine`
+  and `repr(engine)` say `metal`.
+* The callback receives the `NodeTraverser` and a second argument that is `None` under `collect`
+  and an integer under `profile` (the time since the query started, which the engine uses to place
+  its rows in the profile).
+* `set_udf` turns the current node into a `PythonScan` whose function Polars calls as
+  `f(with_columns, predicate, n_rows, should_time)`. That function takes no input, so **a replaced
+  subtree is a leaf**: the only subtrees that can move are ones whose leaves are all in-memory
+  frames (`DataFrameScan`). A file scan (`Scan`, `PythonScan`) stays with Polars, and so does
+  everything above it.
+* Polars does not check the replacement's output. The engine does: a frame whose schema is not
+  the one `get_schema()` promised raises `ArrowMetalError` inside the query.
+* An exception from the callback reaches the user as
+  `ComputeError: 'cuda' conversion failed: <Type>: <message>`; the `'cuda'` is hardcoded in Polars.
+  The engine's own messages start with `ArrowMetal MetalEngine:` so they read correctly inside it.
+* `LazyFrame.profile(engine=...)` passes the callback only for a `GPUEngine`, so
+  `lf.profile(engine=MetalEngine())` profiles plain Polars. `engine.profile(lf)` passes the callback
+  through `profile`'s own keyword, and each replaced subtree appears as a `metal:<Node>#<id>` row.
+* `collect_async` and `collect(background=True)` never run the callback; Polars runs the plan
+  (background collection warns, as `GPUEngine` does). The `sink_*` family and `collect_batches` do
+  run it, and Polars' streaming sink then panics on a replaced subtree ("entered unreachable code"),
+  so the engine leaves any plan with a `Sink` node to Polars whole.
+* The IR version the engine was written against, `(14, 7)`, is pinned by a test, as is every Polars
+  surface it touches (`_LocalEngine`, `_post_opt_callback`, the `NodeTraverser` methods, the node
+  classes), so a Polars upgrade that moves one fails a named test instead of changing an answer.
+  A different IR major makes the engine leave the whole plan to Polars.
+
+### What it translates
+
+| Polars node | ArrowMetal | Taken when |
+|---|---|---|
+| `DataFrameScan` | `scan` | every column it reads (after Polars' projection pushdown) is an integer, float, Boolean, String, Date, Datetime, Duration or Time |
+| `Filter` | `filter` | the predicate translates; Polars' `dynamic_pred` hints (which `sort().head()` inserts) are dropped |
+| `Select`, `HStack` | kept virtual: each output is an s-expression over the physical columns, computed where it is used or in one `select` at the top | every output translates and is numeric or Boolean (a bare column of any carried type is carried) |
+| `Select` whose every output is an aggregate | `aggregate` | each output is one of the aggregates in the last row of the expression table |
+| `SimpleProjection` | no operator: a column list | always |
+| `Slice` | `limit` | offset >= 0 (`tail` counts from the end and stays with Polars) |
+| `Sort` | `sort`, with `limit` for a pushed-in slice | keys are columns, none of them String; no `maintain_order=True` together with a slice |
+| `GroupBy` | `group_by` | keys are non-float columns; `maintain_order=False`; not rolling or dynamic |
+| `Join` | `join` | inner, left, semi or anti; key columns of equal, non-float dtypes (String, multi-column and temporal keys included); `nulls_equal=False` (null keys never match, on both engines); `maintain_order="none"`; no pushed-in slice; the output names are the ones ArrowMetal's join gives (left columns, then right columns without a same-named key, the suffix on a collision), which covers Polars' coalescing defaults and `left_on`/`right_on` with different names |
+| `Distinct` (`unique`) | `unique` | `keep="first"` or `"any"` (ArrowMetal keeps each group's first row, a valid `"any"`); `maintain_order=False`; no float column in the subset |
+| everything else (`Union`, `HConcat`, `Cache`, `MapFunction`, `MergeSorted`, `ExtContext`, `Sink`, `Scan`, `PythonScan`, and right, full, cross and as-of joins) | -- | stays with Polars, named in the report |
+
+| Expression | ArrowMetal |
+|---|---|
+| column, alias, typed literal (a Null literal takes the type it meets) | `(col ...)`, the literal at Polars' own dtype |
+| `+ - *`, true division | `add sub mul div`, each operand cast to the result dtype Polars' `get_dtype` gives; a literal divisor as `mul` by its reciprocal, which is how Polars divides by a scalar (below); a float multiply by a scalar -1 as `negate`, as Polars does (below); Float32 goes through binary64 (below) |
+| `== != < <= > >=` | `eq ne lt le gt ge`; floats in Polars' total order; String against a literal by `str_eq` (`==`, `!=` only) |
+| `&`, `\|`, `^`, `~` | `and_kleene`, `or_kleene`, `ne` of the two as integers for Boolean xor, `bit_and`/`bit_or`/`bit_xor` on integers, `not`/`bit_not` |
+| `when/then/otherwise` | `if_else`, a null condition taking the `otherwise` branch |
+| `cast` | only casts that cannot fail or lose a value (integer widening, unsigned to a wider signed type, integers to Float64, 8/16-bit integers to Float32, Float32 to Float64, Boolean to numbers) |
+| `is_null`, `is_not_null`, `fill_null` | `is_null`, `is_valid`, `fill_null` |
+| `is_in` a literal list of 1 to 64 values | `is_in` (numbers) or `str_eq` terms (strings), null for a null input; a NaN in the list matches NaN rows, as in Polars' total order (`(ne x x)`) |
+| `str.starts_with`, `str.contains(literal=True)` or a pattern without regex characters | `starts_with`, `contains` |
+| `sum min max mean count len` | the plan's aggregates, with the fix-ups below (`min`/`max` of a Boolean stay with Polars; a per-group `count` of a Float64 or Boolean column is a sum of validity bits) |
+
+Everything else -- `%`, `//`, `eq_missing`, `str.ends_with`, regex, windows (`over`), `rank`,
+`median`, an expression over an aggregate, a String-valued output, a narrowing or fallible cast,
+true division by a scalar that is not a plain literal, a finite float literal of magnitude 2^63
+or more (directly, or as the reciprocal of a divisor such as `2.0**-1022`: ArrowMetal's expression
+compiler converts every float literal to Int64 as well, which traps the process for such a value),
+a column name holding a NUL byte (Polars' own Arrow export panics on one) -- falls back, and the
+report says which one. Categorical, Enum, Decimal, List, Struct, Null, Binary
+and Object columns in a subtree's input keep the whole subtree on Polars.
+
+### Where the answers would differ, and what the engine emits instead
+
+Each line is a differential case in `test_polars_engine.py`, run against Polars itself.
+
+* **Float comparisons.** Polars compares floats in a total order: NaN equals NaN and is greater than
+  every number, and -0.0 equals 0.0. The engine adds the NaN terms (`(ne x x)` is "x is NaN") so the
+  fused comparison gives Polars' answer, nulls included. `is_in` matches the same way: a NaN in the
+  value list becomes an `(ne x x)` term, since ArrowMetal's `is_in` compares with IEEE equality.
+* **Float32 arithmetic.** The GPU's float adds, multiplies and divides flush subnormals to zero,
+  which Polars does not. The engine computes Float32 `+ - * /` in ArrowMetal's correctly rounded
+  software binary64 and rounds once back to Float32, which is the correctly rounded Float32 result
+  for these four operations, subnormals included. Float64 `+ - * /` is correctly rounded in both.
+* **Division by a scalar.** Polars divides a column by a scalar as `x * (1 / c)`, with the
+  reciprocal rounded in the result type; that differs from the correctly rounded `x / c` by at most
+  one ulp, in a share of rows that depends on the divisor (about a third of Float64 rows for `/ 3.0`,
+  none for a power of two). The engine emits the same multiply, so the bits match Polars'
+  (`test_true_division_by_a_literal_is_polars_reciprocal_multiply`, which also checks zero, infinite,
+  NaN, subnormal and null divisors). A column divisor is a true division in both.
+* **Multiplying by -1.** Polars multiplies a float column by a scalar -1 (on either side, and divides
+  by -1) as a negation, which flips a NaN's sign bit where a multiply keeps the input NaN. The engine
+  emits ArrowMetal's `negate` there, so NaN rows carry Polars' bits too
+  (`test_multiply_by_minus_one_is_a_negation_like_polars`, which compares the raw bits).
+* **Aggregates.** A `sum` over no values is 0 in Polars (ArrowMetal: null) and gets a `fill_null`; a
+  `min`/`max` over only NaN is NaN in Polars (ArrowMetal: null over a whole frame, an infinity per
+  group), so the engine counts the non-null and non-NaN values and decides from the two; a `mean` of
+  an Int64/UInt64 column is taken over the values cast to Float64, because ArrowMetal's integer mean
+  sums in 64-bit integers and wraps on extreme values where Polars does not; every result is cast
+  to Polars' dtype (UInt32 counts, the Int32 sum of an Int32 column, Float32 of a Float32, UInt32
+  for the sum of a Boolean). A per-group `count` of a Float64 or Boolean column is the sum of its
+  validity bits, because ArrowMetal's group-by will not read those values even to count them, and
+  `min`/`max` of a Float64 column per group stays with Polars for the same reason.
+* **Sort order.** ArrowMetal puts nulls last in both directions and a NaN after the numbers in a
+  descending sort; Polars' default is nulls first and NaN above every number. The engine adds a
+  validity key or a NaN key in front where it needs one.
+* **Integer overflow** wraps in both (checked on Int8 and Int64 extremes), and an integer true
+  division by zero is IEEE in both.
+
+### Four ArrowMetal behaviours the engine works around
+
+Found by this suite, pinned by strict `xfail` tests in `test_polars_engine.py` that start failing
+the day each is fixed in the engine, which is the signal to drop the workaround:
+
+1. **A null String slot with bytes under it.** Polars exports a null String value with the bytes the
+   slot held (valid Arrow), and ArrowMetal's String compaction then reads those bytes into the next
+   value (`test_core_string_filter_null_slot`). The engine clears the bytes under nulls on the way in.
+2. **A Boolean column through the plan's sort** comes back with the right validity bitmap and a null
+   count of 0, and Polars believes the count (`test_core_bool_sort_null_count`). The engine rebuilds
+   each result column with the count left for the reader to compute (zero-copy).
+3. **A filter over a scan that carries a `date32` column** is rejected by the fused filter
+   (`test_core_filter_carrying_a_date`). The engine never reads a temporal value in an expression, so
+   it hands temporal columns to ArrowMetal as their integer storage (a zero-copy `view`) and views
+   the results back.
+4. **Sorting by a String column that holds a null and a value of 8 bytes or more** returns wrong rows
+   (`test_core_string_sort_with_nulls`, run in a child process because one run ended in a bus error).
+   The engine does not sort by String columns.
+
+### Which translatable subtrees it runs: the defaults
+
+A subtree the engine can translate still has to be one where the GPU is ahead, because getting a
+Polars column onto the GPU is not free: a single-chunk numeric column is imported without a copy,
+but mapping its pages into Metal and releasing them costs time on every query, and a String column
+is converted on the CPU. `Benchmarks/polars_engine_bench.py` measures the eight shapes of
+`Benchmarks/engine_bench.py` plus ten group-by, sort and `unique` shapes, as Polars LazyFrames, through
+Polars' in-memory engine, Polars' streaming engine and the engine with everything it can translate
+(`shapes="all"`), cold (nothing imported before) and warm (see the import cache below). The run
+behind the defaults is `Benchmarks/results/polars_engine_bench_2026-09-23_provisional.csv`; it ran
+while other work shared the machine, so its numbers are provisional and not quoted here.
+
+Read cold, against the faster of Polars' two engines, that run says (sizes near a crossover move
+between runs on a shared machine, which is why the defaults keep a margin):
+
+* **A full sort** whose keys ArrowMetal orders as Polars does (no helper key): both such shapes were
+  ahead at every size measured, from 500,000 rows. (An earlier provisional run had one of them
+  behind at 500,000.)
+* **A full sort that needs a helper key** (nulls first on a nullable key, or a float key descending)
+  was behind at 1,000,000 rows and below, level at 2,000,000, and ahead from 10,000,000.
+* **A sort that carries a String column** was behind at every size: the String import is a CPU copy.
+* **Group-by** depends on what nobody knows before running it, the number of groups, and on the key
+  types: some shapes were ahead from 500,000 rows, others behind at every size below 50,000,000 and
+  level with Polars there.
+* **Top-k, whole-frame aggregates and row-wise filters and projections** were behind the faster
+  Polars engine at every size.
+* **Joins and `unique`**: an inner join feeding an aggregate, and a `unique` over a key with ten
+  thousand distinct values, were ahead at every size measured; a semi join returning most of its
+  probe rows was behind at every size. Like group-by, both run on the key-to-id machine, whose speed
+  against Polars depends on how many distinct keys there are, and one shape of each is not enough to
+  set a default by.
+* **Windows and the as-of join** stay with Polars in this version; their rows record what the
+  callback costs a plan it leaves alone.
+
+So `MetalEngine()` takes a subtree when every shape in it is a full sort (`MEASURED_SHAPES`), none of
+its inputs is a String column, and its in-memory inputs hold at least 1,000,000 rows -- 10,000,000
+when a helper key is needed. 1,000,000 is the sort family's crossover against the fastest CPU
+library in `Benchmarks/results/router_2026-09-17.json` (`sort float64`, `argsort int64`, `lexsort (2
+int32 keys)`); the provisional run had full sorts ahead below it as well, so the default keeps the
+router's figure as its margin. Every other subtree stays with Polars with the reason in the report.
+
+```python
+am.MetalEngine()                          # the defaults above
+am.MetalEngine(shapes="all")              # every translatable subtree of at least min_rows rows
+am.MetalEngine(shapes="all", min_rows=0)  # everything it can translate (what the tests use)
+am.MetalEngine(raise_on_fail=True)        # raise instead of leaving anything to Polars
+```
+
+`shapes="all"` is there for plans the benchmark did not cover and for moving work off the CPU cores:
+the CPU-ms column of the results file is the process CPU time of each run.
+
+### The import cache
+
+Each Polars column the engine imports is kept, keyed by its Arrow type, length, offset and the
+address and size of every buffer, and the next query that reads the same column reuses the import.
+That is safe because the cached import holds the exported array and, through it, Polars' own buffer:
+while an entry lives, Polars can neither free that memory (so no other column can appear at the same
+address) nor write to it in place (Polars copies a buffer it shares before writing). Only a column
+that was imported without a copy is cached; a String column is converted on every export, and a
+multi-chunk column concatenated on every export, so neither is. Entries are evicted least recently
+used above a byte budget, a quarter of physical memory by default:
+
+```python
+from arrowmetal import polars_engine
+polars_engine.import_cache_info()       # {"entries", "bytes", "limit", "hits", "misses"}
+polars_engine.import_cache_limit(2 << 30)
+polars_engine.clear_import_cache()      # and with it the Polars buffers it kept alive
+```
+
+The "warm" column of the results file is a second collect over the same frame; the defaults above
+were read from the cold one.
+
+### The report
+
+```
+MetalEngine report (polars 1.44.1, IR (14, 7))
+  metal:  Sort#3 [Sort > HStack > Filter > DataFrameScan] over 10,000,000 rows, ran in <t> ms -> <n> rows
+  polars: Select#1: function rank has no ArrowMetal translation
+```
+
+`engine.last_report` is a `MetalPlanReport`: `taken` (one entry per subtree that ran on Metal: the
+node at its top, the node kinds inside it, the rows it read, the ArrowMetal plan text, and after the
+run its wall time and output rows), `fallbacks` (one `Kind#id: reason` line per node that stayed
+with Polars for a reason of its own), `walked` (every node of the optimised plan) and `nodes`. With
+`POLARS_VERBOSE=1` the fallback lines are also issued as a `PerformanceWarning`. The report belongs to
+the engine object, so two threads collecting through one `MetalEngine` overwrite each other's.
+
+### Tests
+
+```
+PYTHONPATH=python python -m pytest python/tests/test_polars_engine.py -q
+DIFF_QUICK=1 PYTHONPATH=python python -m pytest python/tests/test_polars_engine.py -q   # without the 100,003-row datasets
+```
+
+The differential cases collect each LazyFrame on Polars and through
+`MetalEngine(raise_on_fail=True, min_rows=0, shapes="all")` -- so nothing may fall back -- and
+compare the frames: schema first, then values, exactly for integers, Booleans, Strings, nulls and
+element-wise floats, with a relative tolerance for float aggregates. The inputs are
+`test_differential.py`'s generators at 0, 1, 33, 4,097 and 100,003 rows, null ratios 0, 0.3 and 1,
+its "sliced" and "special" (extremes, NaN, infinities, subnormals) flavours, and two Polars-side
+shapes, a two-chunk frame and a frame sliced with `DataFrame.slice`. Every numeric dtype runs
+through the comparisons, arithmetic, null logic, `is_in`, casts, group-by and whole-frame aggregates,
+sorts in both directions with nulls at both ends, and top-k; Boolean logic, String predicates and
+carried temporal columns have their own cases, and so do the four join kinds on integer, String and
+two-column keys with null keys and duplicates on both sides (a two-chunk right side among the
+shapes), suffix collisions, different key names, a join inside a filter-join-aggregate plan, and
+`unique` with and without a subset. Each fallback in the tables above has a case that
+checks the result is still Polars' and the report names the reason. One case reruns
+`test_polars.py` and `test_lazy.py` with every `LazyFrame.collect()` also collected through the engine
+(`python/tests/metal_engine_everywhere.py`) and requires the two to agree.
+
+### A checklist to run by hand
+
+The plan behind this tier asks for these on real hardware before anything from it goes upstream:
+
+0. `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c release --product ArrowMetalC`,
+   then `PYTHONPATH=python python -m pytest python/tests/test_polars.py python/tests/test_lazy.py -q`:
+   tiers 1 to 3 still green.
+1. `PYTHONPATH=python python -m pytest python/tests/test_polars_engine.py -q`, after that fresh build.
+2. In a REPL: `import sys, arrowmetal as am` and check `"polars" not in sys.modules`; then collect one
+   plan through `am.MetalEngine(shapes="all", min_rows=0)` and read `engine.last_report`.
+3. With `POLARS_VERBOSE=1`, collect a plan with an unsupported node (`pl.col("v").rank()`) and see the
+   `PerformanceWarning` listing it.
+4. `am.zero_copy_report(df["v"])` on a single-chunk numeric column of a million rows says the two
+   addresses are the same.
+5. `out, timings = engine.profile(lf)` shows a `metal:` row.
+6. Run `PYTHONPATH=python python Benchmarks/polars_engine_bench.py --sizes 1000000,10000000,50000000
+   --out a.csv` twice on a quiet machine, compare the two files, and read the `taken` column of the
+   eight engine_bench shapes against the defaults above.
+7. Read this section against `engine.last_report` on your machine.
 
 ---
 
 ## Numbers
+
+These are tiers 1 and 2; tier 4's measurements are in
+`Benchmarks/results/polars_engine_bench_2026-09-23_provisional.csv` (see "Tier 4" above).
 
 Apple M4 Max, macOS 26.6.2, polars 1.44.1 (16 threads), pyarrow 25.0.1, ArrowMetal 0.1.0. Best of 5
 runs after a warm-up, one process, one data set. Every figure below is from
@@ -428,6 +712,7 @@ pyarrow's Acero are on the Compare tab and in the benchmark matrix.
 | Tier 1, resident | You run several kernels over the same column. `to_metal()` once, then every kernel in the table above is 0.8-10.5 ms. |
 | Tier 2 | The GPU op belongs inside a plan you want Polars to keep optimising -- scans, pushdown, and lazy composition still apply. |
 | Tier 3 | Polars should do the IO and the reshaping and ArrowMetal should do one heavy pass at the end. |
+| Tier 4 | You want Polars' own `collect()` and its answers, with the parts of the plan the GPU is measured ahead on (by default, large sorts of in-memory frames) run there. |
 
 ---
 
@@ -476,9 +761,11 @@ Polars calls per group -- the plugin API has no hook for that. See the tier-2 se
 state thread-local, so Polars is free to call the plugin from several worker threads. The plugin
 takes no lock of its own.
 
-**Version coupling.** Tier 2 only: the plugin is pinned to polars 0.55.1 / pyo3-polars 0.28 for
+**Version coupling.** Tier 2: the plugin is pinned to polars 0.55.1 / pyo3-polars 0.28 for
 py-polars 1.44.x. Tiers 1 and 3 speak the C Data Interface and are not coupled to a Polars
-version.
+version. Tier 4 is pure Python but reads Polars' optimised IR through an API Polars calls unstable;
+it was written against IR version (14, 7) of polars 1.44.1, a test pins both, and a different IR
+major makes it leave every plan to Polars.
 
 ---
 
@@ -487,7 +774,10 @@ version.
 ```
 PYTHONPATH=python python -m pytest python/tests/test_polars.py -q     # 90 tests
 cd polars-plugin/arrowmetal-sys && cargo test --release               # 10 tests
+PYTHONPATH=python python -m pytest python/tests/test_polars_engine.py -q   # tier 4
 ```
+
+`test_polars_engine.py` is described under "Tier 4", "Tests".
 
 `test_polars.py` covers round trips for every shared dtype (plus Categorical, Enum, empty,
 all-null and chunked), the namespace methods against native Polars at five sizes from 0 to

@@ -6,7 +6,7 @@ pushed. Numbers are from the last gated run of `main` (0.1.0) on an M4 Max.
 | Layer | Size | Oracle |
 |---|---|---|
 | Swift suites (`Tests/ArrowMetalTests`) | 782 tests in 62 files, run in release (all 782 executed, 3 skipped in the last gated run: the three opt-in throughput measurements) | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
-| Python suites (`python/tests`) | 2,473 collected cases over the ctypes API and the three integrations (2,452 passed and 21 skipped in the last gate, `private/keep/2026-09-08/final_gate_b2dc7fa.log`) | `pyarrow.compute`, Polars, DuckDB, pandas |
+| Python suites (`python/tests`) | 2,473 collected cases over the ctypes API and the three integrations in the 2026-09-08 gate (2,452 passed and 21 skipped, `private/keep/2026-09-08/final_gate_b2dc7fa.log`); suites added after that gate, such as `test_polars_engine.py`, are listed in section 2 and are not in this figure | `pyarrow.compute`, Polars, DuckDB, pandas |
 | Rust suites (`rust/arrowmetal/tests`, `rust/arrowmetal-sys`) | 48 tests, 46 in the safe crate against arrow-rs plus 2 in `arrowmetal-sys` over the raw ABI, run in release, plus 4 `no_run` doc-tests (compiled, not executed) | `arrow::compute` (arrow-rs 59) on the same data; a `HashMap` fold where arrow-rs has no kernel; `include/arrowmetal.h` re-parsed for the ABI signatures ([RUST.md](RUST.md)) |
 | Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | 39,069 generated cases, 45 column types, every public operation | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
 | TypeScript suites (`node/test`) | 62 tests in 6 files over the N-API addon | Apache Arrow JS 21.2.0 and plain JS over the same rows ([TYPESCRIPT.md](TYPESCRIPT.md)) |
@@ -79,7 +79,7 @@ a sliced input at offsets 1, 7, 31, 32, 33, 63 and 64 against the same rows buil
 ## 2. Python suites
 
 The column below counts `def test_*` functions. The 2,473 in the table at the top of this page is what
-pytest *collects*, which is larger because a parametrised function collects once per parameter set.
+pytest *collected* in the 2026-09-08 gate, which is larger because a parametrised function collects once per parameter set.
 
 | File | Test functions | Compares against |
 |---|---|---|
@@ -92,6 +92,7 @@ pytest *collects*, which is larger because a parametrised function collects once
 | `test_ipc_views.py` | 12 | view types, big-endian integration files and `arrow.fixed_shape_tensor` through `scan_ipc` against pyarrow, the little-endian twins and the files' JSON; tensor shapes whose product overflows refused; a column naming another extension type through every streaming operator, matching the same column without the keys |
 | `test_stream.py` | 27 | streaming results against pyarrow and Polars, including a 2 GB IPC directory generated at test time |
 | `test_polars.py` | 53 | the bridge and namespaces against native Polars; the 17 Rust-plugin test functions (28 tests as pytest collects them, the parametrised one expanding to 12) run when `polars-plugin/` is built |
+| `test_polars_engine.py` | 74 | `MetalEngine` (tier 4 of [POLARS.md](POLARS.md)) against Polars' own collect of the same LazyFrame, over `test_differential.py`'s generators at five sizes, three null ratios, sliced, special-value, two-chunk and `DataFrame.slice` frames, joins and `unique` included; each fallback with its reason; the Polars surfaces and IR version it relies on; four strict xfails pinning engine behaviours it works around; one case reruns `test_polars.py` and `test_lazy.py` with every collect also run through the engine (`metal_engine_everywhere.py`) |
 | `test_duckdb.py` | 38 | the bridge against DuckDB SQL; the 11 extension tests run when `duckdb-extension/build.sh` has produced the extension, and one test compiles the public C header as C |
 | `test_duckdb_rewrite.py` | 38 (178 collected) | the rewrite extension ([DUCKDB.md](DUCKDB.md) §4b) against DuckDB's own operators: every query with `arrowmetal_rewrite` off and forced, same types and values bit for bit, over generated tables reaching both ends of every integer type, each connection-taking test once in one block and once in 2,048-row streamed blocks; plus the `auto` gate against `router_2026-09-17.json` and the provisional benchmark results. Skips until `duckdb-extension/build_rewrite.sh` has built the extension |
 | `test_pandas.py` | 72 | the accessor and accel mode against plain pandas across five null-carrying dtype flavours; `install()`/`uninstall()` restore every patched slot |
