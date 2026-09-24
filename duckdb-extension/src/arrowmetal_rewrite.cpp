@@ -1,0 +1,2046 @@
+// ArrowMetal underneath ordinary DuckDB SQL: an optimizer extension that moves eligible aggregates
+// onto the GPU without the query changing.
+//
+//   LOAD 'duckdb-extension/build/arrowmetal_rewrite.duckdb_extension';
+//   SELECT k, sum(v), count(*), min(v), max(v), avg(v) FROM t WHERE v > 0 GROUP BY k;
+//   -- EXPLAIN shows ARROWMETAL_AGGREGATE where DuckDB would have had HASH_GROUP_BY
+//
+// WHY A C++ EXTENSION. DuckDB's C extension API (duckdb_extension.h, which the table-function
+// extension in arrowmetal_extension.cpp uses) has no optimizer hook: its only planner-adjacent entry
+// point is the replacement scan. The optimizer hook, `OptimizerExtension`, is C++ only, so this file is
+// built against the DuckDB v1.5.5 headers and stamped with the CPP ABI, which DuckDB loads only into
+// the exact engine version it was built for. See docs/DUCKDB.md §4b.
+//
+// WHAT IT DOES. After DuckDB's own optimizers have run, it looks for a LogicalAggregate whose shape it
+// can answer exactly - SUM / COUNT / COUNT(*) / MIN / MAX / AVG over integer columns (MIN and MAX also
+// over DATE and TIMESTAMP), no DISTINCT, no FILTER, no ORDER BY inside the aggregate, at most one GROUP
+// BY column that is an integer, DATE, TIMESTAMP or VARCHAR column - sitting on a chain of projections
+// and filters over a table function whose row count DuckDB knows. When DuckDB's estimate of the rows
+// reaching the aggregate is at or above the crossover (Benchmarks/results/router_2026-09-17.json), the
+// LogicalAggregate is replaced by ARROWMETAL_AGGREGATE. Everything below the aggregate - the scan, the
+// pushed-down filters, the projections - is still DuckDB's, planned and run exactly as before.
+//
+// ARROWMETAL_AGGREGATE is a parallel sink. Each DuckDB worker thread appends its chunks into one
+// shared, page-aligned, column-major buffer per input column (a reservation per chunk, then a memcpy
+// outside any lock). When the pipeline finishes, the buffers are wrapped as Arrow arrays without a
+// copy (page-aligned memory goes to Metal through makeBuffer(bytesNoCopy:)), the aggregate runs on the
+// GPU, and the result is handed back to DuckDB with the aggregate's own column bindings and types.
+//
+// EXACTNESS. Integer sums are exact to DuckDB's HUGEINT: a BIGINT column is summed as its high and low
+// 32-bit halves (each of which fits in 64 bits for any table under 2^31 rows) and recombined in 128
+// bits, unless DuckDB's own statistics already proved the sum fits in 64 bits (sum_no_overflow). AVG is
+// finished with the same arithmetic DuckDB's avg uses. Floating-point SUM and AVG are not rewritten:
+// DuckDB's own float sums depend on thread scheduling, so there is no single answer to match.
+//
+// CONTROLS.
+//   SET arrowmetal_rewrite = 'auto';   -- default: rewrite supported shapes at or above the crossover
+//   SET arrowmetal_rewrite = 'off';    -- never rewrite
+//   SET arrowmetal_rewrite = 'force';  -- rewrite every supported shape regardless of size (for tests)
+//   SELECT * FROM arrowmetal_rewrites();  -- every decision this process made, newest last, with reason
+//   EXPLAIN ...                           -- ARROWMETAL_AGGREGATE in the plan means the query was rewritten
+
+#include "duckdb.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/common/types/hugeint.hpp"
+#include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/function/table_function.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_extension_operator.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+
+#include "arrowmetal.h"
+
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <sys/mman.h>
+
+namespace duckdb {
+namespace arrowmetal_rewrite {
+
+//===--------------------------------------------------------------------===//
+// Crossovers, from Benchmarks/results/router_2026-09-17.json ("vs_fastest_library"). The row count
+// at which ArrowMetal's kernel first beats the fastest CPU library on the same operation. A query is
+// rewritten in 'auto' mode only when DuckDB's estimate of the rows reaching the aggregate is at or
+// above the largest crossover among its aggregates. python/tests/test_duckdb_rewrite.py checks these
+// constants against the JSON, so they cannot drift from it silently.
+//===--------------------------------------------------------------------===//
+struct Crossovers {
+	// "reductions: sum(int64, 10% nulls)", "min(...)", "max(...)", "mean(...)"
+	static constexpr int64_t SUM = 10000000;
+	static constexpr int64_t MIN = 50000000;
+	static constexpr int64_t MAX = 10000000;
+	static constexpr int64_t MEAN = 1000000;
+	// "group-by: {sum,count,min,max,mean} by int32 key (1000 groups)" - all five are 10M
+	static constexpr int64_t GROUP_1K = 10000000;
+	// "group-by: {sum,count,min,max,mean} by int32 key (100000 groups)" - all five are 100k
+	static constexpr int64_t GROUP_100K = 100000;
+	// "group-by: sum by utf8 key (1000 distinct)" and "(100000 distinct)" - both 10M
+	static constexpr int64_t GROUP_UTF8 = 10000000;
+};
+
+// The fused group-by keeps one slot per key value; above this span the hash group-by is used instead.
+// At 10M rows a 1M-key fused group-by ran in about half the hash group-by's time.
+static constexpr int64_t DENSE_KEY_SPAN = int64_t(1) << 20;
+// Slots the fused group-by keeps in threadgroup memory (ExprCompiler.gbMaxPrivateSlots).
+static constexpr int64_t FUSED_PRIVATE_SLOTS = 2048;
+// The GPU kernels index rows with 32-bit integers, and a 32-bit value summed over fewer than 2^31
+// rows cannot leave int64. Larger inputs are left to DuckDB.
+static constexpr int64_t MAX_ROWS = (int64_t(1) << 31) - 1;
+
+enum class Mode { AUTO, OFF, FORCE };
+
+static Mode GetMode(ClientContext &context) {
+	Value value;
+	if (context.TryGetCurrentSetting("arrowmetal_rewrite", value) && !value.IsNull()) {
+		auto text = StringUtil::Lower(value.ToString());
+		if (text == "off" || text == "false" || text == "0") {
+			return Mode::OFF;
+		}
+		if (text == "force") {
+			return Mode::FORCE;
+		}
+	}
+	return Mode::AUTO;
+}
+
+//===--------------------------------------------------------------------===//
+// The decision log behind arrowmetal_rewrites()
+//===--------------------------------------------------------------------===//
+struct Decision {
+	int64_t id = 0;
+	string decision; // "rewritten" or "kept"
+	string reason;
+	string shape;
+	int64_t input_rows = -1;
+	int64_t threshold_rows = -1;
+	// Filled in when a rewritten plan runs.
+	string path;
+	int64_t rows_seen = -1;
+	int64_t groups = -1;
+	double gpu_ms = -1;
+};
+
+static std::mutex g_log_lock;
+static std::deque<Decision> g_log;
+static int64_t g_next_id = 1;
+static constexpr size_t LOG_CAPACITY = 1024;
+
+static int64_t Record(Decision decision) {
+	std::lock_guard<std::mutex> guard(g_log_lock);
+	decision.id = g_next_id++;
+	g_log.push_back(decision);
+	while (g_log.size() > LOG_CAPACITY) {
+		g_log.pop_front();
+	}
+	return decision.id;
+}
+
+static void RecordRun(int64_t id, const string &path, int64_t rows, int64_t groups, double gpu_ms) {
+	std::lock_guard<std::mutex> guard(g_log_lock);
+	for (auto it = g_log.rbegin(); it != g_log.rend(); ++it) {
+		if (it->id == id) {
+			it->path = path;
+			it->rows_seen = rows;
+			it->groups = groups;
+			it->gpu_ms = gpu_ms;
+			return;
+		}
+	}
+}
+
+// One GPU at a time: ArrowMetal serialises on the device anyway, and holding this keeps two queries'
+// command buffers from interleaving.
+static std::mutex g_gpu_lock;
+
+//===--------------------------------------------------------------------===//
+// Column kinds the sink gathers
+//===--------------------------------------------------------------------===//
+enum class Kind : uint8_t { I8, I16, I32, I64, U8, U16, U32, U64, STR };
+
+static idx_t KindWidth(Kind kind) {
+	switch (kind) {
+	case Kind::I8:
+	case Kind::U8:
+		return 1;
+	case Kind::I16:
+	case Kind::U16:
+		return 2;
+	case Kind::I32:
+	case Kind::U32:
+		return 4;
+	case Kind::I64:
+	case Kind::U64:
+		return 8;
+	default:
+		return 0;
+	}
+}
+
+static bool KindSigned(Kind kind) {
+	return kind == Kind::I8 || kind == Kind::I16 || kind == Kind::I32 || kind == Kind::I64;
+}
+
+static const char *KindFormat(Kind kind) {
+	switch (kind) {
+	case Kind::I8: return "c";
+	case Kind::I16: return "s";
+	case Kind::I32: return "i";
+	case Kind::I64: return "l";
+	case Kind::U8: return "C";
+	case Kind::U16: return "S";
+	case Kind::U32: return "I";
+	case Kind::U64: return "L";
+	case Kind::STR: return "U";
+	}
+	return "";
+}
+
+// The numeric types whose values the GPU aggregates exactly. DATE and TIMESTAMP travel as their
+// storage integers: only MIN and MAX accept them (SQL has no SUM of a date).
+static bool NumericKind(const LogicalType &type, Kind &kind) {
+	switch (type.id()) {
+	case LogicalTypeId::TINYINT: kind = Kind::I8; return true;
+	case LogicalTypeId::SMALLINT: kind = Kind::I16; return true;
+	case LogicalTypeId::INTEGER: kind = Kind::I32; return true;
+	case LogicalTypeId::BIGINT: kind = Kind::I64; return true;
+	case LogicalTypeId::UTINYINT: kind = Kind::U8; return true;
+	case LogicalTypeId::USMALLINT: kind = Kind::U16; return true;
+	case LogicalTypeId::UINTEGER: kind = Kind::U32; return true;
+	case LogicalTypeId::UBIGINT: kind = Kind::U64; return true;
+	case LogicalTypeId::DATE: kind = Kind::I32; return true;
+	case LogicalTypeId::TIMESTAMP: kind = Kind::I64; return true;
+	default: return false;
+	}
+}
+
+static bool IsTemporal(const LogicalType &type) {
+	return type.id() == LogicalTypeId::DATE || type.id() == LogicalTypeId::TIMESTAMP;
+}
+
+// A cast that keeps every value of its source: integer to a wider integer that holds its whole range.
+static bool ValuePreservingCast(const LogicalType &source, const LogicalType &target) {
+	Kind s, t;
+	if (IsTemporal(source) || IsTemporal(target) || !NumericKind(source, s) || !NumericKind(target, t)) {
+		return false;
+	}
+	const idx_t sw = KindWidth(s), tw = KindWidth(t);
+	if (KindSigned(s) == KindSigned(t)) {
+		return tw >= sw;
+	}
+	if (!KindSigned(s) && KindSigned(t)) {
+		return tw > sw;
+	}
+	return false; // signed into unsigned loses the negatives
+}
+
+//===--------------------------------------------------------------------===//
+// What the rewritten operator computes
+//===--------------------------------------------------------------------===//
+enum class AggOp : uint8_t { COUNT_STAR, COUNT, SUM, MIN, MAX, AVG };
+
+struct AggSpec {
+	AggOp op = AggOp::COUNT_STAR;
+	idx_t input = DConstants::INVALID_INDEX; // index into Spec::inputs
+	// The integer width DuckDB's own aggregate works at (the function's argument type): 16, 32 or 64.
+	idx_t semantic_bits = 64;
+	// sum_no_overflow: DuckDB's statistics proved the total fits in 64 bits.
+	bool proven_no_overflow = false;
+	LogicalType return_type;
+	string name;
+};
+
+struct Spec {
+	vector<LogicalType> input_types; // the gathered columns, as the child produces them
+	vector<Kind> input_kinds;
+	bool has_key = false; // input 0 is the group key when set
+	vector<AggSpec> aggs;
+	vector<LogicalType> result_types; // key (if any), then one per aggregate
+	int64_t decision_id = 0;
+};
+
+//===--------------------------------------------------------------------===//
+// Page-aligned, lazily committed memory. mmap hands back pages Metal can wrap without copying, and
+// untouched pages cost nothing, so a region can be sized for the largest possible input.
+//===--------------------------------------------------------------------===//
+static constexpr size_t PAGE = 16384; // Apple silicon's VM page, what makeBuffer(bytesNoCopy:) wants
+
+static size_t PageRound(size_t n) {
+	return (n + PAGE - 1) / PAGE * PAGE;
+}
+
+static uint8_t *MapBytes(size_t bytes) {
+	void *p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+	if (p == MAP_FAILED) {
+		throw OutOfMemoryException("arrowmetal_rewrite: could not map %llu bytes", (unsigned long long)bytes);
+	}
+	return static_cast<uint8_t *>(p);
+}
+
+// A plain mapping, for the string key's buffers.
+struct Region {
+	uint8_t *ptr = nullptr;
+	size_t bytes = 0;
+
+	Region() = default;
+	Region(const Region &) = delete;
+	Region &operator=(const Region &) = delete;
+	~Region() {
+		Free();
+	}
+	void Allocate(size_t size) {
+		Free();
+		bytes = PageRound(size < PAGE ? PAGE : size);
+		ptr = MapBytes(bytes);
+	}
+	void Free() {
+		if (ptr) {
+			munmap(ptr, bytes);
+			ptr = nullptr;
+			bytes = 0;
+		}
+	}
+};
+
+//===--------------------------------------------------------------------===//
+// Slabs: a fixed-width column's memory, kept from one query to the next together with its Metal
+// wrapping.
+//
+// Wrapping fresh memory for the GPU is not free: at 50M int64 rows makeBuffer(bytesNoCopy:) and the
+// GPU's first touch of the new mapping cost several times what the aggregate itself does. So each
+// slab is imported into ArrowMetal once, over its whole capacity, and every query afterwards writes
+// its rows into the same memory and hands ArrowMetal a zero-copy slice of the first `rows` of it.
+// Freed slabs wait in a pool (least recently used first out) holding at most SLAB_POOL_BYTES.
+//===--------------------------------------------------------------------===//
+static constexpr size_t SLAB_POOL_BYTES = size_t(4) << 30;
+
+struct Slab {
+	Kind kind = Kind::I64;
+	idx_t capacity = 0;
+	uint8_t *base = nullptr;
+	size_t bytes = 0;
+	uint64_t *validity = nullptr; // Arrow bitmap, all-valid between uses
+	uint8_t *values = nullptr;
+	bool bitmap_dirty = false;       // the last user cleared some bits
+	am_array *with_validity = nullptr;    // imported once, on first use
+	am_array *without_validity = nullptr;
+
+	Slab(Kind kind_p, idx_t capacity_p) : kind(kind_p), capacity(capacity_p) {
+		const size_t bitmap_bytes = PageRound(((capacity + 64) / 64) * 8);
+		bytes = bitmap_bytes + PageRound(capacity * KindWidth(kind) + 64);
+		base = MapBytes(bytes);
+		validity = reinterpret_cast<uint64_t *>(base);
+		values = base + bitmap_bytes;
+		std::memset(validity, 0xFF, bitmap_bytes);
+	}
+	~Slab() {
+		if (with_validity) {
+			am_release(with_validity);
+		}
+		if (without_validity) {
+			am_release(without_validity);
+		}
+		munmap(base, bytes);
+	}
+	void ResetBitmap() {
+		if (bitmap_dirty) {
+			std::memset(validity, 0xFF, ((capacity + 64) / 64) * 8);
+			bitmap_dirty = false;
+		}
+	}
+};
+
+static std::mutex g_slab_lock;
+// Deliberately never destroyed: releasing Metal-backed arrays from a static destructor at process exit
+// would race ArrowMetal's own teardown.
+static auto *g_slabs = new std::deque<unique_ptr<Slab>>();
+static size_t g_slab_bytes = 0;
+
+static unique_ptr<Slab> TakeSlab(Kind kind, idx_t rows) {
+	{
+		std::lock_guard<std::mutex> guard(g_slab_lock);
+		idx_t best = DConstants::INVALID_INDEX;
+		for (idx_t i = 0; i < g_slabs->size(); i++) {
+			auto &slab = *(*g_slabs)[i];
+			if (slab.kind == kind && slab.capacity >= rows && slab.capacity / 2 <= rows &&
+			    (best == DConstants::INVALID_INDEX || slab.capacity < (*g_slabs)[best]->capacity)) {
+				best = i;
+			}
+		}
+		if (best != DConstants::INVALID_INDEX) {
+			auto slab = std::move((*g_slabs)[best]);
+			g_slabs->erase(g_slabs->begin() + int64_t(best));
+			g_slab_bytes -= slab->bytes;
+			slab->ResetBitmap();
+			return slab;
+		}
+	}
+	return make_uniq<Slab>(kind, rows);
+}
+
+static void ReturnSlab(unique_ptr<Slab> slab) {
+	vector<unique_ptr<Slab>> evicted;
+	{
+		std::lock_guard<std::mutex> guard(g_slab_lock);
+		if (slab->bytes > SLAB_POOL_BYTES) {
+			evicted.push_back(std::move(slab));
+		} else {
+			g_slab_bytes += slab->bytes;
+			g_slabs->push_back(std::move(slab));
+			while (g_slab_bytes > SLAB_POOL_BYTES) {
+				g_slab_bytes -= g_slabs->front()->bytes;
+				evicted.push_back(std::move(g_slabs->front()));
+				g_slabs->pop_front();
+			}
+		}
+	}
+	// `evicted` is destroyed here, outside the lock.
+}
+
+struct ColumnStore {
+	Kind kind = Kind::I64;
+	idx_t width = 8;
+	unique_ptr<Slab> slab; // fixed width
+	Region data;           // STR: the UTF-8 bytes
+	Region offsets;        // STR: int64 offsets, rows + 1 of them
+	Region bits;           // STR: the validity bitmap
+	// Where the gather writes, in the slab or the regions. The bitmap starts all-valid; a NULL clears
+	// its bit.
+	uint64_t *validity = nullptr;
+	uint8_t *values = nullptr;
+	int64_t *offsets_ptr = nullptr;
+	std::atomic<int64_t> nulls {0};
+	size_t byte_capacity = 0; // STR only
+	size_t bytes_used = 0;    // STR only, guarded by the reservation lock
+
+	void Allocate(idx_t rows, size_t bytes) {
+		if (kind == Kind::STR) {
+			const size_t bitmap_bytes = ((rows + 64) / 64) * 8;
+			bits.Allocate(bitmap_bytes);
+			std::memset(bits.ptr, 0xFF, bitmap_bytes);
+			offsets.Allocate((rows + 1) * sizeof(int64_t));
+			data.Allocate(bytes);
+			byte_capacity = data.bytes;
+			validity = reinterpret_cast<uint64_t *>(bits.ptr);
+			values = data.ptr;
+			offsets_ptr = reinterpret_cast<int64_t *>(offsets.ptr);
+		} else {
+			slab = TakeSlab(kind, rows);
+			validity = slab->validity;
+			values = slab->values;
+		}
+	}
+	~ColumnStore() {
+		if (slab) {
+			slab->bitmap_dirty = nulls.load() > 0;
+			ReturnSlab(std::move(slab));
+		}
+	}
+};
+
+static inline void ClearBit(uint64_t *bitmap, idx_t row) {
+	__atomic_fetch_and(&bitmap[row >> 6], ~(uint64_t(1) << (row & 63)), __ATOMIC_RELAXED);
+}
+
+// Virtual bytes reserved per row for a string column. Untouched pages are never committed, so this is
+// address space, not memory; a table whose strings average more than this goes through the overflow.
+static constexpr size_t STRING_BYTES_PER_ROW = 64;
+
+//===--------------------------------------------------------------------===//
+// The sink's global state: the gathered columns and, after Finalize, the result
+//
+// Rows are appended at positions reserved per chunk. Fixed-width plans reserve with one atomic add
+// and copy without any lock. Plans with a string key reserve rows and bytes together under a mutex,
+// so that the offsets stay in row order. The regions are sized for the most rows the source can
+// produce; a chunk that does not fit (a prepared statement run after the table grew, say) is kept in
+// `overflow` and appended at Finalize.
+//===--------------------------------------------------------------------===//
+class RewriteGlobalState : public GlobalSinkState {
+public:
+	RewriteGlobalState(ClientContext &context, const Spec &spec, idx_t capacity_rows)
+	    : overflow_types(spec.input_types), result(context, spec.result_types) {
+		columns.reserve(spec.input_kinds.size());
+		for (auto kind : spec.input_kinds) {
+			auto column = make_uniq<ColumnStore>();
+			column->kind = kind;
+			column->width = KindWidth(kind);
+			has_strings = has_strings || kind == Kind::STR;
+			columns.push_back(std::move(column));
+		}
+		capacity = capacity_rows < STANDARD_VECTOR_SIZE ? STANDARD_VECTOR_SIZE : capacity_rows;
+		for (auto &column : columns) {
+			column->Allocate(capacity, capacity * STRING_BYTES_PER_ROW + (1 << 20));
+		}
+		// A pooled slab may hold more rows than asked for; use all of it.
+		if (!has_strings) {
+			idx_t smallest = DConstants::INVALID_INDEX;
+			for (auto &column : columns) {
+				smallest = MinValue<idx_t>(smallest, column->slab->capacity);
+			}
+			capacity = smallest;
+		}
+	}
+
+	// Rows [0, RegionRows()) of the regions hold data.
+	idx_t RegionRows() const {
+		if (has_strings) {
+			return locked_rows;
+		}
+		const idx_t total = reserved.load();
+		if (total <= capacity) {
+			return total;
+		}
+		const idx_t hole = hole_start.load();
+		return hole < capacity ? hole : capacity;
+	}
+
+	vector<unique_ptr<ColumnStore>> columns;
+	idx_t capacity = 0;
+	bool has_strings = false;
+	std::atomic<idx_t> reserved {0};                              // fixed-width plans
+	std::atomic<idx_t> hole_start {DConstants::INVALID_INDEX};    // a reservation that straddled capacity
+	std::mutex reserve_lock;                                      // string plans
+	idx_t locked_rows = 0;                                        // string plans, guarded by reserve_lock
+
+	std::mutex overflow_lock;
+	vector<LogicalType> overflow_types;
+	unique_ptr<ColumnDataCollection> overflow;
+
+	// The group key's range, for choosing the fused dense group-by. Guarded by key_lock.
+	std::mutex key_lock;
+	bool key_seen = false;
+	int64_t key_min = 0;
+	int64_t key_max = 0;
+
+	ColumnDataCollection result;
+	int64_t groups = 0;
+};
+
+class RewriteLocalState : public LocalSinkState {
+public:
+	bool key_seen = false;
+	int64_t key_min = 0;
+	int64_t key_max = 0;
+};
+
+class RewriteSourceState : public GlobalSourceState {
+public:
+	ColumnDataScanState scan;
+	bool initialized = false;
+};
+
+//===--------------------------------------------------------------------===//
+// Gathering one chunk
+//===--------------------------------------------------------------------===//
+template <class T>
+static void GatherFixed(const UnifiedVectorFormat &format, idx_t count, T *target) {
+	auto source = reinterpret_cast<const T *>(format.data); // raw bytes: the width is all that matters here
+	if (!format.sel->IsSet()) {
+		std::memcpy(target, source, count * sizeof(T));
+		return;
+	}
+	for (idx_t i = 0; i < count; i++) {
+		target[i] = source[format.sel->get_index(i)];
+	}
+}
+
+template <class T>
+static void KeyRange(const UnifiedVectorFormat &format, idx_t count, RewriteLocalState &local) {
+	auto source = reinterpret_cast<const T *>(format.data); // raw bytes: the width is all that matters here
+	bool seen = local.key_seen;
+	int64_t lo = local.key_min, hi = local.key_max;
+	const bool all_valid = format.validity.AllValid();
+	for (idx_t i = 0; i < count; i++) {
+		const idx_t index = format.sel->get_index(i);
+		if (!all_valid && !format.validity.RowIsValid(index)) {
+			continue;
+		}
+		const int64_t v = static_cast<int64_t>(source[index]);
+		if (!seen) {
+			lo = hi = v;
+			seen = true;
+		} else {
+			lo = v < lo ? v : lo;
+			hi = v > hi ? v : hi;
+		}
+	}
+	local.key_seen = seen;
+	local.key_min = lo;
+	local.key_max = hi;
+}
+
+//===--------------------------------------------------------------------===//
+// The physical operator
+//===--------------------------------------------------------------------===//
+class PhysicalArrowMetalAggregate : public PhysicalOperator {
+public:
+	PhysicalArrowMetalAggregate(PhysicalPlan &physical_plan, Spec spec_p, vector<idx_t> child_columns_p,
+	                            idx_t capacity_rows_p, idx_t estimated_cardinality)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, spec_p.result_types, estimated_cardinality),
+	      spec(std::move(spec_p)), child_columns(std::move(child_columns_p)), capacity_rows(capacity_rows_p) {
+	}
+
+	Spec spec;
+	vector<idx_t> child_columns; // which column of the child's chunk feeds each gathered input
+	idx_t capacity_rows;
+
+	string GetName() const override {
+		return "ARROWMETAL_AGGREGATE";
+	}
+
+	InsertionOrderPreservingMap<string> ParamsToString() const override {
+		InsertionOrderPreservingMap<string> result;
+		if (spec.has_key) {
+			result["Groups"] = "#" + to_string(child_columns[0]);
+		}
+		string aggs;
+		for (idx_t i = 0; i < spec.aggs.size(); i++) {
+			aggs += (i ? "\n" : "") + spec.aggs[i].name;
+		}
+		result["Aggregates"] = aggs;
+		result["Engine"] = "ArrowMetal (Metal GPU)";
+		SetEstimatedCardinality(result, estimated_cardinality);
+		return result;
+	}
+
+	// Sink interface
+	bool IsSink() const override {
+		return true;
+	}
+	bool ParallelSink() const override {
+		return true;
+	}
+	bool SinkOrderDependent() const override {
+		return false;
+	}
+
+	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
+		return make_uniq<RewriteGlobalState>(context, spec, capacity_rows);
+	}
+	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override {
+		return make_uniq<RewriteLocalState>();
+	}
+
+	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
+		auto &gstate = input.global_state.Cast<RewriteGlobalState>();
+		auto &lstate = input.local_state.Cast<RewriteLocalState>();
+		const idx_t count = chunk.size();
+		if (count == 0) {
+			return SinkResultType::NEED_MORE_INPUT;
+		}
+		const idx_t ncols = child_columns.size();
+		vector<UnifiedVectorFormat> formats(ncols);
+		size_t string_bytes = 0;
+		for (idx_t c = 0; c < ncols; c++) {
+			chunk.data[child_columns[c]].ToUnifiedFormat(count, formats[c]);
+			if (spec.input_kinds[c] == Kind::STR) {
+				auto strings = UnifiedVectorFormat::GetData<string_t>(formats[c]);
+				for (idx_t i = 0; i < count; i++) {
+					const idx_t index = formats[c].sel->get_index(i);
+					if (formats[c].validity.RowIsValid(index)) {
+						string_bytes += strings[index].GetSize();
+					}
+				}
+			}
+		}
+		if (spec.has_key && spec.input_kinds[0] != Kind::STR && spec.input_kinds[0] != Kind::U64) {
+			switch (spec.input_kinds[0]) {
+			case Kind::I8: KeyRange<int8_t>(formats[0], count, lstate); break;
+			case Kind::I16: KeyRange<int16_t>(formats[0], count, lstate); break;
+			case Kind::I32: KeyRange<int32_t>(formats[0], count, lstate); break;
+			case Kind::I64: KeyRange<int64_t>(formats[0], count, lstate); break;
+			case Kind::U8: KeyRange<uint8_t>(formats[0], count, lstate); break;
+			case Kind::U16: KeyRange<uint16_t>(formats[0], count, lstate); break;
+			case Kind::U32: KeyRange<uint32_t>(formats[0], count, lstate); break;
+			default: break;
+			}
+		}
+
+		idx_t row0 = 0;
+		size_t byte0 = 0;
+		bool fits = false;
+		if (!gstate.has_strings) {
+			row0 = gstate.reserved.fetch_add(count, std::memory_order_relaxed);
+			fits = row0 + count <= gstate.capacity;
+			if (!fits && row0 < gstate.capacity) {
+				gstate.hole_start.store(row0);
+			}
+		} else {
+			std::lock_guard<std::mutex> guard(gstate.reserve_lock);
+			auto &strings = *gstate.columns[0];
+			fits = gstate.locked_rows + count <= gstate.capacity &&
+			       strings.bytes_used + string_bytes <= strings.byte_capacity;
+			if (fits) {
+				row0 = gstate.locked_rows;
+				byte0 = strings.bytes_used;
+				gstate.locked_rows += count;
+				strings.bytes_used += string_bytes;
+			}
+		}
+		if (fits) {
+			for (idx_t c = 0; c < ncols; c++) {
+				CopyColumn(*gstate.columns[c], formats[c], count, row0, byte0);
+			}
+			return SinkResultType::NEED_MORE_INPUT;
+		}
+		// Past the regions: keep the chunk's gathered columns aside for Finalize.
+		DataChunk kept;
+		kept.InitializeEmpty(gstate.overflow_types);
+		for (idx_t c = 0; c < ncols; c++) {
+			kept.data[c].Reference(chunk.data[child_columns[c]]);
+		}
+		kept.SetCardinality(count);
+		std::lock_guard<std::mutex> guard(gstate.overflow_lock);
+		if (!gstate.overflow) {
+			gstate.overflow = make_uniq<ColumnDataCollection>(context.client, gstate.overflow_types);
+		}
+		gstate.overflow->Append(kept);
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+
+	static void CopyColumn(ColumnStore &column, const UnifiedVectorFormat &format, idx_t count, idx_t row0,
+	                       size_t byte0) {
+		auto *bitmap = column.validity;
+		int64_t nulls = 0;
+		if (!format.validity.AllValid()) {
+			for (idx_t i = 0; i < count; i++) {
+				if (!format.validity.RowIsValid(format.sel->get_index(i))) {
+					ClearBit(bitmap, row0 + i);
+					nulls++;
+				}
+			}
+			column.nulls.fetch_add(nulls, std::memory_order_relaxed);
+		}
+		switch (column.kind) {
+		case Kind::I8:
+		case Kind::U8:
+			GatherFixed<uint8_t>(format, count, column.values + row0);
+			break;
+		case Kind::I16:
+		case Kind::U16:
+			GatherFixed<uint16_t>(format, count, reinterpret_cast<uint16_t *>(column.values) + row0);
+			break;
+		case Kind::I32:
+		case Kind::U32:
+			GatherFixed<uint32_t>(format, count, reinterpret_cast<uint32_t *>(column.values) + row0);
+			break;
+		case Kind::I64:
+		case Kind::U64:
+			GatherFixed<uint64_t>(format, count, reinterpret_cast<uint64_t *>(column.values) + row0);
+			break;
+		case Kind::STR: {
+			auto strings = UnifiedVectorFormat::GetData<string_t>(format);
+			auto *offsets = column.offsets_ptr;
+			size_t at = byte0;
+			for (idx_t i = 0; i < count; i++) {
+				offsets[row0 + i] = static_cast<int64_t>(at);
+				const idx_t index = format.sel->get_index(i);
+				if (format.validity.RowIsValid(index)) {
+					const auto &s = strings[index];
+					const auto size = s.GetSize();
+					std::memcpy(column.values + at, s.GetData(), size);
+					at += size;
+				}
+			}
+			break;
+		}
+		}
+	}
+
+	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override {
+		auto &gstate = input.global_state.Cast<RewriteGlobalState>();
+		auto &lstate = input.local_state.Cast<RewriteLocalState>();
+		if (lstate.key_seen) {
+			std::lock_guard<std::mutex> guard(gstate.key_lock);
+			if (!gstate.key_seen) {
+				gstate.key_min = lstate.key_min;
+				gstate.key_max = lstate.key_max;
+				gstate.key_seen = true;
+			} else {
+				gstate.key_min = lstate.key_min < gstate.key_min ? lstate.key_min : gstate.key_min;
+				gstate.key_max = lstate.key_max > gstate.key_max ? lstate.key_max : gstate.key_max;
+			}
+		}
+		return SinkCombineResultType::FINISHED;
+	}
+
+	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+	                          OperatorSinkFinalizeInput &input) const override;
+
+	// Source interface
+	bool IsSource() const override {
+		return true;
+	}
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override {
+		return make_uniq<RewriteSourceState>();
+	}
+
+protected:
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+	                                 OperatorSourceInput &input) const override {
+		auto &gstate = sink_state->Cast<RewriteGlobalState>();
+		auto &state = input.global_state.Cast<RewriteSourceState>();
+		if (!state.initialized) {
+			gstate.result.InitializeScan(state.scan);
+			state.initialized = true;
+		}
+		gstate.result.Scan(state.scan, chunk);
+		return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
+	}
+};
+
+//===--------------------------------------------------------------------===//
+// The GPU half: Arrow arrays over the gathered buffers, and the ArrowMetal calls
+//===--------------------------------------------------------------------===//
+struct ArrowHolder {
+	const void *buffers[3] = {nullptr, nullptr, nullptr};
+};
+
+static void ReleaseArray(ArrowArray *array) {
+	delete static_cast<ArrowHolder *>(array->private_data);
+	array->release = nullptr;
+}
+
+static void ReleaseSchema(ArrowSchema *schema) {
+	schema->release = nullptr;
+}
+
+static string AmError() {
+	const char *msg = am_last_error();
+	return msg && *msg ? string(msg) : string("unknown ArrowMetal error");
+}
+
+[[noreturn]] static void Fail(const string &what) {
+	throw InvalidInputException("arrowmetal_rewrite: %s: %s (SET arrowmetal_rewrite = 'off' runs the query on "
+	                            "DuckDB's own operators)",
+	                            what, AmError());
+}
+
+// Owns an am_array handle.
+struct Handle {
+	am_array *ptr = nullptr;
+	Handle() = default;
+	Handle(const Handle &) = delete;
+	Handle &operator=(const Handle &) = delete;
+	Handle(Handle &&other) noexcept : ptr(other.ptr) {
+		other.ptr = nullptr;
+	}
+	~Handle() {
+		if (ptr) {
+			am_release(ptr);
+		}
+	}
+};
+
+// Wraps memory this file owns as an Arrow array, zero-copy (every buffer is page aligned). The Arrow
+// release only drops the holder: the memory belongs to a Slab or a Region, which outlives the handle.
+static am_array *ImportBuffers(Kind kind, int64_t length, int64_t null_count, const void *validity,
+                               const void *second, const void *third) {
+	auto holder = new ArrowHolder();
+	holder->buffers[0] = validity;
+	holder->buffers[1] = second;
+	holder->buffers[2] = third;
+	ArrowSchema schema;
+	std::memset(&schema, 0, sizeof(schema));
+	schema.format = KindFormat(kind);
+	schema.name = "";
+	schema.flags = ARROW_FLAG_NULLABLE;
+	schema.release = ReleaseSchema;
+	ArrowArray array;
+	std::memset(&array, 0, sizeof(array));
+	array.length = length;
+	array.null_count = null_count;
+	array.n_buffers = kind == Kind::STR ? 3 : 2;
+	array.buffers = holder->buffers;
+	array.private_data = holder;
+	array.release = ReleaseArray;
+	am_array *out = nullptr;
+	const int rc = am_import(&schema, &array, &out);
+	if (schema.release) {
+		schema.release(&schema);
+	}
+	if (rc != 0) {
+		if (array.release) {
+			array.release(&array);
+		}
+		Fail("importing a gathered column");
+	}
+	return out;
+}
+
+// The first `rows` of a gathered column as an ArrowMetal array. A fixed-width column is a slice of
+// its slab's long-lived import (made on the slab's first use); a string column is imported fresh.
+static am_array *ImportColumn(ColumnStore &column, idx_t rows) {
+	const int64_t nulls = column.nulls.load();
+	if (column.kind == Kind::STR) {
+		column.offsets_ptr[rows] = static_cast<int64_t>(column.bytes_used);
+		return ImportBuffers(Kind::STR, int64_t(rows), nulls, nulls ? column.validity : nullptr, column.offsets_ptr,
+		                     column.values);
+	}
+	auto &slab = *column.slab;
+	am_array *&base = nulls ? slab.with_validity : slab.without_validity;
+	if (!base) {
+		// null_count -1: ArrowMetal counts the bitmap itself. Each slice counts its own rows again.
+		base = ImportBuffers(slab.kind, int64_t(slab.capacity), nulls ? -1 : 0, nulls ? slab.validity : nullptr,
+		                     slab.values, nullptr);
+	}
+	am_array *out = nullptr;
+	if (am_slice(base, 0, int64_t(rows), &out) != 0) {
+		Fail("slicing a gathered column");
+	}
+	return out;
+}
+
+// A column read back from the GPU: 64-bit slots (signed or unsigned bit patterns) or strings.
+struct HostColumn {
+	string format;
+	vector<int64_t> values;
+	vector<string> strings;
+	vector<bool> valid;
+};
+
+static void ReadColumn(am_array *handle, HostColumn &out) {
+	ArrowSchema schema;
+	ArrowArray array;
+	std::memset(&schema, 0, sizeof(schema));
+	std::memset(&array, 0, sizeof(array));
+	if (am_export(handle, &schema, &array) != 0) {
+		Fail("reading a result column");
+	}
+	out.format = schema.format ? schema.format : "";
+	const int64_t n = array.length;
+	const int64_t off = array.offset;
+	auto validity = array.n_buffers > 0 ? static_cast<const uint64_t *>(array.buffers[0]) : nullptr;
+	out.values.assign(n, 0);
+	out.valid.assign(n, true);
+	const string &f = out.format;
+	const bool is_str = f == "u" || f == "U";
+	if (is_str) {
+		out.strings.assign(n, string());
+	}
+	for (int64_t i = 0; i < n; i++) {
+		const int64_t r = i + off;
+		if (validity && !((validity[r >> 6] >> (r & 63)) & 1)) {
+			out.valid[i] = false;
+			continue;
+		}
+		const void *data = array.buffers[1];
+		if (f == "c") {
+			out.values[i] = static_cast<const int8_t *>(data)[r];
+		} else if (f == "C") {
+			out.values[i] = static_cast<const uint8_t *>(data)[r];
+		} else if (f == "s") {
+			out.values[i] = static_cast<const int16_t *>(data)[r];
+		} else if (f == "S") {
+			out.values[i] = static_cast<const uint16_t *>(data)[r];
+		} else if (f == "i" || f == "tdD") {
+			out.values[i] = static_cast<const int32_t *>(data)[r];
+		} else if (f == "I") {
+			out.values[i] = static_cast<const uint32_t *>(data)[r];
+		} else if (f == "l" || f == "L" || f.rfind("ts", 0) == 0) {
+			out.values[i] = static_cast<const int64_t *>(data)[r];
+		} else if (f == "g") {
+			double d = static_cast<const double *>(data)[r];
+			std::memcpy(&out.values[i], &d, 8);
+		} else if (f == "u") {
+			auto offsets = static_cast<const int32_t *>(data);
+			auto bytes = static_cast<const char *>(array.buffers[2]);
+			out.strings[i].assign(bytes + offsets[r], offsets[r + 1] - offsets[r]);
+		} else if (f == "U") {
+			auto offsets = static_cast<const int64_t *>(data);
+			auto bytes = static_cast<const char *>(array.buffers[2]);
+			out.strings[i].assign(bytes + offsets[r], offsets[r + 1] - offsets[r]);
+		} else {
+			if (array.release) {
+				array.release(&array);
+			}
+			if (schema.release) {
+				schema.release(&schema);
+			}
+			throw InternalException("arrowmetal_rewrite: unexpected result format '%s'", f);
+		}
+	}
+	if (array.release) {
+		array.release(&array);
+	}
+	if (schema.release) {
+		schema.release(&schema);
+	}
+}
+
+// One GPU-side aggregate the plan needs, deduplicated across the SQL aggregates that share it.
+enum class Need : uint8_t { ROWS, COUNT, SUM, SUM_HI, SUM_LO, MIN, MAX };
+
+struct NeedKey {
+	Need need;
+	idx_t input;
+	bool operator==(const NeedKey &o) const {
+		return need == o.need && input == o.input;
+	}
+};
+
+struct Plan {
+	vector<NeedKey> needs;
+	idx_t Add(Need need, idx_t input) {
+		for (idx_t i = 0; i < needs.size(); i++) {
+			if (needs[i] == NeedKey {need, input}) {
+				return i;
+			}
+		}
+		needs.push_back(NeedKey {need, input});
+		return needs.size() - 1;
+	}
+};
+
+// Whether a SUM/AVG over `input` has to be split into 32-bit halves to stay exact.
+static bool NeedsSplit(const Spec &spec, const AggSpec &agg) {
+	if (agg.proven_no_overflow) {
+		return false;
+	}
+	const Kind kind = spec.input_kinds[agg.input];
+	return KindWidth(kind) == 8; // a 64-bit source can overflow int64; anything narrower cannot
+}
+
+struct AggSlots {
+	idx_t count = DConstants::INVALID_INDEX;
+	idx_t sum = DConstants::INVALID_INDEX;
+	idx_t hi = DConstants::INVALID_INDEX;
+	idx_t lo = DConstants::INVALID_INDEX;
+	idx_t extreme = DConstants::INVALID_INDEX;
+};
+
+// `nullable[c]` says whether gathered column c holds any NULL; a count over a column without one is the
+// row count, which the plan already has.
+static vector<AggSlots> PlanNeeds(const Spec &spec, const vector<bool> &nullable, Plan &plan) {
+	vector<AggSlots> slots(spec.aggs.size());
+	plan.Add(Need::ROWS, DConstants::INVALID_INDEX); // always slot 0: rows per group
+	auto count = [&](idx_t input) -> idx_t { return nullable[input] ? plan.Add(Need::COUNT, input) : 0; };
+	for (idx_t a = 0; a < spec.aggs.size(); a++) {
+		auto &agg = spec.aggs[a];
+		auto &s = slots[a];
+		switch (agg.op) {
+		case AggOp::COUNT_STAR:
+			break;
+		case AggOp::COUNT:
+			s.count = count(agg.input);
+			break;
+		case AggOp::SUM:
+		case AggOp::AVG:
+			s.count = count(agg.input);
+			if (NeedsSplit(spec, agg)) {
+				s.hi = plan.Add(Need::SUM_HI, agg.input);
+				s.lo = plan.Add(Need::SUM_LO, agg.input);
+			} else {
+				s.sum = plan.Add(Need::SUM, agg.input);
+			}
+			break;
+		case AggOp::MIN:
+			s.count = count(agg.input);
+			s.extreme = plan.Add(Need::MIN, agg.input);
+			break;
+		case AggOp::MAX:
+			s.count = count(agg.input);
+			s.extreme = plan.Add(Need::MAX, agg.input);
+			break;
+		}
+	}
+	return slots;
+}
+
+static string ColName(idx_t input) {
+	return "c" + to_string(input);
+}
+
+// The fused-expression text for one need; `name` labels its output.
+static string NeedText(const NeedKey &need, const string &name) {
+	const string col = need.input == DConstants::INVALID_INDEX ? "" : "(col \"" + ColName(need.input) + "\")";
+	switch (need.need) {
+	case Need::ROWS: return "(count \"" + name + "\")";
+	case Need::COUNT: return "(count \"" + name + "\" " + col + ")";
+	case Need::SUM: return "(sum \"" + name + "\" " + col + ")";
+	case Need::SUM_HI: return "(sum \"" + name + "\" (shr " + col + " (i64 32)))";
+	case Need::SUM_LO: return "(sum \"" + name + "\" (bit_and " + col + " (i64 4294967295)))";
+	case Need::MIN: return "(min \"" + name + "\" " + col + ")";
+	case Need::MAX: return "(max \"" + name + "\" " + col + ")";
+	}
+	return "";
+}
+
+// Per-group results: one 64-bit slot per need, as a signed or unsigned bit pattern, plus validity.
+struct Groups {
+	idx_t count = 0;
+	HostColumn key;                      // the group key per group (grouped queries)
+	vector<vector<int64_t>> slot;        // [need][group]
+	vector<vector<bool>> slot_valid;     // [need][group]
+	vector<bool> slot_unsigned;          // [need]
+};
+
+struct QueryResultHolder {
+	am_query_result *ptr = nullptr;
+	~QueryResultHolder() {
+		if (ptr) {
+			am_query_result_release(ptr);
+		}
+	}
+};
+
+// Runs `text` over the gathered columns and appends the scalars (one row) to `groups`.
+static void RunScalarQuery(vector<am_array *> &columns, const string &text, const Plan &plan, Groups &groups) {
+	vector<string> names;
+	vector<const char *> name_ptrs;
+	for (idx_t i = 0; i < columns.size(); i++) {
+		names.push_back(ColName(i));
+	}
+	for (auto &n : names) {
+		name_ptrs.push_back(n.c_str());
+	}
+	QueryResultHolder result;
+	if (am_query(columns.data(), name_ptrs.data(), int64_t(columns.size()), text.c_str(), &result.ptr) != 0) {
+		Fail("running the fused aggregate");
+	}
+	const idx_t g = groups.count++;
+	for (idx_t n = 0; n < plan.needs.size(); n++) {
+		int64_t iv = 0;
+		double dv = 0;
+		int kind = 0;
+		int is_null = 0;
+		if (am_query_scalar(result.ptr, int64_t(n), &iv, &dv, &kind, &is_null) != 0) {
+			Fail("reading an aggregate");
+		}
+		groups.slot[n].resize(g + 1);
+		groups.slot_valid[n].resize(g + 1);
+		groups.slot[n][g] = iv;
+		groups.slot_valid[n][g] = !is_null;
+		groups.slot_unsigned[n] = kind == 1;
+	}
+}
+
+static string AggregateList(const Plan &plan) {
+	string text;
+	for (idx_t n = 0; n < plan.needs.size(); n++) {
+		text += " " + NeedText(plan.needs[n], "n" + to_string(n));
+	}
+	return text;
+}
+
+static bool SignedResultFormat(const string &f) {
+	return f == "c" || f == "s" || f == "i" || f == "l" || f == "tdD" || f.rfind("ts", 0) == 0;
+}
+
+// The fused dense group-by: one pass, one slot per key value in [key_min, key_max].
+static void RunDense(vector<am_array *> &columns, const Plan &plan, int64_t key_min, int64_t span,
+                     int64_t key_nulls, Kind key_kind, Groups &groups) {
+	vector<string> names;
+	vector<const char *> name_ptrs;
+	for (idx_t i = 0; i < columns.size(); i++) {
+		names.push_back(ColName(i));
+	}
+	for (auto &n : names) {
+		name_ptrs.push_back(n.c_str());
+	}
+	const string key = "(sub (cast (col \"c0\") i64) (i64 " + to_string(key_min) + "))";
+	// The fused group-by keeps its table in threadgroup memory while span x aggregates fits in
+	// FUSED_PRIVATE_SLOTS, and falls back to contended device-wide atomics above that. For small key
+	// spans it is cheaper to read the columns again than to leave threadgroup memory, so the needs are
+	// split across as many queries as keep each one private.
+	idx_t per_query = plan.needs.size();
+	if (span * int64_t(plan.needs.size()) > FUSED_PRIVATE_SLOTS && span <= FUSED_PRIVATE_SLOTS / 2) {
+		per_query = idx_t(FUSED_PRIVATE_SLOTS / span);
+	}
+	vector<HostColumn> host(plan.needs.size());
+	for (idx_t first = 0; first < plan.needs.size(); first += per_query) {
+		const idx_t last = MinValue<idx_t>(plan.needs.size(), first + per_query);
+		string aggs;
+		for (idx_t n = first; n < last; n++) {
+			aggs += " " + NeedText(plan.needs[n], "n" + to_string(n));
+		}
+		const string text = "(query (group_by " + to_string(span) + " \"key\" " + key + ") (aggregate" + aggs + "))";
+		QueryResultHolder result;
+		if (am_query(columns.data(), name_ptrs.data(), int64_t(columns.size()), text.c_str(), &result.ptr) != 0) {
+			Fail("running the fused group-by");
+		}
+		// Column 0 is the key slot index, then one column per need in order.
+		for (idx_t n = first; n < last; n++) {
+			Handle column;
+			if (am_query_column(result.ptr, int64_t(n - first + 1), &column.ptr) != 0) {
+				Fail("reading a grouped aggregate");
+			}
+			ReadColumn(column.ptr, host[n]);
+		}
+	}
+	auto &rows = host[0]; // Need::ROWS is always slot 0
+	idx_t present = 0;
+	for (int64_t k = 0; k < span; k++) {
+		present += rows.values[k] > 0;
+	}
+	groups.key.format = KindFormat(key_kind);
+	groups.key.values.reserve(present + 1);
+	groups.key.valid.reserve(present + 1);
+	for (idx_t n = 0; n < plan.needs.size(); n++) {
+		groups.slot[n].reserve(present + 1);
+		groups.slot_valid[n].reserve(present + 1);
+		groups.slot_unsigned[n] = !SignedResultFormat(host[n].format);
+	}
+	for (int64_t k = 0; k < span; k++) {
+		if (rows.values[k] <= 0) {
+			continue;
+		}
+		groups.key.values.push_back(key_min + k);
+		groups.key.valid.push_back(true);
+		for (idx_t n = 0; n < plan.needs.size(); n++) {
+			groups.slot[n].push_back(host[n].values[k]);
+			groups.slot_valid[n].push_back(host[n].valid[k]);
+		}
+		groups.count++;
+	}
+	if (key_nulls > 0) {
+		// Rows whose key is NULL form one more group, as in SQL.
+		const string null_text = "(query (filter (is_null (col \"c0\"))) (aggregate" + AggregateList(plan) + "))";
+		const idx_t before = groups.count;
+		auto unsigned_flags = groups.slot_unsigned;
+		RunScalarQuery(columns, null_text, plan, groups);
+		groups.slot_unsigned = unsigned_flags; // keep the grouped columns' signedness
+		groups.key.values.push_back(0);
+		groups.key.valid.push_back(false);
+		(void)before;
+	}
+}
+
+// The hash group-by: am_group_by_keys, then one am_group_agg_ex per need.
+static void RunHash(vector<am_array *> &columns, const Plan &plan, Groups &groups) {
+	am_groupby *gb = nullptr;
+	am_array *key_columns[1] = {columns[0]};
+	if (am_group_by_keys(key_columns, 1, &gb) != 0) {
+		Fail("grouping the key column");
+	}
+	struct GroupByHolder {
+		am_groupby *ptr;
+		~GroupByHolder() {
+			am_group_by_release(ptr);
+		}
+	} holder {gb};
+	{
+		Handle keys;
+		if (am_group_by_keys_result(gb, 0, &keys.ptr) != 0) {
+			Fail("reading the group keys");
+		}
+		ReadColumn(keys.ptr, groups.key);
+	}
+	groups.count = groups.key.valid.size();
+
+	// The 32-bit halves of any column that must be summed in two parts, computed once per column.
+	vector<std::pair<idx_t, std::pair<unique_ptr<Handle>, unique_ptr<Handle>>>> halves;
+	auto half = [&](idx_t input, bool high) -> am_array * {
+		for (auto &h : halves) {
+			if (h.first == input) {
+				return high ? h.second.first->ptr : h.second.second->ptr;
+			}
+		}
+		vector<string> names;
+		vector<const char *> name_ptrs;
+		for (idx_t i = 0; i < columns.size(); i++) {
+			names.push_back(ColName(i));
+		}
+		for (auto &n : names) {
+			name_ptrs.push_back(n.c_str());
+		}
+		const string col = "(col \"" + ColName(input) + "\")";
+		const string text = "(query (project (as \"h\" (shr " + col + " (i64 32))) (as \"l\" (bit_and " + col +
+		                    " (i64 4294967295)))))";
+		QueryResultHolder result;
+		if (am_query(columns.data(), name_ptrs.data(), int64_t(columns.size()), text.c_str(), &result.ptr) != 0) {
+			Fail("splitting a column into 32-bit halves");
+		}
+		auto hi = make_uniq<Handle>();
+		auto lo = make_uniq<Handle>();
+		if (am_query_column(result.ptr, 0, &hi->ptr) != 0 || am_query_column(result.ptr, 1, &lo->ptr) != 0) {
+			Fail("reading the 32-bit halves");
+		}
+		halves.emplace_back(input, std::make_pair(std::move(hi), std::move(lo)));
+		auto &h = halves.back();
+		return high ? h.second.first->ptr : h.second.second->ptr;
+	};
+
+	for (idx_t n = 0; n < plan.needs.size(); n++) {
+		const auto &need = plan.needs[n];
+		HostColumn host;
+		if (need.need == Need::COUNT && need.input == 0 && columns[0] && groups.key.format.size() &&
+		    (groups.key.format == "u" || groups.key.format == "U")) {
+			// COUNT of the string key itself: every row of a group shares its key, so the count is the
+			// group's row count, or 0 for the NULL-key group. (ArrowMetal has no grouped count over utf8.)
+			Handle rows;
+			if (am_group_agg_ex(gb, nullptr, 1, 0.0, &rows.ptr) != 0) {
+				Fail("counting rows per group");
+			}
+			ReadColumn(rows.ptr, host);
+			for (idx_t g = 0; g < groups.count; g++) {
+				if (!groups.key.valid[g]) {
+					host.values[g] = 0;
+				}
+			}
+		} else {
+			Handle out;
+			int rc = 0;
+			switch (need.need) {
+			case Need::ROWS: rc = am_group_agg_ex(gb, nullptr, 1, 0.0, &out.ptr); break;
+			case Need::COUNT: rc = am_group_agg_ex(gb, columns[need.input], 2, 0.0, &out.ptr); break;
+			case Need::SUM: rc = am_group_agg_ex(gb, columns[need.input], 0, 0.0, &out.ptr); break;
+			case Need::SUM_HI: rc = am_group_agg_ex(gb, half(need.input, true), 0, 0.0, &out.ptr); break;
+			case Need::SUM_LO: rc = am_group_agg_ex(gb, half(need.input, false), 0, 0.0, &out.ptr); break;
+			case Need::MIN: rc = am_group_agg_ex(gb, columns[need.input], 4, 0.0, &out.ptr); break;
+			case Need::MAX: rc = am_group_agg_ex(gb, columns[need.input], 5, 0.0, &out.ptr); break;
+			}
+			if (rc != 0) {
+				Fail("running a grouped aggregate");
+			}
+			ReadColumn(out.ptr, host);
+		}
+		groups.slot[n] = std::move(host.values);
+		groups.slot_valid[n] = std::move(host.valid);
+		groups.slot_unsigned[n] = !SignedResultFormat(host.format);
+	}
+}
+
+//===--------------------------------------------------------------------===//
+// Finishing each SQL aggregate from its slots, with DuckDB's own arithmetic
+//===--------------------------------------------------------------------===//
+static hugeint_t ToHuge(__int128 v) {
+	return hugeint_t(static_cast<int64_t>(v >> 64), static_cast<uint64_t>(v));
+}
+
+static __int128 SlotSum(const Groups &groups, idx_t slot, idx_t g) {
+	return groups.slot_unsigned[slot] ? __int128(static_cast<uint64_t>(groups.slot[slot][g]))
+	                                  : __int128(groups.slot[slot][g]);
+}
+
+static void WriteResult(const Spec &spec, const vector<AggSlots> &slots, const Groups &groups,
+                        ColumnDataCollection &collection) {
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), spec.result_types);
+	const idx_t total = groups.count;
+	for (idx_t start = 0; start < total; start += STANDARD_VECTOR_SIZE) {
+		const idx_t n = MinValue<idx_t>(STANDARD_VECTOR_SIZE, total - start);
+		chunk.Reset();
+		idx_t col = 0;
+		if (spec.has_key) {
+			auto &vec = chunk.data[col++];
+			auto &validity = FlatVector::Validity(vec);
+			const auto &type = spec.result_types[0];
+			for (idx_t i = 0; i < n; i++) {
+				const idx_t g = start + i;
+				if (!groups.key.valid[g]) {
+					validity.SetInvalid(i);
+					continue;
+				}
+				const int64_t v = groups.key.values.empty() ? 0 : groups.key.values[g];
+				switch (type.InternalType()) {
+				case PhysicalType::INT8: FlatVector::GetData<int8_t>(vec)[i] = int8_t(v); break;
+				case PhysicalType::INT16: FlatVector::GetData<int16_t>(vec)[i] = int16_t(v); break;
+				case PhysicalType::INT32: FlatVector::GetData<int32_t>(vec)[i] = int32_t(v); break;
+				case PhysicalType::INT64: FlatVector::GetData<int64_t>(vec)[i] = v; break;
+				case PhysicalType::UINT8: FlatVector::GetData<uint8_t>(vec)[i] = uint8_t(v); break;
+				case PhysicalType::UINT16: FlatVector::GetData<uint16_t>(vec)[i] = uint16_t(v); break;
+				case PhysicalType::UINT32: FlatVector::GetData<uint32_t>(vec)[i] = uint32_t(v); break;
+				case PhysicalType::UINT64: FlatVector::GetData<uint64_t>(vec)[i] = uint64_t(v); break;
+				case PhysicalType::VARCHAR:
+					FlatVector::GetData<string_t>(vec)[i] = StringVector::AddString(vec, groups.key.strings[g]);
+					break;
+				default:
+					throw InternalException("arrowmetal_rewrite: unexpected key type");
+				}
+			}
+		}
+		for (idx_t a = 0; a < spec.aggs.size(); a++) {
+			auto &agg = spec.aggs[a];
+			auto &s = slots[a];
+			auto &vec = chunk.data[col++];
+			auto &validity = FlatVector::Validity(vec);
+			for (idx_t i = 0; i < n; i++) {
+				const idx_t g = start + i;
+				const int64_t rows = groups.slot[0][g];
+				if (agg.op == AggOp::COUNT_STAR) {
+					FlatVector::GetData<int64_t>(vec)[i] = rows;
+					continue;
+				}
+				const int64_t valid = groups.slot[s.count][g];
+				if (agg.op == AggOp::COUNT) {
+					FlatVector::GetData<int64_t>(vec)[i] = valid;
+					continue;
+				}
+				if (valid == 0) {
+					validity.SetInvalid(i);
+					continue;
+				}
+				if (agg.op == AggOp::SUM || agg.op == AggOp::AVG) {
+					__int128 total_sum;
+					if (s.sum != DConstants::INVALID_INDEX) {
+						total_sum = SlotSum(groups, s.sum, g);
+					} else {
+						total_sum = SlotSum(groups, s.hi, g) * (__int128(1) << 32) + SlotSum(groups, s.lo, g);
+					}
+					if (agg.op == AggOp::SUM) {
+						if (agg.return_type.InternalType() == PhysicalType::INT128) {
+							FlatVector::GetData<hugeint_t>(vec)[i] = ToHuge(total_sum);
+						} else {
+							FlatVector::GetData<int64_t>(vec)[i] = int64_t(total_sum);
+						}
+					} else if (agg.semantic_bits == 16) {
+						// IntegerAverageOperation: an int64 state, double(sum) / double(count)
+						FlatVector::GetData<double>(vec)[i] = double(int64_t(total_sum)) / double(uint64_t(valid));
+					} else {
+						// IntegerAverageOperationHugeint: Hugeint::Cast<long double>(sum) / (long double)count
+						long double numerator = 0;
+						Hugeint::TryCast<long double>(ToHuge(total_sum), numerator);
+						const long double divident = static_cast<long double>(uint64_t(valid));
+						FlatVector::GetData<double>(vec)[i] = static_cast<double>(numerator / divident);
+					}
+					continue;
+				}
+				// MIN / MAX: the value in the aggregate's own type.
+				const int64_t v = groups.slot[s.extreme][g];
+				switch (agg.return_type.InternalType()) {
+				case PhysicalType::INT8: FlatVector::GetData<int8_t>(vec)[i] = int8_t(v); break;
+				case PhysicalType::INT16: FlatVector::GetData<int16_t>(vec)[i] = int16_t(v); break;
+				case PhysicalType::INT32: FlatVector::GetData<int32_t>(vec)[i] = int32_t(v); break;
+				case PhysicalType::INT64: FlatVector::GetData<int64_t>(vec)[i] = v; break;
+				case PhysicalType::UINT8: FlatVector::GetData<uint8_t>(vec)[i] = uint8_t(v); break;
+				case PhysicalType::UINT16: FlatVector::GetData<uint16_t>(vec)[i] = uint16_t(v); break;
+				case PhysicalType::UINT32: FlatVector::GetData<uint32_t>(vec)[i] = uint32_t(v); break;
+				case PhysicalType::UINT64: FlatVector::GetData<uint64_t>(vec)[i] = uint64_t(v); break;
+				default:
+					throw InternalException("arrowmetal_rewrite: unexpected MIN/MAX type");
+				}
+			}
+		}
+		chunk.SetCardinality(n);
+		collection.Append(chunk);
+	}
+}
+
+// ARROWMETAL_REWRITE_TRACE=1 prints the time since `start` at each Finalize step to stderr.
+static void Trace(const char *step, std::chrono::steady_clock::time_point start) {
+	static const bool enabled = getenv("ARROWMETAL_REWRITE_TRACE") != nullptr;
+	if (enabled) {
+		fprintf(stderr, "arrowmetal_rewrite: %-8s %8.3f ms\n", step,
+		        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+	}
+}
+
+// The rare path: some chunks did not fit the regions. Moves everything into regions large enough for
+// all of it - the rows already gathered, then the overflow chunks - so the GPU still sees one array per
+// column.
+static void AppendOverflow(RewriteGlobalState &gstate) {
+	auto &overflow = *gstate.overflow;
+	const idx_t kept = gstate.RegionRows();
+	const idx_t total = kept + overflow.Count();
+	size_t extra_bytes = 0;
+	if (gstate.has_strings) {
+		for (auto &chunk : overflow.Chunks()) {
+			UnifiedVectorFormat format;
+			chunk.data[0].ToUnifiedFormat(chunk.size(), format);
+			auto strings = UnifiedVectorFormat::GetData<string_t>(format);
+			for (idx_t i = 0; i < chunk.size(); i++) {
+				const idx_t index = format.sel->get_index(i);
+				if (format.validity.RowIsValid(index)) {
+					extra_bytes += strings[index].GetSize();
+				}
+			}
+		}
+	}
+	vector<unique_ptr<ColumnStore>> grown;
+	for (auto &old : gstate.columns) {
+		auto column = make_uniq<ColumnStore>();
+		column->kind = old->kind;
+		column->width = old->width;
+		column->Allocate(total, old->bytes_used + extra_bytes + 1);
+		std::memcpy(column->validity, old->validity, ((kept + 63) / 64) * 8);
+		if (column->kind == Kind::STR) {
+			std::memcpy(column->offsets_ptr, old->offsets_ptr, kept * sizeof(int64_t));
+			std::memcpy(column->values, old->values, old->bytes_used);
+			column->bytes_used = old->bytes_used;
+		} else {
+			std::memcpy(column->values, old->values, kept * column->width);
+		}
+		column->nulls.store(old->nulls.load());
+		grown.push_back(std::move(column));
+	}
+	// Bits past `kept` in the last copied word belong to rows that were never written; set them valid.
+	for (auto &column : grown) {
+		auto *bitmap = column->validity;
+		if (kept % 64) {
+			bitmap[kept / 64] |= ~((uint64_t(1) << (kept % 64)) - 1);
+		}
+	}
+	idx_t row = kept;
+	for (auto &chunk : overflow.Chunks()) {
+		const idx_t count = chunk.size();
+		for (idx_t c = 0; c < grown.size(); c++) {
+			UnifiedVectorFormat format;
+			chunk.data[c].ToUnifiedFormat(count, format);
+			size_t byte0 = grown[c]->bytes_used;
+			if (grown[c]->kind == Kind::STR) {
+				auto strings = UnifiedVectorFormat::GetData<string_t>(format);
+				for (idx_t i = 0; i < count; i++) {
+					const idx_t index = format.sel->get_index(i);
+					if (format.validity.RowIsValid(index)) {
+						grown[c]->bytes_used += strings[index].GetSize();
+					}
+				}
+			}
+			PhysicalArrowMetalAggregate::CopyColumn(*grown[c], format, count, row, byte0);
+		}
+		row += count;
+	}
+	gstate.columns = std::move(grown);
+	gstate.capacity = total;
+	gstate.reserved.store(total);
+	gstate.hole_start.store(DConstants::INVALID_INDEX);
+	gstate.locked_rows = total;
+	gstate.overflow.reset();
+}
+
+SinkFinalizeType PhysicalArrowMetalAggregate::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+                                                       OperatorSinkFinalizeInput &input) const {
+	auto &gstate = input.global_state.Cast<RewriteGlobalState>();
+	const auto started = std::chrono::steady_clock::now();
+	const idx_t overflowed = gstate.overflow ? gstate.overflow->Count() : 0;
+	if (overflowed > 0) {
+		AppendOverflow(gstate);
+	}
+	const idx_t rows = gstate.RegionRows();
+	if (int64_t(rows) > MAX_ROWS) {
+		throw InvalidInputException("arrowmetal_rewrite: %llu rows reached the aggregate, more than the GPU path "
+		                            "takes (2^31 - 1); SET arrowmetal_rewrite = 'off' for this query",
+		                            (unsigned long long)rows);
+	}
+
+	Plan plan;
+	vector<bool> nullable;
+	for (auto &column : gstate.columns) {
+		nullable.push_back(column->nulls.load() > 0);
+	}
+	auto slots = PlanNeeds(spec, nullable, plan);
+	Groups groups;
+	groups.slot.resize(plan.needs.size());
+	groups.slot_valid.resize(plan.needs.size());
+	groups.slot_unsigned.assign(plan.needs.size(), false);
+	string path;
+
+	if (rows == 0) {
+		// No input: an ungrouped aggregate still answers one row (counts 0, everything else NULL), a
+		// grouped one answers none.
+		path = "empty";
+		if (!spec.has_key) {
+			groups.count = 1;
+			for (idx_t n = 0; n < plan.needs.size(); n++) {
+				groups.slot[n].assign(1, 0);
+				groups.slot_valid[n].assign(1, false);
+			}
+		}
+	} else {
+		std::lock_guard<std::mutex> gpu(g_gpu_lock);
+		vector<am_array *> columns;
+		struct Releaser {
+			vector<am_array *> &c;
+			~Releaser() {
+				for (auto h : c) {
+					if (h) {
+						am_release(h);
+					}
+				}
+			}
+		} releaser {columns};
+		for (auto &column : gstate.columns) {
+			columns.push_back(ImportColumn(*column, rows));
+		}
+		Trace("import", started);
+		if (!spec.has_key) {
+			path = "fused aggregate";
+			RunScalarQuery(columns, "(query (aggregate" + AggregateList(plan) + "))", plan, groups);
+		} else {
+			const Kind key_kind = spec.input_kinds[0];
+			// The span in unsigned arithmetic: key_max - key_min can exceed INT64_MAX.
+			const uint64_t span = uint64_t(gstate.key_max) - uint64_t(gstate.key_min);
+			bool dense = key_kind != Kind::STR && key_kind != Kind::U64 && gstate.key_seen &&
+			             span < uint64_t(DENSE_KEY_SPAN);
+			// The fused group-by keeps MIN and MAX in 32-bit atomics.
+			for (auto &need : plan.needs) {
+				if ((need.need == Need::MIN || need.need == Need::MAX) && KindWidth(spec.input_kinds[need.input]) > 4) {
+					dense = false;
+				}
+			}
+			if (dense) {
+				path = "fused dense group-by";
+				RunDense(columns, plan, gstate.key_min, gstate.key_max - gstate.key_min + 1,
+				         gstate.columns[0]->nulls.load(), key_kind, groups);
+			} else if (!gstate.key_seen && key_kind != Kind::STR && key_kind != Kind::U64) {
+				// Every key is NULL: one group.
+				path = "fused aggregate (all keys NULL)";
+				RunScalarQuery(columns, "(query (aggregate" + AggregateList(plan) + "))", plan, groups);
+				groups.key.values.assign(1, 0);
+				groups.key.valid.assign(1, false);
+			} else {
+				path = "hash group-by";
+				RunHash(columns, plan, groups);
+			}
+		}
+	}
+	Trace("gpu", started);
+	if (overflowed > 0) {
+		path += " (" + to_string(overflowed) + " rows past the reserved buffers)";
+	}
+	WriteResult(spec, slots, groups, gstate.result);
+	Trace("write", started);
+	gstate.groups = int64_t(groups.count);
+	const double ms =
+	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+	RecordRun(spec.decision_id, path, int64_t(rows), int64_t(groups.count), ms);
+	// The gathered columns are no longer needed; free them before the result is scanned.
+	gstate.columns.clear();
+	return SinkFinalizeType::READY;
+}
+
+//===--------------------------------------------------------------------===//
+// The logical operator that stands in for the LogicalAggregate
+//===--------------------------------------------------------------------===//
+class LogicalArrowMetalAggregate : public LogicalExtensionOperator {
+public:
+	LogicalArrowMetalAggregate(Spec spec_p, idx_t group_index_p, idx_t aggregate_index_p, idx_t capacity_rows_p)
+	    : spec(std::move(spec_p)), group_index(group_index_p), aggregate_index(aggregate_index_p),
+	      capacity_rows(capacity_rows_p) {
+	}
+
+	Spec spec;
+	idx_t group_index;
+	idx_t aggregate_index;
+	idx_t capacity_rows;
+
+	vector<ColumnBinding> GetColumnBindings() override {
+		vector<ColumnBinding> result;
+		if (spec.has_key) {
+			result.emplace_back(group_index, 0);
+		}
+		for (idx_t i = 0; i < spec.aggs.size(); i++) {
+			result.emplace_back(aggregate_index, i);
+		}
+		return result;
+	}
+
+	vector<idx_t> GetTableIndex() const override {
+		return {group_index, aggregate_index};
+	}
+
+	string GetName() const override {
+		return "ARROWMETAL_AGGREGATE";
+	}
+
+	InsertionOrderPreservingMap<string> ParamsToString() const override {
+		InsertionOrderPreservingMap<string> result;
+		string aggs;
+		for (idx_t i = 0; i < spec.aggs.size(); i++) {
+			aggs += (i ? "\n" : "") + spec.aggs[i].name;
+		}
+		result["Aggregates"] = aggs;
+		SetParamsEstimatedCardinality(result);
+		return result;
+	}
+
+	string GetExtensionName() const override {
+		return "arrowmetal_rewrite";
+	}
+
+	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
+		auto &child = planner.CreatePlan(*children[0]);
+		// After column binding resolution each expression is a reference into the child's chunk.
+		vector<idx_t> child_columns;
+		for (auto &expr : expressions) {
+			if (expr->GetExpressionClass() != ExpressionClass::BOUND_REF) {
+				throw InternalException("arrowmetal_rewrite: expected a column reference");
+			}
+			child_columns.push_back(expr->Cast<BoundReferenceExpression>().index);
+		}
+		auto &op = planner.Make<PhysicalArrowMetalAggregate>(spec, std::move(child_columns), capacity_rows,
+		                                                     estimated_cardinality);
+		op.children.push_back(child);
+		return op;
+	}
+
+protected:
+	void ResolveTypes() override {
+		types = spec.result_types;
+	}
+};
+
+//===--------------------------------------------------------------------===//
+// The optimizer: find eligible aggregates and swap them
+//===--------------------------------------------------------------------===//
+struct Candidate {
+	string reason; // empty when eligible
+	Spec spec;
+	vector<unique_ptr<Expression>> inputs; // column references, in gathered order
+	int64_t threshold = 0;
+	int64_t input_rows = -1;
+	string shape;
+};
+
+// Finds (or adds) the gathered input for a column binding; returns its index.
+static idx_t InputFor(Candidate &c, BoundColumnRefExpression &ref, Kind kind, const LogicalType &type) {
+	for (idx_t i = 0; i < c.inputs.size(); i++) {
+		auto &existing = c.inputs[i]->Cast<BoundColumnRefExpression>();
+		if (existing.binding == ref.binding) {
+			return i;
+		}
+	}
+	c.inputs.push_back(ref.Copy());
+	c.spec.input_types.push_back(type);
+	c.spec.input_kinds.push_back(kind);
+	return c.inputs.size() - 1;
+}
+
+static int64_t CrossoverFor(AggOp op, bool grouped, bool string_key, bool many_groups) {
+	if (grouped) {
+		if (string_key) {
+			return Crossovers::GROUP_UTF8;
+		}
+		return many_groups ? Crossovers::GROUP_100K : Crossovers::GROUP_1K;
+	}
+	switch (op) {
+	case AggOp::SUM: return Crossovers::SUM;
+	case AggOp::MIN: return Crossovers::MIN;
+	case AggOp::MAX: return Crossovers::MAX;
+	case AggOp::AVG: return Crossovers::MEAN;
+	default: return 0; // a count needs no kernel
+	}
+}
+
+static void Analyse(ClientContext &context, LogicalAggregate &aggr, Candidate &c) {
+	auto &spec = c.spec;
+	if (!aggr.grouping_functions.empty() || aggr.grouping_sets.size() > 1) {
+		c.reason = "GROUPING SETS / ROLLUP / CUBE";
+		return;
+	}
+	if (aggr.groups.size() > 1) {
+		c.reason = "more than one GROUP BY column";
+		return;
+	}
+	if (aggr.children.size() != 1) {
+		c.reason = "unexpected plan shape";
+		return;
+	}
+
+	// The key.
+	bool string_key = false;
+	if (aggr.groups.size() == 1) {
+		auto &group = *aggr.groups[0];
+		if (group.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			c.reason = "GROUP BY an expression rather than a column";
+			return;
+		}
+		Kind kind;
+		if (group.return_type.id() == LogicalTypeId::VARCHAR) {
+			kind = Kind::STR;
+			string_key = true;
+		} else if (!NumericKind(group.return_type, kind)) {
+			c.reason = "GROUP BY column of type " + group.return_type.ToString();
+			return;
+		}
+		spec.has_key = true;
+		InputFor(c, group.Cast<BoundColumnRefExpression>(), kind, group.return_type);
+		spec.result_types.push_back(group.return_type);
+		c.shape = "GROUP BY " + group.return_type.ToString() + ": ";
+	}
+
+	// The aggregates.
+	bool any_kernel = false;
+	for (auto &expr : aggr.expressions) {
+		if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+			c.reason = "non-aggregate expression";
+			return;
+		}
+		auto &bound = expr->Cast<BoundAggregateExpression>();
+		const string &fname = bound.function.name;
+		if (bound.IsDistinct() || bound.filter || bound.order_bys) {
+			c.reason = fname + " with DISTINCT, FILTER or ORDER BY";
+			return;
+		}
+		AggSpec agg;
+		agg.return_type = bound.return_type;
+		agg.name = bound.GetName();
+		if (fname == "count_star") {
+			agg.op = AggOp::COUNT_STAR;
+		} else if (fname == "count") {
+			agg.op = AggOp::COUNT;
+		} else if (fname == "sum" || fname == "sum_no_overflow") {
+			agg.op = AggOp::SUM;
+			agg.proven_no_overflow = fname == "sum_no_overflow";
+		} else if (fname == "min") {
+			agg.op = AggOp::MIN;
+		} else if (fname == "max") {
+			agg.op = AggOp::MAX;
+		} else if (fname == "avg") {
+			agg.op = AggOp::AVG;
+		} else {
+			c.reason = "aggregate " + fname;
+			return;
+		}
+		if (agg.op != AggOp::COUNT_STAR) {
+			if (bound.children.size() != 1) {
+				c.reason = "aggregate " + fname + " with " + to_string(bound.children.size()) + " arguments";
+				return;
+			}
+			if (bound.bind_info) {
+				c.reason = "aggregate " + fname + " with bind data (DECIMAL)";
+				return;
+			}
+			// The argument: a column, possibly under a cast that keeps every value.
+			Expression *arg = bound.children[0].get();
+			const LogicalType semantic = arg->return_type;
+			if (arg->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
+				auto &cast = arg->Cast<BoundCastExpression>();
+				if (cast.try_cast || !ValuePreservingCast(cast.child->return_type, cast.return_type)) {
+					c.reason = fname + " over a cast " + cast.child->return_type.ToString() + " -> " +
+					           cast.return_type.ToString();
+					return;
+				}
+				arg = cast.child.get();
+			}
+			if (arg->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+				c.reason = fname + " over an expression rather than a column";
+				return;
+			}
+			Kind kind;
+			const LogicalType &source = arg->return_type;
+			if (!NumericKind(source, kind)) {
+				c.reason = fname + " over " + source.ToString();
+				return;
+			}
+			if ((agg.op == AggOp::SUM || agg.op == AggOp::AVG) && IsTemporal(source)) {
+				c.reason = fname + " over " + source.ToString();
+				return;
+			}
+			if (agg.op == AggOp::SUM || agg.op == AggOp::AVG) {
+				switch (semantic.InternalType()) {
+				case PhysicalType::INT16: agg.semantic_bits = 16; break;
+				case PhysicalType::INT32: agg.semantic_bits = 32; break;
+				case PhysicalType::INT64: agg.semantic_bits = 64; break;
+				default:
+					c.reason = fname + " at " + semantic.ToString();
+					return;
+				}
+				const auto rt = agg.return_type.InternalType();
+				if ((agg.op == AggOp::SUM && rt != PhysicalType::INT128 && rt != PhysicalType::INT64) ||
+				    (agg.op == AggOp::AVG && rt != PhysicalType::DOUBLE)) {
+					c.reason = fname + " returning " + agg.return_type.ToString();
+					return;
+				}
+			}
+			if ((agg.op == AggOp::MIN || agg.op == AggOp::MAX) && agg.return_type != source &&
+			    agg.return_type != semantic) {
+				c.reason = fname + " returning " + agg.return_type.ToString();
+				return;
+			}
+			if (agg.op == AggOp::COUNT && agg.return_type.id() != LogicalTypeId::BIGINT) {
+				c.reason = "count returning " + agg.return_type.ToString();
+				return;
+			}
+			agg.input = InputFor(c, arg->Cast<BoundColumnRefExpression>(), kind, source);
+		}
+		if (agg.op != AggOp::COUNT && agg.op != AggOp::COUNT_STAR) {
+			any_kernel = true;
+		}
+		c.shape += (c.shape.empty() || c.shape.back() == ' ' ? "" : ", ") + agg.name;
+		spec.aggs.push_back(agg);
+		spec.result_types.push_back(agg.return_type);
+	}
+	if (!spec.has_key && !any_kernel) {
+		c.reason = "only counts, which need no kernel";
+		return;
+	}
+	if (spec.has_key && spec.input_kinds[0] == Kind::STR) {
+		for (auto &agg : spec.aggs) {
+			if (agg.input == 0 && agg.op != AggOp::COUNT) {
+				c.reason = agg.name + " over the VARCHAR key";
+				return;
+			}
+		}
+	}
+
+	// The input: projections and filters over one table function whose size DuckDB knows.
+	LogicalOperator *node = aggr.children[0].get();
+	while (node->type == LogicalOperatorType::LOGICAL_PROJECTION ||
+	       node->type == LogicalOperatorType::LOGICAL_FILTER) {
+		if (node->children.size() != 1) {
+			c.reason = "unexpected plan shape";
+			return;
+		}
+		node = node->children[0].get();
+	}
+	if (node->type != LogicalOperatorType::LOGICAL_GET) {
+		c.reason = "input is a " + LogicalOperatorToString(node->type) + ", not a table scan";
+		return;
+	}
+	auto &get = node->Cast<LogicalGet>();
+	if (!get.function.cardinality) {
+		c.reason = "the source " + get.function.name + " does not report its size";
+		return;
+	}
+	auto stats = get.function.cardinality(context, get.bind_data.get());
+	if (!stats || !stats->has_estimated_cardinality) {
+		c.reason = "the source " + get.function.name + " does not report its size";
+		return;
+	}
+	auto &child = *aggr.children[0];
+	int64_t rows = child.has_estimated_cardinality ? int64_t(child.estimated_cardinality)
+	                                               : int64_t(child.EstimateCardinality(context));
+	c.input_rows = rows;
+	c.shape = get.function.name + " -> " + c.shape;
+	if (rows > MAX_ROWS || int64_t(stats->estimated_cardinality) > MAX_ROWS) {
+		c.reason = "more rows than the GPU path takes (2^31 - 1)";
+		return;
+	}
+
+	const idx_t groups_estimate =
+	    aggr.has_estimated_cardinality ? aggr.estimated_cardinality : aggr.EstimateCardinality(context);
+	const bool many_groups = spec.has_key && groups_estimate >= 100000;
+	int64_t threshold = 0;
+	for (auto &agg : spec.aggs) {
+		threshold = MaxValue<int64_t>(threshold, CrossoverFor(agg.op, spec.has_key, string_key, many_groups));
+	}
+	c.threshold = threshold;
+}
+
+static void VisitPlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &op, Mode mode) {
+	for (auto &child : op->children) {
+		VisitPlan(input, child, mode);
+	}
+	if (op->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		return;
+	}
+	auto &aggr = op->Cast<LogicalAggregate>();
+	Candidate c;
+	Analyse(input.context, aggr, c);
+	Decision d;
+	d.shape = c.shape;
+	d.input_rows = c.input_rows;
+	d.threshold_rows = c.threshold;
+	if (c.reason.empty() && mode == Mode::AUTO && c.input_rows < c.threshold) {
+		c.reason = "below the crossover";
+	}
+	if (!c.reason.empty()) {
+		d.decision = "kept";
+		d.reason = c.reason;
+		Record(d);
+		return;
+	}
+	d.decision = "rewritten";
+	d.reason = mode == Mode::FORCE ? "forced" : "at or above the crossover";
+	c.spec.decision_id = Record(d);
+
+	// Capacity: the most rows the source can hand over, so the sink rarely has to grow.
+	idx_t capacity = 0;
+	{
+		LogicalOperator *node = aggr.children[0].get();
+		while (!node->children.empty()) {
+			node = node->children[0].get();
+		}
+		auto &get = node->Cast<LogicalGet>();
+		auto stats = get.function.cardinality(input.context, get.bind_data.get());
+		capacity = stats->has_max_cardinality ? stats->max_cardinality : stats->estimated_cardinality;
+	}
+	auto replacement =
+	    make_uniq<LogicalArrowMetalAggregate>(std::move(c.spec), aggr.group_index, aggr.aggregate_index, capacity);
+	replacement->expressions = std::move(c.inputs);
+	replacement->children = std::move(aggr.children);
+	replacement->has_estimated_cardinality = aggr.has_estimated_cardinality;
+	replacement->estimated_cardinality = aggr.estimated_cardinality;
+	replacement->ResolveOperatorTypes();
+	op = std::move(replacement);
+}
+
+static void Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	const Mode mode = GetMode(input.context);
+	if (mode == Mode::OFF) {
+		return;
+	}
+	VisitPlan(input, plan, mode);
+}
+
+//===--------------------------------------------------------------------===//
+// arrowmetal_rewrites(): the decision log
+//===--------------------------------------------------------------------===//
+struct LogState : public GlobalTableFunctionState {
+	vector<Decision> rows;
+	idx_t offset = 0;
+};
+
+static unique_ptr<FunctionData> LogBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &types,
+                                        vector<string> &names) {
+	names = {"id", "decision", "reason", "shape", "input_rows", "threshold_rows",
+	         "path", "rows_seen", "groups", "gpu_ms"};
+	types = {LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	         LogicalType::BIGINT, LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::BIGINT,
+	         LogicalType::BIGINT, LogicalType::DOUBLE};
+	return make_uniq<TableFunctionData>();
+}
+
+static unique_ptr<GlobalTableFunctionState> LogInit(ClientContext &, TableFunctionInitInput &) {
+	auto state = make_uniq<LogState>();
+	std::lock_guard<std::mutex> guard(g_log_lock);
+	state->rows.assign(g_log.begin(), g_log.end());
+	return std::move(state);
+}
+
+static void LogScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<LogState>();
+	idx_t n = 0;
+	while (state.offset < state.rows.size() && n < STANDARD_VECTOR_SIZE) {
+		auto &d = state.rows[state.offset++];
+		output.SetValue(0, n, Value::BIGINT(d.id));
+		output.SetValue(1, n, Value(d.decision));
+		output.SetValue(2, n, Value(d.reason));
+		output.SetValue(3, n, Value(d.shape));
+		output.SetValue(4, n, d.input_rows < 0 ? Value(LogicalType::BIGINT) : Value::BIGINT(d.input_rows));
+		output.SetValue(5, n, d.threshold_rows < 0 ? Value(LogicalType::BIGINT) : Value::BIGINT(d.threshold_rows));
+		output.SetValue(6, n, d.path.empty() ? Value(LogicalType::VARCHAR) : Value(d.path));
+		output.SetValue(7, n, d.rows_seen < 0 ? Value(LogicalType::BIGINT) : Value::BIGINT(d.rows_seen));
+		output.SetValue(8, n, d.groups < 0 ? Value(LogicalType::BIGINT) : Value::BIGINT(d.groups));
+		output.SetValue(9, n, d.gpu_ms < 0 ? Value(LogicalType::DOUBLE) : Value::DOUBLE(d.gpu_ms));
+		n++;
+	}
+	output.SetCardinality(n);
+}
+
+static void Load(ExtensionLoader &loader) {
+	auto &db = loader.GetDatabaseInstance();
+	auto &config = DBConfig::GetConfig(db);
+	config.AddExtensionOption("arrowmetal_rewrite",
+	                          "ArrowMetal aggregate rewrite: 'auto' (at or above the crossover), 'off', or 'force'",
+	                          LogicalType::VARCHAR, Value("auto"));
+	OptimizerExtension extension;
+	extension.optimize_function = Optimize;
+	OptimizerExtension::Register(config, extension);
+
+	TableFunction log("arrowmetal_rewrites", {}, LogScan, LogBind, LogInit);
+	loader.RegisterFunction(log);
+	loader.SetDescription("ArrowMetal: runs eligible aggregates on the Metal GPU");
+}
+
+} // namespace arrowmetal_rewrite
+} // namespace duckdb
+
+extern "C" {
+DUCKDB_CPP_EXTENSION_ENTRY(arrowmetal_rewrite, loader) {
+	duckdb::arrowmetal_rewrite::Load(loader);
+}
+}
