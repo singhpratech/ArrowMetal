@@ -7,6 +7,14 @@ This is the only roadmap: the older `../ROADMAP.md` now points here.
 
 ## Kernels
 
+- **Delta Lake and Iceberg read speed.** The table readers are correct but slow: on the 2026-09-24 run
+  every CPU reader measured is ahead on every read, by the widest margin on a full Delta read
+  (`Benchmarks/results/lakehouse_2026-09-24.csv`, [LAKEHOUSE.md](LAKEHOUSE.md)). The metadata walk and
+  the per-file Parquet reads are the places to look first.
+- **IPC view layouts and nested Parquet reads.** pyarrow is ahead on every IPC view layout
+  (`Benchmarks/results/ipc_views_2026-09-24.csv`), and plain lists, small lists of structs and the
+  all-columns read are behind the fastest CPU reader
+  (`Benchmarks/results/parquet_nested_2026-09-24.csv`, [PARQUET.md](PARQUET.md)).
 - **The router for float columns and array-to-array compares.** The router's table covers integer
   columns; float columns have no measured crossover yet and stay on the GPU. The compare row is fitted on
   the scalar compare, and an array-to-array compare near 3M rows is the one case in the router check where
