@@ -247,9 +247,9 @@ final class ExprEmitter {
             return ExprSlot(type: t, v: try numericLiteral(Double(v), int: v, type: t), ok: "true")
         case .double(let v):
             let t: ExprType = (hint == .float32) ? .float32 : .float64
-            return ExprSlot(type: t, v: try numericLiteral(v, int: Int64(v.isFinite ? v : 0), type: t), ok: "true")
+            return ExprSlot(type: t, v: try numericLiteral(v, int: try truncatedLiteral(v, for: t), type: t), ok: "true")
         case .typedDouble(let v, let t):
-            return ExprSlot(type: t, v: try numericLiteral(v, int: Int64(v.isFinite ? v : 0), type: t), ok: "true")
+            return ExprSlot(type: t, v: try numericLiteral(v, int: try truncatedLiteral(v, for: t), type: t), ok: "true")
         case .bool(let v):
             return ExprSlot(type: .boolean, v: v ? "true" : "false", ok: "true")
         case .string:
@@ -530,6 +530,18 @@ final class ExprEmitter {
         case .float64: return "0ul"
         default: return "(\(t.msl))0"
         }
+    }
+
+    /// The integer a floating-point literal becomes when the target type is an integer: truncated toward
+    /// zero, as an Arrow cast does. A float target never uses it, so it is 0 there and for non-finite
+    /// values. A value whose truncation does not fit in 64 bits is an error, never a trap: `Int64(Double)`
+    /// traps outside `[-2^63, 2^63)`, which used to end the host process for a literal such as `1e19`.
+    private func truncatedLiteral(_ v: Double, for type: ExprType) throws -> Int64 {
+        if type == .float32 || type == .float64 || !v.isFinite { return 0 }
+        guard let i = Int64(exactly: v.rounded(.towardZero)) else {
+            throw ExprError.unsupported("the literal \(v) does not fit a 64-bit integer, so it cannot be a \(type.rawValue) literal")
+        }
+        return i
     }
 
     private func numericLiteral(_ d: Double, int: Int64, type: ExprType) throws -> String {

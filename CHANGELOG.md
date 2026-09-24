@@ -281,6 +281,10 @@ Bindings
   The publication steps are in docs/RELEASE.md (step 4 is the PyPI upload).
 
 Fixed
+- A float literal whose value is 2^63 or more in magnitude no longer ends the host process: the fused
+  expression compiler converted every float literal to Int64 even for float targets, and `Int64(Double)`
+  traps outside its range. Float targets no longer compute the integer; an integer-typed float literal that
+  does not fit 64 bits is an `ExprError` naming it. Found by the review of the Polars engine lane.
 - `GroupByKeys._agg` in the Python package took the device handle of a temporary `MetalArray` that was
   released before the C call read it, segfaulting every grouped aggregate whose values arrived as a
   pyarrow array rather than a `MetalArray`.
