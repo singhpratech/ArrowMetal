@@ -18,9 +18,9 @@ row, so the structure scan has quotes to track. Readers, all producing typed col
     pandas_c            pandas.read_csv (the default C engine)
     duckdb              duckdb.read_csv(path).to_arrow_table(), DuckDB's relational API
 
+Each reader is warmed once, then timed `--repeat` times; the median, min and max wall times are
 written with the machine, row count and file size. A run taken while other work shares the GPU is
 provisional, and the default output name says so.
-script is new, so any result it writes is provisional until a quiet rerun.
 """
 import argparse
 import csv
