@@ -4473,3 +4473,179 @@ def write_parquet(data, path, compression="snappy", use_dictionary=True, row_gro
 from . import stream                                                       # noqa: E402
 from .stream import (Stream, GroupedStream, JoinedStream, JoinedGroupedStream,  # noqa: E402,F401
                      scan_ipc, scan_arrow, scan_table)
+
+
+# ---- Lakehouse tables: Delta Lake and Apache Iceberg (docs/LAKEHOUSE.md)
+#
+# The table metadata (the Delta log and checkpoints; Iceberg's metadata JSON and Avro manifests) is
+# resolved on the CPU, data files are pruned by partition values and column statistics, and the
+# surviving Parquet files are read by the GPU Parquet reader. Unlike `read_parquet`, whose filters only
+# skip row groups, these filters are applied to the rows as well: the result holds exactly the rows
+# where every `(column, op, value)` holds, as `deltalake` and `pyiceberg` return them.
+
+_lib.am_delta_read.argtypes = [ctypes.c_char_p, ctypes.c_int64, ctypes.POINTER(ctypes.c_char_p), ctypes.c_int64,
+                               ctypes.c_char_p, ctypes.POINTER(_P)]
+_lib.am_delta_read.restype = ctypes.c_int
+_lib.am_delta_latest_version.argtypes = [ctypes.c_char_p]
+_lib.am_delta_latest_version.restype = ctypes.c_int64
+_lib.am_iceberg_read.argtypes = [ctypes.c_char_p, ctypes.c_int64, ctypes.c_int, ctypes.POINTER(ctypes.c_char_p),
+                                 ctypes.c_int64, ctypes.c_char_p, ctypes.POINTER(_P)]
+_lib.am_iceberg_read.restype = ctypes.c_int
+_lib.am_iceberg_current_snapshot.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int64)]
+_lib.am_iceberg_current_snapshot.restype = ctypes.c_int
+_lib.am_lakehouse_batch_columns.argtypes = [_P]
+_lib.am_lakehouse_batch_columns.restype = ctypes.c_int64
+_lib.am_lakehouse_batch_rows.argtypes = [_P]
+_lib.am_lakehouse_batch_rows.restype = ctypes.c_int64
+_lib.am_lakehouse_batch_column_name.argtypes = [_P, ctypes.c_int64]
+_lib.am_lakehouse_batch_column_name.restype = ctypes.c_char_p
+_lib.am_lakehouse_batch_column.argtypes = [_P, ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_lakehouse_batch_column.restype = ctypes.c_int
+_lib.am_lakehouse_batch_stats.argtypes = [_P, ctypes.POINTER(ctypes.c_int64)]
+_lib.am_lakehouse_batch_stats.restype = ctypes.c_int
+_lib.am_lakehouse_batch_release.argtypes = [_P]
+
+
+def _lakehouse_filter_text(filters):
+    """`[("x", ">", 3), ("d", ">=", datetime.date(2024, 1, 1))]` -> the ABI's filter text. Dates and
+    datetimes become ISO 8601 string literals, which the reader parses against the column's type (a
+    naive datetime is taken as UTC)."""
+    if not filters:
+        return None
+    if isinstance(filters, str):
+        return filters.encode()
+    import datetime as _dt
+    parts = []
+    for f in filters:
+        if len(f) != 3:
+            raise ArrowMetalError("a filter is (column, op, value); got %r" % (f,))
+        col, op, val = f
+        if op not in ("==", "!=", "<", "<=", ">", ">="):
+            raise ArrowMetalError("filter op must be one of == != < <= > >=; got %r" % (op,))
+        if isinstance(val, _dt.datetime):
+            if val.tzinfo is not None:
+                val = val.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+            lit = '"%s"' % val.isoformat()
+        elif isinstance(val, _dt.date):
+            lit = '"%s"' % val.isoformat()
+        elif isinstance(val, str):
+            if '"' in val or ";" in val:
+                raise ArrowMetalError("a string filter literal cannot contain '\"' or ';'; got %r" % (val,))
+            lit = '"%s"' % val
+        elif isinstance(val, bool):
+            lit = "1" if val else "0"
+        elif isinstance(val, (int, float)):
+            lit = repr(val)
+        else:
+            try:
+                import decimal as _decimal
+                if isinstance(val, _decimal.Decimal):
+                    lit = '"%s"' % format(val, "f")
+                else:
+                    raise TypeError
+            except TypeError:
+                raise ArrowMetalError("unsupported filter literal %r for column %r" % (val, col))
+        parts.append("%s%s%s" % (col, op, lit))
+    return ";".join(parts).encode()
+
+
+class LakehouseScanStats(dict):
+    """How a table read was pruned: files total / pruned by partition / pruned by statistics / read,
+    and (Iceberg) manifests total / pruned."""
+
+
+def _lakehouse_columns(columns):
+    if columns is None:
+        return None, 0
+    columns = list(columns)
+    return (ctypes.c_char_p * max(len(columns), 1))(*[c.encode() for c in columns]), len(columns)
+
+
+def _lakehouse_collect(out, with_stats):
+    try:
+        pairs = []
+        for i in range(_lib.am_lakehouse_batch_columns(out)):
+            name = _lib.am_lakehouse_batch_column_name(out, i).decode()
+            h = _P()
+            _check(_lib.am_lakehouse_batch_column(out, i, ctypes.byref(h)))
+            pairs.append((name, MetalArray(h)))
+        cols = ColumnSet(pairs)
+        if not with_stats:
+            return cols
+        buf = (ctypes.c_int64 * 6)()
+        _check(_lib.am_lakehouse_batch_stats(out, buf))
+        keys = ("files_total", "files_pruned_by_partition", "files_pruned_by_statistics", "files_read",
+                "manifests_total", "manifests_pruned")
+        return cols, LakehouseScanStats(zip(keys, [int(x) for x in buf]))
+    finally:
+        _lib.am_lakehouse_batch_release(out)
+
+
+def _lakehouse_table(cols):
+    if not len(cols):
+        return pa.table({})
+    return pa.table([c.to_arrow() for c in cols.columns], names=cols.names)
+
+
+def read_delta(path, version=None, columns=None, filters=None, with_stats=False):
+    """Reads a Delta Lake table on the GPU and returns a `ColumnSet`.
+
+    `version` time-travels (the latest version when None), `columns` projects, and `filters` is a list
+    of `(column, op, value)` triples, all of which must hold: files are skipped by partition values and
+    by their min/max statistics, row groups by the Parquet footer, and the remaining rows are filtered.
+    `with_stats=True` returns `(columns, stats)` with the pruning counters.
+
+        cols = am.read_delta("events", version=3, columns=["user", "amount"],
+                             filters=[("day", ">=", datetime.date(2024, 1, 1))])
+    """
+    names, n = _lakehouse_columns(columns)
+    out = _P()
+    _check(_lib.am_delta_read(str(path).encode(), -1 if version is None else int(version), names, n,
+                              _lakehouse_filter_text(filters), ctypes.byref(out)))
+    return _lakehouse_collect(out, with_stats)
+
+
+def read_delta_table(path, version=None, columns=None, filters=None):
+    """`read_delta` exported as a `pyarrow.Table`."""
+    return _lakehouse_table(read_delta(path, version=version, columns=columns, filters=filters))
+
+
+def delta_latest_version(path):
+    """The newest version recorded in a Delta table's log."""
+    v = _lib.am_delta_latest_version(str(path).encode())
+    if v < 0:
+        _check(1)
+    return int(v)
+
+
+def read_iceberg(metadata_path_or_table_dir, snapshot_id=None, columns=None, filters=None, with_stats=False):
+    """Reads an Apache Iceberg table on the GPU and returns a `ColumnSet`.
+
+    The table is named by its `*.metadata.json` file or its directory (the newest metadata file, or the
+    one `version-hint.text` names, is used). `snapshot_id` time-travels (the current snapshot when
+    None); columns are matched by field id, so renamed columns read correctly from older files.
+    `filters` prune manifests and data files by partition summaries and column bounds and are then
+    applied to the rows. `with_stats=True` returns `(columns, stats)` with the pruning counters.
+    """
+    names, n = _lakehouse_columns(columns)
+    out = _P()
+    has = snapshot_id is not None
+    _check(_lib.am_iceberg_read(str(metadata_path_or_table_dir).encode(), int(snapshot_id) if has else 0,
+                                1 if has else 0, names, n, _lakehouse_filter_text(filters), ctypes.byref(out)))
+    return _lakehouse_collect(out, with_stats)
+
+
+def read_iceberg_table(metadata_path_or_table_dir, snapshot_id=None, columns=None, filters=None):
+    """`read_iceberg` exported as a `pyarrow.Table`."""
+    return _lakehouse_table(read_iceberg(metadata_path_or_table_dir, snapshot_id=snapshot_id,
+                                         columns=columns, filters=filters))
+
+
+def iceberg_current_snapshot(metadata_path_or_table_dir):
+    """The current snapshot id of an Iceberg table, or None when it has none."""
+    v = ctypes.c_int64()
+    rc = _lib.am_iceberg_current_snapshot(str(metadata_path_or_table_dir).encode(), ctypes.byref(v))
+    if rc == 3:
+        return None
+    _check(rc)
+    return int(v.value)
