@@ -237,6 +237,22 @@ Fixed
   expression compiler converted every float literal to Int64 even for float targets, and `Int64(Double)`
   traps outside its range. Float targets no longer compute the integer; an integer-typed float literal that
   does not fit 64 bits is an `ExprError` naming it. Found by the review of the Polars engine lane.
+- Parquet row-group and page-index filters on string and binary columns compare the statistics as
+  Parquet orders them, by unsigned bytes, with a string literal taken as its UTF-8 bytes. They used
+  Swift's `String` order (Unicode canonical equivalence), so a filter on non-ASCII strings could skip a
+  row group or page holding matches (`Z`, `Å` spelled `A` + ring, `e` + combining accent). A decimal
+  column stored as INT32 / INT64 no longer compares its unscaled statistics with the literal (a filter
+  `< 200` skipped a row group holding 123.45). Regression tests against pyarrow's filtered reads in
+  `test_parquet_nested.py`, one also checking an int64 column against double literals near 2^53.
+- Delta and Iceberg filters take string and binary literals holding `;`, `"`, `\` and operator
+  characters: Python writes them double-quoted with `\"` and `\\` escapes, the grammar the Parquet
+  filter text already reads, instead of refusing them. An int64 column's double literal of 2^53 or more
+  now prunes row groups too, compared exactly. Tested against deltalake and pyiceberg.
+- `sink_ipc` and `sort_to_ipc` write an `arrow.fixed_shape_tensor` column (any extension column) with its
+  `ARROW:extension:*` keys, as `ArrowIPCWriter` does; pyarrow reads it back as a `FixedShapeTensorArray`
+  instead of its `fixed_size_list` storage.
+- docs/JSON.md said the JSON reader parses floats on the CPU; they parse on the GPU (Eisel-Lemire, CPU
+  only for the values it cannot decide exactly), which `testFloatColumnsParseOnTheGPU` checks.
 
 Quality
 - The crossover table (docs/CROSSOVER.md, `Benchmarks/crossover.py`, `arrowmetal-bench crossover`): a size sweep of
