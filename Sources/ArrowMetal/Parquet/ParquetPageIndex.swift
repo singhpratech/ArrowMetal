@@ -9,8 +9,9 @@ import Metal
 // can do better than keep or drop whole row groups:
 //
 //   1. For each filter on a flat column, each page whose [min, max] cannot satisfy it (or that holds only
-//      nulls) rules out its rows. The rows the filters leave, intersected across filters, are the row
-//      group's *candidate ranges*; a row group left with none is dropped like a statistics-pruned one.
+//      nulls, by its null-page flag *and* its null count) rules out its rows. The rows the filters leave,
+//      intersected across filters, are the row group's *candidate ranges*; a row group left with none is
+//      dropped like a statistics-pruned one.
 //   2. Every flat column that has an offset index then decodes only the data pages that overlap a
 //      candidate range. The skipped pages are never decompressed, never decoded, and their headers are
 //      never read: the page list comes from the offset index, not from walking the chunk.
@@ -176,9 +177,17 @@ extension ParquetFile {
                     let lo = Swift.max(0, Swift.min(Int(page.firstRowIndex), rows))
                     let hi = i + 1 < oi.count ? Swift.max(lo, Swift.min(Int(oi[i + 1].firstRowIndex), rows)) : rows
                     guard lo < hi else { continue }
-                    // An all-null page satisfies no comparison.
-                    if ci.nullPages[i] { continue }
-                    if filter.mayMatch(lower: ci.minValues[i], upper: ci.maxValues[i], leaf: leaf) {
+                    // An all-null page satisfies no comparison, but only a confirmed one is ruled out: Polars
+                    // flags every page holding a NaN as a null page while its null count is 0. A flagged page
+                    // whose null count does not cover its rows is kept, since its min / max are placeholders.
+                    let keepPage: Bool
+                    if ci.nullPages[i] {
+                        if Self.certainlyAllNull(ci, page: i, rows: hi - lo) { continue }
+                        keepPage = true
+                    } else {
+                        keepPage = filter.mayMatch(lower: ci.minValues[i], upper: ci.maxValues[i], leaf: leaf)
+                    }
+                    if keepPage {
                         if let last = ranges.last, last.upperBound == lo { ranges[ranges.count - 1] = last.lowerBound..<hi }
                         else { ranges.append(lo..<hi) }
                     }
@@ -189,6 +198,36 @@ extension ParquetFile {
             if narrowed, keep != [0..<rows] { out[g] = keep }
         }
         return out
+    }
+
+    /// True when page `i`, flagged as a null page, is confirmed to hold nothing but nulls: the index's
+    /// `null_counts` entry for it covers all `rows` of it (a flat column has one value per row). Without
+    /// null counts the flag alone is not trusted and the page is kept.
+    static func certainlyAllNull(_ ci: ParquetColumnIndex, page i: Int, rows: Int) -> Bool {
+        guard let counts = ci.nullCounts, i < counts.count else { return false }
+        return counts[i] >= Int64(rows)
+    }
+
+    /// False when the chunk's column index flags a page as a null page that its null counts say is not all
+    /// null. Polars writes such pages for every page holding a NaN and leaves them out of the row group's
+    /// min / max, so those statistics do not bound the chunk's values and must not drop the row group
+    /// (pyarrow trusts them and drops it). True when there is no column index or nothing looks wrong.
+    func rowGroupStatisticsTrusted(_ g: Int, column: String) -> Bool {
+        guard let leaf = leaves.first(where: { $0.dottedPath == column || $0.name == column }),
+              leaf.maxRepetition == 0,
+              let ci = try? columnIndex(rowGroup: g, column: leaf.index), ci.nullPages.contains(true),
+              let counts = ci.nullCounts, counts.count == ci.nullPages.count else { return true }
+        let rows = rowsIn(group: g)
+        let oi = (try? offsetIndex(rowGroup: g, column: leaf.index)).flatMap { $0 }
+        let pageRows: ((Int) -> Int)? = oi.flatMap { oi in
+            guard oi.count == ci.nullPages.count, Self.wellOrdered(oi, rows: rows) else { return nil }
+            return { i in (i + 1 < oi.count ? Int(oi[i + 1].firstRowIndex) : rows) - Int(oi[i].firstRowIndex) }
+        }
+        for i in ci.nullPages.indices where ci.nullPages[i] {
+            if counts[i] <= 0 { return false }
+            if let pageRows, counts[i] < Int64(pageRows(i)) { return false }
+        }
+        return true
     }
 
     /// Intersection of two sorted lists of disjoint ranges.

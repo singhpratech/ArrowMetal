@@ -4249,8 +4249,18 @@ def _parquet_metadata(call):
     return out
 
 
+def _np_bool_types():
+    """numpy.bool_ when numpy is importable (a comparison result is one), else no extra types."""
+    try:
+        import numpy
+        return (numpy.bool_,)
+    except ImportError:
+        return ()
+
+
 def _filter_text(filters):
     """`[("x", ">", 3), ("s", "==", "a")]` -> the ABI's `x>3;s=="a"` text."""
+    import numbers
     if not filters:
         return None
     if isinstance(filters, str):
@@ -4264,10 +4274,18 @@ def _filter_text(filters):
             raise ArrowMetalError("filter op must be one of == != < <= > >=; got %r" % (op,))
         if isinstance(val, str):
             lit = '"%s"' % val
-        elif isinstance(val, bool):
+        elif isinstance(val, (bool, _np_bool_types())):
             lit = "1" if val else "0"
+        elif isinstance(val, numbers.Integral):
+            lit = str(int(val))
+        elif isinstance(val, numbers.Real):
+            lit = repr(float(val))
         else:
-            lit = repr(val)
+            # A date, datetime or Decimal has no text the filter parser reads as the column's value, and
+            # used to rule out every row group silently. Filter a date or timestamp column by its stored
+            # integer (days since the epoch, ticks in the column's unit) instead.
+            raise ArrowMetalError("a Parquet filter value must be a str, bool, int or float; got %s %r for "
+                                  "column %r" % (type(val).__name__, val, col))
         parts.append("%s%s%s" % (col, op, lit))
     return ";".join(parts).encode()
 
@@ -4522,7 +4540,9 @@ def read_parquet(path, columns=None, row_groups=None, filters=None, dictionary=T
 
     `columns` projects (only the requested column chunks are ever touched), `row_groups` selects by
     index, and `filters` is a list of `(column, op, value)` triples evaluated against the footer's
-    min/max statistics, so whole row groups that cannot match are never read. `dictionary=False`
+    min/max statistics, so whole row groups that cannot match are never read. A filter value is a str,
+    bool, int or float; a date or timestamp column is filtered by its stored integer (days since the
+    epoch, or ticks in the column's unit), and any other value raises. `dictionary=False`
     materialises dictionary-encoded columns instead of returning them dictionary encoded; either way
     the compute functions accept the column, decoding a dictionary for you when they must.
 

@@ -14,9 +14,11 @@ import Foundation
 //   - every field's custom metadata, served by `arrowFieldMetadata(column:)`.
 //
 // The `null` type needs none of this: Parquet annotates a null column with the `UNKNOWN` logical type,
-// and `ParquetLeafData.arrowArray` reads that as `null`. Absent or malformed metadata is ignored: the file
-// reads exactly as the Parquet schema alone describes it. The IPC FlatBuffers reader's table and vector
-// views (`IPC/FlatBuffers.swift`) do the decoding; every offset they follow is bounds-checked.
+// and `ParquetLeafData.arrowArray` reads that as `null`. Absent or malformed metadata, and a stored schema
+// with a different number of top-level fields, are ignored: the file reads exactly as the Parquet schema
+// alone describes it. The two schemas are matched by position, as Arrow's reader matches them. The IPC
+// FlatBuffers reader's table and vector views (`IPC/FlatBuffers.swift`) do the decoding; every offset they
+// follow is bounds-checked.
 
 /// One field of the Arrow schema stored in `ARROW:schema`, reduced to what the Parquet reader restores.
 public struct ParquetArrowField: Sendable {
@@ -156,14 +158,20 @@ extension ParquetFile {
 
     // MARK: - Applying it
 
-    /// The stored Arrow field for top-level field `f`: by position when the two schemas line up, else by name.
+    /// The stored schema when it applies to this file: it decodes and has one field per top-level Parquet
+    /// field. Arrow's reader matches the two by position and ignores a stored schema of another width.
+    var appliedArrowSchema: [ParquetArrowField]? {
+        guard let stored = arrowSchema, stored.count == fields.count else { return nil }
+        return stored
+    }
+
+    /// The stored Arrow field for top-level field `f`, by position (so two fields of the same name each
+    /// get their own); nil when the stored schema does not apply.
     func arrowField(for f: ParquetField) -> ParquetArrowField? {
-        guard let stored = arrowSchema else { return nil }
-        if stored.count == fields.count, let i = fields.firstIndex(where: { $0.name == f.name }),
-           stored[i].name == f.name {
-            return stored[i]
-        }
-        return stored.first { $0.name == f.name }
+        guard let stored = appliedArrowSchema,
+              let i = fields.firstIndex(where: { $0.name == f.name && $0.leaves.map(\.index) == f.leaves.map(\.index) })
+        else { return nil }
+        return stored[i]
     }
 
     /// Puts back what the Parquet schema could not say, where the stored field agrees with the array.
@@ -221,9 +229,10 @@ extension ParquetFile {
         default:
             break
         }
-        if case .dictionary = stored.kind {
-            // The column's Arrow type is a dictionary (a pandas categorical, say): encode it, as Arrow's
-            // reader does, whether or not its pages were dictionary encoded.
+        if case .dictionary = stored.kind, Self.dictionaryRestorable(out) {
+            // The column's Arrow type is a dictionary of strings or binaries (a pandas categorical, say):
+            // encode it, as Arrow's reader does, whether or not its pages were dictionary encoded. Arrow
+            // restores only these value types; a categorical of integers or timestamps reads plain.
             out = try out.dictionaryEncoded()
         }
         if let ext = stored.extensionName {
@@ -231,6 +240,14 @@ extension ParquetFile {
                                                 metadata: stored.metadata[ArrowSchemaMetadata.extensionMetadataKey]))
         }
         return out
+    }
+
+    /// The value types Arrow's Parquet reader reads back dictionary encoded: string and binary.
+    private static func dictionaryRestorable(_ a: AnyMetalArray) -> Bool {
+        switch a {
+        case .string, .binary: return true
+        default: return false
+        }
     }
 
     /// A list whose valid rows all hold `width` elements as a `fixed_size_list<width>`: null rows get
@@ -267,10 +284,12 @@ extension ParquetFile {
         return m
     }
 
-    /// The file's key/value metadata without `ARROW:schema`, which is what Arrow reports as the schema's
-    /// own metadata.
+    /// The file's key/value metadata, which is what Arrow reports as the schema's own metadata: without
+    /// `ARROW:schema` when the stored schema was applied, with it (as Arrow's reader keeps it) when it
+    /// was not.
     public var arrowSchemaMetadata: ArrowSchemaMetadata {
-        ArrowSchemaMetadata(metadata.keyValueMetadata.filter { $0.0 != Self.arrowSchemaKey }
-                                .map { .init(key: $0.0, string: $0.1) })
+        let applied = appliedArrowSchema != nil
+        return ArrowSchemaMetadata(metadata.keyValueMetadata.filter { !applied || $0.0 != Self.arrowSchemaKey }
+                                       .map { .init(key: $0.0, string: $0.1) })
     }
 }

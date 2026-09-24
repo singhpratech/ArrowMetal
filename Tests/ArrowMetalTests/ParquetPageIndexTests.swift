@@ -122,6 +122,90 @@ final class ParquetPageIndexTests: XCTestCase {
         }
     }
 
+    /// Polars flags every page that holds a NaN as a null page, with a null count of 0. Those pages hold
+    /// matching rows, so they must not be skipped.
+    func testNaNPagesFlaggedNullByPolarsAreKept() throws {
+        try requireRealGPU()
+        let polars = try open("pageindexnan__polars")
+        let ci = try XCTUnwrap(try polars.columnIndex(rowGroup: 0, column: 1))
+        XCTAssertTrue(ci.nullPages.contains(true))
+        XCTAssertEqual(ci.nullCounts?.allSatisfy { $0 == 0 }, true)
+        // Polars' row-group min / max leave the flagged pages out too, so they cannot drop the row group:
+        // the least value is about -350, the row group's min about -77.
+        let below = [ParquetFilter(column: "f64", op: .lt, value: .double(-150))]
+        XCTAssertEqual(try polars.selectedRowGroups(ParquetReadOptions(filters: below)), [0])
+        XCTAssertFalse(below[0].mayMatch(rowGroup: polars.metadata.rowGroups[0], file: polars))
+        let filters: [[ParquetFilter]] = [
+            [ParquetFilter(column: "f64", op: .gt, value: .double(100))],
+            [ParquetFilter(column: "f64", op: .lt, value: .double(-150))],
+            [ParquetFilter(column: "f32", op: .lt, value: .double(5))],
+            [ParquetFilter(column: "f64", op: .ge, value: .double(0)), ParquetFilter(column: "id", op: .lt, value: .int(3000))],
+        ]
+        for name in ["pageindexnan__polars", "pageindexnan__pa_plain_none"] {
+            let f = try open(name)
+            for flt in filters {
+                let opts = ParquetReadOptions(columns: ["id", "f64", "f32"], filters: flt)
+                f.usePageIndex = false
+                let whole = try f.read(opts)
+                f.usePageIndex = true
+                let part = try f.read(opts)
+                XCTAssertEqual(try matchingIDs(whole, flt), try matchingIDs(part, flt), "\(name) \(flt.map(\.column))")
+                XCTAssertGreaterThan(try matchingIDs(part, flt).count, 0, "\(name) \(flt.map(\.column))")
+            }
+        }
+        // pyarrow leaves NaN out of min / max and flags nothing, so its pages still skip.
+        let pa = try open("pageindexnan__pa_plain_none")
+        _ = try pa.read(ParquetReadOptions(columns: ["id"], filters: [ParquetFilter(column: "f64", op: .gt, value: .double(100))]))
+        XCTAssertGreaterThan(pa.lastReadStatistics.pagesSkipped, 0)
+    }
+
+    /// The ids whose `f64`, `f32` and `id` satisfy every filter, from the batch's own values.
+    private func matchingIDs(_ b: MetalRecordBatch, _ flt: [ParquetFilter]) throws -> [Int64] {
+        let ids = try self.ids(b)
+        let f64 = try XCTUnwrap(b["f64"]?.asFloat64).toArray()
+        let f32 = try XCTUnwrap(b["f32"]?.asFloat32).toArray()
+        return ids.indices.filter { i in
+            flt.allSatisfy { f in
+                let x: Double
+                switch f.column {
+                case "f64": x = f64[i] ?? .nan
+                case "f32": x = f32[i].map(Double.init) ?? .nan
+                default: x = Double(ids[i])
+                }
+                let v: Double
+                switch f.value { case .double(let d): v = d; case .int(let n): v = Double(n); default: return false }
+                switch f.op {
+                case .gt: return x > v
+                case .ge: return x >= v
+                case .lt: return x < v
+                case .le: return x <= v
+                case .eq: return x == v
+                case .ne: return x != v
+                }
+            }
+        }.map { ids[$0] }
+    }
+
+    /// The format says a NaN min or max must be ignored; a literal of another kind than the column's
+    /// cannot rule anything out either.
+    func testNaNBoundsAndMismatchedLiteralsRuleNothingOut() throws {
+        let f = try open("pageindexnan__pa_plain_none")
+        let f64 = try XCTUnwrap(f.leaves.first { $0.name == "f64" })
+        let id = try XCTUnwrap(f.leaves.first { $0.name == "id" })
+        func bytes(_ d: Double) -> [UInt8] { withUnsafeBytes(of: d) { Array($0) } }
+        func bytes(_ n: Int64) -> [UInt8] { withUnsafeBytes(of: n) { Array($0) } }
+        // A real bound still rules out.
+        XCTAssertFalse(ParquetFilter(column: "f64", op: .gt, value: .double(10)).mayMatch(lower: bytes(1.0), upper: bytes(5.0), leaf: f64))
+        XCTAssertTrue(ParquetFilter(column: "f64", op: .gt, value: .double(10)).mayMatch(lower: bytes(1.0), upper: bytes(Double.nan), leaf: f64))
+        XCTAssertTrue(ParquetFilter(column: "f64", op: .lt, value: .double(0)).mayMatch(lower: bytes(Double.nan), upper: bytes(5.0), leaf: f64))
+        XCTAssertTrue(ParquetFilter(column: "f64", op: .eq, value: .double(7)).mayMatch(lower: bytes(Double.nan), upper: bytes(Double.nan), leaf: f64))
+        // A string literal against an int64 column: never ruled out, whatever the op.
+        for op in [ParquetFilter.Op.eq, .ne, .lt, .le, .gt, .ge] {
+            XCTAssertTrue(ParquetFilter(column: "id", op: op, value: .string("datetime.date(2021, 1, 1)"))
+                            .mayMatch(lower: bytes(Int64(5)), upper: bytes(Int64(5)), leaf: id), "\(op)")
+        }
+    }
+
     func testRangeIntersection() {
         XCTAssertEqual(ParquetFile.intersect([0..<10, 20..<30], [5..<25]), [5..<10, 20..<25])
         XCTAssertEqual(ParquetFile.intersect([0..<10], [10..<20]), [])

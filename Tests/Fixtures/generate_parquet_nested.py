@@ -12,6 +12,7 @@ ArrowMetal and with `pyarrow.parquet.read_table` and require the two to agree.
 Writers that are not installed are skipped with a message; the files are committed, so the tests do
 not need them.
 """
+import base64
 import datetime
 import decimal
 import json
@@ -235,6 +236,52 @@ def arrow_types_table():
     })
 
 
+def categoricals_table():
+    """Dictionary-typed columns over several value types. Arrow's Parquet reader restores the dictionary
+    type only over strings and binaries; the others read back as their value type."""
+    n = 200
+    return pa.table({
+        "cat_str": pa.array([None if i % 6 == 0 else ["red", "green", "blue"][i % 3] for i in range(n)]).dictionary_encode(),
+        "cat_bin": pa.array([None if i % 5 == 0 else b"b%d" % (i % 4) for i in range(n)], pa.binary()).dictionary_encode(),
+        "cat_int": pa.array([None if i % 5 == 0 else i % 7 for i in range(n)], pa.int64()).dictionary_encode(),
+        "cat_ts": pa.array([1_700_000_000_000_000 + (i % 9) for i in range(n)],
+                           pa.timestamp("us", tz="UTC")).dictionary_encode(),
+        "cat_date": pa.array([None if i % 4 == 0 else 19_000 + i % 3 for i in range(n)], pa.date32()).dictionary_encode(),
+        "k": pa.array(range(n), pa.int32()),
+    })
+
+
+def arrow_schema_b64(schema):
+    """`schema` as Arrow writers store it under ARROW:schema: base64 of an encapsulated IPC Schema message."""
+    return base64.b64encode(schema.serialize().to_pybytes()).decode()
+
+
+def plain_metadata_table():
+    return pa.table({c: metadata_table()[c] for c in ("id", "ts_paris", "ts_utc", "ts_naive", "price")})
+
+
+# The ARROW:schema values DuckDB writes into otherwise identical files (`KV_METADATA`): not base64, base64
+# of a truncated message, and well-formed schemas that do not line up with the Parquet one.
+_PLAIN_CLAIMS = [("id", pa.duration("s")), ("ts_paris", pa.timestamp("us", tz="Asia/Tokyo"))]
+CRAFTED_ARROW_SCHEMAS = {
+    "corrupt": "not base64 at all!",
+    "truncated": "/////w==",
+    # Two stored fields against five Parquet columns, and nine: Arrow ignores both.
+    "fewer": arrow_schema_b64(pa.schema(_PLAIN_CLAIMS)),
+    "more": arrow_schema_b64(pa.schema(_PLAIN_CLAIMS + [("x%d" % i, pa.int32()) for i in range(7)])),
+    # Five fields whose first name differs: Arrow matches by position and applies it.
+    "renamed": arrow_schema_b64(pa.schema([("idx", pa.duration("s")), ("ts_paris", pa.timestamp("us", tz="Asia/Tokyo")),
+                                           ("ts_utc", pa.timestamp("us", tz="UTC")), ("ts_naive", pa.timestamp("us")),
+                                           ("price", pa.float64())])),
+}
+
+
+def dict_struct_table():
+    n = 40
+    return pa.table({"k": pa.array(range(n), pa.int32()),
+                     "s": pa.array([None if i % 7 == 0 else {"a": i, "b": "x%d" % i} for i in range(n)])})
+
+
 # ----------------------------------------------------------------------------- page index fixtures
 
 def pageindex_table():
@@ -251,6 +298,19 @@ def pageindex_table():
         "noise": pa.array(r.integers(0, 1000, n).astype(np.int32), pa.int32()),
         "xs": pa.array([None if i % 31 == 0 else [i + t for t in range(i % 3)] for i in range(n)],
                        pa.list_(pa.int64())),
+    })
+
+
+def pageindex_nan_table():
+    """A sorted float column with a NaN every 97th row. Polars flags every page holding a NaN as a null page
+    in the column index while giving it a null count of 0; the page still holds matching rows."""
+    n = 4_000
+    f = np.sort(np.random.default_rng(1).standard_normal(n)) * 100
+    f[::97] = np.nan
+    return pa.table({
+        "id": pa.array(np.arange(n), pa.int64()),
+        "f64": pa.array(f, pa.float64()),
+        "f32": pa.array(f.astype(np.float32), pa.float32()),
     })
 
 
@@ -285,7 +345,7 @@ def write_pyarrow(table, name, **kw):
     return path
 
 
-def write_duckdb(table, name, **opts):
+def write_duckdb(table, name, arrow_schema=None, **opts):
     try:
         import duckdb
     except ImportError:
@@ -295,6 +355,8 @@ def write_duckdb(table, name, **opts):
     con = duckdb.connect()
     con.register("t", table)
     extra = "".join(", %s %s" % (k, v) for k, v in opts.items())
+    if arrow_schema is not None:
+        extra += ", KV_METADATA {'ARROW:schema': '%s'}" % arrow_schema
     con.execute("COPY (SELECT * FROM t) TO '%s' (FORMAT parquet%s)" % (path, extra))
     con.close()
     return path
@@ -355,14 +417,22 @@ def main():
     write_pyarrow(pa.table({"fsl": pa.array([None if i % 7 == 0 else [i, -i, None if i % 5 == 0 else i * 2]
                                              for i in range(60)], pa.list_(pa.int32(), 3))}),
                   "arrowschema__pa_fslnull", compression="none")
-    plain = pa.table({c: metadata_table()[c] for c in ("id", "ts_paris", "ts_utc", "ts_naive", "price")})
+    write_pyarrow(categoricals_table(), "arrowschema__pa_categoricals", compression="none")
+    write_pyarrow(categoricals_table(), "arrowschema__pa_categoricals_plain", compression="snappy",
+                  use_dictionary=False)
+    plain = plain_metadata_table()
     write_polars(plain, "arrowschema__polars")
-    # The same columns with no ARROW:schema at all, and with a corrupt one.
+    # The same columns with no ARROW:schema at all. pyarrow drops a hand-set ARROW:schema key when
+    # store_schema=False, so the crafted values go through DuckDB's KV_METADATA instead, beside a DuckDB
+    # file without the key to compare against.
     write_pyarrow(plain, "arrowschema__pa_nostore", compression="none", store_schema=False)
-    corrupt = plain.replace_schema_metadata({"ARROW:schema": "not base64 at all!"})
-    write_pyarrow(corrupt, "arrowschema__pa_corrupt", compression="none", store_schema=False)
-    truncated = plain.replace_schema_metadata({"ARROW:schema": "/////w=="})
-    write_pyarrow(truncated, "arrowschema__pa_truncated", compression="none", store_schema=False)
+    write_duckdb(plain, "arrowschema__duckdb_nostore")
+    for kind, value in CRAFTED_ARROW_SCHEMAS.items():
+        write_duckdb(plain, "arrowschema__duckdb_" + kind, arrow_schema=value)
+    # A dictionary claim over a struct column, which no dictionary encoding can honour.
+    ds = dict_struct_table()
+    write_duckdb(ds, "arrowschema__duckdb_dictstruct",
+                 arrow_schema=arrow_schema_b64(pa.schema([("k", pa.int32()), ("s", pa.dictionary(pa.int32(), ds["s"].type))])))
 
     # Column and offset indexes: small pages, several row groups.
     pidx = pageindex_table()
@@ -376,6 +446,11 @@ def main():
                   write_page_index=False, data_page_size=1024, row_group_size=2500)
     write_polars(pidx, "pageindex__polars", row_group_size=2500, data_page_size=1024,
                  statistics=True)
+    # NaN in a float column: Polars marks those pages as null pages; pyarrow leaves NaN out of min / max.
+    pnan = pageindex_nan_table()
+    write_polars(pnan, "pageindexnan__polars", row_group_size=4000, data_page_size=800, statistics=True)
+    write_pyarrow(pnan, "pageindexnan__pa_plain_none", compression="none", use_dictionary=False,
+                  write_page_index=True, data_page_size=800, row_group_size=4000)
 
     # Split-block bloom filters, from pyarrow (every column) and DuckDB (its dictionary-encoded columns).
     bloom = bloom_table()

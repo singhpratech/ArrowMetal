@@ -206,9 +206,11 @@ def test_damaged_nested_files_never_crash_the_process():
 
 # --------------------------------------------------------------------------- 4. ARROW:schema
 
-# `arrowschema__pa_types` and `arrowschema__pa_fslnull` have tests of their own below.
+# `arrowschema__pa_types` and `arrowschema__pa_fslnull` have tests of their own below, and so do the two
+# files whose ARROW:schema does not decode, which pyarrow refuses to open.
 ARROW_SCHEMA = sorted(p for p in glob.glob(os.path.join(NESTED, "arrowschema__*.parquet"))
-                      if ids(p) not in ("arrowschema__pa_types", "arrowschema__pa_fslnull"))
+                      if ids(p) not in ("arrowschema__pa_types", "arrowschema__pa_fslnull",
+                                        "arrowschema__duckdb_corrupt", "arrowschema__duckdb_truncated"))
 
 
 def assert_same_schema_metadata(got, want):
@@ -326,14 +328,70 @@ def test_registered_extension_type_is_rebuilt():
         pa.unregister_extension_type("example.label")
 
 
-@pytest.mark.parametrize("name", ["arrowschema__pa_nostore", "arrowschema__pa_corrupt", "arrowschema__pa_truncated"])
-def test_absent_or_malformed_arrow_schema_is_ignored(name):
-    """No ARROW:schema, one that is not base64, one that is base64 of a truncated message: each reads
-    as the Parquet schema alone describes it, exactly as pyarrow does."""
+@pytest.mark.parametrize("name", ["arrowschema__pa_nostore", "arrowschema__duckdb_nostore"])
+def test_absent_arrow_schema(name):
+    """No ARROW:schema: the file reads as the Parquet schema alone describes it, exactly as pyarrow reads it."""
     path = os.path.join(NESTED, name + ".parquet")
     got, want = am.read_parquet_table(path), pq.read_table(path)
+    assert b"ARROW:schema" not in open(path, "rb").read()
     assert_same_table(got, want)
     assert got["ts_paris"].type == pa.timestamp("us", tz="UTC") == want["ts_paris"].type
+
+
+@pytest.mark.parametrize("kind,value", [("corrupt", b"not base64 at all!"), ("truncated", b"/////w==")])
+def test_malformed_arrow_schema_is_ignored(kind, value):
+    """An ARROW:schema that is not base64, or is base64 of a truncated message. pyarrow refuses to open
+    such a file; ArrowMetal reads it as the same columns without the key read, keeping the undecodable
+    value in the schema metadata, since it was not applied."""
+    path = os.path.join(NESTED, "arrowschema__duckdb_%s.parquet" % kind)
+    raw = open(path, "rb").read()
+    assert b"ARROW:schema" in raw and value in raw
+    with pytest.raises(pa.ArrowInvalid):
+        pq.read_table(path)
+    got = am.read_parquet_table(path)
+    want = pq.read_table(os.path.join(NESTED, "arrowschema__duckdb_nostore.parquet"))
+    assert_same_table(got, want)
+    assert got["ts_paris"].type == pa.timestamp("us", tz="UTC")
+    assert got.schema.metadata == {b"ARROW:schema": value}
+
+
+def test_stored_schema_of_another_width_is_ignored_like_pyarrow():
+    """Two or nine stored fields against five columns: pyarrow ignores the stored schema and keeps the key
+    in the schema metadata; five fields apply by position whatever the names say."""
+    for kind in ("fewer", "more"):
+        path = os.path.join(NESTED, "arrowschema__duckdb_%s.parquet" % kind)
+        got, want = am.read_parquet_table(path), pq.read_table(path)
+        assert got["id"].type == want["id"].type == pa.int64()
+        assert got["ts_paris"].type == want["ts_paris"].type == pa.timestamp("us", tz="UTC")
+        assert b"ARROW:schema" in got.schema.metadata
+        assert got.schema.metadata == want.schema.metadata
+    path = os.path.join(NESTED, "arrowschema__duckdb_renamed.parquet")
+    got, want = am.read_parquet_table(path), pq.read_table(path)
+    assert got["id"].type == want["id"].type == pa.duration("s")
+    assert got["ts_paris"].type == want["ts_paris"].type == pa.timestamp("us", tz="Asia/Tokyo")
+
+
+def test_dictionary_claim_over_a_struct_is_ignored():
+    path = os.path.join(NESTED, "arrowschema__duckdb_dictstruct.parquet")
+    got, want = am.read_parquet_table(path), pq.read_table(path)
+    assert pa.types.is_struct(got["s"].type) and got["s"].type == want["s"].type
+    assert got["s"].to_pylist() == want["s"].to_pylist()
+
+
+@pytest.mark.parametrize("name", ["arrowschema__pa_categoricals", "arrowschema__pa_categoricals_plain"])
+def test_only_string_and_binary_categoricals_are_restored(name):
+    """pyarrow restores a stored dictionary type only over string and binary values; a categorical of
+    integers, timestamps or dates reads back as its value type. ArrowMetal does the same."""
+    path = os.path.join(NESTED, name + ".parquet")
+    got, want = am.read_parquet_table(path), pq.read_table(path)
+    for col in want.column_names:
+        assert got[col].type == want[col].type, col
+        assert got[col].to_pylist() == want[col].to_pylist(), col
+    assert got["cat_str"].type == pa.dictionary(pa.int32(), pa.string())
+    assert got["cat_bin"].type == pa.dictionary(pa.int32(), pa.binary())
+    assert got["cat_int"].type == pa.int64()
+    assert got["cat_ts"].type == pa.timestamp("us", tz="UTC")
+    assert got["cat_date"].type == pa.date32()
 
 
 def test_arrow_types_parquet_cannot_name():
@@ -438,6 +496,96 @@ def test_a_row_group_can_be_ruled_out_by_pages_alone():
     assert 1 in f.selected_row_groups(flt)          # the row-group statistics keep it
     f.read_table(columns=["id"], filters=flt)
     assert f.last_read_stats["row_groups_skipped_by_page_index"] >= 1
+
+
+NAN_FILTERS = [
+    [("f64", ">", 100.0)], [("f64", "<", -150.0)], [("f64", "<=", 0.0)], [("f32", "<", 5.0)],
+    [("f32", ">=", 50.0), ("id", "<", 3500)], [("f64", ">=", 0.0), ("f64", "<=", 1.0)],
+]
+
+
+@pytest.mark.parametrize("name", ["pageindexnan__polars", "pageindexnan__pa_plain_none"])
+@pytest.mark.parametrize("flt", NAN_FILTERS, ids=lambda f: ";".join("%s%s%s" % t for t in f))
+def test_nan_pages_are_never_skipped_wrongly(name, flt):
+    """Polars marks each page holding a NaN as a null page with a null count of 0. Such a page holds
+    matching rows; the page-index read must keep it and agree with the read without the index and with
+    the exact matches of the whole file."""
+    path = os.path.join(NESTED, name + ".parquet")
+    f = am.ParquetFile(path)
+    f.use_page_index = True
+    with_index = f.read_table(filters=flt)
+    f.use_page_index = False
+    without = f.read_table(filters=flt)
+    want = _exact(pq.read_table(path), flt)
+    assert want.num_rows > 0
+    assert _exact(with_index, flt).to_pylist() == _exact(without, flt).to_pylist() == want.to_pylist()
+    # pyarrow's own filtered read trusts Polars' row-group min / max, which leave the flagged pages out:
+    # it returns every match or, when the filter falls outside the unflagged pages' range, none.
+    by_pyarrow = _exact(pq.read_table(path, filters=flt), flt).num_rows
+    if name.endswith("pa_plain_none"):
+        assert by_pyarrow == want.num_rows
+    else:
+        assert by_pyarrow in (want.num_rows, 0)
+
+
+def test_polars_row_group_statistics_leave_nan_pages_out():
+    """The one place ArrowMetal and pyarrow's filtered read differ on these files: Polars' row-group
+    min is the least value of the pages it did not flag, so `f64 < -150` rules the row group out for
+    pyarrow, which returns no rows, while ArrowMetal sees the flagged pages in the column index, keeps
+    the row group and returns every match."""
+    path = os.path.join(NESTED, "pageindexnan__polars.parquet")
+    flt = [("f64", "<", -150.0)]
+    stats = pq.ParquetFile(path).metadata.row_group(0).column(1).statistics
+    exact = _exact(pq.read_table(path), flt).num_rows
+    assert stats.min > -150.0 and exact > 0
+    assert pq.read_table(path, filters=flt).num_rows == 0
+    f = am.ParquetFile(path)
+    assert f.selected_row_groups(flt) == [0]
+    assert _exact(f.read_table(filters=flt), flt).num_rows == exact
+
+
+def test_polars_flags_nan_pages_as_null_pages():
+    """The fixture really has the shape the test above guards against: pages flagged null with a zero
+    null count, and a column (f32) with no row-group statistics to fall back on."""
+    path = os.path.join(NESTED, "pageindexnan__polars.parquet")
+    md = pq.ParquetFile(path).metadata.row_group(0)
+    assert md.column(1).statistics.null_count == 0
+    assert md.column(2).statistics is None or not md.column(2).statistics.has_min_max
+    f = am.ParquetFile(path)
+    f.read_table(columns=["id"], filters=[("f64", ">", 100.0)])
+    stats = f.last_read_stats
+    # Pages without a NaN still skip; the flagged ones are decoded.
+    assert stats["pages_skipped"] > 0 and stats["pages_decoded"] > 2
+
+
+def test_filter_values_of_other_types_raise():
+    """A date, datetime or Decimal has no filter text; it used to rule out every row group without a
+    word. It now raises, and the stored integer filters a date or timestamp column the way pyarrow's
+    date and datetime values do."""
+    import datetime
+    import decimal
+    path = os.path.join(NESTED, "pageindex__pa_plain_none.parquet")
+    for val in (datetime.date(2021, 1, 1), datetime.datetime(2021, 1, 1), decimal.Decimal("3.5")):
+        with pytest.raises(am.ArrowMetalError, match="must be a str, bool, int or float"):
+            am.read_parquet_table(path, filters=[("id", ">", val)])
+    # numpy scalars are numbers.
+    import numpy as np
+    got = am.read_parquet_table(path, filters=[("id", "<", np.int64(500))])
+    assert _exact(got, [("id", "<", 500)]).num_rows == 97
+    tbl = pa.table({"d": pa.array(range(18_000, 22_000), pa.date32()),
+                    "t": pa.array([v * 86_400_000_000 for v in range(18_000, 22_000)], pa.timestamp("us"))})
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "dates.parquet")
+        pq.write_table(tbl, p, row_group_size=500)
+        day = (datetime.date(2021, 1, 1) - datetime.date(1970, 1, 1)).days
+        want = pq.read_table(p, filters=[("d", ">=", datetime.date(2021, 1, 1))])
+        f = am.ParquetFile(p)
+        got = f.read_table(filters=[("d", ">=", day)])
+        assert f.last_read_stats["row_groups_skipped_by_statistics"] > 0
+        assert _exact(got, [("d", ">=", datetime.date(2021, 1, 1))]).to_pylist() == want.to_pylist()
+        got = f.read_table(filters=[("t", "<", day * 86_400_000_000)])
+        want = pq.read_table(p, filters=[("t", "<", datetime.datetime(2021, 1, 1))])
+        assert _exact(got, [("t", "<", pa.scalar(day * 86_400_000_000, pa.timestamp("us")))]).to_pylist() == want.to_pylist()
 
 
 def test_no_index_means_no_page_skipping():

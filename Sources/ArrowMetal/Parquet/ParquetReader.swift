@@ -99,11 +99,10 @@ extension ParquetFile {
                 names.append(f.name)
                 var column = try readField(f, rowGroups: groups, options: options, plan: plan)
                 // A top-level column takes back what `ARROW:schema` says the Parquet schema lost; a leaf
-                // selected on its own by dotted path reads as the Parquet schema describes it.
-                if let top = fields.first(where: { $0.name == f.name }),
-                   top.leaves.map(\.index) == f.leaves.map(\.index),
-                   let stored = arrowField(for: top) {
-                    column = try applyArrowField(column, stored)
+                // selected on its own by dotted path reads as the Parquet schema describes it. The stored
+                // schema is advisory: a claim the column cannot take leaves it as the Parquet schema says.
+                if let stored = arrowField(for: f), let restored = try? applyArrowField(column, stored) {
+                    column = restored
                 }
                 columns.append(column)
             }
@@ -154,7 +153,13 @@ extension ParquetFile {
             throw ParquetError.malformed("row group \(g) is outside 0..<\(metadata.rowGroups.count)")
         }
         if !options.filters.isEmpty {
-            groups = groups.filter { g in options.filters.allSatisfy { $0.mayMatch(rowGroup: metadata.rowGroups[g], file: self) } }
+            // A row group the statistics rule out is dropped, unless its page index shows those statistics
+            // leave pages out (`rowGroupStatisticsTrusted`); that check runs only on a drop.
+            groups = groups.filter { g in
+                options.filters.allSatisfy {
+                    $0.mayMatch(rowGroup: metadata.rowGroups[g], file: self) || !rowGroupStatisticsTrusted(g, column: $0.column)
+                }
+            }
         }
         return groups
     }
@@ -241,6 +246,10 @@ public struct ParquetFilter: Sendable {
     /// satisfy the filter. Used for a row group's statistics and for one page's column-index entry.
     func mayMatch(lower lo: [UInt8], upper hi: [UInt8], leaf: ParquetLeaf) -> Bool {
         guard let low = decode(lo, leaf), let high = decode(hi, leaf) else { return true }
+        // A NaN bound says nothing (the format asks readers to ignore it), and a literal of another kind
+        // than the column's (a string against a number) cannot be ordered against it: look at the rows.
+        guard !Self.isNaN(low), !Self.isNaN(high), !Self.isNaN(self.value),
+              Self.comparable(low, self.value), Self.comparable(high, self.value) else { return true }
         // `ne` can only be excluded when the whole group is a single value equal to the literal.
         switch op {
         case .eq: return compare(low, high) <= 0 ? (compare(low, self.value) <= 0 && compare(self.value, high) <= 0) : true
@@ -282,6 +291,19 @@ public struct ParquetFilter: Sendable {
             return bytes.first.map { .int(Int64($0 == 0 ? 0 : 1)) }
         case .int96:
             return nil
+        }
+    }
+
+    private static func isNaN(_ v: Value) -> Bool {
+        if case .double(let d) = v { return d.isNaN }
+        return false
+    }
+
+    /// True when `compare` orders the two: numbers against numbers, strings against strings.
+    private static func comparable(_ a: Value, _ b: Value) -> Bool {
+        switch (a, b) {
+        case (.int, .int), (.int, .double), (.double, .int), (.double, .double), (.string, .string): return true
+        default: return false
         }
     }
 

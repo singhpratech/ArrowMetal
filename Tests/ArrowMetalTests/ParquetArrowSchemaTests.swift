@@ -110,12 +110,60 @@ final class ParquetArrowSchemaTests: XCTestCase {
 
     func testAbsentOrMalformedMetadataIsIgnored() throws {
         try requireRealGPU()
-        for name in ["arrowschema__pa_nostore", "arrowschema__pa_corrupt", "arrowschema__pa_truncated"] {
+        for name in ["arrowschema__pa_nostore", "arrowschema__duckdb_nostore",
+                     "arrowschema__duckdb_corrupt", "arrowschema__duckdb_truncated"] {
             let f = try open(name)
+            // The damaged files do carry the key; it just does not decode.
+            let hasKey = f.metadata.keyValueMetadata.contains { $0.0 == ParquetFile.arrowSchemaKey }
+            XCTAssertEqual(hasKey, name.hasSuffix("corrupt") || name.hasSuffix("truncated"), name)
             XCTAssertNil(f.arrowSchema, name)
             let b = try f.read(ParquetReadOptions(dictionaryEncoded: false))
             XCTAssertEqual(temporalType(b["ts_paris"]), .timestamp(.micro, timezone: "UTC"), name)
             XCTAssertEqual(b.length, 300, name)
+            // A key that was not applied stays in the schema metadata, as Arrow's reader keeps it.
+            XCTAssertEqual(f.arrowSchemaMetadata.string(ParquetFile.arrowSchemaKey) != nil, hasKey, name)
+        }
+    }
+
+    func testAStoredSchemaOfAnotherWidthIsIgnored() throws {
+        try requireRealGPU()
+        for name in ["arrowschema__duckdb_fewer", "arrowschema__duckdb_more"] {
+            let f = try open(name)
+            XCTAssertNotNil(f.arrowSchema, name)          // it decodes...
+            let b = try f.read()                            // ...but has 2 or 9 fields against 5 columns
+            XCTAssertEqual(b["id"]?.arrowFormat, "l", name)
+            XCTAssertEqual(temporalType(b["ts_paris"]), .timestamp(.micro, timezone: "UTC"), name)
+            XCTAssertNotNil(f.arrowSchemaMetadata.string(ParquetFile.arrowSchemaKey), name)
+        }
+        // Five stored fields against five columns apply by position, whatever the first one is called.
+        let f = try open("arrowschema__duckdb_renamed")
+        let b = try f.read()
+        XCTAssertEqual(temporalType(b["id"]), .duration(.second))
+        XCTAssertEqual(temporalType(b["ts_paris"]), .timestamp(.micro, timezone: "Asia/Tokyo"))
+        XCTAssertNil(f.arrowSchemaMetadata.string(ParquetFile.arrowSchemaKey))
+    }
+
+    func testAClaimTheColumnCannotTakeIsIgnored() throws {
+        try requireRealGPU()
+        // ARROW:schema calls the struct column `s` a dictionary of structs.
+        let b = try open("arrowschema__duckdb_dictstruct").read()
+        guard case .structure(let s)? = b["s"] else { return XCTFail("s is \(String(describing: b["s"]?.arrowFormat))") }
+        XCTAssertEqual(s.length, 40)
+        XCTAssertEqual(ParquetNestedTests.rows(.structure(s))[1], "{a: 1, b: \"x1\"}")
+    }
+
+    func testOnlyStringAndBinaryCategoricalsComeBackDictionaryEncoded() throws {
+        try requireRealGPU()
+        for name in ["arrowschema__pa_categoricals", "arrowschema__pa_categoricals_plain"] {
+            let b = try open(name).read(ParquetReadOptions(dictionaryEncoded: false))
+            guard case .dictionary(_, let s)? = b["cat_str"] else { return XCTFail("\(name): cat_str is not a dictionary") }
+            XCTAssertEqual(s.arrowFormat, "u", name)
+            guard case .dictionary(_, let bin)? = b["cat_bin"] else { return XCTFail("\(name): cat_bin is not a dictionary") }
+            XCTAssertEqual(bin.arrowFormat, "z", name)
+            // Arrow's reader restores a dictionary type only over strings and binaries; so does this one.
+            XCTAssertEqual(b["cat_int"]?.arrowFormat, "l", name)
+            XCTAssertEqual(temporalType(b["cat_ts"]), .timestamp(.micro, timezone: "UTC"), name)
+            XCTAssertEqual(b["cat_date"]?.arrowFormat, "tdD", name)
         }
     }
 }
