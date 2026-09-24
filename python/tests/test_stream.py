@@ -419,3 +419,19 @@ def test_two_gigabyte_ipc_directory(tmp_path):
         assert sum(groups["n"].to_pylist()) == expected_rows
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_scan_ipc_keeps_two_columns_of_the_same_name(tmp_path):
+    """Two columns named alike used to come back as two copies of the first: the default projection
+    looked every column up by name. Found 2026-09-24 by the review of the IPC lane."""
+    import pyarrow.ipc as ipc
+    t = pa.table([pa.array([1, 2, 3]), pa.array(["a", "b", "c"]), pa.array([10, 20, 30]), pa.array(["x", "y", "z"])],
+                 names=["a", "b", "a", "b"])
+    p = str(tmp_path / "dup.arrow")
+    with ipc.new_file(p, t.schema) as w:
+        w.write_table(t)
+    got = am.scan_ipc(p).collect()
+    assert got.column_names == ["a", "b", "a", "b"]
+    assert [c.to_pylist() for c in got.columns] == [c.to_pylist() for c in t.columns]
+    filtered = am.scan_ipc(p).filter(am.col("a") > 1).collect()
+    assert [c.to_pylist() for c in filtered.columns] == [[2, 3], ["b", "c"], [20, 30], ["y", "z"]]
