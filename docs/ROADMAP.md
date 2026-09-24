@@ -7,6 +7,12 @@ This is the only roadmap: the older `../ROADMAP.md` now points here.
 
 ## Kernels
 
+- **The router's table from a quiet run.** The CPU/GPU router on `main` routes seven operations from a
+  crossover table fitted on a machine that was building other work at the time; near 300,000 rows it
+  still picks the slower path for `min`, `max` and the grouped sum. A quiet `Benchmarks/router_check.py`
+  run and `Benchmarks/router_table.py --from-check` refit it. Float columns have no measured crossover
+  yet and stay on the GPU.
+
 - **Grouped moments at a few groups.** Variance at a thousand groups is 0.96x of pyarrow at 50M rows
   (0.78x of it in the eager baseline), and stddev 1.24x of the fastest parallel idiom, because Metal
   has no 64-bit atomics and the software-binary64 accumulators cannot be privatised per threadgroup.
@@ -33,8 +39,9 @@ This is the only roadmap: the older `../ROADMAP.md` now points here.
 The gaps a caller meets at the border. Each one is a type or an interface ArrowMetal does not answer
 to yet; the by-family status of every one of them is in [COVERAGE.md](COVERAGE.md).
 
-- **`utf8_view` / `binary_view`** import and export. Nothing in `Sources/` reads the `vu` / `vz`
-  formats today; the list views import and re-export as a plain list.
+- **`utf8_view` / `binary_view` through the C Data Interface.** The IPC reader takes the view types on
+  `main` (materialised to the classic layouts), but the C Data importer and exporter still do not read
+  the `vu` / `vz` formats, and the list views import and re-export as a plain list.
 - **decimal256 beyond selection.** Import, export, the comparisons, `filter` / `take` / `slice` and
   `sum` are there; `min` / `max`, arithmetic, the rounding family and the casts throw rather than
   compute something wrong (`Sources/ArrowMetal/Decimal.swift`).
@@ -66,10 +73,13 @@ to yet; the by-family status of every one of them is in [COVERAGE.md](COVERAGE.m
   and `ArrowMetalMLX`, a bridge to `MLXArray` for feeding columns into models. Neither target exists
   yet; both would go through the Arrow C interfaces rather than becoming dependencies
   ([DECISIONS.md](DECISIONS.md)).
-- **Polars:** an `engine="metal"` behind `collect()` that hands the optimised plan to the C ABI, the way
-  the GPU engine hands it to cuDF. Needs Polars.
-- **DuckDB:** an optimizer rule that pushes scan, filter and aggregate down into the extension. Needs
-  DuckDB.
+- **Polars:** `lf.collect(engine=am.MetalEngine())` runs the parts of an optimised plan it can take on
+  `main` ([POLARS.md](POLARS.md), tier 4). Still open: plans that start from a file scan, and a named
+  `engine="metal"`, which needs a change in Polars itself.
+- **DuckDB:** an optimizer extension on `main` runs eligible aggregates of unchanged SQL on the GPU
+  ([DUCKDB.md](DUCKDB.md) §4b). Still open: shapes beyond those aggregates, and a signed build, since an
+  unsigned C++ extension is tied to one DuckDB release and must be loaded with
+  `allow_unsigned_extensions`.
 - **pandas:** a stable extension-array hook for compute kernels, so the accelerator stops patching.
 - **Apache Arrow:** a round-trip test between ArrowMetal and nanoarrow's experimental Metal device implementation (memory only today), so the two agree on `ARROW_DEVICE_METAL`.
 - **DataFusion, Ibis, Lance, Hugging Face datasets, MLX:** one operator, one backend, one scan, one
