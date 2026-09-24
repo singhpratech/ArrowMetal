@@ -567,7 +567,15 @@ def test_true_division_by_a_literal_is_polars_reciprocal_multiply():
         pl.when(pl.col("q") % 11 == 0).then(None).otherwise(pl.col("x")).alias("xn"))
     ieee = x / 3.0
     off = int((df.select(pl.col("x") / 3.0)["x"].to_numpy() != ieee)[~np.isnan(x)].sum())
-    assert 0.30 < off / n < 0.37, off           # "about a third of Float64 rows" (docs/POLARS.md)
+    assert 0.30 < off / n < 0.37, off           # "about a third of Float64 rows for / 3.0"
+    # "At most one ulp, in a share of rows that depends on the divisor ... none for a power of two".
+    finite = np.isfinite(x)
+    for d in (3.0, 7.0, 0.1, 1e-5, 3.3333333333333335, 0.3, 2.0, 0.125, 2.0 ** -40):
+        got = df.select(pl.col("x") / d)["x"].to_numpy()[finite].view(np.int64)
+        ulps = np.abs(got - (x[finite] / d).view(np.int64))
+        assert ulps.max() <= 1, (d, ulps.max())
+        if d in (2.0, 0.125, 2.0 ** -40):
+            assert ulps.max() == 0, d
     for c in ("x", "f", "i", "i8", "xn"):
         exprs = [(pl.col(c) / d).alias(f"{c}/{d}")
                  for d in (3.0, 7, 0.1, 1e-310, 0.0, -0.0, float("inf"), float("nan"), -2.5)]
@@ -582,6 +590,96 @@ def test_true_division_by_a_literal_is_polars_reciprocal_multiply():
     check(df.lazy().with_columns((pl.col("x") / 3.0).alias("y")).sort("q"), kinds=["Sort"],
           order=True)
 
+
+
+# A finite float literal of magnitude 2**63 or more traps the process inside ArrowMetal's expression
+# compiler (it converts every float literal to Int64 as well), so the translator declines it. Run in
+# a child process: a trap there fails this test instead of ending the pytest run.
+_HUGE_LITERALS = r"""
+import json, sys, warnings
+import numpy as np, polars as pl
+from polars.testing import assert_frame_equal
+import arrowmetal as am
+warnings.simplefilter("ignore")
+df = pl.DataFrame({"x": [1.0, 2.0, None, 1e19, -1e19, float("nan")],
+                   "f": pl.Series([1.0, 2.0, None, 1e19, -1e19, float("nan")], dtype=pl.Float32),
+                   "i": [1, 2, None, 4, 5, 6]})
+x, f = pl.col("x"), pl.col("f")
+declined = {
+    "gt": x > 1e19, "eq": x == 1e19, "lt_neg": x < -1e19, "f32_gt": f > 1e19,
+    "f32_lit": f > pl.lit(1e30, pl.Float32), "mul": x * 1e30, "add": x + 1e100, "sub": x - 1e100,
+    "int_mul": pl.col("i") * 1e19, "fill_null": x.fill_null(1e19),
+    "when_then": pl.when(x > 1.5).then(1e19).otherwise(x), "is_in": x.is_in([1.0, 1.7e308]),
+    "recip_63": x / 2.0 ** -63, "recip_1022": x / 2.0 ** -1022, "f32_recip": f / 2.0 ** -70,
+}
+taken = {"below": x * 9.2e18, "min_i64": x * -(2.0 ** 63), "inf": x * float("inf")}
+out = {}
+for name, e in declined.items():
+    lf = df.lazy().select(e.alias("o"))
+    eng = am.MetalEngine(min_rows=0, shapes="all")
+    assert_frame_equal(lf.collect(engine=eng), lf.collect())
+    out[name] = [not eng.last_report.taken, list(eng.last_report.fallbacks)]
+for name, e in taken.items():
+    lf = df.lazy().select(e.alias("o"))
+    eng = am.MetalEngine(min_rows=0, shapes="all", raise_on_fail=True)
+    assert_frame_equal(lf.collect(engine=eng), lf.collect())
+    out[name] = [bool(eng.last_report.taken), []]
+# The shape the default engine takes: a large sort, here with a filter against such a literal.
+n = 1_000_000
+rng = np.random.default_rng(3)
+big = pl.DataFrame({"q": rng.integers(0, 10**9, n), "x": rng.standard_normal(n) * 1e19})
+lf = big.lazy().filter(pl.col("x") < 1e19).sort("q")
+eng = am.MetalEngine()
+assert_frame_equal(lf.collect(engine=eng).sort("q", "x"), lf.collect().sort("q", "x"))
+out["default_sort"] = [True, list(eng.last_report.fallbacks)]
+print(json.dumps(out))
+"""
+
+
+def test_a_float_literal_of_magnitude_2_63_or_more_falls_back_instead_of_trapping():
+    env = dict(os.environ, PYTHONPATH=os.path.join(REPO, "python"))
+    r = subprocess.run([sys.executable, "-c", _HUGE_LITERALS], env=env, cwd=REPO,
+                       capture_output=True, text=True, timeout=600)
+    assert r.returncode == 0, (r.returncode, r.stderr[-2000:])
+    out = json.loads(r.stdout.strip().splitlines()[-1])
+    for name, (ok, fallbacks) in out.items():
+        assert ok, (name, fallbacks)
+        if name not in ("below", "min_i64", "inf", "default_sort"):
+            assert any("2**63" in fb for fb in fallbacks), (name, fallbacks)
+    assert any("2**63" in fb for fb in out["default_sort"][1]), out["default_sort"]
+
+
+def test_multiply_by_minus_one_is_a_negation_like_polars():
+    """Polars multiplies a float by a scalar -1 (either side, or divides by -1) as a negation, so a
+    NaN comes back with its sign bit flipped; the engine emits `negate` and matches the raw bits,
+    which `assert_frame_equal` cannot see. Any other multiplier keeps the input NaN in both."""
+    nan = float("nan")
+    x = np.array([nan, -nan, 1.0, 0.0, -0.0, np.inf, 5e-324, -2.5, 3.0])
+    df = pl.DataFrame({"x": x, "f": x.astype(np.float32), "i": np.arange(9) - 4}).with_columns(
+        pl.when(pl.col("i") == 0).then(None).otherwise(pl.col("x")).alias("xn"))
+    for c in ("x", "f", "xn", "i"):
+        col = pl.col(c)
+        cases = {f"{c}*-1.0": col * -1.0, f"-1.0*{c}": -1.0 * col, f"{c}/-1.0": col / -1.0,
+                 f"{c}*-1": col * -1, f"{c}/-1": col / pl.lit(-1),
+                 f"{c}*f32(-1)": col * pl.lit(-1.0, pl.Float32),
+                 f"{c}*-2.5": col * -2.5, f"{c}*-1.0000000000000002": col * -1.0000000000000002,
+                 f"{c}/3.0": col / 3.0}
+        lf = df.lazy().select([e.alias(k) for k, e in cases.items()])
+        want = lf.collect()
+        eng = metal()
+        got = lf.collect(engine=eng)
+        assert got.schema == want.schema
+        for k in cases:
+            a, b = want[k], got[k]
+            assert (a.is_null() == b.is_null()).all(), k
+            an, bn = a.to_numpy(), b.to_numpy()
+            if an.dtype.kind == "f":
+                view = np.uint32 if an.dtype == np.float32 else np.uint64
+                assert (an.view(view) == bn.view(view)).all(), (k, an, bn)
+            else:
+                assert a.equals(b), k
+        plan = eng.last_report.taken[0]["plan"]
+        assert "(negate " in plan and "(f64 -1.0)" not in plan, plan
 
 LOSSLESS = {"int8": [pl.Int16, pl.Int64, pl.Float64, pl.Float32], "int16": [pl.Int32, pl.Float32],
             "int32": [pl.Int64, pl.Float64], "int64": [pl.Float64],

@@ -439,7 +439,7 @@ Read from the installed package and checked by `python/tests/test_polars_engine.
 | Expression | ArrowMetal |
 |---|---|
 | column, alias, typed literal (a Null literal takes the type it meets) | `(col ...)`, the literal at Polars' own dtype |
-| `+ - *`, true division | `add sub mul div`, each operand cast to the result dtype Polars' `get_dtype` gives; a literal divisor as `mul` by its reciprocal, which is how Polars divides by a scalar (below); Float32 goes through binary64 (below) |
+| `+ - *`, true division | `add sub mul div`, each operand cast to the result dtype Polars' `get_dtype` gives; a literal divisor as `mul` by its reciprocal, which is how Polars divides by a scalar (below); a float multiply by a scalar -1 as `negate`, as Polars does (below); Float32 goes through binary64 (below) |
 | `== != < <= > >=` | `eq ne lt le gt ge`; floats in Polars' total order; String against a literal by `str_eq` (`==`, `!=` only) |
 | `&`, `\|`, `^`, `~` | `and_kleene`, `or_kleene`, `ne` of the two as integers for Boolean xor, `bit_and`/`bit_or`/`bit_xor` on integers, `not`/`bit_not` |
 | `when/then/otherwise` | `if_else`, a null condition taking the `otherwise` branch |
@@ -451,8 +451,11 @@ Read from the installed package and checked by `python/tests/test_polars_engine.
 
 Everything else -- `%`, `//`, `eq_missing`, `str.ends_with`, regex, windows (`over`), `rank`,
 `median`, an expression over an aggregate, a String-valued output, a narrowing or fallible cast,
-true division by a scalar that is not a plain literal, a column name holding a NUL byte (Polars'
-own Arrow export panics on one) -- falls back, and the report says which one. Categorical, Enum, Decimal, List, Struct, Null, Binary
+true division by a scalar that is not a plain literal, a finite float literal of magnitude 2^63
+or more (directly, or as the reciprocal of a divisor such as `2.0**-1022`: ArrowMetal's expression
+compiler converts every float literal to Int64 as well, which traps the process for such a value),
+a column name holding a NUL byte (Polars' own Arrow export panics on one) -- falls back, and the
+report says which one. Categorical, Enum, Decimal, List, Struct, Null, Binary
 and Object columns in a subtree's input keep the whole subtree on Polars.
 
 ### Where the answers would differ, and what the engine emits instead
@@ -468,10 +471,15 @@ Each line is a differential case in `test_polars_engine.py`, run against Polars 
   software binary64 and rounds once back to Float32, which is the correctly rounded Float32 result
   for these four operations, subnormals included. Float64 `+ - * /` is correctly rounded in both.
 * **Division by a scalar.** Polars divides a column by a scalar as `x * (1 / c)`, with the
-  reciprocal rounded in the result type; that differs from the correctly rounded `x / c` by one ulp
-  in about a third of Float64 rows. The engine emits the same multiply, so the bits match Polars'
+  reciprocal rounded in the result type; that differs from the correctly rounded `x / c` by at most
+  one ulp, in a share of rows that depends on the divisor (about a third of Float64 rows for `/ 3.0`,
+  none for a power of two). The engine emits the same multiply, so the bits match Polars'
   (`test_true_division_by_a_literal_is_polars_reciprocal_multiply`, which also checks zero, infinite,
   NaN, subnormal and null divisors). A column divisor is a true division in both.
+* **Multiplying by -1.** Polars multiplies a float column by a scalar -1 (on either side, and divides
+  by -1) as a negation, which flips a NaN's sign bit where a multiply keeps the input NaN. The engine
+  emits ArrowMetal's `negate` there, so NaN rows carry Polars' bits too
+  (`test_multiply_by_minus_one_is_a_negation_like_polars`, which compares the raw bits).
 * **Aggregates.** A `sum` over no values is 0 in Polars (ArrowMetal: null) and gets a `fill_null`; a
   `min`/`max` over only NaN is NaN in Polars (ArrowMetal: null over a whole frame, an infinity per
   group), so the engine counts the non-null and non-NaN values and decides from the two; a `mean` of

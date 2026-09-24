@@ -222,11 +222,13 @@ Integrations
   plans and runs them on the GPU through Polars' post-optimisation callback, leaving every other node
   to Polars; `engine.last_report` says what ran where and why. Results are Polars' own (float total
   order, `is_in` matching NaN, Kleene logic, Polars' aggregate dtypes and empty-group answers, Float32
-  arithmetic without subnormal flushing, division by a literal as Polars' reciprocal multiply), checked by `python/tests/test_polars_engine.py` against Polars across sizes,
+  arithmetic without subnormal flushing, division by a literal as Polars' reciprocal multiply, a float
+  multiply by -1 as Polars' negation, NaN sign bits included), checked by `python/tests/test_polars_engine.py` against Polars across sizes,
   null ratios, dtypes and chunked and sliced frames. By default it takes the shapes the provisional
   benchmark (`Benchmarks/polars_engine_bench.py`) measured ahead of both Polars engines -- full sorts
   from 1M rows -- and `shapes="all"` takes everything it can translate. Imports of Polars columns are
-  cached by buffer address across queries.
+  cached by buffer address across queries. A float literal of magnitude 2^63 or more, which traps the
+  process inside ArrowMetal's expression compiler, is left to Polars.
 - Four engine behaviours found by that suite and worked around in `polars_engine.py`, each pinned by a
   strict xfail: String compaction reading bytes under a null slot, a Boolean column's null count lost
   through the plan's sort, a filter rejecting a plan that carries a `date32` column, and a String sort

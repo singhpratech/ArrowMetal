@@ -48,6 +48,7 @@ version this module was written against is `TESTED_IR_VERSION` and a test fails 
 upgrade moves it.
 """
 import json
+import math
 import os
 import re
 import time
@@ -177,6 +178,28 @@ def _reciprocal(value, code):
         return float(np.float64(1.0) / np.float64(value))
 
 
+def _float_text(f, code):
+    """`f` as an ArrowMetal float literal. A finite value outside [-2**63, 2**63) is declined:
+    ArrowMetal's expression compiler converts every float literal to Int64 as well
+    (Sources/ArrowMetal/Expr/ExprSource.swift), and that conversion traps the process for such a
+    value, where a declined literal leaves the plan to Polars."""
+    with np.errstate(over="ignore"):
+        g = float(np.float32(f)) if code == "f32" else f
+    if any(math.isfinite(v) and not -_TWO_63 <= v < _TWO_63 for v in (f, g)):
+        raise _Unsupported(f"float literal {f!r} has magnitude 2**63 or more (ArrowMetal's "
+                           "expression compiler cannot lower it)")
+    return f"({code} {repr(f)})"
+
+
+_TWO_63 = float(2 ** 63)
+
+
+def _is_minus_one(x):
+    """`x` is a scalar literal equal to -1."""
+    return (x.is_lit and not x.has_col and not isinstance(x.lit, bool)
+            and isinstance(x.lit, (int, float)) and x.lit == -1)
+
+
 def _num_lit(value, code):
     """A typed literal, or None when `value` is not exactly representable in `code`."""
     if value is None:
@@ -201,7 +224,7 @@ def _num_lit(value, code):
         f = float(value)
         if isinstance(value, int) and int(f) != value:
             return None
-        return f"({code} {repr(f)})"
+        return _float_text(f, code)
     return None
 
 
@@ -959,11 +982,18 @@ class _Translator:
                     raise _Unsupported("true division by a scalar expression")
                 if r2.lit is not None:
                     am = "mul"
-                    r2 = _E(f"(f64 {repr(_reciprocal(r2.lit, want))})", "f64", False,
-                            dtype=pl.Float64, lit=None, is_lit=True, has_col=False)
-                    if want == "f64":
+                    rec = _reciprocal(r2.lit, want)
+                    r2 = _E(_float_text(rec, "f64"), "f64", False, dtype=pl.Float64, lit=rec,
+                            is_lit=True, has_col=False)
+                    if want == "f64" and rec != -1.0:
                         return _E(f"(mul {l2.s} {r2.s})", want, nullable, dtype=_dtype_of(want),
                                   has_col=has_col)
+            if am == "mul" and _is_float(want) and (_is_minus_one(l2) or _is_minus_one(r2)):
+                # Polars multiplies a float by a scalar -1 (either side, or divides by -1) as a
+                # negation, which flips a NaN's sign bit where a multiply keeps the input NaN.
+                o64 = self._to(r2 if _is_minus_one(l2) else l2, "f64")
+                s = f"(negate {o64.s})" if want == "f64" else f"(cast (negate {o64.s}) f32)"
+                return _E(s, want, nullable, dtype=_dtype_of(want), has_col=has_col)
             if want == "f32":
                 # The GPU's float ALUs flush subnormals to zero; Polars does not. Binary64 (software,
                 # correctly rounded) and one rounding back gives the correctly rounded Float32
