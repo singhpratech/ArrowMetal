@@ -165,7 +165,7 @@ enum JSONKernels {
             set(enc, src, 0); bytes(enc, P, 1); set(enc, escKey, 2)
             Dispatch.dispatch1D(enc, p, count: nblocks)
         }
-        jprof("  escape"); let escIn = try maxScan(ctx, escKey, nblocks); jprof("  maxscan")
+        let escIn = try maxScan(ctx, escKey, nblocks)
         let qpar = try alloc(ctx, nblocks * 4)
         try ctx.run { enc in
             let p = try pso(ctx, "jb_quotes")
@@ -173,7 +173,7 @@ enum JSONKernels {
             set(enc, src, 0); bytes(enc, P, 1); set(enc, escIn, 2); set(enc, qpar, 3)
             Dispatch.dispatch1D(enc, p, count: nblocks)
         }
-        jprof("  quotes"); let qScan = try sumScan(ctx, qpar, nblocks)
+        let qScan = try sumScan(ctx, qpar, nblocks)
         let delta = try alloc(ctx, nblocks * 4)
         try ctx.run { enc in
             let p = try pso(ctx, "jb_depth")
@@ -181,7 +181,7 @@ enum JSONKernels {
             set(enc, src, 0); bytes(enc, P, 1); set(enc, escIn, 2); set(enc, qScan, 3); set(enc, delta, 4)
             Dispatch.dispatch1D(enc, p, count: nblocks)
         }
-        jprof("  depth"); let dScan = try sumScan(ctx, delta, nblocks)
+        let dScan = try sumScan(ctx, delta, nblocks)
         let counts = try alloc(ctx, nblocks * 4)
         let firstErr = try alloc(ctx, 4)
         firstErr.mutableTyped(UInt32.self)[0] = .max
@@ -193,14 +193,14 @@ enum JSONKernels {
             set(enc, counts, 5); set(enc, firstErr, 6); set(enc, errCode, 7)
             Dispatch.dispatch1D(enc, p, count: nblocks)
         }
-        jprof("  records"); let base = try sumScan(ctx, counts, nblocks)
+        let base = try sumScan(ctx, counts, nblocks)
         let total = Int(base.typed(Int32.self)[nblocks])
         let recStart = try alloc(ctx, total * 4)
         let recEnd = try alloc(ctx, total * 4)
         // A record whose closing bracket never comes runs to the end of the file; the walk reports it.
         var fill = UInt32(n)
         if total > 0 { memset_pattern4(recEnd.mutableContents, &fill, total * 4) }
-        jprof("  fill"); if total > 0 {
+        if total > 0 {
             let scratch = try alloc(ctx, 4)
             try ctx.run { enc in
                 let p = try pso(ctx, "jb_emit")
@@ -314,35 +314,60 @@ enum JSONKernels {
         }
     }
 
-    struct Scatter { var count: UInt32; var rows: UInt32; var fidLo: Int32; var fidHi: Int32; var atomicMode: UInt32 }
+    struct Scatter { var count: UInt32; var rows: UInt32; var fidLo: Int32; var fidHi: Int32; var atomicMode: UInt32; var kindsMode: UInt32 }
+
+    /// Fields per group for which the scatter also gathers the kinds (`KINDS_FIELDS` in the kernel).
+    static let kindsFields = 64
 
     /// Slot matrix for fields [lo, hi): `(hi - lo) * rows` entry indices, -1 where the field is missing.
-    /// Returns the first entry that named a field its object had already named, if any.
+    /// Returns the first entry that named a field its object had already named, if any, and -- when the
+    /// group has at most `kindsFields` fields -- every field's kinds, as `kinds` would compute them.
     static func scatter(_ ctx: MetalContext, level: JSONLevel, fid: MetalArrowBuffer, rows: Int, lo: Int, hi: Int,
-                        mayRepeat: Bool) throws -> (matrix: MetalArrowBuffer, firstDup: Int?) {
+                        mayRepeat: Bool, wanted: [Bool])
+        throws -> (matrix: MetalArrowBuffer, firstDup: Int?, kinds: [(mask: UInt32, flags: UInt32)]?) {
         let slots = (hi - lo) * rows
         let M = try alloc(ctx, slots * 4)
-        memset(M.mutableContents, 0xFF, slots * 4)
+        let withKinds = hi - lo <= kindsFields
+        let kinds = try alloc(ctx, (hi - lo) * 12, zeroed: true)
         let P = Scatter(count: UInt32(level.count), rows: UInt32(rows), fidLo: Int32(lo), fidHi: Int32(hi),
-                        atomicMode: mayRepeat ? 1 : 0)
-        guard level.count > 0 else { return (M, nil) }
+                        atomicMode: mayRepeat ? 1 : 0, kindsMode: withKinds ? 1 : 0)
         try ctx.run { enc in
-            let p = try pso(ctx, "jm_scatter")
-            enc.setComputePipelineState(p)
-            bytes(enc, P, 0); set(enc, level.entries, 1); set(enc, fid, 2); set(enc, M, 3)
-            Dispatch.dispatch1D(enc, p, count: level.count)
+            if slots > 0 {
+                let f = try pso(ctx, "jm_fill")
+                enc.setComputePipelineState(f)
+                set(enc, M, 0); bytes(enc, UInt32(slots), 1)
+                Dispatch.dispatch1D(enc, f, count: slots)
+                enc.memoryBarrier(scope: .buffers)
+            }
+            if level.count > 0 {
+                let p = try pso(ctx, "jm_scatter")
+                enc.setComputePipelineState(p)
+                bytes(enc, P, 0); set(enc, level.entries, 1); set(enc, fid, 2); set(enc, M, 3); set(enc, kinds, 4)
+                Dispatch.dispatch1D(enc, p, count: level.count)
+            }
         }
-        guard mayRepeat else { return (M, nil) }
+        var fieldKinds: [(mask: UInt32, flags: UInt32)]? = nil
+        if withKinds {
+            let k = kinds.typed(UInt32.self)
+            fieldKinds = (0..<(hi - lo)).map { j in
+                (k[3 * j] | (Int(k[3 * j + 2]) < rows ? 1 : 0), k[3 * j + 1])
+            }
+        }
+        guard mayRepeat, level.count > 0 else { return (M, nil, fieldKinds) }
         let first = try alloc(ctx, 4)
         first.mutableTyped(UInt32.self)[0] = .max
+        let table = try alloc(ctx, hi - lo)
+        let tp = table.mutableTyped(UInt8.self)
+        for j in 0..<(hi - lo) { tp[j] = wanted[j] ? 1 : 0 }
         try ctx.run { enc in
             let p = try pso(ctx, "jm_dups")
             enc.setComputePipelineState(p)
             bytes(enc, P, 0); set(enc, level.entries, 1); set(enc, fid, 2); set(enc, M, 3); set(enc, first, 4)
+            set(enc, table, 5)
             Dispatch.dispatch1D(enc, p, count: level.count)
         }
         let f = first.typed(UInt32.self)[0]
-        return (M, f == .max ? nil : Int(f))
+        return (M, f == .max ? nil : Int(f), fieldKinds)
     }
 
     /// First entry whose field id is not marked expected.
@@ -546,12 +571,3 @@ enum JSONKernels {
     }
 }
 
-// TEMP-PROFILE
-let jprofOn = ProcessInfo.processInfo.environment["JPROF"] != nil
-var jprofLast = DispatchTime.now().uptimeNanoseconds
-func jprof(_ label: String) {
-    guard jprofOn else { return }
-    let now = DispatchTime.now().uptimeNanoseconds
-    FileHandle.standardError.write("  [jprof] \(label): \(String(format: "%.2f", Double(Int64(bitPattern: now &- jprofLast)) / 1e6)) ms\n".data(using: .utf8)!)
-    jprofLast = now
-}

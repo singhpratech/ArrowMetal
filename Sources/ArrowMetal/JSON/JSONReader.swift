@@ -3,12 +3,13 @@ import Metal
 
 // Newline-delimited JSON, parsed on the GPU (docs/JSON.md).
 //
-// `JSONReader` reads a file into Metal shared memory and turns its top-level objects into Arrow columns with the semantics of
-// `pyarrow.json.read_json`: the same type inference (null, bool, int64, double, timestamp[s], string,
-// struct, list), the same field order (first appearance), the same explicit-schema and
-// unexpected-field options, and the same error texts. The structure scan, the per-record walk, key
-// matching, string unescaping and timestamp parsing run as Metal kernels (`Kernels/JSONSource.swift`);
-// number text is gathered on the GPU and handed to `MetalStringArray.parse`.
+// `JSONReader` reads a file into Metal shared memory and turns its top-level objects into Arrow
+// columns with the semantics of `pyarrow.json.read_json`: the same type inference (null, bool, int64,
+// double, timestamp[s], string, struct, list), the same field order (first appearance), the same
+// explicit-schema and unexpected-field options, and the same error texts. The structure scan, the
+// per-record walk, key matching, string unescaping and timestamp parsing run as Metal kernels
+// (`Kernels/JSONSource.swift`); number text is gathered on the GPU and handed to
+// `MetalStringArray.parse`.
 
 /// What to do with a field the explicit schema does not name (pyarrow's `unexpected_field_behavior`).
 public enum JSONUnexpectedFieldBehavior: String, Sendable {
@@ -224,7 +225,7 @@ public final class JSONReader: @unchecked Sendable {
         let start = (n >= 3 && host[0] == 0xEF && host[1] == 0xBB && host[2] == 0xBF) ? 3 : 0
 
         // Stage 1: where the records are.
-        jprof("start"); let recs = try JSONKernels.records(ctx, source, n: n, start: start); jprof("records")
+        let recs = try JSONKernels.records(ctx, source, n: n, start: start)
         // Stage 2: validate every record and count its fields.
         let (counts, walkError) = try JSONKernels.walkCount(ctx, source, n: n, spanStart: recs.start,
                                                             spanEnd: recs.end, spans: recs.count)
@@ -236,7 +237,10 @@ public final class JSONReader: @unchecked Sendable {
         let recStart = recs.start.typed(UInt32.self)
         if let top = recs.topError {
             var lo = 0, hi = recs.count
-            while lo < hi { let mid = (lo + hi) / 2; if Int(recStart[mid]) < top.position { lo = mid + 1 } else { hi = mid } }
+            while lo < hi {
+                let mid = (lo + hi) / 2
+                if Int(recStart[mid]) < top.position { lo = mid + 1 } else { hi = mid }
+            }
             rows = lo
             let text = JSONSyntax.message(top.code)
             syntax = (top.position, JSONSyntax.hasRow(top.code) ? "\(text) in row \(lo)" : text)
@@ -246,11 +250,12 @@ public final class JSONReader: @unchecked Sendable {
             rows = w.code == 14 ? w.span : w.span + 1
             syntax = (w.position, "\(JSONSyntax.message(w.code)) in row \(w.span)")
         }
-        jprof("walkCount"); let level = try JSONKernels.walkEmit(ctx, source, n: n, spanStart: recs.start, spanEnd: recs.end,
+        let level = try JSONKernels.walkEmit(ctx, source, n: n, spanStart: recs.start, spanEnd: recs.end,
                                              spans: rows, counts: counts)
         // Stage 3: columns.
-        let builder = JSONColumnBuilder(context: ctx, source: source, n: n, host: host, behavior: options.unexpectedFieldBehavior)
-        jprof("walkEmit"); let (names, columns) = try builder.fields(level: level, rows: rows, schema: options.explicitSchema,
+        let builder = JSONColumnBuilder(context: ctx, source: source, n: n, host: host,
+                                        behavior: options.unexpectedFieldBehavior)
+        let (names, columns) = try builder.fields(level: level, rows: rows, schema: options.explicitSchema,
                                                   path: "", rowToRecord: { $0 })
         let firstParse = builder.parseErrors.min(by: { $0.position < $1.position })
         if let e = firstParse, syntax == nil || e.position < syntax!.position { throw JSONError.parse(e.message) }

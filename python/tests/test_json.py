@@ -351,6 +351,8 @@ EXPLICIT = {
     "ignored_object": ('{"a":1,"z":{"q":1}}\n', S(("a", pa.int64()), unexpected_field_behavior="ignore")),
     "ignored_conflict": ('{"a":1,"z":[1,"x"]}\n', S(("a", pa.int64()), unexpected_field_behavior="ignore")),
     "ignored_duplicate": ('{"a":1,"z":1,"z":2}\n', S(("a", pa.int64()), unexpected_field_behavior="ignore")),
+    "ignored_duplicate_between_kept": ('{"a":1,"z":1,"z":2,"c":1}\n',
+                                       S(("a", pa.int64()), ("c", pa.int64()), unexpected_field_behavior="ignore")),
     "duplicate_in_error_mode": ('{"a":1,"a":2}\n', S(("a", pa.int64()), unexpected_field_behavior="error")),
     "duplicate_inferred_with_schema": ('{"z":1,"z":2}\n', S(("a", pa.int64()))),
     "unexpected_then_conflict": ('{"a":1}\n{"a":"x","z":1}\n', S(("a", pa.int64()), unexpected_field_behavior="error")),

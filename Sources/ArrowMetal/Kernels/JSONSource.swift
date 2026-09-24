@@ -4,14 +4,17 @@ import Foundation
 ///
 /// The reader runs in three stages, all on the GPU:
 ///
-/// 1. **Structure** (`jb_*`, one thread per 64-byte block). A backslash escapes the byte after it, so
-///    whether a block starts inside an escape depends only on the parity of the backslash run that ends
-///    the last block before it that is not all backslashes: `jb_escape` writes that as a key, and a
-///    max-scan (`js_*`) hands every block its carry. `jb_quotes` counts unescaped quotes, a sum-scan of
-///    their parity gives the in-string state at every block start, `jb_depth` counts brackets outside
-///    strings, and a sum-scan of those gives the nesting depth at every block start. `jb_records` and
-///    `jb_emit` then find the top-level values: a `{` at depth 0 opens a record, the bracket that brings
-///    the depth back to 0 closes it, and anything else at depth 0 that is not whitespace is an error.
+/// 1. **Structure** (`jb_*`, one thread per block of `blockBytes` bytes, read as 64-byte chunks of
+///    bit masks). A backslash escapes the byte after it, so whether a block starts inside an escape
+///    depends only on the parity of the backslash run that ends the last block before it that is not
+///    all backslashes: `jb_escape` writes that as a key, and a max-scan (`js_*`) hands every block its
+///    carry. `jb_quotes` counts unescaped quotes, a sum-scan of their parity gives the in-string state
+///    at every block start, `jb_depth` counts brackets outside strings, and a sum-scan of those gives
+///    the nesting depth at every block start. Inside a block the classes come from SWAR compares, the
+///    escaped bytes from the carry, and the string bytes from a prefix XOR of the quote mask.
+///    `jb_records` and `jb_emit` then find the top-level values: a `{` at depth 0 opens a record, the
+///    bracket that brings the depth back to 0 closes it, a `null` at depth 0 is a record of nulls, and
+///    anything else at depth 0 that is not whitespace is an error.
 /// 2. **Walk** (`jw_walk`, one thread per span). Each record (or, one level down, each nested object or
 ///    array) is walked by a single thread with an explicit container stack. The walk validates the full
 ///    JSON grammar with the error texts of RapidJSON (the parser pyarrow uses) and emits one `JEntry`
@@ -19,11 +22,12 @@ import Foundation
 ///    once to write at the scanned offsets.
 /// 3. **Columns** (`jk_*`, `jm_*`, `jc_*`, `jg_*`, `jt_*`). Keys are matched against the first object's
 ///    layout by a byte compare; the rest are dictionary-encoded on the GPU. Entries are scattered into a
-///    row-by-field slot matrix, kinds are OR-reduced per column, strings are unescaped in a length pass
-///    and a write pass, number text is gathered for the string-to-number parse, and ISO-8601 strings are
-///    parsed to timestamps.
+///    row-by-field slot matrix (which also OR-reduces each field's kinds), strings are unescaped in a
+///    length pass and a write pass, number text is gathered for the string-to-number parse, and
+///    ISO-8601 strings are parsed to timestamps.
 enum JSONSource {
-    /// Bytes per thread in the structure passes (even, so a block of backslashes passes the escape carry through).
+    /// Bytes per thread in the structure passes: a multiple of 64 (the mask chunk), and even, so a block
+    /// of nothing but backslashes passes the escape carry through unchanged.
     static let blockBytes = 256
 
     static let source: String = KernelSource.prelude + """
@@ -79,10 +83,7 @@ enum JSONSource {
     }
     // Four hex digits at p (bounded by end); -1 when they are not all there.
     inline int j_hex4(device const uchar* s, uint p, uint end) {
-        if (p + 4u > end) {
-            // Report the first missing or bad digit the way a byte-at-a-time reader would.
-            return -1;
-        }
+        if (p + 4u > end) return -1;
         int v = 0;
         for (uint k = 0; k < 4u; k++) { int h = j_hex(s[p + k]); if (h < 0) return -1; v = (v << 4) | h; }
         return v;
@@ -92,11 +93,11 @@ enum JSONSource {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Stage 1: structure, one thread per 64-byte block
+    // Stage 1: structure, one thread per block of BLK bytes, read as 64-byte chunks of bit masks
 
     struct JBlk { uint n; uint start; uint nblocks; };
 
-    // Escape carry key: 0 for a block of nothing but backslashes (it passes the carry through: 64 is
+    // Escape carry key: 0 for a block of nothing but backslashes (it passes the carry through: BLK is
     // even), otherwise (block + 1) * 2 + (parity of the backslash run that ends the block).
     kernel void jb_escape(device const uchar* s [[buffer(0)]], constant JBlk& P [[buffer(1)]],
                           device uint* key [[buffer(2)]], uint b [[thread_position_in_grid]]) {
@@ -107,25 +108,68 @@ enum JSONSource {
         key[b] = all ? 0u : (((b + 1u) << 1) | (t & 1u));
     }
 
+    #define J_REP(c) (0x0101010101010101ul * (ulong)(c))
+
+    // One bit per byte of x equal to the byte repeated in pat (SWAR compare, then gather the high bits).
+    inline ulong j_eq8(ulong x, ulong pat) {
+        ulong y = x ^ pat;
+        ulong t = ((y & 0x7F7F7F7F7F7F7F7Ful) + 0x7F7F7F7F7F7F7F7Ful) | y;
+        ulong z = ~t & 0x8080808080808080ul;
+        return ((z >> 7) * 0x0102040810204080ul) >> 56;
+    }
+
+    // Backslashes, quotes, opening and closing brackets of the 64-byte chunk at `base`, one bit per
+    // byte; bytes at or past `limit` (chunk-relative) are cleared.
+    struct JMasks { ulong bs; ulong q; ulong open; ulong close; };
+    inline JMasks j_masks(device const uchar* s, uint base, uint limit) {
+        device const ulong* w = (device const ulong*)(s + base);
+        JMasks m = {0ul, 0ul, 0ul, 0ul};
+        for (uint k = 0u; k < 8u && k * 8u < limit; k++) {
+            ulong x = w[k];
+            ulong x20 = x | J_REP(0x20);          // '[' -> '{', ']' -> '}'; no other byte maps there
+            uint sh = 8u * k;
+            m.bs |= j_eq8(x, J_REP(0x5C)) << sh;
+            m.q |= j_eq8(x, J_REP(0x22)) << sh;
+            m.open |= j_eq8(x20, J_REP(0x7B)) << sh;
+            m.close |= j_eq8(x20, J_REP(0x7D)) << sh;
+        }
+        ulong valid = limit >= 64u ? ~0ul : ((1ul << limit) - 1ul);
+        m.bs &= valid; m.q &= valid; m.open &= valid; m.close &= valid;
+        return m;
+    }
+
+    // Bytes escaped by a backslash, given that the first byte is escaped when `carry` is set; leaves in
+    // `carry` whether the byte after the chunk is. Chunks without a backslash take the fast path.
+    inline ulong j_escaped(ulong bs, thread bool& carry) {
+        if (bs == 0ul) { ulong e = carry ? 1ul : 0ul; carry = false; return e; }
+        ulong esc = 0ul;
+        bool e = carry;
+        for (uint i = 0u; i < 64u; i++) {
+            if (e) { esc |= 1ul << i; e = false; }
+            else if ((bs >> i) & 1ul) e = true;
+        }
+        carry = e;
+        return esc;
+    }
+
+    // Inclusive prefix XOR: bit i is the parity of bits 0..i (an opening quote and the bytes it opens).
+    inline ulong j_prefix_xor(ulong x) {
+        x ^= x << 1; x ^= x << 2; x ^= x << 4; x ^= x << 8; x ^= x << 16; x ^= x << 32;
+        return x;
+    }
+
     // Unescaped quotes per block (parity only).
     kernel void jb_quotes(device const uchar* s [[buffer(0)]], constant JBlk& P [[buffer(1)]],
                           device const uint* escIn [[buffer(2)]], device int* qpar [[buffer(3)]],
                           uint b [[thread_position_in_grid]]) {
         if (b >= P.nblocks) return;
         uint lo = b * BLK, hi = min(lo + BLK, P.n);
-        bool esc = (escIn[b] & 1u) != 0u;
+        bool carry = (escIn[b] & 1u) != 0u;
         uint q = 0u;
-        // Eight 8-byte loads per block rather than 64 byte loads: a SIMD group's lanes read 64 bytes
-        // apart, so every load instruction touches many cache lines.
-        device const ulong* w8 = (device const ulong*)(s + lo);
-        ulong x = 0ul;
-        for (uint i = lo; i < hi; i++) {
-            uint o = i - lo;
-            if ((o & 7u) == 0u) x = w8[o >> 3];
-            uchar c = (uchar)(x >> (8u * (o & 7u)));
-            if (esc) { esc = false; continue; }
-            if (c == 0x5C) { esc = true; continue; }
-            if (c == 0x22) q++;
+        for (uint base = lo; base < hi; base += 64u) {
+            JMasks m = j_masks(s, base, hi - base);
+            ulong esc = j_escaped(m.bs, carry);
+            q += popcount(m.q & ~esc);
         }
         qpar[b] = (int)(q & 1u);
     }
@@ -136,23 +180,16 @@ enum JSONSource {
                          device int* delta [[buffer(4)]], uint b [[thread_position_in_grid]]) {
         if (b >= P.nblocks) return;
         uint lo = b * BLK, hi = min(lo + BLK, P.n);
-        bool esc = (escIn[b] & 1u) != 0u;
-        bool ins = (qScan[b] & 1) != 0;
+        bool carry = (escIn[b] & 1u) != 0u;
+        ulong ins = (qScan[b] & 1) != 0 ? ~0ul : 0ul;
         int d = 0;
-        // Eight 8-byte loads per block rather than 64 byte loads: a SIMD group's lanes read 64 bytes
-        // apart, so every load instruction touches many cache lines.
-        device const ulong* w8 = (device const ulong*)(s + lo);
-        ulong x = 0ul;
-        for (uint i = lo; i < hi; i++) {
-            uint o = i - lo;
-            if ((o & 7u) == 0u) x = w8[o >> 3];
-            uchar c = (uchar)(x >> (8u * (o & 7u)));
-            if (esc) { esc = false; continue; }
-            if (c == 0x5C) { esc = true; continue; }
-            if (c == 0x22) { ins = !ins; continue; }
-            if (ins) continue;
-            if (c == 0x7B || c == 0x5B) d++;
-            else if (c == 0x7D || c == 0x5D) d--;
+        for (uint base = lo; base < hi; base += 64u) {
+            JMasks m = j_masks(s, base, hi - base);
+            ulong esc = j_escaped(m.bs, carry);
+            ulong inStr = j_prefix_xor(m.q & ~esc) ^ ins;
+            ins = (inStr >> 63) != 0ul ? ~0ul : 0ul;
+            ulong outside = ~esc & ~inStr;
+            d += (int)popcount(m.open & outside) - (int)popcount(m.close & outside);
         }
         delta[b] = d;
     }
@@ -328,58 +365,71 @@ enum JSONSource {
         return err != E_NONE ? err : E_TOP_NUMBER;
     }
 
-    // Walks one block with its carries. mode 0 counts record starts and reports top-level errors;
-    // mode 1 writes record starts and ends.
-    inline void j_block_records(device const uchar* s, constant JBlk& P, uint b, bool esc, bool ins, int d,
+    // Walks one block with its carries. mode 0 counts record starts and reports the block's first
+    // top-level error; mode 1 writes record starts and ends. Brackets outside strings come from the
+    // chunk masks in order; only the bytes between them at depth 0 (usually one newline) are read one
+    // at a time, to find whitespace, `null` records and anything else, which is an error.
+    inline void j_block_records(device const uchar* s, constant JBlk& P, uint b, bool carry, bool insIn, int d,
                                 uint mode, thread uint& count, device uint* recStart, device uint* recEnd,
-                                uint base, device atomic_uint* firstErr, device uint* errCode) {
+                                uint first, device atomic_uint* firstErr, device uint* errCode) {
         uint lo = b * BLK, hi = min(lo + BLK, P.n);
         bool reported = false;
-        // Eight 8-byte loads per block rather than 64 byte loads: a SIMD group's lanes read 64 bytes
-        // apart, so every load instruction touches many cache lines.
-        device const ulong* w8 = (device const ulong*)(s + lo);
-        ulong x = 0ul;
-        for (uint i = lo; i < hi; i++) {
-            uint o = i - lo;
-            if ((o & 7u) == 0u) x = w8[o >> 3];
-            uchar c = (uchar)(x >> (8u * (o & 7u)));
-            if (esc) { esc = false; continue; }
-            bool top = (d == 0 && !ins && i >= P.start);
-            if (c == 0x5C) {
-                esc = true;
-                if (top && mode == 0u && !reported) { reported = true; errCode[b] = E_VALUE; atomic_fetch_min_explicit(firstErr, i, memory_order_relaxed); }
-                continue;
-            }
-            if (c == 0x22) {
-                if (top && mode == 0u && !reported) { reported = true; errCode[b] = j_top_error(s, i, P.n, c); atomic_fetch_min_explicit(firstErr, i, memory_order_relaxed); }
-                ins = !ins; continue;
-            }
-            if (ins) continue;
-            if (i < P.start) continue;
-            if (d == 0) {
-                if (j_ws(c)) continue;
-                if (c == 0x7B) {
-                    if (mode == 1u) recStart[base + count] = i;
-                    count++; d = 1; continue;
+        ulong ins = insIn ? ~0ul : 0ul;
+        for (uint base = lo; base < hi; base += 64u) {
+            uint limit = min(64u, hi - base);
+            JMasks m = j_masks(s, base, limit);
+            ulong esc = j_escaped(m.bs, carry);
+            ulong quotes = m.q & ~esc;
+            ulong inStr = j_prefix_xor(quotes) ^ ins;
+            ins = (inStr >> 63) != 0ul ? ~0ul : 0ul;
+            ulong outside = ~esc & ~inStr;
+            ulong open = m.open & outside, close = m.close & outside;
+            ulong structs = open | close;
+            // Skipped at depth 0: escaped bytes (their backslash is the error), and string contents and
+            // closing quotes (the opening quote is the error).
+            ulong skip = esc | (inStr ^ quotes);
+            uint pos = 0u;
+            while (pos < limit) {
+                ulong rest = structs >> pos;
+                uint next = rest != 0ul ? pos + (uint)ctz(rest) : limit;
+                if (d == 0) {
+                    for (uint o = pos; o < next; o++) {
+                        uint i = base + o;
+                        if (i < P.start || ((skip >> o) & 1ul)) continue;
+                        uchar c = s[i];
+                        if (j_ws(c)) continue;
+                        if (c == 0x6E && j_lit(s, i, P.n, 0x6E, 0x75, 0x6C, 0x6C)) {
+                            if (mode == 1u) { recStart[first + count] = i; recEnd[first + count] = i + 4u; }
+                            count++; o += 3u; continue;
+                        }
+                        if ((c == 0x75 || c == 0x6C) && j_in_null(s, i, P.n, P.start)) continue;
+                        if (mode == 0u && !reported) {
+                            reported = true;
+                            errCode[b] = j_top_error(s, i, P.n, c);
+                            atomic_fetch_min_explicit(firstErr, i, memory_order_relaxed);
+                        }
+                    }
                 }
-                if (c == 0x6E && j_lit(s, i, P.n, 0x6E, 0x75, 0x6C, 0x6C)) {
-                    if (mode == 1u) { recStart[base + count] = i; recEnd[base + count] = i + 4u; }
-                    count++; continue;
+                if (next >= limit) break;
+                uint i = base + next;
+                if ((open >> next) & 1ul) {
+                    if (d == 0 && i >= P.start) {
+                        if (s[i] == 0x7B) { if (mode == 1u) recStart[first + count] = i; count++; }
+                        else if (mode == 0u && !reported) {
+                            reported = true; errCode[b] = E_TOP_ARRAY;
+                            atomic_fetch_min_explicit(firstErr, i, memory_order_relaxed);
+                        }
+                    }
+                    d++;
+                } else {
+                    if (d == 0 && mode == 0u && !reported) {
+                        reported = true; errCode[b] = E_DOC_EMPTY;
+                        atomic_fetch_min_explicit(firstErr, i, memory_order_relaxed);
+                    }
+                    d--;
+                    if (d == 0 && mode == 1u && count + first > 0u) recEnd[first + count - 1u] = i + 1u;
                 }
-                if ((c == 0x75 || c == 0x6C) && j_in_null(s, i, P.n, P.start)) continue;
-                if (mode == 0u && !reported) {
-                    reported = true;
-                    errCode[b] = j_top_error(s, i, P.n, c);
-                    atomic_fetch_min_explicit(firstErr, i, memory_order_relaxed);
-                }
-                if (c == 0x5B) d++;
-                else if (c == 0x7D || c == 0x5D) d--;
-                continue;
-            }
-            if (c == 0x7B || c == 0x5B) d++;
-            else if (c == 0x7D || c == 0x5D) {
-                d--;
-                if (d == 0 && mode == 1u && count + base > 0u) recEnd[base + count - 1u] = i + 1u;
+                pos = next + 1u;
             }
         }
     }
@@ -448,9 +498,9 @@ enum JSONSource {
 
     struct JWalk { uint n; uint nspans; uint emit; };
 
-    // Emits (or counts) one child of the span. `partialEnd` is the error position for a child the walk
-    // stopped inside, which is still reported so the columns see what a sequential parser saw before
-    // the error: the kind of a container it had opened, or a key whose value never came.
+    // Emits (or counts) one child of the span. After an error the walk still reports the child it
+    // stopped inside, so the columns see what a sequential parser saw before the error: the kind of a
+    // container it had opened, or a key whose value never came.
     inline void j_child(constant JWalk& P, device JEntry* entries, uint base, thread uint& cnt, uint t,
                         uint keyStart, uint keyLen, uint valStart, uint valEnd, uint flags) {
         if (P.emit) {
@@ -619,26 +669,66 @@ enum JSONSource {
         if (j < count) fid[list[j]] = codes[skip + j];
     }
 
-    struct JScatter { uint count; uint rows; int fidLo; int fidHi; uint atomicMode; };
+    struct JScatter { uint count; uint rows; int fidLo; int fidHi; uint atomicMode; uint kindsMode; };
+
+    #define KINDS_FIELDS 64u
+
+    kernel void jm_fill(device uint* M [[buffer(0)]], constant uint& n [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+        if (i < n) M[i] = 0xFFFFFFFFu;
+    }
 
     // Slot matrix, one column of `rows` slots per field: slot = min entry index holding that field.
+    // With kindsMode (at most KINDS_FIELDS fields) it also ORs every field's kinds and flag bits and
+    // counts its entries -- through threadgroup atomics, one device atomic per field per threadgroup --
+    // so the columns need no separate kinds pass: a field with fewer entries than rows has nulls.
     kernel void jm_scatter(constant JScatter& P [[buffer(0)]], device const JEntry* ent [[buffer(1)]],
                            device const int* fid [[buffer(2)]], device uint* M [[buffer(3)]],
-                           uint e [[thread_position_in_grid]]) {
-        if (e >= P.count) return;
-        int f = fid[e];
-        if (f < P.fidLo || f >= P.fidHi) return;
-        uint slot = (uint)(f - P.fidLo) * P.rows + ent[e].parent;
-        if (P.atomicMode) atomic_fetch_min_explicit((device atomic_uint*)&M[slot], e, memory_order_relaxed);
-        else M[slot] = e;
+                           device atomic_uint* kinds [[buffer(4)]], uint e [[thread_position_in_grid]],
+                           uint lid [[thread_index_in_threadgroup]]) {
+        threadgroup atomic_uint tk[KINDS_FIELDS * 3u];
+        if (P.kindsMode) {
+            for (uint k = lid; k < KINDS_FIELDS * 3u; k += TG) atomic_store_explicit(&tk[k], 0u, memory_order_relaxed);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (e < P.count) {
+            int f = fid[e];
+            if (f >= P.fidLo && f < P.fidHi) {
+                JEntry x = ent[e];
+                uint slot = (uint)(f - P.fidLo) * P.rows + x.parent;
+                if (P.atomicMode) atomic_fetch_min_explicit((device atomic_uint*)&M[slot], e, memory_order_relaxed);
+                else M[slot] = e;
+                if (P.kindsMode) {
+                    uint j = (uint)(f - P.fidLo);
+                    atomic_fetch_or_explicit(&tk[3u * j], 1u << (x.flags & 15u), memory_order_relaxed);
+                    uint fl = x.flags & 0xF0u;
+                    if (fl) atomic_fetch_or_explicit(&tk[3u * j + 1u], fl, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&tk[3u * j + 2u], 1u, memory_order_relaxed);
+                }
+            }
+        }
+        if (P.kindsMode) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint G = (uint)(P.fidHi - P.fidLo);
+            for (uint j = lid; j < G; j += TG) {
+                uint c = atomic_load_explicit(&tk[3u * j + 2u], memory_order_relaxed);
+                if (c == 0u) continue;
+                atomic_fetch_or_explicit(&kinds[3u * j], atomic_load_explicit(&tk[3u * j], memory_order_relaxed), memory_order_relaxed);
+                uint fl = atomic_load_explicit(&tk[3u * j + 1u], memory_order_relaxed);
+                if (fl) atomic_fetch_or_explicit(&kinds[3u * j + 1u], fl, memory_order_relaxed);
+                atomic_fetch_add_explicit(&kinds[3u * j + 2u], c, memory_order_relaxed);
+            }
+        }
     }
     // A field named twice in one object: the later entry lost the slot to the earlier one.
+    // Fields the output does not keep (unexpected_field_behavior="ignore") are not checked, as pyarrow
+    // does not look at them.
     kernel void jm_dups(constant JScatter& P [[buffer(0)]], device const JEntry* ent [[buffer(1)]],
                         device const int* fid [[buffer(2)]], device const uint* M [[buffer(3)]],
-                        device atomic_uint* firstDup [[buffer(4)]], uint e [[thread_position_in_grid]]) {
+                        device atomic_uint* firstDup [[buffer(4)]], device const uchar* wanted [[buffer(5)]],
+                        uint e [[thread_position_in_grid]]) {
         if (e >= P.count) return;
         int f = fid[e];
-        if (f < P.fidLo || f >= P.fidHi) return;
+        if (f < P.fidLo || f >= P.fidHi || wanted[f - P.fidLo] == 0) return;
         uint slot = (uint)(f - P.fidLo) * P.rows + ent[e].parent;
         if (M[slot] != e) atomic_fetch_min_explicit(firstDup, e, memory_order_relaxed);
     }
