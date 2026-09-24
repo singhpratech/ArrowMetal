@@ -29,7 +29,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 EXTENSION = os.path.join(REPO, "duckdb-extension", "build", "arrowmetal_rewrite.duckdb_extension")
 SOURCE = os.path.join(REPO, "duckdb-extension", "src", "arrowmetal_rewrite.cpp")
 ROUTER = os.path.join(REPO, "Benchmarks", "results", "router_2026-09-17.json")
-RESULTS = os.path.join(REPO, "Benchmarks", "results", "duckdb_rewrite_2026-09-23_provisional.csv")
+RESULTS = os.path.join(REPO, "Benchmarks", "results", "duckdb_rewrite_2026-09-24.csv")
 
 pytestmark = pytest.mark.skipif(not os.path.exists(EXTENSION),
                                 reason="build it with duckdb-extension/build_rewrite.sh")

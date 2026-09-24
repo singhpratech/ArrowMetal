@@ -3,6 +3,10 @@
     PYTHONPATH=python python Benchmarks/duckdb_rewrite_bench.py                    # 1M, 10M, 50M rows
     PYTHONPATH=python python Benchmarks/duckdb_rewrite_bench.py 10000000 --reps 7
     PYTHONPATH=python python Benchmarks/duckdb_rewrite_bench.py --out path.csv
+    PYTHONPATH=python python Benchmarks/duckdb_rewrite_bench.py --provisional     # other work running
+
+The default output is Benchmarks/results/duckdb_rewrite_<date>.csv; with --provisional the file name
+and its header line say the run shared the machine.
 
 Needs duckdb-extension/build/arrowmetal_rewrite.duckdb_extension (duckdb-extension/build_rewrite.sh).
 
@@ -24,7 +28,7 @@ import argparse, csv, datetime, os, platform, resource, subprocess, sys, time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 EXTENSION = os.path.join(ROOT, "duckdb-extension", "build", "arrowmetal_rewrite.duckdb_extension")
-DEFAULT_OUT = os.path.join(ROOT, "Benchmarks", "results", "duckdb_rewrite_2026-09-23_provisional.csv")
+RESULTS_DIR = os.path.join(ROOT, "Benchmarks", "results")
 
 TABLE = """
 CREATE OR REPLACE TABLE t AS SELECT
@@ -99,8 +103,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("rows", nargs="*", type=int, default=[1_000_000, 10_000_000, 50_000_000])
     parser.add_argument("--reps", type=int, default=5)
-    parser.add_argument("--out", default=DEFAULT_OUT)
+    parser.add_argument("--out", default=None,
+                        help="default: Benchmarks/results/duckdb_rewrite_<date>[_provisional].csv")
+    parser.add_argument("--provisional", action="store_true",
+                        help="mark the run as taken while other work shared the machine")
     args = parser.parse_args()
+    if args.out is None:
+        args.out = os.path.join(RESULTS_DIR, "duckdb_rewrite_%s%s.csv" % (
+            datetime.date.today().isoformat(), "_provisional" if args.provisional else ""))
     if not os.path.exists(EXTENSION):
         sys.exit("build the extension first: duckdb-extension/build_rewrite.sh")
 
@@ -109,8 +119,8 @@ def main():
     threads = con.sql("SELECT current_setting('threads')").fetchone()[0]
     header = (f"# duckdb {duckdb.__version__}, threads={threads}, python {platform.python_version()}, "
               f"{sysctl('machdep.cpu.brand_string')}, macOS {platform.mac_ver()[0]}, "
-              f"loadavg at start {os.getloadavg()[0]:.1f}, {datetime.datetime.now().isoformat(timespec='seconds')}; "
-              f"PROVISIONAL: measured while other work shared the machine")
+              f"loadavg at start {os.getloadavg()[0]:.1f}, {datetime.datetime.now().isoformat(timespec='seconds')}"
+              + ("; PROVISIONAL: measured while other work shared the machine" if args.provisional else ""))
     rows_out = []
     for n in args.rows:
         con.execute(TABLE.format(rows=n))

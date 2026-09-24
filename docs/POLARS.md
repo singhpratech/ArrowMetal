@@ -523,38 +523,58 @@ but mapping its pages into Metal and releasing them costs time on every query, a
 is converted on the CPU. `Benchmarks/polars_engine_bench.py` measures the eight shapes of
 `Benchmarks/engine_bench.py` plus ten group-by, sort and `unique` shapes, as Polars LazyFrames, through
 Polars' in-memory engine, Polars' streaming engine and the engine with everything it can translate
-(`shapes="all"`), cold (nothing imported before) and warm (see the import cache below). The run
-behind the defaults is `Benchmarks/results/polars_engine_bench_2026-09-23_provisional.csv`; it ran
-while other work shared the machine, so its numbers are provisional and not quoted here.
+(`shapes="all"`), cold (nothing imported before) and warm (see the import cache below). The numbers
+below are from a quiet run at 2,000,000 and 50,000,000 rows,
+`Benchmarks/results/polars_engine_bench_2026-09-24.csv`; the load average and the file-sync process's
+CPU at its start are recorded in `Benchmarks/results/bench_conditions_2026-09-24.txt`. The defaults
+were first chosen from a run at 500,000 to 50,000,000 rows taken while other work shared the machine,
+kept as history in `Benchmarks/results/polars_engine_bench_2026-09-23_provisional.csv`; the quiet run
+did not repeat the 500,000, 1,000,000 and 10,000,000-row sizes.
 
-Read cold, against the faster of Polars' two engines, that run says (sizes near a crossover move
-between runs on a shared machine, which is why the defaults keep a margin):
+Read cold, against the faster of Polars' two engines (`vs_fastest_polars` of the `MetalEngine all,
+cold` rows, where above 1 is ahead; 2M rows first, then 50M), the quiet run says:
 
-* **A full sort** whose keys ArrowMetal orders as Polars does (no helper key): both such shapes were
-  ahead at every size measured, from 500,000 rows. (An earlier provisional run had one of them
-  behind at 500,000.)
-* **A full sort that needs a helper key** (nulls first on a nullable key, or a float key descending)
-  was behind at 1,000,000 rows and below, level at 2,000,000, and ahead from 10,000,000.
-* **A sort that carries a String column** was behind at every size: the String import is a CPU copy.
+* **A full sort** whose keys ArrowMetal orders as Polars does (no helper key) is ahead at both sizes:
+  `(m) sort 3 columns by an int64 key` at 5.05 and 4.73, `(q) filter, then sort by (int32 asc, int64
+  desc)` at 3.59 and 6.44. The provisional run had both ahead from 500,000 rows.
+* **A full sort that needs a helper key** (nulls first on a nullable key, or a float key descending),
+  `(p) filter, then sort by (int32 asc, nullable Float64 desc)`, is behind at 2M rows (0.92) and ahead
+  at 50M (1.66). The provisional run had it behind at 1,000,000 rows and below, level at 2,000,000 and
+  ahead from 10,000,000. This shape also carries the String column of its frame, so the default leaves
+  it to Polars at every size by the String rule below (its `MetalEngine default, cold` rows are 0.96
+  at both sizes).
+* **A sort that carries a String column**, `(o) sort with a String column, by an int64 key`, is to
+  improve at both sizes (0.74 and 0.89): the String import is a CPU copy.
 * **Group-by** depends on what nobody knows before running it, the number of groups, and on the key
-  types: some shapes were ahead from 500,000 rows, others behind at every size below 50,000,000 and
-  level with Polars there.
-* **Top-k, whole-frame aggregates and row-wise filters and projections** were behind the faster
-  Polars engine at every size.
-* **Joins and `unique`**: an inner join feeding an aggregate, and a `unique` over a key with ten
-  thousand distinct values, were ahead at every size measured; a semi join returning most of its
-  probe rows was behind at every size. Like group-by, both run on the key-to-id machine, whose speed
-  against Polars depends on how many distinct keys there are, and one shape of each is not enough to
-  set a default by.
+  types. Ahead at both sizes: `(c) group-by (region, sub) mean + max` (1.32, 1.72) and `(l) group-by
+  (region, sub), Float64 sum + mean` (1.45, 2.05). Ahead at 50M only: `(i) group-by 1 key, 100 000
+  groups, sum` (0.74, 1.94). To improve at both sizes: `(j) group-by (k1, k2), sum + count` (0.51,
+  0.86), `(k) group-by (String, int32), sum` (0.37, 0.66) and `(b) filter + group-by 200 keys + sort
+  desc + limit 10` (0.34, 0.58).
+* **Top-k, whole-frame aggregates and row-wise filters and projections** are to improve at both sizes:
+  `(n) top 100 by Float64, descending` (0.39, 0.18), `(a) filtered sum + count` (0.19, 0.17) and `(d)
+  projection chain then filter` (0.26, 0.31).
+* **Joins and `unique`**: `(e) inner join then sum` (1.90, 1.88) and `(r) unique over (region, sub),
+  keep first` (1.60, 5.52) are ahead at both sizes; `(f) semi join` is to improve at both (0.22, 0.41).
+  Like group-by, both run on the key-to-id machine, whose speed against Polars depends on how many
+  distinct keys there are, and one shape of each is not enough to set a default by.
 * **Windows and the as-of join** stay with Polars in this version; their rows record what the
-  callback costs a plan it leaves alone.
+  callback costs a plan it leaves alone. `MetalEngine default, cold` against `polars in-memory`: `(g)
+  row_number over partitions` 15.139 ms against 14.770 ms at 2M rows and 93.614 ms against 95.680 ms at
+  50M, `(h) as-of join` 7.039 ms against 7.116 ms and 152.100 ms against 151.741 ms.
 
 So `MetalEngine()` takes a subtree when every shape in it is a full sort (`MEASURED_SHAPES`), none of
 its inputs is a String column, and its in-memory inputs hold at least 1,000,000 rows -- 10,000,000
 when a helper key is needed. 1,000,000 is the sort family's crossover against the fastest CPU
 library in `Benchmarks/results/router_2026-09-17.json` (`sort float64`, `argsort int64`, `lexsort (2
 int32 keys)`); the provisional run had full sorts ahead below it as well, so the default keeps the
-router's figure as its margin. Every other subtree stays with Polars with the reason in the report.
+router's figure as its margin. The quiet run keeps these defaults. Both sorts the default takes are
+ahead of the faster Polars engine at both sizes (`MetalEngine default, cold`: `(m)` at 5.20 and 4.86,
+`(q)` at 3.75 and 6.35). Every shape it declines is behind at one of the two sizes, or belongs to a
+family with a shape that is (`(j)` for group-by over two or more keys, `(i)` at 2M rows for group-by
+over one key, `(f)` for joins), except `(r)`: `unique` is ahead at both sizes, but with one shape
+measured it stays out for the reason above. Every other subtree stays with Polars with the reason in
+the report, and `shapes="all"` takes it.
 
 ```python
 am.MetalEngine()                          # the defaults above
@@ -651,7 +671,7 @@ The plan behind this tier asks for these on real hardware before anything from i
 ## Numbers
 
 These are tiers 1 and 2; tier 4's measurements are in
-`Benchmarks/results/polars_engine_bench_2026-09-23_provisional.csv` (see "Tier 4" above).
+`Benchmarks/results/polars_engine_bench_2026-09-24.csv` (see "Tier 4" above).
 
 Apple M4 Max, macOS 26.6.2, polars 1.44.1 (16 threads), pyarrow 25.0.1, ArrowMetal 0.1.0. Best of 5
 runs after a warm-up, one process, one data set. Every figure below is from

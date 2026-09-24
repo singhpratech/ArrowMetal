@@ -24,7 +24,7 @@ docs/POLARS.md, "Tier 4". Everything else falls back with
 a one-line reason in `engine.last_report`.
 
 Which of those it does take is a second decision. By default (`shapes="measured"`) it takes only
-the shape classes the provisional benchmark measured ahead of both Polars engines, from the row
+the shape classes the benchmark measured ahead of both Polars engines, from the row
 count at which they were ahead (`MEASURED_SHAPES`, `min_rows`); `shapes="all"` takes everything it
 can translate. docs/POLARS.md says how the defaults were chosen and which results files they come
 from.
@@ -76,7 +76,8 @@ TESTED_POLARS = "1.44.1"
 # Default size gate, in total rows over a subtree's in-memory inputs. How it was chosen is in
 # docs/POLARS.md ("Tier 4", "Which translatable subtrees it runs"): the sort family's crossover in
 # Benchmarks/results/router_2026-09-17.json, checked against
-# Benchmarks/results/polars_engine_bench_2026-09-23_provisional.csv.
+# Benchmarks/results/polars_engine_bench_2026-09-23_provisional.csv and the quiet rerun,
+# Benchmarks/results/polars_engine_bench_2026-09-24.csv.
 DEFAULT_MIN_ROWS = 1_000_000
 
 # Shape classes of a translated subtree: "sort" (a full sort whose keys ArrowMetal orders as Polars
@@ -1511,7 +1512,7 @@ class MetalEngine(_LocalEngine):
     Two gates decide whether a translatable subtree runs on Metal:
 
     * `shapes="measured"` (the default) takes only the shape classes in `MEASURED_SHAPES`, the ones
-      the provisional benchmark measured ahead of both Polars engines; `shapes="all"` takes every
+      the benchmark measured ahead of both Polars engines; `shapes="all"` takes every
       subtree the translator can express (for testing, or to move work off the CPU cores).
     * `min_rows`: a subtree whose in-memory inputs hold fewer rows stays with Polars. `min_rows=0`
       turns the gate off.

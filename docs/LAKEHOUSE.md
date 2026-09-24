@@ -199,8 +199,25 @@ comparison over every column type. See [TESTING.md](TESTING.md).
 against `deltalake`, pyiceberg, polars (`scan_delta`, `scan_iceberg`) and DuckDB's `delta_scan` /
 `iceberg_scan` (used only when the extensions load with auto-install switched off); the first run used
 `deltalake` 1.6.5, pyiceberg 0.12.0, polars 1.44.1 and DuckDB 1.5.5 with its extensions from the local
-extension cache. That run,
-`Benchmarks/results/lakehouse_2026-09-23_provisional.csv`, was taken while other work shared the machine
-and the GPU; it is provisional. On it, the CPU readers are ahead on every read. The benchmark times whole
-reads; data files are decoded several at a time by the GPU Parquet reader ([PARQUET.md](PARQUET.md)), each
-thread with its own command buffer.
+extension cache. The numbers here are from a quiet run over a 2,000,000-row table,
+`Benchmarks/results/lakehouse_2026-09-24.csv`; the load average and the file-sync process's CPU at its
+start are recorded in `Benchmarks/results/bench_conditions_2026-09-24.txt`. Median wall time in that
+file:
+
+| read | `arrowmetal` | `deltalake` / `pyiceberg` | `polars` | `duckdb` |
+|---|---:|---:|---:|---:|
+| Delta, full | 1788.18 ms | 18.15 ms | 7.16 ms | 66.82 ms |
+| Delta, projected | 740.68 ms | 16.17 ms | 4.17 ms | 21.64 ms |
+| Delta, filtered | 185.79 ms | 9.93 ms | 3.31 ms | 7.59 ms |
+| Iceberg, full | 155.20 ms | 27.66 ms | 12.87 ms | 91.18 ms |
+| Iceberg, projected | 46.29 ms | 22.19 ms | 10.81 ms | 36.04 ms |
+| Iceberg, filtered | 32.93 ms | 9.95 ms | 7.72 ms | 7.39 ms |
+
+Every CPU reader is ahead of ArrowMetal on every read, so table reads are to improve. The gap is
+largest on Delta: a full read takes 1788.18 ms against Polars' 7.16 ms. On Iceberg it is narrower: a
+projected read takes 46.29 ms against 36.04 ms for DuckDB and 10.81 ms for Polars. The file also
+times `arrowmetal_table`, the same read handed to pyarrow. An earlier run
+over a 1,000,000-row table, taken while other work shared the machine and the GPU, is kept as history
+in `Benchmarks/results/lakehouse_2026-09-23_provisional.csv`. The benchmark times whole reads; data
+files are decoded several at a time by the GPU Parquet reader ([PARQUET.md](PARQUET.md)), each thread
+with its own command buffer.

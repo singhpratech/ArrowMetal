@@ -18,7 +18,7 @@
 // and filters over a table function whose row count DuckDB knows. In 'auto' mode, when DuckDB's
 // estimate of the rows reaching the aggregate is at or above both the router's crossover
 // (Benchmarks/results/router_2026-09-17.json) and the measured floor of the query's shape class
-// (Benchmarks/results/duckdb_rewrite_2026-09-23_provisional.csv), the LogicalAggregate is replaced by
+// (Benchmarks/results/duckdb_rewrite_2026-09-24.csv), the LogicalAggregate is replaced by
 // ARROWMETAL_AGGREGATE. Everything below the aggregate - the scan, the pushed-down filters, the
 // projections - is still DuckDB's, planned and run exactly as before.
 //
@@ -105,10 +105,11 @@ struct Crossovers {
 // rows first have to be gathered out of DuckDB's scan, and DuckDB's own aggregate is fast. So 'auto'
 // also requires the query's shape class to have been measured faster than DuckDB's operators, from
 // the row count below, in Benchmarks/duckdb_rewrite_bench.py
-// (Benchmarks/results/duckdb_rewrite_2026-09-23_provisional.csv). A class with no floor here was not
+// (Benchmarks/results/duckdb_rewrite_2026-09-24.csv, a quiet run). Each floor is the smallest of
+// 1M, 10M and 50M rows at which every query of the class was ahead. A class with no floor here was not
 // measured faster at 1M, 10M or 50M rows and is never rewritten in 'auto'. The effective threshold is
-// the larger of the two. These are from a provisional run on a shared machine; they are revisited
-// with the quiet rerun.
+// the larger of the two. The floors were first fitted to a run on a shared machine
+// (duckdb_rewrite_2026-09-23_provisional.csv); the quiet run gives the same ones.
 //===--------------------------------------------------------------------===//
 struct Measured {
 	// Ungrouped, with three or more of SUM/MIN/MAX/AVG (at 10M rows 'sum, max, avg' was not ahead of
@@ -2663,7 +2664,7 @@ static void Analyse(ClientContext &context, LogicalAggregate &aggr, Candidate &c
 	}
 	c.threshold = threshold;
 
-	// The measured half of the gate: the shape classes the provisional benchmark found faster than
+	// The measured half of the gate: the shape classes the benchmark found faster than
 	// DuckDB's own operators, and from how many rows (see `Measured`).
 	idx_t kernels = 0;
 	for (auto &agg : spec.aggs) {

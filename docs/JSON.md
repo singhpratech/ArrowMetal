@@ -261,9 +261,24 @@ Each has a test of its own in `python/tests/test_json.py` that checks the differ
 `am.read_json_table`, `pyarrow.json.read_json`, `polars.read_ndjson`, `pandas.read_json(lines=True)` and
 DuckDB's `read_json` (each producing an in-memory table), at 1 M and 10 M rows, in a flat shape and a
 nested one that adds a struct and a list per record, after checking ArrowMetal's table against
-pyarrow's. The first results, `Benchmarks/results/json_bench_2026-09-23_provisional.csv`, are a smoke
-run taken while other work shared the GPU and the cores; the published numbers will come from a quiet
-rerun.
+pyarrow's. The numbers here are from a quiet run, `Benchmarks/results/json_bench_2026-09-24.csv`; the
+load average and the file-sync process's CPU at its start are recorded in
+`Benchmarks/results/bench_conditions_2026-09-24.txt`. In that file, median wall time:
+
+| reader | flat, 1 M | flat, 10 M | nested, 1 M | nested, 10 M |
+|---|---:|---:|---:|---:|
+| `arrowmetal` (`am.read_json`) | 21.12 ms | 156.76 ms | 40.36 ms | 287.12 ms |
+| `arrowmetal-table` (`am.read_json_table`) | 24.75 ms | 156.71 ms | 40.77 ms | 290.51 ms |
+| `polars` | 26.15 ms | 252.12 ms | 84.53 ms | 861.20 ms |
+| `pyarrow` | 64.15 ms | 517.29 ms | 79.17 ms | 775.28 ms |
+| `duckdb` | 78.04 ms | 220.15 ms | 109.21 ms | 320.60 ms |
+| `pandas` | 1082.20 ms | 11159.75 ms | 1707.81 ms | 17557.51 ms |
+
+ArrowMetal is ahead of every CPU reader in all four cases. The closest is DuckDB on the nested file at
+10 M rows (320.60 ms against 287.12 ms). The host CPU time differs more than the wall time: at 10 M
+flat rows `am.read_json` used 113.28 ms of CPU, Polars 2906.46 ms and pyarrow 8024.27 ms (`cpu_ms`).
+The first results, a smoke run taken while other work shared the GPU and the cores, are kept as
+history in `Benchmarks/results/json_bench_2026-09-23_provisional.csv`.
 
 ```
 PYTHONPATH=python python Benchmarks/json_bench.py --rows 1000000,10000000 --shapes flat,nested

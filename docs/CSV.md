@@ -69,7 +69,8 @@ am_csv_read(r, &b);          /* am_csv_batch_rows / _columns / _column_name / _c
 By default the file is read with `pread` — up to eight ranges in parallel — into a page-aligned buffer from the
 context's pool, which is already a Metal shared buffer. `fileAccess = .map` (`file_access="map"`) maps
 the file instead and wraps the mapping with `makeBuffer(bytesNoCopy:)`, as the Parquet reader does.
-No copy is made, but on a warm page cache the mapped read measured slower than the copy overall;
+No copy is made, but on a warm page cache the mapped read measured slower than the copy overall
+(105.39 ms against 51.8 ms at 10 M rows in `Benchmarks/results/csv_bench_2026-09-24.csv`);
 `Benchmarks/csv_bench.py` records both (`arrowmetal` and `arrowmetal_map`), and `ARROWMETAL_CSV_TRACE=1`
 shows where the time goes phase by phase.
 
@@ -331,10 +332,28 @@ PYTHONPATH=python python Benchmarks/csv_bench.py --rows 1000000,10000000
 `Benchmarks/csv_bench.py` reads a mixed-type file (int64, float64, string, bool, date, timestamp and a
 quoted text column) at 1M and 10M rows with ArrowMetal, `pyarrow.csv.read_csv`, `polars.read_csv`,
 `pandas.read_csv` (pyarrow engine and default engine) and DuckDB's `read_csv`, and writes the median,
-min and max of each. The run recorded so far was taken while other work shared the GPU and is kept as
+min and max of each. The numbers here are from a quiet run, `Benchmarks/results/csv_bench_2026-09-24.csv`;
+the load average and the file-sync process's CPU at its start are recorded in
+`Benchmarks/results/bench_conditions_2026-09-24.txt`. In that file, median wall time:
+
+| reader | 1 M rows | 10 M rows |
+|---|---:|---:|
+| `arrowmetal` (`am.read_csv`, pread) | 8.46 ms | 51.8 ms |
+| `arrowmetal_table` (`am.read_csv_table`) | 7.79 ms | 50.84 ms |
+| `arrowmetal_map` (`file_access="map"`) | 14.56 ms | 105.39 ms |
+| `polars` | 10.37 ms | 98.75 ms |
+| `pyarrow` | 16.74 ms | 158.81 ms |
+| `pandas_pyarrow` | 21.91 ms | 196.04 ms |
+| `duckdb` | 56.06 ms | 261.12 ms |
+| `pandas_c` | 403.25 ms | 4174.89 ms |
+
+The default read and `read_csv_table` are ahead of every CPU reader at both sizes; at 10 M rows
+`arrowmetal` reads 16580.9 MB/s against Polars' 8697.9. The mapped read is to improve: at 10 M rows it
+takes 105.39 ms against Polars' 98.75 ms, and at 1 M rows 14.56 ms against 10.37 ms.
+
+An earlier run, taken while other work shared the GPU, is kept as history in
 `Benchmarks/results/csv_bench_2026-09-23_provisional.csv` (named for the lane's day; the run itself
-went past midnight, so its `date` column reads 2026-09-24); published numbers will come from a quiet
-rerun.
+went past midnight, so its `date` column reads 2026-09-24).
 
 `ARROWMETAL_CSV_TRACE=1` prints the wall time of each phase of a read to stderr, and `=2` runs every
 kernel in its own command buffer and prints its GPU time.

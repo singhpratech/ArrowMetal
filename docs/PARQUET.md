@@ -450,10 +450,29 @@ PYTHONPATH=python python Benchmarks/parquet_bench.py --rows 50000000 --codecs sn
 ```
 
 Nested reads — a struct, a list, a list of lists, a map and a list of structs, at 1 M and 10 M rows,
-against pyarrow, Polars and DuckDB — have their own script. Its first run is a provisional smoke run
-recorded while other work shared the GPU, in
-`Benchmarks/results/parquet_nested_2026-09-23_provisional.csv`; the published numbers will come from a
-quiet rerun:
+against pyarrow, Polars and DuckDB — have their own script. Its numbers here are from
+`Benchmarks/results/parquet_nested_2026-09-24.csv`. The load average and the file-sync process's CPU
+at the start of the run are recorded in `Benchmarks/results/bench_conditions_2026-09-24.txt`; this run
+started with the file-sync process at 24.3% CPU and a load average of 6.10, busier than the other
+benchmarks of that day. Wall time in that file, with the fastest CPU reader of each row:
+
+| shape | ArrowMetal, 1 M | fastest CPU, 1 M | ArrowMetal, 10 M | fastest CPU, 10 M |
+|---|---:|---:|---:|---:|
+| struct | 10.35 ms | 11.44 ms (pyarrow) | 19.99 ms | 27.14 ms (Polars) |
+| list | 6.1 ms | 4.96 ms (pyarrow) | 17.54 ms | 14.46 ms (Polars) |
+| list of list | 7.39 ms | 9.34 ms (pyarrow) | 25.56 ms | 26.16 ms (Polars) |
+| map | 9.69 ms | 17.65 ms (pyarrow) | 36.0 ms | 39.21 ms (Polars) |
+| list of struct | 10.76 ms | 6.09 ms (pyarrow) | 24.14 ms | 25.17 ms (pyarrow) |
+| all five | 42.81 ms | 19.8 ms (pyarrow) | 115.24 ms | 91.38 ms (pyarrow) |
+
+ArrowMetal is ahead on the struct, list of list and map reads at both sizes and on the list of struct
+read at 10 M rows. To improve: the list read (6.1 ms against pyarrow's 4.96 at 1 M rows, 17.54 ms
+against Polars' 14.46 at 10 M), the list of struct read at 1 M rows (10.76 ms against 6.09), and the
+read of all five columns together (42.81 ms against pyarrow's 19.8 at 1 M rows, 115.24 ms against
+91.38 at 10 M). The host CPU time is lower on every row: all five columns at 10 M rows cost 34.99 ms
+of CPU against pyarrow's 593.14 and Polars' 1269.84 (`cpu_ms`). Every ArrowMetal row matches
+pyarrow's table (`match`). An earlier smoke run, recorded while other work shared the GPU, is kept as
+history in `Benchmarks/results/parquet_nested_2026-09-23_provisional.csv`.
 
 ```
 PYTHONPATH=python python Benchmarks/parquet_nested_bench.py --rows 1000000,10000000 --repeat 3 --out results.csv

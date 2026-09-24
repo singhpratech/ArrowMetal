@@ -190,8 +190,9 @@ Integrations
   Answers are DuckDB's exactly (`HUGEINT` sums through 32-bit halves, `avg` with DuckDB's own finalizer
   arithmetic, NULL groups, empty inputs), checked by `python/tests/test_duckdb_rewrite.py` with the
   rewrite off and forced. `SET arrowmetal_rewrite = 'auto'` rewrites only at or above the router's
-  crossover and the shape class's measured floor (`Benchmarks/duckdb_rewrite_bench.py`, provisional
-  results in `Benchmarks/results/duckdb_rewrite_2026-09-23_provisional.csv`); `'off'` and `'force'`
+  crossover and the shape class's measured floor (`Benchmarks/duckdb_rewrite_bench.py`, results in
+  `Benchmarks/results/duckdb_rewrite_2026-09-24.csv`, a quiet run that gives the floors first fitted to
+  `Benchmarks/results/duckdb_rewrite_2026-09-23_provisional.csv`); `'off'` and `'force'`
   too; `arrowmetal_rewrites()` and `EXPLAIN` show what happened. Python: `am.duckdb_connect()`,
   `am.duckdb_rewrites(con)`, `am.duckdb_is_rewritten(con, sql)`. In `auto` an ungrouped query is
   rewritten only with three or more of `sum`/`min`/`max`/`avg`, from 50M rows; a `GROUP BY` with no
@@ -207,9 +208,10 @@ Integrations
   order, `is_in` matching NaN, Kleene logic, Polars' aggregate dtypes and empty-group answers, Float32
   arithmetic without subnormal flushing, division by a literal as Polars' reciprocal multiply, a float
   multiply by -1 as Polars' negation, NaN sign bits included), checked by `python/tests/test_polars_engine.py` against Polars across sizes,
-  null ratios, dtypes and chunked and sliced frames. By default it takes the shapes the provisional
-  benchmark (`Benchmarks/polars_engine_bench.py`) measured ahead of both Polars engines -- full sorts
-  from 1M rows -- and `shapes="all"` takes everything it can translate. Imports of Polars columns are
+  null ratios, dtypes and chunked and sliced frames. By default it takes the shapes the
+  benchmark (`Benchmarks/polars_engine_bench.py`, `Benchmarks/results/polars_engine_bench_2026-09-24.csv`)
+  measured ahead of both Polars engines -- full sorts from 1M rows, 10M with a helper key -- and
+  `shapes="all"` takes everything it can translate. Imports of Polars columns are
   cached by buffer address across queries. A float literal of magnitude 2^63 or more runs on Metal like
   any other literal.
 - `import arrowmetal` still imports none of the bridges, the Polars engine and the DuckDB rewrite
