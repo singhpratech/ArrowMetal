@@ -18,10 +18,17 @@ query), and a string `LIKE` scan is **9.3x** resident (**0.6x** cold). DuckDB is
 extension works and matches DuckDB's answers exactly; it is **behind DuckDB's own SQL in 0.1.0**, and §4 says
 why.
 
+A third piece needs no change to the SQL at all. The **rewrite extension** is a DuckDB optimizer
+extension: loaded into a connection, it moves eligible aggregates of ordinary queries onto the GPU, with
+DuckDB's exact answers, and in its default mode only for the shape classes whose every benchmarked
+query was ahead of DuckDB's own operators, from the size where that held. §4b has what it rewrites,
+the feasibility finding behind it, and where it is ahead and where it is not.
+
 - [1. Which tier you want](#1-which-tier-you-want)
 - [2. Install](#2-install)
 - [3. Tier 1: the Python bridge](#3-tier-1-the-python-bridge)
 - [4. Tier 2: the loadable extension](#4-tier-2-the-loadable-extension)
+- [4b. Tier 3: ordinary SQL, rewritten](#4b-tier-3-ordinary-sql-rewritten)
 - [5. Numbers](#5-numbers)
 - [6. When this is worth it, and when it is not](#6-when-this-is-worth-it-and-when-it-is-not)
 - [7. Limits](#7-limits)
@@ -30,18 +37,19 @@ why.
 
 ## 1. Which tier you want
 
-| | Tier 1: Python bridge | Tier 2: loadable extension |
-|---|---|---|
-| You write | Python around SQL | SQL only |
-| Install | `pip install duckdb`, nothing else | build a `.duckdb_extension`, connect with `allow_unsigned_extensions` |
-| Data crossing | zero-copy where DuckDB returns one chunk | DataChunks assembled into one buffer (a copy) |
-| Types | everything DuckDB emits, including strings, decimals, lists, structs, maps | the fixed-width numeric types, `DATE`, `TIMESTAMP` |
-| Speed | resident: 16.0x on 100k-key group-by, 9.3x on `LIKE`, 2.2x on sort; one-shot (crossing included): 1.1x, 0.6x, 0.7x (§5) | **behind DuckDB** in 0.1.0, see §4 |
-| Larger than memory | yes, `am.duckdb_batches` | no |
+| | Tier 1: Python bridge | Tier 2: loadable extension | Tier 3: rewrite extension |
+|---|---|---|---|
+| You write | Python around SQL | SQL only | SQL only, unchanged |
+| Install | `pip install duckdb`, nothing else | build a `.duckdb_extension`, connect with `allow_unsigned_extensions` | build it against the installed DuckDB release (`build_rewrite.sh`), connect with `allow_unsigned_extensions`, or `am.duckdb_connect()` |
+| Data crossing | zero-copy where DuckDB returns one chunk | DataChunks assembled into one buffer (a copy) | DuckDB's scan output copied into page-aligned buffers the GPU reads in place |
+| Types | everything DuckDB emits, including strings, decimals, lists, structs, maps | the fixed-width numeric types, `DATE`, `TIMESTAMP` | integer columns (`MIN`/`MAX` also `DATE`, `TIMESTAMP`); an integer, `DATE`, `TIMESTAMP` or `VARCHAR` group key |
+| Speed | resident: 16.0x on 100k-key group-by, 9.3x on `LIKE`, 2.2x on sort; one-shot (crossing included): 1.1x, 0.6x, 0.7x (§5) | **behind DuckDB** in 0.1.0, see §4 | in `auto`, rewrites only the shape classes whose every benchmarked query was ahead of DuckDB, from that size (§4b) |
+| Larger than memory | yes, `am.duckdb_batches` | no | no: the aggregate's input is gathered in memory (a streamed plan holds only the blocks in flight, §4b) |
 
-If you are reading this to make something faster: **use tier 1**. Tier 2 exists because "call it from
-SQL" is a real requirement for some people, and because the extension is the piece that has to exist
-before it can be made fast.
+If you are reading this to make something faster: **use tier 1**, or tier 3 when the SQL must stay as it
+is and its aggregates fall in §4b's table. Tier 2 exists because "call it from SQL" is a real
+requirement for some people, and because the extension is the piece that has to exist before it can be
+made fast.
 
 ---
 
@@ -97,6 +105,28 @@ version `v1.2.0`, not the DuckDB version - a `C_STRUCT` extension is compatible 
 whose C API is at least what it declares, so it is not pinned to 1.5.5. The **platform** string is
 checked strictly: an `osx_arm64` build will not load into an `osx_amd64` DuckDB. Rebuild with
 `DUCKDB_PLATFORM=... ./duckdb-extension/build.sh` to target another one.
+
+### Tier 3
+
+```
+PYTHON=/path/to/the/python/with/duckdb ./duckdb-extension/build_rewrite.sh
+```
+
+It reads the DuckDB release and `source_id` from that Python's `duckdb` module, shallow-clones the
+matching DuckDB tag into `duckdb-extension/build/duckdb-<version>/` on first run (only the headers are
+used; nothing of DuckDB is compiled), checks the clone's commit against the `source_id`, compiles
+`src/arrowmetal_rewrite.cpp`, checks that the module exports every DuckDB symbol the extension needs,
+and stamps the footer with the `CPP` ABI and that exact release. The result is
+`duckdb-extension/build/arrowmetal_rewrite.duckdb_extension`. Built and tested against DuckDB 1.5.5
+(`source_id d8cdaa33fd`) in the duckdb 1.5.5 Python module.
+
+```python
+import arrowmetal as am
+con = am.duckdb_connect()     # duckdb.connect + allow_unsigned_extensions + LOAD + SET arrowmetal_rewrite = 'auto'
+```
+
+or by hand: `duckdb.connect(config={"allow_unsigned_extensions": "true"})`, then
+`LOAD '.../arrowmetal_rewrite.duckdb_extension'`.
 
 ---
 
@@ -278,6 +308,205 @@ extension's path. Three things account for it:
 Fixing (1) and (2) is the obvious next work: partition the assembly across threads, and execute the
 inner query in streaming mode. None of it changes the extension's interface, so the SQL above is
 what it will keep being.
+
+---
+
+## 4b. Tier 3: ordinary SQL, rewritten
+
+`duckdb-extension/src/arrowmetal_rewrite.cpp` is a DuckDB **optimizer extension**. The query does not
+change. After DuckDB's own optimizers have run, the extension looks at every aggregate in the plan, and
+where the shape is one it answers exactly (and, in the default mode, the size is one where the GPU was
+measured ahead) it puts `ARROWMETAL_AGGREGATE` where DuckDB's `HASH_GROUP_BY` or `UNGROUPED_AGGREGATE`
+would have been. The scan, the pushed-down filters and the projections below it are still DuckDB's,
+planned and run exactly as before; so is everything above it.
+
+```sql
+LOAD 'duckdb-extension/build/arrowmetal_rewrite.duckdb_extension';
+
+SELECT region, sum(amount), count(*), max(amount) FROM sales GROUP BY region;   -- as written
+
+EXPLAIN SELECT region, sum(amount) FROM sales GROUP BY region;   -- ARROWMETAL_AGGREGATE when rewritten
+SELECT * FROM arrowmetal_rewrites();    -- every decision, with the reason, the threshold and the GPU path
+
+SET arrowmetal_rewrite = 'auto';        -- the default: supported shapes, at the sizes measured faster
+SET arrowmetal_rewrite = 'off';         -- plain DuckDB
+SET arrowmetal_rewrite = 'force';       -- every supported shape, whatever its size
+```
+
+From Python, `am.duckdb_connect()` opens a connection with the extension loaded,
+`am.duckdb_is_rewritten(con, sql)` says whether the plan of `sql` has an `ARROWMETAL_AGGREGATE`, and
+`am.duckdb_rewrites(con)` returns the decision log as a `pyarrow.Table`.
+
+### Why a C++ extension: the feasibility finding
+
+- **DuckDB's C extension API has no optimizer hook.** Tier 2 is built on it. Its header
+  (`duckdb_extension.h`, the v1.2.0 C API that DuckDB 1.5.5 ships) has one planner-adjacent entry
+  point, `duckdb_add_replacement_scan`, which swaps a table function in for a table name before
+  binding; nothing in it sees or changes a logical plan.
+- **The C++ API has one.** `OptimizerExtension` (`duckdb/optimizer/optimizer_extension.hpp`) takes an
+  `optimize_function` that DuckDB calls with the whole logical plan after its own optimizers, registered
+  with `OptimizerExtension::Register(DBConfig &, ...)`. `LogicalExtensionOperator` and
+  `PhysicalOperator` let the extension put its own operator into the plan.
+- **A C++ extension loads into the Python module.** It leaves DuckDB's symbols unresolved and takes
+  them from the process that loads it, and the duckdb 1.5.5 Python module exports DuckDB's C++
+  symbols, `OptimizerExtension::Register` among them. Compiled against the v1.5.5 headers (the module's
+  `source_id`, `d8cdaa33fd`) with `-undefined dynamic_lookup` and stamped `CPP` / `v1.5.5`, the
+  extension loads into that module with `allow_unsigned_extensions`. No DuckDB build is needed, only
+  its headers. `build_rewrite.sh` checks the symbols on every build, because a missing one would abort
+  the process at its first call instead of failing the `LOAD`.
+- **So the Python-level alternative is not needed.** Intercepting queries in a wrapper and routing them
+  by their `EXPLAIN` would work only from Python and only for queries sent through the wrapper; the
+  optimizer route works for any client of the loaded connection. `am.duckdb_connect` only loads it.
+
+The price of the C++ route is the pin: DuckDB loads a `CPP` extension only into the exact release in
+its footer, where the C-API extension of tier 2 loads into any DuckDB with C API 1.2 or later. A new
+DuckDB release means rebuilding with `build_rewrite.sh`, which fetches that release's headers, and
+possibly changing the source, since DuckDB's C++ API is not stable across releases: against the 1.4.5
+headers it does not compile (`OptimizerExtension::Register` and `PhysicalOperator::GetDataInternal`
+are not there yet).
+
+### What is rewritten
+
+| | Eligible |
+|---|---|
+| Aggregates | none (`SELECT k FROM t GROUP BY k`), or any of: `sum` and `avg` over integer columns of every width and signedness except `UBIGINT` (which DuckDB sums through a cast to `HUGEINT`); `min` and `max` over integer, `DATE` and `TIMESTAMP` columns; `count(x)`, `count(*)`. The argument is a column, or a column under the widening integer cast DuckDB inserts itself (`sum` over `TINYINT` is `sum(CAST(x AS BIGINT))`). No `DISTINCT`, `FILTER` or `ORDER BY` inside the aggregate. |
+| Grouping | none, or one column that is an integer, `DATE`, `TIMESTAMP` or `VARCHAR` column. No `GROUPING SETS`, `ROLLUP` or `CUBE`. |
+| Input | projections and filters over one table function whose row count DuckDB's planner knows: a table's `seq_scan`, `read_parquet`. A join, a window or another aggregate below the aggregate, or a source that does not report its size (a Python-registered Arrow table's `arrow_scan`), leaves it to DuckDB. |
+
+What DuckDB has already done to the plan stays done: the filters it pushed into the scan, its
+compressed materialization of the group key, its rewrite of `sum(x + 1)` into `sum(x)` plus a count,
+and its switch from `sum` to `sum_no_overflow` where its statistics prove the total fits in 64 bits.
+`test_unsupported_shapes_are_left_alone` covers the shapes left to DuckDB and the reason the log gives
+for each; `test_a_parquet_scan` and `test_a_registered_arrow_table_is_left_to_duckdb` the two sources.
+
+### Exactly DuckDB's answers
+
+`python/tests/test_duckdb_rewrite.py` runs every query twice on the same connection, with
+`arrowmetal_rewrite` off and forced, and requires the same column types and the same values bit for
+bit, `avg` included; only the order of an unordered `GROUP BY` may differ, since SQL does not define
+it, and with `ORDER BY` the order is compared too. Every test that takes a connection runs twice,
+once where its table fits one block and once with 2,048-row blocks, so the streamed path is covered
+by the same queries. The tables come from `hash()` of the row number and reach both ends of every
+integer type.
+
+- **Integer sums are exact to `HUGEINT`.** DuckDB's `sum` over an integer column returns `HUGEINT`. A
+  64-bit column is summed as its high and low 32-bit halves, each of which fits in 64 bits over fewer
+  than 2^31 rows, and the halves are recombined in 128 bits; where DuckDB's statistics already proved
+  the total fits in 64 bits (`sum_no_overflow`), it is summed directly, and narrower columns cannot
+  leave 64 bits. `test_sums_past_int64_are_exact_hugeints` sums values at both ends of `BIGINT`.
+- **`avg` uses DuckDB's own arithmetic**: `double(sum) / double(count)` over `SMALLINT`, and
+  `Hugeint::Cast<long double>(sum) / count` over `INTEGER` and `BIGINT`, the two finalizers in DuckDB's
+  `avg.cpp`, so the doubles are the same doubles.
+- **NULLs**: `count(x)` skips them; `sum`, `avg`, `min` and `max` of a group with no value are NULL;
+  an empty input gives one row of zero counts and NULLs without `GROUP BY` and no rows with it; the
+  NULL key is one group; a table whose keys are all NULL is one group. Each has a test.
+- **Floating-point `sum` and `avg` are not rewritten**: DuckDB's own float sums depend on how its
+  threads split the input, so there is no single answer to match. `min` and `max` over floats are not
+  rewritten either: DuckDB orders NaN above every number, where ArrowMetal's `min`/`max` skip NaN.
+
+### How it runs
+
+- **The sink.** `ARROWMETAL_AGGREGATE` is a parallel sink. Each DuckDB thread reserves row positions
+  for its chunk with one atomic add and copies the aggregate's input columns into page-aligned
+  buffers without a lock; a NULL clears its bit in an Arrow validity bitmap. A string key reserves its
+  rows and bytes together under a lock, so the offsets stay in row order.
+- **Slabs.** A fixed-width column's buffer comes from a pool kept across queries. Each slab is
+  imported into ArrowMetal once, over its whole capacity; a query writes its rows into the same
+  memory and hands ArrowMetal a zero-copy slice of the first rows, so the GPU wrapping is made once
+  per slab rather than once per query. The pool keeps at most 4 GB of mappings, least recently used
+  out first.
+- **Three GPU paths.** Without `GROUP BY`, one fused query computes every aggregate in one pass
+  (`am_query`, [EXPR.md](EXPR.md)). With an integer key whose values span at most 2^20, the fused dense
+  group-by keeps one slot per key value, split into several passes when the table would not fit in
+  threadgroup memory. Anything else - a `VARCHAR` key, a wider key range, a 64-bit `min`/`max` under a
+  `GROUP BY` - takes the hash group-by (`am_group_by_keys` and `am_group_agg_ex`). A short `VARCHAR`
+  key that DuckDB's compressed materialization has already turned into an integer arrives as that
+  integer and takes the integer paths.
+- **Streamed plans.** An ungrouped aggregate, and a group-by whose key DuckDB's statistics put within
+  65,536 values (with `min`/`max` over at most 32-bit columns), is processed in blocks of
+  `arrowmetal_rewrite_block_rows` rows (default 16,777,216). Each block goes to a GPU worker thread the
+  moment its last row lands, while DuckDB is still scanning; Finalize runs the last, partly filled one
+  and merges the per-block results on the host, exactly (sums in 128 bits). The other plans take up to
+  2^31 - 1 rows, the GPU kernels' 32-bit row index; a streamed plan is not held to that, since each
+  block is smaller and the partial sums are added in 128 bits.
+- **Rows past the reservation.** The buffers are sized from the source's row count at planning time.
+  Rows beyond that - a prepared statement run after the table grew - are kept aside and appended in
+  Finalize (`test_a_prepared_statement_after_the_table_grew`, `test_a_streamed_plan_past_its_block_directory`).
+- **One GPU.** Rewritten queries on different connections take turns on the GPU, under one
+  process-wide lock (`test_concurrent_queries_on_two_connections`).
+
+### When `auto` rewrites
+
+Two conditions, both recorded for each decision in `arrowmetal_rewrites()`:
+
+1. **The router's crossover.** DuckDB's estimate of the rows reaching the aggregate is at or above the
+   largest crossover among the query's aggregates in `Benchmarks/results/router_2026-09-17.json`: the
+   `reductions` rows without `GROUP BY`, the `group-by` rows with it, in the 1,000-group or
+   100,000-group class by DuckDB's estimate of the group count (split at 10,000, the geometric middle),
+   and the utf8 rows for a `VARCHAR` key. `test_crossovers_match_the_router_sweep` holds the constants to
+   the JSON.
+2. **A measured floor.** The router's crossovers compare kernels on data already on the GPU. Here every
+   row is first copied out of DuckDB's scan, and DuckDB's own aggregate runs while it scans, so the
+   query's shape class must also have been measured faster than DuckDB's operators, from the size in
+   this table, by `Benchmarks/duckdb_rewrite_bench.py`:
+
+| Shape class | `auto` from |
+|---|---:|
+| no `GROUP BY`, with three or more of `sum`/`min`/`max`/`avg` | 50,000,000 rows |
+| fused group-by, an estimated 10,000 groups or more (with no aggregates too) | 10,000,000 rows |
+| fused group-by, fewer groups, three or more of `sum`/`min`/`max`/`avg` | 50,000,000 rows |
+| hash group-by, an estimated 10,000 groups or more (with no aggregates too) | 50,000,000 rows |
+| no `GROUP BY` with one or two of `sum`/`min`/`max`/`avg`; fused group-by with fewer groups and at most two; hash group-by with fewer groups; a `VARCHAR` key | not rewritten in `auto` |
+
+The benchmark's queries in each class are the rows of the results file whose `shape_class` column
+names it; a query the file does not list is in `auto` because of its class, not because it was timed.
+`test_measured_floors_are_in_the_benchmark_results` requires every row of a rewritten class to be
+ahead at the class's floor, and no row of any other class to be rewritten.
+
+The measurements are in `Benchmarks/results/duckdb_rewrite_2026-09-23_provisional.csv`: for each
+query and size (1M, 10M, 50M rows), DuckDB's time and the rewrite's, wall and CPU, the GPU path taken,
+and what `auto` decided. `test_measured_floors_are_in_the_benchmark_results` requires every class in
+the table to be faster in that file at its floor. The run is **provisional**: it was measured while
+other work shared the machine, which its header records, and the floors are revisited with a quiet
+rerun. Reproduce with:
+
+```
+./duckdb-extension/build_rewrite.sh
+PYTHONPATH=python python Benchmarks/duckdb_rewrite_bench.py        # 1M, 10M and 50M rows
+```
+
+The classes left to DuckDB are the ones where its own operators came out ahead in that file, or not
+ahead consistently: a single `sum` (DuckDB aggregates while it scans, and the rewrite has to copy the
+column out first), few groups with at most two aggregates, and `VARCHAR` keys that DuckDB keeps as
+strings. One ungrouped case is left to DuckDB although the rewrite was ahead on some of its queries:
+one or two aggregates. There DuckDB's time depends on the values, which the plan does not show: in the
+file, `avg` and `sum, avg` over non-negative `BIGINT` values are to improve, while `sum` and
+`sum, avg` over full-range `BIGINT` values are ahead. The first `auto` class starts at 50,000,000 rows because at 10,000,000 one of its
+queries (`sum, max, avg`) was not ahead of DuckDB.
+
+### Limits
+
+- Built for one DuckDB release and one platform string at a time; unsigned.
+- The decision is made when the plan is: a prepared statement keeps the decision made at `PREPARE`,
+  and `EXPLAIN` records a decision of its own.
+- A plan keeps the key statistics it was made with. Where DuckDB would have run the group-by as its
+  `PERFECT_HASH_GROUP_BY` (an integer key whose statistics span at most 2^`perfect_ht_threshold` - 2
+  values, 12 bits by default), a key that lands past the table those statistics sized raises DuckDB's
+  own error, `Perfect hash aggregate: aggregate group N exceeded total groups M. This likely means that
+  the statistics in your data source are corrupt.`, as DuckDB does with the rewrite off. That happens
+  when a prepared statement runs after keys outside the planned range were inserted: the plan's
+  compressed materialization narrowed the key to `key - min` in a smaller unsigned type, in which
+  such keys wrap. Where DuckDB would have used its hash group-by, which does not check, the
+  rewrite does not either, and both answer over the same narrowed keys
+  (`test_a_prepared_statement_whose_key_outgrew_its_statistics`,
+  `test_where_duckdb_does_not_check_the_statistics_neither_does_the_rewrite`).
+- The log keeps the last 1,024 decisions of the process and is shared by every connection; a
+  rewritten plan's `path`, `rows_seen`, `groups` and `gpu_ms` describe its latest run.
+- The aggregate's input is held in memory: the buffers are reserved for the source's row count and
+  filled as rows arrive (a streamed plan holds only its blocks in flight). Freed slabs stay mapped in
+  the pool, up to 4 GB.
+- The shapes in "What is rewritten" only: one group key, no floating-point `sum`/`avg`, no
+  `DECIMAL`, `HUGEINT` or `BOOLEAN` values, no `min`/`max` over strings.
 
 ---
 
@@ -523,14 +752,23 @@ many keys and string matching are compute-heavy per byte; `sum` is not.
 - Unsigned. `allow_unsigned_extensions` has to be set when the connection is created.
 - Built for one platform string at a time; `osx_arm64` unless you set `DUCKDB_PLATFORM`.
 
+**Tier 3**
+
+- §4b, "Limits".
+
 ## Files
 
 | Path | What |
 |---|---|
-| `python/arrowmetal/duckdb_bridge.py` | tier 1, the whole bridge |
+| `python/arrowmetal/duckdb_bridge.py` | tier 1, the whole bridge; `duckdb_connect`, `duckdb_rewrites`, `duckdb_is_rewritten` for tier 3 |
 | `duckdb-extension/src/arrowmetal_extension.cpp` | tier 2, the extension |
-| `duckdb-extension/build.sh` | builds the extension without cmake |
-| `duckdb-extension/CMakeLists.txt` | the same build, for cmake |
-| `duckdb-extension/scripts/append_metadata.py` | writes DuckDB's 512-byte extension footer |
-| `python/tests/test_duckdb.py` | both tiers, with DuckDB's own SQL as the oracle |
+| `duckdb-extension/src/arrowmetal_rewrite.cpp` | tier 3, the optimizer extension |
+| `duckdb-extension/build.sh` | builds the tier 2 extension without cmake |
+| `duckdb-extension/build_rewrite.sh` | builds the tier 3 extension against the installed DuckDB release |
+| `duckdb-extension/CMakeLists.txt` | the tier 2 build, for cmake |
+| `duckdb-extension/scripts/append_metadata.py` | writes DuckDB's 512-byte extension footer (`C_STRUCT` or `CPP`) |
+| `python/tests/test_duckdb.py` | tiers 1 and 2, with DuckDB's own SQL as the oracle |
+| `python/tests/test_duckdb_rewrite.py` | tier 3, differential against DuckDB with the rewrite off |
 | `Benchmarks/duckdb_bench.py` | the tables in §5 |
+| `Benchmarks/duckdb_rewrite_bench.py` | tier 3 against DuckDB's own operators at 1M, 10M and 50M rows |
+| `Benchmarks/results/duckdb_rewrite_2026-09-23_provisional.csv` | its provisional run, which the `auto` floors cite |
