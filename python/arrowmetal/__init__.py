@@ -4635,8 +4635,12 @@ def read_csv(path, *, read_options=None, parse_options=None, convert_options=Non
     arr, n = _csv_strings(list(inc) if inc else None)
     keep.append(arr)
     c.include_columns, c.n_include_columns = arr, n
-    types = o["column_types"] or {}
-    if isinstance(types, (list, tuple)):
+    types = o["column_types"]
+    if types is None:
+        types = {}
+    elif isinstance(types, pa.Schema):
+        types = {f.name: f.type for f in types}
+    elif isinstance(types, (list, tuple)):
         types = dict(types)
     names_arr, n = _csv_strings(list(types.keys()))
     fmts_arr, _ = _csv_strings([_csv_type_format(t) for t in types.values()])

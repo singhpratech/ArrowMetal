@@ -321,6 +321,15 @@ def test_options(tmp_csv, name, data, kw):
     check(tmp_csv(data), **kw)
 
 
+def test_column_types_spellings(tmp_csv):
+    """column_types as a dict, a pyarrow Schema, (name, type) pairs, or type aliases."""
+    path = tmp_csv("a,b\n1,2\n")
+    exp = pc.read_csv(path, convert_options=C(column_types={"a": pa.int8(), "b": pa.string()}))
+    for types in ({"a": pa.int8(), "b": pa.string()}, pa.schema([("a", pa.int8()), ("b", pa.string())]),
+                  [("a", pa.int8()), ("b", pa.string())], {"a": "int8", "b": "string"}):
+        assert_tables_equal(am.read_csv_table(path, column_types=types), exp)
+
+
 def test_keywords_match_option_objects(tmp_csv):
     path = tmp_csv("x;y;z\nskip;me;now\na;1,5;NA\n")
     kw = dict(skip_rows_after_names=1, delimiter=";", decimal_point=",", include_columns=["y", "x"],
