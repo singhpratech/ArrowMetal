@@ -28,7 +28,8 @@ from . import ArrowMetalError, MetalArray, group_by as _group_by
 
 __all__ = ["from_duckdb", "to_duckdb", "duckdb_gpu_query", "duckdb_batches", "duckdb_aggregate",
            "duckdb_group_by", "duckdb_reader", "duckdb_table", "is_zero_copy",
-           "DEFAULT_ROWS_PER_BATCH"]
+           "DEFAULT_ROWS_PER_BATCH", "duckdb_connect", "duckdb_rewrites", "duckdb_is_rewritten",
+           "rewrite_extension_path"]
 
 #: Rows per record batch when streaming. DuckDB's own vector size is 2048; a few hundred thousand
 #: rows per batch keeps the GPU busy without materialising the whole table.
@@ -463,3 +464,85 @@ def duckdb_group_by(source, keys, aggs, con=None, rows_per_batch=DEFAULT_ROWS_PE
         out_names.append(name)
         out_columns.append(pa.array(values))
     return pa.Table.from_arrays(out_columns, names=out_names)
+
+
+# ---------------------------------------------------------------------------------------------------
+# Ordinary SQL, rewritten: the optimizer extension (docs/DUCKDB.md §4b)
+#
+# duckdb-extension/src/arrowmetal_rewrite.cpp is a DuckDB optimizer extension. Loaded into a
+# connection, it replaces an eligible aggregate in the plan of any query - no change to the SQL - with
+# ARROWMETAL_AGGREGATE, which runs it on the GPU. These helpers open such a connection and report what
+# the extension decided.
+# ---------------------------------------------------------------------------------------------------
+
+_REWRITE_MODES = ("auto", "off", "force")
+
+
+def rewrite_extension_path():
+    """Where the rewrite extension is: ``$ARROWMETAL_DUCKDB_REWRITE_EXTENSION`` if set, else the build
+    directory of the repository this package sits in (``duckdb-extension/build``)."""
+    import os
+    env = os.environ.get("ARROWMETAL_DUCKDB_REWRITE_EXTENSION")
+    if env:
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(os.path.dirname(os.path.dirname(here)), "duckdb-extension", "build",
+                        "arrowmetal_rewrite.duckdb_extension")
+
+
+def duckdb_connect(database=":memory:", rewrite="auto", config=None, extension=None, read_only=False):
+    """A DuckDB connection with ArrowMetal underneath its SQL.
+
+    Opens ``duckdb.connect(database, ...)`` with ``allow_unsigned_extensions`` set (the extension is
+    not signed), loads the rewrite extension and sets ``arrowmetal_rewrite`` to `rewrite`:
+
+      ``"auto"``   rewrite a supported aggregate when its size and shape were measured faster on the GPU
+      ``"off"``    never rewrite; the connection behaves exactly like plain DuckDB
+      ``"force"``  rewrite every supported aggregate, whatever its size
+
+    The mode can be changed later with ``con.execute("SET arrowmetal_rewrite = 'off'")``. Queries are
+    plain SQL; ``am.duckdb_is_rewritten(con, sql)`` and ``am.duckdb_rewrites(con)`` say what happened.
+
+    The extension is built for one DuckDB release (a C++ extension; see docs/DUCKDB.md §4b). Loading it
+    into another raises ArrowMetalError naming both.
+
+        con = am.duckdb_connect()
+        con.execute("CREATE TABLE t AS SELECT i % 100000 AS k, i AS v FROM range(50000000) r(i)")
+        con.sql("SELECT k, sum(v), count(*) FROM t GROUP BY k").fetchall()
+    """
+    import os
+    import duckdb
+    if rewrite not in _REWRITE_MODES:
+        raise ArrowMetalError(f"rewrite must be one of {_REWRITE_MODES}, not {rewrite!r}")
+    path = extension or rewrite_extension_path()
+    if not os.path.exists(path):
+        raise ArrowMetalError(f"the ArrowMetal DuckDB rewrite extension is not at {path}; build it with "
+                              "duckdb-extension/build_rewrite.sh (docs/DUCKDB.md §4b)")
+    settings = {"allow_unsigned_extensions": "true"}
+    settings.update(config or {})
+    con = duckdb.connect(database, read_only=read_only, config=settings)
+    try:
+        con.execute("LOAD '" + path.replace("'", "''") + "'")
+    except duckdb.Error as e:
+        con.close()
+        raise ArrowMetalError(f"could not load {path} into duckdb {duckdb.__version__}: {e}. The extension is "
+                              "built for one DuckDB release; rebuild it with duckdb-extension/build_rewrite.sh "
+                              "against the installed one") from e
+    con.execute(f"SET arrowmetal_rewrite = '{rewrite}'")
+    return con
+
+
+def duckdb_rewrites(con):
+    """The rewrite extension's decision log as a ``pyarrow.Table``, oldest first.
+
+    One row per aggregate the optimizer looked at, in this process: ``decision`` is "rewritten" or
+    "kept", ``reason`` says why (the shape class and the threshold it was held to), ``input_rows`` is
+    DuckDB's estimate of the rows reaching the aggregate and ``threshold_rows`` the auto threshold
+    (NULL for a class never rewritten in auto). For a rewritten plan, ``path`` (the GPU path taken),
+    ``rows_seen``, ``groups`` and ``gpu_ms`` describe its most recent run."""
+    return duckdb_table(con.sql("SELECT * FROM arrowmetal_rewrites() ORDER BY id"))
+
+
+def duckdb_is_rewritten(con, sql):
+    """True when the plan DuckDB makes for `sql` on `con` right now has an ARROWMETAL_AGGREGATE in it."""
+    return any("ARROWMETAL_AGGREGATE" in row[1] for row in con.sql("EXPLAIN " + sql).fetchall())

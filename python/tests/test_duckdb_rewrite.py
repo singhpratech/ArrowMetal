@@ -15,6 +15,7 @@ Run: PYTHONPATH=python python -m pytest python/tests/test_duckdb_rewrite.py -q
 Skipped unless duckdb-extension/build/arrowmetal_rewrite.duckdb_extension exists; build it with
 duckdb-extension/build_rewrite.sh (it needs the DuckDB release the installed duckdb module is).
 """
+import csv
 import json
 import os
 import re
@@ -28,6 +29,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 EXTENSION = os.path.join(REPO, "duckdb-extension", "build", "arrowmetal_rewrite.duckdb_extension")
 SOURCE = os.path.join(REPO, "duckdb-extension", "src", "arrowmetal_rewrite.cpp")
 ROUTER = os.path.join(REPO, "Benchmarks", "results", "router_2026-09-17.json")
+RESULTS = os.path.join(REPO, "Benchmarks", "results", "duckdb_rewrite_2026-09-23_provisional.csv")
 
 pytestmark = pytest.mark.skipif(not os.path.exists(EXTENSION),
                                 reason="build it with duckdb-extension/build_rewrite.sh")
@@ -382,6 +384,32 @@ def test_the_decision_log_records_the_run(con):
     assert "seq_scan" in row[3] and "GROUP BY" in row[3]
 
 
+MEASURED_CLASSES = {
+    "UNGROUPED": "ungrouped",
+    "DENSE_MANY_GROUPS": "fused group-by, an estimated 10k or more groups",
+    "DENSE_FEW_GROUPS": "fused group-by, fewer groups, three or more aggregates",
+    "HASH_MANY_GROUPS": "hash group-by, an estimated 10k or more groups",
+}
+
+
+def test_measured_floors_are_in_the_benchmark_results():
+    """Every class 'auto' rewrites was measured faster than DuckDB's own operators at its floor, in the
+    results file the floors cite (Benchmarks/duckdb_rewrite_bench.py writes it)."""
+    source = open(SOURCE).read()
+    floors = dict(re.findall(r"static constexpr int64_t (\w+) = (\d+);", source))
+    with open(RESULTS) as f:
+        rows = list(csv.DictReader(line for line in f if not line.startswith("#")))
+    for constant, shape_class in MEASURED_CLASSES.items():
+        floor = int(floors[constant])
+        at_floor = [r for r in rows if r["shape_class"] == shape_class and int(r["rows"]) == floor]
+        assert at_floor, (shape_class, floor)
+        assert all(float(r["speedup"]) > 1 for r in at_floor), at_floor
+    # The classes with no floor are the rest; none of them is rewritten in auto anywhere in the file.
+    for r in rows:
+        if r["auto"] == "rewritten":
+            assert r["shape_class"] in MEASURED_CLASSES.values(), r
+
+
 def test_crossovers_match_the_router_sweep():
     """The auto gate's constants are the router's crossovers (Benchmarks/results/router_2026-09-17.json)."""
     source = open(SOURCE).read()
@@ -489,3 +517,33 @@ def test_concurrent_queries_on_two_connections():
     assert not errors
     assert len(results) == 20 and all(r == expected for r in results)
     db.close()
+
+
+# ---------------------------------------------------------------------------------------------------
+# The Python side: am.duckdb_connect and friends
+# ---------------------------------------------------------------------------------------------------
+
+def test_python_duckdb_connect():
+    am = pytest.importorskip("arrowmetal")
+    con = am.duckdb_connect(rewrite="force")
+    assert con.sql("SELECT current_setting('arrowmetal_rewrite')").fetchone()[0] == "force"
+    con.execute("CREATE TABLE t AS SELECT (i % 7)::INTEGER k, i::BIGINT v FROM range(10000) r(i)")
+    sql = "SELECT k, sum(v), count(*) FROM t GROUP BY k"
+    assert am.duckdb_is_rewritten(con, sql)
+    got = sorted(con.sql(sql).fetchall())
+    log = am.duckdb_rewrites(con)
+    assert log.column_names[:3] == ["id", "decision", "reason"]
+    assert log.column("decision").to_pylist()[-1] == "rewritten"
+    con.execute("SET arrowmetal_rewrite = 'off'")
+    assert not am.duckdb_is_rewritten(con, sql)
+    assert got == sorted(con.sql(sql).fetchall())
+    con.close()
+    assert am.duckdb_connect().sql("SELECT current_setting('arrowmetal_rewrite')").fetchone()[0] == "auto"
+
+
+def test_python_duckdb_connect_refuses_what_it_cannot_do():
+    am = pytest.importorskip("arrowmetal")
+    with pytest.raises(am.ArrowMetalError, match="rewrite must be one of"):
+        am.duckdb_connect(rewrite="sometimes")
+    with pytest.raises(am.ArrowMetalError, match="build it with duckdb-extension/build_rewrite.sh"):
+        am.duckdb_connect(extension="/nonexistent/arrowmetal_rewrite.duckdb_extension")
