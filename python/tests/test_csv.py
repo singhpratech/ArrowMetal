@@ -450,6 +450,46 @@ def test_block_boundary_straddles(tmp_csv, block):
     check(tmp_csv(data), scan_block_bytes=block)
 
 
+# The reader infers each column's type from its first 8192 rows and converts every row against that
+# guess, checking as it goes; a value past the sample that does not fit sends the column through
+# full inference. These put the value that decides the type far past the sample.
+LATE = [
+    ("int_then_float", "1", "1.5"),
+    ("int_then_string", "1", "abc"),
+    ("int_then_bool_is_string", "7", "true"),
+    ("bool01_then_true", "1", "true"),
+    ("null_then_int", "", "5"),
+    ("null_then_string", "NA", "x"),
+    ("date_then_timestamp", "2020-01-01", "2020-01-01 00:00:01"),
+    ("ts_then_fraction", "2020-01-01 00:00:01", "2020-01-01 00:00:01.25"),
+    ("ts_then_zone_is_string", "2020-01-01 00:00:01", "2020-01-01 00:00:01Z"),
+    ("float_then_string", "1.5", "x1.5"),
+    ("string_then_invalid_utf8", "x", b"\xff"),
+    ("time_then_date_is_string", "12:00", "2020-01-01"),
+    ("int_then_overflow", "1", "9223372036854775808"),
+]
+
+
+@pytest.mark.parametrize("name,early,late", LATE, ids=[c[0] for c in LATE])
+def test_type_decided_after_the_sample(tmp_csv, name, early, late):
+    early = early.encode() if isinstance(early, str) else early
+    late = late.encode() if isinstance(late, str) else late
+    rows = [early] * 20000 + [late] + [early] * 10
+    check(tmp_csv(b"a,b\n" + b"\n".join(r + b",%d" % i for i, r in enumerate(rows)) + b"\n"))
+
+
+def test_forced_type_error_after_the_sample(tmp_csv):
+    rows = ["1"] * 20000 + ["x"]
+    check(tmp_csv("a\n" + "\n".join(rows) + "\n"), convert_options=C(column_types={"a": pa.int64()}))
+
+
+def test_file_access_map(tmp_csv):
+    rng = random.Random(5)
+    for seed in range(5):
+        kinds = [rng.choice(KINDS) for _ in range(rng.randint(1, 6))]
+        check(tmp_csv(_gen_csv(rng, rng.randint(1, 300), kinds)), file_access="map")
+
+
 def test_wide_file(tmp_csv):
     rng = random.Random(7)
     kinds = [rng.choice(KINDS) for _ in range(300)]

@@ -95,6 +95,8 @@ final class CSVColumnConverter {
         var range: MetalArrowBuffer! = nil
         var type: CSVColumnType = .null
         var inferred = false
+        /// An inferred type known to hold for every row (not only the sample it was inferred from).
+        var verified = false
         var values: MetalArrowBuffer! = nil
         var wide: MetalArrowBuffer! = nil
         var validity: MetalArrowBuffer! = nil
@@ -166,41 +168,40 @@ final class CSVColumnConverter {
             try unescape(w, keep: &keep)
         }
 
-        // Phase 2: inference for every column without an override. A speculative pass finds the range
-        // of first kinds; only a column whose rows disagree runs the full classification.
+        // Phase 2: inference from a sample. The type every one of the first `sampleRows` rows converts
+        // as is a speculation for the whole column: the conversion below also checks every row against
+        // it, so the column's bytes are read once when it holds. Every kind ahead of it in Arrow's order
+        // already fails on some sampled row, so when every row converts, it is exactly Arrow's answer.
         let inferred = live.filter { $0.forced == nil }
         for w in inferred {
             w.inferred = true
-            w.range = try alloc(8, &keep)
-            w.range.mutableTyped(UInt32.self)[0] = UInt32.max
-            w.range.mutableTyped(UInt32.self)[1] = 0
-            if nRows > 0 { try kindRange(w) }
-        }
-        try ctx.syncPoint()
-        reader.mark("unescape + kind range")
-        var undecided: [Work] = []
-        for w in inferred {
-            let lo = w.range.typed(UInt32.self)[0], hi = w.range.typed(UInt32.self)[1]
-            if lo == UInt32.max { w.type = .null }                              // no non-null value
-            else if lo == hi, let k = CSVKind(rawValue: Int(lo)) { w.type = k.type }
-            else { undecided.append(w) }
-        }
-        for w in undecided {
             w.mask = try alloc(4, &keep)
             w.mask.mutableTyped(UInt32.self)[0] = 0xFFF
-            try classify(w)
+            if nRows > 0 { try classify(w, rows: Swift.min(nRows, Self.sampleRows)) }
         }
-        if !undecided.isEmpty {
-            try ctx.syncPoint()
-            reader.mark("classify")
-            for w in undecided { w.type = CSVKind.first(in: w.mask.typed(UInt32.self)[0]).type }
+        try ctx.syncPoint()
+        reader.mark("unescape + sample")
+        for w in inferred {
+            w.type = CSVKind.first(in: w.mask.typed(UInt32.self)[0]).type
+            w.verified = nRows <= Self.sampleRows
         }
         for w in live where w.forced != nil { w.type = w.forced! }
 
-        // Phase 3: conversion.
+        // Phase 3: conversion (and, for a speculated type, the check that every row converts).
         for w in live { try dispatchConversion(w, keep: &keep) }
         try ctx.syncPoint()
         reader.mark("convert")
+
+        // Phase 4: a speculation that failed: full inference over every row, then convert again.
+        let missed = inferred.filter { w in
+            !w.verified && (w.err.map { $0.typed(UInt32.self)[0] != UInt32.max || $0.typed(UInt32.self)[1] != UInt32.max } ?? false)
+        }
+        if !missed.isEmpty {
+            try inferAll(missed, keep: &keep)
+            for w in missed { try dispatchConversion(w, keep: &keep) }
+            try ctx.syncPoint()
+            reader.mark("infer all + convert again")
+        }
         for w in live { try checkErrors(w) }
         reader.mark("check errors")
 
@@ -215,6 +216,37 @@ final class CSVColumnConverter {
         }
         reader.mark("finish (strings)")
         return out
+    }
+
+    /// Rows the type speculation is inferred from.
+    static let sampleRows = 8192
+
+    /// Full inference over every row: the range of first kinds, and only for a column whose rows
+    /// disagree, the per-kind classification.
+    private func inferAll(_ cols: [Work], keep: inout [AnyObject]) throws {
+        for w in cols {
+            w.range = try alloc(8, &keep)
+            w.range.mutableTyped(UInt32.self)[0] = UInt32.max
+            w.range.mutableTyped(UInt32.self)[1] = 0
+            try kindRange(w)
+        }
+        try ctx.syncPoint()
+        var undecided: [Work] = []
+        for w in cols {
+            w.verified = true
+            let lo = w.range.typed(UInt32.self)[0], hi = w.range.typed(UInt32.self)[1]
+            if lo == UInt32.max { w.type = .null }                              // no non-null value
+            else if lo == hi, let k = CSVKind(rawValue: Int(lo)) { w.type = k.type }
+            else { undecided.append(w) }
+        }
+        for w in undecided {
+            w.mask.mutableTyped(UInt32.self)[0] = 0xFFF
+            try classify(w, rows: nRows)
+        }
+        if !undecided.isEmpty {
+            try ctx.syncPoint()
+            for w in undecided { w.type = CSVKind.first(in: w.mask.typed(UInt32.self)[0]).type }
+        }
     }
 
     // MARK: phases
@@ -284,15 +316,17 @@ final class CSVColumnConverter {
         enc.setBuffer(listBytes.mtl, offset: listBytes.offset, index: 5)
     }
 
-    private func classify(_ w: Work) throws {
+    /// The per-kind classification of the first `rows` rows, ANDed into `w.mask`.
+    private func classify(_ w: Work, rows: Int) throws {
         var P = params(w)
+        P.nRows = UInt32(rows)
         let pso = try reader.pipeline("csv_classify")
         try reader.gpu("csv_classify") { enc in
             enc.setComputePipelineState(pso)
             bindRow(enc, w, &P)
             enc.setBuffer(w.mask.mtl, offset: w.mask.offset, index: 6)
             enc.setBuffer(events.mtl, offset: events.offset, index: 7)
-            Dispatch.dispatch1D(enc, pso, count: nRows)
+            Dispatch.dispatch1D(enc, pso, count: rows)
         }
     }
 
@@ -315,6 +349,7 @@ final class CSVColumnConverter {
     }
 
     private func dispatchConversion(_ w: Work, keep: inout [AnyObject]) throws {
+        w.values = nil; w.wide = nil; w.host = nil; w.hostCount = nil         // a second attempt starts clean
         var P = params(w)
         w.validity = try alloc(words * 4, &keep)
         w.err = try alloc(8, &keep)
@@ -324,7 +359,7 @@ final class CSVColumnConverter {
         var extra: ((MTLComputeCommandEncoder) -> Void)? = nil
         switch w.type {
         case .null:
-            if w.inferred { return }                              // every row is already known to be null
+            if w.inferred && w.verified { return }                // every row is already known to be null
             fn = "csv_conv_null"
         case .bool:
             fn = "csv_conv_bool"
@@ -359,7 +394,8 @@ final class CSVColumnConverter {
         case .utf8, .binary:
             fn = "csv_str_len"
             w.values = try alloc(nRows * 4, &keep)
-            var check: UInt32 = (w.type == .utf8 && !w.inferred && options.checkUTF8) ? 1 : 0
+            // A forced or speculated utf8 column is validated here; a verified inferred one already was.
+            var check: UInt32 = (w.type == .utf8 && !(w.inferred && w.verified) && options.checkUTF8) ? 1 : 0
             extra = { enc in enc.setBytes(&check, length: 4, index: 9) }
         default:
             guard let lim = intLimits(w.type) else { throw CSVError.invalidOptions("unsupported column type \(w.type.arrowName)") }
