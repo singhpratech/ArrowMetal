@@ -353,6 +353,10 @@ Bindings
   The publication steps are in docs/RELEASE.md (step 4 is the PyPI upload).
 
 Fixed
+- `am.scan_ipc(...)` (and every stream with no explicit projection) no longer replaces the second of two
+  same-named columns with a copy of the first: the default projection looked each column up by name.
+  Such a batch now stays positional; batches with unique names take the fused path as before. Found by
+  the review of the IPC lane.
 - A float literal whose value is 2^63 or more in magnitude no longer ends the host process: the fused
   expression compiler converted every float literal to Int64 even for float targets, and `Int64(Double)`
   traps outside its range. Float targets no longer compute the integer; an integer-typed float literal that

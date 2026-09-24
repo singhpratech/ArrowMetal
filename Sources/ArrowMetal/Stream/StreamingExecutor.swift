@@ -1693,6 +1693,20 @@ func exprCanMaterialise(_ c: AnyMetalArray) -> Bool {
 ///   computed outputs go back through the compiler.
 func streamFilterProject(_ batch: MetalRecordBatch, filter: Expr?, projections: [(String, Expr)]?,
                          context: MetalContext) throws -> MetalRecordBatch {
+    // "Every column" with two columns of one name cannot go through name-keyed projections: the second
+    // `a` would resolve to the first and its values would silently replace the other column's. Keep
+    // such a batch positional: filter it with the mask, or pass it through. A batch with unique names
+    // takes the fused path below, unchanged.
+    if projections == nil, Set(batch.names).count != batch.names.count {
+        guard let f = filter else { return batch }
+        var seen = Set<String>(), names: [String] = [], cols: [AnyMetalArray] = []
+        for (n, c) in zip(batch.names, batch.columns) where seen.insert(n).inserted { names.append(n); cols.append(c) }
+        let r = try runExprQuery(ExprQueryBuilder().project([("__mask", f)]), names: names, columns: cols, context: context)
+        guard let mask = r["__mask"]?.asBoolean else {
+            throw ArrowMetalError.unsupportedType("a streaming filter predicate must be boolean")
+        }
+        return try batch.filter(mask)
+    }
     let projs = projections ?? batch.names.map { ($0, Expr.column($0)) }
     func passthrough(_ e: Expr) -> String? { if case .column(let n) = e { return n }; return nil }
 
