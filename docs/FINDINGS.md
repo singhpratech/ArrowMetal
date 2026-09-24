@@ -65,9 +65,9 @@ failure; they were then fixed at the root, each with a test that fails on the ol
 - A filter refused any batch that also carried a date32 column, because the expression compiler bound
   every column, read or not. It binds only the ones the query reads.
 - A string sort returned wrong rows when a column held a null and a value of eight bytes or more: the
-  null partition read the sort's indices on the CPU before the GPU had written them. It now waits for
-  them. That makes such a sort about 15% slower at ten million rows than the old, wrong one; moving the
-  partition onto the GPU would win it back.
+  null partition read the sort's indices on the CPU before the GPU had written them. It first waited for
+  them, which made such a sort slower than the old, wrong one; the partition now runs on the GPU, as a
+  bit in the sort's own prefix keys, and there is nothing to wait for.
 
 The JSON reader's review found a fifth wrong answer, in new code: an explicit `timestamp[ns]` outside the
 years 1678 to 2261 wrapped around instead of raising, as pyarrow raises. It raises now.
