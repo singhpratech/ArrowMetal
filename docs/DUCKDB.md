@@ -419,13 +419,16 @@ integer type.
   (`am_query`, [EXPR.md](EXPR.md)). With an integer key whose values span at most 2^20, the fused dense
   group-by keeps one slot per key value, split into several passes when the table would not fit in
   threadgroup memory. Anything else - a `VARCHAR` key, a wider key range, a 64-bit `min`/`max` under a
-  `GROUP BY` - takes the hash group-by (`am_group_by_keys` and `am_group_agg_ex`).
+  `GROUP BY` - takes the hash group-by (`am_group_by_keys` and `am_group_agg_ex`). A short `VARCHAR`
+  key that DuckDB's compressed materialization has already turned into an integer arrives as that
+  integer and takes the integer paths.
 - **Streamed plans.** An ungrouped aggregate, and a group-by whose key DuckDB's statistics put within
   65,536 values (with `min`/`max` over at most 32-bit columns), is processed in blocks of
   `arrowmetal_rewrite_block_rows` rows (default 16,777,216). Each block goes to a GPU worker thread the
   moment its last row lands, while DuckDB is still scanning; Finalize runs the last, partly filled one
-  and merges the per-block results on the host, exactly (sums in 128 bits). A streamed plan has no row
-  limit; the others take up to 2^31 - 1 rows, the GPU kernels' 32-bit row index.
+  and merges the per-block results on the host, exactly (sums in 128 bits). The other plans take up to
+  2^31 - 1 rows, the GPU kernels' 32-bit row index; a streamed plan is not held to that, since each
+  block is smaller and the partial sums are added in 128 bits.
 - **Rows past the reservation.** The buffers are sized from the source's row count at planning time.
   Rows beyond that - a prepared statement run after the table grew - are kept aside and appended in
   Finalize (`test_a_prepared_statement_after_the_table_grew`, `test_a_streamed_plan_past_its_block_directory`).
