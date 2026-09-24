@@ -69,6 +69,7 @@ enum JSONSource {
     #define E_TOP_BOOLEAN   19u
 
     #define MAX_DEPTH 1024u
+    #define J_REP(c) (0x0101010101010101ul * (ulong)(c))   // byte c in all eight lanes
     #define BLK \(JSONSource.blockBytes)u      // bytes per structure-pass thread
 
     struct JEntry { uint parent; uint keyStart; uint keyLen; uint valStart; uint valLen; uint flags; };
@@ -107,8 +108,6 @@ enum JSONSource {
         for (uint i = hi; i > lo; i--) { if (s[i - 1u] == 0x5C) t++; else { all = false; break; } }
         key[b] = all ? 0u : (((b + 1u) << 1) | (t & 1u));
     }
-
-    #define J_REP(c) (0x0101010101010101ul * (ulong)(c))
 
     // One bit per byte of x equal to the byte repeated in pat (SWAR compare, then gather the high bits).
     inline ulong j_eq8(ulong x, ulong pat) {
@@ -194,10 +193,36 @@ enum JSONSource {
         delta[b] = d;
     }
 
-    // A string starting at the quote at p. Returns the position after the closing quote.
+    // Eight bytes from any position (two aligned loads). The input is followed by 64 zero bytes, so the
+    // second load never leaves the buffer.
+    inline ulong j_load8(device const uchar* s, uint p) {
+        device const ulong* w = (device const ulong*)(s + (p & ~7u));
+        uint sh = (p & 7u) * 8u;
+        return sh == 0u ? w[0] : ((w[0] >> sh) | (w[1] << (64u - sh)));
+    }
+
+    // High bit of each byte of x that is a quote, a backslash or below 0x20. A borrow only runs towards
+    // later bytes, so the lowest flagged byte is always a real one, which is all the caller uses.
+    inline ulong j_string_stops(ulong x) {
+        ulong q = x ^ J_REP(0x22), b = x ^ J_REP(0x5C);
+        ulong hi = J_REP(0x80);
+        ulong zq = (q - J_REP(0x01)) & ~q & hi;
+        ulong zb = (b - J_REP(0x01)) & ~b & hi;
+        ulong lt = (x - J_REP(0x20)) & ~x & hi;
+        return zq | zb | lt;
+    }
+
+    // A string starting at the quote at p. Returns the position after the closing quote. Runs of
+    // ordinary bytes are skipped eight at a time.
     inline uint j_string(device const uchar* s, uint p, uint end, thread uint& err, thread bool& esc) {
         p++;
         while (true) {
+            while (p + 8u <= end) {
+                ulong stops = j_string_stops(j_load8(s, p));
+                if (stops == 0ul) { p += 8u; continue; }
+                p += (uint)(ctz(stops) >> 3);
+                break;
+            }
             if (p >= end) { err = E_STR_QUOTE; return p; }
             uchar c = s[p];
             if (c == 0x22) return p + 1u;
