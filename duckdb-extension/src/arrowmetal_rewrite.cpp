@@ -106,11 +106,16 @@ struct Crossovers {
 struct Measured {
 	// Ungrouped, with two or more of SUM/MIN/MAX/AVG, or one DuckDB keeps in a 128-bit state.
 	static constexpr int64_t UNGROUPED = 10000000;
-	// Integer key within the fused group-by's range, DuckDB estimating 100k groups or more.
+	// Integer key within the fused group-by's range, DuckDB estimating MANY_GROUPS groups or more.
 	static constexpr int64_t DENSE_MANY_GROUPS = 10000000;
 	// Integer key within the fused group-by's range, fewer groups, three or more of SUM/MIN/MAX/AVG.
 	static constexpr int64_t DENSE_FEW_GROUPS = 50000000;
+	// Integer key over a wider range (ArrowMetal's hash group-by), MANY_GROUPS groups or more.
+	static constexpr int64_t HASH_MANY_GROUPS = 50000000;
 };
+
+// Where the router's 1,000-group and 100,000-group classes meet (see Analyse).
+static constexpr int64_t MANY_GROUPS = 10000;
 
 // The fused group-by keeps one slot per key value; above this span the hash group-by is used instead.
 // At 10M rows a 1M-key fused group-by ran in about half the hash group-by's time.
@@ -119,7 +124,7 @@ static constexpr int64_t DENSE_KEY_SPAN = int64_t(1) << 20;
 // the per-block partials to a direct-indexed array.
 static constexpr int64_t STREAM_KEY_SPAN = 65536;
 // Rows per block of a streamed plan, unless SET arrowmetal_rewrite_block_rows says otherwise.
-static constexpr int64_t DEFAULT_BLOCK_ROWS = int64_t(1) << 22;
+static constexpr int64_t DEFAULT_BLOCK_ROWS = int64_t(1) << 24;
 // Slots the fused group-by keeps in threadgroup memory (ExprCompiler.gbMaxPrivateSlots).
 static constexpr int64_t FUSED_PRIVATE_SLOTS = 2048;
 // The GPU kernels index rows with 32-bit integers, and a 32-bit value summed over fewer than 2^31
@@ -2450,9 +2455,12 @@ static void Analyse(ClientContext &context, LogicalAggregate &aggr, Candidate &c
 		return;
 	}
 
+	// DuckDB's estimate of the group count (from its distinct-count sketches, within about 20% on the
+	// benchmark's tables) picks the router's 1,000-group or 100,000-group class, split at 10,000, the
+	// geometric middle of the two.
 	const idx_t groups_estimate =
 	    aggr.has_estimated_cardinality ? aggr.estimated_cardinality : aggr.EstimateCardinality(context);
-	const bool many_groups = spec.has_key && groups_estimate >= 100000;
+	const bool many_groups = spec.has_key && groups_estimate >= MANY_GROUPS;
 	int64_t threshold = 0;
 	for (auto &agg : spec.aggs) {
 		threshold = MaxValue<int64_t>(threshold, CrossoverFor(agg.op, spec.has_key, string_key, many_groups));
@@ -2485,16 +2493,19 @@ static void Analyse(ClientContext &context, LogicalAggregate &aggr, Candidate &c
 		c.shape_class = "VARCHAR key";
 	} else {
 		const bool dense = spec.input_kinds[0] != Kind::U64 && span >= 0 && span < DENSE_KEY_SPAN;
-		if (!dense) {
-			c.shape_class = "integer key over too wide a range for the fused group-by";
+		if (!dense && many_groups) {
+			c.shape_class = "hash group-by, an estimated 10k or more groups";
+			c.measured_floor = Measured::HASH_MANY_GROUPS;
+		} else if (!dense) {
+			c.shape_class = "hash group-by, an estimated fewer than 10k groups";
 		} else if (many_groups) {
-			c.shape_class = "fused group-by, 100k or more groups";
+			c.shape_class = "fused group-by, an estimated 10k or more groups";
 			c.measured_floor = Measured::DENSE_MANY_GROUPS;
 		} else if (kernels >= 3) {
-			c.shape_class = "fused group-by, three or more aggregates";
+			c.shape_class = "fused group-by, fewer groups, three or more aggregates";
 			c.measured_floor = Measured::DENSE_FEW_GROUPS;
 		} else {
-			c.shape_class = "fused group-by, fewer than 100k groups and fewer than three aggregates";
+			c.shape_class = "fused group-by, fewer groups, one or two aggregates";
 		}
 	}
 }

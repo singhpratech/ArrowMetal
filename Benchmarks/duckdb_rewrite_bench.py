@@ -30,6 +30,7 @@ TABLE = """
 CREATE OR REPLACE TABLE t AS SELECT
     (hash(i) % 1000)::INTEGER                                     AS k1k,
     (hash(i + 7) % 100000)::INTEGER                               AS k100k,
+    (hash(i + 11) % 10000)::INTEGER                               AS k10k,
     'key_' || (hash(i) % 1000)::VARCHAR                           AS kstr,
     'customer segment ' || (hash(i) % 1000)::VARCHAR || ' of the table' AS klong,
     ((hash(i) % 1000)::BIGINT * 1000003 + i % 3)                   AS kwide,
@@ -52,6 +53,7 @@ QUERIES = [
      "SELECT k1k, sum(w), count(*), min(w), max(w), avg(w) FROM t GROUP BY k1k"),
     ("grouped", "1k INTEGER keys: sum, count (10% NULL)", "SELECT k1k, sum(n), count(n) FROM t GROUP BY k1k"),
     ("grouped", "1k INTEGER keys, WHERE w < 500: sum", "SELECT k1k, sum(v) FROM t WHERE w < 500 GROUP BY k1k"),
+    ("grouped", "10k INTEGER keys: sum, count", "SELECT k10k, sum(v), count(*) FROM t GROUP BY k10k"),
     ("grouped", "100k INTEGER keys: sum, count", "SELECT k100k, sum(v), count(*) FROM t GROUP BY k100k"),
     ("grouped", "100k INTEGER keys: sum, min, max, avg",
      "SELECT k100k, sum(v), min(w), max(w), avg(v) FROM t GROUP BY k100k"),

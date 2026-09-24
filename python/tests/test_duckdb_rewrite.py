@@ -319,7 +319,7 @@ def test_auto_leaves_a_table_below_the_crossover_alone(con):
     sql = "SELECT k, sum(v0), min(v0), max(v0) FROM t GROUP BY k"
     assert OPERATOR not in plan(con, sql)
     decision = last_decision(con)
-    assert decision[1] == "kept" and decision[2] == "below the crossover: fused group-by, three or more aggregates"
+    assert decision[1] == "kept" and decision[2] == "below the crossover: fused group-by, fewer groups, three or more aggregates"
     # The router's 10M crossover for a 1,000-group sum, and the 50M measured floor for this class.
     assert decision[4] == 10_000 and decision[5] == 50_000_000
 
