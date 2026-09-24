@@ -540,4 +540,22 @@ final class JSONReaderTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - number parsing
+
+    /// Number columns are parsed by `MetalStringArray.parse`, whose float parse runs on the GPU: on a
+    /// fresh context, reading a double column builds the GPU float-parse pipeline, and the values are
+    /// the ones Swift's `Double` initialiser gives.
+    func testFloatColumnsParseOnTheGPU() throws {
+        try requireRealGPU()
+        try XCTSkipIf(MetalStringArray.floatParseHostOnly, "ARROWMETAL_FLOAT_PARSE_HOST=1 keeps floats on the CPU")
+        let ctx = try MetalContext()
+        let text = (0..<1000).map { "{\"x\": \($0).25, \"y\": \($0)e-3, \"i\": \($0)}" }.joined(separator: "\n")
+        XCTAssertFalse(ctx.hasPipeline(cacheKey: "strcast/str_parse_f64"))
+        let t = try JSONReader(string: text, context: ctx).read()
+        XCTAssertTrue(ctx.hasPipeline(cacheKey: "strcast/str_parse_f64"), "the float parse did not run on the GPU")
+        XCTAssertEqual(t["x"]?.asFloat64?.toArray(), (0..<1000).map { Double("\($0).25") })
+        XCTAssertEqual(t["y"]?.asFloat64?.toArray(), (0..<1000).map { Double("\($0)e-3") })
+        XCTAssertEqual(t["i"]?.asInt64?.toArray(), (0..<1000).map { Int64($0) })
+    }
 }

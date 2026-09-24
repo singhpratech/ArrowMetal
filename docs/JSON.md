@@ -121,8 +121,11 @@ conflicts. Columns that come out as the same scalar type are built together — 
 gather and one parse for all of them — so a file with hundreds of fields costs a few dispatches per type
 rather than per column.
 
-- **Numbers**: the value text is gathered into one utf8 array and parsed by `MetalStringArray.parse` —
-  integers on the GPU; floats on the CPU in this build, the path the string-to-float work speeds up.
+- **Numbers**: the value text is gathered into one utf8 array and parsed by `MetalStringArray.parse`,
+  integers and floats both on the GPU. Floats use Eisel-Lemire in integer arithmetic, bit-identical to
+  Swift's `Double` / `Float` initialiser; the rare values the GPU cannot decide exactly (more than 19
+  significant digits on a rounding boundary, for instance) are parsed on the CPU with that initialiser
+  (`testFloatColumnsParseOnTheGPU` checks that a JSON read builds the GPU float-parse kernel).
   `NaN`, `Inf` and `Infinity` are set by the reader rather than left to the text parser.
 - **Strings**: a length pass and a write pass; strings without escapes are copied, escaped ones decoded
   (`\uXXXX` and surrogate pairs to UTF-8) on the GPU.
@@ -301,7 +304,6 @@ PYTHONPATH=python python -m pytest python/tests/test_json.py -q
   improve.
 - **Each nested level costs its own set of dispatches**, so deeply nested documents take time
   proportional to their depth.
-- **Floats are parsed on the CPU** by `MetalStringArray.parse` in this build.
 - **Explicit-schema types** are the set above.
 - Arrays are capped at 2^32 elements, as everywhere else in ArrowMetal, and a column set's text at 2 GiB
   (32-bit utf8 offsets).
