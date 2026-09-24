@@ -52,7 +52,7 @@ public final class ChunkedTableSource: BatchSource {
     public init(_ batches: [MetalRecordBatch], schema: ArrowIPCSchema? = nil) {
         self.batches = batches
         self.streamSchema = schema ?? batches.first.map { b in
-            ArrowIPCSchema(fields: zip(b.names, b.columns).map { ArrowIPCField(name: $0.0, type: $0.1.ipcType) })
+            ArrowIPCSchema(fields: zip(b.names, b.columns).map { ArrowIPCField(column: $0.1, name: $0.0) })
         }
     }
 

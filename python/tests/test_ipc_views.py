@@ -212,22 +212,6 @@ def test_fixed_shape_tensor_shape_overflow_is_an_error(tmp_path, shape):
         read(path)
 
 
-def test_scan_ipc_sinks_write_a_tensor_column_as_its_storage(tmp_path):
-    """`sink_ipc` and `sort_to_ipc` write the storage fixed_size_list without the extension keys; the
-    reader and `ArrowIPCWriter` keep them (the Swift suite round-trips those with pyarrow)."""
-    tensor = pa.FixedShapeTensorArray.from_numpy_ndarray(np.arange(24, dtype=np.int32).reshape(6, 2, 2))
-    path = str(tmp_path / "t.arrow")
-    write(path, [pa.record_batch([pa.array(range(6), pa.int64()), tensor], names=["i", "t"])], "file")
-    assert read(path).column("t").type == tensor.type
-    for name, run in [("sink", lambda out: am.scan_ipc(path, prefetch=0).sink_ipc(out)),
-                      ("sorted", lambda out: am.scan_ipc(path, prefetch=0).sort_to_ipc("i", out))]:
-        out = str(tmp_path / (name + ".arrows"))
-        run(out)
-        got = pa.ipc.open_stream(out).read_all()
-        assert got.schema.field("t").type == tensor.storage.type, name
-        assert got.column("t").combine_chunks().equals(tensor.storage), name
-
-
 # ---- other extension names
 
 def test_other_extension_names_read_as_their_storage_through_every_operator(tmp_path):

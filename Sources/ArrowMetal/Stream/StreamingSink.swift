@@ -100,8 +100,10 @@ public final class IPCStreamSink: StreamSink {
         guard !finished else { throw ArrowIPCError.malformed("write after finish()") }
         let batch = try decodeDictionaries(batch)
         if schema == nil {
+            // Each column writes itself as `ArrowIPCWriter` writes it: an extension column (such as
+            // `arrow.fixed_shape_tensor`) keeps its `ARROW:extension:*` keys in the field's metadata.
             try writeSchema(ArrowIPCSchema(fields: zip(batch.names, batch.columns).map {
-                ArrowIPCField(name: $0.0, type: $0.1.ipcType)
+                ArrowIPCField(column: $0.1, name: $0.0)
             }))
         }
         guard batch.length > 0 else { return }

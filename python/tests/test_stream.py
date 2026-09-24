@@ -435,3 +435,35 @@ def test_scan_ipc_keeps_two_columns_of_the_same_name(tmp_path):
     assert [c.to_pylist() for c in got.columns] == [c.to_pylist() for c in t.columns]
     filtered = am.scan_ipc(p).filter(am.col("a") > 1).collect()
     assert [c.to_pylist() for c in filtered.columns] == [[2, 3], ["b", "c"], [20, 30], ["y", "z"]]
+
+
+def test_sinks_keep_an_extension_column_as_its_extension_type(tmp_path):
+    """`sink_ipc` and `sort_to_ipc` write an `arrow.fixed_shape_tensor` column with its extension keys,
+    as `ArrowIPCWriter` does, so pyarrow reads it back as a FixedShapeTensorArray (dimension names and
+    permutation included) rather than as its fixed_size_list storage."""
+    plain = pa.FixedShapeTensorArray.from_numpy_ndarray(np.arange(24, dtype=np.int32).reshape(6, 2, 2))
+    t = pa.fixed_shape_tensor(pa.int64(), [2, 2], dim_names=["r", "c"], permutation=[1, 0])
+    named = pa.ExtensionArray.from_storage(t, pa.array(
+        [[1, 2, 3, 4], None, [5, 6, 7, 8], [9, 10, 11, 12], [0, 0, 0, 0], [4, 3, 2, 1]], pa.list_(pa.int64(), 4)))
+    ids = pa.array([5, 3, 1, 4, 0, 2], pa.int64())
+    src = pa.record_batch([ids, plain, named], names=["i", "t", "n"])
+    path = str(tmp_path / "t.arrow")
+    with pa.ipc.new_file(path, src.schema) as w:
+        w.write_batch(src)
+    order = pc.sort_indices(ids).to_pylist()
+    for name, run, rows in [
+            ("sink", lambda out: am.scan_ipc(path, prefetch=0).sink_ipc(out), list(range(6))),
+            ("sorted", lambda out: am.scan_ipc(path, prefetch=0).sort_to_ipc("i", out), order)]:
+        out = str(tmp_path / (name + ".arrows"))
+        run(out)
+        got = pa.ipc.open_stream(out).read_all()
+        assert got.schema.field("t").type == plain.type, name
+        assert got.schema.field("n").type == t, name
+        assert got.schema.field("n").type.dim_names == ["r", "c"], name
+        assert got.schema.field("n").type.permutation == [1, 0], name
+        tc = got.column("t").combine_chunks()
+        assert isinstance(tc, pa.FixedShapeTensorArray), name
+        assert tc.equals(plain.take(rows)), name
+        assert got.column("n").combine_chunks().equals(named.take(rows)), name
+        np.testing.assert_array_equal(tc.to_numpy_ndarray(),
+                                      np.arange(24, dtype=np.int32).reshape(6, 2, 2)[rows])
