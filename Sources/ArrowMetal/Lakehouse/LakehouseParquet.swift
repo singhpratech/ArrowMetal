@@ -51,7 +51,7 @@ extension ParquetFile {
     /// the result, since writers differ in which optional columns they include.
     func lakeReadCheckpointColumns(_ paths: [String]) throws -> [String: CheckpointColumn] {
         let elements = lakeSchemaElements()
-        enum Plan { case leaf(ParquetField), list(ParquetField), map(key: ParquetField, value: ParquetField) }
+        enum Plan { case leaf(ParquetField), list(ParquetField), map(key: ParquetField, value: ParquetField), nativeMap(ParquetField) }
         var plans: [(String, Plan)] = []
         for p in paths {
             let parts = p.split(separator: ".").map(String.init)
@@ -59,6 +59,10 @@ extension ParquetFile {
             switch f.kind {
             case .leaf:
                 plans.append((p, .leaf(ParquetField(name: p, kind: f.kind, nullable: true))))
+            case .list where f.isMap:
+                // The Parquet reader models a MAP as a list of key/value entries and reassembles it
+                // itself; read the field as the file describes it.
+                plans.append((p, .nativeMap(f)))
             case .list:
                 plans.append((p, .list(ParquetField(name: p, kind: f.kind, nullable: true))))
             case .group(let children):
@@ -90,7 +94,7 @@ extension ParquetFile {
         try context.batch {
             for (p, plan) in plans {
                 switch plan {
-                case .leaf(let f), .list(let f):
+                case .leaf(let f), .list(let f), .nativeMap(let f):
                     arrays[p] = [try readField(f, rowGroups: groups, options: opts)]
                 case .map(let k, let v):
                     arrays[p] = [try readField(k, rowGroups: groups, options: opts),
@@ -109,6 +113,8 @@ extension ParquetFile {
                 out[p] = .stringLists(try Self.hostStringLists(a[0], path: p))
             case .map:
                 out[p] = .maps(try Self.hostMaps(a[0], a[1], path: p))
+            case .nativeMap:
+                out[p] = .maps(try Self.hostNativeMaps(a[0], path: p))
             }
         }
         return out
@@ -149,6 +155,37 @@ extension ParquetFile {
     }
 
     /// A map column from its key and value lists, keeping null values as nil.
+    /// A map column as the Parquet reader reassembles it: a list of `{key, value}` entries.
+    private static func hostNativeMaps(_ a: AnyMetalArray, path: String) throws -> [[String: String?]?] {
+        let entries: MetalListArray
+        switch a {
+        case .map(let m): entries = m.entries
+        case .list(let l): entries = l
+        default: throw LakehouseError.malformed("checkpoint map \(path) read as \(a.arrowFormat), not a map")
+        }
+        guard case .structure(let kv) = entries.values, kv.children.count == 2 else {
+            throw LakehouseError.malformed("checkpoint map \(path) entries are not key/value pairs")
+        }
+        func strings(_ c: AnyMetalArray) throws -> [String?] {
+            switch try c.decodedIfDictionary() {
+            case .string(let s), .binary(let s): return s.toArray()
+            default: throw LakehouseError.malformed("checkpoint map \(path) holds \(c.arrowFormat), expected strings")
+            }
+        }
+        let k = try strings(kv.children[0]), v = try strings(kv.children[1])
+        let o = entries.offsets.typed(Int32.self)
+        let valid = entries.validity.map { b in (0..<entries.length).map { Bitmap.isSet(b.typed(UInt8.self), $0) } }
+        var out: [[String: String?]?] = []
+        out.reserveCapacity(entries.length)
+        for i in 0..<entries.length {
+            if let valid, !valid[i] { out.append(nil); continue }
+            var m: [String: String?] = [:]
+            for j in Int(o[i])..<Int(o[i + 1]) { m[k[j] ?? ""] = j < v.count ? v[j] : nil }
+            out.append(m)
+        }
+        return out
+    }
+
     private static func hostMaps(_ keys: AnyMetalArray, _ values: AnyMetalArray, path: String) throws -> [[String: String?]?] {
         guard case .list(let kl) = keys, case .list(let vl) = values else {
             throw LakehouseError.malformed("checkpoint map \(path) did not read as two lists")

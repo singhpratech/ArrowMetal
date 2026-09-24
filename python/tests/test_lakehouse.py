@@ -752,3 +752,19 @@ def test_null_rows_under_always_true_filters_differ_from_pyiceberg(tmp_path):
         ref = sorted(StaticTable.from_metadata(meta).scan(row_filter=expr).to_arrow()["id"].to_pylist())
         assert ref == pyiceberg_ids, flt
         assert got != ref, flt
+
+
+@needs_delta
+def test_an_integer_literal_above_int64_max(delta_table):
+    """The Parquet filter grammar carries integers above INT64_MAX exactly (as unsigned). No Iceberg or
+    Delta integer column can hold one, and comparing it through a double would round INT64_MAX up to the
+    literal and prune matching rows, so an integer column refuses it; decimal and float columns compare it
+    by value."""
+    with pytest.raises(am.ArrowMetalError, match="does not fit column id"):
+        am.read_delta_table(delta_table, filters=[("id", "<", 2**63)])
+    # A decimal column compares it exactly by value (decimal128 holds it): every non-null row matches.
+    everything = dl.DeltaTable(delta_table).to_pyarrow_table()
+    expected_m = everything.filter(pc.is_valid(everything["m"]))
+    assert normalise(am.read_delta_table(delta_table, filters=[("m", "<", 2**63)])) == normalise(expected_m)
+    expected = dl.DeltaTable(delta_table).to_pyarrow_table(filters=[("x", "<", float(2**63))])
+    assert normalise(am.read_delta_table(delta_table, filters=[("x", "<", 2**63)])) == normalise(expected)

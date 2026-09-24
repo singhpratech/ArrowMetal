@@ -373,6 +373,7 @@ func lakeLiteral(_ v: ParquetFilter.Value, for field: LakehouseField) throws -> 
         let shown: String
         switch v {
         case .int(let i): shown = String(i)
+        case .uint(let u): shown = String(u)
         case .double(let d): shown = String(d)
         case .string(let s): shown = "\"\(s)\""
         }
@@ -382,6 +383,9 @@ func lakeLiteral(_ v: ParquetFilter.Value, for field: LakehouseField) throws -> 
     case .int8, .int16, .int32, .int64:
         switch v {
         case .int(let i): return .int(i)
+        // Above Int64.max: no Iceberg or Delta integer column can hold it, and comparing it through a
+        // Double would round Int64.max up to the literal and prune rows that match. Refuse it.
+        case .uint: throw bad()
         case .double(let d): return .double(d)
         case .string(let s):
             if let i = Int64(s) { return .int(i) }
@@ -391,6 +395,7 @@ func lakeLiteral(_ v: ParquetFilter.Value, for field: LakehouseField) throws -> 
     case .float32, .float64:
         switch v {
         case .int(let i): return .double(Double(i))
+        case .uint(let u): return .double(Double(u))
         case .double(let d): return .double(d)
         case .string(let s):
             guard let d = Double(s) else { throw bad() }
@@ -416,7 +421,7 @@ func lakeLiteral(_ v: ParquetFilter.Value, for field: LakehouseField) throws -> 
         case .string(let s):
             guard let d = LakeTime.parseDate(s), Int32(exactly: d) != nil else { throw bad() }
             return .int(d)
-        case .double: throw bad()
+        case .double, .uint: throw bad()
         }
     case .timestamp(let ns, _):
         switch v {
@@ -424,7 +429,7 @@ func lakeLiteral(_ v: ParquetFilter.Value, for field: LakehouseField) throws -> 
         case .string(let s):
             guard let t = LakeTime.parseTimestamp(s, unitsPerSecond: ns ? 1_000_000_000 : 1_000_000) else { throw bad() }
             return .int(t)
-        case .double: throw bad()
+        case .double, .uint: throw bad()
         }
     case .time:
         guard case .int(let i) = v else { throw bad() }
@@ -433,6 +438,10 @@ func lakeLiteral(_ v: ParquetFilter.Value, for field: LakehouseField) throws -> 
         switch v {
         case .int(let i):
             guard let d = LakeTime.parseDecimal(String(i), scale: scale) else { throw bad() }
+            return .decimal(d)
+        case .uint(let u):
+            // Exact: a decimal of this scale either holds the integer or parseDecimal refuses it.
+            guard let d = LakeTime.parseDecimal(String(u), scale: scale) else { throw bad() }
             return .decimal(d)
         case .string(let s):
             guard let d = LakeTime.parseDecimal(s, scale: scale) else { throw bad() }
