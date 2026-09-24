@@ -95,7 +95,7 @@ runners are never published: their GPU is virtual.
 
 | Read this | To learn |
 |---|---|
-| [PARQUET.md](PARQUET.md) | The Parquet reader that decodes on the Apple GPU: the pipeline, the parallel RLE strategy, GPU Snappy and LZ4, the supported encoding/codec/type matrix, projection and statistics pushdown, benchmarks against pyarrow / Polars / pandas, the small writer, and the limits |
+| [PARQUET.md](PARQUET.md) | The Parquet reader that decodes on the Apple GPU: the pipeline, the parallel RLE strategy, GPU Snappy and LZ4, the supported encoding/codec/type matrix, structs, maps and lists nested to any depth, the stored `ARROW:schema`, projection, statistics pushdown with page-index and bloom-filter skipping, benchmarks against pyarrow / Polars / pandas (and a nested-read script against pyarrow / Polars / DuckDB), the small writer, and the limits |
 
 ```
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter "ParquetTests|ParquetWriterTests"

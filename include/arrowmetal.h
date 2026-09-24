@@ -1550,6 +1550,37 @@ int am_stream_join_group_by(am_stream* s, struct ArrowArrayStream* build, const 
                             const int* ops, const char** columns, const char** names, int64_t n_aggs,
                             int64_t dense_key_count, int ddof, am_stream_result** out);
 
+// ---------------------------------------------------------------------------------------------------
+// Parquet: the stored Arrow schema and page-index statistics (docs/PARQUET.md)
+//
+// A read already applies what the file's ARROW:schema key/value metadata says the Parquet schema lost:
+// time zones, durations and extension types. These two return the metadata a pyarrow Table would carry:
+// the custom metadata of one top-level column (plus PARQUET:field_id when the Parquet schema has one),
+// and the file's key/value metadata without ARROW:schema. Both write the C Data Interface metadata blob
+// (int32 count, then int32-length-prefixed key and value bytes, native endian) into `out` when `cap` is
+// large enough, and return its size in bytes: 0 when there is no metadata, -1 on a bad argument. Call
+// once with out = NULL to learn the size.
+int64_t am_parquet_field_metadata(am_parquet_file* f, const char* column, uint8_t* out, int64_t cap);
+int64_t am_parquet_schema_metadata(am_parquet_file* f, uint8_t* out, int64_t cap);
+
+// Page-level skipping: with a filter, a file's column index and offset index rule out the data pages
+// whose min/max cannot match, and those pages are never read or decompressed. On by default;
+// am_parquet_set_page_index(f, 0) turns it off (every read is then row-group granular). After a read,
+// am_parquet_last_read_stats fills up to `cap` of [row groups read, row groups skipped by statistics,
+// row groups skipped by the page index, data pages decoded, data pages skipped, rows, row groups skipped
+// by bloom filters] and returns 7. An equality filter also consults the column chunks' split-block bloom
+// filters, when the file has them, and drops the row groups its value is certainly absent from;
+// am_parquet_set_bloom_filters(f, 0) turns that off.
+int     am_parquet_set_page_index(am_parquet_file* f, int enabled);
+int     am_parquet_set_bloom_filters(am_parquet_file* f, int enabled);
+int64_t am_parquet_last_read_stats(am_parquet_file* f, int64_t* out, int64_t cap);
+
+// Filter text details (am_parquet_read_ex, am_parquet_selected_row_groups): the operator is the first
+// one after the column name, so a name cannot hold = ! < > or ;. Inside a double-quoted literal, `;` is
+// part of the string and \" and \\ stand for a quote and a backslash. An integer literal above
+// INT64_MAX is kept exact and compared as unsigned against a uint64 column's statistics. On a float or
+// double column `!=` never rules a row group or page out, since writers leave NaN out of min/max.
+
 #ifdef __cplusplus
 }
 #endif

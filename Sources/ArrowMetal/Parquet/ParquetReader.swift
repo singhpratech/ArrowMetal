@@ -74,7 +74,15 @@ public struct ParquetReadOptions: Sendable {
 extension ParquetFile {
     /// Reads the selected columns and row groups into one Metal-resident record batch.
     public func read(_ options: ParquetReadOptions = ParquetReadOptions()) throws -> MetalRecordBatch {
-        let groups = try selectedRowGroups(options)
+        let afterStatistics = try selectedRowGroups(options)
+        // An equality filter whose value the row group's bloom filter has never seen rules it out.
+        let afterBloom = useBloomFilters && options.filters.contains(where: { $0.op == .eq })
+            ? afterStatistics.filter { bloomFiltersMayMatch(options.filters, rowGroup: $0) } : afterStatistics
+        // The page index narrows each row group to candidate row ranges; a row group left with none is
+        // not read at all.
+        let ranges = try candidateRowRanges(options, rowGroups: afterBloom)
+        let groups = afterBloom.filter { ranges[$0].map { !$0.isEmpty } ?? true }
+        let plan = ParquetReadPlan(ranges: ranges.filter { !$0.value.isEmpty })
         let wanted = try selectedFields(options.columns)
         var names: [String] = []
         var columns: [AnyMetalArray] = []
@@ -89,9 +97,25 @@ extension ParquetFile {
         try context.batch {
             for f in wanted {
                 names.append(f.name)
-                columns.append(try readField(f, rowGroups: groups, options: options))
+                var column = try readField(f, rowGroups: groups, options: options, plan: plan)
+                // A top-level column takes back what `ARROW:schema` says the Parquet schema lost; a leaf
+                // selected on its own by dotted path reads as the Parquet schema describes it. The stored
+                // schema is advisory: a claim the column cannot take leaves it as the Parquet schema says.
+                if let stored = arrowField(for: f), let restored = try? applyArrowField(column, stored) {
+                    column = restored
+                }
+                columns.append(column)
             }
         }
+        var stats = ParquetReadStatistics()
+        stats.rowGroupsRead = groups.count
+        stats.rowGroupsSkippedByStatistics = (options.rowGroups?.count ?? metadata.rowGroups.count) - afterStatistics.count
+        stats.rowGroupsSkippedByBloomFilter = afterStatistics.count - afterBloom.count
+        stats.rowGroupsSkippedByPageIndex = afterBloom.count - groups.count
+        stats.pagesDecoded = plan.pagesDecoded
+        stats.pagesSkipped = plan.pagesSkipped
+        stats.rows = columns.first?.length ?? 0
+        recordReadStatistics(stats)
         if columns.isEmpty {
             // A projection of no columns still has a row count; expose it as an empty batch.
             return try MetalRecordBatch(names: [], columns: [])
@@ -129,7 +153,13 @@ extension ParquetFile {
             throw ParquetError.malformed("row group \(g) is outside 0..<\(metadata.rowGroups.count)")
         }
         if !options.filters.isEmpty {
-            groups = groups.filter { g in options.filters.allSatisfy { $0.mayMatch(rowGroup: metadata.rowGroups[g], file: self) } }
+            // A row group the statistics rule out is dropped, unless its page index shows those statistics
+            // leave pages out (`rowGroupStatisticsTrusted`); that check runs only on a drop.
+            groups = groups.filter { g in
+                options.filters.allSatisfy {
+                    $0.mayMatch(rowGroup: metadata.rowGroups[g], file: self) || !rowGroupStatisticsTrusted(g, column: $0.column)
+                }
+            }
         }
         return groups
     }
@@ -152,19 +182,32 @@ extension ParquetFile {
         try selectedRowGroups(options).reduce(0) { $0 + Int(metadata.rowGroups[$1].numRows) }
     }
 
-    func readField(_ f: ParquetField, rowGroups: [Int], options: ParquetReadOptions) throws -> AnyMetalArray {
+    func readField(_ f: ParquetField, rowGroups: [Int], options: ParquetReadOptions,
+                   plan: ParquetReadPlan? = nil) throws -> AnyMetalArray {
+        // Whole row groups, for the columns that are not trimmed page by page.
+        let whole = rowGroups.map { (group: $0, rows: 0..<rowsIn(group: $0)) }
+        let trimming = plan.map { !$0.ranges.isEmpty } ?? false
         switch f.kind {
         case .leaf(let l):
-            let d = try decodeLeaf(l, rowGroups: rowGroups, options: options)
-            return try d.arrowArray()
+            let d = try decodeLeaf(l, rowGroups: rowGroups, options: options, plan: plan, subset: true)
+            let a = try d.arrowArray()
+            // A leaf below a list, read on its own by dotted path, has one entry per element rather than
+            // per row, so there are no rows to trim it to.
+            return trimming && l.maxRepetition == 0 ? try trim(a, spans: d.rowSpans, plan: plan!) : a
         case .list(let element, let repeatedDefinition):
-            guard case .leaf(let l) = element.kind else {
-                throw ParquetError.unsupported("list of non-primitive elements (column \(f.name))")
+            // A one-level `list<primitive>` keeps its dedicated kernel pair; every other list, map and
+            // struct goes through the general assembler.
+            let a: AnyMetalArray
+            if !f.isMap, case .leaf(let l) = element.kind, l.maxRepetition == 1 {
+                let d = try decodeLeaf(l, rowGroups: rowGroups, options: options, needRepetition: true, plan: plan)
+                a = try d.listArray(repeatedDefinition: repeatedDefinition, outerNullable: f.nullable)
+            } else {
+                a = try ParquetNestedAssembler(file: self, rowGroups: rowGroups, options: options, plan: plan).buildTopLevel(f)
             }
-            let d = try decodeLeaf(l, rowGroups: rowGroups, options: options, needRepetition: true)
-            return try d.listArray(repeatedDefinition: repeatedDefinition, outerNullable: f.nullable)
+            return trimming ? try trim(a, spans: whole, plan: plan!) : a
         case .group:
-            throw ParquetError.unsupported("struct column \(f.name); read its leaves by dotted path instead")
+            let a = try ParquetNestedAssembler(file: self, rowGroups: rowGroups, options: options, plan: plan).buildTopLevel(f)
+            return trimming ? try trim(a, spans: whole, plan: plan!) : a
         }
     }
 }
@@ -176,6 +219,8 @@ public struct ParquetFilter: Sendable {
     public enum Op: String, Sendable { case eq = "==", ne = "!=", lt = "<", le = "<=", gt = ">", ge = ">=" }
     public enum Value: Sendable {
         case int(Int64)
+        /// An integer above `Int64.max`, for an unsigned 64-bit column.
+        case uint(UInt64)
         case double(Double)
         case string(String)
     }
@@ -195,9 +240,22 @@ public struct ParquetFilter: Sendable {
         guard let leaf = file.leaves.first(where: { $0.dottedPath == column || $0.name == column }),
               leaf.index < rowGroup.columns.count else { return true }
         let meta = rowGroup.columns[leaf.index].meta
-        guard let stats = meta.statistics, let lo = stats.lower, let hi = stats.upper,
-              let low = decode(lo, leaf), let high = decode(hi, leaf) else { return true }
-        // `ne` can only be excluded when the whole group is a single value equal to the literal.
+        guard let stats = meta.statistics, let lo = stats.lower, let hi = stats.upper else { return true }
+        return mayMatch(lower: lo, upper: hi, leaf: leaf)
+    }
+
+    /// True when values between `lower` and `upper` (statistics bytes in the leaf's physical type) *may*
+    /// satisfy the filter. Used for a row group's statistics and for one page's column-index entry.
+    func mayMatch(lower lo: [UInt8], upper hi: [UInt8], leaf: ParquetLeaf) -> Bool {
+        // Writers leave NaN out of min / max, so a FLOAT or DOUBLE range whose bounds both equal the
+        // literal can still hold a NaN, and NaN satisfies `!=`: on those columns `!=` rules nothing out.
+        if op == .ne, leaf.physical == .float || leaf.physical == .double { return true }
+        guard let low = decode(lo, leaf), let high = decode(hi, leaf) else { return true }
+        // A NaN bound says nothing (the format asks readers to ignore it), and a literal of another kind
+        // than the column's (a string against a number) cannot be ordered against it: look at the rows.
+        guard !Self.isNaN(low), !Self.isNaN(high), !Self.isNaN(self.value),
+              Self.comparable(low, self.value), Self.comparable(high, self.value) else { return true }
+        // `ne` can only be excluded when the whole range is a single value equal to the literal.
         switch op {
         case .eq: return compare(low, high) <= 0 ? (compare(low, self.value) <= 0 && compare(self.value, high) <= 0) : true
         case .ne: return !(compare(low, self.value) == 0 && compare(high, self.value) == 0)
@@ -221,6 +279,7 @@ public struct ParquetFilter: Sendable {
             guard bytes.count >= 8 else { return nil }
             var v: Int64 = 0
             withUnsafeMutableBytes(of: &v) { $0.copyBytes(from: bytes[0..<8]) }
+            if case .integer(_, let signed) = leaf.logicalType, !signed { return .uint(UInt64(bitPattern: v)) }
             return .int(v)
         case .float:
             guard bytes.count >= 4 else { return nil }
@@ -241,14 +300,58 @@ public struct ParquetFilter: Sendable {
         }
     }
 
-    private func compare(_ a: Value, _ b: Value) -> Int {
+    private static func isNaN(_ v: Value) -> Bool {
+        if case .double(let d) = v { return d.isNaN }
+        return false
+    }
+
+    /// True when `compare` orders the two: numbers against numbers, strings against strings.
+    private static func comparable(_ a: Value, _ b: Value) -> Bool {
         switch (a, b) {
-        case (.int(let x), .int(let y)): return x < y ? -1 : (x == y ? 0 : 1)
-        case (.int(let x), .double(let y)): return Double(x) < y ? -1 : (Double(x) == y ? 0 : 1)
-        case (.double(let x), .int(let y)): return x < Double(y) ? -1 : (x == Double(y) ? 0 : 1)
-        case (.double(let x), .double(let y)): return x < y ? -1 : (x == y ? 0 : 1)
-        case (.string(let x), .string(let y)): return x < y ? -1 : (x == y ? 0 : 1)
-        default: return 0
+        case (.int, .int), (.int, .uint), (.int, .double), (.uint, .int), (.uint, .uint), (.uint, .double),
+             (.double, .int), (.double, .uint), (.double, .double), (.string, .string): return true
+        default: return false
         }
+    }
+
+    /// Orders two numbers exactly, whatever their kinds: a 64-bit integer is never rounded to a double.
+    /// Neither may be NaN (the caller has ruled NaN out).
+    private static func compareNumbers(_ a: Value, _ b: Value) -> Int? {
+        func sign<T: Comparable>(_ x: T, _ y: T) -> Int { x < y ? -1 : (x == y ? 0 : 1) }
+        // An integer against a double: compare with the double's integer part, then with its fraction.
+        func intVsDouble(_ x: Int64, _ d: Double) -> Int {
+            if d >= 0x1p63 { return -1 }
+            if d < -0x1p63 { return 1 }
+            let whole = d.rounded(.down)
+            let t = Int64(whole)
+            if x != t { return sign(x, t) }
+            return d > whole ? -1 : 0
+        }
+        func uintVsDouble(_ x: UInt64, _ d: Double) -> Int {
+            if d < 0 { return 1 }
+            if d >= 0x1p64 { return -1 }
+            let whole = d.rounded(.down)
+            let t = UInt64(whole)
+            if x != t { return sign(x, t) }
+            return d > whole ? -1 : 0
+        }
+        func intVsUInt(_ x: Int64, _ u: UInt64) -> Int { x < 0 ? -1 : sign(UInt64(x), u) }
+        switch (a, b) {
+        case (.int(let x), .int(let y)): return sign(x, y)
+        case (.uint(let x), .uint(let y)): return sign(x, y)
+        case (.double(let x), .double(let y)): return sign(x, y)
+        case (.int(let x), .uint(let y)): return intVsUInt(x, y)
+        case (.uint(let x), .int(let y)): return -intVsUInt(y, x)
+        case (.int(let x), .double(let y)): return intVsDouble(x, y)
+        case (.double(let x), .int(let y)): return -intVsDouble(y, x)
+        case (.uint(let x), .double(let y)): return uintVsDouble(x, y)
+        case (.double(let x), .uint(let y)): return -uintVsDouble(y, x)
+        default: return nil
+        }
+    }
+
+    private func compare(_ a: Value, _ b: Value) -> Int {
+        if case (.string(let x), .string(let y)) = (a, b) { return x < y ? -1 : (x == y ? 0 : 1) }
+        return Self.compareNumbers(a, b) ?? 0
     }
 }

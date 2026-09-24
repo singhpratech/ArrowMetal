@@ -13,14 +13,15 @@ extension ParquetLeafData {
     /// compacted to the element positions with the package's existing `filter`.
     func listArray(repeatedDefinition dRep: Int, outerNullable: Bool) throws -> AnyMetalArray {
         let ctx = context
-        guard let def = defLevels else {
-            throw ParquetError.malformed("a list column must have definition levels")
-        }
         let n = levels
+        // No rows (every row group filtered away): an empty list, before asking for levels it cannot have.
         guard n > 0 else {
-            let off = try MetalArrowBuffer.allocate(byteCount: 8, context: ctx)
+            let off = try MetalArrowBuffer.allocate(byteCount: 8, zeroed: true, context: ctx)
             return .list(MetalListArray(length: 0, nullCount: 0, validity: nil, offsets: off,
                                         values: try arrowArray(), context: ctx))
+        }
+        guard let def = defLevels else {
+            throw ParquetError.malformed("a list column must have definition levels")
         }
         // A LIST wrapper whose repeated node produced no repetition levels (a required, single-element
         // list) leaves every entry starting its own row.
@@ -66,6 +67,9 @@ extension ParquetLeafData {
         let child: AnyMetalArray
         if totalElements == n {
             child = leafArray
+        } else if case .null = leafArray {
+            // A `null` leaf (Parquet UNKNOWN) has no values to compact, only a length: one per element.
+            child = .null(MetalNullArray(length: totalElements, context: ctx))
         } else {
             let bits = try MetalArrowBuffer.allocate(byteCount: Swift.max(Bitmap.byteCount(bits: n), 4),
                                                      zeroed: true, context: ctx)

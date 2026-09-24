@@ -167,6 +167,9 @@ extension ParquetLeafData {
     /// The Arrow array for a flat column.
     func arrowArray() throws -> AnyMetalArray {
         let ctx = context
+        // The `UNKNOWN` logical type is how Arrow writers mark a column of the `null` type (its pages hold
+        // only definition levels, every one of them null).
+        if leaf.logicalType == .unknown { return .null(MetalNullArray(length: levels, context: ctx)) }
         switch values {
         case .boolean(let bits):
             return .boolean(MetalBooleanArray(length: levels, nullCount: nullCount, validity: validity,

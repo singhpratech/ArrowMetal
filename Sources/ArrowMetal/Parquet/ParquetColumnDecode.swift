@@ -19,6 +19,9 @@ final class ParquetLeafData {
     /// Packed Arrow validity bitmap over the levels, or nil when nothing is null.
     var validity: MetalArrowBuffer?
     var nullCount: Int = 0
+    /// The rows (row group, row-group-coordinate range) the levels cover, in order. For a repeated
+    /// column these are rows, not level entries.
+    var rowSpans: [(group: Int, rows: Range<Int>)] = []
 
     enum Values {
         /// Row-positioned fixed-width values.
@@ -66,21 +69,7 @@ extension ParquetFile {
             var r = ThriftReader(bytes, at: at)
             let h = try ParquetPageHeader.read(&r)
             let body = r.pos
-            guard h.compressedSize >= 0, body + Int(h.compressedSize) <= fileSize else {
-                throw ParquetError.truncated("page at \(at) claims \(h.compressedSize) bytes")
-            }
-            // Every one of these is a signed thrift i32 that the decode below narrows to UInt32 to
-            // build a page descriptor, and `UInt32(negative)` is a trap, not an error. A page header
-            // that is negative anywhere is malformed; say so here, once, rather than on the way in.
-            guard h.uncompressedSize >= 0, h.numValues >= 0, h.dictNumValues >= 0,
-                  h.defLevelsByteLength >= 0, h.repLevelsByteLength >= 0,
-                  Int(h.defLevelsByteLength) + Int(h.repLevelsByteLength) <= Int(h.compressedSize),
-                  Int(h.defLevelsByteLength) + Int(h.repLevelsByteLength) <= Int(h.uncompressedSize) else {
-                throw ParquetError.malformed(
-                    "page at \(at) has a negative or inconsistent header (uncompressed \(h.uncompressedSize), "
-                    + "values \(h.numValues), dict values \(h.dictNumValues), levels "
-                    + "\(h.repLevelsByteLength)+\(h.defLevelsByteLength) of \(h.compressedSize))")
-            }
+            try validate(h, at: at, body: body)
             let page = ParquetRawPage(header: h, bodyOffset: body, rowGroup: rowGroup)
             switch h.type {
             case .dictionaryPage: dict = page
@@ -94,10 +83,33 @@ extension ParquetFile {
         return (dict, data)
     }
 
+    /// Rejects a page header that would overflow or trap later on.
+    func validate(_ h: ParquetPageHeader, at: Int, body: Int) throws {
+        guard h.compressedSize >= 0, body + Int(h.compressedSize) <= fileSize else {
+            throw ParquetError.truncated("page at \(at) claims \(h.compressedSize) bytes")
+        }
+        // Every one of these is a signed thrift i32 that the decode below narrows to UInt32 to
+        // build a page descriptor, and `UInt32(negative)` is a trap, not an error. A page header
+        // that is negative anywhere is malformed; say so here, once, rather than on the way in.
+        guard h.uncompressedSize >= 0, h.numValues >= 0, h.dictNumValues >= 0,
+              h.defLevelsByteLength >= 0, h.repLevelsByteLength >= 0,
+              Int(h.defLevelsByteLength) + Int(h.repLevelsByteLength) <= Int(h.compressedSize),
+              Int(h.defLevelsByteLength) + Int(h.repLevelsByteLength) <= Int(h.uncompressedSize) else {
+            throw ParquetError.malformed(
+                "page at \(at) has a negative or inconsistent header (uncompressed \(h.uncompressedSize), "
+                + "values \(h.numValues), dict values \(h.dictNumValues), levels "
+                + "\(h.repLevelsByteLength)+\(h.defLevelsByteLength) of \(h.compressedSize))")
+        }
+    }
+
     // MARK: - Leaf decode
 
+    /// Decodes one leaf column over `rowGroups`. With a `plan`, the decoded and skipped pages are counted
+    /// into it, and with `subset` a flat column decodes only the data pages its offset index says overlap
+    /// the plan's candidate rows (`ParquetPageIndex.swift`); `rowSpans` then says which rows came back.
     func decodeLeaf(_ leaf: ParquetLeaf, rowGroups: [Int], options: ParquetReadOptions,
-                    needRepetition: Bool = false) throws -> ParquetLeafData {
+                    needRepetition: Bool = false, plan: ParquetReadPlan? = nil,
+                    subset: Bool = false) throws -> ParquetLeafData {
         let ctx = context
         let maxDef = leaf.maxDefinition
         let maxRep = leaf.maxRepetition
@@ -127,6 +139,8 @@ extension ParquetFile {
         var dictBaseOf: [Int: UInt32] = [:]         // row group -> merged dictionary base
         var dictCountOf: [Int: Int] = [:]
         var totalDict = 0
+        var spans: [(group: Int, rows: Range<Int>)] = []
+        var skippedPages = 0
         for g in rowGroups {
             let rg = metadata.rowGroups[g]
             guard leaf.index < rg.columns.count else {
@@ -136,7 +150,17 @@ extension ParquetFile {
             if rg.columns[leaf.index].filePath != nil && !(rg.columns[leaf.index].filePath!.isEmpty) {
                 throw ParquetError.unsupported("column chunks stored in a separate file")
             }
-            let (d, pages) = try pageHeaders(of: meta, rowGroup: g)
+            let d: ParquetRawPage?
+            let pages: [ParquetRawPage]
+            if subset, leaf.maxRepetition == 0, let ranges = plan?.ranges[g],
+               let found = try indexedPages(of: meta, rowGroup: g, column: leaf.index, ranges: ranges) {
+                (d, pages) = (found.dict, found.data)
+                spans.append(contentsOf: found.spans.map { (g, $0) })
+                skippedPages += found.skipped
+            } else {
+                (d, pages) = try pageHeaders(of: meta, rowGroup: g)
+                spans.append((g, 0..<rowsIn(group: g)))
+            }
             if let d {
                 // Dictionary bases are 32-bit in the page descriptor, and every dictionary buffer is
                 // sized `totalDict * width`: both need `totalDict` to stay inside UInt32.
@@ -151,8 +175,11 @@ extension ParquetFile {
             }
             for p in pages { dataPages.append(p); codecOf.append(meta.codec) }
         }
+        plan?.count(decoded: dataPages.count, skipped: skippedPages)
         guard !dataPages.isEmpty else {
-            return try emptyLeaf(leaf, options: options)
+            let empty = try emptyLeaf(leaf, options: options)
+            empty.rowSpans = spans
+            return empty
         }
         let totalLevels = dataPages.reduce(0) { $0 + Int($1.header.numValues) }
         try Dispatch.checkLength(totalLevels)
@@ -296,10 +323,13 @@ extension ParquetFile {
         var repBytes: MetalArrowBuffer? = nil
         if needRepetition && maxRep > 0 {
             let rb = try MetalArrowBuffer.allocate(byteCount: Swift.max(totalLevels, 1), zeroed: true, context: ctx)
-            let dummy = try MetalArrowBuffer.allocate(byteCount: 4, context: ctx)
+            // `pq_decode_levels` writes a rank for every level it decodes, so the scratch rank buffer
+            // needs a slot per level. (It was once 4 bytes, which is fine up to the 16 KB allocation
+            // padding -- 4,096 levels -- and past that wrote over whatever memory followed.)
+            let scratchRanks = try MetalArrowBuffer.allocate(byteCount: Swift.max(totalLevels * 4, 4), zeroed: false, context: ctx)
             try runLevels(ctx, data: pageData, dataOffset: pageDataOffset, pages: pagesBuf, count: infos.count,
                           bitWidth: bitWidth(of: maxRep), matchLevel: 0, which: 1, countSlot: 2,
-                          levels: rb, ranks: dummy)
+                          levels: rb, ranks: scratchRanks)
             repBytes = rb
         }
 
@@ -354,6 +384,7 @@ extension ParquetFile {
                                    nonNull: totalNonNull, values: result)
         data.defLevels = defBytes
         data.repLevels = repBytes
+        data.rowSpans = spans
         if levelDef > 0, totalNonNull < totalLevels {
             let bm = try MetalArrowBuffer.allocate(byteCount: Swift.max(Bitmap.byteCount(bits: totalLevels), 4),
                                                    zeroed: true, context: ctx)

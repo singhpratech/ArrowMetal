@@ -382,6 +382,7 @@ Arrow type matrix and the interop status.
   Interface import, C Device Data Interface import/export, `MTLBuffer` recovery from our own exports.
 - `ArrowIPCReader` / `ArrowIPCWriter`: the Arrow IPC streaming and file formats, including a minimal
   FlatBuffers reader and builder, with no dependencies. Cross-checked against pyarrow in both directions.
+- Parquet decoded on the GPU, structs, maps and lists nested to any depth included, with the stored Arrow schema applied and page-index and bloom-filter skipping ([docs/PARQUET.md](docs/PARQUET.md)).
 - A CPU reference implementation behind the kernels, used as the oracle in tests.
 
 ## Design notes

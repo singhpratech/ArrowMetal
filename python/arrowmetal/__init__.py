@@ -4213,9 +4213,54 @@ _lib.am_parquet_write.argtypes = [ctypes.c_char_p, ctypes.POINTER(_P), ctypes.PO
                                   ctypes.c_int64, ctypes.c_char_p, ctypes.c_int, ctypes.c_int64]
 _lib.am_parquet_write.restype = ctypes.c_int
 
+# ---- Parquet: the stored Arrow schema and page-index statistics (docs/PARQUET.md)
+_lib.am_parquet_field_metadata.argtypes = [_P, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int64]
+_lib.am_parquet_field_metadata.restype = ctypes.c_int64
+_lib.am_parquet_schema_metadata.argtypes = [_P, ctypes.c_void_p, ctypes.c_int64]
+_lib.am_parquet_schema_metadata.restype = ctypes.c_int64
+_lib.am_parquet_set_page_index.argtypes = [_P, ctypes.c_int]
+_lib.am_parquet_set_page_index.restype = ctypes.c_int
+_lib.am_parquet_set_bloom_filters.argtypes = [_P, ctypes.c_int]
+_lib.am_parquet_set_bloom_filters.restype = ctypes.c_int
+_lib.am_parquet_last_read_stats.argtypes = [_P, ctypes.POINTER(ctypes.c_int64), ctypes.c_int64]
+_lib.am_parquet_last_read_stats.restype = ctypes.c_int64
+
+
+def _parquet_metadata(call):
+    """Runs a size-then-fill metadata call and decodes the C Data Interface metadata blob
+    (int32 count, then int32-length-prefixed key and value bytes) into `{bytes: bytes}`."""
+    n = call(None, 0)
+    if n < 0:
+        _check(1)
+    if n == 0:
+        return {}
+    buf = (ctypes.c_uint8 * n)()
+    call(buf, n)
+    raw = bytes(buf)
+    count, = struct.unpack_from("=i", raw, 0)
+    pos, out = 4, {}
+    for _ in range(count):
+        kl, = struct.unpack_from("=i", raw, pos)
+        key = raw[pos + 4:pos + 4 + kl]
+        pos += 4 + kl
+        vl, = struct.unpack_from("=i", raw, pos)
+        out[key] = raw[pos + 4:pos + 4 + vl]
+        pos += 4 + vl
+    return out
+
+
+def _np_bool_types():
+    """numpy.bool_ when numpy is importable (a comparison result is one), else no extra types."""
+    try:
+        import numpy
+        return (numpy.bool_,)
+    except ImportError:
+        return ()
+
 
 def _filter_text(filters):
     """`[("x", ">", 3), ("s", "==", "a")]` -> the ABI's `x>3;s=="a"` text."""
+    import numbers
     if not filters:
         return None
     if isinstance(filters, str):
@@ -4227,12 +4272,23 @@ def _filter_text(filters):
         col, op, val = f
         if op not in ("==", "!=", "<", "<=", ">", ">="):
             raise ArrowMetalError("filter op must be one of == != < <= > >=; got %r" % (op,))
+        if any(ch in str(col) for ch in "=!<>;"):
+            raise ArrowMetalError("a Parquet filter column name cannot contain = ! < > or ;; got %r" % (col,))
         if isinstance(val, str):
-            lit = '"%s"' % val
-        elif isinstance(val, bool):
+            # Quoted, with a quote or backslash inside escaped, so `;` and `"` in the value survive.
+            lit = '"%s"' % val.replace("\\", "\\\\").replace('"', '\\"')
+        elif isinstance(val, (bool, _np_bool_types())):
             lit = "1" if val else "0"
+        elif isinstance(val, numbers.Integral):
+            lit = str(int(val))
+        elif isinstance(val, numbers.Real):
+            lit = repr(float(val))
         else:
-            lit = repr(val)
+            # A date, datetime or Decimal has no text the filter parser reads as the column's value, and
+            # used to rule out every row group silently. Filter a date or timestamp column by its stored
+            # integer (days since the epoch, ticks in the column's unit) instead.
+            raise ArrowMetalError("a Parquet filter value must be a str, bool, int or float; got %s %r for "
+                                  "column %r" % (type(val).__name__, val, col))
         parts.append("%s%s%s" % (col, op, lit))
     return ";".join(parts).encode()
 
@@ -4416,7 +4472,69 @@ class ParquetFile:
         if not len(cols):
             return pa.table({})
         # Positional, so a projection naming a column twice gives a Table with both, as pyarrow does.
-        return pa.table([c.to_arrow() for c in cols.columns], names=cols.names)
+        arrays = [c.to_arrow() for c in cols.columns]
+        return pa.Table.from_arrays(arrays, schema=self._arrow_schema(cols.names, arrays))
+
+    # ---- the stored Arrow schema (docs/PARQUET.md, "The stored Arrow schema")
+    #
+    # A read already puts back the time zones, durations and extension types the file's ARROW:schema
+    # records. The field and schema metadata travel beside the arrays, the way pyarrow's Table carries
+    # them: `read_table` attaches both.
+
+    def field_metadata(self, column):
+        """A top-level column's custom metadata as `{bytes: bytes}` (what `pyarrow.parquet.read_table`
+        puts on the field), including `PARQUET:field_id` when the Parquet schema has one."""
+        return _parquet_metadata(lambda out, cap: _lib.am_parquet_field_metadata(self._h, str(column).encode(), out, cap))
+
+    @property
+    def schema_metadata(self):
+        """The file's key/value metadata without ARROW:schema, as `{bytes: bytes}`."""
+        return _parquet_metadata(lambda out, cap: _lib.am_parquet_schema_metadata(self._h, out, cap))
+
+    # ---- page-level skipping (docs/PARQUET.md, "Page-level skipping")
+
+    @property
+    def use_page_index(self):
+        """Whether a filtered read uses the file's column and offset indexes to skip data pages (on by
+        default). Turning it off makes every filtered read row-group granular."""
+        return getattr(self, "_use_page_index", True)
+
+    @use_page_index.setter
+    def use_page_index(self, enabled):
+        _check(_lib.am_parquet_set_page_index(self._h, 1 if enabled else 0))
+        self._use_page_index = bool(enabled)
+
+    @property
+    def use_bloom_filters(self):
+        """Whether an equality filter consults the file's bloom filters to drop row groups (on by default)."""
+        return getattr(self, "_use_bloom_filters", True)
+
+    @use_bloom_filters.setter
+    def use_bloom_filters(self, enabled):
+        _check(_lib.am_parquet_set_bloom_filters(self._h, 1 if enabled else 0))
+        self._use_bloom_filters = bool(enabled)
+
+    @property
+    def last_read_stats(self):
+        """What the most recent read on this handle did: row groups read and skipped (by statistics, by
+        the page index and by bloom filters), data pages decoded and skipped, and rows returned."""
+        buf = (ctypes.c_int64 * 7)()
+        if _lib.am_parquet_last_read_stats(self._h, buf, 7) < 0:
+            _check(1)
+        keys = ("row_groups_read", "row_groups_skipped_by_statistics", "row_groups_skipped_by_page_index",
+                "pages_decoded", "pages_skipped", "rows", "row_groups_skipped_by_bloom_filter")
+        return dict(zip(keys, (int(v) for v in buf)))
+
+    def _arrow_schema(self, names, arrays):
+        fields = []
+        for name, arr in zip(names, arrays):
+            md = self.field_metadata(name) or None
+            if md and isinstance(arr.type, pa.BaseExtensionType):
+                # A registered extension type consumes its two keys, as it does in pyarrow (which then
+                # keeps an empty metadata map rather than none).
+                md = {k: v for k, v in md.items() if not k.startswith(b"ARROW:extension:")}
+            fields.append(pa.field(name, arr.type, metadata=md))
+        return pa.schema(fields, metadata=self.schema_metadata or None)
 
 
 def read_parquet(path, columns=None, row_groups=None, filters=None, dictionary=True):
@@ -4425,7 +4543,9 @@ def read_parquet(path, columns=None, row_groups=None, filters=None, dictionary=T
 
     `columns` projects (only the requested column chunks are ever touched), `row_groups` selects by
     index, and `filters` is a list of `(column, op, value)` triples evaluated against the footer's
-    min/max statistics, so whole row groups that cannot match are never read. `dictionary=False`
+    min/max statistics, so whole row groups that cannot match are never read. A filter value is a str,
+    bool, int or float; a date or timestamp column is filtered by its stored integer (days since the
+    epoch, or ticks in the column's unit), and any other value raises. `dictionary=False`
     materialises dictionary-encoded columns instead of returning them dictionary encoded; either way
     the compute functions accept the column, decoding a dictionary for you when they must.
 
