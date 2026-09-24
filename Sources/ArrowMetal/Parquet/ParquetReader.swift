@@ -158,13 +158,15 @@ extension ParquetFile {
             let d = try decodeLeaf(l, rowGroups: rowGroups, options: options)
             return try d.arrowArray()
         case .list(let element, let repeatedDefinition):
-            guard case .leaf(let l) = element.kind else {
-                throw ParquetError.unsupported("list of non-primitive elements (column \(f.name))")
+            // A one-level `list<primitive>` keeps its dedicated kernel pair; every other list, map and
+            // struct goes through the general assembler.
+            if !f.isMap, case .leaf(let l) = element.kind, l.maxRepetition == 1 {
+                let d = try decodeLeaf(l, rowGroups: rowGroups, options: options, needRepetition: true)
+                return try d.listArray(repeatedDefinition: repeatedDefinition, outerNullable: f.nullable)
             }
-            let d = try decodeLeaf(l, rowGroups: rowGroups, options: options, needRepetition: true)
-            return try d.listArray(repeatedDefinition: repeatedDefinition, outerNullable: f.nullable)
+            return try ParquetNestedAssembler(file: self, rowGroups: rowGroups, options: options).buildTopLevel(f)
         case .group:
-            throw ParquetError.unsupported("struct column \(f.name); read its leaves by dotted path instead")
+            return try ParquetNestedAssembler(file: self, rowGroups: rowGroups, options: options).buildTopLevel(f)
         }
     }
 }

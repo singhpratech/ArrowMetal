@@ -192,6 +192,13 @@ Parquet on the GPU
   decode as Metal kernels straight into shared-memory Arrow arrays. ZSTD/GZIP/BROTLI pages decompress on
   the host. Row-group and column selection, nested lists; a small host-side writer for round trips.
   `am.read_parquet(path)` in Python, `ParquetReader` in Swift.
+- Nested Parquet columns reassembled from their leaves at any depth: structs (nullable, structs of
+  structs, structs of strings), maps (`map<K, V>` with nullable and nested values), and lists nested in
+  lists, in structs and in maps (`list<list<T>>`, `list<struct<...>>`, `struct<list<...>>`,
+  `list<map<...>>`). Three levels per field from the schema, one flag kernel, one prefix sum and one scatter
+  per field (`Parquet/ParquetNested.swift`). Checked value for value and type for type against
+  `pyarrow.parquet.read_table` on files written by pyarrow, DuckDB and Polars
+  (`Tests/Fixtures/generate_parquet_nested.py`, `ParquetNestedTests`, `python/tests/test_parquet_nested.py`).
 
 Out-of-core streaming
 - A streaming executor for datasets larger than memory (docs/STREAMING.md): Arrow IPC files/directories

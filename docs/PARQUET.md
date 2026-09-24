@@ -202,23 +202,33 @@ wrong data; that is the documented host fallback.
 | `FIXED_LEN_BYTE_ARRAY` | `fixed_size_binary(n)` | |
 | `FIXED_LEN_BYTE_ARRAY` + `DECIMAL(p,s)` | `decimal128(p,s)` | big-endian, sign-extended on the GPU |
 | `FIXED_LEN_BYTE_ARRAY` + `FLOAT16` | `float16` | |
-| `list<T>` (3-level and 2-level) | `list<T>` | Dremel assembly on the GPU, below |
-| `struct` | — | read its leaves by dotted path; a struct column raises `ParquetError.unsupported` |
-| `map` | — | not yet |
+| `list<T>` (3-level and 2-level) | `list<T>` | Dremel assembly on the GPU, below; `T` may itself be nested |
+| `struct` (a group without a `LIST` / `MAP` annotation) | `struct<...>` | reassembled from its leaves; its leaves also read on their own by dotted path |
+| `map` (`MAP` / `MAP_KEY_VALUE`) | `map<K, V>` | a list of key/value entries; `V` may be nested |
 
 ### Nesting
 
-Flat columns and `list<primitive>` are supported, including null lists, empty lists and null elements, in
-both the three-level (`group (LIST) { repeated group list { element } }`) and two-level
-(`group (LIST) { repeated element }`) shapes. The assembly is one kernel plus two prefix sums: a new row
-starts wherever the repetition level is 0, an element exists wherever the definition level reaches the
-repeated node's level, and the row is null when its first entry's definition level does not reach the
-enclosing group. Numbering the rows and the elements with two scans lets the row starts write the offsets
-buffer directly, and the child array is the leaf array compacted to the element positions with the
-package's existing `filter`.
+Structs, maps and lists nest to any depth — `list<list<T>>`, `list<struct<...>>`, `struct<list<...>>`,
+`map<K, list<V>>`, `list<map<K, V>>` — with nulls and empty lists at every level, in the three-level
+(`group (LIST) { repeated group list { element } }`) and two-level (`group (LIST) { repeated element }`)
+list shapes. Every Arrow-level field carries three numbers from the schema: the definition level at
+which it is present, the largest repetition level that starts a new element of it, and the definition
+level of its nearest repeated ancestor. Over the level entries of any one leaf beneath the field, an
+entry is one **slot** of the field when its repetition level is at most the first and its definition
+level reaches the third, and the slot is non-null when the definition level reaches the second. So:
 
-Struct columns are read leaf by leaf: `am.read_parquet(path, columns=["addr.city"])` works, but a
-`struct` is not reassembled into `MetalStructArray` yet.
+- a **leaf** is its decoded array compacted to its own slots with the package's existing `filter`;
+- a **struct** is its children plus a validity bitmap, read off one leaf's entries at the struct's slots;
+- a **list** is its child plus offsets: at each of the list's slots, the number of child slots before it,
+  which is a prefix sum of the child's slot flags read at the list's own slots;
+- a **map** is a list whose child is the key/value entries struct.
+
+Each of those is one flag kernel over the entries (`pq_nest_flags`), one prefix sum and one scatter
+(`pq_nest_scatter`), and every leaf is decoded once however many fields read its levels
+(`ParquetNested.swift`). A one-level `list<primitive>` keeps the dedicated kernel pair it had before, which
+reads the same levels the same way. A struct's leaves still read on their own by dotted path:
+`am.read_parquet(path, columns=["addr.city"])` returns the `city` leaf as a flat column, null wherever
+`addr` or `city` is null.
 
 ## Projection and predicate pushdown
 
@@ -382,23 +392,35 @@ int64, float64, string, bool and timestamp columns, uncompressed and Snappy; `Pa
   footer nesting Thrift structs 60,000 deep, a 2^64 length, a `num_children` past the schema — and
   requires every one of them to raise rather than crash, hang or read outside the mapping.
 - `ParquetWriterTests` and the Python writer test close the round trip.
+- `Tests/Fixtures/generate_parquet_nested.py` writes the nested fixtures under `Tests/Fixtures/nested`
+  (committed): structs three levels deep, structs of strings and binaries, `map<string, int64>`,
+  `map<int32, string>`, maps of structs and of lists, `list<list<T>>`, `list<list<list<int32>>>`,
+  `list<struct<...>>`, `struct<list<...>>` and `list<map<...>>`, with nulls and empty lists at every level —
+  written by pyarrow in four encoding / codec / page-version variants with 512-byte pages (so levels cross
+  hundreds of page boundaries), by DuckDB (`COPY ... TO ... (FORMAT parquet)`) and by Polars wherever it can
+  express the shape (it has no map type).
+- `Tests/ArrowMetalTests/ParquetNestedTests.swift` checks known values against the generator's formulas
+  and every writer's and variant's file against every other's, row by row.
+- `python/tests/test_parquet_nested.py` reads every nested fixture with ArrowMetal and with
+  `pyarrow.parquet.read_table` and requires the same values and the same types, apart from the two
+  differences listed under Limits (32-bit offsets, nullable struct members), each of which has its own test
+  showing the difference is exactly that; it also damages nested files 200 ways and requires every read to
+  raise or return rather than crash.
 
 ```
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter "ParquetTests|ParquetWriterTests"
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test -c release --filter "ParquetTests|ParquetWriterTests"
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter "ParquetTests|ParquetWriterTests|ParquetNestedTests"
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test -c release --filter "ParquetTests|ParquetWriterTests|ParquetNestedTests"
 swift build -c release --product ArrowMetalC
-PYTHONPATH=python python -m pytest python/tests/test_parquet.py -q
+PYTHONPATH=python python -m pytest python/tests/test_parquet.py python/tests/test_parquet_nested.py -q
 ARROWMETAL_PARQUET_BIG=1 PYTHONPATH=python python -m pytest python/tests/test_parquet.py -q -k fifty
 ```
 
 ## Limits
 
-- **Struct and map columns** are not reassembled; read struct leaves by dotted path.
 - **Duplicate column names are kept, not merged.** `read` hands back a `ColumnSet` — a dict that is
   positional underneath — so `read_parquet(path, columns=["a", "a"])` returns both columns and a file
   with two columns of the same name reads both of them. Indexing by name gives the first; `names`,
   `columns`, `items()` and iteration walk all of them in order.
-- **Nested lists** (`list<list<T>>`) are not assembled — one level of repetition only.
 - **`BIT_PACKED`** (the deprecated level encoding) and **LZO** are rejected.
 - **Encrypted files** are not supported.
 - **A single column chunk above 4 GiB** is rejected (the file itself has no size limit).
@@ -413,6 +435,9 @@ ARROWMETAL_PARQUET_BIG=1 PYTHONPATH=python python -m pytest python/tests/test_pa
   adjusted column comes back as `timestamp[unit, tz=UTC]` where `pyarrow.parquet.read_table` reads the
   original zone out of the file's `ARROW:schema` key/value metadata, which this reader ignores. The
   instants are identical; the type differs for any zone other than UTC.
+- **The members of a struct and the element of a list are exported as nullable.** A writer that declares
+  a struct member `required` gets `not null` on that member from `pyarrow.parquet.read_table`; the values
+  are the same, and the member reads as nullable here.
 - **`large_string`, `large_binary` and `large_list` come back 32-bit.** ArrowMetal narrows 64-bit offsets
   everywhere, so a column pyarrow reads as `large_string` reads here as `string`, with the same values.
 - **`decimal256` (precision above 38) is rejected**, as is any Arrow type ArrowMetal does not carry.
