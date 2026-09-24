@@ -151,9 +151,7 @@ public final class JSONReader: @unchecked Sendable {
 
     /// Reads the file. Nothing is parsed until `read` is called.
     ///
-    /// The bytes are read with parallel `pread` calls into a buffer from the context's pool rather
-    /// than `mmap`ed: every byte gets parsed, and a mapped file costs the GPU a fault on its first
-    /// touch of every page, which measured several times slower than the read (docs/JSON.md).
+    /// The bytes are read with parallel `pread` calls into a Metal buffer, since every byte gets parsed.
     public init(path: String, context: MetalContext = .shared) throws {
         self.path = path
         self.context = context
@@ -189,15 +187,30 @@ public final class JSONReader: @unchecked Sendable {
     }
 
     /// Parses bytes already in memory (they are copied into a Metal buffer once).
-    public init(bytes: [UInt8], context: MetalContext = .shared) throws {
+    public convenience init(bytes: [UInt8], context: MetalContext = .shared) throws {
+        try self.init(buffer: UnsafeRawBufferPointer(start: nil, count: 0), context: context, bytes: bytes)
+    }
+
+    /// Parses bytes already in memory without an intermediate array (they are copied into a Metal
+    /// buffer once). The caller's memory is not referenced after the call.
+    public convenience init(buffer: UnsafeRawBufferPointer, context: MetalContext = .shared) throws {
+        try self.init(buffer: buffer, context: context, bytes: nil)
+    }
+
+    private init(buffer: UnsafeRawBufferPointer, context: MetalContext, bytes: [UInt8]?) throws {
         path = nil
         self.context = context
-        try JSONReader.checkSize(bytes.count)
-        byteCount = bytes.count
-        let buffer = try MetalArrowBuffer.allocate(byteCount: bytes.count + 64, zeroed: true, context: context)
-        let dst = buffer.mutableContents.assumingMemoryBound(to: UInt8.self)
-        for (i, b) in bytes.enumerated() { dst[i] = b }
-        source = buffer
+        let count = bytes?.count ?? buffer.count
+        try JSONReader.checkSize(count)
+        byteCount = count
+        let dst = try MetalArrowBuffer.allocate(byteCount: count + 64, zeroed: false, context: context)
+        if let bytes {
+            bytes.withUnsafeBytes { if count > 0 { memcpy(dst.mutableContents, $0.baseAddress!, count) } }
+        } else if count > 0 {
+            memcpy(dst.mutableContents, buffer.baseAddress!, count)
+        }
+        memset(dst.mutableContents + count, 0, 64)
+        source = dst
     }
 
     public convenience init(string: String, context: MetalContext = .shared) throws {

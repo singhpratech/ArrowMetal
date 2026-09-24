@@ -1568,8 +1568,9 @@ void  am_json_close(am_json_file* f);
 
 // explicit_schema: NULL to infer every field, or a struct ("+s") ArrowSchema whose children fix the
 // types of the fields they name; it is only read, the caller keeps ownership. The reader converts to
-// bool, int8..int64, uint8..uint64, float, double, utf8, timestamp (any unit, any timezone), list and
-// struct; any other type is rejected with the field's path.
+// null (all-null values only, as pyarrow), bool, int8..int64, uint8..uint64, float, double, utf8,
+// timestamp (any unit, any timezone; timestamp[ns] holds 1677-09-21 to 2262-04-11), list and struct;
+// any other type is rejected with the field's path.
 // unexpected_field_behavior, for fields the schema does not name: 0 infer (appended after the schema's
 // fields), 1 ignore (dropped), 2 error ("JSON parse error: unexpected field").
 int am_json_read(am_json_file* f, const struct ArrowSchema* explicit_schema,
@@ -1579,6 +1580,11 @@ int64_t     am_json_batch_columns(am_json_batch* b);
 // Rows, which a file of empty objects still has when it has no columns.
 int64_t     am_json_batch_rows(am_json_batch* b);
 const char* am_json_batch_column_name(am_json_batch* b, int64_t i);
+// Every field name column i carries, with lengths, for keys that hold "\u0000" (where the C string above
+// and the C Data Interface's field names stop at the NUL): the column's name, then each struct field name
+// of its type in depth-first order (through list items), each as a 4-byte little-endian length and its
+// UTF-8 bytes. *out is valid until the batch is released. Returns the length in bytes, or -1.
+int64_t     am_json_batch_column_names(am_json_batch* b, int64_t i, const uint8_t** out);
 // Hands out a new am_array handle; release it with am_release.
 int         am_json_batch_column(am_json_batch* b, int64_t i, am_array** out);
 void        am_json_batch_release(am_json_batch* b);

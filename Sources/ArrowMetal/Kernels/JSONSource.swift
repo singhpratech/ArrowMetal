@@ -374,7 +374,8 @@ enum JSONSource {
     // an invalid token reports its own error; an array is reported at its opening bracket.
     inline uint j_top_error(device const uchar* s, uint i, uint n, uchar c) {
         if (c == 0x5B) return E_TOP_ARRAY;
-        if (c == 0x7D || c == 0x5D || c == 0x2C || c == 0x3A) return E_DOC_EMPTY;
+        // RapidJSON reads a NUL byte as the end of its input, so a record starting there is an empty document.
+        if (c == 0x7D || c == 0x5D || c == 0x2C || c == 0x3A || c == 0x00) return E_DOC_EMPTY;
         uint err = E_NONE;
         if (c == 0x22) {
             bool esc = false;
@@ -959,6 +960,19 @@ enum JSONSource {
     }
     inline bool j_leap(uint y) { return (y % 4u == 0u && y % 100u != 0u) || y % 400u == 0u; }
 
+    // secs * unitScale + sub, false when it does not fit int64 (timestamp[ns] outside 1677-09-21 to
+    // 2262-04-11). Like Arrow, the whole seconds must scale without overflow before the fraction is added.
+    inline bool j_scale(long secs, long unitScale, long sub, thread long& out) {
+        // INT64_MAX / unitScale, spelled out: a 64-bit division per value costs the GPU more than the parse.
+        long lim = unitScale == 1000000000 ? 9223372036L : unitScale == 1000000 ? 9223372036854L
+                 : unitScale == 1000 ? 9223372036854775L : 0x7FFFFFFFFFFFFFFF;
+        if (secs > lim || secs < -lim) return false;
+        long v = secs * unitScale;
+        if (v > 0 && sub > 0x7FFFFFFFFFFFFFFF - v) return false;
+        out = v + sub;
+        return true;
+    }
+
     // unitScale: ticks per second (1, 1e3, 1e6, 1e9); fracMax: fraction digits the unit holds (0, 3, 6, 9).
     inline bool j_iso8601(device const uchar* d, uint p, uint length, long unitScale, uint fracMax, thread long& out) {
         if (length < 10u) return false;
@@ -971,7 +985,7 @@ enum JSONSource {
         uint dim = mdays[mo - 1u] + ((mo == 2u && j_leap(year)) ? 1u : 0u);
         if (dy > dim) return false;
         long secs = j_days_from_civil((long)year, mo, dy) * 86400;
-        if (length == 10u) { out = secs * unitScale; return true; }
+        if (length == 10u) return j_scale(secs, unitScale, 0, out);
         if (d[p + 10u] != 0x20 && d[p + 10u] != 0x54) return false;
         long zone = 0;
         if (d[p + length - 1u] == 0x5A) {
@@ -995,15 +1009,14 @@ enum JSONSource {
         else if (length == 19u || (length >= 21u && length <= 29u)) { if (!j_hh_mm_ss(d, p + 11u, tod)) return false; }
         else return false;
         secs += tod + zone;
-        if (length <= 19u) { out = secs * unitScale; return true; }
+        if (length <= 19u) return j_scale(secs, unitScale, 0, out);
         if (d[p + 19u] != 0x2E) return false;
         uint fl = length - 20u;
         if (fl > fracMax) return false;
         long sub = 0;
         for (uint k = 0u; k < fl; k++) { uchar c = d[p + 20u + k]; if (!j_digit(c)) return false; sub = sub * 10 + (long)(c - 0x30); }
         for (uint k = fl; k < fracMax; k++) sub *= 10;
-        out = secs * unitScale + sub;
-        return true;
+        return j_scale(secs, unitScale, sub, out);
     }
 
     struct JTime { uint rows; uint cols; long unitScale; uint fracMax; };

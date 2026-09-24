@@ -282,6 +282,24 @@ PROBES = {
     "eof_in_array": '{"a":[1',
     "eof_after_array_comma": '{"a":[1,',
     "eof_after_brace": '{',
+    # A conflict inside a column's objects or arrays, earlier than the column's own conflict.
+    "nested_list_conflict_before_outer": '{"a":[1]}\n{"a":["x"]}\n{"a":1}\n',
+    "nested_struct_conflict_before_outer": '{"a":{"b":[]}}\n{"a":{"b":{}}}\n{"a":"x"}\n',
+    "nested_repeat_before_outer": '{"a":{"b":1,"b":2}}\n{"a":2}\n',
+    "list_of_structs_conflict_before_outer": '{"a":[{"b":1},{"b":"x"}]}\n{"a":{}}\n',
+    "list_of_lists_conflict_before_outer": '{"a":[[1],[{}]]}\n{"a":3}\n',
+    "outer_conflict_before_nested": '{"a":[1]}\n{"a":1}\n{"a":["x"]}\n',
+    # RapidJSON reads a NUL byte as the end of its input.
+    "nul_between_records": '{"a":1}\x00{"a":2}',
+    "nul_before_first_record": '\x00{"a":1}',
+    "nul_line_after_records": '{"a":1}\n\x00\n',
+    "nul_at_end": '{"a":1}\n\x00',
+    "nul_as_value": '{"a":\x00}\n',
+    "nul_after_value": '{"a":1\x00}\n',
+    "nul_in_string": '{"a":"x\x00y"}\n',
+    "nul_in_key": '{"a\x00":1}\n',
+    "nul_before_key": '{\x00"a":1}\n',
+    "nul_in_array": '{"a":[1,\x00]}\n',
 }
 
 EXPLICIT = {
@@ -358,7 +376,29 @@ EXPLICIT = {
     "duplicate_inferred_with_schema": ('{"z":1,"z":2}\n', S(("a", pa.int64()))),
     "unexpected_then_conflict": ('{"a":1}\n{"a":"x","z":1}\n', S(("a", pa.int64()), unexpected_field_behavior="error")),
     "conflict_then_unexpected": ('{"a":1}\n{"z":1,"a":"x"}\n', S(("a", pa.int64()), unexpected_field_behavior="error")),
+    "nested_conflict_before_schema_conflict": ('{"a":{"b":"x"}}\n{"a":1}\n', S(("a", pa.struct([("b", pa.int64())])))),
+    # timestamp[ns] holds 1677-09-21T00:12:43.145224192 to 2262-04-11T23:47:16.854775807.
+    "timestamp_ns_far_future": ('{"a":"9999-12-31"}\n{"a":"1500-01-01"}\n', S(("a", pa.timestamp("ns")))),
+    "timestamp_ns_far_past": ('{"a":"2000-01-01"}\n{"a":"1500-01-01"}\n', S(("a", pa.timestamp("ns")))),
+    "timestamp_us_every_year": ('{"a":"9999-12-31T23:59:59.999999"}\n{"a":"0000-01-01"}\n', S(("a", pa.timestamp("us")))),
 }
+
+# The edges of timestamp[ns], each read alone.
+for i, v in enumerate(["1677-09-21T00:12:43.145224192", "1677-09-21T00:12:43.145224191", "2262-04-11T23:47:16.854775807",
+                       "2262-04-11T23:47:16.854775808", "2262-04-11T23:47:16", "2262-04-11T23:47:17",
+                       "1677-09-21T00:12:43", "1677-09-21T00:12:44", "2262-04-12", "1677-09-22", "1677-09-21",
+                       "2262-04-11T23:00:00-01:00", "2262-04-12T00:30:00+01:00", "1677-09-21T00:12:44+00:01",
+                       "1677-09-21T00:12:43.9-00:01", "2262-04-11T23:47:16.854775807Z", "2262-04-11 23:47",
+                       "2262-04-11T23:47:16.854775807+00:00", "1677-09-21T00:12:43.9-0001"]):
+    EXPLICIT["timestamp_ns_edge_%02d" % i] = ('{"a":"%s"}\n' % v, S(("a", pa.timestamp("ns"))))
+
+# Explicit null, at the top level, as a list item and as a struct field: pyarrow infers the column
+# and then converts it to null.
+for t in [pa.null(), pa.list_(pa.null()), pa.struct([("m", pa.null())])]:
+    for j, v in enumerate(['null', '1', '1.5', 'true', '"x"', '{}', '[]', '[null]', '[1]', '{"m":1}', '{"m":null}',
+                           '[[1]]', '[{"q":true}]', '{"m":[]}']):
+        for k, tail in enumerate(['', '{"l":2}\n', '{"l":null}\n']):
+            EXPLICIT["null_%s_%02d_%d" % (str(t).replace(" ", ""), j, k)] = ('{"l":null}\n{"l":%s}\n%s' % (v, tail), S(("l", t)))
 
 
 @pytest.mark.parametrize("name", sorted(PROBES))
@@ -610,7 +650,7 @@ def test_bad_unexpected_field_behavior():
 
 
 @pytest.mark.parametrize("typ", [pa.date32(), pa.decimal128(10, 2), pa.binary(), pa.large_string(),
-                                 pa.float16(), pa.dictionary(pa.int32(), pa.string()), pa.null()])
+                                 pa.float16(), pa.dictionary(pa.int32(), pa.string())])
 def test_explicit_types_outside_the_supported_set_are_rejected(typ):
     with pytest.raises(am.ArrowMetalError, match="/a"):
         am.read_json_table(b'{"a":"1"}\n', explicit_schema=pa.schema([("a", typ)]))
@@ -757,3 +797,49 @@ def test_invalid_utf8_passes_through_as_pyarrow_does():
     assert got.buffers()[2].to_pybytes()[:2] == want.buffers()[2].to_pybytes()[:2] == b"\xff\xfe"
     with pytest.raises(pa.ArrowInvalid):
         got.validate(full=True)
+
+
+def test_timestamp_ns_out_of_range_is_an_error_not_a_wrapped_value():
+    with pytest.raises(am.ArrowMetalError) as e:
+        am.read_json_table(b'{"a":"9999-12-31"}\n{"a":"1500-01-01"}\n', explicit_schema=pa.schema([("a", pa.timestamp("ns"))]))
+    assert str(e.value) == "Failed to convert JSON to timestamp[ns], couldn't parse:9999-12-31"
+
+
+def test_key_holding_nul_keeps_its_full_name():
+    # The C ABI's plain name accessor and the C Data Interface stop at a NUL; the names travel with
+    # their lengths through am_json_batch_column_names instead.
+    data = b'{"a\\u0000b":1}\n{"a\\u0000b":2,"a":3}\n'
+    t = am.read_json_table(data)
+    assert t.schema.names == ["a\x00b", "a"]
+    assert t.equals(pj.read_json(io.BytesIO(data)))
+    assert list(am.read_json(data).keys()) == ["a\x00b", "a"]
+    nested = b'{"s\\u0000":{"a\\u0000b":1,"a":2,"l":[{"x\\u0000":1,"x":2}]}}\n'
+    t = am.read_json_table(nested)
+    assert t.equals(pj.read_json(io.BytesIO(nested)))
+    assert t.to_pylist() == [{"s\x00": {"a\x00b": 1, "a": 2, "l": [{"x\x00": 1, "x": 2}]}}]
+    # The documented limit: a MetalArray's own export carries nested names only up to the NUL.
+    assert am.read_json(nested)["s\x00"].to_arrow().type.field(0).name == "a"
+
+
+def test_negative_nan_keeps_its_sign():
+    # Table.equals and the NaN-tolerant comparison above cannot see a NaN's sign; compare the bits.
+    import struct
+    for v in [b"-NaN", b"NaN"]:
+        data = b'{"a":' + v + b'}\n'
+        for typ, fmt in [(pa.float64(), "<d"), (pa.float32(), "<f")]:
+            po = S(("a", typ))
+            got = am.read_json_table(data, parse_options=po)["a"].chunk(0).buffers()[1].to_pybytes()[:struct.calcsize(fmt)]
+            want = pj.read_json(io.BytesIO(data), parse_options=po)["a"].chunk(0).buffers()[1].to_pybytes()[:struct.calcsize(fmt)]
+            assert got == want, (v, typ)
+        got = am.read_json_table(data)["a"].chunk(0).buffers()[1].to_pybytes()[:8]
+        assert got == pj.read_json(io.BytesIO(data))["a"].chunk(0).buffers()[1].to_pybytes()[:8]
+    assert am.read_json_table(b'{"a":-NaN}\n')["a"].chunk(0).buffers()[1].to_pybytes()[:8].hex() == "000000000000f8ff"
+
+
+def test_invalid_utf8_in_a_key_is_replaced():
+    # The documented difference: field names are Swift strings, so an invalid UTF-8 sequence in a key
+    # becomes U+FFFD. pyarrow keeps the raw byte, which its Schema.names then cannot decode.
+    data = b'{"\xff":1}\n'
+    assert am.read_json_table(data).schema.names == ["\ufffd"]
+    with pytest.raises(UnicodeDecodeError):
+        pj.read_json(io.BytesIO(data)).schema.names

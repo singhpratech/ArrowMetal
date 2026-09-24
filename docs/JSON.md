@@ -27,7 +27,11 @@ let typed = try JSONReader(path: "events.jsonl").read(JSONReadOptions(
 
 The C ABI is `am_json_open` / `am_json_open_buffer` / `am_json_read` and the `am_json_batch_*`
 accessors in `include/arrowmetal.h`, shaped like `am_parquet_batch`; the explicit schema crosses as a
-struct-typed `ArrowSchema`.
+struct-typed `ArrowSchema`. `am_json_batch_column_names` hands out a column's name and its nested struct
+field names with their lengths, so a key holding `\u0000` arrives whole where a C string and the C Data
+Interface's field names stop at the NUL; `am.read_json_table` restores such nested names on the pyarrow
+table. `am.read_json` keeps the full top-level names, but a struct column's `to_arrow()` goes through the
+C Data Interface and its nested names stop at the NUL (`test_key_holding_nul_keeps_its_full_name`).
 
 - `Sources/ArrowMetal/JSON/JSONReader.swift` — the public API, the options and the read pipeline.
 - `Sources/ArrowMetal/JSON/JSONColumns.swift` — keys to fields, type inference, the column builders and
@@ -68,7 +72,8 @@ records need not be one per line (`{"a":1}{"a":2}` is two records, and an object
 is what pyarrow reads too. A `null` at depth 0 is a record whose fields are all null, as pyarrow reads it
 after the first object. Anything else at depth 0 that is not whitespace is an error, reported with the
 text a sequential parser gives (`Column() changed from object to array`, `The document is empty.`, a
-string's own error when the string is malformed).
+string's own error when the string is malformed). RapidJSON reads a NUL byte as the end of its input, so
+a NUL where a record would start is `The document is empty.` too.
 
 ### The walk
 
@@ -85,6 +90,11 @@ When a record holds a syntax error, the walk still reports the children it reach
 whose value never came and the kind of a container it had opened — so the columns see what a sequential
 parser had seen before the error. That is how a type conflict or a repeated key earlier in the same
 record is reported ahead of the syntax error, as pyarrow reports it.
+
+A column whose classes conflict is not built, but its objects or arrays are still walked one level down
+as the class the column started with (values of other classes read as null there), so a conflict or a
+repeated key inside them that comes earlier in the file than the column's own conflict is found and
+reported first (`nested_*_before_outer` probes).
 
 ### Keys and fields
 
@@ -165,7 +175,11 @@ readers and compared: the schema, the values and the nulls, or the error text.
 | `\r\n`, `\r`, tabs, spaces between records | whitespace |
 | `{"a":1e309}` | `... Number too big to be stored in double. in row 0` |
 | `{"a":1.7976931348623157e309}`, `{"a":10e308}` | `inf` |
-| invalid UTF-8 inside a string | passed through unchanged (neither reader validates) |
+| invalid UTF-8 inside a string value | passed through unchanged (neither reader validates); in a key, see the differences |
+| `{"a":[1]}`, `{"a":["x"]}`, `{"a":1}` | `... Column(/a/[]) changed from number to string in row 1` (the nested conflict comes first) |
+| `{"a":1}` NUL `{"a":2}`, a NUL line, a leading NUL | `JSON parse error: The document is empty.` |
+| NUL inside a record | the error for what was expected there (`Invalid value.`, `Missing a closing quotation mark in string.`, ...) |
+| `-NaN` | a NaN with the sign bit set (`test_negative_nan_keeps_its_sign`) |
 
 With an explicit schema, the schema's fields come first in schema order and the others follow in order
 of first appearance (`infer`), are dropped (`ignore`) or fail with `JSON parse error: unexpected field`
@@ -178,9 +192,23 @@ same rules one level down.
 ## Explicit-schema types
 
 `bool`, `int8` to `int64`, `uint8` to `uint64`, `float`, `double`, `string`, `timestamp` in any unit and
-timezone (fractions up to the unit's precision, zone offsets converted to UTC), `list` and `struct` of
-those. Any other type is rejected with an error naming the field (`date32`, `decimal128`, `binary`,
-`large_string`, `float16`, `dictionary`, `null`; `test_explicit_types_outside_the_supported_set_are_rejected`).
+timezone (fractions up to the unit's precision, zone offsets converted to UTC), `null`, `list` and
+`struct` of those. Any other type is rejected with an error naming the field (`date32`, `decimal128`,
+`binary`, `large_string`, `float16`, `dictionary`;
+`test_explicit_types_outside_the_supported_set_are_rejected`).
+
+`timestamp[ns]` holds 1677-09-21T00:12:43.145224192 to 2262-04-11T23:47:16.854775807; a value outside
+fails with `Failed to convert JSON to timestamp[ns], couldn't parse:...`, as in pyarrow. As in Arrow, the
+whole seconds (after the zone offset) must fit before the fraction is added, so
+`1677-09-21T00:12:43.145224192` fails although its nanosecond count would fit (`timestamp_ns_*`
+explicit cases). The coarser units hold every four-digit year.
+
+`null` follows pyarrow, which infers the column and then converts it: values that are all null (or
+absent) read as a null column, including as a list item or struct field; values of two classes are the
+inferred column's conflict; any other value fails with `Failed to convert JSON to null from <type>`,
+the type as pyarrow holds it before conversion (`bool`; numbers and strings as
+`dictionary<values=string, indices=int32, ordered=0>`; `struct<...>` and `list<item: ...>` of those;
+the `null_*` explicit cases, as top-level, list-item and struct-field types).
 
 ## Differences from pyarrow 25.0.1
 
@@ -211,6 +239,9 @@ Each has a test of its own in `python/tests/test_json.py` that checks the differ
 - **When several explicit-schema values fail to convert, the one earliest in the file is named.** pyarrow
   names one of them, depending on its conversion order
   (`test_conversion_error_names_the_first_failing_value`).
+- **Invalid UTF-8 in a key becomes U+FFFD.** Field names are Swift strings, so `{"\xff":1}` reads as a
+  field named `"\ufffd"`; pyarrow keeps the raw byte, which its `Schema.names` then cannot decode
+  (`test_invalid_utf8_in_a_key_is_replaced`). Values are passed through unchanged.
 - **Errors are `ArrowMetalError`**, with pyarrow's text; pyarrow raises `ArrowInvalid`.
 
 ## Benchmarks
@@ -240,8 +271,10 @@ PYTHONPATH=python python Benchmarks/json_bench.py --rows 1000000 --readers arrow
   random documents (strings holding brackets, escaped quotes, backslash runs across blocks, multi-line
   objects, `null` records) against a sequential CPU scanner; top-level error positions and codes; the
   walk's key spans, value spans, kinds and flags; RapidJSON's error texts; conflicts and repeated keys;
-  timestamps against a day-counting reference; explicit schemas; nested structs and lists; random flat
-  files against Foundation's `JSONSerialization`; a 400-field file; files on disk.
+  timestamps against a day-counting reference and the edges of `timestamp[ns]`; explicit schemas,
+  explicit `null`; nested structs and lists; nested conflicts ahead of a column's own; NUL bytes; the
+  sign of `-NaN`; keys holding `\u0000`; random flat files against Foundation's `JSONSerialization`; a
+  400-field file; files on disk and bytes in memory.
 
 ```
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test -c release --filter JSONReaderTests

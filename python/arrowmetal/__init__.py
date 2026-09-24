@@ -4483,6 +4483,8 @@ _lib.am_json_batch_rows.argtypes = [_P]
 _lib.am_json_batch_rows.restype = ctypes.c_int64
 _lib.am_json_batch_column_name.argtypes = [_P, ctypes.c_int64]
 _lib.am_json_batch_column_name.restype = ctypes.c_char_p
+_lib.am_json_batch_column_names.argtypes = [_P, ctypes.c_int64, ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8))]
+_lib.am_json_batch_column_names.restype = ctypes.c_int64
 _lib.am_json_batch_column.argtypes = [_P, ctypes.c_int64, ctypes.POINTER(_P)]
 _lib.am_json_batch_column.restype = ctypes.c_int
 _lib.am_json_batch_release.argtypes = [_P]
@@ -4490,8 +4492,34 @@ _lib.am_json_batch_release.argtypes = [_P]
 _UNEXPECTED_FIELD = {"infer": 0, "ignore": 1, "error": 2}
 
 
+def _json_column_names(out, i):
+    """Column i's name and its nested struct field names (depth-first), read with their lengths so a
+    key holding "\\u0000" survives (a C string and the C Data Interface stop at the NUL)."""
+    p = ctypes.POINTER(ctypes.c_uint8)()
+    n = _lib.am_json_batch_column_names(out, i, ctypes.byref(p))
+    if n < 0:
+        _check(1)
+    blob = ctypes.string_at(p, n) if n else b""
+    names, k = [], 0
+    while k < n:
+        ln = int.from_bytes(blob[k:k + 4], "little")
+        names.append(blob[k + 4:k + 4 + ln].decode())
+        k += 4 + ln
+    return names
+
+
+def _json_renamed(t, names):
+    """`t` with its struct field names replaced, depth-first, from the iterator `names`."""
+    if pa.types.is_struct(t):
+        return pa.struct([pa.field(next(names), _json_renamed(t.field(j).type, names), t.field(j).nullable)
+                          for j in range(t.num_fields)])
+    if pa.types.is_list(t):
+        return pa.list_(pa.field(t.value_field.name, _json_renamed(t.value_type, names), t.value_field.nullable))
+    return t
+
+
 def _json_read(source, read_options, parse_options, explicit_schema, unexpected_field_behavior):
-    """Runs one read; returns (pairs, rows)."""
+    """Runs one read; returns (pairs, rows, {column: nested field names when one holds a NUL})."""
     del read_options  # block_size and use_threads do not change what this reader returns
     if parse_options is not None:
         if explicit_schema is None:
@@ -4528,13 +4556,15 @@ def _json_read(source, read_options, parse_options, explicit_schema, unexpected_
             if schema_c is not None and schema_c.release:
                 schema_c.release(ctypes.byref(schema_c))
         try:
-            pairs = []
+            pairs, nested = [], {}
             for i in range(_lib.am_json_batch_columns(out)):
-                name = _lib.am_json_batch_column_name(out, i).decode()
+                names = _json_column_names(out, i)
                 c = _P()
                 _check(_lib.am_json_batch_column(out, i, ctypes.byref(c)))
-                pairs.append((name, MetalArray(c)))
-            return pairs, int(_lib.am_json_batch_rows(out))
+                pairs.append((names[0], MetalArray(c)))
+                if any("\x00" in nm for nm in names[1:]):
+                    nested[i] = names[1:]
+            return pairs, int(_lib.am_json_batch_rows(out)), nested
         finally:
             _lib.am_json_batch_release(out)
     finally:
@@ -4557,7 +4587,7 @@ def read_json(path, read_options=None, parse_options=None, memory_pool=None, *,
         cols["latency_ms"].mean()            # already on the GPU
     """
     del memory_pool
-    pairs, _ = _json_read(path, read_options, parse_options, explicit_schema, unexpected_field_behavior)
+    pairs, _, _ = _json_read(path, read_options, parse_options, explicit_schema, unexpected_field_behavior)
     return ColumnSet(pairs)
 
 
@@ -4565,11 +4595,16 @@ def read_json_table(path, read_options=None, parse_options=None, memory_pool=Non
                     explicit_schema=None, unexpected_field_behavior=None):
     """`read_json` exported as a `pyarrow.Table` (zero copy), with pyarrow's schema and row count."""
     del memory_pool
-    pairs, rows = _json_read(path, read_options, parse_options, explicit_schema, unexpected_field_behavior)
+    pairs, rows, nested = _json_read(path, read_options, parse_options, explicit_schema, unexpected_field_behavior)
     if not pairs:
         # A file of empty objects has rows but no columns.
         return pa.Table.from_struct_array(pa.array([{}] * rows, type=pa.struct([])))
-    return pa.table([c.to_arrow() for _, c in pairs], names=[n for n, _ in pairs])
+    arrays = [c.to_arrow() for _, c in pairs]
+    for i, names in nested.items():
+        # Struct field names holding a NUL come back cut at it through the C Data Interface; the
+        # layout is unchanged, so the full names are restored with a view.
+        arrays[i] = arrays[i].view(_json_renamed(arrays[i].type, iter(names)))
+    return pa.table(arrays, names=[n for n, _ in pairs])
 
 
 # ---- out-of-core streaming execution (python/arrowmetal/stream.py, docs/STREAMING.md)

@@ -10,11 +10,38 @@ private final class JSONFileBox { let r: JSONReader; init(_ r: JSONReader) { sel
 private final class JSONBatchBox {
     let table: JSONTable
     var names: [UnsafeMutablePointer<CChar>] = []
+    /// Per column, every field name the column carries (its own, then each struct field of its type in
+    /// depth-first order), each as a 4-byte little-endian length and the UTF-8 bytes: a key holding
+    /// `\u0000` survives here, where the C string of `names` and the C Data Interface stop at the NUL.
+    var nameBlobs: [UnsafeMutableBufferPointer<UInt8>] = []
     init(_ t: JSONTable) {
         table = t
         names = t.names.map { strdup($0)! }
+        nameBlobs = zip(t.names, t.columns).map { name, col in
+            var blob: [UInt8] = []
+            func put(_ s: String) {
+                let u = Array(s.utf8)
+                withUnsafeBytes(of: UInt32(u.count).littleEndian) { blob += $0 }
+                blob += u
+            }
+            func walk(_ a: AnyMetalArray) {
+                switch a {
+                case .structure(let s): for (n, c) in zip(s.names, s.children) { put(n); walk(c) }
+                case .list(let l): walk(l.values)
+                default: break
+                }
+            }
+            put(name)
+            walk(col)
+            let stored = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: blob.count)
+            _ = stored.initialize(from: blob)
+            return stored
+        }
     }
-    deinit { for n in names { free(n) } }
+    deinit {
+        for n in names { free(n) }
+        for b in nameBlobs { b.deallocate() }
+    }
 }
 
 private func jsonStore(_ m: String) {
@@ -54,8 +81,7 @@ public func am_json_open_buffer(_ data: UnsafeRawPointer?, _ length: Int64,
     guard length >= 0 else { return jsonBadArgument("am_json_open_buffer", "`length` is \(length), which is negative") }
     guard data != nil || length == 0 else { return jsonBadArgument("am_json_open_buffer", "`data` is NULL but `length` is \(length)") }
     do {
-        let bytes = data.map { Array(UnsafeRawBufferPointer(start: $0, count: Int(length))) } ?? []
-        let r = try JSONReader(bytes: bytes)
+        let r = try JSONReader(buffer: UnsafeRawBufferPointer(start: data, count: Int(length)))
         out.pointee = OpaquePointer(Unmanaged.passRetained(JSONFileBox(r)).toOpaque())
         return 0
     } catch { jsonStore("\(error)"); return 1 }
@@ -168,6 +194,21 @@ public func am_json_batch_rows(_ b: OpaquePointer?) -> Int64 {
 public func am_json_batch_column_name(_ b: OpaquePointer?, _ i: Int64) -> UnsafePointer<CChar>? {
     guard let box = jsonBatch(b), i >= 0, Int(i) < box.names.count else { return nil }
     return UnsafePointer(box.names[Int(i)])
+}
+
+/// Every field name of column `i` with its length (see `JSONBatchBox.nameBlobs`); the bytes stay
+/// valid until the batch is released. Returns the blob's length, or -1 for a bad handle or index.
+@_cdecl("am_json_batch_column_names")
+public func am_json_batch_column_names(_ b: OpaquePointer?, _ i: Int64,
+                                       _ out: UnsafeMutablePointer<UnsafePointer<UInt8>?>?) -> Int64 {
+    guard let box = jsonBatch(b) else { jsonStore("am_json_batch_column_names: `b` is NULL (no batch)"); return -1 }
+    guard let out else { jsonStore("am_json_batch_column_names: `out` is NULL"); return -1 }
+    guard i >= 0, Int(i) < box.nameBlobs.count else {
+        jsonStore("am_json_batch_column_names: column index \(i) is outside 0..<\(box.nameBlobs.count)")
+        return -1
+    }
+    out.pointee = UnsafePointer(box.nameBlobs[Int(i)].baseAddress)
+    return Int64(box.nameBlobs[Int(i)].count)
 }
 
 @_cdecl("am_json_batch_column")

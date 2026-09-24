@@ -234,13 +234,17 @@ final class JSONColumnBuilder {
             for b in 1...7 where mask & (1 << UInt32(b)) != 0 { classes.insert(JSONKind(rawValue: UInt32(b))!.classID) }
             let target: JSONType
             let inferred: Bool
+            if let type = types[k], type == .null {
+                try explicitNull(set.column(sel[k]), classes: classes, path: paths[k], rowToRecord: rowToRecord)
+                out[k] = .null(MetalNullArray(length: set.rows, context: ctx))
+                continue
+            }
             if let type = types[k] {
-                if type == .null {
-                    throw JSONError.unsupported("explicit_schema: \(paths[k]) has type null, which the JSON reader does not convert to")
-                }
                 if classes.contains(where: { $0 != type.jsonClassID }) {
-                    reportConflict(set.column(sel[k]), expected: (type.jsonClass, type.jsonClassID), path: paths[k],
-                                   rowToRecord: rowToRecord)
+                    let col = set.column(sel[k])
+                    reportConflict(col, expected: (type.jsonClass, type.jsonClassID), path: paths[k], rowToRecord: rowToRecord)
+                    try nestedBeforeConflict(col, classID: type.jsonClassID, explicit: type, path: paths[k],
+                                             rowToRecord: rowToRecord)
                     out[k] = .null(MetalNullArray(length: set.rows, context: ctx))
                     continue
                 }
@@ -248,7 +252,10 @@ final class JSONColumnBuilder {
                 inferred = false
             } else {
                 if classes.count > 1 {
-                    reportConflict(set.column(sel[k]), expected: nil, path: paths[k], rowToRecord: rowToRecord)
+                    let col = set.column(sel[k])
+                    if let first = reportConflict(col, expected: nil, path: paths[k], rowToRecord: rowToRecord) {
+                        try nestedBeforeConflict(col, classID: first, explicit: nil, path: paths[k], rowToRecord: rowToRecord)
+                    }
                     out[k] = .null(MetalNullArray(length: set.rows, context: ctx))
                     continue
                 }
@@ -286,9 +293,11 @@ final class JSONColumnBuilder {
     }
 
     /// Finds the first row whose class differs from the first non-null class (or from the expected
-    /// class of an explicit type) and records pyarrow's message for it.
+    /// class of an explicit type) and records pyarrow's message for it. Returns the class the column
+    /// started with.
+    @discardableResult
     func reportConflict(_ col: JSONKernels.ColumnSet, expected: (name: String, id: Int)?, path: String,
-                        rowToRecord: (Int) -> Int) {
+                        rowToRecord: (Int) -> Int) -> Int? {
         var first = expected
         for r in 0..<col.rows {
             let e = col.entryIndex(0, r)
@@ -300,8 +309,70 @@ final class JSONColumnBuilder {
             if k.classID != f.id {
                 parseErrors.append((Int(x.valStart),
                                     "Column(\(path)) changed from \(f.name) to \(k.className) in row \(rowToRecord(r))"))
-                return
+                return f.id
             }
+        }
+        return first?.id
+    }
+
+    /// A column whose classes conflict is not built, but a sequential parser meets a conflict (or a
+    /// repeated key) inside the objects or arrays before the conflicting row first. When the column
+    /// started as objects or arrays, their children are walked as that class (values of other classes
+    /// read as null there) so those errors are collected too; the reader reports the earliest.
+    func nestedBeforeConflict(_ col: JSONKernels.ColumnSet, classID: Int, explicit: JSONType?, path: String,
+                              rowToRecord: @escaping (Int) -> Int) throws {
+        switch explicit {
+        case .some(.structure), .some(.list):
+            _ = try nested(col, type: explicit!, inferred: false, path: path, rowToRecord: rowToRecord)
+        case .some:
+            return
+        case .none:
+            if classID == 4 { _ = try nested(col, type: .structure([]), inferred: true, path: path, rowToRecord: rowToRecord) }
+            if classID == 5 { _ = try nested(col, type: .list(.null), inferred: true, path: path, rowToRecord: rowToRecord) }
+        }
+    }
+
+    /// An explicit `null` field, which pyarrow reads by inferring the column and then converting it to
+    /// null: all-null (or absent) values read as null, a conflict is the inferred column's conflict,
+    /// and any other value fails with `Failed to convert JSON to null from <inferred type>`, the type
+    /// spelled as pyarrow holds it before conversion (numbers and strings as a string dictionary).
+    func explicitNull(_ col: JSONKernels.ColumnSet, classes: Set<Int>, path: String,
+                      rowToRecord: @escaping (Int) -> Int) throws {
+        guard let only = classes.first else { return }
+        if classes.count > 1 {
+            if let first = reportConflict(col, expected: nil, path: path, rowToRecord: rowToRecord) {
+                try nestedBeforeConflict(col, classID: first, explicit: nil, path: path, rowToRecord: rowToRecord)
+            }
+            return
+        }
+        var position = Int.max
+        for r in 0..<col.rows {
+            let e = col.entryIndex(0, r)
+            guard e >= 0 else { continue }
+            let x = col.level.entry(e)
+            if x.kind != .null { position = Int(x.valStart); break }
+        }
+        let from: String
+        switch only {
+        case 1: from = "bool"
+        case 4: from = Self.inferenceSpelling(try nested(col, type: .structure([]), inferred: true, path: path, rowToRecord: rowToRecord))
+        case 5: from = Self.inferenceSpelling(try nested(col, type: .list(.null), inferred: true, path: path, rowToRecord: rowToRecord))
+        default: from = Self.stringDictionary
+        }
+        conversionErrors.append((position, "Failed to convert JSON to null from \(from)"))
+    }
+
+    static let stringDictionary = "dictionary<values=string, indices=int32, ordered=0>"
+
+    /// An inferred column's type as pyarrow spells it before conversion.
+    static func inferenceSpelling(_ a: AnyMetalArray) -> String {
+        switch a {
+        case .null: return "null"
+        case .boolean: return "bool"
+        case .list(let l): return "list<item: \(inferenceSpelling(l.values))>"
+        case .structure(let s):
+            return "struct<\(zip(s.names, s.children).map { "\($0): \(inferenceSpelling($1))" }.joined(separator: ", "))>"
+        default: return stringDictionary
         }
     }
 
@@ -402,7 +473,7 @@ final class JSONColumnBuilder {
                     var p = Int(x.valStart)
                     let negative = host[p] == 0x2D
                     if negative { p += 1 }
-                    let d: Double = host[p] == 0x4E ? .nan : (negative ? -.infinity : .infinity)
+                    let d: Double = host[p] == 0x4E ? (negative ? -Double.nan : .nan) : (negative ? -.infinity : .infinity)
                     vp[j * rows + r] = T.self == Float.self ? Float(d) as! T : d as! T
                 }
             }
@@ -434,7 +505,7 @@ final class JSONColumnBuilder {
             let (s, e) = try JSONKernels.spans(ctx, col, validMask: Self.maskArray)
             let level = try walk(s, e, rows)
             let elements = JSONKernels.ColumnSet(level: level, rowEntry: nil, rows: level.count, cols: 1)
-            let values = try columns(elements, sel: [0], types: [inferred || elementType == .null ? nil : elementType],
+            let values = try columns(elements, sel: [0], types: [inferred ? nil : elementType],
                                      paths: [path + "/[]"],
                                      rowToRecord: { r in rowToRecord(Int(level.entry(r).parent)) })[0]
             return .list(MetalListArray(length: rows, nullCount: v.nulls[0],

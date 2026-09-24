@@ -405,4 +405,108 @@ final class JSONReaderTests: XCTestCase {
         XCTAssertThrowsError(try JSONReader.read(path: empty)) { XCTAssertEqual("\($0)", "Empty JSON file") }
         XCTAssertThrowsError(try JSONReader(path: dir.appendingPathComponent("does-not-exist.jsonl").path))
     }
+
+    /// timestamp[ns] holds 1677-09-21T00:12:43.145224192 to 2262-04-11T23:47:16.854775807; values outside
+    /// fail to convert, as in pyarrow, instead of wrapping around. The whole seconds must scale before
+    /// the fraction is added (Arrow's order), so the last partial second before the minimum fails too.
+    func testTimestampNanosecondRange() throws {
+        try requireRealGPU()
+        let ns = JSONReadOptions(explicitSchema: [JSONField("a", .timestamp(.nano, timezone: nil))])
+        for bad in ["9999-12-31", "1500-01-01", "2262-04-12", "1677-09-21", "2262-04-11T23:47:17",
+                    "2262-04-11T23:47:16.854775808", "1677-09-21T00:12:43", "1677-09-21T00:12:43.145224192",
+                    "2262-04-11T23:00:00-01:00", "1677-09-21T00:12:44+00:01"] {
+            XCTAssertEqual(readError("{\"a\":\"\(bad)\"}\n", ns), "Failed to convert JSON to timestamp[ns], couldn't parse:\(bad)", bad)
+        }
+        let good: [(String, Int64)] = [
+            ("2262-04-11T23:47:16.854775807", Int64.max), ("2262-04-11T23:47:16.854775807Z", Int64.max),
+            ("2262-04-11T23:47:16", 9_223_372_036_000_000_000), ("1677-09-21T00:12:44", -9_223_372_036_000_000_000),
+            ("1677-09-22", -9_223_286_400_000_000_000), ("2262-04-12T00:30:00+01:00", 9_223_371_000_000_000_000),
+            ("1677-09-21T00:12:43.9-00:01", -9_223_371_976_100_000_000),
+        ]
+        let t = try read(good.map { "{\"a\":\"\($0.0)\"}\n" }.joined(), ns)
+        guard case .temporal(let ts)? = t["a"], case .int64(let v) = ts.storage else { return XCTFail("a should be a timestamp") }
+        XCTAssertEqual(v.toArray(), good.map { $0.1 })
+        // The coarser units hold every four-digit year.
+        let us = try read("{\"a\":\"9999-12-31T23:59:59.999999\"}\n{\"a\":\"0000-01-01\"}\n",
+                          JSONReadOptions(explicitSchema: [JSONField("a", .timestamp(.micro, timezone: nil))]))
+        guard case .temporal(let tu)? = us["a"], case .int64(let u) = tu.storage else { return XCTFail("a should be a timestamp") }
+        XCTAssertEqual(u.toArray(), [(days(9999, 12, 31) * 86400 + 86399) * 1_000_000 + 999_999, days(0, 1, 1) * 86400 * 1_000_000])
+    }
+
+    /// A column whose classes conflict is not built, but a conflict inside its objects or arrays earlier in
+    /// the file is what a sequential parser reports.
+    func testNestedConflictBeforeOuterConflict() throws {
+        try requireRealGPU()
+        XCTAssertEqual(readError("{\"a\":[1]}\n{\"a\":[\"x\"]}\n{\"a\":1}\n"),
+                       "JSON parse error: Column(/a/[]) changed from number to string in row 1")
+        XCTAssertEqual(readError("{\"a\":{\"b\":[]}}\n{\"a\":{\"b\":{}}}\n{\"a\":\"x\"}\n"),
+                       "JSON parse error: Column(/a/b) changed from array to object in row 1")
+        XCTAssertEqual(readError("{\"a\":{\"b\":1,\"b\":2}}\n{\"a\":2}\n"), "JSON parse error: Column(/a/b) was specified twice in row 0")
+        // The outer conflict still wins when it comes first.
+        XCTAssertEqual(readError("{\"a\":[1]}\n{\"a\":1}\n{\"a\":[\"x\"]}\n"),
+                       "JSON parse error: Column(/a) changed from array to number in row 1")
+        // Against an explicit type too.
+        let s = JSONReadOptions(explicitSchema: [JSONField("a", .structure([JSONField("b", .int64)]))])
+        XCTAssertEqual(readError("{\"a\":{\"b\":\"x\"}}\n{\"a\":1}\n", s), "JSON parse error: Column(/a/b) changed from number to string in row 0")
+    }
+
+    /// Explicit `null` reads as pyarrow does: all-null values give a null column, anything else fails to
+    /// convert from the type pyarrow inferred, a conflict is the inferred column's conflict.
+    func testExplicitNull() throws {
+        try requireRealGPU()
+        let n = JSONReadOptions(explicitSchema: [JSONField("l", .null)])
+        let t = try read("{\"l\":null}\n{\"x\":1}\n", n)
+        XCTAssertEqual(t.names, ["l", "x"])
+        guard case .null(let z)? = t["l"] else { return XCTFail("l should be null") }
+        XCTAssertEqual(z.length, 2)
+        let dict = "dictionary<values=string, indices=int32, ordered=0>"
+        XCTAssertEqual(readError("{\"l\":null}\n{\"l\":1}\n", n), "Failed to convert JSON to null from \(dict)")
+        XCTAssertEqual(readError("{\"l\":true}\n", n), "Failed to convert JSON to null from bool")
+        XCTAssertEqual(readError("{\"l\":[]}\n", n), "Failed to convert JSON to null from list<item: null>")
+        XCTAssertEqual(readError("{\"l\":{\"m\":[1]}}\n", n), "Failed to convert JSON to null from struct<m: list<item: \(dict)>>")
+        XCTAssertEqual(readError("{\"l\":true}\n{\"l\":2}\n", n), "JSON parse error: Column(/l) changed from boolean to number in row 1")
+        let list = JSONReadOptions(explicitSchema: [JSONField("l", .list(.null))])
+        guard case .list(let l)? = try read("{\"l\":[]}\n{\"l\":[null]}\n{\"l\":null}\n", list)["l"] else { return XCTFail("l should be a list") }
+        XCTAssertEqual(l.nullCount, 1)
+        guard case .null = l.values else { return XCTFail("l's items should be null") }
+        XCTAssertEqual(readError("{\"l\":[1]}\n", list), "Failed to convert JSON to null from \(dict)")
+        let st = JSONReadOptions(explicitSchema: [JSONField("l", .structure([JSONField("m", .null)]))])
+        XCTAssertEqual(readError("{\"l\":{\"m\":1}}\n", st), "Failed to convert JSON to null from \(dict)")
+    }
+
+    /// `-NaN` keeps its sign bit, as pyarrow's parser does.
+    func testNegativeNaNKeepsSign() throws {
+        try requireRealGPU()
+        let t = try read("{\"a\":-NaN,\"b\":NaN}\n")
+        XCTAssertEqual(t["a"]?.asFloat64?.toArray()[0]?.bitPattern, (-Double.nan).bitPattern)
+        XCTAssertEqual(t["b"]?.asFloat64?.toArray()[0]?.bitPattern, Double.nan.bitPattern)
+        XCTAssertEqual((-Double.nan).bitPattern, 0xFFF8_0000_0000_0000)
+        let f = try read("{\"a\":-NaN}\n", JSONReadOptions(explicitSchema: [JSONField("a", .float32)]))
+        guard case .float32(let fa)? = f["a"] else { return XCTFail("a should be float") }
+        XCTAssertEqual(fa.toArray()[0]?.bitPattern, 0xFFC0_0000)
+    }
+
+    /// RapidJSON reads a NUL byte as the end of its input: one where a record would start is an empty
+    /// document; inside a record it is the error of whatever was expected there.
+    func testNULByteWhereARecordStarts() throws {
+        try requireRealGPU()
+        for text in ["{\"a\":1}\0{\"a\":2}", "\0{\"a\":1}", "{\"a\":1}\n\0\n", "{\"a\":1}\n\0"] {
+            XCTAssertEqual(readError(text), "JSON parse error: The document is empty.", text.debugDescription)
+        }
+        XCTAssertEqual(readError("{\"a\":\0}\n"), "JSON parse error: Invalid value. in row 0")
+    }
+
+    /// A key holding `\u0000` keeps its full name, and bytes read through `init(buffer:)` match `init(bytes:)`.
+    func testKeyWithNULAndBufferInput() throws {
+        try requireRealGPU()
+        let text = "{\"a\\u0000b\":1}\n{\"a\\u0000b\":2,\"a\":3}\n"
+        XCTAssertEqual(try read(text).names, ["a\u{0}b", "a"])
+        let bytes = Array(text.utf8)
+        let viaBuffer = try bytes.withUnsafeBytes { try JSONReader(buffer: $0).read() }
+        XCTAssertEqual(viaBuffer.names, ["a\u{0}b", "a"])
+        XCTAssertEqual(viaBuffer["a"]?.asInt64?.toArray(), [nil, 3])
+        XCTAssertThrowsError(try JSONReader(buffer: UnsafeRawBufferPointer(start: nil, count: 0)).read()) {
+            XCTAssertEqual("\($0)", "Empty JSON file")
+        }
+    }
 }
