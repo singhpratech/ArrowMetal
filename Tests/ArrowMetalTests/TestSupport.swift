@@ -19,15 +19,11 @@ private let routerDefaultApplied: Void = {
 }()
 func routerTestDefault() { _ = routerDefaultApplied }
 
-/// XCTest asks every test class for its suite before the first test runs, so this pins the default
-/// for the tests that never call `requireRealGPU()` too.
+/// The pin rides on `requireRealGPU()`, which the GPU test files call in `setUp` or at the top of each
+/// test. A test that runs a routed operation without calling it runs under the process default (`auto`).
 final class RouterTestDefaults: XCTestCase {
-    override class var defaultTestSuite: XCTestSuite {
-        routerTestDefault()
-        return super.defaultTestSuite
-    }
-    func testRouterDefaultForSuites() {
-        routerTestDefault()
+    func testRouterDefaultForSuites() throws {
+        try requireRealGPU()
         XCTAssertEqual(Router.mode, Router.environmentMode ?? .gpu)
     }
 }

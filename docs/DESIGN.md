@@ -362,13 +362,15 @@ completion).
 
 Every public call without a batch pays one command-buffer round trip (above), and on small inputs that
 floor is the whole cost. The router is the answer the engine gives to that: for seven operations it has
-a second implementation, a tight single-threaded CPU loop, and it runs that loop when the measured
-crossover says the CPU is faster for an input of this size. The output is the same Arrow array either
+a second implementation, a tight single-threaded CPU loop, and it runs that loop when its crossover
+table says the CPU is faster for an input of this size (the table and what its CPU side measured are
+below). The output is the same Arrow array either
 way, byte for byte.
 
 **What is routed.** `sum`, `min`, `max` (and `mean`, which is `sum` over the valid count), `compare`
 (scalar and array), `add` / `subtract` / `multiply` (scalar and array), `filter` by a mask and the fused
-`filter(where:)`, and `GroupBy.sum` over integer values with at most `Router.groupBySumMaxKeys` (1,024)
+`filter(where:)`, and `GroupBy.sum` over integer values (and `GroupBy.sumUnsigned`, uint64 kept
+unsigned, which the C ABI and Python use for uint64) with at most `Router.groupBySumMaxKeys` (1,024)
 keys, which is also what `hash_sum` reaches through the dense-key mapping. Every other operation is
 unchanged and always runs its GPU kernel.
 
@@ -420,6 +422,15 @@ under `gpu`, `cpu` and `auto` and says whether `auto` picked the faster path; it
 `Benchmarks/results/router_check_2026-09-23_provisional.csv`, a provisional run taken while other builds
 were using the machine, to be replaced by a quiet rerun.
 
+*What the table's CPU side is.* The committed table comes from the 2026-09-17 sweep, whose CPU side is
+the bench's own single-core loops in `Sources/ArrowMetalBench/main.swift` (`cpu-1core`, and
+`cpu-candidate` for the group-by), measured before `Router/RouterCPU.swift` existed. They are not the
+loops the router runs, and the provisional check above shows the two CPU sides are not the same speed at
+every size, so near a crossover `auto` can pick the slower path. `router_table.py --from-check
+Benchmarks/results/router_check_<date>.csv` fits the same table from a `router_check.py` run, whose CPU
+side is RouterCPU; the table is to be regenerated that way from a quiet run. The generated file's header
+says which of the two it came from, and `--check` regenerates from the source the file names.
+
 **The CPU side** (`Router/RouterCPU.swift`) is one generic loop per shape, over the Arrow layout:
 *reduce* (a branch-free fold where a null slot feeds the operation's identity), *map* (arithmetic, every
 slot including those under nulls, as the GPU computes them), *map-to-bitmap* (compare, 32 bits per
@@ -460,7 +471,7 @@ the C functions above; no operation signature changed.
 **What the router does not do.** It does not remove the floor, and it does not touch the operations
 whose cost is not the floor (memory-bound single passes, software binary64 transcendentals, host regex,
 views, temporal extraction: [TO_IMPROVE.md](TO_IMPROVE.md)). It chooses between ArrowMetal's own two
-paths, never a CPU library. Strings are not routed: the string rows lose to a 12-core Acero, and a
+paths, never a CPU library. Strings are not routed: the string rows are behind a 12-core Acero, and a
 single-threaded loop would not change that.
 
 ## Top-k and order statistics: GPU radix select

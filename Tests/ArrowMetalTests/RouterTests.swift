@@ -252,6 +252,31 @@ final class RouterTests: XCTestCase {
         }
     }
 
+    /// `GroupBy.sumUnsigned` (uint64 values kept unsigned: C op 0 over uint64, Python's `sum` on a
+    /// uint64 column) is routed like `sum`, byte-identical on both paths.
+    func testGroupBySumUnsignedBothPathsIdentical() throws {
+        for n in [0, 1, 65, 1000, 100_003] {
+            for kcount in [1, 7, 1024] {
+                var g = RouterRNG(UInt64(n * 53 + kcount))
+                var keys: [Int32?] = [], vals: [UInt64?] = []
+                for _ in 0..<n {
+                    let r = Int.random(in: 0..<100, using: &g)
+                    keys.append(r < 5 ? nil : Int32(r < 8 ? kcount + r : Int.random(in: 0..<kcount, using: &g)))
+                    vals.append(Int.random(in: 0..<10, using: &g) == 0 ? nil : UInt64.random(in: .min ... .max, using: &g))
+                }
+                let gb = try MetalArray<Int32>(keys).groupBy(keyCount: kcount)
+                let vc = try MetalArray<UInt64>(vals)
+                let r = try both(.groupBySum) { try gb.sumUnsigned(vc) }
+                assertArrowIdentical(r.gpu, r.cpu, "group-by sumUnsigned keys=\(kcount) n=\(n)")
+                // Same bits as the signed sum's CPU loop.
+                let signed = try Router.withMode(.cpu) { try gb.sum(vc) }
+                withExtendedLifetime((signed, r.cpu)) {
+                    XCTAssertEqual(memcmp(signed.values.contents, r.cpu.values.contents, kcount * 8), 0)
+                }
+            }
+        }
+    }
+
     func testGroupBySumAboveLimitStaysOnGPU() throws {
         let keys = try MetalArray<Int32>((0..<100).map { Int32($0 % 2000) })
         let vals = try MetalArray<Int64>((0..<100).map { Int64($0) })

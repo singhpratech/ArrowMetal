@@ -54,10 +54,13 @@ exercises the host paths only; the numbers above are from a physical Mac.
 
 **The router and the suites.** The CPU/GPU router ([DESIGN.md](DESIGN.md#cpugpu-router)) sends small
 inputs of seven operations to a CPU loop under its default `auto` mode, and the suites are full of small
-inputs. So both harnesses pin the router to the GPU and keep exercising the kernels: Swift's
-`TestSupport.swift` (from `requireRealGPU()` and from the suite list XCTest builds) and Python's
-`python/tests/conftest.py` set the process mode to `gpu`. `ARROWMETAL_ROUTER`, when set, wins over that
-pin, so the same suites run every routed operation through its CPU loop with
+inputs. So three harnesses pin the router to the GPU and keep exercising the kernels: Swift's
+`TestSupport.swift` sets the process mode to `gpu` from `requireRealGPU()`, which the GPU test files call
+(a test that runs a routed operation without calling it runs under `auto`); Python's
+`python/tests/conftest.py` sets it for every pytest run; and `python/tests/differential_report.py`, a
+plain script that pytest's conftest does not reach, sets it itself, and prints the mode in its header.
+`ARROWMETAL_ROUTER`, when set, wins over each pin, so the same suites run every routed operation through
+its CPU loop with
 
 ```
 ARROWMETAL_ROUTER=cpu swift test -c release
@@ -68,6 +71,14 @@ ARROWMETAL_ROUTER=cpu PYTHONPATH=python python python/tests/differential_report.
 and a green run there means the CPU loops give the answers the GPU tests expect. The router's own
 suites (`RouterTests`, `test_router.py`) choose the path per call and run `gpu`, `cpu` and `auto`
 regardless of either setting.
+
+The other bindings' suites are not pinned: the Go tests (`go/arrowmetal/*_test.go`), the Rust crate's
+tests (`rust/arrowmetal/tests`), the R package's testthat suite and the Node tests (`node/test`) call the
+C ABI in their own processes under the process default `auto`, so a routed operation they run on an
+input below its crossover runs the CPU loop. Run them with `ARROWMETAL_ROUTER=gpu` to exercise the GPU
+kernels, and with `ARROWMETAL_ROUTER=cpu` for the CPU loops. The Polars plugin and the DuckDB extension
+are tested from pytest (`test_polars.py`, `test_duckdb.py`); outside it they, too, run under `auto`
+unless `ARROWMETAL_ROUTER` says otherwise.
 
 ## 1. Swift suites
 
@@ -90,7 +101,7 @@ a sliced input at offsets 1, 7, 31, 32, 33, 63 and 64 against the same rows buil
 | Expression compiler and engine | ExprTests, ExprLiteralTypeTests, EngineTests, JoinTests | fused expressions against the unfused kernels, literal promotion, every optimizer rule against the unoptimized plan, six join kinds and as-of against a dictionary oracle |
 | Parquet | ParquetTests, ParquetWriterTests | pyarrow-written fixtures across encodings and compressions, damaged files that must error rather than trap |
 | Streaming | StreamTests | every streaming operator against the in-memory answer at 1–120 batches with ragged and empty batches, HyperLogLog within 3σ, external sort over 120 runs, grace join against the in-memory join |
-| CPU/GPU router | RouterTests | both paths of every routed operation byte-identical (values including slots under nulls, validity bits, null count, buffer size) on all ten primitives, sizes across word and threadgroup boundaries, 0/10/90% nulls, slices at offset 7, signed zeros, infinities, quiet and signaling NaNs with payloads, subnormals; float sums bit-identical past one block per GPU thread; group-by sum with null and out-of-range keys; the CPU loops against `CPUReference`; the decision rules (table, batch, pending input, no CPU path, modes, per-thread override) |
+| CPU/GPU router | RouterTests | both paths of every routed operation byte-identical (values including slots under nulls, validity bits, null count, buffer size) on all ten primitives, sizes across word and threadgroup boundaries, 0/10/90% nulls, slices at offset 7, signed zeros, infinities, quiet and signaling NaNs with payloads, subnormals; float sums bit-identical past one block per GPU thread; group-by sum (and `sumUnsigned`) with null and out-of-range keys; the CPU loops against `CPUReference`; the decision rules (table, batch, pending input, no CPU path, modes, per-thread override) |
 | Adversarial pins | AdversarialKernelTests, AdversarialKernelTests2, AdversarialGroupSliceTests | the probes the review pass ran that came back clean, kept so they stay clean: 100–200 repeat determinism loops, boundary lengths, slice-of-slice, group-by with one group and with one group per row, threadgroup-size invariants |
 
 ## 2. Python suites
@@ -110,7 +121,7 @@ pytest *collects*, which is larger because a parametrised function collects once
 | `test_duckdb.py` | 38 | the bridge against DuckDB SQL; the 11 extension tests run when `duckdb-extension/build.sh` has produced the extension, and one test compiles the public C header as C |
 | `test_pandas.py` | 72 | the accessor and accel mode against plain pandas across five null-carrying dtype flavours; `install()`/`uninstall()` restore every patched slot |
 | `test_numpy.py` | 6 | the numpy bridge: which dtypes cross without a copy, NaN as a value, and float64 arithmetic against numpy bit for bit ([NUMPY.md](NUMPY.md)) |
-| `test_router.py` | 8 | both router paths byte-identical through the ctypes API and equal to `pyarrow.compute` (and to pyarrow's `hash_sum` for the group-by), `am.last_route()` and its reasons, `am.router()` / `am.set_router()`, `ARROWMETAL_ROUTER` in a subprocess, and `Benchmarks/router_table.py --check` against the committed table |
+| `test_router.py` | 12 | both router paths byte-identical through the ctypes API and equal to `pyarrow.compute` (and to pyarrow's `hash_sum` for the group-by, signed and uint64), `am.last_route()` and its reasons, `am.router()` / `am.set_router()`, `ARROWMETAL_ROUTER` in a subprocess, `differential_report.py`'s GPU pin, `Benchmarks/router_table.py --check` against the committed table, the table's header naming which CPU loops it measured, and `--from-check` fitting a table inside the brackets of a `router_check.py` run |
 | `test_differential.py` (standalone part) | 95 plus 17 documented xfails | one test per finding and per fixed finding, plus the guards that every public operation and every module-level function has a matrix case |
 
 ## 3. The differential matrix

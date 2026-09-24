@@ -47,6 +47,7 @@ public struct GroupBy<K: ArrowIndex> {
     /// Sum of unsigned 64-bit values per key, kept unsigned (Arrow's hash_sum over uint64 is uint64).
     public func sumUnsigned(_ values: MetalArray<UInt64>) throws -> MetalArray<UInt64> {
         try check(values)
+        if Router.decideGroupBySum(keys: keys, values: values, keyCount: keyCount).isCPU { return try RouterCPU.groupBySumUnsigned(keys: keys, keyCount: keyCount, values: values) }
         let (out, counts) = try run(values: values, kind: 1)
         let res = try MetalArray<UInt64>.allocate(length: keyCount, withValidity: true, context: values.context)
         withExtendedLifetime((out, counts)) {

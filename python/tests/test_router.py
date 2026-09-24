@@ -202,3 +202,84 @@ def test_table_matches_the_results_file():
     table = dict(re.findall(r"case \.(\w+): return (\d+)", body))
     names = {"groupBySum": "group_by_sum"}
     assert {names.get(k, k): int(v) for k, v in table.items()} == am.router_crossovers()
+
+
+@pytest.mark.parametrize("value", [None, "cpu"])
+def test_differential_report_pins_the_gpu(value):
+    """differential_report.py is a plain script, so conftest.py's pin does not reach it; it pins the
+    GPU itself (its datasets are below every crossover) and ARROWMETAL_ROUTER still wins."""
+    env = {k: v for k, v in os.environ.items() if k != "ARROWMETAL_ROUTER"}
+    env["PYTHONPATH"] = os.path.join(ROOT, "python")
+    if value:
+        env["ARROWMETAL_ROUTER"] = value
+    tests = os.path.join(ROOT, "python", "tests")
+    code = ("import sys; sys.path.insert(0, %r); import differential_report, arrowmetal as am; "
+            "print(am.get_router())" % tests)
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True)
+    assert out.stdout.strip().splitlines()[-1] == (value or "gpu")
+
+
+def test_group_by_sum_uint64_is_routed():
+    """uint64 values reach GroupBy.sumUnsigned through the C ABI; it is routed like the signed sum."""
+    for n in (0, 1, 65, 1000, 100_003):
+        rng = np.random.default_rng(n + 5)
+        keys = pa.array(rng.integers(0, 100, n, dtype=np.int32), mask=rng.random(n) < 0.05)
+        vals = column(pa.uint64(), n, 0.1, n + 11)
+        k, v = am.array(keys), am.array(vals)
+        gb = am.GroupBy(k, 100)
+        am.clear_last_route()
+        g, c = on("gpu", lambda: gb.sum(v)), on("cpu", lambda: gb.sum(v))
+        same(g, c)
+        assert am.last_route().op == "group_by_sum"
+        assert c.to_arrow().type == pa.uint64()
+        t = pa.table({"k": keys, "v": vals}).group_by("k").aggregate([("v", "sum")])
+        expected = [None] * 100
+        for key, s in zip(t["k"].to_pylist(), t["v_sum"].to_pylist()):
+            if key is not None:
+                expected[key] = s
+        assert c.to_arrow().to_pylist() == expected
+
+
+def test_table_says_what_its_cpu_side_measured():
+    """The committed table names its source and, in its header, which CPU loops that source timed:
+    the 2026-09-17 bench's own loops for the JSON, the shipped RouterCPU loops for a router_check CSV."""
+    src = open(os.path.join(ROOT, "Sources", "ArrowMetal", "Router", "RouterTable.swift")).read()
+    source = re.search(r'static let source = "([^"]+)"', src).group(1)
+    header = src.split("enum RouterTable", 1)[0]
+    if source.endswith(".json"):
+        assert "Sources/ArrowMetalBench/main.swift" in header and "`cpu-1core`" in header
+        assert "not the RouterCPU loops the router" in header
+        assert "--from-check" in header
+    else:
+        assert "shipped RouterCPU loops" in header
+
+
+def test_table_from_router_check(tmp_path):
+    """`router_table.py --from-check` fits the table from a router_check.py run (CPU side: RouterCPU):
+    every crossover lies inside the bracket that file measured."""
+    import csv
+    check = os.path.join(ROOT, "Benchmarks", "results", "router_check_2026-09-23_provisional.csv")
+    out = tmp_path / "RouterTable.swift"
+    subprocess.run([sys.executable, os.path.join(ROOT, "Benchmarks", "router_table.py"),
+                    "--from-check", check, "--out", str(out)], check=True, capture_output=True)
+    text = out.read_text()
+    assert "shipped RouterCPU loops" in text
+    assert 'static let source = "Benchmarks/results/router_check_2026-09-23_provisional.csv"' in text
+
+    def table(name):
+        body = text.split(f"static func {name}", 1)[1].split("static func", 1)[0]
+        return {k: int(v) for k, v in re.findall(r"case \.(\w+): return (\d+)", body)}
+    cross, step, low = table("crossoverRows"), table("measuredStepRows"), table("bracketLowRows")
+    labels = {"sum": "sum(int64)", "min": "min(int64)", "max": "max(int64)", "compare": "compare(int64 > 0)",
+              "arithmetic": "add(int64, 1)", "filter": "filter(int64, mask)",
+              "groupBySum": "group-by sum (1000 keys)"}
+    with open(check) as fh:
+        rows = list(csv.DictReader(line for line in fh if not line.startswith("#")))
+    for case, label in labels.items():
+        timings = {int(r["rows"]): (float(r["gpu_us"]), float(r["cpu_us"])) for r in rows if r["op"] == label}
+        assert low[case] < cross[case] <= step[case], case
+        assert timings[low[case]][0] > timings[low[case]][1], case          # CPU ahead at the bracket's low end
+        assert all(g <= c for n, (g, c) in timings.items() if n >= step[case]), case
+    # --check follows the source the table names.
+    subprocess.run([sys.executable, os.path.join(ROOT, "Benchmarks", "router_table.py"), "--check",
+                    "--out", str(out)], check=True, capture_output=True)

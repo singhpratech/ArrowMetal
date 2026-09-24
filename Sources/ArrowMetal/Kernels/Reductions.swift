@@ -17,7 +17,8 @@ extension MetalArray {
 
     /// Sum of non-null values. Returns nil when there are no valid values (Arrow semantics).
     /// Integer sums are exact (Int64/UInt64 accumulation, wrapping on overflow like Arrow's `sum`).
-    /// Float32 sums accumulate per-thread in float and finalise in double.
+    /// Float32 values are widened exactly to binary64 (`d_from_float`) and accumulated with the software
+    /// binary64 adder (`d_add`) on the GPU, as Float64 is; the host adds the threadgroup partials in order.
     public func sum() throws -> SumResult? {
         if Router.decide(.sum, self).isCPU { return RouterCPU.sum(self) }
         if !pending && validCount == 0 { return nil }

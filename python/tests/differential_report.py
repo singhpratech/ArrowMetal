@@ -25,6 +25,13 @@ import pyarrow as pa                                                  # noqa: E4
 import arrowmetal as am                                               # noqa: E402
 import test_differential as diff                                      # noqa: E402
 
+# The matrix's datasets are small enough (100,003 rows at most without DIFF_LARGE) that the router's
+# `auto` mode would send every routed integer operation to its CPU loop. This script is not run by
+# pytest, so conftest.py's pin does not reach it: pin the GPU here too. ARROWMETAL_ROUTER, when set,
+# wins, which is how the same matrix runs the CPU loops. See docs/TESTING.md.
+if "ARROWMETAL_ROUTER" not in os.environ:
+    am.set_router("gpu")
+
 
 class Cell:
     __slots__ = ("passed", "failed", "skipped", "first_failure", "skip_reason", "findings", "new")
@@ -94,7 +101,7 @@ def render(cells, ops, types, total, elapsed):
     add = lines.append
 
     add("ArrowMetal vs pyarrow.compute -- differential matrix")
-    add(f"arrowmetal {am.__version__} on {am.device_name()} | pyarrow {pa.__version__}")
+    add(f"arrowmetal {am.__version__} on {am.device_name()} | pyarrow {pa.__version__} | router {am.get_router()}")
     add(f"{len(diff.OPS)} operations x {len(diff.MATRIX_TYPES)} column types x "
         f"{len(diff.SHAPES)} datasets: sizes "
         f"{', '.join(str(s) for s in diff.sizes())}; null ratios "

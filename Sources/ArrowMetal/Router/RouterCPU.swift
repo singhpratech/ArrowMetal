@@ -518,6 +518,15 @@ enum RouterCPU {
         keyCount > Router.groupBySumMaxKeys ? "more than \(Router.groupBySumMaxKeys) keys" : nil
     }
 
+    /// `GroupBy.sumUnsigned`: the same loop, kept unsigned. A wrapping 64-bit sum has the same bits
+    /// in Int64 and UInt64, and the buffers are the ones `sumUnsigned` allocates (`keyCount` words and a
+    /// `keyCount`-bit validity bitmap), so the result is the GPU's byte for byte.
+    static func groupBySumUnsigned<K: ArrowIndex>(keys: MetalArray<K>, keyCount: Int,
+                                                  values: MetalArray<UInt64>) throws -> MetalArray<UInt64> {
+        let r = try groupBySum(keys: keys, keyCount: keyCount, values: values)
+        return MetalArray<UInt64>(length: keyCount, nullCount: r.nullCount, validity: r.validity, values: r.values, context: r.context)
+    }
+
     /// `GroupBy.sum` over integer values: one pass, a `keyCount`-slot table of wrapping 64-bit sums and
     /// counts. Null keys, keys outside `0 ..< keyCount` and null values are skipped; a key that counted
     /// nothing is null with a 0 in its slot — the GPU accumulate + finalize result.

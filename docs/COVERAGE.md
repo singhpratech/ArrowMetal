@@ -126,7 +126,7 @@ The long form is at the bottom of this file.
 | **Planned** | Not implemented; a [ROADMAP](ROADMAP.md) item covers it (linked in the note). |
 
 A note that starts with *Routed* marks a row whose operation also has a single-threaded CPU loop with
-byte-identical Arrow output, which the CPU/GPU router runs below the measured crossover
+byte-identical Arrow output, which the CPU/GPU router runs below its crossover table's row count
 ([DESIGN.md](DESIGN.md#cpugpu-router)). The status still names the GPU kernel: it runs at and above the
 crossover, inside a batch, for the types the loop does not cover, and always under `ARROWMETAL_ROUTER=gpu`.
 
@@ -138,7 +138,7 @@ Counts in the summary are counts of **rows**. A row covers one Arrow function un
 
 | Arrow function | Status | Notes |
 |---|---|---|
-| `sum` | **GPU** | *Routed* (all ten primitives). `Kernels/Reductions.swift`. Threadgroup partials, host finalise, no atomics. Integers accumulate in Int64/UInt64 and wrap; Float32 accumulates per thread in `float` and finalises in `double`, so the last ulp can differ from a strictly sequential double sum; Float64 uses a software IEEE-754 binary64 adder on the GPU (`Kernels/DoubleMath.swift`). Returns nil when there is no valid value, matching Arrow. |
+| `sum` | **GPU** | *Routed* (all ten primitives). `Kernels/Reductions.swift`. Threadgroup partials, host finalise, no atomics. Integers accumulate in Int64/UInt64 and wrap; Float32 values are widened exactly to binary64 and, like Float64, accumulated with the software IEEE-754 binary64 adder on the GPU (`Kernels/DoubleMath.swift`); the host adds the threadgroup partials in order. The summation order is the kernel's tree, so the last ulp can differ from a strictly sequential double sum. Returns nil when there is no valid value, matching Arrow. |
 | `product` | **GPU** | `Kernels/Aggregates.swift`, the same threadgroup-partial shape as `sum`. Integers accumulate in Int64/UInt64 and wrap, as Arrow's does; Float32 accumulates in `float` per thread and combines in `double`, so thousands of factors reassociate (about 1e-5 relative); Float64 multiplies through the software binary64 routine on the GPU. Nil when there is no valid value. `product()` in Swift, `am_reduce_ex` op 0 in C, `product()` in Python. |
 | `mean` | **GPU** | *Routed* (all ten primitives). GPU sum divided by the valid count on the host (`Reductions.swift`). |
 | `min` | **GPU** | *Routed* (integers and float64; float32 stays on the GPU). NaN is skipped; all-NaN returns null, matching Arrow's `min_max`. Float64 reduces on order-preserving 64-bit keys. |
@@ -179,7 +179,7 @@ exactly what the atomic path could not: Float64 sums and means (through the soft
 
 | Arrow function | Status | Notes |
 |---|---|---|
-| `hash_sum` | **GPU** | *Routed* for integer values when there are 1,024 groups or fewer. All value types, and now **any key type**: `GroupByKeys` (`Kernels/GroupByKeys.swift`) maps arbitrary keys to dense ids first. Integers go through the atomic `sum`; Float32 through `sumFloat` (Float32 accumulation, host finalise) or `sumFloatAsDouble` (Float64 accumulation, GPU); Float64 through `sumDouble`, which adds with the software binary64 adder on the GPU. `am_group_agg_ex` op 0 in C, `group_by([...]).sum()` in Python. |
+| `hash_sum` | **GPU** | *Routed* for integer values (uint64 through `sumUnsigned` too) when there are 1,024 groups or fewer. All value types, and now **any key type**: `GroupByKeys` (`Kernels/GroupByKeys.swift`) maps arbitrary keys to dense ids first. Integers go through the atomic `sum`; Float32 through `sumFloat` (Float32 accumulation, host finalise) or `sumFloatAsDouble` (Float64 accumulation, GPU); Float64 through `sumDouble`, which adds with the software binary64 adder on the GPU. `am_group_agg_ex` op 0 in C, `group_by([...]).sum()` in Python. |
 | `hash_mean` | **GPU** | Any key type. Integer values through `mean` (GPU sum + GPU count, host division); Float32 and Float64 through `meanFloat` / `meanDouble`, which sum and divide entirely on the GPU. `am_group_agg_ex` op 3. |
 | `hash_min` | **GPU** | Any key type, all ten primitive value types. 32-bit and narrower use the atomic `min`; Int64, UInt64 and Float64 use `min64` on the segmented path, since MSL has no 64-bit atomic min/max. `min64` forwards narrower types to `min`, so it is safe to call for any type — as is the fused `minMax`, which covers every width in one kernel. `am_group_agg_ex` op 4. |
 | `hash_max` | **GPU** | As `hash_min` (`max` / `max64`). `am_group_agg_ex` op 5. |

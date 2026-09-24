@@ -24,15 +24,20 @@ Core
 - Arrow C Data Interface and C Device Data Interface (ARROW_DEVICE_METAL) import and export.
 - CPU/GPU router: `sum`, `min`, `max`, `compare`, `add`/`subtract`/`multiply`, `filter` (by mask and
   fused `filter(where:)`) and the group-by sum over at most 1,024 keys run a single-threaded CPU loop
-  below the measured crossover and the GPU kernel at or above it, with byte-identical Arrow output on
-  both paths (float sums reproduce the GPU's summation order bit for bit). The crossover table is
-  generated from `Benchmarks/results/router_2026-09-17.json` by `Benchmarks/router_table.py`; a batch
+  below the crossover table's row count and the GPU kernel at or above it, with byte-identical Arrow
+  output on both paths (float sums reproduce the GPU's summation order bit for bit). The crossover table
+  is generated from `Benchmarks/results/router_2026-09-17.json` by `Benchmarks/router_table.py`, whose
+  CPU side is the bench's single-core loops rather than the router's own; `router_table.py --from-check`
+  fits it from a `Benchmarks/router_check.py` run of the shipped loops instead. The group-by sum is
+  routed for uint64 values kept unsigned (`GroupBy.sumUnsigned`) as well. A batch
   always keeps the GPU, and so does `auto` for float columns and `multiply`, which have no measured
   crossover yet. `Benchmarks/router_check.py` times each routed operation under gpu, cpu and auto. `ARROWMETAL_ROUTER=auto|gpu|cpu`, `Router.mode` / `Router.withMode` in Swift,
   `am_router_*` in C, and `am.set_router`, `with am.router(...)`, `am.last_route()` in Python
   (docs/DESIGN.md, "CPU/GPU router").
-- The Swift and Python test harnesses pin the router to the GPU unless `ARROWMETAL_ROUTER` is set, so
-  the suites keep exercising the kernels and `ARROWMETAL_ROUTER=cpu` runs them over the CPU loops.
+- The Swift and Python test harnesses and `python/tests/differential_report.py` pin the router to the
+  GPU unless `ARROWMETAL_ROUTER` is set, so the suites keep exercising the kernels and
+  `ARROWMETAL_ROUTER=cpu` runs them over the CPU loops; the other bindings' suites run under `auto`
+  (docs/TESTING.md).
 
 Strings and sorting
 - `MetalStringArray` (utf8): byte/char length, equals/starts_with/ends_with/contains, MurmurHash3, GPU filter/take,
