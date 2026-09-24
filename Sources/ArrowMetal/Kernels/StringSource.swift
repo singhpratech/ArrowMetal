@@ -95,7 +95,10 @@ enum StringSource {
         if (i >= *nPtr) return;
         int s = src[i];
         if (s < 0) return;
-        int from = srcOffsets[s], len = srcOffsets[s + 1] - from, to = outOffsets[i];
+        // The output slot's own width, not the source row's: a null source row keeps whatever bytes it
+        // held (valid Arrow) but was given length 0, so copying its source bytes would write them over
+        // the next row's slot.
+        int to = outOffsets[i], len = outOffsets[i + 1] - to, from = srcOffsets[s];
         for (int k = 0; k < len; k++) outData[to + k] = srcData[from + k];
     }
     // Exclusive scan of int32 lengths into offsets (n+1), two-level: per-block scan + block totals.

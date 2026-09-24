@@ -680,4 +680,89 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(i64col(opt, "q"), i64col(raw, "q"))
         XCTAssertEqual(i32col(opt, "r"), i32col(raw, "r"))
     }
+
+    // MARK: - findings from the Polars engine lane's differential suite
+
+    /// A null utf8 slot may keep the bytes it held (valid Arrow: a null slot's contents are
+    /// unspecified; Polars exports them). A gather gives it length 0 in the output, so its bytes must
+    /// not be copied: they used to land on the next kept row ("xanana" for "banana").
+    func testStringGatherIgnoresBytesUnderANullSlot() throws {
+        try requireRealGPU()
+        func withBytesUnderNulls() throws -> MetalStringArray {
+            let off = try MetalArrowBuffer.allocate(byteCount: 16)
+            let o = off.mutableTyped(Int32.self)
+            for (i, v) in [0, 1, 7, 13].enumerated() { o[i] = Int32(v) }
+            let text = Array("xcherrybanana".utf8)
+            let dat = try MetalArrowBuffer.allocate(byteCount: text.count)
+            for (i, b) in text.enumerated() { dat.mutableTyped(UInt8.self)[i] = b }
+            let bm = try MetalArrowBuffer.allocate(byteCount: 1)
+            bm.mutableTyped(UInt8.self)[0] = 0b110
+            return MetalStringArray(length: 3, nullCount: 1, validity: bm, offsets: off, data: dat)
+        }
+        let a = try withBytesUnderNulls()
+        XCTAssertEqual(try a.filter(try MetalBooleanArray([true, false, true])).toArray(), [nil, "banana"])
+        XCTAssertEqual(try a.take(try MetalArray<Int32>([0, 2, 0, 1])).toArray(), [nil, "banana", nil, "cherry"])
+        // Through the plan's filter as well.
+        let b = try MetalRecordBatch(names: ["s", "k"], columns: [.string(a), try ints([1, 0, 1])])
+        XCTAssertEqual(strcol(try frame(b).filter(col("k") > 0).collect(), "s"), [nil, "banana"])
+    }
+
+    /// A Boolean column carried through the plan's sort keeps its null count. The sort gathers it with
+    /// `take`, whose null count the open batch computes only at the flush; the Boolean repack copied the
+    /// count before that and reported 0 over a bitmap with nulls.
+    func testBooleanThroughSortKeepsItsNullCount() throws {
+        try requireRealGPU()
+        let n = 33
+        let flags: [Bool?] = (0..<n).map { $0 % 3 == 0 ? nil : $0 % 2 == 0 }
+        let bm = try MetalArrowBuffer.allocate(byteCount: 8), vb = try MetalArrowBuffer.allocate(byteCount: 8)
+        for (i, f) in flags.enumerated() {
+            if f != nil { Bitmap.set(bm.mutableTyped(UInt8.self), i) }
+            if f == true { Bitmap.set(vb.mutableTyped(UInt8.self), i) }
+        }
+        let g = MetalBooleanArray(length: n, nullCount: 11, validity: bm, values: vb)
+        let b = try MetalRecordBatch(names: ["a", "g"],
+                                     columns: [try ints((0..<n).map { Int32(n - 1 - $0) }), .boolean(g)])
+        let out = try frame(b).sort("a").collect()
+        guard case .boolean(let s)? = out["g"] else { return XCTFail("g is not boolean") }
+        XCTAssertEqual(s.nullCount, 11)
+        XCTAssertEqual(s.toArray(), Array(flags.reversed()))
+
+        // The same hand-off for a numeric element-wise result: of a `take` (count due at the flush)
+        // and of a `filter` (length and count due at the flush).
+        let v = try MetalArray<Int32>((0..<n).map { $0 % 4 == 0 ? nil : Int32($0) })
+        let (taken, filtered) = try MetalContext.shared.batch {
+            (try v.take(try MetalArray<Int32>((0..<n).map { Int32($0) })).cast(to: Int64.self),
+             try v.filter(try MetalBooleanArray((0..<n).map { $0 % 2 == 0 })).cast(to: Int64.self))
+        }
+        XCTAssertEqual(taken.nullCount, 9)
+        XCTAssertEqual(filtered.nullCount, 9)
+        XCTAssertEqual(filtered.length, 17)
+    }
+
+    /// A filter over a batch that carries a date32 column it never reads. The expression compiler
+    /// bound every column of the batch as a kernel input and refused the date32 one.
+    func testFilterCarriesAColumnTheCompilerDoesNotRead() throws {
+        try requireRealGPU()
+        let days = try MetalTemporalArray(type: .date32, (0..<10).map { Int64($0) })
+        let b = try MetalRecordBatch(names: ["t", "a"],
+                                     columns: [.temporal(days), try longs((-5..<5).map { Int64($0) })])
+        let out = try frame(b).filter(col("a") > 0).collect()
+        XCTAssertEqual(out.length, 4)
+        XCTAssertEqual(out["t"]?.asTemporal?.toArray(), [6, 7, 8, 9])
+        XCTAssertEqual(i64col(out, "a"), [1, 2, 3, 4])
+    }
+
+    /// A utf8 sort with a null and a row of 8+ bytes (two prefix chunks) inside a batch. The null
+    /// partition read the index array on the CPU before the GPU had written it.
+    func testStringSortWithANullAndALongRowInABatch() throws {
+        try requireRealGPU()
+        let xs: [String?] = ["b", "a", nil, "c", "ab", "xxxxxxxx"]
+        let b = try MetalRecordBatch(names: ["s"], columns: [try strs(xs)])
+        XCTAssertEqual(strcol(try frame(b).sort("s").collect(), "s"), ["a", "ab", "b", "c", "xxxxxxxx", nil])
+        XCTAssertEqual(strcol(try frame(b).sort("s", descending: true).collect(), "s"),
+                       ["xxxxxxxx", "c", "b", "ab", "a", nil])
+        let a = try MetalStringArray(xs)
+        let sorted = try MetalContext.shared.batch { try a.sorted() }
+        XCTAssertEqual(sorted.toArray(), ["a", "ab", "b", "c", "xxxxxxxx", nil])
+    }
 }

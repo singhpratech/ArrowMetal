@@ -96,6 +96,10 @@ extension MetalStringArray {
                                placement: NullPlacement,
                                context: MetalContext) throws -> MetalArray<Int32> {
         let n = idx.length
+        // The partition reads the indices on the CPU. Inside a batch they may still be unwritten: with
+        // two or more prefix chunks `idx` is a `take` of the passes, whose length is known up front, so
+        // nothing marks it pending and `valuePointer` would not wait for it.
+        try context.syncPoint()
         let out = try MetalArrowBuffer.allocate(byteCount: n * 4, zeroed: false, context: context)
         return try withExtendedLifetime((idx, validity, out)) { () -> MetalArray<Int32> in
             let bm = validity.typed(UInt8.self)

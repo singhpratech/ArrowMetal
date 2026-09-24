@@ -665,3 +665,50 @@ def test_python_path_costs_almost_nothing_over_the_resident_path():
     approx(rows(collect(table)), rows(collect(resident)))
     gpu, python = best(resident), best(table)
     assert python < gpu + 3.0, f"python path {python:.2f} ms vs resident path {gpu:.2f} ms"
+
+
+
+# --------------------------------------------------------------------------------------------------
+# findings from the Polars engine lane's differential suite (each once worked around there)
+
+
+def test_string_filter_ignores_bytes_under_a_null_slot():
+    """A null string slot may keep bytes (valid Arrow; Polars exports them). The gather used to copy
+    them over the next kept row: 'xanana' for 'banana'."""
+    import numpy as np
+    offsets = pa.py_buffer(np.array([0, 1, 7, 13], dtype=np.int64).tobytes())
+    validity = pa.py_buffer(bytes([0b110]))
+    s = pa.LargeStringArray.from_buffers(3, offsets, pa.py_buffer(b"xcherrybanana"), validity,
+                                         null_count=1)
+    got = am.MetalArray.from_arrow(s).filter(am.MetalArray.from_arrow(pa.array([True, False, True])))
+    assert got.to_arrow().to_pylist() == [None, "banana"]
+    t = pa.table({"s": s, "k": pa.array([1, 0, 1], pa.int64())})
+    assert am.scan(t).filter(am.col("k") > 0).collect().column("s").to_pylist() == [None, "banana"]
+
+
+def test_boolean_through_sort_keeps_its_null_count():
+    """The sort gathers a Boolean column with `take`, whose null count the batch computes at the
+    flush; the Boolean repack used to copy the count before that and report 0."""
+    g = pa.array([None if i % 3 == 0 else i % 2 == 0 for i in range(33)], pa.bool_())
+    t = pa.table({"a": pa.array(list(range(32, -1, -1)), pa.int32()), "g": g})
+    out = am.scan(t).sort("a").collect().column("g")
+    assert out.null_count == g.null_count == 11
+    assert out.to_pylist() == g.to_pylist()[::-1]
+
+
+def test_filter_carries_a_date32_column():
+    """The expression compiler used to bind every column of the batch, and refused the date32 one the
+    filter only carries."""
+    t = pa.table({"t": pa.array(range(10), pa.date32()), "a": pa.array(range(-5, 5), pa.int64())})
+    out = am.scan(t).filter(am.col("a") > 0).collect()
+    assert out.equals(t.filter(pc.greater(t["a"], 0)))
+
+
+def test_string_sort_with_a_null_and_a_long_row():
+    """A row of 8+ bytes takes two prefix passes; the null partition used to read the index array on
+    the CPU before the batch had written it."""
+    t = pa.table({"s": pa.array(["b", "a", None, "c", "ab", "xxxxxxxx"], pa.large_string())})
+    assert am.scan(t).sort("s").collect().column("s").to_pylist() == \
+        ["a", "ab", "b", "c", "xxxxxxxx", None]
+    assert am.scan(t).sort("s", descending=True).collect().column("s").to_pylist() == \
+        ["xxxxxxxx", "c", "b", "ab", "a", None]
