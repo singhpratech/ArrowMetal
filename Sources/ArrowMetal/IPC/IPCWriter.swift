@@ -192,7 +192,8 @@ public enum ArrowIPCWriter {
             })
         }()
         // An explicit schema may name a dictionary column without giving it an id; the column index does.
-        let resolved = ArrowIPCSchema(fields: schema.fields.enumerated().map { i, field in
+        // A view type (a schema taken from a reader, say) is written as its classic counterpart.
+        let resolved = ArrowIPCSchema(fields: schema.fields.map(\.classic).enumerated().map { i, field in
             if case .dictionary = field.type, field.dictionaryID == nil {
                 return ArrowIPCField(name: field.name, type: field.type, nullable: field.nullable,
                                      dictionaryID: Int64(i), metadata: field.metadata)
@@ -455,6 +456,8 @@ public enum ArrowIPCWriter {
             b.addOffset(id: 1, ids)
             return (.union, b.endObject())
         case .runEndEncoded: return empty(.runEndEncoded)
+        // `resolve` has already replaced every view type with its classic counterpart.
+        case .utf8View, .binaryView, .listView, .largeListView: return type(b, t.classic)
         }
     }
 

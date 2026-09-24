@@ -306,8 +306,10 @@ the right type and the right values, and every file pyarrow writes for one of th
 pyarrow's values. The reader also decompresses LZ4_FRAME and ZSTD bodies (ZSTD through libzstd, as the
 Parquet reader does, with a clear error when it is not installed), and follows message order for
 dictionaries, so a stream may replace a dictionary part way through or extend it with a delta. The
-writer emits uncompressed bodies only. Big-endian data and the view types are rejected by both;
-[docs/COVERAGE.md](docs/COVERAGE.md) says what each type is covered by.
+writer emits uncompressed, little-endian bodies of classic types only. The reader takes big-endian
+sources, the view types (materialised to the classic layouts) and the `arrow.fixed_shape_tensor`
+extension type, and refuses IPC tensor messages. [docs/COVERAGE.md](docs/COVERAGE.md) says what each
+type is covered by.
 
 ## What is implemented
 
