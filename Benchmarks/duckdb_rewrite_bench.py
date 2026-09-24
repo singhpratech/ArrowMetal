@@ -48,6 +48,11 @@ QUERIES = [
     ("ungrouped", "sum, min, max, avg (BIGINT)", "SELECT sum(v), min(v), max(v), avg(v) FROM t"),
     ("ungrouped", "sum, avg over full-range BIGINT (HUGEINT result)", "SELECT sum(vfull), avg(vfull) FROM t"),
     ("ungrouped", "sum, count, min, max (BIGINT, 10% NULL)", "SELECT sum(n), count(n), min(n), max(n) FROM t"),
+    ("ungrouped", "sum, max, avg (BIGINT)", "SELECT sum(v), max(v), avg(v) FROM t"),
+    ("ungrouped", "sum, min, max, avg (INTEGER)", "SELECT sum(w), min(w), max(w), avg(w) FROM t"),
+    ("ungrouped", "avg (BIGINT)", "SELECT avg(v) FROM t"),
+    ("ungrouped", "sum, avg (BIGINT)", "SELECT sum(v), avg(v) FROM t"),
+    ("ungrouped", "sum over full-range BIGINT (HUGEINT result)", "SELECT sum(vfull) FROM t"),
     ("grouped", "1k INTEGER keys: sum", "SELECT k1k, sum(v) FROM t GROUP BY k1k"),
     ("grouped", "1k INTEGER keys: sum, count, min, max, avg",
      "SELECT k1k, sum(w), count(*), min(w), max(w), avg(w) FROM t GROUP BY k1k"),
@@ -61,6 +66,9 @@ QUERIES = [
     ("grouped", "1k long VARCHAR keys: sum, count", "SELECT klong, sum(v), count(*) FROM t GROUP BY klong"),
     ("grouped", "~3k wide BIGINT keys: sum", "SELECT kwide, sum(v) FROM t GROUP BY kwide"),
     ("grouped", "~1M wide BIGINT keys: sum, count", "SELECT kwide1m, sum(v), count(*) FROM t GROUP BY kwide1m"),
+    ("grouped", "1k INTEGER keys alone (no aggregates)", "SELECT k1k FROM t GROUP BY k1k"),
+    ("grouped", "100k INTEGER keys alone (no aggregates)", "SELECT k100k FROM t GROUP BY k100k"),
+    ("grouped", "~1M wide BIGINT keys alone (no aggregates)", "SELECT kwide1m FROM t GROUP BY kwide1m"),
 ]
 
 

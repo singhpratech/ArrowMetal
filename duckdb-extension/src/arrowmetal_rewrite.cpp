@@ -61,6 +61,7 @@
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 
 #include "arrowmetal.h"
 
@@ -109,8 +110,11 @@ struct Crossovers {
 // with the quiet rerun.
 //===--------------------------------------------------------------------===//
 struct Measured {
-	// Ungrouped, with two or more of SUM/MIN/MAX/AVG, or one DuckDB keeps in a 128-bit state.
-	static constexpr int64_t UNGROUPED = 10000000;
+	// Ungrouped, with three or more of SUM/MIN/MAX/AVG (at 10M rows 'sum, max, avg' was not ahead of
+	// DuckDB). With one or two, DuckDB's time depends on the values, which the plan cannot see: the
+	// rewrite measured ahead on full-range BIGINT values and behind on non-negative ones, so those are
+	// not a class.
+	static constexpr int64_t UNGROUPED = 50000000;
 	// Integer key within the fused group-by's range, DuckDB estimating MANY_GROUPS groups or more.
 	static constexpr int64_t DENSE_MANY_GROUPS = 10000000;
 	// Integer key within the fused group-by's range, fewer groups, three or more of SUM/MIN/MAX/AVG.
@@ -318,6 +322,11 @@ struct Spec {
 	// Streamed plans aggregate block by block while DuckDB scans (see "Blocks").
 	bool stream = false;
 	idx_t block_rows = 0;
+	// Where DuckDB would have run the group-by as its PERFECT_HASH_GROUP_BY: the key's minimum and the
+	// table's slot count, both fixed from the key's statistics at planning time (see CheckPerfectHash).
+	bool perfect_hash = false;
+	__int128 perfect_hash_min = 0;
+	uint64_t perfect_hash_groups = 0;
 };
 
 //===--------------------------------------------------------------------===//
@@ -1847,9 +1856,71 @@ struct StreamAccumulator {
 	}
 };
 
+// DuckDB's PERFECT_HASH_GROUP_BY puts a key at slot (key - min) + 1 of a table of 2^bits slots sized from
+// the key's statistics when the plan was made, and raises when a key lands past the table
+// (perfect_aggregate_hashtable.cpp). A plan outlives its statistics when a prepared statement runs after
+// the table changed; the key DuckDB's compressed materialization narrowed (key - min, cast to a smaller
+// unsigned type) then wraps, and only this check tells the wrapped keys from real ones. Where DuckDB
+// would have used that operator, the rewrite raises the same error; where it would have used its hash
+// group-by, which does not check, the rewrite does not either, and both answer over the same keys.
+template <class T>
+static bool FirstPastPerfectHash(const Spec &spec, const BlockColumn &column, idx_t rows, uint64_t &group) {
+	auto values = reinterpret_cast<const T *>(column.values);
+	const bool any_null = column.nulls.load() > 0;
+	for (idx_t r = 0; r < rows; r++) {
+		if (any_null && !((column.validity[r >> 6] >> (r & 63)) & 1)) {
+			continue;
+		}
+		const __int128 slot = __int128(values[r]) - spec.perfect_hash_min + 1;
+		if (slot < 0 || slot >= __int128(spec.perfect_hash_groups)) {
+			group = uint64_t(int64_t(slot)); // what DuckDB's uintptr_t arithmetic reports
+			return true;
+		}
+	}
+	return false;
+}
+
+static void CheckPerfectHash(const Spec &spec, const Block &block, idx_t rows) {
+	if (!spec.perfect_hash || rows == 0) {
+		return;
+	}
+	const Kind kind = spec.input_kinds[0];
+	if (kind != Kind::U64) {
+		if (!block.HasKeys()) {
+			return; // every key NULL: slot 0
+		}
+		const __int128 lo = block.key_min.load(), hi = block.key_max.load();
+		if (lo >= spec.perfect_hash_min && hi - spec.perfect_hash_min + 1 < __int128(spec.perfect_hash_groups)) {
+			return;
+		}
+	}
+	// Some key is past the table: find the first one, in row order, for the message.
+	auto &column = *block.columns[0];
+	uint64_t group = 0;
+	bool past = false;
+	switch (kind) {
+	case Kind::I8: past = FirstPastPerfectHash<int8_t>(spec, column, rows, group); break;
+	case Kind::I16: past = FirstPastPerfectHash<int16_t>(spec, column, rows, group); break;
+	case Kind::I32: past = FirstPastPerfectHash<int32_t>(spec, column, rows, group); break;
+	case Kind::I64: past = FirstPastPerfectHash<int64_t>(spec, column, rows, group); break;
+	case Kind::U8: past = FirstPastPerfectHash<uint8_t>(spec, column, rows, group); break;
+	case Kind::U16: past = FirstPastPerfectHash<uint16_t>(spec, column, rows, group); break;
+	case Kind::U32: past = FirstPastPerfectHash<uint32_t>(spec, column, rows, group); break;
+	case Kind::U64: past = FirstPastPerfectHash<uint64_t>(spec, column, rows, group); break;
+	default: return;
+	}
+	if (past) {
+		throw InvalidInputException("Perfect hash aggregate: aggregate group %llu exceeded total groups %llu. This "
+		                            "likely means that the statistics in your data source are corrupt.\n* PRAGMA "
+		                            "disable_optimizer to disable optimizations that rely on correct statistics",
+		                            (unsigned long long)group, (unsigned long long)spec.perfect_hash_groups);
+	}
+}
+
 // Runs one block through the GPU and merges its partial result. The block's buffers go back to the slab
 // pool at once, so a streamed plan holds only the blocks being filled or waiting.
 static void ProcessBlock(RewriteGlobalState &gstate, Block &block, idx_t rows) {
+	CheckPerfectHash(gstate.spec, block, rows);
 	std::lock_guard<std::recursive_mutex> gpu(g_gpu_lock);
 	const auto nullable = Nullable(block);
 	Plan plan;
@@ -2098,6 +2169,7 @@ SinkFinalizeType PhysicalArrowMetalAggregate::Finalize(Pipeline &pipeline, Event
 				}
 			}
 		} else {
+			CheckPerfectHash(spec, block, rows);
 			std::lock_guard<std::recursive_mutex> gpu(g_gpu_lock);
 			path = RunBlock(spec, block, rows, plan, groups);
 		}
@@ -2211,12 +2283,11 @@ struct Candidate {
 	int64_t measured_floor = -1; // -1: the class was not measured faster at any size
 };
 
-// max - min of a key column's statistics, or -1 when DuckDB has none.
-static int64_t StatsSpan(const BaseStatistics &stats, Kind kind) {
+// A key column's [min, max] from its statistics; false when DuckDB has none.
+static bool StatsRange(const BaseStatistics &stats, Kind kind, __int128 &lo, __int128 &hi) {
 	if (!NumericStats::HasMinMax(stats)) {
-		return -1;
+		return false;
 	}
-	__int128 lo = 0, hi = 0;
 	auto min = NumericStats::Min(stats), max = NumericStats::Max(stats);
 	switch (kind) {
 	case Kind::I8: lo = min.GetValueUnsafe<int8_t>(); hi = max.GetValueUnsafe<int8_t>(); break;
@@ -2226,10 +2297,94 @@ static int64_t StatsSpan(const BaseStatistics &stats, Kind kind) {
 	case Kind::U8: lo = min.GetValueUnsafe<uint8_t>(); hi = max.GetValueUnsafe<uint8_t>(); break;
 	case Kind::U16: lo = min.GetValueUnsafe<uint16_t>(); hi = max.GetValueUnsafe<uint16_t>(); break;
 	case Kind::U32: lo = min.GetValueUnsafe<uint32_t>(); hi = max.GetValueUnsafe<uint32_t>(); break;
-	default: return -1;
+	case Kind::U64: lo = min.GetValueUnsafe<uint64_t>(); hi = max.GetValueUnsafe<uint64_t>(); break;
+	default: return false;
+	}
+	return true;
+}
+
+// max - min of a key column's statistics, or -1 when DuckDB has none (or the key is UBIGINT).
+static int64_t StatsSpan(const BaseStatistics &stats, Kind kind) {
+	__int128 lo = 0, hi = 0;
+	if (kind == Kind::U64 || !StatsRange(stats, kind, lo, hi)) {
+		return -1;
 	}
 	const __int128 span = hi - lo;
 	return span < 0 || span > __int128(INT64_MAX) ? -1 : int64_t(span);
+}
+
+// Whether DuckDB would plan this group-by as PARTITIONED_AGGREGATE rather than a hash table
+// (CanUsePartitionedAggregate in plan_aggregate.cpp): the key is a plain column all the way down, and
+// the source reports that column as single-value partitions (a hive-partitioned read, say).
+static bool DuckDBWouldPartition(ClientContext &context, LogicalAggregate &aggr, LogicalGet &get) {
+	if (!get.function.get_partition_info) {
+		return false;
+	}
+	ColumnBinding binding = aggr.groups[0]->Cast<BoundColumnRefExpression>().binding;
+	LogicalOperator *node = aggr.children[0].get();
+	while (node->type == LogicalOperatorType::LOGICAL_PROJECTION ||
+	       node->type == LogicalOperatorType::LOGICAL_FILTER) {
+		if (node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			auto &projection = node->Cast<LogicalProjection>();
+			if (projection.table_index == binding.table_index) {
+				auto &expr = *projection.expressions[binding.column_index];
+				if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+					return false; // DuckDB partitions only through plain references
+				}
+				binding = expr.Cast<BoundColumnRefExpression>().binding;
+			}
+		}
+		node = node->children[0].get();
+	}
+	auto &column_ids = get.GetColumnIds();
+	if (binding.table_index != get.table_index || binding.column_index >= column_ids.size()) {
+		return true; // not followed: assume it might
+	}
+	vector<column_t> partition_ids {column_ids[binding.column_index].GetPrimaryIndex()};
+	TableFunctionPartitionInput input(get.bind_data.get(), partition_ids);
+	return get.function.get_partition_info(context, input) == TablePartitionInfo::SINGLE_VALUE_PARTITIONS;
+}
+
+// Whether DuckDB would run this group-by as its PERFECT_HASH_GROUP_BY (CanUsePerfectHashAggregate in
+// plan_aggregate.cpp, for one integer key), and if so the key's minimum and the table's slot count.
+static bool DuckDBWouldUsePerfectHash(ClientContext &context, LogicalAggregate &aggr, Kind kind, __int128 &min,
+                                      uint64_t &groups) {
+	__int128 lo = 0, hi = 0;
+	auto *stats = aggr.group_stats.empty() ? nullptr : aggr.group_stats[0].get();
+	if (stats) {
+		if (!StatsRange(*stats, kind, lo, hi)) {
+			return false;
+		}
+	} else {
+		// No statistics: DuckDB still uses it for a key of at most 16 bits, over the type's whole range.
+		switch (kind) {
+		case Kind::I8: lo = INT8_MIN; hi = INT8_MAX; break;
+		case Kind::I16: lo = INT16_MIN; hi = INT16_MAX; break;
+		case Kind::U8: lo = 0; hi = UINT8_MAX; break;
+		case Kind::U16: lo = 0; hi = UINT16_MAX; break;
+		default: return false;
+		}
+	}
+	if (hi < lo || hi - lo >= __int128(NumericLimits<int32_t>::Maximum())) {
+		return false;
+	}
+	uint32_t n = uint32_t(hi - lo + 2);
+	idx_t bits = 0;
+	while (n > 0) {
+		n >>= 1;
+		bits++;
+	}
+	Value threshold;
+	idx_t max_bits = 12;
+	if (context.TryGetCurrentSetting("perfect_ht_threshold", threshold) && !threshold.IsNull()) {
+		max_bits = threshold.GetValue<idx_t>();
+	}
+	if (bits > max_bits) {
+		return false;
+	}
+	min = lo;
+	groups = uint64_t(1) << bits;
+	return true;
 }
 
 // Finds (or adds) the gathered input for a column binding; returns its index.
@@ -2444,6 +2599,12 @@ static void Analyse(ClientContext &context, LogicalAggregate &aggr, Candidate &c
 	c.input_rows = rows;
 	c.shape = get.function.name + " -> " + c.shape;
 
+	// Where DuckDB would have checked every key against its statistics' range, so does the rewrite.
+	if (spec.has_key && !string_key && !DuckDBWouldPartition(context, aggr, get)) {
+		spec.perfect_hash = DuckDBWouldUsePerfectHash(context, aggr, spec.input_kinds[0], spec.perfect_hash_min,
+		                                              spec.perfect_hash_groups);
+	}
+
 	// The key's range from DuckDB's statistics, when it has them.
 	int64_t span = -1;
 	if (spec.has_key && !string_key && !aggr.group_stats.empty() && aggr.group_stats[0]) {
@@ -2481,24 +2642,17 @@ static void Analyse(ClientContext &context, LogicalAggregate &aggr, Candidate &c
 	// The measured half of the gate: the shape classes the provisional benchmark found faster than
 	// DuckDB's own operators, and from how many rows (see `Measured`).
 	idx_t kernels = 0;
-	bool hugeint_state = false;
 	for (auto &agg : spec.aggs) {
 		if (agg.op == AggOp::SUM || agg.op == AggOp::AVG || agg.op == AggOp::MIN || agg.op == AggOp::MAX) {
 			kernels++;
 		}
-		// DuckDB accumulates these in 128 bits: sum over INTEGER/BIGINT it could not prove fits in 64
-		// bits, and avg over INTEGER/BIGINT always.
-		if ((agg.op == AggOp::SUM && !agg.proven_no_overflow && agg.semantic_bits >= 32) ||
-		    (agg.op == AggOp::AVG && agg.semantic_bits >= 32)) {
-			hugeint_state = true;
-		}
 	}
 	if (!spec.has_key) {
-		if (hugeint_state || kernels >= 2) {
-			c.shape_class = "ungrouped";
+		if (kernels >= 3) {
+			c.shape_class = "ungrouped, three or more aggregates";
 			c.measured_floor = Measured::UNGROUPED;
 		} else {
-			c.shape_class = "ungrouped, one aggregate with a 64-bit state";
+			c.shape_class = "ungrouped, one or two aggregates";
 		}
 	} else if (string_key) {
 		c.shape_class = "VARCHAR key";
@@ -2516,7 +2670,7 @@ static void Analyse(ClientContext &context, LogicalAggregate &aggr, Candidate &c
 			c.shape_class = "fused group-by, fewer groups, three or more aggregates";
 			c.measured_floor = Measured::DENSE_FEW_GROUPS;
 		} else {
-			c.shape_class = "fused group-by, fewer groups, one or two aggregates";
+			c.shape_class = "fused group-by, fewer groups, at most two aggregates";
 		}
 	}
 }

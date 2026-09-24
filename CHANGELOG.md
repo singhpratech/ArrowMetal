@@ -226,7 +226,11 @@ Integrations
   crossover and the shape class's measured floor (`Benchmarks/duckdb_rewrite_bench.py`, provisional
   results in `Benchmarks/results/duckdb_rewrite_2026-09-23_provisional.csv`); `'off'` and `'force'`
   too; `arrowmetal_rewrites()` and `EXPLAIN` show what happened. Python: `am.duckdb_connect()`,
-  `am.duckdb_rewrites(con)`, `am.duckdb_is_rewritten(con, sql)`.
+  `am.duckdb_rewrites(con)`, `am.duckdb_is_rewritten(con, sql)`. In `auto` an ungrouped query is
+  rewritten only with three or more of `sum`/`min`/`max`/`avg`, from 50M rows; a `GROUP BY` with no
+  aggregates is rewritten like any other group-by. Where DuckDB would have run the group-by as its
+  `PERFECT_HASH_GROUP_BY`, a key past the table its planning-time statistics sized (a prepared statement
+  run after out-of-range keys were inserted) raises DuckDB's own error, as it does with the rewrite off.
 - pandas (docs/PANDAS.md): an `.am` accessor on Series/DataFrame, and an opt-in accel mode that patches a
   documented set of pandas methods, routes to the GPU only when dtype, size and arguments qualify, and
   restores the originals exactly on `uninstall()`.

@@ -20,9 +20,9 @@ why.
 
 A third piece needs no change to the SQL at all. The **rewrite extension** is a DuckDB optimizer
 extension: loaded into a connection, it moves eligible aggregates of ordinary queries onto the GPU, with
-DuckDB's exact answers, and in its default mode only for the shapes and sizes where it was measured
-ahead of DuckDB's own operators. §4b has what it rewrites, the feasibility finding behind it, and where
-it is ahead and where it is not.
+DuckDB's exact answers, and in its default mode only for the shape classes whose every benchmarked
+query was ahead of DuckDB's own operators, from the size where that held. §4b has what it rewrites,
+the feasibility finding behind it, and where it is ahead and where it is not.
 
 - [1. Which tier you want](#1-which-tier-you-want)
 - [2. Install](#2-install)
@@ -43,7 +43,7 @@ it is ahead and where it is not.
 | Install | `pip install duckdb`, nothing else | build a `.duckdb_extension`, connect with `allow_unsigned_extensions` | build it against the installed DuckDB release (`build_rewrite.sh`), connect with `allow_unsigned_extensions`, or `am.duckdb_connect()` |
 | Data crossing | zero-copy where DuckDB returns one chunk | DataChunks assembled into one buffer (a copy) | DuckDB's scan output copied into page-aligned buffers the GPU reads in place |
 | Types | everything DuckDB emits, including strings, decimals, lists, structs, maps | the fixed-width numeric types, `DATE`, `TIMESTAMP` | integer columns (`MIN`/`MAX` also `DATE`, `TIMESTAMP`); an integer, `DATE`, `TIMESTAMP` or `VARCHAR` group key |
-| Speed | resident: 16.0x on 100k-key group-by, 9.3x on `LIKE`, 2.2x on sort; one-shot (crossing included): 1.1x, 0.6x, 0.7x (§5) | **behind DuckDB** in 0.1.0, see §4 | rewrites only the shape classes measured ahead of DuckDB, from the size they were measured at (§4b) |
+| Speed | resident: 16.0x on 100k-key group-by, 9.3x on `LIKE`, 2.2x on sort; one-shot (crossing included): 1.1x, 0.6x, 0.7x (§5) | **behind DuckDB** in 0.1.0, see §4 | in `auto`, rewrites only the shape classes whose every benchmarked query was ahead of DuckDB, from that size (§4b) |
 | Larger than memory | yes, `am.duckdb_batches` | no | no: the aggregate's input is gathered in memory (a streamed plan holds only the blocks in flight, §4b) |
 
 If you are reading this to make something faster: **use tier 1**, or tier 3 when the SQL must stay as it
@@ -369,7 +369,7 @@ are not there yet).
 
 | | Eligible |
 |---|---|
-| Aggregates | `sum` and `avg` over integer columns of every width and signedness except `UBIGINT` (which DuckDB sums through a cast to `HUGEINT`); `min` and `max` over integer, `DATE` and `TIMESTAMP` columns; `count(x)`, `count(*)`. The argument is a column, or a column under the widening integer cast DuckDB inserts itself (`sum` over `TINYINT` is `sum(CAST(x AS BIGINT))`). No `DISTINCT`, `FILTER` or `ORDER BY` inside the aggregate. |
+| Aggregates | none (`SELECT k FROM t GROUP BY k`), or any of: `sum` and `avg` over integer columns of every width and signedness except `UBIGINT` (which DuckDB sums through a cast to `HUGEINT`); `min` and `max` over integer, `DATE` and `TIMESTAMP` columns; `count(x)`, `count(*)`. The argument is a column, or a column under the widening integer cast DuckDB inserts itself (`sum` over `TINYINT` is `sum(CAST(x AS BIGINT))`). No `DISTINCT`, `FILTER` or `ORDER BY` inside the aggregate. |
 | Grouping | none, or one column that is an integer, `DATE`, `TIMESTAMP` or `VARCHAR` column. No `GROUPING SETS`, `ROLLUP` or `CUBE`. |
 | Input | projections and filters over one table function whose row count DuckDB's planner knows: a table's `seq_scan`, `read_parquet`. A join, a window or another aggregate below the aggregate, or a source that does not report its size (a Python-registered Arrow table's `arrow_scan`), leaves it to DuckDB. |
 
@@ -452,11 +452,16 @@ Two conditions, both recorded for each decision in `arrowmetal_rewrites()`:
 
 | Shape class | `auto` from |
 |---|---:|
-| no `GROUP BY`, with two or more of `sum`/`min`/`max`/`avg`, or one DuckDB keeps in 128 bits (`sum` over `INTEGER`/`BIGINT` not proven to fit in 64 bits, `avg` over `INTEGER`/`BIGINT`) | 10,000,000 rows |
-| fused group-by, an estimated 10,000 groups or more | 10,000,000 rows |
+| no `GROUP BY`, with three or more of `sum`/`min`/`max`/`avg` | 50,000,000 rows |
+| fused group-by, an estimated 10,000 groups or more (with no aggregates too) | 10,000,000 rows |
 | fused group-by, fewer groups, three or more of `sum`/`min`/`max`/`avg` | 50,000,000 rows |
-| hash group-by, an estimated 10,000 groups or more | 50,000,000 rows |
-| no `GROUP BY` with one aggregate in a 64-bit state; fused group-by with fewer groups and one or two aggregates; hash group-by with fewer groups; a `VARCHAR` key | not rewritten in `auto` |
+| hash group-by, an estimated 10,000 groups or more (with no aggregates too) | 50,000,000 rows |
+| no `GROUP BY` with one or two of `sum`/`min`/`max`/`avg`; fused group-by with fewer groups and at most two; hash group-by with fewer groups; a `VARCHAR` key | not rewritten in `auto` |
+
+The benchmark's queries in each class are the rows of the results file whose `shape_class` column
+names it; a query the file does not list is in `auto` because of its class, not because it was timed.
+`test_measured_floors_are_in_the_benchmark_results` requires every row of a rewritten class to be
+ahead at the class's floor, and no row of any other class to be rewritten.
 
 The measurements are in `Benchmarks/results/duckdb_rewrite_2026-09-23_provisional.csv`: for each
 query and size (1M, 10M, 50M rows), DuckDB's time and the rewrite's, wall and CPU, the GPU path taken,
@@ -472,14 +477,29 @@ PYTHONPATH=python python Benchmarks/duckdb_rewrite_bench.py        # 1M, 10M and
 
 The classes left to DuckDB are the ones where its own operators came out ahead in that file, or not
 ahead consistently: a single `sum` (DuckDB aggregates while it scans, and the rewrite has to copy the
-column out first), few groups with one or two aggregates, and `VARCHAR` keys that DuckDB keeps as
-strings.
+column out first), few groups with at most two aggregates, and `VARCHAR` keys that DuckDB keeps as
+strings. One ungrouped case is left to DuckDB although the rewrite was ahead on some of its queries:
+one or two aggregates. There DuckDB's time depends on the values, which the plan does not show: in the
+file, `avg` and `sum, avg` over non-negative `BIGINT` values are to improve, while `sum` and
+`sum, avg` over full-range `BIGINT` values are ahead. The first `auto` class starts at 50,000,000 rows because at 10,000,000 one of its
+queries (`sum, max, avg`) was not ahead of DuckDB.
 
 ### Limits
 
 - Built for one DuckDB release and one platform string at a time; unsigned.
 - The decision is made when the plan is: a prepared statement keeps the decision made at `PREPARE`,
   and `EXPLAIN` records a decision of its own.
+- A plan keeps the key statistics it was made with. Where DuckDB would have run the group-by as its
+  `PERFECT_HASH_GROUP_BY` (an integer key whose statistics span at most 2^`perfect_ht_threshold` - 2
+  values, 12 bits by default), a key that lands past the table those statistics sized raises DuckDB's
+  own error, `Perfect hash aggregate: aggregate group N exceeded total groups M. This likely means that
+  the statistics in your data source are corrupt.`, as DuckDB does with the rewrite off. That happens
+  when a prepared statement runs after keys outside the planned range were inserted: the plan's
+  compressed materialization narrowed the key to `key - min` in a smaller unsigned type, in which
+  such keys wrap. Where DuckDB would have used its hash group-by, which does not check, the
+  rewrite does not either, and both answer over the same narrowed keys
+  (`test_a_prepared_statement_whose_key_outgrew_its_statistics`,
+  `test_where_duckdb_does_not_check_the_statistics_neither_does_the_rewrite`).
 - The log keeps the last 1,024 decisions of the process and is shared by every connection; a
   rewritten plan's `path`, `rows_seen`, `groups` and `gpu_ms` describe its latest run.
 - The aggregate's input is held in memory: the buffers are reserved for the source's row count and

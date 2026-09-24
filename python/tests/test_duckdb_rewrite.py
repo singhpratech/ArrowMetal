@@ -196,6 +196,17 @@ KEYS = {
 }
 
 
+def test_group_by_with_no_aggregates(con):
+    # SELECT k FROM t GROUP BY k is an aggregate with an empty aggregate list; it is rewritten like any
+    # other group-by, on the fused path (a narrow key) and the hash path (a wide one).
+    make(con, 20_000, "(hash(i) % 1000)::INTEGER", [value_sql("BIGINT", 27)])
+    check(con, "SELECT k FROM t GROUP BY k")
+    check(con, "SELECT v0 FROM t GROUP BY v0")
+    check(con, "SELECT k FROM t GROUP BY k ORDER BY k", ordered=True)
+    con.execute("SET arrowmetal_rewrite = 'auto'")
+    assert OPERATOR not in plan(con, "SELECT k FROM t GROUP BY k")
+    assert last_decision(con)[2] == "not measured faster than DuckDB: fused group-by, fewer groups, at most two aggregates"
+
 @pytest.mark.parametrize("key", list(KEYS))
 def test_group_keys_match_duckdb(con, key):
     make(con, 60_000, KEYS[key], [value_sql("BIGINT", 7, -10**12, 10**12), value_sql("INTEGER", 8)])
@@ -369,18 +380,31 @@ def test_auto_never_rewrites_a_class_not_measured_faster(con):
 
 
 def test_auto_rewrites_at_scale(con):
-    """At 10M rows 'auto' takes the many-groups and the ungrouped classes, and still matches DuckDB."""
+    """At 10M rows 'auto' takes the many-groups class and still matches DuckDB. An ungrouped query with
+    three or more aggregates waits for its 50M floor; one with one or two is left to DuckDB at any size,
+    since its time depends on the values (the benchmark has avg and sum+avg over non-negative BIGINT
+    behind, sum and sum+avg over full-range BIGINT ahead), which the plan cannot see."""
     con.execute("CREATE TABLE big AS SELECT (hash(i) % 200000)::INTEGER k, "
                 "(hash(i * 3) % 1000000000)::BIGINT v, (hash(i * 5)::HUGEINT - 9223372036854775808)::BIGINT f "
                 "FROM range(10000000) r(i)")
     con.execute("SET arrowmetal_rewrite = 'auto'")
-    for sql in ["SELECT k, sum(v), count(*) FROM big GROUP BY k", "SELECT sum(f), avg(f) FROM big"]:
+    # range() reports its size, so 50M rows need no table.
+    for sql in ["SELECT k, sum(v), count(*) FROM big GROUP BY k", "SELECT k FROM big GROUP BY k",
+                "SELECT sum(i), max(i), avg(i) FROM range(50000000) r(i)"]:
         assert OPERATOR in plan(con, sql), sql
         assert last_decision(con)[2].startswith("at or above the threshold")
         got = sorted(con.sql(sql).fetchall(), key=sort_key)
         con.execute("SET arrowmetal_rewrite = 'off'")
         assert got == sorted(con.sql(sql).fetchall(), key=sort_key)
         con.execute("SET arrowmetal_rewrite = 'auto'")
+    assert OPERATOR not in plan(con, "SELECT sum(v), max(v), avg(v) FROM big")
+    decision = last_decision(con)
+    assert decision[1:3] == ("kept", "below the measured floor: ungrouped, three or more aggregates"), decision
+    for sql in ["SELECT avg(v) FROM big", "SELECT sum(v), avg(v) FROM big", "SELECT sum(f), avg(f) FROM big",
+                "SELECT sum(f) FROM big", "SELECT avg(i) FROM range(50000000) r(i)"]:
+        assert OPERATOR not in plan(con, sql), sql
+        decision = last_decision(con)
+        assert decision[1:3] == ("kept", "not measured faster than DuckDB: ungrouped, one or two aggregates"), decision
 
 
 def test_auto_is_the_default_and_off_turns_it_off(con):
@@ -415,7 +439,7 @@ def test_the_decision_log_records_the_run(con):
 
 
 MEASURED_CLASSES = {
-    "UNGROUPED": "ungrouped",
+    "UNGROUPED": "ungrouped, three or more aggregates",
     "DENSE_MANY_GROUPS": "fused group-by, an estimated 10k or more groups",
     "DENSE_FEW_GROUPS": "fused group-by, fewer groups, three or more aggregates",
     "HASH_MANY_GROUPS": "hash group-by, an estimated 10k or more groups",
@@ -484,6 +508,65 @@ def test_a_prepared_statement_after_the_table_grew(con):
     assert grown_p == sorted(con.sql("SELECT k, sum(v0), count(*), min(v0) FROM t GROUP BY k").fetchall())
     assert grown_q == con.sql("SELECT sum(v0), count(*), max(v0) FROM t").fetchall()
     assert grown_p != first
+
+
+# DuckDB's compressed materialization narrows a key its statistics bound (here k - 0, cast to UTINYINT),
+# and its PERFECT_HASH_GROUP_BY sizes a table from those statistics (5 keys + NULL: 8 slots) and raises
+# when a key lands past it. After PREPARE, rows whose keys leave the range wrap in the narrowed key: 300
+# becomes 44 and -7 becomes 249. The rewrite must raise the same error, not answer over wrapped keys.
+PERFECT_HASH_ERROR = r"Perfect hash aggregate: aggregate group \d+ exceeded total groups 8\. This likely means"
+
+
+def prepare_outgrown(con, key_type, inserted):
+    con.execute(f"CREATE OR REPLACE TABLE p AS SELECT (i % 5)::{key_type} k, i::INTEGER v FROM range(10000) r(i)")
+    start = con.sql("SELECT coalesce(max(id), 0) FROM arrowmetal_rewrites()").fetchone()[0]
+    con.execute("SET arrowmetal_rewrite = 'off'")
+    con.execute("PREPARE p_off AS SELECT k, sum(v), count(*) FROM p GROUP BY k")
+    con.execute("SET arrowmetal_rewrite = 'force'")
+    con.execute("PREPARE p_gpu AS SELECT k, sum(v), count(*) FROM p GROUP BY k")
+    decisions = con.sql(f"SELECT decision FROM arrowmetal_rewrites() WHERE id > {start}").fetchall()
+    assert decisions == [("rewritten",)]
+    if inserted == "two keys":
+        con.execute("INSERT INTO p VALUES (300, 1), (-7, 2)")
+    else:  # 300,000 keys over [-1e9, 1e9], which wrap onto every one of the 256 narrowed values
+        con.execute(f"INSERT INTO p SELECT ((hash(i) % 2000000001)::BIGINT - 1000000000)::{key_type}, 1 "
+                    "FROM range(300000) r(i)")
+
+
+@pytest.mark.parametrize("inserted", ["two keys", "300k keys"])
+@pytest.mark.parametrize("key_type", ["INTEGER", "BIGINT"])
+def test_a_prepared_statement_whose_key_outgrew_its_statistics(con, key_type, inserted):
+    prepare_outgrown(con, key_type, inserted)
+    with pytest.raises(duckdb.InvalidInputException, match=PERFECT_HASH_ERROR) as expected:
+        con.execute("EXECUTE p_off")
+    with pytest.raises(duckdb.InvalidInputException, match=PERFECT_HASH_ERROR) as got:
+        con.execute("EXECUTE p_gpu")
+    if inserted == "two keys":
+        assert str(got.value) == str(expected.value)   # group 45: the key 300, first in row order
+
+
+def test_where_duckdb_does_not_check_the_statistics_neither_does_the_rewrite(con):
+    # With perfect_ht_threshold = 0 DuckDB plans its HASH_GROUP_BY, which takes the narrowed keys as
+    # they come; both then answer over the same wrapped keys (44 and 249), and so must agree.
+    con.execute("SET perfect_ht_threshold = 0")
+    prepare_outgrown(con, "INTEGER", "two keys")
+    expected = sorted(con.execute("EXECUTE p_off").fetchall())
+    assert (44, 1, 1) in expected and (249, 2, 1) in expected
+    assert sorted(con.execute("EXECUTE p_gpu").fetchall()) == expected
+
+
+def test_a_prepared_statement_within_duckdbs_perfect_hash_table(con):
+    # Keys 5..7 over statistics [0, 4] still land inside the 8-slot table, which DuckDB does not check
+    # against the statistics themselves: both answer, with the new keys as their own groups.
+    con.execute("CREATE OR REPLACE TABLE p AS SELECT (i % 5)::INTEGER k, i::INTEGER v FROM range(10000) r(i)")
+    con.execute("SET arrowmetal_rewrite = 'off'")
+    con.execute("PREPARE p_off AS SELECT k, sum(v), count(*) FROM p GROUP BY k")
+    con.execute("SET arrowmetal_rewrite = 'force'")
+    con.execute("PREPARE p_gpu AS SELECT k, sum(v), count(*) FROM p GROUP BY k")
+    con.execute("INSERT INTO p VALUES (5, 1), (6, 2), (6, 3), (NULL, 4)")
+    expected = sorted(con.execute("EXECUTE p_off").fetchall(), key=sort_key)
+    assert (6, 5, 2) in expected and (None, 4, 1) in expected
+    assert sorted(con.execute("EXECUTE p_gpu").fetchall(), key=sort_key) == expected
 
 
 def test_a_streamed_plan_past_its_block_directory():
