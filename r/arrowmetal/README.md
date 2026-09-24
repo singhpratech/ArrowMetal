@@ -164,7 +164,7 @@ idle Mac.
 
 ## Tests
 
-64 `test_that()` blocks in the sources (65 as testthat runs them: the one in test-dispatch.R runs once per attach order), 266 expectations, comparing against base R and against `arrow`'s
+68 `test_that()` blocks in the sources (69 as testthat runs them: the one in test-dispatch.R runs once per attach order), 273 expectations, comparing against base R and against `arrow`'s
 own kernels on the same data: nulls, all-null and empty columns, sliced input, lengths of 1, 33,
 1024, 65537 and 1,000,001 (crossing a threadgroup boundary), int64 above 2^53, float32, strings and
 booleans, and every error path.

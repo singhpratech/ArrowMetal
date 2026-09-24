@@ -245,7 +245,9 @@ There is also no dplyr backend and no `RecordBatch`/`Table` surface: everything 
 
 ## Tests
 
-64 `test_that()` blocks in the sources (65 as testthat runs them: the one in test-dispatch.R runs once per attach order), 266 expectations, against base R and against `arrow`'s own
+`src/arrowmetal.h` and `src/arrow_abi.h` are copies of the repository's `include/` headers; refresh them (`cp include/arrowmetal.h r/arrowmetal/src/`) whenever the header changes, or `python/tests/test_header_copies.py` and `test-header-copy.R` fail.
+
+68 `test_that()` blocks in the sources (69 as testthat runs them: the one in test-dispatch.R runs once per attach order), 273 expectations, against base R and against `arrow`'s own
 kernels on the same data: nulls, all-null and empty columns, sliced input at three offsets, lengths
 of 1, 33, 1024, 65537 and 1,000,001 (crossing a threadgroup boundary), one group per row and one group for
 everything, int64 above 2^53, float32 accumulation, and every documented error path.
