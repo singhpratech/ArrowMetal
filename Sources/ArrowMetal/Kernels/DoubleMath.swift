@@ -4,8 +4,11 @@ import Foundation
 ///
 /// Values travel as raw 64-bit patterns (`ulong`). `d_add`, `d_sub`, `d_mul` are correctly rounded
 /// (round to nearest, ties to even) including subnormals, signed zeros, infinities and NaN propagation.
-/// `d_div` is a restoring long division on the significands, also correctly rounded, and `d_sqrt` is a
-/// restoring digit-by-digit extraction, correctly rounded too — bit-identical to `Foundation.sqrt`.
+/// `d_div` is a Newton reciprocal seeded by one hardware `float` division, with the exact 128-bit
+/// remainder settling the last bit, also correctly rounded (it replaced an earlier restoring long
+/// division; docs/FINDINGS.md round 6), and `d_sqrt` is a hardware `rsqrt` seed refined by Newton steps in
+/// fixed point with an exact remainder settling the last bit, correctly rounded too — bit-identical to
+/// `Foundation.sqrt`.
 enum DoubleMath {
     static let msl = """
 

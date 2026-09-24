@@ -285,7 +285,8 @@ the CPU to know the length. A reduction still syncs once to read its partials.
 (`d_add`, `d_sub`, `d_mul`, `d_div`, `d_sqrt`) over `ulong` bit patterns, correctly rounded. Sum
 accumulates with `d_add`; arithmetic kernels run one element per thread. `d_div` is a Newton reciprocal
 seeded by one hardware `float` division, with the exact 128-bit remainder `N - q·D` settling the last
-bit; `d_sqrt` extracts the root digit by digit in integers. Both are correctly rounded rather than close,
+bit; `d_sqrt` refines a hardware `rsqrt` seed with Newton steps in fixed point and settles the last bit with
+the exact remainder. Both are correctly rounded rather than close,
 and `DoubleMathTests` holds them to Swift's own `Double` bit for bit. `add` and `multiply` run at this
 ~390 GB/s these single-pass rows reach at 50M rows and `divide` within 15% of it (331 GB/s), so the
 software arithmetic is all but invisible in a bandwidth-bound query. `cast` is the one float64 path that
