@@ -96,6 +96,7 @@ runners are never published: their GPU is virtual.
 | Read this | To learn |
 |---|---|
 | [PARQUET.md](PARQUET.md) | The Parquet reader that decodes on the Apple GPU: the pipeline, the parallel RLE strategy, GPU Snappy and LZ4, the supported encoding/codec/type matrix, projection and statistics pushdown, benchmarks against pyarrow / Polars / pandas, the small writer, and the limits |
+| [JSON.md](JSON.md) | The newline-delimited JSON reader that parses on the Apple GPU: the structure scan, the per-record walk, key matching, type inference, pyarrow's behaviour as probed, the documented differences, the benchmark script and the limits |
 
 ```
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter "ParquetTests|ParquetWriterTests"

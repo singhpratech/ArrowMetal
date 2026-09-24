@@ -22,8 +22,9 @@ final class JSONColumnBuilder {
     var parseErrors: [(position: Int, message: String)] = []
     var conversionErrors: [(position: Int, message: String)] = []
 
-    /// Slot-matrix budget per group of fields; wider tables are processed in groups.
-    static let matrixBudgetBytes = 512 << 20
+    /// Slot-matrix budget per group of fields; wider tables are processed in groups. A variable so the
+    /// tests can force groups on a small file.
+    nonisolated(unsafe) static var matrixBudgetBytes = 512 << 20
 
     init(context: MetalContext, source: MetalArrowBuffer, n: Int, host: UnsafePointer<UInt8>,
          behavior: JSONUnexpectedFieldBehavior) {

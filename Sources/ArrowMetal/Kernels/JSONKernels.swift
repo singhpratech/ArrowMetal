@@ -516,9 +516,17 @@ enum JSONKernels {
                 Dispatch.dispatch1D(enc, p, count: n)
             }
         }
+        if cs.level.entries.byteCount > 0, src.byteCount > Int(Int32.max) {
+            // The offsets are 32-bit: on an input past 2 GiB, add the lengths up before trusting the scan.
+            let lp = lens.typed(Int32.self)
+            var sum = 0
+            for i in 0..<n { sum += Int(lp[i]) }
+            guard sum <= Int(Int32.max) else {
+                throw JSONError.unsupported("a column set holds \(sum) bytes of text; utf8 offsets are 32-bit")
+            }
+        }
         let offsets = try sumScan(ctx, lens, n)
         let total = Int(offsets.typed(Int32.self)[n])
-        guard total >= 0 else { throw JSONError.unsupported("a column set holds more than 2 GiB of text") }
         let data = try alloc(ctx, total)
         if n > 0 && total > 0 {
             try ctx.run { enc in

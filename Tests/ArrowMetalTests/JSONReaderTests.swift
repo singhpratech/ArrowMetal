@@ -364,6 +364,25 @@ final class JSONReaderTests: XCTestCase {
         }
     }
 
+    /// Tables whose slot matrix passes the budget are built a group of fields at a time; with the
+    /// budget forced down to a few rows' worth, every field is its own group.
+    func testSlotMatrixGroups() throws {
+        try requireRealGPU()
+        let saved = JSONColumnBuilder.matrixBudgetBytes
+        defer { JSONColumnBuilder.matrixBudgetBytes = saved }
+        var text = ""
+        for r in 0..<100 { text += "{\"a\":\(r),\"b\":\"s\(r)\",\"a\(r % 3)\":true,\"c\":[\(r)]}\n" }
+        let whole = try read(text)
+        JSONColumnBuilder.matrixBudgetBytes = 100 * 4
+        let grouped = try read(text)
+        XCTAssertEqual(grouped.names, whole.names)
+        XCTAssertEqual(grouped.names, ["a", "b", "a0", "c", "a1", "a2"])
+        XCTAssertEqual(grouped["a"]?.asInt64?.toArray(), (0..<100).map { Int64($0) })
+        XCTAssertEqual(grouped["b"]?.asString?.toArray(), (0..<100).map { "s\($0)" })
+        XCTAssertEqual(grouped["a1"]?.asBoolean?.toArray(), (0..<100).map { $0 % 3 == 1 ? true : nil })
+        XCTAssertEqual(readError("{\"a\":1,\"b\":2,\"a\":3}\n"), "JSON parse error: Column(/a) was specified twice in row 0")
+    }
+
     func testInputsOf4GiBAreRejected() throws {
         XCTAssertNoThrow(try JSONReader.checkSize(Int(UInt32.max) - 4097))
         XCTAssertThrowsError(try JSONReader.checkSize(Int(UInt32.max))) {

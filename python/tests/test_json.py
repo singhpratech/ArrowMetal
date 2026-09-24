@@ -99,6 +99,7 @@ PROBES = {
     "big_integer_digits": '{"a":' + "9" * 400 + '}\n',
     "number_too_big_1e309": '{"a":1e309}\n',
     "number_1e308": '{"a":1e308}\n',
+    "number_long_mantissa_1e309": '{"a":1.7976931348623157e309}\n',
     "number_10e308": '{"a":10e308}\n',
     "number_0.5e309": '{"a":0.5e309}\n',
     "number_0.5e310": '{"a":0.5e310}\n',
@@ -588,6 +589,13 @@ def test_keyword_options_match_parse_options():
     # A list of fields is accepted as a schema.
     assert am.read_json_table(data, explicit_schema=[("b", pa.int32())],
                               unexpected_field_behavior="ignore").equals(by_keywords)
+
+
+def test_newlines_in_values_does_not_change_the_result():
+    data = b'{"a":\n1}\n{"a":2}\n'
+    want = pj.read_json(io.BytesIO(data))
+    for flag in (False, True):
+        assert am.read_json_table(data, parse_options=pj.ParseOptions(newlines_in_values=flag)).equals(want)
 
 
 def test_read_options_are_accepted():
