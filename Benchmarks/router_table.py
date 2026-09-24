@@ -20,7 +20,6 @@ Usage:
     python Benchmarks/router_table.py --json Benchmarks/results/router_<date>.json
 """
 import argparse
-
 import json
 import math
 import os
