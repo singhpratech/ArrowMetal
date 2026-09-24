@@ -1,0 +1,3 @@
+{"protocol":{"minReaderVersion":2,"minWriterVersion":5}}
+{"metaData":{"id":"00000000-0000-0000-0000-000000000002","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\": \"struct\", \"fields\": [{\"name\": \"id\", \"type\": \"long\", \"nullable\": true, \"metadata\": {\"delta.columnMapping.id\": 1, \"delta.columnMapping.physicalName\": \"col-1a\"}}]}","partitionColumns":[],"createdTime":1700000000000,"configuration":{"delta.columnMapping.mode":"id"}}}
+{"add":{"path":"part-0.parquet","partitionValues":{},"size":520,"modificationTime":1700000000000,"dataChange":true,"stats":"{\"numRecords\": 3}"}}

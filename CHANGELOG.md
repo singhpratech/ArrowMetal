@@ -255,6 +255,27 @@ Parquet on the GPU
   the value; a column name holding `= ! < > ;` raises.
 - A restored Parquet dictionary type has `int32` indices and no ordered flag, where pyarrow keeps the
   stored index type and flag; listed under Limits in docs/PARQUET.md and tested.
+- Delta Lake and Apache Iceberg tables (docs/LAKEHOUSE.md): `am.read_delta` / `am.read_iceberg` (and
+  `*_table` for a pyarrow.Table), `DeltaTable` / `IcebergTable` in Swift, `am_delta_read` /
+  `am_iceberg_read` in C. The Delta log (JSON commits, single and multi-part checkpoints read with the GPU
+  Parquet reader) and the Iceberg metadata (v1 and v2, Avro manifest lists and manifests through a small
+  CPU Avro reader with the null, deflate and snappy codecs) are resolved on the CPU; time travel, partition
+  columns, Delta column mapping `none`/`name`, Iceberg columns by field id (renames, added columns, int to
+  long); filters prune files by partition values and statistics and are applied to the rows. Unimplemented
+  reader features (deletion vectors, column mapping `id`, Iceberg delete files, unknown features) are
+  refused with an error naming them. Checked against `deltalake` 1.6.5 and pyiceberg 0.12.0
+  (`LakehouseTests`, `python/tests/test_lakehouse.py`); `Benchmarks/lakehouse_bench.py` for timings.
+- Lakehouse reads: a Delta empty-string partition value reads as null for every type, as the protocol
+  and `deltalake` have it; string row-group pruning is byte-wise, the row filter's order, so decomposed
+  strings are no longer pruned away; Iceberg data-file paths are opened as written (pyiceberg's
+  `grp=x%3Dy` directories); a float32 column compares with a double literal exactly, as pyarrow does.
+  Filter literals at the edges of their types (doubles past the Int64 range, huge years, non-ASCII digits,
+  decimals over 38 digits) and malformed Avro manifests or Delta `partitionValues` are answers or errors,
+  never a crash or a hang; a negative Delta version other than -1 (C) is an error.
+- Lakehouse reads: a NaN Delta float partition is kept for `!=` (it was pruned for every comparison); a
+  Delta reader protocol 3 whose `readerFeatures` is missing or not a list of strings, an Iceberg snapshot
+  with neither a manifest list nor manifests, and a data file holding none of the table's columns are
+  errors instead of reads.
 
 Out-of-core streaming
 - A streaming executor for datasets larger than memory (docs/STREAMING.md): Arrow IPC files/directories

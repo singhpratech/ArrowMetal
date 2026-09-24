@@ -1581,6 +1581,42 @@ int64_t am_parquet_last_read_stats(am_parquet_file* f, int64_t* out, int64_t cap
 // INT64_MAX is kept exact and compared as unsigned against a uint64 column's statistics. On a float or
 // double column `!=` never rules a row group or page out, since writers leave NaN out of min/max.
 
+// ---- Lakehouse tables: Delta Lake and Apache Iceberg (docs/LAKEHOUSE.md) --------------------------
+//
+// A table read resolves the table's metadata on the CPU (the Delta log and its checkpoints; the
+// Iceberg metadata JSON, manifest list and Avro manifests), prunes data files by partition values and
+// column statistics, and reads the surviving Parquet files with the GPU Parquet reader. The result is
+// a batch handle, used like am_parquet_batch: columns come out one at a time as am_array handles.
+//
+// `columns`: NULL reads every column of the table's schema; otherwise exactly the `n_columns` named.
+// `filters`: NULL or a `name<op><literal>` list as in am_parquet_read_ex (`x>3;s=="a"`). Unlike the
+// Parquet read, the filters here are applied to the rows too, so only matching rows come back; nulls
+// never match. A date literal may be written "YYYY-MM-DD" and a timestamp literal as ISO 8601.
+// Features the reader does not implement (Delta deletion vectors, column mapping mode id, unknown
+// reader features; Iceberg delete files) fail with an error naming the feature.
+typedef struct am_lakehouse_batch am_lakehouse_batch;   // opaque
+
+// Delta Lake: `path` is the table directory (holding _delta_log/). `version` -1 reads the latest; any
+// other negative version is an error.
+int     am_delta_read(const char* path, int64_t version, const char** columns, int64_t n_columns,
+                      const char* filters, am_lakehouse_batch** out);
+int64_t am_delta_latest_version(const char* path);          // -1 on error
+
+// Iceberg: `path` is a *.metadata.json file or a table directory (holding metadata/). With
+// `has_snapshot_id` 0 the current snapshot is read, otherwise `snapshot_id`.
+int     am_iceberg_read(const char* path, int64_t snapshot_id, int has_snapshot_id, const char** columns,
+                        int64_t n_columns, const char* filters, am_lakehouse_batch** out);
+// 0 and the id in *out; 3 when the table has no current snapshot; 1 on error.
+int     am_iceberg_current_snapshot(const char* path, int64_t* out);
+
+int64_t     am_lakehouse_batch_columns(am_lakehouse_batch* b);
+int64_t     am_lakehouse_batch_rows(am_lakehouse_batch* b);
+const char* am_lakehouse_batch_column_name(am_lakehouse_batch* b, int64_t i);
+int         am_lakehouse_batch_column(am_lakehouse_batch* b, int64_t i, am_array** out);
+// Six counters: files total, pruned by partition, pruned by statistics, read; manifests total, pruned.
+int         am_lakehouse_batch_stats(am_lakehouse_batch* b, int64_t* out);
+void        am_lakehouse_batch_release(am_lakehouse_batch* b);
+
 #ifdef __cplusplus
 }
 #endif
