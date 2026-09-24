@@ -308,7 +308,15 @@ so a `;`, a quote or an operator inside it is part of the value; a column name c
 `>` or `;`, and Python raises on one that does. An integer above the int64 range stays exact and is
 compared as unsigned against a `uint64` column's statistics, which are read as unsigned
 (`test_uint64_literals_past_the_signed_range`,
-`test_string_literals_with_quotes_semicolons_and_backslashes`). On a `float` or `double` column `!=`
+`test_string_literals_with_quotes_semicolons_and_backslashes`). String and binary statistics are compared
+the way Parquet orders them, by unsigned bytes: the min / max stay raw bytes and a string literal is
+compared as its UTF-8 bytes, so a composed and a decomposed accent, `Z` before `a` before `é`, and an
+emoji above every BMP character are all ordered as pyarrow orders them, row groups and page index alike
+(`test_string_statistics_are_ordered_by_bytes`). An integer statistic and a float literal are compared
+exactly, never through a double: 2^53 + 1 is above the literal 2^53
+(`test_int64_statistics_against_a_double_literal_near_2_pow_53`). A decimal column's statistics hold
+its unscaled integer, so they never rule a row group or page out
+(`test_decimal_statistics_stored_as_integers_are_not_compared_unscaled`). On a `float` or `double` column `!=`
 never rules a row group or page out: writers leave NaN out of min / max, so a range of one value equal to
 the literal can still hold a NaN, which `!=` keeps. pyarrow's `read_table(filters=...)` rules out a row
 group whose min and max both equal the literal, and so leaves out that group's NaN rows; ArrowMetal

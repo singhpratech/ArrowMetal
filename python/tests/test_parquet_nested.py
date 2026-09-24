@@ -821,6 +821,81 @@ def test_damaged_page_indexes_never_crash_the_process():
         assert len(seen) == n
 
 
+# Strings whose UTF-8 byte order differs from Unicode canonical order: a composed and a decomposed
+# accent (canonically equal, different bytes), upper case before lower case, the Angstrom sign and the
+# two spellings of Å, a ligature, U+FFFD and an emoji (four UTF-8 bytes, above every BMP character).
+_NON_ASCII = ["Z", "a", "é", "é", "\U0001F600", "ﬁ", "�", "zz", "Å", "Å",
+              "Å", "été", "été"]
+
+
+@pytest.mark.parametrize("layout", ["row_groups", "pages"])
+def test_string_statistics_are_ordered_by_bytes(layout):
+    """Parquet orders BYTE_ARRAY statistics by unsigned byte comparison. Every filter on a column of
+    non-ASCII strings returns the rows pyarrow's filtered read returns and the exact matches, whether
+    the statistics are the row groups' (one row each) or the pages' column index (one row per page)."""
+    table = pa.table({"s": _NON_ASCII, "i": list(range(len(_NON_ASCII)))})
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "strings.parquet")
+        if layout == "row_groups":
+            pq.write_table(table, path, row_group_size=1, use_dictionary=False)
+        else:
+            pq.write_table(table, path, use_dictionary=False, write_page_index=True, max_rows_per_page=1)
+        f = am.ParquetFile(path)
+        f.use_page_index = layout == "pages"
+        whole = pq.read_table(path)
+        for lit in _NON_ASCII:
+            for op in _OPS:
+                flt = [("s", op, lit)]
+                want = _exact(whole, flt).to_pylist()
+                assert _exact(f.read_table(filters=flt), flt).to_pylist() == want, (ascii(lit), op)
+                assert _exact(pq.read_table(path, filters=flt), flt).to_pylist() == want
+        # The statistics still rule groups and pages out: one value matches, the rest are skipped.
+        got = f.read_table(filters=[("s", "==", "é")])
+        st = f.last_read_stats
+        assert got["s"].to_pylist() == ["é"]
+        if layout == "row_groups":
+            assert st["row_groups_skipped_by_statistics"] == len(_NON_ASCII) - 1
+        else:
+            assert st["pages_skipped"] >= len(_NON_ASCII) - 1
+
+
+def test_int64_statistics_against_a_double_literal_near_2_pow_53():
+    """An int64 statistic and a double literal are compared exactly, never through a rounded double:
+    2^53 + 1 is greater than 2^53 as a double even though it rounds to it. pyarrow refuses these
+    filters, so the reference is the exact comparison Python makes between an int and a float."""
+    import operator
+    ints = [2 ** 53 - 1, 2 ** 53, 2 ** 53 + 1, 2 ** 53 + 2, 2 ** 53 + 3, -(2 ** 53) - 1]
+    py_ops = {"==": operator.eq, "!=": operator.ne, "<": operator.lt, "<=": operator.le, ">": operator.gt,
+              ">=": operator.ge}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "ints.parquet")
+        pq.write_table(pa.table({"x": pa.array(ints, pa.int64())}), path, row_group_size=1,
+                       write_page_index=True)
+        f = am.ParquetFile(path)
+        for lit in [2.0 ** 53, 2.0 ** 53 + 2, 9007199254740991.5, -(2.0 ** 53), 2.0 ** 53 + 4, 2.0 ** 63,
+                    -(2.0 ** 63), 1e300]:
+            for op, fn in py_ops.items():
+                want = [v for v in ints if fn(v, lit)]
+                got = f.read_table(filters=[("x", op, lit)])["x"].to_pylist()
+                assert [v for v in got if fn(v, lit)] == want, (lit, op)
+                if op == "==":
+                    assert len(got) == len(want)    # only the row group holding the value is read
+
+
+def test_decimal_statistics_stored_as_integers_are_not_compared_unscaled():
+    """A decimal stored as INT32 / INT64 has its unscaled integer as statistics (12345 for 123.45);
+    comparing that with a literal in the column's units ruled out a row group that matches."""
+    import decimal
+    table = pa.table({"x": pa.array([decimal.Decimal("123.45"), decimal.Decimal("300.00")], pa.decimal128(9, 2))})
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "dec.parquet")
+        pq.write_table(table, path, row_group_size=1, store_decimal_as_integer=True)
+        want = pq.read_table(path, filters=[("x", "<", decimal.Decimal(200))])["x"].to_pylist()
+        assert want == [decimal.Decimal("123.45")]
+        got = am.ParquetFile(path).read_table(filters=[("x", "<", 200)])["x"].to_pylist()
+        assert want[0] in got
+
+
 # ---------------------------------------------------------------------------- 6. bloom filters
 
 BLOOM_COLUMNS = ("i64", "i32", "u32", "f64", "s", "long", "cat")

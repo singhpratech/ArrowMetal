@@ -4279,7 +4279,7 @@ def _filter_text(filters):
             raise ArrowMetalError("a Parquet filter column name cannot contain = ! < > or ;; got %r" % (col,))
         if isinstance(val, str):
             # Quoted, with a quote or backslash inside escaped, so `;` and `"` in the value survive.
-            lit = '"%s"' % val.replace("\\", "\\\\").replace('"', '\\"')
+            lit = _quoted_literal(val)
         elif isinstance(val, (bool, _np_bool_types())):
             lit = "1" if val else "0"
         elif isinstance(val, numbers.Integral):
@@ -5070,15 +5070,20 @@ _lib.am_lakehouse_batch_stats.restype = ctypes.c_int
 _lib.am_lakehouse_batch_release.argtypes = [_P]
 
 
-_LAKEHOUSE_OPS = ("==", "!=", "<=", ">=", "<", ">")    # the order the ABI's filter parser tries them in
+def _quoted_literal(text):
+    """A double-quoted filter literal, with a quote or backslash inside escaped (`\\"`, `\\\\`), so
+    `;`, `"` and operator characters in the value survive: the grammar the ABI's filter parser reads
+    (include/arrowmetal.h, filter text details)."""
+    return '"%s"' % text.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _lakehouse_filter_text(filters):
     """`[("x", ">", 3), ("d", ">=", datetime.date(2024, 1, 1))]` -> the ABI's filter text. Dates and
     datetimes become ISO 8601 string literals, which the reader parses against the column's type (a
-    naive datetime is taken as UTC). A `bytes` literal (for a binary column) is passed as its UTF-8 text,
-    so it must be valid UTF-8; a filter the text form cannot carry exactly is an error, never a
-    different filter."""
+    naive datetime is taken as UTC). String literals are quoted with `"` and `\\` escaped, so they may
+    hold `;`, `"` and operator characters. A `bytes` literal (for a binary column) is passed as its UTF-8
+    text, so it must be valid UTF-8; a filter the text form cannot carry exactly (a NUL byte, which
+    ends the C string) is an error, never a different filter."""
     if not filters:
         return None
     if isinstance(filters, str):
@@ -5103,13 +5108,13 @@ def _lakehouse_filter_text(filters):
             except UnicodeDecodeError:
                 raise ArrowMetalError("a bytes filter literal must be valid UTF-8 (the filter text carries it "
                                       "as a string); got %r" % (bytes(val),))
-            if '"' in text or ";" in text or "\0" in text:
-                raise ArrowMetalError("a bytes filter literal cannot contain '\"', ';' or NUL; got %r" % (bytes(val),))
-            lit = '"%s"' % text
+            if "\0" in text:
+                raise ArrowMetalError("a bytes filter literal cannot contain NUL; got %r" % (bytes(val),))
+            lit = _quoted_literal(text)
         elif isinstance(val, str):
-            if '"' in val or ";" in val or "\0" in val:
-                raise ArrowMetalError("a string filter literal cannot contain '\"', ';' or NUL; got %r" % (val,))
-            lit = '"%s"' % val
+            if "\0" in val:
+                raise ArrowMetalError("a string filter literal cannot contain NUL; got %r" % (val,))
+            lit = _quoted_literal(val)
         elif isinstance(val, bool):
             lit = "1" if val else "0"
         elif isinstance(val, (int, float)):
@@ -5123,19 +5128,12 @@ def _lakehouse_filter_text(filters):
                     raise TypeError
             except TypeError:
                 raise ArrowMetalError("unsupported filter literal %r for column %r" % (val, col))
-        if not isinstance(col, str) or not col or col.strip() != col or any(c in col for c in ';"\0'):
-            raise ArrowMetalError("filter column name %r cannot be written as filter text" % (col,))
-        text = "%s%s%s" % (col, op, lit)
-        # The parser splits at the first operator it finds, trying them in `_LAKEHOUSE_OPS` order; refuse
-        # a column name or literal that would move the split (`("s", "<", "a==b")`).
-        for cand in _LAKEHOUSE_OPS:
-            at = text.find(cand)
-            if at >= 0:
-                if (at, cand) != (len(col), op):
-                    raise ArrowMetalError("filter %r cannot be written as filter text: the operator %r inside "
-                                          "the column name or literal would be read first" % ((col, op, val), cand))
-                break
-        parts.append(text)
+        # The parser reads the name up to the first operator character, so the name cannot hold one;
+        # the literal can (`("s", "<", "a==b")`).
+        if not isinstance(col, str) or not col or col.strip() != col or any(c in col for c in '=!<>;"\0'):
+            raise ArrowMetalError("filter column name %r cannot be written as filter text (it cannot contain "
+                                  "= ! < > ; \" or NUL)" % (col,))
+        parts.append("%s%s%s" % (col, op, lit))
     return ";".join(parts).encode()
 
 

@@ -136,6 +136,13 @@ public final class MetalContext: @unchecked Sendable {
     /// a 1,000-row `sum` — even though the pipeline was already compiled and cached. Deferring it means
     /// the string is only ever built on a cache miss. Callers must pass the generator expression
     /// directly rather than a `let` computed beforehand, or the saving is lost.
+    /// True when the pipeline cached under `cacheKey` has been built on this context: the tests use it
+    /// to show which kernel a path ran.
+    func hasPipeline(cacheKey: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return pipelines[cacheKey] != nil
+    }
+
     public func pipeline(source: @autoclosure () -> String, function: String, cacheKey: String) throws -> MTLComputePipelineState {
         lock.lock(); defer { lock.unlock() }
         if let p = pipelines[cacheKey] { return p }

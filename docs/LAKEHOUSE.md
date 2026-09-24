@@ -69,11 +69,16 @@ exact values, as pyarrow compares them:
   fields that fits the column's unit;
 - a decimal literal is an integer, a `decimal.Decimal` or a string of ASCII digits that is exact at the
   column's scale and has at most 38 significant digits;
-- a `bytes` literal (for a binary column) is passed through the filter text as UTF-8, so it must be valid
-  UTF-8 without `"`, `;` or NUL; other bytes are refused with an error saying so. The same holds for string
-  literals. A column name or literal containing an operator that the filter text would split at first
-  (`("s", "<", "a==b")`) is refused rather than read as a different filter
-  (`test_filter_text_that_would_change_meaning_is_refused`).
+- a string literal is written into the filter text double-quoted, with `"` and `\` escaped as `\"` and
+  `\\` (the grammar of the Parquet filter text, `include/arrowmetal.h`), so it may hold `;`, `"`, `\` and
+  operator characters (`("s", "<", "a==b")`); a `bytes` literal (for a binary column) is passed the same
+  way as its UTF-8 text, so it must be valid UTF-8. A NUL byte ends the C string and is refused in both,
+  and so are bytes that are not UTF-8, each with an error saying so. Data columns, partition columns and
+  binary columns filter as deltalake and pyiceberg filter them
+  (`test_delta_string_literals_holding_quotes_and_semicolons`,
+  `test_iceberg_string_literals_holding_quotes_and_semicolons`). A column name cannot hold `=`, `!`, `<`,
+  `>`, `;` or `"`, since the filter text's name ends at the first operator character; Python refuses one
+  that does (`test_operators_in_a_literal_are_kept_and_in_a_column_name_refused`).
 
 A literal that does not fit its column is an error naming both, never a crash (`test_filter_literals`,
 `testRowFilterSemantics`, `testDeltaUnknownColumnAndBadLiteral`, `testFilterLiteralsAtTypeEdges`).
@@ -84,8 +89,9 @@ CPU. Row groups are pruned by the same order: the readers decide string and bina
 row-group pruning themselves, byte-wise on the footer's `min_value` / `max_value`, so a decomposed "é"
 (which byte-wise sorts below "f") is kept for `< "f"` (`testStringRowGroupPruningIsByteWise`,
 `test_delta_decomposed_strings_survive_row_group_pruning`). Numeric, date, timestamp and boolean filters
-use the Parquet reader's row-group filter, only where its comparison is exact (an integer column's double
-literal below 2^53 in magnitude; a timestamp stored in the table's unit; floats never under `!=`).
+use the Parquet reader's row-group filter, only where its comparison is exact (an integer column against a
+double literal of any magnitude, compared without rounding the integer; a timestamp stored in the table's
+unit; floats never under `!=`).
 
 Malformed metadata is an error naming the file, never a crash or a hang: Avro blocks whose sizes or counts
 run past the data, records that contain themselves with nothing optional in between, a Delta
