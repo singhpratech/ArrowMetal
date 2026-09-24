@@ -4484,7 +4484,7 @@ class _CsvOptions(ctypes.Structure):
         ("true_values", ctypes.POINTER(ctypes.c_char_p)), ("n_true_values", ctypes.c_int64),
         ("false_values", ctypes.POINTER(ctypes.c_char_p)), ("n_false_values", ctypes.c_int64),
         ("strings_can_be_null", ctypes.c_int32), ("quoted_strings_can_be_null", ctypes.c_int32),
-        ("check_utf8", ctypes.c_int32), ("reserved0", ctypes.c_int32),
+        ("check_utf8", ctypes.c_int32), ("file_access", ctypes.c_int32),
         ("scan_block_bytes", ctypes.c_int64),
     ]
 
@@ -4529,7 +4529,7 @@ def _csv_resolve(read_options, parse_options, convert_options, kw):
          "include_columns": None, "include_missing_columns": False, "column_types": None,
          "null_values": None, "true_values": None, "false_values": None, "strings_can_be_null": False,
          "quoted_strings_can_be_null": True, "check_utf8": True, "decimal_point": ".",
-         "scan_block_bytes": None}
+         "scan_block_bytes": None, "file_access": "read"}
     if read_options is not None:
         if (read_options.encoding or "utf8").lower().replace("-", "") != "utf8":
             raise NotImplementedError("am.read_csv reads UTF-8 only; got encoding=%r" % read_options.encoding)
@@ -4587,7 +4587,7 @@ def read_csv(path, *, read_options=None, parse_options=None, convert_options=Non
              include_columns=None, include_missing_columns=None, column_types=None, null_values=None,
              true_values=None, false_values=None, strings_can_be_null=None,
              quoted_strings_can_be_null=None, check_utf8=None, decimal_point=None,
-             scan_block_bytes=None):
+             scan_block_bytes=None, file_access=None):
     """Reads a CSV file on the GPU and returns a `ColumnSet` of MetalArrays.
 
     Options follow `pyarrow.csv.read_csv`: pass pyarrow's own `ReadOptions`, `ParseOptions` and
@@ -4595,8 +4595,9 @@ def read_csv(path, *, read_options=None, parse_options=None, convert_options=Non
     with pyarrow's rules -- null, int64, bool, date32, time32[s], timestamp[s] / [ns] (UTC when the
     values carry an offset), float64, then string, or binary when a value is not UTF-8.
     `include_columns` projects: the other columns are never converted. Quoted newlines are always
-    parsed (pyarrow's `newlines_in_values=True`). `scan_block_bytes` sets how many bytes each GPU
-    thread scans in the structure pass; it changes only the speed.
+    parsed (pyarrow's `newlines_in_values=True`). Two ArrowMetal keywords change only the speed:
+    `scan_block_bytes`, the bytes each GPU thread scans in the structure pass, and `file_access`,
+    "read" (pread into a Metal buffer, the default) or "map" (mmap the file, no copy).
 
         import arrowmetal as am
         cols = am.read_csv("trades.csv", include_columns=["price", "qty"])
@@ -4609,7 +4610,8 @@ def read_csv(path, *, read_options=None, parse_options=None, convert_options=Non
         include_missing_columns=include_missing_columns, column_types=column_types,
         null_values=null_values, true_values=true_values, false_values=false_values,
         strings_can_be_null=strings_can_be_null, quoted_strings_can_be_null=quoted_strings_can_be_null,
-        check_utf8=check_utf8, decimal_point=decimal_point, scan_block_bytes=scan_block_bytes))
+        check_utf8=check_utf8, decimal_point=decimal_point, scan_block_bytes=scan_block_bytes,
+        file_access=file_access))
     c = _CsvOptions()
     _lib.am_csv_options_init(ctypes.byref(c))
     c.delimiter = _csv_char(o["delimiter"], "delimiter")
@@ -4644,6 +4646,9 @@ def read_csv(path, *, read_options=None, parse_options=None, convert_options=Non
     c.quoted_strings_can_be_null = 1 if o["quoted_strings_can_be_null"] else 0
     c.check_utf8 = 1 if o["check_utf8"] else 0
     c.scan_block_bytes = int(o["scan_block_bytes"] or 0)
+    if o["file_access"] not in ("read", "map"):
+        raise ValueError("am.read_csv: file_access must be \"read\" or \"map\", got %r" % (o["file_access"],))
+    c.file_access = 0 if o["file_access"] == "read" else 1
 
     reader = _P()
     _check(_lib.am_csv_open(os.fspath(path).encode(), ctypes.byref(c), ctypes.byref(reader)))

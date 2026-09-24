@@ -173,5 +173,14 @@ public struct CSVReadOptions: Sendable {
     /// Bytes per GPU thread in the structure scan. Only the speed depends on it.
     public var scanBlockBytes = CSVReadOptions.defaultScanBlockBytes
 
+    /// How the file reaches the GPU. Only the speed depends on it.
+    public enum FileAccess: Sendable {
+        /// pread into a page-aligned shared Metal buffer (parallel ranges).
+        case read
+        /// mmap the file and wrap the mapping as a Metal buffer, no copy.
+        case map
+    }
+    public var fileAccess = FileAccess.read
+
     public init() {}
 }

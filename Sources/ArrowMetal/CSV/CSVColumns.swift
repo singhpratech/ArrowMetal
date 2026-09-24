@@ -20,7 +20,7 @@ struct CSVColParams {
     var expectZone: UInt32 = 0
     var isSigned: UInt32 = 1
     var maxHex: UInt32 = 16
-    var pad0: UInt32 = 0
+    var hasSpans: UInt32 = 0
     var limPos: UInt64 = 0
     var limNeg: UInt64 = 0
 }
@@ -90,9 +90,9 @@ final class CSVColumnConverter {
         let source: Int
         let forced: CSVColumnType?
         var spans: MetalArrowBuffer! = nil
-        var complexCount: MetalArrowBuffer! = nil
         var side: MetalArrowBuffer! = nil
         var mask: MetalArrowBuffer! = nil
+        var range: MetalArrowBuffer! = nil
         var type: CSVColumnType = .null
         var inferred = false
         var values: MetalArrowBuffer! = nil
@@ -123,6 +123,7 @@ final class CSVColumnConverter {
         P.nNull = UInt32(o.nullValues.count)
         P.nTrue = UInt32(o.trueValues.count)
         P.nFalse = UInt32(o.falseValues.count)
+        P.hasSpans = w.spans == nil ? 0 : 1
         return P
     }
 
@@ -149,39 +150,59 @@ final class CSVColumnConverter {
         return b
     }
 
-    func convert(plan: [(name: String, source: Int?)], keep: inout [AnyObject]) throws -> [AnyMetalArray] {
+    func convert(plan: [(name: String, source: Int?)], complexCounts: [Int], keep: inout [AnyObject]) throws -> [AnyMetalArray] {
         try buildLists(keep: &keep)
         var work: [Work?] = plan.map { p in
             p.source.map { Work(source: $0, forced: options.columnTypes[p.name]) }
         }
         let live = work.compactMap { $0 }
 
-        // Phase 1: content spans; complex fields (doubled quotes, text after a closing quote) unescaped.
-        for w in live {
+        // Phase 1: a column with complex fields (doubled quotes, text after a closing quote; counted by
+        // csv_check_fields) materialises its spans and unescapes them into a side buffer.
+        for w in live { w.side = dummy }
+        for w in live where nRows > 0 && complexCounts[w.source] > 0 {
             w.spans = try alloc(nRows * 8, &keep)
-            w.complexCount = try alloc(4, zeroed: true, &keep)
-            w.side = dummy
-            if nRows > 0 { try spans(w) }
+            try spans(w)
+            try unescape(w, keep: &keep)
+        }
+
+        // Phase 2: inference for every column without an override. A speculative pass finds the range
+        // of first kinds; only a column whose rows disagree runs the full classification.
+        let inferred = live.filter { $0.forced == nil }
+        for w in inferred {
+            w.inferred = true
+            w.range = try alloc(8, &keep)
+            w.range.mutableTyped(UInt32.self)[0] = UInt32.max
+            w.range.mutableTyped(UInt32.self)[1] = 0
+            if nRows > 0 { try kindRange(w) }
         }
         try ctx.syncPoint()
-        for w in live where w.complexCount.typed(UInt32.self)[0] > 0 { try unescape(w, keep: &keep) }
-
-        // Phase 2: inference for every column without an override.
-        for w in live where w.forced == nil {
+        reader.mark("unescape + kind range")
+        var undecided: [Work] = []
+        for w in inferred {
+            let lo = w.range.typed(UInt32.self)[0], hi = w.range.typed(UInt32.self)[1]
+            if lo == UInt32.max { w.type = .null }                              // no non-null value
+            else if lo == hi, let k = CSVKind(rawValue: Int(lo)) { w.type = k.type }
+            else { undecided.append(w) }
+        }
+        for w in undecided {
             w.mask = try alloc(4, &keep)
             w.mask.mutableTyped(UInt32.self)[0] = 0xFFF
-            w.inferred = true
-            if nRows > 0 { try classify(w) }
+            try classify(w)
         }
-        try ctx.syncPoint()
-        for w in live {
-            w.type = w.forced ?? CSVKind.first(in: w.mask.typed(UInt32.self)[0]).type
+        if !undecided.isEmpty {
+            try ctx.syncPoint()
+            reader.mark("classify")
+            for w in undecided { w.type = CSVKind.first(in: w.mask.typed(UInt32.self)[0]).type }
         }
+        for w in live where w.forced != nil { w.type = w.forced! }
 
         // Phase 3: conversion.
         for w in live { try dispatchConversion(w, keep: &keep) }
         try ctx.syncPoint()
+        reader.mark("convert")
         for w in live { try checkErrors(w) }
+        reader.mark("check errors")
 
         var out: [AnyMetalArray] = []
         for (j, p) in plan.enumerated() {
@@ -192,21 +213,33 @@ final class CSVColumnConverter {
             }
             work[j] = nil
         }
+        reader.mark("finish (strings)")
         return out
     }
 
     // MARK: phases
 
+    private func kindRange(_ w: Work) throws {
+        var P = params(w)
+        let pso = try reader.pipeline("csv_kind_range")
+        try reader.gpu("csv_kind_range") { enc in
+            enc.setComputePipelineState(pso)
+            bindRow(enc, w, &P)
+            enc.setBuffer(w.range.mtl, offset: w.range.offset, index: 6)
+            enc.setBuffer(events.mtl, offset: events.offset, index: 7)
+            Dispatch.dispatch1D(enc, pso, count: nRows)
+        }
+    }
+
     private func spans(_ w: Work) throws {
         var P = params(w)
         let pso = try reader.pipeline("csv_spans")
-        try ctx.run { enc in
+        try reader.gpu("csv_spans") { enc in
             enc.setComputePipelineState(pso)
             enc.setBuffer(file.mtl, offset: file.offset, index: 0)
             enc.setBuffer(events.mtl, offset: events.offset, index: 1)
             enc.setBytes(&P, length: MemoryLayout<CSVColParams>.size, index: 2)
             enc.setBuffer(w.spans.mtl, offset: w.spans.offset, index: 3)
-            enc.setBuffer(w.complexCount.mtl, offset: w.complexCount.offset, index: 4)
             Dispatch.dispatch1D(enc, pso, count: nRows)
         }
     }
@@ -215,7 +248,7 @@ final class CSVColumnConverter {
         var P = params(w)
         let lens = try alloc(nRows * 4, &keep)
         let pLen = try reader.pipeline("csv_side_len")
-        try ctx.run { enc in
+        try reader.gpu("csv_side_len") { enc in
             enc.setComputePipelineState(pLen)
             enc.setBuffer(w.spans.mtl, offset: w.spans.offset, index: 0)
             enc.setBytes(&P, length: MemoryLayout<CSVColParams>.size, index: 1)
@@ -229,7 +262,7 @@ final class CSVColumnConverter {
         guard total >= 0 else { throw CSVError.io("unescaped quoted fields of one column exceed 2 GiB") }
         w.side = try alloc(total, &keep)
         let pUn = try reader.pipeline("csv_unescape")
-        try ctx.run { enc in
+        try reader.gpu("csv_unescape") { enc in
             enc.setComputePipelineState(pUn)
             enc.setBuffer(file.mtl, offset: file.offset, index: 0)
             enc.setBuffer(events.mtl, offset: events.offset, index: 1)
@@ -244,7 +277,8 @@ final class CSVColumnConverter {
     private func bindRow(_ enc: MTLComputeCommandEncoder, _ w: Work, _ P: inout CSVColParams) {
         enc.setBuffer(file.mtl, offset: file.offset, index: 0)
         enc.setBuffer(w.side.mtl, offset: w.side.offset, index: 1)
-        enc.setBuffer(w.spans.mtl, offset: w.spans.offset, index: 2)
+        let sp = w.spans ?? dummy!
+        enc.setBuffer(sp.mtl, offset: sp.offset, index: 2)
         enc.setBytes(&P, length: MemoryLayout<CSVColParams>.size, index: 3)
         enc.setBuffer(lists.mtl, offset: lists.offset, index: 4)
         enc.setBuffer(listBytes.mtl, offset: listBytes.offset, index: 5)
@@ -253,10 +287,11 @@ final class CSVColumnConverter {
     private func classify(_ w: Work) throws {
         var P = params(w)
         let pso = try reader.pipeline("csv_classify")
-        try ctx.run { enc in
+        try reader.gpu("csv_classify") { enc in
             enc.setComputePipelineState(pso)
             bindRow(enc, w, &P)
             enc.setBuffer(w.mask.mtl, offset: w.mask.offset, index: 6)
+            enc.setBuffer(events.mtl, offset: events.offset, index: 7)
             Dispatch.dispatch1D(enc, pso, count: nRows)
         }
     }
@@ -339,19 +374,20 @@ final class CSVColumnConverter {
         guard nRows > 0 else { return }
         let pso = try reader.pipeline(fn)
         let out = w.wide ?? w.values
-        try ctx.run { enc in
+        try reader.gpu(fn) { enc in
             enc.setComputePipelineState(pso)
             bindRow(enc, w, &P)
             if let out { enc.setBuffer(out.mtl, offset: out.offset, index: 6) }
             enc.setBuffer(w.validity.mtl, offset: w.validity.offset, index: 7)
             enc.setBuffer(w.err.mtl, offset: w.err.offset, index: 8)
+            enc.setBuffer(events.mtl, offset: events.offset, index: 11)
             extra?(enc)
             Dispatch.dispatch1D(enc, pso, count: nRows)
         }
         if let lim = intLimits(w.type), lim.width < 8 {
             let pN = try reader.pipeline("csv_narrow")
             var n = UInt32(nRows), width = UInt32(lim.width)
-            try ctx.run { enc in
+            try reader.gpu("csv_narrow") { enc in
                 enc.setComputePipelineState(pN)
                 enc.setBuffer(w.wide.mtl, offset: w.wide.offset, index: 0)
                 enc.setBuffer(w.values.mtl, offset: w.values.offset, index: 1)
@@ -364,11 +400,9 @@ final class CSVColumnConverter {
 
     /// The (unescaped) text of row `r`, for error messages and the CPU float fallback.
     private func text(_ w: Work, _ r: Int) -> [UInt8] {
-        let sp = w.spans.typed(UInt32.self)
-        let start = Int(sp[2 * r]), word = sp[2 * r + 1]
-        let len = Int(word & 0x3FFF_FFFF)
-        let base = (word & 0x4000_0000) != 0 ? w.side.contents : file.contents
-        return Array(UnsafeRawBufferPointer(start: base.advanced(by: start), count: len))
+        let bytes = UnsafeRawBufferPointer(start: file.contents, count: dataEnd)
+        return reader.fieldValue(events.typed(UInt32.self), (firstRecord + r) * nCols + w.source, bytes,
+                                 dataStart: dataStart)
     }
 
     private func checkErrors(_ w: Work) throws {
@@ -487,14 +521,16 @@ final class CSVColumnConverter {
         if n > 0 && total > 0 {
             var P = params(w)
             let pso = try reader.pipeline("csv_str_copy")
-            try ctx.run { enc in
+            try reader.gpu("csv_str_copy") { enc in
                 enc.setComputePipelineState(pso)
                 enc.setBuffer(file.mtl, offset: file.offset, index: 0)
                 enc.setBuffer(w.side.mtl, offset: w.side.offset, index: 1)
-                enc.setBuffer(w.spans.mtl, offset: w.spans.offset, index: 2)
+                let sp = w.spans ?? dummy!
+                enc.setBuffer(sp.mtl, offset: sp.offset, index: 2)
                 enc.setBytes(&P, length: MemoryLayout<CSVColParams>.size, index: 3)
                 enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 4)
                 enc.setBuffer(data.mtl, offset: data.offset, index: 5)
+                enc.setBuffer(events.mtl, offset: events.offset, index: 6)
                 Dispatch.dispatch1D(enc, pso, count: n)
             }
         }

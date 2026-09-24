@@ -33,7 +33,7 @@ struct AMCSVOptions {
     var stringsCanBeNull: Int32
     var quotedStringsCanBeNull: Int32
     var checkUTF8: Int32
-    var reserved0: Int32
+    var fileAccess: Int32
     var scanBlockBytes: Int64
 }
 
@@ -77,7 +77,7 @@ public func am_csv_options_init(_ o: UnsafeMutableRawPointer?) {
         columnNames: nil, nColumnNames: 0, includeColumns: nil, nIncludeColumns: 0,
         columnTypeNames: nil, columnTypeFormats: nil, nColumnTypes: 0,
         nullValues: nil, nNullValues: 0, trueValues: nil, nTrueValues: 0, falseValues: nil, nFalseValues: 0,
-        stringsCanBeNull: 0, quotedStringsCanBeNull: 1, checkUTF8: 1, reserved0: 0, scanBlockBytes: 0)
+        stringsCanBeNull: 0, quotedStringsCanBeNull: 1, checkUTF8: 1, fileAccess: 0, scanBlockBytes: 0)
 }
 
 private func strings(_ p: UnsafePointer<UnsafePointer<CChar>?>?, _ n: Int64, _ what: String) throws -> [String]? {
@@ -125,6 +125,11 @@ func csvOptions(_ c: AMCSVOptions) throws -> CSVReadOptions {
     o.quotedStringsCanBeNull = c.quotedStringsCanBeNull != 0
     o.checkUTF8 = c.checkUTF8 != 0
     if c.scanBlockBytes > 0 { o.scanBlockBytes = Int(c.scanBlockBytes) }
+    switch c.fileAccess {
+    case 0: o.fileAccess = .read
+    case 1: o.fileAccess = .map
+    default: throw CSVError.invalidOptions("am_csv_open: `file_access` must be 0 (read) or 1 (map), got \(c.fileAccess)")
+    }
     return o
 }
 

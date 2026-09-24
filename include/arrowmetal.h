@@ -1592,7 +1592,7 @@ typedef struct am_csv_options {
     int32_t strings_can_be_null;                // 0
     int32_t quoted_strings_can_be_null;         // 1
     int32_t check_utf8;                         // 1: an inferred column that is not UTF-8 is binary
-    int32_t reserved0;                          // 0
+    int32_t file_access;                        // 0: pread into a Metal buffer; 1: mmap, no copy
     int64_t scan_block_bytes;                   // 0: the default (bytes per GPU thread in the scan)
 } am_csv_options;
 

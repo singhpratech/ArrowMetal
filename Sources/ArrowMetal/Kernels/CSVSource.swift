@@ -75,14 +75,44 @@ enum CSVSource {
         uint hi = min(lo + P.blockBytes, P.dataEnd);
         uint s0 = 0u, s1 = 1u, s2 = 2u, s3 = 3u, s4 = 4u;
         uint c0 = 0u, c1 = 0u, c2 = 0u, c3 = 0u, c4 = 0u;
-        for (uint i = lo; i < hi; i++) {
-            uint k = csv_class(data[i], P);
-            uint t = P.trans[k], e = P.emit[k];
-            c0 += (e >> s0) & 1u; s0 = (t >> (3u * s0)) & 7u;
-            c1 += (e >> s1) & 1u; s1 = (t >> (3u * s1)) & 7u;
-            c2 += (e >> s2) & 1u; s2 = (t >> (3u * s2)) & 7u;
-            c3 += (e >> s3) & 1u; s3 = (t >> (3u * s3)) & 7u;
-            c4 += (e >> s4) & 1u; s4 = (t >> (3u * s4)) & 7u;
+        // All five runs until they have collapsed onto at most two states (in practice: the first
+        // newline outside quotes sends every run but "inside quotes" to line start) ...
+        uint i = lo;
+        bool merged = false;
+        uint a = 0u, bb = 0u;
+        while (i < hi) {
+            uint stop = min(i + 16u, hi);
+            for (; i < stop; i++) {
+                uint k = csv_class(data[i], P);
+                uint t = P.trans[k], e = P.emit[k];
+                c0 += (e >> s0) & 1u; s0 = (t >> (3u * s0)) & 7u;
+                c1 += (e >> s1) & 1u; s1 = (t >> (3u * s1)) & 7u;
+                c2 += (e >> s2) & 1u; s2 = (t >> (3u * s2)) & 7u;
+                c3 += (e >> s3) & 1u; s3 = (t >> (3u * s3)) & 7u;
+                c4 += (e >> s4) & 1u; s4 = (t >> (3u * s4)) & 7u;
+            }
+            a = s0; bb = s0;
+            bool two = true;
+            uint ss[4] = {s1, s2, s3, s4};
+            for (uint j = 0u; j < 4u; j++) {
+                if (ss[j] != a) { if (bb == a) bb = ss[j]; else if (ss[j] != bb) two = false; }
+            }
+            if (two) { merged = true; break; }
+        }
+        // ... then only the (at most) two distinct runs, each standing for the runs that share its state.
+        if (merged && i < hi) {
+            uint sa = a, sb = bb, ca = 0u, cb = 0u;
+            for (; i < hi; i++) {
+                uint k = csv_class(data[i], P);
+                uint t = P.trans[k], e = P.emit[k];
+                ca += (e >> sa) & 1u; sa = (t >> (3u * sa)) & 7u;
+                cb += (e >> sb) & 1u; sb = (t >> (3u * sb)) & 7u;
+            }
+            if (s0 == a) { c0 += ca; s0 = sa; } else { c0 += cb; s0 = sb; }
+            if (s1 == a) { c1 += ca; s1 = sa; } else { c1 += cb; s1 = sb; }
+            if (s2 == a) { c2 += ca; s2 = sa; } else { c2 += cb; s2 = sb; }
+            if (s3 == a) { c3 += ca; s3 = sa; } else { c3 += cb; s3 = sb; }
+            if (s4 == a) { c4 += ca; s4 = sa; } else { c4 += cb; s4 = sb; }
         }
         BlockSum r;
         r.ends = s0 | (s1 << 3) | (s2 << 6) | (s3 << 9) | (s4 << 12);
@@ -203,18 +233,6 @@ enum CSVSource {
         }
     }
 
-    // Every record has nCols fields exactly when the record ends sit at k = nCols - 1, 2 nCols - 1, ...
-    kernel void csv_check_rows(device const uint* events [[buffer(0)]],
-                               constant uint& nEvents [[buffer(1)]],
-                               constant uint& nCols [[buffer(2)]],
-                               device atomic_uint* firstBad [[buffer(3)]],
-                               uint k [[thread_position_in_grid]]) {
-        if (k >= nEvents) return;
-        bool isEnd = (events[k] >> 31) != 0u;
-        bool expect = ((k + 1u) % nCols) == 0u;
-        if (isEnd != expect) atomic_fetch_min_explicit(firstBad, k, memory_order_relaxed);
-    }
-
     // ------------------------------------------------------------------ columns
 
     struct CsvCol {
@@ -235,7 +253,7 @@ enum CSVSource {
         uint expectZone;     // timestamps: 1 when the target type carries a timezone
         uint isSigned;
         uint maxHex;         // integers: at most this many hex digits after 0x
-        uint pad0;
+        uint hasSpans;       // 1 when the column's spans were materialised (it has complex fields)
         ulong limPos;
         ulong limNeg;
     };
@@ -286,11 +304,36 @@ enum CSVSource {
         return len;
     }
 
+    // One pass over every boundary. Every record has nCols fields exactly when the record ends sit at
+    // k = nCols - 1, 2 nCols - 1, ...; the first boundary that breaks the pattern is reported. The same
+    // pass counts each column's complex fields (a doubled quote, or text after the closing quote): a
+    // column with none, nearly all of them, never materialises spans, its kernels derive each row's
+    // span from the boundaries.
+    kernel void csv_check_fields(device const uchar* d [[buffer(0)]],
+                                 device const uint* ev [[buffer(1)]],
+                                 constant CsvCol& P [[buffer(2)]],
+                                 constant uint& nEvents [[buffer(3)]],
+                                 device atomic_uint* firstBad [[buffer(4)]],
+                                 device atomic_uint* complexCounts [[buffer(5)]],
+                                 uint k [[thread_position_in_grid]]) {
+        if (k >= nEvents) return;
+        bool isEnd = (ev[k] >> 31) != 0u;
+        bool expect = ((k + 1u) % P.nCols) == 0u;
+        if (isEnd != expect) atomic_fetch_min_explicit(firstBad, k, memory_order_relaxed);
+        if (P.quote > 255u) return;
+        uint2 raw = csv_raw(d, ev, k, P);
+        if (raw.x < raw.y && (uint)d[raw.x] == P.quote) {
+            bool simple; uint cs;
+            csv_quoted(d, raw.x, raw.y, P, simple, cs);
+            if (!simple) atomic_fetch_add_explicit(complexCounts + (k % P.nCols), 1u, memory_order_relaxed);
+        }
+    }
+
+    // Materialised spans, for a column with complex fields; those are marked for `csv_unescape`.
     kernel void csv_spans(device const uchar* d [[buffer(0)]],
                           device const uint* ev [[buffer(1)]],
                           constant CsvCol& P [[buffer(2)]],
                           device uint2* spans [[buffer(3)]],
-                          device atomic_uint* complexCount [[buffer(4)]],
                           uint r [[thread_position_in_grid]]) {
         if (r >= P.nRows) return;
         uint k = (P.firstRecord + r) * P.nCols + P.col;
@@ -303,7 +346,6 @@ enum CSVSource {
         uint len = csv_quoted(d, raw.x, raw.y, P, simple, cs);
         if (simple) { spans[r] = uint2(cs, len | CSV_QUOTED); return; }
         spans[r] = uint2(raw.x, len | CSV_QUOTED | CSV_SIDE);                 // unescaped later
-        atomic_fetch_add_explicit(complexCount, 1u, memory_order_relaxed);
     }
 
     kernel void csv_side_len(device const uint2* spans [[buffer(0)]],
@@ -344,6 +386,19 @@ enum CSVSource {
 
     inline device const uchar* csv_ptr(uint2 sp, device const uchar* d, device const uchar* side) {
         return ((sp.y & CSV_SIDE) != 0u ? side : d) + sp.x;
+    }
+
+    // Row r's content span: the materialised one, or derived from the boundaries (a column without
+    // complex fields, where every quoted field is one span of the file).
+    inline uint2 csv_span(uint r, device const uint2* spans, device const uint* ev, device const uchar* d,
+                          constant CsvCol& P) {
+        if (P.hasSpans != 0u) return spans[r];
+        uint k = (P.firstRecord + r) * P.nCols + P.col;
+        uint2 raw = csv_raw(d, ev, k, P);
+        if (P.quote > 255u || raw.x >= raw.y || (uint)d[raw.x] != P.quote) return uint2(raw.x, raw.y - raw.x);
+        bool simple; uint cs;
+        uint len = csv_quoted(d, raw.x, raw.y, P, simple, cs);
+        return uint2(cs, len | CSV_QUOTED);
     }
 
     inline bool csv_match(device const uchar* p, uint len, uint first, uint count,
@@ -395,13 +450,27 @@ enum CSVSource {
         if (p[0] == (uchar)0x2Du) { if (!isSigned) return false; neg = true; i = 1u; }
         if (i >= len) return false;
         ulong lim = neg ? limNeg : limPos;
+        // No 64-bit division (slow on the GPU): up to 19 significant digits cannot overflow a ulong
+        // (10^19 - 1 < 2^64), so they accumulate freely and only the final value is compared with
+        // the limit; a 20th significant digit is checked by hand.
         ulong acc = 0UL;
+        uint sig = 0u;
         for (; i < len; i++) {
             uint dd = (uint)p[i] - 48u;
             if (dd > 9u) return false;
-            if (acc > (lim - (ulong)dd) / 10UL) return false;
-            acc = acc * 10UL + (ulong)dd;
+            if (sig < 19u) {
+                acc = acc * 10UL + (ulong)dd;
+                if (acc != 0UL) sig++;
+            } else {
+                if (sig > 19u || acc > 1844674407370955161UL) return false;
+                ulong t = acc * 10UL;
+                ulong nv = t + (ulong)dd;
+                if (nv < t) return false;
+                acc = nv;
+                sig++;
+            }
         }
+        if (acc > lim) return false;
         out = neg ? (0UL - acc) : acc;
         return true;
     }
@@ -574,6 +643,55 @@ enum CSVSource {
     #define K_BIN 2048u
     #define K_TYPED (K_INT | K_BOOL | K_DATE | K_TIME | K_TS | K_TSNS | K_TSZ | K_TSZNS | K_REAL)
 
+    // The first kind (in Arrow's order) a non-null value converts as; 0xFFFFFFFF for a null value.
+    inline uint csv_first_kind(device const uchar* p, uint len, constant CsvCol& P,
+                               device const uint* lists, device const uchar* lbytes) {
+        ulong iv;
+        if (csv_int(p, len, true, 16u, 0x7FFFFFFFFFFFFFFFUL, 0x8000000000000000UL, iv)) return 1u;
+        if (csv_match(p, len, P.nNull, P.nTrue, lists, lbytes) || csv_match(p, len, P.nNull + P.nTrue, P.nFalse, lists, lbytes)) return 2u;
+        int days;
+        if (csv_date(p, len, days)) return 3u;
+        long tv;
+        if (csv_time(p, len, 0u, tv)) return 4u;
+        bool zone, frac;
+        if (csv_iso(p, len, 9u, tv, zone, frac)) return zone ? (frac ? 8u : 7u) : (frac ? 6u : 5u);
+        ulong bits;
+        if (fp_parse(p, len, FP_CSV, (uchar)P.decimalPoint, false, bits) != FP_INVALID) return 9u;
+        if ((P.flags & CSV_UTF8) == 0u || csv_utf8(p, len)) return 10u;
+        return 11u;
+    }
+
+    // Speculative inference: the smallest and largest first-kind over the non-null rows. When they are
+    // equal, that kind is the column's type (every row converts as it, and no row converts as any
+    // earlier kind); otherwise the host runs the full `csv_classify`.
+    kernel void csv_kind_range(device const uchar* d [[buffer(0)]],
+                               device const uchar* side [[buffer(1)]],
+                               device const uint2* spans [[buffer(2)]],
+                               constant CsvCol& P [[buffer(3)]],
+                               device const uint* lists [[buffer(4)]],
+                               device const uchar* lbytes [[buffer(5)]],
+                               device atomic_uint* range [[buffer(6)]],
+                               device const uint* ev [[buffer(7)]],
+                               uint r [[thread_position_in_grid]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+        uint lo = 0xFFFFFFFFu, hi = 0u;
+        if (r < P.nRows) {
+            uint2 sp = csv_span(r, spans, ev, d, P);
+            device const uchar* p = csv_ptr(sp, d, side);
+            uint len = sp.y & CSV_LEN;
+            bool quoted = (sp.y & CSV_QUOTED) != 0u;
+            if (!csv_is_null(p, len, quoted, P, lists, lbytes)) {
+                uint k = csv_first_kind(p, len, P, lists, lbytes);
+                lo = k; hi = k;
+            }
+        }
+        lo = simd_min(lo); hi = simd_max(hi);
+        if (lane == 0u && lo != 0xFFFFFFFFu) {
+            atomic_fetch_min_explicit(range, lo, memory_order_relaxed);
+            atomic_fetch_max_explicit(range + 1, hi, memory_order_relaxed);
+        }
+    }
+
     kernel void csv_classify(device const uchar* d [[buffer(0)]],
                              device const uchar* side [[buffer(1)]],
                              device const uint2* spans [[buffer(2)]],
@@ -581,12 +699,13 @@ enum CSVSource {
                              device const uint* lists [[buffer(4)]],
                              device const uchar* lbytes [[buffer(5)]],
                              device atomic_uint* colMask [[buffer(6)]],
+                             device const uint* ev [[buffer(7)]],
                              uint r [[thread_position_in_grid]],
                              uint lane [[thread_index_in_simdgroup]]) {
         uint ok = 0xFFFFFFFFu;
         if (r < P.nRows) {
             uint alive = atomic_load_explicit(colMask, memory_order_relaxed);
-            uint2 sp = spans[r];
+            uint2 sp = csv_span(r, spans, ev, d, P);
             device const uchar* p = csv_ptr(sp, d, side);
             uint len = sp.y & CSV_LEN;
             bool quoted = (sp.y & CSV_QUOTED) != 0u;
@@ -628,7 +747,7 @@ enum CSVSource {
         bool valid = false; bool bad = false; \\
         device const uchar* p = d; uint len = 0u; bool quoted = false; bool isNull = false; \\
         if (r < P.nRows) { \\
-            uint2 sp = spans[r]; \\
+            uint2 sp = csv_span(r, spans, ev, d, P); \\
             p = csv_ptr(sp, d, side); len = sp.y & CSV_LEN; quoted = (sp.y & CSV_QUOTED) != 0u; \\
             isNull = csv_is_null(p, len, quoted, P, lists, lbytes); \\
         }
@@ -647,6 +766,7 @@ enum CSVSource {
         device const uchar* lbytes [[buffer(5)]], \\
         device uint* outValid [[buffer(7)]], \\
         device atomic_uint* err [[buffer(8)]], \\
+        device const uint* ev [[buffer(11)]], \\
         uint r [[thread_position_in_grid]], \\
         uint lane [[thread_index_in_simdgroup]]
 
@@ -786,11 +906,12 @@ enum CSVSource {
                              constant CsvCol& P [[buffer(3)]],
                              device const int* offsets [[buffer(4)]],
                              device uchar* out [[buffer(5)]],
+                             device const uint* ev [[buffer(6)]],
                              uint r [[thread_position_in_grid]]) {
         if (r >= P.nRows) return;
         int o = offsets[r], n = offsets[r + 1] - o;
         if (n <= 0) return;
-        device const uchar* p = csv_ptr(spans[r], d, side);
+        device const uchar* p = csv_ptr(csv_span(r, spans, ev, d, P), d, side);
         for (int i = 0; i < n; i++) out[o + i] = p[i];
     }
     """

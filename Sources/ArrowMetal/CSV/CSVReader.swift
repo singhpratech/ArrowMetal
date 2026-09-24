@@ -3,7 +3,8 @@ import Metal
 
 // Reading a CSV file on the GPU.
 //
-//   mmap the file, wrap it as one MTLBuffer (no copy)
+//   bring the file into one Metal buffer: parallel pread into a page-aligned shared buffer (the
+//   default), or mmap + wrap with no copy (`CSVReadOptions.fileAccess = .map`)
 //     -> structure pass (CSVScan.swift): every field and record boundary, quote-aware
 //     -> csv_check_rows: every record has the header's width, or the error names the row
 //     -> per projected column: csv_spans (content span per row; doubled quotes unescaped into a side
@@ -27,29 +28,82 @@ public final class CSVReader: @unchecked Sendable {
     public private(set) var numRows = 0
 
     private let fileSize: Int
-    private let region: MappedRegion?
+
+    /// `ARROWMETAL_CSV_TRACE=1` prints the wall time of each phase of a read to stderr; `=2` also
+    /// runs every kernel in its own command buffer and prints its GPU time.
+    static let trace = ProcessInfo.processInfo.environment["ARROWMETAL_CSV_TRACE"] != nil
+    static let traceKernels = ProcessInfo.processInfo.environment["ARROWMETAL_CSV_TRACE"] == "2"
+
+    /// Encodes one kernel (or a short chain); under `ARROWMETAL_CSV_TRACE=2` reports its GPU time.
+    func gpu(_ name: String, _ body: (MTLComputeCommandEncoder) throws -> Void) throws {
+        let cb = try context.run(body)
+        if Self.traceKernels, let cb {
+            FileHandle.standardError.write(String(format: "gpu %@ %.3f ms\n", name as NSString,
+                                                  (cb.gpuEndTime - cb.gpuStartTime) * 1e3).data(using: .utf8)!)
+        }
+    }
+    private var traceClock: UInt64 = 0
+    func mark(_ label: String) {
+        guard Self.trace else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        if traceClock != 0 {
+            FileHandle.standardError.write(String(format: "csv %-22@ %8.2f ms\n", label as NSString,
+                                                  Double(now - traceClock) / 1e6).data(using: .utf8)!)
+        }
+        traceClock = now
+    }
 
     public init(path: String, options: CSVReadOptions = CSVReadOptions(), context: MetalContext = .shared) throws {
         self.path = path
         self.options = options
         self.context = context
-        let fd = open(path, O_RDONLY)
-        guard fd >= 0 else { throw CSVError.io("cannot open \(path): \(String(cString: strerror(errno)))") }
-        defer { close(fd) }
         var st = stat()
-        guard fstat(fd, &st) == 0 else { throw CSVError.io("cannot stat \(path)") }
+        guard stat(path, &st) == 0 else { throw CSVError.io("cannot open \(path): \(String(cString: strerror(errno)))") }
         fileSize = Int(st.st_size)
         guard fileSize < 0x8000_0000 else {
             throw CSVError.io("\(path) is \(fileSize) bytes; files of 2 GiB and more are not supported yet")
         }
-        if fileSize == 0 {
-            region = nil
-        } else {
-            do {
-                region = try MappedRegion(fd: fd, fileOffset: 0, length: roundUp(fileSize, to: metalPageSize()))
-            } catch {
-                throw CSVError.io("cannot map \(path): \(error)")
+    }
+
+    /// The whole file as one Metal buffer.
+    ///
+    /// `.read` (the default) preads it, eight ranges in parallel, into a page-aligned shared buffer
+    /// from the context's pool. `.map` maps it and wraps the mapping with no copy; the GPU then pays
+    /// to make the mapped pages resident on the first kernel that touches them, which measured slower
+    /// than the copy on a warm page cache (Benchmarks/csv_bench.py records both).
+    private func loadFile() throws -> MetalArrowBuffer {
+        let fd = open(path, O_RDONLY)
+        guard fd >= 0 else { throw CSVError.io("cannot open \(path): \(String(cString: strerror(errno)))") }
+        defer { close(fd) }
+        switch options.fileAccess {
+        case .map:
+            let region: MappedRegion
+            do { region = try MappedRegion(fd: fd, fileOffset: 0, length: roundUp(fileSize, to: metalPageSize())) }
+            catch { throw CSVError.io("cannot map \(path): \(error)") }
+            return try MetalArrowBuffer.wrapOrCopy(UnsafeRawPointer(region.base), byteCount: fileSize,
+                                                   keepAlive: region, context: context).0
+        case .read:
+            let buf = try MetalArrowBuffer.allocate(byteCount: fileSize, zeroed: false, context: context)
+            let base = buf.mutableContents
+            let parts = Swift.max(1, Swift.min(8, fileSize / (4 << 20)))
+            let step = roundUp((fileSize + parts - 1) / parts, to: metalPageSize())
+            var failed = Int32(0)
+            let failLock = NSLock()
+            DispatchQueue.concurrentPerform(iterations: parts) { i in
+                var off = i * step
+                let end = Swift.min(fileSize, off + step)
+                while off < end {
+                    let n = pread(fd, base + off, end - off, off_t(off))
+                    if n <= 0 {
+                        let e = n == 0 ? EIO : errno
+                        failLock.lock(); if failed == 0 { failed = e }; failLock.unlock()
+                        return
+                    }
+                    off += n
+                }
             }
+            guard failed == 0 else { throw CSVError.io("cannot read \(path): \(String(cString: strerror(failed)))") }
+            return buf
         }
     }
 
@@ -62,18 +116,23 @@ public final class CSVReader: @unchecked Sendable {
     /// Parses, infers and converts every projected column.
     public func read() throws -> MetalRecordBatch {
         try validateOptions()
-        guard let region else { throw CSVError.parse("Empty CSV file") }
-        let bytes = region.raw
+        guard fileSize > 0 else { throw CSVError.parse("Empty CSV file") }
         var keep: [AnyObject] = []
-        return try context.batch {
+        traceClock = 0
+        mark("start")
+        let file = try loadFile()
+        keep.append(file)
+        mark("load file")
+        let bytes = UnsafeRawBufferPointer(start: file.contents, count: fileSize)
+        func phases<R>(_ body: () throws -> R) throws -> R {
+            Self.traceKernels ? try body() : try context.batch(body)
+        }
+        return try phases {
             // A UTF-8 byte order mark is not part of the data.
             var pos = 0
             if fileSize >= 3, bytes[0] == 0xEF, bytes[1] == 0xBB, bytes[2] == 0xBF { pos = 3 }
             if pos == fileSize { throw CSVError.parse("Empty CSV file") }
             let skipped = try skipLines(bytes, from: &pos)
-            let (file, _) = try MetalArrowBuffer.wrapOrCopy(UnsafeRawPointer(region.base), byteCount: fileSize,
-                                                            keepAlive: region, context: context)
-            keep.append(file)
             let s = try scanStructure(file: file, dataStart: pos, dataEnd: fileSize, keep: &keep)
             keep.append(s.events)
             return try assemble(file: file, bytes: bytes, structure: s, dataStart: pos, skipped: skipped, keep: &keep)
@@ -154,6 +213,7 @@ public final class CSVReader: @unchecked Sendable {
         let ev = s.events.typed(UInt32.self)
         // Wait for the boundaries before the host reads any of them.
         try context.syncPoint()
+        mark("emit boundaries")
 
         // pyarrow infers the column count from the first complete line; a file whose first record has
         // no newline after it (or that has no record at all) has none.
@@ -164,7 +224,9 @@ public final class CSVReader: @unchecked Sendable {
         if let names = o.columnNames { nCols = names.count } else { nCols = firstRecordEnd(ev, s.count) + 1 }
         guard nCols > 0 else { throw CSVError.parse("CSV parse error: Empty CSV file or block: cannot infer number of columns") }
 
-        if let k = try firstRaggedBoundary(s, nCols: nCols, keep: &keep) {
+        let (firstBad, complexCounts) = try checkFields(s, file: file, nCols: nCols, dataStart: dataStart,
+                                                        dataEnd: fileSize, keep: &keep)
+        if let k = firstBad {
             let k0 = (k / nCols) * nCols
             var kEnd = k0
             while kEnd < s.count - 1, (ev[kEnd] >> 31) == 0 { kEnd += 1 }
@@ -174,6 +236,7 @@ public final class CSVReader: @unchecked Sendable {
             throw CSVError.parse("CSV parse error: Row #\(skipped + k0 / nCols + 1): Expected \(nCols) columns, got \(kEnd - k0 + 1): \(text)")
         }
         let nRecords = s.count / nCols
+        mark("check rows")
 
         var names: [String]
         let headerRecords: Int
@@ -204,8 +267,9 @@ public final class CSVReader: @unchecked Sendable {
         let conv = CSVColumnConverter(reader: self, file: file, events: s.events, nCols: nCols,
                                       firstRecord: firstRecord, nRows: nRows, dataStart: dataStart,
                                       dataEnd: fileSize, rowBase: skipped + firstRecord + 1)
-        let columns = try conv.convert(plan: plan, keep: &keep)
+        let columns = try conv.convert(plan: plan, complexCounts: complexCounts, keep: &keep)
         numRows = nRows
+        mark("columns")
         return try MetalRecordBatch(names: plan.map { $0.name }, columns: columns)
     }
 

@@ -104,7 +104,7 @@ extension CSVReader {
         let pGroups = try pipeline("csv_scan_groups")
         let tg = MTLSize(width: 256, height: 1, depth: 1)
         var nb = UInt32(nBlocks), ng = UInt32(nGroups)
-        try ctx.run { enc in
+        try gpu("csv_summarize + scans") { enc in
             enc.setComputePipelineState(pSum)
             enc.setBuffer(file.mtl, offset: file.offset, index: 0)
             enc.setBytes(&P, length: MemoryLayout<CSVScanParams>.size, index: 1)
@@ -125,6 +125,7 @@ extension CSVReader {
             enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: tg)
         }
         try ctx.syncPoint()
+        mark("scan (summarize + prefix)")
         let end = starts.typed(UInt32.self)
         let finalState = Int(end[2 * nGroups]), emitted = Int(end[2 * nGroups + 1])
         let unterminated = finalState != 0
@@ -134,7 +135,7 @@ extension CSVReader {
         if unterminated { events.mutableTyped(UInt32.self)[emitted] = UInt32(dataEnd) | 0x8000_0000 }
         if emitted > 0 {
             let pEmit = try pipeline("csv_emit")
-            try ctx.run { enc in
+            try gpu("csv_emit") { enc in
                 enc.setComputePipelineState(pEmit)
                 enc.setBuffer(file.mtl, offset: file.offset, index: 0)
                 enc.setBytes(&P, length: MemoryLayout<CSVScanParams>.size, index: 1)
@@ -147,26 +148,38 @@ extension CSVReader {
         return CSVStructure(events: events, count: count, unterminated: unterminated)
     }
 
-    /// Index of the first boundary where a record does not have exactly `nCols` fields, or nil.
-    func firstRaggedBoundary(_ s: CSVStructure, nCols: Int, keep: inout [AnyObject]) throws -> Int? {
-        guard s.count > 0 else { return nil }
+    /// Index of the first boundary where a record does not have exactly `nCols` fields (or nil), and
+    /// how many complex fields each column has.
+    func checkFields(_ s: CSVStructure, file: MetalArrowBuffer, nCols: Int, dataStart: Int, dataEnd: Int,
+                     keep: inout [AnyObject]) throws -> (firstBad: Int?, complex: [Int]) {
+        guard s.count > 0 else { return (nil, [Int](repeating: 0, count: nCols)) }
         let ctx = context
         let bad = try MetalArrowBuffer.allocate(byteCount: 4, zeroed: false, context: ctx)
         bad.mutableTyped(UInt32.self)[0] = UInt32.max
-        keep.append(bad)
-        let pso = try pipeline("csv_check_rows")
-        var n = UInt32(s.count), c = UInt32(nCols)
-        try ctx.run { enc in
+        let counts = try MetalArrowBuffer.allocate(byteCount: nCols * 4, zeroed: true, context: ctx)
+        keep += [bad, counts]
+        var P = CSVColParams()
+        P.nCols = UInt32(nCols)
+        P.dataStart = UInt32(dataStart)
+        P.dataEnd = UInt32(dataEnd)
+        P.quote = options.quoteChar.map { UInt32($0) } ?? 256
+        P.doubleQuote = options.doubleQuote ? 1 : 0
+        let pso = try pipeline("csv_check_fields")
+        var n = UInt32(s.count)
+        try gpu("csv_check_fields") { enc in
             enc.setComputePipelineState(pso)
-            enc.setBuffer(s.events.mtl, offset: s.events.offset, index: 0)
-            enc.setBytes(&n, length: 4, index: 1)
-            enc.setBytes(&c, length: 4, index: 2)
-            enc.setBuffer(bad.mtl, offset: bad.offset, index: 3)
+            enc.setBuffer(file.mtl, offset: file.offset, index: 0)
+            enc.setBuffer(s.events.mtl, offset: s.events.offset, index: 1)
+            enc.setBytes(&P, length: MemoryLayout<CSVColParams>.size, index: 2)
+            enc.setBytes(&n, length: 4, index: 3)
+            enc.setBuffer(bad.mtl, offset: bad.offset, index: 4)
+            enc.setBuffer(counts.mtl, offset: counts.offset, index: 5)
             Dispatch.dispatch1D(enc, pso, count: s.count)
         }
         try ctx.syncPoint()
         let k = bad.typed(UInt32.self)[0]
-        return k == UInt32.max ? nil : Int(k)
+        let c = counts.typed(UInt32.self)
+        return (k == UInt32.max ? nil : Int(k), (0..<nCols).map { Int(c[$0]) })
     }
 
     func pipeline(_ fn: String) throws -> MTLComputePipelineState {
