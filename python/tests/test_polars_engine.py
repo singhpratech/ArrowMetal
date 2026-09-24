@@ -203,6 +203,12 @@ def test_polars_surfaces_this_module_uses_exist():
     from polars.lazyframe.engine import _LocalEngine
     assert hasattr(_LocalEngine, "_post_opt_callback") and hasattr(_LocalEngine, "collect")
     assert hasattr(pl.DataFrame, "_from_pydf")
+    for kind in ("DataFrameScan", "Filter", "Select", "HStack", "SimpleProjection", "Slice", "Sort",
+                 "GroupBy"):
+        assert hasattr(pe._in, kind), kind
+    for kind in ("Column", "Literal", "BinaryExpr", "Cast", "Ternary", "Function", "Agg", "Len",
+                 "Operator", "BooleanFunction", "StringFunction"):
+        assert hasattr(pe._xn, kind), kind
     seen = {}
 
     def cb(nt, duration):
@@ -280,6 +286,7 @@ def test_raise_on_fail_names_the_node_and_reason(tmp_path):
             lf.collect(engine=metal())
         text = str(err.value)
         assert "ArrowMetal MetalEngine:" in text and kind in text, text
+        assert "'cuda' conversion failed" in text      # hardcoded in polars 1.44.1
     # A plan with nothing unsupported does not raise.
     plans["Sort"][0].collect(engine=metal())
 
@@ -304,6 +311,31 @@ def test_background_collection_warns_and_runs_on_polars():
     assert q.fetch_blocking().equals(lf.collect())
 
 
+def test_a_sink_plan_is_left_to_polars(tmp_path):
+    """`sink_*` and `collect_batches` do run the callback, and Polars' streaming sink panics on a
+    replaced subtree ("entered unreachable code"), so a plan with a sink stays whole."""
+    lf = pl.LazyFrame({"v": [3, 1, 2]}).sort("v")
+    eng = pe.MetalEngine(min_rows=0, shapes="all")
+    lf.sink_parquet(tmp_path / "x.parquet", engine=eng)
+    assert pl.read_parquet(tmp_path / "x.parquet").equals(lf.collect())
+    assert not eng.last_report.taken
+    assert any("sinks" in f for f in eng.last_report.fallbacks), eng.last_report
+    batches = list(lf.collect_batches(engine=pe.MetalEngine(min_rows=0, shapes="all")))
+    assert pl.concat(batches).equals(lf.collect())
+
+
+def test_collect_async_does_not_run_the_callback():
+    import asyncio
+    lf = pl.LazyFrame({"v": [3, 1, 2]}).sort("v")
+    eng = pe.MetalEngine(min_rows=0, shapes="all")
+
+    async def go():
+        return await lf.collect_async(engine=eng)
+
+    assert asyncio.run(go()).equals(lf.collect())
+    assert eng.last_report is None
+
+
 def test_eager_and_background_callbacks_are_none():
     e = am.MetalEngine()
     assert e._post_opt_callback(background=False, eager=True) is None
@@ -321,6 +353,22 @@ def test_profile_shows_a_metal_row():
     assert any(n.startswith("metal:Sort#") for n in nodes), nodes
     row = timings.filter(pl.col("node").str.starts_with("metal:"))
     assert (row["end"] >= row["start"]).all()
+
+
+def test_callback_second_argument_is_none_under_collect_and_an_int_under_profile(monkeypatch):
+    seen = []
+    real = pe.execute_with_metal
+
+    def spy(nt, duration, *, config):
+        seen.append(duration)
+        return real(nt, duration, config=config)
+
+    monkeypatch.setattr(pe, "execute_with_metal", spy)
+    lf = pl.LazyFrame({"v": [3, 1, 2]}).sort("v")
+    eng = pe.MetalEngine(min_rows=0, shapes="all")
+    lf.collect(engine=eng)
+    eng.profile(lf)
+    assert seen[0] is None and isinstance(seen[1], int), seen
 
 
 def test_lazyframe_profile_with_engine_runs_polars_only():
@@ -565,6 +613,22 @@ def test_is_in_of_a_null_is_null():
     df = pl.DataFrame({"k": [1, None, 3]})
     eng = check(df.lazy().select(pl.col("k").is_in([1, None]).alias("i")), order=True)
     assert "if_else" in eng.last_report.taken[0]["plan"]
+
+
+def test_gpu_float32_arithmetic_flushes_subnormals_so_the_engine_computes_in_binary64():
+    """The property the Float32 translation exists for: the GPU's float adds flush a subnormal to
+    zero, so `(add a b)` over Float32 is not Polars' answer; the engine emits
+    `(cast (add (cast a f64) (cast b f64)) f32)`, which is."""
+    from arrowmetal import lazy
+    tiny = pa.array(np.array([1.4e-45, 1.0], dtype=np.float32))
+    zero = pa.array(np.array([0.0, 1.0], dtype=np.float32))
+    plan = {"op": "select", "input": {"op": "scan", "source": "t"},
+            "exprs": [["x", '(add (col "a") (col "b"))']]}
+    got = lazy.LazyFrame(plan, {"t": lazy._Source(["a", "b"], [tiny, zero])}).collect()
+    assert got.column("x").to_pylist()[0] == 0.0
+    df = pl.DataFrame({"a": tiny, "b": zero})
+    eng = check(df.lazy().select((pl.col("a") + pl.col("b")).alias("x")), order=True)
+    assert "(cast (add (cast" in eng.last_report.taken[0]["plan"]
 
 
 def test_true_division_by_zero_is_ieee():

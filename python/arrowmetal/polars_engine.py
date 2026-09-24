@@ -22,9 +22,11 @@ engine takes `Filter`, `Select`, `HStack` (`with_columns`), `SimpleProjection`, 
 over the expressions and dtypes listed in docs/POLARS.md, "Tier 4". Everything else falls back with
 a one-line reason in `engine.last_report`.
 
-A subtree whose in-memory inputs hold fewer than `min_rows` rows in total is left to Polars as
-well: below that size the GPU's fixed cost is larger than the work (docs/POLARS.md says how the
-default was chosen and which results file it comes from).
+Which of those it does take is a second decision. By default (`shapes="measured"`) it takes only
+the shape classes the provisional benchmark measured ahead of both Polars engines, from the row
+count at which they were ahead (`MEASURED_SHAPES`, `min_rows`); `shapes="all"` takes everything it
+can translate. docs/POLARS.md says how the defaults were chosen and which results files they come
+from.
 
 Results are Polars' results
 ---------------------------
@@ -32,8 +34,9 @@ Where ArrowMetal and Polars differ in semantics the translation emits the Polars
 cases are pinned by `python/tests/test_polars_engine.py`: float comparisons use Polars' total order
 (NaN equals NaN and sorts above every number), `&`/`|` are Kleene, a null `when` condition takes the
 `otherwise` branch, `is_in` of a null is null, a sum over no values is 0, a min/max over only NaN is
-NaN, and every output column is cast to the dtype Polars' own schema says it has (Polars does not
-check what an engine returns, so this module does).
+NaN, Float32 arithmetic keeps subnormals, and every output column is cast to the dtype Polars' own
+schema says it has (Polars does not check what an engine returns, so this module does). Four
+ArrowMetal behaviours the engine works around are pinned by strict xfails in the same file.
 
 The Polars surfaces used
 ------------------------
@@ -52,7 +55,7 @@ from functools import partial
 import polars as pl
 import pyarrow as pa
 from polars._plr import _expr_nodes as _xn
-from polars._plr import _ir_nodes as _in
+from polars._plr import _ir_nodes as _in  # noqa: F401  (the node classes; tested to exist)
 from polars.lazyframe.engine import _LocalEngine
 
 from . import ArrowMetalError, lazy as _lazy
@@ -1336,6 +1339,13 @@ def execute_with_metal(nt, duration_since_start, *, config):
         tr.walk(root)
     finally:
         nt.set_node(root)
+    sinks = [n for n, k in report.walked if k == "Sink"]
+    if sinks:
+        # `sink_*` runs its plan on Polars' streaming engine, which panics on a replaced subtree
+        # (`test_a_sink_plan_is_left_to_polars`); a plan with a sink stays whole.
+        report.fallbacks.append(f"Sink#{sinks[0]}: a plan that sinks runs on Polars' streaming "
+                                "engine, which cannot run a replaced subtree")
+        return _finish(config, report)
 
     # Take the largest translated subtrees that do GPU work, top down.
     chosen, seen = [], set()

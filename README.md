@@ -171,6 +171,7 @@ import polars as pl
 col = am.array(pl.Series([1, None, 3, 40]).to_arrow())
 print(pl.from_arrow(col.filter_where(">", 2).to_arrow()))
 ```
+A whole lazy plan can run through `lf.collect(engine=am.MetalEngine())`, which takes the parts it measured ahead of Polars and leaves the rest to Polars ([docs/POLARS.md](docs/POLARS.md), tier 4).
 ```python
 from decimal import Decimal
 

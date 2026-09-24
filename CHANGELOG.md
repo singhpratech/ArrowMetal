@@ -215,7 +215,22 @@ Integrations
 - pandas (docs/PANDAS.md): an `.am` accessor on Series/DataFrame, and an opt-in accel mode that patches a
   documented set of pandas methods, routes to the GPU only when dtype, size and arguments qualify, and
   restores the originals exactly on `uninstall()`.
-- `import arrowmetal` imports none of the three; each bridge loads on first use through one chained
+- Polars engine (docs/POLARS.md, tier 4): `lf.collect(engine=am.MetalEngine())` translates the
+  subtrees of Polars' optimised plan that read in-memory frames -- filters, projections, slices,
+  sorts, group-bys and aggregates over a documented set of expressions and dtypes -- into ArrowMetal
+  plans and runs them on the GPU through Polars' post-optimisation callback, leaving every other node
+  to Polars; `engine.last_report` says what ran where and why. Results are Polars' own (float total
+  order, Kleene logic, Polars' aggregate dtypes and empty-group answers, Float32 arithmetic without
+  subnormal flushing), checked by `python/tests/test_polars_engine.py` against Polars across sizes,
+  null ratios, dtypes and chunked and sliced frames. By default it takes the shapes the provisional
+  benchmark (`Benchmarks/polars_engine_bench.py`) measured ahead of both Polars engines -- full sorts
+  from 1M rows -- and `shapes="all"` takes everything it can translate. Imports of Polars columns are
+  cached by buffer address across queries.
+- Four engine behaviours found by that suite and worked around in `polars_engine.py`, each pinned by a
+  strict xfail: String compaction reading bytes under a null slot, a Boolean column's null count lost
+  through the plan's sort, a filter rejecting a plan that carries a `date32` column, and a String sort
+  returning wrong rows when the column holds a null and a value of 8 bytes or more.
+- `import arrowmetal` imports none of the bridges; each loads on first use through one chained
   PEP 562 hook (`_LAZY_HOOKS`).
 - The public C header compiles as C, which `test_the_public_c_header_compiles` now holds it to (a
   typedef/function name clash, `am_plan_source`, was a redefinition in both C and C++ and blocked every
