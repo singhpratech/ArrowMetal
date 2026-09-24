@@ -162,6 +162,16 @@ Temporal, timezones and the rest of the type matrix
   malformed rather than read with the surplus ignored; a field is classified by its type before it is
   judged for having children, so an unsupported type is named for what it is; and dictionary
   materialisation no longer reads every `DictionaryBatch` in the source on the first batch read.
+- The IPC reader reads the view types: `utf8_view` and `binary_view` materialise to the utf8 / binary
+  layout in a CPU pass sharded over the cores, `list_view` and `large_list_view` to a list (child used as
+  it is when the rows are in order, gathered with `take` otherwise). The writer writes their classic
+  counterparts.
+- The IPC reader reads big-endian sources, byte swapping every buffer by element width (decimal limbs
+  reordered, interval parts and view headers swapped one by one); fixtures are Arrow's 1.0.0 big-endian
+  integration files. The writer stays little-endian.
+- The IPC reader keeps field `custom_metadata` and returns extension columns as `.extended`; the canonical
+  `arrow.fixed_shape_tensor` round-trips with pyarrow's FixedShapeTensorArray (`ArrowFixedShapeTensorType`).
+  IPC Tensor and SparseTensor messages are refused with an error that names them.
 
 Arrow function coverage
 - `arrowmetal.functions`: a registry with one entry per Arrow v25 compute function name — all 307, the
