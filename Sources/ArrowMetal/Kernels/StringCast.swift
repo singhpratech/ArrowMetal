@@ -9,7 +9,7 @@ import Metal
 /// | number → string | `float32`, `float64` | CPU |
 /// | boolean → string | `bool` | CPU |
 /// | string → number | `int8/16/32/64`, `uint8/16/32/64` | **GPU** (`str_parse_int`) |
-/// | string → number | `float32`, `float64` | CPU |
+/// | string → number | `float32`, `float64` | **GPU** (`str_parse_f32/f64`), CPU for the rows it cannot decide |
 /// | string → boolean | `bool` | CPU |
 ///
 /// Nulls always propagate; a null row of a `toStrings()` result emits no bytes and shares the input's
@@ -103,8 +103,11 @@ extension MetalStringArray {
     /// **null**, which is Arrow's `safe=false` behaviour. A `-` sign is rejected for an unsigned
     /// target, `"-0"` included. Pass `strict: true` to throw instead of nulling those rows.
     ///
-    /// **Floats** parse on the CPU with Swift's `Float`/`Double` initialiser, which accepts decimal
-    /// and exponent forms plus `inf`, `-inf` and `nan` and rejects trailing junk.
+    /// **Floats** follow Swift's `Float`/`Double` initialiser, which accepts decimal and exponent forms
+    /// plus `inf`, `-inf` and `nan` and rejects trailing junk. They parse on the GPU (Eisel-Lemire in
+    /// integer arithmetic, `CSVFloatSource`), bit-identical to the initialiser for every row the GPU
+    /// decides; the rows it cannot decide exactly (hex floats, NaN payloads, a 20+ digit mantissa on a
+    /// rounding boundary, ...) are parsed on the CPU with the initialiser itself.
     public func parse<T: ArrowPrimitive>(_ type: T.Type, strict: Bool = false) throws -> MetalArray<T> {
         let result: MetalArray<T> = T.isFloatingPoint ? try parseFloat(T.self) : try parseInteger(T.self)
 
@@ -149,7 +152,80 @@ extension MetalStringArray {
         return out
     }
 
+    /// `ARROWMETAL_FLOAT_PARSE_HOST=1` keeps `parse(Double.self)` / `parse(Float.self)` on the CPU path,
+    /// so the tests can compare the two implementations bit for bit.
+    static let floatParseHostOnly = ProcessInfo.processInfo.environment["ARROWMETAL_FLOAT_PARSE_HOST"] == "1"
+
     private func parseFloat<T: ArrowPrimitive>(_: T.Type) throws -> MetalArray<T> {
+        if Self.floatParseHostOnly || length == 0 { return try parseFloatHost(T.self) }
+        return try parseFloatGPU(T.self)
+    }
+
+    /// The GPU float parse (`CSVFloatSource`): Eisel-Lemire in integer arithmetic, bit-identical to the
+    /// host path for every value it decides. Rows it cannot decide exactly (hex floats, NaN payloads,
+    /// more than 19 significant digits that straddle a rounding boundary, ...) are flagged and parsed
+    /// on the CPU with the same Swift initialiser the host path uses.
+    func parseFloatGPU<T: ArrowPrimitive>(_: T.Type) throws -> MetalArray<T> {
+        try parseFloatGPUCounting(T.self).array
+    }
+
+    /// `parseFloatGPU` plus the number of rows the GPU handed to the CPU (for the tests).
+    func parseFloatGPUCounting<T: ArrowPrimitive>(_: T.Type) throws -> (array: MetalArray<T>, hostRows: Int) {
+        let ctx = context, n = length
+        try Dispatch.checkLength(n)
+        let isFloat32 = T.self == Float.self
+        let words = BitmapOps.words(bits: n)
+        let outVals = try MetalArrowBuffer.allocate(byteCount: Swift.max(n * T.byteWidth, T.byteWidth),
+                                                    zeroed: false, context: ctx)
+        let outValid = try MetalArrowBuffer.allocate(byteCount: Swift.max(words * 4, 4), zeroed: true, context: ctx)
+        let outHost = try MetalArrowBuffer.allocate(byteCount: Swift.max(words * 4, 4), zeroed: true, context: ctx)
+        let hostCount = try MetalArrowBuffer.allocate(byteCount: 4, zeroed: true, context: ctx)
+        let vb = validity ?? offsets                              // never read when hasValidity is 0
+        let fn = isFloat32 ? "str_parse_f32" : "str_parse_f64"
+        let pso = try ctx.pipeline(source: CSVFloatSource.stringKernels, function: fn, cacheKey: "strcast/\(fn)")
+        try ctx.run { enc in
+            enc.setComputePipelineState(pso)
+            enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
+            enc.setBuffer(data.mtl, offset: data.offset, index: 1)
+            Dispatch.setLength(enc, n, nil, index: 2)
+            enc.setBuffer(vb.mtl, offset: vb.offset, index: 3)
+            Dispatch.setUInt(enc, validity == nil ? 0 : 1, index: 4)
+            enc.setBuffer(outVals.mtl, offset: outVals.offset, index: 5)
+            enc.setBuffer(outValid.mtl, offset: outValid.offset, index: 6)
+            enc.setBuffer(outHost.mtl, offset: outHost.offset, index: 7)
+            enc.setBuffer(hostCount.mtl, offset: hostCount.offset, index: 8)
+            Dispatch.dispatch1D(enc, pso, count: n)
+        }
+        // The host rows have to be read back, so an open batch is flushed here.
+        try ctx.syncPoint()
+        let hostRows = Int(hostCount.typed(UInt32.self)[0])
+        if hostRows > 0 {
+            let flags = outHost.typed(UInt32.self)
+            let vals = outVals.mutableTyped(T.self), bits = outValid.mutableTyped(UInt8.self)
+            let o = offsets.typed(Int32.self), d = data.typed(UInt8.self)
+            for w in 0..<words where flags[w] != 0 {
+                var m = flags[w]
+                while m != 0 {
+                    let i = w * 32 + m.trailingZeroBitCount
+                    m &= m - 1
+                    let s = String(decoding: UnsafeBufferPointer(start: d + Int(o[i]), count: Int(o[i + 1] - o[i])),
+                                   as: UTF8.self)
+                    if isFloat32 {
+                        if let v = Float(s) { vals[i] = v as! T; Bitmap.set(bits, i) }
+                    } else {
+                        if let v = Double(s) { vals[i] = v as! T; Bitmap.set(bits, i) }
+                    }
+                }
+            }
+        }
+        withExtendedLifetime((outHost, hostCount)) {}
+        let out = MetalArray<T>(length: n, nullCount: 0, validity: outValid, values: outVals, context: ctx)
+        out.recomputeNullCount()
+        return (out, hostRows)
+    }
+
+    /// The CPU float parse: Swift's `Float` / `Double` initialiser on every row, rows in parallel.
+    func parseFloatHost<T: ArrowPrimitive>(_: T.Type) throws -> MetalArray<T> {
         let n = length
         let ctx = context
         let outVals = try MetalArrowBuffer.allocate(byteCount: Swift.max(n * T.byteWidth, T.byteWidth),
