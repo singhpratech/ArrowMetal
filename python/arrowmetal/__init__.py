@@ -4839,6 +4839,192 @@ def read_csv_table(path, **kwargs):
     cols = read_csv(path, **kwargs)
     return pa.table([c.to_arrow() for c in cols.columns], names=cols.names)
 
+# Newline-delimited JSON, parsed on the GPU (docs/JSON.md)
+#
+# `am.read_json(path)` reads the file into Metal shared memory and parses it with Metal kernels: the structure scan, the
+# per-record walk, key matching, string unescaping and ISO-8601 timestamps all run on the GPU. The
+# result follows `pyarrow.json.read_json` -- the same inferred types, field order, null handling and
+# error texts -- and the keyword names are pyarrow's.
+
+_lib.am_json_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(_P)]
+_lib.am_json_open.restype = ctypes.c_int
+_lib.am_json_open_buffer.argtypes = [ctypes.c_char_p, ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_json_open_buffer.restype = ctypes.c_int
+_lib.am_json_close.argtypes = [_P]
+_lib.am_json_read.argtypes = [_P, ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_json_read.restype = ctypes.c_int
+_lib.am_json_read_named.argtypes = [_P, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int64, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_json_read_named.restype = ctypes.c_int
+_lib.am_json_last_error.argtypes = [ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8))]
+_lib.am_json_last_error.restype = ctypes.c_int64
+_lib.am_json_batch_columns.argtypes = [_P]
+_lib.am_json_batch_columns.restype = ctypes.c_int64
+_lib.am_json_batch_rows.argtypes = [_P]
+_lib.am_json_batch_rows.restype = ctypes.c_int64
+_lib.am_json_batch_column_name.argtypes = [_P, ctypes.c_int64]
+_lib.am_json_batch_column_name.restype = ctypes.c_char_p
+_lib.am_json_batch_column_names.argtypes = [_P, ctypes.c_int64, ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8))]
+_lib.am_json_batch_column_names.restype = ctypes.c_int64
+_lib.am_json_batch_column.argtypes = [_P, ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_json_batch_column.restype = ctypes.c_int
+_lib.am_json_batch_release.argtypes = [_P]
+
+_UNEXPECTED_FIELD = {"infer": 0, "ignore": 1, "error": 2}
+
+
+def _json_check(rc):
+    """`_check` reading the message with its length, so a key or value it quotes that holds a NUL
+    arrives whole (am_last_error's C string stops at the NUL)."""
+    if rc != 0:
+        p = ctypes.POINTER(ctypes.c_uint8)()
+        n = _lib.am_json_last_error(ctypes.byref(p))
+        msg = ctypes.string_at(p, n).decode("utf-8", "replace") if n > 0 else ""
+        raise ArrowMetalError(msg or "unknown error")
+
+
+def _json_schema_names(schema):
+    """The explicit schema's field names depth-first (through list items), each as a 4-byte
+    little-endian length and its UTF-8 bytes: the layout `am_json_read_named` takes."""
+    out = bytearray()
+
+    def walk(t):
+        if pa.types.is_struct(t):
+            for j in range(t.num_fields):
+                put(t.field(j))
+        elif pa.types.is_list(t):
+            walk(t.value_type)
+
+    def put(f):
+        b = f.name.encode()
+        out.extend(len(b).to_bytes(4, "little"))
+        out.extend(b)
+        walk(f.type)
+
+    for f in schema:
+        put(f)
+    return bytes(out)
+
+
+def _json_column_names(out, i):
+    """Column i's name and its nested struct field names (depth-first), read with their lengths so a
+    key holding "\\u0000" survives (a C string and the C Data Interface stop at the NUL)."""
+    p = ctypes.POINTER(ctypes.c_uint8)()
+    n = _lib.am_json_batch_column_names(out, i, ctypes.byref(p))
+    if n < 0:
+        _json_check(1)
+    blob = ctypes.string_at(p, n) if n else b""
+    names, k = [], 0
+    while k < n:
+        ln = int.from_bytes(blob[k:k + 4], "little")
+        names.append(blob[k + 4:k + 4 + ln].decode())
+        k += 4 + ln
+    return names
+
+
+def _json_renamed(t, names):
+    """`t` with its struct field names replaced, depth-first, from the iterator `names`."""
+    if pa.types.is_struct(t):
+        return pa.struct([pa.field(next(names), _json_renamed(t.field(j).type, names), t.field(j).nullable)
+                          for j in range(t.num_fields)])
+    if pa.types.is_list(t):
+        return pa.list_(pa.field(t.value_field.name, _json_renamed(t.value_type, names), t.value_field.nullable))
+    return t
+
+
+def _json_read(source, read_options, parse_options, explicit_schema, unexpected_field_behavior):
+    """Runs one read; returns (pairs, rows, {column: nested field names when one holds a NUL})."""
+    del read_options  # block_size and use_threads do not change what this reader returns
+    if parse_options is not None:
+        if explicit_schema is None:
+            explicit_schema = parse_options.explicit_schema
+        if unexpected_field_behavior is None:
+            unexpected_field_behavior = parse_options.unexpected_field_behavior
+    ufb = unexpected_field_behavior or "infer"
+    if ufb not in _UNEXPECTED_FIELD:
+        raise ArrowMetalError("unexpected_field_behavior must be 'infer', 'ignore' or 'error'; got %r" % (ufb,))
+    if explicit_schema is not None and not isinstance(explicit_schema, pa.Schema):
+        explicit_schema = pa.schema(explicit_schema)
+
+    h = _P()
+    if isinstance(source, (bytes, bytearray, memoryview)):
+        buf = bytes(source)
+        _json_check(_lib.am_json_open_buffer(buf, len(buf), ctypes.byref(h)))
+    elif hasattr(source, "read"):
+        buf = source.read()
+        if isinstance(buf, str):
+            buf = buf.encode()
+        _json_check(_lib.am_json_open_buffer(buf, len(buf), ctypes.byref(h)))
+    else:
+        _json_check(_lib.am_json_open(os.fspath(source).encode(), ctypes.byref(h)))
+    try:
+        schema_c = None
+        if explicit_schema is not None:
+            schema_c = _ArrowSchema()
+            explicit_schema._export_to_c(ctypes.addressof(schema_c))
+        out = _P()
+        try:
+            if schema_c is None:
+                _json_check(_lib.am_json_read(h, None, _UNEXPECTED_FIELD[ufb], ctypes.byref(out)))
+            else:
+                # The field names travel with their lengths too: the C Data Interface's C strings
+                # stop at a NUL, which a JSON key may hold.
+                blob = _json_schema_names(explicit_schema)
+                _json_check(_lib.am_json_read_named(h, ctypes.addressof(schema_c), blob, len(blob),
+                                                    _UNEXPECTED_FIELD[ufb], ctypes.byref(out)))
+        finally:
+            if schema_c is not None and schema_c.release:
+                schema_c.release(ctypes.byref(schema_c))
+        try:
+            pairs, nested = [], {}
+            for i in range(_lib.am_json_batch_columns(out)):
+                names = _json_column_names(out, i)
+                c = _P()
+                _json_check(_lib.am_json_batch_column(out, i, ctypes.byref(c)))
+                pairs.append((names[0], MetalArray(c)))
+                if any("\x00" in nm for nm in names[1:]):
+                    nested[i] = names[1:]
+            return pairs, int(_lib.am_json_batch_rows(out)), nested
+        finally:
+            _lib.am_json_batch_release(out)
+    finally:
+        _lib.am_json_close(h)
+
+
+def read_json(path, read_options=None, parse_options=None, memory_pool=None, *,
+              explicit_schema=None, unexpected_field_behavior=None):
+    """Reads newline-delimited JSON on the GPU and returns a `ColumnSet` of MetalArrays.
+
+    The arguments are `pyarrow.json.read_json`'s: `parse_options` is a `pyarrow.json.ParseOptions`
+    (its `explicit_schema` and `unexpected_field_behavior` are honoured), and the two can also be given
+    directly as keywords. `path` may be a file path, bytes, or a binary file object. `read_options`
+    and `memory_pool` are accepted for drop-in use; this reader infers over the whole file at once, so
+    `block_size` does not change the result. Type inference, field order and error texts match
+    pyarrow's; docs/JSON.md lists the probes behind that and the documented differences.
+
+        import arrowmetal as am
+        cols = am.read_json("events.jsonl")
+        cols["latency_ms"].mean()            # already on the GPU
+    """
+    del memory_pool
+    pairs, _, _ = _json_read(path, read_options, parse_options, explicit_schema, unexpected_field_behavior)
+    return ColumnSet(pairs)
+
+
+def read_json_table(path, read_options=None, parse_options=None, memory_pool=None, *,
+                    explicit_schema=None, unexpected_field_behavior=None):
+    """`read_json` exported as a `pyarrow.Table` (zero copy), with pyarrow's schema and row count."""
+    del memory_pool
+    pairs, rows, nested = _json_read(path, read_options, parse_options, explicit_schema, unexpected_field_behavior)
+    if not pairs:
+        # A file of empty objects has rows but no columns.
+        return pa.Table.from_struct_array(pa.array([{}] * rows, type=pa.struct([])))
+    arrays = [c.to_arrow() for _, c in pairs]
+    for i, names in nested.items():
+        # Struct field names holding a NUL come back cut at it through the C Data Interface; the
+        # layout is unchanged, so the full names are restored with a view.
+        arrays[i] = arrays[i].view(_json_renamed(arrays[i].type, iter(names)))
+    return pa.table(arrays, names=[n for n, _ in pairs])
+
 
 # ---- out-of-core streaming execution (python/arrowmetal/stream.py, docs/STREAMING.md)
 #

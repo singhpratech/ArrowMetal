@@ -98,6 +98,7 @@ runners are never published: their GPU is virtual.
 |---|---|
 | [PARQUET.md](PARQUET.md) | The Parquet reader that decodes on the Apple GPU: the pipeline, the parallel RLE strategy, GPU Snappy and LZ4, the supported encoding/codec/type matrix, structs, maps and lists nested to any depth, the stored `ARROW:schema`, projection, statistics pushdown with page-index and bloom-filter skipping, benchmarks against pyarrow / Polars / pandas (and a nested-read script against pyarrow / Polars / DuckDB), the small writer, and the limits |
 | [CSV.md](CSV.md) | The CSV reader that parses on the Apple GPU: the quote-aware structure scan, pyarrow's inference rules and how they were established, the GPU float parse and its bit-identity tests, the options, the exact differences from `pyarrow.csv.read_csv`, and the limits |
+| [JSON.md](JSON.md) | The newline-delimited JSON reader that parses on the Apple GPU: the structure scan, the per-record walk, key matching, type inference, pyarrow's behaviour as probed, the documented differences, the benchmark script and the limits |
 
 ```
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter "ParquetTests|ParquetWriterTests"

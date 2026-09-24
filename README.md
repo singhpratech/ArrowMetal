@@ -386,6 +386,7 @@ Arrow type matrix and the interop status.
 - Parquet decoded on the GPU, structs, maps and lists nested to any depth included, with the stored Arrow schema applied and page-index and bloom-filter skipping ([docs/PARQUET.md](docs/PARQUET.md)).
 - Delta Lake and Apache Iceberg tables (`am.read_delta`, `am.read_iceberg`): metadata on the CPU, data files through the GPU Parquet reader ([docs/LAKEHOUSE.md](docs/LAKEHOUSE.md)).
 - `CSVReader` / `am.read_csv`: CSV parsed and typed on the GPU with pyarrow's rules, tested against `pyarrow.csv.read_csv` ([docs/CSV.md](docs/CSV.md)).
+- `JSONReader` / `am.read_json`: newline-delimited JSON parsed on the GPU with `pyarrow.json.read_json`'s types, field order and error texts ([docs/JSON.md](docs/JSON.md)).
 - A CPU reference implementation behind the kernels, used as the oracle in tests.
 
 ## Design notes

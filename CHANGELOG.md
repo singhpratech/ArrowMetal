@@ -317,6 +317,17 @@ CSV on the GPU
   byte lengths (`am_csv_options.*_lengths`), so a NUL byte inside one matches as in pyarrow; a NUL
   `delimiter`, `quote_char` or `decimal_point` and a bytes path are refused, as pyarrow refuses them.
 
+JSON on the GPU
+- A newline-delimited JSON reader that parses on the GPU (docs/JSON.md): bit-mask structure passes find
+  the records, one thread per record validates the grammar with RapidJSON's error texts, keys match
+  fields by byte compare and GPU dictionary encoding, and strings and ISO-8601 timestamps decode as
+  kernels; number text goes through `MetalStringArray.parse`. Type inference, field order, missing keys,
+  nested structs and lists, `explicit_schema` and `unexpected_field_behavior` follow
+  `pyarrow.json.read_json`, compared input by input in `python/tests/test_json.py`, with the documented
+  differences each tested. `am.read_json` / `am.read_json_table` in Python, `JSONReader` in Swift,
+  `am_json_open` / `am_json_read` in C; `Benchmarks/json_bench.py` against pyarrow, Polars, pandas and
+  DuckDB.
+
 Out-of-core streaming
 - A streaming executor for datasets larger than memory (docs/STREAMING.md): Arrow IPC files/directories
   (parallel readers with readahead and backpressure) or any Arrow C Stream flow through the GPU one
