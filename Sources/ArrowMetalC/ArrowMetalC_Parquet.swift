@@ -253,35 +253,71 @@ public func am_parquet_selected_row_groups(_ f: OpaquePointer?, _ filters: Unsaf
 }
 
 func parseFilters(_ text: String) throws -> [ParquetFilter] {
+    // `name<op><literal>` items separated by `;`. The operator is the first one after the name, so a
+    // literal may hold operator characters; a double-quoted literal may also hold `;`, and inside it
+    // `\"` and `\\` stand for a quote and a backslash (any other backslash is kept as it is). An integer
+    // above Int64.max is kept exact as an unsigned value.
     var out: [ParquetFilter] = []
-    for part in text.split(separator: ";") {
-        let s = part.trimmingCharacters(in: .whitespaces)
-        if s.isEmpty { continue }
-        var op: ParquetFilter.Op? = nil
-        var idx: String.Index? = nil
-        for candidate in ["==", "!=", "<=", ">=", "<", ">"] {
-            if let r = s.range(of: candidate) {
-                op = ParquetFilter.Op(rawValue: candidate)
-                idx = r.lowerBound
-                break
+    let chars = Array(text)
+    var i = 0
+    func skipSpaces() { while i < chars.count, chars[i] == " " || chars[i] == "\t" { i += 1 } }
+    while i < chars.count {
+        let itemStart = i
+        // The name: everything up to the first operator character.
+        while i < chars.count, !"=!<>;".contains(chars[i]) { i += 1 }
+        let name = String(chars[itemStart..<i]).trimmingCharacters(in: .whitespaces)
+        if i >= chars.count || chars[i] == ";" {
+            if !name.isEmpty { throw ParquetError.malformed("filter \"\(name)\" has no comparison operator") }
+            i += 1
+            continue
+        }
+        let two = i + 1 < chars.count ? String(chars[i...(i + 1)]) : ""
+        let op: ParquetFilter.Op
+        if let o = ParquetFilter.Op(rawValue: two), two.count == 2 { op = o; i += 2 }
+        else if let o = ParquetFilter.Op(rawValue: String(chars[i])) { op = o; i += 1 }
+        else {
+            throw ParquetError.malformed("filter \"\(String(chars[itemStart..<Swift.min(i + 2, chars.count)]))\" has no comparison operator")
+        }
+        skipSpaces()
+        // A quoted string, read to its closing quote. One that is not closed, or is followed by more text
+        // before the `;`, reads as it did before escapes existed: the text up to the `;`, quotes stripped.
+        var quoted: String? = nil
+        if i < chars.count, chars[i] == "\"" {
+            var s = ""
+            var j = i + 1
+            var closed = false
+            while j < chars.count {
+                let c = chars[j]
+                if c == "\\", j + 1 < chars.count, chars[j + 1] == "\"" || chars[j + 1] == "\\" {
+                    s.append(chars[j + 1]); j += 2; continue
+                }
+                if c == "\"" { closed = true; j += 1; break }
+                s.append(c); j += 1
+            }
+            while j < chars.count, chars[j] == " " || chars[j] == "\t" { j += 1 }
+            if closed, j >= chars.count || chars[j] == ";" { quoted = s; i = j }
+        }
+        let value: ParquetFilter.Value
+        if let quoted {
+            value = .string(quoted)
+        } else {
+            let litStart = i
+            while i < chars.count, chars[i] != ";" { i += 1 }
+            let literal = String(chars[litStart..<i]).trimmingCharacters(in: .whitespaces)
+            if literal.hasPrefix("\"") && literal.hasSuffix("\"") && literal.count >= 2 {
+                value = .string(String(literal.dropFirst().dropLast()))
+            } else if let v = Int64(literal) {
+                value = .int(v)
+            } else if let u = UInt64(literal) {
+                value = .uint(u)
+            } else if let d = Double(literal) {
+                value = .double(d)
+            } else {
+                value = .string(literal)
             }
         }
-        guard let op, let idx, let r = s.range(of: op.rawValue) else {
-            throw ParquetError.malformed("filter \"\(s)\" has no comparison operator")
-        }
-        let name = String(s[s.startIndex..<idx]).trimmingCharacters(in: .whitespaces)
-        let literal = String(s[r.upperBound...]).trimmingCharacters(in: .whitespaces)
-        let value: ParquetFilter.Value
-        if literal.hasPrefix("\"") && literal.hasSuffix("\"") && literal.count >= 2 {
-            value = .string(String(literal.dropFirst().dropLast()))
-        } else if let i = Int64(literal) {
-            value = .int(i)
-        } else if let d = Double(literal) {
-            value = .double(d)
-        } else {
-            value = .string(literal)
-        }
         out.append(ParquetFilter(column: name, op: op, value: value))
+        i += 1      // past the `;`, if any
     }
     return out
 }

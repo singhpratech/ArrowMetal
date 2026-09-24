@@ -72,6 +72,22 @@ def required_struct_table():
     return pa.table({"rs": pa.array(vals, typ), "k": pa.array(range(200), pa.int32())})
 
 
+def null_leaves_table():
+    """The null type (a Parquet UNKNOWN leaf) below lists, maps and structs: every element is null, and the
+    assembled column needs one slot per element all the same."""
+    n = 240
+    pat = lambda xs: [xs[i % len(xs)] for i in range(n)]
+    return pa.table({
+        "id": pa.array(range(n), pa.int32()),
+        "ln": pa.array(pat([[None, None], [], None, [None]]), pa.list_(pa.null())),
+        "lln": pa.array(pat([[[None], [], None], None, [], [[None, None]]]), pa.list_(pa.list_(pa.null()))),
+        "mn": pa.array(pat([[("a", None), ("b", None)], None, [], [("c", None)]]), pa.map_(pa.string(), pa.null())),
+        "lsn": pa.array(pat([[{"a": None, "b": 1}], None, [None], [{"a": None, "b": None}, {"a": None, "b": 4}]]),
+                        pa.list_(pa.struct([("a", pa.null()), ("b", pa.int32())]))),
+        "sln": pa.array(pat([{"l": [None]}, None, {"l": None}, {"l": []}]), pa.struct([("l", pa.list_(pa.null()))])),
+    })
+
+
 def maps_table():
     m, mi, ms, ml = [], [], [], []
     for i in range(N):
@@ -314,6 +330,44 @@ def pageindex_nan_table():
     })
 
 
+def pageindex_nan_const_table():
+    """Pages of 64 rows (written with write_batch_size=64): the first is 5.0 everywhere but one NaN, the
+    second is 5.0 everywhere. pyarrow leaves NaN out of a page's min / max, so the column index says
+    min == max == 5.0 for both, and only the second really holds nothing but 5.0."""
+    n = 4_000
+    f = np.concatenate([np.full(128, 5.0), (np.arange(128, n) - 2_000) * 0.125])
+    f[10] = np.nan
+    f[200::97] = np.nan
+    return pa.table({
+        "id": pa.array(np.arange(n), pa.int64()),
+        "f64": pa.array(f, pa.float64()),
+        "f32": pa.array(f.astype(np.float32), pa.float32()),
+        # The same shape in an integer column, where `!=` may still rule the constant pages out.
+        "i64": pa.array(np.where(np.arange(n) < 128, 5, np.arange(n)), pa.int64()),
+    })
+
+
+def unsigned_table():
+    """Unsigned columns past the signed range, whose statistics only read right as unsigned."""
+    n = 5_000
+    return pa.table({
+        "id": pa.array(range(n), pa.int64()),
+        "u64": pa.array([2**63 + i for i in range(n)], pa.uint64()),
+        "u64lo": pa.array([i * 3 for i in range(n)], pa.uint64()),
+        "u32": pa.array([2**31 + i for i in range(n)], pa.uint32()),
+    })
+
+
+def pandas_categoricals():
+    """pandas categoricals, which pyarrow stores as dictionary<int8, string> (ordered for an ordered one)."""
+    import pandas as pd
+    n = 200
+    return pa.Table.from_pandas(pd.DataFrame({
+        "c": pd.Categorical([None if i % 9 == 0 else ["a", "b", "c"][i % 3] for i in range(n)]),
+        "o": pd.Categorical(["lo", "mid", "hi"] * 66 + ["lo", "hi"], categories=["lo", "mid", "hi"], ordered=True),
+    }), preserve_index=False)
+
+
 # ------------------------------------------------------------------------------ bloom filter fixtures
 
 BLOOM_GROUPS = 4
@@ -401,6 +455,10 @@ def main():
     write_pyarrow(required_struct_table(), "reqstruct__pa_plain_none", compression="none",
                   use_dictionary=False)
 
+    # The null type below lists, maps and structs. Polars and DuckDB have no way to write a null-typed
+    # leaf inside a nested column, so these files are pyarrow's.
+    pyarrow_variants(null_leaves_table(), "nullleaves")
+
     # ARROW:schema: time zones, the null type, durations, field metadata and extension types.
     pa.register_extension_type(RationalType())
     pa.register_extension_type(LabelType())
@@ -422,6 +480,21 @@ def main():
                   use_dictionary=False)
     plain = plain_metadata_table()
     write_polars(plain, "arrowschema__polars")
+    # Dictionary types with another index width or the ordered flag: pandas categoricals (via pyarrow)
+    # and Polars' Categorical and Enum.
+    try:
+        write_pyarrow(pandas_categoricals(), "catwidth__pandas", compression="snappy")
+    except ImportError:
+        print("pandas not installed; skipping catwidth__pandas")
+    try:
+        import polars as pl
+        pdf = pl.DataFrame({
+            "cat": pl.Series([None if i % 7 == 0 else ["x", "y", "z"][i % 3] for i in range(150)], dtype=pl.Categorical),
+            "enum": pl.Series([["lo", "mid", "hi"][i % 3] for i in range(150)], dtype=pl.Enum(["lo", "mid", "hi"])),
+        })
+        pdf.write_parquet(os.path.join(OUT, "catwidth__polars.parquet"))
+    except ImportError:
+        print("polars not installed; skipping catwidth__polars")
     # The same columns with no ARROW:schema at all. pyarrow drops a hand-set ARROW:schema key when
     # store_schema=False, so the crafted values go through DuckDB's KV_METADATA instead, beside a DuckDB
     # file without the key to compare against.
@@ -451,6 +524,14 @@ def main():
     write_polars(pnan, "pageindexnan__polars", row_group_size=4000, data_page_size=800, statistics=True)
     write_pyarrow(pnan, "pageindexnan__pa_plain_none", compression="none", use_dictionary=False,
                   write_page_index=True, data_page_size=800, row_group_size=4000)
+
+    # A NaN inside a page whose other values all equal the filter literal.
+    write_pyarrow(pageindex_nan_const_table(), "pageindexnan__pa_constpage", compression="none",
+                  use_dictionary=False, write_page_index=True, data_page_size=64, write_batch_size=64,
+                  row_group_size=4000)
+    # Unsigned 64-bit values above the signed range, in five row groups.
+    write_pyarrow(unsigned_table(), "unsigned__pa_plain_none", compression="none", use_dictionary=False,
+                  write_page_index=True, row_group_size=1000, data_page_size=800, write_batch_size=100)
 
     # Split-block bloom filters, from pyarrow (every column) and DuckDB (its dictionary-encoded columns).
     bloom = bloom_table()

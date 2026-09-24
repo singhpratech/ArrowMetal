@@ -147,7 +147,12 @@ extension ParquetFile {
             guard let i = Int32(exactly: v) else { return nil }
             return XXHash64.hash(le(i))
         case (.int64, .int(let v)):
+            // A negative literal is no value of an unsigned column.
+            if case .integer(_, false) = leaf.logicalType, v < 0 { return nil }
             return XXHash64.hash(le(v))
+        case (.int64, .uint(let u)):
+            guard case .integer(_, false) = leaf.logicalType else { return nil }
+            return XXHash64.hash(le(u))
         case (.float, .double(let d)):
             guard let f = Float(exactly: d), f != 0, !f.isNaN else { return nil }
             return XXHash64.hash(le(f.bitPattern))

@@ -67,6 +67,9 @@ extension ParquetLeafData {
         let child: AnyMetalArray
         if totalElements == n {
             child = leafArray
+        } else if case .null = leafArray {
+            // A `null` leaf (Parquet UNKNOWN) has no values to compact, only a length: one per element.
+            child = .null(MetalNullArray(length: totalElements, context: ctx))
         } else {
             let bits = try MetalArrowBuffer.allocate(byteCount: Swift.max(Bitmap.byteCount(bits: n), 4),
                                                      zeroed: true, context: ctx)

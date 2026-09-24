@@ -90,11 +90,18 @@ extension ParquetFile {
     }
 
     private static func parseArrowField(_ t: FBTable, depth: Int) throws -> ParquetArrowField {
-        guard depth < 64 else { throw ArrowIPCError.malformed("ARROW:schema nests more than 64 levels") }
         // Field { name; nullable; type_type; type; dictionary; children; custom_metadata }
         let name = try t.string(0) ?? ""
         let nullable = try t.bool(1)
         let code = try t.uint8(2)
+        // Past 64 levels the field is kept as an opaque type with nothing below it, so the stored schema
+        // still applies to the other columns (and to this one down to that depth): a column that deep
+        // reads there as its Parquet schema describes it, and pyarrow does the same with a stored field
+        // that does not match the column.
+        guard depth < 64 else {
+            return ParquetArrowField(name: name, nullable: nullable, kind: .other(code), children: [],
+                                     metadata: ArrowSchemaMetadata())
+        }
         var kind = ParquetArrowField.Kind.other(code)
         if let k = FBTypeKind(rawValue: code) {
             switch k {

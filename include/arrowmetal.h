@@ -1575,6 +1575,12 @@ int     am_parquet_set_page_index(am_parquet_file* f, int enabled);
 int     am_parquet_set_bloom_filters(am_parquet_file* f, int enabled);
 int64_t am_parquet_last_read_stats(am_parquet_file* f, int64_t* out, int64_t cap);
 
+// Filter text details (am_parquet_read_ex, am_parquet_selected_row_groups): the operator is the first
+// one after the column name, so a name cannot hold = ! < > or ;. Inside a double-quoted literal, `;` is
+// part of the string and \" and \\ stand for a quote and a backslash. An integer literal above
+// INT64_MAX is kept exact and compared as unsigned against a uint64 column's statistics. On a float or
+// double column `!=` never rules a row group or page out, since writers leave NaN out of min/max.
+
 #ifdef __cplusplus
 }
 #endif

@@ -25,7 +25,7 @@ PY_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 NESTED = os.path.abspath(os.path.join(HERE, "..", "..", "Tests", "Fixtures", "nested"))
 
 
-def nested_paths(prefixes=("structs", "maps", "lists", "reqstruct")):
+def nested_paths(prefixes=("structs", "maps", "lists", "reqstruct", "nullleaves")):
     return sorted(p for p in glob.glob(os.path.join(NESTED, "*.parquet"))
                   if os.path.basename(p).split("__")[0] in prefixes)
 
@@ -526,6 +526,171 @@ def test_nan_pages_are_never_skipped_wrongly(name, flt):
         assert by_pyarrow == want.num_rows
     else:
         assert by_pyarrow in (want.num_rows, 0)
+
+
+
+@pytest.mark.parametrize("col", ["f64", "f32"])
+def test_not_equal_keeps_a_nan_hidden_in_a_constant_page(col):
+    """Pages of 64 rows; the first is 5.0 everywhere but one NaN (row 10). pyarrow leaves NaN out of a
+    page's min / max, so its index entry says 5.0 .. 5.0, like the all-5.0 page after it. NaN != 5.0 is
+    true, so `!= 5.0` must keep that page: the read with the index, the read without it and pyarrow's
+    filtered read all return the same rows."""
+    path = os.path.join(NESTED, "pageindexnan__pa_constpage.parquet")
+    ci = pq.ParquetFile(path).metadata.row_group(0).column(1)
+    assert ci.has_column_index
+    flt = [(col, "!=", 5.0)]
+    f = am.ParquetFile(path)
+    f.use_page_index = True
+    on = _exact(f.read_table(filters=flt), flt)
+    f.use_page_index = False
+    off = _exact(f.read_table(filters=flt), flt)
+    want = _exact(pq.read_table(path), flt)
+    assert 10 in on["id"].to_pylist()
+    assert on["id"].to_pylist() == off["id"].to_pylist() == want["id"].to_pylist()
+    assert pq.read_table(path, filters=flt).num_rows == want.num_rows
+    # An integer column has no NaN: its two constant pages are still skipped.
+    f.use_page_index = True
+    got = f.read_table(columns=["id", "i64"], filters=[("i64", "!=", 5)])
+    assert f.last_read_stats["pages_skipped"] >= 2
+    assert _exact(got, [("i64", "!=", 5)]).to_pylist() == _exact(pq.read_table(path, columns=["id", "i64"]), [("i64", "!=", 5)]).to_pylist()
+
+
+def test_not_equal_keeps_a_nan_row_group_where_pyarrow_drops_it():
+    """The same at row-group level, where pyarrow's filtered read differs: a row group of 5.0 with one
+    NaN has min == max == 5.0 in its statistics, and `pyarrow.parquet.read_table(filters=[("x", "!=",
+    5.0)])` rules it out, dropping the NaN row that `pyarrow.compute.not_equal` keeps. ArrowMetal keeps
+    the row group and returns the exact matches."""
+    import numpy as np
+    x = np.full(256, 5.0)
+    x[10] = np.nan
+    x = np.concatenate([x, np.arange(256.0)])
+    tbl = pa.table({"id": pa.array(range(len(x)), pa.int64()), "x": pa.array(x)})
+    flt = [("x", "!=", 5.0)]
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "nan_rg.parquet")
+        pq.write_table(tbl, p, row_group_size=256, use_dictionary=False)
+        st = pq.ParquetFile(p).metadata.row_group(0).column(1).statistics
+        assert (st.min, st.max) == (5.0, 5.0)
+        want = _exact(pq.read_table(p), flt)
+        by_pyarrow = pq.read_table(p, filters=flt)
+        f = am.ParquetFile(p)
+        assert f.selected_row_groups(flt) == [0, 1]
+        got = _exact(f.read_table(filters=flt), flt)
+        assert got["id"].to_pylist() == want["id"].to_pylist()
+        assert 10 in got["id"].to_pylist() and 10 not in by_pyarrow["id"].to_pylist()
+        assert by_pyarrow.num_rows == want.num_rows - 1
+
+
+@pytest.mark.parametrize("op,value", [(">=", 2**63), ("==", 2**63 + 7), (">", 2**63 + 4990), ("<", 2**63 + 10),
+                                      ("!=", 2**63 + 7), ("<=", 2**64 - 1), (">", 2**64 + 5), ("<", 0),
+                                      (">", 9.3e18), (">=", 0)])
+def test_uint64_literals_past_the_signed_range(op, value):
+    """uint64 values 2^63 .. 2^63 + 4999 in five row groups. The statistics are unsigned and a literal
+    above the int64 range stays exact, so the row groups kept are those that can match, and the rows are
+    pyarrow's."""
+    path = os.path.join(NESTED, "unsigned__pa_plain_none.parquet")
+    flt = [("u64", op, value)]
+    import operator
+    pyop = {"==": operator.eq, "!=": operator.ne, "<": operator.lt, "<=": operator.le, ">": operator.gt,
+            ">=": operator.ge}[op]
+    table = pq.read_table(path)
+    # Python compares an int with an int or a float exactly.
+    want = [i for i, u in zip(table["id"].to_pylist(), table["u64"].to_pylist()) if pyop(u, value)]
+    f = am.ParquetFile(path)
+    got = f.read_table(filters=flt)
+    got_exact = [i for i, u in zip(got["id"].to_pylist(), got["u64"].to_pylist()) if pyop(u, value)]
+    assert got_exact == want
+    if isinstance(value, int) and 0 <= value < 2**64:
+        by_pyarrow = pq.read_table(path, filters=[("u64", op, pa.scalar(value, pa.uint64()))])
+        assert by_pyarrow["id"].to_pylist() == want
+    kept = f.selected_row_groups(flt)
+    need = sorted({i // 1000 for i in want})
+    assert set(need) <= set(kept)
+    if op != "!=":
+        assert kept == need
+
+
+def test_null_type_below_lists_maps_and_structs():
+    """A pyarrow `list<null>` (Parquet UNKNOWN below a LIST) used to fail the import with "Length spanned by
+    list offsets larger than values array"; every null-typed leaf inside a nested column now has a slot
+    per element."""
+    for v in ("pa_plain_none", "pa_dict_snappy", "pa_v2_snappy", "pa_v2_lz4"):
+        path = os.path.join(NESTED, "nullleaves__%s.parquet" % v)
+        got, want = am.read_parquet_table(path), pq.read_table(path)
+        assert_same_table(got, want)
+        assert got["ln"].type == want["ln"].type == pa.list_(pa.field("element", pa.null()))
+        assert pa.types.is_null(got["mn"].type.item_type)
+        for name in ("ln", "lln", "lsn", "sln"):
+            one = am.read_parquet_table(path, columns=[name])
+            assert one[name].to_pylist() == want[name].to_pylist(), name
+
+
+# The one place a restored dictionary type differs from pyarrow's: ArrowMetal's dictionary arrays have
+# int32 indices and no ordered flag, so a stored dictionary<int8 | uint8 | uint32, ..., ordered> comes back
+# as dictionary<int32, ...>, unordered, with the same values.
+@pytest.mark.parametrize("name,expect", [
+    ("catwidth__pandas", {"c": (pa.int8(), False), "o": (pa.int8(), True)}),
+    ("catwidth__polars", {"cat": (pa.uint32(), False), "enum": (pa.uint8(), True)}),
+])
+def test_restored_dictionaries_have_int32_indices_and_no_ordered_flag(name, expect):
+    path = os.path.join(NESTED, name + ".parquet")
+    got, want = am.read_parquet_table(path), pq.read_table(path)
+    for col, (index, ordered) in expect.items():
+        w, g = want[col].type, got[col].type
+        assert (w.index_type, w.ordered) == (index, ordered), col
+        assert g == pa.dictionary(pa.int32(), pa.string()) and not g.ordered, col
+        assert narrow(w.value_type) == g.value_type == pa.string(), col
+        assert got[col].to_pylist() == want[col].to_pylist(), col
+        # Everything but the index type and the flag is pyarrow's.
+        assert got[col].cast(pa.string()).to_pylist() == want[col].cast(pa.string()).to_pylist(), col
+
+
+def test_string_literals_with_quotes_semicolons_and_backslashes():
+    """A string filter value travels to the C parser quoted, with `"` and `\\` escaped, so a quote, a
+    semicolon, a backslash or an operator inside it is part of the value."""
+    vals = ['a"b;c', 'x;y', '\\', 'p\\"q', 'k==v', 'plain', '"', ';', 'end\\', '<>!=']
+    n = 400
+    tbl = pa.table({"id": pa.array(range(n), pa.int64()), "s": pa.array([vals[i // 40] for i in range(n)])})
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "quotes.parquet")
+        pq.write_table(tbl, p, row_group_size=40, write_page_index=True)
+        f = am.ParquetFile(p)
+        for k, v in enumerate(vals):
+            for op in ("==", "!=", "<"):
+                flt = [("s", op, v), ("id", ">=", 0)]
+                got = _exact(f.read_table(filters=flt), flt)
+                want = _exact(tbl, flt)
+                assert got.to_pylist() == want.to_pylist(), (v, op)
+            assert f.selected_row_groups([("s", "==", v)]) == [k], v
+        with pytest.raises(am.ArrowMetalError, match="column name cannot contain"):
+            f.read_table(filters=[("a;b", "==", 1)])
+
+
+def test_a_stored_field_nested_past_64_levels_is_ignored_like_pyarrow():
+    """A stored Arrow field nested 70 levels deep is kept to 64 levels and does not match its int64
+    column, so that column reads as the Parquet schema says, the other stored fields still apply, and the
+    schema metadata is pyarrow's (no ARROW:schema key)."""
+    import base64
+    duckdb = pytest.importorskip("duckdb")
+    n = 50
+    base = pa.table({"i": pa.array(range(n), pa.int64()),
+                     "ts": pa.array([k * 1000 for k in range(n)], pa.timestamp("us", tz="UTC"))})
+    deep = pa.int32()
+    for _ in range(70):
+        deep = pa.struct([pa.field("c", deep)])
+    stored = pa.schema([pa.field("i", deep), pa.field("ts", pa.timestamp("us", tz="Asia/Tokyo"))])
+    kv = base64.b64encode(stored.serialize().to_pybytes()).decode()
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "deep.parquet")
+        con = duckdb.connect()
+        con.register("t", base)
+        con.execute("COPY (SELECT * FROM t) TO '%s' (FORMAT parquet, KV_METADATA {'ARROW:schema': '%s'})" % (p, kv))
+        con.close()
+        got, want = am.read_parquet_table(p), pq.read_table(p)
+        assert_same_table(got, want)
+        assert got["i"].type == want["i"].type == pa.int64()
+        assert got["ts"].type == want["ts"].type == pa.timestamp("us", tz="Asia/Tokyo")
+        assert got.schema.metadata == want.schema.metadata
 
 
 def test_polars_row_group_statistics_leave_nan_pages_out():

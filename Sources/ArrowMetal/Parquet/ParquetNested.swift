@@ -151,7 +151,13 @@ final class ParquetNestedAssembler {
             let data = try leafData(l)
             let array = try data.arrowArray()
             if everyEntryIsSlot(data, maxRep: f.repetitionLevel, slotDef: f.slotDefinitionLevel) { return array }
-            // Below a repeated ancestor: keep only the entries that are elements of this leaf.
+            // Below a repeated ancestor: keep only the entries that are elements of this leaf. A `null` leaf
+            // (Parquet UNKNOWN) has no values to keep, only a length: its number of slots.
+            if case .null = array {
+                let s = try slots(of: data, maxRep: f.repetitionLevel, slotDef: f.slotDefinitionLevel,
+                                  validDef: f.definitionLevel)
+                return .null(MetalNullArray(length: s.count, context: context))
+            }
             let s = try slots(of: data, maxRep: f.repetitionLevel, slotDef: f.slotDefinitionLevel,
                               validDef: f.definitionLevel, numbered: false)
             let n = data.levels

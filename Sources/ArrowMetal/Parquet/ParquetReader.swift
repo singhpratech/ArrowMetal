@@ -219,6 +219,8 @@ public struct ParquetFilter: Sendable {
     public enum Op: String, Sendable { case eq = "==", ne = "!=", lt = "<", le = "<=", gt = ">", ge = ">=" }
     public enum Value: Sendable {
         case int(Int64)
+        /// An integer above `Int64.max`, for an unsigned 64-bit column.
+        case uint(UInt64)
         case double(Double)
         case string(String)
     }
@@ -245,12 +247,15 @@ public struct ParquetFilter: Sendable {
     /// True when values between `lower` and `upper` (statistics bytes in the leaf's physical type) *may*
     /// satisfy the filter. Used for a row group's statistics and for one page's column-index entry.
     func mayMatch(lower lo: [UInt8], upper hi: [UInt8], leaf: ParquetLeaf) -> Bool {
+        // Writers leave NaN out of min / max, so a FLOAT or DOUBLE range whose bounds both equal the
+        // literal can still hold a NaN, and NaN satisfies `!=`: on those columns `!=` rules nothing out.
+        if op == .ne, leaf.physical == .float || leaf.physical == .double { return true }
         guard let low = decode(lo, leaf), let high = decode(hi, leaf) else { return true }
         // A NaN bound says nothing (the format asks readers to ignore it), and a literal of another kind
         // than the column's (a string against a number) cannot be ordered against it: look at the rows.
         guard !Self.isNaN(low), !Self.isNaN(high), !Self.isNaN(self.value),
               Self.comparable(low, self.value), Self.comparable(high, self.value) else { return true }
-        // `ne` can only be excluded when the whole group is a single value equal to the literal.
+        // `ne` can only be excluded when the whole range is a single value equal to the literal.
         switch op {
         case .eq: return compare(low, high) <= 0 ? (compare(low, self.value) <= 0 && compare(self.value, high) <= 0) : true
         case .ne: return !(compare(low, self.value) == 0 && compare(high, self.value) == 0)
@@ -274,6 +279,7 @@ public struct ParquetFilter: Sendable {
             guard bytes.count >= 8 else { return nil }
             var v: Int64 = 0
             withUnsafeMutableBytes(of: &v) { $0.copyBytes(from: bytes[0..<8]) }
+            if case .integer(_, let signed) = leaf.logicalType, !signed { return .uint(UInt64(bitPattern: v)) }
             return .int(v)
         case .float:
             guard bytes.count >= 4 else { return nil }
@@ -302,19 +308,50 @@ public struct ParquetFilter: Sendable {
     /// True when `compare` orders the two: numbers against numbers, strings against strings.
     private static func comparable(_ a: Value, _ b: Value) -> Bool {
         switch (a, b) {
-        case (.int, .int), (.int, .double), (.double, .int), (.double, .double), (.string, .string): return true
+        case (.int, .int), (.int, .uint), (.int, .double), (.uint, .int), (.uint, .uint), (.uint, .double),
+             (.double, .int), (.double, .uint), (.double, .double), (.string, .string): return true
         default: return false
         }
     }
 
-    private func compare(_ a: Value, _ b: Value) -> Int {
-        switch (a, b) {
-        case (.int(let x), .int(let y)): return x < y ? -1 : (x == y ? 0 : 1)
-        case (.int(let x), .double(let y)): return Double(x) < y ? -1 : (Double(x) == y ? 0 : 1)
-        case (.double(let x), .int(let y)): return x < Double(y) ? -1 : (x == Double(y) ? 0 : 1)
-        case (.double(let x), .double(let y)): return x < y ? -1 : (x == y ? 0 : 1)
-        case (.string(let x), .string(let y)): return x < y ? -1 : (x == y ? 0 : 1)
-        default: return 0
+    /// Orders two numbers exactly, whatever their kinds: a 64-bit integer is never rounded to a double.
+    /// Neither may be NaN (the caller has ruled NaN out).
+    private static func compareNumbers(_ a: Value, _ b: Value) -> Int? {
+        func sign<T: Comparable>(_ x: T, _ y: T) -> Int { x < y ? -1 : (x == y ? 0 : 1) }
+        // An integer against a double: compare with the double's integer part, then with its fraction.
+        func intVsDouble(_ x: Int64, _ d: Double) -> Int {
+            if d >= 0x1p63 { return -1 }
+            if d < -0x1p63 { return 1 }
+            let whole = d.rounded(.down)
+            let t = Int64(whole)
+            if x != t { return sign(x, t) }
+            return d > whole ? -1 : 0
         }
+        func uintVsDouble(_ x: UInt64, _ d: Double) -> Int {
+            if d < 0 { return 1 }
+            if d >= 0x1p64 { return -1 }
+            let whole = d.rounded(.down)
+            let t = UInt64(whole)
+            if x != t { return sign(x, t) }
+            return d > whole ? -1 : 0
+        }
+        func intVsUInt(_ x: Int64, _ u: UInt64) -> Int { x < 0 ? -1 : sign(UInt64(x), u) }
+        switch (a, b) {
+        case (.int(let x), .int(let y)): return sign(x, y)
+        case (.uint(let x), .uint(let y)): return sign(x, y)
+        case (.double(let x), .double(let y)): return sign(x, y)
+        case (.int(let x), .uint(let y)): return intVsUInt(x, y)
+        case (.uint(let x), .int(let y)): return -intVsUInt(y, x)
+        case (.int(let x), .double(let y)): return intVsDouble(x, y)
+        case (.double(let x), .int(let y)): return -intVsDouble(y, x)
+        case (.uint(let x), .double(let y)): return uintVsDouble(x, y)
+        case (.double(let x), .uint(let y)): return -uintVsDouble(y, x)
+        default: return nil
+        }
+    }
+
+    private func compare(_ a: Value, _ b: Value) -> Int {
+        if case (.string(let x), .string(let y)) = (a, b) { return x < y ? -1 : (x == y ? 0 : 1) }
+        return Self.compareNumbers(a, b) ?? 0
     }
 }

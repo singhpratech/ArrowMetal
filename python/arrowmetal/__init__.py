@@ -4272,8 +4272,11 @@ def _filter_text(filters):
         col, op, val = f
         if op not in ("==", "!=", "<", "<=", ">", ">="):
             raise ArrowMetalError("filter op must be one of == != < <= > >=; got %r" % (op,))
+        if any(ch in str(col) for ch in "=!<>;"):
+            raise ArrowMetalError("a Parquet filter column name cannot contain = ! < > or ;; got %r" % (col,))
         if isinstance(val, str):
-            lit = '"%s"' % val
+            # Quoted, with a quote or backslash inside escaped, so `;` and `"` in the value survive.
+            lit = '"%s"' % val.replace("\\", "\\\\").replace('"', '\\"')
         elif isinstance(val, (bool, _np_bool_types())):
             lit = "1" if val else "0"
         elif isinstance(val, numbers.Integral):
