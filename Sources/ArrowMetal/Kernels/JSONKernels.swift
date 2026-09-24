@@ -115,9 +115,10 @@ enum JSONKernels {
         enc.setBuffer(b.mtl, offset: b.offset, index: i)
     }
 
-    static func bytes<T>(_ enc: MTLComputeCommandEncoder, _ v: T, _ i: Int) {
-        var v = v
-        enc.setBytes(&v, length: MemoryLayout<T>.stride, index: i)
+    /// Binds a small struct by value. Every struct passed here has no tail padding (its size is its
+    /// stride and matches the MSL struct); `Time`, which has, is bound as a one-element array.
+    static func bytes<T: BitwiseCopyable>(_ enc: MTLComputeCommandEncoder, _ v: T, _ i: Int) {
+        withUnsafeBytes(of: v) { enc.setBytes($0.baseAddress!, length: $0.count, index: i) }
     }
 
     /// Exclusive prefix sum of `n` int32 values: `n + 1` entries, the total last.
@@ -374,7 +375,7 @@ enum JSONKernels {
     static func firstUnexpected(_ ctx: MetalContext, level: JSONLevel, fid: MetalArrowBuffer, expected: [UInt8]) throws -> Int? {
         guard level.count > 0 else { return nil }
         let table = try alloc(ctx, expected.count)
-        expected.withUnsafeBytes { memcpy(table.mutableContents, $0.baseAddress!, $0.count) }
+        _ = expected.withUnsafeBytes { memcpy(table.mutableContents, $0.baseAddress!, $0.count) }
         let first = try alloc(ctx, 4)
         first.mutableTyped(UInt32.self)[0] = .max
         try ctx.run { enc in
