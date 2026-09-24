@@ -1550,6 +1550,39 @@ int am_stream_join_group_by(am_stream* s, struct ArrowArrayStream* build, const 
                             const int* ops, const char** columns, const char** names, int64_t n_aggs,
                             int64_t dense_key_count, int ddof, am_stream_result** out);
 
+// ---------------------------------------------------------------------------------------------------
+// Newline-delimited JSON, parsed on the GPU (docs/JSON.md)
+//
+// am_json_open reads the file into Metal shared memory; am_json_read parses every top-level object on the GPU and returns its
+// columns with the semantics of pyarrow.json.read_json: the same type inference (null, bool, int64,
+// double, timestamp[s] from ISO-8601 strings, string, struct, list), fields in order of first
+// appearance, a missing key read as null, and pyarrow's error texts for syntax errors, type
+// conflicts, repeated keys and unconvertible values. Every non-zero return sets am_last_error().
+typedef struct am_json_file am_json_file;      // opaque, one JSON input held in Metal shared memory
+typedef struct am_json_batch am_json_batch;    // opaque, the columns one read produced
+
+int   am_json_open(const char* path, am_json_file** out);
+// The same over bytes already in memory; they are copied once into a Metal buffer.
+int   am_json_open_buffer(const void* data, int64_t length, am_json_file** out);
+void  am_json_close(am_json_file* f);
+
+// explicit_schema: NULL to infer every field, or a struct ("+s") ArrowSchema whose children fix the
+// types of the fields they name; it is only read, the caller keeps ownership. The reader converts to
+// bool, int8..int64, uint8..uint64, float, double, utf8, timestamp (any unit, any timezone), list and
+// struct; any other type is rejected with the field's path.
+// unexpected_field_behavior, for fields the schema does not name: 0 infer (appended after the schema's
+// fields), 1 ignore (dropped), 2 error ("JSON parse error: unexpected field").
+int am_json_read(am_json_file* f, const struct ArrowSchema* explicit_schema,
+                 int unexpected_field_behavior, am_json_batch** out);
+
+int64_t     am_json_batch_columns(am_json_batch* b);
+// Rows, which a file of empty objects still has when it has no columns.
+int64_t     am_json_batch_rows(am_json_batch* b);
+const char* am_json_batch_column_name(am_json_batch* b, int64_t i);
+// Hands out a new am_array handle; release it with am_release.
+int         am_json_batch_column(am_json_batch* b, int64_t i, am_array** out);
+void        am_json_batch_release(am_json_batch* b);
+
 #ifdef __cplusplus
 }
 #endif

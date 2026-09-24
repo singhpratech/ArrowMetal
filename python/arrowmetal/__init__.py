@@ -4462,6 +4462,116 @@ def write_parquet(data, path, compression="snappy", use_dictionary=True, row_gro
     return str(path)
 
 
+# ---------------------------------------------------------------------------------------------------
+# Newline-delimited JSON, parsed on the GPU (docs/JSON.md)
+#
+# `am.read_json(path)` reads the file into Metal shared memory and parses it with Metal kernels: the structure scan, the
+# per-record walk, key matching, string unescaping and ISO-8601 timestamps all run on the GPU. The
+# result follows `pyarrow.json.read_json` -- the same inferred types, field order, null handling and
+# error texts -- and the keyword names are pyarrow's.
+
+_lib.am_json_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(_P)]
+_lib.am_json_open.restype = ctypes.c_int
+_lib.am_json_open_buffer.argtypes = [ctypes.c_char_p, ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_json_open_buffer.restype = ctypes.c_int
+_lib.am_json_close.argtypes = [_P]
+_lib.am_json_read.argtypes = [_P, ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_json_read.restype = ctypes.c_int
+_lib.am_json_batch_columns.argtypes = [_P]
+_lib.am_json_batch_columns.restype = ctypes.c_int64
+_lib.am_json_batch_rows.argtypes = [_P]
+_lib.am_json_batch_rows.restype = ctypes.c_int64
+_lib.am_json_batch_column_name.argtypes = [_P, ctypes.c_int64]
+_lib.am_json_batch_column_name.restype = ctypes.c_char_p
+_lib.am_json_batch_column.argtypes = [_P, ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_json_batch_column.restype = ctypes.c_int
+_lib.am_json_batch_release.argtypes = [_P]
+
+_UNEXPECTED_FIELD = {"infer": 0, "ignore": 1, "error": 2}
+
+
+def _json_read(source, read_options, parse_options, explicit_schema, unexpected_field_behavior):
+    """Runs one read; returns (pairs, rows)."""
+    del read_options  # block_size and use_threads do not change what this reader returns
+    if parse_options is not None:
+        if explicit_schema is None:
+            explicit_schema = parse_options.explicit_schema
+        if unexpected_field_behavior is None:
+            unexpected_field_behavior = parse_options.unexpected_field_behavior
+    ufb = unexpected_field_behavior or "infer"
+    if ufb not in _UNEXPECTED_FIELD:
+        raise ArrowMetalError("unexpected_field_behavior must be 'infer', 'ignore' or 'error'; got %r" % (ufb,))
+    if explicit_schema is not None and not isinstance(explicit_schema, pa.Schema):
+        explicit_schema = pa.schema(explicit_schema)
+
+    h = _P()
+    if isinstance(source, (bytes, bytearray, memoryview)):
+        buf = bytes(source)
+        _check(_lib.am_json_open_buffer(buf, len(buf), ctypes.byref(h)))
+    elif hasattr(source, "read"):
+        buf = source.read()
+        if isinstance(buf, str):
+            buf = buf.encode()
+        _check(_lib.am_json_open_buffer(buf, len(buf), ctypes.byref(h)))
+    else:
+        _check(_lib.am_json_open(os.fspath(source).encode(), ctypes.byref(h)))
+    try:
+        schema_c = None
+        if explicit_schema is not None:
+            schema_c = _ArrowSchema()
+            explicit_schema._export_to_c(ctypes.addressof(schema_c))
+        out = _P()
+        try:
+            _check(_lib.am_json_read(h, ctypes.addressof(schema_c) if schema_c is not None else None,
+                                     _UNEXPECTED_FIELD[ufb], ctypes.byref(out)))
+        finally:
+            if schema_c is not None and schema_c.release:
+                schema_c.release(ctypes.byref(schema_c))
+        try:
+            pairs = []
+            for i in range(_lib.am_json_batch_columns(out)):
+                name = _lib.am_json_batch_column_name(out, i).decode()
+                c = _P()
+                _check(_lib.am_json_batch_column(out, i, ctypes.byref(c)))
+                pairs.append((name, MetalArray(c)))
+            return pairs, int(_lib.am_json_batch_rows(out))
+        finally:
+            _lib.am_json_batch_release(out)
+    finally:
+        _lib.am_json_close(h)
+
+
+def read_json(path, read_options=None, parse_options=None, memory_pool=None, *,
+              explicit_schema=None, unexpected_field_behavior=None):
+    """Reads newline-delimited JSON on the GPU and returns a `ColumnSet` of MetalArrays.
+
+    The arguments are `pyarrow.json.read_json`'s: `parse_options` is a `pyarrow.json.ParseOptions`
+    (its `explicit_schema` and `unexpected_field_behavior` are honoured), and the two can also be given
+    directly as keywords. `path` may be a file path, bytes, or a binary file object. `read_options`
+    and `memory_pool` are accepted for drop-in use; this reader infers over the whole file at once, so
+    `block_size` does not change the result. Type inference, field order and error texts match
+    pyarrow's; docs/JSON.md lists the probes behind that and the documented differences.
+
+        import arrowmetal as am
+        cols = am.read_json("events.jsonl")
+        cols["latency_ms"].mean()            # already on the GPU
+    """
+    del memory_pool
+    pairs, _ = _json_read(path, read_options, parse_options, explicit_schema, unexpected_field_behavior)
+    return ColumnSet(pairs)
+
+
+def read_json_table(path, read_options=None, parse_options=None, memory_pool=None, *,
+                    explicit_schema=None, unexpected_field_behavior=None):
+    """`read_json` exported as a `pyarrow.Table` (zero copy), with pyarrow's schema and row count."""
+    del memory_pool
+    pairs, rows = _json_read(path, read_options, parse_options, explicit_schema, unexpected_field_behavior)
+    if not pairs:
+        # A file of empty objects has rows but no columns.
+        return pa.Table.from_struct_array(pa.array([{}] * rows, type=pa.struct([])))
+    return pa.table([c.to_arrow() for _, c in pairs], names=[n for n, _ in pairs])
+
+
 # ---- out-of-core streaming execution (python/arrowmetal/stream.py, docs/STREAMING.md)
 #
 # Everything above works on arrays and batches that fit in memory. `am.scan_ipc(...)` and
