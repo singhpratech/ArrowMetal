@@ -68,10 +68,10 @@ public final class CSVReader: @unchecked Sendable {
 
     /// The whole file as one Metal buffer.
     ///
-    /// `.read` (the default) preads it, eight ranges in parallel, into a page-aligned shared buffer
-    /// from the context's pool. `.map` maps it and wraps the mapping with no copy; the GPU then pays
-    /// to make the mapped pages resident on the first kernel that touches them, which measured slower
-    /// than the copy on a warm page cache (Benchmarks/csv_bench.py records both).
+    /// `.read` (the default) preads it, in up to eight ranges of at least 4 MiB at once, into a
+    /// page-aligned shared buffer from the context's pool. `.map` maps it and wraps the mapping with no
+    /// copy, which measured slower overall than the copy on a warm page cache (Benchmarks/csv_bench.py
+    /// records both).
     private func loadFile() throws -> MetalArrowBuffer {
         let fd = open(path, O_RDONLY)
         guard fd >= 0 else { throw CSVError.io("cannot open \(path): \(String(cString: strerror(errno)))") }

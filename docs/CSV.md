@@ -66,12 +66,12 @@ am_csv_read(r, &b);          /* am_csv_batch_rows / _columns / _column_name / _c
 
 ### Getting the bytes to the GPU
 
-By default the file is read with `pread` — eight ranges in parallel — into a page-aligned buffer from the
+By default the file is read with `pread` — up to eight ranges in parallel — into a page-aligned buffer from the
 context's pool, which is already a Metal shared buffer. `fileAccess = .map` (`file_access="map"`) maps
 the file instead and wraps the mapping with `makeBuffer(bytesNoCopy:)`, as the Parquet reader does.
-Creating the mapping is cheap, but the first kernel that touches it pays to make the pages resident
-for the GPU, and on a warm page cache that measured slower than the copy; `Benchmarks/csv_bench.py`
-records both (`arrowmetal` and `arrowmetal_map`).
+No copy is made, but on a warm page cache the mapped read measured slower than the copy overall;
+`Benchmarks/csv_bench.py` records both (`arrowmetal` and `arrowmetal_map`), and `ARROWMETAL_CSV_TRACE=1`
+shows where the time goes phase by phase.
 
 ### Finding every field: the parser as a table, scanned
 
