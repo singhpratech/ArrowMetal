@@ -4,7 +4,7 @@ Apple GPUs have no double-precision hardware, so these six run as software IEEE-
 GPU (`Kernels/DoubleMath.swift`, `Kernels/DoublePower.swift`). This file is the cross-engine half of
 the claim the Swift suite measures: every value is compared with what `pyarrow.compute` returns for
 the same input, in **ulp**, and the budget is 2 — with `sqrt` held to bit equality, because a
-digit-by-digit extraction is correctly rounded and so is Arrow's.
+Newton-with-exact-remainder square root is correctly rounded and so is Arrow's.
 
     PYTHONPATH=python python -m pytest python/tests/test_float64_math.py -q
 

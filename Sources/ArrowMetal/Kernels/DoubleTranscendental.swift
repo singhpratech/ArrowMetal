@@ -18,7 +18,7 @@ import Foundation
 ///
 /// | function  | method                                                                    | measured |
 /// |-----------|---------------------------------------------------------------------------|----------|
-/// | `dt_sqrt` | `DoubleMath.d_sqrt`, digit by digit                                        | correctly rounded |
+/// | `dt_sqrt` | `DoubleMath.d_sqrt`, Newton steps with an exact remainder                   | correctly rounded |
 /// | `dt_ln`   | `x = 2^e·m`, `m` folded to `[1/√2, √2]`, `atanh` series in `s = (m-1)/(m+1)`, `e·ln2` in a hi/lo split | (via `logb`) |
 /// | `dt_expm1`| `x = k·ln2 + r` (no reduction below 0.5), Taylor `r·Σ rⁿ/(n+1)!`, then `2^k(1+E) − 1` | ≤ 2 ulp |
 /// | `dt_log1p`| four-term series below `2^-20`, else `ln(u)·x/(u−1)` (Kahan's correction)  | ≤ 1 ulp  |

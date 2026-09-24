@@ -9,7 +9,7 @@ import Foundation
 ///   * `float64` — values travel as raw `ulong` bit patterns because Metal has no `double`. Sign, abs,
 ///     `floor`/`ceil`/`round`/`trunc` and element-wise min/max are **exact**, done on the bit pattern
 ///     with the software binary64 adder from `DoubleMath` for the one carry each rounding step needs.
-///     `sqrt` is **correctly rounded** (`d_sqrt`, a digit-by-digit extraction), and `exp`, `ln`,
+///     `sqrt` is **correctly rounded** (`d_sqrt`: an `rsqrt` seed, Newton steps, an exact remainder), and `exp`, `ln`,
 ///     `log10`, `log2` and `power` run entirely in software binary64 through `DoublePower` — within
 ///     2 ulp, measured. `modulo` on `float64` is still not implemented — `Rounding.swift` throws
 ///     rather than return a silently poor answer.

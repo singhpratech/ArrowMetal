@@ -1099,7 +1099,7 @@ int  am_cumulative_checked(am_array* a, int op, int64_t p1, am_array** out);
 // Taylor series near zero -- the usual (exp(x)-1)*x/log(exp(x)) repair is unusable because the Metal
 // front end folds log(exp(x)) back to x. float64 runs entirely in software binary64 -- a natural log by
 // argument reduction plus an atanh series, exp by argument reduction against a 107-bit ln 2 plus a
-// Taylor series, sqrt by digit-by-digit extraction (correctly rounded). Measured against Foundation
+// Taylor series, sqrt by Newton steps with an exact remainder (correctly rounded). Measured against Foundation
 // over 10^6 random inputs: expm1 and logb within 2 ulp, log1p and hypot within 1 ulp. am_unary's
 // sqrt/exp/ln/log2/log10 and am_binary's power are software binary64 too, and no less accurate.
 int  am_math_extra(am_array* a, int op, am_array* b /* or NULL */, const void* scalar /* or NULL */,

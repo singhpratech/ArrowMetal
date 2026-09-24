@@ -544,7 +544,7 @@ _ROWS = [
      _u("sign"), ((_INT,), {})),
     ("sqrt", "Arithmetic", GPU, "Kernels/Rounding.swift", "sqrt()",
      "A negative input gives NaN, as Arrow's unchecked `sqrt` does. On float64 this is "
-     "`DoubleMath.d_sqrt`, a digit-by-digit extraction in integers and therefore **correctly rounded** "
+     "`DoubleMath.d_sqrt`, an `rsqrt` seed refined by Newton steps with an exact remainder settling the last bit, and therefore **correctly rounded** "
      "— bit-identical to Foundation over 10^6 random bit patterns, subnormals included.",
      _u("sqrt"), ((_FLT_POS,), {})),
     ("subtract", "Arithmetic", GPU, "Kernels/Arithmetic.swift", "a - b", "Wrapping on integers.",
