@@ -1550,6 +1550,73 @@ int am_stream_join_group_by(am_stream* s, struct ArrowArrayStream* build, const 
                             const int* ops, const char** columns, const char** names, int64_t n_aggs,
                             int64_t dense_key_count, int ddof, am_stream_result** out);
 
+// ---------------------------------------------------------------------------------------------------
+// Parquet: the stored Arrow schema and page-index statistics (docs/PARQUET.md)
+//
+// A read already applies what the file's ARROW:schema key/value metadata says the Parquet schema lost:
+// time zones, durations and extension types. These two return the metadata a pyarrow Table would carry:
+// the custom metadata of one top-level column (plus PARQUET:field_id when the Parquet schema has one),
+// and the file's key/value metadata without ARROW:schema. Both write the C Data Interface metadata blob
+// (int32 count, then int32-length-prefixed key and value bytes, native endian) into `out` when `cap` is
+// large enough, and return its size in bytes: 0 when there is no metadata, -1 on a bad argument. Call
+// once with out = NULL to learn the size.
+int64_t am_parquet_field_metadata(am_parquet_file* f, const char* column, uint8_t* out, int64_t cap);
+int64_t am_parquet_schema_metadata(am_parquet_file* f, uint8_t* out, int64_t cap);
+
+// Page-level skipping: with a filter, a file's column index and offset index rule out the data pages
+// whose min/max cannot match, and those pages are never read or decompressed. On by default;
+// am_parquet_set_page_index(f, 0) turns it off (every read is then row-group granular). After a read,
+// am_parquet_last_read_stats fills up to `cap` of [row groups read, row groups skipped by statistics,
+// row groups skipped by the page index, data pages decoded, data pages skipped, rows, row groups skipped
+// by bloom filters] and returns 7. An equality filter also consults the column chunks' split-block bloom
+// filters, when the file has them, and drops the row groups its value is certainly absent from;
+// am_parquet_set_bloom_filters(f, 0) turns that off.
+int     am_parquet_set_page_index(am_parquet_file* f, int enabled);
+int     am_parquet_set_bloom_filters(am_parquet_file* f, int enabled);
+int64_t am_parquet_last_read_stats(am_parquet_file* f, int64_t* out, int64_t cap);
+
+// Filter text details (am_parquet_read_ex, am_parquet_selected_row_groups): the operator is the first
+// one after the column name, so a name cannot hold = ! < > or ;. Inside a double-quoted literal, `;` is
+// part of the string and \" and \\ stand for a quote and a backslash. An integer literal above
+// INT64_MAX is kept exact and compared as unsigned against a uint64 column's statistics. On a float or
+// double column `!=` never rules a row group or page out, since writers leave NaN out of min/max.
+
+// ---- Lakehouse tables: Delta Lake and Apache Iceberg (docs/LAKEHOUSE.md) --------------------------
+//
+// A table read resolves the table's metadata on the CPU (the Delta log and its checkpoints; the
+// Iceberg metadata JSON, manifest list and Avro manifests), prunes data files by partition values and
+// column statistics, and reads the surviving Parquet files with the GPU Parquet reader. The result is
+// a batch handle, used like am_parquet_batch: columns come out one at a time as am_array handles.
+//
+// `columns`: NULL reads every column of the table's schema; otherwise exactly the `n_columns` named.
+// `filters`: NULL or a `name<op><literal>` list as in am_parquet_read_ex (`x>3;s=="a"`). Unlike the
+// Parquet read, the filters here are applied to the rows too, so only matching rows come back; nulls
+// never match. A date literal may be written "YYYY-MM-DD" and a timestamp literal as ISO 8601.
+// Features the reader does not implement (Delta deletion vectors, column mapping mode id, unknown
+// reader features; Iceberg delete files) fail with an error naming the feature.
+typedef struct am_lakehouse_batch am_lakehouse_batch;   // opaque
+
+// Delta Lake: `path` is the table directory (holding _delta_log/). `version` -1 reads the latest; any
+// other negative version is an error.
+int     am_delta_read(const char* path, int64_t version, const char** columns, int64_t n_columns,
+                      const char* filters, am_lakehouse_batch** out);
+int64_t am_delta_latest_version(const char* path);          // -1 on error
+
+// Iceberg: `path` is a *.metadata.json file or a table directory (holding metadata/). With
+// `has_snapshot_id` 0 the current snapshot is read, otherwise `snapshot_id`.
+int     am_iceberg_read(const char* path, int64_t snapshot_id, int has_snapshot_id, const char** columns,
+                        int64_t n_columns, const char* filters, am_lakehouse_batch** out);
+// 0 and the id in *out; 3 when the table has no current snapshot; 1 on error.
+int     am_iceberg_current_snapshot(const char* path, int64_t* out);
+
+int64_t     am_lakehouse_batch_columns(am_lakehouse_batch* b);
+int64_t     am_lakehouse_batch_rows(am_lakehouse_batch* b);
+const char* am_lakehouse_batch_column_name(am_lakehouse_batch* b, int64_t i);
+int         am_lakehouse_batch_column(am_lakehouse_batch* b, int64_t i, am_array** out);
+// Six counters: files total, pruned by partition, pruned by statistics, read; manifests total, pruned.
+int         am_lakehouse_batch_stats(am_lakehouse_batch* b, int64_t* out);
+void        am_lakehouse_batch_release(am_lakehouse_batch* b);
+
 // ---- CPU/GPU router (docs/DESIGN.md, "CPU/GPU router")
 //
 // sum, min, max, compare, add/subtract/multiply, filter and the low-cardinality group-by sum

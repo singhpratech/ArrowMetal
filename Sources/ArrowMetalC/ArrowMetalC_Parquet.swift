@@ -253,35 +253,71 @@ public func am_parquet_selected_row_groups(_ f: OpaquePointer?, _ filters: Unsaf
 }
 
 func parseFilters(_ text: String) throws -> [ParquetFilter] {
+    // `name<op><literal>` items separated by `;`. The operator is the first one after the name, so a
+    // literal may hold operator characters; a double-quoted literal may also hold `;`, and inside it
+    // `\"` and `\\` stand for a quote and a backslash (any other backslash is kept as it is). An integer
+    // above Int64.max is kept exact as an unsigned value.
     var out: [ParquetFilter] = []
-    for part in text.split(separator: ";") {
-        let s = part.trimmingCharacters(in: .whitespaces)
-        if s.isEmpty { continue }
-        var op: ParquetFilter.Op? = nil
-        var idx: String.Index? = nil
-        for candidate in ["==", "!=", "<=", ">=", "<", ">"] {
-            if let r = s.range(of: candidate) {
-                op = ParquetFilter.Op(rawValue: candidate)
-                idx = r.lowerBound
-                break
+    let chars = Array(text)
+    var i = 0
+    func skipSpaces() { while i < chars.count, chars[i] == " " || chars[i] == "\t" { i += 1 } }
+    while i < chars.count {
+        let itemStart = i
+        // The name: everything up to the first operator character.
+        while i < chars.count, !"=!<>;".contains(chars[i]) { i += 1 }
+        let name = String(chars[itemStart..<i]).trimmingCharacters(in: .whitespaces)
+        if i >= chars.count || chars[i] == ";" {
+            if !name.isEmpty { throw ParquetError.malformed("filter \"\(name)\" has no comparison operator") }
+            i += 1
+            continue
+        }
+        let two = i + 1 < chars.count ? String(chars[i...(i + 1)]) : ""
+        let op: ParquetFilter.Op
+        if let o = ParquetFilter.Op(rawValue: two), two.count == 2 { op = o; i += 2 }
+        else if let o = ParquetFilter.Op(rawValue: String(chars[i])) { op = o; i += 1 }
+        else {
+            throw ParquetError.malformed("filter \"\(String(chars[itemStart..<Swift.min(i + 2, chars.count)]))\" has no comparison operator")
+        }
+        skipSpaces()
+        // A quoted string, read to its closing quote. One that is not closed, or is followed by more text
+        // before the `;`, reads as it did before escapes existed: the text up to the `;`, quotes stripped.
+        var quoted: String? = nil
+        if i < chars.count, chars[i] == "\"" {
+            var s = ""
+            var j = i + 1
+            var closed = false
+            while j < chars.count {
+                let c = chars[j]
+                if c == "\\", j + 1 < chars.count, chars[j + 1] == "\"" || chars[j + 1] == "\\" {
+                    s.append(chars[j + 1]); j += 2; continue
+                }
+                if c == "\"" { closed = true; j += 1; break }
+                s.append(c); j += 1
+            }
+            while j < chars.count, chars[j] == " " || chars[j] == "\t" { j += 1 }
+            if closed, j >= chars.count || chars[j] == ";" { quoted = s; i = j }
+        }
+        let value: ParquetFilter.Value
+        if let quoted {
+            value = .string(quoted)
+        } else {
+            let litStart = i
+            while i < chars.count, chars[i] != ";" { i += 1 }
+            let literal = String(chars[litStart..<i]).trimmingCharacters(in: .whitespaces)
+            if literal.hasPrefix("\"") && literal.hasSuffix("\"") && literal.count >= 2 {
+                value = .string(String(literal.dropFirst().dropLast()))
+            } else if let v = Int64(literal) {
+                value = .int(v)
+            } else if let u = UInt64(literal) {
+                value = .uint(u)
+            } else if let d = Double(literal) {
+                value = .double(d)
+            } else {
+                value = .string(literal)
             }
         }
-        guard let op, let idx, let r = s.range(of: op.rawValue) else {
-            throw ParquetError.malformed("filter \"\(s)\" has no comparison operator")
-        }
-        let name = String(s[s.startIndex..<idx]).trimmingCharacters(in: .whitespaces)
-        let literal = String(s[r.upperBound...]).trimmingCharacters(in: .whitespaces)
-        let value: ParquetFilter.Value
-        if literal.hasPrefix("\"") && literal.hasSuffix("\"") && literal.count >= 2 {
-            value = .string(String(literal.dropFirst().dropLast()))
-        } else if let i = Int64(literal) {
-            value = .int(i)
-        } else if let d = Double(literal) {
-            value = .double(d)
-        } else {
-            value = .string(literal)
-        }
         out.append(ParquetFilter(column: name, op: op, value: value))
+        i += 1      // past the `;`, if any
     }
     return out
 }
@@ -329,4 +365,80 @@ public func am_parquet_batch_column(_ b: OpaquePointer?, _ i: Int64,
 public func am_parquet_batch_release(_ b: OpaquePointer?) {
     guard let b else { return }
     Unmanaged<BatchBox>.fromOpaque(UnsafeRawPointer(b)).release()
+}
+
+// MARK: - ARROW:schema metadata (docs/PARQUET.md, "The stored Arrow schema")
+
+/// Copies a metadata set into `out` as the C Data Interface metadata blob and returns its size; with a
+/// NULL `out` or a small `cap` nothing is copied and the size is still returned, so a caller asks twice.
+private func pqMetadataBlob(_ m: ArrowSchemaMetadata, _ out: UnsafeMutablePointer<UInt8>?, _ cap: Int64) -> Int64 {
+    guard !m.isEmpty else { return 0 }
+    let blob = m.encoded()
+    if let out, Int(cap) >= blob.count {
+        blob.withUnsafeBufferPointer { out.update(from: $0.baseAddress!, count: blob.count) }
+    }
+    return Int64(blob.count)
+}
+
+@_cdecl("am_parquet_field_metadata")
+public func am_parquet_field_metadata(_ f: OpaquePointer?, _ column: UnsafePointer<CChar>?,
+                                      _ out: UnsafeMutablePointer<UInt8>?, _ cap: Int64) -> Int64 {
+    guard let file = pqFile(f) else { return pqMissingFile("am_parquet_field_metadata") }
+    guard let column else {
+        pqBadArgument("am_parquet_field_metadata", "`column` is NULL")
+        return -1
+    }
+    guard cap >= 0 else {
+        pqBadArgument("am_parquet_field_metadata", "`cap` is \(cap), which is negative")
+        return -1
+    }
+    return pqMetadataBlob(file.arrowFieldMetadata(column: String(cString: column)), out, cap)
+}
+
+@_cdecl("am_parquet_schema_metadata")
+public func am_parquet_schema_metadata(_ f: OpaquePointer?, _ out: UnsafeMutablePointer<UInt8>?,
+                                       _ cap: Int64) -> Int64 {
+    guard let file = pqFile(f) else { return pqMissingFile("am_parquet_schema_metadata") }
+    guard cap >= 0 else {
+        pqBadArgument("am_parquet_schema_metadata", "`cap` is \(cap), which is negative")
+        return -1
+    }
+    return pqMetadataBlob(file.arrowSchemaMetadata, out, cap)
+}
+
+// MARK: - Page index (docs/PARQUET.md, "Page-level skipping")
+
+@_cdecl("am_parquet_set_page_index")
+public func am_parquet_set_page_index(_ f: OpaquePointer?, _ enabled: Int32) -> Int32 {
+    guard let file = pqFile(f) else { return pqBadArgument("am_parquet_set_page_index", "`f` is NULL (no open file)") }
+    file.usePageIndex = enabled != 0
+    return 0
+}
+
+@_cdecl("am_parquet_set_bloom_filters")
+public func am_parquet_set_bloom_filters(_ f: OpaquePointer?, _ enabled: Int32) -> Int32 {
+    guard let file = pqFile(f) else { return pqBadArgument("am_parquet_set_bloom_filters", "`f` is NULL (no open file)") }
+    file.useBloomFilters = enabled != 0
+    return 0
+}
+
+/// `[row groups read, row groups skipped by statistics, row groups skipped by the page index,
+/// data pages decoded, data pages skipped, rows, row groups skipped by bloom filters]` of the most recent
+/// read; returns 7.
+@_cdecl("am_parquet_last_read_stats")
+public func am_parquet_last_read_stats(_ f: OpaquePointer?, _ out: UnsafeMutablePointer<Int64>?, _ cap: Int64) -> Int64 {
+    guard let file = pqFile(f) else { return pqMissingFile("am_parquet_last_read_stats") }
+    guard cap >= 0 else {
+        pqBadArgument("am_parquet_last_read_stats", "`cap` is \(cap), which is negative")
+        return -1
+    }
+    guard out != nil || cap == 0 else {
+        pqBadArgument("am_parquet_last_read_stats", "`out` is NULL but `cap` is \(cap)")
+        return -1
+    }
+    let s = file.lastReadStatistics
+    let values = [s.rowGroupsRead, s.rowGroupsSkippedByStatistics, s.rowGroupsSkippedByPageIndex,
+                  s.pagesDecoded, s.pagesSkipped, s.rows, s.rowGroupsSkippedByBloomFilter]
+    if let out { for (i, v) in values.enumerated() where i < Int(cap) { out[i] = Int64(v) } }
+    return Int64(values.count)
 }

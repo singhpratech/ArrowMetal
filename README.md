@@ -142,6 +142,7 @@ low-cardinality group-by and multi-key sort: against it, `sum by int32 key` at 1
 1.8x rather than the 3.8x the matrix shows against Acero, and `lexsort` is 7.0x rather than 24.0x. From
 100,000 groups upward, and on every sort, ArrowMetal stays 3x or more ahead of DuckDB, at 1 to 2 CPU-ms
 against DuckDB's 135 to 4,350.
+An optimizer extension also runs eligible aggregates of unchanged DuckDB SQL on the GPU with DuckDB's exact answers ([docs/DUCKDB.md](docs/DUCKDB.md) §4b).
 
 ## From Python
 
@@ -172,6 +173,7 @@ import polars as pl
 col = am.array(pl.Series([1, None, 3, 40]).to_arrow())
 print(pl.from_arrow(col.filter_where(">", 2).to_arrow()))
 ```
+A whole lazy plan can run through `lf.collect(engine=am.MetalEngine())`, which takes the parts it measured ahead of Polars and leaves the rest to Polars ([docs/POLARS.md](docs/POLARS.md), tier 4).
 ```python
 from decimal import Decimal
 
@@ -307,8 +309,10 @@ the right type and the right values, and every file pyarrow writes for one of th
 pyarrow's values. The reader also decompresses LZ4_FRAME and ZSTD bodies (ZSTD through libzstd, as the
 Parquet reader does, with a clear error when it is not installed), and follows message order for
 dictionaries, so a stream may replace a dictionary part way through or extend it with a delta. The
-writer emits uncompressed bodies only. Big-endian data and the view types are rejected by both;
-[docs/COVERAGE.md](docs/COVERAGE.md) says what each type is covered by.
+writer emits uncompressed, little-endian bodies of classic types only. The reader takes big-endian
+sources, the view types (materialised to the classic layouts) and the `arrow.fixed_shape_tensor`
+extension type, and refuses IPC tensor messages. [docs/COVERAGE.md](docs/COVERAGE.md) says what each
+type is covered by.
 
 ## What is implemented
 
@@ -379,6 +383,8 @@ Arrow type matrix and the interop status.
   Interface import, C Device Data Interface import/export, `MTLBuffer` recovery from our own exports.
 - `ArrowIPCReader` / `ArrowIPCWriter`: the Arrow IPC streaming and file formats, including a minimal
   FlatBuffers reader and builder, with no dependencies. Cross-checked against pyarrow in both directions.
+- Parquet decoded on the GPU, structs, maps and lists nested to any depth included, with the stored Arrow schema applied and page-index and bloom-filter skipping ([docs/PARQUET.md](docs/PARQUET.md)).
+- Delta Lake and Apache Iceberg tables (`am.read_delta`, `am.read_iceberg`): metadata on the CPU, data files through the GPU Parquet reader ([docs/LAKEHOUSE.md](docs/LAKEHOUSE.md)).
 - A CPU reference implementation behind the kernels, used as the oracle in tests.
 
 ## Design notes

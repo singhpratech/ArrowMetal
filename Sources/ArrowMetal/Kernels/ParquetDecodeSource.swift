@@ -1050,5 +1050,57 @@ enum ParquetDecodeSource {
         uint listDef = (dRep >= 1u) ? (dRep - 1u) : 0u;
         validBytes[r] = ((uint)defLevels[i] >= listDef) ? 1u : 0u;
     }
+
+    // ------------------------------------------------------------------ nested assembly
+    //
+    // Dremel at any depth, one field at a time. Over the level entries of one leaf beneath the field,
+    // an entry is a *slot* of the field -- one element of the Arrow array being built -- when its
+    // repetition level is at most `maxRep` and its definition level reaches `slotDef`, and the slot is
+    // non-null when the definition level reaches `validDef`. One flag pass, one prefix sum over the
+    // flags and one scatter give a struct its validity and a list its offsets (the offsets are the
+    // prefix sum of the *child's* slot flags, read at the list's own slots).
+    kernel void pq_nest_flags(device const uchar* defLevels [[buffer(0)]],
+                              device const uchar* repLevels [[buffer(1)]],
+                              constant uint& n [[buffer(2)]],
+                              constant uint& hasDef [[buffer(3)]],
+                              constant uint& hasRep [[buffer(4)]],
+                              constant uint& maxRep [[buffer(5)]],
+                              constant uint& slotDef [[buffer(6)]],
+                              constant uint& validDef [[buffer(7)]],
+                              device uint* slotFlag [[buffer(8)]],
+                              device uchar* slotByte [[buffer(9)]],
+                              device uchar* validByte [[buffer(10)]],
+                              uint i [[thread_position_in_grid]]) {
+        if (i > n) return;
+        if (i == n) { slotFlag[n] = 0u; return; }
+        uint d = (hasDef != 0u) ? (uint)defLevels[i] : 0u;
+        uint r = (hasRep != 0u) ? (uint)repLevels[i] : 0u;
+        uint s = (r <= maxRep && d >= slotDef) ? 1u : 0u;
+        slotFlag[i] = s;
+        slotByte[i] = (uchar)s;
+        validByte[i] = (uchar)((d >= validDef) ? 1u : 0u);
+    }
+
+    // `flags` bit 0: write the slot's validity byte; bit 1: write the slot's list offset. Thread `n`
+    // writes the closing offset: `slotIdx[n]` is the slot count and `childIdx[n]` the child count.
+    kernel void pq_nest_scatter(device const uint* slotFlag [[buffer(0)]],
+                                device const uint* slotIdx [[buffer(1)]],
+                                device const uchar* validByte [[buffer(2)]],
+                                device const uint* childIdx [[buffer(3)]],
+                                constant uint& n [[buffer(4)]],
+                                constant uint& flags [[buffer(5)]],
+                                device uchar* outValid [[buffer(6)]],
+                                device uint* outOffsets [[buffer(7)]],
+                                uint i [[thread_position_in_grid]]) {
+        if (i > n) return;
+        if (i == n) {
+            if ((flags & 2u) != 0u) outOffsets[slotIdx[n]] = childIdx[n];
+            return;
+        }
+        if (slotFlag[i] == 0u) return;
+        uint k = slotIdx[i];
+        if ((flags & 1u) != 0u) outValid[k] = validByte[i];
+        if ((flags & 2u) != 0u) outOffsets[k] = childIdx[i];
+    }
     """
 }

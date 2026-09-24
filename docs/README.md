@@ -28,8 +28,9 @@ test or the CSV a claim comes from.
 | [R.md](R.md) | The R package: arrow R interop, int64 through bit64, the timing table with both measurement modes |
 | [EXPR.md](EXPR.md) | Fused expression queries: one runtime-generated kernel for a whole expression DAG, the grammar, how nulls are compiled, the numbers and the limits |
 | [ENGINE.md](ENGINE.md) | The lazy query engine: the logical plan, the optimizer rules with `explain()` examples, fusion planning, the full join matrix (multi-key, utf8, outer, semi/anti, as-of), window functions, the plan grammar, the numbers and the limits |
-| [POLARS.md](POLARS.md) | Polars on the GPU in three tiers: the zero-copy bridge and `.arrowmetal` namespaces, the Rust expression plugin for lazy plans, and the streaming hand-off — with install, numbers at 10M and 50M rows, and what a real Metal `engine=` backend would need |
-| [DUCKDB.md](DUCKDB.md) | Using ArrowMetal from DuckDB: the Python bridge (copy-free where DuckDB returns one chunk), the loadable SQL extension, streaming tables larger than memory, and which shapes the GPU is ahead on and which it is not |
+| [POLARS.md](POLARS.md) | Polars on the GPU in four tiers: the zero-copy bridge and `.arrowmetal` namespaces, the Rust expression plugin for lazy plans, the streaming hand-off, and `MetalEngine`, which runs parts of the optimised plan itself through `lf.collect(engine=am.MetalEngine())` — with install, numbers, what the engine translates, where it matches Polars by construction, and how its defaults were measured |
+| [DUCKDB.md](DUCKDB.md) | Using ArrowMetal from DuckDB: the Python bridge (copy-free where DuckDB returns one chunk), the loadable SQL extension, the optimizer extension that runs eligible aggregates of unchanged SQL on the GPU (§4b), streaming tables larger than memory, and which shapes the GPU is ahead on and which it is not |
+| [LAKEHOUSE.md](LAKEHOUSE.md) | Delta Lake and Apache Iceberg tables: log and metadata replay on the CPU, pruning by partitions and statistics, data files through the GPU Parquet reader; what is supported, what is refused by name, and where results differ from `deltalake` and pyiceberg |
 | [STREAMING.md](STREAMING.md) | Out-of-core streaming execution: datasets larger than memory flowing from disk through the GPU, the three-stage pipeline and its measured overlap, every streaming operator with exact-or-approximate marked, and the buffer budget |
 | [DECISIONS.md](DECISIONS.md) | Why it is built this way, one dated entry per decision |
 | [FINDINGS.md](FINDINGS.md) | Things learned the hard way: toolchain quirks, Metal limits, bugs and their lessons |
@@ -95,7 +96,7 @@ runners are never published: their GPU is virtual.
 
 | Read this | To learn |
 |---|---|
-| [PARQUET.md](PARQUET.md) | The Parquet reader that decodes on the Apple GPU: the pipeline, the parallel RLE strategy, GPU Snappy and LZ4, the supported encoding/codec/type matrix, projection and statistics pushdown, benchmarks against pyarrow / Polars / pandas, the small writer, and the limits |
+| [PARQUET.md](PARQUET.md) | The Parquet reader that decodes on the Apple GPU: the pipeline, the parallel RLE strategy, GPU Snappy and LZ4, the supported encoding/codec/type matrix, structs, maps and lists nested to any depth, the stored `ARROW:schema`, projection, statistics pushdown with page-index and bloom-filter skipping, benchmarks against pyarrow / Polars / pandas (and a nested-read script against pyarrow / Polars / DuckDB), the small writer, and the limits |
 
 ```
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter "ParquetTests|ParquetWriterTests"

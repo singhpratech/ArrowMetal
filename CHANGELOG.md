@@ -178,6 +178,18 @@ Temporal, timezones and the rest of the type matrix
   malformed rather than read with the surplus ignored; a field is classified by its type before it is
   judged for having children, so an unsupported type is named for what it is; and dictionary
   materialisation no longer reads every `DictionaryBatch` in the source on the first batch read.
+- The IPC reader reads the view types: `utf8_view` and `binary_view` materialise to the utf8 / binary
+  layout in a CPU pass sharded over the cores, `list_view` and `large_list_view` to a list (child used as
+  it is when the rows are in order, gathered with `take` otherwise). The writer writes their classic
+  counterparts.
+- The IPC reader reads big-endian sources, byte swapping every buffer by element width (decimal limbs
+  reordered, interval parts and view headers swapped one by one); fixtures are Arrow's 1.0.0 big-endian
+  integration files. The writer stays little-endian.
+- The IPC reader keeps field `custom_metadata` on its schema and returns `arrow.fixed_shape_tensor` columns
+  as `.extended`, round-tripping with pyarrow's FixedShapeTensorArray (`ArrowFixedShapeTensorType`); tensor
+  metadata whose shape product overflows is a malformed-data error. Columns naming any other extension type
+  read as their storage, as before. IPC Tensor and SparseTensor messages are refused with an error that
+  names them.
 
 Arrow function coverage
 - `arrowmetal.functions`: a registry with one entry per Arrow v25 compute function name — all 307, the
@@ -208,6 +220,78 @@ Parquet on the GPU
   decode as Metal kernels straight into shared-memory Arrow arrays. ZSTD/GZIP/BROTLI pages decompress on
   the host. Row-group and column selection, nested lists; a small host-side writer for round trips.
   `am.read_parquet(path)` in Python, `ParquetReader` in Swift.
+- Nested Parquet columns reassembled from their leaves at any depth: structs (nullable, structs of
+  structs, structs of strings), maps (`map<K, V>` with nullable and nested values), and lists nested in
+  lists, in structs and in maps (`list<list<T>>`, `list<struct<...>>`, `struct<list<...>>`,
+  `list<map<...>>`). Three levels per field from the schema, one flag kernel, one prefix sum and one scatter
+  per field (`Parquet/ParquetNested.swift`). Checked value for value and type for type against
+  `pyarrow.parquet.read_table` on files written by pyarrow, DuckDB and Polars
+  (`Tests/Fixtures/generate_parquet_nested.py`, `ParquetNestedTests`, `python/tests/test_parquet_nested.py`).
+- The Parquet reader applies the file's `ARROW:schema` metadata: timestamp time zones, durations,
+  decimal32 / decimal64, fixed-size lists, string and binary dictionary (categorical) columns and
+  extension types come back as their stored Arrow types, at any depth for zones, durations and decimals;
+  a categorical of any other value type reads as that type, as in pyarrow; a column annotated `UNKNOWN`
+  reads as the `null` type rather than an all-null `int32`. Field and schema metadata are served by
+  `arrowFieldMetadata(column:)` / `arrowSchemaMetadata`, `am_parquet_field_metadata` /
+  `am_parquet_schema_metadata`, and carried on `read_parquet_table`'s Table. The stored fields match the
+  columns by position; a stored schema of another width is ignored, as pyarrow ignores it, and one that
+  is not base64 or not a Schema message is ignored where pyarrow refuses the file
+  (`ParquetArrowSchemaTests`).
+- Parquet filter values: Python raises on a filter value that is not a str, bool, int or float (a
+  `datetime.date` or `Decimal` used to rule out every row group without an error), and a literal of
+  another kind than its column's never rules a row group or page out.
+- Page-level skipping for Parquet statistics filters: with a column index and offset index in the file,
+  the pages whose min/max cannot match (or that hold only nulls, by their null count as well as their
+  flag, since Polars flags pages holding a NaN) are never read, decompressed or decoded; the row-group
+  min/max of a column whose index shows such a flagged page do not drop the row group, since Polars
+  leaves those pages out of them; a row group every page of which is ruled out is dropped, and every
+  column is trimmed to the same candidate rows. The matching rows are identical with and without the
+  index; `usePageIndex` / `use_page_index` / `am_parquet_set_page_index` turn it off and
+  `lastReadStatistics` / `last_read_stats` / `am_parquet_last_read_stats` count the pages decoded and
+  skipped (`ParquetPageIndexTests`).
+- Parquet split-block bloom filters (pyarrow's `bloom_filter_options`, DuckDB's): an `==` filter drops
+  the row groups whose bloom filter rules its literal out, before any page is read; `useBloomFilters` /
+  `use_bloom_filters` / `am_parquet_set_bloom_filters` turn it off (`ParquetBloomFilterTests`).
+- Parquet repetition levels were decoded with a 4-byte scratch buffer for the per-level ranks the kernel
+  writes, so a list column with more than 4,096 level entries in one read wrote past that buffer into
+  host memory (the allocation is `posix_memalign` memory wrapped for the GPU); the scratch buffer now
+  has a slot per level. `test_parquet_nested.py::test_repeated_columns_past_one_allocation_page` fails
+  without the fix and passes with it.
+- A one-level Parquet list column read from row groups that a filter removed entirely now comes back
+  empty instead of raising "a list column must have definition levels".
+- Parquet `!=` filters on a `float` or `double` column never rule out a row group or page: writers leave
+  NaN out of min / max, so a page of one value with a NaN in it was skipped and its NaN row lost with
+  the page index on. pyarrow's filtered read still rules out such a row group; ArrowMetal returns its NaN
+  rows (`test_not_equal_keeps_a_nan_hidden_in_a_constant_page`, `ParquetFilterEdgeTests`).
+- A pyarrow `list<null>` column (and any `null`-typed leaf below a list or map) reads as its Arrow type,
+  the null child with one slot per element (`test_null_type_below_lists_maps_and_structs`).
+- `uint64` statistics are read as unsigned, and an integer filter literal above the int64 range stays
+  exact: `u64 >= 2**63` used to rule out every row group (`test_uint64_literals_past_the_signed_range`).
+- Python quotes a string filter value with `"` and `\` escaped, so a `;` or quote inside it is part of
+  the value; a column name holding `= ! < > ;` raises.
+- A restored Parquet dictionary type has `int32` indices and no ordered flag, where pyarrow keeps the
+  stored index type and flag; listed under Limits in docs/PARQUET.md and tested.
+- Delta Lake and Apache Iceberg tables (docs/LAKEHOUSE.md): `am.read_delta` / `am.read_iceberg` (and
+  `*_table` for a pyarrow.Table), `DeltaTable` / `IcebergTable` in Swift, `am_delta_read` /
+  `am_iceberg_read` in C. The Delta log (JSON commits, single and multi-part checkpoints read with the GPU
+  Parquet reader) and the Iceberg metadata (v1 and v2, Avro manifest lists and manifests through a small
+  CPU Avro reader with the null, deflate and snappy codecs) are resolved on the CPU; time travel, partition
+  columns, Delta column mapping `none`/`name`, Iceberg columns by field id (renames, added columns, int to
+  long); filters prune files by partition values and statistics and are applied to the rows. Unimplemented
+  reader features (deletion vectors, column mapping `id`, Iceberg delete files, unknown features) are
+  refused with an error naming them. Checked against `deltalake` 1.6.5 and pyiceberg 0.12.0
+  (`LakehouseTests`, `python/tests/test_lakehouse.py`); `Benchmarks/lakehouse_bench.py` for timings.
+- Lakehouse reads: a Delta empty-string partition value reads as null for every type, as the protocol
+  and `deltalake` have it; string row-group pruning is byte-wise, the row filter's order, so decomposed
+  strings are no longer pruned away; Iceberg data-file paths are opened as written (pyiceberg's
+  `grp=x%3Dy` directories); a float32 column compares with a double literal exactly, as pyarrow does.
+  Filter literals at the edges of their types (doubles past the Int64 range, huge years, non-ASCII digits,
+  decimals over 38 digits) and malformed Avro manifests or Delta `partitionValues` are answers or errors,
+  never a crash or a hang; a negative Delta version other than -1 (C) is an error.
+- Lakehouse reads: a NaN Delta float partition is kept for `!=` (it was pruned for every comparison); a
+  Delta reader protocol 3 whose `readerFeatures` is missing or not a list of strings, an Iceberg snapshot
+  with neither a manifest list nor manifests, and a data file holding none of the table's columns are
+  errors instead of reads.
 
 Out-of-core streaming
 - A streaming executor for datasets larger than memory (docs/STREAMING.md): Arrow IPC files/directories
@@ -228,10 +312,47 @@ Integrations
   functions; its answers are checked against DuckDB's by the 11 `@extension` tests in
   `python/tests/test_duckdb.py`, which run once `duckdb-extension/build.sh` has built it, and it is not
   yet a speedup (2048-row vectors).
+- DuckDB rewrite extension (docs/DUCKDB.md §4b): `duckdb-extension/src/arrowmetal_rewrite.cpp`, a C++
+  optimizer extension for DuckDB 1.5.5 (the C extension API has no optimizer hook; the duckdb Python
+  module exports the C++ symbols a `CPP` extension needs), built by `duckdb-extension/build_rewrite.sh`.
+  It replaces an eligible aggregate of unchanged SQL - `sum`/`avg` over integers, `min`/`max` over
+  integers, `DATE` and `TIMESTAMP`, `count`, with no key or one integer, `DATE`, `TIMESTAMP` or `VARCHAR`
+  key, over a table or Parquet scan - with `ARROWMETAL_AGGREGATE`: a parallel sink into pooled,
+  page-aligned slabs imported into ArrowMetal once, then a fused aggregate, a fused dense group-by or the
+  hash group-by, with ungrouped and narrow-key plans streamed to the GPU in blocks while DuckDB scans.
+  Answers are DuckDB's exactly (`HUGEINT` sums through 32-bit halves, `avg` with DuckDB's own finalizer
+  arithmetic, NULL groups, empty inputs), checked by `python/tests/test_duckdb_rewrite.py` with the
+  rewrite off and forced. `SET arrowmetal_rewrite = 'auto'` rewrites only at or above the router's
+  crossover and the shape class's measured floor (`Benchmarks/duckdb_rewrite_bench.py`, provisional
+  results in `Benchmarks/results/duckdb_rewrite_2026-09-23_provisional.csv`); `'off'` and `'force'`
+  too; `arrowmetal_rewrites()` and `EXPLAIN` show what happened. Python: `am.duckdb_connect()`,
+  `am.duckdb_rewrites(con)`, `am.duckdb_is_rewritten(con, sql)`. In `auto` an ungrouped query is
+  rewritten only with three or more of `sum`/`min`/`max`/`avg`, from 50M rows; a `GROUP BY` with no
+  aggregates is rewritten like any other group-by. Where DuckDB would have run the group-by as its
+  `PERFECT_HASH_GROUP_BY`, a key past the table its planning-time statistics sized (a prepared statement
+  run after out-of-range keys were inserted) raises DuckDB's own error, as it does with the rewrite off.
 - pandas (docs/PANDAS.md): an `.am` accessor on Series/DataFrame, and an opt-in accel mode that patches a
   documented set of pandas methods, routes to the GPU only when dtype, size and arguments qualify, and
   restores the originals exactly on `uninstall()`.
-- `import arrowmetal` imports none of the three; each bridge loads on first use through one chained
+- Polars engine (docs/POLARS.md, tier 4): `lf.collect(engine=am.MetalEngine())` translates the
+  subtrees of Polars' optimised plan that read in-memory frames -- filters, projections, slices,
+  sorts, group-bys, aggregates, inner/left/semi/anti joins and `unique`, over a documented set of
+  expressions and dtypes -- into ArrowMetal
+  plans and runs them on the GPU through Polars' post-optimisation callback, leaving every other node
+  to Polars; `engine.last_report` says what ran where and why. Results are Polars' own (float total
+  order, `is_in` matching NaN, Kleene logic, Polars' aggregate dtypes and empty-group answers, Float32
+  arithmetic without subnormal flushing, division by a literal as Polars' reciprocal multiply, a float
+  multiply by -1 as Polars' negation, NaN sign bits included), checked by `python/tests/test_polars_engine.py` against Polars across sizes,
+  null ratios, dtypes and chunked and sliced frames. By default it takes the shapes the provisional
+  benchmark (`Benchmarks/polars_engine_bench.py`) measured ahead of both Polars engines -- full sorts
+  from 1M rows -- and `shapes="all"` takes everything it can translate. Imports of Polars columns are
+  cached by buffer address across queries. A float literal of magnitude 2^63 or more, which traps the
+  process inside ArrowMetal's expression compiler, is left to Polars.
+- Four engine behaviours found by that suite and worked around in `polars_engine.py`, each pinned by a
+  strict xfail: String compaction reading bytes under a null slot, a Boolean column's null count lost
+  through the plan's sort, a filter rejecting a plan that carries a `date32` column, and a String sort
+  returning wrong rows when the column holds a null and a value of 8 bytes or more.
+- `import arrowmetal` imports none of the bridges; each loads on first use through one chained
   PEP 562 hook (`_LAZY_HOOKS`).
 - The public C header compiles as C, which `test_the_public_c_header_compiles` now holds it to (a
   typedef/function name clash, `am_plan_source`, was a redefinition in both C and C++ and blocked every
@@ -248,6 +369,10 @@ Bindings
   The publication steps are in docs/RELEASE.md (step 4 is the PyPI upload).
 
 Fixed
+- A float literal whose value is 2^63 or more in magnitude no longer ends the host process: the fused
+  expression compiler converted every float literal to Int64 even for float targets, and `Int64(Double)`
+  traps outside its range. Float targets no longer compute the integer; an integer-typed float literal that
+  does not fit 64 bits is an `ExprError` naming it. Found by the review of the Polars engine lane.
 - `GroupByKeys._agg` in the Python package took the device handle of a temporary `MetalArray` that was
   released before the C call read it, segfaulting every grouped aggregate whose values arrived as a
   pyarrow array rather than a `MetalArray`.

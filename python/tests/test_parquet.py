@@ -39,16 +39,10 @@ def normalise(table):
     return out
 
 
-def has_struct(table):
-    return any(pa.types.is_struct(f.type) for f in table.schema)
-
-
 @pytest.mark.skipif(not fixture_paths(), reason="fixtures not generated")
 @pytest.mark.parametrize("path", fixture_paths(), ids=lambda p: os.path.basename(p)[:-8])
 def test_matches_pyarrow(path):
     want = pq.read_table(path)
-    if has_struct(want):
-        pytest.skip("struct columns are read leaf by leaf; see test_struct_leaves")
     try:
         got = am.read_parquet_table(path)
     except am.ArrowMetalError as e:
@@ -64,8 +58,6 @@ def test_matches_pyarrow(path):
 @pytest.mark.parametrize("path", fixture_paths(), ids=lambda p: os.path.basename(p)[:-8])
 def test_types_match_pyarrow(path):
     want = pq.read_table(path)
-    if has_struct(want):
-        pytest.skip("struct columns are read leaf by leaf")
     try:
         got = am.read_parquet_table(path)
     except am.ArrowMetalError as e:
@@ -120,7 +112,7 @@ def test_dictionary_encoded_columns():
 
 
 def test_struct_leaves():
-    """A struct column is not reassembled, but each of its leaves reads by dotted path."""
+    """A struct column reads whole, and each of its leaves also reads on its own by dotted path."""
     path = os.path.join(FIXTURES, "struct__plain_none.parquet")
     if not os.path.exists(path):
         pytest.skip("fixture not generated")
@@ -130,9 +122,11 @@ def test_struct_leaves():
     assert got["addr.city"].to_pylist() == [v["city"] if v else None for v in want["addr"].to_pylist()]
     assert got["addr.zip"].to_pylist() == [v["zip"] if v else None for v in want["addr"].to_pylist()]
     assert got["k"].to_pylist() == want["k"].to_pylist()
-    # Asking for the struct itself says so rather than returning something wrong.
-    with pytest.raises(am.ArrowMetalError):
-        am.read_parquet(path, columns=["addr"])
+    # The struct itself is reassembled from those leaves (python/tests/test_parquet_nested.py covers
+    # the nested shapes in depth).
+    whole = am.read_parquet_table(path, columns=["addr"])
+    assert whole["addr"].type == want["addr"].type
+    assert whole["addr"].to_pylist() == want["addr"].to_pylist()
 
 
 def test_arrays_are_gpu_resident():

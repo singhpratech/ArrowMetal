@@ -4213,9 +4213,54 @@ _lib.am_parquet_write.argtypes = [ctypes.c_char_p, ctypes.POINTER(_P), ctypes.PO
                                   ctypes.c_int64, ctypes.c_char_p, ctypes.c_int, ctypes.c_int64]
 _lib.am_parquet_write.restype = ctypes.c_int
 
+# ---- Parquet: the stored Arrow schema and page-index statistics (docs/PARQUET.md)
+_lib.am_parquet_field_metadata.argtypes = [_P, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int64]
+_lib.am_parquet_field_metadata.restype = ctypes.c_int64
+_lib.am_parquet_schema_metadata.argtypes = [_P, ctypes.c_void_p, ctypes.c_int64]
+_lib.am_parquet_schema_metadata.restype = ctypes.c_int64
+_lib.am_parquet_set_page_index.argtypes = [_P, ctypes.c_int]
+_lib.am_parquet_set_page_index.restype = ctypes.c_int
+_lib.am_parquet_set_bloom_filters.argtypes = [_P, ctypes.c_int]
+_lib.am_parquet_set_bloom_filters.restype = ctypes.c_int
+_lib.am_parquet_last_read_stats.argtypes = [_P, ctypes.POINTER(ctypes.c_int64), ctypes.c_int64]
+_lib.am_parquet_last_read_stats.restype = ctypes.c_int64
+
+
+def _parquet_metadata(call):
+    """Runs a size-then-fill metadata call and decodes the C Data Interface metadata blob
+    (int32 count, then int32-length-prefixed key and value bytes) into `{bytes: bytes}`."""
+    n = call(None, 0)
+    if n < 0:
+        _check(1)
+    if n == 0:
+        return {}
+    buf = (ctypes.c_uint8 * n)()
+    call(buf, n)
+    raw = bytes(buf)
+    count, = struct.unpack_from("=i", raw, 0)
+    pos, out = 4, {}
+    for _ in range(count):
+        kl, = struct.unpack_from("=i", raw, pos)
+        key = raw[pos + 4:pos + 4 + kl]
+        pos += 4 + kl
+        vl, = struct.unpack_from("=i", raw, pos)
+        out[key] = raw[pos + 4:pos + 4 + vl]
+        pos += 4 + vl
+    return out
+
+
+def _np_bool_types():
+    """numpy.bool_ when numpy is importable (a comparison result is one), else no extra types."""
+    try:
+        import numpy
+        return (numpy.bool_,)
+    except ImportError:
+        return ()
+
 
 def _filter_text(filters):
     """`[("x", ">", 3), ("s", "==", "a")]` -> the ABI's `x>3;s=="a"` text."""
+    import numbers
     if not filters:
         return None
     if isinstance(filters, str):
@@ -4227,12 +4272,23 @@ def _filter_text(filters):
         col, op, val = f
         if op not in ("==", "!=", "<", "<=", ">", ">="):
             raise ArrowMetalError("filter op must be one of == != < <= > >=; got %r" % (op,))
+        if any(ch in str(col) for ch in "=!<>;"):
+            raise ArrowMetalError("a Parquet filter column name cannot contain = ! < > or ;; got %r" % (col,))
         if isinstance(val, str):
-            lit = '"%s"' % val
-        elif isinstance(val, bool):
+            # Quoted, with a quote or backslash inside escaped, so `;` and `"` in the value survive.
+            lit = '"%s"' % val.replace("\\", "\\\\").replace('"', '\\"')
+        elif isinstance(val, (bool, _np_bool_types())):
             lit = "1" if val else "0"
+        elif isinstance(val, numbers.Integral):
+            lit = str(int(val))
+        elif isinstance(val, numbers.Real):
+            lit = repr(float(val))
         else:
-            lit = repr(val)
+            # A date, datetime or Decimal has no text the filter parser reads as the column's value, and
+            # used to rule out every row group silently. Filter a date or timestamp column by its stored
+            # integer (days since the epoch, ticks in the column's unit) instead.
+            raise ArrowMetalError("a Parquet filter value must be a str, bool, int or float; got %s %r for "
+                                  "column %r" % (type(val).__name__, val, col))
         parts.append("%s%s%s" % (col, op, lit))
     return ";".join(parts).encode()
 
@@ -4416,7 +4472,69 @@ class ParquetFile:
         if not len(cols):
             return pa.table({})
         # Positional, so a projection naming a column twice gives a Table with both, as pyarrow does.
-        return pa.table([c.to_arrow() for c in cols.columns], names=cols.names)
+        arrays = [c.to_arrow() for c in cols.columns]
+        return pa.Table.from_arrays(arrays, schema=self._arrow_schema(cols.names, arrays))
+
+    # ---- the stored Arrow schema (docs/PARQUET.md, "The stored Arrow schema")
+    #
+    # A read already puts back the time zones, durations and extension types the file's ARROW:schema
+    # records. The field and schema metadata travel beside the arrays, the way pyarrow's Table carries
+    # them: `read_table` attaches both.
+
+    def field_metadata(self, column):
+        """A top-level column's custom metadata as `{bytes: bytes}` (what `pyarrow.parquet.read_table`
+        puts on the field), including `PARQUET:field_id` when the Parquet schema has one."""
+        return _parquet_metadata(lambda out, cap: _lib.am_parquet_field_metadata(self._h, str(column).encode(), out, cap))
+
+    @property
+    def schema_metadata(self):
+        """The file's key/value metadata without ARROW:schema, as `{bytes: bytes}`."""
+        return _parquet_metadata(lambda out, cap: _lib.am_parquet_schema_metadata(self._h, out, cap))
+
+    # ---- page-level skipping (docs/PARQUET.md, "Page-level skipping")
+
+    @property
+    def use_page_index(self):
+        """Whether a filtered read uses the file's column and offset indexes to skip data pages (on by
+        default). Turning it off makes every filtered read row-group granular."""
+        return getattr(self, "_use_page_index", True)
+
+    @use_page_index.setter
+    def use_page_index(self, enabled):
+        _check(_lib.am_parquet_set_page_index(self._h, 1 if enabled else 0))
+        self._use_page_index = bool(enabled)
+
+    @property
+    def use_bloom_filters(self):
+        """Whether an equality filter consults the file's bloom filters to drop row groups (on by default)."""
+        return getattr(self, "_use_bloom_filters", True)
+
+    @use_bloom_filters.setter
+    def use_bloom_filters(self, enabled):
+        _check(_lib.am_parquet_set_bloom_filters(self._h, 1 if enabled else 0))
+        self._use_bloom_filters = bool(enabled)
+
+    @property
+    def last_read_stats(self):
+        """What the most recent read on this handle did: row groups read and skipped (by statistics, by
+        the page index and by bloom filters), data pages decoded and skipped, and rows returned."""
+        buf = (ctypes.c_int64 * 7)()
+        if _lib.am_parquet_last_read_stats(self._h, buf, 7) < 0:
+            _check(1)
+        keys = ("row_groups_read", "row_groups_skipped_by_statistics", "row_groups_skipped_by_page_index",
+                "pages_decoded", "pages_skipped", "rows", "row_groups_skipped_by_bloom_filter")
+        return dict(zip(keys, (int(v) for v in buf)))
+
+    def _arrow_schema(self, names, arrays):
+        fields = []
+        for name, arr in zip(names, arrays):
+            md = self.field_metadata(name) or None
+            if md and isinstance(arr.type, pa.BaseExtensionType):
+                # A registered extension type consumes its two keys, as it does in pyarrow (which then
+                # keeps an empty metadata map rather than none).
+                md = {k: v for k, v in md.items() if not k.startswith(b"ARROW:extension:")}
+            fields.append(pa.field(name, arr.type, metadata=md))
+        return pa.schema(fields, metadata=self.schema_metadata or None)
 
 
 def read_parquet(path, columns=None, row_groups=None, filters=None, dictionary=True):
@@ -4425,7 +4543,9 @@ def read_parquet(path, columns=None, row_groups=None, filters=None, dictionary=T
 
     `columns` projects (only the requested column chunks are ever touched), `row_groups` selects by
     index, and `filters` is a list of `(column, op, value)` triples evaluated against the footer's
-    min/max statistics, so whole row groups that cannot match are never read. `dictionary=False`
+    min/max statistics, so whole row groups that cannot match are never read. A filter value is a str,
+    bool, int or float; a date or timestamp column is filtered by its stored integer (days since the
+    epoch, or ticks in the column's unit), and any other value raises. `dictionary=False`
     materialises dictionary-encoded columns instead of returning them dictionary encoded; either way
     the compute functions accept the column, decoding a dictionary for you when they must.
 
@@ -4473,6 +4593,257 @@ def write_parquet(data, path, compression="snappy", use_dictionary=True, row_gro
 from . import stream                                                       # noqa: E402
 from .stream import (Stream, GroupedStream, JoinedStream, JoinedGroupedStream,  # noqa: E402,F401
                      scan_ipc, scan_arrow, scan_table)
+
+
+# ---- Lakehouse tables: Delta Lake and Apache Iceberg (docs/LAKEHOUSE.md)
+#
+# The table metadata (the Delta log and checkpoints; Iceberg's metadata JSON and Avro manifests) is
+# resolved on the CPU, data files are pruned by partition values and column statistics, and the
+# surviving Parquet files are read by the GPU Parquet reader. Unlike `read_parquet`, whose filters only
+# skip row groups, these filters are applied to the rows as well: the result holds exactly the rows
+# where every `(column, op, value)` holds, as `deltalake` and `pyiceberg` return them.
+
+_lib.am_delta_read.argtypes = [ctypes.c_char_p, ctypes.c_int64, ctypes.POINTER(ctypes.c_char_p), ctypes.c_int64,
+                               ctypes.c_char_p, ctypes.POINTER(_P)]
+_lib.am_delta_read.restype = ctypes.c_int
+_lib.am_delta_latest_version.argtypes = [ctypes.c_char_p]
+_lib.am_delta_latest_version.restype = ctypes.c_int64
+_lib.am_iceberg_read.argtypes = [ctypes.c_char_p, ctypes.c_int64, ctypes.c_int, ctypes.POINTER(ctypes.c_char_p),
+                                 ctypes.c_int64, ctypes.c_char_p, ctypes.POINTER(_P)]
+_lib.am_iceberg_read.restype = ctypes.c_int
+_lib.am_iceberg_current_snapshot.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int64)]
+_lib.am_iceberg_current_snapshot.restype = ctypes.c_int
+_lib.am_lakehouse_batch_columns.argtypes = [_P]
+_lib.am_lakehouse_batch_columns.restype = ctypes.c_int64
+_lib.am_lakehouse_batch_rows.argtypes = [_P]
+_lib.am_lakehouse_batch_rows.restype = ctypes.c_int64
+_lib.am_lakehouse_batch_column_name.argtypes = [_P, ctypes.c_int64]
+_lib.am_lakehouse_batch_column_name.restype = ctypes.c_char_p
+_lib.am_lakehouse_batch_column.argtypes = [_P, ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_lakehouse_batch_column.restype = ctypes.c_int
+_lib.am_lakehouse_batch_stats.argtypes = [_P, ctypes.POINTER(ctypes.c_int64)]
+_lib.am_lakehouse_batch_stats.restype = ctypes.c_int
+_lib.am_lakehouse_batch_release.argtypes = [_P]
+
+
+_LAKEHOUSE_OPS = ("==", "!=", "<=", ">=", "<", ">")    # the order the ABI's filter parser tries them in
+
+
+def _lakehouse_filter_text(filters):
+    """`[("x", ">", 3), ("d", ">=", datetime.date(2024, 1, 1))]` -> the ABI's filter text. Dates and
+    datetimes become ISO 8601 string literals, which the reader parses against the column's type (a
+    naive datetime is taken as UTC). A `bytes` literal (for a binary column) is passed as its UTF-8 text,
+    so it must be valid UTF-8; a filter the text form cannot carry exactly is an error, never a
+    different filter."""
+    if not filters:
+        return None
+    if isinstance(filters, str):
+        return filters.encode()
+    import datetime as _dt
+    parts = []
+    for f in filters:
+        if len(f) != 3:
+            raise ArrowMetalError("a filter is (column, op, value); got %r" % (f,))
+        col, op, val = f
+        if op not in ("==", "!=", "<", "<=", ">", ">="):
+            raise ArrowMetalError("filter op must be one of == != < <= > >=; got %r" % (op,))
+        if isinstance(val, _dt.datetime):
+            if val.tzinfo is not None:
+                val = val.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+            lit = '"%s"' % val.isoformat()
+        elif isinstance(val, _dt.date):
+            lit = '"%s"' % val.isoformat()
+        elif isinstance(val, (bytes, bytearray)):
+            try:
+                text = bytes(val).decode("utf-8")
+            except UnicodeDecodeError:
+                raise ArrowMetalError("a bytes filter literal must be valid UTF-8 (the filter text carries it "
+                                      "as a string); got %r" % (bytes(val),))
+            if '"' in text or ";" in text or "\0" in text:
+                raise ArrowMetalError("a bytes filter literal cannot contain '\"', ';' or NUL; got %r" % (bytes(val),))
+            lit = '"%s"' % text
+        elif isinstance(val, str):
+            if '"' in val or ";" in val or "\0" in val:
+                raise ArrowMetalError("a string filter literal cannot contain '\"', ';' or NUL; got %r" % (val,))
+            lit = '"%s"' % val
+        elif isinstance(val, bool):
+            lit = "1" if val else "0"
+        elif isinstance(val, (int, float)):
+            lit = repr(val)
+        else:
+            try:
+                import decimal as _decimal
+                if isinstance(val, _decimal.Decimal):
+                    lit = '"%s"' % format(val, "f")
+                else:
+                    raise TypeError
+            except TypeError:
+                raise ArrowMetalError("unsupported filter literal %r for column %r" % (val, col))
+        if not isinstance(col, str) or not col or col.strip() != col or any(c in col for c in ';"\0'):
+            raise ArrowMetalError("filter column name %r cannot be written as filter text" % (col,))
+        text = "%s%s%s" % (col, op, lit)
+        # The parser splits at the first operator it finds, trying them in `_LAKEHOUSE_OPS` order; refuse
+        # a column name or literal that would move the split (`("s", "<", "a==b")`).
+        for cand in _LAKEHOUSE_OPS:
+            at = text.find(cand)
+            if at >= 0:
+                if (at, cand) != (len(col), op):
+                    raise ArrowMetalError("filter %r cannot be written as filter text: the operator %r inside "
+                                          "the column name or literal would be read first" % ((col, op, val), cand))
+                break
+        parts.append(text)
+    return ";".join(parts).encode()
+
+
+class LakehouseScanStats(dict):
+    """How a table read was pruned: files total / pruned by partition / pruned by statistics / read,
+    and (Iceberg) manifests total / pruned."""
+
+
+def _lakehouse_columns(columns):
+    if columns is None:
+        return None, 0
+    columns = list(columns)
+    return (ctypes.c_char_p * max(len(columns), 1))(*[c.encode() for c in columns]), len(columns)
+
+
+def _lakehouse_collect(out, with_stats):
+    try:
+        pairs = []
+        for i in range(_lib.am_lakehouse_batch_columns(out)):
+            name = _lib.am_lakehouse_batch_column_name(out, i).decode()
+            h = _P()
+            _check(_lib.am_lakehouse_batch_column(out, i, ctypes.byref(h)))
+            pairs.append((name, MetalArray(h)))
+        cols = ColumnSet(pairs)
+        if not with_stats:
+            return cols
+        buf = (ctypes.c_int64 * 6)()
+        _check(_lib.am_lakehouse_batch_stats(out, buf))
+        keys = ("files_total", "files_pruned_by_partition", "files_pruned_by_statistics", "files_read",
+                "manifests_total", "manifests_pruned")
+        return cols, LakehouseScanStats(zip(keys, [int(x) for x in buf]))
+    finally:
+        _lib.am_lakehouse_batch_release(out)
+
+
+def _lakehouse_table(cols):
+    if not len(cols):
+        return pa.table({})
+    return pa.table([c.to_arrow() for c in cols.columns], names=cols.names)
+
+
+def read_delta(path, version=None, columns=None, filters=None, with_stats=False):
+    """Reads a Delta Lake table on the GPU and returns a `ColumnSet`.
+
+    `version` time-travels (the latest version when None), `columns` projects, and `filters` is a list
+    of `(column, op, value)` triples, all of which must hold: files are skipped by partition values and
+    by their min/max statistics, row groups by the Parquet footer, and the remaining rows are filtered.
+    `with_stats=True` returns `(columns, stats)` with the pruning counters.
+
+        cols = am.read_delta("events", version=3, columns=["user", "amount"],
+                             filters=[("day", ">=", datetime.date(2024, 1, 1))])
+    """
+    if version is not None and int(version) < 0:
+        raise ArrowMetalError("version must be 0 or more (None reads the latest); got %r" % (version,))
+    names, n = _lakehouse_columns(columns)
+    out = _P()
+    _check(_lib.am_delta_read(str(path).encode(), -1 if version is None else int(version), names, n,
+                              _lakehouse_filter_text(filters), ctypes.byref(out)))
+    return _lakehouse_collect(out, with_stats)
+
+
+def read_delta_table(path, version=None, columns=None, filters=None):
+    """`read_delta` exported as a `pyarrow.Table`."""
+    return _lakehouse_table(read_delta(path, version=version, columns=columns, filters=filters))
+
+
+def delta_latest_version(path):
+    """The newest version recorded in a Delta table's log."""
+    v = _lib.am_delta_latest_version(str(path).encode())
+    if v < 0:
+        _check(1)
+    return int(v)
+
+
+def read_iceberg(metadata_path_or_table_dir, snapshot_id=None, columns=None, filters=None, with_stats=False):
+    """Reads an Apache Iceberg table on the GPU and returns a `ColumnSet`.
+
+    The table is named by its `*.metadata.json` file or its directory (the newest metadata file, or the
+    one `version-hint.text` names, is used). `snapshot_id` time-travels (the current snapshot when
+    None); columns are matched by field id, so renamed columns read correctly from older files.
+    `filters` prune manifests and data files by partition summaries and column bounds and are then
+    applied to the rows. `with_stats=True` returns `(columns, stats)` with the pruning counters.
+    """
+    names, n = _lakehouse_columns(columns)
+    out = _P()
+    has = snapshot_id is not None
+    _check(_lib.am_iceberg_read(str(metadata_path_or_table_dir).encode(), int(snapshot_id) if has else 0,
+                                1 if has else 0, names, n, _lakehouse_filter_text(filters), ctypes.byref(out)))
+    return _lakehouse_collect(out, with_stats)
+
+
+def read_iceberg_table(metadata_path_or_table_dir, snapshot_id=None, columns=None, filters=None):
+    """`read_iceberg` exported as a `pyarrow.Table`."""
+    return _lakehouse_table(read_iceberg(metadata_path_or_table_dir, snapshot_id=snapshot_id,
+                                         columns=columns, filters=filters))
+
+
+def iceberg_current_snapshot(metadata_path_or_table_dir):
+    """The current snapshot id of an Iceberg table, or None when it has none."""
+    v = ctypes.c_int64()
+    rc = _lib.am_iceberg_current_snapshot(str(metadata_path_or_table_dir).encode(), ctypes.byref(v))
+    if rc == 3:
+        return None
+    _check(rc)
+    return int(v.value)
+
+
+# ---------------------------------------------------------------------------------------------------
+# DuckDB rewrite extension (docs/DUCKDB.md §4b): ordinary SQL with ArrowMetal underneath.
+#
+# `am.duckdb_connect()` opens a DuckDB connection with duckdb-extension's optimizer extension loaded,
+# so eligible aggregates of unchanged SQL run on the GPU; `am.duckdb_is_rewritten(con, sql)` and
+# `am.duckdb_rewrites(con)` say what it decided. They live in duckdb_bridge.py and load lazily, like
+# the rest of the DuckDB bridge, so `import arrowmetal` still never needs duckdb.
+# ---------------------------------------------------------------------------------------------------
+_DUCKDB_REWRITE_EXPORTS = ("duckdb_connect", "duckdb_rewrites", "duckdb_is_rewritten")
+
+
+def _duckdb_rewrite_getattr(name):
+    if name in _DUCKDB_REWRITE_EXPORTS:
+        import importlib
+        attr = getattr(importlib.import_module(".duckdb_bridge", __name__), name)
+        globals()[name] = attr
+        return attr
+    raise AttributeError(name)
+
+
+_LAZY_HOOKS.append((_duckdb_rewrite_getattr, lambda: list(_DUCKDB_REWRITE_EXPORTS)))
+
+
+# ---------------------------------------------------------------------------------------------------
+# Polars engine, tier 4 of docs/POLARS.md (python/arrowmetal/polars_engine.py), imported lazily.
+#
+# `lf.collect(engine=am.MetalEngine())` runs the parts of a Polars lazy plan that ArrowMetal can run
+# on the GPU and leaves the rest to Polars; `engine.last_report` says which ran where. Like the other
+# Polars tiers it is loaded on first touch, so `import arrowmetal` still never imports Polars.
+# ---------------------------------------------------------------------------------------------------
+_POLARS_ENGINE_EXPORTS = ("MetalEngine", "MetalPlanReport", "polars_engine")
+
+
+def _polars_engine_getattr(name):
+    if name not in _POLARS_ENGINE_EXPORTS:
+        raise AttributeError(name)
+    import importlib
+    mod = importlib.import_module(__name__ + ".polars_engine")
+    globals()["polars_engine"] = mod
+    globals()["MetalEngine"] = mod.MetalEngine
+    globals()["MetalPlanReport"] = mod.MetalPlanReport
+    return globals()[name]
+
+
+_LAZY_HOOKS.append((_polars_engine_getattr, lambda: list(_POLARS_ENGINE_EXPORTS)))
 
 
 # ---- CPU/GPU router (docs/DESIGN.md, "CPU/GPU router"; include/arrowmetal.h)
