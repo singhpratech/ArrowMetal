@@ -381,12 +381,8 @@ Integrations
   null ratios, dtypes and chunked and sliced frames. By default it takes the shapes the provisional
   benchmark (`Benchmarks/polars_engine_bench.py`) measured ahead of both Polars engines -- full sorts
   from 1M rows -- and `shapes="all"` takes everything it can translate. Imports of Polars columns are
-  cached by buffer address across queries. A float literal of magnitude 2^63 or more, which traps the
-  process inside ArrowMetal's expression compiler, is left to Polars.
-- Four engine behaviours found by that suite and worked around in `polars_engine.py`, each pinned by a
-  strict xfail: String compaction reading bytes under a null slot, a Boolean column's null count lost
-  through the plan's sort, a filter rejecting a plan that carries a `date32` column, and a String sort
-  returning wrong rows when the column holds a null and a value of 8 bytes or more.
+  cached by buffer address across queries. A float literal of magnitude 2^63 or more runs on Metal like
+  any other literal.
 - `import arrowmetal` imports none of the bridges; each loads on first use through one chained
   PEP 562 hook (`_LAZY_HOOKS`).
 - The public C header compiles as C, which `test_the_public_c_header_compiles` now holds it to (a
@@ -404,6 +400,23 @@ Bindings
   The publication steps are in docs/RELEASE.md (step 4 is the PyPI upload).
 
 Fixed
+- A String `filter` or `take` no longer copies the bytes under a null slot over the next kept row:
+  `str_gather_bytes` copied each source row's own byte length while the output offsets gave a null row
+  length 0, so a null that held bytes (valid Arrow; Polars exports them) turned "banana" into "xanana".
+  The kernel now copies the output slot's width. Found by the Polars engine lane's differential suite.
+- A Boolean column carried through the plan's sort keeps its null count. `take` computes its result's
+  null count when the batch flushes, and every result derived from it before then (the Boolean repack,
+  any element-wise kernel) copied the count early and kept 0 over a bitmap with nulls; such results now
+  count their own nulls at the flush, as do element-wise results of a pending `filter`. Found by the
+  Polars engine lane's differential suite.
+- A plan whose filter or projection only carries a column the expression compiler does not read (a
+  `date32`, a list) runs: the compiler bound every column of the batch as a kernel input and refused
+  that one. Only the columns the query reads are bound now. Found by the Polars engine lane's
+  differential suite.
+- A String sort with a null and a row of 8 bytes or more returns the right rows inside a batch (every
+  plan sort): with two or more prefix passes the index array is a `take` of the passes, and the null
+  partition read it on the CPU before the GPU had written it, returning wrong rows and once a bus
+  error. The partition now waits for the batch. Found by the Polars engine lane's differential suite.
 - `am.scan_ipc(...)` (and every stream with no explicit projection) no longer replaces the second of two
   same-named columns with a copy of the first: the default projection looked each column up by name.
   Such a batch now stays positional; batches with unique names take the fused path as before. Found by

@@ -592,9 +592,10 @@ def test_true_division_by_a_literal_is_polars_reciprocal_multiply():
 
 
 
-# A finite float literal of magnitude 2**63 or more traps the process inside ArrowMetal's expression
-# compiler (it converts every float literal to Int64 as well), so the translator declines it. Run in
-# a child process: a trap there fails this test instead of ending the pytest run.
+# A finite float literal of magnitude 2**63 or more once trapped the process inside ArrowMetal's
+# expression compiler (it converted every float literal to Int64 as well), and the translator declined
+# it. The compiler no longer does, so these plans run on Metal. Still run in a child process: a trap
+# there fails this test instead of ending the pytest run.
 _HUGE_LITERALS = r"""
 import json, sys, warnings
 import numpy as np, polars as pl
@@ -605,25 +606,20 @@ df = pl.DataFrame({"x": [1.0, 2.0, None, 1e19, -1e19, float("nan")],
                    "f": pl.Series([1.0, 2.0, None, 1e19, -1e19, float("nan")], dtype=pl.Float32),
                    "i": [1, 2, None, 4, 5, 6]})
 x, f = pl.col("x"), pl.col("f")
-declined = {
+cases = {
     "gt": x > 1e19, "eq": x == 1e19, "lt_neg": x < -1e19, "f32_gt": f > 1e19,
     "f32_lit": f > pl.lit(1e30, pl.Float32), "mul": x * 1e30, "add": x + 1e100, "sub": x - 1e100,
     "int_mul": pl.col("i") * 1e19, "fill_null": x.fill_null(1e19),
     "when_then": pl.when(x > 1.5).then(1e19).otherwise(x), "is_in": x.is_in([1.0, 1.7e308]),
     "recip_63": x / 2.0 ** -63, "recip_1022": x / 2.0 ** -1022, "f32_recip": f / 2.0 ** -70,
+    "below": x * 9.2e18, "min_i64": x * -(2.0 ** 63), "inf": x * float("inf"),
 }
-taken = {"below": x * 9.2e18, "min_i64": x * -(2.0 ** 63), "inf": x * float("inf")}
 out = {}
-for name, e in declined.items():
-    lf = df.lazy().select(e.alias("o"))
-    eng = am.MetalEngine(min_rows=0, shapes="all")
-    assert_frame_equal(lf.collect(engine=eng), lf.collect())
-    out[name] = [not eng.last_report.taken, list(eng.last_report.fallbacks)]
-for name, e in taken.items():
+for name, e in cases.items():
     lf = df.lazy().select(e.alias("o"))
     eng = am.MetalEngine(min_rows=0, shapes="all", raise_on_fail=True)
     assert_frame_equal(lf.collect(engine=eng), lf.collect())
-    out[name] = [bool(eng.last_report.taken), []]
+    out[name] = [bool(eng.last_report.taken), list(eng.last_report.fallbacks)]
 # The shape the default engine takes: a large sort, here with a filter against such a literal.
 n = 1_000_000
 rng = np.random.default_rng(3)
@@ -631,22 +627,20 @@ big = pl.DataFrame({"q": rng.integers(0, 10**9, n), "x": rng.standard_normal(n) 
 lf = big.lazy().filter(pl.col("x") < 1e19).sort("q")
 eng = am.MetalEngine()
 assert_frame_equal(lf.collect(engine=eng).sort("q", "x"), lf.collect().sort("q", "x"))
-out["default_sort"] = [True, list(eng.last_report.fallbacks)]
+out["default_sort"] = [bool(eng.last_report.taken), list(eng.last_report.fallbacks)]
 print(json.dumps(out))
 """
 
 
-def test_a_float_literal_of_magnitude_2_63_or_more_falls_back_instead_of_trapping():
+def test_a_float_literal_of_magnitude_2_63_or_more_runs_on_metal():
     env = dict(os.environ, PYTHONPATH=os.path.join(REPO, "python"))
     r = subprocess.run([sys.executable, "-c", _HUGE_LITERALS], env=env, cwd=REPO,
                        capture_output=True, text=True, timeout=600)
     assert r.returncode == 0, (r.returncode, r.stderr[-2000:])
     out = json.loads(r.stdout.strip().splitlines()[-1])
-    for name, (ok, fallbacks) in out.items():
-        assert ok, (name, fallbacks)
-        if name not in ("below", "min_i64", "inf", "default_sort"):
-            assert any("2**63" in fb for fb in fallbacks), (name, fallbacks)
-    assert any("2**63" in fb for fb in out["default_sort"][1]), out["default_sort"]
+    for name, (taken, fallbacks) in out.items():
+        assert taken, (name, fallbacks)
+        assert not any("2**63" in fb for fb in fallbacks), (name, fallbacks)
 
 
 def test_multiply_by_minus_one_is_a_negation_like_polars():
@@ -1083,7 +1077,6 @@ FALLBACKS = {
     "rank": (lambda lf: lf.select(pl.col("a").rank()), "rank"),
     "tail": (lambda lf: lf.filter(pl.col("a") > 0).tail(3), "negative offset"),
     "sort_by_expr": (lambda lf: lf.sort(pl.col("a") * 2), "sort by an expression"),
-    "string_sort_key": (lambda lf: lf.sort(["k", "s"]), "sort by a String column"),
     "stable_top_k": (lambda lf: lf.sort("a", maintain_order=True).head(3), "maintain_order"),
     "literals_only": (lambda lf: lf.select(pl.lit(1).alias("one")), "literals only"),
     "mixed_select": (lambda lf: lf.select(pl.col("a"), pl.col("a").sum().alias("t")), "mixing"),
@@ -1237,7 +1230,7 @@ def test_engine_overhead_over_the_resident_plan():
 
 
 # =============================================================================================
-# a core finding the engine works around
+# core findings of this suite, fixed in ArrowMetal (the engine once worked around each)
 # =============================================================================================
 
 
@@ -1249,30 +1242,22 @@ def _string_with_bytes_under_a_null():
                                             null_count=1)
 
 
-@pytest.mark.xfail(strict=True, reason="ArrowMetal's string filter reads the bytes under a null "
-                                       "slot into the next value; the engine clears them first")
 def test_core_string_filter_null_slot():
     """Polars exports a null string slot with the bytes it held (valid Arrow). ArrowMetal's
-    string compaction then returns 'xanana' for 'banana'. Strict xfail: when the kernel is fixed
-    this starts passing and the workaround in `polars_engine._empty_null_slots` can go."""
+    string compaction once copied them over the next value ('xanana' for 'banana')."""
     a = _string_with_bytes_under_a_null()
     got = am.MetalArray.from_arrow(a).filter(am.MetalArray.from_arrow(pa.array([True, False, True])))
     assert got.to_arrow().to_pylist() == [None, "banana"]
 
 
-def test_engine_clears_bytes_under_null_strings():
-    a = _string_with_bytes_under_a_null()
-    fixed = pe._empty_null_slots(a)
-    assert fixed.to_pylist() == a.to_pylist()
-    assert np.frombuffer(fixed.buffers()[1], dtype=np.int64).tolist() == [0, 0, 6, 12]
+def test_engine_carries_bytes_under_null_strings():
+    """A Polars String column whose null slots keep their bytes goes to ArrowMetal as exported."""
     s = pl.Series(np.random.default_rng(0).choice(["apple", "banana", "cherry", "x"], 5000))
     df = pl.DataFrame({"s": s.replace("x", None), "v": np.arange(5000)})
     check(df.lazy().filter(pl.col("v") > 10).select("s", "v"), kinds=["Filter"], order=True)
     check(df.lazy().filter(pl.col("v") > 10).sort("v", descending=True), kinds=["Sort"], order=True)
 
 
-@pytest.mark.xfail(strict=True, reason="a Boolean column through the plan's sort keeps its bitmap "
-                                       "but reports null_count 0; the engine recounts")
 def test_core_bool_sort_null_count():
     from arrowmetal import lazy
     g = pa.array([None if i % 3 == 0 else i % 2 == 0 for i in range(33)], pa.bool_())
@@ -1282,8 +1267,6 @@ def test_core_bool_sort_null_count():
     assert out.null_count == g.null_count
 
 
-@pytest.mark.xfail(strict=True, reason="a filter over a scan that carries a date32 column is "
-                                       "rejected; the engine sends temporal columns as integers")
 def test_core_filter_carrying_a_date():
     from arrowmetal import lazy
     t = pa.array(range(10), pa.date32())
@@ -1294,11 +1277,9 @@ def test_core_filter_carrying_a_date():
     assert out.num_rows == 4
 
 
-@pytest.mark.xfail(strict=True, reason="ArrowMetal's String sort returns wrong rows for a column "
-                                       "with a null and a value of 8+ bytes; the engine never "
-                                       "sorts by a String column")
 def test_core_string_sort_with_nulls():
-    """Run in a child process: one run of this ended in a bus error rather than a wrong answer."""
+    """Run in a child process: before the fix, one run of this ended in a bus error rather than a
+    wrong answer."""
     code = ("import pyarrow as pa, arrowmetal as am\n"
             "t = pa.table({'s': pa.array(['b', 'a', None, 'c', 'ab', 'xxxxxxxx'], pa.large_string())})\n"
             "got = am.scan(t).sort('s').collect().column('s').to_pylist()\n"
@@ -1308,14 +1289,24 @@ def test_core_string_sort_with_nulls():
     assert r.returncode == 0, r.stderr[-500:]
 
 
-def test_engine_recounts_nulls_and_carries_temporals_as_integers():
-    from arrowmetal import lazy
-    g = pa.array([None if i % 3 == 0 else i % 2 == 0 for i in range(33)], pa.bool_())
-    a = pa.array(np.arange(33)[::-1].astype(np.int32))
-    plan = {"op": "sort", "input": {"op": "scan", "source": "t"}, "by": [["a", False]]}
-    out = lazy.LazyFrame(plan, {"t": lazy._Source(["a", "g"], [a, g])}).collect().column("g")
-    assert pe._recount_nulls(out).null_count == g.null_count
-    d = pa.array([1, None, 3], pa.date32())
-    assert pe._storage(d).type == pa.int32()
-    assert pe._storage(d).buffers()[1].address == d.buffers()[1].address
-    assert pe._storage(pa.array([1, None], pa.timestamp("us", "UTC"))).type == pa.int64()
+@pytest.mark.parametrize("n", [33, 4097])
+def test_engine_takes_the_plans_it_once_worked_around(n):
+    """Each fixed finding above, now taken by the engine and equal to Polars: a sort by a String
+    column holding nulls and rows of 8+ bytes, a Boolean column with nulls carried through a sort
+    (its null count included), and a filter that carries temporal columns."""
+    rng = np.random.default_rng(n)
+    words = np.array(["b", "a", "c", "ab", "xxxxxxxx", "abcdefghij", "banana", "cherry"])
+    df = pl.DataFrame({
+        "s": pl.Series(rng.choice(words, n)).set(pl.Series(rng.random(n) < 0.2), None),
+        "g": pl.Series([None if i % 3 == 0 else i % 2 == 0 for i in range(n)], dtype=pl.Boolean),
+        "d": pl.Series(rng.integers(0, 20000, n), dtype=pl.Int32).cast(pl.Date),
+        "t": pl.Series(rng.integers(0, 10**12, n)).cast(pl.Datetime("us")),
+        "v": np.arange(n)[::-1].copy()})
+    for desc in (False, True):
+        for nl in (False, True):
+            check(df.lazy().sort(["s", "v"], descending=desc, nulls_last=nl), kinds=["Sort"],
+                  order=True)
+    eng = check(df.lazy().sort("v"), kinds=["Sort"], order=True)
+    got = df.lazy().sort("v").collect(engine=eng)["g"]
+    assert got.null_count() == df["g"].null_count() > 0
+    check(df.lazy().filter(pl.col("v") > n // 3), kinds=["Filter"], order=True)
