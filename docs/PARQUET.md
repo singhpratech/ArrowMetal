@@ -499,12 +499,18 @@ int64, float64, string, bool and timestamp columns, uncompressed and Snappy; `Pa
   with no `ARROW:schema`, with one that is not base64 and with one that is a truncated message.
   `ParquetArrowSchemaTests` and the `ARROW:schema` half of `test_parquet_nested.py` check types, values,
   field metadata and schema metadata against pyarrow.
+- It also writes the page-index fixtures (pyarrow with `write_page_index=True` in three page layouts and
+  once without, and Polars) and the bloom-filter fixtures (pyarrow with `bloom_filter_options`, and DuckDB),
+  which `ParquetPageIndexTests`, `ParquetBloomFilterTests` and the second half of `test_parquet_nested.py`
+  read; that file also damages the page indexes 180 ways and reads them with filters, requiring every read
+  to raise or return, and reads 40,000 rows of repeated columns three times over.
 
 ```
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter "ParquetTests|ParquetWriterTests|ParquetNestedTests|ParquetArrowSchemaTests"
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test -c release --filter "ParquetTests|ParquetWriterTests|ParquetNestedTests|ParquetArrowSchemaTests"
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter "Parquet"
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test -c release --filter "Parquet"
 swift build -c release --product ArrowMetalC
-PYTHONPATH=python python -m pytest python/tests/test_parquet.py python/tests/test_parquet_nested.py -q
+PYTHONPATH=python python -m pytest python/tests/test_parquet.py python/tests/test_parquet_nested.py python/tests/test_parquet_robustness.py -q
+python Tests/Fixtures/generate_parquet_nested.py      # regenerate the nested, schema, page-index and bloom fixtures
 ARROWMETAL_PARQUET_BIG=1 PYTHONPATH=python python -m pytest python/tests/test_parquet.py -q -k fifty
 ```
 
