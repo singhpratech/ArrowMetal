@@ -194,6 +194,17 @@ public enum Router {
                pending: a.pending || b.pending, batching: a.context.isBatching, typeName: typeName(T.self))
     }
 
+    /// Decisions for arithmetic. The table's row was measured on `add`; `subtract` costs the same per
+    /// element, while a 64-bit integer multiply is slower on the CPU than an add, so `multiply` has no
+    /// measured crossover and `auto` keeps it on the GPU.
+    static func decideArithmetic<T: ArrowPrimitive>(_ a: MetalArray<T>, _ b: MetalArray<T>?, _ op: ArithmeticOp) -> RouteDecision {
+        let isMeasured = measured(T.self) && op != .mul
+        return decide(.arithmetic, rows: a.pending ? a.capacityLength : a.knownLength,
+                      cpuPath: RouterCPU.arithmeticUnavailable(T.self, op), measured: isMeasured,
+                      pending: a.pending || (b?.pending ?? false), batching: a.context.isBatching,
+                      typeName: op == .mul && measured(T.self) ? "multiply" : typeName(T.self))
+    }
+
     /// Decision for `filter(mask)`.
     static func decide<T: ArrowPrimitive>(_ op: RoutedOp, _ a: MetalArray<T>, mask: MetalBooleanArray) -> RouteDecision {
         decide(op, rows: a.pending ? a.capacityLength : a.knownLength, cpuPath: nil, measured: measured(T.self),

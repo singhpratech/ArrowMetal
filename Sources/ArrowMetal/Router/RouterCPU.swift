@@ -10,6 +10,9 @@ import Foundation
 /// the threadgroup tree, then the host combine of the partials), with the software `d_add`'s NaN rule,
 /// so they are bit-identical rather than merely close. `CPUReference` stays the tests' oracle.
 enum RouterCPU {
+    // The entry points carry `@_specialize` for every primitive: callers reach them from generic
+    // `MetalArray<T>` methods (and the C ABI through an existential), where the optimiser has no
+    // concrete type, and an unspecialised loop runs an order of magnitude slower than the typed one.
 
     // MARK: bitmap words
 
@@ -40,13 +43,18 @@ enum RouterCPU {
             return acc
         }
         var i = 0
-        while i < n {
-            let w = word64(bm, i, n)
-            let lim = Swift.min(64, n - i)
-            if w != 0 {
-                for j in 0..<lim { acc = f(acc, (w >> UInt64(j)) & 1 != 0 ? p[i + j] : identity) }
+        while i + 64 <= n {
+            let w = UnsafeRawPointer(bm).loadUnaligned(fromByteOffset: i >> 3, as: UInt64.self)
+            if w == ~0 {
+                for j in 0..<64 { acc = f(acc, p[i + j]) }
+            } else if w != 0 {
+                for j in 0..<64 { acc = f(acc, (w >> UInt64(j)) & 1 != 0 ? p[i + j] : identity) }
             }
             i += 64
+        }
+        if i < n {
+            let w = word64(bm, i, n)
+            for j in 0..<(n - i) { acc = f(acc, (w >> UInt64(j)) & 1 != 0 ? p[i + j] : identity) }
         }
         return acc
     }
@@ -126,6 +134,16 @@ enum RouterCPU {
         return total
     }
 
+    @_specialize(where T == Int8)
+    @_specialize(where T == UInt8)
+    @_specialize(where T == Int16)
+    @_specialize(where T == UInt16)
+    @_specialize(where T == Int32)
+    @_specialize(where T == UInt32)
+    @_specialize(where T == Int64)
+    @_specialize(where T == UInt64)
+    @_specialize(where T == Float)
+    @_specialize(where T == Double)
     static func sum<T: ArrowPrimitive>(_ a: MetalArray<T>) -> SumResult? {
         if a.validCount == 0 { return nil }
         let n = a.knownLength
@@ -152,6 +170,16 @@ enum RouterCPU {
     /// Min (`isMin`) or max of the valid values. Integers compare directly; Float64 compares the GPU's
     /// order-preserving keys (NaN skipped, -0 and +0 one key), so a column of NaNs gives nil as it does
     /// there. Float32 has no CPU path (see `minMaxUnavailable`).
+    @_specialize(where T == Int8)
+    @_specialize(where T == UInt8)
+    @_specialize(where T == Int16)
+    @_specialize(where T == UInt16)
+    @_specialize(where T == Int32)
+    @_specialize(where T == UInt32)
+    @_specialize(where T == Int64)
+    @_specialize(where T == UInt64)
+    @_specialize(where T == Float)
+    @_specialize(where T == Double)
     static func minMax<T: ArrowPrimitive>(_ a: MetalArray<T>, isMin: Bool) -> T? {
         if a.validCount == 0 { return nil }
         let n = a.knownLength
@@ -220,6 +248,16 @@ enum RouterCPU {
     /// `compare(op, scalar)`: every slot is compared (the GPU does not look at validity either) and the
     /// input's validity is shared, as on the GPU. IEEE semantics for floats: NaN compares false except
     /// `ne`, -0 == +0, subnormals exact — what the GPU's key-based float kernels compute.
+    @_specialize(where T == Int8)
+    @_specialize(where T == UInt8)
+    @_specialize(where T == Int16)
+    @_specialize(where T == UInt16)
+    @_specialize(where T == Int32)
+    @_specialize(where T == UInt32)
+    @_specialize(where T == Int64)
+    @_specialize(where T == UInt64)
+    @_specialize(where T == Float)
+    @_specialize(where T == Double)
     static func compare<T: ArrowPrimitive>(_ a: MetalArray<T>, _ op: CompareOp, _ scalar: T) throws -> MetalBooleanArray {
         let n = a.knownLength
         let out = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: n), zeroed: false, context: a.context)
@@ -231,6 +269,16 @@ enum RouterCPU {
         return MetalBooleanArray(length: n, nullCount: a._nullCount, validity: a.validity, values: out, context: a.context)
     }
 
+    @_specialize(where T == Int8)
+    @_specialize(where T == UInt8)
+    @_specialize(where T == Int16)
+    @_specialize(where T == UInt16)
+    @_specialize(where T == Int32)
+    @_specialize(where T == UInt32)
+    @_specialize(where T == Int64)
+    @_specialize(where T == UInt64)
+    @_specialize(where T == Float)
+    @_specialize(where T == Double)
     static func compare<T: ArrowPrimitive>(_ a: MetalArray<T>, _ op: CompareOp, _ b: MetalArray<T>) throws -> MetalBooleanArray {
         let n = a.knownLength
         let out = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: n), zeroed: false, context: a.context)
@@ -289,6 +337,16 @@ enum RouterCPU {
         }
     }
 
+    @_specialize(where T == Int8)
+    @_specialize(where T == UInt8)
+    @_specialize(where T == Int16)
+    @_specialize(where T == UInt16)
+    @_specialize(where T == Int32)
+    @_specialize(where T == UInt32)
+    @_specialize(where T == Int64)
+    @_specialize(where T == UInt64)
+    @_specialize(where T == Float)
+    @_specialize(where T == Double)
     static func arithmetic<T: ArrowPrimitive>(_ a: MetalArray<T>, _ op: ArithmeticOp, _ scalar: T) throws -> MetalArray<T> {
         let n = a.knownLength
         let out = try MetalArrowBuffer.allocate(byteCount: n * T.byteWidth, zeroed: false, context: a.context)
@@ -305,6 +363,16 @@ enum RouterCPU {
         return MetalArray<T>(length: n, nullCount: a._nullCount, validity: a.validity, values: out, context: a.context)
     }
 
+    @_specialize(where T == Int8)
+    @_specialize(where T == UInt8)
+    @_specialize(where T == Int16)
+    @_specialize(where T == UInt16)
+    @_specialize(where T == Int32)
+    @_specialize(where T == UInt32)
+    @_specialize(where T == Int64)
+    @_specialize(where T == UInt64)
+    @_specialize(where T == Float)
+    @_specialize(where T == Double)
     static func arithmetic<T: ArrowPrimitive>(_ a: MetalArray<T>, _ op: ArithmeticOp, _ b: MetalArray<T>) throws -> MetalArray<T> {
         let n = a.knownLength
         let out = try MetalArrowBuffer.allocate(byteCount: n * T.byteWidth, zeroed: false, context: a.context)
@@ -341,6 +409,7 @@ enum RouterCPU {
     /// Stream compaction by 64-bit selection words (`sel(i)` for word start `i`, bits past `n` clear):
     /// the selected values in order, and when the input has validity (and anything was selected) an
     /// output bitmap carrying the selected rows' validity — the GPU `compact`'s exact result.
+    @inline(__always)
     static func compact<T: ArrowPrimitive>(_ a: MetalArray<T>, _ sel: (Int) -> UInt64) throws -> MetalArray<T> {
         let n = a.knownLength
         let wordCount = (n + 63) >> 6
@@ -386,6 +455,16 @@ enum RouterCPU {
     }
 
     /// `filter(mask)`: selected where the mask is true and valid (null selection behaviour "drop").
+    @_specialize(where T == Int8)
+    @_specialize(where T == UInt8)
+    @_specialize(where T == Int16)
+    @_specialize(where T == UInt16)
+    @_specialize(where T == Int32)
+    @_specialize(where T == UInt32)
+    @_specialize(where T == Int64)
+    @_specialize(where T == UInt64)
+    @_specialize(where T == Float)
+    @_specialize(where T == Double)
     static func filter<T: ArrowPrimitive>(_ a: MetalArray<T>, _ mask: MetalBooleanArray) throws -> MetalArray<T> {
         let n = a.knownLength
         let mv = mask.values, mvld = mask.validity
@@ -405,27 +484,31 @@ enum RouterCPU {
 
     /// Fused `filter(where: op, scalar)` for integer columns: the predicate and the validity build each
     /// selection word, then the same compaction.
+    @_specialize(where T == Int8)
+    @_specialize(where T == UInt8)
+    @_specialize(where T == Int16)
+    @_specialize(where T == UInt16)
+    @_specialize(where T == Int32)
+    @_specialize(where T == UInt32)
+    @_specialize(where T == Int64)
+    @_specialize(where T == UInt64)
     static func filterWhere<T: ArrowPrimitive>(_ a: MetalArray<T>, _ op: CompareOp, _ scalar: T) throws -> MetalArray<T> {
         let n = a.knownLength
         let vals = a.values, vld = a.validity
+        // The predicate is packed first (the compare loop), then ANDed with the validity per word.
+        let words = (n + 63) >> 6
+        let pred = UnsafeMutablePointer<UInt64>.allocate(capacity: Swift.max(words, 1))
+        defer { pred.deallocate() }
+        if words > 0 { pred[words - 1] = 0 }
         return try withExtendedLifetime((vals, vld)) {
             let p = vals.typed(T.self)
-            let bm = vld?.typed(UInt8.self)
-            @inline(__always) func word(_ i: Int, _ pred: (T) -> Bool) -> UInt64 {
-                let lim = Swift.min(64, n - i)
-                var x: UInt64 = 0
-                for j in 0..<lim { x |= (pred(p[i + j]) ? 1 : 0) << UInt64(j) }
-                if let bm { x &= word64(bm, i, n) }
-                return x
+            comparePacked(n, UnsafeMutableRawPointer(pred).assumingMemoryBound(to: UInt32.self), op, { p[$0] }, { _ in scalar })
+            let packed = UnsafeRawPointer(pred).assumingMemoryBound(to: UInt8.self)
+            if let vld {
+                let bm = vld.typed(UInt8.self)
+                return try compact(a) { word64(packed, $0, n) & word64(bm, $0, n) }
             }
-            switch op {
-            case .eq: return try compact(a) { word($0) { $0 == scalar } }
-            case .ne: return try compact(a) { word($0) { $0 != scalar } }
-            case .lt: return try compact(a) { word($0) { $0 < scalar } }
-            case .le: return try compact(a) { word($0) { $0 <= scalar } }
-            case .gt: return try compact(a) { word($0) { $0 > scalar } }
-            case .ge: return try compact(a) { word($0) { $0 >= scalar } }
-            }
+            return try compact(a) { word64(packed, $0, n) }
         }
     }
 
@@ -438,6 +521,30 @@ enum RouterCPU {
     /// `GroupBy.sum` over integer values: one pass, a `keyCount`-slot table of wrapping 64-bit sums and
     /// counts. Null keys, keys outside `0 ..< keyCount` and null values are skipped; a key that counted
     /// nothing is null with a 0 in its slot — the GPU accumulate + finalize result.
+    @_specialize(where K == Int32, T == Int8)
+    @_specialize(where K == Int32, T == UInt8)
+    @_specialize(where K == Int32, T == Int16)
+    @_specialize(where K == Int32, T == UInt16)
+    @_specialize(where K == Int32, T == Int32)
+    @_specialize(where K == Int32, T == UInt32)
+    @_specialize(where K == Int32, T == Int64)
+    @_specialize(where K == Int32, T == UInt64)
+    @_specialize(where K == Int64, T == Int8)
+    @_specialize(where K == Int64, T == UInt8)
+    @_specialize(where K == Int64, T == Int16)
+    @_specialize(where K == Int64, T == UInt16)
+    @_specialize(where K == Int64, T == Int32)
+    @_specialize(where K == Int64, T == UInt32)
+    @_specialize(where K == Int64, T == Int64)
+    @_specialize(where K == Int64, T == UInt64)
+    @_specialize(where K == UInt32, T == Int8)
+    @_specialize(where K == UInt32, T == UInt8)
+    @_specialize(where K == UInt32, T == Int16)
+    @_specialize(where K == UInt32, T == UInt16)
+    @_specialize(where K == UInt32, T == Int32)
+    @_specialize(where K == UInt32, T == UInt32)
+    @_specialize(where K == UInt32, T == Int64)
+    @_specialize(where K == UInt32, T == UInt64)
     static func groupBySum<K: ArrowIndex, T: ArrowPrimitive>(keys: MetalArray<K>, keyCount: Int,
                                                              values: MetalArray<T>) throws -> MetalArray<Int64> where T: FixedWidthInteger {
         let n = keys.knownLength

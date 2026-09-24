@@ -22,6 +22,17 @@ Core
   and completion-handler), with `MetalArray.sumAsync`/`meanAsync` for scalars, so the calling thread is
   free while the GPU works.
 - Arrow C Data Interface and C Device Data Interface (ARROW_DEVICE_METAL) import and export.
+- CPU/GPU router: `sum`, `min`, `max`, `compare`, `add`/`subtract`/`multiply`, `filter` (by mask and
+  fused `filter(where:)`) and the group-by sum over at most 1,024 keys run a single-threaded CPU loop
+  below the measured crossover and the GPU kernel at or above it, with byte-identical Arrow output on
+  both paths (float sums reproduce the GPU's summation order bit for bit). The crossover table is
+  generated from `Benchmarks/results/router_2026-09-17.json` by `Benchmarks/router_table.py`; a batch
+  always keeps the GPU, and so does `auto` for float columns and `multiply`, which have no measured
+  crossover yet. `Benchmarks/router_check.py` times each routed operation under gpu, cpu and auto. `ARROWMETAL_ROUTER=auto|gpu|cpu`, `Router.mode` / `Router.withMode` in Swift,
+  `am_router_*` in C, and `am.set_router`, `with am.router(...)`, `am.last_route()` in Python
+  (docs/DESIGN.md, "CPU/GPU router").
+- The Swift and Python test harnesses pin the router to the GPU unless `ARROWMETAL_ROUTER` is set, so
+  the suites keep exercising the kernels and `ARROWMETAL_ROUTER=cpu` runs them over the CPU loops.
 
 Strings and sorting
 - `MetalStringArray` (utf8): byte/char length, equals/starts_with/ends_with/contains, MurmurHash3, GPU filter/take,

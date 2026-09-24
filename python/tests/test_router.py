@@ -143,6 +143,8 @@ def test_last_route_and_reasons():
         assert d.reason == f"below the {am.router_crossovers()['sum']}-row crossover"
         am.array(pa.array([1.0, 2.0])).max()
         assert am.last_route().reason == "no measured crossover for float64"
+        small.arith("*", 2)
+        assert am.last_route().reason == "no measured crossover for multiply"
         am.array(pa.array([1.0, 2.0], type=pa.float32())).min()
         assert am.last_route().path == "gpu" and am.last_route().reason.startswith("no alternative")
         with am.batch():

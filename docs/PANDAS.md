@@ -92,7 +92,12 @@ A call is routed to the GPU only when **all four** hold:
    `Float64`, `boolean`, `string`), including pandas 3's default `str` dtype;
 2. **size** — the frame is at least `threshold` rows, 2,000,000 by default
    (`install(threshold=...)`, `set_threshold(...)`, or `ARROWMETAL_PANDAS_ACCEL_THRESHOLD`).
-   Below that the launch latency costs more than the kernel saves;
+   Below that the launch latency costs more than the kernel saves. The measured row counts behind that
+   judgement, per operation, are in [CROSSOVER.md](CROSSOVER.md): where the GPU path overtakes the
+   fastest CPU library, and where it overtakes the engine's own CPU loop. This threshold is the pandas
+   caller's veto on top of the engine (it counts the one-time page mapping of a pandas-owned column,
+   which a column already resident in Metal does not pay); a call that passes it still goes through the engine's CPU/GPU router
+   ([DESIGN.md](DESIGN.md#cpugpu-router)), which gives byte-identical output on either path;
 3. **arguments** — the call uses arguments the kernels implement exactly (the "not routed" column
    below);
 4. **the operation is worth it** — see the next section. Five reductions, `abs` and the scalar

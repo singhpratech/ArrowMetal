@@ -319,6 +319,12 @@ final class RouterTests: XCTestCase {
         _ = try Router.withMode(.auto) { try f.sum() }
         XCTAssertEqual(Router.lastDecision?.path, .gpu)
         XCTAssertEqual(Router.lastDecision?.reason, .notMeasuredForType("float64"))
+        // The arithmetic row was measured on add: subtract follows it, multiply has no measured crossover.
+        _ = try small.subtract(1)
+        XCTAssertEqual(Router.lastDecision?.path, .cpu)
+        _ = try small.multiply(2)
+        XCTAssertEqual(Router.lastDecision?.path, .gpu)
+        XCTAssertEqual(Router.lastDecision?.reason, .notMeasuredForType("multiply"))
     }
 
     func testAutoAtScaleRunsTheGPU() throws {

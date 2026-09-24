@@ -125,6 +125,11 @@ The long form is at the bottom of this file.
 | **Partial** | Available with a stated limitation; the note says exactly what is missing. |
 | **Planned** | Not implemented; a [ROADMAP](ROADMAP.md) item covers it (linked in the note). |
 
+A note that starts with *Routed* marks a row whose operation also has a single-threaded CPU loop with
+byte-identical Arrow output, which the CPU/GPU router runs below the measured crossover
+([DESIGN.md](DESIGN.md#cpugpu-router)). The status still names the GPU kernel: it runs at and above the
+crossover, inside a batch, for the types the loop does not cover, and always under `ARROWMETAL_ROUTER=gpu`.
+
 Counts in the summary are counts of **rows**. A row covers one Arrow function unless it names several
 (for example the eighteen `ascii_is_*` / `utf8_is_*` predicates share four rows). For counts of *names*, use
 [ARROW_FUNCTIONS.md](ARROW_FUNCTIONS.md), which has exactly one row per Arrow function name.
@@ -133,11 +138,11 @@ Counts in the summary are counts of **rows**. A row covers one Arrow function un
 
 | Arrow function | Status | Notes |
 |---|---|---|
-| `sum` | **GPU** | `Kernels/Reductions.swift`. Threadgroup partials, host finalise, no atomics. Integers accumulate in Int64/UInt64 and wrap; Float32 accumulates per thread in `float` and finalises in `double`, so the last ulp can differ from a strictly sequential double sum; Float64 uses a software IEEE-754 binary64 adder on the GPU (`Kernels/DoubleMath.swift`). Returns nil when there is no valid value, matching Arrow. |
+| `sum` | **GPU** | *Routed* (all ten primitives). `Kernels/Reductions.swift`. Threadgroup partials, host finalise, no atomics. Integers accumulate in Int64/UInt64 and wrap; Float32 accumulates per thread in `float` and finalises in `double`, so the last ulp can differ from a strictly sequential double sum; Float64 uses a software IEEE-754 binary64 adder on the GPU (`Kernels/DoubleMath.swift`). Returns nil when there is no valid value, matching Arrow. |
 | `product` | **GPU** | `Kernels/Aggregates.swift`, the same threadgroup-partial shape as `sum`. Integers accumulate in Int64/UInt64 and wrap, as Arrow's does; Float32 accumulates in `float` per thread and combines in `double`, so thousands of factors reassociate (about 1e-5 relative); Float64 multiplies through the software binary64 routine on the GPU. Nil when there is no valid value. `product()` in Swift, `am_reduce_ex` op 0 in C, `product()` in Python. |
-| `mean` | **GPU** | GPU sum divided by the valid count on the host (`Reductions.swift`). |
-| `min` | **GPU** | NaN is skipped; all-NaN returns null, matching Arrow's `min_max`. Float64 reduces on order-preserving 64-bit keys. |
-| `max` | **GPU** | Same as `min`. |
+| `mean` | **GPU** | *Routed* (all ten primitives). GPU sum divided by the valid count on the host (`Reductions.swift`). |
+| `min` | **GPU** | *Routed* (integers and float64; float32 stays on the GPU). NaN is skipped; all-NaN returns null, matching Arrow's `min_max`. Float64 reduces on order-preserving 64-bit keys. |
+| `max` | **GPU** | *Routed* (integers and float64; float32 stays on the GPU). Same as `min`. |
 | `min_max` | **GPU** | `Kernels/Aggregates.swift`: one kernel produces both partials from a single read of the values, and the host combines them. NaN is skipped, as in `min`/`max`. `minMax()` in Swift, `am_reduce_ex` ops 14 and 15 in C, `min_max()` in Python. |
 | `count` (valid values) | **CPU** | `validCount` = `length - nullCount`; the null count comes from a host popcount over the validity bitmap (`MetalArray.swift`, `Bitmap.popcount`). O(1) once the count is known. |
 | `count_all` (rows) | **CPU** | `length`, O(1) metadata. Inside an open batch, reading it forces a sync point. `AnyMetalArray.countAll` in Swift, `am_count_all` in C, `count_all()` in Python. |
@@ -174,7 +179,7 @@ exactly what the atomic path could not: Float64 sums and means (through the soft
 
 | Arrow function | Status | Notes |
 |---|---|---|
-| `hash_sum` | **GPU** | All value types, and now **any key type**: `GroupByKeys` (`Kernels/GroupByKeys.swift`) maps arbitrary keys to dense ids first. Integers go through the atomic `sum`; Float32 through `sumFloat` (Float32 accumulation, host finalise) or `sumFloatAsDouble` (Float64 accumulation, GPU); Float64 through `sumDouble`, which adds with the software binary64 adder on the GPU. `am_group_agg_ex` op 0 in C, `group_by([...]).sum()` in Python. |
+| `hash_sum` | **GPU** | *Routed* for integer values when there are 1,024 groups or fewer. All value types, and now **any key type**: `GroupByKeys` (`Kernels/GroupByKeys.swift`) maps arbitrary keys to dense ids first. Integers go through the atomic `sum`; Float32 through `sumFloat` (Float32 accumulation, host finalise) or `sumFloatAsDouble` (Float64 accumulation, GPU); Float64 through `sumDouble`, which adds with the software binary64 adder on the GPU. `am_group_agg_ex` op 0 in C, `group_by([...]).sum()` in Python. |
 | `hash_mean` | **GPU** | Any key type. Integer values through `mean` (GPU sum + GPU count, host division); Float32 and Float64 through `meanFloat` / `meanDouble`, which sum and divide entirely on the GPU. `am_group_agg_ex` op 3. |
 | `hash_min` | **GPU** | Any key type, all ten primitive value types. 32-bit and narrower use the atomic `min`; Int64, UInt64 and Float64 use `min64` on the segmented path, since MSL has no 64-bit atomic min/max. `min64` forwards narrower types to `min`, so it is safe to call for any type — as is the fused `minMax`, which covers every width in one kernel. `am_group_agg_ex` op 4. |
 | `hash_max` | **GPU** | As `hash_min` (`max` / `max64`). `am_group_agg_ex` op 5. |
@@ -199,9 +204,9 @@ and is reachable as `am_binary(op 5)` and `.modulo()` / `__mod__` in Python.
 
 | Arrow function | Status | Notes |
 |---|---|---|
-| `add` | **GPU** | Scalar and array forms, vectorised 4-wide (`Kernels/Arithmetic.swift`). Integer overflow wraps, like Arrow's unchecked `add`. Float64 runs a software IEEE-754 binary64 adder on the GPU, bit-exact against Swift's `Double`. |
-| `subtract` | **GPU** | As `add`. |
-| `multiply` | **GPU** | As `add`. |
+| `add` | **GPU** | *Routed* (integers and float64; float32 stays on the GPU). Scalar and array forms, vectorised 4-wide (`Kernels/Arithmetic.swift`). Integer overflow wraps, like Arrow's unchecked `add`. Float64 runs a software IEEE-754 binary64 adder on the GPU, bit-exact against Swift's `Double`. |
+| `subtract` | **GPU** | *Routed* (integers and float64; float32 stays on the GPU). As `add`. |
+| `multiply` | **GPU** | *Routed* (integers and float64; float32 stays on the GPU). As `add`. |
 | `divide` | **Partial** | GPU, but integer division by zero is **defined as 0** here (`KernelSource.swift`, matched by the CPU oracle in `ArrowPrimitive.swift`) rather than raising. Check this against Arrow's `divide` before relying on it. Float division follows IEEE. |
 | `add_checked` / `subtract_checked` / `multiply_checked` / `divide_checked` | **GPU** | `Kernels/Checked.swift` and `Kernels/CheckedSource.swift`, scalar and array forms over all ten primitives. Each checked op is the unchecked kernel *plus* one read-only check pass, both encoded into a single command buffer, so the values are bit-identical to the unchecked op and the cost is one GPU round trip. The check pass writes into an eight-word flag buffer only from a failing element (one `atomic_or` for the kind, one `atomic_min` for the row), and the wrapper raises `ArrowMetalError.overflow(op:index:detail:)` naming the Arrow message and the first offending row. Nulls are never checked, on either side. `divide_checked` raises "divide by zero" on every type and "overflow" for `INT_MIN / -1`. On float columns only `divide_checked` can raise: an overflow to infinity and a NaN are ordinary results, as in Arrow. Inside `MetalContext.batch` the check joins the open buffer and the error surfaces from `flush()`. `am_binary_checked` in C, `add_checked()` … in Python. |
 | `negate` / `negate_checked` | **GPU** | `negate()` is GPU over all ten primitives (`Kernels/Rounding.swift`); integers wrap, so `negate(int8 -128)` is `-128`, and unsigned negation is modular. Float64 flips the sign bit, exactly. `negate_checked()` (`Kernels/Checked.swift`) raises for `T.min` on a signed column and — going beyond Arrow, which has no unsigned kernel at all — for every non-zero value on an unsigned one. |
@@ -234,7 +239,7 @@ and is reachable as `am_binary(op 5)` and `.modulo()` / `__mod__` in Python.
 
 | Arrow function | Status | Notes |
 |---|---|---|
-| `equal` | **GPU** | `Kernels/Compare.swift`, scalar and array forms, output is a packed Arrow boolean bitmap written one 32-bit word per thread. Float64 compares on order-preserving bit patterns; IEEE semantics for NaN. |
+| `equal` | **GPU** | *Routed* (all ten primitives). `Kernels/Compare.swift`, scalar and array forms, output is a packed Arrow boolean bitmap written one 32-bit word per thread. Float64 compares on order-preserving bit patterns; IEEE semantics for NaN. |
 | `not_equal` | **GPU** | As `equal`. |
 | `less` | **GPU** | As `equal`. |
 | `less_equal` | **GPU** | As `equal`. |
@@ -347,8 +352,8 @@ zero-copy and a null row emits no bytes. All of them are reachable from Swift, f
 
 | Arrow function | Status | Notes |
 |---|---|---|
-| `filter` / `array_filter` | **GPU** | `Kernels/Filter.swift`: per-block popcount, GPU scan, scatter, validity pack — all in one command buffer. Null mask entries drop the element (Arrow's `null_selection_behavior = "drop"`); the `"emit_null"` option is not implemented. Works for primitives, booleans and `utf8`. |
-| `filter(where:)` (fused predicate + compaction) | **GPU** | ArrowMetal extension, not an Arrow function: the comparison is evaluated inside the counting pass so no boolean array is materialised. |
+| `filter` / `array_filter` | **GPU** | *Routed* (primitive columns). `Kernels/Filter.swift`: per-block popcount, GPU scan, scatter, validity pack — all in one command buffer. Null mask entries drop the element (Arrow's `null_selection_behavior = "drop"`); the `"emit_null"` option is not implemented. Works for primitives, booleans and `utf8`. |
+| `filter(where:)` (fused predicate + compaction) | **GPU** | *Routed* (integer columns; float64 runs a routed compare and a routed filter; float32 stays on the GPU). ArrowMetal extension, not an Arrow function: the comparison is evaluated inside the counting pass so no boolean array is materialised. |
 | `take` / `array_take` | **GPU** | Int32/Int64/UInt32 index arrays. A null index yields a null output element; out-of-range indices set a GPU error flag that is raised after the dispatch. Strings gather through offsets + a GPU byte copy. |
 | `drop_null` | **GPU** | `Kernels/Structural.swift`: `is_valid` followed by the existing `filter` compaction, so it is one command buffer with no host round trip. An array with no validity bitmap is returned unchanged. `dropNull()` in Swift (primitive and boolean), `am_drop_null` in C, `drop_null()` in Python. |
 | `inverse_permutation` | **GPU** | `inversePermutation(maxIndex:)` (`Kernels/Selection.swift`): one atomic scatter kernel writes, for the i-th index, the value i into slot `index`. The output has `max_index + 1` elements (the input's length when `max_index` is negative); a slot no index names comes back **null**, and when several positions name the same slot the **last** one wins — Arrow's rule, and deterministic here, because "last wins" is an `atomic_fetch_max` over the source positions and a maximum does not depend on thread order. Null indices are skipped; an index outside `[0, max_index]` raises through the usual GPU error flag. The result is always int32 — Arrow's `output_type` option is not implemented. `am_inverse_permutation` in C, `inverse_permutation()` in Python. |

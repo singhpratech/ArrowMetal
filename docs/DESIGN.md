@@ -358,6 +358,111 @@ blocks. Deferred errors are thrown from the `await` (or delivered as `.failure`)
 Not yet: async accessors for `min`/`max`/group-by, and cancellation (a committed command buffer runs to
 completion).
 
+## CPU/GPU router
+
+Every public call without a batch pays one command-buffer round trip (above), and on small inputs that
+floor is the whole cost. The router is the answer the engine gives to that: for seven operations it has
+a second implementation, a tight single-threaded CPU loop, and it runs that loop when the measured
+crossover says the CPU is faster for an input of this size. The output is the same Arrow array either
+way, byte for byte.
+
+**What is routed.** `sum`, `min`, `max` (and `mean`, which is `sum` over the valid count), `compare`
+(scalar and array), `add` / `subtract` / `multiply` (scalar and array), `filter` by a mask and the fused
+`filter(where:)`, and `GroupBy.sum` over integer values with at most `Router.groupBySumMaxKeys` (1,024)
+keys, which is also what `hash_sum` reaches through the dense-key mapping. Every other operation is
+unchanged and always runs its GPU kernel.
+
+**Where the decision is made.** Once, at the top of each routed operation's public entry point
+(`Kernels/Reductions.swift`, `Compare.swift`, `Arithmetic.swift`, `Filter.swift`, `GroupBy.swift`),
+before anything is encoded: `if Router.decide(.sum, self).isCPU { return RouterCPU.sum(self) }`. Not in
+`MetalContext.run`, which sees an encode closure and neither the operation nor the row count. The code is
+in `Sources/ArrowMetal/Router/`.
+
+**The decision**, in this order (`Router.decide`):
+
+1. *No CPU path, no choice.* If the operation has no CPU loop for this input the GPU runs it, as before
+   the router, and the decision records why ("no alternative: ..."). That is Float32 `min` / `max`,
+   Float32 arithmetic and the fused Float32 `filter(where:)` predicate, which compute in hardware `float`
+   on the GPU, where subnormals are flushed ([EVALUATION.md](EVALUATION.md), finding 1), so a CPU loop
+   would not give the same bits; `divide`, which is not routed; and a group-by sum over more than 1,024
+   keys.
+2. *Pending input.* An input whose length the open batch is still deciding stays on the GPU.
+3. *Mode `gpu`* runs the GPU.
+4. *Inside a batch, the GPU.* `MetalContext.batch` shares one command buffer's floor across every kernel
+   in it, and queued kernels may be producing this very input; a CPU read would have to commit and wait
+   for them, which is what batching exists to avoid. So any open batch keeps the routed operations on the
+   GPU, including under mode `cpu`.
+5. *Mode `cpu`* runs the CPU loop.
+6. *Mode `auto`* (the default) looks the operation up in the crossover table: below the crossover the CPU
+   loop runs, at or above it the GPU. The table was measured on int64 columns; integer columns of every
+   width use those rows, and floating-point columns, which have no measured crossover, stay on the GPU.
+   The arithmetic row was measured on `add`; `subtract` uses it, while `multiply`, whose 64-bit integer
+   form costs more per element on the CPU than an add, has no measured crossover and stays on the GPU
+   under `auto` (`ARROWMETAL_ROUTER=cpu` and the per-call override still reach its CPU loop).
+
+The router does not adjust for residency: every routed call starts from Metal-shared buffers (an
+imported column is mapped before the operation is called), which is the state the table was measured
+in. It keeps no state across calls beyond the modes and the last decision, and it never estimates at run
+time.
+
+**The table** is data generated from the measurement, not typed: `Benchmarks/router_table.py` reads
+`Benchmarks/results/router_2026-09-17.json` (the step crossover per operation, from
+[CROSSOVER.md](CROSSOVER.md)'s router table) and the `arrowmetal-bench crossover` CSV it names, and
+writes `Sources/ArrowMetal/Router/RouterTable.swift`, a Swift literal, so there is no resource bundle to
+load. The step alone would send every size between the last swept size where the CPU was ahead and the
+first where the GPU was ahead to the CPU, so the script fits the crossover once, offline: inside that
+bracket both paths are taken as straight lines between the two measured points and the crossover is
+where they meet. It never leaves the measured bracket. `router_table.py --check` fails when the
+committed table no longer matches the results file, and `python/tests/test_router.py` runs it. The
+values are in the generated file, in `Router.crossoverRows(_:)` from Swift, `am_router_crossover` from C
+and `am.router_crossovers()` from Python. `Benchmarks/router_check.py` times every routed operation
+under `gpu`, `cpu` and `auto` and says whether `auto` picked the faster path; its latest output is
+`Benchmarks/results/router_check_2026-09-23_provisional.csv`, a provisional run taken while other builds
+were using the machine, to be replaced by a quiet rerun.
+
+**The CPU side** (`Router/RouterCPU.swift`) is one generic loop per shape, over the Arrow layout:
+*reduce* (a branch-free fold where a null slot feeds the operation's identity), *map* (arithmetic, every
+slot including those under nulls, as the GPU computes them), *map-to-bitmap* (compare, 32 bits per
+word, bits past the length zero), *compact* (filter, by 64-bit selection words), and a *dictionary loop*
+for the group-by sum (a `keyCount`-slot table of wrapping 64-bit sums and counts). They are
+single-threaded: the all-core figure in CROSSOVER.md shows what a threaded loop would change and what
+it would cost in CPU time, and that is a separate decision. `CPUReference` stays the tests' oracle; its
+closure-per-element walk is one to two orders slower than these loops (CROSSOVER.md, `cpu-ref`).
+
+**Byte-identical output.** For every routed operation the CPU loop returns what the GPU kernel returns:
+the same values, the same validity buffer (the scalar forms share the input's bitmap exactly as the GPU
+does; the array forms AND the two bitmaps), the same null count and the same buffer sizes. Integer
+arithmetic wraps as the GPU does. Float64 arithmetic is the hardware add, subtract or multiply, which
+is correctly rounded like the software `d_add` / `d_sub` / `d_mul`, with the software kernels' NaN rule
+applied when the result is a NaN (the first NaN operand, quieted; otherwise the positive quiet NaN).
+Float64 `min` / `max` compare the GPU's order-preserving keys, so NaN is skipped and -0 and +0 are one
+key. Float sums reproduce the GPU's summation order exactly rather than adding in row order: thread `t`
+of the `groups x 256` grid adds its 4-element blocks `t, t + grid, ...` and then tail element `t`, each
+threadgroup folds its 256 accumulators as the kernel's tree does, and the host adds the group partials in
+order, as `finaliseSum` does. The sum is therefore the GPU's to the bit, NaN payloads included, with no
+Accelerate and no tolerance. `RouterTests` (Swift) and `test_router.py` (Python) hold both paths to
+this on every type, on sizes across the word and threadgroup boundaries, with 0%, 10% and 90% nulls, on
+slices at an offset, with signed zeros, infinities, quiet and signaling NaNs with payloads and
+subnormals, and on float sums past the point where every GPU thread takes more than one block.
+
+**Overrides and visibility.**
+
+| | Process | One call or one scope | Last decision |
+|---|---|---|---|
+| Environment | `ARROWMETAL_ROUTER=auto\|gpu\|cpu`, read at load | | |
+| Swift | `Router.mode` | `Router.withMode(.cpu) { try col.sum() }` (per thread) | `Router.lastDecision` (per thread) |
+| C | `am_router_set_mode`, `am_router_get_mode` | `am_router_set_thread_mode` (-1 clears) | `am_router_last`, `am_router_last_reason` |
+| Python | `am.set_router("cpu")`, `am.get_router()` | `with am.router("cpu"):` | `am.last_route()` -> `RouteDecision(op, path, reason, rows)` |
+
+The per-thread override wins over the process mode. Bindings other than Python reach the router through
+the C functions above; no operation signature changed.
+
+**What the router does not do.** It does not remove the floor, and it does not touch the operations
+whose cost is not the floor (memory-bound single passes, software binary64 transcendentals, host regex,
+views, temporal extraction: [TO_IMPROVE.md](TO_IMPROVE.md)). It chooses between ArrowMetal's own two
+paths, never a CPU library. Strings are not routed: the string rows lose to a 12-core Acero, and a
+single-threaded loop would not change that.
+
 ## Top-k and order statistics: GPU radix select
 
 `top_k`, `quantile` and `approximate_median` all ask the same question — which rows sit at which rank — and
