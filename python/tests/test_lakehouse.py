@@ -415,8 +415,10 @@ def test_filter_literals():
     assert got.num_rows == sum(1 for v in ts if v is not None and v >= when)
     got = am.read_delta_table(path, filters=[("price", ">=", decimal.Decimal("5.00"))])
     assert got.num_rows == sum(1 for v in base["price"].to_pylist() if v is not None and v >= decimal.Decimal(5))
-    with pytest.raises(am.ArrowMetalError, match="cannot contain"):
-        am.read_delta(path, filters=[("name", "==", 'a"b')])
+    # A quote in a string literal is escaped in the filter text, not refused; a NUL cannot be carried.
+    assert am.read_delta_table(path, filters=[("name", "==", 'a"b')]).num_rows == 0
+    with pytest.raises(am.ArrowMetalError, match="cannot contain NUL"):
+        am.read_delta(path, filters=[("name", "==", "a\0b")])
     with pytest.raises(am.ArrowMetalError, match="does not fit column day"):
         am.read_delta(path, filters=[("day", "==", 1.5)])
 
@@ -535,6 +537,89 @@ def test_iceberg_partition_values_that_need_escaping(tmp_path):
     assert normalise(got) == normalise(full.select(["s", "id"]))
 
 
+# String values holding what the filter text uses as syntax: `;` between filters, `"` around a literal,
+# `\` as its escape, and operator characters.
+SYNTAX_STRINGS = ["a;b", 'say "hi"', "back\\slash", "a==b", "x<y", '\\"', ";", '"', "plain", "end\\", 'x";y=="z']
+
+
+def _syntax_table(copies):
+    n = len(SYNTAX_STRINGS)
+    return pa.table({
+        "id": pa.array(range(copies * n), pa.int64()),
+        "s": pa.array([SYNTAX_STRINGS[i % n] for i in range(copies * n)]),
+        "grp": pa.array([SYNTAX_STRINGS[(i * 7 + i // n) % n] for i in range(copies * n)]),
+        "bin": pa.array([SYNTAX_STRINGS[(i + 3) % n].encode() for i in range(copies * n)], pa.binary()),
+    })
+
+
+@needs_delta
+def test_delta_string_literals_holding_quotes_and_semicolons(tmp_path):
+    """String and binary literals with `;`, `"`, `\\` and operator characters are quoted and escaped in
+    the filter text the Parquet reader's parser reads, so they filter as deltalake filters: data
+    columns, a partition column and a binary column, alone and two at once."""
+    from deltalake import WriterProperties
+    p = str(tmp_path / "t")
+    t = _syntax_table(4)
+    dl.write_deltalake(p, t, partition_by=["grp"], writer_properties=WriterProperties(max_row_group_size=4))
+    full = dl.DeltaTable(p).to_pyarrow_table()
+    for lit in SYNTAX_STRINGS:
+        for op in PA_OPS:
+            for col in ["s", "grp"]:
+                flt = [(col, op, lit)]
+                expected = dl.DeltaTable(p).to_pyarrow_table(filters=flt)
+                assert normalise(am.read_delta_table(p, filters=flt)) == normalise(expected), flt
+        flt = [("s", "!=", lit), ("grp", ">=", lit)]
+        assert normalise(am.read_delta_table(p, filters=flt)) == normalise(dl.DeltaTable(p).to_pyarrow_table(filters=flt))
+        got = am.read_delta_table(p, filters=[("bin", "==", lit.encode())])
+        want = full.filter(pc.equal(full["bin"], pa.scalar(lit.encode(), full.schema.field("bin").type)))
+        assert want.num_rows > 0 and normalise(got) == normalise(want), lit
+
+
+@needs_iceberg
+def test_iceberg_string_literals_holding_quotes_and_semicolons(tmp_path):
+    """The same literals against pyiceberg's scans, with the string column also an identity partition."""
+    from pyiceberg.expressions import (EqualTo, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual,
+                                       NotEqualTo)
+    exprs = {"==": EqualTo, "!=": NotEqualTo, "<": LessThan, "<=": LessThanOrEqual, ">": GreaterThan,
+             ">=": GreaterThanOrEqual}
+    cat = iceberg_catalog(tmp_path)
+    t = _syntax_table(4)
+    tbl = cat.create_table("ns.t", schema=t.schema, properties={"write.parquet.row-group-limit": "4"})
+    with tbl.update_spec() as u:
+        u.add_identity("grp")
+    tbl.append(t)
+    meta = cat.load_table("ns.t").metadata_location
+    static = StaticTable.from_metadata(meta)
+    full = static.scan().to_arrow()
+    for lit in SYNTAX_STRINGS:
+        for op, expr in exprs.items():
+            for col in ["s", "grp"]:
+                expected = static.scan(row_filter=expr(col, lit)).to_arrow()
+                got = am.read_iceberg_table(meta, filters=[(col, op, lit)])
+                assert normalise(got) == normalise(expected), (col, op, lit)
+        got = am.read_iceberg_table(meta, filters=[("bin", "==", lit.encode())])
+        want = full.filter(pc.equal(full["bin"], pa.scalar(lit.encode(), full.schema.field("bin").type)))
+        assert want.num_rows > 0 and normalise(got) == normalise(want), lit
+
+
+@needs_delta
+def test_int64_row_groups_against_double_literals_past_2_pow_53(tmp_path):
+    """Row groups of an int64 column are pruned by a double literal of any magnitude, compared exactly:
+    2^53 + 1 is above 2^53. The reference is Python's exact int-to-float comparison."""
+    import operator
+    from deltalake import WriterProperties
+    p = str(tmp_path / "t")
+    ints = [2 ** 53 + k for k in range(-4, 5)] + [2 ** 62, -(2 ** 62)]
+    dl.write_deltalake(p, pa.table({"x": pa.array(ints, pa.int64())}),
+                       writer_properties=WriterProperties(max_row_group_size=1))
+    py = {"==": operator.eq, "!=": operator.ne, "<": operator.lt, "<=": operator.le, ">": operator.gt,
+          ">=": operator.ge}
+    for lit in [2.0 ** 53, 2.0 ** 53 + 2, 2.0 ** 53 - 1.5, 2.0 ** 62, -(2.0 ** 62), 9.25e18, 1e300]:
+        for op, fn in py.items():
+            got = am.read_delta_table(p, filters=[("x", op, lit)])["x"].to_pylist()
+            assert sorted(got) == sorted(v for v in ints if fn(v, lit)), (op, lit)
+
+
 PA_OPS = {"==": pc.equal, "!=": pc.not_equal, "<": pc.less, "<=": pc.less_equal, ">": pc.greater,
           ">=": pc.greater_equal}
 
@@ -583,10 +668,13 @@ def test_float32_literal_rounding_differs_from_pyiceberg(tmp_path):
     assert got.num_rows == 3                        # exact: 0.1f is 0.10000000149... > 0.1
 
 
-def test_filter_text_that_would_change_meaning_is_refused():
+def test_operators_in_a_literal_are_kept_and_in_a_column_name_refused():
     path = os.path.join(FIXTURES, "delta", "basic")
-    with pytest.raises(am.ArrowMetalError, match="would be read first"):
-        am.read_delta(path, filters=[("name", "<", "a==b")])
+    base = am.read_delta_table(path)
+    got = am.read_delta_table(path, filters=[("name", "<", "a==b")])
+    assert normalise(got) == normalise(base.filter(pc.less(base["name"], "a==b")))
+    with pytest.raises(am.ArrowMetalError, match="cannot be written as filter text"):
+        am.read_delta(path, filters=[("na<me", "==", "x")])
     with pytest.raises(am.ArrowMetalError, match="version must be 0 or more"):
         am.read_delta(path, version=-5)
     lib = am._lib

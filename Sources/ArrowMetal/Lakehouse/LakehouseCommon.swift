@@ -878,10 +878,10 @@ enum LakeDataFile {
     /// statistics decide exactly as the row filter does are used, so pruning never drops a matching row:
     ///
     /// - string and binary filters are decided here, byte-wise on `min_value` / `max_value` (the row
-    ///   filter's order); the Parquet reader's own filter orders strings by Swift `String` comparison,
-    ///   which puts a decomposed "é" after "f";
-    /// - an integer column's double literal only when it is below 2^53 in magnitude, where the reader's
-    ///   integer-to-double conversion is exact;
+    ///   filter's order, and Parquet's), since a binary literal may be bytes that are not UTF-8, which a
+    ///   `ParquetFilter` string cannot carry;
+    /// - an integer column's double literal of any magnitude: the reader compares an integer statistic
+    ///   with a double exactly, never through a rounded double;
     /// - a timestamp only when the file stores the table's unit;
     /// - floats never under `!=` (a NaN matches it and statistics do not count NaNs).
     ///
@@ -908,7 +908,7 @@ enum LakeDataFile {
                 if case .integer(_, false) = leaf.logicalType { value = nil } else { value = .int(i) }
             case (.int8, .double(let d)), (.int16, .double(let d)), (.int32, .double(let d)), (.int64, .double(let d)):
                 if case .integer(_, false) = leaf.logicalType { value = nil }
-                else { value = d.magnitude < 0x1p53 ? .double(d) : nil }
+                else { value = .double(d) }
             case (.date, .int(let i)):
                 value = leaf.logicalType == .date ? .int(i) : nil
             case (.timestamp(let ns, _), .int(let i)):
