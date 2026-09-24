@@ -2169,6 +2169,12 @@ public:
 		return "arrowmetal_rewrite";
 	}
 
+	// A rewritten plan is not written out and read back: DuckDB's plan-serialization check
+	// (PRAGMA verify_serializer, enable_verification) skips a plan with this operator in it.
+	bool SupportSerialization() const override {
+		return false;
+	}
+
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
 		auto &child = planner.CreatePlan(*children[0]);
 		// After column binding resolution each expression is a reference into the child's chunk.

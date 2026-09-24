@@ -311,6 +311,16 @@ def test_unsupported_shapes_are_left_alone(con, sql, reason):
     assert any(reason in r[1] for r in kept), kept
 
 
+@pytest.mark.parametrize("pragma", ["enable_verification", "verify_serializer"])
+def test_under_duckdb_query_verification(con, pragma):
+    # DuckDB's own verification runs each query several ways and compares the answers; a rewritten
+    # plan opts out of the serialization round trip, which it has no reader for.
+    make(con, 30_000, "(hash(i) % 40)::INTEGER", [value_sql("BIGINT", 34), value_sql("INTEGER", 35)])
+    con.execute(f"PRAGMA {pragma}")
+    check(con, "SELECT k, sum(v0), avg(v1), min(v1), count(*) FROM t GROUP BY k")
+    check(con, "SELECT sum(v0), max(v1), avg(v0) FROM t WHERE v1 > 0")
+
+
 def test_a_parquet_scan(con, tmp_path):
     # read_parquet reports its row count from the file's metadata, so it takes the same path as a table.
     make(con, 70_000, "(hash(i) % 300)::INTEGER", [value_sql("BIGINT", 32), value_sql("INTEGER", 33)])
