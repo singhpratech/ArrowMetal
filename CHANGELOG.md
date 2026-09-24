@@ -212,6 +212,21 @@ Integrations
   functions; its answers are checked against DuckDB's by the 11 `@extension` tests in
   `python/tests/test_duckdb.py`, which run once `duckdb-extension/build.sh` has built it, and it is not
   yet a speedup (2048-row vectors).
+- DuckDB rewrite extension (docs/DUCKDB.md §4b): `duckdb-extension/src/arrowmetal_rewrite.cpp`, a C++
+  optimizer extension for DuckDB 1.5.5 (the C extension API has no optimizer hook; the duckdb Python
+  module exports the C++ symbols a `CPP` extension needs), built by `duckdb-extension/build_rewrite.sh`.
+  It replaces an eligible aggregate of unchanged SQL - `sum`/`avg` over integers, `min`/`max` over
+  integers, `DATE` and `TIMESTAMP`, `count`, with no key or one integer, `DATE`, `TIMESTAMP` or `VARCHAR`
+  key, over a table or Parquet scan - with `ARROWMETAL_AGGREGATE`: a parallel sink into pooled,
+  page-aligned slabs imported into ArrowMetal once, then a fused aggregate, a fused dense group-by or the
+  hash group-by, with ungrouped and narrow-key plans streamed to the GPU in blocks while DuckDB scans.
+  Answers are DuckDB's exactly (`HUGEINT` sums through 32-bit halves, `avg` with DuckDB's own finalizer
+  arithmetic, NULL groups, empty inputs), checked by `python/tests/test_duckdb_rewrite.py` with the
+  rewrite off and forced. `SET arrowmetal_rewrite = 'auto'` rewrites only at or above the router's
+  crossover and the shape class's measured floor (`Benchmarks/duckdb_rewrite_bench.py`, provisional
+  results in `Benchmarks/results/duckdb_rewrite_2026-09-23_provisional.csv`); `'off'` and `'force'`
+  too; `arrowmetal_rewrites()` and `EXPLAIN` show what happened. Python: `am.duckdb_connect()`,
+  `am.duckdb_rewrites(con)`, `am.duckdb_is_rewritten(con, sql)`.
 - pandas (docs/PANDAS.md): an `.am` accessor on Series/DataFrame, and an opt-in accel mode that patches a
   documented set of pandas methods, routes to the GPU only when dtype, size and arguments qualify, and
   restores the originals exactly on `uninstall()`.

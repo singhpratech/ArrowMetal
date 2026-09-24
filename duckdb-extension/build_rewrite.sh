@@ -13,6 +13,10 @@
 # file in any other version. The release is read from the target Python's duckdb module, and the
 # source tree's commit is checked against that module's source_id so the headers match the binary.
 #
+# The source is written to the DuckDB 1.5 C++ API. The C++ API changes between releases: against the
+# 1.4.5 headers it does not compile (OptimizerExtension::Register and PhysicalOperator::GetDataInternal
+# are not there yet), so another release may need changes to src/arrowmetal_rewrite.cpp.
+#
 # The extension leaves DuckDB's symbols unresolved (-undefined dynamic_lookup); the host process - the
 # duckdb Python module, or the duckdb CLI - provides them when it loads the file. The last step checks
 # that every DuckDB symbol the extension needs is exported by the target Python's duckdb module.
@@ -38,6 +42,10 @@ v, sid, _ = duckdb.sql("pragma version").fetchone()
 plat = duckdb.sql("pragma platform").fetchone()[0]
 mod = importlib.import_module("_duckdb").__file__
 print(v, sid, plat, mod)')
+if [ -z "${DUCKDB_MODULE:-}" ]; then
+  echo "$PYTHON could not import duckdb; point PYTHON at the interpreter whose duckdb the extension is for" >&2
+  exit 1
+fi
 DUCKDB_PLATFORM="${DUCKDB_PLATFORM:-$DUCKDB_PLATFORM_DETECTED}"
 SOURCE="${DUCKDB_SOURCE_DIR:-$BUILD/duckdb-$DUCKDB_VERSION}"
 

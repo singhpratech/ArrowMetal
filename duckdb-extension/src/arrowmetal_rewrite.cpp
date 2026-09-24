@@ -15,28 +15,33 @@
 // can answer exactly - SUM / COUNT / COUNT(*) / MIN / MAX / AVG over integer columns (MIN and MAX also
 // over DATE and TIMESTAMP), no DISTINCT, no FILTER, no ORDER BY inside the aggregate, at most one GROUP
 // BY column that is an integer, DATE, TIMESTAMP or VARCHAR column - sitting on a chain of projections
-// and filters over a table function whose row count DuckDB knows. When DuckDB's estimate of the rows
-// reaching the aggregate is at or above the crossover (Benchmarks/results/router_2026-09-17.json), the
-// LogicalAggregate is replaced by ARROWMETAL_AGGREGATE. Everything below the aggregate - the scan, the
-// pushed-down filters, the projections - is still DuckDB's, planned and run exactly as before.
+// and filters over a table function whose row count DuckDB knows. In 'auto' mode, when DuckDB's
+// estimate of the rows reaching the aggregate is at or above both the router's crossover
+// (Benchmarks/results/router_2026-09-17.json) and the measured floor of the query's shape class
+// (Benchmarks/results/duckdb_rewrite_2026-09-23_provisional.csv), the LogicalAggregate is replaced by
+// ARROWMETAL_AGGREGATE. Everything below the aggregate - the scan, the pushed-down filters, the
+// projections - is still DuckDB's, planned and run exactly as before.
 //
-// ARROWMETAL_AGGREGATE is a parallel sink. Each DuckDB worker thread appends its chunks into one
-// shared, page-aligned, column-major buffer per input column (a reservation per chunk, then a memcpy
-// outside any lock). When the pipeline finishes, the buffers are wrapped as Arrow arrays without a
-// copy (page-aligned memory goes to Metal through makeBuffer(bytesNoCopy:)), the aggregate runs on the
-// GPU, and the result is handed back to DuckDB with the aggregate's own column bindings and types.
+// ARROWMETAL_AGGREGATE is a parallel sink. Each DuckDB worker thread reserves row positions for its
+// chunk and copies the aggregate's input columns into page-aligned buffers outside any lock. A
+// fixed-width column's buffer is a slab from a pool kept across queries, imported into ArrowMetal once
+// and handed over as a zero-copy slice. An ungrouped aggregate, or a group-by over a narrow integer
+// key, is cut into blocks that a GPU worker thread aggregates while DuckDB is still scanning, and the
+// per-block results are merged on the host; everything else runs once over the whole input when the
+// pipeline finishes. The result goes back to DuckDB with the aggregate's own column bindings and types.
 //
 // EXACTNESS. Integer sums are exact to DuckDB's HUGEINT: a BIGINT column is summed as its high and low
-// 32-bit halves (each of which fits in 64 bits for any table under 2^31 rows) and recombined in 128
-// bits, unless DuckDB's own statistics already proved the sum fits in 64 bits (sum_no_overflow). AVG is
+// 32-bit halves (each of which fits in 64 bits over fewer than 2^31 rows) and recombined in 128 bits,
+// unless DuckDB's own statistics already proved the sum fits in 64 bits (sum_no_overflow). AVG is
 // finished with the same arithmetic DuckDB's avg uses. Floating-point SUM and AVG are not rewritten:
 // DuckDB's own float sums depend on thread scheduling, so there is no single answer to match.
 //
 // CONTROLS.
-//   SET arrowmetal_rewrite = 'auto';   -- default: rewrite supported shapes at or above the crossover
+//   SET arrowmetal_rewrite = 'auto';   -- default: supported shapes, at the sizes measured faster
 //   SET arrowmetal_rewrite = 'off';    -- never rewrite
 //   SET arrowmetal_rewrite = 'force';  -- rewrite every supported shape regardless of size (for tests)
-//   SELECT * FROM arrowmetal_rewrites();  -- every decision this process made, newest last, with reason
+//   SET arrowmetal_rewrite_block_rows = 16777216;  -- rows per block of a streamed plan
+//   SELECT * FROM arrowmetal_rewrites();  -- every decision this process made, oldest first, with reason
 //   EXPLAIN ...                           -- ARROWMETAL_AGGREGATE in the plan means the query was rewritten
 
 #include "duckdb.hpp"
@@ -128,7 +133,7 @@ static constexpr int64_t DEFAULT_BLOCK_ROWS = int64_t(1) << 24;
 // Slots the fused group-by keeps in threadgroup memory (ExprCompiler.gbMaxPrivateSlots).
 static constexpr int64_t FUSED_PRIVATE_SLOTS = 2048;
 // The GPU kernels index rows with 32-bit integers, and a 32-bit value summed over fewer than 2^31
-// rows cannot leave int64. Larger inputs are left to DuckDB.
+// rows cannot leave int64. A plan that is not streamed and would see more rows is left to DuckDB.
 static constexpr int64_t MAX_ROWS = (int64_t(1) << 31) - 1;
 
 enum class Mode { AUTO, OFF, FORCE };
@@ -362,10 +367,10 @@ struct Region {
 // Slabs: a fixed-width column's memory, kept from one query to the next together with its Metal
 // wrapping.
 //
-// Wrapping fresh memory for the GPU is not free: at 50M int64 rows makeBuffer(bytesNoCopy:) and the
-// GPU's first touch of the new mapping cost several times what the aggregate itself does. So each
-// slab is imported into ArrowMetal once, over its whole capacity, and every query afterwards writes
-// its rows into the same memory and hands ArrowMetal a zero-copy slice of the first `rows` of it.
+// Wrapping fresh memory for the GPU is not free: makeBuffer(bytesNoCopy:) and the GPU's first touch of
+// a new mapping take time in proportion to its size, and a fresh mapping's first CPU writes are page
+// faults. So each slab is imported into ArrowMetal once, over its whole capacity, and every query
+// afterwards writes its rows into the same memory and hands ArrowMetal a zero-copy slice of them.
 // Freed slabs wait in a pool (least recently used first out) holding at most SLAB_POOL_BYTES.
 //===--------------------------------------------------------------------===//
 static constexpr size_t SLAB_POOL_BYTES = size_t(4) << 30;
@@ -2455,7 +2460,7 @@ static void Analyse(ClientContext &context, LogicalAggregate &aggr, Candidate &c
 		return;
 	}
 
-	// DuckDB's estimate of the group count (from its distinct-count sketches, within about 20% on the
+	// DuckDB's estimate of the group count (from its distinct-count sketches, within about 25% on the
 	// benchmark's tables) picks the router's 1,000-group or 100,000-group class, split at 10,000, the
 	// geometric middle of the two.
 	const idx_t groups_estimate =

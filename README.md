@@ -141,6 +141,7 @@ low-cardinality group-by and multi-key sort: against it, `sum by int32 key` at 1
 1.8x rather than the 3.8x the matrix shows against Acero, and `lexsort` is 7.0x rather than 24.0x. From
 100,000 groups upward, and on every sort, ArrowMetal stays 3x or more ahead of DuckDB, at 1 to 2 CPU-ms
 against DuckDB's 135 to 4,350.
+An optimizer extension also runs eligible aggregates of unchanged DuckDB SQL on the GPU with DuckDB's exact answers ([docs/DUCKDB.md](docs/DUCKDB.md) §4b).
 
 ## From Python
 

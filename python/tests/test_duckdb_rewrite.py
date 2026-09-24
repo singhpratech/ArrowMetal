@@ -311,6 +311,26 @@ def test_unsupported_shapes_are_left_alone(con, sql, reason):
     assert any(reason in r[1] for r in kept), kept
 
 
+def test_a_parquet_scan(con, tmp_path):
+    # read_parquet reports its row count from the file's metadata, so it takes the same path as a table.
+    make(con, 70_000, "(hash(i) % 300)::INTEGER", [value_sql("BIGINT", 32), value_sql("INTEGER", 33)])
+    path = str(tmp_path / "t.parquet")
+    con.execute(f"COPY t TO '{path}' (FORMAT parquet)")
+    check(con, f"SELECT k, sum(v0), count(v1), min(v1), avg(v0) FROM read_parquet('{path}') GROUP BY k")
+    check(con, f"SELECT sum(v0), max(v1) FROM read_parquet('{path}') WHERE v1 > 0")
+    assert last_decision(con)[3].startswith("read_parquet -> ")
+
+
+def test_a_registered_arrow_table_is_left_to_duckdb(con):
+    # DuckDB's arrow_scan does not report a row count to the planner, so the size gate cannot be applied;
+    # the aggregate stays DuckDB's (the Python bridge, tier 1, is the path for Arrow data).
+    pa = pytest.importorskip("pyarrow")
+    con.register("arrow_t", pa.table({"k": pa.array([1, 2, 3] * 1000, pa.int32()),
+                                      "v": pa.array(range(3000), pa.int64())}))
+    check(con, "SELECT k, sum(v) FROM arrow_t GROUP BY k", rewritten=False)
+    assert last_decision(con)[2] == "the source arrow_scan does not report its size"
+
+
 # ---------------------------------------------------------------------------------------------------
 # The controls: auto / off / force, and seeing what happened
 # ---------------------------------------------------------------------------------------------------
