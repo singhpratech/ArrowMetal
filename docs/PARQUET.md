@@ -313,12 +313,12 @@ group to *candidate row ranges* (`ParquetPageIndex.swift`):
 The rows that match a filter are the same with and without the index; the index only makes the superset
 smaller. `ParquetFile.usePageIndex` (`f.use_page_index` in Python, `am_parquet_set_page_index` in C)
 turns it off, and `lastReadStatistics` (`f.last_read_stats`, `am_parquet_last_read_stats`) reports what
-the last read did: row groups read and skipped by statistics and by the page index, data pages decoded
-and skipped, rows returned. `ParquetPageIndexTests` and `test_parquet_nested.py` compare the exact
+the last read did: row groups read and skipped by statistics, by the page index and by bloom filters
+(below), data pages decoded and skipped, rows returned. `test_parquet_nested.py` compares the exact
 matches with and without the index against pyarrow over fifteen filter sets on five files (pyarrow in
-three page layouts and once without an index, Polars), and check that the skipped and decoded pages add up to the pages of the
-row groups read. A filter on a column inside a list does not narrow pages; the row-group statistics still
-apply to it.
+three page layouts and once without an index, and Polars); `ParquetPageIndexTests` also checks that the
+skipped and decoded pages of flat columns add up to the pages of the row groups read. A filter on a
+column inside a list does not narrow pages; the row-group statistics still apply to it.
 
 ### Bloom filters
 
