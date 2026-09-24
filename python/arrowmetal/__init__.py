@@ -4477,6 +4477,10 @@ _lib.am_json_open_buffer.restype = ctypes.c_int
 _lib.am_json_close.argtypes = [_P]
 _lib.am_json_read.argtypes = [_P, ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(_P)]
 _lib.am_json_read.restype = ctypes.c_int
+_lib.am_json_read_named.argtypes = [_P, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int64, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_json_read_named.restype = ctypes.c_int
+_lib.am_json_last_error.argtypes = [ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8))]
+_lib.am_json_last_error.restype = ctypes.c_int64
 _lib.am_json_batch_columns.argtypes = [_P]
 _lib.am_json_batch_columns.restype = ctypes.c_int64
 _lib.am_json_batch_rows.argtypes = [_P]
@@ -4492,13 +4496,46 @@ _lib.am_json_batch_release.argtypes = [_P]
 _UNEXPECTED_FIELD = {"infer": 0, "ignore": 1, "error": 2}
 
 
+def _json_check(rc):
+    """`_check` reading the message with its length, so a key or value it quotes that holds a NUL
+    arrives whole (am_last_error's C string stops at the NUL)."""
+    if rc != 0:
+        p = ctypes.POINTER(ctypes.c_uint8)()
+        n = _lib.am_json_last_error(ctypes.byref(p))
+        msg = ctypes.string_at(p, n).decode("utf-8", "replace") if n > 0 else ""
+        raise ArrowMetalError(msg or "unknown error")
+
+
+def _json_schema_names(schema):
+    """The explicit schema's field names depth-first (through list items), each as a 4-byte
+    little-endian length and its UTF-8 bytes: the layout `am_json_read_named` takes."""
+    out = bytearray()
+
+    def walk(t):
+        if pa.types.is_struct(t):
+            for j in range(t.num_fields):
+                put(t.field(j))
+        elif pa.types.is_list(t):
+            walk(t.value_type)
+
+    def put(f):
+        b = f.name.encode()
+        out.extend(len(b).to_bytes(4, "little"))
+        out.extend(b)
+        walk(f.type)
+
+    for f in schema:
+        put(f)
+    return bytes(out)
+
+
 def _json_column_names(out, i):
     """Column i's name and its nested struct field names (depth-first), read with their lengths so a
     key holding "\\u0000" survives (a C string and the C Data Interface stop at the NUL)."""
     p = ctypes.POINTER(ctypes.c_uint8)()
     n = _lib.am_json_batch_column_names(out, i, ctypes.byref(p))
     if n < 0:
-        _check(1)
+        _json_check(1)
     blob = ctypes.string_at(p, n) if n else b""
     names, k = [], 0
     while k < n:
@@ -4535,14 +4572,14 @@ def _json_read(source, read_options, parse_options, explicit_schema, unexpected_
     h = _P()
     if isinstance(source, (bytes, bytearray, memoryview)):
         buf = bytes(source)
-        _check(_lib.am_json_open_buffer(buf, len(buf), ctypes.byref(h)))
+        _json_check(_lib.am_json_open_buffer(buf, len(buf), ctypes.byref(h)))
     elif hasattr(source, "read"):
         buf = source.read()
         if isinstance(buf, str):
             buf = buf.encode()
-        _check(_lib.am_json_open_buffer(buf, len(buf), ctypes.byref(h)))
+        _json_check(_lib.am_json_open_buffer(buf, len(buf), ctypes.byref(h)))
     else:
-        _check(_lib.am_json_open(os.fspath(source).encode(), ctypes.byref(h)))
+        _json_check(_lib.am_json_open(os.fspath(source).encode(), ctypes.byref(h)))
     try:
         schema_c = None
         if explicit_schema is not None:
@@ -4550,8 +4587,14 @@ def _json_read(source, read_options, parse_options, explicit_schema, unexpected_
             explicit_schema._export_to_c(ctypes.addressof(schema_c))
         out = _P()
         try:
-            _check(_lib.am_json_read(h, ctypes.addressof(schema_c) if schema_c is not None else None,
-                                     _UNEXPECTED_FIELD[ufb], ctypes.byref(out)))
+            if schema_c is None:
+                _json_check(_lib.am_json_read(h, None, _UNEXPECTED_FIELD[ufb], ctypes.byref(out)))
+            else:
+                # The field names travel with their lengths too: the C Data Interface's C strings
+                # stop at a NUL, which a JSON key may hold.
+                blob = _json_schema_names(explicit_schema)
+                _json_check(_lib.am_json_read_named(h, ctypes.addressof(schema_c), blob, len(blob),
+                                                    _UNEXPECTED_FIELD[ufb], ctypes.byref(out)))
         finally:
             if schema_c is not None and schema_c.release:
                 schema_c.release(ctypes.byref(schema_c))
@@ -4560,7 +4603,7 @@ def _json_read(source, read_options, parse_options, explicit_schema, unexpected_
             for i in range(_lib.am_json_batch_columns(out)):
                 names = _json_column_names(out, i)
                 c = _P()
-                _check(_lib.am_json_batch_column(out, i, ctypes.byref(c)))
+                _json_check(_lib.am_json_batch_column(out, i, ctypes.byref(c)))
                 pairs.append((names[0], MetalArray(c)))
                 if any("\x00" in nm for nm in names[1:]):
                     nested[i] = names[1:]

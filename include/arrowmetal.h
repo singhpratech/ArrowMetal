@@ -1575,6 +1575,18 @@ void  am_json_close(am_json_file* f);
 // fields), 1 ignore (dropped), 2 error ("JSON parse error: unexpected field").
 int am_json_read(am_json_file* f, const struct ArrowSchema* explicit_schema,
                  int unexpected_field_behavior, am_json_batch** out);
+// The same with the explicit schema's field names given with their lengths, for names holding "\u0000"
+// (the ArrowSchema's C strings stop at the NUL): every struct field name of the schema depth-first
+// (through list items), each as a 4-byte little-endian length and its UTF-8 bytes, the layout
+// am_json_batch_column_names returns. NULL field_names reads the schema's C strings; a blob that ends
+// early or holds extra names is an error.
+int am_json_read_named(am_json_file* f, const struct ArrowSchema* explicit_schema,
+                       const uint8_t* field_names, int64_t field_names_length,
+                       int unexpected_field_behavior, am_json_batch** out);
+// The last error's bytes with their length: the message of a failed am_json_* call, whole even when
+// a key or value it quotes holds a NUL (where am_last_error()'s C string stops). *out is valid until
+// the next call to this function on this thread.
+int64_t am_json_last_error(const uint8_t** out);
 
 int64_t     am_json_batch_columns(am_json_batch* b);
 // Rows, which a file of empty objects still has when it has no columns.

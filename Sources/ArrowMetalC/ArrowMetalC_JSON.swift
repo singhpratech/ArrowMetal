@@ -48,6 +48,46 @@ private func jsonStore(_ m: String) {
     Thread.current.threadDictionary["ArrowMetalC.lastError"] = m
 }
 
+/// The last error's bytes and length (see am_json_last_error), kept per thread until the next call.
+@_cdecl("am_json_last_error")
+public func am_json_last_error(_ out: UnsafeMutablePointer<UnsafePointer<UInt8>?>?) -> Int64 {
+    let key = "ArrowMetalC.lastErrorBytes"
+    let u = Array(((Thread.current.threadDictionary["ArrowMetalC.lastError"] as? String) ?? "").utf8)
+    if let old = Thread.current.threadDictionary[key] as? UnsafeMutableBufferPointer<UInt8> { old.deallocate() }
+    let stored = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: max(u.count, 1))
+    _ = stored.initialize(from: u)
+    Thread.current.threadDictionary[key] = stored
+    out?.pointee = UnsafePointer(stored.baseAddress)
+    return Int64(u.count)
+}
+
+/// Explicit-schema field names given with their lengths, consumed depth-first; `nil` reads the
+/// schema's own C strings.
+private final class JSONNameSource {
+    private let blob: UnsafeBufferPointer<UInt8>?
+    private var at = 0
+    init(_ blob: UnsafeBufferPointer<UInt8>?) { self.blob = blob }
+    func next(_ c: UnsafePointer<ArrowSchema>) throws -> String {
+        guard let blob else { return c.pointee.name.map { String(cString: $0) } ?? "" }
+        guard at + 4 <= blob.count else {
+            throw JSONError.unsupported("explicit_schema: `field_names` ends before the schema's field names do")
+        }
+        let n = Int(blob[at]) | Int(blob[at + 1]) << 8 | Int(blob[at + 2]) << 16 | Int(blob[at + 3]) << 24
+        at += 4
+        guard n <= blob.count - at else {
+            throw JSONError.unsupported("explicit_schema: a length in `field_names` runs past its end")
+        }
+        let name = String(decoding: UnsafeBufferPointer(rebasing: blob[at..<(at + n)]), as: UTF8.self)
+        at += n
+        return name
+    }
+    func finish() throws {
+        if let blob, at != blob.count {
+            throw JSONError.unsupported("explicit_schema: `field_names` holds more names than the schema has fields")
+        }
+    }
+}
+
 @discardableResult
 private func jsonBadArgument(_ function: String, _ detail: String) -> Int32 {
     jsonStore("\(function): \(detail)")
@@ -95,7 +135,7 @@ public func am_json_close(_ f: OpaquePointer?) {
 
 /// The explicit schema arrives as an Arrow C Data Interface schema of struct type ("+s"): its children
 /// are the fields. Types outside what the reader converts to are rejected with the field's path.
-private func jsonType(_ s: UnsafePointer<ArrowSchema>, path: String) throws -> JSONType {
+private func jsonType(_ s: UnsafePointer<ArrowSchema>, path: String, names: JSONNameSource) throws -> JSONType {
     guard let fmtC = s.pointee.format else { throw JSONError.unsupported("explicit_schema: \(path) has no format") }
     let fmt = String(cString: fmtC)
     switch fmt {
@@ -116,9 +156,9 @@ private func jsonType(_ s: UnsafePointer<ArrowSchema>, path: String) throws -> J
         guard s.pointee.n_children == 1, let c = s.pointee.children?[0] else {
             throw JSONError.unsupported("explicit_schema: \(path) is a list without a child")
         }
-        return .list(try jsonType(UnsafePointer(c), path: path + "/[]"))
+        return .list(try jsonType(UnsafePointer(c), path: path + "/[]", names: names))
     case "+s":
-        return .structure(try jsonFields(s, path: path))
+        return .structure(try jsonFields(s, path: path, names: names))
     default:
         if fmt.hasPrefix("ts") && fmt.count >= 4 {
             let chars = Array(fmt)
@@ -138,12 +178,12 @@ private func jsonType(_ s: UnsafePointer<ArrowSchema>, path: String) throws -> J
     }
 }
 
-private func jsonFields(_ s: UnsafePointer<ArrowSchema>, path: String) throws -> [JSONField] {
+private func jsonFields(_ s: UnsafePointer<ArrowSchema>, path: String, names: JSONNameSource) throws -> [JSONField] {
     var out: [JSONField] = []
     for i in 0..<Int(s.pointee.n_children) {
         guard let c = s.pointee.children?[i] else { continue }
-        let name = c.pointee.name.map { String(cString: $0) } ?? ""
-        out.append(JSONField(name, try jsonType(UnsafePointer(c), path: "\(path)/\(name)")))
+        let name = try names.next(UnsafePointer(c))
+        out.append(JSONField(name, try jsonType(UnsafePointer(c), path: "\(path)/\(name)", names: names)))
     }
     return out
 }
@@ -154,23 +194,46 @@ private func jsonFields(_ s: UnsafePointer<ArrowSchema>, path: String) throws ->
 @_cdecl("am_json_read")
 public func am_json_read(_ f: OpaquePointer?, _ explicitSchema: UnsafePointer<ArrowSchema>?,
                          _ unexpectedFieldBehavior: Int32, _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
-    guard let file = jsonFile(f) else { return jsonBadArgument("am_json_read", "`f` is NULL (no open file)") }
-    guard let out else { return jsonBadArgument("am_json_read", "`out` is NULL") }
+    jsonRead("am_json_read", f, explicitSchema, nil, unexpectedFieldBehavior, out)
+}
+
+/// `am_json_read` with the explicit schema's field names given with their lengths (a name holding a NUL
+/// is cut at it in the ArrowSchema's C string): every struct field name depth-first, through list items,
+/// each as a 4-byte little-endian length and its UTF-8 bytes; NULL `field_names` uses the C strings.
+@_cdecl("am_json_read_named")
+public func am_json_read_named(_ f: OpaquePointer?, _ explicitSchema: UnsafePointer<ArrowSchema>?,
+                               _ fieldNames: UnsafePointer<UInt8>?, _ fieldNamesLength: Int64,
+                               _ unexpectedFieldBehavior: Int32, _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
+    guard fieldNamesLength >= 0 else {
+        return jsonBadArgument("am_json_read_named", "`field_names_length` is \(fieldNamesLength); it cannot be negative")
+    }
+    // NULL `field_names` reads the schema's own C strings, as am_json_read does.
+    let blob = fieldNames.map { UnsafeBufferPointer(start: $0, count: Int(fieldNamesLength)) }
+    return jsonRead("am_json_read_named", f, explicitSchema, blob, unexpectedFieldBehavior, out)
+}
+
+private func jsonRead(_ function: String, _ f: OpaquePointer?, _ explicitSchema: UnsafePointer<ArrowSchema>?,
+                      _ fieldNames: UnsafeBufferPointer<UInt8>?, _ unexpectedFieldBehavior: Int32,
+                      _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
+    guard let file = jsonFile(f) else { return jsonBadArgument(function, "`f` is NULL (no open file)") }
+    guard let out else { return jsonBadArgument(function, "`out` is NULL") }
     let behavior: JSONUnexpectedFieldBehavior
     switch unexpectedFieldBehavior {
     case 0: behavior = .infer
     case 1: behavior = .ignore
     case 2: behavior = .error
     default:
-        return jsonBadArgument("am_json_read", "`unexpected_field_behavior` is \(unexpectedFieldBehavior); use 0 infer, 1 ignore or 2 error")
+        return jsonBadArgument(function, "`unexpected_field_behavior` is \(unexpectedFieldBehavior); use 0 infer, 1 ignore or 2 error")
     }
     do {
         var schema: [JSONField]? = nil
         if let explicitSchema {
             guard let fmt = explicitSchema.pointee.format, String(cString: fmt) == "+s" else {
-                return jsonBadArgument("am_json_read", "`explicit_schema` must be a struct (\"+s\") schema")
+                return jsonBadArgument(function, "`explicit_schema` must be a struct (\"+s\") schema")
             }
-            schema = try jsonFields(explicitSchema, path: "")
+            let names = JSONNameSource(fieldNames)
+            schema = try jsonFields(explicitSchema, path: "", names: names)
+            try names.finish()
         }
         let table = try file.read(JSONReadOptions(explicitSchema: schema, unexpectedFieldBehavior: behavior))
         out.pointee = OpaquePointer(Unmanaged.passRetained(JSONBatchBox(table)).toOpaque())

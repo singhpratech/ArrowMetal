@@ -172,6 +172,21 @@ PROBES = {
     "empty_file": '',
     "utf8_bom": b'\xef\xbb\xbf{"a":1}\n',
     "bom_mid_file": b'{"a":1}\n\xef\xbb\xbf{"a":2}\n',
+    # pyarrow skips each byte of the mark that is present at the start, in order.
+    "bom_ef_bb": b'\xef\xbb{"a":1}\n',
+    "bom_ef": b'\xef{"a":1}\n',
+    "bom_bb": b'\xbb{"a":1}\n',
+    "bom_bf": b'\xbf{"a":1}\n',
+    "bom_ef_bf": b'\xef\xbf{"a":1}\n',
+    "bom_bb_bf": b'\xbb\xbf{"a":1}\n',
+    "bom_ef_bb_only": b'\xef\xbb',
+    "bom_ef_only": b'\xef',
+    "bom_ef_then_space": b'\xef {"a":1}\n',
+    "bom_ef_bb_bb": b'\xef\xbb\xbb{"a":1}\n',
+    "bom_ef_ef": b'\xef\xef{"a":1}\n',
+    "bom_bb_ef": b'\xbb\xef{"a":1}\n',
+    "bom_twice": b'\xef\xbb\xbf\xef\xbb\xbf{"a":1}\n',
+    "bom_after_space": b' \xef\xbb\xbf{"a":1}\n',
     "null_row_after_first": '{"a":1}\nnull\n{"a":2}\n',
     "two_null_rows": '{"a":1}\nnullnull\n',
     "null_then_garbage": '{"a":1}\nnullx\n',
@@ -270,6 +285,21 @@ PROBES = {
     "exponent_sign_only": '{"a":1e+}\n',
     "infinity_misspelt": '{"a":Infin}\n',
     "nan_trailing_letter": '{"a":NaNx}\n',
+    # RapidJSON ends the number right after NaN / Inf / Infinity; a fraction or exponent after it is
+    # the missing-comma error, not part of the value.
+    "special_nan_exponent": '{"a":NaNe5}\n',
+    "special_nan_fraction": '{"a":NaN.5}\n',
+    "special_nan_signed_exponent": '{"a":NaNE+2}\n',
+    "special_negative_nan_exponent": '{"a":-NaNe1}\n',
+    "special_infinity_exponent": '{"a":Infinitye5}\n',
+    "special_inf_fraction": '{"a":Inf.5}\n',
+    "special_negative_infinity_fraction": '{"a":-Infinity.0}\n',
+    "special_nan_bare_exponent": '{"a":NaNe}\n',
+    "special_inf_bare_exponent": '{"a":Infe}\n',
+    "special_nan_bare_fraction": '{"a":NaN.}\n',
+    "special_inf_bare_fraction_exponent": '{"a":Inf.e5}\n',
+    "special_nan_exponent_in_array": '{"a":[NaNe5]}\n',
+    "special_nan_exponent_later_row": '{"a":1.5}\n{"a":Infinity.0}\n',
     "true_misspelt": '{"a":tru}\n',
     "missing_colon": '{"a" 1}\n',
     "array_missing_comma": '{"a":[1 2]}\n',
@@ -377,6 +407,13 @@ EXPLICIT = {
     "unexpected_then_conflict": ('{"a":1}\n{"a":"x","z":1}\n', S(("a", pa.int64()), unexpected_field_behavior="error")),
     "conflict_then_unexpected": ('{"a":1}\n{"z":1,"a":"x"}\n', S(("a", pa.int64()), unexpected_field_behavior="error")),
     "nested_conflict_before_schema_conflict": ('{"a":{"b":"x"}}\n{"a":1}\n', S(("a", pa.struct([("b", pa.int64())])))),
+    # Schema field names holding a NUL reach the reader whole (am_json_read_named), not cut at it.
+    "nul_in_schema_name": ('{"a\\u0000b":1}\n', S(("a\x00b", pa.int8()))),
+    "nul_in_schema_name_beside_prefix": ('{"a":2,"a\\u0000b":1}\n', S(("a\x00b", pa.int8()), ("a", pa.int16()))),
+    "nul_in_nested_schema_names": ('{"s\\u0000":{"x\\u0000y":1,"l":[{"z\\u0000":true}]}}\n',
+                                   S(("s\x00", pa.struct([("x\x00y", pa.int8()),
+                                                           ("l", pa.list_(pa.struct([("z\x00", pa.bool_())])))])))),
+    "nul_in_schema_name_error_mode": ('{"a\\u0000b":1,"a":2}\n', S(("a\x00b", pa.int8()), unexpected_field_behavior="error")),
     # timestamp[ns] holds 1677-09-21T00:12:43.145224192 to 2262-04-11T23:47:16.854775807.
     "timestamp_ns_far_future": ('{"a":"9999-12-31"}\n{"a":"1500-01-01"}\n', S(("a", pa.timestamp("ns")))),
     "timestamp_ns_far_past": ('{"a":"2000-01-01"}\n{"a":"1500-01-01"}\n', S(("a", pa.timestamp("ns")))),
@@ -819,6 +856,20 @@ def test_key_holding_nul_keeps_its_full_name():
     assert t.to_pylist() == [{"s\x00": {"a\x00b": 1, "a": 2, "l": [{"x\x00": 1, "x": 2}]}}]
     # The documented limit: a MetalArray's own export carries nested names only up to the NUL.
     assert am.read_json(nested)["s\x00"].to_arrow().type.field(0).name == "a"
+
+
+def test_messages_holding_a_nul_arrive_whole():
+    # am_last_error's C string stops at a NUL; the JSON calls read the message with its length.
+    cases = [
+        (b'{"a\\u0000n":[1]}\n{"a\\u0000n":[true]}\n', None),
+        (b'{"a\\u0000n":1,"a\\u0000n":2}\n', None),
+        (b'{"t":"\\u0000x"}\n', S(("t", pa.timestamp("s")))),
+        (b'{"s":{"k\\u0000":1}}\n{"s":{"k\\u0000":"x"}}\n', None),
+    ]
+    for data, po in cases:
+        want, got = pa_read(data, po), am_read(data, po)
+        assert want[0] == got[0] == "err" and "\x00" in want[1], (data, want)
+        assert got[1] == want[1], (data, got[1], want[1])
 
 
 def test_negative_nan_keeps_its_sign():

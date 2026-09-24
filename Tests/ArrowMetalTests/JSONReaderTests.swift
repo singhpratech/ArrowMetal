@@ -509,4 +509,35 @@ final class JSONReaderTests: XCTestCase {
             XCTAssertEqual("\($0)", "Empty JSON file")
         }
     }
+
+    /// RapidJSON ends the number right after `NaN`, `Inf` or `Infinity`: a fraction or exponent after it
+    /// is the missing-comma error (pyarrow 25.0.1's text), never part of the value.
+    func testSpecialNumbersTakeNoFractionOrExponent() throws {
+        try requireRealGPU()
+        let comma = "JSON parse error: Missing a comma or '}' after an object member. in row 0"
+        for v in ["NaNe5", "NaN.5", "NaNE+2", "-NaNe1", "Infinitye5", "Inf.5", "-Infinity.0",
+                  "NaNe", "Infe", "NaN.", "Inf.e5"] {
+            XCTAssertEqual(readError("{\"a\":\(v)}\n"), comma, v)
+        }
+        XCTAssertEqual(readError("{\"a\":[NaNe5]}\n"),
+                       "JSON parse error: Missing a comma or ']' after an array element. in row 0")
+        XCTAssertEqual(try read("{\"a\":Infinity}\n")["a"]?.asFloat64?.toArray(), [Double.infinity])
+    }
+
+    /// Each byte of the UTF-8 mark EF BB BF present at the start, in order, is skipped (pyarrow 25.0.1),
+    /// so a partial mark is too; anything else there is an invalid value.
+    func testPartialByteOrderMarkAtTheStart() throws {
+        try requireRealGPU()
+        let record = Array("{\"a\":1}\n".utf8)
+        for prefix: [UInt8] in [[0xEF, 0xBB, 0xBF], [0xEF, 0xBB], [0xEF, 0xBF], [0xBB, 0xBF], [0xEF], [0xBB], [0xBF]] {
+            let t = try JSONReader(bytes: prefix + record).read()
+            XCTAssertEqual(t["a"]?.asInt64?.toArray(), [1], "\(prefix)")
+        }
+        XCTAssertEqual(try JSONReader(bytes: [0xEF, 0xBB]).read().rowCount, 0)
+        for prefix: [UInt8] in [[0xEF, 0xBB, 0xBB], [0xEF, 0xEF], [0xBB, 0xEF], [0xEF, 0xBB, 0xBF, 0xEF], [0x20, 0xEF]] {
+            XCTAssertThrowsError(try JSONReader(bytes: prefix + record).read(), "\(prefix)") {
+                XCTAssertEqual("\($0)", "JSON parse error: Invalid value. in row 0")
+            }
+        }
+    }
 }

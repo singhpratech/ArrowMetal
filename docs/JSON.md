@@ -32,6 +32,11 @@ field names with their lengths, so a key holding `\u0000` arrives whole where a 
 Interface's field names stop at the NUL; `am.read_json_table` restores such nested names on the pyarrow
 table. `am.read_json` keeps the full top-level names, but a struct column's `to_arrow()` goes through the
 C Data Interface and its nested names stop at the NUL (`test_key_holding_nul_keeps_its_full_name`).
+The same holds going in and for errors: `am_json_read_named` takes the explicit schema's field names with
+their lengths, which `am.read_json` / `am.read_json_table` always pass, so a schema field named `"a\x00b"`
+matches the key `"a\u0000b"` (the `nul_in_*schema*` explicit cases); `am_json_last_error` hands out the
+last error with its length, so a message quoting a key or value that holds a NUL arrives whole
+(`test_messages_holding_a_nul_arrive_whole`).
 
 - `Sources/ArrowMetal/JSON/JSONReader.swift` — the public API, the options and the read pipeline.
 - `Sources/ArrowMetal/JSON/JSONColumns.swift` — keys to fields, type inference, the column builders and
@@ -79,7 +84,8 @@ a NUL where a record would start is `The document is empty.` too.
 
 Each record is walked by one thread with an explicit container stack (1024 levels). The walk checks the
 whole grammar as RapidJSON — the parser inside pyarrow — checks it: literals, the number grammar
-including `NaN`, `Inf` and `Infinity`, RapidJSON's "Number too big to be stored in double" rule for
+including `NaN`, `Inf` and `Infinity` (which end the number: a `.` or `e` after one is the
+missing-comma error, as in RapidJSON; the `special_*` probes), RapidJSON's "Number too big to be stored in double" rule for
 positive exponents, string escapes, `\u` surrogate pairs, control characters in strings, and every
 structural position. Errors carry RapidJSON's texts. For every immediate child of the record it emits an
 entry: the key span, the value span and a kind (null, false, true, integer that fits int64, other
@@ -172,6 +178,8 @@ readers and compared: the schema, the values and the nulls, or the error text.
 | only whitespace or newlines | zero rows, zero columns |
 | `{}` rows | rows with no columns (`read_json_table` keeps the row count) |
 | a UTF-8 BOM at the start | skipped |
+| part of one at the start (`EF BB`, `EF BF`, `BB BF`, `EF`, `BB` or `BF`) | skipped as pyarrow skips it: each byte of `EF BB BF` present, in order; `EF` alone reads as zero rows (the `bom_*` probes) |
+| a BOM after whitespace, two BOMs, `EF BB BB`, `EF EF` | `JSON parse error: Invalid value. in row 0` |
 | `\r\n`, `\r`, tabs, spaces between records | whitespace |
 | `{"a":1e309}` | `... Number too big to be stored in double. in row 0` |
 | `{"a":1.7976931348623157e309}`, `{"a":10e308}` | `inf` |
@@ -273,7 +281,8 @@ PYTHONPATH=python python Benchmarks/json_bench.py --rows 1000000 --readers arrow
   walk's key spans, value spans, kinds and flags; RapidJSON's error texts; conflicts and repeated keys;
   timestamps against a day-counting reference and the edges of `timestamp[ns]`; explicit schemas,
   explicit `null`; nested structs and lists; nested conflicts ahead of a column's own; NUL bytes; the
-  sign of `-NaN`; keys holding `\u0000`; random flat files against Foundation's `JSONSerialization`; a
+  sign of `-NaN`; `NaN` / `Inf` / `Infinity` ending the number; partial byte order marks at the start;
+  keys holding `\u0000`; random flat files against Foundation's `JSONSerialization`; a
   400-field file; files on disk and bytes in memory.
 
 ```

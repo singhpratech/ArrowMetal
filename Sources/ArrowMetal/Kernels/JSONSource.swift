@@ -259,7 +259,7 @@ enum JSONSource {
                          thread uint& flags) {
         bool minus = false;
         if (p < end && s[p] == 0x2D) { minus = true; p++; }
-        uint i32 = 0u; ulong i64 = 0ul; bool use64 = false, useDouble = false, special = false;
+        uint i32 = 0u; ulong i64 = 0ul; bool use64 = false, useDouble = false;
         int sig = 0;
         uchar c = (p < end) ? s[p] : (uchar)0;
         if (c == 0x30) { p++; }
@@ -291,7 +291,10 @@ enum JSONSource {
                 } }
             }
             if (!ok) { err = E_VALUE; return p; }
-            special = true;
+            // RapidJSON ends the number right after NaN / Inf / Infinity: a following '.' or 'e'
+            // is not part of it, so the caller reports the missing comma or closing bracket.
+            kind = K_FLOAT; flags |= F_SPECIAL;
+            return p;
         } else { err = E_VALUE; return p; }
 
         if (use64) {
@@ -306,7 +309,7 @@ enum JSONSource {
         }
         if (useDouble) { while (p < end && j_digit(s[p])) p++; }
 
-        bool isFloat = special;
+        bool isFloat = false;
         long expFrac = 0;
         if (p < end && s[p] == 0x2E) {
             p++;
@@ -355,7 +358,6 @@ enum JSONSource {
         if (useDouble) fits = false;
         else if (use64) fits = minus ? (i64 <= 0x8000000000000000ul) : (i64 <= 0x7FFFFFFFFFFFFFFFul);
         kind = (isFloat || !fits) ? K_FLOAT : K_INT;
-        if (special) flags |= F_SPECIAL;
         return p;
     }
 

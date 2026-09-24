@@ -236,7 +236,10 @@ public final class JSONReader: @unchecked Sendable {
         let ctx = context
         let n = byteCount
         let host = source.typed(UInt8.self)
-        let start = (n >= 3 && host[0] == 0xEF && host[1] == 0xBB && host[2] == 0xBF) ? 3 : 0
+        // pyarrow 25.0.1 skips each byte of the UTF-8 BOM (EF BB BF) that is present at the start, in
+        // order, so a partial mark (EF BB, EF BF, BB BF or any one of the three) is skipped as well.
+        var start = 0
+        for b: UInt8 in [0xEF, 0xBB, 0xBF] where start < n && host[start] == b { start += 1 }
 
         // Stage 1: where the records are.
         let recs = try JSONKernels.records(ctx, source, n: n, start: start)
