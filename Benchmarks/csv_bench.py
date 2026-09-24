@@ -16,7 +16,7 @@ row, so the structure scan has quotes to track. Readers, all producing typed col
     polars              polars.read_csv
     pandas_pyarrow      pandas.read_csv(engine="pyarrow")
     pandas_c            pandas.read_csv (the default C engine)
-    duckdb              duckdb read_csv(...), materialised as a pyarrow.Table (to_arrow_table)
+    duckdb              duckdb.read_csv(path).to_arrow_table(), DuckDB's relational API
 
 Each reader is warmed once, then timed `--repeat` times; the median, min and max wall times are
 written with the machine, row count and file size. Three lanes build on the same GPU while this
@@ -89,7 +89,7 @@ def readers(path):
         pass
     try:
         import duckdb
-        out["duckdb"] = lambda: duckdb.connect().execute("SELECT * FROM read_csv(?)", [path]).to_arrow_table()
+        out["duckdb"] = lambda: duckdb.read_csv(path).to_arrow_table()
     except ImportError:
         pass
     return out
