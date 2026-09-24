@@ -4473,3 +4473,27 @@ def write_parquet(data, path, compression="snappy", use_dictionary=True, row_gro
 from . import stream                                                       # noqa: E402
 from .stream import (Stream, GroupedStream, JoinedStream, JoinedGroupedStream,  # noqa: E402,F401
                      scan_ipc, scan_arrow, scan_table)
+
+
+# ---------------------------------------------------------------------------------------------------
+# Polars engine, tier 4 of docs/POLARS.md (python/arrowmetal/polars_engine.py), imported lazily.
+#
+# `lf.collect(engine=am.MetalEngine())` runs the parts of a Polars lazy plan that ArrowMetal can run
+# on the GPU and leaves the rest to Polars; `engine.last_report` says which ran where. Like the other
+# Polars tiers it is loaded on first touch, so `import arrowmetal` still never imports Polars.
+# ---------------------------------------------------------------------------------------------------
+_POLARS_ENGINE_EXPORTS = ("MetalEngine", "MetalPlanReport", "polars_engine")
+
+
+def _polars_engine_getattr(name):
+    if name not in _POLARS_ENGINE_EXPORTS:
+        raise AttributeError(name)
+    import importlib
+    mod = importlib.import_module(__name__ + ".polars_engine")
+    globals()["polars_engine"] = mod
+    globals()["MetalEngine"] = mod.MetalEngine
+    globals()["MetalPlanReport"] = mod.MetalPlanReport
+    return globals()[name]
+
+
+_LAZY_HOOKS.append((_polars_engine_getattr, lambda: list(_POLARS_ENGINE_EXPORTS)))
