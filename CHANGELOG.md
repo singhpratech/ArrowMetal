@@ -162,6 +162,18 @@ Temporal, timezones and the rest of the type matrix
   malformed rather than read with the surplus ignored; a field is classified by its type before it is
   judged for having children, so an unsupported type is named for what it is; and dictionary
   materialisation no longer reads every `DictionaryBatch` in the source on the first batch read.
+- The IPC reader reads the view types: `utf8_view` and `binary_view` materialise to the utf8 / binary
+  layout in a CPU pass sharded over the cores, `list_view` and `large_list_view` to a list (child used as
+  it is when the rows are in order, gathered with `take` otherwise). The writer writes their classic
+  counterparts.
+- The IPC reader reads big-endian sources, byte swapping every buffer by element width (decimal limbs
+  reordered, interval parts and view headers swapped one by one); fixtures are Arrow's 1.0.0 big-endian
+  integration files. The writer stays little-endian.
+- The IPC reader keeps field `custom_metadata` on its schema and returns `arrow.fixed_shape_tensor` columns
+  as `.extended`, round-tripping with pyarrow's FixedShapeTensorArray (`ArrowFixedShapeTensorType`); tensor
+  metadata whose shape product overflows is a malformed-data error. Columns naming any other extension type
+  read as their storage, as before. IPC Tensor and SparseTensor messages are refused with an error that
+  names them.
 
 Arrow function coverage
 - `arrowmetal.functions`: a registry with one entry per Arrow v25 compute function name — all 307, the
@@ -224,6 +236,25 @@ Integrations
   functions; its answers are checked against DuckDB's by the 11 `@extension` tests in
   `python/tests/test_duckdb.py`, which run once `duckdb-extension/build.sh` has built it, and it is not
   yet a speedup (2048-row vectors).
+- DuckDB rewrite extension (docs/DUCKDB.md §4b): `duckdb-extension/src/arrowmetal_rewrite.cpp`, a C++
+  optimizer extension for DuckDB 1.5.5 (the C extension API has no optimizer hook; the duckdb Python
+  module exports the C++ symbols a `CPP` extension needs), built by `duckdb-extension/build_rewrite.sh`.
+  It replaces an eligible aggregate of unchanged SQL - `sum`/`avg` over integers, `min`/`max` over
+  integers, `DATE` and `TIMESTAMP`, `count`, with no key or one integer, `DATE`, `TIMESTAMP` or `VARCHAR`
+  key, over a table or Parquet scan - with `ARROWMETAL_AGGREGATE`: a parallel sink into pooled,
+  page-aligned slabs imported into ArrowMetal once, then a fused aggregate, a fused dense group-by or the
+  hash group-by, with ungrouped and narrow-key plans streamed to the GPU in blocks while DuckDB scans.
+  Answers are DuckDB's exactly (`HUGEINT` sums through 32-bit halves, `avg` with DuckDB's own finalizer
+  arithmetic, NULL groups, empty inputs), checked by `python/tests/test_duckdb_rewrite.py` with the
+  rewrite off and forced. `SET arrowmetal_rewrite = 'auto'` rewrites only at or above the router's
+  crossover and the shape class's measured floor (`Benchmarks/duckdb_rewrite_bench.py`, provisional
+  results in `Benchmarks/results/duckdb_rewrite_2026-09-23_provisional.csv`); `'off'` and `'force'`
+  too; `arrowmetal_rewrites()` and `EXPLAIN` show what happened. Python: `am.duckdb_connect()`,
+  `am.duckdb_rewrites(con)`, `am.duckdb_is_rewritten(con, sql)`. In `auto` an ungrouped query is
+  rewritten only with three or more of `sum`/`min`/`max`/`avg`, from 50M rows; a `GROUP BY` with no
+  aggregates is rewritten like any other group-by. Where DuckDB would have run the group-by as its
+  `PERFECT_HASH_GROUP_BY`, a key past the table its planning-time statistics sized (a prepared statement
+  run after out-of-range keys were inserted) raises DuckDB's own error, as it does with the rewrite off.
 - pandas (docs/PANDAS.md): an `.am` accessor on Series/DataFrame, and an opt-in accel mode that patches a
   documented set of pandas methods, routes to the GPU only when dtype, size and arguments qualify, and
   restores the originals exactly on `uninstall()`.

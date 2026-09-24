@@ -4696,3 +4696,26 @@ def read_csv_table(path, **kwargs):
 from . import stream                                                       # noqa: E402
 from .stream import (Stream, GroupedStream, JoinedStream, JoinedGroupedStream,  # noqa: E402,F401
                      scan_ipc, scan_arrow, scan_table)
+
+
+# ---------------------------------------------------------------------------------------------------
+# DuckDB rewrite extension (docs/DUCKDB.md §4b): ordinary SQL with ArrowMetal underneath.
+#
+# `am.duckdb_connect()` opens a DuckDB connection with duckdb-extension's optimizer extension loaded,
+# so eligible aggregates of unchanged SQL run on the GPU; `am.duckdb_is_rewritten(con, sql)` and
+# `am.duckdb_rewrites(con)` say what it decided. They live in duckdb_bridge.py and load lazily, like
+# the rest of the DuckDB bridge, so `import arrowmetal` still never needs duckdb.
+# ---------------------------------------------------------------------------------------------------
+_DUCKDB_REWRITE_EXPORTS = ("duckdb_connect", "duckdb_rewrites", "duckdb_is_rewritten")
+
+
+def _duckdb_rewrite_getattr(name):
+    if name in _DUCKDB_REWRITE_EXPORTS:
+        import importlib
+        attr = getattr(importlib.import_module(".duckdb_bridge", __name__), name)
+        globals()[name] = attr
+        return attr
+    raise AttributeError(name)
+
+
+_LAZY_HOOKS.append((_duckdb_rewrite_getattr, lambda: list(_DUCKDB_REWRITE_EXPORTS)))
