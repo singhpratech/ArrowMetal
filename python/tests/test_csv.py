@@ -130,7 +130,10 @@ CASES = [
     ("float_double_sign", "a\n+-1\n"),
     ("float_infin", "a\ninfin\n"),
     ("float_long_mantissa", "a\n0.1000000000000000055511151231257827021181583404541015625\n"
-                            "123456789012345678901234567890\n9007199254740993\n"),
+                            "123456789012345678901234567890\n9007199254740993\n"
+                            # past 19 digits and on a rounding boundary: decided on the CPU
+                            "9007199254740993.0000000000000000001\n9007199254740993.00000000000000000000\n"
+                            '"9007199254740993".0000000000000000001\n'),
     ("float_boundaries", "a\n2.2250738585072011e-308\n4.9406564584124654e-324\n2.4703282292062327e-324\n"
                          "2.4703282292062328e-324\n1.7976931348623157e308\n1.7976931348623158e308\n"
                          "1.7976931348623159e308\n"),
@@ -270,7 +273,8 @@ OPTION_CASES = [
      dict(convert_options=C(column_types={"a": pa.uint64()}))),
     ("types_int_bad", "a,b\n1,x\n", dict(convert_options=C(column_types={"b": pa.int64()}))),
     ("types_int32_float", "a,b\n1,2\n3,4.5\n", dict(convert_options=C(column_types={"b": pa.int32()}))),
-    ("types_float32", "a\n0.1\n3.4028235677973366e38\n1e-46\n", dict(convert_options=C(column_types={"a": pa.float32()}))),
+    ("types_float32", "a\n0.1\n3.4028235677973366e38\n1e-46\n16777217.00000000000000000001\n",
+     dict(convert_options=C(column_types={"a": pa.float32()}))),
     ("types_bool_bad", "a\nyes\n", dict(convert_options=C(column_types={"a": pa.bool_()}))),
     ("types_date_bad", "a\nx\n", dict(convert_options=C(column_types={"a": pa.date32()}))),
     ("types_null_bad", "a\n1\n", dict(convert_options=C(column_types={"a": pa.null()}))),

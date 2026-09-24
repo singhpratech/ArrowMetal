@@ -251,6 +251,19 @@ final class CSVReaderTests: XCTestCase {
         XCTAssertEqual(m.columns.map { $0.arrowFormat }, ["l", "n"])
     }
 
+    /// Values the GPU float parser hands to the CPU (more than 19 significant digits on a rounding
+    /// boundary), in a column converted by the all-columns pass and in one with a complex field (text
+    /// after a closing quote), which is converted by its own kernel.
+    func testFloatValuesDecidedOnTheCPU() throws {
+        let hard = "9007199254740993.0000000000000000001"
+        let arr = try MetalStringArray([hard])
+        XCTAssertEqual(try arr.parseFloatGPUCounting(Double.self).hostRows, 1, "the premise: the GPU defers this one")
+        let b = try read("a,b\n\(hard),\"9007199254740993\".0000000000000000001\n1.5,2.5\n")
+        XCTAssertEqual(b.columns[0].asFloat64?.toArray(), [Double(hard)!, 1.5])
+        XCTAssertEqual(b.columns[1].asFloat64?.toArray(), [Double(hard)!, 2.5])
+        XCTAssertEqual(Double(hard), 9007199254740994)
+    }
+
     func testFloatColumnMatchesCorrectlyRoundedParse() throws {
         var rng = CSVFloatParseTests.SplitMix64(state: 7)
         let values = CSVFloatParseTests.decimals(&rng, count: 5000)
