@@ -204,7 +204,8 @@ public final class JSONReader: @unchecked Sendable {
         try self.init(bytes: Array(string.utf8), context: context)
     }
 
-    private static func checkSize(_ size: Int) throws {
+    /// Byte positions are 32-bit on the GPU.
+    static func checkSize(_ size: Int) throws {
         guard size < Int(UInt32.max) - 4096 else {
             throw JSONError.unsupported("JSON input of \(size) bytes: inputs of 4 GiB or more are not supported yet")
         }
@@ -260,7 +261,7 @@ public final class JSONReader: @unchecked Sendable {
         let firstParse = builder.parseErrors.min(by: { $0.position < $1.position })
         if let e = firstParse, syntax == nil || e.position < syntax!.position { throw JSONError.parse(e.message) }
         if let s = syntax { throw JSONError.parse(s.message) }
-        if let c = builder.conversionErrors.first { throw JSONError.conversion(c) }
+        if let c = builder.conversionErrors.min(by: { $0.position < $1.position }) { throw JSONError.conversion(c.message) }
         return JSONTable(names: names, columns: columns, rowCount: rows)
     }
 }

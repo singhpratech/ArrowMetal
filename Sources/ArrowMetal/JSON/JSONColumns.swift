@@ -20,7 +20,7 @@ final class JSONColumnBuilder {
     let host: UnsafePointer<UInt8>
     let behavior: JSONUnexpectedFieldBehavior
     var parseErrors: [(position: Int, message: String)] = []
-    var conversionErrors: [String] = []
+    var conversionErrors: [(position: Int, message: String)] = []
 
     /// Slot-matrix budget per group of fields; wider tables are processed in groups.
     static let matrixBudgetBytes = 512 << 20
@@ -352,7 +352,8 @@ final class JSONColumnBuilder {
                     continue
                 }
                 if case .timestamp = type, t.fails[j].count > 0, let r = t.fails[j].first {
-                    conversionErrors.append("Failed to convert JSON to \(type), couldn't parse:\(s[r] ?? "")")
+                    conversionErrors.append((Int(set.level.entry(set.entryIndex(j, r)).valStart),
+                                             "Failed to convert JSON to \(type), couldn't parse:\(s[r] ?? "")"))
                 }
                 let arr = MetalArray<Int64>(length: rows, nullCount: s.nullCount, validity: s.validity,
                                             values: t.values.view(byteOffset: j * rows * 8, byteCount: Swift.max(rows * 8, 8)),
@@ -375,14 +376,16 @@ final class JSONColumnBuilder {
         let parsed = try text.parse(T.self)
         let vp = parsed.values.mutableTyped(T.self)
         if !T.isFloatingPoint, parsed.nullCount > v.nulls.reduce(0, +) {
-            // The first value that did not convert, in column order, for pyarrow's message.
+            // Each column's first value that did not convert, with its position in the file; the reader
+            // reports the earliest, in pyarrow's words.
             let pv = parsed.validity?.typed(UInt8.self)
             let vv = v.validity.typed(UInt8.self)
-            search: for j in 0..<cols {
+            for j in 0..<cols {
                 for r in 0..<rows where Bitmap.isSet(vv + j * v.wordsPerColumn * 4, r) {
                     if let pv, !Bitmap.isSet(pv, j * rows + r) {
-                        conversionErrors.append("Failed to convert JSON to \(type), couldn't parse:\(text[j * rows + r] ?? "")")
-                        break search
+                        conversionErrors.append((Int(set.level.entry(set.entryIndex(j, r)).valStart),
+                                                 "Failed to convert JSON to \(type), couldn't parse:\(text[j * rows + r] ?? "")"))
+                        break
                     }
                 }
             }

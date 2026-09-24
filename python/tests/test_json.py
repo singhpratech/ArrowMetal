@@ -608,6 +608,32 @@ def test_explicit_types_outside_the_supported_set_are_rejected(typ):
         am.read_json_table(b'{"a":"1"}\n', explicit_schema=pa.schema([("a", typ)]))
 
 
+@pytest.mark.parametrize("typ", [pa.decimal128(10, 2), pa.binary(), pa.large_string()])
+def test_pyarrow_converts_to_types_this_reader_rejects(typ):
+    # The documented difference: pyarrow reads these explicit types; ArrowMetal rejects them.
+    data = b'{"a":"1"}\n'
+    assert pj.read_json(io.BytesIO(data), parse_options=S(("a", typ))).num_rows == 1
+    with pytest.raises(am.ArrowMetalError):
+        am.read_json_table(data, explicit_schema=pa.schema([("a", typ)]))
+
+
+def test_conversion_error_names_the_first_failing_value():
+    # With several explicit-schema values failing, ArrowMetal names the one earliest in the file;
+    # pyarrow names one of them, which one depending on its conversion order.
+    data = b'{"a":1.5,"b":2.5}\n'
+    po = S(("b", pa.int8()), ("a", pa.int8()))
+    with pytest.raises(am.ArrowMetalError) as e:
+        am.read_json_table(data, parse_options=po)
+    assert str(e.value) == "Failed to convert JSON to int8, couldn't parse:1.5"
+    with pytest.raises(am.ArrowMetalError) as e:
+        am.read_json_table(b'{"a":1,"t":"x"}\n{"a":2.5}\n', parse_options=S(("a", pa.int8()), ("t", pa.timestamp("s"))))
+    assert str(e.value) == "Failed to convert JSON to timestamp[s], couldn't parse:x"
+    with pytest.raises(pa.ArrowInvalid) as p:
+        pj.read_json(io.BytesIO(data), parse_options=po)
+    assert str(p.value) in ("Failed to convert JSON to int8, couldn't parse:1.5",
+                            "Failed to convert JSON to int8, couldn't parse:2.5")
+
+
 def test_missing_file():
     with pytest.raises(am.ArrowMetalError, match="cannot open"):
         am.read_json("/nonexistent/file.jsonl")
@@ -707,9 +733,12 @@ def test_nesting_deeper_than_pyarrows_import_limit():
 
 
 def test_nesting_limit():
+    # Past 1024 levels the read stops with an error; pyarrow's process does not survive 2000 levels.
     data = ('{"a":' + "[" * 1100 + "]" * 1100 + '}\n').encode()
     with pytest.raises(am.ArrowMetalError, match="Nesting deeper than 1024 levels"):
         am.read_json(data)
+    rc, _ = run_pyarrow_in_subprocess(('{"a":' + "[" * 2000 + "]" * 2000 + '}\n').encode())
+    assert rc != 0
 
 
 def test_invalid_utf8_passes_through_as_pyarrow_does():

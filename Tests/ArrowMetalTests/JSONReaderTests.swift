@@ -364,6 +364,13 @@ final class JSONReaderTests: XCTestCase {
         }
     }
 
+    func testInputsOf4GiBAreRejected() throws {
+        XCTAssertNoThrow(try JSONReader.checkSize(Int(UInt32.max) - 4097))
+        XCTAssertThrowsError(try JSONReader.checkSize(Int(UInt32.max))) {
+            XCTAssertTrue("\($0)".contains("4 GiB or more are not supported"))
+        }
+    }
+
     func testReadsFilesAndRejectsEmptyOnes() throws {
         try requireRealGPU()
         let dir = FileManager.default.temporaryDirectory
