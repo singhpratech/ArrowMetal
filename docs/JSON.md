@@ -217,14 +217,15 @@ Each has a test of its own in `python/tests/test_json.py` that checks the differ
 
 `Benchmarks/json_bench.py` reads the same generated event-log file with `am.read_json`,
 `am.read_json_table`, `pyarrow.json.read_json`, `polars.read_ndjson`, `pandas.read_json(lines=True)` and
-DuckDB's `read_json`, at 1 M and 10 M rows (`--nested` adds a struct and a list per record), after
-checking ArrowMetal's table against pyarrow's. The first results,
-`Benchmarks/results/json_bench_2026-09-23_provisional.csv`, are a smoke run taken while other work shared
-the GPU and the cores; the published numbers will come from a quiet rerun.
+DuckDB's `read_json` (each producing an in-memory table), at 1 M and 10 M rows, in a flat shape and a
+nested one that adds a struct and a list per record, after checking ArrowMetal's table against
+pyarrow's. The first results, `Benchmarks/results/json_bench_2026-09-23_provisional.csv`, are a smoke
+run taken while other work shared the GPU and the cores; the published numbers will come from a quiet
+rerun.
 
 ```
-PYTHONPATH=python python Benchmarks/json_bench.py --rows 1000000,10000000
-PYTHONPATH=python python Benchmarks/json_bench.py --rows 1000000 --nested
+PYTHONPATH=python python Benchmarks/json_bench.py --rows 1000000,10000000 --shapes flat,nested
+PYTHONPATH=python python Benchmarks/json_bench.py --rows 1000000 --readers arrowmetal,pyarrow,polars
 ```
 
 ## Tests

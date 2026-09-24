@@ -2,12 +2,14 @@
 """Reads a newline-delimited JSON file with ArrowMetal (GPU), pyarrow, Polars, pandas and DuckDB.
 
     PYTHONPATH=python python Benchmarks/json_bench.py [--rows 1000000,10000000] [--repeat 3]
+                                                      [--shapes flat,nested] [--readers arrowmetal,...]
                                                       [--dir /tmp/arrowmetal-json-bench] [--keep]
                                                       [--out Benchmarks/results/json_bench_<date>.csv]
 
 The fixture is seven fields per record -- an int64 id, a short string, a double, a boolean, an
 ISO-8601 timestamp string, an int64 with 10% nulls and a key that is missing from 5% of the records --
-which is roughly the shape of an event log. `--nested` adds a struct and a list per record.
+which is roughly the shape of an event log (`flat`). The `nested` shape adds a struct of two doubles
+and a list of zero to three strings to every record.
 
 Every reader produces a table in memory:
 
@@ -16,7 +18,7 @@ Every reader produces a table in memory:
     pyarrow            pyarrow.json.read_json (all cores)
     polars             polars.read_ndjson
     pandas             pandas.read_json(lines=True)
-    duckdb             SELECT * FROM read_json(path, format='newline_delimited') fetched as Arrow
+    duckdb             SELECT * FROM read_json(path, format='newline_delimited') as a pyarrow.Table
 
 Reported per reader and size: the median and the minimum wall time over --repeat runs (after one
 warm-up run), the process CPU time of the median run, and file megabytes per second at the median.
@@ -88,7 +90,11 @@ def readers():
         pass
     try:
         import duckdb
-        rs["duckdb"] = lambda p: duckdb.sql("SELECT * FROM read_json('%s', format='newline_delimited')" % p).arrow()
+        def duck(p):
+            # .arrow() hands back a lazy RecordBatchReader; materialise the table like the others.
+            rel = duckdb.sql("SELECT * FROM read_json('%s', format='newline_delimited')" % p)
+            return rel.to_arrow_table() if hasattr(rel, "to_arrow_table") else rel.fetch_arrow_table()
+        rs["duckdb"] = duck
     except ImportError:
         pass
     return rs
@@ -116,7 +122,7 @@ def main():
     ap.add_argument("--repeat", type=int, default=3)
     ap.add_argument("--dir", default=os.path.join(os.sep, "tmp", "arrowmetal-json-bench"))
     ap.add_argument("--keep", action="store_true", help="keep the generated files")
-    ap.add_argument("--nested", action="store_true", help="add a struct and a list to every record")
+    ap.add_argument("--shapes", default="flat", help="comma-separated: flat, nested")
     ap.add_argument("--readers", default="", help="comma-separated subset of readers to run")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "results",
                                                   "json_bench_%s.csv" % datetime.date.today().isoformat()))
@@ -139,17 +145,18 @@ def main():
     print(header)
     rows_out = []
     try:
-        for rows in [int(r) for r in args.rows.split(",")]:
-            path = os.path.join(args.dir, "events_%d%s.jsonl" % (rows, "_nested" if args.nested else ""))
+        for shape, rows in [(sh, int(r)) for sh in args.shapes.split(",") for r in args.rows.split(",")]:
+            nested = shape == "nested"
+            path = os.path.join(args.dir, "events_%d_%s.jsonl" % (rows, shape))
             if not os.path.exists(path):
-                build(path, rows, args.nested)
+                build(path, rows, nested)
             size = os.path.getsize(path)
             got = am.read_json_table(path)
             want = pj.read_json(path, read_options=pj.ReadOptions(use_threads=False))
             if not got.equals(want):
                 raise SystemExit("arrowmetal and pyarrow disagree on %s" % path)
             del got, want
-            print("%d rows, %.1f MB" % (rows, size / 1e6))
+            print("%s, %d rows, %.1f MB" % (shape, rows, size / 1e6))
             for name, fn in rs.items():
                 try:
                     med, best, cpu = measure(fn, path, args.repeat)
@@ -160,7 +167,7 @@ def main():
                 mbs = size / 1e6 / (med / 1e3) if med == med else float("nan")
                 print("  %-17s median %9.1f ms  min %9.1f ms  cpu %9.1f ms  %8.1f MB/s %s" % (name, med, best, cpu, mbs, note))
                 rows_out.append([rows, size, name, "%.2f" % med, "%.2f" % best, "%.2f" % cpu, "%.1f" % mbs,
-                                 args.repeat, "nested" if args.nested else "flat", note])
+                                 args.repeat, shape, note])
     finally:
         if not args.keep:
             shutil.rmtree(args.dir, ignore_errors=True)
