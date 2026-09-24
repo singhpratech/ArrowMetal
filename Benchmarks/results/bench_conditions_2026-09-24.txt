@@ -1,0 +1,36 @@
+## csv 2026-09-24T22:23:02Z loadavg { 2.99 2.50 2.53 } fileproviderd 0.0
+pandas_c           rows=10000000  median   4174.9 ms  (min 4148.6, max 4186.9)     206 MB/s
+duckdb             rows=10000000  median    261.1 ms  (min 259.0, max 265.1)    3290 MB/s
+wrote Benchmarks/results/csv_bench_2026-09-24.csv
+exit=0 csv
+## json 2026-09-24T22:23:47Z loadavg { 3.68 2.70 2.60 } fileproviderd 0.0
+  pandas            median   17557.5 ms  min   17134.7 ms  cpu   17510.9 ms      92.6 MB/s 
+  duckdb            median     320.6 ms  min     320.6 ms  cpu    3931.7 ms    5070.1 MB/s 
+wrote Benchmarks/results/json_bench_2026-09-24.csv
+exit=0 json
+## parquet 2026-09-24T22:40:20Z loadavg { 6.10 3.78 3.03 } fileproviderd 24.3
+ 10000000  all           polars      wall    130.31 ms  cpu   1269.84 ms
+ 10000000  all           duckdb      wall   1576.07 ms  cpu   1605.00 ms
+wrote Benchmarks/results/parquet_nested_2026-09-24.csv
+exit=0 parquet
+## lake 2026-09-24T22:41:12Z loadavg { 4.21 3.64 3.02 } fileproviderd 0.0
+iceberg  filtered  polars                125399 rows  median      7.72 ms  min      7.55 ms
+iceberg  filtered  duckdb                125399 rows  median      7.39 ms  min      7.21 ms
+wrote Benchmarks/results/lakehouse_2026-09-24.csv
+exit=0 lake
+## ipc 2026-09-24T22:41:52Z loadavg { 3.51 3.51 3.00 } fileproviderd 0.0
+list_view_int64_in_order     pyarrow_read_all                  16.99 ms
+list_view_int64_shuffled     arrowmetal_scan_ipc               51.11 ms
+list_view_int64_shuffled     pyarrow_read_all                  17.48 ms
+exit=0 ipc
+## duckdb 2026-09-24T22:41:54Z loadavg { 4.59 3.73 3.08 } fileproviderd 1.0
+50,000,000 100k INTEGER keys alone (no aggregates)              duckdb    48.68 ms  rewrite     8.21 ms  x 5.93  auto=rewritten  fused dense group-by
+50,000,000 ~1M wide BIGINT keys alone (no aggregates)           duckdb   101.40 ms  rewrite    41.85 ms  x 2.42  auto=rewritten  hash group-by
+wrote Benchmarks/results/duckdb_rewrite_2026-09-24.csv
+exit=0 duckdb
+## polars 2026-09-24T22:42:22Z loadavg { 4.71 3.87 3.15 } fileproviderd 0.0
+  (r) unique over (region, sub), keep first    MetalEngine default, cold     174.39 ms   1999.9 CPU-ms  x0.99 vs fastest Polars; taken: nothing
+
+wrote Benchmarks/results/polars_engine_bench_2026-09-24.csv
+exit=0 polars
+## done 2026-09-24T22:44:53Z loadavg { 13.74 7.66 4.78 } fileproviderd 7.8

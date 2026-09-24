@@ -1,0 +1,182 @@
+# ArrowMetal 0.1.0 on Apple M4 Max, polars 1.44.1 (16 threads), pyarrow 25.0.1, best of 5
+rows,case,engine,wall_ms,cpu_ms,taken,fallbacks,equal_to_polars,vs_fastest_polars
+2000000,(a) filtered sum + count,polars in-memory,0.584,1.1,,,,
+2000000,(a) filtered sum + count,polars streaming,0.263,1.6,,,,
+2000000,(a) filtered sum + count,"MetalEngine all, cold",1.389,1.4,Select#3[Select>SimpleProjection>Filter>DataFrameScan],,True,0.19
+2000000,(a) filtered sum + count,"MetalEngine all, warm",0.769,0.8,Select#3[Select>SimpleProjection>Filter>DataFrameScan],,True,0.34
+2000000,(a) filtered sum + count,"MetalEngine default, cold",0.678,3.2,,,True,0.39
+2000000,(b) filter + group-by 200 keys + sort desc + limit 10,polars in-memory,3.683,38.2,,,,
+2000000,(b) filter + group-by 200 keys + sort desc + limit 10,polars streaming,1.663,14.3,,,,
+2000000,(b) filter + group-by 200 keys + sort desc + limit 10,"MetalEngine all, cold",4.873,4.1,Sort#4[Sort>Filter>GroupBy>Filter>DataFrameScan],,True,0.34
+2000000,(b) filter + group-by 200 keys + sort desc + limit 10,"MetalEngine all, warm",4.421,3.6,Sort#4[Sort>Filter>GroupBy>Filter>DataFrameScan],,True,0.38
+2000000,(b) filter + group-by 200 keys + sort desc + limit 10,"MetalEngine default, cold",3.882,41.0,,,True,0.43
+2000000,"(c) group-by (region, sub) mean + max",polars in-memory,7.653,79.9,,,,
+2000000,"(c) group-by (region, sub) mean + max",polars streaming,5.538,62.7,,,,
+2000000,"(c) group-by (region, sub) mean + max","MetalEngine all, cold",4.208,4.0,GroupBy#1[GroupBy>DataFrameScan],,True,1.32
+2000000,"(c) group-by (region, sub) mean + max","MetalEngine all, warm",3.390,3.1,GroupBy#1[GroupBy>DataFrameScan],,True,1.63
+2000000,"(c) group-by (region, sub) mean + max","MetalEngine default, cold",7.267,79.4,,,True,0.76
+2000000,(d) projection chain then filter,polars in-memory,6.170,6.2,,,,
+2000000,(d) projection chain then filter,polars streaming,0.757,7.6,,,,
+2000000,(d) projection chain then filter,"MetalEngine all, cold",2.948,1.5,Filter#2[Filter>Select>HStack>DataFrameScan],,True,0.26
+2000000,(d) projection chain then filter,"MetalEngine all, warm",2.293,0.9,Filter#2[Filter>Select>HStack>DataFrameScan],,True,0.33
+2000000,(d) projection chain then filter,"MetalEngine default, cold",6.303,6.4,,,True,0.12
+2000000,(e) inner join then sum,polars in-memory,7.053,58.6,,,,
+2000000,(e) inner join then sum,polars streaming,4.814,54.6,,,,
+2000000,(e) inner join then sum,"MetalEngine all, cold",2.540,1.7,Select#3[Select>SimpleProjection>Join>DataFrameScan>DataFrameScan],,True,1.90
+2000000,(e) inner join then sum,"MetalEngine all, warm",1.897,1.1,Select#3[Select>SimpleProjection>Join>DataFrameScan>DataFrameScan],,True,2.54
+2000000,(e) inner join then sum,"MetalEngine default, cold",7.007,57.8,,,True,0.69
+2000000,(f) semi join,polars in-memory,1.034,14.2,,,,
+2000000,(f) semi join,polars streaming,0.677,6.4,,,,
+2000000,(f) semi join,"MetalEngine all, cold",3.011,1.7,Join#2[Join>DataFrameScan>DataFrameScan],,True,0.22
+2000000,(f) semi join,"MetalEngine all, warm",1.163,1.2,Join#2[Join>DataFrameScan>DataFrameScan],,True,0.58
+2000000,(f) semi join,"MetalEngine default, cold",0.976,12.9,,,True,0.69
+2000000,(g) row_number over partitions,polars in-memory,14.770,111.3,,,,
+2000000,(g) row_number over partitions,polars streaming,80.325,187.9,,,,
+2000000,(g) row_number over partitions,"MetalEngine all, cold",14.708,113.0,,HStack#1: expression Window has no ArrowMetal translation,True,1.00
+2000000,(g) row_number over partitions,"MetalEngine all, warm",15.231,114.0,,HStack#1: expression Window has no ArrowMetal translation,True,0.97
+2000000,(g) row_number over partitions,"MetalEngine default, cold",15.139,115.7,,,True,0.98
+2000000,(h) as-of join,polars in-memory,7.116,10.5,,,,
+2000000,(h) as-of join,polars streaming,1.203,9.5,,,,
+2000000,(h) as-of join,"MetalEngine all, cold",7.069,9.4,,"Join#2: AsOf join (inner, left, semi and anti are taken)",True,0.17
+2000000,(h) as-of join,"MetalEngine all, warm",6.947,10.6,,"Join#2: AsOf join (inner, left, semi and anti are taken)",True,0.17
+2000000,(h) as-of join,"MetalEngine default, cold",7.039,11.5,,,True,0.17
+2000000,"(i) group-by 1 key, 100 000 groups, sum",polars in-memory,4.699,61.7,,,,
+2000000,"(i) group-by 1 key, 100 000 groups, sum",polars streaming,2.933,31.4,,,,
+2000000,"(i) group-by 1 key, 100 000 groups, sum","MetalEngine all, cold",3.961,3.0,GroupBy#1[GroupBy>DataFrameScan],,True,0.74
+2000000,"(i) group-by 1 key, 100 000 groups, sum","MetalEngine all, warm",2.897,2.4,GroupBy#1[GroupBy>DataFrameScan],,True,1.01
+2000000,"(i) group-by 1 key, 100 000 groups, sum","MetalEngine default, cold",5.113,62.5,,,True,0.57
+2000000,"(j) group-by (k1, k2), sum + count",polars in-memory,15.656,181.8,,,,
+2000000,"(j) group-by (k1, k2), sum + count",polars streaming,7.891,87.5,,,,
+2000000,"(j) group-by (k1, k2), sum + count","MetalEngine all, cold",15.514,12.8,GroupBy#1[GroupBy>DataFrameScan],,True,0.51
+2000000,"(j) group-by (k1, k2), sum + count","MetalEngine all, warm",14.919,12.0,GroupBy#1[GroupBy>DataFrameScan],,True,0.53
+2000000,"(j) group-by (k1, k2), sum + count","MetalEngine default, cold",15.025,187.9,,,True,0.53
+2000000,"(k) group-by (String, int32), sum",polars in-memory,15.157,175.6,,,,
+2000000,"(k) group-by (String, int32), sum",polars streaming,8.217,88.8,,,,
+2000000,"(k) group-by (String, int32), sum","MetalEngine all, cold",22.496,18.7,GroupBy#1[GroupBy>DataFrameScan],,True,0.37
+2000000,"(k) group-by (String, int32), sum","MetalEngine all, warm",21.568,17.6,GroupBy#1[GroupBy>DataFrameScan],,True,0.38
+2000000,"(k) group-by (String, int32), sum","MetalEngine default, cold",15.554,177.9,,,True,0.53
+2000000,"(l) group-by (region, sub), Float64 sum + mean",polars in-memory,8.461,92.3,,,,
+2000000,"(l) group-by (region, sub), Float64 sum + mean",polars streaming,5.556,64.7,,,,
+2000000,"(l) group-by (region, sub), Float64 sum + mean","MetalEngine all, cold",3.835,4.1,GroupBy#2[GroupBy>HStack>DataFrameScan],,True,1.45
+2000000,"(l) group-by (region, sub), Float64 sum + mean","MetalEngine all, warm",3.275,3.4,GroupBy#2[GroupBy>HStack>DataFrameScan],,True,1.70
+2000000,"(l) group-by (region, sub), Float64 sum + mean","MetalEngine default, cold",8.509,88.1,,,True,0.65
+2000000,(m) sort 3 columns by an int64 key,polars in-memory,12.554,146.1,,,,
+2000000,(m) sort 3 columns by an int64 key,polars streaming,13.739,148.6,,,,
+2000000,(m) sort 3 columns by an int64 key,"MetalEngine all, cold",2.486,2.0,Sort#2[Sort>DataFrameScan],,True,5.05
+2000000,(m) sort 3 columns by an int64 key,"MetalEngine all, warm",1.716,1.2,Sort#2[Sort>DataFrameScan],,True,7.31
+2000000,(m) sort 3 columns by an int64 key,"MetalEngine default, cold",2.415,1.9,Sort#2,,True,5.20
+2000000,"(n) top 100 by Float64, descending",polars in-memory,14.398,14.6,,,,
+2000000,"(n) top 100 by Float64, descending",polars streaming,1.535,12.9,,,,
+2000000,"(n) top 100 by Float64, descending","MetalEngine all, cold",3.915,2.4,Sort#3[Sort>Filter>DataFrameScan],,True,0.39
+2000000,"(n) top 100 by Float64, descending","MetalEngine all, warm",3.233,1.8,Sort#3[Sort>Filter>DataFrameScan],,True,0.47
+2000000,"(n) top 100 by Float64, descending","MetalEngine default, cold",14.492,14.7,,,True,0.11
+2000000,"(o) sort with a String column, by an int64 key",polars in-memory,12.770,143.0,,,,
+2000000,"(o) sort with a String column, by an int64 key",polars streaming,15.681,148.0,,,,
+2000000,"(o) sort with a String column, by an int64 key","MetalEngine all, cold",17.187,15.9,Sort#2[Sort>DataFrameScan],,True,0.74
+2000000,"(o) sort with a String column, by an int64 key","MetalEngine all, warm",16.921,15.1,Sort#2[Sort>DataFrameScan],,True,0.75
+2000000,"(o) sort with a String column, by an int64 key","MetalEngine default, cold",13.250,138.0,,,True,0.96
+2000000,"(p) filter, then sort by (int32 asc, nullable Float64 desc)",polars in-memory,21.847,234.0,,,,
+2000000,"(p) filter, then sort by (int32 asc, nullable Float64 desc)",polars streaming,23.452,247.2,,,,
+2000000,"(p) filter, then sort by (int32 asc, nullable Float64 desc)","MetalEngine all, cold",23.864,21.1,Sort#3[Sort>HStack>Filter>DataFrameScan],,True,0.92
+2000000,"(p) filter, then sort by (int32 asc, nullable Float64 desc)","MetalEngine all, warm",22.163,19.2,Sort#3[Sort>HStack>Filter>DataFrameScan],,True,0.99
+2000000,"(p) filter, then sort by (int32 asc, nullable Float64 desc)","MetalEngine default, cold",22.676,249.4,,,True,0.96
+2000000,"(q) filter, then sort by (int32 asc, int64 desc)",polars in-memory,14.389,150.6,,,,
+2000000,"(q) filter, then sort by (int32 asc, int64 desc)",polars streaming,14.307,149.9,,,,
+2000000,"(q) filter, then sort by (int32 asc, int64 desc)","MetalEngine all, cold",3.985,3.3,Sort#3[Sort>Filter>DataFrameScan],,True,3.59
+2000000,"(q) filter, then sort by (int32 asc, int64 desc)","MetalEngine all, warm",2.992,2.3,Sort#3[Sort>Filter>DataFrameScan],,True,4.78
+2000000,"(q) filter, then sort by (int32 asc, int64 desc)","MetalEngine default, cold",3.819,3.2,Sort#3,,True,3.75
+2000000,"(r) unique over (region, sub), keep first",polars in-memory,6.046,53.8,,,,
+2000000,"(r) unique over (region, sub), keep first",polars streaming,7.405,87.1,,,,
+2000000,"(r) unique over (region, sub), keep first","MetalEngine all, cold",3.781,3.8,Distinct#1[Distinct>DataFrameScan],,True,1.60
+2000000,"(r) unique over (region, sub), keep first","MetalEngine all, warm",2.912,2.8,Distinct#1[Distinct>DataFrameScan],,True,2.08
+2000000,"(r) unique over (region, sub), keep first","MetalEngine default, cold",6.165,55.0,,,True,0.98
+50000000,(a) filtered sum + count,polars in-memory,15.666,25.2,,,,
+50000000,(a) filtered sum + count,polars streaming,2.957,43.1,,,,
+50000000,(a) filtered sum + count,"MetalEngine all, cold",17.739,15.1,Select#3[Select>SimpleProjection>Filter>DataFrameScan],,True,0.17
+50000000,(a) filtered sum + count,"MetalEngine all, warm",2.330,0.8,Select#3[Select>SimpleProjection>Filter>DataFrameScan],,True,1.27
+50000000,(a) filtered sum + count,"MetalEngine default, cold",15.851,25.5,,,True,0.19
+50000000,(b) filter + group-by 200 keys + sort desc + limit 10,polars in-memory,28.982,169.9,,,,
+50000000,(b) filter + group-by 200 keys + sort desc + limit 10,polars streaming,11.604,161.8,,,,
+50000000,(b) filter + group-by 200 keys + sort desc + limit 10,"MetalEngine all, cold",20.010,11.7,Sort#4[Sort>Filter>GroupBy>Filter>DataFrameScan],,True,0.58
+50000000,(b) filter + group-by 200 keys + sort desc + limit 10,"MetalEngine all, warm",12.281,3.9,Sort#4[Sort>Filter>GroupBy>Filter>DataFrameScan],,True,0.94
+50000000,(b) filter + group-by 200 keys + sort desc + limit 10,"MetalEngine default, cold",29.647,169.9,,,True,0.39
+50000000,"(c) group-by (region, sub) mean + max",polars in-memory,188.072,2469.5,,,,
+50000000,"(c) group-by (region, sub) mean + max",polars streaming,104.195,1478.2,,,,
+50000000,"(c) group-by (region, sub) mean + max","MetalEngine all, cold",60.723,18.6,GroupBy#1[GroupBy>DataFrameScan],,True,1.72
+50000000,"(c) group-by (region, sub) mean + max","MetalEngine all, warm",46.108,4.1,GroupBy#1[GroupBy>DataFrameScan],,True,2.26
+50000000,"(c) group-by (region, sub) mean + max","MetalEngine default, cold",189.411,2421.7,,,True,0.55
+50000000,(d) projection chain then filter,polars in-memory,152.502,152.6,,,,
+50000000,(d) projection chain then filter,polars streaming,14.566,215.2,,,,
+50000000,(d) projection chain then filter,"MetalEngine all, cold",46.930,15.4,Filter#2[Filter>Select>HStack>DataFrameScan],,True,0.31
+50000000,(d) projection chain then filter,"MetalEngine all, warm",32.454,1.0,Filter#2[Filter>Select>HStack>DataFrameScan],,True,0.45
+50000000,(d) projection chain then filter,"MetalEngine default, cold",153.239,153.3,,,True,0.10
+50000000,(e) inner join then sum,polars in-memory,23.228,215.1,,,,
+50000000,(e) inner join then sum,polars streaming,16.736,222.1,,,,
+50000000,(e) inner join then sum,"MetalEngine all, cold",8.917,3.6,Select#3[Select>SimpleProjection>Join>DataFrameScan>DataFrameScan],,True,1.88
+50000000,(e) inner join then sum,"MetalEngine all, warm",6.417,1.2,Select#3[Select>SimpleProjection>Join>DataFrameScan>DataFrameScan],,True,2.61
+50000000,(e) inner join then sum,"MetalEngine default, cold",22.457,213.6,,,True,0.75
+50000000,(f) semi join,polars in-memory,3.106,28.6,,,,
+50000000,(f) semi join,polars streaming,2.481,31.7,,,,
+50000000,(f) semi join,"MetalEngine all, cold",6.002,3.9,Join#2[Join>DataFrameScan>DataFrameScan],,True,0.41
+50000000,(f) semi join,"MetalEngine all, warm",3.497,1.4,Join#2[Join>DataFrameScan>DataFrameScan],,True,0.71
+50000000,(f) semi join,"MetalEngine default, cold",2.890,30.6,,,True,0.86
+50000000,(g) row_number over partitions,polars in-memory,95.680,632.7,,,,
+50000000,(g) row_number over partitions,polars streaming,327.507,1985.9,,,,
+50000000,(g) row_number over partitions,"MetalEngine all, cold",99.427,663.6,,HStack#1: expression Window has no ArrowMetal translation,True,0.96
+50000000,(g) row_number over partitions,"MetalEngine all, warm",93.369,619.4,,HStack#1: expression Window has no ArrowMetal translation,True,1.02
+50000000,(g) row_number over partitions,"MetalEngine default, cold",93.614,623.2,,,True,1.02
+50000000,(h) as-of join,polars in-memory,151.741,151.9,,,,
+50000000,(h) as-of join,polars streaming,9.577,133.8,,,,
+50000000,(h) as-of join,"MetalEngine all, cold",151.668,151.8,,"Join#2: AsOf join (inner, left, semi and anti are taken)",True,0.06
+50000000,(h) as-of join,"MetalEngine all, warm",152.431,152.6,,"Join#2: AsOf join (inner, left, semi and anti are taken)",True,0.06
+50000000,(h) as-of join,"MetalEngine default, cold",152.100,152.2,,,True,0.06
+50000000,"(i) group-by 1 key, 100 000 groups, sum",polars in-memory,91.879,1324.3,,,,
+50000000,"(i) group-by 1 key, 100 000 groups, sum",polars streaming,46.797,624.6,,,,
+50000000,"(i) group-by 1 key, 100 000 groups, sum","MetalEngine all, cold",24.153,14.1,GroupBy#1[GroupBy>DataFrameScan],,True,1.94
+50000000,"(i) group-by 1 key, 100 000 groups, sum","MetalEngine all, warm",12.798,2.9,GroupBy#1[GroupBy>DataFrameScan],,True,3.66
+50000000,"(i) group-by 1 key, 100 000 groups, sum","MetalEngine default, cold",88.403,1321.5,,,True,0.53
+50000000,"(j) group-by (k1, k2), sum + count",polars in-memory,679.062,7917.9,,,,
+50000000,"(j) group-by (k1, k2), sum + count",polars streaming,402.887,5943.5,,,,
+50000000,"(j) group-by (k1, k2), sum + count","MetalEngine all, cold",470.564,133.6,GroupBy#1[GroupBy>DataFrameScan],,True,0.86
+50000000,"(j) group-by (k1, k2), sum + count","MetalEngine all, warm",450.231,115.3,GroupBy#1[GroupBy>DataFrameScan],,True,0.89
+50000000,"(j) group-by (k1, k2), sum + count","MetalEngine default, cold",619.487,7241.7,,,True,0.65
+50000000,"(k) group-by (String, int32), sum",polars in-memory,378.219,5308.1,,,,
+50000000,"(k) group-by (String, int32), sum",polars streaming,169.589,2538.4,,,,
+50000000,"(k) group-by (String, int32), sum","MetalEngine all, cold",257.613,218.4,GroupBy#1[GroupBy>DataFrameScan],,True,0.66
+50000000,"(k) group-by (String, int32), sum","MetalEngine all, warm",239.890,203.0,GroupBy#1[GroupBy>DataFrameScan],,True,0.71
+50000000,"(k) group-by (String, int32), sum","MetalEngine default, cold",375.043,5295.4,,,True,0.45
+50000000,"(l) group-by (region, sub), Float64 sum + mean",polars in-memory,211.292,2516.5,,,,
+50000000,"(l) group-by (region, sub), Float64 sum + mean",polars streaming,114.188,1558.0,,,,
+50000000,"(l) group-by (region, sub), Float64 sum + mean","MetalEngine all, cold",55.618,15.9,GroupBy#2[GroupBy>HStack>DataFrameScan],,True,2.05
+50000000,"(l) group-by (region, sub), Float64 sum + mean","MetalEngine all, warm",43.872,4.3,GroupBy#2[GroupBy>HStack>DataFrameScan],,True,2.60
+50000000,"(l) group-by (region, sub), Float64 sum + mean","MetalEngine default, cold",212.575,2508.6,,,True,0.54
+50000000,(m) sort 3 columns by an int64 key,polars in-memory,381.045,4660.4,,,,
+50000000,(m) sort 3 columns by an int64 key,polars streaming,439.331,4827.4,,,,
+50000000,(m) sort 3 columns by an int64 key,"MetalEngine all, cold",80.553,33.1,Sort#2[Sort>DataFrameScan],,True,4.73
+50000000,(m) sort 3 columns by an int64 key,"MetalEngine all, warm",59.921,13.0,Sort#2[Sort>DataFrameScan],,True,6.36
+50000000,(m) sort 3 columns by an int64 key,"MetalEngine default, cold",78.402,30.0,Sort#2,,True,4.86
+50000000,"(n) top 100 by Float64, descending",polars in-memory,412.728,413.0,,,,
+50000000,"(n) top 100 by Float64, descending",polars streaming,18.145,197.6,,,,
+50000000,"(n) top 100 by Float64, descending","MetalEngine all, cold",101.777,21.5,Sort#3[Sort>Filter>DataFrameScan],,True,0.18
+50000000,"(n) top 100 by Float64, descending","MetalEngine all, warm",82.414,2.0,Sort#3[Sort>Filter>DataFrameScan],,True,0.22
+50000000,"(n) top 100 by Float64, descending","MetalEngine default, cold",412.909,413.2,,,True,0.04
+50000000,"(o) sort with a String column, by an int64 key",polars in-memory,392.496,4700.8,,,,
+50000000,"(o) sort with a String column, by an int64 key",polars streaming,478.600,4871.3,,,,
+50000000,"(o) sort with a String column, by an int64 key","MetalEngine all, cold",443.455,363.8,Sort#2[Sort>DataFrameScan],,True,0.89
+50000000,"(o) sort with a String column, by an int64 key","MetalEngine all, warm",434.022,365.0,Sort#2[Sort>DataFrameScan],,True,0.90
+50000000,"(o) sort with a String column, by an int64 key","MetalEngine default, cold",404.802,4710.3,,,True,0.97
+50000000,"(p) filter, then sort by (int32 asc, nullable Float64 desc)",polars in-memory,984.526,12034.6,,,,
+50000000,"(p) filter, then sort by (int32 asc, nullable Float64 desc)",polars streaming,1056.563,12595.7,,,,
+50000000,"(p) filter, then sort by (int32 asc, nullable Float64 desc)","MetalEngine all, cold",594.790,391.0,Sort#3[Sort>HStack>Filter>DataFrameScan],,True,1.66
+50000000,"(p) filter, then sort by (int32 asc, nullable Float64 desc)","MetalEngine all, warm",567.141,371.8,Sort#3[Sort>HStack>Filter>DataFrameScan],,True,1.74
+50000000,"(p) filter, then sort by (int32 asc, nullable Float64 desc)","MetalEngine default, cold",1021.139,12104.3,,,True,0.96
+50000000,"(q) filter, then sort by (int32 asc, int64 desc)",polars in-memory,753.264,8749.9,,,,
+50000000,"(q) filter, then sort by (int32 asc, int64 desc)",polars streaming,753.144,8954.6,,,,
+50000000,"(q) filter, then sort by (int32 asc, int64 desc)","MetalEngine all, cold",116.936,35.4,Sort#3[Sort>Filter>DataFrameScan],,True,6.44
+50000000,"(q) filter, then sort by (int32 asc, int64 desc)","MetalEngine all, warm",92.551,11.5,Sort#3[Sort>Filter>DataFrameScan],,True,8.14
+50000000,"(q) filter, then sort by (int32 asc, int64 desc)","MetalEngine default, cold",118.658,36.5,Sort#3,,True,6.35
+50000000,"(r) unique over (region, sub), keep first",polars in-memory,172.969,2095.6,,,,
+50000000,"(r) unique over (region, sub), keep first",polars streaming,178.768,2507.7,,,,
+50000000,"(r) unique over (region, sub), keep first","MetalEngine all, cold",31.339,24.6,Distinct#1[Distinct>DataFrameScan],,True,5.52
+50000000,"(r) unique over (region, sub), keep first","MetalEngine all, warm",8.910,3.1,Distinct#1[Distinct>DataFrameScan],,True,19.41
+50000000,"(r) unique over (region, sub), keep first","MetalEngine default, cold",174.387,1999.9,,,True,0.99

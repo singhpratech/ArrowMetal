@@ -1,0 +1,11 @@
+layout,rows,file_mb,reader,best_ms,iters
+string,10000000,245.0,arrowmetal_scan_ipc,15.76,5
+string,10000000,245.0,pyarrow_read_all,11.51,5
+string_view,10000000,365.0,arrowmetal_scan_ipc,17.51,5
+string_view,10000000,365.0,pyarrow_read_all,16.82,5
+list_int64,10000000,320.0,arrowmetal_scan_ipc,20.51,5
+list_int64,10000000,320.0,pyarrow_read_all,15.12,5
+list_view_int64_in_order,10000000,360.0,arrowmetal_scan_ipc,30.0,5
+list_view_int64_in_order,10000000,360.0,pyarrow_read_all,16.99,5
+list_view_int64_shuffled,10000000,360.0,arrowmetal_scan_ipc,51.11,5
+list_view_int64_shuffled,10000000,360.0,pyarrow_read_all,17.48,5
