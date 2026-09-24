@@ -483,6 +483,29 @@ def test_forced_type_error_after_the_sample(tmp_csv):
     check(tmp_csv("a\n" + "\n".join(rows) + "\n"), convert_options=C(column_types={"a": pa.int64()}))
 
 
+def test_quoted_newline_across_pyarrow_blocks(tmp_csv):
+    """ArrowMetal parses quoted newlines anywhere, as pyarrow does with newlines_in_values=True.
+    pyarrow's default (False) raises when a quoted newline straddles one of its blocks."""
+    data = "a,b\n1," + "y" * 52 + '\n2,"p\nq"\n3,r\n'
+    path = tmp_csv(data)
+    ro = R(block_size=64)
+    with pytest.raises(pa.ArrowInvalid, match="Expected 2 columns"):
+        pc.read_csv(path, read_options=ro)
+    exp = pc.read_csv(path, read_options=ro, parse_options=P(newlines_in_values=True))
+    assert_tables_equal(am.read_csv_table(path), exp)
+    assert exp.column("b").to_pylist() == ["y" * 52, "p\nq", "r"]
+
+
+def test_default_spellings_follow_pyarrow(tmp_csv):
+    """The default null, true and false spellings are pyarrow's, read from pyarrow itself."""
+    co = C()
+    lines = co.null_values + [" " + v for v in co.null_values if v] + ["1"]
+    check(tmp_csv("a\n" + "\n".join(lines) + "\n"))
+    lines = co.true_values + co.false_values
+    check(tmp_csv("a\n" + "\n".join(lines) + "\n"))
+    check(tmp_csv("a\n" + "\n".join(lines + ["2"]) + "\n"))
+
+
 def test_file_access_map(tmp_csv):
     rng = random.Random(5)
     for seed in range(5):

@@ -144,10 +144,13 @@ final class CSVReaderTests: XCTestCase {
             let bytes = Self.randomCSV(&rng, rows: rows, cols: cols)
             let expected = Self.referenceParse(bytes)
             let path = try write(bytes, "r\(trial).csv")
-            for block in [1, 2, 3, 5, 16, 64, 257, 1024] {
+            let runs: [(Int, CSVReadOptions.FileAccess)] = [1, 2, 3, 5, 16, 64, 257, 1024].map { ($0, .read) }
+                + [(3, .map), (1024, .map)]
+            for (block, access) in runs {
                 var o = CSVReadOptions()
                 o.autogenerateColumnNames = true
                 o.scanBlockBytes = block
+                o.fileAccess = access
                 o.columnTypes = Dictionary(uniqueKeysWithValues: (0..<cols).map { ("f\($0)", CSVColumnType.binary) })
                 let batch = try CSVReader.read(path: path, options: o)
                 XCTAssertEqual(batch.columnCount, cols, "trial \(trial) block \(block)")
@@ -257,6 +260,19 @@ final class CSVReaderTests: XCTestCase {
         for (i, s) in values.enumerated() {
             XCTAssertEqual(col[i]?.bitPattern, Double(s)?.bitPattern, s)
         }
+    }
+
+    /// The reader's integer grammar is Arrow's CSV one, not the grammar of Arrow's `cast` that
+    /// `MetalStringArray.parse` implements: the cast takes `+3` and rejects spaces and hex, the CSV
+    /// reader rejects `+` (the column becomes float64) and takes spaces and `0x`.
+    func testIntegerGrammarIsTheCSVOneNotTheCasts() throws {
+        let cast = try MetalStringArray(["+3", " 1", "0x1F"]).parse(Int64.self).toArray()
+        XCTAssertEqual(cast, [3, nil, nil])
+        let b = try read("a,b,c\n+3, 1,0x1F\n")
+        XCTAssertEqual(b.columns.map { $0.arrowFormat }, ["g", "l", "l"])
+        XCTAssertEqual(b.columns[0].asFloat64?.toArray(), [3.0])
+        XCTAssertEqual(b.columns[1].asInt64?.toArray(), [1])
+        XCTAssertEqual(b.columns[2].asInt64?.toArray(), [31])
     }
 
     func testSkipRowsAndNames() throws {

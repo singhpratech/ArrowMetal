@@ -193,6 +193,18 @@ Parquet on the GPU
   the host. Row-group and column selection, nested lists; a small host-side writer for round trips.
   `am.read_parquet(path)` in Python, `ParquetReader` in Swift.
 
+CSV on the GPU
+- A CSV reader that parses on the GPU (docs/CSV.md): a quote-aware structure scan (the RFC 4180 parser as
+  a state table, run per block from every start state and prefix-composed), pyarrow's type inference
+  (null, int64, bool, date32, time32, timestamp with and without a zone, float64, string, binary) from a
+  sample and checked on every row while converting, and one row-major kernel converting every column.
+  Options follow pyarrow's ReadOptions / ParseOptions / ConvertOptions. `CSVReader` in Swift,
+  `am_csv_open` / `am_csv_read` in C, `am.read_csv` / `am.read_csv_table` in Python; differential-tested
+  against `pyarrow.csv.read_csv`.
+- `MetalStringArray.parse(Double.self)` / `parse(Float.self)` run on the GPU (Eisel-Lemire in integer
+  arithmetic), bit-identical to the Swift initialisers they replace, which still parse the rows the GPU
+  cannot decide exactly.
+
 Out-of-core streaming
 - A streaming executor for datasets larger than memory (docs/STREAMING.md): Arrow IPC files/directories
   (parallel readers with readahead and backpressure) or any Arrow C Stream flow through the GPU one

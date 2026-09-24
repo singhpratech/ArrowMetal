@@ -378,6 +378,7 @@ Arrow type matrix and the interop status.
   Interface import, C Device Data Interface import/export, `MTLBuffer` recovery from our own exports.
 - `ArrowIPCReader` / `ArrowIPCWriter`: the Arrow IPC streaming and file formats, including a minimal
   FlatBuffers reader and builder, with no dependencies. Cross-checked against pyarrow in both directions.
+- `CSVReader` / `am.read_csv`: CSV parsed and typed on the GPU with pyarrow's rules, tested against `pyarrow.csv.read_csv` ([docs/CSV.md](docs/CSV.md)).
 - A CPU reference implementation behind the kernels, used as the oracle in tests.
 
 ## Design notes
