@@ -57,14 +57,18 @@ enum ArrowIPCStorage: Equatable {
     case bits
     /// Variable width: validity bitmap + offsets + data. `large` selects 64-bit offsets.
     case varBinary(large: Bool)
+    /// `utf8_view` / `binary_view`: validity bitmap + 16-byte views, then as many variadic data buffers as
+    /// the record batch's `variadicBufferCounts` gives this field (not counted here).
+    case view
     /// A layout whose values live in child field nodes (list, struct, map, union, run-end encoded) or in
     /// no buffer at all (`null`). `buffers` counts only the field's own buffers, its children aside.
     case nested(buffers: Int)
 
-    /// Number of Arrow buffers a field of this storage contributes to a record batch, its children aside.
+    /// Number of Arrow buffers a field of this storage contributes to a record batch, its children aside
+    /// (and, for a view field, its variadic data buffers aside).
     var bufferCount: Int {
         switch self {
-        case .fixedWidth, .bits: return 2
+        case .fixedWidth, .bits, .view: return 2
         case .varBinary: return 3
         case .nested(let n): return n
         }
@@ -119,6 +123,16 @@ public enum ArrowIPCType: Equatable, Sendable, CustomStringConvertible {
     indirect case union(mode: ArrowIPCUnionMode, typeIDs: [Int32], children: [ArrowIPCField])
     /// `run_end_encoded`: no buffers, a `run_ends` child and a `values` child.
     indirect case runEndEncoded(runEnds: ArrowIPCField, values: ArrowIPCField)
+    /// `utf8_view` (`string_view`): 16-byte views over inline bytes or variadic data buffers. Read only:
+    /// the reader materialises it to the `utf8` layout, and the writer writes `utf8`.
+    case utf8View
+    /// `binary_view`: the same layout, bytes uninterpreted. Read as, and written as, `binary`.
+    case binaryView
+    /// `list_view`: validity + int32 offsets + int32 sizes over one child. Read as, and written as, `list`.
+    indirect case listView(ArrowIPCField)
+    /// `large_list_view`: the same with 64-bit offsets and sizes. Read as a list (offsets narrowed, as
+    /// `large_list`'s are); an explicit schema that names it writes `large_list`.
+    indirect case largeListView(ArrowIPCField)
 
     public var description: String {
         switch self {
@@ -151,13 +165,40 @@ public enum ArrowIPCType: Equatable, Sendable, CustomStringConvertible {
         case .union(let mode, _, let fs):
             return "\(mode)_union<\(fs.map { "\($0.name): \($0.type)" }.joined(separator: ", "))>"
         case .runEndEncoded(let r, let v): return "run_end_encoded<\(r.type), \(v.type)>"
+        case .utf8View: return "string_view"
+        case .binaryView: return "binary_view"
+        case .listView(let f): return "list_view<\(f.name): \(f.type)>"
+        case .largeListView(let f): return "large_list_view<\(f.name): \(f.type)>"
+        }
+    }
+
+    /// The type the writer writes for this one: every view type becomes its classic counterparts
+    /// (`utf8_view` to `utf8`, `binary_view` to `binary`, `list_view` to `list`, `large_list_view` to
+    /// `large_list`), children included. Every other type is its own classic type.
+    public var classic: ArrowIPCType {
+        func c(_ f: ArrowIPCField) -> ArrowIPCField { f.classic }
+        switch self {
+        case .utf8View: return .utf8
+        case .binaryView: return .binary
+        case .listView(let f): return .list(c(f))
+        case .largeListView(let f): return .largeList(c(f))
+        case .list(let f): return .list(c(f))
+        case .largeList(let f): return .largeList(c(f))
+        case .fixedSizeList(let f, let n): return .fixedSizeList(c(f), size: n)
+        case .structure(let fs): return .structure(fs.map(c))
+        case .map(let e, let sorted): return .map(entries: c(e), keysSorted: sorted)
+        case .union(let mode, let ids, let fs): return .union(mode: mode, typeIDs: ids, children: fs.map(c))
+        case .runEndEncoded(let r, let v): return .runEndEncoded(runEnds: c(r), values: c(v))
+        case .dictionary(let i, let v): return .dictionary(index: i, value: v.classic)
+        default: return self
         }
     }
 
     /// The child fields the schema carries for this type, in the order Arrow writes them.
     var children: [ArrowIPCField] {
         switch self {
-        case .list(let f), .largeList(let f), .fixedSizeList(let f, _), .map(let f, _): return [f]
+        case .list(let f), .largeList(let f), .fixedSizeList(let f, _), .map(let f, _),
+             .listView(let f), .largeListView(let f): return [f]
         case .structure(let fs), .union(_, _, let fs): return fs
         case .runEndEncoded(let r, let v): return [r, v]
         // A dictionary field carries the value type's children; the index type has none.
@@ -173,6 +214,10 @@ public enum ArrowIPCType: Equatable, Sendable, CustomStringConvertible {
         case .date64, .time64, .timestamp, .duration: return .int(bits: 64, signed: true)
         case .binary: return .utf8
         case .largeBinary: return .largeUtf8
+        // The view types are materialised to the classic layouts on read.
+        case .utf8View, .binaryView: return .utf8
+        case .listView(let f): return .list(f)
+        case .largeListView(let f): return .largeList(f)
         // The record batch carries the codes; the values ride in a dictionary batch.
         case .dictionary(let index, _): return index.physicalType
         default: return self
@@ -201,6 +246,9 @@ public enum ArrowIPCType: Equatable, Sendable, CustomStringConvertible {
         case .union(let mode, _, _): return .nested(buffers: mode == .dense ? 2 : 1)
         // Neither of these has a buffer of its own.
         case .null, .runEndEncoded: return .nested(buffers: 0)
+        case .utf8View, .binaryView: return .view
+        // Validity, offsets and sizes; the values live in the child field node.
+        case .listView, .largeListView: return .nested(buffers: 3)
         }
     }
 
@@ -250,6 +298,16 @@ public struct ArrowIPCField: Equatable, Sendable {
         self.nullable = nullable
         self.dictionaryID = dictionaryID
         self.metadata = metadata
+    }
+
+    /// `ARROW:extension:name` from the field's metadata, or nil when the field is not an extension type.
+    public var extensionName: String? {
+        metadata.first { $0.key == ArrowSchemaMetadata.extensionNameKey }.map { String(decoding: $0.value, as: UTF8.self) }
+    }
+
+    /// The same field with every view type replaced by its classic counterpart (see `ArrowIPCType.classic`).
+    public var classic: ArrowIPCField {
+        ArrowIPCField(name: name, type: type.classic, nullable: nullable, dictionaryID: dictionaryID, metadata: metadata)
     }
 
     public static func == (a: ArrowIPCField, b: ArrowIPCField) -> Bool {
@@ -305,6 +363,8 @@ struct ArrowIPCScan {
     /// For each record batch, how many dictionary messages precede it. A dictionary applies to the
     /// batches that follow it, which is what lets a stream replace or extend one part way through.
     let dictionariesBefore: [Int]
+    /// Whether the schema declares big-endian buffers (the metadata itself is always little-endian).
+    let bigEndian: Bool
 }
 
 /// Retains the source `Data` for as long as any buffer borrowed from it is alive.
@@ -331,6 +391,9 @@ public final class ArrowIPCReader {
     public let format: ArrowIPCFormat
     /// Number of record batches in the source.
     public var batchCount: Int { messages.count }
+    /// Whether the source's schema declares big-endian buffers. Every buffer is then byte swapped on
+    /// read, by the width of the values it holds, so the batches this reader returns are native.
+    public let isBigEndian: Bool
 
     private let data: Data
     private let holder: ArrowIPCSourceHolder
@@ -374,6 +437,7 @@ public final class ArrowIPCReader {
         self.messages = parsed.messages
         self.dictionaryMessages = parsed.dictionaries
         self.dictionariesBefore = parsed.dictionariesBefore
+        self.isBigEndian = parsed.bigEndian
     }
 
     /// Reads every record batch.
@@ -423,6 +487,7 @@ public final class ArrowIPCReader {
         let footer = try FBBuf(raw, from: footerStart, count: footerLength).root()
         guard let schemaTable = try footer.table(1) else { throw ArrowIPCError.malformed("footer has no schema") }
         let schema = try parseSchema(schemaTable)
+        let bigEndian = try isBigEndian(schemaTable)
         var dictionaries: [ArrowIPCMessageRef] = []
         if let dicts = try footer.vector(2) {
             for i in 0..<dicts.count {
@@ -446,6 +511,10 @@ public final class ArrowIPCReader {
                     throw ArrowIPCError.malformed("record batch block \(i) points at an empty message")
                 }
                 guard msg.headerType == FBMessageHeader.recordBatch.rawValue else {
+                    if msg.headerType == FBMessageHeader.tensor.rawValue
+                        || msg.headerType == FBMessageHeader.sparseTensor.rawValue {
+                        throw tensorMessageError
+                    }
                     throw msg.headerType == FBMessageHeader.dictionaryBatch.rawValue
                         ? ArrowIPCError.unsupported("dictionary batches")
                         : ArrowIPCError.malformed("block \(i) is not a record batch")
@@ -456,12 +525,14 @@ public final class ArrowIPCReader {
         // In the file format every dictionary is in scope for every batch: the footer indexes them all,
         // and the format forbids replacing one, so message order carries no meaning here.
         return ArrowIPCScan(format: .file, schema: schema, messages: messages, dictionaries: dictionaries,
-                            dictionariesBefore: Array(repeating: dictionaries.count, count: messages.count))
+                            dictionariesBefore: Array(repeating: dictionaries.count, count: messages.count),
+                            bigEndian: bigEndian)
     }
 
     private static func scanStream(_ raw: UnsafeRawBufferPointer) throws -> ArrowIPCScan {
         var pos = 0
         var schema: ArrowIPCSchema? = nil
+        var bigEndian = false
         var messages: [ArrowIPCMessageRef] = []
         var dictionaries: [ArrowIPCMessageRef] = []
         var dictionariesBefore: [Int] = []
@@ -473,6 +544,7 @@ public final class ArrowIPCReader {
                 let meta = try FBBuf(raw, from: m.ref.metadataOffset, count: m.ref.metadataLength)
                 guard let table = try meta.root().table(2) else { throw ArrowIPCError.malformed("schema message has no header") }
                 schema = try parseSchema(table)
+                bigEndian = try isBigEndian(table)
             case FBMessageHeader.recordBatch.rawValue:
                 guard schema != nil else { throw ArrowIPCError.malformed("record batch before the schema message") }
                 messages.append(m.ref)
@@ -481,7 +553,7 @@ public final class ArrowIPCReader {
                 guard schema != nil else { throw ArrowIPCError.malformed("dictionary batch before the schema message") }
                 dictionaries.append(m.ref)
             case FBMessageHeader.tensor.rawValue, FBMessageHeader.sparseTensor.rawValue:
-                throw ArrowIPCError.unsupported("tensor messages")
+                throw tensorMessageError
             default:
                 throw ArrowIPCError.malformed("unknown message header type \(m.headerType)")
             }
@@ -489,7 +561,7 @@ public final class ArrowIPCReader {
         }
         guard let schema else { throw ArrowIPCError.notArrowIPC }
         return ArrowIPCScan(format: .stream, schema: schema, messages: messages, dictionaries: dictionaries,
-                            dictionariesBefore: dictionariesBefore)
+                            dictionariesBefore: dictionariesBefore, bigEndian: bigEndian)
     }
 
     /// Decodes one encapsulated message header at `pos`. Returns nil at the end-of-stream marker.
@@ -522,9 +594,24 @@ public final class ArrowIPCReader {
 
     // MARK: schema
 
-    static func parseSchema(_ table: FBTable) throws -> ArrowIPCSchema {
+    /// The error for an IPC `Tensor` or `SparseTensor` message. Those carry an n-dimensional array
+    /// outside any record batch; the tensor that lives in a column is the `arrow.fixed_shape_tensor`
+    /// extension type, which this reader does read.
+    static let tensorMessageError = ArrowIPCError.unsupported(
+        "IPC Tensor and SparseTensor messages are not read; only record batches (and their dictionaries) are. "
+        + "A tensor column stored as the arrow.fixed_shape_tensor extension type is read")
+
+    /// `Schema.endianness`: Little = 0, Big = 1.
+    static func isBigEndian(_ table: FBTable) throws -> Bool {
         let endianness = try table.int16(0)
-        guard endianness == 0 else { throw ArrowIPCError.unsupported("big-endian Arrow data") }
+        guard endianness == 0 || endianness == 1 else {
+            throw ArrowIPCError.malformed("schema endianness \(endianness) is neither Little (0) nor Big (1)")
+        }
+        return endianness == 1
+    }
+
+    static func parseSchema(_ table: FBTable) throws -> ArrowIPCSchema {
+        _ = try isBigEndian(table)
         var fields: [ArrowIPCField] = []
         if let vec = try table.vector(1) {
             fields.reserveCapacity(vec.count)
@@ -552,7 +639,19 @@ public final class ArrowIPCReader {
             for i in 0..<vec.count { children.append(try parseField(vec.table(i))) }
         }
         let valueType = try parseType(kind, type, children: children, column: name)
-        guard let encoding else { return ArrowIPCField(name: name, type: valueType, nullable: nullable) }
+        // custom_metadata: [KeyValue], KeyValue { key: string; value: string }. The value is kept as bytes:
+        // `ARROW:extension:metadata` is a byte blob that need not be UTF-8.
+        var metadata: [(key: String, value: [UInt8])] = []
+        if let vec = try field.vector(6) {
+            metadata.reserveCapacity(vec.count)
+            for i in 0..<vec.count {
+                let kv = try vec.table(i)
+                metadata.append((key: try kv.string(0) ?? "", value: try kv.stringBytes(1) ?? []))
+            }
+        }
+        guard let encoding else {
+            return ArrowIPCField(name: name, type: valueType, nullable: nullable, metadata: metadata)
+        }
         // DictionaryEncoding { id: long; indexType: Int; isOrdered: bool; dictionaryKind: short }
         let id = try encoding.int64(0)
         var index = ArrowIPCType.int(bits: 32, signed: true)
@@ -564,7 +663,7 @@ public final class ArrowIPCReader {
             index = .int(bits: bits, signed: try it.bool(1))
         }
         return ArrowIPCField(name: name, type: .dictionary(index: index, value: valueType),
-                             nullable: nullable, dictionaryID: id)
+                             nullable: nullable, dictionaryID: id, metadata: metadata)
     }
 
     private static func parseType(_ kind: FBTypeKind, _ type: FBTable, children: [ArrowIPCField],
@@ -665,6 +764,10 @@ public final class ArrowIPCReader {
                 throw ArrowIPCError.malformed("run-end encoded column '\(column)' needs run_ends and values children")
             }
             return .runEndEncoded(runEnds: children[0], values: children[1])
+        case .utf8View: return .utf8View
+        case .binaryView: return .binaryView
+        case .listView: return .listView(try item())
+        case .largeListView: return .largeListView(try item())
         default:
             throw ArrowIPCError.unsupported("\(kind.name) columns (column '\(column)')")
         }
@@ -680,6 +783,9 @@ public final class ArrowIPCReader {
         let nodes: [(length: Int, nullCount: Int)]
         let buffers: [ArrowIPCBodyBuffer]
         let codec: ArrowIPCCodec?
+        /// `variadicBufferCounts`: one entry per `utf8_view` / `binary_view` field, in pre-order, giving
+        /// how many data buffers follow that field's views.
+        let variadicCounts: [Int]
     }
 
     private func recordBatchParts(header: FBTable, bodyLength: Int) throws -> RecordBatchParts {
@@ -694,8 +800,16 @@ public final class ArrowIPCReader {
             guard method == 0 else { throw ArrowIPCError.unsupported("body compression method \(method)") }
             codec = c
         }
-        if let variadic = try header.vector(4), variadic.count > 0 {
-            throw ArrowIPCError.unsupported("variadic buffers (view types)")
+        var variadicCounts: [Int] = []
+        if let variadic = try header.vector(4) {
+            variadicCounts.reserveCapacity(variadic.count)
+            for i in 0..<variadic.count {
+                let n = try variadic.int64(i)
+                guard n >= 0, n <= Int64(Int32.max) else {
+                    throw ArrowIPCError.malformed("variadic buffer count \(n) for view field \(i)")
+                }
+                variadicCounts.append(Int(n))
+            }
         }
         let length = Int(try header.int64(0))
         guard length >= 0 else { throw ArrowIPCError.malformed("negative record batch length") }
@@ -723,7 +837,8 @@ public final class ArrowIPCReader {
                 buffers.append(ArrowIPCBodyBuffer(offset: off, length: len))
             }
         }
-        return RecordBatchParts(length: length, nodes: nodes, buffers: buffers, codec: codec)
+        return RecordBatchParts(length: length, nodes: nodes, buffers: buffers, codec: codec,
+                                variadicCounts: variadicCounts)
     }
 
     private func buildBatch(header: FBTable, raw: UnsafeRawBufferPointer, bodyOffset: Int, bodyLength: Int,
@@ -734,8 +849,8 @@ public final class ArrowIPCReader {
         lastBatchWasZeroCopy = false
         borrowedAny = false
         try materialiseDictionaries(upTo: dictionaryCount, raw: raw)
-        let body = try messageBody(parts, raw: raw, bodyOffset: bodyOffset)
-        let cursor = ArrowIPCCursor(nodes: parts.nodes, body: body)
+        let body = try messageBody(parts, raw: raw, bodyOffset: bodyOffset, fields: schema.fields)
+        let cursor = ArrowIPCCursor(nodes: parts.nodes, body: body, variadicCounts: parts.variadicCounts)
         var columns: [AnyMetalArray] = []
         columns.reserveCapacity(schema.fields.count)
         for field in schema.fields {
@@ -756,6 +871,10 @@ public final class ArrowIPCReader {
             throw ArrowIPCError.malformed(
                 "record batch declares \(parts.buffers.count) buffers but the schema uses \(cursor.bufferIndex)")
         }
+        guard cursor.variadicIndex == parts.variadicCounts.count else {
+            throw ArrowIPCError.malformed(
+                "record batch declares \(parts.variadicCounts.count) variadic buffer counts but the schema has \(cursor.variadicIndex) view fields")
+        }
         lastBatchWasZeroCopy = borrowedAny
         return try MetalRecordBatch(names: schema.fields.map(\.name), columns: columns)
     }
@@ -763,13 +882,29 @@ public final class ArrowIPCReader {
     // MARK: message body
 
     /// Wraps a message body, decompressing every buffer first when the message declared a codec.
-    private func messageBody(_ parts: RecordBatchParts, raw: UnsafeRawBufferPointer,
-                             bodyOffset: Int) throws -> ArrowIPCMessageBody {
-        guard let codec = parts.codec else {
-            return ArrowIPCMessageBody(raw: raw, offset: bodyOffset, buffers: parts.buffers, plain: nil)
+    ///
+    /// A big-endian source is copied buffer by buffer into shared memory (after decompression, when there
+    /// is a codec) and byte swapped there, following the pre-order of `fields`: the columns the body holds
+    /// (for a dictionary batch, the dictionary's value field).
+    private func messageBody(_ parts: RecordBatchParts, raw: UnsafeRawBufferPointer, bodyOffset: Int,
+                             fields: [ArrowIPCField]) throws -> ArrowIPCMessageBody {
+        var plain: [MetalArrowBuffer]? = nil
+        if let codec = parts.codec {
+            plain = try decompress(codec, parts.buffers, raw: raw, bodyOffset: bodyOffset)
         }
-        return ArrowIPCMessageBody(raw: raw, offset: bodyOffset, buffers: parts.buffers,
-                                   plain: try decompress(codec, parts.buffers, raw: raw, bodyOffset: bodyOffset))
+        if isBigEndian {
+            let buffers = try plain ?? parts.buffers.map { b in
+                guard b.length > 0, let base = raw.baseAddress else {
+                    return try MetalArrowBuffer.allocate(byteCount: 0, context: context)
+                }
+                return try MetalArrowBuffer.copy(from: base.advanced(by: bodyOffset + b.offset), byteCount: b.length,
+                                                 context: context)
+            }
+            let plan = ArrowIPCByteSwap.plan(fields, variadicCounts: parts.variadicCounts)
+            ArrowIPCByteSwap.apply(plan, to: buffers)
+            plain = buffers
+        }
+        return ArrowIPCMessageBody(raw: raw, offset: bodyOffset, buffers: parts.buffers, plain: plain)
     }
 
     /// Arrow compresses a body one buffer at a time: an 8-byte little-endian uncompressed length, then the
@@ -857,7 +992,27 @@ public final class ArrowIPCReader {
     /// each child's whole subtree after. A dictionary-encoded field is the one exception — the record
     /// batch carries only its codes, and its children (if the value type has any) travel in the
     /// `DictionaryBatch` message instead.
+    ///
+    /// A field whose metadata names an extension type (`ARROW:extension:name`) comes back as
+    /// `.extended`: the storage column built from the buffers, plus the extension name, its metadata and
+    /// the field's other keys, which is what the C Data importer does with the same schema.
     private func buildColumn(field: ArrowIPCField, cursor: ArrowIPCCursor) throws -> AnyMetalArray {
+        let storage = try buildStorageColumn(field: field, cursor: cursor)
+        guard !field.metadata.isEmpty, let extensionName = field.extensionName else { return storage }
+        var other = ArrowSchemaMetadata(field.metadata.map { ArrowSchemaMetadata.Pair(key: $0.key, value: $0.value) })
+        let extensionMetadata = other[ArrowSchemaMetadata.extensionMetadataKey]
+        other[ArrowSchemaMetadata.extensionNameKey] = nil
+        other[ArrowSchemaMetadata.extensionMetadataKey] = nil
+        if extensionName == ArrowFixedShapeTensorType.extensionName {
+            // Checked against its storage, so a tensor column always has the shape it declares.
+            _ = try ArrowFixedShapeTensorType(metadata: extensionMetadata ?? [], storage: storage, column: field.name)
+        }
+        return .extended(MetalExtensionArray(storage: storage, name: extensionName, metadata: extensionMetadata,
+                                             otherMetadata: other))
+    }
+
+    /// The column `field`'s buffers describe, before any extension type is applied.
+    private func buildStorageColumn(field: ArrowIPCField, cursor: ArrowIPCCursor) throws -> AnyMetalArray {
         let name = field.name
         let node = try cursor.node(name)
         let length = node.length
@@ -943,6 +1098,22 @@ public final class ArrowIPCReader {
                                         children: kids, context: context)
             return .union(u)
 
+        case .utf8View, .binaryView:
+            let bitmap = try validity(slots[0])
+            let dataSlots = try cursor.buffers(try cursor.variadicCount(name), name)
+            let a = try materialiseViews(body, views: slots[1], data: dataSlots, length: length, nulls: nulls,
+                                         validity: bitmap, name: name)
+            return field.type == .binaryView ? .binary(markBinary(a)) : .string(a)
+
+        case .listView(let item), .largeListView(let item):
+            var large = false
+            if case .largeListView = field.type { large = true }
+            let bitmap = try validity(slots[0])
+            let child = try buildColumn(field: item, cursor: cursor)
+            return .list(try materialiseListView(body, offsets: slots[1], sizes: slots[2], large: large,
+                                                 length: length, nulls: nulls, validity: bitmap, child: child,
+                                                 fieldName: item.name, name: name))
+
         case .runEndEncoded(let endsField, let valuesField):
             // No buffers of its own: the node carries the logical length, the children everything else.
             let ends = try buildColumn(field: endsField, cursor: cursor)
@@ -1002,6 +1173,156 @@ public final class ArrowIPCReader {
         return out
     }
 
+    // MARK: view types
+
+    /// Materialises a `utf8_view` / `binary_view` column into the offsets-plus-data layout.
+    ///
+    /// A tight CPU pass: one walk over the 16-byte views turns lengths into int32 offsets (checking
+    /// every out-of-line view against the data buffer it names), then one copy per non-empty row moves
+    /// the bytes from the view itself (12 bytes or fewer) or from its data buffer. A null row
+    /// contributes no bytes whatever its view says. The engine has no GPU kernel that reads views.
+    private func materialiseViews(_ body: ArrowIPCMessageBody, views slot: Int, data dataSlots: [Int], length: Int,
+                                  nulls: Int, validity: MetalArrowBuffer?, name: String) throws -> MetalStringArray {
+        let offsets = try MetalArrowBuffer.allocate(byteCount: (length + 1) * 4, zeroed: false, context: context)
+        let o = offsets.mutableTyped(Int32.self)
+        o[0] = 0
+        var total = 0
+        var views: UnsafeRawPointer? = nil
+        var buffers: [(start: UnsafeRawPointer?, count: Int)] = []
+        if length > 0 {
+            let have = byteCount(body, slot)
+            guard have >= length * 16 else {
+                throw ArrowIPCError.malformed("view column '\(name)' holds \(have) bytes of views where \(length * 16) are needed")
+            }
+            let v = try pointer(body, slot)
+            views = v
+            buffers = try dataSlots.map { i in
+                let n = byteCount(body, i)
+                return (n > 0 ? try pointer(body, i) : nil, n)
+            }
+            let valid = validity?.typed(UInt8.self)
+            for i in 0..<length {
+                if let valid, !Bitmap.isSet(valid, i) { o[i + 1] = Int32(total); continue }
+                let at = i * 16
+                let n = Int(v.loadUnaligned(fromByteOffset: at, as: Int32.self))
+                guard n >= 0 else { throw ArrowIPCError.malformed("view \(i) of column '\(name)' has a negative length") }
+                if n > 12 {
+                    let b = Int(v.loadUnaligned(fromByteOffset: at + 8, as: Int32.self))
+                    let off = Int(v.loadUnaligned(fromByteOffset: at + 12, as: Int32.self))
+                    guard b >= 0, b < buffers.count, off >= 0, off + n <= buffers[b].count else {
+                        throw ArrowIPCError.malformed(
+                            "view \(i) of column '\(name)' points at bytes \(off)..<\(off + n) of data buffer \(b), "
+                            + "outside the buffers the batch holds")
+                    }
+                }
+                total += n
+                guard total <= Int(Int32.max) else {
+                    throw ArrowIPCError.unsupported(
+                        "view column '\(name)' over 2 GB: the engine's utf8 and binary arrays have 32-bit offsets")
+                }
+                o[i + 1] = Int32(total)
+            }
+        }
+        let data = try MetalArrowBuffer.allocate(byteCount: total, zeroed: false, context: context)
+        if total > 0, let v = views {
+            let d = data.mutableTyped(UInt8.self)
+            for i in 0..<length {
+                let start = Int(o[i]), n = Int(o[i + 1]) - start
+                guard n > 0 else { continue }
+                let at = i * 16
+                if n <= 12 {
+                    memcpy(d + start, v.advanced(by: at + 4), n)
+                } else {
+                    let b = Int(v.loadUnaligned(fromByteOffset: at + 8, as: Int32.self))
+                    let off = Int(v.loadUnaligned(fromByteOffset: at + 12, as: Int32.self))
+                    memcpy(d + start, buffers[b].start!.advanced(by: off), n)
+                }
+            }
+        }
+        let a = MetalStringArray(length: length, nullCount: 0, validity: validity, offsets: offsets, data: data,
+                                 context: context)
+        if nulls < 0 { a.recomputeNullCount() } else { a.setNullCount(nulls) }
+        return a
+    }
+
+    /// Materialises a `list_view` / `large_list_view` column into the list layout (int32 offsets over a
+    /// child whose rows are consecutive).
+    ///
+    /// One CPU pass over the offsets and sizes checks every row against the child and decides between two
+    /// cases. When the valid, non-empty rows are already consecutive and in order (what a `list` cast to
+    /// `list_view` gives), the offsets are derived and the child is used as it is, with no copy.
+    /// Otherwise the rows are gathered from the child with the engine's `take`, which is a GPU gather
+    /// for primitive and string children. A null row contributes no child elements whatever its size says.
+    private func materialiseListView(_ body: ArrowIPCMessageBody, offsets offsetSlot: Int, sizes sizeSlot: Int,
+                                     large: Bool, length: Int, nulls: Int, validity: MetalArrowBuffer?,
+                                     child: AnyMetalArray, fieldName: String, name: String) throws -> MetalListArray {
+        let width = large ? 8 : 4
+        let out = try MetalArrowBuffer.allocate(byteCount: (length + 1) * 4, zeroed: false, context: context)
+        let o = out.mutableTyped(Int32.self)
+        o[0] = 0
+        var values = child
+        if length > 0 {
+            for (slot, what) in [(offsetSlot, "offsets"), (sizeSlot, "sizes")] where byteCount(body, slot) < length * width {
+                throw ArrowIPCError.malformed("list view column '\(name)' has a short \(what) buffer")
+            }
+            let offs = try pointer(body, offsetSlot), sizes = try pointer(body, sizeSlot)
+            func load(_ p: UnsafeRawPointer, _ i: Int) -> Int64 {
+                large ? p.loadUnaligned(fromByteOffset: i * 8, as: Int64.self)
+                      : Int64(p.loadUnaligned(fromByteOffset: i * 4, as: Int32.self))
+            }
+            let valid = validity?.typed(UInt8.self)
+            var starts = [Int](repeating: 0, count: length)
+            var contiguous = true
+            var next: Int? = nil          // where the next non-empty row must start to keep the child consecutive
+            var base = 0, total = 0
+            for i in 0..<length {
+                var size = 0
+                if valid.map({ Bitmap.isSet($0, i) }) ?? true {
+                    let off64 = load(offs, i), size64 = load(sizes, i)
+                    guard off64 >= 0, size64 >= 0 else {
+                        throw ArrowIPCError.malformed("row \(i) of list view column '\(name)' has a negative offset or size")
+                    }
+                    guard off64 <= Int64(Int32.max), size64 <= Int64(Int32.max) else {
+                        throw ArrowIPCError.unsupported("64-bit offsets over 2 GB (column '\(name)')")
+                    }
+                    let start = Int(off64)
+                    size = Int(size64)
+                    guard start + size <= child.length else {
+                        throw ArrowIPCError.malformed(
+                            "row \(i) of list view column '\(name)' covers child elements \(start)..<\(start + size) "
+                            + "of a \(child.length) element child")
+                    }
+                    starts[i] = start
+                    if size > 0 {
+                        if let n = next { if start != n { contiguous = false } } else { base = start }
+                        next = start + size
+                    }
+                }
+                total += size
+                guard total <= Int(Int32.max) else {
+                    throw ArrowIPCError.unsupported("64-bit offsets over 2 GB (column '\(name)')")
+                }
+                o[i + 1] = Int32(total)
+            }
+            if contiguous {
+                // Every non-empty row starts where the previous one ended: point the offsets into the child.
+                if base > 0 { for i in 0...length { o[i] += Int32(base) } }
+            } else {
+                let indices = try MetalArrowBuffer.allocate(byteCount: Swift.max(total, 1) * 4, zeroed: false,
+                                                            context: context)
+                let p = indices.mutableTyped(Int32.self)
+                for i in 0..<length {
+                    let from = Int(o[i]), n = Int(o[i + 1]) - from
+                    for k in 0..<n { p[from + k] = Int32(starts[i] + k) }
+                }
+                let idx = MetalArray<Int32>(length: total, nullCount: 0, validity: nil, values: indices, context: context)
+                values = try child.take(idx)
+            }
+        }
+        return try makeList(length: length, nulls: nulls, validity: validity, offsets: out, child: values,
+                            kind: .variable, fieldName: fieldName, name: name)
+    }
+
     /// Every type whose values are in its own buffers: the primitives, bool, utf8 / binary, the
     /// temporal types, the decimals, `float16`, `fixed_size_binary`, `interval`, and dictionary codes.
     private func buildFlatColumn(field: ArrowIPCField, length: Int, nulls: Int, slots: [Int],
@@ -1050,6 +1371,8 @@ public final class ArrowIPCReader {
         switch field.type.storage {
         case .nested:
             throw ArrowIPCError.malformed("column '\(name)' is \(field.type), which has no buffers of its own")
+        case .view:
+            throw ArrowIPCError.malformed("column '\(name)' is \(field.type), which the view path reads")
 
         case .fixedWidth(let width):
             let buffer = try values(width)
@@ -1201,13 +1524,14 @@ public final class ArrowIPCReader {
         }
         let valueField = ArrowIPCField(name: field.name + ".dictionary", type: valueType, nullable: true)
         let parts = try recordBatchParts(header: data, bodyLength: ref.bodyLength)
-        let body = try messageBody(parts, raw: raw, bodyOffset: ref.bodyOffset)
-        let cursor = ArrowIPCCursor(nodes: parts.nodes, body: body)
+        let body = try messageBody(parts, raw: raw, bodyOffset: ref.bodyOffset, fields: [valueField])
+        let cursor = ArrowIPCCursor(nodes: parts.nodes, body: body, variadicCounts: parts.variadicCounts)
         let values = try buildColumn(field: valueField, cursor: cursor)
         guard values.length == parts.length else {
             throw ArrowIPCError.malformed("dictionary batch \(id) declares \(parts.length) values but holds \(values.length)")
         }
-        guard cursor.nodeIndex == parts.nodes.count, cursor.bufferIndex == parts.buffers.count else {
+        guard cursor.nodeIndex == parts.nodes.count, cursor.bufferIndex == parts.buffers.count,
+              cursor.variadicIndex == parts.variadicCounts.count else {
             throw ArrowIPCError.malformed(
                 "dictionary batch \(id) declares field nodes or buffers a \(valueType) dictionary does not use")
         }
@@ -1241,12 +1565,24 @@ struct ArrowIPCMessageBody {
 final class ArrowIPCCursor {
     let nodes: [(length: Int, nullCount: Int)]
     let body: ArrowIPCMessageBody
+    let variadicCounts: [Int]
     private(set) var nodeIndex = 0
     private(set) var bufferIndex = 0
+    private(set) var variadicIndex = 0
 
-    init(nodes: [(length: Int, nullCount: Int)], body: ArrowIPCMessageBody) {
+    init(nodes: [(length: Int, nullCount: Int)], body: ArrowIPCMessageBody, variadicCounts: [Int] = []) {
         self.nodes = nodes
         self.body = body
+        self.variadicCounts = variadicCounts
+    }
+
+    /// How many variadic data buffers the next view field, `name`, has.
+    func variadicCount(_ name: String) throws -> Int {
+        guard variadicIndex < variadicCounts.count else {
+            throw ArrowIPCError.malformed("the batch has no variadic buffer count for view column '\(name)'")
+        }
+        defer { variadicIndex += 1 }
+        return variadicCounts[variadicIndex]
     }
 
     /// The next field node, which belongs to `name`.
