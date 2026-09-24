@@ -408,7 +408,9 @@ final class IPCTests: XCTestCase {
             check(reader.read_all(), "stream")
         print("ok")
         """
-        XCTAssertEqual(try runPython(script, [fileURL.path, streamURL.path]).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out1 = try runPython(script, [fileURL.path, streamURL.path])
+        XCTAssertEqual(out1.trimmingCharacters(in: .whitespacesAndNewlines), "ok")
     }
 
     /// A file produced by pyarrow, including logical types ArrowMetal carries as integers.
@@ -445,8 +447,9 @@ final class IPCTests: XCTestCase {
                 w.write_batch(b)
         print("ok")
         """
-        XCTAssertEqual(try runPython(script, [fileURL.path, streamURL.path]).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
-
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out2 = try runPython(script, [fileURL.path, streamURL.path])
+        XCTAssertEqual(out2.trimmingCharacters(in: .whitespacesAndNewlines), "ok")
         for (url, format) in [(fileURL, ArrowIPCFormat.file), (streamURL, .stream)] {
             let reader = try ArrowIPCReader(url: url)
             XCTAssertEqual(reader.format, format)
@@ -502,7 +505,9 @@ final class IPCTests: XCTestCase {
             w.write_batch(batch)
         print("ok")
         """
-        XCTAssertEqual(try runPython(script, [url.path, streamURL.path]).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out3 = try runPython(script, [url.path, streamURL.path])
+        XCTAssertEqual(out3.trimmingCharacters(in: .whitespacesAndNewlines), "ok")
         for source in [url, streamURL] {
             let reader = try ArrowIPCReader(url: source)
             let batch = try reader.batch(at: 0)
@@ -588,7 +593,9 @@ final class IPCTests: XCTestCase {
             check(r.read_all(), "stream")
         print("ok")
         """
-        XCTAssertEqual(try runPython(script, [fileURL.path, streamURL.path]).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out4 = try runPython(script, [fileURL.path, streamURL.path])
+        XCTAssertEqual(out4.trimmingCharacters(in: .whitespacesAndNewlines), "ok")
     }
 
     // MARK: - the rest of the type matrix
@@ -743,7 +750,9 @@ final class IPCTests: XCTestCase {
             check(r.read_all(), "stream")
         print("ok")
         """
-        XCTAssertEqual(try runPython(script, [fileURL.path, streamURL.path]).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out5 = try runPython(script, [fileURL.path, streamURL.path])
+        XCTAssertEqual(out5.trimmingCharacters(in: .whitespacesAndNewlines), "ok")
     }
 
     /// A slice at a non-zero offset writes the rows it names and nothing the parent holds before them:
@@ -808,7 +817,9 @@ final class IPCTests: XCTestCase {
             check(r.read_all(), "stream")
         print("ok")
         """
-        XCTAssertEqual(try runPython(script, [fileURL.path, streamURL.path]).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out6 = try runPython(script, [fileURL.path, streamURL.path])
+        XCTAssertEqual(out6.trimmingCharacters(in: .whitespacesAndNewlines), "ok")
     }
 
     /// Zero rows, and rows that are all null, for every nested layout.
@@ -870,7 +881,9 @@ final class IPCTests: XCTestCase {
             assert t.column("lookup").to_pylist() == [None, None], (path, t.column("lookup").to_pylist())
         print("ok")
         """
-        XCTAssertEqual(try runPython(script, files.map(\.path)).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out7 = try runPython(script, files.map(\.path))
+        XCTAssertEqual(out7.trimmingCharacters(in: .whitespacesAndNewlines), "ok")
     }
 
     /// Several batches of nested columns in one file: each body is found through the footer's block
@@ -911,7 +924,9 @@ final class IPCTests: XCTestCase {
             check(r.read_all(), "stream")
         print("ok")
         """
-        XCTAssertEqual(try runPython(script, [fileURL.path, streamURL.path]).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out8 = try runPython(script, [fileURL.path, streamURL.path])
+        XCTAssertEqual(out8.trimmingCharacters(in: .whitespacesAndNewlines), "ok")
     }
 
     /// The other two interval units and the two narrow decimals.
@@ -952,7 +967,9 @@ final class IPCTests: XCTestCase {
         assert t.num_rows == 3, t.num_rows
         print("ok")
         """
-        XCTAssertEqual(try runPython(script, [url.path]).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out9 = try runPython(script, [url.path])
+        XCTAssertEqual(out9.trimmingCharacters(in: .whitespacesAndNewlines), "ok")
     }
 
     /// Everything the writer emits, the reader builds again: the whole type matrix round trips through
@@ -1010,8 +1027,9 @@ final class IPCTests: XCTestCase {
             w.write_batch(batch)
         print("ok")
         """
-        XCTAssertEqual(try runPython(script, [fileURL.path, streamURL.path]).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
-
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out10 = try runPython(script, [fileURL.path, streamURL.path])
+        XCTAssertEqual(out10.trimmingCharacters(in: .whitespacesAndNewlines), "ok")
         for url in [fileURL, streamURL] {
             let reader = try ArrowIPCReader(url: url)
             XCTAssertEqual(reader.schema.names, ["lists", "big", "grid", "people", "lookup", "deep"])
@@ -1075,8 +1093,9 @@ final class IPCTests: XCTestCase {
             w.write_batch(batch)
         print("ok")
         """
-        XCTAssertEqual(try runPython(script, [fileURL.path, streamURL.path]).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
-
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out11 = try runPython(script, [fileURL.path, streamURL.path])
+        XCTAssertEqual(out11.trimmingCharacters(in: .whitespacesAndNewlines), "ok")
         for url in [fileURL, streamURL] {
             let reader = try ArrowIPCReader(url: url)
             XCTAssertEqual(reader.schema["d128"]?.type, .decimal(precision: 18, scale: 3, bits: 128))
@@ -1135,8 +1154,9 @@ final class IPCTests: XCTestCase {
                 w.write_batch(batch)
             print("ok")
             """
-            XCTAssertEqual(try runPython(script, [fileURL.path, streamURL.path]).trimmingCharacters(in: .whitespacesAndNewlines),
-                           "ok", codec)
+            // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+            let written = try runPython(script, [fileURL.path, streamURL.path])
+            XCTAssertEqual(written.trimmingCharacters(in: .whitespacesAndNewlines), "ok", codec)
             if codec == "zstd" && !Zstd.isAvailable { throw XCTSkip("libzstd is not installed") }
             for url in [fileURL, streamURL] {
                 let reader = try ArrowIPCReader(url: url)
@@ -1174,7 +1194,9 @@ final class IPCTests: XCTestCase {
             w.write_batch(second)
         print("ok")
         """
-        XCTAssertEqual(try runPython(script, [url.path]).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out12 = try runPython(script, [url.path])
+        XCTAssertEqual(out12.trimmingCharacters(in: .whitespacesAndNewlines), "ok")
         let reader = try ArrowIPCReader(url: url)
         XCTAssertEqual(reader.batchCount, 2)
         XCTAssertEqual(try reader.batch(at: 0)["k"]?.decode().asString?.toArray(), ["a", "b", "a"])
@@ -1199,7 +1221,9 @@ final class IPCTests: XCTestCase {
             w.write_batch(second)
         print("ok")
         """
-        XCTAssertEqual(try runPython(script, [url.path]).trimmingCharacters(in: .whitespacesAndNewlines), "ok")
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out13 = try runPython(script, [url.path])
+        XCTAssertEqual(out13.trimmingCharacters(in: .whitespacesAndNewlines), "ok")
         let reader = try ArrowIPCReader(url: url)
         XCTAssertEqual(reader.batchCount, 2)
         XCTAssertEqual(try reader.batch(at: 0)["k"]?.decode().asString?.toArray(), ["a", "b"])

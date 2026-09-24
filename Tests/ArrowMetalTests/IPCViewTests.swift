@@ -164,8 +164,9 @@ final class IPCViewTests: XCTestCase {
     func testViewTypesPyarrowWritesRoundTrip() throws {
         let file = temporaryFile(), stream = temporaryFile("arrows"), lz4 = temporaryFile("arrows")
         defer { for u in [file, stream, lz4] { try? FileManager.default.removeItem(at: u) } }
-        XCTAssertEqual(try runPython(Self.viewScript, [file.path, stream.path, lz4.path]), "ok")
-
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out1 = try runPython(Self.viewScript, [file.path, stream.path, lz4.path])
+        XCTAssertEqual(out1, "ok")
         var outputs: [URL] = []
         defer { for u in outputs { try? FileManager.default.removeItem(at: u) } }
         for (url, format) in [(file, ArrowIPCFormat.file), (stream, .stream), (lz4, .stream)] {
@@ -233,7 +234,9 @@ final class IPCViewTests: XCTestCase {
         let scriptFile = temporaryFile("py")
         defer { try? FileManager.default.removeItem(at: scriptFile) }
         try Self.viewScript.write(to: scriptFile, atomically: true, encoding: .utf8)
-        XCTAssertEqual(try runPython(check, [scriptFile.path] + outputs.map(\.path)), "ok")
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out2 = try runPython(check, [scriptFile.path] + outputs.map(\.path))
+        XCTAssertEqual(out2, "ok")
     }
 
     /// Batches past one 64K-row block, which the reader materialises on several cores at once: strings
@@ -262,7 +265,9 @@ final class IPCViewTests: XCTestCase {
             w.write_batch(batch)
         print("ok")
         """
-        XCTAssertEqual(try runPython(script, [input.path]), "ok")
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out3 = try runPython(script, [input.path])
+        XCTAssertEqual(out3, "ok")
         let batches = try ArrowIPCReader(url: input).readAll()
         XCTAssertEqual(batches.map(\.length), [200_003])
         try ArrowIPCWriter.write(batches, to: output)
@@ -276,7 +281,9 @@ final class IPCViewTests: XCTestCase {
         assert got.column("lv").to_pylist() == src.column("lv").to_pylist()
         print("ok")
         """
-        XCTAssertEqual(try runPython(check, [input.path, output.path]), "ok")
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out4 = try runPython(check, [input.path, output.path])
+        XCTAssertEqual(out4, "ok")
     }
 
     /// The writer never writes a view type, even when the schema it is handed names one.
@@ -394,8 +401,9 @@ final class IPCViewTests: XCTestCase {
         with pa.ipc.new_stream(sys.argv[2], batch.schema) as w: w.write_batch(batch)
         print("ok")
         """
-        XCTAssertEqual(try runPython(write, [file.path, stream.path]), "ok")
-
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out5 = try runPython(write, [file.path, stream.path])
+        XCTAssertEqual(out5, "ok")
         var outputs: [URL] = []
         defer { for u in outputs { try? FileManager.default.removeItem(at: u) } }
         for url in [file, stream] {
@@ -461,7 +469,9 @@ final class IPCViewTests: XCTestCase {
         np.testing.assert_array_equal(built.to_numpy_ndarray(), (np.arange(12) / 4).reshape(2, 3, 2))
         print("ok")
         """
-        XCTAssertEqual(try runPython(check, outputs.map(\.path)), "ok")
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out6 = try runPython(check, outputs.map(\.path))
+        XCTAssertEqual(out6, "ok")
     }
 
     /// A tensor column whose metadata disagrees with its storage is malformed, not silently accepted.
@@ -541,7 +551,9 @@ final class IPCViewTests: XCTestCase {
             pa.ipc.write_tensor(pa.Tensor.from_numpy(np.arange(6, dtype=np.int32).reshape(2, 3)), f)
         print("ok")
         """
-        XCTAssertEqual(try runPython(script, [url.path]), "ok")
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out7 = try runPython(script, [url.path])
+        XCTAssertEqual(out7, "ok")
         XCTAssertThrowsError(try ArrowIPCReader(url: url)) { error in
             XCTAssertTrue("\(error)".contains(expected), "\(error)")
         }
@@ -622,7 +634,9 @@ final class IPCViewTests: XCTestCase {
             w.write_batch(pa.record_batch([v], names=["v"]))
         print("ok")
         """
-        XCTAssertEqual(try runPython(script, [listView.path, views.path]), "ok")
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out8 = try runPython(script, [listView.path, views.path])
+        XCTAssertEqual(out8, "ok")
         var lvData = try Data(contentsOf: listView)
         try patchLastInt64(&lvData, marker, huge)
         XCTAssertThrowsError(try ArrowIPCReader(data: lvData).batch(at: 0)) { error in
@@ -647,7 +661,9 @@ final class IPCViewTests: XCTestCase {
             w.write_batch(pa.record_batch([v], names=["v"]))
         print("ok")
         """
-        XCTAssertEqual(try runPython(script, [url.path]), "ok")
+        // Run outside the assertion: an XCTSkip thrown inside XCTAssertEqual counts as a failure.
+        let out9 = try runPython(script, [url.path])
+        XCTAssertEqual(out9, "ok")
         XCTAssertThrowsError(try ArrowIPCReader(url: url).batch(at: 0)) { error in
             XCTAssertTrue("\(error)".contains("view 0 of column 'v' points at bytes 16..<36 of data buffer 0"), "\(error)")
         }
