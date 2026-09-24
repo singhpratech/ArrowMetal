@@ -203,7 +203,7 @@ public final class CSVReader: @unchecked Sendable {
 
         let conv = CSVColumnConverter(reader: self, file: file, events: s.events, nCols: nCols,
                                       firstRecord: firstRecord, nRows: nRows, dataStart: dataStart,
-                                      dataEnd: fileSize)
+                                      dataEnd: fileSize, rowBase: skipped + firstRecord + 1)
         let columns = try conv.convert(plan: plan, keep: &keep)
         numRows = nRows
         return try MetalRecordBatch(names: plan.map { $0.name }, columns: columns)

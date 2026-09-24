@@ -4462,6 +4462,215 @@ def write_parquet(data, path, compression="snappy", use_dictionary=True, row_gro
     return str(path)
 
 
+# ---------------------------------------------------------------------------------------------------
+# CSV, parsed on the GPU (docs/CSV.md)
+#
+# `am.read_csv(path)` maps the file, finds every field and record boundary with a quote-aware GPU scan,
+# infers each column's type with pyarrow.csv's rules and converts it with a compute kernel. The options
+# are pyarrow's -- pass pyarrow's own ReadOptions / ParseOptions / ConvertOptions objects, or the same
+# names as keywords -- and default to pyarrow's values.
+
+class _CsvOptions(ctypes.Structure):
+    _fields_ = [
+        ("delimiter", ctypes.c_int32), ("quote_char", ctypes.c_int32),
+        ("double_quote", ctypes.c_int32), ("decimal_point", ctypes.c_int32),
+        ("skip_rows", ctypes.c_int64), ("skip_rows_after_names", ctypes.c_int64),
+        ("autogenerate_column_names", ctypes.c_int32), ("include_missing_columns", ctypes.c_int32),
+        ("column_names", ctypes.POINTER(ctypes.c_char_p)), ("n_column_names", ctypes.c_int64),
+        ("include_columns", ctypes.POINTER(ctypes.c_char_p)), ("n_include_columns", ctypes.c_int64),
+        ("column_type_names", ctypes.POINTER(ctypes.c_char_p)),
+        ("column_type_formats", ctypes.POINTER(ctypes.c_char_p)), ("n_column_types", ctypes.c_int64),
+        ("null_values", ctypes.POINTER(ctypes.c_char_p)), ("n_null_values", ctypes.c_int64),
+        ("true_values", ctypes.POINTER(ctypes.c_char_p)), ("n_true_values", ctypes.c_int64),
+        ("false_values", ctypes.POINTER(ctypes.c_char_p)), ("n_false_values", ctypes.c_int64),
+        ("strings_can_be_null", ctypes.c_int32), ("quoted_strings_can_be_null", ctypes.c_int32),
+        ("check_utf8", ctypes.c_int32), ("reserved0", ctypes.c_int32),
+        ("scan_block_bytes", ctypes.c_int64),
+    ]
+
+
+_lib.am_csv_options_init.argtypes = [ctypes.POINTER(_CsvOptions)]
+_lib.am_csv_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(_CsvOptions), ctypes.POINTER(_P)]
+_lib.am_csv_open.restype = ctypes.c_int
+_lib.am_csv_close.argtypes = [_P]
+_lib.am_csv_read.argtypes = [_P, ctypes.POINTER(_P)]
+_lib.am_csv_read.restype = ctypes.c_int
+for _n in ("am_csv_batch_rows", "am_csv_batch_columns"):
+    getattr(_lib, _n).argtypes = [_P]
+    getattr(_lib, _n).restype = ctypes.c_int64
+_lib.am_csv_batch_column_name.argtypes = [_P, ctypes.c_int64]
+_lib.am_csv_batch_column_name.restype = ctypes.c_char_p
+_lib.am_csv_batch_column.argtypes = [_P, ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_csv_batch_column.restype = ctypes.c_int
+_lib.am_csv_batch_release.argtypes = [_P]
+
+
+def _csv_type_format(t):
+    """A pyarrow DataType (or its string alias) -> the Arrow C format string the ABI takes."""
+    if isinstance(t, str):
+        t = pa.type_for_alias(t)
+    simple = {pa.null(): "n", pa.bool_(): "b", pa.int8(): "c", pa.int16(): "s", pa.int32(): "i",
+              pa.int64(): "l", pa.uint8(): "C", pa.uint16(): "S", pa.uint32(): "I", pa.uint64(): "L",
+              pa.float32(): "f", pa.float64(): "g", pa.string(): "u", pa.binary(): "z", pa.date32(): "tdD"}
+    if t in simple:
+        return simple[t]
+    units = {"s": "s", "ms": "m", "us": "u", "ns": "n"}
+    if pa.types.is_time32(t) or pa.types.is_time64(t):
+        return "tt" + units[t.unit]
+    if pa.types.is_timestamp(t):
+        return "ts" + units[t.unit] + ":" + (t.tz or "")
+    raise NotImplementedError("am.read_csv: column type %s is not supported (docs/CSV.md lists the types)" % t)
+
+
+def _csv_resolve(read_options, parse_options, convert_options, kw):
+    """Merges pyarrow option objects and keyword overrides into one dict of plain values."""
+    o = {"skip_rows": 0, "skip_rows_after_names": 0, "column_names": None,
+         "autogenerate_column_names": False, "delimiter": ",", "quote_char": '"', "double_quote": True,
+         "include_columns": None, "include_missing_columns": False, "column_types": None,
+         "null_values": None, "true_values": None, "false_values": None, "strings_can_be_null": False,
+         "quoted_strings_can_be_null": True, "check_utf8": True, "decimal_point": ".",
+         "scan_block_bytes": None}
+    if read_options is not None:
+        if (read_options.encoding or "utf8").lower().replace("-", "") != "utf8":
+            raise NotImplementedError("am.read_csv reads UTF-8 only; got encoding=%r" % read_options.encoding)
+        o["skip_rows"] = read_options.skip_rows
+        o["skip_rows_after_names"] = read_options.skip_rows_after_names
+        o["column_names"] = list(read_options.column_names) or None
+        o["autogenerate_column_names"] = read_options.autogenerate_column_names
+    if parse_options is not None:
+        if parse_options.escape_char is not False:
+            raise NotImplementedError("am.read_csv: escape_char is not supported")
+        if not parse_options.ignore_empty_lines:
+            raise NotImplementedError("am.read_csv: ignore_empty_lines=False is not supported")
+        if parse_options.invalid_row_handler is not None:
+            raise NotImplementedError("am.read_csv: invalid_row_handler is not supported")
+        o["delimiter"] = parse_options.delimiter
+        o["quote_char"] = parse_options.quote_char
+        o["double_quote"] = parse_options.double_quote
+    if convert_options is not None:
+        if convert_options.timestamp_parsers:
+            raise NotImplementedError("am.read_csv: timestamp_parsers is not supported (ISO-8601 only)")
+        if convert_options.auto_dict_encode:
+            raise NotImplementedError("am.read_csv: auto_dict_encode is not supported")
+        o["include_columns"] = list(convert_options.include_columns) or None
+        o["include_missing_columns"] = convert_options.include_missing_columns
+        o["column_types"] = dict(convert_options.column_types) or None
+        o["null_values"] = list(convert_options.null_values)
+        o["true_values"] = list(convert_options.true_values)
+        o["false_values"] = list(convert_options.false_values)
+        o["strings_can_be_null"] = convert_options.strings_can_be_null
+        o["quoted_strings_can_be_null"] = convert_options.quoted_strings_can_be_null
+        o["check_utf8"] = convert_options.check_utf8
+        o["decimal_point"] = convert_options.decimal_point
+    for k, v in kw.items():
+        if v is not None:
+            o[k] = v
+    return o
+
+
+def _csv_char(value, name):
+    if not isinstance(value, str) or len(value) != 1 or ord(value) > 127:
+        raise ValueError("am.read_csv: %s must be a single ASCII character, got %r" % (name, value))
+    return ord(value)
+
+
+def _csv_strings(values):
+    if values is None:
+        return None, 0
+    values = [str(v).encode() for v in values]
+    return (ctypes.c_char_p * max(len(values), 1))(*values), len(values)
+
+
+def read_csv(path, *, read_options=None, parse_options=None, convert_options=None,
+             skip_rows=None, skip_rows_after_names=None, column_names=None,
+             autogenerate_column_names=None, delimiter=None, quote_char=None, double_quote=None,
+             include_columns=None, include_missing_columns=None, column_types=None, null_values=None,
+             true_values=None, false_values=None, strings_can_be_null=None,
+             quoted_strings_can_be_null=None, check_utf8=None, decimal_point=None,
+             scan_block_bytes=None):
+    """Reads a CSV file on the GPU and returns a `ColumnSet` of MetalArrays.
+
+    Options follow `pyarrow.csv.read_csv`: pass pyarrow's own `ReadOptions`, `ParseOptions` and
+    `ConvertOptions`, or their fields as keywords (a keyword wins over the object). Types are inferred
+    with pyarrow's rules -- null, int64, bool, date32, time32[s], timestamp[s] / [ns] (UTC when the
+    values carry an offset), float64, then string, or binary when a value is not UTF-8.
+    `include_columns` projects: the other columns are never converted. Quoted newlines are always
+    parsed (pyarrow's `newlines_in_values=True`). `scan_block_bytes` sets how many bytes each GPU
+    thread scans in the structure pass; it changes only the speed.
+
+        import arrowmetal as am
+        cols = am.read_csv("trades.csv", include_columns=["price", "qty"])
+        total = cols["price"].sum()          # already on the GPU
+    """
+    o = _csv_resolve(read_options, parse_options, convert_options, dict(
+        skip_rows=skip_rows, skip_rows_after_names=skip_rows_after_names, column_names=column_names,
+        autogenerate_column_names=autogenerate_column_names, delimiter=delimiter, quote_char=quote_char,
+        double_quote=double_quote, include_columns=include_columns,
+        include_missing_columns=include_missing_columns, column_types=column_types,
+        null_values=null_values, true_values=true_values, false_values=false_values,
+        strings_can_be_null=strings_can_be_null, quoted_strings_can_be_null=quoted_strings_can_be_null,
+        check_utf8=check_utf8, decimal_point=decimal_point, scan_block_bytes=scan_block_bytes))
+    c = _CsvOptions()
+    _lib.am_csv_options_init(ctypes.byref(c))
+    c.delimiter = _csv_char(o["delimiter"], "delimiter")
+    c.quote_char = -1 if o["quote_char"] is False else _csv_char(o["quote_char"], "quote_char")
+    c.double_quote = 1 if o["double_quote"] else 0
+    c.decimal_point = _csv_char(o["decimal_point"], "decimal_point")
+    c.skip_rows = int(o["skip_rows"])
+    c.skip_rows_after_names = int(o["skip_rows_after_names"])
+    c.autogenerate_column_names = 1 if o["autogenerate_column_names"] else 0
+    c.include_missing_columns = 1 if o["include_missing_columns"] else 0
+    keep = []
+    arr, n = _csv_strings(o["column_names"])
+    keep.append(arr)
+    c.column_names, c.n_column_names = arr, n
+    inc = o["include_columns"]
+    arr, n = _csv_strings(list(inc) if inc else None)
+    keep.append(arr)
+    c.include_columns, c.n_include_columns = arr, n
+    types = o["column_types"] or {}
+    if isinstance(types, (list, tuple)):
+        types = dict(types)
+    names_arr, n = _csv_strings(list(types.keys()))
+    fmts_arr, _ = _csv_strings([_csv_type_format(t) for t in types.values()])
+    keep += [names_arr, fmts_arr]
+    c.column_type_names, c.column_type_formats, c.n_column_types = names_arr, fmts_arr, n
+    for key in ("null_values", "true_values", "false_values"):
+        arr, n = _csv_strings(o[key])
+        keep.append(arr)
+        setattr(c, key, arr)
+        setattr(c, "n_" + key, n)
+    c.strings_can_be_null = 1 if o["strings_can_be_null"] else 0
+    c.quoted_strings_can_be_null = 1 if o["quoted_strings_can_be_null"] else 0
+    c.check_utf8 = 1 if o["check_utf8"] else 0
+    c.scan_block_bytes = int(o["scan_block_bytes"] or 0)
+
+    reader = _P()
+    _check(_lib.am_csv_open(os.fspath(path).encode(), ctypes.byref(c), ctypes.byref(reader)))
+    try:
+        out = _P()
+        _check(_lib.am_csv_read(reader, ctypes.byref(out)))
+    finally:
+        _lib.am_csv_close(reader)
+    try:
+        pairs = []
+        for i in range(_lib.am_csv_batch_columns(out)):
+            name = _lib.am_csv_batch_column_name(out, i).decode()
+            h = _P()
+            _check(_lib.am_csv_batch_column(out, i, ctypes.byref(h)))
+            pairs.append((name, MetalArray(h)))
+        return ColumnSet(pairs)
+    finally:
+        _lib.am_csv_batch_release(out)
+
+
+def read_csv_table(path, **kwargs):
+    """`read_csv` exported as a `pyarrow.Table` (zero copy: pyarrow keeps the Metal buffers). Takes the
+    same arguments as `read_csv`."""
+    cols = read_csv(path, **kwargs)
+    return pa.table([c.to_arrow() for c in cols.columns], names=cols.names)
+
+
 # ---- out-of-core streaming execution (python/arrowmetal/stream.py, docs/STREAMING.md)
 #
 # Everything above works on arrays and batches that fit in memory. `am.scan_ipc(...)` and

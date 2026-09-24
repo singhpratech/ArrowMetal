@@ -227,7 +227,7 @@ final class CSVReaderTests: XCTestCase {
         XCTAssertEqual(a.toArray(), [1, -128])
         XCTAssertEqual(u.toArray(), [255, 7])
         XCTAssertThrowsError(try read("a,b\n1,x\n") { $0.columnTypes = ["b": .int64] }) {
-            XCTAssertEqual("\($0)", "In CSV column #1: CSV conversion error to int64: invalid value 'x'")
+            XCTAssertEqual("\($0)", "In CSV column #1: Row #2: CSV conversion error to int64: invalid value 'x'")
         }
         XCTAssertThrowsError(try read("a\n2020-01-01 12:34:56\n") { $0.columnTypes = ["a": .timestamp(.second, timezone: "UTC")] }) {
             XCTAssertTrue("\($0)".contains("expected a zone offset in '2020-01-01 12:34:56'"), "\($0)")

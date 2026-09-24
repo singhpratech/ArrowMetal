@@ -65,12 +65,14 @@ final class CSVColumnConverter {
     let nRows: Int
     let dataStart: Int
     let dataEnd: Int
+    /// pyarrow's row number of data row 0 (lines skipped + records before it + 1).
+    let rowBase: Int
     private var lists: MetalArrowBuffer! = nil
     private var listBytes: MetalArrowBuffer! = nil
     private var dummy: MetalArrowBuffer! = nil
 
     init(reader: CSVReader, file: MetalArrowBuffer, events: MetalArrowBuffer, nCols: Int, firstRecord: Int,
-         nRows: Int, dataStart: Int, dataEnd: Int) {
+         nRows: Int, dataStart: Int, dataEnd: Int, rowBase: Int) {
         self.reader = reader
         self.ctx = reader.context
         self.file = file
@@ -80,6 +82,7 @@ final class CSVColumnConverter {
         self.nRows = nRows
         self.dataStart = dataStart
         self.dataEnd = dataEnd
+        self.rowBase = rowBase
     }
 
     /// One projected column on its way through the phases.
@@ -376,11 +379,11 @@ final class CSVColumnConverter {
             try hostFloats(w)
             return
         }
-        let prefix = "In CSV column #\(w.source): CSV conversion error to \(w.type.arrowName): "
+        let row = Int(Swift.min(invalid, zone))
+        let prefix = "In CSV column #\(w.source): Row #\(rowBase + row): CSV conversion error to \(w.type.arrowName): "
         if w.type == .utf8 {
             throw CSVError.conversion(prefix + "invalid UTF8 data")
         }
-        let row = Int(Swift.min(invalid, zone))
         let value = String(decoding: text(w, row), as: UTF8.self)
         if case .timestamp(_, let tz) = w.type, zone < invalid {
             if tz?.isEmpty == false {
@@ -408,10 +411,10 @@ final class CSVColumnConverter {
                 t = t.map { $0 == dp ? 0x2E : $0 }
                 let s = String(decoding: t, as: UTF8.self)
                 if w.type == .float32 {
-                    guard let v = Float(s) else { throw CSVError.conversion("In CSV column #\(w.source): CSV conversion error to float: invalid value '\(s)'") }
+                    guard let v = Float(s) else { throw CSVError.conversion("In CSV column #\(w.source): Row #\(rowBase + r): CSV conversion error to float: invalid value '\(s)'") }
                     w.values.mutableTyped(Float.self)[r] = v
                 } else {
-                    guard let v = Double(s) else { throw CSVError.conversion("In CSV column #\(w.source): CSV conversion error to double: invalid value '\(s)'") }
+                    guard let v = Double(s) else { throw CSVError.conversion("In CSV column #\(w.source): Row #\(rowBase + r): CSV conversion error to double: invalid value '\(s)'") }
                     w.values.mutableTyped(Double.self)[r] = v
                 }
                 bits[r >> 5] |= 1 << UInt32(r & 31)
