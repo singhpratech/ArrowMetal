@@ -320,8 +320,10 @@ enum CSVSource {
         bool isEnd = (ev[k] >> 31) != 0u;
         bool expect = ((k + 1u) % P.nCols) == 0u;
         if (isEnd != expect) atomic_fetch_min_explicit(firstBad, k, memory_order_relaxed);
-        if (P.quote > 255u) return;
         uint2 raw = csv_raw(d, ev, k, P);
+        // A span keeps its length in 30 bits; slot nCols counts the fields that would not fit.
+        if (raw.y - raw.x > CSV_LEN) atomic_fetch_add_explicit(complexCounts + P.nCols, 1u, memory_order_relaxed);
+        if (P.quote > 255u) return;
         if (raw.x < raw.y && (uint)d[raw.x] == P.quote) {
             bool simple; uint cs;
             csv_quoted(d, raw.x, raw.y, P, simple, cs);
@@ -897,6 +899,147 @@ enum CSVSource {
             if (valid && checkUtf8 != 0u && !csv_utf8(p, len)) bad = true;
         }
         CSV_ROW_EPILOGUE
+    }
+
+    // ------------------------------------------------------------------ all columns in one pass
+
+    // One converted column of `csv_convert_rows`: where its values, validity and flags go in the
+    // shared output buffers, and how to parse it.
+    struct CsvConvCol {
+        uint col;
+        uint kind;           // 0 null check, 1 int, 2 float64, 3 float32, 4 bool, 5 date32, 6 time32,
+                             // 7 time64, 8 timestamp, 9 string lengths
+        uint unitDigits;
+        uint expectZone;
+        uint isSigned;
+        uint maxHex;
+        uint width;          // integers: bytes per value
+        uint checkUtf8;      // strings: validate
+        ulong limPos;
+        ulong limNeg;
+        uint valuesOff;      // bytes into `values`
+        uint validOff;       // words into `valid` (and into `host` for floats)
+        uint pad0;
+        uint pad1;
+    };
+
+    // Converts every row of every column in `descs` (none of them with complex fields). One thread
+    // per row walks the row's fields left to right, so the boundaries and the file bytes are read once
+    // for the whole table rather than once per column; with one kernel per column, each kernel touched
+    // every cache line of both.
+    kernel void csv_convert_rows(device const uchar* d [[buffer(0)]],
+                                 device const uint* ev [[buffer(1)]],
+                                 constant CsvCol& P [[buffer(2)]],
+                                 device const CsvConvCol* descs [[buffer(3)]],
+                                 constant uint& nDescs [[buffer(4)]],
+                                 device const uint* lists [[buffer(5)]],
+                                 device const uchar* lbytes [[buffer(6)]],
+                                 device uchar* values [[buffer(7)]],
+                                 device uint* valid [[buffer(8)]],
+                                 device uint* hostFlags [[buffer(9)]],
+                                 device atomic_uint* err [[buffer(10)]],
+                                 device atomic_uint* hostCount [[buffer(11)]],
+                                 uint r [[thread_position_in_grid]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+        bool live = r < P.nRows;
+        uint rec = P.firstRecord + (live ? r : 0u);
+        for (uint j = 0u; j < nDescs; j++) {
+            CsvConvCol D = descs[j];
+            device const uchar* p = d; uint len = 0u; bool isNull = false;
+            bool ok = false, bad = false, zoneBad = false, host = false, bit = false;
+            if (live) {
+                uint k = rec * P.nCols + D.col;
+                uint2 raw = csv_raw(d, ev, k, P);
+                bool quoted = false;
+                if (P.quote <= 255u && raw.x < raw.y && (uint)d[raw.x] == P.quote) {
+                    bool simple; uint cs;
+                    len = csv_quoted(d, raw.x, raw.y, P, simple, cs);
+                    p = d + cs;
+                    quoted = true;
+                } else { p = d + raw.x; len = raw.y - raw.x; }
+                isNull = csv_is_null(p, len, quoted, P, lists, lbytes);
+                device uchar* out = values + D.valuesOff;
+                switch (D.kind) {
+                case 0u:
+                    if (!isNull) bad = true;
+                    break;
+                case 1u: {
+                    ulong v = 0UL;
+                    if (!isNull) { if (csv_int(p, len, D.isSigned != 0u, D.maxHex, D.limPos, D.limNeg, v)) ok = true; else bad = true; }
+                    if (!ok) v = 0UL;
+                    if (D.width == 8u) ((device ulong*)out)[r] = v;
+                    else if (D.width == 4u) ((device uint*)out)[r] = (uint)v;
+                    else if (D.width == 2u) ((device ushort*)out)[r] = (ushort)v;
+                    else out[r] = (uchar)v;
+                    break;
+                }
+                case 2u:
+                case 3u: {
+                    ulong bits = 0UL;
+                    if (!isNull) {
+                        uint st = fp_parse(p, len, FP_CSV, (uchar)P.decimalPoint, D.kind == 3u, bits);
+                        if (st == FP_VALUE) ok = true; else if (st == FP_HOST) host = true; else bad = true;
+                    }
+                    if (!ok) bits = 0UL;
+                    if (D.kind == 2u) ((device ulong*)out)[r] = bits; else ((device uint*)out)[r] = (uint)bits;
+                    break;
+                }
+                case 4u:
+                    if (!isNull) {
+                        if (csv_match(p, len, P.nNull, P.nTrue, lists, lbytes)) { bit = true; ok = true; }
+                        else if (csv_match(p, len, P.nNull + P.nTrue, P.nFalse, lists, lbytes)) ok = true;
+                        else bad = true;
+                    }
+                    break;
+                case 5u: {
+                    int v = 0;
+                    if (!isNull) { if (csv_date(p, len, v)) ok = true; else bad = true; }
+                    ((device int*)out)[r] = ok ? v : 0;
+                    break;
+                }
+                case 6u:
+                case 7u: {
+                    long v = 0L;
+                    if (!isNull) { if (csv_time(p, len, D.unitDigits, v)) ok = true; else bad = true; }
+                    if (!ok) v = 0L;
+                    if (D.kind == 6u) ((device int*)out)[r] = (int)v; else ((device long*)out)[r] = v;
+                    break;
+                }
+                case 8u: {
+                    long v = 0L;
+                    if (!isNull) {
+                        bool zone, frac;
+                        if (!csv_iso(p, len, D.unitDigits, v, zone, frac)) bad = true;
+                        else if (zone != (D.expectZone != 0u)) zoneBad = true;
+                        else ok = true;
+                    }
+                    ((device long*)out)[r] = ok ? v : 0L;
+                    break;
+                }
+                default: {
+                    bool nullRow = isNull && (P.flags & CSV_SCBN) != 0u;
+                    ok = !nullRow;
+                    ((device int*)out)[r] = nullRow ? 0 : (int)len;
+                    if (ok && D.checkUtf8 != 0u && !csv_utf8(p, len)) bad = true;
+                    break;
+                }
+                }
+            }
+            uint vw = (uint)(simd_vote::vote_t)simd_ballot(ok);
+            uint bw = (uint)(simd_vote::vote_t)simd_ballot(bit);
+            uint hw = (uint)(simd_vote::vote_t)simd_ballot(host);
+            if (lane == 0u && live) {
+                uint w = D.validOff + (r >> 5);
+                valid[w] = vw;
+                if (D.kind == 4u) ((device uint*)(values + D.valuesOff))[r >> 5] = bw;
+                if (D.kind == 2u || D.kind == 3u) {
+                    hostFlags[w] = hw;
+                    if (hw != 0u) atomic_fetch_add_explicit(hostCount + j, popcount(hw), memory_order_relaxed);
+                }
+            }
+            if (bad) atomic_fetch_min_explicit(err + 2u * j, r, memory_order_relaxed);
+            if (zoneBad) atomic_fetch_min_explicit(err + 2u * j + 1u, r, memory_order_relaxed);
+        }
     }
 
     // Strings, pass 2: copy each row's bytes to its offset.

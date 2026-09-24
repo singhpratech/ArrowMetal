@@ -25,6 +25,24 @@ struct CSVColParams {
     var limNeg: UInt64 = 0
 }
 
+/// Mirrors `CsvConvCol` in `CSVSource`.
+struct CSVConvDesc {
+    var col: UInt32 = 0
+    var kind: UInt32 = 0
+    var unitDigits: UInt32 = 0
+    var expectZone: UInt32 = 0
+    var isSigned: UInt32 = 1
+    var maxHex: UInt32 = 16
+    var width: UInt32 = 8
+    var checkUtf8: UInt32 = 0
+    var limPos: UInt64 = 0
+    var limNeg: UInt64 = 0
+    var valuesOff: UInt32 = 0
+    var validOff: UInt32 = 0
+    var pad0: UInt32 = 0
+    var pad1: UInt32 = 0
+}
+
 /// Inference outcomes, in Arrow's order: a column takes the first kind every one of its values
 /// converts as (`arrow/csv/inference_internal.h`).
 enum CSVKind: Int, CaseIterable {
@@ -187,8 +205,10 @@ final class CSVColumnConverter {
         }
         for w in live where w.forced != nil { w.type = w.forced! }
 
-        // Phase 3: conversion (and, for a speculated type, the check that every row converts).
-        for w in live { try dispatchConversion(w, keep: &keep) }
+        // Phase 3: conversion (and, for a speculated type, the check that every row converts). Columns
+        // without complex fields convert together, one pass over the rows; the others one by one.
+        try dispatchFused(live.filter { $0.spans == nil }, keep: &keep)
+        for w in live where w.spans != nil { try dispatchConversion(w, keep: &keep) }
         try ctx.syncPoint()
         reader.mark("convert")
 
@@ -346,6 +366,117 @@ final class CSVColumnConverter {
 
     private func unitDigits(_ u: ArrowTemporalUnit) -> UInt32 {
         switch u { case .second: return 0; case .milli: return 3; case .micro: return 6; case .nano: return 9 }
+    }
+
+    /// Conversion of every column in `cols` by one `csv_convert_rows` pass. Each column's values,
+    /// validity, flags and error slots are sub-ranges of shared buffers; the sub-buffers keep the shared
+    /// allocation alive for as long as any column uses it.
+    private func dispatchFused(_ cols: [Work], keep: inout [AnyObject]) throws {
+        var descs: [CSVConvDesc] = []
+        var members: [(Work, Int, Int)] = []            // work, values bytes, value byte offset
+        var valuesBytes = 0
+        for w in cols {
+            if w.type == .null && w.inferred && w.verified { continue }
+            var D = CSVConvDesc()
+            D.col = UInt32(w.source)
+            var bytes: Int
+            switch w.type {
+            case .null: D.kind = 0; bytes = 0
+            case .float64: D.kind = 2; bytes = nRows * 8
+            case .float32: D.kind = 3; bytes = nRows * 4
+            case .bool: D.kind = 4; bytes = words * 4
+            case .date32: D.kind = 5; bytes = nRows * 4
+            case .time32(let u): D.kind = 6; D.unitDigits = unitDigits(u); bytes = nRows * 4
+            case .time64(let u): D.kind = 7; D.unitDigits = unitDigits(u); bytes = nRows * 8
+            case .timestamp(let u, let tz):
+                D.kind = 8; D.unitDigits = unitDigits(u); D.expectZone = (tz?.isEmpty == false) ? 1 : 0
+                bytes = nRows * 8
+            case .utf8, .binary:
+                D.kind = 9
+                D.checkUtf8 = (w.type == .utf8 && !(w.inferred && w.verified) && options.checkUTF8) ? 1 : 0
+                bytes = nRows * 4
+            default:
+                guard let lim = intLimits(w.type) else { throw CSVError.invalidOptions("unsupported column type \(w.type.arrowName)") }
+                D.kind = 1
+                D.isSigned = lim.signed ? 1 : 0
+                D.maxHex = UInt32(2 * lim.width)
+                D.width = UInt32(lim.width)
+                D.limPos = lim.limPos
+                D.limNeg = lim.limNeg
+                bytes = nRows * lim.width
+            }
+            D.valuesOff = UInt32(valuesBytes)
+            D.validOff = UInt32(descs.count * words)
+            members.append((w, bytes, valuesBytes))
+            valuesBytes += roundUp(Swift.max(bytes, 1), to: 64)
+            descs.append(D)
+        }
+        guard !descs.isEmpty else { return }
+        guard valuesBytes < 0x8000_0000 else {
+            // Past what one shared buffer's 32-bit offsets address: convert column by column instead.
+            for (w, _, _) in members { try dispatchConversion(w, keep: &keep) }
+            return
+        }
+        let n = descs.count
+        let values = try alloc(valuesBytes, &keep)
+        let valid = try alloc(n * words * 4, &keep)
+        let host = try alloc(n * words * 4, &keep)
+        let err = try alloc(n * 8, &keep)
+        let hostCount = try alloc(n * 4, zeroed: true, &keep)
+        let e = err.mutableTyped(UInt32.self)
+        for i in 0..<(2 * n) { e[i] = UInt32.max }
+        func part(_ b: MetalArrowBuffer, _ offset: Int, _ bytes: Int) -> MetalArrowBuffer {
+            MetalArrowBuffer(mtl: b.mtl, byteCount: bytes, offset: b.offset + offset, keepAlive: b)
+        }
+        for (j, (w, bytes, off)) in members.enumerated() {
+            w.values = part(values, off, bytes)
+            w.wide = nil
+            w.validity = part(valid, j * words * 4, words * 4)
+            w.err = part(err, j * 8, 8)
+            if w.type == .float64 || w.type == .float32 {
+                w.host = part(host, j * words * 4, words * 4)
+                w.hostCount = part(hostCount, j * 4, 4)
+            } else {
+                w.host = nil
+                w.hostCount = nil
+            }
+        }
+        var P = CSVColParams()
+        P.nRows = UInt32(nRows)
+        P.nCols = UInt32(nCols)
+        P.firstRecord = UInt32(firstRecord)
+        P.dataStart = UInt32(dataStart)
+        P.dataEnd = UInt32(dataEnd)
+        P.quote = options.quoteChar.map { UInt32($0) } ?? 256
+        P.doubleQuote = options.doubleQuote ? 1 : 0
+        P.flags = (options.quotedStringsCanBeNull ? 1 : 0) | (options.stringsCanBeNull ? 2 : 0) | (options.checkUTF8 ? 4 : 0)
+        P.decimalPoint = UInt32(options.decimalPoint)
+        P.nNull = UInt32(options.nullValues.count)
+        P.nTrue = UInt32(options.trueValues.count)
+        P.nFalse = UInt32(options.falseValues.count)
+        let descBuf = try descs.withUnsafeBytes {
+            try MetalArrowBuffer.copy(from: $0.baseAddress!, byteCount: $0.count, context: ctx)
+        }
+        keep.append(descBuf)
+        guard nRows > 0 else { return }
+        var nd = UInt32(n)
+        let pso = try reader.pipeline("csv_convert_rows")
+        try reader.gpu("csv_convert_rows") { enc in
+            enc.setComputePipelineState(pso)
+            enc.setBuffer(file.mtl, offset: file.offset, index: 0)
+            enc.setBuffer(events.mtl, offset: events.offset, index: 1)
+            enc.setBytes(&P, length: MemoryLayout<CSVColParams>.size, index: 2)
+            enc.setBuffer(descBuf.mtl, offset: descBuf.offset, index: 3)
+            enc.setBytes(&nd, length: 4, index: 4)
+            enc.setBuffer(lists.mtl, offset: lists.offset, index: 5)
+            enc.setBuffer(listBytes.mtl, offset: listBytes.offset, index: 6)
+            enc.setBuffer(values.mtl, offset: values.offset, index: 7)
+            enc.setBuffer(valid.mtl, offset: valid.offset, index: 8)
+            enc.setBuffer(host.mtl, offset: host.offset, index: 9)
+            enc.setBuffer(err.mtl, offset: err.offset, index: 10)
+            enc.setBuffer(hostCount.mtl, offset: hostCount.offset, index: 11)
+            Dispatch.dispatch1D(enc, pso, count: nRows)
+        }
     }
 
     private func dispatchConversion(_ w: Work, keep: inout [AnyObject]) throws {

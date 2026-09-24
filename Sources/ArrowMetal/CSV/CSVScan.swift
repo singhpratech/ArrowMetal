@@ -156,7 +156,7 @@ extension CSVReader {
         let ctx = context
         let bad = try MetalArrowBuffer.allocate(byteCount: 4, zeroed: false, context: ctx)
         bad.mutableTyped(UInt32.self)[0] = UInt32.max
-        let counts = try MetalArrowBuffer.allocate(byteCount: nCols * 4, zeroed: true, context: ctx)
+        let counts = try MetalArrowBuffer.allocate(byteCount: (nCols + 1) * 4, zeroed: true, context: ctx)
         keep += [bad, counts]
         var P = CSVColParams()
         P.nCols = UInt32(nCols)
@@ -179,6 +179,9 @@ extension CSVReader {
         try ctx.syncPoint()
         let k = bad.typed(UInt32.self)[0]
         let c = counts.typed(UInt32.self)
+        if c[nCols] > 0 {
+            throw CSVError.io("\(path) has a field of 1 GiB or more, which this reader does not support")
+        }
         return (k == UInt32.max ? nil : Int(k), (0..<nCols).map { Int(c[$0]) })
     }
 
