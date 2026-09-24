@@ -1580,6 +1580,9 @@ int64_t am_parquet_last_read_stats(am_parquet_file* f, int64_t* out, int64_t cap
 // part of the string and \" and \\ stand for a quote and a backslash. An integer literal above
 // INT64_MAX is kept exact and compared as unsigned against a uint64 column's statistics. On a float or
 // double column `!=` never rules a row group or page out, since writers leave NaN out of min/max.
+// A string literal is compared with string and binary statistics as UTF-8 bytes, unsigned, the order
+// Parquet uses; an integer statistic and a float literal are compared exactly; a decimal column's
+// statistics never rule a row group or page out.
 
 // ---- Lakehouse tables: Delta Lake and Apache Iceberg (docs/LAKEHOUSE.md) --------------------------
 //

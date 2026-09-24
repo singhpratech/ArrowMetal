@@ -250,6 +250,12 @@ public struct ParquetFilter: Sendable {
         // Writers leave NaN out of min / max, so a FLOAT or DOUBLE range whose bounds both equal the
         // literal can still hold a NaN, and NaN satisfies `!=`: on those columns `!=` rules nothing out.
         if op == .ne, leaf.physical == .float || leaf.physical == .double { return true }
+        // A decimal's statistics are its unscaled integer (or its big-endian bytes): not comparable with
+        // a literal written in the column's units, so look at the rows.
+        if case .decimal = leaf.logicalType { return true }
+        if leaf.physical == .byteArray || leaf.physical == .fixedLenByteArray {
+            return mayMatchBytes(lower: lo, upper: hi, leaf: leaf)
+        }
         guard let low = decode(lo, leaf), let high = decode(hi, leaf) else { return true }
         // A NaN bound says nothing (the format asks readers to ignore it), and a literal of another kind
         // than the column's (a string against a number) cannot be ordered against it: look at the rows.
@@ -263,6 +269,27 @@ public struct ParquetFilter: Sendable {
         case .le: return compare(low, self.value) <= 0
         case .gt: return compare(high, self.value) > 0
         case .ge: return compare(high, self.value) >= 0
+        }
+    }
+
+    /// BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY statistics are ordered by unsigned byte comparison, so the
+    /// bounds stay raw bytes and a string literal is compared as its UTF-8 bytes. Swift's `String <`
+    /// orders by Unicode canonical equivalence instead (a composed and a decomposed accent compare
+    /// equal, and the order differs from the bytes'), and decoding a truncated bound into a `String`
+    /// would replace a cut-off UTF-8 sequence with U+FFFD, raising a lower bound: either could rule out
+    /// a row group or page that matches.
+    private func mayMatchBytes(lower lo: [UInt8], upper hi: [UInt8], leaf: ParquetLeaf) -> Bool {
+        // Only a string literal has bytes to compare; FLOAT16 bytes are little-endian numbers.
+        guard case .string(let s) = value, leaf.logicalType != .float16 else { return true }
+        let lit = Array(s.utf8)
+        func cmp(_ a: [UInt8], _ b: [UInt8]) -> Int { a == b ? 0 : (a.lexicographicallyPrecedes(b) ? -1 : 1) }
+        switch op {
+        case .eq: return cmp(lo, hi) <= 0 ? (cmp(lo, lit) <= 0 && cmp(lit, hi) <= 0) : true
+        case .ne: return !(cmp(lo, lit) == 0 && cmp(hi, lit) == 0)
+        case .lt: return cmp(lo, lit) < 0
+        case .le: return cmp(lo, lit) <= 0
+        case .gt: return cmp(hi, lit) > 0
+        case .ge: return cmp(hi, lit) >= 0
         }
     }
 
@@ -292,7 +319,7 @@ public struct ParquetFilter: Sendable {
             withUnsafeMutableBytes(of: &v) { $0.copyBytes(from: bytes[0..<8]) }
             return .double(v)
         case .byteArray, .fixedLenByteArray:
-            return .string(String(decoding: bytes, as: UTF8.self))
+            return nil                      // compared as bytes by `mayMatchBytes`
         case .boolean:
             return bytes.first.map { .int(Int64($0 == 0 ? 0 : 1)) }
         case .int96:
@@ -305,11 +332,11 @@ public struct ParquetFilter: Sendable {
         return false
     }
 
-    /// True when `compare` orders the two: numbers against numbers, strings against strings.
+    /// True when `compare` orders the two: numbers against numbers (strings are compared as bytes).
     private static func comparable(_ a: Value, _ b: Value) -> Bool {
         switch (a, b) {
         case (.int, .int), (.int, .uint), (.int, .double), (.uint, .int), (.uint, .uint), (.uint, .double),
-             (.double, .int), (.double, .uint), (.double, .double), (.string, .string): return true
+             (.double, .int), (.double, .uint), (.double, .double): return true
         default: return false
         }
     }
@@ -351,7 +378,6 @@ public struct ParquetFilter: Sendable {
     }
 
     private func compare(_ a: Value, _ b: Value) -> Int {
-        if case (.string(let x), .string(let y)) = (a, b) { return x < y ? -1 : (x == y ? 0 : 1) }
-        return Self.compareNumbers(a, b) ?? 0
+        Self.compareNumbers(a, b) ?? 0
     }
 }
