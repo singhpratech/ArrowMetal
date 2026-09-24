@@ -407,36 +407,31 @@ imported column is mapped before the operation is called), which is the state th
 in. It keeps no state across calls beyond the modes and the last decision, and it never estimates at run
 time.
 
-**The table** is data generated from the measurement, not typed: `Benchmarks/router_table.py` reads
-`Benchmarks/results/router_2026-09-17.json` (the step crossover per operation, from
-[CROSSOVER.md](CROSSOVER.md)'s router table) and the `arrowmetal-bench crossover` CSV it names, and
-writes `Sources/ArrowMetal/Router/RouterTable.swift`, a Swift literal, so there is no resource bundle to
-load. The step alone would send every size between the last swept size where the CPU was ahead and the
-first where the GPU was ahead to the CPU, so the script fits the crossover once, offline: inside that
-bracket both paths are taken as straight lines between the two measured points and the crossover is
-where they meet. It never leaves the measured bracket. The sweep timed `add` only, so the multiply row is
-fitted the same way from the `multiply(int64, 3)` rows of a `router_check.py` CSV
-(`router_table.py --multiply-from`, by default `Benchmarks/results/router_check_2026-09-23_provisional.csv`),
-whose CPU side is the RouterCPU multiply loop; it is refitted with the rest of the table from the quiet
-rerun. `router_table.py --check` fails when the
-committed table no longer matches the results file, and `python/tests/test_router.py` runs it. The
-values are in the generated file, in `Router.crossoverRows(_:)` and `Router.crossoverRows(arithmetic:)`
-from Swift, `am_router_crossover` and `am_router_multiply_crossover` from C and `am.router_crossovers()`
-from Python. `Benchmarks/router_check.py` times every routed operation
-under `gpu`, `cpu` and `auto` and says whether `auto` picked the faster path. Two provisional runs, both
-taken while other builds were using the machine, are committed: `router_check_2026-09-23_provisional.csv`,
-the run the multiply row was fitted from (taken before that row existed, so its `auto` column keeps
-multiply on the GPU), and `router_check_2026-09-24_provisional.csv`, the same check against the shipped
-table. Both are to be replaced by a quiet rerun.
+**The table** is data generated from the measurement, not typed: `Benchmarks/router_table.py
+--from-check Benchmarks/results/router_check_2026-09-24.csv` fits it from a `Benchmarks/router_check.py`
+run, which times every routed operation with the router pinned to `gpu` and to `cpu`, so the CPU side is
+the shipped RouterCPU loops, and writes `Sources/ArrowMetal/Router/RouterTable.swift`, a Swift literal,
+so there is no resource bundle to load. The step alone would send every size between the last measured
+size where the CPU was ahead and the first where the GPU was ahead to the CPU, so the script fits the
+crossover once, offline: inside that bracket both paths are taken as straight lines between the two
+measured points and the crossover is where they meet. It never leaves the measured bracket. `multiply`
+has its own row, fitted the same way from the `multiply(int64, 3)` rows, because a 64-bit integer
+multiply costs the CPU more per element than an add. `router_table.py --check` fails when the committed
+table no longer matches the results file it names, and `python/tests/test_router.py` runs it. The values
+are in the generated file, in `Router.crossoverRows(_:)` and `Router.crossoverRows(arithmetic:)` from
+Swift, `am_router_crossover` and `am_router_multiply_crossover` from C and `am.router_crossovers()` from
+Python.
 
-*What the table's CPU side is.* The committed table comes from the 2026-09-17 sweep, whose CPU side is
-the bench's own single-core loops in `Sources/ArrowMetalBench/main.swift` (`cpu-1core`, and
-`cpu-candidate` for the group-by), measured before `Router/RouterCPU.swift` existed. They are not the
-loops the router runs, and the provisional check above shows the two CPU sides are not the same speed at
-every size, so near a crossover `auto` can pick the slower path. `router_table.py --from-check
-Benchmarks/results/router_check_<date>.csv` fits the same table from a `router_check.py` run, whose CPU
-side is RouterCPU; the table is to be regenerated that way from a quiet run. The generated file's header
-says which of the two it came from, and `--check` regenerates from the source the file names.
+`Benchmarks/results/router_check_2026-09-24_after_refit.csv` is the same check run against the refitted
+table: `auto` took the faster path in 71 of 72 cases. The one miss is `compare(int64 > int64)` at 3M
+rows, by a margin of 1.10, because the compare row is fitted on the scalar compare. Both runs compare the
+GPU with a single-core CPU loop; a background process holding one of the sixteen cores (the file sync was
+running during both) does not enter either side.
+
+The table can also be generated from `Benchmarks/results/router_2026-09-17.json`, the size sweep behind
+[CROSSOVER.md](CROSSOVER.md) (`router_table.py --json`), whose CPU side is the bench's own single-core
+loops in `Sources/ArrowMetalBench/main.swift` rather than RouterCPU; the generated file's header says
+which source it came from, and `--check` regenerates from that source.
 
 **The CPU side** (`Router/RouterCPU.swift`) is one generic loop per shape, over the Arrow layout:
 *reduce* (a branch-free fold where a null slot feeds the operation's identity), *map* (arithmetic, every

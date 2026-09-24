@@ -7,11 +7,10 @@ This is the only roadmap: the older `../ROADMAP.md` now points here.
 
 ## Kernels
 
-- **The router's table from a quiet run.** The CPU/GPU router on `main` routes seven operations from a
-  crossover table fitted on a machine that was building other work at the time; near 300,000 rows it
-  still picks the slower path for `min`, `max` and the grouped sum. A quiet `Benchmarks/router_check.py`
-  run and `Benchmarks/router_table.py --from-check` refit it. Float columns have no measured crossover
-  yet and stay on the GPU.
+- **The router for float columns and array-to-array compares.** The router's table covers integer
+  columns; float columns have no measured crossover yet and stay on the GPU. The compare row is fitted on
+  the scalar compare, and an array-to-array compare near 3M rows is the one case in the router check where
+  `auto` picks the slower path (`Benchmarks/results/router_check_2026-09-24_after_refit.csv`).
 
 - **Grouped moments at a few groups.** Variance at a thousand groups is 0.96x of pyarrow at 50M rows
   (0.78x of it in the eager baseline), and stddev 1.24x of the fastest parallel idiom, because Metal
