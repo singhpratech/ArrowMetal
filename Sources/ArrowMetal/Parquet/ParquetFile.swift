@@ -72,6 +72,13 @@ public final class ParquetFile: @unchecked Sendable {
     public var lastReadStatistics: ParquetReadStatistics {
         statsLock.lock(); defer { statsLock.unlock() }; return _lastReadStatistics
     }
+    /// Use the column chunks' bloom filters, when the file has them, to drop the row groups an equality
+    /// filter's value is certainly absent from (`ParquetBloomFilter.swift`). On by default.
+    public var useBloomFilters: Bool {
+        get { statsLock.lock(); defer { statsLock.unlock() }; return _useBloomFilters }
+        set { statsLock.lock(); _useBloomFilters = newValue; statsLock.unlock() }
+    }
+    private var _useBloomFilters = true
     private var _usePageIndex = true
     private var _lastReadStatistics = ParquetReadStatistics()
     private let statsLock = NSLock()

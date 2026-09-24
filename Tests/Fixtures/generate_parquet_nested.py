@@ -251,6 +251,29 @@ def pageindex_table():
     })
 
 
+# ------------------------------------------------------------------------------ bloom filter fixtures
+
+BLOOM_GROUPS = 4
+BLOOM_ROWS = 1024
+
+
+def bloom_table():
+    """Row group g holds only values congruent to g mod 4, so every row group's min/max spans nearly the
+    same range and statistics cannot tell them apart; a bloom filter can."""
+    v = [BLOOM_GROUPS * j + g for g in range(BLOOM_GROUPS) for j in range(BLOOM_ROWS)]
+    return pa.table({
+        "i64": pa.array(v, pa.int64()),
+        "i32": pa.array(v, pa.int32()),
+        "u32": pa.array([x + 3_000_000_000 for x in v], pa.uint32()),
+        "f64": pa.array([x * 0.5 for x in v], pa.float64()),
+        "s": pa.array(["s%06d" % x for x in v], pa.string()),
+        # Past 32 bytes, so xxHash64's four-lane loop is exercised too.
+        "long": pa.array(["a value long enough to fill the stripes %06d" % x for x in v], pa.string()),
+        "cat": pa.array(["c%03d" % (BLOOM_GROUPS * (j % 50) + g) for g in range(BLOOM_GROUPS)
+                         for j in range(BLOOM_ROWS)], pa.string()),
+    })
+
+
 # ----------------------------------------------------------------------------------------- writers
 
 def write_pyarrow(table, name, **kw):
@@ -350,6 +373,13 @@ def main():
                   write_page_index=False, data_page_size=1024, row_group_size=2500)
     write_polars(pidx, "pageindex__polars", row_group_size=2500, data_page_size=1024,
                  statistics=True)
+
+    # Split-block bloom filters, from pyarrow (every column) and DuckDB (its dictionary-encoded columns).
+    bloom = bloom_table()
+    write_pyarrow(bloom, "bloom__pa_snappy", compression="snappy", row_group_size=BLOOM_ROWS,
+                  bloom_filter_options={c: {"ndv": BLOOM_ROWS, "fpp": 0.01} for c in bloom.column_names})
+    write_pyarrow(bloom, "bloom__pa_nobloom", compression="snappy", row_group_size=BLOOM_ROWS)
+    write_duckdb(bloom, "bloom__duckdb", row_group_size=2048)          # two row groups of two residues
 
     total = sum(os.path.getsize(os.path.join(OUT, f)) for f in os.listdir(OUT))
     print("wrote %d files, %.1f KB total" % (len(os.listdir(OUT)), total / 1024))

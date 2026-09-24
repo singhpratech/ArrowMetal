@@ -316,6 +316,22 @@ three page layouts and once without an index, Polars), and check that the skippe
 row groups read. A filter on a column inside a list does not narrow pages; the row-group statistics still
 apply to it.
 
+### Bloom filters
+
+A writer may also store a split-block bloom filter per column chunk (pyarrow with `bloom_filter_options`,
+DuckDB for its dictionary-encoded columns). An `==` filter hashes its literal the way the writer hashed
+the column's values — xxHash64 of the PLAIN encoding — and a row group whose filter does not have all 8
+bits of that hash set is dropped before any page is read, even when its min/max statistics let the value
+through (`ParquetBloomFilter.swift`). A set of bits is only a maybe, so the row group is then read as
+usual; a bloom filter never drops a row group that holds the value. Only literals with one exact
+encoding are looked up — integers stored as INT32 / INT64, strings and binaries, and floating-point
+values exactly representable in the column's type other than zero and NaN (which have two encodings
+each) — and anything else keeps the row group. `ParquetFile.useBloomFilters` (`f.use_bloom_filters`,
+`am_parquet_set_bloom_filters`) turns it off, and the read statistics count the row groups it dropped.
+`ParquetBloomFilterTests` checks xxHash64 against its published vectors and every value of the fixture
+against its row group's filter; `test_parquet_nested.py` looks up values in seven columns of a pyarrow
+file and one of a DuckDB file and requires pyarrow's exact matches with the filters on and off.
+
 ## Benchmarks
 
 Measured on an Apple M4 Max (Mac16,6, 64 GB), macOS 26.x, release build. 50,000,000 rows x 8 columns
@@ -487,7 +503,6 @@ ARROWMETAL_PARQUET_BIG=1 PYTHONPATH=python python -m pytest python/tests/test_pa
 - **`BIT_PACKED`** (the deprecated level encoding) and **LZO** are rejected.
 - **Encrypted files** are not supported.
 - **A single column chunk above 4 GiB** is rejected (the file itself has no size limit).
-- **Bloom filters** are ignored.
 - **Statistics pushdown returns a superset of the matching rows**: row-group granular, or page granular
   when the file has a page index. The deprecated `min`/`max` fields are only used when
   `min_value`/`max_value` are absent (they use a signed byte order that is wrong for strings, which is why

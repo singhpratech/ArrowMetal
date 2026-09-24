@@ -44,6 +44,8 @@ public struct ParquetReadStatistics: Sendable, Equatable {
     public var rowGroupsSkippedByStatistics = 0
     /// Row groups every page of which the column index ruled out.
     public var rowGroupsSkippedByPageIndex = 0
+    /// Row groups an equality filter's value is certainly absent from, by the bloom filter.
+    public var rowGroupsSkippedByBloomFilter = 0
     /// Data pages decoded, summed over every leaf column read.
     public var pagesDecoded = 0
     /// Data pages the page index let the read leave untouched, summed over every leaf column read.

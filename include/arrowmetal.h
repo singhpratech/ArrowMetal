@@ -1567,8 +1567,12 @@ int64_t am_parquet_schema_metadata(am_parquet_file* f, uint8_t* out, int64_t cap
 // whose min/max cannot match, and those pages are never read or decompressed. On by default;
 // am_parquet_set_page_index(f, 0) turns it off (every read is then row-group granular). After a read,
 // am_parquet_last_read_stats fills up to `cap` of [row groups read, row groups skipped by statistics,
-// row groups skipped by the page index, data pages decoded, data pages skipped, rows] and returns 6.
+// row groups skipped by the page index, data pages decoded, data pages skipped, rows, row groups skipped
+// by bloom filters] and returns 7. An equality filter also consults the column chunks' split-block bloom
+// filters, when the file has them, and drops the row groups its value is certainly absent from;
+// am_parquet_set_bloom_filters(f, 0) turns that off.
 int     am_parquet_set_page_index(am_parquet_file* f, int enabled);
+int     am_parquet_set_bloom_filters(am_parquet_file* f, int enabled);
 int64_t am_parquet_last_read_stats(am_parquet_file* f, int64_t* out, int64_t cap);
 
 #ifdef __cplusplus

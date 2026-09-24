@@ -4220,6 +4220,8 @@ _lib.am_parquet_schema_metadata.argtypes = [_P, ctypes.c_void_p, ctypes.c_int64]
 _lib.am_parquet_schema_metadata.restype = ctypes.c_int64
 _lib.am_parquet_set_page_index.argtypes = [_P, ctypes.c_int]
 _lib.am_parquet_set_page_index.restype = ctypes.c_int
+_lib.am_parquet_set_bloom_filters.argtypes = [_P, ctypes.c_int]
+_lib.am_parquet_set_bloom_filters.restype = ctypes.c_int
 _lib.am_parquet_last_read_stats.argtypes = [_P, ctypes.POINTER(ctypes.c_int64), ctypes.c_int64]
 _lib.am_parquet_last_read_stats.restype = ctypes.c_int64
 
@@ -4482,14 +4484,24 @@ class ParquetFile:
         self._use_page_index = bool(enabled)
 
     @property
+    def use_bloom_filters(self):
+        """Whether an equality filter consults the file's bloom filters to drop row groups (on by default)."""
+        return getattr(self, "_use_bloom_filters", True)
+
+    @use_bloom_filters.setter
+    def use_bloom_filters(self, enabled):
+        _check(_lib.am_parquet_set_bloom_filters(self._h, 1 if enabled else 0))
+        self._use_bloom_filters = bool(enabled)
+
+    @property
     def last_read_stats(self):
-        """What the most recent read on this handle did: row groups read and skipped (by statistics and
-        by the page index), data pages decoded and skipped, and rows returned."""
-        buf = (ctypes.c_int64 * 6)()
-        if _lib.am_parquet_last_read_stats(self._h, buf, 6) < 0:
+        """What the most recent read on this handle did: row groups read and skipped (by statistics, by
+        the page index and by bloom filters), data pages decoded and skipped, and rows returned."""
+        buf = (ctypes.c_int64 * 7)()
+        if _lib.am_parquet_last_read_stats(self._h, buf, 7) < 0:
             _check(1)
         keys = ("row_groups_read", "row_groups_skipped_by_statistics", "row_groups_skipped_by_page_index",
-                "pages_decoded", "pages_skipped", "rows")
+                "pages_decoded", "pages_skipped", "rows", "row_groups_skipped_by_bloom_filter")
         return dict(zip(keys, (int(v) for v in buf)))
 
     def _arrow_schema(self, names, arrays):

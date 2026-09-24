@@ -495,3 +495,76 @@ def test_damaged_page_indexes_never_crash_the_process():
             "crashed (rc=%d) on %s: %s" % (r.returncode, seen[-1] if seen else "?",
                                            "\n".join(r.stderr.strip().splitlines()[-3:])))
         assert len(seen) == n
+
+
+# ---------------------------------------------------------------------------- 6. bloom filters
+
+BLOOM_COLUMNS = ("i64", "i32", "u32", "f64", "s", "long", "cat")
+
+
+@pytest.mark.parametrize("name", ["bloom__pa_snappy", "bloom__duckdb", "bloom__pa_nobloom"])
+def test_bloom_filters_never_drop_a_matching_row_group(name):
+    """Every row group holds values spanning nearly the same min/max, so only a bloom filter can tell
+    them apart. Looking up values that are present must always find them, with or without bloom
+    filters, and give pyarrow's exact matches."""
+    path = os.path.join(NESTED, name + ".parquet")
+    want = pq.read_table(path)
+    f = am.ParquetFile(path)
+    rnd = random.Random(7)
+    for col in BLOOM_COLUMNS:
+        values = want[col].to_pylist()
+        for v in rnd.sample(values, 25):
+            flt = [(col, "==", v)]
+            f.use_bloom_filters = True
+            with_bloom = _exact(f.read_table(filters=flt), flt)
+            f.use_bloom_filters = False
+            without = _exact(f.read_table(filters=flt), flt)
+            assert with_bloom.to_pylist() == without.to_pylist() == _exact(want, flt).to_pylist(), (col, v)
+            assert with_bloom.num_rows > 0
+
+
+def test_bloom_filters_skip_row_groups():
+    path = os.path.join(NESTED, "bloom__pa_snappy.parquet")
+    want = pq.read_table(path)
+    f = am.ParquetFile(path)
+    rnd = random.Random(8)
+    for col in BLOOM_COLUMNS:
+        lookups = skipped = 0
+        for v in rnd.sample(want[col].to_pylist(), 20):
+            f.read_table(columns=[col], filters=[(col, "==", v)])
+            st = f.last_read_stats
+            skipped += st["row_groups_skipped_by_bloom_filter"]
+            lookups += 1
+            assert st["row_groups_read"] >= 1
+        # Each value lives in one of the four row groups; the other three are ruled out bar the odd
+        # false positive (the filters were written for a 1% false-positive rate).
+        assert skipped >= 0.9 * 3 * lookups, (col, skipped, lookups)
+    f.use_bloom_filters = False
+    f.read_table(columns=["i64"], filters=[("i64", "==", 4001)])
+    assert f.last_read_stats["row_groups_skipped_by_bloom_filter"] == 0
+    assert f.last_read_stats["row_groups_read"] == 4
+
+
+def test_bloom_filters_from_duckdb():
+    """DuckDB writes bloom filters for its dictionary-encoded columns (here `cat`)."""
+    path = os.path.join(NESTED, "bloom__duckdb.parquet")
+    f = am.ParquetFile(path)
+    assert f.num_row_groups == 2
+    skipped = 0
+    for k in range(200):
+        value = "c%03d" % k
+        got = f.read_table(columns=["cat"], filters=[("cat", "==", value)])
+        skipped += f.last_read_stats["row_groups_skipped_by_bloom_filter"]
+        assert value in got["cat"].to_pylist()
+    # Each value is in one of the two row groups; DuckDB's small filters let a few false positives by.
+    assert skipped >= 150, skipped
+
+
+def test_a_value_absent_but_within_the_statistics_is_ruled_out():
+    path = os.path.join(NESTED, "bloom__pa_snappy.parquet")
+    f = am.ParquetFile(path)
+    # 0.25 lies inside row group 0's [min, max] of f64 but is not one of its values.
+    t = f.read_table(columns=["f64"], filters=[("f64", "==", 0.25)])
+    st = f.last_read_stats
+    assert st["row_groups_skipped_by_statistics"] == 3 and st["row_groups_skipped_by_bloom_filter"] == 1
+    assert t.num_rows == 0

@@ -379,8 +379,16 @@ public func am_parquet_set_page_index(_ f: OpaquePointer?, _ enabled: Int32) -> 
     return 0
 }
 
+@_cdecl("am_parquet_set_bloom_filters")
+public func am_parquet_set_bloom_filters(_ f: OpaquePointer?, _ enabled: Int32) -> Int32 {
+    guard let file = pqFile(f) else { return pqBadArgument("am_parquet_set_bloom_filters", "`f` is NULL (no open file)") }
+    file.useBloomFilters = enabled != 0
+    return 0
+}
+
 /// `[row groups read, row groups skipped by statistics, row groups skipped by the page index,
-/// data pages decoded, data pages skipped, rows]` of the most recent read; returns 6.
+/// data pages decoded, data pages skipped, rows, row groups skipped by bloom filters]` of the most recent
+/// read; returns 7.
 @_cdecl("am_parquet_last_read_stats")
 public func am_parquet_last_read_stats(_ f: OpaquePointer?, _ out: UnsafeMutablePointer<Int64>?, _ cap: Int64) -> Int64 {
     guard let file = pqFile(f) else { return pqMissingFile("am_parquet_last_read_stats") }
@@ -394,7 +402,7 @@ public func am_parquet_last_read_stats(_ f: OpaquePointer?, _ out: UnsafeMutable
     }
     let s = file.lastReadStatistics
     let values = [s.rowGroupsRead, s.rowGroupsSkippedByStatistics, s.rowGroupsSkippedByPageIndex,
-                  s.pagesDecoded, s.pagesSkipped, s.rows]
+                  s.pagesDecoded, s.pagesSkipped, s.rows, s.rowGroupsSkippedByBloomFilter]
     if let out { for (i, v) in values.enumerated() where i < Int(cap) { out[i] = Int64(v) } }
     return Int64(values.count)
 }

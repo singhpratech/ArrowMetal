@@ -75,10 +75,13 @@ extension ParquetFile {
     /// Reads the selected columns and row groups into one Metal-resident record batch.
     public func read(_ options: ParquetReadOptions = ParquetReadOptions()) throws -> MetalRecordBatch {
         let afterStatistics = try selectedRowGroups(options)
+        // An equality filter whose value the row group's bloom filter has never seen rules it out.
+        let afterBloom = useBloomFilters && options.filters.contains(where: { $0.op == .eq })
+            ? afterStatistics.filter { bloomFiltersMayMatch(options.filters, rowGroup: $0) } : afterStatistics
         // The page index narrows each row group to candidate row ranges; a row group left with none is
         // not read at all.
-        let ranges = try candidateRowRanges(options, rowGroups: afterStatistics)
-        let groups = afterStatistics.filter { ranges[$0].map { !$0.isEmpty } ?? true }
+        let ranges = try candidateRowRanges(options, rowGroups: afterBloom)
+        let groups = afterBloom.filter { ranges[$0].map { !$0.isEmpty } ?? true }
         let plan = ParquetReadPlan(ranges: ranges.filter { !$0.value.isEmpty })
         let wanted = try selectedFields(options.columns)
         var names: [String] = []
@@ -108,7 +111,8 @@ extension ParquetFile {
         var stats = ParquetReadStatistics()
         stats.rowGroupsRead = groups.count
         stats.rowGroupsSkippedByStatistics = (options.rowGroups?.count ?? metadata.rowGroups.count) - afterStatistics.count
-        stats.rowGroupsSkippedByPageIndex = afterStatistics.count - groups.count
+        stats.rowGroupsSkippedByBloomFilter = afterStatistics.count - afterBloom.count
+        stats.rowGroupsSkippedByPageIndex = afterBloom.count - groups.count
         stats.pagesDecoded = plan.pagesDecoded
         stats.pagesSkipped = plan.pagesSkipped
         stats.rows = columns.first?.length ?? 0
