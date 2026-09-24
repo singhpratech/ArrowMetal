@@ -480,6 +480,53 @@ final class IPCViewTests: XCTestCase {
         XCTAssertThrowsError(try ArrowFixedShapeTensorType(metadata: Array("{\"dim_names\":[]}".utf8)))
     }
 
+    /// Tensor metadata whose shape multiplies past `Int` is malformed input, an error the reader throws;
+    /// before the product was checked it trapped the process. Non-integer dimensions are refused rather
+    /// than truncated.
+    func testFixedShapeTensorShapeOverflowIsAnError() throws {
+        let values = MetalArray<Int32>(length: 8, nullCount: 0, validity: nil,
+                                       values: try MetalArrowBuffer.allocate(byteCount: 32))
+        let storage = try MetalListArray(counts: [4, 4], values: .int32(values), kind: .fixedSize(4))
+        for shape in ["[4294967296,4294967296]", "[9223372036854775807,2]", "[3037000500,3037000500]",
+                      "[65536,65536,65536,65536]"] {
+            let column = AnyMetalArray.extended(MetalExtensionArray(storage: .list(storage), name: "arrow.fixed_shape_tensor",
+                                                                    metadata: Array("{\"shape\":\(shape)}".utf8)))
+            let data = try ArrowIPCWriter.encode([try MetalRecordBatch(names: ["t"], columns: [column])], format: .stream)
+            XCTAssertThrowsError(try ArrowIPCReader(data: data).batch(at: 0)) { error in
+                XCTAssertTrue("\(error)".contains("column 't'"), "\(error)")
+                XCTAssertTrue("\(error)".contains("has more elements than an Int holds"), "\(error)")
+            }
+        }
+        XCTAssertThrowsError(try ArrowFixedShapeTensorType(shape: [Int.max, 2]))
+        XCTAssertEqual(try ArrowFixedShapeTensorType(shape: [Int.max, 1]).elementCount, Int.max)
+        XCTAssertEqual(try ArrowFixedShapeTensorType(shape: [0, Int.max]).elementCount, 0)
+        for bad in ["[1.5,2]", "[1e30]", "[true,false]", "[18446744073709551616]", "[\"2\"]"] {
+            XCTAssertThrowsError(try ArrowFixedShapeTensorType(metadata: Array("{\"shape\":\(bad)}".utf8)), bad) { error in
+                XCTAssertTrue("\(error)".contains("shape is not a list of integers"), "\(bad): \(error)")
+            }
+        }
+        XCTAssertEqual(try ArrowFixedShapeTensorType(metadata: Array("{\"shape\":[2,3]}".utf8)).elementCount, 6)
+    }
+
+    /// A column whose metadata names any extension type other than `arrow.fixed_shape_tensor` reads as
+    /// its storage column, so the operators that take the plain type take it; the keys stay on the
+    /// reader's schema.
+    func testOtherExtensionNamesReadAsTheirStorage() throws {
+        let values = try MetalArray<Int64>([3, nil, 7])
+        let column = AnyMetalArray.int64(values).asExtensionType(name: "example.custom", metadata: Array("meta".utf8))
+        let data = try ArrowIPCWriter.encode([try MetalRecordBatch(names: ["c"], columns: [column])], format: .stream)
+        let reader = try ArrowIPCReader(data: data)
+        XCTAssertEqual(reader.schema["c"]?.extensionName, "example.custom")
+        XCTAssertEqual(reader.schema["c"]?.metadata.first { $0.key == "ARROW:extension:metadata" }?.value,
+                       Array("meta".utf8))
+        let read = try XCTUnwrap(try reader.batch(at: 0)["c"])
+        guard case .int64(let got) = read else { return XCTFail("expected int64 storage, got \(read.arrowFormat)") }
+        XCTAssertEqual(got.toArray(), [3, nil, 7])
+        XCTAssertNil(read.extensionName)
+        // The operators that take int64 key and value columns take it.
+        XCTAssertEqual(try read.streamValues(), [.int(3), .null, .int(7)])
+    }
+
     // MARK: - refused
 
     /// IPC Tensor and SparseTensor messages are refused with an error that names them, in a stream on

@@ -993,20 +993,23 @@ public final class ArrowIPCReader {
     /// batch carries only its codes, and its children (if the value type has any) travel in the
     /// `DictionaryBatch` message instead.
     ///
-    /// A field whose metadata names an extension type (`ARROW:extension:name`) comes back as
-    /// `.extended`: the storage column built from the buffers, plus the extension name, its metadata and
-    /// the field's other keys, which is what the C Data importer does with the same schema.
+    /// A field that is the canonical `arrow.fixed_shape_tensor` comes back as `.extended`: the storage
+    /// column built from the buffers (checked against the tensor's shape), plus the extension name, its
+    /// metadata and the field's other keys. Every other column, including one whose metadata names some
+    /// other extension type, comes back as its storage column, so every operator takes it as it takes
+    /// the plain type; the field's `ARROW:extension:*` keys stay readable on `schema`.
     private func buildColumn(field: ArrowIPCField, cursor: ArrowIPCCursor) throws -> AnyMetalArray {
         let storage = try buildStorageColumn(field: field, cursor: cursor)
-        guard !field.metadata.isEmpty, let extensionName = field.extensionName else { return storage }
+        guard !field.metadata.isEmpty, field.extensionName == ArrowFixedShapeTensorType.extensionName else {
+            return storage
+        }
+        let extensionName = ArrowFixedShapeTensorType.extensionName
         var other = ArrowSchemaMetadata(field.metadata.map { ArrowSchemaMetadata.Pair(key: $0.key, value: $0.value) })
         let extensionMetadata = other[ArrowSchemaMetadata.extensionMetadataKey]
         other[ArrowSchemaMetadata.extensionNameKey] = nil
         other[ArrowSchemaMetadata.extensionMetadataKey] = nil
-        if extensionName == ArrowFixedShapeTensorType.extensionName {
-            // Checked against its storage, so a tensor column always has the shape it declares.
-            _ = try ArrowFixedShapeTensorType(metadata: extensionMetadata ?? [], storage: storage, column: field.name)
-        }
+        // Checked against its storage, so a tensor column always has the shape it declares.
+        _ = try ArrowFixedShapeTensorType(metadata: extensionMetadata ?? [], storage: storage, column: field.name)
         return .extended(MetalExtensionArray(storage: storage, name: extensionName, metadata: extensionMetadata,
                                              otherMetadata: other))
     }

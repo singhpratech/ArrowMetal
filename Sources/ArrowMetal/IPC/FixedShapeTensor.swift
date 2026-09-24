@@ -22,12 +22,20 @@ public struct ArrowFixedShapeTensorType: Equatable, Sendable {
     /// Optional permutation of `0 ..< shape.count` giving the physical order of the dimensions.
     public let permutation: [Int]?
 
-    /// Elements per tensor: the product of `shape` (and the storage list's fixed size).
-    public var elementCount: Int { shape.reduce(1, *) }
+    /// Elements per tensor: the product of `shape` (and the storage list's fixed size). The initialiser
+    /// refuses a shape whose product does not fit in an `Int`.
+    public let elementCount: Int
 
     public init(shape: [Int], dimNames: [String]? = nil, permutation: [Int]? = nil) throws {
         func fail(_ s: String) -> ArrowMetalError { .invalidArrowArray("arrow.fixed_shape_tensor: " + s) }
         guard shape.allSatisfy({ $0 >= 0 }) else { throw fail("shape \(shape) has a negative dimension") }
+        // Checked, so metadata naming a huge shape is an error rather than an overflow trap.
+        var product = 1
+        for d in shape {
+            let (p, overflow) = product.multipliedReportingOverflow(by: d)
+            guard !overflow else { throw fail("shape \(shape) has more elements than an Int holds") }
+            product = p
+        }
         if let dimNames, dimNames.count != shape.count {
             throw fail("\(dimNames.count) dim_names for a \(shape.count)-dimensional shape")
         }
@@ -35,6 +43,7 @@ public struct ArrowFixedShapeTensorType: Equatable, Sendable {
             throw fail("permutation \(permutation) is not a permutation of 0..<\(shape.count)")
         }
         self.shape = shape
+        self.elementCount = product
         self.dimNames = dimNames
         self.permutation = permutation
     }
@@ -47,7 +56,12 @@ public struct ArrowFixedShapeTensorType: Equatable, Sendable {
         }
         func ints(_ key: String) throws -> [Int]? {
             guard let v = object[key] else { return nil }
-            guard let a = v as? [NSNumber] else { throw fail("\(key) is not a list of integers") }
+            // Each entry must be an integer an Int holds exactly: 2.5, 1e30 or true are refused, not
+            // truncated or wrapped by `intValue`.
+            guard let a = v as? [NSNumber],
+                  a.allSatisfy({ CFGetTypeID($0) == CFNumberGetTypeID() && !CFNumberIsFloatType($0)
+                                 && NSNumber(value: $0.int64Value) == $0 })
+            else { throw fail("\(key) is not a list of integers") }
             return a.map(\.intValue)
         }
         guard let shape = try ints("shape") else { throw fail("no shape") }

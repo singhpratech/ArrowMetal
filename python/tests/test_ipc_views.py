@@ -198,3 +198,71 @@ def test_ipc_tensor_messages_are_refused(tmp_path):
         pa.ipc.write_tensor(pa.Tensor.from_numpy(np.arange(6, dtype=np.int32).reshape(2, 3)), f)
     with pytest.raises(Exception, match="IPC Tensor and SparseTensor messages are not read"):
         read(path)
+
+
+@pytest.mark.parametrize("shape", ["[4294967296,4294967296]", "[9223372036854775807,2]", "[3037000500,3037000500]",
+                                   "[65536,65536,65536,65536]"])
+def test_fixed_shape_tensor_shape_overflow_is_an_error(tmp_path, shape):
+    storage = pa.array([[1, 2, 3, 4]] * 2, pa.list_(pa.int32(), 4))
+    f = pa.field("t", storage.type, metadata={"ARROW:extension:name": "arrow.fixed_shape_tensor",
+                                              "ARROW:extension:metadata": '{"shape":%s}' % shape})
+    path = str(tmp_path / "t.arrows")
+    write(path, [pa.record_batch([storage], schema=pa.schema([f]))], "stream")
+    with pytest.raises(Exception, match="has more elements than an Int holds"):
+        read(path)
+
+
+def test_scan_ipc_sinks_write_a_tensor_column_as_its_storage(tmp_path):
+    """`sink_ipc` and `sort_to_ipc` write the storage fixed_size_list without the extension keys; the
+    reader and `ArrowIPCWriter` keep them (the Swift suite round-trips those with pyarrow)."""
+    tensor = pa.FixedShapeTensorArray.from_numpy_ndarray(np.arange(24, dtype=np.int32).reshape(6, 2, 2))
+    path = str(tmp_path / "t.arrow")
+    write(path, [pa.record_batch([pa.array(range(6), pa.int64()), tensor], names=["i", "t"])], "file")
+    assert read(path).column("t").type == tensor.type
+    for name, run in [("sink", lambda out: am.scan_ipc(path, prefetch=0).sink_ipc(out)),
+                      ("sorted", lambda out: am.scan_ipc(path, prefetch=0).sort_to_ipc("i", out))]:
+        out = str(tmp_path / (name + ".arrows"))
+        run(out)
+        got = pa.ipc.open_stream(out).read_all()
+        assert got.schema.field("t").type == tensor.storage.type, name
+        assert got.column("t").combine_chunks().equals(tensor.storage), name
+
+
+# ---- other extension names
+
+def test_other_extension_names_read_as_their_storage_through_every_operator(tmp_path):
+    """A column whose metadata names an extension type other than arrow.fixed_shape_tensor reads as its
+    storage type, so each streaming operator gives the result it gives on the same column without the
+    keys."""
+    n = 1000
+    i = pa.array(np.arange(n, dtype=np.int64))
+    k = pa.array(np.arange(n) % 7, pa.int32())
+    c = pa.array((np.arange(n) * 3) % 11, pa.int64())
+    tagged = pa.schema([pa.field("i", pa.int64()), pa.field("k", pa.int32()),
+                        pa.field("c", pa.int64(), metadata={"ARROW:extension:name": "example.custom",
+                                                            "ARROW:extension:metadata": "meta"})])
+    plain = pa.schema([("i", pa.int64()), ("k", pa.int32()), ("c", pa.int64())])
+    paths = {}
+    for name, schema in [("tagged", tagged), ("plain", plain)]:
+        paths[name] = str(tmp_path / (name + ".arrow"))
+        write(paths[name], [pa.record_batch([i, k, c], schema=schema)], "file")
+
+    def run(path):
+        S = lambda: am.scan_ipc(path, prefetch=0)
+        return {
+            "collect": S().collect().column("c").to_pylist(),
+            "top_k": S().top_k("c", 3).column("c").to_pylist(),
+            "group_by key": S().group_by("c").agg([("count", None, "n")]).sort_by("c").to_pylist(),
+            "group_by sum": S().group_by("k").agg([("sum", "c", "s")]).sort_by("k").to_pylist(),
+            "quantile": S().quantile("c", 0.5),
+            "join": S().join(S(), on="c").collect().num_rows,
+            "join sum": S().join(S().select(["i"]), on="i").sum("c"),
+            "count_distinct": S().count_distinct_approx("c"),
+            "sum": S().sum("c"),
+        }
+
+    got, want = run(paths["tagged"]), run(paths["plain"])
+    assert got == want
+    assert want["collect"] == c.to_pylist()
+    assert want["join sum"] == pa.compute.sum(c).as_py()
+    assert want["count_distinct"] == 11
