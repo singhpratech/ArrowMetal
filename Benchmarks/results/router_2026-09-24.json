@@ -1,7 +1,7 @@
 {
  "generated": "2026-09-24",
  "sources": {
-  "sweep": "full_matrix_2026-09-24.csv",
+  "sweep": "crossover_sweep_2026-09-24.csv",
   "matrix": "full_matrix_2026-09-07-parallel.csv",
   "bench": "crossover_bench_2026-09-24.csv",
   "bench_header": "ArrowMetal crossover on Apple M4 Max, 16 CPU cores, best of up to 20 (5 at 10M rows and above), 10% nulls, 2026-09-24T22:54:48Z"

@@ -1,4 +1,4 @@
-# crossover from full_matrix_2026-09-24.csv + full_matrix_2026-09-07-parallel.csv (50M rows) + crossover_bench_2026-09-24.csv, 2026-09-24
+# crossover from crossover_sweep_2026-09-24.csv + full_matrix_2026-09-07-parallel.csv (50M rows) + crossover_bench_2026-09-24.csv, 2026-09-24
 family,op,rows,arrowmetal_wall_ms,arrowmetal_cpu_ms,best_cpu_wall_ms,best_cpu_library,ratio,crossover_rows
 compare+select,compare array (int64 > int64),1000,0.0020,0.0030,0.0016,polars,0.800,"50,000,000"
 compare+select,compare array (int64 > int64),10000,0.0040,0.0050,0.0029,polars,0.725,"50,000,000"
