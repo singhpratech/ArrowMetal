@@ -1563,6 +1563,14 @@ int am_stream_join_group_by(am_stream* s, struct ArrowArrayStream* build, const 
 int64_t am_parquet_field_metadata(am_parquet_file* f, const char* column, uint8_t* out, int64_t cap);
 int64_t am_parquet_schema_metadata(am_parquet_file* f, uint8_t* out, int64_t cap);
 
+// Page-level skipping: with a filter, a file's column index and offset index rule out the data pages
+// whose min/max cannot match, and those pages are never read or decompressed. On by default;
+// am_parquet_set_page_index(f, 0) turns it off (every read is then row-group granular). After a read,
+// am_parquet_last_read_stats fills up to `cap` of [row groups read, row groups skipped by statistics,
+// row groups skipped by the page index, data pages decoded, data pages skipped, rows] and returns 6.
+int     am_parquet_set_page_index(am_parquet_file* f, int enabled);
+int64_t am_parquet_last_read_stats(am_parquet_file* f, int64_t* out, int64_t cap);
+
 #ifdef __cplusplus
 }
 #endif

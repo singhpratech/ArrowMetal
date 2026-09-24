@@ -267,6 +267,9 @@ public struct ParquetColumnMetadata: Sendable {
     public var indexPageOffset: Int64? = nil
     public var dictionaryPageOffset: Int64? = nil
     public var statistics: ParquetStatistics? = nil
+    /// Where the chunk's split-block bloom filter lives, when the writer wrote one.
+    public var bloomFilterOffset: Int64? = nil
+    public var bloomFilterLength: Int32? = nil
 
     /// Byte offset where this chunk's pages start (the dictionary page comes first when present).
     public var startOffset: Int64 {
@@ -289,6 +292,8 @@ public struct ParquetColumnMetadata: Sendable {
             case 10: m.indexPageOffset = try r.int64(); return true
             case 11: m.dictionaryPageOffset = try r.int64(); return true
             case 12: m.statistics = try ParquetStatistics.read(&r); return true
+            case 14: m.bloomFilterOffset = try r.int64(); return true
+            case 15: m.bloomFilterLength = try r.int32(); return true
             default: _ = t; return false
             }
         }
@@ -300,6 +305,12 @@ public struct ParquetColumnChunk: Sendable {
     public var filePath: String? = nil
     public var fileOffset: Int64 = 0
     public var meta = ParquetColumnMetadata()
+    /// Where the chunk's `OffsetIndex` (one location and first row per data page) lives, when written.
+    public var offsetIndexOffset: Int64? = nil
+    public var offsetIndexLength: Int32? = nil
+    /// Where the chunk's `ColumnIndex` (per-page min / max / null flags) lives, when written.
+    public var columnIndexOffset: Int64? = nil
+    public var columnIndexLength: Int32? = nil
 
     static func read(_ r: inout ThriftReader) throws -> ParquetColumnChunk {
         var c = ParquetColumnChunk()
@@ -308,6 +319,10 @@ public struct ParquetColumnChunk: Sendable {
             case 1: c.filePath = try r.string(); return true
             case 2: c.fileOffset = try r.int64(); return true
             case 3: c.meta = try ParquetColumnMetadata.read(&r); return true
+            case 4: c.offsetIndexOffset = try r.int64(); return true
+            case 5: c.offsetIndexLength = try r.int32(); return true
+            case 6: c.columnIndexOffset = try r.int64(); return true
+            case 7: c.columnIndexLength = try r.int32(); return true
             default: _ = t; return false
             }
         }

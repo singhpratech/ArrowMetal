@@ -61,6 +61,24 @@ public final class ParquetFile: @unchecked Sendable {
     private var wrapped: [Int: MetalArrowBuffer] = [:]
     private let wrapLock = NSLock()
 
+    /// Use the column index and offset index, when the file has them, to skip the data pages a
+    /// statistics filter rules out (`ParquetPageIndex.swift`). On by default; turning it off gives the
+    /// row-group-granular read the same filters produce without the index.
+    public var usePageIndex: Bool {
+        get { statsLock.lock(); defer { statsLock.unlock() }; return _usePageIndex }
+        set { statsLock.lock(); _usePageIndex = newValue; statsLock.unlock() }
+    }
+    /// What the most recent `read` on this handle did with the statistics and the page index.
+    public var lastReadStatistics: ParquetReadStatistics {
+        statsLock.lock(); defer { statsLock.unlock() }; return _lastReadStatistics
+    }
+    private var _usePageIndex = true
+    private var _lastReadStatistics = ParquetReadStatistics()
+    private let statsLock = NSLock()
+    func recordReadStatistics(_ s: ParquetReadStatistics) {
+        statsLock.lock(); _lastReadStatistics = s; statsLock.unlock()
+    }
+
     public var numRows: Int64 { metadata.numRows }
     public var rowGroupCount: Int { metadata.rowGroups.count }
 

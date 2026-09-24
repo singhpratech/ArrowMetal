@@ -215,7 +215,12 @@ struct ThriftReader {
         case .binary, .uuid: _ = try binaryRange()
         case .list, .set:
             let h = try listHeader()
-            for _ in 0..<h.count { try skip(h.type) }
+            // A boolean *element* is a byte (only a boolean field keeps its value in the type nibble).
+            if h.type == .boolTrue || h.type == .boolFalse {
+                for _ in 0..<h.count { _ = try byte() }
+            } else {
+                for _ in 0..<h.count { try skip(h.type) }
+            }
         case .map:
             let mapAt = pos
             let n = try varintCount("thrift map at \(mapAt)")

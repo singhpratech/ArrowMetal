@@ -74,7 +74,12 @@ public struct ParquetReadOptions: Sendable {
 extension ParquetFile {
     /// Reads the selected columns and row groups into one Metal-resident record batch.
     public func read(_ options: ParquetReadOptions = ParquetReadOptions()) throws -> MetalRecordBatch {
-        let groups = try selectedRowGroups(options)
+        let afterStatistics = try selectedRowGroups(options)
+        // The page index narrows each row group to candidate row ranges; a row group left with none is
+        // not read at all.
+        let ranges = try candidateRowRanges(options, rowGroups: afterStatistics)
+        let groups = afterStatistics.filter { ranges[$0].map { !$0.isEmpty } ?? true }
+        let plan = ParquetReadPlan(ranges: ranges.filter { !$0.value.isEmpty })
         let wanted = try selectedFields(options.columns)
         var names: [String] = []
         var columns: [AnyMetalArray] = []
@@ -89,7 +94,7 @@ extension ParquetFile {
         try context.batch {
             for f in wanted {
                 names.append(f.name)
-                var column = try readField(f, rowGroups: groups, options: options)
+                var column = try readField(f, rowGroups: groups, options: options, plan: plan)
                 // A top-level column takes back what `ARROW:schema` says the Parquet schema lost; a leaf
                 // selected on its own by dotted path reads as the Parquet schema describes it.
                 if let top = fields.first(where: { $0.name == f.name }),
@@ -100,6 +105,14 @@ extension ParquetFile {
                 columns.append(column)
             }
         }
+        var stats = ParquetReadStatistics()
+        stats.rowGroupsRead = groups.count
+        stats.rowGroupsSkippedByStatistics = (options.rowGroups?.count ?? metadata.rowGroups.count) - afterStatistics.count
+        stats.rowGroupsSkippedByPageIndex = afterStatistics.count - groups.count
+        stats.pagesDecoded = plan.pagesDecoded
+        stats.pagesSkipped = plan.pagesSkipped
+        stats.rows = columns.first?.length ?? 0
+        recordReadStatistics(stats)
         if columns.isEmpty {
             // A projection of no columns still has a row count; expose it as an empty batch.
             return try MetalRecordBatch(names: [], columns: [])
@@ -160,21 +173,32 @@ extension ParquetFile {
         try selectedRowGroups(options).reduce(0) { $0 + Int(metadata.rowGroups[$1].numRows) }
     }
 
-    func readField(_ f: ParquetField, rowGroups: [Int], options: ParquetReadOptions) throws -> AnyMetalArray {
+    func readField(_ f: ParquetField, rowGroups: [Int], options: ParquetReadOptions,
+                   plan: ParquetReadPlan? = nil) throws -> AnyMetalArray {
+        // Whole row groups, for the columns that are not trimmed page by page.
+        let whole = rowGroups.map { (group: $0, rows: 0..<rowsIn(group: $0)) }
+        let trimming = plan.map { !$0.ranges.isEmpty } ?? false
         switch f.kind {
         case .leaf(let l):
-            let d = try decodeLeaf(l, rowGroups: rowGroups, options: options)
-            return try d.arrowArray()
+            let d = try decodeLeaf(l, rowGroups: rowGroups, options: options, plan: plan, subset: true)
+            let a = try d.arrowArray()
+            // A leaf below a list, read on its own by dotted path, has one entry per element rather than
+            // per row, so there are no rows to trim it to.
+            return trimming && l.maxRepetition == 0 ? try trim(a, spans: d.rowSpans, plan: plan!) : a
         case .list(let element, let repeatedDefinition):
             // A one-level `list<primitive>` keeps its dedicated kernel pair; every other list, map and
             // struct goes through the general assembler.
+            let a: AnyMetalArray
             if !f.isMap, case .leaf(let l) = element.kind, l.maxRepetition == 1 {
-                let d = try decodeLeaf(l, rowGroups: rowGroups, options: options, needRepetition: true)
-                return try d.listArray(repeatedDefinition: repeatedDefinition, outerNullable: f.nullable)
+                let d = try decodeLeaf(l, rowGroups: rowGroups, options: options, needRepetition: true, plan: plan)
+                a = try d.listArray(repeatedDefinition: repeatedDefinition, outerNullable: f.nullable)
+            } else {
+                a = try ParquetNestedAssembler(file: self, rowGroups: rowGroups, options: options, plan: plan).buildTopLevel(f)
             }
-            return try ParquetNestedAssembler(file: self, rowGroups: rowGroups, options: options).buildTopLevel(f)
+            return trimming ? try trim(a, spans: whole, plan: plan!) : a
         case .group:
-            return try ParquetNestedAssembler(file: self, rowGroups: rowGroups, options: options).buildTopLevel(f)
+            let a = try ParquetNestedAssembler(file: self, rowGroups: rowGroups, options: options, plan: plan).buildTopLevel(f)
+            return trimming ? try trim(a, spans: whole, plan: plan!) : a
         }
     }
 }
@@ -205,8 +229,14 @@ public struct ParquetFilter: Sendable {
         guard let leaf = file.leaves.first(where: { $0.dottedPath == column || $0.name == column }),
               leaf.index < rowGroup.columns.count else { return true }
         let meta = rowGroup.columns[leaf.index].meta
-        guard let stats = meta.statistics, let lo = stats.lower, let hi = stats.upper,
-              let low = decode(lo, leaf), let high = decode(hi, leaf) else { return true }
+        guard let stats = meta.statistics, let lo = stats.lower, let hi = stats.upper else { return true }
+        return mayMatch(lower: lo, upper: hi, leaf: leaf)
+    }
+
+    /// True when values between `lower` and `upper` (statistics bytes in the leaf's physical type) *may*
+    /// satisfy the filter. Used for a row group's statistics and for one page's column-index entry.
+    func mayMatch(lower lo: [UInt8], upper hi: [UInt8], leaf: ParquetLeaf) -> Bool {
+        guard let low = decode(lo, leaf), let high = decode(hi, leaf) else { return true }
         // `ne` can only be excluded when the whole group is a single value equal to the literal.
         switch op {
         case .eq: return compare(low, high) <= 0 ? (compare(low, self.value) <= 0 && compare(self.value, high) <= 0) : true

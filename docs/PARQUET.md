@@ -250,7 +250,7 @@ FlatBuffers views in `IPC/FlatBuffers.swift` and puts back what the Parquet sche
 | an extension type | its storage | the storage wrapped in `MetalExtensionArray`, so a consumer that knows the type rebuilds it |
 | field `custom_metadata` | — | `ParquetFile.arrowFieldMetadata(column:)`, `am_parquet_field_metadata`, `f.field_metadata(column)`, and on every field of `read_parquet_table`'s Table |
 
-Time zones, durations and decimals are restored inside structs, lists and maps too. The file's other
+Time zones and durations are restored inside structs, lists and maps too. The file's other
 key/value metadata is the schema metadata (`arrowSchemaMetadata`, `am_parquet_schema_metadata`,
 `f.schema_metadata`), and a Parquet `field_id` shows up as `PARQUET:field_id`, as it does in pyarrow.
 The `null` type needs no stored schema: Parquet annotates a null column `UNKNOWN`, which reads as `null`.
@@ -282,11 +282,39 @@ for day in days:
 
 Only the requested column chunks are ever touched — the other columns' pages are never even faulted
 in. `filters` is evaluated against the footer's `min_value` / `max_value` statistics per row group; a
-row group whose range cannot contain a match is skipped without reading a page. Pushdown is row-group
-granular, so the result is a superset of the matching rows: follow it with `filter` (or a fused
-`am.query`) to get exactly the rows.
-`ParquetFile.selectedRowGroups(_:)` / `ParquetFile.selected_row_groups(...)` report what a filter keeps
-without reading anything.
+row group whose range cannot contain a match is skipped without reading a page. When the file also has a
+column index and an offset index, the same filters then skip pages inside the row groups that remain
+(next section). Either way the result is a superset of the matching rows: follow it with `filter` (or a
+fused `am.query`) to get exactly the rows.
+`ParquetFile.selectedRowGroups(_:)` / `ParquetFile.selected_row_groups(...)` report what the row-group
+statistics keep without reading anything.
+
+### Page-level skipping
+
+A writer may store, after the row groups, a **column index** (each data page's min, max and whether it
+holds only nulls) and an **offset index** (where each data page starts and its first row). pyarrow writes
+them with `write_page_index=True`; Polars writes them by default. With them a filter narrows each row
+group to *candidate row ranges* (`ParquetPageIndex.swift`):
+
+1. For each filter on a flat column, a page whose [min, max] cannot satisfy it, or that holds only nulls,
+   rules out its rows. The ranges the filters leave are intersected; a row group left with none is not
+   read at all, even when its row-group statistics let it through.
+2. Every flat column with an offset index decodes only the data pages that overlap a candidate range.
+   The page list comes from the offset index, so a skipped page is never decompressed, never decoded,
+   and its header is never read.
+3. Pages have different boundaries in different columns, so every column — nested ones and those
+   without an offset index included, which decode their row groups whole — is trimmed to exactly the
+   candidate rows with one `filter`. All columns of the result cover the same rows.
+
+The rows that match a filter are the same with and without the index; the index only makes the superset
+smaller. `ParquetFile.usePageIndex` (`f.use_page_index` in Python, `am_parquet_set_page_index` in C)
+turns it off, and `lastReadStatistics` (`f.last_read_stats`, `am_parquet_last_read_stats`) reports what
+the last read did: row groups read and skipped by statistics and by the page index, data pages decoded
+and skipped, rows returned. `ParquetPageIndexTests` and `test_parquet_nested.py` compare the exact
+matches with and without the index against pyarrow over fifteen filter sets on five files (pyarrow in
+three page layouts and once without an index, Polars), and check that the skipped and decoded pages add up to the pages of the
+row groups read. A filter on a column inside a list does not narrow pages; the row-group statistics still
+apply to it.
 
 ## Benchmarks
 
@@ -459,10 +487,9 @@ ARROWMETAL_PARQUET_BIG=1 PYTHONPATH=python python -m pytest python/tests/test_pa
 - **`BIT_PACKED`** (the deprecated level encoding) and **LZO** are rejected.
 - **Encrypted files** are not supported.
 - **A single column chunk above 4 GiB** is rejected (the file itself has no size limit).
-- **Column and offset indexes** in the footer are parsed past but not used: page-level skipping by index
-  is not implemented, only row-group skipping by statistics.
 - **Bloom filters** are ignored.
-- **Statistics pushdown is row-group granular**, and the deprecated `min`/`max` fields are only used when
+- **Statistics pushdown returns a superset of the matching rows**: row-group granular, or page granular
+  when the file has a page index. The deprecated `min`/`max` fields are only used when
   `min_value`/`max_value` are absent (they use a signed byte order that is wrong for strings, which is why
   Parquet deprecated them).
 - **ZSTD needs libzstd** installed; see above.

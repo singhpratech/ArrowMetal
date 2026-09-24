@@ -206,6 +206,14 @@ Parquet on the GPU
   by `arrowFieldMetadata(column:)` / `arrowSchemaMetadata`, `am_parquet_field_metadata` /
   `am_parquet_schema_metadata`, and carried on `read_parquet_table`'s Table. Absent or malformed
   metadata is ignored (`ParquetArrowSchemaTests`).
+- Page-level skipping for Parquet statistics filters: with a column index and offset index in the file,
+  the pages whose min/max cannot match (or that hold only nulls) are never read, decompressed or decoded,
+  a row group every page of which is ruled out is dropped, and every column is trimmed to the same
+  candidate rows. The matching rows are identical with and without the index; `usePageIndex` /
+  `use_page_index` / `am_parquet_set_page_index` turn it off and `lastReadStatistics` / `last_read_stats`
+  / `am_parquet_last_read_stats` count the pages decoded and skipped (`ParquetPageIndexTests`).
+- A one-level Parquet list column read from row groups that a filter removed entirely now comes back
+  empty instead of raising "a list column must have definition levels".
 
 Out-of-core streaming
 - A streaming executor for datasets larger than memory (docs/STREAMING.md): Arrow IPC files/directories

@@ -369,3 +369,32 @@ public func am_parquet_schema_metadata(_ f: OpaquePointer?, _ out: UnsafeMutable
     }
     return pqMetadataBlob(file.arrowSchemaMetadata, out, cap)
 }
+
+// MARK: - Page index (docs/PARQUET.md, "Page-level skipping")
+
+@_cdecl("am_parquet_set_page_index")
+public func am_parquet_set_page_index(_ f: OpaquePointer?, _ enabled: Int32) -> Int32 {
+    guard let file = pqFile(f) else { return pqBadArgument("am_parquet_set_page_index", "`f` is NULL (no open file)") }
+    file.usePageIndex = enabled != 0
+    return 0
+}
+
+/// `[row groups read, row groups skipped by statistics, row groups skipped by the page index,
+/// data pages decoded, data pages skipped, rows]` of the most recent read; returns 6.
+@_cdecl("am_parquet_last_read_stats")
+public func am_parquet_last_read_stats(_ f: OpaquePointer?, _ out: UnsafeMutablePointer<Int64>?, _ cap: Int64) -> Int64 {
+    guard let file = pqFile(f) else { return pqMissingFile("am_parquet_last_read_stats") }
+    guard cap >= 0 else {
+        pqBadArgument("am_parquet_last_read_stats", "`cap` is \(cap), which is negative")
+        return -1
+    }
+    guard out != nil || cap == 0 else {
+        pqBadArgument("am_parquet_last_read_stats", "`out` is NULL but `cap` is \(cap)")
+        return -1
+    }
+    let s = file.lastReadStatistics
+    let values = [s.rowGroupsRead, s.rowGroupsSkippedByStatistics, s.rowGroupsSkippedByPageIndex,
+                  s.pagesDecoded, s.pagesSkipped, s.rows]
+    if let out { for (i, v) in values.enumerated() where i < Int(cap) { out[i] = Int64(v) } }
+    return Int64(values.count)
+}

@@ -355,3 +355,143 @@ def test_fixed_size_list_with_null_rows():
     got = am.read_parquet_table(path)["fsl"]
     assert got.type == pa.list_(pa.int32(), 3)
     assert got.to_pylist() == [None if i % 7 == 0 else [i, -i, None if i % 5 == 0 else i * 2] for i in range(60)]
+
+
+# --------------------------------------------------------------- 5. page-level skipping
+
+import pyarrow.compute as pc  # noqa: E402
+
+PAGE_INDEX = sorted(glob.glob(os.path.join(NESTED, "pageindex__*.parquet")))
+_OPS = {"==": pc.equal, "!=": pc.not_equal, "<": pc.less, "<=": pc.less_equal, ">": pc.greater,
+        ">=": pc.greater_equal}
+FILTERS = [
+    [("id", ">", 20000)], [("id", "<", 500)], [("id", "==", 12017)], [("id", "!=", 17)],
+    [("i32", "==", 77)], [("i32", ">=", 140)], [("f64", ">", 150.0)], [("f64", "<=", -200.0)],
+    [("cat", "==", "c0010")], [("cat", "<", "c0003")], [("v", "<", 3.0)], [("v", "==", 996.0)],
+    [("id", ">=", 10000), ("i32", "<", 120)], [("noise", "==", 5)],
+    # Row group 1 passes both row-group statistics, but no page passes both filters.
+    [("id", ">=", 20000), ("i32", "<", 70)],
+]
+
+
+def _exact(table, flt):
+    mask = None
+    for col, op, val in flt:
+        m = _OPS[op](table[col], val)
+        mask = m if mask is None else pc.and_(mask, m)
+    return table.filter(mask)
+
+
+@pytest.mark.skipif(not PAGE_INDEX, reason="nested fixtures not generated")
+@pytest.mark.parametrize("path", PAGE_INDEX, ids=ids)
+@pytest.mark.parametrize("flt", FILTERS, ids=lambda f: ";".join("%s%s%s" % t for t in f))
+def test_page_skipping_gives_identical_results(path, flt):
+    """The rows that match are the same with and without the page index, and the same as pyarrow's;
+    the page-index read returns no more rows than the row-group-granular one."""
+    f = am.ParquetFile(path)
+    f.use_page_index = True
+    with_index = f.read_table(filters=flt)
+    stats = f.last_read_stats
+    f.use_page_index = False
+    without = f.read_table(filters=flt)
+    assert f.last_read_stats["pages_skipped"] == 0
+    want = _exact(pq.read_table(path), flt)
+    assert _exact(with_index, flt).to_pylist() == _exact(without, flt).to_pylist() == want.to_pylist()
+    assert with_index.num_rows <= without.num_rows
+    assert stats["rows"] == with_index.num_rows
+    # Every column of the page-index read covers the same rows, nested ones included.
+    assert with_index.column_names == without.column_names
+
+
+def test_pages_are_skipped_and_counted():
+    path = os.path.join(NESTED, "pageindex__pa_plain_none.parquet")
+    f = am.ParquetFile(path)
+    f.use_page_index = False
+    f.read_table(columns=["id", "f64", "cat"], filters=[("id", "==", 12017)])
+    whole = f.last_read_stats
+    f.use_page_index = True
+    got = f.read_table(columns=["id", "f64", "cat"], filters=[("id", "==", 12017)])
+    part = f.last_read_stats
+    assert whole["pages_skipped"] == 0 and part["pages_skipped"] > 0
+    # Flat columns: every page of the row groups read is either decoded or skipped.
+    assert part["pages_decoded"] + part["pages_skipped"] == whole["pages_decoded"]
+    assert part["pages_decoded"] < whole["pages_decoded"] // 2
+    assert part["rows"] < whole["rows"]
+    assert 12017 in got["id"].to_pylist()
+
+
+def test_a_row_group_can_be_ruled_out_by_pages_alone():
+    path = os.path.join(NESTED, "pageindex__pa_plain_none.parquet")
+    f = am.ParquetFile(path)
+    flt = [("id", ">=", 20000), ("i32", "<", 70)]
+    assert 1 in f.selected_row_groups(flt)          # the row-group statistics keep it
+    f.read_table(columns=["id"], filters=flt)
+    assert f.last_read_stats["row_groups_skipped_by_page_index"] >= 1
+
+
+def test_no_index_means_no_page_skipping():
+    path = os.path.join(NESTED, "pageindex__pa_noindex.parquet")
+    f = am.ParquetFile(path)
+    f.read_table(filters=[("id", "==", 12017)])
+    assert f.last_read_stats["pages_skipped"] == 0
+
+
+def test_dictionary_encoded_and_nested_columns_are_trimmed_too():
+    path = os.path.join(NESTED, "pageindex__pa_dict_snappy.parquet")
+    flt = [("id", "<", 500)]
+    cols = am.read_parquet(path, columns=["cat", "xs", "id"], filters=flt, dictionary=True)
+    ids_ = cols["id"].to_arrow().to_pylist()
+    n = len(ids_)
+    assert n < 2500
+    cat = cols["cat"].to_arrow()
+    assert pa.types.is_dictionary(cat.type) and len(cat) == n
+    xs = cols["xs"].to_arrow()
+    assert len(xs) == n
+    want = pq.read_table(path, columns=["id", "cat", "xs"]).to_pylist()
+    by_id = {r["id"]: r for r in want}
+    assert [by_id[i]["xs"] for i in ids_] == xs.to_pylist()
+    assert [by_id[i]["cat"] for i in ids_] == cat.cast(pa.string()).to_pylist()
+
+
+_CHILD_FILTERED = r"""
+import os, sys
+import arrowmetal as am
+for name in sorted(os.listdir(sys.argv[1])):
+    sys.stdout.write("AT %s\n" % name); sys.stdout.flush()
+    for flt in ([("id", ">", 20000)], [("cat", "==", "c0010"), ("i32", "<", 90)], [("v", "<", 3.0)]):
+        try:
+            am.read_parquet_table(os.path.join(sys.argv[1], name), filters=flt)
+        except Exception:
+            pass
+print("ALL-DONE")
+"""
+
+
+def test_damaged_page_indexes_never_crash_the_process():
+    """Single-byte damage in the column and offset indexes (the bytes between the last page and the
+    footer), read with filters so the indexes are used: every read must raise or return."""
+    rnd = random.Random(20260924)
+    with tempfile.TemporaryDirectory() as d:
+        n = 0
+        for base in ("pageindex__pa_plain_none", "pageindex__pa_v2_snappy", "pageindex__polars"):
+            path = os.path.join(NESTED, base + ".parquet")
+            raw = open(path, "rb").read()
+            md = pq.ParquetFile(path).metadata
+            pages_end = max(md.row_group(g).column(c).data_page_offset + md.row_group(g).column(c).total_compressed_size
+                            for g in range(md.num_row_groups) for c in range(md.num_columns))
+            footer = len(raw) - 8 - struct.unpack("<I", raw[-8:-4])[0]
+            assert pages_end < footer
+            for i in range(60):
+                b = bytearray(raw)
+                for _ in range(rnd.choice([1, 2, 6])):
+                    b[rnd.randrange(pages_end, footer)] = rnd.randrange(256)
+                open(os.path.join(d, "%s-%03d.parquet" % (base, i)), "wb").write(bytes(b))
+                n += 1
+        env = dict(os.environ, PYTHONPATH=PY_ROOT, MallocScribble="1")
+        r = subprocess.run([sys.executable, "-c", _CHILD_FILTERED, d], capture_output=True, text=True,
+                           timeout=900, env=env)
+        seen = [l for l in r.stdout.splitlines() if l.startswith("AT ")]
+        assert r.returncode == 0 and "ALL-DONE" in r.stdout, (
+            "crashed (rc=%d) on %s: %s" % (r.returncode, seen[-1] if seen else "?",
+                                           "\n".join(r.stderr.strip().splitlines()[-3:])))
+        assert len(seen) == n

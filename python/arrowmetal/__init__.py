@@ -4218,6 +4218,10 @@ _lib.am_parquet_field_metadata.argtypes = [_P, ctypes.c_char_p, ctypes.c_void_p,
 _lib.am_parquet_field_metadata.restype = ctypes.c_int64
 _lib.am_parquet_schema_metadata.argtypes = [_P, ctypes.c_void_p, ctypes.c_int64]
 _lib.am_parquet_schema_metadata.restype = ctypes.c_int64
+_lib.am_parquet_set_page_index.argtypes = [_P, ctypes.c_int]
+_lib.am_parquet_set_page_index.restype = ctypes.c_int
+_lib.am_parquet_last_read_stats.argtypes = [_P, ctypes.POINTER(ctypes.c_int64), ctypes.c_int64]
+_lib.am_parquet_last_read_stats.restype = ctypes.c_int64
 
 
 def _parquet_metadata(call):
@@ -4463,6 +4467,30 @@ class ParquetFile:
     def schema_metadata(self):
         """The file's key/value metadata without ARROW:schema, as `{bytes: bytes}`."""
         return _parquet_metadata(lambda out, cap: _lib.am_parquet_schema_metadata(self._h, out, cap))
+
+    # ---- page-level skipping (docs/PARQUET.md, "Page-level skipping")
+
+    @property
+    def use_page_index(self):
+        """Whether a filtered read uses the file's column and offset indexes to skip data pages (on by
+        default). Turning it off makes every filtered read row-group granular."""
+        return getattr(self, "_use_page_index", True)
+
+    @use_page_index.setter
+    def use_page_index(self, enabled):
+        _check(_lib.am_parquet_set_page_index(self._h, 1 if enabled else 0))
+        self._use_page_index = bool(enabled)
+
+    @property
+    def last_read_stats(self):
+        """What the most recent read on this handle did: row groups read and skipped (by statistics and
+        by the page index), data pages decoded and skipped, and rows returned."""
+        buf = (ctypes.c_int64 * 6)()
+        if _lib.am_parquet_last_read_stats(self._h, buf, 6) < 0:
+            _check(1)
+        keys = ("row_groups_read", "row_groups_skipped_by_statistics", "row_groups_skipped_by_page_index",
+                "pages_decoded", "pages_skipped", "rows")
+        return dict(zip(keys, (int(v) for v in buf)))
 
     def _arrow_schema(self, names, arrays):
         fields = []

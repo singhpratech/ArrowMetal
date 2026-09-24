@@ -24,19 +24,23 @@ final class ParquetNestedAssembler {
     let context: MetalContext
     let rowGroups: [Int]
     let options: ParquetReadOptions
+    /// Counts the pages decoded. Nested leaves decode their row groups whole, so every leaf of a struct
+    /// covers the same rows; the caller trims the assembled column to the plan's candidate rows.
+    let plan: ParquetReadPlan?
     private var decoded: [Int: ParquetLeafData] = [:]
 
-    init(file: ParquetFile, rowGroups: [Int], options: ParquetReadOptions) {
+    init(file: ParquetFile, rowGroups: [Int], options: ParquetReadOptions, plan: ParquetReadPlan? = nil) {
         self.file = file
         self.context = file.context
         self.rowGroups = rowGroups
         self.options = options
+        self.plan = plan
     }
 
     /// A leaf's decoded buffers with both level streams, decoded on first use.
     func leafData(_ l: ParquetLeaf) throws -> ParquetLeafData {
         if let d = decoded[l.index] { return d }
-        let d = try file.decodeLeaf(l, rowGroups: rowGroups, options: options, needRepetition: true)
+        let d = try file.decodeLeaf(l, rowGroups: rowGroups, options: options, needRepetition: true, plan: plan)
         decoded[l.index] = d
         return d
     }
@@ -44,7 +48,7 @@ final class ParquetNestedAssembler {
     /// The array for a top-level field. Its length must be the row count of the selected row groups.
     func buildTopLevel(_ f: ParquetField) throws -> AnyMetalArray {
         let out = try build(f, column: f.name)
-        let rows = rowGroups.reduce(0) { $0 + Int(file.metadata.rowGroups[$1].numRows) }
+        let rows = rowGroups.reduce(0) { $0 + file.rowsIn(group: $1) }
         guard out.length == rows else {
             throw ParquetError.malformed("column \(f.name) assembles to \(out.length) rows, the row groups hold \(rows)")
         }
