@@ -182,6 +182,7 @@ def metadata_table():
         pa.field("inner_tz", pa.struct([("t", pa.timestamp("ms", tz="Asia/Tokyo")), ("d", pa.duration("ms"))])),
         pa.field("dur_list", pa.list_(pa.duration("ns"))),
         pa.field("tz_map", pa.map_(pa.string(), pa.timestamp("us", tz="Australia/Sydney"))),
+        pa.field("inner_meta", pa.struct([pa.field("x", pa.int32(), metadata={"inner": "kept by pyarrow"})])),
     ]
     cols = [
         pa.array(range(n), pa.int64()),
@@ -208,6 +209,8 @@ def metadata_table():
                  pa.list_(pa.duration("ns"))),
         pa.array([None if i % 12 == 0 else [("k%d" % t, base + i * t) for t in range(i % 2 + 1)] for i in range(n)],
                  pa.map_(pa.string(), pa.timestamp("us", tz="Australia/Sydney"))),
+        pa.array([None if i % 9 == 0 else {"x": i} for i in range(n)],
+                 pa.struct([pa.field("x", pa.int32(), metadata={"inner": "kept by pyarrow"})])),
     ]
     schema = pa.schema(fields, metadata={"source": "generate_parquet_nested.py"})
     return pa.Table.from_arrays(cols, schema=schema)

@@ -291,6 +291,17 @@ def test_extension_types():
     assert got["rat"].type == want["rat"].type
 
 
+def test_metadata_on_a_nested_field_is_not_carried():
+    """The engine's nested arrays hold no per-field metadata, so metadata on a struct member (or a list
+    element, or a map value) is dropped; a top-level field's is kept. The types still compare equal."""
+    path = os.path.join(NESTED, "arrowschema__pa_plain_none.parquet")
+    got, want = am.read_parquet_table(path, columns=["inner_meta"]), pq.read_table(path, columns=["inner_meta"])
+    assert want["inner_meta"].type.field("x").metadata == {b"inner": b"kept by pyarrow"}
+    assert got["inner_meta"].type.field("x").metadata is None
+    assert got["inner_meta"].type == want["inner_meta"].type
+    assert got["inner_meta"].to_pylist() == want["inner_meta"].to_pylist()
+
+
 class _Label(pa.ExtensionType):
     def __init__(self):
         super().__init__(pa.string(), "example.label")

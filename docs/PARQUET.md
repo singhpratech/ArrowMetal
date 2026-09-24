@@ -531,6 +531,9 @@ ARROWMETAL_PARQUET_BIG=1 PYTHONPATH=python python -m pytest python/tests/test_pa
 - **The members of a struct and the element of a list are exported as nullable.** A writer that declares
   a struct member `required` gets `not null` on that member from `pyarrow.parquet.read_table`; the values
   are the same, and the member reads as nullable here.
+- **Custom metadata on a nested field is not carried.** A top-level column's field metadata comes back
+  (above); metadata on a struct member, a list element or a map value does not, because the engine's
+  nested arrays have no per-field metadata. The types still compare equal.
 - **`large_string`, `large_binary` and `large_list` come back 32-bit, and the view types as their
   non-view twins.** ArrowMetal narrows 64-bit offsets everywhere and has no view layouts, so a column
   whose stored Arrow type is `large_string` or `string_view` reads here as `string`, `large_list` or
