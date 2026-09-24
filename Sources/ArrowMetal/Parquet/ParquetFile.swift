@@ -43,9 +43,11 @@ public final class ParquetFile: @unchecked Sendable {
     public let metadata: ParquetFileMetadata
     /// The flattened leaf columns, in the order the column chunks appear in each row group.
     public let leaves: [ParquetLeaf]
-    /// The Arrow-level fields this file exposes (a leaf, or a `list<...>` built from one).
+    /// The Arrow-level fields this file exposes: leaves, lists, maps and structs, at any depth.
     public let fields: [ParquetField]
     public let context: MetalContext
+    /// The decoded `ARROW:schema` key/value metadata, when present and well formed (`ParquetArrowSchema.swift`).
+    let cachedArrowSchema: [ParquetArrowField]?
 
     let fd: Int32
     let fileSize: Int
@@ -58,6 +60,31 @@ public final class ParquetFile: @unchecked Sendable {
     /// wrapped on demand and cached: reading two columns of a forty-column file maps two column chunks.
     private var wrapped: [Int: MetalArrowBuffer] = [:]
     private let wrapLock = NSLock()
+
+    /// Use the column index and offset index, when the file has them, to skip the data pages a
+    /// statistics filter rules out (`ParquetPageIndex.swift`). On by default; turning it off gives the
+    /// row-group-granular read the same filters produce without the index.
+    public var usePageIndex: Bool {
+        get { statsLock.lock(); defer { statsLock.unlock() }; return _usePageIndex }
+        set { statsLock.lock(); _usePageIndex = newValue; statsLock.unlock() }
+    }
+    /// What the most recent `read` on this handle did with the statistics and the page index.
+    public var lastReadStatistics: ParquetReadStatistics {
+        statsLock.lock(); defer { statsLock.unlock() }; return _lastReadStatistics
+    }
+    /// Use the column chunks' bloom filters, when the file has them, to drop the row groups an equality
+    /// filter's value is certainly absent from (`ParquetBloomFilter.swift`). On by default.
+    public var useBloomFilters: Bool {
+        get { statsLock.lock(); defer { statsLock.unlock() }; return _useBloomFilters }
+        set { statsLock.lock(); _useBloomFilters = newValue; statsLock.unlock() }
+    }
+    private var _useBloomFilters = true
+    private var _usePageIndex = true
+    private var _lastReadStatistics = ParquetReadStatistics()
+    private let statsLock = NSLock()
+    func recordReadStatistics(_ s: ParquetReadStatistics) {
+        statsLock.lock(); _lastReadStatistics = s; statsLock.unlock()
+    }
 
     public var numRows: Int64 { metadata.numRows }
     public var rowGroupCount: Int { metadata.rowGroups.count }
@@ -95,6 +122,7 @@ public final class ParquetFile: @unchecked Sendable {
             self.leaves = built.leaves
             self.fields = built.fields
         } catch { close(fd); throw error }
+        self.cachedArrowSchema = ParquetFile.decodeArrowSchema(metadata.keyValueMetadata)
     }
 
     /// A Metal buffer covering `range` of the file, plus the offset of `range.lowerBound` inside it.
@@ -131,7 +159,8 @@ public final class ParquetFile: @unchecked Sendable {
     // MARK: - Schema flattening
 
     /// Walks the flat `SchemaElement` list into a tree and records, for each leaf column, its
-    /// definition and repetition levels — the two numbers Dremel assembly needs.
+    /// definition and repetition levels — the two numbers Dremel assembly needs — and, for every
+    /// Arrow-level field, the three levels its own assembly needs (see `ParquetField`).
     static func buildSchema(_ elements: [ParquetSchemaElement]) throws -> (leaves: [ParquetLeaf], fields: [ParquetField]) {
         guard !elements.isEmpty else { throw ParquetError.malformed("empty schema") }
         var index = 1                    // element 0 is the root message
@@ -140,10 +169,15 @@ public final class ParquetFile: @unchecked Sendable {
 
         /// Recursive descent; returns the field for the subtree rooted at `elements[i]`.
         ///
+        /// `def` and `rep` are the parent's definition and repetition levels, and `slotDef` the
+        /// definition level of the nearest repeated ancestor (0 when there is none). A `repeated` node
+        /// comes back as the *element* of the list it implies: its levels describe one element, and the
+        /// caller either uses it as the element of a LIST / MAP wrapper or wraps it in a list itself.
+        ///
         /// `num_children` comes straight out of the footer, so it can claim more children than the
         /// schema list holds. Every index is checked here rather than trusting it: an unchecked
         /// `elements[i]` on a crafted file is a bounds trap, which takes the process down.
-        func node(_ i: Int, def: Int, rep: Int, path: [String]) throws -> ParquetField {
+        func node(_ i: Int, def: Int, rep: Int, slotDef: Int, path: [String]) throws -> ParquetField {
             guard i >= 0, i < elements.count else {
                 throw ParquetError.malformed("schema element \(i) is outside 0..<\(elements.count)")
             }
@@ -154,7 +188,19 @@ public final class ParquetFile: @unchecked Sendable {
             case .repeated: d += 1; rp += 1
             case .required: break
             }
+            // Every entry of a repeated node's subtree whose definition level reaches `d` is one
+            // element of it; below a repeated node that is the slot condition for everything.
+            let mySlotDef = e.repetition == .repeated ? d : slotDef
             let myPath = path + [e.name]
+            func levelled(_ kind: ParquetField.Kind, nullable: Bool) -> ParquetField {
+                var f = ParquetField(name: e.name, kind: kind, nullable: nullable)
+                f.definitionLevel = d
+                f.repetitionLevel = rp
+                f.slotDefinitionLevel = mySlotDef
+                f.isRepeated = e.repetition == .repeated
+                f.fieldID = e.fieldID
+                return f
+            }
             if e.numChildren == 0 {
                 guard let t = e.type else { throw ParquetError.malformed("leaf \(e.name) has no physical type") }
                 // `type_length` is the value width for FIXED_LEN_BYTE_ARRAY and multiplies every
@@ -169,42 +215,78 @@ public final class ParquetFile: @unchecked Sendable {
                 let leaf = ParquetLeaf(index: leaves.count, element: e, physical: t, path: myPath,
                                        maxDefinition: d, maxRepetition: rp)
                 leaves.append(leaf)
-                return ParquetField(name: e.name, kind: .leaf(leaf), nullable: e.repetition == .optional)
+                return levelled(.leaf(leaf), nullable: e.repetition == .optional)
             }
             var children: [ParquetField] = []
+            var childIndices: [Int] = []
             // `num_children` is a signed thrift i32: a negative one would make `0..<n` a range with a
             // reversed bound, which is a trap, not an error.
             for _ in 0..<Swift.max(e.numChildren, 0) {
                 let c = index
                 index += 1
-                children.append(try node(c, def: d, rep: rp, path: myPath))
+                children.append(try node(c, def: d, rep: rp, slotDef: mySlotDef, path: myPath))
+                childIndices.append(c)
             }
-            // LIST annotation: group { repeated group list { <element> } }
+            let nullable = e.repetition == .optional
+            let isMap = e.logicalType == .map || e.convertedType == .map || e.convertedType == .mapKeyValue
             let isList = e.logicalType == .list || e.convertedType == .list
-            if isList, children.count == 1, case .group(let inner) = children[0].kind, inner.count == 1 {
-                let repeatedIdx = i + 1     // the `list` repeated group
-                let repeated = elements[repeatedIdx]
-                var listDef = d
-                if repeated.repetition == .repeated { listDef += 1 }
-                return ParquetField(name: e.name,
-                                    kind: .list(element: inner[0], repeatedDefinition: listDef),
-                                    nullable: e.repetition == .optional)
+            // A list or map wrapper: exactly one child, and that child repeated.
+            if isList || isMap, children.count == 1, children[0].isRepeated {
+                let repeated = children[0]
+                let repeatedName = elements[childIndices[0]].name
+                if isMap, case .group(let kv) = repeated.kind, kv.count == 2 {
+                    // MAP: group (MAP) { repeated group key_value { key; value } }. The repeated group
+                    // is the entries struct itself, never null.
+                    var entries = repeated
+                    entries.isRepeated = false
+                    var f = levelled(.list(element: entries, repeatedDefinition: repeated.definitionLevel),
+                                     nullable: nullable)
+                    f.isMap = true
+                    return f
+                }
+                // LIST (or a MAP whose entries are not a key/value pair, which Arrow reads as a list).
+                // The backward-compatibility rules of the format decide whether the repeated node is the
+                // element (two-level) or only wraps it (three-level): a repeated primitive, a repeated
+                // group of several fields, and a repeated group named `array` or `<list>_tuple` are the
+                // element; otherwise its one child is.
+                var element = repeated
+                element.isRepeated = false
+                if case .group(let inner) = repeated.kind, inner.count == 1,
+                   repeatedName != "array", repeatedName != e.name + "_tuple" {
+                    element = inner[0]
+                }
+                return levelled(.list(element: element, repeatedDefinition: repeated.definitionLevel),
+                                nullable: nullable)
             }
-            // A two-level list: group (LIST) { repeated <element> }
-            if isList, children.count == 1, elements[i + 1].repetition == .repeated {
-                return ParquetField(name: e.name, kind: .list(element: children[0], repeatedDefinition: d + 1),
-                                    nullable: e.repetition == .optional)
+            // A repeated child that no LIST / MAP annotation claims is a list of required elements.
+            let wrapped = children.map { c -> ParquetField in
+                c.isRepeated ? ParquetFile.implicitList(c, parentDef: d, parentRep: rp, parentSlotDef: mySlotDef) : c
             }
-            return ParquetField(name: e.name, kind: .group(children), nullable: e.repetition == .optional)
+            return levelled(.group(wrapped), nullable: nullable)
         }
 
         let root = elements[0]
         for _ in 0..<Swift.max(root.numChildren, 0) {
             let c = index
             index += 1
-            fields.append(try node(c, def: 0, rep: 0, path: []))
+            let f = try node(c, def: 0, rep: 0, slotDef: 0, path: [])
+            fields.append(f.isRepeated ? implicitList(f, parentDef: 0, parentRep: 0, parentSlotDef: 0) : f)
         }
         return (leaves, fields)
+    }
+
+    /// The list a bare `repeated` node implies: `repeated int32 x` reads as a non-null
+    /// `list<x: int32 not null>`, as Arrow's own reader has it.
+    static func implicitList(_ element: ParquetField, parentDef: Int, parentRep: Int, parentSlotDef: Int) -> ParquetField {
+        var e = element
+        e.isRepeated = false
+        var f = ParquetField(name: element.name, kind: .list(element: e, repeatedDefinition: e.definitionLevel),
+                             nullable: false)
+        f.definitionLevel = parentDef
+        f.repetitionLevel = parentRep
+        f.slotDefinitionLevel = parentSlotDef
+        f.fieldID = element.fieldID
+        return f
     }
 
     /// The leaf column with this dotted path, or nil.
@@ -230,16 +312,41 @@ public struct ParquetLeaf: Sendable {
     public var typeLength: Int { element.typeLength }
 }
 
-/// An Arrow-level field: either a leaf column or a list over one.
+/// An Arrow-level field: a leaf column, a list (or map) over a field, or a struct of fields.
+///
+/// Every field carries the three levels Dremel assembly needs to find *its* values among the level
+/// entries of any leaf beneath it (the same three Arrow's C++ reader keeps in its `LevelInfo`):
+///
+/// - an entry is a **slot** of this field — one element of the Arrow array being built — when its
+///   repetition level is at most `repetitionLevel` and its definition level reaches
+///   `slotDefinitionLevel`;
+/// - the slot is **non-null** when the definition level reaches `definitionLevel`.
+///
+/// A top-level field has `repetitionLevel == 0` and `slotDefinitionLevel == 0`, so its slots are the
+/// entries that start a row.
 public struct ParquetField: Sendable {
     public indirect enum Kind: Sendable {
         case leaf(ParquetLeaf)
+        /// A list, or a map when `isMap` is set (the element is then the key/value entries struct).
         case list(element: ParquetField, repeatedDefinition: Int)
         case group([ParquetField])
     }
     public let name: String
     public let kind: Kind
     public let nullable: Bool
+    /// Definition level at which this field is present (non-null).
+    public internal(set) var definitionLevel: Int = 0
+    /// The largest repetition level of an entry that starts a new slot of this field.
+    public internal(set) var repetitionLevel: Int = 0
+    /// The definition level of the nearest repeated ancestor: an entry below it is a slot of this field
+    /// only when that ancestor has an element there.
+    public internal(set) var slotDefinitionLevel: Int = 0
+    /// A `MAP` column: a list of key/value entries.
+    public internal(set) var isMap = false
+    /// The Parquet `field_id`, when the writer recorded one.
+    public internal(set) var fieldID: Int32? = nil
+    /// Set while the schema is being built: this node is `repeated` and stands for a list element.
+    var isRepeated = false
 
     /// Every leaf beneath this field.
     public var leaves: [ParquetLeaf] {

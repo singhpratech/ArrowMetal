@@ -16,6 +16,10 @@ cuDF does this for NVIDIA.
 - `Sources/ArrowMetal/Parquet/ParquetFile.swift` — the mapped file and the schema tree.
 - `Sources/ArrowMetal/Parquet/ParquetReader.swift`, `ParquetColumnDecode.swift`, `ParquetValueDecode.swift`,
   `ParquetTypeMap.swift`, `ParquetList.swift` — the read pipeline.
+- `Sources/ArrowMetal/Parquet/ParquetNested.swift` — structs, maps and lists at any depth, from their leaves.
+- `Sources/ArrowMetal/Parquet/ParquetArrowSchema.swift` — the stored `ARROW:schema` and what it restores.
+- `Sources/ArrowMetal/Parquet/ParquetPageIndex.swift`, `ParquetBloomFilter.swift` — page-level skipping
+  with the column and offset indexes, and row-group skipping with bloom filters.
 - `Sources/ArrowMetal/Kernels/DecompressSource.swift` / `Decompress.swift` — Snappy and LZ4 on the GPU.
 - `Sources/ArrowMetal/Kernels/ParquetDecodeSource.swift` — every decoding kernel.
 - `Sources/ArrowMetal/Parquet/ParquetWriter.swift` — a small host-side writer, for round trips.
@@ -185,6 +189,7 @@ wrong data; that is the documented host fallback.
 |---|---|---|
 | `BOOLEAN` | `bool` | bit-packed `PLAIN` or `RLE` |
 | `INT32` | `int32` | |
+| `INT32` + `UNKNOWN` (Arrow's `null` type) | `null` | |
 | `INT32` + `INT(8\|16\|32, signed)` | `int8` / `int16` / `int32` | narrowed with the existing cast kernels |
 | `INT32` + `INT(8\|16\|32, unsigned)` | `uint8` / `uint16` / `uint32` | |
 | `INT32` + `DATE` | `date32` | |
@@ -192,7 +197,7 @@ wrong data; that is the documented host fallback.
 | `INT32` + `DECIMAL(p,s)` | `decimal128(p,s)` | widened on the GPU |
 | `INT64` | `int64` | |
 | `INT64` + `INT(64, unsigned)` | `uint64` | |
-| `INT64` + `TIMESTAMP(unit)` | `timestamp[unit]`, `UTC` when `isAdjustedToUTC` | |
+| `INT64` + `TIMESTAMP(unit)` | `timestamp[unit]`, `UTC` when `isAdjustedToUTC` | the stored zone instead of `UTC` when `ARROW:schema` has one, below |
 | `INT64` + `TIME(MICROS\|NANOS)` | `time64[us\|ns]` | |
 | `INT64` + `DECIMAL(p,s)` | `decimal128(p,s)` | |
 | `INT96` | `timestamp[ns]` | Julian day + nanoseconds, converted on the GPU |
@@ -202,23 +207,70 @@ wrong data; that is the documented host fallback.
 | `FIXED_LEN_BYTE_ARRAY` | `fixed_size_binary(n)` | |
 | `FIXED_LEN_BYTE_ARRAY` + `DECIMAL(p,s)` | `decimal128(p,s)` | big-endian, sign-extended on the GPU |
 | `FIXED_LEN_BYTE_ARRAY` + `FLOAT16` | `float16` | |
-| `list<T>` (3-level and 2-level) | `list<T>` | Dremel assembly on the GPU, below |
-| `struct` | — | read its leaves by dotted path; a struct column raises `ParquetError.unsupported` |
-| `map` | — | not yet |
+| `list<T>` (3-level and 2-level) | `list<T>` | Dremel assembly on the GPU, below; `T` may itself be nested |
+| `struct` (a group without a `LIST` / `MAP` annotation) | `struct<...>` | reassembled from its leaves; its leaves also read on their own by dotted path |
+| `map` (`MAP` / `MAP_KEY_VALUE`) | `map<K, V>` | a list of key/value entries; `V` may be nested |
 
 ### Nesting
 
-Flat columns and `list<primitive>` are supported, including null lists, empty lists and null elements, in
-both the three-level (`group (LIST) { repeated group list { element } }`) and two-level
-(`group (LIST) { repeated element }`) shapes. The assembly is one kernel plus two prefix sums: a new row
-starts wherever the repetition level is 0, an element exists wherever the definition level reaches the
-repeated node's level, and the row is null when its first entry's definition level does not reach the
-enclosing group. Numbering the rows and the elements with two scans lets the row starts write the offsets
-buffer directly, and the child array is the leaf array compacted to the element positions with the
-package's existing `filter`.
+Structs, maps and lists nest to any depth — `list<list<T>>`, `list<struct<...>>`, `struct<list<...>>`,
+`map<K, list<V>>`, `list<map<K, V>>` — with nulls and empty lists at every level, in the three-level
+(`group (LIST) { repeated group list { element } }`) and two-level (`group (LIST) { repeated element }`)
+list shapes. Every Arrow-level field carries three numbers from the schema: the definition level at
+which it is present, the largest repetition level that starts a new element of it, and the definition
+level of its nearest repeated ancestor. Over the level entries of any one leaf beneath the field, an
+entry is one **slot** of the field when its repetition level is at most the first and its definition
+level reaches the third, and the slot is non-null when the definition level reaches the second. So:
 
-Struct columns are read leaf by leaf: `am.read_parquet(path, columns=["addr.city"])` works, but a
-`struct` is not reassembled into `MetalStructArray` yet.
+- a **leaf** is its decoded array compacted to its own slots with the package's existing `filter`;
+- a **struct** is its children plus a validity bitmap, read off one leaf's entries at the struct's slots;
+- a **list** is its child plus offsets: at each of the list's slots, the number of child slots before it,
+  which is a prefix sum of the child's slot flags read at the list's own slots;
+- a **map** is a list whose child is the key/value entries struct.
+
+Each of those is one flag kernel over the entries (`pq_nest_flags`), one prefix sum and one scatter
+(`pq_nest_scatter`), and every leaf is decoded once however many fields read its levels
+(`ParquetNested.swift`). A one-level `list<primitive>` keeps the dedicated kernel pair it had before, which
+reads the same levels the same way. A struct's leaves still read on their own by dotted path:
+`am.read_parquet(path, columns=["addr.city"])` returns the `city` leaf as a flat column, null wherever
+`addr` or `city` is null.
+
+### The stored Arrow schema
+
+Parquet has no time zone (only `isAdjustedToUTC`), no duration, no decimal32 / decimal64, no
+fixed-size list, no dictionary type, no extension types and no per-field metadata. Arrow writers —
+pyarrow, Arrow C++, Polars, arrow-rs — therefore store the original Arrow schema in the file's key/value
+metadata under `ARROW:schema` (base64 of an IPC `Schema` message), and the reader decodes it with the IPC
+FlatBuffers views in `IPC/FlatBuffers.swift` and puts back what the Parquet schema lost
+(`ParquetArrowSchema.swift`):
+
+| Stored Arrow type | Parquet stores | Comes back as |
+|---|---|---|
+| `timestamp[unit, tz=Z]` | `TIMESTAMP(isAdjustedToUTC)` | `timestamp[unit, tz=Z]`, on the stored unit (a seconds timestamp is stored, and read, as milliseconds) |
+| `duration[unit]` | plain `INT64` | `duration[unit]` |
+| `decimal32(p,s)` / `decimal64(p,s)` | `INT32` / `INT64` `DECIMAL` | `decimal32(p,s)` / `decimal64(p,s)` |
+| `fixed_size_list<T>[n]` | a list | `fixed_size_list<T>[n]`; a null row gets `n` null child slots |
+| `dictionary<K, T>` over strings or binaries (a pandas categorical, a Polars `Categorical` or `Enum`) | the values | `dictionary<int32, T>`, unordered, dictionary encoded whatever the `dictionary` switch says (pyarrow keeps the stored index type `K` and the ordered flag; see Limits); a dictionary over any other value type (integers, timestamps, dates) reads as that value type, as pyarrow reads it |
+| an extension type | its storage | the storage wrapped in `MetalExtensionArray`, so a consumer that knows the type rebuilds it |
+| field `custom_metadata` | — | `ParquetFile.arrowFieldMetadata(column:)`, `am_parquet_field_metadata`, `f.field_metadata(column)`, and on every field of `read_parquet_table`'s Table |
+
+Time zones and durations are restored inside structs, lists and maps too. The file's other
+key/value metadata is the schema metadata (`arrowSchemaMetadata`, `am_parquet_schema_metadata`,
+`f.schema_metadata`), and a Parquet `field_id` shows up as `PARQUET:field_id`, as it does in pyarrow.
+The `null` type needs no stored schema: Parquet annotates a null column `UNKNOWN`, which reads as `null`,
+at the top level and inside lists, maps and structs (`list<null>`, `map<string, null>`,
+`list<struct<a: null, ...>>`).
+The stored fields are matched to the Parquet columns by position, as Arrow's reader matches them; a
+stored schema with a different number of top-level fields is ignored, and its `ARROW:schema` key stays
+in the schema metadata, as pyarrow keeps it. A stored type the column cannot take (a dictionary claim over
+a struct, say) is ignored for that column. A file without `ARROW:schema` reads exactly as its Parquet
+schema describes it. A file whose `ARROW:schema` is not base64, or does not decode as a Schema message,
+reads the same way, with the undecodable value left in the schema metadata; pyarrow refuses to open such
+a file (`Invalid base64 input`, `Corrupted metadata length`), and `test_parquet_nested.py` checks both
+sides. A stored field nested more than 64 levels deep is read down to 64 levels and taken as a type no
+column matches, so that column reads as its Parquet schema says and the other stored fields still apply,
+as in pyarrow (`test_a_stored_field_nested_past_64_levels_is_ignored_like_pyarrow`). A leaf read on its
+own by dotted path always reads as the Parquet schema describes it.
 
 ## Projection and predicate pushdown
 
@@ -244,11 +296,77 @@ for day in days:
 
 Only the requested column chunks are ever touched — the other columns' pages are never even faulted
 in. `filters` is evaluated against the footer's `min_value` / `max_value` statistics per row group; a
-row group whose range cannot contain a match is skipped without reading a page. Pushdown is row-group
-granular, so the result is a superset of the matching rows: follow it with `filter` (or a fused
-`am.query`) to get exactly the rows.
-`ParquetFile.selectedRowGroups(_:)` / `ParquetFile.selected_row_groups(...)` report what a filter keeps
-without reading anything.
+row group whose range cannot contain a match is skipped without reading a page. When the file also has a
+column index and an offset index, the same filters then skip pages inside the row groups that remain
+(next section). Either way the result is a superset of the matching rows: follow it with `filter` (or a
+fused `am.query`) to get exactly the rows. A filter value is a string, a boolean, an integer or a float;
+a date or timestamp column is filtered by its stored integer (days since the epoch, or ticks in the
+column's unit), and Python raises on any other value (a `datetime.date`, a `Decimal`). A literal of
+another kind than the column's (a string against a number, in the C and Swift filter text) never rules a
+row group or page out. A string value may hold any character: Python quotes it and escapes `"` and `\`,
+so a `;`, a quote or an operator inside it is part of the value; a column name cannot hold `=`, `!`, `<`,
+`>` or `;`, and Python raises on one that does. An integer above the int64 range stays exact and is
+compared as unsigned against a `uint64` column's statistics, which are read as unsigned
+(`test_uint64_literals_past_the_signed_range`,
+`test_string_literals_with_quotes_semicolons_and_backslashes`). On a `float` or `double` column `!=`
+never rules a row group or page out: writers leave NaN out of min / max, so a range of one value equal to
+the literal can still hold a NaN, which `!=` keeps. pyarrow's `read_table(filters=...)` rules out a row
+group whose min and max both equal the literal, and so leaves out that group's NaN rows; ArrowMetal
+returns them (`test_not_equal_keeps_a_nan_row_group_where_pyarrow_drops_it`).
+`ParquetFile.selectedRowGroups(_:)` / `ParquetFile.selected_row_groups(...)` report what the row-group
+statistics keep without reading anything.
+
+### Page-level skipping
+
+A writer may store, after the row groups, a **column index** (each data page's min, max and whether it
+holds only nulls) and an **offset index** (where each data page starts and its first row). pyarrow writes
+them with `write_page_index=True`; Polars writes them by default. With them a filter narrows each row
+group to *candidate row ranges* (`ParquetPageIndex.swift`):
+
+1. For each filter on a flat column, a page whose [min, max] cannot satisfy it, or that holds only nulls,
+   rules out its rows. The ranges the filters leave are intersected; a row group left with none is not
+   read at all, even when its row-group statistics let it through. A page counts as all-null only when
+   the index's null count for it covers every row: Polars (1.44) flags each page that holds a NaN as a
+   null page with a null count of 0, and such a page is kept whole. A NaN min or max rules nothing out,
+   as the format asks. Polars also leaves the flagged pages out of the row group's min / max, so when a
+   chunk's column index shows such a page, that column's row-group statistics do not drop the row
+   group; `pyarrow.parquet.read_table(filters=...)` trusts them and returns no rows for a filter outside
+   the unflagged pages' range, where ArrowMetal returns every match
+   (`test_polars_row_group_statistics_leave_nan_pages_out`).
+2. Every flat column with an offset index decodes only the data pages that overlap a candidate range.
+   The page list comes from the offset index, so a skipped page is never decompressed, never decoded,
+   and its header is never read.
+3. Pages have different boundaries in different columns, so every column — nested ones and those
+   without an offset index included, which decode their row groups whole — is trimmed to exactly the
+   candidate rows with one `filter`. All columns of the result cover the same rows.
+
+The rows that match a filter are the same with and without the index; the index only makes the superset
+smaller. `ParquetFile.usePageIndex` (`f.use_page_index` in Python, `am_parquet_set_page_index` in C)
+turns it off, and `lastReadStatistics` (`f.last_read_stats`, `am_parquet_last_read_stats`) reports what
+the last read did: row groups read and skipped by statistics, by the page index and by bloom filters
+(below), data pages decoded and skipped, rows returned. `test_parquet_nested.py` compares the exact
+matches with and without the index against pyarrow over fifteen filter sets on five files (pyarrow in
+three page layouts and once without an index, and Polars), and six filter sets on a float column with a
+NaN every 97th row, written by Polars and by pyarrow, and `!=` on pages of 64 rows where a NaN hides in
+a page whose min and max both equal the literal; `ParquetPageIndexTests` also checks that the
+skipped and decoded pages of flat columns add up to the pages of the row groups read. A filter on a
+column inside a list does not narrow pages; the row-group statistics still apply to it.
+
+### Bloom filters
+
+A writer may also store a split-block bloom filter per column chunk (pyarrow with `bloom_filter_options`,
+DuckDB for its dictionary-encoded columns). An `==` filter hashes its literal the way the writer hashed
+the column's values — xxHash64 of the PLAIN encoding — and a row group whose filter does not have all 8
+bits of that hash set is dropped before any page is read, even when its min/max statistics let the value
+through (`ParquetBloomFilter.swift`). A set of bits is only a maybe, so the row group is then read as
+usual; a bloom filter never drops a row group that holds the value. Only literals with one exact
+encoding are looked up — integers stored as INT32 / INT64, strings and binaries, and floating-point
+values exactly representable in the column's type other than zero and NaN (which have two encodings
+each) — and anything else keeps the row group. `ParquetFile.useBloomFilters` (`f.use_bloom_filters`,
+`am_parquet_set_bloom_filters`) turns it off, and the read statistics count the row groups it dropped.
+`ParquetBloomFilterTests` checks xxHash64 against its published vectors and every value of the fixture
+against its row group's filter; `test_parquet_nested.py` looks up values in seven columns of a pyarrow
+file and one of a DuckDB file and requires pyarrow's exact matches with the filters on and off.
 
 ## Benchmarks
 
@@ -323,6 +441,16 @@ Reproduce with:
 PYTHONPATH=python python Benchmarks/parquet_bench.py --rows 50000000 --codecs snappy,lz4,none --codec-scan --repeat 3
 ```
 
+Nested reads — a struct, a list, a list of lists, a map and a list of structs, at 1 M and 10 M rows,
+against pyarrow, Polars and DuckDB — have their own script. Its first run is a provisional smoke run
+recorded while other work shared the GPU, in
+`Benchmarks/results/parquet_nested_2026-09-23_provisional.csv`; the published numbers will come from a
+quiet rerun:
+
+```
+PYTHONPATH=python python Benchmarks/parquet_nested_bench.py --rows 1000000,10000000 --repeat 3 --out results.csv
+```
+
 ### What the numbers say
 
 - **CPU time is the headline.** Reading the whole 50 M-row table costs the host 217-262 ms of CPU against
@@ -382,42 +510,80 @@ int64, float64, string, bool and timestamp columns, uncompressed and Snappy; `Pa
   footer nesting Thrift structs 60,000 deep, a 2^64 length, a `num_children` past the schema — and
   requires every one of them to raise rather than crash, hang or read outside the mapping.
 - `ParquetWriterTests` and the Python writer test close the round trip.
+- `Tests/Fixtures/generate_parquet_nested.py` writes the nested fixtures under `Tests/Fixtures/nested`
+  (committed): structs three levels deep, structs of strings and binaries, `map<string, int64>`,
+  `map<int32, string>`, maps of structs and of lists, `list<list<T>>`, `list<list<list<int32>>>`,
+  `list<struct<...>>`, `struct<list<...>>` and `list<map<...>>`, with nulls and empty lists at every level —
+  written by pyarrow in four encoding / codec / page-version variants with 512-byte pages (so levels cross
+  hundreds of page boundaries), by DuckDB (`COPY ... TO ... (FORMAT parquet)`) and by Polars wherever it can
+  express the shape (it has no map type).
+- `Tests/ArrowMetalTests/ParquetNestedTests.swift` checks known values against the generator's formulas
+  and every writer's and variant's file against every other's, row by row.
+- `python/tests/test_parquet_nested.py` reads every nested fixture with ArrowMetal and with
+  `pyarrow.parquet.read_table` and requires the same values and the same types, apart from the three
+  differences listed under Limits (32-bit offsets and no view layouts, nullable struct members, the index
+  type and ordered flag of a restored dictionary), each of which has its own test showing the difference is exactly that; it also damages nested files 200 ways and
+  requires every read to raise or return rather than crash.
+- The same generator writes the `ARROW:schema` fixtures: time zones on every unit (named zones, a fixed
+  offset, UTC, naive), the `null` type (also below lists, maps and structs), durations, decimal32 /
+  decimal64, a fixed-size list, categoricals over strings, binaries, integers, timestamps and dates (and
+  a pandas categorical, a Polars `Categorical` and a Polars `Enum`), field metadata and a `field_id`, a registered
+  (`arrow.uuid`) and two unregistered extension types, zones and durations inside a struct, a list and a
+  map, the view and 64-bit-offset layouts, and the same columns with no `ARROW:schema` (from pyarrow and
+  DuckDB). DuckDB's `KV_METADATA` writes the crafted ones: an
+  `ARROW:schema` that is not base64, one that is a truncated message, stored schemas with fewer and more
+  fields than the file and one whose first field is renamed, and a dictionary claim over a struct.
+  `ParquetArrowSchemaTests` and the `ARROW:schema` half of `test_parquet_nested.py` check types, values,
+  field metadata and schema metadata against pyarrow.
+- It also writes the page-index fixtures (pyarrow with `write_page_index=True` in three page layouts and
+  once without, and Polars; plus a float column with NaN from Polars and pyarrow, a NaN inside a page
+  whose other values all equal the filter literal, and `uint64` values past the int64 range) and the
+  bloom-filter fixtures (pyarrow with `bloom_filter_options`, and DuckDB), which `ParquetPageIndexTests`,
+  `ParquetFilterEdgeTests`, `ParquetBloomFilterTests` and the second half of `test_parquet_nested.py` read; that file also damages
+  the page indexes 180 ways and reads them with filters, requiring every read to raise or return, and
+  reads 40,000 rows of repeated columns three times over.
 
 ```
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter "ParquetTests|ParquetWriterTests"
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test -c release --filter "ParquetTests|ParquetWriterTests"
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter "Parquet"
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test -c release --filter "Parquet"
 swift build -c release --product ArrowMetalC
-PYTHONPATH=python python -m pytest python/tests/test_parquet.py -q
+PYTHONPATH=python python -m pytest python/tests/test_parquet.py python/tests/test_parquet_nested.py python/tests/test_parquet_robustness.py -q
+python Tests/Fixtures/generate_parquet_nested.py      # regenerate the nested, schema, page-index and bloom fixtures
 ARROWMETAL_PARQUET_BIG=1 PYTHONPATH=python python -m pytest python/tests/test_parquet.py -q -k fifty
 ```
 
 ## Limits
 
-- **Struct and map columns** are not reassembled; read struct leaves by dotted path.
 - **Duplicate column names are kept, not merged.** `read` hands back a `ColumnSet` — a dict that is
   positional underneath — so `read_parquet(path, columns=["a", "a"])` returns both columns and a file
   with two columns of the same name reads both of them. Indexing by name gives the first; `names`,
   `columns`, `items()` and iteration walk all of them in order.
-- **Nested lists** (`list<list<T>>`) are not assembled — one level of repetition only.
 - **`BIT_PACKED`** (the deprecated level encoding) and **LZO** are rejected.
 - **Encrypted files** are not supported.
 - **A single column chunk above 4 GiB** is rejected (the file itself has no size limit).
-- **Column and offset indexes** in the footer are parsed past but not used: page-level skipping by index
-  is not implemented, only row-group skipping by statistics.
-- **Bloom filters** are ignored.
-- **Statistics pushdown is row-group granular**, and the deprecated `min`/`max` fields are only used when
+- **Statistics pushdown returns a superset of the matching rows**: row-group granular, or page granular
+  when the file has a page index. The deprecated `min`/`max` fields are only used when
   `min_value`/`max_value` are absent (they use a signed byte order that is wrong for strings, which is why
   Parquet deprecated them).
 - **ZSTD needs libzstd** installed; see above.
-- **A timestamp column's time zone is not recovered.** Parquet records only `isAdjustedToUTC`, so an
-  adjusted column comes back as `timestamp[unit, tz=UTC]` where `pyarrow.parquet.read_table` reads the
-  original zone out of the file's `ARROW:schema` key/value metadata, which this reader ignores. The
-  instants are identical; the type differs for any zone other than UTC.
-- **`large_string`, `large_binary` and `large_list` come back 32-bit.** ArrowMetal narrows 64-bit offsets
-  everywhere, so a column pyarrow reads as `large_string` reads here as `string`, with the same values.
+- **The members of a struct and the element of a list are exported as nullable.** A writer that declares
+  a struct member `required` gets `not null` on that member from `pyarrow.parquet.read_table`; the values
+  are the same, and the member reads as nullable here.
+- **A restored dictionary type has `int32` indices and no ordered flag.** The engine's dictionary arrays
+  carry `int32` codes only, so a stored `dictionary<int8 | uint8 | uint32, T>` (pandas stores a categorical
+  with `int8` indices, Polars a `Categorical` with `uint32` and an `Enum` with `uint8`, ordered) reads here
+  as `dictionary<int32, T>`, unordered, where `pyarrow.parquet.read_table` keeps the stored index type
+  and flag. The values are the same
+  (`test_restored_dictionaries_have_int32_indices_and_no_ordered_flag`).
+- **Custom metadata on a nested field is not carried.** A top-level column's field metadata comes back
+  (above); metadata on a struct member, a list element or a map value does not, because the engine's
+  nested arrays have no per-field metadata. The types still compare equal.
+- **`large_string`, `large_binary` and `large_list` come back 32-bit, and the view types as their
+  non-view twins.** ArrowMetal narrows 64-bit offsets everywhere and has no view layouts, so a column
+  whose stored Arrow type is `large_string` or `string_view` reads here as `string`, `large_list` or
+  `list_view` as `list`, with the same values. Polars records `large_string` / `large_list` for every
+  string and list column it writes.
 - **`decimal256` (precision above 38) is rejected**, as is any Arrow type ArrowMetal does not carry.
-- **A `null`-typed column reads as an all-null `int32`**, because Parquet has no physical null type and
-  the Arrow `null` annotation lives in the metadata this reader ignores.
 - **A dictionary-encoded column decodes itself where the kernels cannot use the codes.** `read_parquet`
   returns dictionary-encoded columns encoded (`dictionary=False`, which `read_parquet_table` passes,
   materialises them instead), and the entry points that need the values rather than the codes decode
