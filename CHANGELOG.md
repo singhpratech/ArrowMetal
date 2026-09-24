@@ -200,18 +200,27 @@ Parquet on the GPU
   `pyarrow.parquet.read_table` on files written by pyarrow, DuckDB and Polars
   (`Tests/Fixtures/generate_parquet_nested.py`, `ParquetNestedTests`, `python/tests/test_parquet_nested.py`).
 - The Parquet reader applies the file's `ARROW:schema` metadata: timestamp time zones, durations,
-  decimal32 / decimal64, fixed-size lists, dictionary (categorical) columns and extension types come back
-  as their stored Arrow types, at any depth for zones, durations and decimals; a column annotated
-  `UNKNOWN` reads as the `null` type rather than an all-null `int32`. Field and schema metadata are served
-  by `arrowFieldMetadata(column:)` / `arrowSchemaMetadata`, `am_parquet_field_metadata` /
-  `am_parquet_schema_metadata`, and carried on `read_parquet_table`'s Table. Absent or malformed
-  metadata is ignored (`ParquetArrowSchemaTests`).
+  decimal32 / decimal64, fixed-size lists, string and binary dictionary (categorical) columns and
+  extension types come back as their stored Arrow types, at any depth for zones, durations and decimals;
+  a categorical of any other value type reads as that type, as in pyarrow; a column annotated `UNKNOWN`
+  reads as the `null` type rather than an all-null `int32`. Field and schema metadata are served by
+  `arrowFieldMetadata(column:)` / `arrowSchemaMetadata`, `am_parquet_field_metadata` /
+  `am_parquet_schema_metadata`, and carried on `read_parquet_table`'s Table. The stored fields match the
+  columns by position; a stored schema of another width is ignored, as pyarrow ignores it, and one that
+  is not base64 or not a Schema message is ignored where pyarrow refuses the file
+  (`ParquetArrowSchemaTests`).
+- Parquet filter values: Python raises on a filter value that is not a str, bool, int or float (a
+  `datetime.date` or `Decimal` used to rule out every row group without an error), and a literal of
+  another kind than its column's never rules a row group or page out.
 - Page-level skipping for Parquet statistics filters: with a column index and offset index in the file,
-  the pages whose min/max cannot match (or that hold only nulls) are never read, decompressed or decoded,
-  a row group every page of which is ruled out is dropped, and every column is trimmed to the same
-  candidate rows. The matching rows are identical with and without the index; `usePageIndex` /
-  `use_page_index` / `am_parquet_set_page_index` turn it off and `lastReadStatistics` / `last_read_stats`
-  / `am_parquet_last_read_stats` count the pages decoded and skipped (`ParquetPageIndexTests`).
+  the pages whose min/max cannot match (or that hold only nulls, by their null count as well as their
+  flag, since Polars flags pages holding a NaN) are never read, decompressed or decoded; the row-group
+  min/max of a column whose index shows such a flagged page do not drop the row group, since Polars
+  leaves those pages out of them; a row group every page of which is ruled out is dropped, and every
+  column is trimmed to the same candidate rows. The matching rows are identical with and without the
+  index; `usePageIndex` / `use_page_index` / `am_parquet_set_page_index` turn it off and
+  `lastReadStatistics` / `last_read_stats` / `am_parquet_last_read_stats` count the pages decoded and
+  skipped (`ParquetPageIndexTests`).
 - Parquet split-block bloom filters (pyarrow's `bloom_filter_options`, DuckDB's): an `==` filter drops
   the row groups whose bloom filter rules its literal out, before any page is read; `useBloomFilters` /
   `use_bloom_filters` / `am_parquet_set_bloom_filters` turn it off (`ParquetBloomFilterTests`).

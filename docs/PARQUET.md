@@ -250,7 +250,7 @@ FlatBuffers views in `IPC/FlatBuffers.swift` and puts back what the Parquet sche
 | `duration[unit]` | plain `INT64` | `duration[unit]` |
 | `decimal32(p,s)` / `decimal64(p,s)` | `INT32` / `INT64` `DECIMAL` | `decimal32(p,s)` / `decimal64(p,s)` |
 | `fixed_size_list<T>[n]` | a list | `fixed_size_list<T>[n]`; a null row gets `n` null child slots |
-| `dictionary<int32, T>` (a pandas categorical) | the values | dictionary encoded, whatever the `dictionary` switch says |
+| `dictionary<int32, T>` over strings or binaries (a pandas categorical) | the values | dictionary encoded, whatever the `dictionary` switch says; a dictionary over any other value type (integers, timestamps, dates) reads as that value type, as pyarrow reads it |
 | an extension type | its storage | the storage wrapped in `MetalExtensionArray`, so a consumer that knows the type rebuilds it |
 | field `custom_metadata` | — | `ParquetFile.arrowFieldMetadata(column:)`, `am_parquet_field_metadata`, `f.field_metadata(column)`, and on every field of `read_parquet_table`'s Table |
 
@@ -258,9 +258,14 @@ Time zones and durations are restored inside structs, lists and maps too. The fi
 key/value metadata is the schema metadata (`arrowSchemaMetadata`, `am_parquet_schema_metadata`,
 `f.schema_metadata`), and a Parquet `field_id` shows up as `PARQUET:field_id`, as it does in pyarrow.
 The `null` type needs no stored schema: Parquet annotates a null column `UNKNOWN`, which reads as `null`.
-A file without `ARROW:schema`, or with one that is not base64 or does not decode as a Schema message,
-reads exactly as its Parquet schema describes it. A leaf read on its own by dotted path always reads as
-the Parquet schema describes it.
+The stored fields are matched to the Parquet columns by position, as Arrow's reader matches them; a
+stored schema with a different number of top-level fields is ignored, and its `ARROW:schema` key stays
+in the schema metadata, as pyarrow keeps it. A stored type the column cannot take (a dictionary claim over
+a struct, say) is ignored for that column. A file without `ARROW:schema` reads exactly as its Parquet
+schema describes it. A file whose `ARROW:schema` is not base64, or does not decode as a Schema message,
+reads the same way, with the undecodable value left in the schema metadata; pyarrow refuses to open such
+a file (`Invalid base64 input`, `Corrupted metadata length`), and `test_parquet_nested.py` checks both
+sides. A leaf read on its own by dotted path always reads as the Parquet schema describes it.
 
 ## Projection and predicate pushdown
 
@@ -289,7 +294,11 @@ in. `filters` is evaluated against the footer's `min_value` / `max_value` statis
 row group whose range cannot contain a match is skipped without reading a page. When the file also has a
 column index and an offset index, the same filters then skip pages inside the row groups that remain
 (next section). Either way the result is a superset of the matching rows: follow it with `filter` (or a
-fused `am.query`) to get exactly the rows.
+fused `am.query`) to get exactly the rows. A filter value is a string, a boolean, an integer or a float;
+a date or timestamp column is filtered by its stored integer (days since the epoch, or ticks in the
+column's unit), and Python raises on any other value (a `datetime.date`, a `Decimal`). A literal of
+another kind than the column's (a string against a number, in the C and Swift filter text) never rules a
+row group or page out.
 `ParquetFile.selectedRowGroups(_:)` / `ParquetFile.selected_row_groups(...)` report what the row-group
 statistics keep without reading anything.
 
@@ -302,7 +311,14 @@ group to *candidate row ranges* (`ParquetPageIndex.swift`):
 
 1. For each filter on a flat column, a page whose [min, max] cannot satisfy it, or that holds only nulls,
    rules out its rows. The ranges the filters leave are intersected; a row group left with none is not
-   read at all, even when its row-group statistics let it through.
+   read at all, even when its row-group statistics let it through. A page counts as all-null only when
+   the index's null count for it covers every row: Polars (1.44) flags each page that holds a NaN as a
+   null page with a null count of 0, and such a page is kept whole. A NaN min or max rules nothing out,
+   as the format asks. Polars also leaves the flagged pages out of the row group's min / max, so when a
+   chunk's column index shows such a page, that column's row-group statistics do not drop the row
+   group; `pyarrow.parquet.read_table(filters=...)` trusts them and returns no rows for a filter outside
+   the unflagged pages' range, where ArrowMetal returns every match
+   (`test_polars_row_group_statistics_leave_nan_pages_out`).
 2. Every flat column with an offset index decodes only the data pages that overlap a candidate range.
    The page list comes from the offset index, so a skipped page is never decompressed, never decoded,
    and its header is never read.
@@ -316,7 +332,8 @@ turns it off, and `lastReadStatistics` (`f.last_read_stats`, `am_parquet_last_re
 the last read did: row groups read and skipped by statistics, by the page index and by bloom filters
 (below), data pages decoded and skipped, rows returned. `test_parquet_nested.py` compares the exact
 matches with and without the index against pyarrow over fifteen filter sets on five files (pyarrow in
-three page layouts and once without an index, and Polars); `ParquetPageIndexTests` also checks that the
+three page layouts and once without an index, and Polars), and six filter sets on a float column with a
+NaN every 97th row, written by Polars and by pyarrow; `ParquetPageIndexTests` also checks that the
 skipped and decoded pages of flat columns add up to the pages of the row groups read. A filter on a
 column inside a list does not narrow pages; the row-group statistics still apply to it.
 
@@ -493,17 +510,21 @@ int64, float64, string, bool and timestamp columns, uncompressed and Snappy; `Pa
   which has its own test showing the difference is exactly that; it also damages nested files 200 ways and
   requires every read to raise or return rather than crash.
 - The same generator writes the `ARROW:schema` fixtures: time zones on every unit (named zones, a fixed
-  offset, UTC, naive), the `null` type, durations, decimal32 / decimal64, a fixed-size list, a categorical,
-  field metadata and a `field_id`, a registered (`arrow.uuid`) and two unregistered extension types, zones
-  and durations inside a struct, a list and a map, the view and 64-bit-offset layouts, and the same columns
-  with no `ARROW:schema`, with one that is not base64 and with one that is a truncated message.
+  offset, UTC, naive), the `null` type, durations, decimal32 / decimal64, a fixed-size list, categoricals
+  over strings, binaries, integers, timestamps and dates, field metadata and a `field_id`, a registered
+  (`arrow.uuid`) and two unregistered extension types, zones and durations inside a struct, a list and a
+  map, the view and 64-bit-offset layouts, and the same columns with no `ARROW:schema` (from pyarrow and
+  DuckDB). DuckDB's `KV_METADATA` writes the crafted ones: an
+  `ARROW:schema` that is not base64, one that is a truncated message, stored schemas with fewer and more
+  fields than the file and one whose first field is renamed, and a dictionary claim over a struct.
   `ParquetArrowSchemaTests` and the `ARROW:schema` half of `test_parquet_nested.py` check types, values,
   field metadata and schema metadata against pyarrow.
 - It also writes the page-index fixtures (pyarrow with `write_page_index=True` in three page layouts and
-  once without, and Polars) and the bloom-filter fixtures (pyarrow with `bloom_filter_options`, and DuckDB),
-  which `ParquetPageIndexTests`, `ParquetBloomFilterTests` and the second half of `test_parquet_nested.py`
-  read; that file also damages the page indexes 180 ways and reads them with filters, requiring every read
-  to raise or return, and reads 40,000 rows of repeated columns three times over.
+  once without, and Polars; plus a float column with NaN from Polars and pyarrow) and the bloom-filter
+  fixtures (pyarrow with `bloom_filter_options`, and DuckDB), which `ParquetPageIndexTests`,
+  `ParquetBloomFilterTests` and the second half of `test_parquet_nested.py` read; that file also damages
+  the page indexes 180 ways and reads them with filters, requiring every read to raise or return, and
+  reads 40,000 rows of repeated columns three times over.
 
 ```
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter "Parquet"
