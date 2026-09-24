@@ -445,11 +445,16 @@ integer type.
 Two conditions, both recorded for each decision in `arrowmetal_rewrites()`:
 
 1. **The router's crossover.** DuckDB's estimate of the rows reaching the aggregate is at or above the
-   largest crossover among the query's aggregates in `Benchmarks/results/router_2026-09-17.json`: the
+   largest crossover among the query's aggregates in `Benchmarks/results/router_2026-09-24.json`: the
    `reductions` rows without `GROUP BY`, the `group-by` rows with it, in the 1,000-group or
    100,000-group class by DuckDB's estimate of the group count (split at 10,000, the geometric middle),
    and the utf8 rows for a `VARCHAR` key. `test_crossovers_match_the_router_sweep` holds the constants to
-   the JSON.
+   the JSON. The constants were first taken from `Benchmarks/results/router_2026-09-17.json`, whose
+   ArrowMetal rows came from a stale library; of the rows used here only `min(int64, 10% nulls)` differs
+   between the two sweeps, 50,000,000 then and 10,000,000 now. `min` without `GROUP BY` is gated by the
+   ungrouped class's floor of 50,000,000 rows below (or not rewritten, with one or two aggregates), so no
+   `auto` decision changes; at 10,000,000 rows the reason for such a query now reads "below the measured
+   floor" where the results file, measured before the change, says "below the crossover".
 2. **A measured floor.** The router's crossovers compare kernels on data already on the GPU. Here every
    row is first copied out of DuckDB's scan, and DuckDB's own aggregate runs while it scans, so the
    query's shape class must also have been measured faster than DuckDB's operators, from the size in

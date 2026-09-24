@@ -565,10 +565,15 @@ cold` rows, where above 1 is ahead; 2M rows first, then 50M), the quiet run says
 
 So `MetalEngine()` takes a subtree when every shape in it is a full sort (`MEASURED_SHAPES`), none of
 its inputs is a String column, and its in-memory inputs hold at least 1,000,000 rows -- 10,000,000
-when a helper key is needed. 1,000,000 is the sort family's crossover against the fastest CPU
-library in `Benchmarks/results/router_2026-09-17.json` (`sort float64`, `argsort int64`, `lexsort (2
-int32 keys)`); the provisional run had full sorts ahead below it as well, so the default keeps the
-router's figure as its margin. The quiet run keeps these defaults. Both sorts the default takes are
+when a helper key is needed. 1,000,000 is the crossover against the fastest CPU library of the
+operations a full sort runs (the engine's `sort` is a `lexsort` and a `take`, [ENGINE.md](ENGINE.md))
+in `Benchmarks/results/router_2026-09-24.json`: `argsort int64`, `argsort float64` and `lexsort (2
+int32 keys)` are all at 1,000,000. The figure was first taken from
+`Benchmarks/results/router_2026-09-17.json`, whose ArrowMetal rows came from a stale library, where
+`sort float64` was cited alongside them at 1,000,000; in the 2026-09-24 sweep `sort float64` (sorting
+a column's values, which the engine does not run for a frame sort) is at 10,000,000, and the rows the
+engine does run are unchanged. The provisional run had full sorts ahead below 1,000,000 as well, so the
+default keeps the router's figure as its margin. The quiet run keeps these defaults. Both sorts the default takes are
 ahead of the faster Polars engine at both sizes (`MetalEngine default, cold`: `(m)` at 5.20 and 4.86,
 `(q)` at 3.75 and 6.35). Every shape it declines is behind at one of the two sizes, or belongs to a
 family with a shape that is (`(j)` for group-by over two or more keys, `(i)` at 2M rows for group-by

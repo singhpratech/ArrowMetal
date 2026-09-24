@@ -28,7 +28,7 @@ duckdb = pytest.importorskip("duckdb")
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 EXTENSION = os.path.join(REPO, "duckdb-extension", "build", "arrowmetal_rewrite.duckdb_extension")
 SOURCE = os.path.join(REPO, "duckdb-extension", "src", "arrowmetal_rewrite.cpp")
-ROUTER = os.path.join(REPO, "Benchmarks", "results", "router_2026-09-17.json")
+ROUTER = os.path.join(REPO, "Benchmarks", "results", "router_2026-09-24.json")
 RESULTS = os.path.join(REPO, "Benchmarks", "results", "duckdb_rewrite_2026-09-24.csv")
 
 pytestmark = pytest.mark.skipif(not os.path.exists(EXTENSION),
@@ -489,7 +489,7 @@ def test_measured_floors_are_in_the_benchmark_results():
 
 
 def test_crossovers_match_the_router_sweep():
-    """The auto gate's constants are the router's crossovers (Benchmarks/results/router_2026-09-17.json)."""
+    """The auto gate's constants are the router's crossovers (Benchmarks/results/router_2026-09-24.json)."""
     source = open(SOURCE).read()
     constants = dict(re.findall(r"static constexpr int64_t (\w+) = (\d+);", source))
     crossover = json.load(open(ROUTER))["vs_fastest_library"]

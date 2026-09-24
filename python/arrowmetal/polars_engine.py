@@ -74,8 +74,8 @@ TESTED_IR_VERSION = (14, 7)
 TESTED_POLARS = "1.44.1"
 
 # Default size gate, in total rows over a subtree's in-memory inputs. How it was chosen is in
-# docs/POLARS.md ("Tier 4", "Which translatable subtrees it runs"): the sort family's crossover in
-# Benchmarks/results/router_2026-09-17.json, checked against
+# docs/POLARS.md ("Tier 4", "Which translatable subtrees it runs"): the crossover of argsort and
+# lexsort, which a full sort runs, in Benchmarks/results/router_2026-09-24.json, checked against
 # Benchmarks/results/polars_engine_bench_2026-09-23_provisional.csv and the quiet rerun,
 # Benchmarks/results/polars_engine_bench_2026-09-24.csv.
 DEFAULT_MIN_ROWS = 1_000_000

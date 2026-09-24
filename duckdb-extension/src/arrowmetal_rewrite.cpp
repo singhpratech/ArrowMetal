@@ -17,7 +17,7 @@
 // BY column that is an integer, DATE, TIMESTAMP or VARCHAR column - sitting on a chain of projections
 // and filters over a table function whose row count DuckDB knows. In 'auto' mode, when DuckDB's
 // estimate of the rows reaching the aggregate is at or above both the router's crossover
-// (Benchmarks/results/router_2026-09-17.json) and the measured floor of the query's shape class
+// (Benchmarks/results/router_2026-09-24.json) and the measured floor of the query's shape class
 // (Benchmarks/results/duckdb_rewrite_2026-09-24.csv), the LogicalAggregate is replaced by
 // ARROWMETAL_AGGREGATE. Everything below the aggregate - the scan, the pushed-down filters, the
 // projections - is still DuckDB's, planned and run exactly as before.
@@ -80,16 +80,17 @@ namespace duckdb {
 namespace arrowmetal_rewrite {
 
 //===--------------------------------------------------------------------===//
-// Crossovers, from Benchmarks/results/router_2026-09-17.json ("vs_fastest_library"). The row count
+// Crossovers, from Benchmarks/results/router_2026-09-24.json ("vs_fastest_library"). The row count
 // at which ArrowMetal's kernel first beats the fastest CPU library on the same operation. A query is
 // rewritten in 'auto' mode only when DuckDB's estimate of the rows reaching the aggregate is at or
 // above the largest crossover among its aggregates. python/tests/test_duckdb_rewrite.py checks these
-// constants against the JSON, so they cannot drift from it silently.
+// constants against the JSON, so they cannot drift from it silently. (From the 2026-09-17 sweep, whose
+// ArrowMetal rows came from a stale library, MIN was 50000000; the rest are unchanged.)
 //===--------------------------------------------------------------------===//
 struct Crossovers {
 	// "reductions: sum(int64, 10% nulls)", "min(...)", "max(...)", "mean(...)"
 	static constexpr int64_t SUM = 10000000;
-	static constexpr int64_t MIN = 50000000;
+	static constexpr int64_t MIN = 10000000;
 	static constexpr int64_t MAX = 10000000;
 	static constexpr int64_t MEAN = 1000000;
 	// "group-by: {sum,count,min,max,mean} by int32 key (1000 groups)" - all five are 10M
