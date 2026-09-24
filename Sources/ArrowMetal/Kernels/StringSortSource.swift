@@ -8,6 +8,11 @@ import Foundation
 /// the mapping exact: a row that stops inside the chunk compares below every row that continues, whatever
 /// byte comes next — including a NUL, which a plain zero-padded key would confuse with the end of a
 /// shorter row ("ab" must sort before "ab\0", and does here).
+///
+/// Bit 63, which the seven fields leave free, carries the null partition: with `nullMode` 1 a null row's
+/// key is exactly `1 << 63` (above every valid key, in both directions), with `nullMode` 2 it is `0` and
+/// every valid key gets bit 63 set. All null rows share one key, so the stable passes keep them in row
+/// order, as a block at the requested end, with no separate partition step and no CPU readback.
 enum StringSortSource {
     /// Bytes packed into one key. 7 x 9 = 63 bits, so the key is always non-negative and `descending`
     /// can mirror it with a subtraction from the 63-bit maximum without losing stability.
@@ -25,6 +30,8 @@ enum StringSortSource {
                                constant uint& hasPerm [[buffer(5)]],
                                constant uint& descending [[buffer(6)]],
                                device ulong* out [[buffer(7)]],
+                               device const uchar* validity [[buffer(8)]],
+                               constant uint& nullMode [[buffer(9)]],
                                uint i [[thread_position_in_grid]]) {
         if (i >= n) return;
         uint row = hasPerm ? (uint)perm[i] : i;
@@ -38,6 +45,11 @@ enum StringSortSource {
             k = (k << 9) | v;
         }
         if (descending) k = 0x7FFFFFFFFFFFFFFFul - k;
+        if (nullMode != 0u) {
+            bool valid = ((validity[row >> 3] >> (row & 7u)) & 1u) != 0u;
+            if (nullMode == 1u) { if (!valid) k = 0x8000000000000000ul; }
+            else { k = valid ? (k | 0x8000000000000000ul) : 0ul; }
+        }
         out[i] = k;
     }
     """

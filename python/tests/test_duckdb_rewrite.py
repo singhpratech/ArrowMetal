@@ -418,6 +418,30 @@ def test_auto_is_the_default_and_off_turns_it_off(con):
     assert last_decision(con)[0] == before   # 'off' does not even look
 
 
+MODE_ERROR = r"arrowmetal_rewrite: unrecognised value .*; expected 'auto', 'off' \(also 'false' or '0'\) or 'force'"
+
+
+@pytest.mark.parametrize("value", ["'on'", "'true'", "'bogus'", "' force'", "'force '", "''", "1", "NULL"])
+def test_an_unrecognised_mode_is_an_error_from_set(con, value):
+    # These used to be taken as 'auto' without a word. SET now refuses them and keeps the mode it had.
+    con.execute("SET arrowmetal_rewrite = 'off'")
+    with pytest.raises(duckdb.InvalidInputException, match=MODE_ERROR):
+        con.execute(f"SET arrowmetal_rewrite = {value}")
+    with pytest.raises(duckdb.InvalidInputException, match=MODE_ERROR):
+        con.execute(f"SET GLOBAL arrowmetal_rewrite = {value}")
+    assert con.sql("SELECT current_setting('arrowmetal_rewrite')").fetchone()[0] == "off"
+
+
+@pytest.mark.parametrize("value, rewritten", [("auto", False), ("AUTO", False), ("off", False), ("false", False),
+                                              ("0", False), ("Off", False), ("force", True), ("FORCE", True)])
+def test_the_accepted_modes_in_any_case(con, value, rewritten):
+    make(con, 1_000, "(i % 10)::INTEGER", [value_sql("BIGINT", 22)])   # 1,000 rows: 'auto' keeps it
+    con.execute(f"SET arrowmetal_rewrite = '{value}'")
+    assert (OPERATOR in plan(con, "SELECT k, sum(v0) FROM t GROUP BY k")) == rewritten
+    con.execute("RESET arrowmetal_rewrite")
+    assert con.sql("SELECT current_setting('arrowmetal_rewrite')").fetchone()[0] == "auto"
+
+
 def test_the_decision_log_records_the_run(con):
     make(con, 20_000, "(i % 10)::INTEGER", [value_sql("BIGINT", 23)])
     con.execute("SET arrowmetal_rewrite = 'force'")
@@ -553,6 +577,35 @@ def test_where_duckdb_does_not_check_the_statistics_neither_does_the_rewrite(con
     expected = sorted(con.execute("EXECUTE p_off").fetchall())
     assert (44, 1, 1) in expected and (249, 2, 1) in expected
     assert sorted(con.execute("EXECUTE p_gpu").fetchall()) == expected
+
+
+@pytest.mark.parametrize("key_type", ["TINYINT", "UTINYINT"])
+def test_an_8_bit_key_below_the_planned_minimum(con, key_type):
+    # An 8-bit key is not narrowed, so a key under the statistics' minimum reaches the perfect-hash
+    # check as a negative slot (3 - 10 + 1 = -6). Both raise the same class with the same text, except
+    # the group number: DuckDB prints it as 2^128 - 6, the rewrite as 2^64 - 6 (docs/DUCKDB.md §4b).
+    con.execute(f"CREATE OR REPLACE TABLE p AS SELECT ((i % 5) + 10)::{key_type} k, i::INTEGER v "
+                "FROM range(10000) r(i)")
+    con.execute("SET arrowmetal_rewrite = 'off'")
+    con.execute("PREPARE p_off AS SELECT k, sum(v), count(*) FROM p GROUP BY k")
+    con.execute("SET arrowmetal_rewrite = 'force'")
+    con.execute("PREPARE p_gpu AS SELECT k, sum(v), count(*) FROM p GROUP BY k")
+    con.execute("INSERT INTO p VALUES (3, 1)")
+    with pytest.raises(duckdb.InvalidInputException, match=PERFECT_HASH_ERROR) as expected:
+        con.execute("EXECUTE p_off")
+    with pytest.raises(duckdb.InvalidInputException, match=PERFECT_HASH_ERROR) as got:
+        con.execute("EXECUTE p_gpu")
+    assert type(got.value) is type(expected.value)
+    assert f"group {2**128 - 6} exceeded" in str(expected.value)
+    assert str(got.value) == str(expected.value).replace(str(2**128 - 6), str(2**64 - 6))
+    # A key one below the minimum has slot 0, DuckDB's NULL slot: DuckDB files its row under a NULL key
+    # without an error, and the rewrite under the key itself.
+    con.execute("DELETE FROM p WHERE k = 3")
+    con.execute("INSERT INTO p VALUES (9, 1)")
+    duck = sorted(con.execute("EXECUTE p_off").fetchall(), key=sort_key)
+    gpu = sorted(con.execute("EXECUTE p_gpu").fetchall(), key=sort_key)
+    assert duck[-1] == (None, 1, 1) and (9, 1, 1) in gpu
+    assert [r for r in duck if r[0] is not None] == [r for r in gpu if r[0] != 9]
 
 
 def test_a_prepared_statement_within_duckdbs_perfect_hash_table(con):

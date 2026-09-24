@@ -333,6 +333,11 @@ SET arrowmetal_rewrite = 'off';         -- plain DuckDB
 SET arrowmetal_rewrite = 'force';       -- every supported shape, whatever its size
 ```
 
+The three values are read in any letter case, and `'off'` is also spelled `'false'` or `'0'`. Any other
+value (`'on'`, `'true'`, `' force'` with a space, `NULL`) is an error from the `SET` itself,
+`arrowmetal_rewrite: unrecognised value 'on'; expected 'auto', 'off' (also 'false' or '0') or 'force'`,
+and the mode stays what it was. `RESET arrowmetal_rewrite` returns to `'auto'`.
+
 From Python, `am.duckdb_connect()` opens a connection with the extension loaded,
 `am.duckdb_is_rewritten(con, sql)` says whether the plan of `sql` has an `ARROWMETAL_AGGREGATE`, and
 `am.duckdb_rewrites(con)` returns the decision log as a `pyarrow.Table`.
@@ -500,6 +505,15 @@ queries (`sum, max, avg`) was not ahead of DuckDB.
   rewrite does not either, and both answer over the same narrowed keys
   (`test_a_prepared_statement_whose_key_outgrew_its_statistics`,
   `test_where_duckdb_does_not_check_the_statistics_neither_does_the_rewrite`).
+- One known difference in that error: for an 8-bit key (`TINYINT`, `UTINYINT`, which the plan does not
+  narrow) below the planned minimum, the group number. Such a key's slot is negative, `key - min + 1`;
+  DuckDB prints it as 2^128 plus the slot and the rewrite as 2^64 plus the slot, so statistics of
+  [10, 14] and a key of 3 read `group 340282366920938463463374607431768211450` from DuckDB and
+  `group 18446744073709551610` from the rewrite. The difference is deterministic; the exception class
+  (`InvalidInputException`) and the rest of the text are the same, and keys of 16 bits or more, or above
+  the maximum, give the same number. A key exactly one below the minimum has slot 0, which is the slot
+  DuckDB keeps for the NULL key: DuckDB returns that key's rows as the NULL group, with no error, and
+  the rewrite returns them under the key itself (`test_an_8_bit_key_below_the_planned_minimum`).
 - The log keeps the last 1,024 decisions of the process and is shared by every connection; a
   rewritten plan's `path`, `rows_seen`, `groups` and `gpu_ms` describe its latest run.
 - The aggregate's input is held in memory: the buffers are reserved for the source's row count and

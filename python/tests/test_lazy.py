@@ -712,3 +712,21 @@ def test_string_sort_with_a_null_and_a_long_row():
         ["a", "ab", "b", "c", "xxxxxxxx", None]
     assert am.scan(t).sort("s", descending=True).collect().column("s").to_pylist() == \
         ["xxxxxxxx", "c", "b", "ab", "a", None]
+
+
+@pytest.mark.parametrize("descending", [False, True])
+def test_string_sort_with_nulls_against_pyarrow(descending):
+    """The null partition runs in the prefix keys on the GPU: a plan sort and an array sort over rows of
+    up to three prefix passes, ties and empty strings, with 10% nulls, row for row with pyarrow."""
+    rng = random.Random(11)
+    xs = [None if rng.random() < 0.1 else "".join(rng.choice("ab\x00z") for _ in range(rng.randint(0, 20)))
+          for _ in range(5000)]
+    a = pa.array(xs, pa.large_string())
+    order = "descending" if descending else "ascending"
+    want = pc.take(a, pc.array_sort_indices(a, order=order)).to_pylist()
+    assert am.scan(pa.table({"s": a})).sort("s", descending=descending).collect().column("s").to_pylist() == want
+    ma = am.MetalArray.from_arrow(pa.array(xs, pa.string()))
+    assert ma.sort(descending=descending).to_arrow().to_pylist() == want
+    with am.batch():
+        inside = ma.sort(descending=descending)
+    assert inside.to_arrow().to_pylist() == want

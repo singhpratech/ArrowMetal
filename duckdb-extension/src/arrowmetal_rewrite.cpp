@@ -40,6 +40,7 @@
 //   SET arrowmetal_rewrite = 'auto';   -- default: supported shapes, at the sizes measured faster
 //   SET arrowmetal_rewrite = 'off';    -- never rewrite
 //   SET arrowmetal_rewrite = 'force';  -- rewrite every supported shape regardless of size (for tests)
+//   (any other value is an error from SET naming these; 'off' also accepts 'false' and '0')
 //   SET arrowmetal_rewrite_block_rows = 16777216;  -- rows per block of a streamed plan
 //   SELECT * FROM arrowmetal_rewrites();  -- every decision this process made, oldest first, with reason
 //   EXPLAIN ...                           -- ARROWMETAL_AGGREGATE in the plan means the query was rewritten
@@ -142,18 +143,41 @@ static constexpr int64_t MAX_ROWS = (int64_t(1) << 31) - 1;
 
 enum class Mode { AUTO, OFF, FORCE };
 
+// The accepted values, in any letter case and nothing else: a value that is not one of them ('on',
+// 'true', ' force' with a space) is an error from SET, raised by CheckModeSetting below.
+static bool ParseMode(const Value &value, Mode &mode) {
+	if (value.IsNull()) {
+		return false;
+	}
+	auto text = StringUtil::Lower(value.ToString());
+	if (text == "off" || text == "false" || text == "0") {
+		mode = Mode::OFF;
+	} else if (text == "auto") {
+		mode = Mode::AUTO;
+	} else if (text == "force") {
+		mode = Mode::FORCE;
+	} else {
+		return false;
+	}
+	return true;
+}
+
+static void CheckModeSetting(ClientContext &context, SetScope scope, Value &parameter) {
+	Mode mode;
+	if (!ParseMode(parameter, mode)) {
+		throw InvalidInputException("arrowmetal_rewrite: unrecognised value %s; expected 'auto', 'off' (also "
+		                            "'false' or '0') or 'force'",
+		                            parameter.IsNull() ? string("NULL") : "'" + parameter.ToString() + "'");
+	}
+}
+
 static Mode GetMode(ClientContext &context) {
 	Value value;
-	if (context.TryGetCurrentSetting("arrowmetal_rewrite", value) && !value.IsNull()) {
-		auto text = StringUtil::Lower(value.ToString());
-		if (text == "off" || text == "false" || text == "0") {
-			return Mode::OFF;
-		}
-		if (text == "force") {
-			return Mode::FORCE;
-		}
+	Mode mode = Mode::AUTO;
+	if (context.TryGetCurrentSetting("arrowmetal_rewrite", value)) {
+		ParseMode(value, mode);                       // SET has already refused anything else
 	}
-	return Mode::AUTO;
+	return mode;
 }
 
 //===--------------------------------------------------------------------===//
@@ -2802,7 +2826,7 @@ static void Load(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(db);
 	config.AddExtensionOption("arrowmetal_rewrite",
 	                          "ArrowMetal aggregate rewrite: 'auto' (at or above the crossover), 'off', or 'force'",
-	                          LogicalType::VARCHAR, Value("auto"));
+	                          LogicalType::VARCHAR, Value("auto"), CheckModeSetting);
 	config.AddExtensionOption("arrowmetal_rewrite_block_rows",
 	                          "ArrowMetal aggregate rewrite: rows per block when a plan is streamed to the GPU",
 	                          LogicalType::BIGINT, Value::BIGINT(DEFAULT_BLOCK_ROWS));

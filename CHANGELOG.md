@@ -22,6 +22,11 @@ Core
   (docs/TESTING.md).
 
 Temporal, timezones and the rest of the type matrix
+- The utf8 / binary sort moves its null rows on the GPU: bit 63 of every prefix key, which the seven
+  9-bit byte fields leave free, carries the null placement, so the stable radix passes leave the nulls as
+  one block in row order at either end and the CPU partition, with the wait for the batch it needed, is
+  gone. A plan sort of 10M strings of 1 to 24 bytes with 10% nulls went from 122.7 ms to 42.0 ms (best
+  of 7, M4 Max); columns without nulls take the same passes as before.
 - The Arrow IPC writer takes every one of these types, nested children recursively: decimal32/64/128/256,
   `float16`, `fixed_size_binary`, the three interval units, `null`, `list`/`large_list`/`fixed_size_list`,
   `struct`, `map`, dense and sparse unions, run-end encoded columns and extension types (whose
@@ -227,7 +232,14 @@ Fixed
 - A String sort with a null and a row of 8 bytes or more returns the right rows inside a batch (every
   plan sort): with two or more prefix passes the index array is a `take` of the passes, and the null
   partition read it on the CPU before the GPU had written it, returning wrong rows and once a bus
-  error. The partition now waits for the batch. Found by the Polars engine lane's differential suite.
+  error. The partition now runs on the GPU, in the sort's own prefix keys, so there is no CPU read to
+  wait for (see Core). Found by the Polars engine lane's differential suite.
+- The DuckDB rewrite extension refuses an unrecognised `arrowmetal_rewrite` value at the `SET`
+  (`'on'`, `'true'`, `' force'` with a space, `NULL`), with an error naming the accepted values: `'auto'`,
+  `'off'` (also `'false'` or `'0'`) and `'force'`, in any letter case. It used to take such a value as
+  `'auto'` silently. docs/DUCKDB.md §4b also records the one known difference from DuckDB's perfect-hash
+  error, the group number an 8-bit key below the planned minimum reports, and that a key exactly one
+  below it is filed by DuckDB under the NULL group and by the rewrite under the key.
 - `am.scan_ipc(...)` (and every stream with no explicit projection) no longer replaces the second of two
   same-named columns with a copy of the first: the default projection looked each column up by name.
   Such a batch now stays positional; batches with unique names take the fused path as before. Found by

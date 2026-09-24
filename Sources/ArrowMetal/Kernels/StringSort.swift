@@ -5,7 +5,8 @@ import Metal
 //
 // The order is byte-wise lexicographic, exactly what pyarrow's `array_sort_indices` and Polars' `arg_sort`
 // produce for utf8: Arrow compares string bytes, not Unicode collation elements, so this is the whole
-// contract. Nulls come last, and equal rows keep their original order (stable), in both directions.
+// contract. Nulls form one block, in row order, at the end `nullPlacement` names (last by default), and
+// equal rows keep their original order (stable), in both directions.
 //
 // How it runs. A string has no fixed-width order-preserving key, so the sort is an LSD radix over
 // fixed-width *prefix chunks*: `StringSortSource` packs seven of a row's bytes into one 63-bit integer
@@ -35,18 +36,22 @@ extension MetalStringArray {
         try Dispatch.checkLength(n)
         if n == 0 { return try MetalArray<Int32>([Int32](), context: ctx) }
 
-        let chunks = try chunkCount()
+        // The null rows ride in bit 63 of every prefix key (see `StringSortSource`), so the stable passes
+        // leave them as one block, in row order, at `nullPlacement`'s end: no separate partition and no
+        // CPU readback of the index array inside an open batch. A column whose valid rows are all empty
+        // strings still takes one pass, to move its nulls.
+        let nulls: (MetalArrowBuffer, NullPlacement)? = nullCount > 0 ? validity.map { ($0, nullPlacement) } : nil
+        var chunks = try chunkCount()
+        if nulls != nil && nullCount < n { chunks = max(chunks, 1) }
         var perm: MetalArray<Int32>? = nil                  // nil means "the identity so far"
         if chunks > 0 {
             for chunk in stride(from: chunks - 1, through: 0, by: -1) {
-                let keys = try prefixKeys(chunk: chunk, order: perm, descending: descending)
+                let keys = try prefixKeys(chunk: chunk, order: perm, descending: descending, nulls: nulls)
                 let step = try keys.argsort()
                 perm = try perm.map { try $0.take(step) } ?? step
             }
         }
-        let idx = try perm ?? MetalArray<Int32>.iota(n, context: ctx)
-        guard nullCount > 0, let v = validity else { return idx }
-        return try Self.partitionNulls(idx, validity: v, placement: nullPlacement, context: ctx)
+        return try perm ?? MetalArray<Int32>.iota(n, context: ctx)
     }
 
     /// The rows in byte-wise lexicographic order (`argsort` then `take`).
@@ -64,8 +69,10 @@ extension MetalStringArray {
         return (Int(longest) + per - 1) / per
     }
 
-    /// The 63-bit key of chunk `chunk` for each row, read in `order` (the identity when it is nil).
-    private func prefixKeys(chunk: Int, order: MetalArray<Int32>?, descending: Bool) throws -> MetalArray<UInt64> {
+    /// The 63-bit key of chunk `chunk` for each row, read in `order` (the identity when it is nil). With
+    /// `nulls`, bit 63 moves the null rows to the placement's end (`StringSortSource`).
+    private func prefixKeys(chunk: Int, order: MetalArray<Int32>?, descending: Bool,
+                            nulls: (MetalArrowBuffer, NullPlacement)?) throws -> MetalArray<UInt64> {
         let n = length
         let ctx = context
         let out = try MetalArrowBuffer.allocate(byteCount: n * 8, zeroed: false, context: ctx)
@@ -82,36 +89,12 @@ extension MetalStringArray {
             Dispatch.setUInt(enc, order == nil ? 0 : 1, index: 5)
             Dispatch.setUInt(enc, descending ? 1 : 0, index: 6)
             enc.setBuffer(out.mtl, offset: out.offset, index: 7)
+            let bm = nulls?.0 ?? out                        // unused when there are no nulls
+            enc.setBuffer(bm.mtl, offset: bm.offset, index: 8)
+            Dispatch.setUInt(enc, nulls.map { $0.1 == .atStart ? 2 : 1 } ?? 0, index: 9)
             Dispatch.dispatch1D(enc, pso, count: n)
         }
         if let order { ctx.retainUntilFlush(order) }
         return MetalArray<UInt64>(length: n, nullCount: 0, validity: nil, values: out, context: ctx)
-    }
-
-    /// Stable partition of an index array that moves the null rows to `placement`'s end, keeping the
-    /// valid rows in the order the sort left them and the null rows in row order — Arrow's
-    /// `null_placement`. `.atEnd` is Arrow's default; `.atStart` is what `lexsortIndices` passes down
-    /// when the caller asked for it, and dropping it here is what made a utf8 key ignore the option.
-    static func partitionNulls(_ idx: MetalArray<Int32>, validity: MetalArrowBuffer,
-                               placement: NullPlacement,
-                               context: MetalContext) throws -> MetalArray<Int32> {
-        let n = idx.length
-        // The partition reads the indices on the CPU. Inside a batch they may still be unwritten: with
-        // two or more prefix chunks `idx` is a `take` of the passes, whose length is known up front, so
-        // nothing marks it pending and `valuePointer` would not wait for it.
-        try context.syncPoint()
-        let out = try MetalArrowBuffer.allocate(byteCount: n * 4, zeroed: false, context: context)
-        return try withExtendedLifetime((idx, validity, out)) { () -> MetalArray<Int32> in
-            let bm = validity.typed(UInt8.self)
-            let src = idx.valuePointer, dst = out.mutableTyped(Int32.self)
-            var nulls: [Int32] = []
-            for i in 0..<n { let j = src[i]; if !Bitmap.isSet(bm, Int(j)) { nulls.append(j) } }
-            nulls.sort()
-            var k = placement == .atStart ? nulls.count : 0
-            for i in 0..<n { let j = src[i]; if Bitmap.isSet(bm, Int(j)) { dst[k] = j; k += 1 } }
-            k = placement == .atStart ? 0 : n - nulls.count
-            for j in nulls { dst[k] = j; k += 1 }
-            return MetalArray<Int32>(length: n, nullCount: 0, validity: nil, values: out, context: context)
-        }
     }
 }

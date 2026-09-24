@@ -765,4 +765,46 @@ final class EngineTests: XCTestCase {
         let sorted = try MetalContext.shared.batch { try a.sorted() }
         XCTAssertEqual(sorted.toArray(), ["a", "ab", "b", "c", "xxxxxxxx", nil])
     }
+
+    /// The null partition runs in the prefix keys on the GPU: every direction and placement, inside and
+    /// outside a batch, with ties, empty strings and rows of up to three prefix chunks, against a CPU
+    /// reference (stable byte order for the valid rows, the null rows in row order at the named end).
+    func testStringArgsortNullPlacementOnTheGPU() throws {
+        try requireRealGPU()
+        var rng = SystemRandomNumberGenerator()
+        let alphabet: [Character] = ["a", "b", "\u{0}", "z"]
+        var xs: [String?] = (0..<3000).map { _ in
+            if Int.random(in: 0..<10, using: &rng) == 0 { return nil }
+            return String((0..<Int.random(in: 0...20, using: &rng)).map { _ in alphabet.randomElement(using: &rng)! })
+        }
+        xs += [nil, "", "", nil, "abcdefghijklmnopqrst", "abcdefghijklmnopqrss"]
+        func reference(_ desc: Bool, _ placement: NullPlacement) -> [Int32] {
+            let valid = xs.indices.filter { xs[$0] != nil }.sorted { l, r in
+                let a = Array(xs[l]!.utf8), b = Array(xs[r]!.utf8)
+                if a == b { return l < r }
+                return desc ? b.lexicographicallyPrecedes(a) : a.lexicographicallyPrecedes(b)
+            }
+            let nulls = xs.indices.filter { xs[$0] == nil }
+            return (placement == .atStart ? nulls + valid : valid + nulls).map { Int32($0) }
+        }
+        let a = try MetalStringArray(xs)
+        for desc in [false, true] {
+            for placement in [NullPlacement.atEnd, .atStart] {
+                let want = reference(desc, placement)
+                XCTAssertEqual(try a.argsort(descending: desc, nullPlacement: placement).toArray(), want)
+                let inBatch = try MetalContext.shared.batch {
+                    try a.argsort(descending: desc, nullPlacement: placement)
+                }
+                XCTAssertEqual(inBatch.toArray(), want)
+                let sorted = try MetalContext.shared.batch { try a.sorted(descending: desc, nullPlacement: placement) }
+                XCTAssertEqual(sorted.toArray(), want.map { xs[Int($0)] })
+            }
+        }
+        // Valid rows that are all empty still need a pass to move the nulls; an all-null column is the identity.
+        let empties = try MetalStringArray(["", nil, "", nil, ""])
+        XCTAssertEqual(try empties.argsort().toArray(), [0, 2, 4, 1, 3])
+        XCTAssertEqual(try empties.argsort(nullPlacement: .atStart).toArray(), [1, 3, 0, 2, 4])
+        let allNull = try MetalStringArray([nil, nil, nil] as [String?])
+        XCTAssertEqual(try allNull.argsort(descending: true, nullPlacement: .atStart).toArray(), [0, 1, 2])
+    }
 }
