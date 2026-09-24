@@ -127,6 +127,8 @@ def shapes(rows, rng):
             ["k2", "x"]),
         ("(q) filter, then sort by (int32 asc, int64 desc)", extra.select("q", "k1", "k2", "x")
             .filter(pl.col("x") > 0.2).sort(["k2", "q"], descending=[False, True]), ["k2", "q"]),
+        ("(r) unique over (region, sub), keep first", f.unique(subset=["region", "sub"],
+                                                                 keep="first"), False),
     ]
 
 

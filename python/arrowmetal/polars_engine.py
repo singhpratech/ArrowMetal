@@ -18,8 +18,9 @@ Which subtrees can be taken
 A replaced subtree becomes a leaf of the Polars plan (it takes no input), so the only subtrees that
 can move are ones whose leaves are all in-memory frames (`DataFrameScan`). Inside such a subtree the
 engine takes `Filter`, `Select`, `HStack` (`with_columns`), `SimpleProjection`, `Slice`, `Sort`
-(with a pushed-in slice, which ArrowMetal runs as top-k), `GroupBy` and all-aggregate `Select`s,
-over the expressions and dtypes listed in docs/POLARS.md, "Tier 4". Everything else falls back with
+(with a pushed-in slice, which ArrowMetal runs as top-k), `GroupBy`, all-aggregate `Select`s,
+inner/left/semi/anti `Join`s and `Distinct` (`unique`), over the expressions and dtypes listed in
+docs/POLARS.md, "Tier 4". Everything else falls back with
 a one-line reason in `engine.last_report`.
 
 Which of those it does take is a second decision. By default (`shapes="measured"`) it takes only
@@ -46,21 +47,25 @@ The Polars surfaces used
 version this module was written against is `TESTED_IR_VERSION` and a test fails loudly when an
 upgrade moves it.
 """
+import json
 import os
 import re
 import time
 import warnings
+from collections import OrderedDict
 from functools import partial
 
+import numpy as np
 import polars as pl
 import pyarrow as pa
 from polars._plr import _expr_nodes as _xn
 from polars._plr import _ir_nodes as _in  # noqa: F401  (the node classes; tested to exist)
 from polars.lazyframe.engine import _LocalEngine
 
-from . import ArrowMetalError, lazy as _lazy
+from . import ArrowMetalError, MetalArray, lazy as _lazy
 
-__all__ = ["MetalEngine", "MetalPlanReport", "TESTED_IR_VERSION", "TESTED_POLARS"]
+__all__ = ["MetalEngine", "MetalPlanReport", "TESTED_IR_VERSION", "TESTED_POLARS", "MEASURED_SHAPES",
+           "clear_import_cache", "import_cache_limit", "import_cache_info"]
 
 # `NodeTraverser.version()` on the polars this module was written and tested against. The major is
 # bumped by Polars for incompatible IR changes (renamed nodes, reshaped tuples); a different major
@@ -70,7 +75,8 @@ TESTED_IR_VERSION = (14, 7)
 TESTED_POLARS = "1.44.1"
 
 # Default size gate, in total rows over a subtree's in-memory inputs. How it was chosen is in
-# docs/POLARS.md ("Tier 4", "The size gate"), from Benchmarks/results/router_2026-09-17.json and
+# docs/POLARS.md ("Tier 4", "Which translatable subtrees it runs"): the sort family's crossover in
+# Benchmarks/results/router_2026-09-17.json, checked against
 # Benchmarks/results/polars_engine_bench_2026-09-23_provisional.csv.
 DEFAULT_MIN_ROWS = 1_000_000
 
@@ -78,7 +84,8 @@ DEFAULT_MIN_ROWS = 1_000_000
 # does), "sort_helper_keys" (a full sort that needs extra key columns for that: nulls first on a
 # nullable key, or a Float64/Float32 key descending, where NaN goes first), "top_k" (a sort with a slice),
 # "group_by_multi" (a GroupBy over two or more keys), "group_by" (one key), "aggregate" (a
-# whole-frame aggregate); a subtree with none of them is "rowwise" (filters and projections only).
+# whole-frame aggregate), "join", "distinct"; a subtree with none of them is "rowwise" (filters and
+# projections only).
 # `shapes="measured"` takes a subtree only when every class in it is a key of MEASURED_SHAPES, none
 # of its inputs is a String column (a String column is copied on the way in, and that copy is what the
 # sort with a String column spent its time on), and it reads at least the class's row minimum (or
@@ -201,7 +208,9 @@ class MetalPlanReport:
       wall time and output rows.
     * `fallbacks` -- one line per node that stayed with Polars for a reason of its own, in the form
       `Kind#id: reason`.
-    * `nodes` -- every node visited, `(id, kind, "metal" | "polars")`.
+    * `nodes` -- the nodes the placement visited, top down, `(id, kind, "metal" | "polars")`; it
+      stops at a node that runs on Metal.
+    * `walked` -- every node of the optimised plan, `(id, kind)`.
     """
 
     def __init__(self, polars_version, ir_version):
@@ -572,6 +581,89 @@ class _Translator:
         return kid.derive(plan=plan, phys=phys, work=True,
                           add_class="top_k" if slc is not None else
                           ("sort_helper_keys" if helpers else "sort"))
+
+    def _key_columns(self, input_id, exprs, cols, what):
+        self.nt.set_node(input_id)
+        names = []
+        for pe in exprs:
+            e = self.nt.view_expression(pe.node)
+            if type(e).__name__ != "Column":
+                raise _Unsupported(f"{what} key is an expression, not a column")
+            c = cols.get(e.name)
+            if c is None:
+                raise _Unsupported(f"{what} key {e.name!r} not found")
+            if _is_float(_code(c.dtype)):
+                raise _Unsupported(f"{what} on a float key (NaN and -0.0 equality)")
+            names.append(e.name)
+        return names
+
+    def _node_Join(self, n, node, inputs, kids, check_only=False):
+        how, nulls_equal, slc, suffix, coalesce, maintain = node.options
+        if not isinstance(how, str) or how not in ("Inner", "Left", "Semi", "Anti"):
+            raise _Unsupported(f"{how if isinstance(how, str) else how[0]} join (inner, left, semi "
+                               "and anti are taken)")
+        if nulls_equal:
+            raise _Unsupported("join(nulls_equal=True): ArrowMetal's null keys never match")
+        if slc is not None:
+            raise _Unsupported("join with a pushed-down slice")
+        if maintain != "none":
+            raise _Unsupported(f"join(maintain_order={maintain!r})")
+        left, right = self.subs[node.input_left], self.subs[node.input_right]
+        lkeys = self._key_columns(node.input_left, node.left_on, left.cols, "join")
+        rkeys = self._key_columns(node.input_right, node.right_on, right.cols, "join")
+        for lk, rk in zip(lkeys, rkeys):
+            if left.cols[lk].dtype != right.cols[rk].dtype:
+                raise _Unsupported(f"join keys {lk!r} and {rk!r} differ in dtype")
+        # ArrowMetal's output columns (LogicalPlan.swift, `.join`): the left columns, then each right
+        # column except a key whose left partner has the same name, renamed with the suffix when the
+        # name is taken (JoinExtra.swift `uniqueName`).
+        meta = [(name, c.dtype, c.nullable) for name, c in left.cols.items()]
+        if how in ("Inner", "Left"):
+            taken = [m[0] for m in meta]
+            for name, c in right.cols.items():
+                if name in rkeys and lkeys[rkeys.index(name)] == name:
+                    continue
+                out, k = name, 2
+                if out in taken:
+                    out = name + suffix
+                    while out in taken:
+                        out, k = f"{name}{suffix}{k}", k + 1
+                taken.append(out)
+                meta.append((out, c.dtype, c.nullable or how == "Left"))
+        by_name = {m[0]: m for m in meta}
+        self.nt.set_node(n)
+        cols = {}
+        for name, dt in self.nt.get_schema().items():
+            m = by_name.get(name)
+            if m is None or m[1] != dt:
+                raise _Unsupported(f"join output column {name!r} is not one ArrowMetal's join names "
+                                   "that way (coalesce, suffix)")
+            cols[name] = _base(name, dt, m[2])
+        plan = {"op": "join", "left": left.final_plan(), "right": right.final_plan(),
+                "left_on": lkeys, "right_on": rkeys, "how": how.lower(), "suffix": suffix}
+        return _Sub(plan, cols, [m[0] for m in meta], left.leaves + right.leaves,
+                    left.rows + right.rows, True, (), left.classes | right.classes | {"join"})
+
+    def _node_Distinct(self, n, node, inputs, kids, check_only=False):
+        keep, subset, maintain, slc = node.options
+        if keep not in ("any", "first"):
+            raise _Unsupported(f"unique(keep={keep!r}) (any and first are taken: ArrowMetal keeps "
+                               "the first row of each group)")
+        if maintain:
+            raise _Unsupported("unique(maintain_order=True)")
+        if slc is not None:
+            raise _Unsupported("unique with a pushed-down slice")
+        kid = kids[0]
+        subset = list(subset) if subset else list(kid.cols)
+        for c in subset:
+            if c not in kid.cols:
+                raise _Unsupported(f"unique subset column {c!r} not found")
+            if _is_float(_code(kid.cols[c].dtype)):
+                raise _Unsupported("unique over a float column (NaN and -0.0 equality)")
+        cols = {name: _base(name, c.dtype, c.nullable) for name, c in kid.cols.items()}
+        plan = {"op": "unique", "input": kid.final_plan(), "subset": subset}
+        return _Sub(plan, cols, list(cols), kid.leaves, kid.rows, True, (),
+                    kid.classes | {"distinct"})
 
     # -- aggregation (GroupBy, and a Select whose every output is an aggregate)
 
@@ -1031,7 +1123,6 @@ def _empty_null_slots(arr):
     (valid Arrow: a null slot's contents are unspecified), and ArrowMetal's string compaction reads
     those bytes into the neighbouring value (`test_polars_engine.py::test_core_string_filter_null_slot`
     pins it). So the bytes under nulls are dropped here, on the CPU, only when there are any."""
-    import numpy as np
     if arr.null_count == 0 or not (pa.types.is_large_string(arr.type) or pa.types.is_string(arr.type)):
         return arr
     if isinstance(arr, pa.ChunkedArray):
@@ -1072,7 +1163,6 @@ def _empty_null_slots(arr):
 
 class _ImportCache:
     def __init__(self):
-        from collections import OrderedDict
         self.entries = OrderedDict()          # key -> (MetalArray, nbytes)
         self.bytes = 0
         self.limit = self._default_limit()
@@ -1104,7 +1194,6 @@ class _ImportCache:
 
     def import_(self, arr):
         """The Metal import of `arr`, from the cache when it holds one."""
-        from . import MetalArray
         key = self.key(arr)
         if key is not None:
             m = self.get(key)
@@ -1158,21 +1247,6 @@ def import_cache_info():
     """`{"entries", "bytes", "limit", "hits", "misses"}` for the import cache."""
     return {"entries": len(_cache.entries), "bytes": _cache.bytes, "limit": _cache.limit,
             "hits": _cache.hits, "misses": _cache.misses}
-
-
-def _cold_bytes(leaves):
-    """Bytes the subtree's inputs would have to import: every column the cache does not hold."""
-    total = 0
-    for _src, df, names in leaves:
-        for c in names:
-            s = df.get_column(c)
-            if s.dtype == pl.String or s.n_chunks() > 1:
-                total += s.estimated_size()
-                continue
-            key = _cache.key(s.to_arrow())
-            if key is None or key not in _cache.entries:
-                total += s.estimated_size()
-    return total
 
 
 def _storage(arr):
@@ -1262,7 +1336,6 @@ def _validate(sub, schema):
     failing inside the query. Cached per plan shape, input dtypes and nullability -- but only a
     verdict from a run that had rows to read: over zero rows nothing dispatches, so it proves
     nothing."""
-    import json
     key = (json.dumps(sub.plan, sort_keys=True),
            tuple((src, tuple((c, str(df.schema[c]), df.get_column(c).null_count() > 0)
                              for c in names)) for src, df, names in sub.leaves),
@@ -1318,7 +1391,6 @@ _warned_minor = [False]
 def execute_with_metal(nt, duration_since_start, *, config):
     """The post-optimisation callback: translate what can run on Metal, replace it with a udf, and
     leave the rest of the plan to Polars. Works by mutating `nt`; returns None."""
-    import json
     callback_ns = time.monotonic_ns()
     report = MetalPlanReport(pl.__version__, None)
     config.last_report = report

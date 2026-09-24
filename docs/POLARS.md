@@ -424,22 +424,24 @@ Read from the installed package and checked by `python/tests/test_polars_engine.
 
 | Polars node | ArrowMetal | Taken when |
 |---|---|---|
-| `DataFrameScan` | `scan` | every column is an integer, float, Boolean, String, Date, Datetime, Duration or Time |
+| `DataFrameScan` | `scan` | every column it reads (after Polars' projection pushdown) is an integer, float, Boolean, String, Date, Datetime, Duration or Time |
 | `Filter` | `filter` | the predicate translates; Polars' `dynamic_pred` hints (which `sort().head()` inserts) are dropped |
 | `Select`, `HStack` | kept virtual: each output is an s-expression over the physical columns, computed where it is used or in one `select` at the top | every output translates and is numeric or Boolean (a bare column of any carried type is carried) |
-| `Select` whose every output is an aggregate | `aggregate` | see the aggregate row |
+| `Select` whose every output is an aggregate | `aggregate` | each output is one of the aggregates in the last row of the expression table |
 | `SimpleProjection` | no operator: a column list | always |
 | `Slice` | `limit` | offset >= 0 (`tail` counts from the end and stays with Polars) |
 | `Sort` | `sort`, with `limit` for a pushed-in slice | keys are columns, none of them String; no `maintain_order=True` together with a slice |
 | `GroupBy` | `group_by` | keys are non-float columns; `maintain_order=False`; not rolling or dynamic |
-| everything else (`Join`, `Distinct`, `Union`, `HConcat`, `Cache`, `MapFunction`, `MergeSorted`, `ExtContext`, `Sink`, `Scan`, `PythonScan`) | -- | stays with Polars, named in the report |
+| `Join` | `join` | inner, left, semi or anti; key columns of equal, non-float dtypes (String, multi-column and temporal keys included); `nulls_equal=False` (null keys never match, on both engines); `maintain_order="none"`; no pushed-in slice; the output names are the ones ArrowMetal's join gives (left columns, then right columns without a same-named key, the suffix on a collision), which covers Polars' coalescing defaults and `left_on`/`right_on` with different names |
+| `Distinct` (`unique`) | `unique` | `keep="first"` or `"any"` (ArrowMetal keeps each group's first row, a valid `"any"`); `maintain_order=False`; no float column in the subset |
+| everything else (`Union`, `HConcat`, `Cache`, `MapFunction`, `MergeSorted`, `ExtContext`, `Sink`, `Scan`, `PythonScan`, and right, full, cross and as-of joins) | -- | stays with Polars, named in the report |
 
 | Expression | ArrowMetal |
 |---|---|
 | column, alias, typed literal (a Null literal takes the type it meets) | `(col ...)`, the literal at Polars' own dtype |
 | `+ - *`, true division | `add sub mul div`, each operand cast to the result dtype Polars' `get_dtype` gives; Float32 goes through binary64 (below) |
 | `== != < <= > >=` | `eq ne lt le gt ge`; floats in Polars' total order; String against a literal by `str_eq` (`==`, `!=` only) |
-| `& | ^ ~` | `and_kleene or_kleene`, `ne` of the two as integers for Boolean xor, `bit_*` on integers, `not`/`bit_not` |
+| `&`, `\|`, `^`, `~` | `and_kleene`, `or_kleene`, `ne` of the two as integers for Boolean xor, `bit_and`/`bit_or`/`bit_xor` on integers, `not`/`bit_not` |
 | `when/then/otherwise` | `if_else`, a null condition taking the `otherwise` branch |
 | `cast` | only casts that cannot fail or lose a value (integer widening, unsigned to a wider signed type, integers to Float64, 8/16-bit integers to Float32, Float32 to Float64, Boolean to numbers) |
 | `is_null`, `is_not_null`, `fill_null` | `is_null`, `is_valid`, `fill_null` |
@@ -503,31 +505,40 @@ A subtree the engine can translate still has to be one where the GPU is ahead, b
 Polars column onto the GPU is not free: a single-chunk numeric column is imported without a copy,
 but mapping its pages into Metal and releasing them costs time on every query, and a String column
 is converted on the CPU. `Benchmarks/polars_engine_bench.py` measures the eight shapes of
-`Benchmarks/engine_bench.py` plus nine group-by and sort shapes, as Polars LazyFrames, through
+`Benchmarks/engine_bench.py` plus ten group-by, sort and `unique` shapes, as Polars LazyFrames, through
 Polars' in-memory engine, Polars' streaming engine and the engine with everything it can translate
 (`shapes="all"`), cold (nothing imported before) and warm (see the import cache below). The run
 behind the defaults is `Benchmarks/results/polars_engine_bench_2026-09-23_provisional.csv`; it ran
 while other work shared the machine, so its numbers are provisional and not quoted here.
 
-Read cold, against the faster of Polars' two engines, that run says:
+Read cold, against the faster of Polars' two engines, that run says (sizes near a crossover move
+between runs on a shared machine, which is why the defaults keep a margin):
 
 * **A full sort** whose keys ArrowMetal orders as Polars does (no helper key): both such shapes were
-  ahead at every size from 1,000,000 rows; at 500,000 one of them was behind.
+  ahead at every size measured, from 500,000 rows. (An earlier provisional run had one of them
+  behind at 500,000.)
 * **A full sort that needs a helper key** (nulls first on a nullable key, or a float key descending)
-  was behind at 1,000,000 and 2,000,000 rows and ahead from 10,000,000.
+  was behind at 1,000,000 rows and below, level at 2,000,000, and ahead from 10,000,000.
 * **A sort that carries a String column** was behind at every size: the String import is a CPU copy.
 * **Group-by** depends on what nobody knows before running it, the number of groups, and on the key
-  types: one shape was ahead from 1,000,000 rows, another behind at every size up to 50,000,000.
+  types: some shapes were ahead from 500,000 rows, others behind at every size below 50,000,000 and
+  level with Polars there.
 * **Top-k, whole-frame aggregates and row-wise filters and projections** were behind the faster
   Polars engine at every size.
-* **Joins, windows and the as-of join** stay with Polars in this version; their rows record what the
+* **Joins and `unique`**: an inner join feeding an aggregate, and a `unique` over a key with ten
+  thousand distinct values, were ahead at every size measured; a semi join returning most of its
+  probe rows was behind at every size. Like group-by, both run on the key-to-id machine, whose speed
+  against Polars depends on how many distinct keys there are, and one shape of each is not enough to
+  set a default by.
+* **Windows and the as-of join** stay with Polars in this version; their rows record what the
   callback costs a plan it leaves alone.
 
 So `MetalEngine()` takes a subtree when every shape in it is a full sort (`MEASURED_SHAPES`), none of
 its inputs is a String column, and its in-memory inputs hold at least 1,000,000 rows -- 10,000,000
-when a helper key is needed. 1,000,000 is also the sort family's crossover against the fastest CPU
+when a helper key is needed. 1,000,000 is the sort family's crossover against the fastest CPU
 library in `Benchmarks/results/router_2026-09-17.json` (`sort float64`, `argsort int64`, `lexsort (2
-int32 keys)`). Every other subtree stays with Polars with the reason in the report.
+int32 keys)`); the provisional run had full sorts ahead below it as well, so the default keeps the
+router's figure as its margin. Every other subtree stays with Polars with the reason in the report.
 
 ```python
 am.MetalEngine()                          # the defaults above
@@ -591,7 +602,10 @@ its "sliced" and "special" (extremes, NaN, infinities, subnormals) flavours, and
 shapes, a two-chunk frame and a frame sliced with `DataFrame.slice`. Every numeric dtype runs
 through the comparisons, arithmetic, null logic, `is_in`, casts, group-by and whole-frame aggregates,
 sorts in both directions with nulls at both ends, and top-k; Boolean logic, String predicates and
-carried temporal columns have their own cases. Each fallback in the tables above has a case that
+carried temporal columns have their own cases, and so do the four join kinds on integer, String and
+two-column keys with null keys and duplicates on both sides (a two-chunk right side among the
+shapes), suffix collisions, different key names, a join inside a filter-join-aggregate plan, and
+`unique` with and without a subset. Each fallback in the tables above has a case that
 checks the result is still Polars' and the report names the reason. One case reruns
 `test_polars.py` and `test_lazy.py` with every `LazyFrame.collect()` also collected through the engine
 (`python/tests/metal_engine_everywhere.py`) and requires the two to agree.

@@ -217,7 +217,8 @@ Integrations
   restores the originals exactly on `uninstall()`.
 - Polars engine (docs/POLARS.md, tier 4): `lf.collect(engine=am.MetalEngine())` translates the
   subtrees of Polars' optimised plan that read in-memory frames -- filters, projections, slices,
-  sorts, group-bys and aggregates over a documented set of expressions and dtypes -- into ArrowMetal
+  sorts, group-bys, aggregates, inner/left/semi/anti joins and `unique`, over a documented set of
+  expressions and dtypes -- into ArrowMetal
   plans and runs them on the GPU through Polars' post-optimisation callback, leaving every other node
   to Polars; `engine.last_report` says what ran where and why. Results are Polars' own (float total
   order, Kleene logic, Polars' aggregate dtypes and empty-group answers, Float32 arithmetic without

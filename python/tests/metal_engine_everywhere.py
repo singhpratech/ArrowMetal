@@ -19,8 +19,8 @@ At the end of the session the counts go to `$AM_EVERYWHERE_STATS` as JSON: how m
 compared and how many of them ran some subtree on Metal.
 """
 import json
-import re
 import os
+import re
 
 import polars as pl
 from polars.testing import assert_frame_equal

@@ -244,8 +244,8 @@ def _node_kind_plans(tmp_path):
         "Slice": (lf.select("v").filter(pl.col("v") > 4).slice(1, 1), True),
         "Sort": (lf.select("k", "v").sort("v", descending=True), True),
         "GroupBy": (lf.group_by("k").agg(pl.col("v").sum()), True),
-        "Distinct": (lf.select("k", "v").unique(), False),
-        "Join": (lf.join(lf2, on="k"), False),
+        "Distinct": (lf.select("k", "v").unique(), True),
+        "Join": (lf.select("k", "v").join(lf2, on="k"), True),
         "Cache": (lf.select("k", "v").join(lf.select("k", "v"), on="k"), False),
         "Union": (pl.concat([lf.select("k"), lf2.select("k")]), False),
         "HConcat": (pl.concat([lf.select("k"), lf2.select("w")], how="horizontal_extend"), False),
@@ -279,7 +279,7 @@ def test_every_node_kind_walks_and_collects_identically(tmp_path):
 
 def test_raise_on_fail_names_the_node_and_reason(tmp_path):
     plans = _node_kind_plans(tmp_path)
-    for kind in ("Distinct", "Join", "Union", "HConcat", "MapFunction", "MergeSorted", "Scan",
+    for kind in ("Cache", "Union", "HConcat", "MapFunction", "MergeSorted", "Scan",
                  "PythonScan", "ExtContext"):
         lf, _ = plans[kind]
         with pytest.raises(pl.exceptions.ComputeError) as err:
@@ -774,6 +774,99 @@ def test_nan_sorts_above_numbers_in_both_directions(shape):
     for desc in (False, True):
         for nl in (False, True):
             check(df.lazy().sort("f", descending=desc, nulls_last=nl), order=True)
+
+
+# =============================================================================================
+# M3 -- joins and unique
+# =============================================================================================
+
+JOIN_HOWS = ["inner", "left", "semi", "anti"]
+
+
+def _right_frame(dtype, shape):
+    """A right side sharing k (Int32, nulls, duplicates), s (String) and g (Boolean) with `frame`,
+    plus a colliding `a` and its own `w`."""
+    right = frame(dtype, shape, seed=11).rename({"b": "w"})
+    return right.select("k", "s", "g", "a", "w")
+
+
+@pytest.mark.parametrize("shape", CORE, ids=CORE_IDS)
+@pytest.mark.parametrize("how", JOIN_HOWS)
+def test_join_kinds_on_an_int_key(how, shape):
+    left, right = frame("int64", shape), _right_frame("int64", shape)
+    check(left.lazy().join(right.lazy(), on="k", how=how), kinds=["Join"])
+
+
+@pytest.mark.parametrize("shape", CORE, ids=CORE_IDS)
+@pytest.mark.parametrize("how", JOIN_HOWS)
+def test_join_kinds_on_string_and_multi_column_keys(how, shape):
+    left, right = frame("int32", shape), _right_frame("int32", shape)
+    check(left.lazy().join(right.lazy(), on="s", how=how), kinds=["Join"])
+    check(left.lazy().join(right.lazy(), on=["k", "g"], how=how), kinds=["Join"])
+
+
+@pytest.mark.parametrize("how", JOIN_HOWS)
+def test_join_on_a_temporal_key(how):
+    days = pl.Series(np.arange(-3000, 3000, 7, dtype=np.int32)).cast(pl.Date)
+    left = pl.DataFrame({"d": days, "v": np.arange(len(days))}).with_columns(
+        pl.when(pl.col("v") % 11 == 0).then(None).otherwise(pl.col("d")).alias("d"))
+    right = pl.DataFrame({"d": days[::3], "w": np.arange(len(days[::3])) * 2})
+    check(left.lazy().join(right.lazy(), on="d", how=how), kinds=["Join"])
+    ts = left.with_columns(pl.col("d").cast(pl.Datetime("us", "UTC")))
+    rts = right.with_columns(pl.col("d").cast(pl.Datetime("us", "UTC")))
+    check(ts.lazy().join(rts.lazy(), on="d", how=how), kinds=["Join"])
+
+
+@pytest.mark.parametrize("shape", CORE, ids=CORE_IDS)
+def test_join_names_suffix_and_different_key_names(shape):
+    left, right = frame("float32", shape), _right_frame("float32", shape)
+    r2 = right.rename({"k": "kk"})
+    check(left.lazy().join(r2.lazy(), left_on="k", right_on="kk", how="inner"), kinds=["Join"])
+    check(left.lazy().join(r2.lazy(), left_on="k", right_on="kk", how="left", suffix="_r"),
+          kinds=["Join"])
+
+
+@pytest.mark.parametrize("shape", CORE, ids=CORE_IDS)
+def test_join_inside_a_plan(shape):
+    """Filters pushed into both sides, a projection and an aggregate above: one subtree."""
+    left, right = frame("int64", shape), _right_frame("int64", shape)
+    lf = (left.lazy().filter(pl.col("a") > 0)
+          .join(right.lazy().filter(pl.col("w") < 0), on="k", how="inner")
+          .select((pl.col("a") + pl.col("w")).alias("aw"), "k")
+          .group_by("k").agg(pl.col("aw").sum(), pl.len()))
+    check(lf, kinds=["Join", "GroupBy", "Filter"])
+
+
+@pytest.mark.parametrize("shape", CORE, ids=CORE_IDS)
+def test_unique(shape):
+    df = frame("int16", shape)
+    check(df.lazy().unique(subset=["k"], keep="first"), kinds=["Distinct"])
+    check(df.lazy().unique(), kinds=["Distinct"])
+    lf = df.lazy().unique(subset=["k", "g"], keep="any")
+    want, got = lf.collect(), lf.collect(engine=metal())
+    compare(got.select("k", "g"), want.select("k", "g"))        # which row of a group is Polars' choice
+
+
+JOIN_FALLBACKS = {
+    "right": (lambda l, r: l.join(r, on="k", how="right"), "Right join"),
+    "full": (lambda l, r: l.join(r, on="k", how="full"), "Full join"),
+    "cross": (lambda l, r: l.join(r.select("w"), how="cross"), "Cross join"),
+    "nulls_equal": (lambda l, r: l.join(r, on="k", nulls_equal=True), "nulls_equal"),
+    "float_key": (lambda l, r: l.join(r, on="a"), "float key"),
+    "maintain_order": (lambda l, r: l.join(r, on="k", maintain_order="left"), "maintain_order"),
+    "keep_last": (lambda l, r: l.unique(subset=["k"], keep="last"), "keep='last'"),
+    "unique_ordered": (lambda l, r: l.unique(subset=["k"], maintain_order=True), "maintain_order"),
+    "unique_float": (lambda l, r: l.unique(subset=["a"]), "float column"),
+}
+
+
+@pytest.mark.parametrize("case", list(JOIN_FALLBACKS))
+def test_join_and_unique_fallbacks(case):
+    build, reason = JOIN_FALLBACKS[case]
+    shape = ("random", 4097, 0.3)
+    left, right = frame("float64", shape), _right_frame("float64", shape)
+    eng = check_fallback(build(left.lazy(), right.lazy()), reason)
+    assert "Join" not in eng.last_report.kinds_taken() and "Distinct" not in eng.last_report.kinds_taken()
 
 
 # =============================================================================================
