@@ -231,6 +231,18 @@ Parquet on the GPU
   without the fix and passes with it.
 - A one-level Parquet list column read from row groups that a filter removed entirely now comes back
   empty instead of raising "a list column must have definition levels".
+- Parquet `!=` filters on a `float` or `double` column never rule out a row group or page: writers leave
+  NaN out of min / max, so a page of one value with a NaN in it was skipped and its NaN row lost with
+  the page index on. pyarrow's filtered read still rules out such a row group; ArrowMetal returns its NaN
+  rows (`test_not_equal_keeps_a_nan_hidden_in_a_constant_page`, `ParquetFilterEdgeTests`).
+- A pyarrow `list<null>` column (and any `null`-typed leaf below a list or map) reads as its Arrow type,
+  the null child with one slot per element (`test_null_type_below_lists_maps_and_structs`).
+- `uint64` statistics are read as unsigned, and an integer filter literal above the int64 range stays
+  exact: `u64 >= 2**63` used to rule out every row group (`test_uint64_literals_past_the_signed_range`).
+- Python quotes a string filter value with `"` and `\` escaped, so a `;` or quote inside it is part of
+  the value; a column name holding `= ! < > ;` raises.
+- A restored Parquet dictionary type has `int32` indices and no ordered flag, where pyarrow keeps the
+  stored index type and flag; listed under Limits in docs/PARQUET.md and tested.
 
 Out-of-core streaming
 - A streaming executor for datasets larger than memory (docs/STREAMING.md): Arrow IPC files/directories
