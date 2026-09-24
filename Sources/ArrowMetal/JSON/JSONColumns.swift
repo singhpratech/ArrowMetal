@@ -160,7 +160,7 @@ final class JSONColumnBuilder {
             }
         }
 
-        // Slot matrix in groups of fields, then one column per planned field.
+        // Slot matrix in groups of fields; each group's columns are built together.
         var built = [AnyMetalArray?](repeating: nil, count: plan.count)
         let wanted = plan.enumerated().compactMap { i, p in p.fid.map { ($0, i) } }.sorted { $0.0 < $1.0 }
         if let fid, !wanted.isEmpty {
@@ -171,7 +171,7 @@ final class JSONColumnBuilder {
                 var hi = lo + 1
                 var end = g + 1
                 while end < wanted.count && wanted[end].0 - lo < perGroup { hi = wanted[end].0 + 1; end += 1 }
-                jprof("keys"); let (M, dup) = try JSONKernels.scatter(ctx, level: level, fid: fid, rows: rows, lo: lo, hi: hi,
+                let (M, dup) = try JSONKernels.scatter(ctx, level: level, fid: fid, rows: rows, lo: lo, hi: hi,
                                                        mayRepeat: mayRepeat)
                 if let dup {
                     let x = level.entry(dup)
@@ -179,37 +179,33 @@ final class JSONColumnBuilder {
                     parseErrors.append((Int(x.keyStart),
                                         "Column(\(path)/\(names[f])) was specified twice in row \(rowToRecord(Int(x.parent)))"))
                 }
-                for k in g..<end {
-                    let (f, planIndex) = wanted[k]
-                    let view = MetalArrowBuffer(mtl: M.mtl, byteCount: Swift.max(rows * 4, 4),
-                                                offset: M.offset + (f - lo) * rows * 4, keepAlive: M)
-                    let col = JSONKernels.Column(level: level, rowEntry: view, rows: rows); defer { jprof("column \(plan[planIndex].name)") }
-                    jprof("before col"); built[planIndex] = try column(col, type: plan[planIndex].type, path: "\(path)/\(plan[planIndex].name)",
-                                                  rowToRecord: rowToRecord)
-                }
+                let members = Array(wanted[g..<end])
+                let set = JSONKernels.ColumnSet(level: level, rowEntry: M, rows: rows, cols: hi - lo)
+                let cols = try columns(set, sel: members.map { $0.0 - lo },
+                                       types: members.map { plan[$0.1].type },
+                                       paths: members.map { "\(path)/\(plan[$0.1].name)" }, rowToRecord: rowToRecord)
+                for (k, m) in members.enumerated() { built[m.1] = cols[k] }
                 g = end
             }
         }
-        // Schema fields that never appear: all-null columns of their type.
-        var columns: [AnyMetalArray] = []
-        for (i, p) in plan.enumerated() {
-            if let c = built[i] { columns.append(c); continue }
-            columns.append(try absentColumn(type: p.type ?? .null, rows: rows, path: "\(path)/\(p.name)"))
+        // Schema fields that never appear: all-null columns of their type, built through the ordinary
+        // path over rows that have no entry.
+        let absent = plan.indices.filter { built[$0] == nil }
+        if !absent.isEmpty {
+            let off = try JSONKernels.alloc(ctx, (rows + 1) * 4, zeroed: true)
+            let empty = JSONLevel(entries: try JSONKernels.alloc(ctx, JSONEntry.stride), count: 0, offsets: off, spans: rows)
+            let rowEntry = try JSONKernels.alloc(ctx, rows * absent.count * 4)
+            memset(rowEntry.mutableContents, 0xFF, rows * absent.count * 4)
+            let set = JSONKernels.ColumnSet(level: empty, rowEntry: rowEntry, rows: rows, cols: absent.count)
+            let cols = try columns(set, sel: Array(0..<absent.count),
+                                   types: absent.map { plan[$0].type == .null ? nil : plan[$0].type },
+                                   paths: absent.map { "\(path)/\(plan[$0].name)" }, rowToRecord: rowToRecord)
+            for (k, i) in absent.enumerated() { built[i] = cols[k] }
         }
-        return (plan.map { $0.name }, columns)
+        return (plan.map { $0.name }, built.map { $0! })
     }
 
-    /// An all-null column of `type`, built through the ordinary path over an empty level.
-    func absentColumn(type: JSONType, rows: Int, path: String) throws -> AnyMetalArray {
-        let off = try JSONKernels.alloc(ctx, (rows + 1) * 4, zeroed: true)
-        let empty = JSONLevel(entries: try JSONKernels.alloc(ctx, JSONEntry.stride), count: 0, offsets: off, spans: rows)
-        let rowEntry = try JSONKernels.alloc(ctx, rows * 4)
-        memset(rowEntry.mutableContents, 0xFF, rows * 4)
-        let col = JSONKernels.Column(level: empty, rowEntry: rowEntry, rows: rows)
-        return try column(col, type: type == .null ? nil : type, path: path, rowToRecord: { $0 })
-    }
-
-    // MARK: - one column
+    // MARK: - columns
 
     static let maskNull: UInt32 = 1 << 0
     static let maskBool: UInt32 = (1 << 1) | (1 << 2)
@@ -218,47 +214,79 @@ final class JSONColumnBuilder {
     static let maskObject: UInt32 = 1 << 6
     static let maskArray: UInt32 = 1 << 7
 
-    /// Builds one column. `type` is the explicit type, or nil to infer one.
-    func column(_ col: JSONKernels.Column, type: JSONType?, path: String,
-                rowToRecord: @escaping (Int) -> Int) throws -> AnyMetalArray {
-        let (mask, flags) = try JSONKernels.kinds(ctx, col)
-        var classes = Set<Int>()
-        for k in 1...7 where mask & (1 << UInt32(k)) != 0 { classes.insert(JSONKind(rawValue: UInt32(k))!.classID) }
-
-        if let type {
-            if type == .null {
-                throw JSONError.unsupported("explicit_schema: \(path) has type null, which the JSON reader does not convert to")
+    /// Builds the columns `sel` of `set` (types: explicit, or nil to infer). Columns that come out as
+    /// the same scalar type are built together: one validity pass, one text gather and one parse for
+    /// all of them, so a wide file costs a handful of dispatches per type rather than per column.
+    func columns(_ set: JSONKernels.ColumnSet, sel: [Int], types: [JSONType?], paths: [String],
+                 rowToRecord: @escaping (Int) -> Int) throws -> [AnyMetalArray] {
+        let kinds = try JSONKernels.kinds(ctx, set)
+        var out = [AnyMetalArray?](repeating: nil, count: sel.count)
+        var groupOrder: [String] = []
+        var groups: [String: (type: JSONType, inferred: Bool, members: [Int], flags: UInt32)] = [:]
+        for k in 0..<sel.count {
+            let (mask, flags) = kinds[sel[k]]
+            var classes = Set<Int>()
+            for b in 1...7 where mask & (1 << UInt32(b)) != 0 { classes.insert(JSONKind(rawValue: UInt32(b))!.classID) }
+            let target: JSONType
+            let inferred: Bool
+            if let type = types[k] {
+                if type == .null {
+                    throw JSONError.unsupported("explicit_schema: \(paths[k]) has type null, which the JSON reader does not convert to")
+                }
+                if classes.contains(where: { $0 != type.jsonClassID }) {
+                    reportConflict(set.column(sel[k]), expected: (type.jsonClass, type.jsonClassID), path: paths[k],
+                                   rowToRecord: rowToRecord)
+                    out[k] = .null(MetalNullArray(length: set.rows, context: ctx))
+                    continue
+                }
+                target = type
+                inferred = false
+            } else {
+                if classes.count > 1 {
+                    reportConflict(set.column(sel[k]), expected: nil, path: paths[k], rowToRecord: rowToRecord)
+                    out[k] = .null(MetalNullArray(length: set.rows, context: ctx))
+                    continue
+                }
+                guard let only = classes.first else {
+                    out[k] = .null(MetalNullArray(length: set.rows, context: ctx))
+                    continue
+                }
+                switch only {
+                case 1: target = .boolean
+                case 2: target = mask & (1 << JSONKind.float.rawValue) != 0 ? .float64 : .int64
+                case 3: target = .utf8
+                case 4: target = .structure([])
+                default: target = .list(.null)
+                }
+                inferred = true
             }
-            let want = type.jsonClassID
-            if classes.contains(where: { $0 != want }) {
-                reportConflict(col, expected: (type.jsonClass, want), path: path, rowToRecord: rowToRecord)
-                return .null(MetalNullArray(length: col.rows, context: ctx))
+            switch target {
+            case .structure, .list:
+                out[k] = try nested(set.column(sel[k]), type: target, inferred: inferred, path: paths[k],
+                                    rowToRecord: rowToRecord)
+            default:
+                let key = "\(target)|\(inferred)"
+                if groups[key] == nil { groupOrder.append(key); groups[key] = (target, inferred, [], 0) }
+                groups[key]!.members.append(k)
+                groups[key]!.flags |= flags
             }
-            return try build(col, type: type, flags: flags, inferred: false, path: path, rowToRecord: rowToRecord)
         }
-        if classes.count > 1 {
-            reportConflict(col, expected: nil, path: path, rowToRecord: rowToRecord)
-            return .null(MetalNullArray(length: col.rows, context: ctx))
+        for key in groupOrder {
+            let g = groups[key]!
+            let packed = try JSONKernels.pack(ctx, set, g.members.map { sel[$0] })
+            let cols = try scalars(packed, type: g.type, inferred: g.inferred, flags: g.flags)
+            for (i, k) in g.members.enumerated() { out[k] = cols[i] }
         }
-        guard let only = classes.first else { return .null(MetalNullArray(length: col.rows, context: ctx)) }
-        let inferred: JSONType
-        switch only {
-        case 1: inferred = .boolean
-        case 2: inferred = mask & (1 << JSONKind.float.rawValue) != 0 ? .float64 : .int64
-        case 3: inferred = .utf8
-        case 4: inferred = .structure([])
-        default: inferred = .list(.null)
-        }
-        return try build(col, type: inferred, flags: flags, inferred: true, path: path, rowToRecord: rowToRecord)
+        return out.map { $0! }
     }
 
     /// Finds the first row whose class differs from the first non-null class (or from the expected
     /// class of an explicit type) and records pyarrow's message for it.
-    func reportConflict(_ col: JSONKernels.Column, expected: (name: String, id: Int)?, path: String,
+    func reportConflict(_ col: JSONKernels.ColumnSet, expected: (name: String, id: Int)?, path: String,
                         rowToRecord: (Int) -> Int) {
         var first = expected
         for r in 0..<col.rows {
-            let e = col.entryIndex(r)
+            let e = col.entryIndex(0, r)
             guard e >= 0 else { continue }
             let x = col.level.entry(e)
             let k = x.kind
@@ -272,74 +300,140 @@ final class JSONColumnBuilder {
         }
     }
 
-    private func bitmapOrNil(_ b: MetalArrowBuffer, nulls: Int) -> MetalArrowBuffer? { nulls == 0 ? nil : b }
+    /// Word-aligned bitmap of column j, or nil when the column has no nulls.
+    private func bitmap(_ b: MetalArrowBuffer, _ j: Int, wpc: Int, nulls: Int) -> MetalArrowBuffer? {
+        nulls == 0 ? nil : b.view(byteOffset: j * wpc * 4, byteCount: Swift.max(wpc * 4, 4))
+    }
 
-    func build(_ col: JSONKernels.Column, type: JSONType, flags: UInt32, inferred: Bool, path: String,
-               rowToRecord: @escaping (Int) -> Int) throws -> AnyMetalArray {
-        let rows = col.rows
+    /// Columns of one scalar type, built together.
+    func scalars(_ set: JSONKernels.ColumnSet, type: JSONType, inferred: Bool, flags: UInt32) throws -> [AnyMetalArray] {
+        let rows = set.rows, cols = set.cols
         switch type {
-        case .null:
-            return .null(MetalNullArray(length: rows, context: ctx))
-
         case .boolean:
-            let (valid, values, nulls) = try JSONKernels.validity(ctx, col, validMask: Self.maskBool, boolValues: true)
-            return .boolean(MetalBooleanArray(length: rows, nullCount: nulls, validity: bitmapOrNil(valid, nulls: nulls),
-                                              values: values!, context: ctx))
+            let v = try JSONKernels.validity(ctx, set, validMask: Self.maskBool, boolValues: true)
+            return (0..<cols).map { j in
+                .boolean(MetalBooleanArray(length: rows, nullCount: v.nulls[j], validity: bitmap(v.validity, j, wpc: v.wordsPerColumn, nulls: v.nulls[j]),
+                                           values: v.values!.view(byteOffset: j * v.wordsPerColumn * 4, byteCount: Swift.max(v.wordsPerColumn * 4, 4)),
+                                           context: ctx))
+            }
+        case .int8: return try numbers(set, Int8.self, type: type, flags: flags).map { .int8($0) }
+        case .int16: return try numbers(set, Int16.self, type: type, flags: flags).map { .int16($0) }
+        case .int32: return try numbers(set, Int32.self, type: type, flags: flags).map { .int32($0) }
+        case .int64: return try numbers(set, Int64.self, type: type, flags: flags).map { .int64($0) }
+        case .uint8: return try numbers(set, UInt8.self, type: type, flags: flags).map { .uint8($0) }
+        case .uint16: return try numbers(set, UInt16.self, type: type, flags: flags).map { .uint16($0) }
+        case .uint32: return try numbers(set, UInt32.self, type: type, flags: flags).map { .uint32($0) }
+        case .uint64: return try numbers(set, UInt64.self, type: type, flags: flags).map { .uint64($0) }
+        case .float32: return try numbers(set, Float.self, type: type, flags: flags).map { .float32($0) }
+        case .float64: return try numbers(set, Double.self, type: type, flags: flags).map { .float64($0) }
+        case .utf8, .timestamp:
+            let v = try JSONKernels.validity(ctx, set, validMask: Self.maskString)
+            let (off, data) = try JSONKernels.gather(ctx, source, set, mode: .stringValue, validMask: Self.maskString)
+            let strings: [MetalStringArray] = (0..<cols).map { j in
+                MetalStringArray(length: rows, nullCount: v.nulls[j], validity: bitmap(v.validity, j, wpc: v.wordsPerColumn, nulls: v.nulls[j]),
+                                 offsets: off.view(byteOffset: j * rows * 4, byteCount: (rows + 1) * 4), data: data, context: ctx)
+            }
+            var unit = ArrowTemporalUnit.second
+            var tz: String? = nil
+            if case .timestamp(let u, let z) = type { unit = u; tz = z }
+            if case .utf8 = type, !inferred { return strings.map { .string($0) } }
+            if case .utf8 = type, !strings.contains(where: { $0.length - $0.nullCount > 0 }) { return strings.map { .string($0) } }
+            // pyarrow infers timestamp[s] for a string column whose every value is an ISO-8601 timestamp.
+            let t = try JSONKernels.timestamps(ctx, offsets: off, data: data, validity: v.validity, rows: rows, cols: cols, unit: unit)
+            var result: [AnyMetalArray] = []
+            for j in 0..<cols {
+                let s = strings[j]
+                if case .utf8 = type, t.fails[j].count > 0 || s.length - s.nullCount == 0 {
+                    result.append(.string(s))
+                    continue
+                }
+                if case .timestamp = type, t.fails[j].count > 0, let r = t.fails[j].first {
+                    conversionErrors.append("Failed to convert JSON to \(type), couldn't parse:\(s[r] ?? "")")
+                }
+                let arr = MetalArray<Int64>(length: rows, nullCount: s.nullCount, validity: s.validity,
+                                            values: t.values.view(byteOffset: j * rows * 8, byteCount: Swift.max(rows * 8, 8)),
+                                            context: ctx)
+                result.append(.temporal(try MetalTemporalArray(type: .timestamp(unit, timezone: tz), arr)))
+            }
+            return result
+        default:
+            throw JSONError.unsupported("internal: \(type) is not a scalar type")
+        }
+    }
 
-        case .int8: return .int8(try integers(col, Int8.self, type: type))
-        case .int16: return .int16(try integers(col, Int16.self, type: type))
-        case .int32: return .int32(try integers(col, Int32.self, type: type))
-        case .int64: return .int64(try integers(col, Int64.self, type: type))
-        case .uint8: return .uint8(try integers(col, UInt8.self, type: type))
-        case .uint16: return .uint16(try integers(col, UInt16.self, type: type))
-        case .uint32: return .uint32(try integers(col, UInt32.self, type: type))
-        case .uint64: return .uint64(try integers(col, UInt64.self, type: type))
-        case .float32: return .float32(try floats(col, Float.self, flags: flags))
-        case .float64: return .float64(try floats(col, Double.self, flags: flags))
-
-        case .utf8:
-            let s = try strings(col)
-            if inferred, s.length - s.nullCount > 0 {
-                // pyarrow infers timestamp[s] when every string is an ISO-8601 timestamp.
-                let t = try JSONKernels.timestamps(ctx, s, unit: .second)
-                if t.fails == 0 {
-                    let arr = MetalArray<Int64>(length: rows, nullCount: s.nullCount,
-                                                validity: bitmapOrNil(t.validity, nulls: s.nullCount),
-                                                values: t.values, context: ctx)
-                    return .temporal(try MetalTemporalArray(type: .timestamp(.second, timezone: nil), arr))
+    /// Number columns: the number text of every column is gathered once and parsed once by
+    /// `MetalStringArray.parse`; each column is a view of the result with its own validity.
+    func numbers<T: ArrowPrimitive>(_ set: JSONKernels.ColumnSet, _: T.Type, type: JSONType, flags: UInt32) throws -> [MetalArray<T>] {
+        let rows = set.rows, cols = set.cols
+        let v = try JSONKernels.validity(ctx, set, validMask: Self.maskNumber)
+        let (off, data) = try JSONKernels.gather(ctx, source, set, mode: .rawValue, validMask: Self.maskNumber)
+        let text = MetalStringArray(length: rows * cols, nullCount: 0, validity: nil, offsets: off, data: data, context: ctx)
+        let parsed = try text.parse(T.self)
+        let vp = parsed.values.mutableTyped(T.self)
+        if !T.isFloatingPoint, parsed.nullCount > v.nulls.reduce(0, +) {
+            // The first value that did not convert, in column order, for pyarrow's message.
+            let pv = parsed.validity?.typed(UInt8.self)
+            let vv = v.validity.typed(UInt8.self)
+            search: for j in 0..<cols {
+                for r in 0..<rows where Bitmap.isSet(vv + j * v.wordsPerColumn * 4, r) {
+                    if let pv, !Bitmap.isSet(pv, j * rows + r) {
+                        conversionErrors.append("Failed to convert JSON to \(type), couldn't parse:\(text[j * rows + r] ?? "")")
+                        break search
+                    }
                 }
             }
-            return .string(s)
-
-        case .timestamp(let unit, let tz):
-            let s = try strings(col)
-            let t = try JSONKernels.timestamps(ctx, s, unit: unit)
-            if t.fails > 0, let r = t.firstFail {
-                conversionErrors.append("Failed to convert JSON to \(type), couldn't parse:\(s[r] ?? "")")
+        }
+        if T.isFloatingPoint, flags & JSONKind.specialFlag != 0 {
+            // NaN, Inf and Infinity are set here rather than left to the text parser.
+            for j in 0..<cols {
+                for r in 0..<rows {
+                    let e = set.entryIndex(j, r)
+                    guard e >= 0 else { continue }
+                    let x = set.level.entry(e)
+                    guard x.flags & JSONKind.specialFlag != 0 else { continue }
+                    var p = Int(x.valStart)
+                    let negative = host[p] == 0x2D
+                    if negative { p += 1 }
+                    let d: Double = host[p] == 0x4E ? .nan : (negative ? -.infinity : .infinity)
+                    vp[j * rows + r] = T.self == Float.self ? Float(d) as! T : d as! T
+                }
             }
-            let arr = MetalArray<Int64>(length: rows, nullCount: s.nullCount,
-                                        validity: bitmapOrNil(t.validity, nulls: s.nullCount), values: t.values, context: ctx)
-            return .temporal(try MetalTemporalArray(type: .timestamp(unit, timezone: tz), arr))
+        }
+        let width = MemoryLayout<T>.stride
+        return (0..<cols).map { j in
+            MetalArray<T>(length: rows, nullCount: v.nulls[j], validity: bitmap(v.validity, j, wpc: v.wordsPerColumn, nulls: v.nulls[j]),
+                          values: parsed.values.view(byteOffset: j * rows * width, byteCount: Swift.max(rows * width, width)),
+                          context: ctx)
+        }
+    }
 
+    /// A struct or list column (one column: nested levels are walked per column).
+    func nested(_ col: JSONKernels.ColumnSet, type: JSONType, inferred: Bool, path: String,
+                rowToRecord: @escaping (Int) -> Int) throws -> AnyMetalArray {
+        let rows = col.rows
+        switch type {
         case .structure(let schemaFields):
-            let (valid, _, nulls) = try JSONKernels.validity(ctx, col, validMask: Self.maskObject)
+            let v = try JSONKernels.validity(ctx, col, validMask: Self.maskObject)
             let (s, e) = try JSONKernels.spans(ctx, col, validMask: Self.maskObject)
             let level = try walk(s, e, rows)
             let (names, children) = try fields(level: level, rows: rows, schema: inferred ? nil : schemaFields,
                                                path: path, rowToRecord: rowToRecord)
-            return .structure(try MetalStructArray(length: rows, nullCount: nulls, validity: bitmapOrNil(valid, nulls: nulls),
+            return .structure(try MetalStructArray(length: rows, nullCount: v.nulls[0],
+                                                   validity: bitmap(v.validity, 0, wpc: v.wordsPerColumn, nulls: v.nulls[0]),
                                                    names: names, children: children, context: ctx))
-
         case .list(let elementType):
-            let (valid, _, nulls) = try JSONKernels.validity(ctx, col, validMask: Self.maskArray)
+            let v = try JSONKernels.validity(ctx, col, validMask: Self.maskArray)
             let (s, e) = try JSONKernels.spans(ctx, col, validMask: Self.maskArray)
             let level = try walk(s, e, rows)
-            let child = JSONKernels.Column(level: level, rowEntry: nil, rows: level.count)
-            let values = try column(child, type: inferred ? nil : (elementType == .null ? nil : elementType),
-                                    path: path + "/[]",
-                                    rowToRecord: { r in rowToRecord(Int(level.entry(r).parent)) })
-            return .list(MetalListArray(length: rows, nullCount: nulls, validity: bitmapOrNil(valid, nulls: nulls),
+            let elements = JSONKernels.ColumnSet(level: level, rowEntry: nil, rows: level.count, cols: 1)
+            let values = try columns(elements, sel: [0], types: [inferred || elementType == .null ? nil : elementType],
+                                     paths: [path + "/[]"],
+                                     rowToRecord: { r in rowToRecord(Int(level.entry(r).parent)) })[0]
+            return .list(MetalListArray(length: rows, nullCount: v.nulls[0],
+                                        validity: bitmap(v.validity, 0, wpc: v.wordsPerColumn, nulls: v.nulls[0]),
                                         offsets: level.offsets, values: values, context: ctx))
+        default:
+            throw JSONError.unsupported("internal: \(type) is not a nested type")
         }
     }
 
@@ -347,68 +441,7 @@ final class JSONColumnBuilder {
     /// spans that stop early are the partial values of the record holding the first syntax error,
     /// whose error the reader already has.
     func walk(_ start: MetalArrowBuffer, _ end: MetalArrowBuffer, _ spans: Int) throws -> JSONLevel {
-        let (counts, _) = try JSONKernels.walkCount(ctx, source, n: n, spanStart: start,
-                                                    spanEnd: end, spans: spans)
-        return try JSONKernels.walkEmit(ctx, source, n: n, spanStart: start, spanEnd: end,
-                                        spans: spans, counts: counts)
-    }
-
-    /// The unescaped string values of a column.
-    func strings(_ col: JSONKernels.Column) throws -> MetalStringArray {
-        let (valid, _, nulls) = try JSONKernels.validity(ctx, col, validMask: Self.maskString)
-        let (off, data) = try JSONKernels.gather(ctx, source, col, mode: .stringValue, validMask: Self.maskString)
-        return MetalStringArray(length: col.rows, nullCount: nulls, validity: bitmapOrNil(valid, nulls: nulls),
-                                offsets: off, data: data, context: ctx)
-    }
-
-    /// The number text of a column, as a utf8 array for the string-to-number parse.
-    func numberText(_ col: JSONKernels.Column) throws -> MetalStringArray {
-        let (valid, _, nulls) = try JSONKernels.validity(ctx, col, validMask: Self.maskNumber)
-        let (off, data) = try JSONKernels.gather(ctx, source, col, mode: .rawValue, validMask: Self.maskNumber)
-        return MetalStringArray(length: col.rows, nullCount: nulls, validity: bitmapOrNil(valid, nulls: nulls),
-                                offsets: off, data: data, context: ctx)
-    }
-
-    func integers<T: ArrowPrimitive>(_ col: JSONKernels.Column, _: T.Type, type: JSONType) throws -> MetalArray<T> {
-        let text = try numberText(col)
-        let out = try text.parse(T.self)
-        if out.nullCount > text.nullCount {
-            // The first value that did not convert, for pyarrow's message.
-            let tv = text.validity?.typed(UInt8.self)
-            let ov = out.validity?.typed(UInt8.self)
-            for r in 0..<col.rows {
-                let inValid = tv.map { Bitmap.isSet($0, r) } ?? true
-                let outValid = ov.map { Bitmap.isSet($0, r) } ?? true
-                if inValid && !outValid {
-                    conversionErrors.append("Failed to convert JSON to \(type), couldn't parse:\(text[r] ?? "")")
-                    break
-                }
-            }
-        }
-        return out
-    }
-
-    func floats<T: ArrowPrimitive>(_ col: JSONKernels.Column, _: T.Type, flags: UInt32) throws -> MetalArray<T> {
-        let text = try numberText(col)
-        let out = try text.parse(T.self)
-        if flags & JSONKind.specialFlag != 0 {
-            // NaN, Inf and Infinity are set here rather than trusted to the text parser.
-            let vals = out.values.mutableTyped(T.self)
-            let bits = out.validity?.mutableTyped(UInt8.self)
-            for r in 0..<col.rows {
-                let e = col.entryIndex(r)
-                guard e >= 0 else { continue }
-                let x = col.level.entry(e)
-                guard x.flags & JSONKind.specialFlag != 0 else { continue }
-                var p = Int(x.valStart)
-                let negative = host[p] == 0x2D
-                if negative { p += 1 }
-                let v: Double = host[p] == 0x4E ? .nan : (negative ? -.infinity : .infinity)
-                if T.self == Float.self { vals[r] = Float(v) as! T } else { vals[r] = v as! T }
-                if let bits { Bitmap.set(bits, r) }
-            }
-            out.recomputeNullCount()
-        }
-        return out
+        let (counts, _) = try JSONKernels.walkCount(ctx, source, n: n, spanStart: start, spanEnd: end, spans: spans)
+        return try JSONKernels.walkEmit(ctx, source, n: n, spanStart: start, spanEnd: end, spans: spans, counts: counts)
     }
 }

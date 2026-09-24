@@ -624,59 +624,70 @@ enum JSONSource {
         if (f >= 0 && expected[f] == 0) atomic_fetch_min_explicit(first, e, memory_order_relaxed);
     }
 
-    struct JCol { uint rows; uint identity; uint validMask; };
+    // A column set: `cols` columns of `rows` rows, `rowEntry` column-major (column j's row r at
+    // j * rows + r), or the identity (row r is entry r) for a single column of list elements.
+    struct JCols { uint rows; uint cols; uint identity; uint validMask; uint boolValues; };
 
-    inline int j_row_entry(constant JCol& P, device const int* rowEntry, uint r) {
-        return P.identity ? (int)r : rowEntry[r];
+    inline int j_entry_at(constant JCols& P, device const int* rowEntry, uint j, uint r) {
+        return P.identity ? (int)r : rowEntry[j * P.rows + r];
     }
 
-    // OR of (1 << kind) and of the flag bits over one column.
-    kernel void jc_kinds(constant JCol& P [[buffer(0)]], device const JEntry* ent [[buffer(1)]],
+    // OR of (1 << kind) and of the flag bits per column; a thread takes 256 rows of one column.
+    kernel void jc_kinds(constant JCols& P [[buffer(0)]], device const JEntry* ent [[buffer(1)]],
                          device const int* rowEntry [[buffer(2)]], device atomic_uint* out [[buffer(3)]],
-                         uint r [[thread_position_in_grid]]) {
+                         uint t [[thread_position_in_grid]]) {
+        uint chunks = (P.rows + 255u) / 256u;
+        uint j = t / chunks, c = t % chunks;
+        if (j >= P.cols) return;
+        uint lo = c * 256u, hi = min(lo + 256u, P.rows);
         uint km = 0u, fl = 0u;
-        if (r < P.rows) {
-            int e = j_row_entry(P, rowEntry, r);
-            if (e < 0) km = 1u << K_NULL;
-            else { uint f = ent[e].flags; km = 1u << (f & 15u); fl = f & 0xF0u; }
+        for (uint r = lo; r < hi; r++) {
+            int e = j_entry_at(P, rowEntry, j, r);
+            if (e < 0) km |= 1u << K_NULL;
+            else { uint f = ent[e].flags; km |= 1u << (f & 15u); fl |= f & 0xF0u; }
         }
-        km = simd_or(km); fl = simd_or(fl);
-        if (simd_is_first()) {
-            if (km) atomic_fetch_or_explicit(&out[0], km, memory_order_relaxed);
-            if (fl) atomic_fetch_or_explicit(&out[1], fl, memory_order_relaxed);
-        }
+        if (km) atomic_fetch_or_explicit(&out[2u * j], km, memory_order_relaxed);
+        if (fl) atomic_fetch_or_explicit(&out[2u * j + 1u], fl, memory_order_relaxed);
     }
 
-    // Validity bitmap (32 rows per thread): valid when the row has an entry whose kind is in validMask.
-    // With `boolValues` set it also writes the boolean values (kind true).
-    kernel void jc_validity(constant JCol& P [[buffer(0)]], device const JEntry* ent [[buffer(1)]],
+    // Copies chosen columns of a slot matrix into a contiguous set: out[k * rows + r] = M[sel[k] * rows + r].
+    kernel void jc_pack(constant uint& rows [[buffer(0)]], constant uint& cols [[buffer(1)]],
+                        device const int* M [[buffer(2)]], device const uint* sel [[buffer(3)]],
+                        device int* out [[buffer(4)]], uint t [[thread_position_in_grid]]) {
+        if (t >= rows * cols) return;
+        uint k = t / rows, r = t - k * rows;
+        out[t] = M[sel[k] * rows + r];
+    }
+
+    // Validity bitmaps, one per column and each starting on a word (column j owns words
+    // [j * wpc, (j + 1) * wpc)): valid when the row's kind is in validMask. With boolValues set it also
+    // writes the boolean values (kind true) in the same layout. Null counts are per column.
+    kernel void jc_validity(constant JCols& P [[buffer(0)]], device const JEntry* ent [[buffer(1)]],
                             device const int* rowEntry [[buffer(2)]], device uint* valid [[buffer(3)]],
-                            device uint* values [[buffer(4)]], constant uint& boolValues [[buffer(5)]],
-                            device atomic_uint* nulls [[buffer(6)]], uint w [[thread_position_in_grid]]) {
-        uint words = (P.rows + 31u) / 32u;
-        uint nn = 0u;
-        if (w < words) {
-            uint vb = 0u, tb = 0u;
-            uint lo = w * 32u, hi = min(lo + 32u, P.rows);
-            for (uint r = lo; r < hi; r++) {
-                int e = j_row_entry(P, rowEntry, r);
-                uint k = (e < 0) ? K_NULL : (ent[e].flags & 15u);
-                if ((P.validMask >> k) & 1u) { vb |= 1u << (r - lo); if (k == K_TRUE) tb |= 1u << (r - lo); }
-                else nn++;
-            }
-            valid[w] = vb;
-            if (boolValues) values[w] = tb;
+                            device uint* values [[buffer(4)]], device atomic_uint* nulls [[buffer(5)]],
+                            uint t [[thread_position_in_grid]]) {
+        uint wpc = (P.rows + 31u) / 32u;
+        uint j = t / wpc, w = t % wpc;
+        if (j >= P.cols) return;
+        uint vb = 0u, tb = 0u, nn = 0u;
+        uint lo = w * 32u, hi = min(lo + 32u, P.rows);
+        for (uint r = lo; r < hi; r++) {
+            int e = j_entry_at(P, rowEntry, j, r);
+            uint k = (e < 0) ? K_NULL : (ent[e].flags & 15u);
+            if ((P.validMask >> k) & 1u) { vb |= 1u << (r - lo); if (k == K_TRUE) tb |= 1u << (r - lo); }
+            else nn++;
         }
-        nn = simd_sum(nn);
-        if (simd_is_first() && nn) atomic_fetch_add_explicit(nulls, nn, memory_order_relaxed);
+        valid[t] = vb;
+        if (P.boolValues) values[t] = tb;
+        if (nn) atomic_fetch_add_explicit(&nulls[j], nn, memory_order_relaxed);
     }
 
-    // Spans of the nested objects or arrays of a column (empty for rows of another kind).
-    kernel void jc_spans(constant JCol& P [[buffer(0)]], device const JEntry* ent [[buffer(1)]],
+    // Spans of the nested objects or arrays of one column (empty for rows of another kind).
+    kernel void jc_spans(constant JCols& P [[buffer(0)]], device const JEntry* ent [[buffer(1)]],
                          device const int* rowEntry [[buffer(2)]], device uint* spanStart [[buffer(3)]],
                          device uint* spanEnd [[buffer(4)]], uint r [[thread_position_in_grid]]) {
         if (r >= P.rows) return;
-        int e = j_row_entry(P, rowEntry, r);
+        int e = j_entry_at(P, rowEntry, 0u, r);
         if (e >= 0 && ((P.validMask >> (ent[e].flags & 15u)) & 1u)) {
             spanStart[r] = ent[e].valStart; spanEnd[r] = ent[e].valStart + ent[e].valLen;
         } else { spanStart[r] = 0u; spanEnd[r] = 0u; }
@@ -853,33 +864,32 @@ enum JSONSource {
         return true;
     }
 
-    struct JTime { uint rows; uint hasValidity; long unitScale; uint fracMax; };
+    struct JTime { uint rows; uint cols; long unitScale; uint fracMax; };
 
-    // Parses a utf8 column. Writes values and a validity bitmap (32 rows per thread); counts the valid
-    // input rows that fail and keeps the first of them.
+    // Parses a set of utf8 columns (combined offsets, column j's row r at j * rows + r) with their
+    // word-aligned validity bitmaps. Writes the values and, per column, the number of valid rows that
+    // do not parse and the first of them (fails[2j], fails[2j + 1]).
     kernel void jt_parse(device const int* offsets [[buffer(0)]], device const uchar* data [[buffer(1)]],
-                         device const uchar* validity [[buffer(2)]], constant JTime& P [[buffer(3)]],
-                         device long* values [[buffer(4)]], device uint* valid [[buffer(5)]],
-                         device atomic_uint* fails [[buffer(6)]], uint w [[thread_position_in_grid]]) {
-        uint words = (P.rows + 31u) / 32u;
-        uint nf = 0u; uint firstFail = 0xFFFFFFFFu;
-        if (w < words) {
-            uint vb = 0u;
-            uint lo = w * 32u, hi = min(lo + 32u, P.rows);
-            for (uint r = lo; r < hi; r++) {
-                if (P.hasValidity && !bit_get(validity, r)) { values[r] = 0; continue; }
-                long v = 0;
-                uint st = (uint)offsets[r], len = (uint)(offsets[r + 1u] - offsets[r]);
-                if (j_iso8601(data, st, len, P.unitScale, P.fracMax, v)) { values[r] = v; vb |= 1u << (r - lo); }
-                else { values[r] = 0; nf++; if (firstFail == 0xFFFFFFFFu) firstFail = r; }
-            }
-            valid[w] = vb;
+                         device const uint* validity [[buffer(2)]], constant JTime& P [[buffer(3)]],
+                         device long* values [[buffer(4)]], device atomic_uint* fails [[buffer(5)]],
+                         uint t [[thread_position_in_grid]]) {
+        uint wpc = (P.rows + 31u) / 32u;
+        uint j = t / wpc, w = t % wpc;
+        if (j >= P.cols) return;
+        uint vw = validity[t];
+        uint nf = 0u, firstFail = 0xFFFFFFFFu;
+        uint lo = w * 32u, hi = min(lo + 32u, P.rows);
+        for (uint r = lo; r < hi; r++) {
+            uint g = j * P.rows + r;
+            if (((vw >> (r - lo)) & 1u) == 0u) { values[g] = 0; continue; }
+            long v = 0;
+            uint st = (uint)offsets[g], len = (uint)(offsets[g + 1u] - offsets[g]);
+            if (j_iso8601(data, st, len, P.unitScale, P.fracMax, v)) values[g] = v;
+            else { values[g] = 0; nf++; if (firstFail == 0xFFFFFFFFu) firstFail = r; }
         }
-        uint total = simd_sum(nf);
-        uint fmin = simd_min(firstFail);
-        if (simd_is_first()) {
-            if (total) atomic_fetch_add_explicit(&fails[0], total, memory_order_relaxed);
-            if (fmin != 0xFFFFFFFFu) atomic_fetch_min_explicit(&fails[1], fmin, memory_order_relaxed);
+        if (nf) {
+            atomic_fetch_add_explicit(&fails[2u * j], nf, memory_order_relaxed);
+            atomic_fetch_min_explicit(&fails[2u * j + 1u], firstFail, memory_order_relaxed);
         }
     }
     """

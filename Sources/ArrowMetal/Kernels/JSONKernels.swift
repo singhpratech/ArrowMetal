@@ -360,66 +360,107 @@ enum JSONKernels {
         return f == .max ? nil : Int(f)
     }
 
-    struct Col { var rows: UInt32; var identity: UInt32; var validMask: UInt32 }
+    struct Cols { var rows: UInt32; var cols: UInt32; var identity: UInt32; var validMask: UInt32; var boolValues: UInt32 }
 
-    /// A column: `rows` rows, each mapped to an entry of `level` through `rowEntry` (nil: row i is entry i).
-    struct Column {
+    /// Columns over one level: `cols` columns of `rows` rows each, every row mapped to an entry of
+    /// `level` through `rowEntry`, column-major (column j's row r at j * rows + r; -1 where the field is
+    /// missing). A nil `rowEntry` is a single column whose row r is entry r (a list's elements).
+    struct ColumnSet {
         let level: JSONLevel
         let rowEntry: MetalArrowBuffer?
         let rows: Int
-        func entryIndex(_ r: Int) -> Int {
+        let cols: Int
+
+        func entryIndex(_ j: Int, _ r: Int) -> Int {
             guard let rowEntry else { return r }
-            return Int(rowEntry.typed(Int32.self)[r])
+            return Int(rowEntry.typed(Int32.self)[j * rows + r])
         }
-        func P(_ validMask: UInt32) -> Col {
-            Col(rows: UInt32(rows), identity: rowEntry == nil ? 1 : 0, validMask: validMask)
+        func P(validMask: UInt32 = 0, boolValues: Bool = false) -> Cols {
+            Cols(rows: UInt32(rows), cols: UInt32(cols), identity: rowEntry == nil ? 1 : 0,
+                 validMask: validMask, boolValues: boolValues ? 1 : 0)
+        }
+        /// Column j alone (a view, no copy).
+        func column(_ j: Int) -> ColumnSet {
+            guard let rowEntry, cols > 1 else { return self }
+            return ColumnSet(level: level, rowEntry: rowEntry.view(byteOffset: j * rows * 4, byteCount: Swift.max(rows * 4, 4)),
+                             rows: rows, cols: 1)
         }
     }
 
-    /// OR of (1 << kind) and of the flag bits over a column.
-    static func kinds(_ ctx: MetalContext, _ col: Column) throws -> (mask: UInt32, flags: UInt32) {
-        let out = try alloc(ctx, 8, zeroed: true)
-        guard col.rows > 0 else { return (0, 0) }
-        try ctx.run { enc in
-            let p = try pso(ctx, "jc_kinds")
-            enc.setComputePipelineState(p)
-            bytes(enc, col.P(0), 0); set(enc, col.level.entries, 1); set(enc, col.rowEntry ?? col.level.entries, 2)
-            set(enc, out, 3)
-            Dispatch.dispatch1D(enc, p, count: col.rows)
+    /// OR of (1 << kind) and of the flag bits, per column.
+    static func kinds(_ ctx: MetalContext, _ cs: ColumnSet) throws -> [(mask: UInt32, flags: UInt32)] {
+        let out = try alloc(ctx, cs.cols * 8, zeroed: true)
+        if cs.rows > 0 && cs.cols > 0 {
+            let chunks = (cs.rows + 255) / 256
+            try ctx.run { enc in
+                let p = try pso(ctx, "jc_kinds")
+                enc.setComputePipelineState(p)
+                bytes(enc, cs.P(), 0); set(enc, cs.level.entries, 1); set(enc, cs.rowEntry ?? cs.level.entries, 2)
+                set(enc, out, 3)
+                Dispatch.dispatch1D(enc, p, count: chunks * cs.cols)
+            }
         }
         let o = out.typed(UInt32.self)
-        return (o[0], o[1])
+        return (0..<cs.cols).map { (o[2 * $0], o[2 * $0 + 1]) }
     }
 
-    /// Validity bitmap (and boolean values when asked) for the rows whose kind is in `validMask`.
-    static func validity(_ ctx: MetalContext, _ col: Column, validMask: UInt32, boolValues: Bool = false)
-        throws -> (validity: MetalArrowBuffer, values: MetalArrowBuffer?, nulls: Int) {
-        let words = (col.rows + 31) / 32
+    /// The chosen columns of `set` as a set of their own: a view when they are adjacent, else a copy.
+    static func pack(_ ctx: MetalContext, _ cs: ColumnSet, _ sel: [Int]) throws -> ColumnSet {
+        guard let rowEntry = cs.rowEntry else { return cs }
+        if let first = sel.first, sel.enumerated().allSatisfy({ $0.element == first + $0.offset }) {
+            let view = rowEntry.view(byteOffset: first * cs.rows * 4, byteCount: Swift.max(sel.count * cs.rows * 4, 4))
+            return ColumnSet(level: cs.level, rowEntry: view, rows: cs.rows, cols: sel.count)
+        }
+        let total = sel.count * cs.rows
+        let out = try alloc(ctx, total * 4)
+        let selBuf = try alloc(ctx, sel.count * 4)
+        let sp = selBuf.mutableTyped(UInt32.self)
+        for (k, s) in sel.enumerated() { sp[k] = UInt32(s) }
+        if total > 0 {
+            try ctx.run { enc in
+                let p = try pso(ctx, "jc_pack")
+                enc.setComputePipelineState(p)
+                bytes(enc, UInt32(cs.rows), 0); bytes(enc, UInt32(sel.count), 1); set(enc, rowEntry, 2)
+                set(enc, selBuf, 3); set(enc, out, 4)
+                Dispatch.dispatch1D(enc, p, count: total)
+            }
+        }
+        return ColumnSet(level: cs.level, rowEntry: out, rows: cs.rows, cols: sel.count)
+    }
+
+    /// Per-column validity bitmaps (and boolean values when asked) for the rows whose kind is in
+    /// `validMask`. Column j's bitmap starts at word j * wordsPerColumn.
+    static func validity(_ ctx: MetalContext, _ cs: ColumnSet, validMask: UInt32, boolValues: Bool = false)
+        throws -> (validity: MetalArrowBuffer, values: MetalArrowBuffer?, nulls: [Int], wordsPerColumn: Int) {
+        let wpc = (cs.rows + 31) / 32
+        let words = wpc * cs.cols
         let valid = try alloc(ctx, words * 4)
         let values = boolValues ? try alloc(ctx, words * 4) : nil
-        let nulls = try alloc(ctx, 4, zeroed: true)
-        if col.rows > 0 {
+        let nulls = try alloc(ctx, cs.cols * 4, zeroed: true)
+        if words > 0 {
             try ctx.run { enc in
                 let p = try pso(ctx, "jc_validity")
                 enc.setComputePipelineState(p)
-                bytes(enc, col.P(validMask), 0); set(enc, col.level.entries, 1)
-                set(enc, col.rowEntry ?? col.level.entries, 2); set(enc, valid, 3); set(enc, values ?? valid, 4)
-                bytes(enc, UInt32(boolValues ? 1 : 0), 5); set(enc, nulls, 6)
+                bytes(enc, cs.P(validMask: validMask, boolValues: boolValues), 0); set(enc, cs.level.entries, 1)
+                set(enc, cs.rowEntry ?? cs.level.entries, 2); set(enc, valid, 3); set(enc, values ?? valid, 4)
+                set(enc, nulls, 5)
                 Dispatch.dispatch1D(enc, p, count: words)
             }
         }
-        return (valid, values, Int(nulls.typed(UInt32.self)[0]))
+        let np = nulls.typed(UInt32.self)
+        return (valid, values, (0..<cs.cols).map { Int(np[$0]) }, wpc)
     }
 
-    /// Spans of the values of kind in `validMask` (empty spans elsewhere), for the next walk.
-    static func spans(_ ctx: MetalContext, _ col: Column, validMask: UInt32) throws -> (MetalArrowBuffer, MetalArrowBuffer) {
+    /// Spans of the values of kind in `validMask` in a single column (empty spans elsewhere), for the
+    /// next walk.
+    static func spans(_ ctx: MetalContext, _ col: ColumnSet, validMask: UInt32) throws -> (MetalArrowBuffer, MetalArrowBuffer) {
         let s = try alloc(ctx, col.rows * 4)
         let e = try alloc(ctx, col.rows * 4)
         if col.rows > 0 {
             try ctx.run { enc in
                 let p = try pso(ctx, "jc_spans")
                 enc.setComputePipelineState(p)
-                bytes(enc, col.P(validMask), 0); set(enc, col.level.entries, 1)
+                bytes(enc, col.P(validMask: validMask), 0); set(enc, col.level.entries, 1)
                 set(enc, col.rowEntry ?? col.level.entries, 2); set(enc, s, 3); set(enc, e, 4)
                 Dispatch.dispatch1D(enc, p, count: col.rows)
             }
@@ -431,32 +472,33 @@ enum JSONKernels {
 
     enum GatherMode: UInt32 { case key = 0, stringValue = 1, rawValue = 2 }
 
-    /// A utf8 array of keys, unescaped string values or raw value text, one row per column row. The
-    /// validity is the caller's to attach (rows without a matching entry are empty).
-    static func gather(_ ctx: MetalContext, _ src: MetalArrowBuffer, _ col: Column, mode: GatherMode,
+    /// Keys, unescaped string values or raw value text for every row of every column of `set`, as one
+    /// offsets array (column j's row r at j * rows + r) over one data buffer. Rows whose kind is not in
+    /// `validMask` are empty; the validity is the caller's to attach.
+    static func gather(_ ctx: MetalContext, _ src: MetalArrowBuffer, _ cs: ColumnSet, mode: GatherMode,
                        validMask: UInt32) throws -> (offsets: MetalArrowBuffer, data: MetalArrowBuffer) {
-        let n = col.rows
-        let P = Gather(rows: UInt32(n), identity: col.rowEntry == nil ? 1 : 0, mode: mode.rawValue, validMask: validMask)
+        let n = cs.rows * cs.cols
+        let P = Gather(rows: UInt32(n), identity: cs.rowEntry == nil ? 1 : 0, mode: mode.rawValue, validMask: validMask)
         let lens = try alloc(ctx, n * 4)
         if n > 0 {
             try ctx.run { enc in
                 let p = try pso(ctx, "jg_len")
                 enc.setComputePipelineState(p)
-                set(enc, src, 0); bytes(enc, P, 1); set(enc, col.level.entries, 2)
-                set(enc, col.rowEntry ?? col.level.entries, 3); set(enc, lens, 4)
+                set(enc, src, 0); bytes(enc, P, 1); set(enc, cs.level.entries, 2)
+                set(enc, cs.rowEntry ?? cs.level.entries, 3); set(enc, lens, 4)
                 Dispatch.dispatch1D(enc, p, count: n)
             }
         }
         let offsets = try sumScan(ctx, lens, n)
         let total = Int(offsets.typed(Int32.self)[n])
-        guard total >= 0 else { throw JSONError.unsupported("a column holds more than 2 GiB of text") }
+        guard total >= 0 else { throw JSONError.unsupported("a column set holds more than 2 GiB of text") }
         let data = try alloc(ctx, total)
         if n > 0 && total > 0 {
             try ctx.run { enc in
                 let p = try pso(ctx, "jg_write")
                 enc.setComputePipelineState(p)
-                set(enc, src, 0); bytes(enc, P, 1); set(enc, col.level.entries, 2)
-                set(enc, col.rowEntry ?? col.level.entries, 3); set(enc, offsets, 4); set(enc, data, 5)
+                set(enc, src, 0); bytes(enc, P, 1); set(enc, cs.level.entries, 2)
+                set(enc, cs.rowEntry ?? cs.level.entries, 3); set(enc, offsets, 4); set(enc, data, 5)
                 Dispatch.dispatch1D(enc, p, count: n)
             }
         }
@@ -466,39 +508,39 @@ enum JSONKernels {
     /// A utf8 array of the keys of the given entries (unescaped), in the order given.
     static func keys(_ ctx: MetalContext, _ src: MetalArrowBuffer, level: JSONLevel, indices: MetalArrowBuffer, count: Int)
         throws -> MetalStringArray {
-        let col = Column(level: level, rowEntry: indices, rows: count)
-        let (off, data) = try gather(ctx, src, col, mode: .key, validMask: 0xFF)
+        let cs = ColumnSet(level: level, rowEntry: indices, rows: count, cols: 1)
+        let (off, data) = try gather(ctx, src, cs, mode: .key, validMask: 0xFF)
         return MetalStringArray(length: count, nullCount: 0, validity: nil, offsets: off, data: data, context: ctx)
     }
 
-    struct Time { var rows: UInt32; var hasValidity: UInt32; var unitScale: Int64; var fracMax: UInt32 }
+    struct Time { var rows: UInt32; var cols: UInt32; var unitScale: Int64; var fracMax: UInt32 }
 
-    /// ISO-8601 parse of a utf8 column (Arrow's rules). Returns values, validity, the number of valid
-    /// input rows that failed and the first of them.
-    static func timestamps(_ ctx: MetalContext, _ s: MetalStringArray, unit: ArrowTemporalUnit)
-        throws -> (values: MetalArrowBuffer, validity: MetalArrowBuffer, fails: Int, firstFail: Int?) {
-        let n = s.length
-        let words = (n + 31) / 32
-        let values = try alloc(ctx, n * 8)
-        let valid = try alloc(ctx, words * 4)
-        let fails = try alloc(ctx, 8)
-        fails.mutableTyped(UInt32.self)[0] = 0
-        fails.mutableTyped(UInt32.self)[1] = .max
+    /// ISO-8601 parse (Arrow's rules) of `cols` utf8 columns of `rows` rows sharing one offsets array,
+    /// with word-aligned validity bitmaps. Returns the values and, per column, how many valid rows did
+    /// not parse and the first of them.
+    static func timestamps(_ ctx: MetalContext, offsets: MetalArrowBuffer, data: MetalArrowBuffer,
+                           validity: MetalArrowBuffer, rows: Int, cols: Int, unit: ArrowTemporalUnit)
+        throws -> (values: MetalArrowBuffer, fails: [(count: Int, first: Int?)]) {
+        let values = try alloc(ctx, rows * cols * 8)
+        let fails = try alloc(ctx, cols * 8)
+        let fp = fails.mutableTyped(UInt32.self)
+        for j in 0..<cols { fp[2 * j] = 0; fp[2 * j + 1] = .max }
         let fracMax: UInt32
         switch unit { case .second: fracMax = 0; case .milli: fracMax = 3; case .micro: fracMax = 6; case .nano: fracMax = 9 }
-        let P = Time(rows: UInt32(n), hasValidity: s.validity == nil ? 0 : 1, unitScale: unit.perSecond, fracMax: fracMax)
-        if n > 0 {
+        let P = Time(rows: UInt32(rows), cols: UInt32(cols), unitScale: unit.perSecond, fracMax: fracMax)
+        let words = (rows + 31) / 32 * cols
+        if words > 0 {
             try ctx.run { enc in
                 let p = try pso(ctx, "jt_parse")
                 enc.setComputePipelineState(p)
-                set(enc, s.offsets, 0); set(enc, s.data, 1); set(enc, s.validity ?? s.offsets, 2)
+                set(enc, offsets, 0); set(enc, data, 1); set(enc, validity, 2)
                 enc.setBytes([P], length: MemoryLayout<Time>.stride, index: 3)
-                set(enc, values, 4); set(enc, valid, 5); set(enc, fails, 6)
+                set(enc, values, 4); set(enc, fails, 5)
                 Dispatch.dispatch1D(enc, p, count: words)
             }
         }
         let f = fails.typed(UInt32.self)
-        return (values, valid, Int(f[0]), f[1] == .max ? nil : Int(f[1]))
+        return (values, (0..<cols).map { (Int(f[2 * $0]), f[2 * $0 + 1] == .max ? nil : Int(f[2 * $0 + 1])) })
     }
 }
 
