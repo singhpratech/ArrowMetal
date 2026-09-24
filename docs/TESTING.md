@@ -5,7 +5,7 @@ pushed. Numbers are from the last gated run of `main` (0.1.0) on an M4 Max.
 
 | Layer | Size | Oracle |
 |---|---|---|
-| Swift suites (`Tests/ArrowMetalTests`) | 941 tests in 73 files, run in release (all 941 executed, 3 skipped in the merge gate of 2026-09-24 at `1825248`: the three opt-in throughput measurements) | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
+| Swift suites (`Tests/ArrowMetalTests`) | 943 tests in 73 files, run in release (all 943 executed, 3 skipped in the merge gate of 2026-09-24 at `1825248`: the three opt-in throughput measurements) | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
 | Python suites (`python/tests`) | 5,843 collected cases over the ctypes API, the integrations and the readers in the merge gate of 2026-09-24 at `1825248` (5,818 passed and 25 skipped; the differential matrix in `test_differential.py` is counted in its own row) | `pyarrow.compute`, Polars, DuckDB, pandas |
 | Rust suites (`rust/arrowmetal/tests`, `rust/arrowmetal-sys`) | 48 tests, 46 in the safe crate against arrow-rs plus 2 in `arrowmetal-sys` over the raw ABI, run in release, plus 4 `no_run` doc-tests (compiled, not executed); all passed on 2026-09-24 at `3c3ea1e` | `arrow::compute` (arrow-rs 59) on the same data; a `HashMap` fold where arrow-rs has no kernel; `include/arrowmetal.h` re-parsed for the ABI signatures ([RUST.md](RUST.md)) |
 | Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | 39,069 generated cases, 45 column types, every public operation | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
@@ -112,7 +112,7 @@ a sliced input at offsets 1, 7, 31, 32, 33, 63 and 64 against the same rows buil
 
 ## 2. Python suites
 
-The column below counts `def test_*` functions. The 5,843 in the table at the top of this page is what
+The column below counts `def test_*` functions. The 5,892 in the table at the top of this page is what
 pytest *collected* in the 2026-09-24 gate, which is larger because a parametrised function collects once per parameter set.
 
 | File | Test functions | Compares against |

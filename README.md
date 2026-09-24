@@ -39,8 +39,8 @@ the CPU idiom is ahead — is in [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MAT
 - **307 of Apache Arrow v25's 307 compute function names** — 283 on the GPU, 17 on the host, 7 with a
   stated limitation. The table is generated from a registry the test suite executes against
   `pyarrow.compute`. [`docs/ARROW_FUNCTIONS.md`](docs/ARROW_FUNCTIONS.md)
-- **39,069 differential cases against pyarrow over 45 column types**, 941 Swift tests against a CPU
-  oracle and 5,843 Python cases (5,818 passed, 25 skipped), all run in release.
+- **39,069 differential cases against pyarrow over 45 column types**, 943 Swift tests against a CPU
+  oracle and 5,892 Python cases (5,867 passed, 25 skipped), all run in release.
   [`docs/TESTING.md`](docs/TESTING.md)
 - **Seven languages on one C ABI** — Swift, Python, C, Rust, Go, TypeScript and R, each binding with its
   own suite against that language's Arrow library. [`docs/README.md`](docs/README.md)
