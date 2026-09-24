@@ -271,3 +271,21 @@ def test_zero_rows():
     assert am.query(t, am.col("a").sum()) is None
     assert am.query(t, am.Query().count()) == 0
     assert len(am.query(t, am.filter(am.col("a") > 0).project([am.col("a")]))["a"]) == 0
+
+
+def test_float_literals_beyond_the_int64_range_do_not_end_the_process():
+    """A float literal at or beyond 2**63 used to trap the host process (Int64(Double) in the
+    compiler), even for float targets. Run in a child so a trap fails this test instead of pytest."""
+    import os, subprocess, sys
+    code = r'''
+import pyarrow as pa, arrowmetal as am
+t = pa.table({"i": pa.array([-1, 0, 5], pa.int64()), "d": pa.array([1.0, -2.0]).cast(pa.float64()).take([0, 1, 1])})
+r = am.query(t, am.project([(am.col("i") >= 1e19).alias("ge"), (am.col("d") * 4.49423283715579e307).alias("big")]))
+assert r["ge"].to_pylist() == [False, False, False], r["ge"].to_pylist()
+assert r["big"].to_pylist() == [4.49423283715579e307, -8.98846567431158e307, -8.98846567431158e307]
+print("ok")
+'''
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.path.join(os.path.dirname(__file__), "..")
+    p = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+    assert p.returncode == 0 and p.stdout.strip() == "ok", (p.returncode, p.stdout, p.stderr[-2000:])

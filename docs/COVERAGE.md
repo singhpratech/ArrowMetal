@@ -40,8 +40,8 @@ against `pyarrow.compute`. Go there for "is `<name>` covered?"; stay here for "h
 | **Total (compute functions)** | **148** | **9** | **16** | **7** | **0** | **180** |
 | Arrow types (matrix below) | 20 | 0 | 0 | 7 | 1 | 28 |
 
-Interop uses a separate vocabulary and is counted apart: 8 in 0.1.0, 1 in 0.1.0 but unpublished,
-1 partial, 2 planned (12 rows). The "Hash join (Acero, not a compute function)" row in the grouped
+Interop uses a separate vocabulary and is counted apart: 9 in 0.1.0, 1 in 0.1.0 but unpublished,
+1 partial, 2 planned (13 rows). The "Hash join (Acero, not a compute function)" row in the grouped
 aggregations section below is likewise outside the compute-function total.
 
 A row here covers a family, so these are not function counts. The by-name numbers are in
@@ -488,6 +488,7 @@ outright.
 | Apache Iceberg table read | **Partial** | `Lakehouse/IcebergTable.swift`, `am.read_iceberg` / `am_iceberg_read`: format v1 and v2, any snapshot, Avro manifest lists and manifests (`null`, `deflate`, `snappy`), columns by field id (renames, added columns, `int -> long`), name mapping for files without ids, manifest and file pruning (identity, year/month/day/hour, truncate), filters applied to the rows. Position and equality delete files are refused by name, and nested columns are not read. Checked against pyiceberg ([LAKEHOUSE.md](LAKEHOUSE.md)). |
 | Python: PyCapsule `__arrow_c_array__` | **In 0.1.0** | `python/arrowmetal/__init__.py` over the C ABI. |
 | Python: wheel with the dylib inside | **In 0.1.0, unpublished** | `scripts/build_wheel.sh` copies `libArrowMetalC.dylib` into the package and builds a `macosx_*_arm64` wheel. It is not on PyPI yet: [ROADMAP → Release mechanics](ROADMAP.md#release-mechanics). |
+| Polars engine: `lf.collect(engine=am.MetalEngine())` | **In 0.1.0** | `python/arrowmetal/polars_engine.py`, tier 4 of [POLARS.md](POLARS.md): translates the subtrees of Polars' optimised plan that read in-memory frames (filter, projection, slice, sort, group-by, aggregate, inner/left/semi/anti join, `unique`) into ArrowMetal plans through Polars' post-optimisation callback and leaves every other node to Polars; results checked against Polars by `python/tests/test_polars_engine.py`. By default it takes full sorts of at least 1M rows, the shapes the provisional benchmark measured ahead of both Polars engines; `shapes="all"` takes everything it can translate. Right, full, cross and as-of joins, windows and file scans stay with Polars. |
 | Python: `__arrow_c_device_array__` | **Planned** | Only `__arrow_c_array__` is defined today. [ROADMAP → Types and interop](ROADMAP.md#types-and-interop). |
 | arrow-swift and MLX bridges, DuckDB/DataFusion UDF | **Planned** | [ROADMAP → Integrations](ROADMAP.md#integrations). |
 | DuckDB: aggregates of unchanged SQL on the GPU | **Built from source** | `duckdb-extension/src/arrowmetal_rewrite.cpp`, a C++ optimizer extension for DuckDB 1.5.5 (the C extension API has no optimizer hook): `sum`/`avg` over integer columns, `min`/`max` over integer, `DATE` and `TIMESTAMP` columns, `count`, with no key or one integer, `DATE`, `TIMESTAMP` or `VARCHAR` key, over projections and filters of a table scan, replaced by `ARROWMETAL_AGGREGATE` with DuckDB's exact answers (`HUGEINT` sums, `avg` arithmetic, NULL groups). Floating-point `sum`/`avg`/`min`/`max`, `DECIMAL`, `DISTINCT`, several keys and joins below the aggregate stay DuckDB's. `SET arrowmetal_rewrite = 'auto' / 'off' / 'force'`; `arrowmetal_rewrites()` logs every decision. [DUCKDB.md](DUCKDB.md) §4b. |
