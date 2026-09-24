@@ -244,6 +244,8 @@ above are not per-core figures.
 
 ## What is covered
 
+`include/arrowmetal.h` and `include/arrow_abi.h` in the module are copies of the repository's `include/` headers; refresh them (`cp include/arrowmetal.h go/arrowmetal/include/`) whenever the header changes, or `python/tests/test_header_copies.py` and `TestHeadersMatchRepository` fail.
+
 Every item below has at least one test in `go/arrowmetal`; the oracle is named. 45 test functions and one `Example`, 46 runnable;
 177 cases counting subtests, all green.
 

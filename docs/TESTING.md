@@ -39,6 +39,8 @@ ARROWMETAL_LIB=$PWD/.build/release/libArrowMetalC.dylib \
   Rscript -e 'testthat::test_local("r/arrowmetal")'
 ```
 
+The R and Go bindings compile against copies of `include/arrowmetal.h` and `include/arrow_abi.h` (`r/arrowmetal/src/`, `go/arrowmetal/include/`); when a header changes, copy it over both, and `python/tests/test_header_copies.py` fails until you do.
+
 The Rust suite finds `libArrowMetalC.dylib` in `.build/release` on its own; from outside the
 repository, set `ARROWMETAL_LIB` to the dylib's full path.
 

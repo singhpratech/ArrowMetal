@@ -1550,6 +1550,226 @@ int am_stream_join_group_by(am_stream* s, struct ArrowArrayStream* build, const 
                             const int* ops, const char** columns, const char** names, int64_t n_aggs,
                             int64_t dense_key_count, int ddof, am_stream_result** out);
 
+// ---------------------------------------------------------------------------------------------------
+// Parquet: the stored Arrow schema and page-index statistics (docs/PARQUET.md)
+//
+// A read already applies what the file's ARROW:schema key/value metadata says the Parquet schema lost:
+// time zones, durations and extension types. These two return the metadata a pyarrow Table would carry:
+// the custom metadata of one top-level column (plus PARQUET:field_id when the Parquet schema has one),
+// and the file's key/value metadata without ARROW:schema. Both write the C Data Interface metadata blob
+// (int32 count, then int32-length-prefixed key and value bytes, native endian) into `out` when `cap` is
+// large enough, and return its size in bytes: 0 when there is no metadata, -1 on a bad argument. Call
+// once with out = NULL to learn the size.
+int64_t am_parquet_field_metadata(am_parquet_file* f, const char* column, uint8_t* out, int64_t cap);
+int64_t am_parquet_schema_metadata(am_parquet_file* f, uint8_t* out, int64_t cap);
+
+// Page-level skipping: with a filter, a file's column index and offset index rule out the data pages
+// whose min/max cannot match, and those pages are never read or decompressed. On by default;
+// am_parquet_set_page_index(f, 0) turns it off (every read is then row-group granular). After a read,
+// am_parquet_last_read_stats fills up to `cap` of [row groups read, row groups skipped by statistics,
+// row groups skipped by the page index, data pages decoded, data pages skipped, rows, row groups skipped
+// by bloom filters] and returns 7. An equality filter also consults the column chunks' split-block bloom
+// filters, when the file has them, and drops the row groups its value is certainly absent from;
+// am_parquet_set_bloom_filters(f, 0) turns that off.
+int     am_parquet_set_page_index(am_parquet_file* f, int enabled);
+int     am_parquet_set_bloom_filters(am_parquet_file* f, int enabled);
+int64_t am_parquet_last_read_stats(am_parquet_file* f, int64_t* out, int64_t cap);
+
+// Filter text details (am_parquet_read_ex, am_parquet_selected_row_groups): the operator is the first
+// one after the column name, so a name cannot hold = ! < > or ;. Inside a double-quoted literal, `;` is
+// part of the string and \" and \\ stand for a quote and a backslash. An integer literal above
+// INT64_MAX is kept exact and compared as unsigned against a uint64 column's statistics. On a float or
+// double column `!=` never rules a row group or page out, since writers leave NaN out of min/max.
+
+// ---- Lakehouse tables: Delta Lake and Apache Iceberg (docs/LAKEHOUSE.md) --------------------------
+//
+// A table read resolves the table's metadata on the CPU (the Delta log and its checkpoints; the
+// Iceberg metadata JSON, manifest list and Avro manifests), prunes data files by partition values and
+// column statistics, and reads the surviving Parquet files with the GPU Parquet reader. The result is
+// a batch handle, used like am_parquet_batch: columns come out one at a time as am_array handles.
+//
+// `columns`: NULL reads every column of the table's schema; otherwise exactly the `n_columns` named.
+// `filters`: NULL or a `name<op><literal>` list as in am_parquet_read_ex (`x>3;s=="a"`). Unlike the
+// Parquet read, the filters here are applied to the rows too, so only matching rows come back; nulls
+// never match. A date literal may be written "YYYY-MM-DD" and a timestamp literal as ISO 8601.
+// Features the reader does not implement (Delta deletion vectors, column mapping mode id, unknown
+// reader features; Iceberg delete files) fail with an error naming the feature.
+typedef struct am_lakehouse_batch am_lakehouse_batch;   // opaque
+
+// Delta Lake: `path` is the table directory (holding _delta_log/). `version` -1 reads the latest; any
+// other negative version is an error.
+int     am_delta_read(const char* path, int64_t version, const char** columns, int64_t n_columns,
+                      const char* filters, am_lakehouse_batch** out);
+int64_t am_delta_latest_version(const char* path);          // -1 on error
+
+// Iceberg: `path` is a *.metadata.json file or a table directory (holding metadata/). With
+// `has_snapshot_id` 0 the current snapshot is read, otherwise `snapshot_id`.
+int     am_iceberg_read(const char* path, int64_t snapshot_id, int has_snapshot_id, const char** columns,
+                        int64_t n_columns, const char* filters, am_lakehouse_batch** out);
+// 0 and the id in *out; 3 when the table has no current snapshot; 1 on error.
+int     am_iceberg_current_snapshot(const char* path, int64_t* out);
+
+int64_t     am_lakehouse_batch_columns(am_lakehouse_batch* b);
+int64_t     am_lakehouse_batch_rows(am_lakehouse_batch* b);
+const char* am_lakehouse_batch_column_name(am_lakehouse_batch* b, int64_t i);
+int         am_lakehouse_batch_column(am_lakehouse_batch* b, int64_t i, am_array** out);
+// Six counters: files total, pruned by partition, pruned by statistics, read; manifests total, pruned.
+int         am_lakehouse_batch_stats(am_lakehouse_batch* b, int64_t* out);
+void        am_lakehouse_batch_release(am_lakehouse_batch* b);
+
+// ---------------------------------------------------------------------------------------------------
+// CSV, parsed on the GPU (docs/CSV.md)
+//
+// am_csv_open checks the file and copies the options; am_csv_read reads the file into one Metal buffer
+// (pread by default, or a no-copy mmap with file_access = 1) and does the work. A structure pass finds
+// every field and record boundary on the GPU (quote-aware: RFC 4180 with quoted delimiters and
+// newlines, "" as an escaped quote, CRLF / LF / CR line ends, a UTF-8 BOM, a missing final newline),
+// then each projected column is typed with pyarrow.csv's inference rules and converted by a compute
+// kernel straight into Metal shared memory. The options mirror pyarrow's ReadOptions, ParseOptions and
+// ConvertOptions and default to the same values; am_csv_options_init fills in those defaults.
+//
+// Column types are Arrow C Data Interface format strings: "n" "b" "c" "s" "i" "l" "C" "S" "I" "L" "f"
+// "g" "u" "z" "tdD" "tts" "ttm" "ttu" "ttn" and "ts{s,m,u,n}:" with an optional timezone.
+// Every non-zero return (and every -1 from a count) sets am_last_error(); parse and conversion errors
+// use pyarrow's wording ("CSV parse error: Row #3: Expected 3 columns, got 2: 4,5").
+typedef struct am_csv_reader am_csv_reader;          // opaque, one CSV file path plus its options
+typedef struct am_csv_batch am_csv_batch;            // opaque, the columns one read produced
+
+typedef struct am_csv_options {
+    int32_t delimiter;                          // ','
+    int32_t quote_char;                         // '"'; -1 turns quoting off (pyarrow's quote_char=False)
+    int32_t double_quote;                       // 1: "" inside quotes is one quote
+    int32_t decimal_point;                      // '.'
+    int64_t skip_rows;                          // lines skipped before the header (quotes ignored)
+    int64_t skip_rows_after_names;              // records skipped after the header
+    int32_t autogenerate_column_names;          // 0; 1 names the columns f0, f1, ...
+    int32_t include_missing_columns;            // 0; 1 returns a listed but absent column as nulls
+    const char* const* column_names;            // NULL: names come from the header row
+    int64_t n_column_names;
+    const char* const* include_columns;         // NULL or empty: every column, in file order
+    int64_t n_include_columns;
+    const char* const* column_type_names;       // parallel arrays: column name -> type format
+    const char* const* column_type_formats;
+    int64_t n_column_types;
+    const char* const* null_values;             // NULL: pyarrow's default list
+    int64_t n_null_values;
+    const char* const* true_values;             // NULL: "1", "True", "TRUE", "true"
+    int64_t n_true_values;
+    const char* const* false_values;            // NULL: "0", "False", "FALSE", "false"
+    int64_t n_false_values;
+    int32_t strings_can_be_null;                // 0
+    int32_t quoted_strings_can_be_null;         // 1
+    int32_t check_utf8;                         // 1: an inferred column that is not UTF-8 is binary
+    int32_t file_access;                        // 0: pread into a Metal buffer; 1: mmap, no copy
+    int64_t scan_block_bytes;                   // 0: the default (bytes per GPU thread in the scan)
+    // Byte lengths of the strings above, for names and values that hold NUL bytes. NULL (the default):
+    // every string of that array is NUL-terminated. Otherwise element i is the byte length of string i,
+    // which then need not be NUL-terminated. column_type_formats are always NUL-terminated.
+    const int64_t* column_names_lengths;
+    const int64_t* include_columns_lengths;
+    const int64_t* column_type_names_lengths;
+    const int64_t* null_values_lengths;
+    const int64_t* true_values_lengths;
+    const int64_t* false_values_lengths;
+} am_csv_options;
+
+void    am_csv_options_init(am_csv_options* options);
+// `options` may be NULL for the defaults. The strings (and length arrays) are copied; the caller keeps
+// ownership. delimiter, quote_char and decimal_point must be ASCII characters other than NUL.
+int     am_csv_open(const char* path, const am_csv_options* options, am_csv_reader** out);
+void    am_csv_close(am_csv_reader* r);
+int     am_csv_read(am_csv_reader* r, am_csv_batch** out);
+
+int64_t     am_csv_batch_rows(am_csv_batch* b);
+int64_t     am_csv_batch_columns(am_csv_batch* b);
+const char* am_csv_batch_column_name(am_csv_batch* b, int64_t i);
+// The byte length of that name (UTF-8, without the terminating NUL): a header field may hold NUL
+// bytes, which the C string above would cut short. -1 for a bad handle or index.
+int64_t     am_csv_batch_column_name_length(am_csv_batch* b, int64_t i);
+// Hands out a new am_array handle; release it with am_release.
+int         am_csv_batch_column(am_csv_batch* b, int64_t i, am_array** out);
+void        am_csv_batch_release(am_csv_batch* b);
+// am_last_error()'s message with its byte length in *length (may be NULL), for messages that quote a
+// value holding a NUL byte. The buffer is per thread and valid until the next call on that thread.
+const char* am_csv_last_error(int64_t* length);
+
+// ---- CPU/GPU router (docs/DESIGN.md, "CPU/GPU router")
+//
+// sum, min, max, compare, add/subtract/multiply, filter and the low-cardinality group-by sum
+// (at most 1024 keys) choose per call between the GPU kernel and a single-threaded CPU loop that
+// produces byte-identical Arrow output. The choice is a lookup in a crossover table generated by
+// Benchmarks/router_table.py from Benchmarks/results/router_2026-09-17.json, plus a multiply row
+// fitted from Benchmarks/results/router_check_2026-09-23_provisional.csv. Under the default mode
+// (auto) this applies to integer columns; float columns stay on the GPU. Inside a batch
+// (am_batch_begin) and for inputs whose length the open batch is still deciding, the GPU always runs.
+// Modes: 0 auto (the table), 1 gpu, 2 cpu (the CPU loop wherever one exists). The process mode starts
+// from the environment variable ARROWMETAL_ROUTER=auto|gpu|cpu; a per-thread override takes precedence.
+// Paths: 0 gpu, 1 cpu. Ops: 0 sum, 1 min, 2 max, 3 compare, 4 arithmetic, 5 filter, 6 group-by sum.
+int         am_router_set_mode(int mode);            // 0, or 2 for an unknown mode
+int         am_router_get_mode(void);
+int         am_router_set_thread_mode(int mode);     // -1 clears the calling thread's override
+int         am_router_get_thread_mode(void);         // -1 when no override is set
+// The last decision on the calling thread: 1 with the out-parameters filled (any may be NULL), or 0
+// when no routed operation ran on this thread since the last clear.
+int         am_router_last(int* op, int* path, int64_t* rows);
+// The last decision's reason as text, NULL when there is none. Thread-local; valid until the next
+// call of this function on the same thread.
+const char* am_router_last_reason(void);
+void        am_router_clear_last(void);
+int64_t     am_router_crossover(int op);             // rows; -1 for an unknown op
+// Op 4 (arithmetic) is the add/subtract row; multiply has its own crossover.
+int64_t     am_router_multiply_crossover(void);
+
+// Newline-delimited JSON, parsed on the GPU (docs/JSON.md)
+//
+// am_json_open reads the file into Metal shared memory; am_json_read parses every top-level object on the GPU and returns its
+// columns with the semantics of pyarrow.json.read_json: the same type inference (null, bool, int64,
+// double, timestamp[s] from ISO-8601 strings, string, struct, list), fields in order of first
+// appearance, a missing key read as null, and pyarrow's error texts for syntax errors, type
+// conflicts, repeated keys and unconvertible values. Every non-zero return sets am_last_error().
+typedef struct am_json_file am_json_file;      // opaque, one JSON input held in Metal shared memory
+typedef struct am_json_batch am_json_batch;    // opaque, the columns one read produced
+
+int   am_json_open(const char* path, am_json_file** out);
+// The same over bytes already in memory; they are copied once into a Metal buffer.
+int   am_json_open_buffer(const void* data, int64_t length, am_json_file** out);
+void  am_json_close(am_json_file* f);
+
+// explicit_schema: NULL to infer every field, or a struct ("+s") ArrowSchema whose children fix the
+// types of the fields they name; it is only read, the caller keeps ownership. The reader converts to
+// null (all-null values only, as pyarrow), bool, int8..int64, uint8..uint64, float, double, utf8,
+// timestamp (any unit, any timezone; timestamp[ns] holds 1677-09-21 to 2262-04-11), list and struct;
+// any other type is rejected with the field's path.
+// unexpected_field_behavior, for fields the schema does not name: 0 infer (appended after the schema's
+// fields), 1 ignore (dropped), 2 error ("JSON parse error: unexpected field").
+int am_json_read(am_json_file* f, const struct ArrowSchema* explicit_schema,
+                 int unexpected_field_behavior, am_json_batch** out);
+// The same with the explicit schema's field names given with their lengths, for names holding "\u0000"
+// (the ArrowSchema's C strings stop at the NUL): every struct field name of the schema depth-first
+// (through list items), each as a 4-byte little-endian length and its UTF-8 bytes, the layout
+// am_json_batch_column_names returns. NULL field_names reads the schema's C strings; a blob that ends
+// early or holds extra names is an error.
+int am_json_read_named(am_json_file* f, const struct ArrowSchema* explicit_schema,
+                       const uint8_t* field_names, int64_t field_names_length,
+                       int unexpected_field_behavior, am_json_batch** out);
+// The last error's bytes with their length: the message of a failed am_json_* call, whole even when
+// a key or value it quotes holds a NUL (where am_last_error()'s C string stops). *out is valid until
+// the next call to this function on this thread.
+int64_t am_json_last_error(const uint8_t** out);
+
+int64_t     am_json_batch_columns(am_json_batch* b);
+// Rows, which a file of empty objects still has when it has no columns.
+int64_t     am_json_batch_rows(am_json_batch* b);
+const char* am_json_batch_column_name(am_json_batch* b, int64_t i);
+// Every field name column i carries, with lengths, for keys that hold "\u0000" (where the C string above
+// and the C Data Interface's field names stop at the NUL): the column's name, then each struct field name
+// of its type in depth-first order (through list items), each as a 4-byte little-endian length and its
+// UTF-8 bytes. *out is valid until the batch is released. Returns the length in bytes, or -1.
+int64_t     am_json_batch_column_names(am_json_batch* b, int64_t i, const uint8_t** out);
+// Hands out a new am_array handle; release it with am_release.
+int         am_json_batch_column(am_json_batch* b, int64_t i, am_array** out);
+void        am_json_batch_release(am_json_batch* b);
+
 #ifdef __cplusplus
 }
 #endif
