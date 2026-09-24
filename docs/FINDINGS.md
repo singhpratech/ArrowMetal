@@ -2,6 +2,94 @@
 
 Things learned the hard way. Add to this whenever something surprises you.
 
+## Round 12 (2026-09-24): eight parts of the next release, and what their reviews found
+
+**TL;DR**
+
+- Eight pieces of the next release were built side by side, each on its own branch, each reviewed by an
+  independent reviewer asked to refute it, fixed, and rechecked: the CPU/GPU router, a Polars engine,
+  DuckDB plan rewriting, GPU CSV and NDJSON readers, the Parquet reader's nested and page-index gaps,
+  Delta Lake and Iceberg tables, and IPC view types, big-endian files and the tensor extension. Each was
+  merged through the full gate one at a time.
+- The reviews found seven bugs older than this work and one in pyarrow; the merges found two ways the
+  branches broke each other. Everything below is fixed on `main` with a test, except the pyarrow report,
+  which is drafted and not yet filed.
+- The merge gate itself had a hole: from 2026-09-08 to 2026-09-24 its Python suites loaded a stale
+  library. It now pins the build it tests and refuses to run otherwise.
+
+### 1. The gate tested the wrong library
+
+The Python package looks for its library in three places, and a copy bundled by a wheel build wins over
+the development build. The 2026-09-07 wheel build left such a copy in the checkout, the gate never said
+which library to load, and so every gate from 2026-09-08 on ran the Python suites and the differential
+against the 2026-09-07 build. The Swift suite and every worktree were unaffected. It surfaced when the
+IPC work's new Python tests failed with "view columns unsupported", which only the old library says.
+
+The gate now builds the library, exports its path, and stops unless Python reports loading exactly that
+file. Rerun against the fresh library, the differential gave the same counts as before (39,069 cases,
+0 unclassified) and the Python suites passed, so nothing had regressed behind the stale copy. The
+2026-09-17 crossover sweep, which the router's table comes from, was run the same way; it is rerun
+with the pinned library before the table is used for a release.
+
+### 2. A float literal of 2^63 or more ended the process
+
+The fused expression compiler converted every float literal to Int64, even when the target was a float,
+and Swift's `Int64(Double)` traps outside its range. `int64_column >= 1e19` or `x * 4.49e307` ended the
+host process. The Polars engine's reviewer found it through a division by a tiny literal. Float targets
+no longer compute the integer; an integer-typed literal that does not fit is an error that names it.
+
+### 3. Two same-named columns came back as one twice
+
+With no explicit projection, a stream looked every column up by name, so the second of two columns
+called `a` was replaced by a copy of the first: `am.scan_ipc(...).collect()` returned wrong data and no
+error. Found by the IPC work's reviewer on a union fixture. A batch with duplicate names now stays
+positional; batches with unique names keep the fused path.
+
+### 4. Skips recorded as failures
+
+Twenty-three IPC test assertions called the pyarrow helper inside `XCTAssertEqual`. When no pyarrow
+interpreter exists, the helper throws `XCTSkip`, and a skip thrown inside the assertion's autoclosure is
+recorded as a failure. Found by the router work, whose full-suite run showed 12 such failures on a clean
+environment. The helper now runs before the assertion.
+
+### 5. Four engine bugs the Polars engine had been working around
+
+The Polars engine's differential suite compared every plan it could take against Polars and found four
+wrong answers inside the engine. That work routed around them and pinned each with a strict expected
+failure; they were then fixed at the root, each with a test that fails on the old code:
+
+- A string filter wrote the bytes a null row still held over the next row's slot, turning "banana"
+  into "xanana". The gather kernel now copies the output slot's own width.
+- A Boolean column lost its null count through a sort inside a batch: results of an array whose count
+  was still pending copied the placeholder. They now count their own nulls after the flush.
+- A filter refused any batch that also carried a date32 column, because the expression compiler bound
+  every column, read or not. It binds only the ones the query reads.
+- A string sort returned wrong rows when a column held a null and a value of eight bytes or more: the
+  null partition read the sort's indices on the CPU before the GPU had written them. It now waits for
+  them. That makes such a sort about 15% slower at ten million rows than the old, wrong one; moving the
+  partition onto the GPU would win it back.
+
+The JSON reader's review found a fifth wrong answer, in new code: an explicit `timestamp[ns]` outside the
+years 1678 to 2261 wrapped around instead of raising, as pyarrow raises. It raises now.
+
+### 6. pyarrow drops NaN rows when statistics are present
+
+The Parquet work's reviewer found that ArrowMetal's own page skipping dropped a page holding a NaN under
+`!=`, because writers leave NaN out of min and max. After the fix, a test showed pyarrow doing the same
+at row-group level. Reproduced in plain pyarrow 25.0.1: `x != 5.0` over `[5, NaN, 5, 5]` returns `[nan]`
+in memory and from a file without statistics, and `[]` from a file with them; `~(x <= 10.0)` over
+`[1, NaN, 10]` behaves the same way. The cause is in
+`ParquetFileFragment::EvaluateStatisticsAsExpression`, unchanged on Arrow's main, and is distinct from
+the 2023 fix for NaN inside min or max (#28074). The same class of bug was fixed on our side in Delta
+partition pruning. The pyarrow report is drafted and not yet filed.
+
+### 7. Branches that merge as text can still break as code
+
+The Parquet work added a filter value for integers above INT64_MAX and changed how a MAP column is
+described. Both merged cleanly with the Delta and Iceberg work, and the merged tree then failed to
+build, and once built, failed 54 lakehouse tests: Delta checkpoints could no longer be read. Only a
+gate after each merge catches this. Both are fixed on main, with tests.
+
 ## Round 11 (2026-09-20): The three Metal findings reported to Apple
 
 **TL;DR**
