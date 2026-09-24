@@ -3,7 +3,8 @@
 ArrowMetal reads CSV with Metal compute kernels: the file's bytes go into one shared-memory buffer, a
 quote-aware scan finds every field and record boundary on the GPU, and each column is typed with
 `pyarrow.csv.read_csv`'s inference rules and converted by a kernel straight into Arrow arrays. The host
-reads the bytes only for a byte order mark, `skip_rows`, the header names and error messages.
+parses bytes only for a byte order mark, `skip_rows`, the header names, error messages and the rare float
+the GPU parser hands back (below).
 
 The oracle is `pyarrow.csv.read_csv`. For every file and option set in `python/tests/test_csv.py` the two
 readers return the same table — names, types, validity and values, floating point bit for bit — or fail

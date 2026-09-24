@@ -11,7 +11,8 @@ import Metal
 //        buffer), csv_classify (Arrow's type inference), one csv_conv_* kernel for the chosen type
 //
 // The host touches the bytes only for the BOM, `skipRows` (line counting, as pyarrow does it), the
-// header names and error messages. Columns that are not projected are never converted.
+// header names, error messages and the floats the GPU parser defers. Columns that are not projected
+// are never converted.
 
 /// A CSV file mapped for reading on the GPU. `read()` returns a Metal-resident record batch.
 ///
@@ -168,7 +169,7 @@ public final class CSVReader: @unchecked Sendable {
         return n
     }
 
-    // MARK: - fields on the host (header names and error messages only)
+    // MARK: - fields on the host (header names, error messages, deferred floats)
 
     /// Start and end of field `k`'s raw bytes, the host twin of `csv_raw`.
     func rawSpan(_ ev: UnsafePointer<UInt32>, _ k: Int, _ bytes: UnsafeRawBufferPointer, dataStart: Int) -> (Int, Int) {
