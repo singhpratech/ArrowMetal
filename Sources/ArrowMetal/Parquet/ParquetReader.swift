@@ -89,7 +89,15 @@ extension ParquetFile {
         try context.batch {
             for f in wanted {
                 names.append(f.name)
-                columns.append(try readField(f, rowGroups: groups, options: options))
+                var column = try readField(f, rowGroups: groups, options: options)
+                // A top-level column takes back what `ARROW:schema` says the Parquet schema lost; a leaf
+                // selected on its own by dotted path reads as the Parquet schema describes it.
+                if let top = fields.first(where: { $0.name == f.name }),
+                   top.leaves.map(\.index) == f.leaves.map(\.index),
+                   let stored = arrowField(for: top) {
+                    column = try applyArrowField(column, stored)
+                }
+                columns.append(column)
             }
         }
         if columns.isEmpty {

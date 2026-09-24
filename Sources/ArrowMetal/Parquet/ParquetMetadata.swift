@@ -158,7 +158,8 @@ public struct ParquetSchemaElement: Sendable {
         case .int64: return .integer(bitWidth: 64, signed: true)
         case .json: return .json
         case .bson: return .bson
-        case .interval: return .unknown
+        // INTERVAL has no logical-type equivalent; `.unknown` is the null type's annotation.
+        case .interval: return .none
         }
     }
 

@@ -199,6 +199,13 @@ Parquet on the GPU
   per field (`Parquet/ParquetNested.swift`). Checked value for value and type for type against
   `pyarrow.parquet.read_table` on files written by pyarrow, DuckDB and Polars
   (`Tests/Fixtures/generate_parquet_nested.py`, `ParquetNestedTests`, `python/tests/test_parquet_nested.py`).
+- The Parquet reader applies the file's `ARROW:schema` metadata: timestamp time zones, durations,
+  decimal32 / decimal64, fixed-size lists, dictionary (categorical) columns and extension types come back
+  as their stored Arrow types, at any depth for zones, durations and decimals; a column annotated
+  `UNKNOWN` reads as the `null` type rather than an all-null `int32`. Field and schema metadata are served
+  by `arrowFieldMetadata(column:)` / `arrowSchemaMetadata`, `am_parquet_field_metadata` /
+  `am_parquet_schema_metadata`, and carried on `read_parquet_table`'s Table. Absent or malformed
+  metadata is ignored (`ParquetArrowSchemaTests`).
 
 Out-of-core streaming
 - A streaming executor for datasets larger than memory (docs/STREAMING.md): Arrow IPC files/directories

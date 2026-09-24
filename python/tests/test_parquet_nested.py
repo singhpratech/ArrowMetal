@@ -38,20 +38,21 @@ def ids(p):
 #
 # The two places ArrowMetal's type differs from pyarrow's by design:
 #
-# 1. Offsets are 32-bit everywhere in ArrowMetal. A writer that records `large_string`,
-#    `large_binary` or `large_list` in its ARROW:schema (Polars does, for every string and list) reads
-#    as `string` / `binary` / `list` here, with the same values.
+# 1. Offsets are 32-bit everywhere in ArrowMetal, and it has no view layouts. A writer that records
+#    `large_string`, `large_binary`, `large_list`, `string_view`, `binary_view` or `list_view` in its
+#    ARROW:schema (Polars records the large ones for every string and list) reads as `string` /
+#    `binary` / `list` here, with the same values.
 # 2. The members of a struct (and the element of a list) are exported as nullable. A writer that
 #    declares a struct member `required` gets `not null` on that member from pyarrow and a nullable
 #    member here, with the same values.
 
 def narrow(t):
-    """`t` with every 64-bit-offset type replaced by its 32-bit twin, recursively."""
-    if pa.types.is_large_string(t):
+    """`t` with every 64-bit-offset or view type replaced by its 32-bit twin, recursively."""
+    if pa.types.is_large_string(t) or pa.types.is_string_view(t):
         return pa.string()
-    if pa.types.is_large_binary(t):
+    if pa.types.is_large_binary(t) or pa.types.is_binary_view(t):
         return pa.binary()
-    if pa.types.is_large_list(t) or pa.types.is_list(t):
+    if pa.types.is_large_list(t) or pa.types.is_list(t) or pa.types.is_list_view(t) or pa.types.is_large_list_view(t):
         return pa.list_(pa.field(t.value_field.name, narrow(t.value_type), t.value_field.nullable))
     if pa.types.is_map(t):
         return pa.map_(narrow(t.key_type), pa.field(t.item_field.name, narrow(t.item_type), t.item_field.nullable),
@@ -201,3 +202,156 @@ def test_damaged_nested_files_never_crash_the_process():
             "crashed (rc=%d) on %s: %s" % (r.returncode, seen[-1] if seen else "?",
                                            "\n".join(r.stderr.strip().splitlines()[-3:])))
         assert len(seen) == n
+
+
+# --------------------------------------------------------------------------- 4. ARROW:schema
+
+# `arrowschema__pa_types` and `arrowschema__pa_fslnull` have tests of their own below.
+ARROW_SCHEMA = sorted(p for p in glob.glob(os.path.join(NESTED, "arrowschema__*.parquet"))
+                      if ids(p) not in ("arrowschema__pa_types", "arrowschema__pa_fslnull"))
+
+
+def assert_same_schema_metadata(got, want):
+    for name in want.column_names:
+        assert got.schema.field(name).metadata == want.schema.field(name).metadata, name
+    assert got.schema.metadata == want.schema.metadata
+
+
+@pytest.mark.skipif(not ARROW_SCHEMA, reason="nested fixtures not generated")
+@pytest.mark.parametrize("path", ARROW_SCHEMA, ids=ids)
+def test_arrow_schema_matches_pyarrow(path):
+    """Values, types, field metadata and schema metadata, as pyarrow.parquet.read_table has them."""
+    got, want = am.read_parquet_table(path), pq.read_table(path)
+    assert_same_table(got, want)
+    for name in want.column_names:
+        if "polars" not in path:
+            assert got[name].type == want[name].type, name
+    assert_same_schema_metadata(got, want)
+
+
+def test_time_zones_come_back():
+    got = am.read_parquet_table(os.path.join(NESTED, "arrowschema__pa_plain_none.parquet"))
+    assert got["ts_paris"].type == pa.timestamp("us", tz="Europe/Paris")
+    # Parquet has no seconds or other units to lose here, but the zone is restored on the stored unit.
+    assert got["ts_ny_ms"].type == pa.timestamp("ms", tz="America/New_York")
+    assert got["ts_off_ns"].type == pa.timestamp("ns", tz="+05:30")
+    assert got["ts_utc"].type == pa.timestamp("us", tz="UTC")
+    assert got["ts_naive"].type == pa.timestamp("us")
+    # Inside a struct, a list and a map too.
+    assert got["inner_tz"].type.field("t").type == pa.timestamp("ms", tz="Asia/Tokyo")
+    assert got["inner_tz"].type.field("d").type == pa.duration("ms")
+    assert got["dur_list"].type.value_type == pa.duration("ns")
+    assert got["tz_map"].type.item_type == pa.timestamp("us", tz="Australia/Sydney")
+    # A column read dictionary-encoded carries the zone on its dictionary.
+    enc = am.read_parquet(os.path.join(NESTED, "arrowschema__pa_dict_snappy.parquet"), columns=["ts_paris"],
+                          dictionary=True)["ts_paris"].to_arrow()
+    assert enc.type == pa.dictionary(pa.int32(), pa.timestamp("us", tz="Europe/Paris"))
+
+
+def test_null_typed_column_reads_as_null():
+    for name in ("arrowschema__pa_plain_none", "arrowschema__pa_dict_snappy"):
+        got = am.read_parquet_table(os.path.join(NESTED, name + ".parquet"))
+        assert got["nothing"].type == pa.null()
+        assert got["nothing"].null_count == got.num_rows == 300
+    # The Parquet UNKNOWN annotation is what marks it, so it needs no ARROW:schema at all.
+    cols = am.read_parquet(os.path.join(NESTED, "arrowschema__pa_plain_none.parquet"), columns=["nothing"])
+    assert cols["nothing"].to_arrow().type == pa.null()
+
+
+def test_durations_come_back():
+    got = am.read_parquet_table(os.path.join(NESTED, "arrowschema__pa_plain_none.parquet"))
+    want = pq.read_table(os.path.join(NESTED, "arrowschema__pa_plain_none.parquet"))
+    assert got["dur_s"].type == pa.duration("s") and got["dur_us"].type == pa.duration("us")
+    assert got["dur_s"].to_pylist() == want["dur_s"].to_pylist()
+
+
+def test_field_metadata_and_field_id():
+    path = os.path.join(NESTED, "arrowschema__pa_plain_none.parquet")
+    f = am.ParquetFile(path)
+    assert f.field_metadata("price") == {b"currency": b"EUR", b"precision": b"cents"}
+    assert f.field_metadata("fid")[b"PARQUET:field_id"] == b"42"
+    assert f.field_metadata("fid")[b"note"] == b"has a field id"
+    assert f.field_metadata("ts_naive") == {}
+    assert f.schema_metadata == {b"source": b"generate_parquet_nested.py"}
+    got = f.read_table(columns=["price", "fid"])
+    want = pq.read_table(path, columns=["price", "fid"])
+    assert_same_schema_metadata(got, want)
+
+
+def test_extension_types():
+    path = os.path.join(NESTED, "arrowschema__pa_plain_none.parquet")
+    got, want = am.read_parquet_table(path), pq.read_table(path)
+    # arrow.uuid is registered in pyarrow, so both readers hand back the extension type.
+    assert got["u"].type == pa.uuid() == want["u"].type
+    # example.label is registered only by the generator: both readers see the storage type and keep
+    # the extension keys in the field metadata.
+    assert got["label"].type == pa.string() == want["label"].type
+    md = got.schema.field("label").metadata
+    assert md[b"ARROW:extension:name"] == b"example.label" and md[b"owner"] == b"fixtures"
+    assert got["rat"].type == want["rat"].type
+
+
+class _Label(pa.ExtensionType):
+    def __init__(self):
+        super().__init__(pa.string(), "example.label")
+
+    def __arrow_ext_serialize__(self):
+        return b""
+
+    @classmethod
+    def __arrow_ext_deserialize__(cls, storage_type, serialized):
+        return cls()
+
+
+def test_registered_extension_type_is_rebuilt():
+    path = os.path.join(NESTED, "arrowschema__pa_plain_none.parquet")
+    pa.register_extension_type(_Label())
+    try:
+        got, want = am.read_parquet_table(path, columns=["label"]), pq.read_table(path, columns=["label"])
+        assert isinstance(got["label"].type, _Label) and isinstance(want["label"].type, _Label)
+        assert got.schema.field("label").metadata == want.schema.field("label").metadata == {b"owner": b"fixtures"}
+        assert got["label"].to_pylist() == want["label"].to_pylist()
+    finally:
+        pa.unregister_extension_type("example.label")
+
+
+@pytest.mark.parametrize("name", ["arrowschema__pa_nostore", "arrowschema__pa_corrupt", "arrowschema__pa_truncated"])
+def test_absent_or_malformed_arrow_schema_is_ignored(name):
+    """No ARROW:schema, one that is not base64, one that is base64 of a truncated message: each reads
+    as the Parquet schema alone describes it, exactly as pyarrow does."""
+    path = os.path.join(NESTED, name + ".parquet")
+    got, want = am.read_parquet_table(path), pq.read_table(path)
+    assert_same_table(got, want)
+    assert got["ts_paris"].type == pa.timestamp("us", tz="UTC") == want["ts_paris"].type
+
+
+def test_arrow_types_parquet_cannot_name():
+    """decimal32 / decimal64, fixed_size_list, a dictionary (categorical) column and a zone on a
+    seconds timestamp come back as their stored Arrow types; the view and 64-bit-offset layouts come
+    back as their 32-bit, non-view twins with the same values -- and nothing else differs."""
+    path = os.path.join(NESTED, "arrowschema__pa_types.parquet")
+    got, want = am.read_parquet_table(path), pq.read_table(path)
+    for name in want.column_names:
+        assert got[name].to_pylist() == want[name].to_pylist(), name
+    assert got["d32"].type == pa.decimal32(7, 2) == want["d32"].type
+    assert got["d64"].type == pa.decimal64(15, 3) == want["d64"].type
+    assert got["fsl"].type == want["fsl"].type == pa.list_(pa.int32(), 3)
+    assert got["cat"].type == want["cat"].type == pa.dictionary(pa.int32(), pa.string())
+    assert got["ts_s_tz"].type == want["ts_s_tz"].type == pa.timestamp("ms", tz="Europe/Berlin")
+    assert (want["sv"].type, got["sv"].type) == (pa.string_view(), pa.string())
+    assert (want["ls"].type, got["ls"].type) == (pa.large_string(), pa.string())
+    assert (want["ll"].type, got["ll"].type) == (pa.large_list(pa.field("element", pa.int64())), pa.list_(pa.int64()))
+    assert (want["lv"].type, got["lv"].type) == (pa.list_view(pa.field("element", pa.int64())), pa.list_(pa.int64()))
+    for name in want.column_names:
+        assert got[name].type == narrow(want[name].type), name
+
+
+def test_fixed_size_list_with_null_rows():
+    """pyarrow 25 writes this file but its own reader rejects it; ArrowMetal reads the fixed-size
+    list back with its null rows (each padded with three null child slots, as the layout requires)."""
+    path = os.path.join(NESTED, "arrowschema__pa_fslnull.parquet")
+    with pytest.raises(pa.ArrowInvalid):
+        pq.read_table(path)
+    got = am.read_parquet_table(path)["fsl"]
+    assert got.type == pa.list_(pa.int32(), 3)
+    assert got.to_pylist() == [None if i % 7 == 0 else [i, -i, None if i % 5 == 0 else i * 2] for i in range(60)]

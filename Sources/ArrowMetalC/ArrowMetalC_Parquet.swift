@@ -330,3 +330,42 @@ public func am_parquet_batch_release(_ b: OpaquePointer?) {
     guard let b else { return }
     Unmanaged<BatchBox>.fromOpaque(UnsafeRawPointer(b)).release()
 }
+
+// MARK: - ARROW:schema metadata (docs/PARQUET.md, "The stored Arrow schema")
+
+/// Copies a metadata set into `out` as the C Data Interface metadata blob and returns its size; with a
+/// NULL `out` or a small `cap` nothing is copied and the size is still returned, so a caller asks twice.
+private func pqMetadataBlob(_ m: ArrowSchemaMetadata, _ out: UnsafeMutablePointer<UInt8>?, _ cap: Int64) -> Int64 {
+    guard !m.isEmpty else { return 0 }
+    let blob = m.encoded()
+    if let out, Int(cap) >= blob.count {
+        blob.withUnsafeBufferPointer { out.update(from: $0.baseAddress!, count: blob.count) }
+    }
+    return Int64(blob.count)
+}
+
+@_cdecl("am_parquet_field_metadata")
+public func am_parquet_field_metadata(_ f: OpaquePointer?, _ column: UnsafePointer<CChar>?,
+                                      _ out: UnsafeMutablePointer<UInt8>?, _ cap: Int64) -> Int64 {
+    guard let file = pqFile(f) else { return pqMissingFile("am_parquet_field_metadata") }
+    guard let column else {
+        pqBadArgument("am_parquet_field_metadata", "`column` is NULL")
+        return -1
+    }
+    guard cap >= 0 else {
+        pqBadArgument("am_parquet_field_metadata", "`cap` is \(cap), which is negative")
+        return -1
+    }
+    return pqMetadataBlob(file.arrowFieldMetadata(column: String(cString: column)), out, cap)
+}
+
+@_cdecl("am_parquet_schema_metadata")
+public func am_parquet_schema_metadata(_ f: OpaquePointer?, _ out: UnsafeMutablePointer<UInt8>?,
+                                       _ cap: Int64) -> Int64 {
+    guard let file = pqFile(f) else { return pqMissingFile("am_parquet_schema_metadata") }
+    guard cap >= 0 else {
+        pqBadArgument("am_parquet_schema_metadata", "`cap` is \(cap), which is negative")
+        return -1
+    }
+    return pqMetadataBlob(file.arrowSchemaMetadata, out, cap)
+}

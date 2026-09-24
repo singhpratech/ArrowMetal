@@ -13,6 +13,7 @@ Writers that are not installed are skipped with a message; the files are committ
 not need them.
 """
 import datetime
+import decimal
 import json
 import os
 import shutil
@@ -177,6 +178,10 @@ def metadata_table():
         pa.field("u", pa.uuid()),
         pa.field("label", LabelType(), metadata={"owner": "fixtures"}),
         pa.field("rat", RationalType()),
+        pa.field("fid", pa.int32(), metadata={"PARQUET:field_id": "42", "note": "has a field id"}),
+        pa.field("inner_tz", pa.struct([("t", pa.timestamp("ms", tz="Asia/Tokyo")), ("d", pa.duration("ms"))])),
+        pa.field("dur_list", pa.list_(pa.duration("ns"))),
+        pa.field("tz_map", pa.map_(pa.string(), pa.timestamp("us", tz="Australia/Sydney"))),
     ]
     cols = [
         pa.array(range(n), pa.int64()),
@@ -195,9 +200,36 @@ def metadata_table():
         pa.ExtensionArray.from_storage(RationalType(), pa.array(
             [None if i % 7 == 0 else {"num": i, "den": i % 5 + 1} for i in range(n)],
             pa.struct([("num", pa.int64()), ("den", pa.int64())]))),
+        pa.array([None if i % 3 == 0 else i for i in range(n)], pa.int32()),
+        pa.array([None if i % 11 == 0 else {"t": None if i % 4 == 0 else base // 1000 + i, "d": i * 7}
+                  for i in range(n)],
+                 pa.struct([("t", pa.timestamp("ms", tz="Asia/Tokyo")), ("d", pa.duration("ms"))])),
+        pa.array([None if i % 10 == 0 else [i * 1000 + t for t in range(i % 3)] for i in range(n)],
+                 pa.list_(pa.duration("ns"))),
+        pa.array([None if i % 12 == 0 else [("k%d" % t, base + i * t) for t in range(i % 2 + 1)] for i in range(n)],
+                 pa.map_(pa.string(), pa.timestamp("us", tz="Australia/Sydney"))),
     ]
     schema = pa.schema(fields, metadata={"source": "generate_parquet_nested.py"})
     return pa.Table.from_arrays(cols, schema=schema)
+
+
+def arrow_types_table():
+    """Arrow types Parquet cannot name, which only ARROW:schema carries: the first group comes back as
+    the original type, the second (view and 64-bit-offset layouts) as its 32-bit, non-view twin."""
+    n = 120
+    return pa.table({
+        "d32": pa.array([None if i % 9 == 0 else decimal.Decimal(i * 37 - 2000).scaleb(-2) for i in range(n)],
+                        pa.decimal32(7, 2)),
+        "d64": pa.array([None if i % 8 == 0 else decimal.Decimal(i * 1234567 - 10**8).scaleb(-3) for i in range(n)],
+                        pa.decimal64(15, 3)),
+        "fsl": pa.array([[i, None if i % 5 == 0 else -i, i * 2] for i in range(n)], pa.list_(pa.int32(), 3)),
+        "cat": pa.array([None if i % 6 == 0 else ["red", "green", "blue"][i % 3] for i in range(n)]).dictionary_encode(),
+        "ts_s_tz": pa.array([None if i % 4 == 0 else 1_700_000_000 + i for i in range(n)], pa.timestamp("s", tz="Europe/Berlin")),
+        "sv": pa.array([None if i % 5 == 0 else "view%d" % i for i in range(n)], pa.string_view()),
+        "ls": pa.array([None if i % 5 == 0 else "large%d" % i for i in range(n)], pa.large_string()),
+        "ll": pa.array([None if i % 4 == 0 else list(range(i % 3)) for i in range(n)], pa.large_list(pa.int64())),
+        "lv": pa.array([None if i % 3 == 0 else list(range(i % 4)) for i in range(n)], pa.list_view(pa.int64())),
+    })
 
 
 # ----------------------------------------------------------------------------- page index fixtures
@@ -291,6 +323,12 @@ def main():
     finally:
         pa.unregister_extension_type("example.rational")
         pa.unregister_extension_type("example.label")
+    write_pyarrow(arrow_types_table(), "arrowschema__pa_types", compression="snappy")
+    # A fixed_size_list with null rows: pyarrow 25 writes it but its own reader rejects the file
+    # ("Expected all lists to be of size=3"); the test pins what ArrowMetal reads instead.
+    write_pyarrow(pa.table({"fsl": pa.array([None if i % 7 == 0 else [i, -i, None if i % 5 == 0 else i * 2]
+                                             for i in range(60)], pa.list_(pa.int32(), 3))}),
+                  "arrowschema__pa_fslnull", compression="none")
     plain = pa.table({c: metadata_table()[c] for c in ("id", "ts_paris", "ts_utc", "ts_naive", "price")})
     write_polars(plain, "arrowschema__polars")
     # The same columns with no ARROW:schema at all, and with a corrupt one.

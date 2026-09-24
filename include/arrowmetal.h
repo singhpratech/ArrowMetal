@@ -1550,6 +1550,19 @@ int am_stream_join_group_by(am_stream* s, struct ArrowArrayStream* build, const 
                             const int* ops, const char** columns, const char** names, int64_t n_aggs,
                             int64_t dense_key_count, int ddof, am_stream_result** out);
 
+// ---------------------------------------------------------------------------------------------------
+// Parquet: the stored Arrow schema and page-index statistics (docs/PARQUET.md)
+//
+// A read already applies what the file's ARROW:schema key/value metadata says the Parquet schema lost:
+// time zones, durations and extension types. These two return the metadata a pyarrow Table would carry:
+// the custom metadata of one top-level column (plus PARQUET:field_id when the Parquet schema has one),
+// and the file's key/value metadata without ARROW:schema. Both write the C Data Interface metadata blob
+// (int32 count, then int32-length-prefixed key and value bytes, native endian) into `out` when `cap` is
+// large enough, and return its size in bytes: 0 when there is no metadata, -1 on a bad argument. Call
+// once with out = NULL to learn the size.
+int64_t am_parquet_field_metadata(am_parquet_file* f, const char* column, uint8_t* out, int64_t cap);
+int64_t am_parquet_schema_metadata(am_parquet_file* f, uint8_t* out, int64_t cap);
+
 #ifdef __cplusplus
 }
 #endif

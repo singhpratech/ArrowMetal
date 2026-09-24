@@ -4213,6 +4213,35 @@ _lib.am_parquet_write.argtypes = [ctypes.c_char_p, ctypes.POINTER(_P), ctypes.PO
                                   ctypes.c_int64, ctypes.c_char_p, ctypes.c_int, ctypes.c_int64]
 _lib.am_parquet_write.restype = ctypes.c_int
 
+# ---- Parquet: the stored Arrow schema and page-index statistics (docs/PARQUET.md)
+_lib.am_parquet_field_metadata.argtypes = [_P, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int64]
+_lib.am_parquet_field_metadata.restype = ctypes.c_int64
+_lib.am_parquet_schema_metadata.argtypes = [_P, ctypes.c_void_p, ctypes.c_int64]
+_lib.am_parquet_schema_metadata.restype = ctypes.c_int64
+
+
+def _parquet_metadata(call):
+    """Runs a size-then-fill metadata call and decodes the C Data Interface metadata blob
+    (int32 count, then int32-length-prefixed key and value bytes) into `{bytes: bytes}`."""
+    n = call(None, 0)
+    if n < 0:
+        _check(1)
+    if n == 0:
+        return {}
+    buf = (ctypes.c_uint8 * n)()
+    call(buf, n)
+    raw = bytes(buf)
+    count, = struct.unpack_from("=i", raw, 0)
+    pos, out = 4, {}
+    for _ in range(count):
+        kl, = struct.unpack_from("=i", raw, pos)
+        key = raw[pos + 4:pos + 4 + kl]
+        pos += 4 + kl
+        vl, = struct.unpack_from("=i", raw, pos)
+        out[key] = raw[pos + 4:pos + 4 + vl]
+        pos += 4 + vl
+    return out
+
 
 def _filter_text(filters):
     """`[("x", ">", 3), ("s", "==", "a")]` -> the ABI's `x>3;s=="a"` text."""
@@ -4416,7 +4445,35 @@ class ParquetFile:
         if not len(cols):
             return pa.table({})
         # Positional, so a projection naming a column twice gives a Table with both, as pyarrow does.
-        return pa.table([c.to_arrow() for c in cols.columns], names=cols.names)
+        arrays = [c.to_arrow() for c in cols.columns]
+        return pa.Table.from_arrays(arrays, schema=self._arrow_schema(cols.names, arrays))
+
+    # ---- the stored Arrow schema (docs/PARQUET.md, "The stored Arrow schema")
+    #
+    # A read already puts back the time zones, durations and extension types the file's ARROW:schema
+    # records. The field and schema metadata travel beside the arrays, the way pyarrow's Table carries
+    # them: `read_table` attaches both.
+
+    def field_metadata(self, column):
+        """A top-level column's custom metadata as `{bytes: bytes}` (what `pyarrow.parquet.read_table`
+        puts on the field), including `PARQUET:field_id` when the Parquet schema has one."""
+        return _parquet_metadata(lambda out, cap: _lib.am_parquet_field_metadata(self._h, str(column).encode(), out, cap))
+
+    @property
+    def schema_metadata(self):
+        """The file's key/value metadata without ARROW:schema, as `{bytes: bytes}`."""
+        return _parquet_metadata(lambda out, cap: _lib.am_parquet_schema_metadata(self._h, out, cap))
+
+    def _arrow_schema(self, names, arrays):
+        fields = []
+        for name, arr in zip(names, arrays):
+            md = self.field_metadata(name) or None
+            if md and isinstance(arr.type, pa.BaseExtensionType):
+                # A registered extension type consumes its two keys, as it does in pyarrow (which then
+                # keeps an empty metadata map rather than none).
+                md = {k: v for k, v in md.items() if not k.startswith(b"ARROW:extension:")}
+            fields.append(pa.field(name, arr.type, metadata=md))
+        return pa.schema(fields, metadata=self.schema_metadata or None)
 
 
 def read_parquet(path, columns=None, row_groups=None, filters=None, dictionary=True):

@@ -185,6 +185,7 @@ wrong data; that is the documented host fallback.
 |---|---|---|
 | `BOOLEAN` | `bool` | bit-packed `PLAIN` or `RLE` |
 | `INT32` | `int32` | |
+| `INT32` + `UNKNOWN` (Arrow's `null` type) | `null` | |
 | `INT32` + `INT(8\|16\|32, signed)` | `int8` / `int16` / `int32` | narrowed with the existing cast kernels |
 | `INT32` + `INT(8\|16\|32, unsigned)` | `uint8` / `uint16` / `uint32` | |
 | `INT32` + `DATE` | `date32` | |
@@ -192,7 +193,7 @@ wrong data; that is the documented host fallback.
 | `INT32` + `DECIMAL(p,s)` | `decimal128(p,s)` | widened on the GPU |
 | `INT64` | `int64` | |
 | `INT64` + `INT(64, unsigned)` | `uint64` | |
-| `INT64` + `TIMESTAMP(unit)` | `timestamp[unit]`, `UTC` when `isAdjustedToUTC` | |
+| `INT64` + `TIMESTAMP(unit)` | `timestamp[unit]`, `UTC` when `isAdjustedToUTC` | the stored zone instead of `UTC` when `ARROW:schema` has one, below |
 | `INT64` + `TIME(MICROS\|NANOS)` | `time64[us\|ns]` | |
 | `INT64` + `DECIMAL(p,s)` | `decimal128(p,s)` | |
 | `INT96` | `timestamp[ns]` | Julian day + nanoseconds, converted on the GPU |
@@ -229,6 +230,33 @@ Each of those is one flag kernel over the entries (`pq_nest_flags`), one prefix 
 reads the same levels the same way. A struct's leaves still read on their own by dotted path:
 `am.read_parquet(path, columns=["addr.city"])` returns the `city` leaf as a flat column, null wherever
 `addr` or `city` is null.
+
+### The stored Arrow schema
+
+Parquet has no time zone (only `isAdjustedToUTC`), no duration, no decimal32 / decimal64, no
+fixed-size list, no dictionary type, no extension types and no per-field metadata. Arrow writers —
+pyarrow, Arrow C++, Polars, arrow-rs — therefore store the original Arrow schema in the file's key/value
+metadata under `ARROW:schema` (base64 of an IPC `Schema` message), and the reader decodes it with the IPC
+FlatBuffers views in `IPC/FlatBuffers.swift` and puts back what the Parquet schema lost
+(`ParquetArrowSchema.swift`):
+
+| Stored Arrow type | Parquet stores | Comes back as |
+|---|---|---|
+| `timestamp[unit, tz=Z]` | `TIMESTAMP(isAdjustedToUTC)` | `timestamp[unit, tz=Z]`, on the stored unit (a seconds timestamp is stored, and read, as milliseconds) |
+| `duration[unit]` | plain `INT64` | `duration[unit]` |
+| `decimal32(p,s)` / `decimal64(p,s)` | `INT32` / `INT64` `DECIMAL` | `decimal32(p,s)` / `decimal64(p,s)` |
+| `fixed_size_list<T>[n]` | a list | `fixed_size_list<T>[n]`; a null row gets `n` null child slots |
+| `dictionary<int32, T>` (a pandas categorical) | the values | dictionary encoded, whatever the `dictionary` switch says |
+| an extension type | its storage | the storage wrapped in `MetalExtensionArray`, so a consumer that knows the type rebuilds it |
+| field `custom_metadata` | — | `ParquetFile.arrowFieldMetadata(column:)`, `am_parquet_field_metadata`, `f.field_metadata(column)`, and on every field of `read_parquet_table`'s Table |
+
+Time zones, durations and decimals are restored inside structs, lists and maps too. The file's other
+key/value metadata is the schema metadata (`arrowSchemaMetadata`, `am_parquet_schema_metadata`,
+`f.schema_metadata`), and a Parquet `field_id` shows up as `PARQUET:field_id`, as it does in pyarrow.
+The `null` type needs no stored schema: Parquet annotates a null column `UNKNOWN`, which reads as `null`.
+A file without `ARROW:schema`, or with one that is not base64 or does not decode as a Schema message,
+reads exactly as its Parquet schema describes it. A leaf read on its own by dotted path always reads as
+the Parquet schema describes it.
 
 ## Projection and predicate pushdown
 
@@ -403,13 +431,20 @@ int64, float64, string, bool and timestamp columns, uncompressed and Snappy; `Pa
   and every writer's and variant's file against every other's, row by row.
 - `python/tests/test_parquet_nested.py` reads every nested fixture with ArrowMetal and with
   `pyarrow.parquet.read_table` and requires the same values and the same types, apart from the two
-  differences listed under Limits (32-bit offsets, nullable struct members), each of which has its own test
-  showing the difference is exactly that; it also damages nested files 200 ways and requires every read to
-  raise or return rather than crash.
+  differences listed under Limits (32-bit offsets and no view layouts, nullable struct members), each of
+  which has its own test showing the difference is exactly that; it also damages nested files 200 ways and
+  requires every read to raise or return rather than crash.
+- The same generator writes the `ARROW:schema` fixtures: time zones on every unit (named zones, a fixed
+  offset, UTC, naive), the `null` type, durations, decimal32 / decimal64, a fixed-size list, a categorical,
+  field metadata and a `field_id`, a registered (`arrow.uuid`) and two unregistered extension types, zones
+  and durations inside a struct, a list and a map, the view and 64-bit-offset layouts, and the same columns
+  with no `ARROW:schema`, with one that is not base64 and with one that is a truncated message.
+  `ParquetArrowSchemaTests` and the `ARROW:schema` half of `test_parquet_nested.py` check types, values,
+  field metadata and schema metadata against pyarrow.
 
 ```
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter "ParquetTests|ParquetWriterTests|ParquetNestedTests"
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test -c release --filter "ParquetTests|ParquetWriterTests|ParquetNestedTests"
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter "ParquetTests|ParquetWriterTests|ParquetNestedTests|ParquetArrowSchemaTests"
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test -c release --filter "ParquetTests|ParquetWriterTests|ParquetNestedTests|ParquetArrowSchemaTests"
 swift build -c release --product ArrowMetalC
 PYTHONPATH=python python -m pytest python/tests/test_parquet.py python/tests/test_parquet_nested.py -q
 ARROWMETAL_PARQUET_BIG=1 PYTHONPATH=python python -m pytest python/tests/test_parquet.py -q -k fifty
@@ -431,18 +466,15 @@ ARROWMETAL_PARQUET_BIG=1 PYTHONPATH=python python -m pytest python/tests/test_pa
   `min_value`/`max_value` are absent (they use a signed byte order that is wrong for strings, which is why
   Parquet deprecated them).
 - **ZSTD needs libzstd** installed; see above.
-- **A timestamp column's time zone is not recovered.** Parquet records only `isAdjustedToUTC`, so an
-  adjusted column comes back as `timestamp[unit, tz=UTC]` where `pyarrow.parquet.read_table` reads the
-  original zone out of the file's `ARROW:schema` key/value metadata, which this reader ignores. The
-  instants are identical; the type differs for any zone other than UTC.
 - **The members of a struct and the element of a list are exported as nullable.** A writer that declares
   a struct member `required` gets `not null` on that member from `pyarrow.parquet.read_table`; the values
   are the same, and the member reads as nullable here.
-- **`large_string`, `large_binary` and `large_list` come back 32-bit.** ArrowMetal narrows 64-bit offsets
-  everywhere, so a column pyarrow reads as `large_string` reads here as `string`, with the same values.
+- **`large_string`, `large_binary` and `large_list` come back 32-bit, and the view types as their
+  non-view twins.** ArrowMetal narrows 64-bit offsets everywhere and has no view layouts, so a column
+  whose stored Arrow type is `large_string` or `string_view` reads here as `string`, `large_list` or
+  `list_view` as `list`, with the same values. Polars records `large_string` / `large_list` for every
+  string and list column it writes.
 - **`decimal256` (precision above 38) is rejected**, as is any Arrow type ArrowMetal does not carry.
-- **A `null`-typed column reads as an all-null `int32`**, because Parquet has no physical null type and
-  the Arrow `null` annotation lives in the metadata this reader ignores.
 - **A dictionary-encoded column decodes itself where the kernels cannot use the codes.** `read_parquet`
   returns dictionary-encoded columns encoded (`dictionary=False`, which `read_parquet_table` passes,
   materialises them instead), and the entry points that need the values rather than the codes decode

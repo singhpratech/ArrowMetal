@@ -46,6 +46,8 @@ public final class ParquetFile: @unchecked Sendable {
     /// The Arrow-level fields this file exposes: leaves, lists, maps and structs, at any depth.
     public let fields: [ParquetField]
     public let context: MetalContext
+    /// The decoded `ARROW:schema` key/value metadata, when present and well formed (`ParquetArrowSchema.swift`).
+    let cachedArrowSchema: [ParquetArrowField]?
 
     let fd: Int32
     let fileSize: Int
@@ -95,6 +97,7 @@ public final class ParquetFile: @unchecked Sendable {
             self.leaves = built.leaves
             self.fields = built.fields
         } catch { close(fd); throw error }
+        self.cachedArrowSchema = ParquetFile.decodeArrowSchema(metadata.keyValueMetadata)
     }
 
     /// A Metal buffer covering `range` of the file, plus the offset of `range.lowerBound` inside it.
