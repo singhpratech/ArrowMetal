@@ -378,6 +378,7 @@ Arrow type matrix and the interop status.
   Interface import, C Device Data Interface import/export, `MTLBuffer` recovery from our own exports.
 - `ArrowIPCReader` / `ArrowIPCWriter`: the Arrow IPC streaming and file formats, including a minimal
   FlatBuffers reader and builder, with no dependencies. Cross-checked against pyarrow in both directions.
+- Delta Lake and Apache Iceberg tables (`am.read_delta`, `am.read_iceberg`): metadata on the CPU, data files through the GPU Parquet reader ([docs/LAKEHOUSE.md](docs/LAKEHOUSE.md)).
 - A CPU reference implementation behind the kernels, used as the oracle in tests.
 
 ## Design notes

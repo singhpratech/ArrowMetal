@@ -346,6 +346,38 @@ def test_column_mapping_reads_the_source_data():
     assert t.sort_by("id")["region"].to_pylist()[:3] == ["north", "south", "north"]
 
 
+@needs_delta
+def test_column_mapping_reference_readers_return_nulls():
+    """The difference docs/LAKEHOUSE.md records, pinned to the versions it names."""
+    path = os.path.join(FIXTURES, "delta", "column_mapping")
+    if dl.__version__ != "1.6.5":
+        pytest.skip("recorded against deltalake 1.6.5")
+    ref = dl.DeltaTable(path).to_pyarrow_table()
+    assert ref.num_rows == 9 and ref["id"].null_count == 9 and ref["total"].null_count == 9
+    pl = pytest.importorskip("polars")
+    if pl.__version__ == "1.44.1":
+        df = pl.read_delta(path)
+        assert df.height == 9 and df["id"].null_count() == 9
+    assert am.read_delta_table(path)["id"].null_count == 0
+
+
+@needs_iceberg
+def test_time_travel_filters_use_the_snapshot_schema(monkeypatch):
+    """`amount` was renamed to `total` after the first snapshots: pyiceberg binds a time-travel filter
+    to the current schema and does not find `amount`; ArrowMetal resolves it in the snapshot's schema."""
+    monkeypatch.chdir(FIXTURES)
+    meta = sorted(glob.glob(os.path.join("iceberg", "v2_partitioned", "metadata", "*.metadata.json")))[-1]
+    static = StaticTable.from_metadata(meta)
+    first = static.metadata.snapshots[1].snapshot_id
+    from pyiceberg.expressions import GreaterThanOrEqual
+    with pytest.raises(ValueError, match="amount"):
+        static.scan(snapshot_id=first, row_filter=GreaterThanOrEqual("amount", 10.0)).to_arrow()
+    got = am.read_iceberg_table(os.path.join(FIXTURES, meta), snapshot_id=first, filters=[("amount", ">=", 10.0)])
+    full = static.scan(snapshot_id=first).to_arrow()
+    expected = full.filter(pc.greater_equal(full["amount"], 10.0))
+    assert normalise(got) == normalise(expected)
+
+
 def test_iceberg_v1_manifests_listed_in_the_snapshot(tmp_path):
     """A format v1 snapshot may list its manifests directly instead of through a manifest list."""
     pytest.importorskip("pyiceberg")

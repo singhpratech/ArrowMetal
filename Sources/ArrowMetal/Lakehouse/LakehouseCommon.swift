@@ -881,6 +881,35 @@ enum LakeDataFile {
         }
     }
 
+    /// Runs `body` for every data file, several files at a time, and returns the batches in file order.
+    ///
+    /// Each file's decode is a chain of small kernels with a few CPU round trips in between (page
+    /// totals, offsets), so a table of many files spends most of a serial read waiting. Command buffers
+    /// are per thread in `MetalContext`, so files read on different threads overlap those waits with
+    /// each other's GPU work. The first error, in file order, is rethrown.
+    static func readAll(count: Int, body: @escaping (Int) throws -> MetalRecordBatch) throws -> [MetalRecordBatch] {
+        if count == 0 { return [] }
+        let width = Swift.min(count, Swift.max(1, Swift.min(ProcessInfo.processInfo.activeProcessorCount, 8)))
+        if width == 1 { return try (0..<count).map(body) }
+        var results = [Result<MetalRecordBatch, Error>?](repeating: nil, count: count)
+        let lock = NSLock()
+        var next = 0
+        DispatchQueue.concurrentPerform(iterations: width) { _ in
+            while true {
+                lock.lock()
+                let i = next
+                next += 1
+                lock.unlock()
+                if i >= count { return }
+                let r = Result { try body(i) }
+                lock.lock()
+                results[i] = r
+                lock.unlock()
+            }
+        }
+        return try results.map { try $0!.get() }
+    }
+
     /// Empty columns with the table's types, for a scan that selects no files.
     static func empty(_ fields: [LakehouseField], context: MetalContext = .shared) throws -> MetalRecordBatch {
         let cols = try fields.map { try LakeColumns.constant($0.type, nil, length: 0, context: context, column: $0.name) }

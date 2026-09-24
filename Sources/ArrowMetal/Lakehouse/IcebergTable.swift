@@ -662,11 +662,12 @@ public final class IcebergTable: @unchecked Sendable {
         }
         let (files, stats) = try plan(snapshotId: snapshotId, schema: schema, filters: resolved)
         let nameMapping = Self.parseNameMapping(properties["schema.name-mapping.default"])
-        var batches: [MetalRecordBatch] = []
-        for df in files {
-            let local = try resolve(df.path)
+        let specs = self.specs
+        let batches = try LakeDataFile.readAll(count: files.count) { [fields, rowFilters, context] i in
+            let df = files[i]
+            let local = try self.resolve(df.path)
             let spec = specs.first { $0.specId == df.specId }
-            let b = try LakeDataFile.read(path: local, fields: fields, resolve: { pf in
+            return try LakeDataFile.read(path: local, fields: fields, resolve: { pf in
                 let byId = Self.parquetNamesById(pf, nameMapping: nameMapping)
                 return fields.map { f -> LakeColumnSource in
                     if let id = f.id, let n = byId[id] { return .parquet(n) }
@@ -690,7 +691,6 @@ public final class IcebergTable: @unchecked Sendable {
                     return ParquetFilter(column: n, op: ParquetFilter.Op(f.op), value: v)
                 }
             }, rowFilters: rowFilters, context: context)
-            batches.append(b)
         }
         return LakehouseScan(batch: try LakeDataFile.finish(batches, fields: fields, keep: keep, context: context),
                              stats: stats)

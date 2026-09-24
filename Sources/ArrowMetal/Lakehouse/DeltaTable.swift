@@ -570,11 +570,12 @@ extension DeltaSnapshot {
             return ParquetFilter(column: f.field.physicalName, op: ParquetFilter.Op(f.op), value: v)
         }
         let (selected, stats) = try plan(resolved)
-        var batches: [MetalRecordBatch] = []
-        for file in selected {
+        let root = tablePath
+        let batches = try LakeDataFile.readAll(count: selected.count) { [fields] i in
+            let file = selected[i]
             let local = try LakePath.local(file.path.contains("://") || file.path.hasPrefix("file:") ? file.path
-                                           : LakePath.join(tablePath, file.path.removingPercentEncoding ?? file.path))
-            let b = try LakeDataFile.read(path: local, fields: fields, resolve: { pf in
+                                           : LakePath.join(root, file.path.removingPercentEncoding ?? file.path))
+            return try LakeDataFile.read(path: local, fields: fields, resolve: { pf in
                 try fields.map { f -> LakeColumnSource in
                     if parts.contains(f.name) {
                         let raw = file.partitionValues[f.physicalName] ?? nil
@@ -583,7 +584,6 @@ extension DeltaSnapshot {
                     return pf.fields.contains(where: { $0.name == f.physicalName }) ? .parquet(f.physicalName) : .constant(nil)
                 }
             }, rowGroupFilters: { _ in rowGroupFilters }, rowFilters: rowFilters, context: context)
-            batches.append(b)
         }
         return LakehouseScan(batch: try LakeDataFile.finish(batches, fields: fields, keep: keep, context: context),
                              stats: stats)

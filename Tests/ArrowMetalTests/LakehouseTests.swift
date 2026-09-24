@@ -204,6 +204,84 @@ final class LakehouseTests: XCTestCase {
         }
     }
 
+    private func tempDir() throws -> URL {
+        let d = FileManager.default.temporaryDirectory.appendingPathComponent("am-lh-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }
+
+    private func writeCommit(_ dir: URL, _ version: Int, _ actions: [[String: Any]]) throws {
+        let log = dir.appendingPathComponent("_delta_log")
+        try FileManager.default.createDirectory(at: log, withIntermediateDirectories: true)
+        let lines = try actions.map { String(decoding: try JSONSerialization.data(withJSONObject: $0), as: UTF8.self) }
+        try (lines.joined(separator: "\n") + "\n").write(to: log.appendingPathComponent(String(format: "%020d.json", version)),
+                                                        atomically: true, encoding: .utf8)
+    }
+
+    /// Reader protocol 3 with only the features this reader implements reads normally.
+    func testDeltaReaderFeaturesItImplements() throws {
+        let tmp = try tempDir()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let t = tmp.appendingPathComponent("t")
+        try FileManager.default.copyItem(atPath: try fixture("delta/basic"), toPath: t.path)
+        try writeCommit(t, 5, [["protocol": ["minReaderVersion": 3, "minWriterVersion": 7,
+                                             "readerFeatures": ["columnMapping", "timestampNtz", "vacuumProtocolCheck"],
+                                             "writerFeatures": ["columnMapping", "timestampNtz"]]]])
+        let s = try DeltaTable(path: t.path).snapshot()
+        XCTAssertEqual(s.version, 5)
+        XCTAssertEqual(s.protocolAction.minReaderVersion, 3)
+        XCTAssertEqual(try Self.rows(DeltaTable(path: t.path).read()), try Self.rows(DeltaTable(path: try fixture("delta/basic")).read()))
+    }
+
+    func testNestedColumnsAndRemotePaths() throws {
+        let tmp = try tempDir()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let schema = #"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}},"#
+            + #"{"name":"s","type":{"type":"struct","fields":[{"name":"a","type":"long","nullable":true,"metadata":{}}]},"nullable":true,"metadata":{}}]}"#
+        let meta: [String: Any] = ["id": "x", "format": ["provider": "parquet", "options": [String: String]()],
+                                   "schemaString": schema, "partitionColumns": [String](), "configuration": [String: String]()]
+        try writeCommit(tmp, 0, [["protocol": ["minReaderVersion": 1, "minWriterVersion": 2]], ["metaData": meta]])
+        let t = try DeltaTable(path: tmp.path)
+        XCTAssertThrowsError(try t.read()) { e in
+            guard case LakehouseError.unsupportedFeature(let m) = e else { return XCTFail("\(e)") }
+            XCTAssert(m.contains("column s has nested type struct"), m)
+        }
+        XCTAssertEqual(try t.read(columns: ["id"]).length, 0)          // no files yet: an empty id column
+        try writeCommit(tmp, 1, [["add": ["path": "s3://bucket/part-0.parquet", "partitionValues": [String: String](),
+                                          "size": 10, "modificationTime": 0, "dataChange": true]]])
+        XCTAssertThrowsError(try t.read(columns: ["id"])) { e in
+            XCTAssert("\(e)".contains("s3:// storage"), "\(e)")
+        }
+
+        // Iceberg: a table with a struct column and no snapshot yet.
+        let ice = tmp.appendingPathComponent("ice/metadata")
+        try FileManager.default.createDirectory(at: ice, withIntermediateDirectories: true)
+        let im: [String: Any] = [
+            "format-version": 2, "table-uuid": "u", "location": "file:///elsewhere/ice", "last-column-id": 3,
+            "current-schema-id": 0,
+            "schemas": [["type": "struct", "schema-id": 0, "fields": [
+                ["id": 1, "name": "id", "required": false, "type": "long"],
+                ["id": 2, "name": "s", "required": false,
+                 "type": ["type": "struct", "fields": [["id": 3, "name": "a", "required": false, "type": "int"]]]]]]],
+            "partition-specs": [["spec-id": 0, "fields": [[String: Any]]()]], "default-spec-id": 0,
+            "current-snapshot-id": -1, "snapshots": [[String: Any]]()]
+        try JSONSerialization.data(withJSONObject: im).write(to: ice.appendingPathComponent("00000-a.metadata.json"))
+        let it = try IcebergTable(path: tmp.appendingPathComponent("ice").path)
+        XCTAssertNil(it.currentSnapshotId)
+        XCTAssertThrowsError(try it.read()) { e in XCTAssert("\(e)".contains("column s has nested type struct"), "\(e)") }
+        let empty = try it.read(columns: ["id"])
+        XCTAssertEqual(empty.length, 0)
+        XCTAssertEqual(empty.columns[0].arrowFormat, "l")
+
+        // gzip-compressed metadata is refused by name.
+        let gz = tmp.appendingPathComponent("gz/metadata")
+        try FileManager.default.createDirectory(at: gz, withIntermediateDirectories: true)
+        try Data([0x1F, 0x8B]).write(to: gz.appendingPathComponent("00000-a.gz.metadata.json"))
+        XCTAssertThrowsError(try IcebergTable(path: tmp.appendingPathComponent("gz").path)) { e in
+            XCTAssert("\(e)".contains("gzip-compressed"), "\(e)")
+        }
+    }
+
     // MARK: - Iceberg
 
     func testIcebergMetadataLocation() throws {

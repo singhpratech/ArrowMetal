@@ -192,6 +192,16 @@ Parquet on the GPU
   decode as Metal kernels straight into shared-memory Arrow arrays. ZSTD/GZIP/BROTLI pages decompress on
   the host. Row-group and column selection, nested lists; a small host-side writer for round trips.
   `am.read_parquet(path)` in Python, `ParquetReader` in Swift.
+- Delta Lake and Apache Iceberg tables (docs/LAKEHOUSE.md): `am.read_delta` / `am.read_iceberg` (and
+  `*_table` for a pyarrow.Table), `DeltaTable` / `IcebergTable` in Swift, `am_delta_read` /
+  `am_iceberg_read` in C. The Delta log (JSON commits, single and multi-part checkpoints read with the GPU
+  Parquet reader) and the Iceberg metadata (v1 and v2, Avro manifest lists and manifests through a small
+  CPU Avro reader with the null, deflate and snappy codecs) are resolved on the CPU; time travel, partition
+  columns, Delta column mapping `none`/`name`, Iceberg columns by field id (renames, added columns, int to
+  long); filters prune files by partition values and statistics and are applied to the rows. Unimplemented
+  reader features (deletion vectors, column mapping `id`, Iceberg delete files, unknown features) are
+  refused with an error naming them. Checked against `deltalake` 1.6.5 and pyiceberg 0.12.0
+  (`LakehouseTests`, `python/tests/test_lakehouse.py`); `Benchmarks/lakehouse_bench.py` for timings.
 
 Out-of-core streaming
 - A streaming executor for datasets larger than memory (docs/STREAMING.md): Arrow IPC files/directories
