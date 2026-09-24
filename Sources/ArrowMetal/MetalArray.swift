@@ -463,6 +463,8 @@ public final class MetalBooleanArray: @unchecked Sendable {
         guard let v = rawValidity else { _nullCount = 0; return }
         let off = offset
         if context.isBatching {
+            // Pending with its length known: dispatches size by `_capacityLength` while pending.
+            if !pending { _capacityLength = _length }
             pending = true
             try? context.afterFlush { [self] in
                 self._nullCount = self._length - Bitmap.popcount(v.typed(UInt8.self), from: off, bits: self._length)
@@ -503,11 +505,17 @@ public final class MetalBooleanArray: @unchecked Sendable {
 // MARK: - Pending propagation (batched execution)
 
 extension MetalArray {
-    /// Element-wise results of a pending input are pending too, with the same length source.
+    /// Element-wise results of a pending input are pending too, with the same length source. An input
+    /// whose length is known but whose null count the open batch has still to produce (a `take`'s
+    /// output: `recomputeNullCount` defers the popcount to the flush) hands the result a count it
+    /// copied too early, so the result counts its own nulls after the flush instead.
     func inheritPending<R: PendingCarrier>(_ r: R) -> R {
-        if pending, let lb = _lengthBuffer {
+        guard pending else { return r }
+        if let lb = _lengthBuffer {
             r.markPending(capacity: capacityLength, lengthBuffer: lb)
             context.retainUntilFlush(self)
+        } else {
+            r.recomputeNullCount()
         }
         return r
     }
@@ -523,10 +531,14 @@ extension MetalArray {
 }
 
 extension MetalBooleanArray {
+    /// As `MetalArray.inheritPending`.
     func inheritPending<R: PendingCarrier>(_ r: R) -> R {
-        if pending, let lb = _lengthBuffer {
+        guard pending else { return r }
+        if let lb = _lengthBuffer {
             r.markPending(capacity: capacityLength, lengthBuffer: lb)
             context.retainUntilFlush(self)
+        } else {
+            r.recomputeNullCount()
         }
         return r
     }
@@ -544,6 +556,7 @@ protocol PendingCarrier: AnyObject {
     var pendingLengthBuffer: MetalArrowBuffer? { get }
     var resolvedLength: Int { get }
     func markPending(capacity: Int, lengthBuffer: MetalArrowBuffer)
+    func recomputeNullCount()
 }
 
 extension MetalArray: PendingCarrier {
@@ -552,7 +565,13 @@ extension MetalArray: PendingCarrier {
     var resolvedLength: Int { length }
     func markPending(capacity: Int, lengthBuffer: MetalArrowBuffer) {
         capacityLength = capacity
-        deferLength(from: lengthBuffer) {}
+        // The count copied from the pending input is its placeholder; count from the bitmap once the
+        // length is known, as `MetalBooleanArray.markPending` does.
+        deferLength(from: lengthBuffer) { [self] in
+            if let v = rawValidity {
+                _nullCount = _length - Bitmap.popcount(v.typed(UInt8.self), from: offset, bits: _length)
+            }
+        }
     }
 }
 extension MetalBooleanArray: PendingCarrier {

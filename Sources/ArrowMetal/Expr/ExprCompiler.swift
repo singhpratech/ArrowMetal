@@ -198,10 +198,14 @@ enum ExprCompiler {
     static func run(_ q: ExprQuery, names: [String], columns: [AnyMetalArray],
                     context: MetalContext) throws -> ExprQueryResult {
         guard names.count == columns.count else { throw ExprError.invalid("names/columns count mismatch") }
-        var inputs: [String: Input] = [:]
-        for (i, n) in names.enumerated() where inputs[n] == nil { inputs[n] = try input(columns[i], name: n) }
-
+        // Only the columns the query reads become kernel inputs: a batch may carry columns of a type
+        // the compiler does not read (a date32, a list), and carrying one is no reason to refuse it.
         let used = referencedColumns(q)
+        let wanted = Set(used)
+        var inputs: [String: Input] = [:]
+        for (i, n) in names.enumerated() where inputs[n] == nil && wanted.contains(n) {
+            inputs[n] = try input(columns[i], name: n)
+        }
         var n = 0, knownLength = -1
         var lengthBuffer: MetalArrowBuffer? = nil
         for name in used {

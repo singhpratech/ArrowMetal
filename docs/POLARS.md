@@ -451,9 +451,7 @@ Read from the installed package and checked by `python/tests/test_polars_engine.
 
 Everything else -- `%`, `//`, `eq_missing`, `str.ends_with`, regex, windows (`over`), `rank`,
 `median`, an expression over an aggregate, a String-valued output, a narrowing or fallible cast,
-true division by a scalar that is not a plain literal, a finite float literal of magnitude 2^63
-or more (directly, or as the reciprocal of a divisor such as `2.0**-1022`: ArrowMetal's expression
-compiler converts every float literal to Int64 as well, which traps the process for such a value),
+true division by a scalar that is not a plain literal,
 a column name holding a NUL byte (Polars' own Arrow export panics on one) -- falls back, and the
 report says which one. Categorical, Enum, Decimal, List, Struct, Null, Binary
 and Object columns in a subtree's input keep the whole subtree on Polars.
@@ -495,24 +493,27 @@ Each line is a differential case in `test_polars_engine.py`, run against Polars 
 * **Integer overflow** wraps in both (checked on Int8 and Int64 extremes), and an integer true
   division by zero is IEEE in both.
 
-### Four ArrowMetal behaviours the engine works around
+### ArrowMetal behaviours this suite found, now fixed in the engine
 
-Found by this suite, pinned by strict `xfail` tests in `test_polars_engine.py` that start failing
-the day each is fixed in the engine, which is the signal to drop the workaround:
+Each was first worked around here and pinned by a strict `xfail`; each is now fixed in ArrowMetal,
+its test in `test_polars_engine.py` passes, and the workaround is gone
+(`test_engine_takes_the_plans_it_once_worked_around` runs the plans the engine once changed or
+declined):
 
 1. **A null String slot with bytes under it.** Polars exports a null String value with the bytes the
-   slot held (valid Arrow), and ArrowMetal's String compaction then reads those bytes into the next
-   value (`test_core_string_filter_null_slot`). The engine clears the bytes under nulls on the way in.
-2. **A Boolean column through the plan's sort** comes back with the right validity bitmap and a null
-   count of 0, and Polars believes the count (`test_core_bool_sort_null_count`). The engine rebuilds
-   each result column with the count left for the reader to compute (zero-copy).
-3. **A filter over a scan that carries a `date32` column** is rejected by the fused filter
-   (`test_core_filter_carrying_a_date`). The engine never reads a temporal value in an expression, so
-   it hands temporal columns to ArrowMetal as their integer storage (a zero-copy `view`) and views
-   the results back.
-4. **Sorting by a String column that holds a null and a value of 8 bytes or more** returns wrong rows
-   (`test_core_string_sort_with_nulls`, run in a child process because one run ended in a bus error).
-   The engine does not sort by String columns.
+   slot held (valid Arrow), and ArrowMetal's String gather copied those bytes over the next kept
+   value (`test_core_string_filter_null_slot`). The engine now hands such a column over as exported.
+2. **A Boolean column through the plan's sort** came back with the right validity bitmap and a null
+   count of 0 (`test_core_bool_sort_null_count`). Result columns are now used as ArrowMetal returns
+   them.
+3. **A filter over a scan that carries a `date32` column** was rejected by the expression compiler
+   (`test_core_filter_carrying_a_date`). Temporal columns now go to ArrowMetal as their own types.
+4. **Sorting by a String column that holds a null and a value of 8 bytes or more** returned wrong
+   rows (`test_core_string_sort_with_nulls`, run in a child process because one run ended in a bus
+   error). The engine now sorts by String columns.
+5. **A finite float literal of magnitude 2^63 or more** trapped the process inside the expression
+   compiler, which converted every float literal to Int64 as well. The engine now runs those plans
+   on Metal (`test_a_float_literal_of_magnitude_2_63_or_more_runs_on_metal`).
 
 ### Which translatable subtrees it runs: the defaults
 

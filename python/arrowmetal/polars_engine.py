@@ -36,8 +36,7 @@ cases are pinned by `python/tests/test_polars_engine.py`: float comparisons use 
 (NaN equals NaN and sorts above every number), `&`/`|` are Kleene, a null `when` condition takes the
 `otherwise` branch, `is_in` of a null is null, a sum over no values is 0, a min/max over only NaN is
 NaN, Float32 arithmetic keeps subnormals, and every output column is cast to the dtype Polars' own
-schema says it has (Polars does not check what an engine returns, so this module does). Four
-ArrowMetal behaviours the engine works around are pinned by strict xfails in the same file.
+schema says it has (Polars does not check what an engine returns, so this module does).
 
 The Polars surfaces used
 ------------------------
@@ -48,7 +47,6 @@ version this module was written against is `TESTED_IR_VERSION` and a test fails 
 upgrade moves it.
 """
 import json
-import math
 import os
 import re
 import time
@@ -179,19 +177,8 @@ def _reciprocal(value, code):
 
 
 def _float_text(f, code):
-    """`f` as an ArrowMetal float literal. A finite value outside [-2**63, 2**63) is declined:
-    ArrowMetal's expression compiler converts every float literal to Int64 as well
-    (Sources/ArrowMetal/Expr/ExprSource.swift), and that conversion traps the process for such a
-    value, where a declined literal leaves the plan to Polars."""
-    with np.errstate(over="ignore"):
-        g = float(np.float32(f)) if code == "f32" else f
-    if any(math.isfinite(v) and not -_TWO_63 <= v < _TWO_63 for v in (f, g)):
-        raise _Unsupported(f"float literal {f!r} has magnitude 2**63 or more (ArrowMetal's "
-                           "expression compiler cannot lower it)")
+    """`f` as an ArrowMetal float literal."""
     return f"({code} {repr(f)})"
-
-
-_TWO_63 = float(2 ** 63)
 
 
 def _is_minus_one(x):
@@ -600,10 +587,6 @@ class _Translator:
             if not _carryable(c.dtype):
                 raise _Unsupported(f"sort key {name!r} has dtype {c.dtype}")
             ref = c.ref
-            if c.dtype == pl.String:
-                raise _Unsupported("sort by a String column (ArrowMetal's String sort returns "
-                                   "wrong rows when the column holds a null and a value of 8 bytes "
-                                   "or more; test_core_string_sort_with_nulls)")
             if c.nullable and not nl:
                 # ArrowMetal puts nulls last in both directions; a validity key in front puts
                 # them first.
@@ -1198,35 +1181,6 @@ _validated = {}                     # (plan json, leaf schemas) -> None or the e
 _VALIDATED_MAX = 512
 
 
-def _empty_null_slots(arr):
-    """A string array whose null slots hold no bytes.
-
-    Polars exports a null string slot with whatever bytes the slot held before it became null
-    (valid Arrow: a null slot's contents are unspecified), and ArrowMetal's string compaction reads
-    those bytes into the neighbouring value (`test_polars_engine.py::test_core_string_filter_null_slot`
-    pins it). So the bytes under nulls are dropped here, on the CPU, only when there are any."""
-    if arr.null_count == 0 or not (pa.types.is_large_string(arr.type) or pa.types.is_string(arr.type)):
-        return arr
-    if isinstance(arr, pa.ChunkedArray):
-        arr = arr.combine_chunks()
-    off_t = np.int64 if pa.types.is_large_string(arr.type) else np.int32
-    bufs = arr.buffers()
-    offsets = np.frombuffer(bufs[1], dtype=off_t)[arr.offset:arr.offset + len(arr) + 1]
-    valid = np.asarray(arr.is_valid())
-    lengths = np.diff(offsets)
-    if not lengths[~valid].any():
-        return arr
-    data = np.frombuffer(bufs[2], dtype=np.uint8) if bufs[2] is not None else np.zeros(0, np.uint8)
-    data = data[offsets[0]:offsets[-1]]
-    keep = np.repeat(valid, lengths)
-    new_len = np.where(valid, lengths, 0)
-    new_off = np.zeros(len(arr) + 1, dtype=off_t)
-    np.cumsum(new_len, out=new_off[1:])
-    return type(arr).from_buffers(len(arr), pa.py_buffer(new_off), pa.py_buffer(data[keep].copy()),
-                                  arr.buffers()[0] if arr.offset == 0 else
-                                  pa.array(valid).buffers()[1], null_count=arr.null_count)
-
-
 # --------------------------------------------------------------------------------------------------
 # The import cache
 #
@@ -1331,18 +1285,6 @@ def import_cache_info():
             "hits": _cache.hits, "misses": _cache.misses}
 
 
-def _storage(arr):
-    """A temporal column as its integer storage, zero-copy. The translation never reads a temporal
-    value in an expression -- it only carries, sorts and groups them, where the integer order and
-    equality are the temporal ones -- and ArrowMetal's fused filter rejects a plan that merely
-    carries a date32 column (`test_polars_engine.py::test_core_filter_carrying_a_date`)."""
-    t = arr.type
-    if not pa.types.is_temporal(t):
-        return arr
-    width = pa.int32() if (pa.types.is_date32(t) or pa.types.is_time32(t)) else pa.int64()
-    return arr.view(width)
-
-
 def _leaf_sources(leaves, rows=None):
     srcs = {}
     for src, df, names in leaves:
@@ -1350,7 +1292,7 @@ def _leaf_sources(leaves, rows=None):
         arrays = []
         for c in names:
             s = frame.get_column(c)
-            a = _storage(_empty_null_slots(s.to_arrow()))
+            a = s.to_arrow()
             # A multi-chunk column is concatenated by `to_arrow`, so its buffers are new every time.
             if rows is None and s.n_chunks() == 1 and isinstance(a, pa.Array):
                 a = _cache.import_(a)
@@ -1363,45 +1305,10 @@ def _run_plan(plan, leaves, rows=None):
     return _lazy.LazyFrame(plan, _leaf_sources(leaves, rows)).collect()
 
 
-def _recount_nulls(arr):
-    """`arr` with its null count recomputed from its validity bitmap.
-
-    A Boolean column that went through the plan's sort comes back with a correct bitmap but
-    `null_count == 0` (`test_polars_engine.py::test_core_bool_sort_null_count` pins it), and Polars
-    believes the count and drops the bitmap. Rebuilding from the same buffers with the count unknown
-    is zero-copy and makes the consumer count."""
-    if isinstance(arr, pa.ChunkedArray):
-        return pa.chunked_array([_recount_nulls(c) for c in arr.chunks], arr.type)
-    bufs = arr.buffers()
-    if not bufs or bufs[0] is None or arr.null_count != 0 or arr.type.num_fields:
-        return arr
-    return pa.Array.from_buffers(arr.type, len(arr), bufs, null_count=-1, offset=arr.offset)
-
-
-_ARROW_TYPE_OF = {}
-
-
-def _arrow_type(dtype):
-    key = str(dtype)
-    t = _ARROW_TYPE_OF.get(key)
-    if t is None:
-        t = _ARROW_TYPE_OF[key] = pl.Series([], dtype=dtype).to_arrow().type
-    return t
-
-
-def _to_polars(table, schema):
+def _to_polars(table):
     if table.num_columns == 0:
         return pl.DataFrame()
-    cols = []
-    for name, c in zip(table.column_names, table.columns):
-        c = _recount_nulls(c)
-        dt = schema.get(name)
-        if dt is not None and dt.is_temporal() and not pa.types.is_temporal(c.type):
-            t = _arrow_type(dt)                  # back from the integer storage `_storage` sent
-            c = (pa.chunked_array([ch.view(t) for ch in c.chunks], t)
-                 if isinstance(c, pa.ChunkedArray) else c.view(t))
-        cols.append(c)
-    return pl.from_arrow(pa.table(cols, names=table.column_names), rechunk=False)
+    return pl.from_arrow(table, rechunk=False)
 
 
 def _check_schema(df, schema, where):
@@ -1426,7 +1333,7 @@ def _validate(sub, schema):
         return _validated[key]
     had_rows = all(df.height > 0 for _src, df, _names in sub.leaves)
     try:
-        out = _to_polars(_run_plan(sub.plan, sub.leaves, _VALIDATION_ROWS), schema)
+        out = _to_polars(_run_plan(sub.plan, sub.leaves, _VALIDATION_ROWS))
         _check_schema(out, schema, "the plan")
         verdict = None
     except ArrowMetalError as e:
@@ -1457,7 +1364,7 @@ def _run_subtree(sub, schema, entry, duration_since_start, with_columns, predica
     except ArrowMetalError as e:
         raise ArrowMetalError(f"ArrowMetal MetalEngine: the subtree at {entry['root']} failed on "
                               f"Metal: {e}\nplan: {entry['plan']}") from e
-    df = _to_polars(table, schema)
+    df = _to_polars(table)
     _check_schema(df, schema, f"the subtree at {entry['root']}")
     end = time.monotonic_ns()
     entry["seconds"] = (end - start) / 1e9
