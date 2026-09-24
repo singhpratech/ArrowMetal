@@ -489,6 +489,7 @@ outright.
 | Python: wheel with the dylib inside | **In 0.1.0, unpublished** | `scripts/build_wheel.sh` copies `libArrowMetalC.dylib` into the package and builds a `macosx_*_arm64` wheel. It is not on PyPI yet: [ROADMAP → Release mechanics](ROADMAP.md#release-mechanics). |
 | Python: `__arrow_c_device_array__` | **Planned** | Only `__arrow_c_array__` is defined today. [ROADMAP → Types and interop](ROADMAP.md#types-and-interop). |
 | arrow-swift and MLX bridges, DuckDB/DataFusion UDF | **Planned** | [ROADMAP → Integrations](ROADMAP.md#integrations). |
+| DuckDB: aggregates of unchanged SQL on the GPU | **Built from source** | `duckdb-extension/src/arrowmetal_rewrite.cpp`, a C++ optimizer extension for DuckDB 1.5.5 (the C extension API has no optimizer hook): `sum`/`avg` over integer columns, `min`/`max` over integer, `DATE` and `TIMESTAMP` columns, `count`, with no key or one integer, `DATE`, `TIMESTAMP` or `VARCHAR` key, over projections and filters of a table scan, replaced by `ARROWMETAL_AGGREGATE` with DuckDB's exact answers (`HUGEINT` sums, `avg` arithmetic, NULL groups). Floating-point `sum`/`avg`/`min`/`max`, `DECIMAL`, `DISTINCT`, several keys and joins below the aggregate stay DuckDB's. `SET arrowmetal_rewrite = 'auto' / 'off' / 'force'`; `arrowmetal_rewrites()` logs every decision. [DUCKDB.md](DUCKDB.md) §4b. |
 
 ## What ArrowMetal 0.1.0 claims, and what it does not
 
