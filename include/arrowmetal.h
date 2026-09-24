@@ -1617,6 +1617,82 @@ int         am_lakehouse_batch_column(am_lakehouse_batch* b, int64_t i, am_array
 int         am_lakehouse_batch_stats(am_lakehouse_batch* b, int64_t* out);
 void        am_lakehouse_batch_release(am_lakehouse_batch* b);
 
+// ---------------------------------------------------------------------------------------------------
+// CSV, parsed on the GPU (docs/CSV.md)
+//
+// am_csv_open checks the file and copies the options; am_csv_read reads the file into one Metal buffer
+// (pread by default, or a no-copy mmap with file_access = 1) and does the work. A structure pass finds
+// every field and record boundary on the GPU (quote-aware: RFC 4180 with quoted delimiters and
+// newlines, "" as an escaped quote, CRLF / LF / CR line ends, a UTF-8 BOM, a missing final newline),
+// then each projected column is typed with pyarrow.csv's inference rules and converted by a compute
+// kernel straight into Metal shared memory. The options mirror pyarrow's ReadOptions, ParseOptions and
+// ConvertOptions and default to the same values; am_csv_options_init fills in those defaults.
+//
+// Column types are Arrow C Data Interface format strings: "n" "b" "c" "s" "i" "l" "C" "S" "I" "L" "f"
+// "g" "u" "z" "tdD" "tts" "ttm" "ttu" "ttn" and "ts{s,m,u,n}:" with an optional timezone.
+// Every non-zero return (and every -1 from a count) sets am_last_error(); parse and conversion errors
+// use pyarrow's wording ("CSV parse error: Row #3: Expected 3 columns, got 2: 4,5").
+typedef struct am_csv_reader am_csv_reader;          // opaque, one CSV file path plus its options
+typedef struct am_csv_batch am_csv_batch;            // opaque, the columns one read produced
+
+typedef struct am_csv_options {
+    int32_t delimiter;                          // ','
+    int32_t quote_char;                         // '"'; -1 turns quoting off (pyarrow's quote_char=False)
+    int32_t double_quote;                       // 1: "" inside quotes is one quote
+    int32_t decimal_point;                      // '.'
+    int64_t skip_rows;                          // lines skipped before the header (quotes ignored)
+    int64_t skip_rows_after_names;              // records skipped after the header
+    int32_t autogenerate_column_names;          // 0; 1 names the columns f0, f1, ...
+    int32_t include_missing_columns;            // 0; 1 returns a listed but absent column as nulls
+    const char* const* column_names;            // NULL: names come from the header row
+    int64_t n_column_names;
+    const char* const* include_columns;         // NULL or empty: every column, in file order
+    int64_t n_include_columns;
+    const char* const* column_type_names;       // parallel arrays: column name -> type format
+    const char* const* column_type_formats;
+    int64_t n_column_types;
+    const char* const* null_values;             // NULL: pyarrow's default list
+    int64_t n_null_values;
+    const char* const* true_values;             // NULL: "1", "True", "TRUE", "true"
+    int64_t n_true_values;
+    const char* const* false_values;            // NULL: "0", "False", "FALSE", "false"
+    int64_t n_false_values;
+    int32_t strings_can_be_null;                // 0
+    int32_t quoted_strings_can_be_null;         // 1
+    int32_t check_utf8;                         // 1: an inferred column that is not UTF-8 is binary
+    int32_t file_access;                        // 0: pread into a Metal buffer; 1: mmap, no copy
+    int64_t scan_block_bytes;                   // 0: the default (bytes per GPU thread in the scan)
+    // Byte lengths of the strings above, for names and values that hold NUL bytes. NULL (the default):
+    // every string of that array is NUL-terminated. Otherwise element i is the byte length of string i,
+    // which then need not be NUL-terminated. column_type_formats are always NUL-terminated.
+    const int64_t* column_names_lengths;
+    const int64_t* include_columns_lengths;
+    const int64_t* column_type_names_lengths;
+    const int64_t* null_values_lengths;
+    const int64_t* true_values_lengths;
+    const int64_t* false_values_lengths;
+} am_csv_options;
+
+void    am_csv_options_init(am_csv_options* options);
+// `options` may be NULL for the defaults. The strings (and length arrays) are copied; the caller keeps
+// ownership. delimiter, quote_char and decimal_point must be ASCII characters other than NUL.
+int     am_csv_open(const char* path, const am_csv_options* options, am_csv_reader** out);
+void    am_csv_close(am_csv_reader* r);
+int     am_csv_read(am_csv_reader* r, am_csv_batch** out);
+
+int64_t     am_csv_batch_rows(am_csv_batch* b);
+int64_t     am_csv_batch_columns(am_csv_batch* b);
+const char* am_csv_batch_column_name(am_csv_batch* b, int64_t i);
+// The byte length of that name (UTF-8, without the terminating NUL): a header field may hold NUL
+// bytes, which the C string above would cut short. -1 for a bad handle or index.
+int64_t     am_csv_batch_column_name_length(am_csv_batch* b, int64_t i);
+// Hands out a new am_array handle; release it with am_release.
+int         am_csv_batch_column(am_csv_batch* b, int64_t i, am_array** out);
+void        am_csv_batch_release(am_csv_batch* b);
+// am_last_error()'s message with its byte length in *length (may be NULL), for messages that quote a
+// value holding a NUL byte. The buffer is per thread and valid until the next call on that thread.
+const char* am_csv_last_error(int64_t* length);
+
 // ---- CPU/GPU router (docs/DESIGN.md, "CPU/GPU router")
 //
 // sum, min, max, compare, add/subtract/multiply, filter and the low-cardinality group-by sum

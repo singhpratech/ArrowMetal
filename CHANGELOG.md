@@ -294,6 +294,29 @@ Parquet on the GPU
   with neither a manifest list nor manifests, and a data file holding none of the table's columns are
   errors instead of reads.
 
+CSV on the GPU
+- A CSV reader that parses on the GPU (docs/CSV.md): a quote-aware structure scan (the RFC 4180 parser as
+  a state table, run per block from every start state and prefix-composed), pyarrow's type inference
+  (null, int64, bool, date32, time32, timestamp with and without a zone, float64, string, binary) from a
+  sample and checked on every row while converting, and one row-major kernel converting every column.
+  Options follow pyarrow's ReadOptions / ParseOptions / ConvertOptions. `CSVReader` in Swift,
+  `am_csv_open` / `am_csv_read` in C, `am.read_csv` / `am.read_csv_table` in Python; differential-tested
+  against `pyarrow.csv.read_csv`.
+- `MetalStringArray.parse(Double.self)` / `parse(Float.self)` run on the GPU (Eisel-Lemire in integer
+  arithmetic), bit-identical to the Swift initialisers they replace, which still parse the rows the GPU
+  cannot decide exactly.
+- CSV reader review fixes: `scan_block_bytes` of 2^32 or more no longer traps (any positive size only
+  changes the speed); a fractional timestamp outside int64 nanoseconds is not inferred as timestamp[ns]
+  and raises when forced, as in pyarrow; `skip_rows_after_names` skips rows without a width check and
+  counts empty lines, as pyarrow does; ragged-row errors quote at most 100 bytes of the row, as pyarrow's
+  do; `delimiter` equal to `quote_char` is accepted; `am_csv_batch_column_name_length` and
+  `am_csv_last_error` carry names and messages that hold NUL bytes.
+- CSV reader second-round fixes: a ragged row that runs to the end of the file inside an open quote is
+  quoted without its last line terminator, as pyarrow quotes it; option strings (`include_columns`,
+  `column_types` names, `column_names`, `null_values`, `true_values`, `false_values`) travel with their
+  byte lengths (`am_csv_options.*_lengths`), so a NUL byte inside one matches as in pyarrow; a NUL
+  `delimiter`, `quote_char` or `decimal_point` and a bytes path are refused, as pyarrow refuses them.
+
 Out-of-core streaming
 - A streaming executor for datasets larger than memory (docs/STREAMING.md): Arrow IPC files/directories
   (parallel readers with readahead and backpressure) or any Arrow C Stream flow through the GPU one
@@ -370,6 +393,10 @@ Bindings
   The publication steps are in docs/RELEASE.md (step 4 is the PyPI upload).
 
 Fixed
+- `am.scan_ipc(...)` (and every stream with no explicit projection) no longer replaces the second of two
+  same-named columns with a copy of the first: the default projection looked each column up by name.
+  Such a batch now stays positional; batches with unique names take the fused path as before. Found by
+  the review of the IPC lane.
 - A float literal whose value is 2^63 or more in magnitude no longer ends the host process: the fused
   expression compiler converted every float literal to Int64 even for float targets, and `Int64(Double)`
   traps outside its range. Float targets no longer compute the integer; an integer-typed float literal that
