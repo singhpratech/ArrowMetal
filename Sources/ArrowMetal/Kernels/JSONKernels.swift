@@ -156,7 +156,7 @@ enum JSONKernels {
 
     /// Stage 1: string state, depth and record boundaries for the whole file.
     static func records(_ ctx: MetalContext, _ src: MetalArrowBuffer, n: Int, start: Int) throws -> JSONRecords {
-        let nblocks = (n + 63) / 64
+        let nblocks = (n + JSONSource.blockBytes - 1) / JSONSource.blockBytes
         let P = Blk(n: UInt32(n), start: UInt32(start), nblocks: UInt32(nblocks))
         let escKey = try alloc(ctx, nblocks * 4)
         try ctx.run { enc in
@@ -198,8 +198,8 @@ enum JSONKernels {
         let recStart = try alloc(ctx, total * 4)
         let recEnd = try alloc(ctx, total * 4)
         // A record whose closing bracket never comes runs to the end of the file; the walk reports it.
-        let ep = recEnd.mutableTyped(UInt32.self)
-        for i in 0..<total { ep[i] = UInt32(n) }
+        var fill = UInt32(n)
+        if total > 0 { memset_pattern4(recEnd.mutableContents, &fill, total * 4) }
         jprof("  fill"); if total > 0 {
             let scratch = try alloc(ctx, 4)
             try ctx.run { enc in
@@ -213,7 +213,7 @@ enum JSONKernels {
         let fe = firstErr.typed(UInt32.self)[0]
         var topError: (Int, UInt32)? = nil
         if fe != .max {
-            topError = (Int(fe), errCode.typed(UInt32.self)[Int(fe) / 64])
+            topError = (Int(fe), errCode.typed(UInt32.self)[Int(fe) / JSONSource.blockBytes])
         }
         return JSONRecords(start: recStart, end: recEnd, count: total, topError: topError)
     }
@@ -274,29 +274,31 @@ enum JSONKernels {
     /// Positional key match against the reference span. Returns the field ids (-1 for novel entries)
     /// and the novel entries' indices in document order.
     static func matchKeys(_ ctx: MetalContext, _ src: MetalArrowBuffer, level: JSONLevel, K0: Int, refFirst: Int)
-        throws -> (fid: MetalArrowBuffer, novel: [Int32], novelBuffer: MetalArrowBuffer, novelCount: Int) {
+        throws -> (fid: MetalArrowBuffer, novelBuffer: MetalArrowBuffer, novelCount: Int) {
         let E = level.count
         let fid = try alloc(ctx, E * 4)
         let flag = try alloc(ctx, E * 4)
+        let count = try alloc(ctx, 4, zeroed: true)
         try ctx.run { enc in
             let p = try pso(ctx, "jk_match")
             enc.setComputePipelineState(p)
             set(enc, src, 0); bytes(enc, Key(count: UInt32(E), K0: UInt32(K0), refFirst: UInt32(refFirst)), 1)
             set(enc, level.entries, 2); set(enc, level.offsets, 3); set(enc, fid, 4); set(enc, flag, 5)
+            set(enc, count, 6)
             Dispatch.dispatch1D(enc, p, count: E)
         }
+        // Every entry matched its position in the reference object: nothing to compact.
+        guard count.typed(UInt32.self)[0] > 0 else { return (fid, try alloc(ctx, 4), 0) }
         let pos = try sumScan(ctx, flag, E)
         let nNovel = Int(pos.typed(Int32.self)[E])
         let list = try alloc(ctx, nNovel * 4)
-        if nNovel > 0 {
-            try ctx.run { enc in
-                let p = try pso(ctx, "jk_compact")
-                enc.setComputePipelineState(p)
-                set(enc, flag, 0); set(enc, pos, 1); bytes(enc, UInt32(E), 2); set(enc, list, 3)
-                Dispatch.dispatch1D(enc, p, count: E)
-            }
+        try ctx.run { enc in
+            let p = try pso(ctx, "jk_compact")
+            enc.setComputePipelineState(p)
+            set(enc, flag, 0); set(enc, pos, 1); bytes(enc, UInt32(E), 2); set(enc, list, 3)
+            Dispatch.dispatch1D(enc, p, count: E)
         }
-        return (fid, [], list, nNovel)
+        return (fid, list, nNovel)
     }
 
     /// fid[list[j]] = codes[skip + j]

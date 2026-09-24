@@ -487,12 +487,23 @@ def test_every_type_with_nulls_and_missing_keys():
     check("\n".join(rows) + "\n")
 
 
-@pytest.mark.parametrize("offset", range(0, 70, 3))
+@pytest.mark.parametrize("offset", range(0, 300, 7))
 def test_escapes_straddling_blocks(offset):
-    # The structure pass works in 64-byte blocks; backslash runs and escaped quotes must be read the
+    # The structure pass works in 256-byte blocks; backslash runs and escaped quotes must be read the
     # same wherever a block boundary falls.
     pad = "x" * offset
     check('{"a":"%s%s\\"q"}\n{"a":"%s","b":"\\\\"}\n{"a":"%s"}\n' % (pad, "\\\\" * 40, "\\\\" * 33, "\\\\" * 64 + "y"))
+
+
+@pytest.mark.parametrize("offset", range(0, 260, 37))
+def test_backslash_runs_longer_than_a_block(offset):
+    # Whole blocks of backslashes pass the escape state through; the quote after the run is escaped
+    # or not by the run's parity, whatever the alignment.
+    pad = "x" * offset
+    for run in (600, 601, 1024):
+        body = "\\" * run
+        text = '{"a":"%s%s"}\n' % (pad, body + ("\\" if run % 2 else ""))
+        check(text + '{"a":"%s\\"%s"}\n' % (body[:(run // 2) * 2], pad))
 
 
 def test_wide_file():

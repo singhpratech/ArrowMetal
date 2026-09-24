@@ -171,7 +171,7 @@ final class JSONColumnBuilder {
                 var hi = lo + 1
                 var end = g + 1
                 while end < wanted.count && wanted[end].0 - lo < perGroup { hi = wanted[end].0 + 1; end += 1 }
-                let (M, dup) = try JSONKernels.scatter(ctx, level: level, fid: fid, rows: rows, lo: lo, hi: hi,
+                jprof("keys"); let (M, dup) = try JSONKernels.scatter(ctx, level: level, fid: fid, rows: rows, lo: lo, hi: hi,
                                                        mayRepeat: mayRepeat)
                 if let dup {
                     let x = level.entry(dup)
@@ -219,7 +219,7 @@ final class JSONColumnBuilder {
     /// all of them, so a wide file costs a handful of dispatches per type rather than per column.
     func columns(_ set: JSONKernels.ColumnSet, sel: [Int], types: [JSONType?], paths: [String],
                  rowToRecord: @escaping (Int) -> Int) throws -> [AnyMetalArray] {
-        let kinds = try JSONKernels.kinds(ctx, set)
+        jprof("scatter"); let kinds = try JSONKernels.kinds(ctx, set); jprof("kinds")
         var out = [AnyMetalArray?](repeating: nil, count: sel.count)
         var groupOrder: [String] = []
         var groups: [String: (type: JSONType, inferred: Bool, members: [Int], flags: UInt32)] = [:]
@@ -274,7 +274,7 @@ final class JSONColumnBuilder {
         for key in groupOrder {
             let g = groups[key]!
             let packed = try JSONKernels.pack(ctx, set, g.members.map { sel[$0] })
-            let cols = try scalars(packed, type: g.type, inferred: g.inferred, flags: g.flags)
+            jprof("pack \(g.type)"); let cols = try scalars(packed, type: g.type, inferred: g.inferred, flags: g.flags); jprof("group \(g.type)")
             for (i, k) in g.members.enumerated() { out[k] = cols[i] }
         }
         return out.map { $0! }
@@ -365,10 +365,10 @@ final class JSONColumnBuilder {
     /// `MetalStringArray.parse`; each column is a view of the result with its own validity.
     func numbers<T: ArrowPrimitive>(_ set: JSONKernels.ColumnSet, _: T.Type, type: JSONType, flags: UInt32) throws -> [MetalArray<T>] {
         let rows = set.rows, cols = set.cols
-        let v = try JSONKernels.validity(ctx, set, validMask: Self.maskNumber)
-        let (off, data) = try JSONKernels.gather(ctx, source, set, mode: .rawValue, validMask: Self.maskNumber)
+        let v = try JSONKernels.validity(ctx, set, validMask: Self.maskNumber); jprof("   n-validity")
+        let (off, data) = try JSONKernels.gather(ctx, source, set, mode: .rawValue, validMask: Self.maskNumber); jprof("   n-gather")
         let text = MetalStringArray(length: rows * cols, nullCount: 0, validity: nil, offsets: off, data: data, context: ctx)
-        let parsed = try text.parse(T.self)
+        let parsed = try text.parse(T.self); jprof("   n-parse")
         let vp = parsed.values.mutableTyped(T.self)
         if !T.isFloatingPoint, parsed.nullCount > v.nulls.reduce(0, +) {
             // The first value that did not convert, in column order, for pyarrow's message.

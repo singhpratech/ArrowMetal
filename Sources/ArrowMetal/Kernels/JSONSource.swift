@@ -23,6 +23,9 @@ import Foundation
 ///    and a write pass, number text is gathered for the string-to-number parse, and ISO-8601 strings are
 ///    parsed to timestamps.
 enum JSONSource {
+    /// Bytes per thread in the structure passes (even, so a block of backslashes passes the escape carry through).
+    static let blockBytes = 256
+
     static let source: String = KernelSource.prelude + """
 
     // ---------------------------------------------------------------------------------------------
@@ -62,6 +65,7 @@ enum JSONSource {
     #define E_TOP_BOOLEAN   19u
 
     #define MAX_DEPTH 1024u
+    #define BLK \(JSONSource.blockBytes)u      // bytes per structure-pass thread
 
     struct JEntry { uint parent; uint keyStart; uint keyLen; uint valStart; uint valLen; uint flags; };
 
@@ -97,7 +101,7 @@ enum JSONSource {
     kernel void jb_escape(device const uchar* s [[buffer(0)]], constant JBlk& P [[buffer(1)]],
                           device uint* key [[buffer(2)]], uint b [[thread_position_in_grid]]) {
         if (b >= P.nblocks) return;
-        uint lo = b * 64u, hi = min(lo + 64u, P.n);
+        uint lo = b * BLK, hi = min(lo + BLK, P.n);
         uint t = 0u; bool all = true;
         for (uint i = hi; i > lo; i--) { if (s[i - 1u] == 0x5C) t++; else { all = false; break; } }
         key[b] = all ? 0u : (((b + 1u) << 1) | (t & 1u));
@@ -108,11 +112,17 @@ enum JSONSource {
                           device const uint* escIn [[buffer(2)]], device int* qpar [[buffer(3)]],
                           uint b [[thread_position_in_grid]]) {
         if (b >= P.nblocks) return;
-        uint lo = b * 64u, hi = min(lo + 64u, P.n);
+        uint lo = b * BLK, hi = min(lo + BLK, P.n);
         bool esc = (escIn[b] & 1u) != 0u;
         uint q = 0u;
+        // Eight 8-byte loads per block rather than 64 byte loads: a SIMD group's lanes read 64 bytes
+        // apart, so every load instruction touches many cache lines.
+        device const ulong* w8 = (device const ulong*)(s + lo);
+        ulong x = 0ul;
         for (uint i = lo; i < hi; i++) {
-            uchar c = s[i];
+            uint o = i - lo;
+            if ((o & 7u) == 0u) x = w8[o >> 3];
+            uchar c = (uchar)(x >> (8u * (o & 7u)));
             if (esc) { esc = false; continue; }
             if (c == 0x5C) { esc = true; continue; }
             if (c == 0x22) q++;
@@ -125,12 +135,18 @@ enum JSONSource {
                          device const uint* escIn [[buffer(2)]], device const int* qScan [[buffer(3)]],
                          device int* delta [[buffer(4)]], uint b [[thread_position_in_grid]]) {
         if (b >= P.nblocks) return;
-        uint lo = b * 64u, hi = min(lo + 64u, P.n);
+        uint lo = b * BLK, hi = min(lo + BLK, P.n);
         bool esc = (escIn[b] & 1u) != 0u;
         bool ins = (qScan[b] & 1) != 0;
         int d = 0;
+        // Eight 8-byte loads per block rather than 64 byte loads: a SIMD group's lanes read 64 bytes
+        // apart, so every load instruction touches many cache lines.
+        device const ulong* w8 = (device const ulong*)(s + lo);
+        ulong x = 0ul;
         for (uint i = lo; i < hi; i++) {
-            uchar c = s[i];
+            uint o = i - lo;
+            if ((o & 7u) == 0u) x = w8[o >> 3];
+            uchar c = (uchar)(x >> (8u * (o & 7u)));
             if (esc) { esc = false; continue; }
             if (c == 0x5C) { esc = true; continue; }
             if (c == 0x22) { ins = !ins; continue; }
@@ -317,10 +333,16 @@ enum JSONSource {
     inline void j_block_records(device const uchar* s, constant JBlk& P, uint b, bool esc, bool ins, int d,
                                 uint mode, thread uint& count, device uint* recStart, device uint* recEnd,
                                 uint base, device atomic_uint* firstErr, device uint* errCode) {
-        uint lo = b * 64u, hi = min(lo + 64u, P.n);
+        uint lo = b * BLK, hi = min(lo + BLK, P.n);
         bool reported = false;
+        // Eight 8-byte loads per block rather than 64 byte loads: a SIMD group's lanes read 64 bytes
+        // apart, so every load instruction touches many cache lines.
+        device const ulong* w8 = (device const ulong*)(s + lo);
+        ulong x = 0ul;
         for (uint i = lo; i < hi; i++) {
-            uchar c = s[i];
+            uint o = i - lo;
+            if ((o & 7u) == 0u) x = w8[o >> 3];
+            uchar c = (uchar)(x >> (8u * (o & 7u)));
             if (esc) { esc = false; continue; }
             bool top = (d == 0 && !ins && i >= P.start);
             if (c == 0x5C) {
@@ -561,21 +583,26 @@ enum JSONSource {
     kernel void jk_match(device const uchar* s [[buffer(0)]], constant JKey& P [[buffer(1)]],
                          device const JEntry* ent [[buffer(2)]], device const int* off [[buffer(3)]],
                          device int* fid [[buffer(4)]], device int* novel [[buffer(5)]],
-                         uint e [[thread_position_in_grid]]) {
-        if (e >= P.count) return;
-        JEntry x = ent[e];
-        uint k = e - (uint)off[x.parent];
-        int f = -1;
-        if (k < P.K0) {
-            JEntry r = ent[P.refFirst + k];
-            if (r.keyLen == x.keyLen) {
-                bool eq = true;
-                for (uint i = 0u; i < x.keyLen; i++) { if (s[x.keyStart + i] != s[r.keyStart + i]) { eq = false; break; } }
-                if (eq) f = (int)k;
+                         device atomic_uint* novelCount [[buffer(6)]], uint e [[thread_position_in_grid]]) {
+        uint isNovel = 0u;
+        if (e < P.count) {
+            JEntry x = ent[e];
+            uint k = e - (uint)off[x.parent];
+            int f = -1;
+            if (k < P.K0) {
+                JEntry r = ent[P.refFirst + k];
+                if (r.keyLen == x.keyLen) {
+                    bool eq = true;
+                    for (uint i = 0u; i < x.keyLen; i++) { if (s[x.keyStart + i] != s[r.keyStart + i]) { eq = false; break; } }
+                    if (eq) f = (int)k;
+                }
             }
+            fid[e] = f;
+            isNovel = (f < 0) ? 1u : 0u;
+            novel[e] = (int)isNovel;
         }
-        fid[e] = f;
-        novel[e] = (f < 0) ? 1 : 0;
+        uint total = simd_sum(isNovel);
+        if (simd_is_first() && total) atomic_fetch_add_explicit(novelCount, total, memory_order_relaxed);
     }
 
     // Compacts the novel entries: out[pos[e]] = e.

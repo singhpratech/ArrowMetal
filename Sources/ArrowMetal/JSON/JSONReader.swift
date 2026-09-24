@@ -242,7 +242,8 @@ public final class JSONReader: @unchecked Sendable {
             syntax = (top.position, JSONSyntax.hasRow(top.code) ? "\(text) in row \(lo)" : text)
         }
         if let w = walkError, w.span < rows {
-            rows = w.span + 1
+            // A record past the nesting limit is not built: its partial values would nest as deep.
+            rows = w.code == 14 ? w.span : w.span + 1
             syntax = (w.position, "\(JSONSyntax.message(w.code)) in row \(w.span)")
         }
         jprof("walkCount"); let level = try JSONKernels.walkEmit(ctx, source, n: n, spanStart: recs.start, spanEnd: recs.end,
