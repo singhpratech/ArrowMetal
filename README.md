@@ -12,6 +12,11 @@ C Device Data Interface (`ARROW_DEVICE_METAL`).
 
 Listed on Apache Arrow's [Powered By](https://arrow.apache.org/powered_by/) page. Site and docs: <https://arrowmetal.org> · Python: `pip install arrowmetal` · Rust: `arrowmetal = "0.1.0"` · Release: [v0.1.0](https://github.com/singhpratech/ArrowMetal/releases/tag/v0.1.0)
 
+This README describes `main`. The GPU readers for CSV and newline-delimited JSON, Delta Lake and Apache
+Iceberg tables, nested Parquet columns, the CPU/GPU router, the Polars engine and the DuckDB optimizer
+extension were added after 0.1.0 and ship in the next release; `pip install arrowmetal` installs 0.1.0
+([CHANGELOG.md](CHANGELOG.md)).
+
 ## The pitch in one paragraph
 
 Every array is Arrow layout in memory the GPU already shares, so there is nothing to upload. Gathers,
