@@ -24,9 +24,11 @@ GPU-resident arrays; pyarrow is `pq.read_table`, Polars `pl.read_parquet`, and D
 `SELECT ... FROM read_parquet(...)` fetched as an Arrow table. The first ArrowMetal read of each shape is
 also checked against pyarrow's table (`match` column).
 
-The values are random rather than sequential on purpose: a run of sequential integers compresses into
-long Snappy token streams, and a 1 MB dictionary page of them is one serial stream for one SIMD group --
-the Snappy weak spot docs/PARQUET.md describes -- which would measure decompression, not reassembly.
+The integers are random over their full range on purpose. Sequential integers, or 64-bit values whose
+high bytes are all zero, compress into long Snappy token streams, and the 1 MB dictionary page pyarrow
+writes before falling back to PLAIN is then one serial stream for one SIMD group -- the Snappy weak spot
+docs/PARQUET.md describes. That costs the same with or without nesting (a flat column of such values
+shows it too), so it would measure decompression rather than reassembly.
 """
 import argparse
 import csv
@@ -59,28 +61,28 @@ def build_chunk(rng, start, n):
     words = pa.array(["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"])
     names = pa.DictionaryArray.from_arrays(pa.array((i % 8).astype(np.int32)), words).cast(pa.string())
     s = pa.StructArray.from_arrays(
-        [pa.array(rng.integers(0, 1 << 40, n), mask=(i % 7) == 3), names, pa.array(rng.random(n))],
+        [pa.array(rng.integers(-(1 << 62), 1 << 62, n), mask=(i % 7) == 3), names, pa.array(rng.random(n))],
         names=["a", "b", "c"],
         mask=pa.array(~valid))
     # list<int64>: 0-3 elements.
     ln = (i % 4).astype(np.int32)
-    l = pa.ListArray.from_arrays(offsets_for(ln), pa.array(rng.integers(0, 1 << 40, int(ln.sum()))),
+    l = pa.ListArray.from_arrays(offsets_for(ln), pa.array(rng.integers(-(1 << 62), 1 << 62, int(ln.sum()))),
                                  mask=pa.array((i % 13) == 0))
     # list<list<int32>>: 2 inner lists of 0-2 elements.
     inner_len = (np.arange(2 * n) % 3).astype(np.int32)
     inner = pa.ListArray.from_arrays(offsets_for(inner_len),
-                                     pa.array(rng.integers(0, 1 << 30, int(inner_len.sum())).astype(np.int32)))
+                                     pa.array(rng.integers(-(1 << 31), 1 << 31, int(inner_len.sum())).astype(np.int32)))
     ll = pa.ListArray.from_arrays(offsets_for(np.full(n, 2, dtype=np.int32)), inner,
                                   mask=pa.array((i % 17) == 0))
     # map<string, int64>: 1-3 entries.
     mn = (i % 3 + 1).astype(np.int32)
     total = int(mn.sum())
     keys = pa.DictionaryArray.from_arrays(pa.array((np.arange(total) % 8).astype(np.int32)), words).cast(pa.string())
-    m = pa.MapArray.from_arrays(offsets_for(mn), keys, pa.array(rng.integers(0, 1 << 40, total)))
+    m = pa.MapArray.from_arrays(offsets_for(mn), keys, pa.array(rng.integers(-(1 << 62), 1 << 62, total)))
     # list<struct<x: int32, y: float64>>: 0-2 elements.
     sn = (i % 3).astype(np.int32)
     total = int(sn.sum())
-    st = pa.StructArray.from_arrays([pa.array(rng.integers(0, 1 << 30, total).astype(np.int32)),
+    st = pa.StructArray.from_arrays([pa.array(rng.integers(-(1 << 31), 1 << 31, total).astype(np.int32)),
                                      pa.array(rng.random(total))],
                                     names=["x", "y"])
     ls = pa.ListArray.from_arrays(offsets_for(sn), st)
