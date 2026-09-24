@@ -164,6 +164,16 @@ static void RecordRun(int64_t id, const string &path, int64_t rows, int64_t grou
 // command buffers from interleaving.
 static std::mutex g_gpu_lock;
 
+// ARROWMETAL_REWRITE_TRACE=1 prints the time since `start` at each Finalize step to stderr.
+static void Trace(const char *step, std::chrono::steady_clock::time_point start) {
+	static const bool enabled = getenv("ARROWMETAL_REWRITE_TRACE") != nullptr;
+	if (enabled) {
+		fprintf(stderr, "arrowmetal_rewrite: %-8s %8.3f ms\n", step,
+		        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+	}
+}
+
+
 //===--------------------------------------------------------------------===//
 // Column kinds the sink gathers
 //===--------------------------------------------------------------------===//
@@ -907,8 +917,16 @@ struct HostColumn {
 	string format;
 	vector<int64_t> values;
 	vector<string> strings;
-	vector<bool> valid;
+	vector<uint8_t> valid;
 };
+
+template <class T>
+static void ReadValues(const void *data, int64_t n, int64_t off, HostColumn &out) {
+	auto values = static_cast<const T *>(data) + off;
+	for (int64_t i = 0; i < n; i++) {
+		out.values[i] = static_cast<int64_t>(values[i]);
+	}
+}
 
 static void ReadColumn(am_array *handle, HostColumn &out) {
 	ArrowSchema schema;
@@ -918,64 +936,70 @@ static void ReadColumn(am_array *handle, HostColumn &out) {
 	if (am_export(handle, &schema, &array) != 0) {
 		Fail("reading a result column");
 	}
+	struct Releaser {
+		ArrowSchema &s;
+		ArrowArray &a;
+		~Releaser() {
+			if (a.release) {
+				a.release(&a);
+			}
+			if (s.release) {
+				s.release(&s);
+			}
+		}
+	} releaser {schema, array};
 	out.format = schema.format ? schema.format : "";
 	const int64_t n = array.length;
 	const int64_t off = array.offset;
 	auto validity = array.n_buffers > 0 ? static_cast<const uint64_t *>(array.buffers[0]) : nullptr;
+	const void *data = array.n_buffers > 1 ? array.buffers[1] : nullptr;
 	out.values.assign(n, 0);
-	out.valid.assign(n, true);
+	out.valid.assign(n, 1);
+	if (validity) {
+		for (int64_t i = 0; i < n; i++) {
+			const int64_t r = i + off;
+			if (!((validity[r >> 6] >> (r & 63)) & 1)) {
+				out.valid[i] = 0;
+			}
+		}
+	}
 	const string &f = out.format;
-	const bool is_str = f == "u" || f == "U";
-	if (is_str) {
+	if (f == "c") {
+		ReadValues<int8_t>(data, n, off, out);
+	} else if (f == "C") {
+		ReadValues<uint8_t>(data, n, off, out);
+	} else if (f == "s") {
+		ReadValues<int16_t>(data, n, off, out);
+	} else if (f == "S") {
+		ReadValues<uint16_t>(data, n, off, out);
+	} else if (f == "i" || f == "tdD") {
+		ReadValues<int32_t>(data, n, off, out);
+	} else if (f == "I") {
+		ReadValues<uint32_t>(data, n, off, out);
+	} else if (f == "l" || f == "L" || f.rfind("ts", 0) == 0) {
+		ReadValues<int64_t>(data, n, off, out);
+	} else if (f == "g") {
+		std::memcpy(out.values.data(), static_cast<const double *>(data) + off, size_t(n) * 8);
+	} else if (f == "u" || f == "U") {
 		out.strings.assign(n, string());
-	}
-	for (int64_t i = 0; i < n; i++) {
-		const int64_t r = i + off;
-		if (validity && !((validity[r >> 6] >> (r & 63)) & 1)) {
-			out.valid[i] = false;
-			continue;
-		}
-		const void *data = array.buffers[1];
-		if (f == "c") {
-			out.values[i] = static_cast<const int8_t *>(data)[r];
-		} else if (f == "C") {
-			out.values[i] = static_cast<const uint8_t *>(data)[r];
-		} else if (f == "s") {
-			out.values[i] = static_cast<const int16_t *>(data)[r];
-		} else if (f == "S") {
-			out.values[i] = static_cast<const uint16_t *>(data)[r];
-		} else if (f == "i" || f == "tdD") {
-			out.values[i] = static_cast<const int32_t *>(data)[r];
-		} else if (f == "I") {
-			out.values[i] = static_cast<const uint32_t *>(data)[r];
-		} else if (f == "l" || f == "L" || f.rfind("ts", 0) == 0) {
-			out.values[i] = static_cast<const int64_t *>(data)[r];
-		} else if (f == "g") {
-			double d = static_cast<const double *>(data)[r];
-			std::memcpy(&out.values[i], &d, 8);
-		} else if (f == "u") {
-			auto offsets = static_cast<const int32_t *>(data);
-			auto bytes = static_cast<const char *>(array.buffers[2]);
-			out.strings[i].assign(bytes + offsets[r], offsets[r + 1] - offsets[r]);
-		} else if (f == "U") {
-			auto offsets = static_cast<const int64_t *>(data);
-			auto bytes = static_cast<const char *>(array.buffers[2]);
-			out.strings[i].assign(bytes + offsets[r], offsets[r + 1] - offsets[r]);
-		} else {
-			if (array.release) {
-				array.release(&array);
+		auto bytes = static_cast<const char *>(array.buffers[2]);
+		for (int64_t i = 0; i < n; i++) {
+			if (!out.valid[i]) {
+				continue;
 			}
-			if (schema.release) {
-				schema.release(&schema);
+			const int64_t r = i + off;
+			int64_t begin, end;
+			if (f == "u") {
+				begin = static_cast<const int32_t *>(data)[r];
+				end = static_cast<const int32_t *>(data)[r + 1];
+			} else {
+				begin = static_cast<const int64_t *>(data)[r];
+				end = static_cast<const int64_t *>(data)[r + 1];
 			}
-			throw InternalException("arrowmetal_rewrite: unexpected result format '%s'", f);
+			out.strings[i].assign(bytes + begin, size_t(end - begin));
 		}
-	}
-	if (array.release) {
-		array.release(&array);
-	}
-	if (schema.release) {
-		schema.release(&schema);
+	} else {
+		throw InternalException("arrowmetal_rewrite: unexpected result format '%s'", f);
 	}
 }
 
@@ -1082,7 +1106,6 @@ struct Groups {
 	idx_t count = 0;
 	HostColumn key;                      // the group key per group (grouped queries)
 	vector<vector<int64_t>> slot;        // [need][group]
-	vector<vector<bool>> slot_valid;     // [need][group]
 	vector<bool> slot_unsigned;          // [need]
 };
 
@@ -1119,9 +1142,8 @@ static void RunScalarQuery(vector<am_array *> &columns, const string &text, cons
 			Fail("reading an aggregate");
 		}
 		groups.slot[n].resize(g + 1);
-		groups.slot_valid[n].resize(g + 1);
 		groups.slot[n][g] = iv;
-		groups.slot_valid[n][g] = !is_null;
+		(void)is_null; // nullness comes from the counts
 		groups.slot_unsigned[n] = kind == 1;
 	}
 }
@@ -1159,6 +1181,7 @@ static void RunDense(vector<am_array *> &columns, const Plan &plan, int64_t key_
 		per_query = idx_t(FUSED_PRIVATE_SLOTS / span);
 	}
 	vector<HostColumn> host(plan.needs.size());
+	const auto traced = std::chrono::steady_clock::now();
 	for (idx_t first = 0; first < plan.needs.size(); first += per_query) {
 		const idx_t last = MinValue<idx_t>(plan.needs.size(), first + per_query);
 		string aggs;
@@ -1170,6 +1193,7 @@ static void RunDense(vector<am_array *> &columns, const Plan &plan, int64_t key_
 		if (am_query(columns.data(), name_ptrs.data(), int64_t(columns.size()), text.c_str(), &result.ptr) != 0) {
 			Fail("running the fused group-by");
 		}
+		Trace("  query", traced);
 		// Column 0 is the key slot index, then one column per need in order.
 		for (idx_t n = first; n < last; n++) {
 			Handle column;
@@ -1178,32 +1202,33 @@ static void RunDense(vector<am_array *> &columns, const Plan &plan, int64_t key_
 			}
 			ReadColumn(column.ptr, host[n]);
 		}
+		Trace("  read", traced);
 	}
 	auto &rows = host[0]; // Need::ROWS is always slot 0
-	idx_t present = 0;
+	vector<uint32_t> present;
+	present.reserve(size_t(span));
 	for (int64_t k = 0; k < span; k++) {
-		present += rows.values[k] > 0;
+		if (rows.values[k] > 0) {
+			present.push_back(uint32_t(k));
+		}
 	}
+	const idx_t count = present.size();
 	groups.key.format = KindFormat(key_kind);
-	groups.key.values.reserve(present + 1);
-	groups.key.valid.reserve(present + 1);
+	groups.key.values.resize(count);
+	groups.key.valid.assign(count, 1);
+	for (idx_t g = 0; g < count; g++) {
+		groups.key.values[g] = key_min + int64_t(present[g]);
+	}
 	for (idx_t n = 0; n < plan.needs.size(); n++) {
-		groups.slot[n].reserve(present + 1);
-		groups.slot_valid[n].reserve(present + 1);
+		auto &slot = groups.slot[n];
+		const auto &values = host[n].values;
+		slot.resize(count);
+		for (idx_t g = 0; g < count; g++) {
+			slot[g] = values[present[g]];
+		}
 		groups.slot_unsigned[n] = !SignedResultFormat(host[n].format);
 	}
-	for (int64_t k = 0; k < span; k++) {
-		if (rows.values[k] <= 0) {
-			continue;
-		}
-		groups.key.values.push_back(key_min + k);
-		groups.key.valid.push_back(true);
-		for (idx_t n = 0; n < plan.needs.size(); n++) {
-			groups.slot[n].push_back(host[n].values[k]);
-			groups.slot_valid[n].push_back(host[n].valid[k]);
-		}
-		groups.count++;
-	}
+	groups.count = count;
 	if (key_nulls > 0) {
 		// Rows whose key is NULL form one more group, as in SQL.
 		const string null_text = "(query (filter (is_null (col \"c0\"))) (aggregate" + AggregateList(plan) + "))";
@@ -1212,7 +1237,7 @@ static void RunDense(vector<am_array *> &columns, const Plan &plan, int64_t key_
 		RunScalarQuery(columns, null_text, plan, groups);
 		groups.slot_unsigned = unsigned_flags; // keep the grouped columns' signedness
 		groups.key.values.push_back(0);
-		groups.key.valid.push_back(false);
+		groups.key.valid.push_back(0);
 		(void)before;
 	}
 }
@@ -1307,7 +1332,6 @@ static void RunHash(vector<am_array *> &columns, const Plan &plan, Groups &group
 			ReadColumn(out.ptr, host);
 		}
 		groups.slot[n] = std::move(host.values);
-		groups.slot_valid[n] = std::move(host.valid);
 		groups.slot_unsigned[n] = !SignedResultFormat(host.format);
 	}
 }
@@ -1324,11 +1348,36 @@ static __int128 SlotSum(const Groups &groups, idx_t slot, idx_t g) {
 	                                  : __int128(groups.slot[slot][g]);
 }
 
+template <class T>
+static void WriteInts(Vector &vec, const vector<int64_t> &source, idx_t start, idx_t n) {
+	auto out = FlatVector::GetData<T>(vec);
+	for (idx_t i = 0; i < n; i++) {
+		out[i] = static_cast<T>(source[start + i]);
+	}
+}
+
+// Integer slots into a vector of `type` (the value is already in that type's range).
+static void WriteIntegral(Vector &vec, PhysicalType type, const vector<int64_t> &source, idx_t start, idx_t n) {
+	switch (type) {
+	case PhysicalType::INT8: WriteInts<int8_t>(vec, source, start, n); break;
+	case PhysicalType::INT16: WriteInts<int16_t>(vec, source, start, n); break;
+	case PhysicalType::INT32: WriteInts<int32_t>(vec, source, start, n); break;
+	case PhysicalType::INT64: WriteInts<int64_t>(vec, source, start, n); break;
+	case PhysicalType::UINT8: WriteInts<uint8_t>(vec, source, start, n); break;
+	case PhysicalType::UINT16: WriteInts<uint16_t>(vec, source, start, n); break;
+	case PhysicalType::UINT32: WriteInts<uint32_t>(vec, source, start, n); break;
+	case PhysicalType::UINT64: WriteInts<uint64_t>(vec, source, start, n); break;
+	default:
+		throw InternalException("arrowmetal_rewrite: unexpected integral result type");
+	}
+}
+
 static void WriteResult(const Spec &spec, const vector<AggSlots> &slots, const Groups &groups,
                         ColumnDataCollection &collection) {
 	DataChunk chunk;
 	chunk.Initialize(Allocator::DefaultAllocator(), spec.result_types);
 	const idx_t total = groups.count;
+	const auto &rows = groups.slot[0];
 	for (idx_t start = 0; start < total; start += STANDARD_VECTOR_SIZE) {
 		const idx_t n = MinValue<idx_t>(STANDARD_VECTOR_SIZE, total - start);
 		chunk.Reset();
@@ -1336,28 +1385,20 @@ static void WriteResult(const Spec &spec, const vector<AggSlots> &slots, const G
 		if (spec.has_key) {
 			auto &vec = chunk.data[col++];
 			auto &validity = FlatVector::Validity(vec);
-			const auto &type = spec.result_types[0];
-			for (idx_t i = 0; i < n; i++) {
-				const idx_t g = start + i;
-				if (!groups.key.valid[g]) {
-					validity.SetInvalid(i);
-					continue;
+			const auto type = spec.result_types[0].InternalType();
+			if (type == PhysicalType::VARCHAR) {
+				auto out = FlatVector::GetData<string_t>(vec);
+				for (idx_t i = 0; i < n; i++) {
+					if (groups.key.valid[start + i]) {
+						out[i] = StringVector::AddString(vec, groups.key.strings[start + i]);
+					}
 				}
-				const int64_t v = groups.key.values.empty() ? 0 : groups.key.values[g];
-				switch (type.InternalType()) {
-				case PhysicalType::INT8: FlatVector::GetData<int8_t>(vec)[i] = int8_t(v); break;
-				case PhysicalType::INT16: FlatVector::GetData<int16_t>(vec)[i] = int16_t(v); break;
-				case PhysicalType::INT32: FlatVector::GetData<int32_t>(vec)[i] = int32_t(v); break;
-				case PhysicalType::INT64: FlatVector::GetData<int64_t>(vec)[i] = v; break;
-				case PhysicalType::UINT8: FlatVector::GetData<uint8_t>(vec)[i] = uint8_t(v); break;
-				case PhysicalType::UINT16: FlatVector::GetData<uint16_t>(vec)[i] = uint16_t(v); break;
-				case PhysicalType::UINT32: FlatVector::GetData<uint32_t>(vec)[i] = uint32_t(v); break;
-				case PhysicalType::UINT64: FlatVector::GetData<uint64_t>(vec)[i] = uint64_t(v); break;
-				case PhysicalType::VARCHAR:
-					FlatVector::GetData<string_t>(vec)[i] = StringVector::AddString(vec, groups.key.strings[g]);
-					break;
-				default:
-					throw InternalException("arrowmetal_rewrite: unexpected key type");
+			} else {
+				WriteIntegral(vec, type, groups.key.values, start, n);
+			}
+			for (idx_t i = 0; i < n; i++) {
+				if (!groups.key.valid[start + i]) {
+					validity.SetInvalid(i);
 				}
 			}
 		}
@@ -1366,23 +1407,24 @@ static void WriteResult(const Spec &spec, const vector<AggSlots> &slots, const G
 			auto &s = slots[a];
 			auto &vec = chunk.data[col++];
 			auto &validity = FlatVector::Validity(vec);
-			for (idx_t i = 0; i < n; i++) {
-				const idx_t g = start + i;
-				const int64_t rows = groups.slot[0][g];
-				if (agg.op == AggOp::COUNT_STAR) {
-					FlatVector::GetData<int64_t>(vec)[i] = rows;
-					continue;
-				}
-				const int64_t valid = groups.slot[s.count][g];
-				if (agg.op == AggOp::COUNT) {
-					FlatVector::GetData<int64_t>(vec)[i] = valid;
-					continue;
-				}
-				if (valid == 0) {
-					validity.SetInvalid(i);
-					continue;
-				}
-				if (agg.op == AggOp::SUM || agg.op == AggOp::AVG) {
+			if (agg.op == AggOp::COUNT_STAR) {
+				WriteInts<int64_t>(vec, rows, start, n);
+				continue;
+			}
+			const auto &valid = groups.slot[s.count];
+			if (agg.op == AggOp::COUNT) {
+				WriteInts<int64_t>(vec, valid, start, n);
+				continue;
+			}
+			if (agg.op == AggOp::MIN || agg.op == AggOp::MAX) {
+				WriteIntegral(vec, agg.return_type.InternalType(), groups.slot[s.extreme], start, n);
+			} else {
+				const bool huge = agg.return_type.InternalType() == PhysicalType::INT128;
+				for (idx_t i = 0; i < n; i++) {
+					const idx_t g = start + i;
+					if (valid[g] == 0) {
+						continue;
+					}
 					__int128 total_sum;
 					if (s.sum != DConstants::INVALID_INDEX) {
 						total_sum = SlotSum(groups, s.sum, g);
@@ -1390,50 +1432,32 @@ static void WriteResult(const Spec &spec, const vector<AggSlots> &slots, const G
 						total_sum = SlotSum(groups, s.hi, g) * (__int128(1) << 32) + SlotSum(groups, s.lo, g);
 					}
 					if (agg.op == AggOp::SUM) {
-						if (agg.return_type.InternalType() == PhysicalType::INT128) {
+						if (huge) {
 							FlatVector::GetData<hugeint_t>(vec)[i] = ToHuge(total_sum);
 						} else {
 							FlatVector::GetData<int64_t>(vec)[i] = int64_t(total_sum);
 						}
 					} else if (agg.semantic_bits == 16) {
 						// IntegerAverageOperation: an int64 state, double(sum) / double(count)
-						FlatVector::GetData<double>(vec)[i] = double(int64_t(total_sum)) / double(uint64_t(valid));
+						FlatVector::GetData<double>(vec)[i] = double(int64_t(total_sum)) / double(uint64_t(valid[g]));
 					} else {
 						// IntegerAverageOperationHugeint: Hugeint::Cast<long double>(sum) / (long double)count
 						long double numerator = 0;
 						Hugeint::TryCast<long double>(ToHuge(total_sum), numerator);
-						const long double divident = static_cast<long double>(uint64_t(valid));
+						const long double divident = static_cast<long double>(uint64_t(valid[g]));
 						FlatVector::GetData<double>(vec)[i] = static_cast<double>(numerator / divident);
 					}
-					continue;
 				}
-				// MIN / MAX: the value in the aggregate's own type.
-				const int64_t v = groups.slot[s.extreme][g];
-				switch (agg.return_type.InternalType()) {
-				case PhysicalType::INT8: FlatVector::GetData<int8_t>(vec)[i] = int8_t(v); break;
-				case PhysicalType::INT16: FlatVector::GetData<int16_t>(vec)[i] = int16_t(v); break;
-				case PhysicalType::INT32: FlatVector::GetData<int32_t>(vec)[i] = int32_t(v); break;
-				case PhysicalType::INT64: FlatVector::GetData<int64_t>(vec)[i] = v; break;
-				case PhysicalType::UINT8: FlatVector::GetData<uint8_t>(vec)[i] = uint8_t(v); break;
-				case PhysicalType::UINT16: FlatVector::GetData<uint16_t>(vec)[i] = uint16_t(v); break;
-				case PhysicalType::UINT32: FlatVector::GetData<uint32_t>(vec)[i] = uint32_t(v); break;
-				case PhysicalType::UINT64: FlatVector::GetData<uint64_t>(vec)[i] = uint64_t(v); break;
-				default:
-					throw InternalException("arrowmetal_rewrite: unexpected MIN/MAX type");
+			}
+			// SUM, AVG, MIN and MAX of a group with no value are NULL.
+			for (idx_t i = 0; i < n; i++) {
+				if (valid[start + i] == 0) {
+					validity.SetInvalid(i);
 				}
 			}
 		}
 		chunk.SetCardinality(n);
 		collection.Append(chunk);
-	}
-}
-
-// ARROWMETAL_REWRITE_TRACE=1 prints the time since `start` at each Finalize step to stderr.
-static void Trace(const char *step, std::chrono::steady_clock::time_point start) {
-	static const bool enabled = getenv("ARROWMETAL_REWRITE_TRACE") != nullptr;
-	if (enabled) {
-		fprintf(stderr, "arrowmetal_rewrite: %-8s %8.3f ms\n", step,
-		        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
 	}
 }
 
@@ -1533,7 +1557,6 @@ SinkFinalizeType PhysicalArrowMetalAggregate::Finalize(Pipeline &pipeline, Event
 	auto slots = PlanNeeds(spec, nullable, plan);
 	Groups groups;
 	groups.slot.resize(plan.needs.size());
-	groups.slot_valid.resize(plan.needs.size());
 	groups.slot_unsigned.assign(plan.needs.size(), false);
 	string path;
 
@@ -1545,7 +1568,6 @@ SinkFinalizeType PhysicalArrowMetalAggregate::Finalize(Pipeline &pipeline, Event
 			groups.count = 1;
 			for (idx_t n = 0; n < plan.needs.size(); n++) {
 				groups.slot[n].assign(1, 0);
-				groups.slot_valid[n].assign(1, false);
 			}
 		}
 	} else {
@@ -1589,7 +1611,7 @@ SinkFinalizeType PhysicalArrowMetalAggregate::Finalize(Pipeline &pipeline, Event
 				path = "fused aggregate (all keys NULL)";
 				RunScalarQuery(columns, "(query (aggregate" + AggregateList(plan) + "))", plan, groups);
 				groups.key.values.assign(1, 0);
-				groups.key.valid.assign(1, false);
+				groups.key.valid.assign(1, 0);
 			} else {
 				path = "hash group-by";
 				RunHash(columns, plan, groups);
