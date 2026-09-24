@@ -4465,7 +4465,8 @@ def write_parquet(data, path, compression="snappy", use_dictionary=True, row_gro
 # ---------------------------------------------------------------------------------------------------
 # CSV, parsed on the GPU (docs/CSV.md)
 #
-# `am.read_csv(path)` maps the file, finds every field and record boundary with a quote-aware GPU scan,
+# `am.read_csv(path)` reads the file into one Metal buffer (pread by default, mmap with
+# file_access="map"), finds every field and record boundary with a quote-aware GPU scan,
 # infers each column's type with pyarrow.csv's rules and converts it with a compute kernel. The options
 # are pyarrow's -- pass pyarrow's own ReadOptions / ParseOptions / ConvertOptions objects, or the same
 # names as keywords -- and default to pyarrow's values.
@@ -4499,7 +4500,20 @@ for _n in ("am_csv_batch_rows", "am_csv_batch_columns"):
     getattr(_lib, _n).argtypes = [_P]
     getattr(_lib, _n).restype = ctypes.c_int64
 _lib.am_csv_batch_column_name.argtypes = [_P, ctypes.c_int64]
-_lib.am_csv_batch_column_name.restype = ctypes.c_char_p
+_lib.am_csv_batch_column_name.restype = _P
+_lib.am_csv_batch_column_name_length.argtypes = [_P, ctypes.c_int64]
+_lib.am_csv_batch_column_name_length.restype = ctypes.c_int64
+_lib.am_csv_last_error.argtypes = [ctypes.POINTER(ctypes.c_int64)]
+_lib.am_csv_last_error.restype = _P
+
+
+def _csv_check(rc):
+    """`_check` with the message taken by length, so a quoted value holding a NUL byte stays whole."""
+    if rc != 0:
+        n = ctypes.c_int64(0)
+        p = _lib.am_csv_last_error(ctypes.byref(n))
+        msg = ctypes.string_at(p, n.value).decode("utf-8", "replace") if p else "unknown error"
+        raise ArrowMetalError(msg or "unknown error")
 _lib.am_csv_batch_column.argtypes = [_P, ctypes.c_int64, ctypes.POINTER(_P)]
 _lib.am_csv_batch_column.restype = ctypes.c_int
 _lib.am_csv_batch_release.argtypes = [_P]
@@ -4660,18 +4674,20 @@ def read_csv(path, *, read_options=None, parse_options=None, convert_options=Non
     c.file_access = 0 if o["file_access"] == "read" else 1
 
     reader = _P()
-    _check(_lib.am_csv_open(os.fspath(path).encode(), ctypes.byref(c), ctypes.byref(reader)))
+    _csv_check(_lib.am_csv_open(os.fspath(path).encode(), ctypes.byref(c), ctypes.byref(reader)))
     try:
         out = _P()
-        _check(_lib.am_csv_read(reader, ctypes.byref(out)))
+        _csv_check(_lib.am_csv_read(reader, ctypes.byref(out)))
     finally:
         _lib.am_csv_close(reader)
     try:
         pairs = []
         for i in range(_lib.am_csv_batch_columns(out)):
-            name = _lib.am_csv_batch_column_name(out, i).decode()
+            # By length: a header field may hold NUL bytes.
+            name = ctypes.string_at(_lib.am_csv_batch_column_name(out, i),
+                                    _lib.am_csv_batch_column_name_length(out, i)).decode()
             h = _P()
-            _check(_lib.am_csv_batch_column(out, i, ctypes.byref(h)))
+            _csv_check(_lib.am_csv_batch_column(out, i, ctypes.byref(h)))
             pairs.append((name, MetalArray(h)))
         return ColumnSet(pairs)
     finally:

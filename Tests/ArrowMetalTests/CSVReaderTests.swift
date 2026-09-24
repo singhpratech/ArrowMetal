@@ -288,6 +288,111 @@ final class CSVReaderTests: XCTestCase {
         XCTAssertEqual(b.columns[2].asInt64?.toArray(), [31])
     }
 
+    /// `scanBlockBytes` changes only the speed, for any positive size: one past 32 bits once trapped.
+    func testScanBlockBytesOfAnySize() throws {
+        let path = try write("a,b\n1,\"x\ny\"\n2,z\n")
+        for access in [CSVReadOptions.FileAccess.read, .map] {
+            for size in [1, 7, 1 << 20, (1 << 32) - 1, 1 << 32, 1 << 40, Int.max] {
+                var o = CSVReadOptions()
+                o.scanBlockBytes = size
+                o.fileAccess = access
+                let b = try CSVReader.read(path: path, options: o)
+                XCTAssertEqual(b.columns[0].asInt64?.toArray(), [1, 2], "\(size)")
+                XCTAssertEqual(strings(b.columns[1]), ["x\ny", "z"], "\(size)")
+            }
+        }
+    }
+
+    private func tsValues(_ a: AnyMetalArray) -> [Int64?] {
+        guard case .temporal(let t) = a, case .int64(let v) = t.storage else { XCTFail("not a timestamp: \(a)"); return [] }
+        return v.toArray()
+    }
+
+    /// timestamp[ns] holds 1677-09-21 00:12:43.145224192 .. 2262-04-11 23:47:16.854775807, less the
+    /// first value (Arrow scales the whole seconds before adding the fraction, and -9223372037 s does not
+    /// scale). Outside it a fractional value is not a timestamp[ns], so inference moves on (to string),
+    /// and a forced timestamp[ns] column raises; whole seconds stay timestamp[s] whatever the year.
+    func testTimestampNanosecondRange() throws {
+        let inside = try read("a\n1677-09-21 00:12:44.0\n2262-04-11 23:47:16.854775807\n")
+        XCTAssertEqual(inside.columns[0].arrowFormat, "tsn:")
+        XCTAssertEqual(tsValues(inside.columns[0]), [-9_223_372_036_000_000_000, Int64.max])
+        for text in ["a\n1000-01-01 00:00:00.5\n2020-01-01 00:00:00.5\n", "a\n3000-01-01 00:00:00.5\n",
+                     "a\n2262-04-11 23:47:16.854775808\n", "a\n1677-09-21 00:12:43.145224192\n",
+                     "a\n1000-01-01 00:00:00.5Z\n", "a\n1677-09-21 00:12:44.0+01:00\n",
+                     "a\n1000-01-01 00:00:00\n2020-01-01 00:00:00.5\n"] {
+            XCTAssertEqual(try read(text).columns[0].arrowFormat, "u", text)
+        }
+        let zoned = try read("a\n2262-04-11 22:47:16.854775807-01:00\n1677-09-21 01:12:44.0+01:00\n")
+        XCTAssertEqual(zoned.columns[0].arrowFormat, "tsn:UTC")
+        XCTAssertEqual(tsValues(zoned.columns[0]), [Int64.max, -9_223_372_036_000_000_000])
+        let seconds = try read("a\n1000-01-01 00:00:00\n9999-12-31 23:59:59\n")
+        XCTAssertEqual(seconds.columns[0].arrowFormat, "tss:")
+        XCTAssertEqual(tsValues(seconds.columns[0]), [-30_610_224_000, 253_402_300_799])
+
+        let ns = CSVColumnType.timestamp(.nano, timezone: nil)
+        for v in ["1000-01-01 00:00:00.5", "1000-01-01 00:00:00", "3000-01-01", "2262-04-11 23:47:16.854775808",
+                  "1677-09-21 00:12:43.145224192", "1000-01-01 00:00:00Z"] {
+            XCTAssertThrowsError(try read("a\n\(v)\n") { $0.columnTypes = ["a": ns] }) {
+                XCTAssertEqual("\($0)", "In CSV column #0: Row #2: CSV conversion error to timestamp[ns]: invalid value '\(v)'")
+            }
+        }
+        let forced = try read("a\n1677-09-21 00:12:44\n2262-04-11 23:47:16.854775807\n") { $0.columnTypes = ["a": ns] }
+        XCTAssertEqual(tsValues(forced.columns[0]), [-9_223_372_036_000_000_000, Int64.max])
+        let us = try read("a\n1000-01-01 00:00:00.5\n") { $0.columnTypes = ["a": .timestamp(.micro, timezone: nil)] }
+        XCTAssertEqual(tsValues(us.columns[0]), [-30_610_223_999_500_000])
+    }
+
+    /// pyarrow skips `skip_rows_after_names` rows without checking their width and counts an empty line
+    /// among them as a row; the rows after them are numbered with the skipped ones counted.
+    func testSkipRowsAfterNamesSkipsRaggedRowsAndCountsEmptyLines() throws {
+        let b = try read("a,b\n1,2,3\n4,5\n") { $0.skipRowsAfterNames = 1 }
+        XCTAssertEqual(b.columns[0].asInt64?.toArray(), [4])
+        XCTAssertEqual(b.columns[1].asInt64?.toArray(), [5])
+        let q = try read("a,b\n\"1\n,2\",3,4\n4,5\n") { $0.skipRowsAfterNames = 1 }
+        XCTAssertEqual(q.columns[0].asInt64?.toArray(), [4])
+        let n = try read("1,2,3\n4,5\n") { $0.skipRowsAfterNames = 1; $0.columnNames = ["a", "b"] }
+        XCTAssertEqual(n.columns[1].asInt64?.toArray(), [5])
+        let e = try read("a,b\n1,2\n\n3,4\n5,6\n") { $0.skipRowsAfterNames = 2 }
+        XCTAssertEqual(e.columns[0].asInt64?.toArray(), [3, 5])
+        let lead = try read("a,b\n\n\n1,2\n3,4\n") { $0.skipRowsAfterNames = 1 }
+        XCTAssertEqual(lead.columns[0].asInt64?.toArray(), [1, 3])
+        let all = try read("a,b\n1,2\n\n\n") { $0.skipRowsAfterNames = 3 }
+        XCTAssertEqual(all.names, ["a", "b"])
+        XCTAssertEqual(all.columns[0].length, 0)
+        XCTAssertThrowsError(try read("a,b\n1,2,3\n4,5\n6\n") { $0.skipRowsAfterNames = 1 }) {
+            XCTAssertEqual("\($0)", "CSV parse error: Row #4: Expected 2 columns, got 1: 6")
+        }
+        XCTAssertThrowsError(try read("a,b\r\r1,2,3\r3,4\r5\r") { $0.skipRowsAfterNames = 2 }) {
+            XCTAssertEqual("\($0)", "CSV parse error: Row #5: Expected 2 columns, got 1: 5")
+        }
+        XCTAssertThrowsError(try read("x\n\na,b\n1,2,3\n4,5\n6\n") { $0.skipRows = 2; $0.skipRowsAfterNames = 1 }) {
+            XCTAssertEqual("\($0)", "CSV parse error: Row #6: Expected 2 columns, got 1: 6")
+        }
+        XCTAssertThrowsError(try read("a,b\n\n1,2,3\n3,4\n5,x\n") { $0.skipRowsAfterNames = 2; $0.columnTypes = ["b": .int64] }) {
+            XCTAssertEqual("\($0)", "In CSV column #1: Row #5: CSV conversion error to int64: invalid value 'x'")
+        }
+    }
+
+    /// pyarrow quotes at most 100 bytes of a ragged row; a longer one is cut to 96 bytes and " ...".
+    func testRaggedRowTextIsCutAt100Bytes() throws {
+        let row100 = String(repeating: "x", count: 98) + ",1"
+        XCTAssertThrowsError(try read("a\n1\n\(row100)\n")) {
+            XCTAssertEqual("\($0)", "CSV parse error: Row #3: Expected 1 columns, got 2: \(row100)")
+        }
+        let row101 = String(repeating: "x", count: 99) + ",1"
+        XCTAssertThrowsError(try read("a\n1\n\(row101)\n")) {
+            XCTAssertEqual("\($0)", "CSV parse error: Row #3: Expected 1 columns, got 2: \(String(repeating: "x", count: 96)) ...")
+        }
+    }
+
+    /// A quote character equal to the delimiter never opens a quote, as in pyarrow.
+    func testDelimiterEqualToQuoteChar() throws {
+        let b = try read("a\"b\n1\"2\n") { $0.delimiter = UInt8(ascii: "\""); $0.quoteChar = UInt8(ascii: "\"") }
+        XCTAssertEqual(b.names, ["a", "b"])
+        XCTAssertEqual(b.columns[0].asInt64?.toArray(), [1])
+        XCTAssertEqual(b.columns[1].asInt64?.toArray(), [2])
+    }
+
     func testSkipRowsAndNames() throws {
         let b = try read("junk\n\njunk2\na,b\n1,2\n3,4\n") { $0.skipRows = 3; $0.skipRowsAfterNames = 1 }
         XCTAssertEqual(b.names, ["a", "b"])

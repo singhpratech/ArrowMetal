@@ -216,6 +216,12 @@ CSV on the GPU
 - `MetalStringArray.parse(Double.self)` / `parse(Float.self)` run on the GPU (Eisel-Lemire in integer
   arithmetic), bit-identical to the Swift initialisers they replace, which still parse the rows the GPU
   cannot decide exactly.
+- CSV reader review fixes: `scan_block_bytes` of 2^32 or more no longer traps (any positive size only
+  changes the speed); a fractional timestamp outside int64 nanoseconds is not inferred as timestamp[ns]
+  and raises when forced, as in pyarrow; `skip_rows_after_names` skips rows without a width check and
+  counts empty lines, as pyarrow does; ragged-row errors quote at most 100 bytes of the row, as pyarrow's
+  do; `delimiter` equal to `quote_char` is accepted; `am_csv_batch_column_name_length` and
+  `am_csv_last_error` carry names and messages that hold NUL bytes.
 
 Out-of-core streaming
 - A streaming executor for datasets larger than memory (docs/STREAMING.md): Arrow IPC files/directories

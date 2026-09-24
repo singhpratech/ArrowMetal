@@ -1553,7 +1553,8 @@ int am_stream_join_group_by(am_stream* s, struct ArrowArrayStream* build, const 
 // ---------------------------------------------------------------------------------------------------
 // CSV, parsed on the GPU (docs/CSV.md)
 //
-// am_csv_open maps the file and copies the options; am_csv_read does the work. A structure pass finds
+// am_csv_open checks the file and copies the options; am_csv_read reads the file into one Metal buffer
+// (pread by default, or a no-copy mmap with file_access = 1) and does the work. A structure pass finds
 // every field and record boundary on the GPU (quote-aware: RFC 4180 with quoted delimiters and
 // newlines, "" as an escaped quote, CRLF / LF / CR line ends, a UTF-8 BOM, a missing final newline),
 // then each projected column is typed with pyarrow.csv's inference rules and converted by a compute
@@ -1564,7 +1565,7 @@ int am_stream_join_group_by(am_stream* s, struct ArrowArrayStream* build, const 
 // "g" "u" "z" "tdD" "tts" "ttm" "ttu" "ttn" and "ts{s,m,u,n}:" with an optional timezone.
 // Every non-zero return (and every -1 from a count) sets am_last_error(); parse and conversion errors
 // use pyarrow's wording ("CSV parse error: Row #3: Expected 3 columns, got 2: 4,5").
-typedef struct am_csv_reader am_csv_reader;          // opaque, one mapped CSV file plus its options
+typedef struct am_csv_reader am_csv_reader;          // opaque, one CSV file path plus its options
 typedef struct am_csv_batch am_csv_batch;            // opaque, the columns one read produced
 
 typedef struct am_csv_options {
@@ -1605,9 +1606,15 @@ int     am_csv_read(am_csv_reader* r, am_csv_batch** out);
 int64_t     am_csv_batch_rows(am_csv_batch* b);
 int64_t     am_csv_batch_columns(am_csv_batch* b);
 const char* am_csv_batch_column_name(am_csv_batch* b, int64_t i);
+// The byte length of that name (UTF-8, without the terminating NUL): a header field may hold NUL
+// bytes, which the C string above would cut short. -1 for a bad handle or index.
+int64_t     am_csv_batch_column_name_length(am_csv_batch* b, int64_t i);
 // Hands out a new am_array handle; release it with am_release.
 int         am_csv_batch_column(am_csv_batch* b, int64_t i, am_array** out);
 void        am_csv_batch_release(am_csv_batch* b);
+// am_last_error()'s message with its byte length in *length (may be NULL), for messages that quote a
+// value holding a NUL byte. The buffer is per thread and valid until the next call on that thread.
+const char* am_csv_last_error(int64_t* length);
 
 #ifdef __cplusplus
 }

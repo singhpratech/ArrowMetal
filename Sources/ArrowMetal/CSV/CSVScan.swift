@@ -73,10 +73,12 @@ extension CSVReader {
     /// Runs the structure pass over [dataStart, dataEnd) of `file`.
     func scanStructure(file: MetalArrowBuffer, dataStart: Int, dataEnd: Int, keep: inout [AnyObject]) throws -> CSVStructure {
         let ctx = context
-        let blockBytes = Swift.max(1, options.scanBlockBytes)
         // Blocks start at multiples of blockBytes from dataStart rounded down to 16, so that with a
         // block size that is a multiple of 16 every block but the first starts 16-byte aligned.
         let base = dataStart & ~15
+        // A block larger than the data is one block either way; capping it there keeps every
+        // position the kernel computes (base + (b + 1) * blockBytes) inside 32 bits for any request.
+        let blockBytes = Swift.max(1, Swift.min(options.scanBlockBytes, roundUp(Swift.max(1, dataEnd - base), to: 16)))
         let nBlocks = dataEnd > dataStart ? (dataEnd - base + blockBytes - 1) / blockBytes : 0
         if nBlocks == 0 {
             let ev = try MetalArrowBuffer.allocate(byteCount: 4, zeroed: true, context: ctx)

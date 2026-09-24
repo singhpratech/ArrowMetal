@@ -163,6 +163,20 @@ CASES = [
     ("ts_bad_forms", "a\n2020-01-01Z\n"),
     ("ts_offset_24", "a\n2020-01-01 12:00:00+24:00\n"),
     ("ts_1900", "a\n1900-01-01 00:00:00.5\n1850-06-30 23:59:59\n"),
+    # timestamp[ns] holds 1677-09-21 00:12:43.145224192 .. 2262-04-11 23:47:16.854775807; a fractional
+    # value outside it does not convert, so the column falls through to string
+    ("ts_ns_before_range", "a\n1000-01-01 00:00:00.5\n2020-01-01 00:00:00.5\n"),
+    ("ts_ns_after_range", "a\n3000-01-01 00:00:00.5\n"),
+    ("ts_ns_before_range_zoned", "a\n1000-01-01 00:00:00.5Z\n"),
+    ("ts_ns_last", "a\n2262-04-11 23:47:16.854775807\n"),
+    ("ts_ns_past_last", "a\n2262-04-11 23:47:16.854775807\n2262-04-11 23:47:16.854775808\n"),
+    ("ts_ns_first_whole_second", "a\n1677-09-21 00:12:44.0\n"),
+    ("ts_ns_min_rejected", "a\n1677-09-21 00:12:43.145224192\n"),
+    ("ts_ns_offset_pushes_out", "a\n1677-09-21 00:12:44.0+01:00\n"),
+    ("ts_ns_offset_brings_in", "a\n2262-04-11 22:47:16.854775807-01:00\n1677-09-21 01:12:44.0+01:00\n"),
+    ("ts_s_far_past_stays_s", "a\n1000-01-01 00:00:00\n0001-01-01\n9999-12-31 23:59:59\n"),
+    ("ts_s_out_of_ns_with_ns", "a\n1000-01-01 00:00:00\n2020-01-01 00:00:00.5\n"),
+    ("ts_ns_out_of_range_zoned_mix", "a\n1000-01-01 00:00:00Z\n2020-01-01 00:00:00.5Z\n"),
     # nulls and strings
     ("nulls", "a,b,c\nNA,,1\nnull,x,\n"),
     ("all_null", "a\n\nNA\n"),
@@ -225,6 +239,12 @@ CASES = [
     ("ragged_after_quoted_newline", 'a,b,c\n"1\n2",2,3\n4,5\n'),
     ("ragged_first_data_row", "a,b,c\n4,5\n"),
     ("ragged_whitespace_line", "a,b\n1,2\n \n"),
+    # pyarrow quotes at most 100 bytes of a ragged row: longer ones are cut to 96 bytes and " ..."
+    ("ragged_row_100_bytes", "a\n1\n" + "x" * 98 + ",1\n"),
+    ("ragged_row_101_bytes", "a\n1\n" + "x" * 99 + ",1\n"),
+    ("ragged_row_long", "a\n1\n" + "x" * 300 + ",1\n"),
+    ("ragged_row_cut_in_a_character", "a\n1\n" + "x" + "\u00e9" * 60 + ",1\n"),
+    ("ragged_row_binary", bytes(range(256))),
 ]
 
 
@@ -249,6 +269,28 @@ OPTION_CASES = [
     ("skip_rows_ragged", "x\na,b,c\n1,2,3\n4,5\n", dict(read_options=R(skip_rows=1))),
     ("skip_rows_after_names", "a,b\n1,2\n3,4\n5,6\n", dict(read_options=R(skip_rows_after_names=2))),
     ("skip_rows_after_names_all", "a,b\n1,2\n", dict(read_options=R(skip_rows_after_names=5))),
+    # skipped rows are not width-checked, an empty line among them counts as a row, and the rows
+    # after them are numbered with the skipped ones counted
+    ("skip_after_ragged", "a,b\n1,2,3\n4,5\n", dict(read_options=R(skip_rows_after_names=1))),
+    ("skip_after_ragged_short", "a,b\n1\n4,5\n", dict(read_options=R(skip_rows_after_names=1))),
+    ("skip_after_ragged_then_ragged", "a,b\n1,2,3\n4,5\n6\n", dict(read_options=R(skip_rows_after_names=1))),
+    ("skip_after_ragged_quoted_newline", 'a,b\n"1\n,2",3,4\n4,5\n', dict(read_options=R(skip_rows_after_names=1))),
+    ("skip_after_ragged_names", "1,2,3\n4,5\n6\n", dict(read_options=R(skip_rows_after_names=1,
+                                                                          column_names=["a", "b"]))),
+    ("skip_after_ragged_autogenerate", "1\n4,5\n", dict(read_options=R(skip_rows_after_names=1,
+                                                                        autogenerate_column_names=True))),
+    ("skip_after_empty_line_counts", "a,b\n1,2\n\n3,4\n5,6\n", dict(read_options=R(skip_rows_after_names=2))),
+    ("skip_after_empty_lines_first", "a,b\n\n\n1,2\n3,4\n", dict(read_options=R(skip_rows_after_names=1))),
+    ("skip_after_crlf_empty", "a,b\r\n\r\n1,2,3\r\n3,4\r\n5\r\n", dict(read_options=R(skip_rows_after_names=2))),
+    ("skip_after_cr_empty", "a,b\r\r1,2,3\r3,4\r5\r", dict(read_options=R(skip_rows_after_names=2))),
+    ("skip_after_lf_then_crlf_empty", "a,b\n\n\r\n1,2,3\n3,4\n5\n", dict(read_options=R(skip_rows_after_names=2))),
+    ("skip_after_names_leading_empty", "\n1,2\n3,4\n5\n", dict(read_options=R(skip_rows_after_names=1,
+                                                                             column_names=["a", "b"]))),
+    ("skip_after_with_skip_rows", "x\n\na,b\n1,2,3\n4,5\n6\n", dict(read_options=R(skip_rows=2,
+                                                                                    skip_rows_after_names=1))),
+    ("skip_after_conversion_error_row", "a,b\n\n1,2,3\n3,4\n5,x\n",
+     dict(read_options=R(skip_rows_after_names=2), convert_options=C(column_types={"b": pa.int64()}))),
+    ("skip_after_past_empty_lines", "a,b\n1,2\n\n\n", dict(read_options=R(skip_rows_after_names=3))),
     ("autogenerate", "1,2\n3,4\n", dict(read_options=R(autogenerate_column_names=True))),
     ("autogenerate_no_newline", "1,2", dict(read_options=R(autogenerate_column_names=True))),
     ("column_names", "1,2\n3,4\n", dict(read_options=R(column_names=["x", "y"]))),
@@ -297,6 +339,17 @@ OPTION_CASES = [
      dict(convert_options=C(column_types={"a": pa.timestamp("s", tz="UTC")}))),
     ("types_time_ms", "a\n12:34:56.5\n12:34:56.\n12:34\n", dict(convert_options=C(column_types={"a": pa.time32("ms")}))),
     ("types_time_ns", "a\n12:34:56.123456789\n", dict(convert_options=C(column_types={"a": pa.time64("ns")}))),
+    ("types_ts_ns_before_range", "a\n1000-01-01 00:00:00.5\n", dict(convert_options=C(column_types={"a": pa.timestamp("ns")}))),
+    ("types_ts_ns_whole_seconds_out", "a\n1000-01-01 00:00:00\n", dict(convert_options=C(column_types={"a": pa.timestamp("ns")}))),
+    ("types_ts_ns_date_out", "a\n3000-01-01\n", dict(convert_options=C(column_types={"a": pa.timestamp("ns")}))),
+    ("types_ts_ns_ends", "a\n1677-09-21 00:12:44\n2262-04-11 23:47:16.854775807\n",
+     dict(convert_options=C(column_types={"a": pa.timestamp("ns")}))),
+    ("types_ts_ns_past_end", "a\n2262-04-11 23:47:16.854775808\n", dict(convert_options=C(column_types={"a": pa.timestamp("ns")}))),
+    ("types_ts_ns_min", "a\n1677-09-21 00:12:43.145224192\n", dict(convert_options=C(column_types={"a": pa.timestamp("ns")}))),
+    ("types_ts_ns_utc_out", "a\n1000-01-01 00:00:00Z\n", dict(convert_options=C(column_types={"a": pa.timestamp("ns", tz="UTC")}))),
+    ("types_ts_ns_out_before_zone_check", "a\n1000-01-01 00:00:00Z\n", dict(convert_options=C(column_types={"a": pa.timestamp("ns")}))),
+    ("types_ts_us_far", "a\n1000-01-01 00:00:00.5\n9999-12-31 23:59:59.999999\n",
+     dict(convert_options=C(column_types={"a": pa.timestamp("us")}))),
     ("types_missing_column_ignored", "a\n1\n", dict(convert_options=C(column_types={"zz": pa.float32()}))),
     ("types_quoted_empty_not_null", 'a\n""\n', dict(convert_options=C(column_types={"a": pa.int64()},
                                                                         quoted_strings_can_be_null=False))),
@@ -313,12 +366,65 @@ OPTION_CASES = [
     ("quote_off", 'a,b\n"x",1\n', dict(parse_options=P(quote_char=False))),
     ("quote_single", "a,b\n'x,y',1\n", dict(parse_options=P(quote_char="'"))),
     ("double_quote_off", 'a\n"x""y"\n', dict(parse_options=P(double_quote=False))),
+    # a quote character equal to the delimiter never opens a quote (pyarrow: the same as quote_char=False)
+    ("delimiter_is_quote_char", 'a"b\n1"2\n', dict(parse_options=P(delimiter='"'))),
+    ("delimiter_is_quote_char_ragged", 'a"b\n"1"2\n', dict(parse_options=P(delimiter='"'))),
+    ("delimiter_is_quote_char_comma", "a,b\n1,2\n", dict(parse_options=P(delimiter=",", quote_char=","))),
 ]
 
 
 @pytest.mark.parametrize("name,data,kw", OPTION_CASES, ids=[c[0] for c in OPTION_CASES])
 def test_options(tmp_csv, name, data, kw):
     check(tmp_csv(data), **kw)
+
+
+def test_scan_block_bytes_of_any_size(tmp_csv):
+    """scan_block_bytes changes only the speed, up to sizes past 32 bits (which once trapped the process)."""
+    path = tmp_csv('a,b\n1,"x\ny"\n2,z\n')
+    exp = am.read_csv_table(path)
+    for size in (1, 7, 1 << 20, (1 << 32) - 1, 1 << 32, 1 << 40, (1 << 63) - 1):
+        assert_tables_equal(am.read_csv_table(path, scan_block_bytes=size), exp)
+        assert_tables_equal(am.read_csv_table(path, scan_block_bytes=size, file_access="map"), exp)
+
+
+def test_nul_bytes_in_names_and_messages(tmp_csv):
+    """A NUL byte in a header name or in a value an error quotes comes through the C ABI whole."""
+    check(tmp_csv(b"a\x00,b\n1,2\n"))
+    check(tmp_csv(b"\x00\n\x00\n"))
+    check(tmp_csv(b"a\n1\x00\n"), convert_options=C(column_types={"a": pa.int64()}))
+    check(tmp_csv(b"a\n1\n2,\x003\n"))
+    t = am.read_csv_table(tmp_csv(b"x\x00y,b\n1,2\n"))
+    assert t.schema.names == ["x\x00y", "b"]
+
+
+@pytest.mark.parametrize("data,kw", [
+    ("a,b\n", {}), ("a,b\n1,2", {}), ('a,b\n"1\n2",3', {}), ("1,2", {"column_names": ["a", "b"]}),
+])
+def test_skip_rows_after_names_with_no_complete_row(tmp_csv, data, kw):
+    """With skip_rows_after_names, when nothing after the header ends with a line terminator outside
+    quotes, pyarrow raises its block-straddle error; this reader skips what is there and returns an empty
+    table with null columns."""
+    path = tmp_csv(data)
+    with pytest.raises(pa.ArrowInvalid, match="straddling object straddles two block boundaries"):
+        pc.read_csv(path, read_options=R(skip_rows_after_names=1, use_threads=False, **kw),
+                    parse_options=P(newlines_in_values=True))
+    t = am.read_csv_table(path, skip_rows_after_names=1, **kw)
+    assert t.schema.names == ["a", "b"]
+    assert [str(f.type) for f in t.schema] == ["null", "null"]
+    assert t.num_rows == 0
+
+
+def test_header_name_not_utf8(tmp_csv):
+    """A header name that is not valid UTF-8 has each invalid sequence replaced by U+FFFD; pyarrow keeps
+    the bytes, which its Python schema.names then cannot decode. The values are the same."""
+    path = tmp_csv(b"\xef\xbba,b\n1,2\n")
+    t = am.read_csv_table(path)
+    assert t.schema.names == ["\ufffda", "b"]
+    exp = pc.read_csv(path)
+    with pytest.raises(UnicodeDecodeError):
+        exp.schema.names
+    # pyarrow's columns are reachable only once the undecodable name is replaced
+    assert_tables_equal(t.rename_columns(["x", "b"]), exp.rename_columns(["x", "b"]))
 
 
 def test_column_types_spellings(tmp_csv):
@@ -363,7 +469,8 @@ def test_unsupported_options_raise(tmp_csv):
         am.read_csv(path, read_options=R(encoding="latin1"))
     with pytest.raises(NotImplementedError):
         am.read_csv(path, parse_options=P(invalid_row_handler=lambda row: "skip"))
-    for t in (pa.decimal128(10, 2), pa.large_string(), pa.dictionary(pa.int32(), pa.string())):
+    for t in (pa.decimal128(10, 2), pa.large_string(), pa.large_binary(), pa.dictionary(pa.int32(), pa.string()),
+              pa.date64(), pa.duration("s"), pa.float16()):
         with pytest.raises(NotImplementedError):
             am.read_csv(path, column_types={"a": t})
     with pytest.raises(NotImplementedError):

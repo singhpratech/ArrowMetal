@@ -3,8 +3,8 @@
 ArrowMetal reads CSV with Metal compute kernels: the file's bytes go into one shared-memory buffer, a
 quote-aware scan finds every field and record boundary on the GPU, and each column is typed with
 `pyarrow.csv.read_csv`'s inference rules and converted by a kernel straight into Arrow arrays. The host
-parses bytes only for a byte order mark, `skip_rows`, the header names, error messages and the rare float
-the GPU parser hands back (below).
+parses bytes only for a byte order mark, `skip_rows` and `skip_rows_after_names`, the header names, error
+messages and the rare float the GPU parser hands back (below).
 
 The oracle is `pyarrow.csv.read_csv`. For every file and option set in `python/tests/test_csv.py` the two
 readers return the same table — names, types, validity and values, floating point bit for bit — or fail
@@ -201,9 +201,11 @@ is a case in `python/tests/test_csv.py`.
 | Integers | `-?digits` in range, or `0x` + 1..16 hex digits; spaces and tabs trimmed; `+3` makes the column float64; out of int64 range makes it float64 |
 | Floats | one optional `+` or `-`; `digits[.digits]` / `.digits` with an optional exponent; `inf`, `infinity`, `nan`, `nan(chars)` in any case; spaces and tabs trimmed; no hex; `nan` is null by default because it is in `null_values`, while `NAN` is a NaN; NaN is the quiet NaN with the sign given |
 | Dates and times | `YYYY-MM-DD` validated (`2021-02-29` is a string); `hh:mm` and `hh:mm:ss` are time32[s], a fraction makes the column a string; spaces and tabs trimmed |
-| Timestamps | not trimmed; `YYYY-MM-DD` alone counts; seconds 60 and hour 24 are rejected; a fraction (up to 9 digits) makes it timestamp[ns]; an offset or `Z` makes it UTC with the offset applied; naive and zoned values together are a string column |
-| Structure | ragged rows raise `CSV parse error: Row #N: Expected w columns, got m: <row>`, N counting skipped lines and records, not empty lines; a header with no newline after it raises `Empty CSV file or block: cannot infer number of columns`; an empty file raises `Empty CSV file`; a BOM is skipped |
+| Timestamps | not trimmed; `YYYY-MM-DD` alone counts; seconds 60 and hour 24 are rejected; a fraction (up to 9 digits) makes it timestamp[ns], provided the value fits in int64 nanoseconds as Arrow computes it (whole seconds scaled first, then the fraction added: 1677-09-21 00:12:44 through 2262-04-11 23:47:16.854775807, so 1677-09-21 00:12:43.145224192 is outside), and a fractional value outside that range makes the column a string; without a fraction the column is timestamp[s] for any year; a forced timestamp[ns] column raises `invalid value` for a value outside the range; an offset or `Z` makes it UTC with the offset applied; naive and zoned values together are a string column |
+| Structure | ragged rows raise `CSV parse error: Row #N: Expected w columns, got m: <row>`, N counting skipped lines and records, not empty lines, and `<row>` the row's text when it is at most 100 bytes, otherwise its first 96 bytes and ` ...`; a header with no newline after it raises `Empty CSV file or block: cannot infer number of columns`; an empty file raises `Empty CSV file`; a BOM is skipped |
 | `skip_rows` | whole lines by their terminators, quotes ignored, empty lines counted; a line with no terminator cannot be skipped |
+| `skip_rows_after_names` | rows after the header, skipped without a width check (`a,b` then `1,2,3` is skipped, not an error); a quoted newline stays inside its row; an empty line counts as one of the skipped rows; row numbers in later errors count the skipped rows |
+| `delimiter` equal to `quote_char` | accepted; the delimiter wins and no field is quoted, the same table as `quote_char=False` |
 | Errors | `In CSV column #c: Row #N: CSV conversion error to <type>: invalid value '<v>'`, and the two zone-offset messages for timestamp columns |
 
 The probe that established the table, abridged (`probe(text, **options)` prints pyarrow's types and
@@ -231,6 +233,11 @@ probe("a\n2020-01-01 12:34:56Z\n2020-01-01 12:34:56\n")   # string
 probe("a\nNAN\n-NAN\nnan(123)\n")              # double NaN (nan alone is a null value)
 probe("a,b,c\n\n1,2,3\n4,5\n", read_options=pc.ReadOptions(use_threads=False))   # Row #3
 probe('"x\ny"\na,b\n1,2\n', read_options=pc.ReadOptions(skip_rows=1))           # skip_rows ignores quotes
+probe("a,b\n1,2,3\n4,5\n", read_options=pc.ReadOptions(skip_rows_after_names=1))  # a=[4] b=[5]: not width-checked
+probe("a\n1000-01-01 00:00:00.5\n")             # string: outside int64 nanoseconds
+probe("a\n1000-01-01 00:00:00\n")               # timestamp[s]
+probe('a"b\n1"2\n', parse_options=pc.ParseOptions(delimiter='"'))                  # a=[1] b=[2]
+probe("a\n1\n" + "x" * 300 + ",1\n", read_options=pc.ReadOptions(use_threads=False))  # row text cut: 96 bytes + " ..."
 ```
 
 ## Options
@@ -260,6 +267,11 @@ probe('"x\ny"\na,b\n1,2\n', read_options=pc.ReadOptions(skip_rows=1))           
 time32[s|ms], time64[us|ns] and timestamp[s|ms|us|ns] with or without a timezone. In Python the keywords
 have pyarrow's names and win over the option objects.
 
+Column names and error messages can hold NUL bytes (a header field `a\0`, an error quoting the value
+`1\0`). The C ABI hands both out as NUL-terminated strings and also gives their byte length,
+`am_csv_batch_column_name_length` and `am_csv_last_error(&length)`; Python reads them by length, so they
+arrive whole (`test_nul_bytes_in_names_and_messages`).
+
 ## Differences from pyarrow
 
 - **Quoted newlines are always parsed**, which is pyarrow's `newlines_in_values=True`; the tests run
@@ -268,13 +280,22 @@ have pyarrow's names and win over the option objects.
   `test_quoted_newline_across_pyarrow_blocks` shows both.
 - **The ragged-row and conversion errors always carry `Row #N`**, which is the message pyarrow's serial
   reader (`use_threads=False`) gives; its threaded reader leaves the row number out.
+- **`skip_rows_after_names` with no complete row after the header**: when nothing after the header
+  ends with a line terminator outside quotes (`a,b\n`, or `a,b\n1,2` with no final newline), pyarrow
+  raises `straddling object straddles two block boundaries (try to increase block size?)`; this reader
+  skips what is there and returns an empty table
+  (`test_skip_rows_after_names_with_no_complete_row`).
+- **A header name that is not valid UTF-8** has each invalid sequence replaced by U+FFFD (`\xef\xbba`
+  becomes `\ufffda`); pyarrow keeps the name's bytes as they are, and its `schema.names` then fails to
+  decode in Python (`test_header_name_not_utf8`).
 - **The table comes back with one chunk per column**, where pyarrow's has one chunk per block it read; the
   tests compare values, not chunking.
 - **Not supported yet**, each raising `NotImplementedError` from Python rather than reading differently:
   `escape_char`, `ignore_empty_lines=False`, `timestamp_parsers`, `auto_dict_encode`, an `encoding` other
-  than UTF-8, `invalid_row_handler`, and `column_types` outside the list above (decimals, dictionaries,
-  the large types). The input is a file path; pyarrow also takes file objects, and decompresses a path
-  ending in `.gz`, `.bz2`, `.lz4`, `.zst` or `.br`, which `am.read_csv` refuses (`test_compressed_extensions_are_refused`).
+  than UTF-8, `invalid_row_handler`, and every `column_types` type outside the list above, among them
+  decimal, dictionary, date64, duration, float16, large_string and large_binary (pyarrow reads all of
+  these except float16, for which it raises its own `ArrowNotImplementedError`). The input is a file
+  path; pyarrow also takes file objects, and decompresses a path ending in `.gz`, `.bz2`, `.lz4`, `.zst` or `.br`, which `am.read_csv` refuses (`test_compressed_extensions_are_refused`).
 
 ## Tests
 
@@ -305,7 +326,8 @@ PYTHONPATH=python python Benchmarks/csv_bench.py --rows 1000000,10000000
 quoted text column) at 1M and 10M rows with ArrowMetal, `pyarrow.csv.read_csv`, `polars.read_csv`,
 `pandas.read_csv` (pyarrow engine and default engine) and DuckDB's `read_csv`, and writes the median,
 min and max of each. The run recorded so far was taken while other work shared the GPU and is kept as
-`Benchmarks/results/csv_bench_2026-09-23_provisional.csv`; published numbers will come from a quiet
+`Benchmarks/results/csv_bench_2026-09-23_provisional.csv` (named for the lane's day; the run itself
+went past midnight, so its `date` column reads 2026-09-24); published numbers will come from a quiet
 rerun.
 
 `ARROWMETAL_CSV_TRACE=1` prints the wall time of each phase of a read to stderr, and `=2` runs every

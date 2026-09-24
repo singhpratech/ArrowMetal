@@ -562,17 +562,32 @@ enum CSVSource {
         return true;
     }
 
+    // secs * 10^unitDigits + sub as Arrow's CastSecondsToUnit and the add after it compute them: false
+    // when either step leaves int64 (sub >= 0). Years 0000-9999 with any zone offset keep |secs| below
+    // 2.6e11, so only nanoseconds can overflow, and they do outside
+    // [-9223372036 s, 9223372036 s] or when the fraction carries the sum past INT64_MAX.
+    inline bool csv_ticks(long secs, uint unitDigits, long scale, long sub, thread long& out) {
+        if (unitDigits >= 9u && (secs > 9223372036L || secs < -9223372036L)) return false;
+        long v = secs * scale;
+        if (v > 0x7FFFFFFFFFFFFFFFL - sub) return false;
+        out = v + sub;
+        return true;
+    }
+
     // Arrow's ParseTimestampISO8601, value in ticks of 10^-unitDigits s. `zone` reports an offset or Z.
-    // `frac` reports whether a fractional part was present.
-    inline bool csv_iso(device const uchar* s, uint length, uint unitDigits, thread long& out,
-                        thread bool& zone, thread bool& frac) {
-        zone = false; frac = false;
+    // `frac` reports whether a fractional part was present. `over` reports a value that parses but does
+    // not fit in int64 ticks of the unit, which Arrow rejects; the function then returns true, so that
+    // inference can still take it as a timestamp at a coarser unit. `csv_iso` below folds `over` into
+    // the result.
+    inline bool csv_iso_x(device const uchar* s, uint length, uint unitDigits, thread long& out,
+                          thread bool& zone, thread bool& frac, thread bool& over) {
+        zone = false; frac = false; over = false;
         if (length < 10u) return false;
         int days;
         if (!csv_ymd(s, days)) return false;
         long scale = csv_pow10(unitDigits);
         long secs = (long)days * 86400L;
-        if (length == 10u) { out = secs * scale; return true; }
+        if (length == 10u) { over = !csv_ticks(secs, unitDigits, scale, 0L, out); return true; }
         if (s[10] != (uchar)0x20u && s[10] != (uchar)0x54u) return false;
         int zoneOff = 0;
         if (s[length - 1u] == (uchar)0x5Au) { length -= 1u; zone = true; }
@@ -598,13 +613,19 @@ enum CSVSource {
         else if (length == 19u || (length >= 21u && length <= 29u)) { if (!csv_hh_mm_ss(s + 11, sm)) return false; }
         else return false;
         secs += (long)sm + (long)zoneOff;
-        if (length <= 19u) { out = secs * scale; return true; }
+        if (length <= 19u) { over = !csv_ticks(secs, unitDigits, scale, 0L, out); return true; }
         if (s[19] != (uchar)0x2Eu) return false;
         long sub;
         if (!csv_subsec(s + 20, length - 20u, unitDigits, sub)) return false;
         frac = true;
-        out = secs * scale + sub;
+        over = !csv_ticks(secs, unitDigits, scale, sub, out);
         return true;
+    }
+
+    inline bool csv_iso(device const uchar* s, uint length, uint unitDigits, thread long& out,
+                        thread bool& zone, thread bool& frac) {
+        bool over;
+        return csv_iso_x(s, length, unitDigits, out, zone, frac, over) && !over;
     }
 
     // Arrow's time32 / time64 parse (after trimming): hh:mm, hh:mm:ss, hh:mm:ss.fff...
@@ -678,8 +699,11 @@ enum CSVSource {
         if (csv_date(p, len, days)) return 3u;
         long tv;
         if (csv_time(p, len, 0u, tv)) return 4u;
-        bool zone, frac;
-        if (csv_iso(p, len, 9u, tv, zone, frac)) return zone ? (frac ? 8u : 7u) : (frac ? 6u : 5u);
+        bool zone, frac, over;
+        // Without a fraction the value is timestamp[s], which cannot overflow; with one it is
+        // timestamp[ns] only when it fits in int64 nanoseconds (otherwise Arrow moves on to float, string).
+        if (csv_iso_x(p, len, 9u, tv, zone, frac, over) && (!frac || !over))
+            return zone ? (frac ? 8u : 7u) : (frac ? 6u : 5u);
         ulong bits;
         if (fp_parse(p, len, FP_CSV, (uchar)P.decimalPoint, false, bits) != FP_INVALID) return 9u;
         if ((P.flags & CSV_UTF8) == 0u || csv_utf8(p, len)) return 10u;
@@ -749,10 +773,11 @@ enum CSVSource {
                 long tv;
                 if ((alive & K_TIME) != 0u && csv_time(p, len, 0u, tv)) ok |= K_TIME;
                 if ((alive & (K_TS | K_TSNS | K_TSZ | K_TSZNS)) != 0u) {
-                    bool zone, frac;
-                    if (csv_iso(p, len, 9u, tv, zone, frac)) {
-                        if (!zone) ok |= K_TSNS | (frac ? 0u : K_TS);
-                        else ok |= K_TSZNS | (frac ? 0u : K_TSZ);
+                    bool zone, frac, over;
+                    if (csv_iso_x(p, len, 9u, tv, zone, frac, over)) {
+                        uint ns = over ? 0u : (zone ? K_TSZNS : K_TSNS);
+                        if (!zone) ok |= ns | (frac ? 0u : K_TS);
+                        else ok |= ns | (frac ? 0u : K_TSZ);
                     }
                 }
                 if ((alive & K_REAL) != 0u) {

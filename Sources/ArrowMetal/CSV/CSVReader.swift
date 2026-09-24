@@ -14,7 +14,7 @@ import Metal
 // header names, error messages and the floats the GPU parser defers. Columns that are not projected
 // are never converted.
 
-/// A CSV file mapped for reading on the GPU. `read()` returns a Metal-resident record batch.
+/// A CSV file read on the GPU. `read()` returns a Metal-resident record batch.
 ///
 /// ```swift
 /// var o = CSVReadOptions()
@@ -56,6 +56,10 @@ public final class CSVReader: @unchecked Sendable {
 
     public init(path: String, options: CSVReadOptions = CSVReadOptions(), context: MetalContext = .shared) throws {
         self.path = path
+        // A quote character equal to the delimiter never opens a quote: the delimiter wins, which is
+        // how pyarrow reads it (the same table as quote_char=False).
+        var options = options
+        if options.quoteChar == options.delimiter { options.quoteChar = nil }
         self.options = options
         self.context = context
         var st = stat()
@@ -149,7 +153,6 @@ public final class CSVReader: @unchecked Sendable {
         if reserved.contains(o.delimiter) { throw CSVError.invalidOptions("ParseOptions: delimiter cannot be \\r or \\n") }
         if let q = o.quoteChar {
             if reserved.contains(q) { throw CSVError.invalidOptions("ParseOptions: quote_char cannot be \\r or \\n") }
-            if q == o.delimiter { throw CSVError.invalidOptions("ParseOptions: delimiter cannot be the same as quote_char") }
         }
         if o.skipRows < 0 || o.skipRowsAfterNames < 0 { throw CSVError.invalidOptions("ReadOptions: skip counts must be >= 0") }
     }
@@ -211,7 +214,7 @@ public final class CSVReader: @unchecked Sendable {
                           dataStart: Int, skipped: Int, keep: inout [AnyObject]) throws -> MetalRecordBatch {
         let o = options
         let namesFromFile = o.columnNames == nil
-        let ev = s.events.typed(UInt32.self)
+        var ev = s.events.typed(UInt32.self)
         // Wait for the boundaries before the host reads any of them.
         try context.syncPoint()
         mark("emit boundaries")
@@ -225,20 +228,6 @@ public final class CSVReader: @unchecked Sendable {
         if let names = o.columnNames { nCols = names.count } else { nCols = firstRecordEnd(ev, s.count) + 1 }
         guard nCols > 0 else { throw CSVError.parse("CSV parse error: Empty CSV file or block: cannot infer number of columns") }
 
-        let (firstBad, complexCounts) = try checkFields(s, file: file, nCols: nCols, dataStart: dataStart,
-                                                        dataEnd: fileSize, keep: &keep)
-        if let k = firstBad {
-            let k0 = (k / nCols) * nCols
-            var kEnd = k0
-            while kEnd < s.count - 1, (ev[kEnd] >> 31) == 0 { kEnd += 1 }
-            let start = rawSpan(ev, k0, bytes, dataStart: dataStart).0
-            let end = Swift.max(start, Int(ev[kEnd] & 0x7FFF_FFFF))
-            let text = String(decoding: bytes[start..<end], as: UTF8.self)
-            throw CSVError.parse("CSV parse error: Row #\(skipped + k0 / nCols + 1): Expected \(nCols) columns, got \(kEnd - k0 + 1): \(text)")
-        }
-        let nRecords = s.count / nCols
-        mark("check rows")
-
         var names: [String]
         let headerRecords: Int
         if let given = o.columnNames {
@@ -249,7 +238,44 @@ public final class CSVReader: @unchecked Sendable {
             names = (0..<nCols).map { String(decoding: fieldValue(ev, $0, bytes, dataStart: dataStart), as: UTF8.self) }
             headerRecords = 1
         }
-        let firstRecord = Swift.min(nRecords, headerRecords + o.skipRowsAfterNames)
+
+        // pyarrow skips `skip_rows_after_names` rows without checking their width, and counts an empty
+        // line among them as a row. Those rows are dropped on the host by moving the start of the
+        // boundary list (and of the data) past them; the width check then covers the rows that are
+        // read. Without skipped rows the header stays in the list as record 0.
+        var s = s
+        var dataStart = dataStart
+        var rowsBefore = 0                  // rows (records and skipped empty lines) before the list
+        if o.skipRowsAfterNames > 0 {
+            let (k, cursor, rows) = skipRecords(ev, s.count, bytes, from: headerRecords == 1 ? nCols : 0,
+                                                at: headerRecords == 1 ? Int(ev[nCols - 1] & 0x7FFF_FFFF) : dataStart,
+                                                headerEnd: headerRecords == 1, count: o.skipRowsAfterNames)
+            let view = MetalArrowBuffer(mtl: s.events.mtl, byteCount: (s.count - k) * 4,
+                                        offset: s.events.offset + k * 4, keepAlive: s.events)
+            s = CSVStructure(events: view, count: s.count - k, unterminated: s.unterminated)
+            ev = view.typed(UInt32.self)
+            dataStart = cursor
+            rowsBefore = headerRecords + rows
+        }
+
+        let (firstBad, complexCounts) = try checkFields(s, file: file, nCols: nCols, dataStart: dataStart,
+                                                        dataEnd: fileSize, keep: &keep)
+        if let k = firstBad {
+            let k0 = (k / nCols) * nCols
+            var kEnd = k0
+            while kEnd < s.count - 1, (ev[kEnd] >> 31) == 0 { kEnd += 1 }
+            let start = rawSpan(ev, k0, bytes, dataStart: dataStart).0
+            let end = Swift.max(start, Int(ev[kEnd] & 0x7FFF_FFFF))
+            // pyarrow quotes at most 100 bytes of the row: longer rows are cut to 96 bytes and " ...".
+            let text = end - start > 100
+                ? String(decoding: bytes[start..<(start + 96)], as: UTF8.self) + " ..."
+                : String(decoding: bytes[start..<end], as: UTF8.self)
+            throw CSVError.parse("CSV parse error: Row #\(skipped + rowsBefore + k0 / nCols + 1): Expected \(nCols) columns, got \(kEnd - k0 + 1): \(text)")
+        }
+        let nRecords = s.count / nCols
+        mark("check rows")
+
+        let firstRecord = o.skipRowsAfterNames > 0 ? 0 : Swift.min(nRecords, headerRecords)
         let nRows = nRecords - firstRecord
         try Dispatch.checkLength(nRows)
 
@@ -267,11 +293,41 @@ public final class CSVReader: @unchecked Sendable {
 
         let conv = CSVColumnConverter(reader: self, file: file, events: s.events, nCols: nCols,
                                       firstRecord: firstRecord, nRows: nRows, dataStart: dataStart,
-                                      dataEnd: fileSize, rowBase: skipped + firstRecord + 1)
+                                      dataEnd: fileSize, rowBase: skipped + rowsBefore + firstRecord + 1)
         let columns = try conv.convert(plan: plan, complexCounts: complexCounts, keep: &keep)
         numRows = nRows
         mark("columns")
         return try MetalRecordBatch(names: plan.map { $0.name }, columns: columns)
+    }
+
+    /// pyarrow's `skip_rows_after_names`: skips `count` rows starting at field `k` (whose record starts
+    /// at or after byte `cursor`), where a row is a record or an empty line. When `headerEnd` is set,
+    /// `cursor` is the header's line terminator, which is consumed first. Returns the first field after
+    /// the skipped rows, the byte position after them, and how many rows were skipped (fewer than
+    /// `count` when the file ends first).
+    private func skipRecords(_ ev: UnsafePointer<UInt32>, _ nEvents: Int, _ bytes: UnsafeRawBufferPointer,
+                             from k: Int, at cursor: Int, headerEnd: Bool, count: Int) -> (Int, Int, Int) {
+        var k = k, pos = cursor, rows = 0
+        /// Consumes one line terminator at `pos` (`\r\n`, `\n` or `\r`), if there is one.
+        func terminator() {
+            guard pos < fileSize else { return }
+            if bytes[pos] == 0x0D, pos + 1 < fileSize, bytes[pos + 1] == 0x0A { pos += 2 }
+            else if bytes[pos] == 0x0A || bytes[pos] == 0x0D { pos += 1 }
+        }
+        if headerEnd { terminator() }
+        while rows < count, pos < fileSize {
+            if bytes[pos] == 0x0A || bytes[pos] == 0x0D {
+                terminator()                                     // an empty line counts as a row
+            } else {
+                guard k < nEvents else { break }
+                while k < nEvents - 1, (ev[k] >> 31) == 0 { k += 1 }
+                pos = Int(ev[k] & 0x7FFF_FFFF)
+                k += 1
+                terminator()
+            }
+            rows += 1
+        }
+        return (k, pos, rows)
     }
 
     /// Index of the first record end, or `count - 1` when there is none (cannot happen: the last
