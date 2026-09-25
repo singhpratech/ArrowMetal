@@ -33,7 +33,7 @@ That produces `.build/release/libArrowMetalC.dylib`. Then, in your own crate:
 # Cargo.toml
 [dependencies]
 arrow = "59"
-arrowmetal = "0.1.0"          # crates.io; or { path = "../ArrowMetal/rust/arrowmetal" } from a checkout
+arrowmetal = "0.2.0"          # crates.io; or { path = "../ArrowMetal/rust/arrowmetal" } from a checkout
 ```
 
 and build with the dylib's location known:

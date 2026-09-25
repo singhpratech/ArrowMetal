@@ -32,7 +32,7 @@ DUCKDB_C_API_VERSION="${DUCKDB_C_API_VERSION:-v1.2.0}"
 # The DuckDB release whose headers are fetched. Only the headers come from here; the extension never
 # links against libduckdb.
 DUCKDB_HEADER_VERSION="${DUCKDB_HEADER_VERSION:-v1.5.5}"
-EXTENSION_VERSION="${EXTENSION_VERSION:-0.1.0}"
+EXTENSION_VERSION="${EXTENSION_VERSION:-0.2.0}"
 
 ARROWMETAL_LIB="${ARROWMETAL_LIB:-$ROOT/.build/release/libArrowMetalC.dylib}"
 

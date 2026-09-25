@@ -57,8 +57,8 @@ PYTHONPATH=python python -c "import arrowmetal as am; print(am.device_name())"
 
 # Python from a wheel that bundles the dylib (macOS 14+, arm64)
 pip install build && scripts/build_wheel.sh          # or python/build_wheel.sh, if the dylib is built
-pip install python/dist/arrowmetal-0.1.0-*.whl
-pip install 'python/dist/arrowmetal-0.1.0-*.whl[polars,duckdb,pandas]'   # optional bridges
+pip install python/dist/arrowmetal-0.2.0-*.whl
+pip install 'python/dist/arrowmetal-0.2.0-*.whl[polars,duckdb,pandas]'   # optional bridges
 ```
 
 The package finds `libArrowMetalC.dylib` in one of three places, in order: `$ARROWMETAL_LIB`, which pins

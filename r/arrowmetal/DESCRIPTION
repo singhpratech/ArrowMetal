@@ -1,7 +1,7 @@
 Package: arrowmetal
 Type: Package
 Title: Apache Arrow Compute on Apple Silicon GPUs
-Version: 0.1.0
+Version: 0.2.0
 Authors@R: person("ArrowMetal", "contributors", role = c("aut", "cre"),
                   email = "noreply@arrowmetal.dev")
 Description: An R binding for ArrowMetal, which runs Apache Arrow compute

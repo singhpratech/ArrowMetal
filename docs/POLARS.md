@@ -3,7 +3,7 @@
 Polars is the reason most people on an Apple silicon Mac have Arrow-shaped data in memory at all.
 This document is how you point that data at the GPU.
 
-There are four tiers, all in 0.1.0, and they differ in **where the GPU sits
+There are four tiers, the first three in 0.1.0 and the engine (tier 4) in 0.2.0, and they differ in **where the GPU sits
 relative to the Polars plan**:
 
 | Tier | Where the GPU runs | What you write | Needs |

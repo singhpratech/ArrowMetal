@@ -18,7 +18,7 @@ name = "arrowmetal"
 path = "src/lib.rs"
 
 [dependencies]
-arrowmetal-sys = { path = "../arrowmetal-sys", version = "0.1.0" }
+arrowmetal-sys = { path = "../arrowmetal-sys", version = "0.2.0" }
 arrow = { version = "59", default-features = false, features = ["ffi"] }
 
 [dev-dependencies]

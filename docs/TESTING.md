@@ -1,7 +1,7 @@
 # Testing
 
 How ArrowMetal is tested, what each layer compares against, and what "green" means before anything is
-pushed. Numbers are from the last gated run of `main` (0.1.0) on an M4 Max.
+pushed. Numbers are from the last gated run of `main` (0.2.0) on an M4 Max.
 
 | Layer | Size | Oracle |
 |---|---|---|

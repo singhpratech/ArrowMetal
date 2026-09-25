@@ -1,11 +1,12 @@
-# Releasing 0.1.0
+# Releasing
 
-The ordered checklist for turning this checkout into published artefacts. 0.1.0 is not yet on PyPI,
-crates.io or a tagged Swift version.
+The ordered checklist for turning this checkout into published artefacts, written for 0.1.0 and followed
+for 0.2.0 with the version changed: read `0.1.0` below as the version being released.
 Every step is the maintainer's to run; the repository itself never publishes anything.
 
-**The version number stays `0.1.0` throughout.** It is not bumped by any step below, and it is not
-bumped after the release either — the next number is a decision, not a formality.
+**The version number is changed only when a release is decided, in every manifest at once** (step 0
+lists them), and not between releases: work after a release goes under an "Unreleased" heading in
+CHANGELOG.md until the next one.
 
 ---
 

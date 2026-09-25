@@ -1,7 +1,7 @@
 # Changelog
 
-## Unreleased (planned as 0.2.0)
-On `main` and not yet released; `pip install arrowmetal` installs 0.1.0. It will ship as 0.2.0.
+## 0.2.0
+Everything below is new in 0.2.0.
 
 Core
 - CPU/GPU router: `sum`, `min`, `max`, `compare`, `add`/`subtract`/`multiply`, `filter` (by mask and

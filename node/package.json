@@ -1,6 +1,6 @@
 {
   "name": "arrowmetal",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Apache Arrow compute on Apple silicon GPUs, from Node.js",
   "license": "Apache-2.0",
   "private": true,

@@ -16,7 +16,7 @@ private func lastErrorPtr() -> UnsafePointer<CChar>? {
     Thread.current.threadDictionary["ArrowMetalC.lastErrorC"] = c
     return UnsafePointer(c)
 }
-private let versionC = strdup("0.1.0")!
+private let versionC = strdup("0.2.0")!
 private let deviceNameC = strdup(MetalContext.shared.device.name)!
 private var formatCache: [String: UnsafeMutablePointer<CChar>] = [:]
 private let formatLock = NSLock()

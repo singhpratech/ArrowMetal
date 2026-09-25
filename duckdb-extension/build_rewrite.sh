@@ -26,7 +26,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 BUILD="$HERE/build"
 PYTHON="${PYTHON:-python3}"
-EXTENSION_VERSION="${EXTENSION_VERSION:-0.1.0}"
+EXTENSION_VERSION="${EXTENSION_VERSION:-0.2.0}"
 ARROWMETAL_LIB="${ARROWMETAL_LIB:-$ROOT/.build/release/libArrowMetalC.dylib}"
 
 if [ ! -f "$ARROWMETAL_LIB" ]; then

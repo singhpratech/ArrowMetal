@@ -24,7 +24,7 @@ get_filename_component(ARROWMETAL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE
 # The extension's version, and the DuckDB *C API* version it declares. A C_STRUCT extension built
 # against v1.2.0 loads into any DuckDB whose C API is at least that; the engine's own version does
 # not have to match. See docs/DUCKDB.md.
-set(EXTENSION_VERSION "0.1.0" CACHE STRING "version stamped into the extension metadata")
+set(EXTENSION_VERSION "0.2.0" CACHE STRING "version stamped into the extension metadata")
 set(DUCKDB_C_API_VERSION "v1.2.0" CACHE STRING "DuckDB C extension API version to declare")
 
 # The platform string DuckDB checks before it will dlopen the file.

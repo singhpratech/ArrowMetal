@@ -28,7 +28,7 @@ An unsigned extension loads only into a database started with `allow_unsigned_ex
 docs/DUCKDB.md.
 
     python3 append_metadata.py -l build/libarrowmetal_extension.dylib \
-        -o build/arrowmetal.duckdb_extension -p osx_arm64 -dv v1.2.0 -ev 0.1.0
+        -o build/arrowmetal.duckdb_extension -p osx_arm64 -dv v1.2.0 -ev 0.2.0
 """
 import argparse
 import shutil

@@ -1,6 +1,6 @@
 # Roadmap
 
-What comes after 0.1.0, in the order it is likely to happen. Everything here is open to a contributor;
+What comes after 0.2.0, in the order it is likely to happen. Everything here is open to a contributor;
 the measured state behind each item is in [TO_IMPROVE.md](TO_IMPROVE.md) and the benchmark matrix.
 
 This is the only roadmap: the older `../ROADMAP.md` now points here.
@@ -46,8 +46,8 @@ This is the only roadmap: the older `../ROADMAP.md` now points here.
 The gaps a caller meets at the border. Each one is a type or an interface ArrowMetal does not answer
 to yet; the by-family status of every one of them is in [COVERAGE.md](COVERAGE.md).
 
-- **`utf8_view` / `binary_view` through the C Data Interface.** The IPC reader takes the view types on
-  `main` (materialised to the classic layouts), but the C Data importer and exporter still do not read
+- **`utf8_view` / `binary_view` through the C Data Interface.** The IPC reader takes the view types since
+  0.2.0 (materialised to the classic layouts), but the C Data importer and exporter still do not read
   the `vu` / `vz` formats, and the list views import and re-export as a plain list.
 - **decimal256 beyond selection.** Import, export, the comparisons, `filter` / `take` / `slice` and
   `sum` are there; `min` / `max`, arithmetic, the rounding family and the casts throw rather than
@@ -80,10 +80,10 @@ to yet; the by-family status of every one of them is in [COVERAGE.md](COVERAGE.m
   and `ArrowMetalMLX`, a bridge to `MLXArray` for feeding columns into models. Neither target exists
   yet; both would go through the Arrow C interfaces rather than becoming dependencies
   ([DECISIONS.md](DECISIONS.md)).
-- **Polars:** `lf.collect(engine=am.MetalEngine())` runs the parts of an optimised plan it can take on
-  `main` ([POLARS.md](POLARS.md), tier 4). Still open: plans that start from a file scan, and a named
+- **Polars:** `lf.collect(engine=am.MetalEngine())` runs the parts of an optimised plan it can take
+  since 0.2.0 ([POLARS.md](POLARS.md), tier 4). Still open: plans that start from a file scan, and a named
   `engine="metal"`, which needs a change in Polars itself.
-- **DuckDB:** an optimizer extension on `main` runs eligible aggregates of unchanged SQL on the GPU
+- **DuckDB:** an optimizer extension (0.2.0) runs eligible aggregates of unchanged SQL on the GPU
   ([DUCKDB.md](DUCKDB.md) §4b). Still open: shapes beyond those aggregates, and a signed build, since an
   unsigned C++ extension is tied to one DuckDB release and must be loaded with
   `allow_unsigned_extensions`.

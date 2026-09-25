@@ -12,7 +12,7 @@ so results drop straight back into Polars, pandas, DuckDB or pyarrow.compute.
 import ctypes, ctypes.util, decimal, os, struct, sys
 import pyarrow as pa
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 _OPS = {"==": 0, "!=": 1, "<": 2, "<=": 3, ">": 4, ">=": 5, "eq": 0, "ne": 1, "lt": 2, "le": 3, "gt": 4, "ge": 5}
 _ARITH = {"+": 0, "-": 1, "*": 2, "/": 3, "add": 0, "sub": 1, "mul": 2, "div": 3}

@@ -6,7 +6,7 @@ input and output go through the Arrow C Data Interface, so it composes with pyar
 ## Install
 
 Two ways: a wheel built with `scripts/build_wheel.sh` and installed with
-`pip install python/dist/arrowmetal-0.1.0-*.whl` (macOS 14 or later on Apple silicon; the wheel bundles
+`pip install python/dist/arrowmetal-0.2.0-*.whl` (macOS 14 or later on Apple silicon; the wheel bundles
 `libArrowMetalC.dylib`, and pyarrow is its only dependency), or from this repository.
 
 **From source**, the development path. Needs the Swift toolchain:
@@ -27,13 +27,13 @@ pip install build
 # swift build, then the wheel
 scripts/build_wheel.sh
 # pyarrow comes with it
-pip install python/dist/arrowmetal-0.1.0-*.whl
+pip install python/dist/arrowmetal-0.2.0-*.whl
 # optional bridges
-pip install "$(echo python/dist/arrowmetal-0.1.0-*.whl)[polars,duckdb,pandas]"
+pip install "$(echo python/dist/arrowmetal-0.2.0-*.whl)[polars,duckdb,pandas]"
 python -c "import arrowmetal as am; print(am.device_name())"
 ```
 
-The wheel is `arrowmetal-0.1.0-py3-none-macosx_14_0_arm64.whl`; the build script prints its size. It is macOS arm64 only:
+The wheel is `arrowmetal-0.2.0-py3-none-macosx_14_0_arm64.whl`; the build script prints its size. It is macOS arm64 only:
 it links Metal and holds an arm64 binary. Extras `polars`, `duckdb`, `pandas` and `test` pull in the
 libraries the corresponding bridges and the test suite want; none of them are needed to `import arrowmetal`.
 

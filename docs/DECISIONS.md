@@ -2,6 +2,12 @@
 
 Architecture and product decisions, newest first. Each entry says what was decided, why, and what it rules out.
 
+## 2026-09-24: 0.2.0, and how versions move from here
+0.1.0 was published on 2026-09-08. The work since (the CPU/GPU router, the CSV and JSON readers, nested
+Parquet, Delta Lake and Iceberg, the IPC view types, the Polars engine and the DuckDB rewrite) is new
+functionality, so it ships as 0.2.0 rather than 0.1.1. Every manifest changes in the same commit; between
+releases, work collects under an "Unreleased" heading in CHANGELOG.md.
+
 ## 2026-09-06: Version stays 0.1.0 until the public launch
 Everything built before going public is one release. Internal rounds are tracked in the changelog under a
 single 0.1.0 heading and in docs/BENCHMARKS.md as numbered rounds.

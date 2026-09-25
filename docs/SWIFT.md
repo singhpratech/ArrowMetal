@@ -9,7 +9,7 @@ on this page is in
 
 ```swift
 // Package.swift
-dependencies: [.package(url: "https://github.com/singhpratech/ArrowMetal", from: "0.1.0")],
+dependencies: [.package(url: "https://github.com/singhpratech/ArrowMetal", from: "0.2.0")],
 targets: [.target(name: "MyApp", dependencies: [.product(name: "ArrowMetal", package: "ArrowMetal")])]
 ```
 
