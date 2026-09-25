@@ -70,6 +70,10 @@ ARROWMETAL_ROUTER=cpu PYTHONPATH=python python -m pytest python/tests -q
 ARROWMETAL_ROUTER=cpu PYTHONPATH=python python python/tests/differential_report.py
 ```
 
+The Swift and Python harnesses also pin the shipped crossover table, so a per-machine table this Mac may
+hold in `~/.arrowmetal/router/` (`python -m arrowmetal.router calibrate`, [CROSSOVER.md](CROSSOVER.md))
+does not change what the suites check; `ARROWMETAL_ROUTER_TABLE`, when set, wins.
+
 and a green run there means the CPU loops give the answers the GPU tests expect. The router's own
 suites (`RouterTests`, `test_router.py`) choose the path per call and run `gpu`, `cpu` and `auto`
 regardless of either setting.
@@ -134,6 +138,7 @@ pytest *collected* on 2026-09-24, which is larger because a parametrised functio
 | `test_pandas.py` | 72 | the accessor and accel mode against plain pandas across five null-carrying dtype flavours; `install()`/`uninstall()` restore every patched slot |
 | `test_numpy.py` | 6 | the numpy bridge: which dtypes cross without a copy, NaN as a value, and float64 arithmetic against numpy bit for bit ([NUMPY.md](NUMPY.md)) |
 | `test_router.py` | 13 | both router paths byte-identical through the ctypes API and equal to `pyarrow.compute` (and to pyarrow's `hash_sum` for the group-by, signed and uint64), `am.last_route()` and its reasons, `am.router()` / `am.set_router()`, `ARROWMETAL_ROUTER` in a subprocess, `differential_report.py`'s GPU pin, `Benchmarks/router_table.py --check` against the committed table, the table's header naming which CPU loops it measured, `--from-check` fitting a table inside the brackets of a `router_check.py` run, and `multiply` switching at its own row, fitted inside the bracket its check file measured |
+| `test_router_calibrate.py` | 9 | determinism: 200 (operation, size) pairs get the same decision across 1,000 calls and across two processes, and `am.route_decision` / `am.explain_route` give what a routed call records; `python -m arrowmetal.router explain` text and JSON; `router_table.py --json-out` loading back as the shipped crossovers; an unreadable `ARROWMETAL_ROUTER_TABLE` leaving the shipped table; `calibrate --quick` end to end under a temporary `HOME`, its file loaded by a new process; `python -m arrowmetal.bench --calibrate`; the shared fit giving the shipped rows |
 | `test_bench.py` | 2 | `python -m arrowmetal.bench` in a subprocess at 200,000 rows: `--json` exits 0 with `match` true and a positive timing for every one of the four operations, and `--quiet` with Polars hidden from the import system prints the table alone, one header and four rows, with no Polars column |
 | `test_differential.py` (standalone part) | 95 plus 17 documented xfails | one test per finding and per fixed finding, plus the guards that every public operation and every module-level function has a matrix case |
 

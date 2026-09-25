@@ -96,6 +96,61 @@ def fmt_rows(n):
     return f"{n:,}"
 
 
+def router_table_section():
+    """The router's table section: how the shipped table is made and how to make one for another Mac.
+    The source file and its machine line are read from the generated RouterTable.swift."""
+    import re
+    with open(os.path.join(ROOT, "Sources", "ArrowMetal", "Router", "RouterTable.swift")) as fh:
+        src = fh.read()
+    source = re.search(r'static let source = "([^"]+)"', src).group(1)
+    header = re.search(r'static let header = "([^"]+)"', src).group(1)
+    L = ["## The router's table: how it is made, and making one for your Mac\n"]
+    L.append(f"The shipped table (`Sources/ArrowMetal/Router/RouterTable.swift`) is fitted from `{source}`: "
+             f"{header}. The pipeline:\n")
+    L.append("1. Sweep: `PYTHONPATH=python python Benchmarks/router_check.py --out "
+             "Benchmarks/results/router_check_<date>.csv` times every routed operation with the router pinned "
+             "to `gpu` and to `cpu`, and under `auto`, on int64 columns with 10% nulls resident in Metal memory "
+             "(12 cases, 1,000 to 10,000,000 rows).")
+    L.append("2. The CSV lands in `Benchmarks/results/`.")
+    L.append("3. Fit: `python Benchmarks/router_table.py --from-check Benchmarks/results/router_check_<date>.csv` "
+             "takes, per operation, the first measured size from which the GPU stays ahead and the size below it, "
+             "joins the two measured points of each path with a straight line, and puts the crossover where the "
+             "lines meet. It writes `RouterTable.swift`; `--json-out PATH` also writes the same table as JSON "
+             "(format `arrowmetal-router-table/1`), and `--check` fails when the committed table no longer "
+             "matches the file it names.")
+    L.append("4. `RouterTable.swift` is a Swift literal compiled into the library.\n")
+    L.append("On any Mac, one command runs the sweep and the fit for that machine:\n")
+    L.append("```")
+    L.append("python -m arrowmetal.router calibrate          # the router check grid: 12 cases x 6 sizes, gpu, cpu and auto")
+    L.append("python -m arrowmetal.router calibrate --quick  # the 8 cases the table is fitted from, 30,000 to 10,000,000 rows")
+    L.append("python -m arrowmetal.bench --calibrate         # the benchmark, then the quick calibration")
+    L.append("```\n")
+    L.append("It writes `~/.arrowmetal/router/<chip>.json`, where `<chip>` is `sysctl machdep.cpu.brand_string` in "
+             "lower case with other characters as `-` (`apple-m4-max`). The file records the chip, the CPU core "
+             "counts, the Metal device, memory, macOS, the date, the ArrowMetal version, the grid that ran and "
+             "every measurement, and the output names the grid. `--out PATH` writes elsewhere; `--csv PATH` also "
+             "writes the sweep as a router check CSV for `router_table.py --from-check`.\n")
+    L.append("The table in force is chosen once, at load: `ARROWMETAL_ROUTER_TABLE=<path>` (or `shipped`), else "
+             "`~/.arrowmetal/router/<chip>.json` when it exists, else the shipped table. An operation the sweep "
+             "did not bring to a crossover keeps its shipped row, and a file that does not parse leaves the "
+             "shipped table in force. `am_router_load_table` (C), `am.load_router_table` (Python) and "
+             "`Router.loadTable(path:)` (Swift) replace it in a running process; `am.router_table()` and "
+             "`am_router_table_info` describe it.\n")
+    L.append("```")
+    L.append("python -m arrowmetal.router explain sum 150000 [--dtype int64] [--nulls 0.1] [--keys 1000] [--json]")
+    L.append("```\n")
+    L.append("prints the decision under the mode and table in force (`mode auto -> cpu`), the reason, the table "
+             "row with its crossover and the two measured points it was fitted between, and whether the table is "
+             "the shipped one or this machine's.\n")
+    L.append("A decision depends only on the operation, the value type, the row count, the mode, whether a batch "
+             "is open and the table; nothing is timed at call time. The table has one shape, int64 with 10% nulls "
+             "on resident arrays, so the null fraction and residency do not change a decision. "
+             "`python/tests/test_router_calibrate.py` checks that 200 (operation, size) pairs get the same "
+             "decision across 1,000 calls and across two processes, and `RouterTests.testRouteIsPure` checks "
+             "the Swift rule the same way.\n")
+    return L
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sweep", required=True, help="full_matrix.py CSV from the size sweep")
@@ -239,6 +294,7 @@ def main():
                  "is the reason the router's CPU side is written as new loops rather than reused from the "
                  "oracle. `cpu-allcores`, where present, is the bench's all-core loop, recorded for "
                  "reference.\n")
+    L.extend(router_table_section())
     L.append("## Per operation, against the fastest CPU idiom\n")
     L.append("| family | operation | crossover (rows) | " + " | ".join(f"{n:,}" for n in SIZES) + " |")
     L.append("|---|---|---:|" + "---:|" * len(SIZES))

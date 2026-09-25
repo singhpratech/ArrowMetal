@@ -33,6 +33,35 @@ Not swept, so no crossover is stated: `chains`, `decimal`, `join`, `temporal`, `
 
 Each cell is GPU / CPU-path wall microseconds, best of the run's repetitions; the CPU path is the tight single-core loop (`cpu-1core`), or for group-by the candidate dictionary loop (`cpu-candidate`). The bench CSV also carries `cpu-ref`, the tests' `CPUReference` oracle, which walks a closure per element and is one to two orders slower than the tight loop: it is the reason the router's CPU side is written as new loops rather than reused from the oracle. `cpu-allcores`, where present, is the bench's all-core loop, recorded for reference.
 
+## The router's table: how it is made, and making one for your Mac
+
+The shipped table (`Sources/ArrowMetal/Router/RouterTable.swift`) is fitted from `Benchmarks/results/router_check_2026-09-24.csv`: ArrowMetal router check on Apple M4 Max, 16 CPU cores, Apple M4 Max, best of 20 (5 at 3M rows and above), int64 with 10% nulls, Python binding on resident arrays, 2026-09-24T17:58:16Z. The pipeline:
+
+1. Sweep: `PYTHONPATH=python python Benchmarks/router_check.py --out Benchmarks/results/router_check_<date>.csv` times every routed operation with the router pinned to `gpu` and to `cpu`, and under `auto`, on int64 columns with 10% nulls resident in Metal memory (12 cases, 1,000 to 10,000,000 rows).
+2. The CSV lands in `Benchmarks/results/`.
+3. Fit: `python Benchmarks/router_table.py --from-check Benchmarks/results/router_check_<date>.csv` takes, per operation, the first measured size from which the GPU stays ahead and the size below it, joins the two measured points of each path with a straight line, and puts the crossover where the lines meet. It writes `RouterTable.swift`; `--json-out PATH` also writes the same table as JSON (format `arrowmetal-router-table/1`), and `--check` fails when the committed table no longer matches the file it names.
+4. `RouterTable.swift` is a Swift literal compiled into the library.
+
+On any Mac, one command runs the sweep and the fit for that machine:
+
+```
+python -m arrowmetal.router calibrate          # the router check grid: 12 cases x 6 sizes, gpu, cpu and auto
+python -m arrowmetal.router calibrate --quick  # the 8 cases the table is fitted from, 30,000 to 10,000,000 rows
+python -m arrowmetal.bench --calibrate         # the benchmark, then the quick calibration
+```
+
+It writes `~/.arrowmetal/router/<chip>.json`, where `<chip>` is `sysctl machdep.cpu.brand_string` in lower case with other characters as `-` (`apple-m4-max`). The file records the chip, the CPU core counts, the Metal device, memory, macOS, the date, the ArrowMetal version, the grid that ran and every measurement, and the output names the grid. `--out PATH` writes elsewhere; `--csv PATH` also writes the sweep as a router check CSV for `router_table.py --from-check`.
+
+The table in force is chosen once, at load: `ARROWMETAL_ROUTER_TABLE=<path>` (or `shipped`), else `~/.arrowmetal/router/<chip>.json` when it exists, else the shipped table. An operation the sweep did not bring to a crossover keeps its shipped row, and a file that does not parse leaves the shipped table in force. `am_router_load_table` (C), `am.load_router_table` (Python) and `Router.loadTable(path:)` (Swift) replace it in a running process; `am.router_table()` and `am_router_table_info` describe it.
+
+```
+python -m arrowmetal.router explain sum 150000 [--dtype int64] [--nulls 0.1] [--keys 1000] [--json]
+```
+
+prints the decision under the mode and table in force (`mode auto -> cpu`), the reason, the table row with its crossover and the two measured points it was fitted between, and whether the table is the shipped one or this machine's.
+
+A decision depends only on the operation, the value type, the row count, the mode, whether a batch is open and the table; nothing is timed at call time. The table has one shape, int64 with 10% nulls on resident arrays, so the null fraction and residency do not change a decision. `python/tests/test_router_calibrate.py` checks that 200 (operation, size) pairs get the same decision across 1,000 calls and across two processes, and `RouterTests.testRouteIsPure` checks the Swift rule the same way.
+
 ## Per operation, against the fastest CPU idiom
 
 | family | operation | crossover (rows) | 1,000 | 10,000 | 100,000 | 1,000,000 | 10,000,000 | 50,000,000 |

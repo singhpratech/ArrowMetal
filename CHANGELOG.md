@@ -6,6 +6,27 @@
   pyarrow, one table for the Mac it runs on with a ready-to-paste block; `--rows`, `--json`, `--quiet`,
   `--no-share`, `--no-polars`. A GitHub issue form (`.github/ISSUE_TEMPLATE/benchmark_result.yml`)
   takes that block (docs/TESTING.md, `python/tests/test_bench.py`).
+- Router table per machine: `python -m arrowmetal.router calibrate [--quick] [--out PATH] [--csv PATH]`
+  runs the router check sweep on the Mac it is run on (the sweep moved from `Benchmarks/router_check.py`
+  into the package, which that script now calls), fits it with the code `Benchmarks/router_table.py`
+  uses (`python/arrowmetal/_router_fit.py`) and writes `~/.arrowmetal/router/<chip>.json` with the chip,
+  core counts, Metal device, date, ArrowMetal version, grid and every measurement. At first use the
+  router takes `ARROWMETAL_ROUTER_TABLE` (a path, or `shipped`), else that file for this chip, else the
+  shipped table; an operation the sweep did not bring to a crossover keeps its shipped row.
+  `python -m arrowmetal.router explain <op> <rows> [--dtype] [--nulls] [--keys] [--json]` prints the
+  decision, its reason, the table row and the two measured points its crossover was fitted between, and
+  whether the table is the shipped one or this machine's. `router_table.py --json-out` writes the shipped
+  table in the same JSON format, and `python -m arrowmetal.bench --calibrate` runs the quick calibration
+  after the benchmark. C: `am_router_load_table`, `am_router_table_info`, `am_router_decide`,
+  `am_router_explain`; Swift: `Router.table`, `Router.loadTable(path:)`, `Router.useShippedTable()`,
+  `Router.explain`, `RouterCrossovers`; Python: `am.router_table()`, `am.load_router_table()`,
+  `am.route_decision()`, `am.explain_route()`. `am_router_crossover`, `Router.crossoverRows` and
+  `am.router_crossovers()` report the table in force. The Swift and Python test harnesses pin the
+  shipped table unless `ARROWMETAL_ROUTER_TABLE` is set (docs/CROSSOVER.md).
+- Router determinism: `Router.route`, the rule every routed call goes through, is a pure function of the
+  operation, value type, row count, mode, batch state and table row; nothing is timed at call time.
+  `python/tests/test_router_calibrate.py` checks 200 (operation, size) pairs for the same decision
+  across 1,000 calls and across two processes, and `RouterTests.testRouteIsPure` checks the Swift rule.
 
 ## 0.2.0
 Everything below is new in 0.2.0.

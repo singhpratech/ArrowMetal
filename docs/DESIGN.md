@@ -404,8 +404,10 @@ in `Sources/ArrowMetal/Router/`.
 
 The router does not adjust for residency: every routed call starts from Metal-shared buffers (an
 imported column is mapped before the operation is called), which is the state the table was measured
-in. It keeps no state across calls beyond the modes and the last decision, and it never estimates at run
-time.
+in. It keeps no state across calls beyond the table in force, the modes and the last decision, and it
+never times or estimates anything at call time: `Router.route`, the rule every routed call goes through,
+is a pure function of the operation, the value type, the row count, the mode, the batch state and the
+table row.
 
 **The table** is data generated from the measurement, not typed: `Benchmarks/router_table.py
 --from-check Benchmarks/results/router_check_2026-09-24.csv` fits it from a `Benchmarks/router_check.py`
@@ -432,6 +434,13 @@ The table can also be generated from `Benchmarks/results/router_2026-09-17.json`
 [CROSSOVER.md](CROSSOVER.md) (`router_table.py --json`), whose CPU side is the bench's own single-core
 loops in `Sources/ArrowMetalBench/main.swift` rather than RouterCPU; the generated file's header says
 which source it came from, and `--check` regenerates from that source.
+
+**A table per machine.** `python -m arrowmetal.router calibrate [--quick]` runs the same sweep on the
+machine it is run on, fits it with the same code (`python/arrowmetal/_router_fit.py`, which
+`router_table.py` loads too) and writes `~/.arrowmetal/router/<chip>.json`. At first use the router takes
+`ARROWMETAL_ROUTER_TABLE` (a path, or `shipped`), else that file for this chip, else the shipped table;
+`python -m arrowmetal.router explain <op> <rows>` prints a decision with the table row it came from.
+[CROSSOVER.md](CROSSOVER.md) describes the pipeline and the JSON format.
 
 **The CPU side** (`Router/RouterCPU.swift`) is one generic loop per shape, over the Arrow layout:
 *reduce* (a branch-free fold where a null slot feeds the operation's identity), *map* (arithmetic, every
