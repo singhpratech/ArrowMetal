@@ -6,9 +6,46 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Apache Arrow Powered By](https://img.shields.io/badge/Apache_Arrow-Powered_By-0B7285)](https://arrow.apache.org/powered_by/)
 
-**Apache Arrow columnar data on Apple silicon GPUs.** Unified-memory, Metal-accelerated kernels that
-understand Arrow's layout natively: validity bitmaps, packed booleans, the C Data Interface and the
-C Device Data Interface (`ARROW_DEVICE_METAL`).
+**ArrowMetal runs Apache Arrow compute on the Apple silicon GPU: Arrow arrays that live in Metal shared
+memory, GPU kernels that keep Arrow's semantics (validity bitmaps, packed booleans, the C Data and C
+Device Data Interfaces), and one C ABI reachable from Swift, Python, Rust, Go, TypeScript, R and C.**
+
+Apple silicon has one physical memory shared by the CPU and the GPU, so an Arrow buffer placed in a
+Metal shared buffer is at once a valid CPU Arrow buffer and a valid GPU buffer: a column is used where
+it already is, with no copy across a bus in either direction. While a kernel runs, the CPU is free for
+the rest of the application, and every table in this repository shows the CPU time of each call next
+to its wall time.
+
+One row, the same in-process data in every column:
+
+| `sum by int32 key (1000 groups)`, 50,000,000 rows | wall ms | CPU ms of that call |
+|---|---:|---:|
+| ArrowMetal | **4.89** | 1.2 |
+| pyarrow Acero (`Table.group_by`, 16 threads) | 18.45 | 250 |
+| Polars lazy (16 threads) | 81.93 | 1,186 |
+| pandas | 247.93 | 248 |
+
+From `Benchmarks/results/full_matrix_2026-09-07-parallel.csv`, Apple M4 Max (16 CPU cores, 64 GB), best of
+up to five calls after one warm-up, release build; the 339-row matrix that row comes from, including the
+77 rows where the CPU idiom is ahead, is in [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MATRIX.md).
+
+```
+pip install arrowmetal          # macOS 14 or later on Apple silicon; pyarrow is the only dependency
+python -m arrowmetal.bench      # 30 seconds or less
+```
+
+The second line generates 10,000,000 rows, runs sum, filter, sort and group-by sum through pyarrow
+(and Polars when it is installed) and through ArrowMetal, and checks every ArrowMetal answer against
+pyarrow's. It prints one table for your Mac, wall and CPU milliseconds per call, with a block ready to
+paste into a [benchmark result](https://github.com/singhpratech/ArrowMetal/issues/new?template=benchmark_result.yml) issue or the Discord `#benchmarks` channel; nothing is sent.
+
+```python
+import pyarrow as pa, arrowmetal as am
+amount = am.MetalArray.from_arrow(pa.array([10.0, 20.0, 30.0, 40.0]))
+region = am.MetalArray.from_arrow(pa.array([1, 2, 1, 2], pa.int32()))
+print(am.group_by([region]).sum(amount).to_arrow())     # [40, 60]: GPU group-by sum, one row per region
+print(amount.filter_where(">", 15).to_arrow())          # [20, 30, 40]: GPU filter, back as a pyarrow array
+```
 
 Listed on Apache Arrow's [Powered By](https://arrow.apache.org/powered_by/) page. Site and docs: <https://arrowmetal.org> · Python: `pip install arrowmetal` · Rust: `arrowmetal = "0.2.0"` · Release: [v0.2.0](https://github.com/singhpratech/ArrowMetal/releases/tag/v0.2.0)
 
@@ -16,7 +53,11 @@ New in 0.2.0: GPU readers for CSV and newline-delimited JSON, Delta Lake and Apa
 nested Parquet columns, a CPU/GPU router, a Polars engine and a DuckDB optimizer extension
 ([CHANGELOG.md](CHANGELOG.md)).
 
-## The pitch in one paragraph
+Contents: [The pitch](#the-pitch-in-one-paragraph) · [What was measured](#what-was-measured) · [Why this exists](#why-this-exists) · [Benchmarks](#benchmarks) · [From Python](#from-python) · [Bindings](#bindings) · [Quick start (Swift)](#quick-start-swift) · [Reading Arrow files](#reading-arrow-files) · [What is implemented](#what-is-implemented) · [Design notes](#design-notes) · [Citing](#citing) · [License](#license)
+
+## Details
+
+### The pitch in one paragraph
 
 Every array is Arrow layout in memory the GPU already shares, so there is nothing to upload. Gathers,
 group-by, sorts and string scans run on the GPU 3.8x to 24.2x faster than the fastest CPU idiom in the
@@ -28,7 +69,7 @@ bindings through one C ABI. The full distribution over all 339 measured rows —
 the CPU idiom is ahead — is in [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MATRIX.md) and
 [docs/TO_IMPROVE.md](docs/TO_IMPROVE.md).
 
-## What was measured
+### What was measured
 
 - **339 benchmark rows over 173 operations against four CPU libraries at their most parallel idiom** —
   Polars' lazy engine, pyarrow's Acero, pandas and numpy on an idle M4 Max, with the cores each call
@@ -47,7 +88,7 @@ the CPU idiom is ahead — is in [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MAT
   Swift compiler — each with the evidence behind it and where its report stands.
   [`docs/UPSTREAM.md`](docs/UPSTREAM.md)
 
-## Why this exists
+### Why this exists
 
 Apple silicon has one physical memory shared by CPU and GPU. An Arrow buffer placed in a `MTLBuffer` with
 `storageModeShared` is *simultaneously* a valid CPU Arrow buffer and a valid GPU buffer. No upload and no
@@ -65,7 +106,7 @@ ArrowMetal fills that hole: Arrow arrays whose buffers live in Metal shared memo
 Arrow semantics, and standard Arrow C interfaces in and out so it plugs into arrow-rs, pyarrow, DuckDB, Polars,
 arrow-swift or anything else that speaks the C Data Interface.
 
-## Benchmarks
+### Benchmarks
 
 Apple M4 Max (16 CPU cores), 50,000,000 rows (10,000,000 for the string row), best of up to five calls
 after a warm-up, release build. Full history and methodology in [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
@@ -148,7 +189,7 @@ low-cardinality group-by and multi-key sort: against it, `sum by int32 key` at 1
 against DuckDB's 135 to 4,350.
 An optimizer extension also runs eligible aggregates of unchanged DuckDB SQL on the GPU with DuckDB's exact answers ([docs/DUCKDB.md](docs/DUCKDB.md) §4b).
 
-## From Python
+### From Python
 
 `pip install arrowmetal` installs the published wheel (macOS 14 or later on Apple silicon). Two more
 ways, both from this checkout:
@@ -205,7 +246,7 @@ price.decimal_add(price).to_arrow()                # [39.98, 10.02]
 ```
 See [python/README.md](python/README.md).
 
-## Bindings
+### Bindings
 
 Four language bindings over the same C ABI (`include/arrowmetal.h`) are in 0.1.0, in this repository, each
 exchanging columns through the Arrow C Data Interface and each with its own test suite:
@@ -219,7 +260,7 @@ exchanging columns through the Arrow C Data Interface and each with its own test
 
 C and C++ callers use the header directly. Any language with an Arrow binding can use the same header.
 
-## Quick start (Swift)
+### Quick start (Swift)
 
 ```swift
 import ArrowMetal
@@ -283,7 +324,7 @@ Requirements: macOS 14+ / iOS 17+, Swift 5.10+. Shaders compile at runtime so th
 enough to build and use it. Running the test suite needs Xcode (for XCTest):
 `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`.
 
-## Reading Arrow files
+### Reading Arrow files
 
 The Arrow IPC streaming and file formats are read and written directly, with no dependencies: a small
 FlatBuffers codec lives in `Sources/ArrowMetal/IPC`. Buffers land straight in Metal shared memory, so a
@@ -317,7 +358,7 @@ sources, the view types (materialised to the classic layouts) and the `arrow.fix
 extension type, and refuses IPC tensor messages. [docs/COVERAGE.md](docs/COVERAGE.md) says what each
 type is covered by.
 
-## What is implemented
+### What is implemented
 
 **307 of Apache Arrow v25's 307 compute function names** — 283 entirely on the GPU, 17 on the host, 7
 with a stated limitation, none missing. Every one of those names has a row in
@@ -392,7 +433,7 @@ Arrow type matrix and the interop status.
 - `JSONReader` / `am.read_json`: newline-delimited JSON parsed on the GPU with `pyarrow.json.read_json`'s types, field order and error texts ([docs/JSON.md](docs/JSON.md)).
 - A CPU reference implementation behind the kernels, used as the oracle in tests.
 
-## Design notes
+### Design notes
 
 - **Runtime shader compilation.** Kernels are MSL strings generated per element type and cached. No `.metal`
   files, no `metal` toolchain, no Xcode required to build.
@@ -409,7 +450,7 @@ See [ROADMAP.md](ROADMAP.md) for the directions the project is heading and [CONT
 
 Questions, and timings from Macs we have not measured: [Discord](https://discord.gg/MEH7QQABUR) or a GitHub issue, whichever you prefer.
 
-## Citing
+### Citing
 
 If you use this project in research or commercial work:
 
@@ -418,7 +459,7 @@ ArrowMetal: Apache Arrow compute on Apple silicon GPUs via Metal.
 2026. https://github.com/singhpratech/ArrowMetal
 ```
 
-## License
+### License
 
 Apache License 2.0. Apache Arrow is a trademark of the Apache Software Foundation; this project is
 independent and not endorsed by the ASF or Apple.

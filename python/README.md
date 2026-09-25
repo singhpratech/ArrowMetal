@@ -1,7 +1,51 @@
 # arrowmetal (Python)
 
-Apache Arrow arrays on the Apple silicon GPU, from Python. A ctypes wrapper over `libArrowMetalC.dylib`;
-input and output go through the Arrow C Data Interface, so it composes with pyarrow, Polars, pandas and DuckDB.
+**ArrowMetal runs Apache Arrow compute on the Apple silicon GPU: Arrow arrays that live in Metal shared
+memory and GPU kernels that keep Arrow's semantics, reached from Python through a ctypes wrapper over
+`libArrowMetalC.dylib` whose input and output go through the Arrow C Data Interface, so it composes with
+pyarrow, Polars, pandas and DuckDB.**
+
+Apple silicon has one physical memory shared by the CPU and the GPU, so an Arrow buffer placed in a
+Metal shared buffer is at once a valid CPU Arrow buffer and a valid GPU buffer: a column is used where
+it already is, with no copy across a bus in either direction. While a kernel runs, the CPU is free for
+the rest of the application, and every table in the repository shows the CPU time of each call next to
+its wall time.
+
+One row, the same in-process data in every column:
+
+| `sum by int32 key (1000 groups)`, 50,000,000 rows | wall ms | CPU ms of that call |
+|---|---:|---:|
+| ArrowMetal | **4.89** | 1.2 |
+| pyarrow Acero (`Table.group_by`, 16 threads) | 18.45 | 250 |
+| Polars lazy (16 threads) | 81.93 | 1,186 |
+| pandas | 247.93 | 248 |
+
+From [`Benchmarks/results/full_matrix_2026-09-07-parallel.csv`](https://github.com/singhpratech/ArrowMetal/blob/main/Benchmarks/results/full_matrix_2026-09-07-parallel.csv),
+Apple M4 Max (16 CPU cores, 64 GB), best of up to five calls after one warm-up, release build; the
+339-row matrix that row comes from, including the 77 rows where the CPU idiom is ahead, is in
+[docs/BENCHMARKS_MATRIX.md](https://github.com/singhpratech/ArrowMetal/blob/main/docs/BENCHMARKS_MATRIX.md).
+
+```
+pip install arrowmetal          # macOS 14 or later on Apple silicon; pyarrow is the only dependency
+python -m arrowmetal.bench      # 30 seconds or less
+```
+
+The second line generates 10,000,000 rows, runs sum, filter, sort and group-by sum through pyarrow
+(and Polars when it is installed) and through ArrowMetal, and checks every ArrowMetal answer against
+pyarrow's. It prints one table for your Mac, wall and CPU milliseconds per call, with a block ready to
+paste into a [benchmark result](https://github.com/singhpratech/ArrowMetal/issues/new?template=benchmark_result.yml)
+issue or the `#benchmarks` channel of the Discord linked from the
+[README](https://github.com/singhpratech/ArrowMetal#readme); nothing is sent.
+
+```python
+import pyarrow as pa, arrowmetal as am
+amount = am.MetalArray.from_arrow(pa.array([10.0, 20.0, 30.0, 40.0]))
+region = am.MetalArray.from_arrow(pa.array([1, 2, 1, 2], pa.int32()))
+print(am.group_by([region]).sum(amount).to_arrow())     # [40, 60]: GPU group-by sum, one row per region
+print(amount.filter_where(">", 15).to_arrow())          # [20, 30, 40]: GPU filter, back as a pyarrow array
+```
+
+Repository, documentation and the other language bindings: <https://github.com/singhpratech/ArrowMetal>. Site: <https://arrowmetal.org>.
 
 ## Install
 
