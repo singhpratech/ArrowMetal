@@ -1,0 +1,19 @@
+name: Benchmark result
+description: Timings from `python -m arrowmetal.bench` on your Mac
+title: "bench: "
+labels: ["benchmark result"]
+body:
+  - type: textarea
+    id: share
+    attributes:
+      label: Paste the Share it block printed by `python -m arrowmetal.bench`
+      description: The machine line and the Markdown table, fences included, exactly as the command printed them.
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything unusual about the machine or the run
+      description: Other work running, low power mode, a virtual machine, a non-default `--rows`.
+    validations:
+      required: false

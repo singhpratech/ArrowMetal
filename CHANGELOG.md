@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+- `python -m arrowmetal.bench`: one seeded 10,000,000-row dataset, sum, filter, sort and group-by sum
+  through pyarrow (and Polars when installed) and through ArrowMetal, each answer checked against
+  pyarrow, one table for the Mac it runs on with a ready-to-paste block; `--rows`, `--json`, `--quiet`,
+  `--no-share`, `--no-polars`. A GitHub issue form (`.github/ISSUE_TEMPLATE/benchmark_result.yml`)
+  takes that block (docs/TESTING.md, `python/tests/test_bench.py`).
+
 ## 0.2.0
 Everything below is new in 0.2.0.
 
