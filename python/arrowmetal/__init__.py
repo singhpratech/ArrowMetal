@@ -5308,6 +5308,13 @@ _lib.am_router_last_reason.argtypes = []; _lib.am_router_last_reason.restype = c
 _lib.am_router_clear_last.argtypes = []; _lib.am_router_clear_last.restype = None
 _lib.am_router_crossover.argtypes = [ctypes.c_int]; _lib.am_router_crossover.restype = ctypes.c_int64
 _lib.am_router_multiply_crossover.argtypes = []; _lib.am_router_multiply_crossover.restype = ctypes.c_int64
+_lib.am_router_load_table.argtypes = [ctypes.c_char_p]; _lib.am_router_load_table.restype = ctypes.c_int
+_lib.am_router_table_info.argtypes = []; _lib.am_router_table_info.restype = ctypes.c_char_p
+_lib.am_router_decide.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int64, ctypes.c_int64,
+                                  ctypes.POINTER(ctypes.c_int64)]
+_lib.am_router_decide.restype = ctypes.c_int
+_lib.am_router_explain.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int64, ctypes.c_int64]
+_lib.am_router_explain.restype = ctypes.c_char_p
 
 
 class RouteDecision(tuple):
@@ -5367,6 +5374,11 @@ class router:
         return False
 
 
+# `import arrowmetal.router` (the calibrate/explain command) rebinds `arrowmetal.router` to that
+# module; the module stays callable as this class through `_RouterScope`.
+_RouterScope = router
+
+
 def last_route():
     """The last routing decision on the calling thread as a `RouteDecision`, or None."""
     op, path, rows = ctypes.c_int(), ctypes.c_int(), ctypes.c_int64()
@@ -5383,8 +5395,50 @@ def clear_last_route():
 
 
 def router_crossovers():
-    """{op: rows} from the shipped crossover table: below `rows`, `auto` runs the CPU loop on an
-    integer column. "arithmetic" is the add/subtract row; "multiply" is multiply's own row."""
+    """{op: rows} from the crossover table in force (`router_table()` says which): below `rows`,
+    `auto` runs the CPU loop on an integer column. "arithmetic" is the add/subtract row; "multiply" is
+    multiply's own row."""
     table = {name: _lib.am_router_crossover(i) for i, name in enumerate(_ROUTER_OPS)}
     table["multiply"] = _lib.am_router_multiply_crossover()
     return table
+
+
+def router_table():
+    """The crossover table in force, as a dict: "shipped" (True for the table built into the
+    library), "source", "header", "path" (a loaded file), "chip", "date", "grid", "crossovers"
+    ({op: {"crossover_rows", "step_rows", "bracket_low_rows", "label", "points"}}), "shipped_ops" (rows
+    a loaded file lacked) and "load_error" (why a table named at load could not be read).
+
+    At load the router takes $ARROWMETAL_ROUTER_TABLE (a path, or "shipped"), else this machine's
+    ~/.arrowmetal/router/<chip>.json from `python -m arrowmetal.router calibrate`, else the shipped table."""
+    import json
+    return json.loads(_lib.am_router_table_info().decode())
+
+
+def load_router_table(path=None):
+    """Puts the JSON table at `path` in force for this process (None or "shipped": the shipped table)."""
+    _check(_lib.am_router_load_table(None if path is None else os.fsencode(path)))
+
+
+def route_decision(op, rows, dtype="int64", key_count=1000):
+    """(path, crossover): where `op` over `rows` values of `dtype` would run under the table and mode in
+    force on this thread, outside a batch, and the table row consulted. Runs nothing. `op` is one of
+    sum, min, max, compare, add, subtract, multiply, divide, filter, filter_where, group_by_sum."""
+    c = ctypes.c_int64()
+    p = _lib.am_router_decide(str(op).encode(), str(dtype).encode(), int(rows), int(key_count), ctypes.byref(c))
+    if p < 0:
+        explain_route(op, rows, dtype, key_count)          # raises with the reason
+        raise ValueError(f"cannot route {op!r} over {dtype!r}")
+    return ("gpu" if p == 0 else "cpu"), c.value
+
+
+def explain_route(op, rows, dtype="int64", key_count=1000):
+    """`route_decision` with its reason, the table row it came from and the table in force, as a dict
+    (see `python -m arrowmetal.router explain`)."""
+    import json
+    if int(rows) < 0:
+        raise ValueError("rows must be at least 0")
+    out = _lib.am_router_explain(str(op).encode(), str(dtype).encode(), int(rows), int(key_count))
+    if out is None:
+        raise ValueError((_lib.am_last_error() or b"unknown error").decode())
+    return json.loads(out.decode())

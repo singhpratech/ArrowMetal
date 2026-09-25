@@ -15,6 +15,7 @@ text to paste into a GitHub issue or the Discord channel if you want to.
     python -m arrowmetal.bench --quiet        # the table only
     python -m arrowmetal.bench --no-share     # no "Share it" block
     python -m arrowmetal.bench --no-polars    # skip Polars even when it is installed
+    python -m arrowmetal.bench --calibrate    # then calibrate the router on this Mac (quick grid)
 """
 import argparse
 import json
@@ -324,6 +325,9 @@ def main(argv=None):
     p.add_argument("--quiet", action="store_true", help="print the table only")
     p.add_argument("--no-share", action="store_true", help="omit the Share it block")
     p.add_argument("--no-polars", action="store_true", help="do not measure Polars even if it is installed")
+    p.add_argument("--calibrate", action="store_true",
+                   help="afterwards, run the router's quick calibration and write this Mac's table "
+                        "(python -m arrowmetal.router calibrate --quick)")
     a = p.parse_args(argv)
     if a.rows < 1:
         p.error("--rows must be at least 1")
@@ -341,7 +345,19 @@ def main(argv=None):
         for line in result["problems"]:
             print("MISMATCH: " + line, file=sys.stderr)
         return 1
+    if a.calibrate:
+        run_calibration(sys.stderr if a.json else sys.stdout)
     return 0
+
+
+def run_calibration(stream):
+    """`--calibrate`: `python -m arrowmetal.router calibrate --quick`, reported in one line."""
+    from . import _router_calibrate
+    path, table = _router_calibrate.calibrate(quick=True, log=lambda s: None)
+    print(f"Router calibration: {table['grid']['name']} grid in {table['grid']['elapsed_s']:.1f} s, table written "
+          f"to {path}. `python -m arrowmetal.router explain <op> <rows>` shows a decision and its row.",
+          file=stream)
+    return path
 
 
 if __name__ == "__main__":
