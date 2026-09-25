@@ -7,6 +7,7 @@
 # Requirements:
 #   - macOS on Apple silicon (arm64). The wheel embeds a Metal-linked arm64 dylib and runs nowhere else.
 #   - Swift toolchain (Command Line Tools are enough; shaders compile at runtime).
+#   - cargo, for the Polars expression plugin the wheel carries (python/build_wheel.sh builds it).
 #   - The Python build frontend:  pip install build
 #
 # Usage:

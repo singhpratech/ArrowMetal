@@ -9,7 +9,7 @@ relative to the Polars plan**:
 | Tier | Where the GPU runs | What you write | Needs |
 |---|---|---|---|
 | 1. Bridge and namespaces | Around Polars: you hand a collected frame over | `df.arrowmetal.group_by("k").sum("v")` | Python only |
-| 2. Expression plugin | Inside a Polars lazy plan | `pl.col("v").arrowmetal.sum()` | a Rust build |
+| 2. Expression plugin | Inside a Polars lazy plan | `pl.col("v").arrowmetal.sum()` | Python only (the wheel carries the plugin) |
 | 3. Streaming hand-off | Polars runs the plan, ArrowMetal finishes it | `lf.arrowmetal.collect_gpu(q)` | Python only |
 | 4. `MetalEngine` | In place of whole subtrees of the optimised Polars plan | `lf.collect(engine=am.MetalEngine())` | Python only |
 
@@ -21,8 +21,33 @@ multi-chunk Series each cost one conversion pass -- see Limits. The evidence is 
 
 ## Install
 
+### From the wheel
+
 ```bash
-# 1. The GPU library (all three tiers need it)
+scripts/build_wheel.sh                                   # swift build, cargo build, then the wheel
+pip install python/dist/arrowmetal-*.whl polars
+```
+
+A wheel built from this tree carries both native libraries in `arrowmetal/_lib/`:
+`libArrowMetalC.dylib` (the GPU library) and `libarrowmetal_polars.dylib` (the tier-2 expression
+plugin, built by cargo during the wheel build, against that same `libArrowMetalC.dylib`). All four
+tiers work from that install, with no Xcode, no cargo and no `DYLD_LIBRARY_PATH`. The packaged plugin
+has one rpath, `@loader_path`, so its `@rpath/libArrowMetalC.dylib` resolves to the copy beside it,
+the same file Python loads. The 0.2.0 wheel on PyPI carries `libArrowMetalC.dylib` only; with it,
+tier 2 needs the cargo build below.
+
+`scripts/check_wheel.sh` checks a built wheel: it installs the wheel and Polars into a fresh
+virtualenv outside the repository, with a scrubbed environment and no cargo on `PATH`, runs one
+expression or plan per tier, and checks that the process loaded exactly one `libArrowMetalC.dylib`,
+the packaged one. On an M4 Max (macOS 26.6.2, Homebrew Python 3.13.9) it passed with polars 1.44.2
+and pyarrow 25.0.1 as pip resolved them, NumPy not installed: the packaged plugin, built against
+polars 0.55 crates, loads in py-polars 1.44.2. The plugin adds 5.0 MB to the compressed wheel
+(3.2 MB before, 8.2 MB after) and is 21 MB on disk after `strip -x`.
+
+### From source
+
+```bash
+# 1. The GPU library (every tier needs it)
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
     swift build -c release --product ArrowMetalC
 
@@ -39,7 +64,13 @@ release build both go through from an empty `target/`, with no other flags and n
 `DYLD_LIBRARY_PATH`. `cargo build --release` is enough for the plugin -- it is a plain `cdylib`
 that Polars `dlopen`s, not a Python extension module, so `maturin` is optional, and
 `arrowmetal.polars_plugin.plugin_path()` finds `polars-plugin/target/release/` on its own.
-`ARROWMETAL_POLARS_PLUGIN` overrides the search.
+
+`plugin_path()` looks, first hit wins, at `$ARROWMETAL_POLARS_PLUGIN` (the full path to a plugin
+dylib); the packaged `arrowmetal/_lib/libarrowmetal_polars.dylib` when Python loaded the packaged
+`libArrowMetalC.dylib` beside it, which is what a wheel install has; `polars-plugin/target/release/`
+and `target/debug/` in a source checkout; the packaged copy in any other case; and a maturin install
+on `sys.path`. When `$ARROWMETAL_LIB` pins a development build, a cargo build linked against it
+therefore wins over a packaged plugin left in `_lib/` by a wheel build in the same checkout.
 
 `maturin develop --release` is the **untested** path: `polars-plugin/` has no `pyproject.toml`,
 and `plugin_path()` looks for a maturin install at

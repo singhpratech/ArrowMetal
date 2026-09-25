@@ -3,8 +3,9 @@
 Run: PYTHONPATH=python python -m pytest python/tests/test_polars.py -q
 
 Tier 1 (the bridge and the `.arrowmetal` namespaces) needs only Polars. Tier 2 (the expression
-plugin) additionally needs `polars-plugin/target/release/libarrowmetal_polars.dylib`; the plugin
-tests skip when it has not been built, so a checkout without a Rust toolchain still runs green.
+plugin) additionally needs `libarrowmetal_polars.dylib`, packaged in a wheel install or built at
+`polars-plugin/target/release/`; the plugin tests skip when neither exists, so a checkout without a
+Rust toolchain still runs green.
 
 The timing assertions at the end use bounds generous enough to survive a busy machine -- they are
 there to catch an accidental copy or a per-row Python loop (which would be 100x over), not to
@@ -869,3 +870,50 @@ def test_plugin_runs_inside_group_by_agg_and_a_streaming_plan():
     assert (df.lazy().group_by("k").agg(pl.col("v").arrowmetal.sum().alias("total"))
             .sort("k").collect(engine="streaming").to_dicts()
             == want.select("k", "total").to_dicts())
+
+
+# ---- where plugin_path() finds the plugin (no plugin build needed)
+
+def _fake_layout(tmp_path, packaged=True, cargo=True):
+    """<tmp>/python/arrowmetal/{polars_plugin.py, _lib/} beside <tmp>/polars-plugin/target/release."""
+    pkg = tmp_path / "python" / "arrowmetal"
+    (pkg / "_lib").mkdir(parents=True)
+    (pkg / "_lib" / "libArrowMetalC.dylib").write_bytes(b"")
+    if packaged:
+        (pkg / "_lib" / "libarrowmetal_polars.dylib").write_bytes(b"")
+    target = tmp_path / "polars-plugin" / "target" / "release"
+    target.mkdir(parents=True)
+    if cargo:
+        (target / "libarrowmetal_polars.dylib").write_bytes(b"")
+    return pkg, target
+
+
+def test_plugin_path_prefers_the_packaged_plugin_when_the_packaged_core_is_loaded(tmp_path, monkeypatch):
+    pkg, target = _fake_layout(tmp_path)
+    monkeypatch.delenv("ARROWMETAL_POLARS_PLUGIN", raising=False)
+    monkeypatch.setattr(polars_plugin, "__file__", str(pkg / "polars_plugin.py"))
+    monkeypatch.setattr(am, "_find_library", lambda: str(pkg / "_lib" / "libArrowMetalC.dylib"))
+    assert polars_plugin.plugin_path() == str(pkg / "_lib" / "libarrowmetal_polars.dylib")
+
+
+def test_plugin_path_prefers_the_cargo_build_when_a_development_core_is_loaded(tmp_path, monkeypatch):
+    # $ARROWMETAL_LIB (or .build/release) is what Python loaded: the cargo build linked against it wins
+    # over a packaged plugin left in _lib/ by a wheel build in the same checkout.
+    pkg, target = _fake_layout(tmp_path)
+    monkeypatch.delenv("ARROWMETAL_POLARS_PLUGIN", raising=False)
+    monkeypatch.setattr(polars_plugin, "__file__", str(pkg / "polars_plugin.py"))
+    monkeypatch.setattr(am, "_find_library", lambda: str(tmp_path / ".build" / "release" / "libArrowMetalC.dylib"))
+    assert polars_plugin.plugin_path() == str(target / "libarrowmetal_polars.dylib")
+    # No cargo build: the packaged copy is still found.
+    (target / "libarrowmetal_polars.dylib").unlink()
+    assert polars_plugin.plugin_path() == str(pkg / "_lib" / "libarrowmetal_polars.dylib")
+
+
+def test_plugin_path_env_override_wins(tmp_path, monkeypatch):
+    pkg, target = _fake_layout(tmp_path)
+    other = tmp_path / "elsewhere.dylib"
+    other.write_bytes(b"")
+    monkeypatch.setattr(polars_plugin, "__file__", str(pkg / "polars_plugin.py"))
+    monkeypatch.setattr(am, "_find_library", lambda: str(pkg / "_lib" / "libArrowMetalC.dylib"))
+    monkeypatch.setenv("ARROWMETAL_POLARS_PLUGIN", str(other))
+    assert polars_plugin.plugin_path() == str(other)
