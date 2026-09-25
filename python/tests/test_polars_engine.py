@@ -145,7 +145,7 @@ def check(lf, *, kinds=(), order=None, rel=None, keys_only=None):
             assert k in taken, f"{k} did not run on Metal:\n{rep}"
     else:
         walked = {k for _n, k in rep.walked}
-        assert walked <= {"DataFrameScan", "SimpleProjection", "Slice"}, str(rep)
+        assert walked <= {"DataFrameScan", "Scan", "SimpleProjection", "Slice"}, str(rep)
     if keys_only:
         assert got.schema == want.schema
         compare(got.select(keys_only), want.select(keys_only), True, rel)
@@ -252,7 +252,7 @@ def _node_kind_plans(tmp_path):
         "MapFunction": (lf.with_row_index(), False),
         "MergeSorted": (lf.select("v").merge_sorted(lf2.select(pl.col("w").alias("v")), key="v"),
                         False),
-        "Scan": (pl.scan_parquet(path), False),
+        "Scan": (pl.scan_parquet(path).filter(pl.col("k") > 1), True),
         "PythonScan": (pl.scan_pyarrow_dataset(ds.dataset(path)), False),
         "ExtContext": (ctx, False),
         "Sink": (lf.select("k").sink_parquet(str(tmp_path / "o.parquet"), lazy=True), False),
@@ -279,6 +279,9 @@ def test_every_node_kind_walks_and_collects_identically(tmp_path):
 
 def test_raise_on_fail_names_the_node_and_reason(tmp_path):
     plans = _node_kind_plans(tmp_path)
+    ipc = str(tmp_path / "a.arrow")
+    pl.DataFrame({"k": [1, 2]}).write_ipc(ipc)
+    plans["Scan"] = (pl.scan_ipc(ipc).sort("k"), False)      # polars 1.44.1 cannot show it
     for kind in ("Cache", "Union", "HConcat", "MapFunction", "MergeSorted", "Scan",
                  "PythonScan", "ExtContext"):
         lf, _ = plans[kind]
@@ -392,7 +395,7 @@ def test_a_wrong_schema_from_metal_is_an_error_not_a_silent_mismatch(monkeypatch
     """Polars does not check what an engine returns; the engine does, inside the replaced node."""
     lf = pl.LazyFrame({"v": [1, 2, 3]}).sort("v", descending=True)
     monkeypatch.setattr(pe, "_validate", lambda sub, schema: None)
-    monkeypatch.setattr(pe, "_run_plan", lambda plan, leaves, rows=None:
+    monkeypatch.setattr(pe, "_run_plan", lambda plan, leaves, rows=None, scans=None:
                         pa.table({"v": pa.array([3.0, 2.0, 1.0])}))
     with pytest.raises(am.ArrowMetalError, match="schema"):
         lf.collect(engine=pe.MetalEngine(min_rows=0, shapes="all"))
@@ -1107,10 +1110,14 @@ def test_unsupported_column_types_fall_back(dtype):
     check_fallback(df.lazy().sort("v"), "does not carry", order=True)
 
 
-def test_file_scans_stay_with_polars(tmp_path):
+def test_other_file_scans_stay_with_polars(tmp_path):
     path = tmp_path / "t.parquet"
     pl.DataFrame({"v": [3, 1, 2]}).write_parquet(path)
-    check_fallback(pl.scan_parquet(path).sort("v"), "Scan", order=True)
+    check(pl.scan_parquet(path).sort("v"), kinds=["Sort", "Scan"], order=True)
+    check_fallback(pl.scan_pyarrow_dataset(__import__("pyarrow.dataset").dataset.dataset(path))
+                   .sort("v"), "PythonScan", order=True)
+    pl.DataFrame({"v": [3, 1, 2]}).write_csv(tmp_path / "t.csv")
+    check_fallback(pl.scan_csv(tmp_path / "t.csv").sort("v"), "a csv scan", order=True)
 
 
 # =============================================================================================
@@ -1310,3 +1317,523 @@ def test_engine_takes_the_plans_it_once_worked_around(n):
     got = df.lazy().sort("v").collect(engine=eng)["g"]
     assert got.null_count() == df["g"].null_count() > 0
     check(df.lazy().filter(pl.col("v") > n // 3), kinds=["Filter"], order=True)
+
+
+# =============================================================================================
+# Parquet scans: the file is read on the GPU and the subtree above it runs there
+# =============================================================================================
+#
+# Every scan-taken shape is collected on Polars and through the engine over files written by
+# pyarrow (three layouts), Polars and DuckDB, with nulls, NaN, -0.0 and infinities in the data, and
+# over the flat columns of the nested fixtures. The predicate-pushdown cases check both the answer
+# and what the reader skipped; the fallback cases check the reason in the report.
+
+NESTED = os.path.join(REPO, "Tests", "Fixtures", "nested")
+SCAN_N = 20_011
+SCAN_RG = 4096
+
+
+def _scan_table(n=SCAN_N, seed=5):
+    rng = np.random.default_rng(seed)
+
+    def mask(p):
+        return rng.random(n) < p
+
+    f64 = rng.standard_normal(n) * 4
+    f64[rng.random(n) < 0.03] = np.nan
+    f64[::997] = -0.0
+    f64[5::1999] = np.inf
+    f32 = (rng.standard_normal(n) * 4).astype(np.float32)
+    f32[rng.random(n) < 0.03] = np.nan
+    f32[7::1499] = -np.inf
+    words = np.array([f"s{i}" for i in range(40)] + ["", "a longer string value"])
+    return pa.table({
+        "id": pa.array(np.arange(n, dtype=np.int64)),
+        "k": pa.array(rng.integers(0, 9, n).astype(np.int32), mask=mask(0.1)),
+        "i8": pa.array(rng.integers(-128, 128, n).astype(np.int8), mask=mask(0.2)),
+        "i16": pa.array(rng.integers(-2**15, 2**15, n).astype(np.int16), mask=mask(0.2)),
+        "i32": pa.array(rng.integers(0, 10, n).astype(np.int32), mask=mask(0.2)),
+        "i64": pa.array(rng.integers(-2**40, 2**40, n), mask=mask(0.2)),
+        "u8": pa.array(rng.integers(0, 256, n).astype(np.uint8), mask=mask(0.2)),
+        "u16": pa.array(rng.integers(0, 2**16, n).astype(np.uint16), mask=mask(0.2)),
+        "u32": pa.array(rng.integers(0, 2**32, n, dtype=np.uint64).astype(np.uint32), mask=mask(0.2)),
+        "u64": pa.array(rng.integers(0, 2**63, n, dtype=np.uint64) * np.uint64(2), mask=mask(0.2)),
+        "f32": pa.array(f32, mask=mask(0.1)),
+        "f64": pa.array(f64, mask=mask(0.1)),
+        "b": pa.array(rng.random(n) < 0.5, mask=mask(0.2)),
+        "s": pa.array(rng.choice(words, n), mask=mask(0.2)),
+        "d": pa.array(rng.integers(0, 20000, n).astype(np.int32), mask=mask(0.2)).cast(pa.date32()),
+        "ts": pa.array(rng.integers(0, 10**15, n), mask=mask(0.2)).cast(pa.timestamp("us")),
+    })
+
+
+def _write_duckdb(table, path, row_group_size):
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect()
+    con.register("t", table)
+    con.execute(f"COPY (SELECT * FROM t) TO '{path}' (FORMAT parquet, ROW_GROUP_SIZE {row_group_size})")
+    con.close()
+
+
+def _write_all(table, d, stem, rg):
+    import pyarrow.parquet as pq
+    paths = {}
+    p = str(d / f"{stem}_pa.parquet")
+    pq.write_table(table, p, row_group_size=rg, compression="snappy")
+    paths["pyarrow"] = p
+    p = str(d / f"{stem}_pa_index_plain.parquet")
+    pq.write_table(table, p, row_group_size=rg, compression="none", use_dictionary=False,
+                   write_page_index=True, data_page_size=2048)
+    paths["pyarrow_page_index_plain"] = p
+    p = str(d / f"{stem}_pa_v2_zstd.parquet")
+    pq.write_table(table, p, row_group_size=rg, compression="zstd", data_page_version="2.0")
+    paths["pyarrow_v2_zstd"] = p
+    p = str(d / f"{stem}_polars.parquet")
+    pl.from_arrow(table).write_parquet(p, row_group_size=rg)
+    paths["polars"] = p
+    p = str(d / f"{stem}_duckdb.parquet")
+    _write_duckdb(table, p, rg)
+    paths["duckdb"] = p
+    return paths
+
+
+@pytest.fixture(scope="module")
+def scan_files(tmp_path_factory):
+    return _write_all(_scan_table(), tmp_path_factory.mktemp("scan"), "t", SCAN_RG)
+
+
+SCAN_WRITERS = ["pyarrow", "pyarrow_page_index_plain", "pyarrow_v2_zstd", "polars", "duckdb"]
+
+# name -> (plan over a scan, check() keywords)
+SCAN_SHAPES = {
+    "filter_select": (lambda lf: lf.filter((pl.col("id") >= 5000) & (pl.col("i64") > 0))
+                      .select("id", "i64", "s", "d", "ts", "b"), {"order": True}),
+    "filter_every_dtype": (lambda lf: lf.filter(
+        (pl.col("i8") < 50) & (pl.col("i16") > -1000) & (pl.col("u16") >= 100)
+        & (pl.col("u32") <= 3_000_000_000) & (pl.col("u64") > 2**60) & (pl.col("f32") < 1.5)
+        & (pl.col("f64") > -1.0) & pl.col("b")), {"order": True}),
+    "float_total_order": (lambda lf: lf.filter((pl.col("f64") >= 2.0) | (pl.col("f32") == 0.0))
+                          .select("id", "f64", "f32"), {"order": True}),
+    "not_equal": (lambda lf: lf.filter((pl.col("i32") != 5) & (pl.col("f64") != 0.0))
+                  .select("id", "i32", "f64"), {"order": True}),
+    "strings": (lambda lf: lf.filter((pl.col("s") == "s7") | pl.col("s").str.starts_with("a l"))
+                .select("id", "s"), {"order": True}),
+    "with_columns": (lambda lf: lf.with_columns((pl.col("i32") * 2 + pl.col("i16")).alias("x"),
+                                                (pl.col("f64") / 4.0).alias("y"))
+                     .filter(pl.col("x") > 0).select("id", "x", "y"), {"order": True}),
+    "group_by": (lambda lf: lf.filter(pl.col("id") < 12_000).group_by("k").agg(
+        pl.col("i64").sum().alias("s64"), pl.col("i32").min().alias("mn"),
+        pl.col("i16").max().alias("mx"), pl.col("f32").mean().alias("m32"),
+        pl.col("u32").count().alias("c"), pl.len().alias("n")), {"rel": 1e-5}),
+    "group_by_two_keys": (lambda lf: lf.group_by("k", "i32").agg(pl.col("i64").sum(), pl.len()),
+                          {}),
+    "aggregate": (lambda lf: lf.filter(pl.col("f64") <= 0.0).select(
+        pl.col("i64").sum().alias("s"), pl.col("f64").max().alias("mx"),
+        pl.col("u64").min().alias("mn"), pl.col("i16").mean().alias("m"), pl.len().alias("n")),
+        {"rel": 1e-9}),
+    "sort": (lambda lf: lf.select("id", "k", "f64", "s").sort(["k", "f64"], descending=[False, True]),
+             {"order": ["k", "f64"]}),
+    "sort_nulls_last": (lambda lf: lf.select("id", "i64", "d").sort("i64", nulls_last=True),
+                        {"order": ["i64"]}),
+    "top_k": (lambda lf: lf.select("id", "i64").sort("i64", descending=True).head(25),
+              {"keys_only": ["i64"]}),
+    "join": (lambda lf: lf.select("k", "i64").join(
+        pl.LazyFrame({"k": pl.Series(range(9), dtype=pl.Int32), "w": range(10, 19)}), on="k")
+        .select(pl.col("i64").sum().alias("s"), pl.col("w").sum().alias("w")), {}),
+    "unique": (lambda lf: lf.select("k", "i32").unique(), {}),
+}
+
+
+@pytest.mark.parametrize("shape", list(SCAN_SHAPES))
+@pytest.mark.parametrize("writer", SCAN_WRITERS)
+def test_parquet_scan_shapes_against_polars(scan_files, writer, shape):
+    build, kw = SCAN_SHAPES[shape]
+    lf = build(pl.scan_parquet(scan_files[writer]))
+    eng = check(lf, kinds=["Scan"], **kw)
+    (entry,) = eng.last_report.taken
+    (scan,) = entry["scans"]
+    assert scan["path"] == scan_files[writer]
+
+
+def _nested_cases():
+    out = []
+    for name in sorted(os.listdir(NESTED)):
+        if not name.endswith(".parquet"):
+            continue
+        path = os.path.join(NESTED, name)
+        try:
+            schema = pl.scan_parquet(path).collect_schema()
+        except BaseException:              # noqa: BLE001 -- a Polars panic on a crafted file
+            continue
+        flat = [c for c, dt in schema.items() if pe._carryable(dt)]
+        numeric = [c for c in flat if pe._code(schema[c]) not in (None, "bool")]
+        if numeric and flat != list(schema):
+            out.append((name, flat, numeric[0]))
+    return out
+
+
+NESTED_CASES = _nested_cases()
+
+
+@pytest.mark.parametrize("name,flat,key", NESTED_CASES, ids=[c[0] for c in NESTED_CASES])
+def test_parquet_scan_over_the_nested_fixtures(name, flat, key):
+    """The flat columns of every nested fixture, by every writer: a filter, a sort and an
+    aggregate on the GPU equal Polars; the whole file, which holds a nested column, stays with
+    Polars and says why."""
+    path = os.path.join(NESTED, name)
+    lf = pl.scan_parquet(path)
+    try:
+        want = lf.select(flat).collect()
+    except BaseException:                  # noqa: BLE001
+        pytest.skip("Polars cannot read this file's flat columns")
+    mid = want[key].drop_nulls().sort()
+    cut = mid[len(mid) // 2] if len(mid) else 0
+    if isinstance(cut, float) and cut != cut:
+        cut = 0.0
+    check(lf.select(flat).filter(pl.col(key) >= cut), kinds=["Scan"], order=True)
+    check(lf.select(flat).sort(key, descending=True, nulls_last=True), kinds=["Scan"],
+          order=[key])
+    check(lf.select(pl.col(key).max().alias("mx"), pl.col(key).count().alias("c"), pl.len()),
+          kinds=["Scan"])
+    check_fallback(lf.filter(pl.col(key) >= cut), "does not carry")
+
+
+# -- predicate pushdown: what the reader skips, and that the answers stay Polars'
+
+PUSH_RG = 2048          # DuckDB rounds a row group to 2048 rows
+
+
+def _push_table():
+    """Five row groups of `PUSH_RG` rows. `f`: [0, 1) with NaN rows, then [10, 11), then only NaN,
+    then only null, then 1.5 everywhere but one NaN (the `!=` case of apache/arrow#51491). `c` is
+    7 in the first row group and 0..9 after it; `s` is "a" in the first row group only."""
+    rng = np.random.default_rng(17)
+    g = PUSH_RG
+    f = np.concatenate([rng.random(g), 10 + rng.random(g), np.full(g, np.nan), np.zeros(g),
+                        np.full(g, 1.5)])
+    f[: g : 50] = np.nan
+    f[4 * g + 10] = np.nan
+    fmask = np.zeros(5 * g, dtype=bool)
+    fmask[3 * g: 4 * g] = True
+    c = np.concatenate([np.full(g, 7), rng.integers(0, 10, 4 * g)]).astype(np.int64)
+    s = np.array(["a"] * g + ["b"] * (4 * g), dtype=object)
+    return pa.table({"id": pa.array(np.arange(5 * g, dtype=np.int64)),
+                     "f": pa.array(f, mask=fmask),
+                     "f32": pa.array(f.astype(np.float32), mask=fmask),
+                     "c": pa.array(c), "s": pa.array(s, pa.string())})
+
+
+@pytest.fixture(scope="module")
+def push_files(tmp_path_factory):
+    return _write_all(_push_table(), tmp_path_factory.mktemp("push"), "p", PUSH_RG)
+
+
+def _scan_entry(lf, **kw):
+    eng = check(lf, kinds=["Scan"], **kw)
+    (entry,) = eng.last_report.taken
+    (scan,) = entry["scans"]
+    return scan
+
+
+def _skipped(scan):
+    return (scan["row_groups_skipped_by_statistics"] + scan["row_groups_skipped_by_page_index"]
+            + scan["row_groups_skipped_by_bloom_filter"])
+
+
+# (predicate, the filters the reader gets, fewest row groups it must skip)
+PUSH_CASES = {
+    "id_range": (pl.col("id") < PUSH_RG, [("id", "<", PUSH_RG)], 4),
+    "id_flipped": (PUSH_RG * 4 <= pl.col("id"), [("id", ">=", PUSH_RG * 4)], 4),
+    "int_not_equal_constant_group": (pl.col("c") != 7, [("c", "!=", 7)], 1),
+    "string_equal": (pl.col("s") == "a", [("s", "==", "a")], 4),
+    "string_not_equal": (pl.col("s") != "b", [("s", "!=", "b")], 4),
+    "float_lt": (pl.col("f") < 5.0, [("f", "<", 5.0)], 1),
+    "float_le": (pl.col("f") <= 0.5, [("f", "<=", 0.5)], 1),
+    "float_eq": (pl.col("f") == 1.5, [("f", "==", 1.5)], 2),
+    "float32_lt": (pl.col("f32") < 5.0, [("f32", "<", 5.0)], 1),
+    # NaN is above every number in Polars' order: `>`, `>=` and `!=` keep NaN rows, which min/max
+    # leave out, so none of them reaches the reader.
+    "float_gt_keeps_nan": (pl.col("f") > 5.0, [], 0),
+    "float_ge_keeps_nan": (pl.col("f") >= 10.0, [], 0),
+    "float_ne_keeps_nan_51491": (pl.col("f") != 1.5, [], 0),
+    "float32_ne_keeps_nan_51491": (pl.col("f32") != 1.5, [], 0),
+    # Polars types a float literal against a Float32 column as Float32, and so does the filter;
+    # a Float64 literal makes Polars compare in Float64 over a cast column, which stays on the GPU.
+    "float32_literal": (pl.col("f32") < 0.1, [("f32", "<", float(np.float32(0.1)))], 1),
+    "float32_against_float64": (pl.col("f32") < pl.lit(0.1, pl.Float64), [], 0),
+    "conjunction": ((pl.col("id") >= PUSH_RG) & (pl.col("f") < 5.0) & (pl.col("f") > 0.25),
+                    [("id", ">=", PUSH_RG), ("f", "<", 5.0)], 2),
+    "or_is_not_pushed": ((pl.col("id") < 10) | (pl.col("c") == 3), [], 0),
+}
+
+
+@pytest.mark.parametrize("case", list(PUSH_CASES))
+@pytest.mark.parametrize("writer", SCAN_WRITERS)
+def test_parquet_predicate_pushdown(push_files, writer, case):
+    pred, filters, skip = PUSH_CASES[case]
+    lf = pl.scan_parquet(push_files[writer]).filter(pred).select("id", "f", "f32", "c", "s")
+    scan = _scan_entry(lf, order=True)
+    assert sorted(scan["filters"]) == sorted(filters)       # Polars may reorder the conjuncts
+    assert _skipped(scan) >= skip, scan
+    if "keeps_nan" in case:
+        got = lf.collect(engine=metal())
+        assert got["f"].is_nan().sum() > 0          # NaN rows are in Polars' answer, and in ours
+        if "51491" in case:
+            assert 4 * PUSH_RG + 10 in got["id"].to_list()
+
+
+def test_a_filter_polars_left_above_the_scan_is_pushed_too(push_files):
+    """With Polars' own predicate pushdown off, the Filter sits on the Scan; its comparisons still
+    reach the reader."""
+    lf = pl.scan_parquet(push_files["pyarrow"]).filter(pl.col("id") < 100)
+    opts = pl.QueryOptFlags(predicate_pushdown=False)
+    want = lf.collect(optimizations=opts)
+    eng = metal()
+    got = lf.collect(engine=eng, optimizations=opts)
+    compare(got, want, order=True)
+    (entry,) = eng.last_report.taken
+    assert entry["kinds"] == ["Filter", "Scan"]
+    assert entry["scans"][0]["filters"] == [("id", "<", 100)]
+    assert _skipped(entry["scans"][0]) == 4
+
+
+def test_use_statistics_false_hands_the_reader_no_filters(push_files):
+    lf = pl.scan_parquet(push_files["pyarrow"], use_statistics=False).filter(pl.col("id") < 100)
+    scan = _scan_entry(lf, order=True)
+    assert scan["filters"] == [] and _skipped(scan) == 0
+
+
+@pytest.mark.parametrize("col", ["f64", "f32"])
+def test_not_equal_keeps_the_nan_in_a_constant_page_fixture(col):
+    """pageindexnan__pa_constpage: a page of 5.0 with one NaN (row 10), whose page index says
+    5.0 .. 5.0. Polars keeps row 10 under `!= 5.0`, and so does the engine."""
+    lf = pl.scan_parquet(os.path.join(NESTED, "pageindexnan__pa_constpage.parquet"))
+    lf = lf.filter(pl.col(col) != 5.0).select("id", col)
+    scan = _scan_entry(lf, order=True)
+    assert scan["filters"] == []
+    assert 10 in lf.collect(engine=metal())["id"].to_list()
+    lf = pl.scan_parquet(os.path.join(NESTED, "pageindexnan__pa_constpage.parquet"))
+    scan = _scan_entry(lf.filter(pl.col("i64") != 5).select("id", "i64"), order=True)
+    assert scan["filters"] == [("i64", "!=", 5)] and scan["pages_skipped"] >= 2
+
+
+@pytest.mark.parametrize("name", ["pageindexnan__polars.parquet", "pageindexnan__pa_plain_none.parquet"])
+@pytest.mark.parametrize("pred", [pl.col("f64") < 0.0, pl.col("f64") <= -1.5, pl.col("f64") == 2.0,
+                                  pl.col("f64") > 3.0, pl.col("f32") < 1.0])
+def test_nan_pages_flagged_by_polars_are_read(name, pred):
+    lf = pl.scan_parquet(os.path.join(NESTED, name)).filter(pred)
+    _scan_entry(lf, order=True)
+
+
+# -- what stays with Polars, and why
+
+
+def test_parquet_scan_fallbacks_name_the_reason(scan_files, tmp_path):
+    p = scan_files["pyarrow"]
+    q = str(tmp_path / "second.parquet")
+    pl.scan_parquet(p).head(100).collect().write_parquet(q)
+    q2 = str(tmp_path / "third.parquet")
+    pl.scan_parquet(p).head(100).collect().write_parquet(q2)
+    hive = tmp_path / "hive" / "part=1"
+    hive.mkdir(parents=True)
+    pl.scan_parquet(p).select("id", "i64").head(100).collect().write_parquet(hive / "x.parquet")
+    csv = str(tmp_path / "t.csv")
+    pl.scan_parquet(p).select("id", "i64").collect().write_csv(csv)
+    ipc = str(tmp_path / "t.arrow")
+    pl.scan_parquet(p).select("id", "i64").collect().write_ipc(ipc)
+    dec = str(tmp_path / "dec.parquet")
+    pl.DataFrame({"x": pl.Series([1, 2, None], dtype=pl.Decimal(10, 2)), "v": [3, 1, 2]}).write_parquet(dec)
+    lst = str(tmp_path / "lst.parquet")
+    pl.DataFrame({"x": [[1], None, [2, 3]], "v": [3, 1, 2]}).write_parquet(lst)
+    cat = str(tmp_path / "cat.parquet")
+    pl.DataFrame({"x": pl.Series(["a", None, "b"], dtype=pl.Categorical), "v": [3, 1, 2]}).write_parquet(cat)
+    gt = pl.col("id") > 3
+    cases = [
+        (pl.scan_parquet(p).head(100).filter(gt), "row limit pushed into the scan", True),
+        (pl.scan_parquet(p).tail(100).filter(gt), "row limit pushed into the scan", True),
+        (pl.scan_parquet(p, row_index_name="ri").filter(gt), "row index", True),
+        (pl.scan_parquet(p, include_file_paths="path").filter(gt), "include_file_paths", True),
+        (pl.scan_parquet([p, q]).filter(gt), "a scan of 2 files", None),
+        (pl.scan_parquet(str(tmp_path / "*d.parquet")).filter(gt), "a scan of 2 files", None),
+        (pl.scan_parquet(str(tmp_path / "hive")).filter(gt), "hive partition columns", None),
+        (pl.scan_parquet("file://" + p).filter(gt), "is not a local file", True),
+        (pl.scan_parquet(p, schema=pl.scan_parquet(p).collect_schema()).filter(gt), "schema=", True),
+        (pl.scan_csv(csv).filter(gt), "a csv scan", True),
+        (pl.scan_ipc(ipc).filter(gt), "does not show this node", True),
+        (pl.scan_parquet(dec).sort("v"), "does not carry", True),
+        (pl.scan_parquet(lst).sort("v"), "does not carry", True),
+        (pl.scan_parquet(cat).sort("v"), "does not carry", True),
+        (pl.scan_parquet(p).filter(pl.col("i64") % 7 == 1), "operator Modulus", True),
+    ]
+    for lf, reason, order in cases:
+        eng = check_fallback(lf, reason, order=order)
+        assert not eng.last_report.taken, eng.last_report
+
+
+def test_a_stored_schema_polars_applies_and_arrowmetal_ignores_falls_back():
+    """arrowschema__duckdb_fewer / _more hold an ARROW:schema with a different number of fields.
+    Polars applies it (and names or types columns after it); ArrowMetal's reader ignores it, as
+    Arrow's does. The engine sees the difference and leaves the scan to Polars."""
+    more = pl.scan_parquet(os.path.join(NESTED, "arrowschema__duckdb_more.parquet"))
+    check_fallback(more.sort("x0"), "is not a column of the file", order=True)
+    fewer = pl.scan_parquet(os.path.join(NESTED, "arrowschema__duckdb_fewer.parquet"))
+    eng = check_fallback(fewer.select("ts_paris").sort("ts_paris", nulls_last=True), "rejected",
+                         order=True)
+    assert "returned schema" in " ".join(eng.last_report.fallbacks)
+
+
+def test_a_bare_scan_stays_with_polars_reader(scan_files):
+    """A scan with no GPU work above it is Polars' to read: moving it would only add the export."""
+    eng = pe.MetalEngine(min_rows=0, shapes="all")
+    lf = pl.scan_parquet(scan_files["polars"]).select("id", "i64")
+    compare(lf.collect(engine=eng), lf.collect(), order=True)
+    assert not eng.last_report.taken and not eng.last_report.fallbacks
+
+
+def test_a_scan_joined_with_a_scan_runs_as_one_subtree(scan_files):
+    left = pl.scan_parquet(scan_files["pyarrow"]).select("id", "k", "i64")
+    right = pl.scan_parquet(scan_files["duckdb"]).select("id", "f64").filter(pl.col("id") < 3000)
+    eng = check(left.join(right, on="id").select(pl.col("i64").sum(), pl.len()), kinds=["Join"])
+    (entry,) = eng.last_report.taken
+    assert len(entry["scans"]) == 2 and entry["kinds"].count("Scan") == 2
+
+
+# -- the open-file cache
+
+
+def test_the_parquet_file_cache_reuses_the_open_file(scan_files):
+    p = scan_files["pyarrow"]
+    am.clear_parquet_cache()
+    lf = pl.scan_parquet(p).filter(pl.col("id") < 100).select("id", "i64")
+    lf.collect(engine=metal())
+    info = am.parquet_cache_info()
+    assert info["entries"] == 1 and info["files"] == [os.path.realpath(p)]
+    misses, hits = info["misses"], info["hits"]
+    compare(lf.collect(engine=metal()), lf.collect(), order=True)
+    info = am.parquet_cache_info()
+    assert info["misses"] == misses and info["hits"] > hits
+    assert info["bytes"] == os.path.getsize(p)
+    # read_parquet(cache=True) goes through the same entry.
+    got = am.read_parquet(p, columns=["i64"], cache=True)["i64"].to_arrow()
+    assert got.equals(am.read_parquet(p, columns=["i64"])["i64"].to_arrow())
+    assert am.parquet_cache_info()["misses"] == misses
+    am.clear_parquet_cache()
+    assert am.parquet_cache_info()["entries"] == 0
+
+
+def test_the_parquet_file_cache_is_invalidated_when_the_file_changes(tmp_path):
+    p = str(tmp_path / "changing.parquet")
+
+    def total():
+        # A new LazyFrame each time: Polars keeps the file's metadata in the one it scanned.
+        lf = pl.scan_parquet(p).filter(pl.col("v") > 1).select(pl.col("v").sum())
+        got = lf.collect(engine=metal())
+        compare(got, lf.collect())
+        return got.item()
+
+    pl.DataFrame({"v": [1, 2, 3]}).write_parquet(p)
+    am.clear_parquet_cache()
+    assert total() == 5
+    before = am.parquet_cache_info()
+    # New content, new size.
+    pl.DataFrame({"v": [5, 6, 7, 8, 9, 10]}).write_parquet(p)
+    assert total() == 45
+    after = am.parquet_cache_info()
+    assert after["invalidations"] == before["invalidations"] + 1 and after["entries"] == 1
+    # Same size, new content: the modification time moves.
+    st = os.stat(p)
+    pl.DataFrame({"v": [5, 6, 7, 8, 9, 11]}).write_parquet(p)
+    assert os.path.getsize(p) == st.st_size
+    os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+    assert total() == 46
+    # Only the modification time moves: the file is opened again all the same.
+    os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000))
+    inv = am.parquet_cache_info()["invalidations"]
+    assert total() == 46
+    assert am.parquet_cache_info()["invalidations"] == inv + 1
+    # Replaced by another file (a new inode) under the same name.
+    other = str(tmp_path / "other.parquet")
+    pl.DataFrame({"v": [100, 200]}).write_parquet(other)
+    os.replace(other, p)
+    assert total() == 300
+    assert am.parquet_cache_info()["entries"] == 1
+    am.clear_parquet_cache()
+
+
+def test_the_parquet_file_cache_is_bounded(tmp_path):
+    paths = []
+    for i in range(3):
+        p = str(tmp_path / f"f{i}.parquet")
+        pl.DataFrame({"v": np.arange(1000 * (i + 1))}).write_parquet(p)
+        paths.append(p)
+    old = am.parquet_cache_limit()
+    am.clear_parquet_cache()
+    try:
+        assert am.parquet_cache_limit(max_entries=2) == (2, old[1])
+        for p in paths:
+            am.read_parquet(p, cache=True)
+        info = am.parquet_cache_info()
+        assert info["entries"] == 2 and info["files"] == [os.path.realpath(q) for q in paths[1:]]
+        # Least recently used goes first.
+        am.read_parquet(paths[1], cache=True)
+        am.read_parquet(paths[0], cache=True)
+        assert am.parquet_cache_info()["files"] == [os.path.realpath(q) for q in (paths[1], paths[0])]
+        # A byte budget below a file's size keeps it out, and the read still works.
+        am.parquet_cache_limit(max_entries=16, max_bytes=os.path.getsize(paths[2]) - 1)
+        assert len(am.read_parquet(paths[2], cache=True)["v"]) == 3000
+        assert os.path.realpath(paths[2]) not in am.parquet_cache_info()["files"]
+        # Shrinking the budget evicts.
+        am.parquet_cache_limit(max_bytes=0)
+        assert am.parquet_cache_info()["entries"] == 0
+        # max_entries=0 turns it off.
+        am.parquet_cache_limit(max_entries=0, max_bytes=old[1])
+        am.read_parquet(paths[0], cache=True)
+        assert am.parquet_cache_info()["entries"] == 0
+    finally:
+        am.parquet_cache_limit(*old)
+        am.clear_parquet_cache()
+
+
+# -- nullability from the footer
+
+
+def test_column_null_count_reads_the_footer(scan_files):
+    """`ParquetFile.column_null_count` is the footer's word, summed over row groups, and equals the
+    data's null count for every writer that records it."""
+    import pyarrow.parquet as pq
+    exact = 0
+    for writer in SCAN_WRITERS:
+        p = scan_files[writer]
+        f = am.ParquetFile(p)
+        t = pq.read_table(p)
+        for c in ("id", "k", "i8", "s", "f64", "d", "ts", "b"):
+            got = f.column_null_count(c)
+            assert got in (None, t[c].null_count), (writer, c, got)
+            exact += got is not None
+    assert exact >= 3 * 8
+    f = am.ParquetFile(os.path.join(NESTED, "structs__pa_plain_none.parquet"))
+    assert f.column_null_count("k") == 0 and f.column_null_count("s") is None
+    with pytest.raises(am.ArrowMetalError, match="no top-level column"):
+        f.column_null_count("nope")
+
+
+def test_a_column_the_footer_says_has_no_nulls_needs_no_null_handling(scan_files):
+    """`id` holds no null, so a descending sort by it needs no validity key: the plan is the sort
+    alone, and the default engine counts it as a plain sort."""
+    lf = pl.scan_parquet(scan_files["pyarrow"]).select("id", "i64").sort("id", descending=True)
+    eng = check(lf, kinds=["Sort", "Scan"], order=True)
+    assert "valid" not in eng.last_report.taken[0]["plan"]
+    lf = pl.scan_parquet(scan_files["pyarrow"]).select("id", "i64").sort("i64", descending=True)
+    eng = check(lf, kinds=["Sort", "Scan"], order=["i64"])
+    assert "__arrowmetal_valid" in eng.last_report.taken[0]["plan"]
+
+
+def test_statistics_that_disagree_with_the_data_are_an_error(scan_files, monkeypatch):
+    """The plan trusts the footer's null counts; a file whose data holds nulls its statistics deny
+    fails the query instead of answering differently from Polars."""
+    monkeypatch.setattr(am.ParquetFile, "column_null_count", lambda self, c: 0)
+    am.clear_parquet_cache()
+    lf = pl.scan_parquet(scan_files["pyarrow"]).filter(pl.col("i64") > 0).select("id", "i64")
+    with pytest.raises(am.ArrowMetalError, match="holds no null"):
+        lf.collect(engine=pe.MetalEngine(min_rows=0, shapes="all"))
+    am.clear_parquet_cache()
