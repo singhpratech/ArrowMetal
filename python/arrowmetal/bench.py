@@ -296,10 +296,11 @@ def report(result, quiet=False, share=True):
     out.append("")
     polars_note = ", Polars its thread pool" if versions.get("polars") else ""
     out.append("Protocol: one warm-up, best of up to 5 calls, wall ms with the process CPU ms of that call in "
-               f"parentheses; pyarrow uses its thread pool{polars_note}; speedup is against the fastest CPU number on the row.")
+               f"parentheses; pyarrow uses its thread pool except for sort_indices, which is single-threaded in pyarrow 25{polars_note}; "
+               "speedup is against the fastest CPU number on the row.")
     out.append(f"ArrowMetal columns resident on the GPU; import cost shown separately: importing the three columns "
                f"once took {result['import_ms']:.1f} ms. Data generation {result['generate_s']:.1f} s, "
-               f"whole run {result['total_s']:.1f} s. Router pinned to the GPU for the run.")
+               f"whole run {result['total_s']:.1f} s. Router mode: {os.environ.get('ARROWMETAL_ROUTER', 'auto')} (the default).")
     if share:
         out.append("")
         out.append("Share it (nothing is sent by this script; copy the block below):")
@@ -327,10 +328,9 @@ def main(argv=None):
     if a.rows < 1:
         p.error("--rows must be at least 1")
 
-    # The suites pin the router the same way (docs/TESTING.md): this is a CPU-against-GPU report, so
-    # the ArrowMetal column is the GPU kernel at every row count. ARROWMETAL_ROUTER, when set, wins.
-    if "ARROWMETAL_ROUTER" not in os.environ:
-        am.set_router("gpu")
+    # The router runs as it does for every user, `auto` unless ARROWMETAL_ROUTER says otherwise: at the
+    # default row count every routed operation lands on the GPU, and a smaller --rows shows the CPU loop
+    # the router chooses instead. The footer says which mode ran.
 
     result = run(a.rows, use_polars=not a.no_polars)
     if a.json:
