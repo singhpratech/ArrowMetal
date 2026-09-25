@@ -3,10 +3,13 @@ import Foundation
 // CPU/GPU router. Design and rules: docs/DESIGN.md, section "CPU/GPU router".
 //
 // The routed operations call `Router.decide` once, at the top of their public entry point, before
-// anything is encoded. The answer is a lookup in `RouterTable` (generated from the measured sweep by
-// Benchmarks/router_table.py) plus a few structural rules; nothing is estimated at run time and no
-// state is kept across calls beyond the process mode, a per-thread override and the per-thread last
-// decision (which exists only so callers can see what happened).
+// anything is encoded. The answer is `Router.route`, a pure function of the operation, the value
+// type, the row count, the mode, the input's batch state and the crossover table in force (the
+// shipped `RouterTable`, generated from the measured sweep by Benchmarks/router_table.py, or a
+// per-machine table from `python -m arrowmetal.router calibrate`, loaded once at first use or by
+// `Router.loadTable`). Nothing is timed or estimated at call time, and no state is kept across calls
+// beyond the table, the process mode, a per-thread override and the per-thread last decision (which
+// exists only so callers can see what happened).
 
 /// The operations the router can send to the CPU.
 public enum RoutedOp: String, CaseIterable, Sendable {
@@ -141,19 +144,51 @@ public enum Router {
     /// Forgets this thread's last decision.
     public static func clearLastDecision() { threadState.last = nil }
 
-    /// The crossover the table holds for `op`, in rows. For `.arithmetic` this is the add/subtract
-    /// row; `crossoverRows(arithmetic:)` gives the row a particular arithmetic operation uses.
-    public static func crossoverRows(_ op: RoutedOp) -> Int { RouterTable.crossoverRows(op) }
+    // MARK: the table
+
+    private static let tableLock = NSLock()
+    private static var _tableLoadError: String?
+    private static var _table: RouterCrossovers = {
+        let env = ProcessInfo.processInfo.environment
+        let (t, err) = RouterCrossovers.initial(environment: env, home: env["HOME"] ?? NSHomeDirectory(),
+                                                chip: RouterCrossovers.machineChip)
+        _tableLoadError = err
+        return t
+    }()
+
+    /// The crossover table in force. At first use it is `ARROWMETAL_ROUTER_TABLE` (a path, or `shipped`),
+    /// else this machine's `~/.arrowmetal/router/<chip id>.json` when one exists, else the shipped table.
+    public static var table: RouterCrossovers {
+        tableLock.lock(); defer { tableLock.unlock() }
+        return _table
+    }
+
+    /// Why the table named at first use (environment or per-machine file) could not be loaded, if it
+    /// could not; the shipped table is in force then.
+    public static var tableLoadError: String? {
+        tableLock.lock(); defer { tableLock.unlock() }
+        _ = _table
+        return _tableLoadError
+    }
+
+    /// Replaces the table in force with the JSON table at `path`; on error the table is unchanged.
+    public static func loadTable(path: String) throws {
+        let t = try RouterCrossovers.load(path: path)
+        tableLock.lock(); _ = _table; _table = t; _tableLoadError = nil; tableLock.unlock()
+    }
+
+    /// Puts the shipped table back in force.
+    public static func useShippedTable() {
+        tableLock.lock(); _ = _table; _table = .shipped; _tableLoadError = nil; tableLock.unlock()
+    }
+
+    /// The crossover the table in force holds for `op`, in rows. For `.arithmetic` this is the
+    /// add/subtract row; `crossoverRows(arithmetic:)` gives the row a particular arithmetic operation uses.
+    public static func crossoverRows(_ op: RoutedOp) -> Int { table.crossover(op) }
 
     /// The crossover `auto` uses for one arithmetic operation: multiply has its own row, add and
     /// subtract share the arithmetic row. Divide is not routed and returns nil.
-    public static func crossoverRows(arithmetic op: ArithmeticOp) -> Int? {
-        switch op {
-        case .add, .sub: return RouterTable.crossoverRows(.arithmetic)
-        case .mul: return RouterTable.multiplyCrossoverRows
-        case .div: return nil
-        }
-    }
+    public static func crossoverRows(arithmetic op: ArithmeticOp) -> Int? { table.crossover(arithmetic: op) }
 
     // MARK: the decision
 
@@ -168,30 +203,30 @@ public enum Router {
                        pending: Bool, batching: @autoclosure () -> Bool, typeName: @autoclosure () -> String,
                        crossover: Int? = nil) -> RouteDecision {
         let st = threadState
-        let d: RouteDecision
-        if let why = unavailable {
-            d = RouteDecision(op: op, path: .gpu, reason: .noCPUPath(why), rows: rows)
-        } else if pending {
-            d = RouteDecision(op: op, path: .gpu, reason: .pendingInput, rows: rows)
-        } else {
-            let thread = st.override
-            let m = thread ?? mode
-            if m == .gpu {
-                d = RouteDecision(op: op, path: .gpu, reason: .forced(.gpu, thread: thread != nil), rows: rows)
-            } else if batching() {
-                d = RouteDecision(op: op, path: .gpu, reason: .batchOpen, rows: rows)
-            } else if m == .cpu {
-                d = RouteDecision(op: op, path: .cpu, reason: .forced(.cpu, thread: thread != nil), rows: rows)
-            } else if !measured {
-                d = RouteDecision(op: op, path: .gpu, reason: .notMeasuredForType(typeName()), rows: rows)
-            } else {
-                let c = crossover ?? RouterTable.crossoverRows(op)
-                d = rows < c ? RouteDecision(op: op, path: .cpu, reason: .belowCrossover(crossover: c), rows: rows)
-                             : RouteDecision(op: op, path: .gpu, reason: .atOrAboveCrossover(crossover: c), rows: rows)
-            }
-        }
+        let thread = st.override
+        let d = route(op, rows: rows, mode: thread ?? mode, threadOverride: thread != nil,
+                      crossover: crossover ?? crossoverRows(op), cpuPath: unavailable, measured: measured,
+                      pending: pending, batching: batching(), typeName: typeName())
         st.last = d
         return d
+    }
+
+    /// The routing rule itself, a pure function: the same arguments give the same decision on every
+    /// call, and nothing is read or written besides the arguments. `crossover` is the table row for
+    /// this operation (`crossoverRows(_:)`, or multiply's own row); `batching` and `typeName` are
+    /// evaluated only when the rule reaches them.
+    public static func route(_ op: RoutedOp, rows: Int, mode m: RouterMode, threadOverride: Bool = false,
+                             crossover c: Int, cpuPath unavailable: String? = nil, measured: Bool = true,
+                             pending: Bool = false, batching: @autoclosure () -> Bool = false,
+                             typeName: @autoclosure () -> String = "int64") -> RouteDecision {
+        if let why = unavailable { return RouteDecision(op: op, path: .gpu, reason: .noCPUPath(why), rows: rows) }
+        if pending { return RouteDecision(op: op, path: .gpu, reason: .pendingInput, rows: rows) }
+        if m == .gpu { return RouteDecision(op: op, path: .gpu, reason: .forced(.gpu, thread: threadOverride), rows: rows) }
+        if batching() { return RouteDecision(op: op, path: .gpu, reason: .batchOpen, rows: rows) }
+        if m == .cpu { return RouteDecision(op: op, path: .cpu, reason: .forced(.cpu, thread: threadOverride), rows: rows) }
+        if !measured { return RouteDecision(op: op, path: .gpu, reason: .notMeasuredForType(typeName()), rows: rows) }
+        return rows < c ? RouteDecision(op: op, path: .cpu, reason: .belowCrossover(crossover: c), rows: rows)
+                        : RouteDecision(op: op, path: .gpu, reason: .atOrAboveCrossover(crossover: c), rows: rows)
     }
 
     /// Decision for a single-input operation over `a`.

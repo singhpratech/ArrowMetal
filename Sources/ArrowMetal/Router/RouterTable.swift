@@ -13,6 +13,9 @@ enum RouterTable {
     /// Results file the table was generated from.
     static let source = "Benchmarks/results/router_check_2026-09-24.csv"
 
+    /// Machine and protocol line of that results file.
+    static let header = "ArrowMetal router check on Apple M4 Max, 16 CPU cores, Apple M4 Max, best of 20 (5 at 3M rows and above), int64 with 10% nulls, Python binding on resident arrays, 2026-09-24T17:58:16Z"
+
     /// Fitted crossover in rows (straight lines between the two bracketing measured sizes).
     static func crossoverRows(_ op: RoutedOp) -> Int {
         switch op {
@@ -52,6 +55,32 @@ enum RouterTable {
         }
     }
 
+    /// The results file's label for the case each row was fitted from.
+    static func label(_ op: RoutedOp) -> String {
+        switch op {
+        case .sum: return "sum(int64)"
+        case .min: return "min(int64)"
+        case .max: return "max(int64)"
+        case .compare: return "compare(int64 > 0)"
+        case .arithmetic: return "add(int64, 1)"
+        case .filter: return "filter(int64, mask)"
+        case .groupBySum: return "group-by sum (1000 keys)"
+        }
+    }
+
+    /// The two measured points each crossover was fitted between: (rows, GPU us, CPU us).
+    static func bracketPoints(_ op: RoutedOp) -> [(Int, Double, Double)] {
+        switch op {
+        case .sum: return [(100000, 125.6, 46.0), (300000, 161.5, 213.6)]
+        case .min: return [(100000, 124.2, 65.8), (300000, 180.3, 208.8)]
+        case .max: return [(100000, 126.3, 66.8), (300000, 178.4, 212.2)]
+        case .compare: return [(1000000, 141.5, 77.0), (3000000, 211.2, 224.0)]
+        case .arithmetic: return [(1000000, 181.8, 120.5), (3000000, 230.1, 363.7)]
+        case .filter: return [(300000, 375.0, 198.1), (1000000, 406.8, 654.9)]
+        case .groupBySum: return [(300000, 269.9, 186.1), (1000000, 558.0, 615.2)]
+        }
+    }
+
     /// Results file the multiply row was fitted from (a router_check.py CSV).
     static let multiplySource = "Benchmarks/results/router_check_2026-09-24.csv"
 
@@ -59,4 +88,6 @@ enum RouterTable {
     static let multiplyCrossoverRows = 678287   // multiply(int64, 3); 300,000 rows: GPU 126.7 us, CPU 71.2 us; 1,000,000 rows: GPU 185 us, CPU 232.2 us
     static let multiplyMeasuredStepRows = 1000000
     static let multiplyBracketLowRows = 300000
+    static let multiplyLabel = "multiply(int64, 3)"
+    static let multiplyBracketPoints: [(Int, Double, Double)] = [(300000, 126.7, 71.2), (1000000, 185.0, 232.2)]
 }

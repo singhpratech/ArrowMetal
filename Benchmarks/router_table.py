@@ -30,6 +30,10 @@ two measured points, and the crossover is where the lines meet. The fitted value
 the measured bracket; nothing is extrapolated.
 
 Output: `Sources/ArrowMetal/Router/RouterTable.swift`, a Swift literal (no resource bundle to load).
+With `--json-out PATH` (and `--from-check`) the same table is also written as JSON in the format the
+router loads at run time (`am_router_load_table`, ARROWMETAL_ROUTER_TABLE), the one
+`python -m arrowmetal.router calibrate` writes for a single machine. The fitting code is shared with
+calibrate: python/arrowmetal/_router_fit.py, loaded here by path so no built library is needed.
 
 Usage:
     python Benchmarks/router_table.py                      # regenerate from the default JSON
@@ -38,16 +42,28 @@ Usage:
     python Benchmarks/router_table.py --json Benchmarks/results/router_<date>.json
     python Benchmarks/router_table.py --from-check Benchmarks/results/router_check_<date>.csv
     python Benchmarks/router_table.py --multiply-from Benchmarks/results/router_check_<date>.csv
+    python Benchmarks/router_table.py --from-check Benchmarks/results/router_check_<date>.csv \
+        --json-out router_table.json               # also write the JSON form
 """
 import argparse
+import importlib.util
 import json
-import csv
-import math
 import os
 import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _load_fit():
+    path = os.path.join(ROOT, "python", "arrowmetal", "_router_fit.py")
+    spec = importlib.util.spec_from_file_location("arrowmetal_router_fit", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_fit = _load_fit()
 DEFAULT_JSON = os.path.join(ROOT, "Benchmarks", "results", "router_2026-09-17.json")
 DEFAULT_MULTIPLY = os.path.join(ROOT, "Benchmarks", "results", "router_check_2026-09-23_provisional.csv")
 MULTIPLY_LABEL = "multiply(int64, 3)"
@@ -80,33 +96,10 @@ def load_bench(path):
 
 
 def fit(label, cpu_label, step, sizes, bench):
-    """(crossover rows, step, bracket low, points) for one operation. `step` None: take it from the
-    timings (the first size from which the GPU is at least as fast at every larger size)."""
-    measured = [n for n in sizes if (label, n, "gpu") in bench and (label, n, cpu_label) in bench]
-    first_gpu = next((n for n in measured
-                      if all(bench[(label, m, "gpu")] <= bench[(label, m, cpu_label)] for m in measured if m >= n)),
-                     None)
-    if step is None:
-        if first_gpu is None:
-            raise SystemExit(f"{label}: the GPU is not ahead at the largest measured size")
-        step = first_gpu
-    if step not in measured:
-        raise SystemExit(f"{label}: step crossover {step} is not a measured size")
-    if first_gpu != step:
-        raise SystemExit(f"{label}: the bench says the GPU stays ahead from {first_gpu}, the JSON says {step}")
-    lower = [n for n in measured if n < step]
-    if not lower:
-        return step, step, step, []
-    lo, hi = lower[-1], step
-    g0, c0 = bench[(label, lo, "gpu")], bench[(label, lo, cpu_label)]
-    g1, c1 = bench[(label, hi, "gpu")], bench[(label, hi, cpu_label)]
-    d0, d1 = c0 - g0, c1 - g1          # CPU minus GPU: negative at lo (CPU ahead), >= 0 at hi
-    if d0 >= 0 or d1 < 0:
-        cross = hi
-    else:
-        cross = lo + (hi - lo) * (-d0) / (d1 - d0)
-    cross = int(min(hi, max(lo + 1, math.ceil(cross))))
-    return cross, step, lo, [(lo, g0, c0), (hi, g1, c1)]
+    try:
+        return _fit.fit(label, cpu_label, step, sizes, bench)
+    except _fit.FitError as e:
+        raise SystemExit(str(e))
 
 
 def entries_from_json(json_path):
@@ -136,22 +129,10 @@ def entries_from_json(json_path):
         "// `Benchmarks/router_table.py --from-check Benchmarks/results/router_check_<date>.csv`.",
     ]
     cpu_side = "a single-core CPU loop of the 2026-09-17 bench (not the RouterCPU loops; see the header)"
-    return entries, rel, source, cpu_side
+    return entries, rel, source, cpu_side, header
 
 
-def load_check(csv_path):
-    header, bench, sizes = "", {}, set()
-    with open(csv_path) as fh:
-        lines = fh.read().splitlines()
-    if lines and lines[0].startswith("#"):
-        header = lines[0][1:].strip()
-        lines = lines[1:]
-    for row in csv.DictReader(lines):
-        n = int(row["rows"])
-        sizes.add(n)
-        bench[(row["op"], n, "gpu")] = float(row["gpu_us"])
-        bench[(row["op"], n, "cpu")] = float(row["cpu_us"])
-    return header, bench, sorted(sizes)
+load_check = _fit.load_check
 
 
 def multiply_entry(csv_path):
@@ -181,15 +162,15 @@ def entries_from_check(csv_path):
         "// Benchmarks/router_check.py with the router pinned to `cpu`, against the GPU pinned to `gpu`.",
     ]
     cpu_side = "the router's single-core CPU loop (RouterCPU), as timed by Benchmarks/router_check.py"
-    return entries, rel, source, cpu_side
+    return entries, rel, source, cpu_side, header
 
 
 def generate(path, multiply_path=None):
     if path.endswith(".csv"):
-        entries, rel, source, cpu_side = entries_from_check(path)
+        entries, rel, source, cpu_side, header = entries_from_check(path)
         multiply_path = path
     else:
-        entries, rel, source, cpu_side = entries_from_json(path)
+        entries, rel, source, cpu_side, header = entries_from_json(path)
         multiply_path = multiply_path or DEFAULT_MULTIPLY
     m_label, m_step, m_cross, m_lo, m_pts, m_rel, m_header = multiply_entry(multiply_path)
     if m_rel != rel:
@@ -208,6 +189,9 @@ def generate(path, multiply_path=None):
         "enum RouterTable {",
         "    /// Results file the table was generated from.",
         f"    static let source = \"{rel}\"",
+        "",
+        "    /// Machine and protocol line of that results file.",
+        f"    static let header = \"{swift_string(header)}\"",
         "",
         "    /// Fitted crossover in rows (straight lines between the two bracketing measured sizes).",
         "    static func crossoverRows(_ op: RoutedOp) -> Int {",
@@ -228,6 +212,18 @@ def generate(path, multiply_path=None):
             "        switch op {"]
     for label, case, step, cross, lo, pts in entries:
         out.append(f"        case .{case}: return {lo}")
+    out += ["        }", "    }", "",
+            "    /// The results file's label for the case each row was fitted from.",
+            "    static func label(_ op: RoutedOp) -> String {",
+            "        switch op {"]
+    for label, case, step, cross, lo, pts in entries:
+        out.append(f"        case .{case}: return \"{swift_string(label)}\"")
+    out += ["        }", "    }", "",
+            "    /// The two measured points each crossover was fitted between: (rows, GPU us, CPU us).",
+            "    static func bracketPoints(_ op: RoutedOp) -> [(Int, Double, Double)] {",
+            "        switch op {"]
+    for label, case, step, cross, lo, pts in entries:
+        out.append(f"        case .{case}: return {swift_points(pts)}")
     m_pt = "; ".join(f"{n:,} rows: GPU {g:g} us, CPU {c:g} us" for n, g, c in m_pts)
     out += ["        }", "    }", "",
             "    /// Results file the multiply row was fitted from (a router_check.py CSV).",
@@ -237,8 +233,40 @@ def generate(path, multiply_path=None):
             f"    static let multiplyCrossoverRows = {m_cross}   // {m_label}; {m_pt}",
             f"    static let multiplyMeasuredStepRows = {m_step}",
             f"    static let multiplyBracketLowRows = {m_lo}",
+            f"    static let multiplyLabel = \"{swift_string(m_label)}\"",
+            f"    static let multiplyBracketPoints: [(Int, Double, Double)] = {swift_points(m_pts)}",
             "}"]
     return "\n".join(out) + "\n"
+
+
+def swift_string(text):
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def swift_points(pts):
+    return "[" + ", ".join(f"({n}, {float(g)!r}, {float(c)!r})" for n, g, c in pts) + "]"
+
+
+def json_table(csv_path):
+    """The table as JSON (python/arrowmetal/_router_fit.py's format), fitted from a router check CSV."""
+    header, bench, sizes = load_check(csv_path)
+    machine, date = {}, None
+    m = re.search(r" on (.+?), (\d+) CPU cores, (.+?), ", header)
+    if m:
+        machine = {"chip": m.group(1), "chip_id": _fit.chip_id(m.group(1)), "cpu_cores": int(m.group(2)),
+                   "metal_device": m.group(3)}
+    d = re.search(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)", header)
+    if d:
+        date = d.group(1)
+    for label in _fit.TABLE_LABELS:
+        if not any(k[0] == label for k in bench):
+            raise SystemExit(f"{label}: not in {csv_path}")
+    table = _fit.table_json(bench, sizes, header, os.path.relpath(csv_path, ROOT), machine=machine, date=date,
+                            grid={"name": "router_check", "sizes": sizes})
+    missing = [op for op, e in table["crossovers"].items() if e["crossover_rows"] is None]
+    if missing:
+        raise SystemExit(f"no crossover for {', '.join(missing)} in {csv_path}")
+    return table
 
 
 def committed_source(out_path, name="source"):
@@ -260,11 +288,14 @@ def main():
     ap.add_argument("--multiply-from", help="with --json: router_check_<date>.csv to fit the multiply row from "
                     "(default: " + os.path.relpath(DEFAULT_MULTIPLY, ROOT) + ")")
     ap.add_argument("--out", default=OUT)
+    ap.add_argument("--json-out", help="with --from-check: also write the table as JSON (the router's run-time format)")
     ap.add_argument("--check", action="store_true",
                     help="compare with the committed table (regenerated from the source it names) instead of writing")
     args = ap.parse_args()
     if args.from_check and args.multiply_from:
         ap.error("--multiply-from goes with --json; --from-check fits every row from its own file")
+    if args.json_out and not args.from_check:
+        ap.error("--json-out needs --from-check (the JSON form is fitted from a router check CSV)")
     path = args.json or args.from_check
     multiply = args.multiply_from
     if path is None:
@@ -286,6 +317,11 @@ def main():
     with open(args.out, "w") as fh:
         fh.write(text)
     print(f"wrote {os.path.relpath(args.out, ROOT)}")
+    if args.json_out:
+        with open(args.json_out, "w") as fh:
+            json.dump(json_table(os.path.abspath(args.from_check)), fh, indent=1)
+            fh.write("\n")
+        print(f"wrote {args.json_out}")
     return 0
 
 

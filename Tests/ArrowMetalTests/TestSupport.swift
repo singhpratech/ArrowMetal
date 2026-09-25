@@ -14,8 +14,11 @@ func requireRealGPU() throws {
 /// router to the GPU and keep exercising the kernels. `ARROWMETAL_ROUTER`, when set, wins: running
 /// the whole suite with `ARROWMETAL_ROUTER=cpu` exercises every CPU path against the same tests. The
 /// router's own tests (RouterTests) choose paths per call and run gpu, cpu and auto.
+/// The suites also run against the shipped crossover table, not a per-machine one this Mac may hold in
+/// ~/.arrowmetal/router/, unless `ARROWMETAL_ROUTER_TABLE` names one.
 private let routerDefaultApplied: Void = {
     if Router.environmentMode == nil { Router.mode = .gpu }
+    if ProcessInfo.processInfo.environment["ARROWMETAL_ROUTER_TABLE"] == nil { Router.useShippedTable() }
 }()
 func routerTestDefault() { _ = routerDefaultApplied }
 

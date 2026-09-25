@@ -465,6 +465,129 @@ final class RouterTests: XCTestCase {
         XCTAssertNil(RouterMode(rawValue: "fastest"))
     }
 
+    // MARK: determinism and the table
+
+    /// 200 (operation, size) pairs over the routed operations and the sizes around every crossover.
+    static func decisionPairs() -> [(RoutedOp, Int)] {
+        var sizes: Set<Int> = [0, 1, 1_000, 100_000, 1_000_000, 10_000_000, 100_000_000]
+        for op in RoutedOp.allCases {
+            let c = RouterCrossovers.shipped.crossover(op)
+            sizes.formUnion([c - 1, c, c + 1, RouterTable.bracketLowRows(op), RouterTable.measuredStepRows(op)])
+        }
+        var k = 0
+        while sizes.count * RoutedOp.allCases.count < 200 { sizes.insert(7 * k + 3); k += 1 }
+        let pairs = sizes.sorted().flatMap { n in RoutedOp.allCases.map { ($0, n) } }
+        return Array(pairs.prefix(200))
+    }
+
+    func testRouteIsPure() throws {
+        Router.useShippedTable()
+        let pairs = Self.decisionPairs()
+        XCTAssertEqual(pairs.count, 200)
+        let table = Router.table
+        let first = pairs.map { Router.route($0.0, rows: $0.1, mode: .auto, crossover: table.crossover($0.0)) }
+        Router.clearLastDecision()
+        for _ in 0..<1000 {
+            for (k, (op, n)) in pairs.enumerated() {
+                let d = Router.route(op, rows: n, mode: .auto, crossover: Router.crossoverRows(op))
+                if d != first[k] { XCTFail("\(op) \(n): \(d) != \(first[k])"); return }
+            }
+        }
+        XCTAssertNil(Router.lastDecision, "route records nothing")
+        XCTAssertEqual(Router.table, table, "route leaves the table alone")
+        // The rule is the table's comparison and nothing else.
+        for (k, (op, n)) in pairs.enumerated() {
+            XCTAssertEqual(first[k].path, n < table.crossover(op) ? .cpu : .gpu, "\(op) \(n)")
+        }
+        // `explain` gives what a routed call records.
+        let a = try MetalArray<Int64>(Array(0..<5000))
+        try Router.withMode(.auto) {
+            _ = try a.sum()
+            let e = try XCTUnwrap(Router.explain(operation: "sum", dtype: "int64", rows: 5000))
+            XCTAssertEqual(Router.lastDecision, e.decision)
+            _ = try a.multiply(3)
+            XCTAssertEqual(Router.lastDecision, try XCTUnwrap(Router.explain(operation: "multiply", dtype: "int64", rows: 5000)).decision)
+        }
+    }
+
+    func testShippedTableIsTheGeneratedLiteral() throws {
+        let t = RouterCrossovers.shipped
+        XCTAssertTrue(t.isShipped)
+        for op in RoutedOp.allCases {
+            let r = try XCTUnwrap(t.rows[op])
+            XCTAssertEqual(r.crossover, RouterTable.crossoverRows(op))
+            XCTAssertEqual(r.stepRows, RouterTable.measuredStepRows(op))
+            XCTAssertEqual(r.bracketLowRows, RouterTable.bracketLowRows(op))
+            XCTAssertEqual(r.points.count, 2, "\(op)")
+            XCTAssertGreaterThan(r.points[0].gpuMicros, r.points[0].cpuMicros, "\(op): CPU ahead at the low end")
+            XCTAssertLessThanOrEqual(r.points[1].gpuMicros, r.points[1].cpuMicros, "\(op): GPU ahead at the step")
+        }
+        XCTAssertEqual(t.multiply.crossover, RouterTable.multiplyCrossoverRows)
+        XCTAssertEqual(t.source, RouterTable.source)
+    }
+
+    func testJSONTableLoadsAndFallsBack() throws {
+        defer { Router.useShippedTable() }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("am-router-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let good = dir.appendingPathComponent("t.json").path
+        let json = """
+        {"format": "arrowmetal-router-table/1", "machine": {"chip": "Test Chip"}, "date": "2026-09-25T00:00:00Z",
+         "grid": {"name": "quick"}, "source": "test",
+         "crossovers": {"sum": {"label": "sum(int64)", "crossover_rows": 1234, "step_rows": 3000, "bracket_low_rows": 1000,
+                                "points": [{"rows": 1000, "gpu_us": 10.5, "cpu_us": 5}, {"rows": 3000, "gpu_us": 11, "cpu_us": 15}]},
+                        "compare": {"label": "compare(int64 > 0)", "crossover_rows": null},
+                        "multiply": {"crossover_rows": 777}}}
+        """
+        try json.write(toFile: good, atomically: true, encoding: .utf8)
+        try Router.loadTable(path: good)
+        let t = Router.table
+        XCTAssertEqual(t.origin, .file(good))
+        XCTAssertEqual(Router.crossoverRows(.sum), 1234)
+        XCTAssertEqual(Router.crossoverRows(arithmetic: .mul), 777)
+        XCTAssertEqual(Router.crossoverRows(.compare), RouterTable.crossoverRows(.compare), "null keeps the shipped row")
+        XCTAssertEqual(Router.crossoverRows(.filter), RouterTable.crossoverRows(.filter), "missing keeps the shipped row")
+        XCTAssertEqual(t.shippedOps, ["min", "max", "compare", "arithmetic", "filter", "group_by_sum"])
+        XCTAssertEqual(t.chip, "Test Chip"); XCTAssertEqual(t.grid, "quick")
+        XCTAssertEqual(t.rows[.sum]?.points, [RouterPoint(rows: 1000, gpuMicros: 10.5, cpuMicros: 5), RouterPoint(rows: 3000, gpuMicros: 11, cpuMicros: 15)])
+        XCTAssertEqual(Router.route(.sum, rows: 1233, mode: .auto, crossover: Router.crossoverRows(.sum)).path, .cpu)
+        XCTAssertEqual(Router.route(.sum, rows: 1234, mode: .auto, crossover: Router.crossoverRows(.sum)).path, .gpu)
+
+        // A bad file leaves the table in force unchanged.
+        for (name, text) in [("fmt", #"{"format": "other", "crossovers": {}}"#), ("junk", "not json"),
+                             ("neg", #"{"format": "arrowmetal-router-table/1", "crossovers": {"sum": {"crossover_rows": -5}}}"#),
+                             ("unknown", #"{"format": "arrowmetal-router-table/1", "crossovers": {"sort": {"crossover_rows": 5}}}"#),
+                             ("empty", #"{"format": "arrowmetal-router-table/1", "crossovers": {}}"#)] {
+            let p = dir.appendingPathComponent("\(name).json").path
+            try text.write(toFile: p, atomically: true, encoding: .utf8)
+            XCTAssertThrowsError(try Router.loadTable(path: p), name)
+            XCTAssertEqual(Router.table, t, name)
+        }
+        XCTAssertThrowsError(try Router.loadTable(path: dir.appendingPathComponent("missing.json").path))
+        Router.useShippedTable()
+        XCTAssertTrue(Router.table.isShipped)
+        XCTAssertEqual(Router.crossoverRows(.sum), RouterTable.crossoverRows(.sum))
+
+        // Which table a process starts with.
+        let home = dir.appendingPathComponent("home").path
+        let machine = RouterCrossovers.machineTablePath(home: home, chip: "Apple M9 Ultra")
+        XCTAssertTrue(machine.hasSuffix("/.arrowmetal/router/apple-m9-ultra.json"), machine)
+        XCTAssertTrue(RouterCrossovers.initial(environment: [:], home: home, chip: "Apple M9 Ultra").0.isShipped)
+        try FileManager.default.createDirectory(atPath: (machine as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(atPath: good, toPath: machine)
+        let (fromHome, e1) = RouterCrossovers.initial(environment: [:], home: home, chip: "Apple M9 Ultra")
+        XCTAssertEqual(fromHome.origin, .file(machine)); XCTAssertNil(e1)
+        XCTAssertTrue(RouterCrossovers.initial(environment: ["ARROWMETAL_ROUTER_TABLE": "shipped"], home: home, chip: "Apple M9 Ultra").0.isShipped)
+        XCTAssertTrue(RouterCrossovers.initial(environment: [:], home: home, chip: "Apple M1").0.isShipped, "another chip's file is not loaded")
+        let (fromEnv, e2) = RouterCrossovers.initial(environment: ["ARROWMETAL_ROUTER_TABLE": good], home: nil, chip: "x")
+        XCTAssertEqual(fromEnv.origin, .file(good)); XCTAssertNil(e2)
+        let (bad, e3) = RouterCrossovers.initial(environment: ["ARROWMETAL_ROUTER_TABLE": dir.appendingPathComponent("junk.json").path], home: home, chip: "Apple M9 Ultra")
+        XCTAssertTrue(bad.isShipped); XCTAssertNotNil(e3)
+        XCTAssertEqual(RouterCrossovers.chipID("Apple M4 Max"), "apple-m4-max")
+        XCTAssertEqual(RouterCrossovers.chipID("  Apple  M2 (Pro) "), "apple-m2-pro")
+    }
+
     func testDecisionDescriptions() throws {
         let d = Router.decide(.filter, rows: 10, cpuPath: nil, measured: true, pending: false, batching: false, typeName: "long")
         XCTAssertTrue(d.description.hasPrefix("filter: "), d.description)
