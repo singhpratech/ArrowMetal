@@ -22,10 +22,9 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 go get github.com/singhpratech/ArrowMetal/go/arrowmetal
 ```
 
-That `go get` line starts working once the repository is public **and** carries a
-`go/arrowmetal/vX.Y.Z` tag — the module lives in a subdirectory, so the Go module proxy wants the
-tag prefixed with the module's path within the repository, not a bare `vX.Y.Z`. Until then, work
-against a checkout: clone the repository and add
+The module is tagged `go/arrowmetal/v0.2.0`: the module lives in a subdirectory, so the Go module
+proxy wants the tag prefixed with the module's path within the repository, not a bare `vX.Y.Z`. A
+checkout works too: clone the repository and add
 
 ```
 replace github.com/singhpratech/ArrowMetal/go/arrowmetal => /path/to/ArrowMetal/go/arrowmetal

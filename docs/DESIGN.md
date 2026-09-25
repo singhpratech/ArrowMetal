@@ -1,6 +1,6 @@
-# Design and future capability
+# Design
 
-How ArrowMetal is put together, what limits it today, and where the next 10x comes from.
+How ArrowMetal is put together and what limits it today.
 
 ## Layers
 ```
@@ -14,7 +14,7 @@ Swift apps ───────────────────────
                                                                           │
                                        Metal shared-memory buffers (page aligned, unified memory)
 ```
-- **Buffers** are the Arrow columnar layout verbatim: validity bitmap + values (+ offsets later). The same bytes
+- **Buffers** are the Arrow columnar layout verbatim: validity bitmap + values (+ offsets for variable-length types). The same bytes
   serve CPU consumers (C Data Interface) and GPU kernels (C Device Interface): copy-free out always, and
   copy-free in when the producer's buffers are page aligned — one copy otherwise, which the importer
   reports (`ImportResult.zeroCopy`).
@@ -134,7 +134,7 @@ argsorts the `K` representative values. Sorting `K` values instead of `n` rows i
 
 Because the table keeps the lowest row per slot, first-appearance order is available for one argsort of
 `K` int32s (`HashGroups.firstSlotOrder`, exposed as `HashDistinct.firstRows`) rather than another pass
-over the rows — which is what an `order:` option would want.
+over the rows, which is what `order="first_appearance"` uses.
 
 The threshold is `1 << 16` rows: below it the sort is a handful of small passes and the table's extra
 round trips do not pay for themselves. `ARROWMETAL_NO_HASH=1` forces the sort path in a release build,
@@ -175,8 +175,7 @@ which a hash-order `unique` would not pay. And `mode` is measured through a Pyth
 computes it **twice** (`_mode` in `python/arrowmetal/__init__.py` calls the reduction once for the
 value and again for the count), so its row carries two reductions. At
 1,000 distinct pyarrow's `mode` is ahead because the values span a narrow range and it counts into a
-direct-indexed table rather than a hash map; the same range trick already exists here in
-`GroupByKeys.rangeIds` and is the obvious next step for these five functions.
+direct-indexed table rather than a hash map.
 ## Group-by
 
 Dense group ids `0 ..< K` come out of `GroupByKeys`; everything below aggregates over them. There are
@@ -356,7 +355,7 @@ For a scalar there is an async accessor: `MetalArray.sumAsync()` (and `meanAsync
 kernel in an async batch and combines the per-threadgroup partials on the completion path, so nothing
 blocks. Deferred errors are thrown from the `await` (or delivered as `.failure`), not from the recording.
 
-Not yet: async accessors for `min`/`max`/group-by, and cancellation (a committed command buffer runs to
+Not available: async accessors for `min`/`max`/group-by, and cancellation (a committed command buffer runs to
 completion).
 
 ## CPU/GPU router
@@ -426,8 +425,8 @@ Python.
 `Benchmarks/results/router_check_2026-09-24_after_refit.csv` is the same check run against the refitted
 table: `auto` took the faster path in 71 of 72 cases. The one miss is `compare(int64 > int64)` at 3M
 rows, by a margin of 1.10, because the compare row is fitted on the scalar compare. Both runs compare the
-GPU with a single-core CPU loop; a background process holding one of the sixteen cores (the file sync was
-running during both) does not enter either side.
+GPU with a single-core CPU loop; a background process holding one of the sixteen cores does not enter
+either side.
 
 The table can also be generated from `Benchmarks/results/router_2026-09-17.json`, the size sweep behind
 [CROSSOVER.md](CROSSOVER.md) (`router_table.py --json`), whose CPU side is the bench's own single-core
@@ -439,8 +438,7 @@ which source it came from, and `--check` regenerates from that source.
 slot including those under nulls, as the GPU computes them), *map-to-bitmap* (compare, 32 bits per
 word, bits past the length zero), *compact* (filter, by 64-bit selection words), and a *dictionary loop*
 for the group-by sum (a `keyCount`-slot table of wrapping 64-bit sums and counts). They are
-single-threaded: the all-core figure in CROSSOVER.md shows what a threaded loop would change and what
-it would cost in CPU time, and that is a separate decision. `CPUReference` stays the tests' oracle; its
+single-threaded; CROSSOVER.md also records the bench's all-core loop for reference. `CPUReference` stays the tests' oracle; its
 closure-per-element walk is one to two orders slower than these loops (CROSSOVER.md, `cpu-ref`).
 
 **Byte-identical output.** For every routed operation the CPU loop returns what the GPU kernel returns:
@@ -587,38 +585,7 @@ The radix sort's block size is also now adaptive below ~256k rows: a fixed 4096 
 20k-element sort — the size top-k's final ordering lands on — running on five threadgroups. Inputs above
 ~256k rows are unaffected, so the 50M argsort is unchanged.
 
-## Roadmap for "no room left"
-
-This is the throughput list this page keeps; the project roadmap is [ROADMAP.md](ROADMAP.md). Four of
-the items it opened with have since landed and are struck through rather than deleted, so a reader can
-see what the design note predicted and where it went.
-
-1. **Pipelined execution** (above). The largest gain for query-shaped work and for Python callers. Still open.
-2. ~~**Fused expressions**~~ — done: `Sources/ArrowMetal/Expr` compiles a whole expression DAG into one
-   runtime-generated MSL kernel, and filter + aggregate, project and dense-key group-by fuse into one
-   dispatch ([EXPR.md](EXPR.md)).
-3. **Reductions with vector loads** (`long4`) and tuned threadgroup counts per chip family.
-4. **Filter in two passes** instead of four: compute selection + per-block counts in one kernel, then
-   scatter with in-kernel decoupled look-back scan.
-5. ~~**Strings**~~ — done for `utf8` / `binary`: equality, prefix, length, hash and GPU dictionary
-   encoding, so group-by over strings maps to the dense-key path (above). `utf8_view` / `binary_view`
-   are the part still open, and are on [ROADMAP.md](ROADMAP.md#types-and-interop).
-6. ~~**Sort / top-k**~~ — done: the LSD radix sort on 32/64-bit keys with payload, `MetalRecordBatch
-   .sorted(by:)`, and the radix select above.
-7. **Hash group-by** for arbitrary keys (open addressing in device memory), feeding the same aggregators.
-   Done for `utf8` / `binary` keys (above); the same table would replace the sort for float and
-   wide-range integer keys, which still argsort.
-8. ~~**Float64 sum/arithmetic** on the GPU~~ — done, but not the way this line guessed: software
-   IEEE-754 binary64 (`Kernels/DoubleMath.swift`) rather than double-float or opt-in Float32, because
-   an approximate float64 would have been a support burden forever ([DECISIONS.md](DECISIONS.md)).
-9. **Binary archives** (`MTLBinaryArchive`) so the first call does not pay ~100 ms of shader compilation.
-10. **Metal 4** command encoding and residency sets for very large resident datasets.
-11. **iOS/visionOS**: the library already targets iOS 17+ (`Package.swift`); add a demo app and
-    thermal-aware sizing. Nothing has been measured on an iPhone or iPad.
-12. **Chip matrix**: publish benchmarks for M1/M2/M3/M4 base, Pro, Max, Ultra and A17/A18. Every number
-    in this repository is from one M4 Max.
-
 ## Non-goals
 - Not a query planner or SQL engine. It is the compute layer that DuckDB, DataFusion, Polars plugins or
   an app can call.
-- Not a tensor library; MLX is that. A zero-copy bridge to MLX is planned.
+- Not a tensor library; MLX is that.

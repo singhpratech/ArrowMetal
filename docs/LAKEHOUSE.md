@@ -200,7 +200,7 @@ against `deltalake`, pyiceberg, polars (`scan_delta`, `scan_iceberg`) and DuckDB
 `iceberg_scan` (used only when the extensions load with auto-install switched off); the first run used
 `deltalake` 1.6.5, pyiceberg 0.12.0, polars 1.44.1 and DuckDB 1.5.5 with its extensions from the local
 extension cache. The numbers here are from a quiet run over a 2,000,000-row table,
-`Benchmarks/results/lakehouse_2026-09-24.csv`; the load average and the file-sync process's CPU at its
+`Benchmarks/results/lakehouse_2026-09-24.csv`; the run conditions at its
 start are recorded in `Benchmarks/results/bench_conditions_2026-09-24.txt`. Median wall time in that
 file:
 

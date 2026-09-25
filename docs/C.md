@@ -4,7 +4,7 @@ One header, one dynamic library, no Swift in sight for the caller. `include/arro
 222 entry points over `libArrowMetalC.dylib`; every other binding in this repository (Python,
 Rust, Go, TypeScript, R, the Polars plugin, the DuckDB extension) is built on it, so it is tested by all
 of their suites as well as by `python/tests`, which calls it through ctypes, and by a test that compiles
-the header as C in the merge gate.
+the header as C.
 
 ## Build the library
 
@@ -63,5 +63,4 @@ name to its entry point.
 - Thread-local errors mean a green-threaded runtime must read `am_last_error` on the thread that made
   the call (the Go binding pins the OS thread around every call for this reason).
 - `am_import` does not report whether it wrapped or copied; a caller infers it from buffer alignment.
-  `am_import_ex` with that flag is on the [roadmap](ROADMAP.md).
 - macOS arm64 only: the library links Metal.

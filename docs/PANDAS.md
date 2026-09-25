@@ -330,8 +330,7 @@ single-pass float operation stays in pandas there.
   and a wrong answer is worse than a slow one. (The *bridge* converts categoricals and datetimes
   fine — `am.from_pandas` handles them; it is the accel layer that will not route them.)
 - **`merge` is the `validate="m:1"` inner join.** Duplicate or null keys on the right frame, and any
-  outer/left/right join, fall back. A many-to-many join needs a GPU expansion the C ABI does not have
-  yet.
+  outer/left/right join, fall back. Many-to-many joins are not supported in accel mode.
 - **`str.upper`/`str.lower` are ASCII-guarded in accel mode.** The kernels implement Unicode's simple
   1:1 mapping over every script, but pandas applies the *full* mapping (`ß` → `SS`), so accel mode
   checks for pure ASCII on the GPU and falls back otherwise; it never returns a different string

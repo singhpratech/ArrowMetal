@@ -88,9 +88,8 @@ overrides the platform tag.
 
 `arrowmetal` looks for `libArrowMetalC.dylib` in this order:
 
-1. **`$ARROWMETAL_LIB`**, the full path to a dylib. It wins over everything else, because pinning one
-   specific build is exactly what the A/B benchmark scripts and the merge gate use it for — a stale
-   `arrowmetal/_lib/` left behind by a wheel build in the same checkout must not shadow it. Setting it to
+1. **`$ARROWMETAL_LIB`**, the full path to a dylib. It wins over everything else, so one specific build
+   can be pinned; a bundled `arrowmetal/_lib/` copy in the same checkout never shadows it. Setting it to
    a path that does not exist is an error, not a silent fall-back to some other dylib.
 2. **Bundled in the installed package**, `arrowmetal/_lib/libArrowMetalC.dylib` — what a wheel install has.
 3. **The development build**, `.build/release/libArrowMetalC.dylib` beside a source checkout
@@ -113,13 +112,12 @@ interop. Every result is compared to `pyarrow.compute` or plain Python. Polars t
 absent; the suite needs a real Metal device.
 
 Not covered by the dense-key `MetalArray.group_by(key_count)` path: `min`/`max` on 64-bit values, `mean` on
-Float32, and Float64 values for any aggregate; `python/tests` pins those as expected errors so the tests flag it
-when they land. `am.group_by(keys)` runs every aggregate on Float64 values
+Float32, and Float64 values for any aggregate; `python/tests` pins those as expected errors. `am.group_by(keys)` runs every aggregate on Float64 values
 (python/tests/test_arrowmetal.py::test_group_by_arbitrary_keys_matches_pyarrow).
 
 ## Polars
 
-Three tiers, all in this repository — see [docs/POLARS.md](https://github.com/singhpratech/ArrowMetal/blob/main/docs/POLARS.md):
+Four tiers, all in this repository — see [docs/POLARS.md](https://github.com/singhpratech/ArrowMetal/blob/main/docs/POLARS.md):
 
 ```python
 import polars as pl, arrowmetal as am

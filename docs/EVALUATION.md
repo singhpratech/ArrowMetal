@@ -13,7 +13,7 @@ it and compares, so a kernel that is wrong in an unanticipated way still fails.
 |---|---|
 | Files | `python/tests/test_differential.py` (the harness), `python/tests/differential_report.py` (the runner) |
 | Oracle | `pyarrow.compute` 25.0.1, plus a reference written in the harness for the 17 operations Arrow has no function for |
-| Cases in the default matrix | 39,069 — 212 operations over 45 column types, 1,447 applicable (operation, type) cells x 27 datasets — about 180 s on an M4 Max (177.5-182.7 s across the four gate logs under private/keep/2026-09-07/); more with `DIFF_LARGE=1` |
+| Cases in the default matrix | 39,069 — 212 operations over 45 column types, 1,447 applicable (operation, type) cells x 27 datasets — about 180 s on an M4 Max; more with `DIFF_LARGE=1` |
 | Result at 0.1.0 | 36,486 pass, 1,566 fail across 22 documented divergences, 1,017 skip (an operation that does not apply to a type), **0 unclassified** |
 
 ## Method
@@ -222,9 +222,7 @@ stays in the input — it poisons every later element in both engines
 
 Twenty-two divergences the harness found that are not bugs but are not free choices either: each is a
 place where a kernel's own consistency was preferred to Arrow's answer, or where a documented limit of
-the GPU path shows through. (A finding whose title starts with `BUG:` is a real bug parked so the gate
-stays green while it is open; the two the coverage pass found are fixed and listed under "Findings that
-were fixed".) Together they account for all 1,566 failing cases; a cell matched by two findings appears
+the GPU path shows through. Together they account for all 1,566 failing cases; a cell matched by two findings appears
 under both, so the Cases column below sums to more than 1,566. Each has an entry in
 `FINDINGS` in `test_differential.py`, so the matrix groups the affected cells under the finding instead
 of burying them, and an `xfail(strict=True)` reproduction, so the suite turns red the moment a kernel
@@ -567,8 +565,7 @@ am.array(a).sin().to_arrow()   # [0.797567…]
 pc.sin(a)                       # [0.874217…]
 ```
 
-A Payne–Hanek reduction would fix it and would cost every ordinary argument the time; the header states
-the limit instead. Float32 is unaffected — it runs Metal's own functions, which reduce correctly across
+The header states the limit. Float32 is unaffected — it runs Metal's own functions, which reduce correctly across
 the whole range. Classified by the data. Reproductions: `test_trig_reduces_a_large_argument` (xfail)
 and `test_trig_agrees_below_the_reduction_limit`.
 
@@ -606,9 +603,8 @@ am.array(a).rolling_min(2).to_arrow()   # [null, 0.0]
 pc.min(a).as_py()                        # -0.0
 ```
 
-Small, and the same shape as the bugs that were fixed in the selection kernels; it is written down here
-rather than fixed because the rolling kernels are the newest in the package and the fix belongs with
-their next revision. Classified by the data. Reproduction:
+Small, and the same shape as the bugs that were fixed in the selection kernels; it is recorded here as a
+known divergence. Classified by the data. Reproduction:
 `test_rolling_min_breaks_a_zero_tie_like_fmin` (xfail).
 
 ### 18. `unique` and `value_counts` drop the null row of a string column

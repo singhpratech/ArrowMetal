@@ -9,10 +9,9 @@ package loads a `.dylib` through `dlopen`.
 
 Full documentation: [`../docs/TYPESCRIPT.md`](../docs/TYPESCRIPT.md).
 
-**Not publishable as it stands.** `binding.gyp` reaches `../include` for the repository's
+**Not published.** `binding.gyp` reaches `../include` for the repository's
 `arrow_abi.h`, which does not exist inside an installed package, so a tarball would not build. The
-package is marked `private` and `files` / `os` / `cpu` have been removed rather than left as a
-promise the tarball cannot keep; see [the note below](#packaging).
+package is marked `private`; see [the note below](#packaging).
 
 ## Install
 
@@ -165,10 +164,8 @@ sliced input.
 
 ## Packaging
 
-`npm publish` is blocked (`"private": true`) and the `files`, `os` and `cpu` fields have been
-removed. The reason is `binding.gyp`, which adds `../include` so the addon can include the
+The package is not published: `npm publish` is blocked (`"private": true`) and there are no `files`,
+`os` or `cpu` fields. The reason is `binding.gyp`, which adds `../include` so the addon can include the
 repository's `arrow_abi.h`. That path is outside the package, so `npm pack` produces a tarball that
-installs and then fails to compile. Publishing needs either a vendored copy of `arrow_abi.h` inside
-`node/` or a prebuilt binary; neither is done here, and pretending otherwise with a `files` list
-would only make the failure later and stranger. `main` and `types` are kept, since they are what
+installs and then fails to compile. `main` and `types` are kept, since they are what
 make a local `file:` or `npm link` install resolve to `dist/`.

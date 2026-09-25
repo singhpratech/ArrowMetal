@@ -10,7 +10,7 @@ Two crates live in [`rust/`](../rust):
 | `arrowmetal-sys` | Raw `extern "C"` declarations over [`include/arrowmetal.h`](../include/arrowmetal.h), plus the `build.rs` that finds and links `libArrowMetalC.dylib`. |
 | `arrowmetal` | The safe crate. An `arrow::array::ArrayRef` goes in, an `ArrayRef` comes out; every failure is a `Result` carrying `am_last_error()`'s message. |
 
-Both are on crates.io at 0.1.0; a path or git dependency on a checkout works too.
+Both are on crates.io at 0.2.0; a path or git dependency on a checkout works too.
 
 Everything below was run in this repository on 2026-09-07 on an Apple M4 Max, macOS 26.6.2,
 `rustc 1.95.0`, arrow-rs 59.3.0, ArrowMetal 0.1.0.
@@ -190,8 +190,8 @@ and both have tests behind their *observable* halves — a sliced array round-tr
 always page aligned, which is the precondition for the no-copy path
 (`arrowmetal_exported_buffers_are_page_aligned`). But **whether a given import copied is not
 observable through the C ABI**: the Swift side computes an `ImportResult.zeroCopy` flag and
-`am_import` discards it. Until the ABI reports it — an `am_import_ex` with an `int* out_zero_copy`
-would do — these two are arguments, not measurements, and are labelled as such.
+`am_import` discards it. The ABI does not report it, so these two are arguments, not measurements,
+and are labelled as such.
 
 ---
 
@@ -253,9 +253,8 @@ This is a limitation of the C ABI, not of the Arrow type — the kernels handle 
 and Swift and Python callers use them. It is an ABI defect on ArrowMetal's side: `am_format` reports
 the C Data Interface's top-level format, which for a dictionary is its index type. The entry point
 that reports the type the kernels compute on exists (`am_compute_format`,
-[`include/arrowmetal.h:32`](../include/arrowmetal.h)); this crate does not use it yet, so it still
-refuses dictionaries. Until it does, refusing the type is what keeps the sentence above true for
-everything this crate accepts.
+[`include/arrowmetal.h:32`](../include/arrowmetal.h)); this crate does not use it and refuses
+dictionaries, which keeps the sentence above true for everything this crate accepts.
 `tests/compute.rs::dictionary_arrays_are_refused_at_import` pins the rejection and the decode path.
 
 ### One divergence from arrow-rs, found and pinned
@@ -409,6 +408,6 @@ cd rust
 ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib cargo test --release
 ```
 
-48 tests, plus 4 `no_run` doc-tests (compiled, not executed); 0 failures in the last gated run
-(`private/keep/2026-09-07/final_gate.log`). What each file compares against is in
+48 tests, plus 4 `no_run` doc-tests (compiled, not executed); 0 failures on 2026-09-24 at
+`3c3ea1e` ([TESTING.md](TESTING.md)). What each file compares against is in
 [`rust/README.md`](../rust/README.md) and in [TESTING.md](TESTING.md).

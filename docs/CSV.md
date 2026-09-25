@@ -333,7 +333,7 @@ PYTHONPATH=python python Benchmarks/csv_bench.py --rows 1000000,10000000
 quoted text column) at 1M and 10M rows with ArrowMetal, `pyarrow.csv.read_csv`, `polars.read_csv`,
 `pandas.read_csv` (pyarrow engine and default engine) and DuckDB's `read_csv`, and writes the median,
 min and max of each. The numbers here are from a quiet run, `Benchmarks/results/csv_bench_2026-09-24.csv`;
-the load average and the file-sync process's CPU at its start are recorded in
+the run conditions at its start are recorded in
 `Benchmarks/results/bench_conditions_2026-09-24.txt`. In that file, median wall time:
 
 | reader | 1 M rows | 10 M rows |
@@ -352,7 +352,7 @@ The default read and `read_csv_table` are ahead of every CPU reader at both size
 takes 105.39 ms against Polars' 98.75 ms, and at 1 M rows 14.56 ms against 10.37 ms.
 
 An earlier run, taken while other work shared the GPU, is kept as history in
-`Benchmarks/results/csv_bench_2026-09-23_provisional.csv` (named for the lane's day; the run itself
+`Benchmarks/results/csv_bench_2026-09-23_provisional.csv` (named for the day it was started; the run itself
 went past midnight, so its `date` column reads 2026-09-24).
 
 `ARROWMETAL_CSV_TRACE=1` prints the wall time of each phase of a read to stderr, and `=2` runs every

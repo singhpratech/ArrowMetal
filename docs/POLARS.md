@@ -152,7 +152,7 @@ aggregate after that reuses it, so `.agg(...)` with six outputs costs **one** gr
 
 ### The join
 
-The bridge does not call the C ABI's `am_join` hash join yet; `df.arrowmetal.join` is built out of
+The bridge does not call the C ABI's `am_join` hash join; `df.arrowmetal.join` is built out of
 two other kernels. `am_index_in` finds, for every left key, the row of the right key column it matches;
 `am_take` and `am_filter` then gather both sides. That is a complete **inner** or **left** join
 whenever the **right key is unique** -- the usual dimension-table shape -- and the whole thing,
@@ -331,35 +331,17 @@ Read from the installed package, not from memory:
   `view_expression(node)`, `add_expressions(expressions)`, `set_expr_mapping(mapping)`,
   `unset_expr_mapping()`.
 
-So a Metal backend is **not** blocked on Polars adding an API -- the API is there. What a
-`MetalEngine` would have to do:
+So a Metal backend is **not** blocked on Polars adding an API -- the API is there, and tier 4 below
+is built on exactly this surface. One fact about names: the engine's `name` is passed to Rust as
+`ldf.collect(self.name, callback)`, and Rust only knows the four in `SUPPORTED_ENGINE_NAMES` (a fifth
+string raises `ValueError`). When a callback is supplied, Rust invokes it for any known name,
+`"in-memory"` and `"streaming"` included (checked on 1.44.1), and an `Engine` object passed to
+`collect(engine=...)` bypasses the Python-side name check. So a third-party engine runs by passing
+`"in-memory"` to Rust and reporting itself through `plan_engine`; what it cannot do is carry its own
+name through Rust, so `explain` and the callback's error message (`'cuda' conversion failed`) name
+the wrong engine.
 
-1. Subclass `_LocalEngine` (or `Engine`) and give it a `name`. The name is passed to Rust as
-   `ldf.collect(self.name, callback)`, and Rust only knows the four in `SUPPORTED_ENGINE_NAMES`
-   (a fifth string raises `ValueError`). When a callback is supplied, Rust invokes it for any
-   known name, `"in-memory"` and `"streaming"` included (checked on 1.44.1), and an `Engine`
-   object passed to `collect(engine=...)` bypasses the Python-side name check. So a third-party
-   backend can run today by passing `"in-memory"` to Rust and reporting itself through
-   `plan_engine`; what it cannot do is carry its own name through Rust, so `explain` and the
-   callback's error message (`'cuda' conversion failed`) name the wrong engine. That naming
-   is the one upstream change worth asking for; it is not a blocker.
-2. Return a `PostOptCallback` from `_post_opt_callback`. It receives the `NodeTraverser` sitting
-   on the optimised IR plus a second argument that is `None` in a plain `collect` (the
-   type alias calls it `int | None`; it is a timing value, not a node id), and returns `None`
-   -- it works by mutation.
-3. Walk the IR with `get_node` / `set_node` / `get_inputs` / `view_current_node` /
-   `view_expression`, translating each node it recognises. Every node it does not recognise is
-   where the backend must decide between falling back (leave the node alone) and raising
-   (`raise_on_fail`, which `GPUEngine` exposes as a config flag).
-4. Replace the translated subtree with `set_udf(callable)`: the callable is what Polars will
-   execute for that node, and it must return a Polars `DataFrame`. This is the seam through
-   which tier 4 returns its results.
-5. Handle the schema contract exactly: `get_schema()` and `get_dtype()` give the dtypes Polars
-   will assume downstream, so a backend that widens an integer sum has to cast back. Polars does
-   **not check** what the replacement returns: a frame with a wrong dtype is accepted and the wrong
-   dtype propagates, so the backend has to assert its own output.
-
-That translator is tier 4, below. `collect_gpu` stays the explicit form of the same idea: Polars
+`collect_gpu` stays the explicit form of the same idea: Polars
 owns the plan, ArrowMetal owns one pass over the result.
 
 ---
@@ -525,8 +507,8 @@ is converted on the CPU. `Benchmarks/polars_engine_bench.py` measures the eight 
 Polars' in-memory engine, Polars' streaming engine and the engine with everything it can translate
 (`shapes="all"`), cold (nothing imported before) and warm (see the import cache below). The numbers
 below are from a quiet run at 2,000,000 and 50,000,000 rows,
-`Benchmarks/results/polars_engine_bench_2026-09-24.csv`; the load average and the file-sync process's
-CPU at its start are recorded in `Benchmarks/results/bench_conditions_2026-09-24.txt`. The defaults
+`Benchmarks/results/polars_engine_bench_2026-09-24.csv`; the run conditions
+at its start are recorded in `Benchmarks/results/bench_conditions_2026-09-24.txt`. The defaults
 were first chosen from a run at 500,000 to 50,000,000 rows taken while other work shared the machine,
 kept as history in `Benchmarks/results/polars_engine_bench_2026-09-23_provisional.csv`; the quiet run
 did not repeat the 500,000, 1,000,000 and 10,000,000-row sizes.
@@ -558,7 +540,7 @@ cold` rows, where above 1 is ahead; 2M rows first, then 50M), the quiet run says
   keep first` (1.60, 5.52) are ahead at both sizes; `(f) semi join` is to improve at both (0.22, 0.41).
   Like group-by, both run on the key-to-id machine, whose speed against Polars depends on how many
   distinct keys there are, and one shape of each is not enough to set a default by.
-* **Windows and the as-of join** stay with Polars in this version; their rows record what the
+* **Windows and the as-of join** stay with Polars; their rows record what the
   callback costs a plan it leaves alone. `MetalEngine default, cold` against `polars in-memory`: `(g)
   row_number over partitions` 15.139 ms against 14.770 ms at 2M rows and 93.614 ms against 95.680 ms at
   50M, `(h) as-of join` 7.039 ms against 7.116 ms and 152.100 ms against 151.741 ms.
@@ -568,11 +550,9 @@ its inputs is a String column, and its in-memory inputs hold at least 1,000,000 
 when a helper key is needed. 1,000,000 is the crossover against the fastest CPU library of the
 operations a full sort runs (the engine's `sort` is a `lexsort` and a `take`, [ENGINE.md](ENGINE.md))
 in `Benchmarks/results/router_2026-09-24.json`: `argsort int64`, `argsort float64` and `lexsort (2
-int32 keys)` are all at 1,000,000. The figure was first taken from
-`Benchmarks/results/router_2026-09-17.json`, whose ArrowMetal rows came from a stale library, where
-`sort float64` was cited alongside them at 1,000,000; in the 2026-09-24 sweep `sort float64` (sorting
-a column's values, which the engine does not run for a frame sort) is at 10,000,000, and the rows the
-engine does run are unchanged. The provisional run had full sorts ahead below 1,000,000 as well, so the
+int32 keys)` are all at 1,000,000. The figure is read from the
+2026-09-24 sweep, which supersedes `router_2026-09-17.json`; `sort float64` (sorting a column's values,
+which the engine does not run for a frame sort) is at 10,000,000 there. The provisional run had full sorts ahead below 1,000,000 as well, so the
 default keeps the router's figure as its margin. The quiet run keeps these defaults. Both sorts the default takes are
 ahead of the faster Polars engine at both sizes (`MetalEngine default, cold`: `(m)` at 5.20 and 4.86,
 `(q)` at 3.75 and 6.35). Every shape it declines is behind at one of the two sizes, or belongs to a
@@ -651,9 +631,7 @@ checks the result is still Polars' and the report names the reason. One case rer
 `test_polars.py` and `test_lazy.py` with every `LazyFrame.collect()` also collected through the engine
 (`python/tests/metal_engine_everywhere.py`) and requires the two to agree.
 
-### A checklist to run by hand
-
-The plan behind this tier asks for these on real hardware before anything from it goes upstream:
+### To verify on your own machine
 
 0. `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c release --product ArrowMetalC`,
    then `PYTHONPATH=python python -m pytest python/tests/test_polars.py python/tests/test_lazy.py -q`:
@@ -813,7 +791,7 @@ enough not to flake. The plugin tests skip when the Rust library has not been bu
 checkout without a Rust toolchain still runs green -- **build it before you trust a green run**,
 or 28 of the 90 are skips (`62 passed, 28 skipped`).
 
-The tier-2 block at the end of the file is the adversarial pass: the scalar operand against the
+The tier-2 block at the end of the file is the hostile-input pass: the scalar operand against the
 tier-1 bridge, nulls against native Polars, a sliced Series and a two-chunk one, an empty frame,
 an all-set validity bitmap with no nulls, the twelve dtypes the numeric expressions refuse (each
 one a Polars error carrying ArrowMetal's wording, never a pyo3 panic), and the expression inside

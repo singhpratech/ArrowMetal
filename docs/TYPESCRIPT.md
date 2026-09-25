@@ -8,8 +8,7 @@ Every number on this page was measured on 2026-09-07 on an Apple M4 Max, macOS, 
 apache-arrow 21.2.0, ArrowMetal 0.1.0 built `-c release`.
 
 **The browser is out of scope.** There is no Metal in a browser, and this package loads a `.dylib`
-through `dlopen`. It is macOS on Apple silicon, in Node, or nothing. There is no WASM fallback and
-none is planned.
+through `dlopen`. It is macOS on Apple silicon, in Node, or nothing. There is no WASM fallback.
 
 ## Install
 
@@ -264,12 +263,10 @@ Numbers are from an M4 Max on 2026-09-07. `node bench/spread.mjs` re-runs the wh
   pinned until ArrowMetal itself lets go. See [Lifetime](#lifetime).
 * **No prebuilt binary.** `npm install` compiles the addon locally, and the dylib must already
   exist.
-* **Not publishable as it stands.** `binding.gyp` adds `../include` so the addon can include the
+* **Not published.** `binding.gyp` adds `../include` so the addon can include the
   repository's `arrow_abi.h`; that path is outside the package, so an `npm pack` tarball installs
-  and then fails to compile. The package is therefore marked `"private": true` and the `files`,
-  `os` and `cpu` fields have been removed rather than left as a promise the tarball cannot keep.
-  Publishing needs either a vendored `arrow_abi.h` under `node/` or a prebuilt binary; neither is
-  done here. `main` and `types` are kept, so a local `file:` or `npm link` install resolves.
+  and then fails to compile. The package is therefore marked `"private": true` and has no `files`,
+  `os` or `cpu` fields. `main` and `types` are kept, so a local `file:` or `npm link` install resolves.
 
 ## Tests
 

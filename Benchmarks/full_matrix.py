@@ -2536,10 +2536,11 @@ SORT_BASED = ("count_distinct", "quantile", "mode(", "median", "tdigest", "uniqu
 CAUSE_HINTS = [
     # (predicate on (family, op), cause)
     (lambda fam, op: "match_like" in op and "_ wildcard" in op,
-     "Host fallback, correctly: `Regex.likePredicate` (Sources/ArrowMetal/Kernels/Regex.swift) maps "
-     "only a pure prefix / suffix / contains / equality LIKE pattern onto a GPU predicate. `_` is "
-     "LIKE's single-character wildcard, so this pattern is translated to an anchored regex and matched "
-     "row by row with NSRegularExpression (ICU) on the CPU. A GPU wildcard matcher is the fix."),
+     "`match_like` with a `_` wildcard runs on the GPU (`Kernels/StringLike.swift`): a pure prefix / "
+     "suffix / contains / equality pattern routes to a plain predicate, and every other pattern is "
+     "compiled into a small byte program run by one thread per row with a greedy-plus-backtrack "
+     "wildcard match that counts code points. The per-row backtracking is the cost against the CPU "
+     "library's scan."),
     (lambda fam, op: "match_like" in op,
      "`match_like` should take the GPU prefix path here (Regex.likePredicate); if this row is short of "
      "3x the GPU predicate itself is the cost, not a fallback."),
@@ -2547,20 +2548,18 @@ CAUSE_HINTS = [
      "`Kernels/StringSort.swift` sorts these on the GPU: an LSD radix over 7-byte prefix chunks, one "
      "stable radix pass per chunk, so the pass count is `ceil(longest row / 7)`. Each pass is a full "
      "64-bit radix argsort plus a gather of the next chunk's keys, which is several times the column "
-     "in traffic; Polars sorts strings with one multi-threaded comparison sort over pointers. Wider "
-     "chunks, or refining only the tie runs after the first pass, is the lever."),
+     "in traffic; Polars sorts strings with one multi-threaded comparison sort over pointers."),
     (lambda fam, op: "dictionary_encode (int32)" in op,
      "`am_dictionary_encode` routes an integer column to `DictionaryCompute.dictionaryEncoded()`, "
      "which is the GPU `unique()` pipeline: a full radix argsort of the column, run marks, a scan and "
-     "a gather. pandas builds its categories from one hash-table pass. A hash-based dense-encoding "
-     "kernel (the one `am_group_by_keys` already has for narrow ranges) is the fix."),
+     "a gather. pandas builds its categories from one hash-table pass."),
     (lambda fam, op: fam == "decimal" and "sum" in op,
      "`sum` on a decimal column routes to `am_decimal_op` op 18 (128-bit threadgroup partials, host "
      "combine). If this row is short of 3x the reduction itself is the cost."),
     (lambda fam, op: any(t in op for t in SORT_BASED),
      "Sort-based path: ArrowMetal answers this with a full GPU radix sort plus a run scan, where the "
      "CPU libraries use a hash table (count_distinct, mode, unique, value_counts) or a partial "
-     "selection (quantile, tdigest). A hash/sketch kernel is the fix."),
+     "selection (quantile, tdigest)."),
     (lambda fam, op: op.startswith("min_max"),
      "`min_max` is two separate `am_reduce_ex` dispatches here (min_of_min_max then max_of_min_max), "
      "so it pays the dispatch floor twice for one pass' worth of work."),
@@ -2568,11 +2567,12 @@ CAUSE_HINTS = [
      "Variable-length output: the kernel measures the lengths, prefix-sums them and writes in a second "
      "pass, against one streaming pass on the CPU."),
     (lambda fam, op: "top_k" in op,
-     "`top_k` is a full GPU radix argsort plus a slice; a CPU running top-k touches each value once "
-     "and rarely writes. Needs a partial radix / threadgroup selection kernel."),
+     "`top_k` (`Kernels/TopK.swift`) keeps the best k of each block in threadgroup memory and radix-sorts "
+     "the `blocks * k` candidates; a CPU running top-k touches each value once and rarely writes, so "
+     "the GPU's fixed passes weigh more at 10M rows than at 50M."),
     (lambda fam, op: op.startswith("partition_nth"),
-     "`partition_nth_indices` is documented as the full stable argsort; there is no partial-partition "
-     "kernel yet."),
+     "`partition_nth_indices` (`Kernels/PartitionNth.swift`) is an MSB-first radix select in a fixed "
+     "four or eight passes plus three stream compactions, against a single-pass CPU selection."),
     (lambda fam, op: fam == "latency",
      "Below the 110-160 us dispatch floor (the latency family's sum and filter rows at 1,000 rows): "
      "encode + commit + wait dominates the kernel. Batching removes "
@@ -2591,8 +2591,9 @@ CAUSE_HINTS = [
      "(`dictionaryEncodeGPU`, up to three hash rounds); what is left is the uniques buffer being "
      "rebuilt as a string array on the host."),
     (lambda fam, op: fam == "strings" and "split" in op,
-     "`Regex.splitPattern` is documented **always CPU**: it builds a Swift `[String]` per row under "
-     "`concurrentPerform`, then rebuilds a MetalStringArray. Nothing runs on the GPU."),
+     "`split_pattern` runs on the GPU (`Kernels/StringSplit.swift`) as three passes over two scans: "
+     "count the pieces of every row, measure them, copy the bytes into a `list<utf8>`. The CPU "
+     "library splits in one streaming pass."),
     (lambda fam, op: fam == "strings" and "regex" in op,
      "ICU host fallback: only a metacharacter-free pattern (or `^literal`) takes the GPU path, "
      "everything else is NSRegularExpression row by row across 4096-row chunks."),
@@ -2644,8 +2645,7 @@ CAUSE_HINTS = [
     (lambda fam, op: fam == "sort" and op.startswith(("argsort", "sort")),
      "The LSD radix sort makes one full read/write pass over the column per digit, plus a gather for "
      "`sort`; that is several times the column in traffic, so it is bandwidth-bound where Polars' "
-     "multi-threaded pattern-defeating sort touches the data far fewer times. Wider digits, or an "
-     "in-threadgroup first pass, is the lever."),
+     "multi-threaded pattern-defeating sort touches the data far fewer times."),
     (lambda fam, op: op.startswith(("sin", "cos", "tan", "ln", "divide")) and "float64" in op,
      "Metal has no `double`: float64 transcendentals and division run ArrowMetal's **software "
      "binary64** (Sources/ArrowMetal/Kernels/DoubleTranscendental.swift), tens of integer instructions "

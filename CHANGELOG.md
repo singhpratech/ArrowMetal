@@ -13,7 +13,7 @@ Core
   check against the result took the faster path in 71 of 72 cases
   (`Benchmarks/results/router_check_2026-09-24_after_refit.csv`). The group-by sum is routed for uint64 values kept unsigned
   (`GroupBy.sumUnsigned`) as well. A batch always keeps the GPU, and so does `auto` for float columns,
-  which have no measured crossover yet. `Benchmarks/router_check.py` times each routed operation under gpu, cpu and auto. `ARROWMETAL_ROUTER=auto|gpu|cpu`, `Router.mode` / `Router.withMode` in Swift,
+  for which no crossover is measured. `Benchmarks/router_check.py` times each routed operation under gpu, cpu and auto. `ARROWMETAL_ROUTER=auto|gpu|cpu`, `Router.mode` / `Router.withMode` in Swift,
   `am_router_*` in C, and `am.set_router`, `with am.router(...)`, `am.last_route()` in Python
   (docs/DESIGN.md, "CPU/GPU router").
 - The Swift and Python test harnesses and `python/tests/differential_report.py` pin the router to the
@@ -221,21 +221,21 @@ Fixed
 - A String `filter` or `take` no longer copies the bytes under a null slot over the next kept row:
   `str_gather_bytes` copied each source row's own byte length while the output offsets gave a null row
   length 0, so a null that held bytes (valid Arrow; Polars exports them) turned "banana" into "xanana".
-  The kernel now copies the output slot's width. Found by the Polars engine lane's differential suite.
+  The kernel now copies the output slot's width. Found by the Polars engine's differential suite.
 - A Boolean column carried through the plan's sort keeps its null count. `take` computes its result's
   null count when the batch flushes, and every result derived from it before then (the Boolean repack,
   any element-wise kernel) copied the count early and kept 0 over a bitmap with nulls; such results now
   count their own nulls at the flush, as do element-wise results of a pending `filter`. Found by the
-  Polars engine lane's differential suite.
+  Polars engine's differential suite.
 - A plan whose filter or projection only carries a column the expression compiler does not read (a
   `date32`, a list) runs: the compiler bound every column of the batch as a kernel input and refused
-  that one. Only the columns the query reads are bound now. Found by the Polars engine lane's
+  that one. Only the columns the query reads are bound now. Found by the Polars engine's
   differential suite.
 - A String sort with a null and a row of 8 bytes or more returns the right rows inside a batch (every
   plan sort): with two or more prefix passes the index array is a `take` of the passes, and the null
   partition read it on the CPU before the GPU had written it, returning wrong rows and once a bus
   error. The partition now runs on the GPU, in the sort's own prefix keys, so there is no CPU read to
-  wait for (see Core). Found by the Polars engine lane's differential suite.
+  wait for (see Core). Found by the Polars engine's differential suite.
 - The DuckDB rewrite extension refuses an unrecognised `arrowmetal_rewrite` value at the `SET`
   (`'on'`, `'true'`, `' force'` with a space, `NULL`), with an error naming the accepted values: `'auto'`,
   `'off'` (also `'false'` or `'0'`) and `'force'`, in any letter case. It used to take such a value as
@@ -244,12 +244,12 @@ Fixed
   below it is filed by DuckDB under the NULL group and by the rewrite under the key.
 - `am.scan_ipc(...)` (and every stream with no explicit projection) no longer replaces the second of two
   same-named columns with a copy of the first: the default projection looked each column up by name.
-  Such a batch now stays positional; batches with unique names take the fused path as before. Found by
-  the review of the IPC lane.
+  Such a batch now stays positional; batches with unique names take the fused path as before. Found
+  while reviewing the IPC reader.
 - A float literal whose value is 2^63 or more in magnitude no longer ends the host process: the fused
   expression compiler converted every float literal to Int64 even for float targets, and `Int64(Double)`
   traps outside its range. Float targets no longer compute the integer; an integer-typed float literal that
-  does not fit 64 bits is an `ExprError` naming it. Found by the review of the Polars engine lane.
+  does not fit 64 bits is an `ExprError` naming it. Found while reviewing the Polars engine.
 - Parquet row-group and page-index filters on string and binary columns compare the statistics as
   Parquet orders them, by unsigned bytes, with a string literal taken as its UTF-8 bytes. They used
   Swift's `String` order (Unicode canonical equivalence), so a filter on non-ASCII strings could skip a
@@ -270,8 +270,9 @@ Fixed
 Quality
 - The crossover table (docs/CROSSOVER.md, `Benchmarks/crossover.py`, `arrowmetal-bench crossover`): a size sweep of
   the matrix from a thousand rows to fifty million over six families, and the GPU kernel timed against the
-  single-core loop a CPU/GPU router would run instead, so the row count from which the GPU path is ahead is
-  stated per operation instead of bracketed. Measured 2026-09-17; the router itself is not implemented.
+  single-core loop the router runs, so the row count from which the GPU path is ahead is
+  stated per operation instead of bracketed. Measured 2026-09-17 and refitted from the 2026-09-24 `router_check`
+  run (Core, above).
 
 ## 0.1.0
 Everything below is in 0.1.0, the first public release.
@@ -462,7 +463,7 @@ Integrations
   PEP 562 hook (`_LAZY_HOOKS`).
 - The public C header compiles as C, which `test_the_public_c_header_compiles` now holds it to (a
   typedef/function name clash, `am_plan_source`, was a redefinition in both C and C++ and blocked every
-  C consumer including the DuckDB extension until the reviewer caught it).
+  C consumer including the DuckDB extension until the review caught it).
 
 Bindings
 - libArrowMetalC C ABI (include/arrowmetal.h) and python/arrowmetal ctypes package (Arrow PyCapsule protocol).
@@ -578,8 +579,7 @@ Quality
   build read 247 / 62 / 15 / 15, and that CSV (`full_matrix_2026-09-07.csv`) is kept. Ten ArrowMetal rows a
   regression check flagged were re-measured on a quieter machine and eight spliced in place, each saying so in its
   `note`. docs/BENCHMARKS_MATRIX.md, docs/BENCHMARKS.md, docs/TO_IMPROVE.md and the README are written against the
-  parallel baseline; the 77 rows to improve are grouped by measured cause in docs/TO_IMPROVE.md, each with what would
-  change it.
-- Adversarial review pass before release (four independent reviewers over the integrations, the engine and
-  expression compiler, the GPU kernels, and the C ABI and Parquet reader): every finding carries a
+  parallel baseline; the 77 rows to improve are grouped by measured cause in docs/TO_IMPROVE.md.
+- A review pass before release over the integrations, the engine and expression compiler, the GPU kernels,
+  the C ABI and the Parquet reader: every finding carries a
   regression test; the fixes are the "Fixed" bullets above and the entries in docs/EVALUATION.md.

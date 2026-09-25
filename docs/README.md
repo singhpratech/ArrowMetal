@@ -19,7 +19,7 @@ test or the CSV a claim comes from.
 | [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md) | The complete operation-by-operation comparison against Polars, pyarrow, pandas and numpy in both their eager and most-parallel idioms, at 1k to 50M rows, with a verdict per row and a list of everything below the 3x bar |
 | [DESIGN.md](DESIGN.md) | How it works: buffers, kernels, batching, GPU-side lengths, software Float64, the CPU/GPU router (which small inputs run on a byte-identical CPU loop, and how to override it), where the time goes |
 | [PANDAS.md](PANDAS.md) | pandas on the GPU: the `.am` accessor and the zero-code-change accel mode, what routes to the GPU and when, the zero-copy and null rules, the numbers and the limits |
-| [NUMPY.md](NUMPY.md) | numpy on the GPU through pyarrow: which dtypes cross without a copy (asserted by `test_numpy.py`), NaN-as-value semantics, the matrix rows measured against numpy, and the NEP 18 step that is ours to take |
+| [NUMPY.md](NUMPY.md) | numpy on the GPU through pyarrow: which dtypes cross without a copy (asserted by `test_numpy.py`), NaN-as-value semantics, the matrix rows measured against numpy, and what numpy dispatch is not implemented |
 | [SWIFT.md](SWIFT.md) | The native Swift API: install, the types, the copy rule, tests and where its numbers live |
 | [C.md](C.md) | The C ABI: build the dylib, the handle and error conventions, an example, what the header covers |
 | [RUST.md](RUST.md) | The Rust crate over the C ABI: install, the copy rule as measured, what is wrapped and what is not, the timing table with its method |
@@ -35,17 +35,16 @@ test or the CSV a claim comes from.
 | [DECISIONS.md](DECISIONS.md) | Why it is built this way, one dated entry per decision |
 | [FINDINGS.md](FINDINGS.md) | Things learned the hard way: toolchain quirks, Metal limits, bugs and their lessons |
 | [RESIDENT.md](RESIDENT.md) | The resident-kernel experiment: where the ~65 µs per command buffer goes, and the two measured probes showing a persistent GPU worker polling shared memory does not beat it |
-| [ROADMAP.md](ROADMAP.md) | What is next and what is open for contributors |
-| [../CHANGELOG.md](../CHANGELOG.md) | What is in 0.1.0 |
+| [ROADMAP.md](ROADMAP.md) | The directions the project is heading, and its non-goals |
+| [../CHANGELOG.md](../CHANGELOG.md) | What each release delivered |
 | [../Benchmarks/README.md](../Benchmarks/README.md) | The benchmark programs and the fairness rules |
 | [../python/README.md](../python/README.md) | The Python package: install, wheel build, usage |
-| [RELEASE.md](RELEASE.md) | The ordered checklist for cutting and publishing 0.1.0: tags, the wheel, PyPI, the plugin crate, the docs to re-verify |
+| [RELEASE.md](RELEASE.md) | How a release is built and verified |
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | How to add a kernel, test it, and benchmark it |
 
 ## Installing
 
-Both install routes go through this checkout; [RELEASE.md](RELEASE.md) is the checklist that puts 0.1.0 on
-PyPI, crates.io and a Swift tag.
+Both install routes are below.
 
 ```
 # Swift: add the package by path or git URL in Package.swift, then
@@ -62,7 +61,7 @@ pip install 'python/dist/arrowmetal-0.2.0-*.whl[polars,duckdb,pandas]'   # optio
 ```
 
 The package finds `libArrowMetalC.dylib` in one of three places, in order: `$ARROWMETAL_LIB`, which pins
-one specific build and wins over everything (the A/B benchmark scripts and the merge gate rely on that),
+one specific build and wins over everything,
 then the copy bundled inside the wheel (`arrowmetal/_lib/`), then a development build in `.build/release`
 beside a source checkout. See [../python/README.md](../python/README.md).
 

@@ -37,8 +37,7 @@ bridges through the Arrow C interfaces rather than foundations.
 
 ## 2026-09-06: Runtime shader compilation from generated MSL
 No `.metal` files, no offline `metal` compiler, builds with Command Line Tools only. Kernels are string
-templates specialised per element type and cached per pipeline. Cost: ~100 ms first-use compile per library
-(binary archives are on the roadmap).
+templates specialised per element type and cached per pipeline. Cost: ~100 ms first-use compile per library.
 
 ## 2026-09-06: Page-aligned, pooled buffers via `posix_memalign` + `makeBuffer(bytesNoCopy:)`
 Metal sub-allocates small `makeBuffer(length:)` buffers from a heap, so they are not page aligned and cannot

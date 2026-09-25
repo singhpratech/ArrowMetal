@@ -262,7 +262,7 @@ Each has a test of its own in `python/tests/test_json.py` that checks the differ
 DuckDB's `read_json` (each producing an in-memory table), at 1 M and 10 M rows, in a flat shape and a
 nested one that adds a struct and a list per record, after checking ArrowMetal's table against
 pyarrow's. The numbers here are from a quiet run, `Benchmarks/results/json_bench_2026-09-24.csv`; the
-load average and the file-sync process's CPU at its start are recorded in
+run conditions at its start are recorded in
 `Benchmarks/results/bench_conditions_2026-09-24.txt`. In that file, median wall time:
 
 | reader | flat, 1 M | flat, 10 M | nested, 1 M | nested, 10 M |
@@ -315,8 +315,7 @@ PYTHONPATH=python python -m pytest python/tests/test_json.py -q
 - **The whole input is read into memory** and parsed in one pass; there is no streaming or chunked read
   yet.
 - **One thread walks each record**, so a single very large record — one line of many megabytes, or one
-  long string — is walked serially. Splitting long records and long strings across a SIMD group is to
-  improve.
+  long string — is walked serially, which is to improve.
 - **Each nested level costs its own set of dispatches**, so deeply nested documents take time
   proportional to their depth.
 - **Explicit-schema types** are the set above.

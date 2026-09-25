@@ -15,7 +15,7 @@ Two questions, two tables. The first is the one a caller asks: from what row cou
 | sort | 12 | 10 | 1,000,000 | 1,000,000 | 10,000,000 |
 | strings | 19 | 16 | 100,000 | 1,000,000 | 10,000,000 |
 
-Not swept yet, so no crossover is stated: `chains`, `decimal`, `join`, `temporal`, `window`. The matrix measures them at 10M and 50M rows only ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md)).
+Not swept, so no crossover is stated: `chains`, `decimal`, `join`, `temporal`, `window`. The matrix measures them at 10M and 50M rows only ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md)).
 
 ## The router's own crossover: GPU kernel against the CPU path it would run
 
@@ -31,7 +31,7 @@ Not swept yet, so no crossover is stated: `chains`, `decimal`, `join`, `temporal
 | min(int64) | 1,000,000 | 104 / 1 µs | 106 / 4 µs | 128 / 40 µs | 263 / 557 µs | 418 / 6174 µs | 1199 / 30238 µs |
 | sum(int64) | 1,000,000 | 115 / 1 µs | 106 / 5 µs | 128 / 56 µs | 197 / 993 µs | 298 / 11304 µs | 1041 / 55652 µs |
 
-Each cell is GPU / CPU-path wall microseconds, best of the run's repetitions; the CPU path is the tight single-core loop (`cpu-1core`), or for group-by the candidate dictionary loop (`cpu-candidate`). The bench CSV also carries `cpu-ref`, the tests' `CPUReference` oracle, which walks a closure per element and is one to two orders slower than the tight loop: it is the reason the router's CPU side is written as new loops rather than reused from the oracle. Where an all-core loop was timed it is `cpu-allcores`: the bound a threaded CPU path could reach, not a path the engine has.
+Each cell is GPU / CPU-path wall microseconds, best of the run's repetitions; the CPU path is the tight single-core loop (`cpu-1core`), or for group-by the candidate dictionary loop (`cpu-candidate`). The bench CSV also carries `cpu-ref`, the tests' `CPUReference` oracle, which walks a closure per element and is one to two orders slower than the tight loop: it is the reason the router's CPU side is written as new loops rather than reused from the oracle. `cpu-allcores`, where present, is the bench's all-core loop, recorded for reference.
 
 ## Per operation, against the fastest CPU idiom
 

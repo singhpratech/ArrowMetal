@@ -1,18 +1,18 @@
 # Testing
 
 How ArrowMetal is tested, what each layer compares against, and what "green" means before anything is
-pushed. Numbers are from the last gated run of `main` (0.2.0) on an M4 Max.
+pushed. Numbers are from the last full run of `main` (0.2.0) on an M4 Max.
 
 | Layer | Size | Oracle |
 |---|---|---|
-| Swift suites (`Tests/ArrowMetalTests`) | 943 tests in 73 files, run in release (all 943 executed, 3 skipped in the merge gate of 2026-09-24 at `89d4ed4`: the three opt-in throughput measurements) | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
-| Python suites (`python/tests`) | 5,892 collected cases over the ctypes API, the integrations and the readers in the merge gate of 2026-09-24 at `89d4ed4` (5,867 passed and 25 skipped; the differential matrix in `test_differential.py` is counted in its own row) | `pyarrow.compute`, Polars, DuckDB, pandas |
+| Swift suites (`Tests/ArrowMetalTests`) | 943 tests in 73 files, run in release (all 943 executed, 3 skipped in the run of 2026-09-24 at `89d4ed4`: the three opt-in throughput measurements) | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
+| Python suites (`python/tests`) | 5,892 collected cases over the ctypes API, the integrations and the readers in the run of 2026-09-24 at `89d4ed4` (5,867 passed and 25 skipped; the differential matrix in `test_differential.py` is counted in its own row) | `pyarrow.compute`, Polars, DuckDB, pandas |
 | Rust suites (`rust/arrowmetal/tests`, `rust/arrowmetal-sys`) | 48 tests, 46 in the safe crate against arrow-rs plus 2 in `arrowmetal-sys` over the raw ABI, run in release, plus 4 `no_run` doc-tests (compiled, not executed); all passed on 2026-09-24 at `3c3ea1e` | `arrow::compute` (arrow-rs 59) on the same data; a `HashMap` fold where arrow-rs has no kernel; `include/arrowmetal.h` re-parsed for the ABI signatures ([RUST.md](RUST.md)) |
 | Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | 39,069 generated cases, 45 column types, every public operation | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
 | TypeScript suites (`node/test`) | 62 tests in 6 files over the N-API addon (62 passed on 2026-09-24 at `3c3ea1e`) | Apache Arrow JS 21.2.0 and plain JS over the same rows ([TYPESCRIPT.md](TYPESCRIPT.md)) |
 | Go binding (`go/arrowmetal`) | 46 test functions and one `Example`, 47 runnable, and 131 subtests: 178 passing results as `go test -count=1 -v ./...` reported them on 2026-09-24 at `3c3ea1e`, 0 failed, run twice (plain and under the cgo pointer checker, `GOEXPERIMENT=cgocheck2`, with the same counts) | `arrow-go/v18`'s own `compute` where it has the function, plain Go loops where it does not ([GO.md](GO.md)) |
 | R suites (`r/arrowmetal/tests/testthat`) | 68 `test_that()` blocks in the sources (69 as testthat runs them: the one in test-dispatch.R runs once per attach order), 273 expectations (0 failed, 0 skipped on 2026-09-17 and again on 2026-09-24 at `3c3ea1e`; the four blocks in test-carriers.R cover the ArrowArray/ArrowSchema carriers the shim allocates: release on drop without import, refusal of a moved or unfilled pair, tag checks), over the 34 ABI entry points the R binding wraps | base R and the `arrow` R package's own kernels on the same data ([R.md](R.md)) |
-| Adversarial review pass | four independent reviewers plus a coverage pass before release | each finding carries a regression test |
+| Review pass before release | the integrations, the engine, the kernels, the C ABI and the readers | each finding carries a regression test |
 | Benchmarks (`Benchmarks/`) | 339 operation-and-size rows over 173 operations, against four CPU libraries in two idioms each — the plain eager one and the most parallel one that library has for the same answer (`polars-lazy`, `pyarrow-threaded`); streaming and engine benches | measured, never estimated; the baseline is the fastest idiom of any library, and against it 145 rows are at or above 3x, 102 between 1x and 3x, 77 to improve, where the fastest CPU idiom is ahead, and 15 without a CPU equivalent ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md), [TO_IMPROVE.md](TO_IMPROVE.md)) |
 
 Run everything:
@@ -48,8 +48,8 @@ The R suite needs R with `arrow` and `testthat`; `R CMD INSTALL r/arrowmetal` fi
 `ARROWMETAL_LIB` at the dylib as above. A conda-built R names its own compiler in `Makeconf`, so
 activate the environment (or put its `bin` on `PATH`) before installing; setting `CC = clang` in
 `~/.R/Makevars` to use Xcode's clang works too. `R CMD check --no-manual` on the built tarball is
-the fuller gate; the run recorded in `private/keep/2026-09-08/final_gate_b2dc7fa.log` is the testthat suite
-(266 passed, 0 failed), not `R CMD check`, so no `R CMD check` result is claimed here.
+the fuller check; the recorded run is the testthat suite, not `R CMD check`, so no `R CMD check` result
+is claimed here.
 
 Tests that need a real GPU skip on virtual Metal devices (`requireRealGPU()`), so a hosted CI runner
 exercises the host paths only; the numbers above are from a physical Mac.
@@ -103,17 +103,16 @@ a sliced input at offsets 1, 7, 31, 32, 33, 63 and 64 against the same rows buil
 | Expression compiler and engine | ExprTests, ExprLiteralTypeTests, EngineTests, JoinTests | fused expressions against the unfused kernels, literal promotion, every optimizer rule against the unoptimized plan, six join kinds and as-of against a dictionary oracle |
 | Parquet | ParquetTests, ParquetWriterTests, ParquetNestedTests, ParquetArrowSchemaTests, ParquetPageIndexTests, ParquetFilterEdgeTests, ParquetBloomFilterTests | pyarrow-written fixtures across encodings and compressions, damaged files that must error rather than trap; nested structs, maps and lists from pyarrow, DuckDB and Polars against the generator's formulas and against each other; the stored Arrow schema's types and metadata; page skipping with identical matches with and without the index, `!=` over a NaN hidden in a constant float page, uint64 statistics past the int64 range, the `null` type below repeated fields; bloom filters against xxHash64's published vectors |
 | Delta Lake and Iceberg | LakehouseTests | the 62 reads in `Tests/Fixtures/lakehouse/expected.json` (what `deltalake` 1.6.5 and pyiceberg 0.12.0 returned for every version, snapshot, projection and filter recorded there) replayed row for row; checkpoint against full log replay, log cleanup, multi-part checkpoints, column mapping, the refused reader features and delete files by name, pruning counters, partition-transform projection, Iceberg bound decoding, the Avro container with the `null`, `deflate` and hand-built `snappy` codecs, malformed Avro containers, Delta partition values and reader-feature lists, Iceberg snapshots without manifests and data files holding none of the table's columns as errors, a NaN Delta partition kept for `!=` only, the row-filter literal rules at the edges of their types, float32 exact comparison, empty-string partitions as null, byte-wise string row-group pruning, Iceberg paths used as written ([LAKEHOUSE.md](LAKEHOUSE.md)) |
-| Parquet | ParquetTests, ParquetWriterTests | pyarrow-written fixtures across encodings and compressions, damaged files that must error rather than trap |
 | CSV | CSVReaderTests, CSVFloatParseTests | the GPU structure scan against an independent CPU parser over random hazard-filled files at eight scan block sizes and both file-access modes; inference, forced types, errors, the timestamp[ns] range, `skip_rows_after_names` over ragged rows, `scanBlockBytes` past 32 bits; the GPU float parse against Swift's `Double` / `Float` initialisers bit for bit over a randomized and adversarial corpus ([CSV.md](CSV.md)) |
 | JSON | JSONReaderTests | the structure scan's record boundaries and top-level errors against a sequential CPU scanner, the max-scan against a CPU loop, the walk's entries, RapidJSON's error texts, timestamps against a day-counting reference, random flat files against Foundation's `JSONSerialization`, grouped slot matrices ([JSON.md](JSON.md)) |
 | Streaming | StreamTests | every streaming operator against the in-memory answer at 1–120 batches with ragged and empty batches, HyperLogLog within 3σ, external sort over 120 runs, grace join against the in-memory join |
 | CPU/GPU router | RouterTests | both paths of every routed operation byte-identical (values including slots under nulls, validity bits, null count, buffer size) on all ten primitives, sizes across word and threadgroup boundaries, 0/10/90% nulls, slices at offset 7, signed zeros, infinities, quiet and signaling NaNs with payloads, subnormals; float sums bit-identical past one block per GPU thread; group-by sum (and `sumUnsigned`) with null and out-of-range keys; the CPU loops against `CPUReference`; the decision rules (table, multiply's own row, batch, pending input, no CPU path, modes, per-thread override) |
-| Adversarial pins | AdversarialKernelTests, AdversarialKernelTests2, AdversarialGroupSliceTests | the probes the review pass ran that came back clean, kept so they stay clean: 100–200 repeat determinism loops, boundary lengths, slice-of-slice, group-by with one group and with one group per row, threadgroup-size invariants |
+| Hostile-input pins | AdversarialKernelTests, AdversarialKernelTests2, AdversarialGroupSliceTests | the probes the review pass ran that came back clean, kept so they stay clean: 100–200 repeat determinism loops, boundary lengths, slice-of-slice, group-by with one group and with one group per row, threadgroup-size invariants |
 
 ## 2. Python suites
 
 The column below counts `def test_*` functions. The 5,892 in the table at the top of this page is what
-pytest *collected* in the 2026-09-24 gate, which is larger because a parametrised function collects once per parameter set.
+pytest *collected* on 2026-09-24, which is larger because a parametrised function collects once per parameter set.
 
 | File | Test functions | Compares against |
 |---|---|---|
@@ -153,20 +152,19 @@ fixed" with a plain regression test, so a relapse is a failure rather than a re-
 `test_every_public_operation_has_a_differential_case` and its module-level twin fail the suite when a
 method is added without a matrix case, so the harness cannot silently fall behind the library.
 
-## 4. Adversarial review before release
+## 4. Review before release
 
-Four independent reviewers (integrations; engine and expression compiler; GPU kernels; C ABI, bindings
-and Parquet) and one coverage pass each received a checklist of hostile inputs (sliced and chunked
-inputs, null-only columns, crafted hash collisions, corrupt files, threadgroup-boundary lengths, escape
-sequences, Unicode edge cases, 40,000-call leak loops, fuzzed C entry points). Every finding they
-reported is either fixed with a regression test or recorded as a finding in EVALUATION.md; the fixes are
-listed under "Fixed" in the CHANGELOG. Nothing from that pass was accepted on the reviewer's word: each
-finding's test fails on the commit before its fix.
+A review pass over the integrations, the engine and expression compiler, the GPU kernels, the C ABI,
+the bindings and the Parquet reader ran a checklist of hostile inputs (sliced and chunked inputs,
+null-only columns, crafted hash collisions, corrupt files, threadgroup-boundary lengths, escape
+sequences, Unicode edge cases, 40,000-call leak loops, fuzzed C entry points). Every finding is either
+fixed with a regression test or recorded as a finding in EVALUATION.md; the fixes are listed under
+"Fixed" in the CHANGELOG. Each finding's test fails on the commit before its fix.
 
 ## 5. What "green" means before a push
 
-Every merge to `main` runs steps 1-5 (`private/tools/gate.sh`), on a quiet machine, in this order, and pushes
-only if all pass:
+Every merge to `main` runs steps 1-5 (the commands under "Run everything" above), on a quiet machine,
+in this order:
 
 1. `swift build -c release` with no errors.
 2. `swift test -c release`: every test, 0 failures (the skips on a physical Mac are the opt-in measurements
@@ -177,14 +175,14 @@ only if all pass:
 4. `pytest python/tests` (every suite): 0 failures; xfails must be strict and tied to a finding.
 5. The standalone tests in `test_differential.py`: 0 failures.
 
-Before a release the binding suites run as well and are recorded in `private/keep/2026-09-08/final_gate_b2dc7fa.log`:
+Before a release the binding suites run as well:
 
 6. `cd rust && cargo test --release`: 48 tests and 4 compile-only doc-tests, 0 failures.
 7. `go test` plain and under `GOEXPERIMENT=cgocheck2`.
 8. `npm test` (62 tests).
 9. testthat (266 expectations).
 
-A benchmark comparison is never part of the gate, because timings on a loaded machine are noise; the
+A benchmark comparison is never part of the release checks, because timings on a loaded machine are noise; the
 benchmark matrix is rerun on an idle machine before its numbers are published.
 
 ## 6. Benchmark method

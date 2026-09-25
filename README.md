@@ -133,8 +133,8 @@ floor is the operation; 28 memory-bound single passes; 6 software binary64 trans
 arithmetic; 2 regular expressions matched on the host; 4 where the CPU library returns a view and
 ArrowMetal materialises a column; 8 temporal extractions; 4 `unique` and `value_counts` rows against a
 threaded hash aggregation; 1 grouped moment; 4 string conversions with variable-length output; and 4
-whole-query chains against a streaming engine. `shift (lag 1)` at 0.01x is the lowest ratio in the matrix outside the latency family. Every one of them is listed with its cause and with what would change it in
-[docs/TO_IMPROVE.md](docs/TO_IMPROVE.md), and [docs/DESIGN.md](docs/DESIGN.md) has the pipelining plan for the dispatch floor.
+whole-query chains against a streaming engine. `shift (lag 1)` at 0.01x is the lowest ratio in the matrix outside the latency family. Every one of them is listed with its cause in
+[docs/TO_IMPROVE.md](docs/TO_IMPROVE.md).
 [docs/CROSSOVER.md](docs/CROSSOVER.md) states the other side of the floor: from what row count the GPU path
 is ahead, per operation and per family, measured with a size sweep from a thousand rows to fifty million.
 Below the router's crossover in that document (the GPU kernel against a single-core CPU loop, not against a CPU library), seven operations (sum, min, max, compare, add/subtract/multiply, filter, group-by sum) take a byte-identical single-core CPU path on integer columns instead; `ARROWMETAL_ROUTER=gpu` turns that off ([docs/DESIGN.md](docs/DESIGN.md#cpugpu-router)).
@@ -217,8 +217,7 @@ exchanging columns through the Arrow C Data Interface and each with its own test
 | TypeScript / JavaScript | `node/` (N-API addon) | 62 tests | [docs/TYPESCRIPT.md](docs/TYPESCRIPT.md) |
 | R | `r/arrowmetal` | 68 `test_that()` blocks in the sources (69 as testthat runs them: the one in test-dispatch.R runs once per attach order), 273 expectations | [docs/R.md](docs/R.md) |
 
-C and C++ callers use the header directly. Java, C# and Julia are on the
-[roadmap](docs/ROADMAP.md).
+C and C++ callers use the header directly. Any language with an Arrow binding can use the same header.
 
 ## Quick start (Swift)
 
@@ -406,7 +405,7 @@ Arrow type matrix and the interop status.
 - **Lifetime discipline.** Raw pointers are only valid while their owning object lives. Prefer the closure
   accessors (`withValues`, `withTyped`).
 
-See [ROADMAP.md](ROADMAP.md) for what is next and [CONTRIBUTING.md](CONTRIBUTING.md) to get involved.
+See [ROADMAP.md](ROADMAP.md) for the directions the project is heading and [CONTRIBUTING.md](CONTRIBUTING.md) to get involved.
 
 Questions, and timings from Macs we have not measured: [Discord](https://discord.gg/MEH7QQABUR) or a GitHub issue, whichever you prefer.
 

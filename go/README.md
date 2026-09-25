@@ -11,9 +11,9 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c release 
 go get github.com/singhpratech/ArrowMetal/go/arrowmetal
 ```
 
-The `go get` line works once the repository is public and carries a `go/arrowmetal/vX.Y.Z` tag; the
-module sits in a subdirectory, so the proxy wants the tag prefixed with that path. Until then, use a
-`replace` directive against a checkout, or work inside `go/arrowmetal`.
+The module is tagged `go/arrowmetal/v0.2.0`; the module sits in a subdirectory, so the proxy wants
+the tag prefixed with that path. A `replace` directive against a checkout, or working inside
+`go/arrowmetal`, works too.
 
 ```go
 b := array.NewInt64Builder(am.NewPageAlignedAllocator())

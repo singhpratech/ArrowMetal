@@ -1,7 +1,7 @@
 # numpy
 
 How a numpy array reaches the GPU, what crosses without a copy and what does not, what the benchmark
-matrix measures against numpy, and the one step that would let existing numpy code run on Metal. Every
+matrix measures against numpy, and what is not implemented. Every
 number here is from `Benchmarks/results/full_matrix_2026-09-07.csv` or from `python/tests/test_numpy.py`,
 which asserts each claim in the first two sections on every run. That CSV is the **eager** run, and the
 numpy rows quoted below are numpy's plain eager idiom; the published baseline is the parallel run in
@@ -94,16 +94,9 @@ is on the same Compare tab. The transcendentals are the narrow rows: `ln` at 1.1
 software binary64 on a GPU with no double hardware against a vectorised libm, and they are listed in
 [TO_IMPROVE.md](TO_IMPROVE.md) as open work.
 
-## 4. The step that would matter, and it is ours to take
+## 4. Limits
 
-numpy already dispatches. Since numpy 1.17, an array type that implements `__array_function__` (NEP 18)
-answers `np.sum(x)`, `np.sort(x)`, `np.where(...)` and the rest on its own memory, and numpy calls it
-instead of its own kernel. An ArrowMetal array type that implements it would let existing numpy code run
-on the GPU with no import changed; the hook on numpy's side has been there for years. It is on the
-roadmap ([ROADMAP.md](ROADMAP.md)) and is not in 0.1.0.
-
-## 5. Limits
-
+- NEP 18 dispatch is not implemented: `np.sum(x)` on a Metal column runs numpy's kernel, not the GPU's.
 - Multi-dimensional arrays are not Arrow arrays; pass one column (`x[:, i]` is strided, so it copies once;
   `np.ascontiguousarray` first if you will reuse it).
 - `bool` costs one pass in each direction because of the bit packing.

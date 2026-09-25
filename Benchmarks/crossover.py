@@ -214,7 +214,7 @@ def main():
         L.append(f"| {f} | {n} | {r} | {lo} | {med} | {hi} |")
     L.append("")
     if not_swept:
-        L.append("Not swept yet, so no crossover is stated: " + ", ".join(f"`{f}`" for f in not_swept)
+        L.append("Not swept, so no crossover is stated: " + ", ".join(f"`{f}`" for f in not_swept)
                  + ". The matrix measures them at 10M and 50M rows only ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md)).\n")
     if cross_own:
         L.append("## The router's own crossover: GPU kernel against the CPU path it would run\n")
@@ -237,8 +237,8 @@ def main():
                  "(`cpu-candidate`). The bench CSV also carries `cpu-ref`, the tests' `CPUReference` oracle, "
                  "which walks a closure per element and is one to two orders slower than the tight loop: it "
                  "is the reason the router's CPU side is written as new loops rather than reused from the "
-                 "oracle. Where an all-core loop was timed it is `cpu-allcores`: the bound a threaded CPU path "
-                 "could reach, not a path the engine has.\n")
+                 "oracle. `cpu-allcores`, where present, is the bench's all-core loop, recorded for "
+                 "reference.\n")
     L.append("## Per operation, against the fastest CPU idiom\n")
     L.append("| family | operation | crossover (rows) | " + " | ".join(f"{n:,}" for n in SIZES) + " |")
     L.append("|---|---|---:|" + "---:|" * len(SIZES))

@@ -285,12 +285,8 @@ by a 5 ms one.
   `batchAsync` for pipelining (11.5 µs/op with 20 command buffers in flight). Small-op workloads
   should batch; the API already supports it in Swift, C and Python.
 - `filter` is still the furthest from the floor (~82 µs at 1,000 rows against ~69 µs for compare)
-  because it encodes three dispatches and allocates. Fusing its count and scan passes is the next win
-  and would take it to roughly the floor.
-- Not attempted, and probably not worth it given where the time goes: `MTLIndirectCommandBuffer` with
-  patched arguments. It removes encoding, and encoding is 2.6 µs of a 65 µs call.
-- Not attempted: Metal 4 (`MTL4CommandQueue`, residency sets). Its committed-command-buffer path may
-  have a shorter notification route; that is the one remaining idea that could move the floor itself.
+  because it encodes three dispatches and allocates.
+- Not attempted: `MTLIndirectCommandBuffer`; encoding is 2.6 µs of a 65 µs call.
 - If a future OS gives MSL a system-scope atomic or a documented CPU/GPU coherence guarantee inside a
   dispatch, `ResidentProbe` is the test to re-run first; `ResidentTests` prints a loud note rather
   than failing if both directions ever start working.

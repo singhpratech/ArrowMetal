@@ -50,5 +50,4 @@ tests on a virtual device anyway. `.github/workflows/ci.yml` therefore runs on p
   `KernelSource.<family>(T:)` to see it.
 
 ## Pull requests
-Small and focused. One kernel or one feature per PR. Update [docs/ROADMAP.md](docs/ROADMAP.md) if you
-finish an item.
+Small and focused. One kernel or one feature per PR. Add a line to [CHANGELOG.md](CHANGELOG.md) for what you shipped.

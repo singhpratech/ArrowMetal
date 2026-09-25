@@ -20,15 +20,14 @@ operation-by-operation matrix in `../docs/BENCHMARKS_MATRIX.md`.
 | `PYTHONPATH=python python Benchmarks/ipc_views_bench.py [rows] [iters]` | Arrow IPC read cost of the view layouts (`string_view`, `list_view` in and out of order) against their classic counterparts through `am.scan_ipc(...).to_reader()`, with pyarrow's own read alongside. Results: `results/ipc_views_2026-09-24.csv` (an earlier run on a shared machine: `results/ipc_views_2026-09-23_provisional.csv`). |
 | `PYTHONPATH=python python Benchmarks/polars_engine_bench.py [--sizes 2000000,50000000] [--iters 5]` | `lf.collect(engine=am.MetalEngine())` against Polars' in-memory and streaming engines on the eight `engine_bench.py` shapes as LazyFrames, import included, results checked against Polars (see `../docs/POLARS.md`). Results: `results/polars_engine_bench_2026-09-24.csv` (an earlier run on a shared machine: `results/polars_engine_bench_2026-09-23_provisional.csv`). |
 | `PYTHONPATH=python python Benchmarks/duckdb_rewrite_bench.py [rows ...] [--reps 5]` | Ordinary DuckDB SQL with the ArrowMetal optimizer extension off, forced and on `auto`, answers checked against DuckDB's own; needs `duckdb-extension/build/arrowmetal_rewrite.duckdb_extension` (see `../docs/DUCKDB.md`). Results: `results/duckdb_rewrite_2026-09-24.csv` (an earlier run on a shared machine: `results/duckdb_rewrite_2026-09-23_provisional.csv`). |
-| `PYTHONPATH=python python Benchmarks/router_check.py --out Benchmarks/results/router_check_<date>.csv` | Every routed operation timed pinned to the GPU, pinned to the CPU loop and under `auto`, and whether `auto` took the faster path. Results: `results/router_check_2026-09-23_provisional.csv` and `results/router_check_2026-09-24_provisional.csv`. |
-| `python Benchmarks/router_table.py [--json <router json> \| --from-check <router_check csv>]` | Generates the router's crossover table, `Sources/ArrowMetal/Router/RouterTable.swift`, from `results/router_2026-09-17.json` (the default) or a `router_check.py` CSV; the multiply row is fitted from `results/router_check_2026-09-23_provisional.csv`. |
+| `PYTHONPATH=python python Benchmarks/router_check.py --out Benchmarks/results/router_check_<date>.csv` | Every routed operation timed pinned to the GPU, pinned to the CPU loop and under `auto`, and whether `auto` took the faster path. Results: `results/router_check_2026-09-24.csv` and `results/router_check_2026-09-24_after_refit.csv` (earlier runs on a shared machine: `results/router_check_2026-09-23_provisional.csv`, `results/router_check_2026-09-24_provisional.csv`). |
+| `python Benchmarks/router_table.py [--json <router json> \| --from-check <router_check csv>]` | Generates the router's crossover table, `Sources/ArrowMetal/Router/RouterTable.swift`, from a `router_check.py` CSV (the shipped table, multiply row included, is fitted from `results/router_check_2026-09-24.csv`) or from a crossover JSON such as `results/router_2026-09-17.json`. |
 
 Files named `*_provisional.csv` are provisional: they were taken while other work shared the machine,
 and are kept as history. The CSV, JSON, nested Parquet, lakehouse, IPC view, Polars engine and DuckDB
-rewrite benchmarks were rerun on a quiet machine on 2026-09-24 (`results/*_2026-09-24.csv`); the load
-average and the file-sync process's CPU before each of those runs are in
-`results/bench_conditions_2026-09-24.txt`. The nested Parquet run started with the file-sync process at
-24.3% CPU and a load average of 6.10, busier than the others.
+rewrite benchmarks were rerun on a quiet machine on 2026-09-24 (`results/*_2026-09-24.csv`); the run
+conditions before each of those runs are in `results/bench_conditions_2026-09-24.txt`. The nested
+Parquet run started at a load average of 6.10, busier than the others.
 
 ## full_matrix.py: the complete comparison
 

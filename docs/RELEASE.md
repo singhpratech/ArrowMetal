@@ -1,14 +1,11 @@
 # Releasing
 
-The ordered checklist for turning this checkout into published artefacts, written for 0.1.0 and followed
-for 0.2.0 with the version changed: read `0.1.0` below as the version being released.
-Every step is the maintainer's to run; the repository itself never publishes anything.
+How a release of ArrowMetal is built, verified and published. Every step is the maintainer's to run;
+the repository itself never publishes anything.
 
-**The version number is changed only when a release is decided, in every manifest at once** (step 0
-lists them), and not between releases: work after a release goes under an "Unreleased" heading in
-CHANGELOG.md until the next one.
-
----
+**The version number is changed only when a release is decided, in every manifest at once**, and not
+between releases: work after a release goes under an "Unreleased" heading in CHANGELOG.md until the
+next one. Read `X.Y.Z` below as the version being released.
 
 ## 0. Preconditions
 
@@ -25,86 +22,72 @@ swift build -c release --product ArrowMetalC
 PYTHONPATH=python python -m pytest python/tests -q
 ```
 
-Confirm the Python version is stated in exactly one place and reads `0.1.0`, and that every binding's
-own manifest agrees:
+The binding suites run as well ([TESTING.md](TESTING.md), "Run everything"). Confirm the Python
+version is stated in exactly one place and that every binding's own manifest agrees:
 
 ```
 grep -rn '__version__' python/arrowmetal/__init__.py       # the single source
 grep -n 'version' python/pyproject.toml                    # must be `dynamic`, reading the above
-grep -nE '0\.1\.0' rust/Cargo.toml rust/arrowmetal/Cargo.toml polars-plugin/Cargo.toml \
+grep -nE 'X\.Y\.Z' rust/Cargo.toml rust/arrowmetal/Cargo.toml polars-plugin/Cargo.toml \
     polars-plugin/arrowmetal-sys/Cargo.toml node/package.json r/arrowmetal/DESCRIPTION \
-    duckdb-extension/CMakeLists.txt duckdb-extension/build.sh   # all must read 0.1.0
-grep -rn '0\.1\.0' README.md CHANGELOG.md docs/*.md | head # narrative mentions only
+    duckdb-extension/CMakeLists.txt duckdb-extension/build.sh   # all must read X.Y.Z
 ```
 
-## 1. Reserve the name on PyPI, before anything else
-
-The project name is the one irreversible thing in the release. Claim `arrowmetal` on PyPI **first**, so
-that no one else takes it between the tag and the upload.
+## 1. Rehearse the upload on TestPyPI
 
 ```
 python -m pip install --upgrade build twine
-
-# 1a. A PyPI account with 2FA, and an API token scoped to "entire account" for the first upload.
-#     Store it as a keyring entry or in ~/.pypirc (never in this repository).
-
-# 1b. Rehearse the whole upload on TestPyPI, which is a separate namespace and separate account:
 python/build_wheel.sh
 twine check python/dist/*.whl
 twine upload --repository testpypi python/dist/*.whl
 
-# 1c. Install what TestPyPI actually served, in a throwaway environment, and smoke test it
-#     from a directory outside this repository so no development dylib can be found:
+# Install what TestPyPI served, in a throwaway environment, from a directory outside this
+# repository so no development dylib can be found:
 python -m venv /tmp/am-testpypi && /tmp/am-testpypi/bin/pip install \
     --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple arrowmetal
 cd /tmp && /tmp/am-testpypi/bin/python -c "import arrowmetal as am; print(am.__version__, am.device_name())"
 ```
 
-Only when TestPyPI installs and imports cleanly does the real upload happen (step 4). After the first
-successful PyPI upload, replace the account-wide token with a project-scoped one.
+Only when TestPyPI installs and imports cleanly does the real upload happen (step 4).
 
 ## 2. Freeze the changelog
 
-`CHANGELOG.md` opens with `## 0.1.0`. Confirm nothing above that heading names a later version, leave
+`CHANGELOG.md` opens with `## X.Y.Z`. Confirm nothing above that heading names a later version, leave
 the content alone, and commit if anything changed. No date: the repository does not date its entries.
 
 `python/README.md` is the PyPI long description (`readme = "README.md"` in `python/pyproject.toml`):
-its Install section must not say the package is unpublished, and its links must be absolute URLs,
-because PyPI does not rewrite relative ones.
-
-```
-git add CHANGELOG.md && git commit -m "0.1.0"
-```
+its links must be absolute URLs, because PyPI does not rewrite relative ones.
 
 ## 3. Tag the Swift package
 
 Swift Package Manager resolves versions from git tags, so the tag *is* the Swift release. Tag the commit
-from step 2, annotated, on `main`.
+from step 2, annotated, on `main`; the Go module takes its own tag.
 
 ```
-git tag -a v0.1.0 -m "ArrowMetal 0.1.0"
+git tag -a vX.Y.Z -m "ArrowMetal X.Y.Z"
+git tag -a go/arrowmetal/vX.Y.Z -m "ArrowMetal Go binding X.Y.Z"
 git push origin main
-git push origin v0.1.0
+git push origin vX.Y.Z go/arrowmetal/vX.Y.Z
 ```
 
 Verify a consumer can resolve it, from a scratch directory outside this repository:
 
 ```
 mkdir /tmp/am-consumer && cd /tmp/am-consumer && swift package init --type executable
-# add .package(url: "<repository URL>", from: "0.1.0") to Package.swift, then
+# add .package(url: "<repository URL>", from: "X.Y.Z") to Package.swift, then
 swift package resolve
 ```
 
 ## 4. Build and upload the wheel
 
-The wheel must be built from the tagged tree, not from a dirty working copy.
+The wheel is built from the tagged tree, not from a dirty working copy.
 
 ```
-git switch --detach v0.1.0
+git switch --detach vX.Y.Z
 scripts/build_wheel.sh                  # swift build -c release, then python/build_wheel.sh
 ```
 
-This produces `python/dist/arrowmetal-0.1.0-py3-none-macosx_14_0_arm64.whl` (the script prints its size) with
+This produces `python/dist/arrowmetal-X.Y.Z-py3-none-macosx_14_0_arm64.whl` with
 `libArrowMetalC.dylib` bundled at `arrowmetal/_lib/`. Check it before uploading:
 
 ```
@@ -112,18 +95,18 @@ twine check python/dist/*.whl
 unzip -l python/dist/*.whl | grep _lib          # the dylib must be in the archive
 python -m venv /tmp/am-wheel && /tmp/am-wheel/bin/pip install python/dist/*.whl
 cd /tmp && /tmp/am-wheel/bin/python -c "import arrowmetal as am; print(am.device_name())"
-cd - && /tmp/am-wheel/bin/pip install "$(echo python/dist/arrowmetal-0.1.0-*.whl)[polars,duckdb,pandas]"
+cd - && /tmp/am-wheel/bin/pip install "$(echo python/dist/arrowmetal-X.Y.Z-*.whl)[polars,duckdb,pandas]"
 ```
 
 Then upload:
 
 ```
-twine upload python/dist/arrowmetal-0.1.0-py3-none-macosx_14_0_arm64.whl
+twine upload python/dist/arrowmetal-X.Y.Z-py3-none-macosx_14_0_arm64.whl
 ```
 
 There is no source distribution (`sdist`). An sdist would promise a build from source on the installing
 machine, which needs a Swift toolchain and a Metal device; the wheel is macOS 14+ arm64 only and says so
-in its platform tag. If an sdist is ever added it must fail loudly on any other platform.
+in its platform tag.
 
 Finally, confirm the published artefact from a clean environment:
 
@@ -134,104 +117,39 @@ cd /tmp && /tmp/am-pypi/bin/python -c "import arrowmetal as am; print(am.__versi
 
 ## 5. The GitHub release
 
-Cut a release from the `v0.1.0` tag, with the changelog section as the body and the wheel attached, so
+Cut a release from the `vX.Y.Z` tag, with the changelog section as the body and the wheel attached, so
 the wheel is installable without PyPI.
 
 ```
-gh release create v0.1.0 python/dist/arrowmetal-0.1.0-py3-none-macosx_14_0_arm64.whl \
-    --title "ArrowMetal 0.1.0" --notes-file <(sed -n '/^## 0.1.0/,/^## /p' CHANGELOG.md)
+gh release create vX.Y.Z python/dist/arrowmetal-X.Y.Z-py3-none-macosx_14_0_arm64.whl \
+    --title "ArrowMetal X.Y.Z" --notes-file <(sed -n '/^## X.Y.Z/,/^## /p' CHANGELOG.md)
 ```
 
-## 5b. Badges
+The README badges point at CI on `main`, PyPI and pkg.go.dev; dispatch `ci.yml` once on the release
+commit (`gh workflow run ci.yml --ref main`).
 
-The README carries no badges until the things they point at exist. Once steps 4 and 5 are done and
-the repository is public, add one row under the title, in this order, and nothing that does not
-resolve on the day it is added:
+## 6. The crates
 
-```
-[![CI](https://github.com/singhpratech/ArrowMetal/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/singhpratech/ArrowMetal/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/arrowmetal)](https://pypi.org/project/arrowmetal/)
-[![Go Reference](https://pkg.go.dev/badge/github.com/singhpratech/ArrowMetal/go/arrowmetal.svg)](https://pkg.go.dev/github.com/singhpratech/ArrowMetal/go/arrowmetal)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-```
-
-The CI badge shows the last run on `main`; the workflow runs on pull requests and by hand, so
-dispatch it once on the release commit (`gh workflow run ci.yml --ref main`) and wait for green
-before adding the badge. A crates.io or npm badge is added only when step 6 publishes those.
-
-## 6. The crates, and the Polars plugin crate
-
-`arrowmetal-sys` and `arrowmetal` are on crates.io at 0.1.0, published from the `v0.1.0` tag in that
-order (`cargo publish -p arrowmetal-sys`, then `-p arrowmetal`, each with `ARROWMETAL_LIB` set so the
+`arrowmetal-sys` and `arrowmetal` are published from the `vX.Y.Z` tag in that order
+(`cargo publish -p arrowmetal-sys`, then `-p arrowmetal`, each with `ARROWMETAL_LIB` set so the
 packaging build finds the dylib; docs.rs builds skip the search). The crates link the dylib the user
 already has, from the wheel or a Swift build, and [RUST.md](RUST.md) says how a binary carries the
 run-time path. Checked after publication: a scratch crate outside the repository depending on
-`arrowmetal = "0.1.0"` and pointed at the wheel's dylib prints `0.1.0 on Apple M4 Max`.
+`arrowmetal = "X.Y.Z"` and pointed at the wheel's dylib prints the version and the device name.
 
 `polars-plugin/` is a Rust `cdylib` that Polars loads by path; it carries its own copy of
-`arrowmetal-sys` under the same name, so it stays `publish = false` and is built from the repository:
+`arrowmetal-sys` under the same name, so it stays `publish = false` and is built from the repository
+(`cd polars-plugin && cargo build --release`). The DuckDB extension (`duckdb-extension/`) is built from
+the repository and is not distributed through the DuckDB community extensions repository. The Node
+package (`node/`) is `"private": true` and is not published to npm: the addon links the dylib built
+from this checkout.
 
-```
-cd polars-plugin && cargo build --release
-```
+## 7. The site
 
-The DuckDB extension (`duckdb-extension/`) is in the same position: it is built from the repository and
-is not distributed through the DuckDB community extensions repository yet.
+The site is published to GitHub Pages from the `gh-pages` branch. Its figures are checked against the
+documents they cite (the benchmark matrix, the coverage tables, the to-improve list) before it goes live.
 
-The Node package (`node/`) is `"private": true` and is not published to npm at 0.1.0: the addon links
-the dylib built from this checkout. `npm pack --dry-run` lists what a later publication would carry.
-
-## 7. The GitHub organisation rename
-
-The repository lives on a personal account today and is meant to move to an organisation of the project's
-own. Do this **after** the tag and the PyPI upload, never between them — a rename mid-release breaks the
-URLs the release refers to.
-
-1. Create the organisation, transfer the repository into it. GitHub keeps redirects from the old path, so
-   existing clones and `swift package resolve` keep working; do not delete or re-create the old repository.
-2. Update every URL that names the old path, then commit:
-   ```
-   grep -rn 'github.com' README.md CHANGELOG.md CONTRIBUTING.md docs/ python/ Package.swift \
-       polars-plugin/ duckdb-extension/ rust/ go/ node/ r/ .github/ | grep -v Binary
-   ```
-   `python/pyproject.toml` carries `[project.urls] Homepage` and `Source`; a changed URL there needs a
-   re-upload to be visible on PyPI, so prefer settling the organisation name *before* step 4 if possible.
-3. Re-check the PyPI project's links and the GitHub release page after the move.
-
-## 8. Re-verify the site's hand-typed figures
-
-The marketing site is built from a working directory that is deliberately git-ignored, so none of it is in
-this repository. Its facts file separates figures the build script computes from the repository on every
-build from figures typed by hand; the build script prints the hand-typed ones as a **RELEASE CHECK** list
-precisely so that they get re-verified at a release. Run the site build, read that list, and confirm every
-figure on it against the document it cites — the benchmark matrix, the coverage tables, the to-improve list —
-before the site goes live. Any figure that no longer matches gets corrected in the facts file, never in the
-page templates.
-
-The same applies to the comparison table of other projects: it is sourced from each project's public docs
-and goes stale on their schedule, not ours.
-
-## 8b. Publish the website
-
-The site is one static page plus its icon set. It is published to GitHub Pages from the `gh-pages`
-branch by a script kept outside the repository (`private/tools/publish_pages.sh`), which rebuilds both site
-outputs from the current sources, refuses to run on a dirty `main` or on a page containing a personal
-address, adds the `CNAME` for the domain and force-pushes the standalone build. Run it after step 8, and
-once only per release state:
-
-```
-private/tools/publish_pages.sh arrowmetal.org
-```
-
-The first time, set the repository's Pages settings by hand: source "Deploy from a branch", branch
-`gh-pages`, folder `/`, custom domain `arrowmetal.org`, "Enforce HTTPS" on; point the domain's DNS at
-GitHub Pages (four A records to `185.199.108.153` … `.111.153`, and `www` as a CNAME to the account's
-`github.io` host). Then open the published page and check, in this order: the tab icon is the ArrowMetal
-mark; every tab renders on first arrival; the Compare table fits at a normal window width; a doc page
-shows its "On this page" list; dark mode shows amber links; the footer links resolve now that the
-repository is public. The claude.ai preview is a separate copy and is never the deployed page.
-
-## 9. Numbers to re-run before announcing
+## 8. Numbers to re-run before announcing
 
 Benchmark tables name the machine they were measured on, and the README quotes them. Re-run on the
 release machine and update `docs/BENCHMARKS.md`, `docs/BENCHMARKS_MATRIX.md` and `docs/TO_IMPROVE.md` if any
@@ -245,9 +163,7 @@ PYTHONPATH=python python Benchmarks/engine_bench.py
 
 Never publish numbers from a GitHub-hosted runner: its GPU is virtual.
 
-## 10. After the release
+## 9. After the release
 
-- Leave the version at `0.1.0`. The next version number is chosen when there is something to put in it.
-- Reopen `CHANGELOG.md` with a new in-development section only when the first post-release change lands.
-- Watch the PyPI project page for the platform tag: `pip install arrowmetal` on Intel macOS, Linux or
-  Windows must fail with "no matching distribution", not install something that cannot import.
+Watch the PyPI project page for the platform tag: `pip install arrowmetal` on Intel macOS, Linux or
+Windows must fail with "no matching distribution", not install something that cannot import.

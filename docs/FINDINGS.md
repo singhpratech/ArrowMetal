@@ -2,54 +2,52 @@
 
 Things learned the hard way. Add to this whenever something surprises you.
 
-## Round 12 (2026-09-24): eight parts of the next release, and what their reviews found
+## Round 12 (2026-09-24): what the 0.2.0 reviews found
 
 **TL;DR**
 
-- Eight pieces of the next release were built side by side, each on its own branch, each reviewed by an
-  independent reviewer asked to refute it, fixed, and rechecked: the CPU/GPU router, a Polars engine,
-  DuckDB plan rewriting, GPU CSV and NDJSON readers, the Parquet reader's nested and page-index gaps,
-  Delta Lake and Iceberg tables, and IPC view types, big-endian files and the tensor extension. Each was
-  merged through the full gate one at a time.
-- The reviews found seven bugs older than this work and one in pyarrow; the merges found two ways the
-  branches broke each other. Everything below is fixed on `main` with a test, except the pyarrow report,
-  which is drafted and not yet filed.
-- The merge gate itself had a hole: from 2026-09-08 to 2026-09-24 its Python suites loaded a stale
-  library. It now pins the build it tests and refuses to run otherwise.
+- The 0.2.0 work (the CPU/GPU router, the Polars engine, DuckDB plan rewriting, the GPU CSV and NDJSON
+  readers, the Parquet reader's nested and page-index gaps, Delta Lake and Iceberg tables, and IPC view
+  types, big-endian files and the tensor extension) was reviewed before it merged.
+- The reviews found seven bugs older than this work and one in pyarrow, filed as
+  [apache/arrow#51491](https://github.com/apache/arrow/issues/51491) ([UPSTREAM.md](UPSTREAM.md)).
+  Everything below is fixed on `main` with a test.
+- The Python suites had been loading a library built on 2026-09-07, left in the checkout by a wheel
+  build. The test run now pins the library it loads.
 
-### 1. The gate tested the wrong library
+### 1. The Python suites tested a stale library
 
 The Python package looks for its library in three places, and a copy bundled by a wheel build wins over
-the development build. The 2026-09-07 wheel build left such a copy in the checkout, the gate never said
-which library to load, and so every gate from 2026-09-08 on ran the Python suites and the differential
-against the 2026-09-07 build. The Swift suite and every worktree were unaffected. It surfaced when the
-IPC work's new Python tests failed with "view columns unsupported", which only the old library says.
+the development build. The 2026-09-07 wheel build left such a copy in the checkout, so from 2026-09-08
+to 2026-09-24 the Python suites and the differential ran against the 2026-09-07 build. The Swift suite
+was unaffected. It surfaced when the IPC work's new Python tests failed with "view columns unsupported",
+which only the old library says.
 
-The gate now builds the library, exports its path, and stops unless Python reports loading exactly that
-file. Rerun against the fresh library, the differential gave the same counts as before (39,069 cases,
-0 unclassified) and the Python suites passed, so nothing had regressed behind the stale copy. The
-2026-09-17 crossover sweep, which the router's table comes from, was run the same way; it is rerun
-with the pinned library before the table is used for a release.
+Fixed by pinning the path: `ARROWMETAL_LIB` names the build under test, and the run stops unless Python
+reports loading exactly that file ([../python/README.md](../python/README.md)). Rerun against the fresh library, the
+differential gave the same counts as before (39,069 cases, 0 unclassified) and the Python suites passed,
+so nothing had regressed behind the stale copy. The 2026-09-17 crossover sweep was rerun the same way
+on 2026-09-24 (`Benchmarks/router_check.py`; [DESIGN.md](DESIGN.md), "CPU/GPU router").
 
 ### 2. A float literal of 2^63 or more ended the process
 
 The fused expression compiler converted every float literal to Int64, even when the target was a float,
 and Swift's `Int64(Double)` traps outside its range. `int64_column >= 1e19` or `x * 4.49e307` ended the
-host process. The Polars engine's reviewer found it through a division by a tiny literal. Float targets
+host process. Found while reviewing the Polars engine, through a division by a tiny literal. Float targets
 no longer compute the integer; an integer-typed literal that does not fit is an error that names it.
 
 ### 3. Two same-named columns came back as one twice
 
 With no explicit projection, a stream looked every column up by name, so the second of two columns
 called `a` was replaced by a copy of the first: `am.scan_ipc(...).collect()` returned wrong data and no
-error. Found by the IPC work's reviewer on a union fixture. A batch with duplicate names now stays
+error. Found while reviewing the IPC reader, on a union fixture. A batch with duplicate names now stays
 positional; batches with unique names keep the fused path.
 
 ### 4. Skips recorded as failures
 
 Twenty-three IPC test assertions called the pyarrow helper inside `XCTAssertEqual`. When no pyarrow
 interpreter exists, the helper throws `XCTSkip`, and a skip thrown inside the assertion's autoclosure is
-recorded as a failure. Found by the router work, whose full-suite run showed 12 such failures on a clean
+recorded as a failure. Found while reviewing the router: a full-suite run showed 12 such failures on a clean
 environment. The helper now runs before the assertion.
 
 ### 5. Four engine bugs the Polars engine had been working around
@@ -74,21 +72,21 @@ years 1678 to 2261 wrapped around instead of raising, as pyarrow raises. It rais
 
 ### 6. pyarrow drops NaN rows when statistics are present
 
-The Parquet work's reviewer found that ArrowMetal's own page skipping dropped a page holding a NaN under
+Found while reviewing the Parquet reader: ArrowMetal's own page skipping dropped a page holding a NaN under
 `!=`, because writers leave NaN out of min and max. After the fix, a test showed pyarrow doing the same
 at row-group level. Reproduced in plain pyarrow 25.0.1: `x != 5.0` over `[5, NaN, 5, 5]` returns `[nan]`
 in memory and from a file without statistics, and `[]` from a file with them; `~(x <= 10.0)` over
 `[1, NaN, 10]` behaves the same way. The cause is in
 `ParquetFileFragment::EvaluateStatisticsAsExpression`, unchanged on Arrow's main, and is distinct from
 the 2023 fix for NaN inside min or max (#28074). The same class of bug was fixed on our side in Delta
-partition pruning. The pyarrow report is drafted and not yet filed.
+partition pruning. Filed as [apache/arrow#51491](https://github.com/apache/arrow/issues/51491)
+([UPSTREAM.md](UPSTREAM.md)).
 
-### 7. Branches that merge as text can still break as code
+### 7. Two Parquet changes that broke the Delta reader
 
 The Parquet work added a filter value for integers above INT64_MAX and changed how a MAP column is
-described. Both merged cleanly with the Delta and Iceberg work, and the merged tree then failed to
-build, and once built, failed 54 lakehouse tests: Delta checkpoints could no longer be read. Only a
-gate after each merge catches this. Both are fixed on main, with tests.
+described. With the Delta and Iceberg work in the same tree, the build failed, and once built, 54
+lakehouse tests failed: Delta checkpoints could no longer be read. Both are fixed on main, with tests.
 
 ## Round 11 (2026-09-20): The three Metal findings reported to Apple
 
@@ -207,9 +205,8 @@ any code, so the interface would be one he wants to maintain.
 1. Read the C++ `ScalarAggregateKernel` (`kernel.h`), the executor (`exec.cc`), the options
    (`api_aggregate.h`) and the kernels (`aggregate_basic.cc`, `aggregate_basic.inc.cc`,
    `aggregate_internal.h`) at f251bc3, and the Go `compute` package at 67ef40b, and write the design.
-2. Three independent reviews of the note: one testing every row of the semantics table against
-   pyarrow built from that C++ commit, one checking every Go identifier and compiling the
-   proposed constraint change in a worktree, one reading it as the maintainer would.
+2. Check the note row by row against pyarrow built from that C++ commit and against the Go
+   identifiers it names, compiling the proposed constraint change.
 3. Build the prototype from the corrected note, run arrow-go's own lint under the Go version it
    pins, and cross-check every expected test value against pyarrow.
 4. Attack the code: sliced inputs at bitmap-hostile offsets, forced small `ChunkSize`, executor pool
@@ -309,11 +306,11 @@ write to the shared span, with a test at chunk sizes 1 to 65.
 - Merged the same day: [#1302](https://github.com/apache/arrow-go/pull/1302) (allocator alignment and
   which allocator to use when C keeps a buffer, closing [#1297](https://github.com/apache/arrow-go/issues/1297))
   and [#1303](https://github.com/apache/arrow-go/pull/1303) (what the compute registry holds).
-- Open: the design note on [#1296](https://github.com/apache/arrow-go/issues/1296) with two questions
-  for the maintainer; [#1305](https://github.com/apache/arrow-go/issues/1305) with its fix
-  [#1306](https://github.com/apache/arrow-go/pull/1306) by singhpratech. The aggregate branch is pushed
-  once the interface is agreed.
-- Status of each is on the [Upstream tracker](UPSTREAM.md) and updates itself from arrow-go's tracker.
+- Open: [#1296](https://github.com/apache/arrow-go/issues/1296) (design approved 2026-09-21) and the
+  framework plus count/sum pull request [#1336](https://github.com/apache/arrow-go/pull/1336);
+  [#1305](https://github.com/apache/arrow-go/issues/1305) with its fix
+  [#1306](https://github.com/apache/arrow-go/pull/1306) by singhpratech.
+- Status of each is on the [Upstream tracker](UPSTREAM.md).
 
 Logs, scripts and raw outputs of every run above (the audit reports, the build and lint log, the
 fuzz fixtures and results, the reproducer and its output on both commits) are kept with the

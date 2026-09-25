@@ -15,7 +15,7 @@ contiguous chunk does copy when DuckDB returns many; see §5.
 DuckDB's once the column and its group ids are already on the GPU (**1.1x** for a single cold
 query), and a string `LIKE` scan is **9.3x** resident (**0.6x** cold). DuckDB is ahead on a plain
 `sum` over a column, which is memory-bound and which DuckDB does while it scans. The loadable
-extension works and matches DuckDB's answers exactly; it is **behind DuckDB's own SQL in 0.1.0**, and §4 says
+extension works and matches DuckDB's answers exactly; it is **behind DuckDB's own SQL** as measured, and §4 says
 why.
 
 A third piece needs no change to the SQL at all. The **rewrite extension** is a DuckDB optimizer
@@ -48,8 +48,7 @@ the feasibility finding behind it, and where it is ahead and where it is not.
 
 If you are reading this to make something faster: **use tier 1**, or tier 3 when the SQL must stay as it
 is and its aggregates fall in §4b's table. Tier 2 exists because "call it from SQL" is a real
-requirement for some people, and because the extension is the piece that has to exist before it can be
-made fast.
+requirement for some people.
 
 ---
 
@@ -301,13 +300,9 @@ extension's path. Three things account for it:
    array is one contiguous buffer, so the extension memcpys chunk after chunk on one thread while
    DuckDB's own aggregate is running on all of them. This is the dominant cost.
 2. **`duckdb_query` materialises the whole result first**, so the rows are copied once inside DuckDB
-   before the extension has touched them. A streaming result would remove that copy.
+   before the extension has touched them.
 3. **The extension re-reads the table on every call**, because a table function has nowhere to cache.
    The bridge pays the crossing once and then runs twenty operations on resident data.
-
-Fixing (1) and (2) is the obvious next work: partition the assembly across threads, and execute the
-inner query in streaming mode. None of it changes the extension's interface, so the SQL above is
-what it will keep being.
 
 ---
 
@@ -449,9 +444,9 @@ Two conditions, both recorded for each decision in `arrowmetal_rewrites()`:
    `reductions` rows without `GROUP BY`, the `group-by` rows with it, in the 1,000-group or
    100,000-group class by DuckDB's estimate of the group count (split at 10,000, the geometric middle),
    and the utf8 rows for a `VARCHAR` key. `test_crossovers_match_the_router_sweep` holds the constants to
-   the JSON. The constants were first taken from `Benchmarks/results/router_2026-09-17.json`, whose
-   ArrowMetal rows came from a stale library; of the rows used here only `min(int64, 10% nulls)` differs
-   between the two sweeps, 50,000,000 then and 10,000,000 now. `min` without `GROUP BY` is gated by the
+   the JSON. The constants are read from `Benchmarks/results/router_2026-09-24.json`, which supersedes the
+   2026-09-17 sweep; of the rows used here only `min(int64, 10% nulls)` moved between the two,
+   50,000,000 then and 10,000,000 now. `min` without `GROUP BY` is gated by the
    ungrouped class's floor of 50,000,000 rows below (or not rewritten, with one or two aggregates), so no
    `auto` decision changes; at 10,000,000 rows the reason for such a query now reads "below the measured
    floor" where the results file, measured before the change, says "below the crossover".
@@ -475,10 +470,8 @@ ahead at the class's floor, and no row of any other class to be rewritten.
 
 The measurements are in `Benchmarks/results/duckdb_rewrite_2026-09-24.csv`, a quiet run: for each
 query and size (1M, 10M, 50M rows), DuckDB's time and the rewrite's, wall and CPU, the GPU path taken,
-and what `auto` decided. The load average and the file-sync process's CPU at the start of the run are
-recorded in `Benchmarks/results/bench_conditions_2026-09-24.txt`; the "PROVISIONAL" note on the file's
-own header line is text the benchmark script wrote on every run until then, and it now writes it only
-with `--provisional`. `test_measured_floors_are_in_the_benchmark_results` requires every class in the
+and what `auto` decided. The run conditions at its start are
+recorded in `Benchmarks/results/bench_conditions_2026-09-24.txt`. `test_measured_floors_are_in_the_benchmark_results` requires every class in the
 table to be faster in that file at its floor. The floors were first fitted to a run taken while other
 work shared the machine, kept as history in `Benchmarks/results/duckdb_rewrite_2026-09-23_provisional.csv`;
 the quiet run gives the same floors. Reproduce with:
@@ -768,7 +761,7 @@ many keys and string matching are compute-heavy per byte; `sum` is not.
 
 **Tier 2**
 
-- Behind DuckDB's own SQL in 0.1.0 (§4).
+- Behind DuckDB's own SQL as measured (§4).
 - The eight integer widths, `FLOAT`, `DOUBLE`, `DATE` and `TIMESTAMP` only -- exactly what
   `arrow_format_for` in `duckdb-extension/src/arrowmetal_extension.cpp` lists. `BOOLEAN` is **not**
   among them; nor are `VARCHAR`, `DECIMAL`, `TIME`,

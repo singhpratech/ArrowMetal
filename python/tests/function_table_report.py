@@ -67,7 +67,7 @@ if it says `gpu`, `cpu` or `partial`, a test in `python/tests/test_functions.py`
 | **CPU** | Implemented and reachable through the ArrowMetal API, but the work happens on the host. Every row here says *why* the host is the right place — a Unicode table, an ICU regex, an output one row wide however long the input, or a metadata-only result that runs no kernel. |
 | **Partial** | Reachable, with a stated limitation. Three different things wear this label and each note says which: (a) an option or an input type Arrow supports and this does not; (b) an answer that deliberately differs from Arrow's — `tdigest` and `hash_tdigest` return one q where Arrow returns a list; (c) an evaluation split between the GPU and the host: `rank_normal`, whose inverse CDF runs on the host, and `hash_tdigest`, whose centroid merge does. |
 | **Missing** | Not implemented. The note says why. |
-| **Pending** | Reserved for a name landing on an unmerged branch. No row carries it today. |
+| **Pending** | Reserved; no row carries it. |
 
 Precision is recorded, not glossed. Three families of float difference exist and the note on each row
 names the one that applies. **float32 columns** run Metal's own library functions, measured at 3-4 ulp

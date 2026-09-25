@@ -1055,7 +1055,7 @@ _register_group_op("max", "max")
 _register_group_op("mean", "mean", tol="result_float")
 
 
-# ---- operations other agents may append ----------------------------
+# ---- additional operations -----------------------------------------
 #
 # None of these exist in 0.1.0. Each is registered only if the method is actually on MetalArray by the
 # time this module is imported, so the matrix picks up new kernels without any edit here; the ones

@@ -112,8 +112,8 @@ am.scan_ipc("/data/events", readers=8).group_by("region").agg([("sum", "amount",
 try StreamQuery(ipc: "/data/events", readers: 8)
 ```
 
-A GPU Parquet reader lives in `Sources/ArrowMetal/Parquet/` and is developed separately; until it is
-the source of record, Parquet arrives through `scan_arrow(pyarrow.dataset(...))`.
+Parquet files reach the streaming executor through `scan_arrow(pyarrow.dataset(...))`; `am.read_parquet`
+is the GPU reader for in-memory reads ([PARQUET.md](PARQUET.md)).
 
 ## 3. Sinks
 
@@ -346,7 +346,7 @@ rows are always inside the union of each group's first n — which is what makes
 cheap over hundreds of runs.
 
 Sort keys use the GPU radix sort for numeric, boolean and temporal columns. `utf8` and `binary`
-columns have no order-preserving GPU key yet, so they fall back to a host sort of the string values
+columns have no order-preserving GPU key in the streaming sort, so they fall back to a host sort of the string values
 (correct, but the one place a sort touches every row on the CPU).
 
 ## 6. Streaming quantiles
@@ -730,8 +730,7 @@ same queries run at 1.2 GB of RSS (and take two to five times as long). The priv
   need one sketch per group and is not implemented.
 * **`variance` / `stddev` are not available in the dense-key GPU group-by path** (they need a third
   accumulator array); the arbitrary-key path has them.
-* **Grace join keys must be integers.** Strings would need the GPU string hash table
-  (`Kernels/StringHashTable.swift`) wired into the partitioner, which is not done.
+* **Grace join keys must be integers.**
 * **The IPC sink writes the stream encapsulation**, not the random-access file format: the file
   footer's block index cannot be built incrementally without reaching into `IPCWriter`. Every reader
   that matters (pyarrow, Polars, this package) reads it.
@@ -742,8 +741,7 @@ same queries run at 1.2 GB of RSS (and take two to five times as long). The priv
 * **A group-by over ten million groups is 1.6x behind Polars** (§9), down from 5.5x. The rows go
   straight into the resident table now, so there is no per-batch encoding left to remove; what is
   left is the insert itself, the batch's `GroupBy` and the fold, all in the merge stage, which the
-  GPU stage then waits 0.22 s on. Splitting the resident table into shards a batch could insert into
-  from more than one stage is not implemented.
+  GPU stage then waits 0.22 s on.
 * **A float64 sum cannot use the row-level atomic accumulate**, because Metal has no 64-bit atomic
   add or compare-exchange (`atomic_ulong` offers only `fetch_min`/`fetch_max`) and no
   emulation of one rounds a binary64 addition correctly. It takes the dense-id branch of §4.1
@@ -768,8 +766,7 @@ same queries run at 1.2 GB of RSS (and take two to five times as long). The priv
 * **A fused aggregate takes at most seven aggregates.** Metal binds 31 buffers and the probe needs
   nine of them, three per aggregate after that.
 * **The dense-id branch costs about 270 MB at ten million groups** — two `uint` arrays the size of
-  the table — which is why `groupby_10m`'s peak RSS rises by 0.62 GB. Packing the batch stamp and the
-  dense id into one word is possible and is not implemented.
+  the table — which is why `groupby_10m`'s peak RSS rises by 0.62 GB.
 * **Each batch is one Metal command buffer, not several.** The fixed cost per batch is paid once per
   batch; a larger `batch_rows` amortises it, at the cost of memory per batch.
 * **`readers > 1` raises peak RSS by roughly `readers` x the part-file size**, because that many

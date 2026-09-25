@@ -251,8 +251,6 @@ There is also no dplyr backend and no `RecordBatch`/`Table` surface: everything 
 kernels on the same data: nulls, all-null and empty columns, sliced input at three offsets, lengths
 of 1, 33, 1024, 65537 and 1,000,001 (crossing a threadgroup boundary), one group per row and one group for
 everything, int64 above 2^53, float32 accumulation, and every documented error path.
-`R CMD build r/arrowmetal && R CMD check --no-manual arrowmetal_0.1.0.tar.gz` is clean: 0 errors,
-0 warnings, 0 notes.
 
 ```sh
 ARROWMETAL_LIB=$PWD/.build/release/libArrowMetalC.dylib \

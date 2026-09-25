@@ -23,11 +23,9 @@ library's *eager* idiom, kept as history.
 
 Each table gives the operation, the row count, ArrowMetal's wall time, the fastest CPU idiom with its
 wall time, the cores that idiom used (its CPU-ms divided by its wall ms), and the ratio.
-Every number in this section is computed from the parallel CSV by
-`private/keep/2026-09-07/losses_parallel.py`. Eight ArrowMetal rows in that
+Every number in this section is computed from the parallel CSV. Eight ArrowMetal rows in that
 CSV were re-measured on a quieter machine after a regression check flagged them and spliced back in
-place — their `note` column says so, and the log is
-`private/keep/2026-09-07/matrix_remeasure.log`.
+place — their `note` column says so.
 
 **What these rows are, and what they are not.** Twelve to fifteen cores running a vectorised kernel
 over a column in unified memory is a fast, well-engineered thing to be, and on a single pass over a
@@ -37,8 +35,7 @@ buffer costs 110–160 µs per call for sum and filter at 1,000 rows (the matrix
 operation. The other 33 are three operations that do more arithmetic per element than hardware doubles
 do, one that never reaches the GPU at all, the rows where the CPU library returns a view and
 ArrowMetal materialises a column, and the causes named below. They are the rows where
-having the option of unified memory on the GPU buys you nothing yet, and each one names what would
-change that.
+having the option of unified memory on the GPU buys you nothing, and each one names its cause.
 
 ### 1. The dispatch floor and the per-call fixed cost, at a million rows and below (16 rows)
 
@@ -75,12 +72,11 @@ the break-even is between one and ten million, not somewhere past the sizes meas
 [CROSSOVER.md](CROSSOVER.md) now measures that break-even directly, per operation, with a size sweep
 from a thousand rows to fifty million.
 
-**What would change it.** Nothing removes the floor on this hardware; the persistent-kernel approach
+**What moves the break-even.** Nothing removes the floor on this hardware; the persistent-kernel approach
 that would is impossible here ([RESIDENT.md](RESIDENT.md)). What moves the break-even down is putting
 more work in each command buffer: `MetalContext.batch` (8–32% off per call), the fused expression
 compiler (one dispatch for a whole expression tree) and the lazy engine (one command buffer for a
-whole plan). The opportunity that would retire these rows is plan-level batching inside the
-engines that call us, where one dispatch carries a whole query rather than one operator.
+whole plan).
 
 ### 2. Memory-bound single passes, where twelve to fifteen cores reach the same memory (28 rows)
 
@@ -131,12 +127,11 @@ one streaming pass over the column.
 `power (float32 ** 2)` is 0.44x at 10M (74.8 GB/s against the CPU idiom's 170) and 0.95x at 50M
 (210 against 220).
 
-**What would change it.** Not a faster kernel — the bytes are already moving at bandwidth. What
+**What moves a memory-bound row.** Not a faster kernel — the bytes are already moving at bandwidth. What
 changes a memory-bound row is reading the bytes fewer times: fusing the operator into an expression so
 the intermediate column is never written, which is what `am.query` and the lazy engine are for, and
 keeping the column resident on the GPU so the next operator does not re-read it from a fresh
-allocation. `replace_with_mask` is the one row here with a kernel-level fix on the table: one streaming
-pass instead of three.
+allocation.
 
 ### 3. Software binary64 transcendentals and calendar arithmetic (6 rows)
 
@@ -163,15 +158,6 @@ Against the *eager* idiom in `full_matrix_2026-09-07.csv` these rows were 1.07x,
 50M rows, because one core is behind the GPU's lane count. Against twelve to fifteen cores of
 hardware doubles they are 0.10x, 0.16x and 0.12x.
 
-**What would change it.** A better polynomial or a cheaper range reduction — this is a self-contained,
-well-specified piece of numerical work with a direct path to a 3x row, and anyone who has done it
-before can do it here without touching the rest of the engine. Failing that, a second numerical
-contract: a `fast_math` variant that computes the transcendentals in float32 or in a reduced-precision
-double, documented as such and never the default, for callers who have said they want it. For
-`days_between` specifically, hoisting the calendar conversion out of the per-element loop (both
-columns are dates, and the difference in days does not need two civil conversions) is a kernel-level
-fix that has been costed but not written.
-
 ### 4. A real regular expression, matched on the host (2 rows)
 
 | operation | rows | ArrowMetal | fastest CPU idiom | its cores | ratio |
@@ -185,12 +171,6 @@ chunks, which the matrix records as the diagnosis. It is already spread across t
 CPU-ms over a 167 ms wall at 10M rows is 15 cores — so this is not a threading gap: it is ICU matching
 row by row against Polars' own compiled regex engine, at 1.05 GB/s against 12.1. LIKE patterns and
 literal substrings never take this path; they are GPU kernels and they are ahead.
-
-**What would change it.** A compiled-automaton kernel: translate the pattern to a DFA on the host,
-upload the transition table, and step it per row on the GPU, the way the LIKE and literal kernels
-already scan bytes. That is the largest open item on the strings side. Short of the full engine,
-widening the set of patterns that reach the existing GPU path — bounded character classes, anchored
-alternations — would take the common cases off the host fallback one shape at a time.
 
 ### 5. The views a CPU library returns for free (4 rows)
 
@@ -214,10 +194,6 @@ over the same device memory in 0.04 ms at 10M rows (`Benchmarks/loss_sort_shift_
 opt-in, because a chunked array is not a `MetalArray` and cannot re-enter a kernel without being
 combined, and the matrix keeps measuring the default.
 
-**What would change it.** A chunked `MetalArray`: a first-class multi-buffer array every kernel
-accepts. That makes the view the default answer for `shift`, and turns slices and concatenations into
-pointers too. It is the single change that would retire this cause, and it is a substantial one.
-
 ### 6. Temporal field extraction and truncation (8 rows)
 
 | operation | rows | ArrowMetal | fastest CPU idiom | its cores | ratio |
@@ -240,13 +216,6 @@ comfortable wins — `year` at 50M was 7.0x in `full_matrix_2026-09-07.csv` — 
 0.66–0.67x at 50M and 0.84–0.93x at 10M. `floor_temporal` is the same conversion and its inverse,
 against a lazy Polars path that reaches 216–239 GB/s doing it.
 
-**What would change it.** Fewer integer operations per row, since that is what the row is made of.
-Two candidates, neither measured yet: the divisions in the conversion are all by compile-time
-constants, so a multiply-and-shift form of each is available; and `year`, `month` and `day` of the
-same column each redo the whole conversion, so a kernel that decomposes once and writes the fields a
-caller asked for turns three passes into one. Both are contained changes in the temporal kernels, and
-both should be measured before anything is claimed for them.
-
 ### 7. `unique` and `value_counts` against a threaded hash aggregation (4 rows)
 
 | operation | rows | ArrowMetal | fastest CPU idiom | its cores | ratio |
@@ -265,12 +234,6 @@ data structure and the sort is not; the CPU-ms say the same from the other side 
 10M: 5.3 ArrowMetal CPU-ms against Acero's 40 — the GPU is doing the work, it is simply doing more of
 it). The matrix records the same diagnosis and the same fix.
 
-**What would change it.** The group-by path already has the kernel: `am_group_by_keys` builds dense
-ids for a narrow-range integer key with a hash-and-scan pass rather than a sort, and it is what took
-`sum by int32 key` past 3x. Routing `unique`, `value_counts` and `dictionary_encode` at a low distinct
-count through that instead of through `DictionaryCompute.dictionaryEncoded()` is a plumbing change on
-top of a kernel that exists, and it is the clearest short-dated opportunity on this page.
-
 ### 8. The grouped moments at a thousand groups (1 row)
 
 | operation | rows | ArrowMetal | fastest CPU idiom | its cores | ratio |
@@ -286,11 +249,7 @@ leaves most of the machine idle. Note that the fastest idiom here is `pyarrow` *
 threaded grouped variance is slower than its single-threaded one on this shape, so the parallel
 baseline did not move this row.
 
-**What would change it.** A simdgroup-per-group accumulator, each lane emulating eight of the 256
-logical slots, keeps every group resident and preserves the accumulation order; the measured shape
-sweep below prices it at about 6 ms of the 15 the two moment passes cost. It would leave the counting
-sort's 10.8 ms untouched, so the ceiling for this row on this hardware is around 1.5x, not 3x.
-A 64-bit atomic add in the shading language would remove the sort as well; that is an ask of Apple,
+A 64-bit atomic add in the shading language would remove the sort; that is an ask of Apple,
 recorded in [UPSTREAM.md](UPSTREAM.md).
 
 ### 9. String conversions with variable-length output (4 rows)
@@ -308,9 +267,7 @@ lengths, prefix-sums them and writes in a second pass, against one streaming pas
 matrix records that diagnosis for all four rows. Two passes over the data against one is the whole of
 the gap, and it is the same 2x for any number of cores on the other side.
 
-**What would change it.** A single-pass form: an upper bound on each row's output length is known
-from the input type (twenty digits for an int64), so the kernel could write into a conservatively
-sized buffer and compact once, or fuse the measure pass into whatever produced the column. That the
+That the
 two conversion rows are the ones left behind while `upper`, `trim`, `split_pattern` and the predicates
 are all ahead at 10M says the shape of the pass is the problem, not the string machinery.
 
@@ -333,15 +290,11 @@ already awake. The CPU-ms are still the other half of the picture — 1.7 agains
 is the argument the wall clock does not make: the same answer, with thirteen cores left for the rest
 of the application.
 
-**What would change it.** For `group-by after filter` the matrix names the cost precisely: the
+**Where the time goes.** For `group-by after filter` the matrix names the cost precisely: the
 chain's group-by rebuilds the dense key mapping after the filter, and that is most of the measured
-time — the filter and the aggregate are each well inside the bar on their own. Carrying the key
-mapping through the filter instead of rebuilding it is the fix, and it is a change to the chain, not
-to a kernel. For `filter two columns + sum`, the same batching answer as cause 1: `[batched]` already
-takes `group-by after filter` at 10M from 3.75 ms to 2.04 ms in this CSV. The larger opportunity is
-the one the join page describes — these chains are short because the harness hands us two columns and
-asks one question; a plan handed down from Polars or DuckDB is longer, and every operator added to it
-amortises against the same dispatch.
+time — the filter and the aggregate are each well inside the bar on their own. For
+`filter two columns + sum`, the same dispatch cost as cause 1: `[batched]` already
+takes `group-by after filter` at 10M from 3.75 ms to 2.04 ms in this CSV.
 
 ## Against each library's eager idiom — history, the 2026-09-07 run
 
@@ -351,7 +304,7 @@ idiom — one core on most element-wise and whole-column rows, as the cores tabl
 verdicts are no longer the project's headline numbers and the counts below are that run's, not the
 parallel run's. It is kept because the diagnoses in it are still the diagnoses, because several rows
 above point back into it, and because the record of what a change was worth should not be edited after
-the fact. The sort section at the end is measured against `private/results/sort_gather_2026-09-07/`
+the fact. The sort section at the end is measured by `Benchmarks/loss_sort_gather.py`
 and stands on its own data.
 
 Of 946 comparisons in that eager matrix: 822 at or above 3x, 93 faster but under 3x, 31 where
@@ -446,10 +399,8 @@ thousand groups is a thousand threadgroups, and only a fraction of them are resi
 resident ones read rows scattered through the column instead of sweeping it. Measured at 50M rows, the
 two moment passes cost 49.1 ms at 10 groups (too few threadgroups to fill the machine), 9.7 ms at 100,
 15.4 ms at 1,000 and 16.1 ms at 4,000 — the wall is between 100 and 1,000 groups, exactly where these
-rows sit. A simdgroup per group instead of a threadgroup would keep every group resident and preserve
-the accumulation order (each lane emulating eight of the 256 logical slots), and the K = 100 figure
-says that is worth about 6 ms of the 15.4. It is not done here, and it would leave the sort's 10.8 ms
-untouched, so the ceiling for these two rows on this hardware is around 1.5x pyarrow, not 3x.
+rows sit. The moment kernels give a whole threadgroup to one group, so between 100 and 1,000 groups
+most of the machine is idle.
 
 #### 4. Grouped min at 1000 groups, 10M rows (1 comparison)
 
@@ -463,8 +414,8 @@ targeted re-measurement at the end of the page put it back at 4.17 ms (1.22x): t
 noise on a 5 ms call. The row stays in this table because the matrix is the record.
 
 Since then the key-mapping change below has taken the operation to **1.66 ms** against pyarrow's 4.62
-in the same script (2.8x), and 5.71 ms against 18.5 at 50M rows (3.2x). The next matrix run should
-remove this row.
+in the same script (2.8x), and 5.71 ms against 18.5 at 50M rows (3.2x). The row stays until the
+matrix is rerun.
 
 #### 5. Regex on the host (1 comparison)
 
@@ -553,7 +504,7 @@ LIKE, floor_temporal, coalesce, fill_null_forward). That is the signature of run
 short calls, not of a regression, and the targeted re-measurement below settles it.
 
 The re-measurement (`full_matrix.py --families sort,group-by,chains --sizes 10000000`, idle machine,
-5.5 minutes, kept as `private` data and summarised here):
+5.5 minutes; not committed, summarised here):
 
 | operation, 10M rows | morning | afternoon matrix | re-measured | fastest CPU | ratio |
 |---|---:|---:|---:|---:|---:|
@@ -600,10 +551,10 @@ sort family moves: argsort int64 7.84 → 7.80 ms at 10M and 39.0 → 39.0 at 50
 and 49.3 → 49.4, top_k (k=100) 1.06 → 0.96 and 2.59 → 2.62, select_k_unstable 1.03 → 0.96 and
 2.63 → 2.65, lexsort 7.14 → 7.14 and 37.4 → 37.4.
 
-### The work between the two runs, as it was designed and measured
+### The two changes between the runs, as measured
 
-This is the record of the two changes that separate the morning run from the afternoon run, written
-by the people who made them, with the numbers they measured at the time. Each number comes from a
+This is the record of the two changes that separate the morning run from the afternoon run, with the
+numbers measured at the time. Each number comes from a
 per-operation script that uses `full_matrix.py`'s columns, seed and rule (one warm-up, best of five),
 with the before and after builds run alternately in separate processes; the matrix rows above are the
 authoritative re-measurement and agree with these to within a few per cent.
@@ -663,10 +614,8 @@ saves. Argsort of 50M int64, same code, digit width only: 8 bits 37.7 ms, 10 bit
 `sort float64` reaches 2.9x rather than 3x, and the remainder is not the sort: it is `take`. `sorted()`
 is `take(argsort())`, and the gather costs 9.4 ms of the 49.2 at 50M rows because a random 8-byte
 gather pulls a whole cache line per element. The sorted *keys* are already sitting in the sort's own
-buffer and the key map is a bijection for every value except -0.0 and NaN, so inverting them instead of
-gathering would remove that 9.4 ms — for a column with no nulls, no NaN and no -0.0, which needs a flag
-the key kernel does not raise yet. That is the next step, and unlike the last one it has been costed.
-(It was taken; the last section of this page is what it measured.)
+buffer and the key map is a bijection for every value except -0.0 and NaN. That gather was removed
+afterwards; the last section of this page measures it.
 
 **`shift`.** The copy is unchanged and is still the default, because it was never the thing that was
 wrong: 3.6 ms for the 800 MB it touches at 50M rows is 220 GB/s, rather
@@ -832,8 +781,7 @@ is slower than main's own spread**: the two that read below 1.0x are `min` and `
 `--digest` hashes every answer instead of timing it: all 220 are **bit-identical** between the two
 builds.
 
-Two shapes in that sweep are slow on both builds and are worth recording as the next thing to look at,
-because they are the same wall cause 3 describes: a grouped `sum` or `mean` over a **float64** column
+Two shapes in that sweep are slow on both builds, for the reason cause 3 describes: a grouped `sum` or `mean` over a **float64** column
 with very few groups runs the segmented path, which gives a whole threadgroup to one group, so 10
 million rows in one group is 35 ms and 90% of the rows in one group is 31 ms, against 4.6 ms for the
 same column spread over a thousand groups. Integer values do not have this shape — they take the
@@ -843,10 +791,8 @@ atomic path — and neither does `min`, `max` or `count`.
 Measured with `Benchmarks/loss_sort_gather.py`, the before build (`main` at `86bd495`) loaded through
 `ARROWMETAL_LIB` and its own ctypes package through `ARROWMETAL_PYTHON` — the change adds an entry
 point, so the old package has to come with the old library. full_matrix's rule throughout: its seed,
-its column builders, one warm-up, best of five. **Every figure below is in
-`private/results/sort_gather_2026-09-07/`**: the matrix-mode tables from `matrix_table.txt` (rolled up
-from `matrix.csv`), the shape sweep from `sweep_table.txt` (from `sweep.csv`), the noise control from
-`noise_control_table.txt`; its `README.md` says which file backs which row.
+its column builders, one warm-up, best of five. Every figure below comes from
+`Benchmarks/loss_sort_gather.py`; the run's raw tables are not committed.
 
 Two harnesses, and it matters which is which. **Matrix mode** runs one build per process, which is how
 `full_matrix.py` measures, and the tables in the next two sections are its (`matrix_table.txt`, best of
