@@ -32,6 +32,7 @@ up to five calls after one warm-up, release build; the 339-row matrix that row c
 ```
 pip install arrowmetal          # macOS 14 or later on Apple silicon; pyarrow is the only dependency
 python -m arrowmetal.bench      # 30 seconds or less
+python -m arrowmetal.bench --parquet data.parquet   # read, sum, filter, group-by on your own file
 ```
 
 The second line generates 10,000,000 rows, runs sum, filter, sort and group-by sum through pyarrow

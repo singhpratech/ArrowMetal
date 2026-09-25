@@ -6,6 +6,30 @@
   pyarrow, one table for the Mac it runs on with a ready-to-paste block; `--rows`, `--json`, `--quiet`,
   `--no-share`, `--no-polars`. A GitHub issue form (`.github/ISSUE_TEMPLATE/benchmark_result.yml`)
   takes that block (docs/TESTING.md, `python/tests/test_bench.py`).
+- `python -m arrowmetal.bench --parquet FILE`: the same report on the user's own Parquet file. It reads
+  the file's integer, floating-point and string columns with `pyarrow.parquet.read_table`,
+  `polars.read_parquet` and `am.read_parquet`, then runs sum and `filter > median` on the largest numeric
+  column and group-by sum keyed on the lowest-cardinality integer or string column, CPU against Metal,
+  each ArrowMetal answer checked against pyarrow's. The Share it block and the prefilled issue link
+  (title and the form's `share` field) carry the row count, column count, row groups, size, codecs and
+  the timings, never the path, column names or values. A file whose columns would take more than a
+  quarter of physical memory is refused with the limit printed; a file with no usable column gets one
+  line saying so. On a generated 10,000,000-row Snappy file (M4 Max): read 134.58 ms against Polars'
+  16.75 ms, filter 1.12 ms against 4.50 ms, sum 1.40 ms against 0.99 ms, group-by sum over a 5-value
+  string key 18.25 ms against 6.82 ms (`python/tests/test_bench.py`).
+- The wheel carries the Polars expression plugin (tier 2): `python/build_wheel.sh` builds
+  `polars-plugin/` with cargo against the `libArrowMetalC.dylib` it bundles, and packages
+  `arrowmetal/_lib/libarrowmetal_polars.dylib` with its rpath set to `@loader_path` and local symbols
+  stripped. `arrowmetal.polars_plugin.plugin_path()` takes the packaged plugin first when Python loaded
+  the packaged `libArrowMetalC.dylib`, and a cargo build first when `$ARROWMETAL_LIB` or a development
+  build is loaded. `scripts/check_wheel.sh` installs a wheel and Polars into a fresh virtualenv with a
+  scrubbed environment and no cargo, runs all four Polars tiers and `bench --parquet`, and checks that
+  one `libArrowMetalC.dylib`, the packaged one, is loaded; it passed with polars 1.44.2 and pyarrow
+  25.0.1, NumPy not installed. The wheel is 8.2 MB (3.2 MB without the plugin) (docs/POLARS.md, Install).
+- `MetalEngine` (tier 4) no longer imports NumPy: the scalar-divisor reciprocal is computed with Python
+  floats, identical to the NumPy result on 800,046 checked values including zeros, infinities, NaN and
+  subnormals. NumPy is not installed by the wheel, pyarrow or Polars, and the engine raised
+  `ModuleNotFoundError` without it.
 
 ## 0.2.0
 Everything below is new in 0.2.0.
