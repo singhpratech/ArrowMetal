@@ -8,8 +8,12 @@ Three ways of reaching the GPU are timed against Polars' own answer for the same
   arrowmetal (resident)     tier 1 with the columns already in Metal memory, so the import is
                             outside the timed region -- what a pipeline that stays on the GPU sees
 
-Usage: PYTHONPATH=python python Benchmarks/polars_bench.py [rows] [iterations]
+Usage: PYTHONPATH=python python Benchmarks/polars_bench.py [rows] [iterations] [--strings]
        PYTHONPATH=python python Benchmarks/polars_bench.py 10000000 5
+       PYTHONPATH=python python Benchmarks/polars_bench.py 50000000 5 --strings   # String rows only
+
+The String column is timed on both of its ways in: "view" (Polars' own Utf8View buffers, read by
+the kernels directly; the default) and "offsets" (Polars converts to large_string first).
 
 Requires .build/release/libArrowMetalC.dylib. The plugin rows are skipped when
 polars-plugin/target/release/libarrowmetal_polars.dylib has not been built.
@@ -30,8 +34,10 @@ import arrowmetal as am
 from arrowmetal import polars_bridge  # noqa: F401  (registers the .arrowmetal namespaces)
 from arrowmetal import polars_plugin
 
-rows = int(sys.argv[1]) if len(sys.argv) > 1 else 50_000_000
-iters = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+args = [a for a in sys.argv[1:] if not a.startswith("--")]
+STRINGS_ONLY = "--strings" in sys.argv[1:]      # only the String column's sections
+rows = int(args[0]) if len(args) > 0 else 50_000_000
+iters = int(args[1]) if len(args) > 1 else 5
 HAVE_PLUGIN = polars_plugin.available()
 
 rng = np.random.default_rng(42)
@@ -45,6 +51,8 @@ def cpu_seconds():
 
 def bench(section, label, fn, *, check=None):
     """Best of `iters` after one warm-up. `check` is the value every run must agree with."""
+    if STRINGS_ONLY and not section.startswith("string"):
+        return None
     got = fn()
     if check is not None:
         ok = np.isclose(float(got), float(check), rtol=1e-9) if isinstance(got, (int, float)) \
@@ -148,21 +156,61 @@ if HAVE_PLUGIN:
 # ---------------------------------------------------------------------------------------------
 sec = "string contains (literal)"
 print("\n" + sec)
-want = df["name"].str.contains("customer-1", literal=True).sum()
+# Two ways a Polars String column reaches the kernels (polars_bridge.STRING_LAYOUTS): "view" hands
+# over Polars' own Utf8View buffers, which the kernel reads directly; "offsets" asks Polars for
+# large_string first, the path before the kernels read views. The namespace rows pay the hand-off
+# on every call, the resident rows hold the column in Metal memory already.
+gn_offsets = am.from_polars(df["name"], string_layout="offsets")
+want = df["name"].str.contains("customer-1", literal=True)
+for layout in polars_bridge.STRING_LAYOUTS:
+    polars_bridge.DEFAULT_STRING_LAYOUT = layout
+    assert df["name"].arrowmetal.contains("customer-1").equals(want), f"namespace ({layout}) disagrees"
+polars_bridge.DEFAULT_STRING_LAYOUT = "view"
+assert am.to_polars(gn.str_contains("customer-1")).equals(want) and \
+    am.to_polars(gn_offsets.str_contains("customer-1")).equals(want), "resident disagrees"
+print(f"  results equal to Polars' for both layouts; resident column layouts: "
+      f"{gn.string_layout} / {gn_offsets.string_layout}")
+
+
+def _namespace(layout):
+    def run():
+        polars_bridge.DEFAULT_STRING_LAYOUT = layout
+        try:
+            return df["name"].arrowmetal.contains("customer-1")
+        finally:
+            polars_bridge.DEFAULT_STRING_LAYOUT = "view"
+    return run
+
+
 bench(sec, "polars", lambda: df["name"].str.contains("customer-1", literal=True), check=None)
-bench(sec, "arrowmetal (namespace)", lambda: df["name"].arrowmetal.contains("customer-1"))
+bench(sec, "arrowmetal (namespace)", _namespace("view"))
+bench(sec, "arrowmetal (namespace, offsets)", _namespace("offsets"))
 bench(sec, "arrowmetal (resident)", lambda: gn.str_contains("customer-1"))
+bench(sec, "arrowmetal (resident, offsets)", lambda: gn_offsets.str_contains("customer-1"))
 if HAVE_PLUGIN:
     bench(sec, "arrowmetal (plugin, lazy)",
           lambda: lf.select(pl.col("name").arrowmetal.contains("customer-1")).collect())
 
 # ---------------------------------------------------------------------------------------------
-sec = "the hand-off itself"
+sec = "string hand-off"
 print("\n" + sec)
-bench(sec, f"pl.Series -> Metal ({rows / 1e6:.0f}M x Int64)", lambda: am.from_polars(df["v"]))
-bench(sec, "Metal -> pl.Series", lambda: am.to_polars(gv, "v"))
-src, dst, same = am.zero_copy_report(df["v"])
-print(f"  zero copy: source buffer {src:#x}, Metal buffer {dst:#x} -> {'SAME' if same else 'COPIED'}")
+bench(sec, f"pl.Series -> Metal ({rows / 1e6:.0f}M x String, view)",
+      lambda: am.from_polars(df["name"], string_layout="view"))
+bench(sec, f"pl.Series -> Metal ({rows / 1e6:.0f}M x String, offsets)",
+      lambda: am.from_polars(df["name"], string_layout="offsets"))
+bench(sec, "Metal -> pl.Series (String, view)", lambda: am.to_polars(gn, "name"))
+info = am.from_polars(df["name"]).string_view_import()
+print(f"  view import: {info['copied_bytes']} bytes copied, {info['data_buffers']} data buffers, "
+      f"{info['string_bytes']} string bytes")
+
+# ---------------------------------------------------------------------------------------------
+if not STRINGS_ONLY:
+    sec = "the hand-off itself"
+    print("\n" + sec)
+    bench(sec, f"pl.Series -> Metal ({rows / 1e6:.0f}M x Int64)", lambda: am.from_polars(df["v"]))
+    bench(sec, "Metal -> pl.Series", lambda: am.to_polars(gv, "v"))
+    src, dst, same = am.zero_copy_report(df["v"])
+    print(f"  zero copy: source buffer {src:#x}, Metal buffer {dst:#x} -> {'SAME' if same else 'COPIED'}")
 
 # ---------------------------------------------------------------------------------------------
 print("\n\n| Operation | Polars | ArrowMetal namespace | ArrowMetal plugin | resident |")
@@ -186,3 +234,24 @@ for section in sections:
 
     print(f"| {section} | {cell('polars')} | {cell('arrowmetal (namespace)')} | "
           f"{cell('arrowmetal (plugin, lazy)')} | {cell('arrowmetal (resident)')} |")
+
+# The String rows by layout: the view path against the conversion path.
+row = {label: (ms, cpu) for s, label, ms, cpu in results if s == "string contains (literal)"}
+if "polars" in row:
+    base = row["polars"][0]
+    print("\n| string contains (literal) | Polars | namespace, view | namespace, offsets | "
+          "resident, view | resident, offsets |")
+    print("|---|---|---|---|---|---|")
+    cells = []
+    for key in ("polars", "arrowmetal (namespace)", "arrowmetal (namespace, offsets)",
+                "arrowmetal (resident)", "arrowmetal (resident, offsets)"):
+        ms, cpu = row.get(key, (None, None))
+        cells.append("-" if ms is None else
+                     f"{ms:.1f} ms / {cpu:.0f} CPU-ms" + ("" if key == "polars" else f" ({base / ms:.1f}x)"))
+    print(f"| {rows / 1e6:.0f}M rows | " + " | ".join(cells) + " |")
+hand = {label: ms for s, label, ms, _ in results if s == "string hand-off"}
+if hand:
+    print("\n| String hand-off | ms |")
+    print("|---|---|")
+    for label, ms in hand.items():
+        print(f"| {label} | {ms:.1f} |")

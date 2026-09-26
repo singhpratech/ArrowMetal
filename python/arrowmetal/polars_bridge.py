@@ -84,14 +84,18 @@ __all__ = [
 #: asks Polars for `large_string` / `large_binary` (a conversion on Polars' side), the layout
 #: ArrowMetal read before it read views.
 STRING_LAYOUTS = ("view", "offsets")
+#: The layout `from_polars` (and so every `.arrowmetal` namespace call) uses when none is given.
+DEFAULT_STRING_LAYOUT = "view"
 
 
-def _series_to_arrow(s, rechunk=True, string_layout="view"):
+def _series_to_arrow(s, rechunk=True, string_layout=None):
     """One pyarrow.Array for a Polars Series, rechunking (and only then copying) when it has to.
 
     `Series.to_arrow()` already combines chunks, so the check is explicit: with `rechunk=False` a
     multi-chunk column raises rather than paying for a silent concatenation.
     """
+    if string_layout is None:
+        string_layout = DEFAULT_STRING_LAYOUT
     if string_layout not in STRING_LAYOUTS:
         raise ArrowMetalError(f"string_layout must be one of {STRING_LAYOUTS}, got {string_layout!r}")
     n = s.n_chunks()
@@ -122,7 +126,7 @@ def _widen_dictionary_indices(arr):
     return pa.DictionaryArray.from_arrays(arr.indices.cast(pa.int32()), arr.dictionary)
 
 
-def from_polars(obj, *, rechunk=True, string_layout="view"):
+def from_polars(obj, *, rechunk=True, string_layout=None):
     """Move a Polars object into Metal memory, zero-copy where the buffers allow it.
 
     * `pl.Series`     -> `MetalArray`
@@ -131,8 +135,8 @@ def from_polars(obj, *, rechunk=True, string_layout="view"):
 
     `rechunk=False` raises on a multi-chunk Series instead of concatenating it, so a copy can
     never happen behind your back. `string_layout` (see `STRING_LAYOUTS`) picks how String and
-    Binary columns cross: `"view"` (the default) keeps Polars' own views, `"offsets"` asks Polars
-    for `large_string` first.
+    Binary columns cross: `"view"` keeps Polars' own views, `"offsets"` asks Polars for
+    `large_string` first; None uses `DEFAULT_STRING_LAYOUT` ("view").
     """
     if isinstance(obj, pl.Series):
         return MetalArray.from_arrow(_series_to_arrow(obj, rechunk, string_layout))

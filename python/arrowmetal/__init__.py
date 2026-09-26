@@ -300,13 +300,16 @@ class MetalArray:
         return ("offsets", "view", "view (converted)")[_lib.am_string_layout(self._h)]
 
     def string_view_import(self):
-        """For a view column, what its import cost: ``{"copied_bytes", "data_buffers",
-        "string_bytes"}``. ``copied_bytes`` is 0 when every buffer was mapped without a copy.
-        None for any other column."""
+        """For a view column, what its import cost and whether it has been converted since:
+        ``{"copied_bytes", "data_buffers", "string_bytes", "converted"}``. ``copied_bytes`` is 0
+        when every buffer was mapped without a copy; ``converted`` is True once an operation in
+        ``STRING_VIEW_CONVERTS`` has converted the column to offsets + bytes. None for any other
+        column."""
         c, d, b = ctypes.c_int64(), ctypes.c_int64(), ctypes.c_int64()
         if _lib.am_string_view_info(self._h, ctypes.byref(c), ctypes.byref(d), ctypes.byref(b)) != 0:
             return None
-        return {"copied_bytes": c.value, "data_buffers": d.value, "string_bytes": b.value}
+        return {"copied_bytes": c.value, "data_buffers": d.value, "string_bytes": b.value,
+                "converted": _lib.am_string_layout(self._h) == 2}
 
     def __repr__(self):
         return f"MetalArray({self.type}, len={len(self)}, nulls={self.null_count}, device={device_name()!r})"
@@ -768,16 +771,30 @@ def array(obj):
     return MetalArray.from_arrow(obj)
 
 
-#: The kernels that read a ``utf8_view`` / ``binary_view`` column's views directly. Every other
-#: operation on such a column converts it to offsets + bytes first, once (``string_layout`` then
-#: reports ``"view (converted)"``).
+#: What reads a ``utf8_view`` / ``binary_view`` column's views directly, without converting it.
 STRING_VIEW_KERNELS = (
     "byte_length", "char_length", "hash32",
     "str_equals (scalar and array)", "starts_with", "ends_with", "str_contains",
     "is_in / index_in (either side a view)",
-    "upper / lower / swapcase / capitalize / title and the utf8 trims",
+    "upper / lower / swapcase / capitalize / title, ascii and utf8",
+    "trims, replace, repeat, slice_codeunits, pad_left / pad_right, str_reverse",
+    "count_substring / find_substring", "the ascii_is_* and utf8_is_* predicates",
+    "utf8_center / utf8_replace_slice",
     "argsort / sort (sort keys)", "group-by keys", "dictionary_encode", "unique", "value_counts",
     "filter / take (the gathered result is offsets + bytes)", "slice (stays a view)",
+    "concatenation of view columns (join keys, unions)",
+    "fused expressions: am.query and the engines' filters and string predicates",
+    "host-side row passes (regex, normalize and the other per-row host functions)",
+)
+
+#: What converts a view column to offsets + bytes first (once; the converted form is kept and
+#: ``string_layout`` then reports ``"view (converted)"``).
+STRING_VIEW_CONVERTS = (
+    "str_concat (binary_join_element_wise)",
+    "split_pattern / split_whitespace / ascii_split_whitespace and the split pairs",
+    "match_like", "strptime", "ascii_lpad / ascii_rpad / ascii_center", "utf8_zero_fill",
+    "binary_slice / binary_reverse / ascii_reverse",
+    "casts from strings, and the IPC, Parquet, CSV and JSON writers",
 )
 
 
