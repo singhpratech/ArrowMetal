@@ -145,6 +145,9 @@ public struct Optimizer {
                 if case .bool(false) = b { return a }
                 if a == b { return a }
             }
+            // A u64 literal above Int64.max is held as a negative bit pattern: signed folding
+            // would misorder it, so such an expression is left for the kernel.
+            if isWideUnsigned(a) || isWideUnsigned(b) { return .binary(op, a, b) }
             if let x = intLiteral(a), let y = intLiteral(b) {
                 switch op {
                 case .add: return .int(x &+ y)
@@ -238,9 +241,13 @@ public struct Optimizer {
         case .double(let v): return v
         case .typedDouble(let v, _): return v
         case .int(let v): return Double(v)
-        case .typedInt(let v, _): return Double(v)
+        case .typedInt(let v, let t): return t == .uint64 ? Double(UInt64(bitPattern: v)) : Double(v)
         default: return nil
         }
+    }
+    private static func isWideUnsigned(_ e: Expr) -> Bool {
+        if case .typedInt(let v, .uint64) = e { return v < 0 }
+        return false
     }
     private static func mayBeNullLiteral(_ e: Expr) -> Bool {
         switch e { case .int, .typedInt, .double, .typedDouble, .bool, .string: return false; default: return true }

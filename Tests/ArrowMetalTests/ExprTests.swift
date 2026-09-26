@@ -578,4 +578,20 @@ final class ExprTests: XCTestCase {
         let qt = q.canonical
         XCTAssertEqual(try ExprQuery(text: qt).canonical, qt)
     }
+
+    /// A u64 literal above Int64.max used to be rejected by the parser ("bad u64 literal"). It is held
+    /// as its bit pattern, printed unsigned, and not folded with signed comparisons.
+    func testWideUnsignedLiteralsParsePrintAndStayUnfolded() throws {
+        for text in ["(u64 18446744073709551615)", "(u64 9223372036854775808)", "(u64 9223372036854775807)",
+                     "(u64 0)"] {
+            let e = try Expr(text: text)
+            XCTAssertEqual(e.description, text)
+        }
+        guard case .typedInt(let v, .uint64) = try Expr(text: "(u64 18446744073709551615)") else {
+            return XCTFail("not a typed u64 literal")
+        }
+        XCTAssertEqual(UInt64(bitPattern: v), UInt64.max)
+        XCTAssertThrowsError(try Expr(text: "(u64 18446744073709551616)"))
+        XCTAssertThrowsError(try Expr(text: "(i64 9223372036854775808)"))
+    }
 }
