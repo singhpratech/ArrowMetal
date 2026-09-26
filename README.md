@@ -48,10 +48,11 @@ print(am.group_by([region]).sum(amount).to_arrow())     # [40, 60]: GPU group-by
 print(amount.filter_where(">", 15).to_arrow())          # [20, 30, 40]: GPU filter, back as a pyarrow array
 ```
 
-Listed on Apache Arrow's [Powered By](https://arrow.apache.org/powered_by/) page. Site and docs: <https://arrowmetal.org> · Python: `pip install arrowmetal` · Rust: `arrowmetal = "0.2.0"` · Release: [v0.2.0](https://github.com/singhpratech/ArrowMetal/releases/tag/v0.2.0)
+Listed on Apache Arrow's [Powered By](https://arrow.apache.org/powered_by/) page. Site and docs: <https://arrowmetal.org> · Python: `pip install arrowmetal` · Rust: `arrowmetal = "0.3.0"` · Release: [v0.3.0](https://github.com/singhpratech/ArrowMetal/releases/tag/v0.3.0)
 
-New in 0.2.0: GPU readers for CSV and newline-delimited JSON, Delta Lake and Apache Iceberg tables,
-nested Parquet columns, a CPU/GPU router, a Polars engine and a DuckDB optimizer extension
+New in 0.3.0: the Polars engine's default placement from measured crossovers, Polars `scan_parquet`
+read on the GPU, strings in Arrow's view layout (`utf8_view`), Parquet pages decompressed by the CPU and
+the GPU at the same time, per-machine router calibration, and a wheel that carries the Polars plugin
 ([CHANGELOG.md](CHANGELOG.md)).
 
 Contents: [The pitch](#the-pitch-in-one-paragraph) · [What was measured](#what-was-measured) · [Why this exists](#why-this-exists) · [Benchmarks](#benchmarks) · [From Python](#from-python) · [Bindings](#bindings) · [Quick start (Swift)](#quick-start-swift) · [Reading Arrow files](#reading-arrow-files) · [What is implemented](#what-is-implemented) · [Design notes](#design-notes) · [Citing](#citing) · [License](#license)
@@ -202,7 +203,7 @@ PYTHONPATH=python python -c "import arrowmetal as am; print(am.device_name())"
 
 # From a wheel that carries the dylib (no Swift toolchain at install time)
 pip install build && scripts/build_wheel.sh         # or python/build_wheel.sh, if the dylib is built
-pip install python/dist/arrowmetal-0.2.0-*.whl      # macOS arm64 only, pyarrow comes with it
+pip install python/dist/arrowmetal-0.3.0-*.whl      # macOS arm64 only, pyarrow comes with it
 python -c "import arrowmetal as am; print(am.device_name())"
 ```
 ```python

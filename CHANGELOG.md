@@ -1,6 +1,26 @@
 # Changelog
 
 ## Unreleased
+Nothing yet.
+
+## 0.3.0 — 2026-09-26
+Everything below is new in 0.3.0. `MetalEngine()` decides per subtree from measured crossovers: in the
+default benchmark (194 case-size pairs at 2,000,000 and 50,000,000 rows) it took 62 pairs, 42 of them
+group-bys, every one ahead of the faster Polars engine, 1.21x to 9.42x
+(`Benchmarks/results/polars_engine_bench_2026-09-26-final3.csv`). The engine takes a Polars
+`scan_parquet` of one local file and reads it on the GPU. The C Data import and export take `utf8_view`
+/ `binary_view`, the string kernels run on that layout, and Polars' String columns are handed over in
+it. A whole-file Parquet read of the 50,000,000-row, 8-column files through a fresh open is 65 ms
+(Snappy), 54 ms (LZ4) and 38 ms (uncompressed), against Polars' 95, 73 and 63 ms in the same run, with
+Snappy and LZ4 pages decompressed by the host and the GPU at the same time
+(`Benchmarks/results/parquet_bench_2026-09-26-split.txt`). `python -m arrowmetal.router calibrate` fits
+the router's table on the Mac it runs on, and `explain` prints a decision with its reason and the
+measured points behind it. The conformance grids compare the Polars engine with Polars (12,597 cases)
+and the DuckDB rewrite with DuckDB (33,376 cases) bit for bit, with 0 unclassified differences. A
+group-by over 2^24 groups or more returns the right Float64 and Float32 sums and means, products and
+lists. The wheel carries the Polars expression plugin, so all four Polars tiers run from
+`pip install`.
+
 - Parquet Snappy and LZ4 pages are decompressed by the host and the GPU at the same time, split page by
   page. A read's router (`DecodeRouter`) orders every Snappy and LZ4 page of the columns it stages by how
   token-dense its header says it is (its ratio: at or below 1.0 a literal, above 1.05 token-dense), and

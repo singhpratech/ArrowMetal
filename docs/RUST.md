@@ -10,7 +10,7 @@ Two crates live in [`rust/`](../rust):
 | `arrowmetal-sys` | Raw `extern "C"` declarations over [`include/arrowmetal.h`](../include/arrowmetal.h), plus the `build.rs` that finds and links `libArrowMetalC.dylib`. |
 | `arrowmetal` | The safe crate. An `arrow::array::ArrayRef` goes in, an `ArrayRef` comes out; every failure is a `Result` carrying `am_last_error()`'s message. |
 
-Both are on crates.io at 0.2.0; a path or git dependency on a checkout works too.
+Both are on crates.io at 0.3.0; a path or git dependency on a checkout works too.
 
 Everything below was run in this repository on 2026-09-07 on an Apple M4 Max, macOS 26.6.2,
 `rustc 1.95.0`, arrow-rs 59.3.0, ArrowMetal 0.1.0.
@@ -33,7 +33,7 @@ That produces `.build/release/libArrowMetalC.dylib`. Then, in your own crate:
 # Cargo.toml
 [dependencies]
 arrow = "59"
-arrowmetal = "0.2.0"          # crates.io; or { path = "../ArrowMetal/rust/arrowmetal" } from a checkout
+arrowmetal = "0.3.0"          # crates.io; or { path = "../ArrowMetal/rust/arrowmetal" } from a checkout
 ```
 
 and build with the dylib's location known:

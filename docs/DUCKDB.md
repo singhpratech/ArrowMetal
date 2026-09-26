@@ -248,7 +248,7 @@ The loader hands it a struct of function pointers and everything after that is p
 ### The functions
 
 ```sql
-SELECT arrowmetal_version();                          -- '0.2.0'
+SELECT arrowmetal_version();                          -- '0.3.0'
 SELECT arrowmetal_device();                           -- 'Apple M4 Max'
 
 SELECT * FROM arrowmetal_agg('sales', 'amount');      -- sum, count, min, max, mean
