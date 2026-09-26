@@ -1,0 +1,14 @@
+# ArrowMetal 0.2.0 on Apple M4 Max, 50000000 rows x 8 columns, 1 MB pages, best of 3
+codec,measure,cold_ms,warm_ms
+snappy,open only,0.27,0.02
+snappy,read price,149.36,9.36
+snappy,read price + sum,153.95,11.01
+snappy,read all 8 columns,354.52,211.85
+lz4,open only,0.24,0.02
+lz4,read price,152.65,9.12
+lz4,read price + sum,155.00,11.03
+lz4,read all 8 columns,334.12,182.36
+none,open only,0.23,0.01
+none,read price,191.30,7.14
+none,read price + sum,193.62,6.79
+none,read all 8 columns,241.45,33.33
