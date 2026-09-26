@@ -79,6 +79,10 @@ GROUP_BUCKETS = (("200", 1, 447), ("1,000", 448, 3_162), ("10,000", 3_163, 31_62
                  ("100,000", 31_623, 316_227), ("1,000,000", 316_228, 3_162_277))
 NEAR_ROWS = 4
 ROWS_BUCKET = "rows/2"
+# Buckets the default never takes, whatever their fit. The rows/2 bucket (about as many groups as rows)
+# is not monotone in the sweep (a one-key count runs 0.76, 1.9, 4.04, 2.21, 1.18 from 2M to 50M rows)
+# and its cases came in at 0.88-0.93x of Polars in the default benchmark where the fit had taken them.
+UNTAKEN_BUCKETS = (ROWS_BUCKET,)
 
 
 def group_bucket(groups, rows):
@@ -189,7 +193,7 @@ def fit_groups(cases):
             continue
         for n, (metal, polars) in c["points"].items():
             b = group_bucket(c["groups"].get(n), n)
-            if b is None:
+            if b is None or b in UNTAKEN_BUCKETS:
                 continue
             for cls in classes:
                 pooled.setdefault((cls, dclass, source, b), {}).setdefault(n, []).append(
@@ -258,6 +262,7 @@ def render(source, header, per_case, table, groups):
         f"SWEEP_SOURCE = {SWEEP_JSON!r}",
         f"MARGIN = {MARGIN!r}",
         f"STRING_FLOOR = {STRING_FLOOR!r}",
+        f"UNTAKEN_BUCKETS = {UNTAKEN_BUCKETS!r}",
         f"GROUP_BUCKETS = {GROUP_BUCKETS!r}",
         f"NEAR_ROWS = {NEAR_ROWS!r}",
         f"ROWS_BUCKET = {ROWS_BUCKET!r}",
