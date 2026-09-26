@@ -2,8 +2,9 @@
 
 The eight shapes of `Benchmarks/engine_bench.py` and 37 more (group-by per aggregate family over one
 and two keys at few and many groups, whole-frame aggregates, each join kind, sorts, top-k, `unique`,
-and the same with a String column), written as Polars LazyFrames over in-memory Polars DataFrames,
-collected five ways:
+and the same with a String column) and a group-by grid of 48 (`group_grid`: each aggregate family
+over one and two int32 keys at 200 to 1,000,000 key values and at half the rows), written as Polars
+LazyFrames over in-memory Polars DataFrames, collected five ways:
 
 * `polars in-memory`, `polars streaming` -- `lf.collect(engine=...)`
 * `MetalEngine all, cold` / `warm`       -- `MetalEngine(shapes="all", min_rows=0)`: every shape it

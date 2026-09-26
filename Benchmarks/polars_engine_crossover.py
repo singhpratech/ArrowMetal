@@ -25,6 +25,11 @@ group-by and top-k does not measure the group-by, because the top-k is a differe
 those cases has no crossover, neither has the class, and the default leaves it to Polars at every size.
 A case taken as more than one subtree, or not taken at all, measures nothing.
 
+The group-by classes are fitted per group-count bucket as well (`GROUP_BUCKETS`, `fit_groups`): each
+point of a group-by-only case goes to the bucket of the number of groups its data holds at that size
+(the results file's `groups` column), and at each size a bucket's point is the worst of its cases
+there. The policy judges a group-by with a group-count estimate by these buckets.
+
 The sort kernels' own crossovers against the fastest CPU library (`vs_fastest_library` of
 Benchmarks/results/router_2026-09-24.json, docs/CROSSOVER.md) are recorded alongside as `SWEEP`;
 the policy (python/arrowmetal/_engine_policy.py) takes the larger of the two, and of the router
