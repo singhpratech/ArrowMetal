@@ -104,7 +104,6 @@ SHAPE_CLASSES = _policy.CLASSES
 # `shapes="all"` without `min_rows=`: a subtree reading fewer rows stays with Polars.
 DEFAULT_MIN_ROWS = _policy.DEFAULT_MIN_ROWS_ALL
 # ArrowMetal's group-by answers a Float64 sum or mean wrongly from this many groups on.
-_F64_GROUP_LIMIT = 1 << 24
 _AGG_FAMILY = {"sum": "sum", "count": "count", "mean": "mean", "min": "minmax", "max": "minmax"}
 
 _HIDDEN = "__arrowmetal_"          # prefix of the helper columns the translation adds and drops
@@ -1190,18 +1189,6 @@ class _Translator:
                     fix.append((name, arg.code, want, ("nan", cnt, num, zs, op)))
                 else:
                     fix.append((name, arg.code, want, None))
-        if keys and f64_sums:
-            # ArrowMetal's group-by returns wrong Float64 sums and means (nulls, or 0 after the
-            # fill) once there are 2^24 groups or more
-            # (`test_core_group_by_float64_sum_and_mean_at_2_24_groups`). The number of groups is
-            # at most the rows reaching the group-by, which is at most the input rows unless an
-            # inner or left join below can multiply them.
-            bound = None if kid.classes & {"join:inner", "join:left"} else kid.rows
-            if bound is None or bound >= _F64_GROUP_LIMIT:
-                raise _Unsupported(f"A per-group Float64 sum or mean over "
-                                   f"{'an unbounded number of' if bound is None else f'{bound:,}'} "
-                                   f"rows is not translated (ArrowMetal's group-by answers these "
-                                   f"wrongly from {_F64_GROUP_LIMIT:,} groups).")
         if keys:
             plan = {"op": "group_by", "input": kid.plan,
                     "keys": [[k, kid.cols[k].ref] for k in keys], "aggs": aggs}

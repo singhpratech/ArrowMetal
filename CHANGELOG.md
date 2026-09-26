@@ -26,11 +26,7 @@
   Parquet cases, taken with a 1-minute load average of 8 to 22) every case-size pair the default took
   was ahead of the faster Polars engine, 1.30x to 8.37x. `Benchmarks/polars_engine_bench.py` gains 37
   cases and `--crossover`; `python/tests/test_engine_policy.py` tests the policy.
-- `MetalEngine` leaves a group-by with a Float64 sum, or a mean over a 64-bit integer or float column,
-  to Polars when its input could hold 2^24 groups (16,777,216 input rows or more, or an inner or left
-  join below it): ArrowMetal's group-by answers those wrongly from 16,777,216 groups (most groups null),
-  found by the crossover sweep's `(v3)` case and pinned by
-  `test_core_group_by_float64_sum_and_mean_at_2_24_groups` (docs/ENGINE.md, "Limits").
+- The crossover sweep's `(v3)` case found ArrowMetal's group-by returning wrong Float64 sums and means from 16,777,216 groups (most groups null); fixed in the core (below), so the engine applies no group-count rule.
 - Parquet reads, cold and warm. On the 50,000,000-row, 8-column benchmark files a whole-file read
   through a fresh open is 114 ms (Snappy), 105 ms (LZ4) and 53 ms (uncompressed), against 369, 340 and
   250 ms in `parquet_bench_2026-09-25-quiet.txt` and against Polars' 104, 86 and 77 ms in the same run,

@@ -362,9 +362,9 @@ def test_the_report_prints_a_rule_for_every_placement_decision():
 
 
 def test_core_group_by_float64_sum_and_mean_at_2_24_groups():
-    """ArrowMetal's group-by returns a wrong Float64 sum (null) for most groups once there are
-    2^24 groups or more; 2^24 - 1 groups are right. Found by the (v3) case of the crossover sweep.
-    The engine leaves such group-bys to Polars (next test); this pins the core behaviour."""
+    """A Float64 group sum at exactly 2^24 groups: every group present and right. Found wrong by the
+    (v3) case of the crossover sweep (per-group grids wrapped past 2^32 threads) and fixed in the core;
+    python/tests/test_group_by_2_24.py covers the other aggregates and counts."""
     from arrowmetal import lazy
     n = 1 << 24
     k = am.MetalArray.from_arrow(pa.array(np.arange(n, dtype=np.int64)))
@@ -373,28 +373,20 @@ def test_core_group_by_float64_sum_and_mean_at_2_24_groups():
             "keys": [["k", '(col "k")']], "aggs": [["sum", "s", '(col "v")']]}
     out = lazy.LazyFrame(plan, {"t": lazy._Source(["k", "v"], [k, v])}).collect()
     s = out.column("s")
-    wrong = s.null_count
-    if wrong == 0:
-        vals = pa.compute.sort_indices(out.column("k"))
-        assert pa.compute.take(s, vals).to_pylist()[:3] == [0.0, 1.0, 2.0]
-    else:
-        pytest.xfail(f"{wrong:,} of {n:,} per-group Float64 sums are null at 2^24 groups")
+    assert s.null_count == 0
+    assert len(s) == n
+    order = pa.compute.sort_indices(out.column("k"))
+    assert pa.compute.take(s, order).to_pylist()[:3] == [0.0, 1.0, 2.0]
 
 
-def test_the_engine_leaves_a_float64_group_sum_that_could_reach_2_24_groups():
+def test_the_engine_takes_a_float64_group_sum_at_2_24_rows():
+    """A group-by with a Float64 sum or mean over 2^24 input rows runs on Metal and equals Polars."""
     df = pl.DataFrame({"k": np.arange(1 << 24, dtype=np.int64) % 1000,
                        "v": np.ones(1 << 24), "i": np.ones(1 << 24, dtype=np.int32)})
     eng = am.MetalEngine(shapes="all", min_rows=0)
-    for agg in (pl.col("v").sum(), pl.col("v").mean(), pl.col("k").mean().alias("m")):
+    for agg in (pl.col("v").sum(), pl.col("v").mean(), pl.col("k").mean().alias("m"), pl.col("i").sum()):
         lf = df.lazy().group_by("k").agg(agg)
         assert lf.collect(engine=eng).sort("k").equals(lf.collect().sort("k"))
-        assert not eng.last_report.taken
-        assert any("per-group Float64 sum or mean over 16,777,216 rows" in f
-                   for f in eng.last_report.fallbacks), eng.last_report
-    # Below the limit, and with a 32-bit sum, the group-by still runs on Metal.
-    lf = df.head((1 << 24) - 1).lazy().group_by("k").agg(pl.col("v").sum())
-    assert lf.collect(engine=eng).sort("k").equals(lf.collect().sort("k"))
-    assert eng.last_report.taken
-    lf = df.lazy().group_by("k").agg(pl.col("i").sum())
-    lf.collect(engine=eng)
-    assert eng.last_report.taken
+        assert eng.last_report.taken, eng.last_report
+
+

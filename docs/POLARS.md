@@ -753,16 +753,7 @@ is ahead of the faster Polars engine in 13 of those 80, all group-by, semi join 
 whose class has a crossover above that size or none (at 50M rows: `(v2)` 8.21, `(v1)` 5.04, `(t5)`
 4.26, `(t7)` 2.39, `(i)` 2.30, `(w3)` 2.20).
 
-**Float64 group sums and means at 2^24 groups.** ArrowMetal's group-by returns a wrong Float64 sum or
-mean (null for most groups) when there are 16,777,216 groups or more; 16,777,215 are right. The (v3)
-case, a mean over two keys with about as many groups as rows, found it at 20,000,000 and 50,000,000
-rows. Every mode of the engine, `shapes="all"` included, leaves a group-by with a Float64 sum or a
-mean over a 64-bit integer or float column to Polars when the rows reaching it could hold that many groups
-(its input rows are 16,777,216 or more, or an inner or left join below it can multiply them); the
-report names it. `test_core_group_by_float64_sum_and_mean_at_2_24_groups` pins the core behaviour as
-an expected failure. At 50,000,000 rows this is why `(c)`, `(l)`, `(t3)`, `(t6)`, `(v3)` and the
-Parquet cases `(s1)` and `(s2)` stay with Polars under `shapes="all"` in the benchmark, and every
-MetalEngine result in it equals Polars'.
+**Float64 group sums and means at 2^24 groups.** The (v3) case of the crossover sweep, a mean over two keys with about as many groups as rows, found ArrowMetal's group-by returning null for most groups at 16,777,216 groups and above (16,777,215 were right): the per-group kernels dispatched one threadgroup per group and the grid wrapped past 2^32 threads. Fixed in the core ([FINDINGS.md](FINDINGS.md), round 13; `python/tests/test_group_by_2_24.py`), so no engine rule is needed and every group-by shape follows the policy above. In the 2026-09-26 benchmark, which ran before the fix, `(c)`, `(l)`, `(t3)`, `(t6)`, `(v3)` and the Parquet cases `(s1)` and `(s2)` stayed with Polars under `shapes="all"` because of the guard that was in place then.
 
 ```python
 am.MetalEngine()                          # shapes="measured": the crossovers above
