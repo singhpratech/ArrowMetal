@@ -140,6 +140,9 @@ private func buildExpr(_ n: Node) throws -> Expr {
                            return .typedDouble(v, t) }
             if t == .boolean { return .bool(text == "true") }
             if t == .utf8 { return .string(text) }
+            // A u64 literal above Int64.max is held as its bit pattern, which is how the code
+            // generator writes every unsigned literal (`UInt64(bitPattern:)`).
+            if t == .uint64, let u = UInt64(text) { return .typedInt(Int64(bitPattern: u), t) }
             guard let v = Int64(text) else { throw ExprError.invalid("bad \(n.head) literal") }
             return .typedInt(v, t)
         }

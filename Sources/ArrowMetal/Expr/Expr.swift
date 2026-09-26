@@ -289,7 +289,9 @@ extension Expr: CustomStringConvertible {
         switch self {
         case .column(let n): return "(col \(quoteExprString(n)))"
         case .int(let v): return "(int \(v))"
-        case .typedInt(let v, let t): return "(\(t.token) \(v))"
+        case .typedInt(let v, let t):
+            if t == .uint64 { return "(\(t.token) \(UInt64(bitPattern: v)))" }
+            return "(\(t.token) \(v))"
         case .double(let v): return "(float \(fullPrecision(v)))"
         case .typedDouble(let v, let t): return "(\(t.token) \(fullPrecision(v)))"
         case .bool(let v): return "(bool \(v))"

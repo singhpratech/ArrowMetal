@@ -1,0 +1,153 @@
+engine,shape,family,cases,pass,documented,unclassified,not_taken
+polars,filter_cmp,filter,244,244,0,0,0
+polars,filter_is_not_null,filter,244,244,0,0,0
+polars,filter_other_column,filter,397,397,0,0,0
+polars,filter_is_in,filter,227,227,0,0,0
+polars,select_arith,select,210,210,0,0,0
+polars,select_div,select,210,210,0,0,0
+polars,select_cmp,select,227,227,0,0,0
+polars,select_null,select,244,244,0,0,0
+polars,select_when,select,227,227,0,0,0
+polars,select_cast,select,206,206,0,0,0
+polars,select_logic,select,185,185,0,0,0
+polars,select_str,select,17,17,0,0,0
+polars,with_columns,hstack,397,397,0,0,0
+polars,slice,slice,397,397,0,0,0
+polars,sort_asc,sort,397,329,0,0,68
+polars,sort_desc,sort,397,397,0,0,0
+polars,sort_nulls_last,sort,397,360,0,0,37
+polars,sort_desc_nulls_last,sort,397,397,0,0,0
+polars,sort_two_keys,sort,397,397,0,0,0
+polars,top_k_asc,sort+limit,397,329,0,0,68
+polars,top_k_desc,sort+limit,397,397,0,0,0
+polars,group_by_key_sum,group_by,355,355,0,0,0
+polars,group_by_key_min,group_by,355,355,0,0,0
+polars,group_by_key_max,group_by,355,355,0,0,0
+polars,group_by_key_mean,group_by,355,355,0,0,0
+polars,group_by_key_count,group_by,355,355,0,0,0
+polars,group_by_key_len,group_by,355,355,0,0,0
+polars,group_by_value_sum,group_by,227,215,12,0,0
+polars,group_by_value_min,group_by,189,189,0,0,0
+polars,group_by_value_max,group_by,189,189,0,0,0
+polars,group_by_value_mean,group_by,210,204,6,0,0
+polars,group_by_value_count,group_by,227,227,0,0,0
+polars,aggregate_sum,aggregate,227,218,9,0,0
+polars,aggregate_min,aggregate,210,210,0,0,0
+polars,aggregate_max,aggregate,210,210,0,0,0
+polars,aggregate_mean,aggregate,210,205,5,0,0
+polars,aggregate_count,aggregate,227,227,0,0,0
+polars,join_inner,join,355,355,0,0,0
+polars,join_left,join,355,355,0,0,0
+polars,join_semi,join,355,355,0,0,0
+polars,join_anti,join,355,355,0,0,0
+polars,unique_subset,unique,355,355,0,0,0
+polars,unique_all,unique,355,355,0,0,0
+duckdb,sum|no key|none,sum,252,154,0,0,98
+duckdb,avg|no key|none,avg,293,154,0,0,139
+duckdb,min|no key|none,min,311,212,0,0,99
+duckdb,max|no key|none,max,311,212,0,0,99
+duckdb,count|no key|none,count,324,0,0,0,324
+duckdb,count_star|no key|none,count_star,324,0,0,0,324
+duckdb,all|no key|none,all,311,190,0,0,121
+duckdb,sum|no key|v_not_null,sum,252,119,0,0,133
+duckdb,avg|no key|v_not_null,avg,293,119,0,0,174
+duckdb,min|no key|v_not_null,min,311,164,0,0,147
+duckdb,max|no key|v_not_null,max,311,164,0,0,147
+duckdb,count|no key|v_not_null,count,324,0,0,0,324
+duckdb,count_star|no key|v_not_null,count_star,324,0,0,0,324
+duckdb,all|no key|v_not_null,all,311,146,0,0,165
+duckdb,sum|no key|other_column,sum,252,154,0,0,98
+duckdb,avg|no key|other_column,avg,297,154,0,0,143
+duckdb,min|no key|other_column,min,315,212,0,0,103
+duckdb,max|no key|other_column,max,315,212,0,0,103
+duckdb,count|no key|other_column,count,324,0,0,0,324
+duckdb,count_star|no key|other_column,count_star,324,0,0,0,324
+duckdb,all|no key|other_column,all,315,190,0,0,125
+duckdb,sum|key int|none,sum,252,154,0,0,98
+duckdb,avg|key int|none,avg,293,154,0,0,139
+duckdb,min|key int|none,min,311,212,0,0,99
+duckdb,max|key int|none,max,311,212,0,0,99
+duckdb,count|key int|none,count,324,258,0,0,66
+duckdb,count_star|key int|none,count_star,324,324,0,0,0
+duckdb,all|key int|none,all,311,190,0,0,121
+duckdb,keys_only|key int|none,keys_only,324,324,0,0,0
+duckdb,sum|key int|v_not_null,sum,252,119,0,0,133
+duckdb,avg|key int|v_not_null,avg,293,119,0,0,174
+duckdb,min|key int|v_not_null,min,311,164,0,0,147
+duckdb,max|key int|v_not_null,max,311,164,0,0,147
+duckdb,count|key int|v_not_null,count,324,210,0,0,114
+duckdb,count_star|key int|v_not_null,count_star,324,248,0,0,76
+duckdb,all|key int|v_not_null,all,311,146,0,0,165
+duckdb,keys_only|key int|v_not_null,keys_only,324,248,0,0,76
+duckdb,sum|key int|other_column,sum,252,154,0,0,98
+duckdb,avg|key int|other_column,avg,297,154,0,0,143
+duckdb,min|key int|other_column,min,315,212,0,0,103
+duckdb,max|key int|other_column,max,315,212,0,0,103
+duckdb,count|key int|other_column,count,324,258,0,0,66
+duckdb,count_star|key int|other_column,count_star,324,324,0,0,0
+duckdb,all|key int|other_column,all,315,190,0,0,125
+duckdb,keys_only|key int|other_column,keys_only,324,324,0,0,0
+duckdb,sum|key bigint_wide|none,sum,252,154,0,0,98
+duckdb,avg|key bigint_wide|none,avg,293,154,0,0,139
+duckdb,min|key bigint_wide|none,min,311,212,0,0,99
+duckdb,max|key bigint_wide|none,max,311,212,0,0,99
+duckdb,count|key bigint_wide|none,count,324,258,0,0,66
+duckdb,count_star|key bigint_wide|none,count_star,324,324,0,0,0
+duckdb,all|key bigint_wide|none,all,311,190,0,0,121
+duckdb,keys_only|key bigint_wide|none,keys_only,324,324,0,0,0
+duckdb,sum|key smallint_neg|none,sum,252,154,0,0,98
+duckdb,avg|key smallint_neg|none,avg,293,154,0,0,139
+duckdb,min|key smallint_neg|none,min,311,212,0,0,99
+duckdb,max|key smallint_neg|none,max,311,212,0,0,99
+duckdb,count|key smallint_neg|none,count,324,258,0,0,66
+duckdb,count_star|key smallint_neg|none,count_star,324,324,0,0,0
+duckdb,all|key smallint_neg|none,all,311,190,0,0,121
+duckdb,keys_only|key smallint_neg|none,keys_only,324,324,0,0,0
+duckdb,sum|key utinyint|none,sum,252,154,0,0,98
+duckdb,avg|key utinyint|none,avg,293,154,0,0,139
+duckdb,min|key utinyint|none,min,311,212,0,0,99
+duckdb,max|key utinyint|none,max,311,212,0,0,99
+duckdb,count|key utinyint|none,count,324,258,0,0,66
+duckdb,count_star|key utinyint|none,count_star,324,324,0,0,0
+duckdb,all|key utinyint|none,all,311,190,0,0,121
+duckdb,keys_only|key utinyint|none,keys_only,324,324,0,0,0
+duckdb,sum|key date|none,sum,252,154,0,0,98
+duckdb,avg|key date|none,avg,293,154,0,0,139
+duckdb,min|key date|none,min,311,212,0,0,99
+duckdb,max|key date|none,max,311,212,0,0,99
+duckdb,count|key date|none,count,324,258,0,0,66
+duckdb,count_star|key date|none,count_star,324,324,0,0,0
+duckdb,all|key date|none,all,311,190,0,0,121
+duckdb,keys_only|key date|none,keys_only,324,324,0,0,0
+duckdb,sum|key timestamp|none,sum,252,154,0,0,98
+duckdb,avg|key timestamp|none,avg,293,154,0,0,139
+duckdb,min|key timestamp|none,min,311,212,0,0,99
+duckdb,max|key timestamp|none,max,311,212,0,0,99
+duckdb,count|key timestamp|none,count,324,258,0,0,66
+duckdb,count_star|key timestamp|none,count_star,324,324,0,0,0
+duckdb,all|key timestamp|none,all,311,190,0,0,121
+duckdb,keys_only|key timestamp|none,keys_only,324,324,0,0,0
+duckdb,sum|key varchar|none,sum,252,154,0,0,98
+duckdb,avg|key varchar|none,avg,293,154,0,0,139
+duckdb,min|key varchar|none,min,311,212,0,0,99
+duckdb,max|key varchar|none,max,311,212,0,0,99
+duckdb,count|key varchar|none,count,324,258,0,0,66
+duckdb,count_star|key varchar|none,count_star,324,324,0,0,0
+duckdb,all|key varchar|none,all,311,190,0,0,121
+duckdb,keys_only|key varchar|none,keys_only,324,324,0,0,0
+duckdb,sum|key varchar|v_not_null,sum,252,119,0,0,133
+duckdb,avg|key varchar|v_not_null,avg,293,119,0,0,174
+duckdb,min|key varchar|v_not_null,min,311,164,0,0,147
+duckdb,max|key varchar|v_not_null,max,311,164,0,0,147
+duckdb,count|key varchar|v_not_null,count,324,210,0,0,114
+duckdb,count_star|key varchar|v_not_null,count_star,324,248,0,0,76
+duckdb,all|key varchar|v_not_null,all,311,146,0,0,165
+duckdb,keys_only|key varchar|v_not_null,keys_only,324,248,0,0,76
+duckdb,sum|key varchar|other_column,sum,252,154,0,0,98
+duckdb,avg|key varchar|other_column,avg,297,154,0,0,143
+duckdb,min|key varchar|other_column,min,315,212,0,0,103
+duckdb,max|key varchar|other_column,max,315,212,0,0,103
+duckdb,count|key varchar|other_column,count,324,258,0,0,66
+duckdb,count_star|key varchar|other_column,count_star,324,324,0,0,0
+duckdb,all|key varchar|other_column,all,315,190,0,0,125
+duckdb,keys_only|key varchar|other_column,keys_only,324,324,0,0,0

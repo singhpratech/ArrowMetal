@@ -369,9 +369,9 @@ are not there yet).
 
 | | Eligible |
 |---|---|
-| Aggregates | none (`SELECT k FROM t GROUP BY k`), or any of: `sum` and `avg` over integer columns of every width and signedness except `UBIGINT` (which DuckDB sums through a cast to `HUGEINT`); `min` and `max` over integer, `DATE` and `TIMESTAMP` columns; `count(x)`, `count(*)`. The argument is a column, or a column under the widening integer cast DuckDB inserts itself (`sum` over `TINYINT` is `sum(CAST(x AS BIGINT))`). No `DISTINCT`, `FILTER` or `ORDER BY` inside the aggregate. |
+| Aggregates | none (`SELECT k FROM t GROUP BY k`), or any of: `sum` and `avg` over integer columns of every width and signedness except `UBIGINT` (which DuckDB sums through a cast to `HUGEINT`); `min` and `max` over integer, `DATE` and `TIMESTAMP` columns; `count(x)` over a column of one of those types, `count(*)`. Without `GROUP BY`, a query whose aggregates are all counts stays DuckDB's (the log's reason: "only counts, which need no kernel"). The argument is a column, or a column under the widening integer cast DuckDB inserts itself (`sum` over `TINYINT` is `sum(CAST(x AS BIGINT))`). No `DISTINCT`, `FILTER` or `ORDER BY` inside the aggregate. |
 | Grouping | none, or one column that is an integer, `DATE`, `TIMESTAMP` or `VARCHAR` column. No `GROUPING SETS`, `ROLLUP` or `CUBE`. |
-| Input | projections and filters over one table function whose row count DuckDB's planner knows: a table's `seq_scan`, `read_parquet`. A join, a window or another aggregate below the aggregate, or a source that does not report its size (a Python-registered Arrow table's `arrow_scan`), leaves it to DuckDB. |
+| Input | projections and filters over one table function whose row count DuckDB's planner knows: a table's `seq_scan`, `read_parquet`. A join, a window or another aggregate below the aggregate, or a source that does not report its size (a Python-registered Arrow table's `arrow_scan`), leaves it to DuckDB, and so does an input DuckDB has already replaced with an empty result (a `WHERE v IS NOT NULL` over a column its statistics know to be all NULL). |
 
 What DuckDB has already done to the plan stays done: the filters it pushed into the scan, its
 compressed materialization of the group key, its rewrite of `sum(x + 1)` into `sum(x)` plus a count,
@@ -403,6 +403,20 @@ integer type.
 - **Floating-point `sum` and `avg` are not rewritten**: DuckDB's own float sums depend on how its
   threads split the input, so there is no single answer to match. `min` and `max` over floats are not
   rewritten either: DuckDB orders NaN above every number, where ArrowMetal's `min`/`max` skip NaN.
+
+**The conformance grid.** `python/tests/engine_duckdb_grid.py` generates the same comparison over a
+grid instead of chosen queries: `sum`, `avg`, `min`, `max`, `count(v)`, `count(*)`, all of them in one
+query, and a `GROUP BY` with no aggregate, over the ten value types the extension rewrites and six it
+leaves to DuckDB (`DOUBLE`, `DECIMAL(18,3)`, `HUGEINT`, `BOOLEAN`, `TIMESTAMP_NS`, `TIMESTAMPTZ`), with
+no key or one key of each kind it takes (`INTEGER` with NULLs, a wide `BIGINT`, a negative `SMALLINT`,
+`UTINYINT`, `DATE`, `TIMESTAMP`, `VARCHAR` with NULLs), no filter or one of two, value columns with
+no, 5%, 70% or all NULLs, and tables of 0, 1, 7, 1,000 and 100,000 rows (the last also in 2,048-row
+blocks), plus integer extremes. Each query runs with the rewrite `'off'` and `'force'` on one
+connection. In the run recorded in `Benchmarks/results/engine_conformance_2026-09-25.csv`, 33,376
+queries: 21,844 rewritten and identical to DuckDB's answer, 11,532 left to DuckDB by the
+extension (and identical, as they must be), and none different. The per-shape counts are in
+`Benchmarks/results/engine_conformance_2026-09-25_shapes.csv`; [COVERAGE.md](COVERAGE.md#engines) has
+the summary.
 
 ### How it runs
 

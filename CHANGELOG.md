@@ -83,6 +83,28 @@
   with the file open, 221 ms before and 57-66 ms after (docs/PARQUET.md, "Decompression").
 - `am_parquet_column_null_count` / `ParquetFile.column_null_count`: a top-level column's null count from
   the footer (0 for a required column, else the sum of the row groups' statistics), without reading data.
+- Engine conformance grid: `python/tests/engine_report.py` runs the Polars engine against
+  `lf.collect()` and the DuckDB rewrite against DuckDB with the rewrite off, over generated shapes x
+  dtypes x null patterns x sizes (0 to 100,000 rows), compares bit for bit, classifies every
+  difference against the documented divergences and exits 1 on an unclassified one; `--csv-dir`
+  writes the summary and per-shape CSVs. Recorded run: Polars 12,597 cases, 12,392 pass, 32
+  documented (float summation order), 0 unclassified, 173 not taken; DuckDB 33,376 cases, 21,844
+  pass, 0 documented, 0 unclassified, 11,532 not taken
+  (`Benchmarks/results/engine_conformance_2026-09-25.csv`, docs/COVERAGE.md "Engines").
+  `python/tests/test_engine_conformance.py` runs the grid without its 100,000-row tables.
+- Polars engine, answers the grid found different from Polars' and now the same:
+  a true division by a scalar and a float multiply by -1 over a column of one row, which Polars
+  computes element-wise (the engine chooses by the input's row count, counting it when the plan runs
+  if a filter or join decides it); `min`/`max` over a column or group holding both 0.0 and -0.0
+  (Polars answers -0.0 and 0.0); a Float32 `mean`, which Polars accumulates in Float64 (docs/POLARS.md,
+  Tier 4).
+- Polars engine: a sort by a nullable Date, Datetime, Duration or Time column with nulls first
+  (Polars' default) runs on Metal; its validity key comes from the in-memory frame, where it used to
+  be an expression ArrowMetal's compiler does not read, which left the sort to Polars.
+- Expression parser: a `u64` literal above 2^63 - 1 is accepted (held as its bit pattern), so a
+  Polars plan comparing a UInt64 column with such a value runs on Metal.
+- docs/DUCKDB.md states two shapes the extension leaves to DuckDB: an ungrouped query whose
+  aggregates are all counts, and an input DuckDB has already replaced with an empty result.
 
 ## 0.2.0
 Everything below is new in 0.2.0.

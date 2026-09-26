@@ -97,6 +97,10 @@ DEFAULT_MIN_ROWS = 1_000_000
 MEASURED_SHAPES = {"sort": 0, "sort_helper_keys": 10_000_000}
 
 _HIDDEN = "__arrowmetal_"          # prefix of the helper columns the translation adds and drops
+# A Boolean the plan's text leaves open until it runs: "the input of probe N holds exactly one row"
+# (`_Translator._row_dependent`, `_resolve_row_probes`).
+_PROBE_TOKEN = "@arrowmetal_one_row_%d@"
+_PROBE_RE = re.compile(r"@arrowmetal_one_row_(\d+)@")
 
 
 # --------------------------------------------------------------------------------------------------
@@ -355,14 +359,22 @@ class _E:
         self.col = col
 
 
+_SAME = object()         # `_Sub.derive`: keep the field as it is
+
+
 class _Sub:
     """A translated subtree: its ArrowMetal plan (None when it cannot run on Metal), its output
     columns, the physical columns its plan produces, its in-memory leaves, their total rows, and
-    whether it does any GPU work at all."""
+    whether it does any GPU work at all. `exact` is the number of rows the plan produces when the
+    translation can know it without running anything (a scan, and what keeps or cuts its rows by a
+    known amount), else None; `probes` the plans whose row counts the plan's text asks for (see
+    `_row_dependent`)."""
 
-    __slots__ = ("plan", "cols", "phys", "leaves", "rows", "work", "kinds", "classes")
+    __slots__ = ("plan", "cols", "phys", "leaves", "rows", "work", "kinds", "classes", "exact",
+                 "probes")
 
-    def __init__(self, plan, cols, phys=(), leaves=(), rows=0, work=False, kinds=(), classes=()):
+    def __init__(self, plan, cols, phys=(), leaves=(), rows=0, work=False, kinds=(), classes=(),
+                 exact=None):
         self.plan = plan
         self.cols = cols
         self.phys = list(phys)
@@ -371,12 +383,15 @@ class _Sub:
         self.work = work
         self.kinds = list(kinds)
         self.classes = set(classes)         # shape classes inside: see _SHAPE_CLASSES
+        self.exact = exact
+        self.probes = []
 
-    def derive(self, plan=None, cols=None, phys=None, work=None, add_class=None):
+    def derive(self, plan=None, cols=None, phys=None, work=None, add_class=None, exact=_SAME):
         return _Sub(self.plan if plan is None else plan, dict(self.cols) if cols is None else cols,
                     self.phys if phys is None else phys, self.leaves, self.rows,
                     self.work if work is None else work, (),
-                    self.classes | ({add_class} if add_class else set()))
+                    self.classes | ({add_class} if add_class else set()),
+                    self.exact if exact is _SAME else exact)
 
     def final_plan(self):
         """The plan with one select on top that computes every virtual column and puts the output
@@ -442,6 +457,13 @@ def _is_file(leaf_data):
     return isinstance(leaf_data, _FileLeaf)
 
 
+def _sliced(rows, offset, length):
+    """The rows a `slice(offset, length)` of `rows` known rows leaves, or None if `rows` is None."""
+    if rows is None:
+        return None
+    return max(0, min(int(length), rows - int(offset)))
+
+
 _ARITH = {"Plus": "add", "Minus": "sub", "Multiply": "mul"}
 _CMP = {"Eq": "eq", "NotEq": "ne", "Lt": "lt", "LtEq": "le", "Gt": "gt", "GtEq": "ge"}
 _REGEX_META = set(".^$*+?()[]{}|\\")
@@ -454,6 +476,8 @@ class _Translator:
         self.subs = {}                  # node id -> _Sub
         self.hidden = 0
         self.names = set()              # every column name in the plan, so a helper avoids them
+        self.probes = []                # plans whose row count a translated expression depends on
+        self.eval_kid = None            # the input of the node whose expressions are translated
 
     # -- helpers
 
@@ -533,6 +557,7 @@ class _Translator:
         method = getattr(self, "_node_" + kind, None)
         if method is None:
             raise _Unsupported(f"node {kind} has no ArrowMetal translation")
+        self.eval_kid = kids[0] if len(kids) == 1 else None
         if kind not in ("DataFrameScan", "Scan") and any(k.plan is None for k in kids):
             # The node itself may be supported; it cannot move without its inputs. Check its own
             # expressions anyway so the report lists every reason at once.
@@ -568,7 +593,8 @@ class _Translator:
                                    "does not carry")
             cols[name] = _base(name, s.dtype, s.null_count() > 0)
         src = f"s{n}"
-        return _Sub({"op": "scan", "source": src}, cols, names, [(src, df, names)], df.height, False)
+        return _Sub({"op": "scan", "source": src}, cols, names, [(src, df, names)], df.height, False,
+                    exact=df.height)
 
     def _node_Scan(self, n, node, inputs, kids, check_only=False):
         """One local Parquet file, read on the GPU: Polars' projection becomes the reader's column
@@ -648,7 +674,8 @@ class _Translator:
                 plan, work = {"op": "filter", "input": plan, "predicate": pred.s}, True
                 if use_stats:
                     leaf = leaf.with_filters(self._stats_filters(node.predicate.node, cols))
-        return _Sub(plan, cols, names, [(src, leaf, names)], rows, work)
+        return _Sub(plan, cols, names, [(src, leaf, names)], rows, work,
+                    exact=0 if rows == 0 else (None if work else rows))
 
     # Comparisons the Parquet reader's statistics can judge the way Polars compares, so a row group
     # or page they rule out holds no row the predicate keeps. Floats: only `<`, `<=` and `==` against
@@ -716,7 +743,7 @@ class _Translator:
             raise _Unsupported(f"slice with a negative offset ({node.offset}) counts from the end")
         kid = kids[0]
         plan = {"op": "limit", "input": kid.plan, "count": int(node.len), "offset": int(node.offset)}
-        return kid.derive(plan=plan)
+        return kid.derive(plan=plan, exact=_sliced(kid.exact, node.offset, node.len))
 
     def _node_Filter(self, n, node, inputs, kids, check_only=False):
         kid = kids[0]
@@ -726,7 +753,8 @@ class _Translator:
             return kid.derive()
         if pred.code != "bool":
             raise _Unsupported("filter predicate is not boolean")
-        sub = kid.derive(plan={"op": "filter", "input": kid.plan, "predicate": pred.s}, work=True)
+        sub = kid.derive(plan={"op": "filter", "input": kid.plan, "predicate": pred.s}, work=True,
+                         exact=0 if kid.exact == 0 else None)
         if (kid.plan.get("op") == "scan" and len(kid.leaves) == 1 and _is_file(kid.leaves[0][1])
                 and kid.leaves[0][1].use_stats):
             # A filter straight over a file scan (Polars left it out of the scan's predicate): its
@@ -834,7 +862,7 @@ class _Translator:
         if slc is not None and stable:
             raise _Unsupported("sort(maintain_order=True) with a slice: top-k does not promise "
                                "stable ties")
-        hidden, by, helpers = [], [], False
+        hidden, by, helpers, leaves = [], [], False, None
         for name, nl, desc in zip(keys, nulls_last, descending):
             c = kid.cols.get(name)
             if c is None:
@@ -846,7 +874,12 @@ class _Translator:
                 # ArrowMetal puts nulls last in both directions; a validity key in front puts
                 # them first.
                 h = self._hidden("valid")
-                hidden.append([h, f"(is_valid {ref})"])
+                if _code(c.dtype) is None and c.dtype != pl.String:
+                    # A temporal column, which ArrowMetal's expressions do not read, not even for
+                    # its validity: the key comes from the scan instead (`_scan_validity`).
+                    leaves = self._scan_validity(kid, leaves or list(kid.leaves), ref, c.dtype, h)
+                else:
+                    hidden.append([h, f"(is_valid {ref})"])
                 helpers = True
                 by.append([h, False])
             if desc and _is_float(_code(c.dtype)):
@@ -864,15 +897,44 @@ class _Translator:
                 hidden.append([h, ref])
                 by.append([h, bool(desc)])
         plan, phys = kid.plan, list(kid.phys)
+        if leaves is not None:
+            phys += [h for _src, _df, names in leaves for h in names if h.startswith(_HIDDEN)
+                     and h not in phys]
         if hidden:
             plan = {"op": "with_columns", "input": plan, "exprs": hidden}
             phys += [h for h, _ in hidden]
         plan = {"op": "sort", "input": plan, "by": by}
+        exact = kid.exact
         if slc is not None:
             plan = {"op": "limit", "input": plan, "count": int(slc[1]), "offset": int(slc[0])}
-        return kid.derive(plan=plan, phys=phys, work=True,
-                          add_class="top_k" if slc is not None else
-                          ("sort_helper_keys" if helpers else "sort"))
+            exact = _sliced(exact, slc[0], slc[1])
+        sub = kid.derive(plan=plan, phys=phys, work=True, exact=exact,
+                         add_class="top_k" if slc is not None else
+                         ("sort_helper_keys" if helpers else "sort"))
+        if leaves is not None:
+            sub.leaves = leaves
+        return sub
+
+    def _scan_validity(self, kid, leaves, ref, dtype, h):
+        """Adds column `h`, the validity of the scan column behind `ref`, to the in-memory frame
+        that column comes from, so the plan carries it from the scan to the sort as a Boolean.
+        Taken only where every row of the subtree is a row of that one scan (no join, group-by,
+        aggregate or unique below the sort), which is what makes the scan's validity the key's."""
+        m = _COL_REF.fullmatch(ref)
+        if (m is None or _unq(m.group(1)) not in kid.phys
+                or kid.classes & {"join", "distinct", "group_by", "group_by_multi", "aggregate"}):
+            raise _Unsupported(f"sort with nulls first by a {dtype} column that is not a column of "
+                               "the scan (ArrowMetal's expressions do not read temporal columns)")
+        name = _unq(m.group(1))
+        hits = [i for i, (_s, _df, names) in enumerate(leaves) if name in names]
+        if len(hits) != 1:
+            raise _Unsupported(f"sort key column {name!r} is not in exactly one scan")
+        src, df, names = leaves[hits[0]]
+        if _is_file(df):
+            raise _Unsupported(f"sort with nulls first by {dtype} column {name!r} read from a Parquet "
+                               "file (the validity key is added to in-memory frames only)")
+        leaves[hits[0]] = (src, df.with_columns(pl.col(name).is_not_null().alias(h)), names + [h])
+        return leaves
 
     def _key_columns(self, input_id, exprs, cols, what):
         self.nt.set_node(input_id)
@@ -955,7 +1017,7 @@ class _Translator:
         cols = {name: _base(name, c.dtype, c.nullable) for name, c in kid.cols.items()}
         plan = {"op": "unique", "input": kid.final_plan(), "subset": subset}
         return _Sub(plan, cols, list(cols), kid.leaves, kid.rows, True, (),
-                    kid.classes | {"distinct"})
+                    kid.classes | {"distinct"}, exact=0 if kid.exact == 0 else None)
 
     # -- aggregation (GroupBy, and a Select whose every output is an aggregate)
 
@@ -1014,9 +1076,11 @@ class _Translator:
                 fix.append((name, got, want, "zero"))
             elif op == "mean":
                 s = arg.s
-                if arg.code in ("i64", "u64"):
+                if arg.code in ("i64", "u64", "f32"):
                     # ArrowMetal sums a 64-bit mean in 64-bit integers, which wraps on extreme
-                    # values; Polars averages in floating point.
+                    # values; Polars averages in floating point. A Float32 mean Polars accumulates
+                    # in Float64 and rounds once to Float32, where ArrowMetal's Float32 mean would
+                    # add in Float32.
                     s = f"(cast {s} f64)"
                 aggs.append(["mean", name, s])
                 fix.append((name, "f64", want, None))
@@ -1029,11 +1093,18 @@ class _Translator:
                     # Polars: min/max skip NaN, but a group of only NaN answers NaN. ArrowMetal
                     # answers null (whole frame) or an infinity (per group) there, so count the
                     # non-null and the non-NaN values and decide from the two.
-                    cnt, num = self._hidden("count"), self._hidden("count")
+                    # Polars also orders -0.0 below 0.0 here: a min over both zeros is -0.0 and a
+                    # max is 0.0, where ArrowMetal's answer depends on which zero it met first. A
+                    # third count, of the zeros of the sign Polars prefers, decides a zero result.
+                    cnt, num, zs = self._hidden("count"), self._hidden("count"), self._hidden("count")
                     x = arg.s
+                    x64 = x if arg.code == "f64" else f"(cast {x} f64)"
+                    sign = "lt" if op == "min" else "gt"
+                    zero = f"(and (eq {x64} (f64 0.0)) ({sign} (div (f64 1.0) {x64}) (f64 0.0)))"
                     aggs.append(["count", cnt, x])
                     aggs.append(["count", num, f"(if_else (ne {x} {x}) (null {arg.code}) {x})"])
-                    fix.append((name, arg.code, want, ("nan", cnt, num)))
+                    aggs.append(["count", zs, f"(if_else {zero} {x} (null {arg.code}))"])
+                    fix.append((name, arg.code, want, ("nan", cnt, num, zs, op)))
                 else:
                     fix.append((name, arg.code, want, None))
         if keys:
@@ -1058,7 +1129,11 @@ class _Translator:
                 s = f"(fill_null {s} ({got} 0))"
                 nullable = False
             elif isinstance(how, tuple):
-                cnt, num = f"(col {_q(how[1])})", f"(col {_q(how[2])})"
+                cnt, num, zs = (f"(col {_q(h)})" for h in how[1:4])
+                preferred, other = ("-0.0", "0.0") if how[4] == "min" else ("0.0", "-0.0")
+                s64 = s if got == "f64" else f"(cast {s} f64)"
+                s = (f"(if_else (eq {s64} (f64 0.0)) (if_else (gt {zs} (i64 0)) ({got} {preferred}) "
+                     f"({got} {other})) {s})")
                 s = (f"(if_else (gt {num} (i64 0)) {s} "
                      f"(if_else (gt {cnt} (i64 0)) ({got} nan) (null {got})))")
             elif how == "count":
@@ -1068,7 +1143,8 @@ class _Translator:
             cols[name] = _Col(_dtype_of(want), nullable, s)
         phys = keys + [a[1] for a in aggs]
         cls = "group_by_multi" if len(keys) > 1 else ("group_by" if keys else "aggregate")
-        return _Sub(plan, cols, phys, kid.leaves, kid.rows, True, (), kid.classes | {cls})
+        return _Sub(plan, cols, phys, kid.leaves, kid.rows, True, (), kid.classes | {cls},
+                    exact=None if keys else 1)
 
     # -- expressions
 
@@ -1212,34 +1288,32 @@ class _Translator:
             else:
                 l2, r2 = self._to(l, want), self._to(r, want)
             am = "div" if name == "TrueDivide" else _ARITH[name]
+            # Polars evaluates a column against a scalar one of two ways (polars-core's
+            # `arithmetic_helper`): over a column of one row the two sides have the same length and
+            # the operation is element-wise; over any other length the scalar is broadcast, and
+            # there a true division is a multiply by the reciprocal and a float multiply by -1 is a
+            # negation. `_row_dependent` emits the element-wise form, the broadcast form, or a
+            # choice between them made when the plan runs.
+            plain = self._arith_text(am, l2, r2, want)
             if name == "TrueDivide" and not r2.has_col:
-                # Polars divides by a scalar as a multiply by its reciprocal, `x * (1 / c)` in the
-                # result type, which is not always the correctly rounded `x / c`; the same product
-                # here gives Polars' bits. A scalar that is not a plain literal stays with Polars.
+                # Broadcast: `x * (1 / c)` with the reciprocal rounded in the result type, which is
+                # not always the correctly rounded `x / c`; the same product here gives Polars'
+                # bits. A scalar that is not a plain literal stays with Polars.
                 if not r2.is_lit:
                     raise _Unsupported("true division by a scalar expression")
                 if r2.lit is not None:
-                    am = "mul"
                     rec = _reciprocal(r2.lit, want)
-                    r2 = _E(_float_text(rec, "f64"), "f64", False, dtype=pl.Float64, lit=rec,
+                    r3 = _E(_float_text(rec, "f64"), "f64", False, dtype=pl.Float64, lit=rec,
                             is_lit=True, has_col=False)
-                    if want == "f64" and rec != -1.0:
-                        return _E(f"(mul {l2.s} {r2.s})", want, nullable, dtype=_dtype_of(want),
-                                  has_col=has_col)
+                    wide = (self._negation_text(l2, want) if rec == -1.0
+                            else self._arith_text("mul", l2, r3, want))
+                    return self._row_dependent(plain, wide, want, nullable, has_col)
             if am == "mul" and _is_float(want) and (_is_minus_one(l2) or _is_minus_one(r2)):
-                # Polars multiplies a float by a scalar -1 (either side, or divides by -1) as a
+                # Broadcast: a float multiplied by a scalar -1 (either side, or divided by -1) is a
                 # negation, which flips a NaN's sign bit where a multiply keeps the input NaN.
-                o64 = self._to(r2 if _is_minus_one(l2) else l2, "f64")
-                s = f"(negate {o64.s})" if want == "f64" else f"(cast (negate {o64.s}) f32)"
-                return _E(s, want, nullable, dtype=_dtype_of(want), has_col=has_col)
-            if want == "f32":
-                # The GPU's float ALUs flush subnormals to zero; Polars does not. Binary64 (software,
-                # correctly rounded) and one rounding back gives the correctly rounded Float32
-                # result for + - * / (53 >= 2 * 24 + 2 bits), subnormals included.
-                l64, r64 = self._to(l2, "f64"), self._to(r2, "f64")
-                return _E(f"(cast ({am} {l64.s} {r64.s}) f32)", want, nullable,
-                          dtype=_dtype_of(want), has_col=has_col)
-            return _E(f"({am} {l2.s} {r2.s})", want, nullable, dtype=_dtype_of(want), has_col=has_col)
+                wide = self._negation_text(r2 if _is_minus_one(l2) else l2, want)
+                return self._row_dependent(plain, wide, want, nullable, has_col)
+            return _E(plain, want, nullable, dtype=_dtype_of(want), has_col=has_col)
         if name in _CMP:
             return self._compare(name, l, r)
         if name in ("And", "LogicalAnd", "Or", "LogicalOr", "Xor"):
@@ -1253,6 +1327,39 @@ class _Translator:
                 return _E(f"({bop} {l.s} {r.s})", l.code, nullable, dtype=l.dtype, has_col=has_col)
             raise _Unsupported(f"{name} over {l.dtype} and {r.dtype}")
         raise _Unsupported(f"operator {name} has no ArrowMetal kernel")
+
+    def _arith_text(self, am, l2, r2, want):
+        """`l2 <am> r2` in `want`, element-wise."""
+        if want == "f32":
+            # The GPU's float ALUs flush subnormals to zero; Polars does not. Binary64 (software,
+            # correctly rounded) and one rounding back gives the correctly rounded Float32
+            # result for + - * / (53 >= 2 * 24 + 2 bits), subnormals included.
+            l64, r64 = self._to(l2, "f64"), self._to(r2, "f64")
+            return f"(cast ({am} {l64.s} {r64.s}) f32)"
+        return f"({am} {l2.s} {r2.s})"
+
+    def _negation_text(self, x, want):
+        o64 = self._to(x, "f64")
+        return f"(negate {o64.s})" if want == "f64" else f"(cast (negate {o64.s}) f32)"
+
+    def _row_dependent(self, plain, wide, want, nullable, has_col):
+        """The expression Polars computes over the input of the node being translated: `plain`
+        (element-wise) when that input holds exactly one row, `wide` (the broadcast scalar form)
+        otherwise. When the translation knows the row count (a scan, and what keeps or cuts it by a
+        known amount) it picks one; otherwise the plan carries both under a condition that
+        `_resolve_row_probes` fills in from a count of the input when the plan runs."""
+        if plain == wide:
+            return _E(plain, want, nullable, dtype=_dtype_of(want), has_col=has_col)
+        kid = self.eval_kid
+        if kid is not None and kid.exact is not None:
+            s = plain if kid.exact == 1 else wide
+        else:
+            if kid is None or kid.plan is None:
+                raise _Unsupported("a scalar division or -1 multiply whose input row count is unknown")
+            pid = len(self.probes)
+            self.probes.append(kid.plan)
+            s = f"(if_else (bool {_PROBE_TOKEN % pid}) {plain} {wide})"
+        return _E(s, want, nullable, dtype=_dtype_of(want), has_col=has_col)
 
     def _widen(self, x, code):
         """For true division: Polars divides in `code` (a float type) whatever the operands."""
@@ -1555,15 +1662,49 @@ def _leaf_sources(leaves, rows=None, scans=None):
             s = frame.get_column(c)
             a = s.to_arrow()
             # A multi-chunk column is concatenated by `to_arrow`, so its buffers are new every time.
-            if rows is None and s.n_chunks() == 1 and isinstance(a, pa.Array):
+            if rows is None and s.n_chunks() == 1 and isinstance(a, pa.Array) \
+                    and not c.startswith(_HIDDEN):     # a helper column is new on every query
                 a = _cache.import_(a)
             arrays.append(a)
         srcs[src] = _lazy._Source(names, arrays)
     return srcs
 
 
-def _run_plan(plan, leaves, rows=None, scans=None):
-    return _lazy.LazyFrame(plan, _leaf_sources(leaves, rows, scans)).collect()
+def _resolve_row_probes(plan, probes, srcs):
+    """`plan` with each open row-count condition decided: a probe's plan is counted (itself with its
+    own probes decided first) and the condition is whether it holds exactly one row."""
+    text = json.dumps(plan)
+    if _PROBE_RE.search(text) is None:
+        return plan
+    known = {}
+
+    def one_row(i):
+        if i not in known:
+            probe = json.loads(decide(json.dumps(probes[i])))
+            count = {"op": "aggregate", "input": probe, "aggs": [["count", "n", ""]]}
+            n = _lazy.LazyFrame(count, srcs).collect().column(0)[0].as_py()
+            known[i] = n == 1
+        return known[i]
+
+    def decide(t):
+        return _PROBE_RE.sub(lambda m: "true" if one_row(int(m.group(1))) else "false", t)
+
+    return json.loads(decide(text))
+
+
+def _run_plan(plan, leaves, rows=None, scans=None, probes=()):
+    srcs = _leaf_sources(leaves, rows, scans)
+    return _lazy.LazyFrame(_resolve_row_probes(plan, probes, srcs), srcs).collect()
+
+
+def _run_sub(sub, rows=None, scans=None):
+    # Passes only the arguments in use (a stand-in `_run_plan` in the tests takes fewer).
+    kw = {}
+    if scans is not None:
+        kw["scans"] = scans
+    if sub.probes:
+        kw["probes"] = sub.probes
+    return _run_plan(sub.plan, sub.leaves, rows, **kw)
 
 
 def _leaf_signature(src, df, names):
@@ -1612,7 +1753,7 @@ def _validate(sub, schema):
         return _validated[key]
     had_rows = all(_leaf_rows(df) > 0 for _src, df, _names in sub.leaves)
     try:
-        out = _to_polars(_run_plan(sub.plan, sub.leaves, _VALIDATION_ROWS))
+        out = _to_polars(_run_sub(sub, _VALIDATION_ROWS))
         _check_schema(out, schema, "the plan")
         verdict = None
     except ArrowMetalError as e:
@@ -1640,7 +1781,7 @@ def _run_subtree(sub, schema, entry, duration_since_start, with_columns, predica
     start = time.monotonic_ns()
     scans = []
     try:
-        table = _run_plan(sub.plan, sub.leaves, scans=scans)
+        table = _run_sub(sub, scans=scans)
     except ArrowMetalError as e:
         raise ArrowMetalError(f"ArrowMetal MetalEngine: the subtree at {entry['root']} failed on "
                               f"Metal: {e}\nplan: {entry['plan']}") from e
@@ -1738,6 +1879,7 @@ def execute_with_metal(nt, duration_since_start, *, config):
             schema = dict(nt.get_schema())
             sub.plan = sub.final_plan()
             sub.phys = list(sub.cols)
+            sub.probes = tr.probes if _PROBE_RE.search(json.dumps(sub.plan)) else []
             verdict = _validate(sub, schema)
             if verdict is None:
                 chosen.append((n, kind, sub, schema))

@@ -461,7 +461,7 @@ Read from the installed package and checked by `python/tests/test_polars_engine.
 | `Select` whose every output is an aggregate | `aggregate` | each output is one of the aggregates in the last row of the expression table |
 | `SimpleProjection` | no operator: a column list | always |
 | `Slice` | `limit` | offset >= 0 (`tail` counts from the end and stays with Polars) |
-| `Sort` | `sort`, with `limit` for a pushed-in slice | keys are columns, none of them String; no `maintain_order=True` together with a slice |
+| `Sort` | `sort`, with `limit` for a pushed-in slice | keys are columns of any carried dtype; no `maintain_order=True` together with a slice. A nullable temporal key sorted with nulls first (Polars' default) takes its validity key from the scan, so it is taken where every row below the sort is a row of one in-memory frame (no join, group-by, aggregate or `unique` below it) |
 | `GroupBy` | `group_by` | keys are non-float columns; `maintain_order=False`; not rolling or dynamic |
 | `Join` | `join` | inner, left, semi or anti; key columns of equal, non-float dtypes (String, multi-column and temporal keys included); `nulls_equal=False` (null keys never match, on both engines); `maintain_order="none"`; no pushed-in slice; the output names are the ones ArrowMetal's join gives (left columns, then right columns without a same-named key, the suffix on a collision), which covers Polars' coalescing defaults and `left_on`/`right_on` with different names |
 | `Distinct` (`unique`) | `unique` | `keep="first"` or `"any"` (ArrowMetal keeps each group's first row, a valid `"any"`); `maintain_order=False`; no float column in the subset |
@@ -489,7 +489,8 @@ and Object columns in a subtree's input keep the whole subtree on Polars.
 
 ### Where the answers would differ, and what the engine emits instead
 
-Each line is a differential case in `test_polars_engine.py`, run against Polars itself.
+Each line is a differential case in `test_polars_engine.py` or `test_engine_conformance.py`, run
+against Polars itself.
 
 * **Float comparisons.** Polars compares floats in a total order: NaN equals NaN and is greater than
   every number, and -0.0 equals 0.0. The engine adds the NaN terms (`(ne x x)` is "x is NaN") so the
@@ -504,11 +505,19 @@ Each line is a differential case in `test_polars_engine.py`, run against Polars 
   one ulp, in a share of rows that depends on the divisor (about a third of Float64 rows for `/ 3.0`,
   none for a power of two). The engine emits the same multiply, so the bits match Polars'
   (`test_true_division_by_a_literal_is_polars_reciprocal_multiply`, which also checks zero, infinite,
-  NaN, subnormal and null divisors). A column divisor is a true division in both.
+  NaN, subnormal and null divisors). A column divisor is a true division in both. Over a column of
+  **one row** Polars divides element-wise instead (the scalar and the column have the same length),
+  so there the answer is the correctly rounded `x / c`. The engine emits whichever of the two Polars
+  computes for the row count of the node's input: from the in-memory frame when nothing between it
+  and the division changes the row count by an unknown amount, and otherwise by counting that input
+  when the plan runs, both forms in the plan and the count choosing between them
+  (`test_scalar_division_and_minus_one_follow_polars_at_every_length`).
 * **Multiplying by -1.** Polars multiplies a float column by a scalar -1 (on either side, and divides
   by -1) as a negation, which flips a NaN's sign bit where a multiply keeps the input NaN. The engine
   emits ArrowMetal's `negate` there, so NaN rows carry Polars' bits too
-  (`test_multiply_by_minus_one_is_a_negation_like_polars`, which compares the raw bits).
+  (`test_multiply_by_minus_one_is_a_negation_like_polars`, which compares the raw bits). Over a
+  column of one row Polars multiplies, and the NaN keeps its sign; the engine chooses by the row
+  count as for a division.
 * **Aggregates.** A `sum` over no values is 0 in Polars (ArrowMetal: null) and gets a `fill_null`; a
   `min`/`max` over only NaN is NaN in Polars (ArrowMetal: null over a whole frame, an infinity per
   group), so the engine counts the non-null and non-NaN values and decides from the two; a `mean` of
@@ -517,7 +526,23 @@ Each line is a differential case in `test_polars_engine.py`, run against Polars 
   to Polars' dtype (UInt32 counts, the Int32 sum of an Int32 column, Float32 of a Float32, UInt32
   for the sum of a Boolean). A per-group `count` of a Float64 or Boolean column is the sum of its
   validity bits, because ArrowMetal's group-by will not read those values even to count them, and
-  `min`/`max` of a Float64 column per group stays with Polars for the same reason.
+  `min`/`max` of a Float64 column per group stays with Polars for the same reason. Polars' `min`
+  and `max` order -0.0 below 0.0, so a `min` over both zeros is -0.0 and a `max` 0.0; ArrowMetal
+  treats the two as equal and returns whichever it met first over a whole frame, and 0.0 per group.
+  The engine counts the zeros of the sign Polars prefers and takes the sign from that count
+  (`test_min_and_max_over_both_zeros_are_polars_signed_zeros`).
+* **Float sums and means.** The one place the answers differ, and the engine leaves it: a Float32
+  or Float64 `sum`, and a Float64 `mean`, add the same values in the GPU's order where Polars adds in
+  its own, so the two can differ in the last bits. Both are sums of the same values, so they differ
+  by at most twice the rounding bound of a sum, 2(n - 1) u sum(|x|) for a sum of n values and
+  2 u sum(|x|) for a mean (u the unit roundoff of the type the sum accumulates in: 2^-24 for a
+  Float32 sum, 2^-53 otherwise), and the engine conformance grid holds each such case to that bound.
+  In the run recorded in `Benchmarks/results/engine_conformance_2026-09-25.csv` the largest difference
+  was 0.216 u sum(|x|) for a Float32 sum (2.81e-5 of the answer) and 0.372 u sum(|x|) for a
+  Float64 sum or mean (8.96e-14 of the answer). A `mean` of an integer or Float32 column is
+  accumulated in Float64 by both (the engine casts the column, as Polars does) and matched bit for
+  bit; every other output of the grid is compared bit for bit. `test_polars_engine.py` compares these
+  aggregates to a relative tolerance.
 * **Sort order.** ArrowMetal puts nulls last in both directions and a NaN after the numbers in a
   descending sort; Polars' default is nulls first and NaN above every number. The engine adds a
   validity key or a NaN key in front where it needs one.
@@ -545,6 +570,11 @@ declined):
 5. **A finite float literal of magnitude 2^63 or more** trapped the process inside the expression
    compiler, which converted every float literal to Int64 as well. The engine now runs those plans
    on Metal (`test_a_float_literal_of_magnitude_2_63_or_more_runs_on_metal`).
+6. **A UInt64 literal above 2^63 - 1** (found by the conformance grid below, not worked around first: `is_in`, a comparison or `fill_null` against a large
+   unsigned value) was rejected by the expression parser, which read every integer literal as an
+   Int64, and the plan stayed with Polars. The parser now keeps such a literal as its bit pattern,
+   the way the code generator writes unsigned literals (`test_a_u64_literal_above_int64_max_reaches_the_gpu`,
+   and `testWideUnsignedLiteralsParsePrintAndStayUnfolded` in Swift).
 
 ### Which translatable subtrees it runs: the defaults
 
@@ -757,6 +787,21 @@ the reader was given and the row groups it skipped, including NaN under `>`, `>=
 apache/arrow#51491 shape, also on the `pageindexnan__pa_constpage` fixture); every fallback reason
 above; the open-file cache's reuse, invalidation and bounds; and footer null counts, including a file
 whose statistics deny its nulls.
+
+**The conformance grid.** `python/tests/engine_polars_grid.py` generates the cases instead of
+choosing them: every shape the engine translates (filters, `select` and `with_columns` expressions,
+`slice`, sorts in both directions with nulls at both ends and over two keys, top-k, group-by with
+each aggregate with the column as the key and as the value, whole-frame aggregates, the four join
+kinds, `unique`) over every dtype it carries (the eight integer widths, Float32, Float64, Boolean,
+String, Date, Datetime in ms, us and ns and with a time zone, Duration in ms, us and ns, Time), with
+no, 5%, 70% or all nulls, at 0, 1, 7, 1,000 and 100,000 rows, plus the special values (integer
+extremes, NaN, infinities, subnormals, -0.0). Each case collects through
+`MetalEngine(shapes="all", min_rows=0)` and through Polars and compares the frames bit for bit.
+In the run recorded in `Benchmarks/results/engine_conformance_2026-09-25.csv`: 12,597 cases,
+12,392 identical on Metal, 32 within the float-summation bound above, none different
+otherwise, and 173 where Polars' optimised plan had nothing to run (all of them sorts over 0 or 1
+row, which Polars leaves out). `python/tests/engine_report.py --engine polars` reruns it and prints the
+per-shape table.
 
 ### To verify on your own machine
 

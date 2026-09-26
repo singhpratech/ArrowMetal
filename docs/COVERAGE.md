@@ -504,6 +504,51 @@ outright.
 | arrow-swift and MLX bridges, DuckDB/DataFusion UDF | **Planned** | Not implemented. |
 | DuckDB: aggregates of unchanged SQL on the GPU | **In 0.2.0, built from source** | `duckdb-extension/src/arrowmetal_rewrite.cpp`, a C++ optimizer extension for DuckDB 1.5.5 (the C extension API has no optimizer hook): `sum`/`avg` over integer columns, `min`/`max` over integer, `DATE` and `TIMESTAMP` columns, `count`, with no key or one integer, `DATE`, `TIMESTAMP` or `VARCHAR` key, over projections and filters of a table scan, replaced by `ARROWMETAL_AGGREGATE` with DuckDB's exact answers (`HUGEINT` sums, `avg` arithmetic, NULL groups). Floating-point `sum`/`avg`/`min`/`max`, `DECIMAL`, `DISTINCT`, several keys and joins below the aggregate stay DuckDB's. `SET arrowmetal_rewrite = 'auto' / 'off' / 'force'`; `arrowmetal_rewrites()` logs every decision. [DUCKDB.md](DUCKDB.md) §4b. |
 
+## Engines
+
+The rows above are checked against `pyarrow.compute`. The two engines built on them are checked
+against their own hosts: `python/tests/engine_report.py` runs a generated grid through each engine and
+through the host's CPU engine and compares the answers bit for bit. Every difference is either a
+documented divergence, with the line of the docs that states it, or unclassified, and the script exits
+1 on an unclassified one. A case the engine did not run itself (Polars' plan had nothing to run, or
+the DuckDB extension left the aggregate to DuckDB) is compared as well and counted as not taken.
+
+| Engine | Against | Cases | Pass | Documented | Unclassified | Not taken |
+|---|---|---:|---:|---:|---:|---:|
+| Polars `MetalEngine(shapes="all", min_rows=0)` | `lf.collect()`, polars 1.44.1 | 12,597 | 12,392 | 32 | 0 | 173 |
+| DuckDB optimizer extension, `arrowmetal_rewrite = 'force'` | `'off'`, DuckDB 1.5.5 | 33,376 | 21,844 | 0 | 0 | 11,532 |
+
+From `Benchmarks/results/engine_conformance_2026-09-25.csv`; one row per shape is in
+`Benchmarks/results/engine_conformance_2026-09-25_shapes.csv`.
+
+* **Polars** — every shape the engine translates (filter, `select` and `with_columns` expressions,
+  `slice`, sort with and without a limit, group-by with each aggregate over the column as key and as
+  value, whole-frame aggregates, inner, left, semi and anti joins, `unique`) over the eight integer
+  widths, Float32, Float64, Boolean, String, Date, Datetime (ms, us, ns and with a time zone), Duration
+  (ms, us, ns) and Time, with no, 5%, 70% or all nulls, at 0, 1, 7, 1,000 and 100,000 rows, plus
+  special values. By family: filter 1,112 cases, `select` 1,526, `with_columns` 397, `slice` 397, sort
+  1,985 (105 not taken), sort with a limit 794 (68 not taken), group-by 3,172 (18 documented),
+  whole-frame aggregate 1,084 (14 documented), join 1,420, `unique` 710. The 173 not taken are sorts
+  over 0 or 1 row, which Polars' optimised plan leaves out.
+* **DuckDB** — `sum`, `avg`, `min`, `max`, `count(v)`, `count(*)`, all of them together and a
+  `GROUP BY` without aggregates, over the ten value types the extension rewrites and six it leaves to
+  DuckDB, with no key or one key of each kind it takes, no filter or one of two, the same null
+  patterns and sizes (the 100,000-row table also in 2,048-row blocks), plus integer extremes. Without
+  a key 6,394 cases (3,838 not taken), with one 26,982 (7,694 not taken). Of the 11,532 not taken,
+  1,746 are ungrouped queries of counts only, 1,030 filters DuckDB's statistics prove empty, and the
+  rest aggregates over types or casts the extension does not take ([DUCKDB.md](DUCKDB.md) §4b, "What
+  is rewritten").
+
+Documented divergences found by the grid:
+
+* **Float sums and means add in another order** (Polars, 32 cases: Float32 and Float64 `sum`, Float64
+  `mean`). The largest difference was 0.216 u·Σ|x| for a Float32 sum (2.81e-5 of the answer) and 0.372
+  u·Σ|x| for Float64 (8.96e-14 of the answer), against a bound of 2(n - 1) u·Σ|x|; stated in
+  [POLARS.md](POLARS.md), Tier 4, "Where the answers would differ", **Float sums and means**.
+
+The DuckDB half has none: every rewritten query returned DuckDB's types and values bit for bit, `avg`
+included.
+
 ## What ArrowMetal 0.2.0 claims, and what it does not
 
 **The claim.** ArrowMetal 0.2.0 answers to **all 307 of the Apache Arrow v25 compute function names** —
