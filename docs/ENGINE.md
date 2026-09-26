@@ -341,6 +341,12 @@ caller already holds) and the plan text carries no data, so the same text can be
 sources and `am_plan_explain` can print a plan without touching the GPU. `include/arrowmetal.h` carries
 the same grammar for C consumers.
 
+Polars' `MetalEngine` ([POLARS.md](POLARS.md), "Tier 4") writes this grammar from Polars' optimised
+plans. Which plans it can write, per plan shape, input dtype and null pattern, with the reason for
+each one it leaves to Polars, is [ENGINE_CAPABILITIES.md](ENGINE_CAPABILITIES.md), generated from runs
+of the engine by `python/tests/engine_capabilities.py` and checked against a fresh run by
+`test_polars_engine.py`; which Polars entry points reach it is POLARS.md, "Collect paths".
+
 ## Numbers
 
 M4 Max, 50 M rows, best of 5, in process, against Polars 1.44.1 lazy (16 threads) and DuckDB 1.5.5

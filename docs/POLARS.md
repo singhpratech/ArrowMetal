@@ -55,7 +55,7 @@ Per tier:
 | 1. Bridge and namespaces | any `polars>=1.0` (pure Python over the Arrow C Data Interface) |
 | 3. Streaming hand-off | any `polars>=1.0` (pure Python over the Arrow C Data Interface) |
 | 2. Expression plugin | 1.44.x: the plugin is built on the polars 0.55 crates, and Polars refuses a plugin built for another minor's ABI (Version pinning, below) |
-| 4. `MetalEngine` | tested on 1.44.1 (the full suite, `TESTED_POLARS`) and 1.44.2 (`scripts/check_wheel.sh`); it walks Polars' unstable IR, checked against `TESTED_IR_VERSION` (14, 7) |
+| 4. `MetalEngine` | tested on 1.44.1 and 1.44.2 (`TESTED_POLARS`: the full engine suite passes and the capability table is the same on both; 1.44.2 also by `scripts/check_wheel.sh`); it walks Polars' unstable IR, checked against `TESTED_IR_VERSION` (14, 7). `python -m arrowmetal.polars_engine check` reports the installed Polars against these |
 
 A Polars outside 1.44 installed without the extra keeps tiers 1 and 3.
 
@@ -437,20 +437,63 @@ Read from the installed package and checked by `python/tests/test_polars_engine.
   the one `get_schema()` promised raises `ArrowMetalError` inside the query.
 * An exception from the callback reaches the user as
   `ComputeError: 'cuda' conversion failed: <Type>: <message>`; the `'cuda'` is hardcoded in Polars.
-  The engine's own messages start with `ArrowMetal MetalEngine:` so they read correctly inside it.
+  The engine's own messages start with `ArrowMetal MetalEngine:` so they read correctly inside it,
+  name the node (`Sort#3`) and the reason, and end with the way to run the plan on Polars instead
+  (`FORCE_POLARS`: collect without `engine=`, or set `ARROWMETAL_METAL_ENGINE=off`).
 * `LazyFrame.profile(engine=...)` passes the callback only for a `GPUEngine`, so
   `lf.profile(engine=MetalEngine())` profiles plain Polars. `engine.profile(lf)` passes the callback
   through `profile`'s own keyword, and each replaced subtree appears as a `metal:<Node>#<id>` row.
-* `collect_async` and `collect(background=True)` never run the callback; Polars runs the plan
-  (background collection warns, as `GPUEngine` does). The `sink_*` family and `collect_batches` do
-  run it, and Polars' streaming sink then panics on a replaced subtree ("entered unreachable code"),
-  so the engine leaves any plan with a `Sink` node to Polars whole.
+* Only `collect` and the paths built on it run the callback; the next section lists every path and
+  what the engine does on it.
 * The IR version the engine was written against, `(14, 7)`, is pinned by a test, as is every Polars
   surface it touches (`_LocalEngine`, `_post_opt_callback`, the `NodeTraverser` methods, the node
   classes), so a Polars upgrade that moves one fails a named test instead of changing an answer.
-  A different IR major makes the engine leave the whole plan to Polars.
+  A different IR major makes the engine leave the whole plan to Polars. So does a node kind outside
+  `KNOWN_NODE_KINDS` (the 20 node classes of polars 1.44.1) or a node Polars fails to show to the
+  engine: the report line is `The plan holds an unknown node <kind> in polars <version>, so the
+  whole plan stays with Polars.`, and the query is not an error.
+* `ARROWMETAL_METAL_ENGINE=off` (or `0`, `false`, `no`, `polars`) makes every `MetalEngine` leave every
+  plan to Polars, `raise_on_fail=True` included; the report says so.
+
+### Collect paths
+
+What each Polars 1.44.1 entry point does with a `MetalEngine` (`eng` below), read from the installed
+package and checked by `test_every_collect_path_is_explicit` and
+`test_polars_side_entry_points_that_never_call_the_engine`. `last_report.path` names the path; a
+path on which the whole plan runs on Polars says why in `last_report.fallbacks` and issues a
+`MetalEngineFallbackWarning` (a `UserWarning`) once per process.
+
+| Entry point | Runs on | `last_report.path` | Warning |
+|---|---|---|---|
+| `lf.collect(engine=eng)` | Metal, the subtrees the engine takes | `collect` | -- |
+| `lf.head(n).collect(engine=eng)`, and `lf.fetch(n, engine=eng)` (deprecated; it is `head(n).collect`) | Metal | `collect` | -- |
+| `lf.collect()` or `df.lazy().collect()` under `pl.Config(engine_affinity=eng)` or `pl.Config.set_engine_affinity(eng)` | Metal | `collect` | -- |
+| `lf.collect(engine=eng)` inside any other `pl.Config` context (`tbl_rows`, `engine_affinity="streaming"`, ...) | Metal | `collect` | -- |
+| `pl.collect_all(lfs, engine=eng)` | Metal, frame by frame: each frame is optimised and collected on its own, where Polars' `collect_all` optimises the frames together | `collect_all`; `last_reports` holds one report per frame | -- |
+| `eng.profile(lf)` | Metal, with a `metal:<Node>#<id>` row per replaced subtree | `profile` | -- (Polars' own `DeprecationWarning` for `profile`) |
+| `eng.explain(lf)` | nothing runs: Polars' optimised plan followed by the report of what would run on Metal (each subtree it would take is still checked over a 64-row prefix) | `explain` | -- |
+| `lf.collect_async(engine=eng)` | Polars' in-memory engine: Polars passes no engine callback on this path | `collect_async` | once |
+| `pl.collect_all_async(lfs, engine=eng)` | Polars' in-memory engine, for the same reason | `collect_all_async` | once |
+| `lf.collect_batches(engine=eng)` | Polars, for the same reason | `collect_batches` | once |
+| `lf.collect(engine=eng, background=True)` | Polars' in-memory engine (background collection is not supported, as for `GPUEngine`) | `background` | once |
+| `lf.sink_parquet`, `sink_ipc`, `sink_csv`, `sink_ndjson`, `sink_batches` with `engine=eng`, and a `lazy=True` sink collected through `eng` | Polars: its streaming sink panics on a replaced subtree ("entered unreachable code"), so a plan with a `Sink` node stays whole | `sink` | once |
+| `lf.explain(engine=eng)` | nothing runs: Polars' plan, the same text as `lf.explain()`; Polars reads only `eng.plan_engine` | not written | none: Polars does not call the engine |
+| `lf.profile(engine=eng)` | Polars: polars 1.44.1 passes the callback only to a `GPUEngine` | not written | none: Polars does not call the engine |
+| Eager `DataFrame` methods (`df.sort`, `df.group_by(...).agg`, ...) under an engine affinity of `eng` | Polars' in-memory engine, which Polars uses for every eager operation | not written | none: Polars does not call the engine |
+| `lf.collect(engine="in-memory")` (or `"streaming"`) under an engine affinity of `eng` | Polars: an explicit engine name wins over the affinity | not written | none: Polars does not call the engine |
+
+`collect(background=False)` with Polars' eager optimisation flag set asks for no callback either;
+the report says `eager` and there is no warning, as for `GPUEngine`. For code that cannot change
+its `collect` calls, `ARROWMETAL_METAL_ENGINE=off` sends every path to Polars.
 
 ### What it translates
+
+[ENGINE_CAPABILITIES.md](ENGINE_CAPABILITIES.md) is the same boundary measured: 29 plan shapes
+(filters, projections, `with_columns`, `slice`, sorts, top-k, group-by with `x` as the key and as the
+value of each aggregate, whole-frame aggregates, the four joins, `unique`, and Parquet scans) over 29
+input dtypes and three null patterns, each run through the engine and marked `Metal` or `Polars`
+with the engine's reason. It is generated by `python/tests/engine_capabilities.py`, and
+`test_the_capability_table_is_current` fails when the committed file differs from a fresh run.
 
 | Polars node | ArrowMetal | Taken when |
 |---|---|---|
@@ -740,15 +783,17 @@ cold and warm, and the filter, group-by and aggregate cases are behind cold.
 ### The report
 
 ```
-MetalEngine report (polars 1.44.1, IR (14, 7))
+MetalEngine report for collect (polars 1.44.1, IR (14, 7))
   metal:  Sort#3 [Sort > HStack > Filter > DataFrameScan] over 10,000,000 rows, ran in <t> ms -> <n> rows
-  polars: Select#1: function rank has no ArrowMetal translation
+  polars: Select#1: Function rank has no ArrowMetal translation.
 ```
 
 `engine.last_report` is a `MetalPlanReport`: `taken` (one entry per subtree that ran on Metal: the
 node at its top, the node kinds inside it, the rows it read, the ArrowMetal plan text, and after the
 run its wall time and output rows), `fallbacks` (one `Kind#id: reason` line per node that stayed
-with Polars for a reason of its own), `walked` (every node of the optimised plan) and `nodes`. With
+with Polars for a reason of its own; every reason is a full sentence, which
+`test_every_unsupported_reason_is_a_full_sentence` checks), `walked` (every node of the optimised
+plan), `nodes`, and `path` (the collect path it is for, "Collect paths" above). With
 `POLARS_VERBOSE=1` the fallback lines are also issued as a `PerformanceWarning`. The report belongs to
 the engine object, so two threads collecting through one `MetalEngine` overwrite each other's.
 
@@ -775,6 +820,20 @@ shapes), suffix collisions, different key names, a join inside a filter-join-agg
 checks the result is still Polars' and the report names the reason. One case reruns
 `test_polars.py` and `test_lazy.py` with every `LazyFrame.collect()` also collected through the engine
 (`python/tests/metal_engine_everywhere.py`) and requires the two to agree.
+
+`test_every_collect_path_is_explicit` runs every row of the collect-path table and checks where the
+plan ran, the report's `path` and reason, and that the warning comes once.
+`test_the_capability_table_is_current` regenerates [ENGINE_CAPABILITIES.md](ENGINE_CAPABILITIES.md)
+and compares it with the committed file; no cell of it may be a Metal answer that differs from
+Polars' or an engine exception. `test_an_unknown_node_kind_keeps_the_whole_plan_on_polars` and
+`test_a_node_polars_cannot_describe_keeps_the_whole_plan_on_polars` check the fail-closed walk, and
+`test_the_check_command_prints_versions_and_the_capability_header` the command below.
+
+`python -m arrowmetal.polars_engine check` prints the installed Polars version and whether it is one
+of `TESTED_POLARS`, the IR version against `TESTED_IR_VERSION`, whether the callback API is present,
+the IR node kinds of this Polars the engine does not know, whether `ARROWMETAL_METAL_ENGINE` is set,
+and the header of the capability table (in a source checkout). It exits 1 when the callback API is
+missing or the IR major differs, since then every plan stays with Polars.
 
 The Parquet scan cases (212 tests) run fourteen scan shapes -- filters over every numeric dtype,
 Polars' float total order, `!=`, String predicates, projections, group-by on one and two keys,
@@ -815,7 +874,8 @@ per-shape table.
    `PerformanceWarning` listing it.
 4. `am.zero_copy_report(df["v"])` on a single-chunk numeric column of a million rows says the two
    addresses are the same.
-5. `out, timings = engine.profile(lf)` shows a `metal:` row.
+5. `out, timings = engine.profile(lf)` shows a `metal:` row, and
+   `PYTHONPATH=python python -m arrowmetal.polars_engine check` prints the versions it was tested with.
 6. Run `PYTHONPATH=python python Benchmarks/polars_engine_bench.py --sizes 1000000,10000000,50000000
    --out a.csv` twice on a quiet machine, compare the two files, and read the `taken` column of the
    eight engine_bench shapes against the defaults above.
