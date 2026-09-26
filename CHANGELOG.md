@@ -136,6 +136,32 @@
   a subtree failing on Metal, a result schema that is not Polars') name the node and the reason and
   end with how to run the plan on Polars instead. `ARROWMETAL_METAL_ENGINE=off` makes every
   `MetalEngine` leave every plan to Polars.
+- Strings in the view layout: the C Data import takes `utf8_view` / `binary_view` (`vu` / `vz`) and
+  keeps the 16-byte views and the variadic data buffers as Metal shared buffers, without a copy at any
+  alignment for the views and data buffers (`MetalArrowBuffer.wrapCovering`); export hands a view
+  column back as `vu` / `vz`. The string kernels are written once against a row accessor and
+  instantiated per layout: lengths, `hash32`, the four pattern predicates, `str_eq` (scalar and
+  array), `is_in` / `index_in`, the gather behind `filter` / `take`, `slice`, the sort keys, the string
+  hash table (group-by keys, `dictionary_encode`, `unique`, `value_counts`), the Unicode and ASCII case
+  transforms, the trims, `replace`, `repeat`, `slice_codeunits`, the pads, `str_reverse`,
+  `count_substring` / `find_substring`, the `ascii_is_*` / `utf8_is_*` predicates, `utf8_center`,
+  `utf8_replace_slice`, the fused expression kernels, concatenation of view columns and the host-side
+  row passes. The rest (`str_concat`, the splits, `match_like`, `strptime`, the byte-counting pads,
+  `utf8_zero_fill`, the byte slices and reversals, casts from strings, the file writers) convert the
+  column to offsets + bytes once, on the GPU, and keep it (docs/DESIGN.md, "Strings in two layouts").
+  C: `am_string_layout`, `am_string_view_info`, `am_string_view_conversions`; Python:
+  `MetalArray.string_layout`, `MetalArray.string_view_import()`, `am.string_view_conversions()`,
+  `am.STRING_VIEW_KERNELS`, `am.STRING_VIEW_CONVERTS`; `ARROWMETAL_TRACE_VIEW_CONVERSION=1` prints the
+  call stack of each conversion. Swift: `StringViewTests` (8 tests).
+- Polars: `from_polars`, the `.arrowmetal` namespaces and `MetalEngine` hand String and Binary columns
+  over in Polars' own `Utf8View` layout; `from_polars(..., string_layout="offsets")`,
+  `polars_bridge.DEFAULT_STRING_LAYOUT` and `polars_engine.STRING_LAYOUT` select the `large_string`
+  path. The tier-2 plugin is unchanged.
+- Differential matrix: every utf8 operation also runs with the values imported as `utf8_view` (the
+  oracle stays on utf8): 40,824 cases over 46 column types, 0 unclassified; the 1,755 `utf8_view`
+  cases give the same pass, fail and skip counts as their utf8 cells. `engine_report.py` takes
+  `--dtypes` and `--string-layout`; the Polars grid's 459 String cases pass with 0 unclassified on
+  both layouts, with no view column converted.
 
 ## 0.2.0
 Everything below is new in 0.2.0.

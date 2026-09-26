@@ -149,6 +149,11 @@ public func importArrowArray(schema: UnsafePointer<ArrowSchema>, array: UnsafeMu
     }
     // The schema decides whether an array is dictionary-encoded; the indices are imported inside.
     if schema.pointee.dictionary != nil { return try importDictionaryArray(schema: schema, array: array, context: context) }
+    // utf8_view / binary_view: kept as views, read by the string kernels directly (`StringView.swift`).
+    if fmt == "vu" || fmt == "vz" {
+        guard array.pointee.n_children == 0 else { throw ArrowMetalError.invalidArrowArray("\(fmt) array with children") }
+        return try importStringViewArray(binary: fmt == "vz", array: array, context: context)
+    }
     // null, float16, decimal32/64, interval, fixed_size_binary and the list views (`TypesExtra.swift`).
     if let r = try importExtraFormats(format: fmt, schema: schema, array: array, context: context) { return r }
     // Nested types (list, large_list, fixed_size_list, struct, map, union) recurse through this function.
@@ -438,28 +443,40 @@ extension MetalBooleanArray {
     }
 }
 
+/// Fills a flat variable-length `ArrowArray` (utf8, binary and their view forms) from its buffers.
+func fillExportedStringArray(length: Int, nullCount: Int, keeps: [AnyObject], bufferPtrs: [UnsafeRawPointer?],
+                             into out: UnsafeMutablePointer<ArrowArray>) {
+    let holder = ExportHolder(keep: keeps, bufferPtrs: bufferPtrs, format: nil, name: nil)
+    out.pointee.length = Int64(length)
+    out.pointee.null_count = Int64(nullCount)
+    out.pointee.offset = 0
+    out.pointee.n_buffers = Int64(bufferPtrs.count)
+    out.pointee.n_children = 0
+    out.pointee.buffers = UnsafeMutablePointer<UnsafeRawPointer?>(holder.buffers)
+    out.pointee.children = nil
+    out.pointee.dictionary = nil
+    out.pointee.release = releaseExportedArray
+    out.pointee.private_data = Unmanaged.passRetained(holder).toOpaque()
+}
+
 extension MetalStringArray {
+    /// Exports as `utf8` / `binary`, or as `utf8_view` / `binary_view` (the column's own views and data
+    /// buffers, nothing copied) when the column was imported in the view layout.
     public func exportArrowArray(into out: UnsafeMutablePointer<ArrowArray>) {
+        if let v = view { return exportViewArray(v, into: out) }
         var keeps: [AnyObject] = [self, offsets, data]
         if let v = validity { keeps.append(v) }
-        let holder = ExportHolder(keep: keeps, bufferPtrs: [validity?.contents, offsets.contents, data.contents], format: nil, name: nil)
-        out.pointee.length = Int64(length)
-        out.pointee.null_count = Int64(nullCount)
-        out.pointee.offset = 0
-        out.pointee.n_buffers = 3
-        out.pointee.n_children = 0
-        out.pointee.buffers = UnsafeMutablePointer<UnsafeRawPointer?>(holder.buffers)
-        out.pointee.children = nil
-        out.pointee.dictionary = nil
-        out.pointee.release = releaseExportedArray
-        out.pointee.private_data = Unmanaged.passRetained(holder).toOpaque()
+        fillExportedStringArray(length: length, nullCount: nullCount, keeps: keeps,
+                                bufferPtrs: [validity?.contents, offsets.contents, data.contents], into: out)
     }
+    /// The C Data format this column exports with: "u"/"z", or "vu"/"vz" for a view column.
+    public var exportFormat: String { view == nil ? (isBinary ? "z" : "u") : (isBinary ? "vz" : "vu") }
     public func exportArrowDeviceArray(into out: UnsafeMutablePointer<ArrowDeviceArray>) {
         withUnsafeMutablePointer(to: &out.pointee.array) { exportArrowArray(into: $0) }
         fillDevice(out)
     }
     public func exportArrowSchema(name: String = "", into out: UnsafeMutablePointer<ArrowSchema>) {
-        ArrowMetal.exportArrowSchema(format: isBinary ? "z" : "u", name: name, into: out)
+        ArrowMetal.exportArrowSchema(format: exportFormat, name: name, into: out)
     }
 }
 
@@ -514,6 +531,10 @@ extension AnyMetalArray {
         case .map(let a): return a.exportArrowSchema(name: name, into: out)
         case .union(let a): return a.exportArrowSchema(name: name, into: out)
         case .runEndEncoded(_, let values): return exportRunEndSchema(values: values, name: name, into: out)
+        case .string(let a) where a.view != nil:
+            return ArrowMetal.exportArrowSchema(format: "vu", name: name, into: out)
+        case .binary(let a) where a.view != nil:
+            return ArrowMetal.exportArrowSchema(format: "vz", name: name, into: out)
         default: break
         }
         ArrowMetal.exportArrowSchema(format: arrowFormat, name: name, into: out)

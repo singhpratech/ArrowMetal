@@ -55,11 +55,10 @@ extension MetalStringArray {
         memset(table.mutableContents, 0xFF, slots * 4)
         let keys = try set.lookupKeys()
         let vb = set.validity ?? table
-        let pso = try set.containmentPipeline("sx_hash_insert")
+        let pso = try set.containmentPipeline(kernelName("sx_hash_insert", set))
         try ctx.run { enc in
             enc.setComputePipelineState(pso)
-            enc.setBuffer(set.offsets.mtl, offset: set.offsets.offset, index: 0)
-            enc.setBuffer(set.data.mtl, offset: set.data.offset, index: 1)
+            set.bindLayout(enc, at: 0)
             enc.setBuffer(keys.values.mtl, offset: keys.values.offset, index: 2)
             enc.setBuffer(vb.mtl, offset: vb.offset, index: 3)
             Dispatch.setLength(enc, set.length, nil, index: 4)
@@ -83,15 +82,13 @@ extension MetalStringArray {
         if n > 0, let lookup = try Self.buildLookup(set) {
             let keys = try lookupKeys()
             let vb = validity ?? out
-            let pso = try containmentPipeline("sx_is_in")
+            let pso = try containmentPipeline(Self.kernelName("sx_is_in", self, lookup.set))
             try ctx.run { enc in
                 enc.setComputePipelineState(pso)
-                enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-                enc.setBuffer(data.mtl, offset: data.offset, index: 1)
+                bindLayout(enc, at: 0)
                 enc.setBuffer(keys.values.mtl, offset: keys.values.offset, index: 2)
                 enc.setBuffer(vb.mtl, offset: vb.offset, index: 3)
-                enc.setBuffer(lookup.set.offsets.mtl, offset: lookup.set.offsets.offset, index: 4)
-                enc.setBuffer(lookup.set.data.mtl, offset: lookup.set.data.offset, index: 5)
+                lookup.set.bindLayout(enc, at: 4)
                 enc.setBuffer(lookup.table.mtl, offset: lookup.table.offset, index: 6)
                 Dispatch.setLength(enc, n, nil, index: 7)
                 Dispatch.setUInt(enc, lookup.mask, index: 8)
@@ -119,15 +116,13 @@ extension MetalStringArray {
         if n > 0, let lookup = try Self.buildLookup(set) {
             let keys = try lookupKeys()
             let vb = validity ?? validBytes
-            let pso = try containmentPipeline("sx_index_in")
+            let pso = try containmentPipeline(Self.kernelName("sx_index_in", self, lookup.set))
             try ctx.run { enc in
                 enc.setComputePipelineState(pso)
-                enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-                enc.setBuffer(data.mtl, offset: data.offset, index: 1)
+                bindLayout(enc, at: 0)
                 enc.setBuffer(keys.values.mtl, offset: keys.values.offset, index: 2)
                 enc.setBuffer(vb.mtl, offset: vb.offset, index: 3)
-                enc.setBuffer(lookup.set.offsets.mtl, offset: lookup.set.offsets.offset, index: 4)
-                enc.setBuffer(lookup.set.data.mtl, offset: lookup.set.data.offset, index: 5)
+                lookup.set.bindLayout(enc, at: 4)
                 enc.setBuffer(lookup.table.mtl, offset: lookup.table.offset, index: 6)
                 Dispatch.setLength(enc, n, nil, index: 7)
                 Dispatch.setUInt(enc, lookup.mask, index: 8)

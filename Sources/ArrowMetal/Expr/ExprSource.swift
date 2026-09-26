@@ -12,6 +12,8 @@ import Foundation
 struct ExprColumnInfo {
     var type: ExprType
     var nullable: Bool
+    /// A utf8 column held as `utf8_view` views (`StringView.swift`): bound as views + buffer table.
+    var view: Bool = false
 }
 
 /// A value plus its validity, as MSL expressions.
@@ -38,6 +40,8 @@ final class ExprEmitter {
         var type: ExprType
         var nullable: Bool
         var index: Int
+        /// A utf8 leaf in the view layout: `LO` is the views and `LD` the data buffer table.
+        var view: Bool = false
     }
 
     let schema: [String: ExprColumnInfo]
@@ -223,7 +227,8 @@ final class ExprEmitter {
     private func leaf(_ name: String) throws -> Leaf {
         if let i = leafByName[name] { return leaves[i] }
         guard let c = schema[name] else { throw ExprError.invalid("no column named \"\(name)\"") }
-        let l = Leaf(name: name, type: c.type, nullable: c.nullable, index: leaves.count)
+        let l = Leaf(name: name, type: c.type, nullable: c.nullable, index: leaves.count,
+                     view: c.type == .utf8 && c.view)
         leafByName[name] = leaves.count
         leaves.append(l)
         return l
@@ -600,7 +605,12 @@ final class ExprEmitter {
                        outputCount: Int) -> String {
         var args: [String] = []
         for l in leaves {
-            if l.type == .utf8 {
+            if l.type == .utf8 && l.view {
+                // Row i's bytes through the view accessor: (pointer, 0, length).
+                args.append("am_svp(LO\(l.index), LD\(l.index), i)")
+                args.append("0")
+                args.append("am_svl(LO\(l.index), LD\(l.index), i)")
+            } else if l.type == .utf8 {
                 args.append("LD\(l.index)")
                 args.append(strBegin(l))
                 args.append(strEnd(l))
@@ -632,7 +642,11 @@ final class ExprEmitter {
 enum ExprSource {
     /// Helpers every generated kernel gets: bitmap word loads, exact float32 comparisons, float64
     /// comparisons and conversions, and the literal string matcher.
-    static let helpers = """
+    static let helpers = StringLayoutSource.accessors + """
+
+    // A utf8_view leaf's row i: its bytes and its length (StringView.swift).
+    inline device const uchar* am_svp(device const uint4* v, device const SVBuf* b, uint i) { int l; return StrView{v, b}.row(i, l); }
+    inline int am_svl(device const uint4* v, device const SVBuf* b, uint i) { return StrView{v, b}.len(i); }
 
     // One validity/boolean word (32 rows) from a byte-addressed bitmap. Buffers are page padded, so the
     // whole trailing word is always readable.

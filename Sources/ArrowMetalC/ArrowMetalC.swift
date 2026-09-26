@@ -91,6 +91,44 @@ public func am_export_device(_ a: OpaquePointer?, _ schema: UnsafeMutablePointer
     return UnsafePointer(c)
 }
 
+/// The string layout of a utf8 / binary array: 0 offsets + bytes (or not a string array), 1 views
+/// (`utf8_view` / `binary_view`, read by the kernels that have a view form), 2 views that a kernel
+/// without a view form has since converted to offsets + bytes (the conversion is kept).
+@_cdecl("am_string_layout") public func am_string_layout(_ a: OpaquePointer?) -> Int32 {
+    guard let x = handle(a) else { return 0 }
+    switch x {
+    case .string(let s), .binary(let s):
+        guard s.view != nil else { return 0 }
+        return s.convertedFromView ? 2 : 1
+    default: return 0
+    }
+}
+
+/// For a view array: bytes copied on import (0 when every buffer was mapped without a copy), the
+/// number of variadic data buffers, and the bytes of its non-null strings. Returns 1 for any other array.
+@_cdecl("am_string_view_info") public func am_string_view_info(_ a: OpaquePointer?, _ copiedBytes: UnsafeMutablePointer<Int64>?,
+                                                             _ dataBuffers: UnsafeMutablePointer<Int64>?,
+                                                             _ logicalBytes: UnsafeMutablePointer<Int64>?) -> Int32 {
+    guard let x = handle(a) else { return 2 }
+    switch x {
+    case .string(let s), .binary(let s):
+        guard let v = s.view else { return 1 }
+        copiedBytes?.pointee = Int64(v.copiedBytes)
+        dataBuffers?.pointee = Int64(v.dataBuffers.count)
+        logicalBytes?.pointee = Int64(v.logicalBytes)
+        return 0
+    default: return 1
+    }
+}
+
+/// Process-wide count of view columns converted to offsets + bytes, and their rows.
+@_cdecl("am_string_view_conversions") public func am_string_view_conversions(_ columns: UnsafeMutablePointer<Int64>?,
+                                                                           _ rows: UnsafeMutablePointer<Int64>?) {
+    let c = StringViewStorage.conversions
+    columns?.pointee = Int64(c.columns)
+    rows?.pointee = Int64(c.rows)
+}
+
 // MARK: - Generic dispatch helpers
 
 private func withPrimitive<R>(_ a: AnyMetalArray, _ body: (any PrimitiveOps) throws -> R) throws -> R {

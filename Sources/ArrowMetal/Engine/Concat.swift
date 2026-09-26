@@ -29,6 +29,46 @@ func copyValidityBits(dst: UnsafeMutablePointer<UInt8>, dstOffset: Int,
     for i in 0..<count where Bitmap.isSet(src, i) { Bitmap.set(dst, dstOffset + i) }
 }
 
+/// Concatenation of `utf8_view` columns without touching a string byte: the views are copied one
+/// after another, every data buffer list is appended to the first, and each out-of-line view of a
+/// later part has its buffer index moved past the buffers before it. Nil unless every part is a view
+/// column (a mix goes through offsets + bytes).
+func concatViews(_ parts: [MetalStringArray], _ ctx: MetalContext) throws -> MetalStringArray? {
+    guard parts.count > 1, parts.allSatisfy({ $0.view != nil }) else { return nil }
+    let logical = parts.reduce(0) { $0 + $1.view!.logicalBytes }
+    guard logical < Int(Int32.max) else { return nil }
+    let total = parts.reduce(0) { $0 + $1.length }
+    let views = try MetalArrowBuffer.allocate(byteCount: Swift.max(total, 1) * 16, zeroed: false, context: ctx)
+    let anyNulls = parts.contains { $0.validity != nil }
+    let validity = anyNulls ? try MetalArrowBuffer.allocate(byteCount: Swift.max(Bitmap.byteCount(bits: total), 1), context: ctx) : nil
+    var data: [MetalArrowBuffer?] = [], sizes: [Int] = []
+    var row = 0, nulls = 0
+    for p in parts {
+        let v = p.view!
+        let base = Int32(data.count)
+        let dst = views.mutableContents.advanced(by: row * 16)
+        if p.length > 0 { memcpy(dst, v.views.contents, p.length * 16) }
+        if base > 0 {
+            for i in 0..<p.length {
+                let r = dst.advanced(by: i * 16)
+                if r.loadUnaligned(as: Int32.self) > 12 {
+                    r.storeBytes(of: r.loadUnaligned(fromByteOffset: 8, as: Int32.self) + base, toByteOffset: 8, as: Int32.self)
+                }
+            }
+        }
+        data += v.dataBuffers; sizes += v.dataSizes
+        if let bm = validity {
+            copyValidityBits(dst: bm.mutableTyped(UInt8.self), dstOffset: row,
+                             src: p.validity.map { $0.typed(UInt8.self) }, count: p.length)
+        }
+        nulls += p.nullCount
+        row += p.length
+    }
+    let storage = try StringViewStorage(views: views, dataBuffers: data, dataSizes: sizes, zeroCopy: false,
+                                        copiedBytes: 0, logicalBytes: logical, context: ctx)
+    return MetalStringArray(length: total, nullCount: nulls, validity: validity, view: storage, context: ctx)
+}
+
 /// Concatenates arrays of one Arrow type into a single column, in the order given.
 ///
 /// Supported: every fixed-width primitive, boolean, utf8/binary, temporal and dictionary-encoded
@@ -117,6 +157,10 @@ public func concatMetalArrays(_ arrays: [AnyMetalArray]) throws -> AnyMetalArray
             case .binary(let s): parts.append(s); binary = true
             default: throw ArrowMetalError.unsupportedType("concat: mixed column types (utf8 and \(a.arrowFormat))")
             }
+        }
+        if let v = try concatViews(parts, ctx) {
+            v.isBinary = binary
+            return binary ? .binary(v) : .string(v)
         }
         let total = parts.reduce(0) { $0 + $1.length }
         let totalBytes = parts.reduce(0) { $0 + $1.totalBytes }

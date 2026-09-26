@@ -38,8 +38,10 @@ What still costs something
 * **Categorical / Enum.** Polars encodes those as a dictionary with uint32 (Categorical) or uint8
   (Enum) indices; ArrowMetal's dictionary support wants int32 or int64. The bridge casts the index
   buffer, which copies 4 bytes a row -- the dictionary values themselves are untouched.
-* **Strings.** Free in this direction: Polars' `to_arrow()` already produces `large_string`
-  (offsets + bytes), which is what ArrowMetal reads.
+* **Strings.** String and Binary columns cross in Polars' own `Utf8View` / `BinaryView` layout
+  (`to_arrow(compat_level=newest)`), and the string kernels read the views directly; a kernel
+  without a view form converts the column to offsets + bytes once. `from_polars(...,
+  string_layout="offsets")` asks Polars for `large_string` instead, the layout used before.
 * **Wiring the pages.** Mapping a 400 MB buffer into the Metal address space costs about 8 ms on
   an M4 Max -- page-table work, not a copy, and one order of magnitude under the ~35 ms a real
   copy of the same bytes takes. See docs/POLARS.md for the measurements.
@@ -77,19 +79,35 @@ __all__ = [
 # from_polars / to_polars
 # ---------------------------------------------------------------------------------------------
 
-def _series_to_arrow(s, rechunk=True):
+#: How a Polars String / Binary column crosses: "view" hands over Polars' own `Utf8View` /
+#: `BinaryView` buffers (`to_arrow(compat_level=newest)`), which ArrowMetal reads as views; "offsets"
+#: asks Polars for `large_string` / `large_binary` (a conversion on Polars' side), the layout
+#: ArrowMetal read before it read views.
+STRING_LAYOUTS = ("view", "offsets")
+#: The layout `from_polars` (and so every `.arrowmetal` namespace call) uses when none is given.
+DEFAULT_STRING_LAYOUT = "view"
+
+
+def _series_to_arrow(s, rechunk=True, string_layout=None):
     """One pyarrow.Array for a Polars Series, rechunking (and only then copying) when it has to.
 
     `Series.to_arrow()` already combines chunks, so the check is explicit: with `rechunk=False` a
     multi-chunk column raises rather than paying for a silent concatenation.
     """
+    if string_layout is None:
+        string_layout = DEFAULT_STRING_LAYOUT
+    if string_layout not in STRING_LAYOUTS:
+        raise ArrowMetalError(f"string_layout must be one of {STRING_LAYOUTS}, got {string_layout!r}")
     n = s.n_chunks()
     if n > 1 and not rechunk:
         raise ArrowMetalError(
             f"Series {s.name!r} has {n} chunks; ArrowMetal takes one Arrow array. "
             "Call .rechunk() first, or pass rechunk=True to have the bridge do it (one copy)."
         )
-    arr = s.to_arrow()
+    if string_layout == "view" and s.dtype in (pl.String, pl.Binary) and hasattr(pl, "CompatLevel"):
+        arr = s.to_arrow(compat_level=pl.CompatLevel.newest())
+    else:
+        arr = s.to_arrow()
     if isinstance(arr, pa.ChunkedArray):
         arr = arr.combine_chunks()
         if isinstance(arr, pa.ChunkedArray):        # pyarrow versions differ on what it returns
@@ -108,7 +126,7 @@ def _widen_dictionary_indices(arr):
     return pa.DictionaryArray.from_arrays(arr.indices.cast(pa.int32()), arr.dictionary)
 
 
-def from_polars(obj, *, rechunk=True):
+def from_polars(obj, *, rechunk=True, string_layout=None):
     """Move a Polars object into Metal memory, zero-copy where the buffers allow it.
 
     * `pl.Series`     -> `MetalArray`
@@ -116,12 +134,14 @@ def from_polars(obj, *, rechunk=True):
     * anything else with `.to_arrow()` (a `pl.LazyFrame` is *not* accepted -- collect it first)
 
     `rechunk=False` raises on a multi-chunk Series instead of concatenating it, so a copy can
-    never happen behind your back.
+    never happen behind your back. `string_layout` (see `STRING_LAYOUTS`) picks how String and
+    Binary columns cross: `"view"` keeps Polars' own views, `"offsets"` asks Polars for
+    `large_string` first; None uses `DEFAULT_STRING_LAYOUT` ("view").
     """
     if isinstance(obj, pl.Series):
-        return MetalArray.from_arrow(_series_to_arrow(obj, rechunk))
+        return MetalArray.from_arrow(_series_to_arrow(obj, rechunk, string_layout))
     if isinstance(obj, pl.DataFrame):
-        return {name: MetalArray.from_arrow(_series_to_arrow(obj[name], rechunk))
+        return {name: MetalArray.from_arrow(_series_to_arrow(obj[name], rechunk, string_layout))
                 for name in obj.columns}
     if isinstance(obj, pl.LazyFrame):
         raise ArrowMetalError("from_polars needs data: call .collect() on the LazyFrame first, "

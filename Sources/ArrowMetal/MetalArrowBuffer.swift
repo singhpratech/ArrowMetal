@@ -105,6 +105,28 @@ public final class MetalArrowBuffer: @unchecked Sendable {
         return (try copy(from: ptr, byteCount: byteCount, context: context), false)
     }
 
+    /// Wraps external memory without copying whatever its alignment: the `MTLBuffer` covers the whole
+    /// pages that hold `[ptr, ptr + byteCount)` and the returned buffer starts `ptr`'s distance into
+    /// the first one. Nil when those pages cannot be wrapped (the caller copies instead).
+    ///
+    /// The pages below `ptr` and above the last byte belong to whatever else the allocator put there;
+    /// the GPU is only ever given this buffer's own window, and only for reading. For a buffer read at
+    /// a byte offset (the string view layout's views and data buffers); a bitmap read in 32-bit words
+    /// keeps `wrapOrCopy`'s page-aligned rule.
+    static func wrapCovering(_ ptr: UnsafeRawPointer, byteCount: Int, keepAlive: AnyObject?,
+                             context: MetalContext = .shared) -> MetalArrowBuffer? {
+        guard byteCount > 0 else { return nil }
+        let page = metalPageSize()
+        let addr = UInt(bitPattern: ptr)
+        let base = addr & ~UInt(page - 1)
+        let delta = Int(addr - base)
+        let len = roundUp(delta + byteCount, to: page)
+        guard let start = UnsafeMutableRawPointer(bitPattern: base), rangeIsMapped(start, length: len),
+              let b = context.device.makeBuffer(bytesNoCopy: start, length: len, options: [.storageModeShared],
+                                                deallocator: nil) else { return nil }
+        return MetalArrowBuffer(mtl: b, byteCount: byteCount, offset: delta, keepAlive: keepAlive ?? NSObject())
+    }
+
     public var contents: UnsafeRawPointer { UnsafeRawPointer(mtl.contents()).advanced(by: offset) }
     public var mutableContents: UnsafeMutableRawPointer { mtl.contents().advanced(by: offset) }
 

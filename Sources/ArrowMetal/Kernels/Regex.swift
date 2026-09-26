@@ -87,15 +87,14 @@ extension MetalStringArray {
     func forEachRowConcurrently(chunk: Int = 4096, _ body: (Int, String?) -> Void) {
         let n = length
         guard n > 0 else { return }
-        let o = offsets.typed(Int32.self), d = data.typed(UInt8.self)
         let bm = validity?.typed(UInt8.self)
         let chunks = (n + chunk - 1) / chunk
+        // Either layout: `rowBytes` reads views directly, so a host pass never converts a view column.
         func work(_ c: Int) {
             let lo = c * chunk, hi = Swift.min(lo + chunk, n)
             for i in lo..<hi {
                 if let bm, !Bitmap.isSet(bm, i) { body(i, nil); continue }
-                let start = Int(o[i]), count = Int(o[i + 1]) - Int(o[i])
-                body(i, String(decoding: UnsafeBufferPointer(start: d + start, count: count), as: UTF8.self))
+                body(i, String(decoding: rowBytes(i), as: UTF8.self))
             }
         }
         if chunks == 1 { work(0) } else { DispatchQueue.concurrentPerform(iterations: chunks, execute: work) }

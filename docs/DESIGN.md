@@ -176,6 +176,59 @@ computes it **twice** (`_mode` in `python/arrowmetal/__init__.py` calls the redu
 value and again for the count), so its row carries two reductions. At
 1,000 distinct pyarrow's `mode` is ahead because the values span a narrow range and it counts into a
 direct-indexed table rather than a hash map.
+
+## Strings in two layouts: offsets + bytes, and views
+
+A string column is held in one of two Arrow layouts (`MetalStringArray`):
+
+* **offsets + bytes** (`utf8` / `binary`): int32 offsets, one more than the rows, into one data buffer.
+* **views** (`utf8_view` / `binary_view`, `Sources/ArrowMetal/StringView.swift`): 16 bytes per row and
+  any number of data buffers. The first four bytes of a view are the length. A string of 12 bytes or
+  fewer sits in the other twelve; a longer one keeps a 4-byte prefix there, then the index of a data
+  buffer and its byte offset inside it. This is Polars' own layout for String and Binary columns, with
+  data buffers that grow to 16 MB each.
+
+**Import.** The C Data import takes `vu` / `vz` as they are: the views and every data buffer are wrapped
+in Metal shared buffers without a copy. A view buffer or data buffer does not have to start on a page:
+`MetalArrowBuffer.wrapCovering` wraps the pages that hold it and binds the buffer at its offset into the
+first one (the kernels read it byte-wise or 16 bytes at a time, never in page-sized units), so Polars'
+buffers, whose starts are not on a 16 KiB page, import without a copy. The
+validity bitmap keeps the page-aligned rule, because bitmap kernels read it in 32-bit words; it is copied
+when it is not page aligned or carries a bit offset. The import also totals the bytes of the non-null
+rows in one GPU pass over the views; a column over 2 GB is refused, the limit the `large_utf8` import has.
+Export hands the same buffers back as `vu` / `vz`, so a Polars column crosses in both directions without
+a copy.
+
+**How a kernel reads either layout.** Every kernel that reads strings reads them through one accessor,
+`row(i, len)`, which returns a pointer to row `i`'s first byte and its length (`StringLayoutSource`):
+`StrOff` over offsets + bytes, `StrView` over views. The kernel body is a template over the accessor, and
+`StringLayoutSource.variants` instantiates it once per layout (`name` and `name_v`; `name_ov`, `name_vo`
+and `name_vv` for a kernel over two string columns). A view kernel binds the views where the offsets
+kernel binds its offsets, and a small table where it binds its data: `{0, count}` followed by one
+`{GPU address, byte size}` per data buffer (`MTLBuffer.gpuAddress`), so a view that points into any
+buffer is one indexed load away. The encoder is told about the data buffers with `useResources`, since
+nothing binds them directly. The accessor checks every out-of-line view against its buffer's size and
+reads a view that points outside it as the empty string, so a malformed view, or the unspecified view
+under a null slot, cannot make a kernel read out of bounds (`StringViewTests.testMalformedViewsReadAsEmpty`).
+
+**What reads views.** Lengths, `hash32`, the four pattern predicates, `str_eq` against a scalar and
+against another column, `is_in` / `index_in` (either side a view), the gather behind `filter` / `take`
+(the result is offsets + bytes), `slice` (the result stays a view), the sort keys, the string hash table
+(group-by keys, `dictionary_encode`, `unique`, `value_counts`), the Unicode and ASCII case transforms, the
+trims, `replace`, `repeat`, `slice_codeunits`, the pads, `str_reverse`, `count_substring` /
+`find_substring`, the `ascii_is_*` / `utf8_is_*` predicates, `utf8_center` / `utf8_replace_slice`, the
+fused expression kernels (`am.query`, the engines' filters and string predicates), concatenation of view
+columns (join keys, unions: the views and data buffer lists are appended and the buffer indices of the
+later parts moved, no string byte is copied) and every host-side row pass (regex, normalisation).
+
+**What converts.** Anything else reads `offsets` / `data`, and the first such read converts the column
+on the GPU in a command buffer of its own (lengths, scan, byte copy) and keeps the result, so a column is
+converted at most once. That is `str_concat`, the splits, `match_like`, `strptime`, the byte-counting
+pads and `utf8_zero_fill`, `binary_slice` / `binary_reverse` / `ascii_reverse`, casts from strings and the
+IPC, Parquet, CSV and JSON writers. `MetalArray.string_layout` reports `"view (converted)"` for a
+converted column, `am.string_view_conversions()` counts conversions process-wide, and
+`ARROWMETAL_TRACE_VIEW_CONVERSION=1` prints the call stack of each one.
+
 ## Group-by
 
 Dense group ids `0 ..< K` come out of `GroupByKeys`; everything below aggregates over them. There are

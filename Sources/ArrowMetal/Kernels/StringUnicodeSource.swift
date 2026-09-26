@@ -35,7 +35,7 @@ import Foundation
 /// `su_cased` is the set of cased code points in the range — U+0041–U+005A, U+0061–U+007A, U+00B5,
 /// U+00C0–U+00D6, U+00D8–U+00F6 and U+00F8–U+017F — which is what `utf8_title` splits words on.
 enum StringUnicodeSource {
-    static let source = KernelSource.prelude + """
+    static let source = KernelSource.prelude + StringLayoutSource.accessors + """
 
     // Op codes; must match UnicodeTransform in StringUnicode.swift.
     #define SU_UPPER      0u
@@ -146,31 +146,34 @@ enum StringUnicodeSource {
     }
 
     // Pass 1: the output byte length, plus a flag byte naming the rows the host must redo.
-    kernel void su_tf_len(device const int* offsets [[buffer(0)]], device const uchar* data [[buffer(1)]],
-                          device const uchar* validity [[buffer(2)]], device const uint* nPtr [[buffer(3)]],
-                          constant SuParams& prm [[buffer(4)]], device const uchar* a1 [[buffer(5)]],
-                          device int* outLens [[buffer(6)]], device uchar* hostRows [[buffer(7)]],
-                          device uchar* scratch [[buffer(8)]], device atomic_uint* declined [[buffer(9)]],
-                          uint i [[thread_position_in_grid]]) {
+    template <typename S> inline void su_tf_len_t(S s, device const uchar* validity, device const uint* nPtr,
+                                                  constant SuParams& prm, device const uchar* a1,
+                                                  device int* outLens, device uchar* hostRows,
+                                                  device uchar* scratch, device atomic_uint* declined, uint i) {
         if (i >= *nPtr) return;
         hostRows[i] = 0;
         if ((prm.flags & 1u) != 0u && !bit_get(validity, i)) { outLens[i] = 0; return; }
-        int start = offsets[i], len = offsets[i + 1] - start;
-        int r = su_apply(data, start, len, a1, prm.n1, prm.op, prm.p1, scratch, 0, false);
+        int len; device const uchar* data = s.row(i, len);
+        int r = su_apply(data, 0, len, a1, prm.n1, prm.op, prm.p1, scratch, 0, false);
         if (r < 0) { outLens[i] = 0; hostRows[i] = 1; atomic_store_explicit(declined, 1u, memory_order_relaxed); return; }
         outLens[i] = r;
     }
     // Pass 2: the bytes, for the rows the GPU claimed in pass 1.
-    kernel void su_tf_write(device const int* offsets [[buffer(0)]], device const uchar* data [[buffer(1)]],
-                            device const uchar* validity [[buffer(2)]], device const uint* nPtr [[buffer(3)]],
-                            constant SuParams& prm [[buffer(4)]], device const uchar* a1 [[buffer(5)]],
-                            device const uchar* hostRows [[buffer(6)]], device const int* outOffsets [[buffer(7)]],
-                            device uchar* outData [[buffer(8)]], uint i [[thread_position_in_grid]]) {
+    template <typename S> inline void su_tf_write_t(S s, device const uchar* validity, device const uint* nPtr,
+                                                    constant SuParams& prm, device const uchar* a1,
+                                                    device const uchar* hostRows, device const int* outOffsets,
+                                                    device uchar* outData, uint i) {
         if (i >= *nPtr) return;
         if (hostRows[i] != 0) return;
         if ((prm.flags & 1u) != 0u && !bit_get(validity, i)) return;
-        int start = offsets[i], len = offsets[i + 1] - start;
-        su_apply(data, start, len, a1, prm.n1, prm.op, prm.p1, outData, outOffsets[i], true);
+        int len; device const uchar* data = s.row(i, len);
+        su_apply(data, 0, len, a1, prm.n1, prm.op, prm.p1, outData, outOffsets[i], true);
     }
-    """
+
+    """ + StringLayoutSource.variants("su_tf_len", slots: [0],
+        params: "device const uchar* validity [[buffer(2)]], device const uint* nPtr [[buffer(3)]], constant SuParams& prm [[buffer(4)]], device const uchar* a1 [[buffer(5)]], device int* outLens [[buffer(6)]], device uchar* hostRows [[buffer(7)]], device uchar* scratch [[buffer(8)]], device atomic_uint* declined [[buffer(9)]], uint i [[thread_position_in_grid]]",
+        call: "su_tf_len_t(S0, validity, nPtr, prm, a1, outLens, hostRows, scratch, declined, i)")
+    + StringLayoutSource.variants("su_tf_write", slots: [0],
+        params: "device const uchar* validity [[buffer(2)]], device const uint* nPtr [[buffer(3)]], constant SuParams& prm [[buffer(4)]], device const uchar* a1 [[buffer(5)]], device const uchar* hostRows [[buffer(6)]], device const int* outOffsets [[buffer(7)]], device uchar* outData [[buffer(8)]], uint i [[thread_position_in_grid]]",
+        call: "su_tf_write_t(S0, validity, nPtr, prm, a1, hostRows, outOffsets, outData, i)")
 }

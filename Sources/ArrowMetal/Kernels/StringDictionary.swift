@@ -15,18 +15,18 @@ import Metal
 /// distinct-value boundaries. When they differ, the caller re-hashes with different seeds; if that keeps
 /// failing, the host implementation finishes the job.
 enum StringDictionarySource {
-    static let source: String = KernelSource.prelude + """
+    static let source: String = KernelSource.prelude + StringLayoutSource.accessors + """
 
     inline uint sd_rotl32(uint x, uint r) { return (x << r) | (x >> (32u - r)); }
     inline uint sd_fmix32(uint h) {
         h ^= h >> 16; h *= 0x85ebca6bu; h ^= h >> 13; h *= 0xc2b2ae35u; h ^= h >> 16; return h;
     }
     // MurmurHash3 x86_32 with an explicit seed. Seed 0 is exactly what `hash32()` computes.
-    kernel void sd_hash32_seed(device const int* offsets [[buffer(0)]], device const uchar* data [[buffer(1)]],
-                               device const uint* nPtr [[buffer(2)]], constant uint& seed [[buffer(3)]],
-                               device uint* out [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+    template <typename S> inline void sd_hash32_seed_t(S s, device const uint* nPtr, uint seed,
+                                                       device uint* out, uint i) {
         if (i >= *nPtr) return;
-        int start = offsets[i], len = offsets[i + 1] - offsets[i];
+        int len; device const uchar* data = s.row(i, len);
+        int start = 0;
         uint h = seed; const uint c1 = 0xcc9e2d51u, c2 = 0x1b873593u;
         int nblocks = len / 4;
         for (int b = 0; b < nblocks; b++) {
@@ -56,11 +56,10 @@ enum StringDictionarySource {
     // strings. `markBytes` feeds the bitmap packer behind `filter`; `markInts` feeds the rank scan and
     // drops the mark at position 0 so the first run gets code 0. `counters[0]` totals content runs and
     // `counters[1]` key runs; see the type comment for what their equality proves.
-    kernel void sd_mark(device const int* offsets [[buffer(0)]], device const uchar* data [[buffer(1)]],
-                        device const ulong* keys [[buffer(2)]], device const int* ord [[buffer(3)]],
-                        device const uint* nPtr [[buffer(4)]], device uchar* markBytes [[buffer(5)]],
-                        device int* markInts [[buffer(6)]], device atomic_uint* counters [[buffer(7)]],
-                        uint i [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    template <typename S> inline void sd_mark_t(S s, device const ulong* keys, device const int* ord,
+                                                device const uint* nPtr, device uchar* markBytes,
+                                                device int* markInts, device atomic_uint* counters,
+                                                uint i, uint lane) {
         uint n = *nPtr;
         uint contentRun = 0u, keyRun = 0u;
         if (i < n) {
@@ -69,10 +68,11 @@ enum StringDictionarySource {
                 int a = ord[i], b = ord[i - 1u];
                 if (keys[a] != keys[b]) { contentRun = 1u; keyRun = 1u; }
                 else {
-                    int a0 = offsets[a], len = offsets[a + 1] - a0;
-                    int b0 = offsets[b], blen = offsets[b + 1] - b0;
+                    int len, blen;
+                    device const uchar* pa = s.row((uint)a, len);
+                    device const uchar* pb = s.row((uint)b, blen);
                     bool eq = (len == blen);
-                    for (int t = 0; eq && t < len; t++) if (data[a0 + t] != data[b0 + t]) eq = false;
+                    for (int t = 0; eq && t < len; t++) if (pa[t] != pb[t]) eq = false;
                     contentRun = eq ? 0u : 1u;
                 }
             }
@@ -86,7 +86,13 @@ enum StringDictionarySource {
             atomic_fetch_add_explicit(&counters[1], ks, memory_order_relaxed);
         }
     }
-    """
+
+    """ + StringLayoutSource.variants("sd_hash32_seed", slots: [0],
+        params: "device const uint* nPtr [[buffer(2)]], constant uint& seed [[buffer(3)]], device uint* out [[buffer(4)]], uint i [[thread_position_in_grid]]",
+        call: "sd_hash32_seed_t(S0, nPtr, seed, out, i)")
+    + StringLayoutSource.variants("sd_mark", slots: [0],
+        params: "device const ulong* keys [[buffer(2)]], device const int* ord [[buffer(3)]], device const uint* nPtr [[buffer(4)]], device uchar* markBytes [[buffer(5)]], device int* markInts [[buffer(6)]], device atomic_uint* counters [[buffer(7)]], uint i [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]",
+        call: "sd_mark_t(S0, keys, ord, nPtr, markBytes, markInts, counters, i, lane)")
 }
 
 extension MetalStringArray {
@@ -155,13 +161,13 @@ extension MetalStringArray {
     /// point; this covers the second half of the key and the retry rounds.
     func seededHash32(_ seed: UInt32) throws -> MetalArray<UInt32> {
         let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(length, 1) * 4, zeroed: false, context: context)
-        let p = try context.pipeline(source: StringDictionarySource.source, function: "sd_hash32_seed",
-                                     cacheKey: "strdict/sd_hash32_seed")
+        let fn = Self.kernelName("sd_hash32_seed", self)
+        let p = try context.pipeline(source: StringDictionarySource.source, function: fn,
+                                     cacheKey: "strdict/\(fn)")
         if length > 0 {
             try context.run { enc in
                 enc.setComputePipelineState(p)
-                enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-                enc.setBuffer(data.mtl, offset: data.offset, index: 1)
+                bindLayout(enc, at: 0)
                 Dispatch.setLength(enc, length, nil, index: 2)
                 Dispatch.setUInt(enc, Int(seed), index: 3)
                 enc.setBuffer(out.mtl, offset: out.offset, index: 4)
@@ -181,11 +187,11 @@ extension MetalStringArray {
         let markBytes = try MetalArrowBuffer.allocate(byteCount: nonNull, zeroed: false, context: ctx)
         let markInts = try MetalArrowBuffer.allocate(byteCount: nonNull * 4, zeroed: false, context: ctx)
         let counters = try MetalArrowBuffer.allocate(byteCount: 8, context: ctx)
-        let p = try ctx.pipeline(source: StringDictionarySource.source, function: "sd_mark", cacheKey: "strdict/sd_mark")
+        let fn = Self.kernelName("sd_mark", self)
+        let p = try ctx.pipeline(source: StringDictionarySource.source, function: fn, cacheKey: "strdict/\(fn)")
         try ctx.run { enc in
             enc.setComputePipelineState(p)
-            enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-            enc.setBuffer(data.mtl, offset: data.offset, index: 1)
+            bindLayout(enc, at: 0)
             enc.setBuffer(keys.values.mtl, offset: keys.values.offset, index: 2)
             enc.setBuffer(ord.values.mtl, offset: ord.values.offset, index: 3)
             Dispatch.setLength(enc, nonNull, nil, index: 4)
@@ -228,11 +234,9 @@ extension MetalStringArray {
         var uniques: [String?] = []
         var codes: [Int32?] = []
         codes.reserveCapacity(length)
-        let o = offsets.typed(Int32.self), d = data.typed(UInt8.self)
-        let bytes = UnsafeBufferPointer(start: d, count: totalBytes)
         for i in 0..<length {
             guard isValid(i) else { codes.append(nil); continue }
-            let slice = Array(bytes[Int(o[i])..<Int(o[i + 1])])[...]
+            let slice = Array(rowBytes(i))[...]
             if let c = map[slice] { codes.append(c) } else {
                 let c = Int32(uniques.count); map[slice] = c; uniques.append(String(decoding: slice, as: UTF8.self)); codes.append(c)
             }

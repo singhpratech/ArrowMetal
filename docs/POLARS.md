@@ -14,8 +14,10 @@ relative to the Polars plan**:
 | 4. `MetalEngine` | In place of whole subtrees of the optimised Polars plan | `lf.collect(engine=am.MetalEngine())` | Python only |
 
 All four move data over the Arrow C Data Interface. For a single-chunk numeric Polars column that
-is **no copy at all** -- the GPU reads the buffer Polars already owns. Strings, Categoricals and
-multi-chunk Series each cost one conversion pass -- see Limits. The evidence is below.
+is **no copy at all** -- the GPU reads the buffer Polars already owns. A String column crosses the
+same way in tiers 1, 3 and 4: in Polars' own `Utf8View` layout, which the string kernels read
+directly (tier 2's plugin still asks Polars for `large_string`). Categoricals and multi-chunk Series
+each cost one conversion pass -- see Limits. The evidence is below.
 
 ---
 
@@ -321,8 +323,9 @@ side `mem::forget`s its copy, exactly as the Python binding does after `_export_
 `import_array_from_c` takes over the exported one coming back.
 
 Strings go through `CompatLevel::oldest()` -- Arrow `LargeUtf8`, not the `Utf8View` layout Polars
-uses natively -- because ArrowMetal's kernels read offsets plus bytes. That conversion is the
-plugin's only copy, and it is why the string rows below are 2.2x rather than 89x.
+uses natively. That conversion is the plugin's only copy, and it is why the plugin's string row
+below is 2.3x rather than 89x. Tiers 1, 3 and 4 hand String columns over as `Utf8View`, which the
+kernels read directly (the Strings paragraphs under Numbers and Limits).
 
 `arrowmetal-sys` is a hand-written transcription of the header, not bindgen output: the surface
 is small, the header is stable, and a checked-in file needs no libclang on the build machine.
@@ -623,8 +626,10 @@ declined):
 
 A subtree the engine can translate still has to be one where the GPU is ahead, because getting a
 Polars column onto the GPU is not free: a single-chunk numeric column is imported without a copy,
-but mapping its pages into Metal and releasing them costs time on every query, and a String column
-is converted on the CPU. `Benchmarks/polars_engine_bench.py` measures the eight shapes of
+but mapping its pages into Metal and releasing them costs time on every query. In the run below a
+String column was also converted on the CPU (Polars' `large_string` export and a narrowing pass); the
+engine now hands String columns over in Polars' own view layout (see "Strings" under Limits), and
+these rows have not been re-measured since. `Benchmarks/polars_engine_bench.py` measures the eight shapes of
 `Benchmarks/engine_bench.py` plus ten group-by, sort and `unique` shapes, as Polars LazyFrames, through
 Polars' in-memory engine, Polars' streaming engine and the engine with everything it can translate
 (`shapes="all"`), cold (nothing imported before) and warm (see the import cache below). The numbers
@@ -648,7 +653,7 @@ cold` rows, where above 1 is ahead; 2M rows first, then 50M), the quiet run says
   it to Polars at every size by the String rule below (its `MetalEngine default, cold` rows are 0.96
   at both sizes).
 * **A sort that carries a String column**, `(o) sort with a String column, by an int64 key`, is to
-  improve at both sizes (0.74 and 0.89): the String import is a CPU copy.
+  improve at both sizes (0.74 and 0.89); in that run the String import was a CPU copy.
 * **Group-by** depends on what nobody knows before running it, the number of groups, and on the key
   types. Ahead at both sizes: `(c) group-by (region, sub) mean + max` (1.32, 1.72) and `(l) group-by
   (region, sub), Float64 sum + mean` (1.45, 2.05). Ahead at 50M only: `(i) group-by 1 key, 100 000
@@ -700,8 +705,8 @@ address and size of every buffer, and the next query that reads the same column 
 That is safe because the cached import holds the exported array and, through it, Polars' own buffer:
 while an entry lives, Polars can neither free that memory (so no other column can appear at the same
 address) nor write to it in place (Polars copies a buffer it shares before writing). Only a column
-that was imported without a copy is cached; a String column is converted on every export, and a
-multi-chunk column concatenated on every export, so neither is. Entries are evicted least recently
+that was imported without a copy is cached; a String column (handed over as views, without a copy,
+but outside the cache's key) and a multi-chunk column (concatenated on every export) are not. Entries are evicted least recently
 used above a byte budget, a quarter of physical memory by default:
 
 ```python
@@ -1015,7 +1020,16 @@ and it keeps a null as one of the distinct values rather than dropping it. Sorts
 **both** directions, where Polars' ascending default is nulls first -- pass `nulls_last=True` when
 comparing.
 
-**Strings.** `upper`/`lower` are Unicode's simple 1:1 case mapping over every script (the GPU
+**Strings.** A String or Binary column crosses in Polars' own `Utf8View` / `BinaryView` layout
+(`to_arrow(compat_level=newest)`): its 16-byte views and data buffers are mapped into Metal without a
+copy, and export hands them back to Polars the same way. `s.arrowmetal.to_metal().string_layout` says
+`"view"`. The string kernels read the views directly (the list is `am.STRING_VIEW_KERNELS`); the
+rest (`am.STRING_VIEW_CONVERTS`: `str_concat`, the splits, `match_like`, `strptime`, the
+byte-counting pads, `utf8_zero_fill`, the byte slices and reversals, casts from strings, the file
+writers) convert the column to offsets + bytes once, on the GPU, and keep that form, which
+`string_layout` then reports as `"view (converted)"`. `am.from_polars(s, string_layout="offsets")`
+asks Polars for `large_string` instead, the layout used before the kernels read views; the tier-2
+plugin still uses that. `upper`/`lower` are Unicode's simple 1:1 case mapping over every script (the GPU
 table covers U+0000–U+017F exactly; a row holding anything above is mapped on the host), so Greek
 and Cyrillic come back mapped. Simple, not full: the multi-character expansions are not applied,
 so U+00DF becomes `ẞ` where Polars' `str.to_uppercase()` gives `SS`, and `ﬁ` stays put.
