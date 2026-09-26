@@ -17,6 +17,7 @@ rechunk=False)`) and a frame sliced with `DataFrame.slice`.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import warnings
@@ -211,7 +212,7 @@ def test_polars_surfaces_this_module_uses_exist():
         assert hasattr(pe._xn, kind), kind
     seen = {}
 
-    def cb(nt, duration):
+    def cb(nt, duration=None):
         for m in ("version", "get_node", "set_node", "get_inputs", "view_current_node",
                   "view_expression", "get_dtype", "get_schema", "set_udf"):
             seen[m] = callable(getattr(nt, m, None))
@@ -220,7 +221,11 @@ def test_polars_surfaces_this_module_uses_exist():
     pl.LazyFrame({"a": [1]}).collect(post_opt_callback=cb)
     assert all(v for k, v in seen.items() if k != "version()"), seen
     assert seen["version()"] == pe.TESTED_IR_VERSION == (14, 7)
-    assert pl.__version__ == pe.TESTED_POLARS
+    assert isinstance(pe.TESTED_POLARS, tuple) and pl.__version__ in pe.TESTED_POLARS
+    # Every IR node class this Polars has is one the walk knows; a new one would make every plan
+    # holding it stay with Polars (`test_an_unknown_node_kind_keeps_the_whole_plan_on_polars`).
+    kinds = {k for k, v in vars(pe._in).items() if isinstance(v, type) and not k.startswith("_")}
+    assert kinds == set(pe.KNOWN_NODE_KINDS), kinds ^ set(pe.KNOWN_NODE_KINDS)
 
 
 def _node_kind_plans(tmp_path):
@@ -290,6 +295,7 @@ def test_raise_on_fail_names_the_node_and_reason(tmp_path):
         text = str(err.value)
         assert "ArrowMetal MetalEngine:" in text and kind in text, text
         assert "'cuda' conversion failed" in text      # hardcoded in polars 1.44.1
+        assert pe.FORCE_POLARS in text, text
     # A plan with nothing unsupported does not raise.
     plans["Sort"][0].collect(engine=metal())
 
@@ -308,41 +314,54 @@ def test_report_says_what_ran_where():
 
 
 def test_background_collection_warns_and_runs_on_polars():
+    pe._warned_paths.clear()
     lf = pl.LazyFrame({"v": [1, 2, 3]}).select(pl.col("v") * 2)
-    with pytest.warns(UserWarning, match="background"):
-        q = lf.collect(engine=metal(), background=True)
+    eng = metal()
+    with pytest.warns(pe.MetalEngineFallbackWarning, match="background"):
+        q = lf.collect(engine=eng, background=True)
     assert q.fetch_blocking().equals(lf.collect())
+    assert eng.last_report.path == "background" and not eng.last_report.taken
 
 
 def test_a_sink_plan_is_left_to_polars(tmp_path):
-    """`sink_*` and `collect_batches` do run the callback, and Polars' streaming sink panics on a
-    replaced subtree ("entered unreachable code"), so a plan with a sink stays whole."""
+    """Polars runs `sink_*` by collecting the sink plan through the engine, and its streaming sink
+    panics on a replaced subtree ("entered unreachable code"), so a plan with a sink stays whole,
+    says so in the report, and warns once."""
+    pe._warned_paths.clear()
     lf = pl.LazyFrame({"v": [3, 1, 2]}).sort("v")
     eng = pe.MetalEngine(min_rows=0, shapes="all")
-    lf.sink_parquet(tmp_path / "x.parquet", engine=eng)
+    with pytest.warns(pe.MetalEngineFallbackWarning, match="ends in a sink"):
+        lf.sink_parquet(tmp_path / "x.parquet", engine=eng)
     assert pl.read_parquet(tmp_path / "x.parquet").equals(lf.collect())
-    assert not eng.last_report.taken
+    assert not eng.last_report.taken and eng.last_report.path == "sink"
     assert any("sinks" in f for f in eng.last_report.fallbacks), eng.last_report
-    batches = list(lf.collect_batches(engine=pe.MetalEngine(min_rows=0, shapes="all")))
-    assert pl.concat(batches).equals(lf.collect())
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", pe.MetalEngineFallbackWarning)      # once per process
+        lf.sink_csv(tmp_path / "x.csv", engine=eng)
+    assert pl.read_csv(tmp_path / "x.csv").equals(lf.collect())
 
 
-def test_collect_async_does_not_run_the_callback():
+def test_collect_async_runs_on_polars_and_says_so():
     import asyncio
+    pe._warned_paths.clear()
     lf = pl.LazyFrame({"v": [3, 1, 2]}).sort("v")
     eng = pe.MetalEngine(min_rows=0, shapes="all")
 
     async def go():
         return await lf.collect_async(engine=eng)
 
-    assert asyncio.run(go()).equals(lf.collect())
-    assert eng.last_report is None
+    with pytest.warns(pe.MetalEngineFallbackWarning, match="collect_async"):
+        assert asyncio.run(go()).equals(lf.collect())
+    assert eng.last_report.path == "collect_async" and not eng.last_report.taken
+    assert "no engine callback" in eng.last_report.fallbacks[0]
 
 
 def test_eager_and_background_callbacks_are_none():
+    pe._warned_paths.clear()
     e = am.MetalEngine()
     assert e._post_opt_callback(background=False, eager=True) is None
-    with pytest.warns(UserWarning):
+    assert e.last_report.path == "eager"
+    with pytest.warns(pe.MetalEngineFallbackWarning):
         assert e._post_opt_callback(background=True, eager=False) is None
     assert callable(e._post_opt_callback(background=False, eager=False))
 
@@ -362,9 +381,9 @@ def test_callback_second_argument_is_none_under_collect_and_an_int_under_profile
     seen = []
     real = pe.execute_with_metal
 
-    def spy(nt, duration, *, config):
+    def spy(nt, duration, **kw):
         seen.append(duration)
-        return real(nt, duration, config=config)
+        return real(nt, duration, **kw)
 
     monkeypatch.setattr(pe, "execute_with_metal", spy)
     lf = pl.LazyFrame({"v": [3, 1, 2]}).sort("v")
@@ -382,6 +401,308 @@ def test_lazyframe_profile_with_engine_runs_polars_only():
     _out, timings = lf.profile(engine=eng)
     assert not any(n.startswith("metal:") for n in timings["node"].to_list())
     assert eng.last_report is None
+
+
+# =============================================================================================
+# every collect path: on Metal, or on Polars and saying so (docs/POLARS.md, "Collect paths")
+# =============================================================================================
+
+
+def _path_plan():
+    return pl.LazyFrame({"v": [3, 1, 2] * 10, "k": list(range(30))}).sort("v")
+
+
+def _run_async(start):
+    """Runs `start()` (which calls a Polars async collect) inside an event loop and awaits it."""
+    import asyncio
+
+    async def go():
+        return await start()
+
+    return asyncio.run(go())
+
+
+def _in_config(eng, fn):
+    with pl.Config(engine_affinity=eng):
+        return fn()
+
+
+# path: (run it with engine `e` and a temporary directory `d`, runs on Metal, report path, warns)
+COLLECT_PATHS = {
+    "collect": (lambda e, d: _path_plan().collect(engine=e), True, "collect", None),
+    "head().collect": (lambda e, d: _path_plan().head(5).collect(engine=e), True, "collect", None),
+    "Config(engine_affinity=e) + lazy().collect()": (
+        lambda e, d: _in_config(e, lambda: pl.DataFrame({"v": [3, 1, 2]}).lazy().sort("v").collect()),
+        True, "collect", None),
+    "Config(tbl_rows=3) + collect(engine=e)": (
+        lambda e, d: _in_config_rows(lambda: _path_plan().collect(engine=e)), True, "collect", None),
+    "collect_all": (lambda e, d: pl.collect_all([_path_plan(), _path_plan().head(3)], engine=e),
+                    True, "collect_all", None),
+    "engine.profile(lf)": (lambda e, d: e.profile(_path_plan()), True, "profile", None),
+    "engine.explain(lf)": (lambda e, d: e.explain(_path_plan()), True, "explain", None),
+    "collect_async": (lambda e, d: _run_async(lambda: _path_plan().collect_async(engine=e)),
+                      False, "collect_async", "collect_async"),
+    "collect_all_async": (lambda e, d: _run_async(lambda: pl.collect_all_async([_path_plan()],
+                                                                               engine=e)),
+                          False, "collect_all_async", "collect_all_async"),
+    "collect_batches": (lambda e, d: list(_path_plan().collect_batches(engine=e)), False,
+                        "collect_batches", "collect_batches"),
+    "collect(background=True)": (lambda e, d: _path_plan().collect(engine=e, background=True)
+                                 .fetch_blocking(), False, "background", "background"),
+    "sink_parquet": (lambda e, d: _path_plan().sink_parquet(os.path.join(d, "o.parquet"), engine=e),
+                     False, "sink", "ends in a sink"),
+    "sink_ipc": (lambda e, d: _path_plan().sink_ipc(os.path.join(d, "o.arrow"), engine=e),
+                 False, "sink", "ends in a sink"),
+    "sink_csv": (lambda e, d: _path_plan().sink_csv(os.path.join(d, "o.csv"), engine=e),
+                 False, "sink", "ends in a sink"),
+    "sink_ndjson": (lambda e, d: _path_plan().sink_ndjson(os.path.join(d, "o.ndjson"), engine=e),
+                    False, "sink", "ends in a sink"),
+    "sink_batches": (lambda e, d: _path_plan().sink_batches(lambda df: None, engine=e),
+                     False, "sink", "ends in a sink"),
+    "lazy sink + collect": (lambda e, d: _path_plan().sink_parquet(os.path.join(d, "l.parquet"),
+                                                                   lazy=True).collect(engine=e),
+                            False, "sink", "ends in a sink"),
+}
+
+
+def _in_config_rows(fn):
+    with pl.Config(tbl_rows=3):
+        return fn()
+
+
+@pytest.mark.parametrize("path", list(COLLECT_PATHS))
+def test_every_collect_path_is_explicit(path, tmp_path):
+    """Each path either runs on Metal and the report names the path, or runs the whole plan on
+    Polars, the report says why, and (except `eager`) a MetalEngineFallbackWarning says so once."""
+    run, on_metal, report_path, warns = COLLECT_PATHS[path]
+    pe._warned_paths.clear()
+    eng = pe.MetalEngine(min_rows=0, shapes="all")
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always")
+        run(eng, str(tmp_path))
+    ours = [str(w.message) for w in seen if issubclass(w.category, pe.MetalEngineFallbackWarning)]
+    rep = eng.last_report
+    assert rep is not None and rep.path == report_path, (path, rep)
+    assert bool(rep.taken) == on_metal, (path, str(rep))
+    if on_metal:
+        assert not rep.fallbacks and not ours, (path, str(rep), ours)
+    else:
+        assert rep.fallbacks and len(ours) == 1 and warns in ours[0], (path, str(rep), ours)
+        with warnings.catch_warnings(record=True) as again:          # once per process
+            warnings.simplefilter("always")
+            run(pe.MetalEngine(min_rows=0, shapes="all"), str(tmp_path))
+        assert not [w for w in again if issubclass(w.category, pe.MetalEngineFallbackWarning)]
+    assert f"report for {report_path}" in str(rep)
+
+
+def test_polars_side_entry_points_that_never_call_the_engine():
+    """`lf.explain(engine=)` and `lf.profile(engine=)` read nothing from the engine but its
+    `plan_engine`, and an eager DataFrame method runs on Polars' in-memory engine whatever the
+    configured affinity: no callback, no report."""
+    lf = _path_plan()
+    eng = pe.MetalEngine(min_rows=0, shapes="all")
+    assert lf.explain(engine=eng) == lf.explain()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        lf.profile(engine=eng)
+    pl.Config.set_engine_affinity(eng)
+    try:
+        pl.DataFrame({"v": [3, 1, 2]}).sort("v")
+        pl.DataFrame({"v": [3, 1, 2]}).lazy().sort("v").collect(engine="in-memory")
+    finally:
+        pl.Config.set_engine_affinity(None)
+    assert eng.last_report is None
+
+
+def test_collect_all_runs_each_frame_through_the_engine():
+    a = _path_plan()
+    b = pl.LazyFrame({"x": [2.0, 1.0, float("nan")]}).sort("x", descending=True)
+    eng = pe.MetalEngine(min_rows=0, shapes="all")
+    got = pl.collect_all([a, b], engine=eng)
+    want = pl.collect_all([a, b])
+    for g, w in zip(got, want):
+        compare(g, w, order=True if g.width == 1 else [g.columns[0]])
+    assert [r.path for r in eng.last_reports] == ["collect_all", "collect_all"]
+    assert all(r.taken for r in eng.last_reports) and eng.last_report is eng.last_reports[-1]
+
+
+def test_explain_reports_the_placement_without_running_the_query():
+    lf = pl.LazyFrame({"v": list(range(100))}).filter(pl.col("v") > 3).select(
+        pl.col("v").rank().alias("r"))
+    eng = pe.MetalEngine(min_rows=0, shapes="all")
+    text = eng.explain(lf)
+    assert lf.explain() in text and "report for explain" in text
+    rep = eng.last_report
+    assert [t["root"].split("#")[0] for t in rep.taken] == ["Filter"]
+    assert rep.taken[0]["seconds"] is None                      # nothing ran
+    eng2 = pe.MetalEngine(min_rows=0, shapes="all")
+    lf.collect(engine=eng2)
+    assert rep.walked == eng2.last_report.walked and rep.fallbacks == eng2.last_report.fallbacks
+
+
+# =============================================================================================
+# version compatibility: fail closed, and the check command
+# =============================================================================================
+
+
+def test_an_unknown_node_kind_keeps_the_whole_plan_on_polars(monkeypatch):
+    """A node kind the walk does not know (a Polars release that adds one) is not an error: the
+    whole plan stays with Polars, and the report names the node and the Polars version."""
+    monkeypatch.setattr(pe, "KNOWN_NODE_KINDS", pe.KNOWN_NODE_KINDS - {"Sort"})
+    lf = pl.LazyFrame({"v": [3, 1, 2], "w": [1, 2, 3]}).filter(pl.col("w") > 1).sort("v")
+    eng = pe.MetalEngine(min_rows=0, shapes="all")
+    assert lf.collect(engine=eng).equals(lf.collect())
+    rep = eng.last_report
+    assert not rep.taken, rep
+    assert len(rep.fallbacks) == 1, rep
+    assert f"unknown node Sort in polars {pl.__version__}" in rep.fallbacks[0], rep
+
+
+def test_a_node_polars_cannot_describe_keeps_the_whole_plan_on_polars(monkeypatch):
+    """polars 1.44.1 raises from `view_current_node` for a `sink_batches` Sink when cloudpickle is
+    not installed. Any such failure keeps the whole plan with Polars instead of failing it."""
+    real_exec = pe.execute_with_metal
+    calls = []
+
+    def spy(nt, d=None, **kw):
+        class Traverser:                   # the real traverser, whose second node cannot be shown
+            def __getattr__(self, name):
+                return getattr(nt, name)
+
+            def view_current_node(self):
+                calls.append(nt.get_node())
+                if len(calls) == 2:
+                    raise ValueError("synthetic: cannot show")
+                return nt.view_current_node()
+
+        return real_exec(Traverser(), d, **kw)
+
+    monkeypatch.setattr(pe, "execute_with_metal", spy)
+    lf = pl.LazyFrame({"v": [3, 1, 2]}).filter(pl.col("v") > 1).sort("v")
+    eng = pe.MetalEngine(min_rows=0, shapes="all")
+    assert lf.collect(engine=eng).equals(lf.collect())
+    rep = eng.last_report
+    assert not rep.taken
+    assert len(rep.fallbacks) == 1 and "unknown node Node#" in rep.fallbacks[0], rep
+    assert "ValueError: synthetic: cannot show" in rep.fallbacks[0], rep
+
+
+def test_the_off_switch_leaves_every_plan_to_polars(monkeypatch):
+    monkeypatch.setenv(pe.OFF_ENV, "off")
+    lf = _path_plan()
+    eng = pe.MetalEngine(min_rows=0, shapes="all", raise_on_fail=True)   # does not raise
+    assert lf.collect(engine=eng).equals(lf.collect())
+    assert not eng.last_report.taken
+    assert f"{pe.OFF_ENV}=off is set" in eng.last_report.fallbacks[0]
+    monkeypatch.setenv(pe.OFF_ENV, "on")
+    lf.collect(engine=eng)
+    assert eng.last_report.taken
+
+
+def test_the_check_command_prints_versions_and_the_capability_header():
+    env = dict(os.environ, PYTHONPATH=os.path.join(REPO, "python"))
+    env.pop(pe.OFF_ENV, None)
+    r = subprocess.run([sys.executable, "-m", "arrowmetal.polars_engine", "check"], env=env,
+                       cwd=REPO, capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout
+    assert f"polars {pl.__version__}: a tested release" in out, out
+    assert f"IR version {pe.TESTED_IR_VERSION}: the tested major" in out, out
+    assert "callback API: present" in out and "unknown to the engine: none" in out, out
+    assert "capability table (docs/ENGINE_CAPABILITIES.md):" in out, out
+    assert re.search(r"- Polars (\S+), IR \(14, 7\)", out).group(1) in pe.TESTED_POLARS, out
+
+
+# =============================================================================================
+# the capability table and the messages
+# =============================================================================================
+
+
+def test_the_capability_table_is_current():
+    """docs/ENGINE_CAPABILITIES.md is what `engine_capabilities.py` generates now (apart from the
+    line naming the commit), and no cell of it is a wrong answer or an exception."""
+    import engine_capabilities as ecap
+    results = ecap.run_all()
+    assert not ecap.bad_cells(results), ecap.bad_cells(results)
+    with open(ecap.DOC, encoding="utf-8") as f:
+        committed = f.read()
+    fresh = ecap.render(results)
+    # The table was generated on one of TESTED_POLARS; on another tested release it must be the
+    # same table, apart from the line naming the Polars version.
+    recorded = re.search(r"^- Polars (\S+), IR ", committed, re.M).group(1)
+    assert recorded in pe.TESTED_POLARS, recorded
+    if pl.__version__ != recorded:
+        assert pl.__version__ in pe.TESTED_POLARS, pl.__version__
+        committed = committed.replace(f"- Polars {recorded}, ", f"- Polars {pl.__version__}, ", 1)
+    if ecap.comparable(committed) != ecap.comparable(fresh):
+        import difflib
+        diff = "\n".join(difflib.unified_diff(ecap.comparable(committed).splitlines(),
+                                              ecap.comparable(fresh).splitlines(), "committed",
+                                              "fresh", lineterm="", n=1))
+        pytest.fail("docs/ENGINE_CAPABILITIES.md is stale; regenerate it with "
+                    "`python python/tests/engine_capabilities.py --write`:\n" + diff[:6000])
+
+
+_VERB = re.compile(r"\b(is|are|was|has|have|does|do|can|cannot|may|stays|stay|holds|counts|"
+                   r"differ|needs|adds|keeps|returns|takes|runs)\b")
+
+
+def _reason_texts():
+    """Every `_Unsupported(...)` message of the engine, with each `{...}` field as `{}`."""
+    import ast
+    path = os.path.join(REPO, "python", "arrowmetal", "polars_engine.py")
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_Unsupported":
+            (arg,) = node.args
+            if isinstance(arg, ast.Constant):
+                text = arg.value
+            else:
+                assert isinstance(arg, ast.JoinedStr), ast.dump(arg)
+                text = "".join(v.value if isinstance(v, ast.Constant) else "{}" for v in arg.values)
+            out.append((node.lineno, text))
+    return out
+
+
+def test_every_unsupported_reason_is_a_full_sentence():
+    """The report prints each reason after its node (`Sort#3: <reason>`): a capitalised sentence
+    with a verb, ending in a full stop."""
+    texts = _reason_texts()
+    assert len(texts) > 90
+    for line, text in texts:
+        assert text[:1].isupper(), (line, text)
+        assert text.endswith("."), (line, text)
+        assert len(text.split()) >= 4 and _VERB.search(text), (line, text)
+
+
+def test_engine_errors_name_the_node_the_reason_and_how_to_force_polars(monkeypatch):
+    lf = pl.LazyFrame({"v": [1, 2, 3]}).select(pl.col("v").rank())
+    with pytest.raises(pl.exceptions.ComputeError) as err:
+        lf.collect(engine=metal())
+    text = str(err.value)
+    assert "Select#" in text and "rank has no ArrowMetal translation" in text, text
+    assert pe.FORCE_POLARS in text and "raise_on_fail=True" in text, text
+
+    lf = pl.LazyFrame({"v": [1, 2, 3]}).sort("v", descending=True)
+    monkeypatch.setattr(pe, "_validate", lambda sub, schema: None)
+
+    def fail(plan, leaves, rows=None, scans=None):
+        raise am.ArrowMetalError("synthetic failure")
+
+    monkeypatch.setattr(pe, "_run_plan", fail)
+    with pytest.raises(am.ArrowMetalError) as err:
+        lf.collect(engine=pe.MetalEngine(min_rows=0, shapes="all"))
+    text = str(err.value)
+    assert "the subtree at Sort#" in text and "synthetic failure" in text, text
+    assert pe.FORCE_POLARS in text, text
+
+    monkeypatch.setattr(pe, "_run_plan", lambda plan, leaves, rows=None, scans=None:
+                        pa.table({"v": pa.array([3.0, 2.0, 1.0])}))
+    with pytest.raises(am.ArrowMetalError) as err:
+        lf.collect(engine=pe.MetalEngine(min_rows=0, shapes="all"))
+    text = str(err.value)
+    assert "the subtree at Sort#" in text and "schema" in text and pe.FORCE_POLARS in text, text
 
 
 def test_polars_verbose_warns_with_the_fallbacks(monkeypatch):
@@ -1085,7 +1406,7 @@ FALLBACKS = {
     "mixed_select": (lambda lf: lf.select(pl.col("a"), pl.col("a").sum().alias("t")), "mixing"),
     "median": (lambda lf: lf.group_by("k").agg(pl.col("a").median()), "median"),
     "agg_expression": (lambda lf: lf.group_by("k").agg(pl.col("a").sum() * 2), "over an aggregate"),
-    "string_output": (lambda lf: lf.select(pl.col("s").str.to_uppercase()), "function"),
+    "string_output": (lambda lf: lf.select(pl.col("s").str.to_uppercase()), "Function"),
     "key_expression": (lambda lf: lf.group_by(pl.col("k") * 2).agg(pl.len()), "key is an expression"),
 }
 
@@ -1117,7 +1438,7 @@ def test_other_file_scans_stay_with_polars(tmp_path):
     check_fallback(pl.scan_pyarrow_dataset(__import__("pyarrow.dataset").dataset.dataset(path))
                    .sort("v"), "PythonScan", order=True)
     pl.DataFrame({"v": [3, 1, 2]}).write_csv(tmp_path / "t.csv")
-    check_fallback(pl.scan_csv(tmp_path / "t.csv").sort("v"), "a csv scan", order=True)
+    check_fallback(pl.scan_csv(tmp_path / "t.csv").sort("v"), "csv scan", order=True)
 
 
 # =============================================================================================
@@ -1653,17 +1974,17 @@ def test_parquet_scan_fallbacks_name_the_reason(scan_files, tmp_path):
         (pl.scan_parquet(p).tail(100).filter(gt), "row limit pushed into the scan", True),
         (pl.scan_parquet(p, row_index_name="ri").filter(gt), "row index", True),
         (pl.scan_parquet(p, include_file_paths="path").filter(gt), "include_file_paths", True),
-        (pl.scan_parquet([p, q]).filter(gt), "a scan of 2 files", None),
-        (pl.scan_parquet(str(tmp_path / "*d.parquet")).filter(gt), "a scan of 2 files", None),
-        (pl.scan_parquet(str(tmp_path / "hive")).filter(gt), "hive partition columns", None),
+        (pl.scan_parquet([p, q]).filter(gt), "scan of 2 files", None),
+        (pl.scan_parquet(str(tmp_path / "*d.parquet")).filter(gt), "scan of 2 files", None),
+        (pl.scan_parquet(str(tmp_path / "hive")).filter(gt), "Hive partition columns", None),
         (pl.scan_parquet("file://" + p).filter(gt), "is not a local file", True),
         (pl.scan_parquet(p, schema=pl.scan_parquet(p).collect_schema()).filter(gt), "schema=", True),
-        (pl.scan_csv(csv).filter(gt), "a csv scan", True),
+        (pl.scan_csv(csv).filter(gt), "csv scan", True),
         (pl.scan_ipc(ipc).filter(gt), "does not show this node", True),
         (pl.scan_parquet(dec).sort("v"), "does not carry", True),
         (pl.scan_parquet(lst).sort("v"), "does not carry", True),
         (pl.scan_parquet(cat).sort("v"), "does not carry", True),
-        (pl.scan_parquet(p).filter(pl.col("i64") % 7 == 1), "operator Modulus", True),
+        (pl.scan_parquet(p).filter(pl.col("i64") % 7 == 1), "Operator Modulus", True),
     ]
     for lf, reason, order in cases:
         eng = check_fallback(lf, reason, order=order)

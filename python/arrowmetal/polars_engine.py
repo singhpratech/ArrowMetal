@@ -46,8 +46,10 @@ The Polars surfaces used
 `NodeTraverser` methods `version`, `get_node`, `set_node`, `get_inputs`, `view_current_node`,
 `view_expression`, `get_dtype`, `get_schema` and `set_udf`. They are unstable Polars API; the IR
 version this module was written against is `TESTED_IR_VERSION` and a test fails loudly when an
-upgrade moves it.
+upgrade moves it. A node kind outside `KNOWN_NODE_KINDS` keeps the whole plan with Polars, and
+`python -m arrowmetal.polars_engine check` reports what the installed Polars offers.
 """
+import contextlib
 import json
 import math
 import os
@@ -67,7 +69,8 @@ from polars.lazyframe.engine import _LocalEngine
 from . import ArrowMetalError, MetalArray, lazy as _lazy
 from . import _cached_parquet_read, _parquet_files
 
-__all__ = ["MetalEngine", "MetalPlanReport", "TESTED_IR_VERSION", "TESTED_POLARS", "MEASURED_SHAPES",
+__all__ = ["MetalEngine", "MetalPlanReport", "MetalEngineFallbackWarning", "TESTED_IR_VERSION",
+           "TESTED_POLARS", "KNOWN_NODE_KINDS", "MEASURED_SHAPES", "FORCE_POLARS",
            "clear_import_cache", "import_cache_limit", "import_cache_info"]
 
 # `NodeTraverser.version()` on the polars this module was written and tested against. The major is
@@ -75,7 +78,23 @@ __all__ = ["MetalEngine", "MetalPlanReport", "TESTED_IR_VERSION", "TESTED_POLARS
 # makes the engine decline every plan. A newer minor only adds nodes, so the engine still runs and
 # warns once.
 TESTED_IR_VERSION = (14, 7)
-TESTED_POLARS = "1.44.1"
+# The Polars releases the full engine suite (test_polars_engine.py, test_engine_conformance.py and
+# the capability table) passed on.
+TESTED_POLARS = ("1.44.1", "1.44.2")
+# Every IR node class of those releases (`polars._plr._ir_nodes`). A node of any other kind makes the
+# whole plan stay with Polars: the walk cannot know what such a node does to the rows under it.
+KNOWN_NODE_KINDS = frozenset({
+    "Cache", "DataFrameScan", "Distinct", "ExtContext", "Filter", "GroupBy", "HConcat", "HStack",
+    "Join", "MapFunction", "MergeSorted", "PythonScan", "Reduce", "Scan", "Select",
+    "SimpleProjection", "Sink", "Slice", "Sort", "Union"})
+
+# Setting this environment variable to "off" (or "0", "false", "no", "polars") makes every
+# MetalEngine leave every plan to Polars, whatever the code that built it asked for.
+OFF_ENV = "ARROWMETAL_METAL_ENGINE"
+_OFF_VALUES = ("off", "0", "false", "no", "polars")
+# How to run a plan on Polars instead: every engine error message ends with this.
+FORCE_POLARS = (f"To run the plan on Polars instead, collect without engine= (or with "
+                f"engine=\"in-memory\"), or set {OFF_ENV}=off.")
 
 # Default size gate, in total rows over a subtree's in-memory inputs. How it was chosen is in
 # docs/POLARS.md ("Tier 4", "Which translatable subtrees it runs"): the crossover of argsort and
@@ -268,11 +287,16 @@ class MetalPlanReport:
     * `nodes` -- the nodes the placement visited, top down, `(id, kind, "metal" | "polars")`; it
       stops at a node that runs on Metal.
     * `walked` -- every node of the optimised plan, `(id, kind)`.
+    * `path` -- the Polars entry point the report is for: "collect", "profile", "explain",
+      "collect_all", "sink" (a plan that ends in a sink), or one of the paths on which the whole
+      plan runs on Polars: "collect_async", "collect_all_async", "collect_batches", "background",
+      "eager". docs/POLARS.md, "Collect paths", lists them.
     """
 
-    def __init__(self, polars_version, ir_version):
+    def __init__(self, polars_version, ir_version, path="collect"):
         self.polars_version = polars_version
         self.ir_version = ir_version
+        self.path = path
         self.taken = []
         self.fallbacks = []
         self.nodes = []
@@ -290,7 +314,8 @@ class MetalPlanReport:
                 f"fallbacks={len(self.fallbacks)})")
 
     def __str__(self):
-        lines = [f"MetalEngine report (polars {self.polars_version}, IR {self.ir_version})"]
+        ir = "" if self.ir_version is None else f", IR {self.ir_version}"
+        lines = [f"MetalEngine report for {self.path} (polars {self.polars_version}{ir})"]
         if not self.taken:
             lines.append("  nothing ran on Metal")
         for t in self.taken:
@@ -310,8 +335,30 @@ class MetalPlanReport:
         return "\n".join(lines)
 
 
+class MetalEngineFallbackWarning(UserWarning):
+    """Issued once per process for each collect path on which MetalEngine runs the whole plan on
+    Polars (collect_async, collect_all_async, collect_batches, a plan that ends in a sink,
+    background collection)."""
+
+
+_warned_paths = set()
+
+
+def _warn_once(path, message):
+    if path in _warned_paths:
+        return
+    _warned_paths.add(path)
+    warnings.warn(message, MetalEngineFallbackWarning, stacklevel=4)
+
+
 class _Unsupported(Exception):
-    pass
+    """A node or expression the translation does not take. The message is a full sentence: the
+    report prints it after the node, as `Kind#id: <message>`."""
+
+
+class _UnknownNode(Exception):
+    """A node the walk cannot account for (a kind not in KNOWN_NODE_KINDS, or one Polars fails to
+    show): the whole plan stays with Polars."""
 
 
 # --------------------------------------------------------------------------------------------------
@@ -528,11 +575,21 @@ class _Translator:
             for i in nt.get_inputs():
                 self.walk(i)
             nt.set_node(n)
-            self._fallback(n, kind, f"Polars does not show this node to an engine ({text})")
+            self._fallback(n, kind, f"Polars does not show this node to an engine ({text}), so "
+                                    "it and every node above it stay with Polars.")
             sub = _Sub(None, self._schema_cols())
             self.subs[n] = sub
             return sub
+        except (KeyboardInterrupt, SystemExit, GeneratorExit):
+            raise
+        except BaseException as e:                    # noqa: BLE001 -- a pyo3 PanicException too
+            # Polars failed to describe the node at all (polars 1.44.1 needs cloudpickle to show
+            # the Python function of `sink_batches`): nothing is known about it.
+            text = str(e).splitlines()[0] if str(e) else type(e).__name__
+            raise _UnknownNode(f"Node#{n} ({type(e).__name__}: {text})") from e
         kind = type(node).__name__
+        if kind not in KNOWN_NODE_KINDS:
+            raise _UnknownNode(kind)
         inputs = list(nt.get_inputs())
         self.report.walked.append((n, kind))
         kids = [self.walk(i) for i in inputs]
@@ -542,8 +599,11 @@ class _Translator:
         except _Unsupported as e:
             self._fallback(n, kind, str(e))
             sub = None
+        except _UnknownNode:
+            raise
         except Exception as e:                        # a translator bug must not fail the query
-            self._fallback(n, kind, f"translation error {type(e).__name__}: {e}")
+            self._fallback(n, kind, f"The engine hit a translation error {type(e).__name__}: {e}; "
+                                    "the node stays with Polars.")
             sub = None
         if sub is None:
             nt.set_node(n)
@@ -556,7 +616,7 @@ class _Translator:
     def _translate(self, n, kind, node, inputs, kids):
         method = getattr(self, "_node_" + kind, None)
         if method is None:
-            raise _Unsupported(f"node {kind} has no ArrowMetal translation")
+            raise _Unsupported(f"Node {kind} has no ArrowMetal translation.")
         self.eval_kid = kids[0] if len(kids) == 1 else None
         if kind not in ("DataFrameScan", "Scan") and any(k.plan is None for k in kids):
             # The node itself may be supported; it cannot move without its inputs. Check its own
@@ -578,19 +638,19 @@ class _Translator:
 
     def _node_DataFrameScan(self, n, node, inputs, kids, check_only=False):
         if node.selection is not None:
-            raise _Unsupported("a DataFrameScan with a pushed-down selection")
+            raise _Unsupported("A DataFrameScan with a pushed-down selection is not translated.")
         df = pl.DataFrame._from_pydf(node.df)
         names = list(node.projection) if node.projection is not None else list(df.columns)
         cols = {}
         for name in names:
             if "\x00" in name:
                 # Polars' own Arrow export panics on a NUL in a column name.
-                raise _Unsupported(f"column name {name!r} holds a NUL byte, which Polars cannot "
-                                   "export to Arrow")
+                raise _Unsupported(f"Column name {name!r} holds a NUL byte, which Polars cannot "
+                                   "export to Arrow.")
             s = df.get_column(name)
             if not _carryable(s.dtype):
-                raise _Unsupported(f"column {name!r} has dtype {s.dtype}, which the Metal plan "
-                                   "does not carry")
+                raise _Unsupported(f"Column {name!r} has dtype {s.dtype}, which the Metal plan "
+                                   "does not carry.")
             cols[name] = _base(name, s.dtype, s.null_count() > 0)
         src = f"s{n}"
         return _Sub({"op": "scan", "source": src}, cols, names, [(src, df, names)], df.height, False,
@@ -603,36 +663,41 @@ class _Translator:
         st = node.scan_type
         what = st[0] if isinstance(st, (tuple, list)) and st else str(st)
         if what != "parquet":
-            raise _Unsupported(f"a {what} scan (the engine reads Parquet files)")
+            raise _Unsupported(f"A {what} scan stays with Polars (the engine reads Parquet files "
+                               "only).")
         try:
             opts = json.loads(st[1]) if len(st) > 1 and isinstance(st[1], str) else {}
         except ValueError:
             opts = {}
         if opts.get("schema") is not None:
-            raise _Unsupported("scan_parquet with a schema= (Polars casts to it)")
+            raise _Unsupported("A scan_parquet with a schema= stays with Polars, which casts the "
+                               "file to that schema.")
         paths = list(node.paths)
         if len(paths) != 1:
-            raise _Unsupported(f"a scan of {len(paths)} files (one local file is taken)")
+            raise _Unsupported(f"A scan of {len(paths)} files stays with Polars (one local file "
+                               "is taken).")
         path = paths[0]
         if "://" in path:
-            raise _Unsupported(f"source {path!r} is not a local file (cloud and URL sources stay "
-                               "with Polars)")
+            raise _Unsupported(f"Source {path!r} is not a local file (cloud and URL sources stay "
+                               "with Polars).")
         if node.hive_parts is not None:
-            raise _Unsupported("hive partition columns")
+            raise _Unsupported("Hive partition columns are added by Polars' scan, not read from "
+                               "the file.")
         fo = node.file_options
         if fo.row_index is not None:
-            raise _Unsupported("a row index added by the scan (row_index_name)")
+            raise _Unsupported("A row index added by the scan (row_index_name) is not translated.")
         if fo.include_file_paths is not None:
-            raise _Unsupported("include_file_paths")
+            raise _Unsupported("A scan with include_file_paths adds a column the file does not "
+                               "hold.")
         if fo.n_rows is not None:
-            raise _Unsupported("a row limit pushed into the scan (n_rows, or a head/slice/tail "
-                               "above it)")
+            raise _Unsupported("A row limit pushed into the scan (n_rows, or a head/slice/tail "
+                               "above it) is not translated.")
         if getattr(fo, "deletion_files", None) is not None:
-            raise _Unsupported("deletion files")
+            raise _Unsupported("A scan with deletion files is not translated.")
         if getattr(fo, "column_mapping", None) is not None:
-            raise _Unsupported("a column mapping")
+            raise _Unsupported("A scan with a column mapping is not translated.")
         if not os.path.isfile(path):
-            raise _Unsupported(f"source {path!r} is not a local file")
+            raise _Unsupported(f"Source {path!r} is not a local file.")
         try:
             key, f, lock = _parquet_files.get(path)
             with lock:
@@ -641,26 +706,27 @@ class _Translator:
                 nulls = {c: f.column_null_count(c) for c in set(file_cols)
                          if c in self.nt.get_schema()}
         except ArrowMetalError as e:
-            raise _Unsupported(f"ArrowMetal's Parquet reader cannot open the file: "
-                               f"{str(e).splitlines()[0] if str(e) else type(e).__name__}")
+            raise _Unsupported("ArrowMetal's Parquet reader cannot open the file "
+                               f"({str(e).splitlines()[0] if str(e) else type(e).__name__}).")
         names, dtypes, cols = [], [], {}
         for name, dt in self.nt.get_schema().items():
             if "\x00" in name:
-                raise _Unsupported(f"column name {name!r} holds a NUL byte")
+                raise _Unsupported(f"Column name {name!r} holds a NUL byte, which Polars cannot "
+                                   "export to Arrow.")
             if name not in file_cols:
-                raise _Unsupported(f"column {name!r} is not a column of the file (added by the "
-                                   "scan, or named by a stored schema)")
+                raise _Unsupported(f"Column {name!r} is not a column of the file (added by the "
+                                   "scan, or named by a stored schema).")
             if file_cols.count(name) > 1:
-                raise _Unsupported(f"the file has {file_cols.count(name)} columns named {name!r}")
+                raise _Unsupported(f"The file has {file_cols.count(name)} columns named {name!r}.")
             if not _carryable(dt):
-                raise _Unsupported(f"column {name!r} has dtype {dt}, which the Metal plan does not "
-                                   "carry")
+                raise _Unsupported(f"Column {name!r} has dtype {dt}, which the Metal plan does "
+                                   "not carry.")
             names.append(name)
             dtypes.append(dt)
             # Nullable unless the footer says the column holds no null (checked again on the read).
             cols[name] = _base(name, dt, nulls.get(name) != 0)
         if not names:
-            raise _Unsupported("a scan that reads no columns")
+            raise _Unsupported("A scan that reads no columns is not translated.")
         use_stats = bool(opts.get("use_statistics", True))
         leaf = _FileLeaf(path, key, names, dtypes, rows, use_stats,
                          [c for c in names if nulls.get(c) == 0])
@@ -670,7 +736,7 @@ class _Translator:
             pred = self._predicate(node.predicate.node, cols)
             if pred is not None:
                 if pred.code != "bool":
-                    raise _Unsupported("scan predicate is not boolean")
+                    raise _Unsupported("The scan predicate is not boolean.")
                 plan, work = {"op": "filter", "input": plan, "predicate": pred.s}, True
                 if use_stats:
                     leaf = leaf.with_filters(self._stats_filters(node.predicate.node, cols))
@@ -740,7 +806,8 @@ class _Translator:
 
     def _node_Slice(self, n, node, inputs, kids, check_only=False):
         if node.offset < 0:
-            raise _Unsupported(f"slice with a negative offset ({node.offset}) counts from the end")
+            raise _Unsupported(f"A slice with a negative offset ({node.offset}) counts from the "
+                               "end, which is not translated.")
         kid = kids[0]
         plan = {"op": "limit", "input": kid.plan, "count": int(node.len), "offset": int(node.offset)}
         return kid.derive(plan=plan, exact=_sliced(kid.exact, node.offset, node.len))
@@ -752,7 +819,7 @@ class _Translator:
         if pred is None:                              # the predicate was only an optimiser hint
             return kid.derive()
         if pred.code != "bool":
-            raise _Unsupported("filter predicate is not boolean")
+            raise _Unsupported("The filter predicate is not boolean.")
         sub = kid.derive(plan={"op": "filter", "input": kid.plan, "predicate": pred.s}, work=True,
                          exact=0 if kid.exact == 0 else None)
         if (kid.plan.get("op") == "scan" and len(kid.leaves) == 1 and _is_file(kid.leaves[0][1])
@@ -803,7 +870,8 @@ class _Translator:
         if exprs and all(aggs):
             return self._aggregate(n, kid, [], exprs)
         if any(aggs):
-            raise _Unsupported("a select mixing aggregates with row-wise expressions")
+            raise _Unsupported("A select mixing aggregates with row-wise expressions is not "
+                               "translated.")
         outputs, work, any_col = [], False, False
         for pe in exprs:
             name, e, computed = self._output(pe, kid.cols)
@@ -811,7 +879,8 @@ class _Translator:
             work = work or computed
             any_col = any_col or e.has_col
         if not any_col:
-            raise _Unsupported("a select of literals only (Polars returns one row)")
+            raise _Unsupported("A select of literals only stays with Polars, which returns one "
+                               "row for it.")
         cols = {}
         plan, phys = self._projected(kid, outputs, cols)
         return kid.derive(plan=plan, cols=cols, phys=phys, work=kid.work or work)
@@ -819,28 +888,30 @@ class _Translator:
     def _node_GroupBy(self, n, node, inputs, kids, check_only=False):
         kid = kids[0]
         if node.maintain_order:
-            raise _Unsupported("group_by(maintain_order=True): ArrowMetal's group order is not "
-                               "first-seen")
+            raise _Unsupported("A group_by(maintain_order=True) needs first-seen group order, "
+                               "which ArrowMetal's group-by does not keep.")
         opts = node.options
         if opts.dynamic is not None or opts.rolling is not None:
-            raise _Unsupported("rolling and dynamic group_by")
+            raise _Unsupported("Rolling and dynamic group_by are not translated.")
         if opts.slice is not None:
-            raise _Unsupported("group_by with a pushed-down slice")
+            raise _Unsupported("A group_by with a pushed-down slice is not translated.")
         if node.apply:
-            raise _Unsupported("group_by with an apply function")
+            raise _Unsupported("A group_by with an apply function is not translated.")
         self.nt.set_node(inputs[0])
         keys = []
         for pe in node.keys:
             e = self.nt.view_expression(pe.node)
             if type(e).__name__ != "Column":
-                raise _Unsupported("group_by key is an expression, not a column")
+                raise _Unsupported("The group_by key is an expression, not a column, which is "
+                                   "not translated.")
             c = kid.cols.get(e.name)
             if c is None:
-                raise _Unsupported(f"group_by key {e.name!r} not found")
+                raise _Unsupported(f"The group_by key {e.name!r} was not found in the input.")
             if _is_float(_code(c.dtype)):
-                raise _Unsupported("group_by on a float key (NaN and -0.0 grouping)")
+                raise _Unsupported("A group_by on a float key is not translated (NaN and -0.0 "
+                                   "grouping).")
             if pe.output_name != e.name:
-                raise _Unsupported("group_by key renamed")
+                raise _Unsupported("A renamed group_by key is not translated.")
             keys.append(e.name)
         return self._aggregate(n, kid, keys, list(node.aggs))
 
@@ -852,23 +923,24 @@ class _Translator:
         for pe in node.by_column:
             e = self.nt.view_expression(pe.node)
             if type(e).__name__ != "Column":
-                raise _Unsupported("sort by an expression, not a column")
+                raise _Unsupported("A sort by an expression, not a column, is not translated.")
             keys.append(e.name)
         nulls_last = list(nulls_last) if len(nulls_last) == len(keys) else [nulls_last[0]] * len(keys)
         descending = list(descending) if len(descending) == len(keys) else [descending[0]] * len(keys)
         slc = node.slice
         if slc is not None and slc[0] < 0:
-            raise _Unsupported("sort with a negative slice offset")
+            raise _Unsupported("A sort with a negative slice offset is not translated.")
         if slc is not None and stable:
-            raise _Unsupported("sort(maintain_order=True) with a slice: top-k does not promise "
-                               "stable ties")
+            raise _Unsupported("A sort(maintain_order=True) with a slice stays with Polars: "
+                               "top-k does not promise stable ties.")
         hidden, by, helpers, leaves = [], [], False, None
         for name, nl, desc in zip(keys, nulls_last, descending):
             c = kid.cols.get(name)
             if c is None:
-                raise _Unsupported(f"sort key {name!r} not found")
+                raise _Unsupported(f"The sort key {name!r} was not found in the input.")
             if not _carryable(c.dtype):
-                raise _Unsupported(f"sort key {name!r} has dtype {c.dtype}")
+                raise _Unsupported(f"The sort key {name!r} has dtype {c.dtype}, which the Metal "
+                                   "plan does not carry.")
             ref = c.ref
             if c.nullable and not nl:
                 # ArrowMetal puts nulls last in both directions; a validity key in front puts
@@ -923,16 +995,18 @@ class _Translator:
         m = _COL_REF.fullmatch(ref)
         if (m is None or _unq(m.group(1)) not in kid.phys
                 or kid.classes & {"join", "distinct", "group_by", "group_by_multi", "aggregate"}):
-            raise _Unsupported(f"sort with nulls first by a {dtype} column that is not a column of "
-                               "the scan (ArrowMetal's expressions do not read temporal columns)")
+            raise _Unsupported(f"A sort with nulls first by a {dtype} column that is not a column "
+                               "of the scan is not translated (ArrowMetal's expressions do not "
+                               "read temporal columns).")
         name = _unq(m.group(1))
         hits = [i for i, (_s, _df, names) in enumerate(leaves) if name in names]
         if len(hits) != 1:
-            raise _Unsupported(f"sort key column {name!r} is not in exactly one scan")
+            raise _Unsupported(f"The sort key column {name!r} is not in exactly one scan.")
         src, df, names = leaves[hits[0]]
         if _is_file(df):
-            raise _Unsupported(f"sort with nulls first by {dtype} column {name!r} read from a Parquet "
-                               "file (the validity key is added to in-memory frames only)")
+            raise _Unsupported(f"A sort with nulls first by {dtype} column {name!r} read from a "
+                               "Parquet file is not translated (the validity key is added to "
+                               "in-memory frames only).")
         leaves[hits[0]] = (src, df.with_columns(pl.col(name).is_not_null().alias(h)), names + [h])
         return leaves
 
@@ -942,32 +1016,35 @@ class _Translator:
         for pe in exprs:
             e = self.nt.view_expression(pe.node)
             if type(e).__name__ != "Column":
-                raise _Unsupported(f"{what} key is an expression, not a column")
+                raise _Unsupported(f"The {what} key is an expression, not a column, which is not "
+                                   "translated.")
             c = cols.get(e.name)
             if c is None:
-                raise _Unsupported(f"{what} key {e.name!r} not found")
+                raise _Unsupported(f"The {what} key {e.name!r} was not found in the input.")
             if _is_float(_code(c.dtype)):
-                raise _Unsupported(f"{what} on a float key (NaN and -0.0 equality)")
+                raise _Unsupported(f"A {what} on a float key is not translated (NaN and -0.0 "
+                                   "equality).")
             names.append(e.name)
         return names
 
     def _node_Join(self, n, node, inputs, kids, check_only=False):
         how, nulls_equal, slc, suffix, coalesce, maintain = node.options
         if not isinstance(how, str) or how not in ("Inner", "Left", "Semi", "Anti"):
-            raise _Unsupported(f"{how if isinstance(how, str) else how[0]} join (inner, left, semi "
-                               "and anti are taken)")
+            raise _Unsupported(f"A {how if isinstance(how, str) else how[0]} join is not "
+                               "translated (inner, left, semi and anti are taken).")
         if nulls_equal:
-            raise _Unsupported("join(nulls_equal=True): ArrowMetal's null keys never match")
+            raise _Unsupported("A join(nulls_equal=True) is not translated: ArrowMetal's null "
+                               "keys never match.")
         if slc is not None:
-            raise _Unsupported("join with a pushed-down slice")
+            raise _Unsupported("A join with a pushed-down slice is not translated.")
         if maintain != "none":
-            raise _Unsupported(f"join(maintain_order={maintain!r})")
+            raise _Unsupported(f"A join(maintain_order={maintain!r}) is not translated.")
         left, right = self.subs[node.input_left], self.subs[node.input_right]
         lkeys = self._key_columns(node.input_left, node.left_on, left.cols, "join")
         rkeys = self._key_columns(node.input_right, node.right_on, right.cols, "join")
         for lk, rk in zip(lkeys, rkeys):
             if left.cols[lk].dtype != right.cols[rk].dtype:
-                raise _Unsupported(f"join keys {lk!r} and {rk!r} differ in dtype")
+                raise _Unsupported(f"The join keys {lk!r} and {rk!r} differ in dtype.")
         # ArrowMetal's output columns (LogicalPlan.swift, `.join`): the left columns, then each right
         # column except a key whose left partner has the same name, renamed with the suffix when the
         # name is taken (JoinExtra.swift `uniqueName`).
@@ -990,8 +1067,8 @@ class _Translator:
         for name, dt in self.nt.get_schema().items():
             m = by_name.get(name)
             if m is None or m[1] != dt:
-                raise _Unsupported(f"join output column {name!r} is not one ArrowMetal's join names "
-                                   "that way (coalesce, suffix)")
+                raise _Unsupported(f"The join output column {name!r} is not one ArrowMetal's join "
+                                   "names that way (coalesce, suffix).")
             cols[name] = _base(name, dt, m[2])
         plan = {"op": "join", "left": left.final_plan(), "right": right.final_plan(),
                 "left_on": lkeys, "right_on": rkeys, "how": how.lower(), "suffix": suffix}
@@ -1001,19 +1078,20 @@ class _Translator:
     def _node_Distinct(self, n, node, inputs, kids, check_only=False):
         keep, subset, maintain, slc = node.options
         if keep not in ("any", "first"):
-            raise _Unsupported(f"unique(keep={keep!r}) (any and first are taken: ArrowMetal keeps "
-                               "the first row of each group)")
+            raise _Unsupported(f"A unique(keep={keep!r}) is not translated (any and first are "
+                               "taken: ArrowMetal keeps the first row of each group).")
         if maintain:
-            raise _Unsupported("unique(maintain_order=True)")
+            raise _Unsupported("A unique(maintain_order=True) is not translated.")
         if slc is not None:
-            raise _Unsupported("unique with a pushed-down slice")
+            raise _Unsupported("A unique with a pushed-down slice is not translated.")
         kid = kids[0]
         subset = list(subset) if subset else list(kid.cols)
         for c in subset:
             if c not in kid.cols:
-                raise _Unsupported(f"unique subset column {c!r} not found")
+                raise _Unsupported(f"The unique subset column {c!r} was not found in the input.")
             if _is_float(_code(kid.cols[c].dtype)):
-                raise _Unsupported("unique over a float column (NaN and -0.0 equality)")
+                raise _Unsupported("A unique over a float column is not translated (NaN and -0.0 "
+                                   "equality).")
         cols = {name: _base(name, c.dtype, c.nullable) for name, c in kid.cols.items()}
         plan = {"op": "unique", "input": kid.final_plan(), "subset": subset}
         return _Sub(plan, cols, list(cols), kid.leaves, kid.rows, True, (),
@@ -1038,21 +1116,24 @@ class _Translator:
                 e = self.nt.view_expression(e.expr)
             k = type(e).__name__
             if want is None:
-                raise _Unsupported(f"aggregate {name!r} has dtype {self.nt.get_dtype(pe.node)}")
+                raise _Unsupported(f"The aggregate {name!r} has dtype "
+                                   f"{self.nt.get_dtype(pe.node)}, which the Metal plan does not "
+                                   "compute.")
             if k == "Len":
                 aggs.append(["count", name, ""])
                 fix.append((name, "i64", want, "count"))
                 continue
             if k != "Agg":
-                raise _Unsupported("an expression over an aggregate")
+                raise _Unsupported("An expression over an aggregate is not translated.")
             if len(e.arguments) != 1:
-                raise _Unsupported(f"aggregate {e.name} with {len(e.arguments)} arguments")
+                raise _Unsupported(f"The aggregate {e.name} with {len(e.arguments)} arguments is "
+                                   "not translated.")
             op = e.name
             if op not in ("sum", "min", "max", "mean", "count"):
-                raise _Unsupported(f"aggregate {op} has no ArrowMetal plan operator")
+                raise _Unsupported(f"The aggregate {op} has no ArrowMetal plan operator.")
             arg = self._expr(e.arguments[0], kid.cols)
             if arg.code is None or arg.s is None:
-                raise _Unsupported(f"aggregate {op} over dtype {arg.dtype}")
+                raise _Unsupported(f"The aggregate {op} over dtype {arg.dtype} is not translated.")
             if op == "count":
                 if e.options:                           # include nulls: the group's row count
                     aggs.append(["count", name, ""])
@@ -1068,7 +1149,7 @@ class _Translator:
                 continue
             if arg.code == "bool":
                 if op != "sum":
-                    raise _Unsupported(f"{op} of a boolean")
+                    raise _Unsupported(f"The {op} of a boolean is not translated.")
                 arg = _E(f"(cast {arg.s} u32)", "u32", arg.nullable)
             if op == "sum":
                 got = "f64" if _is_float(arg.code) else ("u64" if arg.code[0] == "u" else "i64")
@@ -1086,8 +1167,9 @@ class _Translator:
                 fix.append((name, "f64", want, None))
             else:
                 if keys and arg.code == "f64":
-                    raise _Unsupported(f"group_by {op} over Float64 (ArrowMetal's GroupBy min/max "
-                                       "kernels take up to 32-bit floats)")
+                    raise _Unsupported(f"A group_by {op} over Float64 is not translated "
+                                       "(ArrowMetal's GroupBy min/max kernels take up to 32-bit "
+                                       "floats).")
                 aggs.append([op, name, arg.s])
                 if _is_float(arg.code):
                     # Polars: min/max skip NaN, but a group of only NaN answers NaN. ArrowMetal
@@ -1156,15 +1238,15 @@ class _Translator:
         if type(e).__name__ == "Column":
             c = cols.get(e.name)
             if c is None:
-                raise _Unsupported(f"column {e.name!r} not found")
+                raise _Unsupported(f"Column {e.name!r} was not found in the input.")
             return pe.output_name, _E(c.ref, _code(c.dtype), c.nullable, dtype=c.dtype,
                                       col=e.name), False
         x = self._expr(pe.node, cols)
         want = self.nt.get_dtype(pe.node)
         wc = _code(want)
         if x.s is None or wc is None:
-            raise _Unsupported(f"output {pe.output_name!r} of dtype {want} cannot be computed on "
-                               "Metal (a fused kernel writes numeric and boolean columns only)")
+            raise _Unsupported(f"Output {pe.output_name!r} of dtype {want} cannot be computed on "
+                               "Metal (a fused kernel writes numeric and boolean columns only).")
         x = self._to(x, wc)
         x.dtype = want
         return pe.output_name, x, True
@@ -1176,10 +1258,10 @@ class _Translator:
         if x.is_lit:
             s = _num_lit(x.lit, code)
             if s is None:
-                raise _Unsupported(f"literal {x.lit!r} is not exact as {code}")
+                raise _Unsupported(f"The literal {x.lit!r} is not exact as {code}.")
             return _E(s, code, x.nullable, dtype=_dtype_of(code), lit=x.lit, is_lit=True, has_col=False)
         if x.code is None or not _lossless(x.code, code):
-            raise _Unsupported(f"cast from {x.code or x.dtype} to {code} may lose values")
+            raise _Unsupported(f"A cast from {x.code or x.dtype} to {code} may lose values.")
         return _E(f"(cast {x.s} {code})", code, x.nullable, dtype=_dtype_of(code), has_col=x.has_col)
 
     def _predicate(self, i, cols):
@@ -1201,7 +1283,7 @@ class _Translator:
 
     def _logic(self, op, l, r):
         if l.code != "bool" or r.code != "bool":
-            raise _Unsupported("logical operator over non-boolean operands")
+            raise _Unsupported("A logical operator over non-boolean operands is not translated.")
         return _E(f"({op} {l.s} {r.s})", "bool", l.nullable or r.nullable, dtype=pl.Boolean,
                   has_col=l.has_col or r.has_col)
 
@@ -1212,11 +1294,11 @@ class _Translator:
         if k == "Column":
             c = cols.get(e.name)
             if c is None:
-                raise _Unsupported(f"column {e.name!r} not found")
+                raise _Unsupported(f"Column {e.name!r} was not found in the input.")
             code = _code(c.dtype)
             if code is None and c.dtype != pl.String:
-                raise _Unsupported(f"column {e.name!r} of dtype {c.dtype} cannot be read by a "
-                                   "fused expression")
+                raise _Unsupported(f"Column {e.name!r} of dtype {c.dtype} cannot be read by a "
+                                   "fused expression.")
             return _E(c.ref, code, c.nullable, dtype=c.dtype, col=e.name)
         if k == "Alias":
             return self._expr(e.expr, cols)
@@ -1226,17 +1308,18 @@ class _Translator:
             x = self._expr(e.expr, cols)
             code = _code(e.dtype)
             if code is None or (x.code is None and not (x.is_lit and x.lit is None)):
-                raise _Unsupported(f"cast from {x.dtype} to {e.dtype}")
+                raise _Unsupported(f"A cast from {x.dtype} to {e.dtype} is not translated.")
             return self._to(x, code)
         if k == "BinaryExpr":
             return self._binary(i, e, cols)
         if k == "Ternary":
             p = self._expr(e.predicate, cols)
             if p.code != "bool":
-                raise _Unsupported("when() condition is not boolean")
+                raise _Unsupported("The when() condition is not boolean.")
             want = _code(nt.get_dtype(i))
             if want is None:
-                raise _Unsupported(f"when/then/otherwise of dtype {nt.get_dtype(i)}")
+                raise _Unsupported(f"A when/then/otherwise of dtype {nt.get_dtype(i)} is not "
+                                   "translated.")
             t = self._to(self._expr(e.truthy, cols), want)
             f = self._to(self._expr(e.falsy, cols), want)
             ps = f"(coalesce {p.s} (bool false))" if p.nullable else p.s
@@ -1245,8 +1328,8 @@ class _Translator:
         if k == "Function":
             return self._function(i, e, cols)
         if k in ("Agg", "Len"):
-            raise _Unsupported("an aggregate inside a row-wise expression")
-        raise _Unsupported(f"expression {k} has no ArrowMetal translation")
+            raise _Unsupported("An aggregate inside a row-wise expression is not translated.")
+        raise _Unsupported(f"Expression {k} has no ArrowMetal translation.")
 
     def _literal(self, e):
         dt = e.dtype
@@ -1254,10 +1337,10 @@ class _Translator:
         code = _code(dt)
         if code is not None:
             if isinstance(v, (pl.Series,)):
-                raise _Unsupported("a Series literal")
+                raise _Unsupported("A Series literal is not translated.")
             s = _num_lit(v, code)
             if s is None:
-                raise _Unsupported(f"literal {v!r} of dtype {dt}")
+                raise _Unsupported(f"The literal {v!r} of dtype {dt} is not translated.")
             return _E(s, code, v is None, dtype=dt, lit=v, is_lit=True, has_col=False)
         if dt == pl.Null and v is None:
             # `then(None)`: typed by whatever it meets (`_to` writes `(null TYPE)`).
@@ -1266,7 +1349,7 @@ class _Translator:
             return _E(None, None, False, dtype=dt, lit=v, is_lit=True, has_col=False)
         if isinstance(dt, pl.List) and isinstance(v, (list, tuple)):
             return _E(None, None, False, dtype=dt, lit=list(v), is_lit=True, has_col=False)
-        raise _Unsupported(f"literal of dtype {dt}")
+        raise _Unsupported(f"A literal of dtype {dt} is not translated.")
 
     def _binary(self, i, e, cols):
         op = e.op
@@ -1278,11 +1361,13 @@ class _Translator:
         if name in _ARITH or name == "TrueDivide":
             want = _code(self.nt.get_dtype(i))
             if want is None or want == "bool":
-                raise _Unsupported(f"{name} producing {self.nt.get_dtype(i)}")
+                raise _Unsupported(f"The operator {name} producing {self.nt.get_dtype(i)} is not "
+                                   "translated.")
             if name == "TrueDivide" and not _is_float(want):
-                raise _Unsupported("integer true division")
+                raise _Unsupported("Integer true division is not translated.")
             if l.code is None or r.code is None:
-                raise _Unsupported(f"{name} over {l.dtype} and {r.dtype}")
+                raise _Unsupported(f"The operator {name} over {l.dtype} and {r.dtype} is not "
+                                   "translated.")
             if name == "TrueDivide":
                 l2, r2 = self._widen(l, want), self._widen(r, want)
             else:
@@ -1300,7 +1385,7 @@ class _Translator:
                 # not always the correctly rounded `x / c`; the same product here gives Polars'
                 # bits. A scalar that is not a plain literal stays with Polars.
                 if not r2.is_lit:
-                    raise _Unsupported("true division by a scalar expression")
+                    raise _Unsupported("A true division by a scalar expression is not translated.")
                 if r2.lit is not None:
                     rec = _reciprocal(r2.lit, want)
                     r3 = _E(_float_text(rec, "f64"), "f64", False, dtype=pl.Float64, lit=rec,
@@ -1325,8 +1410,9 @@ class _Translator:
             if _is_int(l.code) and l.code == r.code and name in ("And", "Or", "Xor"):
                 bop = {"And": "bit_and", "Or": "bit_or", "Xor": "bit_xor"}[name]
                 return _E(f"({bop} {l.s} {r.s})", l.code, nullable, dtype=l.dtype, has_col=has_col)
-            raise _Unsupported(f"{name} over {l.dtype} and {r.dtype}")
-        raise _Unsupported(f"operator {name} has no ArrowMetal kernel")
+            raise _Unsupported(f"The operator {name} over {l.dtype} and {r.dtype} is not "
+                               "translated.")
+        raise _Unsupported(f"Operator {name} has no ArrowMetal kernel.")
 
     def _arith_text(self, am, l2, r2, want):
         """`l2 <am> r2` in `want`, element-wise."""
@@ -1355,7 +1441,8 @@ class _Translator:
             s = plain if kid.exact == 1 else wide
         else:
             if kid is None or kid.plan is None:
-                raise _Unsupported("a scalar division or -1 multiply whose input row count is unknown")
+                raise _Unsupported("A scalar division or -1 multiply whose input row count is "
+                                   "unknown is not translated.")
             pid = len(self.probes)
             self.probes.append(kid.plan)
             s = f"(if_else (bool {_PROBE_TOKEN % pid}) {plain} {wide})"
@@ -1368,12 +1455,12 @@ class _Translator:
         if x.is_lit:
             return self._to(x, code)
         if x.code is None:
-            raise _Unsupported(f"division over {x.dtype}")
+            raise _Unsupported(f"A division over {x.dtype} is not translated.")
         if _is_int(x.code) or x.code == "bool" or (x.code == "f32" and code == "f64"):
             if code == "f32" and _is_int(x.code) and _INT_BITS[x.code] > 16:
-                raise _Unsupported(f"division of {x.code} in f32")
+                raise _Unsupported(f"A division of {x.code} in f32 is not translated.")
             return _E(f"(cast {x.s} {code})", code, x.nullable, dtype=_dtype_of(code), has_col=x.has_col)
-        raise _Unsupported(f"division of {x.code} in {code}")
+        raise _Unsupported(f"A division of {x.code} in {code} is not translated.")
 
     def _compare(self, name, l, r):
         has_col = l.has_col or r.has_col
@@ -1381,17 +1468,18 @@ class _Translator:
         # Strings: equality against a literal only.
         if l.dtype == pl.String or r.dtype == pl.String:
             if name not in ("Eq", "NotEq"):
-                raise _Unsupported(f"string comparison {name}")
+                raise _Unsupported(f"The string comparison {name} is not translated.")
             if l.is_lit and not r.is_lit:
                 l, r = r, l
             if l.s is None or l.is_lit or not (r.is_lit and isinstance(r.lit, str)):
-                raise _Unsupported("string comparison other than column against a literal")
+                raise _Unsupported("A string comparison other than a column against a literal is "
+                                   "not translated.")
             s = f"(str_eq {l.s} {_q(r.lit)})"
             if name == "NotEq":
                 s = f"(not {s})"
             return _E(s, "bool", l.nullable, dtype=pl.Boolean, has_col=True)
         if l.code is None or r.code is None:
-            raise _Unsupported(f"comparison over {l.dtype} and {r.dtype}")
+            raise _Unsupported(f"A comparison over {l.dtype} and {r.dtype} is not translated.")
         # Bring both sides to one type without losing a value.
         if l.code != r.code:
             if l.is_lit and not r.is_lit:
@@ -1399,7 +1487,7 @@ class _Translator:
             elif r.is_lit and not l.is_lit:
                 r = self._to(r, l.code)
             elif not (_is_int(l.code) and _is_int(r.code)):
-                raise _Unsupported(f"comparison of {l.code} with {r.code}")
+                raise _Unsupported(f"A comparison of {l.code} with {r.code} is not translated.")
             # two integer columns: ArrowMetal's promotion is exact (docs/EXPR.md rules 3-4)
         op = _CMP[name]
         if _is_float(l.code) or _is_float(r.code):
@@ -1424,7 +1512,7 @@ class _Translator:
 
         ln, rn = nan(l), nan(r)
         if "true" in (ln, rn):
-            raise _Unsupported("comparison against a NaN literal")
+            raise _Unsupported("A comparison against a NaN literal is not translated.")
         if name in ("Lt", "LtEq"):
             l, r, ln, rn = r, l, rn, ln
             name = "Gt" if name == "Lt" else "GtEq"
@@ -1452,7 +1540,7 @@ class _Translator:
         if head == B.IsNull or head == B.IsNotNull:
             x = self._expr(args[0], cols)
             if x.s is None:
-                raise _Unsupported("is_null of a literal")
+                raise _Unsupported("An is_null of a literal is not translated.")
             op = "is_null" if head == B.IsNull else "is_valid"
             return _E(f"({op} {x.s})", "bool", False, dtype=pl.Boolean, has_col=x.has_col)
         if head == B.Not:
@@ -1461,27 +1549,30 @@ class _Translator:
                 return _E(f"(not {x.s})", "bool", x.nullable, dtype=pl.Boolean, has_col=x.has_col)
             if _is_int(x.code):
                 return _E(f"(bit_not {x.s})", x.code, x.nullable, dtype=x.dtype, has_col=x.has_col)
-            raise _Unsupported(f"not over {x.dtype}")
+            raise _Unsupported(f"A not over {x.dtype} is not translated.")
         if head == B.IsIn:
             if len(fd) > 1 and fd[1]:
-                raise _Unsupported("is_in(nulls_equal=True)")
+                raise _Unsupported("An is_in(nulls_equal=True) is not translated.")
             x = self._expr(args[0], cols)
             lst = self._expr(args[1], cols)
             if not lst.is_lit or not isinstance(lst.lit, list):
-                raise _Unsupported("is_in over something other than a literal list")
+                raise _Unsupported("An is_in over something other than a literal list is not "
+                                   "translated.")
             values = [v for v in lst.lit if v is not None]
             if not values or len(values) > 64:
-                raise _Unsupported(f"is_in over {len(values)} values (1 to 64 are taken)")
+                raise _Unsupported(f"An is_in over {len(values)} values is not translated (1 to "
+                                   "64 are taken).")
             if x.dtype == pl.String and x.s is not None and not x.is_lit:
                 if not all(isinstance(v, str) for v in values):
-                    raise _Unsupported("is_in of a string column against non-strings")
+                    raise _Unsupported("An is_in of a string column against non-strings is not "
+                                       "translated.")
                 terms = [f"(str_eq {x.s} {_q(v)})" for v in values]
                 acc = terms[0]
                 for t in terms[1:]:
                     acc = f"(or {acc} {t})"
                 return _E(acc, "bool", x.nullable, dtype=pl.Boolean, has_col=True)
             if x.code is None or x.code == "bool" or x.is_lit:
-                raise _Unsupported(f"is_in over {x.dtype}")
+                raise _Unsupported(f"An is_in over {x.dtype} is not translated.")
             # Polars matches floats in its total order, so a NaN in the list matches a NaN row;
             # ArrowMetal's is_in compares with IEEE equality, where NaN matches nothing. `(ne x x)`
             # is "x is NaN" and stands in for the NaN values.
@@ -1489,7 +1580,7 @@ class _Translator:
             values = [v for v in values if not (isinstance(v, float) and v != v)]
             lits = [s for s in (_num_lit(v, x.code) for v in values) if s is not None]
             if not lits and not has_nan:
-                raise _Unsupported("is_in values not representable in the column's type")
+                raise _Unsupported("The is_in values are not representable in the column's type.")
             terms = ([f"(is_in {x.s} {' '.join(lits)})"] if lits else [])
             if has_nan:
                 terms.insert(0, f"(ne {x.s} {x.s})")
@@ -1501,14 +1592,16 @@ class _Translator:
             x = self._expr(args[0], cols)
             p = self._expr(args[1], cols)
             if x.dtype != pl.String or x.is_lit or not (p.is_lit and isinstance(p.lit, str)):
-                raise _Unsupported("string predicate other than column against a literal")
+                raise _Unsupported("A string predicate other than a column against a literal is "
+                                   "not translated.")
             if head == S.EndsWith:
-                raise _Unsupported("str.ends_with is not in the fused expression grammar")
+                raise _Unsupported("The string function str.ends_with is not in the fused "
+                                   "expression grammar.")
             if head == S.Contains:
                 literal = bool(fd[1]) if len(fd) > 1 else False
                 if not literal and any(ch in _REGEX_META for ch in p.lit):
-                    raise _Unsupported("str.contains with a regex pattern (ArrowMetal matches "
-                                       "literally)")
+                    raise _Unsupported("A str.contains with a regex pattern is not translated "
+                                       "(ArrowMetal matches literally).")
                 op = "contains"
             else:
                 op = "starts_with"
@@ -1516,13 +1609,14 @@ class _Translator:
         if head == "fill_null":
             want = _code(self.nt.get_dtype(i))
             if want is None:
-                raise _Unsupported(f"fill_null of dtype {self.nt.get_dtype(i)}")
+                raise _Unsupported(f"A fill_null of dtype {self.nt.get_dtype(i)} is not "
+                                   "translated.")
             x = self._to(self._expr(args[0], cols), want)
             v = self._to(self._expr(args[1], cols), want)
             return _E(f"(fill_null {x.s} {v.s})", want, x.nullable and v.nullable,
                       dtype=_dtype_of(want), has_col=x.has_col or v.has_col)
         label = head if isinstance(head, str) else str(head)
-        raise _Unsupported(f"function {label} has no ArrowMetal translation")
+        raise _Unsupported(f"Function {label} has no ArrowMetal translation.")
 
 
 _CODE_DTYPE = {"i8": pl.Int8, "i16": pl.Int16, "i32": pl.Int32, "i64": pl.Int64, "u8": pl.UInt8,
@@ -1732,12 +1826,12 @@ def _to_polars(table):
     return pl.from_arrow(table, rechunk=False)
 
 
-def _check_schema(df, schema, where):
+def _check_schema(df, schema, where, hint=False):
     got = dict(df.schema)
     want = dict(schema)
     if list(got) != list(want) or any(got[k] != want[k] for k in want):
         raise ArrowMetalError(f"ArrowMetal MetalEngine: {where} returned schema {got}, Polars "
-                              f"expects {want}")
+                              f"expects {want}." + (f" {FORCE_POLARS}" if hint else ""))
 
 
 def _validate(sub, schema):
@@ -1776,17 +1870,18 @@ def _run_subtree(sub, schema, entry, duration_since_start, with_columns, predica
     """What Polars calls in place of the replaced subtree (`PythonScan` with a Python source):
     `(with_columns, predicate, n_rows, should_time)`, the first three always None here."""
     if with_columns is not None or predicate is not None or n_rows is not None:
-        raise ArrowMetalError("ArrowMetal MetalEngine: Polars pushed a projection, predicate or "
-                              "row limit into a replaced subtree, which this engine does not expect")
+        raise ArrowMetalError(f"ArrowMetal MetalEngine: Polars pushed a projection, predicate or "
+                              f"row limit into the replaced subtree at {entry['root']}, which this "
+                              f"engine does not expect. {FORCE_POLARS}")
     start = time.monotonic_ns()
     scans = []
     try:
         table = _run_sub(sub, scans=scans)
     except ArrowMetalError as e:
         raise ArrowMetalError(f"ArrowMetal MetalEngine: the subtree at {entry['root']} failed on "
-                              f"Metal: {e}\nplan: {entry['plan']}") from e
+                              f"Metal: {e}\n{FORCE_POLARS}\nplan: {entry['plan']}") from e
     df = _to_polars(table)
-    _check_schema(df, schema, f"the subtree at {entry['root']}")
+    _check_schema(df, schema, f"the subtree at {entry['root']}", hint=True)
     end = time.monotonic_ns()
     entry["seconds"] = (end - start) / 1e9
     entry["rows_out"] = df.height
@@ -1806,36 +1901,59 @@ def _run_subtree(sub, schema, entry, duration_since_start, with_columns, predica
 _warned_minor = [False]
 
 
-def execute_with_metal(nt, duration_since_start, *, config):
+def _engine_off():
+    """The value of OFF_ENV when it switches the engine off, else None."""
+    value = os.environ.get(OFF_ENV, "")
+    return value if value.strip().lower() in _OFF_VALUES else None
+
+
+def execute_with_metal(nt, duration_since_start=None, *, config, path="collect"):
     """The post-optimisation callback: translate what can run on Metal, replace it with a udf, and
-    leave the rest of the plan to Polars. Works by mutating `nt`; returns None."""
+    leave the rest of the plan to Polars. Works by mutating `nt`; returns None. `path` is the
+    Polars entry point that ran it, for the report. polars 1.44 passes `duration_since_start`
+    (None, or an int under `profile`); polars 2.0.0rc2 passes the traverser alone."""
     callback_ns = time.monotonic_ns()
-    report = MetalPlanReport(pl.__version__, None)
+    report = MetalPlanReport(pl.__version__, None, path)
     config.last_report = report
     version = tuple(nt.version())
     report.ir_version = version
     root = nt.get_node()
+    off = _engine_off()
+    if off is not None:
+        # The switch wins over raise_on_fail: it is there to force Polars.
+        report.fallbacks.append(f"plan#{root}: {OFF_ENV}={off} is set, so the whole plan runs on "
+                                "Polars.")
+        return None
     if version[0] != TESTED_IR_VERSION[0]:
         report.fallbacks.append(f"plan#{root}: Polars IR version {version} is not the tested "
-                                f"{TESTED_IR_VERSION}; the whole plan runs on Polars")
+                                f"{TESTED_IR_VERSION}, so the whole plan runs on Polars.")
         return _finish(config, report)
     if version[1] > TESTED_IR_VERSION[1] and not _warned_minor[0]:
         _warned_minor[0] = True
         warnings.warn(f"arrowmetal MetalEngine was tested against Polars IR {TESTED_IR_VERSION} "
-                      f"(polars {TESTED_POLARS}); this polars reports {version}",
+                      f"(polars {', '.join(TESTED_POLARS)}); this polars reports {version}",
                       stacklevel=2)
     tr = _Translator(nt, report)
     try:
         tr.collect_names(root)
         tr.walk(root)
+    except _UnknownNode as e:
+        # Fail closed: the walk cannot say what an unknown node does to the rows under it, so no
+        # subtree of this plan moves.
+        report.fallbacks.append(f"plan#{root}: The plan holds an unknown node {e} in polars "
+                                f"{pl.__version__}, so the whole plan stays with Polars.")
+        return _finish(config, report)
     finally:
         nt.set_node(root)
     sinks = [n for n, k in report.walked if k == "Sink"]
     if sinks:
         # `sink_*` runs its plan on Polars' streaming engine, which panics on a replaced subtree
         # (`test_a_sink_plan_is_left_to_polars`); a plan with a sink stays whole.
-        report.fallbacks.append(f"Sink#{sinks[0]}: a plan that sinks runs on Polars' streaming "
-                                "engine, which cannot run a replaced subtree")
+        report.path = "sink"
+        report.fallbacks.append(f"Sink#{sinks[0]}: A plan that sinks runs on Polars' streaming "
+                                "engine, which cannot run a replaced subtree, so the whole plan "
+                                "stays with Polars.")
+        _warn_once("sink", _PATH_WARNINGS["sink"])
         return _finish(config, report)
 
     # Take the largest translated subtrees that do GPU work, top down.
@@ -1915,8 +2033,9 @@ def _finish(config, report):
             if reason not in seen:
                 seen.add(reason)
                 lines.append(f)
-        raise NotImplementedError("ArrowMetal MetalEngine: this plan cannot run entirely on Metal:\n  "
-                                  + "\n  ".join(lines))
+        raise NotImplementedError("ArrowMetal MetalEngine: this plan cannot run entirely on Metal "
+                                  "(raise_on_fail=True):\n  " + "\n  ".join(lines) + "\n"
+                                  + FORCE_POLARS)
     return None
 
 
@@ -1969,12 +2088,103 @@ class MetalEngine(_LocalEngine):
 
     def _post_opt_callback(self, *, background, eager):
         if background:
-            warnings.warn("MetalEngine does not support background collection; running on Polars' "
-                          "in-memory engine.", UserWarning, stacklevel=3)
+            self._whole_plan_on_polars("background")
             return None
         if eager:
+            # Polars' own eager DataFrame methods run on its in-memory engine and never ask this
+            # one; an eager-flagged collect through it runs on Polars too, without a warning, as
+            # GPUEngine does.
+            self._whole_plan_on_polars("eager")
             return None
-        return partial(execute_with_metal, config=self)
+        return partial(execute_with_metal, config=self, path=self._path)
+
+    # -- the collect paths (docs/POLARS.md, "Collect paths")
+
+    _path = "collect"
+
+    def _whole_plan_on_polars(self, path):
+        """Records, and for all but "eager" warns once, that Polars runs this whole plan."""
+        report = MetalPlanReport(pl.__version__, None, path)
+        report.fallbacks.append(f"plan: {_PATH_REASONS[path]}")
+        self.last_report = report
+        if path in _PATH_WARNINGS:
+            _warn_once(path, _PATH_WARNINGS[path])
+
+    def collect_async(self, lf, *, optimizations, gevent=False):
+        """Polars' `collect_async`, which in polars 1.44.1 passes no engine callback: the whole plan
+        runs on Polars' in-memory engine. Warns once and says so in `last_report`."""
+        self._whole_plan_on_polars("collect_async")
+        return super().collect_async(lf, optimizations=optimizations, gevent=gevent)
+
+    def collect_all_async(self, lfs, *, optimizations, gevent=False):
+        """Polars' `collect_all_async`, which passes no engine callback: every plan runs on Polars.
+        Warns once and says so in `last_report`."""
+        self._whole_plan_on_polars("collect_all_async")
+        return super().collect_all_async(lfs, optimizations=optimizations, gevent=gevent)
+
+    def collect_batches(self, lf, *, optimizations, maintain_order=True, chunk_size=None,
+                        lazy=False):
+        """Polars' `collect_batches`, which passes no engine callback: the whole plan runs on
+        Polars. Warns once and says so in `last_report`."""
+        self._whole_plan_on_polars("collect_batches")
+        return super().collect_batches(lf, optimizations=optimizations,
+                                       maintain_order=maintain_order, chunk_size=chunk_size,
+                                       lazy=lazy)
+
+    def collect_all(self, lfs, *, optimizations):
+        """`pl.collect_all(lfs, engine=MetalEngine())`: each frame is collected through this engine
+        in turn, so each runs on Metal where it can. Polars' own `collect_all` passes no engine
+        callback and optimises the frames together (a subplan they share runs once); here each
+        frame is optimised on its own. `last_reports` holds one report per frame, `last_report`
+        the last one."""
+        out, reports = [], []
+        with self._on_path("collect_all"):
+            for lf in lfs:
+                out.append(self.collect(lf, optimizations=optimizations))
+                reports.append(self.last_report)
+        self.last_reports = reports
+        return out
+
+    @contextlib.contextmanager
+    def _on_path(self, path):
+        had = "_path" in self.__dict__
+        prev = self.__dict__.get("_path")
+        self._path = path
+        try:
+            yield
+        finally:
+            if had:
+                self._path = prev
+            else:
+                del self._path
+
+    def _sink(self, method, lf, args, kwargs):
+        # Polars runs a sink by collecting the sink plan through this engine; the callback leaves a
+        # plan with a Sink node to Polars whole (and says so), and this warns before it starts --
+        # also for `sink_batches`, whose Sink node polars 1.44.1 cannot always show to an engine.
+        _warn_once("sink", _PATH_WARNINGS["sink"])
+        with self._on_path("sink"):
+            return getattr(super(), method)(lf, *args, **kwargs)
+
+    def sink_parquet(self, lf, *args, **kwargs):
+        """Polars' `sink_parquet`: the whole plan runs on Polars (see `_PATH_WARNINGS["sink"]`)."""
+        return self._sink("sink_parquet", lf, args, kwargs)
+
+    def sink_ipc(self, lf, *args, **kwargs):
+        """Polars' `sink_ipc`: the whole plan runs on Polars."""
+        return self._sink("sink_ipc", lf, args, kwargs)
+
+    def sink_csv(self, lf, *args, **kwargs):
+        """Polars' `sink_csv`: the whole plan runs on Polars."""
+        return self._sink("sink_csv", lf, args, kwargs)
+
+    def sink_ndjson(self, lf, *args, **kwargs):
+        """Polars' `sink_ndjson`: the whole plan runs on Polars."""
+        return self._sink("sink_ndjson", lf, args, kwargs)
+
+    def sink_batches(self, lf, *args, **kwargs):
+        """Polars' `sink_batches`: the whole plan runs on Polars."""
+        return self._sink("sink_batches", lf, args, kwargs)
 
     def profile(self, lf, **kwargs):
         """`lf.profile()` with this engine's callback. polars 1.44.1's `LazyFrame.profile` only
@@ -1982,4 +2192,164 @@ class MetalEngine(_LocalEngine):
         profile plain Polars; this passes the callback through `profile`'s own
         `post_opt_callback` keyword instead. Subtrees that ran on Metal appear as `metal:<node>`
         rows of the timings frame."""
-        return lf.profile(post_opt_callback=partial(execute_with_metal, config=self), **kwargs)
+        return lf.profile(post_opt_callback=partial(execute_with_metal, config=self,
+                                                    path="profile"), **kwargs)
+
+    def explain(self, lf, *, optimizations=None):
+        """Polars' optimised plan for `lf` followed by this engine's report for it: which subtrees
+        would run on Metal and why the rest would not, without running the query (each subtree
+        the engine would take is still checked over a short prefix of its input, as a collect
+        does). `lf.explain(engine=MetalEngine())` prints Polars' plan only: Polars does not call
+        the engine there."""
+        if optimizations is None:
+            optimizations = pl.QueryOptFlags()
+        text = lf.explain(optimizations=optimizations)
+        nt = lf._ldf.with_optimizations(optimizations._pyoptflags).visit()
+        execute_with_metal(nt, None, config=self, path="explain")
+        return f"{text}\n\n{self.last_report}"
+
+
+# What each path that leaves the whole plan to Polars puts in the report, and the warning it gives
+# once per process ("eager" gives none).
+_PATH_REASONS = {
+    "collect_async": "collect_async passes no engine callback in this Polars release, so the whole "
+                     "plan runs on Polars' in-memory engine.",
+    "collect_all_async": "collect_all_async passes no engine callback in this Polars release, so "
+                         "every plan runs on Polars' in-memory engine.",
+    "collect_batches": "collect_batches passes no engine callback in this Polars release, so the "
+                       "whole plan runs on Polars.",
+    "background": "Background collection (collect(background=True)) is not supported, so the "
+                  "whole plan runs on Polars' in-memory engine.",
+    "eager": "An eager-mode collect asks for no engine callback, so the whole plan runs on Polars.",
+}
+_PATH_WARNINGS = {
+    "collect_async": "ArrowMetal MetalEngine: collect_async runs the whole plan on Polars' "
+                     "in-memory engine (Polars passes no engine callback on this path); "
+                     "lf.collect(engine=MetalEngine()) runs it on Metal. Shown once per process.",
+    "collect_all_async": "ArrowMetal MetalEngine: collect_all_async runs every plan on Polars' "
+                         "in-memory engine (Polars passes no engine callback on this path); "
+                         "pl.collect_all(..., engine=MetalEngine()) runs them on Metal. Shown once "
+                         "per process.",
+    "collect_batches": "ArrowMetal MetalEngine: collect_batches runs the whole plan on Polars "
+                       "(Polars passes no engine callback on this path); "
+                       "lf.collect(engine=MetalEngine()) runs it on Metal. Shown once per process.",
+    "sink": "ArrowMetal MetalEngine: a plan that ends in a sink (sink_parquet, sink_ipc, sink_csv, "
+            "sink_ndjson, sink_batches) runs whole on Polars, whose streaming sink cannot run a "
+            "subtree the engine replaces; lf.collect(engine=MetalEngine()) and a write of the "
+            "frame run the query on Metal. Shown once per process.",
+    "background": "ArrowMetal MetalEngine: MetalEngine does not support background collection; "
+                  "running on Polars' in-memory engine. Shown once per process.",
+}
+
+
+# --------------------------------------------------------------------------------------------------
+# `python -m arrowmetal.polars_engine check`
+
+_TRAVERSER_METHODS = ("version", "get_node", "set_node", "get_inputs", "view_current_node",
+                      "view_expression", "get_dtype", "get_schema", "set_udf")
+CAPABILITIES_DOC = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "docs", "ENGINE_CAPABILITIES.md")
+
+
+def compatibility():
+    """What this Polars offers the engine: a dict with the Polars version and whether it is one of
+    TESTED_POLARS, the IR version, whether the callback API is there (`missing` names what is
+    not), the IR node kinds this Polars has that KNOWN_NODE_KINDS lacks, and whether OFF_ENV is
+    set."""
+    missing = [f"_LocalEngine.{m}" for m in ("_post_opt_callback", "collect")
+               if not hasattr(_LocalEngine, m)]
+    seen = {}
+
+    def probe(nt, _duration=None):
+        seen["ir"] = tuple(nt.version())
+        seen["missing"] = [f"NodeTraverser.{m}" for m in _TRAVERSER_METHODS
+                           if not callable(getattr(nt, m, None))]
+
+    try:
+        pl.LazyFrame({"a": [1]}).collect(post_opt_callback=probe)
+    except Exception as e:                            # noqa: BLE001 -- reported, not raised
+        missing.append(f"collect(post_opt_callback=...) ({type(e).__name__}: {e})")
+    if "ir" not in seen and not missing:
+        missing.append("collect(post_opt_callback=...) did not call the callback")
+    missing += seen.get("missing", [])
+    kinds = sorted(k for k, v in vars(_in).items() if isinstance(v, type) and not k.startswith("_"))
+    ir = seen.get("ir")
+    return {
+        "polars": pl.__version__,
+        "polars_tested": pl.__version__ in TESTED_POLARS,
+        "ir": ir,
+        "ir_compatible": ir is not None and ir[0] == TESTED_IR_VERSION[0],
+        "callback_api": not missing,
+        "missing": missing,
+        "unknown_node_kinds": [k for k in kinds if k not in KNOWN_NODE_KINDS],
+        "engine_off": _engine_off(),
+    }
+
+
+def capability_header(path=CAPABILITIES_DOC):
+    """The header lines of the published capability table (the lines before its first section), or
+    None when the file is not there (it ships with the source tree, not the wheel)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+    head = []
+    for line in text.splitlines():
+        if line.startswith("|") or line.startswith("## "):
+            break
+        head.append(line)
+    return "\n".join(head).strip()
+
+
+def check(out=None):
+    """Prints what `compatibility()` found and the capability table's header. Returns 0 when the
+    engine can run on this Polars (the callback API is there and the IR major is the tested one),
+    else 1."""
+    import sys
+    out = out or sys.stdout
+    c = compatibility()
+
+    def say(line=""):
+        print(line, file=out)
+
+    tested = ", ".join(TESTED_POLARS)
+    say(f"polars {c['polars']}: " + ("a tested release" if c["polars_tested"] else
+                                     f"not a tested release (tested: {tested})"))
+    if c["ir"] is None:
+        say("IR version: unknown (the callback did not run)")
+    elif c["ir_compatible"]:
+        say(f"IR version {c['ir']}: the tested major (tested {TESTED_IR_VERSION})")
+    else:
+        say(f"IR version {c['ir']}: not the tested {TESTED_IR_VERSION}; every plan stays with "
+            "Polars")
+    say("callback API: " + ("present" if c["callback_api"] else
+                            "missing: " + "; ".join(c["missing"])))
+    say("IR node kinds unknown to the engine: " + (", ".join(c["unknown_node_kinds"]) or "none")
+        + " (a plan holding one stays with Polars)")
+    say(f"{OFF_ENV}: " + (f"{c['engine_off']} (every plan stays with Polars)"
+                          if c["engine_off"] is not None else "not set"))
+    head = capability_header()
+    say()
+    if head is None:
+        say("capability table: docs/ENGINE_CAPABILITIES.md is not in this install (it ships with "
+            "the source tree)")
+    else:
+        say("capability table (docs/ENGINE_CAPABILITIES.md):")
+        for line in head.splitlines():
+            say(f"  {line}" if line else "")
+    return 0 if c["callback_api"] and c["ir_compatible"] else 1
+
+
+def main(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(prog="python -m arrowmetal.polars_engine",
+                                     description="MetalEngine's compatibility with the installed "
+                                                 "Polars.")
+    parser.add_argument("command", choices=["check"])
+    parser.parse_args(argv)
+    return check()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
