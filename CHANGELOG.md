@@ -22,18 +22,19 @@
   `Kind#id: rule: ...` line ("900,000 input rows is below the 1,250,000-row crossover for join:inner
   (...)"). `arrowmetal.polars_engine.placement_rules()` lists the table; `SHAPE_CLASSES` replaces
   `MEASURED_SHAPES`, and `MetalEngine().min_rows` is `None` unless given. In
-  `Benchmarks/results/polars_engine_bench_2026-09-26.csv` (45 cases at 2M and 50M rows and the 50M
-  Parquet cases, taken with a 1-minute load average of 8 to 22) every case-size pair the default took
-  was ahead of the faster Polars engine, 1.30x to 8.37x. `Benchmarks/polars_engine_bench.py` gains 37
+  `Benchmarks/results/polars_engine_bench_2026-09-26-quiet.csv` (45 cases at 2M and 50M rows) and
+  `polars_engine_scan_2026-09-26-quiet.csv` (the 50M Parquet cases; run conditions in
+  `bench_conditions_2026-09-26-quiet.txt`) every case-size pair the default took was ahead of the
+  faster Polars engine, 1.9x to 7.5x. `Benchmarks/polars_engine_bench.py` gains 37
   cases and `--crossover`; `python/tests/test_engine_policy.py` tests the policy.
 - The crossover sweep's `(v3)` case found ArrowMetal's group-by returning wrong Float64 sums and means from 16,777,216 groups (most groups null); fixed in the core (below), so the engine applies no group-count rule.
 - Parquet reads, cold and warm. On the 50,000,000-row, 8-column benchmark files a whole-file read
-  through a fresh open is 114 ms (Snappy), 105 ms (LZ4) and 53 ms (uncompressed), against 369, 340 and
-  250 ms in `parquet_bench_2026-09-25-quiet.txt` and against Polars' 104, 86 and 77 ms in the same run,
-  with 78-101 ms of process CPU against 806-1299 for pyarrow and Polars; time to first compute is
-  12-14 ms (Polars 18-24); a one-column read through a fresh open is 8.91-13.92 ms, against 149-191 ms
-  before (`Benchmarks/results/parquet_bench_2026-09-26.txt`, `parquet_cache_2026-09-26.csv`; the run
-  started at load average 3.03 and ended at 6.40, `bench_conditions_2026-09-26.txt`). What changed
+  through a fresh open is 108 ms (Snappy), 96 ms (LZ4) and 41 ms (uncompressed), against 369, 340 and
+  250 ms in `parquet_bench_2026-09-25-quiet.txt` and against Polars' 99, 74 and 67 ms in the same run,
+  with 78-91 ms of process CPU against 760-1330 for pyarrow and Polars; time to first compute is
+  9-13 ms (Polars 16-22); a one-column read through a fresh open is 6.9-12.2 ms, against 149-191 ms
+  before (`Benchmarks/results/parquet_bench_2026-09-26-quiet.txt`, `parquet_cache_2026-09-26-quiet.csv`;
+  run conditions in `bench_conditions_2026-09-26-quiet.txt`). What changed
   (docs/PARQUET.md, "The file's bytes are the GPU's bytes" and "Decompression"):
   - the file is mapped read-only and shared: the first kernel to read a wrapped range makes it resident
     for the GPU at 7-10 ms per GB, against 67-78 ms per GB for the private writable mapping, which stays
@@ -118,8 +119,8 @@
   `include_file_paths`, `schema=`, unsupported dtypes, CSV and NDJSON scans stay with Polars, named in
   `engine.last_report`, whose entries now list each file read, its filters and the row groups and
   pages skipped. The defaults take a scan subtree on the same terms as an in-memory one. 50M rows:
-  a sort of two columns is 1.99-2.12x the faster Polars engine through a freshly opened file and
-  4.03-7.85x with the file open; `Benchmarks/results/polars_engine_scan_2026-09-25-quiet.csv`,
+  a sort of two columns is 4.4-7.6x the faster Polars engine through a freshly opened file and
+  4.7-8.7x with the file open; `Benchmarks/results/polars_engine_scan_2026-09-26-quiet.csv`,
   `polars_engine_bench.py --scan-only` (docs/POLARS.md, "Parquet scans").
 - A plan with `scan_ipc` under `MetalEngine` collects on Polars instead of failing: polars 1.44.1
   raises `NotImplementedError` when an engine views that node, and the engine now leaves the node,
@@ -128,8 +129,8 @@
   keep the opened, mapped file across reads, keyed by real path, inode, modification time and size
   (a changed or replaced file is opened afresh), LRU-bounded by 16 files and a quarter of physical
   memory (`parquet_cache_limit`), with `parquet_cache_info` and `clear_parquet_cache`. On the 50M-row,
-  8-column files a one-column read goes from 149-191 ms through a fresh open to 7.14-9.36 ms through
-  the cache (`Benchmarks/results/parquet_cache_2026-09-25-quiet.csv`, `parquet_bench.py --cache`;
+  8-column files a one-column read is 6.9-12.2 ms through a fresh open and 3.2-7.6 ms through the
+  cache (`Benchmarks/results/parquet_cache_2026-09-26-quiet.csv`, `parquet_bench.py --cache`;
   docs/PARQUET.md, "The open-file cache").
 - Parquet SNAPPY dictionary pages, and SNAPPY dispatches of at most 16 pages, are decompressed on the
   host by a bounds-checked decoder instead of one GPU SIMD group per page. A 1,000,000-row file with

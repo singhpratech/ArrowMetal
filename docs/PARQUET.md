@@ -474,28 +474,28 @@ with the same size, a touched file and a replaced file, LRU order, both bounds a
 Cold is the first read in the process (the cache cleared before each run; the file itself stays in
 the OS page cache), warm is the next read of the same file through the cache. 50,000,000 rows x 8
 columns, the files of `Benchmarks/parquet_bench.py`, best of 3,
-`Benchmarks/results/parquet_cache_2026-09-26.csv` (run conditions in
-`Benchmarks/results/bench_conditions_2026-09-26.txt`; load average 3.03 at the start):
+`Benchmarks/results/parquet_cache_2026-09-26-quiet.csv` (run conditions in
+`Benchmarks/results/bench_conditions_2026-09-26-quiet.txt`):
 
 | codec | file | measure | cold ms | warm ms |
 |---|---:|---|---:|---:|
-| snappy | 1.65 GB | open only | 0.30 | 0.02 |
-| snappy | | read `price` (400 MB of values) | 13.92 | 9.08 |
-| snappy | | read `price` + sum | 17.71 | 10.08 |
-| snappy | | read all 8 columns | 112.83 | 92.76 |
-| lz4 | 1.67 GB | open only | 0.31 | 0.02 |
-| lz4 | | read `price` | 13.78 | 10.78 |
-| lz4 | | read `price` + sum | 18.50 | 10.60 |
-| lz4 | | read all 8 columns | 102.33 | 78.97 |
-| none | 2.23 GB | open only | 0.30 | 0.03 |
-| none | | read `price` | 8.91 | 3.48 |
-| none | | read `price` + sum | 12.94 | 5.65 |
-| none | | read all 8 columns | 51.95 | 22.41 |
+| snappy | 1.65 GB | open only | 0.2 | 0.02 |
+| snappy | | read `price` (400 MB of values) | 11.5 | 7.5 |
+| snappy | | read `price` + sum | 12.5 | 8.9 |
+| snappy | | read all 8 columns | 106.8 | 92.3 |
+| lz4 | 1.67 GB | open only | 0.3 | 0.02 |
+| lz4 | | read `price` | 12.2 | 7.6 |
+| lz4 | | read `price` + sum | 12.1 | 8.4 |
+| lz4 | | read all 8 columns | 95.2 | 77.2 |
+| none | 2.23 GB | open only | 0.2 | 0.02 |
+| none | | read `price` | 6.9 | 3.2 |
+| none | | read `price` + sum | 8.7 | 4.2 |
+| none | | read all 8 columns | 39.0 | 16.6 |
 
-Opening the file (the footer and the mapping) is 0.30-0.31 ms. A cold one-column read is 8.91-13.92 ms
-against 3.48-10.78 ms warm: the cold read also parses the column's page headers, a minor fault each on
+Opening the file (the footer and the mapping) is 0.2-0.3 ms. A cold one-column read is 6.9-12.2 ms
+against 3.2-7.6 ms warm: the cold read also parses the column's page headers, a minor fault each on
 a fresh mapping, and makes the column's own chunks resident for the GPU (above, "The file's bytes are
-the GPU's bytes"). A cold read of all 8 columns is 51.95-112.83 ms, 22.41-92.76 ms warm.
+the GPU's bytes"). A cold read of all 8 columns is 39.0-106.8 ms, 16.6-92.3 ms warm.
 
 ```
 PYTHONPATH=python python Benchmarks/parquet_bench.py --rows 50000000 --codecs snappy,lz4,none \
@@ -507,9 +507,8 @@ PYTHONPATH=python python Benchmarks/parquet_bench.py --rows 50000000 --codecs sn
 Measured on an Apple M4 Max (Mac16,6, 64 GB), macOS 26.x, release build. 50,000,000 rows x 8 columns
 (`int64`, `int64`, `int32`, `float64`, `float64`, dictionary-encoded `string`, `timestamp[us]`, `bool`),
 1 MB data pages. Best of 3 in-process runs, caches warm. The tables below are from
-`Benchmarks/results/parquet_bench_2026-09-26.txt` (run conditions in
-`Benchmarks/results/bench_conditions_2026-09-26.txt`: load average 3.03 at the start and 6.40 at the
-end).
+`Benchmarks/results/parquet_bench_2026-09-26-quiet.txt` (run conditions in
+`Benchmarks/results/bench_conditions_2026-09-26-quiet.txt`).
 
 `wall ms` is elapsed time for the whole read; `CPU ms` is process CPU time over the same interval, so GPU
 work does not appear in it; `ttfc` is *time to first compute* — read one `float64` column and sum it,
@@ -519,43 +518,42 @@ which is the smallest query anyone actually runs.
 
 | codec | reader | wall ms | CPU ms | MB/s | ttfc ms |
 |---|---|---:|---:|---:|---:|
-| snappy | **arrowmetal (GPU)** | 114 | **78** | 14470 | **13** |
-| snappy | pyarrow.parquet | 175 | 1236 | 9449 | 86 |
-| snappy | polars | 104 | 1299 | 15833 | 19 |
-| snappy | pandas | 255 | 1442 | 6493 | 99 |
-| lz4 | **arrowmetal (GPU)** | 105 | **85** | 15970 | **14** |
-| lz4 | pyarrow.parquet | 168 | 1035 | 9942 | 86 |
-| lz4 | polars | 86 | 1070 | 19307 | 24 |
-| lz4 | pandas | 241 | 1209 | 6918 | 106 |
-| none | **arrowmetal (GPU)** | **53** | **101** | **41739** | **12** |
-| none | pyarrow.parquet | 172 | 806 | 12932 | 83 |
-| none | polars | 77 | 941 | 29088 | 18 |
-| none | pandas | 253 | 972 | 8802 | 94 |
+| snappy | **arrowmetal (GPU)** | 108 | **80** | 15310 | **13** |
+| snappy | pyarrow.parquet | 162 | 1169 | 10213 | 83 |
+| snappy | polars | 99 | 1330 | 16671 | 22 |
+| snappy | pandas | 226 | 1332 | 7304 | 109 |
+| lz4 | **arrowmetal (GPU)** | 96 | **78** | 17408 | **13** |
+| lz4 | pyarrow.parquet | 160 | 1001 | 10404 | 83 |
+| lz4 | polars | 74 | 1031 | 22514 | 22 |
+| lz4 | pandas | 230 | 1161 | 7244 | 104 |
+| none | **arrowmetal (GPU)** | **41** | **91** | **54031** | **9** |
+| none | pyarrow.parquet | 164 | 760 | 13553 | 81 |
+| none | polars | 67 | 895 | 33481 | 16 |
+| none | pandas | 250 | 928 | 8905 | 112 |
 
-On wall time ArrowMetal is ahead of pyarrow on all three files (1.5x Snappy, 1.6x LZ4, 3.2x
-uncompressed) and ahead of Polars on the uncompressed one (1.45x: 53 ms against 77). It is behind
-Polars on the two compressed files: 114 ms against 104 (Snappy, 0.91x) and 105 against 86 (LZ4,
-0.82x). It is **8.0-16.7x ahead on CPU time** (8.0-15.8x ahead of pyarrow, 9.3-16.7x ahead of Polars):
+On wall time ArrowMetal is ahead of pyarrow on all three files (1.5x Snappy, 1.7x LZ4, 4.0x
+uncompressed) and ahead of Polars on the uncompressed one (1.6x: 41 ms against 67). It is behind
+Polars on the two compressed files: 108 ms against 99 (Snappy, 0.9x) and 96 against 74 (LZ4,
+0.8x). It is **8.4-16.6x ahead on CPU time** (8.4-14.6x ahead of pyarrow, 9.8-16.6x ahead of Polars):
 the decode is work the host never does. Time to first compute, which opens the file afresh for every
-query, is 12-14 ms against Polars' 18-24 ms and pyarrow's 83-86 ms. With the handle kept, which is
+query, is 9-13 ms against Polars' 16-22 ms and pyarrow's 81-83 ms. With the handle kept, which is
 what a query engine does:
 
 ### One `float64` column (400 MB of values), file handle kept open
 
 | codec | reader | read ms | sum ms |
 |---|---|---:|---:|
-| snappy | **arrowmetal (GPU)** | **9** | **2** |
-| snappy | pyarrow.ParquetFile | 54 | 6 |
-| lz4 | **arrowmetal (GPU)** | **9** | **2** |
-| lz4 | pyarrow.ParquetFile | 50 | 6 |
-| none | **arrowmetal (GPU)** | **5** | 6 |
-| none | pyarrow.ParquetFile | 43 | 6 |
+| snappy | **arrowmetal (GPU)** | **7** | **2** |
+| snappy | pyarrow.ParquetFile | 52 | 6 |
+| lz4 | **arrowmetal (GPU)** | **8** | **2** |
+| lz4 | pyarrow.ParquetFile | 49 | 6 |
+| none | **arrowmetal (GPU)** | **3** | **2** |
+| none | pyarrow.ParquetFile | 44 | 6 |
 
 That is the shape a query actually has — open once, project a column, compute — and ArrowMetal is
-5.6-8.6x ahead on the read (6.0x Snappy, 5.6x LZ4, 8.6x uncompressed). The reduction over the columns
-of the two compressed files takes 2 ms against 6, because the values are already in GPU memory when
-it starts; over the uncompressed file's column both took 6 ms in this run. 400 MB decoded in 5 ms is
-80 GB/s.
+6.1-14.7x ahead on the read (7.4x Snappy, 6.1x LZ4, 14.7x uncompressed). The reduction takes 2 ms
+against 6 on all three files, because the values are already in GPU memory when it starts. 400 MB
+decoded in 3.2 ms (the warm `price` read of the open-file cache table above) is 124 GB/s.
 
 ### Decompression on its own
 
@@ -617,26 +615,26 @@ PYTHONPATH=python python Benchmarks/parquet_nested_bench.py --rows 1000000,10000
 
 ### What the numbers say
 
-- **CPU time is the headline.** Reading the whole 50 M-row table costs the host 78-101 ms of CPU against
-  806-1442 ms for the CPU readers. The decode is compute the process never does, so the cores stay free
+- **CPU time is the headline.** Reading the whole 50 M-row table costs the host 78-91 ms of CPU against
+  760-1332 ms for the CPU readers. The decode is compute the process never does, so the cores stay free
   for whatever else is running.
-- **The arrays land in GPU memory already.** Summing the column ArrowMetal just decoded takes 2-6 ms; the
+- **The arrays land in GPU memory already.** Summing the column ArrowMetal just decoded takes 2 ms; the
   CPU reader pays 6 ms *and* had to materialise the array first. There is no import step, because the
   decode wrote into Metal shared memory in the first place.
 - **Opening the file costs little; the first read of a column costs a little more.** A fresh open is
-  0.30-0.31 ms, and a cold one-column read 8.91-13.92 ms against 3.48-10.78 ms with the handle kept: the
+  0.2-0.3 ms, and a cold one-column read 6.9-12.2 ms against 3.2-7.6 ms with the handle kept: the
   cold read parses the column's page headers and makes its chunks resident for the GPU. Holding the
   `ParquetFile` across queries, which is what a query engine does, keeps both.
 - **Snappy and LZ4 on *compressible* data are where ArrowMetal is behind Polars on a whole-file read**
-  (114 and 105 ms against 104 and 86). An LZ77 token stream is serial, so a page is decoded by one
+  (108 and 96 ms against 99 and 74). An LZ77 token stream is serial, so a page is decoded by one
   thread or one SIMD group, and the cost scales with the number of *tokens*, not with bytes.
   Incompressible pages are one huge literal and decode at memory speed — the `price` column, 400 MB of
-  random doubles, comes back in 9 ms with the handle kept. Token-dense pages decode one per thread, with
+  random doubles, comes back in 7-8 ms with the handle kept. Token-dense pages decode one per thread, with
   all of a read's columns in one dispatch (above). An LCG-generated `int64` column in 64 KB-1 MB pages,
   too few pages for that, decodes at 4.7-4.8 GB/s where the uncompressed path does 58-72 GB/s.
 - **Where the GPU is unambiguously ahead is the uncompressed and dictionary paths**, which is also where
   a GPU-resident analytics stack wants to be: 58-72 GB/s for a plain `int64` column, the whole
-  uncompressed table 1.45x Polars, and a dictionary column that comes back as an Arrow dictionary array
+  uncompressed table 1.6x Polars, and a dictionary column that comes back as an Arrow dictionary array
   without materialising a single string.
 
 ## The writer

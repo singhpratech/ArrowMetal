@@ -324,8 +324,9 @@ side `mem::forget`s its copy, exactly as the Python binding does after `_export_
 
 Strings go through `CompatLevel::oldest()` -- Arrow `LargeUtf8`, not the `Utf8View` layout Polars
 uses natively. That conversion is the plugin's only copy, and it is why the plugin's string row
-below is 2.3x rather than 89x. Tiers 1, 3 and 4 hand String columns over as `Utf8View`, which the
-kernels read directly (the Strings paragraphs under Numbers and Limits).
+below is 2.3x where tier 1's, which takes the column as views, is 17.6x. Tiers 1, 3 and 4 hand
+String columns over as `Utf8View`, which the kernels read directly (the Strings paragraphs under
+Numbers and Limits).
 
 `arrowmetal-sys` is a hand-written transcription of the header, not bindgen output: the surface
 is small, the header is stable, and a checked-in file needs no libclang on the build machine.
@@ -626,11 +627,11 @@ declined):
 
 A subtree the engine can translate still has to be one where the GPU is ahead, because getting a
 Polars column onto the GPU is not free: a single-chunk numeric column is imported without a copy,
-but mapping its pages into Metal and releasing them costs time on every query. In the runs below a
-String column was also converted on the CPU (Polars' `large_string` export and a narrowing pass);
-the engine now hands String columns over in Polars' own view layout (see "Strings" under Limits),
-and the `string` rows have not been re-measured since. `MetalEngine()` (`shapes="measured"`)
-decides per subtree from measured crossovers (`python/arrowmetal/_engine_policy.py`). Each translated subtree has shape classes:
+but mapping its pages into Metal and releasing them costs time on every query. In the crossover
+sweep below a String column was also converted on the CPU (Polars' `large_string` export and a
+narrowing pass); the engine now hands String columns over in Polars' own view layout (see "Strings"
+under Limits), which is the layout of the String cases in the benchmark of the defaults below.
+`MetalEngine()` (`shapes="measured"`) decides per subtree from measured crossovers (`python/arrowmetal/_engine_policy.py`). Each translated subtree has shape classes:
 
 * `rowwise` -- filters and projections only;
 * `aggregate:<family>` (a whole-frame aggregate), `group_by:<family>` (one key) and
@@ -719,41 +720,42 @@ table in force.
   2,505,017 rows; the filter, group-by and aggregate cases are behind at every size.
 
 **The default against Polars and against `shapes="all"`.** `Benchmarks/polars_engine_bench.py` over
-all 45 cases at 2,000,000 and 50,000,000 rows and the Parquet cases over the 50,000,000-row files,
-best of 7, every result checked against Polars': `Benchmarks/results/polars_engine_bench_2026-09-26.csv`,
-run conditions in `Benchmarks/results/polars_engine_bench_2026-09-26_conditions.txt` (1-minute load
-average 8 to 22 during the run). The default took a subtree in these 18 case-size pairs, each ahead of
-the faster Polars engine:
+all 45 cases at 2,000,000 and 50,000,000 rows, best of 5, every result checked against Polars':
+`Benchmarks/results/polars_engine_bench_2026-09-26-quiet.csv`; the Parquet cases over the
+50,000,000-row files are the rows of `Benchmarks/results/polars_engine_scan_2026-09-26-quiet.csv`
+("Tier 4 over a Parquet file" under Numbers). Run conditions for both in
+`Benchmarks/results/bench_conditions_2026-09-26-quiet.txt`. The default took a subtree in these 18
+case-size pairs, each ahead of the faster Polars engine:
 
 | case | rows | Polars in-memory | Polars streaming | `shapes="all"`, cold | `MetalEngine()`, cold | vs faster Polars |
 |---|---|---:|---:|---:|---:|---:|
-| (e) inner join then sum (the join taken) | 2M | 8.18 ms | 5.14 ms | 5.03 ms | **3.97 ms** | 1.30 |
-| (m) sort 3 columns by an int64 key | 2M | 13.24 ms | 15.08 ms | 5.40 ms | **3.06 ms** | 4.33 |
-| (q) filter, then sort by (int32 asc, int64 desc) | 2M | 15.23 ms | 15.54 ms | 8.64 ms | **7.29 ms** | 2.09 |
-| (w1) inner join, 1M-row build side | 2M | 7.42 ms | 5.25 ms | 4.36 ms | **4.00 ms** | 1.31 |
-| (w2) left join, 1M-row build side | 2M | 10.53 ms | 6.25 ms | 5.29 ms | **3.97 ms** | 1.57 |
-| (x2) sort by a nullable Float64 key, descending | 2M | 19.94 ms | 20.48 ms | 7.82 ms | **8.55 ms** | 2.33 |
-| (e) inner join then sum (the join taken) | 50M | 23.60 ms | 19.88 ms | 9.96 ms | **9.45 ms** | 2.10 |
-| (m) sort 3 columns by an int64 key | 50M | 437.70 ms | 526.15 ms | 86.33 ms | **79.57 ms** | 5.50 |
-| (p) filter, then sort by (int32 asc, nullable Float64 desc) | 50M | 1080.81 ms | 1147.58 ms | 596.39 ms | **582.99 ms** | 1.85 |
-| (q) filter, then sort by (int32 asc, int64 desc) | 50M | 778.48 ms | 971.85 ms | 121.62 ms | **186.92 ms** | 4.16 |
-| (r) unique over (region, sub), keep first | 50M | 275.54 ms | 307.79 ms | 41.25 ms | **32.92 ms** | 8.37 |
-| (w1) inner join, 1M-row build side | 50M | 96.84 ms | 106.27 ms | 41.88 ms | **38.25 ms** | 2.53 |
-| (w2) left join, 1M-row build side | 50M | 268.88 ms | 105.45 ms | 45.22 ms | **43.15 ms** | 2.44 |
-| (w4) anti join, 1M-row build side | 50M | 80.81 ms | 93.10 ms | 42.46 ms | **39.68 ms** | 2.04 |
-| (x1) unique over (k1, k2), keep first | 50M | 893.09 ms | 606.95 ms | 286.06 ms | **305.79 ms** | 1.98 |
-| (x2) sort by a nullable Float64 key, descending | 50M | 621.42 ms | 656.96 ms | 161.93 ms | **211.11 ms** | 2.94 |
-| (s4) Parquet scan, sort by a Float64 key, uncompressed | 50M | 847.22 ms | 680.41 ms | 274.89 ms | **278.52 ms** | 2.44 |
-| (s4) Parquet scan, sort by a Float64 key, snappy | 50M | 631.10 ms | 678.80 ms | 307.55 ms | **304.41 ms** | 2.07 |
+| (e) inner join then sum (the join taken) | 2M | 7.9 ms | 5.1 ms | 4.0 ms | **2.7 ms** | 1.9 |
+| (m) sort 3 columns by an int64 key | 2M | 12.5 ms | 14.2 ms | 4.5 ms | **2.7 ms** | 4.6 |
+| (q) filter, then sort by (int32 asc, int64 desc) | 2M | 14.4 ms | 14.9 ms | 4.3 ms | **4.3 ms** | 3.4 |
+| (w1) inner join, 1M-row build side | 2M | 7.7 ms | 5.4 ms | 3.6 ms | **2.5 ms** | 2.2 |
+| (w2) left join, 1M-row build side | 2M | 10.7 ms | 6.2 ms | 4.9 ms | **2.9 ms** | 2.1 |
+| (x2) sort by a nullable Float64 key, descending | 2M | 19.4 ms | 20.6 ms | 6.6 ms | **6.8 ms** | 2.9 |
+| (e) inner join then sum (the join taken) | 50M | 24.6 ms | 17.9 ms | 9.1 ms | **9.3 ms** | 1.9 |
+| (m) sort 3 columns by an int64 key | 50M | 405.4 ms | 478.0 ms | 77.3 ms | **81.0 ms** | 5.0 |
+| (p) filter, then sort by (int32 asc, nullable Float64 desc) | 50M | 1023.9 ms | 1079.8 ms | 398.6 ms | **398.3 ms** | 2.6 |
+| (q) filter, then sort by (int32 asc, int64 desc) | 50M | 745.2 ms | 791.1 ms | 119.5 ms | **121.2 ms** | 6.2 |
+| (r) unique over (region, sub), keep first | 50M | 179.9 ms | 243.7 ms | 38.2 ms | **30.5 ms** | 5.9 |
+| (w1) inner join, 1M-row build side | 50M | 105.7 ms | 95.9 ms | 43.2 ms | **38.4 ms** | 2.5 |
+| (w2) left join, 1M-row build side | 50M | 276.1 ms | 103.2 ms | 45.5 ms | **42.9 ms** | 2.4 |
+| (w4) anti join, 1M-row build side | 50M | 78.4 ms | 87.8 ms | 45.0 ms | **40.9 ms** | 1.9 |
+| (x1) unique over (k1, k2), keep first | 50M | 860.1 ms | 586.4 ms | 280.2 ms | **300.6 ms** | 2.0 |
+| (x2) sort by a nullable Float64 key, descending | 50M | 552.8 ms | 650.7 ms | 161.9 ms | **257.9 ms** | 2.1 |
+| (s4) Parquet scan, sort by a Float64 key, uncompressed | 50M | 562.0 ms | 563.2 ms | 73.7 ms | **75.0 ms** | 7.5 |
+| (s4) Parquet scan, sort by a Float64 key, snappy | 50M | 542.3 ms | 559.4 ms | 123.7 ms | **123.5 ms** | 4.4 |
 
 In the other 80 case-size pairs the default took nothing and ran Polars' in-memory plan; there its
-time was 0.67 to 1.50 times the `polars in-memory` row of the same case, which is the spread of two
+time was 0.7 to 1.4 times the `polars in-memory` row of the same case, which is the spread of two
 runs of the same Polars plan in this run and the noise bound its ratios are read against. `shapes="all"`
-is ahead of the faster Polars engine in 13 of those 80, all group-by, semi join and `unique` shapes
-whose class has a crossover above that size or none (at 50M rows: `(v2)` 8.21, `(v1)` 5.04, `(t5)`
-4.26, `(t7)` 2.39, `(i)` 2.30, `(w3)` 2.20).
+is ahead of the faster Polars engine in 24 of those 80: group-by, semi join, `unique` and sort shapes,
+numeric and String, whose class has a crossover above that size or none (at 50M rows: `(v2)` 6.8,
+`(y5)` 4.8, `(v1)` 4.3, `(t5)` 3.8, `(k)` 2.5, `(l)` 2.4, `(i)` 2.2, `(t7)` 2.2, `(c)` 2.0).
 
-**Float64 group sums and means at 2^24 groups.** The (v3) case of the crossover sweep, a mean over two keys with about as many groups as rows, found ArrowMetal's group-by returning null for most groups at 16,777,216 groups and above (16,777,215 were right): the per-group kernels dispatched one threadgroup per group and the grid wrapped past 2^32 threads. Fixed in the core ([FINDINGS.md](FINDINGS.md), round 13; `python/tests/test_group_by_2_24.py`), so no engine rule is needed and every group-by shape follows the policy above. In the 2026-09-26 benchmark, which ran before the fix, `(c)`, `(l)`, `(t3)`, `(t6)`, `(v3)` and the Parquet cases `(s1)` and `(s2)` stayed with Polars under `shapes="all"` because of the guard that was in place then.
+**Float64 group sums and means at 2^24 groups.** The (v3) case of the crossover sweep, a mean over two keys with about as many groups as rows, found ArrowMetal's group-by returning null for most groups at 16,777,216 groups and above (16,777,215 were right): the per-group kernels dispatched one threadgroup per group and the grid wrapped past 2^32 threads. Fixed in the core ([FINDINGS.md](FINDINGS.md), round 13; `python/tests/test_group_by_2_24.py`), so no engine rule is needed and every group-by shape follows the policy above. The benchmark above ran with the fix: under `shapes="all"` the cases the guard once kept with Polars, `(c)`, `(l)`, `(t3)`, `(t6)`, `(v3)` and the Parquet cases `(s1)` and `(s2)`, run on Metal and equal Polars' answers. At 50M rows `(c)` is 2.0, `(l)` 2.4 and `(t6)` 1.3 times the faster Polars engine; `(t3)` is behind at 37.1 ms against 13.9 and `(v3)` at 723.2 ms against 484.0.
 
 ```python
 am.MetalEngine()                          # shapes="measured": the crossovers above
@@ -982,12 +984,15 @@ per-shape table.
 ## Numbers
 
 These are tiers 1 and 2, and tier 4 over a Parquet file at the end; tier 4's measurements over
-in-memory frames are in `Benchmarks/results/polars_engine_bench_2026-09-26.csv` and
+in-memory frames are in `Benchmarks/results/polars_engine_bench_2026-09-26-quiet.csv` and
 `Benchmarks/results/polars_engine_crossover_2026-09-26.csv` (see "Tier 4" above).
 
 Apple M4 Max, macOS 26.6.2, polars 1.44.1 (16 threads), pyarrow 25.0.1, ArrowMetal 0.1.0. Best of 5
 runs after a warm-up, one process, one data set. Every figure below is from
-`Benchmarks/results/polars_bench_50000000_2026-09-07.txt`. Reproduce with:
+`Benchmarks/results/polars_bench_50000000_2026-09-07.txt`, except the String rows: those are ArrowMetal
+0.2.0 with String columns handed over in Polars' view layout, best of 5,
+`Benchmarks/results/polars_bench_strings_view_2026-09-26-quiet.txt` (run conditions in
+`Benchmarks/results/bench_conditions_2026-09-26-quiet.txt`). Reproduce with:
 
 ```
 PYTHONPATH=python python Benchmarks/polars_bench.py 50000000 5
@@ -1005,7 +1010,16 @@ pyarrow's Acero are on the Compare tab and in the benchmark matrix.
 | `filter(k == 2) + sum(v)` | 4.3 ms / 9.4 CPU-ms | 13.9 ms (0.3x) | 11.8 ms (0.4x) | 0.8 ms (5.1x) |
 | group-by `sum(v)` by 1000 keys | 79.3 ms / 1121 CPU-ms | 20.1 ms (4.0x) | 19.7 ms (4.0x) | 1.9 ms, aggregate only, group ids cached |
 | `top_k(100)` | 60.0 ms / 60.1 CPU-ms | 18.2 ms (3.3x) | 18.0 ms (3.3x) | 10.5 ms (5.7x) |
-| string `contains` (literal) | 634.1 ms / 634.0 CPU-ms | 290.7 ms (2.2x) | 272.8 ms (2.3x) | 7.1 ms (89.3x) |
+| string `contains` (literal) | 671.1 ms / 670.8 CPU-ms | 38.1 ms (17.6x) | 290.4 ms (2.3x) | 6.0 ms (112.4x) |
+| string `contains` (literal), `string_layout="offsets"` | 671.1 ms / 670.8 CPU-ms | 316.7 ms (2.1x) | | 6.3 ms (106.9x) |
+
+The String hand-off of that column, 50M rows, in the same run:
+
+| String hand-off | ms | CPU-ms |
+|---|---:|---:|
+| `pl.Series` -> Metal, view layout (0 bytes copied, 40 data buffers) | 30.0 | 27.7 |
+| `pl.Series` -> Metal, offsets (`large_string`) | 309.0 | 308.9 |
+| Metal -> `pl.Series`, view layout | 0.0 | 0.0 |
 
 ### Reading the table
 
@@ -1032,10 +1046,11 @@ pyarrow's Acero are on the Compare tab and in the benchmark matrix.
 * **CPU-ms is the other half of the story.** The 50M group-by costs Polars 1121 CPU-ms across 16
   threads; ArrowMetal costs 14.0 CPU-ms end to end and 0.4 CPU-ms resident. On a laptop that is
   battery, and on a shared box it is 16 cores left free for something else.
-* **Strings** are the exception in both directions: 89x resident, 2.2x through the bridge. Polars
-  stores strings as `Utf8View` and ArrowMetal reads offsets + bytes, so the conversion is a real
-  copy, and at 50M rows it dominates. Keeping a string column resident (`s.arrowmetal.to_metal()`)
-  pays for itself immediately.
+* **Strings** cross in Polars' own `Utf8View` layout: 50M rows hand over in 30.0 ms with no bytes
+  copied, against 309.0 ms through `large_string` (offsets + bytes), which is a copy. Through the
+  namespace `contains` is 17.6x with views and 2.1x with offsets; resident it is 112.4x (106.9x over
+  offsets). The tier-2 plugin still asks Polars for `large_string` and is 2.3x. Keeping a string
+  column resident (`s.arrowmetal.to_metal()`) takes the 38.1 ms call to 6.0 ms.
 
 ### Where each tier is worth using
 
@@ -1055,31 +1070,33 @@ collected by Polars' in-memory and streaming engines and by `MetalEngine(shapes=
 "cold" clears the open-file cache before every run, so the engine opens and maps the file each time;
 "warm" keeps it open between runs. Polars reads the file on every run; the file stays in the OS page
 cache throughout. Best of 5, every engine result equal to Polars',
-`Benchmarks/results/polars_engine_scan_2026-09-25-quiet.csv` (run conditions in
-`Benchmarks/results/bench_conditions_2026-09-25-quiet.txt`).
+`Benchmarks/results/polars_engine_scan_2026-09-26-quiet.csv` (run conditions in
+`Benchmarks/results/bench_conditions_2026-09-26-quiet.txt`).
 
 | case | codec | Polars in-memory | Polars streaming | MetalEngine cold | MetalEngine warm | `MetalEngine()` default, cold |
 |---|---|---:|---:|---:|---:|---:|
-| (s1) filter `price > 500`, group-by `qty` (1,000 keys), sum + count | snappy | 104.84 ms | 46.26 ms | 236.02 ms | 94.60 ms | 103.67 ms (Polars) |
-| | none | 88.97 ms | 36.80 ms | 237.35 ms | 39.97 ms | 92.16 ms (Polars) |
-| (s2) filter `id < 5,000,000` (45 of 50 row groups skipped), group-by, sum | snappy | 24.10 ms | 12.32 ms | 47.61 ms | 33.89 ms | 24.00 ms (Polars) |
-| | none | 16.45 ms | 5.36 ms | 27.78 ms | 7.14 ms | 17.55 ms (Polars) |
-| (s3) filter on two columns, sum + count | snappy | 13.55 ms | 13.46 ms | 168.65 ms | 17.79 ms | 15.17 ms (Polars) |
-| | none | 13.68 ms | 13.50 ms | 204.65 ms | **10.72 ms** | 14.31 ms (Polars) |
-| (s4) sort 2 columns by a Float64 key | snappy | 561.44 ms | 573.40 ms | **281.55 ms** | **139.27 ms** | **277.94 ms** (Metal) |
-| | none | 574.75 ms | 575.73 ms | **271.45 ms** | **73.25 ms** | **262.07 ms** (Metal) |
+| (s1) filter `price > 500`, group-by `qty` (1,000 keys), sum + count | snappy | 98.7 ms | 45.6 ms | 101.9 ms | 91.3 ms | 99.7 ms (Polars) |
+| | none | 87.6 ms | 36.1 ms | 47.2 ms | **31.6 ms** | 90.3 ms (Polars) |
+| (s2) filter `id < 5,000,000` (45 of 50 row groups skipped), group-by, sum | snappy | 21.8 ms | 12.1 ms | 35.0 ms | 33.4 ms | 24.1 ms (Polars) |
+| | none | 16.2 ms | 5.1 ms | 8.5 ms | 6.3 ms | 17.2 ms (Polars) |
+| (s3) filter on two columns, sum + count | snappy | 14.0 ms | 13.7 ms | 21.0 ms | 13.9 ms | 14.7 ms (Polars) |
+| | none | 13.8 ms | 13.1 ms | 13.3 ms | **5.9 ms** | 14.0 ms (Polars) |
+| (s4) sort 2 columns by a Float64 key | snappy | 542.3 ms | 559.4 ms | **123.7 ms** | **116.3 ms** | **123.5 ms** (Metal) |
+| | none | 562.0 ms | 563.2 ms | **73.7 ms** | **64.7 ms** | **75.0 ms** (Metal) |
 
-* **The sort is ahead cold and warm**: 1.99x (snappy) and 2.12x (uncompressed) the faster Polars
-  engine cold, 4.03x and 7.85x warm, and the default takes it (2.02x and 2.19x).
-* **Cold, the other three are behind and to improve**: 0.07-0.26 of the faster Polars engine's speed
-  (`vs_fastest_polars`). The cold runs include what the open-file cache removes: opening the file and
-  handing the pages the query reads to Metal, 149-191 ms for a one-column read of these files
+* **The sort is ahead cold and warm**: 4.4x (snappy) and 7.6x (uncompressed) the faster Polars
+  engine cold, 4.7x and 8.7x warm, and the default takes it (4.4x and 7.5x).
+* **Cold, the other three are behind and to improve**, from 35.0 ms against 12.1 ((s2), snappy) to
+  13.3 ms against 13.1 ((s3), uncompressed) (`vs_fastest_polars`). The cold runs include what the
+  open-file cache removes: opening the file and handing the pages the query reads to Metal; a
+  one-column read of these files is 6.9-12.2 ms through a fresh open and 3.2-7.6 ms through the cache
   ([PARQUET.md](PARQUET.md), "The open-file cache"). The default leaves them to Polars.
-* **Warm**, (s3) over the uncompressed file is ahead of Polars' streaming engine (10.72 ms against
-  13.50, 1.26x); (s1) is behind at 0.92 (39.97 ms against 36.80) and (s2) at 0.75 on the uncompressed
-  file. Over the Snappy file, which the GPU decompresses first ([PARQUET.md](PARQUET.md), "What the
-  numbers say"), (s1) is 0.49, (s2) 0.36 and (s3) 0.76.
-* **CPU time**: the warm engine runs cost 5.3-13.6 ms of process CPU, against 41.5-6765.4 ms for
+* **Warm**, over the uncompressed file (s3) is ahead of Polars' streaming engine (5.9 ms against
+  13.1, 2.2x) and so is (s1) (31.6 ms against 36.1, 1.1x); (s2) is behind at 6.3 ms against 5.1.
+  Over the Snappy file, which the GPU decompresses first ([PARQUET.md](PARQUET.md), "What the
+  numbers say"), (s1) is behind at 91.3 ms against 45.6, (s2) at 33.4 against 12.1 and (s3) at 13.9
+  against 13.7.
+* **CPU time**: the warm engine runs cost 2.9-7.8 ms of process CPU, against 37.5-6733.8 ms for
   Polars (`cpu_ms`).
 
 ```
