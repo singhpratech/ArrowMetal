@@ -26,7 +26,7 @@ import Foundation
 /// blocks). Nothing above U+017F is ever changed, so Greek, Cyrillic and everything else pass
 /// through byte-for-byte.
 enum StringTransformSource {
-    static let source = KernelSource.prelude + """
+    static let source = KernelSource.prelude + StringLayoutSource.accessors + """
     // Transform op codes; must match StringTransform in StringTransforms.swift.
     #define TF_ASCII_UPPER   0u
     #define TF_ASCII_LOWER   1u
@@ -230,26 +230,24 @@ enum StringTransformSource {
     }
 
     // Pass 1: output byte length per row. Null rows produce 0 bytes.
-    kernel void str_tf_len(device const int* offsets [[buffer(0)]], device const uchar* data [[buffer(1)]],
-                           device const uchar* validity [[buffer(2)]], device const uint* nPtr [[buffer(3)]],
-                           constant TfParams& prm [[buffer(4)]], device const uchar* a1 [[buffer(5)]],
-                           device const uchar* a2 [[buffer(6)]], device int* outLens [[buffer(7)]],
-                           device uchar* scratch [[buffer(8)]], uint i [[thread_position_in_grid]]) {
+    template <typename S> inline void str_tf_len_t(S s, device const uchar* validity, device const uint* nPtr,
+                                                   constant TfParams& prm, device const uchar* a1,
+                                                   device const uchar* a2, device int* outLens,
+                                                   device uchar* scratch, uint i) {
         if (i >= *nPtr) return;
         if ((prm.flags & 1u) != 0u && !bit_get(validity, i)) { outLens[i] = 0; return; }
-        int start = offsets[i], len = offsets[i + 1] - start;
-        outLens[i] = tf_apply(data, start, len, a1, prm.n1, a2, prm.n2, prm.op, prm.p1, prm.p2, scratch, 0, false);
+        int len; device const uchar* data = s.row(i, len);
+        outLens[i] = tf_apply(data, 0, len, a1, prm.n1, a2, prm.n2, prm.op, prm.p1, prm.p2, scratch, 0, false);
     }
     // Pass 2: the bytes, at outOffsets[i].
-    kernel void str_tf_write(device const int* offsets [[buffer(0)]], device const uchar* data [[buffer(1)]],
-                             device const uchar* validity [[buffer(2)]], device const uint* nPtr [[buffer(3)]],
-                             constant TfParams& prm [[buffer(4)]], device const uchar* a1 [[buffer(5)]],
-                             device const uchar* a2 [[buffer(6)]], device const int* outOffsets [[buffer(7)]],
-                             device uchar* outData [[buffer(8)]], uint i [[thread_position_in_grid]]) {
+    template <typename S> inline void str_tf_write_t(S s, device const uchar* validity, device const uint* nPtr,
+                                                     constant TfParams& prm, device const uchar* a1,
+                                                     device const uchar* a2, device const int* outOffsets,
+                                                     device uchar* outData, uint i) {
         if (i >= *nPtr) return;
         if ((prm.flags & 1u) != 0u && !bit_get(validity, i)) return;
-        int start = offsets[i], len = offsets[i + 1] - start;
-        tf_apply(data, start, len, a1, prm.n1, a2, prm.n2, prm.op, prm.p1, prm.p2, outData, outOffsets[i], true);
+        int len; device const uchar* data = s.row(i, len);
+        tf_apply(data, 0, len, a1, prm.n1, a2, prm.n2, prm.op, prm.p1, prm.p2, outData, outOffsets[i], true);
     }
 
     // binary_join_element_wise with one separator: a + sep + b, null if either side is null.
@@ -282,12 +280,11 @@ enum StringTransformSource {
     }
 
     // count_substring (mode 0) and find_substring (mode 1, byte index or -1).
-    kernel void str_tf_search(device const int* offsets [[buffer(0)]], device const uchar* data [[buffer(1)]],
-                              device const uint* nPtr [[buffer(2)]], device const uchar* pat [[buffer(3)]],
-                              constant uint& plen [[buffer(4)]], constant uint& mode [[buffer(5)]],
-                              device int* out [[buffer(6)]], uint i [[thread_position_in_grid]]) {
+    template <typename S> inline void str_tf_search_t(S s, device const uint* nPtr, device const uchar* pat,
+                                                      uint plen, uint mode, device int* out, uint i) {
         if (i >= *nPtr) return;
-        int start = offsets[i], end = offsets[i + 1];
+        int len; device const uchar* data = s.row(i, len);
+        int start = 0, end = len;
         if (plen == 0u) { out[i] = (mode == 0u) ? tf_ncp(data, start, end) + 1 : 0; return; }
         int found = 0, p = start;
         while (p + (int)plen <= end) {
@@ -318,17 +315,28 @@ enum StringTransformSource {
         }
         return (op >= 4u) ? anyCased : true;
     }
-    kernel void str_tf_class(device const int* offsets [[buffer(0)]], device const uchar* data [[buffer(1)]],
-                             device const uint* nPtr [[buffer(2)]], constant uint& op [[buffer(3)]],
-                             device uint* out [[buffer(4)]], uint w [[thread_position_in_grid]]) {
+    template <typename S> inline void str_tf_class_t(S s, device const uint* nPtr, uint op, device uint* out, uint w) {
         uint n = *nPtr, base = w * 32u;
         if (base >= n) return;
         uint limit = min(32u, n - base), bits = 0u;
         for (uint j = 0; j < limit; j++) {
             uint i = base + j;
-            if (tf_class(data, offsets[i], offsets[i + 1] - offsets[i], op)) bits |= (1u << j);
+            int len; device const uchar* data = s.row(i, len);
+            if (tf_class(data, 0, len, op)) bits |= (1u << j);
         }
         out[w] = bits;
     }
-    """
+
+    """ + StringLayoutSource.variants("str_tf_len", slots: [0],
+        params: "device const uchar* validity [[buffer(2)]], device const uint* nPtr [[buffer(3)]], constant TfParams& prm [[buffer(4)]], device const uchar* a1 [[buffer(5)]], device const uchar* a2 [[buffer(6)]], device int* outLens [[buffer(7)]], device uchar* scratch [[buffer(8)]], uint i [[thread_position_in_grid]]",
+        call: "str_tf_len_t(S0, validity, nPtr, prm, a1, a2, outLens, scratch, i)")
+    + StringLayoutSource.variants("str_tf_write", slots: [0],
+        params: "device const uchar* validity [[buffer(2)]], device const uint* nPtr [[buffer(3)]], constant TfParams& prm [[buffer(4)]], device const uchar* a1 [[buffer(5)]], device const uchar* a2 [[buffer(6)]], device const int* outOffsets [[buffer(7)]], device uchar* outData [[buffer(8)]], uint i [[thread_position_in_grid]]",
+        call: "str_tf_write_t(S0, validity, nPtr, prm, a1, a2, outOffsets, outData, i)")
+    + StringLayoutSource.variants("str_tf_search", slots: [0],
+        params: "device const uint* nPtr [[buffer(2)]], device const uchar* pat [[buffer(3)]], constant uint& plen [[buffer(4)]], constant uint& mode [[buffer(5)]], device int* out [[buffer(6)]], uint i [[thread_position_in_grid]]",
+        call: "str_tf_search_t(S0, nPtr, pat, plen, mode, out, i)")
+    + StringLayoutSource.variants("str_tf_class", slots: [0],
+        params: "device const uint* nPtr [[buffer(2)]], constant uint& op [[buffer(3)]], device uint* out [[buffer(4)]], uint w [[thread_position_in_grid]]",
+        call: "str_tf_class_t(S0, nPtr, op, out, w)")
 }

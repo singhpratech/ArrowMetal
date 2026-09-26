@@ -96,16 +96,15 @@ enum StringExtraSource {
     }
 
     // One 32-bit word of the answer per thread, plus one word of "this row has a byte >= 0x80".
-    kernel void sx_pred(device const int* offsets [[buffer(0)]], device const uchar* data [[buffer(1)]],
-                        device const uint* nPtr [[buffer(2)]], constant uint& op [[buffer(3)]],
-                        device uint* out [[buffer(4)]], device uint* nonAscii [[buffer(5)]],
-                        uint w [[thread_position_in_grid]]) {
+    template <typename S> inline void sx_pred_t(S s, device const uint* nPtr, uint op, device uint* out,
+                                                device uint* nonAscii, uint w) {
         uint n = *nPtr, base = w * 32u;
         if (base >= n) return;
         uint limit = min(32u, n - base), bits = 0u, high = 0u;
         for (uint j = 0; j < limit; j++) {
             uint i = base + j;
-            int start = offsets[i], end = offsets[i + 1];
+            int len; device const uchar* data = s.row(i, len);
+            int start = 0, end = len;
             bool ascii = true;
             for (int p = start; p < end; p++) if (data[p] >= 0x80u) { ascii = false; break; }
             if (!ascii) { high |= (1u << j); if (op == SXP_STRING_IS_ASCII) continue; }
@@ -188,25 +187,21 @@ enum StringExtraSource {
         }
     }
 
-    kernel void sx_tf_len(device const int* offsets [[buffer(0)]], device const uchar* data [[buffer(1)]],
-                          device const uchar* validity [[buffer(2)]], device const uint* nPtr [[buffer(3)]],
-                          constant SxParams& prm [[buffer(4)]], device const uchar* a1 [[buffer(5)]],
-                          device int* outLens [[buffer(6)]], device uchar* scratch [[buffer(7)]],
-                          uint i [[thread_position_in_grid]]) {
+    template <typename S> inline void sx_tf_len_t(S s, device const uchar* validity, device const uint* nPtr,
+                                                  constant SxParams& prm, device const uchar* a1,
+                                                  device int* outLens, device uchar* scratch, uint i) {
         if (i >= *nPtr) return;
         if ((prm.flags & 1u) != 0u && !bit_get(validity, i)) { outLens[i] = 0; return; }
-        int start = offsets[i], len = offsets[i + 1] - start;
-        outLens[i] = sx_apply(data, start, len, a1, prm.n1, prm.op, prm.p1, prm.p2, scratch, 0, false);
+        int len; device const uchar* data = s.row(i, len);
+        outLens[i] = sx_apply(data, 0, len, a1, prm.n1, prm.op, prm.p1, prm.p2, scratch, 0, false);
     }
-    kernel void sx_tf_write(device const int* offsets [[buffer(0)]], device const uchar* data [[buffer(1)]],
-                            device const uchar* validity [[buffer(2)]], device const uint* nPtr [[buffer(3)]],
-                            constant SxParams& prm [[buffer(4)]], device const uchar* a1 [[buffer(5)]],
-                            device const int* outOffsets [[buffer(6)]], device uchar* outData [[buffer(7)]],
-                            uint i [[thread_position_in_grid]]) {
+    template <typename S> inline void sx_tf_write_t(S s, device const uchar* validity, device const uint* nPtr,
+                                                    constant SxParams& prm, device const uchar* a1,
+                                                    device const int* outOffsets, device uchar* outData, uint i) {
         if (i >= *nPtr) return;
         if ((prm.flags & 1u) != 0u && !bit_get(validity, i)) return;
-        int start = offsets[i], len = offsets[i + 1] - start;
-        sx_apply(data, start, len, a1, prm.n1, prm.op, prm.p1, prm.p2, outData, outOffsets[i], true);
+        int len; device const uchar* data = s.row(i, len);
+        sx_apply(data, 0, len, a1, prm.n1, prm.op, prm.p1, prm.p2, outData, outOffsets[i], true);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -345,7 +340,16 @@ enum StringExtraSource {
         outValid[i] = 1;
     }
 
-    """ + StringLayoutSource.variants("sx_hash_insert", slots: [0],
+    """ + StringLayoutSource.variants("sx_pred", slots: [0],
+        params: "device const uint* nPtr [[buffer(2)]], constant uint& op [[buffer(3)]], device uint* out [[buffer(4)]], device uint* nonAscii [[buffer(5)]], uint w [[thread_position_in_grid]]",
+        call: "sx_pred_t(S0, nPtr, op, out, nonAscii, w)")
+    + StringLayoutSource.variants("sx_tf_len", slots: [0],
+        params: "device const uchar* validity [[buffer(2)]], device const uint* nPtr [[buffer(3)]], constant SxParams& prm [[buffer(4)]], device const uchar* a1 [[buffer(5)]], device int* outLens [[buffer(6)]], device uchar* scratch [[buffer(7)]], uint i [[thread_position_in_grid]]",
+        call: "sx_tf_len_t(S0, validity, nPtr, prm, a1, outLens, scratch, i)")
+    + StringLayoutSource.variants("sx_tf_write", slots: [0],
+        params: "device const uchar* validity [[buffer(2)]], device const uint* nPtr [[buffer(3)]], constant SxParams& prm [[buffer(4)]], device const uchar* a1 [[buffer(5)]], device const int* outOffsets [[buffer(6)]], device uchar* outData [[buffer(7)]], uint i [[thread_position_in_grid]]",
+        call: "sx_tf_write_t(S0, validity, nPtr, prm, a1, outOffsets, outData, i)")
+    + StringLayoutSource.variants("sx_hash_insert", slots: [0],
         params: "device const ulong* keys [[buffer(2)]], device const uchar* sv [[buffer(3)]], device const uint* nPtr [[buffer(4)]], constant uint& mask [[buffer(5)]], constant uint& hasValidity [[buffer(6)]], device atomic_uint* table [[buffer(7)]], uint i [[thread_position_in_grid]]",
         call: "sx_hash_insert_t(S0, keys, sv, nPtr, mask, hasValidity, table, i)")
     + StringLayoutSource.variants("sx_is_in", slots: [0, 4],

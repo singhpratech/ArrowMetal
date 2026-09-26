@@ -250,6 +250,12 @@ extension MetalStringArray {
     /// tables cannot disagree. Reads the shared data buffer on the host, sharded over 64 KiB chunks.
     public func isAllASCII() throws -> Bool {
         try context.syncPoint()
+        if view != nil {
+            // Row by row through the views, so the check does not convert the column.
+            var high = false
+            forEachRowBytes { bytes in if !high, bytes.contains(where: { $0 >= 0x80 }) { high = true } }
+            return !high
+        }
         return withExtendedLifetime(self) { () -> Bool in
             let o = offsets.typed(Int32.self)
             let start = Int(o[0]), end = Int(o[length])
@@ -282,11 +288,10 @@ extension MetalStringArray {
         var prm = Self.sxParams(op.rawValue, arg1.count, 0, p1, p2, validity == nil ? 0 : 1)
 
         if n > 0 {
-            let pLen = try sxPipeline("sx_tf_len")
+            let pLen = try sxPipeline(Self.kernelName("sx_tf_len", self))
             try ctx.run { enc in
                 enc.setComputePipelineState(pLen)
-                enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-                enc.setBuffer(data.mtl, offset: data.offset, index: 1)
+                bindLayout(enc, at: 0)
                 enc.setBuffer(vb.mtl, offset: vb.offset, index: 2)
                 Dispatch.setLength(enc, n, nil, index: 3)
                 enc.setBytes(&prm, length: 24, index: 4)
@@ -301,11 +306,10 @@ extension MetalStringArray {
         let total = Int(withExtendedLifetime(outOffsets) { outOffsets.typed(Int32.self)[n] })
         let outData = try MetalArrowBuffer.allocate(byteCount: total, zeroed: false, context: ctx)
         if n > 0 {
-            let pWrite = try sxPipeline("sx_tf_write")
+            let pWrite = try sxPipeline(Self.kernelName("sx_tf_write", self))
             try ctx.run { enc in
                 enc.setComputePipelineState(pWrite)
-                enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-                enc.setBuffer(data.mtl, offset: data.offset, index: 1)
+                bindLayout(enc, at: 0)
                 enc.setBuffer(vb.mtl, offset: vb.offset, index: 2)
                 Dispatch.setLength(enc, n, nil, index: 3)
                 enc.setBytes(&prm, length: 24, index: 4)
@@ -350,11 +354,10 @@ extension MetalStringArray {
         let nonAscii = try MetalArrowBuffer.allocate(byteCount: Swift.max(Bitmap.byteCount(bits: n), 1),
                                                      zeroed: true, context: ctx)
         if n > 0 {
-            let pso = try sxPipeline("sx_pred")
+            let pso = try sxPipeline(Self.kernelName("sx_pred", self))
             try ctx.run { enc in
                 enc.setComputePipelineState(pso)
-                enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-                enc.setBuffer(data.mtl, offset: data.offset, index: 1)
+                bindLayout(enc, at: 0)
                 Dispatch.setLength(enc, n, nil, index: 2)
                 Dispatch.setUInt(enc, p.rawValue, index: 3)
                 enc.setBuffer(out.mtl, offset: out.offset, index: 4)
@@ -380,7 +383,6 @@ extension MetalStringArray {
             for w in 0..<words where na[w] != 0 { any = true; break }
             guard any else { return }
             let bits = out.mutableTyped(UInt8.self)
-            let o = offsets.typed(Int32.self), d = data.typed(UInt8.self)
             let n = length
             let wordsPerChunk = 128
             let chunks = (words + wordsPerChunk - 1) / wordsPerChunk
@@ -392,8 +394,7 @@ extension MetalStringArray {
                         let i = w * 32 + m.trailingZeroBitCount
                         m &= m &- 1
                         guard i < n else { break }
-                        let s = String(decoding: UnsafeBufferPointer(start: d + Int(o[i]),
-                                                                     count: Int(o[i + 1] - o[i])), as: UTF8.self)
+                        let s = String(decoding: self.rowBytes(i), as: UTF8.self)
                         if evaluate(s) { Bitmap.set(bits, i) } else { Bitmap.clear(bits, i) }
                     }
                 }

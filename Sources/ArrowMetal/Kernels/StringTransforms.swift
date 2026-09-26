@@ -73,11 +73,10 @@ extension MetalStringArray {
         var prm = Self.params(op.rawValue, arg1.count, arg2.count, p1, p2, validity == nil ? 0 : 1)
 
         if n > 0 {
-            let pLen = try tfPipeline("str_tf_len")
+            let pLen = try tfPipeline(Self.kernelName("str_tf_len", self))
             try ctx.run { enc in
                 enc.setComputePipelineState(pLen)
-                enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-                enc.setBuffer(data.mtl, offset: data.offset, index: 1)
+                bindLayout(enc, at: 0)
                 enc.setBuffer(vb.mtl, offset: vb.offset, index: 2)
                 Dispatch.setLength(enc, n, nil, index: 3)
                 enc.setBytes(&prm, length: 24, index: 4)
@@ -94,11 +93,10 @@ extension MetalStringArray {
         let total = Int(withExtendedLifetime(outOffsets) { outOffsets.typed(Int32.self)[n] })
         let outData = try MetalArrowBuffer.allocate(byteCount: total, zeroed: false, context: ctx)
         if n > 0 {
-            let pWrite = try tfPipeline("str_tf_write")
+            let pWrite = try tfPipeline(Self.kernelName("str_tf_write", self))
             try ctx.run { enc in
                 enc.setComputePipelineState(pWrite)
-                enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-                enc.setBuffer(data.mtl, offset: data.offset, index: 1)
+                bindLayout(enc, at: 0)
                 enc.setBuffer(vb.mtl, offset: vb.offset, index: 2)
                 Dispatch.setLength(enc, n, nil, index: 3)
                 enc.setBytes(&prm, length: 24, index: 4)
@@ -319,11 +317,10 @@ extension MetalStringArray {
         let patBuf = try argBuffer(pat)
         let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(n * 4, 4), zeroed: true, context: ctx)
         if n > 0 {
-            let p = try tfPipeline("str_tf_search")
+            let p = try tfPipeline(Self.kernelName("str_tf_search", self))
             try ctx.run { enc in
                 enc.setComputePipelineState(p)
-                enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-                enc.setBuffer(data.mtl, offset: data.offset, index: 1)
+                bindLayout(enc, at: 0)
                 Dispatch.setLength(enc, n, nil, index: 2)
                 enc.setBuffer(patBuf.mtl, offset: patBuf.offset, index: 3)
                 Dispatch.setUInt(enc, pat.count, index: 4)
@@ -344,11 +341,10 @@ extension MetalStringArray {
         try Dispatch.checkLength(n)
         let out = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: n), zeroed: true, context: ctx)
         if n > 0 {
-            let p = try tfPipeline("str_tf_class")
+            let p = try tfPipeline(Self.kernelName("str_tf_class", self))
             try ctx.run { enc in
                 enc.setComputePipelineState(p)
-                enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-                enc.setBuffer(data.mtl, offset: data.offset, index: 1)
+                bindLayout(enc, at: 0)
                 Dispatch.setLength(enc, n, nil, index: 2)
                 Dispatch.setUInt(enc, cls.rawValue, index: 3)
                 enc.setBuffer(out.mtl, offset: out.offset, index: 4)

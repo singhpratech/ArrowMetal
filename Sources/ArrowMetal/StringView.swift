@@ -378,6 +378,11 @@ extension MetalStringArray {
         enc.setBuffer(d.mtl, offset: d.offset, index: index + 1)
     }
 
+    /// Calls `body` with the bytes of every non-null row, in order, from either layout.
+    func forEachRowBytes(_ body: (UnsafeBufferPointer<UInt8>) -> Void) {
+        withExtendedLifetime(self) { for i in 0..<length where isValid(i) { body(rowBytes(i)) } }
+    }
+
     /// `"view"` for a column held as views, `"view (converted)"` once a kernel without a view form has
     /// converted it, `"offsets"` otherwise.
     public var layoutDescription: String {
