@@ -1,0 +1,15 @@
+# engine bench, default vs all, on the table with group-count buckets (polars_engine_crossover_2026-09-26-groups.csv); python polars_engine_bench.py --iters 5 --sizes 2000000,50000000 --scan --scan-rows 50000000 --scan-dir <local directory> --out Benchmarks/results/polars_engine_bench_2026-09-26-groups.csv; start 2026-09-26T18:52:04Z load averages: 2.97 8.90 11.45 worktree 4476e9b; waited 2 min for a 1-minute load under 3
+wait 18:50:04 4.84 11.93 12.76
+wait 18:51:04 4.26 10.40 12.13
+18:53:04 7.99 9.26 11.40
+18:54:04 11.66 10.11 11.58
+18:55:04 12.12 10.46 11.60
+18:56:04 10.99 10.46 11.52
+18:57:04 12.47 11.17 11.73
+18:58:04 9.41 10.48 11.43
+18:59:04 14.06 11.48 11.73
+19:00:04 14.09 11.85 11.84
+19:01:04 14.02 12.41 12.06
+19:02:04 12.06 12.02 11.93
+19:03:04 16.64 13.28 12.40
+rc=0 end 19:04:01 load averages: 17.36 14.09 12.76

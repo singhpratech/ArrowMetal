@@ -31,33 +31,56 @@
   String column is among its inputs) and an input (in-memory frames, or a Parquet file judged by its
   footer's row count). It runs on Metal when its input rows are at or above the crossover of every
   class in it: the largest of the engine table (`python/arrowmetal/_engine_crossovers.py`, fitted by
-  the new `Benchmarks/polars_engine_crossover.py` from `Benchmarks/results/polars_engine_crossover_2026-09-26-quiet.csv`,
-  45 in-memory cases at eight sizes from 250,000 to 50,000,000 rows and the Parquet cases at six sizes
-  from 1,000,000 to 50,000,000, best of 7, run conditions in `polars_engine_crossover_2026-09-26-quiet_conditions.txt`;
+  the new `Benchmarks/polars_engine_crossover.py` from `Benchmarks/results/polars_engine_crossover_2026-09-26-groups.csv`,
+  93 in-memory cases at eight sizes from 250,000 to 50,000,000 rows and the Parquet cases at six sizes
+  from 1,000,000 to 50,000,000, best of 7, run conditions in `polars_engine_crossover_2026-09-26-groups_conditions.txt`;
   a case counts as ahead when its time x 1.15, or x 1.35 for a shape with a String column, is at most
   the faster Polars engine's, and a shape with a String column is taken from 5,000,000 rows at the
   earliest), the router table in force for the kernels it routes, and the sort kernels' crossover
   against the fastest CPU library. Taken: sorts from 1,000,000 rows, numeric-key left joins from
-  1,250,000 input rows, inner joins from 1,331,203 and anti joins from 2,559,451, `unique` from
-  4,339,049, sorts of a Parquet file from 1,611,058, sorts, helper-key sorts and `unique` with a String
-  column from 5,000,000, and a group-by sum over two or more keys with a String column from 8,015,080.
-  Group-by cases have their own crossovers where the sweep brought them ahead (one key, 100,000 groups:
-  min + max from 1,694,705, count from 2,645,908, sum from 3,671,287; two keys, 10,000 groups: count from
-  775,581, sum from 953,630, Float64 sum + mean from 1,736,342, mean + max from 4,446,614), but the
-  200-group cases on one key and the two-key cases with about as many groups as rows are behind at
-  every size, so the numeric group-by classes are not taken; neither are whole-frame aggregates, top-k,
-  semi joins, row-wise shapes and the other String shapes. `shapes="all"`, `min_rows=` and a new
-  explicit set of class names (`shapes={"sort", "join"}`) override it. Each taken subtree's report
-  entry carries `rule`, `shape`, `dtype_class` and `input`, and each node the policy leaves has a
-  `Kind#id: rule: ...` line ("900,000 input rows is below the 1,331,203-row crossover for join:inner
-  (...)"). `arrowmetal.polars_engine.placement_rules()` lists the table; `SHAPE_CLASSES` replaces
-  `MEASURED_SHAPES`, and `MetalEngine().min_rows` is `None` unless given. In
-  `Benchmarks/results/polars_engine_bench_2026-09-26-quiet3.csv` (45 in-memory cases at 2M and 50M
-  rows and the 50M Parquet cases, 98 case-size pairs; run conditions in
-  `bench_conditions_2026-09-26-quiet3.txt`) the default took 22 pairs, each ahead of the faster Polars
-  engine, 1.51x to 7.58x. `Benchmarks/polars_engine_bench.py` gains 37
-  cases and `--crossover`; `python/tests/test_engine_policy.py` tests the policy.
-- The crossover sweep's `(v3)` case found ArrowMetal's group-by returning wrong Float64 sums and means from 16,777,216 groups (most groups null); fixed in the core (below), so the engine applies no group-count rule.
+  1,250,000 input rows, inner joins from 1,290,248 and anti joins from 2,515,388, `unique` from
+  3,360,943, sorts of a Parquet file from 1,488,148, and sorts, helper-key sorts and `unique` with a
+  String column from 5,000,000; group-bys by their number of groups (next entry). Whole-frame
+  aggregates, top-k, semi joins, row-wise shapes and the other String shapes are not taken.
+  `shapes="all"`, `min_rows=` and a new explicit set of class names (`shapes={"sort", "join"}`)
+  override it. Each taken subtree's report entry carries `rule`, `shape`, `dtype_class` and `input`,
+  and each node the policy leaves has a `Kind#id: rule: ...` line ("900,000 input rows is below the
+  1,290,248-row crossover for join:inner (...)"). `arrowmetal.polars_engine.placement_rules()` lists
+  the table; `SHAPE_CLASSES` replaces `MEASURED_SHAPES`, and `MetalEngine().min_rows` is `None` unless
+  given. `Benchmarks/polars_engine_bench.py` gains 85 cases and `--crossover`;
+  `python/tests/test_engine_policy.py` tests the policy.
+- `MetalEngine()` judges a group-by by its number of groups. The crossover sweep has a group-by grid
+  (each aggregate family over one int32 key and over two, keys drawn from 200, 1,000, 10,000, 100,000
+  and 1,000,000 values and from half the rows) and records each group-by's group count; every
+  group-by class is fitted per bucket of group counts (200, 1,000, 10,000, 100,000, 1,000,000, and at
+  least a quarter of the input rows), each bucket from the worst of its cases at each size
+  (`_engine_crossovers.GROUPS`, `arrowmetal.polars_engine.group_placement_rules()`). At plan time the
+  engine estimates the group count of a group-by whose keys are columns of one in-memory input frame:
+  the distinct key tuples of a fixed-seed stratified sample, scaled by the bias-corrected Chao1
+  estimator, from 512 sampled rows and four times more until every count in the estimate's range gets
+  the same decision (at most 65,536 rows); the samples are cached per frame, key columns and size
+  (`clear_group_estimates()`), so the same frame gets the same estimate and decision on every collect
+  and in every process. A Parquet file's footer distinct counts are read when every row group states
+  them. Taken now: over 10,000 to 1,000,000 groups every numeric group-by class, from 736,547 to
+  17,071,257 rows by class and bucket; over two keys the count also at 200 and 1,000 groups and the sum
+  and min/max at 1,000; the one-key count over a quarter of the rows or more from 2,854,102; the
+  (String, int32) sum over about 1,000,000 groups from 7,220,150. Not taken: one-key group-bys over
+  200 or 1,000 groups, and the other classes over a quarter of the rows or more; a group-by with no
+  estimate (a computed key, two group-bys in one subtree) stays with Polars. The report names the
+  estimate in the rule ("estimated 191 groups over (region), a Chao1 estimate from a 512-row sample,
+  189 to 196: below the measured band for group_by:sum at 50,000,000 input rows (taken at 3,163 to
+  3,162,277 groups; ...)") and lists each probe with its time (`last_report.groups`). In
+  `Benchmarks/results/polars_engine_bench_2026-09-26-groups.csv` (the 93 in-memory cases at 2M and 50M
+  rows and the 50M Parquet cases, 194 case-size pairs; run conditions in
+  `bench_conditions_2026-09-26-groups.txt`) the default took 69 pairs, 48 of them group-bys; 68 are
+  ahead of the faster Polars engine, 1.14x to 11.30x, and one, the one-key count over 0.43 times as
+  many groups as rows at 50M, is at 0.94x (`shapes="all"`, the same plan, 1.20x in the same run).
+  The probe takes 66 to 461 µs at 50,000,000 rows (0.10% to 1.19% of the group-by it decides) and 50
+  to 393 µs at 2,000,000 (1.09% to 4.90%), median of 9 cold collects
+  (`Benchmarks/results/group_probe_2026-09-26.csv`, from the new `Benchmarks/group_probe_bench.py`);
+  in the default benchmark's process, which holds every case's frames, up to 22.1 ms on two-key
+  frames with 1,000,000 groups or more at 50M.
+- The crossover sweep's `(v3)` case found ArrowMetal's group-by returning wrong Float64 sums and means from 16,777,216 groups (most groups null); fixed in the core (below), so the engine needs no guard for it.
 - Parquet reads, cold and warm. On the 50,000,000-row, 8-column benchmark files a whole-file read
   through a fresh open is 108 ms (Snappy), 96 ms (LZ4) and 41 ms (uncompressed), against 369, 340 and
   250 ms in `parquet_bench_2026-09-25-quiet.txt` and against Polars' 99, 74 and 67 ms in the same run,

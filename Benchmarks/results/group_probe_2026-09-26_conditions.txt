@@ -1,0 +1,8 @@
+# group-count probe: estimate and cost against the group-by; python group_probe_bench.py --sizes 2000000,50000000 --out Benchmarks/results/group_probe_2026-09-26.csv; start 2026-09-26T19:08:31Z load averages: 2.83 7.62 10.18 worktree 4476e9b; waited 4 min for a 1-minute load under 3
+wait 19:04:01 17.36 14.09 12.76
+wait 19:05:01 9.26 12.31 12.18
+wait 19:06:01 5.20 10.62 11.55
+wait 19:07:01 4.56 9.44 11.05
+wait 19:08:01 3.33 8.23 10.48
+19:09:31 12.88 9.32 10.63
+rc=0 end 19:10:16 load averages: 14.55 10.30 10.92

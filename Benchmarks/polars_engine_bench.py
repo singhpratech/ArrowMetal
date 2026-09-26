@@ -2,8 +2,9 @@
 
 The eight shapes of `Benchmarks/engine_bench.py` and 37 more (group-by per aggregate family over one
 and two keys at few and many groups, whole-frame aggregates, each join kind, sorts, top-k, `unique`,
-and the same with a String column), written as Polars LazyFrames over in-memory Polars DataFrames,
-collected five ways:
+and the same with a String column) and a group-by grid of 48 (`group_grid`: each aggregate family
+over one and two int32 keys at 200 to 1,000,000 key values and at half the rows), written as Polars
+LazyFrames over in-memory Polars DataFrames, collected five ways:
 
 * `polars in-memory`, `polars streaming` -- `lf.collect(engine=...)`
 * `MetalEngine all, cold` / `warm`       -- `MetalEngine(shapes="all", min_rows=0)`: every shape it
@@ -143,7 +144,7 @@ def shapes(rows, rng):
             .filter(pl.col("x") > 0.2).sort(["k2", "q"], descending=[False, True]), ["k2", "q"]),
         ("(r) unique over (region, sub), keep first", f.unique(subset=["region", "sub"],
                                                                  keep="first"), False),
-    ] + more_shapes(rows, rng, fact, extra)
+    ] + more_shapes(rows, rng, fact, extra) + group_grid(rows, rng)
 
 
 def more_shapes(rows, rng, fact, extra):
@@ -225,6 +226,45 @@ def more_shapes(rows, rng, fact, extra):
     ]
 
 
+# The group counts of the group-by grid (`group_grid`): the number of key values each case's keys are
+# drawn from, uniformly; "rows/2" is half the frame's rows.
+GRID_GROUPS = (200, 1_000, 10_000, 100_000, 1_000_000, "rows/2")
+GRID_FAMILIES = (
+    ("sum", "sum", lambda: [pl.col("q").sum().alias("s")]),
+    ("count", "count", lambda: [pl.len().alias("n")]),
+    ("mean", "mean", lambda: [pl.col("q").mean().alias("m")]),
+    ("minmax", "min + max", lambda: [pl.col("q").min().alias("lo"), pl.col("q").max().alias("hi")]),
+)
+GRID_NAMES = {200: "200", 1_000: "1k", 10_000: "10k", 100_000: "100k", 1_000_000: "1M",
+              "rows/2": "R2"}
+
+
+def group_grid(rows, rng):
+    """The group-by grid the default's group-count buckets are fitted from
+    (Benchmarks/polars_engine_crossover.py): each aggregate family over one int32 key and over two,
+    at each of GRID_GROUPS key values, over an int64 value column. One key draws from [0, G); two
+    keys draw the pair from [0, G/b) x [0, b) with b = min(G, 100), so both have G possible groups.
+    The number of groups the data holds is the results file's `groups` column (uniform keys over G
+    values put about G (1 - exp(-R/G)) of them in a frame of R rows)."""
+    q = pl.Series("q", rng.integers(0, 1_000_000_000, size=rows, dtype=np.int64))
+    out = []
+    for g in GRID_GROUPS:
+        n = max(2, rows // 2) if g == "rows/2" else g
+        b = min(n, 100)
+        frame = pl.DataFrame({
+            "k": rng.integers(0, n, size=rows, dtype=np.int32),
+            "k1": rng.integers(0, max(1, n // b), size=rows, dtype=np.int32),
+            "k2": rng.integers(0, b, size=rows, dtype=np.int32),
+            "q": q}).lazy()
+        what = "rows/2" if g == "rows/2" else f"{g:,}".replace(",", " ")
+        for fam, label, aggs in GRID_FAMILIES:
+            out.append((f"(g1{fam}{GRID_NAMES[g]}) group-by grid, 1 key, {what} groups, {label}",
+                        frame.group_by("k").agg(aggs()), False))
+            out.append((f"(g2{fam}{GRID_NAMES[g]}) group-by grid, 2 keys, {what} groups, {label}",
+                        frame.group_by("k1", "k2").agg(aggs()), False))
+    return out
+
+
 def scan_shapes(path):
     """The Parquet scan cases over parquet_bench.py's file (id, qty, code, price, weight, cat, ts,
     flag), (label, LazyFrame, order_matters)."""
@@ -296,6 +336,18 @@ def rule_of(report):
     return " | ".join(lines)
 
 
+def clear_group_estimates():
+    clear = getattr(pe, "clear_group_estimates", None)
+    if clear is not None:
+        clear()
+
+
+def cold_memory():
+    """The cold state of an in-memory case: no cached import and no cached group-count estimate."""
+    pe.clear_import_cache()
+    clear_group_estimates()
+
+
 def run_case(label, lf, order, rows, iters, crossover, cold, results_rows):
     every = am.MetalEngine(min_rows=0, shapes="all")
     default = am.MetalEngine()
@@ -309,11 +361,20 @@ def run_case(label, lf, order, rows, iters, crossover, cold, results_rows):
     engines = [("polars in-memory", lambda: lf.collect(engine="in-memory"), None),
                ("polars streaming", lambda: lf.collect(engine="streaming"), None),
                ("MetalEngine all, cold", lambda: lf.collect(engine=every), cold)]
-    rule = taken_default = ""
+    groups = ""
+    if shape and ";" not in shape and all(c.startswith("group_by")
+                                          for c in shape.split("|")[0].split("+")):
+        groups = str(want.height)       # a group-by alone: one output row per group
+    rule = taken_default = estimate = probe_us = ""
     if not crossover:
+        clear_group_estimates()
         lf.collect(engine=default)
         taken_default = ";".join(t["root"] for t in default.last_report.taken)
         rule = rule_of(default.last_report)
+        # The default's group-count probes on this first, uncached collect: estimate and cost.
+        probes = getattr(default.last_report, "groups", [])
+        estimate = ";".join("" if g["estimate"] is None else str(g["estimate"]) for g in probes)
+        probe_us = ";".join(f"{g['seconds'] * 1e6:.0f}" for g in probes)
         engines += [("MetalEngine all, warm", lambda: lf.collect(engine=every), None),
                     ("MetalEngine default, cold", lambda: lf.collect(engine=default), cold)]
     results = {}
@@ -334,7 +395,10 @@ def run_case(label, lf, order, rows, iters, crossover, cold, results_rows):
                                        if is_metal else ""),
                "shape": shape if is_metal and not is_default else "",
                "input_rows": input_rows if is_metal and not is_default else "",
-               "rule": rule if is_default else ""}
+               "rule": rule if is_default else "",
+               "groups": groups if is_metal else "",
+               "groups_estimate": estimate if is_default else "",
+               "probe_us": probe_us if is_default else ""}
         results_rows.append(row)
         note = ""
         if is_metal:
@@ -379,8 +443,7 @@ def main():
         for label, lf, order in shapes(rows, rng):
             if wanted and case_id(label) not in wanted:
                 continue
-            run_case(label, lf, order, rows, args.iters, args.crossover, pe.clear_import_cache,
-                     rows_out)
+            run_case(label, lf, order, rows, args.iters, args.crossover, cold_memory, rows_out)
     if args.scan or args.scan_only:
         for scan_rows in [int(s) for s in args.scan_rows.split(",")]:
             for codec in args.scan_codecs.split(","):
@@ -393,7 +456,7 @@ def main():
 
                     def cold():
                         am.clear_parquet_cache()
-                        pe.clear_import_cache()
+                        cold_memory()
 
                     before = len(rows_out)
                     rep = run_case(f"{label} [{codec}]", lf, order, scan_rows, args.iters,

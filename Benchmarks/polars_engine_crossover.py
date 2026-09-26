@@ -25,6 +25,11 @@ group-by and top-k does not measure the group-by, because the top-k is a differe
 those cases has no crossover, neither has the class, and the default leaves it to Polars at every size.
 A case taken as more than one subtree, or not taken at all, measures nothing.
 
+The group-by classes are fitted per group-count bucket as well (`GROUP_BUCKETS`, `fit_groups`): each
+point of a group-by-only case goes to the bucket of the number of groups its data holds at that size
+(the results file's `groups` column), and at each size a bucket's point is the worst of its cases
+there. The policy judges a group-by with a group-count estimate by these buckets.
+
 The sort kernels' own crossovers against the fastest CPU library (`vs_fastest_library` of
 Benchmarks/results/router_2026-09-24.json, docs/CROSSOVER.md) are recorded alongside as `SWEEP`;
 the policy (python/arrowmetal/_engine_policy.py) takes the larger of the two, and of the router
@@ -64,6 +69,29 @@ MARGIN = {"numeric": 0.15, "string": 0.35}
 # sweep has them at 1.4x and up.
 STRING_FLOOR = 5_000_000
 METAL = "MetalEngine all, cold"
+# The group-count buckets of the group-by classes: (name, fewest groups, most groups), one per group
+# count of the sweep's group-by grid (Benchmarks/polars_engine_bench.py `GRID_GROUPS`), each reaching
+# half a decade either side of it (the geometric midpoints). A group count of at least the input rows
+# / NEAR_ROWS is the "rows/2" bucket whatever its size: the grid's rows/2 cases hold about 0.43 x rows
+# groups, and its 1,000,000-group cases fall there too below 4,000,000 rows. A group count between
+# the last bucket and rows / NEAR_ROWS, or of 0, has no bucket.
+GROUP_BUCKETS = (("200", 1, 447), ("1,000", 448, 3_162), ("10,000", 3_163, 31_622),
+                 ("100,000", 31_623, 316_227), ("1,000,000", 316_228, 3_162_277))
+NEAR_ROWS = 4
+ROWS_BUCKET = "rows/2"
+
+
+def group_bucket(groups, rows):
+    """The bucket of a group-by with `groups` groups over `rows` input rows, or None (the same rule
+    as _engine_policy.group_bucket, which reads the generated table)."""
+    if groups is None or groups <= 0:
+        return None
+    if groups * NEAR_ROWS >= rows:
+        return ROWS_BUCKET
+    for name, lo, hi in GROUP_BUCKETS:
+        if lo <= groups <= hi:
+            return name
+    return None
 
 
 def _load(name):
@@ -97,7 +125,7 @@ def read_sweep(path):
             continue
         classes, dclass, source = m["shape"].split("|")
         shape = (tuple(classes.split("+")), dclass, source)
-        c = cases.setdefault(case, {"shape": shape, "points": {}})
+        c = cases.setdefault(case, {"shape": shape, "points": {}, "groups": {}})
         if c["shape"] != shape:
             raise SystemExit(f"{case}: the engine took different shapes at different sizes "
                              f"({c['shape']} and {shape})")
@@ -108,32 +136,78 @@ def read_sweep(path):
         # its time.
         metal = float(m["wall_ms"]) if m["equal_to_polars"] == "True" else float("inf")
         c["points"][n] = (metal, min(float(eng[p]["wall_ms"]) for p in POLARS))
+        if m.get("groups"):
+            c["groups"][n] = int(m["groups"])
     return header, cases
 
 
-def fit_cases(cases):
+def fit_points(label, points, dclass, single=True):
+    """(crossover, step, bracket low) of one series {input rows: (metal_ms, polars_ms)}, or Nones.
+    `single`: whether one measured size alone can be a crossover."""
     fit = _load("_router_fit")
+    sizes = sorted(points)
+    bench = {}
+    for n, (metal, polars) in points.items():
+        bench[(label, n, "gpu")] = metal * (1 + MARGIN[dclass])
+        bench[(label, n, "cpu")] = polars
+    try:
+        cross, step, low, _pts = fit.fit(label, "cpu", None, sizes, bench)
+    except fit.FitError:
+        cross = step = low = None
+    if step is not None and step == sizes[-1] and (len(sizes) > 1 or not single):
+        # Ahead at the largest size alone is one measurement: not a crossover.
+        cross = step = low = None
+    if cross is not None and dclass == "string" and cross < STRING_FLOOR:
+        cross = STRING_FLOOR
+        step = min((n for n in sizes if n >= STRING_FLOOR), default=step)
+    return cross, step, low
+
+
+def fit_cases(cases):
     out = {}
     for case, c in sorted(cases.items()):
         sizes = sorted(c["points"])
-        bench = {}
-        for n, (metal, polars) in c["points"].items():
-            bench[(case, n, "gpu")] = metal * (1 + MARGIN[c["shape"][1]])
-            bench[(case, n, "cpu")] = polars
-        try:
-            cross, step, low, _pts = fit.fit(case, "cpu", None, sizes, bench)
-        except fit.FitError:
-            cross = step = low = None
-        if step is not None and step == sizes[-1] and len(sizes) > 1:
-            # Ahead at the largest size alone is one measurement: not a crossover.
-            cross = step = low = None
-        if cross is not None and c["shape"][1] == "string" and cross < STRING_FLOOR:
-            cross = STRING_FLOOR
-            step = min((n for n in sizes if n >= STRING_FLOOR), default=step)
+        cross, step, low = fit_points(case, c["points"], c["shape"][1])
         out[case] = {"shape": c["shape"], "rows": cross, "step": step, "low": low,
                      "largest": sizes[-1], "smallest": sizes[0],
                      "ratios": {n: round(c["points"][n][1] / c["points"][n][0], 2) for n in sizes}}
+        if c["groups"]:
+            out[case]["groups"] = {n: c["groups"][n] for n in sorted(c["groups"])}
     return out
+
+
+def fit_groups(cases):
+    """{(class, dtype class, input, bucket): fit} from the cases that are a group-by alone and
+    record their group counts. Every (case, input rows) point goes to the bucket of its group count
+    at that size, for each class of the case; at each size a bucket's series is the worst of its
+    cases there (the lowest fastest-Polars / MetalEngine ratio), so the fitted step is the largest
+    of the cases' own, and a bucket measured at one size alone has no crossover."""
+    pooled = {}
+    for case, c in cases.items():
+        classes, dclass, source = c["shape"]
+        if not c["groups"] or {node_of(x) for x in classes} != {"group_by"}:
+            continue
+        for n, (metal, polars) in c["points"].items():
+            b = group_bucket(c["groups"].get(n), n)
+            if b is None:
+                continue
+            for cls in classes:
+                pooled.setdefault((cls, dclass, source, b), {}).setdefault(n, []).append(
+                    (case, metal, polars, c["groups"][n]))
+    table = {}
+    for key, by_size in sorted(pooled.items()):
+        points = {}
+        for n, pts in by_size.items():
+            _case, metal, polars, _g = min(pts, key=lambda p: (p[2] / p[1], p[0]))
+            points[n] = (metal, polars)
+        cross, step, _low = fit_points("|".join(key), points, key[1], single=False)
+        sizes = sorted(points)
+        groups = [p[3] for pts in by_size.values() for p in pts]
+        table[key] = {"rows": cross, "step": step, "largest": sizes[-1], "smallest": sizes[0],
+                      "cases": sorted({p[0] for pts in by_size.values() for p in pts}),
+                      "groups": (min(groups), max(groups)),
+                      "ratios": {n: round(points[n][1] / points[n][0], 2) for n in sizes}}
+    return table
 
 
 def fit_classes(per_case):
@@ -163,7 +237,7 @@ def sweep():
             for cls, labels in SWEEP_LABELS.items()}
 
 
-def render(source, header, per_case, table):
+def render(source, header, per_case, table, groups):
     lines = [
         '"""The MetalEngine\'s per-shape crossover table. Generated by Benchmarks/polars_engine_crossover.py',
         f"from {source}; do not edit by hand (`--check` fails when this file and that one disagree).",
@@ -173,6 +247,10 @@ def render(source, header, per_case, table):
         "A case is ahead at a size when MetalEngine time x (1 + MARGIN[dtype class]) <= the faster Polars engine's.",
         "CASES: each case's own fit and its ratio (fastest Polars / MetalEngine) at every input size.",
         "SWEEP: the sort kernels' crossovers against the fastest CPU library, from " + SWEEP_JSON + ".",
+        "GROUPS: {(class, dtype class, input, group-count bucket): the same fit over the points of the",
+        "group-by cases whose group count at that size falls in the bucket (GROUP_BUCKETS, and ROWS_BUCKET",
+        "for at least input rows / NEAR_ROWS groups), the worst case at each size; \"groups\": the fewest",
+        "and most groups measured there}.",
         '"""',
         "",
         f"SOURCE = {source!r}",
@@ -180,10 +258,15 @@ def render(source, header, per_case, table):
         f"SWEEP_SOURCE = {SWEEP_JSON!r}",
         f"MARGIN = {MARGIN!r}",
         f"STRING_FLOOR = {STRING_FLOOR!r}",
+        f"GROUP_BUCKETS = {GROUP_BUCKETS!r}",
+        f"NEAR_ROWS = {NEAR_ROWS!r}",
+        f"ROWS_BUCKET = {ROWS_BUCKET!r}",
         "",
         "ENGINE = " + pprint.pformat(table, width=100, sort_dicts=True),
         "",
         "SWEEP = " + pprint.pformat(sweep(), width=100, sort_dicts=True),
+        "",
+        "GROUPS = " + pprint.pformat(groups, width=100, sort_dicts=True),
         "",
         "CASES = " + pprint.pformat(per_case, width=100, sort_dicts=True),
         "",
@@ -195,7 +278,8 @@ def generate(csv_path):
     source = os.path.relpath(os.path.abspath(csv_path), ROOT)
     header, cases = read_sweep(csv_path)
     per_case = fit_cases(cases)
-    return render(source, header, per_case, fit_classes(per_case)), per_case
+    groups = fit_groups(cases)
+    return render(source, header, per_case, fit_classes(per_case), groups), per_case, groups
 
 
 def main():
@@ -209,7 +293,7 @@ def main():
     if path is None:
         with open(OUT) as fh:
             path = os.path.join(ROOT, re.search(r"^SOURCE = '([^']+)'", fh.read(), re.M).group(1))
-    text, per_case = generate(path)
+    text, per_case, groups = generate(path)
     if args.print:
         for case, f in per_case.items():
             x = f"{f['rows']:,}" if f["rows"] else "not reached"
@@ -221,6 +305,13 @@ def main():
             e = table[k]
             x = f"{e['rows']:,}" if e["rows"] else "not reached"
             print(f"{k[0]:<24} {k[1]:<8} {k[2]:<8} {x:>12}  up to {e['largest']:,}  {', '.join(e['cases'])}")
+        print()
+        order = [b[0] for b in GROUP_BUCKETS] + [ROWS_BUCKET]
+        for k in sorted(groups, key=lambda k: (k[:3], order.index(k[3]))):
+            e = groups[k]
+            x = f"{e['rows']:,}" if e["rows"] else "not reached"
+            print(f"{k[0]:<22} {k[1]:<8} {k[2]:<8} {k[3]:>10} groups {x:>12}  "
+                  f"({e['groups'][0]:,} to {e['groups'][1]:,} groups measured)  {e['ratios']}")
     if args.check:
         with open(OUT) as fh:
             if fh.read() != text:
