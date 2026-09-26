@@ -2,6 +2,40 @@
 
 Things learned the hard way. Add to this whenever something surprises you.
 
+## Round 13 (2026-09-26): a grid of 2^32 threads runs almost none of them
+
+**What.** `am.group_by([key]).sum(values)` and `.mean(values)` over Float64 values, and over Float32
+values (summed in Float64), came back null for 2^24 groups and more; 2^24 - 1 groups were right. At
+exactly 2^24 groups every group was null, at 2^24 + 1 every group but one, at 2^24 + 2^20 the first
+2^20 groups were right and the other 2^24 null. No error was raised. `product` and `list` were wrong
+for the same groups. Count, min and max over every type, and the Int64 sum and mean, were right. Found by
+the Polars engine's crossover sweep.
+
+**Cause.** Those aggregates reduce one group per 256-thread threadgroup and dispatched a
+`(groups, 1, 1)` grid of threadgroups (`seg_reduce`, `Kernels/Segmented.swift`). On the M4 Max the
+thread count of a grid dimension, threadgroups times threads per threadgroup, is held in 32 bits: at
+2^24 threadgroups of 256 threads it is 2^32 and wraps, and the dispatch runs `groups mod 2^24`
+threadgroups. A standalone kernel shows it: 2^24 threadgroups of 32 threads all run, 2^24 of 256 run
+none, 2^23 of 512 run none, 2^25 + 3 of 128 run 3. The groups that no threadgroup reached kept a
+count of zero and came back null. The atomic path (count, 32-bit min/max, integer sum and mean) and
+the two-pass 64-bit min/max dispatch over rows, not groups, and never reach that width. The same
+one-threadgroup-per-group grid served the segmented 64-bit min/max, product, the list gather, the
+variance passes over groups of 32 rows or more on average, and the per-group run sort of the counting
+sort.
+
+**Fix.** `Dispatch.perGroup` dispatches every one-threadgroup-per-group kernel. Below 2^32 threads the
+grid is the same `(groups, 1, 1)`; from there it is folded into rows of 65,536 threadgroups, and the
+kernels read their group as `(tgid.y << 16) + tgid.x`. Reading the row width from
+`threadgroups_per_grid` instead nearly doubled the time of a light per-group kernel (a gather over 10M
+groups of 5 rows: 122.6 ms against 64.5 ms), so the width is a power of two known to the kernel. The
+50M-row group-by rows run in the same time as before.
+
+**Tests.** `GroupByGridFoldTests` (Swift) checks sum, mean, count, min and max over Float64, Float32
+and Int64 at 2^24 - 1, 2^24, 2^24 + 1 and 2^24 + 2^20 groups against a host reference, and runs every
+per-group kernel with the fold forced on at 150,000 groups against the plain grid.
+`python/tests/test_group_by_2_24.py` checks the same aggregates, product and list at the same four
+group counts against pyarrow's `Table.group_by`, and the lazy-plan Float64 sum and mean at 2^24 groups.
+
 ## Round 12 (2026-09-24): what the 0.2.0 reviews found
 
 **TL;DR**

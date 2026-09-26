@@ -174,7 +174,9 @@ also its ceiling: no 64-bit min/max, no Float64 values.
 
 The **segmented** path (`Kernels/Segmented.swift`) removes atomics from the aggregation. It argsorts the
 keys once, which makes each group a contiguous run of the sorted order, then reduces one run per
-threadgroup. `segments()` returns the sorted order so several aggregates share the one sort. It covers
+threadgroup, at any group count (past 2^24 groups the grid of threadgroups is folded into rows,
+see [FINDINGS.md](FINDINGS.md), round 13). `segments()` returns the sorted order so several
+aggregates share the one sort. It covers
 exactly what the atomic path could not: Float64 sums and means (through the software binary64 adder in
 `Kernels/DoubleMath.swift`), Float32 sums and means accumulated in Float64, and 64-bit min/max.
 

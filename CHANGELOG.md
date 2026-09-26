@@ -162,6 +162,15 @@
   cases give the same pass, fail and skip counts as their utf8 cells. `engine_report.py` takes
   `--dtypes` and `--string-layout`; the Polars grid's 459 String cases pass with 0 unclassified on
   both layouts, with no view column converted.
+- Group-by at 2^24 groups and more: the Float64 sum and mean and the Float32 sum and mean (in
+  Float64) came back null for most groups once there were 2^24 groups or more, and product and list
+  were wrong for those groups. These aggregates reduce one group per 256-thread threadgroup, and a grid
+  dimension of 2^32 threads or more wraps on the GPU, so only `groups mod 2^24` threadgroups ran. Every
+  one-threadgroup-per-group kernel (also the segmented 64-bit min/max, the variance passes and the
+  counting sort's run sort) now dispatches through `Dispatch.perGroup`, which folds the grid into rows
+  of 65,536 threadgroups past that width; the 50M-row group-by timings are unchanged. Tests:
+  `GroupByGridFoldTests` and `python/tests/test_group_by_2_24.py`, at 2^24 - 1, 2^24, 2^24 + 1 and
+  2^24 + 2^20 groups (docs/FINDINGS.md, round 13).
 
 ## 0.2.0
 Everything below is new in 0.2.0.
