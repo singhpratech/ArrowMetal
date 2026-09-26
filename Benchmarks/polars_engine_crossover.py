@@ -83,6 +83,11 @@ ROWS_BUCKET = "rows/2"
 # is not monotone in the sweep (a one-key count runs 0.76, 1.9, 4.04, 2.21, 1.18 from 2M to 50M rows)
 # and its cases came in at 0.88-0.93x of Polars in the default benchmark where the fit had taken them.
 UNTAKEN_BUCKETS = (ROWS_BUCKET,)
+# Headroom over the fitted crossover: the fit interpolates between sizes measured 2-2.5x apart, and a
+# shape just past its crossover sits within run-to-run noise of Polars (a 10,000-group min/max fitted at
+# 1.72M rows was 1.45x in the sweep and 0.85x in the benchmark at 2M). The default takes a shape from
+# HEADROOM times its fitted crossover; the fit itself is kept in the table as `fit`.
+HEADROOM = 1.5
 
 
 def group_bucket(groups, rows):
@@ -161,18 +166,26 @@ def fit_points(label, points, dclass, single=True):
     if step is not None and step == sizes[-1] and (len(sizes) > 1 or not single):
         # Ahead at the largest size alone is one measurement: not a crossover.
         cross = step = low = None
+    fitted = cross
+    if cross is not None:
+        cross = int(cross * HEADROOM)
+        if cross > sizes[-1]:
+            # Headroom past the largest size measured: not a crossover the sweep can vouch for.
+            cross = step = low = None
+        else:
+            step = min((n for n in sizes if n >= cross), default=step)
     if cross is not None and dclass == "string" and cross < STRING_FLOOR:
         cross = STRING_FLOOR
         step = min((n for n in sizes if n >= STRING_FLOOR), default=step)
-    return cross, step, low
+    return cross, step, low, fitted
 
 
 def fit_cases(cases):
     out = {}
     for case, c in sorted(cases.items()):
         sizes = sorted(c["points"])
-        cross, step, low = fit_points(case, c["points"], c["shape"][1])
-        out[case] = {"shape": c["shape"], "rows": cross, "step": step, "low": low,
+        cross, step, low, fitted = fit_points(case, c["points"], c["shape"][1])
+        out[case] = {"shape": c["shape"], "rows": cross, "fit": fitted, "step": step, "low": low,
                      "largest": sizes[-1], "smallest": sizes[0],
                      "ratios": {n: round(c["points"][n][1] / c["points"][n][0], 2) for n in sizes}}
         if c["groups"]:
@@ -204,10 +217,10 @@ def fit_groups(cases):
         for n, pts in by_size.items():
             _case, metal, polars, _g = min(pts, key=lambda p: (p[2] / p[1], p[0]))
             points[n] = (metal, polars)
-        cross, step, _low = fit_points("|".join(key), points, key[1], single=False)
+        cross, step, _low, fitted = fit_points("|".join(key), points, key[1], single=False)
         sizes = sorted(points)
         groups = [p[3] for pts in by_size.values() for p in pts]
-        table[key] = {"rows": cross, "step": step, "largest": sizes[-1], "smallest": sizes[0],
+        table[key] = {"rows": cross, "fit": fitted, "step": step, "largest": sizes[-1], "smallest": sizes[0],
                       "cases": sorted({p[0] for pts in by_size.values() for p in pts}),
                       "groups": (min(groups), max(groups)),
                       "ratios": {n: round(points[n][1] / points[n][0], 2) for n in sizes}}
@@ -263,6 +276,7 @@ def render(source, header, per_case, table, groups):
         f"MARGIN = {MARGIN!r}",
         f"STRING_FLOOR = {STRING_FLOOR!r}",
         f"UNTAKEN_BUCKETS = {UNTAKEN_BUCKETS!r}",
+        f"HEADROOM = {HEADROOM!r}",
         f"GROUP_BUCKETS = {GROUP_BUCKETS!r}",
         f"NEAR_ROWS = {NEAR_ROWS!r}",
         f"ROWS_BUCKET = {ROWS_BUCKET!r}",
