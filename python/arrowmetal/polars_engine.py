@@ -1624,6 +1624,17 @@ class _ImportCache:
 
 _cache = _ImportCache()
 
+#: How in-memory String / Binary columns reach the GPU: "view" hands over Polars' own `Utf8View` /
+#: `BinaryView` buffers, which the string kernels read directly; "offsets" asks Polars for
+#: `large_string` / `large_binary` first (the layout used before the kernels read views).
+STRING_LAYOUT = "view"
+
+
+def _series_arrow(s):
+    if STRING_LAYOUT == "view" and s.dtype in (pl.String, pl.Binary) and hasattr(pl, "CompatLevel"):
+        return s.to_arrow(compat_level=pl.CompatLevel.newest())
+    return s.to_arrow()
+
 
 def clear_import_cache():
     """Drops every cached import (and with it the Polars buffers the cache kept alive)."""
@@ -1660,7 +1671,8 @@ def _leaf_sources(leaves, rows=None, scans=None):
         arrays = []
         for c in names:
             s = frame.get_column(c)
-            a = s.to_arrow()
+            # String and Binary columns cross in Polars' own view layout (see STRING_LAYOUT).
+            a = _series_arrow(s)
             # A multi-chunk column is concatenated by `to_arrow`, so its buffers are new every time.
             if rows is None and s.n_chunks() == 1 and isinstance(a, pa.Array) \
                     and not c.startswith(_HIDDEN):     # a helper column is new on every query

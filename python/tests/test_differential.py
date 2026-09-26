@@ -75,8 +75,16 @@ OTHER_TYPES = ["float16", "fixed_size_binary", "dict_utf8", "run_end_int64", "nu
 
 EXTENDED_TYPES = (TIMESTAMP_TYPES + DATE_TYPES + TIME_TYPES + DURATION_TYPES +
                   DECIMAL_TYPES + NESTED_TYPES + OTHER_TYPES)
-#: Every column type the matrix generates, in report order.
-MATRIX_TYPES = ALL_TYPES + EXTENDED_TYPES
+#: The import-layout variants. `utf8_view` is not a separate set of values but a second way in for the
+#: utf8 ones: every operation registered for utf8 also runs as `utf8_view`, where the oracle sees the
+#: same utf8 array and ArrowMetal is handed it as Arrow `string_view` (pyarrow.compute has almost no
+#: string_view kernels, so the oracle stays on utf8). `run_case` swaps the import for the duration of
+#: the case (`_view_imports`); a sliced dataset is cast before it is sliced, so the view import sees
+#: the Arrow offset; and a result ArrowMetal returns as string_view is compared as string (`_unview`).
+VIEW_TYPES = {"utf8_view": "utf8"}
+#: Every column type the matrix generates, in report order. The view variants go last so the other
+#: types keep their index, which seeds their generators.
+MATRIX_TYPES = ALL_TYPES + EXTENDED_TYPES + list(VIEW_TYPES)
 
 
 def _decimal_parts(name):
@@ -111,6 +119,7 @@ def _extended_arrow_type(name):
 
 
 ARROW_TYPE.update({n: _extended_arrow_type(n) for n in EXTENDED_TYPES})
+ARROW_TYPE["utf8_view"] = pa.string_view()
 
 #: Relative tolerance where the two engines legitimately accumulate in a different order.
 FLOAT_TOL = {"float32": 1e-6, "float64": 1e-12}
@@ -479,8 +488,16 @@ class _ByteBudgetCache:
 _CACHE = _ByteBudgetCache()
 
 
+#: id(sliced utf8 array) -> (the array, its unsliced parent, offset), for `_view_imports`. Bounded:
+#: an entry only matters while its dataset is in use.
+_SLICED_FROM = {}
+
+
 def make_array(name, shape, seed=0):
-    """A pyarrow array of type `name` matching `shape`."""
+    """A pyarrow array of type `name` matching `shape`. A view variant (`VIEW_TYPES`) returns the
+    array of the type it is a layout of: the oracle's input."""
+    if name in VIEW_TYPES:
+        return make_array(VIEW_TYPES[name], shape, seed)
     key = (name, shape.id, seed)
     hit = _CACHE.get(key)
     if hit is not None:
@@ -510,10 +527,65 @@ def make_array(name, shape, seed=0):
         arr = pa.array(values, mask=mask, type=ty)
 
     if shape.flavor == "sliced" and shape.offset:
+        parent = arr
         arr = arr.slice(shape.offset, shape.size)
+        if name == "utf8":
+            if len(_SLICED_FROM) > 256:
+                _SLICED_FROM.clear()
+            _SLICED_FROM[id(arr)] = (arr, parent, shape.offset)
     assert len(arr) == shape.size, f"generator produced {len(arr)} rows for {shape.id}"
     _CACHE.put(key, arr)
     return arr
+
+
+# ------------------------------------------------------------------ the view layout variant
+
+def _as_view(obj):
+    """What `MetalArray.from_arrow` is handed in a view case: a utf8 array as `string_view`, cast
+    from its unsliced parent when it is a slice, so the view import has an Arrow offset to honour."""
+    if isinstance(obj, pa.ChunkedArray) and obj.type == pa.string():
+        obj = obj.combine_chunks()
+    if not isinstance(obj, pa.Array) or obj.type != pa.string():
+        return obj
+    hit = _SLICED_FROM.get(id(obj))
+    if hit is not None and hit[0] is obj:
+        _arr, parent, offset = hit
+        return parent.cast(pa.string_view()).slice(offset, len(obj))
+    return obj.cast(pa.string_view())
+
+
+class _view_imports:
+    """For the duration of a view case, every utf8 array ArrowMetal imports arrives as string_view."""
+
+    def __enter__(self):
+        self._saved = am.MetalArray.__dict__["from_arrow"]
+        original = self._saved.__func__
+        am.MetalArray.from_arrow = classmethod(lambda cls, obj: original(cls, _as_view(obj)))
+        return self
+
+    def __exit__(self, *exc):
+        am.MetalArray.from_arrow = self._saved
+        return False
+
+
+def _unview(x):
+    """A result as the utf8 oracle spells it: string_view -> string, binary_view -> binary."""
+    if isinstance(x, (list, tuple)):
+        return type(x)(_unview(v) for v in x)
+    if isinstance(x, (pa.Array, pa.ChunkedArray)):
+        if x.type == pa.string_view():
+            return x.cast(pa.string())
+        if x.type == pa.binary_view():
+            return x.cast(pa.binary())
+    return x
+
+
+def imported_type(src):
+    """The type `am.array(src).type` reports: src's own, or string_view inside a view case."""
+    return pa.string_view() if _IN_VIEW_CASE[0] and src.type == pa.string() else src.type
+
+
+_IN_VIEW_CASE = [False]
 
 
 # ------------------------------------------------------------------ comparison
@@ -628,6 +700,10 @@ class Op:
 
     def __init__(self, name, types, fn, tol=None, note=""):
         self.name, self.types, self.fn, self.tol, self.note = name, list(types), fn, tol, note
+        # Every utf8 operation also runs on the view layout (VIEW_TYPES).
+        for view, base in VIEW_TYPES.items():
+            if base in self.types and view not in self.types:
+                self.types.insert(self.types.index(base) + 1, view)
 
     def __repr__(self):
         return f"Op({self.name})"
@@ -654,7 +730,7 @@ def scalar_for(name):
 @op("roundtrip", ALL_TYPES)
 def _roundtrip(src, shape):
     x = am.array(src)
-    assert x.type == src.type, f"type changed on import: {x.type} != {src.type}"
+    assert x.type == imported_type(src), f"type changed on import: {x.type} != {imported_type(src)}"
     assert len(x) == len(src), f"length changed on import: {len(x)} != {len(src)}"
     assert x.null_count == src.null_count, f"null_count {x.null_count} != {src.null_count}"
     return x.to_arrow(), src
@@ -4212,7 +4288,8 @@ class Finding:
         self.data_check = data_check
 
     def matches(self, op_name, type_name, shape):
-        if op_name not in self.ops or type_name not in self.types:
+        # A view variant computes on the same values as its base type, so it hits the same findings.
+        if op_name not in self.ops or VIEW_TYPES.get(type_name, type_name) not in self.types:
             return False
         if self.flavors is not None and shape.flavor not in self.flavors:
             return False
@@ -4525,9 +4602,20 @@ def run_case(operation, type_name, shape):
     except Exception as exc:                              # pragma: no cover - generator bug
         return FAIL, f"generator raised {type(exc).__name__}: {exc}"
     override = None
+    view = type_name in VIEW_TYPES
     try:
-        result = operation.fn(src, shape)
+        if view:
+            _IN_VIEW_CASE[0] = True
+            try:
+                with _view_imports():
+                    result = operation.fn(src, shape)
+            finally:
+                _IN_VIEW_CASE[0] = False
+        else:
+            result = operation.fn(src, shape)
         got, expected = result[0], result[1]
+        if view:
+            got = _unview(got)
         if len(result) == 3:                          # the op supplied its own tolerance
             override = result[2]
     except Unsupported as exc:
@@ -4587,7 +4675,9 @@ def test_absent_optional_operations_are_reported():
 _NOT_DIFFERENTIABLE = {"from_arrow", "to_arrow", "null_count", "format", "type", "group_by",
                        "unary", "binary", "cumulative",
                        # the later generic dispatchers: every op of each is reached by name below
-                       "window", "string_predicate", "string_transform"}
+                       "window", "string_predicate", "string_transform",
+                       # accessors of the string layout (the utf8_view column of the matrix)
+                       "string_layout", "string_view_import"}
 
 #: Methods with no case in this matrix because the generator makes no array they apply to.
 #: Empty since the generator learned the temporal, decimal and nested types: every method on

@@ -62,9 +62,10 @@ def _engines(which):
     return out
 
 
-def run_engine(name, mod, quick=False, quiet=False):
+def run_engine(name, mod, quick=False, quiet=False, dtypes=None):
     """Runs one engine's grid. Returns (per-shape tallies, total tally, documented hits, the
-    unclassified cases, not-taken reasons, seconds), or None when the engine cannot run here."""
+    unclassified cases, not-taken reasons, seconds), or None when the engine cannot run here.
+    `dtypes` restricts the Polars grid to those column types."""
     started = time.time()
     shapes = OrderedDict()
     total = Tally()
@@ -79,7 +80,7 @@ def run_engine(name, mod, quick=False, quiet=False):
         tables = mod.Tables()
     n = 0
     try:
-        for case in mod.cases(quick=quick):
+        for case in (mod.cases(quick=quick, dtypes=dtypes) if dtypes else mod.cases(quick=quick)):
             t0 = time.time()
             if tables is not None:
                 status, detail, extra = mod.run_case(case, tables)
@@ -221,18 +222,30 @@ def main(argv=None):
     parser.add_argument("--stamp", default=datetime.date.today().isoformat(),
                         help="the date in the CSV file names")
     parser.add_argument("-q", "--quiet", action="store_true", help="no progress on stderr")
+    parser.add_argument("--dtypes", help="Polars grid only: comma-separated column types (e.g. string)")
+    parser.add_argument("--string-layout", choices=["view", "offsets"], default="view",
+                        help="how the Polars engine hands String columns over (polars_engine.STRING_LAYOUT)")
     args = parser.parse_args(argv)
+    if args.dtypes and args.engine != "polars":
+        parser.error("--dtypes needs --engine polars")
 
     import arrowmetal as am
+    from arrowmetal import polars_engine
     # The grid's tables are small, so the router's `auto` would send the routed operations to their
     # CPU loops; pin the GPU as differential_report.py does. ARROWMETAL_ROUTER, when set, wins.
     if "ARROWMETAL_ROUTER" not in os.environ:
         am.set_router("gpu")
+    polars_engine.STRING_LAYOUT = args.string_layout
 
     results = OrderedDict()
+    conversions = am.string_view_conversions()
     for name, mod in _engines(args.engine):
-        results[name] = run_engine(name, mod, args.quick, args.quiet)
+        results[name] = run_engine(name, mod, args.quick, args.quiet,
+                                   dtypes=args.dtypes.split(",") if args.dtypes else None)
+    conversions = tuple(b - a for a, b in zip(conversions, am.string_view_conversions()))
     print(render(results, args.quick))
+    print(f"String columns handed over as {args.string_layout}; view columns converted to offsets + "
+          f"bytes during the run: {conversions[0]} ({conversions[1]} rows)")
     if args.csv_dir:
         for path in write_csv(results, args.csv_dir, args.stamp):
             print(f"wrote {path}")

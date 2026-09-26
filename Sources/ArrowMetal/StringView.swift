@@ -381,6 +381,59 @@ extension MetalStringArray {
     }
 }
 
+// MARK: - Building a view column in Swift
+
+extension MetalStringArray {
+    /// A column in the view layout built from Swift strings: inline views for strings of 12 bytes or
+    /// fewer, the rest packed into data buffers of at most `bufferBytes` bytes each (a string longer
+    /// than that gets a buffer of its own), so a test can make as many buffers as it likes.
+    public static func viewLayout(_ strings: [String?], bufferBytes: Int = 1 << 20,
+                                  context: MetalContext = .shared) throws -> MetalStringArray {
+        let n = strings.count
+        let views = try MetalArrowBuffer.allocate(byteCount: Swift.max(n, 1) * 16, zeroed: true, context: context)
+        var chunks: [[UInt8]] = [[]]
+        let hasNulls = strings.contains { $0 == nil }
+        let bm = hasNulls ? try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: n), context: context) : nil
+        let vp = views.mutableContents
+        var nulls = 0
+        for (i, s) in strings.enumerated() {
+            guard let s else { nulls += 1; continue }
+            if let bm { Bitmap.set(bm.mutableTyped(UInt8.self), i) }
+            let bytes = Array(s.utf8)
+            let row = vp.advanced(by: i * 16)
+            row.storeBytes(of: Int32(bytes.count), as: Int32.self)
+            if bytes.count <= 12 {
+                for (k, b) in bytes.enumerated() { row.storeBytes(of: b, toByteOffset: 4 + k, as: UInt8.self) }
+                continue
+            }
+            if !chunks[chunks.count - 1].isEmpty && chunks[chunks.count - 1].count + bytes.count > bufferBytes {
+                chunks.append([])
+            }
+            let k = chunks.count - 1
+            for j in 0..<4 { row.storeBytes(of: bytes[j], toByteOffset: 4 + j, as: UInt8.self) }
+            row.storeBytes(of: Int32(k), toByteOffset: 8, as: Int32.self)
+            row.storeBytes(of: Int32(chunks[k].count), toByteOffset: 12, as: Int32.self)
+            chunks[k].append(contentsOf: bytes)
+        }
+        if chunks.last?.isEmpty == true { chunks.removeLast() }
+        var data: [MetalArrowBuffer?] = []
+        for c in chunks {
+            let b = try MetalArrowBuffer.allocate(byteCount: Swift.max(c.count, 1), zeroed: false, context: context)
+            c.withUnsafeBytes { memcpy(b.mutableContents, $0.baseAddress!, $0.count) }
+            data.append(b)
+        }
+        let sizes = chunks.map { $0.count }
+        let probe = try StringViewStorage(views: views, dataBuffers: data, dataSizes: sizes, zeroCopy: false,
+                                          copiedBytes: 0, logicalBytes: 0, context: context)
+        let total = try StringViewStorage.logicalBytes(views: views, table: probe.table,
+                                                       resources: data.compactMap { $0?.mtl },
+                                                       length: n, validity: bm, context: context)
+        let storage = try StringViewStorage(views: views, dataBuffers: data, dataSizes: sizes, zeroCopy: false,
+                                            copiedBytes: 0, logicalBytes: total, context: context)
+        return MetalStringArray(length: n, nullCount: nulls, validity: bm, view: storage, context: context)
+    }
+}
+
 // MARK: - Import and export
 
 /// `utf8_view` ("vu") / `binary_view` ("vz") import. Buffers: validity, views, the data buffers, then
@@ -400,7 +453,13 @@ func importStringViewArray(binary: Bool, array: UnsafeMutablePointer<ArrowArray>
     guard k == 0 || sizesPtr != nil else { throw ArrowMetalError.invalidArrowArray("utf8_view: buffer sizes are null") }
 
     var zc = true, copied = 0
-    func wrap(_ p: UnsafeRawPointer, _ bytes: Int) throws -> MetalArrowBuffer {
+    // The views and the data buffers are read byte- or 16-byte-wise and bound at a byte offset, so
+    // they do not need to start on a page: `wrapCovering` maps the pages that hold them. The validity
+    // bitmap keeps the page-aligned rule, because bitmap kernels read it in 32-bit words.
+    func wrap(_ p: UnsafeRawPointer, _ bytes: Int, covering: Bool) throws -> MetalArrowBuffer {
+        if bytes > 0, covering, let b = MetalArrowBuffer.wrapCovering(p, byteCount: bytes, keepAlive: owner, context: context) {
+            return b
+        }
         let page = metalPageSize()
         if bytes > 0, UInt(bitPattern: p) % UInt(page) == 0 {
             let (b, z) = try MetalArrowBuffer.wrapOrCopy(p, byteCount: bytes, keepAlive: owner, context: context)
@@ -417,7 +476,7 @@ func importStringViewArray(binary: Bool, array: UnsafeMutablePointer<ArrowArray>
     var validity: MetalArrowBuffer? = nil
     if let vp = a.buffers[0].map({ UnsafeRawPointer($0) }), length > 0 {
         if offset == 0 {
-            validity = try wrap(vp, Bitmap.byteCount(bits: length))
+            validity = try wrap(vp, Bitmap.byteCount(bits: length), covering: false)
         } else {
             zc = false
             let bytes = Bitmap.byteCount(bits: length)
@@ -431,7 +490,7 @@ func importStringViewArray(binary: Bool, array: UnsafeMutablePointer<ArrowArray>
     let views: MetalArrowBuffer
     if length > 0 {
         guard let vp = a.buffers[1].map({ UnsafeRawPointer($0) }) else { throw ArrowMetalError.invalidArrowArray("utf8_view: views buffer is null") }
-        let whole = try wrap(vp, (offset + length) * 16)
+        let whole = try wrap(vp, (offset + length) * 16, covering: true)
         views = offset == 0 ? whole : whole.view(byteOffset: offset * 16, byteCount: length * 16)
     } else {
         views = try MetalArrowBuffer.allocate(byteCount: 16, context: context)
@@ -443,7 +502,7 @@ func importStringViewArray(binary: Bool, array: UnsafeMutablePointer<ArrowArray>
         guard size >= 0 else { throw ArrowMetalError.invalidArrowArray("utf8_view: negative data buffer size") }
         sizes.append(size)
         if size > 0, let dp = a.buffers[2 + j].map({ UnsafeRawPointer($0) }) {
-            data.append(try wrap(dp, size))
+            data.append(try wrap(dp, size, covering: true))
         } else {
             data.append(nil)
         }
