@@ -147,7 +147,8 @@ extension ParquetFile {
                 }
             }
         }
-        guard lo < hi, !isMappedShared || total * 5 >= (hi - lo) * 4 else { return }
+        // A span of 4 GiB or more cannot be addressed with the decoders' 32-bit offsets anyway.
+        guard lo < hi, !isMappedShared || (total * 5 >= (hi - lo) * 4 && hi - lo < Int(UInt32.max)) else { return }
         _ = try buffer(covering: lo..<Swift.min(hi, fileSize))
     }
 

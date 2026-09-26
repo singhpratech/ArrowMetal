@@ -280,11 +280,13 @@ public final class ParquetFile: @unchecked Sendable {
             return ParquetPageSource(buffer: b, bindingOffset: b.offset + off,
                                      intervals: [(span, 0)], length: span.count)
         }
-        if merged.count == 1 || !isMappedShared || total * 5 >= span.count * 4 || hasWrap(enclosing: span) {
+        // Pages are addressed with 32-bit offsets, so a span of 4 GiB or more always takes a view.
+        let fits = span.count < Int(UInt32.max)
+        if !isMappedShared || (fits && (merged.count == 1 || total * 5 >= span.count * 4 || hasWrap(enclosing: span))) {
             return try whole()
         }
         guard total < Int(UInt32.max) else {
-            throw ParquetError.unsupported("a single column chunk spanning more than 4 GiB")
+            throw ParquetError.unsupported("a single column's chunks totalling more than 4 GiB")
         }
         let key = merged.flatMap { [$0.lowerBound, $0.upperBound] }
         wrapLock.lock()
