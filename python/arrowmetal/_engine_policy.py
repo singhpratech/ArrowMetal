@@ -77,6 +77,7 @@ estimate the decision used, or None when it used none."""
 # The group-count buckets, in order, and the (class, dtype class, input) the sweep measured per bucket.
 BUCKETS = tuple(b[0] for b in _table.GROUP_BUCKETS) + (_table.ROWS_BUCKET,)
 _BUCKETED = frozenset(k[:3] for k in _table.GROUPS)
+NEAR_ROWS = _table.NEAR_ROWS
 
 
 def node_of(cls):
@@ -206,10 +207,42 @@ def _named(cls, names):
     return cls in names or cls.split(":")[0] in names
 
 
-def _estimate(groups):
+def group_regions(rows):
+    """The group counts at `rows` input rows as [(fewest, most, bucket or None)], in order: each
+    bucket below rows / NEAR_ROWS, the counts between the last one and that (no bucket), and the
+    rows bucket."""
+    edge = -(-rows // _table.NEAR_ROWS)
+    out, top = [], 0
+    for name, lo, hi in _table.GROUP_BUCKETS:
+        if lo >= edge:
+            break
+        top = min(hi, edge - 1)
+        out.append((lo, top, name))
+    if top + 1 < edge:
+        out.append((top + 1, edge - 1, None))
+    out.append((max(edge, 1), float("inf"), _table.ROWS_BUCKET))
+    return out
+
+
+def settled_for(classes, dclass, source, rows, router=None):
+    """`settled(lo, hi)`: whether every group count from `lo` to `hi` gets the same answer for these
+    group-by classes at `rows` input rows (each bucket that range reaches is taken, or none is).
+    The probe samples until its estimate's range is settled."""
+    regions = []
+    for lo, hi, b in group_regions(rows):
+        take = b is not None and all(
+            (group_crossover(c, dclass, source, b, router)[0] or rows + 1) <= rows for c in classes)
+        regions.append((lo, hi, take))
+
+    def settled(lo, hi):
+        return len({t for rlo, rhi, t in regions if rlo <= hi and rhi >= lo}) <= 1
+    return settled
+
+
+def _estimate(groups, settled=None):
     """(groups or None, what the estimate is) from `decide`'s `groups` argument."""
     if callable(groups):
-        groups = groups()
+        groups = groups(settled)
     if groups is None:
         return None, "no group-count estimate"
     if isinstance(groups, tuple):
@@ -224,7 +257,8 @@ def decide(classes, dtypes, rows, source="memory", *, shapes="measured", min_row
     'memory' or 'parquet'; `shapes`, `min_rows`: `MetalEngine`'s arguments; `router`: the router
     table's crossovers (`router_crossovers(arrowmetal.router_table())`); `groups`: for a subtree
     with a group-by, its estimated group count -- an int, `(count or None, text)`, None, or a
-    callable returning one of those, called only when a group-count bucket decides."""
+    callable returning one of those, called only when a group-count bucket decides, with the
+    `settled(lo, hi)` predicate of `settled_for` for these classes and rows."""
     classes = sorted(classes) or ["rowwise"]
     rows = int(rows)
     if shapes == "all" or not isinstance(shapes, str):
@@ -274,7 +308,7 @@ def decide(classes, dtypes, rows, source="memory", *, shapes="measured", min_row
             return Decision(False, f"{rows:,} input rows is below the {x:,}-row crossover for "
                                    f"{_what(c, dclass, source)} at every group count measured "
                                    f"({_table.SOURCE})", c, x)
-        count, text = _estimate(groups)
+        count, text = _estimate(groups, settled_for(grouped, dclass, source, rows, router))
         if count is None:
             # No estimate: the engine table's row, which every group count measured is in.
             note = f"; {text}"

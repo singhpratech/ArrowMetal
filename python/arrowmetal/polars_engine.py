@@ -1791,24 +1791,28 @@ def import_cache_info():
 #
 # The default policy judges a group-by by the bucket of its number of groups (_engine_policy.py,
 # `group_bucket`), which the plan does not state. The probe estimates it from the frame the keys come
-# from: the distinct key tuples of a fixed sample of n of its N rows, scaled to the frame by Chao1
-# for sampling without replacement (Chao and Lin, Biometrics 2012),
-#     D = d + f1^2 / (2 f2 n / (n - 1) + f1 q / (1 - q)),  q = n / N,
+# from: the distinct key tuples of a fixed sample of n of its N rows, scaled to the frame by the
+# bias-corrected Chao1 estimator (Chao, Biometrics 2005),
+#     D = d + f1 (f1 - 1) / (2 (f2 + 1)),
 # where d is the number of distinct tuples in the sample and f1, f2 the number seen exactly once and
-# exactly twice; clipped to [d, N]. (Chao1 proper, d + f1^2 / (2 f2), treats the sample as drawn with
-# replacement and runs away on keys that are nearly unique; the q term keeps D at most about N.) The
-# sample is stratified: row i * (N // n) + h(i) for i < n, h a fixed-seed splitmix64 hash of i, so
-# the same frame always gets the same sample and the same estimate. First 2,048 rows; when those
-# leave the estimate above twice d with the denominator under 16 (one f2 count would still move it by
-# more than an eighth), a sample twice as large decides instead, and so on up to 65,536 rows or a
-# quarter of the frame. A frame of at most twice the first sample's rows is counted exactly. A
-# Parquet file's footer answers only when every row group states a distinct count for each key
-# column (`_footer_groups`).
+# exactly twice, clipped to [d, N]. The sample is stratified: row i * (N // n) + h(i) for i < n, h a
+# fixed-seed splitmix64 hash of i, so the same frame always gets the same samples and estimates.
+#
+# The samples are 512, 2,048, 8,192, ... rows, at most 65,536 and a quarter of the frame, and the
+# probe stops at the first whose range settles the decision: the range is D with f2 moved by two of
+# its Poisson standard deviations (and one or two more) either way, and the policy's `settled(lo, hi)`
+# says whether every group count in it gets the same answer (`_engine_policy.settled_for`). Without a
+# decision to settle, the probe stops once D is within twice d, f2 reaches 8, or the low end of the
+# range is at least a quarter of the frame. A frame of at most 4,096 rows is counted exactly. A
+# Parquet file's footer answers only when every row group states a distinct count for each key column
+# (`_footer_groups`).
 
-_GROUP_SAMPLE = 2_048
+_GROUP_FIRST = 512
+_GROUP_GROWTH = 4
 _GROUP_SAMPLE_MAX = 65_536
+_GROUP_EXACT = 4_096
 _GROUP_SEED = 0xA6_5EED
-_GROUP_SETTLED = 16
+_GROUP_SETTLED_F2 = 8
 _GROUP_CACHE_MAX = 64
 
 
@@ -1826,11 +1830,13 @@ class _GroupKeys:
 
 
 _group_positions = OrderedDict()      # (rows, n) -> the sample's row positions
-_group_estimates = OrderedDict()      # frame identity -> (count, how, the key columns, kept alive)
+# frame identity -> {"keep": the key columns, kept alive, "stats": {n: (d, f1, f2)}}, and a Parquet
+# file's identity and key columns -> (groups or None, how)
+_group_estimates = OrderedDict()
 
 
 def clear_group_estimates():
-    """Drops every cached group-count estimate (and the key columns the cache kept alive)."""
+    """Drops every cached group-count sample (and the key columns the cache kept alive)."""
     _group_estimates.clear()
 
 
@@ -1869,41 +1875,61 @@ def _sample_tuples(np, df, columns, pos):
     return out
 
 
-def _chao_lin(np, values, rows):
-    """(estimate before clipping, its denominator, d) of a sample of `rows` rows' key tuples."""
+def _sample_stats(np, values):
+    """(d, f1, f2) of a sample of key tuples."""
     n = len(values)
     s = np.sort(values)
     edges = np.flatnonzero(s[1:] != s[:-1])
     runs = np.diff(np.concatenate(([-1], edges, [n - 1])))
     f = np.bincount(runs, minlength=3)
-    d, f1, f2 = len(runs), int(f[1]), int(f[2])
-    if f1 == 0:
-        return float(d), float("inf"), d
-    q = n / rows
-    den = 2 * f2 * n / (n - 1) + f1 * q / (1 - q)
-    return d + f1 * f1 / den, den, d
+    return len(runs), int(f[1]), int(f[2])
 
 
-def _frame_groups(df, columns):
-    """(estimated groups, how) of in-memory frame `df` over `columns`."""
+def _chao1(d, f1, f2, rows):
+    """(estimate, its low end, its high end), each clipped to [d, rows]. The high end is the whole
+    frame while f2 could still be 0 (below about 6 pairs seen), because Chao1 cannot see a group
+    count much past n^2 / 2 without pairs."""
+    s = math.sqrt(f2)
+
+    def at(f):
+        return min(rows, max(d, d + f1 * (f1 - 1) / (2 * (f + 1))))
+    low_f2 = f2 - 2 * s - 1
+    hi = at(low_f2) if low_f2 > 0 else (d if f1 == 0 else rows)
+    return at(f2), at(f2 + 2 * s + 2), hi
+
+
+def _frame_groups(df, columns, settled=None, stats=None):
+    """(estimated groups, how, whether every sample came from `stats`) of in-memory frame `df`
+    over `columns`. `settled`: the policy's predicate; `stats`: {n: (d, f1, f2)}, the samples
+    already counted for this frame and keys, which the probe adds to."""
     try:
         import numpy as np
     except ImportError:
-        return None, "no group-count estimate: the probe needs numpy"
+        return None, "no group-count estimate: the probe needs numpy", False
     rows = df.height
-    if rows <= 2 * _GROUP_SAMPLE:
-        return df.select(columns).n_unique(), f"counted over all {rows:,} rows"
-    n = _GROUP_SAMPLE
+    if rows <= _GROUP_EXACT:
+        return df.select(columns).n_unique(), f"counted over all {rows:,} rows", False
+    stats = {} if stats is None else stats
+    cached = True
+    n = _GROUP_FIRST
+    cap = min(_GROUP_SAMPLE_MAX, rows // 4)
     while True:
-        est, den, d = _chao_lin(np, _sample_tuples(np, df, columns,
-                                                   _sample_positions(np, rows, n)), rows)
-        # Settled when the sample saw most groups more than once (the estimate is within twice
-        # what it saw) or the denominator is large enough to hold; else a sample twice as large.
-        if est <= 2 * d or den >= _GROUP_SETTLED or 2 * n > min(_GROUP_SAMPLE_MAX, rows // 4):
+        if n not in stats:
+            cached = False
+            stats[n] = _sample_stats(np, _sample_tuples(np, df, columns,
+                                                        _sample_positions(np, rows, n)))
+        d, f1, f2 = stats[n]
+        est, lo, hi = _chao1(d, f1, f2, rows)
+        if n * _GROUP_GROWTH > cap:
             break
-        n *= 2
-    count = int(min(rows, max(d, round(est))))
-    return count, f"a Chao1 estimate from a {n:,}-row sample"
+        if settled is not None:
+            if settled(lo, hi):
+                break
+        elif est <= 2 * d or f2 >= _GROUP_SETTLED_F2 or lo * _policy.NEAR_ROWS >= rows:
+            break
+        n *= _GROUP_GROWTH
+    est, lo, hi = (int(round(x)) for x in (est, lo, hi))
+    return est, f"a Chao1 estimate from a {n:,}-row sample ({lo:,} to {hi:,})", cached
 
 
 def _footer_groups(leaf, columns):
@@ -1948,7 +1974,7 @@ def _identity(df, columns):
     return tuple(out)
 
 
-def _probe_groups(g, report, root):
+def _probe_groups(g, report, root, settled=None):
     """(estimated groups or None, how) for one group-by (`_GroupKeys`); recorded in the report."""
     start = time.perf_counter()
     cached = False
@@ -1962,20 +1988,20 @@ def _probe_groups(g, report, root):
             count, how, cached = hit[0], hit[1], True
         else:
             count, how = _footer_groups(leaf, g.columns)
-            _group_estimates[key] = (count, how, None)
+            _group_estimates[key] = (count, how)
     else:
         df = g.leaf[1]
         key = _identity(df, g.columns)
-        hit = None if key is None else _group_estimates.get(key)
-        if hit is not None:
+        entry = None if key is None else _group_estimates.get(key)
+        if entry is None and key is not None:
+            # The cache keeps the key columns alive, so no other frame can take their buffers'
+            # addresses while the entry stands.
+            entry = _group_estimates[key] = {"keep": [df.get_column(c) for c in g.columns],
+                                             "stats": {}}
+        elif key is not None:
             _group_estimates.move_to_end(key)
-            count, how, cached = hit[0], hit[1], True
-        else:
-            count, how = _frame_groups(df, g.columns)
-            if key is not None and count is not None:
-                # The cache keeps the key columns alive, so no other frame can take their buffers'
-                # addresses while the entry stands.
-                _group_estimates[key] = (count, how, [df.get_column(c) for c in g.columns])
+        count, how, cached = _frame_groups(df, g.columns, settled,
+                                           None if entry is None else entry["stats"])
     while len(_group_estimates) > _GROUP_CACHE_MAX:
         _group_estimates.popitem(last=False)
     seconds = time.perf_counter() - start
@@ -1986,12 +2012,12 @@ def _probe_groups(g, report, root):
     return count, text
 
 
-def _groups_of(sub, report, root):
+def _groups_of(sub, report, root, settled=None):
     """The policy's `groups` for subtree `sub`: the probe of its one group-by."""
     if len(sub.groups) != 1:
         return None, f"no group-count estimate: the subtree holds {len(sub.groups)} group-bys"
     g = sub.groups[0]
-    return _probe_groups(g, report, f"GroupBy#{g.node}")
+    return _probe_groups(g, report, f"GroupBy#{g.node}", settled)
 
 
 def _leaf_sources(leaves, rows=None, scans=None):

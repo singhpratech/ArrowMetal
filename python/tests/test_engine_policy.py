@@ -321,7 +321,7 @@ def test_no_estimate_falls_back_to_the_class_row():
     for cls, dclass, source in sorted({k[:3] for k in GROUP_KEYS}):
         calls = []
 
-        def probe():
+        def probe(settled=None):
             calls.append(1)
             return None, "no group-count estimate: a test"
         d = policy.decide([cls], dtypes_of(dclass), 10**12, source, router=ROUTER, groups=probe)
@@ -355,9 +355,11 @@ def test_the_probe_puts_the_grid_group_counts_in_their_bucket(groups):
     df = _grid_frame(rows, groups)
     for cols in (["k"], ["k1", "k2"], ["s"]):
         true = df.select(cols).n_unique()
-        est, how = pe._frame_groups(df, cols)
+        est, how, _cached = pe._frame_groups(df, cols)
         assert policy.group_bucket(est, rows) == policy.group_bucket(true, rows), (cols, true, est, how)
-        assert 0.5 <= est / true <= 2.0, (cols, true, est, how)
+        if policy.group_bucket(true, rows) != table.ROWS_BUCKET:
+            # In the rows bucket the probe stops once its range's low end is in the bucket.
+            assert 0.5 <= est / true <= 2.0, (cols, true, est, how)
 
 
 def test_the_probe_on_nearly_unique_keys():
@@ -369,10 +371,61 @@ def test_the_probe_on_nearly_unique_keys():
     df = pl.DataFrame({"k1": rng.integers(0, 100_000, rows, dtype=np.int32),
                        "k2": rng.integers(0, 1_000, rows, dtype=np.int32)})
     true = df.select("k1", "k2").n_unique()
-    est, how = pe._frame_groups(df, ["k1", "k2"])
+    est, how, _cached = pe._frame_groups(df, ["k1", "k2"])
     assert policy.group_bucket(est, rows) == policy.group_bucket(true, rows) == table.ROWS_BUCKET
     assert abs(est - true) <= 0.1 * true, (est, true)
     assert int(how.split("from a ")[1].split("-row")[0].replace(",", "")) <= 8_192, how
+
+
+def test_settled_means_one_answer_over_the_range():
+    """`settled_for`: a range of group counts is settled when every bucket it reaches is taken, or
+    none is; the regions tile every count from 1 up."""
+    for cls, dclass, source in sorted({k[:3] for k in GROUP_KEYS}):
+        for rows in (2_000_000, 50_000_000):
+            regions = policy.group_regions(rows)
+            assert regions[0][0] == 1 and all(regions[i][1] + 1 == regions[i + 1][0]
+                                               for i in range(len(regions) - 1))
+            settled = policy.settled_for([cls], dclass, source, rows, ROUTER)
+
+            def take(g):
+                return policy.decide([cls], dtypes_of(dclass), rows, source, router=ROUTER,
+                                     groups=g).take
+            for lo, hi, _b in regions:
+                assert settled(lo, lo) and settled(lo, min(hi, 10**12))
+            counts = [r[0] for r in regions] + [r[1] for r in regions if r[1] != float("inf")]
+            for a in counts:
+                for b in counts:
+                    if a <= b and settled(a, b):
+                        assert take(a) == take(b), (cls, rows, a, b)
+
+
+def test_the_probe_samples_until_the_decision_is_settled():
+    """In the engine the probe stops at the first sample whose range settles the decision: 512 rows
+    for 200 and 10,000 groups at 2,000,000 rows, more for 100,000; the same frame gets the same
+    estimate and decision on every collect, cached or not."""
+    rows = 2_000_000
+    for groups, most in ((200, 512), (10_000, 512), (100_000, 8_192), (1_000_000, 65_536)):
+        df = _grid_frame(rows, groups)
+        lf = df.lazy().group_by("k1", "k2").agg(pl.col("q").sum())
+        # The decision the true group count gets, which the estimate's must equal.
+        true = df.select("k1", "k2").n_unique()
+        want = policy.decide(["group_by_multi:sum"], [pl.Int32, pl.Int64], rows, router=ROUTER,
+                             groups=true).take
+        eng = am.MetalEngine()
+        seen = set()
+        for i in range(4):
+            if i % 2 == 0:
+                pe.clear_group_estimates()
+            lf.collect(engine=eng)
+            rep = eng.last_report
+            g = [x for x in rep.groups if x["keys"] == ["k1", "k2"]]
+            if not g:
+                break                  # no bucket of the class is taken at these rows
+            n = int(g[0]["how"].split("from a ")[1].split("-row")[0].replace(",", ""))
+            assert n <= most, (groups, g[0])
+            assert bool(rep.taken) == want, (groups, true, g[0], rep)
+            seen.add((g[0]["estimate"], g[0]["how"], bool(rep.taken)))
+        assert len(seen) <= 1, seen
 
 
 def _probe_decisions(seed=5):
