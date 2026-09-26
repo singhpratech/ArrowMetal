@@ -113,6 +113,16 @@ final class StringViewTests: XCTestCase {
             XCTAssertEqual(try v.utf8Lower().toArray(), try o.utf8Lower().toArray())
             XCTAssertEqual(try v.unicodeTitle().toArray(), try o.unicodeTitle().toArray())
             XCTAssertEqual(try v.unicodeSwapcase().toArray(), try o.unicodeSwapcase().toArray())
+            XCTAssertEqual(try v.asciiUpper().toArray(), try o.asciiUpper().toArray())
+            XCTAssertEqual(try v.trim().toArray(), try o.trim().toArray())
+            XCTAssertEqual(try v.replaceSubstring("an", with: "AN", maxReplacements: -1).toArray(),
+                           try o.replaceSubstring("an", with: "AN", maxReplacements: -1).toArray())
+            XCTAssertEqual(try v.reverse().toArray(), try o.reverse().toArray())
+            XCTAssertEqual(try v.countSubstring("a").toArray(), try o.countSubstring("a").toArray())
+            XCTAssertEqual(try v.findSubstring("byte").toArray(), try o.findSubstring("byte").toArray())
+            XCTAssertEqual(try v.classify(.alpha).toArray(), try o.classify(.alpha).toArray())
+            XCTAssertEqual(try v.utf8IsAlpha().toArray(), try o.utf8IsAlpha().toArray())
+            XCTAssertEqual(try v.asciiTitle().toArray(), try o.asciiTitle().toArray())
         }
     }
 
@@ -120,12 +130,12 @@ final class StringViewTests: XCTestCase {
         try requireRealGPU()
         let (v, o) = try pair()
         let before = StringViewStorage.conversions.columns
-        XCTAssertEqual(try v.replaceSubstring("an", with: "AN", maxReplacements: -1).toArray(),
-                       try o.replaceSubstring("an", with: "AN", maxReplacements: -1).toArray())
+        // The byte-counting pads (StringBytes.swift) have no view form.
+        XCTAssertEqual(try v.asciiLpad(width: 20, pad: "*").toArray(), try o.asciiLpad(width: 20, pad: "*").toArray())
         XCTAssertTrue(v.convertedFromView)
         XCTAssertEqual(StringViewStorage.conversions.columns, before + 1)
         // The converted form is kept: a second kernel without a view form converts nothing.
-        XCTAssertEqual(try v.reverse().toArray(), try o.reverse().toArray())
+        XCTAssertEqual(try v.binaryReverse().toArray(), try o.binaryReverse().toArray())
         XCTAssertEqual(StringViewStorage.conversions.columns, before + 1)
         XCTAssertEqual(v.totalBytes, o.totalBytes)
     }

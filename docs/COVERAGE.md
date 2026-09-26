@@ -273,8 +273,11 @@ and is reachable as `am_binary(op 5)` and `.modulo()` / `__mod__` in Python.
 ## String transforms
 
 `MetalStringArray` (`Sources/ArrowMetal/MetalStringArray.swift`) is Arrow `utf8`: validity bitmap, int32
-offsets, data bytes. Everything below is byte-wise and case-sensitive except where a row says otherwise:
-the `utf8_*` case, slice, pad and reverse rows work in UTF-8 code points.
+offsets, data bytes; or, imported from `utf8_view` / `binary_view` (Polars' String layout), validity
+bitmap, 16-byte views and the variadic data buffers, which most string kernels read directly and the
+rest convert once ([DESIGN.md](DESIGN.md#strings-in-two-layouts-offsets--bytes-and-views) lists which).
+Everything below is byte-wise and case-sensitive except where a row says otherwise: the `utf8_*` case,
+slice, pad and reverse rows work in UTF-8 code points.
 
 The transforms in `Kernels/StringTransforms.swift` produce new string arrays whose bytes are
 data-dependent, so each runs the same two-pass shape: one kernel writes the output byte length of every
