@@ -188,7 +188,7 @@ def test_fifty_million_rows():
         assert len(cat) == n
 
 
-# ---- SNAPPY pages decoded on the host: dictionary pages, and dispatches of a few pages
+# ---- SNAPPY pages on the host and on the GPU: dictionary pages, chunks of a few pages, many pages
 
 
 def _snappy_table(n):
@@ -207,8 +207,8 @@ def _snappy_table(n):
 @pytest.mark.parametrize("pages", ["few", "many"])
 @pytest.mark.parametrize("dictionary", [True, False])
 def test_snappy_pages_on_the_host_and_on_the_gpu_read_like_pyarrow(tmp_path, pages, dictionary):
-    """With dictionary encoding every chunk starts with a dictionary page, which is decompressed on the
-    host; `few` data pages go to the host too, `many` (small pages) to the GPU. Every way reads what
+    """With dictionary encoding every chunk starts with a dictionary page; `few` data pages all go to
+    the host, `many` (small pages) are split between the host and the GPU. Every way reads what
     pyarrow reads."""
     n = 200_000
     t = _snappy_table(n)
@@ -227,8 +227,8 @@ def test_snappy_pages_on_the_host_and_on_the_gpu_read_like_pyarrow(tmp_path, pag
 @pytest.mark.parametrize("dictionary", [True, False])
 def test_chunks_of_a_few_to_hundreds_of_pages_read_like_pyarrow(tmp_path, codec, pages, dictionary):
     """Column chunks of a handful of pages up to hundreds, over two row groups: ZSTD pages decode on
-    the host in runs that share one context, LZ4 and Snappy pages on the GPU (a few Snappy pages, and
-    Snappy dictionary pages, on the host). Every way reads what pyarrow reads."""
+    the host in runs that share one context, LZ4 and Snappy pages on whichever side the router picks.
+    Every way reads what pyarrow reads."""
     n = 60_000
     t = _snappy_table(n)
     p = str(tmp_path / "c.parquet")
@@ -269,3 +269,48 @@ def test_a_damaged_snappy_dictionary_page_raises(tmp_path):
         except am.ArrowMetalError:
             outcomes.add("raised")
     assert "raised" in outcomes
+
+
+# ---- every decoder: the host, the SIMD-group kernel and the page-per-thread kernel
+
+_EVERY_FIXTURE_CHILD = r'''
+import glob, os, sys
+import pyarrow as pa, pyarrow.parquet as pq
+import arrowmetal as am
+sys.path.insert(0, os.path.dirname(sys.argv[1]))
+from test_parquet import normalise
+bad, n = [], 0
+for p in sorted(glob.glob(os.path.join(sys.argv[2], "*.parquet"))) + sys.argv[3:]:
+    try:
+        got = am.read_parquet_table(p)
+    except am.ArrowMetalError as e:
+        if "libzstd" in str(e):
+            continue
+        bad.append("%s: %s" % (p, e)); continue
+    n += 1
+    if normalise(got) != normalise(pq.read_table(p)):
+        bad.append(p)
+print("READ", n)
+print("\n".join("BAD " + b for b in bad))
+'''
+
+
+@pytest.mark.skipif(not fixture_paths(), reason="fixtures not generated")
+@pytest.mark.parametrize("decoder", ["host", "gpu", "lane"])
+def test_every_fixture_reads_like_pyarrow_on_every_decoder(tmp_path, decoder):
+    """`ARROWMETAL_PARQUET_DECODE` sends every Snappy and LZ4 page to one decoder; each of them reads
+    every fixture, and a Snappy, an LZ4 and a ZSTD file of small pages, as pyarrow does."""
+    import subprocess
+    import sys
+    extra = []
+    for codec in ("snappy", "lz4", "zstd"):
+        p = str(tmp_path / ("%s.parquet" % codec))
+        pq.write_table(_snappy_table(40_000), p, compression=codec, row_group_size=20_000,
+                       data_page_size=4096, write_batch_size=512)
+        extra.append(p)
+    env = dict(os.environ, ARROWMETAL_PARQUET_DECODE=decoder)
+    r = subprocess.run([sys.executable, "-c", _EVERY_FIXTURE_CHILD, os.path.abspath(__file__), FIXTURES] + extra,
+                       capture_output=True, text=True, env=env, timeout=600)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert "READ" in r.stdout and int(r.stdout.split("READ ")[1].split()[0]) > 40, r.stdout
+    assert "BAD" not in r.stdout, r.stdout

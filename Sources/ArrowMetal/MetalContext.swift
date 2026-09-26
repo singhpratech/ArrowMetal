@@ -114,6 +114,27 @@ public final class MetalContext: @unchecked Sendable {
         waitForEvent(ev, value: v, cb)
     }
 
+    /// Commits `cb` without waiting, signalling the completion event as `commitAndWait` does; pass the
+    /// result to `waitSignalled` to wait for it. Lets the host work while the GPU runs.
+    func commitSignalled(_ cb: MTLCommandBuffer) -> (MTLSharedEvent, UInt64)? {
+        guard lowLatencyWait, let ev = completionEvent else {
+            cb.commit()
+            return nil
+        }
+        commitLock.lock()
+        nextEventValue &+= 1
+        let v = nextEventValue
+        cb.encodeSignalEvent(ev, value: v)
+        cb.commit()
+        commitLock.unlock()
+        return (ev, v)
+    }
+
+    /// Waits for a command buffer committed by `commitSignalled`.
+    func waitSignalled(_ cb: MTLCommandBuffer, _ signal: (MTLSharedEvent, UInt64)?) {
+        if let (ev, v) = signal { waitForEvent(ev, value: v, cb) } else { wait(cb) }
+    }
+
     /// Spins on the shared event, then falls back to blocking. Reads the clock once per 64 polls:
     /// `mach_absolute_time` is ~20x cheaper than `DispatchTime.now()` (which goes through
     /// `dispatch_time`) and the polled value itself is a plain memory read.

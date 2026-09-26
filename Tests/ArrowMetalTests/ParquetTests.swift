@@ -444,54 +444,43 @@ final class ParquetTests: XCTestCase {
         }
     }
 
-    /// Snappy and LZ4 pages decode the same through the page-per-thread kernel and the
-    /// SIMD-group-per-page kernel: every fixture read with every page sent to one, then to the other,
-    /// against the default split, whole and one row group at a time.
-    func testPagePerThreadAndSimdGroupDecompressionAgree() throws {
+    /// Snappy and LZ4 pages decode the same on every decoder: every fixture read with every page sent
+    /// to the host, to the SIMD-group-per-page kernel and to the page-per-thread kernel, against the
+    /// routed split, whole and one row group at a time.
+    func testEveryDecoderAgrees() throws {
         try requireRealGPU()
         let names = try FileManager.default.contentsOfDirectory(atPath: Self.fixtures.path)
             .filter { $0.hasSuffix(".parquet") && ($0.contains("snappy") || $0.contains("lz4")) }.sorted()
         XCTAssertGreaterThan(names.count, 5)
-        let saved = Decompress.laneRatioQuarters
-        let savedHost = Decompress.hostSnappyMaxBlocks
-        let savedMin = Decompress.laneMinPages
-        defer {
-            Decompress.laneRatioQuarters = saved; Decompress.hostSnappyMaxBlocks = savedHost
-            Decompress.laneMinPages = savedMin
-        }
-        // Small fixtures have few pages; send every Snappy dispatch to the GPU, and let a dispatch of any
-        // size take the page-per-thread kernel, so both kernels run.
-        Decompress.hostSnappyMaxBlocks = 0
-        Decompress.laneMinPages = 0
+        let saved = DecodeRouter.forced
+        defer { DecodeRouter.forced = saved }
         for name in names {
             let p = Self.fixtures.appendingPathComponent(name).path
-            func reads(_ quarters: UInt64) throws -> [MetalRecordBatch] {
-                Decompress.laneRatioQuarters = quarters
+            func reads(_ side: DecodeSide?) throws -> [MetalRecordBatch] {
+                DecodeRouter.forced = side
                 let f = try ParquetFile(path: p)
                 return try [f.read()] + (0..<f.rowGroupCount).map { try f.read(ParquetReadOptions(rowGroups: [$0])) }
             }
-            let reference = try reads(saved)
-            for q: UInt64 in [0, 1 << 40] {
-                for (i, (a, b)) in zip(reference, try reads(q)).enumerated() { assertEqual(a, b, "\(name) quarters \(q) read \(i)") }
+            let reference = try reads(nil)
+            for side: DecodeSide in [.host, .gpuGroup, .gpuLane] {
+                for (i, (a, b)) in zip(reference, try reads(side)).enumerated() { assertEqual(a, b, "\(name) \(side) read \(i)") }
             }
         }
     }
 
-    /// Damaged Snappy and LZ4 pages through the page-per-thread kernel: every read raises or returns,
-    /// never crashes, hangs or reads outside its page.
-    func testDamagedPagesThroughThePagePerThreadKernelRaiseOrReturn() throws {
+    /// Damaged Snappy and LZ4 pages on each decoder -- the host's, the SIMD-group kernel, the
+    /// page-per-thread kernel -- and on the routed split: every read raises or returns, never crashes,
+    /// hangs or reads outside its page. 240 damaged files per decoder.
+    func testDamagedPagesOnEveryDecoderRaiseOrReturn() throws {
         try requireRealGPU()
-        let saved = (Decompress.laneRatioQuarters, Decompress.hostSnappyMaxBlocks, Decompress.laneMinPages)
-        defer { (Decompress.laneRatioQuarters, Decompress.hostSnappyMaxBlocks, Decompress.laneMinPages) = saved }
-        Decompress.laneRatioQuarters = 0
-        Decompress.hostSnappyMaxBlocks = 0
-        Decompress.laneMinPages = 0
+        let saved = DecodeRouter.forced
+        defer { DecodeRouter.forced = saved }
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("arrowmetal-parquet-damage-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         var rng = SystemRandomNumberGenerator()
-        var outcomes = Set<String>()
+        var files: [String] = []
         for name in ["flat__plain_snappy", "flat__plain_lz4", "flat__v2_lz4", "nulls__plain_snappy"] {
             let original = try Data(contentsOf: URL(fileURLWithPath: try path(name)))
             let f = try ParquetFile(path: try path(name))
@@ -506,10 +495,18 @@ final class ParquetTests: XCTestCase {
                 }
                 let p = dir.appendingPathComponent("\(name)-\(k).parquet").path
                 try Data(bytes).write(to: URL(fileURLWithPath: p))
+                files.append(p)
+            }
+        }
+        XCTAssertEqual(files.count, 240)
+        for side: DecodeSide? in [.host, .gpuGroup, .gpuLane, nil] {
+            DecodeRouter.forced = side
+            var outcomes = Set<String>()
+            for p in files {
                 do { _ = try ParquetFile(path: p).read(); outcomes.insert("read") }
                 catch { outcomes.insert("raised") }
             }
+            XCTAssertTrue(outcomes.contains("raised"), "\(String(describing: side)): no damaged page was reported")
         }
-        XCTAssertTrue(outcomes.contains("raised"), "no damaged page was reported")
     }
 }

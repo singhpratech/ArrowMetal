@@ -12,66 +12,19 @@ struct PageBlock {
 
 /// Block decompression of Parquet pages.
 ///
-/// SNAPPY, LZ4 and LZ4_RAW run entirely on the GPU (`DecompressSource`), one threadgroup per page.
-/// UNCOMPRESSED needs no work at all: the mapped file *is* the page buffer, so the reader passes the
-/// file's own `MTLBuffer` straight to the decoders.
+/// SNAPPY, LZ4 and LZ4_RAW pages are split between the GPU (`DecompressSource`: a SIMD group per page,
+/// or a thread per page) and the host (`SnappyHost`, `LZ4Host`), page by page, by `DecodeRouter`, and
+/// both sides run at once (`Decompress.overlapped`, in `DecodeSplit.swift`). UNCOMPRESSED needs no work
+/// at all: the mapped file *is* the page buffer, so the reader passes the file's own `MTLBuffer`
+/// straight to the decoders.
 ///
-/// A SNAPPY page is decompressed on the host instead when the GPU would decode it alone: a token stream
-/// is serial, so one page is one SIMD group's work, and a dispatch of a few pages takes as long as its
-/// slowest page. A 790 KB dictionary page of random int64 values took about 94 ms that way; one CPU
-/// core decodes a block like it in about 0.5 ms. So dictionary pages (one per column chunk) and dispatches of at most
-/// `hostSnappyMaxBlocks` pages go to the host decoder (`SnappyHost`), the rest to the GPU.
-///
-/// ZSTD, GZIP and BROTLI are decompressed on the host, straight into the shared-memory output buffer the
-/// GPU decoders will read, with pages spread across cores. GZIP and BROTLI go through Foundation's
+/// ZSTD, GZIP and BROTLI are decompressed on the host only, straight into the shared-memory output
+/// buffer the GPU decoders will read, in the same schedule. GZIP and BROTLI go through Foundation's
 /// Compression framework (`COMPRESSION_ZLIB` is raw DEFLATE, so the gzip container is stripped first).
 /// The SDK has no `COMPRESSION_ZSTD`, so libzstd is looked up with `dlopen` at first use; when it is not
 /// installed, a ZSTD column raises `ParquetError.unsupported` naming the missing library rather than
 /// returning wrong data.
 enum Decompress {
-    /// Decompresses every block into a buffer the caller owns, so several codecs can share one buffer.
-    ///
-    /// `source` is bound at `sourceOffset`, so `block.srcOffset` is relative to that: a column chunk
-    /// anywhere in a multi-gigabyte file still addresses its pages with 32-bit offsets.
-    ///
-    /// `preferHost` marks blocks the caller knows the GPU would decode one at a time (dictionary pages);
-    /// a SNAPPY dispatch of those, or of at most `hostSnappyMaxBlocks` blocks, runs on the host.
-    static func into(_ ctx: MetalContext, codec: ParquetCodec, source: MTLBuffer, sourceOffset: Int,
-                     blocks: [PageBlock], out: MetalArrowBuffer, preferHost: Bool = false) throws {
-        guard !blocks.isEmpty else { return }
-        switch codec {
-        case .uncompressed:
-            try gpuCopy(ctx, source: source, sourceOffset: sourceOffset, blocks: blocks, out: out)
-        case .snappy where preferHost || blocks.count <= hostSnappyMaxBlocks:
-            try hostDecompress(codec: codec, source: source, sourceOffset: sourceOffset, blocks: blocks, out: out)
-        case .snappy:
-            try gpuDecompress(ctx, function: "snappy_decompress", source: source, sourceOffset: sourceOffset,
-                              blocks: blocks, out: out, codec: codec)
-        case .lz4, .lz4Raw:
-            try gpuDecompress(ctx, function: "lz4_decompress", source: source, sourceOffset: sourceOffset,
-                              blocks: blocks, out: out, codec: codec)
-        case .gzip, .zstd, .brotli:
-            try hostDecompress(codec: codec, source: source, sourceOffset: sourceOffset, blocks: blocks, out: out)
-        case .lzo:
-            throw ParquetError.unsupported("LZO compression")
-        }
-    }
-
-    /// A SNAPPY dispatch of at most this many pages is decompressed on the host (see the type comment).
-    static var hostSnappyMaxBlocks = 16
-    /// A page whose output is at least this many quarters of its input goes to the page-per-thread
-    /// kernel (`DecompressSource`): 5, output at least 1.25x the input. On the benchmark file's Snappy
-    /// columns that sends the sequential, low-cardinality and timestamp columns (1.3-18x) to it and the
-    /// random doubles (1.0x, one long literal a page) to the SIMD-group kernel. The tests also set 0
-    /// (every page per thread) and a huge value (none).
-    static var laneRatioQuarters: UInt64 = 5
-    /// ... and only when a dispatch has at least this many such pages; below that a thread per page
-    /// leaves the GPU mostly idle, and every page goes to the SIMD-group kernel. 50 token-dense pages of
-    /// one int64 column (1,000,000 random values below 10^9, 160 KB pages) took 64 ms one per thread
-    /// against 16 ms one per SIMD group; 2,525 such pages of one column of the benchmark file 50 ms
-    /// against 66 (`id`).
-    static var laneMinPages = 2048
-
     private static func blockBuffer(_ ctx: MetalContext, _ blocks: [PageBlock]) throws -> MetalArrowBuffer {
         let buf = try MetalArrowBuffer.allocate(byteCount: blocks.count * MemoryLayout<PageBlock>.stride,
                                                 zeroed: false, context: ctx)
@@ -79,7 +32,7 @@ enum Decompress {
         return buf
     }
 
-    private static func gpuCopy(_ ctx: MetalContext, source: MTLBuffer, sourceOffset: Int,
+    static func gpuCopy(_ ctx: MetalContext, source: MTLBuffer, sourceOffset: Int,
                                 blocks: [PageBlock], out: MetalArrowBuffer) throws {
         let desc = try blockBuffer(ctx, blocks)
         let pso = try ctx.pipeline(source: DecompressSource.source, function: "block_copy", cacheKey: "parquet/decompress/block_copy")
@@ -95,101 +48,15 @@ enum Decompress {
         withExtendedLifetime(desc) {}
     }
 
-    private static func gpuDecompress(_ ctx: MetalContext, function: String, source: MTLBuffer, sourceOffset: Int,
-                                      blocks: [PageBlock], out: MetalArrowBuffer, codec: ParquetCodec) throws {
-        // Pages whose output is at least `laneRatioQuarters` quarters of their input are token-dense and go to the
-        // page-per-thread kernel; the rest (mostly long literals) to the SIMD-group-per-page kernel.
-        var laneIdx: [Int] = [], groupIdx: [Int] = []
-        for (i, b) in blocks.enumerated() {
-            if UInt64(b.dstLength) * 4 >= UInt64(b.srcLength) * laneRatioQuarters { laneIdx.append(i) } else { groupIdx.append(i) }
-        }
-        if laneIdx.count < laneMinPages {
-            groupIdx = Array(blocks.indices)
-            laneIdx = []
-        }
-        var pending: [(indices: [Int], status: MetalArrowBuffer, desc: MetalArrowBuffer)] = []
-        for (indices, perThread) in [(groupIdx, false), (laneIdx, true)] where !indices.isEmpty {
-            let desc = try blockBuffer(ctx, indices.map { blocks[$0] })
-            let status = try MetalArrowBuffer.allocate(byteCount: indices.count * 4, context: ctx)
-            let name = perThread ? function + "_lane" : function
-            let pso = try ctx.pipeline(source: DecompressSource.source, function: name, cacheKey: "parquet/decompress/\(name)")
-            try ctx.run { enc in
-                enc.setComputePipelineState(pso)
-                enc.setBuffer(source, offset: sourceOffset, index: 0)
-                enc.setBuffer(out.mtl, offset: out.offset, index: 1)
-                enc.setBuffer(desc.mtl, offset: desc.offset, index: 2)
-                Dispatch.setUInt(enc, indices.count, index: 3)
-                enc.setBuffer(status.mtl, offset: status.offset, index: 4)
-                if perThread {
-                    // One page per thread, in threadgroups of 32 so the pages spread over every core.
-                    let w = 32     // LANES in DecompressSource
-                    enc.dispatchThreadgroups(MTLSize(width: (indices.count + w - 1) / w, height: 1, depth: 1),
-                                             threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
-                } else {
-                    // One SIMD group per page: lane 0 parses the token stream out of an 8 KB
-                    // threadgroup-memory window while all 32 lanes move the bytes.
-                    enc.dispatchThreadgroups(MTLSize(width: indices.count, height: 1, depth: 1),
-                                             threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-                }
-            }
-            pending.append((indices, status, desc))
-        }
-        try ctx.syncPoint()
-        var failed: [(Int, UInt32)] = []
-        for p in pending {
-            let st = p.status.typed(UInt32.self)
-            for (k, i) in p.indices.enumerated() where st[k] != 0 { failed.append((i, st[k])) }
-        }
-        if let (i, code) = failed.min(by: { $0.0 < $1.0 }) {
-            let why = ["ok", "output overrun", "bad token", "input truncated"][Int(Swift.min(code, 3))]
-            throw ParquetError.malformed("\(codec.name) page \(i) failed to decompress: \(why)")
-        }
-        withExtendedLifetime(pending) {}
-    }
-
     // MARK: - Host codecs
 
-    private static func hostDecompress(codec: ParquetCodec, source: MTLBuffer, sourceOffset: Int,
-                                       blocks: [PageBlock], out: MetalArrowBuffer) throws {
-        let src = UnsafeRawPointer(source.contents()).advanced(by: sourceOffset)
-        let dst = out.mutableContents
-        var failure: Error? = nil
-        let lock = NSLock()
-        let n = blocks.count
-        let work: (Int, Zstd.Context?) -> Void = { i, zctx in
-            let b = blocks[i]
-            do {
-                let inPtr = src.advanced(by: Int(b.srcOffset)).assumingMemoryBound(to: UInt8.self)
-                let outPtr = dst.advanced(by: Int(b.dstOffset)).assumingMemoryBound(to: UInt8.self)
-                let produced: Int
-                switch codec {
-                case .gzip: produced = try gunzip(inPtr, Int(b.srcLength), outPtr, Int(b.dstLength))
-                case .brotli: produced = try appleDecode(COMPRESSION_BROTLI, inPtr, Int(b.srcLength), outPtr, Int(b.dstLength))
-                case .zstd: produced = try Zstd.decompress(inPtr, Int(b.srcLength), outPtr, Int(b.dstLength), context: zctx)
-                case .snappy: produced = try SnappyHost.decompress(inPtr, Int(b.srcLength), outPtr, Int(b.dstLength))
-                default: produced = 0
-                }
-                guard produced == Int(b.dstLength) else {
-                    throw ParquetError.malformed("\(codec.name) page \(i): produced \(produced) of \(b.dstLength) bytes")
-                }
-            } catch {
-                lock.lock(); if failure == nil { failure = error }; lock.unlock()
-            }
-        }
-        // Pages are handed out in runs of a few, and each run decodes with one ZSTD context:
-        // `ZSTD_decompress` allocates and frees a fresh context (about 160 KB) on every call, which on a
-        // file of thousands of small pages cost more than the decompression itself.
-        // Runs of one page unless there are many more pages than cores, so a handful of large pages still
-        // spread across cores.
-        let run = codec == .zstd ? Swift.max(1, Swift.min(8, n / (2 * ProcessInfo.processInfo.activeProcessorCount))) : 1
-        let runs = (n + run - 1) / run
-        let perRun: (Int) -> Void = { r in
-            let zctx = codec == .zstd ? Zstd.Context() : nil
-            for i in (r * run)..<Swift.min(n, (r + 1) * run) { work(i, zctx) }
-        }
-        if n >= 4 { DispatchQueue.concurrentPerform(iterations: runs, execute: perRun) }
-        else { for r in 0..<runs { perRun(r) } }
-        if let f = failure { throw f }
+    static func gunzipBlock(_ src: UnsafePointer<UInt8>, _ srcLen: Int,
+                            _ dst: UnsafeMutablePointer<UInt8>, _ dstLen: Int) throws -> Int {
+        try gunzip(src, srcLen, dst, dstLen)
+    }
+    static func brotliBlock(_ src: UnsafePointer<UInt8>, _ srcLen: Int,
+                            _ dst: UnsafeMutablePointer<UInt8>, _ dstLen: Int) throws -> Int {
+        try appleDecode(COMPRESSION_BROTLI, src, srcLen, dst, dstLen)
     }
 
     private static func appleDecode(_ algorithm: compression_algorithm,
@@ -288,6 +155,41 @@ enum Zstd {
     }
 }
 
+/// Copies for the host decoders. Every one of them stays inside `[0, cap)` of the page's own output
+/// slot and inside the page's own input: the wide forms are only taken when the whole 16 or 8 bytes
+/// they touch are inside.
+@inline(__always)
+private func copy16(_ d: UnsafeMutablePointer<UInt8>, _ s: UnsafePointer<UInt8>) {
+    UnsafeMutableRawPointer(d).storeBytes(of: UnsafeRawPointer(s).loadUnaligned(as: SIMD16<UInt8>.self), as: SIMD16<UInt8>.self)
+}
+@inline(__always)
+private func copy8(_ d: UnsafeMutablePointer<UInt8>, _ s: UnsafePointer<UInt8>) {
+    UnsafeMutableRawPointer(d).storeBytes(of: UnsafeRawPointer(s).loadUnaligned(as: UInt64.self), as: UInt64.self)
+}
+
+/// A back-reference: `length` bytes from `offset` back, into `dst[op..<op+length]`, where
+/// `op + length <= cap` and `0 < offset <= op` have been checked. Byte `k` of the match is byte
+/// `k - offset` of the output, so the match repeats a pattern of `offset` bytes and also repeats at `d`,
+/// the first multiple of `offset` that is at least 8, from `d - offset` bytes in. With `d` bytes between
+/// source and destination an 8-byte step reads only bytes already written, so after the first
+/// `d - offset` bytes (none when `offset >= 8`) the match moves in 8-byte steps and a tail of under 8
+/// bytes. Nothing is written at or past `cap`.
+@inline(__always)
+private func backCopy(_ dst: UnsafeMutablePointer<UInt8>, _ op: Int, _ offset: Int, _ length: Int, _ cap: Int) {
+    let d = offset >= 8 ? offset : offset * ((8 + offset - 1) / offset)
+    let p = Swift.min(length, d - offset)
+    for k in 0..<p { dst[op + k] = dst[op - offset + k] }
+    var k = p
+    if op + length + 8 <= cap {
+        // Room for a whole last step inside the slot: the steps may run up to 7 bytes past the match,
+        // bytes the next token overwrites.
+        while k < length { copy8(dst + (op + k), UnsafePointer(dst + (op + k - d))); k += 8 }
+        return
+    }
+    while k + 8 <= length { copy8(dst + (op + k), UnsafePointer(dst + (op + k - d))); k += 8 }
+    while k < length { dst[op + k] = dst[op + k - d]; k += 1 }
+}
+
 /// A Snappy block decoder for the host (the format: a varint of the plaintext length, then literal and
 /// copy elements). Every read and write is checked against the block's bounds, so a damaged page is an
 /// error, never an access outside the page or the output slot.
@@ -314,6 +216,13 @@ enum SnappyHost {
             switch tag & 3 {
             case 0:
                 length = tag >> 2
+                if length < 16 && ip + 16 <= n && op + 16 <= cap {
+                    // A literal of at most 16 bytes with room on both sides: one wide copy.
+                    copy16(dst + op, src + ip)
+                    ip += length + 1
+                    op += length + 1
+                    continue
+                }
                 if length >= 60 {
                     let extra = length - 59
                     guard ip + extra <= n else { throw bad("input truncated") }
@@ -346,14 +255,81 @@ enum SnappyHost {
             }
             guard offset > 0, offset <= op else { throw bad("bad token") }
             guard length <= cap - op else { throw bad("output overrun") }
-            if offset >= length {
-                memcpy(dst + op, dst + (op - offset), length)
-            } else {
-                // An overlapping copy repeats the last `offset` bytes: byte by byte, in order.
-                for k in 0..<length { dst[op + k] = dst[op - offset + k] }
-            }
+            backCopy(dst, op, offset, length, cap)
             op += length
         }
+        return op
+    }
+}
+
+/// An LZ4 block decoder for the host, with the checks, the order of the checks and the outcomes of the
+/// GPU kernels (`lz4_decompress`): the Hadoop framing Parquet's legacy LZ4 codec writes (big-endian
+/// plaintext and block lengths) is recognised and stripped the same way, and a block must fill its
+/// output exactly. Every read and write is checked against the block's bounds.
+enum LZ4Host {
+    static func decompress(_ src0: UnsafePointer<UInt8>, _ n0: Int,
+                           _ dst: UnsafeMutablePointer<UInt8>, _ cap: Int) throws -> Int {
+        func bad(_ why: String) -> ParquetError { ParquetError.malformed("LZ4 page failed to decompress: \(why)") }
+        var src = src0, n = n0
+        if n >= 8 {
+            let u = (Int(src[0]) << 24) | (Int(src[1]) << 16) | (Int(src[2]) << 8) | Int(src[3])
+            let c = (Int(src[4]) << 24) | (Int(src[5]) << 16) | (Int(src[6]) << 8) | Int(src[7])
+            if u == cap && c == n - 8 { src += 8; n -= 8 }
+        }
+        var ip = 0, op = 0
+        while op < cap {
+            // A short sequence (literal run under 15 bytes, match under 19) with room for 48 bytes of
+            // output and 32 of input: one 16-byte literal copy and the match in 8-byte steps, every
+            // bound implied by the room.
+            if op + 48 <= cap && ip + 32 <= n {
+                let token = Int(src[ip])
+                let lit = token >> 4, m = token & 15
+                if lit < 15 && m < 15 {
+                    let offset = Int(src[ip + 1 + lit]) | (Int(src[ip + 2 + lit]) << 8)
+                    guard offset != 0, offset <= op + lit else { throw bad("bad token") }
+                    copy16(dst + op, src + (ip + 1))
+                    ip += 3 + lit
+                    op += lit
+                    backCopy(dst, op, offset, m + 4, cap)
+                    op += m + 4
+                    continue
+                }
+            }
+            guard ip < n else { throw bad("input truncated") }
+            let token = Int(src[ip]); ip += 1
+            var litLen = token >> 4
+            if litLen == 15 {
+                var c2 = 255
+                while c2 == 255 && ip < n { c2 = Int(src[ip]); ip += 1; litLen += c2 }
+            }
+            guard litLen <= n - ip, litLen <= cap - op else { throw bad("output overrun") }
+            let litSrc = ip
+            ip += litLen
+            guard ip + 2 <= n else {
+                // The last sequence: literals only.
+                memcpy(dst + op, src + litSrc, litLen)
+                op += litLen
+                break
+            }
+            let offset = Int(src[ip]) | (Int(src[ip + 1]) << 8)
+            ip += 2
+            var matchLen = token & 15
+            if matchLen == 15 {
+                var c2 = 255
+                while c2 == 255 && ip < n { c2 = Int(src[ip]); ip += 1; matchLen += c2 }
+            }
+            matchLen += 4
+            guard offset != 0, offset <= op + litLen, matchLen <= cap - op - litLen else { throw bad("bad token") }
+            if litLen <= 16 && litSrc + 16 <= n && op + 16 <= cap {
+                copy16(dst + op, src + litSrc)
+            } else {
+                memcpy(dst + op, src + litSrc, litLen)
+            }
+            op += litLen
+            backCopy(dst, op, offset, matchLen, cap)
+            op += matchLen
+        }
+        guard op == cap else { throw bad("input truncated") }
         return op
     }
 }
