@@ -898,31 +898,31 @@ collected by Polars' in-memory and streaming engines and by `MetalEngine(shapes=
 "cold" clears the open-file cache before every run, so the engine opens and maps the file each time;
 "warm" keeps it open between runs. Polars reads the file on every run; the file stays in the OS page
 cache throughout. Best of 5, every engine result equal to Polars',
-`Benchmarks/results/polars_engine_scan_2026-09-25.csv`. The run shared the machine with other work: the
-load average was 17.4 at its start and 25.6 at its end
-(`Benchmarks/results/polars_engine_scan_2026-09-25_conditions.txt`).
+`Benchmarks/results/polars_engine_scan_2026-09-25-quiet.csv` (run conditions in
+`Benchmarks/results/bench_conditions_2026-09-25-quiet.txt`).
 
 | case | codec | Polars in-memory | Polars streaming | MetalEngine cold | MetalEngine warm | `MetalEngine()` default, cold |
 |---|---|---:|---:|---:|---:|---:|
-| (s1) filter `price > 500`, group-by `qty` (1,000 keys), sum + count | snappy | 171.67 ms | 57.27 ms | 375.78 ms | 96.59 ms | 152.57 ms (Polars) |
-| | none | 170.05 ms | 56.54 ms | 426.71 ms | **42.02 ms** | 156.97 ms (Polars) |
-| (s2) filter `id < 5,000,000` (45 of 50 row groups skipped), group-by, sum | snappy | 34.66 ms | 15.43 ms | 68.90 ms | 33.99 ms | 46.20 ms (Polars) |
-| | none | 30.57 ms | 8.27 ms | 45.95 ms | 8.84 ms | 28.55 ms (Polars) |
-| (s3) filter on two columns, sum + count | snappy | 16.77 ms | 17.62 ms | 314.39 ms | 19.62 ms | 21.55 ms (Polars) |
-| | none | 17.04 ms | 15.91 ms | 342.23 ms | **15.67 ms** | 17.77 ms (Polars) |
-| (s4) sort 2 columns by a Float64 key | snappy | 934.92 ms | 885.43 ms | **449.43 ms** | **145.54 ms** | **451.97 ms** (Metal) |
-| | none | 823.39 ms | 877.25 ms | **429.51 ms** | **75.72 ms** | **463.46 ms** (Metal) |
+| (s1) filter `price > 500`, group-by `qty` (1,000 keys), sum + count | snappy | 104.84 ms | 46.26 ms | 236.02 ms | 94.60 ms | 103.67 ms (Polars) |
+| | none | 88.97 ms | 36.80 ms | 237.35 ms | 39.97 ms | 92.16 ms (Polars) |
+| (s2) filter `id < 5,000,000` (45 of 50 row groups skipped), group-by, sum | snappy | 24.10 ms | 12.32 ms | 47.61 ms | 33.89 ms | 24.00 ms (Polars) |
+| | none | 16.45 ms | 5.36 ms | 27.78 ms | 7.14 ms | 17.55 ms (Polars) |
+| (s3) filter on two columns, sum + count | snappy | 13.55 ms | 13.46 ms | 168.65 ms | 17.79 ms | 15.17 ms (Polars) |
+| | none | 13.68 ms | 13.50 ms | 204.65 ms | **10.72 ms** | 14.31 ms (Polars) |
+| (s4) sort 2 columns by a Float64 key | snappy | 561.44 ms | 573.40 ms | **281.55 ms** | **139.27 ms** | **277.94 ms** (Metal) |
+| | none | 574.75 ms | 575.73 ms | **271.45 ms** | **73.25 ms** | **262.07 ms** (Metal) |
 
-* **The sort is ahead cold and warm**: 1.97x and 1.92x the faster Polars engine cold, 6.08x and
-  10.87x warm, and the default takes it (1.96x and 1.78x).
-* **Cold, the other three are to improve.** The cold runs include what the open-file cache removes:
-  opening the file and handing the pages the query reads to Metal, 280-370 ms for a one-column read
-  of these files ([PARQUET.md](PARQUET.md), "The open-file cache"). The default leaves them to Polars.
-* **Warm**, (s1) over the uncompressed file is ahead of Polars' streaming engine (42.02 ms against
-  56.54, 1.35x) and (s3) level with it (1.02); (s2) is at 0.94 on the uncompressed file. Over the
-  Snappy file, which the GPU decompresses first ([PARQUET.md](PARQUET.md), "What the numbers say"),
-  (s1) is 0.59, (s2) 0.45 and (s3) 0.85.
-* **CPU time**: the warm engine runs cost 5.8-14.9 ms of process CPU, against 51.3-7399.7 ms for
+* **The sort is ahead cold and warm**: 1.99x (snappy) and 2.12x (uncompressed) the faster Polars
+  engine cold, 4.03x and 7.85x warm, and the default takes it (2.02x and 2.19x).
+* **Cold, the other three are behind and to improve**: 0.07-0.26 of the faster Polars engine's speed
+  (`vs_fastest_polars`). The cold runs include what the open-file cache removes: opening the file and
+  handing the pages the query reads to Metal, 149-191 ms for a one-column read of these files
+  ([PARQUET.md](PARQUET.md), "The open-file cache"). The default leaves them to Polars.
+* **Warm**, (s3) over the uncompressed file is ahead of Polars' streaming engine (10.72 ms against
+  13.50, 1.26x); (s1) is behind at 0.92 (39.97 ms against 36.80) and (s2) at 0.75 on the uncompressed
+  file. Over the Snappy file, which the GPU decompresses first ([PARQUET.md](PARQUET.md), "What the
+  numbers say"), (s1) is 0.49, (s2) 0.36 and (s3) 0.76.
+* **CPU time**: the warm engine runs cost 5.3-13.6 ms of process CPU, against 41.5-6765.4 ms for
   Polars (`cpu_ms`).
 
 ```

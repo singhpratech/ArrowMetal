@@ -156,9 +156,10 @@ pyarrow writes up to 1 MB of dictionary before falling back to `PLAIN`, and a 79
 page of random `int64` values took about 94 ms on the GPU, where one CPU core decodes a Snappy block
 of that size and content in about 0.5 ms. So SNAPPY dictionary pages, and SNAPPY dispatches of at most 16 pages, are decompressed on the
 host by a bounds-checked Snappy decoder (`SnappyHost` in `Decompress.swift`), like the codecs below.
-Reading that file (1,000,000 rows, an `int64` and a `float64` column, pyarrow's defaults) went from
-102-106 ms to 20-36 ms per read on a busy machine, and five columns of a 10,000,000-row, 7-column
-SNAPPY file from 221 ms to 57-66 ms with the file open (305-358 ms to 105-133 ms through a fresh open).
+Reading that file (1,000,000 rows, an `int64` and a `float64` column, pyarrow's defaults) takes 20-36 ms
+per read, against 102-106 ms measured before the change on the same file shape; five columns of a
+10,000,000-row, 7-column SNAPPY file take 57-66 ms with the file open and 105-133 ms through a fresh
+open, against 221 ms and 305-358 ms measured before the change on the same file shape.
 Data pages in larger dispatches stay on the GPU: 50 token-dense pages of 160 KB (one `int64` column of
 1,000,000 random values below 10^9) take 15.4 ms there, 123 pages of 64 KB 6.7 ms.
 
@@ -431,29 +432,27 @@ with the same size, a touched file and a replaced file, LRU order, both bounds a
 Cold is the first read in the process (the cache cleared before each run; the file itself stays in
 the OS page cache), warm is the next read of the same file through the cache. 50,000,000 rows x 8
 columns, the files of `Benchmarks/parquet_bench.py`, best of 3,
-`Benchmarks/results/parquet_cache_2026-09-25.csv` (run conditions in
-`Benchmarks/results/polars_engine_scan_2026-09-25_conditions.txt`):
+`Benchmarks/results/parquet_cache_2026-09-25-quiet.csv` (run conditions in
+`Benchmarks/results/bench_conditions_2026-09-25-quiet.txt`):
 
 | codec | file | measure | cold ms | warm ms |
 |---|---:|---|---:|---:|
-| snappy | 1.65 GB | open only | 5.66 | 0.04 |
-| snappy | | read `price` (400 MB of values) | 327.93 | 11.96 |
-| snappy | | read `price` + sum | 297.03 | 14.65 |
-| snappy | | read all 8 columns | 517.69 | 224.82 |
-| lz4 | 1.67 GB | open only | 7.73 | 0.04 |
-| lz4 | | read `price` | 291.18 | 10.69 |
-| lz4 | | read `price` + sum | 322.60 | 12.76 |
-| lz4 | | read all 8 columns | 531.89 | 185.06 |
-| none | 2.23 GB | open only | 7.89 | 0.04 |
-| none | | read `price` | 372.77 | 6.06 |
-| none | | read `price` + sum | 300.06 | 7.87 |
-| none | | read all 8 columns | 457.17 | 45.36 |
+| snappy | 1.65 GB | open only | 0.27 | 0.02 |
+| snappy | | read `price` (400 MB of values) | 149.36 | 9.36 |
+| snappy | | read `price` + sum | 153.95 | 11.01 |
+| snappy | | read all 8 columns | 354.52 | 211.85 |
+| lz4 | 1.67 GB | open only | 0.24 | 0.02 |
+| lz4 | | read `price` | 152.65 | 9.12 |
+| lz4 | | read `price` + sum | 155.00 | 11.03 |
+| lz4 | | read all 8 columns | 334.12 | 182.36 |
+| none | 2.23 GB | open only | 0.23 | 0.01 |
+| none | | read `price` | 191.30 | 7.14 |
+| none | | read `price` + sum | 193.62 | 6.79 |
+| none | | read all 8 columns | 241.45 | 33.33 |
 
-Opening the file (the footer and the mapping) is 6-8 ms. The rest of the cold cost is the first read's
-hand-off of the mapped pages to Metal and the faults of a fresh mapping: 280-370 ms on a one-column
-read, which the warm read does not pay. The run shared the machine with other work (load average 11
-at its start), so the cold column moves by tens of milliseconds between runs, as the `read price` and
-`read price + sum` rows show.
+Opening the file (the footer and the mapping) is 0.23-0.27 ms. The rest of the cold cost is the first
+read's hand-off of the mapped pages to Metal and the faults of a fresh mapping: 149-191 ms on a
+one-column read, which the warm read does not pay (7.14-9.36 ms).
 
 ```
 PYTHONPATH=python python Benchmarks/parquet_bench.py --rows 50000000 --codecs snappy,lz4,none \
@@ -464,7 +463,9 @@ PYTHONPATH=python python Benchmarks/parquet_bench.py --rows 50000000 --codecs sn
 
 Measured on an Apple M4 Max (Mac16,6, 64 GB), macOS 26.x, release build. 50,000,000 rows x 8 columns
 (`int64`, `int64`, `int32`, `float64`, `float64`, dictionary-encoded `string`, `timestamp[us]`, `bool`),
-1 MB data pages. Best of 3 in-process runs, caches warm.
+1 MB data pages. Best of 3 in-process runs, caches warm. The two tables below are from
+`Benchmarks/results/parquet_bench_2026-09-25-quiet.txt` (ArrowMetal 0.2.0; run conditions in
+`Benchmarks/results/bench_conditions_2026-09-25-quiet.txt`).
 
 `wall ms` is elapsed time for the whole read; `CPU ms` is process CPU time over the same interval, so GPU
 work does not appear in it; `ttfc` is *time to first compute* — read one `float64` column and sum it,
@@ -474,38 +475,40 @@ which is the smallest query anyone actually runs.
 
 | codec | reader | wall ms | CPU ms | MB/s | ttfc ms |
 |---|---|---:|---:|---:|---:|
-| snappy | **arrowmetal (GPU)** | 440 | **225** | 3759 | 189 |
-| snappy | pyarrow.parquet | 282 | 1955 | 5855 | 127 |
-| snappy | polars | 157 | 1469 | 10502 | 36 |
-| snappy | pandas | 441 | 2253 | 3750 | 132 |
-| lz4 | **arrowmetal (GPU)** | 394 | **217** | 4240 | 203 |
-| lz4 | pyarrow.parquet | 293 | 1738 | 5701 | 122 |
-| lz4 | polars | 93 | 1109 | 17957 | 21 |
-| lz4 | pandas | 306 | 1598 | 5450 | 118 |
-| none | **arrowmetal (GPU)** | 305 | **262** | 7301 | 250 |
-| none | pyarrow.parquet | 206 | 951 | 10814 | 101 |
-| none | polars | 84 | 861 | 26592 | 28 |
-| none | pandas | 317 | 1245 | 7030 | 134 |
+| snappy | **arrowmetal (GPU)** | 369 | **175** | 4476 | 154 |
+| snappy | pyarrow.parquet | 175 | 1246 | 9464 | 84 |
+| snappy | polars | 99 | 1302 | 16751 | 20 |
+| snappy | pandas | 239 | 1414 | 6919 | 94 |
+| lz4 | **arrowmetal (GPU)** | 340 | **177** | 4909 | 154 |
+| lz4 | pyarrow.parquet | 169 | 1045 | 9895 | 87 |
+| lz4 | polars | 82 | 1052 | 20411 | 17 |
+| lz4 | pandas | 249 | 1218 | 6694 | 109 |
+| none | **arrowmetal (GPU)** | 250 | **227** | 8897 | 214 |
+| none | pyarrow.parquet | 167 | 766 | 13359 | 85 |
+| none | polars | 75 | 936 | 29860 | 19 |
+| none | pandas | 248 | 949 | 8968 | 102 |
 
-ArrowMetal is 1.3-4.2x behind Polars and pyarrow on wall time and **3.3-8.7x ahead on CPU time**: the decode is
-work the host never does. The `ttfc` column above re-opens the file for every query, which is the wrong
-way to hold a 2 GB file and costs ArrowMetal the most, because mapping it and handing its pages to Metal
-is a per-open cost the CPU readers do not have. Keep the handle, which is what a query engine does:
+ArrowMetal is 1.5-4.1x behind Polars and pyarrow on wall time (1.5-2.1x behind pyarrow, 3.3-4.1x
+behind Polars) and **3.4-7.4x ahead on CPU time** (3.4-7.1x ahead of pyarrow, 4.1-7.4x ahead of
+Polars): the decode is work the host never does. The `ttfc` column above re-opens the file for every
+query, which is the wrong way to hold a 2 GB file and costs ArrowMetal the most, because mapping it and
+handing its pages to Metal is a per-open cost the CPU readers do not have. Keep the handle, which is what a query engine does:
 
 ### One `float64` column (400 MB of values), file handle kept open
 
 | codec | reader | read ms | sum ms |
 |---|---|---:|---:|
-| snappy | **arrowmetal (GPU)** | **11** | **2** |
-| snappy | pyarrow.ParquetFile | 98 | 8 |
-| lz4 | **arrowmetal (GPU)** | **16** | **3** |
-| lz4 | pyarrow.ParquetFile | 105 | 7 |
-| none | **arrowmetal (GPU)** | **7** | **3** |
-| none | pyarrow.ParquetFile | 57 | 7 |
+| snappy | **arrowmetal (GPU)** | **10** | **2** |
+| snappy | pyarrow.ParquetFile | 55 | 6 |
+| lz4 | **arrowmetal (GPU)** | **12** | **2** |
+| lz4 | pyarrow.ParquetFile | 51 | 6 |
+| none | **arrowmetal (GPU)** | **6** | **3** |
+| none | pyarrow.ParquetFile | 46 | 6 |
 
-That is the shape a query actually has — open once, project a column, compute — and it is a 6-9x win on
-the read plus a 2-4x win on the reduction, because the values are already in GPU memory when the
-reduction starts. 400 MB decoded in 7 ms is 57 GB/s.
+That is the shape a query actually has — open once, project a column, compute — and ArrowMetal is
+4.3-7.7x ahead on the read (5.5x Snappy, 4.3x LZ4, 7.7x uncompressed) and 2-3x ahead on the reduction,
+because the values are already in GPU memory when the reduction starts. 400 MB decoded in 6 ms is
+67 GB/s.
 
 ### Decompression on its own
 
@@ -564,20 +567,20 @@ PYTHONPATH=python python Benchmarks/parquet_nested_bench.py --rows 1000000,10000
 
 ### What the numbers say
 
-- **CPU time is the headline.** Reading the whole 50 M-row table costs the host 217-262 ms of CPU against
-  861-2253 ms for the CPU readers. The decode is compute the process never does, so the cores stay free
+- **CPU time is the headline.** Reading the whole 50 M-row table costs the host 175-227 ms of CPU against
+  766-1414 ms for the CPU readers. The decode is compute the process never does, so the cores stay free
   for whatever else is running.
 - **The arrays land in GPU memory already.** Summing the column ArrowMetal just decoded takes 2-3 ms; the
-  CPU readers pay 7-8 ms *and* had to materialise the array first. There is no import step, because the
+  CPU reader pays 6 ms *and* had to materialise the array first. There is no import step, because the
   decode wrote into Metal shared memory in the first place.
 - **Opening the file is a real per-open cost, so do not re-open it.** Mapping a 2 GB file and handing its
   pages to Metal costs ~17 ms per gigabyte, and the minor faults of a fresh mapping cost more again;
   together they are most of the `ttfc` column. Holding the `ParquetFile` across queries, which is what
-  a query engine does, removes all of it and turns the same read into 7-16 ms.
+  a query engine does, removes all of it and turns the same read into 6-12 ms.
 - **Snappy on *compressible* data is the weak spot, and the reason is structural.** An LZ77 token stream
   is serial, so a page is decoded by one SIMD group, and the cost scales with the number of *tokens*, not
   with bytes. Incompressible pages are one huge literal and decode at memory speed — the `price` column,
-  400 MB of random doubles, comes back in 11 ms. A page full of short matches costs a token each, and an
+  400 MB of random doubles, comes back in 10 ms. A page full of short matches costs a token each, and an
   LCG-generated `int64` column decodes at 2-5 GB/s where the uncompressed path does 14-40 GB/s. Smaller
   pages help a little (the table above) but do not change the shape of it: this is the one part of
   Parquet that a GPU is structurally bad at; the GPU decode is behind the CPU path there.
