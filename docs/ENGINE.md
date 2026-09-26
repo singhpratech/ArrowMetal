@@ -398,6 +398,13 @@ machine (`Benchmarks/results/engine_bench_2000000_2026-09-07.txt`) (a) is 0.57 m
 ahead of Polars and (b) and (f) are behind, and (f) is behind at 50M as well.
 
 
+Polars' `lf.collect(engine=am.MetalEngine())` runs this engine under Polars: it translates subtrees
+of Polars' optimised plan into the grammar above and, by default, runs a subtree here only when its
+input rows are at or above the measured crossover of every shape class in it (sort, each join kind,
+`unique`, group-by and whole-frame aggregates per aggregate family, row-wise), per dtype class and
+input, fitted from `Benchmarks/results/polars_engine_crossover_2026-09-26.csv` against Polars' own
+engines ([POLARS.md](POLARS.md), "Which translatable subtrees it runs: the defaults").
+
 ## Limits
 
 - **Strings are read, not written.** The fused kernels will not materialise a `utf8` output column, so
@@ -413,6 +420,12 @@ ahead of Polars and (b) and (f) are behind, and (f) is behind at 50M as well.
   atomics support (MSL has no 64-bit atomic add): `sum`/`mean` over any integer or `float32`,
   `min`/`max` over a 32-bit-or-narrower integer or `float32`. Anything else — a `float64` sum, a
   64-bit `min` — silently takes `GroupBy`'s own per-aggregate kernels instead, which `explain()` says.
+- **A `float64` group-by `sum` or `mean` over 2^24 groups or more is wrong**: at 16,777,216 groups and
+  above most groups come back null (16,777,215 groups are right). This covers a `mean` over a 64-bit
+  integer column cast to `float64`. `python/tests/test_engine_policy.py`
+  (`test_core_group_by_float64_sum_and_mean_at_2_24_groups`) pins it as an expected failure, and the
+  Polars engine leaves such a group-by to Polars whenever its input could hold that many groups
+  ([POLARS.md](POLARS.md), "Which translatable subtrees it runs: the defaults").
 - **Group order is not Polars'.** `GroupByKeys` emits groups ascending by key for numeric, boolean,
   temporal and decimal keys and in first-seen order for `utf8`; pyarrow and Polars use first-seen for
   everything. Sort both sides before comparing.

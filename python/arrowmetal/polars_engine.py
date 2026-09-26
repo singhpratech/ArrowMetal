@@ -25,10 +25,10 @@ inner/left/semi/anti `Join`s and `Distinct` (`unique`), over the expressions and
 docs/POLARS.md, "Tier 4". Everything else falls back with
 a one-line reason in `engine.last_report`.
 
-Which of those it does take is a second decision. By default (`shapes="measured"`) it takes only
-the shape classes the benchmark measured ahead of both Polars engines, from the row
-count at which they were ahead (`MEASURED_SHAPES`, `min_rows`); `shapes="all"` takes everything it
-can translate. docs/POLARS.md says how the defaults were chosen and which results files they come
+Which of those it does take is a second decision (`_engine_policy.py`). By default
+(`shapes="measured"`) it takes a subtree when its input rows are at or above the measured crossover
+of every shape class in it, for its dtype class and input; `shapes="all"` takes everything it can
+translate. docs/POLARS.md says how the crossovers were measured and which results files they come
 from.
 
 Results are Polars' results
@@ -68,9 +68,10 @@ from polars.lazyframe.engine import _LocalEngine
 
 from . import ArrowMetalError, MetalArray, lazy as _lazy
 from . import _cached_parquet_read, _parquet_files
+from . import _engine_policy as _policy
 
 __all__ = ["MetalEngine", "MetalPlanReport", "MetalEngineFallbackWarning", "TESTED_IR_VERSION",
-           "TESTED_POLARS", "KNOWN_NODE_KINDS", "MEASURED_SHAPES", "FORCE_POLARS",
+           "TESTED_POLARS", "KNOWN_NODE_KINDS", "SHAPE_CLASSES", "placement_rules", "FORCE_POLARS",
            "clear_import_cache", "import_cache_limit", "import_cache_info"]
 
 # `NodeTraverser.version()` on the polars this module was written and tested against. The major is
@@ -96,24 +97,15 @@ _OFF_VALUES = ("off", "0", "false", "no", "polars")
 FORCE_POLARS = (f"To run the plan on Polars instead, collect without engine= (or with "
                 f"engine=\"in-memory\"), or set {OFF_ENV}=off.")
 
-# Default size gate, in total rows over a subtree's in-memory inputs. How it was chosen is in
-# docs/POLARS.md ("Tier 4", "Which translatable subtrees it runs"): the crossover of argsort and
-# lexsort, which a full sort runs, in Benchmarks/results/router_2026-09-24.json, checked against
-# Benchmarks/results/polars_engine_bench_2026-09-23_provisional.csv and the quiet rerun,
-# Benchmarks/results/polars_engine_bench_2026-09-24.csv.
-DEFAULT_MIN_ROWS = 1_000_000
-
-# Shape classes of a translated subtree: "sort" (a full sort whose keys ArrowMetal orders as Polars
-# does), "sort_helper_keys" (a full sort that needs extra key columns for that: nulls first on a
-# nullable key, or a Float64/Float32 key descending, where NaN goes first), "top_k" (a sort with a slice),
-# "group_by_multi" (a GroupBy over two or more keys), "group_by" (one key), "aggregate" (a
-# whole-frame aggregate), "join", "distinct"; a subtree with none of them is "rowwise" (filters and
-# projections only).
-# `shapes="measured"` takes a subtree only when every class in it is a key of MEASURED_SHAPES, none
-# of its inputs is a String column (a String column is copied on the way in, and that copy is what the
-# sort with a String column spent its time on), and it reads at least the class's row minimum (or
-# `min_rows`, whichever is larger). Why these two: docs/POLARS.md, "Tier 4".
-MEASURED_SHAPES = {"sort": 0, "sort_helper_keys": 10_000_000}
+# Which translated subtrees run on Metal is decided by python/arrowmetal/_engine_policy.py from
+# each subtree's shape classes (SHAPE_CLASSES), the dtypes it reads, its input rows and the crossover
+# tables; docs/POLARS.md ("Which translatable subtrees it runs: the defaults") has the measurements.
+SHAPE_CLASSES = _policy.CLASSES
+# `shapes="all"` without `min_rows=`: a subtree reading fewer rows stays with Polars.
+DEFAULT_MIN_ROWS = _policy.DEFAULT_MIN_ROWS_ALL
+# ArrowMetal's group-by answers a Float64 sum or mean wrongly from this many groups on.
+_F64_GROUP_LIMIT = 1 << 24
+_AGG_FAMILY = {"sum": "sum", "count": "count", "mean": "mean", "min": "minmax", "max": "minmax"}
 
 _HIDDEN = "__arrowmetal_"          # prefix of the helper columns the translation adds and drops
 # A Boolean the plan's text leaves open until it runs: "the input of probe N holds exactly one row"
@@ -323,6 +315,8 @@ class MetalPlanReport:
             if t.get("seconds") is not None:
                 ran = f", ran in {t['seconds'] * 1e3:.2f} ms -> {t['rows_out']:,} rows"
             lines.append(f"  metal:  {t['root']} [{' > '.join(t['kinds'])}] over {t['rows']:,} rows{ran}")
+            if t.get("rule"):
+                lines.append(f"          rule: {t['rule']}")
             for sc in t.get("scans") or ():
                 skipped = (sc.get("row_groups_skipped_by_statistics", 0)
                            + sc.get("row_groups_skipped_by_page_index", 0)
@@ -429,7 +423,7 @@ class _Sub:
         self.rows = rows
         self.work = work
         self.kinds = list(kinds)
-        self.classes = set(classes)         # shape classes inside: see _SHAPE_CLASSES
+        self.classes = set(classes)         # shape classes inside: see SHAPE_CLASSES
         self.exact = exact
         self.probes = []
 
@@ -994,7 +988,8 @@ class _Translator:
         aggregate or unique below the sort), which is what makes the scan's validity the key's."""
         m = _COL_REF.fullmatch(ref)
         if (m is None or _unq(m.group(1)) not in kid.phys
-                or kid.classes & {"join", "distinct", "group_by", "group_by_multi", "aggregate"}):
+                or {c.split(":")[0] for c in kid.classes}
+                & {"join", "distinct", "group_by", "group_by_multi", "aggregate"}):
             raise _Unsupported(f"A sort with nulls first by a {dtype} column that is not a column "
                                "of the scan is not translated (ArrowMetal's expressions do not "
                                "read temporal columns).")
@@ -1073,7 +1068,8 @@ class _Translator:
         plan = {"op": "join", "left": left.final_plan(), "right": right.final_plan(),
                 "left_on": lkeys, "right_on": rkeys, "how": how.lower(), "suffix": suffix}
         return _Sub(plan, cols, [m[0] for m in meta], left.leaves + right.leaves,
-                    left.rows + right.rows, True, (), left.classes | right.classes | {"join"})
+                    left.rows + right.rows, True, (), left.classes | right.classes
+                    | {"join:" + how.lower()})
 
     def _node_Distinct(self, n, node, inputs, kids, check_only=False):
         keep, subset, maintain, slc = node.options
@@ -1107,7 +1103,8 @@ class _Translator:
         return k in ("Agg", "Len")
 
     def _aggregate(self, n, kid, keys, exprs):
-        aggs, fix = [], []
+        aggs, fix, families = [], [], set()
+        f64_sums = False                # a sum or mean the group-by adds in Float64
         for pe in exprs:
             name = pe.output_name
             want = _code(self.nt.get_dtype(pe.node))
@@ -1122,6 +1119,7 @@ class _Translator:
             if k == "Len":
                 aggs.append(["count", name, ""])
                 fix.append((name, "i64", want, "count"))
+                families.add("count")
                 continue
             if k != "Agg":
                 raise _Unsupported("An expression over an aggregate is not translated.")
@@ -1131,6 +1129,7 @@ class _Translator:
             op = e.name
             if op not in ("sum", "min", "max", "mean", "count"):
                 raise _Unsupported(f"The aggregate {op} has no ArrowMetal plan operator.")
+            families.add(_AGG_FAMILY[op])
             arg = self._expr(e.arguments[0], kid.cols)
             if arg.code is None or arg.s is None:
                 raise _Unsupported(f"The aggregate {op} over dtype {arg.dtype} is not translated.")
@@ -1155,6 +1154,7 @@ class _Translator:
                 got = "f64" if _is_float(arg.code) else ("u64" if arg.code[0] == "u" else "i64")
                 aggs.append(["sum", name, arg.s])
                 fix.append((name, got, want, "zero"))
+                f64_sums = f64_sums or arg.code == "f64"
             elif op == "mean":
                 s = arg.s
                 if arg.code in ("i64", "u64", "f32"):
@@ -1164,6 +1164,7 @@ class _Translator:
                     # add in Float32.
                     s = f"(cast {s} f64)"
                 aggs.append(["mean", name, s])
+                f64_sums = f64_sums or arg.code in ("f64", "i64", "u64", "f32")
                 fix.append((name, "f64", want, None))
             else:
                 if keys and arg.code == "f64":
@@ -1189,6 +1190,18 @@ class _Translator:
                     fix.append((name, arg.code, want, ("nan", cnt, num, zs, op)))
                 else:
                     fix.append((name, arg.code, want, None))
+        if keys and f64_sums:
+            # ArrowMetal's group-by returns wrong Float64 sums and means (nulls, or 0 after the
+            # fill) once there are 2^24 groups or more
+            # (`test_core_group_by_float64_sum_and_mean_at_2_24_groups`). The number of groups is
+            # at most the rows reaching the group-by, which is at most the input rows unless an
+            # inner or left join below can multiply them.
+            bound = None if kid.classes & {"join:inner", "join:left"} else kid.rows
+            if bound is None or bound >= _F64_GROUP_LIMIT:
+                raise _Unsupported(f"A per-group Float64 sum or mean over "
+                                   f"{'an unbounded number of' if bound is None else f'{bound:,}'} "
+                                   f"rows is not translated (ArrowMetal's group-by answers these "
+                                   f"wrongly from {_F64_GROUP_LIMIT:,} groups).")
         if keys:
             plan = {"op": "group_by", "input": kid.plan,
                     "keys": [[k, kid.cols[k].ref] for k in keys], "aggs": aggs}
@@ -1224,8 +1237,9 @@ class _Translator:
                 s = f"(cast {s} {want})"
             cols[name] = _Col(_dtype_of(want), nullable, s)
         phys = keys + [a[1] for a in aggs]
-        cls = "group_by_multi" if len(keys) > 1 else ("group_by" if keys else "aggregate")
-        return _Sub(plan, cols, phys, kid.leaves, kid.rows, True, (), kid.classes | {cls},
+        kind = "group_by_multi" if len(keys) > 1 else ("group_by" if keys else "aggregate")
+        classes = {f"{kind}:{f}" for f in (families or {"keys"})}
+        return _Sub(plan, cols, phys, kid.leaves, kid.rows, True, (), kid.classes | classes,
                     exact=None if keys else 1)
 
     # -- expressions
@@ -1968,9 +1982,10 @@ def execute_with_metal(nt, duration_since_start=None, *, config, path="collect")
         _warn_once("sink", _PATH_WARNINGS["sink"])
         return _finish(config, report)
 
-    # Take the largest translated subtrees that do GPU work, top down.
+    # Take the largest translated subtrees that do GPU work and the policy takes, top down.
     chosen, seen = [], set()
     kinds = dict(report.walked)
+    router = _router_crossovers() if config.shapes == "measured" else {}
 
     def choose(n):
         if n in seen:                     # a subplan shared under two Cache nodes
@@ -1984,26 +1999,17 @@ def execute_with_metal(nt, duration_since_start=None, *, config, path="collect")
             if not sub.work:
                 report.nodes.append((n, kind, "polars"))
                 return
-            classes = sub.classes or {"rowwise"}
-            # A String column read from a Parquet file is decoded on the GPU rather than copied, but no
-            # scan case with one was measured, so the rule applies to file scans too.
-            strings = any(dt == pl.String for dt in _leaf_dtypes(sub.leaves))
-            need = config.min_rows
-            if config.shapes == "measured":
-                if not classes <= set(MEASURED_SHAPES) or strings:
-                    what = "+".join(sorted(classes)) + (" over a String column" if strings else "")
-                    report.fallbacks.append(
-                        f"{kind}#{n}: shape {what} is not one the benchmark measured ahead of "
-                        "Polars (MetalEngine(shapes='all') takes it)")
-                    report.nodes.append((n, kind, "polars"))
-                    for i in inputs:
-                        choose(i)
-                    return
-                need = max([need] + [MEASURED_SHAPES[c] for c in classes])
-            if sub.rows < need:
-                report.fallbacks.append(f"{kind}#{n}: {sub.rows:,} input rows is below the "
-                                        f"{need:,} this shape needs")
+            shape = sorted(sub.classes) or ["rowwise"]
+            dtypes = list(_leaf_dtypes(sub.leaves))
+            # A Parquet file's rows are the footer's count: what the predicate keeps is not guessed.
+            source = "parquet" if any(_is_file(df) for _s, df, _n in sub.leaves) else "memory"
+            decision = _policy.decide(shape, dtypes, sub.rows, source, shapes=config.shapes,
+                                      min_rows=config.min_rows, router=router)
+            if not decision.take:
+                report.fallbacks.append(f"{kind}#{n}: rule: {decision.reason}")
                 report.nodes.append((n, kind, "polars"))
+                for i in inputs:          # a smaller subtree below may be one the policy takes
+                    choose(i)
                 return
             nt.set_node(n)
             schema = dict(nt.get_schema())
@@ -2012,7 +2018,9 @@ def execute_with_metal(nt, duration_since_start=None, *, config, path="collect")
             sub.probes = tr.probes if _PROBE_RE.search(json.dumps(sub.plan)) else []
             verdict = _validate(sub, schema)
             if verdict is None:
-                chosen.append((n, kind, sub, schema))
+                chosen.append((n, kind, sub, schema, {
+                    "rule": decision.reason, "shape": shape,
+                    "dtype_class": _policy.dtype_class(dtypes), "input": source}))
                 return
             report.fallbacks.append(f"{kind}#{n}: the ArrowMetal plan was rejected: {verdict}")
         report.nodes.append((n, kind, "polars"))
@@ -2021,10 +2029,10 @@ def execute_with_metal(nt, duration_since_start=None, *, config, path="collect")
 
     try:
         choose(root)
-        for n, kind, sub, schema in chosen:
+        for n, kind, sub, schema, placed in chosen:
             entry = {"root": f"{kind}#{n}", "kinds": sub.kinds, "rows": sub.rows,
                      "plan": json.dumps(sub.plan), "seconds": None, "rows_out": None,
-                     "_callback_ns": callback_ns}
+                     "_callback_ns": callback_ns, **placed}
             report.taken.append(entry)
             report.nodes.append((n, kind, "metal"))
             nt.set_node(n)
@@ -2032,6 +2040,22 @@ def execute_with_metal(nt, duration_since_start=None, *, config, path="collect")
     finally:
         nt.set_node(root)
     return _finish(config, report)
+
+
+def _router_crossovers():
+    """The router table in force, as the policy reads it ({op: (rows, where)})."""
+    from . import router_table
+    try:
+        return _policy.router_crossovers(router_table())
+    except (ArrowMetalError, AttributeError, OSError, ValueError):
+        return {}
+
+
+def placement_rules():
+    """The default policy's table under the router table in force: one
+    `(class, dtype class, input, crossover rows or None, where it comes from)` per shape the engine
+    table knows. `None`: not taken at any size."""
+    return _policy.rule_table(_router_crossovers())
 
 
 def _finish(config, report):
@@ -2066,13 +2090,21 @@ class MetalEngine(_LocalEngine):
     `ComputeError: 'cuda' conversion failed: NotImplementedError: ArrowMetal MetalEngine: ...`;
     the `'cuda'` is hardcoded in polars 1.44.1).
 
-    Two gates decide whether a translatable subtree runs on Metal:
+    Which translatable subtrees run on Metal (python/arrowmetal/_engine_policy.py):
 
-    * `shapes="measured"` (the default) takes only the shape classes in `MEASURED_SHAPES`, the ones
-      the benchmark measured ahead of both Polars engines; `shapes="all"` takes every
-      subtree the translator can express (for testing, or to move work off the CPU cores).
-    * `min_rows`: a subtree whose in-memory inputs hold fewer rows stays with Polars. `min_rows=0`
-      turns the gate off.
+    * `shapes="measured"` (the default): a subtree runs on Metal when its input rows (its in-memory
+      frames, or its Parquet file's footer count) are at or above the measured crossover of every
+      shape class in it, for its dtype class (a String column among its inputs, or not) and input;
+      a class with no crossover stays with Polars at every size. `placement_rules()` lists them.
+    * `shapes="all"`: every subtree the translator can express, of at least `min_rows` rows
+      (`DEFAULT_MIN_ROWS` when not given; for testing, or to move work off the CPU cores).
+    * `shapes={...}`: a set of class names (`SHAPE_CLASSES`, or a prefix such as `"group_by"` or
+      `"join"`): a subtree whose classes are all named, of at least `min_rows` rows (0 when not
+      given).
+    * `min_rows`: with `"measured"`, a floor above the crossovers.
+
+    Each taken subtree's report entry says which rule took it (`rule`), and each subtree left to
+    Polars by the policy has a `Kind#id: rule: ...` line.
 
     The name Polars is told is "in-memory": Rust accepts only its four engine names, and the
     in-memory engine is what runs every node this engine leaves to Polars. `plan_engine` and
@@ -2083,10 +2115,23 @@ class MetalEngine(_LocalEngine):
 
     def __init__(self, *, raise_on_fail=False, min_rows=None, shapes="measured", monitoring=None):
         super().__init__(monitoring=monitoring)
-        if shapes not in ("measured", "all"):
-            raise ValueError(f"shapes must be 'measured' or 'all', got {shapes!r}")
+        if isinstance(shapes, str):
+            if shapes not in ("measured", "all"):
+                raise ValueError(f"shapes must be 'measured', 'all' or a set of shape class names, "
+                                 f"got {shapes!r}")
+        else:
+            try:
+                shapes = frozenset(shapes)
+            except TypeError:
+                raise ValueError(f"shapes must be 'measured', 'all' or a set of shape class names, "
+                                 f"got {shapes!r}") from None
+            known = set(SHAPE_CLASSES) | {c.split(":")[0] for c in SHAPE_CLASSES}
+            unknown = sorted(str(c) for c in shapes if c not in known)
+            if unknown or not shapes:
+                raise ValueError(f"unknown shape class names {unknown} (known: "
+                                 f"{', '.join(sorted(known))})")
         self.raise_on_fail = bool(raise_on_fail)
-        self.min_rows = DEFAULT_MIN_ROWS if min_rows is None else int(min_rows)
+        self.min_rows = None if min_rows is None else int(min_rows)
         self.shapes = shapes
         self.last_report = None
 

@@ -1,6 +1,36 @@
 # Changelog
 
 ## Unreleased
+- `MetalEngine()`'s default (`shapes="measured"`) decides per subtree from measured crossovers instead
+  of taking large sorts only. Each translated subtree has shape classes (`rowwise`; `aggregate`,
+  `group_by` and `group_by_multi` per aggregate family `sum`, `count`, `mean`, `minmax`; `sort`,
+  `sort_helper_keys`, `top_k`; `join:inner|left|semi|anti`; `distinct`), a dtype class (`string` when a
+  String column is among its inputs) and an input (in-memory frames, or a Parquet file judged by its
+  footer's row count). It runs on Metal when its input rows are at or above the crossover of every
+  class in it: the largest of the engine table (`python/arrowmetal/_engine_crossovers.py`, fitted by
+  the new `Benchmarks/polars_engine_crossover.py` from `Benchmarks/results/polars_engine_crossover_2026-09-26.csv`,
+  45 in-memory cases at 250,000 to 50,000,000 rows and the Parquet cases at 1,000,000 to 50,000,000,
+  a case counting as ahead when its time x 1.15 is at most the faster Polars engine's), the router table
+  in force for the kernels it routes, and the sort kernels' crossover against the fastest CPU library.
+  Taken: sorts from 1,000,000 rows (helper-key sorts with a String column from 4,458,670), numeric-key
+  inner and left joins from 1,250,000 input rows, anti joins from 7,451,256, `unique` from 3,399,993,
+  sorts of a Parquet file from 2,505,017; group-by, whole-frame aggregates, top-k, row-wise shapes,
+  semi joins and the other String shapes are not taken (the String cases were measured with String
+  columns handed over as `large_string`). `shapes="all"`, `min_rows=` and a new explicit
+  set of class names (`shapes={"sort", "join"}`) override it. Each taken subtree's report entry
+  carries `rule`, `shape`, `dtype_class` and `input`, and each node the policy leaves has a
+  `Kind#id: rule: ...` line ("900,000 input rows is below the 1,250,000-row crossover for join:inner
+  (...)"). `arrowmetal.polars_engine.placement_rules()` lists the table; `SHAPE_CLASSES` replaces
+  `MEASURED_SHAPES`, and `MetalEngine().min_rows` is `None` unless given. In
+  `Benchmarks/results/polars_engine_bench_2026-09-26.csv` (45 cases at 2M and 50M rows and the 50M
+  Parquet cases, taken with a 1-minute load average of 8 to 22) every case-size pair the default took
+  was ahead of the faster Polars engine, 1.30x to 8.37x. `Benchmarks/polars_engine_bench.py` gains 37
+  cases and `--crossover`; `python/tests/test_engine_policy.py` tests the policy.
+- `MetalEngine` leaves a group-by with a Float64 sum, or a mean over a 64-bit integer or float column,
+  to Polars when its input could hold 2^24 groups (16,777,216 input rows or more, or an inner or left
+  join below it): ArrowMetal's group-by answers those wrongly from 16,777,216 groups (most groups null),
+  found by the crossover sweep's `(v3)` case and pinned by
+  `test_core_group_by_float64_sum_and_mean_at_2_24_groups` (docs/ENGINE.md, "Limits").
 - `python -m arrowmetal.bench`: one seeded 10,000,000-row dataset (drawn with `pyarrow.compute` from
   SplitMix64 streams, so nothing beyond `pip install arrowmetal` is needed), sum, filter, sort and group-by sum
   through pyarrow (and Polars when installed) and through ArrowMetal, each answer checked against
@@ -131,7 +161,7 @@
   callback API is present, the IR node kinds the engine does not know, and the capability table's
   header; it exits 1 when every plan would stay with Polars. The callback also accepts the
   one-argument call of polars 2.0.0rc2, whose IR version (15, 1) keeps every plan with Polars.
-- Polars engine messages: every reason in the report is a full sentence
+- Polars engine messages: every translation reason in the report is a full sentence
   (`test_every_unsupported_reason_is_a_full_sentence`), and the engine's errors (`raise_on_fail=True`,
   a subtree failing on Metal, a result schema that is not Polars') name the node and the reason and
   end with how to run the plan on Polars instead. `ARROWMETAL_METAL_ENGINE=off` makes every

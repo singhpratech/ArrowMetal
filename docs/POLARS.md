@@ -626,73 +626,161 @@ declined):
 
 A subtree the engine can translate still has to be one where the GPU is ahead, because getting a
 Polars column onto the GPU is not free: a single-chunk numeric column is imported without a copy,
-but mapping its pages into Metal and releasing them costs time on every query. In the run below a
-String column was also converted on the CPU (Polars' `large_string` export and a narrowing pass); the
-engine now hands String columns over in Polars' own view layout (see "Strings" under Limits), and
-these rows have not been re-measured since. `Benchmarks/polars_engine_bench.py` measures the eight shapes of
-`Benchmarks/engine_bench.py` plus ten group-by, sort and `unique` shapes, as Polars LazyFrames, through
-Polars' in-memory engine, Polars' streaming engine and the engine with everything it can translate
-(`shapes="all"`), cold (nothing imported before) and warm (see the import cache below). The numbers
-below are from a quiet run at 2,000,000 and 50,000,000 rows,
-`Benchmarks/results/polars_engine_bench_2026-09-24.csv`; the run conditions
-at its start are recorded in `Benchmarks/results/bench_conditions_2026-09-24.txt`. The defaults
-were first chosen from a run at 500,000 to 50,000,000 rows taken while other work shared the machine,
-kept as history in `Benchmarks/results/polars_engine_bench_2026-09-23_provisional.csv`; the quiet run
-did not repeat the 500,000, 1,000,000 and 10,000,000-row sizes.
+but mapping its pages into Metal and releasing them costs time on every query. In the runs below a
+String column was also converted on the CPU (Polars' `large_string` export and a narrowing pass);
+the engine now hands String columns over in Polars' own view layout (see "Strings" under Limits),
+and the `string` rows have not been re-measured since. `MetalEngine()` (`shapes="measured"`)
+decides per subtree from measured crossovers (`python/arrowmetal/_engine_policy.py`). Each translated subtree has shape classes:
 
-Read cold, against the faster of Polars' two engines (`vs_fastest_polars` of the `MetalEngine all,
-cold` rows, where above 1 is ahead; 2M rows first, then 50M), the quiet run says:
+* `rowwise` -- filters and projections only;
+* `aggregate:<family>` (a whole-frame aggregate), `group_by:<family>` (one key) and
+  `group_by_multi:<family>` (two or more keys), the families being `sum`, `count` (`count` and
+  `len`), `mean` and `minmax`;
+* `sort` (keys ArrowMetal orders as Polars does), `sort_helper_keys` (a nullable key sorted nulls
+  first, or a float key descending, which need an extra key column) and `top_k` (a sort with a slice);
+* `join:inner`, `join:left`, `join:semi`, `join:anti`, and `distinct` (`unique`).
 
-* **A full sort** whose keys ArrowMetal orders as Polars does (no helper key) is ahead at both sizes:
-  `(m) sort 3 columns by an int64 key` at 5.05 and 4.73, `(q) filter, then sort by (int32 asc, int64
-  desc)` at 3.59 and 6.44. The provisional run had both ahead from 500,000 rows.
-* **A full sort that needs a helper key** (nulls first on a nullable key, or a float key descending),
-  `(p) filter, then sort by (int32 asc, nullable Float64 desc)`, is behind at 2M rows (0.92) and ahead
-  at 50M (1.66). The provisional run had it behind at 1,000,000 rows and below, level at 2,000,000 and
-  ahead from 10,000,000. This shape also carries the String column of its frame, so the default leaves
-  it to Polars at every size by the String rule below (its `MetalEngine default, cold` rows are 0.96
-  at both sizes).
-* **A sort that carries a String column**, `(o) sort with a String column, by an int64 key`, is to
-  improve at both sizes (0.74 and 0.89); in that run the String import was a CPU copy.
-* **Group-by** depends on what nobody knows before running it, the number of groups, and on the key
-  types. Ahead at both sizes: `(c) group-by (region, sub) mean + max` (1.32, 1.72) and `(l) group-by
-  (region, sub), Float64 sum + mean` (1.45, 2.05). Ahead at 50M only: `(i) group-by 1 key, 100 000
-  groups, sum` (0.74, 1.94). To improve at both sizes: `(j) group-by (k1, k2), sum + count` (0.51,
-  0.86), `(k) group-by (String, int32), sum` (0.37, 0.66) and `(b) filter + group-by 200 keys + sort
-  desc + limit 10` (0.34, 0.58).
-* **Top-k, whole-frame aggregates and row-wise filters and projections** are to improve at both sizes:
-  `(n) top 100 by Float64, descending` (0.39, 0.18), `(a) filtered sum + count` (0.19, 0.17) and `(d)
-  projection chain then filter` (0.26, 0.31).
-* **Joins and `unique`**: `(e) inner join then sum` (1.90, 1.88) and `(r) unique over (region, sub),
-  keep first` (1.60, 5.52) are ahead at both sizes; `(f) semi join` is to improve at both (0.22, 0.41).
-  Like group-by, both run on the key-to-id machine, whose speed against Polars depends on how many
-  distinct keys there are, and one shape of each is not enough to set a default by.
-* **Windows and the as-of join** stay with Polars; their rows record what the
-  callback costs a plan it leaves alone. `MetalEngine default, cold` against `polars in-memory`: `(g)
-  row_number over partitions` 15.139 ms against 14.770 ms at 2M rows and 93.614 ms against 95.680 ms at
-  50M, `(h) as-of join` 7.039 ms against 7.116 ms and 152.100 ms against 151.741 ms.
+It also has a dtype class, `string` when a String column is among the columns it reads and `numeric`
+otherwise, and an input, in-memory frames or a Parquet file. A subtree runs on Metal when its input
+rows (the rows of its in-memory frames, or of its Parquet file as the footer states them; what a
+predicate will keep is not estimated) are at or above the crossover of every class in it for its
+dtype class and input. A class whose row says **not taken** stays with Polars at every size. The
+decision reads nothing but the subtree's classes, dtypes, input rows and input and the tables, so
+the same subtree always gets the same answer (`python/tests/test_engine_policy.py` checks it across
+calls and processes). Where the policy leaves a node, the placement moves down to its inputs, so a
+smaller subtree below it can still be taken: under a whole-frame sum over an inner join, the join
+runs on Metal and Polars adds up its output.
 
-So `MetalEngine()` takes a subtree when every shape in it is a full sort (`MEASURED_SHAPES`), none of
-its inputs is a String column, and its inputs (in-memory frames and Parquet files) hold at least 1,000,000 rows -- 10,000,000
-when a helper key is needed. 1,000,000 is the crossover against the fastest CPU library of the
-operations a full sort runs (the engine's `sort` is a `lexsort` and a `take`, [ENGINE.md](ENGINE.md))
-in `Benchmarks/results/router_2026-09-24.json`: `argsort int64`, `argsort float64` and `lexsort (2
-int32 keys)` are all at 1,000,000. The figure is read from the
-2026-09-24 sweep, which supersedes `router_2026-09-17.json`; `sort float64` (sorting a column's values,
-which the engine does not run for a frame sort) is at 10,000,000 there. The provisional run had full sorts ahead below 1,000,000 as well, so the
-default keeps the router's figure as its margin. The quiet run keeps these defaults. Both sorts the default takes are
-ahead of the faster Polars engine at both sizes (`MetalEngine default, cold`: `(m)` at 5.20 and 4.86,
-`(q)` at 3.75 and 6.35). Every shape it declines is behind at one of the two sizes, or belongs to a
-family with a shape that is (`(j)` for group-by over two or more keys, `(i)` at 2M rows for group-by
-over one key, `(f)` for joins), except `(r)`: `unique` is ahead at both sizes, but with one shape
-measured it stays out for the reason above. Every other subtree stays with Polars with the reason in
-the report, and `shapes="all"` takes it.
+**The crossovers.** `Benchmarks/polars_engine_bench.py --crossover` ran 45 LazyFrames over in-memory
+frames at 250,000, 500,000, 1,000,000, 2,000,000, 5,000,000, 10,000,000, 20,000,000 and 50,000,000
+rows (the probe side of the joins grows with the size, the build side is 1,000,000 rows) and the four
+Parquet scan cases over files of 1,000,000 to 50,000,000 rows, snappy and uncompressed, each through
+Polars' in-memory and streaming engines and through `MetalEngine(shapes="all", min_rows=0)` cold,
+best of 7: `Benchmarks/results/polars_engine_crossover_2026-09-26.csv`, run conditions in
+`Benchmarks/results/polars_engine_crossover_2026-09-26_conditions.txt` (the 1-minute load average was
+between 13 and 58 while it ran). `Benchmarks/polars_engine_crossover.py` fits it the way
+`Benchmarks/router_table.py` fits the router table (`python/arrowmetal/_router_fit.py`), with the
+MetalEngine as the GPU side and the faster Polars engine as the CPU side, over each case's input rows.
+A case is ahead at a size when its MetalEngine time times 1.15 is at most the faster Polars engine's
+time, so a case within 15% of Polars counts as behind; its crossover is the first size from which it
+is ahead at every larger size, placed between that size and the one below it where the two straight
+lines meet, and a case ahead at the largest size alone has none. A size where the MetalEngine's answer
+differed from Polars' counts as behind. A class's crossover is the largest over the cases whose
+classes all belong to its node, so both kinds of group-by measured, a few hundred to ten thousand
+groups and a hundred thousand or more, have to be ahead; if one of them has no crossover, neither
+has the class. The fitted table is `python/arrowmetal/_engine_crossovers.py`, and
+`polars_engine_crossover.py --check` fails when it and the results file disagree. The policy then
+takes the larger of that crossover and the kernels' own: the router table in force
+(`am.router_table()`, [CROSSOVER.md](CROSSOVER.md)) for the kernels it routes, and for the sort
+classes the crossover of `argsort int64`, `argsort float64` and `lexsort (2 int32 keys)` against the
+fastest CPU library in `Benchmarks/results/router_2026-09-24.json`, 1,000,000 rows.
+
+| class | dtype | input | crossover (rows) | from | cases (their own crossover) |
+|---|---|---|---:|---|---|
+| `sort` | numeric | in-memory | 1,000,000 | sort kernels | (m) 250,000; (q) 250,000 |
+| `sort_helper_keys` | numeric | in-memory | 1,000,000 | sort kernels | (x2) 292,560 |
+| `sort_helper_keys` | string | in-memory | 4,458,670 | engine table | (p) 4,458,670 |
+| `sort` | numeric | Parquet | 2,505,017 | engine table | (s4) uncompressed 1,000,000; (s4) snappy 2,505,017 |
+| `join:inner` | numeric | in-memory | 1,250,000 | engine table | (w1) 1,250,000 |
+| `join:left` | numeric | in-memory | 1,250,000 | engine table | (w2) 1,250,000 |
+| `join:anti` | numeric | in-memory | 7,451,256 | engine table | (w4) 7,451,256 |
+| `distinct` | numeric | in-memory | 3,399,993 | engine table | (r) 250,000; (x1) 3,399,993 |
+| `join:semi` | numeric | in-memory | not taken | | (f) none; (w3) 3,737,814 |
+| `group_by:sum` | numeric | in-memory | not taken | | (i) 3,024,311; (t1) none |
+| `group_by:count` | numeric | in-memory | not taken | | (t2) none; (t5) 2,195,216 |
+| `group_by:mean` | numeric | in-memory | not taken | | (t3) none; (t6) 8,685,770 |
+| `group_by:minmax` | numeric | in-memory | not taken | | (t4) none; (t7) 3,960,652 |
+| `group_by_multi:sum` | numeric | in-memory | not taken | | (j) none; (l) 3,101,937; (v1) 250,000 |
+| `group_by_multi:count` | numeric | in-memory | not taken | | (j) none; (v2) 250,000 |
+| `group_by_multi:mean` | numeric | in-memory | not taken | | (c) 3,486,598; (l) 3,101,937; (v3) none |
+| `group_by_multi:minmax` | numeric | in-memory | not taken | | (c) 3,486,598; (v4) none |
+| `aggregate:sum`, `:count`, `:mean`, `:minmax` | numeric | in-memory | not taken | | (a), (a2), (a3), (a4) none |
+| `top_k` | numeric | in-memory | not taken | | (n) none; (x3) none |
+| `rowwise` | numeric | in-memory | not taken | | (d) none |
+| `sort`, `top_k`, `rowwise`, `aggregate:sum`, `group_by:sum`, `group_by_multi:sum`, `join:inner`, `distinct` | string | in-memory | not taken | | (o), (y6), (y2), (y3), (y1), (k), (y4), (y5) none |
+| `group_by:sum`, `group_by:count`, `aggregate:sum`, `aggregate:count` | numeric | Parquet | not taken | | (s1), (s2), (s3) none, both codecs |
+
+A class with no row (a String column in any other class, and every Parquet class but these) has no
+measurement and is not taken. `arrowmetal.polars_engine.placement_rules()` returns the table under the router
+table in force.
+
+* **Group-by** is ahead or behind depending on the number of groups, which the policy does not see:
+  over the same key types, the 100,000-group cases on one key are ahead from 2,195,216 to 8,685,770
+  rows and the 200-group cases are behind at every size; over two keys the 10,000-group cases are ahead
+  from 250,000 to 3,486,598 rows and the cases with about as many groups as rows are behind. Every
+  group-by class has one of each, so none is taken.
+* **Joins and `unique`** on numeric keys are ahead from the smallest size measured (1,250,000 input
+  rows for a join) except the anti join, from 7,451,256, and `unique` over as many groups as rows,
+  from 3,399,993. The semi join against a 1,000-row table, (f), is behind at every size.
+* **Whole-frame aggregates, top-k and row-wise filters and projections** are behind at every size,
+  and so is every String shape except the filtered sort with a nullable Float64 key (p), ahead from
+  4,458,670 rows.
+* **Over a Parquet file**, cold (the open-file cache cleared before each run), the sort is ahead from
+  2,505,017 rows; the filter, group-by and aggregate cases are behind at every size.
+
+**The default against Polars and against `shapes="all"`.** `Benchmarks/polars_engine_bench.py` over
+all 45 cases at 2,000,000 and 50,000,000 rows and the Parquet cases over the 50,000,000-row files,
+best of 7, every result checked against Polars': `Benchmarks/results/polars_engine_bench_2026-09-26.csv`,
+run conditions in `Benchmarks/results/polars_engine_bench_2026-09-26_conditions.txt` (1-minute load
+average 8 to 22 during the run). The default took a subtree in these 18 case-size pairs, each ahead of
+the faster Polars engine:
+
+| case | rows | Polars in-memory | Polars streaming | `shapes="all"`, cold | `MetalEngine()`, cold | vs faster Polars |
+|---|---|---:|---:|---:|---:|---:|
+| (e) inner join then sum (the join taken) | 2M | 8.18 ms | 5.14 ms | 5.03 ms | **3.97 ms** | 1.30 |
+| (m) sort 3 columns by an int64 key | 2M | 13.24 ms | 15.08 ms | 5.40 ms | **3.06 ms** | 4.33 |
+| (q) filter, then sort by (int32 asc, int64 desc) | 2M | 15.23 ms | 15.54 ms | 8.64 ms | **7.29 ms** | 2.09 |
+| (w1) inner join, 1M-row build side | 2M | 7.42 ms | 5.25 ms | 4.36 ms | **4.00 ms** | 1.31 |
+| (w2) left join, 1M-row build side | 2M | 10.53 ms | 6.25 ms | 5.29 ms | **3.97 ms** | 1.57 |
+| (x2) sort by a nullable Float64 key, descending | 2M | 19.94 ms | 20.48 ms | 7.82 ms | **8.55 ms** | 2.33 |
+| (e) inner join then sum (the join taken) | 50M | 23.60 ms | 19.88 ms | 9.96 ms | **9.45 ms** | 2.10 |
+| (m) sort 3 columns by an int64 key | 50M | 437.70 ms | 526.15 ms | 86.33 ms | **79.57 ms** | 5.50 |
+| (p) filter, then sort by (int32 asc, nullable Float64 desc) | 50M | 1080.81 ms | 1147.58 ms | 596.39 ms | **582.99 ms** | 1.85 |
+| (q) filter, then sort by (int32 asc, int64 desc) | 50M | 778.48 ms | 971.85 ms | 121.62 ms | **186.92 ms** | 4.16 |
+| (r) unique over (region, sub), keep first | 50M | 275.54 ms | 307.79 ms | 41.25 ms | **32.92 ms** | 8.37 |
+| (w1) inner join, 1M-row build side | 50M | 96.84 ms | 106.27 ms | 41.88 ms | **38.25 ms** | 2.53 |
+| (w2) left join, 1M-row build side | 50M | 268.88 ms | 105.45 ms | 45.22 ms | **43.15 ms** | 2.44 |
+| (w4) anti join, 1M-row build side | 50M | 80.81 ms | 93.10 ms | 42.46 ms | **39.68 ms** | 2.04 |
+| (x1) unique over (k1, k2), keep first | 50M | 893.09 ms | 606.95 ms | 286.06 ms | **305.79 ms** | 1.98 |
+| (x2) sort by a nullable Float64 key, descending | 50M | 621.42 ms | 656.96 ms | 161.93 ms | **211.11 ms** | 2.94 |
+| (s4) Parquet scan, sort by a Float64 key, uncompressed | 50M | 847.22 ms | 680.41 ms | 274.89 ms | **278.52 ms** | 2.44 |
+| (s4) Parquet scan, sort by a Float64 key, snappy | 50M | 631.10 ms | 678.80 ms | 307.55 ms | **304.41 ms** | 2.07 |
+
+In the other 80 case-size pairs the default took nothing and ran Polars' in-memory plan; there its
+time was 0.67 to 1.50 times the `polars in-memory` row of the same case, which is the spread of two
+runs of the same Polars plan in this run and the noise bound its ratios are read against. `shapes="all"`
+is ahead of the faster Polars engine in 13 of those 80, all group-by, semi join and `unique` shapes
+whose class has a crossover above that size or none (at 50M rows: `(v2)` 8.21, `(v1)` 5.04, `(t5)`
+4.26, `(t7)` 2.39, `(i)` 2.30, `(w3)` 2.20).
+
+**Float64 group sums and means at 2^24 groups.** ArrowMetal's group-by returns a wrong Float64 sum or
+mean (null for most groups) when there are 16,777,216 groups or more; 16,777,215 are right. The (v3)
+case, a mean over two keys with about as many groups as rows, found it at 20,000,000 and 50,000,000
+rows. Every mode of the engine, `shapes="all"` included, leaves a group-by with a Float64 sum or a
+mean over a 64-bit integer or float column to Polars when the rows reaching it could hold that many groups
+(its input rows are 16,777,216 or more, or an inner or left join below it can multiply them); the
+report names it. `test_core_group_by_float64_sum_and_mean_at_2_24_groups` pins the core behaviour as
+an expected failure. At 50,000,000 rows this is why `(c)`, `(l)`, `(t3)`, `(t6)`, `(v3)` and the
+Parquet cases `(s1)` and `(s2)` stay with Polars under `shapes="all"` in the benchmark, and every
+MetalEngine result in it equals Polars'.
 
 ```python
-am.MetalEngine()                          # the defaults above
-am.MetalEngine(shapes="all")              # every translatable subtree of at least min_rows rows
+am.MetalEngine()                          # shapes="measured": the crossovers above
+am.MetalEngine(shapes="all")              # every translatable subtree of at least 1,000,000 rows
 am.MetalEngine(shapes="all", min_rows=0)  # everything it can translate (what the tests use)
+am.MetalEngine(shapes={"group_by", "sort"})  # the classes named (or their prefix), any size
+am.MetalEngine(min_rows=5_000_000)        # the crossovers, and at least 5,000,000 rows
 am.MetalEngine(raise_on_fail=True)        # raise instead of leaving anything to Polars
+```
+
+Each subtree the report lists as taken carries the rule that took it, and each node the policy left
+has a `rule:` line:
+
+```
+  metal:  Sort#2 [Sort > DataFrameScan] over 2,000,000 rows, ran in <t> ms -> 2,000,000 rows
+          rule: 2,000,000 input rows is at or above the 1,000,000-row crossover for sort (crossover sweep, ...)
+  polars: Select#3: rule: aggregate:sum was not measured ahead of Polars up to 50,000,000 input rows (...)
+  polars: Join#2: rule: 900,000 input rows is below the 1,250,000-row crossover for join:inner (...)
 ```
 
 `shapes="all"` is there for plans the benchmark did not cover and for moving work off the CPU cores:
@@ -780,10 +868,12 @@ given, row groups read and skipped, pages skipped):
           parquet /data/bench-none-50000000.parquet: filters [('id', '<', 5000000)], 5 row groups read, 45 skipped, 0 pages skipped
 ```
 
-The defaults apply unchanged: a scan subtree is taken by `MetalEngine()` when every shape in it is
-a full sort without a helper key, none of its columns is a String, and the file holds at least
-1,000,000 rows. The scan cases below are in line with that: the sort is ahead of both Polars engines
-cold and warm, and the filter, group-by and aggregate cases are behind cold.
+`MetalEngine()` judges a scan subtree by the same rule as an in-memory one, with the Parquet rows of
+the crossover table and the file's row count from its footer: a sort of a file of at least 2,505,017
+rows is taken, and the filter, group-by and aggregate shapes over a file are not taken at any size
+("Which translatable subtrees it runs: the defaults" above). The scan cases below are in line with
+that: the sort is ahead of both Polars engines cold and warm, and the filter, group-by and aggregate
+cases are behind cold.
 
 ### The report
 
@@ -796,8 +886,9 @@ MetalEngine report for collect (polars 1.44.1, IR (14, 7))
 `engine.last_report` is a `MetalPlanReport`: `taken` (one entry per subtree that ran on Metal: the
 node at its top, the node kinds inside it, the rows it read, the ArrowMetal plan text, and after the
 run its wall time and output rows), `fallbacks` (one `Kind#id: reason` line per node that stayed
-with Polars for a reason of its own; every reason is a full sentence, which
-`test_every_unsupported_reason_is_a_full_sentence` checks), `walked` (every node of the optimised
+with Polars for a reason of its own; every translation reason is a full sentence, which
+`test_every_unsupported_reason_is_a_full_sentence` checks, and a node the placement policy left
+has a `rule: ...` line, as above), `walked` (every node of the optimised
 plan), `nodes`, and `path` (the collect path it is for, "Collect paths" above). With
 `POLARS_VERBOSE=1` the fallback lines are also issued as a `PerformanceWarning`. The report belongs to
 the engine object, so two threads collecting through one `MetalEngine` overwrite each other's.
@@ -807,7 +898,15 @@ the engine object, so two threads collecting through one `MetalEngine` overwrite
 ```
 PYTHONPATH=python python -m pytest python/tests/test_polars_engine.py -q
 DIFF_QUICK=1 PYTHONPATH=python python -m pytest python/tests/test_polars_engine.py -q   # without the 100,003-row datasets
+PYTHONPATH=python python -m pytest python/tests/test_engine_policy.py -q
 ```
+
+`test_engine_policy.py` checks the default policy: the same decision for the same subtree across 200
+calls and in a second process, every row of the crossover table one row below its crossover (left,
+with the reason) and at it (taken), a subtree needing every class's crossover, the String and Parquet
+rows, the router-table and sort-kernel floors, the overrides, a Parquet scan judged by its footer's
+row count under a filter that keeps a handful of rows, the report's `rule` lines, that the committed
+table is the fit of the results file it names, and the Float64 group-by guard at 2^24 groups.
 
 The differential cases collect each LazyFrame on Polars and through
 `MetalEngine(raise_on_fail=True, min_rows=0, shapes="all")` -- so nothing may fall back -- and
@@ -881,9 +980,10 @@ per-shape table.
    addresses are the same.
 5. `out, timings = engine.profile(lf)` shows a `metal:` row, and
    `PYTHONPATH=python python -m arrowmetal.polars_engine check` prints the versions it was tested with.
-6. Run `PYTHONPATH=python python Benchmarks/polars_engine_bench.py --sizes 1000000,10000000,50000000
-   --out a.csv` twice on a quiet machine, compare the two files, and read the `taken` column of the
-   eight engine_bench shapes against the defaults above.
+6. Run `PYTHONPATH=python python Benchmarks/polars_engine_bench.py --sizes 2000000,50000000 --out a.csv`
+   twice on a quiet machine, compare the two files, and read the `taken` and `rule` columns of the
+   `MetalEngine default, cold` rows against the table above. `--crossover` with more sizes, then
+   `python Benchmarks/polars_engine_crossover.py a.csv --print`, fits the table from your own run.
 7. Read this section against `engine.last_report` on your machine.
 
 ---
@@ -891,7 +991,8 @@ per-shape table.
 ## Numbers
 
 These are tiers 1 and 2, and tier 4 over a Parquet file at the end; tier 4's measurements over
-in-memory frames are in `Benchmarks/results/polars_engine_bench_2026-09-24.csv` (see "Tier 4" above).
+in-memory frames are in `Benchmarks/results/polars_engine_bench_2026-09-26.csv` and
+`Benchmarks/results/polars_engine_crossover_2026-09-26.csv` (see "Tier 4" above).
 
 Apple M4 Max, macOS 26.6.2, polars 1.44.1 (16 threads), pyarrow 25.0.1, ArrowMetal 0.1.0. Best of 5
 runs after a warm-up, one process, one data set. Every figure below is from
@@ -953,7 +1054,7 @@ pyarrow's Acero are on the Compare tab and in the benchmark matrix.
 | Tier 1, resident | You run several kernels over the same column. `to_metal()` once, then every kernel in the table above is 0.8-10.5 ms. |
 | Tier 2 | The GPU op belongs inside a plan you want Polars to keep optimising -- scans, pushdown, and lazy composition still apply. |
 | Tier 3 | Polars should do the IO and the reshaping and ArrowMetal should do one heavy pass at the end. |
-| Tier 4 | You want Polars' own `collect()` and its answers, with the parts of the plan the GPU is measured ahead on (by default, large sorts of in-memory frames and Parquet files) run there. |
+| Tier 4 | You want Polars' own `collect()` and its answers, with the parts of the plan the GPU is measured ahead on (by default, sorts, numeric-key inner, left and anti joins and `unique` from their measured crossovers, and sorts of Parquet files) run there. |
 
 ### Tier 4 over a Parquet file, 50M rows
 
