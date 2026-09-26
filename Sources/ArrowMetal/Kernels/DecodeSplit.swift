@@ -48,10 +48,13 @@ enum DecodeCost {
     }
 
     // Host, one core, reading a freshly opened file, where the first touch of each page of the mapping
-    // is a minor fault. Literal pages are a copy: 1.2 GB of them took 18.5 ms on all cores (5.8 ms
-    // from a mapping already touched). Token-dense pages: Snappy 52-78 µs, LZ4 40-44 µs per 160 KB
-    // page on one core (2.0-3.0 and 3.6-3.9 GB/s of output), plus the faults.
-    static let hostLiteralNsPerByte = 0.18
+    // is a minor fault. Literal pages are a copy: 1.2 GB of them took 19 ms on all cores (5.6 ms from
+    // a mapping already touched) against 10 ms on the GPU, and a column of them split between the two
+    // read in 19.6 ms against 12.1 all on the GPU and 13.7 all on the host, both sides copying at
+    // memory speed; at 1 ns per byte a literal page stays on the GPU. Token-dense pages: Snappy
+    // 58-81 µs, LZ4 41-45 µs per 160 KB page on one core (2.0-2.8 and 3.6-3.9 GB/s of output), plus
+    // the faults.
+    static let hostLiteralNsPerByte = 1.0
     static let hostSnappyDenseNsPerByte = 0.42
     static let hostLZ4DenseNsPerByte = 0.37
     static let hostNsPerPage = 1_500.0
