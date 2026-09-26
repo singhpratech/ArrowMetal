@@ -9,8 +9,9 @@ timestamp and one boolean -- which is roughly the shape of a fact table. Four nu
 reader and codec:
 
     wall ms            elapsed time for the read
-    cpu  ms            process CPU time over the same interval (GPU work does not appear here, so a
-                       small number next to a large wall time is the point of the exercise)
+    cpu  ms            process CPU time over the same interval (GPU work does not appear here;
+                       ArrowMetal's CPU time is the page headers and its host share of the
+                       decompression)
     MB/s               file bytes divided by wall time
     ttfc ms            time to first compute: read one column and sum it, which is what a query actually
                        needs. ArrowMetal's sum runs on the GPU over the buffers the decode just filled;
@@ -86,7 +87,7 @@ def timed(fn):
 
 def readers(path):
     r = {
-        "arrowmetal (GPU)": lambda: am.read_parquet(path),
+        "arrowmetal": lambda: am.read_parquet(path),
         "pyarrow.parquet": lambda: pq.read_table(path),
     }
     try:
@@ -104,7 +105,7 @@ def readers(path):
 
 def first_compute(path):
     """Read one column and sum it: the smallest useful end-to-end query."""
-    out = {"arrowmetal (GPU)": lambda: am.read_parquet(path, columns=["price"])["price"].sum(),
+    out = {"arrowmetal": lambda: am.read_parquet(path, columns=["price"])["price"].sum(),
            "pyarrow.parquet": lambda: pq.read_table(path, columns=["price"])["price"].to_numpy().sum()}
     try:
         import polars as pl
@@ -174,7 +175,7 @@ def warm_first_compute(path, repeat):
         _, w2, _ = timed(lambda: cols["price"].sum())
         best_r = w if best_r is None else min(best_r, w)
         best_s = w2 if best_s is None else min(best_s, w2)
-    print("%-24s %10.0f %10.0f" % ("arrowmetal (GPU)", best_r, best_s))
+    print("%-24s %10.0f %10.0f" % ("arrowmetal", best_r, best_s))
     pf = pq.ParquetFile(path)
     best_r = best_s = None
     for _ in range(repeat + 1):

@@ -1,0 +1,14 @@
+# ArrowMetal 0.2.0 + Unreleased (78a82fe) on Apple M4 Max, 50000000 rows x 8 columns, 1 MB pages, best of 5
+codec,measure,cold_ms,warm_ms
+snappy,open only,0.23,0.01
+snappy,read price,12.19,7.01
+snappy,read price + sum,13.92,8.51
+snappy,read all 8 columns,66.65,53.90
+lz4,open only,0.23,0.01
+lz4,read price,12.27,7.00
+lz4,read price + sum,13.52,7.92
+lz4,read all 8 columns,54.49,42.90
+none,open only,0.25,0.01
+none,read price,7.23,2.66
+none,read price + sum,7.92,4.40
+none,read all 8 columns,38.27,15.99

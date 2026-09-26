@@ -1,0 +1,77 @@
+# ArrowMetal 0.2.0 + Unreleased (78a82fe, CPU+GPU split decompression) on Apple M4 Max, Benchmarks/parquet_bench.py --repeat 5; conditions in bench_conditions_2026-09-26-split.txt
+device: Apple M4 Max
+rows:   50,000,000
+
+=== snappy, 1.65 GB on disk ===
+reader                  wall ms     cpu ms       MB/s    ttfc ms
+arrowmetal                   65        674      25373         14
+pyarrow.parquet             160       1164      10314         85
+polars                       95       1283      17455         20
+pandas                      239       1346       6915         89
+
+reader (warm handle)        read ms     sum ms
+arrowmetal                        7          2
+pyarrow.ParquetFile              48          6
+
+=== lz4, 1.67 GB on disk ===
+reader                  wall ms     cpu ms       MB/s    ttfc ms
+arrowmetal                   54        508      31062         14
+pyarrow.parquet             159        987      10516         83
+polars                       73       1007      22854         19
+pandas                      226       1164       7396         90
+
+reader (warm handle)        read ms     sum ms
+arrowmetal                        7          2
+pyarrow.ParquetFile              48          6
+
+=== none, 2.23 GB on disk ===
+reader                  wall ms     cpu ms       MB/s    ttfc ms
+arrowmetal                   38         83      58724          9
+pyarrow.parquet             162        746      13721         80
+polars                       63        790      35232         16
+pandas                      237        910       9412         88
+
+reader (warm handle)        read ms     sum ms
+arrowmetal                        3          2
+pyarrow.ParquetFile              42          6
+
+markdown:
+| codec | reader | wall ms | CPU ms | MB/s | time to first compute (ms) |
+|---|---|---:|---:|---:|---:|
+| snappy | arrowmetal | 65 | 674 | 25373 | 14 |
+| snappy | pyarrow.parquet | 160 | 1164 | 10314 | 85 |
+| snappy | polars | 95 | 1283 | 17455 | 20 |
+| snappy | pandas | 239 | 1346 | 6915 | 89 |
+| lz4 | arrowmetal | 54 | 508 | 31062 | 14 |
+| lz4 | pyarrow.parquet | 159 | 987 | 10516 | 83 |
+| lz4 | polars | 73 | 1007 | 22854 | 19 |
+| lz4 | pandas | 226 | 1164 | 7396 | 90 |
+| none | arrowmetal | 38 | 83 | 58724 | 9 |
+| none | pyarrow.parquet | 162 | 746 | 13721 | 80 |
+| none | polars | 63 | 790 | 35232 | 16 |
+| none | pandas | 237 | 910 | 9412 | 88 |
+
+# --codec-scan --skip-main, same session (best of 3 inside the script)
+=== decompression throughput, one int64 column of 20,000,000 rows, 1024 KB pages ===
+codec           file MB      am ms    am MB/s pyarrow ms
+none              160.1        3.2      50032      200.4
+snappy            152.4        8.1      19670       52.6  (32413 MB/s of decode alone)
+lz4               160.7        4.2      38027       15.2  (158475 MB/s of decode alone)
+zstd              119.7       10.6      15079       60.3  (21585 MB/s of decode alone)
+gzip              110.6       29.7       5382      205.7  (6031 MB/s of decode alone)
+
+=== decompression throughput, one int64 column of 20,000,000 rows, 256 KB pages ===
+codec           file MB      am ms    am MB/s pyarrow ms
+none              160.1        2.9      55896       21.4
+snappy            152.4        8.4      19016       52.2  (28821 MB/s of decode alone)
+lz4               160.7        4.7      33799       15.5  (85497 MB/s of decode alone)
+zstd              119.7       10.0      16009       60.8  (22435 MB/s of decode alone)
+gzip              110.6       29.9       5347      204.8  (5912 MB/s of decode alone)
+
+=== decompression throughput, one int64 column of 20,000,000 rows, 64 KB pages ===
+codec           file MB      am ms    am MB/s pyarrow ms
+none              160.2        2.7      59473       14.8
+snappy            152.6        7.9      20219       60.6  (30634 MB/s of decode alone)
+lz4               142.4        5.0      32228       33.3  (70350 MB/s of decode alone)
+zstd              119.8       10.0      15921       65.0  (21741 MB/s of decode alone)
+gzip              110.9       29.4       5447      207.3  (5996 MB/s of decode alone)
