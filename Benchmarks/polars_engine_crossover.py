@@ -80,12 +80,12 @@ GROUP_BUCKETS = (("200", 1, 447), ("1,000", 448, 3_162), ("10,000", 3_163, 31_62
 NEAR_ROWS = 4
 ROWS_BUCKET = "rows/2"
 # Buckets the default never takes, whatever their fit. The rows/2 bucket (about as many groups as rows)
-# is not monotone in the sweep (a one-key count runs 0.76, 1.9, 4.04, 2.21, 1.18 from 2M to 50M rows)
+# is not monotone in the sweep (a one-key count runs 0.78, 1.9, 4.04, 2.21, 1.18 from 2M to 50M rows)
 # and its cases came in at 0.88-0.93x of Polars in the default benchmark where the fit had taken them.
 UNTAKEN_BUCKETS = (ROWS_BUCKET,)
 # Headroom over the fitted crossover: the fit interpolates between sizes measured 2-2.5x apart, and a
-# shape just past its crossover sits within run-to-run noise of Polars (a 10,000-group min/max fitted at
-# 1.72M rows was 1.45x in the sweep and 0.85x in the benchmark at 2M). The default takes a shape from
+# shape just past its crossover sits within run-to-run noise of Polars (the default benchmark's noise band
+# over untaken pairs is 0.62-1.31x). The default takes a shape from
 # HEADROOM times its fitted crossover; the fit itself is kept in the table as `fit`.
 HEADROOM = 1.5
 
