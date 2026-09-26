@@ -27,9 +27,9 @@ a one-line reason in `engine.last_report`.
 
 Which of those it does take is a second decision (`_engine_policy.py`). By default
 (`shapes="measured"`) it takes a subtree when its input rows are at or above the measured crossover
-of every shape class in it, for its dtype class and input; `shapes="all"` takes everything it can
-translate. docs/POLARS.md says how the crossovers were measured and which results files they come
-from.
+of every shape class in it, for its dtype class and input, and a group-by by the bucket of its
+estimated group count; `shapes="all"` takes everything it can translate. docs/POLARS.md says how
+the crossovers were measured and which results files they come from.
 
 Results are Polars' results
 ---------------------------
@@ -71,8 +71,9 @@ from . import _cached_parquet_read, _parquet_files
 from . import _engine_policy as _policy
 
 __all__ = ["MetalEngine", "MetalPlanReport", "MetalEngineFallbackWarning", "TESTED_IR_VERSION",
-           "TESTED_POLARS", "KNOWN_NODE_KINDS", "SHAPE_CLASSES", "placement_rules", "FORCE_POLARS",
-           "clear_import_cache", "import_cache_limit", "import_cache_info"]
+           "TESTED_POLARS", "KNOWN_NODE_KINDS", "SHAPE_CLASSES", "placement_rules",
+           "group_placement_rules", "FORCE_POLARS", "clear_import_cache", "import_cache_limit",
+           "import_cache_info", "clear_group_estimates"]
 
 # `NodeTraverser.version()` on the polars this module was written and tested against. The major is
 # bumped by Polars for incompatible IR changes (renamed nodes, reshaped tuples); a different major
@@ -278,6 +279,9 @@ class MetalPlanReport:
     * `nodes` -- the nodes the placement visited, top down, `(id, kind, "metal" | "polars")`; it
       stops at a node that runs on Metal.
     * `walked` -- every node of the optimised plan, `(id, kind)`.
+    * `groups` -- one entry per group-count probe the default policy asked for: the group-by node,
+      its keys, the estimate (None when there is none) and how it was made, the seconds it took and
+      whether the estimate came from the cache.
     * `path` -- the Polars entry point the report is for: "collect", "profile", "explain",
       "collect_all", "sink" (a plan that ends in a sink), or one of the paths on which the whole
       plan runs on Polars: "collect_async", "collect_all_async", "collect_batches", "background",
@@ -292,6 +296,7 @@ class MetalPlanReport:
         self.fallbacks = []
         self.nodes = []
         self.walked = []          # every node of the optimised plan, (id, kind), in walk order
+        self.groups = []          # the group-count probes the default policy asked for
 
     @property
     def ran_on_metal(self):
@@ -325,6 +330,10 @@ class MetalPlanReport:
                              f"{sc.get('pages_skipped', 0)} pages skipped")
         for f in self.fallbacks:
             lines.append(f"  polars: {f}")
+        for g in self.groups:
+            est = g["how"] if g["estimate"] is None else f"{g['estimate']:,} groups, {g['how']}"
+            lines.append(f"  groups: {g['root']} over ({', '.join(g['keys'])}): {est} "
+                         f"({'cached' if g['cached'] else 'probed'} in {g['seconds'] * 1e6:.0f} us)")
         return "\n".join(lines)
 
 
@@ -408,13 +417,14 @@ class _Sub:
     whether it does any GPU work at all. `exact` is the number of rows the plan produces when the
     translation can know it without running anything (a scan, and what keeps or cuts its rows by a
     known amount), else None; `probes` the plans whose row counts the plan's text asks for (see
-    `_row_dependent`)."""
+    `_row_dependent`). `groups` holds one `_GroupKeys` per group-by inside, for the group-count
+    probe."""
 
     __slots__ = ("plan", "cols", "phys", "leaves", "rows", "work", "kinds", "classes", "exact",
-                 "probes")
+                 "probes", "groups")
 
     def __init__(self, plan, cols, phys=(), leaves=(), rows=0, work=False, kinds=(), classes=(),
-                 exact=None):
+                 exact=None, groups=()):
         self.plan = plan
         self.cols = cols
         self.phys = list(phys)
@@ -425,13 +435,14 @@ class _Sub:
         self.classes = set(classes)         # shape classes inside: see SHAPE_CLASSES
         self.exact = exact
         self.probes = []
+        self.groups = list(groups)
 
     def derive(self, plan=None, cols=None, phys=None, work=None, add_class=None, exact=_SAME):
         return _Sub(self.plan if plan is None else plan, dict(self.cols) if cols is None else cols,
                     self.phys if phys is None else phys, self.leaves, self.rows,
                     self.work if work is None else work, (),
                     self.classes | ({add_class} if add_class else set()),
-                    self.exact if exact is _SAME else exact)
+                    self.exact if exact is _SAME else exact, self.groups)
 
     def final_plan(self):
         """The plan with one select on top that computes every virtual column and puts the output
@@ -1068,7 +1079,7 @@ class _Translator:
                 "left_on": lkeys, "right_on": rkeys, "how": how.lower(), "suffix": suffix}
         return _Sub(plan, cols, [m[0] for m in meta], left.leaves + right.leaves,
                     left.rows + right.rows, True, (), left.classes | right.classes
-                    | {"join:" + how.lower()})
+                    | {"join:" + how.lower()}, groups=left.groups + right.groups)
 
     def _node_Distinct(self, n, node, inputs, kids, check_only=False):
         keep, subset, maintain, slc = node.options
@@ -1090,7 +1101,8 @@ class _Translator:
         cols = {name: _base(name, c.dtype, c.nullable) for name, c in kid.cols.items()}
         plan = {"op": "unique", "input": kid.final_plan(), "subset": subset}
         return _Sub(plan, cols, list(cols), kid.leaves, kid.rows, True, (),
-                    kid.classes | {"distinct"}, exact=0 if kid.exact == 0 else None)
+                    kid.classes | {"distinct"}, exact=0 if kid.exact == 0 else None,
+                    groups=kid.groups)
 
     # -- aggregation (GroupBy, and a Select whose every output is an aggregate)
 
@@ -1226,8 +1238,29 @@ class _Translator:
         phys = keys + [a[1] for a in aggs]
         kind = "group_by_multi" if len(keys) > 1 else ("group_by" if keys else "aggregate")
         classes = {f"{kind}:{f}" for f in (families or {"keys"})}
+        groups = kid.groups + ([self._group_keys(n, kid, keys)] if keys else [])
         return _Sub(plan, cols, phys, kid.leaves, kid.rows, True, (), kid.classes | classes,
-                    exact=None if keys else 1)
+                    exact=None if keys else 1, groups=groups)
+
+    def _group_keys(self, n, kid, keys):
+        """Where the probe finds a group-by's keys: columns of one input leaf, read as they are
+        (no group-by or aggregate below renames or computes them). A filter, join or `unique`
+        below can only drop key values, so the leaf's count is an upper bound of the groups."""
+        if {c.split(":")[0] for c in kid.classes} & {"group_by", "group_by_multi", "aggregate"}:
+            return _GroupKeys(n, keys, why="no group-count estimate: the keys come from an "
+                                           "aggregate below the group-by")
+        columns = []
+        for k in keys:
+            m = _COL_REF.fullmatch(kid.cols[k].ref)
+            if m is None or _unq(m.group(1)) not in kid.phys:
+                return _GroupKeys(n, keys, why=f"no group-count estimate: the key {k!r} is "
+                                               "computed, not a column of an input frame")
+            columns.append(_unq(m.group(1)))
+        leaves = [leaf for leaf in kid.leaves if all(c in leaf[2] for c in columns)]
+        if len(leaves) != 1 or any(sum(c in leaf[2] for leaf in kid.leaves) != 1 for c in columns):
+            return _GroupKeys(n, keys, why="no group-count estimate: the keys are not columns of "
+                                           "exactly one input frame")
+        return _GroupKeys(n, keys, leaves[0], columns)
 
     # -- expressions
 
@@ -1753,6 +1786,207 @@ def import_cache_info():
             "hits": _cache.hits, "misses": _cache.misses}
 
 
+# --------------------------------------------------------------------------------------------------
+# The group-count probe
+#
+# The default policy judges a group-by by the bucket of its number of groups (_engine_policy.py,
+# `group_bucket`), which the plan does not state. The probe estimates it from the frame the keys come
+# from: the distinct key tuples of a fixed sample of rows, scaled to the frame by the bias-corrected
+# Chao1 estimator, D = d + f1 (f1 - 1) / (2 (f2 + 1)), where d is the number of distinct tuples in
+# the sample and f1, f2 the number seen exactly once and exactly twice (Chao, Biometrics 1987;
+# the bias-corrected form of Chao, Biometrics 2005), clipped to [d, rows]. The sample is stratified:
+# row i * (rows // n) + h(i) for i < n, h a fixed-seed splitmix64 hash of i, so the same frame always
+# gets the same sample and the same estimate. First 2,048 rows; when those put the estimate above
+# twice d with f2 below 8 (from about 250,000 groups, where one f2 count moves the estimate most),
+# a sample twice as large decides instead, and so on up to 65,536 rows or a quarter of the frame.
+# A frame of at most twice the first sample's rows is counted exactly. A Parquet file's footer answers only when every row group
+# states a distinct count for each key column (`_footer_groups`).
+
+_GROUP_SAMPLE = 2_048
+_GROUP_SAMPLE_MAX = 65_536
+_GROUP_SEED = 0xA6_5EED
+_GROUP_ACCEPT_F2 = 8
+_GROUP_CACHE_MAX = 64
+
+
+class _GroupKeys:
+    """One group-by of a translated subtree, for the probe: its node, its key names, and the input
+    leaf (src, frame or _FileLeaf, names) whose columns `columns` the keys are, or `why` not."""
+    __slots__ = ("node", "keys", "leaf", "columns", "why")
+
+    def __init__(self, node, keys, leaf=None, columns=(), why=None):
+        self.node = node
+        self.keys = list(keys)
+        self.leaf = leaf
+        self.columns = list(columns)
+        self.why = why
+
+
+_group_positions = OrderedDict()      # (rows, n) -> the sample's row positions
+_group_estimates = OrderedDict()      # frame identity -> (count, how, the key columns, kept alive)
+
+
+def clear_group_estimates():
+    """Drops every cached group-count estimate (and the key columns the cache kept alive)."""
+    _group_estimates.clear()
+
+
+def _sample_positions(np, rows, n):
+    key = (rows, n)
+    pos = _group_positions.get(key)
+    if pos is None:
+        stride = rows // n
+        with np.errstate(over="ignore"):
+            z = (np.arange(n, dtype=np.uint64) + np.uint64(_GROUP_SEED)) * np.uint64(0x9E3779B97F4A7C15)
+            z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+            z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+            z = z ^ (z >> np.uint64(31))
+        pos = np.arange(n, dtype=np.int64) * stride + (z % np.uint64(stride)).astype(np.int64)
+        _group_positions[key] = pos
+        while len(_group_positions) > 32:
+            _group_positions.popitem(last=False)
+    return pos
+
+
+def _sample_tuples(np, df, columns, pos):
+    """One integer per sampled row, equal for equal key tuples (a hash for a tuple of several
+    columns, a String, Boolean or temporal column, or one with nulls)."""
+    out = None
+    for c in columns:
+        s = df.get_column(c)
+        if s.dtype.is_integer() and s.null_count() == 0:
+            v = s.to_numpy()[pos] if s.n_chunks() == 1 else s.gather(pos).to_numpy()
+        else:
+            v = s.gather(pos).hash(seed=0).to_numpy()
+        if len(columns) == 1:
+            return v
+        v = v.astype(np.uint64)
+        with np.errstate(over="ignore"):
+            out = v if out is None else (out * np.uint64(0x9E3779B97F4A7C15)) ^ v
+    return out
+
+
+def _chao1(np, values):
+    """(estimate before clipping, d, f1, f2) of a sample."""
+    n = len(values)
+    s = np.sort(values)
+    edges = np.flatnonzero(s[1:] != s[:-1])
+    runs = np.diff(np.concatenate(([-1], edges, [n - 1])))
+    f = np.bincount(runs, minlength=3)
+    d, f1, f2 = len(runs), int(f[1]), int(f[2])
+    return d + f1 * (f1 - 1) / (2 * (f2 + 1)), d, f1, f2
+
+
+def _frame_groups(df, columns):
+    """(estimated groups, how) of in-memory frame `df` over `columns`."""
+    try:
+        import numpy as np
+    except ImportError:
+        return None, "no group-count estimate: the probe needs numpy"
+    rows = df.height
+    if rows <= 2 * _GROUP_SAMPLE:
+        return df.select(columns).n_unique(), f"counted over all {rows:,} rows"
+    n = _GROUP_SAMPLE
+    while True:
+        est, d, f1, f2 = _chao1(np, _sample_tuples(np, df, columns,
+                                                   _sample_positions(np, rows, n)))
+        # Settled when the sample saw most groups more than once (the estimate is within twice
+        # what it saw) or saw enough pairs for f1^2 / f2 to hold; else a sample twice as large.
+        if est <= 2 * d or f2 >= _GROUP_ACCEPT_F2 or 2 * n > min(_GROUP_SAMPLE_MAX, rows // 4):
+            break
+        n *= 2
+    count = int(min(rows, max(d, round(est))))
+    return count, f"a Chao1 estimate from a {n:,}-row sample"
+
+
+def _footer_groups(leaf, columns):
+    """(groups, how) from a Parquet file's footer distinct counts, or (None, why): the count lies
+    between the largest row group's and the sum over row groups (at most the file's rows), and is
+    given only when that range falls in one group-count bucket."""
+    try:
+        import pyarrow.parquet as pq
+        md = pq.ParquetFile(leaf.path).metadata
+        where = {md.schema.column(i).path: i for i in range(md.num_columns)}
+        lo, hi = 0, 0
+        for g in range(md.num_row_groups):
+            rg = md.row_group(g)
+            prod = 1
+            for c in columns:
+                st = rg.column(where[c]).statistics
+                if st is None or not st.has_distinct_count:
+                    return None, f"no group-count estimate: the footer of {leaf.path} states no " \
+                                 f"distinct count for {c!r}"
+                lo = max(lo, st.distinct_count)
+                prod *= st.distinct_count
+            hi += prod
+    except (ImportError, OSError, KeyError, ValueError) as e:
+        return None, f"no group-count estimate: the footer could not be read ({type(e).__name__})"
+    hi = min(hi, leaf.rows)
+    if _policy.group_bucket(lo, leaf.rows) != _policy.group_bucket(hi, leaf.rows):
+        return None, (f"no group-count estimate: the footer's distinct counts put the groups "
+                      f"between {lo:,} and {hi:,}, more than one bucket")
+    return lo, f"from the footer's distinct counts ({lo:,} to {hi:,})"
+
+
+def _identity(df, columns):
+    """The frame's identity over `columns` (dtype, length and buffer address of each), or None
+    when a column has no single buffer to name (a String column, several chunks)."""
+    out = []
+    for c in columns:
+        s = df.get_column(c)
+        try:
+            out.append((c, str(s.dtype), s.len(), s._get_buffer_info()))
+        except Exception:                 # noqa: BLE001 -- not a single-chunk physical buffer
+            return None
+    return tuple(out)
+
+
+def _probe_groups(g, report, root):
+    """(estimated groups or None, how) for one group-by (`_GroupKeys`); recorded in the report."""
+    start = time.perf_counter()
+    cached = False
+    if g.why is not None:
+        count, how = None, g.why
+    elif _is_file(g.leaf[1]):
+        leaf = g.leaf[1]
+        key = ("file", leaf.key, tuple(g.columns))
+        hit = _group_estimates.get(key)
+        if hit is not None:
+            count, how, cached = hit[0], hit[1], True
+        else:
+            count, how = _footer_groups(leaf, g.columns)
+            _group_estimates[key] = (count, how, None)
+    else:
+        df = g.leaf[1]
+        key = _identity(df, g.columns)
+        hit = None if key is None else _group_estimates.get(key)
+        if hit is not None:
+            _group_estimates.move_to_end(key)
+            count, how, cached = hit[0], hit[1], True
+        else:
+            count, how = _frame_groups(df, g.columns)
+            if key is not None and count is not None:
+                # The cache keeps the key columns alive, so no other frame can take their buffers'
+                # addresses while the entry stands.
+                _group_estimates[key] = (count, how, [df.get_column(c) for c in g.columns])
+    while len(_group_estimates) > _GROUP_CACHE_MAX:
+        _group_estimates.popitem(last=False)
+    seconds = time.perf_counter() - start
+    keys = ", ".join(g.keys)
+    text = how if count is None else f"{count:,} groups over ({keys}), {how}"
+    report.groups.append({"root": root, "keys": list(g.keys), "estimate": count, "how": how,
+                          "seconds": seconds, "cached": cached})
+    return count, text
+
+
+def _groups_of(sub, report, root):
+    """The policy's `groups` for subtree `sub`: the probe of its one group-by."""
+    if len(sub.groups) != 1:
+        return None, f"no group-count estimate: the subtree holds {len(sub.groups)} group-bys"
+    g = sub.groups[0]
+    return _probe_groups(g, report, f"GroupBy#{g.node}")
+
+
 def _leaf_sources(leaves, rows=None, scans=None):
     srcs = {}
     for src, df, names in leaves:
@@ -1991,7 +2225,8 @@ def execute_with_metal(nt, duration_since_start=None, *, config, path="collect")
             # A Parquet file's rows are the footer's count: what the predicate keeps is not guessed.
             source = "parquet" if any(_is_file(df) for _s, df, _n in sub.leaves) else "memory"
             decision = _policy.decide(shape, dtypes, sub.rows, source, shapes=config.shapes,
-                                      min_rows=config.min_rows, router=router)
+                                      min_rows=config.min_rows, router=router,
+                                      groups=partial(_groups_of, sub, report, f"{kind}#{n}"))
             if not decision.take:
                 report.fallbacks.append(f"{kind}#{n}: rule: {decision.reason}")
                 report.nodes.append((n, kind, "polars"))
@@ -2007,7 +2242,8 @@ def execute_with_metal(nt, duration_since_start=None, *, config, path="collect")
             if verdict is None:
                 chosen.append((n, kind, sub, schema, {
                     "rule": decision.reason, "shape": shape,
-                    "dtype_class": _policy.dtype_class(dtypes), "input": source}))
+                    "dtype_class": _policy.dtype_class(dtypes), "input": source,
+                    "groups": decision.groups}))
                 return
             report.fallbacks.append(f"{kind}#{n}: the ArrowMetal plan was rejected: {verdict}")
         report.nodes.append((n, kind, "polars"))
@@ -2043,6 +2279,13 @@ def placement_rules():
     `(class, dtype class, input, crossover rows or None, where it comes from)` per shape the engine
     table knows. `None`: not taken at any size."""
     return _policy.rule_table(_router_crossovers())
+
+
+def group_placement_rules():
+    """The default policy's group-count buckets under the router table in force: one
+    `(class, dtype class, input, bucket, crossover rows or None, where it comes from)` per bucket
+    the sweep measured, buckets from fewest groups to most."""
+    return _policy.group_rule_table(_router_crossovers())
 
 
 def _finish(config, report):
@@ -2083,6 +2326,9 @@ class MetalEngine(_LocalEngine):
       frames, or its Parquet file's footer count) are at or above the measured crossover of every
       shape class in it, for its dtype class (a String column among its inputs, or not) and input;
       a class with no crossover stays with Polars at every size. `placement_rules()` lists them.
+      A group-by is judged by the bucket of its estimated group count (`group_placement_rules()`),
+      which a fixed-seed sample of its key columns gives (cached per frame and keys;
+      `clear_group_estimates()` drops the cache; `last_report.groups` lists each probe).
     * `shapes="all"`: every subtree the translator can express, of at least `min_rows` rows
       (`DEFAULT_MIN_ROWS` when not given; for testing, or to move work off the CPU cores).
     * `shapes={...}`: a set of class names (`SHAPE_CLASSES`, or a prefix such as `"group_by"` or

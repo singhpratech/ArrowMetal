@@ -30,6 +30,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 ROUTER = policy.router_crossovers(am.router_table())
 KEYS = sorted(table.ENGINE)
+# The (class, dtype class, input) judged by the engine table's row alone; a group-by class the sweep
+# measured per group count is judged by its buckets (below), and by its row only without an estimate.
+CLASS_KEYS = [k for k in KEYS if k not in policy._BUCKETED]
 
 
 def dtypes_of(dclass):
@@ -50,15 +53,21 @@ def _grid():
     for cls, dclass, source in KEYS:
         x = policy.crossover(cls, dclass, source, ROUTER)[0] or 10**9
         for rows in (0, 1, 999_999, 1_000_000, x - 1, x, x + 1, 10**12):
-            out.append(((cls,), dclass, source, rows))
-    out.append((("sort", "group_by:sum", "join:inner"), "numeric", "memory", 7_654_321))
-    out.append(((), "numeric", "memory", 5_000_000))
+            out.append(((cls,), dclass, source, rows, None))
+    for cls, dclass, source, bucket in sorted(table.GROUPS):
+        x = policy.group_crossover(cls, dclass, source, bucket, ROUTER)[0] or 10**9
+        for rows in (1_000_000, x - 1, x, 50_000_000):
+            for g in (None, 150, 2_000, 20_000, 200_000, 2_000_000, 5_000_000, rows // 2):
+                out.append(((cls,), dclass, source, rows, g))
+    out.append((("sort", "group_by:sum", "join:inner"), "numeric", "memory", 7_654_321, None))
+    out.append((("sort", "group_by:sum"), "numeric", "memory", 7_654_321, 20_000))
+    out.append(((), "numeric", "memory", 5_000_000, None))
     return out
 
 
 def _decisions(router):
-    return [tuple(policy.decide(list(c), dtypes_of(d), n, s, router=router))
-            for c, d, s, n in _grid()]
+    return [tuple(policy.decide(list(c), dtypes_of(d), n, s, router=router, groups=g))
+            for c, d, s, n, g in _grid()]
 
 
 def test_the_policy_is_pure_across_calls_and_processes():
@@ -83,7 +92,7 @@ def test_the_table_covers_the_translator_classes_it_measured():
         assert e["rows"] is None or 0 < e["rows"] <= e["largest"]
 
 
-@pytest.mark.parametrize("key", KEYS, ids=lambda k: "|".join(k))
+@pytest.mark.parametrize("key", CLASS_KEYS, ids=lambda k: "|".join(k))
 def test_each_rule_just_below_and_at_its_crossover(key):
     cls, dclass, source = key
     x, where = policy.crossover(cls, dclass, source, ROUTER)
@@ -147,7 +156,7 @@ def test_the_router_table_and_the_sort_sweep_are_floors():
                 assert x >= ROUTER[op][0], (key, op)
         if key[0] in table.SWEEP:
             assert x >= table.SWEEP[key[0]]["rows"], key
-    reached_keys = [k for k in KEYS if reached(k) and k[0] in policy.ROUTER_OPS]
+    reached_keys = [k for k in CLASS_KEYS if reached(k) and k[0] in policy.ROUTER_OPS]
     if reached_keys:
         key = reached_keys[0]
         op = policy.ROUTER_OPS[key[0]][0]
@@ -212,6 +221,271 @@ def test_every_fitted_case_is_ahead_from_its_crossover_on():
     for key, e in table.ENGINE.items():
         rows = [table.CASES[c]["rows"] for c in e["cases"]]
         assert e["rows"] == (None if None in rows else max(rows)), key
+
+
+# =============================================================================================
+# group-by: the group-count buckets
+# =============================================================================================
+
+GROUP_KEYS = sorted(table.GROUPS, key=lambda k: (k[:3], policy.BUCKETS.index(k[3])))
+
+
+def _middle(bucket, rows):
+    """A group count inside `bucket` at `rows` input rows (its geometric middle)."""
+    if bucket == table.ROWS_BUCKET:
+        return rows // 2
+    lo, hi = next(b[1:] for b in table.GROUP_BUCKETS if b[0] == bucket)
+    return int(round((lo * hi) ** 0.5))
+
+
+def test_the_buckets_tile_the_group_counts():
+    b = table.GROUP_BUCKETS
+    assert b[0][1] == 1 and all(b[i][2] + 1 == b[i + 1][1] for i in range(len(b) - 1))
+    rows = 10**12
+    for name, lo, hi in b:
+        assert policy.group_bucket(lo, rows) == policy.group_bucket(hi, rows) == name
+    assert policy.group_bucket(b[-1][2] + 1, rows) is None
+    assert policy.group_bucket(0, rows) is None and policy.group_bucket(None, rows) is None
+    # At least rows / NEAR_ROWS groups is the rows bucket, whatever the count.
+    for rows in (4, 1000, 2_000_000, 50_000_000):
+        edge = -(-rows // table.NEAR_ROWS)
+        assert policy.group_bucket(edge, rows) == table.ROWS_BUCKET
+        if edge > 1:
+            assert policy.group_bucket(edge - 1, rows) != table.ROWS_BUCKET
+
+
+def test_every_bucket_is_ahead_from_its_crossover_on():
+    """The per-bucket fits: at every size measured in a bucket from its crossover's step on, the
+    worst case there is ahead by the margin; a bucket without a crossover is not ahead at its
+    largest size, or ahead there alone."""
+    assert GROUP_KEYS, "the table has no group-count buckets"
+    for key in GROUP_KEYS:
+        e = table.GROUPS[key]
+        ahead = 1.0 + table.MARGIN[key[1]]
+        assert e["cases"] and e["smallest"] <= e["largest"]
+        if e["rows"] is None:
+            last = sorted(e["ratios"])[-2:]
+            assert len(e["ratios"]) == 1 or not all(e["ratios"][n] >= ahead + 0.005 for n in last), key
+            continue
+        assert e["smallest"] <= e["rows"] <= e["largest"], key
+        assert all(r >= ahead - 0.005 for n, r in e["ratios"].items() if n >= e["step"]), (key, e)
+
+
+@pytest.mark.parametrize("key", GROUP_KEYS, ids=lambda k: "|".join(k))
+def test_each_bucket_rule_just_below_and_at_its_crossover(key):
+    cls, dclass, source, bucket = key
+    x, where = policy.group_crossover(cls, dclass, source, bucket, ROUTER)
+    dt = dtypes_of(dclass)
+    if x is None:
+        rows = table.GROUPS[key]["largest"]
+        g = _middle(bucket, rows)
+        d = policy.decide([cls], dt, rows, source, router=ROUTER, groups=g)
+        assert not d.take and d.binding == cls
+        if policy.group_band(cls, dclass, source, rows, ROUTER):
+            assert d.reason.startswith(f"estimated {g:,} groups: "), d.reason
+            assert "the measured band for" in d.reason and where in d.reason, d.reason
+        return
+    assert x >= table.GROUPS[key]["rows"]
+    g_at, g_below = _middle(bucket, x), _middle(bucket, x - 1)
+    below = policy.decide([cls], dt, x - 1, source, router=ROUTER, groups=g_below)
+    at = policy.decide([cls], dt, x, source, router=ROUTER, groups=g_at)
+    assert at.take and at.binding == cls and at.crossover == x and at.groups == f"{g_at:,} groups"
+    assert f"{x:,} input rows is at or above the {x:,}-row crossover for " in at.reason
+    assert f"at an estimated {g_at:,} groups" in at.reason and where in at.reason
+    assert not below.take and below.binding == cls
+
+
+def test_a_losing_bucket_is_named_below_or_above_the_band():
+    """A group count in a bucket the sweep did not bring ahead stays with Polars at every size, and
+    the reason places the estimate against the buckets taken at those rows."""
+    seen = 0
+    for cls, dclass, source, bucket in GROUP_KEYS:
+        rows = table.GROUPS[(cls, dclass, source, bucket)]["largest"]
+        band = policy.group_band(cls, dclass, source, rows, ROUTER)
+        if not band or bucket in band:
+            continue
+        g = _middle(bucket, rows)
+        d = policy.decide([cls], dtypes_of(dclass), 10**12 if bucket != table.ROWS_BUCKET else rows,
+                          source, router=ROUTER, groups=g)
+        assert not d.take and d.crossover is None
+        side = ("below" if policy.BUCKETS.index(bucket) < policy.BUCKETS.index(band[0]) else
+                "above" if policy.BUCKETS.index(bucket) > policy.BUCKETS.index(band[-1]) else "outside")
+        assert d.reason.startswith(f"estimated {g:,} groups: {side} the measured band for {cls}"), d.reason
+        seen += 1
+    assert seen, "no bucket outside a band in the table in force"
+
+
+def test_no_estimate_falls_back_to_the_class_row():
+    """Without an estimate a bucketed class is judged by the engine table's row (every group count
+    measured) and the reason says so; below every bucket's crossover no probe is asked for."""
+    for cls, dclass, source in sorted({k[:3] for k in GROUP_KEYS}):
+        calls = []
+
+        def probe():
+            calls.append(1)
+            return None, "no group-count estimate: a test"
+        d = policy.decide([cls], dtypes_of(dclass), 10**12, source, router=ROUTER, groups=probe)
+        xs = [policy.group_crossover(cls, dclass, source, b, ROUTER)[0] for b in policy.BUCKETS]
+        if any(xs):
+            assert calls and d.reason.endswith("; no group-count estimate: a test"), d.reason
+            assert d.take == (policy.crossover(cls, dclass, source, ROUTER)[0] is not None)
+            calls.clear()
+            low = min(x for x in xs if x)
+            d = policy.decide([cls], dtypes_of(dclass), low - 1, source, router=ROUTER, groups=probe)
+            assert not d.take and not calls and "at every group count measured" in d.reason
+        else:
+            assert not d.take and not calls and "at any group count" in d.reason
+
+
+def _grid_frame(rows, groups, seed=11):
+    rng = np.random.default_rng(seed)
+    b = min(groups, 100)
+    return pl.DataFrame({"k": rng.integers(0, groups, rows, dtype=np.int32),
+                         "k1": rng.integers(0, max(1, groups // b), rows, dtype=np.int32),
+                         "k2": rng.integers(0, b, rows, dtype=np.int32),
+                         "s": pl.Series(rng.integers(0, groups, rows)).cast(pl.String),
+                         "q": rng.integers(0, 10**9, rows)})
+
+
+@pytest.mark.parametrize("groups", [200, 1_000, 10_000, 100_000, 1_000_000])
+def test_the_probe_puts_the_grid_group_counts_in_their_bucket(groups):
+    """The estimate of the probe lands in the bucket of the true group count, over one int key,
+    two int keys and a String key, at 2,000,000 rows."""
+    rows = 2_000_000
+    df = _grid_frame(rows, groups)
+    for cols in (["k"], ["k1", "k2"], ["s"]):
+        true = df.select(cols).n_unique()
+        est, how = pe._frame_groups(df, cols)
+        assert policy.group_bucket(est, rows) == policy.group_bucket(true, rows), (cols, true, est, how)
+        assert 0.5 <= est / true <= 2.0, (cols, true, est, how)
+
+
+def _probe_decisions(seed=5):
+    out = []
+    for groups in (200, 30_000, 900_000):
+        df = _grid_frame(300_000, groups, seed)
+        for cols in (["k"], ["k1", "k2"], ["s"]):
+            out.append(pe._frame_groups(df, cols))
+    return out
+
+
+def test_the_probe_is_deterministic_across_calls_and_processes():
+    pe.clear_group_estimates()
+    first = _probe_decisions()
+    for _ in range(200):
+        assert _probe_decisions() == first
+    code = ("import sys; sys.path.insert(0, %r); import test_engine_policy as t; "
+            "print(repr(t._probe_decisions()))" % HERE)
+    env = dict(os.environ, PYTHONPATH=os.path.join(REPO, "python"))
+    out = subprocess.run([sys.executable, "-c", code], check=True, env=env, cwd=REPO,
+                         capture_output=True, text=True).stdout.strip().splitlines()[-1]
+    assert out == repr(first)
+
+
+def test_the_estimate_is_cached_per_frame_and_keys():
+    key = next((k for k in GROUP_KEYS if k[1:3] == ("numeric", "memory") and k[0] == "group_by:sum"
+                and policy.group_crossover(*k, ROUTER)[0]), None)
+    if key is None:
+        pytest.skip("no group_by:sum bucket with a crossover in the table in force")
+    x = policy.group_crossover(*key, ROUTER)[0]
+    if x > 20_000_000:
+        pytest.skip("the crossover is too large for a unit test")
+    df = _grid_frame(x, max(2, _middle(key[3], x)))
+    lf = df.lazy().group_by("k").agg(pl.col("q").sum())
+    eng = am.MetalEngine()
+    pe.clear_group_estimates()
+    want = lf.collect().sort("k")
+    for i in range(3):
+        assert lf.collect(engine=eng).sort("k").equals(want)
+        g = eng.last_report.groups
+        assert len(g) == 1 and g[0]["cached"] == (i > 0) and g[0]["keys"] == ["k"], g
+    # Other keys of the same frame are probed on their own.
+    df.lazy().group_by("k2").agg(pl.col("q").sum()).collect(engine=eng)
+    assert [g["cached"] for g in eng.last_report.groups] in ([], [False])
+    pe.clear_group_estimates()
+    lf.collect(engine=eng)
+    assert eng.last_report.groups[0]["cached"] is False
+
+
+def test_the_default_takes_a_group_by_by_its_group_count():
+    """Over the same number of rows, a group-by whose keys hold a group count in a bucket the sweep
+    brought ahead runs on Metal, and one in a losing bucket stays with Polars and says why."""
+    taken = [k for k in GROUP_KEYS if k[0] == "group_by:sum" and k[1:3] == ("numeric", "memory")
+             and policy.group_crossover(*k, ROUTER)[0]]
+    losing = [k for k in GROUP_KEYS if k[0] == "group_by:sum" and k[1:3] == ("numeric", "memory")
+              and not policy.group_crossover(*k, ROUTER)[0] and k[3] != table.ROWS_BUCKET]
+    if not taken or not losing:
+        pytest.skip("the table in force does not separate group counts for group_by:sum")
+    x = min(policy.group_crossover(*k, ROUTER)[0] for k in taken)
+    if x > 20_000_000:
+        pytest.skip("the crossover is too large for a unit test")
+    win = next(k for k in taken if policy.group_crossover(*k, ROUTER)[0] == x)
+    eng = am.MetalEngine()
+    df = _grid_frame(x, _middle(win[3], x))
+    lf = df.lazy().group_by("k").agg(pl.col("q").sum())
+    assert lf.collect(engine=eng).sort("k").equals(lf.collect().sort("k"))
+    rep = eng.last_report
+    assert len(rep.taken) == 1 and rep.taken[0]["groups"], rep
+    assert "at an estimated" in rep.taken[0]["rule"] and "groups over (k)" in rep.taken[0]["rule"], rep
+    assert f"groups: GroupBy#" in str(rep)
+    lose = losing[0]
+    df = _grid_frame(x, _middle(lose[3], x))
+    lf = df.lazy().group_by("k").agg(pl.col("q").sum())
+    assert lf.collect(engine=eng).sort("k").equals(lf.collect().sort("k"))
+    rep = eng.last_report
+    assert not rep.taken, rep
+    assert any(f.startswith("GroupBy#") and "rule: estimated " in f and "the measured band for "
+               "group_by:sum" in f for f in rep.fallbacks), rep
+
+
+def _probe_of(lf):
+    """What the probe answers for the one group-by of `lf`'s plan, found by the translator."""
+    seen = []
+
+    def spy(sub, report, root):
+        out = real(sub, report, root)
+        if sub.groups:
+            seen.append(out)
+        return out
+    real = pe._groups_of
+    pe._groups_of = spy
+    try:
+        # A decision that needs the estimate: at 10**12 rows every bucket with a crossover is open.
+        orig = pe._policy.decide
+
+        def decide(*a, **k):
+            if callable(k.get("groups")):
+                k["groups"] = k["groups"]()
+            return orig(*a, **k)
+        pe._policy.decide = decide
+        lf.collect(engine=am.MetalEngine())
+    finally:
+        pe._groups_of = real
+        pe._policy.decide = orig
+    return seen
+
+
+def test_where_the_probe_finds_the_keys():
+    """Keys that are columns of one input frame are probed there, through a filter, a projection
+    and a join; a computed key, or one from an aggregate below, has no estimate."""
+    df = _grid_frame(4_000, 1_000)          # small enough to be counted exactly
+    dim = pl.DataFrame({"k2": np.arange(100, dtype=np.int32), "w": np.arange(100)})
+    q = pl.col("q").sum()
+    for lf, cols in ((df.lazy().group_by("k").agg(q), 1_000),
+                     (df.lazy().filter(pl.col("q") > 5).group_by("k1", "k2").agg(q), 1_000),
+                     (df.lazy().select(pl.col("k").alias("kk"), "q").group_by("kk").agg(q), 1_000),
+                     (df.lazy().join(dim.lazy(), on="k2").group_by("k").agg(pl.col("w").sum()), 1_000)):
+        (count, text), = _probe_of(lf)
+        assert count == df.select("k").n_unique() or count == df.select("k1", "k2").n_unique(), text
+        assert "counted over all 4,000 rows" in text
+    lf = df.lazy().with_columns((pl.col("k") * 2).alias("k3")).group_by("k3").agg(q)
+    (count, text), = _probe_of(lf)
+    assert count is None and "computed" in text
+    # Two group-bys in one subtree: no estimate for it; the inner one alone is probed.
+    lf = df.lazy().group_by("k").agg(q.alias("s")).group_by("s").agg(pl.len())
+    counts = _probe_of(lf)
+    assert counts[0][0] is None and "holds 2 group-bys" in counts[0][1], counts
+    assert counts[1][0] == df.select("k").n_unique(), counts
 
 
 # =============================================================================================
