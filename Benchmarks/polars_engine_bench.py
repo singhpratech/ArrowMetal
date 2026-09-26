@@ -138,6 +138,85 @@ def shapes(rows, rng):
             .filter(pl.col("x") > 0.2).sort(["k2", "q"], descending=[False, True]), ["k2", "q"]),
         ("(r) unique over (region, sub), keep first", f.unique(subset=["region", "sub"],
                                                                  keep="first"), False),
+    ] + more_shapes(rows, rng, fact, extra)
+
+
+def more_shapes(rows, rng, fact, extra):
+    """The cases the per-shape crossovers are fitted from as well (Benchmarks/polars_engine_crossover.py):
+    each aggregate family alone, over a whole frame and per group with one key and with two, at a
+    few hundred to ten thousand groups and at a hundred thousand or more; each join kind with the
+    probe side growing with `rows`; `unique` over many groups; a sort that needs helper keys and a
+    top-k over numeric columns only; and the same operators with a String column in the input."""
+    f = fact.lazy()
+    cond = (pl.col("region") < 20) & (pl.col("qty") > 10)
+    # Joins: the probe side has `rows` rows, the build side 1,000,000 keys, every other value of the
+    # probe side's range, so half the probe rows match.
+    build_rows = 1_000_000
+    probe = pl.DataFrame({"k": rng.integers(0, 2 * build_rows, size=rows, dtype=np.int64),
+                          "v": (rng.random(rows, dtype=np.float32) * 100).astype(np.float32)}).lazy()
+    build = pl.DataFrame({"k": np.arange(0, 2 * build_rows, 2, dtype=np.int64),
+                          "w": (rng.random(build_rows, dtype=np.float32) * 2).astype(np.float32)}).lazy()
+    names = pl.DataFrame({"name": pl.Series(np.arange(0, 1000, 2)).cast(pl.String),
+                          "w": (rng.random(500, dtype=np.float32) * 2).astype(np.float32)}).lazy()
+    nullable_x = extra.select("q", pl.when(pl.col("k2") < 50).then(None).otherwise(pl.col("x"))
+                              .alias("x"))
+    return [
+        # Whole-frame aggregates, one family each ((a) is sum + count).
+        ("(a2) filtered min + max", f.filter(cond)
+            .select(pl.col("qty").min().alias("lo"), pl.col("amount").max().alias("hi")), False),
+        ("(a3) filtered mean", f.filter(cond)
+            .select(pl.col("qty").mean().alias("m"), pl.col("amount").mean().alias("ma")), False),
+        ("(a4) filtered count", f.filter(cond).select(pl.len().alias("n")), False),
+        # Group-by over one int32 key: 200 groups (region) and 100,000 (k1; (i) is the sum).
+        ("(t1) group-by 1 key, 200 groups, sum", f.group_by("region")
+            .agg(pl.col("qty").sum().alias("s")), False),
+        ("(t2) group-by 1 key, 200 groups, count", f.group_by("region")
+            .agg(pl.len().alias("n")), False),
+        ("(t3) group-by 1 key, 200 groups, mean", f.group_by("region")
+            .agg(pl.col("qty").mean().alias("m")), False),
+        ("(t4) group-by 1 key, 200 groups, min + max", f.group_by("region")
+            .agg(pl.col("qty").min().alias("lo"), pl.col("qty").max().alias("hi")), False),
+        ("(t5) group-by 1 key, 100 000 groups, count", extra.group_by("k1")
+            .agg(pl.len().alias("n")), False),
+        ("(t6) group-by 1 key, 100 000 groups, mean", extra.group_by("k1")
+            .agg(pl.col("q").mean().alias("m")), False),
+        ("(t7) group-by 1 key, 100 000 groups, min + max", extra.group_by("k1")
+            .agg(pl.col("q").min().alias("lo"), pl.col("q").max().alias("hi")), False),
+        # Group-by over two int32 keys: (region, sub), 10,000 groups, and (k1, k2), about as many
+        # groups as rows up to 100,000,000 ((c), (j) and (l) mix families).
+        ("(v1) group-by (region, sub), sum", f.group_by("region", "sub")
+            .agg(pl.col("qty").sum().alias("s")), False),
+        ("(v2) group-by (region, sub), count", f.group_by("region", "sub")
+            .agg(pl.len().alias("n")), False),
+        ("(v3) group-by (k1, k2), mean", extra.group_by("k1", "k2")
+            .agg(pl.col("q").mean().alias("m")), False),
+        ("(v4) group-by (k1, k2), min + max", extra.group_by("k1", "k2")
+            .agg(pl.col("q").min().alias("lo"), pl.col("q").max().alias("hi")), False),
+        # Each join kind on an int64 key, the result returned whole.
+        ("(w1) inner join, 1M-row build side", probe.join(build, on="k", how="inner"), False),
+        ("(w2) left join, 1M-row build side", probe.join(build, on="k", how="left"), False),
+        ("(w3) semi join, 1M-row build side", probe.join(build, on="k", how="semi"), False),
+        ("(w4) anti join, 1M-row build side", probe.join(build, on="k", how="anti"), False),
+        # Numeric-only versions of shapes the first cases have only with a String column.
+        ("(x1) unique over (k1, k2), keep first", extra.select("k1", "k2", "q")
+            .unique(subset=["k1", "k2"], keep="first"), False),
+        ("(x2) sort by a nullable Float64 key, descending", nullable_x
+            .sort("x", descending=True), ["x"]),
+        ("(x3) top 100 by an int64 key", extra.select("q", "x").sort("q").head(100), ["q"]),
+        # With a String column in the input.
+        ("(y1) group-by a String key (1000 values), sum", extra.group_by("name")
+            .agg(pl.col("q").sum().alias("s")), False),
+        ("(y2) filter by a String equality", extra.select("q", "name")
+            .filter(pl.col("name") == "17"), False),
+        ("(y3) filter by a String prefix, then sum", extra
+            .filter(pl.col("name").str.starts_with("12")).select(pl.col("q").sum().alias("s")),
+            False),
+        ("(y4) inner join on a String key", extra.select("name", "q")
+            .join(names, on="name", how="inner"), False),
+        ("(y5) unique over (String, int32), keep first", extra.select("name", "k2", "q")
+            .unique(subset=["name", "k2"], keep="first"), False),
+        ("(y6) top 100 by an int64 key with a String column", extra.select("q", "name")
+            .sort("q").head(100), ["q"]),
     ]
 
 
@@ -190,125 +269,138 @@ def same(a, b, order):
         return False
 
 
+def case_id(label):
+    """'(a2) filtered min + max' -> 'a2'."""
+    return label[1:label.index(")")]
+
+
+def shape_of(report):
+    """What the policy sees of the subtrees an engine took: `shape classes|dtype class|input` and
+    the input rows, one per subtree, joined by ';'."""
+    shapes = ";".join("+".join(t["shape"]) + "|" + t["dtype_class"] + "|" + t["input"]
+                      for t in report.taken)
+    rows = ";".join(str(t["rows"]) for t in report.taken)
+    return shapes, rows
+
+
+def rule_of(report):
+    """The default policy's word on a plan: the rule of each subtree it took, and the policy lines
+    of the nodes it left (the placement stops at a taken node, so these are the ones above it)."""
+    lines = [t["root"] + ": " + t["rule"] for t in report.taken]
+    lines += [f for f in report.fallbacks if " rule: " in f]
+    return " | ".join(lines)
+
+
+def run_case(label, lf, order, rows, iters, crossover, cold, results_rows):
+    every = am.MetalEngine(min_rows=0, shapes="all")
+    default = am.MetalEngine()
+    want = lf.collect()
+    got = lf.collect(engine=every)
+    rep = every.last_report
+    taken = ";".join(t["root"] + "[" + ">".join(t["kinds"]) + "]" for t in rep.taken)
+    shape, input_rows = shape_of(rep)
+    fallbacks = " | ".join(rep.fallbacks)
+    ok = same(got, want, order)
+    engines = [("polars in-memory", lambda: lf.collect(engine="in-memory"), None),
+               ("polars streaming", lambda: lf.collect(engine="streaming"), None),
+               ("MetalEngine all, cold", lambda: lf.collect(engine=every), cold)]
+    rule = taken_default = ""
+    if not crossover:
+        lf.collect(engine=default)
+        taken_default = ";".join(t["root"] for t in default.last_report.taken)
+        rule = rule_of(default.last_report)
+        engines += [("MetalEngine all, warm", lambda: lf.collect(engine=every), None),
+                    ("MetalEngine default, cold", lambda: lf.collect(engine=default), cold)]
+    results = {}
+    for name, fn, setup in engines:
+        results[name] = best_of(fn, iters, setup)
+    cold()
+    fastest = min(results["polars in-memory"][0], results["polars streaming"][0])
+    for name, (wall, cpu) in results.items():
+        is_metal = name.startswith("MetalEngine")
+        is_default = name.startswith("MetalEngine default")
+        row = {"rows": rows, "case": label, "engine": name, "wall_ms": f"{wall:.3f}",
+               "cpu_ms": f"{cpu:.1f}",
+               "taken": (taken_default if is_default else taken) if is_metal else "",
+               "fallbacks": fallbacks if is_metal and not is_default else "",
+               "equal_to_polars": ok if is_metal else "",
+               "vs_fastest_polars": f"{fastest / wall:.2f}" if is_metal else "",
+               "vs_polars_in_memory": (f"{results['polars in-memory'][0] / wall:.2f}"
+                                       if is_metal else ""),
+               "shape": shape if is_metal and not is_default else "",
+               "input_rows": input_rows if is_metal and not is_default else "",
+               "rule": rule if is_default else ""}
+        results_rows.append(row)
+        note = ""
+        if is_metal:
+            note = (f"  x{fastest / wall:.2f} vs fastest Polars; taken: "
+                    f"{row['taken'] or 'nothing'}")
+        print(f"  {label[:52]:<52} {name:<26} {wall:9.2f} ms {cpu:8.1f} CPU-ms{note}")
+    if not crossover and rule:
+        print(f"  {'':<52} default rule: {rule}")
+    if not ok:
+        print(f"  !! {label}: MetalEngine result differs from Polars")
+    return rep
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sizes", default="2000000,50000000")
     ap.add_argument("--iters", type=int, default=5)
-    ap.add_argument("--cases", default="", help="comma-separated case letters, e.g. a,c,j")
+    ap.add_argument("--cases", default="", help="comma-separated case ids, e.g. a,c,j,t1,s4")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--crossover", action="store_true",
+                    help="the crossover sweep: Polars' two engines and MetalEngine(shapes='all') "
+                         "cold only, with the shape each subtree has (Benchmarks/"
+                         "polars_engine_crossover.py fits the per-shape crossovers from it)")
     ap.add_argument("--scan", action="store_true", help="add the Parquet scan cases")
     ap.add_argument("--scan-only", action="store_true", help="only the Parquet scan cases")
-    ap.add_argument("--scan-rows", type=int, default=50_000_000)
+    ap.add_argument("--scan-rows", default="50000000",
+                    help="comma-separated file sizes in rows, one file per size and codec")
     ap.add_argument("--scan-codecs", default="snappy,none")
     ap.add_argument("--scan-dir", default=os.path.join(os.sep, "tmp", "arrowmetal-parquet-bench"))
     args = ap.parse_args()
     sizes = [] if args.scan_only else [int(s) for s in args.sizes.split(",")]
     wanted = {c.strip() for c in args.cases.split(",") if c.strip()}
+    mode = ", crossover sweep" if args.crossover else ""
     header = (f"ArrowMetal {am.version()} on {am.device_name()}, polars {pl.__version__} "
-              f"({pl.thread_pool_size()} threads), pyarrow {pa.__version__}, best of {args.iters}")
+              f"({pl.thread_pool_size()} threads), pyarrow {pa.__version__}, best of {args.iters}"
+              f"{mode}")
     print(header)
     rows_out = []
     for rows in sizes:
         rng = np.random.default_rng(1234)
         print(f"\nrows={rows:,}")
         for label, lf, order in shapes(rows, rng):
-            if wanted and label[1] not in wanted:
+            if wanted and case_id(label) not in wanted:
                 continue
-            every = am.MetalEngine(min_rows=0, shapes="all")
-            default = am.MetalEngine()
-            want = lf.collect()
-            got = lf.collect(engine=every)
-            rep = every.last_report
-            taken = ";".join(t["root"] + "[" + ">".join(t["kinds"]) + "]" for t in rep.taken)
-            fallbacks = " | ".join(rep.fallbacks)
-            ok = same(got, want, order)
-            lf.collect(engine=default)
-            taken_default = ";".join(t["root"] for t in default.last_report.taken)
-            cold = pe.clear_import_cache
-            results = {}
-            for name, fn, setup in (
-                    ("polars in-memory", lambda: lf.collect(engine="in-memory"), None),
-                    ("polars streaming", lambda: lf.collect(engine="streaming"), None),
-                    ("MetalEngine all, cold", lambda: lf.collect(engine=every), cold),
-                    ("MetalEngine all, warm", lambda: lf.collect(engine=every), None),
-                    ("MetalEngine default, cold", lambda: lf.collect(engine=default), cold)):
-                results[name] = best_of(fn, args.iters, setup)
-            pe.clear_import_cache()
-            fastest = min(results["polars in-memory"][0], results["polars streaming"][0])
-            for name, (wall, cpu) in results.items():
-                is_metal = name.startswith("MetalEngine")
-                is_default = name.startswith("MetalEngine default")
-                row = {"rows": rows, "case": label, "engine": name, "wall_ms": f"{wall:.3f}",
-                       "cpu_ms": f"{cpu:.1f}",
-                       "taken": (taken_default if is_default else taken) if is_metal else "",
-                       "fallbacks": fallbacks if is_metal and not is_default else "",
-                       "equal_to_polars": ok if is_metal else "",
-                       "vs_fastest_polars": f"{fastest / wall:.2f}" if is_metal else ""}
-                rows_out.append(row)
-                extra = ""
-                if is_metal:
-                    extra = (f"  x{fastest / wall:.2f} vs fastest Polars; taken: "
-                             f"{row['taken'] or 'nothing'}")
-                print(f"  {label[:44]:<44} {name:<26} {wall:9.2f} ms {cpu:8.1f} CPU-ms{extra}")
-            if not ok:
-                print(f"  !! {label}: MetalEngine result differs from Polars")
+            run_case(label, lf, order, rows, args.iters, args.crossover, pe.clear_import_cache,
+                     rows_out)
     if args.scan or args.scan_only:
-        for codec in args.scan_codecs.split(","):
-            path = ensure_scan_file(args.scan_dir, args.scan_rows, codec)
-            size = os.path.getsize(path)
-            print(f"\nscan: {os.path.basename(path)}, {size / 1e9:.2f} GB, {args.scan_rows:,} rows")
-            for label, lf, order in scan_shapes(path):
-                if wanted and label[1:3] not in wanted:
-                    continue
-                every = am.MetalEngine(min_rows=0, shapes="all")
-                default = am.MetalEngine()
-                want = lf.collect()
-                got = lf.collect(engine=every)
-                rep = every.last_report
-                taken = ";".join(t["root"] + "[" + ">".join(t["kinds"]) + "]" for t in rep.taken)
-                fallbacks = " | ".join(rep.fallbacks)
-                scans = [sc for t in rep.taken for sc in t.get("scans") or ()]
-                skipped = sum(sc.get("row_groups_skipped_by_statistics", 0)
-                              + sc.get("row_groups_skipped_by_page_index", 0) for sc in scans)
-                read = sum(sc.get("row_groups_read", 0) for sc in scans)
-                ok = same(got, want, order)
-                lf.collect(engine=default)
-                taken_default = ";".join(t["root"] for t in default.last_report.taken)
+        for scan_rows in [int(s) for s in args.scan_rows.split(",")]:
+            for codec in args.scan_codecs.split(","):
+                path = ensure_scan_file(args.scan_dir, scan_rows, codec)
+                size = os.path.getsize(path)
+                print(f"\nscan: {os.path.basename(path)}, {size / 1e9:.2f} GB, {scan_rows:,} rows")
+                for label, lf, order in scan_shapes(path):
+                    if wanted and case_id(label) not in wanted:
+                        continue
 
-                def cold():
-                    am.clear_parquet_cache()
-                    pe.clear_import_cache()
+                    def cold():
+                        am.clear_parquet_cache()
+                        pe.clear_import_cache()
 
-                results = {}
-                for name, fn, setup in (
-                        ("polars in-memory", lambda: lf.collect(engine="in-memory"), None),
-                        ("polars streaming", lambda: lf.collect(engine="streaming"), None),
-                        ("MetalEngine all, cold", lambda: lf.collect(engine=every), cold),
-                        ("MetalEngine all, warm", lambda: lf.collect(engine=every), None),
-                        ("MetalEngine default, cold", lambda: lf.collect(engine=default), cold)):
-                    results[name] = best_of(fn, args.iters, setup)
-                am.clear_parquet_cache()
-                fastest = min(results["polars in-memory"][0], results["polars streaming"][0])
-                case = f"{label} [{codec}]"
-                for name, (wall, cpu) in results.items():
-                    is_metal = name.startswith("MetalEngine")
-                    is_default = name.startswith("MetalEngine default")
-                    row = {"rows": args.scan_rows, "case": case, "engine": name,
-                           "wall_ms": f"{wall:.3f}", "cpu_ms": f"{cpu:.1f}",
-                           "taken": (taken_default if is_default else taken) if is_metal else "",
-                           "fallbacks": fallbacks if is_metal and not is_default else "",
-                           "equal_to_polars": ok if is_metal else "",
-                           "vs_fastest_polars": f"{fastest / wall:.2f}" if is_metal else "",
-                           "row_groups_read_skipped": (f"{read}/{skipped}"
-                                                       if is_metal and not is_default else "")}
-                    rows_out.append(row)
-                    extra = ""
-                    if is_metal:
-                        extra = (f"  x{fastest / wall:.2f} vs fastest Polars; taken: "
-                                 f"{row['taken'] or 'nothing'}")
-                    print(f"  {case[:52]:<52} {name:<26} {wall:9.2f} ms {cpu:8.1f} CPU-ms{extra}")
-                if not ok:
-                    print(f"  !! {case}: MetalEngine result differs from Polars")
+                    before = len(rows_out)
+                    rep = run_case(f"{label} [{codec}]", lf, order, scan_rows, args.iters,
+                                   args.crossover, cold, rows_out)
+                    scans = [sc for t in rep.taken for sc in t.get("scans") or ()]
+                    skipped = sum(sc.get("row_groups_skipped_by_statistics", 0)
+                                  + sc.get("row_groups_skipped_by_page_index", 0) for sc in scans)
+                    read = sum(sc.get("row_groups_read", 0) for sc in scans)
+                    for r in rows_out[before:]:
+                        r["row_groups_read_skipped"] = (
+                            f"{read}/{skipped}" if r["engine"] == "MetalEngine all, cold"
+                            or r["engine"] == "MetalEngine all, warm" else "")
     if args.out:
         fields = list(dict.fromkeys(k for r in rows_out for k in r))
         for r in rows_out:
