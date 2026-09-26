@@ -14,7 +14,7 @@ subtree, its dtype class and its input) and its input rows (`input_rows`):
 The fit, per case, is router_table.py's (python/arrowmetal/_router_fit.py `fit`), with the
 MetalEngine as the GPU side and the faster of Polars' two engines as the CPU side, over the case's
 input rows: the first measured size from which the engine is ahead at every larger size by at least
-`MARGIN` (its time x 1.15 no more than the faster Polars engine's),
+`MARGIN` (its time x 1.15, or x 1.35 for a shape with a String column, no more than the faster Polars engine's),
 and inside the bracket below it the point where the straight lines through the two measured points
 of each side meet. A case the engine is not ahead of at its largest size has no crossover.
 
@@ -54,8 +54,14 @@ SWEEP_LABELS = {
 }
 POLARS = ("polars in-memory", "polars streaming")
 # A case counts as ahead at a size only when the MetalEngine's time, raised by this fraction, is
-# still at most the faster Polars engine's: a case within that margin of Polars is not ahead.
-MARGIN = 0.15
+# still at most the faster Polars engine's: a case within that margin of Polars is not ahead. A shape
+# with a String column gets the wider margin: its advantage grows slowly with size (the string sort
+# case is 1.02x at 1M rows and 1.4x at 5M), so a crossover fitted at 15% lands on a coin flip.
+MARGIN = {"numeric": 0.15, "string": 0.35}
+# A shape with a String column is taken from this many rows at the earliest, whatever its fit says:
+# below it the string sort cases sit within run-to-run noise of Polars (1.2-1.4x in the sweep, and
+# 0.9x in a repeat of the default benchmark at 2,000,000 rows).
+STRING_FLOOR = 5_000_000
 METAL = "MetalEngine all, cold"
 
 
@@ -111,7 +117,7 @@ def fit_cases(cases):
         sizes = sorted(c["points"])
         bench = {}
         for n, (metal, polars) in c["points"].items():
-            bench[(case, n, "gpu")] = metal * (1 + MARGIN)
+            bench[(case, n, "gpu")] = metal * (1 + MARGIN[c["shape"][1]])
             bench[(case, n, "cpu")] = polars
         try:
             cross, step, low, _pts = fit.fit(case, "cpu", None, sizes, bench)
@@ -120,6 +126,9 @@ def fit_cases(cases):
         if step is not None and step == sizes[-1] and len(sizes) > 1:
             # Ahead at the largest size alone is one measurement: not a crossover.
             cross = step = low = None
+        if cross is not None and c["shape"][1] == "string" and cross < STRING_FLOOR:
+            cross = STRING_FLOOR
+            step = min((n for n in sizes if n >= STRING_FLOOR), default=step)
         out[case] = {"shape": c["shape"], "rows": cross, "step": step, "low": low,
                      "largest": sizes[-1], "smallest": sizes[0],
                      "ratios": {n: round(c["points"][n][1] / c["points"][n][0], 2) for n in sizes}}
@@ -160,7 +169,7 @@ def render(source, header, per_case, table):
         "",
         "ENGINE: {(class, dtype class, input): {\"rows\": crossover or None (not ahead at the largest size",
         "measured), \"largest\": the largest input rows measured, \"cases\": the sweep cases fitted}}.",
-        "A case is ahead at a size when MetalEngine time x (1 + MARGIN) <= the faster Polars engine's.",
+        "A case is ahead at a size when MetalEngine time x (1 + MARGIN[dtype class]) <= the faster Polars engine's.",
         "CASES: each case's own fit and its ratio (fastest Polars / MetalEngine) at every input size.",
         "SWEEP: the sort kernels' crossovers against the fastest CPU library, from " + SWEEP_JSON + ".",
         '"""',
@@ -169,6 +178,7 @@ def render(source, header, per_case, table):
         f"HEADER = {header!r}",
         f"SWEEP_SOURCE = {SWEEP_JSON!r}",
         f"MARGIN = {MARGIN!r}",
+        f"STRING_FLOOR = {STRING_FLOOR!r}",
         "",
         "ENGINE = " + pprint.pformat(table, width=100, sort_dicts=True),
         "",

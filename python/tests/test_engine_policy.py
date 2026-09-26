@@ -202,7 +202,7 @@ def test_every_fitted_case_is_ahead_from_its_crossover_on():
     MetalEngine was at least as fast as the faster Polars engine, and a class's crossover is the
     largest of its cases'."""
     for case, f in table.CASES.items():
-        ahead = 1.0 + table.MARGIN
+        ahead = 1.0 + table.MARGIN[f["shape"][1]]      # the margin is per dtype class
         if f["rows"] is None:
             # Not ahead at the largest size, or ahead there alone.
             last = sorted(f["ratios"])[-2:]

@@ -1,0 +1,2 @@
+engine bench, default vs all, on the refitted table (polars_engine_crossover_2026-09-26-quiet.csv; MARGIN numeric 0.15 / string 0.35; STRING_FLOOR 5,000,000); start 2026-09-26T09:58:25Z load averages: 6.72 9.46 9.45 main b03dda7
+rc=0 end 10:04:12 load averages: 14.19 11.80 10.47
