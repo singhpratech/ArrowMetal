@@ -1,6 +1,29 @@
 # Changelog
 
 ## Unreleased
+- Parquet Snappy and LZ4 pages are decompressed by the host and the GPU at the same time, split page by
+  page. A read's router (`DecodeRouter`) orders every Snappy and LZ4 page of the columns it stages by how
+  token-dense its header says it is (its ratio: at or below 1.0 a literal, above 1.05 token-dense), and
+  gives the host the densest ones until the host's share, spread over its cores, is predicted to finish
+  with the GPU's, from measured per-byte costs on each side: a 160 KB token-dense page takes one CPU core
+  41-81 µs and the GPU 12-15 ms on a SIMD group or 37-60 ms on a thread, while 1.2 GB of literal pages
+  take the GPU 10 ms and 16 host threads 19 ms from a fresh mapping (docs/PARQUET.md, "Decompression").
+  ZSTD, GZIP and BROTLI stay host-only in the same schedule. The GPU dispatch is committed first (slowest
+  pages first), the host decodes its pages on every core while it runs, and the read waits once before
+  the value kernels; the host's pages sit in their own page-aligned range of the staging buffer. A new
+  bounds-checked `LZ4Host` decoder makes the kernels' checks with their outcomes; `SnappyHost` copies 8
+  and 16 bytes at a time inside the page and the slot. This replaces the 16-page host rule for Snappy and
+  the 2,048-page rule for the page-per-thread kernel. On the 50,000,000-row, 8-column files a whole-file
+  read through a fresh open is 65 ms (Snappy) and 54 ms (LZ4), against 108 and 96 ms before and against
+  Polars' 95 and 73 ms and pyarrow's 160 and 159 ms in the same run; it takes 674 and 508 CPU-ms, against
+  80 and 78 before and Polars' 1,283 and 1,007 (`Benchmarks/results/parquet_bench_2026-09-26-split.txt`,
+  `parquet_cache_2026-09-26-split.csv`; run conditions in `bench_conditions_2026-09-26-split.txt`). A
+  10,000,000-row, 7-column pyarrow-default Snappy file reads in 25.4 ms against 67.5 ms.
+  `ARROWMETAL_PARQUET_DECODE=host|gpu|lane` sends every Snappy and LZ4 page to one decoder. Tests: every
+  fixture on every decoder against the split and against pyarrow, the 240 damaged files on each decoder,
+  the host decoders against byte-at-a-time references and under damage between guard pages, the router
+  and the staging layout (`DecompressSplitTests`, `ParquetTests`, `test_parquet.py`).
+  `Benchmarks/parquet_bench.py` labels ArrowMetal's row `arrowmetal`.
 - `MetalEngine()`'s default (`shapes="measured"`) decides per subtree from measured crossovers instead
   of taking large sorts only. Each translated subtree has shape classes (`rowwise`; `aggregate`,
   `group_by` and `group_by_multi` per aggregate family `sum`, `count`, `mean`, `minmax`; `sort`,
