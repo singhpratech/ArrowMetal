@@ -59,8 +59,9 @@ POLARS = ("polars in-memory", "polars streaming")
 # case is 1.02x at 1M rows and 1.4x at 5M), so a crossover fitted at 15% lands on a coin flip.
 MARGIN = {"numeric": 0.15, "string": 0.35}
 # A shape with a String column is taken from this many rows at the earliest, whatever its fit says:
-# below it the string sort cases sit within run-to-run noise of Polars (1.2-1.4x in the sweep, and
-# 0.9x in a repeat of the default benchmark at 2,000,000 rows).
+# below it the string sort cases sit within the margin of Polars (1.22x and 1.37x at 2,000,000 rows in
+# the sweep, 1.20x and 1.32x under shapes="all" in the default benchmark), and from 5,000,000 the
+# sweep has them at 1.4x and up.
 STRING_FLOOR = 5_000_000
 METAL = "MetalEngine all, cold"
 
