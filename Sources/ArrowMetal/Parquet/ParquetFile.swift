@@ -260,6 +260,13 @@ public final class ParquetFile: @unchecked Sendable {
     /// True when the file is mapped read-only and shared (see `MappedRegion`).
     var isMappedShared: Bool { region.isSharedReadOnly }
 
+    /// How many columns the last read staged together (`stageTogether`); the tests use it.
+    var stagedTogetherLastRead: Int {
+        get { statsLock.lock(); defer { statsLock.unlock() }; return _stagedTogether }
+        set { statsLock.lock(); _stagedTogether = newValue; statsLock.unlock() }
+    }
+    private var _stagedTogether = 0
+
     /// Number of column views held (`pageSource(covering:)`); the tests use it to see which path ran.
     var viewCount: Int { wrapLock.lock(); defer { wrapLock.unlock() }; return views.count }
 

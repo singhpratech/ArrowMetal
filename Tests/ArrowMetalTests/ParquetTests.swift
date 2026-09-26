@@ -423,7 +423,10 @@ final class ParquetTests: XCTestCase {
             let path = dir.appendingPathComponent("wide-\(codec.name).parquet").path
             try ParquetWriter.write(batch, to: path,
                                     options: ParquetWriteOptions(compression: codec, useDictionary: true, rowGroupSize: 10_000))
-            let whole = try ParquetFile(path: path).read()
+            let wf = try ParquetFile(path: path)
+            let whole = try wf.read()
+            // Every column of the Snappy file is decompressed in one batch before any is decoded.
+            XCTAssertEqual(wf.stagedTogetherLastRead, codec == .snappy ? 5 : 0, "\(codec.name)")
             let f = try ParquetFile(path: path)
             XCTAssertEqual(f.rowGroupCount, 12)
             for (i, name) in batch.names.enumerated() {

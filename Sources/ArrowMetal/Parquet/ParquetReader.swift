@@ -100,9 +100,13 @@ extension ParquetFile {
         // handful of places that must read a GPU result (a page scan total, an offsets total) flush and
         // reopen the batch through `MetalContext.syncPoint`.
         try context.batch {
+            // Flat columns read in full have their compressed pages decompressed together, up front.
+            let flat = wanted.compactMap { f -> ParquetLeaf? in if case .leaf(let l) = f.kind { return l } else { return nil } }
+            let staged = plan.ranges.isEmpty && flat.count > 1 ? stageTogether(leaves: flat, rowGroups: groups) : [:]
+            stagedTogetherLastRead = staged.count
             for f in wanted {
                 names.append(f.name)
-                var column = try readField(f, rowGroups: groups, options: options, plan: plan)
+                var column = try readField(f, rowGroups: groups, options: options, plan: plan, staged: staged)
                 // A top-level column takes back what `ARROW:schema` says the Parquet schema lost; a leaf
                 // selected on its own by dotted path reads as the Parquet schema describes it. The stored
                 // schema is advisory: a claim the column cannot take leaves it as the Parquet schema says.
@@ -196,13 +200,13 @@ extension ParquetFile {
     }
 
     func readField(_ f: ParquetField, rowGroups: [Int], options: ParquetReadOptions,
-                   plan: ParquetReadPlan? = nil) throws -> AnyMetalArray {
+                   plan: ParquetReadPlan? = nil, staged: [Int: ParquetPreStaged]? = nil) throws -> AnyMetalArray {
         // Whole row groups, for the columns that are not trimmed page by page.
         let whole = rowGroups.map { (group: $0, rows: 0..<rowsIn(group: $0)) }
         let trimming = plan.map { !$0.ranges.isEmpty } ?? false
         switch f.kind {
         case .leaf(let l):
-            let d = try decodeLeaf(l, rowGroups: rowGroups, options: options, plan: plan, subset: true)
+            let d = try decodeLeaf(l, rowGroups: rowGroups, options: options, plan: plan, subset: true, staged: staged)
             let a = try d.arrowArray()
             // A leaf below a list, read on its own by dotted path, has one entry per element rather than
             // per row, so there are no rows to trim it to.
