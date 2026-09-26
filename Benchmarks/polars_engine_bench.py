@@ -17,9 +17,18 @@ Wall time is the best of `--iters` runs, CPU time the process CPU of that run (a
 The size gate (`MetalEngine`'s default `min_rows`) is read from these rows: see docs/POLARS.md,
 "Tier 4".
 
+`--scan` adds the Parquet scan cases: `pl.scan_parquet(file)` under a filter, a group-by, a sort
+or an aggregate, over the 50M-row, 8-column file `Benchmarks/parquet_bench.py` writes (generated
+into `--scan-dir` when it is not there yet), once per codec. There the MetalEngine reads the file
+on the GPU itself; "cold" clears its open-file cache (`am.clear_parquet_cache()`) before every run,
+"warm" keeps the file open between runs. Polars reads the file on every run in both of its
+engines; the file stays in the OS page cache throughout.
+
 Usage:
   PYTHONPATH=python python Benchmarks/polars_engine_bench.py [--sizes 1000000,2000000] [--iters 5]
                                                              [--out results.csv]
+  PYTHONPATH=python python Benchmarks/polars_engine_bench.py --scan-only [--scan-rows 50000000]
+                                        [--scan-codecs snappy,none] [--scan-dir DIR] [--out scan.csv]
 Requires .build/release/libArrowMetalC.dylib (swift build -c release --product ArrowMetalC).
 """
 import argparse
@@ -132,6 +141,37 @@ def shapes(rows, rng):
     ]
 
 
+def scan_shapes(path):
+    """The Parquet scan cases over parquet_bench.py's file (id, qty, code, price, weight, cat, ts,
+    flag), (label, LazyFrame, order_matters)."""
+    lf = pl.scan_parquet(path)
+    return [
+        ("(s1) scan, filter, group-by 1000 keys, sum + count", lf.filter(pl.col("price") > 500.0)
+            .group_by("qty").agg(pl.col("weight").sum().alias("w"), pl.len().alias("n")), False),
+        ("(s2) scan, filter on id (row groups skipped), group-by, sum", lf
+            .filter(pl.col("id") < 5_000_000).group_by("qty")
+            .agg(pl.col("price").sum().alias("p")), False),
+        ("(s3) scan, filter, sum + count", lf.filter((pl.col("code") < 20_000) & pl.col("flag"))
+            .select(pl.col("price").sum().alias("p"), pl.len().alias("n")), False),
+        ("(s4) scan, sort 2 columns by a float64 key", lf.select("id", "price").sort("price"),
+            ["price"]),
+    ]
+
+
+def ensure_scan_file(directory, rows, codec):
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import parquet_bench
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, "bench-%s-%d.parquet" % (codec, rows))
+    if not parquet_bench.complete(path):
+        t0 = time.perf_counter()
+        parquet_bench.build(path, rows, codec)
+        print(f"wrote {path} in {time.perf_counter() - t0:.1f} s")
+    return path
+
+
 def same(a, b, order):
     """`order` is False (any row order), True (the exact order), or the sort key columns: then
     the keys must match row by row and the rows as a whole must match as a multiset, because rows
@@ -156,8 +196,13 @@ def main():
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--cases", default="", help="comma-separated case letters, e.g. a,c,j")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--scan", action="store_true", help="add the Parquet scan cases")
+    ap.add_argument("--scan-only", action="store_true", help="only the Parquet scan cases")
+    ap.add_argument("--scan-rows", type=int, default=50_000_000)
+    ap.add_argument("--scan-codecs", default="snappy,none")
+    ap.add_argument("--scan-dir", default=os.path.join(os.sep, "tmp", "arrowmetal-parquet-bench"))
     args = ap.parse_args()
-    sizes = [int(s) for s in args.sizes.split(",")]
+    sizes = [] if args.scan_only else [int(s) for s in args.sizes.split(",")]
     wanted = {c.strip() for c in args.cases.split(",") if c.strip()}
     header = (f"ArrowMetal {am.version()} on {am.device_name()}, polars {pl.__version__} "
               f"({pl.thread_pool_size()} threads), pyarrow {pa.__version__}, best of {args.iters}")
@@ -207,11 +252,72 @@ def main():
                 print(f"  {label[:44]:<44} {name:<26} {wall:9.2f} ms {cpu:8.1f} CPU-ms{extra}")
             if not ok:
                 print(f"  !! {label}: MetalEngine result differs from Polars")
+    if args.scan or args.scan_only:
+        for codec in args.scan_codecs.split(","):
+            path = ensure_scan_file(args.scan_dir, args.scan_rows, codec)
+            size = os.path.getsize(path)
+            print(f"\nscan: {os.path.basename(path)}, {size / 1e9:.2f} GB, {args.scan_rows:,} rows")
+            for label, lf, order in scan_shapes(path):
+                if wanted and label[1:3] not in wanted:
+                    continue
+                every = am.MetalEngine(min_rows=0, shapes="all")
+                default = am.MetalEngine()
+                want = lf.collect()
+                got = lf.collect(engine=every)
+                rep = every.last_report
+                taken = ";".join(t["root"] + "[" + ">".join(t["kinds"]) + "]" for t in rep.taken)
+                fallbacks = " | ".join(rep.fallbacks)
+                scans = [sc for t in rep.taken for sc in t.get("scans") or ()]
+                skipped = sum(sc.get("row_groups_skipped_by_statistics", 0)
+                              + sc.get("row_groups_skipped_by_page_index", 0) for sc in scans)
+                read = sum(sc.get("row_groups_read", 0) for sc in scans)
+                ok = same(got, want, order)
+                lf.collect(engine=default)
+                taken_default = ";".join(t["root"] for t in default.last_report.taken)
+
+                def cold():
+                    am.clear_parquet_cache()
+                    pe.clear_import_cache()
+
+                results = {}
+                for name, fn, setup in (
+                        ("polars in-memory", lambda: lf.collect(engine="in-memory"), None),
+                        ("polars streaming", lambda: lf.collect(engine="streaming"), None),
+                        ("MetalEngine all, cold", lambda: lf.collect(engine=every), cold),
+                        ("MetalEngine all, warm", lambda: lf.collect(engine=every), None),
+                        ("MetalEngine default, cold", lambda: lf.collect(engine=default), cold)):
+                    results[name] = best_of(fn, args.iters, setup)
+                am.clear_parquet_cache()
+                fastest = min(results["polars in-memory"][0], results["polars streaming"][0])
+                case = f"{label} [{codec}]"
+                for name, (wall, cpu) in results.items():
+                    is_metal = name.startswith("MetalEngine")
+                    is_default = name.startswith("MetalEngine default")
+                    row = {"rows": args.scan_rows, "case": case, "engine": name,
+                           "wall_ms": f"{wall:.3f}", "cpu_ms": f"{cpu:.1f}",
+                           "taken": (taken_default if is_default else taken) if is_metal else "",
+                           "fallbacks": fallbacks if is_metal and not is_default else "",
+                           "equal_to_polars": ok if is_metal else "",
+                           "vs_fastest_polars": f"{fastest / wall:.2f}" if is_metal else "",
+                           "row_groups_read_skipped": (f"{read}/{skipped}"
+                                                       if is_metal and not is_default else "")}
+                    rows_out.append(row)
+                    extra = ""
+                    if is_metal:
+                        extra = (f"  x{fastest / wall:.2f} vs fastest Polars; taken: "
+                                 f"{row['taken'] or 'nothing'}")
+                    print(f"  {case[:52]:<52} {name:<26} {wall:9.2f} ms {cpu:8.1f} CPU-ms{extra}")
+                if not ok:
+                    print(f"  !! {case}: MetalEngine result differs from Polars")
     if args.out:
+        fields = list(dict.fromkeys(k for r in rows_out for k in r))
+        for r in rows_out:
+            for k in fields:
+                r.setdefault(k, "")
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
         with open(args.out, "w", newline="") as fh:
             fh.write("# " + header + "\n")
-            w = csv.DictWriter(fh, fieldnames=list(rows_out[0]))
+            w = csv.DictWriter(fh, fieldnames=fields)
             w.writeheader()
             w.writerows(rows_out)
         print(f"\nwrote {args.out}")

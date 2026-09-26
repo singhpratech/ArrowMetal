@@ -55,6 +55,34 @@
 - The `polars` extra is `polars>=1.44,<1.45`, the minor the packaged plugin's ABI matches (it was
   `polars>=1.0`). Tiers 1 and 3 run on any `polars>=1.0`; tier 4 is tested on 1.44.1 and 1.44.2
   (docs/POLARS.md, "Which Polars").
+- `MetalEngine` takes a Polars `Scan` of one local Parquet file: the file is read on the GPU with
+  Polars' projection as the column list, the scan's predicate runs as a GPU filter over the read, and
+  its comparisons that row-group and page statistics can judge the way Polars compares (integers;
+  Strings `==`/`!=`; floats `<`, `<=`, `==` only, so NaN rows under `>`, `>=`, `!=` are never skipped)
+  also go to the reader. Several files, hive partitions, URLs, `row_index_name`, `n_rows`,
+  `include_file_paths`, `schema=`, unsupported dtypes, CSV and NDJSON scans stay with Polars, named in
+  `engine.last_report`, whose entries now list each file read, its filters and the row groups and
+  pages skipped. The defaults take a scan subtree on the same terms as an in-memory one. 50M rows:
+  a sort of two columns is 1.92-1.97x the faster Polars engine through a freshly opened file and
+  6.08-10.87x with the file open; `Benchmarks/results/polars_engine_scan_2026-09-25.csv`,
+  `polars_engine_bench.py --scan-only` (docs/POLARS.md, "Parquet scans").
+- A plan with `scan_ipc` under `MetalEngine` collects on Polars instead of failing: polars 1.44.1
+  raises `NotImplementedError` when an engine views that node, and the engine now leaves the node,
+  and what is above it, to Polars with that reason.
+- Open-file cache for Parquet: `read_parquet(..., cache=True)` / `read_parquet_table(..., cache=True)`
+  keep the opened, mapped file across reads, keyed by real path, inode, modification time and size
+  (a changed or replaced file is opened afresh), LRU-bounded by 16 files and a quarter of physical
+  memory (`parquet_cache_limit`), with `parquet_cache_info` and `clear_parquet_cache`. On the 50M-row,
+  8-column files a one-column read goes from 291-373 ms through a fresh open to 6.06-11.96 ms through
+  the cache (`Benchmarks/results/parquet_cache_2026-09-25.csv`, `parquet_bench.py --cache`;
+  docs/PARQUET.md, "The open-file cache").
+- Parquet SNAPPY dictionary pages, and SNAPPY dispatches of at most 16 pages, are decompressed on the
+  host by a bounds-checked decoder instead of one GPU SIMD group per page. A 1,000,000-row file with
+  an `int64` and a `float64` column in pyarrow's defaults read in 102-106 ms before (94 ms of it one
+  790 KB dictionary page) and 20-36 ms after; five columns of a 10,000,000-row, 7-column SNAPPY file
+  with the file open, 221 ms before and 57-66 ms after (docs/PARQUET.md, "Decompression").
+- `am_parquet_column_null_count` / `ParquetFile.column_null_count`: a top-level column's null count from
+  the footer (0 for a required column, else the sum of the row groups' statistics), without reading data.
 
 ## 0.2.0
 Everything below is new in 0.2.0.

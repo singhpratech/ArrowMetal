@@ -1,8 +1,9 @@
 # Parquet on the GPU
 
 ArrowMetal reads Apache Parquet with Metal compute kernels: from file bytes to Arrow arrays in shared
-memory, with the CPU reading column data only for the ZSTD, GZIP and BROTLI codecs, which are
-decompressed on the host straight into the shared buffer the GPU decoders read. Snappy and LZ4
+memory, with the CPU reading column data only for the ZSTD, GZIP and BROTLI codecs and for the
+SNAPPY pages the GPU would decode one at a time (dictionary pages, and chunks of a few pages), which
+are decompressed on the host straight into the shared buffer the GPU decoders read. Snappy and LZ4
 decompression, definition levels, dictionary indices, the delta encodings and `BYTE_STREAM_SPLIT` are
 all kernels. The host parses the Thrift footer and the per-page Thrift headers — metadata, not data —
 and everything after that runs on the GPU.
@@ -30,7 +31,8 @@ For one leaf column, across every selected row group at once:
 
 ```
   page headers (host, Thrift only)
-    -> decompression       GPU for SNAPPY / LZ4 / LZ4_RAW; host for ZSTD / GZIP / BROTLI;
+    -> decompression       GPU for SNAPPY / LZ4 / LZ4_RAW; host for ZSTD / GZIP / BROTLI and for
+                           SNAPPY dictionary pages and dispatches of at most 16 pages;
                            nothing at all for UNCOMPRESSED
     -> pq_page_layout      finds each page's level and value sections *inside* the page
     -> pq_decode_levels    definition levels -> one byte per row, plus each row's rank
@@ -147,6 +149,19 @@ A page that decompresses to nonsense is a separate question: the value decoders 
 the page they were given (a `BYTE_ARRAY` length field, for instance), so damaged bytes produce wrong
 *values* but never an out-of-bounds access and never an unbounded loop.
 
+A token stream is serial, so a page is one SIMD group's work however large it is, and a dispatch
+takes as long as its slowest page. That is fine across the hundreds of pages of a large column chunk
+and not for a page the GPU decodes on its own. A column chunk's dictionary page is one such page:
+pyarrow writes up to 1 MB of dictionary before falling back to `PLAIN`, and a 790 KB SNAPPY dictionary
+page of random `int64` values took about 94 ms on the GPU, where one CPU core decodes a Snappy block
+of that size and content in about 0.5 ms. So SNAPPY dictionary pages, and SNAPPY dispatches of at most 16 pages, are decompressed on the
+host by a bounds-checked Snappy decoder (`SnappyHost` in `Decompress.swift`), like the codecs below.
+Reading that file (1,000,000 rows, an `int64` and a `float64` column, pyarrow's defaults) went from
+102-106 ms to 20-36 ms per read on a busy machine, and five columns of a 10,000,000-row, 7-column
+SNAPPY file from 221 ms to 57-66 ms with the file open (305-358 ms to 105-133 ms through a fresh open).
+Data pages in larger dispatches stay on the GPU: 50 token-dense pages of 160 KB (one `int64` column of
+1,000,000 random values below 10^9) take 15.4 ms there, 123 pages of 64 KB 6.7 ms.
+
 `ZSTD`, `GZIP` and `BROTLI` are decompressed on the host, straight into the shared-memory buffer the GPU
 decoders read, with pages spread across cores by `DispatchQueue.concurrentPerform`. GZIP and BROTLI go
 through Foundation's Compression framework (`COMPRESSION_ZLIB` is raw DEFLATE, so the gzip container is
@@ -175,7 +190,7 @@ wrong data; that is the documented host fallback.
 | Codec | Where | Notes |
 |---|---|---|
 | `UNCOMPRESSED` | **GPU** (no work) | the mapped file is the page buffer |
-| `SNAPPY` | **GPU** | one SIMD group per page |
+| `SNAPPY` | **GPU**, host for dictionary pages and for dispatches of at most 16 pages | one SIMD group per page on the GPU |
 | `LZ4` | **GPU** | the Hadoop framing (big-endian sizes) is detected in the kernel |
 | `LZ4_RAW` | **GPU** | |
 | `ZSTD` | host | `dlopen` of libzstd; a clear error when it is missing |
@@ -292,6 +307,9 @@ total = cols["price"].sum()
 f = am.ParquetFile("trades.parquet")
 for day in days:
     px = f.read(columns=["price"], filters=[("day", "==", day)])["price"]
+
+# Or let the open-file cache hold it (below).
+px = am.read_parquet("trades.parquet", columns=["price"], cache=True)["price"]
 ```
 
 Only the requested column chunks are ever touched — the other columns' pages are never even faulted
@@ -322,7 +340,9 @@ the literal can still hold a NaN, which `!=` keeps. pyarrow's `read_table(filter
 group whose min and max both equal the literal, and so leaves out that group's NaN rows; ArrowMetal
 returns them (`test_not_equal_keeps_a_nan_row_group_where_pyarrow_drops_it`).
 `ParquetFile.selectedRowGroups(_:)` / `ParquetFile.selected_row_groups(...)` report what the row-group
-statistics keep without reading anything.
+statistics keep without reading anything, and `ParquetFile.column_null_count(column)`
+(`am_parquet_column_null_count`) a top-level column's null count: 0 for a `required` column, else
+the sum of the row groups' `null_count` statistics, or None when a row group does not record it.
 
 ### Page-level skipping
 
@@ -375,6 +395,70 @@ each) — and anything else keeps the row group. `ParquetFile.useBloomFilters` (
 `ParquetBloomFilterTests` checks xxHash64 against its published vectors and every value of the fixture
 against its row group's filter; `test_parquet_nested.py` looks up values in seven columns of a pyarrow
 file and one of a DuckDB file and requires pyarrow's exact matches with the filters on and off.
+
+## The open-file cache
+
+Opening a file maps it, and the first read of a column hands the mapped pages it covers to Metal; a
+`ParquetFile` keeps both for as long as it lives (above, "The file's bytes are the GPU's bytes"). A
+caller that cannot hold the handle itself — one `read_parquet` call per query, or the Polars engine,
+which sees a file path in every plan — reads through a process-wide cache of open files instead:
+
+```python
+cols = am.read_parquet("trades.parquet", columns=["price"], cache=True)   # opens and maps
+cols = am.read_parquet("trades.parquet", columns=["price"], cache=True)   # the same open file
+
+am.parquet_cache_info()     # {"entries", "bytes", "max_entries", "max_bytes", "hits", "misses",
+                            #  "invalidations", "files"}
+am.parquet_cache_limit(max_entries=4, max_bytes=8 << 30)
+am.clear_parquet_cache()
+```
+
+- **Keyed by the file's identity and state**: its real path, device, inode, modification time in
+  nanoseconds and size. A file rewritten in place (new size or new modification time) or replaced by
+  another under the same name (new inode) is opened afresh on its next read, and its stale entry is
+  dropped then (`invalidations` counts those).
+- **Bounded**: least recently used entries are evicted above `max_entries` (16 by default) or above
+  `max_bytes`, the sum of the cached files' sizes (a quarter of physical memory by default). A file
+  larger than `max_bytes` is read without being cached; `max_entries=0` turns the cache off.
+- **Shared**: reads of one cached file are serialised by a lock per file, so `last_read_stats`
+  belongs to the read that took it. Evicting or clearing an entry closes the file once the last read
+  holding it returns.
+- `read_parquet` without `cache=True` opens and closes the file on every call, as before.
+
+`python/tests/test_polars_engine.py` checks reuse, invalidation on a new size, a new modification time
+with the same size, a touched file and a replaced file, LRU order, both bounds and `clear`.
+
+Cold is the first read in the process (the cache cleared before each run; the file itself stays in
+the OS page cache), warm is the next read of the same file through the cache. 50,000,000 rows x 8
+columns, the files of `Benchmarks/parquet_bench.py`, best of 3,
+`Benchmarks/results/parquet_cache_2026-09-25.csv` (run conditions in
+`Benchmarks/results/polars_engine_scan_2026-09-25_conditions.txt`):
+
+| codec | file | measure | cold ms | warm ms |
+|---|---:|---|---:|---:|
+| snappy | 1.65 GB | open only | 5.66 | 0.04 |
+| snappy | | read `price` (400 MB of values) | 327.93 | 11.96 |
+| snappy | | read `price` + sum | 297.03 | 14.65 |
+| snappy | | read all 8 columns | 517.69 | 224.82 |
+| lz4 | 1.67 GB | open only | 7.73 | 0.04 |
+| lz4 | | read `price` | 291.18 | 10.69 |
+| lz4 | | read `price` + sum | 322.60 | 12.76 |
+| lz4 | | read all 8 columns | 531.89 | 185.06 |
+| none | 2.23 GB | open only | 7.89 | 0.04 |
+| none | | read `price` | 372.77 | 6.06 |
+| none | | read `price` + sum | 300.06 | 7.87 |
+| none | | read all 8 columns | 457.17 | 45.36 |
+
+Opening the file (the footer and the mapping) is 6-8 ms. The rest of the cold cost is the first read's
+hand-off of the mapped pages to Metal and the faults of a fresh mapping: 280-370 ms on a one-column
+read, which the warm read does not pay. The run shared the machine with other work (load average 11
+at its start), so the cold column moves by tens of milliseconds between runs, as the `read price` and
+`read price + sum` rows show.
+
+```
+PYTHONPATH=python python Benchmarks/parquet_bench.py --rows 50000000 --codecs snappy,lz4,none \
+    --cache --skip-main --keep --cache-out parquet_cache.csv
+```
 
 ## Benchmarks
 

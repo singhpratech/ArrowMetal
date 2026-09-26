@@ -1574,6 +1574,11 @@ int64_t am_parquet_schema_metadata(am_parquet_file* f, uint8_t* out, int64_t cap
 int     am_parquet_set_page_index(am_parquet_file* f, int enabled);
 int     am_parquet_set_bloom_filters(am_parquet_file* f, int enabled);
 int64_t am_parquet_last_read_stats(am_parquet_file* f, int64_t* out, int64_t cap);
+// How many nulls a top-level column holds according to the file's metadata alone, without reading it:
+// 0 for a `required` column, otherwise the sum of the row groups' null_count statistics. -1 when that
+// is not known (a row group without the statistic, or a struct, list or map column); -2 on a bad
+// argument (a NULL handle or name, or no top-level column of that name).
+int64_t am_parquet_column_null_count(am_parquet_file* f, const char* column);
 
 // Filter text details (am_parquet_read_ex, am_parquet_selected_row_groups): the operator is the first
 // one after the column name, so a name cannot hold = ! < > or ;. Inside a double-quoted literal, `;` is

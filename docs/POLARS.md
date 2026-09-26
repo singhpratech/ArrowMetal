@@ -428,9 +428,11 @@ Read from the installed package and checked by `python/tests/test_polars_engine.
   its rows in the profile).
 * `set_udf` turns the current node into a `PythonScan` whose function Polars calls as
   `f(with_columns, predicate, n_rows, should_time)`. That function takes no input, so **a replaced
-  subtree is a leaf**: the only subtrees that can move are ones whose leaves are all in-memory
-  frames (`DataFrameScan`). A file scan (`Scan`, `PythonScan`) stays with Polars, and so does
-  everything above it.
+  subtree is a leaf**: the only subtrees that can move are ones whose leaves are in-memory frames
+  (`DataFrameScan`) or Parquet files the engine reads itself (`Scan`, below). Any other scan
+  (`PythonScan`, a CSV or IPC `Scan`) stays with Polars, and so does everything above it.
+* `view_current_node` raises `NotImplementedError: ipc scan` for a `scan_ipc` node. The engine
+  leaves such a node, and everything above it, to Polars and names it in the report.
 * Polars does not check the replacement's output. The engine does: a frame whose schema is not
   the one `get_schema()` promised raises `ArrowMetalError` inside the query.
 * An exception from the callback reaches the user as
@@ -453,6 +455,7 @@ Read from the installed package and checked by `python/tests/test_polars_engine.
 | Polars node | ArrowMetal | Taken when |
 |---|---|---|
 | `DataFrameScan` | `scan` | every column it reads (after Polars' projection pushdown) is an integer, float, Boolean, String, Date, Datetime, Duration or Time |
+| `Scan` of Parquet | the file read on the GPU (`am.read_parquet`, through the open-file cache), then `scan` over the columns it returned, with the scan's predicate as a `filter` | one local file (a list or a glob that resolves to one file counts); every column it reads (Polars' projection is the reader's column list) is one of the `DataFrameScan` types above and a top-level column of the file; no hive partitions, `row_index_name`, `n_rows` (a `head`, `tail` or `slice` Polars pushed into the scan), `include_file_paths`, `schema=`, deletion files or column mapping; something above it does GPU work. See "Parquet scans" below |
 | `Filter` | `filter` | the predicate translates; Polars' `dynamic_pred` hints (which `sort().head()` inserts) are dropped |
 | `Select`, `HStack` | kept virtual: each output is an s-expression over the physical columns, computed where it is used or in one `select` at the top | every output translates and is numeric or Boolean (a bare column of any carried type is carried) |
 | `Select` whose every output is an aggregate | `aggregate` | each output is one of the aggregates in the last row of the expression table |
@@ -462,7 +465,7 @@ Read from the installed package and checked by `python/tests/test_polars_engine.
 | `GroupBy` | `group_by` | keys are non-float columns; `maintain_order=False`; not rolling or dynamic |
 | `Join` | `join` | inner, left, semi or anti; key columns of equal, non-float dtypes (String, multi-column and temporal keys included); `nulls_equal=False` (null keys never match, on both engines); `maintain_order="none"`; no pushed-in slice; the output names are the ones ArrowMetal's join gives (left columns, then right columns without a same-named key, the suffix on a collision), which covers Polars' coalescing defaults and `left_on`/`right_on` with different names |
 | `Distinct` (`unique`) | `unique` | `keep="first"` or `"any"` (ArrowMetal keeps each group's first row, a valid `"any"`); `maintain_order=False`; no float column in the subset |
-| everything else (`Union`, `HConcat`, `Cache`, `MapFunction`, `MergeSorted`, `ExtContext`, `Sink`, `Scan`, `PythonScan`, and right, full, cross and as-of joins) | -- | stays with Polars, named in the report |
+| everything else (`Union`, `HConcat`, `Cache`, `MapFunction`, `MergeSorted`, `ExtContext`, `Sink`, `PythonScan`, a CSV, IPC or NDJSON `Scan`, and right, full, cross and as-of joins) | -- | stays with Polars, named in the report |
 
 | Expression | ArrowMetal |
 |---|---|
@@ -592,7 +595,7 @@ cold` rows, where above 1 is ahead; 2M rows first, then 50M), the quiet run says
   50M, `(h) as-of join` 7.039 ms against 7.116 ms and 152.100 ms against 151.741 ms.
 
 So `MetalEngine()` takes a subtree when every shape in it is a full sort (`MEASURED_SHAPES`), none of
-its inputs is a String column, and its in-memory inputs hold at least 1,000,000 rows -- 10,000,000
+its inputs is a String column, and its inputs (in-memory frames and Parquet files) hold at least 1,000,000 rows -- 10,000,000
 when a helper key is needed. 1,000,000 is the crossover against the fastest CPU library of the
 operations a full sort runs (the engine's `sort` is a `lexsort` and a `take`, [ENGINE.md](ENGINE.md))
 in `Benchmarks/results/router_2026-09-24.json`: `argsort int64`, `argsort float64` and `lexsort (2
@@ -638,6 +641,72 @@ polars_engine.clear_import_cache()      # and with it the Polars buffers it kept
 The "warm" column of the results file is a second collect over the same frame; the defaults above
 were read from the cold one.
 
+### Parquet scans
+
+```python
+lf = (pl.scan_parquet("trades.parquet")
+        .filter(pl.col("price") > 500.0)
+        .group_by("qty").agg(pl.col("weight").sum()))
+lf.collect(engine=am.MetalEngine(shapes="all"))
+```
+
+A `Scan` of one local Parquet file becomes a leaf the engine reads itself, so the subtree above it
+needs no import at all: the columns are decoded on the GPU straight into Metal memory
+([PARQUET.md](PARQUET.md)) and the plan runs over them.
+
+* **Projection.** The columns Polars' projection pushdown left on the `Scan` are the reader's column
+  list; no other column chunk is touched. Dictionary-encoded columns are read materialised, which
+  is what Polars reads them as.
+* **Predicate.** Polars pushes a filter into the `Scan` as its predicate. The engine translates it
+  like any `Filter` and runs it on the GPU over the rows the reader returns. The comparisons in it
+  that the file's statistics can judge the way Polars compares go to the reader as well, which skips
+  row groups (and, with a page index, pages) that cannot hold a matching row: a comparison of a
+  column with a literal, joined by `&`, on an integer column (all six operators), a String column
+  (`==`, `!=`) or a float column (`<`, `<=` and `==` only, against a literal exact in the column's
+  type). Polars orders NaN above every number, so NaN rows pass `>`, `>=` and `!=`, and writers leave
+  NaN out of min/max; those three never reach the reader for a float column, so `!= x` keeps a NaN
+  in a row group whose statistics say x .. x (the case of apache/arrow#51491). `|`, functions and
+  comparisons of two columns stay on the GPU filter only. A `Filter` Polars left directly above the
+  `Scan` (with its predicate pushdown off) is handed to the reader the same way.
+  `scan_parquet(use_statistics=False)` hands it nothing.
+* **Nulls.** A column is treated as nullable unless the footer's statistics say it holds no null
+  (`ParquetFile.column_null_count`), so a sort by a column without nulls needs no validity key. The
+  read checks the footer's word, and a file whose data holds nulls its statistics deny fails the
+  query with `ArrowMetalError` rather than answering differently.
+* **The open file is kept.** The reader goes through the open-file cache
+  ([PARQUET.md](PARQUET.md), "The open-file cache"), keyed by the file's path, inode, modification
+  time and size, so the second query over a file does not map it again, and a rewritten file is read
+  afresh. `am.clear_parquet_cache()` and `am.parquet_cache_limit()` control it.
+* **Checked once per plan and file.** As for in-memory inputs, the plan first runs over a prefix
+  of the file (64 rows of its first row group) and its output schema is compared with Polars'. A
+  file whose stored Arrow schema Polars applies and ArrowMetal's reader does not (one with a
+  different number of fields than the file, which Arrow's own reader ignores) fails that check or
+  names a column the file does not have, and stays with Polars.
+* **A bare scan stays with Polars.** A `Scan` with nothing above it that does GPU work is Polars'
+  to read.
+
+What stays with Polars, with the reason in the report: several files (a list, or a glob or
+directory that matches more than one), hive partition columns, a URL or cloud path (`file://`
+included), `row_index_name`, `n_rows` (and a `head`, `tail` or `slice` Polars pushed into the scan),
+`include_file_paths`, `schema=`, deletion files, column mapping, a column whose dtype the plan does
+not carry (Decimal, Categorical, Enum, List, Struct, Binary, ...), a predicate that does not
+translate, and CSV and NDJSON scans. polars 1.44.1 cannot show an IPC scan to an engine
+(`NodeTraverser.view_current_node` raises `NotImplementedError: ipc scan`), so `scan_ipc` stays with
+Polars as well.
+
+Each taken subtree's report entry lists what the reader did (`scans`: the file, the filters it was
+given, row groups read and skipped, pages skipped):
+
+```
+  metal:  GroupBy#2 [GroupBy > SimpleProjection > Scan] over 50,000,000 rows, ran in <t> ms -> 1,000 rows
+          parquet /data/bench-none-50000000.parquet: filters [('id', '<', 5000000)], 5 row groups read, 45 skipped, 0 pages skipped
+```
+
+The defaults apply unchanged: a scan subtree is taken by `MetalEngine()` when every shape in it is
+a full sort without a helper key, none of its columns is a String, and the file holds at least
+1,000,000 rows. The scan cases below are in line with that: the sort is ahead of both Polars engines
+cold and warm, and the filter, group-by and aggregate cases are behind cold.
+
 ### The report
 
 ```
@@ -677,6 +746,18 @@ checks the result is still Polars' and the report names the reason. One case rer
 `test_polars.py` and `test_lazy.py` with every `LazyFrame.collect()` also collected through the engine
 (`python/tests/metal_engine_everywhere.py`) and requires the two to agree.
 
+The Parquet scan cases (212 tests) run fourteen scan shapes -- filters over every numeric dtype,
+Polars' float total order, `!=`, String predicates, projections, group-by on one and two keys,
+whole-file aggregates, sorts with nulls at both ends, top-k, a join with an in-memory frame and
+`unique` -- over one 20,011-row dataset with nulls, NaN, -0.0 and infinities written by pyarrow
+(snappy; uncompressed with a page index and no dictionary; ZSTD with v2 pages), by Polars and by
+DuckDB; a filter, a sort and an aggregate over the flat columns of 30 nested fixtures from all three
+writers; seventeen predicate-pushdown cases on every writer, each checking the answer, the filters
+the reader was given and the row groups it skipped, including NaN under `>`, `>=` and `!=` (the
+apache/arrow#51491 shape, also on the `pageindexnan__pa_constpage` fixture); every fallback reason
+above; the open-file cache's reuse, invalidation and bounds; and footer null counts, including a file
+whose statistics deny its nulls.
+
 ### To verify on your own machine
 
 0. `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c release --product ArrowMetalC`,
@@ -699,8 +780,8 @@ checks the result is still Polars' and the report names the reason. One case rer
 
 ## Numbers
 
-These are tiers 1 and 2; tier 4's measurements are in
-`Benchmarks/results/polars_engine_bench_2026-09-24.csv` (see "Tier 4" above).
+These are tiers 1 and 2, and tier 4 over a Parquet file at the end; tier 4's measurements over
+in-memory frames are in `Benchmarks/results/polars_engine_bench_2026-09-24.csv` (see "Tier 4" above).
 
 Apple M4 Max, macOS 26.6.2, polars 1.44.1 (16 threads), pyarrow 25.0.1, ArrowMetal 0.1.0. Best of 5
 runs after a warm-up, one process, one data set. Every figure below is from
@@ -762,7 +843,47 @@ pyarrow's Acero are on the Compare tab and in the benchmark matrix.
 | Tier 1, resident | You run several kernels over the same column. `to_metal()` once, then every kernel in the table above is 0.8-10.5 ms. |
 | Tier 2 | The GPU op belongs inside a plan you want Polars to keep optimising -- scans, pushdown, and lazy composition still apply. |
 | Tier 3 | Polars should do the IO and the reshaping and ArrowMetal should do one heavy pass at the end. |
-| Tier 4 | You want Polars' own `collect()` and its answers, with the parts of the plan the GPU is measured ahead on (by default, large sorts of in-memory frames) run there. |
+| Tier 4 | You want Polars' own `collect()` and its answers, with the parts of the plan the GPU is measured ahead on (by default, large sorts of in-memory frames and Parquet files) run there. |
+
+### Tier 4 over a Parquet file, 50M rows
+
+`pl.scan_parquet(file)` under a filter, a group-by, an aggregate or a sort, over the 50,000,000-row,
+8-column files of `Benchmarks/parquet_bench.py` (snappy, 1.65 GB, and uncompressed, 2.23 GB),
+collected by Polars' in-memory and streaming engines and by `MetalEngine(shapes="all", min_rows=0)`.
+"cold" clears the open-file cache before every run, so the engine opens and maps the file each time;
+"warm" keeps it open between runs. Polars reads the file on every run; the file stays in the OS page
+cache throughout. Best of 5, every engine result equal to Polars',
+`Benchmarks/results/polars_engine_scan_2026-09-25.csv`. The run shared the machine with other work: the
+load average was 17.4 at its start and 25.6 at its end
+(`Benchmarks/results/polars_engine_scan_2026-09-25_conditions.txt`).
+
+| case | codec | Polars in-memory | Polars streaming | MetalEngine cold | MetalEngine warm | `MetalEngine()` default, cold |
+|---|---|---:|---:|---:|---:|---:|
+| (s1) filter `price > 500`, group-by `qty` (1,000 keys), sum + count | snappy | 171.67 ms | 57.27 ms | 375.78 ms | 96.59 ms | 152.57 ms (Polars) |
+| | none | 170.05 ms | 56.54 ms | 426.71 ms | **42.02 ms** | 156.97 ms (Polars) |
+| (s2) filter `id < 5,000,000` (45 of 50 row groups skipped), group-by, sum | snappy | 34.66 ms | 15.43 ms | 68.90 ms | 33.99 ms | 46.20 ms (Polars) |
+| | none | 30.57 ms | 8.27 ms | 45.95 ms | 8.84 ms | 28.55 ms (Polars) |
+| (s3) filter on two columns, sum + count | snappy | 16.77 ms | 17.62 ms | 314.39 ms | 19.62 ms | 21.55 ms (Polars) |
+| | none | 17.04 ms | 15.91 ms | 342.23 ms | **15.67 ms** | 17.77 ms (Polars) |
+| (s4) sort 2 columns by a Float64 key | snappy | 934.92 ms | 885.43 ms | **449.43 ms** | **145.54 ms** | **451.97 ms** (Metal) |
+| | none | 823.39 ms | 877.25 ms | **429.51 ms** | **75.72 ms** | **463.46 ms** (Metal) |
+
+* **The sort is ahead cold and warm**: 1.97x and 1.92x the faster Polars engine cold, 6.08x and
+  10.87x warm, and the default takes it (1.96x and 1.78x).
+* **Cold, the other three are to improve.** The cold runs include what the open-file cache removes:
+  opening the file and handing the pages the query reads to Metal, 280-370 ms for a one-column read
+  of these files ([PARQUET.md](PARQUET.md), "The open-file cache"). The default leaves them to Polars.
+* **Warm**, (s1) over the uncompressed file is ahead of Polars' streaming engine (42.02 ms against
+  56.54, 1.35x) and (s3) level with it (1.02); (s2) is at 0.94 on the uncompressed file. Over the
+  Snappy file, which the GPU decompresses first ([PARQUET.md](PARQUET.md), "What the numbers say"),
+  (s1) is 0.59, (s2) 0.45 and (s3) 0.85.
+* **CPU time**: the warm engine runs cost 5.8-14.9 ms of process CPU, against 51.3-7399.7 ms for
+  Polars (`cpu_ms`).
+
+```
+PYTHONPATH=python python Benchmarks/polars_engine_bench.py --scan-only --scan-rows 50000000 \
+    --scan-codecs snappy,none --out scan.csv
+```
 
 ---
 

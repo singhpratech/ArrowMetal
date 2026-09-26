@@ -185,6 +185,39 @@ def warm_first_compute(path, repeat):
     print("%-24s %10.0f %10.0f" % ("pyarrow.ParquetFile", best_r, best_s))
 
 
+def cache_cold_warm(path, codec, repeat):
+    """The open-file cache (`read_parquet(..., cache=True)`, docs/PARQUET.md): the first read of a
+    file in the process opens and maps it and hands the pages it reads to Metal; the next read of
+    the same unchanged file finds the open file in the cache. "cold" clears the cache before every
+    run (the file itself stays in the OS page cache), "warm" reads through a cache that already holds
+    the file. Best of `repeat` runs each."""
+    cases = [
+        ("open only", lambda: am._parquet_files.get(path)),
+        ("read price", lambda: am.read_parquet(path, columns=["price"], cache=True)),
+        ("read price + sum", lambda: am.read_parquet(path, columns=["price"], cache=True)["price"].sum()),
+        ("read all 8 columns", lambda: am.read_parquet(path, cache=True)),
+    ]
+    rows = []
+    print("%-22s %10s %10s %10s" % ("through the cache", "cold ms", "warm ms", "cold-warm"))
+    for name, fn in cases:
+        cold = warm = None
+        for _ in range(repeat):
+            am.clear_parquet_cache()
+            out, w, _c = timed(fn)
+            del out
+            cold = w if cold is None else min(cold, w)
+        am.clear_parquet_cache()
+        fn()
+        for _ in range(repeat):
+            out, w, _c = timed(fn)
+            del out
+            warm = w if warm is None else min(warm, w)
+        am.clear_parquet_cache()
+        print("%-22s %10.2f %10.2f %10.2f" % (name, cold, warm, cold - warm))
+        rows.append((codec, name, cold, warm))
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", type=int, default=50_000_000)
@@ -195,15 +228,18 @@ def main():
     ap.add_argument("--codec-scan", action="store_true",
                     help="also measure per-codec decompression throughput on one column")
     ap.add_argument("--page-size", type=int, default=1 << 20)
-    ap.add_argument("--skip-main", action="store_true", help="only run --codec-scan")
+    ap.add_argument("--skip-main", action="store_true", help="only run --codec-scan / --cache")
+    ap.add_argument("--cache", action="store_true",
+                    help="also measure reads through the open-file cache, cold and warm")
+    ap.add_argument("--cache-out", default=None, help="write the --cache rows to this CSV")
     args = ap.parse_args()
 
     os.makedirs(args.dir, exist_ok=True)
     print("device: %s" % am.device_name())
     print("rows:   {:,}".format(args.rows))
-    rows_out = []
+    rows_out, cache_rows = [], []
     try:
-        for codec in ([] if args.skip_main else args.codecs.split(",")):
+        for codec in ([] if args.skip_main and not args.cache else args.codecs.split(",")):
             path = os.path.join(args.dir, "bench-%s-%d.parquet" % (codec, args.rows))
             if not complete(path):
                 t0 = time.perf_counter()
@@ -211,6 +247,11 @@ def main():
                 print("wrote %s (%.2f GB) in %.1f s" % (os.path.basename(path), size / 1e9,
                                                         time.perf_counter() - t0))
             size = os.path.getsize(path)
+            if args.cache:
+                print("\n=== %s, %.2f GB on disk: the open-file cache ===" % (codec, size / 1e9))
+                cache_rows += cache_cold_warm(path, codec, max(args.repeat, 3))
+            if args.skip_main:
+                continue
             mb = size / 1e6
             print("\n=== %s, %.2f GB on disk ===" % (codec, size / 1e9))
             print("%-20s %10s %10s %10s %10s" % ("reader", "wall ms", "cpu ms", "MB/s", "ttfc ms"))
@@ -236,6 +277,18 @@ def main():
     finally:
         if not args.keep:
             shutil.rmtree(args.dir, ignore_errors=True)
+
+    if cache_rows and args.cache_out:
+        import csv
+        os.makedirs(os.path.dirname(args.cache_out) or ".", exist_ok=True)
+        with open(args.cache_out, "w", newline="") as fh:
+            fh.write("# ArrowMetal %s on %s, %s rows x 8 columns, 1 MB pages, best of %d\n"
+                     % (am.version(), am.device_name(), args.rows, max(args.repeat, 3)))
+            w = csv.writer(fh)
+            w.writerow(["codec", "measure", "cold_ms", "warm_ms"])
+            for codec, name, cold, warm in cache_rows:
+                w.writerow([codec, name, "%.2f" % cold, "%.2f" % warm])
+        print("wrote %s" % args.cache_out)
 
     print("\nmarkdown:")
     print("| codec | reader | wall ms | CPU ms | MB/s | time to first compute (ms) |")

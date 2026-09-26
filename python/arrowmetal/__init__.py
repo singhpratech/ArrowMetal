@@ -4227,6 +4227,8 @@ _lib.am_parquet_set_bloom_filters.argtypes = [_P, ctypes.c_int]
 _lib.am_parquet_set_bloom_filters.restype = ctypes.c_int
 _lib.am_parquet_last_read_stats.argtypes = [_P, ctypes.POINTER(ctypes.c_int64), ctypes.c_int64]
 _lib.am_parquet_last_read_stats.restype = ctypes.c_int64
+_lib.am_parquet_column_null_count.argtypes = [_P, ctypes.c_char_p]
+_lib.am_parquet_column_null_count.restype = ctypes.c_int64
 
 
 def _parquet_metadata(call):
@@ -4382,7 +4384,7 @@ class ParquetFile:
 
     def __del__(self):
         h = getattr(self, "_h", None)
-        if h:
+        if h and _lib is not None:        # at interpreter exit the module may already be torn down
             _lib.am_parquet_close(h)
             self._h = None
 
@@ -4528,6 +4530,15 @@ class ParquetFile:
                 "pages_decoded", "pages_skipped", "rows", "row_groups_skipped_by_bloom_filter")
         return dict(zip(keys, (int(v) for v in buf)))
 
+    def column_null_count(self, column):
+        """How many nulls a top-level column holds according to the footer alone (0 for a `required`
+        column, else the sum of the row groups' null_count statistics), or None when the footer does not
+        say (a row group without the statistic, or a struct, list or map column). Reads no data."""
+        n = _lib.am_parquet_column_null_count(self._h, str(column).encode())
+        if n == -2:
+            _check(1)
+        return None if n < 0 else int(n)
+
     def _arrow_schema(self, names, arrays):
         fields = []
         for name, arr in zip(names, arrays):
@@ -4540,7 +4551,133 @@ class ParquetFile:
         return pa.schema(fields, metadata=self.schema_metadata or None)
 
 
-def read_parquet(path, columns=None, row_groups=None, filters=None, dictionary=True):
+# ---- The open-file cache (docs/PARQUET.md, "The open-file cache")
+#
+# Opening a Parquet file maps it and, on the first read of a column, hands the mapped pages to Metal
+# (`makeBuffer(bytesNoCopy:)`); a `ParquetFile` keeps both for as long as it lives. The cache keeps
+# opened files across reads, keyed by the file's identity and state -- real path, device, inode,
+# modification time in nanoseconds and size -- so a second read of an unchanged file reuses the
+# mapping, and a file that was rewritten, replaced or truncated is opened afresh (its stale entry is
+# dropped on that lookup). Entries are evicted least recently used above an entry count and a byte
+# budget (the sum of the cached files' sizes). `read_parquet(..., cache=True)` and the Polars engine's
+# Parquet scan read through it.
+
+class _ParquetFileCache:
+    def __init__(self):
+        import threading
+        self.lock = threading.Lock()
+        self.entries = {}                 # key -> [ParquetFile, size, lock]; insertion order is LRU order
+        self.by_path = {}                 # real path -> the key cached for it
+        self.max_entries = 16
+        try:
+            self.max_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // 4
+        except (ValueError, OSError, AttributeError):
+            self.max_bytes = 4 << 30
+        self.hits = self.misses = self.invalidations = 0
+
+    @staticmethod
+    def key(path):
+        real = os.path.realpath(os.fspath(path))
+        st = os.stat(real)
+        return (real, st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+
+    def _drop(self, key):
+        e = self.entries.pop(key, None)
+        if e is not None and self.by_path.get(key[0]) == key:
+            del self.by_path[key[0]]
+        return e
+
+    def _evict(self):
+        total = sum(e[1] for e in self.entries.values())
+        while self.entries and (len(self.entries) > self.max_entries or total > self.max_bytes):
+            k = next(iter(self.entries))
+            total -= self._drop(k)[1]
+
+    def get(self, path):
+        """`(key, ParquetFile, lock)` for `path`, opening it when no entry matches its current state.
+        The lock serialises reads on the shared handle, so `last_read_stats` belongs to the read that
+        took it."""
+        import threading
+        key = self.key(path)
+        with self.lock:
+            e = self.entries.pop(key, None)
+            if e is not None:
+                self.entries[key] = e             # most recently used
+                self.hits += 1
+                return key, e[0], e[2]
+            old = self.by_path.get(key[0])
+            if old is not None:                   # the file changed since it was cached
+                self._drop(old)
+                self.invalidations += 1
+            self.misses += 1
+        f = ParquetFile(key[0])
+        with self.lock:
+            e = self.entries.get(key)
+            if e is None:
+                if self.max_entries <= 0 or key[4] > self.max_bytes:
+                    return key, f, threading.Lock()
+                e = [f, key[4], threading.Lock()]
+                self.entries[key] = e
+                self.by_path[key[0]] = key
+                self._evict()
+            return key, e[0], e[2]
+
+    def clear(self):
+        with self.lock:
+            self.entries.clear()
+            self.by_path.clear()
+
+
+_parquet_files = _ParquetFileCache()
+
+
+def _close_cached_parquet_files():
+    _parquet_files.clear()
+
+
+import atexit as _atexit                    # noqa: E402
+_atexit.register(_close_cached_parquet_files)
+
+
+def parquet_cache_info():
+    """`{"entries", "bytes", "max_entries", "max_bytes", "hits", "misses", "invalidations", "files"}` for
+    the open-Parquet-file cache (`bytes` is the sum of the cached files' sizes)."""
+    c = _parquet_files
+    with c.lock:
+        return {"entries": len(c.entries), "bytes": sum(e[1] for e in c.entries.values()),
+                "max_entries": c.max_entries, "max_bytes": c.max_bytes, "hits": c.hits,
+                "misses": c.misses, "invalidations": c.invalidations,
+                "files": [k[0] for k in c.entries]}
+
+
+def parquet_cache_limit(max_entries=None, max_bytes=None):
+    """The open-file cache's bounds; with arguments, sets them (evicting least recently used entries
+    above them; `max_entries=0` turns the cache off) and returns `(max_entries, max_bytes)`. The
+    defaults are 16 files and a quarter of physical memory."""
+    c = _parquet_files
+    with c.lock:
+        if max_entries is not None:
+            c.max_entries = int(max_entries)
+        if max_bytes is not None:
+            c.max_bytes = int(max_bytes)
+        c._evict()
+        return c.max_entries, c.max_bytes
+
+
+def clear_parquet_cache():
+    """Closes every cached Parquet file (a handle a read still holds closes when that read is done)."""
+    _parquet_files.clear()
+
+
+def _cached_parquet_read(path, columns=None, row_groups=None, filters=None, dictionary=True):
+    """One read through the open-file cache: `(ColumnSet, last_read_stats, num_rows)`."""
+    _key, f, lock = _parquet_files.get(path)
+    with lock:
+        cols = f.read(columns=columns, row_groups=row_groups, filters=filters, dictionary=dictionary)
+        return cols, f.last_read_stats, f.num_rows
+
+
+def read_parquet(path, columns=None, row_groups=None, filters=None, dictionary=True, cache=False):
     """Reads a Parquet file on the GPU and returns a `ColumnSet` (a `{name: MetalArray}` mapping that
     keeps its columns positionally, so a name asked for twice comes back twice).
 
@@ -4551,18 +4688,27 @@ def read_parquet(path, columns=None, row_groups=None, filters=None, dictionary=T
     epoch, or ticks in the column's unit), and any other value raises. `dictionary=False`
     materialises dictionary-encoded columns instead of returning them dictionary encoded; either way
     the compute functions accept the column, decoding a dictionary for you when they must.
+    `cache=True` reads through the open-file cache (`parquet_cache_info`), so the next read of the
+    same unchanged file skips opening and mapping it.
 
         import arrowmetal as am
         cols = am.read_parquet("trades.parquet", columns=["price", "qty"],
                                filters=[("price", ">", 100)])
         total = cols["price"].sum()          # already on the GPU; no import step
     """
+    if cache:
+        return _cached_parquet_read(path, columns, row_groups, filters, dictionary)[0]
     with ParquetFile(path) as f:
         return f.read(columns=columns, row_groups=row_groups, filters=filters, dictionary=dictionary)
 
 
-def read_parquet_table(path, columns=None, row_groups=None, filters=None, dictionary=False):
+def read_parquet_table(path, columns=None, row_groups=None, filters=None, dictionary=False, cache=False):
     """`read_parquet` exported as a `pyarrow.Table`."""
+    if cache:
+        _key, f, lock = _parquet_files.get(path)
+        with lock:
+            return f.read_table(columns=columns, row_groups=row_groups, filters=filters,
+                                dictionary=dictionary)
     with ParquetFile(path) as f:
         return f.read_table(columns=columns, row_groups=row_groups, filters=filters, dictionary=dictionary)
 

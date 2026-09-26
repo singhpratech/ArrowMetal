@@ -217,6 +217,15 @@ import, so neither touches the whole table. `explain()` is the exception: it reg
 every row, because the `n/m columns` it prints and the cardinalities that pick a join order are
 statements about the real table.
 
+A source can also be columns that were never anywhere but the GPU. A `_Source` takes `MetalArray`s
+as well as Arrow arrays, and a `MetalArray` is used as it is, with no import. That is how the Polars
+engine runs a Parquet scan ([POLARS.md](POLARS.md), "Parquet scans"): it reads the columns Polars'
+projection names with `am.read_parquet` through the open-file cache ([PARQUET.md](PARQUET.md), "The
+open-file cache"), the decoder writes them straight into Metal shared memory, and the plan scans those
+arrays. The row groups and pages the reader skipped by statistics never reach the plan; the plan's
+`filter` still runs over every row the reader returned, so the answer does not depend on what was
+skipped.
+
 That leaves the one cost that cannot be cached away: the first `collect()` in a process generates and
 compiles MSL for the kernels its plan lowers to; every later run finds them in `MetalContext`'s pipeline
 cache. `q.warmup()` runs the plan over 4096 rows per source to move that cost off the first real query.

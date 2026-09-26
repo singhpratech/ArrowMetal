@@ -442,3 +442,33 @@ public func am_parquet_last_read_stats(_ f: OpaquePointer?, _ out: UnsafeMutable
     if let out { for (i, v) in values.enumerated() where i < Int(cap) { out[i] = Int64(v) } }
     return Int64(values.count)
 }
+
+/// How many nulls a top-level column holds according to the file's metadata alone: 0 for a `required`
+/// column, otherwise the sum of every row group's `null_count` statistic. -1 when that is not known: a
+/// row group without the statistic, or a column that is not a top-level leaf (a struct, list or map).
+/// -2 on a bad argument, with a message behind it.
+@_cdecl("am_parquet_column_null_count")
+public func am_parquet_column_null_count(_ f: OpaquePointer?, _ column: UnsafePointer<CChar>?) -> Int64 {
+    guard let file = pqFile(f) else {
+        pqStoreMessage("am_parquet_column_null_count: `f` is NULL (no open file)")
+        return -2
+    }
+    guard let column else {
+        pqBadArgument("am_parquet_column_null_count", "`column` is NULL")
+        return -2
+    }
+    let name = String(cString: column)
+    guard let field = file.fields.first(where: { $0.name == name }) else {
+        pqBadArgument("am_parquet_column_null_count", "no top-level column named \"\(name)\"")
+        return -2
+    }
+    guard case .leaf(let leaf) = field.kind else { return -1 }
+    if !leaf.isNullable { return 0 }
+    var total: Int64 = 0
+    for rg in file.metadata.rowGroups {
+        guard leaf.index < rg.columns.count, let n = rg.columns[leaf.index].meta.statistics?.nullCount,
+              n >= 0 else { return -1 }
+        total += n
+    }
+    return total
+}

@@ -16,7 +16,9 @@ whatever sits above a replaced subtree. So every plan collects: the worst case i
 Which subtrees can be taken
 ---------------------------
 A replaced subtree becomes a leaf of the Polars plan (it takes no input), so the only subtrees that
-can move are ones whose leaves are all in-memory frames (`DataFrameScan`). Inside such a subtree the
+can move are ones whose leaves are in-memory frames (`DataFrameScan`) or Parquet files the engine
+reads itself (`Scan` of one local Parquet file, read on the GPU through the open-file cache, with
+Polars' projection and the comparisons of its predicate handed to the reader). Inside such a subtree the
 engine takes `Filter`, `Select`, `HStack` (`with_columns`), `SimpleProjection`, `Slice`, `Sort`
 (with a pushed-in slice, which ArrowMetal runs as top-k), `GroupBy`, all-aggregate `Select`s,
 inner/left/semi/anti `Join`s and `Distinct` (`unique`), over the expressions and dtypes listed in
@@ -63,6 +65,7 @@ from polars._plr import _ir_nodes as _in  # noqa: F401  (the node classes; teste
 from polars.lazyframe.engine import _LocalEngine
 
 from . import ArrowMetalError, MetalArray, lazy as _lazy
+from . import _cached_parquet_read, _parquet_files
 
 __all__ = ["MetalEngine", "MetalPlanReport", "TESTED_IR_VERSION", "TESTED_POLARS", "MEASURED_SHAPES",
            "clear_import_cache", "import_cache_limit", "import_cache_info"]
@@ -110,6 +113,14 @@ _CARRY_TYPES = (pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.U
                 pl.Float32, pl.Float64, pl.Boolean, pl.String, pl.Date, pl.Datetime, pl.Duration,
                 pl.Time)
 
+
+
+def _float32_round_trip(v):
+    """v as a Float32 would hold it, or None when Float32 cannot hold it at all (no NumPy needed)."""
+    try:
+        return struct.unpack("f", struct.pack("f", v))[0]
+    except (OverflowError, struct.error):
+        return None
 
 def _code(dt):
     """ArrowMetal's expression type name for a Polars dtype, or None when a fused kernel cannot
@@ -246,7 +257,8 @@ class MetalPlanReport:
 
     * `taken` -- one entry per subtree that ran on the GPU: the Polars node id and kind at its top,
       the node kinds inside it, the rows it read, the ArrowMetal plan it ran, and after the run the
-      wall time and output rows.
+      wall time and output rows, and for each Parquet file it read (`scans`) the filters handed to
+      the reader and what the read skipped.
     * `fallbacks` -- one line per node that stayed with Polars for a reason of its own, in the form
       `Kind#id: reason`.
     * `nodes` -- the nodes the placement visited, top down, `(id, kind, "metal" | "polars")`; it
@@ -282,6 +294,13 @@ class MetalPlanReport:
             if t.get("seconds") is not None:
                 ran = f", ran in {t['seconds'] * 1e3:.2f} ms -> {t['rows_out']:,} rows"
             lines.append(f"  metal:  {t['root']} [{' > '.join(t['kinds'])}] over {t['rows']:,} rows{ran}")
+            for sc in t.get("scans") or ():
+                skipped = (sc.get("row_groups_skipped_by_statistics", 0)
+                           + sc.get("row_groups_skipped_by_page_index", 0)
+                           + sc.get("row_groups_skipped_by_bloom_filter", 0))
+                lines.append(f"          parquet {sc['path']}: filters {sc['filters'] or 'none'}, "
+                             f"{sc.get('row_groups_read', 0)} row groups read, {skipped} skipped, "
+                             f"{sc.get('pages_skipped', 0)} pages skipped")
         for f in self.fallbacks:
             lines.append(f"  polars: {f}")
         return "\n".join(lines)
@@ -369,6 +388,60 @@ class _Sub:
                 "exprs": [[n, c.ref] for n, c in self.cols.items()]}
 
 
+class _FileLeaf:
+    """A Parquet file a translated subtree reads itself: the leaf a Polars `Scan` becomes. The
+    columns are Polars' projection; `filters` are the `(column, op, value)` comparisons of the
+    predicate that the reader may use to skip row groups and pages by their statistics (the whole
+    predicate still runs on the GPU after the read, so a skipped row group only ever held rows the
+    predicate drops). `key` is the file's identity and state when the plan was translated."""
+
+    __slots__ = ("path", "key", "names", "dtypes", "rows", "filters", "use_stats", "no_nulls")
+
+    def __init__(self, path, key, names, dtypes, rows, use_stats, no_nulls=(), filters=()):
+        self.path = path
+        self.key = key
+        self.names = list(names)
+        self.dtypes = list(dtypes)
+        self.rows = rows
+        self.use_stats = use_stats
+        self.no_nulls = list(no_nulls)      # columns the footer says hold no null
+        self.filters = list(filters)
+
+    def with_filters(self, more):
+        filters = list(self.filters) + [f for f in more if f not in self.filters]
+        return _FileLeaf(self.path, self.key, self.names, self.dtypes, self.rows, self.use_stats,
+                         self.no_nulls, filters)
+
+    def arrays(self, rows=None):
+        """`(the columns as MetalArrays, what the read did)`. `rows` asks for a prefix: the first
+        `rows` rows of the first row group that holds any, read without filters (the schema check
+        and the validation run read that)."""
+        if rows is None:
+            cols, stats, _n = _cached_parquet_read(self.path, self.names, None,
+                                                   self.filters or None, False)
+            for c in self.no_nulls:
+                # The plan was built on the footer's word that these hold no null; a file whose
+                # statistics say otherwise than its data is an error, not a different answer.
+                if cols[c].null_count:
+                    raise ArrowMetalError(f"ArrowMetal MetalEngine: the statistics of {self.path} say "
+                                          f"column {c!r} holds no null, but it holds "
+                                          f"{cols[c].null_count}")
+            return [cols[c] for c in self.names], stats
+        _key, f, lock = _parquet_files.get(self.path)
+        with lock:
+            groups = [g for g in range(f.num_row_groups) if f.row_group_rows(g) > 0][:1]
+            cols = f.read(columns=self.names, row_groups=groups, dictionary=False)
+        out = []
+        for c in self.names:
+            a = cols[c]
+            out.append(a.slice(0, min(rows, len(a))) if len(a) > rows else a)
+        return out, None
+
+
+def _is_file(leaf_data):
+    return isinstance(leaf_data, _FileLeaf)
+
+
 _ARITH = {"Plus": "add", "Minus": "sub", "Multiply": "mul"}
 _CMP = {"Eq": "eq", "NotEq": "ne", "Lt": "lt", "LtEq": "le", "Gt": "gt", "GtEq": "ge"}
 _REGEX_META = set(".^$*+?()[]{}|\\")
@@ -418,11 +491,25 @@ class _Translator:
         stays with Polars)."""
         nt = self.nt
         nt.set_node(n)
-        node = nt.view_current_node()
-        kind = type(node).__name__
-        inputs = list(nt.get_inputs())
         if n in self.subs:                 # a subplan shared under two Cache nodes: walk it once
             return self.subs[n]
+        try:
+            node = nt.view_current_node()
+        except NotImplementedError as e:
+            # polars 1.44.1 cannot show some nodes to an engine (`scan_ipc` raises "ipc scan"); such a
+            # node, and everything above it, stays with Polars.
+            text = str(e) or type(e).__name__
+            kind = "Scan" if text.endswith("scan") else "Node"
+            self.report.walked.append((n, kind))
+            for i in nt.get_inputs():
+                self.walk(i)
+            nt.set_node(n)
+            self._fallback(n, kind, f"Polars does not show this node to an engine ({text})")
+            sub = _Sub(None, self._schema_cols())
+            self.subs[n] = sub
+            return sub
+        kind = type(node).__name__
+        inputs = list(nt.get_inputs())
         self.report.walked.append((n, kind))
         kids = [self.walk(i) for i in inputs]
         nt.set_node(n)
@@ -446,7 +533,7 @@ class _Translator:
         method = getattr(self, "_node_" + kind, None)
         if method is None:
             raise _Unsupported(f"node {kind} has no ArrowMetal translation")
-        if kind != "DataFrameScan" and any(k.plan is None for k in kids):
+        if kind not in ("DataFrameScan", "Scan") and any(k.plan is None for k in kids):
             # The node itself may be supported; it cannot move without its inputs. Check its own
             # expressions anyway so the report lists every reason at once.
             nt = self.nt
@@ -483,6 +570,143 @@ class _Translator:
         src = f"s{n}"
         return _Sub({"op": "scan", "source": src}, cols, names, [(src, df, names)], df.height, False)
 
+    def _node_Scan(self, n, node, inputs, kids, check_only=False):
+        """One local Parquet file, read on the GPU: Polars' projection becomes the reader's column
+        list, its predicate a filter over the read, and the predicate's comparisons on a column the
+        reader's statistics can judge also go to the reader to skip row groups and pages."""
+        st = node.scan_type
+        what = st[0] if isinstance(st, (tuple, list)) and st else str(st)
+        if what != "parquet":
+            raise _Unsupported(f"a {what} scan (the engine reads Parquet files)")
+        try:
+            opts = json.loads(st[1]) if len(st) > 1 and isinstance(st[1], str) else {}
+        except ValueError:
+            opts = {}
+        if opts.get("schema") is not None:
+            raise _Unsupported("scan_parquet with a schema= (Polars casts to it)")
+        paths = list(node.paths)
+        if len(paths) != 1:
+            raise _Unsupported(f"a scan of {len(paths)} files (one local file is taken)")
+        path = paths[0]
+        if "://" in path:
+            raise _Unsupported(f"source {path!r} is not a local file (cloud and URL sources stay "
+                               "with Polars)")
+        if node.hive_parts is not None:
+            raise _Unsupported("hive partition columns")
+        fo = node.file_options
+        if fo.row_index is not None:
+            raise _Unsupported("a row index added by the scan (row_index_name)")
+        if fo.include_file_paths is not None:
+            raise _Unsupported("include_file_paths")
+        if fo.n_rows is not None:
+            raise _Unsupported("a row limit pushed into the scan (n_rows, or a head/slice/tail "
+                               "above it)")
+        if getattr(fo, "deletion_files", None) is not None:
+            raise _Unsupported("deletion files")
+        if getattr(fo, "column_mapping", None) is not None:
+            raise _Unsupported("a column mapping")
+        if not os.path.isfile(path):
+            raise _Unsupported(f"source {path!r} is not a local file")
+        try:
+            key, f, lock = _parquet_files.get(path)
+            with lock:
+                file_cols = f.column_names
+                rows = f.num_rows
+                nulls = {c: f.column_null_count(c) for c in set(file_cols)
+                         if c in self.nt.get_schema()}
+        except ArrowMetalError as e:
+            raise _Unsupported(f"ArrowMetal's Parquet reader cannot open the file: "
+                               f"{str(e).splitlines()[0] if str(e) else type(e).__name__}")
+        names, dtypes, cols = [], [], {}
+        for name, dt in self.nt.get_schema().items():
+            if "\x00" in name:
+                raise _Unsupported(f"column name {name!r} holds a NUL byte")
+            if name not in file_cols:
+                raise _Unsupported(f"column {name!r} is not a column of the file (added by the "
+                                   "scan, or named by a stored schema)")
+            if file_cols.count(name) > 1:
+                raise _Unsupported(f"the file has {file_cols.count(name)} columns named {name!r}")
+            if not _carryable(dt):
+                raise _Unsupported(f"column {name!r} has dtype {dt}, which the Metal plan does not "
+                                   "carry")
+            names.append(name)
+            dtypes.append(dt)
+            # Nullable unless the footer says the column holds no null (checked again on the read).
+            cols[name] = _base(name, dt, nulls.get(name) != 0)
+        if not names:
+            raise _Unsupported("a scan that reads no columns")
+        use_stats = bool(opts.get("use_statistics", True))
+        leaf = _FileLeaf(path, key, names, dtypes, rows, use_stats,
+                         [c for c in names if nulls.get(c) == 0])
+        src = f"s{n}"
+        plan, work = {"op": "scan", "source": src}, False
+        if node.predicate is not None:
+            pred = self._predicate(node.predicate.node, cols)
+            if pred is not None:
+                if pred.code != "bool":
+                    raise _Unsupported("scan predicate is not boolean")
+                plan, work = {"op": "filter", "input": plan, "predicate": pred.s}, True
+                if use_stats:
+                    leaf = leaf.with_filters(self._stats_filters(node.predicate.node, cols))
+        return _Sub(plan, cols, names, [(src, leaf, names)], rows, work)
+
+    # Comparisons the Parquet reader's statistics can judge the way Polars compares, so a row group
+    # or page they rule out holds no row the predicate keeps. Floats: only `<`, `<=` and `==` against
+    # a literal exact in the column's type, because Polars orders NaN above every number (so NaN rows
+    # pass `>`, `>=` and `!=`) and writers leave NaN out of min/max. Strings: `==` and `!=`.
+    _STAT_OPS = {"Eq": "==", "NotEq": "!=", "Lt": "<", "LtEq": "<=", "Gt": ">", "GtEq": ">="}
+    _FLIP = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "==": "==", "!=": "!="}
+
+    def _stats_filters(self, i, cols):
+        out = []
+        self._collect_stats_filters(i, cols, out)
+        return out
+
+    def _collect_stats_filters(self, i, cols, out):
+        e = self.nt.view_expression(i)
+        if type(e).__name__ != "BinaryExpr":
+            return
+        name = str(e.op).rsplit(".", 1)[-1]
+        if name in ("And", "LogicalAnd"):
+            self._collect_stats_filters(e.left, cols, out)
+            self._collect_stats_filters(e.right, cols, out)
+            return
+        if name not in self._STAT_OPS:
+            return
+        try:
+            l, r = self._expr(e.left, cols), self._expr(e.right, cols)
+        except _Unsupported:
+            return
+        op = self._STAT_OPS[name]
+        if l.is_lit and not r.is_lit:
+            l, r, op = r, l, self._FLIP[op]
+        if l.is_lit or not r.is_lit or l.col is None or r.lit is None:
+            return
+        c = cols.get(l.col)
+        if c is None or l.s != f"(col {_q(l.col)})":
+            return
+        col = l.col
+        if (not col or col.strip() != col or any(ch in col for ch in '=!<>;"\\\x00')):
+            return
+        v, code = r.lit, _code(c.dtype)
+        if c.dtype == pl.String:
+            if op in ("==", "!=") and isinstance(v, str) and "\x00" not in v:
+                out.append((col, op, v))
+            return
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return
+        if _is_int(code):
+            if isinstance(v, int):
+                out.append((col, op, int(v)))
+            return
+        if _is_float(code) and op in ("<", "<=", "=="):
+            fv = float(v)
+            if fv != fv or (isinstance(v, int) and int(fv) != v):
+                return
+            if code == "f32" and _float32_round_trip(fv) != fv:
+                return
+            out.append((col, op, fv))
+
     def _node_SimpleProjection(self, n, node, inputs, kids, check_only=False):
         kid = kids[0]
         return kid.derive(cols={name: kid.cols[name] for name in self.nt.get_schema()})
@@ -502,7 +726,16 @@ class _Translator:
             return kid.derive()
         if pred.code != "bool":
             raise _Unsupported("filter predicate is not boolean")
-        return kid.derive(plan={"op": "filter", "input": kid.plan, "predicate": pred.s}, work=True)
+        sub = kid.derive(plan={"op": "filter", "input": kid.plan, "predicate": pred.s}, work=True)
+        if (kid.plan.get("op") == "scan" and len(kid.leaves) == 1 and _is_file(kid.leaves[0][1])
+                and kid.leaves[0][1].use_stats):
+            # A filter straight over a file scan (Polars left it out of the scan's predicate): its
+            # comparisons can skip row groups as well.
+            src, leaf, names = kid.leaves[0]
+            more = self._stats_filters(node.predicate.node, kid.cols)
+            if more:
+                sub.leaves = [(src, leaf.with_filters(more), names)]
+        return sub
 
     def _projected(self, kid, outputs, cols):
         """Adds `outputs` [(name, _E)] to `cols` as virtual columns, materialising any whose
@@ -1307,9 +1540,15 @@ def import_cache_info():
             "hits": _cache.hits, "misses": _cache.misses}
 
 
-def _leaf_sources(leaves, rows=None):
+def _leaf_sources(leaves, rows=None, scans=None):
     srcs = {}
     for src, df, names in leaves:
+        if _is_file(df):
+            arrays, stats = df.arrays(rows)
+            srcs[src] = _lazy._Source(names, arrays)
+            if scans is not None:
+                scans.append({"path": df.path, "filters": list(df.filters), **(stats or {})})
+            continue
         frame = df if rows is None else df.head(rows)
         arrays = []
         for c in names:
@@ -1323,8 +1562,27 @@ def _leaf_sources(leaves, rows=None):
     return srcs
 
 
-def _run_plan(plan, leaves, rows=None):
-    return _lazy.LazyFrame(plan, _leaf_sources(leaves, rows)).collect()
+def _run_plan(plan, leaves, rows=None, scans=None):
+    return _lazy.LazyFrame(plan, _leaf_sources(leaves, rows, scans)).collect()
+
+
+def _leaf_signature(src, df, names):
+    if _is_file(df):
+        return (src, "file", df.key, tuple((c, str(d), c not in df.no_nulls)
+                                           for c, d in zip(names, df.dtypes)))
+    return (src, tuple((c, str(df.schema[c]), df.get_column(c).null_count() > 0) for c in names))
+
+
+def _leaf_dtypes(leaves):
+    for _src, df, names in leaves:
+        if _is_file(df):
+            yield from df.dtypes
+        else:
+            yield from (df.schema[c] for c in names)
+
+
+def _leaf_rows(df):
+    return df.rows if _is_file(df) else df.height
 
 
 def _to_polars(table):
@@ -1348,12 +1606,11 @@ def _validate(sub, schema):
     verdict from a run that had rows to read: over zero rows nothing dispatches, so it proves
     nothing."""
     key = (json.dumps(sub.plan, sort_keys=True),
-           tuple((src, tuple((c, str(df.schema[c]), df.get_column(c).null_count() > 0)
-                             for c in names)) for src, df, names in sub.leaves),
+           tuple(_leaf_signature(src, df, names) for src, df, names in sub.leaves),
            tuple((k, str(v)) for k, v in schema.items()))
     if key in _validated:
         return _validated[key]
-    had_rows = all(df.height > 0 for _src, df, _names in sub.leaves)
+    had_rows = all(_leaf_rows(df) > 0 for _src, df, _names in sub.leaves)
     try:
         out = _to_polars(_run_plan(sub.plan, sub.leaves, _VALIDATION_ROWS))
         _check_schema(out, schema, "the plan")
@@ -1381,8 +1638,9 @@ def _run_subtree(sub, schema, entry, duration_since_start, with_columns, predica
         raise ArrowMetalError("ArrowMetal MetalEngine: Polars pushed a projection, predicate or "
                               "row limit into a replaced subtree, which this engine does not expect")
     start = time.monotonic_ns()
+    scans = []
     try:
-        table = _run_plan(sub.plan, sub.leaves)
+        table = _run_plan(sub.plan, sub.leaves, scans=scans)
     except ArrowMetalError as e:
         raise ArrowMetalError(f"ArrowMetal MetalEngine: the subtree at {entry['root']} failed on "
                               f"Metal: {e}\nplan: {entry['plan']}") from e
@@ -1391,6 +1649,8 @@ def _run_subtree(sub, schema, entry, duration_since_start, with_columns, predica
     end = time.monotonic_ns()
     entry["seconds"] = (end - start) / 1e9
     entry["rows_out"] = df.height
+    if scans:
+        entry["scans"] = scans
     if should_time:
         # Polars wants (start, end, name) relative to the query's start, as cudf-polars' Timer does.
         origin = (entry.get("_callback_ns") or start) - (duration_since_start or 0)
@@ -1439,13 +1699,14 @@ def execute_with_metal(nt, duration_since_start, *, config):
 
     # Take the largest translated subtrees that do GPU work, top down.
     chosen, seen = [], set()
+    kinds = dict(report.walked)
 
     def choose(n):
         if n in seen:                     # a subplan shared under two Cache nodes
             return
         seen.add(n)
         nt.set_node(n)
-        kind = type(nt.view_current_node()).__name__
+        kind = kinds.get(n, "Node")
         inputs = list(nt.get_inputs())
         sub = tr.subs.get(n)
         if sub is not None and sub.plan is not None:
@@ -1453,7 +1714,9 @@ def execute_with_metal(nt, duration_since_start, *, config):
                 report.nodes.append((n, kind, "polars"))
                 return
             classes = sub.classes or {"rowwise"}
-            strings = any(df.schema[c] == pl.String for _s, df, names in sub.leaves for c in names)
+            # A String column read from a Parquet file is decoded on the GPU rather than copied, but no
+            # scan case with one was measured, so the rule applies to file scans too.
+            strings = any(dt == pl.String for dt in _leaf_dtypes(sub.leaves))
             need = config.min_rows
             if config.shapes == "measured":
                 if not classes <= set(MEASURED_SHAPES) or strings:

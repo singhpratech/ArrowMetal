@@ -1,0 +1,30 @@
+## parquet_cache 2026-09-25T23:45:12Z loadavg { 11.18 11.60 9.23 } fileproviderd 74.6 lib .build/release/libArrowMetalC.dylib
+
+=== none, 2.23 GB on disk: the open-file cache ===
+through the cache         cold ms    warm ms  cold-warm
+open only                    7.89       0.04       7.85
+read price                 372.77       6.06     366.72
+read price + sum           300.06       7.87     292.19
+read all 8 columns         457.17      45.36     411.81
+wrote Benchmarks/results/parquet_cache_2026-09-25.csv
+
+markdown:
+| codec | reader | wall ms | CPU ms | MB/s | time to first compute (ms) |
+|---|---|---:|---:|---:|---:|
+exit=0 parquet_cache
+## done parquet_cache 2026-09-25T23:45:50Z loadavg { 16.67 13.02 9.86 } fileproviderd 81.2
+## polars_scan 2026-09-25T23:46:04Z loadavg { 17.40 13.40 10.06 } fileproviderd 127.2 lib .build/release/libArrowMetalC.dylib
+  (s3) scan, filter, sum + count [none]                polars in-memory               17.04 ms    162.6 CPU-ms
+  (s3) scan, filter, sum + count [none]                polars streaming               15.91 ms    156.8 CPU-ms
+  (s3) scan, filter, sum + count [none]                MetalEngine all, cold         342.23 ms    298.5 CPU-ms  x0.05 vs fastest Polars; taken: Select#3[Select>SimpleProjection>Scan]
+  (s3) scan, filter, sum + count [none]                MetalEngine all, warm          15.67 ms      8.2 CPU-ms  x1.02 vs fastest Polars; taken: Select#3[Select>SimpleProjection>Scan]
+  (s3) scan, filter, sum + count [none]                MetalEngine default, cold      17.77 ms    148.6 CPU-ms  x0.90 vs fastest Polars; taken: nothing
+  (s4) scan, sort 2 columns by a float64 key [none]    polars in-memory              823.39 ms   6947.5 CPU-ms
+  (s4) scan, sort 2 columns by a float64 key [none]    polars streaming              877.25 ms   7399.7 CPU-ms
+  (s4) scan, sort 2 columns by a float64 key [none]    MetalEngine all, cold         429.51 ms    344.4 CPU-ms  x1.92 vs fastest Polars; taken: Sort#2[Sort>Scan]
+  (s4) scan, sort 2 columns by a float64 key [none]    MetalEngine all, warm          75.72 ms      9.0 CPU-ms  x10.87 vs fastest Polars; taken: Sort#2[Sort>Scan]
+  (s4) scan, sort 2 columns by a float64 key [none]    MetalEngine default, cold     463.46 ms    340.5 CPU-ms  x1.78 vs fastest Polars; taken: Sort#2
+
+wrote Benchmarks/results/polars_engine_scan_2026-09-25.csv
+exit=0 polars_scan
+## done polars_scan 2026-09-25T23:47:36Z loadavg { 25.60 17.14 11.83 } fileproviderd 25.8
