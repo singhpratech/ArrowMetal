@@ -47,14 +47,15 @@ version this module was written against is `TESTED_IR_VERSION` and a test fails 
 upgrade moves it.
 """
 import json
+import math
 import os
 import re
+import struct
 import time
 import warnings
 from collections import OrderedDict
 from functools import partial
 
-import numpy as np
 import polars as pl
 import pyarrow as pa
 from polars._plr import _expr_nodes as _xn
@@ -168,13 +169,33 @@ def _unq(s):
 _COL_REF = re.compile(r'\(col "((?:[^"\\]|\\.)*)"\)')
 
 
+def _to_f32(x):
+    """`x` rounded to the nearest float32 (ties to even), as a Python float; past the float32 range
+    it is the signed infinity, as a C cast gives."""
+    try:
+        return struct.unpack("<f", struct.pack("<f", x))[0]
+    except OverflowError:
+        return math.copysign(math.inf, x)
+
+
 def _reciprocal(value, code):
     """`1 / value` rounded as Polars computes it for a scalar divisor: in `code`'s precision, with
-    IEEE results for zero, infinities and NaN."""
-    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-        if code == "f32":
-            return float(np.float32(1.0) / np.float32(value))
-        return float(np.float64(1.0) / np.float64(value))
+    IEEE results for zero, infinities and NaN.
+
+    Plain Python floats, so the engine needs no NumPy. The float32 case divides in float64 and rounds
+    once to float32; float64 carries more than twice float32's 24-bit significand plus two bits, so
+    that double rounding gives the correctly rounded float32 quotient.
+    """
+    v = float(value)
+    if code == "f32":
+        v = _to_f32(v)
+    if math.isnan(v):
+        r = math.nan
+    elif v == 0.0:
+        r = math.copysign(math.inf, v)
+    else:
+        r = 1.0 / v                     # +-inf -> +-0.0; a subnormal divisor overflows to +-inf
+    return _to_f32(r) if code == "f32" else r
 
 
 def _float_text(f, code):

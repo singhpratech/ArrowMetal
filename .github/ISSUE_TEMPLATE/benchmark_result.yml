@@ -14,6 +14,6 @@ body:
     id: notes
     attributes:
       label: Anything unusual about the machine or the run
-      description: Other work running, low power mode, a virtual machine, a non-default `--rows`.
+      description: Other work running, low power mode, a virtual machine, a non-default `--rows`, the kind of file behind a `--parquet` run.
     validations:
       required: false

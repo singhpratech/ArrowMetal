@@ -11,8 +11,14 @@ optimiser's projection and predicate pushdown.
     lf.with_columns(pl.col("name").arrowmetal.upper())
     lf.select(pl.col("amount").arrowmetal.filter_sum(pl.col("region") == 2))
 
-Building the plugin
--------------------
+Where the plugin comes from
+---------------------------
+The wheel carries it: `python/build_wheel.sh` builds the crate with cargo and packages
+`libarrowmetal_polars.dylib` in `arrowmetal/_lib/`, next to `libArrowMetalC.dylib`, with an
+`@loader_path` rpath, so a wheel install gives tier 2 with no Rust toolchain.
+
+Building it from source
+-----------------------
 The Rust crate lives in `polars-plugin/`. From the repository root:
 
     DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \\
@@ -22,7 +28,7 @@ The Rust crate lives in `polars-plugin/`. From the repository root:
 `cargo build` is enough -- the plugin is a plain `cdylib` that Polars `dlopen`s, not a Python
 extension module, so `maturin` is not needed and the maturin layout below is untested (the crate
 has no pyproject.toml). `plugin_path()` finds `polars-plugin/target/release/` on its own, and
-`ARROWMETAL_POLARS_PLUGIN` overrides the search.
+`ARROWMETAL_POLARS_PLUGIN` overrides the search; see `plugin_path()` for the order.
 
 The crate pins `polars` 0.55.1 / `pyo3-polars` 0.28, the Rust crates py-polars 1.44.x is built
 from. Polars checks the plugin ABI when it loads the library and refuses a mismatched pair with
@@ -42,15 +48,37 @@ __all__ = ["plugin_path", "available", "ArrowMetalExpr"]
 _LIB = "libarrowmetal_polars.dylib"
 
 
+def _loads_packaged_core(here):
+    """True when this process loaded the libArrowMetalC.dylib packaged in `arrowmetal/_lib/`.
+
+    The packaged plugin resolves `@rpath/libArrowMetalC.dylib` through `@loader_path`, so it always
+    runs on the packaged copy. When `$ARROWMETAL_LIB` or a development build is what Python loaded,
+    a cargo-built plugin (linked against that build) is the consistent choice, and a packaged plugin
+    left in `_lib/` by a wheel build in the same checkout must not shadow it.
+    """
+    from . import _find_library
+    try:
+        loaded = _find_library()
+    except OSError:
+        return False
+    packaged = os.path.join(here, "_lib", "libArrowMetalC.dylib")
+    return os.path.exists(packaged) and os.path.realpath(loaded) == os.path.realpath(packaged)
+
+
 def _candidates():
     here = os.path.dirname(os.path.abspath(__file__))
     env = os.environ.get("ARROWMETAL_POLARS_PLUGIN")
     if env:
         yield env
+    # The wheel: the plugin packaged next to the libArrowMetalC.dylib Python loaded.
+    packaged = os.path.join(here, "_lib", _LIB)
+    if _loads_packaged_core(here):
+        yield packaged
     # A SwiftPM/cargo checkout: python/arrowmetal -> <repo>/polars-plugin/target/release
     yield os.path.join(here, "..", "..", "polars-plugin", "target", "release", _LIB)
     yield os.path.join(here, "..", "..", "polars-plugin", "target", "debug", _LIB)
-    # A wheel that shipped the plugin next to the package.
+    yield packaged
+    # An older layout: a plugin copied next to the package.
     yield os.path.join(here, _LIB)
     # `maturin develop` installs it as its own top-level package in the virtualenv.
     for p in sys.path:
@@ -59,9 +87,15 @@ def _candidates():
 
 
 def plugin_path():
-    """The path to `libarrowmetal_polars.dylib`, or None when it has not been built.
+    """The path to `libarrowmetal_polars.dylib`, or None when none is found.
 
-    Set `ARROWMETAL_POLARS_PLUGIN` to override the search.
+    First hit wins:
+      1. `$ARROWMETAL_POLARS_PLUGIN`, the full path to a plugin dylib;
+      2. the copy packaged in the wheel, `arrowmetal/_lib/`, when Python loaded the packaged
+         `libArrowMetalC.dylib` beside it (what a `pip install` of the wheel has);
+      3. a cargo build in a source checkout, `polars-plugin/target/release/` then `target/debug/`;
+      4. the packaged copy, in any other case;
+      5. a maturin install on `sys.path`.
     """
     for c in _candidates():
         if c and os.path.exists(c):
@@ -78,7 +112,8 @@ def _path_or_raise():
     p = plugin_path()
     if p is None:
         raise ArrowMetalError(
-            f"{_LIB} not found. Build it with `cd polars-plugin && cargo build --release` "
+            f"{_LIB} not found. The wheel carries it in arrowmetal/_lib/; from a source "
+            "checkout, build it with `cd polars-plugin && cargo build --release` "
             "(after `swift build -c release --product ArrowMetalC`), or set "
             "ARROWMETAL_POLARS_PLUGIN to the built library."
         )

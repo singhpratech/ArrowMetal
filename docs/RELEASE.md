@@ -88,11 +88,13 @@ scripts/build_wheel.sh                  # swift build -c release, then python/bu
 ```
 
 This produces `python/dist/arrowmetal-X.Y.Z-py3-none-macosx_14_0_arm64.whl` with
-`libArrowMetalC.dylib` bundled at `arrowmetal/_lib/`. Check it before uploading:
+`libArrowMetalC.dylib` and the Polars plugin `libarrowmetal_polars.dylib` bundled at
+`arrowmetal/_lib/`. Check it before uploading:
 
 ```
 twine check python/dist/*.whl
-unzip -l python/dist/*.whl | grep _lib          # the dylib must be in the archive
+unzip -l python/dist/*.whl | grep _lib          # both dylibs must be in the archive
+PYTHON=python3.13 scripts/check_wheel.sh        # fresh virtualenv + [polars] extra: four tiers, bench
 python -m venv /tmp/am-wheel && /tmp/am-wheel/bin/pip install python/dist/*.whl
 cd /tmp && /tmp/am-wheel/bin/python -c "import arrowmetal as am; print(am.device_name())"
 cd - && /tmp/am-wheel/bin/pip install "$(echo python/dist/arrowmetal-X.Y.Z-*.whl)[polars,duckdb,pandas]"
@@ -138,8 +140,8 @@ run-time path. Checked after publication: a scratch crate outside the repository
 `arrowmetal = "X.Y.Z"` and pointed at the wheel's dylib prints the version and the device name.
 
 `polars-plugin/` is a Rust `cdylib` that Polars loads by path; it carries its own copy of
-`arrowmetal-sys` under the same name, so it stays `publish = false` and is built from the repository
-(`cd polars-plugin && cargo build --release`). The DuckDB extension (`duckdb-extension/`) is built from
+`arrowmetal-sys` under the same name, so it stays `publish = false` on crates.io. The wheel build
+compiles it and ships it inside the wheel, at `arrowmetal/_lib/libarrowmetal_polars.dylib`. The DuckDB extension (`duckdb-extension/`) is built from
 the repository and is not distributed through the DuckDB community extensions repository. The Node
 package (`node/`) is `"private": true` and is not published to npm: the addon links the dylib built
 from this checkout.
