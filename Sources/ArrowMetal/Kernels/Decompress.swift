@@ -65,6 +65,12 @@ enum Decompress {
     /// random doubles (1.0x, one long literal a page) to the SIMD-group kernel. The tests also set 0
     /// (every page per thread) and a huge value (none).
     static var laneRatioQuarters: UInt64 = 5
+    /// ... and only when a dispatch has at least this many such pages; below that a thread per page
+    /// leaves the GPU mostly idle, and every page goes to the SIMD-group kernel. 50 token-dense pages of
+    /// one int64 column (1,000,000 random values below 10^9, 160 KB pages) took 64 ms one per thread
+    /// against 16 ms one per SIMD group; 2,525 such pages of one column of the benchmark file 50 ms
+    /// against 66 (`id`).
+    static var laneMinPages = 2048
 
     private static func blockBuffer(_ ctx: MetalContext, _ blocks: [PageBlock]) throws -> MetalArrowBuffer {
         let buf = try MetalArrowBuffer.allocate(byteCount: blocks.count * MemoryLayout<PageBlock>.stride,
@@ -96,6 +102,10 @@ enum Decompress {
         var laneIdx: [Int] = [], groupIdx: [Int] = []
         for (i, b) in blocks.enumerated() {
             if UInt64(b.dstLength) * 4 >= UInt64(b.srcLength) * laneRatioQuarters { laneIdx.append(i) } else { groupIdx.append(i) }
+        }
+        if laneIdx.count < laneMinPages {
+            groupIdx = Array(blocks.indices)
+            laneIdx = []
         }
         var pending: [(indices: [Int], status: MetalArrowBuffer, desc: MetalArrowBuffer)] = []
         for (indices, perThread) in [(groupIdx, false), (laneIdx, true)] where !indices.isEmpty {

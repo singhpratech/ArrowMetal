@@ -454,9 +454,15 @@ final class ParquetTests: XCTestCase {
         XCTAssertGreaterThan(names.count, 5)
         let saved = Decompress.laneRatioQuarters
         let savedHost = Decompress.hostSnappyMaxBlocks
-        defer { Decompress.laneRatioQuarters = saved; Decompress.hostSnappyMaxBlocks = savedHost }
-        // Small fixtures have few pages; send every Snappy dispatch to the GPU so both kernels run.
+        let savedMin = Decompress.laneMinPages
+        defer {
+            Decompress.laneRatioQuarters = saved; Decompress.hostSnappyMaxBlocks = savedHost
+            Decompress.laneMinPages = savedMin
+        }
+        // Small fixtures have few pages; send every Snappy dispatch to the GPU, and let a dispatch of any
+        // size take the page-per-thread kernel, so both kernels run.
         Decompress.hostSnappyMaxBlocks = 0
+        Decompress.laneMinPages = 0
         for name in names {
             let p = Self.fixtures.appendingPathComponent(name).path
             func reads(_ quarters: UInt64) throws -> [MetalRecordBatch] {
@@ -469,5 +475,41 @@ final class ParquetTests: XCTestCase {
                 for (i, (a, b)) in zip(reference, try reads(q)).enumerated() { assertEqual(a, b, "\(name) quarters \(q) read \(i)") }
             }
         }
+    }
+
+    /// Damaged Snappy and LZ4 pages through the page-per-thread kernel: every read raises or returns,
+    /// never crashes, hangs or reads outside its page.
+    func testDamagedPagesThroughThePagePerThreadKernelRaiseOrReturn() throws {
+        try requireRealGPU()
+        let saved = (Decompress.laneRatioQuarters, Decompress.hostSnappyMaxBlocks, Decompress.laneMinPages)
+        defer { (Decompress.laneRatioQuarters, Decompress.hostSnappyMaxBlocks, Decompress.laneMinPages) = saved }
+        Decompress.laneRatioQuarters = 0
+        Decompress.hostSnappyMaxBlocks = 0
+        Decompress.laneMinPages = 0
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("arrowmetal-parquet-damage-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        var rng = SystemRandomNumberGenerator()
+        var outcomes = Set<String>()
+        for name in ["flat__plain_snappy", "flat__plain_lz4", "flat__v2_lz4", "nulls__plain_snappy"] {
+            let original = try Data(contentsOf: URL(fileURLWithPath: try path(name)))
+            let f = try ParquetFile(path: try path(name))
+            // Damage only the column chunks: the footer is checked elsewhere.
+            let chunks = f.metadata.rowGroups.flatMap { $0.columns.map { Int($0.meta.startOffset)..<Int($0.meta.startOffset + $0.meta.totalCompressedSize) } }
+            for k in 0..<60 {
+                var bytes = [UInt8](original)
+                let c = chunks[Int.random(in: 0..<chunks.count, using: &rng)]
+                for _ in 0..<(1 + k % 4) {
+                    let at = Int.random(in: c, using: &rng)
+                    bytes[at] = bytes[at] &+ UInt8.random(in: 1...255, using: &rng)
+                }
+                let p = dir.appendingPathComponent("\(name)-\(k).parquet").path
+                try Data(bytes).write(to: URL(fileURLWithPath: p))
+                do { _ = try ParquetFile(path: p).read(); outcomes.insert("read") }
+                catch { outcomes.insert("raised") }
+            }
+        }
+        XCTAssertTrue(outcomes.contains("raised"), "no damaged page was reported")
     }
 }
