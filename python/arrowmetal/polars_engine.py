@@ -1544,6 +1544,14 @@ def _leaf_signature(src, df, names):
     return (src, tuple((c, str(df.schema[c]), df.get_column(c).null_count() > 0) for c in names))
 
 
+def _leaf_dtypes(leaves):
+    for _src, df, names in leaves:
+        if _is_file(df):
+            yield from df.dtypes
+        else:
+            yield from (df.schema[c] for c in names)
+
+
 def _leaf_rows(df):
     return df.rows if _is_file(df) else df.height
 
@@ -1677,10 +1685,9 @@ def execute_with_metal(nt, duration_since_start, *, config):
                 report.nodes.append((n, kind, "polars"))
                 return
             classes = sub.classes or {"rowwise"}
-            # A String column of an in-memory frame is converted on the CPU on the way in; one read
-            # from a Parquet file is decoded on the GPU.
-            strings = any(df.schema[c] == pl.String for _s, df, names in sub.leaves
-                          if not _is_file(df) for c in names)
+            # A String column read from a Parquet file is decoded on the GPU rather than copied, but no
+            # scan case with one was measured, so the rule applies to file scans too.
+            strings = any(dt == pl.String for dt in _leaf_dtypes(sub.leaves))
             need = config.min_rows
             if config.shapes == "measured":
                 if not classes <= set(MEASURED_SHAPES) or strings:

@@ -1,0 +1,42 @@
+# ArrowMetal 0.2.0 on Apple M4 Max, polars 1.44.1 (16 threads), pyarrow 25.0.1, best of 5
+rows,case,engine,wall_ms,cpu_ms,taken,fallbacks,equal_to_polars,vs_fastest_polars,row_groups_read_skipped
+50000000,"(s1) scan, filter, group-by 1000 keys, sum + count [snappy]",polars in-memory,171.670,1283.2,,,,,
+50000000,"(s1) scan, filter, group-by 1000 keys, sum + count [snappy]",polars streaming,57.267,698.0,,,,,
+50000000,"(s1) scan, filter, group-by 1000 keys, sum + count [snappy]","MetalEngine all, cold",375.778,241.7,GroupBy#2[GroupBy>SimpleProjection>Scan],,True,0.15,50/0
+50000000,"(s1) scan, filter, group-by 1000 keys, sum + count [snappy]","MetalEngine all, warm",96.593,14.9,GroupBy#2[GroupBy>SimpleProjection>Scan],,True,0.59,50/0
+50000000,"(s1) scan, filter, group-by 1000 keys, sum + count [snappy]","MetalEngine default, cold",152.568,1353.5,,,True,0.38,
+50000000,"(s2) scan, filter on id (row groups skipped), group-by, sum [snappy]",polars in-memory,34.657,207.8,,,,,
+50000000,"(s2) scan, filter on id (row groups skipped), group-by, sum [snappy]",polars streaming,15.435,88.7,,,,,
+50000000,"(s2) scan, filter on id (row groups skipped), group-by, sum [snappy]","MetalEngine all, cold",68.898,31.7,GroupBy#2[GroupBy>SimpleProjection>Scan],,True,0.22,5/45
+50000000,"(s2) scan, filter on id (row groups skipped), group-by, sum [snappy]","MetalEngine all, warm",33.989,6.4,GroupBy#2[GroupBy>SimpleProjection>Scan],,True,0.45,5/45
+50000000,"(s2) scan, filter on id (row groups skipped), group-by, sum [snappy]","MetalEngine default, cold",46.203,196.5,,,True,0.33,
+50000000,"(s3) scan, filter, sum + count [snappy]",polars in-memory,16.768,147.9,,,,,
+50000000,"(s3) scan, filter, sum + count [snappy]",polars streaming,17.620,159.2,,,,,
+50000000,"(s3) scan, filter, sum + count [snappy]","MetalEngine all, cold",314.391,252.0,Select#3[Select>SimpleProjection>Scan],,True,0.05,50/0
+50000000,"(s3) scan, filter, sum + count [snappy]","MetalEngine all, warm",19.616,9.1,Select#3[Select>SimpleProjection>Scan],,True,0.85,50/0
+50000000,"(s3) scan, filter, sum + count [snappy]","MetalEngine default, cold",21.546,139.2,,,True,0.78,
+50000000,"(s4) scan, sort 2 columns by a float64 key [snappy]",polars in-memory,934.921,7241.9,,,,,
+50000000,"(s4) scan, sort 2 columns by a float64 key [snappy]",polars streaming,885.432,7231.3,,,,,
+50000000,"(s4) scan, sort 2 columns by a float64 key [snappy]","MetalEngine all, cold",449.429,240.6,Sort#2[Sort>Scan],,True,1.97,50/0
+50000000,"(s4) scan, sort 2 columns by a float64 key [snappy]","MetalEngine all, warm",145.543,9.4,Sort#2[Sort>Scan],,True,6.08,50/0
+50000000,"(s4) scan, sort 2 columns by a float64 key [snappy]","MetalEngine default, cold",451.975,249.4,Sort#2,,True,1.96,
+50000000,"(s1) scan, filter, group-by 1000 keys, sum + count [none]",polars in-memory,170.052,1230.6,,,,,
+50000000,"(s1) scan, filter, group-by 1000 keys, sum + count [none]",polars streaming,56.535,664.0,,,,,
+50000000,"(s1) scan, filter, group-by 1000 keys, sum + count [none]","MetalEngine all, cold",426.713,328.8,GroupBy#2[GroupBy>SimpleProjection>Scan],,True,0.13,50/0
+50000000,"(s1) scan, filter, group-by 1000 keys, sum + count [none]","MetalEngine all, warm",42.020,13.8,GroupBy#2[GroupBy>SimpleProjection>Scan],,True,1.35,50/0
+50000000,"(s1) scan, filter, group-by 1000 keys, sum + count [none]","MetalEngine default, cold",156.973,1220.7,,,True,0.36,
+50000000,"(s2) scan, filter on id (row groups skipped), group-by, sum [none]",polars in-memory,30.570,182.0,,,,,
+50000000,"(s2) scan, filter on id (row groups skipped), group-by, sum [none]",polars streaming,8.267,51.3,,,,,
+50000000,"(s2) scan, filter on id (row groups skipped), group-by, sum [none]","MetalEngine all, cold",45.951,34.4,GroupBy#2[GroupBy>SimpleProjection>Scan],,True,0.18,5/45
+50000000,"(s2) scan, filter on id (row groups skipped), group-by, sum [none]","MetalEngine all, warm",8.838,5.8,GroupBy#2[GroupBy>SimpleProjection>Scan],,True,0.94,5/45
+50000000,"(s2) scan, filter on id (row groups skipped), group-by, sum [none]","MetalEngine default, cold",28.554,172.3,,,True,0.29,
+50000000,"(s3) scan, filter, sum + count [none]",polars in-memory,17.044,162.6,,,,,
+50000000,"(s3) scan, filter, sum + count [none]",polars streaming,15.911,156.8,,,,,
+50000000,"(s3) scan, filter, sum + count [none]","MetalEngine all, cold",342.230,298.5,Select#3[Select>SimpleProjection>Scan],,True,0.05,50/0
+50000000,"(s3) scan, filter, sum + count [none]","MetalEngine all, warm",15.665,8.2,Select#3[Select>SimpleProjection>Scan],,True,1.02,50/0
+50000000,"(s3) scan, filter, sum + count [none]","MetalEngine default, cold",17.770,148.6,,,True,0.90,
+50000000,"(s4) scan, sort 2 columns by a float64 key [none]",polars in-memory,823.389,6947.5,,,,,
+50000000,"(s4) scan, sort 2 columns by a float64 key [none]",polars streaming,877.247,7399.7,,,,,
+50000000,"(s4) scan, sort 2 columns by a float64 key [none]","MetalEngine all, cold",429.509,344.4,Sort#2[Sort>Scan],,True,1.92,50/0
+50000000,"(s4) scan, sort 2 columns by a float64 key [none]","MetalEngine all, warm",75.722,9.0,Sort#2[Sort>Scan],,True,10.87,50/0
+50000000,"(s4) scan, sort 2 columns by a float64 key [none]","MetalEngine default, cold",463.462,340.5,Sort#2,,True,1.78,
