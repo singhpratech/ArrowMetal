@@ -13,6 +13,15 @@ import Metal
 // in by the kernel that first touches them, so a projection over two of forty columns brings neither the
 // other thirty-eight columns' bytes into memory nor their pages into the GPU's page tables.
 
+/// Unmaps a range on a background queue. Unmapping a 2 GB file that the GPU has read took about
+/// 3 ms (M4 Max), all of it on the thread that closed the file; nothing reads the range once its last
+/// owner is gone, so the caller need not wait for it.
+func unmapLater(_ base: UnsafeMutableRawPointer, _ length: Int) {
+    let b = UInt(bitPattern: base)
+    unmapQueue.async { munmap(UnsafeMutableRawPointer(bitPattern: b), length) }
+}
+private let unmapQueue = DispatchQueue(label: "ArrowMetal.unmap", qos: .utility)
+
 /// One `mmap`ed range of a file, wrapped as an `MTLBuffer`.
 final class MappedRegion: @unchecked Sendable {
     let base: UnsafeMutableRawPointer
@@ -44,7 +53,7 @@ final class MappedRegion: @unchecked Sendable {
         self.isSharedReadOnly = sharedReadOnly
     }
 
-    deinit { munmap(base, length) }
+    deinit { unmapLater(base, length) }
 
     var raw: UnsafeRawBufferPointer { UnsafeRawBufferPointer(start: base, count: length) }
 }
@@ -76,7 +85,7 @@ final class MappedView: @unchecked Sendable {
         self.length = length
     }
 
-    deinit { munmap(base, length) }
+    deinit { unmapLater(base, length) }
 }
 
 /// Where a column's page bytes are for the GPU: a buffer, the offset kernels bind it at, and how a file
