@@ -360,4 +360,156 @@ final class ParquetTests: XCTestCase {
         XCTAssertTrue(f[7].hasSuffix("#65535"), "expected a 64 KB value, got \(f[7].suffix(12))")
         XCTAssertEqual(f[0], "#0")
     }
+
+    // MARK: - how the file is mapped
+
+    /// Every fixture reads the same through the shared read-only mapping the reader uses and through
+    /// the private writable one it falls back to: whole files, one column at a time, and one row
+    /// group at a time.
+    func testSharedAndPrivateMappingsAgree() throws {
+        try requireRealGPU()
+        let names = try FileManager.default.contentsOfDirectory(atPath: Self.fixtures.path)
+            .filter { $0.hasSuffix(".parquet") }.sorted()
+        XCTAssertGreaterThan(names.count, 20)
+        defer { ParquetFile.mapsSharedReadOnly = true }
+        var compared = 0
+        for name in names {
+            let p = Self.fixtures.appendingPathComponent(name).path
+            func reads(shared: Bool) -> [MetalRecordBatch]? {
+                ParquetFile.mapsSharedReadOnly = shared
+                guard let f = try? ParquetFile(path: p) else { return nil }
+                var out: [MetalRecordBatch] = []
+                guard let whole = try? f.read() else { return nil }
+                out.append(whole)
+                for c in f.columnNames { if let b = try? f.read(columns: [c]) { out.append(b) } }
+                for g in 0..<f.rowGroupCount {
+                    if let b = try? f.read(ParquetReadOptions(rowGroups: [g])) { out.append(b) }
+                }
+                return out
+            }
+            let shared = reads(shared: true)
+            let priv = reads(shared: false)
+            XCTAssertEqual(shared == nil, priv == nil, "\(name): one mapping reads, the other does not")
+            guard let shared, let priv else { continue }
+            XCTAssertEqual(shared.count, priv.count, "\(name): number of reads")
+            for (i, (a, b)) in zip(shared, priv).enumerated() { assertEqual(a, b, "\(name) read \(i)") }
+            compared += 1
+        }
+        XCTAssertGreaterThan(compared, 20)
+    }
+
+    /// A projection of one column (or a few) of a wide file with many row groups maps only those
+    /// columns' chunks side by side (`ParquetFile.pageSource(covering:)`), and reads what the whole-file
+    /// read returns for them, with and without row-group selection, uncompressed and Snappy, with a
+    /// dictionary column among them.
+    func testSparseProjectionsReadThroughColumnViews() throws {
+        try requireRealGPU()
+        let n = 120_000
+        func opt<T>(_ i: Int, _ v: T) -> T? { i % 11 == 5 ? nil : v }
+        let batch = try MetalRecordBatch(
+            names: ["a", "b", "c", "d", "s"],
+            columns: [
+                .int64(try MetalArray<Int64>((0..<n).map { Int64($0) &* 7919 })),
+                .float64(try MetalArray<Double>((0..<n).map { opt($0, Double($0) * 0.5) })),
+                .int32(try MetalArray<Int32>((0..<n).map { Int32(truncatingIfNeeded: $0 &* 2_654_435_761) })),
+                .int64(try MetalArray<Int64>((0..<n).map { opt($0, Int64($0 % 977)) })),
+                .string(try MetalStringArray((0..<n).map { "value \($0 % 1000)" })),
+            ])
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("arrowmetal-parquet-views-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        for codec in [ParquetCodec.uncompressed, .snappy] {
+            let path = dir.appendingPathComponent("wide-\(codec.name).parquet").path
+            try ParquetWriter.write(batch, to: path,
+                                    options: ParquetWriteOptions(compression: codec, useDictionary: true, rowGroupSize: 10_000))
+            let wf = try ParquetFile(path: path)
+            let whole = try wf.read()
+            // Every column of the Snappy file is decompressed in one batch before any is decoded.
+            XCTAssertEqual(wf.stagedTogetherLastRead, codec == .snappy ? 5 : 0, "\(codec.name)")
+            let f = try ParquetFile(path: path)
+            XCTAssertEqual(f.rowGroupCount, 12)
+            for (i, name) in batch.names.enumerated() {
+                let one = try f.read(columns: [name])
+                assertEqual(try MetalRecordBatch(names: [name], columns: [whole.columns[i]]), one, "\(codec.name) \(name)")
+                // Read again: the cached view serves it.
+                assertEqual(one, try f.read(columns: [name]), "\(codec.name) \(name) again")
+            }
+            XCTAssertGreaterThan(f.viewCount, 0, "\(codec.name): no one-column read went through a view")
+            let groups = [1, 4, 7, 11]
+            let some = try f.read(ParquetReadOptions(columns: ["d", "a"], rowGroups: groups))
+            let wholeSome = try ParquetFile(path: path).read(ParquetReadOptions(rowGroups: groups))
+            assertEqual(try MetalRecordBatch(names: ["d", "a"], columns: [wholeSome.columns[3], wholeSome.columns[0]]),
+                        some, "\(codec.name) d, a over row groups \(groups)")
+        }
+    }
+
+    /// Snappy and LZ4 pages decode the same through the page-per-thread kernel and the
+    /// SIMD-group-per-page kernel: every fixture read with every page sent to one, then to the other,
+    /// against the default split, whole and one row group at a time.
+    func testPagePerThreadAndSimdGroupDecompressionAgree() throws {
+        try requireRealGPU()
+        let names = try FileManager.default.contentsOfDirectory(atPath: Self.fixtures.path)
+            .filter { $0.hasSuffix(".parquet") && ($0.contains("snappy") || $0.contains("lz4")) }.sorted()
+        XCTAssertGreaterThan(names.count, 5)
+        let saved = Decompress.laneRatioQuarters
+        let savedHost = Decompress.hostSnappyMaxBlocks
+        let savedMin = Decompress.laneMinPages
+        defer {
+            Decompress.laneRatioQuarters = saved; Decompress.hostSnappyMaxBlocks = savedHost
+            Decompress.laneMinPages = savedMin
+        }
+        // Small fixtures have few pages; send every Snappy dispatch to the GPU, and let a dispatch of any
+        // size take the page-per-thread kernel, so both kernels run.
+        Decompress.hostSnappyMaxBlocks = 0
+        Decompress.laneMinPages = 0
+        for name in names {
+            let p = Self.fixtures.appendingPathComponent(name).path
+            func reads(_ quarters: UInt64) throws -> [MetalRecordBatch] {
+                Decompress.laneRatioQuarters = quarters
+                let f = try ParquetFile(path: p)
+                return try [f.read()] + (0..<f.rowGroupCount).map { try f.read(ParquetReadOptions(rowGroups: [$0])) }
+            }
+            let reference = try reads(saved)
+            for q: UInt64 in [0, 1 << 40] {
+                for (i, (a, b)) in zip(reference, try reads(q)).enumerated() { assertEqual(a, b, "\(name) quarters \(q) read \(i)") }
+            }
+        }
+    }
+
+    /// Damaged Snappy and LZ4 pages through the page-per-thread kernel: every read raises or returns,
+    /// never crashes, hangs or reads outside its page.
+    func testDamagedPagesThroughThePagePerThreadKernelRaiseOrReturn() throws {
+        try requireRealGPU()
+        let saved = (Decompress.laneRatioQuarters, Decompress.hostSnappyMaxBlocks, Decompress.laneMinPages)
+        defer { (Decompress.laneRatioQuarters, Decompress.hostSnappyMaxBlocks, Decompress.laneMinPages) = saved }
+        Decompress.laneRatioQuarters = 0
+        Decompress.hostSnappyMaxBlocks = 0
+        Decompress.laneMinPages = 0
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("arrowmetal-parquet-damage-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        var rng = SystemRandomNumberGenerator()
+        var outcomes = Set<String>()
+        for name in ["flat__plain_snappy", "flat__plain_lz4", "flat__v2_lz4", "nulls__plain_snappy"] {
+            let original = try Data(contentsOf: URL(fileURLWithPath: try path(name)))
+            let f = try ParquetFile(path: try path(name))
+            // Damage only the column chunks: the footer is checked elsewhere.
+            let chunks = f.metadata.rowGroups.flatMap { $0.columns.map { Int($0.meta.startOffset)..<Int($0.meta.startOffset + $0.meta.totalCompressedSize) } }
+            for k in 0..<60 {
+                var bytes = [UInt8](original)
+                let c = chunks[Int.random(in: 0..<chunks.count, using: &rng)]
+                for _ in 0..<(1 + k % 4) {
+                    let at = Int.random(in: c, using: &rng)
+                    bytes[at] = bytes[at] &+ UInt8.random(in: 1...255, using: &rng)
+                }
+                let p = dir.appendingPathComponent("\(name)-\(k).parquet").path
+                try Data(bytes).write(to: URL(fileURLWithPath: p))
+                do { _ = try ParquetFile(path: p).read(); outcomes.insert("read") }
+                catch { outcomes.insert("raised") }
+            }
+        }
+        XCTAssertTrue(outcomes.contains("raised"), "no damaged page was reported")
+    }
 }

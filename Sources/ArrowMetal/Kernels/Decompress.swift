@@ -59,6 +59,18 @@ enum Decompress {
 
     /// A SNAPPY dispatch of at most this many pages is decompressed on the host (see the type comment).
     static var hostSnappyMaxBlocks = 16
+    /// A page whose output is at least this many quarters of its input goes to the page-per-thread
+    /// kernel (`DecompressSource`): 5, output at least 1.25x the input. On the benchmark file's Snappy
+    /// columns that sends the sequential, low-cardinality and timestamp columns (1.3-18x) to it and the
+    /// random doubles (1.0x, one long literal a page) to the SIMD-group kernel. The tests also set 0
+    /// (every page per thread) and a huge value (none).
+    static var laneRatioQuarters: UInt64 = 5
+    /// ... and only when a dispatch has at least this many such pages; below that a thread per page
+    /// leaves the GPU mostly idle, and every page goes to the SIMD-group kernel. 50 token-dense pages of
+    /// one int64 column (1,000,000 random values below 10^9, 160 KB pages) took 64 ms one per thread
+    /// against 16 ms one per SIMD group; 2,525 such pages of one column of the benchmark file 50 ms
+    /// against 66 (`id`).
+    static var laneMinPages = 2048
 
     private static func blockBuffer(_ ctx: MetalContext, _ blocks: [PageBlock]) throws -> MetalArrowBuffer {
         let buf = try MetalArrowBuffer.allocate(byteCount: blocks.count * MemoryLayout<PageBlock>.stride,
@@ -85,29 +97,54 @@ enum Decompress {
 
     private static func gpuDecompress(_ ctx: MetalContext, function: String, source: MTLBuffer, sourceOffset: Int,
                                       blocks: [PageBlock], out: MetalArrowBuffer, codec: ParquetCodec) throws {
-        let desc = try blockBuffer(ctx, blocks)
-        let status = try MetalArrowBuffer.allocate(byteCount: blocks.count * 4, context: ctx)
-        let pso = try ctx.pipeline(source: DecompressSource.source, function: function, cacheKey: "parquet/decompress/\(function)")
-        // One threadgroup per page: thread 0 parses the token stream out of an 8 KB threadgroup-memory
-        // window while all 256 threads move the bytes.
-        try ctx.run { enc in
-            enc.setComputePipelineState(pso)
-            enc.setBuffer(source, offset: sourceOffset, index: 0)
-            enc.setBuffer(out.mtl, offset: out.offset, index: 1)
-            enc.setBuffer(desc.mtl, offset: desc.offset, index: 2)
-            Dispatch.setUInt(enc, blocks.count, index: 3)
-            enc.setBuffer(status.mtl, offset: status.offset, index: 4)
-            enc.dispatchThreadgroups(MTLSize(width: blocks.count, height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        // Pages whose output is at least `laneRatioQuarters` quarters of their input are token-dense and go to the
+        // page-per-thread kernel; the rest (mostly long literals) to the SIMD-group-per-page kernel.
+        var laneIdx: [Int] = [], groupIdx: [Int] = []
+        for (i, b) in blocks.enumerated() {
+            if UInt64(b.dstLength) * 4 >= UInt64(b.srcLength) * laneRatioQuarters { laneIdx.append(i) } else { groupIdx.append(i) }
+        }
+        if laneIdx.count < laneMinPages {
+            groupIdx = Array(blocks.indices)
+            laneIdx = []
+        }
+        var pending: [(indices: [Int], status: MetalArrowBuffer, desc: MetalArrowBuffer)] = []
+        for (indices, perThread) in [(groupIdx, false), (laneIdx, true)] where !indices.isEmpty {
+            let desc = try blockBuffer(ctx, indices.map { blocks[$0] })
+            let status = try MetalArrowBuffer.allocate(byteCount: indices.count * 4, context: ctx)
+            let name = perThread ? function + "_lane" : function
+            let pso = try ctx.pipeline(source: DecompressSource.source, function: name, cacheKey: "parquet/decompress/\(name)")
+            try ctx.run { enc in
+                enc.setComputePipelineState(pso)
+                enc.setBuffer(source, offset: sourceOffset, index: 0)
+                enc.setBuffer(out.mtl, offset: out.offset, index: 1)
+                enc.setBuffer(desc.mtl, offset: desc.offset, index: 2)
+                Dispatch.setUInt(enc, indices.count, index: 3)
+                enc.setBuffer(status.mtl, offset: status.offset, index: 4)
+                if perThread {
+                    // One page per thread, in threadgroups of 32 so the pages spread over every core.
+                    let w = 32     // LANES in DecompressSource
+                    enc.dispatchThreadgroups(MTLSize(width: (indices.count + w - 1) / w, height: 1, depth: 1),
+                                             threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
+                } else {
+                    // One SIMD group per page: lane 0 parses the token stream out of an 8 KB
+                    // threadgroup-memory window while all 32 lanes move the bytes.
+                    enc.dispatchThreadgroups(MTLSize(width: indices.count, height: 1, depth: 1),
+                                             threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                }
+            }
+            pending.append((indices, status, desc))
         }
         try ctx.syncPoint()
-        let st = status.typed(UInt32.self)
-        for i in 0..<blocks.count where st[i] != 0 {
-            let why = ["ok", "output overrun", "bad token", "input truncated"][Int(Swift.min(st[i], 3))]
+        var failed: [(Int, UInt32)] = []
+        for p in pending {
+            let st = p.status.typed(UInt32.self)
+            for (k, i) in p.indices.enumerated() where st[k] != 0 { failed.append((i, st[k])) }
+        }
+        if let (i, code) = failed.min(by: { $0.0 < $1.0 }) {
+            let why = ["ok", "output overrun", "bad token", "input truncated"][Int(Swift.min(code, 3))]
             throw ParquetError.malformed("\(codec.name) page \(i) failed to decompress: \(why)")
         }
-        withExtendedLifetime(desc) {}
-        withExtendedLifetime(status) {}
+        withExtendedLifetime(pending) {}
     }
 
     // MARK: - Host codecs
@@ -119,7 +156,7 @@ enum Decompress {
         var failure: Error? = nil
         let lock = NSLock()
         let n = blocks.count
-        let work: (Int) -> Void = { i in
+        let work: (Int, Zstd.Context?) -> Void = { i, zctx in
             let b = blocks[i]
             do {
                 let inPtr = src.advanced(by: Int(b.srcOffset)).assumingMemoryBound(to: UInt8.self)
@@ -128,7 +165,7 @@ enum Decompress {
                 switch codec {
                 case .gzip: produced = try gunzip(inPtr, Int(b.srcLength), outPtr, Int(b.dstLength))
                 case .brotli: produced = try appleDecode(COMPRESSION_BROTLI, inPtr, Int(b.srcLength), outPtr, Int(b.dstLength))
-                case .zstd: produced = try Zstd.decompress(inPtr, Int(b.srcLength), outPtr, Int(b.dstLength))
+                case .zstd: produced = try Zstd.decompress(inPtr, Int(b.srcLength), outPtr, Int(b.dstLength), context: zctx)
                 case .snappy: produced = try SnappyHost.decompress(inPtr, Int(b.srcLength), outPtr, Int(b.dstLength))
                 default: produced = 0
                 }
@@ -139,8 +176,19 @@ enum Decompress {
                 lock.lock(); if failure == nil { failure = error }; lock.unlock()
             }
         }
-        if n >= 4 { DispatchQueue.concurrentPerform(iterations: n, execute: work) }
-        else { for i in 0..<n { work(i) } }
+        // Pages are handed out in runs of a few, and each run decodes with one ZSTD context:
+        // `ZSTD_decompress` allocates and frees a fresh context (about 160 KB) on every call, which on a
+        // file of thousands of small pages cost more than the decompression itself.
+        // Runs of one page unless there are many more pages than cores, so a handful of large pages still
+        // spread across cores.
+        let run = codec == .zstd ? Swift.max(1, Swift.min(8, n / (2 * ProcessInfo.processInfo.activeProcessorCount))) : 1
+        let runs = (n + run - 1) / run
+        let perRun: (Int) -> Void = { r in
+            let zctx = codec == .zstd ? Zstd.Context() : nil
+            for i in (r * run)..<Swift.min(n, (r + 1) * run) { work(i, zctx) }
+        }
+        if n >= 4 { DispatchQueue.concurrentPerform(iterations: runs, execute: perRun) }
+        else { for r in 0..<runs { perRun(r) } }
         if let f = failure { throw f }
     }
 
@@ -178,6 +226,20 @@ enum Decompress {
 enum Zstd {
     typealias DecompressFn = @convention(c) (UnsafeMutableRawPointer?, Int, UnsafeRawPointer?, Int) -> Int
     typealias IsErrorFn = @convention(c) (Int) -> UInt32
+    typealias CreateDCtxFn = @convention(c) () -> OpaquePointer?
+    typealias FreeDCtxFn = @convention(c) (OpaquePointer?) -> Int
+    typealias DecompressDCtxFn = @convention(c) (OpaquePointer?, UnsafeMutableRawPointer?, Int, UnsafeRawPointer?, Int) -> Int
+
+    /// A reusable decompression context (`ZSTD_DCtx`), freed with the object. Nil inside when this
+    /// libzstd lacks the context API, and `decompress` then uses the one-shot call.
+    final class Context {
+        let dctx: OpaquePointer?
+        init?() {
+            guard let c = Zstd.contextAPI, let d = c.create() else { return nil }
+            dctx = d
+        }
+        deinit { if let c = Zstd.contextAPI { _ = c.free(dctx) } }
+    }
 
     /// Candidate library paths, most specific first. `ARROWMETAL_ZSTD` overrides everything.
     static let candidates: [String] = {
@@ -197,16 +259,30 @@ enum Zstd {
         return nil
     }()
 
+    private static let contextAPI: (create: CreateDCtxFn, free: FreeDCtxFn, decompress: DecompressDCtxFn)? = {
+        guard loaded != nil else { return nil }
+        for name in candidates {
+            guard let h = dlopen(name, RTLD_LAZY) else { continue }
+            guard let c = dlsym(h, "ZSTD_createDCtx"), let f = dlsym(h, "ZSTD_freeDCtx"),
+                  let d = dlsym(h, "ZSTD_decompressDCtx") else { continue }
+            return (unsafeBitCast(c, to: CreateDCtxFn.self), unsafeBitCast(f, to: FreeDCtxFn.self),
+                    unsafeBitCast(d, to: DecompressDCtxFn.self))
+        }
+        return nil
+    }()
+
     static var isAvailable: Bool { loaded != nil }
 
     static func decompress(_ src: UnsafePointer<UInt8>, _ srcLen: Int,
-                           _ dst: UnsafeMutablePointer<UInt8>, _ dstLen: Int) throws -> Int {
+                           _ dst: UnsafeMutablePointer<UInt8>, _ dstLen: Int, context: Context? = nil) throws -> Int {
         guard let fns = loaded else {
             throw ParquetError.unsupported(
                 "ZSTD pages need libzstd, which macOS does not ship and this SDK's Compression framework does not "
                 + "implement. Install it (brew install zstd) or point ARROWMETAL_ZSTD at libzstd.1.dylib.")
         }
-        let n = fns.decompress(dst, dstLen, src, srcLen)
+        let n: Int
+        if let context, let api = contextAPI { n = api.decompress(context.dctx, dst, dstLen, src, srcLen) }
+        else { n = fns.decompress(dst, dstLen, src, srcLen) }
         if fns.isError(n) != 0 { throw ParquetError.malformed("ZSTD_decompress failed") }
         return n
     }

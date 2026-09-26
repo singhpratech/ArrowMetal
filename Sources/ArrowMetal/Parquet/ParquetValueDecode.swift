@@ -49,10 +49,17 @@ struct ParquetValueDecoder {
         // Dictionary codes, when any page needs them.
         var codes: MetalArrowBuffer? = nil
         if let dictPages = g[.rleDictionary] {
-            let c = try MetalArrowBuffer.allocate(byteCount: Swift.max(totalNonNull * 4, 4), zeroed: true, context: ctx)
+            // `pq_decode_rle_values` writes every slot of the pages it decodes, so when every page is a
+            // dictionary page the codes need no zero fill, only their padding past the last code (a
+            // chunk that mixes in PLAIN pages leaves their slots to the fill, as before).
+            let everySlot = g.count == 1
+            let c = try MetalArrowBuffer.allocate(byteCount: Swift.max(totalNonNull * 4, 4), zeroed: !everySlot, context: ctx)
+            if everySlot {
+                let used = totalNonNull * 4
+                memset(c.mutableContents.advanced(by: used), 0, c.mtl.length - c.offset - used)
+            }
             let sub = try subset(dictPages)
-            try runRLEValues(pages: sub, count: dictPages.count, out: c)
-            try runDictRebase(pages: sub, count: dictPages.count, codes: c)
+            try runRLEValues(pages: sub, count: dictPages.count, out: c, addDictBase: true)
             codes = c
         }
 
@@ -72,7 +79,19 @@ struct ParquetValueDecoder {
 
     private func fixedValues(groups g: [ParquetEncoding: [Int]], codes: MetalArrowBuffer?) throws -> ParquetLeafData.Values {
         let w = Swift.max(width, 1)
-        let dense = try MetalArrowBuffer.allocate(byteCount: Swift.max(totalNonNull * w, w), zeroed: true, context: ctx)
+        ParquetProfile.lap("col.values-pre", sync: ctx)
+        // The pages' dense slots tile [0, totalNonNull), and the PLAIN, dictionary and BYTE_STREAM_SPLIT
+        // kernels write every slot of their pages, whatever the page holds. With only those, the buffer
+        // needs no zero fill of its values -- 2 GB of memset for the eight columns of the benchmark file
+        // -- just of its padding past the last value, so every byte comes back as before.
+        let fillsEverySlot = g.keys.allSatisfy { $0 == .plain || $0 == .rleDictionary || $0 == .byteStreamSplit }
+        let dense = try MetalArrowBuffer.allocate(byteCount: Swift.max(totalNonNull * w, w), zeroed: !fillsEverySlot,
+                                                  context: ctx)
+        if fillsEverySlot {
+            let used = totalNonNull * w
+            memset(dense.mutableContents.advanced(by: used), 0, dense.mtl.length - dense.offset - used)
+        }
+        ParquetProfile.lap("col.alloc-dense")
         for (enc, idx) in g {
             let sub = try subset(idx)
             switch enc {
@@ -319,19 +338,13 @@ struct ParquetValueDecoder {
             enc.setBuffer(out.mtl, offset: out.offset, index: 4)
         }
     }
-    func runRLEValues(pages: MetalArrowBuffer, count: Int, out: MetalArrowBuffer) throws {
+    func runRLEValues(pages: MetalArrowBuffer, count: Int, out: MetalArrowBuffer, addDictBase: Bool = false) throws {
         try perPage("pq_decode_rle_values", count: count) { enc in
             enc.setBuffer(pageData, offset: pageDataOffset, index: 0)
             enc.setBuffer(pages.mtl, offset: pages.offset, index: 1)
             Dispatch.setUInt(enc, count, index: 2)
             enc.setBuffer(out.mtl, offset: out.offset, index: 3)
-        }
-    }
-    func runDictRebase(pages: MetalArrowBuffer, count: Int, codes: MetalArrowBuffer) throws {
-        try perPage("pq_dict_rebase", count: count) { enc in
-            enc.setBuffer(codes.mtl, offset: codes.offset, index: 0)
-            enc.setBuffer(pages.mtl, offset: pages.offset, index: 1)
-            Dispatch.setUInt(enc, count, index: 2)
+            Dispatch.setUInt(enc, addDictBase ? 1 : 0, index: 4)
         }
     }
     func runDictGatherFixed(dict: MetalArrowBuffer, codes: MetalArrowBuffer, pages: MetalArrowBuffer,

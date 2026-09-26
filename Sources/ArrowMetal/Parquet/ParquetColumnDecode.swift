@@ -48,12 +48,81 @@ final class ParquetLeafData {
     }
 }
 
+/// A leaf column's pages as a read selects them (`ParquetFile.collectPages`).
+struct ParquetLeafPages {
+    var dataPages: [ParquetRawPage] = []
+    var dictPages: [ParquetRawPage] = []
+    var codecOf: [ParquetCodec] = []            // per data page
+    var dictCodec: [ParquetCodec] = []          // per dictionary page
+    var dictBaseOf: [Int: UInt32] = [:]         // row group -> merged dictionary base
+    var dictCountOf: [Int: Int] = [:]
+    var totalDict = 0
+    var spans: [(group: Int, rows: Range<Int>)] = []
+    var skippedPages = 0
+}
+
+/// Where a column's pages go in its staging buffer, and the blocks that put them there
+/// (`ParquetFile.stagePages`).
+struct ParquetStaging {
+    var size = 0
+    var dataOffsets: [UInt32] = []
+    var dictOffsets: [UInt32] = []
+    var copies: [PageBlock] = []
+    var byCodec: [ParquetCodec: [PageBlock]] = [:]
+    var dictByCodec: [ParquetCodec: [PageBlock]] = [:]
+}
+
+/// A column's pages already staged by `ParquetFile.stageTogether`: `size` bytes at `base` in `buffer`.
+struct ParquetPreStaged {
+    let buffer: MetalArrowBuffer
+    let base: Int
+    let size: Int
+    let pages: Int
+}
+
 extension ParquetFile {
+    /// The most a batch of `stageTogether` stages at once: an eighth of the device's recommended
+    /// working set, at most 3 GiB (the decoders' 32-bit offsets allow under 4).
+    var maxStagingBytes: Int { Swift.min(Int(context.device.recommendedMaxWorkingSetSize) / 8, 3 << 30) }
 
     // MARK: - Page headers
 
-    /// Walks a column chunk's page headers. Only Thrift headers are read here; no column bytes.
+    /// A column chunk's page headers: from the handle's cache when an earlier read (or this read's
+    /// `prefetchPageHeaders`) parsed them, else parsed now and cached.
     func pageHeaders(of chunk: ParquetColumnMetadata, rowGroup: Int) throws -> (dict: ParquetRawPage?, data: [ParquetRawPage]) {
+        let key = ParquetChunkKey(chunk, rowGroup: rowGroup)
+        if let hit = cachedPageHeaders(key) { return hit }
+        let parsed = try parsePageHeaders(of: chunk, rowGroup: rowGroup)
+        cachePageHeaders(key, parsed)
+        return parsed
+    }
+
+    /// Parses the page headers of every chunk of `leaves` over `rowGroups` that is not cached yet,
+    /// spread across cores. Each header sits in its own page of the mapping, so a cold read of a large
+    /// file takes a minor fault per data page here; done one column at a time that was 13-14 ms of a
+    /// 2 GB, 8-column read. A chunk that fails to parse is left out, and the decode parses it again and
+    /// raises exactly as it would have.
+    func prefetchPageHeaders(leaves: [ParquetLeaf], rowGroups: [Int]) {
+        var todo: [(ParquetColumnMetadata, Int)] = []
+        for leaf in leaves {
+            for g in rowGroups where g >= 0 && g < metadata.rowGroups.count {
+                let rg = metadata.rowGroups[g]
+                guard leaf.index < rg.columns.count else { continue }
+                let meta = rg.columns[leaf.index].meta
+                if cachedPageHeaders(ParquetChunkKey(meta, rowGroup: g)) == nil { todo.append((meta, g)) }
+            }
+        }
+        guard todo.count > 1 else { return }
+        DispatchQueue.concurrentPerform(iterations: todo.count) { i in
+            if let parsed = try? parsePageHeaders(of: todo[i].0, rowGroup: todo[i].1) {
+                cachePageHeaders(ParquetChunkKey(todo[i].0, rowGroup: todo[i].1), parsed)
+            }
+        }
+        ParquetProfile.lap("read.headers \(todo.count) chunks")
+    }
+
+    /// Walks a column chunk's page headers. Only Thrift headers are read here; no column bytes.
+    func parsePageHeaders(of chunk: ParquetColumnMetadata, rowGroup: Int) throws -> (dict: ParquetRawPage?, data: [ParquetRawPage]) {
         var at = Int(chunk.startOffset)
         // `data_page_offset` and `dictionary_page_offset` are signed i64 in the footer: a corrupt one
         // is negative or past the end, and either way it must not become a read position.
@@ -109,7 +178,7 @@ extension ParquetFile {
     /// the plan's candidate rows (`ParquetPageIndex.swift`); `rowSpans` then says which rows came back.
     func decodeLeaf(_ leaf: ParquetLeaf, rowGroups: [Int], options: ParquetReadOptions,
                     needRepetition: Bool = false, plan: ParquetReadPlan? = nil,
-                    subset: Bool = false) throws -> ParquetLeafData {
+                    subset: Bool = false, staged: [Int: ParquetPreStaged]? = nil) throws -> ParquetLeafData {
         let ctx = context
         let maxDef = leaf.maxDefinition
         let maxRep = leaf.maxRepetition
@@ -132,50 +201,12 @@ extension ParquetFile {
         }
 
         // ---- 1. page headers
-        var dataPages: [ParquetRawPage] = []
-        var dictPages: [ParquetRawPage] = []
-        var codecOf: [ParquetCodec] = []            // per data page
-        var dictCodec: [ParquetCodec] = []          // per dictionary page
-        var dictBaseOf: [Int: UInt32] = [:]         // row group -> merged dictionary base
-        var dictCountOf: [Int: Int] = [:]
-        var totalDict = 0
-        var spans: [(group: Int, rows: Range<Int>)] = []
-        var skippedPages = 0
-        for g in rowGroups {
-            let rg = metadata.rowGroups[g]
-            guard leaf.index < rg.columns.count else {
-                throw ParquetError.malformed("row group \(g) has \(rg.columns.count) columns, need \(leaf.index + 1)")
-            }
-            let meta = rg.columns[leaf.index].meta
-            if rg.columns[leaf.index].filePath != nil && !(rg.columns[leaf.index].filePath!.isEmpty) {
-                throw ParquetError.unsupported("column chunks stored in a separate file")
-            }
-            let d: ParquetRawPage?
-            let pages: [ParquetRawPage]
-            if subset, leaf.maxRepetition == 0, let ranges = plan?.ranges[g],
-               let found = try indexedPages(of: meta, rowGroup: g, column: leaf.index, ranges: ranges) {
-                (d, pages) = (found.dict, found.data)
-                spans.append(contentsOf: found.spans.map { (g, $0) })
-                skippedPages += found.skipped
-            } else {
-                (d, pages) = try pageHeaders(of: meta, rowGroup: g)
-                spans.append((g, 0..<rowsIn(group: g)))
-            }
-            if let d {
-                // Dictionary bases are 32-bit in the page descriptor, and every dictionary buffer is
-                // sized `totalDict * width`: both need `totalDict` to stay inside UInt32.
-                guard totalDict + Int(d.header.dictNumValues) <= Int(UInt32.max) else {
-                    throw ParquetError.malformed("dictionary of \(totalDict) + \(d.header.dictNumValues) entries")
-                }
-                dictBaseOf[g] = UInt32(totalDict)
-                dictCountOf[g] = Int(d.header.dictNumValues)
-                totalDict += Int(d.header.dictNumValues)
-                dictPages.append(d)
-                dictCodec.append(meta.codec)
-            }
-            for p in pages { dataPages.append(p); codecOf.append(meta.codec) }
-        }
-        plan?.count(decoded: dataPages.count, skipped: skippedPages)
+        let lp = try collectPages(leaf, rowGroups: rowGroups, plan: plan, subset: subset)
+        let dataPages = lp.dataPages, dictPages = lp.dictPages, codecOf = lp.codecOf, dictCodec = lp.dictCodec
+        let dictBaseOf = lp.dictBaseOf, dictCountOf = lp.dictCountOf, totalDict = lp.totalDict
+        let spans = lp.spans
+        plan?.count(decoded: dataPages.count, skipped: lp.skippedPages)
+        ParquetProfile.lap("col.headers", sync: ctx)
         guard !dataPages.isEmpty else {
             let empty = try emptyLeaf(leaf, options: options)
             empty.rowSpans = spans
@@ -184,17 +215,12 @@ extension ParquetFile {
         let totalLevels = dataPages.reduce(0) { $0 + Int($1.header.numValues) }
         try Dispatch.checkLength(totalLevels)
 
-        // ---- 2. address every page with 32-bit offsets relative to one binding point
-        let page = metalPageSize()
-        var minOffset = Int.max, maxEnd = 0
-        for p in dataPages + dictPages {
-            minOffset = Swift.min(minOffset, p.bodyOffset)
-            maxEnd = Swift.max(maxEnd, p.bodyOffset + Int(p.header.compressedSize))
-        }
-        let srcBase = (minOffset / page) * page
-        guard maxEnd - srcBase < Int(UInt32.max) else {
-            throw ParquetError.unsupported("a single column chunk spanning more than 4 GiB")
-        }
+        // ---- 2. address every page with 32-bit offsets relative to one binding point. Only this
+        // column's page bytes are handed to the GPU, so a projection never pays for the columns it skips.
+        let source = try pageSource(covering: (dataPages + dictPages).map {
+            $0.bodyOffset..<($0.bodyOffset + Int($0.header.compressedSize))
+        })
+        func rel(_ p: ParquetRawPage) -> UInt32 { UInt32(source.offset(ofFile: p.bodyOffset)) }
 
         // ---- 3. page descriptors and decompression
         var infos = [ParquetPageInfo](repeating: ParquetPageInfo(), count: dataPages.count)
@@ -225,73 +251,35 @@ extension ParquetFile {
             dictInfos[i] = info
         }
 
-        // Only this column's byte range is wrapped for the GPU, so a projection never pays for the
-        // columns it skips.
-        let (mapped, mappedOffset) = try buffer(covering: srcBase..<maxEnd)
+        let mapped = source.buffer
         let pageData: MTLBuffer
         let pageDataOffset: Int
         var owned: MetalArrowBuffer? = nil
         if !anyCompressed {
             // The mapped file *is* the page buffer.
             pageData = mapped.mtl
-            pageDataOffset = mapped.offset + mappedOffset
-            for i in infos.indices { infos[i].dataOffset = UInt32(dataPages[i].bodyOffset - srcBase) }
-            for i in dictInfos.indices { dictInfos[i].dataOffset = UInt32(dictPages[i].bodyOffset - srcBase) }
+            pageDataOffset = source.bindingOffset
+            for i in infos.indices { infos[i].dataOffset = rel(dataPages[i]) }
+            for i in dictInfos.indices { dictInfos[i].dataOffset = rel(dictPages[i]) }
         } else {
-            var dst = 0
-            var byCodec: [ParquetCodec: [PageBlock]] = [:]
-            var dictByCodec: [ParquetCodec: [PageBlock]] = [:]     // dictionary pages: one per chunk
-            var copies: [PageBlock] = []
-            func stage(_ p: ParquetRawPage, _ codec: ParquetCodec, _ info: inout ParquetPageInfo,
-                       dictionary: Bool = false) {
-                let uncompressed = Int(p.header.uncompressedSize)
-                info.dataOffset = UInt32(dst)
-                let src = UInt32(p.bodyOffset - srcBase)
-                let levelBytes = p.header.type == .dataPageV2
-                    ? Int(p.header.repLevelsByteLength) + Int(p.header.defLevelsByteLength) : 0
-                let compressed = codec == .uncompressed || !p.header.isCompressed
-                if compressed {
-                    copies.append(PageBlock(srcOffset: src, srcLength: UInt32(p.header.compressedSize),
-                                            dstOffset: UInt32(dst), dstLength: UInt32(uncompressed)))
-                } else if levelBytes > 0 {
-                    // A v2 page keeps its levels uncompressed; only the values are a compressed block.
-                    copies.append(PageBlock(srcOffset: src, srcLength: UInt32(levelBytes),
-                                            dstOffset: UInt32(dst), dstLength: UInt32(levelBytes)))
-                    byCodec[codec, default: []].append(
-                        PageBlock(srcOffset: src + UInt32(levelBytes),
-                                  srcLength: UInt32(Int(p.header.compressedSize) - levelBytes),
-                                  dstOffset: UInt32(dst + levelBytes),
-                                  dstLength: UInt32(uncompressed - levelBytes)))
-                } else if dictionary {
-                    dictByCodec[codec, default: []].append(
-                        PageBlock(srcOffset: src, srcLength: UInt32(p.header.compressedSize),
-                                  dstOffset: UInt32(dst), dstLength: UInt32(uncompressed)))
-                } else {
-                    byCodec[codec, default: []].append(
-                        PageBlock(srcOffset: src, srcLength: UInt32(p.header.compressedSize),
-                                  dstOffset: UInt32(dst), dstLength: UInt32(uncompressed)))
-                }
-                dst = roundUp(dst + uncompressed, to: 8)
+            let st = stagePages(lp, rel: rel)
+            for i in infos.indices { infos[i].dataOffset = st.dataOffsets[i] }
+            for i in dictInfos.indices { dictInfos[i].dataOffset = st.dictOffsets[i] }
+            if let pre = staged?[leaf.index], pre.size == st.size, pre.pages == dataPages.count + dictPages.count {
+                // `stageTogether` already decompressed these pages, with every other column of the read.
+                owned = pre.buffer
+                pageData = pre.buffer.mtl
+                pageDataOffset = pre.buffer.offset + pre.base
+            } else {
+                ParquetProfile.lap("col.stage")
+                let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(st.size, 1), zeroed: false, context: ctx)
+                ParquetProfile.lap("col.alloc-pagebuf")
+                try runStaging([(st, 0, 0)], source: mapped.mtl, sourceOffset: source.bindingOffset, out: out)
+                ParquetProfile.lap("col.decompress \(leaf.name) \(st.byCodec.values.reduce(0) { $0 + $1.count }) pages", sync: ctx)
+                owned = out
+                pageData = out.mtl
+                pageDataOffset = out.offset
             }
-            for (i, p) in dictPages.enumerated() { stage(p, dictCodec[i], &dictInfos[i], dictionary: true) }
-            for (i, p) in dataPages.enumerated() { stage(p, codecOf[i], &infos[i]) }
-            let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(dst, 1), zeroed: false, context: ctx)
-            if !copies.isEmpty {
-                try Decompress.into(ctx, codec: .uncompressed, source: mapped.mtl,
-                                    sourceOffset: mapped.offset + mappedOffset, blocks: copies, out: out)
-            }
-            for (codec, blocks) in dictByCodec {
-                try Decompress.into(ctx, codec: codec, source: mapped.mtl,
-                                    sourceOffset: mapped.offset + mappedOffset, blocks: blocks, out: out,
-                                    preferHost: true)
-            }
-            for (codec, blocks) in byCodec {
-                try Decompress.into(ctx, codec: codec, source: mapped.mtl,
-                                    sourceOffset: mapped.offset + mappedOffset, blocks: blocks, out: out)
-            }
-            owned = out
-            pageData = out.mtl
-            pageDataOffset = out.offset
         }
 
         // ---- 4. page layout, then levels
@@ -346,6 +334,7 @@ extension ParquetFile {
 
         // ---- 5. read the finished descriptors back so pages can be grouped by encoding
         try ctx.syncPoint()
+        ParquetProfile.lap("col.layout+levels")
         let finished = download(pagesBuf, count: infos.count)
 
         // ---- 6. dictionary
@@ -381,6 +370,7 @@ extension ParquetFile {
             }
         }
 
+        ParquetProfile.lap("col.dict", sync: ctx)
         // ---- 7. values, one kernel per encoding family
         let decoder = ParquetValueDecoder(
             file: self, leaf: leaf, ctx: ctx, pageData: pageData, pageDataOffset: pageDataOffset,
@@ -389,6 +379,7 @@ extension ParquetFile {
             totalDict: totalDict, dictValOffset: dictValOffset, dictValLength: dictValLength,
             dictFixed: dictFixed, dictionaryEncoded: options.dictionaryEncoded)
         let result = try decoder.run()
+        ParquetProfile.lap("col.values", sync: ctx)
 
         // ---- 8. validity
         let data = ParquetLeafData(leaf: leaf, file: self, context: ctx, levels: totalLevels,
@@ -403,11 +394,191 @@ extension ParquetFile {
             data.validity = bm
             data.nullCount = totalLevels - totalNonNull
         }
+        ParquetProfile.lap("col.validity", sync: ctx)
         // Keep the decompressed page buffer alive for as long as anything might still point into it.
         if let owned { data.retain(owned) }
         data.retain(mapped)
         data.retain(pagesBuf)
         return data
+    }
+
+    /// Step 1 of `decodeLeaf`: the dictionary and data pages of `leaf` over `rowGroups`, from their
+    /// headers (and, with `subset` and a `plan`, the offset index). Counts nothing into the plan.
+    func collectPages(_ leaf: ParquetLeaf, rowGroups: [Int], plan: ParquetReadPlan?, subset: Bool) throws -> ParquetLeafPages {
+        var lp = ParquetLeafPages()
+        for g in rowGroups {
+            let rg = metadata.rowGroups[g]
+            guard leaf.index < rg.columns.count else {
+                throw ParquetError.malformed("row group \(g) has \(rg.columns.count) columns, need \(leaf.index + 1)")
+            }
+            let meta = rg.columns[leaf.index].meta
+            if rg.columns[leaf.index].filePath != nil && !(rg.columns[leaf.index].filePath!.isEmpty) {
+                throw ParquetError.unsupported("column chunks stored in a separate file")
+            }
+            let d: ParquetRawPage?
+            let pages: [ParquetRawPage]
+            if subset, leaf.maxRepetition == 0, let ranges = plan?.ranges[g],
+               let found = try indexedPages(of: meta, rowGroup: g, column: leaf.index, ranges: ranges) {
+                (d, pages) = (found.dict, found.data)
+                lp.spans.append(contentsOf: found.spans.map { (g, $0) })
+                lp.skippedPages += found.skipped
+            } else {
+                (d, pages) = try pageHeaders(of: meta, rowGroup: g)
+                lp.spans.append((g, 0..<rowsIn(group: g)))
+            }
+            if let d {
+                // Dictionary bases are 32-bit in the page descriptor, and every dictionary buffer is
+                // sized `totalDict * width`: both need `totalDict` to stay inside UInt32.
+                guard lp.totalDict + Int(d.header.dictNumValues) <= Int(UInt32.max) else {
+                    throw ParquetError.malformed("dictionary of \(lp.totalDict) + \(d.header.dictNumValues) entries")
+                }
+                lp.dictBaseOf[g] = UInt32(lp.totalDict)
+                lp.dictCountOf[g] = Int(d.header.dictNumValues)
+                lp.totalDict += Int(d.header.dictNumValues)
+                lp.dictPages.append(d)
+                lp.dictCodec.append(meta.codec)
+            }
+            for p in pages { lp.dataPages.append(p); lp.codecOf.append(meta.codec) }
+        }
+        return lp
+    }
+
+    /// Where every page of `lp` goes in a staging buffer (8-byte aligned, dictionary pages first) and
+    /// the blocks that put it there: plain copies, dictionary pages (host-decoded for SNAPPY) and the
+    /// compressed data pages by codec. `rel` gives a page's offset from the source binding point.
+    func stagePages(_ lp: ParquetLeafPages, rel: (ParquetRawPage) -> UInt32) -> ParquetStaging {
+        var st = ParquetStaging()
+        var dst = 0
+        func stage(_ p: ParquetRawPage, _ codec: ParquetCodec, dictionary: Bool) -> UInt32 {
+            let uncompressed = Int(p.header.uncompressedSize)
+            let at = UInt32(dst)
+            let src = rel(p)
+            let levelBytes = p.header.type == .dataPageV2
+                ? Int(p.header.repLevelsByteLength) + Int(p.header.defLevelsByteLength) : 0
+            let compressed = codec == .uncompressed || !p.header.isCompressed
+            if compressed {
+                st.copies.append(PageBlock(srcOffset: src, srcLength: UInt32(p.header.compressedSize),
+                                           dstOffset: UInt32(dst), dstLength: UInt32(uncompressed)))
+            } else if levelBytes > 0 {
+                // A v2 page keeps its levels uncompressed; only the values are a compressed block.
+                st.copies.append(PageBlock(srcOffset: src, srcLength: UInt32(levelBytes),
+                                           dstOffset: UInt32(dst), dstLength: UInt32(levelBytes)))
+                st.byCodec[codec, default: []].append(
+                    PageBlock(srcOffset: src + UInt32(levelBytes),
+                              srcLength: UInt32(Int(p.header.compressedSize) - levelBytes),
+                              dstOffset: UInt32(dst + levelBytes),
+                              dstLength: UInt32(uncompressed - levelBytes)))
+            } else if dictionary {
+                st.dictByCodec[codec, default: []].append(
+                    PageBlock(srcOffset: src, srcLength: UInt32(p.header.compressedSize),
+                              dstOffset: UInt32(dst), dstLength: UInt32(uncompressed)))
+            } else {
+                st.byCodec[codec, default: []].append(
+                    PageBlock(srcOffset: src, srcLength: UInt32(p.header.compressedSize),
+                              dstOffset: UInt32(dst), dstLength: UInt32(uncompressed)))
+            }
+            dst = roundUp(dst + uncompressed, to: 8)
+            return at
+        }
+        st.dictOffsets = lp.dictPages.enumerated().map { stage($0.element, lp.dictCodec[$0.offset], dictionary: true) }
+        st.dataOffsets = lp.dataPages.enumerated().map { stage($0.element, lp.codecOf[$0.offset], dictionary: false) }
+        st.size = dst
+        return st
+    }
+
+    /// Runs the blocks of several stagings into `out`, each part's source offsets moved by `srcShift`
+    /// (to the common binding point `sourceOffset`) and its destinations by `dstShift`: the copies,
+    /// then the dictionary pages, then the data pages, one dispatch (or host pass) per codec for all
+    /// parts together.
+    func runStaging(_ parts: [(staging: ParquetStaging, srcShift: Int, dstShift: Int)], source: MTLBuffer,
+                    sourceOffset: Int, out: MetalArrowBuffer) throws {
+        func moved(_ bs: [PageBlock], _ s: Int, _ d: Int) -> [PageBlock] {
+            (s == 0 && d == 0) ? bs : bs.map {
+                PageBlock(srcOffset: UInt32(Int($0.srcOffset) + s), srcLength: $0.srcLength,
+                          dstOffset: UInt32(Int($0.dstOffset) + d), dstLength: $0.dstLength)
+            }
+        }
+        var copies: [PageBlock] = []
+        var dict: [ParquetCodec: [PageBlock]] = [:]
+        var data: [ParquetCodec: [PageBlock]] = [:]
+        for p in parts {
+            copies += moved(p.staging.copies, p.srcShift, p.dstShift)
+            for (c, b) in p.staging.dictByCodec { dict[c, default: []] += moved(b, p.srcShift, p.dstShift) }
+            for (c, b) in p.staging.byCodec { data[c, default: []] += moved(b, p.srcShift, p.dstShift) }
+        }
+        let ctx = context
+        if !copies.isEmpty {
+            try Decompress.into(ctx, codec: .uncompressed, source: source, sourceOffset: sourceOffset, blocks: copies, out: out)
+        }
+        for (codec, blocks) in dict {
+            try Decompress.into(ctx, codec: codec, source: source, sourceOffset: sourceOffset, blocks: blocks,
+                                out: out, preferHost: true)
+        }
+        for (codec, blocks) in data {
+            try Decompress.into(ctx, codec: codec, source: source, sourceOffset: sourceOffset, blocks: blocks, out: out)
+        }
+    }
+
+    /// Decompresses the pages of several flat columns of one read together, before any of them is
+    /// decoded, into one staging buffer per batch; `decodeLeaf` then finds its pages staged.
+    ///
+    /// A column of token-dense Snappy or LZ4 pages is one GPU dispatch of a few thousand pages, and the
+    /// page-per-thread kernel gets only a couple of SIMD groups per core out of that, waiting on memory
+    /// most of the time; two or three such columns in one dispatch take about as long as one. So every
+    /// GPU-compressed column the read decodes in full is staged here, when their pages come from one
+    /// mapping. Batches are capped (`maxStagingBytes`), and anything unusual -- a header that does not
+    /// parse, a failed decompression -- drops the whole thing and leaves every column to stage its own
+    /// pages as before, so errors come out exactly as they did.
+    func stageTogether(leaves: [ParquetLeaf], rowGroups: [Int]) -> [Int: ParquetPreStaged] {
+        var items: [(leaf: ParquetLeaf, lp: ParquetLeafPages, source: ParquetPageSource, st: ParquetStaging)] = []
+        var seen = Set<Int>()
+        for leaf in leaves where leaf.maxRepetition == 0 && seen.insert(leaf.index).inserted {
+            guard let lp = try? collectPages(leaf, rowGroups: rowGroups, plan: nil, subset: false) else { return [:] }
+            guard !lp.dataPages.isEmpty,
+                  lp.codecOf.contains(where: { $0 == .snappy || $0 == .lz4 || $0 == .lz4Raw }) else { continue }
+            let ranges = (lp.dataPages + lp.dictPages).map { $0.bodyOffset..<($0.bodyOffset + Int($0.header.compressedSize)) }
+            guard let source = try? pageSource(covering: ranges) else { return [:] }
+            let st = stagePages(lp, rel: { UInt32(source.offset(ofFile: $0.bodyOffset)) })
+            items.append((leaf, lp, source, st))
+        }
+        guard items.count >= 2, let first = items.first,
+              items.allSatisfy({ $0.source.buffer.mtl === first.source.buffer.mtl }) else { return [:] }
+        let common = first.source.buffer.offset
+        let cap = Swift.min(Int(UInt32.max) - (1 << 20), Swift.max(maxStagingBytes, 1 << 26))
+        var staged: [Int: ParquetPreStaged] = [:]
+        var i = 0
+        while i < items.count {
+            // Consecutive columns, page-aligned in the batch, up to the cap (a single larger column
+            // stages on its own as before).
+            var j = i, total = 0
+            while j < items.count, total + roundUp(Swift.max(items[j].st.size, 1), to: metalPageSize()) <= cap {
+                total += roundUp(Swift.max(items[j].st.size, 1), to: metalPageSize())
+                j += 1
+            }
+            if j - i < 2 { i = Swift.max(j, i + 1); continue }
+            do {
+                let arena = try MetalArrowBuffer.allocate(byteCount: total, zeroed: false, context: context)
+                var parts: [(staging: ParquetStaging, srcShift: Int, dstShift: Int)] = []
+                var base = 0
+                var bases: [Int] = []
+                for k in i..<j {
+                    parts.append((items[k].st, items[k].source.bindingOffset - common, base))
+                    bases.append(base)
+                    base += roundUp(Swift.max(items[k].st.size, 1), to: metalPageSize())
+                }
+                try runStaging(parts, source: first.source.buffer.mtl, sourceOffset: common, out: arena)
+                for (n, k) in (i..<j).enumerated() {
+                    staged[items[k].leaf.index] = ParquetPreStaged(
+                        buffer: arena, base: bases[n], size: items[k].st.size,
+                        pages: items[k].lp.dataPages.count + items[k].lp.dictPages.count)
+                }
+            } catch {
+                return [:]
+            }
+            ParquetProfile.lap("read.stage-together \(j - i) columns", sync: context)
+            i = j
+        }
+        return staged
     }
 
     private func emptyLeaf(_ leaf: ParquetLeaf, options: ParquetReadOptions) throws -> ParquetLeafData {

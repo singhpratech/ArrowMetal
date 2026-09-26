@@ -74,6 +74,7 @@ public struct ParquetReadOptions: Sendable {
 extension ParquetFile {
     /// Reads the selected columns and row groups into one Metal-resident record batch.
     public func read(_ options: ParquetReadOptions = ParquetReadOptions()) throws -> MetalRecordBatch {
+        ParquetProfile.start()
         let afterStatistics = try selectedRowGroups(options)
         // An equality filter whose value the row group's bloom filter has never seen rules it out.
         let afterBloom = useBloomFilters && options.filters.contains(where: { $0.op == .eq })
@@ -86,18 +87,26 @@ extension ParquetFile {
         let wanted = try selectedFields(options.columns)
         var names: [String] = []
         var columns: [AnyMetalArray] = []
-        // Wrap the bytes this read will touch as one Metal buffer up front. Column chunks are
-        // interleaved by row group, so a single column's chunks span nearly the whole file in a
-        // many-row-group file: wrapping per column would map the same pages once per column.
+        // When the columns read cover most of the bytes they span, wrap that span as one Metal buffer up
+        // front: column chunks are interleaved by row group, so each column's chunks span nearly the
+        // whole file, and wrapping per column would map the same pages once per column. A sparse
+        // projection skips this and maps each column's own chunks (`pageSource(covering:)`).
+        ParquetProfile.lap("read.plan")
+        // Page headers of the chunks read in full (a page-index subset parses only what it keeps).
+        if plan.ranges.isEmpty { prefetchPageHeaders(leaves: wanted.flatMap { $0.leaves }, rowGroups: groups) }
         try prewrap(fields: wanted, rowGroups: groups)
         // One open command buffer for the whole read: the decode is a chain of small kernels per column,
         // and a command buffer per kernel would spend more time on round trips than on the GPU. The
         // handful of places that must read a GPU result (a page scan total, an offsets total) flush and
         // reopen the batch through `MetalContext.syncPoint`.
         try context.batch {
+            // Flat columns read in full have their compressed pages decompressed together, up front.
+            let flat = wanted.compactMap { f -> ParquetLeaf? in if case .leaf(let l) = f.kind { return l } else { return nil } }
+            let staged = plan.ranges.isEmpty && flat.count > 1 ? stageTogether(leaves: flat, rowGroups: groups) : [:]
+            stagedTogetherLastRead = staged.count
             for f in wanted {
                 names.append(f.name)
-                var column = try readField(f, rowGroups: groups, options: options, plan: plan)
+                var column = try readField(f, rowGroups: groups, options: options, plan: plan, staged: staged)
                 // A top-level column takes back what `ARROW:schema` says the Parquet schema lost; a leaf
                 // selected on its own by dotted path reads as the Parquet schema describes it. The stored
                 // schema is advisory: a claim the column cannot take leaves it as the Parquet schema says.
@@ -106,7 +115,9 @@ extension ParquetFile {
                 }
                 columns.append(column)
             }
+            ParquetProfile.lap("read.flush", sync: context)
         }
+        ParquetProfile.lap("read.flush", sync: context)
         var stats = ParquetReadStatistics()
         stats.rowGroupsRead = groups.count
         stats.rowGroupsSkippedByStatistics = (options.rowGroups?.count ?? metadata.rowGroups.count) - afterStatistics.count
@@ -120,12 +131,16 @@ extension ParquetFile {
             // A projection of no columns still has a row count; expose it as an empty batch.
             return try MetalRecordBatch(names: [], columns: [])
         }
-        return try MetalRecordBatch(names: names, columns: columns)
+        let result = try MetalRecordBatch(names: names, columns: columns)
+        ParquetProfile.lap("read.batch")
+        ParquetProfile.report("read \(names.count) columns")
+        return result
     }
 
-    /// Maps the byte span of every column chunk this read will touch, in one `MTLBuffer`.
+    /// Maps the byte span of every column chunk this read will touch, in one `MTLBuffer`, when those
+    /// chunks fill at least four fifths of it (always, for a file not mapped shared).
     private func prewrap(fields: [ParquetField], rowGroups: [Int]) throws {
-        var lo = Int.max, hi = 0
+        var lo = Int.max, hi = 0, total = 0
         for f in fields {
             for leaf in f.leaves {
                 for g in rowGroups {
@@ -134,10 +149,12 @@ extension ParquetFile {
                     let m = rg.columns[leaf.index].meta
                     lo = Swift.min(lo, Int(m.startOffset))
                     hi = Swift.max(hi, Int(m.startOffset) + Int(m.totalCompressedSize))
+                    total += Swift.max(Int(m.totalCompressedSize), 0)
                 }
             }
         }
-        guard lo < hi else { return }
+        // A span of 4 GiB or more cannot be addressed with the decoders' 32-bit offsets anyway.
+        guard lo < hi, !isMappedShared || (total * 5 >= (hi - lo) * 4 && hi - lo < Int(UInt32.max)) else { return }
         _ = try buffer(covering: lo..<Swift.min(hi, fileSize))
     }
 
@@ -183,13 +200,13 @@ extension ParquetFile {
     }
 
     func readField(_ f: ParquetField, rowGroups: [Int], options: ParquetReadOptions,
-                   plan: ParquetReadPlan? = nil) throws -> AnyMetalArray {
+                   plan: ParquetReadPlan? = nil, staged: [Int: ParquetPreStaged]? = nil) throws -> AnyMetalArray {
         // Whole row groups, for the columns that are not trimmed page by page.
         let whole = rowGroups.map { (group: $0, rows: 0..<rowsIn(group: $0)) }
         let trimming = plan.map { !$0.ranges.isEmpty } ?? false
         switch f.kind {
         case .leaf(let l):
-            let d = try decodeLeaf(l, rowGroups: rowGroups, options: options, plan: plan, subset: true)
+            let d = try decodeLeaf(l, rowGroups: rowGroups, options: options, plan: plan, subset: true, staged: staged)
             let a = try d.arrowArray()
             // A leaf below a list, read on its own by dotted path, has one entry per element rather than
             // per row, so there are no rows to trim it to.
