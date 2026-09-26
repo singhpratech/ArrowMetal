@@ -113,6 +113,8 @@ enum ExprCompiler {
         var knownLength: Int
         var lengthBuffer: MetalArrowBuffer?
         var owner: AnyObject
+        /// A utf8 column in the view layout: `values` is the views, `data` the buffer table.
+        var view: StringViewStorage? = nil
     }
 
     static func input(_ a: AnyMetalArray, name: String) throws -> Input {
@@ -137,6 +139,10 @@ enum ExprCompiler {
                          dispatchLength: x.dispatchLength, knownLength: x.knownLength,
                          lengthBuffer: x.lengthBuffer, owner: x)
         case .string(let x), .binary(let x):
+            if let v = x.view {
+                return Input(type: .utf8, values: v.views, data: v.table, validity: x.validity,
+                             dispatchLength: x.length, knownLength: x.length, lengthBuffer: nil, owner: x, view: v)
+            }
             return Input(type: .utf8, values: x.offsets, data: x.data, validity: x.validity,
                          dispatchLength: x.length, knownLength: x.length, lengthBuffer: nil, owner: x)
         case .extended(let e): return try input(e.storage, name: name)
@@ -220,9 +226,12 @@ enum ExprCompiler {
         try Dispatch.checkLength(n)
 
         var schema: [String: ExprColumnInfo] = [:]
-        for (name, c) in inputs { schema[name] = ExprColumnInfo(type: c.type, nullable: c.validity != nil) }
-        let schemaKey = used.sorted().map { "\($0):\(schema[$0]!.type.rawValue):\(schema[$0]!.nullable)" }
-                                     .joined(separator: ",")
+        for (name, c) in inputs {
+            schema[name] = ExprColumnInfo(type: c.type, nullable: c.validity != nil, view: c.view != nil)
+        }
+        let schemaKey = used.sorted().map {
+            "\($0):\(schema[$0]!.type.rawValue):\(schema[$0]!.nullable)" + (schema[$0]!.view ? ":view" : "")
+        }.joined(separator: ",")
 
         switch q.terminal {
         case .project(let ps):
@@ -265,9 +274,9 @@ enum ExprCompiler {
         for l in leaves {
             switch l.type {
             case .utf8:
-                params.append("device const int* LO\(l.index) [[buffer(\(idx))]]")
+                params.append((l.view ? "device const uint4* LO" : "device const int* LO") + "\(l.index) [[buffer(\(idx))]]")
                 bindings.append(Binding(leaf: l.index, role: .values, index: idx)); idx += 1
-                params.append("device const uchar* LD\(l.index) [[buffer(\(idx))]]")
+                params.append((l.view ? "device const SVBuf* LD" : "device const uchar* LD") + "\(l.index) [[buffer(\(idx))]]")
                 bindings.append(Binding(leaf: l.index, role: .data, index: idx)); idx += 1
             case .boolean:
                 params.append("device const uchar* LB\(l.index) [[buffer(\(idx))]]")
@@ -380,6 +389,8 @@ enum ExprCompiler {
             case .validity: buf = c.validity ?? c.values
             }
             enc.setBuffer(buf.mtl, offset: buf.offset, index: b.index)
+            // A view column's table binding also makes its data buffers resident.
+            if b.role == .data, let v = c.view { v.makeResident(enc) }
         }
     }
 

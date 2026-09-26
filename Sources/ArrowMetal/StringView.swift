@@ -96,6 +96,11 @@ public final class StringViewStorage: @unchecked Sendable {
     func bind(_ enc: MTLComputeCommandEncoder, at index: Int) {
         enc.setBuffer(views.mtl, offset: views.offset, index: index)
         enc.setBuffer(table.mtl, offset: table.offset, index: index + 1)
+        makeResident(enc)
+    }
+
+    /// Declares the data buffers the table points into, which the encoder cannot see otherwise.
+    func makeResident(_ enc: MTLComputeCommandEncoder) {
         if !resources.isEmpty { enc.useResources(resources, usage: .read) }
     }
 
