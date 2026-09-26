@@ -440,4 +440,31 @@ final class ParquetTests: XCTestCase {
                         some, "\(codec.name) d, a over row groups \(groups)")
         }
     }
+
+    /// Snappy and LZ4 pages decode the same through the page-per-thread kernel and the
+    /// SIMD-group-per-page kernel: every fixture read with every page sent to one, then to the other,
+    /// against the default split, whole and one row group at a time.
+    func testPagePerThreadAndSimdGroupDecompressionAgree() throws {
+        try requireRealGPU()
+        let names = try FileManager.default.contentsOfDirectory(atPath: Self.fixtures.path)
+            .filter { $0.hasSuffix(".parquet") && ($0.contains("snappy") || $0.contains("lz4")) }.sorted()
+        XCTAssertGreaterThan(names.count, 5)
+        let saved = Decompress.laneRatioQuarters
+        let savedHost = Decompress.hostSnappyMaxBlocks
+        defer { Decompress.laneRatioQuarters = saved; Decompress.hostSnappyMaxBlocks = savedHost }
+        // Small fixtures have few pages; send every Snappy dispatch to the GPU so both kernels run.
+        Decompress.hostSnappyMaxBlocks = 0
+        for name in names {
+            let p = Self.fixtures.appendingPathComponent(name).path
+            func reads(_ quarters: UInt64) throws -> [MetalRecordBatch] {
+                Decompress.laneRatioQuarters = quarters
+                let f = try ParquetFile(path: p)
+                return try [f.read()] + (0..<f.rowGroupCount).map { try f.read(ParquetReadOptions(rowGroups: [$0])) }
+            }
+            let reference = try reads(saved)
+            for q: UInt64 in [0, 1 << 40] {
+                for (i, (a, b)) in zip(reference, try reads(q)).enumerated() { assertEqual(a, b, "\(name) quarters \(q) read \(i)") }
+            }
+        }
+    }
 }

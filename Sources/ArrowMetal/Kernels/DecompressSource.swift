@@ -240,7 +240,7 @@ enum DecompressSource {
                         }
                         matchLen += 4u;
                         hasMatch = 1u;
-                        if (backOff == 0u || backOff > op + litLen || op + litLen + matchLen > dLen) err = DEC_BAD_TOKEN;
+                        if (backOff == 0u || backOff > op + litLen || matchLen > dLen - op - litLen) err = DEC_BAD_TOKEN;
                     }
                 }
                 tlit = litLen; tlsrc = litSrc; tmlen = matchLen; tback = backOff; thas = hasMatch;
@@ -263,6 +263,184 @@ enum DecompressSource {
             op += matchLen;
         }
         if (tid == 0u) status[b] = (op == dLen || err != DEC_OK) ? err : DEC_SHORT;
+    }
+
+    // ---------------------------------------------------------------- one page per thread
+    //
+    // The kernels above spend a SIMD group on a page, and a page of short tokens -- sequential or
+    // low-cardinality integers, timestamps -- is tens of thousands of tokens of a few bytes each, so 31
+    // of the 32 lanes wait while lane 0 parses and every token costs a broadcast and a barrier. These
+    // two decode a page per *thread*: each lane walks its own page's token stream and copies its own
+    // bytes, so a SIMD group advances 32 token streams at once. They are used for pages whose output is
+    // noticeably larger than their input (many tokens); a page that is mostly one long literal still
+    // goes to the SIMD-group kernels, which copy it 32 lanes wide. Same checks, in the same order, and
+    // the same status codes as the SIMD-group kernels.
+
+    // Each lane keeps the last LRING bytes it wrote in its own slice of threadgroup memory. A
+    // back-reference inside that window -- nearly all of them in token-dense pages, whose matches are
+    // a value or two back -- reads from there instead of from device memory, where a byte this thread
+    // stored a moment ago is a round trip to L2 away.
+    #define LRING 256u
+    #define LMASK (LRING - 1u)
+    #define LANES 32u
+
+    // The token stream is read 16 aligned bytes at a time into registers, so parsing a token is not a
+    // chain of one-byte device loads. `abs` is the byte's offset from the binding point, which is page
+    // aligned, and a page is a multiple of 16 bytes, so the aligned block never leaves the mapping.
+    inline uchar lane_rd(device const uchar* src, thread uint& wBase, thread uint4& w, uint abs) {
+        uint blk = abs & ~15u;
+        if (blk != wBase) { wBase = blk; w = *((device const uint4*)(src + blk)); }
+        uint i = abs & 15u;
+        return (uchar)((w[i >> 2] >> ((i & 3u) * 8u)) & 0xFFu);
+    }
+
+    inline void lane_literal(device uchar* o, threadgroup uchar* ring, uint op, device const uchar* f, uint n) {
+        for (uint i = 0u; i < n; i++) {
+            uchar c = f[i];
+            o[op + i] = c;
+            ring[(op + i) & LMASK] = c;
+        }
+    }
+    inline void lane_backcopy(device uchar* o, threadgroup uchar* ring, uint op, uint back, uint n) {
+        if (back <= LRING) {
+            for (uint i = 0u; i < n; i++) {
+                uchar c = ring[(op - back + i) & LMASK];
+                o[op + i] = c;
+                ring[(op + i) & LMASK] = c;
+            }
+        } else {
+            // A thread's own earlier stores are visible to its later loads.
+            for (uint i = 0u; i < n; i++) {
+                uchar c = o[op - back + i];
+                o[op + i] = c;
+                ring[(op + i) & LMASK] = c;
+            }
+        }
+    }
+
+    kernel void snappy_decompress_lane(device const uchar* src [[buffer(0)]],
+                                       device uchar* dst [[buffer(1)]],
+                                       device const BlockDesc* blocks [[buffer(2)]],
+                                       constant uint& nBlocks [[buffer(3)]],
+                                       device uint* status [[buffer(4)]],
+                                       uint b [[thread_position_in_grid]],
+                                       uint lane [[thread_index_in_threadgroup]]) {
+        threadgroup uchar rings[LANES * LRING];
+        threadgroup uchar* ring = rings + lane * LRING;
+        uint wBase = 1u;                 // not a multiple of 16: no block loaded yet
+        uint4 w = uint4(0u);
+        if (b >= nBlocks) return;
+        BlockDesc d = blocks[b];
+        uint sBase = d.srcOffset;
+        device const uchar* s = src + sBase;
+        device uchar* o = dst + d.dstOffset;
+        uint sLen = d.srcLength, dLen = d.dstLength;
+        uint sp = 0u, op = 0u, err = DEC_OK;
+        while (sp < sLen) { uchar c = lane_rd(src, wBase, w, sBase + sp); sp++; if ((c & 0x80u) == 0u) break; }
+        while (op < dLen) {
+            if (sp >= sLen) { err = DEC_SHORT; break; }
+            uint tag = (uint)lane_rd(src, wBase, w, sBase + sp); sp++;
+            uint t = tag & 3u;
+            uint n = 0u, backOff = 0u;
+            if (t == 0u) {
+                uint len = tag >> 2;
+                if (len >= 60u) {
+                    uint extra = len - 59u;
+                    if (sp + extra > sLen) { err = DEC_SHORT; break; }
+                    uint v = 0u;
+                    for (uint k = 0u; k < extra; k++) v |= ((uint)lane_rd(src, wBase, w, sBase + sp + k)) << (8u * k);
+                    sp += extra;
+                    len = v;
+                }
+                n = len + 1u;
+                // Compared as differences so that a length near 2^32 cannot wrap past the checks.
+                if (n > sLen - sp) { err = DEC_SHORT; break; }
+                uint from = sp;
+                sp += n;
+                if (n > dLen - op) { err = DEC_OVERRUN; break; }
+                lane_literal(o, ring, op, s + from, n);
+                op += n;
+                continue;
+            } else if (t == 1u) {
+                if (sp + 1u > sLen) { err = DEC_SHORT; break; }
+                n = 4u + ((tag >> 2) & 7u);
+                backOff = (((tag >> 5) & 7u) << 8) | (uint)lane_rd(src, wBase, w, sBase + sp);
+                sp += 1u;
+            } else {
+                uint nw = (t == 2u) ? 2u : 4u;
+                if (sp + nw > sLen) { err = DEC_SHORT; break; }
+                n = 1u + (tag >> 2);
+                uint v = 0u;
+                for (uint k = 0u; k < nw; k++) v |= ((uint)lane_rd(src, wBase, w, sBase + sp + k)) << (8u * k);
+                sp += nw;
+                backOff = v;
+            }
+            if (op + n > dLen) { err = DEC_OVERRUN; break; }
+            if (backOff == 0u || backOff > op) { err = DEC_BAD_TOKEN; break; }
+            lane_backcopy(o, ring, op, backOff, n);
+            op += n;
+        }
+        status[b] = err;
+    }
+
+    kernel void lz4_decompress_lane(device const uchar* src [[buffer(0)]],
+                                    device uchar* dst [[buffer(1)]],
+                                    device const BlockDesc* blocks [[buffer(2)]],
+                                    constant uint& nBlocks [[buffer(3)]],
+                                    device uint* status [[buffer(4)]],
+                                    uint b [[thread_position_in_grid]],
+                                    uint lane [[thread_index_in_threadgroup]]) {
+        threadgroup uchar rings[LANES * LRING];
+        threadgroup uchar* ring = rings + lane * LRING;
+        uint wBase = 1u;                 // not a multiple of 16: no block loaded yet
+        uint4 w = uint4(0u);
+        if (b >= nBlocks) return;
+        BlockDesc d = blocks[b];
+        uint sBase = d.srcOffset, sLen = d.srcLength, dLen = d.dstLength;
+        if (sLen >= 8u) {
+            uint u = ((uint)src[sBase] << 24) | ((uint)src[sBase+1] << 16) | ((uint)src[sBase+2] << 8) | (uint)src[sBase+3];
+            uint c = ((uint)src[sBase+4] << 24) | ((uint)src[sBase+5] << 16) | ((uint)src[sBase+6] << 8) | (uint)src[sBase+7];
+            if (u == dLen && c == sLen - 8u) { sBase += 8u; sLen -= 8u; }
+        }
+        device const uchar* s = src + sBase;
+        device uchar* o = dst + d.dstOffset;
+        uint sp = 0u, op = 0u, err = DEC_OK;
+        while (op < dLen && err == DEC_OK) {
+            if (sp >= sLen) { err = DEC_SHORT; break; }
+            uint token = (uint)lane_rd(src, wBase, w, sBase + sp); sp++;
+            uint litLen = token >> 4;
+            if (litLen == 15u) {
+                uint c2 = 255u;
+                while (c2 == 255u && sp < sLen) { c2 = (uint)lane_rd(src, wBase, w, sBase + sp); sp++; litLen += c2; }
+            }
+            // Compared as differences so that a length near 2^32 cannot wrap past the checks.
+            if (litLen > sLen - sp || litLen > dLen - op) { err = DEC_OVERRUN; break; }
+            uint litSrc = sp;
+            sp += litLen;
+            uint matchLen = 0u, backOff = 0u;
+            bool hasMatch = false;
+            if (sp + 2u <= sLen) {
+                backOff = (uint)lane_rd(src, wBase, w, sBase + sp) | ((uint)lane_rd(src, wBase, w, sBase + sp + 1u) << 8);
+                sp += 2u;
+                matchLen = token & 15u;
+                if (matchLen == 15u) {
+                    uint c2 = 255u;
+                    while (c2 == 255u && sp < sLen) { c2 = (uint)lane_rd(src, wBase, w, sBase + sp); sp++; matchLen += c2; }
+                }
+                matchLen += 4u;
+                hasMatch = true;
+                if (backOff == 0u || backOff > op + litLen || op + litLen + matchLen > dLen) err = DEC_BAD_TOKEN;
+            }
+            if (err != DEC_OK) break;
+            if (litLen > 0u) {
+                lane_literal(o, ring, op, s + litSrc, litLen);
+                op += litLen;
+            }
+            if (!hasMatch) break;
+            lane_backcopy(o, ring, op, backOff, matchLen);
+            op += matchLen;
+        }
+        status[b] = (op == dLen || err != DEC_OK) ? err : DEC_SHORT;
     }
 
     // ---------------------------------------------------------------- plain copy

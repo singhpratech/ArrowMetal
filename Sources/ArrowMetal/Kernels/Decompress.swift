@@ -59,6 +59,12 @@ enum Decompress {
 
     /// A SNAPPY dispatch of at most this many pages is decompressed on the host (see the type comment).
     static var hostSnappyMaxBlocks = 16
+    /// A page whose output is at least this many quarters of its input goes to the page-per-thread
+    /// kernel (`DecompressSource`): 5, output at least 1.25x the input. On the benchmark file's Snappy
+    /// columns that sends the sequential, low-cardinality and timestamp columns (1.3-18x) to it and the
+    /// random doubles (1.0x, one long literal a page) to the SIMD-group kernel. The tests also set 0
+    /// (every page per thread) and a huge value (none).
+    static var laneRatioQuarters: UInt64 = 5
 
     private static func blockBuffer(_ ctx: MetalContext, _ blocks: [PageBlock]) throws -> MetalArrowBuffer {
         let buf = try MetalArrowBuffer.allocate(byteCount: blocks.count * MemoryLayout<PageBlock>.stride,
@@ -85,29 +91,50 @@ enum Decompress {
 
     private static func gpuDecompress(_ ctx: MetalContext, function: String, source: MTLBuffer, sourceOffset: Int,
                                       blocks: [PageBlock], out: MetalArrowBuffer, codec: ParquetCodec) throws {
-        let desc = try blockBuffer(ctx, blocks)
-        let status = try MetalArrowBuffer.allocate(byteCount: blocks.count * 4, context: ctx)
-        let pso = try ctx.pipeline(source: DecompressSource.source, function: function, cacheKey: "parquet/decompress/\(function)")
-        // One threadgroup per page: thread 0 parses the token stream out of an 8 KB threadgroup-memory
-        // window while all 256 threads move the bytes.
-        try ctx.run { enc in
-            enc.setComputePipelineState(pso)
-            enc.setBuffer(source, offset: sourceOffset, index: 0)
-            enc.setBuffer(out.mtl, offset: out.offset, index: 1)
-            enc.setBuffer(desc.mtl, offset: desc.offset, index: 2)
-            Dispatch.setUInt(enc, blocks.count, index: 3)
-            enc.setBuffer(status.mtl, offset: status.offset, index: 4)
-            enc.dispatchThreadgroups(MTLSize(width: blocks.count, height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        // Pages whose output is at least `laneRatioQuarters` quarters of their input are token-dense and go to the
+        // page-per-thread kernel; the rest (mostly long literals) to the SIMD-group-per-page kernel.
+        var laneIdx: [Int] = [], groupIdx: [Int] = []
+        for (i, b) in blocks.enumerated() {
+            if UInt64(b.dstLength) * 4 >= UInt64(b.srcLength) * laneRatioQuarters { laneIdx.append(i) } else { groupIdx.append(i) }
+        }
+        var pending: [(indices: [Int], status: MetalArrowBuffer, desc: MetalArrowBuffer)] = []
+        for (indices, perThread) in [(groupIdx, false), (laneIdx, true)] where !indices.isEmpty {
+            let desc = try blockBuffer(ctx, indices.map { blocks[$0] })
+            let status = try MetalArrowBuffer.allocate(byteCount: indices.count * 4, context: ctx)
+            let name = perThread ? function + "_lane" : function
+            let pso = try ctx.pipeline(source: DecompressSource.source, function: name, cacheKey: "parquet/decompress/\(name)")
+            try ctx.run { enc in
+                enc.setComputePipelineState(pso)
+                enc.setBuffer(source, offset: sourceOffset, index: 0)
+                enc.setBuffer(out.mtl, offset: out.offset, index: 1)
+                enc.setBuffer(desc.mtl, offset: desc.offset, index: 2)
+                Dispatch.setUInt(enc, indices.count, index: 3)
+                enc.setBuffer(status.mtl, offset: status.offset, index: 4)
+                if perThread {
+                    // One page per thread, in threadgroups of 32 so the pages spread over every core.
+                    let w = 32     // LANES in DecompressSource
+                    enc.dispatchThreadgroups(MTLSize(width: (indices.count + w - 1) / w, height: 1, depth: 1),
+                                             threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
+                } else {
+                    // One SIMD group per page: lane 0 parses the token stream out of an 8 KB
+                    // threadgroup-memory window while all 32 lanes move the bytes.
+                    enc.dispatchThreadgroups(MTLSize(width: indices.count, height: 1, depth: 1),
+                                             threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                }
+            }
+            pending.append((indices, status, desc))
         }
         try ctx.syncPoint()
-        let st = status.typed(UInt32.self)
-        for i in 0..<blocks.count where st[i] != 0 {
-            let why = ["ok", "output overrun", "bad token", "input truncated"][Int(Swift.min(st[i], 3))]
+        var failed: [(Int, UInt32)] = []
+        for p in pending {
+            let st = p.status.typed(UInt32.self)
+            for (k, i) in p.indices.enumerated() where st[k] != 0 { failed.append((i, st[k])) }
+        }
+        if let (i, code) = failed.min(by: { $0.0 < $1.0 }) {
+            let why = ["ok", "output overrun", "bad token", "input truncated"][Int(Swift.min(code, 3))]
             throw ParquetError.malformed("\(codec.name) page \(i) failed to decompress: \(why)")
         }
-        withExtendedLifetime(desc) {}
-        withExtendedLifetime(status) {}
+        withExtendedLifetime(pending) {}
     }
 
     // MARK: - Host codecs
