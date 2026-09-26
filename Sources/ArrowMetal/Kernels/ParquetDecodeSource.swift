@@ -300,11 +300,14 @@ enum ParquetDecodeSource {
     }
 
     // Dictionary indices (and RLE booleans): the same hybrid stream, decoded straight into the page's
-    // dense value slots. No ranking is needed here -- the values are already dense.
+    // dense value slots. No ranking is needed here -- the values are already dense. With `addBase`, each
+    // page's dictionary base is added as the codes are written, so several row groups (each with its own
+    // dictionary page) share one concatenated dictionary and one code array.
     kernel void pq_decode_rle_values(device const uchar* data [[buffer(0)]],
                                      device const PageInfo* pages [[buffer(1)]],
                                      constant uint& nPages [[buffer(2)]],
                                      device uint* out [[buffer(3)]],
+                                     constant uint& addBase [[buffer(4)]],
                                      uint tgid [[threadgroup_position_in_grid]],
                                      uint tid [[thread_position_in_threadgroup]]) {
         threadgroup uint rKind[PQ_MAXRUNS], rVal[PQ_MAXRUNS], rSkip[PQ_MAXRUNS], rStart[PQ_MAXRUNS + 1u];
@@ -315,6 +318,7 @@ enum ParquetDecodeSource {
         uint bw = pg.bitWidth;
         uint start = pg.valuesOffset, end = pg.valuesOffset + pg.valuesLength;
         uint count = pg.nonNullCount;
+        uint base = addBase != 0u ? pg.dictBase : 0u;
 
         if (tid == 0u) { sPos = start; sSkip = 0u; sEmitted = 0u; sRuns = 0u; sBatch = 0u; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -357,13 +361,16 @@ enum ParquetDecodeSource {
                 while (lo < hi) { uint mid = (lo + hi + 1u) >> 1; if (rStart[mid] <= k) lo = mid; else hi = mid - 1u; }
                 uint idx = rSkip[lo] + (k - rStart[lo]);
                 uint value = (rKind[lo] != 0u) ? pq_bp_get(data, rVal[lo], idx, bw) : rVal[lo];
-                out[pg.nonNullOffset + emitted + k] = value;
+                out[pg.nonNullOffset + emitted + k] = value + base;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (tid == 0u) sEmitted = emitted + bn;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (sEmitted >= count) break;
         }
+        // A stream that runs out before the page's count leaves the rest of its slots at 0 (plus the
+        // base), so every slot of the page is written and the output needs no zero fill beforehand.
+        for (uint k = sEmitted + tid; k < count; k += PQ_TG) out[pg.nonNullOffset + k] = base;
     }
 
     // ------------------------------------------------------------------ per-page prefix sums
@@ -523,19 +530,6 @@ enum ParquetDecodeSource {
             uint dst = v * width;
             for (uint k = 0u; k < width; k++) out[dst + k] = dict[src + k];
         }
-    }
-
-    // Adds each page's dictionary base to its codes, so several row groups (each with its own dictionary
-    // page) can share one concatenated dictionary and one code array.
-    kernel void pq_dict_rebase(device uint* codes [[buffer(0)]],
-                               device const PageInfo* pages [[buffer(1)]],
-                               constant uint& nPages [[buffer(2)]],
-                               uint tgid [[threadgroup_position_in_grid]],
-                               uint tid [[thread_position_in_threadgroup]]) {
-        if (tgid >= nPages) return;
-        PageInfo pg = pages[tgid];
-        if (pg.dictBase == 0u) return;
-        for (uint j = tid; j < pg.nonNullCount; j += PQ_TG) codes[pg.nonNullOffset + j] += pg.dictBase;
     }
 
     // Dense values -> row positions, using the ranks from the level decoder. Null rows keep whatever the

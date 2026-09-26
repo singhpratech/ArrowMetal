@@ -118,8 +118,8 @@ Arrow offsets buffer, and one gather moves every byte of the column in parallel.
 ### Several row groups, one dictionary
 
 A dictionary column is decoded across every selected row group in a single pass even though each row group
-has its own dictionary page: the dictionaries are concatenated, and `pq_dict_rebase` adds each page's
-dictionary base to its codes. The result is one Arrow dictionary array over a merged (not deduplicated)
+has its own dictionary page: the dictionaries are concatenated, and `pq_decode_rle_values` adds each
+page's dictionary base to its codes as it writes them. The result is one Arrow dictionary array over a merged (not deduplicated)
 dictionary, which is exactly what Arrow allows.
 
 ### Decompression

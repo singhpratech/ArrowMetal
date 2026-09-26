@@ -49,10 +49,17 @@ struct ParquetValueDecoder {
         // Dictionary codes, when any page needs them.
         var codes: MetalArrowBuffer? = nil
         if let dictPages = g[.rleDictionary] {
-            let c = try MetalArrowBuffer.allocate(byteCount: Swift.max(totalNonNull * 4, 4), zeroed: true, context: ctx)
+            // `pq_decode_rle_values` writes every slot of the pages it decodes, so when every page is a
+            // dictionary page the codes need no zero fill, only their padding past the last code (a
+            // chunk that mixes in PLAIN pages leaves their slots to the fill, as before).
+            let everySlot = g.count == 1
+            let c = try MetalArrowBuffer.allocate(byteCount: Swift.max(totalNonNull * 4, 4), zeroed: !everySlot, context: ctx)
+            if everySlot {
+                let used = totalNonNull * 4
+                memset(c.mutableContents.advanced(by: used), 0, c.mtl.length - c.offset - used)
+            }
             let sub = try subset(dictPages)
-            try runRLEValues(pages: sub, count: dictPages.count, out: c)
-            try runDictRebase(pages: sub, count: dictPages.count, codes: c)
+            try runRLEValues(pages: sub, count: dictPages.count, out: c, addDictBase: true)
             codes = c
         }
 
@@ -331,19 +338,13 @@ struct ParquetValueDecoder {
             enc.setBuffer(out.mtl, offset: out.offset, index: 4)
         }
     }
-    func runRLEValues(pages: MetalArrowBuffer, count: Int, out: MetalArrowBuffer) throws {
+    func runRLEValues(pages: MetalArrowBuffer, count: Int, out: MetalArrowBuffer, addDictBase: Bool = false) throws {
         try perPage("pq_decode_rle_values", count: count) { enc in
             enc.setBuffer(pageData, offset: pageDataOffset, index: 0)
             enc.setBuffer(pages.mtl, offset: pages.offset, index: 1)
             Dispatch.setUInt(enc, count, index: 2)
             enc.setBuffer(out.mtl, offset: out.offset, index: 3)
-        }
-    }
-    func runDictRebase(pages: MetalArrowBuffer, count: Int, codes: MetalArrowBuffer) throws {
-        try perPage("pq_dict_rebase", count: count) { enc in
-            enc.setBuffer(codes.mtl, offset: codes.offset, index: 0)
-            enc.setBuffer(pages.mtl, offset: pages.offset, index: 1)
-            Dispatch.setUInt(enc, count, index: 2)
+            Dispatch.setUInt(enc, addDictBase ? 1 : 0, index: 4)
         }
     }
     func runDictGatherFixed(dict: MetalArrowBuffer, codes: MetalArrowBuffer, pages: MetalArrowBuffer,
