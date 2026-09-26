@@ -6,6 +6,10 @@ warm-up, the best of up to five calls, wall milliseconds with the process CPU mi
 same call beside them. pyarrow is always measured; Polars is measured when it is installed. Every
 ArrowMetal answer is checked against pyarrow's before anything is printed.
 
+The data: int64 `v` uniform in [-1,000,000, 1,000,000) with 10% nulls, float64 `f` standard normal,
+int32 `k` uniform over 1,000 keys, all drawn with pyarrow.compute from seeded SplitMix64 streams
+(`make_data`), so the bench needs nothing beyond `pip install arrowmetal` (no NumPy).
+
 Nothing is written and nothing is sent: the script prints, and the "Share it" block at the end is
 text to paste into a GitHub issue or the Discord channel if you want to.
 
@@ -26,6 +30,7 @@ never its path, column names or values.
 """
 import argparse
 import json
+import math
 import os
 import platform
 import resource
@@ -107,19 +112,62 @@ def machine_line(m, versions):
 
 # ---- the data
 
+_M64 = (1 << 64) - 1
+_GOLDEN = 0x9E3779B97F4A7C15
+
+
+def _mix64(z):
+    """SplitMix64's finaliser on a Python int."""
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _M64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _M64
+    return z ^ (z >> 31)
+
+
+def _u64(v):
+    return pa.scalar(v, pa.uint64())
+
+
+def _random_u64(rows, seed, stream):
+    """`rows` uniform uint64s: SplitMix64 (state_i = start + i * golden, then the finaliser) computed
+    column-wise with pyarrow.compute, whose unchecked integer kernels wrap modulo 2^64. Deterministic
+    for (seed, stream), and no NumPy."""
+    start = _mix64((seed * 0x100 + stream) & _M64)
+    z = pc.add(pc.cumulative_sum(pa.repeat(_u64(_GOLDEN), rows)), _u64(start))
+    z = pc.multiply(pc.bit_wise_xor(z, pc.shift_right(z, _u64(30))), _u64(0xBF58476D1CE4E5B9))
+    z = pc.multiply(pc.bit_wise_xor(z, pc.shift_right(z, _u64(27))), _u64(0x94D049BB133111EB))
+    return pc.bit_wise_xor(z, pc.shift_right(z, _u64(31)))
+
+
+def _below(u, m):
+    """`u mod m` for uint64 `u` (the bias is m / 2^64, below 1e-12 for the bounds used here)."""
+    return pc.subtract(u, pc.multiply(pc.divide(u, _u64(m)), _u64(m)))
+
+
+def _unit(u, open_low=False):
+    """The top 53 bits of `u` as a float64 in [0, 1), or (0, 1] with `open_low`."""
+    top = pc.shift_right(u, _u64(11))
+    if open_low:
+        top = pc.add(top, _u64(1))
+    return pc.multiply(pc.cast(top, pa.float64()), 2.0 ** -53)
+
+
 def make_data(rows, seed=SEED):
-    """int64 `v` with ~10% nulls, float64 `f`, int32 `k` with 1,000 distinct keys."""
-    import numpy as np      # the generated dataset only; --parquet runs without NumPy
-    rng = np.random.default_rng(seed)
-    v = rng.integers(-1_000_000, 1_000_000, size=rows, dtype=np.int64)
-    mask = rng.random(rows) < NULL_FRACTION
-    f = rng.standard_normal(rows)
-    k = rng.integers(0, KEYS, size=rows, dtype=np.int32)
-    return {
-        "v": pa.array(v, mask=mask, type=pa.int64()),
-        "f": pa.array(f, type=pa.float64()),
-        "k": pa.array(k, type=pa.int32()),
-    }
+    """int64 `v` uniform in [-1,000,000, 1,000,000) with ~10% nulls, float64 `f` standard normal,
+    int32 `k` uniform over 1,000 distinct keys.
+
+    Drawn with pyarrow.compute only, so the bench runs on a plain `pip install arrowmetal`: five
+    SplitMix64 streams (`_random_u64`), `v` and `k` by modulo, the null mask by comparing a stream
+    against 10% of 2^64, and `f` by the Box-Muller transform of two uniform streams.
+    """
+    v = pc.cast(pc.subtract(pc.cast(_below(_random_u64(rows, seed, 0), 2_000_000), pa.int64()), 1_000_000),
+                pa.int64())
+    nulls = pc.less(_random_u64(rows, seed, 1), _u64(int(NULL_FRACTION * 2**64)))
+    v = pc.if_else(nulls, pa.scalar(None, pa.int64()), v)
+    u1 = _unit(_random_u64(rows, seed, 2), open_low=True)
+    u2 = _unit(_random_u64(rows, seed, 3))
+    f = pc.multiply(pc.sqrt(pc.multiply(pc.ln(u1), -2.0)), pc.cos(pc.multiply(u2, 2.0 * math.pi)))
+    k = pc.cast(_below(_random_u64(rows, seed, 4), KEYS), pa.int32())
+    return {"v": v, "f": f, "k": k}
 
 
 def _polars(enabled):
@@ -666,7 +714,10 @@ def main_parquet(path, a):
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="python -m arrowmetal.bench",
-                                description="CPU (pyarrow, Polars if installed) against ArrowMetal on this Mac.")
+                                description="CPU (pyarrow, Polars if installed) against ArrowMetal on this Mac.",
+                                epilog="The generated dataset: int64 v uniform in [-1,000,000, 1,000,000) with 10%% "
+                                       "nulls, float64 f standard normal, int32 k uniform over 1,000 keys, drawn "
+                                       "with pyarrow.compute from seeded SplitMix64 streams (no NumPy).")
     p.add_argument("--rows", type=int, default=10_000_000, help="rows in the generated dataset (default 10,000,000)")
     p.add_argument("--json", action="store_true", help="print one JSON object instead of the text report")
     p.add_argument("--quiet", action="store_true", help="print the table only")
@@ -680,12 +731,6 @@ def main(argv=None):
         p.error("--rows must be at least 1")
     if a.parquet:
         return main_parquet(a.parquet, a)
-    try:
-        import numpy  # noqa: F401
-    except ImportError:
-        print("arrowmetal.bench: the generated dataset needs NumPy, which is not installed "
-              "(pip install numpy); --parquet FILE runs without it.", file=sys.stderr)
-        return 2
 
     # The router runs as it does for every user, `auto` unless ARROWMETAL_ROUTER says otherwise: at the
     # default row count every routed operation lands on the GPU, and a smaller --rows shows the CPU loop

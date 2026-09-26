@@ -94,7 +94,7 @@ This produces `python/dist/arrowmetal-X.Y.Z-py3-none-macosx_14_0_arm64.whl` with
 ```
 twine check python/dist/*.whl
 unzip -l python/dist/*.whl | grep _lib          # both dylibs must be in the archive
-PYTHON=python3.13 scripts/check_wheel.sh        # fresh virtualenv + Polars from PyPI: all four tiers
+PYTHON=python3.13 scripts/check_wheel.sh        # fresh virtualenv + [polars] extra: four tiers, bench
 python -m venv /tmp/am-wheel && /tmp/am-wheel/bin/pip install python/dist/*.whl
 cd /tmp && /tmp/am-wheel/bin/python -c "import arrowmetal as am; print(am.device_name())"
 cd - && /tmp/am-wheel/bin/pip install "$(echo python/dist/arrowmetal-X.Y.Z-*.whl)[polars,duckdb,pandas]"

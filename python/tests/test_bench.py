@@ -6,6 +6,7 @@ import sys
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from arrowmetal import bench
@@ -148,7 +149,7 @@ def test_parquet_without_a_supported_column_says_so(tmp_path):
     assert out.stdout == ""
 
 
-def test_parquet_runs_without_numpy_and_the_generated_dataset_says_it_needs_it(tmp_path):
+def test_both_modes_run_without_numpy(tmp_path):
     # pyarrow and Polars install without NumPy, and so does the wheel.
     path = _write(tmp_path, {"v": pa.array([float(i) for i in range(5_000)]),
                              "k": pa.array([i % 3 for i in range(5_000)], pa.int32())})
@@ -156,9 +157,31 @@ def test_parquet_runs_without_numpy_and_the_generated_dataset_says_it_needs_it(t
     out = _run([], code=hide + f"sys.exit(main(['--parquet', {path!r}, '--quiet']))")
     assert out.returncode == 0, out.stderr
     assert "sum float64 by int32 key (3 groups)" in out.stdout
-    out = _run([], code=hide + "sys.exit(main(['--rows', '1000']))")
-    assert out.returncode == 2
-    assert "needs NumPy" in out.stderr and "--parquet FILE runs without it" in out.stderr
+    out = _run([], code=hide + f"sys.exit(main(['--rows', '{ROWS}', '--json']))")
+    assert out.returncode == 0, out.stderr
+    assert json.loads(out.stdout)["match"] is True
+
+
+def test_generated_dataset_has_the_documented_shape():
+    n = 200_000
+    d = bench.make_data(n)
+    v, f, k = d["v"], d["f"], d["k"]
+    assert (v.type, f.type, k.type) == (pa.int64(), pa.float64(), pa.int32())
+    assert len(v) == len(f) == len(k) == n
+    assert abs(v.null_count / n - 0.10) < 0.005
+    mm = pc.min_max(v).as_py()
+    assert -1_000_000 <= mm["min"] < -990_000 and 990_000 < mm["max"] < 1_000_000
+    assert abs(pc.mean(f).as_py()) < 0.01 and abs(pc.stddev(f).as_py() - 1.0) < 0.01
+    assert not pc.any(pc.is_nan(f)).as_py()
+    assert pc.count_distinct(k).as_py() == 1_000
+    assert pc.min_max(k).as_py() == {"min": 0, "max": 999}
+    # seeded: the same rows every run, and the SplitMix64 stream matches a plain-Python reference
+    again = bench.make_data(n)
+    assert v.equals(again["v"]) and f.equals(again["f"]) and k.equals(again["k"])
+    mask = (1 << 64) - 1
+    start = bench._mix64((bench.SEED * 0x100 + 3) & mask)
+    want = [bench._mix64((start + i * bench._GOLDEN) & mask) for i in range(1, 9)]
+    assert bench._random_u64(8, bench.SEED, 3).to_pylist() == want
 
 
 def test_parquet_string_only_file_measures_the_read_only(tmp_path):

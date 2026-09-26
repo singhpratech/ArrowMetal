@@ -36,8 +36,10 @@ The second line generates 10,000,000 rows, runs sum, filter, sort and group-by s
 pyarrow's. It prints one table for your Mac, wall and CPU milliseconds per call, with a block ready to
 paste into a [benchmark result](https://github.com/singhpratech/ArrowMetal/issues/new?template=benchmark_result.yml)
 issue or the `#benchmarks` channel of the Discord linked from the
-[README](https://github.com/singhpratech/ArrowMetal#readme); nothing is sent. The generated dataset
-is drawn with NumPy, which pyarrow does not install: without it the command says so and exits.
+[README](https://github.com/singhpratech/ArrowMetal#readme); nothing is sent. The dataset (int64 values
+uniform in [-1,000,000, 1,000,000) with 10% nulls, standard-normal float64s, int32 keys uniform over
+1,000 values) is drawn with `pyarrow.compute` from seeded SplitMix64 streams, so the command needs
+nothing beyond `pip install arrowmetal`.
 
 `python -m arrowmetal.bench --parquet data.parquet` runs on your own file instead. It reads the file's
 integer, floating-point and string columns with pyarrow, Polars and ArrowMetal, then runs sum and
@@ -47,7 +49,7 @@ against pyarrow's. The report, the Share it block and the prefilled issue link c
 count, column count, row groups, size and codecs and the timings, never its path, column names or
 values. A file whose columns would take more than a quarter of physical memory is refused, with the
 limit printed (the bench holds the columns up to four times at once), and a file with no integer,
-floating-point or string column gets one line saying so. `--parquet` needs no NumPy.
+floating-point or string column gets one line saying so.
 
 ```python
 import pyarrow as pa, arrowmetal as am
@@ -147,12 +149,13 @@ The version comes from one place, `__version__` in `arrowmetal/__init__.py`; `py
 `ARROWMETAL_POLARS_PLUGIN_DYLIB` at an already built plugin (then cargo is not needed), and `PLAT_TAG`
 overrides the platform tag.
 
-`scripts/check_wheel.sh [wheel]` installs the wheel and Polars from PyPI into a fresh virtualenv in a
-temporary directory, and from there, with a scrubbed environment (no `PYTHONPATH`, `ARROWMETAL_*` or
+`scripts/check_wheel.sh [wheel]` installs the wheel with its `polars` extra (Polars from PyPI) into a
+fresh virtualenv in a temporary directory, and from there, with a scrubbed environment (no `PYTHONPATH`, `ARROWMETAL_*` or
 `DYLD_*` variables, no cargo on `PATH`), runs a tier-1 group-by, tier-2 `sum`, `filter_sum` and
 `device` expressions, a tier-3 `collect_gpu` and a tier-4 `MetalEngine` collect against Polars' own
 answers, checks that the process loaded exactly one `libArrowMetalC.dylib`, the packaged one, and runs
-`python -m arrowmetal.bench --parquet` on a 1,000,000-row file.
+`python -m arrowmetal.bench` (10,000,000 generated rows) and `python -m arrowmetal.bench --parquet` on a
+1,000,000-row file.
 
 ### Where the dylib is found
 

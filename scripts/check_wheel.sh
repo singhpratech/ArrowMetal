@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Install a built wheel into a fresh virtualenv and run all four Polars tiers, and
-# `python -m arrowmetal.bench --parquet`, from it.
+# Install a built wheel with its `polars` extra into a fresh virtualenv and run all four Polars tiers,
+# `python -m arrowmetal.bench` and `python -m arrowmetal.bench --parquet` from it.
 #
 # The check the release runs before any upload (docs/RELEASE.md step 4): the wheel alone, with Polars
 # from PyPI, must give every tier. The virtualenv lives in a new temporary directory outside this
@@ -13,13 +13,13 @@
 # Usage:
 #   scripts/check_wheel.sh                                   # the newest python/dist/arrowmetal-*.whl
 #   scripts/check_wheel.sh python/dist/arrowmetal-X.Y.Z-py3-none-macosx_14_0_arm64.whl
-#   PYTHON=python3.12 POLARS_SPEC='polars==1.44.1' scripts/check_wheel.sh
+#   PYTHON=python3.12 POLARS_SPEC='polars==1.44.1' scripts/check_wheel.sh   # instead of the extra's pin
 #   KEEP_VENV=1 scripts/check_wheel.sh                       # leave the virtualenv for inspection
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${PYTHON:-python3}"
-POLARS_SPEC="${POLARS_SPEC:-polars}"
+POLARS_SPEC="${POLARS_SPEC:-}"
 WHEEL="${1:-$(ls -t "$ROOT"/python/dist/arrowmetal-*.whl 2>/dev/null | head -1)}"
 if [[ -z "$WHEEL" || ! -f "$WHEEL" ]]; then
     echo "error: no wheel given and none in python/dist; build one with scripts/build_wheel.sh" >&2
@@ -34,8 +34,13 @@ CLEAN=(env -i "HOME=$HOME" "PATH=/usr/bin:/bin:/usr/sbin:/sbin" "TMPDIR=${TMPDIR
 
 echo "==> fresh virtualenv in $WORK/venv ($("$PY_ABS" --version))"
 "${CLEAN[@]}" "$PY_ABS" -m venv "$WORK/venv"
-echo "==> pip install $(basename "$WHEEL") $POLARS_SPEC"
-(cd "$WORK" && "${CLEAN[@]}" "$WORK/venv/bin/python" -m pip install -q --disable-pip-version-check "$WHEEL" "$POLARS_SPEC")
+if [[ -n "$POLARS_SPEC" ]]; then
+    SPECS=("$WHEEL" "$POLARS_SPEC")
+else
+    SPECS=("$WHEEL[polars]")        # the extra's own pin
+fi
+echo "==> pip install ${SPECS[*]##*/}"
+(cd "$WORK" && "${CLEAN[@]}" "$WORK/venv/bin/python" -m pip install -q --disable-pip-version-check "${SPECS[@]}")
 
 echo "==> the four tiers, from $WORK"
 cd "$WORK"
@@ -106,7 +111,12 @@ for p in ours:
 assert sorted(os.path.realpath(p) for p in ours) == sorted(
     os.path.realpath(os.path.join(lib_dir, b)) for b in ("libArrowMetalC.dylib", "libarrowmetal_polars.dylib")), ours
 
-# The bench on a Parquet file, from the installed package.
+# The bench, from the installed package: the generated 10,000,000 rows, then a Parquet file.
+r = subprocess.run([sys.executable, "-m", "arrowmetal.bench", "--no-share"], capture_output=True, text=True)
+print("bench      python -m arrowmetal.bench --no-share")
+print(r.stdout.rstrip())
+assert r.returncode == 0, r.stderr
+
 n = 1_000_000
 pq.write_table(pa.table({"k": pa.array([i % 7 for i in range(n)], pa.int32()),
                          "v": pa.array([float(i) for i in range(n)])}), "bench.parquet")
@@ -115,5 +125,5 @@ r = subprocess.run([sys.executable, "-m", "arrowmetal.bench", "--parquet", "benc
 print("bench      python -m arrowmetal.bench --parquet bench.parquet --quiet")
 print(r.stdout.rstrip())
 assert r.returncode == 0, r.stderr
-print("OK: all four tiers and bench --parquet from the wheel, no cargo, no DYLD_LIBRARY_PATH")
+print("OK: all four tiers, bench and bench --parquet from the wheel, no cargo, no DYLD_LIBRARY_PATH")
 PY
