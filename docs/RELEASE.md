@@ -5,7 +5,8 @@ the repository itself never publishes anything.
 
 **The version number is changed only when a release is decided, in every manifest at once**, and not
 between releases: work after a release goes under an "Unreleased" heading in CHANGELOG.md until the
-next one. Read `X.Y.Z` below as the version being released.
+next one. Read `X.Y.Z` below as the version being released: for 0.3.0, the wheel
+`arrowmetal-0.3.0-py3-none-macosx_14_0_arm64.whl` and the tags `v0.3.0` and `go/arrowmetal/v0.3.0`.
 
 ## 0. Preconditions
 
@@ -19,25 +20,51 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test             
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test -c release    # release
 
 swift build -c release --product ArrowMetalC
+export ARROWMETAL_LIB=$PWD/.build/release/libArrowMetalC.dylib   # pin the library under test
+PYTHONPATH=python python -c "import arrowmetal as am; print(am._find_library())"   # must print it
 PYTHONPATH=python python -m pytest python/tests -q
 ```
 
-The binding suites run as well ([TESTING.md](TESTING.md), "Run everything"). Confirm the Python
-version is stated in exactly one place and that every binding's own manifest agrees:
+The DuckDB extensions are rebuilt against this library before their suites run, so that
+`test_duckdb*.py` runs rather than skips (the rewrite extension targets the DuckDB of the Python given
+as `PYTHON`):
+
+```
+PYTHON=python duckdb-extension/build.sh
+PYTHON=python duckdb-extension/build_rewrite.sh
+PYTHONPATH=python python -m pytest python/tests/test_duckdb*.py -q -rs    # 0 skipped
+```
+
+The binding suites run as well ([TESTING.md](TESTING.md), "Run everything"), each against the pinned
+library:
+
+```
+(cd rust && cargo test --release)                  # both crates, doc-tests included
+(cd go/arrowmetal && go test -count=1 ./...)
+(cd go/arrowmetal && GOEXPERIMENT=cgocheck2 go test -count=1 ./...)
+(cd node && npm install && npm test)
+Rscript -e 'testthat::test_local("r/arrowmetal")'
+(cd polars-plugin && cargo build --release && cargo test --release)
+```
+
+Confirm the Python version is stated in exactly one place and that every binding's own manifest
+agrees:
 
 ```
 grep -rn '__version__' python/arrowmetal/__init__.py       # the single source
 grep -n 'version' python/pyproject.toml                    # must be `dynamic`, reading the above
 grep -nE 'X\.Y\.Z' rust/Cargo.toml rust/arrowmetal/Cargo.toml polars-plugin/Cargo.toml \
     polars-plugin/arrowmetal-sys/Cargo.toml node/package.json r/arrowmetal/DESCRIPTION \
-    duckdb-extension/CMakeLists.txt duckdb-extension/build.sh   # all must read X.Y.Z
+    duckdb-extension/CMakeLists.txt duckdb-extension/build.sh duckdb-extension/build_rewrite.sh \
+    Sources/ArrowMetalC/ArrowMetalC.swift CITATION.cff   # all must read X.Y.Z
+git grep -nF '<previous version>'   # only history (changelog, findings, results headers) may name it
 ```
 
 ## 1. Rehearse the upload on TestPyPI
 
 ```
 python -m pip install --upgrade build twine
-python/build_wheel.sh
+PYTHON=python python/build_wheel.sh      # the dylib and the Polars plugin, built by cargo, in _lib/
 twine check python/dist/*.whl
 twine upload --repository testpypi python/dist/*.whl
 
@@ -52,8 +79,9 @@ Only when TestPyPI installs and imports cleanly does the real upload happen (ste
 
 ## 2. Freeze the changelog
 
-`CHANGELOG.md` opens with `## X.Y.Z`. Confirm nothing above that heading names a later version, leave
-the content alone, and commit if anything changed. No date: the repository does not date its entries.
+`CHANGELOG.md` opens with `## Unreleased` ("Nothing yet.") and then `## X.Y.Z — YYYY-MM-DD`, dated the
+day the version is bumped, whose first paragraph states the release's headline facts. Confirm nothing
+above that heading names a later version, leave the content alone, and commit if anything changed.
 
 `python/README.md` is the PyPI long description (`readme = "README.md"` in `python/pyproject.toml`):
 its links must be absolute URLs, because PyPI does not rewrite relative ones.
@@ -94,7 +122,10 @@ This produces `python/dist/arrowmetal-X.Y.Z-py3-none-macosx_14_0_arm64.whl` with
 ```
 twine check python/dist/*.whl
 unzip -l python/dist/*.whl | grep _lib          # both dylibs must be in the archive
-PYTHON=python3.13 scripts/check_wheel.sh        # fresh virtualenv + [polars] extra: four tiers, bench
+PYTHON=python3.13 scripts/check_wheel.sh \
+    python/dist/arrowmetal-X.Y.Z-py3-none-macosx_14_0_arm64.whl
+    # fresh virtualenv, [polars] extra, no NumPy, no cargo: four tiers, bench, bench --parquet,
+    # and exactly one libArrowMetalC.dylib loaded, the packaged one
 python -m venv /tmp/am-wheel && /tmp/am-wheel/bin/pip install python/dist/*.whl
 cd /tmp && /tmp/am-wheel/bin/python -c "import arrowmetal as am; print(am.device_name())"
 cd - && /tmp/am-wheel/bin/pip install "$(echo python/dist/arrowmetal-X.Y.Z-*.whl)[polars,duckdb,pandas]"

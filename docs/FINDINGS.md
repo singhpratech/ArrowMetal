@@ -2,6 +2,94 @@
 
 Things learned the hard way. Add to this whenever something surprises you.
 
+## Round 14 (2026-09-26): what the 0.3.0 reviews and sweeps found
+
+**TL;DR**
+
+- The Polars engine imported NumPy for one reciprocal. NumPy comes with neither the wheel, pyarrow nor
+  Polars, so on a clean install the engine raised `ModuleNotFoundError`.
+- One 790 KB Snappy dictionary page took about 94 ms on the GPU, most of a 1,000,000-row read.
+- A grid of 2^32 threads or more wraps on the GPU, which made group-bys over 2^24 groups or more return
+  nulls: [round 13](#round-13-2026-09-26-a-grid-of-232-threads-runs-almost-none-of-them).
+- The engine conformance grid found three answers of the Polars engine different from Polars'. All three
+  now match.
+- The engine's first crossover table was fitted from a sweep that started at a load average of 50.8.
+  The sweeps rerun from a quiet start moved it: String shapes from 5,000,000 rows, the rows/2
+  group-count bucket never taken, and every shape taken from 1.5 times its fitted crossover.
+
+Each change below is in 0.3.0.
+
+### 1. The Polars engine needed NumPy
+
+Polars divides a column by a scalar as `x * (1 / c)`, with the reciprocal rounded in the result type,
+and the engine emits the same multiply so the bits match ([POLARS.md](POLARS.md#where-the-answers-would-differ-and-what-the-engine-emits-instead)).
+It computed that reciprocal with NumPy. NumPy is installed by none of the wheel, pyarrow and Polars, so
+in a fresh virtualenv holding the wheel and its `polars` extra, tier 4 raised `ModuleNotFoundError`.
+Found by installing the wheel alone (`scripts/check_wheel.sh`). The reciprocal is now computed with
+Python floats, identical to the NumPy result on 800,046 checked values, zeros, infinities, NaN and
+subnormals among them, and `scripts/check_wheel.sh` runs all four tiers with NumPy not installed
+([POLARS.md](POLARS.md#install)).
+
+### 2. One Snappy page took 94 ms on the GPU
+
+A 1,000,000-row file with an `int64` and a `float64` column, written with pyarrow's defaults, read in
+102-106 ms, 94 ms of it one 790 KB dictionary page. Every Snappy page was decompressed by one GPU SIMD
+group, and one worker walks a page's token stream from start to end however the page is decoded. A
+token-dense page is tens of thousands of tokens of a few bytes: on the GPU it costs 130 ns per output
+byte on a SIMD group, on one host core 0.42 ns ([PARQUET.md](PARQUET.md#decompression)). The first fix
+decoded dictionary pages, and dispatches of at most 16 pages, on the host (20-36 ms for that file). The
+reader now splits the Snappy and LZ4 pages of a read between the host and the GPU by how token-dense each
+page header says it is, from measured costs on each side, and runs both at once: the 10,000,000-row,
+7-column pyarrow-default Snappy file reads in 25.4 ms against 67.5 ms, its token-dense pages, the
+790 KB dictionary pages among them, on the host.
+
+### 3. A grid of 2^32 threads
+
+[Round 13](#round-13-2026-09-26-a-grid-of-232-threads-runs-almost-none-of-them).
+
+### 4. Three engine answers that differed from Polars'
+
+The engine conformance grid (`python/tests/engine_report.py`) compares the Polars engine with
+`lf.collect()` bit for bit over generated shapes, dtypes, null patterns and sizes from 0 to 100,000
+rows ([COVERAGE.md](COVERAGE.md#engines)). It found three answers that differed, each now the same as
+Polars' ([POLARS.md](POLARS.md#where-the-answers-would-differ-and-what-the-engine-emits-instead)):
+
+- **A column of one row.** Polars divides by a scalar as a reciprocal multiply and multiplies a float
+  column by -1 as a negation, except over a column of one row, where the scalar and the column have the
+  same length and it computes element-wise. The engine now chooses by the input's row count: from the
+  in-memory frame, or counted when the plan runs if a filter or join decides it.
+- **-0.0 and 0.0.** Polars' `min` and `max` order -0.0 below 0.0; ArrowMetal treats the two as equal.
+  The engine counts the zeros of the sign Polars prefers and takes the sign from that count.
+- **A Float32 `mean`.** Polars accumulates it in Float64. The engine casts the column to Float64 first,
+  and the two match bit for bit.
+
+The recorded run: 12,597 Polars cases, 12,392 pass, 32 documented (float summation order), 0
+unclassified (`Benchmarks/results/engine_conformance_2026-09-25.csv`).
+
+### 5. Crossovers fitted on a busy machine
+
+The default `MetalEngine()` takes a subtree from its measured crossover against the faster Polars engine
+([POLARS.md](POLARS.md#which-translatable-subtrees-it-runs-the-defaults)). The first table was fitted
+from `Benchmarks/results/polars_engine_crossover_2026-09-26.csv`, a sweep that started at a load
+average of 50.8 and ran between 13.6 and 58.2 (`polars_engine_crossover_2026-09-26_conditions.txt`).
+There the String sort (o) was 1.66x the faster Polars engine at 1,000,000 rows, 0.69x at 2,000,000 and
+0.78x at 5,000,000. The final sweep started at 3.2 (`bench_conditions_2026-09-26-final.txt`), and
+there (`polars_engine_crossover_2026-09-26-final.csv`) the same case is 0.98x, 1.20x and 1.37x,
+growing with size. The table in 0.3.0 is fitted from the final sweep, with three rules on the fit:
+
+- **String shapes from 5,000,000 rows** (`STRING_FLOOR`), with a 35% margin where a numeric shape has
+  15% (`MARGIN`). A String shape's advantage grows slowly with size, and below 5,000,000 rows the String
+  sorts, (o) 1.2x and (p) 1.38x at 2,000,000, sit inside the benchmark's noise band of 0.62x to 1.31x.
+- **The rows/2 bucket is never taken** (`UNTAKEN_BUCKETS`). The sweep is not monotone for group-bys over
+  a quarter of the rows or more: the one-key count over 0.43 times as many groups as rows is 0.78x,
+  1.9x, 4.04x, 2.21x and 1.18x the faster Polars engine from 2,000,000 to 50,000,000 rows.
+- **1.5 times the fit** (`HEADROOM`). The fit interpolates between sizes measured 2 to 2.5 times apart,
+  and shapes just past their crossover were within run-to-run noise of Polars.
+
+In the default benchmark on that table (`Benchmarks/results/polars_engine_bench_2026-09-26-final3.csv`,
+194 case-size pairs) the default took 62 pairs, 42 of them group-bys, every one ahead of the faster
+Polars engine, 1.21x to 9.42x.
+
 ## Round 13 (2026-09-26): a grid of 2^32 threads runs almost none of them
 
 **What.** `am.group_by([key]).sum(values)` and `.mean(values)` over Float64 values, and over Float32
