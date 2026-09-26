@@ -1,3 +1,4 @@
+# polars_engine_bench.py --crossover --iters 7 --sizes 250000,500000,1000000,2000000,5000000,10000000,20000000,50000000 --scan --scan-rows 1000000,2000000,5000000,10000000,20000000,50000000 --out Benchmarks/results/polars_engine_crossover_2026-09-26.csv (Apple M4 Max, 64 GB; other work shared the machine; load averages below, sampled each minute)
 ## crossover start 2026-09-26T04:52:43Z load averages: { 50.80 19.01 12.39 }
 dylib 2026-09-25 22:59 worktree HEAD d68ce99
    2026-09-26T04:53:43Z load averages: { 58.21 27.36 15.98 }

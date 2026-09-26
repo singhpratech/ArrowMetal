@@ -1,0 +1,13 @@
+# polars_engine_bench.py --iters 7 --sizes 2000000,50000000 --scan --scan-rows 50000000 --out Benchmarks/results/polars_engine_bench_2026-09-26.csv (Apple M4 Max, 64 GB; other work shared the machine; load averages below, sampled each minute)
+## bench start 2026-09-26T05:11:32Z load averages: { 8.35 10.81 13.89 }
+dylib 2026-09-25 22:59 worktree HEAD 14d89db
+   2026-09-26T05:12:32Z load averages: { 10.97 10.95 13.71 }
+   2026-09-26T05:13:32Z load averages: { 17.92 12.96 14.28 }
+   2026-09-26T05:14:32Z load averages: { 20.36 14.12 14.59 }
+   2026-09-26T05:15:32Z load averages: { 18.59 14.75 14.79 }
+   2026-09-26T05:16:33Z load averages: { 21.93 16.16 15.30 }
+   2026-09-26T05:17:33Z load averages: { 22.29 17.44 15.85 }
+   2026-09-26T05:18:33Z load averages: { 20.63 17.80 16.09 }
+   2026-09-26T05:19:33Z load averages: { 15.18 16.64 15.76 }
+   2026-09-26T05:20:33Z load averages: { 17.38 16.86 15.89 }
+## bench done 2026-09-26T05:21:10Z rc=0 load averages: { 17.95 17.21 16.07 }

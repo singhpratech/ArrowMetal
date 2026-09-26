@@ -1,24 +1,29 @@
 """`lf.collect(engine=am.MetalEngine())` against Polars' own engines, on the same LazyFrames.
 
-The eight shapes of `Benchmarks/engine_bench.py`, written as Polars LazyFrames over in-memory
-Polars DataFrames, collected three ways:
+The eight shapes of `Benchmarks/engine_bench.py` and 37 more (group-by per aggregate family over one
+and two keys at few and many groups, whole-frame aggregates, each join kind, sorts, top-k, `unique`,
+and the same with a String column), written as Polars LazyFrames over in-memory Polars DataFrames,
+collected five ways:
 
-* `polars in-memory`  -- `lf.collect(engine="in-memory")`
-* `polars streaming`  -- `lf.collect(engine="streaming")`
-* `MetalEngine`       -- `lf.collect(engine=am.MetalEngine(min_rows=0))`: the size gate off, so the
-                         row measures what the engine does with every shape it can take
+* `polars in-memory`, `polars streaming` -- `lf.collect(engine=...)`
+* `MetalEngine all, cold` / `warm`       -- `MetalEngine(shapes="all", min_rows=0)`: every shape it
+                                          can take, with the import cache cleared first (cold) or not
+* `MetalEngine default, cold`            -- `MetalEngine()`, the measured default; its `rule` column
+                                          is the report's word on what it took and left
 
 Unlike `engine_bench.py`, nothing is resident on the GPU beforehand: every MetalEngine run imports
 its columns from the Polars frame, runs the plan and hands a Polars DataFrame back, which is what a
-Polars user gets. Each MetalEngine row also records what the engine took (`engine.last_report`), and
-every run checks that the MetalEngine result equals Polars' before timing it.
+Polars user gets. Each MetalEngine row also records what the engine took (`engine.last_report`), the
+shape classes, dtype class and input of each taken subtree (`shape`) and its input rows, and every
+run checks that the MetalEngine result equals Polars' before timing it.
 
 Wall time is the best of `--iters` runs, CPU time the process CPU of that run (as engine_bench.py).
-The size gate (`MetalEngine`'s default `min_rows`) is read from these rows: see docs/POLARS.md,
-"Tier 4".
+`--crossover` is the sweep the default's crossovers are fitted from
+(`Benchmarks/polars_engine_crossover.py`): the two Polars engines and `MetalEngine all, cold` only.
+See docs/POLARS.md, "Which translatable subtrees it runs: the defaults".
 
 `--scan` adds the Parquet scan cases: `pl.scan_parquet(file)` under a filter, a group-by, a sort
-or an aggregate, over the 50M-row, 8-column file `Benchmarks/parquet_bench.py` writes (generated
+or an aggregate, over the 8-column files `Benchmarks/parquet_bench.py` writes, one per `--scan-rows` size (generated
 into `--scan-dir` when it is not there yet), once per codec. There the MetalEngine reads the file
 on the GPU itself; "cold" clears its open-file cache (`am.clear_parquet_cache()`) before every run,
 "warm" keeps the file open between runs. Polars reads the file on every run in both of its
@@ -26,8 +31,8 @@ engines; the file stays in the OS page cache throughout.
 
 Usage:
   PYTHONPATH=python python Benchmarks/polars_engine_bench.py [--sizes 1000000,2000000] [--iters 5]
-                                                             [--out results.csv]
-  PYTHONPATH=python python Benchmarks/polars_engine_bench.py --scan-only [--scan-rows 50000000]
+                                                             [--cases a,t1,w3] [--crossover] [--out results.csv]
+  PYTHONPATH=python python Benchmarks/polars_engine_bench.py --scan-only [--scan-rows 1000000,50000000]
                                         [--scan-codecs snappy,none] [--scan-dir DIR] [--out scan.csv]
 Requires .build/release/libArrowMetalC.dylib (swift build -c release --product ArrowMetalC).
 """
