@@ -9,6 +9,7 @@ pushed. Numbers are from the last full run of `main` (0.2.0) on an M4 Max.
 | Python suites (`python/tests`) | 5,892 collected cases over the ctypes API, the integrations and the readers in the run of 2026-09-24 at `89d4ed4` (5,867 passed and 25 skipped; the differential matrix in `test_differential.py` is counted in its own row) | `pyarrow.compute`, Polars, DuckDB, pandas |
 | Rust suites (`rust/arrowmetal/tests`, `rust/arrowmetal-sys`) | 48 tests, 46 in the safe crate against arrow-rs plus 2 in `arrowmetal-sys` over the raw ABI, run in release, plus 4 `no_run` doc-tests (compiled, not executed); all passed on 2026-09-24 at `3c3ea1e` | `arrow::compute` (arrow-rs 59) on the same data; a `HashMap` fold where arrow-rs has no kernel; `include/arrowmetal.h` re-parsed for the ABI signatures ([RUST.md](RUST.md)) |
 | Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | 39,069 generated cases, 45 column types, every public operation | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
+| Engine conformance grid (`python/tests/engine_report.py`, `engine_polars_grid.py`, `engine_duckdb_grid.py`) | 12,597 Polars cases and 33,376 DuckDB queries, generated over shapes, dtypes, null patterns and sizes (run of 2026-09-25: 0 unclassified; 32 documented, all float summation order) | Polars' own `lf.collect()`; DuckDB with the rewrite off ([COVERAGE.md](COVERAGE.md#engines)) |
 | TypeScript suites (`node/test`) | 62 tests in 6 files over the N-API addon (62 passed on 2026-09-24 at `3c3ea1e`) | Apache Arrow JS 21.2.0 and plain JS over the same rows ([TYPESCRIPT.md](TYPESCRIPT.md)) |
 | Go binding (`go/arrowmetal`) | 46 test functions and one `Example`, 47 runnable, and 131 subtests: 178 passing results as `go test -count=1 -v ./...` reported them on 2026-09-24 at `3c3ea1e`, 0 failed, run twice (plain and under the cgo pointer checker, `GOEXPERIMENT=cgocheck2`, with the same counts) | `arrow-go/v18`'s own `compute` where it has the function, plain Go loops where it does not ([GO.md](GO.md)) |
 | R suites (`r/arrowmetal/tests/testthat`) | 68 `test_that()` blocks in the sources (69 as testthat runs them: the one in test-dispatch.R runs once per attach order), 273 expectations (0 failed, 0 skipped on 2026-09-17 and again on 2026-09-24 at `3c3ea1e`; the four blocks in test-carriers.R cover the ArrowArray/ArrowSchema carriers the shim allocates: release on drop without import, refusal of a moved or unfilled pair, tag checks), over the 34 ABI entry points the R binding wraps | base R and the `arrow` R package's own kernels on the same data ([R.md](R.md)) |
@@ -26,6 +27,8 @@ swift test -c release
 PYTHONPATH=python python -m pytest python/tests -q
 # the matrix as one report; exit 0 = nothing unclassified
 PYTHONPATH=python python python/tests/differential_report.py
+# both engines against their hosts; exit 0 = nothing unclassified (needs the DuckDB extension built)
+PYTHONPATH=python python python/tests/engine_report.py
 # TypeScript: builds the addon, then 62 node:test cases
 (cd node && npm install && npm test)
 # the Rust binding, against arrow-rs's own kernels
