@@ -8,7 +8,7 @@ pushed. Numbers are from the last full run of `main` (0.2.0) on an M4 Max.
 | Swift suites (`Tests/ArrowMetalTests`) | 943 tests in 73 files, run in release (all 943 executed, 3 skipped in the run of 2026-09-24 at `89d4ed4`: the three opt-in throughput measurements) | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
 | Python suites (`python/tests`) | 5,892 collected cases over the ctypes API, the integrations and the readers in the run of 2026-09-24 at `89d4ed4` (5,867 passed and 25 skipped; the differential matrix in `test_differential.py` is counted in its own row) | `pyarrow.compute`, Polars, DuckDB, pandas |
 | Rust suites (`rust/arrowmetal/tests`, `rust/arrowmetal-sys`) | 48 tests, 46 in the safe crate against arrow-rs plus 2 in `arrowmetal-sys` over the raw ABI, run in release, plus 4 `no_run` doc-tests (compiled, not executed); all passed on 2026-09-24 at `3c3ea1e` | `arrow::compute` (arrow-rs 59) on the same data; a `HashMap` fold where arrow-rs has no kernel; `include/arrowmetal.h` re-parsed for the ABI signatures ([RUST.md](RUST.md)) |
-| Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | 39,069 generated cases, 45 column types, every public operation | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
+| Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | 40,824 generated cases, 46 column types (utf8 also imported as `utf8_view`), every public operation | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
 | Engine conformance grid (`python/tests/engine_report.py`, `engine_polars_grid.py`, `engine_duckdb_grid.py`) | 12,597 Polars cases and 33,376 DuckDB queries, generated over shapes, dtypes, null patterns and sizes (run of 2026-09-25: 0 unclassified; 32 documented, all float summation order) | Polars' own `lf.collect()`; DuckDB with the rewrite off ([COVERAGE.md](COVERAGE.md#engines)) |
 | TypeScript suites (`node/test`) | 62 tests in 6 files over the N-API addon (62 passed on 2026-09-24 at `3c3ea1e`) | Apache Arrow JS 21.2.0 and plain JS over the same rows ([TYPESCRIPT.md](TYPESCRIPT.md)) |
 | Go binding (`go/arrowmetal`) | 46 test functions and one `Example`, 47 runnable, and 131 subtests: 178 passing results as `go test -count=1 -v ./...` reported them on 2026-09-24 at `3c3ea1e`, 0 failed, run twice (plain and under the cgo pointer checker, `GOEXPERIMENT=cgocheck2`, with the same counts) | `arrow-go/v18`'s own `compute` where it has the function, plain Go loops where it does not ([GO.md](GO.md)) |
@@ -150,9 +150,10 @@ pytest *collected* on 2026-09-24, which is larger because a parametrised functio
 
 `differential_report.py` builds, for every public operation, a generated column of each type it accepts
 in several shapes (random, sorted, all-equal, special values, three null ratios, plain and sliced) and
-compares the ArrowMetal answer with the `pyarrow.compute` answer for the same options. The last run:
-39,069 cases, 36,486 pass, 1,566 documented divergences, 1,017 skips (an operation that does not apply
-to a type), **0 unclassified**. A divergence counts as documented only if it matches one of the 22
+compares the ArrowMetal answer with the `pyarrow.compute` answer for the same options. Every utf8
+operation runs a second time with the same values imported as `utf8_view` (the oracle stays on utf8,
+which pyarrow.compute supports). The last run (2026-09-25): 40,824 cases, 38,006 pass, 1,644 documented
+divergences, 1,174 skips (an operation that does not apply to a type), **0 unclassified**. A divergence counts as documented only if it matches one of the 22
 open findings in `FINDINGS`, each of which has a section in [EVALUATION.md](EVALUATION.md) with a
 reproduction; a finding may be narrowed by the data (`data_check`) so a dataset that does not contain
 the triggering value still has to agree exactly. The report exits non-zero on any unclassified

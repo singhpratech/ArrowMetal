@@ -13,8 +13,9 @@ it and compares, so a kernel that is wrong in an unanticipated way still fails.
 |---|---|
 | Files | `python/tests/test_differential.py` (the harness), `python/tests/differential_report.py` (the runner) |
 | Oracle | `pyarrow.compute` 25.0.1, plus a reference written in the harness for the 17 operations Arrow has no function for |
-| Cases in the default matrix | 39,069 — 212 operations over 45 column types, 1,447 applicable (operation, type) cells x 27 datasets — about 180 s on an M4 Max; more with `DIFF_LARGE=1` |
+| Cases in the default matrix | 40,824 — 212 operations over 46 column types (45 types plus `utf8_view`, the utf8 values imported as views), 1,512 applicable (operation, type) cells x 27 datasets — 249 s on an M4 Max on 2026-09-25; more with `DIFF_LARGE=1` |
 | Result at 0.1.0 | 36,486 pass, 1,566 fail across 22 documented divergences, 1,017 skip (an operation that does not apply to a type), **0 unclassified** |
+| Result on 2026-09-25, with `utf8_view` | 38,006 pass, 1,644 fail across the documented divergences, 1,174 skip, **0 unclassified**; the 1,755 `utf8_view` cases are the 65 utf8 operations again, with the same pass, fail and skip counts as their utf8 cells |
 
 ## Method
 
@@ -50,7 +51,10 @@ each is compared against a reference written out in the harness rather than agai
 | `extension_type` | the round trip through pyarrow's own extension registry |
 | `nulls_constructor` | `pa.nulls(n)` |
 
-**Generated input, not fixtures.** The generator covers every type ArrowMetal imports — 45 columns:
+**Generated input, not fixtures.** The generator covers every type ArrowMetal imports — 45 columns,
+plus `utf8_view`: the utf8 values again, handed to ArrowMetal as Arrow `string_view` (cast from the
+unsliced parent, so a sliced dataset keeps its Arrow offset) while the oracle computes on the utf8
+array, and a string_view result compared as string:
 
 - **Flat primitives** `int8 int16 int32 int64`, `uint8 uint16 uint32 uint64`, `float32`, `float64`,
   `bool`, `utf8`.

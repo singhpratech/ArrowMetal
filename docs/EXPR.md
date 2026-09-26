@@ -233,7 +233,9 @@ to 71×.
 - **No string outputs.** String columns can be read by `str_eq` / `starts_with` / `contains` against a
   literal pattern; the compiler will not materialise a `utf8` output column, and rejects a projection
   that asks for one by name.
-- **Only these column types are read**: int8–int64, uint8–uint64, float32, float64, boolean, utf8.
+- **Only these column types are read**: int8–int64, uint8–uint64, float32, float64, boolean, utf8
+  (offsets + bytes, or `utf8_view` views read in place: the kernel reads each row through the view
+  accessor of [DESIGN.md](DESIGN.md#strings-in-two-layouts-offsets--bytes-and-views)).
   Temporal, decimal, dictionary, list, struct, map and union columns are rejected with an error naming
   the column and its Arrow format. Extension columns are read through their storage.
 - **Group-by needs a dense integer key** in `[0, keyCount)`, exactly like `GroupBy`. Hash the keys with
