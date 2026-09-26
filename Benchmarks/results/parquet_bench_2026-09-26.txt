@@ -1,0 +1,76 @@
+# ArrowMetal 0.2.0 + unreleased Parquet changes (3803b68) on Apple M4 Max, Benchmarks/parquet_bench.py --repeat 3 --codec-scan, run 2026-09-26T06:24Z-06:30Z, load average 3.03 at the start and 6.40 at the end (other work on the machine); conditions in bench_conditions_2026-09-26.txt
+device: Apple M4 Max
+rows:   50,000,000
+
+=== snappy, 1.65 GB on disk ===
+reader                  wall ms     cpu ms       MB/s    ttfc ms
+arrowmetal (GPU)            114         78      14470         13
+pyarrow.parquet             175       1236       9449         86
+polars                      104       1299      15833         19
+pandas                      255       1442       6493         99
+
+reader (warm handle)        read ms     sum ms
+arrowmetal (GPU)                  9          2
+pyarrow.ParquetFile              54          6
+
+=== lz4, 1.67 GB on disk ===
+reader                  wall ms     cpu ms       MB/s    ttfc ms
+arrowmetal (GPU)            105         85      15970         14
+pyarrow.parquet             168       1035       9942         86
+polars                       86       1070      19307         24
+pandas                      241       1209       6918        106
+
+reader (warm handle)        read ms     sum ms
+arrowmetal (GPU)                  9          2
+pyarrow.ParquetFile              50          6
+
+=== none, 2.23 GB on disk ===
+reader                  wall ms     cpu ms       MB/s    ttfc ms
+arrowmetal (GPU)             53        101      41739         12
+pyarrow.parquet             172        806      12932         83
+polars                       77        941      29088         18
+pandas                      253        972       8802         94
+
+reader (warm handle)        read ms     sum ms
+arrowmetal (GPU)                  5          6
+pyarrow.ParquetFile              43          6
+
+=== decompression throughput, one int64 column of 20,000,000 rows, 1024 KB pages ===
+codec           file MB      am ms    am MB/s pyarrow ms
+none              160.1        2.8      58179       17.3
+snappy            152.4       34.0       4705       73.8  (5119 MB/s of decode alone)
+lz4               160.7        3.8      42331       19.8  (155403 MB/s of decode alone)
+zstd              119.7       10.9      14686       62.9  (19645 MB/s of decode alone)
+gzip              110.6       30.9       5173      211.8  (5678 MB/s of decode alone)
+
+=== decompression throughput, one int64 column of 20,000,000 rows, 256 KB pages ===
+codec           file MB      am ms    am MB/s pyarrow ms
+none              160.1        2.4      66308       21.2
+snappy            152.4       34.0       4707       54.4  (5067 MB/s of decode alone)
+lz4               160.7        3.8      42053       20.1  (114963 MB/s of decode alone)
+zstd              119.7       10.5      15207       66.2  (19733 MB/s of decode alone)
+gzip              110.6       31.6       5068      214.4  (5488 MB/s of decode alone)
+
+=== decompression throughput, one int64 column of 20,000,000 rows, 64 KB pages ===
+codec           file MB      am ms    am MB/s pyarrow ms
+none              160.2        2.2      71774       19.9
+snappy            152.6       33.2       4822       57.3  (5170 MB/s of decode alone)
+lz4               142.4       22.8       7005       46.3  (7762 MB/s of decode alone)
+zstd              119.8       11.0      14502       67.5  (18173 MB/s of decode alone)
+gzip              110.9       29.5       5424      219.5  (5867 MB/s of decode alone)
+
+markdown:
+| codec | reader | wall ms | CPU ms | MB/s | time to first compute (ms) |
+|---|---|---:|---:|---:|---:|
+| snappy | arrowmetal (GPU) | 114 | 78 | 14470 | 13 |
+| snappy | pyarrow.parquet | 175 | 1236 | 9449 | 86 |
+| snappy | polars | 104 | 1299 | 15833 | 19 |
+| snappy | pandas | 255 | 1442 | 6493 | 99 |
+| lz4 | arrowmetal (GPU) | 105 | 85 | 15970 | 14 |
+| lz4 | pyarrow.parquet | 168 | 1035 | 9942 | 86 |
+| lz4 | polars | 86 | 1070 | 19307 | 24 |
+| lz4 | pandas | 241 | 1209 | 6918 | 106 |
+| none | arrowmetal (GPU) | 53 | 101 | 41739 | 12 |
+| none | pyarrow.parquet | 172 | 806 | 12932 | 83 |
+| none | polars | 77 | 941 | 29088 | 18 |
+| none | pandas | 253 | 972 | 8802 | 94 |

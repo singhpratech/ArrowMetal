@@ -1,0 +1,5 @@
+start 2026-09-26T06:24:28Z load averages: 3.03 5.01 6.96
+dylib Sep 26 01:23, commit 3803b68
+cache done 2026-09-26T06:24:36Z rc=0 load averages: 3.18 4.98 6.92
+main done 2026-09-26T06:29:56Z rc=0 load averages: 6.40 6.42 7.03
+note: the machine was shared with other work; the load rose from 3.03 to 6.40 during the main table and codec scan
