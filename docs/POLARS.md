@@ -627,10 +627,9 @@ declined):
 
 A subtree the engine can translate still has to be one where the GPU is ahead, because getting a
 Polars column onto the GPU is not free: a single-chunk numeric column is imported without a copy,
-but mapping its pages into Metal and releasing them costs time on every query. In the crossover
-sweep below a String column was also converted on the CPU (Polars' `large_string` export and a
-narrowing pass); the engine now hands String columns over in Polars' own view layout (see "Strings"
-under Limits), which is the layout of the String cases in the benchmark of the defaults below.
+but mapping its pages into Metal and releasing them costs time on every query. String columns are
+handed over in Polars' own view layout (see "Strings" under Limits), in the crossover sweep and in
+the benchmark of the defaults below alike.
 `MetalEngine()` (`shapes="measured"`) decides per subtree from measured crossovers (`python/arrowmetal/_engine_policy.py`). Each translated subtree has shape classes:
 
 * `rowwise` -- filters and projections only;
@@ -655,107 +654,150 @@ runs on Metal and Polars adds up its output.
 **The crossovers.** `Benchmarks/polars_engine_bench.py --crossover` ran 45 LazyFrames over in-memory
 frames at 250,000, 500,000, 1,000,000, 2,000,000, 5,000,000, 10,000,000, 20,000,000 and 50,000,000
 rows (the probe side of the joins grows with the size, the build side is 1,000,000 rows) and the four
-Parquet scan cases over files of 1,000,000 to 50,000,000 rows, snappy and uncompressed, each through
-Polars' in-memory and streaming engines and through `MetalEngine(shapes="all", min_rows=0)` cold,
-best of 7: `Benchmarks/results/polars_engine_crossover_2026-09-26.csv`, run conditions in
-`Benchmarks/results/polars_engine_crossover_2026-09-26_conditions.txt` (the 1-minute load average was
-between 13 and 58 while it ran). `Benchmarks/polars_engine_crossover.py` fits it the way
-`Benchmarks/router_table.py` fits the router table (`python/arrowmetal/_router_fit.py`), with the
-MetalEngine as the GPU side and the faster Polars engine as the CPU side, over each case's input rows.
-A case is ahead at a size when its MetalEngine time times 1.15 is at most the faster Polars engine's
-time, so a case within 15% of Polars counts as behind; its crossover is the first size from which it
-is ahead at every larger size, placed between that size and the one below it where the two straight
-lines meet, and a case ahead at the largest size alone has none. A size where the MetalEngine's answer
-differed from Polars' counts as behind. A class's crossover is the largest over the cases whose
-classes all belong to its node, so both kinds of group-by measured, a few hundred to ten thousand
-groups and a hundred thousand or more, have to be ahead; if one of them has no crossover, neither
-has the class. The fitted table is `python/arrowmetal/_engine_crossovers.py`, and
+Parquet scan cases over files of 1,000,000, 2,000,000, 5,000,000, 10,000,000, 20,000,000 and
+50,000,000 rows, snappy and uncompressed, each through Polars' in-memory and streaming engines and
+through `MetalEngine(shapes="all", min_rows=0)` cold, best of 7, every MetalEngine result equal to
+Polars': `Benchmarks/results/polars_engine_crossover_2026-09-26-quiet.csv`, run conditions in
+`Benchmarks/results/polars_engine_crossover_2026-09-26-quiet_conditions.txt`.
+`Benchmarks/polars_engine_crossover.py` fits it the way `Benchmarks/router_table.py` fits the router
+table (`python/arrowmetal/_router_fit.py`), with the MetalEngine as the GPU side and the faster Polars
+engine as the CPU side, over each case's input rows. A case's crossover is the first size from which
+it is ahead at every larger size, placed between that size and the one below it where the two
+straight lines meet; a case ahead at the largest size alone has none, and a size where the
+MetalEngine's answer differed from Polars' counts as behind.
+
+**The margin.** A case is ahead at a size when its MetalEngine time, raised by a margin, is at most
+the faster Polars engine's time: 15% for a numeric shape, and 35% for a shape with a String column,
+which is also taken from 5,000,000 rows at the earliest, whatever its fit says. A String shape's
+advantage grows slowly with size: the String sort cases are 1.22x ((o)) and 1.37x ((p)) the faster
+Polars engine at 2,000,000 rows in the sweep, and 1.20x and 1.32x under `shapes="all"` at that size
+in the benchmark below, both inside the 35% margin; from 5,000,000 rows they are 1.40x and up
+in the sweep.
+
+A class's crossover is the largest over the cases whose classes all belong to its node, so every case
+that measures a class has to be ahead; if one of them has no crossover, neither has the class. A case
+whose classes span two nodes, (b) (a group-by under a top-k) and (e) (a whole-frame sum over a join),
+measures no class. The fitted table is `python/arrowmetal/_engine_crossovers.py`, and
 `polars_engine_crossover.py --check` fails when it and the results file disagree. The policy then
 takes the larger of that crossover and the kernels' own: the router table in force
 (`am.router_table()`, [CROSSOVER.md](CROSSOVER.md)) for the kernels it routes, and for the sort
 classes the crossover of `argsort int64`, `argsort float64` and `lexsort (2 int32 keys)` against the
 fastest CPU library in `Benchmarks/results/router_2026-09-24.json`, 1,000,000 rows.
 
-| class | dtype | input | crossover (rows) | from | cases (their own crossover) |
+| class | dtype | input | crossover (rows) | set by | cases (their own crossover) |
 |---|---|---|---:|---|---|
-| `sort` | numeric | in-memory | 1,000,000 | sort kernels | (m) 250,000; (q) 250,000 |
-| `sort_helper_keys` | numeric | in-memory | 1,000,000 | sort kernels | (x2) 292,560 |
-| `sort_helper_keys` | string | in-memory | 4,458,670 | engine table | (p) 4,458,670 |
-| `sort` | numeric | Parquet | 2,505,017 | engine table | (s4) uncompressed 1,000,000; (s4) snappy 2,505,017 |
-| `join:inner` | numeric | in-memory | 1,250,000 | engine table | (w1) 1,250,000 |
-| `join:left` | numeric | in-memory | 1,250,000 | engine table | (w2) 1,250,000 |
-| `join:anti` | numeric | in-memory | 7,451,256 | engine table | (w4) 7,451,256 |
-| `distinct` | numeric | in-memory | 3,399,993 | engine table | (r) 250,000; (x1) 3,399,993 |
-| `join:semi` | numeric | in-memory | not taken | | (f) none; (w3) 3,737,814 |
-| `group_by:sum` | numeric | in-memory | not taken | | (i) 3,024,311; (t1) none |
-| `group_by:count` | numeric | in-memory | not taken | | (t2) none; (t5) 2,195,216 |
-| `group_by:mean` | numeric | in-memory | not taken | | (t3) none; (t6) 8,685,770 |
-| `group_by:minmax` | numeric | in-memory | not taken | | (t4) none; (t7) 3,960,652 |
-| `group_by_multi:sum` | numeric | in-memory | not taken | | (j) none; (l) 3,101,937; (v1) 250,000 |
-| `group_by_multi:count` | numeric | in-memory | not taken | | (j) none; (v2) 250,000 |
-| `group_by_multi:mean` | numeric | in-memory | not taken | | (c) 3,486,598; (l) 3,101,937; (v3) none |
-| `group_by_multi:minmax` | numeric | in-memory | not taken | | (c) 3,486,598; (v4) none |
+| `sort` | numeric | in-memory | 1,000,000 | sort kernels | (m) 491,651; (q) 715,548 |
+| `sort_helper_keys` | numeric | in-memory | 1,000,000 | sort kernels | (x2) 386,637 |
+| `sort` | numeric | Parquet | 1,611,058 | (s4) snappy | (s4) uncompressed 1,000,000; (s4) snappy 1,611,058 |
+| `join:left` | numeric | in-memory | 1,250,000 | (w2) | (w2) 1,250,000 |
+| `join:inner` | numeric | in-memory | 1,331,203 | (w1) | (w1) 1,331,203 |
+| `join:anti` | numeric | in-memory | 2,559,451 | (w4) | (w4) 2,559,451 |
+| `distinct` | numeric | in-memory | 4,339,049 | (x1) | (r) 1,094,121; (x1) 4,339,049 |
+| `sort` | string | in-memory | 5,000,000 | String floor | (o) 5,000,000 |
+| `sort_helper_keys` | string | in-memory | 5,000,000 | String floor | (p) 5,000,000 |
+| `distinct` | string | in-memory | 5,000,000 | String floor | (y5) 5,000,000 |
+| `group_by_multi:sum` | string | in-memory | 8,015,080 | (k) | (k) 8,015,080 |
+| `join:semi` | numeric | in-memory | not taken | (f) | (f) none; (w3) 2,377,454 |
+| `group_by:sum` | numeric | in-memory | not taken | (t1) | (i) 3,671,287; (t1) none |
+| `group_by:count` | numeric | in-memory | not taken | (t2) | (t2) none; (t5) 2,645,908 |
+| `group_by:mean` | numeric | in-memory | not taken | (t3), (t6) | (t3) none; (t6) none |
+| `group_by:minmax` | numeric | in-memory | not taken | (t4) | (t4) none; (t7) 1,694,705 |
+| `group_by_multi:sum` | numeric | in-memory | not taken | (j) | (j) none; (l) 1,736,342; (v1) 953,630 |
+| `group_by_multi:count` | numeric | in-memory | not taken | (j) | (j) none; (v2) 775,581 |
+| `group_by_multi:mean` | numeric | in-memory | not taken | (v3) | (c) 4,446,614; (l) 1,736,342; (v3) none |
+| `group_by_multi:minmax` | numeric | in-memory | not taken | (v4) | (c) 4,446,614; (v4) none |
 | `aggregate:sum`, `:count`, `:mean`, `:minmax` | numeric | in-memory | not taken | | (a), (a2), (a3), (a4) none |
 | `top_k` | numeric | in-memory | not taken | | (n) none; (x3) none |
 | `rowwise` | numeric | in-memory | not taken | | (d) none |
-| `sort`, `top_k`, `rowwise`, `aggregate:sum`, `group_by:sum`, `group_by_multi:sum`, `join:inner`, `distinct` | string | in-memory | not taken | | (o), (y6), (y2), (y3), (y1), (k), (y4), (y5) none |
+| `top_k`, `rowwise`, `aggregate:sum`, `group_by:sum`, `join:inner` | string | in-memory | not taken | | (y6), (y2), (y3), (y1), (y4) none |
 | `group_by:sum`, `group_by:count`, `aggregate:sum`, `aggregate:count` | numeric | Parquet | not taken | | (s1), (s2), (s3) none, both codecs |
 
 A class with no row (a String column in any other class, and every Parquet class but these) has no
 measurement and is not taken. `arrowmetal.polars_engine.placement_rules()` returns the table under the router
 table in force.
 
-* **Group-by** is ahead or behind depending on the number of groups, which the policy does not see:
-  over the same key types, the 100,000-group cases on one key are ahead from 2,195,216 to 8,685,770
-  rows and the 200-group cases are behind at every size; over two keys the 10,000-group cases are ahead
-  from 250,000 to 3,486,598 rows and the cases with about as many groups as rows are behind. Every
-  group-by class has one of each, so none is taken.
-* **Joins and `unique`** on numeric keys are ahead from the smallest size measured (1,250,000 input
-  rows for a join) except the anti join, from 7,451,256, and `unique` over as many groups as rows,
-  from 3,399,993. The semi join against a 1,000-row table, (f), is behind at every size.
-* **Whole-frame aggregates, top-k and row-wise filters and projections** are behind at every size,
-  and so is every String shape except the filtered sort with a nullable Float64 key (p), ahead from
-  4,458,670 rows.
+* **Group-by** has a crossover in every case where the sweep brought the engine ahead. Over one key
+  with 100,000 groups, the min + max (t7) is ahead from 1,694,705 rows, the count (t5) from 2,645,908
+  and the sum (i) from 3,671,287. Over two keys, (region, sub) with 10,000 groups, the count (v2) is
+  ahead from 775,581, the sum (v1) from 953,630, the Float64 sum + mean (l) from 1,736,342 and the
+  mean + max (c) from 4,446,614; over (String, int32), the sum (k) from 8,015,080. Three kinds of
+  group-by never reach one: the 200-group cases on one key, (t1) to (t4), are behind at every size
+  (at best 0.83x, (t2) at 50,000,000 rows); the two-key cases over (k1, k2), about as many groups as
+  rows, are behind at every size, the mean (v3) at 0.69x at 50,000,000 rows, the min + max (v4) at
+  0.86x and the sum + count (j) at 0.92x; and the one-key mean over 100,000 groups (t6) is ahead by
+  more than the margin at 50,000,000 rows alone (1.29x). The group-by on a String key, (y1), is behind
+  at every size (at best 0.53x), and so are the group-bys over a Parquet file, (s1) and (s2) (at best
+  0.94x). The policy sees a group-by's classes and not its number of groups, and every numeric
+  group-by class is measured by at least one case that never reaches a crossover, so no numeric
+  group-by class is taken; `group_by_multi:sum` with a String column, measured by (k) alone, is taken
+  from 8,015,080 rows.
+* **Joins and `unique`** on numeric keys: the left join is ahead from the smallest input measured,
+  1,250,000 rows, the inner join from 1,331,203 and the anti join from 2,559,451. The semi join is not
+  taken: against a 1,000-row table, (f), it is behind at every size (at best 0.47x), though against a
+  1,000,000-row table, (w3), it is ahead from 2,377,454. `unique` is ahead from 1,094,121 rows over
+  10,000 groups (r) and from 4,339,049 over about as many groups as rows (x1).
+* **Sorts** over in-memory frames are ahead from 386,637 rows (x2), 491,651 (m) and 715,548 (q); the
+  sort kernels' crossover, 1,000,000 rows, is the larger and sets both sort classes.
+* **Whole-frame aggregates, top-k and row-wise filters and projections** are behind at every size:
+  (a) to (a4) at 0.08x to 0.23x, (n) at 0.18x to 0.43x, (x3) at 0.25x to 0.81x, (d) at 0.13x to 0.31x.
+* **String shapes**: the sort (o), the helper-key sort (p) and `unique` (y5) are ahead below
+  5,000,000 rows under the 35% margin and are taken from the 5,000,000-row floor; the (String, int32)
+  group-by (k) from 8,015,080. The filter by a String equality (y2, at best 0.13x), the prefix filter
+  and sum (y3, 0.45x), the group-by on a String key (y1, 0.53x), the join on a String key (y4, 0.39x)
+  and the top-k with a String column (y6, 0.53x) are behind at every size.
 * **Over a Parquet file**, cold (the open-file cache cleared before each run), the sort is ahead from
-  2,505,017 rows; the filter, group-by and aggregate cases are behind at every size.
+  1,000,000 rows uncompressed and 1,611,058 snappy; the filter, group-by and aggregate cases are behind
+  at every size ((s1) at best 0.90x, (s2) 0.94x, (s3) 0.97x).
 
 **The default against Polars and against `shapes="all"`.** `Benchmarks/polars_engine_bench.py` over
-all 45 cases at 2,000,000 and 50,000,000 rows, best of 5, every result checked against Polars':
-`Benchmarks/results/polars_engine_bench_2026-09-26-quiet.csv`; the Parquet cases over the
-50,000,000-row files are the rows of `Benchmarks/results/polars_engine_scan_2026-09-26-quiet.csv`
-("Tier 4 over a Parquet file" under Numbers). Run conditions for both in
-`Benchmarks/results/bench_conditions_2026-09-26-quiet.txt`. The default took a subtree in these 18
-case-size pairs, each ahead of the faster Polars engine:
+the 45 in-memory cases at 2,000,000 and 50,000,000 rows and the four Parquet scan cases over the
+50,000,000-row files, snappy and uncompressed, 98 case-size pairs, best of 5, every result equal to
+Polars': `Benchmarks/results/polars_engine_bench_2026-09-26-quiet3.csv`, run conditions in
+`Benchmarks/results/bench_conditions_2026-09-26-quiet3.txt`. The default took a subtree in these 22
+pairs, each ahead of the faster Polars engine, 1.51x ((o) at 50M) to 7.58x ((s4) uncompressed at 50M):
 
 | case | rows | Polars in-memory | Polars streaming | `shapes="all"`, cold | `MetalEngine()`, cold | vs faster Polars |
 |---|---|---:|---:|---:|---:|---:|
-| (e) inner join then sum (the join taken) | 2M | 7.9 ms | 5.1 ms | 4.0 ms | **2.7 ms** | 1.9 |
-| (m) sort 3 columns by an int64 key | 2M | 12.5 ms | 14.2 ms | 4.5 ms | **2.7 ms** | 4.6 |
-| (q) filter, then sort by (int32 asc, int64 desc) | 2M | 14.4 ms | 14.9 ms | 4.3 ms | **4.3 ms** | 3.4 |
-| (w1) inner join, 1M-row build side | 2M | 7.7 ms | 5.4 ms | 3.6 ms | **2.5 ms** | 2.2 |
-| (w2) left join, 1M-row build side | 2M | 10.7 ms | 6.2 ms | 4.9 ms | **2.9 ms** | 2.1 |
-| (x2) sort by a nullable Float64 key, descending | 2M | 19.4 ms | 20.6 ms | 6.6 ms | **6.8 ms** | 2.9 |
-| (e) inner join then sum (the join taken) | 50M | 24.6 ms | 17.9 ms | 9.1 ms | **9.3 ms** | 1.9 |
-| (m) sort 3 columns by an int64 key | 50M | 405.4 ms | 478.0 ms | 77.3 ms | **81.0 ms** | 5.0 |
-| (p) filter, then sort by (int32 asc, nullable Float64 desc) | 50M | 1023.9 ms | 1079.8 ms | 398.6 ms | **398.3 ms** | 2.6 |
-| (q) filter, then sort by (int32 asc, int64 desc) | 50M | 745.2 ms | 791.1 ms | 119.5 ms | **121.2 ms** | 6.2 |
-| (r) unique over (region, sub), keep first | 50M | 179.9 ms | 243.7 ms | 38.2 ms | **30.5 ms** | 5.9 |
-| (w1) inner join, 1M-row build side | 50M | 105.7 ms | 95.9 ms | 43.2 ms | **38.4 ms** | 2.5 |
-| (w2) left join, 1M-row build side | 50M | 276.1 ms | 103.2 ms | 45.5 ms | **42.9 ms** | 2.4 |
-| (w4) anti join, 1M-row build side | 50M | 78.4 ms | 87.8 ms | 45.0 ms | **40.9 ms** | 1.9 |
-| (x1) unique over (k1, k2), keep first | 50M | 860.1 ms | 586.4 ms | 280.2 ms | **300.6 ms** | 2.0 |
-| (x2) sort by a nullable Float64 key, descending | 50M | 552.8 ms | 650.7 ms | 161.9 ms | **257.9 ms** | 2.1 |
-| (s4) Parquet scan, sort by a Float64 key, uncompressed | 50M | 562.0 ms | 563.2 ms | 73.7 ms | **75.0 ms** | 7.5 |
-| (s4) Parquet scan, sort by a Float64 key, snappy | 50M | 542.3 ms | 559.4 ms | 123.7 ms | **123.5 ms** | 4.4 |
+| (e) inner join then sum (the join taken) | 2M | 8.0 ms | 5.1 ms | 2.7 ms | **2.6 ms** | 1.94 |
+| (m) sort 3 columns by an int64 key | 2M | 12.4 ms | 13.8 ms | 2.7 ms | **2.6 ms** | 4.73 |
+| (q) filter, then sort by (int32 asc, int64 desc) | 2M | 14.4 ms | 14.5 ms | 4.2 ms | **4.1 ms** | 3.47 |
+| (w1) inner join, 1M-row build side | 2M | 7.5 ms | 5.3 ms | 3.1 ms | **2.4 ms** | 2.21 |
+| (w2) left join, 1M-row build side | 2M | 10.6 ms | 6.0 ms | 2.8 ms | **2.8 ms** | 2.12 |
+| (w4) anti join, 1M-row build side | 2M | 7.5 ms | 4.1 ms | 5.3 ms | **2.7 ms** | 1.52 |
+| (x2) sort by a nullable Float64 key, descending | 2M | 18.4 ms | 19.7 ms | 6.8 ms | **7.8 ms** | 2.37 |
+| (e) inner join then sum (the join taken) | 50M | 24.0 ms | 16.6 ms | 9.3 ms | **9.2 ms** | 1.80 |
+| (k) group-by (String, int32), sum | 50M | 385.4 ms | 183.1 ms | 76.6 ms | **75.7 ms** | 2.42 |
+| (m) sort 3 columns by an int64 key | 50M | 377.9 ms | 457.1 ms | 74.9 ms | **76.4 ms** | 4.94 |
+| (o) sort with a String column, by an int64 key | 50M | 386.8 ms | 492.7 ms | 260.1 ms | **256.0 ms** | 1.51 |
+| (p) filter, then sort by (int32 asc, nullable Float64 desc) | 50M | 964.4 ms | 1018.5 ms | 391.2 ms | **388.2 ms** | 2.48 |
+| (q) filter, then sort by (int32 asc, int64 desc) | 50M | 693.5 ms | 714.4 ms | 115.1 ms | **115.6 ms** | 6.00 |
+| (r) unique over (region, sub), keep first | 50M | 147.1 ms | 178.7 ms | 30.8 ms | **29.4 ms** | 5.01 |
+| (s4) Parquet scan, sort 2 columns by a Float64 key, uncompressed | 50M | 574.9 ms | 577.5 ms | 75.0 ms | **75.8 ms** | 7.58 |
+| (s4) Parquet scan, sort 2 columns by a Float64 key, snappy | 50M | 582.6 ms | 584.9 ms | 125.0 ms | **127.5 ms** | 4.57 |
+| (w1) inner join, 1M-row build side | 50M | 105.1 ms | 91.3 ms | 35.5 ms | **35.5 ms** | 2.57 |
+| (w2) left join, 1M-row build side | 50M | 264.5 ms | 108.1 ms | 41.7 ms | **41.6 ms** | 2.60 |
+| (w4) anti join, 1M-row build side | 50M | 84.2 ms | 66.1 ms | 38.2 ms | **38.3 ms** | 1.73 |
+| (x1) unique over (k1, k2), keep first | 50M | 772.5 ms | 480.9 ms | 278.5 ms | **279.3 ms** | 1.72 |
+| (x2) sort by a nullable Float64 key, descending | 50M | 549.2 ms | 596.9 ms | 161.3 ms | **161.4 ms** | 3.40 |
+| (y5) unique over (String, int32), keep first | 50M | 372.8 ms | 254.0 ms | 66.8 ms | **66.6 ms** | 3.81 |
 
-In the other 80 case-size pairs the default took nothing and ran Polars' in-memory plan; there its
-time was 0.7 to 1.4 times the `polars in-memory` row of the same case, which is the spread of two
-runs of the same Polars plan in this run and the noise bound its ratios are read against. `shapes="all"`
-is ahead of the faster Polars engine in 24 of those 80: group-by, semi join, `unique` and sort shapes,
-numeric and String, whose class has a crossover above that size or none (at 50M rows: `(v2)` 6.8,
-`(y5)` 4.8, `(v1)` 4.3, `(t5)` 3.8, `(k)` 2.5, `(l)` 2.4, `(i)` 2.2, `(t7)` 2.2, `(c)` 2.0).
+In the other 76 pairs the default took nothing and ran Polars' in-memory plan; there its time was
+0.33 to 1.48 times the `polars in-memory` row of the same case, and 0.87 to 1.15 times in the 62 of
+them where that row is 5 ms or more. That is the spread of two runs of the same Polars plan in this
+run, and the noise band the ratios above are read against. `shapes="all"` took a subtree and was
+ahead of the faster Polars engine in 21 of those 76, each left by the default because its class has a
+crossover above that size or none:
 
-**Float64 group sums and means at 2^24 groups.** The (v3) case of the crossover sweep, a mean over two keys with about as many groups as rows, found ArrowMetal's group-by returning null for most groups at 16,777,216 groups and above (16,777,215 were right): the per-group kernels dispatched one threadgroup per group and the grid wrapped past 2^32 threads. Fixed in the core ([FINDINGS.md](FINDINGS.md), round 13; `python/tests/test_group_by_2_24.py`), so no engine rule is needed and every group-by shape follows the policy above. The benchmark above ran with the fix: under `shapes="all"` the cases the guard once kept with Polars, `(c)`, `(l)`, `(t3)`, `(t6)`, `(v3)` and the Parquet cases `(s1)` and `(s2)`, run on Metal and equal Polars' answers. At 50M rows `(c)` is 2.0, `(l)` 2.4 and `(t6)` 1.3 times the faster Polars engine; `(t3)` is behind at 37.1 ms against 13.9 and `(v3)` at 723.2 ms against 484.0.
+* at 2,000,000 rows: the semi join (w3) 1.54x (`join:semi` is not taken, (f)); `unique` (r) 1.52x
+  (below 4,339,049); the two-key group-bys (l) 1.52x, (v2) 1.43x, (c) 1.30x and (v1) 1.25x and the
+  one-key (t7) 1.18x (their classes are not taken); the String shapes (p) 1.32x, (o) 1.20x and (y5)
+  1.18x (below the 5,000,000-row floor);
+* at 50,000,000 rows: the two-key group-bys (v2) 5.72x, (v1) 4.01x, (l) 2.18x and (c) 1.80x; the
+  one-key group-bys (t5) 3.22x, (t7) 1.97x, (i) 1.87x and (t6) 1.23x; the semi join (w3) 1.74x; over
+  the uncompressed Parquet file, the group-by (s1) 1.28x and the aggregate (s3) 1.03x, which is inside
+  the 15% margin.
+
+**Float64 group sums and means at 2^24 groups.** The (v3) case of the crossover sweep, a mean over two keys with about as many groups as rows, found ArrowMetal's group-by returning null for most groups at 16,777,216 groups and above (16,777,215 were right): the per-group kernels dispatched one threadgroup per group and the grid wrapped past 2^32 threads. Fixed in the core ([FINDINGS.md](FINDINGS.md), round 13; `python/tests/test_group_by_2_24.py`), so no engine rule is needed and every group-by shape follows the policy above. The sweep and the benchmark above ran with the fix: under `shapes="all"` the cases the guard once kept with Polars, `(c)`, `(l)`, `(t3)`, `(t6)`, `(v3)` and the Parquet cases `(s1)` and `(s2)`, run on Metal and equal Polars' answers. At 50M rows `(c)` is 1.80, `(l)` 2.18 and `(t6)` 1.23 times the faster Polars engine; `(t3)` is behind at 36.6 ms against 12.2 and `(v3)` at 613.8 ms against 425.7.
 
 ```python
 am.MetalEngine()                          # shapes="measured": the crossovers above
@@ -773,7 +815,7 @@ has a `rule:` line:
   metal:  Sort#2 [Sort > DataFrameScan] over 2,000,000 rows, ran in <t> ms -> 2,000,000 rows
           rule: 2,000,000 input rows is at or above the 1,000,000-row crossover for sort (crossover sweep, ...)
   polars: Select#3: rule: aggregate:sum was not measured ahead of Polars up to 50,000,000 input rows (...)
-  polars: Join#2: rule: 900,000 input rows is below the 1,250,000-row crossover for join:inner (...)
+  polars: Join#2: rule: 900,000 input rows is below the 1,331,203-row crossover for join:inner (...)
 ```
 
 `shapes="all"` is there for plans the benchmark did not cover and for moving work off the CPU cores:
@@ -862,7 +904,7 @@ given, row groups read and skipped, pages skipped):
 ```
 
 `MetalEngine()` judges a scan subtree by the same rule as an in-memory one, with the Parquet rows of
-the crossover table and the file's row count from its footer: a sort of a file of at least 2,505,017
+the crossover table and the file's row count from its footer: a sort of a file of at least 1,611,058
 rows is taken, and the filter, group-by and aggregate shapes over a file are not taken at any size
 ("Which translatable subtrees it runs: the defaults" above). The scan cases below are in line with
 that: the sort is ahead of both Polars engines cold and warm, and the filter, group-by and aggregate
@@ -984,8 +1026,8 @@ per-shape table.
 ## Numbers
 
 These are tiers 1 and 2, and tier 4 over a Parquet file at the end; tier 4's measurements over
-in-memory frames are in `Benchmarks/results/polars_engine_bench_2026-09-26-quiet.csv` and
-`Benchmarks/results/polars_engine_crossover_2026-09-26.csv` (see "Tier 4" above).
+in-memory frames are in `Benchmarks/results/polars_engine_bench_2026-09-26-quiet3.csv` and
+`Benchmarks/results/polars_engine_crossover_2026-09-26-quiet.csv` (see "Tier 4" above).
 
 Apple M4 Max, macOS 26.6.2, polars 1.44.1 (16 threads), pyarrow 25.0.1, ArrowMetal 0.1.0. Best of 5
 runs after a warm-up, one process, one data set. Every figure below is from
@@ -1060,7 +1102,7 @@ The String hand-off of that column, 50M rows, in the same run:
 | Tier 1, resident | You run several kernels over the same column. `to_metal()` once, then every kernel in the table above is 0.8-10.5 ms. |
 | Tier 2 | The GPU op belongs inside a plan you want Polars to keep optimising -- scans, pushdown, and lazy composition still apply. |
 | Tier 3 | Polars should do the IO and the reshaping and ArrowMetal should do one heavy pass at the end. |
-| Tier 4 | You want Polars' own `collect()` and its answers, with the parts of the plan the GPU is measured ahead on (by default, sorts, numeric-key inner, left and anti joins and `unique` from their measured crossovers, and sorts of Parquet files) run there. |
+| Tier 4 | You want Polars' own `collect()` and its answers, with the parts of the plan the GPU is measured ahead on (by default, from their measured crossovers: sorts, numeric-key inner, left and anti joins, `unique`, sorts of Parquet files, and with a String column sorts, `unique` and the two-key group-by sum) run there. |
 
 ### Tier 4 over a Parquet file, 50M rows
 

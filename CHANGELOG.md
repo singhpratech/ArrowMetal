@@ -8,24 +8,31 @@
   String column is among its inputs) and an input (in-memory frames, or a Parquet file judged by its
   footer's row count). It runs on Metal when its input rows are at or above the crossover of every
   class in it: the largest of the engine table (`python/arrowmetal/_engine_crossovers.py`, fitted by
-  the new `Benchmarks/polars_engine_crossover.py` from `Benchmarks/results/polars_engine_crossover_2026-09-26.csv`,
-  45 in-memory cases at 250,000 to 50,000,000 rows and the Parquet cases at 1,000,000 to 50,000,000,
-  a case counting as ahead when its time x 1.15 is at most the faster Polars engine's), the router table
-  in force for the kernels it routes, and the sort kernels' crossover against the fastest CPU library.
-  Taken: sorts from 1,000,000 rows (helper-key sorts with a String column from 4,458,670), numeric-key
-  inner and left joins from 1,250,000 input rows, anti joins from 7,451,256, `unique` from 3,399,993,
-  sorts of a Parquet file from 2,505,017; group-by, whole-frame aggregates, top-k, row-wise shapes,
-  semi joins and the other String shapes are not taken (the String cases were measured with String
-  columns handed over as `large_string`). `shapes="all"`, `min_rows=` and a new explicit
-  set of class names (`shapes={"sort", "join"}`) override it. Each taken subtree's report entry
-  carries `rule`, `shape`, `dtype_class` and `input`, and each node the policy leaves has a
-  `Kind#id: rule: ...` line ("900,000 input rows is below the 1,250,000-row crossover for join:inner
+  the new `Benchmarks/polars_engine_crossover.py` from `Benchmarks/results/polars_engine_crossover_2026-09-26-quiet.csv`,
+  45 in-memory cases at eight sizes from 250,000 to 50,000,000 rows and the Parquet cases at six sizes
+  from 1,000,000 to 50,000,000, best of 7, run conditions in `polars_engine_crossover_2026-09-26-quiet_conditions.txt`;
+  a case counts as ahead when its time x 1.15, or x 1.35 for a shape with a String column, is at most
+  the faster Polars engine's, and a shape with a String column is taken from 5,000,000 rows at the
+  earliest), the router table in force for the kernels it routes, and the sort kernels' crossover
+  against the fastest CPU library. Taken: sorts from 1,000,000 rows, numeric-key left joins from
+  1,250,000 input rows, inner joins from 1,331,203 and anti joins from 2,559,451, `unique` from
+  4,339,049, sorts of a Parquet file from 1,611,058, sorts, helper-key sorts and `unique` with a String
+  column from 5,000,000, and a group-by sum over two or more keys with a String column from 8,015,080.
+  Group-by cases have their own crossovers where the sweep brought them ahead (one key, 100,000 groups:
+  min + max from 1,694,705, count from 2,645,908, sum from 3,671,287; two keys, 10,000 groups: count from
+  775,581, sum from 953,630, Float64 sum + mean from 1,736,342, mean + max from 4,446,614), but the
+  200-group cases on one key and the two-key cases with about as many groups as rows are behind at
+  every size, so the numeric group-by classes are not taken; neither are whole-frame aggregates, top-k,
+  semi joins, row-wise shapes and the other String shapes. `shapes="all"`, `min_rows=` and a new
+  explicit set of class names (`shapes={"sort", "join"}`) override it. Each taken subtree's report
+  entry carries `rule`, `shape`, `dtype_class` and `input`, and each node the policy leaves has a
+  `Kind#id: rule: ...` line ("900,000 input rows is below the 1,331,203-row crossover for join:inner
   (...)"). `arrowmetal.polars_engine.placement_rules()` lists the table; `SHAPE_CLASSES` replaces
   `MEASURED_SHAPES`, and `MetalEngine().min_rows` is `None` unless given. In
-  `Benchmarks/results/polars_engine_bench_2026-09-26-quiet.csv` (45 cases at 2M and 50M rows) and
-  `polars_engine_scan_2026-09-26-quiet.csv` (the 50M Parquet cases; run conditions in
-  `bench_conditions_2026-09-26-quiet.txt`) every case-size pair the default took was ahead of the
-  faster Polars engine, 1.9x to 7.5x. `Benchmarks/polars_engine_bench.py` gains 37
+  `Benchmarks/results/polars_engine_bench_2026-09-26-quiet3.csv` (45 in-memory cases at 2M and 50M
+  rows and the 50M Parquet cases, 98 case-size pairs; run conditions in
+  `bench_conditions_2026-09-26-quiet3.txt`) the default took 22 pairs, each ahead of the faster Polars
+  engine, 1.51x to 7.58x. `Benchmarks/polars_engine_bench.py` gains 37
   cases and `--crossover`; `python/tests/test_engine_policy.py` tests the policy.
 - The crossover sweep's `(v3)` case found ArrowMetal's group-by returning wrong Float64 sums and means from 16,777,216 groups (most groups null); fixed in the core (below), so the engine applies no group-count rule.
 - Parquet reads, cold and warm. On the 50,000,000-row, 8-column benchmark files a whole-file read
