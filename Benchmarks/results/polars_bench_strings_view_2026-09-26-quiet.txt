@@ -1,0 +1,40 @@
+ArrowMetal 0.2.0 on Apple M4 Max vs polars 1.44.1 (16 threads); rows=50000000, best of 5
+expression plugin: built
+
+sum(Int64)
+
+filter(k == 2) + sum(v)
+
+group-by sum(v) by 1000 keys
+
+top_k(100) of Int64
+
+string contains (literal)
+  results equal to Polars' for both layouts; resident column layouts: view / offsets
+  polars                                  671.08 ms      670.8 CPU-ms
+  arrowmetal (namespace)                   38.07 ms       29.2 CPU-ms
+  arrowmetal (namespace, offsets)         316.72 ms      301.8 CPU-ms
+  arrowmetal (resident)                     5.97 ms        0.4 CPU-ms
+  arrowmetal (resident, offsets)            6.28 ms        0.4 CPU-ms
+  arrowmetal (plugin, lazy)               290.39 ms      273.7 CPU-ms
+
+string hand-off
+  pl.Series -> Metal (50M x String, view)     29.98 ms       27.7 CPU-ms
+  pl.Series -> Metal (50M x String, offsets)    309.00 ms      308.9 CPU-ms
+  Metal -> pl.Series (String, view)         0.01 ms        0.0 CPU-ms
+  view import: 0 bytes copied, 40 data buffers, 636450395 string bytes
+
+
+| Operation | Polars | ArrowMetal namespace | ArrowMetal plugin | resident |
+|---|---|---|---|---|
+| string contains (literal) | 671.1 ms | 38.1 ms (17.6x) | 290.4 ms (2.3x) | 6.0 ms (112.4x) |
+
+| string contains (literal) | Polars | namespace, view | namespace, offsets | resident, view | resident, offsets |
+|---|---|---|---|---|---|
+| 50M rows | 671.1 ms / 671 CPU-ms | 38.1 ms / 29 CPU-ms (17.6x) | 316.7 ms / 302 CPU-ms (2.1x) | 6.0 ms / 0 CPU-ms (112.4x) | 6.3 ms / 0 CPU-ms (106.9x) |
+
+| String hand-off | ms |
+|---|---|
+| pl.Series -> Metal (50M x String, view) | 30.0 |
+| pl.Series -> Metal (50M x String, offsets) | 309.0 |
+| Metal -> pl.Series (String, view) | 0.0 |

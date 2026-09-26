@@ -1,0 +1,52 @@
+# ArrowMetal 0.2.0 (main 0ce78dc) on Apple M4 Max, Benchmarks/parquet_bench.py --repeat 3, quiet run; conditions in bench_conditions_2026-09-26-quiet.txt
+device: Apple M4 Max
+rows:   50,000,000
+
+=== snappy, 1.65 GB on disk ===
+reader                  wall ms     cpu ms       MB/s    ttfc ms
+arrowmetal (GPU)            108         80      15310         13
+pyarrow.parquet             162       1169      10213         83
+polars                       99       1330      16671         22
+pandas                      226       1332       7304        109
+
+reader (warm handle)        read ms     sum ms
+arrowmetal (GPU)                  7          2
+pyarrow.ParquetFile              52          6
+
+=== lz4, 1.67 GB on disk ===
+reader                  wall ms     cpu ms       MB/s    ttfc ms
+arrowmetal (GPU)             96         78      17408         13
+pyarrow.parquet             160       1001      10404         83
+polars                       74       1031      22514         22
+pandas                      230       1161       7244        104
+
+reader (warm handle)        read ms     sum ms
+arrowmetal (GPU)                  8          2
+pyarrow.ParquetFile              49          6
+
+=== none, 2.23 GB on disk ===
+reader                  wall ms     cpu ms       MB/s    ttfc ms
+arrowmetal (GPU)             41         91      54031          9
+pyarrow.parquet             164        760      13553         81
+polars                       67        895      33481         16
+pandas                      250        928       8905        112
+
+reader (warm handle)        read ms     sum ms
+arrowmetal (GPU)                  3          2
+pyarrow.ParquetFile              44          6
+
+markdown:
+| codec | reader | wall ms | CPU ms | MB/s | time to first compute (ms) |
+|---|---|---:|---:|---:|---:|
+| snappy | arrowmetal (GPU) | 108 | 80 | 15310 | 13 |
+| snappy | pyarrow.parquet | 162 | 1169 | 10213 | 83 |
+| snappy | polars | 99 | 1330 | 16671 | 22 |
+| snappy | pandas | 226 | 1332 | 7304 | 109 |
+| lz4 | arrowmetal (GPU) | 96 | 78 | 17408 | 13 |
+| lz4 | pyarrow.parquet | 160 | 1001 | 10404 | 83 |
+| lz4 | polars | 74 | 1031 | 22514 | 22 |
+| lz4 | pandas | 230 | 1161 | 7244 | 104 |
+| none | arrowmetal (GPU) | 41 | 91 | 54031 | 9 |
+| none | pyarrow.parquet | 164 | 760 | 13553 | 81 |
+| none | polars | 67 | 895 | 33481 | 16 |
+| none | pandas | 250 | 928 | 8905 | 112 |
