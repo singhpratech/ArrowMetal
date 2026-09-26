@@ -73,7 +73,17 @@ struct ParquetValueDecoder {
     private func fixedValues(groups g: [ParquetEncoding: [Int]], codes: MetalArrowBuffer?) throws -> ParquetLeafData.Values {
         let w = Swift.max(width, 1)
         ParquetProfile.lap("col.values-pre", sync: ctx)
-        let dense = try MetalArrowBuffer.allocate(byteCount: Swift.max(totalNonNull * w, w), zeroed: true, context: ctx)
+        // The pages' dense slots tile [0, totalNonNull), and the PLAIN, dictionary and BYTE_STREAM_SPLIT
+        // kernels write every slot of their pages, whatever the page holds. With only those, the buffer
+        // needs no zero fill of its values -- 2 GB of memset for the eight columns of the benchmark file
+        // -- just of its padding past the last value, so every byte comes back as before.
+        let fillsEverySlot = g.keys.allSatisfy { $0 == .plain || $0 == .rleDictionary || $0 == .byteStreamSplit }
+        let dense = try MetalArrowBuffer.allocate(byteCount: Swift.max(totalNonNull * w, w), zeroed: !fillsEverySlot,
+                                                  context: ctx)
+        if fillsEverySlot {
+            let used = totalNonNull * w
+            memset(dense.mutableContents.advanced(by: used), 0, dense.mtl.length - dense.offset - used)
+        }
         ParquetProfile.lap("col.alloc-dense")
         for (enc, idx) in g {
             let sub = try subset(idx)
