@@ -222,6 +222,29 @@ def test_snappy_pages_on_the_host_and_on_the_gpu_read_like_pyarrow(tmp_path, pag
     assert got["runs"].to_arrow().to_pylist() == t["runs"].to_pylist()
 
 
+@pytest.mark.parametrize("codec", ["zstd", "lz4", "snappy"])
+@pytest.mark.parametrize("pages", [2, 3, 5, 40, 400])
+@pytest.mark.parametrize("dictionary", [True, False])
+def test_chunks_of_a_few_to_hundreds_of_pages_read_like_pyarrow(tmp_path, codec, pages, dictionary):
+    """Column chunks of a handful of pages up to hundreds, over two row groups: ZSTD pages decode on
+    the host in runs that share one context, LZ4 and Snappy pages on the GPU (a few Snappy pages, and
+    Snappy dictionary pages, on the host). Every way reads what pyarrow reads."""
+    n = 60_000
+    t = _snappy_table(n)
+    p = str(tmp_path / "c.parquet")
+    pq.write_table(t, p, compression=codec, use_dictionary=dictionary, row_group_size=n // 2,
+                   data_page_size=max(1024, (n // 2) * 8 // pages), write_batch_size=256)
+    try:
+        got = am.read_parquet_table(p)
+    except am.ArrowMetalError as e:
+        if zstd_unavailable(e):
+            pytest.skip("libzstd is not installed")
+        raise
+    assert normalise(got) == normalise(pq.read_table(p))
+    for c in t.column_names:
+        assert am.read_parquet_table(p, columns=[c])[c].to_pylist() == t[c].to_pylist()
+
+
 def test_a_damaged_snappy_dictionary_page_raises(tmp_path):
     """The host decoder checks every element against the page and the output slot: damage in a
     dictionary page is an error, never a crash or a read outside the page."""

@@ -119,7 +119,7 @@ enum Decompress {
         var failure: Error? = nil
         let lock = NSLock()
         let n = blocks.count
-        let work: (Int) -> Void = { i in
+        let work: (Int, Zstd.Context?) -> Void = { i, zctx in
             let b = blocks[i]
             do {
                 let inPtr = src.advanced(by: Int(b.srcOffset)).assumingMemoryBound(to: UInt8.self)
@@ -128,7 +128,7 @@ enum Decompress {
                 switch codec {
                 case .gzip: produced = try gunzip(inPtr, Int(b.srcLength), outPtr, Int(b.dstLength))
                 case .brotli: produced = try appleDecode(COMPRESSION_BROTLI, inPtr, Int(b.srcLength), outPtr, Int(b.dstLength))
-                case .zstd: produced = try Zstd.decompress(inPtr, Int(b.srcLength), outPtr, Int(b.dstLength))
+                case .zstd: produced = try Zstd.decompress(inPtr, Int(b.srcLength), outPtr, Int(b.dstLength), context: zctx)
                 case .snappy: produced = try SnappyHost.decompress(inPtr, Int(b.srcLength), outPtr, Int(b.dstLength))
                 default: produced = 0
                 }
@@ -139,8 +139,19 @@ enum Decompress {
                 lock.lock(); if failure == nil { failure = error }; lock.unlock()
             }
         }
-        if n >= 4 { DispatchQueue.concurrentPerform(iterations: n, execute: work) }
-        else { for i in 0..<n { work(i) } }
+        // Pages are handed out in runs of a few, and each run decodes with one ZSTD context:
+        // `ZSTD_decompress` allocates and frees a fresh context (about 160 KB) on every call, which on a
+        // file of thousands of small pages cost more than the decompression itself.
+        // Runs of one page unless there are many more pages than cores, so a handful of large pages still
+        // spread across cores.
+        let run = codec == .zstd ? Swift.max(1, Swift.min(8, n / (2 * ProcessInfo.processInfo.activeProcessorCount))) : 1
+        let runs = (n + run - 1) / run
+        let perRun: (Int) -> Void = { r in
+            let zctx = codec == .zstd ? Zstd.Context() : nil
+            for i in (r * run)..<Swift.min(n, (r + 1) * run) { work(i, zctx) }
+        }
+        if n >= 4 { DispatchQueue.concurrentPerform(iterations: runs, execute: perRun) }
+        else { for r in 0..<runs { perRun(r) } }
         if let f = failure { throw f }
     }
 
@@ -178,6 +189,20 @@ enum Decompress {
 enum Zstd {
     typealias DecompressFn = @convention(c) (UnsafeMutableRawPointer?, Int, UnsafeRawPointer?, Int) -> Int
     typealias IsErrorFn = @convention(c) (Int) -> UInt32
+    typealias CreateDCtxFn = @convention(c) () -> OpaquePointer?
+    typealias FreeDCtxFn = @convention(c) (OpaquePointer?) -> Int
+    typealias DecompressDCtxFn = @convention(c) (OpaquePointer?, UnsafeMutableRawPointer?, Int, UnsafeRawPointer?, Int) -> Int
+
+    /// A reusable decompression context (`ZSTD_DCtx`), freed with the object. Nil inside when this
+    /// libzstd lacks the context API, and `decompress` then uses the one-shot call.
+    final class Context {
+        let dctx: OpaquePointer?
+        init?() {
+            guard let c = Zstd.contextAPI, let d = c.create() else { return nil }
+            dctx = d
+        }
+        deinit { if let c = Zstd.contextAPI { _ = c.free(dctx) } }
+    }
 
     /// Candidate library paths, most specific first. `ARROWMETAL_ZSTD` overrides everything.
     static let candidates: [String] = {
@@ -197,16 +222,30 @@ enum Zstd {
         return nil
     }()
 
+    private static let contextAPI: (create: CreateDCtxFn, free: FreeDCtxFn, decompress: DecompressDCtxFn)? = {
+        guard loaded != nil else { return nil }
+        for name in candidates {
+            guard let h = dlopen(name, RTLD_LAZY) else { continue }
+            guard let c = dlsym(h, "ZSTD_createDCtx"), let f = dlsym(h, "ZSTD_freeDCtx"),
+                  let d = dlsym(h, "ZSTD_decompressDCtx") else { continue }
+            return (unsafeBitCast(c, to: CreateDCtxFn.self), unsafeBitCast(f, to: FreeDCtxFn.self),
+                    unsafeBitCast(d, to: DecompressDCtxFn.self))
+        }
+        return nil
+    }()
+
     static var isAvailable: Bool { loaded != nil }
 
     static func decompress(_ src: UnsafePointer<UInt8>, _ srcLen: Int,
-                           _ dst: UnsafeMutablePointer<UInt8>, _ dstLen: Int) throws -> Int {
+                           _ dst: UnsafeMutablePointer<UInt8>, _ dstLen: Int, context: Context? = nil) throws -> Int {
         guard let fns = loaded else {
             throw ParquetError.unsupported(
                 "ZSTD pages need libzstd, which macOS does not ship and this SDK's Compression framework does not "
                 + "implement. Install it (brew install zstd) or point ARROWMETAL_ZSTD at libzstd.1.dylib.")
         }
-        let n = fns.decompress(dst, dstLen, src, srcLen)
+        let n: Int
+        if let context, let api = contextAPI { n = api.decompress(context.dctx, dst, dstLen, src, srcLen) }
+        else { n = fns.decompress(dst, dstLen, src, srcLen) }
         if fns.isError(n) != 0 { throw ParquetError.malformed("ZSTD_decompress failed") }
         return n
     }
