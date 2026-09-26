@@ -944,8 +944,9 @@ for name, e in cases.items():
     eng = am.MetalEngine(min_rows=0, shapes="all", raise_on_fail=True)
     assert_frame_equal(lf.collect(engine=eng), lf.collect())
     out[name] = [bool(eng.last_report.taken), list(eng.last_report.fallbacks)]
-# The shape the default engine takes: a large sort, here with a filter against such a literal.
-n = 1_000_000
+# The shape the default engine takes: a large sort (from 1,026,501 rows, the table's crossover with
+# its headroom), here with a filter against such a literal.
+n = 2_000_000
 rng = np.random.default_rng(3)
 big = pl.DataFrame({"q": rng.integers(0, 10**9, n), "x": rng.standard_normal(n) * 1e19})
 lf = big.lazy().filter(pl.col("x") < 1e19).sort("q")
