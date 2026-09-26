@@ -1,7 +1,8 @@
 # Changelog
 
 ## Unreleased
-- `python -m arrowmetal.bench`: one seeded 10,000,000-row dataset, sum, filter, sort and group-by sum
+- `python -m arrowmetal.bench`: one seeded 10,000,000-row dataset (drawn with `pyarrow.compute` from
+  SplitMix64 streams, so nothing beyond `pip install arrowmetal` is needed), sum, filter, sort and group-by sum
   through pyarrow (and Polars when installed) and through ArrowMetal, each answer checked against
   pyarrow, one table for the Mac it runs on with a ready-to-paste block; `--rows`, `--json`, `--quiet`,
   `--no-share`, `--no-polars`. A GitHub issue form (`.github/ISSUE_TEMPLATE/benchmark_result.yml`)
@@ -22,14 +23,17 @@
   `arrowmetal/_lib/libarrowmetal_polars.dylib` with its rpath set to `@loader_path` and local symbols
   stripped. `arrowmetal.polars_plugin.plugin_path()` takes the packaged plugin first when Python loaded
   the packaged `libArrowMetalC.dylib`, and a cargo build first when `$ARROWMETAL_LIB` or a development
-  build is loaded. `scripts/check_wheel.sh` installs a wheel and Polars into a fresh virtualenv with a
-  scrubbed environment and no cargo, runs all four Polars tiers and `bench --parquet`, and checks that
-  one `libArrowMetalC.dylib`, the packaged one, is loaded; it passed with polars 1.44.2 and pyarrow
-  25.0.1, NumPy not installed. The wheel is 8.2 MB (3.2 MB without the plugin) (docs/POLARS.md, Install).
+  build is loaded. `scripts/check_wheel.sh` installs a wheel with its `polars` extra into a fresh
+  virtualenv with a scrubbed environment and no cargo, runs all four Polars tiers, `bench` and
+  `bench --parquet`, and checks that one `libArrowMetalC.dylib`, the packaged one, is loaded; it passed
+  with polars 1.44.2 and pyarrow 25.0.1, NumPy not installed. The wheel is 8.2 MB (3.2 MB without the plugin) (docs/POLARS.md, Install).
 - `MetalEngine` (tier 4) no longer imports NumPy: the scalar-divisor reciprocal is computed with Python
   floats, identical to the NumPy result on 800,046 checked values including zeros, infinities, NaN and
   subnormals. NumPy is not installed by the wheel, pyarrow or Polars, and the engine raised
   `ModuleNotFoundError` without it.
+- The `polars` extra is `polars>=1.44,<1.45`, the minor the packaged plugin's ABI matches (it was
+  `polars>=1.0`). Tiers 1 and 3 run on any `polars>=1.0`; tier 4 is tested on 1.44.1 and 1.44.2
+  (docs/POLARS.md, "Which Polars").
 
 ## 0.2.0
 Everything below is new in 0.2.0.

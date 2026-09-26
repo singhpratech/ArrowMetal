@@ -36,13 +36,28 @@ has one rpath, `@loader_path`, so its `@rpath/libArrowMetalC.dylib` resolves to 
 the same file Python loads. The 0.2.0 wheel on PyPI carries `libArrowMetalC.dylib` only; with it,
 tier 2 needs the cargo build below.
 
-`scripts/check_wheel.sh` checks a built wheel: it installs the wheel and Polars into a fresh
-virtualenv outside the repository, with a scrubbed environment and no cargo on `PATH`, runs one
-expression or plan per tier, and checks that the process loaded exactly one `libArrowMetalC.dylib`,
-the packaged one. On an M4 Max (macOS 26.6.2, Homebrew Python 3.13.9) it passed with polars 1.44.2
-and pyarrow 25.0.1 as pip resolved them, NumPy not installed: the packaged plugin, built against
+`scripts/check_wheel.sh` checks a built wheel: it installs the wheel with its `polars` extra into a
+fresh virtualenv outside the repository, with a scrubbed environment and no cargo on `PATH`, runs one
+expression or plan per tier, checks that the process loaded exactly one `libArrowMetalC.dylib`, the
+packaged one, and runs `python -m arrowmetal.bench` with and without `--parquet`. On an M4 Max
+(macOS 26.6.2, Homebrew Python 3.13.9) it passed with polars 1.44.2 and pyarrow 25.0.1 as pip
+resolved them, NumPy not installed: the packaged plugin, built against
 polars 0.55 crates, loads in py-polars 1.44.2. The plugin adds 5.0 MB to the compressed wheel
 (3.2 MB before, 8.2 MB after) and is 21 MB on disk after `strip -x`.
+
+### Which Polars
+
+`pip install 'arrowmetal[polars]'` installs `polars>=1.44,<1.45`, the range every tier works in.
+Per tier:
+
+| Tier | Polars |
+|---|---|
+| 1. Bridge and namespaces | any `polars>=1.0` (pure Python over the Arrow C Data Interface) |
+| 3. Streaming hand-off | any `polars>=1.0` (pure Python over the Arrow C Data Interface) |
+| 2. Expression plugin | 1.44.x: the plugin is built on the polars 0.55 crates, and Polars refuses a plugin built for another minor's ABI (Version pinning, below) |
+| 4. `MetalEngine` | tested on 1.44.1 (the full suite, `TESTED_POLARS`) and 1.44.2 (`scripts/check_wheel.sh`); it walks Polars' unstable IR, checked against `TESTED_IR_VERSION` (14, 7) |
+
+A Polars outside 1.44 installed without the extra keeps tiers 1 and 3.
 
 ### From source
 
