@@ -87,9 +87,10 @@ extension ParquetFile {
         let wanted = try selectedFields(options.columns)
         var names: [String] = []
         var columns: [AnyMetalArray] = []
-        // Wrap the bytes this read will touch as one Metal buffer up front. Column chunks are
-        // interleaved by row group, so a single column's chunks span nearly the whole file in a
-        // many-row-group file: wrapping per column would map the same pages once per column.
+        // When the columns read cover most of the bytes they span, wrap that span as one Metal buffer up
+        // front: column chunks are interleaved by row group, so each column's chunks span nearly the
+        // whole file, and wrapping per column would map the same pages once per column. A sparse
+        // projection skips this and maps each column's own chunks (`pageSource(covering:)`).
         ParquetProfile.lap("read.plan")
         try prewrap(fields: wanted, rowGroups: groups)
         // One open command buffer for the whole read: the decode is a chain of small kernels per column,
@@ -130,9 +131,10 @@ extension ParquetFile {
         return result
     }
 
-    /// Maps the byte span of every column chunk this read will touch, in one `MTLBuffer`.
+    /// Maps the byte span of every column chunk this read will touch, in one `MTLBuffer`, when those
+    /// chunks fill at least four fifths of it (always, for a file not mapped shared).
     private func prewrap(fields: [ParquetField], rowGroups: [Int]) throws {
-        var lo = Int.max, hi = 0
+        var lo = Int.max, hi = 0, total = 0
         for f in fields {
             for leaf in f.leaves {
                 for g in rowGroups {
@@ -141,10 +143,11 @@ extension ParquetFile {
                     let m = rg.columns[leaf.index].meta
                     lo = Swift.min(lo, Int(m.startOffset))
                     hi = Swift.max(hi, Int(m.startOffset) + Int(m.totalCompressedSize))
+                    total += Swift.max(Int(m.totalCompressedSize), 0)
                 }
             }
         }
-        guard lo < hi else { return }
+        guard lo < hi, !isMappedShared || total * 5 >= (hi - lo) * 4 else { return }
         _ = try buffer(covering: lo..<Swift.min(hi, fileSize))
     }
 

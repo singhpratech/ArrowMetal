@@ -49,6 +49,58 @@ final class MappedRegion: @unchecked Sendable {
     var raw: UnsafeRawBufferPointer { UnsafeRawBufferPointer(start: base, count: length) }
 }
 
+/// Several page-aligned ranges of a file mapped next to each other in one reserved range of address
+/// space, so that one `MTLBuffer` covers exactly them: one column's chunks, without the other columns'
+/// chunks that sit between them in the file.
+final class MappedView: @unchecked Sendable {
+    let base: UnsafeMutableRawPointer
+    let length: Int
+
+    /// `intervals` are page-aligned, sorted and disjoint file ranges, mapped read-only and shared.
+    init(fd: Int32, intervals: [Range<Int>]) throws {
+        let length = intervals.reduce(0) { $0 + $1.count }
+        guard length > 0 else { throw ParquetError.io("empty view") }
+        guard let p = mmap(nil, length, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0), p != MAP_FAILED else {
+            throw ParquetError.io("mmap failed: \(String(cString: strerror(errno)))")
+        }
+        var at = 0
+        for r in intervals {
+            let q = mmap(p.advanced(by: at), r.count, PROT_READ, MAP_SHARED | MAP_FIXED, fd, off_t(r.lowerBound))
+            guard q == p.advanced(by: at) else {
+                munmap(p, length)
+                throw ParquetError.io("mmap failed: \(String(cString: strerror(errno)))")
+            }
+            at += r.count
+        }
+        self.base = p
+        self.length = length
+    }
+
+    deinit { munmap(base, length) }
+}
+
+/// Where a column's page bytes are for the GPU: a buffer, the offset kernels bind it at, and how a file
+/// offset translates into an offset from that binding point.
+struct ParquetPageSource {
+    let buffer: MetalArrowBuffer
+    /// Bind `buffer.mtl` at this offset.
+    let bindingOffset: Int
+    /// Sorted, disjoint file ranges and where each starts relative to the binding point.
+    let intervals: [(file: Range<Int>, at: Int)]
+    /// Bytes addressable from the binding point.
+    let length: Int
+
+    /// The offset of file byte `x` (which must lie inside one of the intervals) from the binding point.
+    func offset(ofFile x: Int) -> Int {
+        var lo = 0, hi = intervals.count - 1
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if intervals[mid].file.lowerBound <= x { lo = mid } else { hi = mid - 1 }
+        }
+        return intervals[lo].at + (x - intervals[lo].file.lowerBound)
+    }
+}
+
 /// An open Parquet file: mapped bytes plus the decoded footer.
 public final class ParquetFile: @unchecked Sendable {
     public let path: String
@@ -79,6 +131,9 @@ public final class ParquetFile: @unchecked Sendable {
     /// every projection for the columns it does not read, so ranges are wrapped on demand and cached:
     /// reading two columns of a forty-column file maps two column chunks.
     private var wrapped: [Int: MetalArrowBuffer] = [:]
+    /// Views of one column's chunks (`pageSource(covering:)`), keyed by their file intervals, oldest first.
+    private var views: [(key: [Int], source: ParquetPageSource)] = []
+    private static let maxViews = 64
     private let wrapLock = NSLock()
 
     /// Use the column index and offset index, when the file has them, to skip the data pages a
@@ -172,6 +227,90 @@ public final class ParquetFile: @unchecked Sendable {
         wrapped[start] = buf
         wrapLock.unlock()
         return (buf, range.lowerBound - start)
+    }
+
+    /// True when the file is mapped read-only and shared (see `MappedRegion`).
+    var isMappedShared: Bool { region.isSharedReadOnly }
+
+    /// Number of column views held (`pageSource(covering:)`); the tests use it to see which path ran.
+    var viewCount: Int { wrapLock.lock(); defer { wrapLock.unlock() }; return views.count }
+
+    /// True when a cached wrap already encloses `range`.
+    func hasWrap(enclosing range: Range<Int>) -> Bool {
+        let page = metalPageSize()
+        let start = (Swift.max(range.lowerBound, 0) / page) * page
+        let end = Swift.min(roundUp(Swift.max(range.upperBound, start + 1), to: page), region.length)
+        wrapLock.lock(); defer { wrapLock.unlock() }
+        return wrapped.contains { $0.key <= start && $0.key + $0.value.byteCount >= end }
+    }
+
+    /// The page bytes of `ranges` (file byte ranges: one column's pages across the row groups a read
+    /// selects) for the GPU.
+    ///
+    /// Column chunks interleave by row group, so one column's chunks are spread over nearly the whole
+    /// file even though they are a fraction of its bytes, and the first kernel to read a wrapped range
+    /// pays to make all of it resident. So when the ranges are sparse in their span, they are mapped
+    /// side by side into a `MappedView` and only they are wrapped; when they are dense, when a cached
+    /// wrap already covers them, or when the file is not mapped shared, the span is wrapped as one range
+    /// (`buffer(covering:)`).
+    func pageSource(covering ranges: [Range<Int>]) throws -> ParquetPageSource {
+        let page = metalPageSize()
+        var merged: [Range<Int>] = []
+        for r in ranges.filter({ !$0.isEmpty }).sorted(by: { $0.lowerBound < $1.lowerBound }) {
+            let lo = (Swift.max(r.lowerBound, 0) / page) * page
+            let hi = Swift.min(roundUp(r.upperBound, to: page), region.length)
+            if let last = merged.last, lo <= last.upperBound {
+                merged[merged.count - 1] = last.lowerBound..<Swift.max(last.upperBound, hi)
+            } else if lo < hi {
+                merged.append(lo..<hi)
+            }
+        }
+        guard let first = merged.first, let last = merged.last else {
+            // Nothing but empty pages: any valid range of the mapping will do as the binding point.
+            let (b, off) = try buffer(covering: 0..<Swift.min(page, region.length))
+            return ParquetPageSource(buffer: b, bindingOffset: b.offset + off, intervals: [(0..<0, 0)], length: 0)
+        }
+        let span = first.lowerBound..<last.upperBound
+        let total = merged.reduce(0) { $0 + $1.count }
+        func whole() throws -> ParquetPageSource {
+            guard span.count < Int(UInt32.max) else {
+                throw ParquetError.unsupported("a single column chunk spanning more than 4 GiB")
+            }
+            let (b, off) = try buffer(covering: span)
+            return ParquetPageSource(buffer: b, bindingOffset: b.offset + off,
+                                     intervals: [(span, 0)], length: span.count)
+        }
+        if merged.count == 1 || !isMappedShared || total * 5 >= span.count * 4 || hasWrap(enclosing: span) {
+            return try whole()
+        }
+        guard total < Int(UInt32.max) else {
+            throw ParquetError.unsupported("a single column chunk spanning more than 4 GiB")
+        }
+        let key = merged.flatMap { [$0.lowerBound, $0.upperBound] }
+        wrapLock.lock()
+        if let i = views.firstIndex(where: { $0.key == key }) {
+            let hit = views.remove(at: i)
+            views.append(hit)
+            wrapLock.unlock()
+            return hit.source
+        }
+        wrapLock.unlock()
+        let view = try MappedView(fd: fd, intervals: merged)
+        guard let mtl = context.device.makeBuffer(bytesNoCopy: view.base, length: view.length,
+                                                  options: [.storageModeShared], deallocator: nil) else {
+            return try whole()
+        }
+        ParquetProfile.lap("view \(view.length >> 20) MB in \(merged.count) ranges")
+        var intervals: [(file: Range<Int>, at: Int)] = []
+        var at = 0
+        for r in merged { intervals.append((r, at)); at += r.count }
+        let source = ParquetPageSource(buffer: MetalArrowBuffer(mtl: mtl, byteCount: view.length, keepAlive: view),
+                                       bindingOffset: 0, intervals: intervals, length: view.length)
+        wrapLock.lock()
+        views.append((key, source))
+        if views.count > Self.maxViews { views.removeFirst() }
+        wrapLock.unlock()
+        return source
     }
 
     /// Wraps `length` bytes of the mapping at `start` (both page multiples, inside the mapping).

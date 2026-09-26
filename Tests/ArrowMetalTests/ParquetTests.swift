@@ -397,4 +397,47 @@ final class ParquetTests: XCTestCase {
         }
         XCTAssertGreaterThan(compared, 20)
     }
+
+    /// A projection of one column (or a few) of a wide file with many row groups maps only those
+    /// columns' chunks side by side (`ParquetFile.pageSource(covering:)`), and reads what the whole-file
+    /// read returns for them, with and without row-group selection, uncompressed and Snappy, with a
+    /// dictionary column among them.
+    func testSparseProjectionsReadThroughColumnViews() throws {
+        try requireRealGPU()
+        let n = 120_000
+        func opt<T>(_ i: Int, _ v: T) -> T? { i % 11 == 5 ? nil : v }
+        let batch = try MetalRecordBatch(
+            names: ["a", "b", "c", "d", "s"],
+            columns: [
+                .int64(try MetalArray<Int64>((0..<n).map { Int64($0) &* 7919 })),
+                .float64(try MetalArray<Double>((0..<n).map { opt($0, Double($0) * 0.5) })),
+                .int32(try MetalArray<Int32>((0..<n).map { Int32(truncatingIfNeeded: $0 &* 2_654_435_761) })),
+                .int64(try MetalArray<Int64>((0..<n).map { opt($0, Int64($0 % 977)) })),
+                .string(try MetalStringArray((0..<n).map { "value \($0 % 1000)" })),
+            ])
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("arrowmetal-parquet-views-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        for codec in [ParquetCodec.uncompressed, .snappy] {
+            let path = dir.appendingPathComponent("wide-\(codec.name).parquet").path
+            try ParquetWriter.write(batch, to: path,
+                                    options: ParquetWriteOptions(compression: codec, useDictionary: true, rowGroupSize: 10_000))
+            let whole = try ParquetFile(path: path).read()
+            let f = try ParquetFile(path: path)
+            XCTAssertEqual(f.rowGroupCount, 12)
+            for (i, name) in batch.names.enumerated() {
+                let one = try f.read(columns: [name])
+                assertEqual(try MetalRecordBatch(names: [name], columns: [whole.columns[i]]), one, "\(codec.name) \(name)")
+                // Read again: the cached view serves it.
+                assertEqual(one, try f.read(columns: [name]), "\(codec.name) \(name) again")
+            }
+            XCTAssertGreaterThan(f.viewCount, 0, "\(codec.name): no one-column read went through a view")
+            let groups = [1, 4, 7, 11]
+            let some = try f.read(ParquetReadOptions(columns: ["d", "a"], rowGroups: groups))
+            let wholeSome = try ParquetFile(path: path).read(ParquetReadOptions(rowGroups: groups))
+            assertEqual(try MetalRecordBatch(names: ["d", "a"], columns: [wholeSome.columns[3], wholeSome.columns[0]]),
+                        some, "\(codec.name) d, a over row groups \(groups)")
+        }
+    }
 }

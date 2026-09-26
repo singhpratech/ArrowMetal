@@ -185,17 +185,12 @@ extension ParquetFile {
         let totalLevels = dataPages.reduce(0) { $0 + Int($1.header.numValues) }
         try Dispatch.checkLength(totalLevels)
 
-        // ---- 2. address every page with 32-bit offsets relative to one binding point
-        let page = metalPageSize()
-        var minOffset = Int.max, maxEnd = 0
-        for p in dataPages + dictPages {
-            minOffset = Swift.min(minOffset, p.bodyOffset)
-            maxEnd = Swift.max(maxEnd, p.bodyOffset + Int(p.header.compressedSize))
-        }
-        let srcBase = (minOffset / page) * page
-        guard maxEnd - srcBase < Int(UInt32.max) else {
-            throw ParquetError.unsupported("a single column chunk spanning more than 4 GiB")
-        }
+        // ---- 2. address every page with 32-bit offsets relative to one binding point. Only this
+        // column's page bytes are handed to the GPU, so a projection never pays for the columns it skips.
+        let source = try pageSource(covering: (dataPages + dictPages).map {
+            $0.bodyOffset..<($0.bodyOffset + Int($0.header.compressedSize))
+        })
+        func rel(_ p: ParquetRawPage) -> UInt32 { UInt32(source.offset(ofFile: p.bodyOffset)) }
 
         // ---- 3. page descriptors and decompression
         var infos = [ParquetPageInfo](repeating: ParquetPageInfo(), count: dataPages.count)
@@ -226,18 +221,16 @@ extension ParquetFile {
             dictInfos[i] = info
         }
 
-        // Only this column's byte range is wrapped for the GPU, so a projection never pays for the
-        // columns it skips.
-        let (mapped, mappedOffset) = try buffer(covering: srcBase..<maxEnd)
+        let mapped = source.buffer
         let pageData: MTLBuffer
         let pageDataOffset: Int
         var owned: MetalArrowBuffer? = nil
         if !anyCompressed {
             // The mapped file *is* the page buffer.
             pageData = mapped.mtl
-            pageDataOffset = mapped.offset + mappedOffset
-            for i in infos.indices { infos[i].dataOffset = UInt32(dataPages[i].bodyOffset - srcBase) }
-            for i in dictInfos.indices { dictInfos[i].dataOffset = UInt32(dictPages[i].bodyOffset - srcBase) }
+            pageDataOffset = source.bindingOffset
+            for i in infos.indices { infos[i].dataOffset = rel(dataPages[i]) }
+            for i in dictInfos.indices { dictInfos[i].dataOffset = rel(dictPages[i]) }
         } else {
             var dst = 0
             var byCodec: [ParquetCodec: [PageBlock]] = [:]
@@ -247,7 +240,7 @@ extension ParquetFile {
                        dictionary: Bool = false) {
                 let uncompressed = Int(p.header.uncompressedSize)
                 info.dataOffset = UInt32(dst)
-                let src = UInt32(p.bodyOffset - srcBase)
+                let src = rel(p)
                 let levelBytes = p.header.type == .dataPageV2
                     ? Int(p.header.repLevelsByteLength) + Int(p.header.defLevelsByteLength) : 0
                 let compressed = codec == .uncompressed || !p.header.isCompressed
@@ -281,16 +274,16 @@ extension ParquetFile {
             ParquetProfile.lap("col.alloc-pagebuf")
             if !copies.isEmpty {
                 try Decompress.into(ctx, codec: .uncompressed, source: mapped.mtl,
-                                    sourceOffset: mapped.offset + mappedOffset, blocks: copies, out: out)
+                                    sourceOffset: source.bindingOffset, blocks: copies, out: out)
             }
             for (codec, blocks) in dictByCodec {
                 try Decompress.into(ctx, codec: codec, source: mapped.mtl,
-                                    sourceOffset: mapped.offset + mappedOffset, blocks: blocks, out: out,
+                                    sourceOffset: source.bindingOffset, blocks: blocks, out: out,
                                     preferHost: true)
             }
             for (codec, blocks) in byCodec {
                 try Decompress.into(ctx, codec: codec, source: mapped.mtl,
-                                    sourceOffset: mapped.offset + mappedOffset, blocks: blocks, out: out)
+                                    sourceOffset: source.bindingOffset, blocks: blocks, out: out)
             }
             ParquetProfile.lap("col.decompress \(leaf.name) \(byCodec.values.reduce(0) { $0 + $1.count }) pages", sync: ctx)
             owned = out
