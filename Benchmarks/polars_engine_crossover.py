@@ -13,7 +13,8 @@ subtree, its dtype class and its input) and its input rows (`input_rows`):
 
 The fit, per case, is router_table.py's (python/arrowmetal/_router_fit.py `fit`), with the
 MetalEngine as the GPU side and the faster of Polars' two engines as the CPU side, over the case's
-input rows: the first measured size from which the engine is at least as fast at every larger size,
+input rows: the first measured size from which the engine is ahead at every larger size by at least
+`MARGIN` (its time x 1.15 no more than the faster Polars engine's),
 and inside the bracket below it the point where the straight lines through the two measured points
 of each side meet. A case the engine is not ahead of at its largest size has no crossover.
 
@@ -52,6 +53,9 @@ SWEEP_LABELS = {
     "top_k": ["sort: top_k (k=100, int64)"],
 }
 POLARS = ("polars in-memory", "polars streaming")
+# A case counts as ahead at a size only when the MetalEngine's time, raised by this fraction, is
+# still at most the faster Polars engine's: a case within that margin of Polars is not ahead.
+MARGIN = 0.15
 METAL = "MetalEngine all, cold"
 
 
@@ -84,8 +88,6 @@ def read_sweep(path):
         m = eng.get(METAL)
         if m is None or not m["shape"] or ";" in m["shape"] or not all(p in eng for p in POLARS):
             continue
-        if m["equal_to_polars"] != "True":
-            raise SystemExit(f"{case} at {_rows} rows: the MetalEngine result differs from Polars'")
         classes, dclass, source = m["shape"].split("|")
         shape = (tuple(classes.split("+")), dclass, source)
         c = cases.setdefault(case, {"shape": shape, "points": {}})
@@ -95,7 +97,10 @@ def read_sweep(path):
         n = int(m["input_rows"])
         if n in c["points"]:
             continue        # a case whose input stops growing (a capped side): the first size counts
-        c["points"][n] = (float(m["wall_ms"]), min(float(eng[p]["wall_ms"]) for p in POLARS))
+        # A size where the MetalEngine's answer differed from Polars' counts as not ahead, whatever
+        # its time.
+        metal = float(m["wall_ms"]) if m["equal_to_polars"] == "True" else float("inf")
+        c["points"][n] = (metal, min(float(eng[p]["wall_ms"]) for p in POLARS))
     return header, cases
 
 
@@ -106,11 +111,14 @@ def fit_cases(cases):
         sizes = sorted(c["points"])
         bench = {}
         for n, (metal, polars) in c["points"].items():
-            bench[(case, n, "gpu")] = metal
+            bench[(case, n, "gpu")] = metal * (1 + MARGIN)
             bench[(case, n, "cpu")] = polars
         try:
             cross, step, low, _pts = fit.fit(case, "cpu", None, sizes, bench)
         except fit.FitError:
+            cross = step = low = None
+        if step is not None and step == sizes[-1] and len(sizes) > 1:
+            # Ahead at the largest size alone is one measurement: not a crossover.
             cross = step = low = None
         out[case] = {"shape": c["shape"], "rows": cross, "step": step, "low": low,
                      "largest": sizes[-1], "smallest": sizes[0],
@@ -152,6 +160,7 @@ def render(source, header, per_case, table):
         "",
         "ENGINE: {(class, dtype class, input): {\"rows\": crossover or None (not ahead at the largest size",
         "measured), \"largest\": the largest input rows measured, \"cases\": the sweep cases fitted}}.",
+        "A case is ahead at a size when MetalEngine time x (1 + MARGIN) <= the faster Polars engine's.",
         "CASES: each case's own fit and its ratio (fastest Polars / MetalEngine) at every input size.",
         "SWEEP: the sort kernels' crossovers against the fastest CPU library, from " + SWEEP_JSON + ".",
         '"""',
@@ -159,6 +168,7 @@ def render(source, header, per_case, table):
         f"SOURCE = {source!r}",
         f"HEADER = {header!r}",
         f"SWEEP_SOURCE = {SWEEP_JSON!r}",
+        f"MARGIN = {MARGIN!r}",
         "",
         "ENGINE = " + pprint.pformat(table, width=100, sort_dicts=True),
         "",

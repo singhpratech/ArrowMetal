@@ -192,7 +192,7 @@ def test_engine_identity():
     assert e.name == "in-memory"
     assert e.plan_engine == "metal"
     assert repr(e).startswith("MetalEngine(")
-    assert e.min_rows == pe.DEFAULT_MIN_ROWS and e.shapes == "measured" and not e.raise_on_fail
+    assert e.min_rows is None and e.shapes == "measured" and not e.raise_on_fail
     assert am.MetalEngine is pe.MetalEngine
     with pytest.raises(ValueError):
         am.MetalEngine(shapes="some")
@@ -1125,24 +1125,8 @@ def test_other_file_scans_stay_with_polars(tmp_path):
 # =============================================================================================
 
 
-def test_default_takes_a_large_simple_sort_and_leaves_the_rest():
-    n = 1_000_000
-    rng = np.random.default_rng(3)
-    df = pl.DataFrame({"q": rng.integers(0, 10**9, n), "x": rng.random(n),
-                       "k": rng.integers(0, 50, n).astype(np.int32)})
-    eng = am.MetalEngine()
-    lf = df.lazy().sort("q")
-    compare(lf.collect(engine=eng), lf.collect(), order=["q"])
-    assert [t["kinds"] for t in eng.last_report.taken] == [["Sort", "DataFrameScan"]]
-    for lf, reason in ((df.lazy().group_by("k").agg(pl.col("x").sum()), "group_by"),
-                       (df.lazy().filter(pl.col("x") > 0.5), "rowwise"),
-                       (df.lazy().sort("q").head(10), "top_k"),
-                       (df.lazy().sort("x", descending=True), "needs"),
-                       (df.head(999_999).lazy().sort("q"), "needs"),
-                       (df.with_columns(pl.col("k").cast(pl.String)).lazy().sort("q"), "String")):
-        lf.collect(engine=eng)
-        assert not eng.last_report.taken, eng.last_report
-        assert any(reason in f for f in eng.last_report.fallbacks), (reason, eng.last_report)
+# The default policy itself (which subtrees `MetalEngine()` takes, at which row counts, and the
+# report's rule lines) is tested in test_engine_policy.py.
 
 
 def test_min_rows_gate():
@@ -1837,29 +1821,3 @@ def test_statistics_that_disagree_with_the_data_are_an_error(scan_files, monkeyp
     with pytest.raises(am.ArrowMetalError, match="holds no null"):
         lf.collect(engine=pe.MetalEngine(min_rows=0, shapes="all"))
     am.clear_parquet_cache()
-
-
-def test_the_default_takes_a_large_sort_over_a_parquet_scan_and_leaves_the_rest(tmp_path):
-    """The defaults apply to scans as to in-memory frames: a full sort of at least 1,000,000 rows
-    whose keys need no helper column runs on Metal; group-by, a sort carrying a String column and a
-    smaller file stay with Polars, with the reason in the report."""
-    import pyarrow.parquet as pq
-    n = 1_000_000
-    rng = np.random.default_rng(4)
-    p = str(tmp_path / "big.parquet")
-    pq.write_table(pa.table({"q": rng.integers(0, 10**9, n), "x": rng.random(n),
-                             "k": rng.integers(0, 50, n).astype(np.int32),
-                             "s": pa.array(rng.integers(0, 99, n).astype(str))}), p)
-    small = str(tmp_path / "small.parquet")
-    pq.write_table(pq.read_table(p).slice(0, n - 1), small)
-    eng = am.MetalEngine()
-    lf = pl.scan_parquet(p).select("q", "x").sort("q")
-    compare(lf.collect(engine=eng), lf.collect(), order=["q"])
-    assert [t["kinds"] for t in eng.last_report.taken] == [["Sort", "Scan"]]
-    for lf, reason in ((pl.scan_parquet(p).group_by("k").agg(pl.col("x").sum()), "group_by"),
-                       (pl.scan_parquet(p).filter(pl.col("x") > 0.5), "rowwise"),
-                       (pl.scan_parquet(p).select("q", "s").sort("q"), "String"),
-                       (pl.scan_parquet(small).select("q", "x").sort("q"), "below")):
-        lf.collect(engine=eng)
-        assert not eng.last_report.taken, eng.last_report
-        assert any(reason in f for f in eng.last_report.fallbacks), (reason, eng.last_report)
