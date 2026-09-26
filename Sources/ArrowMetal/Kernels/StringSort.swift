@@ -76,13 +76,12 @@ extension MetalStringArray {
         let n = length
         let ctx = context
         let out = try MetalArrowBuffer.allocate(byteCount: n * 8, zeroed: false, context: ctx)
-        let pso = try ctx.pipeline(source: StringSortSource.source, function: "str_prefix_key",
-                                  cacheKey: "strsort/str_prefix_key")
+        let fn = Self.kernelName("str_prefix_key", self)
+        let pso = try ctx.pipeline(source: StringSortSource.source, function: fn, cacheKey: "strsort/\(fn)")
         let permBuf = order?.values ?? out                  // an unused binding still needs a buffer
         try ctx.run { enc in
             enc.setComputePipelineState(pso)
-            enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-            enc.setBuffer(data.mtl, offset: data.offset, index: 1)
+            bindLayout(enc, at: 0)
             enc.setBuffer(permBuf.mtl, offset: permBuf.offset, index: 2)
             Dispatch.setUInt(enc, n, index: 3)
             Dispatch.setUInt(enc, chunk, index: 4)

@@ -31,6 +31,19 @@ const char* am_format(am_array* a);          // Arrow format string: c C s S i I
 // am_format's. Identical to am_format for every non-dictionary array.
 const char* am_compute_format(am_array* a);
 
+// String layout. am_import accepts utf8_view ("vu") and binary_view ("vz") and keeps the 16-byte
+// views and the variadic data buffers as they are (each mapped without a copy when page aligned,
+// copied once otherwise); am_format reports "u" / "z" for them, and am_export hands them back as
+// "vu" / "vz". The string kernels with a view form read the views directly; any other kernel converts
+// the column to offsets + bytes once, on first use, and keeps the result.
+// am_string_layout: 0 offsets + bytes (or not a string array), 1 views, 2 views already converted.
+int32_t am_string_layout(am_array* a);
+// For a view array: bytes copied on import, number of data buffers, bytes of the non-null strings.
+// Returns 1 for any other array.
+int32_t am_string_view_info(am_array* a, int64_t* copied_bytes, int64_t* data_buffers, int64_t* logical_bytes);
+// Process-wide count of view columns converted to offsets + bytes, and their rows.
+void    am_string_view_conversions(int64_t* columns, int64_t* rows);
+
 // Reductions. out_kind: 0 = int64 in out_i64, 1 = uint64 in out_u64 (same slot), 2 = float64 in out_f64.
 // op: 0 sum, 1 min, 2 max, 3 mean. *is_null is set when there is no valid value.
 int  am_reduce(am_array* a, int op, int64_t* out_i64, double* out_f64, int* out_kind, int* is_null);

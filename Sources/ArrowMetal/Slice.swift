@@ -52,7 +52,6 @@ extension MetalStringArray {
     /// Nothing else is copied.
     public func slice(offset: Int, length newLength: Int) throws -> MetalStringArray {
         precondition(offset >= 0 && newLength >= 0 && offset + newLength <= length, "slice out of range")
-        let off = offsets.view(byteOffset: offset * 4, byteCount: (newLength + 1) * 4)
         var bm: MetalArrowBuffer? = nil
         if let v = validity {
             if offset % 32 == 0 {
@@ -63,7 +62,15 @@ extension MetalStringArray {
                 bm = b
             }
         }
-        let res = MetalStringArray(length: newLength, nullCount: 0, validity: bm, offsets: off, data: data, context: context)
+        // A view column slices its views (16 bytes a row) and keeps its data buffers.
+        let res: MetalStringArray
+        if let v = view {
+            res = MetalStringArray(length: newLength, nullCount: 0, validity: bm,
+                                   view: v.sliced(offset: offset, length: newLength), context: context)
+        } else {
+            let off = offsets.view(byteOffset: offset * 4, byteCount: (newLength + 1) * 4)
+            res = MetalStringArray(length: newLength, nullCount: 0, validity: bm, offsets: off, data: data, context: context)
+        }
         res.isBinary = isBinary
         res.recomputeNullCount()
         return res

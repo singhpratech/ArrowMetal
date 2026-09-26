@@ -94,12 +94,11 @@ extension MetalStringArray {
     func hash64() throws -> MetalArray<UInt64> {
         let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(length, 1) * 8, zeroed: false, context: context)
         if length > 0 {
-            let p = try Self.pso(context, "sht_hash64")
-            let v = validity ?? offsets
+            let p = try Self.pso(context, Self.kernelName("sht_hash64", self))
+            let v = validity ?? anyBuffer
             try context.run { enc in
                 enc.setComputePipelineState(p)
-                enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-                enc.setBuffer(data.mtl, offset: data.offset, index: 1)
+                bindLayout(enc, at: 0)
                 enc.setBuffer(v.mtl, offset: v.offset, index: 2)
                 Dispatch.setUInt(enc, validity == nil ? 0 : 1, index: 3)
                 Dispatch.setLength(enc, length, nil, index: 4)
@@ -138,18 +137,18 @@ extension MetalStringArray {
         }
 
         let keys = try hashes ?? hash64()
-        let v = validity ?? offsets
+        let v = validity ?? anyBuffer
         let flagsBase = (validity == nil ? 0 : 1) | (verify ? 2 : 0)
+        let buildFn = Self.kernelName("sht_build", self)
 
         // The estimate, the growth retry and the rank scan are shared with the primitive table; only the
         // insert kernel differs, because only this one compares bytes.
         let g = try HashTable.groups(ctx: ctx, rows: n, nonNull: nonNull, initialSlots: initialSlots) {
             slots, slotCount, sampleMask, maxProbe, slotOf, firstOfSlot in
-            try HashTable.runBuild(ctx: ctx, function: "sht_build", source: StringHashTableSource.source,
-                                   cacheKey: "strhash/sht_build", slots: slots, slotCount: slotCount,
+            try HashTable.runBuild(ctx: ctx, function: buildFn, source: StringHashTableSource.source,
+                                   cacheKey: "strhash/\(buildFn)", slots: slots, slotCount: slotCount,
                                    rows: n, slotOf: slotOf, firstOfSlot: firstOfSlot) { enc, errorFlag in
-                enc.setBuffer(self.offsets.mtl, offset: self.offsets.offset, index: 0)
-                enc.setBuffer(self.data.mtl, offset: self.data.offset, index: 1)
+                self.bindLayout(enc, at: 0)
                 enc.setBuffer(keys.values.mtl, offset: keys.values.offset, index: 2)
                 enc.setBuffer(v.mtl, offset: v.offset, index: 3)
                 Dispatch.setUInt(enc, flagsBase | (slotOf != nil ? 4 : 0), index: 4)
@@ -169,7 +168,7 @@ extension MetalStringArray {
         let perm = try g.firstSlotOrder.argsort()
         let relabel = try perm.argsort()
         let firstRows = try g.firstSlotOrder.take(perm)
-        let ids = try HashTable.writeIds(ctx: ctx, rows: n, validity: validity, fallbackBuffer: offsets,
+        let ids = try HashTable.writeIds(ctx: ctx, rows: n, validity: validity, fallbackBuffer: anyBuffer,
                                          groups: g, relabel: relabel, nullId: nullId ?? g.groupCount)
         return StringHashTableIds(ids: ids, rows: n, groupCount: g.groupCount, firstRows: firstRows)
     }

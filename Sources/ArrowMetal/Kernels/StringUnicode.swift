@@ -108,11 +108,10 @@ extension MetalStringArray {
                                 validity == nil ? 0 : 1)
 
         if n > 0 {
-            let pLen = try suPipeline("su_tf_len")
+            let pLen = try suPipeline(Self.kernelName("su_tf_len", self))
             try ctx.run { enc in
                 enc.setComputePipelineState(pLen)
-                enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-                enc.setBuffer(data.mtl, offset: data.offset, index: 1)
+                bindLayout(enc, at: 0)
                 enc.setBuffer(vb.mtl, offset: vb.offset, index: 2)
                 Dispatch.setLength(enc, n, nil, index: 3)
                 enc.setBytes(&prm, length: 24, index: 4)
@@ -148,7 +147,6 @@ extension MetalStringArray {
                 let m = hostIndex.count
                 hostValues = [String](repeating: "", count: m)
                 let lenPtr = lens.mutableTyped(Int32.self)
-                let o = offsets.typed(Int32.self), d = data.typed(UInt8.self)
                 hostIndex.withUnsafeBufferPointer { idx in
                     hostValues.withUnsafeMutableBufferPointer { buf in
                         let chunk = 4096
@@ -157,9 +155,7 @@ extension MetalStringArray {
                             let lo = c * chunk, hi = Swift.min(lo + chunk, m)
                             for j in lo..<hi {
                                 let i = Int(idx[j])
-                                let s = String(decoding: UnsafeBufferPointer(start: d + Int(o[i]),
-                                                                             count: Int(o[i + 1] - o[i])),
-                                               as: UTF8.self)
+                                let s = String(decoding: self.rowBytes(i), as: UTF8.self)
                                 let v = host(s)
                                 buf[j] = v
                                 lenPtr[i] = Int32(v.utf8.count)
@@ -176,11 +172,10 @@ extension MetalStringArray {
         let total = Int(withExtendedLifetime(outOffsets) { outOffsets.typed(Int32.self)[n] })
         let outData = try MetalArrowBuffer.allocate(byteCount: Swift.max(total, 1), zeroed: false, context: ctx)
         if n > 0 {
-            let pWrite = try suPipeline("su_tf_write")
+            let pWrite = try suPipeline(Self.kernelName("su_tf_write", self))
             try ctx.run { enc in
                 enc.setComputePipelineState(pWrite)
-                enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-                enc.setBuffer(data.mtl, offset: data.offset, index: 1)
+                bindLayout(enc, at: 0)
                 enc.setBuffer(vb.mtl, offset: vb.offset, index: 2)
                 Dispatch.setLength(enc, n, nil, index: 3)
                 enc.setBytes(&prm, length: 24, index: 4)

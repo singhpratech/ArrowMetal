@@ -20,7 +20,7 @@ import Foundation
 /// Clearing the table, ranking the occupied slots, compacting the representatives and writing the ids
 /// are type-independent and live in `HashTableSource`.
 enum StringHashTableSource {
-    static let source: String = KernelSource.prelude + """
+    static let source: String = KernelSource.prelude + StringLayoutSource.accessors + """
 
     // ---------------------------------------------------------------------------------------------
     // Hashing. One pass over the bytes feeds a 64-bit FNV-style accumulator, finished with the
@@ -52,14 +52,12 @@ enum StringHashTableSource {
         return h;
     }
 
-    kernel void sht_hash64(device const int* offsets [[buffer(0)]], device const uchar* data [[buffer(1)]],
-                           device const uchar* validity [[buffer(2)]], constant uint& hasValidity [[buffer(3)]],
-                           device const uint* nPtr [[buffer(4)]], device ulong* out [[buffer(5)]],
-                           uint i [[thread_position_in_grid]]) {
+    template <typename S> inline void sht_hash64_t(S s, device const uchar* validity, uint hasValidity,
+                                                   device const uint* nPtr, device ulong* out, uint i) {
         if (i >= *nPtr) return;
         if (hasValidity != 0u && !bit_get(validity, i)) { out[i] = 0UL; return; }
-        int start = offsets[i];
-        out[i] = sht_hash_bytes(data, start, offsets[i + 1] - start);
+        int len; device const uchar* p = s.row(i, len);
+        out[i] = sht_hash_bytes(p, 0, len);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -68,11 +66,12 @@ enum StringHashTableSource {
     #define SHT_VERIFY       2u
     #define SHT_WRITE_SLOTS  4u
 
-    inline bool sht_eq(device const int* o, device const uchar* d, uint i, uint j) {
-        int a0 = o[i], la = o[i + 1] - a0;
-        int b0 = o[j], lb = o[j + 1] - b0;
+    template <typename S> inline bool sht_eq(S s, uint i, uint j) {
+        int la, lb;
+        device const uchar* pa = s.row(i, la);
+        device const uchar* pb = s.row(j, lb);
         if (la != lb) return false;
-        for (int t = 0; t < la; t++) if (d[a0 + t] != d[b0 + t]) return false;
+        for (int t = 0; t < la; t++) if (pa[t] != pb[t]) return false;
         return true;
     }
 
@@ -90,14 +89,10 @@ enum StringHashTableSource {
     // `maxProbe` bounds the linear-probe walk. Running out is not an error of the input: it means the
     // table is fuller than the estimate predicted, and the host retries with a bigger one. The last
     // attempt is given a table at least twice the row count and an unbounded budget, so it cannot fail.
-    kernel void sht_build(device const int* offsets [[buffer(0)]], device const uchar* data [[buffer(1)]],
-                          device const ulong* hashes [[buffer(2)]], device const uchar* validity [[buffer(3)]],
-                          constant uint& flags [[buffer(4)]], device const uint* nPtr [[buffer(5)]],
-                          constant uint& mask [[buffer(6)]], constant uint& sampleMask [[buffer(7)]],
-                          constant uint& maxProbe [[buffer(8)]], device atomic_uint* slots [[buffer(9)]],
-                          device uint* slotOf [[buffer(10)]], device atomic_uint* firstOfSlot [[buffer(11)]],
-                          device atomic_uint* errorFlag [[buffer(12)]],
-                          uint i [[thread_position_in_grid]]) {
+    template <typename S> inline void sht_build_t(S str, device const ulong* hashes, device const uchar* validity,
+                          uint flags, device const uint* nPtr, uint mask, uint sampleMask, uint maxProbe,
+                          device atomic_uint* slots, device uint* slotOf, device atomic_uint* firstOfSlot,
+                          device atomic_uint* errorFlag, uint i) {
         if (i >= *nPtr) return;
         if ((flags & SHT_HAS_VALIDITY) != 0u && !bit_get(validity, i)) return;
         ulong h = hashes[i];
@@ -118,7 +113,7 @@ enum StringHashTableSource {
                 if (head == 0u) continue;           // spurious: read the same slot again
             }
             uint r = head - 1u;
-            if (hashes[r] == h && (((flags & SHT_VERIFY) == 0u) || sht_eq(offsets, data, i, r))) {
+            if (hashes[r] == h && (((flags & SHT_VERIFY) == 0u) || sht_eq(str, i, r))) {
                 placed = true; break;
             }
             s = (s + 1u) & mask;
@@ -132,5 +127,11 @@ enum StringHashTableSource {
             atomic_fetch_min_explicit(&firstOfSlot[s], i, memory_order_relaxed);
         }
     }
-    """
+
+    """ + StringLayoutSource.variants("sht_hash64", slots: [0],
+        params: "device const uchar* validity [[buffer(2)]], constant uint& hasValidity [[buffer(3)]], device const uint* nPtr [[buffer(4)]], device ulong* out [[buffer(5)]], uint i [[thread_position_in_grid]]",
+        call: "sht_hash64_t(S0, validity, hasValidity, nPtr, out, i)")
+    + StringLayoutSource.variants("sht_build", slots: [0],
+        params: "device const ulong* hashes [[buffer(2)]], device const uchar* validity [[buffer(3)]], constant uint& flags [[buffer(4)]], device const uint* nPtr [[buffer(5)]], constant uint& mask [[buffer(6)]], constant uint& sampleMask [[buffer(7)]], constant uint& maxProbe [[buffer(8)]], device atomic_uint* slots [[buffer(9)]], device uint* slotOf [[buffer(10)]], device atomic_uint* firstOfSlot [[buffer(11)]], device atomic_uint* errorFlag [[buffer(12)]], uint i [[thread_position_in_grid]]",
+        call: "sht_build_t(S0, hashes, validity, flags, nPtr, mask, sampleMask, maxProbe, slots, slotOf, firstOfSlot, errorFlag, i)")
 }

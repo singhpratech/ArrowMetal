@@ -18,26 +18,16 @@ enum StringSortSource {
     /// can mirror it with a subtraction from the 63-bit maximum without losing stability.
     static let bytesPerChunk = 7
 
-    static let source = """
-    #include <metal_stdlib>
-    using namespace metal;
+    static let source = KernelSource.prelude + StringLayoutSource.accessors + """
 
-    kernel void str_prefix_key(device const int* offsets [[buffer(0)]],
-                               device const uchar* data [[buffer(1)]],
-                               device const int* perm [[buffer(2)]],
-                               constant uint& n [[buffer(3)]],
-                               constant uint& chunk [[buffer(4)]],
-                               constant uint& hasPerm [[buffer(5)]],
-                               constant uint& descending [[buffer(6)]],
-                               device ulong* out [[buffer(7)]],
-                               device const uchar* validity [[buffer(8)]],
-                               constant uint& nullMode [[buffer(9)]],
-                               uint i [[thread_position_in_grid]]) {
+    template <typename S> inline void str_prefix_key_t(S s, device const int* perm, uint n, uint chunk,
+                                                       uint hasPerm, uint descending, device ulong* out,
+                                                       device const uchar* validity, uint nullMode, uint i) {
         if (i >= n) return;
         uint row = hasPerm ? (uint)perm[i] : i;
-        uint start = (uint)offsets[row];
-        uint end = (uint)offsets[row + 1];
-        uint base = start + chunk * 7u;
+        int len; device const uchar* data = s.row(row, len);
+        uint end = (uint)len;
+        uint base = chunk * 7u;
         ulong k = 0ul;
         for (uint j = 0; j < 7u; j++) {
             uint p = base + j;
@@ -52,5 +42,8 @@ enum StringSortSource {
         }
         out[i] = k;
     }
-    """
+
+    """ + StringLayoutSource.variants("str_prefix_key", slots: [0],
+        params: "device const int* perm [[buffer(2)]], constant uint& n [[buffer(3)]], constant uint& chunk [[buffer(4)]], constant uint& hasPerm [[buffer(5)]], constant uint& descending [[buffer(6)]], device ulong* out [[buffer(7)]], device const uchar* validity [[buffer(8)]], constant uint& nullMode [[buffer(9)]], uint i [[thread_position_in_grid]]",
+        call: "str_prefix_key_t(S0, perm, n, chunk, hasPerm, descending, out, validity, nullMode, i)")
 }

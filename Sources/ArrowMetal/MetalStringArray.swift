@@ -2,21 +2,79 @@ import Foundation
 import Metal
 import CArrowABI
 
-/// An Arrow `utf8` array in Metal shared memory: validity bitmap, int32 offsets (length + 1), data bytes.
-/// `large_utf8` producers are accepted on import when the data fits in 2 GB (offsets are narrowed).
+/// An Arrow `utf8` array in Metal shared memory, in one of two layouts:
+///
+/// * **offsets + bytes** (Arrow `utf8` / `binary`): validity bitmap, int32 offsets (length + 1), data
+///   bytes. `large_utf8` producers are accepted on import when the data fits in 2 GB (offsets are
+///   narrowed).
+/// * **views** (Arrow `utf8_view` / `binary_view`, Polars' native layout): validity bitmap, 16-byte
+///   views and the variadic data buffers, held in `view` (`StringView.swift`). The kernels that read
+///   this layout directly bind it through `bindLayout`; anything else reads `offsets` / `data`, which
+///   converts the column to offsets + bytes once, on first use, and keeps the result
+///   (`convertedFromView` then says so).
 public final class MetalStringArray: @unchecked Sendable {
     public let length: Int
     public internal(set) var nullCount: Int
     public let validity: MetalArrowBuffer?
-    public let offsets: MetalArrowBuffer
-    public let data: MetalArrowBuffer
+    /// The views and data buffers of a `utf8_view` / `binary_view` column; nil for offsets + bytes.
+    public let view: StringViewStorage?
+    private var storedOffsets: MetalArrowBuffer?
+    private var storedData: MetalArrowBuffer?
+    private let conversionLock = NSLock()
     public let context: MetalContext
     /// True when the bytes are Arrow `binary`/`large_binary` rather than utf8: same layout, exported as "z".
     public var isBinary = false
 
     public init(length: Int, nullCount: Int, validity: MetalArrowBuffer?, offsets: MetalArrowBuffer, data: MetalArrowBuffer, context: MetalContext = .shared) {
         precondition(offsets.byteCount >= (length + 1) * 4)
-        self.length = length; self.nullCount = nullCount; self.validity = validity; self.offsets = offsets; self.data = data; self.context = context
+        self.length = length; self.nullCount = nullCount; self.validity = validity
+        self.view = nil; self.storedOffsets = offsets; self.storedData = data; self.context = context
+    }
+
+    /// A column in the view layout. Its offsets + bytes form is built on first use of `offsets` / `data`.
+    public init(length: Int, nullCount: Int, validity: MetalArrowBuffer?, view: StringViewStorage,
+                context: MetalContext = .shared) {
+        precondition(view.views.byteCount >= length * 16)
+        self.length = length; self.nullCount = nullCount; self.validity = validity
+        self.view = view; self.storedOffsets = nil; self.storedData = nil; self.context = context
+    }
+
+    /// int32 offsets (length + 1). For a view column the first read converts the column (see the type
+    /// comment) and every later read returns the same buffer.
+    public var offsets: MetalArrowBuffer {
+        if view == nil { return storedOffsets! }
+        conversionLock.lock(); defer { conversionLock.unlock() }
+        if storedOffsets == nil { convertFromView() }
+        return storedOffsets!
+    }
+    /// The data bytes the offsets index. For a view column, converts it first (see `offsets`).
+    public var data: MetalArrowBuffer {
+        if view == nil { return storedData! }
+        conversionLock.lock(); defer { conversionLock.unlock() }
+        if storedOffsets == nil { convertFromView() }
+        return storedData!
+    }
+    /// True once a view column has been converted to offsets + bytes (a kernel without a view form
+    /// read `offsets` or `data`).
+    public var convertedFromView: Bool {
+        guard view != nil else { return false }
+        conversionLock.lock(); defer { conversionLock.unlock() }
+        return storedOffsets != nil
+    }
+    /// A buffer that can always be bound without converting anything: the views for a view column, the
+    /// offsets otherwise. Kernels bind it in slots they do not read (an absent validity bitmap).
+    var anyBuffer: MetalArrowBuffer { view?.views ?? storedOffsets! }
+
+    /// Caller holds `conversionLock`.
+    private func convertFromView() {
+        guard let v = view else { return }
+        do {
+            let (o, d) = try v.convertToOffsets(length: length, validity: validity, context: context)
+            storedOffsets = o; storedData = d
+        } catch {
+            fatalError("ArrowMetal: converting a utf8_view column to offsets + bytes failed: \(error)")
+        }
+        StringViewStorage.noteConversion(rows: length)
     }
 
     public convenience init(_ strings: [String?], context: MetalContext = .shared) throws {
@@ -44,8 +102,14 @@ public final class MetalStringArray: @unchecked Sendable {
     public func isValid(_ i: Int) -> Bool { validity.map { Bitmap.isSet($0.typed(UInt8.self), i) } ?? true }
     public subscript(i: Int) -> String? {
         guard isValid(i) else { return nil }
-        let o = offsets.typed(Int32.self), d = data.typed(UInt8.self)
-        return String(decoding: UnsafeBufferPointer(start: d + Int(o[i]), count: Int(o[i + 1] - o[i])), as: UTF8.self)
+        return withExtendedLifetime(self) { String(decoding: rowBytes(i), as: UTF8.self) }
+    }
+    /// Row `i`'s bytes, read from whichever layout the column is in (nothing is converted). The pointer
+    /// is valid while the array is alive.
+    public func rowBytes(_ i: Int) -> UnsafeBufferPointer<UInt8> {
+        if let v = view { return v.bytes(row: i) }
+        let o = storedOffsets!.typed(Int32.self), d = storedData!.typed(UInt8.self)
+        return UnsafeBufferPointer(start: d + Int(o[i]), count: Int(o[i + 1] - o[i]))
     }
     public func toArray() -> [String?] { (0..<length).map { self[$0] } }
 
@@ -56,21 +120,19 @@ public final class MetalStringArray: @unchecked Sendable {
     }
 
     /// Byte length per string (null in, null out).
-    public func byteLength() throws -> MetalArray<Int32> { try lengths("str_byte_length", withData: false) }
+    public func byteLength() throws -> MetalArray<Int32> { try lengths("str_byte_length") }
     /// UTF-8 code point count per string.
-    public func charLength() throws -> MetalArray<Int32> { try lengths("str_char_length", withData: true) }
+    public func charLength() throws -> MetalArray<Int32> { try lengths("str_char_length") }
 
-    private func lengths(_ fn: String, withData: Bool) throws -> MetalArray<Int32> {
+    private func lengths(_ fn: String) throws -> MetalArray<Int32> {
         let out = try MetalArrowBuffer.allocate(byteCount: length * 4, zeroed: false, context: context)
-        let p = try pso(fn)
+        let p = try pso(Self.kernelName(fn, self))
         if length > 0 {
             try context.run { enc in
                 enc.setComputePipelineState(p)
-                enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-                var idx = 1
-                if withData { enc.setBuffer(data.mtl, offset: data.offset, index: 1); idx = 2 }
-                Dispatch.setLength(enc, length, nil, index: idx)
-                enc.setBuffer(out.mtl, offset: out.offset, index: idx + 1)
+                bindLayout(enc, at: 0)
+                Dispatch.setLength(enc, length, nil, index: 2)
+                enc.setBuffer(out.mtl, offset: out.offset, index: 3)
                 Dispatch.dispatch1D(enc, p, count: length)
             }
         }
@@ -86,12 +148,11 @@ public final class MetalStringArray: @unchecked Sendable {
         let pat = Array(pattern.utf8)
         let patBuf = try MetalArrowBuffer.allocate(byteCount: Swift.max(pat.count, 1), zeroed: false, context: context)
         pat.withUnsafeBytes { if $0.count > 0 { memcpy(patBuf.mutableContents, $0.baseAddress!, $0.count) } }
-        let p = try pso("str_predicate")
+        let p = try pso(Self.kernelName("str_predicate", self))
         if length > 0 {
             try context.run { enc in
                 enc.setComputePipelineState(p)
-                enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-                enc.setBuffer(data.mtl, offset: data.offset, index: 1)
+                bindLayout(enc, at: 0)
                 Dispatch.setLength(enc, length, nil, index: 2)
                 enc.setBuffer(patBuf.mtl, offset: patBuf.offset, index: 3)
                 Dispatch.setUInt(enc, pat.count, index: 4)
@@ -114,14 +175,12 @@ public final class MetalStringArray: @unchecked Sendable {
         guard other.length == length else { throw ArrowMetalError.lengthMismatch(length, other.length) }
         let words = BitmapOps.words(bits: length)
         let out = try MetalArrowBuffer.allocate(byteCount: Bitmap.byteCount(bits: length), zeroed: false, context: context)
-        let p = try pso("str_eq_array")
+        let p = try pso(Self.kernelName("str_eq_array", self, other))
         if length > 0 {
             try context.run { enc in
                 enc.setComputePipelineState(p)
-                enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-                enc.setBuffer(data.mtl, offset: data.offset, index: 1)
-                enc.setBuffer(other.offsets.mtl, offset: other.offsets.offset, index: 2)
-                enc.setBuffer(other.data.mtl, offset: other.data.offset, index: 3)
+                bindLayout(enc, at: 0)
+                other.bindLayout(enc, at: 2)
                 Dispatch.setLength(enc, length, nil, index: 4)
                 enc.setBuffer(out.mtl, offset: out.offset, index: 5)
                 Dispatch.dispatch1D(enc, p, count: words)
@@ -136,12 +195,11 @@ public final class MetalStringArray: @unchecked Sendable {
     /// MurmurHash3 (x86_32, seed 0) of each string's bytes. Nulls hash to 0 and stay null.
     public func hash32() throws -> MetalArray<UInt32> {
         let out = try MetalArrowBuffer.allocate(byteCount: length * 4, zeroed: false, context: context)
-        let p = try pso("str_hash32")
+        let p = try pso(Self.kernelName("str_hash32", self))
         if length > 0 {
             try context.run { enc in
                 enc.setComputePipelineState(p)
-                enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-                enc.setBuffer(data.mtl, offset: data.offset, index: 1)
+                bindLayout(enc, at: 0)
                 Dispatch.setLength(enc, length, nil, index: 2)
                 enc.setBuffer(out.mtl, offset: out.offset, index: 3)
                 Dispatch.dispatch1D(enc, p, count: length)
@@ -179,12 +237,11 @@ public final class MetalStringArray: @unchecked Sendable {
         let outData = try MetalArrowBuffer.allocate(byteCount: total, zeroed: false, context: ctx)
         // Source index with -1 for nulls so the copy kernel skips them.
         let srcFilled: MetalArray<Int32> = src.validity == nil ? src : try src.fillNull(-1)
-        let p = try pso("str_gather_bytes")
+        let p = try pso(Self.kernelName("str_gather_bytes", self))
         if n > 0 {
             try ctx.run { enc in
                 enc.setComputePipelineState(p)
-                enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 0)
-                enc.setBuffer(data.mtl, offset: data.offset, index: 1)
+                bindLayout(enc, at: 0)
                 enc.setBuffer(srcFilled.values.mtl, offset: srcFilled.values.offset, index: 2)
                 enc.setBuffer(outOffsets.mtl, offset: outOffsets.offset, index: 3)
                 Dispatch.setLength(enc, n, nil, index: 4)

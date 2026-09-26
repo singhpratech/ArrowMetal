@@ -19,7 +19,7 @@ import Foundation
 ///
 /// `sx_join_len` / `sx_join_write` are the two-pass form of Arrow `binary_join` over a `list<utf8>`.
 enum StringExtraSource {
-    static let source = KernelSource.prelude + """
+    static let source = KernelSource.prelude + StringLayoutSource.accessors + """
 
     // ---------------------------------------------------------------------------------------------
     // Character-class predicates. Op codes must match StringPredicate in StringExtra.swift.
@@ -264,21 +264,19 @@ enum StringExtraSource {
     // the same slot. Equality is always decided by comparing bytes, never by comparing hashes.
     #define SX_EMPTY 0xFFFFFFFFu
 
-    inline bool sx_eq(device const int* oa, device const uchar* da, uint i,
-                      device const int* ob, device const uchar* db, uint j) {
-        int a0 = oa[i], la = oa[i + 1] - a0;
-        int b0 = ob[j], lb = ob[j + 1] - b0;
+    template <typename A, typename B> inline bool sx_eq(A a, uint i, B b, uint j) {
+        int la, lb;
+        device const uchar* pa = a.row(i, la);
+        device const uchar* pb = b.row(j, lb);
         if (la != lb) return false;
-        for (int t = 0; t < la; t++) if (da[a0 + t] != db[b0 + t]) return false;
+        for (int t = 0; t < la; t++) if (pa[t] != pb[t]) return false;
         return true;
     }
     inline uint sx_slot(ulong k, uint mask) { return ((uint)(k >> 32) ^ (uint)k) & mask; }
 
-    kernel void sx_hash_insert(device const int* so [[buffer(0)]], device const uchar* sd [[buffer(1)]],
-                               device const ulong* keys [[buffer(2)]], device const uchar* sv [[buffer(3)]],
-                               device const uint* nPtr [[buffer(4)]], constant uint& mask [[buffer(5)]],
-                               constant uint& hasValidity [[buffer(6)]], device atomic_uint* table [[buffer(7)]],
-                               uint i [[thread_position_in_grid]]) {
+    template <typename S> inline void sx_hash_insert_t(S set, device const ulong* keys, device const uchar* sv,
+                                                       device const uint* nPtr, uint mask, uint hasValidity,
+                                                       device atomic_uint* table, uint i) {
         uint n = *nPtr;
         if (i >= n) return;
         if (hasValidity != 0u && !bit_get(sv, i)) return;            // nulls in the value set are ignored
@@ -292,7 +290,7 @@ enum StringExtraSource {
                                                           memory_order_relaxed, memory_order_relaxed)) return;
                 continue;                                            // lost the race (or a spurious
             }                                                        // failure): re-read the same slot
-            if (sx_eq(so, sd, i, so, sd, cur)) {
+            if (sx_eq(set, i, set, cur)) {
                 // Same string already present: keep the lowest row index, which index_in reports.
                 uint c = cur;
                 while (c > i) {
@@ -306,51 +304,54 @@ enum StringExtraSource {
     }
 
     // The set row matching probe row i, or SX_EMPTY.
-    inline uint sx_lookup(device const int* po, device const uchar* pd, uint i, ulong key,
-                          device const int* so, device const uchar* sd,
-                          device const uint* table, uint mask) {
+    template <typename P, typename S> inline uint sx_lookup(P probe, uint i, ulong key, S set,
+                                                            device const uint* table, uint mask) {
         uint slot = sx_slot(key, mask);
-        for (uint probe = 0; probe <= mask; probe++) {
+        for (uint k = 0; k <= mask; k++) {
             uint cur = table[slot];
             if (cur == SX_EMPTY) return SX_EMPTY;
-            if (sx_eq(po, pd, i, so, sd, cur)) return cur;
+            if (sx_eq(probe, i, set, cur)) return cur;
             slot = (slot + 1u) & mask;
         }
         return SX_EMPTY;
     }
 
-    kernel void sx_is_in(device const int* po [[buffer(0)]], device const uchar* pd [[buffer(1)]],
-                         device const ulong* keys [[buffer(2)]], device const uchar* pv [[buffer(3)]],
-                         device const int* so [[buffer(4)]], device const uchar* sd [[buffer(5)]],
-                         device const uint* table [[buffer(6)]], device const uint* nPtr [[buffer(7)]],
-                         constant uint& mask [[buffer(8)]], constant uint& hasValidity [[buffer(9)]],
-                         device uint* out [[buffer(10)]], uint w [[thread_position_in_grid]]) {
+    template <typename P, typename S> inline void sx_is_in_t(P probe, S set, device const ulong* keys,
+                                                             device const uchar* pv, device const uint* table,
+                                                             device const uint* nPtr, uint mask, uint hasValidity,
+                                                             device uint* out, uint w) {
         uint n = *nPtr, base = w * 32u;
         if (base >= n) return;
         uint limit = min(32u, n - base), bits = 0u;
         for (uint j = 0; j < limit; j++) {
             uint i = base + j;
             if (hasValidity != 0u && !bit_get(pv, i)) continue;      // a null is never in the set
-            if (sx_lookup(po, pd, i, keys[i], so, sd, table, mask) != SX_EMPTY) bits |= (1u << j);
+            if (sx_lookup(probe, i, keys[i], set, table, mask) != SX_EMPTY) bits |= (1u << j);
         }
         out[w] = bits;
     }
 
-    kernel void sx_index_in(device const int* po [[buffer(0)]], device const uchar* pd [[buffer(1)]],
-                            device const ulong* keys [[buffer(2)]], device const uchar* pv [[buffer(3)]],
-                            device const int* so [[buffer(4)]], device const uchar* sd [[buffer(5)]],
-                            device const uint* table [[buffer(6)]], device const uint* nPtr [[buffer(7)]],
-                            constant uint& mask [[buffer(8)]], constant uint& hasValidity [[buffer(9)]],
-                            device int* outValues [[buffer(10)]], device uchar* outValid [[buffer(11)]],
-                            uint i [[thread_position_in_grid]]) {
+    template <typename P, typename S> inline void sx_index_in_t(P probe, S set, device const ulong* keys,
+                                                                device const uchar* pv, device const uint* table,
+                                                                device const uint* nPtr, uint mask, uint hasValidity,
+                                                                device int* outValues, device uchar* outValid, uint i) {
         if (i >= *nPtr) return;
         outValues[i] = 0;
         outValid[i] = 0;
         if (hasValidity != 0u && !bit_get(pv, i)) return;
-        uint hit = sx_lookup(po, pd, i, keys[i], so, sd, table, mask);
+        uint hit = sx_lookup(probe, i, keys[i], set, table, mask);
         if (hit == SX_EMPTY) return;
         outValues[i] = (int)hit;
         outValid[i] = 1;
     }
-    """
+
+    """ + StringLayoutSource.variants("sx_hash_insert", slots: [0],
+        params: "device const ulong* keys [[buffer(2)]], device const uchar* sv [[buffer(3)]], device const uint* nPtr [[buffer(4)]], constant uint& mask [[buffer(5)]], constant uint& hasValidity [[buffer(6)]], device atomic_uint* table [[buffer(7)]], uint i [[thread_position_in_grid]]",
+        call: "sx_hash_insert_t(S0, keys, sv, nPtr, mask, hasValidity, table, i)")
+    + StringLayoutSource.variants("sx_is_in", slots: [0, 4],
+        params: "device const ulong* keys [[buffer(2)]], device const uchar* pv [[buffer(3)]], device const uint* table [[buffer(6)]], device const uint* nPtr [[buffer(7)]], constant uint& mask [[buffer(8)]], constant uint& hasValidity [[buffer(9)]], device uint* out [[buffer(10)]], uint w [[thread_position_in_grid]]",
+        call: "sx_is_in_t(S0, S1, keys, pv, table, nPtr, mask, hasValidity, out, w)")
+    + StringLayoutSource.variants("sx_index_in", slots: [0, 4],
+        params: "device const ulong* keys [[buffer(2)]], device const uchar* pv [[buffer(3)]], device const uint* table [[buffer(6)]], device const uint* nPtr [[buffer(7)]], constant uint& mask [[buffer(8)]], constant uint& hasValidity [[buffer(9)]], device int* outValues [[buffer(10)]], device uchar* outValid [[buffer(11)]], uint i [[thread_position_in_grid]]",
+        call: "sx_index_in_t(S0, S1, keys, pv, table, nPtr, mask, hasValidity, outValues, outValid, i)")
 }
