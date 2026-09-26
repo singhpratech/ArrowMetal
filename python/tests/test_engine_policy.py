@@ -411,7 +411,7 @@ def test_an_estimate_range_is_taken_only_where_every_count_in_it_is():
     # Reaching the rows bucket, which is not taken: stays with Polars, and says why.
     wide = policy.decide(["group_by_multi:sum"], dt, rows, router=ROUTER,
                          groups=(10_000, "10,000 groups, a test", 5_000, rows))
-    assert not wide.take and "not every count in the estimate's range is" in wide.reason, wide
+    assert not wide.take and "the estimate's range reaches counts that are not" in wide.reason, wide
 
 
 def test_the_probe_samples_until_the_decision_is_settled():

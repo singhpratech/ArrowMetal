@@ -323,18 +323,21 @@ def decide(classes, dtypes, rows, source="memory", *, shapes="measured", min_row
         if count is not None and lo != hi:
             # A range: taken only when every group count in it is.
             for c in grouped:
-                if not all(b is not None and (group_crossover(c, dclass, source, b, router)[0]
-                                              or rows + 1) <= rows
-                           for rlo, rhi, b in group_regions(rows) if rlo <= hi and rhi >= lo):
+                takes = [b is not None and (group_crossover(c, dclass, source, b, router)[0]
+                                            or rows + 1) <= rows
+                         for rlo, rhi, b in group_regions(rows) if rlo <= hi and rhi >= lo]
+                if not all(takes):
                     band = group_band(c, dclass, source, rows, router)
                     side = "outside"
                     if band:
                         first, last = _band_counts(band, rows)
                         side = "below" if hi < first else ("above" if lo > last else "outside")
+                    which = ("no count in the estimate's range is" if not any(takes) else
+                             "the estimate's range reaches counts that are not")
                     return Decision(False, f"estimated {text}: {side} the measured band for "
                                            f"{_what(c, dclass, source)} at {rows:,} input rows "
-                                           f"({_band_text(band, rows)}; not every count in the "
-                                           f"estimate's range is, {_table.SOURCE})", c, None, text)
+                                           f"({_band_text(band, rows)}; {which}; "
+                                           f"{_table.SOURCE})", c, None, text)
         if count is None:
             # No estimate: the engine table's row, which every group count measured is in.
             note = f"; {text}"
