@@ -176,6 +176,7 @@ extension ParquetFile {
             for p in pages { dataPages.append(p); codecOf.append(meta.codec) }
         }
         plan?.count(decoded: dataPages.count, skipped: skippedPages)
+        ParquetProfile.lap("col.headers", sync: ctx)
         guard !dataPages.isEmpty else {
             let empty = try emptyLeaf(leaf, options: options)
             empty.rowSpans = spans
@@ -275,7 +276,9 @@ extension ParquetFile {
             }
             for (i, p) in dictPages.enumerated() { stage(p, dictCodec[i], &dictInfos[i], dictionary: true) }
             for (i, p) in dataPages.enumerated() { stage(p, codecOf[i], &infos[i]) }
+            ParquetProfile.lap("col.stage")
             let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(dst, 1), zeroed: false, context: ctx)
+            ParquetProfile.lap("col.alloc-pagebuf")
             if !copies.isEmpty {
                 try Decompress.into(ctx, codec: .uncompressed, source: mapped.mtl,
                                     sourceOffset: mapped.offset + mappedOffset, blocks: copies, out: out)
@@ -289,6 +292,7 @@ extension ParquetFile {
                 try Decompress.into(ctx, codec: codec, source: mapped.mtl,
                                     sourceOffset: mapped.offset + mappedOffset, blocks: blocks, out: out)
             }
+            ParquetProfile.lap("col.decompress \(leaf.name) \(byCodec.values.reduce(0) { $0 + $1.count }) pages", sync: ctx)
             owned = out
             pageData = out.mtl
             pageDataOffset = out.offset
@@ -346,6 +350,7 @@ extension ParquetFile {
 
         // ---- 5. read the finished descriptors back so pages can be grouped by encoding
         try ctx.syncPoint()
+        ParquetProfile.lap("col.layout+levels")
         let finished = download(pagesBuf, count: infos.count)
 
         // ---- 6. dictionary
@@ -381,6 +386,7 @@ extension ParquetFile {
             }
         }
 
+        ParquetProfile.lap("col.dict", sync: ctx)
         // ---- 7. values, one kernel per encoding family
         let decoder = ParquetValueDecoder(
             file: self, leaf: leaf, ctx: ctx, pageData: pageData, pageDataOffset: pageDataOffset,
@@ -389,6 +395,7 @@ extension ParquetFile {
             totalDict: totalDict, dictValOffset: dictValOffset, dictValLength: dictValLength,
             dictFixed: dictFixed, dictionaryEncoded: options.dictionaryEncoded)
         let result = try decoder.run()
+        ParquetProfile.lap("col.values", sync: ctx)
 
         // ---- 8. validity
         let data = ParquetLeafData(leaf: leaf, file: self, context: ctx, levels: totalLevels,
@@ -403,6 +410,7 @@ extension ParquetFile {
             data.validity = bm
             data.nullCount = totalLevels - totalNonNull
         }
+        ParquetProfile.lap("col.validity", sync: ctx)
         // Keep the decompressed page buffer alive for as long as anything might still point into it.
         if let owned { data.retain(owned) }
         data.retain(mapped)

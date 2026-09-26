@@ -72,7 +72,9 @@ struct ParquetValueDecoder {
 
     private func fixedValues(groups g: [ParquetEncoding: [Int]], codes: MetalArrowBuffer?) throws -> ParquetLeafData.Values {
         let w = Swift.max(width, 1)
+        ParquetProfile.lap("col.values-pre", sync: ctx)
         let dense = try MetalArrowBuffer.allocate(byteCount: Swift.max(totalNonNull * w, w), zeroed: true, context: ctx)
+        ParquetProfile.lap("col.alloc-dense")
         for (enc, idx) in g {
             let sub = try subset(idx)
             switch enc {

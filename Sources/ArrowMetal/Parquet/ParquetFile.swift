@@ -3,9 +3,9 @@ import Metal
 
 // A Parquet file, mapped once and read from the GPU.
 //
-// The whole file is `mmap`ed, and because `mmap` always hands back a page-aligned address, any range of
-// it can be wrapped as an `MTLBuffer` with `makeBuffer(bytesNoCopy:)` — the same trick `MetalArrowBuffer`
-// uses for zero-copy Arrow import. A column chunk's pages are then addressable by a compute kernel as
+// The whole file is `mmap`ed read-only and shared, and because `mmap` always hands back a page-aligned
+// address, any range of it can be wrapped as an `MTLBuffer` with `makeBuffer(bytesNoCopy:)` — the same
+// trick `MetalArrowBuffer` uses for zero-copy Arrow import. A column chunk's pages are then addressable by a compute kernel as
 // byte offsets into that buffer, and the CPU never reads a byte of column data: it only parses the
 // Thrift footer and the page headers, which are metadata.
 //
@@ -19,17 +19,29 @@ final class MappedRegion: @unchecked Sendable {
     let length: Int
     /// File offset of `base` (always a page multiple).
     let fileOffset: Int
+    /// A read-only `MAP_SHARED` mapping rather than a writable `MAP_PRIVATE` one.
+    let isSharedReadOnly: Bool
 
-    init(fd: Int32, fileOffset: Int, length: Int) throws {
+    /// `sharedReadOnly` maps the file `PROT_READ` / `MAP_SHARED`; otherwise the mapping is
+    /// `PROT_READ | PROT_WRITE` / `MAP_PRIVATE`, whose pages are copy-on-write (nothing is ever written
+    /// back to the file).
+    ///
+    /// The difference shows up the first time the GPU reads a wrapped range: Metal makes the whole range
+    /// resident then, and on an M4 Max (macOS 26) that took about 75 ms per gigabyte of a private
+    /// mapping against about 7 ms per gigabyte of a shared read-only one. The decoders only ever read
+    /// the page bytes (every kernel binds them `device const`), so the Parquet reader maps shared and
+    /// read-only, and keeps the private mapping as the fallback for a device that will not wrap it.
+    init(fd: Int32, fileOffset: Int, length: Int, sharedReadOnly: Bool = false) throws {
         precondition(fileOffset % metalPageSize() == 0)
         guard length > 0 else { throw ParquetError.io("empty mapping") }
-        // PROT_WRITE with MAP_PRIVATE gives copy-on-write pages: nothing is written back to the file, and
-        // Metal is happy to wrap writable memory (a read-only mapping is rejected by some drivers).
-        let p = mmap(nil, length, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, off_t(fileOffset))
+        let p = sharedReadOnly
+            ? mmap(nil, length, PROT_READ, MAP_SHARED, fd, off_t(fileOffset))
+            : mmap(nil, length, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, off_t(fileOffset))
         guard let p, p != MAP_FAILED else { throw ParquetError.io("mmap failed: \(String(cString: strerror(errno)))") }
         self.base = p
         self.length = length
         self.fileOffset = fileOffset
+        self.isSharedReadOnly = sharedReadOnly
     }
 
     deinit { munmap(base, length) }
@@ -51,13 +63,21 @@ public final class ParquetFile: @unchecked Sendable {
 
     let fd: Int32
     let fileSize: Int
+    /// The file, mapped read-only and shared (see `MappedRegion`); the host parses headers from it and
+    /// the GPU reads its pages through the wraps below.
     private let region: MappedRegion
+    /// A private writable mapping of the same file, made only if Metal refuses to wrap `region`.
+    private var privateRegion: MappedRegion?
+    /// Map Parquet files read-only and shared. Off, every file is mapped private and writable, as before
+    /// (the tests read the fixtures both ways).
+    static var mapsSharedReadOnly = true
     /// Metal wrappers over sub-ranges of the mapping, one per column chunk actually read.
     ///
-    /// Wrapping bytes with `makeBuffer(bytesNoCopy:)` makes the GPU's page tables cover them, and that
-    /// costs time proportional to the range -- roughly 20 ms per gigabyte on an M4 Max. Wrapping the
-    /// whole file up front would charge every projection for the columns it does not read, so ranges are
-    /// wrapped on demand and cached: reading two columns of a forty-column file maps two column chunks.
+    /// Wrapping bytes with `makeBuffer(bytesNoCopy:)` costs next to nothing by itself, but the first
+    /// kernel that reads a wrapped range makes all of it resident for the GPU, and that costs time
+    /// proportional to the range (see `MappedRegion`). Wrapping the whole file up front would charge
+    /// every projection for the columns it does not read, so ranges are wrapped on demand and cached:
+    /// reading two columns of a forty-column file maps two column chunks.
     private var wrapped: [Int: MetalArrowBuffer] = [:]
     private let wrapLock = NSLock()
 
@@ -92,6 +112,7 @@ public final class ParquetFile: @unchecked Sendable {
     public init(path: String, context: MetalContext = .shared) throws {
         self.path = path
         self.context = context
+        ParquetProfile.start()
         let fd = open(path, O_RDONLY)
         guard fd >= 0 else { throw ParquetError.io("cannot open \(path): \(String(cString: strerror(errno)))") }
         var st = stat()
@@ -102,8 +123,11 @@ public final class ParquetFile: @unchecked Sendable {
         self.fileSize = size
         do {
             let page = metalPageSize()
-            self.region = try MappedRegion(fd: fd, fileOffset: 0, length: roundUp(size, to: page))
+            // Virtualised GPUs (CI runners) keep the private mapping, which is what they were tested with.
+            self.region = try MappedRegion(fd: fd, fileOffset: 0, length: roundUp(size, to: page),
+                                           sharedReadOnly: ParquetFile.mapsSharedReadOnly && !context.isVirtualDevice)
         } catch { close(fd); throw error }
+        ParquetProfile.lap("open.mmap")
         let raw = region.raw
         // PAR1 ... <metadata> <4-byte metadata length> PAR1
         guard raw[0] == 0x50, raw[1] == 0x41, raw[2] == 0x52, raw[3] == 0x31,
@@ -117,12 +141,15 @@ public final class ParquetFile: @unchecked Sendable {
         do {
             self.metadata = try ParquetFileMetadata.read(&r)
         } catch { close(fd); throw error }
+        ParquetProfile.lap("open.footer")
         do {
             let built = try ParquetFile.buildSchema(metadata.schema)
             self.leaves = built.leaves
             self.fields = built.fields
         } catch { close(fd); throw error }
         self.cachedArrowSchema = ParquetFile.decodeArrowSchema(metadata.keyValueMetadata)
+        ParquetProfile.lap("open.schema")
+        ParquetProfile.report("open")
     }
 
     /// A Metal buffer covering `range` of the file, plus the offset of `range.lowerBound` inside it.
@@ -139,13 +166,40 @@ public final class ParquetFile: @unchecked Sendable {
             return (b, range.lowerBound - s)
         }
         wrapLock.unlock()
-        let (buf, _) = try MetalArrowBuffer.wrapOrCopy(UnsafeRawPointer(region.base).advanced(by: start),
-                                                       byteCount: end - start,
-                                                       keepAlive: region, context: context)
+        let buf = try wrap(start: start, length: end - start)
+        ParquetProfile.lap("wrap \((end - start) >> 20) MB")
         wrapLock.lock()
         wrapped[start] = buf
         wrapLock.unlock()
         return (buf, range.lowerBound - start)
+    }
+
+    /// Wraps `length` bytes of the mapping at `start` (both page multiples, inside the mapping).
+    ///
+    /// The mapping is this file's own, so it is known to be mapped: no `mincore` probe, which over a
+    /// 2 GB range cost about 35 ms -- all of what used to be measured as the cost of wrapping.
+    private func wrap(start: Int, length: Int) throws -> MetalArrowBuffer {
+        if region.isSharedReadOnly,
+           let b = context.device.makeBuffer(bytesNoCopy: region.base.advanced(by: start), length: length,
+                                             options: [.storageModeShared], deallocator: nil) {
+            return MetalArrowBuffer(mtl: b, byteCount: length, keepAlive: region)
+        }
+        // A device that will not wrap read-only memory gets the private, writable mapping.
+        let r: MappedRegion
+        if region.isSharedReadOnly {
+            wrapLock.lock(); defer { wrapLock.unlock() }
+            if let p = privateRegion { r = p } else {
+                r = try MappedRegion(fd: fd, fileOffset: 0, length: region.length)
+                privateRegion = r
+            }
+        } else {
+            r = region
+        }
+        if let b = context.device.makeBuffer(bytesNoCopy: r.base.advanced(by: start), length: length,
+                                             options: [.storageModeShared], deallocator: nil) {
+            return MetalArrowBuffer(mtl: b, byteCount: length, keepAlive: r)
+        }
+        return try MetalArrowBuffer.copy(from: r.base.advanced(by: start), byteCount: length, context: context)
     }
 
     deinit { close(fd) }

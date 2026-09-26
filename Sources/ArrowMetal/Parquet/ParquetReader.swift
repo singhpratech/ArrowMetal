@@ -74,6 +74,7 @@ public struct ParquetReadOptions: Sendable {
 extension ParquetFile {
     /// Reads the selected columns and row groups into one Metal-resident record batch.
     public func read(_ options: ParquetReadOptions = ParquetReadOptions()) throws -> MetalRecordBatch {
+        ParquetProfile.start()
         let afterStatistics = try selectedRowGroups(options)
         // An equality filter whose value the row group's bloom filter has never seen rules it out.
         let afterBloom = useBloomFilters && options.filters.contains(where: { $0.op == .eq })
@@ -89,6 +90,7 @@ extension ParquetFile {
         // Wrap the bytes this read will touch as one Metal buffer up front. Column chunks are
         // interleaved by row group, so a single column's chunks span nearly the whole file in a
         // many-row-group file: wrapping per column would map the same pages once per column.
+        ParquetProfile.lap("read.plan")
         try prewrap(fields: wanted, rowGroups: groups)
         // One open command buffer for the whole read: the decode is a chain of small kernels per column,
         // and a command buffer per kernel would spend more time on round trips than on the GPU. The
@@ -106,7 +108,9 @@ extension ParquetFile {
                 }
                 columns.append(column)
             }
+            ParquetProfile.lap("read.flush", sync: context)
         }
+        ParquetProfile.lap("read.flush", sync: context)
         var stats = ParquetReadStatistics()
         stats.rowGroupsRead = groups.count
         stats.rowGroupsSkippedByStatistics = (options.rowGroups?.count ?? metadata.rowGroups.count) - afterStatistics.count
@@ -120,7 +124,10 @@ extension ParquetFile {
             // A projection of no columns still has a row count; expose it as an empty batch.
             return try MetalRecordBatch(names: [], columns: [])
         }
-        return try MetalRecordBatch(names: names, columns: columns)
+        let result = try MetalRecordBatch(names: names, columns: columns)
+        ParquetProfile.lap("read.batch")
+        ParquetProfile.report("read \(names.count) columns")
+        return result
     }
 
     /// Maps the byte span of every column chunk this read will touch, in one `MTLBuffer`.

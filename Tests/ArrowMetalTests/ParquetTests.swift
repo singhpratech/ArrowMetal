@@ -360,4 +360,41 @@ final class ParquetTests: XCTestCase {
         XCTAssertTrue(f[7].hasSuffix("#65535"), "expected a 64 KB value, got \(f[7].suffix(12))")
         XCTAssertEqual(f[0], "#0")
     }
+
+    // MARK: - how the file is mapped
+
+    /// Every fixture reads the same through the shared read-only mapping the reader uses and through
+    /// the private writable one it falls back to: whole files, one column at a time, and one row
+    /// group at a time.
+    func testSharedAndPrivateMappingsAgree() throws {
+        try requireRealGPU()
+        let names = try FileManager.default.contentsOfDirectory(atPath: Self.fixtures.path)
+            .filter { $0.hasSuffix(".parquet") }.sorted()
+        XCTAssertGreaterThan(names.count, 20)
+        defer { ParquetFile.mapsSharedReadOnly = true }
+        var compared = 0
+        for name in names {
+            let p = Self.fixtures.appendingPathComponent(name).path
+            func reads(shared: Bool) -> [MetalRecordBatch]? {
+                ParquetFile.mapsSharedReadOnly = shared
+                guard let f = try? ParquetFile(path: p) else { return nil }
+                var out: [MetalRecordBatch] = []
+                guard let whole = try? f.read() else { return nil }
+                out.append(whole)
+                for c in f.columnNames { if let b = try? f.read(columns: [c]) { out.append(b) } }
+                for g in 0..<f.rowGroupCount {
+                    if let b = try? f.read(ParquetReadOptions(rowGroups: [g])) { out.append(b) }
+                }
+                return out
+            }
+            let shared = reads(shared: true)
+            let priv = reads(shared: false)
+            XCTAssertEqual(shared == nil, priv == nil, "\(name): one mapping reads, the other does not")
+            guard let shared, let priv else { continue }
+            XCTAssertEqual(shared.count, priv.count, "\(name): number of reads")
+            for (i, (a, b)) in zip(shared, priv).enumerated() { assertEqual(a, b, "\(name) read \(i)") }
+            compared += 1
+        }
+        XCTAssertGreaterThan(compared, 20)
+    }
 }
