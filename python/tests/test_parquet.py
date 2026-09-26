@@ -186,3 +186,63 @@ def test_fifty_million_rows():
         assert abs(cols["v"].sum() - (n * (n - 1) / 2) * 0.5) < 1e6
         cat = f.read(columns=["cat"], dictionary=True)["cat"].to_arrow()
         assert len(cat) == n
+
+
+# ---- SNAPPY pages decoded on the host: dictionary pages, and dispatches of a few pages
+
+
+def _snappy_table(n):
+    import numpy as np
+    rng = np.random.default_rng(3)
+    runs = np.repeat(rng.integers(0, 50, n // 100 + 1), 100)[:n]           # overlapping copies
+    words = np.array(["x" * k + str(k) for k in range(1, 300, 7)])          # literals past 60 bytes
+    return pa.table({
+        "rand": pa.array(rng.integers(0, 10**9, n)),                        # 4-byte copies, many tokens
+        "runs": pa.array(runs),
+        "f": pa.array(rng.random(n)),
+        "s": pa.array(rng.choice(words, n), mask=rng.random(n) < 0.1),
+    })
+
+
+@pytest.mark.parametrize("pages", ["few", "many"])
+@pytest.mark.parametrize("dictionary", [True, False])
+def test_snappy_pages_on_the_host_and_on_the_gpu_read_like_pyarrow(tmp_path, pages, dictionary):
+    """With dictionary encoding every chunk starts with a dictionary page, which is decompressed on the
+    host; `few` data pages go to the host too, `many` (small pages) to the GPU. Every way reads what
+    pyarrow reads."""
+    n = 200_000
+    t = _snappy_table(n)
+    p = str(tmp_path / "s.parquet")
+    kw = {"data_page_size": 1 << 20} if pages == "few" else {"data_page_size": 4096,
+                                                             "write_batch_size": 512}
+    pq.write_table(t, p, compression="snappy", use_dictionary=dictionary, **kw)
+    got = am.read_parquet_table(p)
+    assert normalise(got) == normalise(pq.read_table(p))
+    got = am.read_parquet(p, columns=["s", "runs"], dictionary=True)
+    assert got["runs"].to_arrow().to_pylist() == t["runs"].to_pylist()
+
+
+def test_a_damaged_snappy_dictionary_page_raises(tmp_path):
+    """The host decoder checks every element against the page and the output slot: damage in a
+    dictionary page is an error, never a crash or a read outside the page."""
+    import numpy as np
+    n = 50_000
+    p = str(tmp_path / "d.parquet")
+    pq.write_table(_snappy_table(n), p, compression="snappy", use_dictionary=True)
+    cc = pq.ParquetFile(p).metadata.row_group(0).column(0)
+    start, end = cc.dictionary_page_offset, cc.data_page_offset
+    raw = open(p, "rb").read()
+    rng = np.random.default_rng(9)
+    outcomes = set()
+    for k in range(60):
+        b = bytearray(raw)
+        pos = int(rng.integers(start + 16, end))
+        b[pos] = (b[pos] + 1 + int(rng.integers(0, 254))) % 256
+        q = str(tmp_path / f"d{k}.parquet")
+        open(q, "wb").write(bytes(b))
+        try:
+            am.read_parquet(q, columns=["rand"])
+            outcomes.add("read")
+        except am.ArrowMetalError:
+            outcomes.add("raised")
+    assert "raised" in outcomes

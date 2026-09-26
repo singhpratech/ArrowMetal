@@ -27,6 +27,11 @@
   8-column files a one-column read goes from 291-373 ms through a fresh open to 6.06-11.96 ms through
   the cache (`Benchmarks/results/parquet_cache_2026-09-25.csv`, `parquet_bench.py --cache`;
   docs/PARQUET.md, "The open-file cache").
+- Parquet SNAPPY dictionary pages, and SNAPPY dispatches of at most 16 pages, are decompressed on the
+  host by a bounds-checked decoder instead of one GPU SIMD group per page. A 1,000,000-row file with
+  an `int64` and a `float64` column in pyarrow's defaults read in 102-106 ms before (94 ms of it one
+  790 KB dictionary page) and 20-36 ms after; five columns of a 10,000,000-row, 7-column SNAPPY file
+  with the file open, 221 ms before and 57-66 ms after (docs/PARQUET.md, "Decompression").
 - `am_parquet_column_null_count` / `ParquetFile.column_null_count`: a top-level column's null count from
   the footer (0 for a required column, else the sum of the row groups' statistics), without reading data.
 

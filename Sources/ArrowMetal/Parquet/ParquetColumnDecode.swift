@@ -240,8 +240,10 @@ extension ParquetFile {
         } else {
             var dst = 0
             var byCodec: [ParquetCodec: [PageBlock]] = [:]
+            var dictByCodec: [ParquetCodec: [PageBlock]] = [:]     // dictionary pages: one per chunk
             var copies: [PageBlock] = []
-            func stage(_ p: ParquetRawPage, _ codec: ParquetCodec, _ info: inout ParquetPageInfo) {
+            func stage(_ p: ParquetRawPage, _ codec: ParquetCodec, _ info: inout ParquetPageInfo,
+                       dictionary: Bool = false) {
                 let uncompressed = Int(p.header.uncompressedSize)
                 info.dataOffset = UInt32(dst)
                 let src = UInt32(p.bodyOffset - srcBase)
@@ -260,6 +262,10 @@ extension ParquetFile {
                                   srcLength: UInt32(Int(p.header.compressedSize) - levelBytes),
                                   dstOffset: UInt32(dst + levelBytes),
                                   dstLength: UInt32(uncompressed - levelBytes)))
+                } else if dictionary {
+                    dictByCodec[codec, default: []].append(
+                        PageBlock(srcOffset: src, srcLength: UInt32(p.header.compressedSize),
+                                  dstOffset: UInt32(dst), dstLength: UInt32(uncompressed)))
                 } else {
                     byCodec[codec, default: []].append(
                         PageBlock(srcOffset: src, srcLength: UInt32(p.header.compressedSize),
@@ -267,12 +273,17 @@ extension ParquetFile {
                 }
                 dst = roundUp(dst + uncompressed, to: 8)
             }
-            for (i, p) in dictPages.enumerated() { stage(p, dictCodec[i], &dictInfos[i]) }
+            for (i, p) in dictPages.enumerated() { stage(p, dictCodec[i], &dictInfos[i], dictionary: true) }
             for (i, p) in dataPages.enumerated() { stage(p, codecOf[i], &infos[i]) }
             let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(dst, 1), zeroed: false, context: ctx)
             if !copies.isEmpty {
                 try Decompress.into(ctx, codec: .uncompressed, source: mapped.mtl,
                                     sourceOffset: mapped.offset + mappedOffset, blocks: copies, out: out)
+            }
+            for (codec, blocks) in dictByCodec {
+                try Decompress.into(ctx, codec: codec, source: mapped.mtl,
+                                    sourceOffset: mapped.offset + mappedOffset, blocks: blocks, out: out,
+                                    preferHost: true)
             }
             for (codec, blocks) in byCodec {
                 try Decompress.into(ctx, codec: codec, source: mapped.mtl,

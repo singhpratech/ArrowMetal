@@ -4384,7 +4384,7 @@ class ParquetFile:
 
     def __del__(self):
         h = getattr(self, "_h", None)
-        if h:
+        if h and _lib is not None:        # at interpreter exit the module may already be torn down
             _lib.am_parquet_close(h)
             self._h = None
 
@@ -4629,6 +4629,14 @@ class _ParquetFileCache:
 
 
 _parquet_files = _ParquetFileCache()
+
+
+def _close_cached_parquet_files():
+    _parquet_files.clear()
+
+
+import atexit as _atexit                    # noqa: E402
+_atexit.register(_close_cached_parquet_files)
 
 
 def parquet_cache_info():

@@ -16,6 +16,12 @@ struct PageBlock {
 /// UNCOMPRESSED needs no work at all: the mapped file *is* the page buffer, so the reader passes the
 /// file's own `MTLBuffer` straight to the decoders.
 ///
+/// A SNAPPY page is decompressed on the host instead when the GPU would decode it alone: a token stream
+/// is serial, so one page is one SIMD group's work, and a dispatch of a few pages takes as long as its
+/// slowest page. A 790 KB dictionary page of random int64 values took about 94 ms that way; one CPU
+/// core decodes a block like it in about 0.5 ms. So dictionary pages (one per column chunk) and dispatches of at most
+/// `hostSnappyMaxBlocks` pages go to the host decoder (`SnappyHost`), the rest to the GPU.
+///
 /// ZSTD, GZIP and BROTLI are decompressed on the host, straight into the shared-memory output buffer the
 /// GPU decoders will read, with pages spread across cores. GZIP and BROTLI go through Foundation's
 /// Compression framework (`COMPRESSION_ZLIB` is raw DEFLATE, so the gzip container is stripped first).
@@ -27,12 +33,17 @@ enum Decompress {
     ///
     /// `source` is bound at `sourceOffset`, so `block.srcOffset` is relative to that: a column chunk
     /// anywhere in a multi-gigabyte file still addresses its pages with 32-bit offsets.
+    ///
+    /// `preferHost` marks blocks the caller knows the GPU would decode one at a time (dictionary pages);
+    /// a SNAPPY dispatch of those, or of at most `hostSnappyMaxBlocks` blocks, runs on the host.
     static func into(_ ctx: MetalContext, codec: ParquetCodec, source: MTLBuffer, sourceOffset: Int,
-                     blocks: [PageBlock], out: MetalArrowBuffer) throws {
+                     blocks: [PageBlock], out: MetalArrowBuffer, preferHost: Bool = false) throws {
         guard !blocks.isEmpty else { return }
         switch codec {
         case .uncompressed:
             try gpuCopy(ctx, source: source, sourceOffset: sourceOffset, blocks: blocks, out: out)
+        case .snappy where preferHost || blocks.count <= hostSnappyMaxBlocks:
+            try hostDecompress(codec: codec, source: source, sourceOffset: sourceOffset, blocks: blocks, out: out)
         case .snappy:
             try gpuDecompress(ctx, function: "snappy_decompress", source: source, sourceOffset: sourceOffset,
                               blocks: blocks, out: out, codec: codec)
@@ -45,6 +56,9 @@ enum Decompress {
             throw ParquetError.unsupported("LZO compression")
         }
     }
+
+    /// A SNAPPY dispatch of at most this many pages is decompressed on the host (see the type comment).
+    static var hostSnappyMaxBlocks = 16
 
     private static func blockBuffer(_ ctx: MetalContext, _ blocks: [PageBlock]) throws -> MetalArrowBuffer {
         let buf = try MetalArrowBuffer.allocate(byteCount: blocks.count * MemoryLayout<PageBlock>.stride,
@@ -115,6 +129,7 @@ enum Decompress {
                 case .gzip: produced = try gunzip(inPtr, Int(b.srcLength), outPtr, Int(b.dstLength))
                 case .brotli: produced = try appleDecode(COMPRESSION_BROTLI, inPtr, Int(b.srcLength), outPtr, Int(b.dstLength))
                 case .zstd: produced = try Zstd.decompress(inPtr, Int(b.srcLength), outPtr, Int(b.dstLength))
+                case .snappy: produced = try SnappyHost.decompress(inPtr, Int(b.srcLength), outPtr, Int(b.dstLength))
                 default: produced = 0
                 }
                 guard produced == Int(b.dstLength) else {
@@ -194,5 +209,75 @@ enum Zstd {
         let n = fns.decompress(dst, dstLen, src, srcLen)
         if fns.isError(n) != 0 { throw ParquetError.malformed("ZSTD_decompress failed") }
         return n
+    }
+}
+
+/// A Snappy block decoder for the host (the format: a varint of the plaintext length, then literal and
+/// copy elements). Every read and write is checked against the block's bounds, so a damaged page is an
+/// error, never an access outside the page or the output slot.
+enum SnappyHost {
+    static func decompress(_ src: UnsafePointer<UInt8>, _ n: Int,
+                           _ dst: UnsafeMutablePointer<UInt8>, _ cap: Int) throws -> Int {
+        func bad(_ why: String) -> ParquetError { ParquetError.malformed("SNAPPY page failed to decompress: \(why)") }
+        var ip = 0
+        var declared = 0
+        var shift = 0
+        while true {
+            guard ip < n, shift <= 28 else { throw bad("input truncated") }
+            let b = Int(src[ip]); ip += 1
+            declared |= (b & 0x7F) << shift
+            if b < 0x80 { break }
+            shift += 7
+        }
+        guard declared == cap else { throw bad("output overrun") }
+        var op = 0
+        while ip < n {
+            let tag = Int(src[ip]); ip += 1
+            var length: Int
+            var offset: Int
+            switch tag & 3 {
+            case 0:
+                length = tag >> 2
+                if length >= 60 {
+                    let extra = length - 59
+                    guard ip + extra <= n else { throw bad("input truncated") }
+                    length = 0
+                    for k in 0..<extra { length |= Int(src[ip + k]) << (8 * k) }
+                    ip += extra
+                }
+                length += 1
+                guard length <= n - ip else { throw bad("input truncated") }
+                guard length <= cap - op else { throw bad("output overrun") }
+                memcpy(dst + op, src + ip, length)
+                ip += length
+                op += length
+                continue
+            case 1:
+                guard ip < n else { throw bad("input truncated") }
+                length = ((tag >> 2) & 7) + 4
+                offset = ((tag >> 5) << 8) | Int(src[ip])
+                ip += 1
+            case 2:
+                guard ip + 2 <= n else { throw bad("input truncated") }
+                length = (tag >> 2) + 1
+                offset = Int(src[ip]) | (Int(src[ip + 1]) << 8)
+                ip += 2
+            default:
+                guard ip + 4 <= n else { throw bad("input truncated") }
+                length = (tag >> 2) + 1
+                offset = Int(src[ip]) | (Int(src[ip + 1]) << 8) | (Int(src[ip + 2]) << 16) | (Int(src[ip + 3]) << 24)
+                ip += 4
+            }
+            guard offset > 0, offset <= op else { throw bad("bad token") }
+            guard length <= cap - op else { throw bad("output overrun") }
+            if offset >= length {
+                memcpy(dst + op, dst + (op - offset), length)
+            } else {
+                // An overlapping copy repeats the last `offset` bytes: byte by byte, in order.
+                for k in 0..<length { dst[op + k] = dst[op - offset + k] }
+            }
+            op += length
+        }
+        return op
     }
 }
