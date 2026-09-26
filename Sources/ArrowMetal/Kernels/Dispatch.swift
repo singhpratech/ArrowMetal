@@ -21,6 +21,31 @@ enum Dispatch {
         enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)
     }
 
+    /// One threadgroup of `threadsPerGroup` threads per group, for kernels that reduce one group each.
+    ///
+    /// The GPU holds a grid dimension's thread count (threadgroups × threads per threadgroup) in 32 bits:
+    /// at 2^24 threadgroups of 256 threads the width is 2^32, which wraps, and the dispatch then runs
+    /// `count mod 2^24` threadgroups with no error. When the width would reach 2^32 the groups are folded
+    /// into rows of `foldWidth` threadgroups, so the kernel must derive its group as
+    /// `tgid.y * threadgroups_per_grid.x + tgid.x` and return when that is `>= count`. Below the limit the
+    /// grid is the plain `(count, 1, 1)`.
+    static func perGroup(_ enc: MTLComputeCommandEncoder, count: Int, threadsPerGroup: Int = threadgroupSize) {
+        enc.dispatchThreadgroups(perGroupGrid(count: count, threadsPerGroup: threadsPerGroup),
+                                 threadsPerThreadgroup: MTLSize(width: threadsPerGroup, height: 1, depth: 1))
+    }
+
+    /// Threadgroups per row once `perGroup` folds the groups.
+    nonisolated(unsafe) static var foldWidth = 1 << 16
+    /// The grid width in threads at which `perGroup` folds. The hardware limit is 2^32; the tests lower it
+    /// (and `foldWidth`) to run every per-group kernel through the folded grid at small group counts.
+    nonisolated(unsafe) static var foldThreads = 1 << 32
+
+    static func perGroupGrid(count: Int, threadsPerGroup: Int = threadgroupSize) -> MTLSize {
+        let c = Swift.max(count, 1)
+        if c * threadsPerGroup < foldThreads { return MTLSize(width: c, height: 1, depth: 1) }
+        return MTLSize(width: foldWidth, height: (c + foldWidth - 1) / foldWidth, depth: 1)
+    }
+
     /// Binds an element count for a kernel's `device const uint* nPtr` argument. A pending array (its length
     /// still being decided by GPU work in the open batch) binds its length buffer, so the count flows on the
     /// GPU without a sync; otherwise the known length is passed inline.

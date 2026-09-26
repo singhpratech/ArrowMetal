@@ -164,7 +164,7 @@ extension GroupBy {
             if perThreadFix {
                 Dispatch.dispatch1D(enc, fixPSO, count: kc)
             } else {
-                enc.dispatchThreadgroups(MTLSize(width: kc, height: 1, depth: 1), threadsPerThreadgroup: tg)
+                Dispatch.perGroup(enc, count: kc)
             }
         }
         ctx.retainUntilFlush(keys); ctx.retainUntilFlush(cursor)

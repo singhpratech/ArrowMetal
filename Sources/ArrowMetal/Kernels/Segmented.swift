@@ -167,8 +167,7 @@ extension GroupBy {
             Dispatch.setUInt(enc, values.validity == nil ? 0 : 1, index: 6)
             enc.setBuffer(raws.mtl, offset: raws.offset, index: 7)
             enc.setBuffer(counts.mtl, offset: counts.offset, index: 8)
-            enc.dispatchThreadgroups(MTLSize(width: kc, height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1))
+            Dispatch.perGroup(enc, count: kc)
             enc.memoryBarrier(scope: .buffers)
             enc.setComputePipelineState(finPSO)
             enc.setBuffer(raws.mtl, offset: raws.offset, index: 0)
