@@ -36,14 +36,16 @@ struct HostDecodeJob {
 /// Per-page decompression costs, measured on an Apple M4 Max (12 performance and 4 efficiency cores)
 /// over the Snappy and LZ4 files of `Benchmarks/parquet_bench.py` and a 10 M-row, 7-column
 /// pyarrow-default Snappy file: nanoseconds per output byte, by page class. A page's class is its
-/// ratio, uncompressed over compressed: near 1 it is one long literal, from 1.25 up it is token-dense
-/// (sequential, low-cardinality or timestamp values), and far above that (runs of a repeated value) it is
-/// a few long copies again.
+/// ratio, uncompressed over compressed. At 1 or below (incompressible values) the page is one long
+/// literal. Above 1.05 it is taken as token-dense: sequential, low-cardinality and timestamp values
+/// compress 1.3-2.7x, and a column of LCG-generated int64 values compresses only 1.05x with Snappy
+/// yet is tens of thousands of short tokens a page (32-35 ms on the GPU against 8-17 ms on the host
+/// for 160 MB). Far above that (runs of a repeated value) a page is a few long copies again.
 enum DecodeCost {
     /// 0 for a literal page, 1 for a token-dense one, falling again for long-run pages.
     static func density(_ c: DecodeCandidate) -> Double {
         let ratio = Double(c.dstLength) / Double(Swift.max(c.srcLength, 1))
-        let rising = Swift.min(Swift.max((ratio - 1.02) / 0.23, 0), 1)
+        let rising = Swift.min(Swift.max((ratio - 1.0) / 0.05, 0), 1)
         return ratio > 4 ? rising * 4 / ratio : rising
     }
 
