@@ -36,8 +36,8 @@ final class MappedRegion: @unchecked Sendable {
     /// back to the file).
     ///
     /// The difference shows up the first time the GPU reads a wrapped range: Metal makes the whole range
-    /// resident then, and on an M4 Max (macOS 26) that took about 75 ms per gigabyte of a private
-    /// mapping against about 7 ms per gigabyte of a shared read-only one. The decoders only ever read
+    /// resident then, and on an M4 Max (macOS 26) that took 67-78 ms per gigabyte of a private
+    /// mapping against 7-10 ms per gigabyte of a shared read-only one. The decoders only ever read
     /// the page bytes (every kernel binds them `device const`), so the Parquet reader maps shared and
     /// read-only, and keeps the private mapping as the fallback for a device that will not wrap it.
     init(fd: Int32, fileOffset: Int, length: Int, sharedReadOnly: Bool = false) throws {

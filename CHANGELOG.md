@@ -1,6 +1,35 @@
 # Changelog
 
 ## Unreleased
+- Parquet reads, cold and warm. On the 50,000,000-row, 8-column benchmark files a whole-file read
+  through a fresh open is 114 ms (Snappy), 105 ms (LZ4) and 53 ms (uncompressed), against 369, 340 and
+  250 ms in `parquet_bench_2026-09-25-quiet.txt` and against Polars' 104, 86 and 77 ms in the same run,
+  with 78-101 ms of process CPU against 806-1299 for pyarrow and Polars; time to first compute is
+  12-14 ms (Polars 18-24); a one-column read through a fresh open is 8.91-13.92 ms, against 149-191 ms
+  before (`Benchmarks/results/parquet_bench_2026-09-26.txt`, `parquet_cache_2026-09-26.csv`; the run
+  started at load average 3.03 and ended at 6.40, `bench_conditions_2026-09-26.txt`). What changed
+  (docs/PARQUET.md, "The file's bytes are the GPU's bytes" and "Decompression"):
+  - the file is mapped read-only and shared: the first kernel to read a wrapped range makes it resident
+    for the GPU at 7-10 ms per GB, against 67-78 ms per GB for the private writable mapping, which stays
+    as the fallback for a device that will not wrap read-only memory and on virtualised GPUs;
+  - wrapping the reader's own mapping skips `MetalArrowBuffer.wrapOrCopy`'s `mincore` probe, which took
+    about 35 ms over 2 GB;
+  - a projection whose chunks fill less than four fifths of the bytes they span maps them side by side
+    (`MappedView`) and wraps only them; a column whose chunks span 4 GiB or more of a larger file now
+    reads (the limit is 4 GiB of one column's chunks in one read);
+  - page headers are parsed in parallel across the read's chunks and kept on the handle;
+  - dense fixed-width values and all-dictionary code buffers are no longer zero-filled before kernels
+    that write every slot (the padding still is), and dictionary codes get their row group's base as they
+    are decoded instead of in a second pass;
+  - ZSTD pages decode in runs sharing one `ZSTD_DCtx` instead of a fresh context per page;
+  - token-dense Snappy and LZ4 pages (output at least 1.25x the input, in dispatches of at least 2,048
+    such pages) decode one page per thread, and a read decompresses the pages of all its flat columns in
+    one dispatch per codec before decoding them;
+  - a closed file is unmapped on a background queue.
+  `ARROWMETAL_PARQUET_PROFILE=1` prints per-phase times and minor faults of each open and read.
+  ParquetTests adds reads of every fixture through both mappings, one-column and row-group reads through
+  column views, both decompression kernels on every Snappy and LZ4 fixture, and 240 damaged files through
+  the page-per-thread kernel; `test_parquet.py` adds 2 to 400 pages a chunk in ZSTD, LZ4 and Snappy.
 - `python -m arrowmetal.bench`: one seeded 10,000,000-row dataset (drawn with `pyarrow.compute` from
   SplitMix64 streams, so nothing beyond `pip install arrowmetal` is needed), sum, filter, sort and group-by sum
   through pyarrow (and Polars when installed) and through ArrowMetal, each answer checked against
