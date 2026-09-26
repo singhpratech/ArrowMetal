@@ -521,7 +521,7 @@ declined):
 5. **A finite float literal of magnitude 2^63 or more** trapped the process inside the expression
    compiler, which converted every float literal to Int64 as well. The engine now runs those plans
    on Metal (`test_a_float_literal_of_magnitude_2_63_or_more_runs_on_metal`).
-6. **A UInt64 literal above 2^63 - 1** (`is_in`, a comparison or `fill_null` against a large
+6. **A UInt64 literal above 2^63 - 1** (found by the conformance grid below, not worked around first: `is_in`, a comparison or `fill_null` against a large
    unsigned value) was rejected by the expression parser, which read every integer literal as an
    Int64, and the plan stayed with Polars. The parser now keeps such a literal as its bit pattern,
    the way the code generator writes unsigned literals (`test_a_u64_literal_above_int64_max_reaches_the_gpu`,
