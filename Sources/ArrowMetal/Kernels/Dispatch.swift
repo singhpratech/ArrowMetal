@@ -26,18 +26,23 @@ enum Dispatch {
     /// The GPU holds a grid dimension's thread count (threadgroups × threads per threadgroup) in 32 bits:
     /// at 2^24 threadgroups of 256 threads the width is 2^32, which wraps, and the dispatch then runs
     /// `count mod 2^24` threadgroups with no error. When the width would reach 2^32 the groups are folded
-    /// into rows of `foldWidth` threadgroups, so the kernel must derive its group as
-    /// `tgid.y * threadgroups_per_grid.x + tgid.x` and return when that is `>= count`. Below the limit the
-    /// grid is the plain `(count, 1, 1)`.
+    /// into rows of `foldWidth` threadgroups. The kernel takes `uint2 tgid2 [[threadgroup_position_in_grid]]`,
+    /// derives its group as `foldedGroupMSL` and returns when that is `>= count`. Below the limit the grid
+    /// is the plain `(count, 1, 1)`, where `tgid2.y` is 0.
     static func perGroup(_ enc: MTLComputeCommandEncoder, count: Int, threadsPerGroup: Int = threadgroupSize) {
         enc.dispatchThreadgroups(perGroupGrid(count: count, threadsPerGroup: threadsPerGroup),
                                  threadsPerThreadgroup: MTLSize(width: threadsPerGroup, height: 1, depth: 1))
     }
 
-    /// Threadgroups per row once `perGroup` folds the groups.
-    nonisolated(unsafe) static var foldWidth = 1 << 16
+    /// Threadgroups per row once `perGroup` folds the groups: a power of two, so the kernel's group is a
+    /// shift and an add. Reading `threadgroups_per_grid` instead was measured at almost twice the time of
+    /// a light per-group kernel (a gather over 10M groups of 5 rows: 122.6 ms against 64.5 ms).
+    static let foldShift = 16
+    static let foldWidth = 1 << foldShift
+    /// The group of a threadgroup of a `perGroup` grid, in MSL.
+    static let foldedGroupMSL = "((tgid2.y << \(foldShift)u) + tgid2.x)"
     /// The grid width in threads at which `perGroup` folds. The hardware limit is 2^32; the tests lower it
-    /// (and `foldWidth`) to run every per-group kernel through the folded grid at small group counts.
+    /// to run every per-group kernel through the folded grid at small group counts.
     nonisolated(unsafe) static var foldThreads = 1 << 32
 
     static func perGroupGrid(count: Int, threadsPerGroup: Int = threadgroupSize) -> MTLSize {

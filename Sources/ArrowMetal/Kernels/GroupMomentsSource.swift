@@ -81,11 +81,11 @@ enum GroupMomentsSource {
                                 device ulong* sums [[buffer(7)]],
                                 device uint* counts [[buffer(8)]],
                                 uint lid [[thread_index_in_threadgroup]],
-                                uint2 tgid2 [[threadgroup_position_in_grid]], uint2 tgrid [[threadgroups_per_grid]]) {
+                                uint2 tgid2 [[threadgroup_position_in_grid]]) {
             threadgroup ulong sh[TG];
             threadgroup uint sc[TG];
             uint K = *nPtr;
-            uint k = tgid2.y * tgrid.x + tgid2.x;   // Dispatch.perGroup may fold the groups into rows
+            uint k = \(Dispatch.foldedGroupMSL);   // Dispatch.perGroup folds the groups into rows past 2^32 threads
             if (k >= K) return;
             uint s = segStart[k], e = segEnd[k];
             ulong acc = 0ul; uint cnt = 0u;
@@ -133,11 +133,11 @@ enum GroupMomentsSource {
                                 device const ulong* means [[buffer(7)]],
                                 device ulong* out [[buffer(8)]],
                                 uint lid [[thread_index_in_threadgroup]],
-                                uint2 tgid2 [[threadgroup_position_in_grid]], uint2 tgrid [[threadgroups_per_grid]]) {
+                                uint2 tgid2 [[threadgroup_position_in_grid]]) {
             threadgroup ulong s1[TG];
             threadgroup ulong s2[TG];
             uint K = *nPtr;
-            uint k = tgid2.y * tgrid.x + tgid2.x;   // Dispatch.perGroup may fold the groups into rows
+            uint k = \(Dispatch.foldedGroupMSL);   // Dispatch.perGroup folds the groups into rows past 2^32 threads
             if (k >= K) return;
             uint s = segStart[k], e = segEnd[k];
             ulong mean = means[k];
@@ -179,12 +179,12 @@ enum GroupMomentsSource {
                                  device const ulong* means [[buffer(7)]],
                                  device ulong* out [[buffer(8)]],
                                  uint lid [[thread_index_in_threadgroup]],
-                                 uint2 tgid2 [[threadgroup_position_in_grid]], uint2 tgrid [[threadgroups_per_grid]]) {
+                                 uint2 tgid2 [[threadgroup_position_in_grid]]) {
             threadgroup ulong s2[TG];
             threadgroup ulong s3[TG];
             threadgroup ulong s4[TG];
             uint K = *nPtr;
-            uint k = tgid2.y * tgrid.x + tgid2.x;   // Dispatch.perGroup may fold the groups into rows
+            uint k = \(Dispatch.foldedGroupMSL);   // Dispatch.perGroup folds the groups into rows past 2^32 threads
             if (k >= K) return;
             uint s = segStart[k], e = segEnd[k];
             ulong mean = means[k];

@@ -88,15 +88,16 @@ final class GroupByGridFoldTests: XCTestCase {
         check(try gb.max64(l, segments: seg), "i64 segmented max") { imax[$0] }
     }
 
-    // MARK: - the folded grid at small sizes
+    // MARK: - the folded grid below the limit
 
-    /// Runs every per-group kernel twice, once on the plain grid and once with the fold forced on (rows
-    /// of 7 threadgroups, so the last row is partial and holds threadgroups past the last group), and
-    /// asserts the answers are the same. 3000 groups over 120,000 rows take the atomic counting sort
-    /// with the per-group run sort (`cs_fix_tg`, one group holds 600+ rows) and the wide variance.
+    /// Runs every per-group kernel twice, once on the plain grid and once with the fold forced on (three
+    /// rows of 65,536 threadgroups, the last one partial, so it holds threadgroups past the last group),
+    /// and asserts the answers are the same. 150,000 groups over 4,800,000 rows take the atomic counting
+    /// sort with the per-group run sort (`cs_fix_tg`: runs longer than 32 rows, one group holds 600+) and
+    /// the wide variance (32 rows per group on average).
     func testFoldedGridMatchesPlainGrid() throws {
         try requireRealGPU()
-        let K = 3000, n = 120_000
+        let K = 150_000, n = 4_800_000
         var keys = [Int32](repeating: 0, count: n)
         var dv = [Double?](repeating: nil, count: n), iv = [Int64?](repeating: nil, count: n)
         var fv = [Float?](repeating: nil, count: n)
@@ -110,11 +111,14 @@ final class GroupByGridFoldTests: XCTestCase {
         let d = try MetalArray<Double>(dv), f = try MetalArray<Float>(fv), l = try MetalArray<Int64>(iv)
         let keyArray = try MetalArray<Int32>(keys)
 
+        // Float64 answers are compared as bit patterns: the same kernel on either grid must give the same
+        // bits, and a product that overflows to NaN is then equal to itself.
+        func bits(_ a: [Double?]) -> [UInt64?] { a.map { $0?.bitPattern } }
         struct Answers: Equatable {
             var ord: [Int32] = []
-            var sumD: [Double?] = [], meanD: [Double?] = [], sumF: [Double?] = [], meanF: [Double?] = []
-            var minD: [Double?] = [], maxL: [Int64?] = [], varD: [Double?] = [], prodL: [Int64?] = []
-            var prodF: [Double?] = [], listOffsets: [Int32] = [], listValues: [Int64?] = []
+            var sumD: [UInt64?] = [], meanD: [UInt64?] = [], sumF: [UInt64?] = [], meanF: [UInt64?] = []
+            var minD: [UInt64?] = [], maxL: [Int64?] = [], varD: [UInt64?] = [], prodL: [Int64?] = []
+            var prodF: [UInt64?] = [], listOffsets: [Int32] = [], listValues: [Int64?] = []
             var segMin: [Int64?] = [], segMax: [Int64?] = []
         }
         func run() throws -> Answers {
@@ -122,15 +126,15 @@ final class GroupByGridFoldTests: XCTestCase {
             let seg = try gb.segments()
             var a = Answers()
             a.ord = seg.ord.toRawArray()
-            a.sumD = try gb.sumDouble(d, segments: seg).toArray()
-            a.meanD = try gb.meanDouble(d, segments: seg).toArray()
-            a.sumF = try gb.sumFloatAsDouble(f, segments: seg).toArray()
-            a.meanF = try gb.meanFloat(f, segments: seg).toArray()
-            a.minD = try gb.min64(d, segments: seg).toArray()
+            a.sumD = bits(try gb.sumDouble(d, segments: seg).toArray())
+            a.meanD = bits(try gb.meanDouble(d, segments: seg).toArray())
+            a.sumF = bits(try gb.sumFloatAsDouble(f, segments: seg).toArray())
+            a.meanF = bits(try gb.meanFloat(f, segments: seg).toArray())
+            a.minD = bits(try gb.min64(d, segments: seg).toArray())
             a.maxL = try gb.max64(l, segments: seg).toArray()
-            a.varD = try gb.variance(d).toArray()
+            a.varD = bits(try gb.variance(d).toArray())
             a.prodL = try gb.productInt(l, segments: seg).toArray()
-            a.prodF = try gb.productFloat(d, segments: seg).toArray()
+            a.prodF = bits(try gb.productFloat(d, segments: seg).toArray())
             let list = try gb.list(l, segments: seg)
             a.listOffsets = withExtendedLifetime(list) {
                 Array(UnsafeBufferPointer(start: list.offsets.typed(Int32.self), count: K + 1))
@@ -143,12 +147,12 @@ final class GroupByGridFoldTests: XCTestCase {
         }
 
         let plain = try run()
-        let (w, t) = (Dispatch.foldWidth, Dispatch.foldThreads)
-        Dispatch.foldWidth = 7; Dispatch.foldThreads = 0
-        defer { Dispatch.foldWidth = w; Dispatch.foldThreads = t }
+        let t = Dispatch.foldThreads
+        Dispatch.foldThreads = 0
+        defer { Dispatch.foldThreads = t }
         let grid = Dispatch.perGroupGrid(count: K)
-        XCTAssertEqual(grid.width, 7)
-        XCTAssertEqual(grid.height, (K + 6) / 7)
+        XCTAssertEqual(grid.width, 1 << 16)
+        XCTAssertEqual(grid.height, 3)
         let folded = try run()
 
         XCTAssertEqual(folded.ord, plain.ord, "group order")
@@ -169,7 +173,7 @@ final class GroupByGridFoldTests: XCTestCase {
         // And the plain answers are right: the sums against the host.
         var sums = [Double](repeating: 0, count: K), seen = [Bool](repeating: false, count: K)
         for i in 0..<n { if let v = dv[i] { sums[Int(keys[i])] += v; seen[Int(keys[i])] = true } }
-        XCTAssertEqual(plain.sumD, (0..<K).map { seen[$0] ? sums[$0] : nil }, "f64 sum vs host")
+        XCTAssertEqual(plain.sumD, bits((0..<K).map { seen[$0] ? sums[$0] : nil }), "f64 sum vs host")
         XCTAssertEqual(plain.ord.count, n)
     }
 

@@ -131,11 +131,11 @@ enum SegmentedSource {
                                device \(op.accType)* raws [[buffer(7)]],
                                device uint* counts [[buffer(8)]],
                                uint lid [[thread_index_in_threadgroup]],
-                               uint2 tgid2 [[threadgroup_position_in_grid]], uint2 tgrid [[threadgroups_per_grid]]) {
+                               uint2 tgid2 [[threadgroup_position_in_grid]]) {
             threadgroup \(op.accType) shared[TG];
             threadgroup uint scount[TG];
             uint K = *nPtr;
-            uint k = tgid2.y * tgrid.x + tgid2.x;   // Dispatch.perGroup may fold the groups into rows
+            uint k = \(Dispatch.foldedGroupMSL);   // Dispatch.perGroup folds the groups into rows past 2^32 threads
             if (k >= K) return;
             uint s = segStart[k], e = segEnd[k];
             \(op.accType) acc = \(op.identity);
