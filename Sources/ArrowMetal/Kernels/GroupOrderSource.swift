@@ -226,9 +226,9 @@ enum GroupOrderSource {
     kernel void cs_fix_tg(device const uint* segStart [[buffer(0)]], device const uint* segEnd [[buffer(1)]],
                           device int* ord [[buffer(2)]], constant uint& K [[buffer(3)]],
                           uint lid [[thread_index_in_threadgroup]],
-                          uint tgid [[threadgroup_position_in_grid]]) {
+                          uint2 tgid2 [[threadgroup_position_in_grid]]) {
         threadgroup int buf[1024];
-        uint k = tgid;
+        uint k = \(Dispatch.foldedGroupMSL);   // Dispatch.perGroup folds the groups into rows past 2^32 threads
         if (k >= K) return;
         uint s = segStart[k], e = segEnd[k], m = e - s;
         if (m < 2u) return;

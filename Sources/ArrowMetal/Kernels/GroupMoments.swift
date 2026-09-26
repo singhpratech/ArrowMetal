@@ -65,14 +65,13 @@ extension GroupBy {
         let sumPSO = try pso(narrow ? "gm_sum_narrow" : "gm_sum_wide")
         let meanPSO = try pso("gm_mean")
         let devPSO = try pso((powers == 4 ? "gm_dev4_" : "gm_dev_") + (narrow ? "narrow" : "wide"))
-        let tg = MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1)
         try ctx.run { enc in
             enc.setComputePipelineState(sumPSO)
             ExtraAggregates.bindSegments(enc, seg, values)
             enc.setBuffer(sums.mtl, offset: 0, index: 7)
             enc.setBuffer(counts.mtl, offset: 0, index: 8)
             if narrow { Dispatch.dispatch1D(enc, sumPSO, count: kc) }
-            else { enc.dispatchThreadgroups(MTLSize(width: Swift.max(kc, 1), height: 1, depth: 1), threadsPerThreadgroup: tg) }
+            else { Dispatch.perGroup(enc, count: kc) }
             enc.memoryBarrier(scope: .buffers)
             enc.setComputePipelineState(meanPSO)
             enc.setBuffer(sums.mtl, offset: 0, index: 0)
@@ -86,7 +85,7 @@ extension GroupBy {
             enc.setBuffer(means.mtl, offset: 0, index: 7)
             enc.setBuffer(dev.mtl, offset: 0, index: 8)
             if narrow { Dispatch.dispatch1D(enc, devPSO, count: kc) }
-            else { enc.dispatchThreadgroups(MTLSize(width: Swift.max(kc, 1), height: 1, depth: 1), threadsPerThreadgroup: tg) }
+            else { Dispatch.perGroup(enc, count: kc) }
         }
         ctx.retainUntilFlush(seg.ord); ctx.retainUntilFlush(values)
         ctx.retainUntilFlush(sums); ctx.retainUntilFlush(means)

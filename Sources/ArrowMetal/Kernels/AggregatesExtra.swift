@@ -81,8 +81,7 @@ extension GroupBy {
             enc.setBuffer(mins.mtl, offset: 0, index: 7)
             enc.setBuffer(maxs.mtl, offset: 0, index: 8)
             enc.setBuffer(validBytes.mtl, offset: 0, index: 9)
-            enc.dispatchThreadgroups(MTLSize(width: Swift.max(K, 1), height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1))
+            Dispatch.perGroup(enc, count: K)
         }
         ctx.retainUntilFlush(seg.ord); ctx.retainUntilFlush(values)
         try ctx.syncPoint()
@@ -231,8 +230,7 @@ extension GroupBy {
             ExtraAggregates.bindSegments(enc, seg, values)
             enc.setBuffer(out.mtl, offset: 0, index: 7)
             enc.setBuffer(validBytes.mtl, offset: 0, index: 8)
-            enc.dispatchThreadgroups(MTLSize(width: Swift.max(K, 1), height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1))
+            Dispatch.perGroup(enc, count: K)
         }
         ctx.retainUntilFlush(seg.ord); ctx.retainUntilFlush(values)
         try ctx.syncPoint()
@@ -572,8 +570,7 @@ enum ExtraAggregates {
             enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 3)
             Dispatch.setLength(enc, K, nil, index: 4)
             enc.setBuffer(out.mtl, offset: out.offset, index: 5)
-            enc.dispatchThreadgroups(MTLSize(width: K, height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1))
+            Dispatch.perGroup(enc, count: K)
         }
         ctx.retainUntilFlush(seg.ord)
         try ctx.syncPoint()

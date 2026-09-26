@@ -66,9 +66,9 @@ enum AggregatesExtraSource {
                                device const uint* nPtr [[buffer(4)]],
                                device int* out [[buffer(5)]],
                                uint lid [[thread_index_in_threadgroup]],
-                               uint tgid [[threadgroup_position_in_grid]]) {
+                               uint2 tgid2 [[threadgroup_position_in_grid]]) {
         uint K = *nPtr;
-        uint k = tgid;
+        uint k = \(Dispatch.foldedGroupMSL);   // Dispatch.perGroup folds the groups into rows past 2^32 threads
         if (k >= K) return;
         uint s = segStart[k], e = segEnd[k];
         uint base = (uint)offsets[k];
@@ -146,12 +146,12 @@ enum AggregatesExtraSource {
                                   device \(KEYACC)* maxs [[buffer(8)]],
                                   device uchar* validBytes [[buffer(9)]],
                                   uint lid [[thread_index_in_threadgroup]],
-                                  uint tgid [[threadgroup_position_in_grid]]) {
+                                  uint2 tgid2 [[threadgroup_position_in_grid]]) {
             threadgroup \(KEYACC) sharedMin[TG];
             threadgroup \(KEYACC) sharedMax[TG];
             threadgroup uint scount[TG];
             uint K = *nPtr;
-            uint k = tgid;
+            uint k = \(Dispatch.foldedGroupMSL);   // Dispatch.perGroup folds the groups into rows past 2^32 threads
             if (k >= K) return;
             uint s = segStart[k], e = segEnd[k];
             \(KEYACC) lo = \(minInit), hi = \(maxInit);
@@ -191,11 +191,11 @@ enum AggregatesExtraSource {
                                    device \(ACC)* out [[buffer(7)]],
                                    device uchar* validBytes [[buffer(8)]],
                                    uint lid [[thread_index_in_threadgroup]],
-                                   uint tgid [[threadgroup_position_in_grid]]) {
+                                   uint2 tgid2 [[threadgroup_position_in_grid]]) {
             threadgroup \(ACC) shared[TG];
             threadgroup uint scount[TG];
             uint K = *nPtr;
-            uint k = tgid;
+            uint k = \(Dispatch.foldedGroupMSL);   // Dispatch.perGroup folds the groups into rows past 2^32 threads
             if (k >= K) return;
             uint s = segStart[k], e = segEnd[k];
             \(ACC) acc = \(productInit);
@@ -234,13 +234,13 @@ enum AggregatesExtraSource {
                                     device float* out [[buffer(8)]],
                                     device uint* counts [[buffer(9)]],
                                     uint lid [[thread_index_in_threadgroup]],
-                                    uint tgid [[threadgroup_position_in_grid]]) {
+                                    uint2 tgid2 [[threadgroup_position_in_grid]]) {
             threadgroup float2 s2[TG];
             threadgroup float2 s3[TG];
             threadgroup float2 s4[TG];
             threadgroup uint scount[TG];
             uint K = *nPtr;
-            uint k = tgid;
+            uint k = \(Dispatch.foldedGroupMSL);   // Dispatch.perGroup folds the groups into rows past 2^32 threads
             if (k >= K) return;
             uint s = segStart[k], e = segEnd[k];
             float mean = means[k];
