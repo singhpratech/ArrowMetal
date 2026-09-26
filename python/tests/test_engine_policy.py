@@ -360,6 +360,21 @@ def test_the_probe_puts_the_grid_group_counts_in_their_bucket(groups):
         assert 0.5 <= est / true <= 2.0, (cols, true, est, how)
 
 
+def test_the_probe_on_nearly_unique_keys():
+    """Keys about as many as the rows (two keys over 100,000 x 1,000 values, 2,000,000 rows): the
+    estimate is in the rows bucket and within 10% of the true count, from a sample of at most 8,192
+    rows (sampling without replacement bounds the estimate by the frame)."""
+    rows = 2_000_000
+    rng = np.random.default_rng(1234)
+    df = pl.DataFrame({"k1": rng.integers(0, 100_000, rows, dtype=np.int32),
+                       "k2": rng.integers(0, 1_000, rows, dtype=np.int32)})
+    true = df.select("k1", "k2").n_unique()
+    est, how = pe._frame_groups(df, ["k1", "k2"])
+    assert policy.group_bucket(est, rows) == policy.group_bucket(true, rows) == table.ROWS_BUCKET
+    assert abs(est - true) <= 0.1 * true, (est, true)
+    assert int(how.split("from a ")[1].split("-row")[0].replace(",", "")) <= 8_192, how
+
+
 def _probe_decisions(seed=5):
     out = []
     for groups in (200, 30_000, 900_000):

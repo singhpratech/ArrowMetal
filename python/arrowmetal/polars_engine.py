@@ -1791,21 +1791,24 @@ def import_cache_info():
 #
 # The default policy judges a group-by by the bucket of its number of groups (_engine_policy.py,
 # `group_bucket`), which the plan does not state. The probe estimates it from the frame the keys come
-# from: the distinct key tuples of a fixed sample of rows, scaled to the frame by the bias-corrected
-# Chao1 estimator, D = d + f1 (f1 - 1) / (2 (f2 + 1)), where d is the number of distinct tuples in
-# the sample and f1, f2 the number seen exactly once and exactly twice (Chao, Biometrics 1987;
-# the bias-corrected form of Chao, Biometrics 2005), clipped to [d, rows]. The sample is stratified:
-# row i * (rows // n) + h(i) for i < n, h a fixed-seed splitmix64 hash of i, so the same frame always
-# gets the same sample and the same estimate. First 2,048 rows; when those put the estimate above
-# twice d with f2 below 8 (from about 250,000 groups, where one f2 count moves the estimate most),
-# a sample twice as large decides instead, and so on up to 65,536 rows or a quarter of the frame.
-# A frame of at most twice the first sample's rows is counted exactly. A Parquet file's footer answers only when every row group
-# states a distinct count for each key column (`_footer_groups`).
+# from: the distinct key tuples of a fixed sample of n of its N rows, scaled to the frame by Chao1
+# for sampling without replacement (Chao and Lin, Biometrics 2012),
+#     D = d + f1^2 / (2 f2 n / (n - 1) + f1 q / (1 - q)),  q = n / N,
+# where d is the number of distinct tuples in the sample and f1, f2 the number seen exactly once and
+# exactly twice; clipped to [d, N]. (Chao1 proper, d + f1^2 / (2 f2), treats the sample as drawn with
+# replacement and runs away on keys that are nearly unique; the q term keeps D at most about N.) The
+# sample is stratified: row i * (N // n) + h(i) for i < n, h a fixed-seed splitmix64 hash of i, so
+# the same frame always gets the same sample and the same estimate. First 2,048 rows; when those
+# leave the estimate above twice d with the denominator under 16 (one f2 count would still move it by
+# more than an eighth), a sample twice as large decides instead, and so on up to 65,536 rows or a
+# quarter of the frame. A frame of at most twice the first sample's rows is counted exactly. A
+# Parquet file's footer answers only when every row group states a distinct count for each key
+# column (`_footer_groups`).
 
 _GROUP_SAMPLE = 2_048
 _GROUP_SAMPLE_MAX = 65_536
 _GROUP_SEED = 0xA6_5EED
-_GROUP_ACCEPT_F2 = 8
+_GROUP_SETTLED = 16
 _GROUP_CACHE_MAX = 64
 
 
@@ -1866,15 +1869,19 @@ def _sample_tuples(np, df, columns, pos):
     return out
 
 
-def _chao1(np, values):
-    """(estimate before clipping, d, f1, f2) of a sample."""
+def _chao_lin(np, values, rows):
+    """(estimate before clipping, its denominator, d) of a sample of `rows` rows' key tuples."""
     n = len(values)
     s = np.sort(values)
     edges = np.flatnonzero(s[1:] != s[:-1])
     runs = np.diff(np.concatenate(([-1], edges, [n - 1])))
     f = np.bincount(runs, minlength=3)
     d, f1, f2 = len(runs), int(f[1]), int(f[2])
-    return d + f1 * (f1 - 1) / (2 * (f2 + 1)), d, f1, f2
+    if f1 == 0:
+        return float(d), float("inf"), d
+    q = n / rows
+    den = 2 * f2 * n / (n - 1) + f1 * q / (1 - q)
+    return d + f1 * f1 / den, den, d
 
 
 def _frame_groups(df, columns):
@@ -1888,11 +1895,11 @@ def _frame_groups(df, columns):
         return df.select(columns).n_unique(), f"counted over all {rows:,} rows"
     n = _GROUP_SAMPLE
     while True:
-        est, d, f1, f2 = _chao1(np, _sample_tuples(np, df, columns,
-                                                   _sample_positions(np, rows, n)))
+        est, den, d = _chao_lin(np, _sample_tuples(np, df, columns,
+                                                   _sample_positions(np, rows, n)), rows)
         # Settled when the sample saw most groups more than once (the estimate is within twice
-        # what it saw) or saw enough pairs for f1^2 / f2 to hold; else a sample twice as large.
-        if est <= 2 * d or f2 >= _GROUP_ACCEPT_F2 or 2 * n > min(_GROUP_SAMPLE_MAX, rows // 4):
+        # what it saw) or the denominator is large enough to hold; else a sample twice as large.
+        if est <= 2 * d or den >= _GROUP_SETTLED or 2 * n > min(_GROUP_SAMPLE_MAX, rows // 4):
             break
         n *= 2
     count = int(min(rows, max(d, round(est))))
