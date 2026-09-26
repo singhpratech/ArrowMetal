@@ -402,10 +402,13 @@ Polars' `lf.collect(engine=am.MetalEngine())` runs this engine under Polars: it 
 of Polars' optimised plan into the grammar above and, by default, runs a subtree here only when its
 input rows are at or above the measured crossover of every shape class in it (sort, each join kind,
 `unique`, group-by and whole-frame aggregates per aggregate family, row-wise), per dtype class and
-input, fitted from `Benchmarks/results/polars_engine_crossover_2026-09-26-quiet.csv` against Polars'
-own engines. A shape counts as ahead at a size when its time, raised by 15% (35% for a shape with a
-String column, which is also taken from 5,000,000 rows at the earliest), is at most the faster Polars
-engine's ([POLARS.md](POLARS.md), "Which translatable subtrees it runs: the defaults").
+input, fitted from `Benchmarks/results/polars_engine_crossover_2026-09-26-groups.csv` against Polars'
+own engines. A group-by is judged at the bucket of its number of groups (200, 1,000, 10,000, 100,000,
+1,000,000, or at least a quarter of the rows), which a fixed-seed sample of its key columns estimates
+at plan time (bias-corrected Chao1, 512 sampled rows and up until the decision is settled). A shape
+counts as ahead at a size when its time, raised by 15% (35% for a shape with a String column, which is
+also taken from 5,000,000 rows at the earliest), is at most the faster Polars engine's
+([POLARS.md](POLARS.md), "Which translatable subtrees it runs: the defaults").
 
 ## Limits
 
