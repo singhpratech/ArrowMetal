@@ -1899,16 +1899,17 @@ def _chao1(d, f1, f2, rows):
 
 
 def _frame_groups(df, columns, settled=None, stats=None):
-    """(estimated groups, how, whether every sample came from `stats`) of in-memory frame `df`
-    over `columns`. `settled`: the policy's predicate; `stats`: {n: (d, f1, f2)}, the samples
-    already counted for this frame and keys, which the probe adds to."""
+    """(estimated groups, how, whether every sample came from `stats`, low end, high end) of
+    in-memory frame `df` over `columns`. `settled`: the policy's predicate; `stats`:
+    {n: (d, f1, f2)}, the samples already counted for this frame and keys, which the probe adds to."""
     try:
         import numpy as np
     except ImportError:
-        return None, "no group-count estimate: the probe needs numpy", False
+        return None, "no group-count estimate: the probe needs numpy", False, None, None
     rows = df.height
     if rows <= _GROUP_EXACT:
-        return df.select(columns).n_unique(), f"counted over all {rows:,} rows", False
+        count = df.select(columns).n_unique()
+        return count, f"counted over all {rows:,} rows", False, count, count
     stats = {} if stats is None else stats
     cached = True
     n = _GROUP_FIRST
@@ -1929,7 +1930,7 @@ def _frame_groups(df, columns, settled=None, stats=None):
             break
         n *= _GROUP_GROWTH
     est, lo, hi = (int(round(x)) for x in (est, lo, hi))
-    return est, f"a Chao1 estimate from a {n:,}-row sample ({lo:,} to {hi:,})", cached
+    return est, f"a Chao1 estimate from a {n:,}-row sample, {lo:,} to {hi:,}", cached, lo, hi
 
 
 def _footer_groups(leaf, columns):
@@ -1975,9 +1976,11 @@ def _identity(df, columns):
 
 
 def _probe_groups(g, report, root, settled=None):
-    """(estimated groups or None, how) for one group-by (`_GroupKeys`); recorded in the report."""
+    """(estimated groups or None, how, low end, high end) for one group-by (`_GroupKeys`);
+    recorded in the report."""
     start = time.perf_counter()
     cached = False
+    lo = hi = None
     if g.why is not None:
         count, how = None, g.why
     elif _is_file(g.leaf[1]):
@@ -1989,6 +1992,7 @@ def _probe_groups(g, report, root, settled=None):
         else:
             count, how = _footer_groups(leaf, g.columns)
             _group_estimates[key] = (count, how)
+        lo = hi = count
     else:
         df = g.leaf[1]
         key = _identity(df, g.columns)
@@ -2000,22 +2004,23 @@ def _probe_groups(g, report, root, settled=None):
                                              "stats": {}}
         elif key is not None:
             _group_estimates.move_to_end(key)
-        count, how, cached = _frame_groups(df, g.columns, settled,
-                                           None if entry is None else entry["stats"])
+        count, how, cached, lo, hi = _frame_groups(df, g.columns, settled,
+                                                   None if entry is None else entry["stats"])
     while len(_group_estimates) > _GROUP_CACHE_MAX:
         _group_estimates.popitem(last=False)
     seconds = time.perf_counter() - start
     keys = ", ".join(g.keys)
     text = how if count is None else f"{count:,} groups over ({keys}), {how}"
     report.groups.append({"root": root, "keys": list(g.keys), "estimate": count, "how": how,
+                          "range": None if count is None else (lo, hi),
                           "seconds": seconds, "cached": cached})
-    return count, text
+    return count, text, lo, hi
 
 
 def _groups_of(sub, report, root, settled=None):
     """The policy's `groups` for subtree `sub`: the probe of its one group-by."""
     if len(sub.groups) != 1:
-        return None, f"no group-count estimate: the subtree holds {len(sub.groups)} group-bys"
+        return None, f"no group-count estimate: the subtree holds {len(sub.groups)} group-bys", None, None
     g = sub.groups[0]
     return _probe_groups(g, report, f"GroupBy#{g.node}", settled)
 

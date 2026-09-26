@@ -240,14 +240,25 @@ def settled_for(classes, dclass, source, rows, router=None):
 
 
 def _estimate(groups, settled=None):
-    """(groups or None, what the estimate is) from `decide`'s `groups` argument."""
+    """(groups or None, what the estimate is, its low end, its high end) from `decide`'s `groups`
+    argument."""
     if callable(groups):
         groups = groups(settled)
     if groups is None:
-        return None, "no group-count estimate"
+        return None, "no group-count estimate", None, None
     if isinstance(groups, tuple):
-        return groups
-    return int(groups), f"{int(groups):,} groups"
+        if len(groups) == 4:
+            return groups
+        return groups[0], groups[1], groups[0], groups[0]
+    return int(groups), f"{int(groups):,} groups", int(groups), int(groups)
+
+
+def _band_counts(band, rows):
+    """(fewest, most) group count of a band of buckets at `rows` input rows."""
+    edge = -(-rows // _table.NEAR_ROWS)
+    lims = {b[0]: (b[1], min(b[2], edge - 1)) for b in _table.GROUP_BUCKETS}
+    lims[_table.ROWS_BUCKET] = (edge, float("inf"))
+    return lims[band[0]][0], lims[band[-1]][1]
 
 
 def decide(classes, dtypes, rows, source="memory", *, shapes="measured", min_rows=None, router=None,
@@ -308,7 +319,22 @@ def decide(classes, dtypes, rows, source="memory", *, shapes="measured", min_row
             return Decision(False, f"{rows:,} input rows is below the {x:,}-row crossover for "
                                    f"{_what(c, dclass, source)} at every group count measured "
                                    f"({_table.SOURCE})", c, x)
-        count, text = _estimate(groups, settled_for(grouped, dclass, source, rows, router))
+        count, text, lo, hi = _estimate(groups, settled_for(grouped, dclass, source, rows, router))
+        if count is not None and lo != hi:
+            # A range: taken only when every group count in it is.
+            for c in grouped:
+                if not all(b is not None and (group_crossover(c, dclass, source, b, router)[0]
+                                              or rows + 1) <= rows
+                           for rlo, rhi, b in group_regions(rows) if rlo <= hi and rhi >= lo):
+                    band = group_band(c, dclass, source, rows, router)
+                    side = "outside"
+                    if band:
+                        first, last = _band_counts(band, rows)
+                        side = "below" if hi < first else ("above" if lo > last else "outside")
+                    return Decision(False, f"estimated {text}: {side} the measured band for "
+                                           f"{_what(c, dclass, source)} at {rows:,} input rows "
+                                           f"({_band_text(band, rows)}; not every count in the "
+                                           f"estimate's range is, {_table.SOURCE})", c, None, text)
         if count is None:
             # No estimate: the engine table's row, which every group count measured is in.
             note = f"; {text}"

@@ -355,7 +355,7 @@ def test_the_probe_puts_the_grid_group_counts_in_their_bucket(groups):
     df = _grid_frame(rows, groups)
     for cols in (["k"], ["k1", "k2"], ["s"]):
         true = df.select(cols).n_unique()
-        est, how, _cached = pe._frame_groups(df, cols)
+        est, how, *_ = pe._frame_groups(df, cols)
         assert policy.group_bucket(est, rows) == policy.group_bucket(true, rows), (cols, true, est, how)
         if policy.group_bucket(true, rows) != table.ROWS_BUCKET:
             # In the rows bucket the probe stops once its range's low end is in the bucket.
@@ -371,7 +371,7 @@ def test_the_probe_on_nearly_unique_keys():
     df = pl.DataFrame({"k1": rng.integers(0, 100_000, rows, dtype=np.int32),
                        "k2": rng.integers(0, 1_000, rows, dtype=np.int32)})
     true = df.select("k1", "k2").n_unique()
-    est, how, _cached = pe._frame_groups(df, ["k1", "k2"])
+    est, how, *_ = pe._frame_groups(df, ["k1", "k2"])
     assert policy.group_bucket(est, rows) == policy.group_bucket(true, rows) == table.ROWS_BUCKET
     assert abs(est - true) <= 0.1 * true, (est, true)
     assert int(how.split("from a ")[1].split("-row")[0].replace(",", "")) <= 8_192, how
@@ -397,6 +397,21 @@ def test_settled_means_one_answer_over_the_range():
                 for b in counts:
                     if a <= b and settled(a, b):
                         assert take(a) == take(b), (cls, rows, a, b)
+
+
+def test_an_estimate_range_is_taken_only_where_every_count_in_it_is():
+    key = next(k for k in GROUP_KEYS if k[:3] == ("group_by_multi:sum", "numeric", "memory")
+               and k[3] == "10,000" and policy.group_crossover(*k, ROUTER)[0])
+    x = policy.group_crossover(*key, ROUTER)[0]
+    rows = max(x, 2_000_000)
+    dt = [pl.Int32, pl.Int64]
+    inside = policy.decide(["group_by_multi:sum"], dt, rows, router=ROUTER,
+                           groups=(10_000, "10,000 groups, a test", 5_000, 20_000))
+    assert inside.take
+    # Reaching the rows bucket, which is not taken: stays with Polars, and says why.
+    wide = policy.decide(["group_by_multi:sum"], dt, rows, router=ROUTER,
+                         groups=(10_000, "10,000 groups, a test", 5_000, rows))
+    assert not wide.take and "not every count in the estimate's range is" in wide.reason, wide
 
 
 def test_the_probe_samples_until_the_decision_is_settled():
@@ -543,11 +558,11 @@ def test_where_the_probe_finds_the_keys():
                      (df.lazy().filter(pl.col("q") > 5).group_by("k1", "k2").agg(q), 1_000),
                      (df.lazy().select(pl.col("k").alias("kk"), "q").group_by("kk").agg(q), 1_000),
                      (df.lazy().join(dim.lazy(), on="k2").group_by("k").agg(pl.col("w").sum()), 1_000)):
-        (count, text), = _probe_of(lf)
+        (count, text, *_), = _probe_of(lf)
         assert count == df.select("k").n_unique() or count == df.select("k1", "k2").n_unique(), text
         assert "counted over all 4,000 rows" in text
     lf = df.lazy().with_columns((pl.col("k") * 2).alias("k3")).group_by("k3").agg(q)
-    (count, text), = _probe_of(lf)
+    (count, text, *_), = _probe_of(lf)
     assert count is None and "computed" in text
     # Two group-bys in one subtree: no estimate for it; the inner one alone is probed.
     lf = df.lazy().group_by("k").agg(q.alias("s")).group_by("s").agg(pl.len())

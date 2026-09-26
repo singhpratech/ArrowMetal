@@ -68,7 +68,7 @@ def main():
             df = frame(rows, g, rng)
             for cols in (["k"], ["k1", "k2"], ["s"]):
                 true = df.select(cols).n_unique()
-                free, free_how, _c = pe._frame_groups(df, cols)
+                free, free_how, *_ = pe._frame_groups(df, cols)
                 lf = df.lazy().group_by(cols).agg(pl.col("q").sum())
                 probes = []
                 for _ in range(args.probe_iters):
