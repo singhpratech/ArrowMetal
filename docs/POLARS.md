@@ -960,7 +960,16 @@ and it keeps a null as one of the distinct values rather than dropping it. Sorts
 **both** directions, where Polars' ascending default is nulls first -- pass `nulls_last=True` when
 comparing.
 
-**Strings.** `upper`/`lower` are Unicode's simple 1:1 case mapping over every script (the GPU
+**Strings.** A String or Binary column crosses in Polars' own `Utf8View` / `BinaryView` layout
+(`to_arrow(compat_level=newest)`): its 16-byte views and data buffers are mapped into Metal without a
+copy, and export hands them back to Polars the same way. `s.arrowmetal.to_metal().string_layout` says
+`"view"`. The string kernels read the views directly (the list is `am.STRING_VIEW_KERNELS`); the
+rest (`am.STRING_VIEW_CONVERTS`: `str_concat`, the splits, `match_like`, `strptime`, the
+byte-counting pads, `utf8_zero_fill`, the byte slices and reversals, casts from strings, the file
+writers) convert the column to offsets + bytes once, on the GPU, and keep that form, which
+`string_layout` then reports as `"view (converted)"`. `am.from_polars(s, string_layout="offsets")`
+asks Polars for `large_string` instead, the layout used before the kernels read views; the tier-2
+plugin still uses that. `upper`/`lower` are Unicode's simple 1:1 case mapping over every script (the GPU
 table covers U+0000–U+017F exactly; a row holding anything above is mapped on the host), so Greek
 and Cyrillic come back mapped. Simple, not full: the multi-character expansions are not applied,
 so U+00DF becomes `ẞ` where Polars' `str.to_uppercase()` gives `SS`, and `ﬁ` stays put.
