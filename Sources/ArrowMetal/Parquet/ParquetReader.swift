@@ -92,6 +92,8 @@ extension ParquetFile {
         // whole file, and wrapping per column would map the same pages once per column. A sparse
         // projection skips this and maps each column's own chunks (`pageSource(covering:)`).
         ParquetProfile.lap("read.plan")
+        // Page headers of the chunks read in full (a page-index subset parses only what it keeps).
+        if plan.ranges.isEmpty { prefetchPageHeaders(leaves: wanted.flatMap { $0.leaves }, rowGroups: groups) }
         try prewrap(fields: wanted, rowGroups: groups)
         // One open command buffer for the whole read: the decode is a chain of small kernels per column,
         // and a command buffer per kernel would spend more time on round trips than on the GPU. The

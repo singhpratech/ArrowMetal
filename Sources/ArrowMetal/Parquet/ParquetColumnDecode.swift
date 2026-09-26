@@ -52,8 +52,42 @@ extension ParquetFile {
 
     // MARK: - Page headers
 
-    /// Walks a column chunk's page headers. Only Thrift headers are read here; no column bytes.
+    /// A column chunk's page headers: from the handle's cache when an earlier read (or this read's
+    /// `prefetchPageHeaders`) parsed them, else parsed now and cached.
     func pageHeaders(of chunk: ParquetColumnMetadata, rowGroup: Int) throws -> (dict: ParquetRawPage?, data: [ParquetRawPage]) {
+        let key = ParquetChunkKey(chunk, rowGroup: rowGroup)
+        if let hit = cachedPageHeaders(key) { return hit }
+        let parsed = try parsePageHeaders(of: chunk, rowGroup: rowGroup)
+        cachePageHeaders(key, parsed)
+        return parsed
+    }
+
+    /// Parses the page headers of every chunk of `leaves` over `rowGroups` that is not cached yet,
+    /// spread across cores. Each header sits in its own page of the mapping, so a cold read of a large
+    /// file takes a minor fault per data page here; done one column at a time that was 13-14 ms of a
+    /// 2 GB, 8-column read. A chunk that fails to parse is left out, and the decode parses it again and
+    /// raises exactly as it would have.
+    func prefetchPageHeaders(leaves: [ParquetLeaf], rowGroups: [Int]) {
+        var todo: [(ParquetColumnMetadata, Int)] = []
+        for leaf in leaves {
+            for g in rowGroups where g >= 0 && g < metadata.rowGroups.count {
+                let rg = metadata.rowGroups[g]
+                guard leaf.index < rg.columns.count else { continue }
+                let meta = rg.columns[leaf.index].meta
+                if cachedPageHeaders(ParquetChunkKey(meta, rowGroup: g)) == nil { todo.append((meta, g)) }
+            }
+        }
+        guard todo.count > 1 else { return }
+        DispatchQueue.concurrentPerform(iterations: todo.count) { i in
+            if let parsed = try? parsePageHeaders(of: todo[i].0, rowGroup: todo[i].1) {
+                cachePageHeaders(ParquetChunkKey(todo[i].0, rowGroup: todo[i].1), parsed)
+            }
+        }
+        ParquetProfile.lap("read.headers \(todo.count) chunks")
+    }
+
+    /// Walks a column chunk's page headers. Only Thrift headers are read here; no column bytes.
+    func parsePageHeaders(of chunk: ParquetColumnMetadata, rowGroup: Int) throws -> (dict: ParquetRawPage?, data: [ParquetRawPage]) {
         var at = Int(chunk.startOffset)
         // `data_page_offset` and `dictionary_page_offset` are signed i64 in the footer: a corrupt one
         // is negative or past the end, and either way it must not become a read position.

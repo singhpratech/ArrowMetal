@@ -101,6 +101,15 @@ struct ParquetPageSource {
     }
 }
 
+/// What a column chunk's page headers depend on: where it starts, its size and value count as the
+/// footer gives them, and its row group.
+struct ParquetChunkKey: Hashable {
+    let start: Int64, size: Int64, values: Int64, rowGroup: Int
+    init(_ m: ParquetColumnMetadata, rowGroup: Int) {
+        start = m.startOffset; size = m.totalCompressedSize; values = m.numValues; self.rowGroup = rowGroup
+    }
+}
+
 /// An open Parquet file: mapped bytes plus the decoded footer.
 public final class ParquetFile: @unchecked Sendable {
     public let path: String
@@ -135,6 +144,16 @@ public final class ParquetFile: @unchecked Sendable {
     private var views: [(key: [Int], source: ParquetPageSource)] = []
     private static let maxViews = 64
     private let wrapLock = NSLock()
+    /// Parsed page headers by column chunk, for as long as the handle lives: a few dozen bytes per page.
+    private var headerCache: [ParquetChunkKey: (dict: ParquetRawPage?, data: [ParquetRawPage])] = [:]
+    private let headerLock = NSLock()
+    func cachedPageHeaders(_ k: ParquetChunkKey) -> (dict: ParquetRawPage?, data: [ParquetRawPage])? {
+        headerLock.lock(); defer { headerLock.unlock() }
+        return headerCache[k]
+    }
+    func cachePageHeaders(_ k: ParquetChunkKey, _ v: (dict: ParquetRawPage?, data: [ParquetRawPage])) {
+        headerLock.lock(); headerCache[k] = v; headerLock.unlock()
+    }
 
     /// Use the column index and offset index, when the file has them, to skip the data pages a
     /// statistics filter rules out (`ParquetPageIndex.swift`). On by default; turning it off gives the
