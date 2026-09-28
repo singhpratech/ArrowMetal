@@ -426,7 +426,7 @@ async fn differential_grid() {
                 let batch = table(n, nf, seed);
                 let cfg = || SessionConfig::new().with_target_partitions(tp).with_batch_size(1024);
                 let plain = SessionContext::new_with_config(cfg());
-                let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, ..Default::default() });
+                let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, ..ArrowMetalConfig::all() });
                 let metal = session_context(cfg(), rule.clone());
                 plain.register_table("t", mem_table(&batch, parts)).unwrap();
                 metal.register_table("t", mem_table(&batch, parts)).unwrap();

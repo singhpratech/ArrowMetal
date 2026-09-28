@@ -337,6 +337,41 @@ fn blocks(rows: usize, fam: &str, rng: &mut StdRng) -> Vec<Box<dyn FnOnce(&mut S
                 }));
             }
         }
+        // The same grid with an int64 value column (D1's `q`): whether the rule's take-list must
+        // tell aggregates over Float64 from those over integers.
+        "groupby_i64" => {
+            let mut gs = vec![200usize, 10_000, 100_000, 1_000_000, rows / 2];
+            gs.dedup();
+            for g in gs {
+                out.push(Box::new(move |rng| {
+                    let t = data_grid(rng, rows, g);
+                    let q = i64s(rng, rows, 1_000_000_000);
+                    let mut cols: Vec<(&str, ArrayRef)> =
+                        ["k", "k1", "k2"].iter().enumerate().map(|(i, n)| (*n, Arc::clone(t.column(i)))).collect();
+                    cols.push(("q", q));
+                    let t = batch(cols);
+                    let gn = gname(g, rows);
+                    let mut cases = Vec::new();
+                    for (fam, agg) in
+                        [("sum", "sum(q) AS s"), ("mean", "avg(q) AS m"), ("minmax", "min(q) AS lo, max(q) AS hi")]
+                    {
+                        cases.push(case(
+                            &format!("gi1{fam}{gn}"),
+                            &format!("group-by 1 int32 key, {gn} groups, {agg} (int64 values)"),
+                            &format!("SELECT k, {agg} FROM grid GROUP BY k"),
+                            Order::Any,
+                        ));
+                        cases.push(case(
+                            &format!("gi2{fam}{gn}"),
+                            &format!("group-by 2 int32 keys, {gn} groups, {agg} (int64 values)"),
+                            &format!("SELECT k1, k2, {agg} FROM grid GROUP BY k1, k2"),
+                            Order::Any,
+                        ));
+                    }
+                    Block { family: "groupby_i64", source: Source::Mem(vec![("grid", t)]), cases }
+                }));
+            }
+        }
         "distinct" => out.push(Box::new(move |rng| Block {
             family: "distinct",
             source: Source::Mem(vec![("fact", data_fact(rng, rows))]),
@@ -672,7 +707,7 @@ async fn main() {
         let l0 = wait_quiet(a.max_load, &format!("{} {rows} {mode}", block.family));
         println!("  [load {l0:.2} at block start]");
         let mem_mode = if mode.starts_with("parquet") { "b8192" } else { mode.as_str() };
-        let rule_on = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, accept_inexact: true, ..Default::default() });
+        let rule_on = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, accept_inexact: true, ..ArrowMetalConfig::all() });
         let rule_def = ArrowMetalRule::new(ArrowMetalConfig::default());
         let ctx_off = context(&block.source, mem_mode, None).await;
         let ctx_on = context(&block.source, mem_mode, Some(rule_on.clone())).await;

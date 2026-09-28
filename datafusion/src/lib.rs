@@ -13,7 +13,9 @@
 //! use datafusion::prelude::*;
 //! use datafusion_arrowmetal::{session_context, ArrowMetalConfig, ArrowMetalRule};
 //!
-//! let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 1_000_000, ..Default::default() });
+//! // The measured take-list (full sorts from 250,000 rows); `ArrowMetalConfig::all()` takes
+//! // every shape the rule can translate.
+//! let rule = ArrowMetalRule::new(ArrowMetalConfig::default());
 //! let ctx = session_context(SessionConfig::new(), rule.clone());
 //! // register tables, run SQL ...
 //! for d in rule.report().decisions() { println!("{d}"); }

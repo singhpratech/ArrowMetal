@@ -44,13 +44,13 @@ async fn sorted_text(ctx: &SessionContext, sql: &str) -> String {
 
 #[tokio::test]
 async fn below_min_rows_is_left_with_the_count_in_the_reason() {
-    let rule = ArrowMetalRule::new(ArrowMetalConfig::default()); // min_rows 1,000,000
+    let rule = ArrowMetalRule::new(ArrowMetalConfig::default()); // min_rows 250,000
     let ctx = ctx_with(&rule, 5_000, 1).await;
     ctx.sql("SELECT * FROM t ORDER BY v").await.unwrap().collect().await.unwrap();
     let r = rule.report();
     assert_eq!(r.taken().count(), 0);
     let d = r.left().next().expect("the sort is reported");
-    assert!(d.reason.contains("input rows 5000 (exact) vs min_rows 1000000"), "{d}");
+    assert!(d.reason.contains("input rows 5000 (exact) vs min_rows 250000"), "{d}");
 }
 
 #[tokio::test]
@@ -86,7 +86,7 @@ async fn inexact_statistics_are_left_unless_accepted() {
 
 #[tokio::test]
 async fn config_switches_leave_the_node() {
-    let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, sort: false, ..Default::default() });
+    let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, sort: false, ..ArrowMetalConfig::all() });
     let ctx = ctx_with(&rule, 100, 1).await;
     ctx.sql("SELECT * FROM t ORDER BY v").await.unwrap().collect().await.unwrap();
     let r = rule.report();
@@ -96,7 +96,7 @@ async fn config_switches_leave_the_node() {
 
 #[tokio::test]
 async fn unsupported_shapes_are_left_with_a_reason() {
-    let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, ..Default::default() });
+    let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, ..ArrowMetalConfig::all() });
     let ctx = ctx_with(&rule, 100, 1).await;
     for (sql, why) in [
         ("SELECT * FROM t ORDER BY v + 1", "is an expression"),
@@ -119,7 +119,7 @@ async fn unsupported_shapes_are_left_with_a_reason() {
 async fn count_distinct_takes_the_inner_group_by() {
     let sql = "SELECT k, count(DISTINCT v) AS d FROM t GROUP BY k";
     for tp in [1, 4] {
-        let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, accept_inexact: true, ..Default::default() });
+        let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, accept_inexact: true, ..ArrowMetalConfig::all() });
         let ctx = ctx_with(&rule, 20_000, tp).await;
         let got = sorted_text(&ctx, sql).await;
         assert_eq!(got, sorted_text(&plain(20_000, tp).await, sql).await, "tp={tp}");
@@ -136,10 +136,12 @@ async fn count_distinct_takes_the_inner_group_by() {
 #[ignore]
 async fn default_config_at_two_million_rows() {
     let n = 2_000_000;
-    for (sql, text) in [
-        ("SELECT k, v, s FROM t ORDER BY v DESC NULLS LAST, s LIMIT 20", false),
-        ("SELECT k, max(v), min(v), count(v), count(*) FROM t GROUP BY k", true),
-        ("SELECT k, s FROM t WHERE k = 3 AND s <> 's1'", true),
+    // The default take-list: the full sort is taken; top-k, the group-by and the filter are left.
+    for (sql, text, taken) in [
+        ("SELECT s, v, k FROM t ORDER BY v DESC NULLS LAST, s, k", false, 1),
+        ("SELECT k, v, s FROM t ORDER BY v DESC NULLS LAST, s LIMIT 20", false, 0),
+        ("SELECT k, max(v), min(v), count(v), count(*) FROM t GROUP BY k", true, 0),
+        ("SELECT k, s FROM t WHERE k = 3 AND s <> 's1'", true, 0),
     ] {
         let rule = ArrowMetalRule::new(ArrowMetalConfig::default());
         let ctx = ctx_with(&rule, n, 4).await;
@@ -147,21 +149,44 @@ async fn default_config_at_two_million_rows() {
             (sorted_text(&ctx, sql).await, sorted_text(&plain(n, 4).await, sql).await)
         } else {
             let run = |c: SessionContext| async move {
-                pretty_format_batches(&c.sql(sql).await.unwrap().collect().await.unwrap()).unwrap().to_string()
+                let out = c.sql(sql).await.unwrap().collect().await.unwrap();
+                let one = arrow::compute::concat_batches(&out[0].schema(), &out).unwrap();
+                format!("{one:?}")
             };
             (run(ctx.clone()).await, run(plain(n, 4).await).await)
         };
-        assert_eq!(got, want, "{sql}");
+        assert!(got == want, "{sql}: results differ");
         let r = rule.report();
-        assert_eq!(r.taken().count(), 1, "{sql}\n{r}");
+        assert_eq!(r.taken().count(), taken, "{sql}\n{r}");
         assert_eq!(r.runtime_fallbacks().count(), 0, "{sql}\n{r}");
         println!("{sql}\n{r}");
     }
 }
 
+/// What the default take-list leaves, with the reason in the report.
+#[tokio::test]
+async fn default_take_list_leaves_topk_aggregates_and_filters() {
+    let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, ..Default::default() });
+    let ctx = ctx_with(&rule, 1_000, 1).await;
+    for (sql, why) in [
+        ("SELECT * FROM t ORDER BY v LIMIT 5", "top-k (sort with fetch 5) disabled in config"),
+        ("SELECT k, count(*) FROM t GROUP BY k", "aggregate disabled in config"),
+        ("SELECT * FROM t WHERE k = 3", "filter disabled in config"),
+    ] {
+        rule.clear_report();
+        ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let r = rule.report();
+        assert_eq!(r.taken().count(), 0, "{sql}\n{r}");
+        assert!(r.left().any(|d| d.reason == why), "{sql}\n{r}");
+    }
+    rule.clear_report();
+    ctx.sql("SELECT * FROM t ORDER BY v").await.unwrap().collect().await.unwrap();
+    assert_eq!(rule.report().taken().count(), 1, "{}", rule.report());
+}
+
 #[tokio::test]
 async fn explain_shows_metal_exec() {
-    let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, ..Default::default() });
+    let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, ..ArrowMetalConfig::all() });
     let ctx = ctx_with(&rule, 100, 4).await;
     let out = ctx
         .sql("EXPLAIN SELECT k, sum(v) FROM t GROUP BY k ORDER BY k")
@@ -182,7 +207,7 @@ async fn replaced_aggregates_under_a_partitioned_join() {
                (SELECT k, max(v) AS top FROM t GROUP BY k) a \
                JOIN (SELECT k, count(*) AS n FROM t GROUP BY k) b ON a.k = b.k";
     for tp in [1, 4] {
-        let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, sort: false, ..Default::default() });
+        let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, sort: false, ..ArrowMetalConfig::all() });
         let ctx = ctx_with(&rule, 50_000, tp).await;
         let got = sorted_text(&ctx, sql).await;
         let want = sorted_text(&plain(50_000, tp).await, sql).await;
@@ -220,7 +245,7 @@ async fn order_by_through_a_projection_is_taken() {
         "SELECT v * 2 AS w, k, s FROM t ORDER BY k, s, w",
     ] {
         for (parts, tp) in [(3, 4), (1, 1)] {
-            let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, ..Default::default() });
+            let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, ..ArrowMetalConfig::all() });
             let ctx = ctx_parts(Some(&rule), 20_000, parts, tp).await;
             let run = |c: SessionContext| async move {
                 pretty_format_batches(&c.sql(sql).await.unwrap().collect().await.unwrap()).unwrap().to_string()
@@ -250,7 +275,7 @@ async fn order_by_through_a_projection_is_taken() {
 async fn top_level_aggregate_is_not_repartitioned() {
     // Exact aggregates only (a float sum differs in its last bits with the summation order).
     let sql = "SELECT k, max(v) AS top, count(v) AS c, count(*) AS n FROM t GROUP BY k";
-    let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, ..Default::default() });
+    let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, ..ArrowMetalConfig::all() });
     let ctx = ctx_parts(Some(&rule), 20_000, 3, 4).await;
     let got = sorted_text(&ctx, sql).await;
     // sorted_text wraps the query in an outer ORDER BY, so plan the bare query for the report.

@@ -25,6 +25,9 @@ use crate::exec::{MetalExec, MetalOp};
 use crate::translate;
 
 /// When the rule takes a node.
+///
+/// [`Default`] is the measured take-list; [`ArrowMetalConfig::all`] takes every shape the rule can
+/// translate (what the differential grid and the benchmark use).
 #[derive(Debug, Clone)]
 pub struct ArrowMetalConfig {
     /// Take a node only when its input has at least this many rows.
@@ -33,23 +36,57 @@ pub struct ArrowMetalConfig {
     pub accept_inexact: bool,
     /// Take a node whose input row count is unknown. Default: no (leave it).
     pub take_when_unknown: bool,
+    /// Full sorts: `ORDER BY` without `LIMIT`.
     pub sort: bool,
+    /// Top-k: `ORDER BY ... LIMIT` (a sort with a fetch).
+    pub topk: bool,
     pub aggregate: bool,
     pub filter: bool,
 }
 
+/// The default take-list, from the rule on/off measurement against DataFusion 55.1 on an M4 Max
+/// (16 partitions, MemTables of 8192-row batches; `datafusion/results/datafusion_rule_2026-09-27.csv`,
+/// DataFusion alone / DataFusion with the rule, wall, best of 5):
+///
+/// | shape | 1M | 10M | 50M | default |
+/// |---|---:|---:|---:|---|
+/// | ORDER BY int64 / Float64 / String key, 3 columns | 7.4x / 10.4x / 9.1x | 16.0x / 12.3x / 16.4x | 14.8x / 11.2x / 14.6x | taken |
+/// | the same over DataFusion's Parquet scan (snappy, zstd) | | 9.8x, 8.0x | 10.3x, 9.0x | taken |
+/// | ORDER BY ... LIMIT 100 (int64, Float64 DESC) | 0.13x / 0.15x | 0.13x / 0.06x | 0.07x / 0.03x | left |
+/// | GROUP BY, count(*) only, 1M groups | 1.19x / 1.10x | 1.95x / 1.68x | 1.78x / 1.75x | left (see below) |
+/// | GROUP BY, count(*) only, 200 groups | 0.57x / 0.65x | 0.43x / 0.98x | 0.71x / 0.87x | left |
+/// | GROUP BY, sum/avg/min+max over Float64, 200 .. 25M groups | 0.19x - 0.77x | 0.21x - 1.03x | 0.19x - 0.89x | left |
+/// | GROUP BY, sum/avg/min+max over int64, 200 .. 25M groups | | 0.37x - 1.36x | 0.37x - 1.40x | left |
+/// | SELECT DISTINCT (int32, int32), 10k groups | 0.79x | 1.05x | 0.83x | left |
+/// | WHERE + whole-table sum/count (the filter is what is taken) | 0.46x | 0.27x | 0.26x | left |
+/// | GROUP BY over a hash join's output | 0.42x - 0.63x | 0.49x - 0.80x | 0.52x - 0.86x | left |
+///
+/// Full sorts at smaller inputs (int64 / Float64 / String key): 100k rows 1.50x / 1.03x / 1.42x,
+/// 250k 2.80x / 1.99x / 3.42x, 500k 5.96x / 5.01x / 5.75x; hence `min_rows` 250,000.
+///
+/// Aggregates are off: the only group-bys at or above 1.5x at both 10M and 50M are count(*)-only
+/// ones with about 1M groups, and the same query with 200 groups is 0.43x-0.98x. The rule sees
+/// the row count but not the group count, so it cannot tell the two apart. Hash joins are not
+/// replaced at all (the rule has no join operator).
 impl Default for ArrowMetalConfig {
     fn default() -> Self {
-        // 1,000,000 is the order of ArrowMetal's measured crossover for sorts and group-bys
-        // against CPU engines on this hardware (docs/CROSSOVER.md); lane D1 measures DataFusion's.
         Self {
-            min_rows: 1_000_000,
+            min_rows: 250_000,
             accept_inexact: false,
             take_when_unknown: false,
             sort: true,
-            aggregate: true,
-            filter: true,
+            topk: false,
+            aggregate: false,
+            filter: false,
         }
+    }
+}
+
+impl ArrowMetalConfig {
+    /// Every shape the rule can translate (sorts, top-k, aggregates, filters), at the default
+    /// `min_rows`.
+    pub fn all() -> Self {
+        Self { topk: true, aggregate: true, filter: true, ..Self::default() }
     }
 }
 
@@ -190,6 +227,15 @@ impl ArrowMetalRule {
         self.log.lock().unwrap().push(Decision { node, taken, reason, runtime_fallback: false });
     }
 
+    /// Why a sort with this `fetch` is switched off in the config, if it is.
+    fn sort_disabled(&self, fetch: Option<usize>) -> Option<String> {
+        match fetch {
+            None if !self.config.sort => Some("sort disabled in config".into()),
+            Some(n) if !self.config.topk => Some(format!("top-k (sort with fetch {n}) disabled in config")),
+            _ => None,
+        }
+    }
+
     /// The node this rule would replace, as an operation over an input, or `None` when the node is
     /// not one it handles at all (a scan, a projection, ...).
     fn candidate(&self, node: &Arc<dyn ExecutionPlan>) -> Option<Candidate> {
@@ -206,8 +252,12 @@ impl ArrowMetalRule {
                 (Arc::clone(p.input()), Some(Arc::clone(spm.input())))
             };
             let sort = sort_node.downcast_ref::<SortExec>()?;
-            if !self.config.sort {
-                return Some(Candidate::new(Err("sort disabled in config".into()), Arc::clone(sort.input())));
+            let fetch = match (spm.fetch(), sort.fetch()) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            if let Some(why) = self.sort_disabled(fetch) {
+                return Some(Candidate::new(Err(why), Arc::clone(sort.input())));
             }
             let same_order = match &proj {
                 None => sort.expr() == spm.expr(),
@@ -223,10 +273,6 @@ impl ArrowMetalRule {
                     Arc::clone(sort.input()),
                 ));
             }
-            let fetch = match (spm.fetch(), sort.fetch()) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
             let input = Arc::clone(sort.input());
             let op = translate::sort_op(sort.expr(), &input.schema(), fetch);
             let mut c = Candidate::new(op, input);
@@ -241,8 +287,8 @@ impl ArrowMetalRule {
         }
         if let Some(sort) = node.downcast_ref::<SortExec>() {
             let input = Arc::clone(sort.input());
-            if !self.config.sort {
-                return Some(Candidate::new(Err("sort disabled in config".into()), input));
+            if let Some(why) = self.sort_disabled(sort.fetch()) {
+                return Some(Candidate::new(Err(why), input));
             }
             if sort.preserve_partitioning() && input.output_partitioning().partition_count() > 1 {
                 return Some(Candidate::new(Err("per-partition sort (preserve_partitioning) with no replaced merge above it".into()), input));

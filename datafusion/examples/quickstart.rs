@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
     )?;
 
     // A small table, so the threshold is lowered from its 1,000,000-row default.
-    let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 100_000, ..Default::default() });
+    let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 100_000, ..ArrowMetalConfig::all() });
     let ctx = session_context(SessionConfig::new().with_target_partitions(4), rule.clone());
     ctx.register_table("sales", Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))?;
 
