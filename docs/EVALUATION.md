@@ -770,7 +770,9 @@ Everything else — 36,486 of the 39,069 cases — on all 27 datasets per cell:
 - **Selection** `filter` (null mask entries drop the row, as in Arrow), `filter_where` for all six
   predicates, `take` with repeated and null indices, `slice`.
 - **`sort`, `argsort`, `top_k`** ascending and descending on all numeric types, at every size, including
-  `-0.0`, NaN and null placement -- the three now agree with Arrow everywhere in the matrix.
+  `-0.0`, NaN and null placement -- the three now agree with Arrow everywhere in the matrix. With
+  `null_placement="at_start"` against pyarrow's own; with `float_order="total"` against IEEE 754
+  totalOrder written out in numpy.
 - **Element-wise math** `abs`, `negate`, `sign`, `floor`, `ceil`, `round`, `trunc`, `sqrt`, `exp`, `ln`,
   `log10`, `log2`, element-wise `min`/`max`, the four bit-wise ops and both shifts.
 - **Cumulative** `sum`, `min`, `max` on all ten numeric types, nulls included.
@@ -857,7 +859,7 @@ means the values *and* the Arrow type have to match.
 | Reductions | `sum`, `min_max`, `mean`, `product`, `variance_and_stddev`, `quantile`, `mode_and_count_distinct`, `first_last_index_min_max`, `any_all` | the 10 numeric, `bool` | `pc.sum`/`min`/`max`/`mean`/`product`/`variance`/`stddev`/`quantile(linear)`/`mode`/`count_distinct`/`first`/`last`/`index`/`min_max`/`any`/`all`, options spelled out | exact for the positional ones; see *Tolerances* for the rest |
 | Element-wise | `compare_*`, `arith_*`, `cast`, `rounding`, `abs`, `negate`, `sign`, `bitwise_*`, `shift_*`, `modulo`, `power`, `element_wise_min_max`, `float_class` | the 10 numeric | the matching `pc.*`, unchecked variants | bit-exact (floats), exact (integers) |
 | Transcendental | `sqrt`, `exp`, `logarithm`, `trig`, `trig_checked` | `float32`, `float64` | `pc.sqrt`/`exp`/`ln`/`log10`/`log2`/`sin`…`atanh`/`atan2` and the `_checked` twins | relative, per *Tolerances*; the special values pinned exactly |
-| Selection & sort | `filter`, `filter_where`, `take`, `slice`, `sort`, `argsort`, `top_k`, `lexsort`, `indices_nonzero`, `drop_null` | the 10 numeric, `bool`, `utf8` | `Array.filter`/`take`/`slice`, `pc.array_sort_indices`, `pc.sort_indices`, `pc.indices_nonzero`, `pc.drop_null` | exact |
+| Selection & sort | `filter`, `filter_where`, `take`, `slice`, `sort`, `argsort`, `top_k`, `lexsort`, `argsort_nulls_first`, `top_k_nulls_first`, `argsort_total_order`, `indices_nonzero`, `drop_null` | the 10 numeric, `bool`, `utf8` | `Array.filter`/`take`/`slice`, `pc.array_sort_indices` (with `null_placement`), `pc.sort_indices`, `pc.indices_nonzero`, `pc.drop_null`; for `float_order="total"` on floats, IEEE 754 totalOrder by its definition (numpy), which pyarrow has no function for | exact |
 | Structural & conditional | `is_null`, `is_valid`, `fill_null`, `fill_null_direction`, `if_else`, `case_when`, `choose`, `replace_with_mask`, `coalesce`, `is_in`, `index_in`, `kleene`, `logical_extras` | the 10 numeric, `bool`, `utf8` | the matching `pc.*`; `skip_nulls=True` for the set lookups | exact |
 | Cumulative & window | `cumulative_sum`/`_min`/`_max`/`_prod`/`_mean`, `ranking`, `percent_rank_and_cume_dist`, `shift`, `pairwise_diff`, `rolling_sum`, `rolling_mean`, `rolling_min_max` | the 10 numeric | `pc.cumulative_*` with `skip_nulls=True` and an explicit `start`, `pc.rank` with a tiebreaker, `pc.pairwise_diff`; a reference in the harness for the six Arrow has no function for | exact for the integer and min/max forms; the reductions' bound for the float sums |
 | Strings | `str_length`, `str_match`, `str_equals_array`, `str_hash32`, the ASCII transforms and predicates, `replace`, `repeat`, `slice_codeunits`, `pad`, `substring_search`, `str_concat`, `string_predicates`, `string_case_transforms`, `string_pad_and_slice`, `string_trim`, `string_normalize`, `string_set_lookup` | `utf8` | the matching `pc.*`; `unicodedata` for `utf8_normalize` | exact |

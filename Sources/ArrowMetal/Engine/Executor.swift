@@ -118,14 +118,16 @@ public enum Executor {
         case .sort(let child, let keys):
             let input = try node(child)
             guard !keys.isEmpty else { return input }
-            return try input.sorted(by: keys.map { ($0.column, $0.descending) })
+            return try input.sorted(by: keys)
 
         case .topK(let child, let key, let k):
             let input = try node(child)
             guard let c = input[key.column] else {
                 throw ArrowMetalError.invalidArrowArray("top-k: no column named \(key.column)")
             }
-            let idx = try topKIndices(c, k: k, largest: key.descending)
+            let idx = try topKIndices(c, k: k, largest: key.descending,
+                                      nullPlacement: key.nullsFirst ? .atStart : .atEnd,
+                                      floatOrder: key.floatOrder)
             return try input.take(idx)
 
         case .slice(let child, let offset, let count):
@@ -189,20 +191,22 @@ public enum Executor {
         return r.columns[0]
     }
 
-    static func topKIndices(_ c: AnyMetalArray, k: Int, largest: Bool) throws -> MetalArray<Int32> {
+    static func topKIndices(_ c: AnyMetalArray, k: Int, largest: Bool, nullPlacement: NullPlacement = .atEnd,
+                            floatOrder: FloatOrder = .ieee) throws -> MetalArray<Int32> {
+        let p = nullPlacement, f = floatOrder
         switch c {
-        case .int8(let a): return try a.topK(k, largest: largest)
-        case .int16(let a): return try a.topK(k, largest: largest)
-        case .int32(let a): return try a.topK(k, largest: largest)
-        case .int64(let a): return try a.topK(k, largest: largest)
-        case .uint8(let a): return try a.topK(k, largest: largest)
-        case .uint16(let a): return try a.topK(k, largest: largest)
-        case .uint32(let a): return try a.topK(k, largest: largest)
-        case .uint64(let a): return try a.topK(k, largest: largest)
-        case .float32(let a): return try a.topK(k, largest: largest)
-        case .float64(let a): return try a.topK(k, largest: largest)
+        case .int8(let a): return try a.topK(k, largest: largest, nullPlacement: p)
+        case .int16(let a): return try a.topK(k, largest: largest, nullPlacement: p)
+        case .int32(let a): return try a.topK(k, largest: largest, nullPlacement: p)
+        case .int64(let a): return try a.topK(k, largest: largest, nullPlacement: p)
+        case .uint8(let a): return try a.topK(k, largest: largest, nullPlacement: p)
+        case .uint16(let a): return try a.topK(k, largest: largest, nullPlacement: p)
+        case .uint32(let a): return try a.topK(k, largest: largest, nullPlacement: p)
+        case .uint64(let a): return try a.topK(k, largest: largest, nullPlacement: p)
+        case .float32(let a): return try a.topK(k, largest: largest, nullPlacement: p, floatOrder: f)
+        case .float64(let a): return try a.topK(k, largest: largest, nullPlacement: p, floatOrder: f)
         default:
-            let idx = try c.argsortIndices(descending: largest)
+            let idx = try c.argsortIndices(descending: largest, nullPlacement: p, floatOrder: f)
             return try idx.slice(offset: 0, length: Swift.min(k, idx.length))
         }
     }

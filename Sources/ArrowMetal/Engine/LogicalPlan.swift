@@ -95,8 +95,21 @@ public struct NamedExpr: Hashable, Sendable {
 public struct SortKey: Hashable, Sendable {
     public var column: String
     public var descending: Bool
-    public init(_ column: String, descending: Bool = false) { self.column = column; self.descending = descending }
-    public var description: String { descending ? "\(column) DESC" : column }
+    /// Nulls before every value of this key (SQL `NULLS FIRST`), in either direction. Default: last.
+    public var nullsFirst: Bool
+    /// How a float key orders (`FloatOrder`); integer, string and temporal keys ignore it.
+    public var floatOrder: FloatOrder
+    public init(_ column: String, descending: Bool = false, nullsFirst: Bool = false,
+                floatOrder: FloatOrder = .ieee) {
+        self.column = column; self.descending = descending
+        self.nullsFirst = nullsFirst; self.floatOrder = floatOrder
+    }
+    /// `x`, `x DESC`, with ` NULLS FIRST` and ` TOTAL_ORDER` appended only when set, so a key with the
+    /// default options prints as it always has.
+    public var description: String {
+        (descending ? "\(column) DESC" : column) + (nullsFirst ? " NULLS FIRST" : "")
+            + (floatOrder == .total ? " TOTAL_ORDER" : "")
+    }
 }
 
 /// The equi-join half of a join node.

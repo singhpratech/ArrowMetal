@@ -218,6 +218,39 @@ pub mod ffi {
         pub fn am_argsort(a: *mut am_array, descending: c_int, out: *mut *mut am_array) -> c_int;
         /// A sorted copy, same type.
         pub fn am_sort(a: *mut am_array, descending: c_int, out: *mut *mut am_array) -> c_int;
+        // null_placement: 0 at_end, 1 at_start. float_order: 0 ieee (the calls above), 1 IEEE 754
+        // totalOrder (arrow-rs's order).
+        pub fn am_argsort_ex2(
+            a: *mut am_array,
+            descending: c_int,
+            null_placement: c_int,
+            float_order: c_int,
+            out: *mut *mut am_array,
+        ) -> c_int;
+        pub fn am_sort_ex2(
+            a: *mut am_array,
+            descending: c_int,
+            null_placement: c_int,
+            float_order: c_int,
+            out: *mut *mut am_array,
+        ) -> c_int;
+        pub fn am_top_k_ex(
+            a: *mut am_array,
+            k: i64,
+            largest: c_int,
+            null_placement: c_int,
+            float_order: c_int,
+            out: *mut *mut am_array,
+        ) -> c_int;
+        /// Each of `descending`, `null_placement`, `float_order` holds `count` entries or is null.
+        pub fn am_lexsort_ex2(
+            columns: *mut *mut am_array,
+            descending: *const c_int,
+            null_placement: *const c_int,
+            float_order: *const c_int,
+            count: i64,
+            out: *mut *mut am_array,
+        ) -> c_int;
 
         // -- group-by over arbitrary key columns -------------------------------------------------
         pub fn am_group_by_keys(

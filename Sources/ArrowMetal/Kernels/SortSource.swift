@@ -156,6 +156,12 @@ enum SortSource {
         if (active) out[i] = inv ? (nan ? 0xFFFFFFFFFFFFFFFFul : ~k) : k;
         key_report(flags, negZero, nan, wantFlags, lane);
     }
+    // IEEE 754 totalOrder (`FloatOrder.total`, arrow-rs's `total_cmp`): the raw bit pattern with the
+    // sign-flip transform and nothing canonicalised, so -0.0 keys below +0.0, -NaN below -inf and +NaN
+    // above +inf, and a descending sort is the plain complement. The map is a bijection, so there is
+    // nothing to report in `flags` and `unkey` mode 2 inverts it exactly, NaN payloads included.
+    kernel void key_from_f32_total(device const uint* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]], constant uint& wantFlags [[buffer(5)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { uint b = a[i]; uint k = (b & 0x80000000u) ? ~b : (b | 0x80000000u); out[i] = inv ? ~k : k; } }
+    kernel void key_from_f64_total(device const ulong* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]], constant uint& wantFlags [[buffer(5)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { ulong b = a[i]; ulong k = (b & 0x8000000000000000ul) ? ~b : (b | 0x8000000000000000ul); out[i] = inv ? ~k : k; } }
     kernel void iota_u32(device uint* out [[buffer(0)]], device const uint* nPtr [[buffer(1)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) out[i] = i; }
 
     // The inverse of the key map: sorted keys back to sorted values, written at `dstBase`. `mode` picks

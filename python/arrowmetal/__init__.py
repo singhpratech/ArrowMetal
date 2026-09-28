@@ -437,9 +437,17 @@ class MetalArray:
         """Sorted copy of the array, with the same ordering rules as `argsort`."""
         return _call(_lib.am_sort, self._h, 1 if descending else 0)
 
-    def top_k(self, k, largest=True):
-        """Int32 indices of the k largest (or smallest) values, in sorted order."""
-        return _call(_lib.am_top_k, self._h, k, 1 if largest else 0)
+    def top_k(self, k, largest=True, null_placement="at_end", float_order="ieee"):
+        """Int32 indices of the k largest (or smallest) values, in sorted order.
+
+        The first k indices `argsort(descending=largest, null_placement=..., float_order=...)` gives:
+        `null_placement="at_start"` puts the null rows first, `float_order="total"` orders floats by
+        IEEE 754 totalOrder (see `argsort`)."""
+        if null_placement == "at_end" and float_order == "ieee":
+            return _call(_lib.am_top_k, self._h, k, 1 if largest else 0)
+        return _call(_lib.am_top_k_ex, self._h, k, 1 if largest else 0,
+                     _index_of(NULL_PLACEMENT, null_placement, "null_placement"),
+                     _index_of(FLOAT_ORDERS, float_order, "float_order"))
 
     # ---- strings (utf8)
     def byte_length(self): return _call(_lib.am_str_unary, self._h, 0)
@@ -1160,6 +1168,9 @@ _lib.am_lexsort.restype = ctypes.c_int
 _lib.am_lexsort_ex.argtypes = [ctypes.POINTER(_P), ctypes.POINTER(ctypes.c_int), ctypes.c_int64,
                                ctypes.c_int, ctypes.POINTER(_P)]
 _lib.am_lexsort_ex.restype = ctypes.c_int
+_lib.am_lexsort_ex2.argtypes = [ctypes.POINTER(_P), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+                                ctypes.POINTER(ctypes.c_int), ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_lexsort_ex2.restype = ctypes.c_int
 
 # Op numbering is the C ABI contract; see include/arrowmetal.h.
 _WINDOW = {"row_number": 0, "rank": 1, "dense_rank": 2, "percent_rank": 3, "cume_dist": 4,
@@ -1258,16 +1269,19 @@ for _op in ("rolling_sum", "rolling_min", "rolling_max", "rolling_mean"):
 del _op
 
 
-def lexsort_indices(columns, descending=None, null_placement="at_end"):
+def lexsort_indices(columns, descending=None, null_placement="at_end", float_order="ieee"):
     """Multi-column (lexicographic) sort: int32 indices ordering the rows by each column in turn, the
     first column being the most significant.
 
     `descending` is one flag per column, or None for all ascending. Successive stable GPU radix argsorts
-    from the least significant key upwards. `null_placement` applies to every key, in both directions,
-    as Arrow's does.
+    from the least significant key upwards. `null_placement` ("at_end" / "at_start") and `float_order`
+    ("ieee" / "total", see `MetalArray.argsort`) are either one value for every key or a list with one
+    per key; the placement holds in both directions, as Arrow's does.
 
         idx = am.lexsort_indices([region, revenue], [False, True])
         region.take(idx), revenue.take(idx)
+        am.lexsort_indices([a, b], [True, False], null_placement=["at_start", "at_end"],
+                           float_order="total")
     """
     cols = [c if isinstance(c, MetalArray) else MetalArray.from_arrow(c) for c in columns]
     if not cols:
@@ -1278,11 +1292,28 @@ def lexsort_indices(columns, descending=None, null_placement="at_end"):
     handles = (_P * len(cols))(*[c._h for c in cols])
     desc = (ctypes.c_int * len(cols))(*[1 if d else 0 for d in flags])
     out = _P()
+    if not isinstance(null_placement, str) or float_order != "ieee":
+        places = _per_key(null_placement, len(cols), "null_placement")
+        orders = _per_key(float_order, len(cols), "float_order")
+        np_ = (ctypes.c_int * len(cols))(*[_index_of(NULL_PLACEMENT, p, "null_placement") for p in places])
+        fo = (ctypes.c_int * len(cols))(*[_index_of(FLOAT_ORDERS, f, "float_order") for f in orders])
+        _check(_lib.am_lexsort_ex2(handles, desc, np_, fo, len(cols), ctypes.byref(out)))
+        return MetalArray(out)
     _check(_lib.am_lexsort_ex(handles, desc, len(cols),
                               0 if null_placement == "at_end" else
                               (1 if null_placement == "at_start" else _bad_placement(null_placement)),
                               ctypes.byref(out)))
     return MetalArray(out)
+
+
+def _per_key(value, n, what):
+    """One option for every key (a string) or a list with one per key."""
+    if isinstance(value, str):
+        return [value] * n
+    value = list(value)
+    if len(value) != n:
+        raise ArrowMetalError(f"{what} has {len(value)} entries for {n} columns")
+    return value
 
 
 def _bad_placement(value):
@@ -3694,6 +3725,12 @@ _lib.am_argsort_ex.argtypes = [_P, ctypes.c_int, ctypes.c_int, ctypes.POINTER(_P
 _lib.am_argsort_ex.restype = ctypes.c_int
 _lib.am_sort_ex.argtypes = [_P, ctypes.c_int, ctypes.c_int, ctypes.POINTER(_P)]
 _lib.am_sort_ex.restype = ctypes.c_int
+_lib.am_argsort_ex2.argtypes = [_P, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_argsort_ex2.restype = ctypes.c_int
+_lib.am_sort_ex2.argtypes = [_P, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_sort_ex2.restype = ctypes.c_int
+_lib.am_top_k_ex.argtypes = [_P, ctypes.c_int64, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(_P)]
+_lib.am_top_k_ex.restype = ctypes.c_int
 _lib.am_partition_nth_ex.argtypes = [_P, ctypes.c_int64, ctypes.c_int, ctypes.POINTER(_P)]
 _lib.am_partition_nth_ex.restype = ctypes.c_int
 _lib.am_rank_ex.argtypes = [_P, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(_P)]
@@ -3718,6 +3755,9 @@ _lib.am_list_parent_indices64.restype = ctypes.c_int
 
 #: Arrow's `null_placement`: where the null rows sit in a sorted order, in either direction.
 NULL_PLACEMENT = ["at_end", "at_start"]
+#: How a sort orders float keys: "ieee" (Arrow C++'s order, the default) or "total" (IEEE 754 totalOrder,
+#: arrow-rs's order). The index is the C ABI's `float_order`.
+FLOAT_ORDERS = ["ieee", "total"]
 #: Arrow's `rank` tiebreakers.
 TIEBREAKERS = ["min", "max", "first", "dense"]
 #: Arrow's `null_matching_behavior` for `is_in` / `index_in`.
@@ -3837,14 +3877,28 @@ def _cast_ex(self, target, safe=None, **flags):
                  _cast_flag_bits(safe, **flags))
 
 
-def _argsort_ex(self, descending=False, null_placement="at_end"):
+def _argsort_ex(self, descending=False, null_placement="at_end", float_order="ieee"):
     """Arrow `array_sort_indices` / single-key `sort_indices` with `null_placement`.
 
     The nulls form one block at the end (Arrow's default) or the start, in *both* directions — the
     placement is independent of the order, exactly as in Arrow. Stable throughout.
+
+    `float_order` decides how Float32 / Float64 values order (other types ignore it):
+
+    * "ieee" (default) — pyarrow's order: -0.0 and +0.0 tie (input order kept), and NaN rows sit next
+      to the nulls in both directions: after the values with "at_end", between the nulls and the
+      values with "at_start".
+    * "total" — IEEE 754 totalOrder, as arrow-rs / DataFusion / Rust's `total_cmp` order floats:
+      -NaN < -inf < ... < -0.0 < +0.0 < ... < +inf < +NaN, NaNs by payload, and a descending sort is
+      the exact mirror, so +NaN comes first. It is one key map in the same radix passes, not an extra
+      sort key.
     """
-    return _call(_lib.am_argsort_ex, self._h, 1 if descending else 0,
-                 _index_of(NULL_PLACEMENT, null_placement, "null_placement"))
+    if float_order == "ieee":
+        return _call(_lib.am_argsort_ex, self._h, 1 if descending else 0,
+                     _index_of(NULL_PLACEMENT, null_placement, "null_placement"))
+    return _call(_lib.am_argsort_ex2, self._h, 1 if descending else 0,
+                 _index_of(NULL_PLACEMENT, null_placement, "null_placement"),
+                 _index_of(FLOAT_ORDERS, float_order, "float_order"))
 
 
 def _partition_nth_ex(self, pivot, null_placement="at_end"):
@@ -4042,14 +4096,18 @@ MetalArray.round_temporal = _round_temporal_ex
 MetalArray.list_parent_indices64 = _list_parent_indices64
 
 
-def _sort_ex(self, descending=False, null_placement="at_end"):
+def _sort_ex(self, descending=False, null_placement="at_end", float_order="ieee"):
     """A sorted copy, in `argsort`'s order and with the same options.
 
     Numeric columns do not gather: the radix sort's own keys are turned back into the values (see
     `MetalArray.sorted` in Swift), which is a sequential write where `take` was a random one. Types
     without an order-preserving key still take `take(argsort())`."""
-    return _call(_lib.am_sort_ex, self._h, 1 if descending else 0,
-                 _index_of(NULL_PLACEMENT, null_placement, "null_placement"))
+    if float_order == "ieee":
+        return _call(_lib.am_sort_ex, self._h, 1 if descending else 0,
+                     _index_of(NULL_PLACEMENT, null_placement, "null_placement"))
+    return _call(_lib.am_sort_ex2, self._h, 1 if descending else 0,
+                 _index_of(NULL_PLACEMENT, null_placement, "null_placement"),
+                 _index_of(FLOAT_ORDERS, float_order, "float_order"))
 
 
 MetalArray.sort = _sort_ex

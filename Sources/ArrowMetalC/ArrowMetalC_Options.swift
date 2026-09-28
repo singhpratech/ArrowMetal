@@ -7,6 +7,8 @@ import ArrowMetal
 //   am_cast_ex                a cast with Arrow's CastOptions and, for a list or struct target, the
 //                             child formats (comma separated)
 //   am_argsort_ex             array_sort_indices / sort_indices with null_placement
+//   am_argsort_ex2, am_sort_ex2, am_top_k_ex, am_lexsort_ex2
+//                             the same with the float order too (and, for the lexsort, both per key)
 //   am_partition_nth_ex       partition_nth_indices with null_placement
 //   am_rank_ex                rank with tiebreaker, sort direction and null_placement
 //   am_rank_quantile_ex       rank_quantile / rank_normal with direction and null_placement
@@ -17,6 +19,7 @@ import ArrowMetal
 //
 // Enumerations, all matching the Python layer:
 //   null_placement    0 at_end (Arrow's default)  1 at_start
+//   float_order       0 ieee (the default)  1 total (IEEE 754 totalOrder, as arrow-rs)
 //   tiebreaker        0 min   1 max   2 first   3 dense
 //   null_matching     0 match  1 skip  2 emit_null  3 inconclusive
 //   value order       0 first_appearance (Arrow's own)  1 sorted (the cheaper GPU pass)
@@ -43,6 +46,14 @@ private func optRun(_ out: UnsafeMutablePointer<OpaquePointer?>?, _ body: () thr
 }
 
 private func placement(_ v: Int32) -> NullPlacement { v == 1 ? .atStart : .atEnd }
+
+private func floatOrder(_ v: Int32) throws -> FloatOrder {
+    switch v {
+    case 0: return .ieee
+    case 1: return .total
+    default: throw ArrowMetalError.invalidArrowArray("unknown float_order \(v)")
+    }
+}
 
 private func tiebreaker(_ v: Int32) throws -> RankTiebreaker {
     switch v {
@@ -144,6 +155,68 @@ public func am_lexsort_ex(_ columns: UnsafeMutablePointer<OpaquePointer?>?,
     }
     return optRun(out) {
         .int32(try lexsortIndices(cols, descending: desc, nullPlacement: placement(nullPlacement)))
+    }
+}
+
+/// `am_argsort_ex` with the float order: 0 ieee (what `am_argsort_ex` does), 1 IEEE 754 totalOrder.
+@_cdecl("am_argsort_ex2")
+public func am_argsort_ex2(_ a: OpaquePointer?, _ descending: Int32, _ nullPlacement: Int32, _ order: Int32,
+                           _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
+    guard let x = optHandle(a) else { return 2 }
+    return optRun(out) {
+        .int32(try x.decodedIfDictionary().argsortIndices(descending: descending != 0,
+                                                          nullPlacement: placement(nullPlacement),
+                                                          floatOrder: try floatOrder(order)))
+    }
+}
+
+/// `am_sort_ex` with the float order.
+@_cdecl("am_sort_ex2")
+public func am_sort_ex2(_ a: OpaquePointer?, _ descending: Int32, _ nullPlacement: Int32, _ order: Int32,
+                        _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
+    guard let x = optHandle(a) else { return 2 }
+    return optRun(out) {
+        try x.sortedValues(descending: descending != 0, nullPlacement: placement(nullPlacement),
+                           floatOrder: try floatOrder(order))
+    }
+}
+
+/// `am_top_k` with the null placement and the float order: the first k indices `am_argsort_ex2` would
+/// give with the same options (`largest` is its `descending`).
+@_cdecl("am_top_k_ex")
+public func am_top_k_ex(_ a: OpaquePointer?, _ k: Int64, _ largest: Int32, _ nullPlacement: Int32,
+                        _ order: Int32, _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
+    guard let x = optHandle(a) else { return 2 }
+    guard k >= 0 else { optSetError(ArrowMetalError.invalidArrowArray("top_k needs k >= 0")); return 1 }
+    return optRun(out) {
+        let f = try floatOrder(order)
+        // As `am_top_k`: a dictionary column selects by its values, float16 through its float32 widening.
+        var v = try x.decodedIfDictionary()
+        if case .float16(let h) = v { v = .float32(try h.toFloat32()) }
+        return .int32(try withOptionPrimitive(v) { try $0.optTopK(Int(k), largest != 0, placement(nullPlacement), f) })
+    }
+}
+
+/// Multi-key `sort_indices` with the null placement and the float order chosen per key. Each of
+/// `descending`, `null_placement` and `float_order` holds `count` entries or is NULL for the default.
+@_cdecl("am_lexsort_ex2")
+public func am_lexsort_ex2(_ columns: UnsafeMutablePointer<OpaquePointer?>?,
+                           _ descending: UnsafePointer<Int32>?, _ nullPlacements: UnsafePointer<Int32>?,
+                           _ orders: UnsafePointer<Int32>?, _ count: Int64,
+                           _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
+    guard let columns, count > 0 else { return 2 }
+    var cols: [AnyMetalArray] = []
+    var desc: [Bool] = [], places: [NullPlacement] = [], rawOrders: [Int32] = []
+    for i in 0..<Int(count) {
+        guard let c = optHandle(columns[i]) else { return 2 }
+        cols.append(c)
+        desc.append(descending.map { $0[i] != 0 } ?? false)
+        places.append(placement(nullPlacements.map { $0[i] } ?? 0))
+        rawOrders.append(orders.map { $0[i] } ?? 0)
+    }
+    return optRun(out) {
+        .int32(try lexsortIndices(cols, descending: desc, nullPlacements: places,
+                                  floatOrders: try rawOrders.map(floatOrder)))
     }
 }
 
@@ -332,6 +405,7 @@ protocol OptionCOps {
     func optUnique(_ order: ValueOrder) throws -> AnyMetalArray
     func optValueCounts(_ order: ValueOrder) throws -> MetalStructArray
     func optDictionaryEncode(_ order: ValueOrder) throws -> (AnyMetalArray, AnyMetalArray)
+    func optTopK(_ k: Int, _ largest: Bool, _ placement: NullPlacement, _ order: FloatOrder) throws -> MetalArray<Int32>
 }
 
 extension MetalArray: OptionCOps {
@@ -371,6 +445,9 @@ extension MetalArray: OptionCOps {
     func optDictionaryEncode(_ order: ValueOrder) throws -> (AnyMetalArray, AnyMetalArray) {
         let (codes, unique) = try dictionaryEncode(order: order)
         return (.int32(codes), wrap(unique))
+    }
+    func optTopK(_ k: Int, _ largest: Bool, _ placement: NullPlacement, _ order: FloatOrder) throws -> MetalArray<Int32> {
+        try topK(k, largest: largest, nullPlacement: placement, floatOrder: order)
     }
 }
 

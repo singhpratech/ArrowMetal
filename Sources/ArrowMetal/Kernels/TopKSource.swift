@@ -29,6 +29,9 @@ enum TopKSource {
     ///
     /// Narrow integers get a key of their own width (8 or 16 bits) rather than a widened 32-bit one: the
     /// radix select splits on the *top* digit, and a widened key would put every row in one bin.
+    ///
+    /// `f32t` / `f64t` are the `FloatOrder.total` maps (`SortSource.key_from_f32_total/f64_total`): the raw
+    /// bits with the sign-flip transform, nothing canonicalised, and the plain complement for "largest".
     static func keyMap(kind: String, V: String, K: String) -> String {
         let keyMax = K == "ulong" ? "ULONG_MAX" : "UINT_MAX"
         let map: String
@@ -48,6 +51,10 @@ enum TopKSource {
             uint b = as_type<uint>(v); if ((b & 0x7FFFFFFFu) == 0u) b = 0u; if (nan) b = 0x7F800001u;
                 \(K) k = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
             """
+        case "f32t":
+            map = "uint b = as_type<uint>(v); \(K) k = (b & 0x80000000u) ? ~b : (b | 0x80000000u);"
+        case "f64t":
+            map = "ulong b = (ulong)v; \(K) k = (b & 0x8000000000000000ul) ? ~b : (b | 0x8000000000000000ul);"
         case "i64": map = "\(K) k = (ulong)v ^ 0x8000000000000000ul;"
         case "u64": map = "\(K) k = (ulong)v;"
         default:

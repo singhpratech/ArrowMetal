@@ -679,6 +679,117 @@ impl Array {
             ffi::am_sort(self.as_ptr(), descending as c_int, out)
         })
     }
+
+    /// The int32 indices that sort the array with the given [`SortOptions`]. Stable.
+    ///
+    /// `SortOptions::from(arrow::compute::SortOptions)` gives arrow-rs's order exactly: nulls where
+    /// `nulls_first` puts them and floats by IEEE 754 totalOrder, so the permutation applied is what
+    /// `arrow::compute::sort` returns.
+    pub fn argsort_with(&self, options: SortOptions) -> Result<Array> {
+        Self::produce("am_argsort_ex2", |out| unsafe {
+            ffi::am_argsort_ex2(
+                self.as_ptr(),
+                options.descending as c_int,
+                options.nulls_first as c_int,
+                options.float_order as c_int,
+                out,
+            )
+        })
+    }
+
+    /// A sorted copy with the given [`SortOptions`], same type. The values are rebuilt from the sort's
+    /// own keys; with [`FloatOrder::Total`] that is exact for every bit pattern, NaN payloads included.
+    pub fn sort_with(&self, options: SortOptions) -> Result<Array> {
+        Self::produce("am_sort_ex2", |out| unsafe {
+            ffi::am_sort_ex2(
+                self.as_ptr(),
+                options.descending as c_int,
+                options.nulls_first as c_int,
+                options.float_order as c_int,
+                out,
+            )
+        })
+    }
+
+    /// The int32 indices of the first `k` rows [`argsort_with`](Array::argsort_with) would give with
+    /// the same options, selected on the GPU without a full sort where the options allow it.
+    pub fn top_k_with(&self, k: usize, options: SortOptions) -> Result<Array> {
+        Self::produce("am_top_k_ex", |out| unsafe {
+            ffi::am_top_k_ex(
+                self.as_ptr(),
+                k as i64,
+                options.descending as c_int,
+                options.nulls_first as c_int,
+                options.float_order as c_int,
+                out,
+            )
+        })
+    }
+}
+
+/// How a sort orders Float32 / Float64 keys. Integer, string and temporal keys ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FloatOrder {
+    /// Arrow C++'s order (ArrowMetal's default): -0.0 ties +0.0, every NaN is one value, and NaN rows
+    /// sit next to the nulls in both directions.
+    #[default]
+    Ieee = 0,
+    /// IEEE 754 totalOrder, as arrow-rs and `f64::total_cmp` define it:
+    /// -NaN < -inf < ... < -0.0 < +0.0 < ... < +inf < +NaN, and descending is the exact mirror.
+    Total = 1,
+}
+
+/// Per-key sort options: direction, null placement and float order.
+///
+/// `Default` is ArrowMetal's plain sort (ascending, nulls last, [`FloatOrder::Ieee`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SortOptions {
+    /// Largest first.
+    pub descending: bool,
+    /// Nulls before every value, in either direction.
+    pub nulls_first: bool,
+    /// How float keys order.
+    pub float_order: FloatOrder,
+}
+
+impl From<arrow::compute::SortOptions> for SortOptions {
+    /// arrow-rs's options with arrow-rs's float order ([`FloatOrder::Total`]).
+    fn from(o: arrow::compute::SortOptions) -> Self {
+        SortOptions {
+            descending: o.descending,
+            nulls_first: o.nulls_first,
+            float_order: FloatOrder::Total,
+        }
+    }
+}
+
+/// Multi-column (lexicographic) sort: int32 indices ordering the rows by each column in turn, the
+/// first column the most significant, each with its own [`SortOptions`] (one per column). Stable.
+pub fn lexsort(columns: &[&Array], options: &[SortOptions]) -> Result<Array> {
+    if columns.is_empty() {
+        return Err(Error::new("lexsort: needs at least one column"));
+    }
+    if options.len() != columns.len() {
+        return Err(Error::new(format!(
+            "lexsort: {} options for {} columns",
+            options.len(),
+            columns.len()
+        )));
+    }
+    let mut raw: Vec<*mut sys::am_array> = columns.iter().map(|c| c.as_ptr()).collect();
+    let desc: Vec<c_int> = options.iter().map(|o| o.descending as c_int).collect();
+    let nulls: Vec<c_int> = options.iter().map(|o| o.nulls_first as c_int).collect();
+    let orders: Vec<c_int> = options.iter().map(|o| o.float_order as c_int).collect();
+    Array::produce("am_lexsort_ex2", |out| unsafe {
+        ffi::am_lexsort_ex2(
+            raw.as_mut_ptr(),
+            desc.as_ptr(),
+            nulls.as_ptr(),
+            orders.as_ptr(),
+            raw.len() as i64,
+            out,
+        )
+    })
 }
 
 // =================================================================================================

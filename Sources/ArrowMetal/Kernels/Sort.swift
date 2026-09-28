@@ -43,15 +43,19 @@ extension MetalArray {
     ///
     /// `descending` picks the direction and `nullPlacement` decides whether the null rows sit after every
     /// value (Arrow's default) or before every one of them; the two are independent, exactly as in Arrow,
-    /// so nulls stay at the chosen end in both directions. NaN sorts after +inf (total order). Runs an
-    /// LSD radix sort on the GPU over 8-bit digits: four passes for a 32-bit key, eight for a 64-bit
-    /// one, minus any pass whose digit is the same in every row, which is an identity permutation and
-    /// is dropped (see below).
+    /// so nulls stay at the chosen end in both directions. `floatOrder` picks how a float column orders:
+    /// `.ieee` (the default) ties -0.0 with +0.0 and keeps every NaN next to the nulls in both directions,
+    /// as Arrow C++ does; `.total` is IEEE 754 totalOrder, as arrow-rs does (see `FloatOrder`). Both are
+    /// one key map in front of the same passes. Runs an LSD radix sort on the GPU over 8-bit digits: four
+    /// passes for a 32-bit key, eight for a 64-bit one, minus any pass whose digit is the same in every
+    /// row, which is an identity permutation and is dropped (see below).
     public func argsort(descending: Bool = false,
-                        nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
+                        nullPlacement: NullPlacement = .atEnd,
+                        floatOrder: FloatOrder = .ieee) throws -> MetalArray<Int32> {
         try Dispatch.checkLength(length)
         if length == 0 { return try MetalArray<Int32>([Int32](), context: context) }
-        let run = try radixSortRun(descending: descending, nullPlacement: nullPlacement, wantOrder: true)
+        let run = try radixSortRun(descending: descending, nullPlacement: nullPlacement,
+                                   floatOrder: floatOrder, wantOrder: true)
         return MetalArray<Int32>(length: length, nullCount: 0, validity: nil, values: run.order!, context: context)
     }
 
@@ -70,10 +74,15 @@ extension MetalArray {
     /// are copied through the sorted row numbers. Those runs are contiguous (they share a key) and are
     /// found by a binary search over the sorted keys. If between them they cover more than half the
     /// output, the whole thing is gathered instead, which is what `take` did.
+    ///
+    /// With `floatOrder: .total` the key map is a bijection on every bit pattern, so a float column never
+    /// needs the fix-up: the sorted keys invert to the sorted values, NaN payloads and zero signs included.
     public func sorted(descending: Bool = false,
-                       nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<T> {
-        if let out = try sortedByInvertingKeys(descending: descending, nullPlacement: nullPlacement) { return out }
-        return try take(try argsort(descending: descending, nullPlacement: nullPlacement))
+                       nullPlacement: NullPlacement = .atEnd,
+                       floatOrder: FloatOrder = .ieee) throws -> MetalArray<T> {
+        if let out = try sortedByInvertingKeys(descending: descending, nullPlacement: nullPlacement,
+                                               floatOrder: floatOrder) { return out }
+        return try take(try argsort(descending: descending, nullPlacement: nullPlacement, floatOrder: floatOrder))
     }
 
     /// Indices of the k smallest (or largest) values, in the same order `argsort` would put them.
@@ -88,17 +97,63 @@ extension MetalArray {
     ///   where latency rather than bandwidth decides.
     /// - The **full argsort** for everything else: types with no key mapping, k close to n, and the case
     ///   where fewer than k rows are non-null, which needs the null rows placed.
-    public func topK(_ k: Int, largest: Bool = true) throws -> MetalArray<Int32> {
+    ///
+    /// `nullPlacement` and `floatOrder` mean what they mean to `argsort`, and the answer is always the first
+    /// k indices `argsort` would give with the same options. `.atStart` with nulls present takes the first
+    /// null rows in input order, then the selection over the rest; on a float column in `.ieee` order it
+    /// takes the full argsort, because the NaN rows move to the front with the nulls there.
+    public func topK(_ k: Int, largest: Bool = true, nullPlacement: NullPlacement = .atEnd,
+                     floatOrder: FloatOrder = .ieee) throws -> MetalArray<Int32> {
         guard k > 0 else { return try MetalArray<Int32>([Int32](), context: context) }
-        if TopK.preferRadixSelect(n: length, k: k) {
-            if let r = try topKRadixSelect(k, largest: largest) { return r }
-            if let s = try topKSelect(k, largest: largest) { return s }
-        } else {
-            if let s = try topKSelect(k, largest: largest) { return s }
-            if let r = try topKRadixSelect(k, largest: largest) { return r }
+        let total = floatOrder == .total && T.isFloatingPoint
+        if nullPlacement == .atStart {
+            if T.isFloatingPoint && !total {
+                let idx = try argsort(descending: largest, nullPlacement: .atStart)
+                return try idx.slice(offset: 0, length: Swift.min(k, idx.length))
+            }
+            if nullCount > 0 { return try topKNullsFirst(k, largest: largest, floatOrder: floatOrder) }
         }
-        let idx = try argsort(descending: largest)
+        if TopK.preferRadixSelect(n: length, k: k) {
+            if let r = try topKRadixSelect(k, largest: largest, floatOrder: floatOrder) { return r }
+            if let s = try topKSelect(k, largest: largest, floatOrder: floatOrder) { return s }
+        } else {
+            if let s = try topKSelect(k, largest: largest, floatOrder: floatOrder) { return s }
+            if let r = try topKRadixSelect(k, largest: largest, floatOrder: floatOrder) { return r }
+        }
+        let idx = try argsort(descending: largest, floatOrder: floatOrder)
         return try idx.slice(offset: 0, length: Swift.min(k, idx.length))
+    }
+
+    /// Top-k with the nulls first, for a column that has some: the first `min(k, nullCount)` null rows in
+    /// input order (a host scan of the validity bitmap that stops at the k-th null), then the best
+    /// `k - nullCount` values through the ordinary selection, which skips the null rows.
+    private func topKNullsFirst(_ k: Int, largest: Bool, floatOrder: FloatOrder) throws -> MetalArray<Int32> {
+        let n = length
+        let want = Swift.min(k, n)
+        let nulls = nullCount
+        var rows: [Int32] = []
+        rows.reserveCapacity(want)
+        try context.syncPoint()
+        if let v = rawValidity {
+            withExtendedLifetime(v) {
+                let bits = v.typed(UInt8.self)
+                var i = 0
+                while i < n && rows.count < Swift.min(want, nulls) {
+                    let bit = offset + i
+                    // A whole byte of valid rows is skipped at once when the scan is byte aligned.
+                    if bit & 7 == 0 && i + 8 <= n && bits[bit >> 3] == 0xFF { i += 8; continue }
+                    if !Bitmap.isSet(bits, bit) { rows.append(Int32(i)) }
+                    i += 1
+                }
+            }
+        }
+        let rest = Swift.min(want - rows.count, n - nulls)
+        if rest > 0 {
+            let best = try topK(rest, largest: largest, nullPlacement: .atEnd, floatOrder: floatOrder)
+            try context.syncPoint()
+            rows.append(contentsOf: best.withValues { Array($0) })
+        }
+        return try MetalArray<Int32>(rows, context: context)
     }
 
     // MARK: - the sort itself
@@ -124,8 +179,8 @@ extension MetalArray {
     /// nulls keep their input order, which is what Arrow asks for — and one fewer pass of work per radix
     /// round. It replaces a host-side pass over the whole sorted index array, which cost three times the
     /// sort itself on a 10% null column.
-    func radixSortRun(descending: Bool, nullPlacement: NullPlacement, wantOrder: Bool,
-                      keysWanted: Bool = false) throws -> SortRun {
+    func radixSortRun(descending: Bool, nullPlacement: NullPlacement, floatOrder: FloatOrder = .ieee,
+                      wantOrder: Bool, keysWanted: Bool = false) throws -> SortRun {
         let ctx = context
         let n = length
         let wide = T.byteWidth == 8
@@ -136,6 +191,9 @@ extension MetalArray {
         func p(_ f: String) throws -> MTLComputePipelineState {
             try ctx.pipeline(source: src, function: f, cacheKey: "sort/\(keyType)/\(bits)/\(f)")
         }
+        // `.total` swaps the float key map for the raw totalOrder transform; everything after the map is
+        // the same, except that a NaN is then an ordinary value and has no block of its own.
+        let totalOrder = floatOrder == .total && T.isFloatingPoint
         // Narrow types widen to 32-bit keys; the mapping kernel expects the source width, so cast first.
         let mapFn: String
         let source: MetalArrowBuffer
@@ -143,10 +201,10 @@ extension MetalArray {
         switch T.self {
         case is Int32.Type: mapFn = "key_from_i32"; source = values
         case is UInt32.Type: mapFn = "key_from_u32"; source = values
-        case is Float.Type: mapFn = "key_from_f32"; source = values
+        case is Float.Type: mapFn = totalOrder ? "key_from_f32_total" : "key_from_f32"; source = values
         case is Int64.Type: mapFn = "key_from_i64"; source = values
         case is UInt64.Type: mapFn = "key_from_u64"; source = values
-        case is Double.Type: mapFn = "key_from_f64"; source = values
+        case is Double.Type: mapFn = totalOrder ? "key_from_f64_total" : "key_from_f64"; source = values
         default:
             let widened = try cast(to: Int32.self); tmpKeep = widened; mapFn = "key_from_i32"; source = widened.values
         }
@@ -154,7 +212,7 @@ extension MetalArray {
         // A NaN is placed with the nulls, not with the values, which is Arrow's rule. `.atEnd` needs no
         // separate block for it — the keys already leave every NaN at the tail of the value block, in
         // both directions — so only `.atStart` on a float column asks the partition for a NaN bucket.
-        let separateNaN = T.isFloatingPoint && nullPlacement == .atStart
+        let separateNaN = T.isFloatingPoint && !totalOrder && nullPlacement == .atStart
         // Read once, here: on a slice at an offset that is not a multiple of 32 these normalise the
         // buffers, which runs a kernel, and that must not happen with an encoder already open.
         let bitmap = validity
@@ -192,7 +250,7 @@ extension MetalArray {
         // Only `sorted()` on a float column has any use for the -0.0 / NaN report, and the kernel does
         // not touch the pointer when `wantFlags` is 0 — but it gets a scratch buffer of its own either
         // way, so that no kernel ever holds two differently-typed device pointers into one allocation.
-        let wantFlags = keysWanted && T.isFloatingPoint
+        let wantFlags = keysWanted && T.isFloatingPoint && !totalOrder
         let flagBuf = try MetalArrowBuffer.allocate(byteCount: 4, zeroed: true, context: ctx)
         // The partition's own tables: three counters per block and the three bucket totals, which are
         // what the sort's element count comes from when the nulls have been taken out.
@@ -436,7 +494,8 @@ extension MetalArray {
     // MARK: - sorted values without the gather
 
     /// `sorted()` built out of the sorted keys, or nil when this column cannot take that path.
-    private func sortedByInvertingKeys(descending: Bool, nullPlacement: NullPlacement) throws -> MetalArray<T>? {
+    private func sortedByInvertingKeys(descending: Bool, nullPlacement: NullPlacement,
+                                       floatOrder: FloatOrder) throws -> MetalArray<T>? {
         let n = length
         // Below the analysis threshold the flags are never read back, so the path cannot know whether the
         // map is invertible; a gather of that many rows costs less than the command buffer it would take
@@ -451,7 +510,7 @@ extension MetalArray {
             try ctx.pipeline(source: src, function: f, cacheKey: "sort/\(keyType)/\(SortSource.digitBits)/\(f)")
         }
         let run = try radixSortRun(descending: descending, nullPlacement: nullPlacement,
-                                   wantOrder: false, keysWanted: true)
+                                   floatOrder: floatOrder, wantOrder: false, keysWanted: true)
         guard run.measured else { return nil }
 
         // Output positions the inverse map cannot produce: the null block, and the runs of values that

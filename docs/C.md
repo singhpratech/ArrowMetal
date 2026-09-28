@@ -1,7 +1,7 @@
 # C
 
 One header, one dynamic library, no Swift in sight for the caller. `include/arrowmetal.h` declares
-224 entry points over `libArrowMetalC.dylib`; every other binding in this repository (Python,
+283 entry points over `libArrowMetalC.dylib`; every other binding in this repository (Python,
 Rust, Go, TypeScript, R, the Polars plugin, the DuckDB extension) is built on it, so it is tested by all
 of their suites as well as by `python/tests`, which calls it through ctypes, and by a test that compiles
 the header as C.
