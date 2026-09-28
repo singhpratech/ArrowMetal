@@ -203,7 +203,10 @@ columns the plan reads and caches them on the object it scanned, keyed by identi
 weak reference, so the cache dies with the table and a second scan of the same table costs nothing. An
 imported `MetalArray` owns the Arrow C Data Interface release callback of the array it came from, so it
 keeps the producer's buffers alive by itself; caching it is safe even after the `pyarrow.Array` is
-gone. A chunked column is rechunked on first use rather than on the way into every query.
+gone. A chunked column is imported on first use rather than on the way into every query, chunk by
+chunk through `am_import_chunks` (each chunk copied straight into the final Metal buffers, with no
+`combine_chunks` copy first) for every type that path takes; dictionary and nested columns are
+combined first.
 
 Which columns get imported is worked out from the plan text before the plan is sent, so a 200-column
 table scanned for two of them imports two. It is the same question `projection_pruning` answers in the

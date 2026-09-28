@@ -414,6 +414,71 @@ impl Array {
         })
     }
 
+    /// Imports several arrow-rs arrays of one type (the chunks of a column, e.g. one column of a
+    /// stream of `RecordBatch`es) as one array of their total length.
+    ///
+    /// Each chunk's buffers are copied straight into the final Metal buffers on the CPU cores in
+    /// parallel (`am_import_chunks`), so there is no concatenated copy in between: this replaces
+    /// `arrow::compute::concat` followed by [`Array::from_arrow`], with the same result. Each chunk's
+    /// offset, length and validity (present, absent or with an unknown null count) is honoured.
+    ///
+    /// One chunk is [`Array::from_arrow`] of it (copy-free when its buffers allow). A type the
+    /// chunked import does not take (nested types; see `am_import_chunks` in `include/arrowmetal.h`)
+    /// is concatenated with `arrow::compute::concat` and imported, so every type
+    /// [`Array::from_arrow`] takes is taken here too. Dictionary arrays are refused, as there.
+    ///
+    /// ```no_run
+    /// use arrow::array::Int64Array;
+    /// let a = Int64Array::from(vec![1i64, 2, 3]);
+    /// let b = Int64Array::from(vec![Some(4i64), None]);
+    /// let gpu = arrowmetal::Array::from_arrow_chunks(&[&a, &b])?;
+    /// assert_eq!(gpu.len(), 5);
+    /// # Ok::<(), arrowmetal::Error>(())
+    /// ```
+    pub fn from_arrow_chunks(chunks: &[&dyn ArrowArrayTrait]) -> Result<Self> {
+        let Some(first) = chunks.first() else {
+            return Err(Error::new(
+                "from_arrow_chunks: needs at least one chunk (the type comes from it)",
+            ));
+        };
+        let data_type = first.data_type();
+        if let Some(other) = chunks.iter().find(|c| c.data_type() != data_type) {
+            return Err(Error::new(format!(
+                "from_arrow_chunks: every chunk must have one type; got {data_type} and {}",
+                other.data_type()
+            )));
+        }
+        if chunks.len() == 1 || matches!(data_type, DataType::Dictionary(..)) {
+            return Self::from_arrow(*first);
+        }
+        let mut arrays = Vec::with_capacity(chunks.len());
+        let mut schema = None;
+        for c in chunks {
+            let (a, s) = to_ffi(&c.to_data())?;
+            arrays.push(a);
+            schema.get_or_insert(s);
+        }
+        let schema = schema.expect("at least one chunk");
+        let schema_ptr = (&schema as *const FFI_ArrowSchema).cast::<sys::ArrowSchema>();
+        if unsafe { ffi::am_import_chunks_supported(schema_ptr) } == 0 {
+            drop(arrays);
+            let merged = arrow::compute::concat(chunks)?;
+            return Self::from_arrow(merged.as_ref());
+        }
+        // `am_import_chunks` moves every chunk on success (their `release` becomes null, so the
+        // drops below do nothing); on failure a chunk it did not move still has `release` set and
+        // its drop frees the export. `FFI_ArrowArray` is `repr(C)`, so the Vec is the contiguous
+        // array of structs the call takes.
+        Self::produce("am_import_chunks", |out| unsafe {
+            ffi::am_import_chunks(
+                schema_ptr,
+                arrays.as_mut_ptr().cast::<sys::ArrowArray>(),
+                arrays.len() as i64,
+                out,
+            )
+        })
+    }
+
     /// Exports back to arrow-rs through the C Data Interface. Always copy-free: arrow-rs reads the
     /// Metal buffers in place and releases them when the last reference to them goes.
     pub fn to_arrow(&self) -> Result<ArrayRef> {
@@ -826,6 +891,35 @@ impl Source {
             }),
             None => Err(Error::new("am_plan_source_create: returned a null handle")),
         }
+    }
+}
+
+impl Source {
+    /// Registers the columns of `batches` as a table named `name`: column `i` is
+    /// [`Array::from_arrow_chunks`] over column `i` of every batch, so a stream of small batches
+    /// (8,192-row `RecordBatch`es, a Parquet reader's output) needs no `concat_batches` first.
+    /// Every batch must have the first one's fields.
+    pub fn from_batches(name: &str, batches: &[arrow::record_batch::RecordBatch]) -> Result<Self> {
+        let Some(first) = batches.first() else {
+            return Err(Error::new(
+                "Source::from_batches: needs at least one batch (the schema comes from it)",
+            ));
+        };
+        let schema = first.schema();
+        if let Some(b) = batches.iter().find(|b| b.schema().fields() != schema.fields()) {
+            return Err(Error::new(format!(
+                "Source::from_batches: every batch must have one schema; got {:?} and {:?}",
+                schema.fields(),
+                b.schema().fields()
+            )));
+        }
+        let mut columns = Vec::with_capacity(schema.fields().len());
+        for (i, field) in schema.fields().iter().enumerate() {
+            let chunks: Vec<&dyn ArrowArrayTrait> =
+                batches.iter().map(|b| b.column(i).as_ref()).collect();
+            columns.push((field.name().clone(), Array::from_arrow_chunks(&chunks)?));
+        }
+        Source::new(name, columns)
     }
 }
 

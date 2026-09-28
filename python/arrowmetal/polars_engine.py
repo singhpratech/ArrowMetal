@@ -1758,6 +1758,18 @@ _cache = _ImportCache()
 STRING_LAYOUT = "view"
 
 
+def _series_arrow_chunks(s):
+    """A multi-chunk Series as a `pyarrow.ChunkedArray` of its own chunks, which the import takes
+    chunk by chunk (`am_import_chunks`) instead of `to_arrow` concatenating them first. A type the
+    chunked import does not take (Categorical / Enum dictionaries, nested types) keeps `to_arrow`."""
+    chunks = [_series_arrow(c) for c in s.get_chunks()]
+    t = chunks[0].type
+    if (pa.types.is_dictionary(t) or pa.types.is_nested(t)
+            or any(c.type != t for c in chunks)):
+        return _series_arrow(s)
+    return pa.chunked_array(chunks, type=t)
+
+
 def _series_arrow(s):
     if STRING_LAYOUT == "view" and s.dtype in (pl.String, pl.Binary) and hasattr(pl, "CompatLevel"):
         return s.to_arrow(compat_level=pl.CompatLevel.newest())
@@ -2039,7 +2051,7 @@ def _leaf_sources(leaves, rows=None, scans=None):
         for c in names:
             s = frame.get_column(c)
             # String and Binary columns cross in Polars' own view layout (see STRING_LAYOUT).
-            a = _series_arrow(s)
+            a = _series_arrow_chunks(s) if s.n_chunks() > 1 else _series_arrow(s)
             # A multi-chunk column is concatenated by `to_arrow`, so its buffers are new every time.
             if rows is None and s.n_chunks() == 1 and isinstance(a, pa.Array) \
                     and not c.startswith(_HIDDEN):     # a helper column is new on every query

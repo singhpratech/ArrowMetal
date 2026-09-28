@@ -1,7 +1,7 @@
 # C
 
 One header, one dynamic library, no Swift in sight for the caller. `include/arrowmetal.h` declares
-222 entry points over `libArrowMetalC.dylib`; every other binding in this repository (Python,
+224 entry points over `libArrowMetalC.dylib`; every other binding in this repository (Python,
 Rust, Go, TypeScript, R, the Polars plugin, the DuckDB extension) is built on it, so it is tested by all
 of their suites as well as by `python/tests`, which calls it through ctypes, and by a test that compiles
 the header as C.
@@ -27,6 +27,18 @@ swift build -c release --product ArrowMetalC        # .build/release/libArrowMet
   names it (for a dictionary array `am_format` reports the index type, and the kernels compute on the
   values).
 - Copy-free out, always. Copy-free in when the producer's buffers are page aligned; one copy otherwise.
+- A column held as several arrays (a ChunkedArray, one column of a stream of RecordBatches) imports
+  in one call: `am_import_chunks(schema, arrays, n, &out)` takes `n` contiguous `ArrowArray` structs
+  of the one type `schema` describes and returns one array of their total length, the same array
+  `am_import` of their concatenation gives. Each chunk's offset, length, validity bitmap (or its
+  absence) and null count (`-1` included) are honoured, and each chunk is copied straight into the
+  final buffers on the CPU cores in parallel, with no concatenated copy in between. On success every
+  chunk is moved; on failure a chunk whose `release` is still set is still the caller's. It takes the
+  integer, float, float16, boolean, null, decimal, temporal, interval and fixed_size_binary types,
+  utf8 / large_utf8 / binary / large_binary (a total over 2 GB is refused, as for one large_utf8
+  array) and utf8_view / binary_view; for any other type (dictionary, nested, run-end encoded,
+  extension) it returns 3 and reads and moves nothing, and `am_import_chunks_supported(schema)`
+  answers the question up front. One chunk is `am_import` of it.
 
 ## Example
 

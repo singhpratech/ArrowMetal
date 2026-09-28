@@ -1338,8 +1338,11 @@ values untouched. An `Enum` comes back from `to_polars` as a `Categorical`: the 
 the fact that its value set was closed does not. `List` and `Struct` cross and round-trip, but only
 the structural kernels operate on them -- you cannot sum or group by one. `Object` is not bridged.
 
-**Chunking.** ArrowMetal takes one Arrow array. A multi-chunk Series is rechunked once, which does
-copy; `am.from_polars(s, rechunk=False)` raises instead, so the copy is never silent.
+**Chunking.** `am.from_polars` takes one Arrow array. A multi-chunk Series is rechunked once, which
+does copy; `am.from_polars(s, rechunk=False)` raises instead, so the copy is never silent. The
+`MetalEngine` hands a multi-chunk column of an in-memory frame over as its own chunks, which the
+chunked import (`am_import_chunks`) copies straight into the final Metal buffers without Polars
+concatenating them first; Categorical, Enum and nested columns are still concatenated by `to_arrow`.
 
 **Order.** Group order is ArrowMetal's, not Polars': ascending by key for numeric, boolean,
 temporal and decimal keys, first-seen for utf8 and binary, lexicographic in column order for

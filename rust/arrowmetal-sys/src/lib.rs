@@ -153,6 +153,17 @@ pub mod ffi {
             array: *mut ArrowArray,
             out: *mut *mut am_array,
         ) -> c_int;
+        /// Chunked import: `n` contiguous arrays of the one type `schema` describes, imported as
+        /// one array. Every chunk is moved on success; on failure a chunk whose `release` is still
+        /// set remains the caller's. Returns 3, moving nothing, for a type it does not take.
+        pub fn am_import_chunks(
+            schema: *const ArrowSchema,
+            arrays: *mut ArrowArray,
+            n: i64,
+            out: *mut *mut am_array,
+        ) -> c_int;
+        /// 1 when `am_import_chunks` takes arrays of this schema's type, 0 otherwise.
+        pub fn am_import_chunks_supported(schema: *const ArrowSchema) -> c_int;
         pub fn am_export(
             a: *mut am_array,
             schema: *mut ArrowSchema,

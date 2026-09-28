@@ -143,10 +143,30 @@ public final class MetalArrowBuffer: @unchecked Sendable {
     }
 }
 
-/// Uses `mincore` to check whether every page in the range is mapped into the process.
+/// Whether every page in the range is mapped into the process and readable.
+///
+/// Asks the VM map for the regions that cover the range (`mach_vm_region`), one call per region, so
+/// the cost does not grow with the length: a large producer allocation is one region. The probe
+/// this replaces, `mincore`, reported on every page and took 5.3 ms of a 5.3 ms zero-copy import of
+/// a 400 MB column (M4 Max); the `makeBuffer(bytesNoCopy:)` call itself took 0.01 ms.
 private func rangeIsMapped(_ ptr: UnsafeRawPointer, length: Int) -> Bool {
-    let page = metalPageSize()
-    let pages = (length + page - 1) / page
-    var vec = [CChar](repeating: 0, count: pages)
-    return mincore(UnsafeMutableRawPointer(mutating: ptr), length, &vec) == 0
+    guard length > 0 else { return true }
+    var addr = mach_vm_address_t(UInt(bitPattern: ptr))
+    let end = addr + mach_vm_size_t(length)
+    while addr < end {
+        var regionAddr = addr
+        var size: mach_vm_size_t = 0
+        var info = vm_region_basic_info_data_64_t()
+        var count = mach_msg_type_number_t(MemoryLayout<vm_region_basic_info_data_64_t>.size / MemoryLayout<Int32>.size)
+        var object: mach_port_t = 0
+        let kr = withUnsafeMutablePointer(to: &info) { p in
+            p.withMemoryRebound(to: Int32.self, capacity: Int(count)) {
+                mach_vm_region(mach_task_self_, &regionAddr, &size, VM_REGION_BASIC_INFO_64, $0, &count, &object)
+            }
+        }
+        // The call returns the first region at or above `addr`; one that starts above it is a hole.
+        guard kr == KERN_SUCCESS, regionAddr <= addr, size > 0, info.protection & VM_PROT_READ != 0 else { return false }
+        addr = regionAddr + size
+    }
+    return true
 }

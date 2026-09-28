@@ -120,10 +120,11 @@ class _Source:
                 out.append(a if rows is None else a.slice(0, min(rows, len(a))))
                 continue
             if rows is not None and hasattr(a, "slice"):
-                out.append(_MetalArray.from_arrow(_as_pa_array(a.slice(0, rows))))
+                out.append(_MetalArray.from_arrow(a.slice(0, rows)))
                 continue
-            # A chunked column is rechunked here, once, rather than on the way into every query.
-            c = _MetalArray.from_arrow(_as_pa_array(a))
+            # A chunked column is imported here, once, chunk by chunk (no concatenated copy),
+            # rather than on the way into every query.
+            c = _MetalArray.from_arrow(a)
             self._cols[n] = c
             out.append(c if rows is None else c.slice(0, min(rows, len(c))))
         return out

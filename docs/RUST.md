@@ -203,6 +203,7 @@ data, at lengths 0, 1, 33, 1024, 1025, 100,001 and 1,000,001, with and without n
 | Rust | ArrowMetal ABI | Oracle |
 |---|---|---|
 | `Array::from_arrow` / `to_arrow` | `am_import` / `am_export` | round trip equals the input, including sliced arrays |
+| `Array::from_arrow_chunks`, `Source::from_batches` | `am_import_chunks`, `am_import_chunks_supported` | equals `Array::from_arrow` of `arrow::compute::concat` and the concatenation itself, over 11 types (integers, Float64, Boolean, Date32, Timestamp, Decimal128, Utf8, LargeUtf8, Utf8View, Binary) and chunk layouts (empty, one-row, sliced, all-null and no-null chunks, one chunk, 10,000 chunks), then through `sum`, `sort`, `argsort` and `group_by` (`tests/chunked.rs`) |
 | `len`, `null_count`, `format` | `am_length`, `am_null_count`, `am_format` | `arrow::array::Array` |
 | `sum`, `min`, `max`, `mean` | `am_reduce` | `arrow::compute::{sum, min, max}`; `mean` against arrow's exact sum over the valid count |
 | `compare_scalar`, `compare` (6 ops) | `am_compare_scalar`, `am_compare_array` | `arrow::compute::kernels::cmp` |
@@ -290,7 +291,7 @@ every other reduction test relies on.
 
 ## What is not wrapped
 
-`include/arrowmetal.h` has 222 entry points. `arrowmetal-sys` declares 35 of them — every one called
+`include/arrowmetal.h` has 224 entry points. `arrowmetal-sys` declares 37 of them — every one called
 by the safe crate, none declared and unused — and the safe crate covers the list above. Everything
 below is reachable from Swift, Python and the C ABI, and **not** from this crate. There is no
 technical obstacle to any of it; it is unwrapped because it is untested here, and an untested wrapper
@@ -381,9 +382,10 @@ reduction does not earn its import back.
   indices. Anything else works through the same entry points but is untested from Rust.
 * **One thread per handle set.** Handles are `!Send` and `!Sync`; `am_last_error` and batching are
   thread-local.
-* **No `RecordBatch` type.** Columns go across one at a time. The plan runner's `Source` takes a
-  named set of columns, which is the closest thing here to a table.
-* **`arrowmetal-sys` declares 35 of the ABI's 222 entry points**, and every one of them is called by
+* **No `RecordBatch` type of its own.** Columns go across one at a time. The plan runner's `Source`
+  takes a named set of columns, or a slice of arrow-rs `RecordBatch`es (`Source::from_batches`, each
+  column imported with `Array::from_arrow_chunks`).
+* **`arrowmetal-sys` declares 37 of the ABI's 224 entry points**, and every one of them is called by
   the safe crate (nothing is declared and unused). The table above lists what is missing.
 * **The docs.rs build of 0.1.0 failed.** Under `DOCS_RS` the `-sys` build script returns before it
   emits anything, so the `env!("ARROWMETAL_SYS_LIB_DIR")` and `env!("ARROWMETAL_LINKED_LIB_DIR")`

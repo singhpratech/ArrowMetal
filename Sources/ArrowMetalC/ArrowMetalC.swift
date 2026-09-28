@@ -47,6 +47,24 @@ public func am_import_device(_ schema: UnsafePointer<ArrowSchema>?, _ array: Uns
     guard let schema, let array else { return 2 }
     return run(out) { try importArrowDeviceArray(schema: schema, array: array).array }
 }
+/// Chunked import (`importArrowChunks`): `n` contiguous `ArrowArray` structs of the one type `schema`
+/// describes, imported as one array. 3 when the type is not taken (nothing is read or moved).
+@_cdecl("am_import_chunks")
+public func am_import_chunks(_ schema: UnsafePointer<ArrowSchema>?, _ arrays: UnsafeMutablePointer<ArrowArray>?, _ n: Int64,
+                             _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
+    guard let schema, n >= 0, n == 0 || arrays != nil else { return 2 }
+    guard chunkedImportSupported(schema: schema) else {
+        let fmt = schema.pointee.format.map { String(cString: $0) } ?? "(null format)"
+        setError(ArrowMetalError.unsupportedType("am_import_chunks does not take \(fmt) arrays; import their concatenation"))
+        return 3
+    }
+    return run(out) { try importArrowChunks(schema: schema, arrays: arrays, count: Int(n)).array }
+}
+@_cdecl("am_import_chunks_supported")
+public func am_import_chunks_supported(_ schema: UnsafePointer<ArrowSchema>?) -> Int32 {
+    guard let schema else { return 0 }
+    return chunkedImportSupported(schema: schema) ? 1 : 0
+}
 @_cdecl("am_export")
 public func am_export(_ a: OpaquePointer?, _ schema: UnsafeMutablePointer<ArrowSchema>?, _ array: UnsafeMutablePointer<ArrowArray>?) -> Int32 {
     guard let x = handle(a), let array else { return 2 }

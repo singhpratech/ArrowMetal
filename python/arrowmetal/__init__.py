@@ -96,6 +96,10 @@ _lib.am_null_count.restype = ctypes.c_int64
 _lib.am_null_count.argtypes = [_P]
 _lib.am_release.argtypes = [_P]
 _lib.am_import.argtypes = [_P, _P, ctypes.POINTER(_P)]
+_lib.am_import_chunks.argtypes = [_P, _P, ctypes.c_int64, ctypes.POINTER(_P)]
+_lib.am_import_chunks.restype = ctypes.c_int
+_lib.am_import_chunks_supported.argtypes = [_P]
+_lib.am_import_chunks_supported.restype = ctypes.c_int
 _lib.am_export.argtypes = [_P, _P, _P]
 _lib.am_reduce.argtypes = [_P, ctypes.c_int, ctypes.POINTER(ctypes.c_int64), ctypes.POINTER(ctypes.c_double),
                            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
@@ -231,9 +235,18 @@ class MetalArray:
     # ---- interop
     @classmethod
     def from_arrow(cls, obj):
-        """Import from anything with __arrow_c_array__ (pyarrow.Array, ChunkedArray of one chunk, Polars .to_arrow(), ...)."""
+        """Import from anything with __arrow_c_array__ (pyarrow.Array, ChunkedArray, Polars .to_arrow(), ...).
+
+        A ChunkedArray of several chunks goes through the chunked import (`am_import_chunks`): each
+        chunk is copied straight into the final Metal buffers, on the CPU cores in parallel, with no
+        `combine_chunks` copy first. Types the chunked import does not take (dictionary, nested) are
+        combined first, as before."""
         if not isinstance(obj, pa.Array):
             if isinstance(obj, pa.ChunkedArray):
+                if obj.num_chunks > 1:
+                    m = _import_chunks(obj.chunks)
+                    if m is not None:
+                        return m
                 obj = obj.combine_chunks()
             elif hasattr(obj, "__arrow_c_array__"):
                 obj = pa.array(obj)
@@ -764,6 +777,30 @@ _ArrowArray._fields_ = [("length", ctypes.c_int64), ("null_count", ctypes.c_int6
                         ("children", ctypes.POINTER(ctypes.POINTER(_ArrowArray))),
                         ("dictionary", ctypes.POINTER(_ArrowArray)),
                         ("release", ctypes.CFUNCTYPE(None, ctypes.POINTER(_ArrowArray))), ("private_data", ctypes.c_void_p)]
+
+
+def _import_chunks(chunks):
+    """One MetalArray from pyarrow arrays of one type (`am_import_chunks`), or None when the chunked
+    import does not take the type (the caller combines the chunks instead)."""
+    schema = _ArrowSchema()
+    chunks[0].type._export_to_c(ctypes.addressof(schema))
+    try:
+        if not _lib.am_import_chunks_supported(ctypes.addressof(schema)):
+            return None
+        n = len(chunks)
+        arrays = (_ArrowArray * n)()
+        try:
+            for i, c in enumerate(chunks):
+                c._export_to_c(ctypes.addressof(arrays[i]))
+            return _call(_lib.am_import_chunks, ctypes.addressof(schema), ctypes.addressof(arrays), n)
+        finally:
+            # Moved chunks come back with release NULL; one left set is still ours (an error).
+            for a in arrays:
+                if a.release:
+                    a.release(ctypes.byref(a))
+    finally:
+        if schema.release:
+            schema.release(ctypes.byref(schema))
 
 
 def array(obj):
@@ -3357,17 +3394,25 @@ def _as_pa_array(c):
     return c
 
 
+def _chunked_column(c):
+    """A Table column for `MetalArray.from_arrow`: one chunk unwrapped, several kept as a
+    ChunkedArray (imported chunk by chunk, without a concatenated copy)."""
+    if isinstance(c, pa.ChunkedArray) and c.num_chunks > 1:
+        return c
+    return _as_pa_array(c)
+
+
 def _query_columns(data):
     """(names, arrays) from a dict, a pyarrow RecordBatch/Table, or a Polars DataFrame."""
     if isinstance(data, dict):
         return list(data.keys()), list(data.values())
     if isinstance(data, pa.Table):
-        return list(data.column_names), [_as_pa_array(c) for c in data.columns]
+        return list(data.column_names), [_chunked_column(c) for c in data.columns]
     if isinstance(data, pa.RecordBatch):
         return list(data.schema.names), [data.column(i) for i in range(data.num_columns)]
     if hasattr(data, "to_arrow") and hasattr(data, "columns"):      # polars.DataFrame
         t = data.to_arrow()
-        return list(t.column_names), [_as_pa_array(c) for c in t.columns]
+        return list(t.column_names), [_chunked_column(c) for c in t.columns]
     raise ArrowMetalError("query() needs a dict of arrays, a pyarrow RecordBatch/Table, or a Polars DataFrame")
 
 

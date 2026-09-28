@@ -461,6 +461,13 @@ func importStringViewArray(binary: Bool, array: UnsafeMutablePointer<ArrowArray>
     let k = nb - 3
     let sizesPtr = a.buffers[nb - 1].map { UnsafeRawPointer($0).assumingMemoryBound(to: Int64.self) }
     guard k == 0 || sizesPtr != nil else { throw ArrowMetalError.invalidArrowArray("utf8_view: buffer sizes are null") }
+    // Many data buffers (an arrow-rs `concat` of view arrays keeps every input's buffers): copying
+    // them into a few merged buffers costs less than mapping and binding each one
+    // (`importViewArrayMerged`, the chunked import's view path).
+    if k > maxWrappedViewBuffers, length > 0 {
+        guard a.buffers[1] != nil else { throw ArrowMetalError.invalidArrowArray("utf8_view: views buffer is null") }
+        return try importViewArrayMerged(owner, binary: binary, context: context)
+    }
 
     var zc = true, copied = 0
     // The views and the data buffers are read byte- or 16-byte-wise and bound at a byte offset, so

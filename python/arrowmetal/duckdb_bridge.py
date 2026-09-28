@@ -156,7 +156,16 @@ def from_duckdb(source, con=None, on_unsupported="keep", columns=None):
     names = list(table.column_names) if columns is None else list(columns)
     out = {}
     for name in names:
-        out[name] = _lift(_flatten(table.column(name)), on_unsupported)
+        column = table.column(name)
+        # A result of several chunks goes through the chunked import (no concatenated copy); a
+        # column that will not import that way is flattened and lifted as before.
+        if isinstance(column, pa.ChunkedArray) and column.num_chunks > 1:
+            try:
+                out[name] = MetalArray.from_arrow(column)
+                continue
+            except Exception:
+                pass
+        out[name] = _lift(_flatten(column), on_unsupported)
     return out
 
 

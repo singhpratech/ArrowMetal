@@ -19,6 +19,20 @@ const char* am_last_error(void);             // thread-local, valid until the ne
 // Lifecycle and interop (zero-copy when the producer's buffers are page aligned; otherwise one copy)
 int  am_import(const struct ArrowSchema* schema, struct ArrowArray* array, am_array** out);
 int  am_import_device(const struct ArrowSchema* schema, struct ArrowDeviceArray* array, am_array** out);
+// Chunked import: `n` arrays of the one type `schema` describes (a ChunkedArray, a column of
+// RecordBatches), imported as one array of their total length. Each chunk's offset, length,
+// validity bitmap (or its absence) and null count (-1 included) are honoured, and each chunk's
+// buffers are copied straight into the final buffers on the CPU cores in parallel, with no
+// concatenated copy in between. `arrays` points at `n` contiguous structs. On success every chunk
+// is moved (its release is NULL on return); on failure a chunk whose release is still set remains
+// the caller's. n == 1 is am_import. Taken: the integer, float, float16, bool, null, decimal,
+// temporal, interval and fixed_size_binary types, utf8 / large_utf8 / binary / large_binary
+// (a total over 2 GB is an error, as for one large_utf8 array) and utf8_view / binary_view.
+// Returns 3, reading and moving nothing, for any other type (dictionary, nested, run-end encoded,
+// extension): import the concatenation instead. am_import_chunks_supported returns 1 when the
+// type is taken, 0 otherwise.
+int  am_import_chunks(const struct ArrowSchema* schema, struct ArrowArray* arrays, int64_t n, am_array** out);
+int  am_import_chunks_supported(const struct ArrowSchema* schema);
 int  am_export(am_array* a, struct ArrowSchema* schema, struct ArrowArray* array);
 int  am_export_device(am_array* a, struct ArrowSchema* schema, struct ArrowDeviceArray* array);
 void am_release(am_array* a);
