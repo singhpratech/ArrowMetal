@@ -192,3 +192,71 @@ async fn replaced_aggregates_under_a_partitioned_join() {
         assert_eq!(rule.report().runtime_fallbacks().count(), 0);
     }
 }
+
+/// The table split over `parts` MemTable partitions (DataFusion plans a merge over per-partition
+/// sorts only when there are several).
+async fn ctx_parts(rule: Option<&ArrowMetalRule>, n: usize, parts: usize, tp: usize) -> SessionContext {
+    let config = SessionConfig::new().with_target_partitions(tp);
+    let ctx = match rule {
+        Some(r) => session_context(config, r.clone()),
+        None => SessionContext::new_with_config(config),
+    };
+    let b = batch(n);
+    let per = n.div_ceil(parts);
+    let p: Vec<Vec<RecordBatch>> =
+        (0..parts).map(|i| vec![b.slice(i * per, per.min(n - i * per))]).collect();
+    ctx.register_table("t", Arc::new(MemTable::try_new(b.schema(), p).unwrap())).unwrap();
+    ctx
+}
+
+/// An ORDER BY whose SELECT list reorders the columns plans as `SortPreservingMergeExec ->
+/// ProjectionExec -> SortExec(preserve_partitioning)`. The rule replaces the merge and the sorts
+/// with one MetalExec and keeps the projection above it; with and without LIMIT, the rows match.
+#[tokio::test]
+async fn order_by_through_a_projection_is_taken() {
+    for sql in [
+        "SELECT s, v, k FROM t ORDER BY k, v DESC, s",
+        "SELECT s, v, k FROM t ORDER BY k DESC, v NULLS FIRST, s LIMIT 37",
+        "SELECT v * 2 AS w, k, s FROM t ORDER BY k, s, w",
+    ] {
+        for (parts, tp) in [(3, 4), (1, 1)] {
+            let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, ..Default::default() });
+            let ctx = ctx_parts(Some(&rule), 20_000, parts, tp).await;
+            let run = |c: SessionContext| async move {
+                pretty_format_batches(&c.sql(sql).await.unwrap().collect().await.unwrap()).unwrap().to_string()
+            };
+            let got = run(ctx).await;
+            let want = run(ctx_parts(None, 20_000, parts, tp).await).await;
+            let r = rule.report();
+            // `v * 2` is computed in the projection, so its sort key is an expression: left.
+            if sql.contains("v * 2") {
+                assert_eq!(got, want, "{sql} parts={parts}");
+                continue;
+            }
+            assert_eq!(got, want, "{sql} parts={parts}\n{r}");
+            assert_eq!(r.taken().count(), 1, "{sql} parts={parts}\n{r}");
+            assert_eq!(r.runtime_fallbacks().count(), 0, "{sql}\n{r}");
+            if parts > 1 {
+                assert!(r.taken().any(|d| d.reason.contains("projection kept above it")), "{sql}\n{r}");
+            }
+        }
+    }
+}
+
+/// A replaced aggregate with only projections above it keeps MetalExec's single output
+/// partition (no hash re-partitioning of the result); below a join it is still re-partitioned
+/// (`replaced_aggregates_under_a_partitioned_join`).
+#[tokio::test]
+async fn top_level_aggregate_is_not_repartitioned() {
+    // Exact aggregates only (a float sum differs in its last bits with the summation order).
+    let sql = "SELECT k, max(v) AS top, count(v) AS c, count(*) AS n FROM t GROUP BY k";
+    let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, ..Default::default() });
+    let ctx = ctx_parts(Some(&rule), 20_000, 3, 4).await;
+    let got = sorted_text(&ctx, sql).await;
+    // sorted_text wraps the query in an outer ORDER BY, so plan the bare query for the report.
+    rule.clear_report();
+    ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let r = rule.report();
+    assert!(r.taken().any(|d| d.reason.contains("kept at one partition")), "{r}");
+    assert_eq!(got, sorted_text(&ctx_parts(None, 20_000, 3, 4).await, sql).await);
+}

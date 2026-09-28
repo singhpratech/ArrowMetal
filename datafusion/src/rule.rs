@@ -10,7 +10,9 @@ use datafusion::common::Result;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
@@ -133,6 +135,36 @@ struct Candidate {
     op: std::result::Result<MetalOp, String>,
     /// The input `MetalExec` reads (the replaced chain's leaf input).
     input: Arc<dyn ExecutionPlan>,
+    /// The runtime fallback, when it is not the node itself (it must have `MetalExec`'s schema).
+    original: Option<Arc<dyn ExecutionPlan>>,
+    /// A node to put back above `MetalExec` (the projection of `SPM -> Projection -> SortExec`).
+    reparent: Option<Arc<dyn ExecutionPlan>>,
+}
+
+impl Candidate {
+    fn new(op: std::result::Result<MetalOp, String>, input: Arc<dyn ExecutionPlan>) -> Self {
+        Self { op, input, original: None, reparent: None }
+    }
+}
+
+/// `spm_expr` (written against the projection's output) mapped through `proj` onto the
+/// projection's input, or `None` when a merge key is not a plain column of the projection.
+fn map_through_projection(
+    spm_expr: &datafusion::physical_expr::LexOrdering,
+    proj: &ProjectionExec,
+) -> Option<Vec<(usize, arrow::compute::SortOptions)>> {
+    let mut out = Vec::new();
+    for s in spm_expr.iter() {
+        let c = s.expr.downcast_ref::<Column>()?;
+        let pe = proj.expr().get(c.index())?;
+        let inner = pe.expr.downcast_ref::<Column>()?;
+        out.push((inner.index(), s.options));
+    }
+    Some(out)
+}
+
+fn sort_keys(expr: &datafusion::physical_expr::LexOrdering) -> Option<Vec<(usize, arrow::compute::SortOptions)>> {
+    expr.iter().map(|s| s.expr.downcast_ref::<Column>().map(|c| (c.index(), s.options))).collect()
 }
 
 impl ArrowMetalRule {
@@ -162,15 +194,34 @@ impl ArrowMetalRule {
     /// not one it handles at all (a scan, a projection, ...).
     fn candidate(&self, node: &Arc<dyn ExecutionPlan>) -> Option<Candidate> {
         if let Some(spm) = node.downcast_ref::<SortPreservingMergeExec>() {
-            let sort = spm.input().downcast_ref::<SortExec>()?;
+            // `SPM -> SortExec`, or `SPM -> ProjectionExec -> SortExec`: DataFusion 55 plans the
+            // latter for any ORDER BY whose SELECT list reorders or computes columns (the
+            // projection stays above the per-partition sorts). The pair is replaced by one
+            // MetalExec sort, and the projection is put back above it.
+            let (sort_node, proj) = if spm.input().downcast_ref::<SortExec>().is_some() {
+                (Arc::clone(spm.input()), None)
+            } else {
+                let p = spm.input().downcast_ref::<ProjectionExec>()?;
+                p.input().downcast_ref::<SortExec>()?;
+                (Arc::clone(p.input()), Some(Arc::clone(spm.input())))
+            };
+            let sort = sort_node.downcast_ref::<SortExec>()?;
             if !self.config.sort {
-                return Some(Candidate { op: Err("sort disabled in config".into()), input: Arc::clone(spm.input()) });
+                return Some(Candidate::new(Err("sort disabled in config".into()), Arc::clone(sort.input())));
             }
-            if sort.expr() != spm.expr() {
-                return Some(Candidate {
-                    op: Err("merge ordering differs from the sort's".into()),
-                    input: Arc::clone(sort.input()),
-                });
+            let same_order = match &proj {
+                None => sort.expr() == spm.expr(),
+                Some(p) => {
+                    let p = p.downcast_ref::<ProjectionExec>()?;
+                    let mapped = map_through_projection(spm.expr(), p);
+                    mapped.is_some() && mapped == sort_keys(sort.expr())
+                }
+            };
+            if !same_order {
+                return Some(Candidate::new(
+                    Err("merge ordering differs from the sort's".into()),
+                    Arc::clone(sort.input()),
+                ));
             }
             let fetch = match (spm.fetch(), sort.fetch()) {
                 (Some(a), Some(b)) => Some(a.min(b)),
@@ -178,29 +229,34 @@ impl ArrowMetalRule {
             };
             let input = Arc::clone(sort.input());
             let op = translate::sort_op(sort.expr(), &input.schema(), fetch);
-            return Some(Candidate { op, input });
+            let mut c = Candidate::new(op, input);
+            if proj.is_some() {
+                // The fallback is the merge over the sorts, without the projection (which stays).
+                c.original = Some(Arc::new(
+                    SortPreservingMergeExec::new(sort.expr().clone(), Arc::clone(&sort_node)).with_fetch(fetch),
+                ));
+                c.reparent = proj;
+            }
+            return Some(c);
         }
         if let Some(sort) = node.downcast_ref::<SortExec>() {
             let input = Arc::clone(sort.input());
             if !self.config.sort {
-                return Some(Candidate { op: Err("sort disabled in config".into()), input });
+                return Some(Candidate::new(Err("sort disabled in config".into()), input));
             }
             if sort.preserve_partitioning() && input.output_partitioning().partition_count() > 1 {
-                return Some(Candidate {
-                    op: Err("per-partition sort (preserve_partitioning) with no replaced merge above it".into()),
-                    input,
-                });
+                return Some(Candidate::new(Err("per-partition sort (preserve_partitioning) with no replaced merge above it".into()), input));
             }
             let op = translate::sort_op(sort.expr(), &input.schema(), sort.fetch());
-            return Some(Candidate { op, input });
+            return Some(Candidate::new(op, input));
         }
         if let Some(agg) = node.downcast_ref::<AggregateExec>() {
             if !self.config.aggregate {
-                return Some(Candidate { op: Err("aggregate disabled in config".into()), input: Arc::clone(agg.input()) });
+                return Some(Candidate::new(Err("aggregate disabled in config".into()), Arc::clone(agg.input())));
             }
             return Some(match agg.mode() {
                 AggregateMode::Single | AggregateMode::SinglePartitioned => {
-                    Candidate { op: translate::aggregate_op(agg), input: Arc::clone(agg.input()) }
+                    Candidate::new(translate::aggregate_op(agg), Arc::clone(agg.input()))
                 }
                 AggregateMode::Final | AggregateMode::FinalPartitioned => {
                     // Walk down through the exchange to the Partial that feeds this Final; the pair
@@ -218,41 +274,29 @@ impl ArrowMetalRule {
                     }
                     match cur.downcast_ref::<AggregateExec>() {
                         Some(p) if *p.mode() == AggregateMode::Partial && translate::same_aggregates(agg, p) => {
-                            Candidate { op: translate::aggregate_op(p), input: Arc::clone(p.input()) }
+                            Candidate::new(translate::aggregate_op(p), Arc::clone(p.input()))
                         }
-                        _ => Candidate {
-                            op: Err("Final aggregate without a matching Partial below its exchange".into()),
-                            input: Arc::clone(agg.input()),
-                        },
+                        _ => Candidate::new(Err("Final aggregate without a matching Partial below its exchange".into()), Arc::clone(agg.input())),
                     }
                 }
-                AggregateMode::Partial => Candidate {
-                    op: Err("Partial aggregate whose Final was not replaced".into()),
-                    input: Arc::clone(agg.input()),
-                },
-                AggregateMode::PartialReduce => Candidate {
-                    op: Err("PartialReduce aggregate".into()),
-                    input: Arc::clone(agg.input()),
-                },
+                AggregateMode::Partial => Candidate::new(Err("Partial aggregate whose Final was not replaced".into()), Arc::clone(agg.input())),
+                AggregateMode::PartialReduce => Candidate::new(Err("PartialReduce aggregate".into()), Arc::clone(agg.input())),
             });
         }
         if let Some(f) = node.downcast_ref::<FilterExec>() {
             let input = Arc::clone(f.input());
             if !self.config.filter {
-                return Some(Candidate { op: Err("filter disabled in config".into()), input });
+                return Some(Candidate::new(Err("filter disabled in config".into()), input));
             }
             if node.fetch().is_some() {
-                return Some(Candidate { op: Err("filter with a fetch limit".into()), input });
+                return Some(Candidate::new(Err("filter with a fetch limit".into()), input));
             }
             if node.output_ordering().is_some() && input.output_partitioning().partition_count() > 1 {
-                return Some(Candidate {
-                    op: Err("order-preserving filter over several partitions".into()),
-                    input,
-                });
+                return Some(Candidate::new(Err("order-preserving filter over several partitions".into()), input));
             }
             let projection = f.projection().as_ref().map(|p| p.iter().copied().collect::<Vec<usize>>());
             let op = translate::filter_op(f.predicate(), &input.schema(), projection);
-            return Some(Candidate { op, input });
+            return Some(Candidate::new(op, input));
         }
         None
     }
@@ -278,7 +322,9 @@ impl ArrowMetalRule {
         }
     }
 
-    fn visit(&self, node: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
+    /// `top` is the node under the root's chain of projections (by address): nothing above it
+    /// requires a distribution, so a replacement there keeps MetalExec's single output partition.
+    fn visit(&self, node: Arc<dyn ExecutionPlan>, top: usize) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
         if node.downcast_ref::<MetalExec>().is_some() {
             return Ok(Transformed::no(node));
         }
@@ -293,9 +339,13 @@ impl ArrowMetalRule {
             }
         };
         // Keep the replaced node's partition count, so every parent's distribution requirement
-        // (fixed by EnsureRequirements before this rule runs) still holds.
+        // (fixed by EnsureRequirements before this rule runs) still holds. At the top of the plan
+        // (only projections above) there is no such requirement: re-partitioning the output there
+        // would only hash every result row to split it, for `collect` to merge it again.
+        let at_top = Arc::as_ptr(&node) as *const () as usize == top;
         let wrap = match node.output_partitioning() {
             p if p.partition_count() <= 1 => None,
+            _ if at_top => None,
             Partitioning::Hash(exprs, n) => Some(Partitioning::Hash(exprs.clone(), *n)),
             Partitioning::RoundRobinBatch(n) | Partitioning::UnknownPartitioning(n) => {
                 Some(Partitioning::RoundRobinBatch(*n))
@@ -320,9 +370,20 @@ impl ArrowMetalRule {
             self.record(&node, false, size);
             return Ok(Transformed::no(node));
         }
-        let metal: Arc<dyn ExecutionPlan> =
-            Arc::new(MetalExec::new(op, input, Arc::clone(&node), Arc::clone(&self.log)));
+        let original = c.original.unwrap_or_else(|| Arc::clone(&node));
+        let metal: Arc<dyn ExecutionPlan> = Arc::new(MetalExec::new(op, input, original, Arc::clone(&self.log)));
         let mut reason = size;
+        if at_top && node.output_partitioning().partition_count() > 1 {
+            reason.push_str("; output kept at one partition (only projections above it)");
+        }
+        let metal = match c.reparent {
+            #[allow(deprecated)] // `replace_children` is the 55 name; `with_new_children` still works
+            Some(p) => {
+                reason.push_str("; projection kept above it");
+                p.with_new_children(vec![metal])?
+            }
+            None => metal,
+        };
         let out: Arc<dyn ExecutionPlan> = match wrap {
             None => metal,
             Some(p) => {
@@ -337,7 +398,13 @@ impl ArrowMetalRule {
 
 impl PhysicalOptimizerRule for ArrowMetalRule {
     fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _config: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(plan.transform_down(|n| self.visit(n))?.data)
+        let mut top = Arc::clone(&plan);
+        while let Some(p) = top.downcast_ref::<ProjectionExec>() {
+            let next = Arc::clone(p.input());
+            top = next;
+        }
+        let top = Arc::as_ptr(&top) as *const () as usize;
+        Ok(plan.transform_down(|n| self.visit(n, top))?.data)
     }
 
     fn name(&self) -> &str {

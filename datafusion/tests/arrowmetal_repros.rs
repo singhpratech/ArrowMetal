@@ -26,46 +26,48 @@ fn group_by(aggs: &str) -> String {
     format!(r#"{{"op":"group_by","keys":[["k","(col \"k\")"]],"aggs":[{aggs}],"input":{{"op":"scan","source":"t"}}}}"#)
 }
 
-/// ArrowMetal defect. `count(v)` over a Float64 column errors whenever the group-by also has
-/// another aggregate over it that the fused kernel cannot take (sum/min/max/mean over Float64):
-/// the whole group-by then runs per aggregate (`Executor.aggregateOne`), whose `count` case sends
-/// Float64 to `GroupBy.count(MetalArray<Double>)`, which throws at Kernels/GroupBy.swift:200.
-/// `count(v)` alone and `sum(v)` alone both work.
+fn as_i64(a: &ArrayRef) -> Vec<i64> {
+    let a = arrow::compute::cast(a, &arrow::datatypes::DataType::Int64).unwrap();
+    a.as_primitive::<Int64Type>().values().to_vec()
+}
+
+/// Fixed in the core (a387a2a). `count(v)` over a Float64 column next to another Float64 aggregate
+/// (sum/min/max/mean, which send the group-by down the per-aggregate path) used to throw "group-by
+/// over Float64 values: cast to Float32 first". It now counts the non-null values, as SQL does.
 #[test]
-fn count_over_float64_next_to_a_float64_aggregate_errors() {
+fn count_over_float64_next_to_a_float64_aggregate() {
     let k: ArrayRef = Arc::new(Int32Array::from(vec![0, 1, 0, 1]));
-    let v: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0]));
+    let v: ArrayRef = Arc::new(Float64Array::from(vec![Some(1.0), Some(2.0), None, Some(4.0)]));
     let s = src(vec![("k", k), ("v", v)]);
     let c = r#"(col \"v\")"#;
-    for alone in [format!(r#"["count","n","{c}"]"#), format!(r#"["sum","a","{c}"]"#)] {
-        assert!(run_plan(&group_by(&alone), &[&s], true).is_ok(), "{alone}");
-    }
     for other in ["sum", "min", "max", "mean"] {
         let aggs = format!(r#"["{other}","a","{c}"],["count","n","{c}"]"#);
-        let err = run_plan(&group_by(&aggs), &[&s], true).unwrap_err();
-        assert!(err.message().contains("group-by over Float64 values: cast to Float32 first"), "{other}: {err}");
+        let out = run_plan(&group_by(&aggs), &[&s], true).unwrap_or_else(|e| panic!("{other}: {e}"));
+        let keys = as_i64(&out.column(0).unwrap().to_arrow().unwrap());
+        let n = as_i64(&out.column(2).unwrap().to_arrow().unwrap());
+        let mut got: Vec<(i64, i64)> = keys.into_iter().zip(n).collect();
+        got.sort();
+        assert_eq!(got, vec![(0, 1), (1, 2)], "{other}");
     }
 }
 
-/// ArrowMetal defect. `count(s)` over a utf8 column with nulls: alone it is rejected; next to a
-/// Float64 `sum` (per-aggregate path) it returns the row count, nulls included — a wrong answer,
-/// not an error: `Executor.aggregateOne`'s `count` falls to `default: gb.count()` for any type it
-/// does not list. SQL's count(s) below is 2.
+/// Fixed in the core (a387a2a). `count(s)` over utf8 with nulls used to be rejected alone, and next
+/// to a Float64 `sum` (per-aggregate path) it counted the null rows (4, a silent wrong answer).
+/// Both paths now give SQL's 2.
 #[test]
-fn count_over_utf8_is_rejected_alone_and_counts_nulls_on_the_per_aggregate_path() {
+fn count_over_utf8_counts_non_null_values_on_every_path() {
     let k: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 1, 1, 1]));
     let s: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None, Some("b"), None]));
     let v: ArrayRef = Arc::new(Float64Array::from(vec![1.0f64, 2.0, 3.0, 4.0]));
     let source = src(vec![("k", k), ("s", s), ("v", v)]);
-    let err = run_plan(&group_by(r#"["count","n","(col \"s\")"]"#), &[&source], true).unwrap_err();
-    assert!(err.message().contains("group_by count of a utf8 expression"), "{err}");
+    let out = run_plan(&group_by(r#"["count","n","(col \"s\")"]"#), &[&source], true).unwrap();
+    assert_eq!(as_i64(&out.column(1).unwrap().to_arrow().unwrap()), vec![2], "alone");
 
     let out = run_plan(&group_by(r#"["count","n","(col \"s\")"],["sum","t","(col \"v\")"]"#), &[&source], true)
         .unwrap();
-    let n = out.column(1).unwrap().to_arrow().unwrap();
-    assert_eq!(n.as_primitive::<Int64Type>().value(0), 4, "ArrowMetal counts the two null rows");
+    assert_eq!(as_i64(&out.column(1).unwrap().to_arrow().unwrap()), vec![2], "next to a Float64 sum");
 
-    // The workaround the crate uses: sum of a validity indicator.
+    // What the crate sends instead (kept; see src/gpu.rs): sum of a validity indicator.
     let out = run_plan(
         &group_by(r#"["sum","n","(if_else (is_valid (col \"s\")) (i64 1) (i64 0))"],["sum","t","(col \"v\")"]"#),
         &[&source],
@@ -118,12 +120,15 @@ fn fused_division_keeps_the_sign_of_zero() {
     assert_eq!((p.value(0), p.value(1), p.value(2)), (f64::INFINITY, f64::NEG_INFINITY, 0.5));
 }
 
-/// The plan runner rejects a group_by with no aggregates (a DISTINCT); the crate adds a row count
-/// and drops it.
+/// The plan runner used to reject a group_by with no aggregates (a DISTINCT); on the current core it
+/// returns the distinct keys. The crate still adds a row count and drops it.
 #[test]
-fn group_by_needs_an_aggregate() {
+fn group_by_without_aggregates_returns_the_distinct_keys() {
     let k: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 1, 2]));
     let s = src(vec![("k", k)]);
-    let err = run_plan(&group_by(""), &[&s], true).unwrap_err();
-    assert!(err.message().contains("at least one aggregation"), "{err}");
+    let out = run_plan(&group_by(""), &[&s], true).unwrap();
+    assert_eq!(out.column_count(), 1);
+    let mut got = as_i64(&out.column(0).unwrap().to_arrow().unwrap());
+    got.sort();
+    assert_eq!(got, vec![1, 2]);
 }

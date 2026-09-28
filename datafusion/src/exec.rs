@@ -14,7 +14,7 @@ use datafusion::execution::TaskContext;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     collect, DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
@@ -241,28 +241,44 @@ impl ExecutionPlan for MetalExec {
         };
         let mut stream = source.execute(0, Arc::clone(&ctx))?;
 
+        // Where the time goes (EXPLAIN ANALYZE shows these): waiting for and collecting the input
+        // stream (includes the upstream operators' own work), concatenating it into one batch, and
+        // the GPU call split into import / plan run / export.
+        let m = |name: &'static str| MetricBuilder::new(&self.metrics).subset_time(name, partition);
+        let (input_time, concat_time) = (m("input_time"), m("concat_time"));
+        let (import_time, kernel_time, export_time) = (m("import_time"), m("kernel_time"), m("export_time"));
+        let input_batches = MetricBuilder::new(&self.metrics).counter("input_batches", partition);
+
         let out_schema = Arc::clone(&schema);
         let fut = async move {
             let reservation = MemoryConsumer::new("MetalExec").register(ctx.memory_pool());
             let mut batches = Vec::new();
+            let t = std::time::Instant::now();
             while let Some(b) = stream.next().await {
                 let b = b?;
                 reservation.try_grow(b.get_array_memory_size())?;
                 batches.push(b);
             }
+            input_time.add_duration(t.elapsed());
+            input_batches.add(batches.len());
             let in_schema = input.schema();
+            let t = std::time::Instant::now();
             let one = concat_batches(&in_schema, &batches)?;
+            concat_time.add_duration(t.elapsed());
             reservation.try_grow(one.get_array_memory_size())?;
             drop(batches);
 
             let op2 = op.clone();
             let s2 = Arc::clone(&out_schema);
-            let (res, one) = tokio::task::spawn_blocking(move || {
+            let (res, one, times) = tokio::task::spawn_blocking(move || {
                 let r = crate::gpu::run(&op2, &one, &s2);
-                (r, one)
+                (r, one, crate::gpu::take_times())
             })
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            import_time.add_duration(times.import);
+            kernel_time.add_duration(times.kernel);
+            export_time.add_duration(times.export);
 
             let out: Vec<RecordBatch> = match res {
                 Ok(b) => {

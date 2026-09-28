@@ -19,6 +19,7 @@ static GPU: Mutex<()> = Mutex::new(());
 
 pub(crate) fn run(op: &MetalOp, input: &RecordBatch, out_schema: &SchemaRef) -> Result<RecordBatch, String> {
     let _guard = GPU.lock().unwrap_or_else(|p| p.into_inner());
+    take_times();
     if input.num_rows() == 0 {
         // A sort, a filter and a grouped aggregate of nothing are all empty.
         return Ok(RecordBatch::new_empty(out_schema.clone()));
@@ -104,6 +105,28 @@ fn select_all(n: usize, input: String) -> String {
     format!(r#"{{"op":"select","exprs":[{}],"input":{input}}}"#, exprs.join(","))
 }
 
+/// Where one [`run`] spent its time: importing the input into Metal memory, the plan runner, and
+/// exporting the result. Read with [`take_times`] on the thread that called `run`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct GpuTimes {
+    pub import: std::time::Duration,
+    pub kernel: std::time::Duration,
+    pub export: std::time::Duration,
+}
+
+thread_local! {
+    static TIMES: std::cell::Cell<GpuTimes> = const { std::cell::Cell::new(GpuTimes {
+        import: std::time::Duration::ZERO,
+        kernel: std::time::Duration::ZERO,
+        export: std::time::Duration::ZERO,
+    }) };
+}
+
+/// The split of the last [`run`] on this thread, and resets it.
+pub(crate) fn take_times() -> GpuTimes {
+    TIMES.with(|t| t.replace(GpuTimes::default()))
+}
+
 /// Imports the columns (all of them, or `only`), runs `plan`, exports every output column.
 fn run_plan(plan: &str, input: &RecordBatch, only: Option<&[usize]>) -> Result<Vec<ArrayRef>, String> {
     let e = |x: arrowmetal::Error| x.message().to_string();
@@ -111,16 +134,28 @@ fn run_plan(plan: &str, input: &RecordBatch, only: Option<&[usize]>) -> Result<V
         Some(o) => o.to_vec(),
         None => (0..input.num_columns()).collect(),
     };
+    let t0 = std::time::Instant::now();
     let mut cols = Vec::with_capacity(wanted.len());
     for &i in &wanted {
         cols.push((format!("c{i}"), arrowmetal::Array::from_arrow(input.column(i).as_ref()).map_err(e)?));
     }
     let src = arrowmetal::Source::new("t", cols).map_err(e)?;
+    let t1 = std::time::Instant::now();
     let out = arrowmetal::run_plan(plan, &[&src], true)
         .map_err(|x| format!("{} [rows {}; plan {plan}]", x.message(), input.num_rows()))?;
-    (0..out.column_count())
+    let t2 = std::time::Instant::now();
+    let cols = (0..out.column_count())
         .map(|i| out.column(i).and_then(|a| a.to_arrow()).map_err(e))
-        .collect()
+        .collect();
+    let t3 = std::time::Instant::now();
+    TIMES.with(|t| {
+        let mut v = t.get();
+        v.import += t1 - t0;
+        v.kernel += t2 - t1;
+        v.export += t3 - t2;
+        t.set(v);
+    });
+    cols
 }
 
 /// Casts each column to the type DataFusion's schema says (a no-op when it already matches).
