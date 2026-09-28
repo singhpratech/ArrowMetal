@@ -361,7 +361,13 @@ public final class BufferPool: @unchecked Sendable {
     public let limitBytes: Int
     private let lock = NSLock()
     private var free: [Int: [MTLBuffer]] = [:]
-    private var order: [Int] = []          // lengths in insertion order for eviction
+    // Lengths in insertion order for eviction, read from `head`. `take` leaves its entry behind, so
+    // entries can outnumber the pooled buffers; `compactOrder` drops the stale ones once they do by 4x
+    // and the evicted prefix once it is most of the array. It used `removeFirst()` on an array that
+    // only grew, which a long process paid for in memmove on every eviction.
+    private var order: [Int] = []
+    private var head = 0
+    private var pooledCount = 0
     public private(set) var pooledBytes = 0
 
     init(limitBytes: Int) { self.limitBytes = limitBytes }
@@ -371,7 +377,23 @@ public final class BufferPool: @unchecked Sendable {
         guard var list = free[length], let b = list.popLast() else { return nil }
         free[length] = list.isEmpty ? nil : list
         pooledBytes -= length
+        pooledCount -= 1
         return b
+    }
+
+    /// Keeps, per length, only the newest entries, as many as that length has pooled buffers, in order.
+    private func compactOrder() {
+        var need = free.mapValues(\.count)
+        var kept: [Int] = []
+        kept.reserveCapacity(pooledCount)
+        var i = order.count - 1
+        while i >= head {
+            let len = order[i]
+            if let n = need[len], n > 0 { kept.append(len); need[len] = n - 1 }
+            i -= 1
+        }
+        order = kept.reversed()
+        head = 0
     }
 
     /// Buffers returned while a batch is open; they may still be referenced by pending GPU work.
@@ -390,21 +412,25 @@ public final class BufferPool: @unchecked Sendable {
         if let ctx = context, ctx.openBatches.value > 0 { parked.append(b); return }
         let len = b.length
         if len > limitBytes { return }
-        while pooledBytes + len > limitBytes, let evictLen = order.first {
-            order.removeFirst()
+        while pooledBytes + len > limitBytes, head < order.count {
+            let evictLen = order[head]
+            head += 1
             if var list = free[evictLen], let _ = list.popLast() {
                 free[evictLen] = list.isEmpty ? nil : list
                 pooledBytes -= evictLen
+                pooledCount -= 1
             }
         }
         free[len, default: []].append(b)
         order.append(len)
         pooledBytes += len
+        pooledCount += 1
+        if order.count - head > 4 * pooledCount + 1024 || head > 4096 && head > order.count / 2 { compactOrder() }
     }
 
     /// Releases every pooled buffer back to the OS.
     public func drain() {
         lock.lock(); defer { lock.unlock() }
-        free.removeAll(); order.removeAll(); pooledBytes = 0
+        free.removeAll(); order.removeAll(); head = 0; pooledCount = 0; pooledBytes = 0
     }
 }

@@ -24,6 +24,10 @@
   other type. `am_group_agg_ex` op 2 (`hash_count`) takes every type, as the header states; it rejected
   utf8, binary, decimal, dictionary and nested columns. The fused stream join aggregate's `count` takes
   a column of any type.
+- The buffer pool's eviction order no longer grows with every reuse of a pooled buffer. `take` left
+  its entry behind and eviction removed the first element of that array, so a long process spent more
+  time copying it with every eviction: 20,000 evictions after 300,000 reuses took 7.0 s and take 1.3 s
+  now, most of it the reuses.
 
 ## 0.3.0 — 2026-09-26
 Everything below is new in 0.3.0. `MetalEngine()` decides per subtree from measured crossovers: in the
