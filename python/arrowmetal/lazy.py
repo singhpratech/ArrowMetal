@@ -360,7 +360,7 @@ def _as_named(items, kwargs=None):
     return out
 
 
-def _as_sort_keys(by, descending):
+def _as_sort_keys(by, descending, null_placement="at_end", float_order="ieee"):
     if isinstance(by, str):
         by = [by]
     by = list(by)
@@ -369,7 +369,28 @@ def _as_sort_keys(by, descending):
     descending = list(descending)
     if len(descending) != len(by):
         raise _ArrowMetalError(f"sort: {len(descending)} descending flags for {len(by)} keys")
-    return [[b, bool(d)] for b, d in zip(by, descending)]
+
+    def per_key(v, what, allowed):
+        vs = [v] * len(by) if isinstance(v, str) else list(v)
+        if len(vs) != len(by):
+            raise _ArrowMetalError(f"sort: {len(vs)} {what} entries for {len(by)} keys")
+        for x in vs:
+            if x not in allowed:
+                raise _ArrowMetalError(f"sort: unknown {what} {x!r}; expected one of {allowed}")
+        return vs
+
+    places = per_key(null_placement, "null_placement", ["at_end", "at_start"])
+    orders = per_key(float_order, "float_order", ["ieee", "total"])
+    keys = []
+    for b, d, p, f in zip(by, descending, places, orders):
+        # A key with both options at their defaults stays a plain pair: the plan is the one it always was.
+        opts = {}
+        if p == "at_start":
+            opts["nulls"] = "first"
+        if f == "total":
+            opts["float_order"] = "total"
+        keys.append([b, bool(d), opts] if opts else [b, bool(d)])
+    return keys
 
 
 # --------------------------------------------------------------------------------------------------
@@ -450,8 +471,12 @@ class LazyFrame:
 
     # -- ordering and slicing
 
-    def sort(self, by, descending=False):
-        return self._with({"op": "sort", "input": self._plan, "by": _as_sort_keys(by, descending)})
+    def sort(self, by, descending=False, null_placement="at_end", float_order="ieee"):
+        """Sorts by one or more columns. `descending`, `null_placement` ("at_end" / "at_start") and
+        `float_order` ("ieee" / "total", see `MetalArray.argsort`) are each one value for every key or a
+        list with one per key. A single key with a `limit` after it runs as a GPU top-k."""
+        return self._with({"op": "sort", "input": self._plan,
+                           "by": _as_sort_keys(by, descending, null_placement, float_order)})
 
     def limit(self, n):
         return self._with({"op": "limit", "input": self._plan, "count": int(n), "offset": 0})

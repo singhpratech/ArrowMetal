@@ -1,0 +1,142 @@
+group,tag,op,rows,wall_ms
+default,before,argsort int64,1000000,0.942
+default,after,argsort int64,1000000,0.968
+default,before,argsort float64,1000000,0.962
+default,after,argsort float64,1000000,0.968
+default,before,argsort float32,1000000,0.584
+default,after,argsort float32,1000000,0.571
+default,before,argsort utf8 (1000 distinct),1000000,0.753
+default,after,argsort utf8 (1000 distinct),1000000,0.751
+default,before,argsort float64 (10% nulls),1000000,1.055
+default,after,argsort float64 (10% nulls),1000000,1.042
+default,before,sort float64 (sorted copy),1000000,1.515
+default,after,sort float64 (sorted copy),1000000,1.514
+default,before,lexsort int32 + float64,1000000,2.42
+default,after,lexsort int32 + float64,1000000,2.578
+default,before,top_k int64 (k=100),1000000,0.689
+default,after,top_k int64 (k=100),1000000,0.716
+default,before,top_k float64 (k=100),1000000,1.238
+default,after,top_k float64 (k=100),1000000,1.169
+default,before,plan sort by int64,1000000,1.543
+default,after,plan sort by int64,1000000,1.574
+default,before,plan sort by float64,1000000,1.616
+default,after,plan sort by float64,1000000,1.557
+default,before,plan top-100 float64 desc,1000000,0.697
+default,after,plan top-100 float64 desc,1000000,0.734
+option,after,argsort float64 total,1000000,1.411
+option,after,argsort float64 desc total nulls first (10% nulls),1000000,1.242
+option,after,sort float64 total (sorted copy),1000000,1.258
+option,after,top_k float64 desc total nulls first (k=100),1000000,0.33
+option,after,"top_k float64 desc total nulls first (k=100, 10% nulls)",1000000,0.003
+plan,before:helper,float64 asc,1000000,2.882
+plan,after:helper,float64 asc,1000000,2.955
+plan,after:option,float64 asc,1000000,1.98
+plan,before:helper,float64 desc nulls first,1000000,4.658
+plan,after:helper,float64 desc nulls first,1000000,4.648
+plan,after:option,float64 desc nulls first,1000000,2.384
+plan,before:helper,float64 desc nulls first top-100,1000000,4.709
+plan,after:helper,float64 desc nulls first top-100,1000000,4.714
+plan,after:option,float64 desc nulls first top-100,1000000,0.529
+plan,before:helper,float64 asc (10% nulls),1000000,3.953
+plan,after:helper,float64 asc (10% nulls),1000000,3.793
+plan,after:option,float64 asc (10% nulls),1000000,2.09
+plan,before:helper,float64 desc nulls first (10% nulls),1000000,4.325
+plan,after:helper,float64 desc nulls first (10% nulls),1000000,4.214
+plan,after:option,float64 desc nulls first (10% nulls),1000000,1.633
+plan,before:helper,float64 desc nulls first top-100 (10% nulls),1000000,3.879
+plan,after:helper,float64 desc nulls first top-100 (10% nulls),1000000,3.767
+plan,after:option,float64 desc nulls first top-100 (10% nulls),1000000,0.191
+default,before,argsort int64,10000000,7.498
+default,after,argsort int64,10000000,7.481
+default,before,argsort float64,10000000,7.438
+default,after,argsort float64,10000000,7.428
+default,before,argsort float32,10000000,2.828
+default,after,argsort float32,10000000,2.84
+default,before,argsort utf8 (1000 distinct),10000000,3.785
+default,after,argsort utf8 (1000 distinct),10000000,3.756
+default,before,argsort float64 (10% nulls),10000000,7.386
+default,after,argsort float64 (10% nulls),10000000,7.371
+default,before,sort float64 (sorted copy),10000000,7.899
+default,after,sort float64 (sorted copy),10000000,7.836
+default,before,lexsort int32 + float64,10000000,11.329
+default,after,lexsort int32 + float64,10000000,11.346
+default,before,top_k int64 (k=100),10000000,0.731
+default,after,top_k int64 (k=100),10000000,0.733
+default,before,top_k float64 (k=100),10000000,1.248
+default,after,top_k float64 (k=100),10000000,1.22
+default,before,plan sort by int64,10000000,11.858
+default,after,plan sort by int64,10000000,11.859
+default,before,plan sort by float64,10000000,11.846
+default,after,plan sort by float64,10000000,11.812
+default,before,plan top-100 float64 desc,10000000,1.351
+default,after,plan top-100 float64 desc,10000000,1.331
+option,after,argsort float64 total,10000000,7.398
+option,after,argsort float64 desc total nulls first (10% nulls),10000000,7.55
+option,after,sort float64 total (sorted copy),10000000,6.161
+option,after,top_k float64 desc total nulls first (k=100),10000000,1.806
+option,after,"top_k float64 desc total nulls first (k=100, 10% nulls)",10000000,0.002
+plan,before:helper,float64 asc,10000000,16.639
+plan,after:helper,float64 asc,10000000,16.16
+plan,after:option,float64 asc,10000000,12.037
+plan,before:helper,float64 desc nulls first,10000000,23.281
+plan,after:helper,float64 desc nulls first,10000000,23.615
+plan,after:option,float64 desc nulls first,10000000,12.14
+plan,before:helper,float64 desc nulls first top-100,10000000,23.055
+plan,after:helper,float64 desc nulls first top-100,10000000,22.82
+plan,after:option,float64 desc nulls first top-100,10000000,1.665
+plan,before:helper,float64 asc (10% nulls),10000000,16.982
+plan,after:helper,float64 asc (10% nulls),10000000,16.856
+plan,after:option,float64 asc (10% nulls),10000000,11.909
+plan,before:helper,float64 desc nulls first (10% nulls),10000000,25.089
+plan,after:helper,float64 desc nulls first (10% nulls),10000000,25.694
+plan,after:option,float64 desc nulls first (10% nulls),10000000,12.654
+plan,before:helper,float64 desc nulls first top-100 (10% nulls),10000000,25.34
+plan,after:helper,float64 desc nulls first top-100 (10% nulls),10000000,25.778
+plan,after:option,float64 desc nulls first top-100 (10% nulls),10000000,0.193
+default,before,argsort int64,50000000,39.41
+default,after,argsort int64,50000000,39.898
+default,before,argsort float64,50000000,38.118
+default,after,argsort float64,50000000,38.045
+default,before,argsort float32,50000000,13.955
+default,after,argsort float32,50000000,14.03
+default,before,argsort utf8 (1000 distinct),50000000,19.211
+default,after,argsort utf8 (1000 distinct),50000000,18.504
+default,before,argsort float64 (10% nulls),50000000,39.874
+default,after,argsort float64 (10% nulls),50000000,38.906
+default,before,sort float64 (sorted copy),50000000,41.755
+default,after,sort float64 (sorted copy),50000000,41.281
+default,before,lexsort int32 + float64,50000000,64.71
+default,after,lexsort int32 + float64,50000000,63.96
+default,before,top_k int64 (k=100),50000000,2.35
+default,after,top_k int64 (k=100),50000000,2.308
+default,before,top_k float64 (k=100),50000000,4.233
+default,after,top_k float64 (k=100),50000000,4.259
+default,before,plan sort by int64,50000000,68.832
+default,after,plan sort by int64,50000000,69.35
+default,before,plan sort by float64,50000000,68.252
+default,after,plan sort by float64,50000000,68.267
+default,before,plan top-100 float64 desc,50000000,4.721
+default,after,plan top-100 float64 desc,50000000,4.591
+option,after,argsort float64 total,50000000,39.926
+option,after,argsort float64 desc total nulls first (10% nulls),50000000,40.343
+option,after,sort float64 total (sorted copy),50000000,31.001
+option,after,top_k float64 desc total nulls first (k=100),50000000,3.837
+option,after,"top_k float64 desc total nulls first (k=100, 10% nulls)",50000000,0.004
+plan,before:helper,float64 asc,50000000,98.264
+plan,after:helper,float64 asc,50000000,99.441
+plan,after:option,float64 asc,50000000,71.407
+plan,before:helper,float64 desc nulls first,50000000,150.719
+plan,after:helper,float64 desc nulls first,50000000,150.823
+plan,after:option,float64 desc nulls first,50000000,72.643
+plan,before:helper,float64 desc nulls first top-100,50000000,151.294
+plan,after:helper,float64 desc nulls first top-100,50000000,151.476
+plan,after:option,float64 desc nulls first top-100,50000000,3.077
+plan,before:helper,float64 asc (10% nulls),50000000,108.93
+plan,after:helper,float64 asc (10% nulls),50000000,109.778
+plan,after:option,float64 asc (10% nulls),50000000,75.534
+plan,before:helper,float64 desc nulls first (10% nulls),50000000,169.539
+plan,after:helper,float64 desc nulls first (10% nulls),50000000,170.243
+plan,after:option,float64 desc nulls first (10% nulls),50000000,76.237
+plan,before:helper,float64 desc nulls first top-100 (10% nulls),50000000,170.446
+plan,after:helper,float64 desc nulls first top-100 (10% nulls),50000000,170.902
+plan,after:option,float64 desc nulls first top-100 (10% nulls),50000000,0.194

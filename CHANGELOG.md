@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+- Sort options per key: the null placement (`nulls` first or last, in either direction) and the float
+  order. `float_order="ieee"` is the order every sort has used (Arrow C++'s: -0.0 ties +0.0, NaN next to
+  the nulls) and stays the default, unchanged. `float_order="total"` is IEEE 754 totalOrder, the order
+  arrow-rs and DataFusion use (-NaN < -inf < … < -0.0 < +0.0 < … < +inf < +NaN; descending is the
+  exact mirror). Both are part of the radix sort's key map and null partition, so neither adds a key or
+  a pass; a single-key sort followed by a limit stays a GPU top-k with either option.
+  - Swift: `argsort` / `sorted` / `topK(_:largest:nullPlacement:floatOrder:)`, `argsortIndices`,
+    `sortedValues`, `lexsortIndices(_:descending:nullPlacements:floatOrders:)`,
+    `MetalRecordBatch.sorted(by: [SortKey])`, and `SortKey(_:descending:nullsFirst:floatOrder:)`.
+  - C ABI: `am_argsort_ex2`, `am_sort_ex2`, `am_top_k_ex`, `am_lexsort_ex2` (per-key arrays). The
+    existing entry points are unchanged.
+  - Plan grammar: a `sort` key may be `[column, descending, {"nulls": "first", "float_order":
+    "total"}]` or `{"column": …, "descending": …, "nulls": …, "float_order": …}`, and the `sort` node may
+    carry `nulls` / `float_order` defaults. A `[column, descending]` key parses and runs as before.
+  - Python: `float_order=` on `MetalArray.argsort` / `sort`, `null_placement=` and `float_order=` on
+    `top_k`, per-key lists on `lexsort_indices`, and `null_placement=` / `float_order=` on the lazy
+    `sort`. Rust: `Array::argsort_with` / `sort_with` / `top_k_with`, `arrowmetal::lexsort`, and
+    `SortOptions` (with `From<arrow::compute::SortOptions>`, which selects totalOrder). Go, Node and R
+    do not expose the options yet.
+  - Measured on an M4 Max with `Benchmarks/sort_options_bench.py`: the builds before and after, in
+    one process and timed alternately, best of five
+    (`Benchmarks/results/sort_options_2026-09-28.csv`). With no options, every sort entry point stays
+    within 1.5% of the previous build at 10M and 50M rows (argsort of int64 / float64 / float32 / utf8,
+    the sorted copy, a two-key lexsort, top-k, and plan sorts). At 1M rows the rows differ by up to
+    6.5% in either direction (a two-key lexsort 2.42 → 2.58 ms, float64 top-k 1.24 → 1.17 ms).
+  - A float64 key in arrow-rs order through the plan runner, 50M rows, as one key with the options
+    against the same order written with helper keys (`with_columns` adding an is-null key, a NaN key
+    and a signed-zero key, then a sort over them): ascending 71.4 ms against 98.3 ms; descending with
+    nulls first 72.6 ms against 150.7 ms; descending with nulls first and `limit 100` 3.1 ms against
+    151.3 ms, because the one-key form stays a top-k. With 10% nulls: 75.5 / 76.2 / 0.19 ms against
+    108.9 / 169.5 / 170.4 ms. The one-key totalOrder sort costs what the int64 sort costs (69.4 ms). A
+    float64 sorted copy in totalOrder takes 31.0 ms against 41.3 ms in IEEE order: the totalOrder key
+    map is invertible for every value, so no row is gathered.
+
 - `count(expr)` in a plan's `group_by` is the number of non-null values of `expr` in each group for a
   column of every Arrow type, read from its validity bitmap alone. It had two wrong results when another
   aggregate of the same `group_by` took the per-aggregate kernels (a `sum`, `mean`, `min` or `max` over

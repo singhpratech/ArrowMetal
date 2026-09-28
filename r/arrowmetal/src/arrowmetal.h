@@ -71,7 +71,8 @@ int  am_slice(am_array* a, int64_t offset, int64_t length, am_array** out);
 // Float keys are canonicalised first: -0.0 sorts as 0.0 (they are equal, so the tie keeps input order)
 // and every NaN is one value. Nulls and NaN stay at the end when `descending` is set -- a reversed order
 // does not mirror them to the front -- and am_top_k maps its keys the same way, so it agrees with
-// am_argsort element for element.
+// am_argsort element for element. am_argsort_ex2 / am_sort_ex2 / am_top_k_ex / am_lexsort_ex2 below
+// take the null placement and IEEE 754 totalOrder for floats as options.
 int  am_argsort(am_array* a, int descending, am_array** out);   // int32 indices
 int  am_sort(am_array* a, int descending, am_array** out);      // sorted copy, same type
 int  am_top_k(am_array* a, int64_t k, int largest, am_array** out);  // int32 indices of the k largest/smallest
@@ -1267,6 +1268,7 @@ int  am_extract_struct(am_array* a, const uint8_t* pattern, int64_t plen, int fl
 // Enumerations, shared by all of them:
 //
 //   null_placement            0 at_end (Arrow's default)   1 at_start
+//   float_order               0 ieee (the default)   1 total
 //   tiebreaker                0 min   1 max   2 first   3 dense
 //   null_matching_behavior    0 match   1 skip   2 emit_null   3 inconclusive
 //   value order               0 first_appearance (Arrow's own)   1 sorted (the cheaper GPU pass)
@@ -1297,6 +1299,23 @@ int  am_sort_ex(am_array* a, int descending, int null_placement, am_array** out)
 int  am_lexsort_ex(am_array** columns, const int* descending /* or NULL */, int64_t count,
                    int null_placement, am_array** out);
 int  am_partition_nth_ex(am_array* a, int64_t pivot, int null_placement, am_array** out);
+// The sorts with the float order as well. float_order 0 (ieee) is exactly the order of the calls
+// above: -0.0 ties +0.0, every NaN is one value, and NaN rows sit next to the nulls in both
+// directions (after the values at_end, between the nulls and the values at_start), as in Arrow C++.
+// float_order 1 (total) is IEEE 754 totalOrder as arrow-rs and Rust's total_cmp define it:
+// -NaN < -inf < ... < -0.0 < +0.0 < ... < +inf < +NaN, NaNs by payload, only identical bits tie, and a
+// descending sort is the exact mirror (+NaN first). Both are one key map in front of the same radix
+// passes, so neither costs an extra pass. Integer, string and temporal keys ignore float_order.
+// am_top_k_ex answers with the first k indices am_argsort_ex2 gives with the same options (largest
+// is its descending). am_lexsort_ex2 takes each option per key: descending, null_placement and
+// float_order each hold `count` entries or are NULL for the default.
+int  am_argsort_ex2(am_array* a, int descending, int null_placement, int float_order, am_array** out);
+int  am_sort_ex2(am_array* a, int descending, int null_placement, int float_order, am_array** out);
+int  am_top_k_ex(am_array* a, int64_t k, int largest, int null_placement, int float_order,
+                 am_array** out);
+int  am_lexsort_ex2(am_array** columns, const int* descending /* or NULL */,
+                    const int* null_placement /* or NULL */, const int* float_order /* or NULL */,
+                    int64_t count, am_array** out);
 int  am_rank_ex(am_array* a, int tiebreaker, int descending, int null_placement, am_array** out);
 int  am_rank_quantile_ex(am_array* a, int op, int descending, int null_placement, am_array** out);
 int  am_is_in_ex(am_array* a, am_array* set_array, int null_matching_behavior, am_array** out);
@@ -1324,7 +1343,7 @@ int  am_list_parent_indices64(am_array* a, am_array** out);
 //           | "with_columns"{"input": plan, "exprs": [[NAME, SEXPR], ...]}
 //           | "aggregate"   {"input": plan, "aggs": [[AGGOP, NAME, SEXPR?], ...]}
 //           | "group_by"    {"input": plan, "keys": [[NAME, SEXPR], ...], "aggs": [...]}
-//           | "sort"        {"input": plan, "by": [[NAME, DESCENDING], ...]}
+//           | "sort"        {"input": plan, "by": [KEY, ...], "nulls": NULLS?, "float_order": FORDER?}
 //           | "limit"       {"input": plan, "count": INT, "offset": INT?}
 //           | "unique"      {"input": plan, "subset": [NAME, ...]?}
 //           | "join"        {"left": plan, "right": plan, "left_on": [...], "right_on": [...],
@@ -1340,6 +1359,11 @@ int  am_list_parent_indices64(am_array* a, am_array** out);
 //   WFN    := "row_number" | "rank" | "dense_rank" | "lag" | "lead" | "cum_sum"
 //           | "rolling_sum" | "rolling_mean" | "rolling_min" | "rolling_max"
 //           | "sum" | "min" | "max" | "mean" | "count"     -- a whole-partition aggregate
+//   KEY    := [NAME, DESCENDING] | [NAME, DESCENDING, {"nulls": NULLS?, "float_order": FORDER?}]
+//           | {"column": NAME, "descending": BOOL?, "nulls": NULLS?, "float_order": FORDER?}
+//   NULLS  := "last" (the default) | "first"       -- per key, in either direction
+//   FORDER := "ieee" (the default) | "total"       -- see am_argsort_ex2; the sort-level fields are the
+//                                                    defaults for keys that do not name their own
 //   SEXPR  := the expression grammar above, verbatim.
 //
 // Example: sum(amount) by region where amount > 100, biggest first, top 10.

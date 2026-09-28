@@ -30,7 +30,11 @@ import Metal
 extension TopK {
     /// Value types the radix-select kernels map to a sort key. Narrow integers get a key of their own width
     /// so that the top digit still discriminates.
-    static func radixKind<T: ArrowPrimitive>(_: T.Type) -> (kind: String, valueType: String, keyType: String, keyBits: Int)? {
+    static func radixKind<T: ArrowPrimitive>(_: T.Type, floatOrder: FloatOrder = .ieee) -> (kind: String, valueType: String, keyType: String, keyBits: Int)? {
+        if floatOrder == .total {
+            if T.self == Float.self { return ("f32t", "float", "uint", 32) }
+            if T.self == Double.self { return ("f64t", "ulong", "ulong", 64) }
+        }
         switch T.self {
         case is Int8.Type: return ("i8", "char", "uint", 8)
         case is UInt8.Type: return ("u8", "uchar", "uint", 8)
@@ -80,8 +84,8 @@ extension MetalArray {
     /// to reach into the null rows, which only the sort places), and when k is more than half the selectable
     /// rows — at that point the compaction copies most of the column and the full argsort does the same work
     /// in one go.
-    func topKRadixSelect(_ k: Int, largest: Bool) throws -> MetalArray<Int32>? {
-        guard k > 0, let kd = TopK.radixKind(T.self) else { return nil }
+    func topKRadixSelect(_ k: Int, largest: Bool, floatOrder: FloatOrder = .ieee) throws -> MetalArray<Int32>? {
+        guard k > 0, let kd = TopK.radixKind(T.self, floatOrder: floatOrder) else { return nil }
         let n = length
         let valid = n - nullCount
         guard valid >= k, k <= valid / 2 else { return nil }

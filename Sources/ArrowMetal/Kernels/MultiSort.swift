@@ -16,17 +16,39 @@ import Foundation
 /// still far cheaper than a comparison sort with a k-way comparator, and it needs no new kernel.
 public func lexsortIndices(_ columns: [AnyMetalArray], descending: [Bool] = [],
                            nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
+    try lexsortIndices(columns, descending: descending, nullPlacements: [nullPlacement], floatOrders: [])
+}
+
+/// `lexsortIndices` with the null placement and the float order chosen per key.
+///
+/// `nullPlacements` and `floatOrders` each hold one entry per column, one entry for every column, or
+/// none for the defaults (`.atEnd`, `.ieee`). Each key's options go into that key's own radix pass —
+/// the null block at that key's chosen end, the float key map that key's order asks for — so a key
+/// with options costs exactly what a key without them does.
+public func lexsortIndices(_ columns: [AnyMetalArray], descending: [Bool] = [],
+                           nullPlacements: [NullPlacement], floatOrders: [FloatOrder]) throws -> MetalArray<Int32> {
     guard let first = columns.first else {
         throw ArrowMetalError.invalidArrowArray("lexsort needs at least one column")
     }
     guard descending.isEmpty || descending.count == columns.count else {
         throw ArrowMetalError.invalidArrowArray("descending has \(descending.count) entries for \(columns.count) columns")
     }
+    guard nullPlacements.count <= 1 || nullPlacements.count == columns.count else {
+        throw ArrowMetalError.invalidArrowArray("null placement has \(nullPlacements.count) entries for \(columns.count) columns")
+    }
+    guard floatOrders.count <= 1 || floatOrders.count == columns.count else {
+        throw ArrowMetalError.invalidArrowArray("float order has \(floatOrders.count) entries for \(columns.count) columns")
+    }
+    func placement(_ k: Int) -> NullPlacement {
+        nullPlacements.isEmpty ? .atEnd : nullPlacements[nullPlacements.count == 1 ? 0 : k]
+    }
+    func order(_ k: Int) -> FloatOrder { floatOrders.isEmpty ? .ieee : floatOrders[floatOrders.count == 1 ? 0 : k] }
     let n = first.length
     for c in columns where c.length != n { throw ArrowMetalError.lengthMismatch(n, c.length) }
     let ctx = first.metalContext
     if columns.count == 1 {
-        return try columns[0].argsortIndices(descending: descending.first ?? false, nullPlacement: nullPlacement)
+        return try columns[0].argsortIndices(descending: descending.first ?? false, nullPlacement: placement(0),
+                                             floatOrder: order(0))
     }
     guard n > 0 else { return try MetalArray<Int32>([Int32](), context: ctx) }
 
@@ -35,7 +57,7 @@ public func lexsortIndices(_ columns: [AnyMetalArray], descending: [Bool] = [],
         let desc = descending.isEmpty ? false : descending[k]
         // The first pass sees the column as it is; later ones see it in the order the previous passes left.
         let keys = try perm.map { try columns[k].take($0) } ?? columns[k]
-        let idx = try keys.argsortIndices(descending: desc, nullPlacement: nullPlacement)
+        let idx = try keys.argsortIndices(descending: desc, nullPlacement: placement(k), floatOrder: order(k))
         perm = try perm.map { try $0.take(idx) } ?? idx
     }
     return perm!
@@ -48,9 +70,11 @@ extension AnyMetalArray {
     /// Booleans go through their unpacked byte form and temporal columns through their integer storage.
     /// utf8 and binary columns sort byte-wise through the prefix radix sort in `Kernels/StringSort.swift`,
     /// so a lexsort may mix them freely with numeric keys. Dictionary-encoded and nested columns have no
-    /// order-preserving GPU key yet, so they throw.
+    /// order-preserving GPU key yet, so they throw. `floatOrder` applies to Float32, Float64 and float16
+    /// columns (see `FloatOrder`) and is ignored by every other type.
     public func argsortIndices(descending: Bool = false,
-                               nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
+                               nullPlacement: NullPlacement = .atEnd,
+                               floatOrder: FloatOrder = .ieee) throws -> MetalArray<Int32> {
         switch self {
         case .int8(let a): return try a.argsort(descending: descending, nullPlacement: nullPlacement)
         case .uint8(let a): return try a.argsort(descending: descending, nullPlacement: nullPlacement)
@@ -60,8 +84,8 @@ extension AnyMetalArray {
         case .uint32(let a): return try a.argsort(descending: descending, nullPlacement: nullPlacement)
         case .int64(let a): return try a.argsort(descending: descending, nullPlacement: nullPlacement)
         case .uint64(let a): return try a.argsort(descending: descending, nullPlacement: nullPlacement)
-        case .float32(let a): return try a.argsort(descending: descending, nullPlacement: nullPlacement)
-        case .float64(let a): return try a.argsort(descending: descending, nullPlacement: nullPlacement)
+        case .float32(let a): return try a.argsort(descending: descending, nullPlacement: nullPlacement, floatOrder: floatOrder)
+        case .float64(let a): return try a.argsort(descending: descending, nullPlacement: nullPlacement, floatOrder: floatOrder)
         case .boolean(let a): return try a.toUInt8Array().argsort(descending: descending, nullPlacement: nullPlacement)
         case .temporal(let t):
             switch t.storage {
@@ -75,13 +99,13 @@ extension AnyMetalArray {
         case .dictionary, .runEndEncoded, .decimal, .list, .structure, .map, .union:
             throw ArrowMetalError.unsupportedType("sort by \(arrowFormat) is not implemented")
         // float16 sorts through the float32 widening; the rest have no order-preserving GPU key.
-        case .float16(let a): return try a.toFloat32().argsort(descending: descending, nullPlacement: nullPlacement)
+        case .float16(let a): return try a.toFloat32().argsort(descending: descending, nullPlacement: nullPlacement, floatOrder: floatOrder)
         case .smallDecimal(let s):
             switch s.storage {
             case .int32(let a): return try a.argsort(descending: descending, nullPlacement: nullPlacement)
             case .int64(let a): return try a.argsort(descending: descending, nullPlacement: nullPlacement)
             }
-        case .extended(let a): return try a.storage.argsortIndices(descending: descending, nullPlacement: nullPlacement)
+        case .extended(let a): return try a.storage.argsortIndices(descending: descending, nullPlacement: nullPlacement, floatOrder: floatOrder)
         case .null, .interval, .fixedBinary:
             throw ArrowMetalError.unsupportedType("sort by \(arrowFormat) is not implemented")
         }
@@ -96,22 +120,25 @@ extension AnyMetalArray {
     /// back a dictionary: the codes are gathered and the value array is left alone, which is what
     /// `take` of `argsort` has always done for it.
     public func sortedValues(descending: Bool = false,
-                             nullPlacement: NullPlacement = .atEnd) throws -> AnyMetalArray {
+                             nullPlacement: NullPlacement = .atEnd,
+                             floatOrder: FloatOrder = .ieee) throws -> AnyMetalArray {
         switch self {
         case .int32(let a): return .int32(try a.sorted(descending: descending, nullPlacement: nullPlacement))
         case .uint32(let a): return .uint32(try a.sorted(descending: descending, nullPlacement: nullPlacement))
         case .int64(let a): return .int64(try a.sorted(descending: descending, nullPlacement: nullPlacement))
         case .uint64(let a): return .uint64(try a.sorted(descending: descending, nullPlacement: nullPlacement))
-        case .float32(let a): return .float32(try a.sorted(descending: descending, nullPlacement: nullPlacement))
-        case .float64(let a): return .float64(try a.sorted(descending: descending, nullPlacement: nullPlacement))
+        case .float32(let a): return .float32(try a.sorted(descending: descending, nullPlacement: nullPlacement, floatOrder: floatOrder))
+        case .float64(let a): return .float64(try a.sorted(descending: descending, nullPlacement: nullPlacement, floatOrder: floatOrder))
         case .dictionary:
             // The codes carry no order of their own, so the permutation comes from the decoded column;
             // the gather then runs on the codes, so the dictionary survives.
             let order = try decodedIfDictionary().argsortIndices(descending: descending,
-                                                                nullPlacement: nullPlacement)
+                                                                nullPlacement: nullPlacement,
+                                                                floatOrder: floatOrder)
             return try take(order)
         default:
-            return try take(try argsortIndices(descending: descending, nullPlacement: nullPlacement))
+            return try take(try argsortIndices(descending: descending, nullPlacement: nullPlacement,
+                                               floatOrder: floatOrder))
         }
     }
 
@@ -166,5 +193,19 @@ extension MetalRecordBatch {
             desc.append(k.descending)
         }
         return try take(try lexsortIndices(cols, descending: desc, nullPlacement: nullPlacement))
+    }
+
+    /// Sorts every column by several keys, each with its own direction, null placement and float order
+    /// (`SortKey`). Keys that leave both options at their defaults sort exactly as `sorted(by:)` does.
+    public func sorted(by keys: [SortKey]) throws -> MetalRecordBatch {
+        guard !keys.isEmpty else { return self }
+        var cols: [AnyMetalArray] = []
+        for k in keys {
+            guard let c = self[k.column] else { throw ArrowMetalError.invalidArrowArray("no column named \(k.column)") }
+            cols.append(c)
+        }
+        return try take(try lexsortIndices(cols, descending: keys.map(\.descending),
+                                           nullPlacements: keys.map { $0.nullsFirst ? .atStart : .atEnd },
+                                           floatOrders: keys.map(\.floatOrder)))
     }
 }

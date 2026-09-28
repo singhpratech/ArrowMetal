@@ -26,7 +26,7 @@ import Foundation
 // | `select` / `with_columns` | `input`, `exprs`: `[[name, sexpr], ...]` |
 // | `aggregate` | `input`, `aggs`: `[[op, name, sexpr?], ...]` |
 // | `group_by` | `input`, `keys`: `[[name, sexpr], ...]`, `aggs` |
-// | `sort` | `input`, `by`: `[[column, descending], ...]` |
+// | `sort` | `input`, `by`: `[[column, descending, {nulls?, float_order?}?], ...]`, `nulls`?, `float_order`? |
 // | `limit` | `input`, `count`, `offset`? |
 // | `unique` | `input`, `subset`? |
 // | `join` | `left`, `right`, `left_on`, `right_on`, `how`, `suffix`? |
@@ -76,12 +76,45 @@ public enum PlanJSON {
                 return ExprAggregate(aggOp, e, name: n)
             }
         }
-        func sortKeys(_ key: String) -> [SortKey] {
+        func flag(_ v: Any?) -> Bool { (v as? Bool) ?? ((v as? NSNumber)?.boolValue ?? false) }
+        // The optional per-key options, and the sort-level defaults they override. Only these two fields
+        // are read, and a key that names neither sorts exactly as a `[column, descending]` pair always has.
+        func nullsFirst(_ v: Any?, _ fallback: Bool) throws -> Bool {
+            guard let v, !(v is NSNull) else { return fallback }
+            switch v as? String {
+            case "first": return true
+            case "last": return false
+            default: throw ArrowMetalError.invalidArrowArray("plan: sort \"nulls\" must be \"first\" or \"last\"")
+            }
+        }
+        func floatOrder(_ v: Any?, _ fallback: FloatOrder) throws -> FloatOrder {
+            guard let v, !(v is NSNull) else { return fallback }
+            guard let name = v as? String, let f = FloatOrder(name: name) else {
+                throw ArrowMetalError.invalidArrowArray("plan: sort \"float_order\" must be \"ieee\" or \"total\"")
+            }
+            return f
+        }
+        func sortKeys(_ key: String) throws -> [SortKey] {
             guard let xs = o[key] as? [Any] else { return [] }
-            return xs.compactMap { x in
+            let defaultNullsFirst = try nullsFirst(o["nulls"], false)
+            let defaultOrder = try floatOrder(o["float_order"], .ieee)
+            return try xs.compactMap { x in
+                // `{"column": c, "descending": d?, "nulls": ..?, "float_order": ..?}`
+                if let d = x as? [String: Any] {
+                    guard let c = d["column"] as? String else {
+                        throw ArrowMetalError.invalidArrowArray("plan: a sort key object needs a \"column\"")
+                    }
+                    return SortKey(c, descending: flag(d["descending"]),
+                                   nullsFirst: try nullsFirst(d["nulls"], defaultNullsFirst),
+                                   floatOrder: try floatOrder(d["float_order"], defaultOrder))
+                }
+                // `[c, descending, {"nulls": ..?, "float_order": ..?}?]`
                 guard let pair = x as? [Any], let c = pair.first as? String else { return nil }
-                let d = pair.count > 1 ? ((pair[1] as? Bool) ?? ((pair[1] as? NSNumber)?.boolValue ?? false)) : false
-                return SortKey(c, descending: d)
+                let d = pair.count > 1 ? flag(pair[1]) : false
+                let opts = pair.count > 2 ? pair[2] as? [String: Any] : nil
+                return SortKey(c, descending: d,
+                               nullsFirst: try nullsFirst(opts?["nulls"], defaultNullsFirst),
+                               floatOrder: try floatOrder(opts?["float_order"], defaultOrder))
             }
         }
 
@@ -101,7 +134,7 @@ public enum PlanJSON {
         case "with_columns": return .withColumns(try input(), try namedExprs("exprs"))
         case "aggregate": return .aggregate(try input(), try aggregates())
         case "group_by": return .groupAggregate(try input(), keys: try namedExprs("keys"), aggregates: try aggregates())
-        case "sort": return .sort(try input(), sortKeys("by"))
+        case "sort": return .sort(try input(), try sortKeys("by"))
         case "limit":
             let n = (o["count"] as? NSNumber)?.intValue ?? Int.max
             let off = (o["offset"] as? NSNumber)?.intValue ?? 0

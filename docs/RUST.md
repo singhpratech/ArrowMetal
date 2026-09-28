@@ -210,6 +210,7 @@ data, at lengths 0, 1, 33, 1024, 1025, 100,001 and 1,000,001, with and without n
 | `take` | `am_take` | `arrow::compute::take`, with repeated, out-of-order and null indices |
 | `slice` | `am_slice` | `arrow::array::Array::slice` |
 | `sort`, `argsort` | `am_sort`, `am_argsort` | `arrow::compute::sort` with `nulls_first: false` |
+| `sort_with`, `argsort_with`, `top_k_with` with `SortOptions { descending, nulls_first, float_order }`; `lexsort(columns, options)` | `am_sort_ex2`, `am_argsort_ex2`, `am_top_k_ex`, `am_lexsort_ex2` | `arrow::compute::sort` / `lexsort_to_indices` with every `SortOptions`, bit for bit on Float64 and Float32 columns holding NaN of both signs, ±0.0, ±inf and subnormals (`tests/sort_options.rs`) |
 | `cast` | `am_cast` | `arrow::compute::cast` |
 | `group_by(keys)` with `sum`, `min`, `max`, `mean`, `count`, `count_all`; `keys(i)`, `ids()`, `agg_raw` | `am_group_by_keys`, `am_group_agg_ex` | a plain `HashMap` fold — arrow-rs's `arrow` crate has no hash aggregation (it lives in DataFusion) |
 | `Source`, `run_plan`, `explain_plan`, `PlanResult` | `am_plan_source_create`, `am_plan_run`, `am_plan_explain`, `am_plan_column*` | the same plan assembled by hand from arrow-rs kernels |
@@ -257,6 +258,27 @@ that reports the type the kernels compute on exists (`am_compute_format`,
 dictionaries, which keeps the sentence above true for everything this crate accepts.
 `tests/compute.rs::dictionary_arrays_are_refused_at_import` pins the rejection and the decode path.
 
+### Sort order: arrow-rs's, on request
+
+`sort` and `argsort` keep ArrowMetal's default order, which is Arrow C++'s: nulls last in both
+directions, -0.0 tied with +0.0, and NaN next to the nulls. arrow-rs orders differently — nulls where
+`SortOptions::nulls_first` says, floats by `total_cmp` (-NaN < -inf < … < -0.0 < +0.0 < … < +inf <
++NaN) — and the `_with` forms take that order as an option:
+
+```rust
+use arrow::compute::SortOptions as ArrowSortOptions;
+let opts: arrowmetal::SortOptions = ArrowSortOptions { descending: true, nulls_first: true }.into();
+let idx = gpu.argsort_with(opts)?;          // what arrow::compute::sort_to_indices orders
+let top = gpu.top_k_with(100, opts)?;       // its first 100 rows, by GPU selection
+let multi = arrowmetal::lexsort(&[&a, &b], &[opts, opts])?;
+```
+
+`From<arrow::compute::SortOptions>` sets `float_order: FloatOrder::Total`; `SortOptions::default()` is
+the plain sort. Neither option adds a pass to the GPU sort: the null placement is where the partition
+that takes the null rows out of the radix sort puts them, and totalOrder is the key map in front of the
+radix passes. `tests/sort_options.rs` compares every combination against `arrow::compute::sort` bit for
+bit.
+
 ### One divergence from arrow-rs, found and pinned
 
 `min` / `max` on a float column containing NaN. The two libraries use different, each internally
@@ -290,7 +312,7 @@ every other reduction test relies on.
 
 ## What is not wrapped
 
-`include/arrowmetal.h` has 222 entry points. `arrowmetal-sys` declares 35 of them — every one called
+`include/arrowmetal.h` has 281 entry points. `arrowmetal-sys` declares 39 of them — every one called
 by the safe crate, none declared and unused — and the safe crate covers the list above. Everything
 below is reachable from Swift, Python and the C ABI, and **not** from this crate. There is no
 technical obstacle to any of it; it is unwrapped because it is untested here, and an untested wrapper
@@ -308,7 +330,7 @@ does not go into 0.1.0.
 | Boolean and Kleene logic | `am_bool_and`, `am_bool_or`, `am_bool_not`, `am_and_kleene`, `am_or_kleene` |
 | Structural and conditional | `am_is_null`, `am_is_valid`, `am_fill_null`, `am_fill_null_direction`, `am_drop_null`, `am_if_else`, `am_coalesce`, `am_case_when`, `am_choose`, `am_replace_with_mask`, `am_indices_nonzero`, `am_true_unless_null` |
 | Set lookup and hashing | `am_is_in`, `am_index_in`, `am_is_in_ex`, `am_index_in_ex`, `am_hash64`, `am_fixed_binary_hash64`, `am_fixed_binary_compare` |
-| Sorting and selection beyond `sort`/`argsort` | `am_sort_ex`, `am_top_k`, `am_lexsort`, `am_lexsort_ex`, `am_argsort_ex`, `am_partition_nth_indices`, `am_partition_nth_ex`, `am_rank`, `am_rank_ex`, `am_rank_quantile_ex`, `am_inverse_permutation`, `am_scatter` |
+| Sorting and selection beyond the sorts above | `am_sort_ex`, `am_top_k`, `am_lexsort`, `am_lexsort_ex`, `am_argsort_ex`, `am_partition_nth_indices`, `am_partition_nth_ex`, `am_rank`, `am_rank_ex`, `am_rank_quantile_ex`, `am_inverse_permutation`, `am_scatter` |
 | Window functions and rolling | `am_window` |
 | The rest of the aggregates | `am_reduce_ex`, `am_reduce_ex2`, `am_count_all`, `am_first_last`, `am_winsorize`, `am_group_pivot_wider`, `am_pivot_wider` |
 | Dictionaries, run-end, uniqueness | `am_dictionary_encode`, `am_dictionary_encode_ex`, `am_dictionary_decode`, `am_run_end_encode`, `am_run_end_decode`, `am_unique`, `am_unique_ex`, `am_value_counts`, `am_value_counts_ex` |

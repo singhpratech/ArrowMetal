@@ -31,6 +31,31 @@ public enum NullPlacement: String, Sendable, CaseIterable {
     }
 }
 
+/// How a sort orders the values of a Float32 or Float64 key. Integer, string and temporal keys ignore it.
+///
+/// - `ieee` (the default, and the order Arrow C++ / pyarrow use): the values in IEEE comparison order,
+///   -0.0 and +0.0 equal (a tie, kept in input order), and every NaN one value placed next to the nulls —
+///   after the values when the nulls are last, between the nulls and the values when they are first —
+///   in both directions.
+/// - `total`: IEEE 754 totalOrder, as arrow-rs, DataFusion and Rust's `f32/f64::total_cmp` order floats.
+///   -NaN < -inf < ... < -0.0 < +0.0 < ... < +inf < +NaN, NaNs ordered by payload, and a descending sort
+///   is the exact mirror (so +NaN comes first). Every bit pattern is its own value, so only identical bits
+///   tie. It is a pure bit transform of the value, so the radix sort runs it with the same passes as
+///   `ieee`.
+public enum FloatOrder: String, Sendable, CaseIterable {
+    case ieee
+    case total
+
+    /// Parses `"ieee"` / `"total"` (also `"total_order"`).
+    public init?(name: String) {
+        switch name {
+        case "ieee": self = .ieee
+        case "total", "total_order", "totalOrder": self = .total
+        default: return nil
+        }
+    }
+}
+
 /// How `rank` numbers the rows of a tie group (Arrow's `tiebreaker`).
 public enum RankTiebreaker: String, Sendable, CaseIterable {
     /// Every row of the group takes the group's *first* 1-based position; the next group skips the gap.

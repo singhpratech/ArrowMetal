@@ -980,6 +980,64 @@ def _top_k(src, shape):
              pc.array_sort_indices(src).cast(pa.int32()).slice(0, k)])
 
 
+@op("argsort_nulls_first", NUMERIC, note="null_placement='at_start' in both directions")
+def _argsort_nulls_first(src, shape):
+    x = am.array(src)
+    return ([arrow(x.argsort(False, null_placement="at_start")),
+             arrow(x.argsort(True, null_placement="at_start"))],
+            [pc.array_sort_indices(src, null_placement="at_start").cast(pa.int32()),
+             pc.array_sort_indices(src, order="descending", null_placement="at_start").cast(pa.int32())])
+
+
+@op("top_k_nulls_first", NUMERIC)
+def _top_k_nulls_first(src, shape):
+    x = am.array(src)
+    k = min(len(src), 17)
+    return ([arrow(x.top_k(k, null_placement="at_start")),
+             arrow(x.top_k(k, False, null_placement="at_start"))],
+            [pc.array_sort_indices(src, order="descending", null_placement="at_start")
+             .cast(pa.int32()).slice(0, k),
+             pc.array_sort_indices(src, null_placement="at_start").cast(pa.int32()).slice(0, k)])
+
+
+def _total_order_indices(src, descending, null_placement):
+    """IEEE 754 totalOrder (arrow-rs `total_cmp`), stable, from its definition. pyarrow has no such
+    order; for integers it is pyarrow's own."""
+    if src.type not in (pa.float32(), pa.float64()):
+        return pc.array_sort_indices(src, order="descending" if descending else "ascending",
+                                     null_placement=null_placement).cast(pa.int32())
+    wide = src.type == pa.float64()
+    valid = np.asarray(src.is_valid())
+    raw = src.fill_null(0).to_numpy(zero_copy_only=False)
+    bits = raw.view(np.uint64 if wide else np.uint32).astype(np.uint64)
+    width = 64 if wide else 32
+    full = np.uint64(0xFFFFFFFFFFFFFFFF) if wide else np.uint64(0xFFFFFFFF)
+    sign = np.uint64(1 << (width - 1))
+    key = np.where(bits & sign, ~bits & full, bits | sign)
+    if descending:
+        key = ~key & full
+    rows = np.nonzero(valid)[0]
+    ordered = rows[np.argsort(key[rows], kind="stable")]
+    nulls = np.nonzero(~valid)[0]
+    parts = [nulls, ordered] if null_placement == "at_start" else [ordered, nulls]
+    return pa.array(np.concatenate(parts).astype(np.int32), pa.int32())
+
+
+@op("argsort_total_order", NUMERIC,
+    note="float_order='total'; oracle for floats is IEEE 754 totalOrder by definition (pyarrow has none)")
+def _argsort_total_order(src, shape):
+    x = am.array(src)
+    got, want = [], []
+    for d in (False, True):
+        for p in ("at_end", "at_start"):
+            got.append(arrow(x.argsort(d, null_placement=p, float_order="total")))
+            want.append(_total_order_indices(src, d, p))
+    k = min(len(src), 17)
+    got.append(arrow(x.top_k(k, null_placement="at_start", float_order="total")))
+    want.append(_total_order_indices(src, True, "at_start").slice(0, k))
+    return got, want
+
+
 # ---- strings -------------------------------------------------------
 
 @op("str_length", ["utf8"])

@@ -63,8 +63,8 @@ So the engine is a plan, three layers of decision over it, and one of execution:
 | with_columns | `.withColumns(_:)` | `.with_columns(...)` | as select, keeping the other columns |
 | aggregate | `.aggregate(_:)` | `.agg(...)` | one fused kernel, threadgroup partials |
 | group-by aggregate | `.groupBy(_:_:)` | `.group_by(...).agg(...)` | `GroupByKeys` for the ids, then one fused group-by kernel (or `GroupBy`'s per-aggregate kernels) |
-| sort | `.sort(_:)` | `.sort(by, descending)` | `lexsort` (one stable radix sort per key) + `take` |
-| limit / head / slice | `.limit(_:offset:)` | `.limit(n)`, `.head(n)`, `.slice(o, n)` | a slice, or the top-k selection kernel when it follows a single-key sort |
+| sort | `.sort(_:)` | `.sort(by, descending, null_placement=, float_order=)` | `lexsort` (one stable radix sort per key) + `take` |
+| limit / head / slice | `.limit(_:offset:)` | `.limit(n)`, `.head(n)`, `.slice(o, n)` | a slice, or the top-k selection kernel when it follows a single-key sort (with that key's options) |
 | unique | `.unique(subset:)` | `.unique(subset=)` | `GroupByKeys` + the lowest row index per group |
 | join | `.join(_:leftOn:rightOn:how:)` | `.join(other, on=, how=)` | GPU hash join; see the matrix below |
 | join_asof | `.joinAsof(_:_:)` | `.join_asof(other, on=, by=, strategy=, tolerance=)` | GPU binary search per probe row |
@@ -306,6 +306,28 @@ partition — the right trade below a few thousand partitions, and capped at 819
 Nulls follow SQL `ORDER BY x NULLS LAST`, which is what `lexsort` does in both directions: a null key
 sorts after every value, and all nulls of one key form one tie group.
 
+### Sort key options
+
+Each key of a `sort` carries two options besides its direction. Both default to the order the engine has
+always used, so a key that names neither sorts exactly as before.
+
+| option | values | meaning |
+|---|---|---|
+| `nulls` | `"last"` (default), `"first"` | the key's null rows before or after every value, in either direction (SQL `NULLS FIRST` / `NULLS LAST`) |
+| `float_order` | `"ieee"` (default), `"total"` | how a Float32 / Float64 key orders; integer, string and temporal keys ignore it |
+
+- `"ieee"` is Arrow C++'s (and pyarrow's) order: IEEE comparison, -0.0 and +0.0 equal (a tie, kept in
+  input order), and every NaN one value placed next to the nulls in both directions — after the values
+  when the nulls are last, between the nulls and the values when they are first.
+- `"total"` is IEEE 754 totalOrder, the order arrow-rs (`total_cmp`), DataFusion and Rust use:
+  -NaN < -inf < … < -0.0 < +0.0 < … < +inf < +NaN, NaNs ordered by payload, only identical bits tie, and
+  a descending key is the exact mirror, so +NaN comes first.
+
+Neither option adds work to the sort. A null placement is where the stable partition that takes the null
+rows out of the radix sort puts them; a float order is the key map in front of the radix passes —
+`"total"` is the raw bit pattern with the sign-flip transform, a pure function of the value. A
+single-key `sort` + `limit` stays a top-k selection with either option.
+
 ## The plan grammar
 
 Expressions already have a text form — the s-expression grammar of `docs/EXPR.md`, which is the cache
@@ -327,7 +349,7 @@ wrapper, because a plan is a tree of records with optional fields.
 | `select` / `with_columns` | `input`, `exprs`: `[[name, sexpr], …]` |
 | `aggregate` | `input`, `aggs`: `[[op, name, sexpr?], …]` |
 | `group_by` | `input`, `keys`, `aggs` |
-| `sort` | `input`, `by`: `[[column, descending], …]` |
+| `sort` | `input`, `by`: `[key, …]`, `nulls`?, `float_order`? |
 | `limit` | `input`, `count`, `offset`? |
 | `unique` | `input`, `subset`? |
 | `join` | `left`, `right`, `left_on`, `right_on`, `how`, `suffix`? |
@@ -335,6 +357,16 @@ wrapper, because a plan is a tree of records with optional fields.
 | `concat` | `inputs` |
 | `window` | `input`, `specs`: `[{name, fn, column?, n?, partition_by?, order_by?}, …]` |
 | `explode` | `input`, `columns` |
+
+A sort `key` is `[column, descending]` as before, `[column, descending, {"nulls": …, "float_order": …}]`,
+or `{"column": …, "descending": …, "nulls": …, "float_order": …}`, every field but `column` optional.
+The sort-level `nulls` and `float_order` are the defaults for keys that do not name their own:
+
+```json
+{"op": "limit", "count": 100, "input":
+  {"op": "sort", "by": [["price", true, {"nulls": "first", "float_order": "total"}]],
+   "input": {"op": "scan", "source": "t"}}}
+```
 
 Over the C ABI the tables are registered once (`am_plan_source_create`, which takes the `am_array` handles the
 caller already holds) and the plan text carries no data, so the same text can be re-run against new

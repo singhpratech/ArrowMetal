@@ -1457,8 +1457,11 @@ _ROWS = [
      ((pa.array([10, 20, 30], type=pa.int64()), pa.array([1, 1, 3], type=pa.int32())), {"max_index": 4})),
 
     # ---- Sorts and partitions ---------------------------------------------
-    ("array_sort_indices", "Sorts", GPU, "Kernels/Sort.swift", "array_sort_indices(descending, null_placement)",
-     "LSD radix sort, stable, total order for floats (NaN after +inf); utf8 and binary columns take the "
+    ("array_sort_indices", "Sorts", GPU, "Kernels/Sort.swift",
+     "array_sort_indices(descending, null_placement, float_order)",
+     "LSD radix sort, stable. Floats order as pyarrow orders them (-0.0 ties +0.0, NaN next to the "
+     "nulls in both directions); `float_order=\"total\"` is IEEE 754 totalOrder, arrow-rs's order, "
+     "through the same passes. utf8 and binary columns take the "
      "prefix radix sort in `Kernels/StringSort.swift`, byte-wise lexicographic, index for index with pyarrow. Both of Arrow's "
      "`null_placement` values are implemented, in both directions: the nulls are one block at "
      "whichever end, moved there by a stable partition of the index array.",
@@ -1469,7 +1472,8 @@ _ROWS = [
     ("sort_indices", "Sorts", PARTIAL, "Kernels/MultiSort.swift", "sort_indices() / am.lexsort_indices(cols)",
      "Single key through the radix argsort; multiple keys through `lexsort_indices`, which is "
      "successive stable argsorts from the least significant key upwards. Both `null_placement` values "
-     "are implemented, and apply to every key as Arrow's do. utf8 and binary keys sort through "
+     "are implemented, and apply to every key as Arrow's do; `lexsort_indices` also takes "
+     "`null_placement` and `float_order` per key. utf8 and binary keys sort through "
      "`Kernels/StringSort.swift`; dictionary and nested key columns are still not sortable, which is what "
      "keeps this row `partial`.",
      lambda args, options: _out(_a(args[0]).sort_indices()), ((_INT,), {})),

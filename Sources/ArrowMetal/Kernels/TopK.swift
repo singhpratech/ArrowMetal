@@ -12,7 +12,11 @@ import Metal
 /// broken by row index — so `topK(k)` returns exactly the first k indices `argsort` would.
 enum TopK {
     /// Value types the selection kernel maps to a sort key directly. Everything else keeps the sort path.
-    static func keyKind<T: ArrowPrimitive>(_: T.Type) -> (kind: String, valueType: String, keyType: String)? {
+    static func keyKind<T: ArrowPrimitive>(_: T.Type, floatOrder: FloatOrder = .ieee) -> (kind: String, valueType: String, keyType: String)? {
+        if floatOrder == .total {
+            if T.self == Float.self { return ("f32t", "float", "uint") }
+            if T.self == Double.self { return ("f64t", "ulong", "ulong") }
+        }
         switch T.self {
         case is Int32.Type: return ("i32", "int", "uint")
         case is UInt32.Type: return ("u32", "uint", "uint")
@@ -48,8 +52,8 @@ enum TopK {
 extension MetalArray {
     /// Row indices of the k best rows, selected per threadgroup and ordered by one small radix sort.
     /// Returns nil when this array's type or shape is better served by the full sort.
-    func topKSelect(_ k: Int, largest: Bool) throws -> MetalArray<Int32>? {
-        guard k > 0, k <= 1024, let kind = TopK.keyKind(T.self) else { return nil }
+    func topKSelect(_ k: Int, largest: Bool, floatOrder: FloatOrder = .ieee) throws -> MetalArray<Int32>? {
+        guard k > 0, k <= 1024, let kind = TopK.keyKind(T.self, floatOrder: floatOrder) else { return nil }
         let n = length
         // Fewer valid rows than k means the answer has to reach into the null rows, which the selection
         // kernel skips; the sort path already places them, so let it.
