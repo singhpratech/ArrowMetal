@@ -13,6 +13,7 @@ run, and the 1-minute load average before each case. Output is CSV.
 
     PYTHONPATH=python python Benchmarks/chunked_import_bench.py [--rows 1000000,10000000,50000000]
         [--types int64,float64,utf8,utf8view] [--iters 5] [--out results/<file>.csv]
+        [--label name] [--no-chunked]
 
 Numbers from a run while other work shares the machine are provisional; publish only a quiet rerun.
 """
@@ -63,8 +64,11 @@ def main():
     ap.add_argument("--types", default="int64,float64,utf8,utf8view")
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--out")
+    ap.add_argument("--label", default="new")
+    ap.add_argument("--no-chunked", action="store_true",
+                    help="skip the chunked import (for a library without am_import_chunks)")
     args = ap.parse_args()
-    fields = ["rows", "type", "chunk_rows", "chunks", "load", "combine_import_wall_ms", "combine_import_cpu_ms",
+    fields = ["label", "rows", "type", "chunk_rows", "chunks", "load", "load_end", "combine_import_wall_ms", "combine_import_cpu_ms",
               "combine_ms", "import_after_combine_ms", "chunked_wall_ms", "chunked_cpu_ms",
               "single_import_wall_ms", "single_import_cpu_ms", "speedup"]
     w = csv.DictWriter(open(args.out, "w", newline="") if args.out else sys.stdout, fieldnames=fields)
@@ -88,11 +92,14 @@ def main():
                     return comb * 1e3, imp * 1e3
 
                 tw, tc, (comb, imp) = best(args.iters, today)
-                cw, cc, _ = best(args.iters, lambda: [am.array(c) for c in cols])
+                if args.no_chunked:
+                    cw = cc = float("nan")
+                else:
+                    cw, cc, _ = best(args.iters, lambda: [am.array(c) for c in cols])
                 flats = [c.combine_chunks() for c in cols]
                 sw, sc, _ = best(args.iters, lambda: [am.array(f) for f in flats])
                 del flats
-                w.writerow({"rows": n, "type": ty, "chunk_rows": chunk, "chunks": cols[0].num_chunks,
+                w.writerow({"label": args.label, "load_end": f"{os.getloadavg()[0]:.2f}", "rows": n, "type": ty, "chunk_rows": chunk, "chunks": cols[0].num_chunks,
                             "load": f"{load:.2f}", "combine_import_wall_ms": f"{tw:.2f}",
                             "combine_import_cpu_ms": f"{tc:.1f}", "combine_ms": f"{comb:.2f}",
                             "import_after_combine_ms": f"{imp:.2f}", "chunked_wall_ms": f"{cw:.2f}",

@@ -18,6 +18,10 @@ Swift apps ───────────────────────
   serve CPU consumers (C Data Interface) and GPU kernels (C Device Interface): copy-free out always, and
   copy-free in when the producer's buffers are page aligned — one copy otherwise, which the importer
   reports (`ImportResult.zeroCopy`).
+- **Copy-free import** wraps a producer buffer with `makeBuffer(bytesNoCopy:)` after checking that
+  every page of it is mapped and readable. The check asks the VM map for the regions that cover the
+  buffer (`mach_vm_region`, one call per region), so it costs the same for 8 MB and 400 MB; see
+  [Chunked columns](#chunked-columns-and-the-import) for what it replaced.
 - **Kernels** never assume a length multiple of anything: every buffer is padded to a page so trailing
   32-bit bitmap words are readable; kernels bounds-check the last word/element.
 - **Nulls** ride along as bitmaps. Element-wise ops share the input's validity buffer (zero-copy); binary ops

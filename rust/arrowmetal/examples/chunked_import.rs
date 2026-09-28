@@ -12,6 +12,9 @@
 //! system, all threads) of the best run; the 1-minute load average before each case. It also
 //! reports whether the imported buffers of the concatenated column were mapped without a copy.
 //!
+//! `--no-chunked` skips the chunked import (for a library without `am_import_chunks`), and
+//! `--label` names the run in the first column.
+//!
 //! ```text
 //! cargo run --release --example chunked_import -- [--rows 1000000,10000000,50000000] [--iters 5]
 //! ```
@@ -136,12 +139,14 @@ fn main() {
         .map(|s| s.parse().unwrap())
         .collect();
     let iters: usize = arg("--iters").map(|s| s.parse().unwrap()).unwrap_or(5);
+    let label = arg("--label").unwrap_or_else(|| "new".into());
+    let with_chunked = !args.iter().any(|a| a == "--no-chunked");
     let types: Vec<String> = arg("--types")
         .unwrap_or_else(|| "int64,float64,utf8,utf8view".into())
         .split(',')
         .map(String::from)
         .collect();
-    println!("rows,type,chunk_rows,chunks,load,concat_import_wall_ms,concat_import_cpu_ms,concat_ms,import_after_concat_ms,chunked_wall_ms,chunked_cpu_ms,single_import_wall_ms,single_import_cpu_ms,speedup,concat_page_aligned");
+    println!("label,rows,type,chunk_rows,chunks,load,load_end,concat_import_wall_ms,concat_import_cpu_ms,concat_ms,import_after_concat_ms,chunked_wall_ms,chunked_cpu_ms,single_import_wall_ms,single_import_cpu_ms,speedup,concat_page_aligned");
     for &n in &rows {
         for ty in &types {
             for chunk in [8192usize, n.div_ceil(16)] {
@@ -167,14 +172,18 @@ fn main() {
                     }
                     (concat_ms, import_ms)
                 });
-                let chunked = best(iters, || {
+                let chunked = if !with_chunked {
+                    Best { wall: f64::NAN, cpu: f64::NAN, parts: (0.0, 0.0) }
+                } else {
+                    best(iters, || {
                     let keep: Vec<Array> = cols
                         .iter()
                         .map(|c| Array::from_arrow_chunks(&c.iter().map(|a| a.as_ref()).collect::<Vec<_>>()).unwrap())
                         .collect();
                     assert_eq!(keep[0].len(), n);
                     (0.0, 0.0)
-                });
+                    })
+                };
                 let flat: Vec<ArrayRef> = cols
                     .iter()
                     .map(|c| arrow::compute::concat(&c.iter().map(|a| a.as_ref()).collect::<Vec<_>>()).unwrap())
@@ -185,8 +194,9 @@ fn main() {
                     (0.0, 0.0)
                 });
                 println!(
-                    "{n},{ty},{chunk},{},{l:.2},{:.2},{:.1},{:.2},{:.2},{:.2},{:.1},{:.2},{:.1},{:.2},{aligned}",
+                    "{label},{n},{ty},{chunk},{},{l:.2},{:.2},{:.2},{:.1},{:.2},{:.2},{:.2},{:.1},{:.2},{:.1},{:.2},{aligned}",
                     cols[0].len(),
+                    load(),
                     today.wall,
                     today.cpu,
                     today.parts.0,
