@@ -104,7 +104,8 @@ public enum PhysicalPlanner {
             return .maskFilter(try plan(child), pred)
 
         case .aggregate(let child, let aggs):
-            if case .filter(let base, let pred) = child, try canFuseAggregate(aggs, pred, base.schema()) {
+            if case .filter(let base, let pred) = child, try canFuseAggregate(aggs, pred, base.schema()),
+               try aggs.allSatisfy({ Executor.scalarKernelTakes($0, try base.schema()) }) {
                 return .fusedAggregate(try plan(base), filter: pred, aggregates: aggs)
             }
             return .fusedAggregate(try plan(child), filter: nil, aggregates: aggs)
@@ -198,8 +199,13 @@ public enum PhysicalPlanner {
 
     /// The fused group-by kernel finishes its sums with 32-bit atomics, which bounds the types it
     /// takes (see docs/EXPR.md). Everything else goes through `GroupBy`'s own kernels instead.
+    ///
+    /// A `count` never decides the path: it is the expression's non-null values on either one, and
+    /// the fused group-by counts what its kernel cannot read from the validity next to the kernel
+    /// (`fusedKernelTakes`).
     static func fusableGroupAggregate(_ a: ExprAggregate, _ s: PlanSchema) throws -> Bool {
-        guard let e = a.expr else { return a.op == .count }
+        if a.op == .count { return true }
+        guard let e = a.expr else { return false }
         let cols = s.exprColumns
         for c in e.referencedColumns where cols[c] == nil { return false }
         guard let t = try? ExprEmitter(schema: cols).typeOf(e) else { return false }
@@ -207,6 +213,41 @@ public enum PhysicalPlanner {
         case .count: return true
         case .sum, .mean: return t.isInteger || t == .float32
         case .min, .max: return (t.isInteger && t.bitWidth <= 32) || t == .float32
+        }
+    }
+}
+
+extension Executor {
+    /// Whether the fused group-by kernel computes this aggregate itself. It reads numeric expressions
+    /// only, so a `count` of anything else (utf8, boolean, temporal, decimal, nested, ...) is counted
+    /// by `aggregateOne` from the expression's validity.
+    static func fusedKernelTakes(_ a: ExprAggregate, _ s: PlanSchema) -> Bool {
+        guard a.op == .count, let e = a.expr else { return true }
+        let cols = s.exprColumns
+        for c in e.referencedColumns where cols[c] == nil { return false }
+        guard let t = try? ExprEmitter(schema: cols).typeOf(e) else { return false }
+        return t.isNumeric
+    }
+
+    /// The same for the whole-input reduce kernel, which also counts a boolean expression.
+    static func scalarKernelTakes(_ a: ExprAggregate, _ s: PlanSchema) -> Bool {
+        guard a.op == .count, let e = a.expr else { return true }
+        let cols = s.exprColumns
+        for c in e.referencedColumns where cols[c] == nil { return false }
+        guard let t = try? ExprEmitter(schema: cols).typeOf(e) else { return false }
+        return t.isNumeric || t == .boolean
+    }
+
+    /// Non-null values of a column of any type: the set bits of its logical validity.
+    static func validCount(_ c: AnyMetalArray) throws -> Int {
+        let n = c.length
+        guard let v = try c.logicalValidity() else { return n }
+        return withExtendedLifetime(v) {
+            let p = v.typed(UInt8.self)
+            var set = 0
+            for b in 0..<(n / 8) { set += p[b].nonzeroBitCount }
+            if n % 8 != 0 { set += (p[n / 8] & UInt8((1 << (n % 8)) - 1)).nonzeroBitCount }
+            return set
         }
     }
 }

@@ -415,7 +415,7 @@ public func am_group_by(_ keys: OpaquePointer?, _ keyCount: Int64, _ agg: Int32,
             case (4, .uint32(let x)): return .float64(try gb.mean(x))
             case (4, .int64(let x)): return .float64(try gb.mean(x))
             case (4, .uint64(let x)): return .float64(try gb.mean(x))
-            case (5, _): return .int64(try withPrimitive(v) { p in try countErased(gb, p.erased()) })
+            case (5, _): return .int64(try gb.countValid(v))     // non-null values, any type
             default: throw ArrowMetalError.unsupportedType("group-by agg \(agg) on \(v.arrowFormat)")
             }
         }
@@ -440,25 +440,6 @@ private func minMaxErased<K: ArrowIndex>(_ gb: GroupBy<K>, _ v: AnyMetalArray, i
     default: throw ArrowMetalError.unsupportedType("group-by min/max needs a 32-bit or narrower type")
     }
 }
-private func countErased<K: ArrowIndex>(_ gb: GroupBy<K>, _ v: AnyMetalArray) throws -> MetalArray<Int64> {
-    switch v {
-    case .int8(let x): return try gb.count(x)
-    case .uint8(let x): return try gb.count(x)
-    case .int16(let x): return try gb.count(x)
-    case .uint16(let x): return try gb.count(x)
-    case .int32(let x): return try gb.count(x)
-    case .uint32(let x): return try gb.count(x)
-    case .int64(let x): return try gb.count(x)
-    case .uint64(let x): return try gb.count(x)
-    case .float32(let x): return try gb.count(x)
-    case .float64(let x): return try gb.count(x)
-    case .boolean, .string, .temporal, .binary, .dictionary, .decimal, .list, .structure, .map, .union, .runEndEncoded:
-        throw ArrowMetalError.unsupportedType("count over non-numeric values")
-    case .null, .float16, .smallDecimal, .interval, .fixedBinary, .extended:
-        throw ArrowMetalError.unsupportedType("count over non-numeric values")
-    }
-}
-
 // MARK: - Strings
 
 /// A `utf8` **or** `binary` array: the two share a layout, and every Arrow name that reaches here is

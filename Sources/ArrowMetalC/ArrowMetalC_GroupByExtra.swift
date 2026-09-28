@@ -131,11 +131,12 @@ private func groupedAggregate(_ g: GroupByKeys, _ values: AnyMetalArray?, _ op: 
     default: break
     }
     guard let values else { throw ArrowMetalError.invalidArrowArray("am_group_agg_ex op \(op) needs a value column") }
+    // hash_count: the non-null values of a column of any type, from its validity alone.
+    if op == 2 { return .int64(try gb.countValid(values)) }
     if case .boolean(let b) = values {
         switch op {
         case 14: return .boolean(try gb.any(b))
         case 15: return .boolean(try gb.all(b))
-        case 2: return .int64(try gb.count(try b.toUInt8Array()))
         default: throw ArrowMetalError.unsupportedType("am_group_agg_ex op \(op) is not defined for a boolean column")
         }
     }
@@ -153,7 +154,6 @@ extension MetalArray: GroupedValueOps {
     fileprivate func apply<K: ArrowIndex>(_ gb: GroupBy<K>, _ op: Int32, _ p1: Double) throws -> AnyMetalArray {
         switch op {
         case 0: return try summed(gb)
-        case 2: return .int64(try gb.countValid(self))
         case 3: return .float64(try meaned(gb))
         case 4: return anyArray(try gb.minMax(self).min)
         case 5: return anyArray(try gb.minMax(self).max)

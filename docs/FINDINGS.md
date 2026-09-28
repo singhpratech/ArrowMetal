@@ -2,6 +2,62 @@
 
 Things learned the hard way. Add to this whenever something surprises you.
 
+## Round 15 (2026-09-27): a count that depended on its neighbours
+
+**What.** `count(expr)` in a plan's `group_by` gave three different answers for one column depending
+on the other aggregates of the same `group_by`. Alone, or next to aggregates the one-kernel group-by
+takes, a count of a Float64 column was right and a count of a utf8 column was rejected ("group_by
+count of a utf8 expression"). Next to a `sum`, `mean`, `min` or `max` over Float64, the count of the
+Float64 column failed ("group-by over Float64 values: cast to Float32 first"), and the count of the
+utf8 column returned the group's row count with its nulls: 4 for `["a", null, "b", null]`, where SQL's
+`count` is 2. No error was raised for the second. Found by a differential grid of group-by plans.
+
+**Cause.** One aggregate the one-kernel group-by cannot take (its sums finish with 32-bit atomics)
+sends the whole `group_by` through `GroupBy`'s per-aggregate kernels (`Executor.aggregateOne`). That
+path's `count` switched on the column's type: the numeric types went to `GroupBy.count(_:)`, whose
+shared accumulate kernel refuses a Float64 `MetalArray` before it looks at the kind, although a count
+reads only the validity bitmap; every type the switch did not list fell to `default:` and to
+`GroupBy.count()`, the row count. The one-kernel path reads numeric expressions only and rejected the
+rest. The same `default:` counted rows in the streaming group-by's per-batch count, for boolean,
+decimal, dictionary and nested columns (667 per group where 500 rows were non-null), and the dense-key
+streaming result left out a key whose rows were all null in the first counted or summed column,
+because it chose its groups by that aggregate's count of values instead of rows.
+
+**Fix.** A count is computed from validity and nothing else, for every type. `GroupBy.count(validity:)`
+runs the existing count kernel with a validity bitmap and the key column's buffer standing in for
+the values, which the count kind never loads; `GroupBy.countValid(_: AnyMetalArray)` takes a column of
+any type through `AnyMetalArray.logicalValidity()`, which is the column's own bitmap, or, where Arrow's
+nulls live elsewhere, one built on the host: all null for the `null` type, the code's and the
+dictionary entry's validity for a dictionary, the run's for run-end encoded, the selected child
+slot's for a union. The per-aggregate path, the streaming group-by, the C ABI's `hash_count` and the
+dense `am_group_by` count all call it. A `count` no longer decides the group-by path; in the one-kernel
+path a count of an expression the kernel does not read as a number is taken the same way next to the
+kernel, and the whole-table aggregate does the same. The dense-key streaming result keeps a row count
+per key, taken from a count the batch already has when its column holds no null.
+
+**Cost.** Over 10,000,000 rows and 200 groups the one-kernel group-by shapes (a filtered `sum` and
+row count, `count` of an int32 or Float64 column with 10% nulls, an int32 `sum` with both counts) run
+in the same time as before, 2.0-2.7 ms, each within 0.1 ms of its time before (best of 15 per run,
+best of six runs of each library, interleaved). On the per-aggregate kernels a Float64 `sum` next to
+`count(*)` is 5.63 ms against 6.34, next to the count of an int32 column 6.37 ms against 5.33, inside
+those shapes' run-to-run spread of 5.3-9.0 ms; next to the count of the Float64 column, which failed
+before, 5.43 ms. The dense-key streaming group-by now counts a column once per batch where `sum` and
+`count` share it (21.0-21.2 ms against 21.6-21.8 for the two over a column with nulls); a `sum` alone
+over a column with nulls adds one row count per batch, 20.5-21.5 ms against 19.3-20.3 ms best, over
+10,000,000 rows in 1,048,576-row batches.
+
+**Tests.** `GroupByCountTests` (Swift) checks 27 column types, the ten numeric types, boolean, utf8,
+utf8 views, binary, date32, timestamp, decimal128, list, struct, two dictionaries (null codes, null
+entries), fixed-size binary, float16, `null`, run-end encoded, a sparse union and an extension type,
+at null fractions 0, 0.1 and 1.0, alone, next to a Float64 `sum`, `mean`, `min` and `max`, and next
+to an int32 sum and a row count, against a count of the validity each column was built from; and the
+same types through the whole-table aggregate with and without a filter, the dense `GroupBy` API at 13
+and 5,000 keys, computed expressions with nulls, empty input, the streaming group-by with and without
+a dense key count, and the fused stream join aggregate on both sides.
+`python/tests/test_group_count.py` checks the plan runner, `am.group_by(...).count(...)`, the dense
+`count_values` and the streaming group-by against pyarrow's `is_valid` per key, and
+`rust/arrowmetal/tests/plan.rs` checks the two minimal cases above.
+
 ## Round 14 (2026-09-26): what the 0.3.0 reviews and sweeps found
 
 **TL;DR**

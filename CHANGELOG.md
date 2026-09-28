@@ -1,7 +1,29 @@
 # Changelog
 
 ## Unreleased
-Nothing yet.
+
+- `count(expr)` in a plan's `group_by` is the number of non-null values of `expr` in each group for a
+  column of every Arrow type, read from its validity bitmap alone. It had two wrong results when another
+  aggregate of the same `group_by` took the per-aggregate kernels (a `sum`, `mean`, `min` or `max` over
+  Float64): `count` of a Float64 column failed with "group-by over Float64 values: cast to Float32
+  first", and `count` of a column of any type other than the integers, floats and boolean (utf8,
+  binary, temporal, decimal, dictionary, nested) returned the group's row count, nulls included: 4 for
+  `count(s)` over `["a", null, "b", null]`, where the answer is 2. Alone, `count` of a utf8 column was
+  rejected ("group_by count of a utf8 expression"); it now runs, and so does a whole-table `count` of
+  it. A `count` no longer decides between the fused and the per-aggregate group-by. Direct callers of
+  the plan runner were affected (the Swift `LazyFrame`, `am.scan(...)` in Python, `am_plan_run`, the
+  Rust `run_plan` and the other bindings over it). The Polars `MetalEngine` was not: it does not
+  translate a `count` over a String column, and translates one over Float64 or Boolean as a sum of
+  validity bits.
+- The streaming group-by (`am_stream_group_by`, `stream.group_by(...)` in Python) returned the row
+  count for `count(column)` over a boolean, decimal, dictionary, list, struct and other non-numeric,
+  non-string column: 667 per group where 500 of the rows were non-null. It counts non-null values
+  now. With a dense key count, a key whose rows were all null in the first counted or summed column
+  was left out of the result; it is a group, with a count of 0.
+- `am_group_by` op 5 (count of values) takes a Float64 column, which it rejected, and a column of any
+  other type. `am_group_agg_ex` op 2 (`hash_count`) takes every type, as the header states; it rejected
+  utf8, binary, decimal, dictionary and nested columns. The fused stream join aggregate's `count` takes
+  a column of any type.
 
 ## 0.3.0 — 2026-09-26
 Everything below is new in 0.3.0. `MetalEngine()` decides per subtree from measured crossovers: in the

@@ -22,8 +22,12 @@ public struct GroupBy<K: ArrowIndex> {
     }
 
     /// Number of rows per key (rows with a null key are not counted).
-    public func count() throws -> MetalArray<Int64> {
-        let (_, counts) = try run(values: keys, kind: 3)
+    public func count() throws -> MetalArray<Int64> { try countRows(sync: true) }
+
+    /// `count()`, optionally left in the open batch (`sync` false) for a caller whose next reader is
+    /// another kernel of the same batch, so the count costs no flush of its own.
+    func countRows(sync: Bool) throws -> MetalArray<Int64> {
+        let (_, counts) = try run(values: keys, kind: 3, sync: sync)
         return MetalArray<Int64>(length: keyCount, nullCount: 0, validity: nil, values: counts, context: keys.context)
     }
 
@@ -117,11 +121,36 @@ public struct GroupBy<K: ArrowIndex> {
         return a
     }
 
-    /// Number of non-null values per key.
+    /// Number of non-null values per key, for every value type (Float64 included): a count reads the
+    /// validity bitmap and nothing else.
     public func count<T: ArrowPrimitive>(_ values: MetalArray<T>) throws -> MetalArray<Int64> {
         try check(values)
-        let (_, counts) = try run(values: values, kind: 3, countValues: true)
-        return MetalArray<Int64>(length: keyCount, nullCount: 0, validity: nil, values: counts, context: values.context)
+        return try count(validity: values.validity)
+    }
+
+    /// Number of non-null values per key of a column of **any** Arrow type: utf8, binary, boolean,
+    /// temporal, decimal, dictionary, nested, run-end encoded, union, `null` and extension columns
+    /// alike. The count comes from the column's logical validity (`AnyMetalArray.logicalValidity`)
+    /// alone, so no value type is ever rejected and no type falls back to counting rows.
+    public func countValid(_ column: AnyMetalArray) throws -> MetalArray<Int64> {
+        guard column.length == keys.length else { throw ArrowMetalError.lengthMismatch(keys.length, column.length) }
+        return try count(validity: try column.logicalValidity())
+    }
+
+    /// Number of rows per key whose bit is set in `validity`, a bitmap of `keys.length` bits starting
+    /// at bit 0; nil counts every row (as `count()` does).
+    ///
+    /// The count kernel reads the value validity and never the values, so the key column's own values
+    /// buffer stands in for them: the kernel is the one `count()` uses, with the value-validity flag on.
+    public func count(validity: MetalArrowBuffer?) throws -> MetalArray<Int64> {
+        guard let validity else { return try count() }
+        guard validity.byteCount >= Bitmap.byteCount(bits: keys.length) else {
+            throw ArrowMetalError.invalidArrowArray("count: the validity bitmap is shorter than the \(keys.length) rows")
+        }
+        let proxy = MetalArray<K>(length: keys.length, nullCount: 0, validity: validity, values: keys.values,
+                                  context: keys.context)
+        let (_, counts) = try run(values: proxy, kind: 3, countValues: true)
+        return MetalArray<Int64>(length: keyCount, nullCount: 0, validity: nil, values: counts, context: keys.context)
     }
 
     /// Min / max per key for 32-bit-or-narrower types (Int8/16/32, UInt8/16/32, Float32). NaN is skipped.
@@ -298,4 +327,83 @@ public struct GroupBy<K: ArrowIndex> {
 extension MetalArray where T: ArrowIndex {
     /// Convenience: `keys.groupBy(keyCount:)`.
     public func groupBy(keyCount: Int) throws -> GroupBy<T> { try GroupBy(keys: self, keyCount: keyCount) }
+}
+
+extension AnyMetalArray {
+    /// The column's **logical** validity: a bitmap of `length` bits from bit 0, set for each non-null
+    /// value, or nil when the column has no validity bitmap (every value is valid).
+    ///
+    /// For most types this is the column's own bitmap. The types whose nulls live elsewhere are
+    /// resolved on the host, as Arrow's logical nulls define them: a `null` column is all null; a
+    /// dictionary value is null when its code is null or the dictionary entry it points at is; a
+    /// run-end encoded value is null when its run's value is; a union value is null when the child
+    /// slot it selects is; an extension column is its storage.
+    public func logicalValidity() throws -> MetalArrowBuffer? {
+        switch self {
+        case .null(let a):
+            return try Self.hostBitmap(a.length, context) { _ in false }
+        case .dictionary(let codes, let values):
+            guard let vv = try values.logicalValidity() else { return codes.validity }
+            let n = values.length
+            return try withExtendedLifetime(vv) {
+                let vb = vv.typed(UInt8.self)
+                return try Self.hostBitmap(codes.length, context) { i in
+                    guard let c = codes[i] else { return false }
+                    return c >= 0 && Int(c) < n && Bitmap.isSet(vb, Int(c))
+                }
+            }
+        case .runEndEncoded(let runEnds, let values):
+            guard let vv = try values.logicalValidity() else { return nil }
+            let n = runEndLogicalLength(runEnds)
+            let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(Bitmap.byteCount(bits: n), 1), context: context)
+            withExtendedLifetime((runEnds, vv, out)) {
+                let ends = runEnds.valuePointer, vb = vv.typed(UInt8.self), o = out.mutableTyped(UInt8.self)
+                var previous = 0
+                for j in 0..<Swift.min(runEnds.length, values.length) {
+                    let end = Swift.min(Int(ends[j]), n)
+                    if Bitmap.isSet(vb, j) && end > previous { for i in previous..<end { Bitmap.set(o, i) } }
+                    previous = Swift.max(previous, end)
+                }
+            }
+            return out
+        case .union(let u):
+            let children = try u.children.map { try $0.logicalValidity() }
+            if children.allSatisfy({ $0 == nil }) { return nil }
+            return try withExtendedLifetime(children) {
+                let bits = children.map { $0?.typed(UInt8.self) }
+                return try Self.hostBitmap(u.length, context) { i in
+                    guard let (c, idx) = u.location(i) else { return false }
+                    guard let b = bits[c] else { return true }
+                    return Bitmap.isSet(b, idx)
+                }
+            }
+        case .extended(let e):
+            return try e.storage.logicalValidity()
+        default:
+            return validityBitmap
+        }
+    }
+
+    /// Whether any value may be logically null: the column's own null count, or a null its layout
+    /// keeps elsewhere (a dictionary entry, a union child). False means counting rows counts values.
+    public var mayHaveLogicalNulls: Bool {
+        switch self {
+        case .null(let a): return a.length > 0
+        case .dictionary(let codes, let values): return codes.nullCount != 0 || values.mayHaveLogicalNulls
+        case .union(let u): return u.children.contains { $0.mayHaveLogicalNulls }
+        case .runEndEncoded(_, let values): return values.mayHaveLogicalNulls
+        case .extended(let e): return e.storage.mayHaveLogicalNulls
+        default: return nullCount != 0
+        }
+    }
+
+    /// A host-built validity bitmap of `n` bits.
+    private static func hostBitmap(_ n: Int, _ ctx: MetalContext, _ valid: (Int) -> Bool) throws -> MetalArrowBuffer {
+        let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(Bitmap.byteCount(bits: n), 1), context: ctx)
+        withExtendedLifetime(out) {
+            let o = out.mutableTyped(UInt8.self)
+            for i in 0..<n where valid(i) { Bitmap.set(o, i) }
+        }
+        return out
+    }
 }

@@ -38,15 +38,11 @@ extension GroupBy {
     /// Arrow `hash_count_all`: rows per key, null values included. A key with no row is zero, never null.
     public func countAll() throws -> MetalArray<Int64> { try count() }
 
-    /// Arrow `hash_count`: non-null values per key, for **any** value type including Float64.
-    ///
-    /// `count(_:)` reads the values through a typed kernel and so rejects Float64; counting only ever
-    /// looks at the validity bitmap, so this reinterprets the values buffer as bytes and counts that.
+    /// Arrow `hash_count`: non-null values per key, for **any** value type including Float64. The
+    /// same count as `count(_:)`, which reads the validity bitmap alone; `countValid(_: AnyMetalArray)`
+    /// takes a column of any Arrow type.
     public func countValid<T: ArrowPrimitive>(_ values: MetalArray<T>) throws -> MetalArray<Int64> {
-        guard values.length == keys.length else { throw ArrowMetalError.lengthMismatch(keys.length, values.length) }
-        let proxy = MetalArray<UInt8>(length: values.length, nullCount: values.nullCount,
-                                      validity: values.validity, values: values.values, context: values.context)
-        return try count(proxy)
+        try count(values)
     }
 
     /// Arrow `hash_min_max`: the smallest and largest non-null value of each key, from **one** read of

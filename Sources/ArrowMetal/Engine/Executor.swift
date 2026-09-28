@@ -82,13 +82,33 @@ public enum Executor {
 
         case .fusedAggregate(let child, let filter, let aggs):
             let input = try node(child)
-            let r = try input.query(ExprQuery(filter: filter, terminal: .aggregate(aggs)))
             let schema = PlanSchema.of(input)
+            // A `count` of an expression the reduce kernel cannot read (utf8, temporal, nested, ...)
+            // is the expression's non-null values, from its validity. The planner only fuses a
+            // filter into this node when the kernel takes every aggregate, so `filter` is nil here
+            // whenever one is counted outside it.
+            let inKernel = aggs.map { scalarKernelTakes($0, schema) }
+            let kernelAggs = zip(aggs, inKernel).filter(\.1).map(\.0)
+            var scalars: [ExprScalar] = []
+            if !kernelAggs.isEmpty {
+                scalars = try input.query(ExprQuery(filter: filter, terminal: .aggregate(kernelAggs))).scalars
+                guard scalars.count == kernelAggs.count else {
+                    throw ArrowMetalError.invalidArrowArray("the fused aggregate returned \(scalars.count) of \(kernelAggs.count) aggregates")
+                }
+            }
             var names: [String] = [], cols: [AnyMetalArray] = []
-            for (i, n) in r.scalarNames.enumerated() {
-                names.append(n)
-                let want = (try? schema.aggregateField(aggs[i]))?.exprType
-                cols.append(try scalarColumn(r.scalars[i], as: want, context: try context(of: child)))
+            var next = 0
+            for (a, k) in zip(aggs, inKernel) {
+                names.append(a.name)
+                let s: ExprScalar
+                if k { s = scalars[next]; next += 1 } else {
+                    guard filter == nil, let e = a.expr else {
+                        throw ArrowMetalError.invalidArrowArray("count \(a.name) cannot be computed outside the fused aggregate")
+                    }
+                    s = .int(Int64(try validCount(try column(e, of: input))))
+                }
+                let want = (try? schema.aggregateField(a))?.exprType
+                cols.append(try scalarColumn(s, as: want, context: try context(of: child)))
             }
             return try MetalRecordBatch(names: names, columns: cols)
 
@@ -238,21 +258,36 @@ public enum Executor {
         var cols = try gk.groupKeys()
 
         if fused, gk.groupCount > 0 {
-            // One fused kernel for every aggregate at once, over the dense ids as the group key.
-            var qNames = input.names + ["__am_gid"]
-            var qCols = input.columns + [AnyMetalArray.int32(gk.ids)]
-            // Drop columns the aggregates never read so the kernel binds fewer buffers.
-            var used = Set<String>(["__am_gid"])
-            for a in aggs { used.formUnion(a.expr?.referencedColumns ?? []) }
-            var keepN: [String] = [], keepC: [AnyMetalArray] = []
-            for (i, n) in qNames.enumerated() where used.contains(n) { keepN.append(n); keepC.append(qCols[i]) }
-            qNames = keepN; qCols = keepC
-            let q = ExprQuery(groupKey: .column("__am_gid"), keyCount: gk.groupCount, keyName: "__am_gid",
-                              terminal: .aggregate(aggs))
-            let r = try runExprQuery(q, names: qNames, columns: qCols, context: ctx)
-            for (i, n) in r.names.enumerated() where n != "__am_gid" {
-                names.append(n)
-                cols.append(try gk.trimExported(r.columns[i]))
+            // One fused kernel for every aggregate at once, over the dense ids as the group key. A
+            // `count` of an expression the kernel cannot read as a number (utf8, a nested or decimal
+            // column, ...) is counted from the expression's validity instead, next to the kernel.
+            let schema = PlanSchema.of(input)
+            let inKernel = aggs.map { fusedKernelTakes($0, schema) }
+            let kernelAggs = zip(aggs, inKernel).filter(\.1).map(\.0)
+            var fromKernel: [AnyMetalArray] = []
+            if !kernelAggs.isEmpty {
+                var qNames = input.names + ["__am_gid"]
+                var qCols = input.columns + [AnyMetalArray.int32(gk.ids)]
+                // Drop columns the aggregates never read so the kernel binds fewer buffers.
+                var used = Set<String>(["__am_gid"])
+                for a in kernelAggs { used.formUnion(a.expr?.referencedColumns ?? []) }
+                var keepN: [String] = [], keepC: [AnyMetalArray] = []
+                for (i, n) in qNames.enumerated() where used.contains(n) { keepN.append(n); keepC.append(qCols[i]) }
+                qNames = keepN; qCols = keepC
+                let q = ExprQuery(groupKey: .column("__am_gid"), keyCount: gk.groupCount, keyName: "__am_gid",
+                                  terminal: .aggregate(kernelAggs))
+                let r = try runExprQuery(q, names: qNames, columns: qCols, context: ctx)
+                for (i, n) in r.names.enumerated() where n != "__am_gid" { fromKernel.append(r.columns[i]) }
+                guard fromKernel.count == kernelAggs.count else {
+                    throw ArrowMetalError.invalidArrowArray("the fused group-by returned \(fromKernel.count) of \(kernelAggs.count) aggregates")
+                }
+            }
+            var next = 0
+            for (a, k) in zip(aggs, inKernel) {
+                names.append(a.name)
+                let c: AnyMetalArray
+                if k { c = fromKernel[next]; next += 1 } else { c = try aggregateOne(gk, a, over: input, ctx) }
+                cols.append(try gk.trimExported(c))
             }
             return try MetalRecordBatch(names: names, columns: cols)
         }
@@ -276,20 +311,9 @@ public enum Executor {
         let values = try column(e, of: input)
         switch a.op {
         case .count:
-            switch values {
-            case .int8(let v): return .int64(try gb.count(v))
-            case .int16(let v): return .int64(try gb.count(v))
-            case .int32(let v): return .int64(try gb.count(v))
-            case .int64(let v): return .int64(try gb.count(v))
-            case .uint8(let v): return .int64(try gb.count(v))
-            case .uint16(let v): return .int64(try gb.count(v))
-            case .uint32(let v): return .int64(try gb.count(v))
-            case .uint64(let v): return .int64(try gb.count(v))
-            case .float32(let v): return .int64(try gb.count(v))
-            case .float64(let v): return .int64(try gb.count(v))
-            case .boolean(let v): return .int64(try gb.count(try v.toUInt8Array()))
-            default: return .int64(try gb.count())
-            }
+            // The non-null values of the expression, from its logical validity alone: every Arrow
+            // type counts the same way, and none falls back to the row count.
+            return .int64(try gb.countValid(values))
         case .sum:
             switch values {
             case .int8(let v): return .int64(try gb.sum(v))

@@ -1149,8 +1149,8 @@ class _Translator:
                     aggs.append(["count", name, ""])
                     fix.append((name, "i64", want, "count"))
                 elif keys and arg.code in ("f64", "bool"):
-                    # ArrowMetal's group-by will not read Float64 or Boolean values even to count
-                    # them; the validity bits summed per group are the same count.
+                    # The validity bits summed per group: the same number as a count of the
+                    # non-null values.
                     aggs.append(["sum", name, f"(cast (is_valid {arg.s}) u32)"])
                     fix.append((name, "u64", want, "zero"))
                 else:

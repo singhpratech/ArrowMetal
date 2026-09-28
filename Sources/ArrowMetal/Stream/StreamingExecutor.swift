@@ -544,6 +544,8 @@ public final class StreamGroupByOperator: StreamOperator {
     /// GPU-resident dense state, one array per aggregate.
     private var denseSum: [AnyMetalArray?] = []
     private var denseCount: [MetalArray<Int64>?] = []
+    /// Rows per dense key, so a key whose rows are all null in every aggregated column is still a group.
+    private var denseRows: MetalArray<Int64>?
     private var denseMin: [AnyMetalArray?] = []
     private var denseMax: [AnyMetalArray?] = []
     private var spilled = false
@@ -616,7 +618,7 @@ public final class StreamGroupByOperator: StreamOperator {
             switch a.op {
             // `count(col)` needs the column's validity, which the accumulate reads out of the widened
             // payload — unless the column has no nulls at all, when counting rows is counting values.
-            case .count: if c.nullCount != 0 && !canWiden64(c) { return false }
+            case .count: if c.mayHaveLogicalNulls && !canWiden64(c) { return false }
             case .sum, .mean: if !canWiden64(c) { return false }
             default: return false
             }
@@ -672,10 +674,24 @@ public final class StreamGroupByOperator: StreamOperator {
             // Dense path: the GPU keeps the global table; nothing crosses to the host per batch.
             let gb = try GroupBy(keys: idx, keyCount: K)
             var partials: [(AnyMetalArray?, MetalArray<Int64>?, AnyMetalArray?, AnyMetalArray?)] = []
+            // One count per column per batch: `sum(v)` and `count(v)` share theirs.
+            var counts: [String: MetalArray<Int64>] = [:]
             for a in aggregates {
-                partials.append(try densePartial(a, gb, work))
+                partials.append(try densePartial(a, gb, work, &counts))
             }
-            return DensePartial(parts: partials)
+            // Rows per key: a count this batch already has when its column holds no null (or it is
+            // count(*)), otherwise one more count, left in the batch `process` runs in (the merge
+            // reads it after that batch is flushed).
+            var rows: MetalArray<Int64>? = counts[""]
+            if rows == nil {
+                for a in aggregates {
+                    guard let c = a.column, let n = counts[c] else { continue }
+                    if try !column(a, work).mayHaveLogicalNulls { rows = n; break }
+                }
+            }
+            let rowCounts: MetalArray<Int64>
+            if let rows { rowCounts = rows } else { rowCounts = try gb.countRows(sync: false) }
+            return DensePartial(parts: partials, rows: rowCounts)
         }
 
         // Arbitrary path with an integer key: the global table stays on the GPU, so this batch's one
@@ -743,7 +759,10 @@ public final class StreamGroupByOperator: StreamOperator {
 
     final class DensePartial {
         let parts: [(AnyMetalArray?, MetalArray<Int64>?, AnyMetalArray?, AnyMetalArray?)]
-        init(parts: [(AnyMetalArray?, MetalArray<Int64>?, AnyMetalArray?, AnyMetalArray?)]) { self.parts = parts }
+        /// Rows per key in this batch, null values included.
+        let rows: MetalArray<Int64>?
+        init(parts: [(AnyMetalArray?, MetalArray<Int64>?, AnyMetalArray?, AnyMetalArray?)],
+             rows: MetalArray<Int64>? = nil) { self.parts = parts; self.rows = rows }
     }
     struct HostPartial {
         let groupCount: Int
@@ -754,17 +773,23 @@ public final class StreamGroupByOperator: StreamOperator {
     }
 
     /// One batch's dense-key aggregate arrays, still on the GPU.
-    private func densePartial(_ a: StreamAggregate, _ gb: GroupBy<Int32>, _ batch: MetalRecordBatch)
+    private func densePartial(_ a: StreamAggregate, _ gb: GroupBy<Int32>, _ batch: MetalRecordBatch,
+                              _ counts: inout [String: MetalArray<Int64>])
         throws -> (AnyMetalArray?, MetalArray<Int64>?, AnyMetalArray?, AnyMetalArray?) {
+        // Non-null values of the aggregate's column per key (rows for count(*)), once per batch.
+        func counted() throws -> MetalArray<Int64> {
+            let key = a.column ?? ""
+            if let c = counts[key] { return c }
+            let c = a.column == nil ? try gb.count() : try countValid(try column(a, batch), gb)
+            counts[key] = c
+            return c
+        }
         switch a.op {
-        case .count where a.column == nil:
-            return (nil, try gb.count(), nil, nil)
         case .count:
-            let col = try column(a, batch)
-            return (nil, try countValid(col, gb), nil, nil)
+            return (nil, try counted(), nil, nil)
         case .sum, .mean:
             let col = try column(a, batch)
-            return (try groupSum(col, gb), try countValid(col, gb), nil, nil)
+            return (try groupSum(col, gb), try counted(), nil, nil)
         case .min:
             let col = try column(a, batch)
             return (nil, nil, try groupMinMax(col, gb, isMin: true), nil)
@@ -996,6 +1021,7 @@ public final class StreamGroupByOperator: StreamOperator {
             if let mn { denseMin[i] = try elementwiseMinMax(denseMin[i], mn, isMin: true) }
             if let mx { denseMax[i] = try elementwiseMinMax(denseMax[i], mx, isMin: false) }
         }
+        if let r = d.rows { denseRows = denseRows == nil ? r : try denseRows!.add(r) }
         // Spill check: the state is K entries per aggregate; if it outgrew the budget, move it to the
         // host table and continue there. (In practice K is fixed, so this fires on the first batch.)
         let bytes = (denseKeyCount ?? 0) * aggregates.count * 8 * 2
@@ -1239,8 +1265,10 @@ public final class StreamGroupByOperator: StreamOperator {
             mins.append(mn == nil ? [] : try mn!.streamValues())
             maxs.append(mx == nil ? [] : try mx!.streamValues())
         }
+        let rows = try d.rows.map { try AnyMetalArray.int64($0).streamValues() } ?? []
         for k in 0..<K {
             var any = false
+            if rows.count > k, case .int(let n) = rows[k], n > 0 { any = true }
             for i in 0..<aggregates.count {
                 if counts[i].count > k, case .int(let n) = counts[i][k], n > 0 { any = true }
                 if sums[i].count > k, !sums[i][k].isNull { any = true }
@@ -1276,8 +1304,10 @@ public final class StreamGroupByOperator: StreamOperator {
             mins.append(denseMin[i] == nil ? [] : try denseMin[i]!.streamValues())
             maxs.append(denseMax[i] == nil ? [] : try denseMax[i]!.streamValues())
         }
+        let rows = try denseRows.map { try AnyMetalArray.int64($0).streamValues() } ?? []
         for k in 0..<K {
             var any = false
+            if rows.count > k, case .int(let n) = rows[k], n > 0 { any = true }
             for i in 0..<aggregates.count {
                 if counts[i].count > k, case .int(let n) = counts[i][k], n > 0 { any = true }
                 if sums[i].count > k, !sums[i][k].isNull { any = true }
@@ -1295,7 +1325,7 @@ public final class StreamGroupByOperator: StreamOperator {
                 if maxs[i].count > k, !maxs[i][k].isNull { shard.accs[base + i].maxV = maxs[i][k] }
             }
         }
-        denseSum = []; denseCount = []; denseMin = []; denseMax = []
+        denseSum = []; denseCount = []; denseMin = []; denseMax = []; denseRows = nil
     }
 
     public func finish() throws -> StreamResult {
@@ -1377,6 +1407,7 @@ public final class StreamGroupByOperator: StreamOperator {
         }
         // Drop keys no row ever landed on, so the result matches the arbitrary-key path.
         let batch = try MetalRecordBatch(names: names, columns: cols)
+        if let rows = denseRows { return try batch.filter(try rows.compare(.gt, 0)) }
         if let ci = aggregates.firstIndex(where: { $0.op == .count || $0.op == .sum || $0.op == .mean }),
            let counts = denseCount[ci] {
             let mask = try counts.compare(.gt, 0)
@@ -1536,23 +1567,9 @@ func groupMinMax(_ col: AnyMetalArray, _ gb: GroupBy<Int32>, isMin: Bool) throws
     }
 }
 
+/// Non-null values per group of a column of any type, from its logical validity alone.
 func countValid(_ col: AnyMetalArray, _ gb: GroupBy<Int32>) throws -> MetalArray<Int64> {
-    switch col {
-    case .int8(let a): return try gb.countValid(a)
-    case .int16(let a): return try gb.countValid(a)
-    case .int32(let a): return try gb.countValid(a)
-    case .int64(let a): return try gb.countValid(a)
-    case .uint8(let a): return try gb.countValid(a)
-    case .uint16(let a): return try gb.countValid(a)
-    case .uint32(let a): return try gb.countValid(a)
-    case .uint64(let a): return try gb.countValid(a)
-    case .float32(let a): return try gb.countValid(a)
-    case .float64(let a): return try gb.countValid(a)
-    case .temporal(let t): return try gb.countValid(try t.int64Values())
-    case .string(let a), .binary(let a):
-        return try gb.countValid(try a.byteLength())
-    default: return try gb.count()
-    }
+    try gb.countValid(col)
 }
 
 func toDouble(_ col: AnyMetalArray) throws -> MetalArray<Double> {

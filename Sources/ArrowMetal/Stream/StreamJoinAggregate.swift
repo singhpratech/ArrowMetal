@@ -350,6 +350,21 @@ struct FusedJoinColumn {
     var owner: AnyObject
 }
 
+/// What a fused `count(column)` reads: the validity bit and nothing else, so a column of any type
+/// counts. A numeric column is bound as it is; any other type binds its logical validity
+/// (`AnyMetalArray.logicalValidity`), with a stand-in for the values buffer the count never loads.
+func fusedJoinCountColumn(_ a: AnyMetalArray, _ name: String) throws -> FusedJoinColumn {
+    switch a {
+    case .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .float32, .float64:
+        return try fusedJoinColumn(a, name)
+    default:
+        let validity = try a.logicalValidity()
+        let stand = try validity ?? MetalArrowBuffer.allocate(byteCount: 16, context: a.context)
+        return FusedJoinColumn(values: stand, validity: validity, elementType: "uchar", kind: .int64,
+                               length: a.length, owner: stand)
+    }
+}
+
 /// The buffers, MSL element type and accumulator width of a numeric column.
 ///
 /// Float64 arrives as `ulong` bit patterns because Metal has no `double`; float32 is widened into the
@@ -522,7 +537,7 @@ public final class BroadcastJoinAggregateOperator: StreamOperator {
             case .probe(let n): column = batch[n]!
             case .build(let n): column = build[n]!
             }
-            let fc = try fusedJoinColumn(column, name)
+            let fc = s.op == .count ? try fusedJoinCountColumn(column, name) : try fusedJoinColumn(column, name)
             let isBuild: Bool
             if case .build = side { isBuild = true } else { isBuild = false }
             newSides.append(side)
@@ -585,7 +600,7 @@ public final class BroadcastJoinAggregateOperator: StreamOperator {
                 columns.append(nil)
                 continue
             }
-            let fc = try fusedJoinColumn(c, name)
+            let fc = slots[i].op == .count ? try fusedJoinCountColumn(c, name) : try fusedJoinColumn(c, name)
             guard fc.elementType == slots[i].elementType else {
                 throw ArrowMetalError.unsupportedType(
                     "column \(name) changed type mid-stream (\(slots[i].elementType) then \(fc.elementType))")

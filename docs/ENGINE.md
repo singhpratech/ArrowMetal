@@ -428,6 +428,10 @@ translatable subtrees it runs: the defaults").
   atomics support (MSL has no 64-bit atomic add): `sum`/`mean` over any integer or `float32`,
   `min`/`max` over a 32-bit-or-narrower integer or `float32`. Anything else — a `float64` sum, a
   64-bit `min` — silently takes `GroupBy`'s own per-aggregate kernels instead, which `explain()` says.
+- **`count(expr)` is the number of non-null values of `expr`** for a column of any type, on both
+  paths and in a whole-table aggregate. A count never decides the path: a count of an expression the
+  fused kernel does not read as a number (utf8, boolean, temporal, decimal, nested, dictionary, ...)
+  is taken from the column's validity bitmap next to the kernel.
 - **Group order is not Polars'.** `GroupByKeys` emits groups ascending by key for numeric, boolean,
   temporal and decimal keys and in first-seen order for `utf8`; pyarrow and Polars use first-seen for
   everything. Sort both sides before comparing.

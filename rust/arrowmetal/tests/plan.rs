@@ -179,3 +179,63 @@ fn a_plan_over_an_empty_table_produces_no_rows() {
     assert_eq!(out.row_count(), 0);
     assert_eq!(out.column(0).unwrap().to_arrow().unwrap().len(), 0);
 }
+
+fn group_count_source(cols: Vec<(&str, ArrayRef)>) -> Source {
+    Source::new(
+        "t",
+        cols.into_iter().map(|(n, a)| (n.to_string(), Array::from_arrow(a.as_ref()).unwrap())).collect(),
+    )
+    .unwrap()
+}
+
+fn group_by_k(aggs: &str) -> String {
+    format!(r#"{{"op":"group_by","keys":[["k","(col \"k\")"]],"aggs":[{aggs}],"input":{{"op":"scan","source":"t"}}}}"#)
+}
+
+fn int64_column(out: &arrowmetal::PlanResult, i: usize) -> Vec<Option<i64>> {
+    let a = out.column(i).unwrap().to_arrow().unwrap();
+    a.as_any().downcast_ref::<Int64Array>().unwrap().iter().collect()
+}
+
+/// `count(v)` over Float64 next to a Float64 sum / min / max / mean (the per-aggregate group-by)
+/// counts the non-null values; it used to fail with "cast to Float32 first".
+#[test]
+fn group_by_count_of_float64_next_to_a_float64_aggregate() {
+    use arrow::array::{Float64Array, Int32Array};
+    let k: ArrayRef = Arc::new(Int32Array::from(vec![0, 1, 0, 1]));
+    let v: ArrayRef = Arc::new(Float64Array::from(vec![Some(1.0), Some(2.0), None, Some(4.0)]));
+    let s = group_count_source(vec![("k", k), ("v", v)]);
+    for other in ["sum", "min", "max", "mean"] {
+        let aggs = format!(r#"["{other}","a","(col \"v\")"],["count","n","(col \"v\")"]"#);
+        let out = run_plan(&group_by_k(&aggs), &[&s], true).unwrap();
+        let keys = out.column(0).unwrap().to_arrow().unwrap();
+        let keys = keys.as_any().downcast_ref::<Int32Array>().unwrap();
+        let n = int64_column(&out, 2);
+        assert_eq!(keys.len(), 2, "{other}");
+        for (i, key) in keys.iter().enumerate() {
+            let want = if key == Some(0) { 1 } else { 2 };
+            assert_eq!(n[i], Some(want), "{other} key {key:?}");
+        }
+    }
+}
+
+/// `count(s)` over utf8 is the number of non-null strings: alone, and next to a Float64 sum, where
+/// it used to return the row count (4) instead of 2.
+#[test]
+fn group_by_count_of_utf8_counts_non_null_strings() {
+    use arrow::array::{Float64Array, StringArray};
+    let k: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 1, 1, 1]));
+    let s: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None, Some("b"), None]));
+    let v: ArrayRef = Arc::new(Float64Array::from(vec![1.0f64, 2.0, 3.0, 4.0]));
+    let source = group_count_source(vec![("k", k), ("s", s), ("v", v)]);
+
+    let alone = run_plan(&group_by_k(r#"["count","n","(col \"s\")"]"#), &[&source], true).unwrap();
+    assert_eq!(int64_column(&alone, 1), vec![Some(2)]);
+
+    let with_sum =
+        run_plan(&group_by_k(r#"["count","n","(col \"s\")"],["sum","t","(col \"v\")"]"#), &[&source], true)
+            .unwrap();
+    assert_eq!(int64_column(&with_sum, 1), vec![Some(2)]);
+    let t = with_sum.column(2).unwrap().to_arrow().unwrap();
+    assert_eq!(t.as_any().downcast_ref::<Float64Array>().unwrap().value(0), 10.0);
+}
