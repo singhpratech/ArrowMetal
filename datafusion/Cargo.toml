@@ -1,4 +1,4 @@
-# ArrowMetal as a DataFusion physical optimizer rule: a spike.
+# ArrowMetal as an Apache DataFusion physical optimizer rule (docs/DATAFUSION.md).
 #
 # Its own workspace, like rust/ and polars-plugin/, so the DataFusion dependency tree stays out of
 # the plain Rust binding's build.
@@ -10,16 +10,24 @@ version = "0.0.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/singhpratech/ArrowMetal"
-rust-version = "1.85"
-description = "Spike: ArrowMetal as a DataFusion physical optimizer rule on Apple silicon GPUs"
+homepage = "https://arrowmetal.org"
+documentation = "https://github.com/singhpratech/ArrowMetal/blob/main/docs/DATAFUSION.md"
+readme = "README.md"
+# DataFusion 55.1.0 declares rust-version 1.94.0.
+rust-version = "1.94"
+description = "A DataFusion physical optimizer rule that runs full sorts on Apple silicon GPUs through ArrowMetal"
+keywords = ["datafusion", "arrow", "metal", "gpu", "apple-silicon"]
+categories = ["database"]
 publish = false
 build = "build.rs"
 
 [dependencies]
-arrowmetal = { path = "../rust/arrowmetal" }
-# datafusion 55.1.0 depends on arrow ^59.2.0: the same arrow-rs major as the arrowmetal crate, so
-# RecordBatches pass between the two with no bridge.
-datafusion = { version = "55.1.0", default-features = false, features = ["sql"] }
+# By path for this repository, and by version for a registry build.
+arrowmetal = { path = "../rust/arrowmetal", version = "0.3.0" }
+# Pinned to the release the differential grid and the benchmark ran on: DataFusion's physical-plan
+# API changes between releases. 55.1.0 depends on arrow ^59.2.0, the same arrow-rs major as the
+# arrowmetal crate, so RecordBatches pass between the two with no bridge.
+datafusion = { version = "=55.1.0", default-features = false, features = ["sql"] }
 arrow = { version = "59", default-features = false, features = ["ffi"] }
 futures = "0.3"
 tokio = { version = "1", features = ["rt"] }
@@ -28,9 +36,12 @@ tokio = { version = "1", features = ["rt"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 rand = "0.9"
 # The benchmark (examples/bench.rs) registers Parquet files; the library itself stays without it.
-datafusion = { version = "55.1.0", default-features = false, features = ["sql", "parquet"] }
+datafusion = { version = "=55.1.0", default-features = false, features = ["sql", "parquet"] }
 libc = "0.2"
 
 # examples/bench.rs is timed from a release build with thin LTO.
 [profile.release]
 lto = "thin"
+
+[package.metadata.docs.rs]
+targets = ["aarch64-apple-darwin"]

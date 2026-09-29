@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- `datafusion-arrowmetal` (`datafusion/`, docs/DATAFUSION.md): a physical optimizer rule for Apache
+  DataFusion 55.1. Registered on a `SessionContext` (`session_context`, `with_arrowmetal` or
+  `physical_optimizer_rules`), it replaces a full `ORDER BY` whose input has an exact row count of at
+  least 250,000 with `MetalExec`, which collects the input, sorts it on the GPU through the plan runner
+  with DataFusion's null placement and float order (IEEE 754 totalOrder), and returns DataFusion's
+  batches. Top-k, aggregates and filters are translated too and switched off by default. Every node
+  the rule looks at is reported with the reason it was taken or left; an ArrowMetal error at run time
+  runs the replaced DataFusion subtree instead.
+  - Correctness: `tests/grid.rs` runs 4,656 query pairs with and without the rule (sorts with every
+    null placement and direction, floats with ±0.0, ±inf, NaN, -NaN and NaN payloads, strings, nulls,
+    one and several partitions): 0 mismatches.
+  - Measured on an M4 Max, DataFusion's defaults (16 partitions), with a warm-up before timing,
+    best of 5 (`datafusion/results/datafusion_sort_warm_2026-09-29.csv`): full sorts by an int64,
+    Float64, Float32 or string key are 6.9x to 28.8x faster than DataFusion alone from 250,000 to
+    50M rows (int64 at 50M: 1,581.22 → 69.74 ms, 6,104.1 → 125.8 CPU-ms). Over DataFusion's Parquet
+    reader, 10.8x to 16.5x at 10M and 50M rows (`datafusion/results/datafusion_rule_2026-09-29.csv`).
+    With the rule switched on for them (DataFusion alone ÷ with the rule): top-k 0.14x to 0.41x from
+    250,000 to 50M rows, filters 0.51x to 0.74x, and group-bys 0.26x to 3.23x at 10M and 50M rows
+    depending on the aggregate and the number of groups.
+
 - Chunked import: a column held as many Arrow arrays (a pyarrow `ChunkedArray`, a multi-chunk Polars
   Series, one column of a stream of arrow-rs `RecordBatch`es) imports in one call, each chunk written
   straight into the final Metal buffers on the CPU cores in parallel, with no concatenated copy first.

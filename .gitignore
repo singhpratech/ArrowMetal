@@ -36,5 +36,5 @@ r/arrowmetal/src/*.so
 r/arrowmetal.Rcheck/
 r/*.tar.gz
 r/arrowmetal/src/lib_path*.h
-# DataFusion integration spike build artefacts
+# DataFusion crate build artefacts
 datafusion/target/
