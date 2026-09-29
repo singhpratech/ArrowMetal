@@ -304,8 +304,6 @@ improve](#aggregates)).
 
 ---
 
-## What it leaves, and why---
-
 ## What it leaves, and why
 
 | Shape | Default | Why |
