@@ -280,7 +280,7 @@ Sizes are at or below 10M elements throughout.
 
 ## What is not wrapped
 
-The C ABI has 222 entry points; this binding resolves 33 of them. Not wrapped, and not tested from
+The C ABI has 283 entry points; this binding resolves 33 of them. Not wrapped, and not tested from
 Go:
 
 - **Arithmetic and math**: `am_arith_scalar`, `am_arith_array`, `am_unary`, `am_binary`,

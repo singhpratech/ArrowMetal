@@ -197,7 +197,7 @@ column; and multi-chunk, single-chunk and empty ChunkedArrays.
 
 ## Not covered
 
-The binding resolves 34 of the ABI's 222 entry points. Not wrapped, and reachable only from
+The binding resolves 34 of the ABI's 283 entry points. Not wrapped, and reachable only from
 Python or Swift for now:
 
 - arithmetic (`am_arith_*`, `am_unary`, `am_binary`, checked variants), casts (`am_cast`),

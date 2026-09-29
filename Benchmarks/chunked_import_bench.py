@@ -25,14 +25,15 @@ import time
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 
 import arrowmetal as am
 
 
 def column(ty, rows, chunk, seed):
     rng = np.random.default_rng(seed)
-    words = np.array([f"a-longer-name-{k:04d}" if k % 3 == 0 else f"name-{k:04d}" for k in range(1000)],
-                     dtype=object)
+    # 1,000 distinct strings, a third of them over 12 bytes (out of line in the view layout).
+    words = pa.array([f"a-longer-name-{k:04d}" if k % 3 == 0 else f"name-{k:04d}" for k in range(1000)], pa.string())
     out = []
     for at in range(0, rows, chunk):
         n = min(chunk, rows - at)
@@ -41,7 +42,7 @@ def column(ty, rows, chunk, seed):
         elif ty == "float64":
             out.append(pa.array(rng.random(n) * 1e6))
         else:
-            a = pa.array(words[rng.integers(0, 1000, n)], pa.string())
+            a = pc.take(words, pa.array(rng.integers(0, 1000, n)))      # a new allocation per chunk
             out.append(a.cast(pa.string_view()) if ty == "utf8view" else a)
     return pa.chunked_array(out)
 
@@ -65,17 +66,21 @@ def main():
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--out")
     ap.add_argument("--label", default="new")
+    ap.add_argument("--chunkings", default="8192,/16",
+                    help="chunk sizes: a row count, or /k for rows/k (k chunks)")
     ap.add_argument("--no-chunked", action="store_true",
                     help="skip the chunked import (for a library without am_import_chunks)")
     args = ap.parse_args()
     fields = ["label", "rows", "type", "chunk_rows", "chunks", "load", "load_end", "combine_import_wall_ms", "combine_import_cpu_ms",
               "combine_ms", "import_after_combine_ms", "chunked_wall_ms", "chunked_cpu_ms",
               "single_import_wall_ms", "single_import_cpu_ms", "speedup"]
-    w = csv.DictWriter(open(args.out, "w", newline="") if args.out else sys.stdout, fieldnames=fields)
+    f = open(args.out, "w", newline="") if args.out else sys.stdout
+    w = csv.DictWriter(f, fieldnames=fields)
     w.writeheader()
     for n in [int(x) for x in args.rows.split(",")]:
         for ty in args.types.split(","):
-            for chunk in (8192, -(-n // 16)):
+            for spec in args.chunkings.split(","):
+                chunk = -(-n // int(spec[1:])) if spec.startswith("/") else int(spec)
                 cols = [column(ty, n, chunk, 7 + c) for c in range(3)]
                 load = os.getloadavg()[0]
 
@@ -105,6 +110,7 @@ def main():
                             "import_after_combine_ms": f"{imp:.2f}", "chunked_wall_ms": f"{cw:.2f}",
                             "chunked_cpu_ms": f"{cc:.1f}", "single_import_wall_ms": f"{sw:.2f}",
                             "single_import_cpu_ms": f"{sc:.1f}", "speedup": f"{tw / cw:.2f}"})
+                f.flush()
 
 
 if __name__ == "__main__":

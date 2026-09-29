@@ -155,9 +155,13 @@ public func importArrowChunks(schema: UnsafePointer<ArrowSchema>, arrays: [Unsaf
         throw ArrowMetalError.unsupportedType("chunked import does not take \(fmt) arrays; import their concatenation")
     }
     // Validate every chunk before anything is read, copied or moved.
+    var seen = Set<UnsafeMutablePointer<ArrowArray>>()
+    seen.reserveCapacity(arrays.count)
     for (i, p) in arrays.enumerated() {
         let a = p.pointee
         guard a.release != nil else { throw ArrowMetalError.releasedArray }
+        // One struct passed twice would be moved (and released) twice.
+        guard seen.insert(p).inserted else { throw ArrowMetalError.invalidArrowArray("chunk \(i): the same ArrowArray twice") }
         guard a.length >= 0, a.offset >= 0 else {
             throw ArrowMetalError.invalidArrowArray("chunk \(i): negative length or offset")
         }
@@ -211,7 +215,9 @@ public func importArrowChunks(schema: UnsafePointer<ArrowSchema>, arrays: [Unsaf
     case .null:
         result = .null(MetalNullArray(length: total, context: context))
     case .fixed(let width, let make):
-        let values = try MetalArrowBuffer.allocate(byteCount: Swift.max(total * width, 1), zeroed: false, context: context)
+        let (valueBytes, overflow) = total.multipliedReportingOverflow(by: width)
+        guard !overflow else { throw ArrowMetalError.invalidArrowArray("chunk lengths overflow") }
+        let values = try MetalArrowBuffer.allocate(byteCount: Swift.max(valueBytes, 1), zeroed: false, context: context)
         if width > 0 {
             let dst = values.mutableContents
             parallelCopy(refs.map { c in
@@ -435,9 +441,10 @@ private func mergeOffsetStrings(_ refs: [ChunkRef], total: Int, large: Bool,
         guard s >= 0, e >= s else { throw ArrowMetalError.invalidArrowArray("chunk \(i): offsets run backwards") }
         if e > s, c.buffer(2) == nil { throw ArrowMetalError.invalidArrowArray("chunk \(i): data buffer is null") }
         starts.append(s); bases.append(bytes)
-        bytes += e - s
+        let (sum, overflow) = bytes.addingReportingOverflow(e - s)
+        bytes = sum
         // The limit the large_utf8 import has: every string kernel reads int32 offsets.
-        guard bytes < Int(Int32.max) else {
+        guard !overflow, bytes < Int(Int32.max) else {
             throw ArrowMetalError.unsupportedType("\(large ? "large_" : "")utf8 chunks over 2 GB in total")
         }
     }
@@ -544,7 +551,7 @@ private func mergeViewStrings(_ refs: [ChunkRef], total: Int, binary: Bool, owne
         let cap = Int(Int32.max)
         var groups: [[Int]] = [[]], fill = [0]
         for (d, b) in distinct.enumerated() {
-            if fill[fill.count - 1] + b.size > cap { groups.append([]); fill.append(0) }
+            if fill[fill.count - 1] > 0, fill[fill.count - 1] + b.size > cap { groups.append([]); fill.append(0) }
             placeIndex[d] = Int32(groups.count - 1)
             placeBase[d] = Int32(fill[fill.count - 1])
             groups[groups.count - 1].append(d)

@@ -480,6 +480,21 @@ final class ChunkedImportTests: XCTestCase {
         schema("l") { XCTAssertTrue(chunkedImportSupported(schema: $0)) }
     }
 
+    /// One ArrowArray struct passed twice is refused before anything is moved, so it is not released twice.
+    func testSameChunkTwiceIsRefused() throws {
+        let vals: [UInt8] = [Int32(7)].flatMap { v in withUnsafeBytes(of: v) { Array($0) } }
+        var a = producerArray(ProducerMemory([nil, vals]), length: 1, offset: 0, nullCount: 0)
+        try schema("i") { s in
+            try withUnsafeMutablePointer(to: &a) { p in
+                XCTAssertThrowsError(try importArrowChunks(schema: s, arrays: [p, p])) { e in
+                    XCTAssertTrue("\(e)".contains("twice"), "\(e)")
+                }
+            }
+        }
+        XCTAssertNotNil(a.release, "nothing is moved")
+        a.release!(&a)
+    }
+
     /// utf8 chunks whose data totals 2 GB or more are refused, as one large_utf8 array that size is,
     /// and nothing is moved. The offsets claim the bytes; no data is read before the check.
     func testUtf8OverTwoGigabytesIsRefused() throws {

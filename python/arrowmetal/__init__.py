@@ -247,7 +247,8 @@ class MetalArray:
                     m = _import_chunks(obj.chunks)
                     if m is not None:
                         return m
-                obj = obj.combine_chunks()
+                # One chunk is taken as it is (combine_chunks copies even one chunk).
+                obj = _as_pa_array(obj)
             elif hasattr(obj, "__arrow_c_array__"):
                 obj = pa.array(obj)
             else:
