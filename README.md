@@ -190,6 +190,7 @@ low-cardinality group-by and multi-key sort: against it, `sum by int32 key` at 1
 100,000 groups upward, and on every sort, ArrowMetal stays 3x or more ahead of DuckDB, at 1 to 2 CPU-ms
 against DuckDB's 135 to 4,350.
 An optimizer extension also runs eligible aggregates of unchanged DuckDB SQL on the GPU with DuckDB's exact answers ([docs/DUCKDB.md](docs/DUCKDB.md) §4b).
+In Rust, a physical optimizer rule for DataFusion 55.1 runs the full `ORDER BY` sorts of unchanged SQL on the GPU with DataFusion's answers, 6.9x to 28.8x faster than DataFusion alone from 250,000 to 50M rows on an M4 Max ([docs/DATAFUSION.md](docs/DATAFUSION.md)).
 
 ### From Python
 

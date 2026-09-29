@@ -1,6 +1,10 @@
-//! ArrowMetal under DataFusion: one table, three queries, the rule's report and EXPLAIN for each.
+//! ArrowMetal under DataFusion with the default configuration: a full `ORDER BY` runs on the GPU;
+//! a top-k and a `GROUP BY` stay on DataFusion. For each query it prints the physical plan, the
+//! rule's report and the first rows of the answer. This is the example in docs/DATAFUSION.md.
 //!
-//!     ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib cargo run --example quickstart
+//! ```text
+//! ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib cargo run --example quickstart
+//! ```
 
 use std::sync::Arc;
 
@@ -10,16 +14,19 @@ use arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::MemTable;
 use datafusion::error::Result;
+use datafusion::physical_plan::{collect, displayable};
 use datafusion::prelude::SessionConfig;
 use datafusion_arrowmetal::{session_context, ArrowMetalConfig, ArrowMetalRule};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let n = 200_000usize;
+    // One million rows: above the default threshold (`min_rows`, 250,000).
+    let n = 1_000_000usize;
     let region: Int64Array = (0..n).map(|i| Some((i * 7919 % 13) as i64)).collect();
-    let amount: Float64Array =
-        (0..n).map(|i| if i % 97 == 0 { None } else { Some(((i * 104_729) % 10_007) as f64 / 7.0) }).collect();
-    let name: StringArray = (0..n).map(|i| Some(format!("n{:05}", (i * 31) % 50_000))).collect();
+    let amount: Float64Array = (0..n)
+        .map(|i| if i % 97 == 0 { None } else { Some(((i * 104_729) % 10_007) as f64 / 7.0) })
+        .collect();
+    let name: StringArray = (0..n).map(|i| Some(format!("n{:06}", (i * 31) % 500_000))).collect();
     let schema = Arc::new(Schema::new(vec![
         Field::new("region", DataType::Int64, false),
         Field::new("amount", DataType::Float64, true),
@@ -30,28 +37,28 @@ async fn main() -> Result<()> {
         vec![Arc::new(region), Arc::new(amount), Arc::new(name)],
     )?;
 
-    // A small table, so the threshold is lowered from its 250,000-row default.
-    let rule = ArrowMetalRule::new(ArrowMetalConfig::all().with_min_rows(100_000));
+    // The default configuration: full sorts from 250,000 rows. Four partitions keep the printed
+    // plans short; DataFusion's own default is one per core.
+    let rule = ArrowMetalRule::new(ArrowMetalConfig::default());
     let ctx = session_context(SessionConfig::new().with_target_partitions(4), rule.clone());
     ctx.register_table("sales", Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))?;
 
     for sql in [
-        "SELECT region, sum(amount) AS total, count(*) AS n, avg(amount) AS mean, max(amount) AS top \
-         FROM sales GROUP BY region ORDER BY total DESC",
-        "SELECT name, amount FROM sales ORDER BY amount DESC NULLS LAST, name LIMIT 5",
-        "SELECT region, amount FROM sales WHERE region = 3 AND amount > 1000.5 ORDER BY amount LIMIT 3",
+        "SELECT name, region, amount FROM sales ORDER BY amount DESC NULLS LAST, name",
+        "SELECT name, amount FROM sales ORDER BY amount DESC NULLS LAST LIMIT 3",
+        "SELECT region, count(*) AS n, avg(amount) AS mean FROM sales GROUP BY region ORDER BY region",
     ] {
         rule.clear_report();
         println!("== {sql}\n");
-        let df = ctx.sql(sql).await?;
-        let plan = df.clone().create_physical_plan().await?;
-        println!(
-            "{}",
-            datafusion::physical_plan::displayable(plan.as_ref()).indent(false)
-        );
-        println!("report:\n{}", rule.report());
-        let out = df.collect().await?;
-        println!("{}\n", pretty_format_batches(&out)?);
+        // Plan once and run that plan, so the report holds one planning pass.
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        println!("{}", displayable(plan.as_ref()).indent(false));
+        println!("{}", rule.report());
+        let out = collect(plan, ctx.task_ctx()).await?;
+        let rows: usize = out.iter().map(|b| b.num_rows()).sum();
+        let head = out.first().map(|b| b.slice(0, b.num_rows().min(3)));
+        println!("{rows} rows; the first {}:", head.as_ref().map_or(0, |b| b.num_rows()));
+        println!("{}\n", pretty_format_batches(head.as_slice())?);
     }
     Ok(())
 }

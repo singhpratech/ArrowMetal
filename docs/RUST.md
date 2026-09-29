@@ -12,6 +12,10 @@ Two crates live in [`rust/`](../rust):
 
 Both are on crates.io at 0.3.0; a path or git dependency on a checkout works too.
 
+For Apache DataFusion, [`datafusion/`](../datafusion) holds `datafusion-arrowmetal`, built on the
+`arrowmetal` crate: a physical optimizer rule that runs full `ORDER BY` sorts on the GPU with
+DataFusion's answers ([DATAFUSION.md](DATAFUSION.md)).
+
 Everything below was run in this repository on 2026-09-07 on an Apple M4 Max, macOS 26.6.2,
 `rustc 1.95.0`, arrow-rs 59.3.0, ArrowMetal 0.1.0.
 
