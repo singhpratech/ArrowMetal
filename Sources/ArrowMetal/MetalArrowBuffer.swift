@@ -147,8 +147,8 @@ public final class MetalArrowBuffer: @unchecked Sendable {
 ///
 /// Asks the VM map for the regions that cover the range (`mach_vm_region`), one call per region, so
 /// the cost does not grow with the length: a large producer allocation is one region. The probe
-/// this replaces, `mincore`, reported on every page and took 5.3 ms of a 5.3 ms zero-copy import of
-/// a 400 MB column (M4 Max); the `makeBuffer(bytesNoCopy:)` call itself took 0.01 ms.
+/// this replaces, `mincore`, reported on every page: a zero-copy import of a 400 MB pyarrow column
+/// took 5.2 ms with it and takes 0.02 ms with this one (M4 Max).
 private func rangeIsMapped(_ ptr: UnsafeRawPointer, length: Int) -> Bool {
     guard length > 0 else { return true }
     var addr = mach_vm_address_t(UInt(bitPattern: ptr))

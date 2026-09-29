@@ -798,15 +798,20 @@ def _import_chunks(chunks):
             return None
         n = len(chunks)
         arrays = (_ArrowArray * n)()
+        base, size = ctypes.addressof(arrays), ctypes.sizeof(_ArrowArray)
+        moved = False
         try:
             for i, c in enumerate(chunks):
-                c._export_to_c(ctypes.addressof(arrays[i]))
-            return _call(_lib.am_import_chunks, ctypes.addressof(schema), ctypes.addressof(arrays), n)
+                c._export_to_c(base + i * size)
+            m = _call(_lib.am_import_chunks, ctypes.addressof(schema), base, n)
+            moved = True        # success moves every chunk (each release is NULL now)
+            return m
         finally:
-            # Moved chunks come back with release NULL; one left set is still ours (an error).
-            for a in arrays:
-                if a.release:
-                    a.release(ctypes.byref(a))
+            # On an error, a chunk whose release is still set is still ours.
+            if not moved:
+                for a in arrays:
+                    if a.release:
+                        a.release(ctypes.byref(a))
     finally:
         if schema.release:
             schema.release(ctypes.byref(schema))

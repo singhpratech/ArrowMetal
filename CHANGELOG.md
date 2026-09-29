@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+- Chunked import: a column held as many Arrow arrays (a pyarrow `ChunkedArray`, a multi-chunk Polars
+  Series, one column of a stream of arrow-rs `RecordBatch`es) imports in one call, each chunk written
+  straight into the final Metal buffers on the CPU cores in parallel, with no concatenated copy first.
+  Each chunk's offset, length, validity bitmap (or its absence) and null count (-1 included) are
+  honoured; the result equals the import of the concatenation. It takes the integer, float, float16,
+  boolean, null, decimal, temporal, interval and fixed_size_binary types, utf8 / large_utf8 / binary /
+  large_binary and utf8_view / binary_view; dictionary, nested, run-end encoded and extension columns
+  are concatenated first, as before.
+  - C ABI: `am_import_chunks(schema, arrays, n, &out)` and `am_import_chunks_supported(schema)`.
+    Swift: `importArrowChunks`, `chunkedImportSupported`. Rust: `Array::from_arrow_chunks` and
+    `Source::from_batches`. Python: `am.array` / `MetalArray.from_arrow` of a multi-chunk
+    `ChunkedArray`, and through it `am.query`, `am.scan` and `am.write_parquet` over a pyarrow Table
+    or Polars DataFrame, the DuckDB bridge's `from_duckdb`, and the Polars `MetalEngine` for a
+    multi-chunk column of an in-memory frame. A one-chunk `ChunkedArray` imports its chunk as it is (`combine_chunks` copied it).
+  - Measured on an M4 Max with `Benchmarks/chunked_import_bench.py`, three columns of 50M rows, the
+    builds before and after timed alternately, best of 5
+    (`Benchmarks/results/chunked_import_2026-09-28.csv`): `combine_chunks` and import on the previous
+    build against the chunked import, in 16 chunks / in 6,104 chunks of 8,192 rows: int64 33.2 → 6.8 ms
+    / 38.2 → 14.6 ms, float64 32.9 → 6.9 / 37.9 → 16.5 ms, utf8 68.8 → 14.5 / 80.0 → 24.3 ms, utf8_view
+    423.2 → 38.9 / 560.9 → 60.0 ms. The chunked import uses more CPU time (87 against 33 CPU-ms for
+    int64 in 16 chunks).
+
+- A copy-free import checks that the producer's pages are mapped with `mach_vm_region` (one call per VM
+  region) instead of `mincore` (one entry per page). Importing a page-aligned 50M-row int64 pyarrow
+  column took 5.2 ms and takes 0.02 ms (8 MB: 0.11 → 0.005 ms). The pyarrow columns measured
+  (`pa.array` from numpy, compute results, `combine_chunks`; int64 and float64 at 1M, 10M and 50M rows)
+  and arrow-rs `concat` results (int64, float64, utf8 at 1M rows and more) were page aligned, so their
+  import is the probe alone. `MetalEngine(shapes="all")` with the import cache cleared, 50M rows
+  (`Benchmarks/polars_engine_bench.py`, three alternating rounds, best of 5;
+  `Benchmarks/results/chunked_import_polars_2026-09-28.csv`): filtered sum
+  17.7 → 6.4 ms, group-by over two keys 60.6 → 50.1 ms, 100,000-group sum 23.2 → 14.6 ms, 200-group
+  sum 17.9 → 10.0 ms, inner join 30.2 → 21.9 ms, nullable Float64 sort 145.9 → 132.1 ms; with the
+  columns already imported every case is within 1.5% of the previous build. At 2M rows (filtered
+  sum, two-key group-by, 100,000- and 200-group sums and the join, re-timed with 15 runs per round)
+  the cases with the cache cleared take 0.60-0.89 of the previous build's time, and under the default
+  `MetalEngine()` 0.77-1.05; the 1.05 is the 200-group sum, which the default leaves to Polars below
+  its crossover, so no import runs in it (re-timed with 40 runs: 1.26 against 1.21 ms).
+
+- A utf8_view / binary_view array with more than 64 data buffers (an arrow-rs or pyarrow
+  concatenation of view arrays keeps every input's buffers) has its data buffers copied into merged
+  buffers on import instead of each being wrapped and bound: a pyarrow `combine_chunks` of three 50M-row
+  utf8_view columns with 6,104 data buffers each imports in 49.5 ms against 150.5 ms, using 545 CPU-ms
+  against 143.
+
 - Sort options per key: the null placement (`nulls` first or last, in either direction) and the float
   order. `float_order="ieee"` is the order every sort has used (Arrow C++'s: -0.0 ties +0.0, NaN next to
   the nulls) and stays the default, unchanged. `float_order="total"` is IEEE 754 totalOrder, the order

@@ -13,7 +13,11 @@ run, and the 1-minute load average before each case. Output is CSV.
 
     PYTHONPATH=python python Benchmarks/chunked_import_bench.py [--rows 1000000,10000000,50000000]
         [--types int64,float64,utf8,utf8view] [--iters 5] [--out results/<file>.csv]
-        [--label name] [--no-chunked]
+        [--label name] [--no-chunked] [--chunkings 8192,/16]
+
+`--chunkings` lists the chunk sizes: a row count, or `/k` for k chunks of rows/k. `--no-chunked` runs
+against a build without `am_import_chunks`, so two builds can be timed alternately (one process
+each, `ARROWMETAL_LIB` and `PYTHONPATH` pointing at the build).
 
 Numbers from a run while other work shares the machine are provisional; publish only a quiet rerun.
 """

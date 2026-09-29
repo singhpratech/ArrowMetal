@@ -20,8 +20,8 @@ Swift apps ───────────────────────
   reports (`ImportResult.zeroCopy`).
 - **Copy-free import** wraps a producer buffer with `makeBuffer(bytesNoCopy:)` after checking that
   every page of it is mapped and readable. The check asks the VM map for the regions that cover the
-  buffer (`mach_vm_region`, one call per region), so it costs the same for 8 MB and 400 MB; see
-  [Chunked columns](#chunked-columns-and-the-import) for what it replaced.
+  buffer (`mach_vm_region`, one call per region), so its cost does not grow with the page count; see
+  [Chunked columns and the import](#chunked-columns-and-the-import) for what it replaced.
 - **Kernels** never assume a length multiple of anything: every buffer is padded to a page so trailing
   32-bit bitmap words are readable; kernels bounds-check the last word/element.
 - **Nulls** ride along as bitmaps. Element-wise ops share the input's validity buffer (zero-copy); binary ops
@@ -201,7 +201,10 @@ validity bitmap keeps the page-aligned rule, because bitmap kernels read it in 3
 when it is not page aligned or carries a bit offset. The import also totals the bytes of the non-null
 rows in one GPU pass over the views; a column over 2 GB is refused, the limit the `large_utf8` import has.
 Export hands the same buffers back as `vu` / `vz`, so a Polars column crosses in both directions without
-a copy.
+a copy. An array with more than 64 data buffers (an arrow-rs or pyarrow concatenation of view arrays
+keeps every input's buffers) has its data buffers copied back to back into merged buffers of under
+2 GB each and its views rewritten to point into them, since binding thousands of buffers for every
+kernel costs more than one parallel copy.
 
 **How a kernel reads either layout.** Every kernel that reads strings reads them through one accessor,
 `row(i, len)`, which returns a pointer to row `i`'s first byte and its length (`StringLayoutSource`):
@@ -651,7 +654,67 @@ The radix sort's block size is also now adaptive below ~256k rows: a fixed 4096 
 20k-element sort — the size top-k's final ordering lands on — running on five threadgroups. Inputs above
 ~256k rows are unaffected, so the 50M argsort is unchanged.
 
-## Non-goals
+## Chunked columns and the import
+
+A column often arrives as many Arrow arrays: a pyarrow `ChunkedArray`, a multi-chunk Polars Series, one
+column of a stream of arrow-rs `RecordBatch`es. `am_import_chunks` (`Sources/ArrowMetal/ChunkedImport.swift`)
+takes all of them in one call and writes each chunk straight into the final page-aligned Metal buffers,
+on the CPU cores in parallel, with no concatenated copy in between. The work is split by output
+position, not by chunk, so 6,104 chunks of 8,192 rows and 16 large chunks both spread over every core,
+and no two threads write the same byte:
+
+* fixed-width values: one `memcpy` per chunk piece, from the chunk's Arrow offset;
+* bitmaps (validity, boolean values): assembled 64 output bits at a time from each chunk's bits at its
+  own bit offset, since chunk boundaries are generally not byte aligned; a chunk without a bitmap, or
+  with a null count of 0, contributes set bits, and the null count is counted from the merged bitmap;
+* utf8 / binary and their large variants: offsets rebased by a prefix sum of the chunks' byte lengths
+  and narrowed to int32 (a total of 2 GB or more is refused, as for one `large_utf8` array), bytes copied;
+* utf8_view / binary_view: views copied with each out-of-line view's buffer index and offset rewritten.
+  Data buffers shared by several chunks (the slices of one array) are taken once; up to 64 distinct
+  buffers are wrapped without a copy, more are copied back to back into merged buffers.
+
+Dictionary, nested, run-end encoded and extension types are not taken: the call returns 3 without
+reading or moving anything, and the bindings concatenate those columns first, as before.
+
+**The page probe.** A copy-free import has to know that every page it wraps is mapped. The probe used to
+be `mincore`, which reports on every page: for a page-aligned pyarrow column of 50M int64 (400 MB) it
+took 5.2 ms, the whole of the import and as long as a 400 MB `memcpy` on the same machine (5.2-5.3 ms).
+`mach_vm_region` answers per VM region, and a large allocation is one region: the same import takes
+0.02 ms (0.005 ms at 8 MB, where `mincore` took 0.11 ms; 0.01 ms at 80 MB, where it took 1.04 ms). A buffer that is not page aligned is still copied:
+50M int64 at an 8-byte offset from a page imports in 6.8 ms, of which a plain `memcpy` of the bytes is
+5.3 ms.
+
+In practice pyarrow's buffers of 1M rows and more (`pa.array` from numpy, compute results,
+`combine_chunks`) start on a 16 KiB page and are wrapped; so are arrow-rs `concat` results of fixed-width
+and utf8 columns at 1M rows and more.
+
+**Measured** (M4 Max, `Benchmarks/chunked_import_bench.py`, three columns per case, best of 5 (of 15 at
+1M rows), the build before and after alternating in one session, 1-minute load 2.9-3.5 at the start of
+every case, 4.2 at most at the end of one; `Benchmarks/results/chunked_import_2026-09-28.csv`). "Before" is `combine_chunks()` and the
+import on the previous build; "chunked" is `am.array(chunked_array)`:
+
+| 50M rows, 3 columns | chunks | before (combine + import) | chunked | CPU-ms before / chunked |
+|---|---:|---:|---:|---:|
+| int64 | 16 | 33.2 ms (16.5 + 16.7) | 6.8 ms | 33 / 87 |
+| int64 | 6,104 | 38.2 ms (21.5 + 16.7) | 14.6 ms | 38 / 100 |
+| float64 | 16 | 32.9 ms (16.0 + 16.9) | 6.9 ms | 33 / 88 |
+| float64 | 6,104 | 37.9 ms (20.9 + 16.9) | 16.5 ms | 38 / 113 |
+| utf8 | 16 | 68.8 ms (34.3 + 34.4) | 14.5 ms | 69 / 177 |
+| utf8 | 6,104 | 80.0 ms (46.6 + 33.4) | 24.3 ms | 80 / 225 |
+| utf8_view | 16 | 423.2 ms (324.0 + 94.4) | 38.9 ms | 415 / 384 |
+| utf8_view | 6,104 | 560.9 ms (366.4 + 152.2) | 60.0 ms | 547 / 561 |
+
+The import half of "before" was the `mincore` probe: on the new build `combine_chunks()` plus the import
+of the combined column takes 16.4 ms for 50M int64 in 16 chunks (6.8 ms chunked) and 21.8 ms in 6,104
+chunks (14.6 ms chunked). The chunked import spends more CPU time than the single-threaded
+`combine_chunks` and less wall time. Of the 4.9 ms per column at 6,104 chunks, 0.7 ms is the Python
+side exporting each chunk through the C Data Interface.
+
+utf8_view imports 2.7x (16 chunks) and 2.5x (6,104 chunks) slower than utf8 at 50M rows. A view column
+here is 16 bytes of view per row plus the data buffer, against 4 bytes of offset plus the string bytes
+for utf8 (strings of 9 and 18 bytes), and each view is read, checked against its buffer and rewritten
+one row at a time, where utf8 moves its bytes with `memcpy` and adds a constant to each offset.
+
 - Not a query planner or SQL engine. It is the compute layer that DuckDB, DataFusion, Polars plugins or
   an app can call.
 - Not a tensor library; MLX is that.
