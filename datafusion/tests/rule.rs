@@ -450,9 +450,9 @@ async fn a_refused_memory_reservation_hands_the_node_back() {
 }
 
 /// A take decided from the first batches of each partition is checked against a sample of the
-/// whole input. Here each partition starts with 90,112 rows over 50,000 keys (so the prefix shows
-/// about 150,000 groups, a bucket the table takes at 2,000,000 rows) and continues with keys seen
-/// once (about 1,080,000 groups in all, a bucket it does not take): the node is handed back.
+/// whole input. Here each partition starts with 90,112 rows over 20,000 keys (so the prefix shows
+/// about 60,000 groups, a bucket the table takes at 2,000,000 rows) and continues with keys seen
+/// once (about 990,000 groups in all, a bucket it does not take): the node is handed back.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_prefix_take_is_confirmed_over_the_whole_input() {
     let (parts, per, head) = (3usize, 400_000usize, 90_112usize);
@@ -462,7 +462,7 @@ async fn a_prefix_take_is_confirmed_over_the_whole_input() {
         let keys: Vec<i64> = (0..per)
             .map(|i| {
                 if i < head {
-                    (part * 50_000 + i % 50_000) as i64
+                    (part * 20_000 + i % 20_000) as i64
                 } else {
                     (1_000_000 + part * per + i) as i64
                 }

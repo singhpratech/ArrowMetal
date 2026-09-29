@@ -213,7 +213,9 @@ fn chao1(d: u64, f1: u64, f2: u64, rows: usize) -> (f64, f64, f64) {
 /// of `batches`) from `batches`: the whole input, or a part of it (the first batches of each
 /// partition), which the sample is drawn from. `settled(lo, hi)`: whether every group count from
 /// `lo` to `hi` gets the same decision; `None` stops once the estimate is within twice d, f2
-/// reaches 8, or the low end is a quarter of the input.
+/// reaches 8, or the low end is a quarter of the input. (The run-time choice uses
+/// [`estimate_up_to`] with a smaller largest sample.)
+#[cfg(test)]
 pub(crate) fn estimate(
     batches: &[&RecordBatch],
     keys: &[usize],

@@ -230,6 +230,11 @@ impl Collected {
 /// most a quarter of them).
 const PREFIX_ROWS: usize = 262_144;
 
+/// The largest sample the run-time choice draws. A range still not settled at this size hands the
+/// node back: at 5M and 10M rows with about rows / 2 groups, growing the sample to 32,768 rows took
+/// 0.35 to 0.53 ms, 4 % to 8 % of DataFusion's time for the query.
+const DECIDE_SAMPLE: usize = 8_192;
+
 /// The largest sample of the whole input that confirms a take decided from the prefix.
 const CONFIRM_SAMPLE: usize = 2_048;
 
@@ -669,7 +674,7 @@ fn decide(
     };
     let at = table_rows.unwrap_or(rows) as u64;
     let settled = crate::choice::settled_for(&shape, at);
-    let e = crate::probe::estimate(refs, keys, Some(&settled), Some(rows));
+    let e = crate::probe::estimate_up_to(refs, keys, Some(&settled), Some(rows), DECIDE_SAMPLE);
     let how = if e.exact {
         format!("{} groups, counted over all {} rows", e.estimate, e.rows)
     } else {
