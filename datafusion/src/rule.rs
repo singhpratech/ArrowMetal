@@ -45,29 +45,39 @@ pub struct ArrowMetalConfig {
 }
 
 /// The default take-list, from the rule on/off measurement against DataFusion 55.1 on an M4 Max
-/// (16 partitions, MemTables of 8192-row batches; `datafusion/results/datafusion_rule_2026-09-27.csv`,
-/// DataFusion alone / DataFusion with the rule, wall, best of 5):
+/// (16 partitions; MemTables of 8192-row batches and of one batch per partition; this crate with
+/// one totalOrder key per ORDER BY key and the chunked import;
+/// `datafusion/results/datafusion_rule_2026-09-29.csv`, rows `crate = now`; DataFusion alone /
+/// DataFusion with the rule, wall, best of 5, both layouts):
 ///
 /// | shape | 1M | 10M | 50M | default |
 /// |---|---:|---:|---:|---|
-/// | ORDER BY int64 / Float64 / String key, 3 columns | 7.4x / 10.4x / 9.1x | 16.0x / 12.3x / 16.4x | 14.8x / 11.2x / 14.6x | taken |
-/// | the same over DataFusion's Parquet scan (snappy, zstd) | | 9.8x, 8.0x | 10.3x, 9.0x | taken |
-/// | ORDER BY ... LIMIT 100 (int64, Float64 DESC) | 0.13x / 0.15x | 0.13x / 0.06x | 0.07x / 0.03x | left |
-/// | GROUP BY, count(*) only, 1M groups | 1.19x / 1.10x | 1.95x / 1.68x | 1.78x / 1.75x | left (see below) |
-/// | GROUP BY, count(*) only, 200 groups | 0.57x / 0.65x | 0.43x / 0.98x | 0.71x / 0.87x | left |
-/// | GROUP BY, sum/avg/min+max over Float64, 200 .. 25M groups | 0.19x - 0.77x | 0.21x - 1.03x | 0.19x - 0.89x | left |
-/// | GROUP BY, sum/avg/min+max over int64, 200 .. 25M groups | | 0.37x - 1.36x | 0.37x - 1.40x | left |
-/// | SELECT DISTINCT (int32, int32), 10k groups | 0.79x | 1.05x | 0.83x | left |
-/// | WHERE + whole-table sum/count (the filter is what is taken) | 0.46x | 0.27x | 0.26x | left |
-/// | GROUP BY over a hash join's output | 0.42x - 0.63x | 0.49x - 0.80x | 0.52x - 0.86x | left |
+/// | ORDER BY int64 / Float64 / String / Float32 key, 3 columns | 5.9x - 12.8x | 19.2x - 28.7x | 18.9x - 27.2x | taken |
+/// | the same over DataFusion's Parquet scan (snappy, zstd) | | 13.6x, 10.8x | 16.5x, 13.8x | taken |
+/// | ORDER BY ... LIMIT 100 (int64, Float64 DESC, Float32 DESC) | 0.14x - 0.49x | 0.24x - 0.41x | 0.17x - 0.29x | left |
+/// | GROUP BY, count(*) only, 100k and 1M groups | 1.08x - 1.26x | 1.41x - 2.63x | 1.62x - 3.23x | left (see below) |
+/// | GROUP BY, count(*) only, 200 groups | 0.43x - 0.63x | 0.76x - 1.39x | 0.95x - 1.72x | left |
+/// | GROUP BY, count(*) only, rows/2 groups | 1.08x - 1.29x | 1.61x - 1.90x | 0.87x - 0.92x | left |
+/// | GROUP BY, sum / avg over Float64, 200 .. rows/2 groups | 0.22x - 1.06x | 0.46x - 1.47x | 0.42x - 1.42x | left |
+/// | GROUP BY, min + max over Float64, 200 .. rows/2 groups | 0.16x - 0.71x | 0.26x - 1.07x | 0.26x - 0.88x | left |
+/// | SELECT DISTINCT (int32, int32), 10k groups | 0.72x - 0.85x | 1.60x - 1.80x | 1.51x - 1.65x | left (see below) |
+/// | GROUP BY over DataFusion's Parquet scan, 100k groups, sum + count | | 1.08x - 1.39x | 1.29x - 1.57x | left |
+/// | WHERE + whole-table sum/count (the filter is what is taken) | 0.56x - 0.59x | 0.62x - 0.72x | 0.74x | left |
+/// | Parquet WHERE + GROUP BY | | 0.52x - 0.53x | 0.54x - 0.55x | left |
 ///
-/// Full sorts at smaller inputs (int64 / Float64 / String key): 100k rows 1.50x / 1.03x / 1.42x,
-/// 250k 2.80x / 1.99x / 3.42x, 500k 5.96x / 5.01x / 5.75x; hence `min_rows` 250,000.
+/// Full sorts at smaller inputs (every key type, both layouts): 100k rows 1.34x - 2.63x, 250k
+/// 2.64x - 4.80x, 500k 4.32x - 7.49x; the 1x crossover is below 100k for every key, and 250k is
+/// the first measured size at which every key type is at or above 2.6x; hence `min_rows` 250,000.
 ///
-/// Aggregates are off: the only group-bys at or above 1.5x at both 10M and 50M are count(*)-only
-/// ones with about 1M groups, and the same query with 200 groups is 0.43x-0.98x. The rule sees
-/// the row count but not the group count, so it cannot tell the two apart. Hash joins are not
-/// replaced at all (the rule has no join operator).
+/// Top-k is left: DataFusion's TopK answers LIMIT 100 over 50M rows in 4.6 - 6.5 ms; the rule's
+/// GPU top-k takes 20 - 29 ms there, of which collecting the input stream alone is 6.5 - 8 ms.
+///
+/// Aggregates are off: count(*)-only group-bys with 100k-1M groups clear 1.5x at 10M and 50M
+/// (one exception, 1.41x), and so does the one DISTINCT shape measured, but the same count(*) SQL
+/// with 200 groups is 0.76x - 1.72x and with rows/2 groups at 50M 0.87x - 0.92x, and every
+/// sum / avg / min+max family has shapes below 1x. The rule sees the row count but not the group
+/// count (DataFusion's MemTable and Parquet statistics carry no distinct counts), so it cannot tell
+/// these apart. Hash joins are not replaced at all (the rule has no join operator).
 impl Default for ArrowMetalConfig {
     fn default() -> Self {
         Self {
