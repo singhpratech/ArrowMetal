@@ -95,6 +95,9 @@ struct Args {
     explain: bool,
     contexts: Vec<String>,
     lock_dir: Option<String>,
+    /// Timed rounds per case; each round warms and times every context once, in an order rotated
+    /// by one per round; a context's figure is its best over the rounds.
+    rounds: usize,
 }
 
 fn args() -> Args {
@@ -113,6 +116,7 @@ fn args() -> Args {
         codecs: vec!["snappy".into(), "zstd".into()],
         explain: false,
         contexts: vec!["off".into(), "on".into()],
+        rounds: 1,
         lock_dir: None,
     };
     let v: Vec<String> = std::env::args().skip(1).collect();
@@ -135,6 +139,7 @@ fn args() -> Args {
             "--parquet-rows" => a.parquet_rows = nums(&val),
             "--codecs" => a.codecs = list(&val),
             "--contexts" => a.contexts = list(&val),
+            "--rounds" => a.rounds = val.parse().unwrap(),
             "--lock-dir" => a.lock_dir = Some(val),
             "--explain" => {
                 a.explain = true;
@@ -879,7 +884,8 @@ async fn main() {
              import_ms,kernel_ms,export_ms,input_batches,out_rows,block_load_start,block_load_end,warm_ms,untimed_off,\
              untimed_on,on_first_ms,back_ms,back_cpu_ms,back_first_ms,equal_back,def_ms,def_cpu_ms,def_first_ms,\
              equal_def,def_taken,def_handed_back,def_groups_est,def_probe_ms,def_input_ms,def_kernel_ms,def_choice,\
-             off_first_ms,block_t0,block_t1,last_sleep"
+             off_first_ms,block_t0,block_t1,last_sleep,rounds,off_round_median_ms,def_round_median_ms,\
+             back_round_median_ms,on_round_median_ms"
         )
         .unwrap();
     }
@@ -1038,18 +1044,31 @@ async fn main() {
                 });
             }
             drop(firsts);
-            for (i, x) in ctxs.iter().enumerate() {
-                if let Some(r) = &x.rule {
-                    r.clear_report();
+            let mut round_bests: Vec<Vec<f64>> = vec![Vec::new(); ctxs.len()];
+            for round in 0..a.rounds.max(1) {
+                for k in 0..ctxs.len() {
+                    let i = (k + round) % ctxs.len();
+                    let x = &ctxs[i];
+                    if let Some(r) = &x.rule {
+                        r.clear_report();
+                    }
+                    let (b, n, u) = best(&x.ctx, &c.sql, res[i].first_ms, &a).await;
+                    if let Some(r) = &x.rule {
+                        res[i].fallbacks = res[i].fallbacks.max(r.report().runtime_fallbacks().count());
+                    }
+                    round_bests[i].push(b.wall);
+                    if round == 0 || b.wall < res[i].best.wall {
+                        res[i].best = b;
+                    }
+                    res[i].iters += n;
+                    res[i].untimed += u;
                 }
-                let (b, n, u) = best(&x.ctx, &c.sql, res[i].first_ms, &a).await;
-                if let Some(r) = &x.rule {
-                    res[i].fallbacks = res[i].fallbacks.max(r.report().runtime_fallbacks().count());
-                }
-                res[i].best = b;
-                res[i].iters = n;
-                res[i].untimed = u;
             }
+            let median = |v: &[f64]| {
+                let mut v = v.to_vec();
+                v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                v[v.len() / 2]
+            };
             let by = |n: &str| ctxs.iter().position(|x| x.name == n).map(|i| &res[i]);
             let off = &res[0];
             let on = by("on");
@@ -1122,15 +1141,19 @@ async fn main() {
                 f(def, &|r| csv(&r.decisions)),
                 off.first_ms,
             );
-            rows_out.push((row, tail, extra));
+            let med = |n: &str| {
+                ctxs.iter().position(|x| x.name == n).map(|i| format!("{:.2}", median(&round_bests[i]))).unwrap_or_default()
+            };
+            let rounds_s = format!("{},{},{},{},{}", a.rounds.max(1), med("off"), med("def"), med("back"), med("on"));
+            rows_out.push((row, tail, extra, rounds_s));
         }
         let l1 = load1();
         let t1 = now_text();
         drop(lock);
         let sleep = last_sleep();
         println!("  [load {l1:.2} at block end, {t1}; last sleep {sleep}]");
-        for (r, tail, extra) in rows_out {
-            writeln!(out, "{r},{l0:.2},{l1:.2},{tail},{extra},{t0},{t1},{sleep}").unwrap();
+        for (r, tail, extra, rounds_s) in rows_out {
+            writeln!(out, "{r},{l0:.2},{l1:.2},{tail},{extra},{t0},{t1},{sleep},{rounds_s}").unwrap();
         }
         out.flush().unwrap();
     }

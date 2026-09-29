@@ -83,78 +83,111 @@ fn positions(rows: usize, n: usize) -> Vec<usize> {
         .collect()
 }
 
-/// The value of one key cell as a u64 that is equal for equal keys (DataFusion's grouping: -0.0
-/// and +0.0 one group, each NaN bit pattern its own, null its own).
-fn cell(a: &dyn Array, i: usize) -> u64 {
-    if a.is_null(i) {
-        return NULL_KEY;
+/// Folds the key values of rows `idx` of column `a` into `out` (one slot per row): each value
+/// becomes a u64 that is equal for equal keys (DataFusion's grouping: -0.0 and +0.0 one group, each
+/// NaN bit pattern its own, null its own), mixed, and combined with what `out` holds unless
+/// `first`. One type dispatch per column and batch, not per value.
+fn fold_column(a: &dyn Array, idx: &[usize], out: &mut [u64], first: bool) {
+    fn put(out: &mut [u64], j: usize, v: u64, first: bool) {
+        let v = splitmix(v);
+        out[j] = if first { v } else { out[j].rotate_left(23).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ v };
     }
-    let v = match a.data_type() {
-        DataType::Int8 => a.as_primitive::<Int8Type>().value(i) as i64 as u64,
-        DataType::Int16 => a.as_primitive::<Int16Type>().value(i) as i64 as u64,
-        DataType::Int32 => a.as_primitive::<Int32Type>().value(i) as i64 as u64,
-        DataType::Int64 => a.as_primitive::<Int64Type>().value(i) as u64,
-        DataType::UInt8 => a.as_primitive::<UInt8Type>().value(i) as u64,
-        DataType::UInt16 => a.as_primitive::<UInt16Type>().value(i) as u64,
-        DataType::UInt32 => a.as_primitive::<UInt32Type>().value(i) as u64,
-        DataType::UInt64 => a.as_primitive::<UInt64Type>().value(i),
-        DataType::Float64 => {
-            let x = a.as_primitive::<Float64Type>().value(i);
-            (if x == 0.0 { 0.0 } else { x }).to_bits()
+    let nulls = a.nulls();
+    let valid = |i: usize| nulls.is_none_or(|n| n.is_valid(i));
+    macro_rules! prim {
+        ($t:ty, $f:expr) => {{
+            let v = a.as_primitive::<$t>().values();
+            for (j, &i) in idx.iter().enumerate() {
+                put(out, j, if valid(i) { $f(v[i]) } else { NULL_KEY }, first);
+            }
+        }};
+    }
+    macro_rules! strs {
+        ($arr:expr) => {{
+            let s = $arr;
+            for (j, &i) in idx.iter().enumerate() {
+                put(out, j, if valid(i) { fnv1a(s.value(i).as_bytes()) } else { NULL_KEY }, first);
+            }
+        }};
+    }
+    match a.data_type() {
+        DataType::Int8 => prim!(Int8Type, |x: i8| x as i64 as u64),
+        DataType::Int16 => prim!(Int16Type, |x: i16| x as i64 as u64),
+        DataType::Int32 => prim!(Int32Type, |x: i32| x as i64 as u64),
+        DataType::Int64 => prim!(Int64Type, |x: i64| x as u64),
+        DataType::UInt8 => prim!(UInt8Type, |x: u8| x as u64),
+        DataType::UInt16 => prim!(UInt16Type, |x: u16| x as u64),
+        DataType::UInt32 => prim!(UInt32Type, |x: u32| x as u64),
+        DataType::UInt64 => prim!(UInt64Type, |x: u64| x),
+        DataType::Float64 => prim!(Float64Type, |x: f64| (if x == 0.0 { 0.0 } else { x }).to_bits()),
+        DataType::Float32 => prim!(Float32Type, |x: f32| (if x == 0.0 { 0.0f32 } else { x }).to_bits() as u64),
+        DataType::Utf8 => strs!(a.as_string::<i32>()),
+        DataType::LargeUtf8 => strs!(a.as_string::<i64>()),
+        DataType::Utf8View => strs!(a.as_string_view()),
+        // Other key types are not taken by the rule (the caller never gets here): only nulls
+        // are told apart.
+        _ => {
+            for (j, &i) in idx.iter().enumerate() {
+                put(out, j, if valid(i) { 0 } else { NULL_KEY }, first);
+            }
         }
-        DataType::Float32 => {
-            let x = a.as_primitive::<Float32Type>().value(i);
-            (if x == 0.0 { 0.0f32 } else { x }).to_bits() as u64
-        }
-        DataType::Utf8 => fnv1a(a.as_string::<i32>().value(i).as_bytes()),
-        DataType::LargeUtf8 => fnv1a(a.as_string::<i64>().value(i).as_bytes()),
-        DataType::Utf8View => fnv1a(a.as_string_view().value(i).as_bytes()),
-        // Other key types are not taken by the rule; hash nothing, so the count is 1 per null
-        // pattern (the caller never gets here).
-        _ => 0,
-    };
-    splitmix(v)
+    }
 }
 
-/// One u64 per sampled row, equal for equal key tuples.
+/// One u64 per sampled row (`pos`: increasing positions over the batches in order), equal for
+/// equal key tuples.
 fn sample(batches: &[&RecordBatch], keys: &[usize], pos: &[usize]) -> Vec<u64> {
-    let mut out = Vec::with_capacity(pos.len());
-    let mut b = 0usize;
+    let mut out = vec![0u64; pos.len()];
     let mut start = 0usize;
-    for &p in pos {
-        while p >= start + batches[b].num_rows() {
-            start += batches[b].num_rows();
-            b += 1;
+    let mut at = 0usize;
+    let mut idx = Vec::new();
+    for b in batches {
+        let end = start + b.num_rows();
+        idx.clear();
+        let from = at;
+        while at < pos.len() && pos[at] < end {
+            idx.push(pos[at] - start);
+            at += 1;
         }
-        let i = p - start;
-        let mut h = 0u64;
-        for (j, &k) in keys.iter().enumerate() {
-            let v = cell(batches[b].column(k).as_ref(), i);
-            h = if j == 0 { v } else { h.rotate_left(23).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ v };
+        if !idx.is_empty() {
+            for (j, &k) in keys.iter().enumerate() {
+                fold_column(b.column(k).as_ref(), &idx, &mut out[from..at], j == 0);
+            }
         }
-        out.push(h);
+        start = end;
+        if at == pos.len() {
+            break;
+        }
     }
     out
 }
 
-/// (d, f1, f2) of a sample of key tuples.
-fn stats(mut v: Vec<u64>) -> (u64, u64, u64) {
-    v.sort_unstable();
-    let (mut d, mut f1, mut f2) = (0u64, 0u64, 0u64);
-    let mut i = 0;
-    while i < v.len() {
-        let mut j = i + 1;
-        while j < v.len() && v[j] == v[i] {
-            j += 1;
+/// (d, f1, f2) of a sample of key tuples: an open-addressing count (the values are already mixed
+/// hashes), about a quarter of the time of sorting them.
+fn stats(v: Vec<u64>) -> (u64, u64, u64) {
+    let size = (v.len() * 2).next_power_of_two().max(16);
+    let mask = size - 1;
+    let mut keys = vec![0u64; size];
+    let mut counts = vec![0u32; size];
+    let mut d = 0u64;
+    for x in v {
+        let mut i = (x as usize) & mask;
+        loop {
+            if counts[i] == 0 {
+                keys[i] = x;
+                counts[i] = 1;
+                d += 1;
+                break;
+            }
+            if keys[i] == x {
+                counts[i] += 1;
+                break;
+            }
+            i = (i + 1) & mask;
         }
-        d += 1;
-        match j - i {
-            1 => f1 += 1,
-            2 => f2 += 1,
-            _ => {}
-        }
-        i = j;
     }
+    let f1 = counts.iter().filter(|&&c| c == 1).count() as u64;
+    let f2 = counts.iter().filter(|&&c| c == 2).count() as u64;
     (d, f1, f2)
 }
 
@@ -298,6 +331,45 @@ mod tests {
         let e = estimate(&[&b], &[0, 1], None, None);
         // 10 x (3 strings + null) = 40 tuples.
         assert!((30..=48).contains(&e.estimate), "{e:?}");
+    }
+
+    #[test]
+    fn a_prefix_estimates_the_whole_input() {
+        // The first 262,144 of 2,000,000 rows, keys uniform over 100,000 values.
+        let keys = uniform(2_000_000, 100_000);
+        let b = batches(keys[..262_144].to_vec(), 8192);
+        let r: Vec<&RecordBatch> = b.iter().collect();
+        let e = estimate(&r, &[0], None, Some(2_000_000));
+        assert_eq!(e.rows, 2_000_000);
+        assert!((50_000..200_000).contains(&e.estimate), "{e:?}");
+    }
+
+    /// Probe timing (release build): `cargo test --release --lib probe_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn probe_timing() {
+        let keys: Vec<i64> = (0..262_144u64).map(|i| (splitmix(i) % 1_000_000) as i64).collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let b: Vec<RecordBatch> = keys
+            .chunks(8192)
+            .map(|c| RecordBatch::try_new(schema.clone(), vec![Arc::new(arrow::array::Int64Array::from(c.to_vec()))]).unwrap())
+            .collect();
+        let r: Vec<&RecordBatch> = b.iter().collect();
+        for n in [512usize, 2048, 8192, 32768] {
+            let pos = positions(262_144, n);
+            let t = Instant::now();
+            let mut v = Vec::new();
+            for _ in 0..100 {
+                v = sample(&r, &[0], &pos);
+            }
+            let ts = t.elapsed() / 100;
+            let t = Instant::now();
+            for _ in 0..100 {
+                std::hint::black_box(stats(v.clone()));
+            }
+            let tt = t.elapsed() / 100;
+            println!("n {n}: sample {ts:?}, stats {tt:?}");
+        }
     }
 
     #[test]

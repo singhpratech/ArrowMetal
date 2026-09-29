@@ -302,6 +302,11 @@ async fn top_level_aggregate_is_not_repartitioned() {
 /// A table whose i64 key `k` holds `groups` distinct values over `n` rows (dealt round-robin, so
 /// every batch holds many groups), a Float64 `v` and an int64 `q`, in `parts` partitions.
 async fn grouped_ctx(rule: Option<&ArrowMetalRule>, n: usize, groups: i64, parts: usize) -> SessionContext {
+    grouped_ctx_batches(rule, n, groups, parts, usize::MAX).await
+}
+
+/// `grouped_ctx` with each partition in batches of at most `batch` rows.
+async fn grouped_ctx_batches(rule: Option<&ArrowMetalRule>, n: usize, groups: i64, parts: usize, batch: usize) -> SessionContext {
     let config = SessionConfig::new().with_target_partitions(4);
     let ctx = match rule {
         Some(r) => session_context(config, r.clone()),
@@ -317,7 +322,17 @@ async fn grouped_ctx(rule: Option<&ArrowMetalRule>, n: usize, groups: i64, parts
     ]));
     let b = RecordBatch::try_new(schema.clone(), vec![Arc::new(k) as ArrayRef, Arc::new(v), Arc::new(q)]).unwrap();
     let per = n.div_ceil(parts);
-    let p: Vec<Vec<RecordBatch>> = (0..parts).map(|i| vec![b.slice(i * per, per.min(n - i * per))]).collect();
+    let p: Vec<Vec<RecordBatch>> = (0..parts)
+        .map(|i| {
+            let (start, len) = (i * per, per.min(n - i * per));
+            (0..len.div_ceil(batch.min(len).max(1)))
+                .map(|j| {
+                    let off = j * batch.min(len).max(1);
+                    b.slice(start + off, batch.min(len - off))
+                })
+                .collect()
+        })
+        .collect();
     ctx.register_table("g", Arc::new(MemTable::try_new(schema, p).unwrap())).unwrap();
     ctx
 }
@@ -346,20 +361,36 @@ async fn forced_hand_back_gives_datafusions_answer() {
 #[tokio::test]
 async fn measured_choice_records_the_estimate_and_matches() {
     let sql = "SELECT k, count(*) AS n FROM g GROUP BY k";
-    for (groups, n) in [(150i64, 40_000usize), (60_000, 200_000)] {
+    // (groups, rows, rows per batch, runs on ArrowMetal): the table at 50M rows hands a count over
+    // one int64 key back at 200 groups and takes it at 100k. With 8192-row batches the decision
+    // comes from the first batches of each partition (a prefix).
+    for (groups, n, batch, gpu) in [
+        (150i64, 40_000usize, usize::MAX, false),
+        (60_000, 200_000, usize::MAX, true),
+        (150, 600_000, 8192, false),
+        (60_000, 600_000, 8192, true),
+    ] {
         let rule = ArrowMetalRule::new(ArrowMetalConfig::default().with_min_rows(0).with_table_rows(Some(50_000_000)));
-        let ctx = grouped_ctx(Some(&rule), n, groups, 3).await;
+        let ctx = grouped_ctx_batches(Some(&rule), n, groups, 3, batch).await;
         let got = sorted_text(&ctx, sql).await;
-        let want = sorted_text(&grouped_ctx(None, n, groups, 3).await, sql).await;
+        let want = sorted_text(&grouped_ctx_batches(None, n, groups, 3, batch).await, sql).await;
         assert_eq!(got, want, "groups={groups}");
         let r = rule.report();
         assert_eq!(r.runtime_fallbacks().count(), 0, "{r}");
-        for d in r.runtime_choices() {
+        let choices: Vec<_> = r.runtime_choices().collect();
+        assert!(!choices.is_empty(), "groups={groups} rows={n}: no run-time choice
+{r}");
+        for d in choices {
             let e = d.groups.as_ref().unwrap().estimate.expect("an estimate");
             assert!(e.low <= groups as u64 * 5 / 4 && e.high >= groups as u64 * 3 / 4, "groups={groups}: {d}");
             assert!(d.reason.contains("estimated") || d.reason.contains("counted"), "{d}");
+            assert_eq!(d.taken, gpu, "groups={groups} rows={n}: {d}");
+            if batch == 8192 && !gpu {
+                assert!(d.reason.contains("from the first"), "{d}");
+            }
         }
-        println!("groups={groups}:\n{r}");
+        println!("groups={groups} rows={n}:
+{r}");
     }
 }
 

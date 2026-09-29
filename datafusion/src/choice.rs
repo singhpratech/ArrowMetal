@@ -132,7 +132,10 @@ fn family_takes(family: &str, s: &Shape, bucket: &str, rows: u64) -> Result<u64,
     };
     let ratios = r.ratios.iter().map(|(n, x)| format!("{}: {x:.2}x", rows_text(*n))).collect::<Vec<_>>().join(", ");
     match r.min_rows {
-        None => Err(format!("{family} at the {bucket} bucket is not taken at any measured size ({ratios})")),
+        None => Err(format!(
+            "{family} at the {bucket} bucket is not taken at any measured size (needs {:.2}x at two or more sizes; {ratios})",
+            table::MIN_RATIO * table::HEADROOM
+        )),
         Some(m) if rows < m => Err(format!("{family} at the {bucket} bucket is taken from {} rows ({ratios})", rows_text(m))),
         Some(_) if r.max_rows.is_some_and(|x| rows > x) => Err(format!(
             "{family} at the {bucket} bucket is taken up to {} rows only, the largest size measured, its ratio falling there ({ratios})",
