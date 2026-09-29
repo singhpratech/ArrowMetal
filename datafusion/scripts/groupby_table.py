@@ -26,6 +26,9 @@ The fit:
 Two constraints from the default-take check CSVs (`--check`, merged in order: a later file's row
 replaces an earlier one's for the same size, layout and case) then raise the thresholds:
 
+Each constraint reads, per size, layout and case, the latest row in which the default took that path
+(ran it on ArrowMetal, or handed it back), whatever a later file decided.
+
 * First run after idle: a series (family, keys, key class, input, bucket) is taken at a size only
   if, at that size and every larger measured size, every row the default ran on ArrowMetal has
   `off_ms / def_idle_ms >= IDLE_RATIO` (the default's first run after the GPU idled, pipelines
@@ -126,13 +129,17 @@ def fit(points):
     return sizes[start], cap, worst
 
 
-def read_checks(paths):
-    """The default-check rows, merged in order (a later file's row replaces an earlier one's)."""
+def read_checks(paths, kind=None):
+    """The default-check rows, merged in order (a later file's row replaces an earlier one's).
+    With `kind` ("gpu" or "back"), only rows the default decided that way are merged: the latest
+    measurement of that path for each size, layout and case, whatever later files decided."""
     merged = {}
     for path in paths:
         with open(path) as fh:
             for r in csv.DictReader(fh):
                 if r["family"] != "gsweep" or not CASE.match(r["case"]):
+                    continue
+                if kind is not None and state(r) != kind:
                     continue
                 merged[(r["size"], r["layout"], r["case"])] = r
     return list(merged.values())
@@ -159,11 +166,12 @@ def first_holding(ok_by_size):
     return None
 
 
-def constraints(checks):
-    """({series key: first size its idle constraint holds, or None}, {shape: first size its hand-back
-    constraint holds, or None}), with the rows that fail, for the report."""
+def constraints(paths):
+    """({series key: {size: every first run after idle passes}}, {shape: {size: every hand-back
+    passes}}, the rows that fail), from the latest measurement of each path per size, layout and
+    case (`read_checks` with `kind`)."""
     idle, back, fails = {}, {}, []
-    for r in checks:
+    for r in read_checks(paths, "gpu") + read_checks(paths, "back"):
         size = int(r["size"])
         shape = shape_of(r)
         if state(r) == "gpu":
@@ -188,8 +196,7 @@ def constraints(checks):
 
 def table(path, checks=()):
     s = read(path)
-    rows_ = read_checks(checks) if checks else []
-    idle, back, _ = constraints(rows_)
+    idle, back, _ = constraints(checks) if checks else ({}, {}, [])
     rows = []
     for key in sorted(s, key=lambda k: (k[0], k[1], k[2], k[3], ORDER.index(k[4]))):
         lo, hi, worst = fit(s[key])
@@ -304,7 +311,7 @@ def main():
     rows = table(path, checks)
     text = rust(path, rows, checks)
     if a.fails:
-        for f in sorted(constraints(read_checks(checks))[2], key=str):
+        for f in sorted(constraints(checks)[2], key=str):
             print(*f)
         return
     if a.print:

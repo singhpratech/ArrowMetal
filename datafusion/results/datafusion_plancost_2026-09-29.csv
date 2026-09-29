@@ -1,0 +1,5 @@
+sql,rows,rounds,plan_alone_median_ms,plan_alone_min_ms,plan_rule_median_ms,plan_rule_min_ms,run_alone_median_ms,run_alone_min_ms,run_rule_median_ms,run_rule_min_ms,start,end,load_start,load_end,last_sleep
+"SELECT k, sum(x) AS s FROM t GROUP BY k",1000000,300,0.139,0.116,0.148,0.122,0.831,0.755,0.846,0.770,2026-09-29 16:17:59,2026-09-29 16:18:03,3.09,3.40,2026-09-29 00:37:52
+"SELECT k, min(x), max(x) FROM t GROUP BY k",1000000,300,0.120,0.104,0.131,0.109,0.858,0.792,0.867,0.794,2026-09-29 16:17:59,2026-09-29 16:18:03,3.09,3.40,2026-09-29 00:37:52
+"SELECT k, sum(x) AS s FROM t GROUP BY k",10000000,60,0.269,0.226,0.298,0.247,3.526,3.397,3.532,3.403,2026-09-29 16:17:59,2026-09-29 16:18:03,3.09,3.40,2026-09-29 00:37:52
+"SELECT k, min(x), max(x) FROM t GROUP BY k",10000000,60,0.272,0.234,0.282,0.219,3.869,3.751,3.900,3.787,2026-09-29 16:17:59,2026-09-29 16:18:03,3.09,3.40,2026-09-29 00:37:52
