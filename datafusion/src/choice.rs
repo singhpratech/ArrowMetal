@@ -146,9 +146,9 @@ fn family_takes(family: &str, s: &Shape, bucket: &str, rows: u64) -> Result<u64,
 }
 
 pub(crate) fn rows_text(n: u64) -> String {
-    if n >= 1_000_000 && n % 1_000_000 == 0 {
+    if n >= 1_000_000 && n.is_multiple_of(1_000_000) {
         format!("{}M", n / 1_000_000)
-    } else if n >= 1_000 && n % 1_000 == 0 {
+    } else if n >= 1_000 && n.is_multiple_of(1_000) {
         format!("{}k", n / 1_000)
     } else {
         n.to_string()

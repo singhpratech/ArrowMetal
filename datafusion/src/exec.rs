@@ -134,6 +134,16 @@ pub struct MetalExec {
     rows_hint: Option<usize>,
 }
 
+/// How a replaced aggregate is decided (see [`AggregateChoice`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AggSettings {
+    pub choice: AggregateChoice,
+    /// Look the table up at this row count instead of the input's.
+    pub table_rows: Option<usize>,
+    /// The input's row count as the plan's statistics give it.
+    pub rows_hint: Option<usize>,
+}
+
 /// The per-phase metrics of one execution.
 struct PhaseMetrics {
     input_time: Time,
@@ -220,6 +230,9 @@ impl Collected {
 /// most a quarter of them).
 const PREFIX_ROWS: usize = 262_144;
 
+/// The largest sample of the whole input that confirms a take decided from the prefix.
+const CONFIRM_SAMPLE: usize = 2_048;
+
 /// Drains `streams`, reserving each batch in the memory pool: every stream to its end (one task
 /// each), or with `quota`, each until it has given at least `quota` rows (polled together in
 /// this task; the rest of each stream is kept). A stream whose reservation is refused stops there
@@ -296,9 +309,12 @@ async fn finish(mut c: Collected, ctx: &TaskContext) -> Result<Collected> {
 /// A leaf that replays collected batches, then the rest of their streams: the input of the
 /// replaced subtree when `MetalExec` hands a node back. One partition per collected stream; each
 /// partition can be executed once.
+/// One partition of a [`ReplayExec`]: the collected batches and the rest of their stream.
+type ReplaySlot = Option<(Vec<RecordBatch>, Option<SendableRecordBatchStream>)>;
+
 struct ReplayExec {
     schema: SchemaRef,
-    slots: Mutex<Vec<Option<(Vec<RecordBatch>, Option<SendableRecordBatchStream>)>>>,
+    slots: Mutex<Vec<ReplaySlot>>,
     props: Arc<PlanProperties>,
 }
 
@@ -503,6 +519,7 @@ impl Job {
             self.mm.handed_back.add(1);
             return self.hand_back(c);
         }
+        let mut from_prefix: Option<(String, crate::probe::GroupEstimate)> = None;
         if let (Some(_), Some(total)) = (prefix, self.rows_hint) {
             if c.rest.iter().any(Option::is_some) {
                 // Decide from the prefix.
@@ -519,6 +536,9 @@ impl Job {
                     self.record(Decision::runtime_choice(&self.op, false, reason, total, estimate));
                     self.mm.handed_back.add(1);
                     return self.hand_back(c);
+                }
+                if let Some(e) = estimate {
+                    from_prefix = Some((reason, e));
                 }
                 let t = std::time::Instant::now();
                 c = finish(c, &self.ctx).await?;
@@ -537,8 +557,25 @@ impl Job {
         self.mm.input_batches.add(c.parts.iter().map(|p| p.len()).sum());
         let rows = c.rows();
         let t = std::time::Instant::now();
-        let (on_gpu, reason, estimate) = match self.choice {
-            AggregateChoice::Measured => {
+        let (on_gpu, reason, estimate) = match (self.choice, from_prefix) {
+            (AggregateChoice::Measured, Some((why, e))) => {
+                // Taken from the prefix: a small sample of the whole input must agree (its range
+                // must meet the prefix's). Data ordered by its keys shows fewer groups in a prefix
+                // than the input holds; a sample spread over the whole input sees them.
+                let refs: Vec<&RecordBatch> = c.parts.iter().flatten().collect();
+                let f = crate::probe::estimate_up_to(&refs, &keys, None, Some(rows), CONFIRM_SAMPLE);
+                let agree = f.low <= e.high && f.high >= e.low;
+                let check = format!(
+                    "a {}-row sample of the whole input puts it at {} to {} groups",
+                    f.sample_rows, f.low, f.high
+                );
+                if agree {
+                    (true, format!("{why} (from the first rows of each partition; {check})"), Some(e))
+                } else {
+                    (false, format!("{why} from the first rows of each partition, but {check}; left to DataFusion"), Some(f))
+                }
+            }
+            (AggregateChoice::Measured, None) => {
                 let refs: Vec<&RecordBatch> = c.parts.iter().flatten().collect();
                 decide(&self.op, self.input.as_ref(), &refs, &keys, rows, self.table_rows)
             }
@@ -564,12 +601,10 @@ impl MetalExec {
         op: MetalOp,
         input: Arc<dyn ExecutionPlan>,
         original: Arc<dyn ExecutionPlan>,
-        log: SharedLog,
-        plan: u64,
-        choice: AggregateChoice,
-        table_rows: Option<usize>,
-        rows_hint: Option<usize>,
+        (log, plan): (SharedLog, u64),
+        agg: AggSettings,
     ) -> Self {
+        let AggSettings { choice, table_rows, rows_hint } = agg;
         let mut eq = original.equivalence_properties().clone();
         eq.clear_per_partition_constants();
         let props = PlanProperties::new(

@@ -448,3 +448,47 @@ async fn a_refused_memory_reservation_hands_the_node_back() {
         );
     }
 }
+
+/// A take decided from the first batches of each partition is checked against a sample of the
+/// whole input. Here each partition starts with 90,112 rows over 50,000 keys (so the prefix shows
+/// about 150,000 groups, a bucket the table takes at 2,000,000 rows) and continues with keys seen
+/// once (about 1,080,000 groups in all, a bucket it does not take): the node is handed back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prefix_take_is_confirmed_over_the_whole_input() {
+    let (parts, per, head) = (3usize, 400_000usize, 90_112usize);
+    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+    let mut p = Vec::new();
+    for part in 0..parts {
+        let keys: Vec<i64> = (0..per)
+            .map(|i| {
+                if i < head {
+                    (part * 50_000 + i % 50_000) as i64
+                } else {
+                    (1_000_000 + part * per + i) as i64
+                }
+            })
+            .collect();
+        let a = Int64Array::from(keys);
+        let batches: Vec<RecordBatch> = (0..per.div_ceil(8192))
+            .map(|j| {
+                let off = j * 8192;
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(a.slice(off, 8192.min(per - off))) as ArrayRef]).unwrap()
+            })
+            .collect();
+        p.push(batches);
+    }
+    let sql = "SELECT k, count(*) AS n FROM c GROUP BY k";
+    let rule = ArrowMetalRule::new(ArrowMetalConfig::default().with_min_rows(0).with_table_rows(Some(2_000_000)));
+    let ctx = session_context(SessionConfig::new().with_target_partitions(3), rule.clone());
+    ctx.register_table("c", Arc::new(MemTable::try_new(schema.clone(), p.clone()).unwrap())).unwrap();
+    let plain = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(3));
+    plain.register_table("c", Arc::new(MemTable::try_new(schema, p).unwrap())).unwrap();
+    assert_eq!(sorted_text(&ctx, sql).await, sorted_text(&plain, sql).await);
+    rule.clear_report();
+    ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let r = rule.report();
+    let choices: Vec<_> = r.runtime_choices().collect();
+    assert_eq!(choices.len(), 1, "{r}");
+    assert!(!choices[0].taken, "{r}");
+    assert!(choices[0].reason.contains("sample of the whole input"), "{r}");
+}

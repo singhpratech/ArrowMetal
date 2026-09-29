@@ -220,6 +220,17 @@ pub(crate) fn estimate(
     settled: Option<&dyn Fn(u64, u64) -> bool>,
     total: Option<usize>,
 ) -> GroupEstimate {
+    estimate_up_to(batches, keys, settled, total, SAMPLE_MAX)
+}
+
+/// [`estimate`] with samples of at most `max_sample` rows.
+pub(crate) fn estimate_up_to(
+    batches: &[&RecordBatch],
+    keys: &[usize],
+    settled: Option<&dyn Fn(u64, u64) -> bool>,
+    total: Option<usize>,
+    max_sample: usize,
+) -> GroupEstimate {
     let t = Instant::now();
     let batches: Vec<&RecordBatch> = batches.iter().copied().filter(|b| b.num_rows() > 0).collect();
     let avail: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -237,7 +248,7 @@ pub(crate) fn estimate(
             time: t.elapsed(),
         };
     }
-    let cap = SAMPLE_MAX.min(avail / 4).max(FIRST.min(avail));
+    let cap = max_sample.min(SAMPLE_MAX).min(avail / 4).max(FIRST.min(avail));
     let mut n = FIRST.min(avail);
     loop {
         let (d, f1, f2) = stats(sample(&batches, keys, &positions(avail, n)));

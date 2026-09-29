@@ -642,11 +642,12 @@ impl ArrowMetalRule {
             op,
             input,
             original,
-            Arc::clone(&self.log),
-            plan,
-            self.config.aggregate_choice,
-            self.config.table_rows,
-            rows,
+            (Arc::clone(&self.log), plan),
+            crate::exec::AggSettings {
+                choice: self.config.aggregate_choice,
+                table_rows: self.config.table_rows,
+                rows_hint: rows,
+            },
         ));
         let mut reason = size;
         if at_top && node.output_partitioning().partition_count() > 1 {
