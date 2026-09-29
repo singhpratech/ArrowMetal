@@ -5,20 +5,22 @@ Arrow, with its own planner, optimizer and multi-threaded operators. `datafusion
 [`datafusion/`](../datafusion)) is a **physical optimizer rule for DataFusion 55.1**. Registered on a
 `SessionContext`, it replaces DataFusion's full sort (an `ORDER BY` without `LIMIT`) with `MetalExec`,
 which runs the sort on the Apple GPU through ArrowMetal's plan runner and hands DataFusion the
-`RecordBatch`es it expects. It also replaces the hash aggregates (`GROUP BY`) of the one shape a
-measured table takes: `count(*)` over two int32 keys of a `MemTable` of at least 50,000,000 rows.
-Such an aggregate estimates its number of groups from a sample of its keys when it runs, runs on the
-GPU at about 316,000 to 3,160,000 groups, and otherwise hands the node back to DataFusion's own
-operators. The SQL does not change, and every other node of the plan stays DataFusion's.
+`RecordBatch`es it expects. It also replaces the hash aggregates (`GROUP BY`, `DISTINCT`) of the
+shapes a measured table takes: `count(*)` and `DISTINCT` over two int32 keys of a `MemTable` of at
+least 10,000,000 rows. Such an aggregate estimates its number of groups from a sample of its keys
+when it runs, runs on the GPU at the numbers of groups the table takes at that row count, and
+otherwise hands the node back to DataFusion's own operators. The SQL does not change, and every
+other node of the plan stays DataFusion's.
 
 **The summary.** On an Apple M4 Max with DataFusion's default of one partition per core, a full sort
 of 250,000 to 50,000,000 rows is **6.9x to 28.8x faster** with the rule than DataFusion alone, and at
 50M rows it uses 96 to 126 CPU-ms where DataFusion uses 6,104 to 8,311. Over DataFusion's own Parquet
 reader, a Float64 sort is 10.8x to 16.5x faster at 10M and 50M rows, and a sort over a Parquet file
-with a string column 3.6x to 5.5x at 1M to 50M rows. The aggregate the default runs on the GPU,
-`count(*)` over two int32 keys with 1,000,000 groups at 50M rows, was 3.90x and 4.16x faster than
-DataFusion alone, and 1.23x and 1.70x on its first run after the GPU had idled for 500 ms
-([Aggregates](#aggregates-with-the-default)). The answers are DataFusion's: a differential grid of
+with a string column 3.6x to 5.5x at 1M to 50M rows. The aggregates the default runs on the GPU,
+`count(*)` and `DISTINCT` over two int32 keys at 10M and 50M rows, were 1.74x to 3.97x faster than
+DataFusion alone warm. On the first run after 500 ms of idle they were 1.00x to 2.05x faster than
+DataFusion alone's first run after the same idle, and 0.35x to 1.43x of DataFusion alone's warm
+time ([Aggregates](#aggregates-with-the-default)). The answers are DataFusion's: a differential grid of
 7,656 query pairs runs every query with and without the rule and finds 0 mismatches. Top-k
 (`ORDER BY … LIMIT`), filters and every other aggregate shape are left to DataFusion by default; the
 measured numbers for them are under [To improve](#to-improve).
@@ -281,26 +283,33 @@ the measurements it names:
    smallest measured row count at which its worst case (over the layouts and the family's queries)
    was at least 1.65x faster than DataFusion alone, at that size and every larger one, at two sizes
    or more. 26 of the 120 measured series qualify, from 2M to 10M rows.
-2. The first run after the GPU idles: a series is taken at a size only if, at that size and every
-   larger one, the default's first run after 500 ms of idle (the Metal pipelines already compiled)
-   was at least as fast as DataFusion alone's warm time, in every case and layout
-   (`datafusion_groupby_default_idle_2026-09-29.csv`, `datafusion_groupby_recheck_gpu_2026-09-29.csv`).
+2. Idle against idle: a series is taken at a size only if, at that size and every larger one, the
+   default's first run after 500 ms of idle (the Metal pipelines already compiled) was at least as
+   fast as DataFusion alone's first run after the same 500 ms of idle, for the same query, size and
+   layout, in every case and layout (the median of three runs of each, the two alternating;
+   `datafusion_groupby_idle_vs_idle_2026-09-29.csv` and the earlier `…_idle_…` and
+   `…_recheck_gpu_…` files).
 3. The hand-back: a shape is replaced at a size only if, at that size and every larger one, every
    case the default handed back at run time was at 0.97x of DataFusion alone or better on the best
-   run and on the median run (`datafusion_groupby_default_handback_2026-09-29.csv`,
-   `datafusion_groupby_recheck_2026-09-29.csv` and the files before them).
+   run and on the median run (`datafusion_groupby_idle_vs_idle_2026-09-29.csv`,
+   `datafusion_groupby_idle_vs_idle_recheck_2026-09-29.csv` and the files before them).
 
-One series is taken:
+Seven series are taken, all over two int32 (or narrower) keys of a `MemTable` scan:
 
-| shape | groups | taken from |
-|---|---|---|
-| `count` (`count(*)`, `count(x)`) over two int32 keys (or narrower), `MemTable` input | 316,228 to 3,162,277 | 50,000,000 rows |
+| aggregate | groups | taken from | sweep, worst case 10M / 50M |
+|---|---|---|---|
+| `count` (`count(*)`, `count(x)`) | 31,623 to 316,227 | 10,000,000 rows | 2.7x / 3.2x |
+| `count` | 316,228 to 3,162,277 | 10,000,000 rows | 2.8x / 4.0x |
+| `count` | 1,415 to 31,622 | 50,000,000 rows | 1.8x / 2.1x |
+| `DISTINCT` | 1 to 1,414 | 10,000,000 rows | 1.7x / 2.2x |
+| `DISTINCT` | 1,415 to 31,622 | 50,000,000 rows | 1.8x / 2.1x |
+| `DISTINCT` | 31,623 to 316,227 | 50,000,000 rows | 2.6x / 3.0x |
+| `DISTINCT` | 316,228 to 3,162,277 | 50,000,000 rows | 2.1x / 3.4x |
 
-Of the other 25 series that qualify in the sweep, 20 are not taken because their first run after
-idle was slower than DataFusion alone's warm time at every size, and 5 (`count` over one int32, one
-int64 or two int64 keys, `DISTINCT` over one int64 key, and `sum`/`avg` over two int32 keys, all at
-1,000,000 groups) because a hand-back of the same shape at 50M rows cost more than 3% ([To
-improve](#aggregates)).
+Each series' row in `src/agg_table.rs` ends with the reason for its threshold. Of the other 19
+series that qualify in the sweep, 3 are left because their first run after idle was slower than
+DataFusion alone's first run after the same idle at 50M rows, and 16 because a hand-back of the same
+shape at 50M rows cost more than 3% ([To improve](#aggregates)).
 
 ---
 
@@ -309,8 +318,8 @@ improve](#aggregates)).
 | Shape | Default | Why |
 |---|---|---|
 | top-k, `ORDER BY … LIMIT` | left | behind DataFusion at every measured size from 250,000 to 50M rows: 0.14x to 0.41x ([To improve](#top-k)) |
-| `GROUP BY`, `DISTINCT` of a shape the table does not take at the input's row count | left | behind DataFusion, not 1.65x ahead in the worst case at two sizes, slower than DataFusion on the first run after idle, or its hand-backs cost more than 3% ([To improve](#aggregates)) |
-| `count(*)` over two int32 keys at 50M rows or more whose estimated number of groups is not in the taken range | handed back at run time | `HANDBACK` in the report |
+| `GROUP BY`, `DISTINCT` of a shape the table does not take at the input's row count | left | behind DataFusion, not 1.65x ahead in the worst case at two sizes, slower than DataFusion alone on the first run after the same idle, or its hand-backs cost more than 3% ([To improve](#aggregates)) |
+| `count(*)` or `DISTINCT` over two int32 keys at 10M rows or more whose estimated number of groups is not in a taken range | handed back at run time | `HANDBACK` in the report |
 | `WHERE` | left | behind on the measured shapes: 0.51x to 0.74x ([To improve](#filters)) |
 | joins | not replaced | the rule has no join operator |
 | a sort over an estimated row count (above a filter, a join or an aggregate) | left | the threshold needs an exact count; `accept_inexact` takes it |
@@ -378,13 +387,13 @@ times with the rule: forced onto the GPU (`AggregateChoice::ArrowMetal`), forced
 - **Comparison:** floats by bit pattern (so -0.0 ≠ +0.0, and NaN sign and payload must match), except
   float `sum` and every `avg`, compared within 1e-9 relative.
 
-Run on 2026-09-29 (`cargo test`, debug build, 85 s):
+Run on 2026-09-29 (`cargo test`, debug build, 102 s):
 
 | | |
 |---|---|
 | query pairs | **7,656**: 5,304 with every node forced onto the GPU, 1,176 `GROUP BY` forced back, 1,176 `GROUP BY` with the measured choice |
 | pairs with a node replaced | 5,976, including all 3,696 `ORDER BY` pairs |
-| run-time choices | forced onto the GPU: 960 on the GPU; forced back: 960 handed back; measured: none replaced (the table takes one shape at 50M rows; the grid's tables hold at most 20,000 rows) |
+| run-time choices | forced onto the GPU: 960 on the GPU; forced back: 960 handed back; measured: none replaced (every `GROUP BY` of the grid has one key; the table takes two-key shapes only) |
 | mismatches | **0** |
 | hand-backs on an ArrowMetal error | **0** |
 | hand-backs on the data (the checks above) | 128: 64 Float64 `MIN` over a group with NaN, 32 filters on a column holding -NaN, 32 group keys with several NaN patterns |
@@ -392,9 +401,9 @@ Run on 2026-09-29 (`cargo test`, debug build, 85 s):
 
 The pairs of the forced variant with nothing taken are Float32 `MIN`/`MAX` group-bys, a `CAST` in a
 predicate, and a float comparison against zero, each left by the rule with its reason.
-`tests/rule.rs` checks both branches of the measured choice with the table looked up at 50M rows:
-`count(*)` over two int32 keys drawn from 1,000,000 values runs on the GPU, over 150 values it is
-handed back, on one batch per partition and on 8,192-row batches. A unit test in `src/exec.rs`
+`tests/rule.rs` checks both branches of the measured choice with the table looked up at 10M and at
+50M rows: `count(*)` over two int32 keys drawn from 1,000,000 values runs on the GPU, over 150 values
+it is handed back, on one batch per partition and on 8,192-row batches. A unit test in `src/exec.rs`
 checks that a prefix repeating a few thousand keys, followed by keys seen once, is not confirmed by
 the 2,048-row sample of the whole input.
 
@@ -519,40 +528,84 @@ The default configuration takes both (exact row counts from the file's footer).
 ### Aggregates with the default
 
 Every `GROUP BY` and `DISTINCT` case of the sweep (with one and two int32 and int64 keys, 200 to about
-rows / 2 groups) and `SELECT DISTINCT region, sub FROM fact`, with `ArrowMetalConfig::default()`
-timed against DataFusion alone, both layouts, 1M to 50M rows. A case whose default ran on the GPU:
-three rounds of best of 5 with the two contexts in rotated order, then three runs of each after
-500 ms of sleep. Any other case (both contexts on the CPU): 30 runs of each, alternating run by run,
-after a 100 ms warm-up. The files: `datafusion_groupby_default_2026-09-29.csv` (every case, the
-earlier table) and the re-measurements after it, whose rows replace its rows for the same case,
-size and layout (`…_taken_…`, `…_cap_…`, `…_idle_…`, `…_handback_…`, `…_recheck_gpu_…`,
-`…_recheck_…`, `…_recheck2_…`); every row whose decision the final table changed was re-measured,
-and so was a random fifth of the rest. Every answer was equal to DataFusion's.
+rows / 2 groups) and `SELECT DISTINCT region, sub FROM fact` (two int32 keys, 10,000 groups), with
+`ArrowMetalConfig::default()` timed against DataFusion alone, both layouts, 1M to 50M rows. A case
+whose default ran on the GPU: three rounds of best of 5 with the two contexts in rotated order, then
+three runs of each after 500 ms of sleep, the two contexts alternating (the median of the three is
+the first-run time). Any other case (both contexts on the CPU): 30 runs of each, alternating run by
+run, after a 100 ms warm-up, and the same idle runs. The files: `datafusion_groupby_default_2026-09-29.csv`
+(every case, an earlier table) and the re-measurements after it, whose rows replace its rows for the
+same case, size and layout (`…_taken_…`, `…_cap_…`, `…_idle_…`, `…_handback_…`, `…_recheck_gpu_…`,
+`…_recheck_…`, `…_recheck2_…`, `…_idle_vs_idle_…`, `…_idle_vs_idle_recheck_…`). The last two hold
+every case whose decision this table changed, a random fifth of the rest (374 and 42 rows, 17:21 to
+18:45 EDT, load 1.75 to 3.49 at the start of each block). Every answer was equal to DataFusion's.
 
 | rows | cases | left at plan time | handed back at run time | run on the GPU |
 |---:|---:|---:|---:|---:|
-| 1,000,000 to 10,000,000 | 1,224 | 1,224 | 0 | 0 |
-| 50,000,000 | 322 | 312 | 8 | 2 |
+| 1,000,000 to 5,000,000 | 902 | 902 | 0 | 0 |
+| 10,000,000 | 322 | 300 | 16 | 6 |
+| 50,000,000 | 322 | 300 | 6 | 16 |
 
-**On the GPU** (`datafusion_groupby_recheck_gpu_2026-09-29.csv`), `count(*)` over two int32 keys,
-1,000,000 groups, 50M rows:
+**On the GPU** (`datafusion_groupby_idle_vs_idle_2026-09-29.csv`), over two int32 keys. *Warm*: best
+run, DataFusion alone ÷ the default. *Idle vs idle*: DataFusion alone's first run after 500 ms of
+idle ÷ the default's first run after the same idle. *GPU idle vs DataFusion warm*: DataFusion alone
+warm ÷ the default's first run after idle, the comparison of a single query on an idle GPU with
+DataFusion's time when it has just run the same query. CPU-ms: process CPU time of the best warm run
+and of the median idle run.
 
-| layout | DataFusion alone warm, ms | default warm, ms | off ÷ default | first run after 500 ms idle, ms (median of 3; slowest) | DataFusion alone warm ÷ that | DataFusion alone after the same idle, ms | CPU-ms off / default |
-|---|---:|---:|---:|---|---:|---:|---|
-| 8,192-row batches | 74.78 | 19.18 | 3.90x | 60.70; 72.02 | 1.23x | 94.94 | 1,129 / 50 |
-| one batch per partition | 73.99 | 17.80 | 4.16x | 43.64; 58.56 | 1.70x | 95.18 | 1,120 / 49 |
+| query | groups | rows | layout | DataFusion warm, ms | default warm, ms | warm | DataFusion idle, ms | default idle, ms | idle vs idle | GPU idle vs DataFusion warm | CPU-ms warm, DataFusion / default | CPU-ms idle, DataFusion / default |
+|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---|---|
+| `count(*)` | 100,000 | 10M | 8,192-row batches | 14.97 | 5.48 | 2.73x | 28.91 | 18.64 | 1.55x | 0.80x | 180 / 12 | 317 / 31 |
+| `count(*)` | 100,000 | 10M | one per partition | 14.48 | 4.80 | 3.02x | 31.52 | 15.39 | 2.05x | 0.94x | 180 / 10 | 314 / 24 |
+| `count(*)` | 999,943 | 10M | 8,192-row batches | 17.87 | 6.88 | 2.60x | 29.46 | 26.91 | 1.09x | 0.66x | 258 / 12 | 395 / 37 |
+| `count(*)` | 999,943 | 10M | one per partition | 17.41 | 6.34 | 2.75x | 32.65 | 18.88 | 1.73x | 0.92x | 256 / 12 | 373 / 23 |
+| `DISTINCT` | 200 | 10M | 8,192-row batches | 7.64 | 4.40 | 1.74x | 23.11 | 22.01 | 1.05x | 0.35x | 86 / 9 | 165 / 38 |
+| `DISTINCT` | 200 | 10M | one per partition | 7.45 | 3.73 | 2.00x | 19.71 | 17.89 | 1.10x | 0.42x | 85 / 10 | 143 / 31 |
+| `count(*)` | 10,000 | 50M | 8,192-row batches | 34.36 | 16.92 | 2.03x | 57.71 | 57.43 | 1.00x | 0.60x | 474 / 51 | 693 / 103 |
+| `count(*)` | 10,000 | 50M | one per partition | 33.37 | 15.88 | 2.10x | 57.10 | 37.57 | 1.52x | 0.89x | 472 / 51 | 698 / 70 |
+| `count(*)` | 100,000 | 50M | 8,192-row batches | 52.95 | 17.85 | 2.97x | 78.48 | 46.30 | 1.70x | 1.14x | 741 / 52 | 953 / 84 |
+| `count(*)` | 100,000 | 50M | one per partition | 51.35 | 15.80 | 3.25x | 73.26 | 42.22 | 1.74x | 1.22x | 769 / 50 | 969 / 78 |
+| `count(*)` | 1,000,000 | 50M | 8,192-row batches | 73.68 | 19.61 | 3.76x | 101.45 | 55.43 | 1.83x | 1.33x | 1,093 / 43 | 1,247 / 82 |
+| `count(*)` | 1,000,000 | 50M | one per partition | 72.67 | 18.29 | 3.97x | 92.68 | 50.71 | 1.83x | 1.43x | 1,098 / 46 | 1,289 / 71 |
+| `DISTINCT` | 200 | 50M | 8,192-row batches | 30.59 | 13.94 | 2.19x | 54.60 | 47.25 | 1.16x | 0.65x | 420 / 50 | 628 / 102 |
+| `DISTINCT` | 200 | 50M | one per partition | 30.15 | 12.73 | 2.37x | 50.88 | 36.65 | 1.39x | 0.82x | 414 / 45 | 637 / 83 |
+| `DISTINCT` | 10,000 | 50M | 8,192-row batches | 31.34 | 15.57 | 2.01x | 47.20 | 42.39 | 1.11x | 0.74x | 432 / 48 | 596 / 92 |
+| `DISTINCT` | 10,000 | 50M | one per partition | 31.23 | 14.27 | 2.19x | 51.29 | 41.15 | 1.25x | 0.76x | 429 / 49 | 656 / 94 |
+| `SELECT DISTINCT region, sub` | 10,000 | 50M | 8,192-row batches | 40.86 | 15.07 | 2.71x | 53.71 | 44.16 | 1.22x | 0.93x | 387 / 48 | 591 / 82 |
+| `SELECT DISTINCT region, sub` | 10,000 | 50M | one per partition | 31.89 | 14.16 | 2.25x | 52.27 | 33.64 | 1.55x | 0.95x | 425 / 43 | 640 / 64 |
+| `DISTINCT` | 100,000 | 50M | 8,192-row batches | 42.98 | 16.03 | 2.68x | 61.03 | 42.23 | 1.45x | 1.02x | 618 / 43 | 813 / 88 |
+| `DISTINCT` | 100,000 | 50M | one per partition | 41.25 | 14.76 | 2.79x | 69.38 | 37.68 | 1.84x | 1.09x | 646 / 50 | 860 / 76 |
+| `DISTINCT` | 1,000,000 | 50M | 8,192-row batches | 59.88 | 17.29 | 3.46x | 80.60 | 45.58 | 1.77x | 1.31x | 894 / 50 | 1,067 / 76 |
+| `DISTINCT` | 1,000,000 | 50M | one per partition | 56.34 | 15.99 | 3.52x | 75.32 | 41.68 | 1.81x | 1.35x | 859 / 48 | 1,054 / 78 |
 
-**Handed back at run time:** the same shape at 50M rows with 200, 10,000, 100,000 and about
-rows / 2 groups, both layouts: 0.977x to 1.037x of DataFusion alone on the best run and 0.995x to
-1.023x on the median run; the group-count estimate took 0.02 to 0.17 ms.
+Per size: at 10M rows the default was 1.74x to 3.02x faster warm, 1.05x to 2.05x idle against idle,
+and 0.35x to 0.94x of DataFusion's warm time on its first run after idle; at 50M rows 2.01x to 3.97x,
+1.00x to 1.84x and 0.60x to 1.43x. After the same 500 ms idle DataFusion alone took 1.65x to 3.02x
+its warm time at 10M rows and 1.28x to 1.78x at 50M; the default took 2.98x to 5.00x and 2.37x to
+3.39x. On the median of the three rounds instead of the best run, the lowest warm ratio is 1.24x
+(`DISTINCT`, 200 groups, 10M rows, one batch per partition; 2.00x best) and 2.02x at 50M.
+
+**Idle for 5 seconds** (`datafusion_groupby_idle_gap_2026-09-29.csv`, 18:22 to 18:31 EDT, load 1.12 to
+3.39 at the start of each block): twelve cases, each timed once with three runs after 5 s of idle and
+then once with three runs after 500 ms, the contexts alternating. Idle against idle, DataFusion
+alone's first run ÷ the default's was 0.87x to 1.67x (median 1.24x, 1 of 12 below 1.0x) after 500 ms
+and 0.71x to 1.49x (median 1.07x, 5 of 12 below 1.0x) after 5 s. DataFusion alone's first run took a
+median 1.61x its warm time after either idle; the default's took a median 3.34x after 500 ms and
+3.81x after 5 s. Of the cases the default takes: `count(*)`, 1,000,000 groups, 50M rows, 1.61x and
+1.49x; `count(*)`, 10,000 groups, 50M rows, 1.62x and 1.08x; `DISTINCT`, 100,000 groups, 50M rows,
+1.36x and 1.11x; `count(*)`, 100,000 groups, 10M rows, 1.67x and 1.07x; `count(*)`, 1,000,000
+groups, 10M rows, 1.03x and 1.06x; `DISTINCT`, 200 groups, 10M rows, 1.12x and 0.71x.
+
+**Handed back at run time:** the other group counts of the same two shapes at 10M and 50M rows, both
+layouts (22 cases): 0.977x to 1.025x of DataFusion alone on the best run and 0.978x to 1.029x on the
+median run; the group-count estimate took 0.016 to 0.169 ms.
 
 **Left at plan time:** DataFusion's own plan in both contexts, with the rule's walk over the plan in
 one. The walk added 0.009 to 0.029 ms to planning (median, `examples/plancost.rs`,
 `datafusion_plancost_2026-09-29.csv`: 0.139 against 0.148 ms and 0.120 against 0.131 ms at 1M rows,
 0.269 against 0.298 ms and 0.272 against 0.282 ms at 10M; plan and run 0.831 against 0.846 ms,
-3.526 against 3.532 ms). Measured run by run, the 661 left cases were at 0.906x to 1.109x of
-DataFusion alone on the best run and 0.936x to 1.068x on the median run, none below 0.97x on both;
-the 875 left cases measured only in rotated rounds were at 0.912x to 1.108x and 0.906x to 1.319x.
+3.526 against 3.532 ms). The 332 left cases in the two newest files were at 0.894x to 1.105x of
+DataFusion alone on the best run and 0.943x to 1.049x on the median run, none below 0.97x on both.
 
 **Pipeline compilation** (`examples/coldstart.rs`, `datafusion_coldstart_2026-09-29.csv`, 10M
 rows, three fresh processes per query): the first GPU query of a process compiles its Metal
@@ -608,15 +661,16 @@ query.
 
 With every replaced aggregate forced onto the GPU (`AggregateChoice::ArrowMetal`), DataFusion alone ÷
 with the rule, the range over one and two keys, int32 and int64 keys, both layouts and the family's
-queries, from `datafusion_groupby_sweep_2026-09-29.csv`. The default takes one cell's two-int32-key
-cases: `count(*)` at 1,000,000 groups, 50M rows (bold).
+queries, from `datafusion_groupby_sweep_2026-09-29.csv`. Of these cells the default takes the
+two-int32-key cases of `count(*)` at 100,000 and 1,000,000 groups from 10M rows and at 10,000 groups
+at 50M, and of `DISTINCT` at 200 groups from 10M rows and at 10,000 to 1,000,000 groups at 50M.
 
 | aggregate | groups | 1M | 2M | 5M | 10M | 50M |
 |---|---|---|---|---|---|---|
 | `count(*)` | 200 | 0.40-0.58 | 0.40-0.92 | 0.64-1.32 | 0.91-1.68 | 1.32-2.31 |
 | `count(*)` | 10,000 | 0.70-0.88 | 0.70-0.95 | 0.67-1.63 | 1.14-1.83 | 1.25-2.38 |
 | `count(*)` | 100,000 | 1.17-1.31 | 1.49-2.20 | 1.35-2.76 | 2.45-2.95 | 2.45-3.25 |
-| `count(*)` | 1,000,000 | | | 2.03-2.46 | 1.88-2.97 | **3.39-4.10** |
+| `count(*)` | 1,000,000 | | | 2.03-2.46 | 1.88-2.97 | 3.39-4.10 |
 | `count(*)` | rows / 2 | 1.13-1.59 | 1.39-1.76 | 1.25-2.06 | 1.88-2.13 | 0.89-0.94 |
 | `sum`, `avg` over int64 | 200 | 0.35-0.62 | 0.45-0.83 | 0.64-1.23 | 0.69-1.62 | 0.90-1.94 |
 | `sum`, `avg` over int64 | 10,000 | 0.58-0.76 | 0.66-1.17 | 0.82-1.53 | 0.81-1.68 | 0.94-1.75 |
@@ -647,33 +701,26 @@ cases: `count(*)` at 1,000,000 groups, 50M rows (bold).
 At 1M and 2M rows the 1,000,000-group data holds at least rows / 4 groups and is in the rows / 2
 row.
 
-**The first run after the GPU idles.** Of the 26 series that are at least 1.65x faster warm at two
-sizes or more, 25 are left because of their first run after 500 ms of idle (pipelines compiled) or
-the cost of a hand-back of the same shape. The first run after idle against DataFusion alone's warm time, lowest over
-the cases and layouts of each size, from `datafusion_groupby_default_idle_2026-09-29.csv` (the
-default's GPU runs with the earlier table):
+**The first run after the GPU idles.** 26 series are at least 1.65x faster warm at two sizes or
+more; the default takes 7. The first run after 500 ms of idle (pipelines compiled) of every case the
+default has run on the GPU, over the latest measurement of each case and layout
+(`datafusion_groupby_default_idle_2026-09-29.csv`, `datafusion_groupby_recheck_gpu_2026-09-29.csv`,
+`datafusion_groupby_idle_vs_idle_2026-09-29.csv`; the first two with DataFusion's idle run always
+before the default's, the third alternating):
 
-| rows | cases | warm: off ÷ default, min / median | first run after idle: DataFusion warm ÷ it, min / median / max | at or above 1.0x |
-|---:|---:|---|---|---:|
-| 2,000,000 | 6 | 1.48 / 1.73 | 0.35 / 0.42 / 0.72 | 0 |
-| 5,000,000 | 34 | 1.94 / 2.31 | 0.40 / 0.48 / 0.63 | 0 |
-| 10,000,000 | 60 | 1.74 / 2.61 | 0.41 / 0.63 / 0.93 | 0 |
-| 50,000,000 | 60 | 1.81 / 2.76 | 0.62 / 0.97 / 1.94 | 27 |
+| rows | cases | idle vs idle: DataFusion idle ÷ default idle, min / median / max | at or above 1.0x | GPU idle vs DataFusion warm, min / median / max | DataFusion idle ÷ its warm time |
+|---:|---:|---|---:|---|---|
+| 2,000,000 | 6 | 1.04 / 1.45 / 2.57 | 6 | 0.35 / 0.42 / 0.72 | 2.79-4.08 |
+| 5,000,000 | 34 | 0.71 / 1.20 / 1.65 | 26 | 0.40 / 0.49 / 0.63 | 1.56-3.63 |
+| 10,000,000 | 60 | 0.81 / 1.21 / 2.05 | 52 | 0.35 / 0.63 / 0.94 | 1.27-3.02 |
+| 50,000,000 | 60 | 0.88 / 1.36 / 2.37 | 56 | 0.48 / 1.04 / 1.94 | 1.15-1.82 |
 
-DataFusion alone is slower after the same idle too: its first run after 500 ms took 1.16x to 4.08x
-its warm time in these cases (median 3.30x at 2M rows, 1.33x at 50M). Against DataFusion alone after
-the same idle, DataFusion alone's time ÷ the default's first run was 0.71x to 2.57x (median 1.20x to
-1.45x per size).
+The 32 cases measured in both the earlier and the alternating file differ between the two: the
+later idle-against-idle ratio is 0.69x to 1.51x of the earlier one (median 0.93x).
 
-Series left at 50M rows by the first run after idle, lowest DataFusion warm ÷ first run over the
-cases and layouts: `count(*)`, one int32 key, 100,000 groups 0.83; one int64 key, 100,000 groups
-0.93; two int32 keys, 10,000 groups 0.72 and 100,000 groups 0.93; two int64 keys, 100,000 groups
-0.93; `DISTINCT`, one int32 key, 100,000 groups 0.62 and 1,000,000 groups 0.87; one int64 key,
-100,000 groups 0.66; two int32 keys, 200 groups 0.65, 10,000 groups 0.64, 100,000 groups 0.88,
-1,000,000 groups 0.997; two int64 keys, 100,000 groups 0.91 and 1,000,000 groups 0.83; `min`/`max`
-over int64, two int32 keys, 100,000 groups 0.73; two int64 keys, 100,000 groups 0.84 and 1,000,000
-groups 0.85; `sum`/`avg` over int64, two int32 keys, 100,000 groups 0.79; two int64 keys, 100,000
-groups 0.77 and 1,000,000 groups 0.92.
+Series left at 50M rows by the first run after idle, lowest DataFusion idle ÷ default idle over the
+cases and layouts: `DISTINCT` over one int32 key, 100,000 groups 0.88; `min`/`max` over int64, two
+int32 keys, 100,000 groups 0.97; two int64 keys, 1,000,000 groups 0.99.
 
 **The hand-back.** Handing an aggregate back at run time (reading the first batches, estimating the
 groups, then running DataFusion's plan) cost, against DataFusion alone, measured run by run
@@ -681,11 +728,16 @@ groups, then running DataFusion's plan) cost, against DataFusion alone, measured
 the best run / the median run: at 2M rows a median of 0.969x / 0.967x, lowest 0.934x and 0.921x
 (the latter `count(*)` over one int64 key, 864,909 groups: 5.30 → 5.61 ms best); at 5M a median of
 0.984x / 0.984x, lowest 0.936x and 0.914x; at 10M 0.990x / 0.991x, lowest 0.884x and 0.968x; at 50M
-0.993x / 0.995x, lowest 0.944x and 0.924x. The series whose first run after idle passes at 50M but
-whose shape's hand-backs there do not, with that shape's lowest hand-back at 50M (best / median):
-`count(*)` over one int32 key, 1,000,000 groups (0.961x / 1.003x); over one int64 key (0.948x /
-0.943x); over two int64 keys (0.972x / 0.958x); `DISTINCT` over one int64 key (0.901x / 1.039x);
-`sum`/`avg` over int64 with two int32 keys (0.990x / 0.924x).
+0.993x / 0.995x, lowest 0.944x and 0.924x. The 16 series whose first run after idle passes at 50M
+but whose shape's hand-backs there do not, by shape, with the shape's lowest hand-back at 50M (best /
+median; the latest measurement of each case in the check files): `count(*)` over one int32 key,
+100,000 and 1,000,000 groups (0.961x / 1.003x); over one int64 key, 100,000 and 1,000,000 groups
+(0.948x / 0.943x); over two int64 keys, 100,000 and 1,000,000 groups (0.972x / 0.958x); `DISTINCT`
+over one int32 key, 1,000,000 groups (0.968x / 0.996x); over one int64 key, 100,000 and 1,000,000
+groups (0.901x / 1.039x); over two int64 keys, 100,000 and 1,000,000 groups (0.953x / 1.002x);
+`min`/`max` over int64 with two int64 keys, 100,000 groups (0.968x / 0.982x); `sum`/`avg` over int64
+with two int32 keys, 100,000 and 1,000,000 groups (0.990x / 0.924x); with two int64 keys, 100,000
+and 1,000,000 groups (0.944x / 0.992x).
 
 ### Filters
 
@@ -725,9 +777,10 @@ warm time for the same query (8.08 to 31.75 ms).
 - **Exact row counts.** By default a node is taken only when DataFusion's statistics give its input
   an exact row count. A sort above a filter, a join or an aggregate has an estimate and is left
   unless `accept_inexact` is set; an unknown count is left unless `take_when_unknown` is set.
-- **Aggregates.** The measured table takes one shape: `count` over two int32 (or narrower) keys of a
-  `MemTable` scan with at least 50,000,000 rows. Every other aggregate is left, including every
-  aggregate over a Parquet scan, a filter or a join, and every one with a float or string key.
+- **Aggregates.** The measured table takes two shapes: `count` and `DISTINCT` over two int32 (or
+  narrower) keys of a `MemTable` scan with at least 10,000,000 rows. Every other aggregate is left,
+  including every aggregate over a Parquet scan, a filter or a join, and every one with a float or
+  string key.
 - **Pipeline compilation.** The first GPU query of a process compiles its Metal pipelines: 42 to
   66 ms at 10M rows (`datafusion_coldstart_2026-09-29.csv`).
 - **macOS on Apple silicon only.** `build.rs` stops the build for any other target with a message
@@ -773,7 +826,8 @@ On 2026-09-29: 30 passed, 2 ignored, doc-test passed; the ignored rule test pass
 | `datafusion/results/datafusion_sort_warm_2026-09-29.csv` | sorts and top-k with the warm-up, 100,000 to 50M rows |
 | `datafusion/results/datafusion_rule_2026-09-29.csv` | every case, rule off and on, 100,000 to 50M rows, and the Parquet cases |
 | `datafusion/results/datafusion_groupby_sweep_2026-09-29.csv` | the aggregate sweep, rule forced on, off and forced back, 1M to 50M rows: the table's source |
-| `datafusion/results/datafusion_groupby_default_2026-09-29.csv` and `…_taken_…`, `…_cap_…`, `…_idle_…`, `…_handback_…`, `…_recheck_gpu_…`, `…_recheck_…`, `…_recheck2_…` | the aggregates with the default configuration timed |
+| `datafusion/results/datafusion_groupby_default_2026-09-29.csv` and `…_taken_…`, `…_cap_…`, `…_idle_…`, `…_handback_…`, `…_recheck_gpu_…`, `…_recheck_…`, `…_recheck2_…`, `…_idle_vs_idle_…`, `…_idle_vs_idle_recheck_…` | the aggregates with the default configuration timed |
+| `datafusion/results/datafusion_groupby_idle_gap_2026-09-29.csv` | twelve aggregates after 5 s and after 500 ms of idle |
 | `datafusion/results/datafusion_coldstart_2026-09-29.csv` | pipeline compilation per process |
 | `datafusion/results/datafusion_plancost_2026-09-29.csv` | the rule's planning cost |
 | `datafusion/results/datafusion_parquet_string_sort_2026-09-29.csv` | Parquet sorts with a string column |

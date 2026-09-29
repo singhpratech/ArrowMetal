@@ -29,10 +29,12 @@ replaces an earlier one's for the same size, layout and case) then raise the thr
 Each constraint reads, per size, layout and case, the latest row in which the default took that path
 (ran it on ArrowMetal, or handed it back), whatever a later file decided.
 
-* First run after idle: a series (family, keys, key class, input, bucket) is taken at a size only
-  if, at that size and every larger measured size, every row the default ran on ArrowMetal has
-  `off_ms / def_idle_ms >= IDLE_RATIO` (the default's first run after the GPU idled, pipelines
-  already compiled, against DataFusion alone's warm time). A size with no such row is not taken.
+* First run after idle, idle against idle: a series (family, keys, key class, input, bucket) is
+  taken at a size only if, at that size and every larger measured size, every row the default ran
+  on ArrowMetal has `off_idle_ms / def_idle_ms >= IDLE_RATIO`: the default's first run after the
+  same idle (pipelines already compiled) against DataFusion alone's first run after that idle, same
+  query, size and layout, each the median of the runs after `idle_gap_ms` of sleep. A size with no
+  such row, or a row without both idle times, is not taken.
 * Hand-back: a shape (family, keys, key class, input) is replaced at plan time from a size only if,
   at that size and every larger measured size, every row the default handed back at run time is at
   least HANDBACK_RATIO of DataFusion alone on the best run AND on the median of the round bests.
@@ -56,8 +58,8 @@ MIN_RATIO = 1.5
 # The sweep ratio needed at a size is MIN_RATIO x HEADROOM: a shape measured at 1.5x sits within
 # run-to-run noise of 1.5x, so the default takes only shapes measured at least 10 % above it.
 HEADROOM = 1.1
-# The default's first run after the GPU idled (pipelines compiled) must not be slower than
-# DataFusion alone warm.
+# The default's first run after an idle gap (pipelines compiled) must not be slower than DataFusion
+# alone's first run after the same gap.
 IDLE_RATIO = 1.0
 # A run-time hand-back may cost at most 3 % against DataFusion alone (best and median of rounds).
 HANDBACK_RATIO = 0.97
@@ -177,52 +179,95 @@ def constraints(paths):
         if state(r) == "gpu":
             b = bucket(int(r["out_rows"]), size)
             key = shape + (b,)
-            v = r.get("def_idle_ms")
-            ok = bool(v) and float(r["off_ms"]) / float(v) >= IDLE_RATIO
+            v, o = r.get("def_idle_ms"), r.get("off_idle_ms")
+            ratio = float(o) / float(v) if v and o else None
+            ok = ratio is not None and ratio >= IDLE_RATIO
             idle.setdefault(key, {})
-            idle[key][size] = idle[key].get(size, True) and ok
+            prev = idle[key].get(size)
+            # Per size: (every row passes, the lowest ratio with its row; None: a row not measured).
+            low = prev[1] if prev else (float("inf"), "")
+            if ratio is None:
+                low = (None, f"{r['case']} {r['layout']}")
+            elif low[0] is not None and ratio < low[0]:
+                low = (ratio, f"{r['case']} {r['layout']}")
+            idle[key][size] = ((prev[0] if prev else True) and ok, low)
             if not ok:
-                fails.append(("idle", key, size, r["layout"], r["case"], r["off_ms"], v or "-"))
+                fails.append(("idle", key, size, r["layout"], r["case"], o or "-", v or "-"))
         elif state(r) == "back":
             best = float(r["off_ms"]) / float(r["def_ms"])
             med = float(r["off_round_median_ms"] or r["off_ms"]) / float(r["def_round_median_ms"] or r["def_ms"])
             ok = best >= HANDBACK_RATIO and med >= HANDBACK_RATIO
             back.setdefault(shape, {})
-            back[shape][size] = back[shape].get(size, True) and ok
+            prev = back[shape].get(size)
+            low = prev[1] if prev else (float("inf"), "")
+            if min(best, med) < low[0]:
+                low = (min(best, med), f"{r['case']} {r['layout']} {best:.3f} / {med:.3f}")
+            back[shape][size] = ((prev[0] if prev else True) and ok, low)
             if not ok:
                 fails.append(("handback", shape, size, r["layout"], r["case"], f"{best:.3f}", f"{med:.3f}"))
     return idle, back, fails
 
 
+def mn(n):
+    return f"{n // 1_000_000}M"
+
+
 def table(path, checks=()):
+    """[(series key, min_rows, max_rows, {size: worst ratio}, [reason, ...])]: every series carries
+    the reason for its threshold (or for not being taken)."""
     s = read(path)
     idle, back, _ = constraints(checks) if checks else ({}, {}, [])
+    need = MIN_RATIO * HEADROOM
     rows = []
     for key in sorted(s, key=lambda k: (k[0], k[1], k[2], k[3], ORDER.index(k[4]))):
         lo, hi, worst = fit(s[key])
         why = []
+        if lo is None:
+            below = [n for n in sorted(worst) if worst[n] < need]
+            if below:
+                n = below[-1]
+                why.append(f"warm {worst[n]:.2f}x at {mn(n)}, below {need:.2f}x")
+            else:
+                why.append(f"warm {need:.2f}x or more at one measured size only")
+        else:
+            why.append(f"warm {need:.2f}x or more from {mn(lo)}" + (f" to {mn(hi)} (the ratio falls between the two largest sizes)" if hi else ""))
         if lo is not None and checks:
-            sizes = idle.get(key, {})
+            sizes = {n: v[0] for n, v in idle.get(key, {}).items()}
             # A size at or above the threshold where the default never ran this series on the GPU
             # has no first-run measurement: not taken there.
             for n in SIZES_ALL:
                 if n >= lo and n in worst and n not in sizes:
                     sizes = {**sizes, n: False}
             first = first_holding(sizes)
+            fail = [n for n in sorted(sizes) if not sizes[n]]
+            def low(n):
+                v = idle.get(key, {}).get(n)
+                if v is None:
+                    return f"no first run after idle measured at {mn(n)}"
+                if v[1][0] is None:
+                    return f"idle vs idle not measured at {mn(n)} ({v[1][1]})"
+                return f"idle vs idle {v[1][0]:.2f}x at {mn(n)} ({v[1][1]})"
             if first is None or (hi is not None and first > hi):
-                why.append("first run after idle below DataFusion alone at every size")
+                why.append(low(fail[-1]) + f", below {IDLE_RATIO}x")
                 lo = hi = None
             elif first > lo:
-                why.append(f"first run after idle holds from {first // 1_000_000}M")
+                why.append(f"idle vs idle {IDLE_RATIO}x or more from {mn(first)}; " + low(fail[-1]))
                 lo = first
+            else:
+                why.append(f"idle vs idle {IDLE_RATIO}x or more from {mn(lo)}")
         if lo is not None and checks:
-            first = first_holding(back.get(key[:4], {}))
+            by = back.get(key[:4], {})
+            first = first_holding({n: v[0] for n, v in by.items()})
+            fail = [n for n in sorted(by) if not by[n][0]]
             if first is None or (hi is not None and first > hi):
-                why.append("a run-time hand-back of the shape below the limit at the largest size")
+                why.append(f"hand-back {by[fail[-1]][1][1]} (best / median) at {mn(fail[-1])}, below {HANDBACK_RATIO}x")
                 lo = hi = None
             elif first > lo:
-                why.append(f"run-time hand-backs of the shape hold from {first // 1_000_000}M")
+                why.append(f"hand-backs {HANDBACK_RATIO}x or more from {mn(first)}; {by[fail[-1]][1][1]} at {mn(fail[-1])}")
                 lo = first
+            else:
+                why.append(f"hand-backs {HANDBACK_RATIO}x or more from {mn(lo)}" if any(n >= lo for n in by) else "no hand-back measured at or above it")
+        why.append("not taken" if lo is None else f"taken from {mn(lo)}" + (f" to {mn(hi)}" if hi else ""))
         rows.append((key, lo, hi, worst, why))
     return rows
 
@@ -243,8 +288,9 @@ def rust(path, rows, checks=()):
         "//! larger one (None: not taken at any size); `max_rows` caps a take whose ratio fell between the",
         "//! two largest sizes; `ratios` is the worst ratio (both layouts, every case of the family) per size.",
         f"//! The `check:` files raise `min_rows` where the default's first run after idle is below",
-        f"//! {IDLE_RATIO}x of DataFusion alone warm, or a run-time hand-back of the shape below {HANDBACK_RATIO}x",
-        "//! (best and median of rounds); the reason follows the row.",
+        f"//! {IDLE_RATIO}x of DataFusion alone's first run after the same idle (idle vs idle), or a run-time",
+        f"//! hand-back of the shape below {HANDBACK_RATIO}x (best and median of rounds). Every row ends with",
+        "//! the reason for its threshold.",
         "",
         "pub(crate) struct Row {",
         "    pub family: &'static str,",
@@ -274,7 +320,7 @@ def rust(path, rows, checks=()):
         out.append(
             f'    Row {{ family: "{fam}", keys: "{keys}", key_class: "{kc}", source: "{source}", bucket: "{b}", '
             f"min_rows: {opt(lo)}, max_rows: {opt(hi)}, ratios: &[{ratios}] }},"
-            + (f" // {'; '.join(why)}" if why else "")
+            + f" // {'; '.join(why)}"
         )
     out.append("];")
     out.append("")

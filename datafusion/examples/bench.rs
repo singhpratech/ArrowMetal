@@ -102,7 +102,8 @@ struct Args {
     /// alternating run by run (the order rotated each time) instead of the rounds.
     alternate: usize,
     /// After the timed runs: this many runs of `off` and `def`, each after `idle_gap_ms` of sleep
-    /// (the GPU idles; pipelines are compiled by then).
+    /// (the GPU idles; pipelines are compiled by then). The order alternates by repetition
+    /// (`off` first on even ones, `def` first on odd ones).
     idle_reps: usize,
     idle_gap_ms: u64,
     /// Only these (size, layout, case) triples, one `size,layout,case` per line.
@@ -258,13 +259,15 @@ impl Drop for TimingLock {
 /// Waits for a quiet machine (and, with a lock dir, for no BUILDING and no one else's TIMING), then
 /// takes TIMING. Returns the load at the start and the lock.
 fn acquire(a: &Args, what: &str) -> (f64, TimingLock) {
+    // The owner tag written to `TIMING` (`BENCH_LANE`, default `g1`): a lock with another tag waits.
+    let lane = format!("{} ", std::env::var("BENCH_LANE").unwrap_or_else(|_| "g1".into()));
     loop {
         if let Some(d) = &a.lock_dir {
             let d = std::path::Path::new(d);
             let mut waited = 0;
             loop {
                 let building = d.join("BUILDING").exists();
-                let other = std::fs::read_to_string(d.join("TIMING")).map(|s| !s.starts_with("g1 ")).unwrap_or(false);
+                let other = std::fs::read_to_string(d.join("TIMING")).map(|s| !s.starts_with(&lane)).unwrap_or(false);
                 if !building && !other {
                     break;
                 }
@@ -279,7 +282,7 @@ fn acquire(a: &Args, what: &str) -> (f64, TimingLock) {
         let Some(d) = &a.lock_dir else { return (l, TimingLock(None)) };
         let d = std::path::Path::new(d);
         let t = d.join("TIMING");
-        std::fs::write(&t, format!("g1 {}\n", std::process::id())).unwrap();
+        std::fs::write(&t, format!("{lane}{}\n", std::process::id())).unwrap();
         if d.join("BUILDING").exists() {
             std::fs::remove_file(&t).ok();
             continue;
@@ -914,7 +917,7 @@ async fn main() {
              equal_def,def_taken,def_handed_back,def_groups_est,def_probe_ms,def_input_ms,def_kernel_ms,def_choice,\
              off_first_ms,block_t0,block_t1,last_sleep,rounds,off_round_median_ms,def_round_median_ms,\
              back_round_median_ms,on_round_median_ms,method,def_gpu,def_idle_ms,def_idle_max_ms,off_idle_ms,\
-             idle_gap_ms"
+             idle_gap_ms,off_idle_max_ms,def_idle_cpu_ms,off_idle_cpu_ms,idle_reps"
         )
         .unwrap();
     }
@@ -1142,12 +1145,17 @@ async fn main() {
                 v[v.len() / 2]
             };
             // First runs after the GPU idled, pipelines compiled (every context has run by now).
+            // The order alternates by repetition so neither context always follows the other.
             let mut idle: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
-            for _ in 0..a.idle_reps {
-                for name in ["off", "def"] {
+            let mut idle_cpu: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+            for rep in 0..a.idle_reps {
+                let order = if rep % 2 == 0 { ["off", "def"] } else { ["def", "off"] };
+                for name in order {
                     if let Some(x) = ctxs.iter().find(|x| x.name == name) {
                         std::thread::sleep(Duration::from_millis(a.idle_gap_ms));
-                        idle.entry(name).or_default().push(run(&x.ctx, &c.sql).await.wall);
+                        let r = run(&x.ctx, &c.sql).await;
+                        idle.entry(name).or_default().push(r.wall);
+                        idle_cpu.entry(name).or_default().push(r.cpu);
                     }
                 }
             }
@@ -1155,6 +1163,7 @@ async fn main() {
             let idle_max = |n: &str| {
                 idle.get(n).map(|v| format!("{:.2}", v.iter().cloned().fold(0.0, f64::max))).unwrap_or_default()
             };
+            let idle_cpu_med = |n: &str| idle_cpu.get(n).map(|v| format!("{:.1}", median(v))).unwrap_or_default();
             let by = |n: &str| ctxs.iter().position(|x| x.name == n).map(|i| &res[i]);
             let off = &res[0];
             let on = by("on");
@@ -1231,7 +1240,7 @@ async fn main() {
                 ctxs.iter().position(|x| x.name == n).map(|i| format!("{:.2}", median(&round_bests[i]))).unwrap_or_default()
             };
             let rounds_s = format!(
-                "{},{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 if alternate { a.alternate } else { a.rounds.max(1) },
                 med("off"),
                 med("def"),
@@ -1243,6 +1252,10 @@ async fn main() {
                 idle_max("def"),
                 idle_med("off"),
                 if a.idle_reps > 0 { a.idle_gap_ms.to_string() } else { String::new() },
+                idle_max("off"),
+                idle_cpu_med("def"),
+                idle_cpu_med("off"),
+                a.idle_reps,
             );
             rows_out.push((row, tail, extra, rounds_s));
         }
