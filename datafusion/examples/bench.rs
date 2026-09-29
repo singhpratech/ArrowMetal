@@ -98,6 +98,15 @@ struct Args {
     /// Timed rounds per case; each round warms and times every context once, in an order rotated
     /// by one per round; a context's figure is its best over the rounds.
     rounds: usize,
+    /// For a case no context ran on the GPU: after the warm-up, this many runs of each context,
+    /// alternating run by run (the order rotated each time) instead of the rounds.
+    alternate: usize,
+    /// After the timed runs: this many runs of `off` and `def`, each after `idle_gap_ms` of sleep
+    /// (the GPU idles; pipelines are compiled by then).
+    idle_reps: usize,
+    idle_gap_ms: u64,
+    /// Only these (size, layout, case) triples, one `size,layout,case` per line.
+    select: Option<std::collections::HashSet<(usize, String, String)>>,
 }
 
 fn args() -> Args {
@@ -117,6 +126,10 @@ fn args() -> Args {
         explain: false,
         contexts: vec!["off".into(), "on".into()],
         rounds: 1,
+        alternate: 0,
+        idle_reps: 0,
+        idle_gap_ms: 500,
+        select: None,
         lock_dir: None,
     };
     let v: Vec<String> = std::env::args().skip(1).collect();
@@ -140,6 +153,21 @@ fn args() -> Args {
             "--codecs" => a.codecs = list(&val),
             "--contexts" => a.contexts = list(&val),
             "--rounds" => a.rounds = val.parse().unwrap(),
+            "--alternate" => a.alternate = val.parse().unwrap(),
+            "--idle-reps" => a.idle_reps = val.parse().unwrap(),
+            "--idle-gap-ms" => a.idle_gap_ms = val.parse().unwrap(),
+            "--select" => {
+                let text = std::fs::read_to_string(&val).unwrap();
+                a.select = Some(
+                    text.lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .map(|l| {
+                            let f: Vec<&str> = l.trim().split(',').collect();
+                            (f[0].parse().unwrap(), f[1].to_string(), f[2].to_string())
+                        })
+                        .collect(),
+                );
+            }
             "--lock-dir" => a.lock_dir = Some(val),
             "--explain" => {
                 a.explain = true;
@@ -885,7 +913,8 @@ async fn main() {
              untimed_on,on_first_ms,back_ms,back_cpu_ms,back_first_ms,equal_back,def_ms,def_cpu_ms,def_first_ms,\
              equal_def,def_taken,def_handed_back,def_groups_est,def_probe_ms,def_input_ms,def_kernel_ms,def_choice,\
              off_first_ms,block_t0,block_t1,last_sleep,rounds,off_round_median_ms,def_round_median_ms,\
-             back_round_median_ms,on_round_median_ms"
+             back_round_median_ms,on_round_median_ms,method,def_gpu,def_idle_ms,def_idle_max_ms,off_idle_ms,\
+             idle_gap_ms"
         )
         .unwrap();
     }
@@ -965,8 +994,12 @@ async fn main() {
         let mut rng = StdRng::seed_from_u64(1234);
         let t = Instant::now();
         let block = build(&mut rng);
-        let cases: Vec<&Case> =
-            block.cases.iter().filter(|c| a.cases.is_empty() || a.cases.contains(&c.id)).collect();
+        let cases: Vec<&Case> = block
+            .cases
+            .iter()
+            .filter(|c| a.cases.is_empty() || a.cases.contains(&c.id))
+            .filter(|c| a.select.as_ref().is_none_or(|s| s.contains(&(rows, mode.clone(), c.id.clone()))))
+            .collect();
         if cases.is_empty() {
             continue;
         }
@@ -1001,6 +1034,7 @@ async fn main() {
             }
             // First runs, in context order: each compared with off's.
             let mut firsts: Vec<(Run, usize, String, usize)> = Vec::new();
+            let mut gpu = false;
             for x in &ctxs {
                 if let Some(r) = &x.rule {
                     r.clear_report();
@@ -1009,7 +1043,13 @@ async fn main() {
                 let (taken, s, fb) = match &x.rule {
                     Some(rule) => {
                         let (t, s) = decisions(rule);
-                        (t, s, rule.report().runtime_fallbacks().count())
+                        let rep = rule.report();
+                        // A replaced sort or filter always runs on the GPU; an aggregate when its
+                        // run-time choice says so.
+                        let metal_nodes = r.metal.get("nodes").copied().unwrap_or(0.0) > 0.0;
+                        let handed = rep.runtime_choices().count() > 0 && rep.runtime_choices().all(|d| !d.taken);
+                        gpu |= metal_nodes && !handed && rep.runtime_fallbacks().count() == 0;
+                        (t, s, rep.runtime_fallbacks().count())
                     }
                     None => (0, String::new(), 0),
                 };
@@ -1045,7 +1085,39 @@ async fn main() {
             }
             drop(firsts);
             let mut round_bests: Vec<Vec<f64>> = vec![Vec::new(); ctxs.len()];
-            for round in 0..a.rounds.max(1) {
+            let alternate = a.alternate > 0 && !gpu;
+            if alternate {
+                // CPU only in every context: warm each, then run them in turn, run by run.
+                for x in &ctxs {
+                    let mut spent = 0.0;
+                    while spent < a.warm_ms {
+                        spent += run(&x.ctx, &c.sql).await.wall;
+                    }
+                }
+                for x in &ctxs {
+                    if let Some(r) = &x.rule {
+                        r.clear_report();
+                    }
+                }
+                for k in 0..a.alternate {
+                    for j in 0..ctxs.len() {
+                        let i = (j + k) % ctxs.len();
+                        let r = run(&ctxs[i].ctx, &c.sql).await;
+                        let r = Run { out: Vec::new(), ..r };
+                        round_bests[i].push(r.wall);
+                        if res[i].iters == 0 || r.wall < res[i].best.wall {
+                            res[i].best = r;
+                        }
+                        res[i].iters += 1;
+                    }
+                }
+                for (i, x) in ctxs.iter().enumerate() {
+                    if let Some(r) = &x.rule {
+                        res[i].fallbacks = res[i].fallbacks.max(r.report().runtime_fallbacks().count());
+                    }
+                }
+            }
+            for round in 0..if alternate { 0 } else { a.rounds.max(1) } {
                 for k in 0..ctxs.len() {
                     let i = (k + round) % ctxs.len();
                     let x = &ctxs[i];
@@ -1068,6 +1140,20 @@ async fn main() {
                 let mut v = v.to_vec();
                 v.sort_by(|x, y| x.partial_cmp(y).unwrap());
                 v[v.len() / 2]
+            };
+            // First runs after the GPU idled, pipelines compiled (every context has run by now).
+            let mut idle: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+            for _ in 0..a.idle_reps {
+                for name in ["off", "def"] {
+                    if let Some(x) = ctxs.iter().find(|x| x.name == name) {
+                        std::thread::sleep(Duration::from_millis(a.idle_gap_ms));
+                        idle.entry(name).or_default().push(run(&x.ctx, &c.sql).await.wall);
+                    }
+                }
+            }
+            let idle_med = |n: &str| idle.get(n).map(|v| format!("{:.2}", median(v))).unwrap_or_default();
+            let idle_max = |n: &str| {
+                idle.get(n).map(|v| format!("{:.2}", v.iter().cloned().fold(0.0, f64::max))).unwrap_or_default()
             };
             let by = |n: &str| ctxs.iter().position(|x| x.name == n).map(|i| &res[i]);
             let off = &res[0];
@@ -1144,7 +1230,20 @@ async fn main() {
             let med = |n: &str| {
                 ctxs.iter().position(|x| x.name == n).map(|i| format!("{:.2}", median(&round_bests[i]))).unwrap_or_default()
             };
-            let rounds_s = format!("{},{},{},{},{}", a.rounds.max(1), med("off"), med("def"), med("back"), med("on"));
+            let rounds_s = format!(
+                "{},{},{},{},{},{},{},{},{},{},{}",
+                if alternate { a.alternate } else { a.rounds.max(1) },
+                med("off"),
+                med("def"),
+                med("back"),
+                med("on"),
+                if alternate { "alternate" } else { "rounds" },
+                gpu,
+                idle_med("def"),
+                idle_max("def"),
+                idle_med("off"),
+                if a.idle_reps > 0 { a.idle_gap_ms.to_string() } else { String::new() },
+            );
             rows_out.push((row, tail, extra, rounds_s));
         }
         let l1 = load1();

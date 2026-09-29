@@ -23,8 +23,20 @@ The fit:
 * Everything else is not taken: the MetalExec hands it back to DataFusion (or the rule leaves it
   at plan time when no bucket is taken at the input's row count).
 
+Two constraints from the default-take check CSVs (`--check`, merged in order: a later file's row
+replaces an earlier one's for the same size, layout and case) then raise the thresholds:
+
+* First run after idle: a series (family, keys, key class, input, bucket) is taken at a size only
+  if, at that size and every larger measured size, every row the default ran on ArrowMetal has
+  `off_ms / def_idle_ms >= IDLE_RATIO` (the default's first run after the GPU idled, pipelines
+  already compiled, against DataFusion alone's warm time). A size with no such row is not taken.
+* Hand-back: a shape (family, keys, key class, input) is replaced at plan time from a size only if,
+  at that size and every larger measured size, every row the default handed back at run time is at
+  least HANDBACK_RATIO of DataFusion alone on the best run AND on the median of the round bests.
+  Every bucket of the shape is raised to that size; a shape with no such size is not taken.
+
 Usage:
-    python3 scripts/groupby_table.py results/<sweep>.csv            # writes src/agg_table.rs
+    python3 scripts/groupby_table.py results/<sweep>.csv --check-csv results/<check>.csv ...  # writes src/agg_table.rs
     python3 scripts/groupby_table.py results/<sweep>.csv --print    # the series and the fit
     python3 scripts/groupby_table.py --check                        # exit 1 if src/agg_table.rs is stale
 """
@@ -41,6 +53,12 @@ MIN_RATIO = 1.5
 # The sweep ratio needed at a size is MIN_RATIO x HEADROOM: a shape measured at 1.5x sits within
 # run-to-run noise of 1.5x, so the default takes only shapes measured at least 10 % above it.
 HEADROOM = 1.1
+# The default's first run after the GPU idled (pipelines compiled) must not be slower than
+# DataFusion alone warm.
+IDLE_RATIO = 1.0
+# A run-time hand-back may cost at most 3 % against DataFusion alone (best and median of rounds).
+HANDBACK_RATIO = 0.97
+SIZES_ALL = (1_000_000, 2_000_000, 5_000_000, 10_000_000, 50_000_000)
 BUCKETS = (("200", 1, 1_414), ("10k", 1_415, 31_622), ("100k", 31_623, 316_227), ("1M", 316_228, 3_162_277))
 NEAR_ROWS = 4
 ROWS_BUCKET = "rows/2"
@@ -108,26 +126,118 @@ def fit(points):
     return sizes[start], cap, worst
 
 
-def table(path):
+def read_checks(paths):
+    """The default-check rows, merged in order (a later file's row replaces an earlier one's)."""
+    merged = {}
+    for path in paths:
+        with open(path) as fh:
+            for r in csv.DictReader(fh):
+                if r["family"] != "gsweep" or not CASE.match(r["case"]):
+                    continue
+                merged[(r["size"], r["layout"], r["case"])] = r
+    return list(merged.values())
+
+
+def state(r):
+    if float(r.get("def_handed_back") or 0) > 0:
+        return "back"
+    if int(r.get("def_taken") or 0) > 0:
+        return "gpu"
+    return "left"
+
+
+def shape_of(r):
+    m = CASE.match(r["case"])
+    return FAMILY[m["fam"]], "1" if m["nk"] == "1" else "2+", m["kc"], "memory"
+
+
+def first_holding(ok_by_size):
+    """The smallest size from which every measured size passes ({size: bool}; sizes absent pass)."""
+    for n in SIZES_ALL:
+        if all(ok_by_size.get(m, True) for m in SIZES_ALL if m >= n):
+            return n
+    return None
+
+
+def constraints(checks):
+    """({series key: first size its idle constraint holds, or None}, {shape: first size its hand-back
+    constraint holds, or None}), with the rows that fail, for the report."""
+    idle, back, fails = {}, {}, []
+    for r in checks:
+        size = int(r["size"])
+        shape = shape_of(r)
+        if state(r) == "gpu":
+            b = bucket(int(r["out_rows"]), size)
+            key = shape + (b,)
+            v = r.get("def_idle_ms")
+            ok = bool(v) and float(r["off_ms"]) / float(v) >= IDLE_RATIO
+            idle.setdefault(key, {})
+            idle[key][size] = idle[key].get(size, True) and ok
+            if not ok:
+                fails.append(("idle", key, size, r["layout"], r["case"], r["off_ms"], v or "-"))
+        elif state(r) == "back":
+            best = float(r["off_ms"]) / float(r["def_ms"])
+            med = float(r["off_round_median_ms"] or r["off_ms"]) / float(r["def_round_median_ms"] or r["def_ms"])
+            ok = best >= HANDBACK_RATIO and med >= HANDBACK_RATIO
+            back.setdefault(shape, {})
+            back[shape][size] = back[shape].get(size, True) and ok
+            if not ok:
+                fails.append(("handback", shape, size, r["layout"], r["case"], f"{best:.3f}", f"{med:.3f}"))
+    return idle, back, fails
+
+
+def table(path, checks=()):
     s = read(path)
+    rows_ = read_checks(checks) if checks else []
+    idle, back, _ = constraints(rows_)
     rows = []
     for key in sorted(s, key=lambda k: (k[0], k[1], k[2], k[3], ORDER.index(k[4]))):
         lo, hi, worst = fit(s[key])
-        rows.append((key, lo, hi, worst))
+        why = []
+        if lo is not None and checks:
+            sizes = idle.get(key, {})
+            # A size at or above the threshold where the default never ran this series on the GPU
+            # has no first-run measurement: not taken there.
+            for n in SIZES_ALL:
+                if n >= lo and n in worst and n not in sizes:
+                    sizes = {**sizes, n: False}
+            first = first_holding(sizes)
+            if first is None or (hi is not None and first > hi):
+                why.append("first run after idle below DataFusion alone at every size")
+                lo = hi = None
+            elif first > lo:
+                why.append(f"first run after idle holds from {first // 1_000_000}M")
+                lo = first
+        if lo is not None and checks:
+            first = first_holding(back.get(key[:4], {}))
+            if first is None or (hi is not None and first > hi):
+                why.append("a run-time hand-back of the shape below the limit at the largest size")
+                lo = hi = None
+            elif first > lo:
+                why.append(f"run-time hand-backs of the shape hold from {first // 1_000_000}M")
+                lo = first
+        rows.append((key, lo, hi, worst, why))
     return rows
 
 
-def rust(path, rows):
+def rust(path, rows, checks=()):
     src = os.path.relpath(os.path.abspath(path), HERE)
     out = [
         "//! The measured aggregate table. Generated by scripts/groupby_table.py from",
         f"//! {src}; do not edit by hand (`--check` fails when this file and that one disagree).",
+    ]
+    for c in checks:
+        out.append(f"//! check: {os.path.relpath(os.path.abspath(c), HERE)}")
+    out += [
         "//!",
         "//! One row per (aggregate family, key count, key class, input, group-count bucket) the sweep",
         "//! measured: `min_rows` is the fewest input rows from which ArrowMetal was measured at least",
         f"//! MIN_RATIO x HEADROOM ({MIN_RATIO} x {HEADROOM}) ahead of DataFusion alone at that size and every",
         "//! larger one (None: not taken at any size); `max_rows` caps a take whose ratio fell between the",
         "//! two largest sizes; `ratios` is the worst ratio (both layouts, every case of the family) per size.",
+        f"//! The `check:` files raise `min_rows` where the default's first run after idle is below",
+        f"//! {IDLE_RATIO}x of DataFusion alone warm, or a run-time hand-back of the shape below {HANDBACK_RATIO}x",
+        "//! (best and median of rounds); the reason follows the row.",
         "",
         "pub(crate) struct Row {",
         "    pub family: &'static str,",
@@ -152,11 +262,12 @@ def rust(path, rows):
         "pub(crate) const TABLE: &[Row] = &[",
     ]
     opt = lambda v: "None" if v is None else f"Some({v})"
-    for (fam, keys, kc, source, b), lo, hi, worst in rows:
+    for (fam, keys, kc, source, b), lo, hi, worst, why in rows:
         ratios = ", ".join(f"({n}, {worst[n]:.2})" for n in sorted(worst))
         out.append(
             f'    Row {{ family: "{fam}", keys: "{keys}", key_class: "{kc}", source: "{source}", bucket: "{b}", '
             f"min_rows: {opt(lo)}, max_rows: {opt(hi)}, ratios: &[{ratios}] }},"
+            + (f" // {'; '.join(why)}" if why else "")
         )
     out.append("];")
     out.append("")
@@ -164,12 +275,18 @@ def rust(path, rows):
 
 
 def committed_source():
+    src, checks = None, []
     with open(OUT) as fh:
         for line in fh:
             m = re.match(r'pub\(crate\) const SOURCE: &str = "(.*)";', line)
             if m:
-                return os.path.join(HERE, m.group(1))
-    raise SystemExit("no SOURCE line in src/agg_table.rs")
+                src = os.path.join(HERE, m.group(1))
+            m = re.match(r"//! check: (.*)$", line.rstrip())
+            if m:
+                checks.append(os.path.join(HERE, m.group(1)))
+    if src is None:
+        raise SystemExit("no SOURCE line in src/agg_table.rs")
+    return src, checks
 
 
 def main():
@@ -177,15 +294,24 @@ def main():
     ap.add_argument("csv", nargs="?")
     ap.add_argument("--print", action="store_true")
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--check-csv", action="append", default=[])
+    ap.add_argument("--fails", action="store_true", help="print the check rows that fail a constraint")
     a = ap.parse_args()
-    path = a.csv or committed_source()
-    rows = table(path)
-    text = rust(path, rows)
+    if a.csv:
+        path, checks = a.csv, a.check_csv
+    else:
+        path, checks = committed_source()
+    rows = table(path, checks)
+    text = rust(path, rows, checks)
+    if a.fails:
+        for f in sorted(constraints(read_checks(checks))[2], key=str):
+            print(*f)
+        return
     if a.print:
-        for (fam, keys, kc, source, b), lo, hi, worst in rows:
+        for (fam, keys, kc, source, b), lo, hi, worst, why in rows:
             r = "  ".join(f"{n // 1_000_000}M {worst[n]:.2}" for n in sorted(worst))
             took = "-" if lo is None else f"from {lo // 1_000_000}M" + ("" if hi is None else f" to {hi // 1_000_000}M")
-            print(f"{fam:12} {keys:2} {kc} {b:7} {took:14} {r}")
+            print(f"{fam:12} {keys:2} {kc} {b:7} {took:14} {r}  {'; '.join(why)}")
         return
     if a.check:
         with open(OUT) as fh:

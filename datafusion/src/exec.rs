@@ -568,8 +568,7 @@ impl Job {
                 // must meet the prefix's). Data ordered by its keys shows fewer groups in a prefix
                 // than the input holds; a sample spread over the whole input sees them.
                 let refs: Vec<&RecordBatch> = c.parts.iter().flatten().collect();
-                let f = crate::probe::estimate_up_to(&refs, &keys, None, Some(rows), CONFIRM_SAMPLE);
-                let agree = f.low <= e.high && f.high >= e.low;
+                let (agree, f) = confirm(&refs, &keys, rows, &e);
                 let check = format!(
                     "a {}-row sample of the whole input puts it at {} to {} groups",
                     f.sample_rows, f.low, f.high
@@ -658,6 +657,18 @@ impl MetalExec {
             groups_estimate: MetricBuilder::new(&self.metrics).gauge("groups_estimate", 0),
         }
     }
+}
+
+/// Whether a sample of at most `CONFIRM_SAMPLE` rows of the whole input (`refs`, `rows` rows)
+/// agrees with the estimate `e` a take was decided from: their ranges must meet.
+pub(crate) fn confirm(
+    refs: &[&RecordBatch],
+    keys: &[usize],
+    rows: usize,
+    e: &crate::probe::GroupEstimate,
+) -> (bool, crate::probe::GroupEstimate) {
+    let f = crate::probe::estimate_up_to(refs, keys, None, Some(rows), CONFIRM_SAMPLE);
+    (f.low <= e.high && f.high >= e.low, f)
 }
 
 /// The run-time decision under `AggregateChoice::Measured`: (on ArrowMetal, why, the estimate).
@@ -849,5 +860,50 @@ impl ExecutionPlan for MetalExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{Field, Schema};
+
+    fn batches(keys: Vec<i64>) -> Vec<RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        keys.chunks(8192)
+            .map(|c| RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(c.to_vec()))]).unwrap())
+            .collect()
+    }
+
+    /// A prefix that repeats a few thousand keys, followed by keys seen once: the prefix's estimate
+    /// is far below the input's groups, and the whole-input sample disagrees with it.
+    #[test]
+    fn a_prefix_that_under_counts_is_not_confirmed() {
+        let n = 1_200_000usize;
+        let head = 262_144usize;
+        let keys: Vec<i64> = (0..n).map(|i| if i < head { (i % 20_000) as i64 } else { i as i64 }).collect();
+        let all = batches(keys);
+        let refs: Vec<&RecordBatch> = all.iter().collect();
+        let prefix: Vec<&RecordBatch> = refs[..head / 8192].to_vec();
+        let e = crate::probe::estimate_up_to(&prefix, &[0], None, Some(n), 8_192);
+        assert!(e.high < 40_000, "{e:?}");
+        let (agree, f) = confirm(&refs, &[0], n, &e);
+        assert!(!agree, "prefix {e:?} whole {f:?}");
+        // The same data in random order: the prefix's range meets the whole input's.
+        let mut shuffled: Vec<i64> = (0..n).map(|i| if i < head { (i % 20_000) as i64 } else { i as i64 }).collect();
+        let mut state = 0x1234_5678u64;
+        for i in (1..n).rev() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            shuffled.swap(i, (state % (i as u64 + 1)) as usize);
+        }
+        let all = batches(shuffled);
+        let refs: Vec<&RecordBatch> = all.iter().collect();
+        let prefix: Vec<&RecordBatch> = refs[..head / 8192].to_vec();
+        let e = crate::probe::estimate_up_to(&prefix, &[0], None, Some(n), 8_192);
+        let (agree, f) = confirm(&refs, &[0], n, &e);
+        assert!(agree, "prefix {e:?} whole {f:?}");
     }
 }

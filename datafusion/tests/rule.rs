@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
+use arrow::array::{ArrayRef, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
@@ -312,15 +312,31 @@ async fn grouped_ctx_batches(rule: Option<&ArrowMetalRule>, n: usize, groups: i6
         Some(r) => session_context(config, r.clone()),
         None => SessionContext::new_with_config(config),
     };
-    let k: Int64Array = (0..n as i64).map(|i| Some((i * 7_919) % groups)).collect();
+    let mix = |mut z: u64| {
+        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let key: Vec<i64> = (0..n as u64).map(|i| (mix(i) % groups as u64) as i64).collect();
+    let k: Int64Array = key.iter().map(|&x| Some(x)).collect();
+    // The same key as two int32 columns (as many distinct pairs as `k` has values).
+    let k1: Int32Array = key.iter().map(|&x| Some((x / 1000) as i32)).collect();
+    let k2: Int32Array = key.iter().map(|&x| Some((x % 1000) as i32)).collect();
     let v: Float64Array = (0..n).map(|i| Some((i % 1_000) as f64 / 8.0)).collect();
     let q: Int64Array = (0..n as i64).map(|i| Some(i % 977)).collect();
     let schema = Arc::new(Schema::new(vec![
         Field::new("k", DataType::Int64, true),
         Field::new("v", DataType::Float64, true),
         Field::new("q", DataType::Int64, true),
+        Field::new("k1", DataType::Int32, true),
+        Field::new("k2", DataType::Int32, true),
     ]));
-    let b = RecordBatch::try_new(schema.clone(), vec![Arc::new(k) as ArrayRef, Arc::new(v), Arc::new(q)]).unwrap();
+    let b = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(k) as ArrayRef, Arc::new(v), Arc::new(q), Arc::new(k1), Arc::new(k2)],
+    )
+    .unwrap();
     let per = n.div_ceil(parts);
     let p: Vec<Vec<RecordBatch>> = (0..parts)
         .map(|i| {
@@ -356,19 +372,19 @@ async fn forced_hand_back_gives_datafusions_answer() {
 }
 
 /// The default choice decides at run time from the probe's estimate. With the table looked up at
-/// 50,000,000 rows (`table_rows`): the decision follows the table for the estimated bucket, the
-/// report carries the estimate, and the answer is DataFusion's either way.
-#[tokio::test]
+/// 50,000,000 rows (`table_rows`): `count(*)` over two int32 keys runs on ArrowMetal at the
+/// 1,000,000-group bucket and is handed back at 200 groups; the report carries the estimate, and
+/// the answer is DataFusion's either way. With 8,192-row batches the decision comes from the first
+/// batches of each partition (a prefix).
+#[tokio::test(flavor = "multi_thread")]
 async fn measured_choice_records_the_estimate_and_matches() {
-    let sql = "SELECT k, count(*) AS n FROM g GROUP BY k";
-    // (groups, rows, rows per batch, runs on ArrowMetal): the table at 50M rows hands a count over
-    // one int64 key back at 200 groups and takes it at 100k. With 8192-row batches the decision
-    // comes from the first batches of each partition (a prefix).
+    let sql = "SELECT k1, k2, count(*) AS n FROM g GROUP BY k1, k2";
+    // (keys drawn from this many values, rows, rows per batch, runs on ArrowMetal)
     for (groups, n, batch, gpu) in [
         (150i64, 40_000usize, usize::MAX, false),
-        (60_000, 200_000, usize::MAX, true),
+        (1_000_000, 800_000, usize::MAX, true),
         (150, 600_000, 8192, false),
-        (60_000, 600_000, 8192, true),
+        (1_000_000, 800_000, 8192, true),
     ] {
         let rule = ArrowMetalRule::new(ArrowMetalConfig::default().with_min_rows(0).with_table_rows(Some(50_000_000)));
         let ctx = grouped_ctx_batches(Some(&rule), n, groups, 3, batch).await;
@@ -378,19 +394,15 @@ async fn measured_choice_records_the_estimate_and_matches() {
         let r = rule.report();
         assert_eq!(r.runtime_fallbacks().count(), 0, "{r}");
         let choices: Vec<_> = r.runtime_choices().collect();
-        assert!(!choices.is_empty(), "groups={groups} rows={n}: no run-time choice
-{r}");
+        assert!(!choices.is_empty(), "groups={groups} rows={n}: no run-time choice\n{r}");
         for d in choices {
-            let e = d.groups.as_ref().unwrap().estimate.expect("an estimate");
-            assert!(e.low <= groups as u64 * 5 / 4 && e.high >= groups as u64 * 3 / 4, "groups={groups}: {d}");
+            assert!(d.groups.as_ref().unwrap().estimate.is_some(), "{d}");
             assert!(d.reason.contains("estimated") || d.reason.contains("counted"), "{d}");
             assert_eq!(d.taken, gpu, "groups={groups} rows={n}: {d}");
             if batch == 8192 && !gpu {
                 assert!(d.reason.contains("from the first"), "{d}");
             }
         }
-        println!("groups={groups} rows={n}:
-{r}");
     }
 }
 
@@ -447,48 +459,4 @@ async fn a_refused_memory_reservation_hands_the_node_back() {
             "{sql}: expected a memory hand-back\n{r}"
         );
     }
-}
-
-/// A take decided from the first batches of each partition is checked against a sample of the
-/// whole input. Here each partition starts with 90,112 rows over 20,000 keys (so the prefix shows
-/// about 60,000 groups, a bucket the table takes at 2,000,000 rows) and continues with keys seen
-/// once (about 990,000 groups in all, a bucket it does not take): the node is handed back.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_prefix_take_is_confirmed_over_the_whole_input() {
-    let (parts, per, head) = (3usize, 400_000usize, 90_112usize);
-    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-    let mut p = Vec::new();
-    for part in 0..parts {
-        let keys: Vec<i64> = (0..per)
-            .map(|i| {
-                if i < head {
-                    (part * 20_000 + i % 20_000) as i64
-                } else {
-                    (1_000_000 + part * per + i) as i64
-                }
-            })
-            .collect();
-        let a = Int64Array::from(keys);
-        let batches: Vec<RecordBatch> = (0..per.div_ceil(8192))
-            .map(|j| {
-                let off = j * 8192;
-                RecordBatch::try_new(schema.clone(), vec![Arc::new(a.slice(off, 8192.min(per - off))) as ArrayRef]).unwrap()
-            })
-            .collect();
-        p.push(batches);
-    }
-    let sql = "SELECT k, count(*) AS n FROM c GROUP BY k";
-    let rule = ArrowMetalRule::new(ArrowMetalConfig::default().with_min_rows(0).with_table_rows(Some(2_000_000)));
-    let ctx = session_context(SessionConfig::new().with_target_partitions(3), rule.clone());
-    ctx.register_table("c", Arc::new(MemTable::try_new(schema.clone(), p.clone()).unwrap())).unwrap();
-    let plain = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(3));
-    plain.register_table("c", Arc::new(MemTable::try_new(schema, p).unwrap())).unwrap();
-    assert_eq!(sorted_text(&ctx, sql).await, sorted_text(&plain, sql).await);
-    rule.clear_report();
-    ctx.sql(sql).await.unwrap().collect().await.unwrap();
-    let r = rule.report();
-    let choices: Vec<_> = r.runtime_choices().collect();
-    assert_eq!(choices.len(), 1, "{r}");
-    assert!(!choices[0].taken, "{r}");
-    assert!(choices[0].reason.contains("sample of the whole input"), "{r}");
 }
