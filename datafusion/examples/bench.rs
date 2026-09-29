@@ -25,6 +25,15 @@
 //!   `--iters` wall-clock runs (best of 2 when the untimed run took over `--slow-s` seconds), with the
 //!   process CPU time (getrusage, user + system, all threads) of that best run. Timed: SQL to
 //!   logical plan, physical planning (the rule runs there), and `collect`.
+//! * Warm-up (`--warm-ms`, default 100): before the timed runs of each context, untimed runs
+//!   repeat until they add up to `--warm-ms` of wall time (the first, compared run not counted).
+//!   The GPU steps up to its fast state only after about 20-25 ms of back-to-back queries. On the
+//!   M4 Max, a 250,000-row Float64 ORDER BY runs its plan in 2.3-3.0 ms in the first seven queries
+//!   after the GPU idled, and in 0.8 ms from the eighth on. Without the warm-up, the best of 5 sits
+//!   on either side of that step depending on how long each run is. The CSV records the setting,
+//!   the untimed runs of each context, and `on_first_ms`: the first rule-on run, untimed, with the
+//!   GPU idle before it (the first case of a process also compiles its pipelines there).
+//!   `--warm-ms 0` is the earlier method. `BENCH_TRACE=1` prints every timed run.
 //! * `MetalExec`'s metrics from the best on-run: input wait, import, plan run, export (the
 //!   `concat_ms` column is 0 since the crate hands the batches to the chunked import; it stays in
 //!   the CSV so the files of the earlier crate state line up).
@@ -61,6 +70,7 @@ struct Args {
     cases: Vec<String>,
     iters: usize,
     slow_s: f64,
+    warm_ms: f64,
     max_load: f64,
     out: String,
     parquet_dir: Option<String>,
@@ -78,6 +88,7 @@ fn args() -> Args {
         cases: vec![],
         iters: 5,
         slow_s: 2.0,
+        warm_ms: 100.0,
         max_load: 3.5,
         out: "results/datafusion_rule.csv".into(),
         parquet_dir: None,
@@ -98,6 +109,7 @@ fn args() -> Args {
             "--cases" => a.cases = list(&val),
             "--iters" => a.iters = val.parse().unwrap(),
             "--slow-s" => a.slow_s = val.parse().unwrap(),
+            "--warm-ms" => a.warm_ms = val.parse().unwrap(),
             "--max-load" => a.max_load = val.parse().unwrap(),
             "--out" => a.out = val,
             "--parquet-dir" => a.parquet_dir = Some(val),
@@ -499,17 +511,30 @@ async fn run(ctx: &SessionContext, sql: &str) -> Run {
     Run { out, wall, cpu, metal }
 }
 
-async fn best(ctx: &SessionContext, sql: &str, first_ms: f64, a: &Args) -> (Run, usize) {
+/// Untimed runs until they add up to `--warm-ms` of wall time (the first, compared run is not
+/// counted: in a process's first case it also compiles pipelines while the GPU idles), then the best
+/// of `--iters` timed runs. Returns the best run, the timed count and the untimed count (the first
+/// run included).
+async fn best(ctx: &SessionContext, sql: &str, first_ms: f64, a: &Args) -> (Run, usize, usize) {
+    let mut spent = 0.0;
+    let mut untimed = 1;
+    while spent < a.warm_ms {
+        spent += run(ctx, sql).await.wall;
+        untimed += 1;
+    }
     let n = if first_ms > a.slow_s * 1e3 { a.iters.min(2) } else { a.iters };
     let mut best: Option<Run> = None;
     for _ in 0..n {
         let r = run(ctx, sql).await;
         let r = Run { out: Vec::new(), ..r };
+        if std::env::var("BENCH_TRACE").is_ok() {
+            println!("    iter wall {:6.2} kernel {:6.2}", r.wall, r.metal.get("kernel_time").copied().unwrap_or(0.0));
+        }
         if best.as_ref().is_none_or(|b| r.wall < b.wall) {
             best = Some(r);
         }
     }
-    (best.unwrap(), n)
+    (best.unwrap(), n, untimed)
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -660,12 +685,16 @@ async fn main() {
             out,
             "size,layout,family,case,label,sql,off_ms,on_ms,ratio,off_cpu_ms,on_cpu_ms,iters_off,iters_on,\
              equal,max_rel_dev,nodes_taken,rule_on,rule_default,runtime_fallbacks,metal_nodes,input_ms,concat_ms,\
-             import_ms,kernel_ms,export_ms,input_batches,out_rows,block_load_start,block_load_end"
+             import_ms,kernel_ms,export_ms,input_batches,out_rows,block_load_start,block_load_end,warm_ms,untimed_off,\
+             untimed_on,on_first_ms"
         )
         .unwrap();
     }
     let parts = SessionConfig::new().target_partitions();
-    println!("target_partitions {parts}; iters {}; slow {} s; max load {}", a.iters, a.slow_s, a.max_load);
+    println!(
+        "target_partitions {parts}; iters {}; slow {} s; warm {} ms; max load {}",
+        a.iters, a.slow_s, a.warm_ms, a.max_load
+    );
 
     // (size, layout, family, block builder)
     let mut work: Vec<(usize, String, Box<dyn FnOnce(&mut StdRng) -> Block>)> = Vec::new();
@@ -749,9 +778,9 @@ async fn main() {
             let (off_first, on_first) = (off0.wall, on0.wall);
             drop(off0);
             drop(on0);
-            let (off, n_off) = best(&ctx_off, &c.sql, off_first, &a).await;
+            let (off, n_off, u_off) = best(&ctx_off, &c.sql, off_first, &a).await;
             rule_on.clear_report();
-            let (on, n_on) = best(&ctx_on, &c.sql, on_first, &a).await;
+            let (on, n_on, u_on) = best(&ctx_on, &c.sql, on_first, &a).await;
             let fallbacks = rule_on.report().runtime_fallbacks().count();
             let m = |k: &str| on.metal.get(k).copied().unwrap_or(0.0);
             let ratio = off.wall / on.wall;
@@ -760,7 +789,8 @@ async fn main() {
                 "  {:14} off {:9.1} ms  on {:9.1} ms  {:6.2}x  cpu {:8.0}/{:8.0}  concat {:6.1} import {:6.1} kernel {:7.1}{}",
                 c.id, off.wall, on.wall, ratio, off.cpu, on.cpu, m("concat_time"), m("import_time"), m("kernel_time"), mark
             );
-            rows_out.push(format!(
+            let tail = format!("{},{u_off},{u_on},{on_first:.2}", a.warm_ms);
+            rows_out.push((format!(
                 "{rows},{mode},{},{},{},{},{:.2},{:.2},{:.3},{:.1},{:.1},{n_off},{n_on},{},{:.3e},{taken},{},{},{fallbacks},{},{:.2},{:.2},{:.2},{:.2},{:.2},{},{out_rows}",
                 block.family,
                 c.id,
@@ -782,12 +812,12 @@ async fn main() {
                 m("kernel_time"),
                 m("export_time"),
                 m("input_batches"),
-            ));
+            ), tail));
         }
         let l1 = load1();
         println!("  [load {l1:.2} at block end]");
-        for r in rows_out {
-            writeln!(out, "{r},{l0:.2},{l1:.2}").unwrap();
+        for (r, tail) in rows_out {
+            writeln!(out, "{r},{l0:.2},{l1:.2},{tail}").unwrap();
         }
         out.flush().unwrap();
     }
