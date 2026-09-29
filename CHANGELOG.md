@@ -7,20 +7,33 @@
   `physical_optimizer_rules`), it replaces a full `ORDER BY` whose input has an exact row count of at
   least 250,000 with `MetalExec`, which collects the input, sorts it on the GPU through the plan runner
   with DataFusion's null placement and float order (IEEE 754 totalOrder), and returns DataFusion's
-  batches. Top-k, aggregates and filters are translated too and switched off by default. Every node
-  the rule looks at is reported with the reason it was taken or left; an ArrowMetal error at run time
-  runs the replaced DataFusion subtree instead.
-  - Correctness: `tests/grid.rs` runs 4,656 query pairs with and without the rule (sorts with every
-    null placement and direction, floats with ±0.0, ±inf, NaN, -NaN and NaN payloads, strings, nulls,
-    one and several partitions): 0 mismatches.
+  batches. A `GROUP BY` or `DISTINCT` over a `MemTable` is replaced when a measured table
+  (`datafusion/src/agg_table.rs`, generated from `datafusion/results/datafusion_groupby_sweep_2026-09-29.csv`)
+  takes its shape at the input's row count; when it runs, it estimates its number of groups from a
+  sample of the keys and runs on the GPU where the table takes that number, handing the node back to
+  DataFusion's own operators otherwise. Top-k and filters are translated too and switched off by
+  default. Every node the rule looks at is reported with the reason it was taken or left, and every
+  aggregate's run-time choice with its estimate; an ArrowMetal error, a panic in the GPU path or a
+  refused memory reservation runs the replaced DataFusion subtree instead.
+  - Correctness: `tests/grid.rs` runs 7,656 query pairs with and without the rule (sorts with every
+    null placement and direction, floats with ±0.0, ±inf, NaN, -NaN and NaN payloads, strings as
+    Utf8, Utf8View and LargeUtf8, nulls, one and several partitions; every `GROUP BY` forced onto the
+    GPU, forced back and with the measured choice): 0 mismatches.
   - Measured on an M4 Max, DataFusion's defaults (16 partitions), with a warm-up before timing,
     best of 5 (`datafusion/results/datafusion_sort_warm_2026-09-29.csv`): full sorts by an int64,
     Float64, Float32 or string key are 6.9x to 28.8x faster than DataFusion alone from 250,000 to
     50M rows (int64 at 50M: 1,581.22 → 69.74 ms, 6,104.1 → 125.8 CPU-ms). Over DataFusion's Parquet
     reader, 10.8x to 16.5x at 10M and 50M rows (`datafusion/results/datafusion_rule_2026-09-29.csv`).
-    With the rule switched on for them (DataFusion alone ÷ with the rule): top-k 0.14x to 0.41x from
-    250,000 to 50M rows, filters 0.51x to 0.74x, and group-bys 0.26x to 3.23x at 10M and 50M rows
-    depending on the aggregate and the number of groups.
+    A sort over a Parquet file with a string column (read as Utf8View): 3.6x to 5.5x at 1M to 50M
+    rows (`datafusion/results/datafusion_parquet_string_sort_2026-09-29.csv`). With the default
+    configuration timed (`datafusion/results/datafusion_groupby_default_2026-09-29.csv` and the two
+    re-timings next to it), the aggregates it runs on the GPU are 1.53x to 4.32x faster than
+    DataFusion alone at 2M to 50M rows (`count(*)` over two int32 keys, 1,000,000 groups, 50M rows:
+    76.20 → 17.63 ms); the ones it hands back cost a median of 3.1% at 2M rows to 0.3% at 50M, at most
+    0.918x (`count(*)` over one int64 key, 864,909 groups, 2M rows). With the rule switched on for
+    them (DataFusion alone ÷ with the rule): top-k 0.14x to 0.41x from 250,000 to 50M rows, filters
+    0.51x to 0.74x, Float64 `sum`/`avg` 0.22x to 1.68x and `min`/`max` 0.16x to 1.07x at 1M to 50M
+    rows, and about rows / 2 groups 0.26x to 0.94x at 50M rows; the default leaves these.
 
 - Chunked import: a column held as many Arrow arrays (a pyarrow `ChunkedArray`, a multi-chunk Polars
   Series, one column of a stream of arrow-rs `RecordBatch`es) imports in one call, each chunk written
