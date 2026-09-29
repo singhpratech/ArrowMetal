@@ -9,7 +9,12 @@ use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_arrowmetal::{session_context, ArrowMetalConfig, ArrowMetalRule};
+use datafusion_arrowmetal::{session_context, AggregateChoice, ArrowMetalConfig, ArrowMetalRule};
+
+/// Every shape the rule can translate, a replaced aggregate forced onto ArrowMetal.
+fn gpu_all() -> ArrowMetalConfig {
+    ArrowMetalConfig::all().with_min_rows(0).with_aggregate_choice(AggregateChoice::ArrowMetal)
+}
 
 fn batch(n: usize) -> RecordBatch {
     let k: Int64Array = (0..n).map(|i| Some((i % 17) as i64)).collect();
@@ -55,10 +60,16 @@ async fn below_min_rows_is_left_with_the_count_in_the_reason() {
 
 #[tokio::test]
 async fn at_min_rows_is_taken() {
-    let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 5_000, ..Default::default() });
+    let rule = ArrowMetalRule::new(ArrowMetalConfig::default().with_min_rows(5_000));
     let ctx = ctx_with(&rule, 5_000, 1).await;
-    ctx.sql("SELECT * FROM t ORDER BY v").await.unwrap().collect().await.unwrap();
-    assert_eq!(rule.report().taken().count(), 1, "{}", rule.report());
+    let sql = "SELECT * FROM t ORDER BY v, k, s";
+    let got = pretty_format_batches(&ctx.sql(sql).await.unwrap().collect().await.unwrap()).unwrap().to_string();
+    let want = pretty_format_batches(&plain(5_000, 1).await.sql(sql).await.unwrap().collect().await.unwrap()).unwrap().to_string();
+    assert_eq!(got, want);
+    let r = rule.report();
+    assert_eq!(r.taken().count(), 1, "{r}");
+    assert!(r.taken().any(|d| d.reason.contains("input rows 5000 (exact) vs min_rows 5000")), "{r}");
+    assert_eq!(r.runtime_fallbacks().count(), 0, "{r}");
 }
 
 /// A filter's output row count is an estimate, so a sort above it is left by default and taken
@@ -66,19 +77,14 @@ async fn at_min_rows_is_taken() {
 #[tokio::test]
 async fn inexact_statistics_are_left_unless_accepted() {
     let sql = "SELECT * FROM t WHERE k = 3 ORDER BY v";
-    let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 10, filter: false, ..Default::default() });
+    let rule = ArrowMetalRule::new(ArrowMetalConfig::default().with_min_rows(10).with_filter(false));
     let ctx = ctx_with(&rule, 5_000, 1).await;
     ctx.sql(sql).await.unwrap().collect().await.unwrap();
     let r = rule.report();
     assert_eq!(r.taken().count(), 0, "{r}");
     assert!(r.left().any(|d| d.reason.contains("estimate")), "{r}");
 
-    let rule = ArrowMetalRule::new(ArrowMetalConfig {
-        min_rows: 10,
-        filter: false,
-        accept_inexact: true,
-        ..Default::default()
-    });
+    let rule = ArrowMetalRule::new(ArrowMetalConfig::default().with_min_rows(10).with_filter(false).with_accept_inexact(true));
     let ctx = ctx_with(&rule, 5_000, 1).await;
     ctx.sql(sql).await.unwrap().collect().await.unwrap();
     assert_eq!(rule.report().taken().count(), 1, "{}", rule.report());
@@ -86,7 +92,7 @@ async fn inexact_statistics_are_left_unless_accepted() {
 
 #[tokio::test]
 async fn config_switches_leave_the_node() {
-    let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, sort: false, ..ArrowMetalConfig::all() });
+    let rule = ArrowMetalRule::new(ArrowMetalConfig::all().with_min_rows(0).with_sort(false));
     let ctx = ctx_with(&rule, 100, 1).await;
     ctx.sql("SELECT * FROM t ORDER BY v").await.unwrap().collect().await.unwrap();
     let r = rule.report();
@@ -96,7 +102,7 @@ async fn config_switches_leave_the_node() {
 
 #[tokio::test]
 async fn unsupported_shapes_are_left_with_a_reason() {
-    let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, ..ArrowMetalConfig::all() });
+    let rule = ArrowMetalRule::new(ArrowMetalConfig::all().with_min_rows(0));
     let ctx = ctx_with(&rule, 100, 1).await;
     for (sql, why) in [
         ("SELECT * FROM t ORDER BY v + 1", "is an expression"),
@@ -119,7 +125,7 @@ async fn unsupported_shapes_are_left_with_a_reason() {
 async fn count_distinct_takes_the_inner_group_by() {
     let sql = "SELECT k, count(DISTINCT v) AS d FROM t GROUP BY k";
     for tp in [1, 4] {
-        let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, accept_inexact: true, ..ArrowMetalConfig::all() });
+        let rule = ArrowMetalRule::new(gpu_all().with_accept_inexact(true));
         let ctx = ctx_with(&rule, 20_000, tp).await;
         let got = sorted_text(&ctx, sql).await;
         assert_eq!(got, sorted_text(&plain(20_000, tp).await, sql).await, "tp={tp}");
@@ -129,18 +135,20 @@ async fn count_distinct_takes_the_inner_group_by() {
     }
 }
 
-/// The default config (min_rows 1,000,000, exact statistics only) at 2,000,000 rows: the sort,
-/// the group-by and the filter are taken and the answers match. Slow in a debug build, so ignored;
-/// run with `cargo test --test rule -- --ignored`.
+/// The default config at 2,000,000 rows: the full sort is taken, top-k and the filter are left,
+/// the group-by never runs on ArrowMetal, and the answers match DataFusion's. Slow in a debug
+/// build, so ignored; run with `cargo test --test rule -- --ignored`.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn default_config_at_two_million_rows() {
     let n = 2_000_000;
-    // The default take-list: the full sort is taken; top-k, the group-by and the filter are left.
+    // The default take-list: the full sort is taken; top-k and the filter are left; the group-by
+    // (17 groups, Float64 min/max) is left at plan time or handed back at run time by the measured
+    // table, never run on ArrowMetal.
     for (sql, text, taken) in [
         ("SELECT s, v, k FROM t ORDER BY v DESC NULLS LAST, s, k", false, 1),
         ("SELECT k, v, s FROM t ORDER BY v DESC NULLS LAST, s LIMIT 20", false, 0),
-        ("SELECT k, max(v), min(v), count(v), count(*) FROM t GROUP BY k", true, 0),
+        ("SELECT k, max(v), min(v), count(v), count(*) FROM t GROUP BY k", true, usize::MAX),
         ("SELECT k, s FROM t WHERE k = 3 AND s <> 's1'", true, 0),
     ] {
         let rule = ArrowMetalRule::new(ArrowMetalConfig::default());
@@ -157,27 +165,32 @@ async fn default_config_at_two_million_rows() {
         };
         assert!(got == want, "{sql}: results differ");
         let r = rule.report();
-        assert_eq!(r.taken().count(), taken, "{sql}\n{r}");
+        if taken == usize::MAX {
+            assert_eq!(r.runtime_choices().filter(|d| d.taken).count(), 0, "{sql}\n{r}");
+        } else {
+            assert_eq!(r.taken().count(), taken, "{sql}\n{r}");
+        }
         assert_eq!(r.runtime_fallbacks().count(), 0, "{sql}\n{r}");
         println!("{sql}\n{r}");
     }
 }
 
-/// What the default take-list leaves, with the reason in the report.
+/// What the default take-list leaves, with the reason in the report: top-k and filters by the
+/// config, an aggregate by the measured table (it takes no aggregate shape at 1,000 rows).
 #[tokio::test]
 async fn default_take_list_leaves_topk_aggregates_and_filters() {
-    let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, ..Default::default() });
+    let rule = ArrowMetalRule::new(ArrowMetalConfig::default().with_min_rows(0));
     let ctx = ctx_with(&rule, 1_000, 1).await;
     for (sql, why) in [
         ("SELECT * FROM t ORDER BY v LIMIT 5", "top-k (sort with fetch 5) disabled in config"),
-        ("SELECT k, count(*) FROM t GROUP BY k", "aggregate disabled in config"),
+        ("SELECT k, count(*) FROM t GROUP BY k", "the measured table takes"),
         ("SELECT * FROM t WHERE k = 3", "filter disabled in config"),
     ] {
         rule.clear_report();
         ctx.sql(sql).await.unwrap().collect().await.unwrap();
         let r = rule.report();
         assert_eq!(r.taken().count(), 0, "{sql}\n{r}");
-        assert!(r.left().any(|d| d.reason == why), "{sql}\n{r}");
+        assert!(r.left().any(|d| d.reason.contains(why)), "{sql}\n{r}");
     }
     rule.clear_report();
     ctx.sql("SELECT * FROM t ORDER BY v").await.unwrap().collect().await.unwrap();
@@ -186,7 +199,7 @@ async fn default_take_list_leaves_topk_aggregates_and_filters() {
 
 #[tokio::test]
 async fn explain_shows_metal_exec() {
-    let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, ..ArrowMetalConfig::all() });
+    let rule = ArrowMetalRule::new(gpu_all());
     let ctx = ctx_with(&rule, 100, 4).await;
     let out = ctx
         .sql("EXPLAIN SELECT k, sum(v) FROM t GROUP BY k ORDER BY k")
@@ -207,7 +220,7 @@ async fn replaced_aggregates_under_a_partitioned_join() {
                (SELECT k, max(v) AS top FROM t GROUP BY k) a \
                JOIN (SELECT k, count(*) AS n FROM t GROUP BY k) b ON a.k = b.k";
     for tp in [1, 4] {
-        let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, sort: false, ..ArrowMetalConfig::all() });
+        let rule = ArrowMetalRule::new(gpu_all().with_sort(false));
         let ctx = ctx_with(&rule, 50_000, tp).await;
         let got = sorted_text(&ctx, sql).await;
         let want = sorted_text(&plain(50_000, tp).await, sql).await;
@@ -245,7 +258,7 @@ async fn order_by_through_a_projection_is_taken() {
         "SELECT v * 2 AS w, k, s FROM t ORDER BY k, s, w",
     ] {
         for (parts, tp) in [(3, 4), (1, 1)] {
-            let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, ..ArrowMetalConfig::all() });
+            let rule = ArrowMetalRule::new(ArrowMetalConfig::all().with_min_rows(0));
             let ctx = ctx_parts(Some(&rule), 20_000, parts, tp).await;
             let run = |c: SessionContext| async move {
                 pretty_format_batches(&c.sql(sql).await.unwrap().collect().await.unwrap()).unwrap().to_string()
@@ -275,7 +288,7 @@ async fn order_by_through_a_projection_is_taken() {
 async fn top_level_aggregate_is_not_repartitioned() {
     // Exact aggregates only (a float sum differs in its last bits with the summation order).
     let sql = "SELECT k, max(v) AS top, count(v) AS c, count(*) AS n FROM t GROUP BY k";
-    let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, ..ArrowMetalConfig::all() });
+    let rule = ArrowMetalRule::new(gpu_all());
     let ctx = ctx_parts(Some(&rule), 20_000, 3, 4).await;
     let got = sorted_text(&ctx, sql).await;
     // sorted_text wraps the query in an outer ORDER BY, so plan the bare query for the report.
@@ -284,4 +297,123 @@ async fn top_level_aggregate_is_not_repartitioned() {
     let r = rule.report();
     assert!(r.taken().any(|d| d.reason.contains("kept at one partition")), "{r}");
     assert_eq!(got, sorted_text(&ctx_parts(None, 20_000, 3, 4).await, sql).await);
+}
+
+/// A table whose i64 key `k` holds `groups` distinct values over `n` rows (dealt round-robin, so
+/// every batch holds many groups), a Float64 `v` and an int64 `q`, in `parts` partitions.
+async fn grouped_ctx(rule: Option<&ArrowMetalRule>, n: usize, groups: i64, parts: usize) -> SessionContext {
+    let config = SessionConfig::new().with_target_partitions(4);
+    let ctx = match rule {
+        Some(r) => session_context(config, r.clone()),
+        None => SessionContext::new_with_config(config),
+    };
+    let k: Int64Array = (0..n as i64).map(|i| Some((i * 7_919) % groups)).collect();
+    let v: Float64Array = (0..n).map(|i| Some((i % 1_000) as f64 / 8.0)).collect();
+    let q: Int64Array = (0..n as i64).map(|i| Some(i % 977)).collect();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, true),
+        Field::new("v", DataType::Float64, true),
+        Field::new("q", DataType::Int64, true),
+    ]));
+    let b = RecordBatch::try_new(schema.clone(), vec![Arc::new(k) as ArrayRef, Arc::new(v), Arc::new(q)]).unwrap();
+    let per = n.div_ceil(parts);
+    let p: Vec<Vec<RecordBatch>> = (0..parts).map(|i| vec![b.slice(i * per, per.min(n - i * per))]).collect();
+    ctx.register_table("g", Arc::new(MemTable::try_new(schema, p).unwrap())).unwrap();
+    ctx
+}
+
+/// The forced hand-back (`AggregateChoice::DataFusion`) gives DataFusion's answer, over one and
+/// several input partitions, and records its run-time choice in the report.
+#[tokio::test]
+async fn forced_hand_back_gives_datafusions_answer() {
+    let sql = "SELECT k, count(*) AS n, sum(q) AS s, min(q) AS lo, max(q) AS hi FROM g GROUP BY k";
+    for parts in [1, 3] {
+        let rule = ArrowMetalRule::new(gpu_all().with_aggregate_choice(AggregateChoice::DataFusion));
+        let ctx = grouped_ctx(Some(&rule), 30_000, 5_000, parts).await;
+        let got = sorted_text(&ctx, sql).await;
+        let want = sorted_text(&grouped_ctx(None, 30_000, 5_000, parts).await, sql).await;
+        assert_eq!(got, want, "parts={parts}");
+        let r = rule.report();
+        assert!(r.runtime_choices().count() >= 1, "{r}");
+        assert!(r.runtime_choices().all(|d| !d.taken && d.reason.contains("aggregate_choice is DataFusion")), "{r}");
+        assert_eq!(r.runtime_fallbacks().count(), 0, "{r}");
+    }
+}
+
+/// The default choice decides at run time from the probe's estimate. With the table looked up at
+/// 50,000,000 rows (`table_rows`): the decision follows the table for the estimated bucket, the
+/// report carries the estimate, and the answer is DataFusion's either way.
+#[tokio::test]
+async fn measured_choice_records_the_estimate_and_matches() {
+    let sql = "SELECT k, count(*) AS n FROM g GROUP BY k";
+    for (groups, n) in [(150i64, 40_000usize), (60_000, 200_000)] {
+        let rule = ArrowMetalRule::new(ArrowMetalConfig::default().with_min_rows(0).with_table_rows(Some(50_000_000)));
+        let ctx = grouped_ctx(Some(&rule), n, groups, 3).await;
+        let got = sorted_text(&ctx, sql).await;
+        let want = sorted_text(&grouped_ctx(None, n, groups, 3).await, sql).await;
+        assert_eq!(got, want, "groups={groups}");
+        let r = rule.report();
+        assert_eq!(r.runtime_fallbacks().count(), 0, "{r}");
+        for d in r.runtime_choices() {
+            let e = d.groups.as_ref().unwrap().estimate.expect("an estimate");
+            assert!(e.low <= groups as u64 * 5 / 4 && e.high >= groups as u64 * 3 / 4, "groups={groups}: {d}");
+            assert!(d.reason.contains("estimated") || d.reason.contains("counted"), "{d}");
+        }
+        println!("groups={groups}:\n{r}");
+    }
+}
+
+/// A session whose memory pool holds 3 MiB: the MetalExec's reservation for its input is refused,
+/// and the node is handed back to DataFusion (whose sort spills) with the reason in the report;
+/// the answers are DataFusion's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_memory_reservation_hands_the_node_back() {
+    use datafusion::execution::memory_pool::GreedyMemoryPool;
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion::execution::session_state::SessionStateBuilder;
+    let n = 200_000;
+    for sql in [
+        "SELECT k, count(*) AS n, max(v) AS top FROM t GROUP BY k",
+        "SELECT k, v, s FROM t ORDER BY v DESC NULLS LAST, k, s",
+    ] {
+        let rule = ArrowMetalRule::new(gpu_all());
+        let rt = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(3 << 20)))
+            .build_arc()
+            .unwrap();
+        let state = datafusion_arrowmetal::with_arrowmetal(
+            SessionStateBuilder::new()
+                .with_config(SessionConfig::new().with_target_partitions(4).with_sort_spill_reservation_bytes(256 << 10))
+                .with_runtime_env(rt)
+                .with_default_features(),
+            rule.clone(),
+        )
+        .build();
+        let ctx = SessionContext::new_with_state(state);
+        // Four batches of their own (not slices of one: DataFusion's sort reserves a slice at the
+        // size of the buffer it shares).
+        let p: Vec<Vec<RecordBatch>> = (0..4).map(|_| vec![batch(n / 4)]).collect();
+        let schema = p[0][0].schema();
+        ctx.register_table("t", Arc::new(MemTable::try_new(Arc::clone(&schema), p.clone()).unwrap())).unwrap();
+        let reference = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+        reference.register_table("t", Arc::new(MemTable::try_new(schema, p).unwrap())).unwrap();
+        let text = |out: Vec<RecordBatch>| pretty_format_batches(&out).unwrap().to_string();
+        let grouped = sql.contains("GROUP BY");
+        let got = if grouped {
+            sorted_text(&ctx, sql).await
+        } else {
+            text(ctx.sql(sql).await.unwrap().collect().await.unwrap())
+        };
+        let want = if grouped {
+            sorted_text(&reference, sql).await
+        } else {
+            text(reference.sql(sql).await.unwrap().collect().await.unwrap())
+        };
+        assert!(got == want, "{sql}: results differ");
+        let r = rule.report();
+        assert!(
+            r.runtime_fallbacks().any(|d| d.reason.contains("memory pool refused")),
+            "{sql}: expected a memory hand-back\n{r}"
+        );
+    }
 }

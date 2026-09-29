@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Generates the measured aggregate table (datafusion/src/agg_table.rs) from a sweep CSV.
+
+The sweep is `examples/bench.rs --families gsweep --contexts off,on,...`: every aggregate family
+(count; sum and avg over int64; sum and avg over Float64; min + max over int64; min + max over
+Float64; DISTINCT) over one and two keys, int32 and int64 keys, at five group counts in the key
+domain (200, 10k, 100k, 1M, rows/2), per input size and batch layout; DataFusion alone (`off`)
+against the rule with every replaced aggregate forced onto ArrowMetal (`on`), both warm, best of 5.
+
+The fit:
+
+* Each (case, size, layout) is a point with ratio = off_ms / on_ms (0 when the answers differed).
+  It goes to the group-count bucket of the groups its data holds at that size (`out_rows`):
+  BUCKETS by group count, ROWS_BUCKET for at least rows / NEAR_ROWS groups, none in between.
+* Per (family, keys, key class, input, bucket) and size, the series' ratio is the worst point
+  there: over both layouts and over the cases of the family (sum and avg form one family).
+* A series is taken from the smallest measured size from which its ratio is at least
+  MIN_RATIO x HEADROOM at that size and every larger measured size, and only when that holds at
+  two or more measured sizes (one measured size alone is not a crossover).
+* The take is capped at the largest measured size when the ratio falls between the two largest
+  measured sizes (a falling ratio cannot be extended past the sweep); otherwise it has no upper
+  bound.
+* Everything else is not taken: the MetalExec hands it back to DataFusion (or the rule leaves it
+  at plan time when no bucket is taken at the input's row count).
+
+Usage:
+    python3 scripts/groupby_table.py results/<sweep>.csv            # writes src/agg_table.rs
+    python3 scripts/groupby_table.py results/<sweep>.csv --print    # the series and the fit
+    python3 scripts/groupby_table.py --check                        # exit 1 if src/agg_table.rs is stale
+"""
+import argparse
+import csv
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT = os.path.join(HERE, "src", "agg_table.rs")
+
+MIN_RATIO = 1.5
+# The sweep ratio needed at a size is MIN_RATIO x HEADROOM: a shape measured at 1.5x sits within
+# run-to-run noise of 1.5x, so the default takes only shapes measured at least 10 % above it.
+HEADROOM = 1.1
+BUCKETS = (("200", 1, 1_414), ("10k", 1_415, 31_622), ("100k", 31_623, 316_227), ("1M", 316_228, 3_162_277))
+NEAR_ROWS = 4
+ROWS_BUCKET = "rows/2"
+ORDER = [b[0] for b in BUCKETS] + [ROWS_BUCKET]
+FAMILY = {
+    "count": "count",
+    "sum_f64": "sum_avg_f64",
+    "avg_f64": "sum_avg_f64",
+    "minmax_f64": "minmax_f64",
+    "sum_int": "sum_avg_int",
+    "avg_int": "sum_avg_int",
+    "minmax_int": "minmax_int",
+    "distinct": "distinct",
+}
+CASE = re.compile(r"^(?P<fam>[a-z_0-9]+?)_(?P<nk>[12])(?P<kc>i32|i64)_(?P<g>[^_]+)$")
+
+
+def bucket(groups, rows):
+    if groups <= 0:
+        return None
+    if groups * NEAR_ROWS >= rows:
+        return ROWS_BUCKET
+    for name, lo, hi in BUCKETS:
+        if lo <= groups <= hi:
+            return name
+    return None
+
+
+def read(path):
+    """{(family, keys, key class, input, bucket): {size: [(case, layout, ratio, off, on)]}}"""
+    series = {}
+    with open(path) as fh:
+        for r in csv.DictReader(fh):
+            if r["family"] != "gsweep" or not r["on_ms"]:
+                continue
+            m = CASE.match(r["case"])
+            if not m:
+                raise SystemExit(f"unexpected case id {r['case']}")
+            size = int(r["size"])
+            b = bucket(int(r["out_rows"]), size)
+            if b is None:
+                continue
+            off, on = float(r["off_ms"]), float(r["on_ms"])
+            ratio = off / on if r["equal"] == "yes" else 0.0
+            key = (FAMILY[m["fam"]], "1" if m["nk"] == "1" else "2+", m["kc"], "memory", b)
+            series.setdefault(key, {}).setdefault(size, []).append((r["case"], r["layout"], ratio, off, on))
+    return series
+
+
+def fit(points):
+    """(min_rows or None, max_rows or None, {size: worst ratio})"""
+    worst = {n: min(p[2] for p in pts) for n, pts in points.items()}
+    sizes = sorted(worst)
+    need = MIN_RATIO * HEADROOM
+    start = None
+    for i in range(len(sizes)):
+        if all(worst[n] >= need for n in sizes[i:]):
+            start = i
+            break
+    if start is None or len(sizes) - start < 2:
+        return None, None, worst
+    cap = None
+    if len(sizes) >= 2 and worst[sizes[-1]] < worst[sizes[-2]]:
+        cap = sizes[-1]
+    return sizes[start], cap, worst
+
+
+def table(path):
+    s = read(path)
+    rows = []
+    for key in sorted(s, key=lambda k: (k[0], k[1], k[2], k[3], ORDER.index(k[4]))):
+        lo, hi, worst = fit(s[key])
+        rows.append((key, lo, hi, worst))
+    return rows
+
+
+def rust(path, rows):
+    src = os.path.relpath(os.path.abspath(path), HERE)
+    out = [
+        "//! The measured aggregate table. Generated by scripts/groupby_table.py from",
+        f"//! {src}; do not edit by hand (`--check` fails when this file and that one disagree).",
+        "//!",
+        "//! One row per (aggregate family, key count, key class, input, group-count bucket) the sweep",
+        "//! measured: `min_rows` is the fewest input rows from which ArrowMetal was measured at least",
+        f"//! MIN_RATIO x HEADROOM ({MIN_RATIO} x {HEADROOM}) ahead of DataFusion alone at that size and every",
+        "//! larger one (None: not taken at any size); `max_rows` caps a take whose ratio fell between the",
+        "//! two largest sizes; `ratios` is the worst ratio (both layouts, every case of the family) per size.",
+        "",
+        "pub(crate) struct Row {",
+        "    pub family: &'static str,",
+        "    pub keys: &'static str,",
+        "    pub key_class: &'static str,",
+        "    pub source: &'static str,",
+        "    pub bucket: &'static str,",
+        "    pub min_rows: Option<u64>,",
+        "    pub max_rows: Option<u64>,",
+        "    pub ratios: &'static [(u64, f64)],",
+        "}",
+        "",
+        f"pub(crate) const SOURCE: &str = {src!r};".replace("'", '"'),
+        f"pub(crate) const MIN_RATIO: f64 = {MIN_RATIO};",
+        f"pub(crate) const HEADROOM: f64 = {HEADROOM};",
+        f"pub(crate) const NEAR_ROWS: u64 = {NEAR_ROWS};",
+        f'pub(crate) const ROWS_BUCKET: &str = "{ROWS_BUCKET}";',
+        "pub(crate) const BUCKETS: &[(&str, u64, u64)] = &["
+        + ", ".join(f'("{n}", {lo}, {hi})' for n, lo, hi in BUCKETS)
+        + "];",
+        "",
+        "pub(crate) const TABLE: &[Row] = &[",
+    ]
+    opt = lambda v: "None" if v is None else f"Some({v})"
+    for (fam, keys, kc, source, b), lo, hi, worst in rows:
+        ratios = ", ".join(f"({n}, {worst[n]:.2})" for n in sorted(worst))
+        out.append(
+            f'    Row {{ family: "{fam}", keys: "{keys}", key_class: "{kc}", source: "{source}", bucket: "{b}", '
+            f"min_rows: {opt(lo)}, max_rows: {opt(hi)}, ratios: &[{ratios}] }},"
+        )
+    out.append("];")
+    out.append("")
+    return "\n".join(out)
+
+
+def committed_source():
+    with open(OUT) as fh:
+        for line in fh:
+            m = re.match(r'pub\(crate\) const SOURCE: &str = "(.*)";', line)
+            if m:
+                return os.path.join(HERE, m.group(1))
+    raise SystemExit("no SOURCE line in src/agg_table.rs")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("csv", nargs="?")
+    ap.add_argument("--print", action="store_true")
+    ap.add_argument("--check", action="store_true")
+    a = ap.parse_args()
+    path = a.csv or committed_source()
+    rows = table(path)
+    text = rust(path, rows)
+    if a.print:
+        for (fam, keys, kc, source, b), lo, hi, worst in rows:
+            r = "  ".join(f"{n // 1_000_000}M {worst[n]:.2}" for n in sorted(worst))
+            took = "-" if lo is None else f"from {lo // 1_000_000}M" + ("" if hi is None else f" to {hi // 1_000_000}M")
+            print(f"{fam:12} {keys:2} {kc} {b:7} {took:14} {r}")
+        return
+    if a.check:
+        with open(OUT) as fh:
+            ok = fh.read() == text
+        print("src/agg_table.rs is " + ("up to date" if ok else "STALE"))
+        sys.exit(0 if ok else 1)
+    with open(OUT, "w") as fh:
+        fh.write(text)
+    print(f"wrote {OUT}: {sum(1 for r in rows if r[1] is not None)} of {len(rows)} series taken")
+
+
+if __name__ == "__main__":
+    main()

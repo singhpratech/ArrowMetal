@@ -15,14 +15,14 @@ use crate::exec::{AggKind, MetalOp};
 
 /// One GPU job at a time in this process. The plan runner is thread-safe per handle set, but
 /// serialising keeps concurrent `MetalExec`s (a join's two sides, parallel tests) from contending
-/// for the one GPU queue; it costs nothing in a spike that runs one query at a time.
+/// for the one GPU queue.
 static GPU: Mutex<()> = Mutex::new(());
 
-pub(crate) fn run(op: &MetalOp, input: &[RecordBatch], out_schema: &SchemaRef) -> Result<RecordBatch, String> {
+pub(crate) fn run(op: &MetalOp, input: &[&RecordBatch], out_schema: &SchemaRef) -> Result<RecordBatch, String> {
     let _guard = GPU.lock().unwrap_or_else(|p| p.into_inner());
     take_times();
     // The chunked import takes every non-empty batch as one chunk of each column.
-    let input: Vec<&RecordBatch> = input.iter().filter(|b| b.num_rows() > 0).collect();
+    let input: Vec<&RecordBatch> = input.iter().copied().filter(|b| b.num_rows() > 0).collect();
     if input.is_empty() {
         // A sort, a filter and a grouped aggregate of nothing are all empty.
         return Ok(RecordBatch::new_empty(out_schema.clone()));
@@ -278,15 +278,16 @@ fn aggregate(
                     // The engine's `count(x)` counts the non-null values of every type on every
                     // path (core a387a2a).
                     AggKind::Count => "count",
-                    AggKind::CountAll => unreachable!(),
+                    AggKind::CountAll => "count",
                 };
-                format!("[\"{op}\",\"a{j}\",\"{}\"]", c.clone().unwrap())
+                let Some(c) = &c else { return Err(format!("{op} without an argument column")) };
+                format!("[\"{op}\",\"a{j}\",\"{c}\"]")
             }
         };
         agg_json.push(row);
         if matches!(a.kind, AggKind::Min | AggKind::Max) && a.float {
             // Helpers go after every main aggregate, so the first keys+aggs outputs line up.
-            let c = c.unwrap();
+            let Some(c) = c else { return Err("min/max without an argument column".into()) };
             helper_json.push(format!("[\"sum\",\"nan{j}\",\"(if_else (ne {c} {c}) (i64 1) (i64 0))\"]"));
             helper_json.push(format!("[\"count\",\"cnt{j}\",\"{c}\"]"));
             helper_json.push(format!("[\"sum\",\"z{j}\",\"(if_else (eq {c} (f64 0)) (i64 1) (i64 0))\"]"));

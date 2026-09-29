@@ -1,7 +1,8 @@
 //! `ArrowMetalRule`: the `PhysicalOptimizerRule` that swaps supported nodes for `MetalExec`.
 
+use std::collections::VecDeque;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Precision;
@@ -28,7 +29,12 @@ use crate::translate;
 ///
 /// [`Default`] is the measured take-list; [`ArrowMetalConfig::all`] takes every shape the rule can
 /// translate (what the differential grid and the benchmark use).
+///
+/// The fields are public to read and to set on a value (`let mut c = ArrowMetalConfig::all();
+/// c.min_rows = 0;`); outside this crate a config is built from [`Default`] or
+/// [`ArrowMetalConfig::all`] and the `with_*` methods.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ArrowMetalConfig {
     /// Take a node only when its input has at least this many rows.
     pub min_rows: usize,
@@ -40,8 +46,40 @@ pub struct ArrowMetalConfig {
     pub sort: bool,
     /// Top-k: `ORDER BY ... LIMIT` (a sort with a fetch).
     pub topk: bool,
+    /// Aggregates (GROUP BY, DISTINCT). Who runs a replaced one is `aggregate_choice`.
     pub aggregate: bool,
+    /// Filters: a `FilterExec` whose predicate translates.
     pub filter: bool,
+    /// Who runs a replaced aggregate. Default: [`AggregateChoice::Measured`].
+    pub aggregate_choice: AggregateChoice,
+    /// Under [`AggregateChoice::Measured`], look the measured table up at this row count instead of
+    /// the input's, at plan time and at run time (tests and experiments; default `None`).
+    pub table_rows: Option<usize>,
+    /// The report keeps the decisions of the last this many plans the rule optimized (an EXPLAIN
+    /// and each execution plan count one each), with the run-time decisions of their nodes.
+    /// Default 64; 0 keeps one.
+    pub report_plans: usize,
+}
+
+/// Who runs an aggregate the rule replaced.
+///
+/// The rule sees the input's row count at plan time but not its group count, and the same
+/// aggregate SQL is faster on ArrowMetal at some group counts and slower at others. So a replaced
+/// aggregate is decided when it runs: `MetalExec` collects its input, and under `Measured` it
+/// estimates the group count from a sample of the key columns on the CPU and looks the shape up in
+/// the measured table (`src/agg_table.rs`). It runs on ArrowMetal only where the sweep measured it
+/// ahead; otherwise it hands the node back to DataFusion's own operators over the same batches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AggregateChoice {
+    /// Estimate the group count and look it up in the measured table (the default). At plan time
+    /// the rule replaces an aggregate only when the table takes its shape at some group count at
+    /// the input's exact row count.
+    #[default]
+    Measured,
+    /// Always run a replaced aggregate on ArrowMetal (the benchmark's crossover sweep, tests).
+    ArrowMetal,
+    /// Always hand a replaced aggregate back to DataFusion (measures the hand-back itself, tests).
+    DataFusion,
 }
 
 /// The default take-list, from the rule on/off measurement against DataFusion 55.1 on an M4 Max
@@ -86,8 +124,11 @@ impl Default for ArrowMetalConfig {
             take_when_unknown: false,
             sort: true,
             topk: false,
-            aggregate: false,
+            aggregate: true,
             filter: false,
+            aggregate_choice: AggregateChoice::Measured,
+            table_rows: None,
+            report_plans: 64,
         }
     }
 }
@@ -98,18 +139,85 @@ impl ArrowMetalConfig {
     pub fn all() -> Self {
         Self { topk: true, aggregate: true, filter: true, ..Self::default() }
     }
+
+    /// Sets [`min_rows`](Self::min_rows).
+    pub fn with_min_rows(mut self, rows: usize) -> Self {
+        self.min_rows = rows;
+        self
+    }
+    /// Sets [`accept_inexact`](Self::accept_inexact).
+    pub fn with_accept_inexact(mut self, on: bool) -> Self {
+        self.accept_inexact = on;
+        self
+    }
+    /// Sets [`take_when_unknown`](Self::take_when_unknown).
+    pub fn with_take_when_unknown(mut self, on: bool) -> Self {
+        self.take_when_unknown = on;
+        self
+    }
+    /// Sets [`sort`](Self::sort).
+    pub fn with_sort(mut self, on: bool) -> Self {
+        self.sort = on;
+        self
+    }
+    /// Sets [`topk`](Self::topk).
+    pub fn with_topk(mut self, on: bool) -> Self {
+        self.topk = on;
+        self
+    }
+    /// Sets [`aggregate`](Self::aggregate).
+    pub fn with_aggregate(mut self, on: bool) -> Self {
+        self.aggregate = on;
+        self
+    }
+    /// Sets [`filter`](Self::filter).
+    pub fn with_filter(mut self, on: bool) -> Self {
+        self.filter = on;
+        self
+    }
+    /// Sets [`aggregate_choice`](Self::aggregate_choice).
+    pub fn with_aggregate_choice(mut self, choice: AggregateChoice) -> Self {
+        self.aggregate_choice = choice;
+        self
+    }
+    /// Sets [`table_rows`](Self::table_rows).
+    pub fn with_table_rows(mut self, rows: Option<usize>) -> Self {
+        self.table_rows = rows;
+        self
+    }
+    /// Sets [`report_plans`](Self::report_plans).
+    pub fn with_report_plans(mut self, plans: usize) -> Self {
+        self.report_plans = plans;
+        self
+    }
 }
 
-/// One node the rule looked at, or one runtime fallback.
+/// One node the rule looked at, one replaced aggregate's run-time choice, or one runtime fallback.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Decision {
     /// The node, as DataFusion prints it on one line.
     pub node: String,
+    /// At plan time: the node was replaced by a `MetalExec`. For a run-time choice: the aggregate
+    /// ran on ArrowMetal.
     pub taken: bool,
     /// Why it was taken or left.
     pub reason: String,
     /// True for a `MetalExec` that hit an ArrowMetal error at run time and ran DataFusion instead.
     pub runtime_fallback: bool,
+    /// For a replaced aggregate's run-time choice: what it was decided from. `taken` is then
+    /// whether it ran on ArrowMetal.
+    pub groups: Option<GroupChoice>,
+}
+
+/// What a replaced aggregate's run-time choice was made from.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct GroupChoice {
+    /// Rows of the collected input.
+    pub rows: usize,
+    /// The group-count probe's answer (`None` when `aggregate_choice` forced the choice).
+    pub estimate: Option<crate::probe::GroupEstimate>,
 }
 
 impl Decision {
@@ -119,10 +227,42 @@ impl Decision {
         } else {
             format!("ArrowMetal error at run time, ran the DataFusion plan instead: {msg}")
         };
-        Decision { node: format!("MetalExec {op:?}"), taken: false, reason, runtime_fallback: true }
+        Decision { node: format!("MetalExec {op:?}"), taken: false, reason, runtime_fallback: true, groups: None }
     }
 
-    /// A runtime fallback caused by the data (see [`Decision::runtime_fallback`]), not an error.
+    pub(crate) fn memory_hand_back(op: &MetalOp, what: &str, err: &str) -> Self {
+        Decision {
+            node: format!("MetalExec {op:?}"),
+            taken: false,
+            reason: format!("the memory pool refused the reservation for {what}, ran the DataFusion plan instead: {err}"),
+            runtime_fallback: true,
+            groups: None,
+        }
+    }
+
+    pub(crate) fn runtime_choice(
+        op: &MetalOp,
+        on_arrowmetal: bool,
+        reason: String,
+        rows: usize,
+        estimate: Option<crate::probe::GroupEstimate>,
+    ) -> Self {
+        let reason = format!("{}: {reason}", if on_arrowmetal { "ran on ArrowMetal" } else { "handed back to DataFusion" });
+        Decision {
+            node: format!("MetalExec {op:?}"),
+            taken: on_arrowmetal,
+            reason,
+            runtime_fallback: false,
+            groups: Some(GroupChoice { rows, estimate }),
+        }
+    }
+
+    /// A replaced aggregate's run-time choice (see [`AggregateChoice`]).
+    pub fn is_runtime_choice(&self) -> bool {
+        self.groups.is_some()
+    }
+
+    /// A runtime fallback (the `runtime_fallback` field) caused by the data, not an error.
     pub fn is_data_dependent(&self) -> bool {
         self.runtime_fallback && self.reason.starts_with(crate::gpu::DATA_DEPENDENT)
     }
@@ -132,6 +272,8 @@ impl fmt::Display for Decision {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let tag = if self.runtime_fallback {
             "FALLBACK"
+        } else if self.groups.is_some() {
+            if self.taken { "GPU" } else { "HANDBACK" }
         } else if self.taken {
             "TAKEN"
         } else {
@@ -141,20 +283,30 @@ impl fmt::Display for Decision {
     }
 }
 
-/// Everything the rule decided since it was created or last cleared.
+/// What the rule decided for the last `report_plans` plans since it was created or last cleared.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct Report(Vec<Decision>);
 
 impl Report {
+    /// Every decision, oldest first.
     pub fn decisions(&self) -> &[Decision] {
         &self.0
     }
+    /// Nodes the rule replaced at plan time.
     pub fn taken(&self) -> impl Iterator<Item = &Decision> {
-        self.0.iter().filter(|d| d.taken)
+        self.0.iter().filter(|d| d.taken && d.groups.is_none())
     }
+    /// Nodes the rule left at plan time.
     pub fn left(&self) -> impl Iterator<Item = &Decision> {
-        self.0.iter().filter(|d| !d.taken && !d.runtime_fallback)
+        self.0.iter().filter(|d| !d.taken && !d.runtime_fallback && d.groups.is_none())
     }
+    /// Replaced aggregates' run-time choices (ArrowMetal or handed back).
+    pub fn runtime_choices(&self) -> impl Iterator<Item = &Decision> {
+        self.0.iter().filter(|d| d.groups.is_some())
+    }
+    /// `MetalExec`s that ran DataFusion's plan instead after an ArrowMetal error or on data the
+    /// GPU path cannot answer exactly (see [`Decision::is_data_dependent`]).
     pub fn runtime_fallbacks(&self) -> impl Iterator<Item = &Decision> {
         self.0.iter().filter(|d| d.runtime_fallback)
     }
@@ -169,13 +321,52 @@ impl fmt::Display for Report {
     }
 }
 
+/// The shared decision log: the decisions of the last `keep` plans, each tagged with its plan.
+#[derive(Debug)]
+pub(crate) struct Log {
+    entries: VecDeque<(u64, Decision)>,
+    plan: u64,
+    keep: u64,
+}
+
+impl Log {
+    fn new(keep: usize) -> Self {
+        Self { entries: VecDeque::new(), plan: 0, keep: keep.max(1) as u64 }
+    }
+
+    /// Starts a new plan: drops the decisions of plans outside the last `keep`.
+    fn begin_plan(&mut self) -> u64 {
+        self.plan += 1;
+        let first = self.plan.saturating_sub(self.keep - 1);
+        while self.entries.front().is_some_and(|(p, _)| *p < first) {
+            self.entries.pop_front();
+        }
+        self.plan
+    }
+
+    /// Records a decision of plan `plan` (dropped when that plan is no longer kept).
+    pub(crate) fn push(&mut self, plan: u64, d: Decision) {
+        if plan + self.keep > self.plan {
+            self.entries.push_back((plan, d));
+        }
+    }
+}
+
+pub(crate) type SharedLog = Arc<Mutex<Log>>;
+
+/// The log, also after a panic elsewhere poisoned its mutex (the log stays consistent: every
+/// update is a single push or pop).
+pub(crate) fn lock(log: &SharedLog) -> MutexGuard<'_, Log> {
+    log.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Replaces `SortExec` (+ its `SortPreservingMergeExec`), hash `AggregateExec` (a `Single` node, or
 /// a `Final`/`Partial` pair) and `FilterExec` with [`MetalExec`] when ArrowMetal gives the same
 /// answer and the input is big enough. Cloning shares the report.
 #[derive(Debug, Clone)]
 pub struct ArrowMetalRule {
     config: ArrowMetalConfig,
-    log: Arc<Mutex<Vec<Decision>>>,
+    log: SharedLog,
 }
 
 struct Candidate {
@@ -215,26 +406,31 @@ fn sort_keys(expr: &datafusion::physical_expr::LexOrdering) -> Option<Vec<(usize
 }
 
 impl ArrowMetalRule {
+    /// A rule with this config and an empty report.
     pub fn new(config: ArrowMetalConfig) -> Self {
-        Self { config, log: Arc::new(Mutex::new(Vec::new())) }
+        let keep = config.report_plans;
+        Self { config, log: Arc::new(Mutex::new(Log::new(keep))) }
     }
 
+    /// The config the rule was made with.
     pub fn config(&self) -> &ArrowMetalConfig {
         &self.config
     }
 
-    /// A snapshot of every decision so far (planning and runtime fallbacks).
+    /// A snapshot of the decisions of the last `report_plans` plans (plan time, run-time choices
+    /// and runtime fallbacks).
     pub fn report(&self) -> Report {
-        Report(self.log.lock().unwrap().clone())
+        Report(lock(&self.log).entries.iter().map(|(_, d)| d.clone()).collect())
     }
 
+    /// Empties the report.
     pub fn clear_report(&self) {
-        self.log.lock().unwrap().clear();
+        lock(&self.log).entries.clear();
     }
 
-    fn record(&self, node: &Arc<dyn ExecutionPlan>, taken: bool, reason: String) {
+    fn record(&self, plan: u64, node: &Arc<dyn ExecutionPlan>, taken: bool, reason: String) {
         let node = displayable(node.as_ref()).one_line().to_string().trim_end().to_string();
-        self.log.lock().unwrap().push(Decision { node, taken, reason, runtime_fallback: false });
+        lock(&self.log).push(plan, Decision { node, taken, reason, runtime_fallback: false, groups: None });
     }
 
     /// Why a sort with this `fetch` is switched off in the config, if it is.
@@ -357,8 +553,9 @@ impl ArrowMetalRule {
         None
     }
 
-    /// Whether the input is big enough, and the phrase the report uses for its size.
-    fn size_ok(&self, input: &Arc<dyn ExecutionPlan>) -> (bool, String) {
+    /// Whether the input is big enough, the phrase the report uses for its size, and the row count
+    /// it went by (None when unknown).
+    fn size_ok(&self, input: &Arc<dyn ExecutionPlan>) -> (bool, String, Option<usize>) {
         let stats = StatisticsContext::new().compute(input.as_ref(), &StatisticsArgs::new());
         let rows = match stats {
             Ok(s) => s.num_rows,
@@ -366,21 +563,22 @@ impl ArrowMetalRule {
         };
         let min = self.config.min_rows;
         match rows {
-            Precision::Exact(n) => (n >= min, format!("input rows {n} (exact) vs min_rows {min}")),
+            Precision::Exact(n) => (n >= min, format!("input rows {n} (exact) vs min_rows {min}"), Some(n)),
             Precision::Inexact(n) if self.config.accept_inexact => {
-                (n >= min, format!("input rows ~{n} (inexact, accepted) vs min_rows {min}"))
+                (n >= min, format!("input rows ~{n} (inexact, accepted) vs min_rows {min}"), Some(n))
             }
-            Precision::Inexact(n) => (false, format!("input rows ~{n} are an estimate (accept_inexact is off)")),
+            Precision::Inexact(n) => (false, format!("input rows ~{n} are an estimate (accept_inexact is off)"), None),
             Precision::Absent => (
                 self.config.take_when_unknown,
                 format!("input row count unknown (take_when_unknown = {})", self.config.take_when_unknown),
+                None,
             ),
         }
     }
 
     /// `top` is the node under the root's chain of projections (by address): nothing above it
     /// requires a distribution, so a replacement there keeps MetalExec's single output partition.
-    fn visit(&self, node: Arc<dyn ExecutionPlan>, top: usize) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
+    fn visit(&self, plan: u64, node: Arc<dyn ExecutionPlan>, top: usize) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
         if node.downcast_ref::<MetalExec>().is_some() {
             return Ok(Transformed::no(node));
         }
@@ -390,7 +588,7 @@ impl ArrowMetalRule {
         let op = match c.op {
             Ok(op) => op,
             Err(why) => {
-                self.record(&node, false, why);
+                self.record(plan, &node, false, why);
                 return Ok(Transformed::no(node));
             }
         };
@@ -407,7 +605,7 @@ impl ArrowMetalRule {
                 Some(Partitioning::RoundRobinBatch(*n))
             }
             Partitioning::Range(_) => {
-                self.record(&node, false, "range-partitioned output".into());
+                self.record(plan, &node, false, "range-partitioned output".into());
                 return Ok(Transformed::no(node));
             }
         };
@@ -421,13 +619,39 @@ impl ArrowMetalRule {
             let next = Arc::clone(r.input());
             input = next;
         }
-        let (ok, size) = self.size_ok(&input);
+        let (ok, mut size, rows) = self.size_ok(&input);
         if !ok {
-            self.record(&node, false, size);
+            self.record(plan, &node, false, size);
             return Ok(Transformed::no(node));
         }
+        // A replaced aggregate is decided at run time; under `Measured` it is replaced only when
+        // the measured table takes its shape at some group count at this row count.
+        if matches!(op, MetalOp::Aggregate { .. }) && self.config.aggregate_choice == AggregateChoice::Measured {
+            let Some(shape) = crate::choice::shape(&op, input.as_ref()) else {
+                self.record(plan, &node, false, "aggregate without a shape".into());
+                return Ok(Transformed::no(node));
+            };
+            if let Some(n) = self.config.table_rows.or(rows) {
+                match crate::choice::any_bucket(&shape, n as u64) {
+                    Ok(why) => size = format!("{size}; {why}"),
+                    Err(why) => {
+                        self.record(plan, &node, false, format!("{size}; {why}"));
+                        return Ok(Transformed::no(node));
+                    }
+                }
+            }
+        }
         let original = c.original.unwrap_or_else(|| Arc::clone(&node));
-        let metal: Arc<dyn ExecutionPlan> = Arc::new(MetalExec::new(op, input, original, Arc::clone(&self.log)));
+        let metal: Arc<dyn ExecutionPlan> = Arc::new(MetalExec::new(
+            op,
+            input,
+            original,
+            Arc::clone(&self.log),
+            plan,
+            self.config.aggregate_choice,
+            self.config.table_rows,
+            rows,
+        ));
         let mut reason = size;
         if at_top && node.output_partitioning().partition_count() > 1 {
             reason.push_str("; output kept at one partition (only projections above it)");
@@ -447,7 +671,7 @@ impl ArrowMetalRule {
                 Arc::new(RepartitionExec::try_new(metal, p)?)
             }
         };
-        self.record(&node, true, reason);
+        self.record(plan, &node, true, reason);
         Ok(Transformed::yes(out))
     }
 }
@@ -460,7 +684,8 @@ impl PhysicalOptimizerRule for ArrowMetalRule {
             top = next;
         }
         let top = Arc::as_ptr(&top) as *const () as usize;
-        Ok(plan.transform_down(|n| self.visit(n, top))?.data)
+        let id = lock(&self.log).begin_plan();
+        Ok(plan.transform_down(|n| self.visit(id, n, top))?.data)
     }
 
     fn name(&self) -> &str {

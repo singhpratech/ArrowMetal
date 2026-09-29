@@ -10,6 +10,12 @@
 //!   |a - b| <= 1e-9 * max(1, |a|, |b|) (floating-point addition is not associative; the two
 //!   engines add in different orders), any NaN equal to any NaN there (a NaN sum's payload is the
 //!   adder's choice).
+//! * A GROUP BY runs three times with the rule, once per run-time choice of a replaced aggregate:
+//!   forced onto ArrowMetal (`AggregateChoice::ArrowMetal`), forced back to DataFusion
+//!   (`AggregateChoice::DataFusion`: the hand-back over the collected batches), and the default
+//!   (`Measured`: the group-count probe and the measured table, looked up at 50,000,000 rows with
+//!   `table_rows` so the table decides at these small sizes). Sorts and filters run once (forced
+//!   onto ArrowMetal as before).
 //! * The float columns hold both zero signs, ±inf and NaNs: `kf` one NaN bit pattern (so a
 //!   GROUP BY over it runs on the GPU), `kn` (Float64) and `kf32` / `vf32` (Float32) negative NaNs
 //!   and NaN payloads, `vf` positive NaNs with payloads.
@@ -22,7 +28,7 @@ use arrow::datatypes::{DataType, Field, Float32Type, Float64Type, Int32Type, Int
 use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_arrowmetal::{session_context, ArrowMetalConfig, ArrowMetalRule};
+use datafusion_arrowmetal::{session_context, AggregateChoice, ArrowMetalConfig, ArrowMetalRule};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -62,6 +68,8 @@ fn schema() -> SchemaRef {
         Field::new("kn", DataType::Float64, true),
         Field::new("kf32", DataType::Float32, true),
         Field::new("vf32", DataType::Float32, true),
+        Field::new("ksv", DataType::Utf8View, true),
+        Field::new("ksl", DataType::LargeUtf8, true),
     ]))
 }
 
@@ -136,6 +144,11 @@ fn table(n: usize, null_frac: f64, seed: u64) -> RecordBatch {
         Arc::new(arrow::array::Float32Array::from(kf32)),
         Arc::new(arrow::array::Float32Array::from(vf32)),
     ];
+    // `ks` again as Utf8View (DataFusion's Parquet reader's string type) and LargeUtf8.
+    let mut cols = cols;
+    let ks = std::sync::Arc::clone(&cols[3]);
+    cols.push(arrow::compute::cast(&ks, &DataType::Utf8View).unwrap());
+    cols.push(arrow::compute::cast(&ks, &DataType::LargeUtf8).unwrap());
     RecordBatch::try_new(schema(), cols).unwrap()
 }
 
@@ -190,6 +203,7 @@ fn column_values(a: &ArrayRef) -> Vec<V> {
                 DataType::Float32 => V::F32(a.as_primitive::<Float32Type>().value(i).to_bits()),
                 DataType::Utf8 => V::S(a.as_string::<i32>().value(i).to_string()),
                 DataType::Utf8View => V::S(a.as_string_view().value(i).to_string()),
+                DataType::LargeUtf8 => V::S(a.as_string::<i64>().value(i).to_string()),
                 DataType::Boolean => V::B(a.as_boolean().value(i)),
                 t => panic!("value type {t} not handled by the grid"),
             }
@@ -280,10 +294,10 @@ fn relax_order_dependent(r: &mut [Vec<V>], (sum, min, max): (usize, usize, usize
 
 fn queries() -> Vec<Query> {
     let mut q = Vec::new();
-    let cols = ["k32", "k64", "kf", "ks", "v32", "v64", "vf", "vg", "kn", "kf32", "vf32"];
+    let cols = ["k32", "k64", "kf", "ks", "v32", "v64", "vf", "vg", "kn", "kf32", "vf32", "ksv", "ksl"];
     let pos = |c: &str| cols.iter().position(|x| *x == c).unwrap();
     // Single-column ORDER BY, every direction x null placement, with and without LIMIT.
-    for c in ["k32", "k64", "kf", "kn", "kf32", "ks", "v64", "vf", "vf32", "vg"] {
+    for c in ["k32", "k64", "kf", "kn", "kf32", "ks", "ksv", "ksl", "v64", "vf", "vf32", "vg"] {
         for dir in ["ASC", "DESC"] {
             for nulls in ["NULLS FIRST", "NULLS LAST", ""] {
                 for limit in [None, Some(7)] {
@@ -308,6 +322,8 @@ fn queries() -> Vec<Query> {
         ("kf32 DESC NULLS LAST, kn", ""),
         ("vf32 ASC NULLS FIRST, k64 DESC", ""),
         ("kn, vf DESC NULLS FIRST", " LIMIT 40"),
+        ("ksv DESC, k32 NULLS FIRST, v64", ""),
+        ("ksl, kf DESC", " LIMIT 13"),
     ] {
         let key_cols = keys.split(',').map(|k| pos(k.split_whitespace().next().unwrap())).collect();
         q.push(Query {
@@ -342,6 +358,7 @@ fn queries() -> Vec<Query> {
         "SELECT k32, count(ks) FROM t GROUP BY k32",
         "SELECT k32, count(ks), count(vf), sum(vf) FROM t GROUP BY k32",
         "SELECT ks, count(ks), count(k64), max(v64) FROM t GROUP BY ks",
+        "SELECT k32, count(ksv), count(ksl) FROM t GROUP BY k32",
     ] {
         q.push(Query {
             class: sql.to_string(),
@@ -493,6 +510,14 @@ async fn differential_grid() {
     let mut data_dependent: BTreeMap<String, usize> = BTreeMap::new();
     let mut relaxed_cells = 0usize;
 
+    // Per variant: (pairs, pairs with a node on ArrowMetal, run-time choices on ArrowMetal, handed back).
+    let mut per_variant: BTreeMap<&str, [usize; 4]> = BTreeMap::new();
+    let variants = [
+        ("take", AggregateChoice::ArrowMetal, None),
+        ("back", AggregateChoice::DataFusion, None),
+        ("def", AggregateChoice::Measured, Some(50_000_000usize)),
+    ];
+
     let mut seed = 1u64;
     for &n in &sizes {
         for &nf in &null_fracs {
@@ -501,62 +526,98 @@ async fn differential_grid() {
                 let batch = table(n, nf, seed);
                 let cfg = || SessionConfig::new().with_target_partitions(tp).with_batch_size(1024);
                 let plain = SessionContext::new_with_config(cfg());
-                let rule = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, ..ArrowMetalConfig::all() });
-                let metal = session_context(cfg(), rule.clone());
                 plain.register_table("t", mem_table(&batch, parts)).unwrap();
-                metal.register_table("t", mem_table(&batch, parts)).unwrap();
-
+                let mut wants = Vec::with_capacity(queries.len());
                 for q in &queries {
-                    pairs += 1;
-                    let label = format!("[n={n} nulls={nf} parts={parts} tp={tp}] {}", q.sql);
-                    let want = plain.sql(&q.sql).await.unwrap().collect().await.unwrap();
-                    rule.clear_report();
-                    let got = match metal.sql(&q.sql).await.unwrap().collect().await {
-                        Ok(b) => b,
-                        Err(e) => {
-                            failures.push(format!("{label}: error with the rule: {e}"));
-                            *per_class_fail.entry(q.class.clone()).or_default() += 1;
+                    wants.push(plain.sql(&q.sql).await.unwrap().collect().await.unwrap());
+                }
+
+                for &(variant, choice, table_rows) in &variants {
+                    let rule = ArrowMetalRule::new(ArrowMetalConfig::all().with_min_rows(0).with_aggregate_choice(choice).with_table_rows(table_rows));
+                    let metal = session_context(cfg(), rule.clone());
+                    metal.register_table("t", mem_table(&batch, parts)).unwrap();
+                    for (q, want) in queries.iter().zip(&wants) {
+                        let aggregate = q.sql.contains("GROUP BY");
+                        if variant != "take" && !aggregate {
                             continue;
                         }
-                    };
-                    let report = rule.report();
-                    let taken = report.taken().count();
-                    nodes_taken += taken;
-                    if taken > 0 {
-                        pairs_taken += 1;
-                    }
-                    for d in report.left() {
-                        let reason = d.reason.split(" (exact)").next().unwrap().to_string();
-                        let key = format!("{} :: {}", d.node.split(':').next().unwrap(), reason);
-                        *left_reasons.entry(key).or_default() += 1;
-                    }
-                    for d in report.runtime_fallbacks() {
-                        if d.is_data_dependent() {
-                            *data_dependent.entry(d.reason.clone()).or_default() += 1;
-                        } else {
-                            fallbacks.push(format!("{label}: {}", d.reason));
+                        pairs += 1;
+                        let pv = per_variant.entry(variant).or_default();
+                        pv[0] += 1;
+                        let label = format!("[{variant} n={n} nulls={nf} parts={parts} tp={tp}] {}", q.sql);
+                        rule.clear_report();
+                        let got = match metal.sql(&q.sql).await.unwrap().collect().await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                failures.push(format!("{label}: error with the rule: {e}"));
+                                *per_class_fail.entry(q.class.clone()).or_default() += 1;
+                                continue;
+                            }
+                        };
+                        let report = rule.report();
+                        let taken = report.taken().count();
+                        nodes_taken += taken;
+                        let on_gpu = report.runtime_choices().filter(|d| d.taken).count();
+                        let back = report.runtime_choices().filter(|d| !d.taken).count();
+                        pv[2] += on_gpu;
+                        pv[3] += back;
+                        if taken > 0 {
+                            pairs_taken += 1;
+                            pv[1] += 1;
                         }
-                    }
-                    let (mut w, mut g) = (rows(&want), rows(&got));
-                    if let (Some(cols), true) = (q.float_min_max, tp > 1) {
-                        relaxed_cells += relax_order_dependent(&mut w, cols);
-                        relax_order_dependent(&mut g, cols);
-                    }
-                    if let Kind::Unordered { tol_cols } = &q.kind {
-                        if w.len() == g.len() {
-                            max_dev = max_dev.max(max_float_dev(&w, &g, tol_cols));
+                        if choice == AggregateChoice::ArrowMetal && back > 0 {
+                            failures.push(format!("{label}: a forced ArrowMetal aggregate was handed back"));
                         }
-                    }
-                    if let Err(msg) = compare(&q.kind, &w, &g) {
-                        failures.push(format!("{label}: {msg}"));
-                        *per_class_fail.entry(q.class.clone()).or_default() += 1;
+                        if choice == AggregateChoice::DataFusion && on_gpu > 0 {
+                            failures.push(format!("{label}: a forced hand-back ran on ArrowMetal"));
+                        }
+                        for d in report.left() {
+                            let reason = d.reason.split(" (exact)").next().unwrap().to_string();
+                            let key = format!("{variant} {} :: {}", d.node.split(':').next().unwrap(), reason);
+                            *left_reasons.entry(key).or_default() += 1;
+                        }
+                        for d in report.runtime_fallbacks() {
+                            if d.is_data_dependent() {
+                                *data_dependent.entry(d.reason.clone()).or_default() += 1;
+                            } else {
+                                fallbacks.push(format!("{label}: {}", d.reason));
+                            }
+                        }
+                        for d in report.runtime_choices() {
+                            if variant == "def" {
+                                let est = d.groups.as_ref().and_then(|g| g.estimate).map(|e| e.estimate);
+                                let key = format!(
+                                    "def run-time choice: {} (estimate {})",
+                                    if d.taken { "ArrowMetal" } else { "handed back" },
+                                    est.map(|e| if e <= 1414 { "in the 200 bucket".to_string() } else { format!("{e}") }).unwrap_or_default()
+                                );
+                                *left_reasons.entry(key).or_default() += 1;
+                            }
+                        }
+                        let (mut w, mut g) = (rows(want), rows(&got));
+                        if let (Some(cols), true) = (q.float_min_max, tp > 1) {
+                            relaxed_cells += relax_order_dependent(&mut w, cols);
+                            relax_order_dependent(&mut g, cols);
+                        }
+                        if let Kind::Unordered { tol_cols } = &q.kind {
+                            if w.len() == g.len() {
+                                max_dev = max_dev.max(max_float_dev(&w, &g, tol_cols));
+                            }
+                        }
+                        if let Err(msg) = compare(&q.kind, &w, &g) {
+                            failures.push(format!("{label}: {msg}"));
+                            *per_class_fail.entry(q.class.clone()).or_default() += 1;
+                        }
                     }
                 }
             }
         }
     }
 
-    println!("grid: {pairs} query pairs, {pairs_taken} with at least one node on ArrowMetal, {nodes_taken} nodes taken");
+    println!("grid: {pairs} query pairs, {pairs_taken} with at least one node replaced, {nodes_taken} nodes replaced");
+    for (v, [p, t, g, b]) in &per_variant {
+        println!("  variant {v}: {p} pairs, {t} with a node replaced, run-time choices: {g} on ArrowMetal, {b} handed back");
+    }
     println!("largest relative deviation in a toleranced float column: {max_dev:e}");
     println!("left (node :: reason -> count):");
     for (k, v) in &left_reasons {

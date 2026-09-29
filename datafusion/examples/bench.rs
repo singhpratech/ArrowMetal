@@ -40,6 +40,21 @@
 //! * Before each block (one family at one size and layout): wait until the 1-minute load is below
 //!   `--max-load` and no cargo / rustc / swift-build / swift-frontend / swiftc / pytest runs,
 //!   checking every 20 s. The load at the start and end of each block goes in every row.
+//!   With `--lock-dir <dir>`, also wait while `<dir>/BUILDING` exists (another process compiles or
+//!   runs tests) and hold `<dir>/TIMING` for the block. Each row records the block's start and end
+//!   time and the last `Sleep` entry of `pmset -g log` at its end, so a block that spans a sleep
+//!   can be found and rerun.
+//! * Contexts (`--contexts`, default `off,on`): `off` DataFusion alone (always timed, the
+//!   reference); `on` the rule taking every node it can translate, a replaced aggregate forced onto
+//!   ArrowMetal (`AggregateChoice::ArrowMetal`); `back` the same with every replaced aggregate
+//!   handed back to DataFusion at run time (`AggregateChoice::DataFusion`: the cost of the
+//!   hand-back itself); `def` the default config, timed (the group-count probe and the measured
+//!   table decide). Each context's first run is compared with `off`'s and its time is recorded as
+//!   `<ctx>_first_ms` (the GPU idle before it: the previous context ran on the CPU).
+//! * `--families gsweep`: the aggregate sweep. One block per group count (200, 10k, 100k, 1M,
+//!   rows/2 in the key domain); per block, count / sum / avg / min+max over a Float64 and an int64
+//!   value column, and DISTINCT, each over one key and over two keys, int32 and int64 keys.
+//!   `out_rows` is the group count the data holds.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -53,7 +68,7 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig};
-use datafusion_arrowmetal::{session_context, ArrowMetalConfig, ArrowMetalRule, MetalExec};
+use datafusion_arrowmetal::{session_context, AggregateChoice, ArrowMetalConfig, ArrowMetalRule, MetalExec};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -78,6 +93,8 @@ struct Args {
     codecs: Vec<String>,
     /// Print each case's physical plan (off and on) and skip the timing.
     explain: bool,
+    contexts: Vec<String>,
+    lock_dir: Option<String>,
 }
 
 fn args() -> Args {
@@ -95,6 +112,8 @@ fn args() -> Args {
         parquet_rows: vec![10_000_000, 50_000_000],
         codecs: vec!["snappy".into(), "zstd".into()],
         explain: false,
+        contexts: vec!["off".into(), "on".into()],
+        lock_dir: None,
     };
     let v: Vec<String> = std::env::args().skip(1).collect();
     let list = |s: &str| s.split(',').filter(|x| !x.is_empty()).map(String::from).collect::<Vec<_>>();
@@ -115,6 +134,8 @@ fn args() -> Args {
             "--parquet-dir" => a.parquet_dir = Some(val),
             "--parquet-rows" => a.parquet_rows = nums(&val),
             "--codecs" => a.codecs = list(&val),
+            "--contexts" => a.contexts = list(&val),
+            "--lock-dir" => a.lock_dir = Some(val),
             "--explain" => {
                 a.explain = true;
                 i += 1;
@@ -132,6 +153,7 @@ fn args() -> Args {
 
 fn load1() -> f64 {
     let mut l = [0f64; 3];
+    // SAFETY: `l` holds the 3 doubles getloadavg writes at most.
     unsafe { libc::getloadavg(l.as_mut_ptr(), 3) };
     l[0]
 }
@@ -169,8 +191,74 @@ fn wait_quiet(max_load: f64, what: &str) -> f64 {
     }
 }
 
+fn sh(cmd: &str) -> String {
+    std::process::Command::new("sh")
+        .args(["-c", cmd])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+fn now_text() -> String {
+    sh("date '+%Y-%m-%d %H:%M:%S'")
+}
+
+/// The timestamp of the last `Sleep` entry in `pmset -g log`.
+fn last_sleep() -> String {
+    let l = sh("pmset -g log | grep ' Sleep  ' | tail -1");
+    l.split_whitespace().take(2).collect::<Vec<_>>().join(" ")
+}
+
+/// Holds `<dir>/TIMING` for one block; removed on drop.
+struct TimingLock(Option<std::path::PathBuf>);
+
+impl Drop for TimingLock {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            if std::fs::read_to_string(p).map(|s| s.starts_with("g1 ")).unwrap_or(false) {
+                std::fs::remove_file(p).ok();
+            }
+        }
+    }
+}
+
+/// Waits for a quiet machine (and, with a lock dir, for no BUILDING and no one else's TIMING), then
+/// takes TIMING. Returns the load at the start and the lock.
+fn acquire(a: &Args, what: &str) -> (f64, TimingLock) {
+    loop {
+        if let Some(d) = &a.lock_dir {
+            let d = std::path::Path::new(d);
+            let mut waited = 0;
+            loop {
+                let building = d.join("BUILDING").exists();
+                let other = std::fs::read_to_string(d.join("TIMING")).map(|s| !s.starts_with("g1 ")).unwrap_or(false);
+                if !building && !other {
+                    break;
+                }
+                if waited % 120 == 0 {
+                    println!("  [waiting before {what}: BUILDING {building}, other TIMING {other}]");
+                }
+                std::thread::sleep(Duration::from_secs(10));
+                waited += 10;
+            }
+        }
+        let l = wait_quiet(a.max_load, what);
+        let Some(d) = &a.lock_dir else { return (l, TimingLock(None)) };
+        let d = std::path::Path::new(d);
+        let t = d.join("TIMING");
+        std::fs::write(&t, format!("g1 {}\n", std::process::id())).unwrap();
+        if d.join("BUILDING").exists() {
+            std::fs::remove_file(&t).ok();
+            continue;
+        }
+        return (l, TimingLock(Some(t)));
+    }
+}
+
 fn cpu_s() -> f64 {
+    // SAFETY: `rusage` is plain integers and timevals, for which all-zero bytes are a valid value.
     let mut r: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `r` is a valid, writable rusage for getrusage to fill.
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut r) };
     let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 * 1e-6;
     tv(r.ru_utime) + tv(r.ru_stime)
@@ -236,6 +324,55 @@ fn data_grid(rng: &mut StdRng, n: usize, g: usize) -> RecordBatch {
     batch(vec![("k", k), ("k1", k1), ("k2", k2), ("x", x)])
 }
 
+/// The aggregate sweep's table: `data_grid`'s int32 keys, the same keys as int64 (`kl`, `kl1`,
+/// `kl2`), a Float64 value `x` [0, 1) and an int64 value `q` [0, 1e9).
+fn data_sweep(rng: &mut StdRng, n: usize, g: usize) -> RecordBatch {
+    let t = data_grid(rng, n, g);
+    let q = i64s(rng, n, 1_000_000_000);
+    let wide = |i: usize| cast(t.column(i), &DataType::Int64).unwrap();
+    batch(vec![
+        ("k", Arc::clone(t.column(0))),
+        ("k1", Arc::clone(t.column(1))),
+        ("k2", Arc::clone(t.column(2))),
+        ("kl", wide(0)),
+        ("kl1", wide(1)),
+        ("kl2", wide(2)),
+        ("x", Arc::clone(t.column(3))),
+        ("q", q),
+    ])
+}
+
+/// The sweep's cases for one group count: (id, label, SQL).
+fn sweep_cases(gn: &str) -> Vec<Case> {
+    let mut out = Vec::new();
+    for (kc, one, two) in [("i32", "k", "k1, k2"), ("i64", "kl", "kl1, kl2")] {
+        for (nk, keys) in [("1", one), ("2", two)] {
+            for (fam, agg) in [
+                ("count", Some("count(*) AS n")),
+                ("sum_f64", Some("sum(x) AS s")),
+                ("avg_f64", Some("avg(x) AS m")),
+                ("minmax_f64", Some("min(x) AS lo, max(x) AS hi")),
+                ("sum_int", Some("sum(q) AS s")),
+                ("avg_int", Some("avg(q) AS m")),
+                ("minmax_int", Some("min(q) AS lo, max(q) AS hi")),
+                ("distinct", None),
+            ] {
+                let sql = match agg {
+                    Some(agg) => format!("SELECT {keys}, {agg} FROM grid GROUP BY {keys}"),
+                    None => format!("SELECT DISTINCT {keys} FROM grid"),
+                };
+                out.push(case(
+                    &format!("{fam}_{nk}{kc}_{gn}"),
+                    &format!("{fam}, {nk} {kc} key(s), {gn} groups in the key domain"),
+                    &sql,
+                    Order::Any,
+                ));
+            }
+        }
+    }
+    out
+}
+
 // -------------------------------------------------------------------------------------------------
 // cases
 
@@ -283,9 +420,12 @@ fn gname(g: usize, rows: usize) -> String {
     }
 }
 
+/// Builds one block's tables and cases (run when the block's turn comes).
+type BlockFn = Box<dyn FnOnce(&mut StdRng) -> Block>;
+
 /// The blocks of one size, generated lazily (only one block's tables alive at a time).
-fn blocks(rows: usize, fam: &str, rng: &mut StdRng) -> Vec<Box<dyn FnOnce(&mut StdRng) -> Block>> {
-    let mut out: Vec<Box<dyn FnOnce(&mut StdRng) -> Block>> = Vec::new();
+fn blocks(rows: usize, fam: &str, rng: &mut StdRng) -> Vec<BlockFn> {
+    let mut out: Vec<BlockFn> = Vec::new();
     match fam {
         "sort" => out.push(Box::new(move |rng| Block {
             family: "sort",
@@ -390,6 +530,16 @@ fn blocks(rows: usize, fam: &str, rng: &mut StdRng) -> Vec<Box<dyn FnOnce(&mut S
                 }));
             }
         }
+        "gsweep" => {
+            let mut gs = vec![200usize, 10_000, 100_000, 1_000_000, rows / 2];
+            gs.dedup();
+            for g in gs {
+                out.push(Box::new(move |rng| {
+                    let gn = gname(g, rows);
+                    Block { family: "gsweep", source: Source::Mem(vec![("grid", data_sweep(rng, rows, g))]), cases: sweep_cases(&gn) }
+                }));
+            }
+        }
         "distinct" => out.push(Box::new(move |rng| Block {
             family: "distinct",
             source: Source::Mem(vec![("fact", data_fact(rng, rows))]),
@@ -478,8 +628,17 @@ struct Run {
     metal: BTreeMap<&'static str, f64>,
 }
 
-const METRICS: &[&str] =
-    &["input_time", "concat_time", "import_time", "kernel_time", "export_time", "input_batches"];
+const METRICS: &[&str] = &[
+    "input_time",
+    "concat_time",
+    "import_time",
+    "kernel_time",
+    "export_time",
+    "input_batches",
+    "probe_time",
+    "handed_back",
+    "groups_estimate",
+];
 
 fn metal_metrics(plan: &Arc<dyn ExecutionPlan>, acc: &mut BTreeMap<&'static str, f64>) {
     if let Some(m) = plan.downcast_ref::<MetalExec>() {
@@ -487,7 +646,7 @@ fn metal_metrics(plan: &Arc<dyn ExecutionPlan>, acc: &mut BTreeMap<&'static str,
         if let Some(ms) = m.metrics() {
             for &k in METRICS {
                 if let Some(v) = ms.sum_by_name(k) {
-                    let scale = if k == "input_batches" { 1.0 } else { 1e-6 };
+                    let scale = if matches!(k, "input_batches" | "handed_back" | "groups_estimate") { 1.0 } else { 1e-6 };
                     *acc.entry(k).or_default() += v.as_usize() as f64 * scale;
                 }
             }
@@ -671,9 +830,41 @@ fn csv(s: &str) -> String {
 
 // -------------------------------------------------------------------------------------------------
 
+/// One timed context of a case.
+struct Ctx {
+    name: String,
+    ctx: SessionContext,
+    rule: Option<ArrowMetalRule>,
+}
+
+/// One context's result for one case.
+struct Res {
+    best: Run,
+    iters: usize,
+    untimed: usize,
+    first_ms: f64,
+    equal: String,
+    dev: f64,
+    taken: usize,
+    decisions: String,
+    fallbacks: usize,
+}
+
+fn rule_for(name: &str) -> Option<ArrowMetalRule> {
+    let all = ArrowMetalConfig::all().with_min_rows(0).with_accept_inexact(true);
+    match name {
+        "off" => None,
+        "on" => Some(ArrowMetalRule::new(all.clone().with_aggregate_choice(AggregateChoice::ArrowMetal))),
+        "back" => Some(ArrowMetalRule::new(all.clone().with_aggregate_choice(AggregateChoice::DataFusion))),
+        "def" => Some(ArrowMetalRule::new(ArrowMetalConfig::default())),
+        c => panic!("unknown context {c}"),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let a = args();
+    assert_eq!(a.contexts.first().map(String::as_str), Some("off"), "--contexts must start with off");
     if let Some(dir) = std::path::Path::new(&a.out).parent() {
         std::fs::create_dir_all(dir).ok();
     }
@@ -686,28 +877,63 @@ async fn main() {
             "size,layout,family,case,label,sql,off_ms,on_ms,ratio,off_cpu_ms,on_cpu_ms,iters_off,iters_on,\
              equal,max_rel_dev,nodes_taken,rule_on,rule_default,runtime_fallbacks,metal_nodes,input_ms,concat_ms,\
              import_ms,kernel_ms,export_ms,input_batches,out_rows,block_load_start,block_load_end,warm_ms,untimed_off,\
-             untimed_on,on_first_ms"
+             untimed_on,on_first_ms,back_ms,back_cpu_ms,back_first_ms,equal_back,def_ms,def_cpu_ms,def_first_ms,\
+             equal_def,def_taken,def_handed_back,def_groups_est,def_probe_ms,def_input_ms,def_kernel_ms,def_choice,\
+             off_first_ms,block_t0,block_t1,last_sleep"
         )
         .unwrap();
     }
     let parts = SessionConfig::new().target_partitions();
     println!(
-        "target_partitions {parts}; iters {}; slow {} s; warm {} ms; max load {}",
-        a.iters, a.slow_s, a.warm_ms, a.max_load
+        "target_partitions {parts}; iters {}; slow {} s; warm {} ms; max load {}; contexts {:?}",
+        a.iters, a.slow_s, a.warm_ms, a.max_load, a.contexts
     );
 
     // (size, layout, family, block builder)
-    let mut work: Vec<(usize, String, Box<dyn FnOnce(&mut StdRng) -> Block>)> = Vec::new();
+    let mut work: Vec<(usize, String, BlockFn)> = Vec::new();
     for &rows in &a.sizes {
         for mode in &a.modes {
             for fam in &a.families {
-                if fam == "parquet" {
+                if fam == "parquet" || fam == "psort" {
                     continue;
                 }
                 let mut dummy = StdRng::seed_from_u64(0);
                 for b in blocks(rows, fam, &mut dummy) {
                     work.push((rows, mode.clone(), b));
                 }
+            }
+        }
+        // A Parquet file with a String column, written on first use: DataFusion reads its strings as
+        // Utf8View, so the sorts carry (or sort by) a Utf8View column.
+        if a.families.iter().any(|f| f == "psort") {
+            if let Some(dir) = &a.parquet_dir {
+                let path = format!("{dir}/psort-{rows}.parquet");
+                work.push((
+                    rows,
+                    "parquet-psort".to_string(),
+                    Box::new(move |rng| {
+                        if !std::path::Path::new(&path).exists() {
+                            let b = data_extra(rng, rows);
+                            let f = std::fs::File::create(&path).unwrap();
+                            let mut w = datafusion::parquet::arrow::ArrowWriter::try_new(f, b.schema(), None).unwrap();
+                            let mut off = 0;
+                            while off < rows {
+                                let n = (1usize << 20).min(rows - off);
+                                w.write(&b.slice(off, n)).unwrap();
+                                off += n;
+                            }
+                            w.close().unwrap();
+                        }
+                        Block {
+                            family: "psort",
+                            source: Source::Parquet(path),
+                            cases: vec![
+                                case("ps_str", "Parquet scan, sort 3 columns by a String key (Utf8View)", "SELECT name, q, k1 FROM f ORDER BY name", Order::Keys(vec![0])),
+                                case("ps_i64_str", "Parquet scan, sort by int64, a String column carried", "SELECT q, name, k1 FROM f ORDER BY q", Order::Keys(vec![0])),
+                            ],
+                        }
+                    }),
+                ));
             }
         }
         if a.families.iter().any(|f| f == "parquet") && a.parquet_rows.contains(&rows) {
@@ -739,14 +965,18 @@ async fn main() {
             continue;
         }
         println!("== {} rows, {}, {} ({} cases; data {:.1} s)", rows, mode, block.family, cases.len(), t.elapsed().as_secs_f64());
-        let l0 = wait_quiet(a.max_load, &format!("{} {rows} {mode}", block.family));
-        println!("  [load {l0:.2} at block start]");
         let mem_mode = if mode.starts_with("parquet") { "b8192" } else { mode.as_str() };
-        let rule_on = ArrowMetalRule::new(ArrowMetalConfig { min_rows: 0, accept_inexact: true, ..ArrowMetalConfig::all() });
         let rule_def = ArrowMetalRule::new(ArrowMetalConfig::default());
-        let ctx_off = context(&block.source, mem_mode, None).await;
-        let ctx_on = context(&block.source, mem_mode, Some(rule_on.clone())).await;
         let ctx_def = context(&block.source, mem_mode, Some(rule_def.clone())).await;
+        let mut ctxs = Vec::new();
+        for name in &a.contexts {
+            let rule = rule_for(name);
+            let ctx = context(&block.source, mem_mode, rule.clone()).await;
+            ctxs.push(Ctx { name: name.clone(), ctx, rule });
+        }
+        let (l0, lock) = acquire(&a, &format!("{} {rows} {mode}", block.family));
+        let t0 = now_text();
+        println!("  [load {l0:.2} at block start, {t0}]");
         let mut rows_out = Vec::new();
         for c in cases {
             // Decisions under the default config (planned, not run).
@@ -755,69 +985,152 @@ async fn main() {
             let (_, def_s) = decisions(&rule_def);
 
             if a.explain {
-                for (tag, ctx) in [("off", &ctx_off), ("on", &ctx_on)] {
-                    let plan = ctx.sql(&c.sql).await.unwrap().create_physical_plan().await.unwrap();
+                for x in &ctxs {
+                    let plan = x.ctx.sql(&c.sql).await.unwrap().create_physical_plan().await.unwrap();
                     let shown = datafusion::physical_plan::displayable(plan.as_ref()).indent(false).to_string();
-                    println!("--- {} {tag}\n{shown}", c.id);
+                    println!("--- {} {}\n{shown}", c.id, x.name);
                 }
                 println!("    default: {def_s}");
                 continue;
             }
-            let off0 = run(&ctx_off, &c.sql).await;
-            rule_on.clear_report();
-            let on0 = run(&ctx_on, &c.sql).await;
-            let (taken, on_s) = decisions(&rule_on);
-            let (equal, dev) = match same(&off0.out, &on0.out, &c.order) {
-                Ok(d) => ("yes".to_string(), d),
-                Err(e) => {
-                    println!("  !! {} {}: results differ: {e}", c.id, rows);
-                    (format!("NO: {e}"), f64::NAN)
+            // First runs, in context order: each compared with off's.
+            let mut firsts: Vec<(Run, usize, String, usize)> = Vec::new();
+            for x in &ctxs {
+                if let Some(r) = &x.rule {
+                    r.clear_report();
                 }
-            };
-            let out_rows: usize = off0.out.iter().map(|b| b.num_rows()).sum();
-            let (off_first, on_first) = (off0.wall, on0.wall);
-            drop(off0);
-            drop(on0);
-            let (off, n_off, u_off) = best(&ctx_off, &c.sql, off_first, &a).await;
-            rule_on.clear_report();
-            let (on, n_on, u_on) = best(&ctx_on, &c.sql, on_first, &a).await;
-            let fallbacks = rule_on.report().runtime_fallbacks().count();
-            let m = |k: &str| on.metal.get(k).copied().unwrap_or(0.0);
-            let ratio = off.wall / on.wall;
-            let mark = if taken == 0 { "  (rule took nothing)" } else { "" };
-            println!(
-                "  {:14} off {:9.1} ms  on {:9.1} ms  {:6.2}x  cpu {:8.0}/{:8.0}  concat {:6.1} import {:6.1} kernel {:7.1}{}",
-                c.id, off.wall, on.wall, ratio, off.cpu, on.cpu, m("concat_time"), m("import_time"), m("kernel_time"), mark
-            );
-            let tail = format!("{},{u_off},{u_on},{on_first:.2}", a.warm_ms);
-            rows_out.push((format!(
-                "{rows},{mode},{},{},{},{},{:.2},{:.2},{:.3},{:.1},{:.1},{n_off},{n_on},{},{:.3e},{taken},{},{},{fallbacks},{},{:.2},{:.2},{:.2},{:.2},{:.2},{},{out_rows}",
+                let r = run(&x.ctx, &c.sql).await;
+                let (taken, s, fb) = match &x.rule {
+                    Some(rule) => {
+                        let (t, s) = decisions(rule);
+                        (t, s, rule.report().runtime_fallbacks().count())
+                    }
+                    None => (0, String::new(), 0),
+                };
+                firsts.push((r, taken, s, fb));
+            }
+            let out_rows: usize = firsts[0].0.out.iter().map(|b| b.num_rows()).sum();
+            let mut res: Vec<Res> = Vec::new();
+            for (i, x) in ctxs.iter().enumerate() {
+                let (equal, dev) = if i == 0 {
+                    ("yes".to_string(), 0.0)
+                } else {
+                    match same(&firsts[0].0.out, &firsts[i].0.out, &c.order) {
+                        Ok(d) => ("yes".to_string(), d),
+                        Err(e) => {
+                            println!("  !! {} {} {}: results differ: {e}", c.id, rows, x.name);
+                            (format!("NO: {e}"), f64::NAN)
+                        }
+                    }
+                };
+                let first_ms = firsts[i].0.wall;
+                let (_, taken, ref s, fb) = firsts[i];
+                res.push(Res {
+                    best: Run { out: Vec::new(), wall: first_ms, cpu: 0.0, metal: BTreeMap::new() },
+                    iters: 0,
+                    untimed: 0,
+                    first_ms,
+                    equal,
+                    dev,
+                    taken,
+                    decisions: s.clone(),
+                    fallbacks: fb,
+                });
+            }
+            drop(firsts);
+            for (i, x) in ctxs.iter().enumerate() {
+                if let Some(r) = &x.rule {
+                    r.clear_report();
+                }
+                let (b, n, u) = best(&x.ctx, &c.sql, res[i].first_ms, &a).await;
+                if let Some(r) = &x.rule {
+                    res[i].fallbacks = res[i].fallbacks.max(r.report().runtime_fallbacks().count());
+                }
+                res[i].best = b;
+                res[i].iters = n;
+                res[i].untimed = u;
+            }
+            let by = |n: &str| ctxs.iter().position(|x| x.name == n).map(|i| &res[i]);
+            let off = &res[0];
+            let on = by("on");
+            let back = by("back");
+            let def = by("def");
+            let f = |r: Option<&Res>, g: &dyn Fn(&Res) -> String| r.map(g).unwrap_or_default();
+            let mm = |r: &Res, k: &str| r.best.metal.get(k).copied().unwrap_or(0.0);
+            let ms = |r: Option<&Res>| f(r, &|r| format!("{:.2}", r.best.wall));
+            let cpu = |r: Option<&Res>| f(r, &|r| format!("{:.1}", r.best.cpu));
+            let first = |r: Option<&Res>| f(r, &|r| format!("{:.2}", r.first_ms));
+            let eq = |r: Option<&Res>| f(r, &|r| csv(&r.equal));
+            let ratio = |r: Option<&Res>| f(r, &|r| format!("{:.3}", off.best.wall / r.best.wall));
+            print!("  {:22} off {:8.1}", c.id, off.best.wall);
+            for (name, r) in [("on", on), ("back", back), ("def", def)] {
+                if let Some(r) = r {
+                    print!("  {name} {:8.1} {:5.2}x", r.best.wall, off.best.wall / r.best.wall);
+                }
+            }
+            if let Some(d) = def {
+                print!("  [def: {} probe {:.3} ms]", if mm(d, "handed_back") > 0.0 { "handed back" } else if mm(d, "nodes") > 0.0 { "gpu" } else { "left" }, mm(d, "probe_time"));
+            }
+            println!();
+            let equal_all = res.iter().skip(1).map(|r| r.equal.clone()).find(|e| e != "yes").unwrap_or_else(|| "yes".into());
+            let dev = res.iter().skip(1).map(|r| r.dev).fold(0.0f64, |x, y| if y.is_nan() { f64::NAN } else { x.max(y) });
+            let tail = format!("{},{},{},{}", a.warm_ms, off.untimed, f(on, &|r| r.untimed.to_string()), first(on));
+            let onr = on.unwrap_or(off);
+            let row = format!(
+                "{rows},{mode},{},{},{},{},{:.2},{},{},{:.1},{},{},{},{},{:.3e},{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{},{out_rows}",
                 block.family,
                 c.id,
                 csv(&c.label),
                 csv(&c.sql),
-                off.wall,
-                on.wall,
-                ratio,
-                off.cpu,
-                on.cpu,
-                csv(&equal),
+                off.best.wall,
+                ms(on),
+                ratio(on),
+                off.best.cpu,
+                cpu(on),
+                off.iters,
+                f(on, &|r| r.iters.to_string()),
+                csv(&equal_all),
                 dev,
-                csv(&on_s),
+                f(on, &|r| r.taken.to_string()),
+                f(on, &|r| csv(&r.decisions)),
                 csv(&def_s),
-                m("nodes"),
-                m("input_time"),
-                m("concat_time"),
-                m("import_time"),
-                m("kernel_time"),
-                m("export_time"),
-                m("input_batches"),
-            ), tail));
+                f(on, &|r| r.fallbacks.to_string()),
+                mm(onr, "nodes"),
+                mm(onr, "input_time"),
+                mm(onr, "concat_time"),
+                mm(onr, "import_time"),
+                mm(onr, "kernel_time"),
+                mm(onr, "export_time"),
+                mm(onr, "input_batches"),
+            );
+            let extra = format!(
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.2}",
+                ms(back),
+                cpu(back),
+                first(back),
+                eq(back),
+                ms(def),
+                cpu(def),
+                first(def),
+                eq(def),
+                f(def, &|r| r.taken.to_string()),
+                f(def, &|r| format!("{}", mm(r, "handed_back"))),
+                f(def, &|r| format!("{}", mm(r, "groups_estimate"))),
+                f(def, &|r| format!("{:.4}", mm(r, "probe_time"))),
+                f(def, &|r| format!("{:.2}", mm(r, "input_time"))),
+                f(def, &|r| format!("{:.2}", mm(r, "kernel_time"))),
+                f(def, &|r| csv(&r.decisions)),
+                off.first_ms,
+            );
+            rows_out.push((row, tail, extra));
         }
         let l1 = load1();
-        println!("  [load {l1:.2} at block end]");
-        for (r, tail) in rows_out {
-            writeln!(out, "{r},{l0:.2},{l1:.2},{tail}").unwrap();
+        let t1 = now_text();
+        drop(lock);
+        let sleep = last_sleep();
+        println!("  [load {l1:.2} at block end, {t1}; last sleep {sleep}]");
+        for (r, tail, extra) in rows_out {
+            writeln!(out, "{r},{l0:.2},{l1:.2},{tail},{extra},{t0},{t1},{sleep}").unwrap();
         }
         out.flush().unwrap();
     }

@@ -1,20 +1,25 @@
 //! ArrowMetal inside Apache DataFusion: a physical optimizer rule and a custom `ExecutionPlan`.
 //!
-//! **Spike.** [`ArrowMetalRule`] walks DataFusion's optimized physical plan and replaces the nodes
-//! ArrowMetal can run with the same answer — `SortExec` (with or without `fetch`), a hash
-//! `AggregateExec` over column keys with `sum`/`min`/`max`/`count`/`avg`, and a `FilterExec` whose
-//! predicate translates — by a [`MetalExec`]. `MetalExec` collects its input's partitions, runs the
-//! operation through ArrowMetal's plan runner on the GPU, and emits `RecordBatch`es with the schema
-//! DataFusion expects. Anything it does not support is left unchanged, and the reason is recorded in
-//! the rule's [`Report`].
+//! [`ArrowMetalRule`] walks DataFusion's optimized physical plan and replaces the nodes ArrowMetal
+//! can run with the same answer by a [`MetalExec`]: `SortExec` (with or without `fetch`), a hash
+//! `AggregateExec` over column keys with `sum`/`min`/`max`/`count`/`avg` or none (DISTINCT),
+//! and a `FilterExec` whose predicate translates. `MetalExec` collects its input's partitions, runs
+//! the operation through ArrowMetal's plan runner on the GPU, and emits `RecordBatch`es with the
+//! schema DataFusion expects. Anything it does not support is left unchanged, and the reason is
+//! recorded in the rule's [`Report`].
+//!
+//! The default config ([`ArrowMetalConfig::default`]) takes full sorts from 250,000 input rows and
+//! aggregates where the measured table (`src/agg_table.rs`) takes their shape: a replaced aggregate
+//! estimates its group count from a sample of its keys when it runs and either runs on ArrowMetal
+//! or hands the node back to DataFusion's own operators ([`AggregateChoice`]). Top-k and filters
+//! are left.
 //!
 //! ```no_run
 //! # async fn f() -> datafusion::error::Result<()> {
 //! use datafusion::prelude::*;
 //! use datafusion_arrowmetal::{session_context, ArrowMetalConfig, ArrowMetalRule};
 //!
-//! // The measured take-list (full sorts from 250,000 rows); `ArrowMetalConfig::all()` takes
-//! // every shape the rule can translate.
+//! // The measured take-list; `ArrowMetalConfig::all()` takes every shape the rule can translate.
 //! let rule = ArrowMetalRule::new(ArrowMetalConfig::default());
 //! let ctx = session_context(SessionConfig::new(), rule.clone());
 //! // register tables, run SQL ...
@@ -22,13 +27,19 @@
 //! # Ok(()) }
 //! ```
 
+#![warn(missing_docs)]
+
+mod agg_table;
+mod choice;
 mod exec;
 mod gpu;
+mod probe;
 mod rule;
 mod translate;
 
-pub use exec::{MetalExec, MetalOp};
-pub use rule::{ArrowMetalConfig, ArrowMetalRule, Decision, Report};
+pub use exec::{AggKind, AggSpec, MetalExec, MetalOp, SortKey};
+pub use probe::GroupEstimate;
+pub use rule::{AggregateChoice, ArrowMetalConfig, ArrowMetalRule, Decision, GroupChoice, Report};
 
 use std::sync::Arc;
 

@@ -40,7 +40,7 @@ pub(crate) fn is_float(t: &DataType) -> bool {
 /// Column types a `MetalExec` will carry through a sort or filter (imported, `take`n, exported).
 /// A whitelist: only what the differential grid covers, so everything else fails closed.
 fn carried(t: &DataType) -> bool {
-    is_int(t) || is_float(t) || matches!(t, DataType::Utf8 | DataType::Boolean)
+    is_int(t) || is_float(t) || matches!(t, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 | DataType::Boolean)
 }
 
 fn column_of(e: &Arc<dyn PhysicalExpr>) -> Option<&Column> {
@@ -74,7 +74,7 @@ pub(crate) fn sort_op(
         let t = input_schema.field(c.index()).data_type();
         // Float keys sort by IEEE 754 totalOrder in the core (the plan key's `float_order`), the
         // order arrow-rs uses, so Float32 and Float64 both qualify.
-        if !(is_int(t) || is_float(t) || *t == DataType::Utf8) {
+        if !(is_int(t) || is_float(t) || matches!(t, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8)) {
             return Err(format!("sort key {} has type {t}", c.name()));
         }
         keys.push(SortKey { column: c.index(), descending: s.options.descending, nulls_first: s.options.nulls_first });
@@ -329,7 +329,7 @@ fn comparison_sexpr(b: &BinaryExpr, schema: &Schema, floats: &mut Vec<usize>) ->
             (true, false) => (r, b.left()),
             _ => return Err("string comparison not between a column and a literal".into()),
         };
-        let ScalarValue::Utf8(Some(p)) = lit.downcast_ref::<Literal>().unwrap().value() else {
+        let Some(ScalarValue::Utf8(Some(p))) = lit.downcast_ref::<Literal>().map(|l| l.value()) else {
             return Err("string literal is null".into());
         };
         let eq = format!("(str_eq {col} \"{}\")", escape(p));
