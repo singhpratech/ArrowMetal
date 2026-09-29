@@ -25,7 +25,9 @@
 //!   `--iters` wall-clock runs (best of 2 when the untimed run took over `--slow-s` seconds), with the
 //!   process CPU time (getrusage, user + system, all threads) of that best run. Timed: SQL to
 //!   logical plan, physical planning (the rule runs there), and `collect`.
-//! * `MetalExec`'s metrics from the best on-run: input wait, concat, import, plan run, export.
+//! * `MetalExec`'s metrics from the best on-run: input wait, import, plan run, export (the
+//!   `concat_ms` column is 0 since the crate hands the batches to the chunked import; it stays in
+//!   the CSV so the files of the earlier crate state line up).
 //! * Before each block (one family at one size and layout): wait until the 1-minute load is below
 //!   `--max-load` and no cargo / rustc / swift-build / swift-frontend / swiftc / pytest runs,
 //!   checking every 20 s. The load at the start and end of each block goes in every row.
@@ -34,7 +36,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, ArrayRef, AsArray, Float64Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::compute::{cast, concat_batches, lexsort_to_indices, take, SortColumn};
 use arrow::datatypes::{DataType, Field, Float64Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -182,7 +184,8 @@ fn batch(cols: Vec<(&str, ArrayRef)>) -> RecordBatch {
     RecordBatch::try_new(Arc::new(schema), cols.into_iter().map(|(_, a)| a).collect()).unwrap()
 }
 
-/// k1 int32 [0, 100k), k2 int32 [0, 1000), name utf8 (1000 values), x f64 [0, 1), q int64 [0, 1e9).
+/// k1 int32 [0, 100k), k2 int32 [0, 1000), name utf8 (1000 values), x f64 [0, 1), q int64 [0, 1e9),
+/// y f32 [0, 1) (drawn last, so the other columns are the earlier runs' values).
 fn data_extra(rng: &mut StdRng, n: usize) -> RecordBatch {
     let k1 = i32s(rng, n, 100_000);
     let k2 = i32s(rng, n, 1000);
@@ -190,7 +193,8 @@ fn data_extra(rng: &mut StdRng, n: usize) -> RecordBatch {
         Arc::new(StringArray::from_iter_values((0..n).map(|_| rng.random_range(0..1000).to_string())));
     let x = f64s(rng, n, 1.0, 0.0);
     let q = i64s(rng, n, 1_000_000_000);
-    batch(vec![("k1", k1), ("k2", k2), ("name", name), ("x", x), ("q", q)])
+    let y: ArrayRef = Arc::new(Float32Array::from_iter_values((0..n).map(|_| rng.random::<f32>())));
+    batch(vec![("k1", k1), ("k2", k2), ("name", name), ("x", x), ("q", q), ("y", y)])
 }
 
 /// region int32 [0, 200), sub int32 [0, 50), amount f64 [-500, 1500), qty int64 [-10, 40).
@@ -280,6 +284,8 @@ fn blocks(rows: usize, fam: &str, rng: &mut StdRng) -> Vec<Box<dyn FnOnce(&mut S
                 case("srt_str", "sort 3 columns by a String key (1000 values)", "SELECT name, q, k1 FROM extra ORDER BY name", Order::Keys(vec![0])),
                 case("top_i64", "top 100 by an int64 key (control)", "SELECT q, k1, x FROM extra ORDER BY q LIMIT 100", Order::KeysLimit(vec![0])),
                 case("top_f64", "top 100 by Float64, descending (control)", "SELECT q, k1, x FROM extra ORDER BY x DESC LIMIT 100", Order::KeysLimit(vec![2])),
+                case("srt_f32", "sort 3 columns by a Float32 key", "SELECT q, k1, y FROM extra ORDER BY y", Order::Keys(vec![2])),
+                case("top_f32", "top 100 by Float32, descending", "SELECT q, k1, y FROM extra ORDER BY y DESC LIMIT 100", Order::KeysLimit(vec![2])),
             ],
         })),
         "join" => {

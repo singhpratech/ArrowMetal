@@ -105,7 +105,7 @@ pub struct Decision {
 impl Decision {
     pub(crate) fn runtime_fallback(op: &MetalOp, msg: &str) -> Self {
         let reason = if msg.starts_with(crate::gpu::DATA_DEPENDENT) {
-            format!("{msg}: DataFusion's answer depends on its row order, ran the DataFusion plan instead")
+            format!("{msg}; ran the DataFusion plan instead")
         } else {
             format!("ArrowMetal error at run time, ran the DataFusion plan instead: {msg}")
         };

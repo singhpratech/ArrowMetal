@@ -1,13 +1,14 @@
-//! The GPU half of `MetalExec`: one `RecordBatch` in, one out, through ArrowMetal's plan runner.
+//! The GPU half of `MetalExec`: the collected `RecordBatch`es in, one batch out, through
+//! ArrowMetal's plan runner.
 //!
 //! Synchronous, and every ArrowMetal handle lives and dies inside one call on one thread (the
 //! handles are `!Send`; the ABI's error slot and batching are thread-local).
 
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{Array as _, ArrayRef, AsArray, Float64Array, Int64Array};
+use arrow::array::{Array as _, ArrayRef, AsArray, Float32Array, Float64Array, Int64Array};
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, Float64Type, Int64Type, SchemaRef};
+use arrow::datatypes::{DataType, Float32Type, Float64Type, Int64Type, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
 use crate::exec::{AggKind, MetalOp};
@@ -17,69 +18,124 @@ use crate::exec::{AggKind, MetalOp};
 /// for the one GPU queue; it costs nothing in a spike that runs one query at a time.
 static GPU: Mutex<()> = Mutex::new(());
 
-pub(crate) fn run(op: &MetalOp, input: &RecordBatch, out_schema: &SchemaRef) -> Result<RecordBatch, String> {
+pub(crate) fn run(op: &MetalOp, input: &[RecordBatch], out_schema: &SchemaRef) -> Result<RecordBatch, String> {
     let _guard = GPU.lock().unwrap_or_else(|p| p.into_inner());
     take_times();
-    if input.num_rows() == 0 {
+    // The chunked import takes every non-empty batch as one chunk of each column.
+    let input: Vec<&RecordBatch> = input.iter().filter(|b| b.num_rows() > 0).collect();
+    if input.is_empty() {
         // A sort, a filter and a grouped aggregate of nothing are all empty.
         return Ok(RecordBatch::new_empty(out_schema.clone()));
     }
+    let num_columns = input[0].num_columns();
     match op {
         MetalOp::Sort { keys, fetch } => {
-            let mut flags = Vec::new();
-            let mut by = Vec::new();
-            for (i, k) in keys.iter().enumerate() {
-                let c = format!("(col \\\"c{}\\\")", k.column);
-                // ArrowMetal's sort puts nulls last in both directions. NULLS FIRST is a leading
-                // is-null key sorted descending.
-                if k.nulls_first {
-                    flags.push(format!("[\"n{i}\",\"(if_else (is_null {c}) (i32 1) (i32 0))\"]"));
-                    by.push(format!("[\"n{i}\",true]"));
-                }
-                // ArrowMetal keeps NaN after the values in both directions; arrow-rs orders NaN
-                // above +inf, so a descending float key puts NaN first. A NaN key sorted
-                // descending ahead of the value does that (null rows get a null flag: last).
-                if k.float && k.descending {
-                    flags.push(format!("[\"f{i}\",\"(if_else (ne {c} {c}) (i32 1) (i32 0))\"]"));
-                    by.push(format!("[\"f{i}\",true]"));
-                }
-                by.push(format!("[\"c{}\",{}]", k.column, k.descending));
-                // ArrowMetal's sort ties -0.0 with +0.0 (IEEE equality); arrow-rs's totalOrder puts
-                // -0.0 first ascending. 1/x is -inf exactly for -0.0 among the zeros, so a key
-                // "1/x < 0" (0 for -0.0, 1 otherwise) right after the value orders each zero tie.
-                if k.float {
-                    flags.push(format!("[\"z{i}\",\"(if_else (lt (div (f64 1) {c}) (f64 0)) (i32 0) (i32 1))\"]"));
-                    by.push(format!("[\"z{i}\",{}]", k.descending));
-                }
-            }
-            let mut node = scan();
-            if !flags.is_empty() {
-                node = format!(r#"{{"op":"with_columns","exprs":[{}],"input":{node}}}"#, flags.join(","));
-            }
-            node = format!(r#"{{"op":"sort","by":[{}],"input":{node}}}"#, by.join(","));
+            // One plan key per ORDER BY key, with DataFusion's null placement and arrow-rs's float
+            // order (IEEE 754 totalOrder: -NaN < -inf < ... < -0.0 < +0.0 < ... < +inf < +NaN, NaNs
+            // by payload, the exact mirror when descending). Integer and string keys ignore
+            // `float_order`. A one-key sort under a limit stays a GPU top-k with these options
+            // (docs/ENGINE.md, "Sort key options").
+            let by: Vec<String> = keys
+                .iter()
+                .map(|k| {
+                    format!(
+                        r#"["c{}",{},{{"nulls":"{}","float_order":"total"}}]"#,
+                        k.column,
+                        k.descending,
+                        if k.nulls_first { "first" } else { "last" }
+                    )
+                })
+                .collect();
+            let mut node = format!(r#"{{"op":"sort","by":[{}],"input":{}}}"#, by.join(","), scan());
             if let Some(f) = fetch {
                 node = format!(r#"{{"op":"limit","count":{f},"input":{node}}}"#);
             }
-            node = select_all(input.num_columns(), node);
-            let cols = run_plan(&node, input, None)?;
+            node = select_all(num_columns, node);
+            let cols = run_plan(&node, &input, None)?;
             assemble(cols, out_schema)
         }
-        MetalOp::Filter { predicate, projection } => {
+        MetalOp::Filter { predicate, projection, float_compared } => {
+            // The fused comparisons are IEEE; the rewrite in translate.rs matches arrow-rs's
+            // totalOrder for every value except a NaN with the sign bit set, which totalOrder puts
+            // below -inf (the expression grammar has no sign-bit test). A compared float column
+            // holding one sends the node back to DataFusion.
+            for &c in float_compared {
+                if has_negative_nan(&input, c) {
+                    return Err(format!(
+                        "{DATA_DEPENDENT}: a compared float column holds a NaN with the sign bit set \
+                         (totalOrder puts it below -inf, the GPU comparison cannot)"
+                    ));
+                }
+            }
             let node = format!(
                 r#"{{"op":"filter","predicate":"{}","input":{}}}"#,
                 json_escape(predicate),
                 scan()
             );
-            let node = select_all(input.num_columns(), node);
-            let cols = run_plan(&node, input, None)?;
+            let node = select_all(num_columns, node);
+            let cols = run_plan(&node, &input, None)?;
             let cols = match projection {
                 Some(p) => p.iter().map(|&i| cols[i].clone()).collect(),
                 None => cols,
             };
             assemble(cols, out_schema)
         }
-        MetalOp::Aggregate { keys, aggs } => aggregate(keys, aggs, input, out_schema),
+        MetalOp::Aggregate { keys, aggs } => aggregate(keys, aggs, &input, out_schema),
     }
+}
+
+/// True when column `c` of any batch holds a NaN with the sign bit set (null slots included: a
+/// false positive only costs the fallback). Negative NaNs are exactly the bit patterns above -inf's.
+fn has_negative_nan(input: &[&RecordBatch], c: usize) -> bool {
+    input.iter().any(|b| {
+        let a = b.column(c);
+        match a.data_type() {
+            DataType::Float64 => {
+                a.as_primitive::<Float64Type>().values().iter().any(|v| v.to_bits() > 0xFFF0_0000_0000_0000)
+            }
+            DataType::Float32 => a.as_primitive::<Float32Type>().values().iter().any(|v| v.to_bits() > 0xFF80_0000),
+            _ => false,
+        }
+    })
+}
+
+/// True when the non-null values of float column `c` hold NaNs of more than one bit pattern.
+/// DataFusion keeps each NaN bit pattern as its own group (`HashValue::canonicalize` folds only
+/// -0.0 into +0.0); ArrowMetal puts every NaN in one group.
+fn has_distinct_nans(input: &[&RecordBatch], c: usize) -> bool {
+    let mut first: Option<u64> = None;
+    let mut seen = |x: u64| -> bool {
+        match first {
+            None => {
+                first = Some(x);
+                false
+            }
+            Some(f) => f != x,
+        }
+    };
+    for b in input {
+        let a = b.column(c);
+        match a.data_type() {
+            DataType::Float64 => {
+                let p = a.as_primitive::<Float64Type>();
+                for i in 0..p.len() {
+                    if p.is_valid(i) && p.value(i).is_nan() && seen(p.value(i).to_bits()) {
+                        return true;
+                    }
+                }
+            }
+            DataType::Float32 => {
+                let p = a.as_primitive::<Float32Type>();
+                for i in 0..p.len() {
+                    if p.is_valid(i) && p.value(i).is_nan() && seen(p.value(i).to_bits() as u64) {
+                        return true;
+                    }
+                }
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// A JSON string body: quotes, backslashes and control characters escaped.
@@ -128,21 +184,28 @@ pub(crate) fn take_times() -> GpuTimes {
 }
 
 /// Imports the columns (all of them, or `only`), runs `plan`, exports every output column.
-fn run_plan(plan: &str, input: &RecordBatch, only: Option<&[usize]>) -> Result<Vec<ArrayRef>, String> {
+///
+/// Each column is imported from its chunks, one per batch, with `Array::from_arrow_chunks`
+/// (`am_import_chunks`): the chunks are copied straight into the Metal buffers, with no
+/// `concat_batches` copy in between. A single batch is imported as it is (copy-free when its
+/// buffers allow).
+fn run_plan(plan: &str, input: &[&RecordBatch], only: Option<&[usize]>) -> Result<Vec<ArrayRef>, String> {
     let e = |x: arrowmetal::Error| x.message().to_string();
     let wanted: Vec<usize> = match only {
         Some(o) => o.to_vec(),
-        None => (0..input.num_columns()).collect(),
+        None => (0..input[0].num_columns()).collect(),
     };
+    let rows: usize = input.iter().map(|b| b.num_rows()).sum();
     let t0 = std::time::Instant::now();
     let mut cols = Vec::with_capacity(wanted.len());
     for &i in &wanted {
-        cols.push((format!("c{i}"), arrowmetal::Array::from_arrow(input.column(i).as_ref()).map_err(e)?));
+        let chunks: Vec<&dyn arrow::array::Array> = input.iter().map(|b| b.column(i).as_ref()).collect();
+        cols.push((format!("c{i}"), arrowmetal::Array::from_arrow_chunks(&chunks).map_err(e)?));
     }
     let src = arrowmetal::Source::new("t", cols).map_err(e)?;
     let t1 = std::time::Instant::now();
     let out = arrowmetal::run_plan(plan, &[&src], true)
-        .map_err(|x| format!("{} [rows {}; plan {plan}]", x.message(), input.num_rows()))?;
+        .map_err(|x| format!("{} [rows {rows}; plan {plan}]", x.message()))?;
     let t2 = std::time::Instant::now();
     let cols = (0..out.column_count())
         .map(|i| out.column(i).and_then(|a| a.to_arrow()).map_err(e))
@@ -180,9 +243,19 @@ fn assemble(cols: Vec<ArrayRef>, schema: &SchemaRef) -> Result<RecordBatch, Stri
 fn aggregate(
     keys: &[usize],
     aggs: &[crate::exec::AggSpec],
-    input: &RecordBatch,
+    input: &[&RecordBatch],
     out_schema: &SchemaRef,
 ) -> Result<RecordBatch, String> {
+    let schema = input[0].schema();
+    for &k in keys {
+        if matches!(schema.field(k).data_type(), DataType::Float32 | DataType::Float64) && has_distinct_nans(input, k) {
+            return Err(format!(
+                "{DATA_DEPENDENT}: float group key {} holds NaNs of more than one bit pattern \
+                 (DataFusion groups each pattern apart, ArrowMetal groups every NaN together)",
+                schema.field(k).name()
+            ));
+        }
+    }
     let mut key_json = Vec::new();
     for (j, k) in keys.iter().enumerate() {
         key_json.push(format!("[\"k{j}\",\"(col \\\"c{k}\\\")\"]"));
@@ -196,20 +269,16 @@ fn aggregate(
         let c = a.column.map(|c| format!("(col \\\"c{c}\\\")"));
         let row = match a.kind {
             AggKind::CountAll => format!("[\"count\",\"a{j}\"]"),
-            // count(x) as sum(is_valid(x) ? 1 : 0). The engine's own `count` fails or miscounts
-            // when the group-by takes the per-aggregate path (see SPIKE.md, ArrowMetal defects):
-            // over Float64 it throws "group-by over Float64 values", over other non-numeric types
-            // it counts rows.
-            AggKind::Count => {
-                format!("[\"sum\",\"a{j}\",\"(if_else (is_valid {}) (i64 1) (i64 0))\"]", c.clone().unwrap())
-            }
             k => {
                 let op = match k {
                     AggKind::Sum => "sum",
                     AggKind::Min => "min",
                     AggKind::Max => "max",
                     AggKind::Mean => "mean",
-                    AggKind::Count | AggKind::CountAll => unreachable!(),
+                    // The engine's `count(x)` counts the non-null values of every type on every
+                    // path (core a387a2a).
+                    AggKind::Count => "count",
+                    AggKind::CountAll => unreachable!(),
                 };
                 format!("[\"{op}\",\"a{j}\",\"{}\"]", c.clone().unwrap())
             }
@@ -219,7 +288,7 @@ fn aggregate(
             // Helpers go after every main aggregate, so the first keys+aggs outputs line up.
             let c = c.unwrap();
             helper_json.push(format!("[\"sum\",\"nan{j}\",\"(if_else (ne {c} {c}) (i64 1) (i64 0))\"]"));
-            helper_json.push(format!("[\"sum\",\"cnt{j}\",\"(if_else (is_valid {c}) (i64 1) (i64 0))\"]"));
+            helper_json.push(format!("[\"count\",\"cnt{j}\",\"{c}\"]"));
             helper_json.push(format!("[\"sum\",\"z{j}\",\"(if_else (eq {c} (f64 0)) (i64 1) (i64 0))\"]"));
             helper_json.push(format!(
                 "[\"sum\",\"nz{j}\",\"(if_else (and (eq {c} (f64 0)) (lt (div (f64 1) {c}) (f64 0))) (i64 1) (i64 0))\"]"
@@ -230,13 +299,8 @@ fn aggregate(
             helpers.push(None);
         }
     }
-    // A GROUP BY with no aggregates (DISTINCT, or the inner half of count(DISTINCT x)): the plan
-    // runner wants at least one, so count rows and drop the column afterwards.
-    let dummy = aggs.is_empty();
-    if dummy {
-        agg_json.push("[\"count\",\"__distinct\"]".to_string());
-        next += 1;
-    }
+    // A GROUP BY with no aggregates (DISTINCT, or the inner half of count(DISTINCT x)) is sent as
+    // it is: the plan runner returns the distinct keys.
     agg_json.extend(helper_json);
     let plan = format!(
         r#"{{"op":"group_by","keys":[{}],"aggs":[{}],"input":{}}}"#,
@@ -256,12 +320,20 @@ fn aggregate(
     // DataFusion folds -0.0 into +0.0 in a group key (`normalize_float_zero`); ArrowMetal groups
     // them together too but reports the first-seen zero as the key.
     for (j, &k) in keys.iter().enumerate() {
-        if input.schema().field(k).data_type() == &DataType::Float64 {
-            let a = cast(&out[j], &DataType::Float64).map_err(|e| e.to_string())?;
-            let p = a.as_primitive::<Float64Type>();
-            let fixed: Float64Array =
-                p.iter().map(|v| v.map(|x| if x == 0.0 { 0.0 } else { x })).collect();
-            out[j] = Arc::new(fixed);
+        match schema.field(k).data_type() {
+            DataType::Float64 => {
+                let a = cast(&out[j], &DataType::Float64).map_err(|e| e.to_string())?;
+                let p = a.as_primitive::<Float64Type>();
+                let fixed: Float64Array = p.iter().map(|v| v.map(|x| if x == 0.0 { 0.0 } else { x })).collect();
+                out[j] = Arc::new(fixed);
+            }
+            DataType::Float32 => {
+                let a = cast(&out[j], &DataType::Float32).map_err(|e| e.to_string())?;
+                let p = a.as_primitive::<Float32Type>();
+                let fixed: Float32Array = p.iter().map(|v| v.map(|x| if x == 0.0 { 0.0 } else { x })).collect();
+                out[j] = Arc::new(fixed);
+            }
+            _ => {}
         }
     }
     for (j, h) in helpers.iter().enumerate() {
@@ -272,8 +344,9 @@ fn aggregate(
     assemble(out, out_schema)
 }
 
-/// Prefix of a `run` error that is not an ArrowMetal failure but data on which DataFusion's own
-/// answer depends on row order, so only DataFusion can give it.
+/// Prefix of a `run` error that is not an ArrowMetal failure but data on which the GPU path cannot
+/// give DataFusion's answer (DataFusion's answer depends on row order, or the data holds a value
+/// the GPU path orders differently), so only DataFusion can give it.
 pub(crate) const DATA_DEPENDENT: &str = "data-dependent";
 
 /// DataFusion's grouped Float64 MIN/MAX folds with `partial_cmp` and replaces the running value

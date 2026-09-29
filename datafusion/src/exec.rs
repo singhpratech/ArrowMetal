@@ -3,7 +3,6 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use arrow::compute::concat_batches;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -30,8 +29,6 @@ pub struct SortKey {
     pub column: usize,
     pub descending: bool,
     pub nulls_first: bool,
-    /// Float keys need the NaN ordering adjusted when descending.
-    pub float: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,15 +59,16 @@ pub struct AggSpec {
 pub enum MetalOp {
     Sort { keys: Vec<SortKey>, fetch: Option<usize> },
     Aggregate { keys: Vec<usize>, aggs: Vec<AggSpec> },
-    /// `predicate` is an ArrowMetal s-expression over columns named `c{i}`.
-    Filter { predicate: String, projection: Option<Vec<usize>> },
+    /// `predicate` is an ArrowMetal s-expression over columns named `c{i}`; `float_compared` are
+    /// the float columns it compares with a literal (checked for negative NaN at run time).
+    Filter { predicate: String, projection: Option<Vec<usize>>, float_compared: Vec<usize> },
 }
 
 /// Runs one [`MetalOp`] on ArrowMetal.
 ///
-/// Collects every partition of its input (coalesced), concatenates them into one batch, runs the
-/// operation on the GPU through ArrowMetal's plan runner, and emits the result in `batch_size`
-/// slices as a single partition. If ArrowMetal returns an error at run time, the replaced subtree
+/// Collects every partition of its input (coalesced), hands the batches to ArrowMetal's chunked
+/// import (no `concat_batches`), runs the operation on the GPU through ArrowMetal's plan runner, and
+/// emits the result in `batch_size` slices as a single partition. If ArrowMetal returns an error at run time, the replaced subtree
 /// (`original`) is run instead on the collected batches, and that is recorded in the report.
 pub struct MetalExec {
     op: MetalOp,
@@ -148,7 +146,7 @@ impl DisplayAs for MetalExec {
                     .collect();
                 write!(f, "MetalExec: group_by=[{}], aggr=[{}]", ks.join(", "), asx.join(", "))
             }
-            MetalOp::Filter { predicate, projection } => {
+            MetalOp::Filter { predicate, projection, .. } => {
                 write!(f, "MetalExec: filter={predicate}")?;
                 if let Some(p) = projection {
                     write!(f, ", projection={p:?}")?;
@@ -242,10 +240,10 @@ impl ExecutionPlan for MetalExec {
         let mut stream = source.execute(0, Arc::clone(&ctx))?;
 
         // Where the time goes (EXPLAIN ANALYZE shows these): waiting for and collecting the input
-        // stream (includes the upstream operators' own work), concatenating it into one batch, and
-        // the GPU call split into import / plan run / export.
+        // stream (includes the upstream operators' own work), and the GPU call split into import
+        // (the chunked copy into Metal buffers) / plan run / export.
         let m = |name: &'static str| MetricBuilder::new(&self.metrics).subset_time(name, partition);
-        let (input_time, concat_time) = (m("input_time"), m("concat_time"));
+        let input_time = m("input_time");
         let (import_time, kernel_time, export_time) = (m("import_time"), m("kernel_time"), m("export_time"));
         let input_batches = MetricBuilder::new(&self.metrics).counter("input_batches", partition);
 
@@ -262,17 +260,12 @@ impl ExecutionPlan for MetalExec {
             input_time.add_duration(t.elapsed());
             input_batches.add(batches.len());
             let in_schema = input.schema();
-            let t = std::time::Instant::now();
-            let one = concat_batches(&in_schema, &batches)?;
-            concat_time.add_duration(t.elapsed());
-            reservation.try_grow(one.get_array_memory_size())?;
-            drop(batches);
 
             let op2 = op.clone();
             let s2 = Arc::clone(&out_schema);
-            let (res, one, times) = tokio::task::spawn_blocking(move || {
-                let r = crate::gpu::run(&op2, &one, &s2);
-                (r, one, crate::gpu::take_times())
+            let (res, batches, times) = tokio::task::spawn_blocking(move || {
+                let r = crate::gpu::run(&op2, &batches, &s2);
+                (r, batches, crate::gpu::take_times())
             })
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -282,6 +275,7 @@ impl ExecutionPlan for MetalExec {
 
             let out: Vec<RecordBatch> = match res {
                 Ok(b) => {
+                    drop(batches);
                     let mut v = Vec::new();
                     let mut off = 0;
                     while off < b.num_rows() {
@@ -294,7 +288,7 @@ impl ExecutionPlan for MetalExec {
                 Err(msg) => {
                     log.lock().unwrap().push(Decision::runtime_fallback(&op, &msg));
                     let mem: Arc<dyn ExecutionPlan> =
-                        MemorySourceConfig::try_new_exec(&[vec![one]], in_schema, None)?;
+                        MemorySourceConfig::try_new_exec(&[batches], in_schema, None)?;
                     let plan = replace_leaf(&original, &input, &mem)?;
                     collect(plan, ctx).await?
                 }

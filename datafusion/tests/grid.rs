@@ -5,15 +5,20 @@
 //!   each run of equal keys (SQL leaves the order of ties unspecified). With LIMIT, the last tie
 //!   run is excluded from the row comparison, since which of its rows make the cut is unspecified.
 //! * GROUP BY and WHERE: order-insensitive (both sides sorted by the full row).
-//! * Values compare exactly — floats by bit pattern, so -0.0 != +0.0, any NaN == any NaN — except
-//!   `sum` over Float64 and every `avg`, which compare within |a - b| <= 1e-9 * max(1, |a|, |b|)
-//!   (floating-point addition is not associative; the two engines add in different orders).
+//! * Values compare exactly — floats by bit pattern, so -0.0 != +0.0 and NaNs of different sign
+//!   or payload differ — except `sum` over a float column and every `avg`, which compare within
+//!   |a - b| <= 1e-9 * max(1, |a|, |b|) (floating-point addition is not associative; the two
+//!   engines add in different orders), any NaN equal to any NaN there (a NaN sum's payload is the
+//!   adder's choice).
+//! * The float columns hold both zero signs, ±inf and NaNs: `kf` one NaN bit pattern (so a
+//!   GROUP BY over it runs on the GPU), `kn` (Float64) and `kf32` / `vf32` (Float32) negative NaNs
+//!   and NaN payloads, `vf` positive NaNs with payloads.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray};
-use arrow::datatypes::{DataType, Field, Float64Type, Int32Type, Int64Type, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Float32Type, Float64Type, Int32Type, Int64Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -25,7 +30,23 @@ use rand::{Rng, SeedableRng};
 // Data
 // -------------------------------------------------------------------------------------------------
 
-const FLOAT_KEYS: [f64; 6] = [-1.5, -0.0, 0.0, 2.25, f64::NAN, 7.0];
+const FLOAT_KEYS: [f64; 8] = [-1.5, -0.0, 0.0, 2.25, f64::NAN, 7.0, f64::INFINITY, f64::NEG_INFINITY];
+/// NaN-heavy Float64 keys: negative NaN, NaN payloads of both signs, ±0.0, ±inf.
+fn nan_keys() -> [f64; 9] {
+    [
+        f64::NAN,
+        f64::from_bits(0xFFF8_0000_0000_0000),
+        f64::from_bits(0x7FF0_0000_0000_0001),
+        f64::from_bits(0xFFF4_0000_0000_0003),
+        -0.0,
+        0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        -3.5,
+    ]
+}
+/// Float32 keys: one NaN bit pattern, ±0.0, ±inf.
+const F32_KEYS: [f32; 8] = [-1.5, -0.0, 0.0, 2.25, f32::NAN, 7.0, f32::INFINITY, f32::NEG_INFINITY];
 const STR_KEYS: [&str; 7] = ["a", "b", "B", "ab", "", "\u{fc}", "zz"];
 
 fn schema() -> SchemaRef {
@@ -38,6 +59,9 @@ fn schema() -> SchemaRef {
         Field::new("v64", DataType::Int64, true),
         Field::new("vf", DataType::Float64, true),
         Field::new("vg", DataType::Float64, true),
+        Field::new("kn", DataType::Float64, true),
+        Field::new("kf32", DataType::Float32, true),
+        Field::new("vf32", DataType::Float32, true),
     ]))
 }
 
@@ -53,6 +77,10 @@ fn table(n: usize, null_frac: f64, seed: u64) -> RecordBatch {
     let mut v64 = Vec::new();
     let mut vf = Vec::new();
     let mut vg = Vec::new();
+    let mut kn = Vec::new();
+    let mut kf32 = Vec::new();
+    let mut vf32 = Vec::new();
+    let nk = nan_keys();
     for _ in 0..n {
         k32.push(if null(&mut r) { None } else { Some(r.random_range(-3i32..=3)) });
         k64.push(if null(&mut r) { None } else { Some(k64_domain[r.random_range(0..50)]) });
@@ -63,10 +91,11 @@ fn table(n: usize, null_frac: f64, seed: u64) -> RecordBatch {
         vf.push(if null(&mut r) {
             None
         } else {
-            Some(match r.random_range(0..20) {
-                0 => f64::NAN,
-                1 => -0.0,
-                2 => 0.0,
+            Some(match r.random_range(0..40) {
+                0 | 1 => f64::NAN,
+                2 => f64::from_bits(0x7FF0_0000_0000_0005),
+                3 | 4 => -0.0,
+                5 | 6 => 0.0,
                 _ => (r.random_range(-4000i32..=4000) as f64) * 0.25,
             })
         });
@@ -78,6 +107,21 @@ fn table(n: usize, null_frac: f64, seed: u64) -> RecordBatch {
         } else {
             Some(r.random_range(-1000.0f64..1000.0) / 3.0)
         });
+        kn.push(if null(&mut r) { None } else { Some(nk[r.random_range(0..nk.len())]) });
+        kf32.push(if null(&mut r) { None } else { Some(F32_KEYS[r.random_range(0..F32_KEYS.len())]) });
+        vf32.push(if null(&mut r) {
+            None
+        } else {
+            Some(match r.random_range(0..40) {
+                0 => f32::NAN,
+                1 => f32::from_bits(0xFFC0_0000),
+                2 => f32::from_bits(0x7F80_0007),
+                3 => -0.0,
+                4 => 0.0,
+                5 => f32::NEG_INFINITY,
+                _ => (r.random_range(-4000i32..=4000) as f32) * 0.25,
+            })
+        });
     }
     let cols: Vec<ArrayRef> = vec![
         Arc::new(arrow::array::Int32Array::from(k32)),
@@ -88,6 +132,9 @@ fn table(n: usize, null_frac: f64, seed: u64) -> RecordBatch {
         Arc::new(arrow::array::Int64Array::from(v64)),
         Arc::new(arrow::array::Float64Array::from(vf)),
         Arc::new(arrow::array::Float64Array::from(vg)),
+        Arc::new(arrow::array::Float64Array::from(kn)),
+        Arc::new(arrow::array::Float32Array::from(kf32)),
+        Arc::new(arrow::array::Float32Array::from(vf32)),
     ];
     RecordBatch::try_new(schema(), cols).unwrap()
 }
@@ -113,19 +160,18 @@ fn mem_table(b: &RecordBatch, parts: usize) -> Arc<MemTable> {
 enum V {
     Null,
     I(i64),
-    /// Float by bit pattern, NaN canonicalised.
+    /// Float64 by bit pattern.
     F(u64),
+    /// Float32 by bit pattern.
+    F32(u32),
     S(String),
     B(bool),
-}
-
-fn fbits(x: f64) -> u64 {
-    if x.is_nan() { f64::NAN.to_bits() } else { x.to_bits() }
 }
 
 fn f_of(v: &V) -> Option<f64> {
     match v {
         V::F(b) => Some(f64::from_bits(*b)),
+        V::F32(b) => Some(f32::from_bits(*b) as f64),
         V::I(i) => Some(*i as f64),
         _ => None,
     }
@@ -140,7 +186,8 @@ fn column_values(a: &ArrayRef) -> Vec<V> {
             match a.data_type() {
                 DataType::Int32 => V::I(a.as_primitive::<Int32Type>().value(i) as i64),
                 DataType::Int64 => V::I(a.as_primitive::<Int64Type>().value(i)),
-                DataType::Float64 => V::F(fbits(a.as_primitive::<Float64Type>().value(i))),
+                DataType::Float64 => V::F(a.as_primitive::<Float64Type>().value(i).to_bits()),
+                DataType::Float32 => V::F32(a.as_primitive::<Float32Type>().value(i).to_bits()),
                 DataType::Utf8 => V::S(a.as_string::<i32>().value(i).to_string()),
                 DataType::Utf8View => V::S(a.as_string_view().value(i).to_string()),
                 DataType::Boolean => V::B(a.as_boolean().value(i)),
@@ -166,6 +213,10 @@ fn close(a: &V, b: &V) -> bool {
         (Some(x), Some(y)) => {
             if x.is_nan() || y.is_nan() {
                 return x.is_nan() && y.is_nan();
+            }
+            // An infinite sum or mean must be the same infinity (inf - inf is NaN).
+            if x.is_infinite() || y.is_infinite() {
+                return x == y;
             }
             (x - y).abs() <= 1e-9 * 1f64.max(x.abs()).max(y.abs())
         }
@@ -216,7 +267,10 @@ fn relax_order_dependent(r: &mut [Vec<V>], (sum, min, max): (usize, usize, usize
                 row[c] = V::Null;
                 n += 1;
             } else if matches!(f_of(&row[c]), Some(x) if x == 0.0) {
-                row[c] = V::F(0);
+                row[c] = match row[c] {
+                    V::F32(_) => V::F32(0),
+                    _ => V::F(0),
+                };
                 n += 1;
             }
         }
@@ -226,10 +280,10 @@ fn relax_order_dependent(r: &mut [Vec<V>], (sum, min, max): (usize, usize, usize
 
 fn queries() -> Vec<Query> {
     let mut q = Vec::new();
-    let cols = ["k32", "k64", "kf", "ks", "v32", "v64", "vf", "vg"];
+    let cols = ["k32", "k64", "kf", "ks", "v32", "v64", "vf", "vg", "kn", "kf32", "vf32"];
     let pos = |c: &str| cols.iter().position(|x| *x == c).unwrap();
     // Single-column ORDER BY, every direction x null placement, with and without LIMIT.
-    for c in ["k32", "k64", "kf", "ks", "v64", "vf", "vg"] {
+    for c in ["k32", "k64", "kf", "kn", "kf32", "ks", "v64", "vf", "vf32", "vg"] {
         for dir in ["ASC", "DESC"] {
             for nulls in ["NULLS FIRST", "NULLS LAST", ""] {
                 for limit in [None, Some(7)] {
@@ -250,6 +304,10 @@ fn queries() -> Vec<Query> {
         ("kf DESC, k32 ASC NULLS FIRST", ""),
         ("k32 DESC NULLS LAST, ks DESC, v64", " LIMIT 11"),
         ("vf, kf DESC NULLS LAST", " LIMIT 5"),
+        ("kn DESC NULLS FIRST, kf32 ASC", " LIMIT 9"),
+        ("kf32 DESC NULLS LAST, kn", ""),
+        ("vf32 ASC NULLS FIRST, k64 DESC", ""),
+        ("kn, vf DESC NULLS FIRST", " LIMIT 40"),
     ] {
         let key_cols = keys.split(',').map(|k| pos(k.split_whitespace().next().unwrap())).collect();
         q.push(Query {
@@ -260,12 +318,13 @@ fn queries() -> Vec<Query> {
         });
     }
     // GROUP BY with every aggregate, per key and value column.
-    for key in ["k32", "k64", "kf", "ks", "k32, ks", "kf, k64"] {
+    for key in ["k32", "k64", "kf", "ks", "k32, ks", "kf, k64", "kn", "kf32", "kf32, k32"] {
         let nk = key.split(',').count();
-        for v in ["v32", "v64", "vf", "vg"] {
+        for v in ["v32", "v64", "vf", "vg", "vf32"] {
+            let float = v == "vf" || v == "vg" || v == "vf32";
             // sum over a float column and every avg take the tolerance.
             let mut tol = vec![nk + 5];
-            if v == "vf" || v == "vg" {
+            if float {
                 tol.push(nk);
             }
             q.push(Query {
@@ -274,7 +333,7 @@ fn queries() -> Vec<Query> {
                     "SELECT {key}, sum({v}), min({v}), max({v}), count({v}), count(*), avg({v}) FROM t GROUP BY {key}"
                 ),
                 kind: Kind::Unordered { tol_cols: tol },
-                float_min_max: if v == "vf" || v == "vg" { Some((nk, nk + 1, nk + 2)) } else { None },
+                float_min_max: if float { Some((nk, nk + 1, nk + 2)) } else { None },
             });
         }
     }
@@ -303,6 +362,14 @@ fn queries() -> Vec<Query> {
         "vf >= 100.25 AND v64 < 0",
         "vf = 0.0",
         "vf < 1.5",
+        "vg > 1.5",
+        "vg <= -2.5 OR k32 = 1",
+        "vf32 > 1.5",
+        "vf32 < -2.5 AND k64 IS NOT NULL",
+        "vf32 > CAST(1.5 AS REAL)",
+        "vf32 <= CAST(-2.5 AS REAL) OR k32 = 1",
+        "kn > 1.5",
+        "kn <= -2.5",
     ] {
         q.push(Query {
             class: format!("where {pred}"),
@@ -370,7 +437,15 @@ fn compare(kind: &Kind, want: &[Vec<V>], got: &[Vec<V>]) -> Result<(), String> {
                     .zip(&g)
                     .position(|(a, b)| !rows_equal(std::slice::from_ref(a), std::slice::from_ref(b), tol_cols))
                     .unwrap_or(0);
-                return Err(format!("row {at} (sorted): want {:?}, got {:?}", w[at], g[at]));
+                let cols: Vec<usize> = (0..w[at].len())
+                    .filter(|&i| if tol_cols.contains(&i) { !close(&w[at][i], &g[at][i]) } else { w[at][i] != g[at][i] })
+                    .collect();
+                return Err(format!(
+                    "row {at} of {} (sorted), columns {cols:?} differ: want {:?}, got {:?}",
+                    w.len(),
+                    w[at],
+                    g[at]
+                ));
             }
             Ok(())
         }

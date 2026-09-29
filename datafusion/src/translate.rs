@@ -72,16 +72,12 @@ pub(crate) fn sort_op(
             return Err(format!("sort key {} is an expression, not a column", s.expr));
         };
         let t = input_schema.field(c.index()).data_type();
-        // Float32 keys would need f32 literals in the NaN / signed-zero keys; untested, so left.
-        if !(is_int(t) || *t == DataType::Float64 || *t == DataType::Utf8) {
+        // Float keys sort by IEEE 754 totalOrder in the core (the plan key's `float_order`), the
+        // order arrow-rs uses, so Float32 and Float64 both qualify.
+        if !(is_int(t) || is_float(t) || *t == DataType::Utf8) {
             return Err(format!("sort key {} has type {t}", c.name()));
         }
-        keys.push(SortKey {
-            column: c.index(),
-            descending: s.options.descending,
-            nulls_first: s.options.nulls_first,
-            float: is_float(t),
-        });
+        keys.push(SortKey { column: c.index(), descending: s.options.descending, nulls_first: s.options.nulls_first });
     }
     if keys.is_empty() {
         return Err("sort with no keys".into());
@@ -212,7 +208,11 @@ pub(crate) fn same_aggregates(final_: &AggregateExec, partial: &AggregateExec) -
 
 /// Translates a DataFusion predicate into the s-expression grammar of docs/EXPR.md, column `i`
 /// named `c{i}`. Only shapes whose semantics match arrow-rs exactly are translated.
-pub(crate) fn predicate_sexpr(e: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Result<String, Why> {
+pub(crate) fn predicate_sexpr(
+    e: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+    floats: &mut Vec<usize>,
+) -> Result<String, Why> {
     let any = e.as_ref();
     if let Some(c) = any.downcast_ref::<Column>() {
         let t = schema.field(c.index()).data_type();
@@ -228,7 +228,7 @@ pub(crate) fn predicate_sexpr(e: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Res
         return Ok(format!("(is_valid {})", value_sexpr(n.arg(), schema)?.0));
     }
     if let Some(n) = any.downcast_ref::<NotExpr>() {
-        return Ok(format!("(not {})", predicate_sexpr(n.arg(), schema)?));
+        return Ok(format!("(not {})", predicate_sexpr(n.arg(), schema, floats)?));
     }
     if let Some(l) = any.downcast_ref::<Literal>() {
         return match l.value() {
@@ -244,8 +244,8 @@ pub(crate) fn predicate_sexpr(e: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Res
         match op {
             // SQL AND / OR are three-valued; the Kleene forms are the ones that match.
             Operator::And | Operator::Or => {
-                let l = predicate_sexpr(b.left(), schema)?;
-                let r = predicate_sexpr(b.right(), schema)?;
+                let l = predicate_sexpr(b.left(), schema, floats)?;
+                let r = predicate_sexpr(b.right(), schema, floats)?;
                 let f = if *op == Operator::And { "and_kleene" } else { "or_kleene" };
                 return Ok(format!("({f} {l} {r})"));
             }
@@ -254,7 +254,7 @@ pub(crate) fn predicate_sexpr(e: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Res
             | Operator::Lt
             | Operator::LtEq
             | Operator::Gt
-            | Operator::GtEq => return comparison_sexpr(b, schema),
+            | Operator::GtEq => return comparison_sexpr(b, schema, floats),
             other => return Err(format!("operator {other} in a predicate")),
         }
     }
@@ -305,7 +305,7 @@ pub(crate) fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\t', "\\t")
 }
 
-fn comparison_sexpr(b: &BinaryExpr, schema: &Schema) -> Result<String, Why> {
+fn comparison_sexpr(b: &BinaryExpr, schema: &Schema, floats: &mut Vec<usize>) -> Result<String, Why> {
     let (l, lt) = value_sexpr(b.left(), schema)?;
     let (r, rt) = value_sexpr(b.right(), schema)?;
     if lt != rt {
@@ -343,17 +343,24 @@ fn comparison_sexpr(b: &BinaryExpr, schema: &Schema) -> Result<String, Why> {
         return Err("boolean comparison".into());
     }
     if is_float(&lt) {
-        // arrow-rs compares floats by IEEE 754 totalOrder (NaN above +inf, -0.0 below +0.0); the
-        // fused kernels use IEEE comparisons (NaN compares false, -0.0 == +0.0). They agree for a
-        // column against a finite non-zero literal except that NaN is greater than the literal, so
-        // gt/ge take `or (x != x)`. A column against a column, or against zero, is left.
+        // arrow-rs compares floats by IEEE 754 totalOrder (+NaN above +inf, -NaN below -inf, -0.0
+        // below +0.0); the fused kernels use IEEE comparisons (NaN compares false, -0.0 == +0.0).
+        // They agree for a column against a finite non-zero literal except that a (positive) NaN
+        // is greater than the literal, so gt/ge take `or (x != x)`. A NaN with the sign bit set
+        // is checked for at run time (`float_compared`: the node goes back to DataFusion). A
+        // column against a column, or against zero, is left.
         let lit_right = b.right().downcast_ref::<Literal>();
         let lit_left = b.left().downcast_ref::<Literal>();
-        let (col, lit, flipped) = match (lit_left, lit_right) {
-            (None, Some(v)) => (l, v, false),
-            (Some(v), None) => (r, v, true),
+        let (col, lit, flipped, col_expr) = match (lit_left, lit_right) {
+            (None, Some(v)) => (l, v, false, b.left()),
+            (Some(v), None) => (r, v, true, b.right()),
             _ => return Err("float comparison not between a column and a literal".into()),
         };
+        if let Some(c) = column_of(col_expr) {
+            if !floats.contains(&c.index()) {
+                floats.push(c.index());
+            }
+        }
         let v = match lit.value() {
             ScalarValue::Float64(Some(x)) => *x,
             ScalarValue::Float32(Some(x)) => *x as f64,
@@ -392,6 +399,7 @@ pub(crate) fn filter_op(
     projection: Option<Vec<usize>>,
 ) -> Result<MetalOp, Why> {
     check_schema(input_schema)?;
-    let sexpr = predicate_sexpr(predicate, input_schema)?;
-    Ok(MetalOp::Filter { predicate: sexpr, projection })
+    let mut float_compared = Vec::new();
+    let sexpr = predicate_sexpr(predicate, input_schema, &mut float_compared)?;
+    Ok(MetalOp::Filter { predicate: sexpr, projection, float_compared })
 }

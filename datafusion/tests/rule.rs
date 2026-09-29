@@ -114,7 +114,7 @@ async fn unsupported_shapes_are_left_with_a_reason() {
 }
 
 /// count(DISTINCT v) plans as an inner GROUP BY k, v with no aggregates under an outer count;
-/// the inner one is taken (a dummy row count stands in for the missing aggregate).
+/// the inner one is taken (sent as a group_by with no aggregates, which returns the distinct keys).
 #[tokio::test]
 async fn count_distinct_takes_the_inner_group_by() {
     let sql = "SELECT k, count(DISTINCT v) AS d FROM t GROUP BY k";
