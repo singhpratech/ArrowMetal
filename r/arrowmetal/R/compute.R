@@ -147,27 +147,128 @@ am_take <- function(x, indices) {
   .Call(C_am_take, am_array(x), am_array(indices))
 }
 
+null_placements <- c(at_end = 0L, at_start = 1L)
+float_orders <- c(ieee = 0L, total = 1L)
+
+sort_code <- function(value, table, what) {
+  if (!is.character(value) || length(value) != 1L || is.na(value) || !(value %in% names(table)))
+    stop("`", what, "` must be one of ", paste0('"', names(table), '"', collapse = ", "),
+         call. = FALSE)
+  table[[value]]
+}
+
+# The plain calls keep their own entry points, so the defaults run exactly the code they always did.
+sort_defaults <- function(null_placement, float_order)
+  identical(null_placement, "at_end") && identical(float_order, "ieee")
+
 #' Sort indices
 #'
-#' A stable GPU radix sort. Nulls go last and `NaN` sorts after `+Inf`; neither is mirrored to the
-#' front when `descending = TRUE`.
+#' A stable GPU radix sort. By default nulls go last and `NaN` sorts after `+Inf`; neither is
+#' mirrored to the front when `descending = TRUE`.
+#'
+#' `null_placement = "at_start"` puts the null rows first, in either direction. `float_order =
+#' "total"` orders a float column by IEEE 754 totalOrder, as arrow-rs and Rust's `total_cmp` define
+#' it: `-NaN < -Inf < ... < -0 < +0 < ... < +Inf < +NaN`, and a descending sort is its exact mirror.
+#' The default `"ieee"` is Arrow C++'s order: `-0` ties `+0`, every `NaN` is one value, and the `NaN`
+#' rows sit next to the nulls in both directions. Integer, string and temporal columns ignore
+#' `float_order`. Neither option adds a pass to the GPU sort.
 #'
 #' @param x An `am_array`, or anything [am_array()] accepts.
 #' @param descending Sort largest first.
+#' @param null_placement `"at_end"` (the default) or `"at_start"`, as in Arrow's sort options.
+#' @param float_order `"ieee"` (the default) or `"total"`.
 #' @return An int32 `am_array` of zero-based indices.
+#' @examples
+#' if (am_available()) {
+#'   x <- c(2, NA, -0, NaN, 0, -Inf)
+#'   as.vector(am_argsort(x, null_placement = "at_start", float_order = "total"))
+#' }
 #' @export
-am_argsort <- function(x, descending = FALSE) {
+am_argsort <- function(x, descending = FALSE, null_placement = "at_end", float_order = "ieee") {
   am_require()
-  .Call(C_am_argsort, am_array(x), isTRUE(descending))
+  if (sort_defaults(null_placement, float_order))
+    return(.Call(C_am_argsort, am_array(x), isTRUE(descending)))
+  .Call(C_am_argsort_ex, am_array(x), isTRUE(descending),
+        sort_code(null_placement, null_placements, "null_placement"),
+        sort_code(float_order, float_orders, "float_order"))
 }
 
 #' Sorted copy of a column
 #' @inheritParams am_argsort
 #' @return An `am_array` of the same type as `x`.
 #' @export
-am_sort <- function(x, descending = FALSE) {
+am_sort <- function(x, descending = FALSE, null_placement = "at_end", float_order = "ieee") {
   am_require()
-  .Call(C_am_sort, am_array(x), isTRUE(descending))
+  if (sort_defaults(null_placement, float_order))
+    return(.Call(C_am_sort, am_array(x), isTRUE(descending)))
+  .Call(C_am_sort_ex, am_array(x), isTRUE(descending),
+        sort_code(null_placement, null_placements, "null_placement"),
+        sort_code(float_order, float_orders, "float_order"))
+}
+
+#' Indices of the k largest or smallest values
+#'
+#' The first `k` indices [am_argsort()] gives with `descending = largest` and the same options,
+#' found by GPU selection rather than a whole sort.
+#'
+#' @inheritParams am_argsort
+#' @param k Number of rows (a whole number, 0 or more; past the length gives every row).
+#' @param largest The `k` largest (default) or, with `FALSE`, the `k` smallest.
+#' @return An int32 `am_array` of zero-based indices, in sorted order.
+#' @examples
+#' if (am_available()) as.vector(am_top_k(c(5, NA, 9, 1), 2))
+#' @export
+am_top_k <- function(x, k, largest = TRUE, null_placement = "at_end", float_order = "ieee") {
+  am_require()
+  if (!is.numeric(k) || length(k) != 1L || is.na(k) || k < 0 || k != trunc(k))
+    stop("`k` must be a whole number, 0 or more", call. = FALSE)
+  if (sort_defaults(null_placement, float_order))
+    return(.Call(C_am_top_k, am_array(x), as.double(k), isTRUE(largest)))
+  .Call(C_am_top_k_ex, am_array(x), as.double(k), isTRUE(largest),
+        sort_code(null_placement, null_placements, "null_placement"),
+        sort_code(float_order, float_orders, "float_order"))
+}
+
+#' Sort indices over several columns
+#'
+#' Orders the rows by each column in turn, the first column the most significant. Each of
+#' `descending`, `null_placement` and `float_order` is one value for every column or a vector with
+#' one per column, so each key can have its own direction, null placement and float order.
+#'
+#' @param columns A list of columns: `am_array`s or anything [am_array()] accepts, all one length.
+#' @param descending Logical, one per column or one for all.
+#' @param null_placement `"at_end"` or `"at_start"`, one per column or one for all.
+#' @param float_order `"ieee"` or `"total"`, one per column or one for all.
+#' @return An int32 `am_array` of zero-based indices.
+#' @examples
+#' if (am_available()) {
+#'   as.vector(am_lexsort(list(c(1, 1, 2), c(3, NA, 1)), descending = c(FALSE, TRUE),
+#'                        null_placement = c("at_end", "at_start")))
+#' }
+#' @export
+am_lexsort <- function(columns, descending = FALSE, null_placement = "at_end", float_order = "ieee") {
+  am_require()
+  columns <- as.list(columns)
+  n <- length(columns)
+  if (!n) stop("am_lexsort needs at least one column", call. = FALSE)
+  per_key <- function(v, what) {
+    if (length(v) == 1L) return(rep(v, n))
+    if (length(v) != n)
+      stop("`", what, "` has ", length(v), " entries for ", n, " columns", call. = FALSE)
+    v
+  }
+  desc <- per_key(descending, "descending")
+  if (!is.logical(desc) || anyNA(desc)) stop("`descending` must be TRUE or FALSE", call. = FALSE)
+  handles <- lapply(columns, am_array)
+  places <- per_key(null_placement, "null_placement")
+  orders <- per_key(float_order, "float_order")
+  if (all(places == "at_end") && all(orders == "ieee"))
+    return(.Call(C_am_lexsort, handles, as.integer(desc), NULL, NULL))
+  .Call(C_am_lexsort, handles, as.integer(desc),
+        vapply(places, sort_code, integer(1), table = null_placements, what = "null_placement",
+               USE.NAMES = FALSE),
+        vapply(orders, sort_code, integer(1), table = float_orders, what = "float_order",
+               USE.NAMES = FALSE))
 }
 
 #' A zero-copy slice of a column

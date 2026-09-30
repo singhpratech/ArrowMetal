@@ -2,8 +2,9 @@
 
 A Go module that hands an `arrow.Array` from [Apache Arrow Go](https://github.com/apache/arrow-go)
 to the GPU and takes the answer back, over the Arrow C Data Interface. It wraps a deliberately small
-part of the C ABI: import and export, the four reductions, compare, filter, take, sort, argsort,
-lexsort, group-by, and the JSON plan runner. Everything it wraps has a test against Arrow Go's own
+part of the C ABI: import and export (one array or a column in chunks), the four reductions,
+compare, filter, take, sort, argsort, top-k and lexsort (with per-key null placement and float order),
+group-by, and the JSON plan runner. Everything it wraps has a test against Arrow Go's own
 compute or against a plain Go loop on the same data. Everything it does not wrap is listed under
 [What is not wrapped](#what-is-not-wrapped).
 
@@ -98,6 +99,75 @@ func main() {
 ```
 
 Run it with `ARROWMETAL_LIB=/path/to/.build/release/libArrowMetalC.dylib go run .`.
+
+---
+
+## Sort options
+
+`Argsort`, `Sort`, `TopK` and `Lexsort` keep the order they always had: nulls last and NaN after
++Inf in both directions, -0.0 tied with +0.0. The `With` forms take a `SortOptions` per key:
+
+```go
+type SortOptions struct {
+	Descending bool
+	Nulls      NullPlacement // NullsLast (the default) or NullsFirst, in either direction
+	FloatOrder FloatOrder    // FloatIEEE (the default) or FloatTotal
+}
+
+func (a *Array) ArgsortWith(o SortOptions) (*Array, error)
+func (a *Array) SortWith(o SortOptions) (*Array, error)
+func (a *Array) TopK(k int64, largest bool) (*Array, error)
+func (a *Array) TopKWith(k int64, o SortOptions) (*Array, error) // o.Descending: the k largest
+func LexsortWith(columns []*Array, keys []SortOptions) (*Array, error)
+```
+
+`FloatIEEE` is Arrow C++'s order, which arrow-go's `compute.SortIndices` also uses: -0.0 ties +0.0,
+every NaN is one value, and the NaN rows sit next to the nulls in both directions. `FloatTotal` is
+IEEE 754 totalOrder, the order arrow-rs and Rust's `total_cmp` use: -NaN < -Inf < … < -0.0 < +0.0 <
+… < +Inf < +NaN, NaNs by payload, and a descending sort is its exact mirror. Integer, string and
+temporal keys ignore the float order. The zero `SortOptions` gives what `Argsort(false)` gives.
+`TopKWith(k, o)` answers with the first `k` indices `ArgsortWith(o)` gives. Neither option adds a pass
+to the GPU sort.
+
+```go
+// src is [2, null, NaN, -0, 7]
+plain, _ := gpu.Argsort(true)       // [4 0 3 2 1]: nulls and NaN stay last
+opts := am.SortOptions{Descending: true, Nulls: am.NullsFirst, FloatOrder: am.FloatTotal}
+total, _ := gpu.ArgsortWith(opts)   // [1 2 4 0 3]: the null, then +NaN > 7 > 2 > -0
+top, _ := gpu.TopKWith(2, opts)     // [1 2]
+```
+
+(`ExampleArray_ArgsortWith` in `example_test.go` runs this.) A plan's `sort` key takes the same
+options as JSON: `{"column": "x", "descending": true, "nulls": "first", "float_order": "total"}` or
+`["x", true, {"nulls": "first"}]` ([ENGINE.md](ENGINE.md)).
+
+## Chunked import
+
+A column held as several `arrow.Array`s of one type imports as one `Array` of their total length,
+without `array.Concatenate`:
+
+```go
+func ImportChunks(chunks []arrow.Array) (*Array, error)
+func ImportChunked(c *arrow.Chunked) (*Array, error)
+func ImportColumn(batches []arrow.RecordBatch, i int) (*Array, error)
+func NewSourceFromBatches(name string, batches []arrow.RecordBatch) (*Source, error)
+func ChunksSupported(dt arrow.DataType) (bool, error)
+```
+
+```go
+gpu, err := am.ImportChunked(chunked) // chunks [1 2] and [3 null 5]
+sum, _ := gpu.Sum()                   // gpu.Len() 5, gpu.NullCount() 1, sum 11
+```
+
+(`ExampleImportChunks` runs this.) Every chunk crosses the C Data Interface on its own and
+`am_import_chunks` copies its buffers straight into the final Metal buffers, on the CPU cores in
+parallel. Each chunk's offset, length, validity bitmap (or its absence) and null count are honoured.
+One chunk is `Import`, with its copy rule. A type the chunked import does not take (dictionary,
+nested, run-end encoded, extension; `ChunksSupported` reports it) is concatenated with
+`array.Concatenate` and imported. The chunks stay the caller's: `ImportChunks` hands each one to C
+exactly once, pins its buffers for the call, and the library releases each export it took; the
+caller releases the chunks as usual. `NewSourceFromBatches` registers every column of a run of
+record batches this way, and the `Source` keeps those handles until its own `Release`.
 
 ---
 
@@ -239,14 +309,62 @@ above are not per-core figures.
   doing strictly less work than the other two Filter rows. It is included because it is what a Go
   programmer writes when they have not reached for Arrow yet.
 
+### Chunked import against concatenating first
+
+`go run ./cmd/amchunks`: a column in chunks, each chunk its own allocation from Arrow Go's default
+allocator, imported with `ImportChunks` against `array.Concatenate` then `Import`, both end to end
+with the handle (and the concatenation) released inside the timed call. M4 Max, 2026-09-29, Go
+1.27.1, arrow-go v18.7.0; three rounds, each row warmed for 100 ms and then timed 10 times; best of
+the three rounds, and the median of the per-round medians in parentheses; CPU is process CPU time per
+call. Source: `Benchmarks/results/bindings_chunked_import_2026-09-29.csv`.
+
+| Column | Rows | Chunks | Concatenate + `Import` | `ImportChunks` | CPU ms (concatenate / chunked) |
+|---|---:|---:|---:|---:|---:|
+| float64, 10% null | 10,000,000 | 153 | 2.18 (3.79) ms | 0.73 (1.04) ms | 3.9 / 8.5 |
+| float64, 10% null | 10,000,000 | 10 | 2.21 (4.01) ms | 0.63 (0.95) ms | 4.1 / 8.6 |
+| float64, 10% null | 50,000,000 | 763 | 8.76 (15.41) ms | 3.06 (3.75) ms | 15.2 / 37.1 |
+| float64, 10% null | 50,000,000 | 50 | 8.14 (15.57) ms | 2.78 (3.20) ms | 14.0 / 39.0 |
+| int64 | 10,000,000 | 153 | 1.83 (3.40) ms | 0.59 (0.67) ms | 3.5 / 6.9 |
+| int64 | 10,000,000 | 10 | 1.83 (3.28) ms | 0.54 (0.58) ms | 3.3 / 5.9 |
+| int64 | 50,000,000 | 763 | 8.22 (15.60) ms | 2.55 (2.79) ms | 14.5 / 31.2 |
+| int64 | 50,000,000 | 50 | 8.01 (15.27) ms | 2.21 (2.69) ms | 14.3 / 31.4 |
+
+The chunked import copies each chunk once, straight into the Metal buffers, on the CPU cores in
+parallel; the concatenation copies every byte once, and the import then borrows or copies the result
+by the copy rule above. The parallel copy takes 1.8x to 2.8x the CPU time of the concatenation per
+call (the last column).
+
+### The existing calls, before and after
+
+`go run ./cmd/ambench` times the calls that existed before the sort options and the chunked import,
+built from the previous commit and from this one against the same `libArrowMetalC.dylib`, in four
+alternating rounds (each row warmed for 100 ms, a 500 ms idle and one call timed on its own, then 30
+calls); best of the four rounds, the median of the per-round medians in parentheses. The Go code of
+these calls is unchanged; the shim resolves seven more entry points at load. At 10M rows:
+
+| Call | Previous commit | This commit |
+|---|---:|---:|
+| `Import` + `Release`, page-aligned int64 | 0.03 (0.06) ms | 0.01 (0.02) ms |
+| `Argsort(false)`, float64 with 10% nulls | 7.35 (7.93) ms | 7.16 (8.11) ms |
+| `Argsort(true)`, int64 | 7.95 (8.59) ms | 7.84 (8.64) ms |
+| `Sort(false)`, float64 with 10% nulls | 6.98 (7.69) ms | 6.70 (7.64) ms |
+| `Lexsort`, int64 then float64 descending | 18.28 (18.85) ms | 18.32 (18.58) ms |
+
+At 1,000 and 1,000,000 rows three rows were slower in both best and median in the four rounds
+(`Argsort(true)` at 1,000 rows, `Lexsort` at 1,000 and 1,000,000 rows); timed again alone, eight
+alternating rounds of 100 calls, this commit over the previous one is 1.02 / 1.14 (best / median) for
+`Argsort(true)` at 1,000 rows (0.39 / 0.50 ms against 0.38 / 0.44 ms) and 0.97 / 1.04 and 1.02 / 1.02
+for `Lexsort` at 1,000 and 1,000,000 rows. Every row, with first-call-after-idle and CPU time:
+`Benchmarks/results/bindings_call_overhead_2026-09-29_summary.csv`.
+
 ---
 
 ## What is covered
 
 `include/arrowmetal.h` and `include/arrow_abi.h` in the module are copies of the repository's `include/` headers; refresh them (`cp include/arrowmetal.h go/arrowmetal/include/`) whenever the header changes, or `python/tests/test_header_copies.py` and `TestHeadersMatchRepository` fail.
 
-Every item below has at least one test in `go/arrowmetal`; the oracle is named. 46 test functions and one `Example`, 47 runnable;
-178 cases counting subtests, all green.
+Every item below has at least one test in `go/arrowmetal`; the oracle is named. 61 test functions and three `Example`s, 64 runnable;
+419 cases counting subtests, all green, plain, under `-race` and under `GOEXPERIMENT=cgocheck2`.
 
 | Surface | Go API | Oracle |
 |---|---|---|
@@ -262,6 +380,8 @@ Every item below has at least one test in `go/arrowmetal`; the oracle is named. 
 | Sort | `(*Array).Sort` | `compute.SortArray`, ascending and descending, nulls at end |
 | Argsort | `(*Array).Argsort` | `compute.SortIndicesArray`, index for index, on data with heavy ties |
 | Lexsort | `Lexsort` | `sort.SliceStable` over the same two columns |
+| Sort options | `ArgsortWith`, `SortWith`, `TopK`, `TopKWith`, `LexsortWith` | index for index against a stable `sort.SliceStable` reference of the documented order, every direction × null placement × float order, on Float64 and Float32 columns holding NaN of both signs and several payloads, ±0.0, ±Inf and subnormals, with nulls, at 0 to 100,001 rows; the IEEE order also against arrow-go's `compute.SortIndicesArray` / `SortIndicesRecordBatch` with `SortNullsAtStart`; `SortWith` bit for bit; `TopKWith` against the head of `ArgsortWith` at k = 0 to past the length; the zero options against the plain calls; a plan `sort` key with `nulls` and `float_order` |
+| Chunked import | `ImportChunks`, `ImportChunked`, `ImportColumn`, `NewSourceFromBatches`, `ChunksSupported` | `array.Equal` against the concatenation and against `Import` of it, over 15 types (integers, floats, boolean, date32, timestamp, decimal128, fixed_size_binary, utf8, large_utf8, binary, utf8_view) and five layouts (empty, one-row, sliced, all-null and no-null chunks mixed; one chunk; all empty; all null; 1,000 small chunks), built with arrow-go's checked allocator so every chunk has to be released exactly once; dictionary chunks through the concatenation; sum and every sort option on a 40-chunk column; a plan over record batches |
 | Group-by | `NewGroupBy`, `.Sum/.Count/.CountAll/.Mean/.Min/.Max/.Key/.IDs` | plain Go maps; one and two key columns, 1 to 1000 groups, null keys, float values, zero rows |
 | JSON plan runner | `NewSource`, `RunPlan`, `ExplainPlan`, `PlanResult.RecordBatch` | plain Go; the header's own group-by/sort/limit example, optimized against unoptimized, a type-check failure |
 | Slice on the GPU | `(*Array).Slice` | the same rows read from the source |
@@ -280,7 +400,9 @@ Sizes are at or below 10M elements throughout.
 
 ## What is not wrapped
 
-The C ABI has 283 entry points; this binding resolves 33 of them. Not wrapped, and not tested from
+The C ABI has 283 entry points; this binding resolves 40 of them (34 it needs, and 6 newer ones it
+uses when the loaded library has them: an older library still loads, and the calls that need them
+return an error naming the missing entry point). Not wrapped, and not tested from
 Go:
 
 - **Arithmetic and math**: `am_arith_scalar`, `am_arith_array`, `am_unary`, `am_binary`,
@@ -290,8 +412,8 @@ Go:
 - **Temporal**: `am_temporal_extract`, `am_temporal_cast_unit`, `am_round_temporal_ex`,
   `am_add_interval`.
 - **Types**: decimals, dictionaries beyond what import/export carries through, nested types (list,
-  struct, map, union), run-end encoding, and every `_ex` option variant (`am_argsort_ex`,
-  `am_rank_ex`, `am_is_in_ex`, …).
+  struct, map, union), run-end encoding, and the `_ex` option variants other than the sorts'
+  (`am_rank_ex`, `am_is_in_ex`, …).
 - **Structural and conditional**: `am_is_null`, `am_fill_null`, `am_drop_null`, `am_if_else`,
   `am_coalesce`, `am_is_in`, `am_index_in`, the Kleene operators.
 - **Aggregates beyond the four**: `am_reduce_ex` (product, variance, stddev), and the grouped
@@ -302,8 +424,8 @@ Go:
   you across calls.
 - **Whole subsystems**: Parquet (`am_parquet_*`), streaming (`am_stream_*`), the device interface
   (`am_import_device` / `am_export_device`), joins (`am_join`).
-- `arrow.RecordBatch` and `arrow.Table` go in only one at a time, column by column. `PlanResult` can
-  produce a `RecordBatch`; nothing consumes one.
+- `arrow.Table` has no entry point of its own; its columns go in as `arrow.Chunked`
+  (`ImportChunked`), and a run of `arrow.RecordBatch`es as a `Source` (`NewSourceFromBatches`).
 
 Adding any of these is mechanical: a prototype in `amshim.h`, a pointer and a forwarder in
 `amshim.c`, a method in Go, and a test with an oracle.

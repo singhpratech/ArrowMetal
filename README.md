@@ -257,9 +257,9 @@ exchanging columns through the Arrow C Data Interface and each with its own test
 | Binding | Where | Tests | Doc |
 |---|---|---|---|
 | Rust | `rust/arrowmetal`, `rust/arrowmetal-sys`; [crates.io](https://crates.io/crates/arrowmetal) | 48 tests plus 4 `no_run` doc-tests | [docs/RUST.md](docs/RUST.md) |
-| Go | `go/arrowmetal` | 46 test functions and one example, 47 runnable | [docs/GO.md](docs/GO.md) |
-| TypeScript / JavaScript | `node/` (N-API addon) | 62 tests | [docs/TYPESCRIPT.md](docs/TYPESCRIPT.md) |
-| R | `r/arrowmetal` | 68 `test_that()` blocks in the sources (69 as testthat runs them: the one in test-dispatch.R runs once per attach order), 273 expectations | [docs/R.md](docs/R.md) |
+| Go | `go/arrowmetal` | 61 test functions and three examples, 64 runnable | [docs/GO.md](docs/GO.md) |
+| TypeScript / JavaScript | `node/` (N-API addon) | 76 tests | [docs/TYPESCRIPT.md](docs/TYPESCRIPT.md) |
+| R | `r/arrowmetal` | 83 `test_that()` blocks in the sources (84 as testthat runs them: the one in test-dispatch.R runs once per attach order), 778 expectations | [docs/R.md](docs/R.md) |
 
 C and C++ callers use the header directly. Any language with an Arrow binding can use the same header.
 

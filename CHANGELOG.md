@@ -47,6 +47,57 @@
     alone's first run after the same idle at 50M rows, after 500 ms or 5 s) and 16 by a hand-back of
     the same shape at 50M rows below 0.97x on the best or the median run (lowest 0.901x).
 
+- Go, Node and R: the per-key sort options and the chunked import.
+  - Go (`go/arrowmetal`): `SortOptions{Descending, Nulls, FloatOrder}` (`NullsLast` / `NullsFirst`,
+    `FloatIEEE` / `FloatTotal`) on `(*Array).ArgsortWith`, `SortWith`, `TopKWith` and
+    `LexsortWith(columns, []SortOptions)`, and `(*Array).TopK`; `ImportChunks([]arrow.Array)`,
+    `ImportChunked(*arrow.Chunked)`, `ImportColumn([]arrow.RecordBatch, i)`,
+    `NewSourceFromBatches` and `ChunksSupported`, with no `array.Concatenate` for the types the
+    chunked import takes. Each chunk's buffers are pinned for the call and each export is handed to C
+    once.
+  - Node: `argsort`, `sort` and `topK` take `{ descending | largest, nulls: 'last' | 'first',
+    floatOrder: 'ieee' | 'total' }` as well as the boolean they took, and `lexsort` takes one
+    `SortOptions` per key; `MetalArray.fromChunks` imports `Data` chunks or `Vector`s of one type as
+    one array, and `fromArrow` of a `Vector` with more than one chunk, which was refused, now imports
+    through it.
+  - R: `null_placement` (`"at_end"` / `"at_start"`) and `float_order` (`"ieee"` / `"total"`) on
+    `am_argsort()` and `am_sort()`, and `am_top_k()` and `am_lexsort()` with the same arguments;
+    `am_array_chunks()` imports a ChunkedArray or a list of Arrays, reading the chunks in C from one
+    `ArrowArrayStream`, so the R side does the same work for 10 chunks as for 1,000. `am_array()` of a
+    ChunkedArray still concatenates first.
+  - With the default options every existing call runs the entry point it ran before. The six new
+    entry points are resolved when the library has them: an older `libArrowMetalC.dylib` still loads,
+    and a new call names the entry point it lacks.
+  - Tests: Go 61 test functions and 3 examples (15 functions and 2 examples new), 419 results with
+    subtests, plain, under `-race` and under `GOEXPERIMENT=cgocheck2`; Node 76 tests (14 new); R 84
+    `test_that()` blocks as testthat runs them (15 new), 778 expectations. The sorts are checked index
+    for index against arrow-go's `SortIndices` and arrow R's `array_sort_indices` for the IEEE order
+    with nulls last, and against a stable reference of the documented order for every direction,
+    null placement and float order, on columns holding NaN of both signs and several payloads, ±0.0,
+    ±inf and subnormals; `top-k` against the head of the argsort; the chunked import against the
+    import of the concatenation over empty, one-row, sliced, all-null and no-null chunks.
+  - Measured on an M4 Max (`Benchmarks/results/bindings_chunked_import_2026-09-29.csv`, three rounds,
+    best): the chunked import against concatenating first and importing, int64 at 50M rows in 763
+    chunks, Go 8.22 → 2.55 ms, Node 7.49 → 2.65 ms, R 7.74 → 3.37 ms with `gc()` between calls; float64
+    with 10% nulls at 50M rows in 50 chunks, Go 8.14 → 2.78 ms, Node 80.17 → 2.58 ms (the JS
+    concatenation assembles the validity bitmap), R 6.02 → 3.07 ms. At 10M rows the chunked import is
+    3.0x to 3.5x faster in Go, 2.7x to 22.2x in Node and 1.3x to 1.5x in R (with `gc()`). The chunked
+    import uses more CPU time per call (int64, 50M rows, 763 chunks: Go 14.5 → 31.2 CPU-ms). In R,
+    with handles left to the collector, it is at 0.97x to 1.93x the time of the concatenation at 10M
+    rows (docs/R.md, To improve).
+  - The existing calls, previous commit against this one, four alternating rounds, best
+    (`Benchmarks/results/bindings_call_overhead_2026-09-29_summary.csv`): at 10M rows every sort,
+    argsort and lexsort in the three bindings is within 0.96x to 1.15x in best and 0.96x to 1.18x in
+    median, and no import row (0.008 to 4.15 ms) is slower in both by more than 5% (15% under 1 ms).
+    The three rows at 1,000 and 1,000,000 rows that were (Go `Argsort(true)` at 1,000 rows, `Lexsort`
+    at 1,000 and 1,000,000) were timed again alone, eight rounds of 100 calls: 0.97x to 1.02x in best
+    and 1.02x to 1.14x in median.
+  - Node `fromArrow` of an int64 vector, a few microseconds per call, timed again alone: 1.83x the
+    CPU time at 10M rows in eight rounds of 100 calls (0.016 → 0.029 ms) and 0.72x in two rounds of
+    1,000 calls; 2.7x in best at 1,000 rows in the rounds of 1,000 calls (0.0012 → 0.0032 ms), where
+    this build's process placed the 1,000-row vector's 8 KB buffer off a page boundary and the import
+    copied it.
+
 - Chunked import: a column held as many Arrow arrays (a pyarrow `ChunkedArray`, a multi-chunk Polars
   Series, one column of a stream of arrow-rs `RecordBatch`es) imports in one call, each chunk written
   straight into the final Metal buffers on the CPU cores in parallel, with no concatenated copy first.
@@ -108,8 +159,8 @@
   - Python: `float_order=` on `MetalArray.argsort` / `sort`, `null_placement=` and `float_order=` on
     `top_k`, per-key lists on `lexsort_indices`, and `null_placement=` / `float_order=` on the lazy
     `sort`. Rust: `Array::argsort_with` / `sort_with` / `top_k_with`, `arrowmetal::lexsort`, and
-    `SortOptions` (with `From<arrow::compute::SortOptions>`, which selects totalOrder). Go, Node and R
-    do not expose the options yet.
+    `SortOptions` (with `From<arrow::compute::SortOptions>`, which selects totalOrder). Go, Node and R:
+    the entry below.
   - Measured on an M4 Max with `Benchmarks/sort_options_bench.py`: the builds before and after, in
     one process and timed alternately, best of five
     (`Benchmarks/results/sort_options_2026-09-28.csv`). With no options, every sort entry point stays

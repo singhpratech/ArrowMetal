@@ -65,6 +65,66 @@ const gb = groupBy(region);
 [...gb.sum(amount).toArrow()];                   // [400n, 300n]
 ```
 
+## Sort options
+
+`argsort`, `sort` and `topK` take either the boolean they always took or an options object, and
+`lexsort` takes one options object per key:
+
+```ts
+type NullPlacement = 'last' | 'first';
+type FloatOrder = 'ieee' | 'total';
+interface SortOptions { descending?: boolean; nulls?: NullPlacement; floatOrder?: FloatOrder }
+interface TopKOptions { largest?: boolean; nulls?: NullPlacement; floatOrder?: FloatOrder }
+
+argsort(options?: boolean | SortOptions): MetalArray
+sort(options?: boolean | SortOptions): MetalArray
+topK(k: number, options?: boolean | TopKOptions): MetalArray   // a boolean is `largest`, default true
+lexsort(columns: MetalArray[], keys?: boolean[] | SortOptions[]): MetalArray
+```
+
+A boolean, or nothing, is the order the plain calls have always had: nulls last and NaN after
++Infinity in both directions, -0 tied with +0. `nulls: 'first'` puts the null rows first in either
+direction. `floatOrder: 'ieee'` (the default) is Arrow C++'s order: -0 ties +0, every NaN is one
+value, and the NaN rows sit next to the nulls in both directions. `floatOrder: 'total'` is IEEE 754
+totalOrder, the order arrow-rs and Rust's `total_cmp` use: -NaN < -Infinity < … < -0 < +0 < … <
++Infinity < +NaN, and a descending sort is its exact mirror. Integer, string and temporal keys ignore
+the float order. `topK(k, options)` answers with the first `k` indices `argsort` gives in that
+direction with the same options.
+
+```ts
+const x = MetalArray.fromArrow(vectorFromArray([2, null, NaN, -0, 7], new Float64()));
+[...x.argsort(true).toTypedArray()];                                  // [4, 0, 3, 2, 1]
+[...x.argsort({ descending: true, nulls: 'first', floatOrder: 'total' }).toTypedArray()];
+                                                                      // [1, 2, 4, 0, 3]
+[...x.topK(2, { nulls: 'first', floatOrder: 'total' }).toTypedArray()]; // [1, 2]
+lexsort([region, amount], [{ nulls: 'first' }, { descending: true }]);
+```
+
+A plan's `sort` key takes the same options as JSON: `{ column: 'x', descending: true, nulls:
+'first', float_order: 'total' }` ([ENGINE.md](ENGINE.md)).
+
+## Chunked columns
+
+`MetalArray.fromChunks(chunks)` imports a column held as several chunks of one type — `Data`
+chunks, `Vector`s of any number of chunks, or a mix — as one array of their total length, with no
+concatenation in JS. `fromArrow` of a `Vector` with more than one chunk (a column of a `Table` built
+from several record batches) takes the same path.
+
+```ts
+const table = new Table([batch1, batch2, batch3]);   // or tableFromIPC(bytes)
+const k = MetalArray.fromArrow(table.getChild('k')!); // one array, every batch's rows
+const c = MetalArray.fromChunks([vectorFromArray([1n, 2n], new Int64()),
+                                 vectorFromArray([3n, null, 5n], new Int64())]);
+c.length;                                            // 5
+c.sum();                                             // 11n
+```
+
+Each chunk crosses the C Data Interface on its own and `am_import_chunks` copies its buffers straight
+into the final Metal buffers, on the CPU cores in parallel. Each chunk's offset, length and validity
+are honoured, and each chunk's V8 buffers stay pinned until ArrowMetal releases that chunk, as for
+`fromArrow`. One chunk in total is `fromArrow`, with its copy rule. Chunks of different types are
+refused with both types named.
+
 ## The copy rule
 
 **Copy-free out, always. Copy-free in when the producer's buffers are page aligned, one copy
@@ -160,7 +220,8 @@ lands on a page boundary and is still wrapped.
 | Arithmetic | `arith('+' \| '-' \| '*' \| '/', scalar)` | `am_arith_scalar` |
 | Cast | `cast(format)` | `am_cast` |
 | Selection | `filter`, `take`, `slice` | `am_filter`, `am_take`, `am_slice` |
-| Sorting | `argsort`, `sort`, `lexsort([...])` | `am_argsort`, `am_sort`, `am_lexsort` |
+| Sorting | `argsort`, `sort`, `topK`, `lexsort([...])`, each with per-key `nulls` and `floatOrder` | `am_argsort`, `am_sort`, `am_top_k`, `am_lexsort`; with options `am_argsort_ex2`, `am_sort_ex2`, `am_top_k_ex`, `am_lexsort_ex2` |
+| Chunked columns | `MetalArray.fromChunks`, `fromArrow` of a multi-chunk `Vector` | `am_import_chunks`, `am_import_chunks_supported` |
 | Group-by | `groupBy(keys).sum / mean / min / max / count`, `.keys(i)`, `.groups` | `am_group_by_keys` + `am_group_agg_ex` |
 | Query engine | `PlanSource.create`, `runPlan`, `explainPlan`, `PlanResult#column` | `am_plan_source_create`, `am_plan_run`, `am_plan_explain` |
 | Diagnostics | `info`, `bufferAddress`, `isPageAligned`, `wrappedProducerBuffers` | — |
@@ -178,12 +239,12 @@ The C ABI has 283 entry points. This binding wraps the ones above and no others.
 * strings beyond `utf8` import/export — no `am_str_unary`, `am_str_match`, `am_str_transform`,
   `am_regex`, `am_to_strings`, `am_parse`
 * temporal, decimal128/256, nested (list, struct, map, union), dictionary and run-end types
-* window functions, cumulative ops, `am_reduce_ex` / `am_reduce_ex2` statistics, `am_top_k`,
+* window functions, cumulative ops, `am_reduce_ex` / `am_reduce_ex2` statistics,
   `am_unary` / `am_binary` op tables, Kleene logic and conditionals
 * joins (`am_join`), IPC, Parquet, the streaming API (`am_stream_*`), the device C interface
   (`am_import_device` / `am_export_device`), batching (`am_batch_begin` / `am_batch_end`)
-* Arrow JS `Table` and `RecordBatch`; only a single-chunk `Vector` or `Data` is accepted. A chunked
-  vector is rejected with a message saying to concatenate it first, not silently concatenated.
+* Arrow JS `Table` and `RecordBatch` as a whole; their columns import one at a time, through
+  `fromArrow` / `fromChunks`.
 * every call is synchronous on the JS thread. There is no worker or async variant, so a long kernel
   blocks the event loop.
 
@@ -247,6 +308,58 @@ Reading the tables:
 Numbers are from an M4 Max on 2026-09-07. `node bench/spread.mjs` re-runs the whole thing;
 `node bench/bench.mjs` runs a single process and prints tables.
 
+### Chunked columns against concatenating first
+
+`node --expose-gc bench/chunks.mjs`: a column in chunks, each chunk its own Arrow JS `Data`, imported
+with `MetalArray.fromChunks` against what a program writes without it (copy the chunks into one typed
+array with `TypedArray.set`, assemble one validity bitmap bit by bit when there are nulls, then
+`fromTypedArray`), both end to end with the handle released inside the timed call. M4 Max,
+2026-09-29, node v24.9.0, apache-arrow 21.2.0; three rounds, each row warmed for 100 ms and then
+timed 10 times; best of the three rounds, the median of the per-round medians in parentheses; CPU is
+process CPU time per call. Source: `Benchmarks/results/bindings_chunked_import_2026-09-29.csv`.
+
+| Column | Rows | Chunks | Concatenate + import | `fromChunks` | CPU ms (concatenate / chunked) |
+|---|---:|---:|---:|---:|---:|
+| float64, 10% null | 10,000,000 | 153 | 16.16 (17.41) ms | 0.88 (1.16) ms | 22.1 / 8.9 |
+| float64, 10% null | 10,000,000 | 10 | 16.99 (17.33) ms | 0.77 (1.10) ms | 22.6 / 11.0 |
+| float64, 10% null | 50,000,000 | 763 | 81.68 (82.80) ms | 3.04 (3.77) ms | 86.0 / 39.0 |
+| float64, 10% null | 50,000,000 | 50 | 80.17 (81.26) ms | 2.58 (3.27) ms | 86.4 / 40.5 |
+| int64 | 10,000,000 | 153 | 1.88 (2.54) ms | 0.70 (0.83) ms | 4.8 / 9.4 |
+| int64 | 10,000,000 | 10 | 1.93 (2.38) ms | 0.55 (0.59) ms | 4.4 / 8.9 |
+| int64 | 50,000,000 | 763 | 7.49 (8.03) ms | 2.65 (2.98) ms | 11.4 / 32.8 |
+| int64 | 50,000,000 | 50 | 7.28 (8.14) ms | 2.29 (2.75) ms | 10.4 / 33.3 |
+
+The chunked import copies each chunk once, straight into the Metal buffers, on the CPU cores in
+parallel. For int64 it takes 2.0x to 3.2x the CPU time of the concatenation per call; for the
+nullable float64 column, where the concatenation assembles the validity bitmap in JS, it takes less.
+
+### The existing calls, before and after
+
+`node --expose-gc bench/overhead.mjs` times the calls that existed before, built from the previous
+commit and from this one against the same `libArrowMetalC.dylib`, in four alternating rounds (each
+row warmed for 100 ms, a 500 ms idle and one call timed on its own, then 30 calls); best of the four
+rounds, the median of the per-round medians in parentheses. At 10M rows:
+
+| Call | Previous commit | This commit |
+|---|---:|---:|
+| `fromArrow(vector).release()`, int64 | 0.016 (0.049) ms | 0.008 (0.015) ms |
+| `fromTypedArray(values, { validity }).release()`, float64 with 10% nulls | 0.014 (0.063) ms | 0.021 (0.058) ms |
+| `argsort(false)`, float64 with 10% nulls | 5.74 (5.90) ms | 5.72 (5.84) ms |
+| `argsort(true)`, int64 | 7.33 (7.51) ms | 7.32 (7.71) ms |
+| `sort(false)`, float64 with 10% nulls | 5.69 (6.10) ms | 5.60 (5.86) ms |
+| `lexsort`, int64 then float64 descending | 15.72 (16.33) ms | 15.98 (16.26) ms |
+
+In the four rounds `fromArrow` took 1.5x to 1.6x the CPU time per call at 1,000 and 1,000,000 rows
+(a few microseconds), so it was timed again alone, eight alternating rounds of 100 calls: best 0.37x,
+1.00x and 0.93x at 1,000, 1,000,000 and 10M rows, median 0.71x, 0.61x and 1.74x, and 1.83x the CPU
+time at 10M rows (0.016 against 0.029 ms per call). Two further rounds of 1,000 calls give 0.96x
+best, 0.81x median and 0.72x the CPU time at 10M rows, and 2.7x best at 1,000 rows (0.0032 against
+0.0012 ms): in this build's process the 8 KB buffer of the 1,000-row vector was not page aligned, so
+ArrowMetal copied it (`wrappedProducerBuffers` false), where the previous build's process had it
+aligned and borrowed it; the alignment table above shows that this varies at small sizes.
+Every row, with first-call-after-idle and CPU time:
+`Benchmarks/results/bindings_call_overhead_2026-09-29_summary.csv`.
+
 ## Limits
 
 * **macOS on Apple silicon, in Node.** No browser, no WASM, no Intel, no Linux.
@@ -255,7 +368,8 @@ Numbers are from an M4 Max on 2026-09-07. `node bench/spread.mjs` re-runs the wh
   be `BigInt`s (`amount.gt(60n)`, not `amount.gt(60)`); a `number` is accepted and truncated toward
   zero.
   Arrow JS's `Int64` vectors are `BigInt64Array`-backed, which matches.
-* **Single-chunk only.** `Table`, `RecordBatch` and chunked `Vector`s are not accepted.
+* **Column by column.** A `Table` or `RecordBatch` is imported one column at a time; a chunked
+  column goes through the chunked import.
 * **Synchronous.** Every call blocks the event loop for the length of the kernel.
 * **Handles are GC-managed.** A `MetalArray` holds GPU memory until it is collected; call
   `release()` in a loop that makes many of them. `release()` is safe at any point: it frees the
@@ -270,7 +384,7 @@ Numbers are from an M4 Max on 2026-09-07. `node bench/spread.mjs` re-runs the wh
 
 ## Tests
 
-62 tests, `node:test`, oracles are Apache Arrow JS and plain JS over the same rows.
+76 tests, `node:test`, oracles are Apache Arrow JS and plain JS over the same rows.
 `npm test` sets `NODE_OPTIONS=--expose-gc`, which the lifetime tests need.
 
 ```
@@ -280,11 +394,13 @@ ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib npm test
 
 | File | Tests | What it pins |
 |---|---:|---|
-| `test/interop.test.js` | 21 | round trip for all 12 carried types with nulls; sliced, doubly sliced, sliced-with-nulls, sliced utf8 and bool; chunked and unsupported input rejected by message; the alignment table above; wrapped-vs-copied proved by mutating the source buffer; short-buffer rejection with byte counts for validity, values, utf8 offsets, utf8 values and bool; utf8 offsets that decrease or start below zero, named by index; impossible `nullCount`s; type-tagged handles rejected across kinds; an argument-guard rejection never reporting a stale message; 10,000 import/compute/export cycles |
+| `test/interop.test.js` | 21 | round trip for all 12 carried types with nulls; sliced, doubly sliced, sliced-with-nulls, sliced utf8 and bool; a chunked vector imported as one array, and chunks of two types and an unsupported type rejected by message; the alignment table above; wrapped-vs-copied proved by mutating the source buffer; short-buffer rejection with byte counts for validity, values, utf8 offsets, utf8 values and bool; utf8 offsets that decrease or start below zero, named by index; impossible `nullCount`s; type-tagged handles rejected across kinds; an argument-guard rejection never reporting a stale message; 10,000 import/compute/export cycles |
 | `test/reductions.test.js` | 10 | sum/min/max/mean against plain-JS oracles for Int64 and Float64, with nulls, all-null, empty; 1,000,001 rows; Kahan-summed float oracle to 1e-9 relative; validity bitmaps with a known and an unknown null count |
 | `test/compute.test.js` | 18 | all six comparison ops against JS; null masks; filter on empty and at 1,000,001 rows; sort and argsort with nulls last and stable ties; sort at 1,000,001 rows against `Array.prototype.sort`; take, slice, arith, cast; groupBy sum/mean/min/max/count against a JS `Map`, including a null key group and 1,000,001 rows; lexsort |
 | `test/plan.test.js` | 7 | a filter → group_by → sort plan against the same steps in JS; optimized vs unoptimized agree; explain; a plan that does not type-check throws the engine's own message; an out-of-range column named by index and by name |
 | `test/lifetime.test.js` | 4 | a slice, a plan source and a group-by all still read the right bytes after the parent handle is released, every JS reference to the source array dropped, two collections forced and the freed pages trampled; and an exported `Vector` after its handle is released |
+| `test/sortoptions.test.js` | 9 | `argsort` / `sort` with every direction × null placement × float order, index for index and bit for bit against a stable plain-JS reference of the documented order, on Float64 columns holding NaN of both signs and several payloads, ±0, ±Infinity and subnormals, with nulls, at 0 to 100,001 rows; Int64 and Float32 columns; the boolean forms and the defaults equal to the options forms; `topK` against the head of `argsort` at k = 0 to past the length; `lexsort` with per-key options; a plan `sort` key with `nulls` and `float_order`; the examples on this page |
+| `test/chunks.test.js` | 5 | `fromChunks` and `fromArrow` of a multi-chunk `Vector` against the import of the concatenation, over 9 types and five layouts (empty, one-row, sliced, all-null and no-null chunks mixed; one chunk; all empty; all null; 300 small chunks); sum, max and sorts on a 30-chunk column; a `Table` of five record batches through a plan; refusals by message; chunk buffers kept pinned across collections |
 | `test/workers.test.js` | 2 | four `worker_threads` workers importing, deriving and releasing concurrently, each answering correctly; and workers that exit with references still parked, so the env cleanup hook has to drain them |
 
 Sizes are 0, small, and 1,000,001 — a length that crosses a threadgroup boundary. Nothing above

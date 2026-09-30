@@ -21,6 +21,10 @@ import (
 // with, so releasing the Arrays that went into it does not invalidate the source.
 type Source struct {
 	s *C.am_plan_source
+
+	// owned are handles the Source made itself (NewSourceFromBatches) and releases with itself, so
+	// the pins of a borrowed single-batch import last as long as the source can read those bytes.
+	owned []*Array
 }
 
 // NewSource registers a table under name. names and columns must be the same length; the columns are
@@ -74,6 +78,10 @@ func (s *Source) Release() {
 	}
 	C.amx_plan_source_release(s.s)
 	s.s = nil
+	for _, a := range s.owned {
+		a.Release() // after the source: it may have been reading their bytes
+	}
+	s.owned = nil
 	runtime.SetFinalizer(s, nil)
 }
 

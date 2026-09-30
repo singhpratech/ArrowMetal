@@ -48,6 +48,23 @@ int amx_take(am_array* a, am_array* indices, am_array** out);
 int amx_argsort(am_array* a, int descending, am_array** out);
 int amx_sort(am_array* a, int descending, am_array** out);
 int amx_lexsort(am_array** columns, const int* descending, int64_t count, am_array** out);
+int amx_top_k(am_array* a, int64_t k, int largest, am_array** out);
+
+// --- sort options and the chunked import --------------------------------------------------------
+// These entry points are newer than the rest. They are resolved when present and do not stop an
+// older dylib from loading; amshim_has_sort_options / amshim_has_import_chunks report whether they
+// were found, and the Go layer checks before calling.
+int amshim_has_sort_options(void);
+int amshim_has_import_chunks(void);
+int amx_argsort_ex2(am_array* a, int descending, int null_placement, int float_order, am_array** out);
+int amx_sort_ex2(am_array* a, int descending, int null_placement, int float_order, am_array** out);
+int amx_top_k_ex(am_array* a, int64_t k, int largest, int null_placement, int float_order,
+                 am_array** out);
+int amx_lexsort_ex2(am_array** columns, const int* descending, const int* null_placement,
+                    const int* float_order, int64_t count, am_array** out);
+int amx_import_chunks(const struct ArrowSchema* schema, struct ArrowArray* arrays, int64_t n,
+                      am_array** out);
+int amx_import_chunks_supported(const struct ArrowSchema* schema);
 
 // --- group by -------------------------------------------------------------------------------------
 int     amx_group_by_keys(am_array** columns, int64_t count, am_groupby** out);

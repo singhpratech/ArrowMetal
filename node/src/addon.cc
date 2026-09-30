@@ -72,6 +72,16 @@ struct Lib {
   int (*am_argsort)(am_array*, int, am_array**) = nullptr;
   int (*am_sort)(am_array*, int, am_array**) = nullptr;
   int (*am_lexsort)(am_array**, const int*, int64_t, am_array**) = nullptr;
+  int (*am_top_k)(am_array*, int64_t, int, am_array**) = nullptr;
+
+  // Newer than the rest: resolved when present, and an older dylib still loads without them. The
+  // entry points that need them say so by name (requireSymbol).
+  int (*am_argsort_ex2)(am_array*, int, int, int, am_array**) = nullptr;
+  int (*am_sort_ex2)(am_array*, int, int, int, am_array**) = nullptr;
+  int (*am_top_k_ex)(am_array*, int64_t, int, int, int, am_array**) = nullptr;
+  int (*am_lexsort_ex2)(am_array**, const int*, const int*, const int*, int64_t, am_array**) = nullptr;
+  int (*am_import_chunks)(const struct ArrowSchema*, struct ArrowArray*, int64_t, am_array**) = nullptr;
+  int (*am_import_chunks_supported)(const struct ArrowSchema*) = nullptr;
 
   int (*am_group_by_keys)(am_array**, int64_t, am_groupby**) = nullptr;
   int64_t (*am_group_by_group_count)(am_groupby*) = nullptr;
@@ -165,6 +175,7 @@ void loadLibrary(const std::string& packageDir) {
   bind(g.am_argsort, "am_argsort", missing);
   bind(g.am_sort, "am_sort", missing);
   bind(g.am_lexsort, "am_lexsort", missing);
+  bind(g.am_top_k, "am_top_k", missing);
   bind(g.am_group_by_keys, "am_group_by_keys", missing);
   bind(g.am_group_by_group_count, "am_group_by_group_count", missing);
   bind(g.am_group_by_keys_result, "am_group_by_keys_result", missing);
@@ -180,6 +191,14 @@ void loadLibrary(const std::string& packageDir) {
   bind(g.am_plan_column, "am_plan_column", missing);
   bind(g.am_plan_result_release, "am_plan_result_release", missing);
 
+  std::vector<std::string> optional;  // absent from an older dylib; not an error here
+  bind(g.am_argsort_ex2, "am_argsort_ex2", optional);
+  bind(g.am_sort_ex2, "am_sort_ex2", optional);
+  bind(g.am_top_k_ex, "am_top_k_ex", optional);
+  bind(g.am_lexsort_ex2, "am_lexsort_ex2", optional);
+  bind(g.am_import_chunks, "am_import_chunks", optional);
+  bind(g.am_import_chunks_supported, "am_import_chunks_supported", optional);
+
   if (!missing.empty()) {
     std::string msg = "ArrowMetal: " + chosen + " is missing entry points:";
     for (const auto& m : missing) msg += " " + m;
@@ -190,6 +209,15 @@ void loadLibrary(const std::string& packageDir) {
 void requireLoaded(const Napi::Env& env) {
   if (g.handle == nullptr) {
     throw Napi::Error::New(env, "ArrowMetal: library not loaded; call load(packageDir) first");
+  }
+}
+
+// For the optional entry points: a dylib that predates them is named, not crashed into.
+void requireSymbol(const Napi::Env& env, const void* fn, const char* name) {
+  requireLoaded(env);
+  if (fn == nullptr) {
+    throw Napi::Error::New(env, std::string("ArrowMetal: ") + g.path + " has no " + name +
+                                    "; it predates this entry point, so rebuild it.");
   }
 }
 
@@ -525,23 +553,13 @@ Napi::Value Load(const Napi::CallbackInfo& info) {
   return out;
 }
 
-// importArray(format, length, offset, nullCount, validity|null, data|null, offsets|null)
-Napi::Value ImportArray(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  requireLoaded(env);
-
-  std::string format = info[0].As<Napi::String>();
-  int64_t length = info[1].As<Napi::Number>().Int64Value();
-  int64_t offset = info[2].As<Napi::Number>().Int64Value();
-  int64_t nullCount = info[3].As<Napi::Number>().Int64Value();
-
-  int width = elementWidth(format.c_str());
-  if (width == 0) {
-    throw Napi::Error::New(
-        env, "ArrowMetal (Node): Arrow format \"" + format +
-                 "\" is not carried by this binding. Supported: c C s S i I l L f g b u.");
-  }
-
+// Fills `array` over the JS buffers of one array of `format`, checked against the Arrow layout for
+// offset + length rows, with an ImportPriv that pins them until ArrowMetal runs the release
+// callback; that callback sets `released`. On a throw nothing is left allocated.
+void fillImportArray(const Napi::Env& env, const std::string& format, int width, int64_t length,
+                     int64_t offset, int64_t nullCount, const Napi::Value& validityV,
+                     const Napi::Value& dataV, const Napi::Value& offsetsV,
+                     const std::shared_ptr<std::atomic<bool>>& released, struct ArrowArray* array) {
   if (length < 0 || offset < 0) {
     throw Napi::Error::New(env, "ArrowMetal (Node): length and offset must be >= 0, got length " +
                                     std::to_string(length) + " and offset " +
@@ -550,11 +568,7 @@ Napi::Value ImportArray(const Napi::CallbackInfo& info) {
   const int64_t rows = offset + length;  // the C Data Interface addresses rows [offset, offset+length)
 
   auto* priv = new ImportPriv();
-  // am_import moves the ArrowArray, which per the C Data Interface nulls our copy's release pointer
-  // whether it wrapped the buffers or copied them. This flag is the only way to tell the two apart:
-  // it is set if and only if ArrowMetal actually ran the release callback.
-  auto releasedFlag = std::make_shared<std::atomic<bool>>(false);
-  priv->released = releasedFlag;
+  priv->released = released;
   priv->owner = addonData(env);
 
   // Every buffer is checked against the size the Arrow layout requires for `rows` rows. Without
@@ -581,9 +595,9 @@ Napi::Value ImportArray(const Napi::CallbackInfo& info) {
   const int64_t bitmapBytes = (rows + 7) / 8;
   int64_t nBuffers = (width == -2) ? 3 : 2;
   try {
-    addBuffer(0, info[4], "validity", bitmapBytes);
+    addBuffer(0, validityV, "validity", bitmapBytes);
     if (width == -2) {
-      addBuffer(1, info[6], "utf8 offsets", (rows + 1) * 4);
+      addBuffer(1, offsetsV, "utf8 offsets", (rows + 1) * 4);
       // Arrow requires the offsets to start at or above 0 and never decrease. A violation would
       // make the values-buffer size check below meaningless and hand the kernels a negative
       // length, so it is rejected here with the index that broke it.
@@ -606,39 +620,73 @@ Napi::Value ImportArray(const Napi::CallbackInfo& info) {
         }
         neededBytes = offs[rows];
       }
-      addBuffer(2, info[5], "utf8 values", neededBytes);
+      addBuffer(2, dataV, "utf8 values", neededBytes);
     } else if (width == -1) {
-      addBuffer(1, info[5], "boolean values", bitmapBytes);
+      addBuffer(1, dataV, "boolean values", bitmapBytes);
     } else {
-      addBuffer(1, info[5], "values", rows * width);
+      addBuffer(1, dataV, "values", rows * width);
     }
   } catch (...) {
     delete priv;
     throw;
   }
 
-  struct ArrowSchema schema {};
-  schema.format = format.c_str();
-  schema.name = "";
-  schema.metadata = nullptr;
-  schema.flags = ARROW_FLAG_NULLABLE;
-  schema.n_children = 0;
-  schema.children = nullptr;
-  schema.dictionary = nullptr;
-  schema.release = importSchemaRelease;
-  schema.private_data = nullptr;
+  *array = ArrowArray{};
+  array->length = length;
+  array->null_count = nullCount;
+  array->offset = offset;
+  array->n_buffers = nBuffers;
+  array->n_children = 0;
+  array->buffers = priv->buffers;
+  array->children = nullptr;
+  array->dictionary = nullptr;
+  array->release = importArrayRelease;
+  array->private_data = priv;
+}
 
+void fillImportSchema(const std::string& format, struct ArrowSchema* schema) {
+  *schema = ArrowSchema{};
+  schema->format = format.c_str();
+  schema->name = "";
+  schema->metadata = nullptr;
+  schema->flags = ARROW_FLAG_NULLABLE;
+  schema->n_children = 0;
+  schema->children = nullptr;
+  schema->dictionary = nullptr;
+  schema->release = importSchemaRelease;
+  schema->private_data = nullptr;
+}
+
+int checkedWidth(const Napi::Env& env, const std::string& format) {
+  int width = elementWidth(format.c_str());
+  if (width == 0) {
+    throw Napi::Error::New(
+        env, "ArrowMetal (Node): Arrow format \"" + format +
+                 "\" is not carried by this binding. Supported: c C s S i I l L f g b u.");
+  }
+  return width;
+}
+
+// importArray(format, length, offset, nullCount, validity|null, data|null, offsets|null)
+Napi::Value ImportArray(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  requireLoaded(env);
+
+  std::string format = info[0].As<Napi::String>();
+  int64_t length = info[1].As<Napi::Number>().Int64Value();
+  int64_t offset = info[2].As<Napi::Number>().Int64Value();
+  int64_t nullCount = info[3].As<Napi::Number>().Int64Value();
+  int width = checkedWidth(env, format);
+
+  // am_import moves the ArrowArray, which per the C Data Interface nulls our copy's release pointer
+  // whether it wrapped the buffers or copied them. This flag is the only way to tell the two apart:
+  // it is set if and only if ArrowMetal actually ran the release callback.
+  auto releasedFlag = std::make_shared<std::atomic<bool>>(false);
   struct ArrowArray array {};
-  array.length = length;
-  array.null_count = nullCount;
-  array.offset = offset;
-  array.n_buffers = nBuffers;
-  array.n_children = 0;
-  array.buffers = priv->buffers;
-  array.children = nullptr;
-  array.dictionary = nullptr;
-  array.release = importArrayRelease;
-  array.private_data = priv;
+  fillImportArray(env, format, width, length, offset, nullCount, info[4], info[5], info[6],
+                  releasedFlag, &array);
+  struct ArrowSchema schema {};
+  fillImportSchema(format, &schema);
 
   am_array* out = nullptr;
   int rc = g.am_import(&schema, &array, &out);
@@ -655,6 +703,68 @@ Napi::Value ImportArray(const Napi::CallbackInfo& info) {
   auto* h = new ArrayHandle();
   h->p = out;
   h->retained = !releasedFlag->load();
+  return wrapHandle(env, h, kArrayTag);
+}
+
+// importChunks(format, [[length, offset, nullCount, validity|null, data|null, offsets|null], ...])
+//
+// One array from several chunks of one format (am_import_chunks): each chunk's buffers are copied
+// straight into the final Metal buffers, with no concatenated copy in JS first. Every chunk carries
+// its own ImportPriv, so each chunk's JS buffers stay pinned until ArrowMetal releases that chunk.
+Napi::Value ImportChunks(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  requireSymbol(env, reinterpret_cast<const void*>(g.am_import_chunks), "am_import_chunks");
+  std::string format = info[0].As<Napi::String>();
+  int width = checkedWidth(env, format);
+  Napi::Array parts = info[1].As<Napi::Array>();
+  const uint32_t n = parts.Length();
+  if (n == 0) throw Napi::Error::New(env, "ArrowMetal (Node): importChunks needs at least one chunk.");
+
+  struct ArrowSchema schema {};
+  fillImportSchema(format, &schema);
+  if (g.am_import_chunks_supported(&schema) == 0) {
+    schema.release(&schema);
+    throw Napi::Error::New(env, "ArrowMetal (Node): the chunked import does not take Arrow format \"" +
+                                    format + "\".");
+  }
+
+  std::vector<struct ArrowArray> arrays(n);
+  std::vector<std::shared_ptr<std::atomic<bool>>> flags;
+  flags.reserve(n);
+  auto releaseLeft = [&]() {
+    for (auto& a : arrays) {
+      if (a.release != nullptr) a.release(&a);
+    }
+  };
+  try {
+    for (uint32_t i = 0; i < n; i++) {
+      Napi::Array p = parts.Get(i).As<Napi::Array>();
+      flags.push_back(std::make_shared<std::atomic<bool>>(false));
+      fillImportArray(env, format, width, p.Get(0u).As<Napi::Number>().Int64Value(),
+                      p.Get(1u).As<Napi::Number>().Int64Value(),
+                      p.Get(2u).As<Napi::Number>().Int64Value(), p.Get(3u), p.Get(4u), p.Get(5u),
+                      flags.back(), &arrays[i]);
+    }
+  } catch (...) {
+    releaseLeft();
+    schema.release(&schema);
+    throw;
+  }
+
+  am_array* out = nullptr;
+  int rc = g.am_import_chunks(&schema, arrays.data(), static_cast<int64_t>(n), &out);
+  schema.release(&schema);
+  if (rc != 0) {
+    // A chunk whose release is still set was not moved and is still ours; the moved ones belong to
+    // ArrowMetal, which has released them or will.
+    releaseLeft();
+    if (rc == 2) check(env, rc);
+    const char* e = g.am_last_error();
+    throw Napi::Error::New(env, e != nullptr && *e != 0 ? e : "ArrowMetal: am_import_chunks failed");
+  }
+  auto* h = new ArrayHandle();
+  h->p = out;
+  for (const auto& f : flags) h->retained = h->retained || !f->load();
   return wrapHandle(env, h, kArrayTag);
 }
 
@@ -883,6 +993,75 @@ Napi::Value Lexsort(const Napi::CallbackInfo& info) {
   return wrapArray(env, out);
 }
 
+// The option-taking sorts. Null placement: 0 last, 1 first; float order: 0 ieee, 1 total.
+Napi::Value ArgsortEx(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  requireSymbol(env, reinterpret_cast<const void*>(g.am_argsort_ex2), "am_argsort_ex2");
+  auto* a = unwrapArray(env, info[0]);
+  am_array* out = nullptr;
+  check(env, g.am_argsort_ex2(a->p, info[1].ToBoolean().Value() ? 1 : 0,
+                              info[2].As<Napi::Number>().Int32Value(),
+                              info[3].As<Napi::Number>().Int32Value(), &out));
+  return wrapArray(env, out);
+}
+
+Napi::Value SortEx(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  requireSymbol(env, reinterpret_cast<const void*>(g.am_sort_ex2), "am_sort_ex2");
+  auto* a = unwrapArray(env, info[0]);
+  am_array* out = nullptr;
+  check(env, g.am_sort_ex2(a->p, info[1].ToBoolean().Value() ? 1 : 0,
+                           info[2].As<Napi::Number>().Int32Value(),
+                           info[3].As<Napi::Number>().Int32Value(), &out));
+  return wrapArray(env, out);
+}
+
+// topK(handle, k, largest)
+Napi::Value TopK(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  requireLoaded(env);
+  auto* a = unwrapArray(env, info[0]);
+  am_array* out = nullptr;
+  check(env, g.am_top_k(a->p, info[1].As<Napi::Number>().Int64Value(),
+                        info[2].ToBoolean().Value() ? 1 : 0, &out));
+  return wrapArray(env, out);
+}
+
+// topKEx(handle, k, largest, nullPlacement, floatOrder)
+Napi::Value TopKEx(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  requireSymbol(env, reinterpret_cast<const void*>(g.am_top_k_ex), "am_top_k_ex");
+  auto* a = unwrapArray(env, info[0]);
+  am_array* out = nullptr;
+  check(env, g.am_top_k_ex(a->p, info[1].As<Napi::Number>().Int64Value(),
+                           info[2].ToBoolean().Value() ? 1 : 0,
+                           info[3].As<Napi::Number>().Int32Value(),
+                           info[4].As<Napi::Number>().Int32Value(), &out));
+  return wrapArray(env, out);
+}
+
+// lexsortEx(columns, descending[], nullPlacement[], floatOrder[])
+Napi::Value LexsortEx(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  requireSymbol(env, reinterpret_cast<const void*>(g.am_lexsort_ex2), "am_lexsort_ex2");
+  Napi::Array cols = info[0].As<Napi::Array>();
+  Napi::Array descs = info[1].As<Napi::Array>();
+  Napi::Array places = info[2].As<Napi::Array>();
+  Napi::Array orders = info[3].As<Napi::Array>();
+  std::vector<am_array*> ptrs;
+  std::vector<int> desc, place, order;
+  for (uint32_t i = 0; i < cols.Length(); i++) {
+    ptrs.push_back(unwrapArray(env, cols.Get(i))->p);
+    desc.push_back(descs.Get(i).ToBoolean().Value() ? 1 : 0);
+    place.push_back(places.Get(i).As<Napi::Number>().Int32Value());
+    order.push_back(orders.Get(i).As<Napi::Number>().Int32Value());
+  }
+  am_array* out = nullptr;
+  check(env, g.am_lexsort_ex2(ptrs.data(), desc.data(), place.data(), order.data(),
+                              static_cast<int64_t>(ptrs.size()), &out));
+  return wrapArray(env, out);
+}
+
 Napi::Value GroupByKeys(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   requireLoaded(env);
@@ -1072,6 +1251,12 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("argsort", Napi::Function::New(env, Entry<Argsort>));
   exports.Set("sort", Napi::Function::New(env, Entry<Sort>));
   exports.Set("lexsort", Napi::Function::New(env, Entry<Lexsort>));
+  exports.Set("importChunks", Napi::Function::New(env, Entry<ImportChunks>));
+  exports.Set("argsortEx", Napi::Function::New(env, Entry<ArgsortEx>));
+  exports.Set("sortEx", Napi::Function::New(env, Entry<SortEx>));
+  exports.Set("topK", Napi::Function::New(env, Entry<TopK>));
+  exports.Set("topKEx", Napi::Function::New(env, Entry<TopKEx>));
+  exports.Set("lexsortEx", Napi::Function::New(env, Entry<LexsortEx>));
   exports.Set("groupByKeys", Napi::Function::New(env, Entry<GroupByKeys>));
   exports.Set("groupCount", Napi::Function::New(env, Entry<GroupCount>));
   exports.Set("groupKeysResult", Napi::Function::New(env, Entry<GroupKeysResult>));

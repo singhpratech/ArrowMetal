@@ -34,15 +34,22 @@
   X(am_child_count) X(am_child)                                                      \
   X(am_reduce) X(am_compare_scalar) X(am_compare_array)                              \
   X(am_filter) X(am_take) X(am_slice)                                                \
-  X(am_argsort) X(am_sort)                                                           \
+  X(am_argsort) X(am_sort) X(am_top_k) X(am_lexsort)                                \
   X(am_group_by_keys) X(am_group_by_group_count) X(am_group_by_keys_result)          \
   X(am_group_by_ids) X(am_group_by_release) X(am_group_agg_ex)                       \
   X(am_plan_source_create) X(am_plan_source_release) X(am_plan_run)                  \
   X(am_plan_explain) X(am_plan_column_count) X(am_plan_row_count)                    \
   X(am_plan_column_name) X(am_plan_column) X(am_plan_result_release)
 
+/* Newer entry points: resolved when present, and an older dylib still loads without them. The
+ * functions that call them check the pointer first (require_sym) and name the missing symbol. */
+#define AM_OPT_FNS(X)                                                               \
+  X(am_argsort_ex2) X(am_sort_ex2) X(am_top_k_ex) X(am_lexsort_ex2)                  \
+  X(am_import_chunks) X(am_import_chunks_supported)
+
 #define AM_DECL(f) static __typeof__(f) *p_##f = NULL;
 AM_FNS(AM_DECL)
+AM_OPT_FNS(AM_DECL)
 #undef AM_DECL
 
 static void *g_lib = NULL;
@@ -57,6 +64,12 @@ static void am_stop(void) {
 
 static void require_lib(void) {
   if (g_lib == NULL) Rf_error("ArrowMetal: the library is not loaded (see arrowmetal::am_lib_path())");
+}
+
+static void require_sym(const void *fn, const char *name) {
+  require_lib();
+  if (fn == NULL)
+    Rf_error("ArrowMetal: %s has no %s; it predates this entry point, so rebuild it", g_lib_path, name);
 }
 
 /* --- am_array handles ------------------------------------------------------- */
@@ -145,6 +158,23 @@ static void finalize_arrow_schema(SEXP xp) {
   R_ClearExternalPtr(xp);
 }
 
+static void finalize_arrow_stream(SEXP xp) {
+  struct ArrowArrayStream *s = (struct ArrowArrayStream *)R_ExternalPtrAddr(xp);
+  if (s != NULL) {
+    if (s->release != NULL) s->release(s);
+    free(s);
+  }
+  R_ClearExternalPtr(xp);
+}
+
+static struct ArrowArrayStream *unwrap_arrow_stream(SEXP xp) {
+  if (TYPEOF(xp) != EXTPTRSXP || R_ExternalPtrTag(xp) != Rf_install("ArrowArrayStream"))
+    Rf_error("ArrowMetal: expected an ArrowArrayStream pointer");
+  struct ArrowArrayStream *s = (struct ArrowArrayStream *)R_ExternalPtrAddr(xp);
+  if (s == NULL) Rf_error("ArrowMetal: this ArrowArrayStream pointer has been freed");
+  return s;
+}
+
 static struct ArrowArray *unwrap_arrow_array(SEXP xp) {
   if (TYPEOF(xp) != EXTPTRSXP || R_ExternalPtrTag(xp) != Rf_install("ArrowArray"))
     Rf_error("ArrowMetal: expected an ArrowArray pointer");
@@ -182,6 +212,9 @@ SEXP C_am_load(SEXP path) {
   }
   AM_FNS(AM_RESOLVE)
 #undef AM_RESOLVE
+#define AM_RESOLVE_OPT(f) p_##f = (__typeof__(f) *)dlsym(h, #f);
+  AM_OPT_FNS(AM_RESOLVE_OPT)
+#undef AM_RESOLVE_OPT
   g_lib = h;
   snprintf(g_lib_path, sizeof(g_lib_path), "%s", p);
   return R_NilValue;
@@ -219,6 +252,15 @@ SEXP C_alloc_arrow_array(void) {
   return xp;
 }
 
+SEXP C_alloc_arrow_stream(void) {
+  struct ArrowArrayStream *s = (struct ArrowArrayStream *)calloc(1, sizeof(struct ArrowArrayStream));
+  if (s == NULL) Rf_error("ArrowMetal: out of memory");
+  SEXP xp = PROTECT(R_MakeExternalPtr(s, Rf_install("ArrowArrayStream"), R_NilValue));
+  R_RegisterCFinalizerEx(xp, finalize_arrow_stream, TRUE);
+  UNPROTECT(1);
+  return xp;
+}
+
 SEXP C_alloc_arrow_schema(void) {
   struct ArrowSchema *s = (struct ArrowSchema *)calloc(1, sizeof(struct ArrowSchema));
   if (s == NULL) Rf_error("ArrowMetal: out of memory");
@@ -242,6 +284,102 @@ SEXP C_am_import(SEXP schema_xp, SEXP array_xp) {
    * stays the caller's, so it is released here whether or not the import succeeded. */
   if (s->release != NULL) s->release(s);
   if (rc != 0) am_stop();
+  return wrap_am_array(out);
+}
+
+/* 1 when am_import_chunks takes the type the (filled-in) schema describes, 0 when it does not or
+ * when the dylib has no chunked import. The schema stays the caller's. */
+SEXP C_am_import_chunks_supported(SEXP schema_xp) {
+  require_lib();
+  struct ArrowSchema *s = unwrap_arrow_schema(schema_xp);
+  if (s->release == NULL) Rf_error("ArrowMetal: the schema was not filled in by a producer");
+  if (p_am_import_chunks == NULL || p_am_import_chunks_supported == NULL) return Rf_ScalarLogical(0);
+  return Rf_ScalarLogical(p_am_import_chunks_supported(s) != 0);
+}
+
+/* Imports every chunk of a column as one array (am_import_chunks), reading the chunks from an
+ * ArrowArrayStream of one-column record batches -- what arrow's RecordBatchReader$export_to_c
+ * fills from a Table holding the column. The stream is the R side's one crossing, whatever the
+ * number of chunks; per chunk everything here is C.
+ *
+ * Each batch arrives as a struct array with one child. The child is moved into a block of structs
+ * this function owns (its release is nulled, as a move does) and the batch is released at once,
+ * which the C Data Interface allows once a child has been moved out. On success am_import_chunks
+ * moves every chunk out of the block; on failure a chunk whose release is still set is released
+ * here, exactly once. The stream and its schema are released here either way. */
+static void release_block(struct ArrowArray *block, int64_t n) {
+  for (int64_t i = 0; i < n; i++)
+    if (block[i].release != NULL) block[i].release(&block[i]);
+  free(block);
+}
+
+SEXP C_am_import_stream_column(SEXP stream_xp) {
+  require_sym((const void *)p_am_import_chunks, "am_import_chunks");
+  struct ArrowArrayStream *st = unwrap_arrow_stream(stream_xp);
+  if (st->release == NULL) Rf_error("ArrowMetal: the stream was not filled in by a producer");
+
+  char err[512] = "";
+  struct ArrowSchema sch;
+  memset(&sch, 0, sizeof(sch));
+  struct ArrowArray *block = NULL;
+  int64_t n = 0, cap = 0;
+  am_array *out = NULL;
+
+  if (st->get_schema(st, &sch) != 0 || sch.release == NULL) {
+    const char *e = st->get_last_error ? st->get_last_error(st) : NULL;
+    snprintf(err, sizeof(err), "reading the stream's schema: %s", e ? e : "failed");
+    goto done;
+  }
+  if (sch.n_children != 1) {
+    snprintf(err, sizeof(err), "expected a stream of one-column batches, got %lld columns",
+             (long long)sch.n_children);
+    goto done;
+  }
+  for (;;) {
+    struct ArrowArray batch;
+    memset(&batch, 0, sizeof(batch));
+    if (st->get_next(st, &batch) != 0) {
+      const char *e = st->get_last_error ? st->get_last_error(st) : NULL;
+      snprintf(err, sizeof(err), "reading the stream: %s", e ? e : "failed");
+      goto done;
+    }
+    if (batch.release == NULL) break; /* end of stream */
+    if (batch.n_children != 1 || batch.offset != 0 || batch.children[0]->release == NULL) {
+      batch.release(&batch);
+      snprintf(err, sizeof(err), "a batch of the stream is not a one-column record batch");
+      goto done;
+    }
+    if (n == cap) {
+      int64_t ncap = cap ? cap * 2 : 16;
+      struct ArrowArray *nb = (struct ArrowArray *)realloc(block, (size_t)ncap * sizeof(*nb));
+      if (nb == NULL) {
+        batch.release(&batch);
+        snprintf(err, sizeof(err), "out of memory");
+        goto done;
+      }
+      block = nb;
+      cap = ncap;
+    }
+    memcpy(&block[n], batch.children[0], sizeof(struct ArrowArray));
+    batch.children[0]->release = NULL; /* moved */
+    n++;
+    batch.release(&batch);
+  }
+  if (n == 0) {
+    snprintf(err, sizeof(err), "the stream has no batches");
+    goto done;
+  }
+  if (p_am_import_chunks(sch.children[0], block, n, &out) != 0) {
+    const char *m = p_am_last_error ? p_am_last_error() : NULL;
+    snprintf(err, sizeof(err), "%s", (m && *m) ? m : "am_import_chunks failed");
+    out = NULL;
+  }
+
+done:
+  if (block != NULL) release_block(block, n);
+  if (sch.release != NULL) sch.release(&sch);
+  st->release(st);
+  if (out == NULL) Rf_error("ArrowMetal: %s", err[0] ? err : "chunked import failed");
   return wrap_am_array(out);
 }
 
@@ -408,6 +546,66 @@ SEXP C_am_sort(SEXP h, SEXP descending) {
   require_lib();
   am_array *out = NULL;
   if (p_am_sort(unwrap_am_array(h), Rf_asLogical(descending) == TRUE, &out) != 0) am_stop();
+  return wrap_am_array(out);
+}
+
+/* The option-taking sorts. null_placement: 0 last, 1 first; float_order: 0 ieee, 1 total. */
+SEXP C_am_argsort_ex(SEXP h, SEXP descending, SEXP null_placement, SEXP float_order) {
+  require_sym((const void *)p_am_argsort_ex2, "am_argsort_ex2");
+  am_array *out = NULL;
+  if (p_am_argsort_ex2(unwrap_am_array(h), Rf_asLogical(descending) == TRUE,
+                       Rf_asInteger(null_placement), Rf_asInteger(float_order), &out) != 0)
+    am_stop();
+  return wrap_am_array(out);
+}
+
+SEXP C_am_sort_ex(SEXP h, SEXP descending, SEXP null_placement, SEXP float_order) {
+  require_sym((const void *)p_am_sort_ex2, "am_sort_ex2");
+  am_array *out = NULL;
+  if (p_am_sort_ex2(unwrap_am_array(h), Rf_asLogical(descending) == TRUE,
+                    Rf_asInteger(null_placement), Rf_asInteger(float_order), &out) != 0)
+    am_stop();
+  return wrap_am_array(out);
+}
+
+SEXP C_am_top_k(SEXP h, SEXP k, SEXP largest) {
+  require_lib();
+  am_array *out = NULL;
+  if (p_am_top_k(unwrap_am_array(h), (int64_t)Rf_asReal(k), Rf_asLogical(largest) == TRUE, &out) != 0)
+    am_stop();
+  return wrap_am_array(out);
+}
+
+SEXP C_am_top_k_ex(SEXP h, SEXP k, SEXP largest, SEXP null_placement, SEXP float_order) {
+  require_sym((const void *)p_am_top_k_ex, "am_top_k_ex");
+  am_array *out = NULL;
+  if (p_am_top_k_ex(unwrap_am_array(h), (int64_t)Rf_asReal(k), Rf_asLogical(largest) == TRUE,
+                    Rf_asInteger(null_placement), Rf_asInteger(float_order), &out) != 0)
+    am_stop();
+  return wrap_am_array(out);
+}
+
+/* descending, null_placement, float_order: integer vectors with one entry per column. */
+SEXP C_am_lexsort(SEXP handles, SEXP descending, SEXP null_placement, SEXP float_order) {
+  require_lib();
+  R_xlen_t n = Rf_xlength(handles);
+  if (n < 1) Rf_error("ArrowMetal: lexsort needs at least one column");
+  if (TYPEOF(descending) != INTSXP || Rf_xlength(descending) != n)
+    Rf_error("ArrowMetal: lexsort needs one descending flag per column");
+  am_array **cols = (am_array **)R_alloc(n, sizeof(am_array *));
+  for (R_xlen_t i = 0; i < n; i++) cols[i] = unwrap_am_array(VECTOR_ELT(handles, i));
+  am_array *out = NULL;
+  if (Rf_isNull(null_placement) && Rf_isNull(float_order)) {
+    if (p_am_lexsort(cols, INTEGER(descending), (int64_t)n, &out) != 0) am_stop();
+    return wrap_am_array(out);
+  }
+  require_sym((const void *)p_am_lexsort_ex2, "am_lexsort_ex2");
+  if (TYPEOF(null_placement) != INTSXP || Rf_xlength(null_placement) != n ||
+      TYPEOF(float_order) != INTSXP || Rf_xlength(float_order) != n)
+    Rf_error("ArrowMetal: lexsort needs one null placement and one float order per column");
+  if (p_am_lexsort_ex2(cols, INTEGER(descending), INTEGER(null_placement), INTEGER(float_order),
+                       (int64_t)n, &out) != 0)
+    am_stop();
   return wrap_am_array(out);
 }
 
@@ -582,6 +780,14 @@ static const R_CallMethodDef CallEntries[] = {
     {"C_am_slice", (DL_FUNC)&C_am_slice, 3},
     {"C_am_argsort", (DL_FUNC)&C_am_argsort, 2},
     {"C_am_sort", (DL_FUNC)&C_am_sort, 2},
+    {"C_am_argsort_ex", (DL_FUNC)&C_am_argsort_ex, 4},
+    {"C_am_sort_ex", (DL_FUNC)&C_am_sort_ex, 4},
+    {"C_am_top_k", (DL_FUNC)&C_am_top_k, 3},
+    {"C_am_top_k_ex", (DL_FUNC)&C_am_top_k_ex, 5},
+    {"C_am_lexsort", (DL_FUNC)&C_am_lexsort, 4},
+    {"C_am_import_stream_column", (DL_FUNC)&C_am_import_stream_column, 1},
+    {"C_alloc_arrow_stream", (DL_FUNC)&C_alloc_arrow_stream, 0},
+    {"C_am_import_chunks_supported", (DL_FUNC)&C_am_import_chunks_supported, 1},
     {"C_am_child_count", (DL_FUNC)&C_am_child_count, 1},
     {"C_am_child", (DL_FUNC)&C_am_child, 2},
     {"C_am_group_by_keys", (DL_FUNC)&C_am_group_by_keys, 1},

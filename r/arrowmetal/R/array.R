@@ -2,8 +2,8 @@
 #'
 #' Imports an Arrow array through the Arrow C Data Interface and returns an ArrowMetal handle.
 #' Anything the `arrow` package can turn into an [arrow::Array] is accepted; an
-#' [arrow::ChunkedArray] has its chunks concatenated first, and an `am_array` is returned
-#' unchanged.
+#' [arrow::ChunkedArray] has its chunks concatenated first (see [am_array_chunks()] for the chunked
+#' import), and an `am_array` is returned unchanged.
 #'
 #' The transfer is copy-free when the producer's buffers are page aligned and one copy otherwise.
 #' Use [am_buffer_alignment()] to see which case a given array falls into.
@@ -26,6 +26,50 @@ am_array <- function(x, type = NULL) {
   schema_ptr <- .Call(C_alloc_arrow_schema)
   a$export_to_c(array_ptr, schema_ptr)
   .Call(C_am_import, schema_ptr, array_ptr)
+}
+
+#' Move a column held in chunks onto the GPU
+#'
+#' Imports several Arrow arrays of one type -- the chunks of an [arrow::ChunkedArray], or a list of
+#' [arrow::Array]s such as one column of several record batches -- as one `am_array` of their total
+#' length (`am_import_chunks`). The column crosses the C Data Interface once, as a stream of
+#' one-column record batches, and each chunk's buffers are copied straight into the final GPU
+#' buffers, on the CPU cores in parallel, with no concatenated copy first. Each chunk's offset,
+#' length and validity are honoured.
+#'
+#' One chunk is [am_array()]. A type the chunked import does not take (dictionary, nested, run-end
+#' encoded, extension) is concatenated and imported, as [am_array()] does. A list of arrays is made
+#' a [arrow::ChunkedArray] first, which checks that every chunk has one type.
+#'
+#' @param x An [arrow::ChunkedArray], or a list of [arrow::Array]s (or R vectors) of one type.
+#' @return An `am_array` handle.
+#' @examples
+#' if (am_available()) {
+#'   ca <- arrow::chunked_array(c(1, NA), numeric(0), c(3, 4, 5))
+#'   am_sum(am_array_chunks(ca))
+#' }
+#' @export
+am_array_chunks <- function(x) {
+  am_require()
+  if (!inherits(x, "ChunkedArray")) {
+    if (!is.list(x)) stop("`x` must be a ChunkedArray or a list of arrays", call. = FALSE)
+    if (!length(x)) stop("am_array_chunks needs at least one chunk (the type comes from it)",
+                         call. = FALSE)
+    chunks <- lapply(x, as_input_array)
+    x <- tryCatch(do.call(arrow::chunked_array, chunks), error = function(e)
+      stop("every chunk must have one type: ", conditionMessage(e), call. = FALSE))
+  }
+  if (x$length() == 0) return(am_array(arrow::concat_arrays(type = x$type)))
+  if (x$num_chunks == 1L) return(am_array(x$chunk(0L)))
+  schema_ptr <- .Call(C_alloc_arrow_schema)
+  x$type$export_to_c(schema_ptr)
+  if (!.Call(C_am_import_chunks_supported, schema_ptr))
+    return(am_array(arrow::as_arrow_array(x)))  # the concatenation, as am_array() always did
+  # One crossing for every chunk: the column as a stream of one-column record batches, which the
+  # shim reads chunk by chunk in C. (ChunkedArray$chunks alone makes an R object per chunk.)
+  stream_ptr <- .Call(C_alloc_arrow_stream)
+  arrow::as_record_batch_reader(arrow::arrow_table(x = x))$export_to_c(stream_ptr)
+  .Call(C_am_import_stream_column, stream_ptr)
 }
 
 # arrow's own generic already turns an Array, ChunkedArray (concatenating the chunks), Scalar,
