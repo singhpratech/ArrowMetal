@@ -696,9 +696,13 @@ alternating rounds, `Benchmarks/results/chunked_import_2026-09-30.csv`).
 (`Benchmarks/results/import_threads_2026-09-30.csv`), and `Benchmarks/import_threads_policy.py` turns the
 sweep into two tables with one rule per import: a thread count is allowed when its CPU time is at most
 32 ms or at most twice the one-thread import's, whichever is larger, and the policy takes the fewest
-threads that come within 5% of the fastest allowed count. Sizes are grouped by the bytes an import
-writes (both chunk layouts together), and between two measured sizes the boundary is their geometric
-mean:
+threads that come within 5% of the fastest allowed count. Copies have no CPU limit from the size where
+the limit costs wall time: the smallest measured size from which, at every larger size too, some type
+and chunk layout is more than 5% slower under the limited count than at its own fastest count. In the
+sweep that is 381 MiB per column (50M int64 rows in 16 chunks: 4 threads within the limit, 7.0 ms,
+against 6.5 ms on 16), and the sizes below it, up to 305 MiB, lose nothing to the limit; from there
+a copy takes the fastest count. Sizes are grouped by the bytes an import writes (both chunk layouts
+together), and between two measured sizes the boundary is their geometric mean:
 
 | copies (values, string bytes, offsets, bitmaps, view data buffers): bytes written | threads |
 |---|---:|
@@ -707,7 +711,7 @@ mean:
 | 2.7 to 5.4 MiB | 2 |
 | 5.4 to 108 MiB | 8 |
 | 108 to 341 MiB | 12 |
-| 341 MiB and more | 4 |
+| 341 MiB and more (no CPU limit) | 16 |
 
 | the utf8_view / binary_view view pass: bytes of views | threads |
 |---|---:|
@@ -721,7 +725,7 @@ mean:
 Below about 2 MiB the copies are split into pieces of at least 1 MiB, so the first row's two threads
 run one piece; 250,000 int64 rows in 16 chunks take 0.10 ms on 1 to 16 threads. A memory copy of the
 largest columns stops gaining wall time at four threads until all sixteen cores run it, and those
-sixteen take 5.3-6.0x the one-thread CPU time; the view pass, bound by its arithmetic, divides its wall
+sixteen take 5.0-6.0x the one-thread CPU time, as the previous build's all-core copy did; the view pass, bound by its arithmetic, divides its wall
 time by the thread count at almost no CPU cost up to six. Wall ms / CPU-ms, three columns, in 16 chunks
 and (last column) one utf8_view array with 6,104 data buffers:
 
@@ -751,63 +755,58 @@ In practice pyarrow's buffers of 1M rows and more (`pa.array` from numpy, comput
 `combine_chunks`) start on a 16 KiB page and are wrapped; so are arrow-rs `concat` results of fixed-width
 and utf8 columns at 1M rows and more.
 
-**Measured** (M4 Max, `Benchmarks/chunked_import_bench.py`, three columns per case, best of 5 runs (of 7
-at 1M rows) per round, three rounds with the previous build (`c4e2f6f`, which copied on all sixteen
-cores) and this one alternating, 1-minute load 3.1-4.2 at the start of a case;
-`Benchmarks/results/chunked_import_2026-09-30.csv`). "combine + import" is `combine_chunks()` and the
-import of the combined column; "chunked" is `am.array(chunked_array)`, best of the three rounds:
+**Measured** (M4 Max, `Benchmarks/chunked_import_bench.py`, three columns per case, the previous build
+(`c4e2f6f`, which copied on all sixteen cores) and this one alternating; `Benchmarks/results/chunked_import_2026-09-30.csv`).
+At 10M rows: three rounds, best of 5 runs per round, best of the rounds. At 50M rows: each case re-timed
+alone, eight rounds of 100 runs, best (the 1-minute load was 2.8 when the block started). "combine +
+import" is `combine_chunks()` and the import of the combined column (one round); "chunked" is
+`am.array(chunked_array)`:
 
 | 3 columns | chunks | combine + import | chunked, previous | chunked | CPU-ms previous / now |
 |---|---:|---:|---:|---:|---:|
-| int64 10M | 16 | 3.3 ms | 1.58 ms | 1.46 ms | 20 / 11 |
-| int64 10M | 1,221 | 4.2 ms | 2.72 ms | 2.68 ms | 20 / 12 |
-| utf8 10M | 16 | 6.9 ms | 3.41 ms | 2.98 ms | 40 / 32 |
-| utf8 10M | 1,221 | 9.3 ms | 4.56 ms | 4.44 ms | 43 / 37 |
-| utf8_view 10M | 16 | 76.3 ms | 6.42 ms | 3.15 ms | 79 / 33 |
-| utf8_view 10M | 1,221 | 75.6 ms | 10.99 ms | 7.78 ms | 116 / 66 |
-| int64 50M | 16 | 16.5 ms | 6.65 ms | 6.95 ms | 89 / 28 |
-| int64 50M | 6,104 | 21.4 ms | 14.38 ms | 14.29 ms | 96 / 35 |
-| float64 50M | 16 | 16.5 ms | 6.64 ms | 6.93 ms | 89 / 27 |
-| float64 50M | 6,104 | 21.2 ms | 14.17 ms | 13.83 ms | 99 / 34 |
-| utf8 50M | 16 | 35.1 ms | 14.13 ms | 14.27 ms | 183 / 56 |
-| utf8 50M | 6,104 | 47.6 ms | 22.25 ms | 23.42 ms | 215 / 73 |
-| utf8_view 50M | 16 | 372.6 ms | 32.53 ms | 14.36 ms | 393 / 111 |
-| utf8_view 50M | 6,104 | 379.3 ms | 54.44 ms | 40.29 ms | 568 / 188 |
+| int64 10M | 16 | 3.3 ms | 1.61 ms | 1.54 ms | 20 / 11 |
+| int64 10M | 1,221 | 4.2 ms | 2.80 ms | 2.76 ms | 20 / 12 |
+| utf8 10M | 16 | 6.9 ms | 3.37 ms | 3.14 ms | 40 / 35 |
+| utf8 10M | 1,221 | 9.3 ms | 4.62 ms | 4.42 ms | 44 / 37 |
+| utf8_view 10M | 16 | 76.3 ms | 6.57 ms | 3.24 ms | 79 / 32 |
+| utf8_view 10M | 1,221 | 75.6 ms | 11.12 ms | 7.89 ms | 116 / 65 |
+| int64 50M | 16 | 16.5 ms | 6.52 ms | 6.42 ms | 91 / 99 |
+| int64 50M | 6,104 | 21.4 ms | 14.38 ms | 13.88 ms | 96 / 106 |
+| float64 50M | 16 | 16.5 ms | 6.51 ms | 6.43 ms | 90 / 98 |
+| float64 50M | 6,104 | 21.2 ms | 14.11 ms | 13.74 ms | 98 / 108 |
+| utf8 50M | 16 | 35.1 ms | 13.41 ms | 13.21 ms | 182 / 198 |
+| utf8 50M | 6,104 | 47.6 ms | 22.15 ms | 21.27 ms | 209 / 227 |
+| utf8_view 50M | 16 | 372.6 ms | 31.19 ms | 14.26 ms | 392 / 111 |
+| utf8_view 50M | 6,104 | 379.3 ms | 54.26 ms | 38.96 ms | 564 / 299 |
 
-At 50M rows the chunked import takes 0.28-0.37x the CPU time of the previous build's; at 10M rows
-0.42-0.87x. At 1M rows every case is within 0.01 ms of the previous build or faster (utf8_view 0.52
-against 0.95 ms in 16 chunks). Against the single-threaded `combine_chunks` and import it replaces, the
-chunked import takes 1.5-1.7x the CPU time for 0.41-0.67x the wall time at 50M rows (int64, float64,
-utf8), and 0.30-0.36x the CPU time for 0.04-0.11x the wall time (utf8_view). utf8_view imports as fast
-as utf8 in 16 chunks (14.36 against 14.27 ms, 1.01x) and 1.72x slower in 6,104 chunks (40.29 against
-23.42 ms): there its 6,104 data buffers are copied into one merged buffer, so the column moves 16 bytes
+Every case in the table is as fast as on the previous build or faster, on best and on median time.
+CPU time: the 50M copies, where the policy has no CPU limit, take 1.09-1.11x the previous build's
+(and 4.8-6.0x the single-threaded `combine_chunks` and import, for 0.38-0.65x its wall time); the 10M copies take
+0.54-0.87x; the utf8_view pass takes 0.28x at 50M in 16 chunks and 0.41-0.56x elsewhere. At 20M and
+30M rows (three rounds) every copy case is within 1.3% of the previous build's best time or faster,
+at 0.81-1.22x its CPU time (utf8 at 30M in 16 chunks: 8.67 against 8.56 ms, 128 against 104 CPU-ms);
+at 1M rows within 0.01 ms or faster (utf8_view 0.52 against 0.95 ms in 16 chunks). utf8_view imports
+1.08x the time of utf8 in 16 chunks (14.26 against 13.21 ms) and 1.83x in 6,104 chunks (38.96 against
+21.27 ms): there its 6,104 data buffers are copied into one merged buffer, so the column moves 16 bytes
 of view per row plus the string bytes, against 4 bytes of offset per row plus the string bytes for
 utf8.
 
 One utf8_view array with 6,104 data buffers (`combine_chunks` of the 6,104-chunk column above) imports
-in 27.8 ms and 161 CPU-ms (previous build: 46.0 ms and 557 CPU-ms; the build before the merged copy
+in 26.5 ms and 274 CPU-ms (previous build: 44.8 ms and 548 CPU-ms; the build before the merged copy
 path: 150.5 ms and 143 CPU-ms, `Benchmarks/results/chunked_import_2026-09-28.csv`); at 10M rows in 5.6
-ms and 58 CPU-ms against 9.3 ms and 113 CPU-ms.
+ms and 59 CPU-ms against 9.2 ms and 112 CPU-ms.
 
 Through the engines, with the previous build alternating: `Benchmarks/polars_engine_bench.py --sizes
-2000000,50000000 --cases a,c,i,t1,w1,x2`, `MetalEngine` with the import cache cleared, takes 0.97-1.03x
-of the previous build's best time at 50M rows (three rounds), and at 2M rows 0.95-1.05x in every case
-but two with every shape taken: the 100,000-group sum (best 3.33 against 2.42 ms, median 3.47 against
-3.43 ms) and the 200-group sum, which re-timed alone over eight rounds of 100 runs takes 1.68 against
-1.59 ms (best) and 1.74 against 1.70 ms (median)
+2000000,50000000 --cases a,c,i,t1,w1,x2`, `MetalEngine` with the import cache cleared, takes 0.98-1.01x
+of the previous build's best time at 50M rows (three rounds) and 0.73-1.06x at 2M rows (the 1.06x, the
+200-group sum under the default engine, takes 0.91x of its median); the two 2M cases that differed
+more with every shape taken, the 100,000-group sum and the join, re-timed alone over eight rounds of
+100 runs, take 0.92x and 0.98x of its best time and 1.02x and 1.00x of its median
 (`Benchmarks/results/chunked_import_polars_2026-09-30.csv`). The DataFusion rule's sorts
 (`datafusion/examples/bench.rs --families sort`, rule on, two rounds,
-`datafusion/results/datafusion_sort_import_2026-09-30.csv`) take 0.95-1.05x of the previous build's time
-at 10M and 50M rows in both table layouts, with 0.54-0.88x of its CPU time (int64 key at 50M rows in
-8,192-row batches: 71.06 against 69.69 ms, 78 against 126 CPU-ms).
-
-To improve: four cases at 50M rows stay above the previous build's wall time, re-timed alone (eight
-alternating rounds of 100 runs, best / median): int64 in 16 chunks 6.96 / 6.98 against 6.53 / 6.55 ms,
-float64 in 16 chunks 6.96 / 6.97 against 6.50 / 6.55 ms, utf8 in 16 chunks 14.19 / 14.22 against 13.50 /
-13.66 ms, utf8 in 6,104 chunks 23.23 / 23.32 against 21.86 / 22.24 ms, with 0.30-0.34x the CPU time
-(int64: 27.6 against 90.6 CPU-ms). The previous build's wall time takes all sixteen cores, which is
-33 CPU-ms per int64 column and 66 per utf8 column, over the policy's limit. `am_set_import_threads(16)`
-or `ARROWMETAL_IMPORT_THREADS=16` gives them all the cores.
+`datafusion/results/datafusion_sort_import_2026-09-30.csv`) take 0.93-0.99x of the previous build's
+time at 50M rows in both table layouts, at 0.91-1.04x its CPU time (int64 key in 8,192-row batches:
+68.84 against 70.63 ms), and 0.95-1.05x at 10M rows with 0.54-0.88x its CPU time.
 
 - Not a query planner or SQL engine. It is the compute layer that DuckDB, DataFusion, Polars plugins or
   an app can call.

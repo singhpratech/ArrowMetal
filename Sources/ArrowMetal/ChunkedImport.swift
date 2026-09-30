@@ -306,8 +306,11 @@ private func releaseChunk(_ p: UnsafeMutablePointer<ArrowArray>) {
 /// The tables are derived by `Benchmarks/import_threads_policy.py` from a sweep of 1 to 16 threads at
 /// 100,000 to 50,000,000 rows (`Benchmarks/results/import_threads_2026-09-30.csv`) with one rule per
 /// import: a thread count is allowed when its CPU time is at most max(32 CPU-ms, 2x the one-thread
-/// CPU time), and the policy takes the smallest count within 5% of the fastest allowed one. Between
-/// two measured sizes the boundary is their geometric mean.
+/// CPU time), and the policy takes the smallest count within 5% of the fastest allowed one. Copies
+/// have no CPU limit from the size where the limit costs wall time (the smallest measured size from
+/// which, at every larger size, some type and chunk layout is more than 5% slower under the limit
+/// than at its fastest count): from there a copy takes the fastest count. Between two measured sizes
+/// the boundary is their geometric mean.
 public enum ImportThreads {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var current: Int =
@@ -332,7 +335,7 @@ public enum ImportThreads {
 
     /// Copy steps: (bytes written below, threads), from `Benchmarks/import_threads_policy.py`.
     static let copyTable: [(below: Int, threads: Int)] = [
-        (1_131_370, 2), (2_828_427, 1), (5_656_854, 2), (113_137_084, 8), (357_770_876, 12), (Int.max, 4),
+        (1_131_370, 2), (2_828_427, 1), (5_656_854, 2), (113_137_084, 8), (357_770_876, 12), (Int.max, 16),
     ]
     /// The view pass: (bytes of views below, threads), from the same script.
     static let viewTable: [(below: Int, threads: Int)] = [

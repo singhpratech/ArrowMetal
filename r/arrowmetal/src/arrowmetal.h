@@ -37,9 +37,11 @@ int  am_import_chunks_supported(const struct ArrowSchema* schema);
 // default, is the measured policy: a table of thread counts by the bytes a copy step writes, and by
 // the bytes of views for the utf8_view / binary_view view pass, derived from a thread sweep with the
 // rule "CPU time at most max(32 ms, 2x one thread); the fewest threads within 5% of the fastest such
-// count" (Benchmarks/import_threads_policy.py). n >= 1 is at most n threads for every step; 1 keeps
-// the import on the calling thread. The setting is process-wide and starts from the environment
-// variable ARROWMETAL_IMPORT_THREADS. am_set_import_threads returns 2 for a negative n.
+// count", without the CPU limit for copies from the size where it costs wall time (341 MiB; there
+// the fastest count, all 16 cores on an M4 Max) (Benchmarks/import_threads_policy.py). n >= 1 is at
+// most n threads for every step; 1 keeps the import on the calling thread. The setting is
+// process-wide and starts from the environment variable ARROWMETAL_IMPORT_THREADS.
+// am_set_import_threads returns 2 for a negative n.
 int  am_set_import_threads(int n);
 int  am_get_import_threads(void);
 int  am_export(am_array* a, struct ArrowSchema* schema, struct ArrowArray* array);
