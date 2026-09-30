@@ -144,6 +144,17 @@ def test_import_threads_setting():
         am.set_import_threads(saved)
 
 
+def test_thread_table_is_the_derived_one():
+    """`ImportThreads`' tables are what Benchmarks/import_threads_policy.py derives from the committed sweep."""
+    import pathlib
+    import subprocess
+    import sys
+    root = pathlib.Path(__file__).resolve().parents[2]
+    r = subprocess.run([sys.executable, str(root / "Benchmarks/import_threads_policy.py"), "--check"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
 @pytest.mark.parametrize("ty", ["int64", "bool", "utf8", "utf8_view", "utf8_view_many"])
 def test_thread_counts_give_the_same_array(ty):
     """One thread, several and the default policy import the same column (1.2M rows, so every

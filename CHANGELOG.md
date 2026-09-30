@@ -61,17 +61,18 @@
     `ChunkedArray`, and through it `am.query`, `am.scan` and `am.write_parquet` over a pyarrow Table
     or Polars DataFrame, the DuckDB bridge's `from_duckdb`, and the Polars `MetalEngine` for a
     multi-chunk column of an in-memory frame. A one-chunk `ChunkedArray` imports its chunk as it is (`combine_chunks` copied it).
-  - Copy threads: a measured policy, `ImportThreads` (`Benchmarks/results/import_threads_2026-09-29.csv`:
-    1 to 12 threads at 100,000 to 50,000,000 rows; per case, the smallest count within 10% of the
-    fastest count whose CPU time is at most 1.5x the one-thread import's, or at most 2x where it halves
-    the wall time). The copies (values, string bytes, offsets, bitmaps, view data buffers) use one thread when
-    the import writes less than 4 MiB, two below 320 MiB and four from 320 MiB; the utf8_view /
-    binary_view view pass uses one thread per 2 MiB of views, at most eight. The pieces are handed out
-    one at a time, so a thread on a slower core takes fewer. `am_set_import_threads(n)` /
-    `am_get_import_threads()` (C), `am.set_import_threads` / `am.get_import_threads` (Python),
-    `arrowmetal::set_import_threads` / `import_threads` (Rust), `ImportThreads.limit` (Swift) and the
-    environment variable `ARROWMETAL_IMPORT_THREADS` cap every step at n threads; 1 keeps the import on
-    the calling thread, 0 is the policy.
+  - Copy threads: a measured policy, `ImportThreads`. `Benchmarks/import_threads_policy.py` derives
+    its tables from a sweep of 1 to 16 threads at 100,000 to 50,000,000 rows
+    (`Benchmarks/results/import_threads_2026-09-30.csv`) with one rule per import: a thread count is
+    allowed when its CPU time is at most max(32 ms, 2x the one-thread import's), and the policy takes
+    the fewest threads within 5% of the fastest allowed count. The copies (values, string bytes,
+    offsets, bitmaps, view data buffers) use 1-2 threads below 5.4 MiB written, 8 up to 108 MiB, 12 up
+    to 341 MiB and 4 above; the utf8_view / binary_view view pass 4 to 12 threads by the bytes of views
+    (8 from 216 MiB). The pieces are handed out one at a time, so a thread on a slower core takes
+    fewer. `am_set_import_threads(n)` / `am_get_import_threads()` (C), `am.set_import_threads` /
+    `am.get_import_threads` (Python), `arrowmetal::set_import_threads` / `import_threads` (Rust),
+    `ImportThreads.limit` (Swift) and the environment variable `ARROWMETAL_IMPORT_THREADS` cap every
+    step at n threads; 1 keeps the import on the calling thread, 0 is the policy.
   - The utf8_view / binary_view view pass is C with NEON intrinsics (`Sources/CArrowMetalCopy`): four
     views per `vld4q_u32` step, each out-of-line view given its merged buffer index and offset base and
     checked (length, offset, buffer index, byte range) with vector selects, no branch per view; a
@@ -79,18 +80,20 @@
     reads as the empty string, as after the single-array import.
   - Measured on an M4 Max with `Benchmarks/chunked_import_bench.py`, three columns of 50M rows, best
     of 5 per round, three rounds alternating with the build before the thread policy and the NEON pass
-    (`Benchmarks/results/chunked_import_2026-09-29.csv`): `combine_chunks` and import against the
-    chunked import, in 16 chunks / in 6,104 chunks of 8,192 rows, wall time and (CPU time): int64 16.6
-    (17) → 7.0 (28) ms / 21.9 (22) → 14.3 (35) ms, float64 16.6 (17) → 7.0 (28) / 21.7 (22) → 14.0
-    (35) ms, utf8 35.8 (36) → 14.3 (56) / 48.7 (49) → 23.6 (73) ms, utf8_view 374.4 (364) → 14.3 (111)
-    / 389.1 (528) → 40.6 (189) ms. The build before the thread policy copied on every core: 6.7 / 14.2,
-    6.8 / 14.4, 13.8 / 22.6 and 33.2 / 56.8 ms, with 89-565 CPU-ms (the policy's CPU time is 0.28-0.38x
-    of it). utf8_view imports as fast as utf8 in 16 chunks (1.00x) and 1.72x slower in 6,104 chunks,
-    where its data buffers are copied (2.7x and 2.5x before the NEON pass). At 10M rows the copies
-    take more wall time than on every core: int64 in 16 chunks 2.3 against 1.5 ms (4.4 against 16.3
-    CPU-ms), utf8 in 1,221 chunks 6.8 against 4.5 ms (12 against 42 CPU-ms), and the DataFusion rule's
-    sorts at 10M rows take 3-17% more time with half the CPU time
-    (`datafusion/results/datafusion_sort_import_2026-09-29.csv`).
+    (`Benchmarks/results/chunked_import_2026-09-30.csv`): `combine_chunks` and import against the
+    chunked import, in 16 chunks / in 6,104 chunks of 8,192 rows, wall time and (CPU time): int64 16.5
+    (16) → 6.95 (28) ms / 21.4 (21) → 14.29 (35) ms, float64 16.5 (17) → 6.93 (27) / 21.2 (21) → 13.83
+    (34) ms, utf8 35.1 (35) → 14.27 (56) / 47.6 (48) → 23.42 (73) ms, utf8_view 372.6 (362) → 14.36
+    (111) / 379.3 (528) → 40.29 (188) ms. The build before the thread policy copied on all sixteen
+    cores: 6.65 / 14.38, 6.64 / 14.17, 14.13 / 22.25 and 32.53 / 54.44 ms, with 89-568 CPU-ms (the
+    policy's CPU time is 0.28-0.37x of it; at 10M rows its wall time is 0.49-1.03x of that build's
+    and its CPU time 0.42-0.87x). utf8_view imports as fast as utf8 in 16 chunks (1.01x) and 1.72x
+    slower in 6,104 chunks, where its data buffers are copied (2.7x and 2.5x before the NEON pass).
+    Four cases at 50M rows stay above the all-core build's wall time, re-timed alone over eight
+    rounds of 100 runs (best): int64 and float64 in 16 chunks 6.96 against 6.53 and 6.50 ms, utf8 in
+    16 chunks 14.19 against 13.50 ms, utf8 in 6,104 chunks 23.23 against 21.86 ms, with 0.30-0.34x the
+    CPU time. The DataFusion rule's sorts at 10M and 50M rows take 0.95-1.05x of that build's time with
+    0.54-0.88x of its CPU time (`datafusion/results/datafusion_sort_import_2026-09-30.csv`).
 
 - A copy-free import checks that the producer's pages are mapped with `mach_vm_region` (one call per VM
   region) instead of `mincore` (one entry per page). Importing a page-aligned 50M-row int64 pyarrow
@@ -111,8 +114,8 @@
 - A utf8_view / binary_view array with more than 64 data buffers (an arrow-rs or pyarrow
   concatenation of view arrays keeps every input's buffers) has its data buffers copied into merged
   buffers on import instead of each being wrapped and bound: a pyarrow `combine_chunks` of three 50M-row
-  utf8_view columns with 6,104 data buffers each imports in 27.9 ms and 161 CPU-ms
-  (`Benchmarks/results/chunked_import_2026-09-29.csv`), against 150.5 ms and 143 CPU-ms when each
+  utf8_view columns with 6,104 data buffers each imports in 27.8 ms and 161 CPU-ms
+  (`Benchmarks/results/chunked_import_2026-09-30.csv`), against 150.5 ms and 143 CPU-ms when each
   buffer was wrapped (`Benchmarks/results/chunked_import_2026-09-28.csv`).
 
 - Sort options per key: the null placement (`nulls` first or last, in either direction) and the float

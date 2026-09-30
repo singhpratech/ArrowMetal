@@ -10,7 +10,7 @@ import CArrowMetalCopy
 // `MetalArrowBuffer`s); there is no intermediate concatenated copy. The work is split by output
 // position, not by chunk, into pieces the copy threads take one after another (`parallelSum`), so a
 // column of 10,000 small chunks and a column of 16 large ones spread alike, and no two threads write
-// the same byte. How many threads is `ImportThreads`' measured policy (one below 4 MiB):
+// the same byte. How many threads is `ImportThreads`' measured policy:
 //
 // * fixed-width values: one `memcpy` per chunk piece, from the chunk's Arrow offset.
 // * bitmaps (validity, and boolean values): assembled 64 output bits at a time from each chunk's
@@ -297,22 +297,17 @@ private func releaseChunk(_ p: UnsafeMutablePointer<ArrowArray>) {
 /// The number of CPU threads the chunked import copies on.
 ///
 /// Unless `limit` is set, the import's copy steps (the values, the string bytes and offsets, the
-/// bitmaps, the view data buffers) take their thread count from the bytes the import writes, and the
+/// bitmaps, the view data buffers) take their thread count from the bytes those steps write, and the
 /// utf8_view / binary_view view pass from the bytes of views it writes, by the measured policy
 /// `automatic(bytes:step:)`. A limit of n >= 1 runs every step on at most n threads, and 1 keeps the
 /// whole import on the calling thread. The limit starts from the environment variable
 /// `ARROWMETAL_IMPORT_THREADS` and is set with `limit` (C: `am_set_import_threads`).
 ///
-/// The policy is the thread count that comes within 10% of the fastest count whose CPU time is at
-/// most 1.5x the one-thread import's (or at most 2x where it halves the wall time), measured with
-/// `Benchmarks/chunked_import_bench.py --threads` from 100,000 to 50,000,000 rows (docs/DESIGN.md,
-/// "Chunked columns and the import"):
-///
-/// * copy steps: one thread below 4 MiB, two below 320 MiB, four from 320 MiB. A memory copy stops
-///   gaining wall time at about four threads, and on columns under 320 MiB a third and fourth thread
-///   add more CPU time than they save wall time.
-/// * the view pass: one thread per 2 MiB of views, at most eight. It is bound by its arithmetic (four
-///   views per NEON step), so up to about six threads divide its wall time at almost no CPU cost.
+/// The tables are derived by `Benchmarks/import_threads_policy.py` from a sweep of 1 to 16 threads at
+/// 100,000 to 50,000,000 rows (`Benchmarks/results/import_threads_2026-09-30.csv`) with one rule per
+/// import: a thread count is allowed when its CPU time is at most max(32 CPU-ms, 2x the one-thread
+/// CPU time), and the policy takes the smallest count within 5% of the fastest allowed one. Between
+/// two measured sizes the boundary is their geometric mean.
 public enum ImportThreads {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var current: Int =
@@ -324,14 +319,8 @@ public enum ImportThreads {
         set { lock.lock(); current = Swift.max(0, newValue); lock.unlock() }
     }
 
-    /// The performance cores (`hw.perflevel0.physicalcpu`), or every active core where that is not
-    /// reported: the measured policy never uses more.
-    public static let performanceCores: Int = {
-        var v: Int32 = 0
-        var n = MemoryLayout<Int32>.size
-        if sysctlbyname("hw.perflevel0.physicalcpu", &v, &n, nil, 0) == 0, v > 0 { return Int(v) }
-        return Swift.max(1, ProcessInfo.processInfo.activeProcessorCount)
-    }()
+    /// The active cores: the measured policy never uses more.
+    public static let cores = Swift.max(1, ProcessInfo.processInfo.activeProcessorCount)
 
     /// The kinds of import step the policy tells apart.
     public enum Step: Sendable {
@@ -341,15 +330,21 @@ public enum ImportThreads {
         case views
     }
 
-    /// The measured policy's thread count: `bytes` is what the import writes for a copy step, and the
-    /// bytes of views for the view pass.
+    /// Copy steps: (bytes written below, threads), from `Benchmarks/import_threads_policy.py`.
+    static let copyTable: [(below: Int, threads: Int)] = [
+        (1_131_370, 2), (2_828_427, 1), (5_656_854, 2), (113_137_084, 8), (357_770_876, 12), (Int.max, 4),
+    ]
+    /// The view pass: (bytes of views below, threads), from the same script.
+    static let viewTable: [(below: Int, threads: Int)] = [
+        (2_529_822, 4), (5_656_854, 8), (11_313_708, 12), (22_627_416, 8), (226_274_169, 12), (Int.max, 8),
+    ]
+
+    /// The measured policy's thread count: `bytes` is what the copy steps write, or the bytes of views
+    /// for the view pass. Never more than `cores`.
     public static func automatic(bytes: Int, step: Step) -> Int {
-        let t: Int
-        switch step {
-        case .copy: t = bytes < 4 << 20 ? 1 : bytes < 320 << 20 ? 2 : 4
-        case .views: t = Swift.min(8, bytes / (2 << 20))
-        }
-        return Swift.max(1, Swift.min(t, performanceCores))
+        let table = step == .copy ? copyTable : viewTable
+        let t = table.first { bytes < $0.below }?.threads ?? 1
+        return Swift.max(1, Swift.min(t, cores))
     }
 
     /// Threads for a step that writes `bytes` bytes, under the limit in force.
@@ -368,7 +363,9 @@ private func parallelSum(_ n: Int, grain: Int, threads: Int, _ body: (Int, Int) 
     let fit = (n + grain - 1) / grain
     let workers = Swift.max(1, Swift.min(threads, fit))
     if workers == 1 { return body(0, n) }
-    let pieces = Swift.min(fit, workers * 8)
+    // A whole number of pieces per thread (up to eight), so that with few pieces no thread takes one
+    // more than the others.
+    let pieces = workers * Swift.max(1, Swift.min(8, fit / workers))
     let step = (n + pieces - 1) / pieces
     let next = PieceCounter()
     let partial = UnsafeMutablePointer<Int>.allocate(capacity: workers)
@@ -666,8 +663,8 @@ private func mergeViewStrings(_ refs: [ChunkRef], total: Int, binary: Bool, owne
             dataBuffers.append(buf); dataSizes.append(fill[g])
         }
     }
-    // The copy steps' threads follow the column's bytes written; the view pass has its own count.
-    let threads = ImportThreads.forStep(bytes: segments.reduce(0) { $0 + $1.count } + total * 16 + validityBytes(refs, total))
+    // The copy steps (data buffers, validity) take their count from their bytes; the view pass has its own.
+    let threads = ImportThreads.forStep(bytes: segments.reduce(0) { $0 + $1.count } + validityBytes(refs, total))
     parallelCopy(threads: threads, segments)
 
     // 3. Validity first: the byte total counts the non-null rows only.
