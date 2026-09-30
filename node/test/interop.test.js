@@ -69,12 +69,17 @@ test('a sliced utf8 and a sliced bool vector import correctly', () => {
   assert.deepEqual([...MetalArray.fromArrow(bs).toArrow()], [...bs]);
 });
 
-test('a chunked vector is rejected with a message that says what to do', () => {
+test('a chunked vector imports as one array through the chunked import', () => {
   const chunked = new A.Vector([
     A.vectorFromArray([1n, 2n], new A.Int64()).data[0],
     A.vectorFromArray([3n], new A.Int64()).data[0],
   ]);
-  assert.throws(() => MetalArray.fromArrow(chunked), /single-chunk Vector, got 2 chunks/);
+  assert.deepEqual([...MetalArray.fromArrow(chunked).toArrow()], [1n, 2n, 3n]);
+  const mixed = new A.Vector([
+    A.vectorFromArray([1n], new A.Int64()).data[0],
+    A.vectorFromArray([1.5], new A.Float64()).data[0],
+  ]);
+  assert.throws(() => MetalArray.fromArrow(mixed), /every chunk must have one type/);
 });
 
 test('an unsupported Arrow type is rejected by name', () => {

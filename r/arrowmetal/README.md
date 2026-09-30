@@ -26,7 +26,8 @@ Full documentation, including installation, is in [`docs/R.md`](../../docs/R.md)
 | Query engine | `am_plan_source()`, `am_plan_run()`, `am_plan_explain()` |
 | Environment | `am_available()`, `am_load_error()`, `am_lib_path()`, `am_version()`, `am_device_name()`, `am_buffer_alignment()` |
 
-This binding resolves 34 of the C ABI's 222 entry points. Everything not in the table above —
+This binding resolves 36 of the C ABI's entry points, and 6 newer ones (the sort options and the
+chunked import) when the loaded library has them. Everything not in the table above —
 string kernels, temporal kernels, casts, arithmetic, joins, Parquet, the streaming engine — is
 reachable from Python or Swift but not yet from R.
 
@@ -164,7 +165,7 @@ idle Mac.
 
 ## Tests
 
-68 `test_that()` blocks in the sources (69 as testthat runs them: the one in test-dispatch.R runs once per attach order), 273 expectations, comparing against base R and against `arrow`'s
+83 `test_that()` blocks in the sources (84 as testthat runs them: the one in test-dispatch.R runs once per attach order), 778 expectations, comparing against base R and against `arrow`'s
 own kernels on the same data: nulls, all-null and empty columns, sliced input, lengths of 1, 33,
 1024, 65537 and 1,000,001 (crossing a threadgroup boundary), int64 above 2^53, float32, strings and
 booleans, and every error path.

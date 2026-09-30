@@ -155,7 +155,7 @@ Numbers are from one machine on one day. `node bench/spread.mjs` re-runs it.
 
 ```
 cd node
-ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib npm test    # 62 tests, node:test
+ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib npm test    # 76 tests, node:test
 ```
 
 Oracles are Apache Arrow JS and plain JS over the same rows. Sizes include 0, small, and 1,000,001

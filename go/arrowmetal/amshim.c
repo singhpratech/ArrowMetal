@@ -22,6 +22,8 @@ static char g_error[1024];
             return 2;                                                        \
         }                                                                    \
     } while (0)
+// An optional symbol: absent from an older dylib, which still loads; its pointer stays NULL.
+#define AM_BIND_OPT(name) p_##name = (__typeof__(&name))dlsym(g_handle, #name)
 
 AM_SYM(am_version)
 AM_SYM(am_device_name)
@@ -41,6 +43,13 @@ AM_SYM(am_take)
 AM_SYM(am_argsort)
 AM_SYM(am_sort)
 AM_SYM(am_lexsort)
+AM_SYM(am_top_k)
+AM_SYM(am_argsort_ex2)
+AM_SYM(am_sort_ex2)
+AM_SYM(am_top_k_ex)
+AM_SYM(am_lexsort_ex2)
+AM_SYM(am_import_chunks)
+AM_SYM(am_import_chunks_supported)
 AM_SYM(am_group_by_keys)
 AM_SYM(am_group_by_group_count)
 AM_SYM(am_group_by_keys_result)
@@ -84,6 +93,13 @@ int amshim_load(const char* path) {
     AM_BIND(am_argsort);
     AM_BIND(am_sort);
     AM_BIND(am_lexsort);
+    AM_BIND(am_top_k);
+    AM_BIND_OPT(am_argsort_ex2);
+    AM_BIND_OPT(am_sort_ex2);
+    AM_BIND_OPT(am_top_k_ex);
+    AM_BIND_OPT(am_lexsort_ex2);
+    AM_BIND_OPT(am_import_chunks);
+    AM_BIND_OPT(am_import_chunks_supported);
     AM_BIND(am_group_by_keys);
     AM_BIND(am_group_by_group_count);
     AM_BIND(am_group_by_keys_result);
@@ -140,6 +156,36 @@ int amx_argsort(am_array* a, int descending, am_array** out) { return p_am_argso
 int amx_sort(am_array* a, int descending, am_array** out) { return p_am_sort(a, descending, out); }
 int amx_lexsort(am_array** columns, const int* descending, int64_t count, am_array** out) {
     return p_am_lexsort(columns, descending, count, out);
+}
+
+int amx_top_k(am_array* a, int64_t k, int largest, am_array** out) {
+    return p_am_top_k(a, k, largest, out);
+}
+
+int amshim_has_sort_options(void) {
+    return p_am_argsort_ex2 && p_am_sort_ex2 && p_am_top_k_ex && p_am_lexsort_ex2;
+}
+int amshim_has_import_chunks(void) { return p_am_import_chunks && p_am_import_chunks_supported; }
+int amx_argsort_ex2(am_array* a, int descending, int null_placement, int float_order, am_array** out) {
+    return p_am_argsort_ex2(a, descending, null_placement, float_order, out);
+}
+int amx_sort_ex2(am_array* a, int descending, int null_placement, int float_order, am_array** out) {
+    return p_am_sort_ex2(a, descending, null_placement, float_order, out);
+}
+int amx_top_k_ex(am_array* a, int64_t k, int largest, int null_placement, int float_order,
+                 am_array** out) {
+    return p_am_top_k_ex(a, k, largest, null_placement, float_order, out);
+}
+int amx_lexsort_ex2(am_array** columns, const int* descending, const int* null_placement,
+                    const int* float_order, int64_t count, am_array** out) {
+    return p_am_lexsort_ex2(columns, descending, null_placement, float_order, count, out);
+}
+int amx_import_chunks(const struct ArrowSchema* schema, struct ArrowArray* arrays, int64_t n,
+                      am_array** out) {
+    return p_am_import_chunks(schema, arrays, n, out);
+}
+int amx_import_chunks_supported(const struct ArrowSchema* schema) {
+    return p_am_import_chunks_supported(schema);
 }
 
 int amx_group_by_keys(am_array** columns, int64_t count, am_groupby** out) {

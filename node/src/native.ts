@@ -27,6 +27,16 @@ export interface ExportedBuffers {
   data: ArrayBuffer | null;
 }
 
+/** One chunk for importChunks: length, offset, nullCount, validity, data, offsets. */
+export type ChunkParts = [
+  number,
+  number,
+  number,
+  ArrayBufferView | null,
+  ArrayBufferView | null,
+  ArrayBufferView | null,
+];
+
 export interface LoadInfo {
   path: string;
   version: string;
@@ -62,6 +72,17 @@ export interface Native {
   argsort(a: ArrayHandle, descending: boolean): ArrayHandle;
   sort(a: ArrayHandle, descending: boolean): ArrayHandle;
   lexsort(columns: ArrayHandle[], descending: boolean[]): ArrayHandle;
+  importChunks(format: string, chunks: ChunkParts[]): ArrayHandle;
+  argsortEx(a: ArrayHandle, descending: boolean, nullPlacement: number, floatOrder: number): ArrayHandle;
+  sortEx(a: ArrayHandle, descending: boolean, nullPlacement: number, floatOrder: number): ArrayHandle;
+  topK(a: ArrayHandle, k: number, largest: boolean): ArrayHandle;
+  topKEx(a: ArrayHandle, k: number, largest: boolean, nullPlacement: number, floatOrder: number): ArrayHandle;
+  lexsortEx(
+    columns: ArrayHandle[],
+    descending: boolean[],
+    nullPlacement: number[],
+    floatOrder: number[],
+  ): ArrayHandle;
   groupByKeys(columns: ArrayHandle[]): GroupByHandle;
   groupCount(gb: GroupByHandle): number;
   groupKeysResult(gb: GroupByHandle, i: number): ArrayHandle;

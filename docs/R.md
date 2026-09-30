@@ -73,6 +73,55 @@ res <- am_plan_run('{"op":"limit","count":2,"input":{"op":"scan","source":"sales
 as.vector(as_arrow_array(res$amount))                # back to plain R
 ```
 
+## Sort options
+
+`am_argsort()`, `am_sort()`, `am_top_k()` and `am_lexsort()` take Arrow's `null_placement`
+(`"at_end"`, the default, or `"at_start"`) and a `float_order` (`"ieee"`, the default, or `"total"`):
+
+```r
+x <- c(2, NA, NaN, -0, 7)
+am_argsort(x, descending = TRUE)                                  # 4 0 3 2 1: NA and NaN last
+am_argsort(x, descending = TRUE, null_placement = "at_start",
+           float_order = "total")                                 # 1 2 4 0 3
+am_top_k(x, 2, null_placement = "at_start", float_order = "total")   # 1 2
+am_lexsort(list(c(1, 1, 2), c(3, NA, 1)), descending = c(FALSE, TRUE),
+           null_placement = c("at_end", "at_start"))              # 1 0 2
+```
+
+(Each is shown through `as.vector()`; `test-sort-options.R` and `test-chunks.R` run these lines.)
+With the defaults each function runs the call it always ran: nulls last and `NaN` after `+Inf` in both directions, `-0`
+tied with `0`. `"at_start"` puts the nulls first in either direction. `float_order = "ieee"` is Arrow
+C++'s order: `-0` ties `0`, every `NaN` is one value, and the `NaN` rows sit next to the nulls in both
+directions. `"total"` is IEEE 754 totalOrder, the order arrow-rs and Rust's `total_cmp` use:
+`-NaN < -Inf < ... < -0 < 0 < ... < Inf < NaN`, and a descending sort is its exact mirror. Integer,
+string and temporal columns ignore `float_order`. `am_top_k(x, k, largest, ...)` is the first `k`
+indices of `am_argsort(x, descending = largest, ...)`. In `am_lexsort()` each option is one value for
+every key or a vector with one per key. A plan's `sort` key takes the same options as JSON:
+`{"column": "x", "descending": true, "nulls": "first", "float_order": "total"}` ([ENGINE.md](ENGINE.md)).
+
+## Chunked columns
+
+`am_array_chunks()` imports a column held in chunks — an `arrow::ChunkedArray`, or a list of
+Arrays of one type such as one column of several record batches — as one `am_array`, with no
+concatenated copy first. `am_array()` keeps concatenating a ChunkedArray first, as it always has
+(measured below, that is the faster path in R at 10M and 50M rows).
+
+```r
+ca <- arrow::chunked_array(c(1, NA), numeric(0), c(3, 4, 5))
+h <- am_array_chunks(ca)
+length(h); am_null_count(h); am_sum(h)    # 5, 1, 13
+```
+
+The column crosses the C Data Interface once, as an `ArrowArrayStream` of one-column record batches
+(`arrow::as_record_batch_reader()`), so the R side does the same work for 10 chunks as for 1,000. The
+shim reads the stream in C, moves each batch's column into one block of `ArrowArray` structs it owns
+and releases the batch, and `am_import_chunks` copies each chunk's buffers straight into the final
+GPU buffers, on the CPU cores in parallel, honouring each chunk's offset, length and validity. Each
+chunk's release callback runs exactly once, by ArrowMetal or, for a chunk it did not take, by the
+shim. One chunk is `am_array()`. A list of arrays becomes a ChunkedArray first, which checks that
+the chunks share one type. A type the chunked import does not take (dictionary, nested, run-end
+encoded, extension) is concatenated and imported, as `am_array()` always did.
+
 ## The copy rule
 
 **Out is always copy-free.** `as_arrow_array()` hands `arrow` a C Data Interface array pointing at
@@ -182,11 +231,11 @@ per-core figure. Timings on a loaded machine are noise; these ran on an idle mac
 
 | Area | Functions |
 |---|---|
-| Import / export | `am_array()`, `as_arrow_array()`, `as.vector()`, `length()`, `am_null_count()`, `am_format()` |
+| Import / export | `am_array()`, `am_array_chunks()` (a ChunkedArray or a list of arrays, `am_import_chunks`), `as_arrow_array()`, `as.vector()`, `length()`, `am_null_count()`, `am_format()` |
 | Reductions | `am_sum()`, `am_min()`, `am_max()`, `am_mean()` |
 | Element-wise | `am_compare()` — `==`, `!=`, `<`, `<=`, `>`, `>=`, against a scalar or a column |
 | Selection | `am_filter()`, `am_take()`, `am_slice()` |
-| Sorting | `am_argsort()`, `am_sort()` |
+| Sorting | `am_argsort()`, `am_sort()`, `am_top_k()`, `am_lexsort()`, each with `null_placement` and `float_order` |
 | Grouping | `am_group_by()` over any number of key columns of any supported type, with `$sum $min $max $mean $count $count_all $first $last $product $var $sd $median $quantile` and `$agg()` for the remaining `am_group_agg_ex` ops |
 | Query engine | `am_plan_source()`, `am_plan_run()`, `am_plan_explain()` — the full JSON plan grammar |
 | Environment | `am_available()`, `am_load_error()`, `am_lib_path()`, `am_version()`, `am_device_name()`, `am_buffer_alignment()` |
@@ -197,14 +246,15 @@ column; and multi-chunk, single-chunk and empty ChunkedArrays.
 
 ## Not covered
 
-The binding resolves 34 of the ABI's 283 entry points. Not wrapped, and reachable only from
+The binding resolves 42 of the ABI's 283 entry points (36 it needs, and 6 newer ones it uses when the
+loaded library has them). Not wrapped, and reachable only from
 Python or Swift for now:
 
 - arithmetic (`am_arith_*`, `am_unary`, `am_binary`, checked variants), casts (`am_cast`),
   boolean logic and Kleene logic;
 - every string kernel (`am_str_*`, `am_string_*`, `am_regex`, `am_split`), temporal kernels,
   decimal, list, struct, map and extension types;
-- `am_top_k`, `am_lexsort`, `am_rank`, `am_unique`, `am_value_counts`, `am_is_in`,
+- `am_rank`, `am_unique`, `am_value_counts`, `am_is_in`,
   `am_cumulative`, `am_window`, `am_hash64`, `am_if_else`, `am_coalesce`, `am_fill_null`;
 - joins (`am_join`), the dense-key `am_group_by`, `am_query` (the fused expression compiler),
   Parquet (`am_parquet_*`), the streaming engine (`am_stream_*`), C Device interop
@@ -239,15 +289,16 @@ There is also no dplyr backend and no `RecordBatch`/`Table` surface: everything 
 - **Group order is not first-seen order**: ascending by key for numeric, boolean, temporal and
   decimal columns (nulls last), first-seen for strings and binary, lexicographic in column order
   for several columns. Label rows with `$keys()`.
-- **Sorts put nulls and `NaN` last in both directions**, so a descending sort is not the exact
-  reverse of an ascending one.
+- **By default sorts put nulls and `NaN` last in both directions**, so a descending sort is not the
+  exact reverse of an ascending one; `null_placement = "at_start"` and `float_order = "total"`
+  change that ([Sort options](#sort-options)).
 - **macOS on Apple silicon only.** The dylib is not included in the package.
 
 ## Tests
 
 `src/arrowmetal.h` and `src/arrow_abi.h` are copies of the repository's `include/` headers; refresh them (`cp include/arrowmetal.h r/arrowmetal/src/`) whenever the header changes, or `python/tests/test_header_copies.py` and `test-header-copy.R` fail.
 
-68 `test_that()` blocks in the sources (69 as testthat runs them: the one in test-dispatch.R runs once per attach order), 273 expectations, against base R and against `arrow`'s own
+83 `test_that()` blocks in the sources (84 as testthat runs them: the one in test-dispatch.R runs once per attach order), 778 expectations, against base R and against `arrow`'s own
 kernels on the same data: nulls, all-null and empty columns, sliced input at three offsets, lengths
 of 1, 33, 1024, 65537 and 1,000,001 (crossing a threadgroup boundary), one group per row and one group for
 everything, int64 above 2^53, float32 accumulation, and every documented error path.

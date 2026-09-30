@@ -9,7 +9,15 @@
 //
 // The browser is out of scope: there is no Metal there. This package is macOS/arm64 only.
 
-import { native, info, ArrayHandle, GroupByHandle, PlanSourceHandle, PlanResultHandle } from './native';
+import {
+  native,
+  info,
+  ArrayHandle,
+  ChunkParts,
+  GroupByHandle,
+  PlanSourceHandle,
+  PlanResultHandle,
+} from './native';
 import type { Data, DataType, Vector } from 'apache-arrow';
 
 export { info };
@@ -21,6 +29,64 @@ export type ArithOp = '+' | '-' | '*' | '/';
 
 const CMP: Record<CompareOp, number> = { '==': 0, '!=': 1, '<': 2, '<=': 3, '>': 4, '>=': 5 };
 const ARITH: Record<ArithOp, number> = { '+': 0, '-': 1, '*': 2, '/': 3 };
+
+/** Where the null rows of a sort key go. It holds in both directions. */
+export type NullPlacement = 'last' | 'first';
+/**
+ * How a float key orders -0.0, +0.0 and NaN (integer, string and temporal keys ignore it).
+ * `'ieee'` is the order of the plain sorts, Arrow C++'s: -0.0 ties +0.0, every NaN is one value,
+ * and the NaN rows sit next to the nulls in both directions. `'total'` is IEEE 754 totalOrder, as
+ * arrow-rs and Rust's `total_cmp` define it: -NaN < -Infinity < ... < -0 < +0 < ... < +Infinity <
+ * +NaN, and a descending sort is its exact mirror.
+ */
+export type FloatOrder = 'ieee' | 'total';
+
+/** Options of one sort key. Every field left out takes the plain sort's default. */
+export interface SortOptions {
+  /** Largest first. Default false. */
+  descending?: boolean;
+  /** Default `'last'`. */
+  nulls?: NullPlacement;
+  /** Default `'ieee'`. */
+  floatOrder?: FloatOrder;
+}
+
+/** Options of {@link MetalArray.topK}. */
+export interface TopKOptions {
+  /** The k largest (default) or, with false, the k smallest. */
+  largest?: boolean;
+  /** Default `'last'`. */
+  nulls?: NullPlacement;
+  /** Default `'ieee'`. */
+  floatOrder?: FloatOrder;
+}
+
+const NULL_PLACEMENT: Record<NullPlacement, number> = { last: 0, first: 1 };
+const FLOAT_ORDER: Record<FloatOrder, number> = { ieee: 0, total: 1 };
+
+function nullPlacementCode(v: NullPlacement | undefined): number {
+  if (v === undefined) return 0;
+  const c = NULL_PLACEMENT[v];
+  if (c === undefined || !Object.prototype.hasOwnProperty.call(NULL_PLACEMENT, v)) {
+    throw new Error(`ArrowMetal (Node): nulls must be 'last' or 'first', got ${JSON.stringify(v)}.`);
+  }
+  return c;
+}
+
+function floatOrderCode(v: FloatOrder | undefined): number {
+  if (v === undefined) return 0;
+  const c = FLOAT_ORDER[v];
+  if (c === undefined || !Object.prototype.hasOwnProperty.call(FLOAT_ORDER, v)) {
+    throw new Error(`ArrowMetal (Node): floatOrder must be 'ieee' or 'total', got ${JSON.stringify(v)}.`);
+  }
+  return c;
+}
+
+function checkK(k: number): void {
+  if (!Number.isSafeInteger(k) || k < 0) {
+    throw new Error(`ArrowMetal (Node): k must be a non-negative integer, got ${k}.`);
+  }
+}
 
 // am_reduce op numbering.
 const REDUCE = { sum: 0, min: 1, max: 2, mean: 3 } as const;
@@ -129,6 +195,29 @@ function rewind<T extends ArrayBufferView>(view: T, offset: number, totalElement
   return new Ctor(view.buffer, view.byteOffset - back, totalElements);
 }
 
+// The format and the C Data Interface parts (length, offset, nullCount, validity, data, offsets)
+// of one Arrow JS Data, over its own buffers.
+function dataParts(data: Data): [Format, ChunkParts] {
+  const format = typeToFormat(data.type);
+  const offset = data.offset;
+  const length = data.length;
+  const nullCount = data.nullCount;
+
+  const bitmap = data.nullBitmap;
+  const validity = nullCount > 0 && bitmap != null && bitmap.length > 0 ? bitmap : null;
+
+  if (format === 'u') {
+    const valueOffsets = rewind(data.valueOffsets as Int32Array, offset, offset + length + 1);
+    return [format, [length, offset, nullCount, validity, data.values as Uint8Array, valueOffsets]];
+  }
+  if (format === 'b') {
+    // Bool data is a bitmap; Arrow JS does not advance it, so the C offset applies as-is.
+    return [format, [length, offset, nullCount, validity, data.values as Uint8Array, null]];
+  }
+  const values = rewind(data.values as ArrayBufferView, offset, offset + length);
+  return [format, [length, offset, nullCount, validity, values, null]];
+}
+
 // ---------------------------------------------------------------------------------------------
 // MetalArray
 // ---------------------------------------------------------------------------------------------
@@ -160,47 +249,66 @@ export class MetalArray {
    * itself wraps those pages when they are page aligned and copies once when they are not; see
    * `wrappedProducerBuffers`.
    *
-   * A chunked Vector (more than one `Data`) is rejected rather than silently concatenated.
+   * A chunked Vector (more than one `Data`, e.g. a column of a Table built from several record
+   * batches) goes through {@link MetalArray.fromChunks}: one array of the total length, with no
+   * concatenation in JS.
    */
   static fromArrow<T extends DataType>(input: Vector<T> | Data<T>): MetalArray {
-    const data = 'data' in input && Array.isArray((input as Vector<T>).data)
-      ? (() => {
-          const chunks = (input as Vector<T>).data;
-          if (chunks.length !== 1) {
-            throw new Error(
-              `ArrowMetal (Node): expected a single-chunk Vector, got ${chunks.length} chunks. ` +
-                'Concatenate it first, e.g. with `vectorFromArray([...vector], vector.type)`.',
-            );
-          }
-          return chunks[0];
-        })()
-      : (input as Data<T>);
-
-    const format = typeToFormat(data.type);
-    const offset = data.offset;
-    const length = data.length;
-    const nullCount = data.nullCount;
-
-    const bitmap = data.nullBitmap;
-    const validity = nullCount > 0 && bitmap != null && bitmap.length > 0 ? bitmap : null;
-
-    if (format === 'u') {
-      const valueOffsets = rewind(data.valueOffsets as Int32Array, offset, offset + length + 1);
-      const bytes = data.values as Uint8Array;
-      return new MetalArray(
-        native.importArray('u', length, offset, nullCount, validity, bytes, valueOffsets),
-      );
+    if ('data' in input && Array.isArray((input as Vector<T>).data)) {
+      const chunks = (input as Vector<T>).data;
+      if (chunks.length !== 1) return MetalArray.fromChunks([input as Vector<T>]);
+      const [format, parts] = dataParts(chunks[0]);
+      return new MetalArray(native.importArray(format, ...parts));
     }
-    if (format === 'b') {
-      // Bool data is a bitmap; Arrow JS does not advance it, so the C offset applies as-is.
-      return new MetalArray(
-        native.importArray('b', length, offset, nullCount, validity, data.values as Uint8Array, null),
-      );
+    const [format, parts] = dataParts(input as Data<T>);
+    return new MetalArray(native.importArray(format, ...parts));
+  }
+
+  /**
+   * Imports a column held as several chunks of one type — `Data` chunks, `Vector`s (each of any
+   * number of chunks), or a mix — as one array of their total length (`am_import_chunks`). Each
+   * chunk's buffers are copied straight into the final Metal buffers, on the CPU cores in parallel,
+   * with no concatenated copy in JS first. Each chunk's offset, length and validity are honoured.
+   * One chunk in total is `fromArrow`, with its copy rule.
+   *
+   *   const table = tableFromIPC(bytes);          // several record batches
+   *   const col = MetalArray.fromChunks([table.getChild('x')!]);
+   */
+  static fromChunks(chunks: ReadonlyArray<Vector | Data>): MetalArray {
+    const datas: Data[] = [];
+    let type: DataType | undefined;
+    for (const c of chunks) {
+      if ('data' in c && Array.isArray((c as Vector).data)) {
+        type ??= (c as Vector).type;
+        datas.push(...(c as Vector).data);
+      } else {
+        datas.push(c as Data);
+      }
     }
-    const values = rewind(data.values as ArrayBufferView, offset, offset + length);
-    return new MetalArray(
-      native.importArray(format, length, offset, nullCount, validity, values, null),
-    );
+    if (datas.length === 0) {
+      if (type === undefined) {
+        throw new Error('ArrowMetal (Node): fromChunks needs at least one chunk (the type comes from it).');
+      }
+      // A Vector with no chunks still carries its type: an empty array of it.
+      return MetalArray.fromArrow(arrow().makeData({ type, length: 0 } as never) as Data);
+    }
+    if (datas.length === 1) {
+      const [format, parts] = dataParts(datas[0]);
+      return new MetalArray(native.importArray(format, ...parts));
+    }
+    const format = typeToFormat(datas[0].type);
+    const all: ChunkParts[] = [];
+    for (let i = 0; i < datas.length; i++) {
+      const [f, parts] = dataParts(datas[i]);
+      if (f !== format) {
+        throw new Error(
+          `ArrowMetal (Node): every chunk must have one type; chunk 0 is ${String(datas[0].type)} ` +
+            `and chunk ${i} is ${String(datas[i].type)}.`,
+        );
+      }
+      all.push(parts);
+    }
+    return new MetalArray(native.importChunks(format, all));
   }
 
   /**
@@ -342,13 +450,57 @@ export class MetalArray {
 
   // -- sorting ---------------------------------------------------------------------------------
 
-  /** Int32 indices that put the array in order. Stable; nulls last, NaN after +Infinity. */
-  argsort(descending = false): MetalArray {
-    return new MetalArray(native.argsort(this.handle, descending));
+  /**
+   * Int32 indices that put the array in order. Stable. With a boolean (or nothing): nulls last and
+   * NaN after +Infinity in both directions. With {@link SortOptions}: the null placement and the
+   * float order as given.
+   *
+   *   col.argsort();                                                  // ascending, plain
+   *   col.argsort({ descending: true, nulls: 'first', floatOrder: 'total' });
+   */
+  argsort(options: boolean | SortOptions = false): MetalArray {
+    if (typeof options === 'boolean') return new MetalArray(native.argsort(this.handle, options));
+    return new MetalArray(
+      native.argsortEx(
+        this.handle,
+        options.descending === true,
+        nullPlacementCode(options.nulls),
+        floatOrderCode(options.floatOrder),
+      ),
+    );
   }
-  /** A sorted copy, same type. */
-  sort(descending = false): MetalArray {
-    return new MetalArray(native.sort(this.handle, descending));
+  /** A sorted copy, same type, ordered as {@link MetalArray.argsort} with the same options orders it. */
+  sort(options: boolean | SortOptions = false): MetalArray {
+    if (typeof options === 'boolean') return new MetalArray(native.sort(this.handle, options));
+    return new MetalArray(
+      native.sortEx(
+        this.handle,
+        options.descending === true,
+        nullPlacementCode(options.nulls),
+        floatOrderCode(options.floatOrder),
+      ),
+    );
+  }
+  /**
+   * Int32 indices of the k largest (default) or k smallest rows, in sorted order: the first k
+   * indices `argsort` gives in that direction with the same options, found by GPU selection rather
+   * than a whole sort. A boolean is `largest`.
+   *
+   *   col.topK(10);                                   // the 10 largest
+   *   col.topK(10, { largest: false, nulls: 'first' });
+   */
+  topK(k: number, options: boolean | TopKOptions = true): MetalArray {
+    checkK(k);
+    if (typeof options === 'boolean') return new MetalArray(native.topK(this.handle, k, options));
+    return new MetalArray(
+      native.topKEx(
+        this.handle,
+        k,
+        options.largest !== false,
+        nullPlacementCode(options.nulls),
+        floatOrderCode(options.floatOrder),
+      ),
+    );
   }
 
   // -- output ----------------------------------------------------------------------------------
@@ -504,19 +656,38 @@ export function groupBy(keys: MetalArray | MetalArray[]): GroupBy {
   return new GroupBy(native.groupByKeys(cols.map((c) => c.handle)), cols.length);
 }
 
-/** Int32 indices ordering the rows by each column in turn, the first column most significant. */
-export function lexsort(columns: MetalArray[], descending?: boolean[]): MetalArray {
+/**
+ * Int32 indices ordering the rows by each column in turn, the first column most significant. The
+ * second argument is one descending flag per column, or one {@link SortOptions} per column, which
+ * gives each key its own direction, null placement and float order.
+ *
+ *   lexsort([region, revenue], [false, true]);
+ *   lexsort([region, revenue], [{ nulls: 'first' }, { descending: true, floatOrder: 'total' }]);
+ */
+export function lexsort(columns: MetalArray[], keys?: boolean[] | SortOptions[]): MetalArray {
   if (columns.length === 0) {
     throw new Error('ArrowMetal (Node): lexsort needs at least one column, got an empty list.');
   }
-  const desc = descending ?? columns.map(() => false);
-  if (desc.length !== columns.length) {
+  const k = keys ?? columns.map(() => false);
+  if (k.length !== columns.length) {
     throw new Error(
-      `ArrowMetal (Node): lexsort got ${columns.length} columns but ${desc.length} ` +
-        'descending flags; pass one per column or omit them entirely.',
+      `ArrowMetal (Node): lexsort got ${columns.length} columns but ${k.length} ` +
+        'descending flags or SortOptions; pass one per column or omit them entirely.',
     );
   }
-  return new MetalArray(native.lexsort(columns.map((c) => c.handle), desc));
+  const handles = columns.map((c) => c.handle);
+  if (k.every((x) => typeof x === 'boolean')) {
+    return new MetalArray(native.lexsort(handles, k as boolean[]));
+  }
+  const opts = k.map((x) => (typeof x === 'boolean' ? { descending: x } : x) as SortOptions);
+  return new MetalArray(
+    native.lexsortEx(
+      handles,
+      opts.map((o) => o.descending === true),
+      opts.map((o) => nullPlacementCode(o.nulls)),
+      opts.map((o) => floatOrderCode(o.floatOrder)),
+    ),
+  );
 }
 
 // ---------------------------------------------------------------------------------------------
