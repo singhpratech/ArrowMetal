@@ -1,0 +1,53 @@
+Go, Node and R bindings: call overhead (previous commit c4e2f6f against this one) and the chunked
+import against concatenating first. 2026-09-29 to 2026-09-30, Apple M4 Max, macOS; Go 1.27.1 and
+arrow-go v18.7.0; node v24.9.0 and apache-arrow 21.2.0; R 4.5.3 and arrow 25.0.0. Both builds of
+each binding loaded the same libArrowMetalC.dylib (built -c release from this commit; Sources/ is
+identical in both commits).
+
+Method. Each block ran only when no other timing or build held the machine and the 1-minute load
+average was below 3.5; the load at the start and end of each block and the last sleep entry of
+`pmset -g log` are below (no block spans a sleep). Every row: calls of the same shape run untimed
+for at least 100 ms, then a 500 ms idle and one call timed on its own (first_after_idle_ms), then
+the timed calls (30 per row in the four rounds, 100 in the re-time, 1,000 in the second re-time,
+which ran two of its planned eight rounds; 10 in the chunk rounds), giving best and median wall time
+and process CPU time per call (getrusage / process.cpuUsage / proc.time). The previous and this
+commit alternate in every round, in the order old-new, new-old, ... Programs:
+go/arrowmetal/cmd/ambench, go/arrowmetal/cmd/amchunks, node/bench/overhead.mjs,
+node/bench/chunks.mjs, r/arrowmetal/inst/bench/overhead.R, r/arrowmetal/inst/bench/chunks.R (with
+its `gc` argument for the _gc_between rows).
+
+Blocks: name, start, end, load at start, load at end, exit code, last sleep entry
+go_overhead_r1,19:04:24,19:04:48,1.96,1.88,0,2026-09-29 00:37:52
+node_overhead_r1,19:51:21,19:51:47,3.22,3.42,0,2026-09-29 00:37:52
+r_overhead_r1,19:52:45,19:53:08,1.90,2.29,0,2026-09-29 00:37:52
+go_overhead_r2,19:58:05,19:58:28,2.50,2.21,0,2026-09-29 00:37:52
+node_overhead_r2,19:59:13,19:59:38,1.54,1.50,0,2026-09-29 00:37:52
+r_overhead_r2,20:23:22,20:23:46,3.10,2.76,0,2026-09-29 00:37:52
+go_overhead_r3,20:24:57,20:25:23,2.80,2.54,0,2026-09-29 00:37:52
+node_overhead_r3,20:43:18,20:43:44,3.31,2.80,0,2026-09-29 00:37:52
+r_overhead_r3,21:19:40,21:20:03,3.31,4.13,0,2026-09-29 00:37:52
+go_overhead_r4,21:21:26,21:21:50,2.36,2.42,0,2026-09-29 00:37:52
+node_overhead_r4,21:23:01,21:23:27,3.02,2.80,0,2026-09-29 00:37:52
+r_overhead_r4,21:27:01,21:27:25,3.27,3.13,0,2026-09-29 00:37:52
+go_chunks_r1,21:28:46,21:28:57,2.78,2.62,0,2026-09-29 00:37:52
+node_chunks_r1,22:16:14,22:16:38,2.83,2.83,0,2026-09-29 00:37:52
+r_chunks_r1,22:22:08,22:22:29,3.32,2.63,0,2026-09-29 00:37:52
+go_chunks_r2,23:23:02,23:23:13,3.33,3.19,0,2026-09-29 00:37:52
+node_chunks_r2,23:35:44,23:36:08,3.33,2.67,0,2026-09-29 00:37:52
+r_chunks_r2,23:44:11,23:44:29,3.48,5.46,0,2026-09-29 00:37:52
+go_chunks_r3,23:45:56,23:46:08,3.42,3.05,0,2026-09-29 00:37:52
+node_chunks_r3,23:47:46,23:48:10,1.53,1.54,0,2026-09-29 00:37:52
+r_chunks_r3,00:04:20,00:04:38,1.81,1.74,0,2026-09-29 00:37:52
+retime_r1,00:07:20,00:07:42,1.72,1.41,0,2026-09-29 00:37:52
+retime_r2,00:25:06,00:25:29,3.30,2.78,0,2026-09-29 00:37:52
+retime_r3,00:27:49,00:28:11,3.15,2.54,0,2026-09-29 00:37:52
+retime_r4,00:29:37,00:29:58,1.41,1.55,0,2026-09-29 00:37:52
+retime_r5,00:34:49,00:35:11,3.47,3.18,0,2026-09-29 00:37:52
+retime_r6,00:37:24,00:37:45,1.82,1.78,0,2026-09-29 00:37:52
+retime_r7,00:44:21,00:44:44,3.45,2.89,0,2026-09-29 00:37:52
+retime_r8,00:47:38,00:47:59,1.77,1.76,0,2026-09-29 00:37:52
+r_chunks_gc_r1,00:50:03,00:50:25,1.72,1.89,0,2026-09-29 00:37:52
+r_chunks_gc_r2,00:51:11,00:51:32,1.50,1.36,0,2026-09-29 00:37:52
+r_chunks_gc_r3,00:57:30,00:57:53,3.19,3.13,0,2026-09-29 00:37:52
+retime2_r1,01:05:55,01:06:02,3.45,3.65,0,2026-09-29 00:37:52
+retime2_r2,01:42:02,01:42:09,3.39,3.12,0,2026-09-29 00:37:52

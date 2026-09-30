@@ -73,6 +73,55 @@ res <- am_plan_run('{"op":"limit","count":2,"input":{"op":"scan","source":"sales
 as.vector(as_arrow_array(res$amount))                # back to plain R
 ```
 
+## Sort options
+
+`am_argsort()`, `am_sort()`, `am_top_k()` and `am_lexsort()` take Arrow's `null_placement`
+(`"at_end"`, the default, or `"at_start"`) and a `float_order` (`"ieee"`, the default, or `"total"`):
+
+```r
+x <- c(2, NA, NaN, -0, 7)
+am_argsort(x, descending = TRUE)                                  # 4 0 3 2 1: NA and NaN last
+am_argsort(x, descending = TRUE, null_placement = "at_start",
+           float_order = "total")                                 # 1 2 4 0 3
+am_top_k(x, 2, null_placement = "at_start", float_order = "total")   # 1 2
+am_lexsort(list(c(1, 1, 2), c(3, NA, 1)), descending = c(FALSE, TRUE),
+           null_placement = c("at_end", "at_start"))              # 1 0 2
+```
+
+(Each is shown through `as.vector()`; `test-sort-options.R` and `test-chunks.R` run these lines.)
+With the defaults each function runs the call it always ran: nulls last and `NaN` after `+Inf` in both directions, `-0`
+tied with `0`. `"at_start"` puts the nulls first in either direction. `float_order = "ieee"` is Arrow
+C++'s order: `-0` ties `0`, every `NaN` is one value, and the `NaN` rows sit next to the nulls in both
+directions. `"total"` is IEEE 754 totalOrder, the order arrow-rs and Rust's `total_cmp` use:
+`-NaN < -Inf < ... < -0 < 0 < ... < Inf < NaN`, and a descending sort is its exact mirror. Integer,
+string and temporal columns ignore `float_order`. `am_top_k(x, k, largest, ...)` is the first `k`
+indices of `am_argsort(x, descending = largest, ...)`. In `am_lexsort()` each option is one value for
+every key or a vector with one per key. A plan's `sort` key takes the same options as JSON:
+`{"column": "x", "descending": true, "nulls": "first", "float_order": "total"}` ([ENGINE.md](ENGINE.md)).
+
+## Chunked columns
+
+`am_array_chunks()` imports a column held in chunks — an `arrow::ChunkedArray`, or a list of
+Arrays of one type such as one column of several record batches — as one `am_array`, with no
+concatenated copy first. `am_array()` keeps concatenating a ChunkedArray first, as it always has
+(measured below, that is the faster path in R at 10M and 50M rows).
+
+```r
+ca <- arrow::chunked_array(c(1, NA), numeric(0), c(3, 4, 5))
+h <- am_array_chunks(ca)
+length(h); am_null_count(h); am_sum(h)    # 5, 1, 13
+```
+
+The column crosses the C Data Interface once, as an `ArrowArrayStream` of one-column record batches
+(`arrow::as_record_batch_reader()`), so the R side does the same work for 10 chunks as for 1,000. The
+shim reads the stream in C, moves each batch's column into one block of `ArrowArray` structs it owns
+and releases the batch, and `am_import_chunks` copies each chunk's buffers straight into the final
+GPU buffers, on the CPU cores in parallel, honouring each chunk's offset, length and validity. Each
+chunk's release callback runs exactly once, by ArrowMetal or, for a chunk it did not take, by the
+shim. One chunk is `am_array()`. A list of arrays becomes a ChunkedArray first, which checks that
+the chunks share one type. A type the chunked import does not take (dictionary, nested, run-end
+encoded, extension) is concatenated and imported, as `am_array()` always did.
+
 ## The copy rule
 
 **Out is always copy-free.** `as_arrow_array()` hands `arrow` a C Data Interface array pointing at
@@ -178,15 +227,83 @@ The `import` rows are the one place isolated timing is *worse* than interleaved 
 arrow's kernels are multi-threaded and base R's are not, so a comparison against base R is not a
 per-core figure. Timings on a loaded machine are noise; these ran on an idle machine.
 
+### Chunked columns against concatenating first
+
+`Rscript inst/bench/chunks.R`: a column in chunks, each chunk its own Array, imported with
+`am_array_chunks()` against `am_array(do.call(arrow::concat_arrays, chunks))`, which is what
+`am_array()` of a ChunkedArray does. M4 Max, 2026-09-29, R 4.5.3, arrow 25.0.0; three rounds, each row
+warmed for 100 ms and then timed 10 times; best of the three rounds, the median of the per-round
+medians in parentheses; CPU is process CPU time per call. Source:
+`Benchmarks/results/bindings_chunked_import_2026-09-29.csv`.
+
+An `am_array` is freed when R's collector finalizes it. With `gc()` run before every timed call
+(outside the timed region), each call starts with the previous call's handle and GPU memory gone,
+as a program that releases its columns sees it:
+
+| Column | Rows | Chunks | `concat_arrays` + `am_array()` | `am_array_chunks()` | CPU ms (concatenate / chunked) |
+|---|---:|---:|---:|---:|---:|
+| float64, 10% null | 10,000,000 | 153 | 1.82 (1.89) ms | 1.20 (1.31) ms | 2.1 / 8.4 |
+| float64, 10% null | 10,000,000 | 10 | 1.47 (1.51) ms | 1.12 (1.24) ms | 1.7 / 8.0 |
+| float64, 10% null | 50,000,000 | 763 | 8.36 (9.03) ms | 3.68 (4.01) ms | 10.5 / 34.6 |
+| float64, 10% null | 50,000,000 | 50 | 6.02 (6.12) ms | 3.07 (3.35) ms | 7.2 / 37.0 |
+| int64 | 10,000,000 | 153 | 1.59 (1.66) ms | 1.09 (1.23) ms | 1.8 / 6.9 |
+| int64 | 10,000,000 | 10 | 1.26 (1.31) ms | 0.97 (1.05) ms | 1.3 / 6.7 |
+| int64 | 50,000,000 | 763 | 7.74 (8.42) ms | 3.37 (3.81) ms | 8.6 / 32.3 |
+| int64 | 50,000,000 | 50 | 5.57 (5.71) ms | 2.69 (2.98) ms | 5.9 / 30.4 |
+
+Without the `gc()` calls, the handles of earlier calls hold their GPU memory until the collector
+runs, and every chunked import writes into newly allocated GPU memory, while `arrow`'s concatenation
+is page aligned and borrowed. There the chunked import is behind at 10M rows (see To improve below):
+
+| Column | Rows | Chunks | `concat_arrays` + `am_array()` | `am_array_chunks()` | CPU ms (concatenate / chunked) |
+|---|---:|---:|---:|---:|---:|
+| float64, 10% null | 10,000,000 | 153 | 2.87 (3.52) ms | 5.15 (5.71) ms | 4.2 / 93.8 |
+| float64, 10% null | 10,000,000 | 10 | 2.37 (4.89) ms | 4.57 (5.03) ms | 5.0 / 81.2 |
+| float64, 10% null | 50,000,000 | 763 | 13.42 (14.34) ms | 7.23 (12.44) ms | 15.3 / 119.4 |
+| float64, 10% null | 50,000,000 | 50 | 11.31 (15.78) ms | 7.70 (86.55) ms | 16.2 / 185.4 |
+| int64 | 10,000,000 | 153 | 4.51 (5.22) ms | 4.36 (5.68) ms | 5.6 / 90.8 |
+| int64 | 10,000,000 | 10 | 4.32 (5.12) ms | 4.85 (5.59) ms | 5.6 / 93.9 |
+| int64 | 50,000,000 | 763 | 16.96 (21.79) ms | 9.73 (10.27) ms | 21.3 / 133.8 |
+| int64 | 50,000,000 | 50 | 10.76 (11.72) ms | 10.12 (10.83) ms | 12.0 / 151.0 |
+
+`am_array()` of a ChunkedArray therefore keeps concatenating first, as it did.
+
+### The existing calls, before and after
+
+`Rscript inst/bench/overhead.R` times the calls that existed before, installed from the previous
+commit and from this one against the same `libArrowMetalC.dylib`, in four alternating rounds (each row
+warmed for 100 ms, a 500 ms idle and one call timed on its own, then 30 calls); best of the four
+rounds, the median of the per-round medians in parentheses. At 10M rows:
+
+| Call | Previous commit | This commit |
+|---|---:|---:|
+| `am_array()`, int64 Array | 0.011 (0.029) ms | 0.011 (0.015) ms |
+| `am_array()`, float64 Array with 10% nulls | 4.15 (4.82) ms | 4.15 (4.86) ms |
+| `am_array()`, one-chunk ChunkedArray | 3.76 (4.50) ms | 3.91 (4.59) ms |
+| `am_argsort(x)`, float64 with 10% nulls | 6.47 (7.74) ms | 6.48 (7.92) ms |
+| `am_argsort(x, TRUE)`, int64 | 3.74 (5.46) ms | 4.29 (5.28) ms |
+| `am_sort(x)`, float64 with 10% nulls | 7.40 (8.07) ms | 7.26 (9.50) ms |
+
+No row at 1,000, 1,000,000 or 10M rows was slower in both best and median. Every row, with
+first-call-after-idle and CPU time: `Benchmarks/results/bindings_call_overhead_2026-09-29_summary.csv`.
+
+### To improve
+
+- `am_array_chunks()` in a loop that leaves its handles to R's collector: at 10M rows it takes 0.97x
+  to 1.93x the time of `concat_arrays` + `am_array()` (best of three rounds; int64 in 153 chunks
+  4.36 against 4.51 ms, float64 in 10 chunks 4.57 against 2.37 ms), and at 50M rows float64 in 50
+  chunks has a median of 86.5 ms against 15.8 ms. It uses 81 to 185 CPU-ms per call there, against
+  7 to 37 with `gc()` between calls.
+
 ## Covered
 
 | Area | Functions |
 |---|---|
-| Import / export | `am_array()`, `as_arrow_array()`, `as.vector()`, `length()`, `am_null_count()`, `am_format()` |
+| Import / export | `am_array()`, `am_array_chunks()` (a ChunkedArray or a list of arrays, `am_import_chunks`), `as_arrow_array()`, `as.vector()`, `length()`, `am_null_count()`, `am_format()` |
 | Reductions | `am_sum()`, `am_min()`, `am_max()`, `am_mean()` |
 | Element-wise | `am_compare()` — `==`, `!=`, `<`, `<=`, `>`, `>=`, against a scalar or a column |
 | Selection | `am_filter()`, `am_take()`, `am_slice()` |
-| Sorting | `am_argsort()`, `am_sort()` |
+| Sorting | `am_argsort()`, `am_sort()`, `am_top_k()`, `am_lexsort()`, each with `null_placement` and `float_order` |
 | Grouping | `am_group_by()` over any number of key columns of any supported type, with `$sum $min $max $mean $count $count_all $first $last $product $var $sd $median $quantile` and `$agg()` for the remaining `am_group_agg_ex` ops |
 | Query engine | `am_plan_source()`, `am_plan_run()`, `am_plan_explain()` — the full JSON plan grammar |
 | Environment | `am_available()`, `am_load_error()`, `am_lib_path()`, `am_version()`, `am_device_name()`, `am_buffer_alignment()` |
@@ -197,14 +314,15 @@ column; and multi-chunk, single-chunk and empty ChunkedArrays.
 
 ## Not covered
 
-The binding resolves 34 of the ABI's 283 entry points. Not wrapped, and reachable only from
+The binding resolves 42 of the ABI's 283 entry points (36 it needs, and 6 newer ones it uses when the
+loaded library has them). Not wrapped, and reachable only from
 Python or Swift for now:
 
 - arithmetic (`am_arith_*`, `am_unary`, `am_binary`, checked variants), casts (`am_cast`),
   boolean logic and Kleene logic;
 - every string kernel (`am_str_*`, `am_string_*`, `am_regex`, `am_split`), temporal kernels,
   decimal, list, struct, map and extension types;
-- `am_top_k`, `am_lexsort`, `am_rank`, `am_unique`, `am_value_counts`, `am_is_in`,
+- `am_rank`, `am_unique`, `am_value_counts`, `am_is_in`,
   `am_cumulative`, `am_window`, `am_hash64`, `am_if_else`, `am_coalesce`, `am_fill_null`;
 - joins (`am_join`), the dense-key `am_group_by`, `am_query` (the fused expression compiler),
   Parquet (`am_parquet_*`), the streaming engine (`am_stream_*`), C Device interop
@@ -239,15 +357,16 @@ There is also no dplyr backend and no `RecordBatch`/`Table` surface: everything 
 - **Group order is not first-seen order**: ascending by key for numeric, boolean, temporal and
   decimal columns (nulls last), first-seen for strings and binary, lexicographic in column order
   for several columns. Label rows with `$keys()`.
-- **Sorts put nulls and `NaN` last in both directions**, so a descending sort is not the exact
-  reverse of an ascending one.
+- **By default sorts put nulls and `NaN` last in both directions**, so a descending sort is not the
+  exact reverse of an ascending one; `null_placement = "at_start"` and `float_order = "total"`
+  change that ([Sort options](#sort-options)).
 - **macOS on Apple silicon only.** The dylib is not included in the package.
 
 ## Tests
 
 `src/arrowmetal.h` and `src/arrow_abi.h` are copies of the repository's `include/` headers; refresh them (`cp include/arrowmetal.h r/arrowmetal/src/`) whenever the header changes, or `python/tests/test_header_copies.py` and `test-header-copy.R` fail.
 
-68 `test_that()` blocks in the sources (69 as testthat runs them: the one in test-dispatch.R runs once per attach order), 273 expectations, against base R and against `arrow`'s own
+83 `test_that()` blocks in the sources (84 as testthat runs them: the one in test-dispatch.R runs once per attach order), 778 expectations, against base R and against `arrow`'s own
 kernels on the same data: nulls, all-null and empty columns, sliced input at three offsets, lengths
 of 1, 33, 1024, 65537 and 1,000,001 (crossing a threadgroup boundary), one group per row and one group for
 everything, int64 above 2^53, float32 accumulation, and every documented error path.
