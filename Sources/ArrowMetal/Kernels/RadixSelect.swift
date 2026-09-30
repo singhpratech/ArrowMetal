@@ -35,6 +35,10 @@ extension TopK {
             if T.self == Float.self { return ("f32t", "float", "uint", 32) }
             if T.self == Double.self { return ("f64t", "ulong", "ulong", 64) }
         }
+        if floatOrder == .nanLargest {
+            if T.self == Float.self { return ("f32n", "float", "uint", 32) }
+            if T.self == Double.self { return ("f64n", "ulong", "ulong", 64) }
+        }
         switch T.self {
         case is Int8.Type: return ("i8", "char", "uint", 8)
         case is UInt8.Type: return ("u8", "uchar", "uint", 8)

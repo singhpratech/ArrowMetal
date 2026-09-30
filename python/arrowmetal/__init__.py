@@ -443,7 +443,7 @@ class MetalArray:
 
         The first k indices `argsort(descending=largest, null_placement=..., float_order=...)` gives:
         `null_placement="at_start"` puts the null rows first, `float_order="total"` orders floats by
-        IEEE 754 totalOrder (see `argsort`)."""
+        IEEE 754 totalOrder and `"nan_largest"` with NaN above +inf (see `argsort`)."""
         if null_placement == "at_end" and float_order == "ieee":
             return _call(_lib.am_top_k, self._h, k, 1 if largest else 0)
         return _call(_lib.am_top_k_ex, self._h, k, 1 if largest else 0,
@@ -1281,7 +1281,7 @@ def lexsort_indices(columns, descending=None, null_placement="at_end", float_ord
 
     `descending` is one flag per column, or None for all ascending. Successive stable GPU radix argsorts
     from the least significant key upwards. `null_placement` ("at_end" / "at_start") and `float_order`
-    ("ieee" / "total", see `MetalArray.argsort`) are either one value for every key or a list with one
+    ("ieee" / "total" / "nan_largest", see `MetalArray.argsort`) are either one value for every key or a list with one
     per key; the placement holds in both directions, as Arrow's does.
 
         idx = am.lexsort_indices([region, revenue], [False, True])
@@ -3761,9 +3761,10 @@ _lib.am_list_parent_indices64.restype = ctypes.c_int
 
 #: Arrow's `null_placement`: where the null rows sit in a sorted order, in either direction.
 NULL_PLACEMENT = ["at_end", "at_start"]
-#: How a sort orders float keys: "ieee" (Arrow C++'s order, the default) or "total" (IEEE 754 totalOrder,
-#: arrow-rs's order). The index is the C ABI's `float_order`.
-FLOAT_ORDERS = ["ieee", "total"]
+#: How a sort orders float keys: "ieee" (Arrow C++'s order, the default), "total" (IEEE 754 totalOrder,
+#: arrow-rs's order) or "nan_largest" (NaN above +inf in both directions, Polars' order). The index is the
+#: C ABI's `float_order`.
+FLOAT_ORDERS = ["ieee", "total", "nan_largest"]
 #: Arrow's `rank` tiebreakers.
 TIEBREAKERS = ["min", "max", "first", "dense"]
 #: Arrow's `null_matching_behavior` for `is_in` / `index_in`.
@@ -3898,6 +3899,8 @@ def _argsort_ex(self, descending=False, null_placement="at_end", float_order="ie
       -NaN < -inf < ... < -0.0 < +0.0 < ... < +inf < +NaN, NaNs by payload, and a descending sort is
       the exact mirror, so +NaN comes first. It is one key map in the same radix passes, not an extra
       sort key.
+    * "nan_largest" — Polars' and NumPy's order: every NaN is one value above +inf in both directions
+      (last ascending, first descending), -0.0 and +0.0 tie. Also one key map, no extra key.
     """
     if float_order == "ieee":
         return _call(_lib.am_argsort_ex, self._h, 1 if descending else 0,

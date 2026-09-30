@@ -18,10 +18,53 @@ import Foundation
 
 /// Streaming external sort. Rows come out in full sort order through `sink`.
 public final class ExternalSortOperator: StreamOperator {
+    /// One sort key, with the options of a plan sort key (`SortKey`): the direction, where the nulls go
+    /// (after every value by default, before every value with `nullsFirst`, in either direction) and, for
+    /// a Float32 / Float64 key, the float order (`FloatOrder`). The per-batch sort and the merge both
+    /// follow them, so every run and the merged output are in one order.
     public struct Key: Sendable {
         public var column: String
         public var descending: Bool
-        public init(_ column: String, descending: Bool = false) { self.column = column; self.descending = descending }
+        public var nullsFirst: Bool
+        public var floatOrder: FloatOrder
+        public init(_ column: String, descending: Bool = false, nullsFirst: Bool = false,
+                    floatOrder: FloatOrder = .ieee) {
+            self.column = column; self.descending = descending
+            self.nullsFirst = nullsFirst; self.floatOrder = floatOrder
+        }
+        var sortKey: SortKey { SortKey(column, descending: descending, nullsFirst: nullsFirst, floatOrder: floatOrder) }
+        var nullPlacement: NullPlacement { nullsFirst ? .atStart : .atEnd }
+
+        /// -1, 0 or 1 as `x` sorts before, ties with or sorts after `y` under this key: the order the
+        /// GPU sort gives the same values, applied by the CPU merge.
+        func order(_ x: StreamValue, _ y: StreamValue) -> Int {
+            if x.isNull || y.isNull {
+                if x.isNull && y.isNull { return 0 }
+                return x.isNull == nullsFirst ? -1 : 1
+            }
+            if case .double(let a) = x, case .double(let b) = y { return floatOrderOf(a, b) }
+            if x == y { return 0 }
+            return StreamValue.less(x, y) != descending ? -1 : 1
+        }
+
+        private func floatOrderOf(_ a: Double, _ b: Double) -> Int {
+            func directed(_ c: Int) -> Int { descending ? -c : c }
+            switch floatOrder {
+            case .total:
+                if a.bitPattern == b.bitPattern { return 0 }
+                return directed(a.isTotallyOrdered(belowOrEqualTo: b) ? -1 : 1)
+            case .nanLargest:
+                if a.isNaN || b.isNaN { return a.isNaN && b.isNaN ? 0 : directed(a.isNaN ? 1 : -1) }
+                return a == b ? 0 : directed(a < b ? -1 : 1)
+            case .ieee:
+                // Every NaN is one value, placed next to the nulls whichever the direction.
+                if a.isNaN || b.isNaN {
+                    if a.isNaN && b.isNaN { return 0 }
+                    return a.isNaN == nullsFirst ? -1 : 1
+                }
+                return a == b ? 0 : directed(a < b ? -1 : 1)
+            }
+        }
     }
 
     public let keys: [Key]
@@ -93,9 +136,11 @@ public final class ExternalSortOperator: StreamOperator {
             guard let c = batch[keys[0].column] else {
                 throw ArrowMetalError.invalidArrowArray("no column named \(keys[0].column)")
             }
-            return try batch.take(try argsortAny(c, descending: keys[0].descending))
+            return try batch.take(try argsortAny(c, descending: keys[0].descending,
+                                                 nullPlacement: keys[0].nullPlacement,
+                                                 floatOrder: keys[0].floatOrder))
         }
-        return try batch.sorted(by: keys.map { (column: $0.column, descending: $0.descending) })
+        return try batch.sorted(by: keys.map(\.sortKey))
     }
 
     /// The first `n` rows of `batch` in the sort's own total order.
@@ -105,7 +150,9 @@ public final class ExternalSortOperator: StreamOperator {
     /// so this is a cheaper way to compute the same prefix, not a different answer.
     private func sortedHead(_ batch: MetalRecordBatch, _ n: Int) throws -> MetalRecordBatch {
         if keys.count == 1, batch.length > n, let c = batch[keys[0].column],
-           let idx = try topKIndicesIfSupported(c, k: n, largest: keys[0].descending) {
+           let idx = try topKIndicesIfSupported(c, k: n, largest: keys[0].descending,
+                                                nullPlacement: keys[0].nullPlacement,
+                                                floatOrder: keys[0].floatOrder) {
             return try batch.take(idx)
         }
         let sorted = try sortWhole(batch)
@@ -117,7 +164,8 @@ public final class ExternalSortOperator: StreamOperator {
         let ctx = batch.firstContext ?? context
         var work = batch
         if pruning, !threshold.isNull, let c = batch[keys[0].column],
-           let m = try topNThresholdMask(c, threshold, largest: keys[0].descending) {
+           let m = try topNThresholdMask(c, threshold, largest: keys[0].descending,
+                                         nullsFirst: keys[0].nullsFirst, floatOrder: keys[0].floatOrder) {
             guard let idx = try survivorIndices(m) else { prunedBatches += 1; return }
             work = try batch.take(idx)
         }
@@ -258,13 +306,9 @@ func kWayMerge(runs: [URL], keys: [ExternalSortOperator.Key], sink: StreamSink,
     /// True when run `a`'s current row sorts before run `b`'s.
     func before(_ a: RunCursor, _ b: RunCursor) -> Bool {
         for (i, k) in keys.enumerated() {
-            let x = a.key(i), y = b.key(i)
-            if x == y { continue }
-            // Nulls last in both directions, as `argsort` places them.
-            if x.isNull { return false }
-            if y.isNull { return true }
-            let lt = StreamValue.less(x, y)
-            return k.descending ? !lt : lt
+            // Each key's own order (`Key.order`): its direction, null placement and float order.
+            let c = k.order(a.key(i), b.key(i))
+            if c != 0 { return c < 0 }
         }
         return false
     }

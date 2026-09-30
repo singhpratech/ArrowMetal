@@ -279,7 +279,8 @@ let multi = arrowmetal::lexsort(&[&a, &b], &[opts, opts])?;
 ```
 
 `From<arrow::compute::SortOptions>` sets `float_order: FloatOrder::Total`; `SortOptions::default()` is
-the plain sort. Neither option adds a pass to the GPU sort: the null placement is where the partition
+the plain sort. `FloatOrder::NanLargest` is the third float order, Polars': every NaN one value above
++inf in both directions, -0.0 tied with +0.0. Neither option adds a pass to the GPU sort: the null placement is where the partition
 that takes the null rows out of the radix sort puts them, and totalOrder is the key map in front of the
 radix passes. `tests/sort_options.rs` compares every combination against `arrow::compute::sort` bit for
 bit.

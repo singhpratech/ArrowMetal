@@ -737,6 +737,9 @@ pub enum FloatOrder {
     /// IEEE 754 totalOrder, as arrow-rs and `f64::total_cmp` define it:
     /// -NaN < -inf < ... < -0.0 < +0.0 < ... < +inf < +NaN, and descending is the exact mirror.
     Total = 1,
+    /// Polars' order: every NaN is one value above +inf in both directions (last ascending, first
+    /// descending), and -0.0 ties +0.0.
+    NanLargest = 2,
 }
 
 /// Per-key sort options: direction, null placement and float order.

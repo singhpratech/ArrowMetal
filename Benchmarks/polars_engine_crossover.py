@@ -54,7 +54,6 @@ OUT = os.path.join(ROOT, "python", "arrowmetal", "_engine_crossovers.py")
 SWEEP_JSON = "Benchmarks/results/router_2026-09-24.json"
 SWEEP_LABELS = {
     "sort": ["sort: argsort int64", "sort: argsort float64", "sort: lexsort (2 int32 keys)"],
-    "sort_helper_keys": ["sort: argsort int64", "sort: argsort float64", "sort: lexsort (2 int32 keys)"],
     "top_k": ["sort: top_k (k=100, int64)"],
 }
 POLARS = ("polars in-memory", "polars streaming")
@@ -115,7 +114,7 @@ def node_of(cls):
     # The same map as _engine_policy.NODE (that module imports the generated table, so it is not
     # loaded here).
     head = cls.split(":")[0]
-    return {"group_by_multi": "group_by", "sort_helper_keys": "sort", "top_k": "sort"}.get(head, head)
+    return {"group_by_multi": "group_by", "top_k": "sort"}.get(head, head)
 
 
 def read_sweep(path):

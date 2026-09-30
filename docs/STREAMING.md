@@ -306,8 +306,10 @@ Two details make it exact rather than merely close:
 * The comparison is `>=`, not `>`. A row that *ties* the running k-th value can still be the row the
   total order picks (`topK` breaks ties by row index), and for a multi-key sort it can still win on
   the second key. Keeping ties is what makes the pruned answer *the* answer.
-* A threshold is only taken when the k-th row's key is **non-null**. Nulls sort last, so once k
-  non-null rows are resident no null row can displace one; while fewer than k are, nothing is pruned.
+* A threshold is only taken when the k-th row's key is **non-null** and not NaN. Nulls sort last, so
+  once k non-null rows are resident no null row can displace one; while fewer than k are, nothing is
+  pruned. With a sort key's nulls first (§5), a batch that holds nulls is not pruned, and where the
+  key's float order puts NaN ahead of the values the NaN rows pass the prune as well.
 
 The fold runs on the GPU thread rather than the merge thread, which leaves the merge stage idle *and*
 means the threshold the next batch prunes with is always the newest one.
@@ -344,6 +346,14 @@ would want 570 file descriptors and 570 resident batches; instead the merge runs
 stay constant however many runs there are. A `limit` is applied to *every* pass — the global first n
 rows are always inside the union of each group's first n — which is what makes `ORDER BY ... LIMIT`
 cheap over hundreds of runs.
+
+Each sort key carries the options of a plan sort key ([ENGINE.md](ENGINE.md), "Sort key options"):
+its direction, its null placement (`nullsFirst`, last by default) and, for a float key, its float
+order (`ieee` by default, `total`, `nan_largest`). The per-batch GPU sort and the CPU merge order by
+the same rules, so the runs and the merged output agree, and every NaN is placed as the order says
+(`ieee`: next to the nulls). `ExternalSortOperator.Key(_:descending:nullsFirst:floatOrder:)` in
+Swift, `am_stream_sort_ex` in the C ABI and `Stream.sort(..., null_placement=, float_order=)` in
+Python.
 
 Sort keys use the GPU radix sort for numeric, boolean and temporal columns. `utf8` and `binary`
 columns have no order-preserving GPU key in the streaming sort, so they fall back to a host sort of the string values

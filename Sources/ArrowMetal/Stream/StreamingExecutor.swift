@@ -1639,47 +1639,46 @@ func topKRows(_ batch: MetalRecordBatch, column: String, k: Int, largest: Bool) 
     return ranked.length > k ? try ranked.slice(offset: 0, length: k) : ranked
 }
 
-func topKIndices(_ c: AnyMetalArray, k: Int, largest: Bool) throws -> MetalArray<Int32> {
+func topKIndices(_ c: AnyMetalArray, k: Int, largest: Bool, nullPlacement: NullPlacement = .atEnd,
+                 floatOrder: FloatOrder = .ieee) throws -> MetalArray<Int32> {
+    let p = nullPlacement
     switch c {
-    case .int8(let a): return try a.topK(k, largest: largest)
-    case .int16(let a): return try a.topK(k, largest: largest)
-    case .int32(let a): return try a.topK(k, largest: largest)
-    case .int64(let a): return try a.topK(k, largest: largest)
-    case .uint8(let a): return try a.topK(k, largest: largest)
-    case .uint16(let a): return try a.topK(k, largest: largest)
-    case .uint32(let a): return try a.topK(k, largest: largest)
-    case .uint64(let a): return try a.topK(k, largest: largest)
-    case .float32(let a): return try a.topK(k, largest: largest)
-    case .float64(let a): return try a.topK(k, largest: largest)
+    case .int8(let a): return try a.topK(k, largest: largest, nullPlacement: p)
+    case .int16(let a): return try a.topK(k, largest: largest, nullPlacement: p)
+    case .int32(let a): return try a.topK(k, largest: largest, nullPlacement: p)
+    case .int64(let a): return try a.topK(k, largest: largest, nullPlacement: p)
+    case .uint8(let a): return try a.topK(k, largest: largest, nullPlacement: p)
+    case .uint16(let a): return try a.topK(k, largest: largest, nullPlacement: p)
+    case .uint32(let a): return try a.topK(k, largest: largest, nullPlacement: p)
+    case .uint64(let a): return try a.topK(k, largest: largest, nullPlacement: p)
+    case .float32(let a): return try a.topK(k, largest: largest, nullPlacement: p, floatOrder: floatOrder)
+    case .float64(let a): return try a.topK(k, largest: largest, nullPlacement: p, floatOrder: floatOrder)
     case .temporal(let t):
         switch t.storage {
-        case .int32(let a): return try a.topK(k, largest: largest)
-        case .int64(let a): return try a.topK(k, largest: largest)
+        case .int32(let a): return try a.topK(k, largest: largest, nullPlacement: p)
+        case .int64(let a): return try a.topK(k, largest: largest, nullPlacement: p)
         }
     default: throw ArrowMetalError.unsupportedType("top-k over \(c.arrowFormat)")
     }
 }
 
-/// Order of one column, nulls last. Numeric, boolean and temporal columns use the GPU radix sort
-/// (`AnyMetalArray.argsortIndices`); utf8 and binary columns have no order-preserving GPU key yet, so
-/// they fall back to a host sort of the string values (documented in docs/STREAMING.md).
-func argsortAny(_ c: AnyMetalArray, descending: Bool) throws -> MetalArray<Int32> {
+/// Order of one column, nulls last unless `nullPlacement` says first, floats in `floatOrder`. Numeric,
+/// boolean and temporal columns use the GPU radix sort (`AnyMetalArray.argsortIndices`); utf8 and binary
+/// columns fall back to a host sort of the string values (documented in docs/STREAMING.md).
+func argsortAny(_ c: AnyMetalArray, descending: Bool, nullPlacement: NullPlacement = .atEnd,
+                floatOrder: FloatOrder = .ieee) throws -> MetalArray<Int32> {
     switch c {
     case .string, .binary:
         let vals = try c.streamValues()
+        let key = ExternalSortOperator.Key("", descending: descending, nullsFirst: nullPlacement == .atStart)
         var order = Array(0..<vals.count)
         order.sort { i, j in
-            let a = vals[i], b = vals[j]
-            if a == b { return i < j }
-            let lt = StreamValue.less(a, b)
-            // Nulls stay last in both directions.
-            if a.isNull { return false }
-            if b.isNull { return true }
-            return descending ? !lt : lt
+            let o = key.order(vals[i], vals[j])
+            return o == 0 ? i < j : o < 0
         }
         return try MetalArray<Int32>(order.map { Int32($0) }, context: c.anyContext)
     default:
-        return try c.argsortIndices(descending: descending)
+        return try c.argsortIndices(descending: descending, nullPlacement: nullPlacement, floatOrder: floatOrder)
     }
 }
 

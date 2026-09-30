@@ -89,6 +89,11 @@ _lib.am_stream_sort.argtypes = [_S, ctypes.POINTER(ctypes.c_char_p), ctypes.POIN
                                 ctypes.c_int64, ctypes.c_int64, ctypes.c_char_p, ctypes.c_char_p,
                                 ctypes.POINTER(_R)]
 _lib.am_stream_sort.restype = ctypes.c_int
+_lib.am_stream_sort_ex.argtypes = [_S, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_int),
+                                   ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+                                   ctypes.c_int64, ctypes.c_int64, ctypes.c_char_p, ctypes.c_char_p,
+                                   ctypes.POINTER(_R)]
+_lib.am_stream_sort_ex.restype = ctypes.c_int
 _lib.am_stream_sink_ipc.argtypes = [_S, ctypes.c_char_p, ctypes.POINTER(_R)]
 _lib.am_stream_sink_ipc.restype = ctypes.c_int
 _lib.am_stream_join_broadcast.argtypes = [_S, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
@@ -367,29 +372,37 @@ class Stream:
         ordered = [vals.get(f"q{x}") for x in want]
         return ordered[0] if isinstance(q, (int, float)) else ordered
 
-    def sort(self, by, limit=0, scratch=None):
+    def sort(self, by, limit=0, scratch=None, null_placement="at_end", float_order="ieee"):
         """External sort, collected into a pyarrow.Table.
 
         `by` is a column name, a (name, descending) pair, or a list of either. Sorted runs go to
         `scratch` (a temporary directory by default) and are merged k-way. Pass `limit` unless the
-        whole sorted result really fits in memory; without it every row is collected."""
-        cols, desc = _sort_keys(by)
-        names = _c_strings(cols)
-        flags = (ctypes.c_int * max(len(cols), 1))(*[1 if d else 0 for d in desc])
-        r = self._terminal(lambda out: _lib.am_stream_sort(
-            self._h, names, flags, len(cols), limit,
-            None if scratch is None else str(scratch).encode(), None, out))
-        return r.table()
+        whole sorted result really fits in memory; without it every row is collected.
+        `null_placement` ("at_end" / "at_start") and `float_order` ("ieee" / "total" / "nan_largest",
+        see `MetalArray.argsort`) are one value for every key or a list with one per key."""
+        return self._sort(by, limit, scratch, None, null_placement, float_order).table()
 
-    def sort_to_ipc(self, by, path, scratch=None):
+    def sort_to_ipc(self, by, path, scratch=None, null_placement="at_end", float_order="ieee"):
         """External sort straight into an Arrow IPC stream file; returns the run's statistics."""
+        self._sort(by, 0, scratch, path, null_placement, float_order)
+        return self.stats
+
+    def _sort(self, by, limit, scratch, path, null_placement, float_order):
+        from . import NULL_PLACEMENT, FLOAT_ORDERS, _index_of, _per_key
         cols, desc = _sort_keys(by)
         names = _c_strings(cols)
         flags = (ctypes.c_int * max(len(cols), 1))(*[1 if d else 0 for d in desc])
-        self._terminal(lambda out: _lib.am_stream_sort(
-            self._h, names, flags, len(cols), 0,
-            None if scratch is None else str(scratch).encode(), str(path).encode(), out))
-        return self.stats
+        scratch_b = None if scratch is None else str(scratch).encode()
+        path_b = None if path is None else str(path).encode()
+        if null_placement == "at_end" and float_order == "ieee":
+            return self._terminal(lambda out: _lib.am_stream_sort(
+                self._h, names, flags, len(cols), limit, scratch_b, path_b, out))
+        places = _per_key(null_placement, len(cols), "null_placement")
+        orders = _per_key(float_order, len(cols), "float_order")
+        np_ = (ctypes.c_int * len(cols))(*[_index_of(NULL_PLACEMENT, p, "null_placement") for p in places])
+        fo = (ctypes.c_int * len(cols))(*[_index_of(FLOAT_ORDERS, f, "float_order") for f in orders])
+        return self._terminal(lambda out: _lib.am_stream_sort_ex(
+            self._h, names, flags, np_, fo, len(cols), limit, scratch_b, path_b, out))
 
     def sink_ipc(self, path):
         """Stream the filtered and projected rows into an Arrow IPC stream file. Returns the run's

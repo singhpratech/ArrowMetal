@@ -2,6 +2,68 @@
 
 ## Unreleased
 
+- Sort key options: a third float order, `nan_largest` (Polars' and NumPy's): every NaN one value above
+  +inf in both directions, last ascending and first among the values descending, -0.0 tied with
+  +0.0. Like `total` it is one key map in front of the same radix passes (`ieee`'s map with the
+  descending key the plain complement), and a single-key sort + limit stays a GPU top-k with it,
+  nulls first or last. Swift `FloatOrder.nanLargest`, C ABI `float_order` 2 (`am_argsort_ex2`,
+  `am_sort_ex2`, `am_top_k_ex`, `am_lexsort_ex2`), plan JSON `"float_order": "nan_largest"`, Python
+  `float_order="nan_largest"`, Rust `FloatOrder::NanLargest`.
+  - Window `order_by` keys take the sort key options: each key's null placement and float order, in
+    the plan JSON (`[column, descending, {"nulls", "float_order"}]` or the key object, with a window
+    spec's own `nulls` / `float_order` as the defaults) and in Python (`with_rank(...,
+    null_placement=, float_order=)` and the other window methods). Tie groups follow the order: under
+    `total` a Float key ties on identical bits only. Keys that name no option rank exactly as before.
+  - The streaming external sort takes them too: `ExternalSortOperator.Key(_:descending:nullsFirst:
+    floatOrder:)`, `am_stream_sort_ex` (per key `null_placement` and `float_order`), and
+    `Stream.sort(..., null_placement=, float_order=)` / `sort_to_ipc`. The per-batch GPU sort and the
+    CPU k-way merge order by the same rules, so a NaN now merges where the batch sort put it (the merge
+    used to compare NaN as neither less nor greater). With a limit, the top-n threshold keeps the rows
+    that can still win under the key's options (a batch holding nulls when they sort first, NaN rows
+    where the float order puts NaN ahead), and a NaN threshold no longer rejects the later rows.
+  - Tests: `SortNanLargestTests` (argsort, sorted values, both top-k selections and lexsort under
+    `nan_largest` at sizes around the radix block and past the 2^18 analysis threshold, the plan JSON
+    and its top-k fusion, window row numbers and ranks for all three float orders and both null
+    placements, the external sort with and without a limit, against a CPU reference);
+    `test_sort_nan_largest.py` (the same against Polars' own `sort(maintain_order=True)`, pyarrow and
+    the totalOrder definition).
+- Polars `MetalEngine`: every Polars sort key is one ArrowMetal sort key, with Polars' order as the
+  key's options — `"nulls": "first"` where Polars puts the nulls first (its default, in either
+  direction), `"float_order": "nan_largest"` on a Float32 / Float64 key. The validity key a
+  nulls-first nullable key used to add and the NaN key a descending float key used to add are gone,
+  so a sort keeps the key count Polars gave it, a single-key `sort().head()`, `top_k` or `bottom_k`
+  runs as the GPU top-k, and a nullable temporal key sorted nulls first is taken over a join, a
+  group-by or a Parquet file as well (it used to need a validity column added to its in-memory
+  scan). The `sort_helper_keys` shape class is gone with them (those sorts are `sort`).
+  `test_polars_sort_order.py` pins Polars' ordering rules on the installed Polars (they hold for
+  1.44.1 and 2.0.0rc2) and checks each dtype, direction, null placement and multi-key sort for one
+  plan key per Polars key.
+  - Measured on an M4 Max, the build before this change and this one alternating, three rounds, best of
+    5 after a 100 ms warm-up each (`Benchmarks/results/polars_engine_sort_options_2026-09-30.csv`),
+    `shapes="all"` cold, best / median: top 100 by a nullable Float64 key descending (x4), 50M rows
+    129.53 / 129.89 → 11.07 / 11.09 ms (warm 122.91 → 4.85 ms), 2M rows 12.31 → 2.57 ms; top 100 by a
+    Float64 key descending (n), 50M 79.93 → 11.50 ms, 2M 8.56 → 2.17 ms; sort by a nullable Float64
+    key descending (x2), 50M 133.85 → 93.02 ms (the default: 134.03 → 93.54 ms), 2M under the default
+    15.71 → 8.79 ms; filter, then sort by (int32 asc, nullable Float64 desc) with a String column (p),
+    50M 349.44 → 321.81 ms (the default 350.54 → 317.39 ms), 2M 25.82 → 16.01 ms. The sorts with no
+    option to change, the top-k by an int64 key and the group-by controls are unchanged: the rows
+    more than 5% slower in best and median over the three rounds were timed again alone, eight
+    alternating rounds of 100 runs, at 0.95 to 1.25 (before ÷ after) in best and 0.96 to 1.22 in
+    median.
+  - The sort and top-k cases were swept again for the default's crossovers
+    (`Benchmarks/results/polars_engine_crossover_2026-09-29-sort.csv`): `sort` over in-memory frames
+    is taken from 1,000,000 rows (the sort kernels' crossover; it was 1,026,501, and 1,000,000 for the
+    sorts that had helper keys), and with a String column from the 5,000,000-row floor (it was
+    6,301,531). `top_k` is still not taken: (n) is fitted at 6,600,767 rows (1.81x the faster Polars
+    engine at 50M), but (x4), whose top 100 are null rows, is at 0.75x to 1.05x.
+- Engine conformance grid (Polars): seven more sort shapes — stable sorts with nulls first and last,
+  three keys with per-key null placement, ties falling through to the next key, `top_k`, `bottom_k`
+  and a two-key top-k — over every dtype. Recorded run
+  (`Benchmarks/results/engine_conformance_2026-09-30.csv`): 15,376 cases, 15,097 pass, 32 documented
+  (float summation order, as before), 0 unclassified, 247 where Polars' plan has nothing to run.
+  `docs/ENGINE_CAPABILITIES.md`: the Parquet sort by a nullable temporal column runs on Metal for
+  every temporal type.
+
 - `datafusion-arrowmetal` (`datafusion/`, docs/DATAFUSION.md): a physical optimizer rule for Apache
   DataFusion 55.1. Registered on a `SessionContext` (`session_context`, `with_arrowmetal` or
   `physical_optimizer_rules`), it replaces a full `ORDER BY` whose input has an exact row count of at

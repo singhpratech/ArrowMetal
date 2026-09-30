@@ -20,8 +20,11 @@ import Foundation
 // is handed to them and the results are concatenated. That is one dispatch per partition, which is the
 // right trade below a few thousand partitions and the documented limit above it.
 //
-// Nulls follow SQL `ORDER BY x NULLS LAST`, which is what `lexsort` does in both directions: a null key
-// sorts after every value and all nulls of one key form a single tie group.
+// Each order key carries the options of a sort key (`SortKey`): its null placement (SQL `NULLS LAST` by
+// default, `NULLS FIRST` on request, in either direction) and, for a float key, its float order. They go
+// into that key's own radix pass. All nulls of one key form a single tie group; two float values tie when
+// their order ties them — -0.0 with +0.0 and every NaN with every NaN under `ieee` and `nanLargest`, only
+// identical bits under `total`.
 enum WindowOps {
 
     /// Above this many partitions the per-partition path (cum_sum and the rolling functions) refuses to
@@ -59,11 +62,20 @@ enum WindowOps {
 
         // 1. Sort by (partition, order).
         var sortCols: [AnyMetalArray] = [], sortDesc: [Bool] = []
-        for c in spec.partitionBy { sortCols.append(try columnNamed(c, input)); sortDesc.append(false) }
-        for k in spec.orderBy { sortCols.append(try columnNamed(k.column, input)); sortDesc.append(k.descending) }
+        var places: [NullPlacement] = [], orders: [FloatOrder] = []
+        for c in spec.partitionBy {
+            sortCols.append(try columnNamed(c, input)); sortDesc.append(false)
+            places.append(.atEnd); orders.append(.ieee)
+        }
+        for k in spec.orderBy {
+            sortCols.append(try columnNamed(k.column, input)); sortDesc.append(k.descending)
+            places.append(k.nullsFirst ? .atStart : .atEnd); orders.append(k.floatOrder)
+        }
         let positions = try GroupByKeys.rowIndices(n, ctx)
         let perm: MetalArray<Int32>
-        if sortCols.isEmpty { perm = positions } else { perm = try lexsortIndices(sortCols, descending: sortDesc) }
+        if sortCols.isEmpty { perm = positions } else {
+            perm = try lexsortIndices(sortCols, descending: sortDesc, nullPlacements: places, floatOrders: orders)
+        }
         let inverse = sortCols.isEmpty ? positions : try perm.argsort()
 
         // 2. Partition ids in sorted order, and each row's partition start.
@@ -189,7 +201,9 @@ enum WindowOps {
                                        _ ctx: MetalContext) throws -> TieGroups {
         var cols: [AnyMetalArray] = []
         if let p = sortedPartitionIds { cols.append(.int32(p)) }
-        for k in spec.orderBy { cols.append(try columnNamed(k.column, input).take(perm)) }
+        for k in spec.orderBy {
+            cols.append(tieKey(try columnNamed(k.column, input).take(perm), k.floatOrder))
+        }
         guard !cols.isEmpty else {
             // No order at all: every row of a partition ties, so the tie start is the partition start.
             return TieGroups(starts: try constant(0, positions.length, ctx))
@@ -199,6 +213,23 @@ enum WindowOps {
         let gb = try GroupBy(keys: gk.ids, keyCount: Swift.max(gk.groupCount, 1))
         let mins = try gb.min64(positions)
         return TieGroups(starts: try mins.take(gk.ids))
+    }
+
+    /// The column whose equal values are one tie group under `order`. `GroupByKeys` groups a float column
+    /// by value, with -0.0 and +0.0 one key and every NaN one key, which is exactly how `ieee` and
+    /// `nanLargest` tie. Under `total` only identical bits tie, so the float column is grouped by its bit
+    /// pattern instead: the same buffers read as unsigned integers.
+    private static func tieKey(_ c: AnyMetalArray, _ order: FloatOrder) -> AnyMetalArray {
+        guard order == .total else { return c }
+        switch c {
+        case .float32(let a):
+            return .uint32(MetalArray<UInt32>(length: a.length, nullCount: a.nullCount, validity: a.validity,
+                                              values: a.values, context: a.context))
+        case .float64(let a):
+            return .uint64(MetalArray<UInt64>(length: a.length, nullCount: a.nullCount, validity: a.validity,
+                                              values: a.values, context: a.context))
+        default: return c
+        }
     }
 
     /// `DENSE_RANK`: the number of distinct tie groups seen so far inside the partition.

@@ -381,15 +381,15 @@ def _as_sort_keys(by, descending, null_placement="at_end", float_order="ieee"):
         return vs
 
     places = per_key(null_placement, "null_placement", ["at_end", "at_start"])
-    orders = per_key(float_order, "float_order", ["ieee", "total"])
+    orders = per_key(float_order, "float_order", ["ieee", "total", "nan_largest"])
     keys = []
     for b, d, p, f in zip(by, descending, places, orders):
         # A key with both options at their defaults stays a plain pair: the plan is the one it always was.
         opts = {}
         if p == "at_start":
             opts["nulls"] = "first"
-        if f == "total":
-            opts["float_order"] = "total"
+        if f != "ieee":
+            opts["float_order"] = f
         keys.append([b, bool(d), opts] if opts else [b, bool(d)])
     return keys
 
@@ -474,7 +474,7 @@ class LazyFrame:
 
     def sort(self, by, descending=False, null_placement="at_end", float_order="ieee"):
         """Sorts by one or more columns. `descending`, `null_placement` ("at_end" / "at_start") and
-        `float_order` ("ieee" / "total", see `MetalArray.argsort`) are each one value for every key or a
+        `float_order` ("ieee" / "total" / "nan_largest", see `MetalArray.argsort`) are each one value for every key or a
         list with one per key. A single key with a `limit` after it runs as a GPU top-k."""
         return self._with({"op": "sort", "input": self._plan,
                            "by": _as_sort_keys(by, descending, null_placement, float_order)})
@@ -548,7 +548,11 @@ class LazyFrame:
             specs = [specs]
         return self._with({"op": "window", "input": self._plan, "specs": list(specs)})
 
-    def _win(self, fn, name, column=None, n=None, partition_by=None, order_by=None, descending=False):
+    def _win(self, fn, name, column=None, n=None, partition_by=None, order_by=None, descending=False,
+             null_placement="at_end", float_order="ieee"):
+        """One window spec. `order_by` keys take `descending`, `null_placement` ("at_end" / "at_start")
+        and `float_order` ("ieee" / "total" / "nan_largest"), each one value for every key or a list,
+        as `sort` does."""
         spec = {"name": name, "fn": fn}
         if column is not None:
             spec["column"] = column
@@ -557,33 +561,45 @@ class LazyFrame:
         if partition_by is not None:
             spec["partition_by"] = [partition_by] if isinstance(partition_by, str) else list(partition_by)
         if order_by is not None:
-            spec["order_by"] = _as_sort_keys(order_by, descending)
+            spec["order_by"] = _as_sort_keys(order_by, descending, null_placement, float_order)
         return self.window(spec)
 
-    def with_row_number(self, name="row_number", partition_by=None, order_by=None, descending=False):
-        return self._win("row_number", name, partition_by=partition_by, order_by=order_by, descending=descending)
+    def with_row_number(self, name="row_number", partition_by=None, order_by=None, descending=False,
+                        null_placement="at_end", float_order="ieee"):
+        return self._win("row_number", name, partition_by=partition_by, order_by=order_by, descending=descending,
+                         null_placement=null_placement, float_order=float_order)
 
-    def with_rank(self, name="rank", partition_by=None, order_by=None, descending=False, dense=False):
+    def with_rank(self, name="rank", partition_by=None, order_by=None, descending=False, dense=False,
+                  null_placement="at_end", float_order="ieee"):
         return self._win("dense_rank" if dense else "rank", name,
-                         partition_by=partition_by, order_by=order_by, descending=descending)
+                         partition_by=partition_by, order_by=order_by, descending=descending,
+                         null_placement=null_placement, float_order=float_order)
 
-    def with_lag(self, column, n=1, name=None, partition_by=None, order_by=None, descending=False):
+    def with_lag(self, column, n=1, name=None, partition_by=None, order_by=None, descending=False,
+                 null_placement="at_end", float_order="ieee"):
         return self._win("lag", name or f"{column}_lag", column=column, n=n,
-                         partition_by=partition_by, order_by=order_by, descending=descending)
+                         partition_by=partition_by, order_by=order_by, descending=descending,
+                         null_placement=null_placement, float_order=float_order)
 
-    def with_lead(self, column, n=1, name=None, partition_by=None, order_by=None, descending=False):
+    def with_lead(self, column, n=1, name=None, partition_by=None, order_by=None, descending=False,
+                  null_placement="at_end", float_order="ieee"):
         return self._win("lead", name or f"{column}_lead", column=column, n=n,
-                         partition_by=partition_by, order_by=order_by, descending=descending)
+                         partition_by=partition_by, order_by=order_by, descending=descending,
+                         null_placement=null_placement, float_order=float_order)
 
-    def with_cum_sum(self, column, name=None, partition_by=None, order_by=None, descending=False):
+    def with_cum_sum(self, column, name=None, partition_by=None, order_by=None, descending=False,
+                     null_placement="at_end", float_order="ieee"):
         return self._win("cum_sum", name or f"{column}_cum_sum", column=column,
-                         partition_by=partition_by, order_by=order_by, descending=descending)
+                         partition_by=partition_by, order_by=order_by, descending=descending,
+                         null_placement=null_placement, float_order=float_order)
 
-    def with_rolling(self, kind, column, window, name=None, partition_by=None, order_by=None, descending=False):
+    def with_rolling(self, kind, column, window, name=None, partition_by=None, order_by=None, descending=False,
+                     null_placement="at_end", float_order="ieee"):
         if kind not in ("sum", "mean", "min", "max"):
             raise _ArrowMetalError(f"rolling kind must be sum/mean/min/max, got {kind!r}")
         return self._win(f"rolling_{kind}", name or f"{column}_rolling_{kind}", column=column, n=window,
-                         partition_by=partition_by, order_by=order_by, descending=descending)
+                         partition_by=partition_by, order_by=order_by, descending=descending,
+                         null_placement=null_placement, float_order=float_order)
 
     def with_partition_agg(self, op, column, name=None, partition_by=None):
         return self._win(op, name or f"{column}_{op}", column=column, partition_by=partition_by)

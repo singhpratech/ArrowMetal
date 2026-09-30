@@ -1,6 +1,6 @@
 """`lf.collect(engine=am.MetalEngine())` against Polars' own engines, on the same LazyFrames.
 
-The eight shapes of `Benchmarks/engine_bench.py` and 37 more (group-by per aggregate family over one
+The eight shapes of `Benchmarks/engine_bench.py` and 38 more (group-by per aggregate family over one
 and two keys at few and many groups, whole-frame aggregates, each join kind, sorts, top-k, `unique`,
 and the same with a String column) and a group-by grid of 48 (`group_grid`: each aggregate family
 over one and two int32 keys at 200 to 1,000,000 key values and at half the rows), written as Polars
@@ -57,20 +57,45 @@ def cpu_seconds():
     return r.ru_utime + r.ru_stime
 
 
+#: `--idle`: warm up with at least this much of the same call, then time one run after an idle gap
+#: of IDLE_GAP seconds on its own (after an idle gap the GPU runs small jobs slower for the first
+#: 20-25 ms of work), then the `--iters` runs.
+WARMUP_S = 0.1
+IDLE_GAP = 0.5
+IDLE = False
+
+
 def best_of(fn, iters, setup=None):
+    """(best wall ms, its CPU ms, median wall ms, first run after an idle gap in ms or None)."""
     if setup:
         setup()
     fn()
-    best, best_cpu = float("inf"), float("inf")
+    idle = None
+    if IDLE:
+        spent = 0.0
+        while spent < WARMUP_S:
+            if setup:
+                setup()
+            t0 = time.perf_counter()
+            fn()
+            spent += time.perf_counter() - t0
+        if setup:
+            setup()
+        time.sleep(IDLE_GAP)
+        t0 = time.perf_counter()
+        fn()
+        idle = (time.perf_counter() - t0) * 1e3
+    best, best_cpu, walls = float("inf"), float("inf"), []
     for _ in range(iters):
         if setup:
             setup()
         c0, t0 = cpu_seconds(), time.perf_counter()
         fn()
         wall, cpu = time.perf_counter() - t0, cpu_seconds() - c0
+        walls.append(wall)
         if wall < best:
             best, best_cpu = wall, cpu
-    return best * 1e3, best_cpu * 1e3
+    return best * 1e3, best_cpu * 1e3, float(np.median(walls)) * 1e3, idle
 
 
 def shapes(rows, rng):
@@ -151,8 +176,9 @@ def more_shapes(rows, rng, fact, extra):
     """The cases the per-shape crossovers are fitted from as well (Benchmarks/polars_engine_crossover.py):
     each aggregate family alone, over a whole frame and per group with one key and with two, at a
     few hundred to ten thousand groups and at a hundred thousand or more; each join kind with the
-    probe side growing with `rows`; `unique` over many groups; a sort that needs helper keys and a
-    top-k over numeric columns only; and the same operators with a String column in the input."""
+    probe side growing with `rows`; `unique` over many groups; a sort and a top-k by a nullable
+    Float64 key with Polars' default nulls first and a top-k over numeric columns only; and the same
+    operators with a String column in the input."""
     f = fact.lazy()
     cond = (pl.col("region") < 20) & (pl.col("qty") > 10)
     # Joins: the probe side has `rows` rows, the build side 1,000,000 keys, every other value of the
@@ -209,6 +235,8 @@ def more_shapes(rows, rng, fact, extra):
         ("(x2) sort by a nullable Float64 key, descending", nullable_x
             .sort("x", descending=True), ["x"]),
         ("(x3) top 100 by an int64 key", extra.select("q", "x").sort("q").head(100), ["q"]),
+        ("(x4) top 100 by a nullable Float64 key, descending", nullable_x
+            .sort("x", descending=True).head(100), ("keys_only", ["x"])),
         # With a String column in the input.
         ("(y1) group-by a String key (1000 values), sum", extra.group_by("name")
             .agg(pl.col("q").sum().alias("s")), False),
@@ -302,6 +330,13 @@ def same(a, b, order):
     that tie on every key come back in an unspecified order from both engines."""
     from polars.testing import assert_frame_equal
     try:
+        if isinstance(order, tuple):
+            # ("keys_only", cols): a top-k whose cut falls inside a run of tied keys (the null rows
+            # a nulls-first top-k returns) keeps an unspecified choice of the tied rows in both
+            # engines, so only the keys are compared.
+            assert_frame_equal(a.select(order[1]), b.select(order[1]), check_exact=False,
+                               rel_tol=1e-4, abs_tol=1e-6)
+            return True
         if isinstance(order, list):
             assert_frame_equal(a.select(order), b.select(order), check_exact=False,
                                rel_tol=1e-4, abs_tol=1e-6)
@@ -382,7 +417,7 @@ def run_case(label, lf, order, rows, iters, crossover, cold, results_rows):
         results[name] = best_of(fn, iters, setup)
     cold()
     fastest = min(results["polars in-memory"][0], results["polars streaming"][0])
-    for name, (wall, cpu) in results.items():
+    for name, (wall, cpu, median, idle) in results.items():
         is_metal = name.startswith("MetalEngine")
         is_default = name.startswith("MetalEngine default")
         row = {"rows": rows, "case": label, "engine": name, "wall_ms": f"{wall:.3f}",
@@ -399,6 +434,9 @@ def run_case(label, lf, order, rows, iters, crossover, cold, results_rows):
                "groups": groups if is_metal else "",
                "groups_estimate": estimate if is_default else "",
                "probe_us": probe_us if is_default else ""}
+        if IDLE:
+            row["median_ms"] = f"{median:.3f}"
+            row["after_idle_ms"] = f"{idle:.3f}"
         results_rows.append(row)
         note = ""
         if is_metal:
@@ -422,6 +460,9 @@ def main():
                     help="the crossover sweep: Polars' two engines and MetalEngine(shapes='all') "
                          "cold only, with the shape each subtree has (Benchmarks/"
                          "polars_engine_crossover.py fits the per-shape crossovers from it)")
+    ap.add_argument("--idle", action="store_true",
+                    help="warm each call up for 100 ms, time one run after a 500 ms idle gap on its own "
+                         "(after_idle_ms), and record the median of the --iters runs (median_ms)")
     ap.add_argument("--scan", action="store_true", help="add the Parquet scan cases")
     ap.add_argument("--scan-only", action="store_true", help="only the Parquet scan cases")
     ap.add_argument("--scan-rows", default="50000000",
@@ -429,6 +470,8 @@ def main():
     ap.add_argument("--scan-codecs", default="snappy,none")
     ap.add_argument("--scan-dir", default=os.path.join(os.sep, "tmp", "arrowmetal-parquet-bench"))
     args = ap.parse_args()
+    global IDLE
+    IDLE = args.idle
     sizes = [] if args.scan_only else [int(s) for s in args.sizes.split(",")]
     wanted = {c.strip() for c in args.cases.split(",") if c.strip()}
     mode = ", crossover sweep" if args.crossover else ""

@@ -17,6 +17,10 @@ enum TopK {
             if T.self == Float.self { return ("f32t", "float", "uint") }
             if T.self == Double.self { return ("f64t", "ulong", "ulong") }
         }
+        if floatOrder == .nanLargest {
+            if T.self == Float.self { return ("f32n", "float", "uint") }
+            if T.self == Double.self { return ("f64n", "ulong", "ulong") }
+        }
         switch T.self {
         case is Int32.Type: return ("i32", "int", "uint")
         case is UInt32.Type: return ("u32", "uint", "uint")

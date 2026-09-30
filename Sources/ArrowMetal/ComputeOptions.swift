@@ -42,15 +42,22 @@ public enum NullPlacement: String, Sendable, CaseIterable {
 ///   is the exact mirror (so +NaN comes first). Every bit pattern is its own value, so only identical bits
 ///   tie. It is a pure bit transform of the value, so the radix sort runs it with the same passes as
 ///   `ieee`.
+/// - `nanLargest` (`"nan_largest"`): every NaN is one value greater than every number, +inf included, in
+///   both directions — after the values ascending, before them descending — and -0.0 and +0.0 tie, as in
+///   `ieee`. This is the order Polars and NumPy sort floats in. It is `ieee`'s key map with the descending
+///   key the plain complement, so a NaN turns around with the values instead of staying next to the nulls;
+///   the null placement is independent of it, and it costs no pass either.
 public enum FloatOrder: String, Sendable, CaseIterable {
     case ieee
     case total
+    case nanLargest = "nan_largest"
 
-    /// Parses `"ieee"` / `"total"` (also `"total_order"`).
+    /// Parses `"ieee"` / `"total"` (also `"total_order"`) / `"nan_largest"`.
     public init?(name: String) {
         switch name {
         case "ieee": self = .ieee
         case "total", "total_order", "totalOrder": self = .total
+        case "nan_largest", "nanLargest": self = .nanLargest
         default: return nil
         }
     }

@@ -219,7 +219,7 @@ pub mod ffi {
         /// A sorted copy, same type.
         pub fn am_sort(a: *mut am_array, descending: c_int, out: *mut *mut am_array) -> c_int;
         // null_placement: 0 at_end, 1 at_start. float_order: 0 ieee (the calls above), 1 IEEE 754
-        // totalOrder (arrow-rs's order).
+        // totalOrder (arrow-rs's order), 2 nan_largest (Polars' order).
         pub fn am_argsort_ex2(
             a: *mut am_array,
             descending: c_int,

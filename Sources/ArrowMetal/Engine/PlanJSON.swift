@@ -32,7 +32,7 @@ import Foundation
 // | `join` | `left`, `right`, `left_on`, `right_on`, `how`, `suffix`? |
 // | `join_asof` | `left`, `right`, `left_on`, `right_on`, `by`?, `by_right`?, `strategy`?, `tolerance`?, `suffix`? |
 // | `concat` | `inputs` |
-// | `window` | `input`, `specs`: `[{name, fn, column?, n?, partition_by?, order_by?}, ...]` |
+// | `window` | `input`, `specs`: `[{name, fn, column?, n?, partition_by?, order_by?, nulls?, float_order?}, ...]`; `order_by` keys as `sort`'s `by` |
 // | `explode` | `input`, `columns` |
 
 public enum PlanJSON {
@@ -90,14 +90,17 @@ public enum PlanJSON {
         func floatOrder(_ v: Any?, _ fallback: FloatOrder) throws -> FloatOrder {
             guard let v, !(v is NSNull) else { return fallback }
             guard let name = v as? String, let f = FloatOrder(name: name) else {
-                throw ArrowMetalError.invalidArrowArray("plan: sort \"float_order\" must be \"ieee\" or \"total\"")
+                throw ArrowMetalError.invalidArrowArray("plan: sort \"float_order\" must be \"ieee\", \"total\" or \"nan_largest\"")
             }
             return f
         }
-        func sortKeys(_ key: String) throws -> [SortKey] {
-            guard let xs = o[key] as? [Any] else { return [] }
-            let defaultNullsFirst = try nullsFirst(o["nulls"], false)
-            let defaultOrder = try floatOrder(o["float_order"], .ieee)
+        // The keys of a sort's `by`, or of a window spec's `order_by`: the list under `key` in `obj`, with
+        // `obj`'s own `nulls` / `float_order` as the defaults each key may override.
+        func sortKeys(_ key: String, in obj: [String: Any]? = nil) throws -> [SortKey] {
+            let obj = obj ?? o
+            guard let xs = obj[key] as? [Any] else { return [] }
+            let defaultNullsFirst = try nullsFirst(obj["nulls"], false)
+            let defaultOrder = try floatOrder(obj["float_order"], .ieee)
             return try xs.compactMap { x in
                 // `{"column": c, "descending": d?, "nulls": ..?, "float_order": ..?}`
                 if let d = x as? [String: Any] {
@@ -200,14 +203,9 @@ public enum PlanJSON {
                     throw ArrowMetalError.invalidArrowArray("plan: unknown window function \"\(fn)\"")
                 }
                 let partitionBy = (d["partition_by"] as? [Any])?.compactMap { $0 as? String } ?? []
-                var order: [SortKey] = []
-                if let ob = d["order_by"] as? [Any] {
-                    order = ob.compactMap { x in
-                        guard let pair = x as? [Any], let c = pair.first as? String else { return nil }
-                        let desc = pair.count > 1 ? ((pair[1] as? Bool) ?? ((pair[1] as? NSNumber)?.boolValue ?? false)) : false
-                        return SortKey(c, descending: desc)
-                    }
-                }
+                // The same key forms and options as a sort's `by`; the spec's own `nulls` / `float_order`
+                // are the defaults.
+                let order = try sortKeys("order_by", in: d)
                 specs.append(WindowSpec(name: name, function: f, partitionBy: partitionBy, orderBy: order))
             }
             return .window(try input(), specs)

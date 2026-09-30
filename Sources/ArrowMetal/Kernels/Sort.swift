@@ -27,10 +27,13 @@ extension MetalArray {
         var flags: UInt32
     }
 
-    /// The order-preserving key of a NaN, which every NaN shares (`SortSource.key_from_f32/f64`).
-    static func nanKey(wide: Bool, descending: Bool) -> UInt64 {
-        if descending { return wide ? UInt64.max : UInt64(UInt32.max) }
-        return wide ? 0xFFF0_0000_0000_0001 : 0xFF80_0001
+    /// The order-preserving key of a NaN, which every NaN shares (`SortSource.key_from_f32/f64`, and
+    /// `key_from_f32/f64_nanlargest`, whose descending key is the plain complement of the ascending one).
+    static func nanKey(wide: Bool, descending: Bool, floatOrder: FloatOrder = .ieee) -> UInt64 {
+        let asc: UInt64 = wide ? 0xFFF0_0000_0000_0001 : 0xFF80_0001
+        guard descending else { return asc }
+        if floatOrder == .nanLargest { return wide ? ~asc : UInt64(UInt32(truncatingIfNeeded: ~asc)) }
+        return wide ? UInt64.max : UInt64(UInt32.max)
     }
 
     /// The order-preserving key of ±0.0, which -0.0 and +0.0 share.
@@ -45,8 +48,9 @@ extension MetalArray {
     /// value (Arrow's default) or before every one of them; the two are independent, exactly as in Arrow,
     /// so nulls stay at the chosen end in both directions. `floatOrder` picks how a float column orders:
     /// `.ieee` (the default) ties -0.0 with +0.0 and keeps every NaN next to the nulls in both directions,
-    /// as Arrow C++ does; `.total` is IEEE 754 totalOrder, as arrow-rs does (see `FloatOrder`). Both are
-    /// one key map in front of the same passes. Runs an LSD radix sort on the GPU over 8-bit digits: four
+    /// as Arrow C++ does; `.total` is IEEE 754 totalOrder, as arrow-rs does; `.nanLargest` is `.ieee` with
+    /// NaN the largest value in both directions, as Polars does (see `FloatOrder`). Each is one key map in
+    /// front of the same passes. Runs an LSD radix sort on the GPU over 8-bit digits: four
     /// passes for a 32-bit key, eight for a 64-bit one, minus any pass whose digit is the same in every
     /// row, which is an identity permutation and is dropped (see below).
     public func argsort(descending: Bool = false,
@@ -77,6 +81,8 @@ extension MetalArray {
     ///
     /// With `floatOrder: .total` the key map is a bijection on every bit pattern, so a float column never
     /// needs the fix-up: the sorted keys invert to the sorted values, NaN payloads and zero signs included.
+    /// `.nanLargest` shares `.ieee`'s map and its fix-up; its NaN run is simply at the other end of a
+    /// descending sort.
     public func sorted(descending: Bool = false,
                        nullPlacement: NullPlacement = .atEnd,
                        floatOrder: FloatOrder = .ieee) throws -> MetalArray<T> {
@@ -101,13 +107,13 @@ extension MetalArray {
     /// `nullPlacement` and `floatOrder` mean what they mean to `argsort`, and the answer is always the first
     /// k indices `argsort` would give with the same options. `.atStart` with nulls present takes the first
     /// null rows in input order, then the selection over the rest; on a float column in `.ieee` order it
-    /// takes the full argsort, because the NaN rows move to the front with the nulls there.
+    /// takes the full argsort, because the NaN rows move to the front with the nulls there. `.nanLargest`
+    /// keeps NaN among the values, so it takes the selection like every other order.
     public func topK(_ k: Int, largest: Bool = true, nullPlacement: NullPlacement = .atEnd,
                      floatOrder: FloatOrder = .ieee) throws -> MetalArray<Int32> {
         guard k > 0 else { return try MetalArray<Int32>([Int32](), context: context) }
-        let total = floatOrder == .total && T.isFloatingPoint
         if nullPlacement == .atStart {
-            if T.isFloatingPoint && !total {
+            if T.isFloatingPoint && floatOrder == .ieee {
                 let idx = try argsort(descending: largest, nullPlacement: .atStart)
                 return try idx.slice(offset: 0, length: Swift.min(k, idx.length))
             }
@@ -194,6 +200,10 @@ extension MetalArray {
         // `.total` swaps the float key map for the raw totalOrder transform; everything after the map is
         // the same, except that a NaN is then an ordinary value and has no block of its own.
         let totalOrder = floatOrder == .total && T.isFloatingPoint
+        // `.nanLargest` is the `.ieee` map with the plain complement for descending: NaN is the largest
+        // value of the value block, so it too has no block of its own.
+        let nanLargest = floatOrder == .nanLargest && T.isFloatingPoint
+        let floatSuffix = totalOrder ? "_total" : (nanLargest ? "_nanlargest" : "")
         // Narrow types widen to 32-bit keys; the mapping kernel expects the source width, so cast first.
         let mapFn: String
         let source: MetalArrowBuffer
@@ -201,10 +211,10 @@ extension MetalArray {
         switch T.self {
         case is Int32.Type: mapFn = "key_from_i32"; source = values
         case is UInt32.Type: mapFn = "key_from_u32"; source = values
-        case is Float.Type: mapFn = totalOrder ? "key_from_f32_total" : "key_from_f32"; source = values
+        case is Float.Type: mapFn = "key_from_f32" + floatSuffix; source = values
         case is Int64.Type: mapFn = "key_from_i64"; source = values
         case is UInt64.Type: mapFn = "key_from_u64"; source = values
-        case is Double.Type: mapFn = totalOrder ? "key_from_f64_total" : "key_from_f64"; source = values
+        case is Double.Type: mapFn = "key_from_f64" + floatSuffix; source = values
         default:
             let widened = try cast(to: Int32.self); tmpKeep = widened; mapFn = "key_from_i32"; source = widened.values
         }
@@ -212,7 +222,7 @@ extension MetalArray {
         // A NaN is placed with the nulls, not with the values, which is Arrow's rule. `.atEnd` needs no
         // separate block for it — the keys already leave every NaN at the tail of the value block, in
         // both directions — so only `.atStart` on a float column asks the partition for a NaN bucket.
-        let separateNaN = T.isFloatingPoint && !totalOrder && nullPlacement == .atStart
+        let separateNaN = T.isFloatingPoint && floatOrder == .ieee && nullPlacement == .atStart
         // Read once, here: on a slice at an offset that is not a multiple of 32 these normalise the
         // buffers, which runs a kernel, and that must not happen with an encoder already open.
         let bitmap = validity
@@ -543,7 +553,7 @@ extension MetalArray {
             }
             withExtendedLifetime(keys) {
                 if run.flags & 1 != 0 { addRun(Self.zeroKey(wide: wide, descending: descending)) }
-                if run.flags & 2 != 0 { addRun(Self.nanKey(wide: wide, descending: descending)) }
+                if run.flags & 2 != 0 { addRun(Self.nanKey(wide: wide, descending: descending, floatOrder: floatOrder)) }
             }
         }
         // More than half the output through the fix-up is more work than gathering all of it, which is

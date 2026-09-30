@@ -13,9 +13,8 @@ Shape classes (`polars_engine._Translator` assigns them):
 * `aggregate:<family>` -- a whole-frame aggregate, `group_by:<family>` -- a group-by over one key,
   `group_by_multi:<family>` -- over two or more; the families are `sum`, `count` (`count` and
   `len`), `mean` and `minmax` (`min` and `max`); `:keys` is a group-by with no aggregate;
-* `sort` -- a full sort whose keys ArrowMetal orders as Polars does, `sort_helper_keys` -- one that
-  needs extra key columns for that (nulls first on a nullable key, a float key descending),
-  `top_k` -- a sort with a slice;
+* `sort` -- a full sort (every Polars sort key is one ArrowMetal key, Polars' null placement and
+  float order its options), `top_k` -- a sort with a slice;
 * `join:inner`, `join:left`, `join:semi`, `join:anti`;
 * `distinct` -- `unique`.
 
@@ -48,14 +47,14 @@ FAMILIES = ("sum", "count", "mean", "minmax")
 CLASSES = (("rowwise",)
            + tuple(f"{kind}:{f}" for kind in ("aggregate", "group_by", "group_by_multi")
                    for f in FAMILIES)
-           + ("group_by:keys", "group_by_multi:keys", "sort", "sort_helper_keys", "top_k")
+           + ("group_by:keys", "group_by_multi:keys", "sort", "top_k")
            + tuple(f"join:{how}" for how in ("inner", "left", "semi", "anti"))
            + ("distinct",))
 
 # The node a class belongs to: a sweep case whose classes all belong to one node measures each of
 # them (`Benchmarks/polars_engine_crossover.py`).
 NODE = {"rowwise": "rowwise", "aggregate": "aggregate", "group_by": "group_by",
-        "group_by_multi": "group_by", "sort": "sort", "sort_helper_keys": "sort", "top_k": "sort",
+        "group_by_multi": "group_by", "sort": "sort", "top_k": "sort",
         "join": "join", "distinct": "distinct"}
 
 # The router-table operations (`arrowmetal.router_table()["crossovers"]`) whose kernels a class runs.

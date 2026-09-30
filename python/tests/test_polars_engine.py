@@ -765,12 +765,15 @@ def test_a_nul_in_a_column_name_falls_back():
 
 
 def test_helper_columns_never_take_a_user_column_name():
-    """The sort's helper columns (`__arrowmetal_valid1`, `__arrowmetal_nan2`, ...) skip names the
-    frame already uses, so such a frame still runs on Metal."""
-    df = pl.DataFrame({"a": [1.0, None, float("nan"), 3.0], "__arrowmetal_valid1": [1, 2, 3, 4],
-                       "__arrowmetal_nan2": [5, 6, 7, 8], "__arrowmetal_key3": [9, 9, 9, 9]})
+    """The columns the translation adds (`__arrowmetal_key1`, ...) skip names the frame already
+    uses, so such a frame still runs on Metal. A sort needs none for Polars' order: nulls first
+    and NaN above every number are options of the one key (`{"nulls": "first", "float_order":
+    "nan_largest"}`)."""
+    df = pl.DataFrame({"a": [1.0, None, float("nan"), 3.0], "__arrowmetal_key1": [1, 2, 3, 4],
+                       "__arrowmetal_key2": [5, 6, 7, 8], "__arrowmetal_expr3": [9, 9, 9, 9]})
     eng = check(df.lazy().sort("a", descending=True), kinds=["Sort"], order=True)
-    assert '"__arrowmetal_valid2"' in eng.last_report.taken[0]["plan"]
+    plan = json.loads(eng.last_report.taken[0]["plan"])
+    assert plan["by"] == [["a", True, {"nulls": "first", "float_order": "nan_largest"}]]
     check(df.lazy().with_columns((pl.col("a") * 2.0).alias("b")).sort("b"), kinds=["Sort"],
           order=True)
 
@@ -2124,14 +2127,14 @@ def test_column_null_count_reads_the_footer(scan_files):
 
 
 def test_a_column_the_footer_says_has_no_nulls_needs_no_null_handling(scan_files):
-    """`id` holds no null, so a descending sort by it needs no validity key: the plan is the sort
-    alone, and the default engine counts it as a plain sort."""
+    """`id` holds no null, so a descending sort by it needs no null placement: the key is a plain
+    `[name, descending]` pair. `i64` may hold nulls, so its key puts them first, Polars' default."""
     lf = pl.scan_parquet(scan_files["pyarrow"]).select("id", "i64").sort("id", descending=True)
     eng = check(lf, kinds=["Sort", "Scan"], order=True)
-    assert "valid" not in eng.last_report.taken[0]["plan"]
+    assert '"nulls"' not in eng.last_report.taken[0]["plan"]
     lf = pl.scan_parquet(scan_files["pyarrow"]).select("id", "i64").sort("i64", descending=True)
     eng = check(lf, kinds=["Sort", "Scan"], order=["i64"])
-    assert "__arrowmetal_valid" in eng.last_report.taken[0]["plan"]
+    assert '["i64", true, {"nulls": "first"}]' in eng.last_report.taken[0]["plan"]
 
 
 def test_statistics_that_disagree_with_the_data_are_an_error(scan_files, monkeypatch):

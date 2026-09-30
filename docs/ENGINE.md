@@ -317,7 +317,7 @@ always used, so a key that names neither sorts exactly as before.
 | option | values | meaning |
 |---|---|---|
 | `nulls` | `"last"` (default), `"first"` | the key's null rows before or after every value, in either direction (SQL `NULLS FIRST` / `NULLS LAST`) |
-| `float_order` | `"ieee"` (default), `"total"` | how a Float32 / Float64 key orders; integer, string and temporal keys ignore it |
+| `float_order` | `"ieee"` (default), `"total"`, `"nan_largest"` | how a Float32 / Float64 key orders; integer, string and temporal keys ignore it |
 
 - `"ieee"` is Arrow C++'s (and pyarrow's) order: IEEE comparison, -0.0 and +0.0 equal (a tie, kept in
   input order), and every NaN one value placed next to the nulls in both directions — after the values
@@ -325,11 +325,20 @@ always used, so a key that names neither sorts exactly as before.
 - `"total"` is IEEE 754 totalOrder, the order arrow-rs (`total_cmp`), DataFusion and Rust use:
   -NaN < -inf < … < -0.0 < +0.0 < … < +inf < +NaN, NaNs ordered by payload, only identical bits tie, and
   a descending key is the exact mirror, so +NaN comes first.
+- `"nan_largest"` is Polars' (and NumPy's) order: IEEE comparison with -0.0 and +0.0 equal, and every NaN
+  one value greater than every number, +inf included, in both directions — last ascending, first among
+  the values descending. The null placement is independent of it.
 
-Neither option adds work to the sort. A null placement is where the stable partition that takes the null
+No option adds work to the sort. A null placement is where the stable partition that takes the null
 rows out of the radix sort puts them; a float order is the key map in front of the radix passes —
-`"total"` is the raw bit pattern with the sign-flip transform, a pure function of the value. A
-single-key `sort` + `limit` stays a top-k selection with either option.
+`"total"` is the raw bit pattern with the sign-flip transform, a pure function of the value, and
+`"nan_largest"` is `"ieee"`'s map with the descending key the plain complement. A single-key `sort` +
+`limit` stays a top-k selection with any option.
+
+The keys of a window's `order_by` take the same forms and the same options (a window spec's own `nulls`
+and `float_order` are the defaults of its keys), and so do the keys of the streaming external sort
+(`ExternalSortOperator.Key`, `am_stream_sort_ex`, `Stream.sort(null_placement=, float_order=)`), whose
+merge compares by the same rules.
 
 ## The plan grammar
 
@@ -358,7 +367,7 @@ wrapper, because a plan is a tree of records with optional fields.
 | `join` | `left`, `right`, `left_on`, `right_on`, `how`, `suffix`? |
 | `join_asof` | `left`, `right`, `left_on`, `right_on`, `by`?, `by_right`?, `strategy`?, `tolerance`?, `suffix`? |
 | `concat` | `inputs` |
-| `window` | `input`, `specs`: `[{name, fn, column?, n?, partition_by?, order_by?}, …]` |
+| `window` | `input`, `specs`: `[{name, fn, column?, n?, partition_by?, order_by?, nulls?, float_order?}, …]`; `order_by` keys as `sort`'s |
 | `explode` | `input`, `columns` |
 
 A sort `key` is `[column, descending]` as before, `[column, descending, {"nulls": …, "float_order": …}]`,

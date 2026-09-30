@@ -244,6 +244,43 @@ def _top_k(descending):
     return build
 
 
+# Polars' order in the places a key's options decide it: nulls first or last per key, NaN above
+# every number and -0.0 tied with 0.0 in both directions (the "special" flavour holds NaN, both
+# zeros and both infinities), ties kept in input order, a tie on one key falling through to the next.
+
+def _sort_stable(descending, nulls_last):
+    def build(df, dtype, ds):
+        # maintain_order: tied rows (the two zeros, every NaN, the nulls) keep their input order, so
+        # the whole frame is compared row by row, bit for bit.
+        return (df.lazy().sort("x", descending=descending, nulls_last=nulls_last, maintain_order=True),
+                {"order": "exact"})
+    return build
+
+
+def _sort_three_keys_per_key_nulls(df, dtype, ds):
+    return (df.lazy().sort(["k", "x", "id"], descending=[True, False, True],
+                           nulls_last=[False, True, False]), {"order": "exact"})
+
+
+def _sort_ties_fall_through(df, dtype, ds):
+    # xk holds 12 distinct values, so most rows tie on it and x decides between them.
+    return (df.lazy().sort(["xk", "x"], descending=[False, True], nulls_last=[True, False]),
+            {"order": ("keys", ["xk", "x"])})
+
+
+def _top_k_polars(largest):
+    def build(df, dtype, ds):
+        lf = df.lazy()
+        return (lf.top_k(10, by="x") if largest else lf.bottom_k(10, by="x"),
+                {"order": ("keys_only", ["x"])})
+    return build
+
+
+def _top_k_two_keys(df, dtype, ds):
+    return (df.lazy().sort(["x", "id"], descending=[True, False], nulls_last=[False, True]).head(10),
+            {"order": "exact"})
+
+
 _AGGS = ["sum", "min", "max", "mean", "count"]
 
 
@@ -313,6 +350,13 @@ SHAPES = [
     ("sort_two_keys", "sort", ALL, _sort_multi),
     ("top_k_asc", "sort+limit", ALL, _top_k(False)),
     ("top_k_desc", "sort+limit", ALL, _top_k(True)),
+    ("sort_desc_stable", "sort", ALL, _sort_stable(True, False)),
+    ("sort_asc_nulls_last_stable", "sort", ALL, _sort_stable(False, True)),
+    ("sort_three_keys_per_key_nulls", "sort", ALL, _sort_three_keys_per_key_nulls),
+    ("sort_ties_fall_through", "sort", ALL, _sort_ties_fall_through),
+    ("top_k", "sort+limit", ALL, _top_k_polars(True)),
+    ("bottom_k", "sort+limit", ALL, _top_k_polars(False)),
+    ("top_k_two_keys", "sort+limit", ALL, _top_k_two_keys),
 ]
 for _agg in _AGGS + ["len"]:
     SHAPES.append((f"group_by_key_{_agg}", "group_by", KEYABLE, _group_by_key(_agg)))

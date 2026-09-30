@@ -104,11 +104,11 @@ public struct SortKey: Hashable, Sendable {
         self.column = column; self.descending = descending
         self.nullsFirst = nullsFirst; self.floatOrder = floatOrder
     }
-    /// `x`, `x DESC`, with ` NULLS FIRST` and ` TOTAL_ORDER` appended only when set, so a key with the
-    /// default options prints as it always has.
+    /// `x`, `x DESC`, with ` NULLS FIRST` and ` TOTAL_ORDER` / ` NAN_LARGEST` appended only when set, so
+    /// a key with the default options prints as it always has.
     public var description: String {
         (descending ? "\(column) DESC" : column) + (nullsFirst ? " NULLS FIRST" : "")
-            + (floatOrder == .total ? " TOTAL_ORDER" : "")
+            + (floatOrder == .total ? " TOTAL_ORDER" : (floatOrder == .nanLargest ? " NAN_LARGEST" : ""))
     }
 }
 

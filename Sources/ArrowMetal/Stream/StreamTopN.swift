@@ -27,11 +27,30 @@ import Metal
 /// `threshold`. Nil when the column's type cannot be compared against the threshold, which simply
 /// turns pruning off for that scan.
 ///
-/// A null value never passes: nulls sort last, so once n non-null rows are resident no null row can
-/// displace one. (The caller only sets a threshold when the n-th row's key is non-null.)
-func topNThresholdMask(_ c: AnyMetalArray, _ threshold: StreamValue, largest: Bool) throws -> MetalBooleanArray? {
+/// A null value never passes: with the nulls last, once n non-null rows are resident no null row can
+/// displace one. (The caller only sets a threshold when the n-th row's key is non-null.) With the nulls
+/// first every null row beats the threshold, so a batch that holds nulls is not pruned at all.
+///
+/// A float threshold compares in IEEE order, which leaves out the NaN rows; where the key's float order
+/// puts NaN ahead of the values — `nanLargest` descending, `total` in either direction (-NaN ascending,
+/// +NaN descending), `ieee` with the nulls first — the NaN rows are kept as well. A NaN threshold turns
+/// pruning off. The mask may keep more rows than can win (a -0.0 against a +0.0 threshold under
+/// `total`), never fewer.
+func topNThresholdMask(_ c: AnyMetalArray, _ threshold: StreamValue, largest: Bool,
+                       nullsFirst: Bool = false, floatOrder: FloatOrder = .ieee) throws -> MetalBooleanArray? {
     guard !threshold.isNull else { return nil }
+    if nullsFirst && c.nullCount > 0 { return nil }
+    if case .double(let d) = threshold, d.isNaN { return nil }
     let op: CompareOp = largest ? .ge : .le
+    let nanAhead: Bool
+    switch floatOrder {
+    case .ieee: nanAhead = nullsFirst
+    case .total: nanAhead = true
+    case .nanLargest: nanAhead = largest
+    }
+    func keepingNaN<T: ArrowPrimitive>(_ a: MetalArray<T>, _ m: MetalBooleanArray) throws -> MetalBooleanArray {
+        nanAhead ? try m.or(try a.isNan()) : m
+    }
 
     var signed: Int64? = nil
     var unsigned: UInt64? = nil
@@ -54,8 +73,8 @@ func topNThresholdMask(_ c: AnyMetalArray, _ threshold: StreamValue, largest: Bo
     case .uint64(let a): guard let v = unsigned else { return nil }; return try a.compare(op, v)
     case .float32(let a):
         guard let v = real, v.isFinite || v.isInfinite else { return nil }
-        return try a.compare(op, Float(v))
-    case .float64(let a): guard let v = real else { return nil }; return try a.compare(op, v)
+        return try keepingNaN(a, try a.compare(op, Float(v)))
+    case .float64(let a): guard let v = real else { return nil }; return try keepingNaN(a, try a.compare(op, v))
     case .temporal(let t):
         guard let v = signed else { return nil }
         switch t.storage {
@@ -79,11 +98,12 @@ func survivorIndices(_ mask: MetalBooleanArray) throws -> MetalArray<Int32>? {
 
 /// `topKIndices` where the value type has a GPU selection, nil where it does not (`utf8`, `binary`,
 /// `boolean`, decimals, nested types), so the caller can fall back to the full ordering.
-func topKIndicesIfSupported(_ c: AnyMetalArray, k: Int, largest: Bool) throws -> MetalArray<Int32>? {
+func topKIndicesIfSupported(_ c: AnyMetalArray, k: Int, largest: Bool, nullPlacement: NullPlacement = .atEnd,
+                            floatOrder: FloatOrder = .ieee) throws -> MetalArray<Int32>? {
     switch c {
     case .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .float32, .float64, .temporal:
         guard k > 0, k <= c.length else { return nil }
-        return try topKIndices(c, k: k, largest: largest)
+        return try topKIndices(c, k: k, largest: largest, nullPlacement: nullPlacement, floatOrder: floatOrder)
     case .boolean, .string, .binary, .decimal, .smallDecimal, .list, .structure, .map, .union,
          .runEndEncoded, .null, .float16, .interval, .fixedBinary, .extended, .dictionary:
         return nil

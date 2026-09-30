@@ -35,7 +35,8 @@ Results are Polars' results
 ---------------------------
 Where ArrowMetal and Polars differ in semantics the translation emits the Polars answer, and the
 cases are pinned by `python/tests/test_polars_engine.py`: float comparisons use Polars' total order
-(NaN equals NaN and sorts above every number), `&`/`|` are Kleene, a null `when` condition takes the
+(NaN equals NaN and sorts above every number), a sort key carries Polars' null placement and float
+order as options of that one key (`nulls`, `float_order: "nan_largest"`), `&`/`|` are Kleene, a null `when` condition takes the
 `otherwise` branch, `is_in` of a null is null, a sum over no values is 0, a min/max over only NaN is
 NaN, Float32 arithmetic keeps subnormals, and every output column is cast to the dtype Polars' own
 schema says it has (Polars does not check what an engine returns, so this module does).
@@ -937,7 +938,7 @@ class _Translator:
         if slc is not None and stable:
             raise _Unsupported("A sort(maintain_order=True) with a slice stays with Polars: "
                                "top-k does not promise stable ties.")
-        hidden, by, helpers, leaves = [], [], False, None
+        hidden, by = [], []
         for name, nl, desc in zip(keys, nulls_last, descending):
             c = kid.cols.get(name)
             if c is None:
@@ -946,36 +947,24 @@ class _Translator:
                 raise _Unsupported(f"The sort key {name!r} has dtype {c.dtype}, which the Metal "
                                    "plan does not carry.")
             ref = c.ref
+            # One plan key per Polars key, Polars' order being options of the key itself: its null
+            # placement (nulls first unless `nulls_last`, in either direction), and for a float key
+            # "nan_largest" (NaN one value above every number in both directions, -0.0 equal to
+            # 0.0). Both live in the sort's key encoding, so they cost the sort nothing and a
+            # sort + head stays a GPU top-k.
+            opts = {}
             if c.nullable and not nl:
-                # ArrowMetal puts nulls last in both directions; a validity key in front puts
-                # them first.
-                h = self._hidden("valid")
-                if _code(c.dtype) is None and c.dtype != pl.String:
-                    # A temporal column, which ArrowMetal's expressions do not read, not even for
-                    # its validity: the key comes from the scan instead (`_scan_validity`).
-                    leaves = self._scan_validity(kid, leaves or list(kid.leaves), ref, c.dtype, h)
-                else:
-                    hidden.append([h, f"(is_valid {ref})"])
-                helpers = True
-                by.append([h, False])
-            if desc and _is_float(_code(c.dtype)):
-                # Polars sorts NaN above every number in both directions; ArrowMetal's descending
-                # sort puts it after the numbers. A NaN key in front restores Polars' order.
-                h = self._hidden("nan")
-                hidden.append([h, f"(ne {ref} {ref})"])
-                helpers = True
-                by.append([h, True])
+                opts["nulls"] = "first"
+            if _is_float(_code(c.dtype)):
+                opts["float_order"] = "nan_largest"
             m = _COL_REF.fullmatch(ref)
             if m is not None and _unq(m.group(1)) in kid.phys:
-                by.append([_unq(m.group(1)), bool(desc)])
+                col = _unq(m.group(1))
             else:                                     # a virtual column: materialise the key
-                h = self._hidden("key")
-                hidden.append([h, ref])
-                by.append([h, bool(desc)])
+                col = self._hidden("key")
+                hidden.append([col, ref])
+            by.append([col, bool(desc), opts] if opts else [col, bool(desc)])
         plan, phys = kid.plan, list(kid.phys)
-        if leaves is not None:
-            phys += [h for _src, _df, names in leaves for h in names if h.startswith(_HIDDEN)
-                     and h not in phys]
         if hidden:
             plan = {"op": "with_columns", "input": plan, "exprs": hidden}
             phys += [h for h, _ in hidden]
@@ -984,36 +973,8 @@ class _Translator:
         if slc is not None:
             plan = {"op": "limit", "input": plan, "count": int(slc[1]), "offset": int(slc[0])}
             exact = _sliced(exact, slc[0], slc[1])
-        sub = kid.derive(plan=plan, phys=phys, work=True, exact=exact,
-                         add_class="top_k" if slc is not None else
-                         ("sort_helper_keys" if helpers else "sort"))
-        if leaves is not None:
-            sub.leaves = leaves
-        return sub
-
-    def _scan_validity(self, kid, leaves, ref, dtype, h):
-        """Adds column `h`, the validity of the scan column behind `ref`, to the in-memory frame
-        that column comes from, so the plan carries it from the scan to the sort as a Boolean.
-        Taken only where every row of the subtree is a row of that one scan (no join, group-by,
-        aggregate or unique below the sort), which is what makes the scan's validity the key's."""
-        m = _COL_REF.fullmatch(ref)
-        if (m is None or _unq(m.group(1)) not in kid.phys
-                or {c.split(":")[0] for c in kid.classes}
-                & {"join", "distinct", "group_by", "group_by_multi", "aggregate"}):
-            raise _Unsupported(f"A sort with nulls first by a {dtype} column that is not a column "
-                               "of the scan is not translated (ArrowMetal's expressions do not "
-                               "read temporal columns).")
-        name = _unq(m.group(1))
-        hits = [i for i, (_s, _df, names) in enumerate(leaves) if name in names]
-        if len(hits) != 1:
-            raise _Unsupported(f"The sort key column {name!r} is not in exactly one scan.")
-        src, df, names = leaves[hits[0]]
-        if _is_file(df):
-            raise _Unsupported(f"A sort with nulls first by {dtype} column {name!r} read from a "
-                               "Parquet file is not translated (the validity key is added to "
-                               "in-memory frames only).")
-        leaves[hits[0]] = (src, df.with_columns(pl.col(name).is_not_null().alias(h)), names + [h])
-        return leaves
+        return kid.derive(plan=plan, phys=phys, work=True, exact=exact,
+                          add_class="top_k" if slc is not None else "sort")
 
     def _key_columns(self, input_id, exprs, cols, what):
         self.nt.set_node(input_id)

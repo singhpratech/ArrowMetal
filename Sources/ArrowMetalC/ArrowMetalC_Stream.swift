@@ -324,6 +324,34 @@ public func am_stream_sort(_ s: OpaquePointer?,
     }
 }
 
+/// `am_stream_sort` with the null placement (0 at_end, 1 at_start) and the float order (0 ieee, 1 total,
+/// 2 nan_largest) per key; either array may be NULL for the defaults.
+@_cdecl("am_stream_sort_ex")
+public func am_stream_sort_ex(_ s: OpaquePointer?,
+                              _ columns: UnsafeMutablePointer<UnsafePointer<CChar>?>?,
+                              _ descending: UnsafeMutablePointer<Int32>?,
+                              _ nullPlacements: UnsafeMutablePointer<Int32>?,
+                              _ orders: UnsafeMutablePointer<Int32>?, _ nKeys: Int64,
+                              _ limit: Int64, _ scratch: UnsafePointer<CChar>?,
+                              _ sinkPath: UnsafePointer<CChar>?,
+                              _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
+    guard let b = streamBox(s), let out, nKeys > 0, let cols = cstrings(columns, nKeys) else { return 2 }
+    return runTerminal(out) {
+        let keys = try cols.enumerated().map { i, c in
+            ExternalSortOperator.Key(c, descending: (descending?[i] ?? 0) != 0,
+                                     nullsFirst: placement(nullPlacements?[i] ?? 0) == .atStart,
+                                     floatOrder: try floatOrder(orders?[i] ?? 0))
+        }
+        let dir = scratch.map { URL(fileURLWithPath: String(cString: $0)) }
+            ?? FileManager.default.temporaryDirectory.appendingPathComponent("arrowmetal-sort-\(UUID().uuidString)")
+        var sink: StreamSink = CollectingSink()
+        if let p = sinkPath { sink = try IPCStreamSink(url: URL(fileURLWithPath: String(cString: p))) }
+        var r = try b.query.sort(by: keys, into: sink, scratch: dir, limit: limit > 0 ? Int(limit) : nil)
+        if let c = sink as? CollectingSink { r.batch = try c.table() }
+        return r
+    }
+}
+
 /// Streams the filtered and projected rows into an Arrow IPC stream file.
 @_cdecl("am_stream_sink_ipc")
 public func am_stream_sink_ipc(_ s: OpaquePointer?, _ path: UnsafePointer<CChar>?,

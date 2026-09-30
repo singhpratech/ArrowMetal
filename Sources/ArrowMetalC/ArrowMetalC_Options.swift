@@ -20,6 +20,7 @@ import ArrowMetal
 // Enumerations, all matching the Python layer:
 //   null_placement    0 at_end (Arrow's default)  1 at_start
 //   float_order       0 ieee (the default)  1 total (IEEE 754 totalOrder, as arrow-rs)
+//                     2 nan_largest (NaN above +inf in both directions, as Polars)
 //   tiebreaker        0 min   1 max   2 first   3 dense
 //   null_matching     0 match  1 skip  2 emit_null  3 inconclusive
 //   value order       0 first_appearance (Arrow's own)  1 sorted (the cheaper GPU pass)
@@ -45,12 +46,14 @@ private func optRun(_ out: UnsafeMutablePointer<OpaquePointer?>?, _ body: () thr
     }
 }
 
-private func placement(_ v: Int32) -> NullPlacement { v == 1 ? .atStart : .atEnd }
+// Internal rather than private: `am_stream_sort_ex` (ArrowMetalC_Stream.swift) reads the same codes.
+func placement(_ v: Int32) -> NullPlacement { v == 1 ? .atStart : .atEnd }
 
-private func floatOrder(_ v: Int32) throws -> FloatOrder {
+func floatOrder(_ v: Int32) throws -> FloatOrder {
     switch v {
     case 0: return .ieee
     case 1: return .total
+    case 2: return .nanLargest
     default: throw ArrowMetalError.invalidArrowArray("unknown float_order \(v)")
     }
 }
@@ -158,7 +161,8 @@ public func am_lexsort_ex(_ columns: UnsafeMutablePointer<OpaquePointer?>?,
     }
 }
 
-/// `am_argsort_ex` with the float order: 0 ieee (what `am_argsort_ex` does), 1 IEEE 754 totalOrder.
+/// `am_argsort_ex` with the float order: 0 ieee (what `am_argsort_ex` does), 1 IEEE 754 totalOrder,
+/// 2 nan_largest.
 @_cdecl("am_argsort_ex2")
 public func am_argsort_ex2(_ a: OpaquePointer?, _ descending: Int32, _ nullPlacement: Int32, _ order: Int32,
                            _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {

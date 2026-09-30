@@ -142,9 +142,8 @@ _TEMPORAL = {
 
 @pytest.mark.parametrize("dtype", list(_TEMPORAL))
 def test_a_nullable_temporal_sort_key_with_nulls_first_runs_on_metal(dtype):
-    """The validity key that puts nulls first used to be an expression over the column, which
-    ArrowMetal's expressions do not read for a temporal type, so the plan was rejected and the sort
-    left to Polars. The key now comes from the scan."""
+    """Nulls first on a temporal key used to need a validity key, which ArrowMetal's expressions do
+    not compute for a temporal type. It is now the key's own option, with no column added."""
     rng = np.random.default_rng(4)
     raw = pl.Series(rng.integers(0, 10**6, 200)).cast(pl.Int64)
     raw = raw.scatter(rng.integers(0, 200, 30), None)
@@ -157,7 +156,8 @@ def test_a_nullable_temporal_sort_key_with_nulls_first_runs_on_metal(dtype):
         got, eng = _metal(lf)
         want = lf.collect()
         assert got["t"].to_list() == want["t"].to_list()
-        assert "__arrowmetal_valid" in eng.last_report.taken[0]["plan"]
+        plan = eng.last_report.taken[0]["plan"]
+        assert '"nulls": "first"' in plan and "__arrowmetal_" not in plan
 
 
 @pytest.mark.parametrize("dtype", [pl.Float32, pl.Float64])

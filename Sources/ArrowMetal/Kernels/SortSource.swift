@@ -162,6 +162,32 @@ enum SortSource {
     // nothing to report in `flags` and `unkey` mode 2 inverts it exactly, NaN payloads included.
     kernel void key_from_f32_total(device const uint* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]], constant uint& wantFlags [[buffer(5)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { uint b = a[i]; uint k = (b & 0x80000000u) ? ~b : (b | 0x80000000u); out[i] = inv ? ~k : k; } }
     kernel void key_from_f64_total(device const ulong* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]], constant uint& wantFlags [[buffer(5)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) { ulong b = a[i]; ulong k = (b & 0x8000000000000000ul) ? ~b : (b | 0x8000000000000000ul); out[i] = inv ? ~k : k; } }
+    // NaN as the largest value (`FloatOrder.nanLargest`, Polars' and NumPy's order): the `ieee` map —
+    // -0.0 onto +0.0, every NaN onto one value after +inf — with the descending key the plain complement,
+    // so the NaN key turns around with the values and a descending sort puts NaN first. The map is not
+    // injective on exactly the values `ieee`'s is not, so it reports the same flags.
+    kernel void key_from_f32_nanlargest(device const uint* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device uint* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]], constant uint& wantFlags [[buffer(5)]],
+                                        uint i [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+        bool active = i < *nPtr;
+        uint b = active ? a[i] : 0u;
+        bool negZero = active && b == 0x80000000u;
+        bool nan = active && (b & 0x7FFFFFFFu) > 0x7F800000u;
+        if ((b & 0x7FFFFFFFu) == 0u) b = 0u; if (nan) b = 0x7F800001u;
+        uint k = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+        if (active) out[i] = inv ? ~k : k;
+        key_report(flags, negZero, nan, wantFlags, lane);
+    }
+    kernel void key_from_f64_nanlargest(device const ulong* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device ulong* out [[buffer(2)]], constant uint& inv [[buffer(3)]], device atomic_uint* flags [[buffer(4)]], constant uint& wantFlags [[buffer(5)]],
+                                        uint i [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+        bool active = i < *nPtr;
+        ulong b = active ? a[i] : 0ul;
+        bool negZero = active && b == 0x8000000000000000ul;
+        bool nan = active && (b & 0x7FFFFFFFFFFFFFFFul) > 0x7FF0000000000000ul;
+        if ((b & 0x7FFFFFFFFFFFFFFFul) == 0ul) b = 0ul; if (nan) b = 0x7FF0000000000001ul;
+        ulong k = (b & 0x8000000000000000ul) ? ~b : (b | 0x8000000000000000ul);
+        if (active) out[i] = inv ? ~k : k;
+        key_report(flags, negZero, nan, wantFlags, lane);
+    }
     kernel void iota_u32(device uint* out [[buffer(0)]], device const uint* nPtr [[buffer(1)]], uint i [[thread_position_in_grid]]) { if (i < *nPtr) out[i] = i; }
 
     // The inverse of the key map: sorted keys back to sorted values, written at `dstBase`. `mode` picks

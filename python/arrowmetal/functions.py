@@ -1460,7 +1460,8 @@ _ROWS = [
     ("array_sort_indices", "Sorts", GPU, "Kernels/Sort.swift",
      "array_sort_indices(descending, null_placement, float_order)",
      "LSD radix sort, stable. Floats order as pyarrow orders them (-0.0 ties +0.0, NaN next to the "
-     "nulls in both directions); `float_order=\"total\"` is IEEE 754 totalOrder, arrow-rs's order, "
+     "nulls in both directions); `float_order=\"total\"` is IEEE 754 totalOrder, arrow-rs's order, and "
+     "`float_order=\"nan_largest\"` NaN above +inf in both directions, Polars' order, "
      "through the same passes. utf8 and binary columns take the "
      "prefix radix sort in `Kernels/StringSort.swift`, byte-wise lexicographic, index for index with pyarrow. Both of Arrow's "
      "`null_placement` values are implemented, in both directions: the nulls are one block at "

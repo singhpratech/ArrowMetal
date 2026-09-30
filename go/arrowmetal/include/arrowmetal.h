@@ -86,7 +86,7 @@ int  am_slice(am_array* a, int64_t offset, int64_t length, am_array** out);
 // and every NaN is one value. Nulls and NaN stay at the end when `descending` is set -- a reversed order
 // does not mirror them to the front -- and am_top_k maps its keys the same way, so it agrees with
 // am_argsort element for element. am_argsort_ex2 / am_sort_ex2 / am_top_k_ex / am_lexsort_ex2 below
-// take the null placement and IEEE 754 totalOrder for floats as options.
+// take the null placement and IEEE 754 totalOrder or NaN-largest for floats as options.
 int  am_argsort(am_array* a, int descending, am_array** out);   // int32 indices
 int  am_sort(am_array* a, int descending, am_array** out);      // sorted copy, same type
 int  am_top_k(am_array* a, int64_t k, int largest, am_array** out);  // int32 indices of the k largest/smallest
@@ -1282,8 +1282,8 @@ int  am_extract_struct(am_array* a, const uint8_t* pattern, int64_t plen, int fl
 // Enumerations, shared by all of them:
 //
 //   null_placement            0 at_end (Arrow's default)   1 at_start
-//   float_order               0 ieee (the default)   1 total
-//   tiebreaker                0 min   1 max   2 first   3 dense
+//   float_order               0 ieee (the default)   1 total   2 nan_largest
+//   tiebreaker               0 min   1 max   2 first   3 dense
 //   null_matching_behavior    0 match   1 skip   2 emit_null   3 inconclusive
 //   value order               0 first_appearance (Arrow's own)   1 sorted (the cheaper GPU pass)
 //   temporal rounding mode    0 floor   1 ceil   2 round
@@ -1318,8 +1318,10 @@ int  am_partition_nth_ex(am_array* a, int64_t pivot, int null_placement, am_arra
 // directions (after the values at_end, between the nulls and the values at_start), as in Arrow C++.
 // float_order 1 (total) is IEEE 754 totalOrder as arrow-rs and Rust's total_cmp define it:
 // -NaN < -inf < ... < -0.0 < +0.0 < ... < +inf < +NaN, NaNs by payload, only identical bits tie, and a
-// descending sort is the exact mirror (+NaN first). Both are one key map in front of the same radix
-// passes, so neither costs an extra pass. Integer, string and temporal keys ignore float_order.
+// descending sort is the exact mirror (+NaN first). float_order 2 (nan_largest) is Polars' order:
+// every NaN is one value above +inf in both directions (last ascending, first descending) and -0.0
+// ties +0.0. Each is one key map in front of the same radix passes, so none costs an extra pass.
+// Integer, string and temporal keys ignore float_order.
 // am_top_k_ex answers with the first k indices am_argsort_ex2 gives with the same options (largest
 // is its descending). am_lexsort_ex2 takes each option per key: descending, null_placement and
 // float_order each hold `count` entries or are NULL for the default.
@@ -1367,7 +1369,8 @@ int  am_list_parent_indices64(am_array* a, am_array** out);
 //                            "strategy": "backward"|"forward"|"nearest"?, "suffix": STR?}
 //           | "concat"      {"inputs": [plan, ...]}
 //           | "window"      {"input": plan, "specs": [{"name": NAME, "fn": WFN, "column": NAME?,
-//                            "n": INT?, "partition_by": [...]?, "order_by": [[NAME, DESC], ...]?}, ...]}
+//                            "n": INT?, "partition_by": [...]?, "order_by": [KEY, ...]?,
+//                            "nulls": NULLS?, "float_order": FORDER?}, ...]}
 //           | "explode"     {"input": plan, "columns": [NAME]}
 //   AGGOP  := "sum" | "min" | "max" | "mean" | "count"
 //   WFN    := "row_number" | "rank" | "dense_rank" | "lag" | "lead" | "cum_sum"
@@ -1376,7 +1379,8 @@ int  am_list_parent_indices64(am_array* a, am_array** out);
 //   KEY    := [NAME, DESCENDING] | [NAME, DESCENDING, {"nulls": NULLS?, "float_order": FORDER?}]
 //           | {"column": NAME, "descending": BOOL?, "nulls": NULLS?, "float_order": FORDER?}
 //   NULLS  := "last" (the default) | "first"       -- per key, in either direction
-//   FORDER := "ieee" (the default) | "total"       -- see am_argsort_ex2; the sort-level fields are the
+//   FORDER := "ieee" (the default) | "total" | "nan_largest"   -- see am_argsort_ex2; the sort-level
+//                                                    (or window-spec-level) fields are the
 //                                                    defaults for keys that do not name their own
 //   SEXPR  := the expression grammar above, verbatim.
 //
@@ -1551,6 +1555,12 @@ int am_stream_quantiles(am_stream* s, const char* column, const double* qs, int6
 // External sort: one sorted run per batch under scratch_dir, then a k-way merge. limit 0 means all.
 int am_stream_sort(am_stream* s, const char** columns, const int* descending, int64_t n_keys,
                    int64_t limit, const char* scratch_dir, const char* sink_path, am_stream_result** out);
+// am_stream_sort with null_placement and float_order per key (the enumerations of am_argsort_ex2);
+// each array holds n_keys entries or is NULL for the defaults (at_end, ieee).
+int am_stream_sort_ex(am_stream* s, const char** columns, const int* descending,
+                      const int* null_placement, const int* float_order, int64_t n_keys,
+                      int64_t limit, const char* scratch_dir, const char* sink_path,
+                      am_stream_result** out);
 int am_stream_sink_ipc(am_stream* s, const char* path, am_stream_result** out);
 // kind: 0 inner, 1 left.
 int am_stream_join_broadcast(am_stream* s, struct ArrowArrayStream* build, const char* probe_key,

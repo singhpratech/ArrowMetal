@@ -32,6 +32,8 @@ enum TopKSource {
     ///
     /// `f32t` / `f64t` are the `FloatOrder.total` maps (`SortSource.key_from_f32_total/f64_total`): the raw
     /// bits with the sign-flip transform, nothing canonicalised, and the plain complement for "largest".
+    /// `f32n` / `f64n` are the `FloatOrder.nanLargest` maps (`key_from_f32/f64_nanlargest`): canonicalised
+    /// as `f32` / `f64`, with the plain complement for "largest", so NaN is the largest value both ways.
     static func keyMap(kind: String, V: String, K: String) -> String {
         let keyMax = K == "ulong" ? "ULONG_MAX" : "UINT_MAX"
         let map: String
@@ -55,6 +57,17 @@ enum TopKSource {
             map = "uint b = as_type<uint>(v); \(K) k = (b & 0x80000000u) ? ~b : (b | 0x80000000u);"
         case "f64t":
             map = "ulong b = (ulong)v; \(K) k = (b & 0x8000000000000000ul) ? ~b : (b | 0x8000000000000000ul);"
+        case "f32n":
+            // `nan` stays false: the canonical NaN key is complemented with the rest for "largest".
+            map = """
+            uint b = as_type<uint>(v); if ((b & 0x7FFFFFFFu) == 0u) b = 0u; if ((b & 0x7FFFFFFFu) > 0x7F800000u) b = 0x7F800001u;
+                \(K) k = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+            """
+        case "f64n":
+            map = """
+            ulong b = (ulong)v; if ((b & 0x7FFFFFFFFFFFFFFFul) == 0ul) b = 0ul; if ((b & 0x7FFFFFFFFFFFFFFFul) > 0x7FF0000000000000ul) b = 0x7FF0000000000001ul;
+                \(K) k = (b & 0x8000000000000000ul) ? ~b : (b | 0x8000000000000000ul);
+            """
         case "i64": map = "\(K) k = (ulong)v ^ 0x8000000000000000ul;"
         case "u64": map = "\(K) k = (ulong)v;"
         default:

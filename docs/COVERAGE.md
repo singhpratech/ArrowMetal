@@ -520,11 +520,12 @@ the DuckDB extension left the aggregate to DuckDB) is compared as well and count
 
 | Engine | Against | Cases | Pass | Documented | Unclassified | Not taken |
 |---|---|---:|---:|---:|---:|---:|
-| Polars `MetalEngine(shapes="all", min_rows=0)` | `lf.collect()`, polars 1.44.1 | 12,597 | 12,392 | 32 | 0 | 173 |
+| Polars `MetalEngine(shapes="all", min_rows=0)` | `lf.collect()`, polars 1.44.1 | 15,376 | 15,097 | 32 | 0 | 247 |
 | DuckDB optimizer extension, `arrowmetal_rewrite = 'force'` | `'off'`, DuckDB 1.5.5 | 33,376 | 21,844 | 0 | 0 | 11,532 |
 
-From `Benchmarks/results/engine_conformance_2026-09-25.csv`; one row per shape is in
-`Benchmarks/results/engine_conformance_2026-09-25_shapes.csv`.
+The Polars row from `Benchmarks/results/engine_conformance_2026-09-30.csv`, the DuckDB row from
+`Benchmarks/results/engine_conformance_2026-09-25.csv`; one row per shape is in the `_shapes.csv`
+file of each.
 
 * **Polars** — every shape the engine translates (filter, `select` and `with_columns` expressions,
   `slice`, sort with and without a limit, group-by with each aggregate over the column as key and as
