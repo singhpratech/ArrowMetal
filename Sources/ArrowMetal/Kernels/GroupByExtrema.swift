@@ -74,6 +74,7 @@ extension GroupBy {
             if n > 0 {
                 enc.setComputePipelineState(loPSO)
                 bindRows(enc)
+                enc.setBuffer(table.mtl, offset: 0, index: 9)       // the high words, read plainly
                 enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
                 enc.memoryBarrier(scope: .buffers)
             }

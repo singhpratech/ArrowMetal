@@ -197,17 +197,21 @@ enum GroupByExtremaSource {
             : ""
         let minRef = priv ? "&tMin[k]" : "&g[2]"
         let maxRef = priv ? "&tMax[k]" : "&g[3]"
-        let hiMin = priv ? "sHiMin[k]" : "atomic_load_explicit(&g[0], memory_order_relaxed)"
-        let hiMax = priv ? "sHiMax[k]" : "atomic_load_explicit(&g[1], memory_order_relaxed)"
+        // The high words are final after pass 1 and this pass never writes them, so they are read
+        // through a plain (cacheable) view of the table, `th`, rather than as atomics: at a few
+        // thousand groups the table stays in cache and an atomic load would go past it on every row.
+        let hiMin = priv ? "sHiMin[k]" : "hw.x"
+        let hiMax = priv ? "sHiMax[k]" : "hw.y"
         return """
-        kernel void gxm_lo_\(space)(\(args(s, KT: KT))) {
+        kernel void gxm_lo_\(space)(\(args(s, KT: KT)),
+                                 device const uint2* th [[buffer(9)]]) {
             \(decl)
             \(priv ? """
             for (uint k = lid; k < K; k += TG) {
                 atomic_store_explicit(&tMin[k], 0xFFFFFFFFu, memory_order_relaxed);
                 atomic_store_explicit(&tMax[k], 0u, memory_order_relaxed);
-                sHiMin[k] = atomic_load_explicit(&t[(ulong)k * 4ul], memory_order_relaxed);
-                sHiMax[k] = atomic_load_explicit(&t[(ulong)k * 4ul + 1ul], memory_order_relaxed);
+                uint2 hw = th[(ulong)k * 2ul];
+                sHiMin[k] = hw.x; sHiMax[k] = hw.y;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             """ : "")
@@ -215,7 +219,7 @@ enum GroupByExtremaSource {
             for (uint i = start + lid; i < end; i += TG) {
         \(rowPrologue(s, KT: KT))
                 uint hi = (uint)(u >> 32), lo = (uint)u;
-                \(priv ? "" : "device atomic_uint* g = &t[(ulong)k * 4ul];")
+                \(priv ? "" : "device atomic_uint* g = &t[(ulong)k * 4ul]; uint2 hw = th[(ulong)k * 2ul];")
                 if (hi == \(hiMin)) { \(improve("min", minRef, "lo")) }
                 if (hi == \(hiMax)) { \(improve("max", maxRef, "lo")) }
             }
