@@ -162,7 +162,7 @@
 
 - Chunked import: a column held as many Arrow arrays (a pyarrow `ChunkedArray`, a multi-chunk Polars
   Series, one column of a stream of arrow-rs `RecordBatch`es) imports in one call, each chunk written
-  straight into the final Metal buffers on the CPU cores in parallel, with no concatenated copy first.
+  straight into the final Metal buffers, with no concatenated copy first.
   Each chunk's offset, length, validity bitmap (or its absence) and null count (-1 included) are
   honoured; the result equals the import of the concatenation. It takes the integer, float, float16,
   boolean, null, decimal, temporal, interval and fixed_size_binary types, utf8 / large_utf8 / binary /
@@ -174,13 +174,42 @@
     `ChunkedArray`, and through it `am.query`, `am.scan` and `am.write_parquet` over a pyarrow Table
     or Polars DataFrame, the DuckDB bridge's `from_duckdb`, and the Polars `MetalEngine` for a
     multi-chunk column of an in-memory frame. A one-chunk `ChunkedArray` imports its chunk as it is (`combine_chunks` copied it).
-  - Measured on an M4 Max with `Benchmarks/chunked_import_bench.py`, three columns of 50M rows, the
-    builds before and after timed alternately, best of 5
-    (`Benchmarks/results/chunked_import_2026-09-28.csv`): `combine_chunks` and import on the previous
-    build against the chunked import, in 16 chunks / in 6,104 chunks of 8,192 rows: int64 33.2 → 6.8 ms
-    / 38.2 → 14.6 ms, float64 32.9 → 6.9 / 37.9 → 16.5 ms, utf8 68.8 → 14.5 / 80.0 → 24.3 ms, utf8_view
-    423.2 → 38.9 / 560.9 → 60.0 ms. The chunked import uses more CPU time (87 against 33 CPU-ms for
-    int64 in 16 chunks).
+  - Copy threads: a measured policy, `ImportThreads`. `Benchmarks/import_threads_policy.py` derives
+    its tables from a sweep of 1 to 16 threads at 100,000 to 50,000,000 rows
+    (`Benchmarks/results/import_threads_2026-09-30.csv`) with one rule per import: a thread count is
+    allowed when its CPU time is at most max(32 ms, 2x the one-thread import's), and the policy takes
+    the fewest threads within 5% of the fastest allowed count. Copies have no CPU limit from the size
+    where the limit costs wall time (the smallest measured size from which some type and chunk layout
+    is more than 5% slower under the limit than at its fastest count, at that size and every larger
+    one: 381 MiB, 50M int64 rows); there a copy takes the fastest count. The copies (values, string
+    bytes, offsets, bitmaps, view data buffers) use 1-2 threads below 5.4 MiB written, 8 up to 108 MiB,
+    12 up to 341 MiB and 16 above; the utf8_view / binary_view view pass 4 to 12 threads by the bytes
+    of views (8 from 216 MiB). The pieces are handed out one at a time, so a thread on a slower core takes
+    fewer. `am_set_import_threads(n)` / `am_get_import_threads()` (C), `am.set_import_threads` /
+    `am.get_import_threads` (Python), `arrowmetal::set_import_threads` / `import_threads` (Rust),
+    `ImportThreads.limit` (Swift) and the environment variable `ARROWMETAL_IMPORT_THREADS` cap every
+    step at n threads; 1 keeps the import on the calling thread, 0 is the policy.
+  - The utf8_view / binary_view view pass is C with NEON intrinsics (`Sources/CArrowMetalCopy`): four
+    views per `vld4q_u32` step, each out-of-line view given its merged buffer index and offset base and
+    checked (length, offset, buffer index, byte range) with vector selects, no branch per view; a
+    block of 2,048 rows holding a view that fails the check is redone view by view, and that view
+    reads as the empty string, as after the single-array import.
+  - Measured on an M4 Max with `Benchmarks/chunked_import_bench.py`, three columns of 50M rows, each
+    case re-timed alone over eight rounds of 100 runs alternating with the build before the thread
+    policy and the NEON pass, which copied on all sixteen cores
+    (`Benchmarks/results/chunked_import_2026-09-30.csv`); `combine_chunks` and import, that build's
+    chunked import, and this one, in 16 chunks / in 6,104 chunks of 8,192 rows, wall time and (CPU
+    time): int64 16.5 (16), 6.52 (91), 6.42 (99) ms / 21.4 (21), 14.38 (96), 13.88 (106) ms; float64
+    16.5 (17), 6.51 (90), 6.43 (98) / 21.2 (21), 14.11 (98), 13.74 (108) ms; utf8 35.1 (35), 13.41
+    (182), 13.21 (198) / 47.6 (48), 22.15 (209), 21.27 (227) ms; utf8_view 372.6 (362), 31.19 (392),
+    14.26 (111) / 379.3 (528), 54.26 (564), 38.96 (299) ms. The 50M copies take 1.09-1.11x the CPU time
+    of the all-core build; at 10M rows the copies take 0.54-0.87x of it and 0.92-0.99x its wall time,
+    at 20M and 30M within 1.3% of its best time at 0.81-1.22x its CPU time, and the utf8_view pass
+    takes 0.28-0.56x its CPU time at 10M and 50M rows. utf8_view imports 1.08x the time of utf8 in 16
+    chunks and 1.83x in 6,104 chunks, where its data buffers are copied (2.7x and 2.5x before the NEON
+    pass). The DataFusion rule's sorts take 0.93-0.99x of that build's time at 50M rows (0.91-1.04x
+    its CPU time) and 0.95-1.05x at 10M rows (0.54-0.88x)
+    (`datafusion/results/datafusion_sort_import_2026-09-30.csv`).
 
 - A copy-free import checks that the producer's pages are mapped with `mach_vm_region` (one call per VM
   region) instead of `mincore` (one entry per page). Importing a page-aligned 50M-row int64 pyarrow
@@ -201,8 +230,9 @@
 - A utf8_view / binary_view array with more than 64 data buffers (an arrow-rs or pyarrow
   concatenation of view arrays keeps every input's buffers) has its data buffers copied into merged
   buffers on import instead of each being wrapped and bound: a pyarrow `combine_chunks` of three 50M-row
-  utf8_view columns with 6,104 data buffers each imports in 49.5 ms against 150.5 ms, using 545 CPU-ms
-  against 143.
+  utf8_view columns with 6,104 data buffers each imports in 26.5 ms and 274 CPU-ms
+  (`Benchmarks/results/chunked_import_2026-09-30.csv`), against 150.5 ms and 143 CPU-ms when each
+  buffer was wrapped (`Benchmarks/results/chunked_import_2026-09-28.csv`).
 
 - Sort options per key: the null placement (`nulls` first or last, in either direction) and the float
   order. `float_order="ieee"` is the order every sort has used (Arrow C++'s: -0.0 ties +0.0, NaN next to

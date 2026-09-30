@@ -19,9 +19,11 @@ let package = Package(
     targets: [
         // Verbatim Arrow C Data / C Device / C Stream ABI structs (no dependencies).
         .target(name: "CArrowABI", path: "Sources/CArrowABI"),
+        // The chunked view import's CPU pass, in C for its NEON intrinsics (ld4 / st4).
+        .target(name: "CArrowMetalCopy", path: "Sources/CArrowMetalCopy"),
         .target(
             name: "ArrowMetal",
-            dependencies: ["CArrowABI"],
+            dependencies: ["CArrowABI", "CArrowMetalCopy"],
             linkerSettings: [.linkedFramework("Metal")]
         ),
         .target(name: "ArrowMetalC", dependencies: ["ArrowMetal", "CArrowABI"]),

@@ -173,6 +173,20 @@ pub fn device_name() -> String {
     unsafe { CStr::from_ptr(ffi::am_device_name()) }.to_string_lossy().into_owned()
 }
 
+/// Sets the CPU threads the chunked import ([`Array::from_arrow_chunks`], [`Source::from_batches`])
+/// copies on, process-wide: 0 is the measured policy (the default), `n >= 1` at most `n` threads,
+/// and 1 keeps the import on the calling thread. The setting starts from the environment variable
+/// `ARROWMETAL_IMPORT_THREADS`.
+pub fn set_import_threads(n: usize) {
+    let n = c_int::try_from(n).unwrap_or(c_int::MAX);
+    unsafe { ffi::am_set_import_threads(n) };
+}
+
+/// The chunked import's thread setting: 0 for the measured policy, else the most threads it uses.
+pub fn import_threads() -> usize {
+    unsafe { ffi::am_get_import_threads() }.max(0) as usize
+}
+
 // =================================================================================================
 // Element types
 // =================================================================================================

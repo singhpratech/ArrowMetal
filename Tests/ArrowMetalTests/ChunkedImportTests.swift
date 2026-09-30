@@ -28,6 +28,11 @@ private final class ProducerMemory {
         bases = b; pointers = p
         ProducerMemory.live += 1
     }
+    /// Buffers the caller malloc'd and filled; freed with this object.
+    init(raw: [UnsafeMutableRawPointer?]) {
+        bases = raw; pointers = raw.map { $0.map { UnsafeRawPointer($0) } }
+        ProducerMemory.live += 1
+    }
     deinit { for m in bases { free(m) }; ProducerMemory.live -= 1 }
 }
 
@@ -558,6 +563,285 @@ final class ChunkedImportTests: XCTestCase {
             guard case .string(let s) = try check(t, plans, rng: &rng, "\(f) for kernels") else { return XCTFail() }
             XCTAssertEqual(try s.argsort().toArray(), try ref.argsort().toArray(), "\(f) argsort")
         }
+    }
+}
+
+// MARK: - Copy threads, view blocks, merged view buffers past 2 GiB
+
+/// Every buffer of an imported array as bytes: the validity bitmap (its first `length` bits), then
+/// the values, the offsets and data, or the views and each data buffer.
+private func rawBytes(_ a: AnyMetalArray) -> [[UInt8]] {
+    var s = ArrowSchema(), arr = ArrowArray()
+    a.exportArrowSchema(into: &s)
+    a.exportArrowArray(into: &arr)
+    defer {
+        if let r = arr.release { r(&arr) }
+        if let r = s.release { r(&s) }
+    }
+    let fmt = String(cString: s.format)
+    let n = Int(arr.length)
+    precondition(arr.offset == 0)
+    func bits(_ p: UnsafeRawPointer?) -> [UInt8] {
+        guard let p, n > 0 else { return [] }
+        var b = Array(UnsafeRawBufferPointer(start: p, count: (n + 7) / 8))
+        if n % 8 != 0 { b[b.count - 1] &= UInt8((1 << (n % 8)) - 1) }
+        return b
+    }
+    var out: [[UInt8]] = [bits(arr.buffers[0].map { UnsafeRawPointer($0) })]
+    let b1 = arr.buffers[1].map { UnsafeRawPointer($0) }!
+    switch fmt {
+    case "b":
+        out.append(bits(b1))
+    case "u", "z":
+        let o = b1.assumingMemoryBound(to: Int32.self)
+        out.append(Array(UnsafeRawBufferPointer(start: b1, count: (n + 1) * 4)))
+        out.append(Array(UnsafeRawBufferPointer(start: arr.buffers[2], count: Int(o[n]))))
+    case "vu", "vz":
+        let nb = Int(arr.n_buffers)
+        out.append(Array(UnsafeRawBufferPointer(start: b1, count: n * 16)))
+        let sizes = arr.buffers[nb - 1]!.assumingMemoryBound(to: Int64.self)
+        for j in 0..<(nb - 3) {
+            out.append(arr.buffers[2 + j].map { Array(UnsafeRawBufferPointer(start: $0, count: Int(sizes[j]))) } ?? [])
+        }
+    default:
+        out.append(Array(UnsafeRawBufferPointer(start: b1, count: n * fixedWidth(fmt)!)))
+    }
+    return out
+}
+
+/// A chunk of `n` random rows after `pad` more, written straight into its buffers (for columns too
+/// long to build row by row): int64 / float64 ("l", "g"), bool, utf8 / large_utf8, or utf8_view with
+/// `viewBuffers` data buffers, about one view in 3,000 pointing past its buffer.
+private func rawChunk(_ fmt: String, rows n: Int, pad: Int, nulls: Bool, viewBuffers: Int = 1,
+                      rng: inout Rng) -> ProducerMemory {
+    let all = pad + n
+    var validity: [UInt8]? = nil
+    if nulls { validity = (0..<((all + 7) / 8)).map { _ in rng.byte() | rng.byte() | rng.byte() } }
+    switch fmt {
+    case "l", "g":
+        return ProducerMemory([validity, (0..<(all * 8)).map { _ in rng.byte() }])
+    case "b":
+        return ProducerMemory([validity, (0..<((all + 7) / 8)).map { _ in rng.byte() }])
+    case "u", "U":
+        var data: [UInt8] = [], offs: [Int] = [0]
+        for _ in 0..<all {
+            for _ in 0..<rng.int(21) { data.append(UInt8(97 + rng.int(26))) }
+            offs.append(data.count)
+        }
+        let o: [UInt8] = fmt == "u" ? offs.flatMap { v in withUnsafeBytes(of: Int32(v)) { Array($0) } }
+                                    : offs.flatMap { v in withUnsafeBytes(of: Int64(v)) { Array($0) } }
+        return ProducerMemory([validity, o, data])
+    default:
+        var views = [UInt8](repeating: 0, count: all * 16)
+        var datas = [[UInt8]](repeating: [], count: viewBuffers)
+        for r in 0..<all {
+            let len = rng.int(3) == 0 ? 13 + rng.int(30) : rng.int(13)
+            let bytes = (0..<len).map { _ in UInt8(97 + rng.int(26)) }
+            views.withUnsafeMutableBytes { v in
+                let p = v.baseAddress! + r * 16
+                p.storeBytes(of: Int32(len), as: Int32.self)
+                if len <= 12 {
+                    for (k, x) in bytes.enumerated() { p.storeBytes(of: x, toByteOffset: 4 + k, as: UInt8.self) }
+                    return
+                }
+                let j = rng.int(viewBuffers)
+                for k in 0..<4 { p.storeBytes(of: bytes[k], toByteOffset: 4 + k, as: UInt8.self) }
+                p.storeBytes(of: Int32(j), toByteOffset: 8, as: Int32.self)
+                p.storeBytes(of: Int32(datas[j].count), toByteOffset: 12, as: Int32.self)
+                datas[j] += bytes
+                if rng.int(3000) == 0 {
+                    switch rng.int(4) {
+                    case 0: p.storeBytes(of: Int32(viewBuffers), toByteOffset: 8, as: Int32.self)          // index past the buffers
+                    case 1: p.storeBytes(of: Int32(-3), toByteOffset: 12, as: Int32.self)                  // negative offset
+                    case 2: p.storeBytes(of: Int32(1 << 30), toByteOffset: 12, as: Int32.self)             // past its buffer
+                    default: p.storeBytes(of: Int32(-40), as: Int32.self)                                  // negative length
+                    }
+                }
+            }
+        }
+        let sizes = datas.flatMap { d in withUnsafeBytes(of: Int64(d.count)) { Array($0) } }
+        return ProducerMemory([validity, views] + datas.map { Optional($0) } + [sizes])
+    }
+}
+
+extension ChunkedImportTests {
+    /// One copy thread, several and the default policy give the same buffers, byte for byte, for
+    /// columns long enough that every copy step splits over the threads it is given.
+    func testThreadCountsGiveIdenticalBytes() throws {
+        let saved = ImportThreads.limit
+        defer { ImportThreads.limit = saved }
+        var rng = Rng(s: 77)
+        let total = 1_100_000
+        let cases: [(String, Int, Int)] = [("l", 37, 1), ("g", 5, 1), ("b", 23, 1), ("u", 41, 1), ("U", 9, 1),
+                                           ("vu", 16, 3), ("vu", 200, 1)]
+        for (fmt, chunkCount, viewBuffers) in cases {
+            var sizes = (0..<chunkCount).map { _ in 1 + rng.int(2 * total / chunkCount) }
+            sizes[sizes.count - 1] += Swift.max(0, total - sizes.reduce(0, +))
+            let parts = sizes.map { n -> (ProducerMemory, Int, Int) in
+                let pad = rng.int(3) == 0 ? 0 : rng.int(70)
+                return (rawChunk(fmt, rows: n, pad: pad, nulls: rng.int(4) != 0, viewBuffers: viewBuffers, rng: &rng), n, pad)
+            }
+            var reference: [[UInt8]]? = nil
+            for limit in [1, 2, 3, 4, 7, 16, 0] {
+                ImportThreads.limit = limit
+                var arrays = parts.map { producerArray($0.0, length: $0.1, offset: $0.2, nullCount: -1) }
+                var got: AnyMetalArray! = nil
+                try schema(fmt) { s in
+                    got = try arrays.withUnsafeMutableBufferPointer { try importArrowChunks(schema: s, arrays: $0.baseAddress, count: $0.count).array }
+                }
+                let bytes = rawBytes(got)
+                if let reference {
+                    XCTAssertTrue(bytes == reference, "\(fmt), \(chunkCount) chunks: \(limit) threads differ from one")
+                } else {
+                    reference = bytes
+                }
+                if case .string(let sa) = got, let v = sa.view {
+                    // The byte total is the same sum on every thread count.
+                    XCTAssertEqual(v.logicalBytes, (0..<got.length).reduce(0) { $0 + (sa.isValid($1) ? v.bytes(row: $1).count : 0) })
+                }
+            }
+        }
+        XCTAssertEqual(ProducerMemory.live, 0)
+    }
+
+    /// The NEON view pass against the view-by-view rewrite on the same chunks: the same views, byte
+    /// for byte, and the same byte total, with malformed views of every kind sprinkled in, for chunks
+    /// with one data buffer, several (merged buffers as they are) and more chunks than are wrapped
+    /// (copied into one merged buffer), with and without nulls.
+    func testViewPassMatchesViewByView() throws {
+        let saved = ImportThreads.limit
+        defer { ImportThreads.limit = saved; viewRewriteExactOnly = false }
+        var rng = Rng(s: 91)
+        for (chunkCount, viewBuffers) in [(12, 1), (9, 4), (150, 1), (90, 3), (1, 200)] {
+            let parts = (0..<chunkCount).map { _ -> (ProducerMemory, Int, Int) in
+                let n = 1 + rng.int(9000), pad = rng.int(3) == 0 ? 0 : rng.int(70)
+                return (rawChunk("vu", rows: n, pad: pad, nulls: rng.int(3) != 0, viewBuffers: viewBuffers, rng: &rng), n, pad)
+            }
+            var results: [([[UInt8]], Int)] = []
+            for exact in [true, false] {
+                viewRewriteExactOnly = exact
+                ImportThreads.limit = exact ? 1 : 3
+                var arrays = parts.map { producerArray($0.0, length: $0.1, offset: $0.2, nullCount: -1) }
+                var got: AnyMetalArray! = nil
+                try schema("vu") { s in
+                    got = try arrays.withUnsafeMutableBufferPointer { try importArrowChunks(schema: s, arrays: $0.baseAddress, count: $0.count).array }
+                }
+                results.append((rawBytes(got), got.asStringArray!.view!.logicalBytes))
+            }
+            XCTAssertTrue(results[0].0 == results[1].0, "\(chunkCount) chunks of \(viewBuffers) buffers: the views differ")
+            XCTAssertEqual(results[0].1, results[1].1, "\(chunkCount) chunks of \(viewBuffers) buffers: byte total")
+        }
+        XCTAssertEqual(ProducerMemory.live, 0)
+    }
+
+    /// Chunks whose sizes straddle the 64-row validity words and the view rewrite's 2,048-row blocks,
+    /// with no, one and several data buffers, and malformed views at those boundaries: every
+    /// malformed view reads as the empty string, keeps the out-of-bounds index, and adds nothing to
+    /// the byte total; every other row is its own.
+    func testViewsAcrossChunkBoundaries() throws {
+        let saved = ImportThreads.limit
+        defer { ImportThreads.limit = saved }
+        var rng = Rng(s: 31)
+        let t = specs.first { $0.format == "vu" }!
+        let sizes = [1, 63, 64, 65, 2047, 2048, 2049, 4097, 3, 130, 6000]
+        for mode in ["one buffer per chunk", "several per chunk", "inline only", "mixed"] {
+            for limit in [1, 4] {
+                ImportThreads.limit = limit
+                var expected: [Row] = [], malformed: [Int] = []
+                var arrays: [ArrowArray] = []
+                for (ci, n) in sizes.enumerated() {
+                    let m = mode == "mixed" ? ["one buffer per chunk", "several per chunk", "inline only"][ci % 3] : mode
+                    var rows: [Row] = (0..<n).map { _ in
+                        m == "inline only" ? (rng.int(5) == 0 ? nil : (0..<rng.int(13)).map { _ in UInt8(97 + rng.int(26)) })
+                                           : randomRow(t, &rng)
+                    }
+                    let pad = rng.int(70)
+                    var bufs = buffers(t, rows: rows, pad: pad, withValidity: true, rng: &rng,
+                                       viewBufferBytes: m == "several per chunk" ? 200 : 1 << 20)
+                    if m == "inline only" { bufs = [bufs[0], bufs[1], []] }      // no data buffer at all
+                    let k = bufs.count - 3
+                    for r in Set([0, 63, 64, 65, 2047, 2048, n - 1, rng.int(n)]) where r < n {
+                        guard let row = rows[r], row.count > 12 else { continue }
+                        let at = (pad + r) * 16
+                        let idx = Int(bufs[1]![at + 8]) | Int(bufs[1]![at + 9]) << 8
+                        func put(_ v: Int32, _ byte: Int) {
+                            withUnsafeBytes(of: v) { for q in 0..<4 { bufs[1]![at + byte + q] = $0[q] } }
+                        }
+                        switch rng.int(5) {
+                        case 0: put(Int32(k), 8)                                         // past the chunk's buffers
+                        case 1: put(-1, 8)                                               // negative index
+                        case 2: put(-5, 12)                                              // negative offset
+                        case 3: put(Int32(bufs[2 + idx]!.count - row.count + 1), 12)     // one byte past its buffer
+                        default: put(-20, 0)                                             // negative length
+                        }
+                        rows[r] = []
+                        malformed.append(expected.count + r)
+                    }
+                    expected += rows
+                    arrays.append(producerArray(ProducerMemory(bufs), length: n, offset: pad, nullCount: -1))
+                }
+                var got: AnyMetalArray! = nil
+                try schema("vu") { s in
+                    got = try arrays.withUnsafeMutableBufferPointer { try importArrowChunks(schema: s, arrays: $0.baseAddress, count: $0.count).array }
+                }
+                if mode != "inline only" { XCTAssertFalse(malformed.isEmpty, mode) }
+                XCTAssertEqual(readBack(got).rows, expected, "\(mode), \(limit) threads")
+                guard let v = got.asStringArray?.view else { return XCTFail("not a view column") }
+                XCTAssertEqual(v.logicalBytes, expected.reduce(0) { $0 + ($1?.count ?? 0) }, "\(mode), \(limit) threads")
+                for r in malformed {
+                    XCTAssertEqual(v.views.contents.loadUnaligned(fromByteOffset: r * 16 + 8, as: Int32.self), Int32.max, "\(mode) row \(r)")
+                }
+            }
+        }
+        XCTAssertEqual(ProducerMemory.live, 0)
+    }
+
+    /// Merged data buffers are capped under 2 GiB, so a column's buffers spread over several and the
+    /// views point into each: with the cap lowered to 700 bytes, and for real with 70 data buffers of
+    /// 32 MiB (2.2 GiB), where the views of the last seven buffers point into the second merged buffer.
+    func testMergedViewBuffersPastTheOffsetLimit() throws {
+        var rng = Rng(s: 55)
+        let t = specs.first { $0.format == "vu" }!
+        do {
+            let saved = viewPackLimit
+            viewPackLimit = 700
+            defer { viewPackLimit = saved }
+            let got = try check(t, plan(t, sizes: (0..<150).map { _ in 1 + rng.int(60) }, rng: &rng), rng: &rng, "700-byte merged buffers")
+            guard let v = got.asStringArray?.view else { return XCTFail("not a view column") }
+            XCTAssertGreaterThan(v.dataBuffers.count, 3)
+            XCTAssertTrue(v.dataSizes.allSatisfy { $0 <= 700 }, "\(v.dataSizes)")
+        }
+
+        let bufBytes = 32 << 20, count = 70
+        var arrays: [ArrowArray] = []
+        var expected: [Row] = []
+        for c in 0..<count {
+            let s = Array("string \(c) of a 32 MiB data buffer".utf8)
+            let data = malloc(bufBytes)!                   // left untouched but for the string
+            let off = c % 2 == 0 ? 0 : bufBytes - s.count  // the first and the last bytes of the buffer
+            s.withUnsafeBytes { memcpy(data + off, $0.baseAddress!, s.count) }
+            let views = malloc(16)!
+            views.storeBytes(of: Int32(s.count), as: Int32.self)
+            for q in 0..<4 { views.storeBytes(of: s[q], toByteOffset: 4 + q, as: UInt8.self) }
+            views.storeBytes(of: Int32(0), toByteOffset: 8, as: Int32.self)
+            views.storeBytes(of: Int32(off), toByteOffset: 12, as: Int32.self)
+            let sizes = malloc(8)!
+            sizes.storeBytes(of: Int64(bufBytes), as: Int64.self)
+            arrays.append(producerArray(ProducerMemory(raw: [nil, views, data, sizes]), length: 1, offset: 0, nullCount: 0))
+            expected.append(s)
+        }
+        var got: AnyMetalArray! = nil
+        try schema("vu") { s in
+            got = try arrays.withUnsafeMutableBufferPointer { try importArrowChunks(schema: s, arrays: $0.baseAddress, count: $0.count).array }
+        }
+        XCTAssertEqual(readBack(got).rows, expected)
+        guard let v = got.asStringArray?.view else { return XCTFail("not a view column") }
+        XCTAssertEqual(v.dataBuffers.count, 2)
+        XCTAssertEqual(v.dataSizes, [63 * bufBytes, 7 * bufBytes])
+        XCTAssertEqual(v.views.contents.loadUnaligned(fromByteOffset: 69 * 16 + 8, as: Int32.self), 1)
+        XCTAssertEqual(v.views.contents.loadUnaligned(fromByteOffset: 69 * 16 + 12, as: Int32.self), Int32(7 * bufBytes - expected[69]!.count))
+        got = nil
+        XCTAssertEqual(ProducerMemory.live, 0)
     }
 }
 
