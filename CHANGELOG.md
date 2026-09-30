@@ -2,6 +2,55 @@
 
 ## Unreleased
 
+- Grouped Float64 `sum` and `mean` are correctly rounded, and are computed without putting the rows
+  in group order. **Behaviour change:** a Float64 group `sum` is now the binary64 value nearest the
+  exact sum of the group's non-null values (ties to even), equal to `math.fsum` of those values; it
+  no longer depends on row order, and it differs in the last bits from the earlier ordered sum in
+  some groups (it is never further from the exact sum). A Float64 group `mean` is the exact sum
+  divided by the count, rounded once. Special values: a group holding NaN returns NaN (the canonical
+  quiet NaN `0x7FF8000000000000` when every NaN in it is that one, else the group's first NaN in row
+  order, quieted); +inf together with -inf returns the canonical quiet NaN; otherwise an infinity is
+  returned as is; a sum whose exact value is finite is returned even where a running sum would
+  overflow (`[max, max, -max]` gives `max`), and one whose exact value is beyond the largest double
+  rounds to ±inf; an exact zero is -0.0 only when every value of the group is -0.0. `am.group_by(...)`,
+  the plan runner, the C ABI and the bindings over them return these; the streaming group-by keeps
+  its ordered sum. Float64 `min` and `max` return the same bits as before.
+  - How: two passes over the rows in place. The first takes each group's largest exponent and its
+    count and notes NaN, ±inf and +0.0; the second adds each value, as an integer in a fixed-point
+    window below that exponent, to a 128-bit accumulator with 32-bit atomics that carry word by word.
+    One rounding per group finishes it. A group whose rounding the window cannot settle, or that holds
+    a NaN other than the canonical one, is summed exactly on the host from its own rows. Grouped
+    `min` and `max` keep a group's four table words in one 16-byte entry, issue an atomic only when a
+    row improves on what it read, and keep no count. A `sum` and a `mean`, or a `min` and a `max`, of
+    one column on one grouping share one call.
+  - Measured on an M4 Max, the builds before and after timed alternately in three rounds
+    (`Benchmarks/results/groupby_float64_2026-09-30.csv`, `Benchmarks/groupby_float64_bench.py`): at
+    50M rows over one or two int32 keys, with and without 10% nulls, 200 to 25M groups, `sum` and
+    `mean` are 1.41x-2.66x faster through `am.group_by(keys)` and 1.34x-2.33x through the plan
+    runner (one key, 1M groups: 43.50 → 17.69 ms and 47.75 → 22.11 ms; 25M groups: 283.67 → 197.05 ms
+    and 328.73 → 242.34 ms); `min` + `max` in one plan 1.29x-2.12x (1M groups: 28.86 → 13.63 ms);
+    `min` or `max` alone 0.95x-1.51x. `count`, an Int64 `sum` and a Float32 `sum` in the same runs:
+    0.96x-1.04x. The kernels alone at 50M rows
+    (`Benchmarks/results/groupby_float64_profile_2026-09-30.csv`): `sum` 10.62 → 3.48 ms at 200
+    groups, 39.78 → 14.17 ms at 1M and 227.11 → 110.43 ms at 25M; `min` + `max` 10.64 → 5.91 ms at
+    1M and 82.82 → 35.65 ms at 25M. Polars `MetalEngine()` at 50M rows
+    (`Benchmarks/results/polars_engine_groupby_float64_2026-09-30.csv`): the Float64 `min` + `max` grid cases
+    the default runs on the GPU 1.19x-2.59x faster (1M groups: 48.36 → 18.67 ms), `(l)` Float64 `sum` + `mean` 46.12 →
+    29.68 ms. Through the DataFusion rule forced on at 50M rows
+    (`datafusion/results/datafusion_float64_groupby_2026-09-30.csv`): Float64 `sum` and `avg`
+    1.33x-1.82x faster than before and 0.59x-2.55x of DataFusion alone; `MIN` + `MAX` 1.06x-1.19x
+    faster and 0.31x-1.03x of DataFusion alone.
+  - To improve: through the DataFusion rule, a Float64 `MIN`/`MAX` carries four helper aggregates per
+    extreme (the NaN, value, zero and negative-zero counts, each a sum over an `if_else`), which take
+    most of the plan: 36.88 ms at 200 groups from 50M rows, where the plan runner's own `min` + `max`
+    takes 7.34 ms. At 25M groups from 50M rows, the grouping itself (`am.group_by(keys)` with a
+    `count`) is 110.12 ms of the 197.05 ms `sum`.
+  - Tests: `GroupSumExactTests` (Swift) and `python/tests/test_group_sum_exact.py` against
+    correctly rounded references (special values, signed zeros, subnormals, overflow, ties,
+    cancellation, 2^24 + 3 groups, min/max with NaN and both zeros), and the differential rows
+    `group_by_sum_correctly_rounded` and `group_by_mean_correctly_rounded`, bit for bit against the
+    exact value rounded once.
+
 - `datafusion-arrowmetal` (`datafusion/`, docs/DATAFUSION.md): a physical optimizer rule for Apache
   DataFusion 55.1. Registered on a `SessionContext` (`session_context`, `with_arrowmetal` or
   `physical_optimizer_rules`), it replaces a full `ORDER BY` whose input has an exact row count of at
