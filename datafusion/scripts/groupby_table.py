@@ -27,14 +27,18 @@ Two constraints from the default-take check CSVs (`--check`, merged in order: a 
 replaces an earlier one's for the same size, layout and case) then raise the thresholds:
 
 Each constraint reads, per size, layout and case, the latest row in which the default took that path
-(ran it on ArrowMetal, or handed it back), whatever a later file decided.
+(ran it on ArrowMetal, or handed it back), whatever a later file decided. The check rows are the
+sweep's cases and the cases in EXTRA (queries outside the sweep with a shape the table decides).
 
-* First run after idle, idle against idle: a series (family, keys, key class, input, bucket) is
-  taken at a size only if, at that size and every larger measured size, every row the default ran
-  on ArrowMetal has `off_idle_ms / def_idle_ms >= IDLE_RATIO`: the default's first run after the
-  same idle (pipelines already compiled) against DataFusion alone's first run after that idle, same
-  query, size and layout, each the median of the runs after `idle_gap_ms` of sleep. A size with no
-  such row, or a row without both idle times, is not taken.
+* First run after idle, idle against idle, at every gap of IDLE_GAPS_MS: a series (family, keys,
+  key class, input, bucket) is taken at a size only if, at that size and every larger measured size,
+  every row the default ran on ArrowMetal has, at each gap, DataFusion alone's first run after that
+  gap / the default's first run after the same gap >= IDLE_RATIO (same query, size and layout,
+  pipelines already compiled; each the median of the runs after the gap). A row's idle times at a
+  gap are the latest ones measured for its size, layout and case at that gap in a row where the
+  default ran on ArrowMetal (the `idle_gap_ms` columns and, when a file measured two gaps, the
+  `idle_gap2_ms` columns). A size with no such row, or a row without idle times at some gap, is not
+  taken.
 * Hand-back: a shape (family, keys, key class, input) is replaced at plan time from a size only if,
   at that size and every larger measured size, every row the default handed back at run time is at
   least HANDBACK_RATIO of DataFusion alone on the best run AND on the median of the round bests.
@@ -59,8 +63,9 @@ MIN_RATIO = 1.5
 # run-to-run noise of 1.5x, so the default takes only shapes measured at least 10 % above it.
 HEADROOM = 1.1
 # The default's first run after an idle gap (pipelines compiled) must not be slower than DataFusion
-# alone's first run after the same gap.
+# alone's first run after the same gap, at each of these gaps.
 IDLE_RATIO = 1.0
+IDLE_GAPS_MS = (500, 5000)
 # A run-time hand-back may cost at most 3 % against DataFusion alone (best and median of rounds).
 HANDBACK_RATIO = 0.97
 SIZES_ALL = (1_000_000, 2_000_000, 5_000_000, 10_000_000, 50_000_000)
@@ -79,6 +84,9 @@ FAMILY = {
     "distinct": "distinct",
 }
 CASE = re.compile(r"^(?P<fam>[a-z_0-9]+?)_(?P<nk>[12])(?P<kc>i32|i64)_(?P<g>[^_]+)$")
+# Check-file cases outside the sweep whose shape the table decides: (family column, case) -> shape.
+# `u_small` is `SELECT DISTINCT region, sub FROM fact` (two int32 keys, a MemTable).
+EXTRA = {("distinct", "u_small"): ("distinct", "2+", "i32", "memory")}
 
 
 def bucket(groups, rows):
@@ -139,7 +147,7 @@ def read_checks(paths, kind=None):
     for path in paths:
         with open(path) as fh:
             for r in csv.DictReader(fh):
-                if r["family"] != "gsweep" or not CASE.match(r["case"]):
+                if shape_of(r) is None:
                     continue
                 if kind is not None and state(r) != kind:
                     continue
@@ -156,7 +164,12 @@ def state(r):
 
 
 def shape_of(r):
+    """(family, keys, key class, input) of a check row, or None for a case the table does not decide."""
+    if (r["family"], r["case"]) in EXTRA:
+        return EXTRA[(r["family"], r["case"])]
     m = CASE.match(r["case"])
+    if r["family"] != "gsweep" or not m:
+        return None
     return FAMILY[m["fam"]], "1" if m["nk"] == "1" else "2+", m["kc"], "memory"
 
 
@@ -168,31 +181,50 @@ def first_holding(ok_by_size):
     return None
 
 
+def idle_times(paths):
+    """{(size, layout, case, gap ms): (off_idle_ms, def_idle_ms)}: the latest idle times at each gap
+    from the rows in which the default ran on ArrowMetal (files in order, both gap column sets)."""
+    out = {}
+    for path in paths:
+        with open(path) as fh:
+            for r in csv.DictReader(fh):
+                if shape_of(r) is None or state(r) != "gpu":
+                    continue
+                for g, o, d in (("idle_gap_ms", "off_idle_ms", "def_idle_ms"), ("idle_gap2_ms", "off_idle2_ms", "def_idle2_ms")):
+                    if r.get(g) and r.get(o) and r.get(d):
+                        out[(r["size"], r["layout"], r["case"], int(r[g]))] = (float(r[o]), float(r[d]))
+    return out
+
+
 def constraints(paths):
-    """({series key: {size: every first run after idle passes}}, {shape: {size: every hand-back
-    passes}}, the rows that fail), from the latest measurement of each path per size, layout and
-    case (`read_checks` with `kind`)."""
+    """({series key: {size: (every first run after idle passes at every gap, lowest)}}, {shape:
+    {size: (every hand-back passes, lowest)}}, the rows that fail), from the latest measurement of
+    each path per size, layout and case (`read_checks` with `kind`) and the latest idle times at
+    each gap (`idle_times`)."""
     idle, back, fails = {}, {}, []
+    times = idle_times(paths)
     for r in read_checks(paths, "gpu") + read_checks(paths, "back"):
         size = int(r["size"])
         shape = shape_of(r)
         if state(r) == "gpu":
             b = bucket(int(r["out_rows"]), size)
             key = shape + (b,)
-            v, o = r.get("def_idle_ms"), r.get("off_idle_ms")
-            ratio = float(o) / float(v) if v and o else None
-            ok = ratio is not None and ratio >= IDLE_RATIO
             idle.setdefault(key, {})
-            prev = idle[key].get(size)
-            # Per size: (every row passes, the lowest ratio with its row; None: a row not measured).
-            low = prev[1] if prev else (float("inf"), "")
-            if ratio is None:
-                low = (None, f"{r['case']} {r['layout']}")
-            elif low[0] is not None and ratio < low[0]:
-                low = (ratio, f"{r['case']} {r['layout']}")
-            idle[key][size] = ((prev[0] if prev else True) and ok, low)
-            if not ok:
-                fails.append(("idle", key, size, r["layout"], r["case"], o or "-", v or "-"))
+            for gap in IDLE_GAPS_MS:
+                t = times.get((r["size"], r["layout"], r["case"], gap))
+                ratio = t[0] / t[1] if t else None
+                ok = ratio is not None and ratio >= IDLE_RATIO
+                prev = idle[key].get(size)
+                # Per size: (every row passes, the lowest ratio with its row; None: a row not measured).
+                low = prev[1] if prev else (float("inf"), "")
+                where = f"{r['case']} {r['layout']}, {gap / 1000:g} s idle"
+                if ratio is None:
+                    low = (None, where)
+                elif low[0] is not None and ratio < low[0]:
+                    low = (ratio, where)
+                idle[key][size] = ((prev[0] if prev else True) and ok, low)
+                if not ok:
+                    fails.append(("idle", key, size, r["layout"], r["case"], gap, f"{ratio:.3f}" if ratio else "-"))
         elif state(r) == "back":
             best = float(r["off_ms"]) / float(r["def_ms"])
             med = float(r["off_round_median_ms"] or r["off_ms"]) / float(r["def_round_median_ms"] or r["def_ms"])
@@ -251,10 +283,10 @@ def table(path, checks=()):
                 why.append(low(fail[-1]) + f", below {IDLE_RATIO}x")
                 lo = hi = None
             elif first > lo:
-                why.append(f"idle vs idle {IDLE_RATIO}x or more from {mn(first)}; " + low(fail[-1]))
+                why.append(f"idle vs idle {IDLE_RATIO}x or more at every gap from {mn(first)}; " + low(fail[-1]))
                 lo = first
             else:
-                why.append(f"idle vs idle {IDLE_RATIO}x or more from {mn(lo)}")
+                why.append(f"idle vs idle {IDLE_RATIO}x or more at every gap from {mn(lo)}")
         if lo is not None and checks:
             by = back.get(key[:4], {})
             first = first_holding({n: v[0] for n, v in by.items()})
@@ -288,7 +320,8 @@ def rust(path, rows, checks=()):
         "//! larger one (None: not taken at any size); `max_rows` caps a take whose ratio fell between the",
         "//! two largest sizes; `ratios` is the worst ratio (both layouts, every case of the family) per size.",
         f"//! The `check:` files raise `min_rows` where the default's first run after idle is below",
-        f"//! {IDLE_RATIO}x of DataFusion alone's first run after the same idle (idle vs idle), or a run-time",
+        f"//! {IDLE_RATIO}x of DataFusion alone's first run after the same idle (idle vs idle) at any of",
+        f"//! {', '.join(f'{g} ms' for g in IDLE_GAPS_MS)}, or a run-time",
         f"//! hand-back of the shape below {HANDBACK_RATIO}x (best and median of rounds). Every row ends with",
         "//! the reason for its threshold.",
         "",

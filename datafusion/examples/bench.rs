@@ -40,8 +40,8 @@
 //! * Before each block (one family at one size and layout): wait until the 1-minute load is below
 //!   `--max-load` and no cargo / rustc / swift-build / swift-frontend / swiftc / pytest runs,
 //!   checking every 20 s. The load at the start and end of each block goes in every row.
-//!   With `--lock-dir <dir>`, also wait while `<dir>/BUILDING` exists (another process compiles or
-//!   runs tests) and hold `<dir>/TIMING` for the block. Each row records the block's start and end
+//!   With `--lock-dir <dir>`, also wait while a `<dir>/BUILDING*` file exists (another process
+//!   compiles or runs tests) and hold `<dir>/TIMING` for the block. Each row records the block's start and end
 //!   time and the last `Sleep` entry of `pmset -g log` at its end, so a block that spans a sleep
 //!   can be found and rerun.
 //! * Contexts (`--contexts`, default `off,on`): `off` DataFusion alone (always timed, the
@@ -101,11 +101,12 @@ struct Args {
     /// For a case no context ran on the GPU: after the warm-up, this many runs of each context,
     /// alternating run by run (the order rotated each time) instead of the rounds.
     alternate: usize,
-    /// After the timed runs: this many runs of `off` and `def`, each after `idle_gap_ms` of sleep
-    /// (the GPU idles; pipelines are compiled by then). The order alternates by repetition
-    /// (`off` first on even ones, `def` first on odd ones).
+    /// After the timed runs: per idle gap (`--idle-gap-ms`, one or two values), this many runs of
+    /// `off` and `def`, each after that gap of sleep (the GPU idles; pipelines are compiled by then).
+    /// The order of the contexts alternates run by run and the order of the gaps by repetition.
+    /// The first gap goes to the `*_idle_*` columns, the second to the `*_idle2_*` columns.
     idle_reps: usize,
-    idle_gap_ms: u64,
+    idle_gaps: Vec<u64>,
     /// Only these (size, layout, case) triples, one `size,layout,case` per line.
     select: Option<std::collections::HashSet<(usize, String, String)>>,
 }
@@ -129,7 +130,7 @@ fn args() -> Args {
         rounds: 1,
         alternate: 0,
         idle_reps: 0,
-        idle_gap_ms: 500,
+        idle_gaps: vec![500],
         select: None,
         lock_dir: None,
     };
@@ -156,7 +157,10 @@ fn args() -> Args {
             "--rounds" => a.rounds = val.parse().unwrap(),
             "--alternate" => a.alternate = val.parse().unwrap(),
             "--idle-reps" => a.idle_reps = val.parse().unwrap(),
-            "--idle-gap-ms" => a.idle_gap_ms = val.parse().unwrap(),
+            "--idle-gap-ms" => {
+                a.idle_gaps = nums(&val).into_iter().map(|g: usize| g as u64).collect();
+                assert!((1..=2).contains(&a.idle_gaps.len()), "--idle-gap-ms takes one or two values");
+            }
             "--select" => {
                 let text = std::fs::read_to_string(&val).unwrap();
                 a.select = Some(
@@ -243,20 +247,27 @@ fn last_sleep() -> String {
     l.split_whitespace().take(2).collect::<Vec<_>>().join(" ")
 }
 
-/// Holds `<dir>/TIMING` for one block; removed on drop.
-struct TimingLock(Option<std::path::PathBuf>);
+/// Holds `<dir>/TIMING` for one block (with its owner tag); removed on drop.
+struct TimingLock(Option<std::path::PathBuf>, String);
 
 impl Drop for TimingLock {
     fn drop(&mut self) {
         if let Some(p) = &self.0 {
-            if std::fs::read_to_string(p).map(|s| s.starts_with("g1 ")).unwrap_or(false) {
+            if std::fs::read_to_string(p).map(|s| s.starts_with(&self.1)).unwrap_or(false) {
                 std::fs::remove_file(p).ok();
             }
         }
     }
 }
 
-/// Waits for a quiet machine (and, with a lock dir, for no BUILDING and no one else's TIMING), then
+/// Whether a `BUILDING*` file exists in the lock dir.
+fn building(d: &std::path::Path) -> bool {
+    std::fs::read_dir(d)
+        .map(|it| it.flatten().any(|e| e.file_name().to_string_lossy().starts_with("BUILDING")))
+        .unwrap_or(false)
+}
+
+/// Waits for a quiet machine (and, with a lock dir, for no BUILDING* and no one else's TIMING), then
 /// takes TIMING. Returns the load at the start and the lock.
 fn acquire(a: &Args, what: &str) -> (f64, TimingLock) {
     // The owner tag written to `TIMING` (`BENCH_LANE`, default `g1`): a lock with another tag waits.
@@ -266,7 +277,7 @@ fn acquire(a: &Args, what: &str) -> (f64, TimingLock) {
             let d = std::path::Path::new(d);
             let mut waited = 0;
             loop {
-                let building = d.join("BUILDING").exists();
+                let building = building(d);
                 let other = std::fs::read_to_string(d.join("TIMING")).map(|s| !s.starts_with(&lane)).unwrap_or(false);
                 if !building && !other {
                     break;
@@ -279,15 +290,15 @@ fn acquire(a: &Args, what: &str) -> (f64, TimingLock) {
             }
         }
         let l = wait_quiet(a.max_load, what);
-        let Some(d) = &a.lock_dir else { return (l, TimingLock(None)) };
+        let Some(d) = &a.lock_dir else { return (l, TimingLock(None, lane)) };
         let d = std::path::Path::new(d);
         let t = d.join("TIMING");
         std::fs::write(&t, format!("{lane}{}\n", std::process::id())).unwrap();
-        if d.join("BUILDING").exists() {
+        if building(d) {
             std::fs::remove_file(&t).ok();
             continue;
         }
-        return (l, TimingLock(Some(t)));
+        return (l, TimingLock(Some(t), lane));
     }
 }
 
@@ -917,7 +928,8 @@ async fn main() {
              equal_def,def_taken,def_handed_back,def_groups_est,def_probe_ms,def_input_ms,def_kernel_ms,def_choice,\
              off_first_ms,block_t0,block_t1,last_sleep,rounds,off_round_median_ms,def_round_median_ms,\
              back_round_median_ms,on_round_median_ms,method,def_gpu,def_idle_ms,def_idle_max_ms,off_idle_ms,\
-             idle_gap_ms,off_idle_max_ms,def_idle_cpu_ms,off_idle_cpu_ms,idle_reps"
+             idle_gap_ms,off_idle_max_ms,def_idle_cpu_ms,off_idle_cpu_ms,idle_reps,idle_gap2_ms,def_idle2_ms,\
+             def_idle2_max_ms,off_idle2_ms,off_idle2_max_ms,def_idle2_cpu_ms,off_idle2_cpu_ms"
         )
         .unwrap();
     }
@@ -1146,24 +1158,38 @@ async fn main() {
             };
             // First runs after the GPU idled, pipelines compiled (every context has run by now).
             // The order alternates by repetition so neither context always follows the other.
-            let mut idle: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
-            let mut idle_cpu: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+            // (gap index, context) -> wall and CPU times of the runs after that gap.
+            let mut idle: BTreeMap<(usize, &str), Vec<f64>> = BTreeMap::new();
+            let mut idle_cpu: BTreeMap<(usize, &str), Vec<f64>> = BTreeMap::new();
+            let mut turn = 0;
             for rep in 0..a.idle_reps {
-                let order = if rep % 2 == 0 { ["off", "def"] } else { ["def", "off"] };
-                for name in order {
-                    if let Some(x) = ctxs.iter().find(|x| x.name == name) {
-                        std::thread::sleep(Duration::from_millis(a.idle_gap_ms));
-                        let r = run(&x.ctx, &c.sql).await;
-                        idle.entry(name).or_default().push(r.wall);
-                        idle_cpu.entry(name).or_default().push(r.cpu);
+                let mut gaps: Vec<usize> = (0..a.idle_gaps.len()).collect();
+                if rep % 2 == 1 {
+                    gaps.reverse();
+                }
+                for gi in gaps {
+                    for k in 0..2 {
+                        let name = if (turn + k) % 2 == 0 { "off" } else { "def" };
+                        if let Some(x) = ctxs.iter().find(|x| x.name == name) {
+                            std::thread::sleep(Duration::from_millis(a.idle_gaps[gi]));
+                            let r = run(&x.ctx, &c.sql).await;
+                            idle.entry((gi, name)).or_default().push(r.wall);
+                            idle_cpu.entry((gi, name)).or_default().push(r.cpu);
+                        }
                     }
+                    turn += 1;
                 }
             }
-            let idle_med = |n: &str| idle.get(n).map(|v| format!("{:.2}", median(v))).unwrap_or_default();
-            let idle_max = |n: &str| {
-                idle.get(n).map(|v| format!("{:.2}", v.iter().cloned().fold(0.0, f64::max))).unwrap_or_default()
+            let idle_med =
+                |g: usize, n: &str| idle.get(&(g, n)).map(|v| format!("{:.2}", median(v))).unwrap_or_default();
+            let idle_max = |g: usize, n: &str| {
+                idle.get(&(g, n)).map(|v| format!("{:.2}", v.iter().cloned().fold(0.0, f64::max))).unwrap_or_default()
             };
-            let idle_cpu_med = |n: &str| idle_cpu.get(n).map(|v| format!("{:.1}", median(v))).unwrap_or_default();
+            let idle_cpu_med =
+                |g: usize, n: &str| idle_cpu.get(&(g, n)).map(|v| format!("{:.1}", median(v))).unwrap_or_default();
+            let gap = |g: usize| {
+                if a.idle_reps > 0 { a.idle_gaps.get(g).map(|x| x.to_string()).unwrap_or_default() } else { String::new() }
+            };
             let by = |n: &str| ctxs.iter().position(|x| x.name == n).map(|i| &res[i]);
             let off = &res[0];
             let on = by("on");
@@ -1240,7 +1266,7 @@ async fn main() {
                 ctxs.iter().position(|x| x.name == n).map(|i| format!("{:.2}", median(&round_bests[i]))).unwrap_or_default()
             };
             let rounds_s = format!(
-                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 if alternate { a.alternate } else { a.rounds.max(1) },
                 med("off"),
                 med("def"),
@@ -1248,14 +1274,21 @@ async fn main() {
                 med("on"),
                 if alternate { "alternate" } else { "rounds" },
                 gpu,
-                idle_med("def"),
-                idle_max("def"),
-                idle_med("off"),
-                if a.idle_reps > 0 { a.idle_gap_ms.to_string() } else { String::new() },
-                idle_max("off"),
-                idle_cpu_med("def"),
-                idle_cpu_med("off"),
+                idle_med(0, "def"),
+                idle_max(0, "def"),
+                idle_med(0, "off"),
+                gap(0),
+                idle_max(0, "off"),
+                idle_cpu_med(0, "def"),
+                idle_cpu_med(0, "off"),
                 a.idle_reps,
+                gap(1),
+                idle_med(1, "def"),
+                idle_max(1, "def"),
+                idle_med(1, "off"),
+                idle_max(1, "off"),
+                idle_cpu_med(1, "def"),
+                idle_cpu_med(1, "off"),
             );
             rows_out.push((row, tail, extra, rounds_s));
         }
