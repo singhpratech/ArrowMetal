@@ -80,10 +80,36 @@ groups), 23.78 → 9.02 ms (10,000), 39.78 → 14.17 ms (1M), 227.11 → 110.43 
 Polars `MetalEngine()` (`Benchmarks/results/polars_engine_groupby_float64_2026-09-30.csv`, three
 alternating rounds, every result equal to Polars'): at 50M rows the Float64 `min` + `max` grid cases
 the default runs on the GPU are 1.19x-2.59x faster (1M groups, one key: 48.36 → 18.67 ms) and `(l)`
-Float64 `sum` + `mean` is 46.12 → 29.68 ms. Through the DataFusion rule forced on at 50M rows
+Float64 `sum` + `mean` is 46.12 → 29.68 ms. At 2M rows six case-engine pairs were slower in that run;
+timed again alone, eight alternating rounds of 100 runs
+(`Benchmarks/results/polars_engine_groupby_float64_retime_2026-09-30.csv`), none is slower in both
+best and median: the Float64 `min` + `max` cases are 1.18x-1.38x faster cold (`g1minmax10k` 1.90 →
+1.43 ms, `g2minmax10k` 2.28 → 1.82 ms, `t7` 2.18 → 1.58 ms), the Int64 `g1sum1M` 1.04x, and the
+default's `g1minmax200` and `t4`, which it does not run on the GPU at 2M rows, 0.98x-1.02x. Through the DataFusion rule forced on at 50M rows
 (`datafusion/results/datafusion_float64_groupby_2026-09-30.csv`, one run of each build): Float64
 `sum` and `avg` 1.33x-1.82x faster than before (1M groups: 58.03 → 31.95 ms against DataFusion
 alone's 55.51 ms), `MIN` + `MAX` 1.06x-1.19x.
+
+**The 10M-row, 10,000-group min/max rows.** In the alternating run and in eight further rounds of
+100 calls each (`Benchmarks/results/groupby_float64_retime_2026-09-30.csv`), ten Float64 `min`/`max`
+rows at 10M rows were slower in both best and median, nine of them at 10,000 groups (best
+0.60x-0.92x, median 0.71x-0.88x). Their first run after 500 ms of idle was faster than before in
+the same file (one key, `max`: 8.60 → 7.09 ms). The time they lost was in the GPU's state after a
+loop of the new kernel, not in the kernel
+(`Benchmarks/results/groupby_float64_minmax_state_2026-09-30.csv`, eight rounds per build):
+
+- A `count` over the same grouping, the same code in both builds, took 0.40 and 0.32 ms (best; one
+  key, two keys with nulls) after a loop of the earlier `max`, 0.46 and 0.49 ms after a loop of the
+  new one, and 0.41 and 0.38 ms on the new build with the earlier `max` kernel in place of the new
+  one; run first in the process, before any `max`, it took 0.44-0.47 ms in every build.
+- With the same 50M-row Int64 group sum run before every timed call in both builds, the new `max`
+  was faster: 1.38 → 1.12 ms best and 1.57 → 1.36 ms median (one key), 1.28 → 1.09 ms and 1.50 →
+  1.34 ms (two keys, 10% nulls); the `count` beside it was unchanged (0.42 → 0.40 ms and 0.38 →
+  0.39 ms best).
+- In fresh processes that time only `am.group_by(keys).max(values)`, at 5M, 10M and 20M rows and
+  3,000, 10,000 and 30,000 groups, warm loop and with the same heater, the new build was faster in
+  17 of 18 cells in best and 17 of 18 in median (10M rows, 10,000 groups, warm loop: 1.85 → 1.72 ms
+  best, 3.21 → 2.39 ms median); no cell was slower in both.
 
 **To improve.** Through the DataFusion rule, a Float64 `MIN`/`MAX` carries four helper aggregates per
 extreme (the NaN, value, zero and negative-zero counts, each a sum over an `if_else`), which take
