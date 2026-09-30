@@ -1189,6 +1189,49 @@ _register_group_op("max", "max")
 _register_group_op("mean", "mean", tol="result_float")
 
 
+def _exact_group_value(xs, mean):
+    """The sum (or mean) of `xs` rounded once from the exact rational value: what a correctly rounded
+    grouped sum returns, bit for bit. IEEE special values as in addition; an exact zero is -0.0 only
+    when every value is -0.0."""
+    from fractions import Fraction
+    if not xs:
+        return None
+    if any(math.isnan(x) for x in xs) or (math.inf in xs and -math.inf in xs):
+        return math.nan
+    if math.inf in xs or -math.inf in xs:
+        return math.inf if math.inf in xs else -math.inf
+    q = sum(map(Fraction, xs))
+    if q == 0:
+        return -0.0 if all(math.copysign(1.0, x) < 0 for x in xs) else 0.0
+    q = q / len(xs) if mean else q
+    try:
+        return float(q)
+    except OverflowError:
+        return math.inf if q > 0 else -math.inf
+
+
+def _register_exact_group_op(agg):
+    @op("group_by_" + agg + "_correctly_rounded", ["float64"],
+        note="Float64 grouped " + agg + " through GroupByKeys, bit for bit against the exact value rounded once")
+    def run(src, shape, agg=agg):
+        keys, _ = group_keys(shape)
+        g = am.group_by([am.array(keys)])
+        got = pylist(getattr(g, agg)(am.array(src)))
+        groups = {}
+        for k, v in zip(keys.to_pylist(), src.to_pylist()):
+            groups.setdefault(k, [])
+            if v is not None:
+                groups[k].append(v)
+        order = g.keys()[0]
+        order = (order.to_arrow() if hasattr(order, "to_arrow") else order).to_pylist()
+        return got, [_exact_group_value(groups.get(k, []), agg == "mean") for k in order]
+    return run
+
+
+_register_exact_group_op("sum")
+_register_exact_group_op("mean")
+
+
 # ---- additional operations -----------------------------------------
 #
 # None of these exist in 0.1.0. Each is registered only if the method is actually on MetalArray by the

@@ -12,6 +12,34 @@ public struct GroupBy<K: ArrowIndex> {
     /// A reference type deliberately: copies of the struct share it.
     final class Cache {
         var segments: GroupSegments?
+        /// The last Float64 column summed exactly and its sums and means (`exactSumMean`), so a `sum`
+        /// and a `mean` of one column share one pass. Weak: the cache never keeps a column alive.
+        weak var exactValues: AnyObject?
+        var exactResult: Any?
+        /// The last column whose extremes were taken (`extrema`) and both of them, so a `min` and a
+        /// `max` of one column share one pass.
+        weak var extremaValues: AnyObject?
+        var extremaResult: Any?
+        private let lock = NSLock()
+
+        /// The result kept for `values` under `slot`, if the last column stored there is `values`.
+        func lookup(_ slot: Slot, _ values: AnyObject) -> Any? {
+            lock.lock(); defer { lock.unlock() }
+            switch slot {
+            case .exact: return exactValues === values ? exactResult : nil
+            case .extrema: return extremaValues === values ? extremaResult : nil
+            }
+        }
+
+        func store(_ slot: Slot, _ values: AnyObject, _ result: Any) {
+            lock.lock(); defer { lock.unlock() }
+            switch slot {
+            case .exact: exactValues = values; exactResult = result
+            case .extrema: extremaValues = values; extremaResult = result
+            }
+        }
+
+        enum Slot { case exact, extrema }
     }
     let cache = Cache()
 

@@ -824,9 +824,9 @@ public final class StreamGroupByOperator: StreamOperator {
             let col = try column(a, batch)
             let dbl = try toDouble(col)
             let sq = try dbl.multiply(dbl)
-            return (try gk.trim(.float64(try gb.sumDouble(dbl))),
+            return (try gk.trim(.float64(try gb.sumDoubleOrdered(dbl))),
                     try gk.trim(.int64(try countValid(col, gb))),
-                    try gk.trim(.float64(try gb.sumDouble(sq))))
+                    try gk.trim(.float64(try gb.sumDoubleOrdered(sq))))
         case .countDistinctApprox:
             throw ArrowMetalError.unsupportedType("count_distinct_approx is a whole-dataset aggregate, not a group-by one")
         }
@@ -1536,7 +1536,10 @@ func groupSum(_ col: AnyMetalArray, _ gb: GroupBy<Int32>) throws -> AnyMetalArra
     case .uint32(let a): return .int64(try gb.sum(a))
     case .uint64(let a): return .uint64(try gb.sumUnsigned(a))
     case .float32(let a): return .float64(try gb.sumFloatAsDouble(a))
-    case .float64(let a): return .float64(try gb.sumDouble(a))
+    // The ordered segmented sum, not the correctly rounded one: the streaming group-by's paths (the
+    // per-batch reduction, the resident one-thread-per-group kernel, the host table) all add in this
+    // one fixed order, so their results agree bit for bit.
+    case .float64(let a): return .float64(try gb.sumDoubleOrdered(a))
     case .temporal(let t): return .int64(try gb.sum(try t.int64Values()))
     default: throw ArrowMetalError.unsupportedType("streaming group sum over \(col.arrowFormat)")
     }

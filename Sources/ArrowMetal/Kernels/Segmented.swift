@@ -74,14 +74,27 @@ extension GroupBy {
 
     // MARK: - Public aggregates
 
-    /// Sum of the non-null Float64 values of each key, through the software binary64 adder on the GPU.
-    /// Keys with no valid value are null.
+    /// Sum of the non-null Float64 values of each key, **correctly rounded** (the binary64 value nearest
+    /// the exact sum, ties to even), from two passes over the rows in row order (`exactSumMean`); no
+    /// group order is built, so `segments` is accepted and not needed. Keys with no valid value are null.
     public func sumDouble(_ values: MetalArray<Double>, segments s: GroupSegments? = nil) throws -> MetalArray<Double> {
+        try exactSumMean(values).sum
+    }
+
+    /// Mean of the non-null Float64 values of each key: the exact sum divided by the count, rounded once
+    /// (correctly rounded). Shares its passes with a `sumDouble` of the same column.
+    public func meanDouble(_ values: MetalArray<Double>, segments s: GroupSegments? = nil) throws -> MetalArray<Double> {
+        try exactSumMean(values).mean
+    }
+
+    /// The segmented sum the correctly rounded one replaced: each group in a fixed tree order over its
+    /// run of the group order. Kept for differential testing.
+    func sumDoubleOrdered(_ values: MetalArray<Double>, segments s: GroupSegments? = nil) throws -> MetalArray<Double> {
         try reduceToDouble(values, op: SegmentedSource.sumDouble(), segments: s)
     }
 
-    /// Mean of the non-null Float64 values of each key (GPU sum, GPU division).
-    public func meanDouble(_ values: MetalArray<Double>, segments s: GroupSegments? = nil) throws -> MetalArray<Double> {
+    /// The segmented mean the correctly rounded one replaced. Kept for differential testing.
+    func meanDoubleOrdered(_ values: MetalArray<Double>, segments s: GroupSegments? = nil) throws -> MetalArray<Double> {
         try reduceToDouble(values, op: SegmentedSource.meanDouble(), segments: s)
     }
 
