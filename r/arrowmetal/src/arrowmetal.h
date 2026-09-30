@@ -33,6 +33,14 @@ int  am_import_device(const struct ArrowSchema* schema, struct ArrowDeviceArray*
 // type is taken, 0 otherwise.
 int  am_import_chunks(const struct ArrowSchema* schema, struct ArrowArray* arrays, int64_t n, am_array** out);
 int  am_import_chunks_supported(const struct ArrowSchema* schema);
+// CPU threads of the chunked import (and of a view array with more than 64 data buffers). 0, the
+// default, is the measured policy: the copies (values, string bytes, offsets, bitmaps) use one thread
+// when the import writes under 4 MiB, two under 320 MiB and four from 320 MiB; the utf8_view /
+// binary_view view pass uses one thread per 2 MiB of views, at most eight. n >= 1 is at most n threads for every
+// step; 1 keeps the import on the calling thread. The setting is process-wide and starts from the
+// environment variable ARROWMETAL_IMPORT_THREADS. am_set_import_threads returns 2 for a negative n.
+int  am_set_import_threads(int n);
+int  am_get_import_threads(void);
 int  am_export(am_array* a, struct ArrowSchema* schema, struct ArrowArray* array);
 int  am_export_device(am_array* a, struct ArrowSchema* schema, struct ArrowDeviceArray* array);
 void am_release(am_array* a);

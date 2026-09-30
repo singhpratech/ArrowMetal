@@ -65,6 +65,15 @@ public func am_import_chunks_supported(_ schema: UnsafePointer<ArrowSchema>?) ->
     guard let schema else { return 0 }
     return chunkedImportSupported(schema: schema) ? 1 : 0
 }
+/// Copy threads of the chunked import: 0 is the measured policy, n >= 1 at most n threads.
+@_cdecl("am_set_import_threads")
+public func am_set_import_threads(_ n: Int32) -> Int32 {
+    guard n >= 0 else { return 2 }
+    ImportThreads.limit = Int(n)
+    return 0
+}
+@_cdecl("am_get_import_threads")
+public func am_get_import_threads() -> Int32 { Int32(clamping: ImportThreads.limit) }
 @_cdecl("am_export")
 public func am_export(_ a: OpaquePointer?, _ schema: UnsafeMutablePointer<ArrowSchema>?, _ array: UnsafeMutablePointer<ArrowArray>?) -> Int32 {
     guard let x = handle(a), let array else { return 2 }

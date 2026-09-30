@@ -1,14 +1,16 @@
 import Foundation
 import Metal
 import CArrowABI
+import CArrowMetalCopy
 
 // Chunked import: several Arrow arrays of one type (a pyarrow / Polars ChunkedArray, a column of
 // arrow-rs RecordBatches) taken as one ArrowMetal array of their total length.
 //
 // Each chunk's buffers are written straight into the final buffers (shared, page-aligned
-// `MetalArrowBuffer`s), on the CPU cores in parallel; there is no intermediate concatenated copy.
-// The work is split by output position, not by chunk, so a column of 10,000 small chunks and a
-// column of 16 large ones both spread over every core, and no two threads write the same byte:
+// `MetalArrowBuffer`s); there is no intermediate concatenated copy. The work is split by output
+// position, not by chunk, into pieces the copy threads take one after another (`parallelSum`), so a
+// column of 10,000 small chunks and a column of 16 large ones spread alike, and no two threads write
+// the same byte. How many threads is `ImportThreads`' measured policy (one below 4 MiB):
 //
 // * fixed-width values: one `memcpy` per chunk piece, from the chunk's Arrow offset.
 // * bitmaps (validity, and boolean values): assembled 64 output bits at a time from each chunk's
@@ -20,11 +22,13 @@ import CArrowABI
 //   totals 2 GB or more is refused, as the single-array import refuses a large_utf8 array that
 //   size: every string kernel reads int32 offsets.
 // * utf8_view / binary_view: the views are copied with each out-of-line view's buffer index and
-//   offset rewritten to the merged data buffers; inline views are copied as they are. Data buffers
-//   shared between chunks (the chunks of one sliced array) are taken once. A column with up to
-//   `maxWrappedViewBuffers` distinct data buffers maps them without a copy where the single-array
-//   import would; with more, they are copied back to back into data buffers of under 2 GB each. The
-//   byte total of the non-null strings is summed on the CPU during the view pass.
+//   offset rewritten to the merged data buffers; inline views are copied as they are. The pass is
+//   branch-free C with NEON (`am_rewrite_views`, CArrowMetalCopy), four views per step, checking
+//   every out-of-line view as it goes; a block with a view that fails the check is redone view by
+//   view. Data buffers shared between chunks (the chunks of one sliced array) are taken once. A
+//   column with up to `maxWrappedViewBuffers` distinct data buffers maps them without a copy where
+//   the single-array import would; with more, they are copied back to back into data buffers of
+//   under 2 GB each. The byte total of the non-null strings is summed in the view pass.
 //
 // Dictionary, nested, run-end encoded, list-view and extension arrays are not taken
 // (`chunkedImportSupported` is false and nothing is read or moved); the caller concatenates those
@@ -32,6 +36,10 @@ import CArrowABI
 
 /// Most distinct view data buffers a chunked import maps without a copy; with more, they are copied.
 let maxWrappedViewBuffers = 64
+
+/// Largest merged data buffer the view copy path fills (a view offset is int32). Tests lower it to
+/// spread a small column over several merged buffers.
+nonisolated(unsafe) var viewPackLimit = Int(Int32.max)
 
 /// What a chunked import builds for one Arrow type.
 private enum ChunkLayout {
@@ -218,21 +226,23 @@ public func importArrowChunks(schema: UnsafePointer<ArrowSchema>, arrays: [Unsaf
         let (valueBytes, overflow) = total.multipliedReportingOverflow(by: width)
         guard !overflow else { throw ArrowMetalError.invalidArrowArray("chunk lengths overflow") }
         let values = try MetalArrowBuffer.allocate(byteCount: Swift.max(valueBytes, 1), zeroed: false, context: context)
+        let threads = ImportThreads.forStep(bytes: valueBytes + validityBytes(refs, total))
         if width > 0 {
             let dst = values.mutableContents
-            parallelCopy(refs.map { c in
+            parallelCopy(threads: threads, refs.map { c in
                 CopySegment(src: c.buffer(1)!.advanced(by: c.offset * width), dst: dst.advanced(by: c.rowStart * width),
                             count: c.length * width)
             })
         }
-        let (validity, nulls) = try mergedValidity(refs, total: total, context: context)
+        let (validity, nulls) = try mergedValidity(refs, total: total, threads: threads, context: context)
         result = try make(total, validity, values, nulls, context)
     case .boolean:
         let values = try allocateBitmap(bits: total, context: context)
-        _ = mergeBits(into: values, bits: total, parts: refs.map {
+        let threads = ImportThreads.forStep(bytes: values.byteCount + validityBytes(refs, total))
+        _ = mergeBits(into: values, bits: total, threads: threads, parts: refs.map {
             BitPart(bits: $0.buffer(1)!.assumingMemoryBound(to: UInt8.self), bitOffset: $0.offset, rowStart: $0.rowStart, length: $0.length)
         })
-        let (validity, nulls) = try mergedValidity(refs, total: total, context: context)
+        let (validity, nulls) = try mergedValidity(refs, total: total, threads: threads, context: context)
         result = .boolean(MetalBooleanArray(length: total, nullCount: nulls, validity: validity, values: values, context: context))
     case .offsets(let large, let binary):
         let s = try mergeOffsetStrings(refs, total: total, large: large, context: context)
@@ -284,26 +294,110 @@ private func releaseChunk(_ p: UnsafeMutablePointer<ArrowArray>) {
 
 // MARK: - Parallel pieces
 
-private let chunkWorkers = Swift.max(1, Int(ProcessInfo.processInfo.environment["ARROWMETAL_IMPORT_THREADS"] ?? "")
-                                        ?? ProcessInfo.processInfo.activeProcessorCount)
+/// The number of CPU threads the chunked import copies on.
+///
+/// Unless `limit` is set, the import's copy steps (the values, the string bytes and offsets, the
+/// bitmaps, the view data buffers) take their thread count from the bytes the import writes, and the
+/// utf8_view / binary_view view pass from the bytes of views it writes, by the measured policy
+/// `automatic(bytes:step:)`. A limit of n >= 1 runs every step on at most n threads, and 1 keeps the
+/// whole import on the calling thread. The limit starts from the environment variable
+/// `ARROWMETAL_IMPORT_THREADS` and is set with `limit` (C: `am_set_import_threads`).
+///
+/// The policy is the thread count that comes within 10% of the fastest count whose CPU time is at
+/// most 1.5x the one-thread import's (or at most 2x where it halves the wall time), measured with
+/// `Benchmarks/chunked_import_bench.py --threads` from 100,000 to 50,000,000 rows (docs/DESIGN.md,
+/// "Chunked columns and the import"):
+///
+/// * copy steps: one thread below 4 MiB, two below 320 MiB, four from 320 MiB. A memory copy stops
+///   gaining wall time at about four threads, and on columns under 320 MiB a third and fourth thread
+///   add more CPU time than they save wall time.
+/// * the view pass: one thread per 2 MiB of views, at most eight. It is bound by its arithmetic (four
+///   views per NEON step), so up to about six threads divide its wall time at almost no CPU cost.
+public enum ImportThreads {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var current: Int =
+        Swift.max(0, Int(ProcessInfo.processInfo.environment["ARROWMETAL_IMPORT_THREADS"] ?? "") ?? 0)
 
-/// Splits `[0, n)` into at most one shard per core, each at least `grain` long, runs `body(lo, hi)`
-/// on them concurrently and returns the sum of what the shards return.
-private func parallelSum(_ n: Int, grain: Int, _ body: (Int, Int) -> Int) -> Int {
+    /// 0: the measured policy; n >= 1: at most n threads. A negative value is taken as 0.
+    public static var limit: Int {
+        get { lock.lock(); defer { lock.unlock() }; return current }
+        set { lock.lock(); current = Swift.max(0, newValue); lock.unlock() }
+    }
+
+    /// The performance cores (`hw.perflevel0.physicalcpu`), or every active core where that is not
+    /// reported: the measured policy never uses more.
+    public static let performanceCores: Int = {
+        var v: Int32 = 0
+        var n = MemoryLayout<Int32>.size
+        if sysctlbyname("hw.perflevel0.physicalcpu", &v, &n, nil, 0) == 0, v > 0 { return Int(v) }
+        return Swift.max(1, ProcessInfo.processInfo.activeProcessorCount)
+    }()
+
+    /// The kinds of import step the policy tells apart.
+    public enum Step: Sendable {
+        /// Bytes moved as they are, or with a constant added (values, string bytes, offsets, bitmaps).
+        case copy
+        /// The utf8_view / binary_view view pass.
+        case views
+    }
+
+    /// The measured policy's thread count: `bytes` is what the import writes for a copy step, and the
+    /// bytes of views for the view pass.
+    public static func automatic(bytes: Int, step: Step) -> Int {
+        let t: Int
+        switch step {
+        case .copy: t = bytes < 4 << 20 ? 1 : bytes < 320 << 20 ? 2 : 4
+        case .views: t = Swift.min(8, bytes / (2 << 20))
+        }
+        return Swift.max(1, Swift.min(t, performanceCores))
+    }
+
+    /// Threads for a step that writes `bytes` bytes, under the limit in force.
+    static func forStep(bytes: Int, _ step: Step = .copy) -> Int {
+        let l = limit
+        return l > 0 ? l : automatic(bytes: bytes, step: step)
+    }
+}
+
+/// Runs `body(lo, hi)` over pieces of `[0, n)`, each at least `grain` long, on at most `threads`
+/// threads, and returns the sum of what the pieces return. There are up to eight pieces per thread,
+/// and each thread takes the next piece when it finishes one, so a thread that runs slower (an
+/// efficiency core, a preempted one) takes fewer pieces instead of holding up the others.
+private func parallelSum(_ n: Int, grain: Int, threads: Int, _ body: (Int, Int) -> Int) -> Int {
     guard n > 0 else { return 0 }
-    let shards = Swift.max(1, Swift.min(chunkWorkers, (n + grain - 1) / grain))
-    if shards == 1 { return body(0, n) }
-    let step = (n + shards - 1) / shards
-    let partial = UnsafeMutablePointer<Int>.allocate(capacity: shards)
-    partial.initialize(repeating: 0, count: shards)
+    let fit = (n + grain - 1) / grain
+    let workers = Swift.max(1, Swift.min(threads, fit))
+    if workers == 1 { return body(0, n) }
+    let pieces = Swift.min(fit, workers * 8)
+    let step = (n + pieces - 1) / pieces
+    let next = PieceCounter()
+    let partial = UnsafeMutablePointer<Int>.allocate(capacity: workers)
+    partial.initialize(repeating: 0, count: workers)
     defer { partial.deallocate() }
-    DispatchQueue.concurrentPerform(iterations: shards) { s in
-        let lo = s * step, hi = Swift.min(lo + step, n)
-        if lo < hi { partial[s] = body(lo, hi) }
+    DispatchQueue.concurrentPerform(iterations: workers) { w in
+        var acc = 0
+        while true {
+            let p = next.take()
+            let lo = p * step
+            guard p < pieces, lo < n else { break }
+            acc += body(lo, Swift.min(lo + step, n))
+        }
+        partial[w] = acc
     }
     var sum = 0
-    for s in 0..<shards { sum += partial[s] }
+    for w in 0..<workers { sum += partial[w] }
     return sum
+}
+
+/// The next piece index of a `parallelSum`, handed out once each.
+private final class PieceCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    func take() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        value += 1
+        return value - 1
+    }
 }
 
 /// Index of the last entry of `starts` (ascending) that is `<= x`.
@@ -322,9 +416,9 @@ struct CopySegment {
     let count: Int
 }
 
-/// Copies every segment, split by output byte across the cores (a large segment is shared by
-/// several threads, many small ones go to one).
-private func parallelCopy(_ segments: [CopySegment]) {
+/// Copies every segment on up to `threads` threads, split by output byte (a large segment is shared
+/// by several threads, many small ones go to one).
+private func parallelCopy(threads: Int, _ segments: [CopySegment]) {
     let segs = segments.filter { $0.count > 0 }
     guard !segs.isEmpty else { return }
     var starts = [Int](repeating: 0, count: segs.count)
@@ -332,7 +426,7 @@ private func parallelCopy(_ segments: [CopySegment]) {
     for (i, s) in segs.enumerated() { starts[i] = total; total += s.count }
     starts.withUnsafeBufferPointer { st in
         segs.withUnsafeBufferPointer { sg in
-            _ = parallelSum(total, grain: 1 << 20) { lo, hi in
+            _ = parallelSum(total, grain: 1 << 20, threads: threads) { lo, hi in
                 var k = lastStart(st, atMost: lo)
                 var pos = lo
                 while pos < hi {
@@ -371,14 +465,14 @@ private func allocateBitmap(bits: Int, context: MetalContext) throws -> MetalArr
 
 /// Assembles `parts` (ascending, back to back from row 0) into `dst`, 64 output bits per step, and
 /// returns the number of set bits.
-private func mergeBits(into dst: MetalArrowBuffer, bits total: Int, parts: [BitPart]) -> Int {
+private func mergeBits(into dst: MetalArrowBuffer, bits total: Int, threads: Int, parts: [BitPart]) -> Int {
     guard total > 0, !parts.isEmpty else { return 0 }
     let out = dst.mutableContents.assumingMemoryBound(to: UInt64.self)
     let words = (total + 63) / 64
     let starts = parts.map(\.rowStart)
     return starts.withUnsafeBufferPointer { st in
         parts.withUnsafeBufferPointer { pp in
-            parallelSum(words, grain: 1 << 13) { w0, w1 in
+            parallelSum(words, grain: 1 << 13, threads: threads) { w0, w1 in
                 let end = Swift.min(w1 * 64, total)
                 var pos = w0 * 64
                 var k = lastStart(st, atMost: pos)
@@ -410,11 +504,16 @@ private func mergeBits(into dst: MetalArrowBuffer, bits total: Int, parts: [BitP
     }
 }
 
+/// Bytes of the merged validity bitmap, 0 when no chunk can hold a null.
+private func validityBytes(_ refs: [ChunkRef], _ total: Int) -> Int {
+    refs.contains(where: { $0.validity != nil }) ? Bitmap.byteCount(bits: total) : 0
+}
+
 /// The merged validity bitmap and null count; nil and 0 when no chunk can hold a null.
-private func mergedValidity(_ refs: [ChunkRef], total: Int, context: MetalContext) throws -> (MetalArrowBuffer?, Int) {
+private func mergedValidity(_ refs: [ChunkRef], total: Int, threads: Int, context: MetalContext) throws -> (MetalArrowBuffer?, Int) {
     guard refs.contains(where: { $0.validity != nil }) else { return (nil, 0) }
     let buf = try allocateBitmap(bits: total, context: context)
-    let valid = mergeBits(into: buf, bits: total, parts: refs.map {
+    let valid = mergeBits(into: buf, bits: total, threads: threads, parts: refs.map {
         BitPart(bits: $0.validity, bitOffset: $0.offset, rowStart: $0.rowStart, length: $0.length)
     })
     return (buf, total - valid)
@@ -450,11 +549,12 @@ private func mergeOffsetStrings(_ refs: [ChunkRef], total: Int, large: Bool,
     }
     let offsets = try MetalArrowBuffer.allocate(byteCount: (total + 1) * 4, zeroed: false, context: context)
     let data = try MetalArrowBuffer.allocate(byteCount: Swift.max(bytes, 1), zeroed: false, context: context)
+    let threads = ImportThreads.forStep(bytes: (total + 1) * 4 + bytes + validityBytes(refs, total))
     let out = offsets.mutableTyped(Int32.self)
     let rowStarts = refs.map(\.rowStart)
     rowStarts.withUnsafeBufferPointer { rs in
         refs.withUnsafeBufferPointer { rf in
-            _ = parallelSum(total, grain: 1 << 16) { r0, r1 in
+            _ = parallelSum(total, grain: 1 << 16, threads: threads) { r0, r1 in
                 var k = lastStart(rs, atMost: r0)
                 var r = r0
                 while r < r1 {
@@ -480,12 +580,12 @@ private func mergeOffsetStrings(_ refs: [ChunkRef], total: Int, large: Bool,
     }
     out[total] = Int32(bytes)
     let dp = data.mutableContents
-    parallelCopy(refs.enumerated().compactMap { (k, c) in
+    parallelCopy(threads: threads, refs.enumerated().compactMap { (k, c) in
         guard let src = c.buffer(2) else { return nil }
         let e = k + 1 < refs.count ? bases[k + 1] : bytes
         return CopySegment(src: src + starts[k], dst: dp + bases[k], count: e - bases[k])
     })
-    let (validity, nulls) = try mergedValidity(refs, total: total, context: context)
+    let (validity, nulls) = try mergedValidity(refs, total: total, threads: threads, context: context)
     return MetalStringArray(length: total, nullCount: nulls, validity: validity, offsets: offsets, data: data, context: context)
 }
 
@@ -548,7 +648,7 @@ private func mergeViewStrings(_ refs: [ChunkRef], total: Int, binary: Bool, owne
         }
     } else {
         // Many buffers: packed back to back into merged buffers of under 2 GB (a view offset is int32).
-        let cap = Int(Int32.max)
+        let cap = viewPackLimit
         var groups: [[Int]] = [[]], fill = [0]
         for (d, b) in distinct.enumerated() {
             if fill[fill.count - 1] > 0, fill[fill.count - 1] + b.size > cap { groups.append([]); fill.append(0) }
@@ -566,25 +666,36 @@ private func mergeViewStrings(_ refs: [ChunkRef], total: Int, binary: Bool, owne
             dataBuffers.append(buf); dataSizes.append(fill[g])
         }
     }
-    parallelCopy(segments)
+    // The copy steps' threads follow the column's bytes written; the view pass has its own count.
+    let threads = ImportThreads.forStep(bytes: segments.reduce(0) { $0 + $1.count } + total * 16 + validityBytes(refs, total))
+    parallelCopy(threads: threads, segments)
 
     // 3. Validity first: the byte total counts the non-null rows only.
-    let (validity, nulls) = try mergedValidity(refs, total: total, context: context)
+    let (validity, nulls) = try mergedValidity(refs, total: total, threads: threads, context: context)
     let views = try MetalArrowBuffer.allocate(byteCount: Swift.max(total, 1) * 16, zeroed: false, context: context)
     copied += total * 16 + (validity.map { $0.byteCount } ?? 0)
 
-    // 4. The views: inline ones copied, out-of-line ones pointed at the merged buffers. A view whose
-    //    buffer index or byte range is out of bounds gets an index no buffer has, so it reads as the
-    //    empty string, as it does after the single-array import.
+    // 4. The views: inline ones copied as they are, out-of-line ones pointed at the merged buffers.
+    //    A view whose buffer index or byte range is out of bounds gets an index no buffer has, so it
+    //    reads as the empty string, as it does after the single-array import.
+    //
+    //    The views are rewritten in blocks of rows by `am_rewrite_views` (CArrowMetalCopy): four
+    //    views per NEON step, each out-of-line one given its merged buffer index and offset base from
+    //    its chunk's map and checked (length, offset, buffer index, byte range) in the same pass, with
+    //    no branch per view. A block with a view that fails the check is redone view by view
+    //    (`rewriteViewsExact`), which gives that view the out-of-bounds index; so is every block of a
+    //    chunk whose buffers are neither merged buffers d, d + 1, ... as they are nor copied into one
+    //    merged buffer.
     let chunkMap: [[(index: Int32, base: Int32, size: Int)]] = zip(chunkIds, chunkSizes).map { cid, csz in
         zip(cid, csz).map { id, size in id < 0 ? (Int32.max, 0, 0) : (placeIndex[id], placeBase[id], size) }
     }
-    let vbits = validity?.typed(UInt8.self)
+    let viewMaps = chunkMap.map { ViewChunkMap($0) }
+    let vwords = validity.map { UnsafePointer($0.mutableTyped(UInt64.self)) }
     let outViews = views.mutableContents
     let rowStarts = refs.map(\.rowStart)
     let logical = rowStarts.withUnsafeBufferPointer { rs in
         refs.withUnsafeBufferPointer { rf in
-            parallelSum(total, grain: 1 << 15) { r0, r1 in
+            parallelSum(total, grain: 1 << 15, threads: ImportThreads.forStep(bytes: total * 16, .views)) { r0, r1 in
                 var k = lastStart(rs, atMost: r0)
                 var r = r0
                 var acc = 0
@@ -595,31 +706,22 @@ private func mergeViewStrings(_ refs: [ChunkRef], total: Int, binary: Bool, owne
                     let src = c.buffer(1)! + (c.offset + (r - c.rowStart)) * 16
                     let dst = outViews + r * 16
                     chunkMap[k].withUnsafeBufferPointer { map in
-                        for j in 0..<n {
-                            let s = src + j * 16, d = dst + j * 16
-                            let lo = s.loadUnaligned(as: UInt64.self)
-                            let hi = s.loadUnaligned(fromByteOffset: 8, as: UInt64.self)
-                            let len = UInt32(truncatingIfNeeded: lo)
-                            let valid = vbits.map { Bitmap.isSet($0, r + j) } ?? true
-                            d.storeBytes(of: lo, as: UInt64.self)
-                            if len <= 12 {
-                                d.storeBytes(of: hi, toByteOffset: 8, as: UInt64.self)
-                                if valid { acc += Int(len) }
-                                continue
-                            }
-                            let idx = Int32(truncatingIfNeeded: hi)
-                            let off = Int32(truncatingIfNeeded: hi >> 32)
-                            if idx >= 0, Int(idx) < map.count, off >= 0 {
-                                let m = map[Int(idx)]
-                                if m.index != Int32.max, Int(off) + Int(len) <= m.size {
-                                    d.storeBytes(of: m.index, toByteOffset: 8, as: Int32.self)
-                                    d.storeBytes(of: m.base &+ off, toByteOffset: 12, as: Int32.self)
-                                    if valid { acc += Int(len) }
-                                    continue
+                        let vm = viewMaps[k]
+                        vm.targets.withUnsafeBufferPointer { t in
+                            var cmap = am_view_map(index_keep: vm.keepIndex ? 1 : 0, index_add: vm.indexAdd,
+                                                   count: UInt32(t.count), pad: 0, targets: t.baseAddress)
+                            var b = 0
+                            while b < n {
+                                let m = Swift.min(viewBlockRows, n - b)
+                                let s = src + b * 16, d = dst + b * 16
+                                let bytes = vm.fast && !viewRewriteExactOnly ? am_rewrite_views(s, d, m, &cmap, vwords, r + b) : -1
+                                if bytes >= 0 {
+                                    acc += Int(bytes)
+                                } else {
+                                    acc += rewriteViewsExact(s, d, rows: m, firstRow: r + b, map: map, validity: vwords)
                                 }
+                                b += m
                             }
-                            d.storeBytes(of: Int32.max, toByteOffset: 8, as: Int32.self)
-                            d.storeBytes(of: off, toByteOffset: 12, as: Int32.self)
                         }
                     }
                     r += n
@@ -637,4 +739,77 @@ private func mergeViewStrings(_ refs: [ChunkRef], total: Int, binary: Bool, owne
     let s = MetalStringArray(length: total, nullCount: nulls, validity: validity, view: storage, context: context)
     s.isBinary = binary
     return (s, wrapped)
+}
+
+/// Rows per block of the branch-free view rewrite: a block with a view that fails the check is
+/// redone view by view, so one malformed view costs one block, not its chunk.
+private let viewBlockRows = 2048
+
+/// Tests set this to run every view through `rewriteViewsExact`, the reference the NEON pass is
+/// compared with.
+nonisolated(unsafe) var viewRewriteExactOnly = false
+
+/// A chunk's map for `am_rewrite_views`: per data buffer its base and size, and how its views'
+/// buffer index changes.
+private struct ViewChunkMap {
+    /// Whether the chunk's buffers are merged buffers `indexAdd + j` as they are (`keepIndex`), or
+    /// were all copied into merged buffer `indexAdd`; false for any other placement.
+    let fast: Bool
+    let keepIndex: Bool
+    let indexAdd: UInt32
+    let targets: [am_view_target]
+
+    init(_ map: [(index: Int32, base: Int32, size: Int)]) {
+        targets = map.map { am_view_target(base: UInt32(bitPattern: $0.base), size: $0.index == Int32.max ? 0 : UInt32(clamping: $0.size)) }
+        let present = map.enumerated().filter { $0.element.index != Int32.max }
+        guard let first = present.first else {
+            // No buffer (or none present): every out-of-line view fails the check.
+            fast = map.count < Int(UInt32.max); keepIndex = false; indexAdd = 0; return
+        }
+        let d = first.element.index &- Int32(first.offset)
+        if d >= 0, present.allSatisfy({ $0.element.index == d &+ Int32($0.offset) }) {
+            fast = true; keepIndex = true; indexAdd = UInt32(d)
+        } else if present.allSatisfy({ $0.element.index == first.element.index }) {
+            fast = true; keepIndex = false; indexAdd = UInt32(first.element.index)
+        } else {
+            fast = false; keepIndex = false; indexAdd = 0
+        }
+    }
+}
+
+/// The view-by-view rewrite through `map` (merged index, base and size per chunk buffer): the exact
+/// rule for every view, with an out-of-bounds view given index `Int32.max`. Returns the byte total of
+/// the valid rows' in-bounds views.
+private func rewriteViewsExact(_ src: UnsafeRawPointer, _ dst: UnsafeMutableRawPointer, rows n: Int, firstRow r: Int,
+                               map: UnsafeBufferPointer<(index: Int32, base: Int32, size: Int)>,
+                               validity: UnsafePointer<UInt64>?) -> Int {
+    var acc = 0
+    for j in 0..<n {
+        let s = src + j * 16, d = dst + j * 16
+        let lo = s.loadUnaligned(as: UInt64.self)
+        let hi = s.loadUnaligned(fromByteOffset: 8, as: UInt64.self)
+        let len = UInt32(truncatingIfNeeded: lo)
+        let row = r + j
+        let valid = validity.map { ($0[row >> 6] >> UInt64(row & 63)) & 1 == 1 } ?? true
+        d.storeBytes(of: lo, as: UInt64.self)
+        if len <= 12 {
+            d.storeBytes(of: hi, toByteOffset: 8, as: UInt64.self)
+            if valid { acc += Int(len) }
+            continue
+        }
+        let idx = Int32(truncatingIfNeeded: hi)
+        let off = Int32(truncatingIfNeeded: hi >> 32)
+        if idx >= 0, Int(idx) < map.count, off >= 0 {
+            let m = map[Int(idx)]
+            if m.index != Int32.max, Int(off) + Int(len) <= m.size {
+                d.storeBytes(of: m.index, toByteOffset: 8, as: Int32.self)
+                d.storeBytes(of: m.base &+ off, toByteOffset: 12, as: Int32.self)
+                if valid { acc += Int(len) }
+                continue
+            }
+        }
+        d.storeBytes(of: Int32.max, toByteOffset: 8, as: Int32.self)
+        d.storeBytes(of: off, toByteOffset: 12, as: Int32.self)
+    }
+    return acc
 }

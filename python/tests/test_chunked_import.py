@@ -131,6 +131,51 @@ def test_one_chunk_is_the_single_import(counted):
     assert m.to_arrow().equals(a)
 
 
+def test_import_threads_setting():
+    saved = am.get_import_threads()
+    try:
+        am.set_import_threads(3)
+        assert am.get_import_threads() == 3
+        am.set_import_threads(0)
+        assert am.get_import_threads() == 0
+        with pytest.raises(ValueError):
+            am.set_import_threads(-1)
+    finally:
+        am.set_import_threads(saved)
+
+
+@pytest.mark.parametrize("ty", ["int64", "bool", "utf8", "utf8_view", "utf8_view_many"])
+def test_thread_counts_give_the_same_array(ty):
+    """One thread, several and the default policy import the same column (1.2M rows, so every
+    copy step splits over the threads it is given). utf8_view_many has more data buffers than are
+    wrapped, so they are copied into merged buffers."""
+    rng = np.random.default_rng(17)
+    words = pa.array([f"a-longer-string-{k:05d}" if k % 3 else f"s{k}" for k in range(5000)], pa.string())
+    chunks = []
+    for n in (rng.integers(1, 30_000, 80) if ty == "utf8_view_many" else rng.integers(1, 60_000, 40)):
+        idx = pa.array(rng.integers(0, 5000, int(n)), mask=rng.random(int(n)) < 0.1)
+        if ty == "int64":
+            chunks.append(pa.array(rng.integers(-(1 << 62), 1 << 62, int(n)), mask=rng.random(int(n)) < 0.1))
+        elif ty == "bool":
+            chunks.append(pa.array(rng.random(int(n)) < 0.5, mask=rng.random(int(n)) < 0.1))
+        else:
+            s = pc.take(words, idx)
+            chunks.append(s.cast(pa.string_view()) if ty.startswith("utf8_view") else s)
+    ca = pa.chunked_array(chunks)
+    saved = am.get_import_threads()
+    try:
+        results = []
+        for t in [1, 2, 5, 16, 0]:
+            am.set_import_threads(t)
+            results.append(am.array(ca).to_arrow())
+    finally:
+        am.set_import_threads(saved)
+    flat = ca.combine_chunks()
+    for r in results:
+        assert r.equals(results[0])
+    assert results[0].to_pylist() == flat.to_pylist()
+
+
 def test_slices_of_one_view_array_share_data_buffers():
     rng = random.Random(5)
     base = _array("utf8_view", 5000, rng, 7)

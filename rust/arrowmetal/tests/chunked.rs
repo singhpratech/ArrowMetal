@@ -120,6 +120,31 @@ fn ten_thousand_chunks() {
     }
 }
 
+/// One copy thread, several and the default policy import the same column. The setting is
+/// process-wide, so the other tests may run under any of these counts; their results do not change.
+#[test]
+fn thread_counts_give_the_same_array() {
+    let saved = arrowmetal::import_threads();
+    let mut r = common::rng(5);
+    let sizes: Vec<usize> = (0..90).map(|_| r.random_range(1..25_000)).collect();
+    for ty in ["int64", "bool", "utf8", "utf8_view"] {
+        let parts = chunks(ty, &sizes, 3);
+        let refs: Vec<&dyn arrow::array::Array> = parts.iter().map(|a| a.as_ref()).collect();
+        let mut first = None;
+        for t in [1, 2, 5, 16, 0] {
+            arrowmetal::set_import_threads(t);
+            assert_eq!(arrowmetal::import_threads(), t);
+            let got = Array::from_arrow_chunks(&refs).unwrap().to_arrow().unwrap().to_data();
+            match &first {
+                None => first = Some(got),
+                Some(f) => assert_eq!(&got, f, "{ty}: {t} threads against one"),
+            }
+        }
+        check(ty, &parts, "90 chunks");
+    }
+    arrowmetal::set_import_threads(saved);
+}
+
 #[test]
 fn nested_types_fall_back_to_concat() {
     let a: ArrayRef = Arc::new(arrow::array::ListArray::from_iter_primitive::<arrow::datatypes::Int64Type, _, _>(vec![

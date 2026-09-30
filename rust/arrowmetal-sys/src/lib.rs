@@ -164,6 +164,11 @@ pub mod ffi {
         ) -> c_int;
         /// 1 when `am_import_chunks` takes arrays of this schema's type, 0 otherwise.
         pub fn am_import_chunks_supported(schema: *const ArrowSchema) -> c_int;
+        /// Sets the chunked import's copy threads: 0 the measured policy, n >= 1 at most n.
+        /// Returns 2 for a negative `n`.
+        pub fn am_set_import_threads(n: c_int) -> c_int;
+        /// The chunked import's thread setting (0: the measured policy).
+        pub fn am_get_import_threads() -> c_int;
         pub fn am_export(
             a: *mut am_array,
             schema: *mut ArrowSchema,

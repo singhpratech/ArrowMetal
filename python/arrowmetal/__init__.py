@@ -100,6 +100,10 @@ _lib.am_import_chunks.argtypes = [_P, _P, ctypes.c_int64, ctypes.POINTER(_P)]
 _lib.am_import_chunks.restype = ctypes.c_int
 _lib.am_import_chunks_supported.argtypes = [_P]
 _lib.am_import_chunks_supported.restype = ctypes.c_int
+_lib.am_set_import_threads.argtypes = [ctypes.c_int]
+_lib.am_set_import_threads.restype = ctypes.c_int
+_lib.am_get_import_threads.argtypes = []
+_lib.am_get_import_threads.restype = ctypes.c_int
 _lib.am_export.argtypes = [_P, _P, _P]
 _lib.am_reduce.argtypes = [_P, ctypes.c_int, ctypes.POINTER(ctypes.c_int64), ctypes.POINTER(ctypes.c_double),
                            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
@@ -815,6 +819,21 @@ def _import_chunks(chunks):
     finally:
         if schema.release:
             schema.release(ctypes.byref(schema))
+
+
+def set_import_threads(n):
+    """Sets the CPU threads the chunked import copies on, process-wide: 0 is the measured policy
+    (the default), n >= 1 at most n threads, 1 keeps the import on the calling thread. The setting
+    starts from the environment variable ``ARROWMETAL_IMPORT_THREADS``."""
+    n = int(n)
+    if n < 0:
+        raise ValueError(f"import threads must be 0 (automatic) or more, got {n}")
+    _check(_lib.am_set_import_threads(n))
+
+
+def get_import_threads():
+    """The chunked import's thread setting: 0 for the measured policy, else the most threads it uses."""
+    return _lib.am_get_import_threads()
 
 
 def array(obj):
