@@ -3,8 +3,9 @@
 A physical optimizer rule for [Apache DataFusion](https://datafusion.apache.org) 55.1 that runs full
 `ORDER BY` sorts on Apple silicon GPUs through ArrowMetal, with DataFusion's answers. The default
 also takes the aggregate shapes a measured table takes (`count(*)` over two int32 keys of a
-`MemTable` of at least 50,000,000 rows): such an aggregate estimates its number of groups when it
-runs and runs on the GPU or hands the node back to DataFusion's own operators.
+`MemTable` of at least 10,000,000 rows, `DISTINCT` over two int32 keys of one of at least
+50,000,000 rows): such an aggregate estimates its number of groups
+when it runs and runs on the GPU or hands the node back to DataFusion's own operators.
 
 User documentation — registering the rule, what the default takes and leaves, the semantics matched,
 the differential grid, the measured numbers and the limits — is in

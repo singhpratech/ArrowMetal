@@ -372,21 +372,24 @@ async fn forced_hand_back_gives_datafusions_answer() {
 }
 
 /// The default choice decides at run time from the probe's estimate. With the table looked up at
-/// 50,000,000 rows (`table_rows`): `count(*)` over two int32 keys runs on ArrowMetal at the
-/// 1,000,000-group bucket and is handed back at 200 groups; the report carries the estimate, and
-/// the answer is DataFusion's either way. With 8,192-row batches the decision comes from the first
-/// batches of each partition (a prefix).
+/// 10,000,000 and 50,000,000 rows (`table_rows`, the smallest and the largest size at which the
+/// table takes the shape): `count(*)` over two int32 keys runs on ArrowMetal at the 1,000,000-group
+/// bucket and is handed back at 200 groups; the report carries the estimate, and the answer is
+/// DataFusion's either way. With 8,192-row batches the decision comes from the first batches of
+/// each partition (a prefix).
 #[tokio::test(flavor = "multi_thread")]
 async fn measured_choice_records_the_estimate_and_matches() {
     let sql = "SELECT k1, k2, count(*) AS n FROM g GROUP BY k1, k2";
-    // (keys drawn from this many values, rows, rows per batch, runs on ArrowMetal)
-    for (groups, n, batch, gpu) in [
-        (150i64, 40_000usize, usize::MAX, false),
-        (1_000_000, 800_000, usize::MAX, true),
-        (150, 600_000, 8192, false),
-        (1_000_000, 800_000, 8192, true),
+    // (table_rows, keys drawn from this many values, rows, rows per batch, runs on ArrowMetal)
+    for (at, groups, n, batch, gpu) in [
+        (10_000_000, 150i64, 40_000usize, usize::MAX, false),
+        (10_000_000, 1_000_000, 800_000, usize::MAX, true),
+        (10_000_000, 150, 600_000, 8192, false),
+        (10_000_000, 1_000_000, 800_000, 8192, true),
+        (50_000_000, 150, 40_000, usize::MAX, false),
+        (50_000_000, 1_000_000, 800_000, 8192, true),
     ] {
-        let rule = ArrowMetalRule::new(ArrowMetalConfig::default().with_min_rows(0).with_table_rows(Some(50_000_000)));
+        let rule = ArrowMetalRule::new(ArrowMetalConfig::default().with_min_rows(0).with_table_rows(Some(at)));
         let ctx = grouped_ctx_batches(Some(&rule), n, groups, 3, batch).await;
         let got = sorted_text(&ctx, sql).await;
         let want = sorted_text(&grouped_ctx_batches(None, n, groups, 3, batch).await, sql).await;
@@ -394,11 +397,11 @@ async fn measured_choice_records_the_estimate_and_matches() {
         let r = rule.report();
         assert_eq!(r.runtime_fallbacks().count(), 0, "{r}");
         let choices: Vec<_> = r.runtime_choices().collect();
-        assert!(!choices.is_empty(), "groups={groups} rows={n}: no run-time choice\n{r}");
+        assert!(!choices.is_empty(), "at={at} groups={groups} rows={n}: no run-time choice\n{r}");
         for d in choices {
             assert!(d.groups.as_ref().unwrap().estimate.is_some(), "{d}");
             assert!(d.reason.contains("estimated") || d.reason.contains("counted"), "{d}");
-            assert_eq!(d.taken, gpu, "groups={groups} rows={n}: {d}");
+            assert_eq!(d.taken, gpu, "at={at} groups={groups} rows={n}: {d}");
             if batch == 8192 && !gpu {
                 assert!(d.reason.contains("from the first"), "{d}");
             }
