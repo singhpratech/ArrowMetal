@@ -1,7 +1,12 @@
 # The chunked import (am_array_chunks) against concatenating first (arrow::concat_arrays, then
 # am_array), both end to end. Not run by the test suite.
 #
-#   Rscript chunks.R <label> [reps] [rows,...]
+#   Rscript chunks.R <label> [reps] [rows,...] [gc]
+#
+# With `gc` as the fourth argument, gc() runs before every timed call (outside the timed region),
+# so each call starts with the previous call's handle collected and its GPU memory returned; the
+# rows are named with a `_gc_between` suffix. Without it, handles are collected whenever R's
+# collector runs, as in a program that does not call gc().
 #
 # Each chunk is its own Array, as the batches of a Table are. Method as in overhead.R (100 ms of
 # untimed calls, a 500 ms idle and one call on its own, then `reps` calls for best, median and
@@ -14,6 +19,8 @@ args <- commandArgs(TRUE)
 label <- if (length(args) >= 1) args[1] else ""
 REPS <- if (length(args) >= 2) as.integer(args[2]) else 10L
 SIZES <- if (length(args) >= 3) as.numeric(strsplit(args[3], ",")[[1]]) else c(1e7, 5e7)
+GC <- length(args) >= 4 && identical(args[4], "gc")
+SUFFIX <- if (GC) "_gc_between" else ""
 now <- microbenchmark::get_nanotime
 
 row <- function(name, n, chunk_rows, expr) {
@@ -26,14 +33,22 @@ row <- function(name, n, chunk_rows, expr) {
   idle <- (now() - t0) / 1e6
   d <- numeric(REPS)
   c0 <- proc.time()
+  gc_cpu <- 0
   for (i in seq_len(REPS)) {
+    if (GC) {
+      g0 <- proc.time()
+      invisible(gc(FALSE))
+      g1 <- proc.time()
+      gc_cpu <- gc_cpu + (g1[["user.self"]] - g0[["user.self"]]) + (g1[["sys.self"]] - g0[["sys.self"]])
+    }
     t0 <- now()
     f()
     d[i] <- (now() - t0) / 1e6
   }
   c1 <- proc.time()
-  cpu <- ((c1[["user.self"]] - c0[["user.self"]]) + (c1[["sys.self"]] - c0[["sys.self"]])) * 1e3 / REPS
-  cat(sprintf("%s,r,%s,%d,%d,%.3f,%.3f,%.3f,%.3f\n", label, name, as.integer(n),
+  cpu <- ((c1[["user.self"]] - c0[["user.self"]]) + (c1[["sys.self"]] - c0[["sys.self"]]) - gc_cpu) *
+    1e3 / REPS
+  cat(sprintf("%s,r,%s%s,%d,%d,%.3f,%.3f,%.3f,%.3f\n", label, name, SUFFIX, as.integer(n),
               as.integer(chunk_rows), idle, min(d), stats::median(d), cpu))
 }
 

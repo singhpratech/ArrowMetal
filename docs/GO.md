@@ -309,6 +309,54 @@ above are not per-core figures.
   doing strictly less work than the other two Filter rows. It is included because it is what a Go
   programmer writes when they have not reached for Arrow yet.
 
+### Chunked import against concatenating first
+
+`go run ./cmd/amchunks`: a column in chunks, each chunk its own allocation from Arrow Go's default
+allocator, imported with `ImportChunks` against `array.Concatenate` then `Import`, both end to end
+with the handle (and the concatenation) released inside the timed call. M4 Max, 2026-09-29, Go
+1.27.1, arrow-go v18.7.0; three rounds, each row warmed for 100 ms and then timed 10 times; best of
+the three rounds, and the median of the per-round medians in parentheses; CPU is process CPU time per
+call. Source: `Benchmarks/results/bindings_chunked_import_2026-09-29.csv`.
+
+| Column | Rows | Chunks | Concatenate + `Import` | `ImportChunks` | CPU ms (concatenate / chunked) |
+|---|---:|---:|---:|---:|---:|
+| float64, 10% null | 10,000,000 | 153 | 2.18 (3.79) ms | 0.73 (1.04) ms | 3.9 / 8.5 |
+| float64, 10% null | 10,000,000 | 10 | 2.21 (4.01) ms | 0.63 (0.95) ms | 4.1 / 8.6 |
+| float64, 10% null | 50,000,000 | 763 | 8.76 (15.41) ms | 3.06 (3.75) ms | 15.2 / 37.1 |
+| float64, 10% null | 50,000,000 | 50 | 8.14 (15.57) ms | 2.78 (3.20) ms | 14.0 / 39.0 |
+| int64 | 10,000,000 | 153 | 1.83 (3.40) ms | 0.59 (0.67) ms | 3.5 / 6.9 |
+| int64 | 10,000,000 | 10 | 1.83 (3.28) ms | 0.54 (0.58) ms | 3.3 / 5.9 |
+| int64 | 50,000,000 | 763 | 8.22 (15.60) ms | 2.55 (2.79) ms | 14.5 / 31.2 |
+| int64 | 50,000,000 | 50 | 8.01 (15.27) ms | 2.21 (2.69) ms | 14.3 / 31.4 |
+
+The chunked import copies each chunk once, straight into the Metal buffers, on the CPU cores in
+parallel; the concatenation copies every byte once, and the import then borrows or copies the result
+by the copy rule above. The parallel copy takes 1.8x to 2.8x the CPU time of the concatenation per
+call (the last column).
+
+### The existing calls, before and after
+
+`go run ./cmd/ambench` times the calls that existed before the sort options and the chunked import,
+built from the previous commit and from this one against the same `libArrowMetalC.dylib`, in four
+alternating rounds (each row warmed for 100 ms, a 500 ms idle and one call timed on its own, then 30
+calls); best of the four rounds, the median of the per-round medians in parentheses. The Go code of
+these calls is unchanged; the shim resolves seven more entry points at load. At 10M rows:
+
+| Call | Previous commit | This commit |
+|---|---:|---:|
+| `Import` + `Release`, page-aligned int64 | 0.03 (0.06) ms | 0.01 (0.02) ms |
+| `Argsort(false)`, float64 with 10% nulls | 7.35 (7.93) ms | 7.16 (8.11) ms |
+| `Argsort(true)`, int64 | 7.95 (8.59) ms | 7.84 (8.64) ms |
+| `Sort(false)`, float64 with 10% nulls | 6.98 (7.69) ms | 6.70 (7.64) ms |
+| `Lexsort`, int64 then float64 descending | 18.28 (18.85) ms | 18.32 (18.58) ms |
+
+At 1,000 and 1,000,000 rows three rows were slower in both best and median in the four rounds
+(`Argsort(true)` at 1,000 rows, `Lexsort` at 1,000 and 1,000,000 rows); timed again alone, eight
+alternating rounds of 100 calls, this commit over the previous one is 1.02 / 1.14 (best / median) for
+`Argsort(true)` at 1,000 rows (0.39 / 0.50 ms against 0.38 / 0.44 ms) and 0.97 / 1.04 and 1.02 / 1.02
+for `Lexsort` at 1,000 and 1,000,000 rows. Every row, with first-call-after-idle and CPU time:
+`Benchmarks/results/bindings_call_overhead_2026-09-29_summary.csv`.
+
 ---
 
 ## What is covered

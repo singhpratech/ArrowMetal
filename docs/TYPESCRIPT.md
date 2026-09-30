@@ -308,6 +308,58 @@ Reading the tables:
 Numbers are from an M4 Max on 2026-09-07. `node bench/spread.mjs` re-runs the whole thing;
 `node bench/bench.mjs` runs a single process and prints tables.
 
+### Chunked columns against concatenating first
+
+`node --expose-gc bench/chunks.mjs`: a column in chunks, each chunk its own Arrow JS `Data`, imported
+with `MetalArray.fromChunks` against what a program writes without it (copy the chunks into one typed
+array with `TypedArray.set`, assemble one validity bitmap bit by bit when there are nulls, then
+`fromTypedArray`), both end to end with the handle released inside the timed call. M4 Max,
+2026-09-29, node v24.9.0, apache-arrow 21.2.0; three rounds, each row warmed for 100 ms and then
+timed 10 times; best of the three rounds, the median of the per-round medians in parentheses; CPU is
+process CPU time per call. Source: `Benchmarks/results/bindings_chunked_import_2026-09-29.csv`.
+
+| Column | Rows | Chunks | Concatenate + import | `fromChunks` | CPU ms (concatenate / chunked) |
+|---|---:|---:|---:|---:|---:|
+| float64, 10% null | 10,000,000 | 153 | 16.16 (17.41) ms | 0.88 (1.16) ms | 22.1 / 8.9 |
+| float64, 10% null | 10,000,000 | 10 | 16.99 (17.33) ms | 0.77 (1.10) ms | 22.6 / 11.0 |
+| float64, 10% null | 50,000,000 | 763 | 81.68 (82.80) ms | 3.04 (3.77) ms | 86.0 / 39.0 |
+| float64, 10% null | 50,000,000 | 50 | 80.17 (81.26) ms | 2.58 (3.27) ms | 86.4 / 40.5 |
+| int64 | 10,000,000 | 153 | 1.88 (2.54) ms | 0.70 (0.83) ms | 4.8 / 9.4 |
+| int64 | 10,000,000 | 10 | 1.93 (2.38) ms | 0.55 (0.59) ms | 4.4 / 8.9 |
+| int64 | 50,000,000 | 763 | 7.49 (8.03) ms | 2.65 (2.98) ms | 11.4 / 32.8 |
+| int64 | 50,000,000 | 50 | 7.28 (8.14) ms | 2.29 (2.75) ms | 10.4 / 33.3 |
+
+The chunked import copies each chunk once, straight into the Metal buffers, on the CPU cores in
+parallel. For int64 it takes 2.0x to 3.2x the CPU time of the concatenation per call; for the
+nullable float64 column, where the concatenation assembles the validity bitmap in JS, it takes less.
+
+### The existing calls, before and after
+
+`node --expose-gc bench/overhead.mjs` times the calls that existed before, built from the previous
+commit and from this one against the same `libArrowMetalC.dylib`, in four alternating rounds (each
+row warmed for 100 ms, a 500 ms idle and one call timed on its own, then 30 calls); best of the four
+rounds, the median of the per-round medians in parentheses. At 10M rows:
+
+| Call | Previous commit | This commit |
+|---|---:|---:|
+| `fromArrow(vector).release()`, int64 | 0.016 (0.049) ms | 0.008 (0.015) ms |
+| `fromTypedArray(values, { validity }).release()`, float64 with 10% nulls | 0.014 (0.063) ms | 0.021 (0.058) ms |
+| `argsort(false)`, float64 with 10% nulls | 5.74 (5.90) ms | 5.72 (5.84) ms |
+| `argsort(true)`, int64 | 7.33 (7.51) ms | 7.32 (7.71) ms |
+| `sort(false)`, float64 with 10% nulls | 5.69 (6.10) ms | 5.60 (5.86) ms |
+| `lexsort`, int64 then float64 descending | 15.72 (16.33) ms | 15.98 (16.26) ms |
+
+In the four rounds `fromArrow` took 1.5x to 1.6x the CPU time per call at 1,000 and 1,000,000 rows
+(a few microseconds), so it was timed again alone, eight alternating rounds of 100 calls: best 0.37x,
+1.00x and 0.93x at 1,000, 1,000,000 and 10M rows, median 0.71x, 0.61x and 1.74x, and 1.83x the CPU
+time at 10M rows (0.016 against 0.029 ms per call). Two further rounds of 1,000 calls give 0.96x
+best, 0.81x median and 0.72x the CPU time at 10M rows, and 2.7x best at 1,000 rows (0.0032 against
+0.0012 ms): in this build's process the 8 KB buffer of the 1,000-row vector was not page aligned, so
+ArrowMetal copied it (`wrappedProducerBuffers` false), where the previous build's process had it
+aligned and borrowed it; the alignment table above shows that this varies at small sizes.
+Every row, with first-call-after-idle and CPU time:
+`Benchmarks/results/bindings_call_overhead_2026-09-29_summary.csv`.
+
 ## Limits
 
 * **macOS on Apple silicon, in Node.** No browser, no WASM, no Intel, no Linux.

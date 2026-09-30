@@ -227,6 +227,74 @@ The `import` rows are the one place isolated timing is *worse* than interleaved 
 arrow's kernels are multi-threaded and base R's are not, so a comparison against base R is not a
 per-core figure. Timings on a loaded machine are noise; these ran on an idle machine.
 
+### Chunked columns against concatenating first
+
+`Rscript inst/bench/chunks.R`: a column in chunks, each chunk its own Array, imported with
+`am_array_chunks()` against `am_array(do.call(arrow::concat_arrays, chunks))`, which is what
+`am_array()` of a ChunkedArray does. M4 Max, 2026-09-29, R 4.5.3, arrow 25.0.0; three rounds, each row
+warmed for 100 ms and then timed 10 times; best of the three rounds, the median of the per-round
+medians in parentheses; CPU is process CPU time per call. Source:
+`Benchmarks/results/bindings_chunked_import_2026-09-29.csv`.
+
+An `am_array` is freed when R's collector finalizes it. With `gc()` run before every timed call
+(outside the timed region), each call starts with the previous call's handle and GPU memory gone,
+as a program that releases its columns sees it:
+
+| Column | Rows | Chunks | `concat_arrays` + `am_array()` | `am_array_chunks()` | CPU ms (concatenate / chunked) |
+|---|---:|---:|---:|---:|---:|
+| float64, 10% null | 10,000,000 | 153 | 1.82 (1.89) ms | 1.20 (1.31) ms | 2.1 / 8.4 |
+| float64, 10% null | 10,000,000 | 10 | 1.47 (1.51) ms | 1.12 (1.24) ms | 1.7 / 8.0 |
+| float64, 10% null | 50,000,000 | 763 | 8.36 (9.03) ms | 3.68 (4.01) ms | 10.5 / 34.6 |
+| float64, 10% null | 50,000,000 | 50 | 6.02 (6.12) ms | 3.07 (3.35) ms | 7.2 / 37.0 |
+| int64 | 10,000,000 | 153 | 1.59 (1.66) ms | 1.09 (1.23) ms | 1.8 / 6.9 |
+| int64 | 10,000,000 | 10 | 1.26 (1.31) ms | 0.97 (1.05) ms | 1.3 / 6.7 |
+| int64 | 50,000,000 | 763 | 7.74 (8.42) ms | 3.37 (3.81) ms | 8.6 / 32.3 |
+| int64 | 50,000,000 | 50 | 5.57 (5.71) ms | 2.69 (2.98) ms | 5.9 / 30.4 |
+
+Without the `gc()` calls, the handles of earlier calls hold their GPU memory until the collector
+runs, and every chunked import writes into newly allocated GPU memory, while `arrow`'s concatenation
+is page aligned and borrowed. There the chunked import is behind at 10M rows (see To improve below):
+
+| Column | Rows | Chunks | `concat_arrays` + `am_array()` | `am_array_chunks()` | CPU ms (concatenate / chunked) |
+|---|---:|---:|---:|---:|---:|
+| float64, 10% null | 10,000,000 | 153 | 2.87 (3.52) ms | 5.15 (5.71) ms | 4.2 / 93.8 |
+| float64, 10% null | 10,000,000 | 10 | 2.37 (4.89) ms | 4.57 (5.03) ms | 5.0 / 81.2 |
+| float64, 10% null | 50,000,000 | 763 | 13.42 (14.34) ms | 7.23 (12.44) ms | 15.3 / 119.4 |
+| float64, 10% null | 50,000,000 | 50 | 11.31 (15.78) ms | 7.70 (86.55) ms | 16.2 / 185.4 |
+| int64 | 10,000,000 | 153 | 4.51 (5.22) ms | 4.36 (5.68) ms | 5.6 / 90.8 |
+| int64 | 10,000,000 | 10 | 4.32 (5.12) ms | 4.85 (5.59) ms | 5.6 / 93.9 |
+| int64 | 50,000,000 | 763 | 16.96 (21.79) ms | 9.73 (10.27) ms | 21.3 / 133.8 |
+| int64 | 50,000,000 | 50 | 10.76 (11.72) ms | 10.12 (10.83) ms | 12.0 / 151.0 |
+
+`am_array()` of a ChunkedArray therefore keeps concatenating first, as it did.
+
+### The existing calls, before and after
+
+`Rscript inst/bench/overhead.R` times the calls that existed before, installed from the previous
+commit and from this one against the same `libArrowMetalC.dylib`, in four alternating rounds (each row
+warmed for 100 ms, a 500 ms idle and one call timed on its own, then 30 calls); best of the four
+rounds, the median of the per-round medians in parentheses. At 10M rows:
+
+| Call | Previous commit | This commit |
+|---|---:|---:|
+| `am_array()`, int64 Array | 0.011 (0.029) ms | 0.011 (0.015) ms |
+| `am_array()`, float64 Array with 10% nulls | 4.15 (4.82) ms | 4.15 (4.86) ms |
+| `am_array()`, one-chunk ChunkedArray | 3.76 (4.50) ms | 3.91 (4.59) ms |
+| `am_argsort(x)`, float64 with 10% nulls | 6.47 (7.74) ms | 6.48 (7.92) ms |
+| `am_argsort(x, TRUE)`, int64 | 3.74 (5.46) ms | 4.29 (5.28) ms |
+| `am_sort(x)`, float64 with 10% nulls | 7.40 (8.07) ms | 7.26 (9.50) ms |
+
+No row at 1,000, 1,000,000 or 10M rows was slower in both best and median. Every row, with
+first-call-after-idle and CPU time: `Benchmarks/results/bindings_call_overhead_2026-09-29_summary.csv`.
+
+### To improve
+
+- `am_array_chunks()` in a loop that leaves its handles to R's collector: at 10M rows it takes 0.97x
+  to 1.93x the time of `concat_arrays` + `am_array()` (best of three rounds; int64 in 153 chunks
+  4.36 against 4.51 ms, float64 in 10 chunks 4.57 against 2.37 ms), and at 50M rows float64 in 50
+  chunks has a median of 86.5 ms against 15.8 ms. It uses 81 to 185 CPU-ms per call there, against
+  7 to 37 with `gc()` between calls.
+
 ## Covered
 
 | Area | Functions |
