@@ -76,6 +76,11 @@ built (`DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c 
 PYTHONPATH=python python -m pytest python/tests/test_functions.py -q
 ```
 
+The last section, the differential matrix's cases by section, is read from the matrix's recorded run
+(`docs/data/differential_coverage.json`). `PYTHONPATH=python python python/tests/coverage_report.py`
+runs the matrix, records it and rewrites this page together with the per-function table in
+[COVERAGE.md](COVERAGE.md#differential-cases-per-arrow-function).
+
 ## Summary by section
 
 | Section | GPU | CPU | Partial | Missing | Pending | Rows |
@@ -427,6 +432,46 @@ Totals: **283 gpu**, **17 cpu**, **7 partial**, **0 missing**, **0 pending** ove
 | `hash_kurtosis` | GroupedAggregations | **GPU** | `group_by(keys).kurtosis(values)` | `Kernels/AggregatesExtra.swift` | Excess kurtosis, biased, from two GPU passes over the per-group means, in binary64 like `hash_variance`. A group with too few values is null here where pyarrow returns NaN. |
 | `hash_skew` | GroupedAggregations | **GPU** | `group_by(keys).skew(values)` | `Kernels/AggregatesExtra.swift` | The third standardised central moment, biased. Same passes, precision and null-on-degenerate group as `hash_kurtosis`. |
 | `hash_tdigest` | GroupedAggregations | **Partial** | `group_by(keys).tdigest(values, q)` | `Kernels/AggregatesExtra.swift` | Mixed: a GPU sort by (group, value) and a **host** merge of each group's centroids. Returns one q per group as a scalar column where Arrow returns a list, and being a sketch it agrees with Arrow's to within the sketch's error. `group_by(keys).quantile(values, q)` is the exact answer. |
+
+## Differential matrix cases, by section
+
+Separately from the row-by-row calls above, `python/tests/test_differential.py` runs every ArrowMetal operation over generated columns of every type it accepts: 41,688 cases in the recorded run, 38,897 pass, 1,644 documented divergences, 1,147 skipped, 0 unclassified. [COVERAGE.md](COVERAGE.md#differential-cases-per-arrow-function) has the count for each name; this is how many names in each section the matrix reaches.
+
+| Section | Names | With matrix cases | Names without |
+|---|---:|---:|---|
+| Aggregations | 24 | 21 | `count`, `count_all`, `pivot_wider` |
+| Arithmetic | 20 | 20 | - |
+| Bitwise | 8 | 8 | - |
+| Rounding | 6 | 6 | - |
+| Logarithmic | 10 | 10 | - |
+| Trigonometric | 20 | 20 | - |
+| Comparisons | 8 | 8 | - |
+| Logical | 8 | 8 | - |
+| StringPredicates | 19 | 19 | - |
+| StringTransforms | 21 | 21 | - |
+| StringPadding | 7 | 7 | - |
+| StringTrimming | 12 | 8 | `ascii_trim_whitespace`, `ascii_trim`, `ascii_ltrim`, `ascii_rtrim` |
+| StringSplitting | 4 | 4 | - |
+| StringExtraction | 2 | 2 | - |
+| StringJoining | 2 | 2 | - |
+| StringSlicing | 2 | 2 | - |
+| Containment | 11 | 11 | - |
+| Categorizations | 7 | 7 | - |
+| Selecting | 4 | 4 | - |
+| Conversions | 6 | 6 | - |
+| TemporalExtraction | 24 | 24 | - |
+| TemporalDifference | 13 | 13 | - |
+| Timezone | 2 | 2 | - |
+| Random | 1 | 0 | `random` |
+| Associative | 4 | 4 | - |
+| Selections | 7 | 7 | - |
+| Sorts | 10 | 10 | - |
+| NullFilling | 3 | 3 | - |
+| Structural | 9 | 8 | `make_struct` |
+| Pairwise | 2 | 2 | - |
+| Cumulative | 7 | 7 | - |
+| GroupedAggregations | 24 | 6 | `hash_min_max`, `hash_all`, `hash_any`, `hash_approximate_median`, `hash_count_distinct`, `hash_distinct`, `hash_first`, `hash_first_last`, `hash_last`, `hash_list`, `hash_one`, `hash_product`, `hash_stddev`, `hash_variance`, `hash_pivot_wider`, `hash_kurtosis`, `hash_skew`, `hash_tdigest` |
+| **Total** | **307** | **280** | |
 
 ---
 

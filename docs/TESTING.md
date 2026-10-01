@@ -8,7 +8,7 @@ pushed. Numbers are from the last full run of `main` (0.2.0) on an M4 Max.
 | Swift suites (`Tests/ArrowMetalTests`) | 943 tests in 73 files, run in release (all 943 executed, 3 skipped in the run of 2026-09-24 at `89d4ed4`: the three opt-in throughput measurements) | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
 | Python suites (`python/tests`) | 5,892 collected cases over the ctypes API, the integrations and the readers in the run of 2026-09-24 at `89d4ed4` (5,867 passed and 25 skipped; the differential matrix in `test_differential.py` is counted in its own row) | `pyarrow.compute`, Polars, DuckDB, pandas |
 | Rust suites (`rust/arrowmetal/tests`, `rust/arrowmetal-sys`) | 48 tests, 46 in the safe crate against arrow-rs plus 2 in `arrowmetal-sys` over the raw ABI, run in release, plus 4 `no_run` doc-tests (compiled, not executed); all passed on 2026-09-24 at `3c3ea1e` | `arrow::compute` (arrow-rs 59) on the same data; a `HashMap` fold where arrow-rs has no kernel; `include/arrowmetal.h` re-parsed for the ABI signatures ([RUST.md](RUST.md)) |
-| Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | 40,824 generated cases, 46 column types (utf8 also imported as `utf8_view`), every public operation | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
+| Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | generated cases over 46 column types (utf8 also imported as `utf8_view`), every public operation; the counts of the recorded run, in total and per Arrow function, are generated into [COVERAGE.md](COVERAGE.md#differential-cases-per-arrow-function) | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
 | Engine conformance grid (`python/tests/engine_report.py`, `engine_polars_grid.py`, `engine_duckdb_grid.py`) | 15,376 Polars cases and 33,376 DuckDB queries, generated over shapes, dtypes, null patterns and sizes (Polars run of 2026-09-30, DuckDB run of 2026-09-25: 0 unclassified; 32 documented, all float summation order) | Polars' own `lf.collect()`; DuckDB with the rewrite off ([COVERAGE.md](COVERAGE.md#engines)) |
 | TypeScript suites (`node/test`) | 76 tests in 8 files over the N-API addon (76 passed on 2026-09-29) | Apache Arrow JS 21.2.0 and plain JS over the same rows ([TYPESCRIPT.md](TYPESCRIPT.md)) |
 | Go binding (`go/arrowmetal`) | 61 test functions and three `Example`s, 64 runnable, and 355 subtests: 419 passing results as `go test -count=1 -v ./...` reported them on 2026-09-29, 0 failed, run three times (plain, under `-race`, and under the cgo pointer checker, `GOEXPERIMENT=cgocheck2`, with the same counts) | `arrow-go/v18`'s own `compute` where it has the function, plain Go loops where it does not ([GO.md](GO.md)) |
@@ -142,8 +142,9 @@ pytest *collected* on 2026-09-24, which is larger because a parametrised functio
 | `test_numpy.py` | 6 | the numpy bridge: which dtypes cross without a copy, NaN as a value, and float64 arithmetic against numpy bit for bit ([NUMPY.md](NUMPY.md)) |
 | `test_router.py` | 13 | both router paths byte-identical through the ctypes API and equal to `pyarrow.compute` (and to pyarrow's `hash_sum` for the group-by, signed and uint64), `am.last_route()` and its reasons, `am.router()` / `am.set_router()`, `ARROWMETAL_ROUTER` in a subprocess, `differential_report.py`'s GPU pin, `Benchmarks/router_table.py --check` against the committed table, the table's header naming which CPU loops it measured, `--from-check` fitting a table inside the brackets of a `router_check.py` run, and `multiply` switching at its own row, fitted inside the bracket its check file measured |
 | `test_router_calibrate.py` | 9 | determinism: 200 (operation, size) pairs get the same decision across 1,000 calls and across two processes, and `am.route_decision` / `am.explain_route` give what a routed call records; `python -m arrowmetal.router explain` text and JSON; `router_table.py --json-out` loading back as the shipped crossovers; an unreadable `ARROWMETAL_ROUTER_TABLE` leaving the shipped table; `calibrate --quick` end to end under a temporary `HOME`, its file loaded by a new process; `python -m arrowmetal.bench --calibrate`; the shared fit giving the shipped rows |
-| `test_bench.py` | 2 | `python -m arrowmetal.bench` in a subprocess at 200,000 rows: `--json` exits 0 with `match` true and a positive timing for every one of the four operations, and `--quiet` with Polars hidden from the import system prints the table alone, one header and four rows, with no Polars column |
 | `test_bench.py` | 12 | `python -m arrowmetal.bench` in a subprocess at 200,000 rows: `--json` exits 0 with `match` true and a positive timing for every one of the four operations, and `--quiet` with Polars hidden from the import system prints the table alone, one header and four rows, with no Polars column. The generated dataset has the documented types, null fraction, ranges, distribution and 1,000 keys, is the same on every run, and its SplitMix64 stream matches a plain-Python reference; both modes run with NumPy hidden. `--parquet` on small generated files: the value column is the largest numeric one (ties by encoded bytes, then file order), the key the lowest-cardinality integer or string column (nulls one group, a constant column last), the size guard refuses with the limit named and exit 2, a file with no usable column gets one line and exit 2, a string-only file measures the read only, and a full run matches pyarrow while its output carries no path and no column name |
+| `test_bench_share.py` | 8 | the Share it block of `python -m arrowmetal.bench` against the issue form `.github/ISSUE_TEMPLATE/benchmark_result.yml`: the form declares exactly the fields the block fills plus free text, the block parses back into chip, macOS, machine, versions, run, router table and the result table (generated and `--parquet` runs, with and without Polars), the prefilled issue link carries the same field values, paths name the home directory as `~`, and a real run at 200,000 rows prints a block with this Mac's chip and the shipped router table |
+| `test_coverage_report.py` | 8 | the per-function table in [COVERAGE.md](COVERAGE.md#differential-cases-per-arrow-function) and the matrix section of [ARROW_FUNCTIONS.md](ARROW_FUNCTIONS.md): every matrix operation assigned to Arrow function names from the registry (or listed as checking none), the record `docs/data/differential_coverage.json` holding exactly the matrix's (operation, type) cells with consistent counts and no unclassified case, both pages equal to their rendering from the record, and 24 seeded cells rerun against their recorded counts |
 | `test_differential.py` (standalone part) | 95 plus 17 documented xfails | one test per finding and per fixed finding, plus the guards that every public operation and every module-level function has a matrix case |
 
 ## 3. The differential matrix
@@ -152,8 +153,9 @@ pytest *collected* on 2026-09-24, which is larger because a parametrised functio
 in several shapes (random, sorted, all-equal, special values, three null ratios, plain and sliced) and
 compares the ArrowMetal answer with the `pyarrow.compute` answer for the same options. Every utf8
 operation runs a second time with the same values imported as `utf8_view` (the oracle stays on utf8,
-which pyarrow.compute supports). The last run (2026-09-25): 40,824 cases, 38,006 pass, 1,644 documented
-divergences, 1,174 skips (an operation that does not apply to a type), **0 unclassified**. A divergence counts as documented only if it matches one of the 22
+which pyarrow.compute supports). The counts of the recorded run, in total and per Arrow function, are the
+generated table in [COVERAGE.md](COVERAGE.md#differential-cases-per-arrow-function) (pass, documented
+divergences, skips where an operation does not apply to a type, **0 unclassified**). A divergence counts as documented only if it matches one of the 22
 open findings in `FINDINGS`, each of which has a section in [EVALUATION.md](EVALUATION.md) with a
 reproduction; a finding may be narrowed by the data (`data_check`) so a dataset that does not contain
 the triggering value still has to agree exactly. The report exits non-zero on any unclassified
@@ -162,6 +164,25 @@ fixed" with a plain regression test, so a relapse is a failure rather than a re-
 
 `test_every_public_operation_has_a_differential_case` and its module-level twin fail the suite when a
 method is added without a matrix case, so the harness cannot silently fall behind the library.
+
+**The per-function table.** One command runs the matrix, records each (operation, type) cell's counts in
+`docs/data/differential_coverage.json` and renders the table in COVERAGE.md and the section in
+ARROW_FUNCTIONS.md from that record:
+
+```
+PYTHONPATH=python python python/tests/coverage_report.py            # run, record, render both pages
+PYTHONPATH=python python python/tests/coverage_report.py --check    # run and compare, write nothing
+PYTHONPATH=python python python/tests/coverage_report.py --render   # render the pages from the record
+```
+
+Which Arrow function a case counts toward is `OPERATION_FUNCTIONS` in that file: the function whose
+ArrowMetal implementation the operation calls, or, for an ArrowMetal call with no Arrow name of its own,
+the function its answer is compared with; the operations that check no Arrow function (interop,
+slicing, ArrowMetal's hashes and window functions) are listed apart. The table cannot drift:
+`differential_report.py` compares every full default run with the record and exits 3 when a cell
+differs, and `test_coverage_report.py` fails when an operation is added without an assignment, when the
+record's cells are not the matrix's, when a page is not the rendering of the record, or when a seeded
+sample of cells run again gives other counts.
 
 ## 4. Review before release
 
@@ -182,7 +203,8 @@ in this order:
    behind `ARROWMETAL_IPC_THROUGHPUT`, `ARROWMETAL_LATENCY_BENCH` and `ARROWMETAL_UNIQUE_BENCH`, and the fourteen
    pyarrow cross-checks in `IPCTests` when no python with pyarrow is found; on a virtual Metal device
    `requireRealGPU()` skips the GPU-only suites as well).
-3. `differential_report.py` exits 0: 0 unclassified divergences.
+3. `differential_report.py` exits 0: 0 unclassified divergences, and the run equals the record behind
+   the per-function table (`coverage table: matches ...`; exit 3 and the differing cells otherwise).
 4. `pytest python/tests` (every suite): 0 failures; xfails must be strict and tied to a finding.
 5. The standalone tests in `test_differential.py`: 0 failures.
 
@@ -211,7 +233,31 @@ moves between runs is re-measured in place before it is called a regression. The
 every (workload, engine) cell in its own subprocess so peak RSS is that engine's alone. Results land in `Benchmarks/results/*.csv` and are rendered into
 [BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md); rows to improve stay in the table.
 
-## 7. Hardware and toolchain of the published numbers
+## 7. Pull requests: the conformance subset on GitHub's runner
+
+`.github/workflows/ci.yml` runs on every pull request, in three jobs on GitHub's `macos-15` runner:
+
+| Job | Runs |
+|---|---|
+| `conformance` | `swift build -c release --product ArrowMetalC`, then `.github/scripts/conformance_subset.sh differential standalone coverage engines`: 2,000 cases of the differential matrix sampled with seed 20261001 (`differential_report.py --sample 2000 --seed 20261001`), the standalone tests of `test_differential.py`, `test_coverage_report.py`, and the Polars engine grid without its 100,000-row tables over `int64`, `float64` and `string` columns (`engine_report.py --engine polars --quick --dtypes int64,float64,string`) |
+| `swift-tests` | `swift test -c release` |
+| `datafusion-rules` | the DataFusion crate's rule tests, `cargo test --test rule` (`conformance_subset.sh datafusion`), not its grid |
+
+The script prints the summary lines of the full run above (`differential:`, `differential-standalone:`,
+`engines:`, `datafusion:`, and a `GATE` line with `-` for the parts it did not run), plus a
+`coverage-table:` line, and runs the same way on a Mac: from the repository root, after the dylib build,
+`PY=python .github/scripts/conformance_subset.sh` runs all five parts.
+
+What the runner cannot do: its GPU is an "Apple Paravirtual device" on which pipeline creation fails at
+random even after the library's one retry ([FINDINGS.md](FINDINGS.md), FB24858160). The Swift GPU suites
+skip there (`requireRealGPU()`). The subset runs its GPU cases anyway: on a device whose name contains
+"Paravirtual", `differential_report.py` reruns a case that failed with `Metal pipeline creation failed`
+up to three times and prints how many reruns it took, and a pytest part whose every failure carries that
+error is rerun once on its failed tests, both lines printed. No timing is taken on the runner, and the
+full differential matrix, the full engine grids, the DataFusion grid and the binding suites run locally
+(section 5).
+
+## 8. Hardware and toolchain of the published numbers
 
 Apple M4 Max (16 cores, 64 GB unified memory, internal SSD), macOS 26.6.2, Swift 6.3.3 (Xcode
 toolchain), Python 3.13, pyarrow 25.0.1, Polars 1.44.1, DuckDB 1.5.5, pandas 3.0.5.

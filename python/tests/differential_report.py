@@ -6,6 +6,12 @@ divergence -- a cell that fails without an entry in FINDINGS and a paragraph in 
     DIFF_QUICK=1 ...    # drop the 100k row datasets
     DIFF_LARGE=1 ...    # add the 5,000,000 row datasets
     ... --ops sort,argsort --types int32,float64    # narrow the matrix
+    ... --sample 2000 --seed 20261001               # a seeded sample of the matrix's cases
+
+A full default run (no filter, no sample, no DIFF_QUICK / DIFF_LARGE, the router on the GPU) is also
+compared with the per-cell record behind docs/COVERAGE.md's function table
+(docs/data/differential_coverage.json, written by coverage_report.py): exit code 3 when they differ,
+so the table cannot fall behind the matrix.
 
 The cases are the ones in test_differential.py, so the report and `pytest python/tests` agree by
 construction. The report exists because the pass/fail shape of ~6000 parametrised tests is easier to
@@ -14,6 +20,7 @@ what the first divergence looked like.
 """
 import argparse
 import os
+import random
 import sys
 import time
 from collections import defaultdict
@@ -31,6 +38,16 @@ import test_differential as diff                                      # noqa: E4
 # wins, which is how the same matrix runs the CPU loops. See docs/TESTING.md.
 if "ARROWMETAL_ROUTER" not in os.environ:
     am.set_router("gpu")
+
+#: GitHub's hosted macOS runners expose an "Apple Paravirtual device" whose pipeline creation fails at
+#: random (docs/FINDINGS.md, FB24858160); a failed pipeline is not cached, so the same case run again
+#: compiles it again. On such a device only, a case that failed with that error is rerun, up to
+#: PIPELINE_RETRIES times, and the report says how many reruns it took. On real Apple silicon the error
+#: has never occurred and nothing is rerun.
+VIRTUAL_DEVICE = "paravirtual" in am.device_name().lower()
+PIPELINE_ERROR = "Metal pipeline creation failed"
+PIPELINE_RETRIES = 3
+RETRIES = [0]
 
 
 class Cell:
@@ -56,23 +73,41 @@ class Cell:
         return f"skip {self.skipped}"
 
 
-def run(op_filter=None, type_filter=None, quiet=False):
+def sample_indices(count, seed, population):
+    """`count` case positions out of `population`, the same for the same seed, in matrix order."""
+    return set(random.Random(seed).sample(range(population), min(count, population)))
+
+
+def run(op_filter=None, type_filter=None, quiet=False, sample=None, seed=0, cell_filter=None):
+    """Run the matrix, or the part of it the filters keep: `op_filter` / `type_filter` (sets of
+    names), `cell_filter` (a set of (operation, type) pairs) and `sample` (that many cases, chosen by
+    `seed` out of the cases the other filters keep)."""
     cells = defaultdict(Cell)
     order_ops, order_types = [], []
     started = time.time()
     total = 0
 
-    for operation, type_name, shape in diff.all_cases():
-        if op_filter and operation.name not in op_filter:
-            continue
-        if type_filter and type_name not in type_filter:
-            continue
+    cases = [(operation, type_name, shape) for operation, type_name, shape in diff.all_cases()
+             if not (op_filter and operation.name not in op_filter)
+             and not (type_filter and type_name not in type_filter)
+             and not (cell_filter is not None and (operation.name, type_name) not in cell_filter)]
+    if sample is not None:
+        keep = sample_indices(sample, seed, len(cases))
+        cases = [c for i, c in enumerate(cases) if i in keep]
+
+    for operation, type_name, shape in cases:
         if operation.name not in order_ops:
             order_ops.append(operation.name)
         if type_name not in order_types:
             order_types.append(type_name)
 
         status, detail = diff.run_case(operation, type_name, shape)
+        tries = 0
+        while (VIRTUAL_DEVICE and status == diff.FAIL and PIPELINE_ERROR in detail
+               and tries < PIPELINE_RETRIES):
+            tries += 1
+            RETRIES[0] += 1
+            status, detail = diff.run_case(operation, type_name, shape)
         cell = cells[(operation.name, type_name)]
         total += 1
         if status == diff.PASS:
@@ -134,6 +169,8 @@ def render(cells, ops, types, total, elapsed):
     brand_new = sum(c.new for c in cells.values())
     add(f"total: {total} cases  |  pass {passed}  fail {failed} ({brand_new} unclassified, "
         f"{failed - brand_new} documented)  skip {skipped}  |  {elapsed:.1f}s")
+    if RETRIES[0]:
+        add(f"pipeline creation failed on the virtual device and the case was rerun: {RETRIES[0]} rerun(s)")
     add("legend: 'ok N' all N datasets agree ('+Ns' = N skipped); 'known n/N' n datasets hit an open "
         "finding below; 'NEW n/N' an unclassified divergence; 'skip N' not implemented for that "
         "type; '-' out of scope")
@@ -214,14 +251,39 @@ def main(argv=None):
     parser.add_argument("--ops", help="comma-separated operation names to include")
     parser.add_argument("--types", help="comma-separated type names to include")
     parser.add_argument("-q", "--quiet", action="store_true", help="no progress on stderr")
+    parser.add_argument("--sample", type=int, help="run this many cases of the matrix, chosen by --seed")
+    parser.add_argument("--seed", type=int, default=0, help="the seed --sample chooses with (default 0)")
     args = parser.parse_args(argv)
 
     op_filter = set(args.ops.split(",")) if args.ops else None
     type_filter = set(args.types.split(",")) if args.types else None
 
-    cells, ops, types, total, elapsed = run(op_filter, type_filter, args.quiet)
+    cells, ops, types, total, elapsed = run(op_filter, type_filter, args.quiet, args.sample, args.seed)
     print(render(cells, ops, types, total, elapsed))
-    return 1 if any(c.new for c in cells.values()) else 0
+    if any(c.new for c in cells.values()):
+        return 1
+    if op_filter or type_filter or args.sample is not None:
+        return 0
+    return check_coverage_record(cells)
+
+
+def check_coverage_record(cells):
+    """Compare a full run with the record behind docs/COVERAGE.md's function table. Prints one
+    `coverage table:` line; returns 3 when the record differs from this run."""
+    import coverage_report
+    problem = coverage_report.default_matrix_problem()
+    if problem:
+        print(f"coverage table: not compared ({problem})")
+        return 0
+    fresh = coverage_report.cells_from_report(cells)
+    diffs = coverage_report.compare_cells(fresh, coverage_report.load_record()["cells"])
+    if not diffs:
+        print(f"coverage table: matches docs/data/differential_coverage.json ({len(fresh)} cells)")
+        return 0
+    print(f"coverage table: STALE in {len(diffs)} cell(s) -- regenerate with {coverage_report.COMMAND}")
+    for line in diffs[:40]:
+        print("  " + line)
+    return 3
 
 
 if __name__ == "__main__":

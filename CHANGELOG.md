@@ -342,6 +342,26 @@
   its entry behind and eviction removed the first element of that array, so a long process spent more
   time copying it with every eviction: 20,000 evictions after 300,000 reuses took 7.0 s and take 1.3 s
   now, most of it the reuses.
+- `docs/COVERAGE.md` has a generated table of the differential matrix per Arrow compute function: the
+  cases, passes, documented divergences and skips of every function name the matrix reaches, and the
+  operations that check no Arrow function, rendered by `python/tests/coverage_report.py` from the
+  per-cell record of a run (`docs/data/differential_coverage.json`); `docs/ARROW_FUNCTIONS.md` gains the
+  count of names each section's matrix cases reach. `differential_report.py` compares every full default
+  run with the record and exits 3 when a cell differs; `test_coverage_report.py` checks the operation
+  assignments, the record's cells and both pages, and reruns a seeded sample of cells.
+  `differential_report.py --sample N --seed S` runs a seeded sample of the matrix.
+- Pull requests run a conformance subset on GitHub's macOS runner (`.github/workflows/ci.yml`,
+  `.github/scripts/conformance_subset.sh`): the Swift build and release tests, a seeded 2,000-case sample
+  of the differential matrix, the standalone differential tests, the coverage-table tests, the Polars
+  engine grid without its 100,000-row tables over three column types, and the DataFusion crate's rule
+  tests, printing the summary lines of the full local run. On the runner's virtual GPU a case or pytest
+  failure carrying the pipeline-creation error is rerun and the rerun is reported.
+- `python -m arrowmetal.bench`: the Share it block is one piece that parses back into the fields of the
+  "Benchmark result" issue form (`arrowmetal.bench.parse_share_block`, `form_fields`): chip, macOS,
+  machine, versions, the run, a `--parquet` file's shape, the router table in force (its path with the
+  home directory as `~`) and the result table. The form gains chip and macOS version fields, and the
+  printed link prefills them. `--calibrate` now runs before the report, so the block names the table it
+  wrote. docs/BENCHMARKS.md says how to submit a result.
 
 ## 0.3.0 — 2026-09-26
 Everything below is new in 0.3.0. `MetalEngine()` decides per subtree from measured crossovers: in the

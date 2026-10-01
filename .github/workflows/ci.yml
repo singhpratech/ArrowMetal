@@ -1,21 +1,84 @@
 name: CI
-# GitHub's hosted Apple silicon runners expose an "Apple Paravirtual device": the GPU is virtual, so the
-# correctness tests skip there (requireRealGPU()) and this job proves the build, the interop and the CPU
-# paths only. The bench step below runs on that virtual device and its numbers are never published --
-# every benchmark table in the repository was measured on real Apple silicon. Real GPU testing happens
-# locally; the job runs on pull requests and by hand rather than on every push.
+# GitHub's hosted Apple silicon runners expose an "Apple Paravirtual device": the GPU is virtual, and
+# pipeline creation on it fails at random (docs/FINDINGS.md, FB24858160). The Swift GPU suites skip there
+# (requireRealGPU()); the conformance subset runs its GPU cases anyway, rerunning a case or a pytest
+# failure that carries the pipeline-creation error, and says so in its log. No timing is taken here:
+# every benchmark table in the repository was measured on real Apple silicon, and the full differential
+# matrix, the full engine grids and the DataFusion grid run locally (docs/TESTING.md).
 on:
   pull_request:
   workflow_dispatch:
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+env:
+  ARROWMETAL_DEBUG_SHADERS: "1"
 jobs:
-  test:
+  conformance:
+    # The Swift build, then the conformance subset: 2,000 seeded cases of the differential matrix, its
+    # standalone tests, the coverage-table checks and the Polars engine grid's smoke subset.
     runs-on: macos-15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - run: sudo xcode-select -s /Applications/Xcode_16.4.app || true
       - run: swift --version
-      - run: swift build
       - run: system_profiler SPDisplaysDataType | grep -E 'Chipset|Vendor|Metal' || true
-      - run: ARROWMETAL_DEBUG_SHADERS=1 swift test
-      - run: swift test -c release
-      - run: swift run -c release arrowmetal-bench 2000000 2
+      - name: Swift build
+        run: swift build -c release --product ArrowMetalC
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Python packages
+        run: python -m pip install pyarrow==25.0.1 polars==1.44.1 numpy==2.5.3 pytest==9.1.1
+      - name: Conformance subset
+        env:
+          PY: python
+          OUT: ${{ runner.temp }}/subset
+        run: mkdir -p "$OUT" && .github/scripts/conformance_subset.sh differential standalone coverage engines
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-logs
+          path: ${{ runner.temp }}/subset
+          if-no-files-found: ignore
+
+  swift-tests:
+    # The Swift suites in release: the host paths, the interop and the CPU loops (the GPU suites skip on
+    # the virtual device).
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo xcode-select -s /Applications/Xcode_16.4.app || true
+      - name: Swift tests
+        run: |
+          set +e
+          swift test -c release > "$RUNNER_TEMP/swift.txt" 2>&1
+          rc=$?
+          tail -40 "$RUNNER_TEMP/swift.txt"
+          echo "swift: $(grep -E '^\s*Executed [0-9]+ tests' "$RUNNER_TEMP/swift.txt" | tail -1)"
+          exit $rc
+
+  datafusion-rules:
+    # The DataFusion crate's rule tests (datafusion/tests/rule.rs); the crate's grid runs locally.
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo xcode-select -s /Applications/Xcode_16.4.app || true
+      - name: Swift build
+        run: swift build -c release --product ArrowMetalC
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            datafusion/target
+          key: datafusion-${{ runner.os }}-${{ hashFiles('datafusion/Cargo.lock', 'datafusion/Cargo.toml', 'rust/arrowmetal/Cargo.toml', 'rust/arrowmetal-sys/Cargo.toml') }}
+          restore-keys: datafusion-${{ runner.os }}-
+      - name: Rule tests
+        env:
+          PY: python3
+        run: .github/scripts/conformance_subset.sh datafusion

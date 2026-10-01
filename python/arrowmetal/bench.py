@@ -10,8 +10,13 @@ The data: int64 `v` uniform in [-1,000,000, 1,000,000) with 10% nulls, float64 `
 int32 `k` uniform over 1,000 keys, all drawn with pyarrow.compute from seeded SplitMix64 streams
 (`make_data`), so the bench needs nothing beyond `pip install arrowmetal` (no NumPy).
 
-Nothing is written and nothing is sent: the script prints, and the "Share it" block at the end is
-text to paste into a GitHub issue or the Discord channel if you want to.
+Nothing is sent: the script prints, and the "Share it" block at the end is text to paste into a
+GitHub issue (the "Benchmark result" form, `.github/ISSUE_TEMPLATE/benchmark_result.yml`) or the
+Discord channel if you want to. The block is one piece: a header line, `key: value` lines for the
+chip, macOS, the machine, the versions, the run and the router table in force (its path, with the home
+directory written as `~`), then the Markdown result table. `parse_share_block` reads it back and
+`form_fields` gives the issue form's fields from it. `--calibrate` writes this Mac's router table
+before the report, so the block names the file it wrote.
 
     python -m arrowmetal.bench                # 10,000,000 rows
     python -m arrowmetal.bench --rows 2000000
@@ -49,6 +54,10 @@ SEED = 20260907
 KEYS = 1_000
 NULL_FRACTION = 0.10
 ISSUE_URL = "https://github.com/singhpratech/ArrowMetal/issues/new?template=benchmark_result.yml&title="
+#: The issue form's field ids (.github/ISSUE_TEMPLATE/benchmark_result.yml): the pasted block, the chip,
+#: the macOS version, and free text the submitter writes.
+FORM_FIELDS = ("share", "chip", "os", "notes")
+SHARE_HEADER = "ArrowMetal bench result"
 
 
 # ---- timing, as Benchmarks/full_matrix.py does it
@@ -334,7 +343,8 @@ def markdown_table(result):
 
 
 def issue_url(result, share=None):
-    """The new-issue link. `share` prefills the form's `share` field (the Share it block)."""
+    """The new-issue link. `share` (the Share it block) prefills the form's `share`, `chip` and `os`
+    fields."""
     if "file" in result:
         f = result["file"]
         title = (f"bench --parquet: {result['machine']['chip']}, {f['rows']:,} rows, {f['columns']} columns, "
@@ -343,8 +353,103 @@ def issue_url(result, share=None):
         title = f"bench: {result['machine']['chip']}, {result['rows']:,} rows"
     url = ISSUE_URL + urllib.parse.quote(title, safe="")
     if share is not None:
-        url += "&share=" + urllib.parse.quote("```\n" + share + "\n```", safe="")
+        for field, value in form_fields(share).items():
+            url += f"&{field}=" + urllib.parse.quote(value, safe="")
     return url
+
+
+# ---- the Share it block: one pasteable piece that parses back into the issue form's fields
+
+def _home(path):
+    """`path` with the home directory written as `~`, so the block carries no user name."""
+    home = os.path.expanduser("~")
+    path = os.path.abspath(path)
+    return "~" + path[len(home):] if home and (path == home or path.startswith(home + os.sep)) else path
+
+
+def router_table_line(written=None):
+    """Which crossover table the router uses: the file `--calibrate` just wrote, this Mac's file
+    from an earlier calibration, or the shipped table."""
+    if written:
+        return f"{_home(written)} (written by --calibrate in this run)"
+    info = am.router_table()
+    if info.get("shipped"):
+        return "shipped (`python -m arrowmetal.bench --calibrate` writes this Mac's)"
+    when = f", {info['date']}" if info.get("date") else ""
+    return f"{_home(info.get('path') or '?')} (this Mac's{when})"
+
+
+def share_block(result):
+    """The text between the fences of the Share it block."""
+    m, v = result["machine"], result["versions"]
+    mem = f"{m['memory_gb']} GB" if m["memory_gb"] else "memory unknown"
+    libs = [f"ArrowMetal {v['arrowmetal']}", f"pyarrow {v['pyarrow']}"]
+    if v.get("polars"):
+        libs.append(f"Polars {v['polars']}")
+    if v.get("python"):
+        libs.append(f"Python {v['python']}")
+    what = "--parquet, your file" if "file" in result else "generated data"
+    router = os.environ.get("ARROWMETAL_ROUTER", "auto")
+    lines = [SHARE_HEADER,
+             f"chip: {m['chip']}",
+             f"macOS: {m['macos']}",
+             f"machine: {m['cores']} CPU cores, {mem}, Metal device {m['gpu']}",
+             f"versions: {', '.join(libs)}",
+             f"run: python -m arrowmetal.bench, {what}, {result['rows']:,} rows, router {router}, "
+             + ("results match pyarrow" if result["match"] else "MISMATCH against pyarrow")]
+    if "file" in result:
+        lines.append(file_line(result["file"]))
+    lines.append(f"router table: {result.get('router_table') or router_table_line()}")
+    lines.append("")
+    lines.append(markdown_table(result))
+    return "\n".join(lines)
+
+
+def parse_share_block(text):
+    """The Share it block (fences optional) -> {"chip", "macos", "machine", "versions" {name: version},
+    "run", "file" (a --parquet run), "router_table", "table" [{column: cell}]}. Raises ValueError on
+    text that is not a Share it block."""
+    lines = [ln.rstrip() for ln in text.strip().splitlines()]
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].startswith("```"):
+        lines = lines[:-1]
+    while lines and not lines[0]:
+        lines.pop(0)
+    if not lines or lines[0] != SHARE_HEADER:
+        raise ValueError(f"not a Share it block: the first line is not {SHARE_HEADER!r}")
+    keys = {"chip": "chip", "macOS": "macos", "machine": "machine", "versions": "versions", "run": "run",
+            "file": "file", "router table": "router_table"}
+    out, i = {}, 1
+    while i < len(lines) and lines[i]:
+        key, sep, value = lines[i].partition(": ")
+        if not sep or key not in keys:
+            raise ValueError(f"unexpected line in the Share it block: {lines[i]!r}")
+        out[keys[key]] = value
+        i += 1
+    for required in ("chip", "macos", "machine", "versions", "run", "router_table"):
+        if required not in out:
+            raise ValueError(f"the Share it block has no {required!r} line")
+    out["versions"] = dict(part.rsplit(" ", 1) for part in out["versions"].split(", "))
+    rows = [ln for ln in lines[i:] if ln.startswith("|")]
+    if len(rows) < 3:
+        raise ValueError("the Share it block has no result table")
+
+    def cells(ln):
+        return [c.strip() for c in ln.strip().strip("|").split("|")]
+    head = cells(rows[0])
+    out["table"] = [dict(zip(head, cells(r))) for r in rows[2:]]
+    return out
+
+
+def form_fields(block):
+    """The issue form's fields that come from the block: {"share", "chip", "os"}. "notes" is the
+    submitter's own text."""
+    parsed = parse_share_block(block)
+    body = block.strip()
+    if not body.startswith("```"):
+        body = "```\n" + body + "\n```"
+    return {"share": body, "chip": parsed["chip"], "os": "macOS " + parsed["macos"]}
 
 
 def report(result, quiet=False, share=True):
@@ -368,16 +473,15 @@ def report(result, quiet=False, share=True):
                f"once took {result['import_ms']:.1f} ms. Data generation {result['generate_s']:.1f} s, "
                f"whole run {result['total_s']:.1f} s. Router mode: {os.environ.get('ARROWMETAL_ROUTER', 'auto')} (the default).")
     if share:
+        block = share_block(result)
         out.append("")
-        out.append("Share it (nothing is sent by this script; copy the block below):")
+        out.append("Share it (nothing is sent by this script; copy the block below, fences included):")
         out.append("")
         out.append("```")
-        out.append(line)
-        out.append("")
-        out.append(markdown_table(result))
+        out.append(block)
         out.append("```")
         out.append("")
-        out.append(f"Open a prefilled issue: {issue_url(result)}")
+        out.append(f"Open a prefilled issue: {issue_url(result, share=block)}")
         out.append("or drop it in the #benchmarks channel of the ArrowMetal Discord (link in the README).")
     return "\n".join(out)
 
@@ -676,9 +780,9 @@ def report_parquet(result, quiet=False, share=True):
     out.append(f"Whole run {result['total_s']:.1f} s. Router mode: "
                f"{os.environ.get('ARROWMETAL_ROUTER', 'auto')} (the default).")
     if share:
-        block = line + "\n" + fline + "\n\n" + markdown_table(result)
+        block = share_block(result)
         out += ["", "Share it (nothing is sent by this script; the block holds the file's shape and the "
-                "timings, never its path, column names or values; copy it below):", "",
+                "timings, never its path, column names or values; copy it below, fences included):", "",
                 "```", block, "```", "",
                 f"Open a prefilled issue: {issue_url(result, share=block)}",
                 "or drop it in the #benchmarks channel of the ArrowMetal Discord (link in the README)."]
@@ -702,6 +806,7 @@ def main_parquet(path, a):
         print("arrowmetal.bench: " + no_column_line(info), file=sys.stderr)
         return 2
     result = run_parquet(path, use_polars=not a.no_polars, info=info)
+    result["router_table"] = router_table_line()
     if a.json:
         print(json.dumps(result, indent=2))
     else:
@@ -741,6 +846,12 @@ def main(argv=None):
     # the router chooses instead. The footer says which mode ran.
 
     result = run(a.rows, use_polars=not a.no_polars)
+    # --calibrate runs after the timings (so its sweep does not warm the GPU they measure) and before
+    # the report, so the Share it block names the table it wrote. A mismatch skips it.
+    written = None
+    if a.calibrate and result["match"]:
+        written = run_calibration(sys.stderr if a.json else sys.stdout)
+    result["router_table"] = router_table_line(written)
     if a.json:
         print(json.dumps(result, indent=2))
     else:
@@ -749,8 +860,6 @@ def main(argv=None):
         for line in result["problems"]:
             print("MISMATCH: " + line, file=sys.stderr)
         return 1
-    if a.calibrate:
-        run_calibration(sys.stderr if a.json else sys.stdout)
     return 0
 
 

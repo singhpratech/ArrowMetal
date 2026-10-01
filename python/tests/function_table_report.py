@@ -7,16 +7,21 @@
     PYTHONPATH=python python python/tests/function_table_report.py --page > docs/ARROW_FUNCTIONS.md
 
 With section names it prints only those sections, in the order given. `--page` writes the whole of
-`docs/ARROW_FUNCTIONS.md`, intro included, so that file is never edited by hand.
+`docs/ARROW_FUNCTIONS.md`, intro included, so that file is never edited by hand. Its last section, the
+differential matrix's cases by section, comes from the record `coverage_report.py` writes
+(docs/data/differential_coverage.json); `coverage_report.py` rewrites this page with every new record.
 
 The numbers come from `arrowmetal.functions`, the same table `python/tests/test_functions.py` calls
 row by row, so a status here has been executed against pyarrow.compute rather than asserted.
 """
+import os
 import sys
 
 import pyarrow.compute as pc
 
 from arrowmetal import functions as F
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 _INTRO = """# Apache Arrow compute functions, one row per name
 
@@ -97,11 +102,21 @@ ArrowMetalC`). Check the numbers first with:
 PYTHONPATH=python python -m pytest python/tests/test_functions.py -q
 ```
 
+The last section, the differential matrix's cases by section, is read from the matrix's recorded run
+(`docs/data/differential_coverage.json`). `PYTHONPATH=python python python/tests/coverage_report.py`
+runs the matrix, records it and rewrites this page together with the per-function table in
+[COVERAGE.md](COVERAGE.md#differential-cases-per-arrow-function).
+
 ## Summary by section
 """
 
 
-def page():
+def page(record=None):
+    """The whole of docs/ARROW_FUNCTIONS.md. `record` is the differential matrix's per-cell record
+    (coverage_report.RECORD); by default the committed one is read."""
+    import coverage_report
+    if record is None:
+        record = coverage_report.load_record()
     counts = F.status_counts()["Total"]
     hashes = sum(1 for n in F.list_functions() if n.startswith("hash_"))
     total = len(F.list_functions())
@@ -117,6 +132,8 @@ def page():
     out.append("## Every Arrow function name")
     out.append("")
     out.append(F.markdown_table())
+    out.append("")
+    out.append(coverage_report.arrow_functions_section(record))
     out.append("")
     out.append("---")
     out.append("")

@@ -1,5 +1,29 @@
 # Benchmark history
 
+## Submitting a result from your Mac
+
+Every round below was measured on one Apple M4 Max. A run on another Mac goes in as a GitHub issue:
+
+1. Run `python -m arrowmetal.bench` (10,000,000 generated rows; `--rows N` for another size,
+   `--parquet FILE` for your own file). With `--calibrate` it also runs the router's quick calibration
+   and writes this Mac's crossover table to `~/.arrowmetal/router/<chip>.json`.
+2. Copy the **Share it** block it prints, fences included. The block is one piece: an
+   `ArrowMetal bench result` line; `chip:`, `macOS:`, `machine:` (CPU cores, memory, Metal device),
+   `versions:` (ArrowMetal, pyarrow, Polars when installed, Python), `run:` (data, rows, router mode,
+   whether every answer matched pyarrow), `file:` for a `--parquet` run (shape and codecs only, never
+   the path, a column name or a value) and `router table:` (the table in force, with the home directory
+   written as `~`); then the result table, one row per operation with wall and CPU milliseconds for
+   each library and the speedup.
+3. Open the [Benchmark result](https://github.com/singhpratech/ArrowMetal/issues/new?template=benchmark_result.yml)
+   issue form (label `benchmark result`), or the prefilled link the command prints, which fills the
+   first three fields. The form has four: the block, the chip, the macOS version, and free text for
+   anything unusual about the machine or the run. A router table written by `--calibrate` can be
+   attached in the free-text field.
+
+Nothing is sent by the command. Submitted results are reviewed. `python/tests/test_bench_share.py`
+checks that the block parses back into the form's fields (`arrowmetal.bench.parse_share_block` and
+`form_fields`) and that the form declares exactly those fields.
+
 ## 2026-09-07, Apple M4 Max, round 10: the integration benchmarks rerun and recorded
 
 The four integration benchmark scripts were rerun and their complete stdout recorded as tracked
