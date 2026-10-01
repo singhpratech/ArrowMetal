@@ -811,7 +811,7 @@ final class StreamGroupTable {
 
 /// The per-group float64 sum of a batch, and the non-null count that comes out of the same pass.
 ///
-/// Bit-identical to `GroupBy.sumDouble` — the kernel reproduces that reduction's exact order — but
+/// Bit-identical to `GroupBy.sumDoubleOrdered` — the kernel reproduces that reduction's exact order — but
 /// one thread per group instead of one threadgroup, which is what a batch with a million groups of
 /// one row needs. Returns nil when the runs are long enough that a threadgroup each is the better
 /// shape; both give the same answer, so this is only a choice of dispatch.

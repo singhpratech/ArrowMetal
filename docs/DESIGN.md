@@ -239,19 +239,42 @@ converted column, `am.string_view_conversions()` counts conversions process-wide
 ## Group-by
 
 Dense group ids `0 ..< K` come out of `GroupByKeys`; everything below aggregates over them. There are
-three shapes, and the point of the current design is that **none of them sorts the key column**.
+four shapes, and the point of the current design is that **none of them sorts the key column**.
 
 **Atomic accumulation** (`Kernels/GroupBy.swift`, `GroupBySource.swift`) is one linear pass. For
 `K <= 1024` each threadgroup keeps a private table in threadgroup memory and merges it into the device
 table once; above that the updates go straight to device memory. 64-bit sums are a pair of 32-bit atomic
 adds with an explicit carry, because Metal has no 64-bit atomic add (only min and max, UPSTREAM.md).
 
+**Correctly rounded Float64 sums** (`Kernels/GroupSumExact.swift`, `GroupSumExactSource.swift`) give
+`sum` and `mean` over Float64 values without any group order. A correctly rounded sum does not depend on
+the order of its terms, so the rows are added where they lie, in two passes of 32-bit atomics. Pass one
+takes each group's largest exponent (an atomic max of the 11-bit field), counts its values and notes
+NaN, ±inf and +0.0 in a flags word. Pass two writes each value as an integer in a fixed-point window
+whose unit is `2^-G` of the group's largest exponent's last bit and adds it to a 128-bit
+two's-complement accumulator, one 32-bit word at a time with the carry (or borrow) taken from each
+word's own read-modify-write, so the words hold the exact sum modulo 2^128 however the rows interleave.
+`G = 74 - bitlength(rows)`: 53 significand bits, `G` guard bits and `bitlength(rows)` of headroom stay
+below the sign bit, so no sum can overflow it. A value whose last bits fall below the window is
+truncated and counted. The finalize, a thread per group, rounds once to nearest-even: with nothing
+truncated the accumulator is the exact sum, and the mean is the exact sum divided by the count in a
+long division, rounded once. With `d` values truncated the exact sum lies strictly between `W - d` and
+`W + d` units; the result is taken when both ends round to the same double, and the rare group whose
+rounding the window cannot settle (or that holds a NaN other than the canonical one) is summed exactly
+on the host, from its rows alone. Both come out of one call, which the `GroupBy` keeps, so a `sum` and
+a `mean` of the same column cost one pair of passes. Up to 1,024 groups each threadgroup accumulates in
+threadgroup memory and merges once, as the atomic accumulation does.
+
 **Sort-free extremes** (`Kernels/GroupByExtrema.swift`) is how `min`, `max` and `hash_min_max` avoid the
 missing 64-bit atomic. Every element type maps order-preservingly into a 64-bit unsigned key. Pass one
-takes the extremes of that key's **high** word with 32-bit atomics and counts the values; pass two takes
-the extremes of the **low** word among only the rows whose high word already equals the winner. Some row
-attains the winning high word, and among those the smallest low word is the overall minimum, so the
-answer is exact. Types four bytes wide or narrower skip pass one — their whole key is the low word.
+takes the extremes of that key's **high** word with 32-bit atomics; pass two takes the extremes of the
+**low** word among only the rows whose high word already equals the winner. Some row attains the winning
+high word, and among those the smallest low word is the overall minimum, so the answer is exact. Types
+four bytes wide or narrower skip pass one — their whole key is the low word. A group's four words sit
+together in one 16-byte entry, a row reads them before it writes and issues an atomic only when it
+improves on what it read, and no count is kept: a group has a value exactly when its minimum key is at
+or below its maximum key, which the empty identities never are. Both extremes come out of one call,
+which the `GroupBy` keeps, so a `min` and a `max` of the same column cost one pair of passes.
 `first` / `last` ride the same kernel over a masked row index.
 
 **Counting sort by group id** (`Kernels/GroupOrder.swift`, `GroupOrderSource.swift`) replaces the argsort

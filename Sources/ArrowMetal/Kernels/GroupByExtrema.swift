@@ -13,8 +13,12 @@ extension GroupBy {
 
     /// Both extremes of each key's non-null values, from two linear passes. NaN is skipped, so a key
     /// whose only values are NaN is null, exactly as `minMax` promised on the segmented path.
+    ///
+    /// Both come out of the same passes, so the last column's pair is kept on the `GroupBy` (weakly
+    /// keyed by the column): a `min` and a `max` of one column cost one call.
     func extrema<T: ArrowPrimitive>(_ values: MetalArray<T>) throws -> (min: MetalArray<T>, max: MetalArray<T>) {
         guard values.length == keys.length else { throw ArrowMetalError.lengthMismatch(keys.length, values.length) }
+        if let hit = cache.lookup(.extrema, values) as? (min: MetalArray<T>, max: MetalArray<T>) { return hit }
         try Dispatch.checkLength(keys.length)
         let ctx = keys.context
         let n = keys.length
@@ -25,14 +29,10 @@ extension GroupBy {
         func pso(_ f: String) throws -> MTLComputePipelineState {
             try Dispatch.pipeline(ctx, family: "groupextrema", source: src, function: f, type: cacheType)
         }
-        let hiMin = try MetalArrowBuffer.allocate(byteCount: kc * 4, zeroed: false, context: ctx)
-        let hiMax = try MetalArrowBuffer.allocate(byteCount: kc * 4, zeroed: false, context: ctx)
-        let loMin = try MetalArrowBuffer.allocate(byteCount: kc * 4, zeroed: false, context: ctx)
-        let loMax = try MetalArrowBuffer.allocate(byteCount: kc * 4, zeroed: false, context: ctx)
-        let cnt = try MetalArrowBuffer.allocate(byteCount: kc * 4, zeroed: false, context: ctx)
+        let table = try MetalArrowBuffer.allocate(byteCount: Swift.max(kc, 1) * 16, zeroed: false, context: ctx)
         let outMin = try MetalArrowBuffer.allocate(byteCount: Swift.max(kc, 1) * T.byteWidth, zeroed: false, context: ctx)
         let outMax = try MetalArrowBuffer.allocate(byteCount: Swift.max(kc, 1) * T.byteWidth, zeroed: false, context: ctx)
-        let validBytes = try MetalArrowBuffer.allocate(byteCount: Swift.max(kc, 1), context: ctx)
+        let validBytes = try MetalArrowBuffer.allocate(byteCount: Swift.max(kc, 1), zeroed: false, context: ctx)
 
         let priv = kc <= GroupByExtremaSource.maxPrivateKeys
         let numTG = Swift.max(1, Swift.min(priv ? 1024 : 4096, (n + 4095) / 4096))
@@ -56,57 +56,44 @@ extension GroupBy {
             Dispatch.setUInt(enc, flags, index: 5)
             Dispatch.setUInt(enc, kc, index: 6)
             Dispatch.setUInt(enc, chunk, index: 7)
+            enc.setBuffer(table.mtl, offset: 0, index: 8)
         }
 
         try ctx.run { enc in
             enc.setComputePipelineState(initPSO)
-            enc.setBuffer(hiMin.mtl, offset: 0, index: 0)
-            enc.setBuffer(hiMax.mtl, offset: 0, index: 1)
-            enc.setBuffer(loMin.mtl, offset: 0, index: 2)
-            enc.setBuffer(loMax.mtl, offset: 0, index: 3)
-            enc.setBuffer(cnt.mtl, offset: 0, index: 4)
-            Dispatch.setUInt(enc, kc, index: 5)
+            enc.setBuffer(table.mtl, offset: 0, index: 0)
+            Dispatch.setUInt(enc, kc, index: 1)
             Dispatch.dispatch1D(enc, initPSO, count: kc)
             enc.memoryBarrier(scope: .buffers)
             if n > 0, let hiPSO {
                 enc.setComputePipelineState(hiPSO)
                 bindRows(enc)
-                enc.setBuffer(hiMin.mtl, offset: 0, index: 8)
-                enc.setBuffer(hiMax.mtl, offset: 0, index: 9)
-                enc.setBuffer(cnt.mtl, offset: 0, index: 10)
                 enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
                 enc.memoryBarrier(scope: .buffers)
             }
             if n > 0 {
                 enc.setComputePipelineState(loPSO)
                 bindRows(enc)
-                enc.setBuffer(hiMin.mtl, offset: 0, index: 8)
-                enc.setBuffer(hiMax.mtl, offset: 0, index: 9)
-                enc.setBuffer(loMin.mtl, offset: 0, index: 10)
-                enc.setBuffer(loMax.mtl, offset: 0, index: 11)
-                enc.setBuffer(cnt.mtl, offset: 0, index: 12)
+                enc.setBuffer(table.mtl, offset: 0, index: 9)       // the high words, read plainly
                 enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
                 enc.memoryBarrier(scope: .buffers)
             }
             enc.setComputePipelineState(packPSO)
-            enc.setBuffer(hiMin.mtl, offset: 0, index: 0)
-            enc.setBuffer(hiMax.mtl, offset: 0, index: 1)
-            enc.setBuffer(loMin.mtl, offset: 0, index: 2)
-            enc.setBuffer(loMax.mtl, offset: 0, index: 3)
-            enc.setBuffer(cnt.mtl, offset: 0, index: 4)
-            Dispatch.setUInt(enc, kc, index: 5)
-            enc.setBuffer(outMin.mtl, offset: 0, index: 6)
-            enc.setBuffer(outMax.mtl, offset: 0, index: 7)
-            enc.setBuffer(validBytes.mtl, offset: 0, index: 8)
+            enc.setBuffer(table.mtl, offset: 0, index: 0)
+            Dispatch.setUInt(enc, kc, index: 1)
+            enc.setBuffer(outMin.mtl, offset: 0, index: 2)
+            enc.setBuffer(outMax.mtl, offset: 0, index: 3)
+            enc.setBuffer(validBytes.mtl, offset: 0, index: 4)
             Dispatch.dispatch1D(enc, packPSO, count: kc)
         }
-        ctx.retainUntilFlush(keys); ctx.retainUntilFlush(values)
+        ctx.retainUntilFlush(keys); ctx.retainUntilFlush(values); ctx.retainUntilFlush(table)
         let bmMin = try BitmapOps.packBits(ctx, bytes: validBytes, bits: kc)
         let bmMax = try BitmapOps.packBits(ctx, bytes: validBytes, bits: kc)
         try ctx.syncPoint()
         let lo = MetalArray<T>(length: kc, nullCount: 0, validity: bmMin, values: outMin, context: ctx)
         let hi = MetalArray<T>(length: kc, nullCount: 0, validity: bmMax, values: outMax, context: ctx)
         lo.recomputeNullCount(); hi.recomputeNullCount()
+        cache.store(.extrema, values, (min: lo, max: hi))
         return (lo, hi)
     }
 }

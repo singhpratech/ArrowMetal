@@ -2,6 +2,133 @@
 
 Things learned the hard way. Add to this whenever something surprises you.
 
+## Round 16 (2026-09-30): Float64 group sums without a group order
+
+**What.** Float64 group-by aggregates were the slowest ones ArrowMetal ran. Over 50M rows a Float64
+`sum` took 10.62 ms at 200 groups, 39.78 ms at 1M groups and 227.11 ms at 25M groups (rows / 2),
+where an Int64 `sum` took 1.73, 7.94 and 52.16 ms and `count` 1.00, 1.66 and 15.29 ms
+(`Benchmarks/results/groupby_float64_profile_2026-09-30.csv`, the Swift API, best of 5).
+
+**Where the time went.** A Float64 sum put each group's rows together first (the counting sort by
+group id, `GroupBy.segments()`: 7.02 ms at 200 groups, 29.20 ms at 1M, 92.60 ms at 25M) and then gave
+a 256-thread threadgroup to each group, which added its run in a fixed tree order (3.64, 10.38 and
+134.15 ms). The order was the reason for the sort: the tree is what made the answer reproducible. At
+200 groups that reduction ran 200 threadgroups over 250,000 rows each; at 25M groups it launched 6.4
+billion threads for 50M additions. `min` and `max` took two passes of 32-bit atomics, with three
+atomic updates per row in the first (the high word's minimum and maximum, and a count) spread over
+four arrays, and a plan with a `min` and a `max` of one column ran both passes twice.
+
+**Change.** A correctly rounded sum does not depend on the order of its terms, so Float64 `sum` and
+`mean` no longer build a group order (`Kernels/GroupSumExact.swift`, DESIGN.md "Group-by"):
+
+- Pass one takes each group's largest exponent with an atomic max of the 11-bit field, counts its
+  values, and records NaN, ±inf and whether a +0.0 was seen.
+- Pass two writes each value as an integer in a per-group fixed-point window, `G = 74 -
+  bitlength(rows)` bits below the last bit of the group's largest exponent, and adds it to a 128-bit
+  two's-complement accumulator with 32-bit atomics that carry (or borrow) word by word. Each word's
+  carry comes from its own read-modify-write, so the four words hold the exact sum modulo 2^128 in any
+  interleaving, and the headroom keeps every sum inside it. A value whose last bits fall below the
+  window is truncated and counted.
+- A thread per group rounds once to nearest-even. With nothing truncated that is the correctly
+  rounded sum, and the mean is the 128-bit sum divided by the count in a long division, rounded once
+  (a power-of-two count is a shift). With `d` truncated values the exact sum lies strictly between
+  `W - d` and `W + d` units, and the result stands when both ends round to the same double. A group
+  whose rounding that cannot settle, or that holds a NaN other than `0x7FF8000000000000`, is summed on
+  the host from its own rows with an exact 2,240-bit accumulator.
+- Up to 1,024 groups each threadgroup accumulates in threadgroup memory and merges once.
+
+`min` and `max` keep their two passes and change their table: a group's four words sit in one
+16-byte entry, a row in pass one reads them and issues an atomic only when it improves on what it
+read, pass two reads the finished high words through a plain view of the table, and no count is
+kept (a group has a value exactly when its minimum key is at or below its maximum key). A `sum` and
+a `mean`, or a `min` and a `max`, of one column on one grouping share one call.
+
+**Behaviour change.** Grouped Float64 `sum` is now correctly rounded: the binary64 value nearest the
+exact sum of the group's non-null values, ties to even, equal to `math.fsum` of those values. It no
+longer depends on row order, it differs from the earlier ordered sum in the last bits of some groups,
+and it is never further from the exact sum than that sum. `mean` is the exact sum divided by the
+count, rounded once. A group whose exact sum is finite returns it where a running sum overflowed
+(`[max, max, -max]` gives `max`); one whose exact sum is beyond the largest double gives ±inf. NaN
+in a group gives NaN: the canonical quiet NaN when every NaN of the group is that one, else the
+group's first NaN in row order, quieted. +inf with -inf gives the canonical quiet NaN; an exact zero
+is -0.0 only when every value is -0.0. `min` and `max` return the same bits as before. The streaming
+group-by keeps the ordered sum, so its per-batch, resident and host paths stay bit-identical to each
+other.
+
+**Measured.** The builds before and after, timed alternately in three rounds, with a warm-up of at
+least 100 ms before each case and the first run after 500 ms of idle recorded apart
+(`Benchmarks/results/groupby_float64_2026-09-30.csv`; every round in `…_raw_…`, the conditions in
+`…_conditions.txt`). The array API is one `am.group_by(keys)` and one aggregate per call; the plan
+runner is a warm `collect()`. At 50M rows, one int32 key, no nulls:
+
+| aggregate | groups | array API | plan runner |
+|---|---:|---:|---:|
+| `sum` | 200 | 12.73 → 5.62 ms (2.27x) | 14.87 → 7.77 ms (1.91x) |
+| `sum` | 1,000,000 | 43.50 → 17.69 ms (2.46x) | 47.75 → 22.11 ms (2.16x) |
+| `sum` | 25,000,000 | 283.67 → 197.05 ms (1.44x) | 328.73 → 242.34 ms (1.36x) |
+| `min` | 1,000,000 | 14.59 → 9.68 ms (1.51x) | 18.31 → 13.59 ms (1.35x) |
+| `min` + `max` | 1,000,000 | 14.04 → 9.57 ms (1.47x) | 28.86 → 13.63 ms (2.12x) |
+| `min` + `max` | 25,000,000 | 176.05 → 130.96 ms (1.34x) | 300.75 → 175.30 ms (1.72x) |
+
+Over every 50M-row case (one and two keys, 0 and 10% nulls, 200 to 25M groups), best of the rounds:
+`sum` and `mean` 1.41x-2.66x (array API) and 1.34x-2.33x (plan runner); `min` + `max` 0.98x-1.49x and
+1.29x-2.12x; `min` or `max` alone 0.96x-1.51x and 0.95x-1.35x. `count`, an Int64 `sum` and a Float32
+`sum` in the same runs are 0.96x-1.04x. The kernels alone at 50M rows: `sum` 10.62 → 3.48 ms (200
+groups), 23.78 → 9.02 ms (10,000), 39.78 → 14.17 ms (1M), 227.11 → 110.43 ms (25M); `min` + `max`
+10.64 → 5.91 ms (1M) and 82.82 → 35.65 ms (25M).
+
+Polars `MetalEngine()` (`Benchmarks/results/polars_engine_groupby_float64_2026-09-30.csv`, three
+alternating rounds, every result equal to Polars'): at 50M rows the Float64 `min` + `max` grid cases
+the default runs on the GPU are 1.19x-2.59x faster (1M groups, one key: 48.36 → 18.67 ms) and `(l)`
+Float64 `sum` + `mean` is 46.12 → 29.68 ms. At 2M rows six case-engine pairs were slower in that run;
+timed again alone, eight alternating rounds of 100 runs
+(`Benchmarks/results/polars_engine_groupby_float64_retime_2026-09-30.csv`), none is slower in both
+best and median: the Float64 `min` + `max` cases are 1.18x-1.38x faster cold (`g1minmax10k` 1.90 →
+1.43 ms, `g2minmax10k` 2.28 → 1.82 ms, `t7` 2.18 → 1.58 ms), the Int64 `g1sum1M` 1.04x, and the
+default's `g1minmax200` and `t4`, which it does not run on the GPU at 2M rows, 0.98x-1.02x. Through the DataFusion rule forced on at 50M rows
+(`datafusion/results/datafusion_float64_groupby_2026-09-30.csv`, one run of each build): Float64
+`sum` and `avg` 1.33x-1.82x faster than before (1M groups: 58.03 → 31.95 ms against DataFusion
+alone's 55.51 ms), `MIN` + `MAX` 1.06x-1.19x.
+
+**The 10M-row, 10,000-group min/max rows.** In the alternating run and in eight further rounds of
+100 calls each (`Benchmarks/results/groupby_float64_retime_2026-09-30.csv`), ten Float64 `min`/`max`
+rows at 10M rows were slower in both best and median, nine of them at 10,000 groups (best
+0.60x-0.92x, median 0.71x-0.88x). Their first run after 500 ms of idle was faster than before in
+the same file (one key, `max`: 8.60 → 7.09 ms). The time they lost was in the GPU's state after a
+loop of the new kernel, not in the kernel
+(`Benchmarks/results/groupby_float64_minmax_state_2026-09-30.csv`, eight rounds per build):
+
+- A `count` over the same grouping, the same code in both builds, took 0.40 and 0.32 ms (best; one
+  key, two keys with nulls) after a loop of the earlier `max`, 0.46 and 0.49 ms after a loop of the
+  new one, and 0.41 and 0.38 ms on the new build with the earlier `max` kernel in place of the new
+  one; run first in the process, before any `max`, it took 0.44-0.47 ms in every build.
+- With the same 50M-row Int64 group sum run before every timed call in both builds, the new `max`
+  was faster: 1.38 → 1.12 ms best and 1.57 → 1.36 ms median (one key), 1.28 → 1.09 ms and 1.50 →
+  1.34 ms (two keys, 10% nulls); the `count` beside it was unchanged (0.42 → 0.40 ms and 0.38 →
+  0.39 ms best).
+- In fresh processes that time only `am.group_by(keys).max(values)`, at 5M, 10M and 20M rows and
+  3,000, 10,000 and 30,000 groups, warm loop and with the same heater, the new build was faster in
+  17 of 18 cells in best and 17 of 18 in median (10M rows, 10,000 groups, warm loop: 1.85 → 1.72 ms
+  best, 3.21 → 2.39 ms median); no cell was slower in both.
+
+**To improve.** Through the DataFusion rule, a Float64 `MIN`/`MAX` carries four helper aggregates per
+extreme (the NaN, value, zero and negative-zero counts, each a sum over an `if_else`), which take
+most of the plan: 36.88 ms at 200 groups from 50M rows, where the plan runner's own `min` + `max`
+takes 7.34 ms. At 25M groups from 50M rows the grouping itself (`am.group_by(keys)` with a `count`)
+is 110.12 ms of the 197.05 ms `sum`.
+
+**Tests.** `GroupSumExactTests` (Swift) checks sums and means against an independent correctly
+rounded reference (CPython's `msum` partials with its half-even correction, and a residual check of
+each mean against its two neighbours) over 1 to 100,000 groups on both sides of the private-table
+limit, with null and out-of-range keys, null values, magnitudes spread over 2^-300 to 2^300,
+hand-built groups of cancellation, signed zeros, subnormals, overflow, ties and every special value
+on both paths, cancellation-heavy groups of 10^15 to 10^17 terms that cancel, 2^24 + 3 groups, and
+`min`/`max` over Float64 (NaN, both zeros, inf), Int64 near its maximum, Float32 and UInt32 against a
+host reference. `python/tests/test_group_sum_exact.py` checks the array API and the plan runner
+against the exact `Fraction` sum and mean of each group, and two differential rows,
+`group_by_sum_correctly_rounded` and `group_by_mean_correctly_rounded`, check every shape of the
+matrix bit for bit against the exact value rounded once.
+
 ## Round 15 (2026-09-27): a count that depended on its neighbours
 
 **What.** `count(expr)` in a plan's `group_by` gave three different answers for one column depending

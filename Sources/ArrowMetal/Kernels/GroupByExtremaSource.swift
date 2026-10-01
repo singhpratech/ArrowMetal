@@ -7,7 +7,7 @@ import Foundation
 /// order-preserving map into a 64-bit unsigned key, and the minimum of a set of 64-bit unsigned keys can
 /// be found with two passes of **32-bit** atomics.
 ///
-/// - Pass 1 takes the minimum (and maximum) of the *high* 32 bits of the key, and counts the values.
+/// - Pass 1 takes the minimum (and maximum) of the *high* 32 bits of the key.
 /// - Pass 2 takes the minimum of the *low* 32 bits among only those rows whose high word already equals
 ///   the winning high word. Since some row attains the winning high word, and among those rows the one
 ///   with the smallest low word is the overall minimum, the answer is exact.
@@ -19,6 +19,14 @@ import Foundation
 /// Contention is handled the way `GroupBySource` handles it: for `K <= 1024` each threadgroup keeps a
 /// private table in threadgroup memory and merges it into the device table once at the end, so the
 /// device atomics see `numThreadgroups * K` updates instead of one per row.
+///
+/// The device table keeps a group's four words together (`hiMin, hiMax, loMin, loMax`, 16 bytes), so
+/// a row touches one cache line rather than one in each of four arrays. A row reads its group's words
+/// before it writes them and issues an atomic only when it improves on what it read: once a group has
+/// seen a few rows almost no row does, so almost every row costs a read instead of a read-modify-write.
+/// A stale read only costs an atomic that changes nothing. No count is kept: a group has a value
+/// exactly when its minimum key is at or below its maximum key, which the identities (all ones for the
+/// minimum, zero for the maximum) never satisfy.
 ///
 /// Nulls follow Arrow: a null key or a key outside `[0, K)` contributes nothing, null values are
 /// skipped, NaN is skipped, and a key with no valid value comes back null.
@@ -72,35 +80,30 @@ enum GroupByExtremaSource {
         inline uint gx_f32key(float f) { uint b = as_type<uint>(f); return (b & 0x80000000u) ? ~b : (b | 0x80000000u); }
         inline float gx_f32unkey(uint o) { return as_type<float>((o & 0x80000000u) ? (o & 0x7FFFFFFFu) : ~o); }
 
-        // Every group's tables back to their identities.
-        kernel void gxm_init(device uint* hiMin [[buffer(0)]], device uint* hiMax [[buffer(1)]],
-                             device uint* loMin [[buffer(2)]], device uint* loMax [[buffer(3)]],
-                             device uint* cnt [[buffer(4)]], constant uint& K [[buffer(5)]],
+        // Every group's four words back to their identities. A key four bytes wide or narrower has a
+        // high word of zero on every row, so pass 1 is skipped and its high words start at that zero.
+        kernel void gxm_init(device uint4* t [[buffer(0)]], constant uint& K [[buffer(1)]],
                              uint k [[thread_position_in_grid]]) {
             if (k >= K) return;
-            // A key four bytes wide or narrower has a high word of zero on every row, so pass 1 is
-            // skipped and the identities of the high tables are that zero, not the empty extremes.
-            hiMin[k] = \(s.wide ? "0xFFFFFFFFu" : "0u"); hiMax[k] = 0u;
-            loMin[k] = 0xFFFFFFFFu; loMax[k] = 0u;
-            cnt[k] = 0u;
+            t[k] = uint4(\(s.wide ? "0xFFFFFFFFu" : "0u"), 0u, 0xFFFFFFFFu, 0u);
         }
 
         // (hiMin, loMin) and (hiMax, loMax) back into the two element values, plus a validity byte.
         // Doing the inverse map here is what keeps the whole aggregate off the host: a group count of
         // ten million would otherwise be ten million iterations of a generic Swift loop.
-        kernel void gxm_pack(device const uint* hiMin [[buffer(0)]], device const uint* hiMax [[buffer(1)]],
-                             device const uint* loMin [[buffer(2)]], device const uint* loMax [[buffer(3)]],
-                             device const uint* cnt [[buffer(4)]], constant uint& K [[buffer(5)]],
-                             device \(s.outType)* outMin [[buffer(6)]], device \(s.outType)* outMax [[buffer(7)]],
-                             device uchar* valid [[buffer(8)]],
+        kernel void gxm_pack(device const uint4* t [[buffer(0)]], constant uint& K [[buffer(1)]],
+                             device \(s.outType)* outMin [[buffer(2)]], device \(s.outType)* outMax [[buffer(3)]],
+                             device uchar* valid [[buffer(4)]],
                              uint k [[thread_position_in_grid]]) {
             if (k >= K) return;
-            uint c = cnt[k];
+            uint4 g = t[k];
+            ulong umin = ((ulong)g.x << 32) | (ulong)g.z, umax = ((ulong)g.y << 32) | (ulong)g.w;
+            bool c = umin <= umax;
             valid[k] = c ? 1 : 0;
             if (!c) { outMin[k] = (\(s.outType))0; outMax[k] = (\(s.outType))0; return; }
-            ulong u = ((ulong)hiMin[k] << 32) | (ulong)loMin[k];
+            ulong u = umin;
             outMin[k] = \(s.unkeyExpr);
-            u = ((ulong)hiMax[k] << 32) | (ulong)loMax[k];
+            u = umax;
             outMax[k] = \(s.unkeyExpr);
         }
 
@@ -108,7 +111,7 @@ enum GroupByExtremaSource {
         var out = common
         for space in ["priv", "dev"] {
             if s.wide { out += pass1(space: space, s: s, KT: KT) }
-            out += pass2(space: space, s: s, KT: KT, countHere: !s.wide)
+            out += pass2(space: space, s: s, KT: KT)
         }
         return out
     }
@@ -134,28 +137,30 @@ enum GroupByExtremaSource {
                                  constant uint& flags [[buffer(5)]],
                                  constant uint& K [[buffer(6)]],
                                  constant uint& chunk [[buffer(7)]],
+                                 device atomic_uint* t [[buffer(8)]],
+                                 uint lid [[thread_index_in_threadgroup]],
+                                 uint tgid [[threadgroup_position_in_grid]]
     """ }
 
-    /// Pass 1: the extremes of the high word, and the count of contributing values.
+    /// `atomic_fetch_min` / `max` of `x` into `p`, issued only when `x` improves on what `p` holds now.
+    private static func improve(_ op: String, _ p: String, _ x: String) -> String {
+        let cmp = op == "min" ? "<" : ">"
+        return "if (\(x) \(cmp) atomic_load_explicit(\(p), memory_order_relaxed)) atomic_fetch_\(op)_explicit(\(p), \(x), memory_order_relaxed);"
+    }
+
+    /// Pass 1: the extremes of the high word.
     private static func pass1(space: String, s: Shape, KT: String) -> String {
         let priv = space == "priv"
-        let decl = priv ? "threadgroup atomic_uint tMin[MAXK]; threadgroup atomic_uint tMax[MAXK]; threadgroup atomic_uint tCnt[MAXK];" : ""
-        let minRef = priv ? "&tMin[k]" : "&hiMin[k]"
-        let maxRef = priv ? "&tMax[k]" : "&hiMax[k]"
-        let cntRef = priv ? "&tCnt[k]" : "&cnt[k]"
+        let decl = priv ? "threadgroup atomic_uint tMin[MAXK]; threadgroup atomic_uint tMax[MAXK];" : ""
+        let minRef = priv ? "&tMin[k]" : "&g[0]"
+        let maxRef = priv ? "&tMax[k]" : "&g[1]"
         return """
-        kernel void gxm_hi_\(space)(\(args(s, KT: KT))
-                                 device atomic_uint* hiMin [[buffer(8)]],
-                                 device atomic_uint* hiMax [[buffer(9)]],
-                                 device atomic_uint* cnt [[buffer(10)]],
-                                 uint lid [[thread_index_in_threadgroup]],
-                                 uint tgid [[threadgroup_position_in_grid]]) {
+        kernel void gxm_hi_\(space)(\(args(s, KT: KT))) {
             \(decl)
             \(priv ? """
             for (uint k = lid; k < K; k += TG) {
                 atomic_store_explicit(&tMin[k], 0xFFFFFFFFu, memory_order_relaxed);
                 atomic_store_explicit(&tMax[k], 0u, memory_order_relaxed);
-                atomic_store_explicit(&tCnt[k], 0u, memory_order_relaxed);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             """ : "")
@@ -163,18 +168,19 @@ enum GroupByExtremaSource {
             for (uint i = start + lid; i < end; i += TG) {
         \(rowPrologue(s, KT: KT))
                 uint hi = (uint)(u >> 32);
-                atomic_fetch_min_explicit(\(minRef), hi, memory_order_relaxed);
-                atomic_fetch_max_explicit(\(maxRef), hi, memory_order_relaxed);
-                atomic_fetch_add_explicit(\(cntRef), 1u, memory_order_relaxed);
+                \(priv ? "" : "device atomic_uint* g = &t[(ulong)k * 4ul];")
+                \(improve("min", minRef, "hi"))
+                \(improve("max", maxRef, "hi"))
             }
             \(priv ? """
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint k = lid; k < K; k += TG) {
-                uint c = atomic_load_explicit(&tCnt[k], memory_order_relaxed);
-                if (!c) continue;
-                atomic_fetch_min_explicit(&hiMin[k], atomic_load_explicit(&tMin[k], memory_order_relaxed), memory_order_relaxed);
-                atomic_fetch_max_explicit(&hiMax[k], atomic_load_explicit(&tMax[k], memory_order_relaxed), memory_order_relaxed);
-                atomic_fetch_add_explicit(&cnt[k], c, memory_order_relaxed);
+                uint a = atomic_load_explicit(&tMin[k], memory_order_relaxed);
+                uint b = atomic_load_explicit(&tMax[k], memory_order_relaxed);
+                if (a > b) continue;                          // no value of this key in this threadgroup
+                device atomic_uint* g = &t[(ulong)k * 4ul];
+                \(improve("min", "&g[0]", "a"))
+                \(improve("max", "&g[1]", "b"))
             }
             """ : "")
         }
@@ -183,34 +189,29 @@ enum GroupByExtremaSource {
     }
 
     /// Pass 2: the extremes of the low word among the rows that already hold the winning high word.
-    /// When the key is 32 bits or narrower the high word is zero everywhere, so this pass also counts.
-    private static func pass2(space: String, s: Shape, KT: String, countHere: Bool) -> String {
+    /// When the key is 32 bits or narrower the high word is zero everywhere, so every row takes part.
+    private static func pass2(space: String, s: Shape, KT: String) -> String {
         let priv = space == "priv"
         let decl = priv
             ? "threadgroup atomic_uint tMin[MAXK]; threadgroup atomic_uint tMax[MAXK]; threadgroup uint sHiMin[MAXK]; threadgroup uint sHiMax[MAXK];"
-              + (countHere ? " threadgroup atomic_uint tCnt[MAXK];" : "")
             : ""
-        let minRef = priv ? "&tMin[k]" : "&loMin[k]"
-        let maxRef = priv ? "&tMax[k]" : "&loMax[k]"
-        let hiMinRef = priv ? "sHiMin[k]" : "hiMin[k]"
-        let hiMaxRef = priv ? "sHiMax[k]" : "hiMax[k]"
-        let cntRef = priv ? "&tCnt[k]" : "&cnt[k]"
+        let minRef = priv ? "&tMin[k]" : "&g[2]"
+        let maxRef = priv ? "&tMax[k]" : "&g[3]"
+        // The high words are final after pass 1 and this pass never writes them, so they are read
+        // through a plain (cacheable) view of the table, `th`, rather than as atomics: at a few
+        // thousand groups the table stays in cache and an atomic load would go past it on every row.
+        let hiMin = priv ? "sHiMin[k]" : "hw.x"
+        let hiMax = priv ? "sHiMax[k]" : "hw.y"
         return """
-        kernel void gxm_lo_\(space)(\(args(s, KT: KT))
-                                 device const uint* hiMin [[buffer(8)]],
-                                 device const uint* hiMax [[buffer(9)]],
-                                 device atomic_uint* loMin [[buffer(10)]],
-                                 device atomic_uint* loMax [[buffer(11)]],
-                                 device atomic_uint* cnt [[buffer(12)]],
-                                 uint lid [[thread_index_in_threadgroup]],
-                                 uint tgid [[threadgroup_position_in_grid]]) {
+        kernel void gxm_lo_\(space)(\(args(s, KT: KT)),
+                                 device const uint2* th [[buffer(9)]]) {
             \(decl)
             \(priv ? """
             for (uint k = lid; k < K; k += TG) {
                 atomic_store_explicit(&tMin[k], 0xFFFFFFFFu, memory_order_relaxed);
                 atomic_store_explicit(&tMax[k], 0u, memory_order_relaxed);
-                sHiMin[k] = hiMin[k]; sHiMax[k] = hiMax[k];
-                \(countHere ? "atomic_store_explicit(&tCnt[k], 0u, memory_order_relaxed);" : "")
+                uint2 hw = th[(ulong)k * 2ul];
+                sHiMin[k] = hw.x; sHiMax[k] = hw.y;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             """ : "")
@@ -218,23 +219,18 @@ enum GroupByExtremaSource {
             for (uint i = start + lid; i < end; i += TG) {
         \(rowPrologue(s, KT: KT))
                 uint hi = (uint)(u >> 32), lo = (uint)u;
-                \(countHere ? "atomic_fetch_add_explicit(\(cntRef), 1u, memory_order_relaxed);" : "")
-                if (hi == \(hiMinRef)) atomic_fetch_min_explicit(\(minRef), lo, memory_order_relaxed);
-                if (hi == \(hiMaxRef)) atomic_fetch_max_explicit(\(maxRef), lo, memory_order_relaxed);
+                \(priv ? "" : "device atomic_uint* g = &t[(ulong)k * 4ul]; uint2 hw = th[(ulong)k * 2ul];")
+                if (hi == \(hiMin)) { \(improve("min", minRef, "lo")) }
+                if (hi == \(hiMax)) { \(improve("max", maxRef, "lo")) }
             }
             \(priv ? """
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint k = lid; k < K; k += TG) {
                 uint a = atomic_load_explicit(&tMin[k], memory_order_relaxed);
                 uint b = atomic_load_explicit(&tMax[k], memory_order_relaxed);
-                if (a != 0xFFFFFFFFu || b != 0u) {
-                    atomic_fetch_min_explicit(&loMin[k], a, memory_order_relaxed);
-                    atomic_fetch_max_explicit(&loMax[k], b, memory_order_relaxed);
-                }
-                \(countHere ? """
-                uint c = atomic_load_explicit(&tCnt[k], memory_order_relaxed);
-                if (c) atomic_fetch_add_explicit(&cnt[k], c, memory_order_relaxed);
-                """ : "")
+                device atomic_uint* g = &t[(ulong)k * 4ul];
+                if (a != 0xFFFFFFFFu) { \(improve("min", "&g[2]", "a")) }
+                if (b != 0u) { \(improve("max", "&g[3]", "b")) }
             }
             """ : "")
         }

@@ -472,6 +472,11 @@ translatable subtrees it runs: the defaults").
   atomics support (MSL has no 64-bit atomic add): `sum`/`mean` over any integer or `float32`,
   `min`/`max` over a 32-bit-or-narrower integer or `float32`. Anything else — a `float64` sum, a
   64-bit `min` — silently takes `GroupBy`'s own per-aggregate kernels instead, which `explain()` says.
+  There a Float64 `sum` is correctly rounded (the binary64 value nearest the exact sum of the group's
+  non-null values, ties to even) and a Float64 `mean` is the exact sum divided by the count, rounded
+  once; both come from two passes over the rows with no group order ([DESIGN.md](DESIGN.md#group-by)).
+  A `sum` and a `mean`, or a `min` and a `max`, of the same column in one `group_by` share one pair of
+  passes.
 - **`count(expr)` is the number of non-null values of `expr`** for a column of any type, on both
   paths and in a whole-table aggregate. A count never decides the path: a count of an expression the
   fused kernel does not read as a number (utf8, boolean, temporal, decimal, nested, dictionary, ...)
