@@ -1,0 +1,55 @@
+binding,build,round,row,best_ms,median_ms,cpu_ms_per_call,first_after_500ms_idle_ms,reps
+node,old,1,"argsort() f64 1M 10% null",1.5286,1.6831,0.8072,95.0132,40
+node,old,1,"sort() f64 1M 10% null",1.8104,2.2395,1.1979,52.5265,40
+node,old,1,"argsort({}) f64 1M 10% null",1.4490,1.9940,0.8492,8.0390,40
+node,old,1,"topK(100) f64 1M 10% null",1.3366,1.3798,1.6933,61.0469,40
+node,old,1,"fromTypedArray(f64 1M, validity).release()",0.0054,0.0061,0.0065,0.7119,40
+go,old,1,"Argsort(false) f64 1M 10% null",1.4965,1.7072,0.8414,89.9393,40
+go,old,1,"ArgsortWith(SortOptions{}) f64 1M 10% null",1.9377,2.3565,0.9094,5.7737,40
+go,old,1,"SortWith(SortOptions{}) f64 1M 10% null",1.8133,2.0638,1.1218,48.0416,40
+go,old,1,"TopKWith(100, SortOptions{Descending}) f64 1M 10% null",1.3365,1.4047,1.7256,104.3765,40
+node,new,1,"argsort() f64 1M 10% null",1.5868,1.6742,0.9755,23.4861,40
+node,new,1,"sort() f64 1M 10% null",1.5029,1.7064,0.9650,6.5085,40
+node,new,1,"argsort({}) f64 1M 10% null",1.5222,1.7433,0.9744,6.1029,40
+node,new,1,"topK(100) f64 1M 10% null",1.2089,1.2197,1.5064,4.0660,40
+node,new,1,"fromTypedArray(f64 1M, validity).release()",0.0060,0.0062,0.0071,0.6933,40
+go,new,1,"Argsort(false) f64 1M 10% null",1.6433,1.8450,1.1549,27.6064,40
+go,new,1,"ArgsortWith(SortOptions{}) f64 1M 10% null",1.9732,2.1567,1.1121,5.6591,40
+go,new,1,"SortWith(SortOptions{}) f64 1M 10% null",2.2690,2.5403,1.4760,5.7365,40
+go,new,1,"TopKWith(100, SortOptions{Descending}) f64 1M 10% null",1.2571,1.4073,1.7426,5.5815,40
+node,new,2,"argsort() f64 1M 10% null",1.5573,1.7207,0.8393,23.3186,40
+node,new,2,"sort() f64 1M 10% null",1.9859,3.0137,1.2709,9.8695,40
+node,new,2,"argsort({}) f64 1M 10% null",1.7552,1.9063,1.0560,5.0214,40
+node,new,2,"topK(100) f64 1M 10% null",1.2037,1.2344,1.5086,6.9215,40
+node,new,2,"fromTypedArray(f64 1M, validity).release()",0.0055,0.0091,0.0097,0.5636,40
+go,new,2,"Argsort(false) f64 1M 10% null",1.6403,1.7623,0.8637,17.5649,40
+go,new,2,"ArgsortWith(SortOptions{}) f64 1M 10% null",1.7674,1.9042,1.0587,4.9390,40
+go,new,2,"SortWith(SortOptions{}) f64 1M 10% null",2.3410,2.7105,1.3171,9.3470,40
+go,new,2,"TopKWith(100, SortOptions{Descending}) f64 1M 10% null",1.3420,1.3945,1.7324,10.1080,40
+node,old,2,"argsort() f64 1M 10% null",1.8925,2.0639,1.1173,24.3600,40
+node,old,2,"sort() f64 1M 10% null",2.5264,3.9443,1.5063,9.6768,40
+node,old,2,"argsort({}) f64 1M 10% null",1.9930,2.3852,1.2038,5.8420,40
+node,old,2,"topK(100) f64 1M 10% null",1.3452,1.4020,1.7349,4.3022,40
+node,old,2,"fromTypedArray(f64 1M, validity).release()",0.0053,0.0060,0.0065,0.6241,40
+go,old,2,"Argsort(false) f64 1M 10% null",1.6523,1.7941,0.9819,23.4425,40
+go,old,2,"ArgsortWith(SortOptions{}) f64 1M 10% null",1.7879,2.0063,1.0412,5.4020,40
+go,old,2,"SortWith(SortOptions{}) f64 1M 10% null",1.9921,2.1293,1.1231,6.2220,40
+go,old,2,"TopKWith(100, SortOptions{Descending}) f64 1M 10% null",1.1987,1.2210,1.5151,14.1409,40
+node,old,3,"argsort() f64 1M 10% null",1.4709,1.5318,1.0371,23.5032,40
+node,old,3,"sort() f64 1M 10% null",1.7543,1.9233,1.1163,5.2894,40
+node,old,3,"argsort({}) f64 1M 10% null",2.2295,2.5792,1.0328,6.2905,40
+node,old,3,"topK(100) f64 1M 10% null",1.3069,1.3506,1.6690,11.5217,40
+node,old,3,"fromTypedArray(f64 1M, validity).release()",0.0059,0.0061,0.0066,0.7105,40
+go,old,3,"Argsort(false) f64 1M 10% null",1.5693,1.7231,1.0519,24.9610,40
+go,old,3,"ArgsortWith(SortOptions{}) f64 1M 10% null",1.5143,2.0507,0.8479,5.7583,40
+go,old,3,"SortWith(SortOptions{}) f64 1M 10% null",2.7406,3.9319,1.6502,9.5332,40
+go,old,3,"TopKWith(100, SortOptions{Descending}) f64 1M 10% null",1.2096,1.2655,1.5773,13.8767,40
+node,new,3,"argsort() f64 1M 10% null",1.6617,1.8665,1.0110,15.8538,40
+node,new,3,"sort() f64 1M 10% null",2.7984,4.0943,1.5023,6.7078,40
+node,new,3,"argsort({}) f64 1M 10% null",1.5033,2.0621,0.8717,5.9378,40
+node,new,3,"topK(100) f64 1M 10% null",1.2170,1.3953,1.7159,10.4709,40
+node,new,3,"fromTypedArray(f64 1M, validity).release()",0.0055,0.0062,0.0067,0.5868,40
+go,new,3,"Argsort(false) f64 1M 10% null",1.2615,1.4163,0.7842,25.3967,40
+go,new,3,"ArgsortWith(SortOptions{}) f64 1M 10% null",1.9107,2.2504,1.0200,5.6598,40
+go,new,3,"SortWith(SortOptions{}) f64 1M 10% null",2.1519,2.4315,1.6749,5.5250,40
+go,new,3,"TopKWith(100, SortOptions{Descending}) f64 1M 10% null",1.2832,1.4042,1.7200,12.9783,40

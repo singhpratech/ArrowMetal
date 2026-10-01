@@ -8,7 +8,9 @@
   descending key the plain complement), and a single-key sort + limit stays a GPU top-k with it,
   nulls first or last. Swift `FloatOrder.nanLargest`, C ABI `float_order` 2 (`am_argsort_ex2`,
   `am_sort_ex2`, `am_top_k_ex`, `am_lexsort_ex2`), plan JSON `"float_order": "nan_largest"`, Python
-  `float_order="nan_largest"`, Rust `FloatOrder::NanLargest`.
+  `float_order="nan_largest"`, Rust `FloatOrder::NanLargest`, Go `FloatNanLargest` (on
+  `ArgsortWith`, `SortWith`, `TopKWith`, `LexsortWith`), Node `floatOrder: 'nan_largest'` (on
+  `argsort`, `sort`, `topK`, `lexsort`).
   - Window `order_by` keys take the sort key options: each key's null placement and float order, in
     the plan JSON (`[column, descending, {"nulls", "float_order"}]` or the key object, with a window
     spec's own `nulls` / `float_order` as the defaults) and in Python (`with_rank(...,
@@ -27,6 +29,23 @@
     placements, the external sort with and without a limit, against a CPU reference);
     `test_sort_nan_largest.py` (the same against Polars' own `sort(maintain_order=True)`, pyarrow and
     the totalOrder definition).
+  - Go and Node tests: every direction × null placement × float order against a stable reference
+    of the documented order on Float64 and Float32 columns holding NaN of both signs, ±0.0, ±inf and
+    nulls (argsort index for index, sort bit for bit, top-k as the head of the argsort, lexsort per
+    key), a hand-picked column with its expected indices, and the plan JSON `"float_order":
+    "nan_largest"` in each key form and as the sort-level default, with and without a limit.
+- Node: `MetalArray.fromTypedArray` of an empty typed array (`new Float64Array(0)` and every other
+  typed-array type) failed with "values buffer is null", and so did `fromArrow` of an Arrow JS
+  `makeData({ type, length: 0 })` (any type; for utf8 an empty offsets buffer was refused). A
+  zero-length `ArrayBuffer` has no backing store, so the view's base address is null; a buffer that
+  holds no bytes now points at a zero-filled region instead (an empty validity bitmap is the absent
+  one), and a zero-row utf8 array's offsets buffer may be empty. `test/empty.test.js` covers empty
+  input through `fromTypedArray` (every type, with and without a validity bitmap, zero-length views),
+  `fromArrow`, `fromChunks` (empty chunks alone and next to non-empty ones, a table with no batches)
+  and back out through `toArrow` / `toTypedArray`. Go's `Import` of zero-length arrays already
+  worked (arrow-go exports a non-null placeholder buffer); `TestImportEmpty` now pins it for 12
+  types, built with no rows, all-null, and as zero-length slices, through `Import`, `ImportChunks`
+  and `Export`.
 - Polars `MetalEngine`: every Polars sort key is one ArrowMetal sort key, with Polars' order as the
   key's options — `"nulls": "first"` where Polars puts the nulls first (its default, in either
   direction), `"float_order": "nan_largest"` on a Float32 / Float64 key. The validity key a

@@ -72,7 +72,7 @@ const gb = groupBy(region);
 
 ```ts
 type NullPlacement = 'last' | 'first';
-type FloatOrder = 'ieee' | 'total';
+type FloatOrder = 'ieee' | 'total' | 'nan_largest';
 interface SortOptions { descending?: boolean; nulls?: NullPlacement; floatOrder?: FloatOrder }
 interface TopKOptions { largest?: boolean; nulls?: NullPlacement; floatOrder?: FloatOrder }
 
@@ -87,8 +87,10 @@ A boolean, or nothing, is the order the plain calls have always had: nulls last 
 direction. `floatOrder: 'ieee'` (the default) is Arrow C++'s order: -0 ties +0, every NaN is one
 value, and the NaN rows sit next to the nulls in both directions. `floatOrder: 'total'` is IEEE 754
 totalOrder, the order arrow-rs and Rust's `total_cmp` use: -NaN < -Infinity < … < -0 < +0 < … <
-+Infinity < +NaN, and a descending sort is its exact mirror. Integer, string and temporal keys ignore
-the float order. `topK(k, options)` answers with the first `k` indices `argsort` gives in that
++Infinity < +NaN, and a descending sort is its exact mirror. `floatOrder: 'nan_largest'` is Polars'
+and NumPy's order: -0 ties +0, and every NaN is one value greater than every number, +Infinity
+included, in both directions (last ascending, first among the values descending); the null placement
+is independent of it. Integer, string and temporal keys ignore the float order. `topK(k, options)` answers with the first `k` indices `argsort` gives in that
 direction with the same options.
 
 ```ts
@@ -97,11 +99,14 @@ const x = MetalArray.fromArrow(vectorFromArray([2, null, NaN, -0, 7], new Float6
 [...x.argsort({ descending: true, nulls: 'first', floatOrder: 'total' }).toTypedArray()];
                                                                       // [1, 2, 4, 0, 3]
 [...x.topK(2, { nulls: 'first', floatOrder: 'total' }).toTypedArray()]; // [1, 2]
+[...x.argsort({ descending: true, floatOrder: 'nan_largest' }).toTypedArray()];
+                                                                      // [2, 4, 0, 3, 1]
 lexsort([region, amount], [{ nulls: 'first' }, { descending: true }]);
 ```
 
 A plan's `sort` key takes the same options as JSON: `{ column: 'x', descending: true, nulls:
-'first', float_order: 'total' }` ([ENGINE.md](ENGINE.md)).
+'first', float_order: 'total' }` or `['x', true, { float_order: 'nan_largest' }]`
+([ENGINE.md](ENGINE.md)).
 
 ## Chunked columns
 
@@ -384,7 +389,7 @@ Every row, with first-call-after-idle and CPU time:
 
 ## Tests
 
-76 tests, `node:test`, oracles are Apache Arrow JS and plain JS over the same rows.
+82 tests, `node:test`, oracles are Apache Arrow JS and plain JS over the same rows.
 `npm test` sets `NODE_OPTIONS=--expose-gc`, which the lifetime tests need.
 
 ```
@@ -399,7 +404,8 @@ ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib npm test
 | `test/compute.test.js` | 18 | all six comparison ops against JS; null masks; filter on empty and at 1,000,001 rows; sort and argsort with nulls last and stable ties; sort at 1,000,001 rows against `Array.prototype.sort`; take, slice, arith, cast; groupBy sum/mean/min/max/count against a JS `Map`, including a null key group and 1,000,001 rows; lexsort |
 | `test/plan.test.js` | 7 | a filter → group_by → sort plan against the same steps in JS; optimized vs unoptimized agree; explain; a plan that does not type-check throws the engine's own message; an out-of-range column named by index and by name |
 | `test/lifetime.test.js` | 4 | a slice, a plan source and a group-by all still read the right bytes after the parent handle is released, every JS reference to the source array dropped, two collections forced and the freed pages trampled; and an exported `Vector` after its handle is released |
-| `test/sortoptions.test.js` | 9 | `argsort` / `sort` with every direction × null placement × float order, index for index and bit for bit against a stable plain-JS reference of the documented order, on Float64 columns holding NaN of both signs and several payloads, ±0, ±Infinity and subnormals, with nulls, at 0 to 100,001 rows; Int64 and Float32 columns; the boolean forms and the defaults equal to the options forms; `topK` against the head of `argsort` at k = 0 to past the length; `lexsort` with per-key options; a plan `sort` key with `nulls` and `float_order`; the examples on this page |
+| `test/sortoptions.test.js` | 11 | `argsort` / `sort` with every direction × null placement × float order (`ieee`, `total`, `nan_largest`), index for index and bit for bit against a stable plain-JS reference of the documented order, on Float64 columns holding NaN of both signs and several payloads, ±0, ±Infinity and subnormals, with nulls, at 0 to 100,001 rows; Int64 and Float32 columns; the boolean forms and the defaults equal to the options forms; `topK` against the head of `argsort` at k = 0 to past the length; `lexsort` with per-key options; `nan_largest` on a hand-picked column with NaN of both signs, ±0, ±Infinity and a null, against its expected indices for `argsort`, `sort`, `topK` and a two-key `lexsort`; a plan `sort` key with `nulls` and `float_order`, and `float_order: 'nan_largest'` in each key form and as the sort-level default, with and without a `limit`; the examples on this page |
+| `test/empty.test.js` | 4 | zero-row input: `fromTypedArray` of every typed-array type (empty, over a zero-byte `ArrayBuffer`, zero-length views into a non-empty buffer, with an empty validity bitmap), `fromArrow` of an empty vector, of `makeData({ type, length: 0 })` and of a zero-length slice for all 12 types, `fromChunks` of empty chunks alone, next to a non-empty chunk and from a table with no batches; each back out through `toArrow` / `toTypedArray`, and argsort, sort, topK and sum on the empty array; utf8 rows that are all empty strings over a zero-byte values buffer |
 | `test/chunks.test.js` | 5 | `fromChunks` and `fromArrow` of a multi-chunk `Vector` against the import of the concatenation, over 9 types and five layouts (empty, one-row, sliced, all-null and no-null chunks mixed; one chunk; all empty; all null; 300 small chunks); sum, max and sorts on a 30-chunk column; a `Table` of five record batches through a plan; refusals by message; chunk buffers kept pinned across collections |
 | `test/workers.test.js` | 2 | four `worker_threads` workers importing, deriving and releasing concurrently, each answering correctly; and workers that exit with references still parked, so the env cleanup hook has to drain them |
 

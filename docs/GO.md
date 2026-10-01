@@ -111,7 +111,7 @@ Run it with `ARROWMETAL_LIB=/path/to/.build/release/libArrowMetalC.dylib go run 
 type SortOptions struct {
 	Descending bool
 	Nulls      NullPlacement // NullsLast (the default) or NullsFirst, in either direction
-	FloatOrder FloatOrder    // FloatIEEE (the default) or FloatTotal
+	FloatOrder FloatOrder    // FloatIEEE (the default), FloatTotal or FloatNanLargest
 }
 
 func (a *Array) ArgsortWith(o SortOptions) (*Array, error)
@@ -124,10 +124,12 @@ func LexsortWith(columns []*Array, keys []SortOptions) (*Array, error)
 `FloatIEEE` is Arrow C++'s order, which arrow-go's `compute.SortIndices` also uses: -0.0 ties +0.0,
 every NaN is one value, and the NaN rows sit next to the nulls in both directions. `FloatTotal` is
 IEEE 754 totalOrder, the order arrow-rs and Rust's `total_cmp` use: -NaN < -Inf < … < -0.0 < +0.0 <
-… < +Inf < +NaN, NaNs by payload, and a descending sort is its exact mirror. Integer, string and
-temporal keys ignore the float order. The zero `SortOptions` gives what `Argsort(false)` gives.
-`TopKWith(k, o)` answers with the first `k` indices `ArgsortWith(o)` gives. Neither option adds a pass
-to the GPU sort.
+… < +Inf < +NaN, NaNs by payload, and a descending sort is its exact mirror. `FloatNanLargest` is
+Polars' and NumPy's order: -0.0 ties +0.0, and every NaN is one value greater than every number, +Inf
+included, in both directions (last ascending, first among the values descending); the null placement
+is independent of it. Integer, string and temporal keys ignore the float order. The zero
+`SortOptions` gives what `Argsort(false)` gives. `TopKWith(k, o)` answers with the first `k` indices
+`ArgsortWith(o)` gives. Neither option adds a pass to the GPU sort.
 
 ```go
 // src is [2, null, NaN, -0, 7]
@@ -135,11 +137,13 @@ plain, _ := gpu.Argsort(true)       // [4 0 3 2 1]: nulls and NaN stay last
 opts := am.SortOptions{Descending: true, Nulls: am.NullsFirst, FloatOrder: am.FloatTotal}
 total, _ := gpu.ArgsortWith(opts)   // [1 2 4 0 3]: the null, then +NaN > 7 > 2 > -0
 top, _ := gpu.TopKWith(2, opts)     // [1 2]
+polars, _ := gpu.ArgsortWith(am.SortOptions{Descending: true, FloatOrder: am.FloatNanLargest})
+                                    // [2 4 0 3 1]: NaN > 7 > 2 > -0, the null last
 ```
 
 (`ExampleArray_ArgsortWith` in `example_test.go` runs this.) A plan's `sort` key takes the same
 options as JSON: `{"column": "x", "descending": true, "nulls": "first", "float_order": "total"}` or
-`["x", true, {"nulls": "first"}]` ([ENGINE.md](ENGINE.md)).
+`["x", true, {"nulls": "first", "float_order": "nan_largest"}]` ([ENGINE.md](ENGINE.md)).
 
 ## Chunked import
 
@@ -363,12 +367,13 @@ for `Lexsort` at 1,000 and 1,000,000 rows. Every row, with first-call-after-idle
 
 `include/arrowmetal.h` and `include/arrow_abi.h` in the module are copies of the repository's `include/` headers; refresh them (`cp include/arrowmetal.h go/arrowmetal/include/`) whenever the header changes, or `python/tests/test_header_copies.py` and `TestHeadersMatchRepository` fail.
 
-Every item below has at least one test in `go/arrowmetal`; the oracle is named. 61 test functions and three `Example`s, 64 runnable;
-419 cases counting subtests, all green, plain, under `-race` and under `GOEXPERIMENT=cgocheck2`.
+Every item below has at least one test in `go/arrowmetal`; the oracle is named. 64 test functions and three `Example`s, 67 runnable;
+581 cases counting subtests, all green, plain, under `-race` and under `GOEXPERIMENT=cgocheck2`.
 
 | Surface | Go API | Oracle |
 |---|---|---|
 | C Data Interface in and out | `Import`, `(*Array).Export` | value-and-null round trip at lengths 0, 1, 1000, 1,000,001, plain and sliced |
+| Empty input | `Import`, `ImportChunks`, `(*Array).Export` | zero-row arrays of 12 types (integers, floats, boolean, utf8), built with no rows, all-null and as zero-length slices at offsets 0 and 1: length and type out through `Export`, an empty `ArgsortWith`, and `ImportChunks` with empty chunks alone and next to a non-empty one |
 | Sliced input (`offset != 0`) | the same | `array.NewSlice` at offsets 1, 7, 31, 32, 33, 63, 64, 1000 against the same rows read directly |
 | Sum, Min, Max, Mean | `(*Array).Sum/Min/Max/Mean` | plain Go loops (arrow-go has no aggregates); Int64 and Float64, with and without nulls |
 | Null and NaN rules | the same | all-null and empty arrays report an invalid `Scalar`; min/max skip NaN; an all-NaN column is null |
@@ -380,7 +385,7 @@ Every item below has at least one test in `go/arrowmetal`; the oracle is named. 
 | Sort | `(*Array).Sort` | `compute.SortArray`, ascending and descending, nulls at end |
 | Argsort | `(*Array).Argsort` | `compute.SortIndicesArray`, index for index, on data with heavy ties |
 | Lexsort | `Lexsort` | `sort.SliceStable` over the same two columns |
-| Sort options | `ArgsortWith`, `SortWith`, `TopK`, `TopKWith`, `LexsortWith` | index for index against a stable `sort.SliceStable` reference of the documented order, every direction × null placement × float order, on Float64 and Float32 columns holding NaN of both signs and several payloads, ±0.0, ±Inf and subnormals, with nulls, at 0 to 100,001 rows; the IEEE order also against arrow-go's `compute.SortIndicesArray` / `SortIndicesRecordBatch` with `SortNullsAtStart`; `SortWith` bit for bit; `TopKWith` against the head of `ArgsortWith` at k = 0 to past the length; the zero options against the plain calls; a plan `sort` key with `nulls` and `float_order` |
+| Sort options | `ArgsortWith`, `SortWith`, `TopK`, `TopKWith`, `LexsortWith` | index for index against a stable `sort.SliceStable` reference of the documented order, every direction × null placement × float order (`FloatIEEE`, `FloatTotal`, `FloatNanLargest`), on Float64 and Float32 columns holding NaN of both signs and several payloads, ±0.0, ±Inf and subnormals, with nulls, at 0 to 100,001 rows; the IEEE order also against arrow-go's `compute.SortIndicesArray` / `SortIndicesRecordBatch` with `SortNullsAtStart`; `SortWith` bit for bit; `TopKWith` against the head of `ArgsortWith` at k = 0 to past the length; the zero options against the plain calls; `FloatNanLargest` on a hand-picked column with NaN of both signs, ±0.0, ±Inf and a null against its expected indices for all four calls; a plan `sort` key with `nulls` and `float_order`, and `"float_order": "nan_largest"` in each key form and as the sort-level default, with and without a `limit` |
 | Chunked import | `ImportChunks`, `ImportChunked`, `ImportColumn`, `NewSourceFromBatches`, `ChunksSupported` | `array.Equal` against the concatenation and against `Import` of it, over 15 types (integers, floats, boolean, date32, timestamp, decimal128, fixed_size_binary, utf8, large_utf8, binary, utf8_view) and five layouts (empty, one-row, sliced, all-null and no-null chunks mixed; one chunk; all empty; all null; 1,000 small chunks), built with arrow-go's checked allocator so every chunk has to be released exactly once; dictionary chunks through the concatenation; sum and every sort option on a 40-chunk column; a plan over record batches |
 | Group-by | `NewGroupBy`, `.Sum/.Count/.CountAll/.Mean/.Min/.Max/.Key/.IDs` | plain Go maps; one and two key columns, 1 to 1000 groups, null keys, float values, zero rows |
 | JSON plan runner | `NewSource`, `RunPlan`, `ExplainPlan`, `PlanResult.RecordBatch` | plain Go; the header's own group-by/sort/limit example, optimized against unoptimized, a type-check failure |
