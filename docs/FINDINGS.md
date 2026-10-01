@@ -78,7 +78,7 @@ groups), 23.78 → 9.02 ms (10,000), 39.78 → 14.17 ms (1M), 227.11 → 110.43 
 10.64 → 5.91 ms (1M) and 82.82 → 35.65 ms (25M).
 
 Polars `MetalEngine()` (`Benchmarks/results/polars_engine_groupby_float64_2026-09-30.csv`, three
-alternating rounds, every result equal to Polars'): at 50M rows the Float64 `min` + `max` grid cases
+alternating rounds, every result equal to Polars'): at 50M rows the grid's `min` + `max` cases (over an int64 column)
 the default runs on the GPU are 1.19x-2.59x faster (1M groups, one key: 48.36 → 18.67 ms) and `(l)`
 Float64 `sum` + `mean` is 46.12 → 29.68 ms. At 2M rows six case-engine pairs were slower in that run;
 timed again alone, eight alternating rounds of 100 runs

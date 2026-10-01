@@ -2,8 +2,9 @@
 
 The eight shapes of `Benchmarks/engine_bench.py` and 38 more (group-by per aggregate family over one
 and two keys at few and many groups, whole-frame aggregates, each join kind, sorts, top-k, `unique`,
-and the same with a String column) and a group-by grid of 48 (`group_grid`: each aggregate family
-over one and two int32 keys at 200 to 1,000,000 key values and at half the rows), written as Polars
+and the same with a String column) and a group-by grid of 60 (`group_grid`: each aggregate family
+over one and two int32 keys at 200 to 1,000,000 key values and at half the rows, over an int64
+column, and a sum over a Float64 column at the same keys), written as Polars
 LazyFrames over in-memory Polars DataFrames, collected five ways:
 
 * `polars in-memory`, `polars streaming` -- `lf.collect(engine=...)`
@@ -59,7 +60,7 @@ def cpu_seconds():
 
 #: `--idle`: warm up with at least this much of the same call, then time one run after an idle gap
 #: of IDLE_GAP seconds on its own (after an idle gap the GPU runs small jobs slower for the first
-#: 20-25 ms of work), then the `--iters` runs.
+#: 20-25 ms of work), warm up again for as long, then the `--iters` runs.
 WARMUP_S = 0.1
 IDLE_GAP = 0.5
 IDLE = False
@@ -85,6 +86,14 @@ def best_of(fn, iters, setup=None):
         t0 = time.perf_counter()
         fn()
         idle = (time.perf_counter() - t0) * 1e3
+        # Warm up again, so the timed runs do not start in the slow state the idle gap left.
+        spent = 0.0
+        while spent < WARMUP_S:
+            if setup:
+                setup()
+            t0 = time.perf_counter()
+            fn()
+            spent += time.perf_counter() - t0
     best, best_cpu, walls = float("inf"), float("inf"), []
     for _ in range(iters):
         if setup:
@@ -263,6 +272,11 @@ GRID_FAMILIES = (
     ("mean", "mean", lambda: [pl.col("q").mean().alias("m")]),
     ("minmax", "min + max", lambda: [pl.col("q").min().alias("lo"), pl.col("q").max().alias("hi")]),
 )
+# The grid's Float64 family: a sum over a Float64 column `x` (q / 1e9, in [0, 1)) on the same keys.
+# (The mean of the int64 `q` runs as a Float64 mean already: the engine casts it to Float64 first.)
+GRID_FLOAT_FAMILIES = (
+    ("fsum", "Float64 sum", lambda: [pl.col("x").sum().alias("s")]),
+)
 GRID_NAMES = {200: "200", 1_000: "1k", 10_000: "10k", 100_000: "100k", 1_000_000: "1M",
               "rows/2": "R2"}
 
@@ -270,26 +284,32 @@ GRID_NAMES = {200: "200", 1_000: "1k", 10_000: "10k", 100_000: "100k", 1_000_000
 def group_grid(rows, rng):
     """The group-by grid the default's group-count buckets are fitted from
     (Benchmarks/polars_engine_crossover.py): each aggregate family over one int32 key and over two,
-    at each of GRID_GROUPS key values, over an int64 value column. One key draws from [0, G); two
+    at each of GRID_GROUPS key values, over an int64 value column, and a Float64 sum
+    (GRID_FLOAT_FAMILIES) over the same keys. One key draws from [0, G); two
     keys draw the pair from [0, G/b) x [0, b) with b = min(G, 100), so both have G possible groups.
     The number of groups the data holds is the results file's `groups` column (uniform keys over G
     values put about G (1 - exp(-R/G)) of them in a frame of R rows)."""
     q = pl.Series("q", rng.integers(0, 1_000_000_000, size=rows, dtype=np.int64))
+    # Derived from q, so the random draws (and the int64 cases' data) are those of the grid without it.
+    x = pl.Series("x", q.to_numpy() / 1e9)
     out = []
     for g in GRID_GROUPS:
         n = max(2, rows // 2) if g == "rows/2" else g
         b = min(n, 100)
-        frame = pl.DataFrame({
+        df = pl.DataFrame({
             "k": rng.integers(0, n, size=rows, dtype=np.int32),
             "k1": rng.integers(0, max(1, n // b), size=rows, dtype=np.int32),
             "k2": rng.integers(0, b, size=rows, dtype=np.int32),
-            "q": q}).lazy()
+            "q": q})
+        frame = df.lazy()
+        floats = df.select("k", "k1", "k2").with_columns(x).lazy()
         what = "rows/2" if g == "rows/2" else f"{g:,}".replace(",", " ")
-        for fam, label, aggs in GRID_FAMILIES:
-            out.append((f"(g1{fam}{GRID_NAMES[g]}) group-by grid, 1 key, {what} groups, {label}",
-                        frame.group_by("k").agg(aggs()), False))
-            out.append((f"(g2{fam}{GRID_NAMES[g]}) group-by grid, 2 keys, {what} groups, {label}",
-                        frame.group_by("k1", "k2").agg(aggs()), False))
+        for families, lf in ((GRID_FAMILIES, frame), (GRID_FLOAT_FAMILIES, floats)):
+            for fam, label, aggs in families:
+                out.append((f"(g1{fam}{GRID_NAMES[g]}) group-by grid, 1 key, {what} groups, {label}",
+                            lf.group_by("k").agg(aggs()), False))
+                out.append((f"(g2{fam}{GRID_NAMES[g]}) group-by grid, 2 keys, {what} groups, {label}",
+                            lf.group_by("k1", "k2").agg(aggs()), False))
     return out
 
 
@@ -462,7 +482,8 @@ def main():
                          "polars_engine_crossover.py fits the per-shape crossovers from it)")
     ap.add_argument("--idle", action="store_true",
                     help="warm each call up for 100 ms, time one run after a 500 ms idle gap on its own "
-                         "(after_idle_ms), and record the median of the --iters runs (median_ms)")
+                         "(after_idle_ms), warm up for 100 ms again, and record the median of the "
+                         "--iters runs (median_ms)")
     ap.add_argument("--scan", action="store_true", help="add the Parquet scan cases")
     ap.add_argument("--scan-only", action="store_true", help="only the Parquet scan cases")
     ap.add_argument("--scan-rows", default="50000000",

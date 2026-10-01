@@ -1,0 +1,21 @@
+Run conditions of polars_engine_default_groupby_retime_2026-10-01.csv (summary) and
+polars_engine_default_groupby_retime_raw_2026-10-01.csv (every run).
+
+What: Benchmarks/polars_engine_bench.py --idle --iters 5 --sizes 2000000 over (c), (g2mean10k),
+(g2mean100k) and (g2minmax10k), the 2M rows in the buckets the default-benchmark rule raised or that
+share them, one process per run, the same library build and two copies of the Python package: "old"
+with the table fitted from polars_engine_crossover_2026-09-30-groupby.csv alone, "new" with the same
+table under the rule (BENCH = polars_engine_default_groupby_raw_2026-09-30.csv). Three rounds,
+old/new, new/old, old/new; each process started with the 1-minute load average below 3.5, no build
+or test process and no other timing run (another benchmark waiting for its next block was held off
+for the six runs). Every MetalEngine answer was equal to Polars'. A browser's GPU process used 0.0%
+of a core at the end of each run (browser_gpu_helper_cpu below).
+
+Load average (1, 5, 15 minutes) at the start and end of each process, and the two most recent pmset
+sleep entries at its end (both before these runs):
+round 1 old 2000000: rc=0 start=10:03:01 secs=16 load_start=1.29 2.17 2.46 load_end=2.36 2.35 2.52 browser_gpu_helper_cpu=0.0 sleep_log=[2026-09-29 00:22:22 -0400 Sleep               	Entering Sleep state due to 'Sleep Service Back to Sleep':TCPKeepAlive=active Using AC (Charge:100%) 919 secs  |2026-09-29 00:37:52 -0400 Sleep               	Entering Sleep state due to 'Maintenance Sleep':TCPKeepAlive=active Using AC (Charge:100%) 643 secs  |]
+round 1 new 2000000: rc=0 start=10:03:21 secs=16 load_start=2.25 2.32 2.51 load_end=2.58 2.39 2.53 browser_gpu_helper_cpu=0.0 sleep_log=[2026-09-29 00:22:22 -0400 Sleep               	Entering Sleep state due to 'Sleep Service Back to Sleep':TCPKeepAlive=active Using AC (Charge:100%) 919 secs  |2026-09-29 00:37:52 -0400 Sleep               	Entering Sleep state due to 'Maintenance Sleep':TCPKeepAlive=active Using AC (Charge:100%) 643 secs  |]
+round 2 new 2000000: rc=0 start=10:03:40 secs=16 load_start=2.45 2.37 2.52 load_end=2.43 2.36 2.51 browser_gpu_helper_cpu=0.0 sleep_log=[2026-09-29 00:22:22 -0400 Sleep               	Entering Sleep state due to 'Sleep Service Back to Sleep':TCPKeepAlive=active Using AC (Charge:100%) 919 secs  |2026-09-29 00:37:52 -0400 Sleep               	Entering Sleep state due to 'Maintenance Sleep':TCPKeepAlive=active Using AC (Charge:100%) 643 secs  |]
+round 2 old 2000000: rc=0 start=10:04:00 secs=16 load_start=2.48 2.37 2.52 load_end=2.16 2.31 2.49 browser_gpu_helper_cpu=0.0 sleep_log=[2026-09-29 00:22:22 -0400 Sleep               	Entering Sleep state due to 'Sleep Service Back to Sleep':TCPKeepAlive=active Using AC (Charge:100%) 919 secs  |2026-09-29 00:37:52 -0400 Sleep               	Entering Sleep state due to 'Maintenance Sleep':TCPKeepAlive=active Using AC (Charge:100%) 643 secs  |]
+round 3 old 2000000: rc=0 start=10:04:20 secs=16 load_start=2.07 2.28 2.48 load_end=1.84 2.22 2.45 browser_gpu_helper_cpu=0.0 sleep_log=[2026-09-29 00:22:22 -0400 Sleep               	Entering Sleep state due to 'Sleep Service Back to Sleep':TCPKeepAlive=active Using AC (Charge:100%) 919 secs  |2026-09-29 00:37:52 -0400 Sleep               	Entering Sleep state due to 'Maintenance Sleep':TCPKeepAlive=active Using AC (Charge:100%) 643 secs  |]
+round 3 new 2000000: rc=0 start=10:04:39 secs=16 load_start=1.85 2.22 2.45 load_end=1.67 2.16 2.42 browser_gpu_helper_cpu=0.0 sleep_log=[2026-09-29 00:22:22 -0400 Sleep               	Entering Sleep state due to 'Sleep Service Back to Sleep':TCPKeepAlive=active Using AC (Charge:100%) 919 secs  |2026-09-29 00:37:52 -0400 Sleep               	Entering Sleep state due to 'Maintenance Sleep':TCPKeepAlive=active Using AC (Charge:100%) 643 secs  |]

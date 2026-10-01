@@ -1,0 +1,27 @@
+# 2,000,000 rows, the frames of Benchmarks/polars_engine_bench.py (seed 1234); five ways to collect each case, 15 back-to-back runs each, three rounds (the order reversed in the second), no idle gap; best = best run over the rounds, median = median of the rounds' medians. 'all' = MetalEngine(shapes='all', min_rows=0), 'default' = MetalEngine(); cold = import cache and group-count cache cleared before each run, probe cache cleared = only the group-count cache cleared, no clear = nothing cleared. Load average (1, 5, 15 min) at the start: 3.40 7.18 9.43; at the end: 3.13 7.06 9.37
+case,engine,best_ms,median_ms
+(c),"all, cold",2.63,3.79
+(c),"default, cold",2.89,3.60
+(c),"all, probe cache cleared",2.42,3.54
+(c),"default, no clear",2.66,6.97
+(c),"polars streaming",5.48,5.78
+(g2mean10k),"all, cold",2.32,3.05
+(g2mean10k),"default, cold",2.41,2.95
+(g2mean10k),"all, probe cache cleared",1.89,3.68
+(g2mean10k),"default, no clear",2.05,5.42
+(g2mean10k),"polars streaming",5.09,5.48
+(g2mean100k),"all, cold",2.52,5.06
+(g2mean100k),"default, cold",3.03,3.56
+(g2mean100k),"all, probe cache cleared",2.32,3.57
+(g2mean100k),"default, no clear",2.55,6.67
+(g2mean100k),"polars streaming",5.74,6.38
+(g2minmax10k),"all, cold",1.76,3.47
+(g2minmax10k),"default, cold",1.88,2.89
+(g2minmax10k),"all, probe cache cleared",1.57,1.97
+(g2minmax10k),"default, no clear",1.80,2.85
+(g2minmax10k),"polars streaming",5.57,5.90
+(v2),"all, cold",2.52,2.68
+(v2),"default, cold",2.65,2.78
+(v2),"all, probe cache cleared",2.36,2.51
+(v2),"default, no clear",2.47,2.72
+(v2),"polars streaming",4.82,5.08
