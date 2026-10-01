@@ -47,6 +47,10 @@ const (
 	// -NaN < -Inf < ... < -0.0 < +0.0 < ... < +Inf < +NaN, NaNs by payload, only identical bits tie,
 	// and a descending sort is the exact mirror (+NaN first).
 	FloatTotal FloatOrder = 1
+	// FloatNanLargest is Polars' and NumPy's order: IEEE comparison with -0.0 and +0.0 equal, and every
+	// NaN one value greater than every number, +Inf included, in both directions (last ascending,
+	// first among the values descending). The null placement is independent of it.
+	FloatNanLargest FloatOrder = 2
 )
 
 func (o FloatOrder) String() string {
@@ -55,6 +59,8 @@ func (o FloatOrder) String() string {
 		return "ieee"
 	case FloatTotal:
 		return "total"
+	case FloatNanLargest:
+		return "nan_largest"
 	}
 	return fmt.Sprintf("FloatOrder(%d)", int(o))
 }
@@ -63,8 +69,8 @@ func (o FloatOrder) String() string {
 // Argsort and Sort use, so ArgsortWith(SortOptions{}) gives the indices Argsort(false) gives.
 //
 // Neither option adds a pass on the GPU: the null placement is where the partition that takes the
-// null rows out of the radix sort puts them, and FloatTotal is the key map in front of the radix
-// passes.
+// null rows out of the radix sort puts them, and FloatTotal and FloatNanLargest are the key map in
+// front of the radix passes.
 type SortOptions struct {
 	Descending bool
 	Nulls      NullPlacement
@@ -75,8 +81,8 @@ func (o SortOptions) check(op string) error {
 	if o.Nulls != NullsLast && o.Nulls != NullsFirst {
 		return fmt.Errorf("arrowmetal: %s: %v is not NullsLast or NullsFirst", op, o.Nulls)
 	}
-	if o.FloatOrder != FloatIEEE && o.FloatOrder != FloatTotal {
-		return fmt.Errorf("arrowmetal: %s: %v is not FloatIEEE or FloatTotal", op, o.FloatOrder)
+	if o.FloatOrder != FloatIEEE && o.FloatOrder != FloatTotal && o.FloatOrder != FloatNanLargest {
+		return fmt.Errorf("arrowmetal: %s: %v is not FloatIEEE, FloatTotal or FloatNanLargest", op, o.FloatOrder)
 	}
 	return nil
 }

@@ -1,5 +1,5 @@
-// Sort options (null placement, IEEE 754 totalOrder) and top-k, against a stable plain-JS reference
-// sort of the same rows.
+// Sort options (null placement; the ieee, total and nan_largest float orders) and top-k, against a
+// stable plain-JS reference sort of the same rows.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const A = require('apache-arrow');
@@ -61,8 +61,6 @@ function awkwardColumn(n, nullEvery, seed) {
   }
   const bits = new BigUint64Array(values.buffer);
   for (let i = 0; i < n; i++) if (rows[i] !== null) rows[i] = bits[i];
-  // An empty typed array has no backing store to hand over; an empty Arrow JS vector has one.
-  if (n === 0) return { rows, col: MetalArray.fromArrow(A.vectorFromArray([], new A.Float64())) };
   return { rows, col: MetalArray.fromTypedArray(values, { validity: valid, nullCount: nulls }) };
 }
 
@@ -75,7 +73,7 @@ const asBits = (x) => (typeof x === 'bigint' ? x : bitsOf(x));
 
 // The documented order of one key: nulls where `nulls` says in both directions; with 'ieee' the NaN
 // rows sit next to the nulls in both directions and -0 ties +0; with 'total' a descending sort is
-// the mirror.
+// the mirror; with 'nan_largest' -0 ties +0 and every NaN is one value above +Infinity.
 function keyCmp(a, b, o) {
   const first = o.nulls === 'first';
   if (a === null || b === null) {
@@ -93,6 +91,12 @@ function keyCmp(a, b, o) {
       return na === first ? -1 : 1;
     }
     c = x < y ? -1 : x > y ? 1 : 0;
+  } else if (o.floatOrder === 'nan_largest') {
+    const x = num(a);
+    const y = num(b);
+    const na = Number.isNaN(x);
+    const nb = Number.isNaN(y);
+    c = na || nb ? (na && nb ? 0 : na ? 1 : -1) : x < y ? -1 : x > y ? 1 : 0;
   } else {
     const ka = totalKey(asBits(a));
     const kb = totalKey(asBits(b));
@@ -109,7 +113,7 @@ function refArgsort(rows, o) {
 const COMBOS = [];
 for (const descending of [false, true])
   for (const nulls of ['last', 'first'])
-    for (const floatOrder of ['ieee', 'total']) COMBOS.push({ descending, nulls, floatOrder });
+    for (const floatOrder of ['ieee', 'total', 'nan_largest']) COMBOS.push({ descending, nulls, floatOrder });
 
 const idxOf = (m) => [...m.toTypedArray()];
 // A Float64 result's validity and bits, read from its buffers rather than through JS numbers.
@@ -156,7 +160,7 @@ test('an Int64 column places its nulls in both directions (float order ignored)'
   }
 });
 
-test('Float32 totalOrder with NaN of both signs and both zeros', () => {
+test('Float32 totalOrder and nan_largest with NaN of both signs and both zeros', () => {
   const specials = [NaN, fromBits(0xfff8000000000000n), 0, -0, Infinity, -Infinity, 2.5];
   const r = rng(8);
   const n = 5003;
@@ -177,7 +181,7 @@ test('Float32 totalOrder with NaN of both signs and both zeros', () => {
   });
   const col = MetalArray.fromTypedArray(v32);
   for (const o of COMBOS) {
-    if (o.floatOrder !== 'total') continue;
+    if (o.floatOrder === 'ieee') continue;
     assert.deepEqual(idxOf(col.argsort(o)), refArgsort(rows, o), JSON.stringify(o));
   }
 });
@@ -205,7 +209,7 @@ test('topK with options is the head of argsort with the same options', () => {
   assert.throws(() => col.topK(-1), /non-negative integer/);
   assert.throws(() => col.topK(1.5), /non-negative integer/);
   assert.throws(() => col.argsort({ nulls: 'at_start' }), /nulls must be 'last' or 'first'/);
-  assert.throws(() => col.argsort({ floatOrder: 'totalOrder' }), /floatOrder must be 'ieee' or 'total'/);
+  assert.throws(() => col.argsort({ floatOrder: 'totalOrder' }), /floatOrder must be 'ieee', 'total' or 'nan_largest'/);
 });
 
 test('lexsort with per-key SortOptions matches a stable reference', () => {
@@ -215,7 +219,7 @@ test('lexsort with per-key SortOptions matches a stable reference', () => {
   const k1col = MetalArray.fromArrow(A.vectorFromArray(k1, new A.Int32()));
   const { rows: k2, col: k2col } = awkwardColumn(n, 9, 0x5eed);
   for (const o1 of COMBOS) {
-    if (o1.floatOrder === 'total') continue; // an integer key ignores the float order
+    if (o1.floatOrder !== 'ieee') continue; // an integer key ignores the float order
     for (const o2 of COMBOS) {
       const ref = k1
         .map((_, i) => i)
@@ -242,11 +246,66 @@ test('a plan sort key takes nulls and float_order', () => {
   assert.deepEqual(resultBits(runPlan(plan, [src]).column('x')), ref.map((i) => rows[i]));
 });
 
+test('nan_largest on a hand-picked column: argsort, sort, topK and lexsort', () => {
+  //                                  0  1    2     3         4   5          6  7     8
+  const negNaN = fromBits(0xfff8000000000000n);
+  const vals = [2, NaN, null, Infinity, -1, -Infinity, 0, negNaN, -0];
+  const x = MetalArray.fromArrow(A.vectorFromArray(vals, new A.Float64()));
+  const cases = [
+    // -Infinity, -1, 0 and -0 tied in input order, 2, Infinity, the NaNs (sign ignored), the null
+    [{ floatOrder: 'nan_largest' }, [5, 4, 6, 8, 0, 3, 1, 7, 2]],
+    [{ nulls: 'first', floatOrder: 'nan_largest' }, [2, 5, 4, 6, 8, 0, 3, 1, 7]],
+    [{ descending: true, floatOrder: 'nan_largest' }, [1, 7, 3, 0, 6, 8, 4, 5, 2]],
+    [{ descending: true, nulls: 'first', floatOrder: 'nan_largest' }, [2, 1, 7, 3, 0, 6, 8, 4, 5]],
+  ];
+  const rows = [...new BigUint64Array(new Float64Array(vals.map((v) => v ?? 0)).buffer)].map((b, i) =>
+    vals[i] === null ? null : b,
+  );
+  for (const [o, want] of cases) {
+    assert.deepEqual(refArgsort(rows, o), want, `reference ${JSON.stringify(o)}`);
+    assert.deepEqual(idxOf(x.argsort(o)), want, JSON.stringify(o));
+    assert.deepEqual(resultBits(x.sort(o)), want.map((i) => rows[i]), JSON.stringify(o));
+    for (const k of [0, 1, 3, 9, 20]) {
+      const got = idxOf(x.topK(k, { largest: o.descending === true, nulls: o.nulls, floatOrder: o.floatOrder }));
+      assert.deepEqual(got, want.slice(0, k), `k=${k} ${JSON.stringify(o)}`);
+    }
+  }
+  // A group key splitting the rows in two, then the float key descending under nan_largest.
+  const g = MetalArray.fromTypedArray(new Int32Array([1, 0, 1, 0, 1, 0, 1, 0, 1]));
+  assert.deepEqual(
+    idxOf(lexsort([g, x], [{}, { descending: true, floatOrder: 'nan_largest' }])),
+    [1, 7, 3, 5, 0, 6, 8, 4, 2],
+  );
+});
+
+test('a plan sort takes float_order nan_largest per key and as the sort default, with a limit', () => {
+  const { rows, col } = awkwardColumn(20011, 4, 37);
+  const src = PlanSource.create('t', { x: col });
+  const scan = { op: 'scan', source: 't' };
+  for (const descending of [false, true]) {
+    for (const nulls of ['last', 'first']) {
+      const forms = {
+        object: { op: 'sort', by: [{ column: 'x', descending, nulls, float_order: 'nan_largest' }], input: scan },
+        array: { op: 'sort', by: [['x', descending, { nulls, float_order: 'nan_largest' }]], input: scan },
+        level: { op: 'sort', by: [['x', descending]], nulls, float_order: 'nan_largest', input: scan },
+      };
+      const ref = refArgsort(rows, { descending, nulls, floatOrder: 'nan_largest' }).map((i) => rows[i]);
+      for (const [form, plan] of Object.entries(forms)) {
+        const what = `${form} descending=${descending} nulls=${nulls}`;
+        assert.deepEqual(resultBits(runPlan(plan, [src]).column('x')), ref, what);
+        const top = { op: 'limit', count: 100, input: plan };
+        assert.deepEqual(resultBits(runPlan(top, [src]).column('x')), ref.slice(0, 100), `${what} limit 100`);
+      }
+    }
+  }
+});
+
 test('the docs/TYPESCRIPT.md sort-options and chunked-column examples', () => {
   const x = MetalArray.fromArrow(A.vectorFromArray([2, null, NaN, -0, 7], new A.Float64()));
   assert.deepEqual(idxOf(x.argsort(true)), [4, 0, 3, 2, 1]);
   assert.deepEqual(idxOf(x.argsort({ descending: true, nulls: 'first', floatOrder: 'total' })), [1, 2, 4, 0, 3]);
   assert.deepEqual(idxOf(x.topK(2, { nulls: 'first', floatOrder: 'total' })), [1, 2]);
+  assert.deepEqual(idxOf(x.argsort({ descending: true, floatOrder: 'nan_largest' })), [2, 4, 0, 3, 1]);
   const c = MetalArray.fromChunks([
     A.vectorFromArray([1n, 2n], new A.Int64()),
     A.vectorFromArray([3n, null, 5n], new A.Int64()),

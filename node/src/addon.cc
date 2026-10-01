@@ -553,6 +553,12 @@ Napi::Value Load(const Napi::CallbackInfo& info) {
   return out;
 }
 
+// What a buffer slot points at when the JS view holds no bytes. V8 gives a zero-length ArrayBuffer
+// no backing store, so the view of `new Float64Array(0)` (or an Arrow JS Data made with no buffers)
+// has a null base address, and a null data buffer is not a valid Arrow array. Zero-filled, so as a
+// utf8 offsets buffer it reads as the single offset 0.
+alignas(64) const uint8_t kEmptyRegion[64] = {};
+
 // Fills `array` over the JS buffers of one array of `format`, checked against the Arrow layout for
 // offset + length rows, with an ImportPriv that pins them until ArrowMetal runs the release
 // callback; that callback sets `released`. On a throw nothing is left allocated.
@@ -581,6 +587,12 @@ void fillImportArray(const Napi::Env& env, const std::string& format, int width,
     }
     size_t len = 0;
     uint8_t* base = viewBase(env, v, &len);
+    if (len == 0 && needed == 0) {
+      // No bytes needed and none given: a zero-row array (or utf8 values of empty strings only). An
+      // empty validity bitmap is the absent one; any other slot gets the zero region, never null.
+      priv->buffers[slot] = slot == 0 ? nullptr : kEmptyRegion;
+      return;
+    }
     if (static_cast<int64_t>(len) < needed) {
       throw Napi::Error::New(
           env, std::string("ArrowMetal (Node): the ") + name + " buffer is " + std::to_string(len) +
@@ -597,7 +609,9 @@ void fillImportArray(const Napi::Env& env, const std::string& format, int width,
   try {
     addBuffer(0, validityV, "validity", bitmapBytes);
     if (width == -2) {
-      addBuffer(1, offsetsV, "utf8 offsets", (rows + 1) * 4);
+      // A zero-row utf8 array may come with an empty offsets buffer (Arrow allows it; Arrow JS's
+      // makeData gives one); it reads as the single offset 0.
+      addBuffer(1, offsetsV, "utf8 offsets", rows == 0 ? 0 : (rows + 1) * 4);
       // Arrow requires the offsets to start at or above 0 and never decrease. A violation would
       // make the values-buffer size check below meaningless and hand the kernels a negative
       // length, so it is rejected here with the index that broke it.
@@ -993,7 +1007,8 @@ Napi::Value Lexsort(const Napi::CallbackInfo& info) {
   return wrapArray(env, out);
 }
 
-// The option-taking sorts. Null placement: 0 last, 1 first; float order: 0 ieee, 1 total.
+// The option-taking sorts. Null placement: 0 last, 1 first; float order: 0 ieee, 1 total,
+// 2 nan_largest.
 Napi::Value ArgsortEx(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   requireSymbol(env, reinterpret_cast<const void*>(g.am_argsort_ex2), "am_argsort_ex2");

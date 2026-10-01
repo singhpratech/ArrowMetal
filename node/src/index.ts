@@ -37,9 +37,12 @@ export type NullPlacement = 'last' | 'first';
  * `'ieee'` is the order of the plain sorts, Arrow C++'s: -0.0 ties +0.0, every NaN is one value,
  * and the NaN rows sit next to the nulls in both directions. `'total'` is IEEE 754 totalOrder, as
  * arrow-rs and Rust's `total_cmp` define it: -NaN < -Infinity < ... < -0 < +0 < ... < +Infinity <
- * +NaN, and a descending sort is its exact mirror.
+ * +NaN, and a descending sort is its exact mirror. `'nan_largest'` is Polars' and NumPy's order:
+ * -0 ties +0, and every NaN is one value greater than every number, +Infinity included, in both
+ * directions (last ascending, first among the values descending); the null placement is independent
+ * of it.
  */
-export type FloatOrder = 'ieee' | 'total';
+export type FloatOrder = 'ieee' | 'total' | 'nan_largest';
 
 /** Options of one sort key. Every field left out takes the plain sort's default. */
 export interface SortOptions {
@@ -62,7 +65,7 @@ export interface TopKOptions {
 }
 
 const NULL_PLACEMENT: Record<NullPlacement, number> = { last: 0, first: 1 };
-const FLOAT_ORDER: Record<FloatOrder, number> = { ieee: 0, total: 1 };
+const FLOAT_ORDER: Record<FloatOrder, number> = { ieee: 0, total: 1, nan_largest: 2 };
 
 function nullPlacementCode(v: NullPlacement | undefined): number {
   if (v === undefined) return 0;
@@ -77,7 +80,7 @@ function floatOrderCode(v: FloatOrder | undefined): number {
   if (v === undefined) return 0;
   const c = FLOAT_ORDER[v];
   if (c === undefined || !Object.prototype.hasOwnProperty.call(FLOAT_ORDER, v)) {
-    throw new Error(`ArrowMetal (Node): floatOrder must be 'ieee' or 'total', got ${JSON.stringify(v)}.`);
+    throw new Error(`ArrowMetal (Node): floatOrder must be 'ieee', 'total' or 'nan_largest', got ${JSON.stringify(v)}.`);
   }
   return c;
 }

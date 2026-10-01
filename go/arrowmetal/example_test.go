@@ -55,7 +55,8 @@ func ExampleArray_ArgsortWith() {
 	opts := am.SortOptions{Descending: true, Nulls: am.NullsFirst, FloatOrder: am.FloatTotal}
 	total, _ := gpu.ArgsortWith(opts) // null first, then +NaN > 7 > 2 > -0
 	top, _ := gpu.TopKWith(2, opts)
-	for _, h := range []*am.Array{plain, total, top} {
+	polars, _ := gpu.ArgsortWith(am.SortOptions{Descending: true, FloatOrder: am.FloatNanLargest}) // NaN > 7 > 2 > -0, null last
+	for _, h := range []*am.Array{plain, total, top, polars} {
 		out, _ := h.Export()
 		fmt.Println(out)
 		out.Release()
@@ -65,6 +66,7 @@ func ExampleArray_ArgsortWith() {
 	// [4 0 3 2 1]
 	// [1 2 4 0 3]
 	// [1 2]
+	// [2 4 0 3 1]
 }
 
 // ExampleImportChunks is the chunked-import example in docs/GO.md.

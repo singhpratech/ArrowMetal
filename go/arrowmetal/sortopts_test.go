@@ -69,7 +69,8 @@ func refFloatCmp(a, b float64, order am.FloatOrder) int {
 		}
 		return 0
 	}
-	// ieee: every NaN is one value, larger than +Inf; -0.0 == +0.0.
+	// ieee and nan_largest: every NaN is one value, larger than +Inf; -0.0 == +0.0. (ieee's NaN rows
+	// are moved next to the nulls by refKeyCmp before this is reached.)
 	na, nb := math.IsNaN(a), math.IsNaN(b)
 	switch {
 	case na && nb:
@@ -88,7 +89,8 @@ func refFloatCmp(a, b float64, order am.FloatOrder) int {
 
 // refKeyLess orders two rows of one float key under o, the way the header documents it: nulls where
 // o.Nulls says in both directions; with FloatIEEE the NaN rows stay next to the nulls in both
-// directions; with FloatTotal a descending sort is the exact mirror. Ties return (false, true).
+// directions; with FloatTotal a descending sort is the exact mirror; with FloatNanLargest every NaN
+// is one value above +Inf, so it comes last ascending and first among the values descending.
 func refKeyCmp(v []float64, valid []bool, i, j int32, o am.SortOptions) int {
 	vi, vj := valid[i], valid[j]
 	if !vi || !vj {
@@ -148,7 +150,7 @@ func allSortOptions() []am.SortOptions {
 	var out []am.SortOptions
 	for _, desc := range []bool{false, true} {
 		for _, nulls := range []am.NullPlacement{am.NullsLast, am.NullsFirst} {
-			for _, fo := range []am.FloatOrder{am.FloatIEEE, am.FloatTotal} {
+			for _, fo := range []am.FloatOrder{am.FloatIEEE, am.FloatTotal, am.FloatNanLargest} {
 				out = append(out, am.SortOptions{Descending: desc, Nulls: nulls, FloatOrder: fo})
 			}
 		}
@@ -472,8 +474,8 @@ func TestLexsortWith(t *testing.T) {
 	}
 	for _, o1 := range allSortOptions() {
 		for _, o2 := range allSortOptions() {
-			if o1.FloatOrder == am.FloatTotal {
-				continue // an integer key ignores the float order; half the grid is enough
+			if o1.FloatOrder != am.FloatIEEE {
+				continue // an integer key ignores the float order; one float order is enough
 			}
 			keys := []am.SortOptions{o1, o2}
 			t.Run(optName(o1)+"+"+optName(o2), func(t *testing.T) {
@@ -576,6 +578,137 @@ func TestPlanSortKeyOptions(t *testing.T) {
 	for i, r := range ref {
 		if gvalid[i] != valid[r] || (valid[r] && math.Float64bits(gv[i]) != math.Float64bits(v[r])) {
 			t.Fatalf("row %d: got (%v, %v), want (%v, %v)", i, gv[i], gvalid[i], v[r], valid[r])
+		}
+	}
+}
+
+// TestFloatNanLargestHandPicked pins the nan_largest order on a column small enough to read: NaN of
+// both signs, both zeros, both infinities and nulls, in both directions and both null placements,
+// for ArgsortWith, SortWith, TopKWith and a two-key LexsortWith.
+func TestFloatNanLargestHandPicked(t *testing.T) {
+	requireLib(t)
+	negNaN := math.Float64frombits(0xFFF8_0000_0000_0000)
+	//                  0    1           2    3       4    5             6    7       8
+	v := []float64{2, math.NaN(), 0, math.Inf(1), -1, math.Inf(-1), 0, negNaN, math.Copysign(0, -1)}
+	valid := []bool{true, true, false, true, true, true, true, true, true}
+	src := buildFloat64(t, v, valid)
+	defer src.Release()
+	h := importArr(t, src)
+	cases := []struct {
+		o    am.SortOptions
+		want []int32
+	}{
+		// -Inf, -1, then 0 / -0.0 tied in input order, 2, +Inf, the NaNs (sign ignored), the null.
+		{am.SortOptions{FloatOrder: am.FloatNanLargest}, []int32{5, 4, 6, 8, 0, 3, 1, 7, 2}},
+		{am.SortOptions{Nulls: am.NullsFirst, FloatOrder: am.FloatNanLargest}, []int32{2, 5, 4, 6, 8, 0, 3, 1, 7}},
+		{am.SortOptions{Descending: true, FloatOrder: am.FloatNanLargest}, []int32{1, 7, 3, 0, 6, 8, 4, 5, 2}},
+		{am.SortOptions{Descending: true, Nulls: am.NullsFirst, FloatOrder: am.FloatNanLargest}, []int32{2, 1, 7, 3, 0, 6, 8, 4, 5}},
+	}
+	for _, c := range cases {
+		t.Run(optName(c.o), func(t *testing.T) {
+			equalIdx(t, "reference", refArgsort(v, valid, c.o), c.want)
+			got, err := h.ArgsortWith(c.o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			equalIdx(t, "ArgsortWith", indicesOf(t, got), c.want)
+			for _, k := range []int64{0, 1, 3, 9, 20} {
+				tk, err := h.TopKWith(k, c.o)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := c.want
+				if k < int64(len(want)) {
+					want = want[:k]
+				}
+				equalIdx(t, fmt.Sprintf("TopKWith(%d)", k), indicesOf(t, tk), want)
+			}
+			sorted, err := h.SortWith(c.o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sorted.Release()
+			gv, gvalid := float64sOf(t, exportArr(t, sorted))
+			for i, r := range c.want {
+				if gvalid[i] != valid[r] || (valid[r] && math.Float64bits(gv[i]) != math.Float64bits(v[r])) {
+					t.Fatalf("SortWith row %d: got (%v, %v), want row %d (%v, %v)", i, gv[i], gvalid[i], r, v[r], valid[r])
+				}
+			}
+		})
+	}
+	// Two keys: a group key that splits the rows in two, then the float key descending, nan_largest.
+	g := buildInt32(t, []int32{1, 0, 1, 0, 1, 0, 1, 0, 1}, nil)
+	defer g.Release()
+	cols := []*am.Array{importArr(t, g), h}
+	got, err := am.LexsortWith(cols, []am.SortOptions{{}, {Descending: true, FloatOrder: am.FloatNanLargest}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// group 0: rows 1 (NaN), 3 (+Inf), 5 (-Inf), 7 (-NaN); group 1: 0 (2), 2 (null), 4 (-1), 6 (0), 8 (-0.0)
+	equalIdx(t, "LexsortWith", indicesOf(t, got), []int32{1, 7, 3, 5, 0, 6, 8, 4, 2})
+	if s := am.FloatNanLargest.String(); s != "nan_largest" {
+		t.Fatalf("FloatNanLargest.String() = %q", s)
+	}
+}
+
+// TestPlanSortNanLargest runs "float_order": "nan_largest" through the plan JSON in each key form
+// and as the sort-level default, with and without a limit (the top-k path), against the reference.
+func TestPlanSortNanLargest(t *testing.T) {
+	requireLib(t)
+	const n = 20011
+	v, valid := awkwardFloat64(n, 4, 37)
+	src := buildFloat64(t, v, valid)
+	defer src.Release()
+	h := importArr(t, src)
+	s, err := am.NewSource("t", []string{"x"}, []*am.Array{h})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Release()
+	const scan = `{"op":"scan","source":"t"}`
+	for _, desc := range []bool{false, true} {
+		for _, nulls := range []am.NullPlacement{am.NullsLast, am.NullsFirst} {
+			nj := "last"
+			if nulls == am.NullsFirst {
+				nj = "first"
+			}
+			sorts := map[string]string{
+				"object": fmt.Sprintf(`{"op":"sort","by":[{"column":"x","descending":%v,"nulls":%q,"float_order":"nan_largest"}],"input":%s}`, desc, nj, scan),
+				"array":  fmt.Sprintf(`{"op":"sort","by":[["x",%v,{"nulls":%q,"float_order":"nan_largest"}]],"input":%s}`, desc, nj, scan),
+				"level":  fmt.Sprintf(`{"op":"sort","by":[["x",%v]],"nulls":%q,"float_order":"nan_largest","input":%s}`, desc, nj, scan),
+			}
+			ref := refArgsort(v, valid, am.SortOptions{Descending: desc, Nulls: nulls, FloatOrder: am.FloatNanLargest})
+			for form, sortPlan := range sorts {
+				for _, limit := range []int{-1, 100} {
+					plan := sortPlan
+					want := ref
+					if limit >= 0 {
+						plan = fmt.Sprintf(`{"op":"limit","count":%d,"input":%s}`, limit, sortPlan)
+						want = ref[:limit]
+					}
+					t.Run(fmt.Sprintf("desc=%v/%s/%s/limit=%d", desc, nj, form, limit), func(t *testing.T) {
+						res, err := am.RunPlan(plan, true, s)
+						if err != nil {
+							t.Fatal(err)
+						}
+						defer res.Release()
+						col, err := res.Column(0)
+						if err != nil {
+							t.Fatal(err)
+						}
+						defer col.Release()
+						gv, gvalid := float64sOf(t, exportArr(t, col))
+						if len(gv) != len(want) {
+							t.Fatalf("%d rows, want %d", len(gv), len(want))
+						}
+						for i, r := range want {
+							if gvalid[i] != valid[r] || (valid[r] && math.Float64bits(gv[i]) != math.Float64bits(v[r])) {
+								t.Fatalf("row %d: got (%v, %v), want (%v, %v)", i, gv[i], gvalid[i], v[r], valid[r])
+							}
+						}
+					})
+				}
+			}
 		}
 	}
 }
