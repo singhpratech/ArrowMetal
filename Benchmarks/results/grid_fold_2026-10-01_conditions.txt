@@ -1,0 +1,16 @@
+grid_fold_2026-10-01.csv and argsort_total_order_2026-10-01.csv
+
+Machine: Apple M4 Max, 64 GB, macOS 27.0, AC power. One timing block, 2026-10-01 03:59:50 to 04:00:35
+EDT, no build or test process running; 1-minute load 2.25 at the start, 2.15 between the two scripts,
+1.97 at the end. No sleep inside the block (pmset log).
+
+grid_fold_2026-10-01.csv: Benchmarks/grid_fold_bench.py --rounds 8 --reps 100. "before" is the commit
+before the grid fold (2d34522), "after" the fold; both release builds of libArrowMetalC.dylib, loaded into
+one Python process and alternated round by round. Per case and row count: an untimed warm-up of at least
+100 ms of the same call per build, the first call after a 500 ms idle per build (first_after_idle_ms),
+then 8 rounds x 100 calls per build. best_ms / median_ms are wall time per call; cpu_median_ms is the
+median process CPU time per call (getrusage).
+
+argsort_total_order_2026-10-01.csv: Benchmarks/argsort_total_order_bench.py (8 rounds; 100 calls per
+order per round at 1M rows, 10 at 10M and 50M), the "after" build only, the two orders alternated round by
+round, same warm-up and first-after-idle rule.

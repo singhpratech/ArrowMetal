@@ -289,3 +289,90 @@ print("ok")
     env["PYTHONPATH"] = os.path.join(os.path.dirname(__file__), "..")
     p = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
     assert p.returncode == 0 and p.stdout.strip() == "ok", (p.returncode, p.stdout, p.stderr[-2000:])
+
+
+# ---------------------------------------------------------------------------- sign bit and NaN
+
+_F64_BITS = [0x0, 0x8000000000000000, 0x3FF0000000000000, 0xBFF0000000000000, 0x4004000000000000,
+             0xC004000000000000, 0x1, 0x8000000000000001, 0x7FF0000000000000, 0xFFF0000000000000,
+             0x7FF8000000000000, 0xFFF8000000000000, 0x7FF0000000000001, 0xFFF0000000000001,
+             0x7FFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0x7FF8DEADBEEF0042, 0xFFF4000000001234]
+_F32_BITS = [0x0, 0x80000000, 0x3F800000, 0xBF800000, 0x40200000, 0xC0200000, 0x1, 0x80000001,
+             0x7F800000, 0xFF800000, 0x7FC00000, 0xFFC00000, 0x7F800001, 0xFF800001, 0x7FFFFFFF,
+             0xFFFFFFFF, 0x7FC0BEEF, 0xFFA01234]
+
+
+def _special(n, width):
+    """`n` values cycling through the special bit patterns, a null every 7th row from row 3."""
+    pats = np.array(_F64_BITS if width == 64 else _F32_BITS, dtype=np.uint64 if width == 64 else np.uint32)
+    bits = pats[(np.arange(n) * 5 + np.arange(n) // 3) % len(pats)]
+    vals = bits.view(np.float64 if width == 64 else np.float32)
+    mask = (np.arange(n) % 7) == 3
+    return bits, vals, mask
+
+
+def _total_key(bits, width):
+    """The IEEE 754 totalOrder key: the sign-flip transform of the bit pattern."""
+    sign = np.uint64(1) << np.uint64(width - 1)
+    full = np.uint64(0xFFFFFFFFFFFFFFFF if width == 64 else 0xFFFFFFFF)
+    b = bits.astype(np.uint64)
+    return np.where(b & sign, ~b & full, b | sign)
+
+
+@pytest.mark.parametrize("width", [32, 64])
+@pytest.mark.parametrize("n", [1, 33, 4097])
+def test_signbit_and_is_nan(width, n):
+    bits, vals, mask = _special(n, width)
+    col = pa.array(vals, mask=mask)
+    r = am.query(table(x=col), am.project([am.col("x").signbit().alias("s"), am.col("x").is_nan().alias("n")]))
+    assert r["n"].equals(pc.is_nan(col))
+    assert r["s"].equals(pa.array((bits >> (width - 1)).astype(bool), mask=mask))
+    assert np.array_equal(np.signbit(vals), (bits >> (width - 1)).astype(bool))
+
+
+def test_signbit_on_integers_and_text_form():
+    t = table(i=pa.array([0, -1, 5, None, -(2 ** 31)], pa.int32()), u=pa.array([0, 255, None, 1, 2], pa.uint8()))
+    r = am.query(t, am.project([am.col("i").signbit().alias("is"), am.col("i").is_nan().alias("in"),
+                                am.col("u").signbit().alias("us")]))
+    assert r["is"].to_pylist() == [False, True, False, None, True]
+    assert r["in"].to_pylist() == [False, False, False, None, False]
+    assert r["us"].to_pylist() == [False, False, None, False, False]
+    assert am.col("x").signbit().sexpr() == '(signbit (col "x"))'
+    assert am.col("x").is_nan().sexpr() == '(is_nan (col "x"))'
+
+
+def _total_order_expr(op, c, tok):
+    """`x OP c` in IEEE 754 totalOrder, as in docs/EXPR.md."""
+    x, lit = am.col("x"), am.lit(c, tok)
+    s, nan = x.signbit(), x.is_nan()
+    if c == 0:
+        neg = bool(np.signbit(c))
+        below = (s & (x != lit)) if neg else s
+        at_or_below = s if neg else (s | (x == lit))
+        equal = ((x == lit) & s) if neg else ((x == lit) & ~s)
+        return {"eq": equal, "ne": ~equal, "lt": below, "le": at_or_below, "gt": ~at_or_below, "ge": ~below}[op]
+    ieee = {"eq": x == lit, "ne": x != lit, "lt": x < lit, "le": x <= lit, "gt": x > lit, "ge": x >= lit}[op]
+    if op in ("lt", "le"):
+        return ieee | (nan & s)
+    if op in ("gt", "ge"):
+        return ieee | (nan & ~s)
+    return ieee
+
+
+@pytest.mark.parametrize("width", [32, 64])
+def test_total_order_comparisons_against_the_bit_keys(width):
+    n = 4099
+    bits, vals, mask = _special(n, width)
+    col = pa.array(vals, mask=mask)
+    keys = _total_key(bits, width)
+    tok = "float64" if width == 64 else "float32"
+    ftype, utype = (np.float64, np.uint64) if width == 64 else (np.float32, np.uint32)
+    cmp = {"eq": np.equal, "ne": np.not_equal, "lt": np.less, "le": np.less_equal, "gt": np.greater,
+           "ge": np.greater_equal}
+    for c in [2.5, -2.5, 0.0, -0.0, float("inf"), float("-inf")]:
+        ck = _total_key(np.array([c], dtype=ftype).view(utype), width)[0]
+        r = am.query(table(x=col), am.project([_total_order_expr(op, c, tok).alias(op) for op in cmp]))
+        for op, f in cmp.items():
+            assert r[op].equals(pa.array(f(keys, ck), mask=mask)), (width, c, op)
+        kept = am.query(table(x=col), am.filter(_total_order_expr("gt", c, tok)).project([am.col("x")]))["x"]
+        assert len(kept) == int(np.sum(np.greater(keys, ck) & ~mask)), (width, c)

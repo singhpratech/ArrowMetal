@@ -1,0 +1,12 @@
+GridRowFoldTests.testKernelOver2To32Minus1Elements, ARROWMETAL_BIG_TESTS=1, release build, Apple M4 Max 64 GB,
+2026-10-01 01:56 EDT. A UInt8 array of 4,294,967,295 (2^32 - 1) elements, bitwise xor with 0xA5 and bitwise not:
+the kernel dispatches 2^24 threadgroups of 256 threads (2^32 threads).
+
+folded grid (65,536 x 256 threadgroups): xor  4294967295 of 4294967295 bytes right
+folded grid (65,536 x 256 threadgroups): not  4294967295 of 4294967295 bytes right
+plain grid (16,777,216 x 1 threadgroups): xor  0 of 4294967295 bytes right, no error reported
+
+Test output:
+GridRowFoldTests: xor over 4294967295 elements, 0.45 s with the check
+GridRowFoldTests: plain grid of 2^24 threadgroups: 0 of 4294967295 bytes right
+Test Case '-[ArrowMetalTests.GridRowFoldTests testKernelOver2To32Minus1Elements]' passed (0.976 seconds).

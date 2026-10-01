@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Fused expressions: `(signbit x)` and `(is_nan x)`, boolean, null where `x` is null. `signbit` is true
+  for -0.0, negative values, -inf and a NaN with the sign bit set (any payload); on a signed integer it
+  is `x < 0`, on an unsigned one false. `is_nan` is Arrow's. With them a float column compared with a
+  literal in IEEE 754 totalOrder (arrow-rs and DataFusion: -NaN below -inf, +NaN above +inf, -0.0 below
+  +0.0) is one fused expression; docs/EXPR.md has the expression for every operator against a finite,
+  zero or infinite literal. Swift `Expr.signBit` / `Expr.isNaN`, Python `Expr.signbit()` /
+  `Expr.is_nan()`, the plan JSON and `am_query` text take the same names. A NaN literal now prints with
+  its sign (`(f64 -nan)`), so +NaN and -NaN literals no longer share a compiled kernel. Tests:
+  `ExprSignBitTests` (7) and `test_expr.py` (9 new cases) against the totalOrder keys of Float32 and
+  Float64 columns holding ±0.0, ±inf, subnormals, NaN of both signs with four payloads each, and nulls.
+- Row-wise kernels over 2^32 - 255 to 2^32 - 1 elements: their grid of 2^24 threadgroups is 2^32
+  threads, which the GPU wraps, and the kernel ran no thread (a `bitwise xor` over 2^32 - 1 UInt8
+  values got 0 bytes right, with no error). Such a grid is now folded into rows of 65,536 threadgroups,
+  as the per-group grids already were, and every kernel reads its position through the fold; the
+  two-level scans (string, join, unique, cumulative, forward-fill and window offsets) fold the same way.
+  A grid past 2^32 threads, which a 32-bit index cannot address, stops with a message instead of
+  running wrapped. The fused group-by kernels' last chunk near 2^32 rows no longer wraps its end. No
+  measurable cost: 0.957x-1.006x best time on add, bitwise_and, abs and a fused group-by at 10M and
+  50M rows (`Benchmarks/results/grid_fold_2026-10-01.csv`). Tests: `GridRowFoldTests` (5), and the
+  whole Swift suite run with the fold forced on. docs/FINDINGS.md round 17.
+
 - Sort key options: a third float order, `nan_largest` (Polars' and NumPy's): every NaN one value above
   +inf in both directions, last ascending and first among the values descending, -0.0 tied with
   +0.0. Like `total` it is one key map in front of the same radix passes (`ieee`'s map with the

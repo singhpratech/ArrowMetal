@@ -130,11 +130,10 @@ extension MetalArray {
         let startPos = try MetalArrowBuffer.allocate(byteCount: n * 4, context: ctx)
         let endPos = try MetalArrowBuffer.allocate(byteCount: n * 4, context: ctx)
         let blocks = (n + Dispatch.threadgroupSize - 1) / Dispatch.threadgroupSize
-        let blockTotals = try MetalArrowBuffer.allocate(byteCount: blocks * 4, zeroed: false, context: ctx)
+        let blockTotals = try MetalArrowBuffer.allocate(byteCount: Dispatch.launchedThreadgroups(blocks) * 4, zeroed: false, context: ctx)
         let marksPSO = try pso("win_marks"), blockPSO = try pso("win_scan_block")
         let totalsPSO = try pso("win_scan_totals"), addPSO = try pso("win_scan_add"), boundsPSO = try pso("win_run_bounds")
         let tg = MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1)
-        let grid = MTLSize(width: blocks, height: 1, depth: 1)
         try ctx.run { enc in
             enc.setComputePipelineState(marksPSO)
             enc.setBuffer(keyValues.mtl, offset: keyValues.offset, index: 0)
@@ -151,7 +150,7 @@ extension MetalArray {
             Dispatch.setLength(enc, n, nil, index: 1)
             enc.setBuffer(ranks.mtl, offset: ranks.offset, index: 2)
             enc.setBuffer(blockTotals.mtl, offset: blockTotals.offset, index: 3)
-            enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
+            try Dispatch.dispatchRows(enc, threadgroups: blocks)
             enc.memoryBarrier(scope: .buffers)
 
             enc.setComputePipelineState(totalsPSO)
@@ -164,7 +163,7 @@ extension MetalArray {
             enc.setBuffer(ranks.mtl, offset: ranks.offset, index: 0)
             enc.setBuffer(blockTotals.mtl, offset: blockTotals.offset, index: 1)
             Dispatch.setLength(enc, n, nil, index: 2)
-            enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
+            try Dispatch.dispatchRows(enc, threadgroups: blocks)
             enc.memoryBarrier(scope: .buffers)
 
             enc.setComputePipelineState(boundsPSO)
@@ -303,14 +302,13 @@ extension MetalArray {
         let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(n, 1) * T.byteWidth, zeroed: false, context: ctx)
         guard n > 0 else { return MetalArray<T>(length: 0, nullCount: 0, validity: nil, values: out, context: ctx) }
         let blocks = (n + Dispatch.threadgroupSize - 1) / Dispatch.threadgroupSize
-        let totals = try MetalArrowBuffer.allocate(byteCount: blocks * T.byteWidth, zeroed: false, context: ctx)
+        let totals = try MetalArrowBuffer.allocate(byteCount: Dispatch.launchedThreadgroups(blocks) * T.byteWidth, zeroed: false, context: ctx)
         let (src, cacheType) = Self.prodSource
         func pso(_ f: String) throws -> MTLComputePipelineState {
             try Dispatch.pipeline(ctx, family: "window-prod", source: src, function: f, type: cacheType)
         }
         let blockPSO = try pso("cum_block_prod"), totalsPSO = try pso("cum_totals_prod"), addPSO = try pso("cum_add_prod")
         let tg = MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1)
-        let grid = MTLSize(width: blocks, height: 1, depth: 1)
         let hasV = validity != nil
         try ctx.run { enc in
             enc.setComputePipelineState(blockPSO)
@@ -321,7 +319,7 @@ extension MetalArray {
             Dispatch.setUInt(enc, hasV ? 1 : 0, index: 3)
             enc.setBuffer(out.mtl, offset: out.offset, index: 4)
             enc.setBuffer(totals.mtl, offset: totals.offset, index: 5)
-            enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
+            try Dispatch.dispatchRows(enc, threadgroups: blocks)
             enc.memoryBarrier(scope: .buffers)
 
             enc.setComputePipelineState(totalsPSO)
@@ -334,7 +332,7 @@ extension MetalArray {
             enc.setBuffer(out.mtl, offset: out.offset, index: 0)
             enc.setBuffer(totals.mtl, offset: totals.offset, index: 1)
             Dispatch.setLength(enc, n, nil, index: 2)
-            enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
+            try Dispatch.dispatchRows(enc, threadgroups: blocks)
         }
         ctx.retainUntilFlush(self)
         ctx.retainUntilFlush(totals)

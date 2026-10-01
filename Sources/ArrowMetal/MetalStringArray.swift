@@ -277,7 +277,7 @@ extension MetalArray where T == Int32 {
         let ctx = context
         let out = try MetalArrowBuffer.allocate(byteCount: (n + 1) * 4, zeroed: false, context: ctx)
         let blocks = Swift.max(1, (n + Dispatch.threadgroupSize - 1) / Dispatch.threadgroupSize)
-        let totals = try MetalArrowBuffer.allocate(byteCount: blocks * 4, zeroed: false, context: ctx)
+        let totals = try MetalArrowBuffer.allocate(byteCount: Dispatch.launchedThreadgroups(blocks) * 4, zeroed: false, context: ctx)
         let grand = try MetalArrowBuffer.allocate(byteCount: 4, zeroed: false, context: ctx)
         let p1 = try ctx.pipeline(source: StringSource.source, function: "scan_block", cacheKey: "str/scan_block")
         let p2 = try ctx.pipeline(source: StringSource.source, function: "scan_totals", cacheKey: "str/scan_totals")
@@ -289,7 +289,7 @@ extension MetalArray where T == Int32 {
             Dispatch.setLength(enc, n, nil, index: 1)
             enc.setBuffer(out.mtl, offset: 0, index: 2)
             enc.setBuffer(totals.mtl, offset: 0, index: 3)
-            enc.dispatchThreadgroups(MTLSize(width: blocks, height: 1, depth: 1), threadsPerThreadgroup: tg)
+            try Dispatch.dispatchRows(enc, threadgroups: blocks)
             enc.memoryBarrier(scope: .buffers)
             enc.setComputePipelineState(p2)
             enc.setBuffer(totals.mtl, offset: 0, index: 0)
@@ -302,7 +302,7 @@ extension MetalArray where T == Int32 {
             enc.setBuffer(totals.mtl, offset: 0, index: 1)
             Dispatch.setLength(enc, n, nil, index: 2)
             enc.setBuffer(grand.mtl, offset: 0, index: 3)
-            enc.dispatchThreadgroups(MTLSize(width: blocks + 1, height: 1, depth: 1), threadsPerThreadgroup: tg)
+            try Dispatch.dispatchRows(enc, threadgroups: blocks + 1)
         }
         try ctx.syncPoint()
         return out

@@ -1,0 +1,7 @@
+case,rows,build,first_after_idle_ms,best_ms,median_ms,cpu_median_ms,rounds,reps
+argsort float64 ieee,1000000,after,5.112,1.119,1.876,0.868,8,100
+argsort float64 total,1000000,after,5.188,1.096,1.607,0.768,8,100
+argsort float64 ieee,10000000,after,16.914,7.492,7.593,0.784,8,10
+argsort float64 total,10000000,after,19.404,7.531,7.588,0.792,8,10
+argsort float64 ieee,50000000,after,45.869,37.911,38.109,0.845,8,10
+argsort float64 total,50000000,after,51.189,37.934,38.068,0.845,8,10

@@ -28,7 +28,7 @@ extension MetalArray {
         guard n > 0 else { return MetalArray<T>(length: 0, nullCount: 0, validity: nil, values: out, context: ctx) }
 
         let blocks = (n + Dispatch.threadgroupSize - 1) / Dispatch.threadgroupSize
-        let totals = try MetalArrowBuffer.allocate(byteCount: blocks * T.byteWidth, zeroed: false, context: ctx)
+        let totals = try MetalArrowBuffer.allocate(byteCount: Dispatch.launchedThreadgroups(blocks) * T.byteWidth, zeroed: false, context: ctx)
         let (src, cacheType) = Self.cumulativeSource
         func pso(_ f: String) throws -> MTLComputePipelineState {
             try Dispatch.pipeline(ctx, family: "cumulative", source: src, function: f, type: cacheType)
@@ -37,7 +37,6 @@ extension MetalArray {
         let totalsPSO = try pso("cum_totals_\(op.rawValue)")
         let addPSO = try pso("cum_add_\(op.rawValue)")
         let tg = MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1)
-        let grid = MTLSize(width: blocks, height: 1, depth: 1)
         let hasV = validity != nil
         try ctx.run { enc in
             enc.setComputePipelineState(blockPSO)
@@ -48,7 +47,7 @@ extension MetalArray {
             Dispatch.setUInt(enc, hasV ? 1 : 0, index: 3)
             enc.setBuffer(out.mtl, offset: out.offset, index: 4)
             enc.setBuffer(totals.mtl, offset: totals.offset, index: 5)
-            enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
+            try Dispatch.dispatchRows(enc, threadgroups: blocks)
             enc.memoryBarrier(scope: .buffers)
 
             enc.setComputePipelineState(totalsPSO)
@@ -61,7 +60,7 @@ extension MetalArray {
             enc.setBuffer(out.mtl, offset: out.offset, index: 0)
             enc.setBuffer(totals.mtl, offset: totals.offset, index: 1)
             Dispatch.setLength(enc, n, nil, index: 2)
-            enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
+            try Dispatch.dispatchRows(enc, threadgroups: blocks)
         }
         ctx.retainUntilFlush(self)
         ctx.retainUntilFlush(totals)

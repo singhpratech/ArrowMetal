@@ -101,7 +101,7 @@ final class ExprEmitter {
             return try promote(ta!, tb!, op: op.rawValue)
         case .unary(let op, let a):
             switch op {
-            case .not: return .boolean
+            case .not, .signbit, .isNan: return .boolean
             case .sqrt, .exp, .ln:
                 guard let t = try typeOf(a) else { return .float64 }
                 return t == .float32 ? .float32 : .float64
@@ -404,6 +404,22 @@ final class ExprEmitter {
             default: call = "dt_ln(\(s.v))"
             }
             return define(.float64, call, s.ok)
+        }
+        if op == .signbit || op == .isNan {
+            // Bit tests on the value as stored: a Float64 travels as its bit pattern and a Float32
+            // register keeps its bits through `as_type`, so the sign and the NaN payload are the input's.
+            let s = try emit(a)
+            guard s.type.isNumeric else { throw ExprError.unsupported("\(op.rawValue) needs a numeric operand, got \(s.type.rawValue)") }
+            let test: String
+            switch (op, s.type) {
+            case (.signbit, .float32): test = "((as_type<uint>(\(s.v)) >> 31) != 0u)"
+            case (.signbit, .float64): test = "((\(s.v) >> 63) != 0ul)"
+            case (.signbit, _): test = s.type.isSigned ? "(\(s.v) < (\(s.type.msl))0)" : "false"
+            case (_, .float32): test = "f_isnan32(as_type<uint>(\(s.v)))"
+            case (_, .float64): test = "((\(s.v) & 0x7FFFFFFFFFFFFFFFul) > 0x7FF0000000000000ul)"
+            default: test = "false"
+            }
+            return define(.boolean, test, s.ok)
         }
         let s = try emit(a, hint: hint)
         guard s.type.isNumeric else { throw ExprError.unsupported("\(op.rawValue) needs a numeric operand, got \(s.type.rawValue)") }
