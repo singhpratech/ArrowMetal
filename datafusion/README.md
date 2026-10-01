@@ -6,7 +6,9 @@ also takes the aggregate shapes a measured table takes (`count(*)` over two int3
 `MemTable` of at least 10,000,000 rows; `DISTINCT` over two int32 keys, and `MIN`/`MAX` of an
 integer column over two integer keys or one int64 key, of one of at least 50,000,000 rows): such an
 aggregate estimates its number of groups
-when it runs and runs on the GPU or hands the node back to DataFusion's own operators.
+when it runs and runs on the GPU or hands the node back to DataFusion's own operators. Hash joins
+(inner, left, right on int32, int64 or Utf8 keys) are translated and decided by a measured join
+table, which takes no measured join.
 
 User documentation — registering the rule, what the default takes and leaves, the semantics matched,
 the differential grid, the measured numbers and the limits — is in
@@ -33,11 +35,11 @@ to `=55.1.0`.
 | `src/rule.rs` | `ArrowMetalRule`, `ArrowMetalConfig` (the default take-list), `AggregateChoice`, `Report`, `Decision` |
 | `src/exec.rs` | `MetalExec`: collects the input, the aggregates' run-time choice, runs the GPU plan, hands the node back to DataFusion |
 | `src/probe.rs` | the group-count estimate from a sample of the keys |
-| `src/choice.rs`, `src/agg_table.rs` | an aggregate's shape and the measured table (generated) |
-| `scripts/groupby_table.py` | generates `src/agg_table.rs` from the result CSVs (`--check`) |
+| `src/choice.rs`, `src/agg_table.rs`, `src/join_table.rs` | an aggregate's shape, the measured aggregate table and the measured join table (generated) |
+| `scripts/groupby_table.py`, `scripts/join_table.py` | generate `src/agg_table.rs` and `src/join_table.rs` from the result CSVs (`--check`) |
 | `src/translate.rs` | the checks on node shapes and types, and predicates to ArrowMetal expressions |
 | `src/gpu.rs` | the plans sent to ArrowMetal, the chunked import, the run-time checks on the data |
-| `tests/` | `grid.rs` (7,656 query pairs, rule off against rule on), `rule.rs`, `arrowmetal_repros.rs` |
+| `tests/` | `grid.rs` (13,632 query pairs, rule off against rule on), `rule.rs`, `arrowmetal_repros.rs` |
 | `examples/quickstart.rs` | the example |
 | `examples/bench.rs` | the rule off / rule on benchmark |
 | `examples/coldstart.rs`, `examples/plancost.rs` | pipeline compilation per process; the rule's planning cost |

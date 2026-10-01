@@ -21,7 +21,7 @@ use datafusion::physical_plan::{
     PlanProperties, SendableRecordBatchStream,
 };
 use futures::stream::BoxStream;
-use futures::{StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 
 use crate::rule::{lock, AggregateChoice, Decision, SharedLog};
 
@@ -63,10 +63,24 @@ pub struct AggSpec {
     pub kind: AggKind,
     /// The argument column (`None` for `count(*)`).
     pub column: Option<usize>,
-    /// The argument column is floating point (min/max get the NaN / signed-zero fix-up).
+    /// The argument column is floating point (min/max keep DataFusion's NaN, signed-zero and
+    /// infinity semantics).
     pub float: bool,
     /// The type DataFusion's schema gives the result.
     pub out_type: DataType,
+}
+
+/// Which rows of an equi-join come out (the `JoinType`s of DataFusion's `HashJoinExec` that
+/// `MetalExec` runs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum JoinHow {
+    /// The pairs of rows whose keys are equal.
+    Inner,
+    /// The inner pairs, and every left (build-side) row without a match, with nulls on the right.
+    Left,
+    /// The inner pairs, and every right (probe-side) row without a match, with nulls on the left.
+    Right,
 }
 
 /// What a `MetalExec` computes, in terms of its input's column indices.
@@ -93,17 +107,31 @@ pub enum MetalOp {
         predicate: String,
         /// The output columns, if the filter projects.
         projection: Option<Vec<usize>>,
-        /// The float columns the predicate compares with a literal (checked for negative NaN at
-        /// run time).
-        float_compared: Vec<usize>,
+    },
+    /// An equi-join over column keys (DataFusion's `HashJoinExec`), both inputs collected. The
+    /// output is DataFusion's: the left input's columns, then the right input's, through
+    /// `projection`.
+    Join {
+        /// Which unmatched rows are kept.
+        how: JoinHow,
+        /// The key columns of the left (build) input, in the join's `on` order.
+        left_keys: Vec<usize>,
+        /// The key columns of the right (probe) input, in the same order.
+        right_keys: Vec<usize>,
+        /// The output columns, as indices into the left input's columns followed by the right's.
+        projection: Vec<usize>,
+        /// The number of columns of the left input.
+        left_columns: usize,
     },
 }
 
 /// Runs one [`MetalOp`] on ArrowMetal.
 ///
-/// Collects its input, hands the batches to ArrowMetal's chunked import (no `concat_batches`),
+/// Collects its input (a join: both inputs), hands the batches to ArrowMetal's chunked import (no
+/// `concat_batches`; the columns of one call are imported at the same time, one thread each),
 /// runs the operation on the GPU through ArrowMetal's plan runner, and emits the result in
-/// `batch_size` slices as a single partition.
+/// `batch_size` slices as a single partition (a join: dealt out to as many partitions as the join
+/// it replaced, from one execution).
 ///
 /// The replaced subtree (`original`) runs instead, over the batches already collected and the
 /// rest of the input, when:
@@ -118,8 +146,9 @@ pub enum MetalOp {
 /// not interrupted when the query is dropped: it finishes, and its result is discarded.
 pub struct MetalExec {
     op: MetalOp,
-    input: Arc<dyn ExecutionPlan>,
-    /// The subtree this node replaced, with `input` as its leaf: the runtime fallback.
+    /// What it reads: one input, or a join's left and right inputs.
+    inputs: Vec<Arc<dyn ExecutionPlan>>,
+    /// The subtree this node replaced, with `inputs` as its leaves: the runtime fallback.
     original: Arc<dyn ExecutionPlan>,
     props: Arc<PlanProperties>,
     log: SharedLog,
@@ -132,6 +161,8 @@ pub struct MetalExec {
     table_rows: Option<usize>,
     /// The input's row count as the plan's statistics give it (exact, or an accepted estimate).
     rows_hint: Option<usize>,
+    /// A join's execution, shared by its output partitions.
+    join_slot: JoinSlot,
 }
 
 /// How a replaced aggregate is decided (see [`AggregateChoice`]).
@@ -217,6 +248,8 @@ struct Collected {
     held: Vec<MemoryReservation>,
     /// Why the pool refused, if it did.
     refused: Option<String>,
+    /// How many of the streams belong to each input, in order (one input but for a join).
+    per_input: Vec<usize>,
 }
 
 impl Collected {
@@ -275,7 +308,7 @@ async fn collect_streams(
         }
         v
     };
-    let mut out = Collected { parts: Vec::new(), rest: Vec::new(), held: Vec::new(), refused: None };
+    let mut out = Collected { parts: Vec::new(), rest: Vec::new(), held: Vec::new(), refused: None, per_input: Vec::new() };
     for (v, rest, r, refused) in results {
         out.parts.push(v);
         out.rest.push(rest);
@@ -288,6 +321,7 @@ async fn collect_streams(
         out.parts.push(Vec::new());
         out.rest.push(None);
     }
+    out.per_input = vec![out.parts.len()];
     Ok(out)
 }
 
@@ -395,7 +429,7 @@ impl fmt::Debug for MetalExec {
 /// Everything one execution needs, moved into its future.
 struct Job {
     op: MetalOp,
-    input: Arc<dyn ExecutionPlan>,
+    inputs: Vec<Arc<dyn ExecutionPlan>>,
     original: Arc<dyn ExecutionPlan>,
     out_schema: SchemaRef,
     log: SharedLog,
@@ -416,23 +450,56 @@ impl Job {
     /// each stream), one partition per collected stream, coalesced to one stream. `c`'s
     /// reservations are released first: DataFusion's operators reserve what they buffer as they
     /// consume the replayed batches (and can spill), which they could not with this node still
-    /// holding the pool.
+    /// holding the pool. A join's streams are its left input's partitions, then its right's
+    /// (`c.per_input`).
     fn hand_back(&self, c: Collected) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-        drop(c.held);
-        let leaf: Arc<dyn ExecutionPlan> = Arc::new(ReplayExec::new(self.input.schema(), c.parts, c.rest));
-        let plan = replace_leaf(&self.original, &self.input, &leaf)?;
+        let plan = self.hand_back_plan(c)?;
         Ok(Box::pin(execute_stream(plan, Arc::clone(&self.ctx))?))
+    }
+
+    /// The replaced subtree over `c` (see [`hand_back`](Self::hand_back)), not yet executed.
+    fn hand_back_plan(&self, c: Collected) -> Result<Arc<dyn ExecutionPlan>> {
+        drop(c.held);
+        let per_input = if c.per_input.len() == self.inputs.len() { c.per_input } else { vec![c.parts.len()] };
+        let (mut parts, mut rest) = (c.parts.into_iter(), c.rest.into_iter());
+        let mut plan = Arc::clone(&self.original);
+        for (input, n) in self.inputs.iter().zip(per_input) {
+            let p: Vec<Vec<RecordBatch>> = parts.by_ref().take(n).collect();
+            let r: Vec<Option<SendableRecordBatchStream>> = rest.by_ref().take(n).collect();
+            let leaf: Arc<dyn ExecutionPlan> = Arc::new(ReplayExec::new(input.schema(), p, r));
+            plan = replace_leaf(&plan, input, &leaf)?;
+        }
+        Ok(plan)
     }
 
     /// Runs the op on ArrowMetal over `c`; on an error, a panic, a data-dependent refusal or a
     /// refused result reservation, hands the node back instead (recorded).
     async fn run_gpu(self, c: Collected) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        let ctx = Arc::clone(&self.ctx);
+        match self.run_gpu_outcome(c).await? {
+            Outcome::Gpu(batches, held) => Ok(Box::pin(futures::stream::iter(batches.into_iter().map(Ok)).map(move |b| {
+                let _held = &held;
+                b
+            }))),
+            Outcome::Back(plan) => Ok(Box::pin(execute_stream(plan, ctx)?)),
+        }
+    }
+
+    /// [`run_gpu`](Self::run_gpu), with the result as `batch_size` slices and the reservation
+    /// holding them, or the plan DataFusion runs instead.
+    async fn run_gpu_outcome(self, c: Collected) -> Result<Outcome> {
         let op = self.op.clone();
         let s2 = Arc::clone(&self.out_schema);
         let parts = c.parts;
+        let per_input = c.per_input.clone();
         let (res, parts, times) = tokio::task::spawn_blocking(move || {
-            let refs: Vec<&RecordBatch> = parts.iter().flatten().collect();
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::gpu::run(&op, &refs, &s2)))
+            // The batches of each input (one input but for a join).
+            let mut groups: Vec<Vec<&RecordBatch>> = Vec::new();
+            let mut it = parts.iter();
+            for &n in &per_input {
+                groups.push(it.by_ref().take(n).flatten().collect());
+            }
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::gpu::run(&op, &groups, &s2)))
                 .unwrap_or_else(|p| {
                     let msg = p
                         .downcast_ref::<String>()
@@ -453,19 +520,16 @@ impl Job {
                 if let Err(e) = out.try_grow(batch_bytes(&b)) {
                     self.record(Decision::memory_hand_back(&self.op, "the result", &e.to_string()));
                     self.mm.handed_back.add(1);
-                    return self.hand_back(c);
+                    return Ok(Outcome::Back(self.hand_back_plan(c)?));
                 }
                 // The input is released; the result's reservation is held until the stream ends.
                 drop(c);
                 let batch_size = self.ctx.session_config().batch_size();
-                Ok(Box::pin(futures::stream::iter(slices(b, batch_size).into_iter().map(Ok)).map(move |b| {
-                    let _held = &out;
-                    b
-                })))
+                Ok(Outcome::Gpu(slices(b, batch_size), out))
             }
             Err(msg) => {
                 self.record(Decision::runtime_fallback(&self.op, &msg));
-                self.hand_back(c)
+                Ok(Outcome::Back(self.hand_back_plan(c)?))
             }
         }
     }
@@ -508,6 +572,7 @@ impl Job {
                 rest: streams.into_iter().map(Some).collect(),
                 held: Vec::new(),
                 refused: None,
+                per_input: vec![n],
             };
             self.record(Decision::runtime_choice(&self.op, false, "aggregate_choice is DataFusion".into(), self.rows_hint.unwrap_or(0), None));
             self.mm.handed_back.add(1);
@@ -531,7 +596,7 @@ impl Job {
                 self.mm.input_time.add_duration(t.elapsed());
                 let t = std::time::Instant::now();
                 let refs: Vec<&RecordBatch> = c.parts.iter().flatten().collect();
-                let (take, reason, estimate) = decide(&self.op, self.input.as_ref(), &refs, &keys, total, self.table_rows);
+                let (take, reason, estimate) = decide(&self.op, self.inputs[0].as_ref(), &refs, &keys, total, self.table_rows);
                 self.mm.probe_time.add_duration(t.elapsed());
                 if !take {
                     if let Some(e) = &estimate {
@@ -581,7 +646,7 @@ impl Job {
             }
             (AggregateChoice::Measured, None) => {
                 let refs: Vec<&RecordBatch> = c.parts.iter().flatten().collect();
-                decide(&self.op, self.input.as_ref(), &refs, &keys, rows, self.table_rows)
+                decide(&self.op, self.inputs[0].as_ref(), &refs, &keys, rows, self.table_rows)
             }
             _ => (true, "aggregate_choice is ArrowMetal".to_string(), None),
         };
@@ -596,6 +661,71 @@ impl Job {
         }
         self.run_gpu(c).await
     }
+
+    /// A join: every partition of both inputs collected, each in its own task (all at the same
+    /// time), then the GPU. `left` is the number of `streams` that belong to the left input.
+    async fn run_join(self, streams: Vec<SendableRecordBatchStream>, left: usize) -> Result<Outcome> {
+        let t = std::time::Instant::now();
+        let total = streams.len();
+        let mut c = collect_streams(streams, &self.ctx, None).await?;
+        c.per_input = vec![left, total - left];
+        self.mm.input_time.add_duration(t.elapsed());
+        self.mm.input_batches.add(c.parts.iter().map(|p| p.len()).sum());
+        if let Some(e) = &c.refused {
+            self.record(Decision::memory_hand_back(&self.op, "the input", e));
+            self.mm.handed_back.add(1);
+            return Ok(Outcome::Back(self.hand_back_plan(c)?));
+        }
+        self.run_gpu_outcome(c).await
+    }
+}
+
+/// What one execution of a `MetalExec` produced.
+enum Outcome {
+    /// The GPU's result in `batch_size` slices, and the reservation that holds it.
+    Gpu(Vec<RecordBatch>, MemoryReservation),
+    /// The replaced subtree, over the collected batches, for DataFusion to run instead.
+    Back(Arc<dyn ExecutionPlan>),
+}
+
+/// A join's one execution, shared by its output partitions: started by the first partition
+/// executed, and taken by each partition once.
+type SharedOutcome = futures::future::Shared<futures::future::BoxFuture<'static, std::result::Result<Arc<Outcome>, Arc<DataFusionError>>>>;
+
+/// The shared execution and how many output partitions have taken it.
+type JoinSlot = Arc<Mutex<Option<(SharedOutcome, usize)>>>;
+
+/// Output partition `p` of `n` of a shared join execution: every `n`-th GPU slice from the `p`-th,
+/// or partition `p` of the replaced subtree.
+fn partition_of(shared: SharedOutcome, p: usize, n: usize, ctx: Arc<TaskContext>) -> BoxStream<'static, Result<RecordBatch>> {
+    let s = futures::stream::once(shared).map(move |r| -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        let out = r.map_err(DataFusionError::Shared)?;
+        match &*out {
+            Outcome::Gpu(batches, _) => {
+                let mine: Vec<RecordBatch> = batches.iter().skip(p).step_by(n).cloned().collect();
+                let held = Arc::clone(&out);
+                Ok(Box::pin(futures::stream::iter(mine.into_iter().map(Ok)).map(move |b| {
+                    let _held = &held;
+                    b
+                })))
+            }
+            // `fit_partitions` gave it `n` partitions.
+            Outcome::Back(plan) => Ok(Box::pin(plan.execute(p, Arc::clone(&ctx))?)),
+        }
+    });
+    Box::pin(s.try_flatten())
+}
+
+/// `plan` with `n` output partitions: as it is, coalesced to one, or split round-robin.
+fn fit_partitions(plan: Arc<dyn ExecutionPlan>, n: usize) -> Result<Arc<dyn ExecutionPlan>> {
+    let have = plan.output_partitioning().partition_count();
+    Ok(if have == n {
+        plan
+    } else if n == 1 {
+        Arc::new(CoalescePartitionsExec::new(plan))
+    } else {
+        Arc::new(datafusion::physical_plan::repartition::RepartitionExec::try_new(plan, Partitioning::RoundRobinBatch(n))?)
+    })
 }
 
 impl MetalExec {
@@ -603,7 +733,7 @@ impl MetalExec {
     /// constants) are kept, its partitioning becomes a single partition.
     pub(crate) fn new(
         op: MetalOp,
-        input: Arc<dyn ExecutionPlan>,
+        inputs: Vec<Arc<dyn ExecutionPlan>>,
         original: Arc<dyn ExecutionPlan>,
         (log, plan): (SharedLog, u64),
         agg: AggSettings,
@@ -619,7 +749,7 @@ impl MetalExec {
         );
         Self {
             op,
-            input,
+            inputs,
             original,
             props: Arc::new(props),
             log,
@@ -628,6 +758,40 @@ impl MetalExec {
             choice,
             table_rows,
             rows_hint,
+            join_slot: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// A join's `MetalExec` with `n` output partitions: one execution on the GPU, its result
+    /// dealt out to the partitions batch by batch, so the operators above consume it in parallel
+    /// as they did the `HashJoinExec`'s partitions.
+    pub(crate) fn with_output_partitions(mut self, n: usize) -> Self {
+        if matches!(self.op, MetalOp::Join { .. }) && n > 1 {
+            let props = PlanProperties::new(
+                self.props.eq_properties.clone(),
+                Partitioning::UnknownPartitioning(n),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            );
+            self.props = Arc::new(props);
+        }
+        self
+    }
+
+    /// Everything one execution needs.
+    fn job(&self, ctx: &Arc<TaskContext>) -> Job {
+        Job {
+            op: self.op.clone(),
+            inputs: self.inputs.clone(),
+            original: Arc::clone(&self.original),
+            out_schema: self.schema(),
+            log: Arc::clone(&self.log),
+            plan: self.plan,
+            choice: self.choice,
+            table_rows: self.table_rows,
+            rows_hint: self.rows_hint,
+            mm: self.phase_metrics(),
+            ctx: Arc::clone(ctx),
         }
     }
 
@@ -636,9 +800,14 @@ impl MetalExec {
         &self.op
     }
 
-    /// The input it reads.
+    /// The input it reads (a join's left input).
     pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
-        &self.input
+        &self.inputs[0]
+    }
+
+    /// Every input it reads: one, or a join's left and right inputs.
+    pub fn inputs(&self) -> &[Arc<dyn ExecutionPlan>] {
+        &self.inputs
     }
 
     /// The per-phase metrics (EXPLAIN ANALYZE shows them): waiting for and collecting the input
@@ -711,9 +880,18 @@ fn decide(
 
 impl DisplayAs for MetalExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        let schema = self.input.schema();
+        let schema = self.inputs[0].schema();
         let name = |i: usize| schema.field(i).name().clone();
         match &self.op {
+            MetalOp::Join { how, left_keys, right_keys, projection, .. } => {
+                let right = self.inputs.get(1).map(|r| r.schema()).unwrap_or_else(|| Arc::clone(&schema));
+                let on: Vec<String> = left_keys
+                    .iter()
+                    .zip(right_keys)
+                    .map(|(&l, &r)| format!("({}, {})", name(l), right.field(r).name()))
+                    .collect();
+                write!(f, "MetalExec: join={how:?}, on=[{}], projection={projection:?}", on.join(", "))
+            }
             MetalOp::Sort { keys, fetch } => {
                 let ks: Vec<String> = keys
                     .iter()
@@ -781,11 +959,11 @@ impl ExecutionPlan for MetalExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
+        self.inputs.iter().collect()
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![false]
+        vec![false; self.inputs.len()]
     }
 
     fn apply_expressions(
@@ -797,16 +975,18 @@ impl ExecutionPlan for MetalExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        mut children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return internal_err!("MetalExec takes one child, got {}", children.len());
+        if children.len() != self.inputs.len() {
+            return internal_err!("MetalExec takes {} children, got {}", self.inputs.len(), children.len());
         }
-        let input = children.swap_remove(0);
-        let original = replace_leaf(&self.original, &self.input, &input)?;
+        let mut original = Arc::clone(&self.original);
+        for (old, new) in self.inputs.iter().zip(&children) {
+            original = replace_leaf(&original, old, new)?;
+        }
         Ok(Arc::new(MetalExec {
             op: self.op.clone(),
-            input,
+            inputs: children,
             original,
             props: Arc::clone(&self.props),
             log: Arc::clone(&self.log),
@@ -815,41 +995,67 @@ impl ExecutionPlan for MetalExec {
             choice: self.choice,
             table_rows: self.table_rows,
             rows_hint: self.rows_hint,
+            join_slot: Arc::new(Mutex::new(None)),
         }))
     }
 
     fn execute(&self, partition: usize, ctx: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
-            return internal_err!("MetalExec has one partition, asked for {partition}");
+        let n = self.props.partitioning.partition_count();
+        if partition >= n {
+            return internal_err!("MetalExec has {n} partition(s), asked for {partition}");
         }
         let schema = self.schema();
-        let job = Job {
-            op: self.op.clone(),
-            input: Arc::clone(&self.input),
-            original: Arc::clone(&self.original),
-            out_schema: Arc::clone(&schema),
-            log: Arc::clone(&self.log),
-            plan: self.plan,
-            choice: self.choice,
-            table_rows: self.table_rows,
-            rows_hint: self.rows_hint,
-            mm: self.phase_metrics(),
-            ctx: Arc::clone(&ctx),
-        };
+        if matches!(self.op, MetalOp::Join { .. }) {
+            // One execution for all output partitions: the first partition executed starts it,
+            // and a new one starts once every partition has taken the last one.
+            let mut slot = self.join_slot.lock().unwrap_or_else(|p| p.into_inner());
+            let fresh = slot.as_ref().is_none_or(|(_, taken)| *taken >= n);
+            if fresh {
+                let job = self.job(&ctx);
+                let mut streams = Vec::new();
+                let mut left = 0;
+                for (i, input) in self.inputs.iter().enumerate() {
+                    for p in 0..input.output_partitioning().partition_count() {
+                        streams.push(input.execute(p, Arc::clone(&ctx))?);
+                    }
+                    if i == 0 {
+                        left = streams.len();
+                    }
+                }
+                let fut: futures::future::BoxFuture<'static, std::result::Result<Arc<Outcome>, Arc<DataFusionError>>> =
+                    Box::pin(async move {
+                        let out = match job.run_join(streams, left).await {
+                            Ok(Outcome::Back(plan)) => fit_partitions(plan, n).map(Outcome::Back),
+                            other => other,
+                        };
+                        out.map(Arc::new).map_err(Arc::new)
+                    });
+                *slot = Some((fut.shared(), 0));
+            }
+            let Some((shared, taken)) = slot.as_mut() else {
+                return internal_err!("MetalExec join slot empty");
+            };
+            *taken += 1;
+            let s = partition_of(shared.clone(), partition, n, ctx);
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, s)));
+        }
+        let job = self.job(&ctx);
         let fut: futures::future::BoxFuture<'static, Result<BoxStream<'static, Result<RecordBatch>>>> =
             if matches!(self.op, MetalOp::Aggregate { .. }) {
-                let parts = self.input.output_partitioning().partition_count();
-                let mut streams = Vec::with_capacity(parts);
-                for p in 0..parts {
-                    streams.push(self.input.execute(p, Arc::clone(&ctx))?);
+                // Every partition of the input, each its own stream.
+                let input = &self.inputs[0];
+                let mut streams = Vec::new();
+                for p in 0..input.output_partitioning().partition_count() {
+                    streams.push(input.execute(p, Arc::clone(&ctx))?);
                 }
                 Box::pin(job.run_aggregate(streams))
             } else {
                 // Coalescing runs the input partitions concurrently, as DataFusion's own merge does.
-                let source: Arc<dyn ExecutionPlan> = if self.input.output_partitioning().partition_count() > 1 {
-                    Arc::new(CoalescePartitionsExec::new(Arc::clone(&self.input)))
+                let input = &self.inputs[0];
+                let source: Arc<dyn ExecutionPlan> = if input.output_partitioning().partition_count() > 1 {
+                    Arc::new(CoalescePartitionsExec::new(Arc::clone(input)))
                 } else {
-                    Arc::clone(&self.input)
+                    Arc::clone(input)
                 };
                 let stream = source.execute(0, Arc::clone(&ctx))?;
                 Box::pin(job.run_sort_or_filter(stream))

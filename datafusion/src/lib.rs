@@ -3,16 +3,18 @@
 //! [`ArrowMetalRule`] walks DataFusion's optimized physical plan and replaces the nodes ArrowMetal
 //! can run with the same answer by a [`MetalExec`]: `SortExec` (with or without `fetch`), a hash
 //! `AggregateExec` over column keys with `sum`/`min`/`max`/`count`/`avg` or none (DISTINCT),
-//! and a `FilterExec` whose predicate translates. `MetalExec` collects its input's partitions, runs
-//! the operation through ArrowMetal's plan runner on the GPU, and emits `RecordBatch`es with the
-//! schema DataFusion expects. Anything it does not support is left unchanged, and the reason is
-//! recorded in the rule's [`Report`].
+//! a `FilterExec` whose predicate translates, and a `HashJoinExec` (inner, left, right) on equal
+//! int32, int64 or Utf8 keys. `MetalExec` collects its input's partitions, runs the operation
+//! through ArrowMetal's plan runner on the GPU, and emits `RecordBatch`es with the schema
+//! DataFusion expects. Anything it does not support is left unchanged, and the reason is recorded
+//! in the rule's [`Report`].
 //!
-//! The default config ([`ArrowMetalConfig::default`]) takes full sorts from 250,000 input rows and
-//! aggregates where the measured table (`src/agg_table.rs`) takes their shape: a replaced aggregate
-//! estimates its group count from a sample of its keys when it runs and either runs on ArrowMetal
-//! or hands the node back to DataFusion's own operators ([`AggregateChoice`]). Top-k and filters
-//! are left.
+//! The default config ([`ArrowMetalConfig::default`]) takes full sorts from 250,000 input rows,
+//! aggregates where the measured table (`src/agg_table.rs`) takes their shape (a replaced
+//! aggregate estimates its group count from a sample of its keys when it runs and either runs on
+//! ArrowMetal or hands the node back to DataFusion's own operators, [`AggregateChoice`]), and
+//! joins where the measured join table (`src/join_table.rs`) takes them ([`JoinChoice`]). Top-k
+//! and filters are left.
 //!
 //! ```no_run
 //! # async fn f() -> datafusion::error::Result<()> {
@@ -33,13 +35,14 @@ mod agg_table;
 mod choice;
 mod exec;
 mod gpu;
+mod join_table;
 mod probe;
 mod rule;
 mod translate;
 
-pub use exec::{AggKind, AggSpec, MetalExec, MetalOp, SortKey};
+pub use exec::{AggKind, AggSpec, JoinHow, MetalExec, MetalOp, SortKey};
 pub use probe::GroupEstimate;
-pub use rule::{AggregateChoice, ArrowMetalConfig, ArrowMetalRule, Decision, GroupChoice, Report};
+pub use rule::{AggregateChoice, ArrowMetalConfig, ArrowMetalRule, Decision, GroupChoice, JoinChoice, Report};
 
 use std::sync::Arc;
 

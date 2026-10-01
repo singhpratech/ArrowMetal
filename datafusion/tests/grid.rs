@@ -28,7 +28,7 @@ use arrow::datatypes::{DataType, Field, Float32Type, Float64Type, Int32Type, Int
 use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_arrowmetal::{session_context, AggregateChoice, ArrowMetalConfig, ArrowMetalRule};
+use datafusion_arrowmetal::{session_context, AggregateChoice, ArrowMetalConfig, ArrowMetalRule, JoinChoice};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -150,6 +150,107 @@ fn table(n: usize, null_frac: f64, seed: u64) -> RecordBatch {
     cols.push(arrow::compute::cast(&ks, &DataType::Utf8View).unwrap());
     cols.push(arrow::compute::cast(&ks, &DataType::LargeUtf8).unwrap());
     RecordBatch::try_new(schema(), cols).unwrap()
+}
+
+fn side_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("k32", DataType::Int32, true),
+        Field::new("k64", DataType::Int64, true),
+        Field::new("ks", DataType::Utf8, true),
+        Field::new("w", DataType::Float64, true),
+        Field::new("flag", DataType::Boolean, true),
+    ]))
+}
+
+/// The other side of the grid's joins (`u`): keys that partly overlap `t`'s (int32 2 to 40 against
+/// `t`'s -3 to 3; int64 values 40 to 89 of the 50-value domain `t` draws 0 to 49 from; two of `t`'s
+/// strings among 30 others), each repeated, so a key matches several rows on both sides; nulls in
+/// every column at `null_frac`.
+fn side(n: usize, null_frac: f64, seed: u64) -> RecordBatch {
+    let mut r = StdRng::seed_from_u64(seed ^ 0x5eed);
+    let null = |r: &mut StdRng| null_frac >= 1.0 || (null_frac > 0.0 && r.random_bool(null_frac));
+    let k64_domain: Vec<i64> = (0..100).map(|i| (i as i64 - 25) * 40_000_000_007).collect();
+    let strs: Vec<String> = ["b", "zz"].iter().map(|s| s.to_string()).chain((0..30).map(|i| format!("x{i}"))).collect();
+    let mut k32 = Vec::new();
+    let mut k64 = Vec::new();
+    let mut ks = Vec::new();
+    let mut w = Vec::new();
+    let mut flag = Vec::new();
+    for _ in 0..n {
+        k32.push(if null(&mut r) { None } else { Some(r.random_range(2i32..=40)) });
+        k64.push(if null(&mut r) { None } else { Some(k64_domain[r.random_range(40..90)]) });
+        ks.push(if null(&mut r) { None } else { Some(strs[r.random_range(0..strs.len())].clone()) });
+        w.push(if null(&mut r) {
+            None
+        } else {
+            Some(match r.random_range(0..20) {
+                0 => f64::NAN,
+                1 => -0.0,
+                _ => r.random_range(-100.0f64..100.0),
+            })
+        });
+        flag.push(if null(&mut r) { None } else { Some(r.random_bool(0.5)) });
+    }
+    let cols: Vec<ArrayRef> = vec![
+        Arc::new(arrow::array::Int32Array::from(k32)),
+        Arc::new(arrow::array::Int64Array::from(k64)),
+        Arc::new(arrow::array::StringArray::from(ks)),
+        Arc::new(arrow::array::Float64Array::from(w)),
+        Arc::new(arrow::array::BooleanArray::from(flag)),
+    ];
+    RecordBatch::try_new(side_schema(), cols).unwrap()
+}
+
+/// `ti`: float MIN/MAX values whose answer DataFusion gives from its starting values or the one
+/// zero sign present. Groups (k32) 0..8: group 0 holds only -inf, 1 only +inf, 2 both infinities,
+/// 3 -inf and finite values, 4 only -0.0 (in `vz`) and only +0.0 (in `vz32`), the rest finite
+/// values; `vz` has no +0.0 and `vz32` no -0.0. `vi32` / `vz32` are Float32.
+fn inf_table(n: usize, null_frac: f64, seed: u64) -> RecordBatch {
+    let mut r = StdRng::seed_from_u64(seed ^ 0x1f1f);
+    let null = |r: &mut StdRng| null_frac >= 1.0 || (null_frac > 0.0 && r.random_bool(null_frac));
+    let mut k = Vec::new();
+    let (mut vi, mut vi32, mut vz, mut vz32) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..n {
+        let g = r.random_range(0i32..8);
+        k.push(Some(g));
+        let fin = (r.random_range(-400i32..=400) as f64) * 0.5;
+        let x = match g {
+            0 => f64::NEG_INFINITY,
+            1 => f64::INFINITY,
+            2 => if r.random_bool(0.5) { f64::INFINITY } else { f64::NEG_INFINITY },
+            3 => if r.random_bool(0.5) { f64::NEG_INFINITY } else { fin },
+            _ => fin,
+        };
+        vi.push(if null(&mut r) { None } else { Some(x) });
+        vi32.push(if null(&mut r) { None } else { Some(x as f32) });
+        let z = if g == 4 { -0.0 } else { [-0.0, 1.5, -2.5, 3.0][r.random_range(0..4)] };
+        vz.push(if null(&mut r) { None } else { Some(z) });
+        let z32 = if g == 4 { 0.0f32 } else { [0.0f32, 1.5, -2.5][r.random_range(0..3)] };
+        vz32.push(if null(&mut r) { None } else { Some(z32) });
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k32", DataType::Int32, true),
+        Field::new("vi", DataType::Float64, true),
+        Field::new("vi32", DataType::Float32, true),
+        Field::new("vz", DataType::Float64, true),
+        Field::new("vz32", DataType::Float32, true),
+    ]));
+    let cols: Vec<ArrayRef> = vec![
+        Arc::new(arrow::array::Int32Array::from(k)),
+        Arc::new(arrow::array::Float64Array::from(vi)),
+        Arc::new(arrow::array::Float32Array::from(vi32)),
+        Arc::new(arrow::array::Float64Array::from(vz)),
+        Arc::new(arrow::array::Float32Array::from(vz32)),
+    ];
+    RecordBatch::try_new(schema, cols).unwrap()
+}
+
+/// Rows of `u` for a `t` of `n` rows.
+fn side_rows(n: usize) -> usize {
+    match n {
+        0 | 1 => n,
+        _ => (n / 50).max(10),
+    }
 }
 
 fn mem_table(b: &RecordBatch, parts: usize) -> Arc<MemTable> {
@@ -367,6 +468,103 @@ fn queries() -> Vec<Query> {
             float_min_max: None,
         });
     }
+    // Joins with `u` (keys repeated on both sides, nulls in the keys) and with `e` (no rows): the
+    // rule replaces inner, left and right hash joins on int32, int64 and Utf8 keys and leaves the
+    // rest (full, semi, anti, a join filter, IS NOT DISTINCT FROM, a float key).
+    for sql in [
+        "SELECT t.k32, t.v64, t.ks, u.k32, u.w FROM t JOIN u ON t.k32 = u.k32",
+        "SELECT t.k64, t.vf, u.k64, u.w, u.flag FROM t JOIN u ON t.k64 = u.k64",
+        "SELECT t.ks, t.kf32, t.ksv, u.ks, u.w FROM t JOIN u ON t.ks = u.ks",
+        "SELECT t.k64, t.ksl, u.w, u.ks FROM t LEFT JOIN u ON t.k64 = u.k64",
+        "SELECT u.k64, u.w, t.vf, t.k32 FROM u LEFT JOIN t ON u.k64 = t.k64",
+        "SELECT t.k32, u.ks, u.w FROM t RIGHT JOIN u ON t.k32 = u.k32",
+        "SELECT u.k32, u.flag, t.v32 FROM u RIGHT JOIN t ON u.k32 = t.k32",
+        "SELECT t.k64, t.ks, u.w FROM t JOIN u ON t.k64 = u.k64 AND t.ks = u.ks",
+        "SELECT t.k32, t.ks, u.k32, u.ks, u.flag FROM t LEFT JOIN u ON t.k32 = u.k32 AND t.ks = u.ks",
+        "SELECT t.*, u.w FROM t JOIN u ON t.k64 = u.k64",
+        "SELECT count(*) FROM t JOIN u ON t.k64 = u.k64",
+        "SELECT t.k64, e.w FROM t LEFT JOIN e ON t.k64 = e.k64",
+        "SELECT t.k64, e.w FROM t JOIN e ON t.k64 = e.k64",
+        "SELECT e.k64, e.flag, t.vf FROM e LEFT JOIN t ON e.k64 = t.k64",
+        "SELECT t.k32, e.w FROM e RIGHT JOIN t ON e.k32 = t.k32",
+        "SELECT t.k64, u.w FROM t JOIN u ON t.k32 = u.k64",
+        // Left by the rule.
+        "SELECT t.k64, u.w FROM t FULL JOIN u ON t.k64 = u.k64",
+        "SELECT t.k64, u.w FROM t JOIN u ON t.k64 = u.k64 AND t.vg > u.w",
+        "SELECT t.k64, t.v32 FROM t WHERE t.k64 IN (SELECT k64 FROM u)",
+        "SELECT t.k64, t.v32 FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.k64 = t.k64)",
+        "SELECT t.k64, u.w FROM t JOIN u ON t.k64 IS NOT DISTINCT FROM u.k64",
+        "SELECT t.kf, u.w FROM t JOIN u ON t.kf = u.w",
+    ] {
+        q.push(Query {
+            class: format!("join: {sql}"),
+            sql: sql.to_string(),
+            kind: Kind::Unordered { tol_cols: vec![] },
+            float_min_max: None,
+        });
+    }
+    // An ORDER BY above a join: with one partition DataFusion sorts the probe side below the join
+    // and relies on the join keeping its order.
+    for (sql, keys) in [
+        ("SELECT t.k64, t.v64, t.vf, u.w FROM t JOIN u ON t.k64 = u.k64 ORDER BY t.k64, t.v64", vec![0, 1]),
+        ("SELECT t.ks, t.v32, u.flag FROM t LEFT JOIN u ON t.ks = u.ks ORDER BY t.ks DESC, t.v32", vec![0, 1]),
+    ] {
+        q.push(Query {
+            class: format!("join: {sql}"),
+            sql: sql.to_string(),
+            kind: Kind::Ordered { key_cols: keys, limited: false },
+            float_min_max: None,
+        });
+    }
+    // An aggregate above a join.
+    for (sql, tol) in [
+        ("SELECT t.k32, count(*), sum(u.w) FROM t JOIN u ON t.k32 = u.k32 GROUP BY t.k32", vec![2]),
+        ("SELECT u.ks, count(t.v64), max(t.v64) FROM t RIGHT JOIN u ON t.ks = u.ks GROUP BY u.ks", vec![]),
+    ] {
+        q.push(Query {
+            class: format!("join: {sql}"),
+            sql: sql.to_string(),
+            kind: Kind::Unordered { tol_cols: tol },
+            float_min_max: None,
+        });
+    }
+    // MIN / MAX over float values whose groups hold only -inf or only +inf, and Float32.
+    for sql in [
+        "SELECT k32, min(vi), max(vi) FROM ti GROUP BY k32",
+        "SELECT k32, min(vi32), max(vi32) FROM ti GROUP BY k32",
+        "SELECT k32, min(vz), max(vz), min(vz32), max(vz32) FROM ti GROUP BY k32",
+    ] {
+        q.push(Query { class: sql.to_string(), sql: sql.to_string(), kind: Kind::Unordered { tol_cols: vec![] }, float_min_max: None });
+    }
+    // WHERE over float columns holding NaNs of both signs with payloads, ±0.0 and ±inf (`kn`,
+    // `kf`, `vf32`, `kf32`), every comparison operator against zero of both signs, both
+    // infinities and finite literals, on either side.
+    for (col, ty) in [("kn", "DOUBLE"), ("kf", "DOUBLE"), ("vf", "DOUBLE"), ("vf32", "REAL"), ("kf32", "REAL")] {
+        let lits = [
+            format!("CAST(0.0 AS {ty})"),
+            format!("CAST(-0.0 AS {ty})"),
+            format!("CAST('inf' AS {ty})"),
+            format!("CAST('-inf' AS {ty})"),
+            format!("CAST(1.5 AS {ty})"),
+            format!("CAST(-2.5 AS {ty})"),
+        ];
+        for lit in &lits {
+            for op in ["=", "<>", "<", "<=", ">", ">="] {
+                let sql = format!("SELECT k64, {col} FROM t WHERE {col} {op} {lit}");
+                q.push(Query { class: format!("where {col} {op} {lit}"), sql, kind: Kind::Unordered { tol_cols: vec![] }, float_min_max: None });
+            }
+        }
+        // A NaN literal is left to DataFusion (totalOrder tells NaN payloads apart).
+        let nan = format!("CAST('NaN' AS {ty})");
+        for op in ["=", ">"] {
+            let sql = format!("SELECT k64, {col} FROM t WHERE {col} {op} {nan}");
+            q.push(Query { class: format!("where {col} {op} {nan}"), sql, kind: Kind::Unordered { tol_cols: vec![] }, float_min_max: None });
+        }
+        for (op, lit) in [("<", &lits[1]), (">=", &lits[0]), (">", &lits[3]), ("<=", &lits[4])] {
+            let sql = format!("SELECT k64, {col} FROM t WHERE {lit} {op} {col}");
+            q.push(Query { class: format!("where {lit} {op} {col}"), sql, kind: Kind::Unordered { tol_cols: vec![] }, float_min_max: None });
+        }
+    }
     // WHERE.
     for pred in [
         "v32 > 5",
@@ -509,6 +707,7 @@ async fn differential_grid() {
     let mut max_dev = 0f64;
     let mut data_dependent: BTreeMap<String, usize> = BTreeMap::new();
     let mut relaxed_cells = 0usize;
+    let mut joins_replaced = 0usize;
 
     // Per variant: (pairs, pairs with a node on ArrowMetal, run-time choices on ArrowMetal, handed back).
     let mut per_variant: BTreeMap<&str, [usize; 4]> = BTreeMap::new();
@@ -524,18 +723,33 @@ async fn differential_grid() {
             for &(parts, tp) in &layouts {
                 seed += 1;
                 let batch = table(n, nf, seed);
+                let other = side(side_rows(n), nf, seed);
+                let empty = other.slice(0, 0);
+                let inf = inf_table(n, nf, seed);
+                let register = |ctx: &SessionContext| {
+                    ctx.register_table("t", mem_table(&batch, parts)).unwrap();
+                    ctx.register_table("u", mem_table(&other, parts)).unwrap();
+                    ctx.register_table("e", mem_table(&empty, parts)).unwrap();
+                    ctx.register_table("ti", mem_table(&inf, parts)).unwrap();
+                };
                 let cfg = || SessionConfig::new().with_target_partitions(tp).with_batch_size(1024);
                 let plain = SessionContext::new_with_config(cfg());
-                plain.register_table("t", mem_table(&batch, parts)).unwrap();
+                register(&plain);
                 let mut wants = Vec::with_capacity(queries.len());
                 for q in &queries {
                     wants.push(plain.sql(&q.sql).await.unwrap().collect().await.unwrap());
                 }
 
                 for &(variant, choice, table_rows) in &variants {
-                    let rule = ArrowMetalRule::new(ArrowMetalConfig::all().with_min_rows(0).with_aggregate_choice(choice).with_table_rows(table_rows));
+                    let rule = ArrowMetalRule::new(
+                        ArrowMetalConfig::all()
+                            .with_min_rows(0)
+                            .with_aggregate_choice(choice)
+                            .with_table_rows(table_rows)
+                            .with_join_choice(JoinChoice::ArrowMetal),
+                    );
                     let metal = session_context(cfg(), rule.clone());
-                    metal.register_table("t", mem_table(&batch, parts)).unwrap();
+                    register(&metal);
                     for (q, want) in queries.iter().zip(&wants) {
                         let aggregate = q.sql.contains("GROUP BY");
                         if variant != "take" && !aggregate {
@@ -556,6 +770,7 @@ async fn differential_grid() {
                         };
                         let report = rule.report();
                         let taken = report.taken().count();
+                        joins_replaced += report.taken().filter(|d| d.node.starts_with("HashJoinExec")).count();
                         nodes_taken += taken;
                         let on_gpu = report.runtime_choices().filter(|d| d.taken).count();
                         let back = report.runtime_choices().filter(|d| !d.taken).count();
@@ -628,6 +843,7 @@ async fn differential_grid() {
         println!("  {v:5}  {k}");
     }
     println!("order-dependent min/max(vf) cells relaxed in multi-partition layouts: {relaxed_cells}");
+    println!("hash joins replaced: {joins_replaced}");
     println!("runtime fallbacks on an ArrowMetal error: {}", fallbacks.len());
     for f in fallbacks.iter().take(20) {
         println!("  {f}");

@@ -7,11 +7,12 @@ Arrow, with its own planner, optimizer and multi-threaded operators. `datafusion
 which runs the sort on the Apple GPU through ArrowMetal's plan runner and hands DataFusion the
 `RecordBatch`es it expects. It also replaces the hash aggregates (`GROUP BY`, `DISTINCT`) of the
 shapes a measured table takes: `count(*)` over two int32 keys of a `MemTable` of at least
-10,000,000 rows and `DISTINCT` over two int32 keys of one of at least 50,000,000 rows. Such an
-aggregate estimates its number of groups from a sample of its keys when it runs, runs on the GPU at
-the numbers of groups the table takes at that row count, and otherwise hands the node back to
-DataFusion's own operators. The SQL does not change, and every
-other node of the plan stays DataFusion's.
+10,000,000 rows, and `DISTINCT` over two int32 keys or `MIN`/`MAX` of an integer column over one
+int64 key or two integer keys of one of at least 50,000,000 rows. Such an aggregate estimates its
+number of groups from a sample of its keys when it runs, runs on the GPU at the numbers of groups the
+table takes at that row count, and otherwise hands the node back to DataFusion's own operators. Hash
+joins (inner, left, right) are translated too, and a measured join table decides them; it takes no
+measured join. The SQL does not change, and every other node of the plan stays DataFusion's.
 
 **The summary.** On an Apple M4 Max with DataFusion's default of one partition per core, a full sort
 of 250,000 to 50,000,000 rows is **6.9x to 28.8x faster** with the rule than DataFusion alone, and at
@@ -19,13 +20,16 @@ of 250,000 to 50,000,000 rows is **6.9x to 28.8x faster** with the rule than Dat
 reader, a Float64 sort is 10.8x to 16.5x faster at 10M and 50M rows, and a sort over a Parquet file
 with a string column 3.6x to 5.5x at 1M to 50M rows. The aggregates the default runs on the GPU,
 `count(*)` over two int32 keys at 10M and 50M rows and `DISTINCT` over two int32 keys at 50M rows,
-were 2.14x to 4.11x faster than DataFusion alone warm. On the first run after 500 ms of idle they
+were 2.14x to 4.11x faster than DataFusion alone warm; on the first run after 500 ms of idle they
 were 1.34x to 2.08x faster than DataFusion alone's first run after the same idle, and after 5 s of
 idle 1.08x to 1.72x; against DataFusion alone's warm time, that first run was 0.67x to 1.60x after
-500 ms and 0.53x to 1.23x after 5 s ([Aggregates](#aggregates-with-the-default)). The answers are
-DataFusion's: a differential grid of 7,656 query pairs runs every query with and without the rule
-and finds 0 mismatches. Top-k (`ORDER BY … LIMIT`), filters and every other aggregate shape are
-left to DataFusion by default; the measured numbers for them are under [To improve](#to-improve).
+500 ms and 0.53x to 1.23x after 5 s ([Aggregates](#aggregates-with-the-default)). The integer
+`MIN`/`MAX` it runs on the GPU at 50M rows were 2.64x to 3.60x faster warm, and 1.20x to 2.03x
+(500 ms) and 1.16x to 1.56x (5 s) idle against idle. The answers are DataFusion's: a differential
+grid of 13,632 query pairs runs every query with and without the rule and finds 0 mismatches.
+Top-k (`ORDER BY … LIMIT`), filters, joins and every other aggregate shape are left to DataFusion
+by default; the measured numbers for them are under [To improve](#to-improve) and
+[Joins, rule on and off](#joins-rule-on-and-off).
 
 - [Install](#install)
 - [Use](#use)
@@ -226,10 +230,12 @@ count one each), until `clear_report()` empties it.
 | `topk` | off | `ORDER BY … LIMIT` |
 | `aggregate` | **on** | hash `GROUP BY` and `DISTINCT` of the shapes the measured table takes (below) |
 | `filter` | off | `WHERE` |
+| `join` | **on** | hash joins (inner, left, right on equal keys) the measured join table takes ([Joins](#joins)) |
 | `accept_inexact` | off | use an estimated row count as if it were exact |
 | `take_when_unknown` | off | take a node whose input row count is unknown |
 | `aggregate_choice` | `Measured` | who runs a replaced aggregate: `Measured` (the group-count estimate and the measured table), `ArrowMetal` (always the GPU), `DataFusion` (always handed back) |
 | `table_rows` | none | look the measured table up at this row count instead of the input's |
+| `join_choice` | `Measured` | which translatable joins are replaced: `Measured` (the measured join table), `ArrowMetal` (every one from `min_rows`) |
 | `report_plans` | 64 | how many plans the report keeps |
 
 `ArrowMetalConfig::all()` switches `topk` and `filter` on as well. The fields are public to read; a
@@ -322,6 +328,35 @@ than DataFusion alone's first run after the same idle, 16 with no measurement af
 there), and 3 because a hand-back of the same shape at 50M rows cost more than 3%
 ([To improve](#aggregates)).
 
+### Joins
+
+The rule translates a `HashJoinExec` when:
+
+- its join type is inner, left or right (DataFusion plans the SQL `probe LEFT JOIN build` of a larger
+  table as a right join with the smaller table on the build side), with equal keys only: no join
+  filter, SQL's `=` (`NullEqualsNothing`), no fetch;
+- every key is a column, of the same type on both sides, int32, int64 or Utf8 (one key or several);
+- every column it outputs is one of the types a sort carries;
+- both inputs have an exact row count, and the larger is at least `min_rows`;
+- an output ordering, if the join has one, is the probe side's in one partition.
+
+`MetalExec` reads below the exchanges under the join (its `RepartitionExec`s and
+`CoalescePartitionsExec`s), collects both inputs, runs the join on the GPU, and deals the result out
+to as many output partitions as the join had; a hash-partitioned join keeps a `RepartitionExec` by
+the same hash above it where the parent requires that distribution.
+
+Which joins the default replaces is a measured table, [`src/join_table.rs`](../datafusion/src/join_table.rs),
+generated by [`scripts/join_table.py`](../datafusion/scripts/join_table.py) from
+`datafusion_join_2026-10-01.csv`: per join type, key type and build-side size (10,000, 1,000,000
+and 10,000,000 rows, each standing for half a decade either side), a cell is taken from the smallest
+measured probe-side size (10M, 50M rows) from which every case, in both layouts, is at least 1.5x
+faster than DataFusion alone warm and at least 1.0x on the first run after 500 ms and after 5 s of
+idle against DataFusion alone's first run after the same idle, at that size and every larger one.
+The cases: `SELECT count(*), sum(b.w) FROM probe p [LEFT] JOIN build b ON p.k = b.k` and
+`SELECT p.k, count(*), sum(p.v) … GROUP BY p.k` over the join, half the probe rows matching.
+**The table takes none of its 18 cells**, so the default replaces no join; every row of the table
+ends with the reason ([Joins, rule on and off](#joins-rule-on-and-off)).
+
 ---
 
 ## What it leaves, and why
@@ -331,14 +366,15 @@ there), and 3 because a hand-back of the same shape at 50M rows cost more than 3
 | top-k, `ORDER BY … LIMIT` | left | behind DataFusion at every measured size from 250,000 to 50M rows: 0.14x to 0.41x ([To improve](#top-k)) |
 | `GROUP BY`, `DISTINCT` of a shape the table does not take at the input's row count | left | behind DataFusion, not 1.65x ahead in the worst case at two sizes, slower than DataFusion alone on the first run after the same idle, or its hand-backs cost more than 3% ([To improve](#aggregates)) |
 | `count(*)` over two int32 keys at 10M rows or more, or `DISTINCT` over two int32 keys or `min`/`max` over an integer column with one int64 key or two integer keys at 50M rows or more, whose estimated number of groups is not in a taken range | handed back at run time | `HANDBACK` in the report |
-| `WHERE` | left | behind on the measured shapes: 0.51x to 0.74x ([To improve](#filters)) |
-| joins | not replaced | the rule has no join operator |
+| `WHERE` | left | behind on every measured shape: 0.31x to 0.79x over `MemTable`s, 0.51x to 0.55x over Parquet ([To improve](#filters)) |
+| hash joins (inner, left, right on int32, int64 or Utf8 keys) | left | no measured cell is 1.5x ahead warm in every case and at or above DataFusion alone on the first run after the same idle at both gaps ([Joins, rule on and off](#joins-rule-on-and-off)) |
+| full, semi and anti joins, a join with a condition besides the equal keys, `IS NOT DISTINCT FROM` keys, keys of another type | left | not translated |
 | a sort over an estimated row count (above a filter, a join or an aggregate) | left | the threshold needs an exact count; `accept_inexact` takes it |
 | a sort key that is an expression, or a key or carried column of another type (Date, Timestamp, Decimal, Dictionary, nested) | left | not in the types the grid covers |
 | a per-partition sort with no merge above it, a merge whose ordering differs from its sort's | left | one sorted partition cannot stand in for several |
 
-Each of these except joins is a `LEFT` line in the report with its reason; the rule does not report
-the nodes it has no operator for.
+Each of these is a `LEFT` line in the report with its reason; the rule does not report the nodes it
+has no operator for (a nested-loop or sort-merge join, a window, a union).
 
 ---
 
@@ -365,15 +401,46 @@ returns an error or the GPU path panics, or the session's memory pool refuses th
 the collected input or the result, `MetalExec` runs that subtree over the batches it collected and
 the rest of its input, returns DataFusion's answer, and adds a `FALLBACK` line to the report. No
 query in the grid or in the benchmarks took that path; `tests/rule.rs` runs a sort and a group-by
-in a 3 MiB memory pool, which hand back. With aggregates and filters taken, three checks on the data
-also hand the node back, because on such data only DataFusion can give DataFusion's answer:
+in a 3 MiB memory pool, which hand back, and a join in a 6 MiB pool. With aggregates taken, two
+checks on the data also hand the node back, because on such data only DataFusion can give
+DataFusion's answer:
 
-- a filter that compares a float column with a literal, when the column holds a NaN with the sign bit
-  set (totalOrder puts it below -inf; the GPU comparison cannot place it);
 - a `GROUP BY` over a float key that holds NaNs of more than one bit pattern (DataFusion keeps each
   pattern as its own group; ArrowMetal puts every NaN in one group);
-- a grouped Float64 `MIN` or `MAX` over a group that holds a NaN, or both -0.0 and +0.0 with a zero
+- a grouped float `MIN` or `MAX` over a group that holds a NaN, or both -0.0 and +0.0 with a zero
   result (DataFusion's answer there depends on the order the rows arrive in).
+
+**Float comparisons in a `WHERE`.** DataFusion 55.1 compares floats with arrow-rs's IEEE 754
+totalOrder kernels after rewriting -0.0 to +0.0 on both sides: a NaN with the sign bit set is below
+every value, one without it above every value, and -0.0 equals +0.0. A column compared with a
+literal that is not a NaN (finite, zero or infinite, Float64 or Float32, on either side) becomes one
+fused expression, IEEE comparisons plus the expression grammar's `signbit` and `is_nan`
+([EXPR.md](EXPR.md#totalorder-comparisons)): `x > c` is
+`(or (gt x c) (and (is_nan x) (not (signbit x))))`, `x < c` is `(or (lt x c) (and (is_nan x) (signbit x)))`,
+`x = c` and `x <> c` are the IEEE `eq` and its `not`. A comparison with a NaN literal is left (totalOrder
+tells NaN payloads apart). Nothing about the data hands such a filter back.
+
+**`MIN` and `MAX` over Float64 and Float32** run as the plan runner's own grouped `min` and `max`.
+DataFusion's grouped float `MIN`/`MAX` starts each group at the type's largest finite value (`MIN`)
+or lowest finite value (`MAX`) and replaces the running value whenever the new one compares lower
+(higher) or does not compare at all. So a group whose values are all -inf has a `MAX` of the lowest
+finite value (`f64::MIN`, `f32::MIN`) and one whose values are all +inf a `MIN` of the largest;
+-0.0 and +0.0 compare equal, so the first zero to arrive is kept; and a NaN makes the answer depend
+on the order the rows arrive in. Before the GPU call, `MetalExec` reads the value column once on the
+CPU (up to 8 threads, above 2,000,000 rows) for NaN, -0.0 and +0.0. A column with no NaN and at most
+one zero sign runs as the plan runner's `min`/`max`, with the infinities and the sign of a zero
+result set as DataFusion gives them. A column with a NaN or both zero signs adds four per-group
+counts (NaN, value, zero and negative-zero counts); a group with a NaN, or both zero signs and a
+zero result, hands the node back.
+
+**Joins.** A replaced join gives DataFusion's answer for an inner, left or right `HashJoinExec` with
+equal keys only: a null in a key matches nothing on either side (SQL's `=`, DataFusion's
+`NullEqualsNothing`); a left join keeps every row of the build (left) side and a right join every
+row of the probe (right) side, with nulls for the other side's columns; the output columns are
+DataFusion's (the left input's, then the right's, through the join's projection). The plan runner's
+join keeps the order of its left input, and `MetalExec` makes the probe side that input for an
+inner and a right join, so a join whose output carries the probe side's ordering (DataFusion sorts
+the probe side below an inner join when the probe side is one partition) keeps it.
 
 ---
 
@@ -385,33 +452,50 @@ times with the rule: forced onto the GPU (`AggregateChoice::ArrowMetal`), forced
 (`AggregateChoice::DataFusion`), and with the measured choice looked up at 50M rows
 (`table_rows`).
 
-- **Tables:** 13 columns: Int32 and Int64 keys; Float64 keys with ±0.0, ±inf and NaN; Float64 keys
-  with -NaN and NaN payloads of both signs; Float32 keys with NaN, ±0.0 and ±inf; Utf8 keys and the
-  same keys as Utf8View and as LargeUtf8; Int32 and Int64 values; Float64 values with NaN, NaN
-  payloads and both zeros; Float64 values whose sums round; Float32 values with -NaN and a NaN
-  payload.
+- **Tables:**
+  - `t`, 13 columns: Int32 and Int64 keys; Float64 keys with ±0.0, ±inf and NaN; Float64 keys with
+    -NaN and NaN payloads of both signs; Float32 keys with NaN, ±0.0 and ±inf; Utf8 keys and the same
+    keys as Utf8View and as LargeUtf8; Int32 and Int64 values; Float64 values with NaN, NaN payloads
+    and both zeros; Float64 values whose sums round; Float32 values with -NaN, a NaN payload and -inf.
+  - `u`, the other side of the joins (a fiftieth of `t`'s rows, at least 10): Int32, Int64 and Utf8
+    keys that partly overlap `t`'s and repeat on both sides, Float64 values with NaN and -0.0, and a
+    Boolean column; `e`, the same columns with no rows.
+  - `ti`, float `MIN`/`MAX` data: groups whose values are only -inf, only +inf, both infinities, -inf
+    and finite values, only -0.0 or only +0.0, in Float64 and Float32.
 - **24 table configurations:** 0, 1, 1,000 and 20,000 rows × null fraction 0, 0.1 and 1.0 on every
   column × two layouts (one partition with `target_partitions` 1; three partitions with
-  `target_partitions` 4, which plans per-partition sorts under a merge).
-- **221 queries:** 154 `ORDER BY` (12 columns × ASC/DESC × `NULLS FIRST`/`NULLS LAST`/default × with
-  and without `LIMIT 7`, plus 10 multi-column orderings), 49 `GROUP BY`, and 18 `WHERE`.
+  `target_partitions` 4, which plans per-partition sorts under a merge and hash-partitioned joins).
+- **460 queries:**
+  - 154 `ORDER BY` (12 columns × ASC/DESC × `NULLS FIRST`/`NULLS LAST`/default × with and without
+    `LIMIT 7`, plus 10 multi-column orderings);
+  - 52 `GROUP BY` (every aggregate over each key and value column, `count` over string columns, and
+    `MIN`/`MAX` over `ti`);
+  - 228 `WHERE`: 18 mixed predicates, and over four float columns and `vf` every operator (`=`, `<>`,
+    `<`, `<=`, `>`, `>=`) against +0.0, -0.0, +inf, -inf, 1.5 and -2.5, four with the literal on
+    the left, and two against a NaN literal;
+  - 26 joins: inner, left and right joins on int32, int64, Utf8 and two-column keys, with an empty
+    side, with an `ORDER BY` and a `GROUP BY` above, and the shapes the rule leaves (full, semi, anti,
+    a condition besides the keys, `IS NOT DISTINCT FROM`, a Float64 key).
 - **Comparison:** floats by bit pattern (so -0.0 ≠ +0.0, and NaN sign and payload must match), except
   float `sum` and every `avg`, compared within 1e-9 relative.
+- **Joins** are forced onto the GPU in every variant (`JoinChoice::ArrowMetal`).
 
-Run on 2026-09-29 (`cargo test`, debug build, 88 s):
+Run on 2026-10-01 (`cargo test`, debug build):
 
 | | |
 |---|---|
-| query pairs | **7,656**: 5,304 with every node forced onto the GPU, 1,176 `GROUP BY` forced back, 1,176 `GROUP BY` with the measured choice |
-| pairs with a node replaced | 5,976, including all 3,696 `ORDER BY` pairs |
-| run-time choices | forced onto the GPU: 960 on the GPU; forced back: 960 handed back; measured: none replaced (every `GROUP BY` of the grid has one key; the table takes two-key shapes only) |
+| query pairs | **13,632**: 11,040 with every node forced onto the GPU, 1,296 `GROUP BY` forced back, 1,296 `GROUP BY` with the measured choice |
+| pairs with a node replaced | 11,931 |
+| hash joins replaced | 555 |
+| run-time choices | forced onto the GPU: 1,248 on the GPU; forced back: 1,248 handed back; measured: no aggregate replaced (no `GROUP BY` of the grid has a shape the table takes; the 48 pairs with a node replaced there are joins under a `GROUP BY`) |
 | mismatches | **0** |
 | hand-backs on an ArrowMetal error | **0** |
-| hand-backs on the data (the checks above) | 128: 64 Float64 `MIN` over a group with NaN, 32 filters on a column holding -NaN, 32 group keys with several NaN patterns |
-| largest relative deviation in a float `sum`/`avg` | 2.8e-13 |
+| hand-backs on the data (the checks above) | 168: 128 float `MIN` over a group with NaN, 40 group keys with several NaN patterns |
+| largest relative deviation in a float `sum`/`avg` | 2.2e-13 |
 
-The pairs of the forced variant with nothing taken are Float32 `MIN`/`MAX` group-bys, a `CAST` in a
-predicate, and a float comparison against zero, each left by the rule with its reason.
+The pairs of the forced variant with nothing taken are a `CAST` in a predicate, a comparison with a
+NaN literal, the joins the rule leaves, and aggregates over an estimated row count (above a join),
+each left by the rule with its reason.
 `tests/rule.rs` checks both branches of the measured choice with the table looked up at 10M and at
 50M rows: `count(*)` over two int32 keys drawn from 1,000,000 values runs on the GPU, over 150 values
 it is handed back, on one batch per partition and on 8,192-row batches. A unit test in `src/exec.rs`
@@ -667,6 +751,108 @@ The sort itself is 67% to 75% of the wall time. The import writes each column's 
 straight into that column's Metal buffers (`Array::from_arrow_chunks`), with no `concat_batches` copy
 before it.
 
+### The columns of one node imported at the same time
+
+From 1,000,000 input rows `MetalExec` imports its columns on threads of their own, one per column,
+at the same time (each column's import keeps its own measured copy-thread count). Against the crate
+before the change, alternating block by block in one session on the same core library
+(`datafusion_sort_import_2026-10-01.csv`, the sort family with the rule forced on, warm, three
+rounds of best of 5), before ÷ now:
+
+| rows | full sorts, best / median of rounds | top-k, best / median of rounds | process CPU, now ÷ before |
+|---:|---|---|---|
+| 1,000,000 | 0.959x-1.236x / 0.877x-1.143x | 0.951x-1.134x / 1.000x-1.035x | 1.04x-1.24x |
+| 10,000,000 | 1.008x-1.060x / 1.004x-1.064x | 1.045x-1.128x / 0.976x-1.134x | 1.07x-1.49x |
+| 50,000,000 | 1.017x-1.046x / 1.019x-1.044x | 1.096x-1.166x / 1.103x-1.183x | 0.92x-1.07x |
+
+At 50M rows with 8,192-row batches the int64 sort's import is 9.85 → 8.07 ms (68.79 → 67.31 ms in
+all), the Float64 sort's 10.26 → 8.02 ms, the string sort's 10.10 → 7.83 ms. At 10M rows the
+process CPU time of a full sort is 18.4 to 27.1 CPU-ms, against 15.3 to 20.6 before (int64,
+8,192-row batches: 18.4 → 27.1).
+
+The aggregates the default runs on the GPU, timed the same way with `ArrowMetalConfig::default()`
+(`datafusion_groupby_default_import_2026-10-01.csv`, the default's GPU cases at 10M and 50M rows,
+both layouts, 24 rows): before ÷ now 0.942x to 1.139x on the best run and 0.976x to 1.320x on the
+median of the rounds, process CPU now ÷ before 0.85x to 1.41x. The first run after idle against
+DataFusion alone's first run after the same idle: now 1.24x to 2.19x after 500 ms and 0.81x to
+1.68x after 5 s; before, in the same session, 0.89x to 2.15x and 0.84x to 1.48x (`count(*)` over
+two int32 keys at 10M rows was below 1.0x after 5 s in both crates: now 0.81x and 0.88x on two of
+its four rows, before 0.84x to 0.94x on three). The cases the default leaves to DataFusion at those
+sizes (20 rows) were at 0.936x to 1.154x best and 0.928x to 1.177x median of the crate before; the
+two below 0.95x on both, timed again alone (`datafusion_groupby_default_import_retime_2026-10-01.csv`,
+four blocks of each crate alternating, 104 runs of each context per block alternating run by run),
+are at 0.987x best and 0.988x median (`min`/`max` over int64, two int32 keys, 100,000 groups, 10M
+rows, 8,192-row batches: 18.88 → 19.13 ms) and 1.000x and 1.000x (`SELECT DISTINCT region, sub`,
+50M rows, one batch per partition: 30.08 → 30.09 ms); both run DataFusion's plan in both crates.
+
+### Float `MIN` and `MAX`
+
+`SELECT k, min(x), max(x) FROM grid GROUP BY k` (and over two keys `k1, k2`) with every replaced
+aggregate forced onto the GPU (`AggregateChoice::ArrowMetal`), `x` Float64 in [0, 1), against the
+crate before the change (which ran each extreme with four per-group helper counts), alternating
+block by block in one session (`datafusion_minmax_2026-10-01.csv`, warm, three rounds of best of 5,
+8,192-row batches):
+
+| keys | groups | 10M: DataFusion / before / now, ms | 10M: before ÷ now | 10M: DataFusion ÷ now | 50M: DataFusion / before / now, ms | 50M: before ÷ now | 50M: DataFusion ÷ now |
+|---|---|---|---:|---:|---|---:|---:|
+| one int32 | 200 | 4.20 / 13.90 / 5.63 | 2.47x | 0.75x | 18.13 / 45.12 / 17.95 | 2.51x | 1.01x |
+| one int32 | 10,000 | 5.81 / 15.27 / 5.42 | 2.82x | 1.07x | 20.36 / 64.11 / 20.19 | 3.18x | 1.01x |
+| one int32 | 100,000 | 16.02 / 16.28 / 7.34 | 2.22x | 2.18x | 45.00 / 66.98 / 22.06 | 3.04x | 2.04x |
+| one int32 | 1,000,000 | 19.41 / 27.46 / 12.05 | 2.28x | 1.61x | 75.50 / 96.31 / 28.46 | 3.38x | 2.65x |
+| one int32 | rows / 2 | 32.48 / 70.34 / 34.92 | 2.01x | 0.93x | 198.40 / 652.08 / 282.13 | 2.31x | 0.70x |
+| two int32 | 200 | 8.60 / 14.87 / 6.50 | 2.29x | 1.32x | 32.86 / 49.40 / 21.03 | 2.35x | 1.56x |
+| two int32 | 10,000 | 10.41 / 16.10 / 6.58 | 2.45x | 1.58x | 37.64 / 68.53 / 22.76 | 3.01x | 1.65x |
+| two int32 | 100,000 | 19.91 / 17.67 / 7.62 | 2.32x | 2.61x | 70.77 / 70.34 / 23.98 | 2.93x | 2.95x |
+| two int32 | 1,000,000 | 23.99 / 29.01 / 13.13 | 2.21x | 1.83x | 96.12 / 101.26 / 30.72 | 3.30x | 3.13x |
+| two int32 | rows / 2 | 36.56 / 71.68 / 35.61 | 2.01x | 1.03x | 211.36 / 682.60 / 300.96 | 2.27x | 0.70x |
+
+Over both layouts: now 1.95x to 3.53x faster than before on the best run and 1.90x to 3.54x on the
+median of the rounds, and 0.70x to 3.26x of DataFusion alone (behind it at about rows / 2 groups
+at 50M rows and over one key at 10M, and at 200 groups over one key at 10M rows). Over a Float32 column, which the crate before left to
+DataFusion, 0.44x to 2.49x of DataFusion alone. The measured table takes no float `MIN`/`MAX`
+shape.
+
+### Joins, rule on and off
+
+DataFusion alone against the default configuration with every translatable join replaced
+(`JoinChoice::ArrowMetal`; an aggregate above the join stays DataFusion's, as under the default),
+`datafusion_join_2026-10-01.csv`: probe tables of 10M and 50M rows, build tables of 10,000,
+1,000,000 and 10,000,000 rows holding every other key of the probe's key domain (half the probe rows
+match), keys as int64, int32 and Utf8 (decimal text of the same values), both layouts, warm (three
+rounds of best of 5), then three runs of each context after 500 ms and three after 5 s of idle
+(the median), the contexts and the gaps alternating. *Warm* is DataFusion alone ÷ with the rule,
+over the two layouts, for the count-and-sum query and for the `GROUP BY` query; *idle vs idle* is
+DataFusion alone's first run after the idle ÷ the rule's first run after the same idle, over the
+two queries and layouts. Every answer was equal to DataFusion's.
+
+| key | SQL join | build rows | 10M probe: warm, count + sum / group by | 10M: idle vs idle 500 ms / 5 s | 50M probe: warm, count + sum / group by | 50M: idle vs idle 500 ms / 5 s |
+|---|---|---:|---|---|---|---|
+| int32 | INNER | 10,000 | 1.53-2.19x / 1.25-1.30x | 0.71-1.26x / 0.47-0.78x | 1.24-2.29x / 1.11-1.54x | 0.70-1.45x / 0.71-1.04x |
+| int32 | INNER | 1,000,000 | 1.89-1.92x / 1.40-1.42x | 0.91-1.40x / 0.77-0.93x | 1.91-1.99x / 1.58-1.60x | 0.99-1.05x / 0.87-1.08x |
+| int32 | INNER | 10,000,000 | 2.07-2.17x / 1.44-1.46x | 1.02-1.49x / 0.80-1.23x | 1.53-1.57x / 1.30-1.32x | 1.08-1.35x / 1.01-1.12x |
+| int32 | LEFT | 10,000 | 1.85-1.98x / 1.33-1.36x | 0.78-1.11x / 0.81-1.04x | 1.58-2.14x / 1.19-1.64x | 1.04-1.48x / 0.85-1.09x |
+| int32 | LEFT | 1,000,000 | 1.77-1.85x / 1.22-1.26x | 0.73-1.13x / 0.63-0.80x | 1.88-1.89x / 1.37-1.37x | 0.94-1.36x / 0.98-0.99x |
+| int32 | LEFT | 10,000,000 | 1.98-2.05x / 1.33-1.34x | 0.93-1.41x / 0.88-1.38x | 1.51-1.55x / 1.15-1.18x | 0.99-1.21x / 1.00-1.04x |
+| int64 | INNER | 10,000 | 1.45-2.15x / 1.25-1.41x | 0.54-1.21x / 0.59-0.74x | 1.16-2.17x / 1.03-1.50x | 0.86-1.43x / 0.58-0.83x |
+| int64 | INNER | 1,000,000 | 1.74-1.87x / 1.35-1.40x | 0.81-1.05x / 0.69-0.81x | 1.73-1.79x / 1.49-1.53x | 0.93-1.14x / 0.95-1.09x |
+| int64 | INNER | 10,000,000 | 2.09-2.14x / 1.46-1.48x | 0.88-1.28x / 0.81-1.12x | 1.51-1.53x / 1.28-1.30x | 0.97-1.27x / 0.95-1.06x |
+| int64 | LEFT | 10,000 | 1.36-1.82x / 1.16-1.32x | 0.93-1.08x / 0.70-1.06x | 1.53-2.04x / 1.16-1.19x | 0.69-1.52x / 0.63-0.93x |
+| int64 | LEFT | 1,000,000 | 1.64-1.67x / 1.22-1.25x | 0.93-1.47x / 0.67-0.87x | 1.68-1.69x / 1.26-1.32x | 0.99-1.15x / 0.78-0.98x |
+| int64 | LEFT | 10,000,000 | 2.04-2.05x / 1.26-1.27x | 0.85-1.25x / 0.86-1.07x | 1.49-1.51x / 1.13-1.14x | 0.94-1.03x / 0.93-0.99x |
+| Utf8 | INNER | 10,000 | 0.95-1.16x / 1.02-1.15x | 0.39-0.90x / 0.47-0.67x | 0.90-1.60x / 0.93-1.14x | 0.60-0.98x / 0.56-0.78x |
+| Utf8 | INNER | 1,000,000 | 0.93-0.94x / 0.92-0.93x | 0.62-0.77x / 0.49-0.64x | 1.01-1.01x / 0.98-1.01x | 0.64-0.80x / 0.59-0.71x |
+| Utf8 | INNER | 10,000,000 | 0.79-0.79x / 0.79-0.79x | 0.56-0.71x / 0.54-0.60x | 0.81-0.83x / 0.89-0.89x | 0.64-0.74x / 0.60-0.73x |
+| Utf8 | LEFT | 10,000 | 0.28-0.33x / 0.38-0.47x | 0.32-0.45x / 0.29-0.45x | 0.22-0.36x / 0.38-0.42x | 0.22-0.38x / 0.24-0.37x |
+| Utf8 | LEFT | 1,000,000 | 0.35-0.36x / 0.50-0.51x | 0.37-0.45x / 0.26-0.43x | 0.33-0.33x / 0.50-0.50x | 0.31-0.46x / 0.30-0.45x |
+| Utf8 | LEFT | 10,000,000 | 0.51-0.52x / 0.60-0.62x | 0.38-0.55x / 0.39-0.50x | 0.41-0.42x / 0.60-0.61x | 0.36-0.56x / 0.36-0.55x |
+
+On integer keys the joins with a count and a sum above them are 1.16x to 2.29x faster warm; the
+`GROUP BY` of the probe key above the join, which DataFusion runs over the join's partitions (for a
+hash-partitioned join, after the same hash re-partitioning), is 1.03x to 1.64x. In every integer
+cell the rule's first run after idle is below DataFusion alone's first run after the same idle for
+some case at some probe size and gap (lowest 0.47x). Utf8 keys go through ArrowMetal's key densification
+before the hash join and are 0.22x to 1.60x warm.
+
 ---
 
 ## To improve
@@ -701,7 +887,9 @@ queries, from `datafusion_groupby_sweep_2026-09-30.csv` (the Float64 `sum`/`avg`
 rows measured on 2026-09-30). Of these cells the default takes the two-int32-key cases of `count(*)`
 at 100,000 and 1,000,000 groups from 10M rows, of `DISTINCT` at 200, 100,000 and 1,000,000 groups at
 50M, and of `min`/`max` over int64 at 100,000 and 1,000,000 groups at 50M over two int32 keys and
-over two int64 keys, and at 1,000,000 groups over one int64 key.
+over two int64 keys, and at 1,000,000 groups over one int64 key. The `min`, `max` over Float64 rows
+are the path with four per-group helper counts per extreme; the current path's numbers are under
+[Float `MIN` and `MAX`](#float-min-and-max).
 
 | aggregate | groups | 1M | 2M | 5M | 10M | 50M |
 |---|---|---|---|---|---|---|
@@ -810,6 +998,39 @@ With `ArrowMetalConfig::all()`, from `datafusion_rule_2026-09-29.csv`:
 
 DataFusion's `FilterExec` streams batch by batch; `MetalExec` collects the whole input first.
 
+Float comparisons against a literal, now one fused expression each (see
+[DataFusion's semantics](#datafusions-semantics)), with the rule switched on for every node it
+translates, from `datafusion_filter_2026-10-01.csv` (warm: three rounds of best of 5; after idle: the
+median of three runs after 500 ms and three after 5 s, the contexts and the gaps alternating;
+`f_gt`: `SELECT region, amount FROM fact WHERE amount > 1000.0`, `f_lt0`: `… WHERE amount < 0.0`,
+`f_ne0`: `SELECT region, qty FROM fact WHERE amount <> 0.0`, `f_sum_ge0`:
+`SELECT sum(qty), count(*) FROM fact WHERE amount >= 0.0`):
+
+| case | rows | layout | DataFusion alone, ms | with the rule, ms | warm | after 500 ms idle, DataFusion / rule, ms | idle vs idle 500 ms | after 5 s idle, DataFusion / rule, ms | idle vs idle 5 s | CPU-ms DataFusion / rule |
+|---|---:|---|---:|---:|---:|---|---:|---|---:|---|
+| `a_sumcnt` | 10M | 8,192-row batches | 3.58 | 4.87 | 0.74x | 11.95 / 8.57 | 1.39x | 11.69 / 21.59 | 0.54x | 36 / 25 |
+| `a_sumcnt` | 10M | one per partition | 3.26 | 4.54 | 0.72x | 14.56 / 14.01 | 1.04x | 5.76 / 14.76 | 0.39x | 34 / 24 |
+| `a_sumcnt` | 50M | 8,192-row batches | 15.54 | 19.79 | 0.79x | 30.50 / 50.91 | 0.60x | 28.82 / 67.35 | 0.43x | 174 / 127 |
+| `a_sumcnt` | 50M | one per partition | 13.22 | 18.72 | 0.71x | 29.05 / 30.67 | 0.95x | 30.92 / 55.68 | 0.56x | 170 / 118 |
+| `f_gt` | 10M | 8,192-row batches | 1.55 | 3.67 | 0.42x | 9.49 / 13.94 | 0.68x | 7.67 / 22.81 | 0.34x | 17 / 15 |
+| `f_gt` | 10M | one per partition | 1.40 | 3.42 | 0.41x | 9.30 / 5.15 | 1.81x | 6.82 / 23.66 | 0.29x | 16 / 14 |
+| `f_gt` | 50M | 8,192-row batches | 6.42 | 16.77 | 0.38x | 19.64 / 35.28 | 0.56x | 19.35 / 52.42 | 0.37x | 83 / 82 |
+| `f_gt` | 50M | one per partition | 5.68 | 15.62 | 0.36x | 18.54 / 28.14 | 0.66x | 19.93 / 44.42 | 0.45x | 77 / 71 |
+| `f_lt0` | 10M | 8,192-row batches | 1.53 | 3.85 | 0.40x | 6.65 / 10.08 | 0.66x | 9.42 / 20.87 | 0.45x | 17 / 14 |
+| `f_lt0` | 10M | one per partition | 1.36 | 3.56 | 0.38x | 7.10 / 15.26 | 0.47x | 10.27 / 23.67 | 0.43x | 16 / 14 |
+| `f_lt0` | 50M | 8,192-row batches | 6.48 | 16.98 | 0.38x | 12.50 / 29.96 | 0.42x | 14.67 / 44.23 | 0.33x | 83 / 76 |
+| `f_lt0` | 50M | one per partition | 5.91 | 15.15 | 0.39x | 15.77 / 27.32 | 0.58x | 18.03 / 44.47 | 0.41x | 79 / 65 |
+| `f_ne0` | 10M | 8,192-row batches | 2.08 | 6.67 | 0.31x | 8.43 / 23.38 | 0.36x | 9.39 / 33.91 | 0.28x | 13 / 23 |
+| `f_ne0` | 10M | one per partition | 2.13 | 6.42 | 0.33x | 6.45 / 20.24 | 0.32x | 6.29 / 23.49 | 0.27x | 14 / 22 |
+| `f_ne0` | 50M | 8,192-row batches | 11.52 | 31.79 | 0.36x | 26.64 / 77.21 | 0.35x | 26.60 / 78.99 | 0.34x | 73 / 125 |
+| `f_ne0` | 50M | one per partition | 11.67 | 30.78 | 0.38x | 16.70 / 50.11 | 0.33x | 25.64 / 76.37 | 0.34x | 77 / 114 |
+| `f_sum_ge0` | 10M | 8,192-row batches | 3.67 | 6.39 | 0.57x | 12.91 / 16.57 | 0.78x | 13.65 / 26.38 | 0.52x | 47 / 26 |
+| `f_sum_ge0` | 10M | one per partition | 3.57 | 5.91 | 0.60x | 11.36 / 9.43 | 1.20x | 11.64 / 26.56 | 0.44x | 47 / 24 |
+| `f_sum_ge0` | 50M | 8,192-row batches | 16.65 | 28.29 | 0.59x | 33.31 / 48.20 | 0.69x | 33.16 / 72.00 | 0.46x | 232 / 136 |
+| `f_sum_ge0` | 50M | one per partition | 15.89 | 27.17 | 0.58x | 30.47 / 44.37 | 0.69x | 30.94 / 61.33 | 0.50x | 230 / 124 |
+
+Every case is behind DataFusion alone warm (0.31x to 0.79x), so `filter` stays off by default.
+
 ### The first query of a process
 
 The first GPU query in a process also compiles the Metal pipelines. In the table above, the int64
@@ -820,9 +1041,9 @@ warm time for the same query (8.08 to 31.75 ms).
 
 ## Limits
 
-- **It collects its input.** `MetalExec` reads every input partition to the end before it sorts or
-  runs an aggregate on the GPU (an aggregate it hands back reads only the first batches of each
-  partition before DataFusion takes over). It has no spill path of its own. The collected batches
+- **It collects its input.** `MetalExec` reads every input partition to the end before it sorts,
+  joins or runs an aggregate on the GPU (an aggregate it hands back reads only the first batches of
+  each partition before DataFusion takes over); a join reads both of its inputs to the end. It has no spill path of its own. The collected batches
   and the result are counted in DataFusion's memory pool (a `MemoryConsumer` named `MetalExec`, at
   the bytes each batch's slices reference); when the pool refuses, `MetalExec` hands the node back to
   DataFusion, whose operators can spill. The Metal buffers themselves (the imported columns) are not
@@ -831,17 +1052,22 @@ warm time for the same query (8.08 to 31.75 ms).
   query is dropped, it runs to its end and its result is discarded.
 - **One GPU job at a time per process.** A process-wide lock serialises every `MetalExec`, so two
   queries that both reach the GPU run their GPU parts one after the other.
-- **One blocking thread per node.** ArrowMetal handles are not `Send`, so all GPU work of one
-  `MetalExec` runs inside one `tokio::task::spawn_blocking` call, off DataFusion's async worker
-  threads.
+- **One blocking thread per node.** All GPU work of one `MetalExec` runs inside one
+  `tokio::task::spawn_blocking` call, off DataFusion's async worker threads. From 1,000,000 input
+  rows its columns are imported on threads of their own, one per column, at the same time; each
+  imported column is then used only by that blocking thread.
 - **Exact row counts.** By default a node is taken only when DataFusion's statistics give its input
-  an exact row count. A sort above a filter, a join or an aggregate has an estimate and is left
-  unless `accept_inexact` is set; an unknown count is left unless `take_when_unknown` is set.
-- **Aggregates.** The measured table takes two shapes: `count` over two int32 (or narrower) keys of
-  a `MemTable` scan with at least 10,000,000 rows, and `DISTINCT` over the same keys with at least
-  50,000,000 rows. Every other aggregate is left,
-  including every aggregate over a Parquet scan, a filter or a join, and every one with a float or
-  string key.
+  an exact row count (a join: both inputs). A sort above a filter, a join or an aggregate has an
+  estimate and is left unless `accept_inexact` is set; an unknown count is left unless
+  `take_when_unknown` is set.
+- **Aggregates.** The measured table takes three shapes: `count` over two int32 (or narrower) keys
+  of a `MemTable` scan with at least 10,000,000 rows, and `DISTINCT` over the same keys and
+  `MIN`/`MAX` of an integer column over one int64 key or two integer keys with at least 50,000,000
+  rows. Every other aggregate is left, including every aggregate over a Parquet scan, a filter or a
+  join, and every one with a float or string key.
+- **Joins.** The measured join table takes no join; `JoinChoice::ArrowMetal` replaces every
+  translatable one. A join reads both inputs to the end before it runs, where DataFusion's hash join
+  streams its probe side.
 - **Pipeline compilation.** The first GPU query of a process compiles its Metal pipelines: 42 to
   66 ms at 10M rows (`datafusion_coldstart_2026-09-29.csv`).
 - **macOS on Apple silicon only.** `build.rs` stops the build for any other target with a message
@@ -856,19 +1082,18 @@ warm time for the same query (8.08 to 31.75 ms).
 
 ```bash
 cd datafusion
-ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib cargo test                       # 30 tests + 1 doc-test
+ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib cargo test                       # 37 tests + 1 doc-test
 ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib cargo test --test rule -- --ignored   # default config at 2M rows
 ```
 
 | File | What it checks |
 |---|---|
 | `tests/grid.rs` | the differential grid above (1 test) |
-| `tests/rule.rs` | 14 tests: the threshold and its reason, inexact statistics, the config switches, what the default leaves, unsupported shapes, `EXPLAIN`, `ORDER BY` through a projection, replaced aggregates under a partitioned join, `count(DISTINCT)`, the forced hand-back, the measured choice's two branches, a refused memory reservation; plus 1 ignored test of the default configuration at 2,000,000 rows |
+| `tests/rule.rs` | 20 tests: the threshold and its reason, inexact statistics, the config switches, what the default leaves, unsupported shapes, `EXPLAIN` (an aggregate and a join), `ORDER BY` through a projection, replaced aggregates under a partitioned join, `count(DISTINCT)`, the forced hand-back, the measured choice's two branches, a refused memory reservation (a sort and a group-by; a join); joins replaced and matching with one and four partitions (collected and hash-partitioned plans, an aggregate above, an empty projection), an ordered inner join keeping the probe order, the joins the rule leaves with their reasons, the default config's join table; plus 1 ignored test of the default configuration at 2,000,000 rows |
 | `src/probe.rs`, `src/exec.rs` (unit tests) | 7 tests: the group-count estimate (exact small inputs, 200 to 1,000,000 groups, sorted keys, key tuples, the same estimate for the same input, a prefix of the input) and the whole-input check of a prefix that under-counts |
-| `tests/arrowmetal_repros.rs` | 8 tests of ArrowMetal's plan runner alone, no DataFusion: totalOrder against arrow-rs, NaN and zero group keys, `count` on every path, the chunked import |
+| `tests/arrowmetal_repros.rs` | 9 tests of ArrowMetal's plan runner alone, no DataFusion: totalOrder against arrow-rs, NaN and zero group keys, `count` on every path, the chunked import, `signbit` and `is_nan` placing NaNs in a comparison |
 
-On 2026-09-29: 30 passed, 2 ignored, doc-test passed; the ignored rule test passed when run with
-`--ignored`.
+On 2026-10-01: 37 passed, 2 ignored, doc-test passed.
 
 | Path | What it is |
 |---|---|
@@ -878,6 +1103,8 @@ On 2026-09-29: 30 passed, 2 ignored, doc-test passed; the ignored rule test pass
 | `datafusion/src/choice.rs` | an aggregate's shape and the table lookup |
 | `datafusion/src/agg_table.rs` | the measured table (generated) |
 | `datafusion/scripts/groupby_table.py` | generates the table from the sweep and the default-check CSVs (`--check`, `--print`) |
+| `datafusion/src/join_table.rs` | the measured join table (generated) |
+| `datafusion/scripts/join_table.py` | generates the join table from the join CSV (`--check`, `--print`) |
 | `datafusion/src/translate.rs` | the checks on node shapes and types; predicates to ArrowMetal expressions |
 | `datafusion/src/gpu.rs` | the plans sent to ArrowMetal, the import, and the run-time checks |
 | `datafusion/examples/quickstart.rs` | the example above |
@@ -892,6 +1119,11 @@ On 2026-09-29: 30 passed, 2 ignored, doc-test passed; the ignored rule test pass
 | `datafusion/results/datafusion_coldstart_2026-09-29.csv` | pipeline compilation per process |
 | `datafusion/results/datafusion_plancost_2026-09-29.csv` | the rule's planning cost |
 | `datafusion/results/datafusion_parquet_string_sort_2026-09-29.csv` | Parquet sorts with a string column |
+| `datafusion/results/datafusion_join_2026-10-01.csv` | joins, rule off and on, warm and after 500 ms and 5 s of idle: the join table's source |
+| `datafusion/results/datafusion_minmax_2026-10-01.csv` | float `MIN`/`MAX`, rule forced on, the crate before and now (column `crate`) |
+| `datafusion/results/datafusion_sort_import_2026-10-01.csv` | the sort family, the crate before and now: the columns imported at the same time |
+| `datafusion/results/datafusion_groupby_default_import_2026-10-01.csv`, `…_retime_…` | the default's aggregates, the crate before and now; two rows timed again alone |
+| `datafusion/results/datafusion_filter_2026-10-01.csv` | float comparisons in a filter, rule off and on |
 
 The first two CSVs also hold rows with `crate = before`: an earlier state of this crate, measured in the same
 sessions. The tables on this page use the rows with `crate = now`.

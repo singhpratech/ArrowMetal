@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Schema};
-use datafusion::common::ScalarValue;
+use datafusion::common::{JoinType, NullEquality, ScalarValue};
 use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::expressions::{
     BinaryExpr, CastExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr, Literal, NotExpr,
@@ -14,8 +14,10 @@ use datafusion::physical_expr::expressions::{
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::expressions::PhysicalSortExpr;
+use datafusion::physical_plan::joins::HashJoinExec;
+use datafusion::physical_plan::ExecutionPlan;
 
-use crate::exec::{AggKind, AggSpec, MetalOp, SortKey};
+use crate::exec::{AggKind, AggSpec, JoinHow, MetalOp, SortKey};
 
 pub(crate) type Why = String;
 
@@ -168,8 +170,9 @@ pub(crate) fn aggregate_op(agg: &AggregateExec) -> Result<MetalOp, Why> {
         }
         let ok = match kind {
             AggKind::Sum | AggKind::Mean => is_int(t) || is_float(t),
-            // The NaN / signed-zero fix-up in gpu.rs is written for Float64 only.
-            AggKind::Min | AggKind::Max => is_int(t) || *t == DataType::Float64,
+            // Float32 and Float64 get DataFusion's NaN, signed-zero and infinity semantics in
+            // gpu.rs (`aggregate`).
+            AggKind::Min | AggKind::Max => is_int(t) || is_float(t),
             AggKind::Count => carried(t),
             AggKind::CountAll => true,
         };
@@ -211,7 +214,6 @@ pub(crate) fn same_aggregates(final_: &AggregateExec, partial: &AggregateExec) -
 pub(crate) fn predicate_sexpr(
     e: &Arc<dyn PhysicalExpr>,
     schema: &Schema,
-    floats: &mut Vec<usize>,
 ) -> Result<String, Why> {
     let any = e.as_ref();
     if let Some(c) = any.downcast_ref::<Column>() {
@@ -228,7 +230,7 @@ pub(crate) fn predicate_sexpr(
         return Ok(format!("(is_valid {})", value_sexpr(n.arg(), schema)?.0));
     }
     if let Some(n) = any.downcast_ref::<NotExpr>() {
-        return Ok(format!("(not {})", predicate_sexpr(n.arg(), schema, floats)?));
+        return Ok(format!("(not {})", predicate_sexpr(n.arg(), schema)?));
     }
     if let Some(l) = any.downcast_ref::<Literal>() {
         return match l.value() {
@@ -244,8 +246,8 @@ pub(crate) fn predicate_sexpr(
         match op {
             // SQL AND / OR are three-valued; the Kleene forms are the ones that match.
             Operator::And | Operator::Or => {
-                let l = predicate_sexpr(b.left(), schema, floats)?;
-                let r = predicate_sexpr(b.right(), schema, floats)?;
+                let l = predicate_sexpr(b.left(), schema)?;
+                let r = predicate_sexpr(b.right(), schema)?;
                 let f = if *op == Operator::And { "and_kleene" } else { "or_kleene" };
                 return Ok(format!("({f} {l} {r})"));
             }
@@ -254,7 +256,7 @@ pub(crate) fn predicate_sexpr(
             | Operator::Lt
             | Operator::LtEq
             | Operator::Gt
-            | Operator::GtEq => return comparison_sexpr(b, schema, floats),
+            | Operator::GtEq => return comparison_sexpr(b, schema),
             other => return Err(format!("operator {other} in a predicate")),
         }
     }
@@ -293,6 +295,8 @@ fn literal_sexpr(v: &ScalarValue) -> Result<(String, DataType), Why> {
         ScalarValue::UInt64(Some(x)) => format!("(u64 {x})"),
         ScalarValue::Float64(Some(x)) if x.is_finite() => format!("(f64 {x:e})"),
         ScalarValue::Float32(Some(x)) if x.is_finite() => format!("(f32 {x:e})"),
+        ScalarValue::Float64(Some(x)) if x.is_infinite() => format!("(f64 {})", if *x > 0.0 { "inf" } else { "-inf" }),
+        ScalarValue::Float32(Some(x)) if x.is_infinite() => format!("(f32 {})", if *x > 0.0 { "inf" } else { "-inf" }),
         ScalarValue::Utf8(Some(x)) => format!("(str \"{}\")", escape(x)),
         ScalarValue::Boolean(Some(b)) => format!("(bool {b})"),
         other => return Err(format!("literal {other}")),
@@ -305,7 +309,7 @@ pub(crate) fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\t', "\\t")
 }
 
-fn comparison_sexpr(b: &BinaryExpr, schema: &Schema, floats: &mut Vec<usize>) -> Result<String, Why> {
+fn comparison_sexpr(b: &BinaryExpr, schema: &Schema) -> Result<String, Why> {
     let (l, lt) = value_sexpr(b.left(), schema)?;
     let (r, rt) = value_sexpr(b.right(), schema)?;
     if lt != rt {
@@ -343,33 +347,18 @@ fn comparison_sexpr(b: &BinaryExpr, schema: &Schema, floats: &mut Vec<usize>) ->
         return Err("boolean comparison".into());
     }
     if is_float(&lt) {
-        // arrow-rs compares floats by IEEE 754 totalOrder (+NaN above +inf, -NaN below -inf, -0.0
-        // below +0.0); the fused kernels use IEEE comparisons (NaN compares false, -0.0 == +0.0).
-        // They agree for a column against a finite non-zero literal except that a (positive) NaN
-        // is greater than the literal, so gt/ge take `or (x != x)`. A NaN with the sign bit set
-        // is checked for at run time (`float_compared`: the node goes back to DataFusion). A
-        // column against a column, or against zero, is left.
         let lit_right = b.right().downcast_ref::<Literal>();
         let lit_left = b.left().downcast_ref::<Literal>();
-        let (col, lit, flipped, col_expr) = match (lit_left, lit_right) {
-            (None, Some(v)) => (l, v, false, b.left()),
-            (Some(v), None) => (r, v, true, b.right()),
+        let (col, lit, flipped) = match (lit_left, lit_right) {
+            (None, Some(v)) => (l, v, false),
+            (Some(v), None) => (r, v, true),
             _ => return Err("float comparison not between a column and a literal".into()),
         };
-        if let Some(c) = column_of(col_expr) {
-            if !floats.contains(&c.index()) {
-                floats.push(c.index());
-            }
-        }
         let v = match lit.value() {
             ScalarValue::Float64(Some(x)) => *x,
             ScalarValue::Float32(Some(x)) => *x as f64,
             _ => return Err("float literal is null".into()),
         };
-        if v == 0.0 || !v.is_finite() {
-            return Err("float comparison against zero or a non-finite literal (totalOrder differs)".into());
-        }
-        let lit_text = literal_sexpr(lit.value())?.0;
         // Normalise to `col OP lit`.
         let op = match (b.op(), flipped) {
             (o, false) => *o,
@@ -379,18 +368,110 @@ fn comparison_sexpr(b: &BinaryExpr, schema: &Schema, floats: &mut Vec<usize>) ->
             (Operator::GtEq, true) => Operator::LtEq,
             (o, true) => *o,
         };
-        let base = |n: &str| format!("({n} {col} {lit_text})");
-        return Ok(match op {
-            Operator::Eq => base("eq"),
-            Operator::NotEq => base("ne"),
-            Operator::Lt => base("lt"),
-            Operator::LtEq => base("le"),
-            Operator::Gt => format!("(or {} (ne {col} {col}))", base("gt")),
-            Operator::GtEq => format!("(or {} (ne {col} {col}))", base("ge")),
-            _ => unreachable!(),
-        });
+        return total_order_comparison(op, &col, lit.value(), v);
     }
     Ok(format!("({name} {l} {r})"))
+}
+
+/// `col OP c` for a float column and a non-NaN literal `c` as DataFusion 55.1 compares: IEEE 754
+/// totalOrder (-NaN < -inf < ... < +inf < +NaN) with -0.0 and +0.0 equal. One fused expression: the
+/// plan runner's comparisons are IEEE (a NaN compares false, -0.0 == +0.0), and `signbit` /
+/// `is_nan` (docs/EXPR.md, "totalOrder comparisons") place the NaNs. Null where the column is null,
+/// so a filter drops those rows as DataFusion does.
+fn total_order_comparison(op: Operator, col: &str, lit: &ScalarValue, v: f64) -> Result<String, Why> {
+    if v.is_nan() {
+        return Err("float comparison against a NaN literal (totalOrder tells NaN payloads apart)".into());
+    }
+    let c = match lit {
+        ScalarValue::Float64(Some(x)) if x.is_infinite() => format!("(f64 {})", if *x > 0.0 { "inf" } else { "-inf" }),
+        ScalarValue::Float32(Some(x)) if x.is_infinite() => format!("(f32 {})", if *x > 0.0 { "inf" } else { "-inf" }),
+        // `{:e}` keeps the sign of a zero ("-0e0").
+        ScalarValue::Float64(Some(x)) => format!("(f64 {x:e})"),
+        ScalarValue::Float32(Some(x)) => format!("(f32 {x:e})"),
+        other => return Err(format!("literal {other}")),
+    };
+    // DataFusion 55.1 compares with arrow-rs's totalOrder kernels after rewriting -0.0 to +0.0 on
+    // both sides (`normalize_float_zero` in datum.rs: SQL's `-0.0 = +0.0`). So a zero literal
+    // compares like any other non-NaN literal: the IEEE comparison already treats the zeros as
+    // equal, and only the NaNs need placing (a NaN with the sign bit set below every value, one
+    // without above). This is docs/EXPR.md's "finite non-zero, ±inf" row for every non-NaN `c`.
+    let s = format!("(signbit {col})");
+    let n = format!("(is_nan {col})");
+    let cmp = |name: &str| format!("({name} {col} {c})");
+    Ok(match op {
+        Operator::Eq => cmp("eq"),
+        Operator::NotEq => format!("(not {})", cmp("eq")),
+        Operator::Lt => format!("(or {} (and {n} {s}))", cmp("lt")),
+        Operator::LtEq => format!("(or {} (and {n} {s}))", cmp("le")),
+        Operator::Gt => format!("(or {} (and {n} (not {s})))", cmp("gt")),
+        Operator::GtEq => format!("(or {} (and {n} (not {s})))", cmp("ge")),
+        o => return Err(format!("float comparison {o}")),
+    })
+}
+
+// -------------------------------------------------------------------------------------------------
+// Join
+// -------------------------------------------------------------------------------------------------
+
+/// Key types a join is taken on: the ones the differential grid joins on.
+fn join_key(t: &DataType) -> bool {
+    matches!(t, DataType::Int32 | DataType::Int64 | DataType::Utf8)
+}
+
+/// A `HashJoinExec` the plan runner's join gives DataFusion's answer for: inner, left or right,
+/// equal keys only (no join filter), `NullEqualsNothing` (SQL's `=`), column keys of the same type
+/// on both sides, and carried columns of the whitelisted types.
+pub(crate) fn join_op(j: &HashJoinExec) -> Result<MetalOp, Why> {
+    let how = match j.join_type() {
+        JoinType::Inner => JoinHow::Inner,
+        JoinType::Left => JoinHow::Left,
+        JoinType::Right => JoinHow::Right,
+        t => return Err(format!("{t} join")),
+    };
+    if j.filter().is_some() {
+        return Err("join filter (a condition besides the equal keys)".into());
+    }
+    if j.null_equality() != NullEquality::NullEqualsNothing {
+        return Err("nulls compare equal in the keys (IS NOT DISTINCT FROM)".into());
+    }
+    if j.null_aware {
+        return Err("null-aware anti join".into());
+    }
+    if ExecutionPlan::fetch(j).is_some() {
+        return Err("join with a fetch limit".into());
+    }
+    let (ls, rs) = (j.left().schema(), j.right().schema());
+    let mut left_keys = Vec::new();
+    let mut right_keys = Vec::new();
+    for (l, r) in j.on() {
+        let (Some(lc), Some(rc)) = (column_of(l), column_of(r)) else {
+            return Err(format!("join key {l} = {r} is an expression, not a column"));
+        };
+        let (lt, rt) = (ls.field(lc.index()).data_type(), rs.field(rc.index()).data_type());
+        if lt != rt {
+            return Err(format!("join key types differ: {lt} and {rt}"));
+        }
+        if !join_key(lt) {
+            return Err(format!("join key {} has type {lt}", lc.name()));
+        }
+        left_keys.push(lc.index());
+        right_keys.push(rc.index());
+    }
+    if left_keys.is_empty() {
+        return Err("join without equal keys".into());
+    }
+    let nl = ls.fields().len();
+    let projection: Vec<usize> = match &j.projection {
+        Some(p) => p.iter().copied().collect(),
+        None => (0..nl + rs.fields().len()).collect(),
+    };
+    for &p in &projection {
+        let f = if p < nl { ls.field(p) } else { rs.field(p - nl) };
+        if !carried(f.data_type()) {
+            return Err(format!("column {} has type {} (not in the carried-type whitelist)", f.name(), f.data_type()));
+        }
+    }
+    Ok(MetalOp::Join { how, left_keys, right_keys, projection, left_columns: nl })
 }
 
 pub(crate) fn filter_op(
@@ -399,7 +480,7 @@ pub(crate) fn filter_op(
     projection: Option<Vec<usize>>,
 ) -> Result<MetalOp, Why> {
     check_schema(input_schema)?;
-    let mut float_compared = Vec::new();
-    let sexpr = predicate_sexpr(predicate, input_schema, &mut float_compared)?;
-    Ok(MetalOp::Filter { predicate: sexpr, projection, float_compared })
+
+    let sexpr = predicate_sexpr(predicate, input_schema)?;
+    Ok(MetalOp::Filter { predicate: sexpr, projection })
 }

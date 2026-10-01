@@ -41,7 +41,9 @@
 //!   `--max-load` and no cargo / rustc / swift-build / swift-frontend / swiftc / pytest runs,
 //!   checking every 20 s. The load at the start and end of each block goes in every row.
 //!   With `--lock-dir <dir>`, also wait while a `<dir>/BUILDING*` file exists (another process
-//!   compiles or runs tests) and hold `<dir>/TIMING` for the block. Each row records the block's start and end
+//!   compiles or runs tests) or `<dir>/TIMING` exists (anyone else's timing), and hold
+//!   `<dir>/TIMING` for the block, tagged `<BENCH_LANE> <pid>`; only that tag is ever removed.
+//!   Each row records the block's start and end
 //!   time and the last `Sleep` entry of `pmset -g log` at its end, so a block that spans a sleep
 //!   can be found and rerun.
 //! * Contexts (`--contexts`, default `off,on`): `off` DataFusion alone (always timed, the
@@ -51,6 +53,10 @@
 //!   hand-back itself); `def` the default config, timed (the group-count probe and the measured
 //!   table decide). Each context's first run is compared with `off`'s and its time is recorded as
 //!   `<ctx>_first_ms` (the GPU idle before it: the previous context ran on the CPU).
+//! * `--idle-ctx <ctx>`: the context timed after each idle gap next to `off` (default `def`; its
+//!   times go to the `def_idle*` columns, and the `idle_ctx` column names it). `--on joins`: the
+//!   `on` context is the default config with every translatable join replaced (`on_config` column).
+//!   `--join-keys i64,i32,str`: the key types of the join family's cases.
 //! * `--families gsweep`: the aggregate sweep. One block per group count (200, 10k, 100k, 1M,
 //!   rows/2 in the key domain); per block, count / sum / avg / min+max over a Float64 and an int64
 //!   value column, and DISTINCT, each over one key and over two keys, int32 and int64 keys.
@@ -68,7 +74,7 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig};
-use datafusion_arrowmetal::{session_context, AggregateChoice, ArrowMetalConfig, ArrowMetalRule, MetalExec};
+use datafusion_arrowmetal::{session_context, AggregateChoice, ArrowMetalConfig, ArrowMetalRule, JoinChoice, MetalExec};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -109,6 +115,14 @@ struct Args {
     idle_gaps: Vec<u64>,
     /// `--idle-gpu-only`: the idle runs only for a case some context ran on the GPU.
     idle_gpu_only: bool,
+    /// The context timed after each idle gap next to `off` (default `def`); its times go to the
+    /// `def_idle*` columns, and the `idle_ctx` column names it.
+    idle_ctx: String,
+    /// Key classes of the join family's cases: `i64` (`j_*`), `i32` (`j32_*`), `str` (`js_*`).
+    join_keys: Vec<String>,
+    /// `--on joins`: the `on` context is the default config with every translatable join
+    /// replaced (column `on_config` = `joins`); `--on all` (default): every node forced.
+    on_joins: bool,
     /// Only these (size, layout, case) triples, one `size,layout,case` per line.
     select: Option<std::collections::HashSet<(usize, String, String)>>,
 }
@@ -134,6 +148,9 @@ fn args() -> Args {
         idle_reps: 0,
         idle_gaps: vec![500],
         idle_gpu_only: false,
+        idle_ctx: "def".into(),
+        join_keys: vec!["i64".into()],
+        on_joins: false,
         select: None,
         lock_dir: None,
     };
@@ -177,6 +194,13 @@ fn args() -> Args {
                 );
             }
             "--lock-dir" => a.lock_dir = Some(val),
+            "--idle-ctx" => a.idle_ctx = val,
+            "--join-keys" => a.join_keys = list(&val),
+            "--on" => a.on_joins = match val.as_str() {
+                "joins" => true,
+                "all" => false,
+                v => panic!("--on takes joins or all, got {v}"),
+            },
             "--explain" => {
                 a.explain = true;
                 i += 1;
@@ -255,62 +279,83 @@ fn last_sleep() -> String {
     l.split_whitespace().take(2).collect::<Vec<_>>().join(" ")
 }
 
-/// Holds `<dir>/TIMING` for one block (with its owner tag); removed on drop.
+/// Holds `<dir>/TIMING` for one block. The file holds this process's tag (`<lane> <pid>`) and is
+/// removed on drop only while it still holds exactly that tag: a TIMING file another lane or
+/// process wrote (with its own tag, or none) is never removed here.
 struct TimingLock(Option<std::path::PathBuf>, String);
+
+impl TimingLock {
+    fn holds(path: &std::path::Path, tag: &str) -> bool {
+        std::fs::read_to_string(path).map(|s| s.trim_end() == tag).unwrap_or(false)
+    }
+}
 
 impl Drop for TimingLock {
     fn drop(&mut self) {
         if let Some(p) = &self.0 {
-            if std::fs::read_to_string(p).map(|s| s.starts_with(&self.1)).unwrap_or(false) {
+            if Self::holds(p, &self.1) {
                 std::fs::remove_file(p).ok();
             }
         }
     }
 }
 
-/// Whether a `BUILDING*` file exists in the lock dir.
+/// Whether a `BUILDING*` file (`BUILDING.<lane>`: a build or a test run) exists in the lock dir.
 fn building(d: &std::path::Path) -> bool {
     std::fs::read_dir(d)
         .map(|it| it.flatten().any(|e| e.file_name().to_string_lossy().starts_with("BUILDING")))
         .unwrap_or(false)
 }
 
-/// Waits for a quiet machine (and, with a lock dir, for no BUILDING* and no one else's TIMING), then
-/// takes TIMING. Returns the load at the start and the lock.
+/// This process's TIMING tag: `<BENCH_LANE> <pid>` (`BENCH_LANE` defaults to `bench`).
+fn timing_tag() -> String {
+    format!("{} {}", std::env::var("BENCH_LANE").unwrap_or_else(|_| "bench".into()), std::process::id())
+}
+
+/// Waits for a quiet machine and, with a lock dir, for no `BUILDING*` file and no TIMING file
+/// at all (another lane's, another process's, or one made with `touch`), then creates TIMING with
+/// this process's tag (create-new, so two processes cannot both take it). Returns the load at
+/// the start and the lock.
 fn acquire(a: &Args, what: &str) -> (f64, TimingLock) {
-    // The owner tag written to `TIMING` (`BENCH_LANE`, default `g1`): a lock with another tag waits.
-    let lane = format!("{} ", std::env::var("BENCH_LANE").unwrap_or_else(|_| "g1".into()));
+    let tag = timing_tag();
     loop {
         if let Some(d) = &a.lock_dir {
             let d = std::path::Path::new(d);
             let mut waited = 0;
             loop {
                 let building = building(d);
-                let other = std::fs::read_to_string(d.join("TIMING")).map(|s| !s.starts_with(&lane)).unwrap_or(false);
-                if !building && !other {
+                let timing = d.join("TIMING").exists();
+                if !building && !timing {
                     break;
                 }
                 if waited % 120 == 0 {
-                    println!("  [waiting before {what}: BUILDING {building}, other TIMING {other}]");
+                    println!("  [waiting before {what}: BUILDING {building}, TIMING held {timing}]");
                 }
                 std::thread::sleep(Duration::from_secs(10));
                 waited += 10;
             }
         }
         let l = wait_quiet(a.max_load, what);
-        let Some(d) = &a.lock_dir else { return (l, TimingLock(None, lane)) };
+        let Some(d) = &a.lock_dir else { return (l, TimingLock(None, tag)) };
         let d = std::path::Path::new(d);
         let t = d.join("TIMING");
-        // Another process may have taken TIMING while this one waited for the load to settle.
-        if std::fs::read_to_string(&t).map(|s| !s.starts_with(&lane)).unwrap_or(false) {
+        // Created only if absent: another process may have taken TIMING while this one waited
+        // for the load to settle.
+        let created = std::fs::OpenOptions::new().write(true).create_new(true).open(&t).and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, "{tag}")
+        });
+        if created.is_err() {
+            // Someone took it between the check and the create: wait again.
             continue;
         }
-        std::fs::write(&t, format!("{lane}{}\n", std::process::id())).unwrap();
         if building(d) {
-            std::fs::remove_file(&t).ok();
+            if TimingLock::holds(&t, &tag) {
+                std::fs::remove_file(&t).ok();
+            }
             continue;
         }
-        return (l, TimingLock(Some(t), lane));
+        return (l, TimingLock(Some(t), tag));
     }
 }
 
@@ -366,11 +411,23 @@ fn data_fact(rng: &mut StdRng, n: usize) -> RecordBatch {
 }
 
 /// Probe keys from [0, 2 build); the build side holds every other value, so half the probe rows match.
-fn data_join(rng: &mut StdRng, n: usize, build: usize) -> (RecordBatch, RecordBatch) {
-    let probe = batch(vec![("k", i64s(rng, n, 2 * build as i64)), ("v", f64s(rng, n, 100.0, 0.0))]);
+/// The same keys as int32 (`k32`) and as Utf8 decimal text (`ks`) when `keys` asks for them.
+fn data_join(rng: &mut StdRng, n: usize, build: usize, keys: &[String]) -> (RecordBatch, RecordBatch) {
+    let pk = i64s(rng, n, 2 * build as i64);
+    let v = f64s(rng, n, 100.0, 0.0);
     let bk: ArrayRef = Arc::new(Int64Array::from_iter_values((0..build as i64).map(|i| 2 * i)));
-    let b = batch(vec![("k", bk), ("w", f64s(rng, build, 2.0, 0.0))]);
-    (probe, b)
+    let w = f64s(rng, build, 2.0, 0.0);
+    let mut pc = vec![("k", Arc::clone(&pk)), ("v", v)];
+    let mut bc = vec![("k", Arc::clone(&bk)), ("w", w)];
+    if keys.iter().any(|k| k == "i32") {
+        pc.push(("k32", cast(&pk, &DataType::Int32).unwrap()));
+        bc.push(("k32", cast(&bk, &DataType::Int32).unwrap()));
+    }
+    if keys.iter().any(|k| k == "str") {
+        pc.push(("ks", cast(&pk, &DataType::Utf8).unwrap()));
+        bc.push(("ks", cast(&bk, &DataType::Utf8).unwrap()));
+    }
+    (batch(pc), batch(bc))
 }
 
 /// One key from [0, G); two keys from [0, G/b) x [0, b), b = min(G, 100); x f64 [0, 1).
@@ -483,7 +540,7 @@ fn gname(g: usize, rows: usize) -> String {
 type BlockFn = Box<dyn FnOnce(&mut StdRng) -> Block>;
 
 /// The blocks of one size, generated lazily (only one block's tables alive at a time).
-fn blocks(rows: usize, fam: &str, rng: &mut StdRng) -> Vec<BlockFn> {
+fn blocks(rows: usize, fam: &str, join_keys: &[String], rng: &mut StdRng) -> Vec<BlockFn> {
     let mut out: Vec<BlockFn> = Vec::new();
     match fam {
         "sort" => out.push(Box::new(move |rng| Block {
@@ -501,23 +558,34 @@ fn blocks(rows: usize, fam: &str, rng: &mut StdRng) -> Vec<BlockFn> {
         })),
         "join" => {
             for b in [10_000usize, 1_000_000, 10_000_000] {
+                let keys = join_keys.to_vec();
                 out.push(Box::new(move |rng| {
-                    let (probe, build) = data_join(rng, rows, b);
+                    let (probe, build) = data_join(rng, rows, b, &keys);
                     let bn = gname(b, 0);
                     let mut cases = Vec::new();
-                    for (how, sql_how) in [("inner", "JOIN"), ("left", "LEFT JOIN")] {
-                        cases.push(case(
-                            &format!("j_{how}_{bn}"),
-                            &format!("{how} join, {bn}-row build, count + sum over the whole result"),
-                            &format!("SELECT count(*) AS n, sum(b.w) AS s FROM probe p {sql_how} build b ON p.k = b.k"),
-                            Order::Any,
-                        ));
-                        cases.push(case(
-                            &format!("jg_{how}_{bn}"),
-                            &format!("{how} join, {bn}-row build, then group by the probe key: count + sum"),
-                            &format!("SELECT p.k, count(*) AS n, sum(p.v) AS s FROM probe p {sql_how} build b ON p.k = b.k GROUP BY p.k"),
-                            Order::Any,
-                        ));
+                    for kc in &keys {
+                        let (pfx, col, kt) = match kc.as_str() {
+                            "i64" => ("", "k", "int64"),
+                            "i32" => ("32", "k32", "int32"),
+                            "str" => ("s", "ks", "Utf8"),
+                            k => panic!("unknown join key class {k}"),
+                        };
+                        for (how, sql_how) in [("inner", "JOIN"), ("left", "LEFT JOIN")] {
+                            cases.push(case(
+                                &format!("j{pfx}_{how}_{bn}"),
+                                &format!("{how} join on an {kt} key, {bn}-row build, count + sum over the whole result"),
+                                &format!("SELECT count(*) AS n, sum(b.w) AS s FROM probe p {sql_how} build b ON p.{col} = b.{col}"),
+                                Order::Any,
+                            ));
+                            cases.push(case(
+                                &format!("jg{pfx}_{how}_{bn}"),
+                                &format!("{how} join on an {kt} key, {bn}-row build, then group by the probe key: count + sum"),
+                                &format!(
+                                    "SELECT p.{col}, count(*) AS n, sum(p.v) AS s FROM probe p {sql_how} build b ON p.{col} = b.{col} GROUP BY p.{col}"
+                                ),
+                                Order::Any,
+                            ));
+                        }
                     }
                     Block { family: "join", source: Source::Mem(vec![("probe", probe), ("build", build)]), cases }
                 }));
@@ -529,6 +597,13 @@ fn blocks(rows: usize, fam: &str, rng: &mut StdRng) -> Vec<BlockFn> {
             for g in gs {
                 out.push(Box::new(move |rng| {
                     let t = data_grid(rng, rows, g);
+                    // A Float32 value column `y` [0, 1), drawn after the others (so they keep the
+                    // values of the files without it).
+                    let y: ArrayRef = Arc::new(Float32Array::from_iter_values((0..rows).map(|_| rng.random::<f32>())));
+                    let mut cols: Vec<(&str, ArrayRef)> =
+                        ["k", "k1", "k2", "x"].iter().enumerate().map(|(i, n)| (*n, Arc::clone(t.column(i)))).collect();
+                    cols.push(("y", y));
+                    let t = batch(cols);
                     let gn = gname(g, rows);
                     let mut cases = Vec::new();
                     for (fam, agg) in [
@@ -536,6 +611,7 @@ fn blocks(rows: usize, fam: &str, rng: &mut StdRng) -> Vec<BlockFn> {
                         ("sum", "sum(x) AS s"),
                         ("mean", "avg(x) AS m"),
                         ("minmax", "min(x) AS lo, max(x) AS hi"),
+                        ("minmax32", "min(y) AS lo, max(y) AS hi"),
                     ] {
                         cases.push(case(
                             &format!("g1{fam}{gn}"),
@@ -607,12 +683,24 @@ fn blocks(rows: usize, fam: &str, rng: &mut StdRng) -> Vec<BlockFn> {
         "filter" => out.push(Box::new(move |rng| Block {
             family: "filter",
             source: Source::Mem(vec![("fact", data_fact(rng, rows))]),
-            cases: vec![case(
-                "a_sumcnt",
-                "filtered sum + count over the whole table (control)",
-                "SELECT sum(amount) AS total, count(*) AS n FROM fact WHERE region < 20 AND qty > 10",
-                Order::Any,
-            )],
+            cases: vec![
+                case(
+                    "a_sumcnt",
+                    "filtered sum + count over the whole table (control)",
+                    "SELECT sum(amount) AS total, count(*) AS n FROM fact WHERE region < 20 AND qty > 10",
+                    Order::Any,
+                ),
+                // Float comparisons against a literal (totalOrder, zeros equal): the rows that pass.
+                case("f_gt", "rows with a Float64 above a finite literal (25%)", "SELECT region, amount FROM fact WHERE amount > 1000.0", Order::Any),
+                case("f_lt0", "rows with a Float64 below zero (25%)", "SELECT region, amount FROM fact WHERE amount < 0.0", Order::Any),
+                case("f_ne0", "rows with a Float64 not equal to zero (all)", "SELECT region, qty FROM fact WHERE amount <> 0.0", Order::Any),
+                case(
+                    "f_sum_ge0",
+                    "sum + count of the rows with a Float64 at or above zero (75%)",
+                    "SELECT sum(qty) AS q, count(*) AS n FROM fact WHERE amount >= 0.0",
+                    Order::Any,
+                ),
+            ],
         })),
         _ => {}
     }
@@ -909,11 +997,19 @@ struct Res {
     fallbacks: usize,
 }
 
-fn rule_for(name: &str) -> Option<ArrowMetalRule> {
+fn rule_for(name: &str, on_joins: bool) -> Option<ArrowMetalRule> {
     let all = ArrowMetalConfig::all().with_min_rows(0).with_accept_inexact(true);
     match name {
         "off" => None,
-        "on" => Some(ArrowMetalRule::new(all.clone().with_aggregate_choice(AggregateChoice::ArrowMetal))),
+        // `--on joins`: the default config with every translatable join replaced, so only the
+        // join differs from DataFusion alone (an aggregate above it stays DataFusion's, as under
+        // the default).
+        "on" if on_joins => Some(ArrowMetalRule::new(
+            ArrowMetalConfig::default().with_min_rows(0).with_join_choice(JoinChoice::ArrowMetal),
+        )),
+        "on" => Some(ArrowMetalRule::new(
+            all.clone().with_aggregate_choice(AggregateChoice::ArrowMetal).with_join_choice(JoinChoice::ArrowMetal),
+        )),
         "back" => Some(ArrowMetalRule::new(all.clone().with_aggregate_choice(AggregateChoice::DataFusion))),
         "def" => Some(ArrowMetalRule::new(ArrowMetalConfig::default())),
         c => panic!("unknown context {c}"),
@@ -941,7 +1037,7 @@ async fn main() {
              off_first_ms,block_t0,block_t1,last_sleep,rounds,off_round_median_ms,def_round_median_ms,\
              back_round_median_ms,on_round_median_ms,method,def_gpu,def_idle_ms,def_idle_max_ms,off_idle_ms,\
              idle_gap_ms,off_idle_max_ms,def_idle_cpu_ms,off_idle_cpu_ms,idle_reps,idle_gap2_ms,def_idle2_ms,\
-             def_idle2_max_ms,off_idle2_ms,off_idle2_max_ms,def_idle2_cpu_ms,off_idle2_cpu_ms"
+             def_idle2_max_ms,off_idle2_ms,off_idle2_max_ms,def_idle2_cpu_ms,off_idle2_cpu_ms,idle_ctx,on_config"
         )
         .unwrap();
     }
@@ -960,7 +1056,7 @@ async fn main() {
                     continue;
                 }
                 let mut dummy = StdRng::seed_from_u64(0);
-                for b in blocks(rows, fam, &mut dummy) {
+                for b in blocks(rows, fam, &a.join_keys, &mut dummy) {
                     work.push((rows, mode.clone(), b));
                 }
             }
@@ -1036,7 +1132,7 @@ async fn main() {
         let ctx_def = context(&block.source, mem_mode, Some(rule_def.clone())).await;
         let mut ctxs = Vec::new();
         for name in &a.contexts {
-            let rule = rule_for(name);
+            let rule = rule_for(name, a.on_joins);
             let ctx = context(&block.source, mem_mode, rule.clone()).await;
             ctxs.push(Ctx { name: name.clone(), ctx, rule });
         }
@@ -1182,7 +1278,7 @@ async fn main() {
                 }
                 for gi in gaps {
                     for k in 0..2 {
-                        let name = if (turn + k) % 2 == 0 { "off" } else { "def" };
+                        let name = if (turn + k) % 2 == 0 { "off" } else { a.idle_ctx.as_str() };
                         if let Some(x) = ctxs.iter().find(|x| x.name == name) {
                             std::thread::sleep(Duration::from_millis(a.idle_gaps[gi]));
                             let r = run(&x.ctx, &c.sql).await;
@@ -1287,20 +1383,20 @@ async fn main() {
                 med("on"),
                 if alternate { "alternate" } else { "rounds" },
                 gpu,
-                idle_med(0, "def"),
-                idle_max(0, "def"),
+                idle_med(0, a.idle_ctx.as_str()),
+                idle_max(0, a.idle_ctx.as_str()),
                 idle_med(0, "off"),
                 gap(0),
                 idle_max(0, "off"),
-                idle_cpu_med(0, "def"),
+                idle_cpu_med(0, a.idle_ctx.as_str()),
                 idle_cpu_med(0, "off"),
                 idle_reps,
                 gap(1),
-                idle_med(1, "def"),
-                idle_max(1, "def"),
+                idle_med(1, a.idle_ctx.as_str()),
+                idle_max(1, a.idle_ctx.as_str()),
                 idle_med(1, "off"),
                 idle_max(1, "off"),
-                idle_cpu_med(1, "def"),
+                idle_cpu_med(1, a.idle_ctx.as_str()),
                 idle_cpu_med(1, "off"),
             );
             rows_out.push((row, tail, extra, rounds_s));
@@ -1311,7 +1407,13 @@ async fn main() {
         let sleep = last_sleep();
         println!("  [load {l1:.2} at block end, {t1}; last sleep {sleep}]");
         for (r, tail, extra, rounds_s) in rows_out {
-            writeln!(out, "{r},{l0:.2},{l1:.2},{tail},{extra},{t0},{t1},{sleep},{rounds_s}").unwrap();
+            writeln!(
+                out,
+                "{r},{l0:.2},{l1:.2},{tail},{extra},{t0},{t1},{sleep},{rounds_s},{},{}",
+                a.idle_ctx,
+                if a.on_joins { "joins" } else { "all" }
+            )
+            .unwrap();
         }
         out.flush().unwrap();
     }

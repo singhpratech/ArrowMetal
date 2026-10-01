@@ -9,7 +9,7 @@ use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_arrowmetal::{session_context, AggregateChoice, ArrowMetalConfig, ArrowMetalRule};
+use datafusion_arrowmetal::{session_context, AggregateChoice, ArrowMetalConfig, ArrowMetalRule, JoinChoice};
 
 /// Every shape the rule can translate, a replaced aggregate forced onto ArrowMetal.
 fn gpu_all() -> ArrowMetalConfig {
@@ -462,4 +462,180 @@ async fn a_refused_memory_reservation_hands_the_node_back() {
             "{sql}: expected a memory hand-back\n{r}"
         );
     }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Joins
+
+/// `p` (probe: `k` int64 from [0, 2 build), `v` Float64 with nulls, `s` Utf8) and `b` (build: every
+/// other key of that domain once, `w` Float64), each split over `parts` MemTable partitions.
+fn join_tables(n_probe: usize, n_build: usize, parts: usize) -> (RecordBatch, RecordBatch, usize) {
+    let k: Int64Array = (0..n_probe).map(|i| Some(((i as u64).wrapping_mul(2_654_435_761) % (2 * n_build as u64)) as i64)).collect();
+    let v: Float64Array = (0..n_probe).map(|i| if i % 13 == 0 { None } else { Some(i as f64 / 7.0) }).collect();
+    let s: StringArray = (0..n_probe).map(|i| Some(format!("s{}", i % 9))).collect();
+    let p = RecordBatch::try_from_iter([("k", Arc::new(k) as ArrayRef), ("v", Arc::new(v) as ArrayRef), ("s", Arc::new(s) as ArrayRef)]).unwrap();
+    let bk: Int64Array = (0..n_build).map(|i| if i % 101 == 0 { None } else { Some(2 * i as i64) }).collect();
+    let w: Float64Array = (0..n_build).map(|i| Some(i as f64 * 0.5)).collect();
+    let b = RecordBatch::try_from_iter([("k", Arc::new(bk) as ArrayRef), ("w", Arc::new(w) as ArrayRef)]).unwrap();
+    (p, b, parts)
+}
+
+fn split(b: &RecordBatch, parts: usize) -> Vec<Vec<RecordBatch>> {
+    let n = b.num_rows();
+    let per = n.div_ceil(parts);
+    (0..parts).map(|i| vec![b.slice(i * per, per.min(n - i * per))]).collect()
+}
+
+async fn join_ctx(rule: Option<&ArrowMetalRule>, n_probe: usize, n_build: usize, tp: usize) -> SessionContext {
+    let config = SessionConfig::new().with_target_partitions(tp);
+    let ctx = match rule {
+        Some(r) => session_context(config, r.clone()),
+        None => SessionContext::new_with_config(config),
+    };
+    let (p, b, parts) = join_tables(n_probe, n_build, tp.max(1));
+    ctx.register_table("p", Arc::new(MemTable::try_new(p.schema(), split(&p, parts)).unwrap())).unwrap();
+    ctx.register_table("b", Arc::new(MemTable::try_new(b.schema(), split(&b, parts)).unwrap())).unwrap();
+    ctx
+}
+
+/// The rows of `sql`'s answer as printed lines, sorted (the answer as a multiset of rows, with no
+/// ORDER BY added to the plan).
+async fn row_lines(ctx: &SessionContext, sql: &str) -> Vec<String> {
+    let out = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let text = pretty_format_batches(&out).unwrap().to_string();
+    let mut lines: Vec<String> = text.lines().filter(|l| l.starts_with('|')).skip(1).map(String::from).collect();
+    lines.sort();
+    lines
+}
+
+fn joins_forced() -> ArrowMetalConfig {
+    ArrowMetalConfig::all().with_min_rows(0).with_join_choice(JoinChoice::ArrowMetal)
+}
+
+/// Inner, left and right joins, alone and under an aggregate, with one and four partitions (four:
+/// a 200,000-row build side is past DataFusion's single-partition threshold, so the join is
+/// hash-partitioned on both sides and the rule reads below both exchanges): replaced, and the
+/// answers are DataFusion's.
+#[tokio::test(flavor = "multi_thread")]
+async fn hash_joins_are_replaced_and_match() {
+    for sql in [
+        "SELECT p.k, p.v, b.w FROM p JOIN b ON p.k = b.k",
+        "SELECT p.k, p.s, b.w FROM p LEFT JOIN b ON p.k = b.k",
+        "SELECT b.k, b.w, p.v FROM b LEFT JOIN p ON b.k = p.k",
+        "SELECT p.s, count(*) AS n, sum(b.w) AS t FROM p JOIN b ON p.k = b.k GROUP BY p.s",
+        "SELECT p.k, count(*) AS n FROM p LEFT JOIN b ON p.k = b.k GROUP BY p.k",
+        // No join column is read above the join: its projection is empty.
+        "SELECT count(*) AS n, 1 AS one FROM p JOIN b ON p.k = b.k",
+    ] {
+        for tp in [1, 4] {
+            let rule = ArrowMetalRule::new(joins_forced());
+            let ctx = join_ctx(Some(&rule), 300_000, 200_000, tp).await;
+            let got = row_lines(&ctx, sql).await;
+            let want = row_lines(&join_ctx(None, 300_000, 200_000, tp).await, sql).await;
+            assert!(got == want, "{sql} tp={tp}: results differ");
+            let r = rule.report();
+            assert!(r.taken().any(|d| d.node.starts_with("HashJoinExec")), "{sql} tp={tp}\n{r}");
+            assert_eq!(r.runtime_fallbacks().count(), 0, "{sql} tp={tp}\n{r}");
+        }
+    }
+}
+
+/// With one partition, DataFusion sorts the probe side below an inner join and relies on the join
+/// keeping its order (no sort above it): the replaced join keeps it, row for row.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ordered_inner_join_keeps_the_probe_order() {
+    let sql = "SELECT * FROM (SELECT p.k, p.v, b.w FROM p JOIN b ON p.k = b.k) ORDER BY 1, 2";
+    let rule = ArrowMetalRule::new(joins_forced().with_sort(false));
+    let ctx = join_ctx(Some(&rule), 300_000, 200_000, 1).await;
+    let got = sorted_text(&ctx, sql).await;
+    let want = sorted_text(&join_ctx(None, 300_000, 200_000, 1).await, sql).await;
+    assert!(got == want, "results differ");
+    let r = rule.report();
+    assert!(r.taken().any(|d| d.node.starts_with("HashJoinExec")), "{r}");
+}
+
+#[tokio::test]
+async fn joins_the_rule_cannot_translate_are_left_with_a_reason() {
+    let rule = ArrowMetalRule::new(joins_forced());
+    let ctx = join_ctx(Some(&rule), 2_000, 500, 1).await;
+    for (sql, why) in [
+        ("SELECT p.k, b.w FROM p FULL JOIN b ON p.k = b.k", "Full join"),
+        ("SELECT p.k, b.w FROM p JOIN b ON p.k = b.k AND p.v > b.w", "join filter"),
+        ("SELECT p.k, b.w FROM p JOIN b ON p.k IS NOT DISTINCT FROM b.k", "nulls compare equal"),
+        ("SELECT p.k, b.w FROM p JOIN b ON p.v = b.w", "has type Float64"),
+        ("SELECT p.k FROM p WHERE p.k IN (SELECT k FROM b)", "Semi join"),
+    ] {
+        rule.clear_report();
+        ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let r = rule.report();
+        assert!(r.left().any(|d| d.node.starts_with("HashJoinExec") && d.reason.contains(why)), "{sql}: expected '{why}'\n{r}");
+    }
+}
+
+/// The default config looks a join up in the measured join table; a join of a shape and size it
+/// does not take is left with that reason, and `with_join(false)` leaves every join.
+#[tokio::test]
+async fn default_config_decides_joins_from_the_measured_table() {
+    let rule = ArrowMetalRule::new(ArrowMetalConfig::default().with_min_rows(0));
+    let ctx = join_ctx(Some(&rule), 2_000, 500, 1).await;
+    ctx.sql("SELECT p.k, b.w FROM p JOIN b ON p.k = b.k").await.unwrap().collect().await.unwrap();
+    let r = rule.report();
+    assert!(r.left().any(|d| d.node.starts_with("HashJoinExec") && d.reason.contains("measured join table")), "{r}");
+    let rule = ArrowMetalRule::new(joins_forced().with_join(false));
+    let ctx = join_ctx(Some(&rule), 2_000, 500, 1).await;
+    ctx.sql("SELECT p.k, b.w FROM p JOIN b ON p.k = b.k").await.unwrap().collect().await.unwrap();
+    let r = rule.report();
+    assert!(r.left().any(|d| d.reason == "join disabled in config"), "{r}");
+}
+
+#[tokio::test]
+async fn explain_shows_a_join_metal_exec() {
+    let rule = ArrowMetalRule::new(joins_forced());
+    let ctx = join_ctx(Some(&rule), 2_000, 500, 4).await;
+    let out = ctx.sql("EXPLAIN SELECT p.k, b.w FROM p JOIN b ON p.k = b.k").await.unwrap().collect().await.unwrap();
+    let text = pretty_format_batches(&out).unwrap().to_string();
+    assert!(text.contains("MetalExec: join="), "{text}");
+}
+
+/// A 6 MiB memory pool: collecting both join inputs is refused, the join is handed back to
+/// DataFusion (whose build side fits) with the reason in the report, and the answers match.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_join_reservation_hands_the_join_back() {
+    use datafusion::execution::memory_pool::GreedyMemoryPool;
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion::execution::session_state::SessionStateBuilder;
+    let rule = ArrowMetalRule::new(joins_forced());
+    let rt = RuntimeEnvBuilder::new().with_memory_pool(Arc::new(GreedyMemoryPool::new(6 << 20))).build_arc().unwrap();
+    let state = datafusion_arrowmetal::with_arrowmetal(
+        SessionStateBuilder::new()
+            .with_config(SessionConfig::new().with_target_partitions(4).with_sort_spill_reservation_bytes(256 << 10))
+            .with_runtime_env(rt)
+            .with_default_features(),
+        rule.clone(),
+    )
+    .build();
+    let ctx = SessionContext::new_with_state(state);
+    // Batches of their own (not slices of one buffer), so each is reserved at its own size.
+    let (p, b, _) = join_tables(600_000, 20_000, 4);
+    let own = |x: &RecordBatch, parts: usize| -> Vec<Vec<RecordBatch>> {
+        split(x, parts)
+            .into_iter()
+            .map(|v| {
+                v.into_iter()
+                    .map(|s| {
+                        let cols = s.columns().iter().map(|c| arrow::compute::concat(&[c.as_ref()]).unwrap()).collect();
+                        RecordBatch::try_new(s.schema(), cols).unwrap()
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    ctx.register_table("p", Arc::new(MemTable::try_new(p.schema(), own(&p, 4)).unwrap())).unwrap();
+    ctx.register_table("b", Arc::new(MemTable::try_new(b.schema(), own(&b, 4)).unwrap())).unwrap();
+    let sql = "SELECT p.s, count(*) AS n, sum(b.w) AS t FROM p JOIN b ON p.k = b.k GROUP BY p.s";
+    let got = sorted_text(&ctx, sql).await;
+    let want = sorted_text(&join_ctx(None, 600_000, 20_000, 4).await, sql).await;
+    assert!(got == want, "results differ");
+    let r = rule.report();
+    assert!(r.runtime_fallbacks().any(|d| d.reason.contains("memory pool refused")), "expected a memory hand-back\n{r}");
 }

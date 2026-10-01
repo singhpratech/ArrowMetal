@@ -245,3 +245,31 @@ fn group_by_without_aggregates_returns_the_distinct_keys() {
     got.sort();
     assert_eq!(got, vec![1, 2]);
 }
+
+/// What the crate's float comparisons rely on (core 41d1bc0): `signbit` and `is_nan` place a NaN by
+/// its sign, so `x > c` in totalOrder is one fused expression (a NaN without the sign bit is above
+/// every value, one with it below); the IEEE `eq` treats -0.0 and +0.0 as equal; null stays null.
+#[test]
+fn signbit_and_is_nan_place_the_nans() {
+    let x: ArrayRef = Arc::new(Float64Array::from(vec![
+        Some(0.0f64),
+        Some(-0.0),
+        Some(2.0),
+        Some(f64::NAN),
+        Some(f64::from_bits(0xFFF4_0000_0000_0003)),
+        Some(f64::NEG_INFINITY),
+        None,
+    ]));
+    let s = src(vec![("x", x)]);
+    let x = "(col \\\"x\\\")";
+    let run = |e: String| -> Vec<Option<bool>> {
+        let plan = format!(r#"{{"op":"select","exprs":[["r","{e}"]],"input":{{"op":"scan","source":"t"}}}}"#);
+        let out = run_plan(&plan, &[&s], true).unwrap().column(0).unwrap().to_arrow().unwrap();
+        out.as_boolean().iter().collect()
+    };
+    let (t, f) = (Some(true), Some(false));
+    assert_eq!(run(format!("(or (gt {x} (f64 1.5e0)) (and (is_nan {x}) (not (signbit {x}))))")), vec![f, f, t, t, f, f, None]);
+    assert_eq!(run(format!("(or (lt {x} (f64 1.5e0)) (and (is_nan {x}) (signbit {x})))")), vec![t, t, f, f, t, t, None]);
+    assert_eq!(run(format!("(eq {x} (f64 -0e0))")), vec![t, t, f, f, f, f, None]);
+    assert_eq!(run(format!("(or (ge {x} (f64 -inf)) (and (is_nan {x}) (not (signbit {x}))))")), vec![t, t, t, t, f, t, None]);
+}
