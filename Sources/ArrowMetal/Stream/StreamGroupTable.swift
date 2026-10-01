@@ -333,7 +333,7 @@ enum StreamGroupTableSource {
             for (uint b = 0u; b < bits; ++b) lane |= ((t >> b) & 1u) << (bits - 1u - b);
             ulong acc = 0ul;
             uint cnt = 0u;
-            for (uint i = s + lane; i < e; i += 256u) {
+            for (uint i = s + lane; i < e; i = (e - i > 256u) ? i + 256u : e) {
                 uint row = (uint)ord[i];
                 if (hasValidity != 0u && !bit_get(validity, row)) continue;
                 ulong v = vals[row];

@@ -785,7 +785,7 @@ enum ExprSource {
                         uint sgid [[simdgroup_index_in_threadgroup]],
                         uint lane [[thread_index_in_simdgroup]]) {
         threadgroup uint simdTotals[32];
-        uint blocks = max(1u, ((*nPtr + 31u) / 32u + TG - 1u) / TG);
+        uint blocks = max(1u, (((*nPtr >> 5) + (uint)((*nPtr & 31u) != 0u)) + TG - 1u) / TG);
         uint per = (blocks + TG - 1) / TG;
         uint lo = lid * per, hi = min(blocks, lo + per);
         uint local = 0;

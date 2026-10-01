@@ -26,7 +26,7 @@ enum StructuralSource {
 
     kernel void st_fill_words(device const uint* nPtr [[buffer(0)]], constant uint& value [[buffer(1)]],
                               device uint* out [[buffer(2)]], uint w [[thread_position_in_grid]]) {
-        if (w < (*nPtr + 31u) / 32u) out[w] = value;
+        if (w < ((*nPtr >> 5) + (uint)((*nPtr & 31u) != 0u))) out[w] = value;
     }
     // flags: bit0 = a has a validity bitmap, bit1 = b has one.
     kernel void st_and_kleene(device const uint* aVal [[buffer(0)]], device const uint* aValid [[buffer(1)]],
@@ -34,7 +34,7 @@ enum StructuralSource {
                               device const uint* nPtr [[buffer(4)]], constant uint& flags [[buffer(5)]],
                               device uint* outVal [[buffer(6)]], device uint* outValid [[buffer(7)]],
                               uint w [[thread_position_in_grid]]) {
-        if (w >= (*nPtr + 31u) / 32u) return;
+        if (w >= ((*nPtr >> 5) + (uint)((*nPtr & 31u) != 0u))) return;
         uint av = aVal[w], bv = bVal[w];
         uint ava = (flags & 1u) ? aValid[w] : 0xFFFFFFFFu;
         uint bva = (flags & 2u) ? bValid[w] : 0xFFFFFFFFu;
@@ -46,7 +46,7 @@ enum StructuralSource {
                              device const uint* nPtr [[buffer(4)]], constant uint& flags [[buffer(5)]],
                              device uint* outVal [[buffer(6)]], device uint* outValid [[buffer(7)]],
                              uint w [[thread_position_in_grid]]) {
-        if (w >= (*nPtr + 31u) / 32u) return;
+        if (w >= ((*nPtr >> 5) + (uint)((*nPtr & 31u) != 0u))) return;
         uint av = aVal[w], bv = bVal[w];
         uint ava = (flags & 1u) ? aValid[w] : 0xFFFFFFFFu;
         uint bva = (flags & 2u) ? bValid[w] : 0xFFFFFFFFu;

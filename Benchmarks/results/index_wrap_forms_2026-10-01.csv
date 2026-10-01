@@ -1,0 +1,13 @@
+block,case,rows,build,first_after_idle_ms,best_ms,median_ms,cpu_median_ms,rounds,reps
+saturating step in every loop,top_k 5000 float64,10000000,before,6.968,3.314,3.769,2.391,10,100
+saturating step in every loop,top_k 5000 float64,10000000,after,8.376,3.43,3.863,2.436,10,100
+saturating step in every loop,top_k 5000 float64,50000000,before,13.205,4.596,5.873,2.986,10,100
+saturating step in every loop,top_k 5000 float64,50000000,after,14.592,4.706,6.198,3.006,10,100
+saturating step in every loop except the radix select,min_max int32 (agg),10000000,before,7.118,1.212,1.347,1.446,20,100
+saturating step in every loop except the radix select,min_max int32 (agg),10000000,after,6.678,1.273,1.432,1.413,20,100
+saturating step in every loop except the radix select,min_max int32 (agg),50000000,before,5.282,1.73,2.419,1.9,20,100
+saturating step in every loop except the radix select,min_max int32 (agg),50000000,after,5.078,1.824,2.433,1.879,20,100
+saturating step in every loop except the radix select and grid-stride loops,group_by 1000 keys min_max int32 (extrema),10000000,before,6.012,1.978,2.953,1.835,20,100
+saturating step in every loop except the radix select and grid-stride loops,group_by 1000 keys min_max int32 (extrema),10000000,after,6.035,2.111,3.045,1.898,20,100
+saturating step in every loop except the radix select and grid-stride loops,group_by 1000 keys min_max int32 (extrema),50000000,before,10.922,3.287,4.071,1.739,20,100
+saturating step in every loop except the radix select and grid-stride loops,group_by 1000 keys min_max int32 (extrema),50000000,after,15.171,3.342,3.996,1.797,20,100

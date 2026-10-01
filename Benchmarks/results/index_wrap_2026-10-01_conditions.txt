@@ -1,0 +1,30 @@
+index_wrap_2026-10-01.csv and index_wrap_forms_2026-10-01.csv
+
+Machine: Apple M4 Max, 64 GB, macOS (Darwin 27.0.0), on AC power. No sleep during any block (last sleep
+entry 2026-09-29).
+Builds: before = main at 2fdcfa4; after = this change. Both `swift build -c release --product ArrowMetalC`,
+loaded side by side in one Python process (Benchmarks/index_wrap_bench.py, pyarrow 25.0.1 inputs, seed
+20261001). Each case: an untimed warm-up of at least 100 ms per build, the first call after a 500 ms idle
+per build (first_after_idle_ms), then `rounds` rounds alternating the builds (order flipped every round),
+`reps` calls per build per round. best/median wall time per call; cpu_median_ms is process CPU time per
+call (getrusage).
+
+index_wrap_2026-10-01.csv (the code as committed)
+  block "all cases":       8 rounds, up to 30 calls (fewer for calls over 33 ms), 10M and 50M rows.
+                           2026-10-01 11:29:28 load 3.43 / 10.18 / 8.27 -> 11:33:21 load 1.12 / 5.30 / 6.56
+  block "re-timed alone":  the five 10M rows whose best and median both came out more than 1% slower,
+                           20 rounds of 100 calls.
+                           2026-10-01 11:33:49 load 2.30 / 5.19 / 6.48 -> 11:34:41 load 2.13 / 4.68 / 6.22
+
+index_wrap_forms_2026-10-01.csv (earlier forms of the change, each re-timed alone, 10 or 20 rounds of 100)
+  "saturating step in every loop": top_k 5000.
+                           2026-10-01 07:12:45 load 2.14 / 2.59 / 3.01 -> 07:13:39 load 2.13 / 2.50 / 2.94
+  "... except the radix select" (radix select by offset): min_max int32.
+                           2026-10-01 08:00:47 load 2.00 / 4.05 / 3.82 -> 08:02:30 load 2.03 / 3.48 / 3.62
+  "... except the radix select and grid-stride loops" (grid-stride loops in two copies): group-by
+  min_max over 1,000 keys.
+                           2026-10-01 10:51:45 load 3.13 / 3.80 / 3.26 -> 10:54:54 load 1.84 / 2.88 / 2.97
+
+Cases whose group-by is built per call (the key mapping is part of the time): the extrema, the exact
+Float64 sum and the variance over 1,000 keys. The product and the Float32 mean reuse one group-by, so
+its group order is built once and the per-group kernels are what is timed.

@@ -144,12 +144,12 @@ enum AggregatesSource {
             uint n = *nPtr;
             \(ACC) acc = \(productInit);
             uint cnt = 0;
-            for (uint i = gid; i < n; i += gridSize) {
+            AM_GRID_STRIDE(i, gid, n, gridSize,
                 if (hasValidity && !bit_get(validity, i)) continue;
                 \(ACC) v = \(load);
                 acc = ag_mul(acc, v);
                 cnt++;
-            }
+            )
             shared[lid] = acc; scount[lid] = cnt;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint s = TG / 2; s > 0; s >>= 1) {
@@ -177,12 +177,12 @@ enum AggregatesSource {
             uint n = *nPtr;
             \(KEYACC) lo = \(minInit), hi = \(maxInit);
             uint cnt = 0;
-            for (uint i = gid; i < n; i += gridSize) {
+            AM_GRID_STRIDE(i, gid, n, gridSize,
                 if (hasValidity && !bit_get(validity, i)) continue;
                 if (!(\(include))) continue;
                 \(KEYACC) k = \(key);
                 lo = min(lo, k); hi = max(hi, k); cnt++;
-            }
+            )
             sharedMin[lid] = lo; sharedMax[lid] = hi; scount[lid] = cnt;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint s = TG / 2; s > 0; s >>= 1) {
@@ -214,12 +214,12 @@ enum AggregatesSource {
             uint n = *nPtr;
             \(momentAcc) acc = \(momentInit);
             uint cnt = 0;
-            for (uint i = gid; i < n; i += gridSize) {
+            AM_GRID_STRIDE(i, gid, n, gridSize,
                 if (hasValidity && !bit_get(validity, i)) continue;
                 if (!(\(momentInclude))) continue;
         \(momentBody)
                 cnt++;
-            }
+            )
             shared[lid] = acc; scount[lid] = cnt;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint s = TG / 2; s > 0; s >>= 1) {

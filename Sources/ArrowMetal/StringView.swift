@@ -344,10 +344,10 @@ enum StringLayoutSource {
         threadgroup ulong sums[TG];
         StrView s{v, b};
         ulong acc = 0ul;
-        for (uint i = gid; i < n; i += grid) {
+        AM_GRID_STRIDE(i, gid, n, grid,
             if (hasValidity != 0u && !bit_get(validity, i)) continue;
             acc += (ulong)s.len(i);
-        }
+        )
         sums[lid] = acc;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lid == 0u) {

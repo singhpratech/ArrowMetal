@@ -164,8 +164,8 @@ enum GroupByExtremaSource {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             """ : "")
-            uint start = tgid * chunk, end = min(n, start + chunk);
-            for (uint i = start + lid; i < end; i += TG) {
+            uint start = tgid * chunk, len = (start < n) ? min(chunk, n - start) : 0u;
+            for (uint off = lid; off < len; off += TG) { uint i = start + off;
         \(rowPrologue(s, KT: KT))
                 uint hi = (uint)(u >> 32);
                 \(priv ? "" : "device atomic_uint* g = &t[(ulong)k * 4ul];")
@@ -215,8 +215,8 @@ enum GroupByExtremaSource {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             """ : "")
-            uint start = tgid * chunk, end = min(n, start + chunk);
-            for (uint i = start + lid; i < end; i += TG) {
+            uint start = tgid * chunk, len = (start < n) ? min(chunk, n - start) : 0u;
+            for (uint off = lid; off < len; off += TG) { uint i = start + off;
         \(rowPrologue(s, KT: KT))
                 uint hi = (uint)(u >> 32), lo = (uint)u;
                 \(priv ? "" : "device atomic_uint* g = &t[(ulong)k * 4ul]; uint2 hw = th[(ulong)k * 2ul];")

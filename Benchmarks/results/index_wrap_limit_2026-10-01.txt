@@ -1,0 +1,39 @@
+Kernels at the 32-bit index limit, 2026-10-01, Apple M4 Max (64 GB, Metal maxBufferLength 38.88 GiB)
+
+Swift: IndexWrapTests with ARROWMETAL_BIG_TESTS=1, 4,294,967,295 (2^32 - 1) rows each, one process per
+test. Inputs are periodic (1 GiB of memory mapped back to back up to the column's length, period 2^27
+rows), outputs real memory. Before = main at 2fdcfa4, after = this change.
+
+test (kernels)                                   before                                              after
+testBitmapsAtTheLimit (bitmap_and/or/not,       and: 1,073,741,824 wrong bits; or: 3,221,225,472;     passed (1.87 s)
+  lx_xor, filter scan)                            xor: 2,147,483,648; not: 2,147,483,647 (no word
+                                                  written); filter kept 4,096 rows of 2,147,483,648
+testExpressionReduceAtTheLimit (am_reduce,       sum null (want 547,608,330,172), count 0              passed (0.52 s)
+  am_scan word count)                             (want 4,294,967,295)
+testSortHistogramAtTheLimit (radix_histogram)    4,261,412,864 of 4,294,967,295 rows counted; the       passed (0.29 s)
+                                                  last block (33,554,431 rows) counted 0
+testGroupByAtTheLimit (GroupBySource, extrema)   count 4,290,772,992 of 4,294,967,295 rows (the last    passed (0.87 s)
+                                                  of 1,024 blocks, 4,194,303 rows, read nothing); sum
+                                                  547,073,556,480 (want 547,608,330,172); min/max
+                                                  equal (periodic values)
+testExactGroupSumAtTheLimit (GroupSumExact,      sum 547,073,556,480 (want 547,608,330,172)            passed (0.89 s)
+  32 GiB Float64 column)
+testGroupSegmentsAtTheLimit (GroupOrder          segments hold 4,292,870,144 of 4,294,967,295 rows      passed (8.38 s; group order 1.96 s)
+  chunked, gx_seg_minmax, gm_*, gx_seg_moment34,  (the last of 2,048 sub-blocks, 2,097,151 rows, read
+  seg_reduce over a 32 GiB Int64 column)          nothing); variance and skew of every key off
+testReductionsAtTheLimit (reduce_*, agg_product,  not run: the grid-stride loops (2^19 threads, a     passed (1.46 s)
+  agg_minmax, agg_moment, gx_moment34)             step of 2^21 four-wide) do not end at this n
+testSelectionAtTheLimit (RadixSelectSource,       not run: pn_hist's grid-stride loop (2^18         passed (2.70 s)
+  TopKSource, pn_hist, pn_count,                   threads) does not end at this n
+  pn_scatter; 16 GiB partition output)
+
+Not run at the limit: the decimal sum (dec_sum) and the utf8_view byte total (sv_total) need a column of
+2^32 - 2^19 or more 16-byte values (64 GiB), past this GPU's largest buffer; the radix sort's scatter
+passes (part_scatter, radix_scatter) need two key and two payload buffers of 16 GiB each.
+
+Python: python/tests/test_parquet_4gb_columns.py with ARROWMETAL_BIG_TESTS=1 (pyarrow 25.0.1 writer).
+
+test                                       rows          before                                    after
+Int64, dictionary encoded                  541,065,216   rows 0..1,048,575 differ (overwritten)    passed (6.8 s)
+INT96 timestamps, dictionary encoded       358,962,517   rows 0..1,048,575 differ (overwritten)    passed (5.6 s)
+decimal128(9, 2), PLAIN FIXED_LEN(4)       269,484,032   passed                                    passed (4.8 s)

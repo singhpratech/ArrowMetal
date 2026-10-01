@@ -138,8 +138,8 @@ enum GroupBySource {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             """ : "")
-            uint start = tgid * chunk, end = min(n, start + chunk);
-            for (uint i = start + lid; i < end; i += TG) {
+            uint start = tgid * chunk, len = (start < n) ? min(chunk, n - start) : 0u;
+            for (uint off = lid; off < len; off += TG) { uint i = start + off;
                 if ((flags & 1u) && !bit_get(kvalid, i)) continue;
                 long kk = (long)keys[i];
                 if (kk < 0 || kk >= (long)K) continue;

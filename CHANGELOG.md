@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Kernels over arrays near 2^32 elements: 32-bit loop steps, block ends and byte positions that passed
+  2^32 now stop at the end or are taken in 64 bits. Before, on 2^32 - 1 rows with no error: a group-by
+  count missed the last block's 4,194,303 rows, the group order 2,097,151, the sort's digit histogram
+  33,554,431; `and`, `or`, `xor` and `not` of boolean columns and a filter's block scan did no work (the
+  word count `(n + 31) / 32` was 0); the fused expression reduce counted 0 rows; and the whole-column
+  aggregates (`sum`, `min`, `max`, `product`, `min_max`, `variance`, `skew`, decimal `sum`), the
+  partition's select and the utf8_view byte total ran grid-stride loops that do not end once `n` is
+  within 2^19 of 2^32 (2^21 for the four-wide `sum`, `min` and `max`, 2^18 for the last two). Parquet's fixed-width decode wrote rows over the start of
+  a column whose decoded bytes passed 4 GB (a dictionary-encoded Int64 column of 541,065,216 rows, an
+  INT96 column of 358,962,517). Below those sizes every kernel visits the same elements in the same
+  order, so results are unchanged. Block loops walk by offset and grid-stride loops keep the plain step
+  wherever it cannot wrap: one call per kernel family at 10M and 50M rows, alternated against the build
+  before, has none slower in both best and median time by more than 1%
+  (`Benchmarks/results/index_wrap_2026-10-01.csv`). Tests: `IndexWrapTests` (8, each over 2^32 - 1 rows with
+  `ARROWMETAL_BIG_TESTS=1`, on periodic columns mapped back to back so a 32 GiB column needs 1 GiB of
+  memory) and `test_parquet_4gb_columns.py` (3); `Benchmarks/results/index_wrap_limit_2026-10-01.txt`.
+  docs/FINDINGS.md round 18.
+- C header: the `am_query` grammar comment lists `signbit` and `is_nan` among the unary operators.
+
 - Fused expressions: `(signbit x)` and `(is_nan x)`, boolean, null where `x` is null. `signbit` is true
   for -0.0, negative values, -inf and a NaN with the sign bit set (any payload); on a signed integer it
   is `x < 0`, on an unsigned one false. `is_nan` is Arrow's. With them a float column compared with a

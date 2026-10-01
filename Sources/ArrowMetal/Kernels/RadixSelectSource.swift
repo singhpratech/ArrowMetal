@@ -51,11 +51,13 @@ enum RadixSelectSource {
             uint n = *nPtr;
             uint sb = tgid * RS_SUBS + sgid;
             uint start = sb * eps;
-            uint end = (start >= n) ? start : min(n, start + eps);
+            // Walked by offset inside the sub-block (at most `eps` rows), which never wraps; a row index
+            // stepped by 32 up to an end near 2^32 would.
+            uint len = (start >= n) ? 0u : min(eps, n - start);
             threadgroup atomic_uint* bank = hist + sgid * RS_RADIX;
-            for (uint chunk = start; chunk < end; chunk += RS_SIMD) {
-                uint i = chunk + lane;
-                if (i >= end) continue;
+            for (uint off = 0u; off < len; off += RS_SIMD) {
+                uint o = off + lane, i = start + o;
+                if (o >= len) continue;
                 if (hasValidity && !bit_get(validity, i)) continue;
                 \(K) key = tk_map(vals[i], inv);
                 if (hasPrefix && (key >> prefixShift) != prefix) continue;
@@ -119,11 +121,13 @@ enum RadixSelectSource {
             uint n = *nPtr;
             uint sb = tgid * RS_SUBS + sgid;
             uint start = sb * eps;
-            uint end = (start >= n) ? start : min(n, start + eps);
+            // Walked by offset inside the sub-block (at most `eps` rows), which never wraps; a row index
+            // stepped by 32 up to an end near 2^32 would.
+            uint len = (start >= n) ? 0u : min(eps, n - start);
             uint lt = 0u, eq = 0u;
-            for (uint chunk = start; chunk < end; chunk += RS_SIMD) {
-                uint i = chunk + lane;
-                if (i >= end) continue;
+            for (uint off = 0u; off < len; off += RS_SIMD) {
+                uint o = off + lane, i = start + o;
+                if (o >= len) continue;
                 if (hasValidity && !bit_get(validity, i)) continue;
                 \(K) key = tk_map(vals[i], inv);
                 if (key < loKey) lt++;
@@ -185,13 +189,15 @@ enum RadixSelectSource {
             uint n = *nPtr;
             uint sb = tgid * RS_SUBS + sgid;
             uint start = sb * eps;
-            uint end = (start >= n) ? start : min(n, start + eps);
+            // Walked by offset inside the sub-block (at most `eps` rows), which never wraps; a row index
+            // stepped by 32 up to an end near 2^32 would.
+            uint len = (start >= n) ? 0u : min(eps, n - start);
             uint posLt = offLt[sb], posEq = offEq[sb];
-            for (uint chunk = start; chunk < end; chunk += RS_SIMD) {
-                uint i = chunk + lane;
+            for (uint off = 0u; off < len; off += RS_SIMD) {
+                uint o = off + lane, i = start + o;
                 bool isLt = false, isEq = false;
                 \(K) key = (\(K))0;
-                if (i < end && (!hasValidity || bit_get(validity, i))) {
+                if (o < len && (!hasValidity || bit_get(validity, i))) {
                     key = tk_map(vals[i], inv);
                     isLt = key < loKey;
                     isEq = !isLt && key <= hiKey;

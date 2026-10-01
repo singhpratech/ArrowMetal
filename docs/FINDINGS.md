@@ -2,6 +2,114 @@
 
 Things learned the hard way. Add to this whenever something surprises you.
 
+## Round 18 (2026-10-01): 32-bit loop steps, block ends and byte positions near 2^32
+
+**What.** Round 17 made the grid itself safe up to 2^32 - 1 elements. Inside the kernels, four kinds of
+32-bit arithmetic still reached 2^32 for arrays of at most 2^32 - 1 elements:
+
+- **Grid-stride loops**, `for (i = gid; i < n; i += gridSize)`: once `n > 2^32 - gridSize` a thread's
+  `i + gridSize` wraps to a value below `n` again and the loop never ends. The whole-column aggregates
+  run 2^19 threads (`reduce_*`, whose four-wide loop steps 2^21 and so wraps from 4,292,870,148 elements;
+  `agg_product`, `agg_minmax`, `agg_moment`, `gx_moment34`, `dec_sum`: from 4,294,443,009), the
+  partition's select and the utf8_view byte total 2^18 (`pn_hist`, `sv_total`: from 4,294,705,153).
+- **Block ends**, `end = min(n, start + chunk)`: on the last block `start + chunk` passes 2^32, wraps
+  to a small number, and the block reads nothing. The group-by passes split the rows into at most 1,024
+  or 4,096 blocks (`GroupBySource`, `GroupByExtremaSource`, `GroupSumExactSource`, the atomic group
+  order: from 4,294,966,273 rows with 1,024 blocks, 4,294,963,201 with 4,096), the chunked group order
+  into 2,048 sub-blocks (from 4,294,965,249), the radix sort and the partition into blocks of up to 2^25
+  rows (`radix_histogram`, `part_count`, `part_scatter`, `radix_scatter`, `pn_count`, `pn_scatter`: from
+  4,294,934,529), top-k into at most 2,048 blocks (from 4,294,965,249) and the radix select into
+  sub-blocks of about 2^19 rows (from 4,294,705,153). Inside a block the loops step by 256 or 32 and
+  wrap the same way from 2^32 - 255, as do the per-group loops that walk a segment of the group order up
+  to its end (`gx_seg_*`, `gm_*`, `seg_reduce`, the streaming Float64 group sum).
+- **Word counts**, `(n + 31) / 32`: 0 for `n > 2^32 - 32`, so the bitmap kernels (`bitmap_and`,
+  `bitmap_or`, `bitmap_not`, `bitmap_and_not`, `lx_xor`, the Kleene forms, `st_fill_words`), the
+  filter's block scan and the fused expression reduce (`am_reduce`, `am_scan`) did no work.
+- **Byte positions**, `row * width` in 32 bits: the Parquet fixed-width decode wrote row `r` at byte
+  `r * width mod 2^32`, over the start of the column, once the decoded column passed 4 GB: from 2^29 rows
+  of Int64 or Float64, 357,913,942 of INT96, and 2^28 rows of a decimal widened to 16 bytes. A bit-packed
+  run's bit position, `index * bitWidth`, wraps the same way in a run of more than 512 MiB. The group-by
+  key gather of a decimal column (`gk_limb`) indexed `row * limbs`, which wraps from 2^31 rows of
+  decimal128.
+
+Measured on 2^32 - 1 rows with the build before (`Benchmarks/results/index_wrap_limit_2026-10-01.txt`):
+a group-by count over 1,024 blocks counted 4,290,772,992 rows (the last 4,194,303 went uncounted), the
+chunked group order placed 4,292,870,144, the sort's digit histogram counted 4,261,412,864, `and`, `or`,
+`xor` and `not` of two boolean columns wrote no word, a filter kept 4,096 rows of 2,147,483,648, and the
+fused reduce returned a count of 0, all with no error. A dictionary-encoded Int64 Parquet column of
+541,065,216 rows and an INT96 column of 358,962,517 rows came back with their first rows overwritten.
+The grid-stride loops were not run on that build: a kernel that does not end holds the GPU.
+
+**Fix.** A first version saturated every step at the end, `i = (end - i > step) ? i + step : end` (the
+form the fused group-by got in round 17), and took every block end in 64 bits. Timed against the build
+before, alternating (`Benchmarks/results/index_wrap_forms_2026-10-01.csv`), that cost more than 1% on
+three calls at 10M rows: Int32 `min_max` (best 5.0% and median 6.3% slower), a top-k of 5,000 (3.5% /
+2.5%) and a group-by `min_max` over 1,000 keys (6.7% / 3.1%). The plain loop is the one the compiler can
+unroll. So the shipped forms keep it wherever it cannot wrap:
+
+- **Block loops** walk the block by offset: `len = start < n ? min(chunk, n - start) : 0`, then
+  `for (off = lid; off < len; off += 256)` with the row at `start + off`. A block holds at most 2^25
+  rows in the sort and the partition, and at most half the array in a group-by over more than 4,096 rows,
+  so `off + 256` never wraps, and `start + len` never passes `n`. The same goes for
+  the radix select's sub-blocks, the top-k blocks, the sort's and the partition's chunk loops (a lane is
+  in range when `off + lid < len`) and the group order's.
+- **Grid-stride loops** are two copies of the loop (`AM_GRID_STRIDE`, in the kernel prelude): the plain
+  `i += step` while `n <= 2^32 - 1 - step`, which holds for every array of up to 4,292,870,143
+  elements, and the saturating step past that.
+- **Segment loops** keep the saturating step: one group can hold every row, so a segment can end within
+  256 rows of 2^32.
+
+The word count is `(n >> 5) + ((n & 31) != 0)`. The Parquet byte positions, the bit position inside a
+run and the limb index are 64-bit. The four-wide aggregate loop's scalar tail (at most 3 elements, on a
+grid of at least 256 threads) is one `if` per thread. Below the wrap every kernel visits the same
+elements in the same order, so the results are bit-identical.
+
+**Testing at the limit.** A column of 2^32 - 1 Float64 values is 32 GiB. `IndexWrapTests` maps one
+1 GiB region back to back (`mach_vm_remap`) and wraps the whole range in one Metal buffer
+(`makeBuffer(bytesNoCopy:)`): a periodic column of any length up to the GPU's largest buffer (38.88 GiB
+on this machine) for 1 GiB of memory, with a host reference of whole periods plus a remainder. With
+`ARROWMETAL_BIG_TESTS=1` each family runs once over 2^32 - 1 rows, and all pass; the largest real
+allocation is a 16 GiB Int32 output (the group order, the partition). `test_parquet_4gb_columns.py`
+reads the two Parquet columns above and a 4 GB decimal column against the values written. Not run at the
+limit: the decimal sum and the utf8_view byte total (a column of 16-byte values that long is 64 GiB, past
+this GPU's largest buffer), the radix sort's scatter passes (four 16 GiB buffers), the decimal key gather
+(2^31 decimal128 rows) and the Parquet bit position (a bit-packed run of more than 512 MiB).
+
+**Cost.** The build before and this one alternated in one process: per call an untimed warm-up of at
+least 100 ms, the first call after a 500 ms idle on its own, then 8 rounds of up to 30 calls each
+(`Benchmarks/index_wrap_bench.py`, `Benchmarks/results/index_wrap_2026-10-01.csv`). One call per kernel
+family touched, at 10M and 50M rows. The rows where both best and median came out more than 1% slower
+were timed again alone, 20 rounds of 100 calls (marked *); none stays slower on both:
+
+| Call (kernel family) | 10M best (ms) | 10M median (ms) | 50M best (ms) | 50M median (ms) |
+|---|---|---|---|---|
+| sum int32 (reduce) | 0.180 → 0.189 | 0.272 → 0.267 | 0.680 → 0.668 | 0.917 → 0.893 |
+| and boolean (bitmap words) | 0.074 → 0.074* | 0.099 → 0.099* | 0.127 → 0.132 | 0.173 → 0.166 |
+| min_max int32 (agg) | 1.234 → 1.237 | 1.294 → 1.331 | 1.870 → 1.802 | 2.445 → 2.092 |
+| variance float64 (agg) | 1.597 → 1.590 | 2.010 → 2.065 | 5.256 → 5.282 | 5.395 → 5.401 |
+| skew float32 (moments) | 1.650 → 1.780 | 2.447 → 2.426 | 2.206 → 2.165 | 2.389 → 2.406 |
+| sum decimal128 | 0.879 → 0.914 | 1.123 → 1.108 | 1.731 → 1.717 | 1.821 → 1.798 |
+| expr sum int32 (fused reduce) | 0.184 → 0.200 | 0.278 → 0.235 | 0.662 → 0.671 | 0.911 → 0.885 |
+| group_by 64 keys sum int32 (atomic) | 0.765 → 0.828 | 0.996 → 0.988 | 1.370 → 1.368 | 1.482 → 1.470 |
+| group_by 1000 keys min_max int32 (extrema) | 1.102 → 1.997* | 2.335 → 2.341* | 3.608 → 3.637 | 4.864 → 4.264 |
+| group_by 1000 keys sum float64 (exact) | 2.046 → 2.091* | 2.888 → 2.880* | 5.521 → 5.532 | 5.671 → 5.667 |
+| group_by 1000 keys variance int64 (group order, moments) | 6.927 → 6.941 | 7.101 → 7.146 | 34.844 → 34.899 | 35.195 → 35.149 |
+| group_by 1000 keys product int64 (segmented) | 1.265 → 1.228 | 1.326 → 1.330 | 7.492 → 7.479 | 7.567 → 7.569 |
+| group_by 1000 keys mean float32 (segmented reduce) | 1.230 → 1.201 | 1.771 → 1.937 | 6.704 → 6.689 | 6.835 → 6.846 |
+| group_by decimal keys count (limb gather) | 6.401 → 7.562 | 11.381 → 11.184 | 17.784 → 17.703 | 18.114 → 18.095 |
+| argsort int32 (radix) | 2.977 → 2.962 | 3.058 → 3.069 | 14.380 → 14.381 | 15.187 → 15.187 |
+| argsort int32 with nulls (partition) | 3.391 → 3.320 | 3.543 → 3.527 | 16.769 → 17.129 | 17.929 → 17.925 |
+| partition_nth_indices int32 | 3.178 → 3.164* | 3.523 → 3.584* | 5.361 → 5.360 | 5.764 → 5.757 |
+| top_k 10 float64 | 3.185 → 2.996 | 3.690 → 3.606 | 4.332 → 4.324 | 4.804 → 4.817 |
+| top_k 5000 float64 | 3.832 → 3.847 | 4.652 → 4.509 | 4.787 → 4.841 | 6.542 → 6.317 |
+| utf8_view import (byte total) | 3.376 → 3.309 | 3.669 → 3.682 | 16.254 → 16.162 | 17.646 → 17.604 |
+| stream group_by 1M keys sum float64 | 71.448 → 72.618 | 74.536 → 75.216 | 472.742 → 475.619 | 480.280 → 483.785 |
+| read_parquet int64 dictionary | 1.254 → 1.248* | 1.728 → 1.711* | 4.938 → 4.940 | 5.178 → 5.180 |
+| read_parquet int64 plain | 1.628 → 1.651 | 1.795 → 1.803 | 6.452 → 6.334 | 7.298 → 7.231 |
+
+A best and a median can move apart by several percent on calls of 1-2 ms from one run to the next (the
+group-by `min_max` before's best of 1.102 ms against medians of 2.335 and 2.341 ms); a loss shows in both.
+
 ## Round 17 (2026-10-01): the 2^32-thread wrap on row-wise kernels, and a totalOrder argsort re-timed
 
 **What.** Round 13 folded the per-group grids; the row-wise ones were still `(groups, 1, 1)`. A kernel

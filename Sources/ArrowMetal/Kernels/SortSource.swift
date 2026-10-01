@@ -43,9 +43,9 @@ enum SortSource {
             atomic_store_explicit(&andHi, 0xFFFFFFFFu, memory_order_relaxed);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        uint n = *nPtr, start = tgid * elemsPerBlock, end = min(n, start + elemsPerBlock);
+        uint n = *nPtr, start = tgid * elemsPerBlock, len = (start < n) ? min(elemsPerBlock, n - start) : 0u;
         \(K) o = 0, a = ~(\(K))0;
-        for (uint i = start + lid; i < end; i += TG) {
+        for (uint off = lid; off < len; off += TG) { uint i = start + off;
             \(K) k = keys[i];
             o |= k; a &= k;
             atomic_fetch_add_explicit(&hist[(uint)((k >> shift) & DIGIT_MASK)], 1u, memory_order_relaxed);
@@ -239,9 +239,9 @@ enum SortSource {
                            uint lid [[thread_index_in_threadgroup]], uint tgid [[threadgroup_position_in_grid]],
                            uint sgid [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
         threadgroup uint tot[PART_SLOTS * SIMDS];
-        uint n = *nPtr, start = tgid * elemsPerBlock, end = min(n, start + elemsPerBlock);
+        uint n = *nPtr, start = tgid * elemsPerBlock, len = (start < n) ? min(elemsPerBlock, n - start) : 0u;
         uint c0 = 0u, c1 = 0u, c2 = 0u;
-        for (uint i = start + lid; i < end; i += TG) {
+        for (uint off = lid; off < len; off += TG) { uint i = start + off;
             uint s = PART_SLOT_OF(i);
             c0 += s == 0u; c1 += s == 1u; c2 += s == 2u;
         }
@@ -295,10 +295,10 @@ enum SortSource {
         for (uint j = lid; j < PART_SLOTS * SIMDS; j += TG) simdCount[j] = 0u;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         uint valueBase = offsets[valueSlot * blocks];      // where the value bucket starts in the output
-        uint n = *nPtr, start = tgid * elemsPerBlock, end = min(n, start + elemsPerBlock);
-        for (uint chunk = start; chunk < end; chunk += TG) {
-            uint i = chunk + lid;
-            bool active = i < end;
+        uint n = *nPtr, start = tgid * elemsPerBlock, len = (start < n) ? min(elemsPerBlock, n - start) : 0u;
+        for (uint off = 0u; off < len; off += TG) {
+            uint chunk = start + off, i = chunk + lid;
+            bool active = off + lid < len;
             \(K) key = active ? keys[i] : (\(K))0;
             uint s = active ? PART_SLOT_OF(i) : 0u;
             uint b0 = (uint)((simd_vote::vote_t)simd_ballot(active && s == 0u));
@@ -344,10 +344,10 @@ enum SortSource {
         for (uint d = lid; d < RADIX; d += TG) base[d] = offsets[d * blocks + tgid];
         for (uint j = lid; j < SIMDS * RADIX; j += TG) peerCount[j] = 0;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        uint n = *nPtr, start = tgid * elemsPerBlock, end = min(n, start + elemsPerBlock);
-        for (uint chunk = start; chunk < end; chunk += TG) {
-            uint i = chunk + lid;
-            bool active = i < end;
+        uint n = *nPtr, start = tgid * elemsPerBlock, len = (start < n) ? min(elemsPerBlock, n - start) : 0u, end = start + len;
+        for (uint off = 0u; off < len; off += TG) {
+            uint chunk = start + off, i = chunk + lid;
+            bool active = off + lid < len;
             \(K) key = active ? keys[i] : (\(K))0;
             \(payload ? "uint val = active ? vals[i] : 0u;" : "")
             uint d = (uint)((key >> shift) & DIGIT_MASK);

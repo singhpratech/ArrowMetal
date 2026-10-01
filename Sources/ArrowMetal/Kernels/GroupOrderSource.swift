@@ -63,8 +63,8 @@ enum GroupOrderSource {
                             device atomic_uint* total [[buffer(6)]],
                             uint lid [[thread_index_in_threadgroup]],
                             uint tgid [[threadgroup_position_in_grid]]) {
-        uint start = tgid * chunk, end = min(n, start + chunk);
-        for (uint i = start + lid; i < end; i += TG) {
+        uint start = tgid * chunk, len = (start < n) ? min(chunk, n - start) : 0u;
+        for (uint off = lid; off < len; off += TG) { uint i = start + off;
             uint k = cs_key(keys, kvalid, flags, K, i);
             if (k == NOKEY) continue;
             atomic_fetch_add_explicit(&total[k], 1u, memory_order_relaxed);
@@ -86,8 +86,8 @@ enum GroupOrderSource {
                                uint lane [[thread_index_in_simdgroup]]) {
         uint lb = tgid * SUBBLOCKS + sgid;
         uint base = lb * K;
-        uint start = lb * chunk, end = min(n, start + chunk);
-        for (uint i = start + lane; i < end; i += 32u) {
+        uint start = lb * chunk, len = (start < n) ? min(chunk, n - start) : 0u;
+        for (uint off = lane; off < len; off += 32u) { uint i = start + off;
             uint k = cs_key(keys, kvalid, flags, K, i);
             if (k == NOKEY) continue;
             atomic_fetch_add_explicit(&hist[base + k], 1u, memory_order_relaxed);
@@ -159,10 +159,10 @@ enum GroupOrderSource {
         threadgroup uint skey[TG];
         uint lb = tgid * SUBBLOCKS + sgid;
         uint base = lb * K, off = sgid * 32u;
-        uint start = lb * chunk, end = min(n, start + chunk);
-        for (uint c = start; c < end; c += 32u) {
-            uint i = c + lane;
-            uint k = (i < end) ? cs_key(keys, kvalid, flags, K, i) : NOKEY;
+        uint start = lb * chunk, len = (start < n) ? min(chunk, n - start) : 0u;
+        for (uint o = 0u; o < len; o += 32u) {
+            uint i = start + o + lane;
+            uint k = (o + lane < len) ? cs_key(keys, kvalid, flags, K, i) : NOKEY;
             skey[off + lane] = k;
             simdgroup_barrier(mem_flags::mem_threadgroup);
             uint pos = 0u;
@@ -199,8 +199,8 @@ enum GroupOrderSource {
                                   device int* ord [[buffer(7)]],
                                   uint lid [[thread_index_in_threadgroup]],
                                   uint tgid [[threadgroup_position_in_grid]]) {
-        uint start = tgid * chunk, end = min(n, start + chunk);
-        for (uint i = start + lid; i < end; i += TG) {
+        uint start = tgid * chunk, len = (start < n) ? min(chunk, n - start) : 0u;
+        for (uint off = lid; off < len; off += TG) { uint i = start + off;
             uint k = cs_key(keys, kvalid, flags, K, i);
             if (k == NOKEY) continue;
             uint pos = atomic_fetch_add_explicit(&cursor[k], 1u, memory_order_relaxed);

@@ -390,7 +390,7 @@ extension ExprCompiler {
 
             """
             src += shared
-            src += "    uint n = *nPtr;\n    uint words = (n + 31u) / 32u;\n"
+            src += "    uint n = *nPtr;\n    uint words = (n >> 5) + (uint)((n & 31u) != 0u);\n"
             src += decls
             src += declareOutputs(slots, indent: "    ")
             src += "    for (uint w = gid; w < words; w += gridSize) {\n"

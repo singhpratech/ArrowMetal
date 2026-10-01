@@ -89,7 +89,7 @@ enum GroupMomentsSource {
             if (k >= K) return;
             uint s = segStart[k], e = segEnd[k];
             ulong acc = 0ul; uint cnt = 0u;
-            for (uint t = s + lid; t < e; t += TG) {
+            for (uint t = s + lid; t < e; t = (e - t > TG) ? t + TG : e) {
                 uint i = (uint)ord[t];
                 if (hasValidity != 0u && !bit_get(validity, i)) continue;
                 acc = d_add(acc, \(load)); cnt++;
@@ -142,7 +142,7 @@ enum GroupMomentsSource {
             uint s = segStart[k], e = segEnd[k];
             ulong mean = means[k];
             ulong a1 = 0ul, a2 = 0ul;
-            for (uint t = s + lid; t < e; t += TG) {
+            for (uint t = s + lid; t < e; t = (e - t > TG) ? t + TG : e) {
                 uint i = (uint)ord[t];
                 if (hasValidity != 0u && !bit_get(validity, i)) continue;
                 ulong dv = d_sub(\(load), mean);
@@ -189,7 +189,7 @@ enum GroupMomentsSource {
             uint s = segStart[k], e = segEnd[k];
             ulong mean = means[k];
             ulong a2 = 0ul, a3 = 0ul, a4 = 0ul;
-            for (uint t = s + lid; t < e; t += TG) {
+            for (uint t = s + lid; t < e; t = (e - t > TG) ? t + TG : e) {
                 uint i = (uint)ord[t];
                 if (hasValidity != 0u && !bit_get(validity, i)) continue;
                 ulong dv = d_sub(\(load), mean);

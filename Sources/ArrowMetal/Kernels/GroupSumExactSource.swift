@@ -303,8 +303,8 @@ enum GroupSumExactSource {
             return """
 
             kernel void gs_a_dev(\(args(KT: KT))) {
-                uint start = tgid * chunk, end = min(n, start + chunk);
-                for (uint i = start + lid; i < end; i += TG) {
+                uint start = tgid * chunk, len = (start < n) ? min(chunk, n - start) : 0u;
+                for (uint off = lid; off < len; off += TG) { uint i = start + off;
             \(rowPrologue)
                     device atomic_uint* g = st + (ulong)k * GS_W;
                     atomic_fetch_add_explicit(&g[1], 1u, memory_order_relaxed);
@@ -327,8 +327,8 @@ enum GroupSumExactSource {
                 atomic_store_explicit(&tF[k], 0u, memory_order_relaxed);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            uint start = tgid * chunk, end = min(n, start + chunk);
-            for (uint i = start + lid; i < end; i += TG) {
+            uint start = tgid * chunk, len = (start < n) ? min(chunk, n - start) : 0u;
+            for (uint off = lid; off < len; off += TG) { uint i = start + off;
         \(rowPrologue)
                 atomic_fetch_add_explicit(&tC[k], 1u, memory_order_relaxed);
         \(specials("&tF[k]"))
@@ -361,8 +361,8 @@ enum GroupSumExactSource {
             return """
 
             kernel void gs_b_dev(\(args(KT: KT))) {
-                uint start = tgid * chunk, end = min(n, start + chunk);
-                for (uint i = start + lid; i < end; i += TG) {
+                uint start = tgid * chunk, len = (start < n) ? min(chunk, n - start) : 0u;
+                for (uint off = lid; off < len; off += TG) { uint i = start + off;
             \(rowPrologue)
             \(body)
                     device atomic_uint* g = st + (ulong)k * GS_W;
@@ -392,8 +392,8 @@ enum GroupSumExactSource {
                 tU[k] = special ? 0u : gs_window(atomic_load_explicit(&g[0], memory_order_relaxed), G);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            uint start = tgid * chunk, end = min(n, start + chunk);
-            for (uint i = start + lid; i < end; i += TG) {
+            uint start = tgid * chunk, len = (start < n) ? min(chunk, n - start) : 0u;
+            for (uint off = lid; off < len; off += TG) { uint i = start + off;
         \(rowPrologue)
         \(body)
                 uint U = tU[k];

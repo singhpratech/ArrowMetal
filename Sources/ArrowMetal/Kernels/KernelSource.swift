@@ -6,6 +6,14 @@ enum KernelSource {
     #include <metal_stdlib>
     using namespace metal;
     #define TG 256u
+    // A grid-stride loop `for (uint i = start; i < n; i += step)` that ends for every n up to 2^32 - 1.
+    // Past n = 2^32 - 1 - step, `i + step` can wrap to a value below n again and the loop would never end;
+    // there the step stops at n. Below that the plain loop runs, which the compiler can unroll: a single
+    // saturating loop for every n measured 5.0% (best) and 6.3% (median) slower on a 10M-row Int32
+    // `min_max`. The body is the variadic tail, so it may hold commas.
+    #define AM_GRID_STRIDE(i, start, n, step, ...) \
+        if ((n) <= 0xFFFFFFFFu - (step)) { for (uint i = (start); i < (n); i += (step)) { __VA_ARGS__ } } \
+        else { for (uint i = (start); i < (n); i = ((n) - i > (step)) ? i + (step) : (n)) { __VA_ARGS__ } }
     inline bool bit_get(device const uchar* bm, uint i) { return (bm[i >> 3] >> (i & 7)) & 1; }
     // IEEE-754 double handled as raw 64-bit patterns (Metal has no double type).
     inline bool d_isnan(long b) { return (b & 0x7FFFFFFFFFFFFFFFL) > 0x7FF0000000000000L; }
@@ -39,9 +47,9 @@ enum KernelSource {
             \(ACC) acc = \(initVal);
             uint cnt = 0;
             // Bulk: 4 consecutive elements per iteration through a vector load (the 4 validity bits sit in one byte).
-            uint n4 = n & ~3u;
+            uint n4 = n & ~3u, step4 = gridSize * 4u;
             if (hasValidity) {
-                for (uint i = gid * 4u; i < n4; i += gridSize * 4u) {
+                AM_GRID_STRIDE(i, gid * 4u, n4, step4,
                     uint vb = (validity[i >> 3] >> (i & 7u)) & 0xFu;
                     if (vb == 0u) continue;
                     \(T)4 x = *(device const \(T)4*)(vals + i);
@@ -49,19 +57,20 @@ enum KernelSource {
                     if (vb & 2u) { \(ACC) v = \(loadExpr.replacingOccurrences(of: "vals[i]", with: "x.y")); if (\(extra.replacingOccurrences(of: "vals[i]", with: "x.y"))) { acc = \(combine); cnt++; } }
                     if (vb & 4u) { \(ACC) v = \(loadExpr.replacingOccurrences(of: "vals[i]", with: "x.z")); if (\(extra.replacingOccurrences(of: "vals[i]", with: "x.z"))) { acc = \(combine); cnt++; } }
                     if (vb & 8u) { \(ACC) v = \(loadExpr.replacingOccurrences(of: "vals[i]", with: "x.w")); if (\(extra.replacingOccurrences(of: "vals[i]", with: "x.w"))) { acc = \(combine); cnt++; } }
-                }
-                for (uint i = n4 + gid; i < n; i += gridSize) {
+                )
+                if (gid < n - n4) {             // the tail: at most 3 elements, one per thread
+                    uint i = n4 + gid;
                     if (bit_get(validity, i) && (\(extra))) { \(ACC) v = \(loadExpr); acc = \(combine); cnt++; }
                 }
             } else {
-                for (uint i = gid * 4u; i < n4; i += gridSize * 4u) {
+                AM_GRID_STRIDE(i, gid * 4u, n4, step4,
                     \(T)4 x = *(device const \(T)4*)(vals + i);
                     { \(ACC) v = \(loadExpr.replacingOccurrences(of: "vals[i]", with: "x.x")); if (\(extra.replacingOccurrences(of: "vals[i]", with: "x.x"))) { acc = \(combine); cnt++; } }
                     { \(ACC) v = \(loadExpr.replacingOccurrences(of: "vals[i]", with: "x.y")); if (\(extra.replacingOccurrences(of: "vals[i]", with: "x.y"))) { acc = \(combine); cnt++; } }
                     { \(ACC) v = \(loadExpr.replacingOccurrences(of: "vals[i]", with: "x.z")); if (\(extra.replacingOccurrences(of: "vals[i]", with: "x.z"))) { acc = \(combine); cnt++; } }
                     { \(ACC) v = \(loadExpr.replacingOccurrences(of: "vals[i]", with: "x.w")); if (\(extra.replacingOccurrences(of: "vals[i]", with: "x.w"))) { acc = \(combine); cnt++; } }
-                }
-                for (uint i = n4 + gid; i < n; i += gridSize) { if (\(extra)) { \(ACC) v = \(loadExpr); acc = \(combine); cnt++; } }
+                )
+                if (gid < n - n4) { uint i = n4 + gid; if (\(extra)) { \(ACC) v = \(loadExpr); acc = \(combine); cnt++; } }
             }
             shared[lid] = acc; scount[lid] = cnt;
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -318,22 +327,22 @@ enum KernelSource {
     kernel void bitmap_and(device const uint* a [[buffer(0)]], device const uint* b [[buffer(1)]],
                            device const uint* nPtr [[buffer(2)]], device uint* out [[buffer(3)]],
                            uint w [[thread_position_in_grid]]) {
-        if (w < (*nPtr + 31u) / 32u) out[w] = a[w] & b[w];
+        if (w < ((*nPtr >> 5) + (uint)((*nPtr & 31u) != 0u))) out[w] = a[w] & b[w];
     }
     kernel void bitmap_and_not(device const uint* a [[buffer(0)]], device const uint* b [[buffer(1)]],
                                device const uint* nPtr [[buffer(2)]], device uint* out [[buffer(3)]],
                                uint w [[thread_position_in_grid]]) {
-        if (w < (*nPtr + 31u) / 32u) out[w] = a[w] & ~b[w];
+        if (w < ((*nPtr >> 5) + (uint)((*nPtr & 31u) != 0u))) out[w] = a[w] & ~b[w];
     }
     kernel void bitmap_or(device const uint* a [[buffer(0)]], device const uint* b [[buffer(1)]],
                           device const uint* nPtr [[buffer(2)]], device uint* out [[buffer(3)]],
                           uint w [[thread_position_in_grid]]) {
-        if (w < (*nPtr + 31u) / 32u) out[w] = a[w] | b[w];
+        if (w < ((*nPtr >> 5) + (uint)((*nPtr & 31u) != 0u))) out[w] = a[w] | b[w];
     }
     kernel void bitmap_not(device const uint* a [[buffer(0)]],
                            device const uint* nPtr [[buffer(2)]], device uint* out [[buffer(3)]],
                            uint w [[thread_position_in_grid]]) {
-        if (w < (*nPtr + 31u) / 32u) out[w] = ~a[w];
+        if (w < ((*nPtr >> 5) + (uint)((*nPtr & 31u) != 0u))) out[w] = ~a[w];
     }
     // Unpacks a bitmap into one byte per element. One thread per element.
     kernel void unpack_bits(device const uchar* bits [[buffer(0)]], device const uint* nPtr [[buffer(1)]],
@@ -394,7 +403,7 @@ enum KernelSource {
                             uint sgid [[simdgroup_index_in_threadgroup]],
                             uint lane [[thread_index_in_simdgroup]]) {
         threadgroup uint simdTotals[32];
-        uint blocks = max(1u, ((*nPtr + 31u) / 32u + TG - 1u) / TG);
+        uint blocks = max(1u, (((*nPtr >> 5) + (uint)((*nPtr & 31u) != 0u)) + TG - 1u) / TG);
         uint per = (blocks + TG - 1) / TG;
         uint lo = lid * per, hi = min(blocks, lo + per);
         uint local = 0;

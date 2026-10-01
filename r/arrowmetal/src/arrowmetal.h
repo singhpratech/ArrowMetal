@@ -1193,7 +1193,7 @@ int64_t am_spin_microseconds(int64_t microseconds);   // pass a negative value t
 //            | "(str_eq"|"starts_with"|"contains" expr "\"pattern\"" ")"
 //   BINOP   := add sub mul div | eq ne lt le gt ge | and or and_kleene or_kleene
 //            | bit_and bit_or bit_xor shl shr
-//   UNOP    := negate abs sqrt exp ln round not bit_not
+//   UNOP    := negate abs sqrt exp ln round not bit_not signbit is_nan
 //   TYPE    := i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool str
 //
 // Example: sum(amount) where region == 2 and amount > 100

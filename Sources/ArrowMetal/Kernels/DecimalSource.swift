@@ -171,12 +171,12 @@ enum DecimalSource {
             uint n = *nPtr;
             dec_t acc = \(initVal);
             uint cnt = 0u;
-            for (uint i = gid; i < n; i += gridSize) {
+            AM_GRID_STRIDE(i, gid, n, gridSize,
                 if (hasValidity != 0u && !bit_get(validity, i)) continue;
                 dec_t v = dec_load(vals, i);
                 acc = \(combine);
                 cnt++;
-            }
+            )
             for (int k = 0; k < DL; k++) sdata[lid * DL + k] = acc.w[k];
             scount[lid] = cnt;
             threadgroup_barrier(mem_flags::mem_threadgroup);

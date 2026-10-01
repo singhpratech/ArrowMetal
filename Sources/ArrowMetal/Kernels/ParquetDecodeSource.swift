@@ -93,9 +93,9 @@ enum ParquetDecodeSource {
     // Value `idx` of an LSB-first bit-packed run of `bw`-bit fields starting at byte `base`.
     inline uint pq_bp_get(device const uchar* p, uint base, uint idx, uint bw) {
         if (bw == 0u) return 0u;
-        uint bit = idx * bw;
-        uint at = base + (bit >> 3);
-        uint sh = bit & 7u;
+        ulong bit = (ulong)idx * (ulong)bw;   // a run of more than 2^32 bits (512 MiB) in one page
+        uint at = base + (uint)(bit >> 3);
+        uint sh = (uint)(bit & 7ul);
         uint nb = (sh + bw + 7u) >> 3;      // at most 5 for bw <= 32
         ulong v = 0ul;
         for (uint k = 0u; k < nb; k++) v |= ((ulong)p[at + k]) << (8u * k);
@@ -233,7 +233,7 @@ enum ParquetDecodeSource {
                         kind = 1u;
                         total = (header >> 1) * 8u;
                         val = pos;
-                        pos += (total * bw + 7u) >> 3;
+                        pos += (uint)(((ulong)total * bw + 7ul) >> 3);
                     } else {
                         kind = 0u;
                         total = header >> 1;
@@ -333,7 +333,7 @@ enum ParquetDecodeSource {
                     uint kind, total, val;
                     if ((header & 1u) != 0u) {
                         kind = 1u; total = (header >> 1) * 8u; val = pos;
-                        pos += (total * bw + 7u) >> 3;
+                        pos += (uint)(((ulong)total * bw + 7ul) >> 3);
                     } else {
                         kind = 0u; total = header >> 1;
                         uint nb = (bw + 7u) >> 3;
@@ -476,7 +476,8 @@ enum ParquetDecodeSource {
         if (tgid >= nPages) return;
         PageInfo pg = pages[tgid];
         uint n = pg.nonNullCount * width;
-        uint src = pg.valuesOffset, dst = pg.nonNullOffset * width;
+        uint src = pg.valuesOffset;
+        ulong dst = (ulong)pg.nonNullOffset * width;     // a byte position in the column: past 4 GB at 2^32 / width values
         for (uint i = tid; i < n; i += PQ_TG) out[dst + i] = data[src + i];
     }
 
@@ -506,7 +507,7 @@ enum ParquetDecodeSource {
         PageInfo pg = pages[tgid];
         uint n = pg.nonNullCount;
         for (uint j = tid; j < n; j += PQ_TG) {
-            uint dst = (pg.nonNullOffset + j) * width;
+            ulong dst = (ulong)(pg.nonNullOffset + j) * width;
             for (uint k = 0u; k < width; k++) out[dst + k] = data[pg.valuesOffset + k * n + j];
         }
     }
@@ -526,8 +527,8 @@ enum ParquetDecodeSource {
         for (uint j = tid; j < pg.nonNullCount; j += PQ_TG) {
             uint v = pg.nonNullOffset + j;
             uint c = codes[v];
-            uint src = (c < dictCount ? c : 0u) * width;
-            uint dst = v * width;
+            ulong src = (ulong)(c < dictCount ? c : 0u) * width;
+            ulong dst = (ulong)v * width;
             for (uint k = 0u; k < width; k++) out[dst + k] = dict[src + k];
         }
     }
@@ -549,8 +550,8 @@ enum ParquetDecodeSource {
         for (uint j = tid; j < pg.numValues; j += PQ_TG) {
             uint gi = pg.levelOffset + j;
             if ((uint)defLevels[gi] != maxDef) continue;
-            uint src = (pg.nonNullOffset + ranks[gi]) * width;
-            uint dst = gi * width;
+            ulong src = (ulong)(pg.nonNullOffset + ranks[gi]) * width;
+            ulong dst = (ulong)gi * width;
             for (uint k = 0u; k < width; k++) out[dst + k] = dense[src + k];
         }
     }
@@ -750,7 +751,7 @@ enum ParquetDecodeSource {
     kernel void pq_int96_to_ns(device const uchar* in [[buffer(0)]], device long* out [[buffer(1)]],
                                constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
         if (i >= n) return;
-        uint at = i * 12u;
+        ulong at = (ulong)i * 12u;
         ulong nanos = 0ul;
         for (uint k = 0u; k < 8u; k++) nanos |= ((ulong)in[at + k]) << (8u * k);
         uint julian = (uint)in[at + 8] | ((uint)in[at + 9] << 8) | ((uint)in[at + 10] << 16) | ((uint)in[at + 11] << 24);
@@ -764,7 +765,7 @@ enum ParquetDecodeSource {
                                       constant uint& n [[buffer(2)]], constant uint& width [[buffer(3)]],
                                       uint i [[thread_position_in_grid]]) {
         if (i >= n) return;
-        uint src = i * width, dst = i * 16u;
+        ulong src = (ulong)i * width, dst = (ulong)i * 16u;
         uchar fill = (width > 0u && (in[src] & 0x80u) != 0u) ? 0xFFu : 0x00u;
         for (uint k = 0u; k < 16u; k++) {
             out[dst + k] = (k < width) ? in[src + width - 1u - k] : fill;
@@ -775,7 +776,7 @@ enum ParquetDecodeSource {
                                      constant uint& n [[buffer(2)]], constant uint& width [[buffer(3)]],
                                      uint i [[thread_position_in_grid]]) {
         if (i >= n) return;
-        uint src = i * width, dst = i * 16u;
+        ulong src = (ulong)i * width, dst = (ulong)i * 16u;
         uchar fill = (in[src + width - 1u] & 0x80u) != 0u ? 0xFFu : 0x00u;
         for (uint k = 0u; k < 16u; k++) out[dst + k] = (k < width) ? in[src + k] : fill;
     }
@@ -833,7 +834,7 @@ enum ParquetDecodeSource {
             sPos = pos;
             sEmitted = 0u;
             if (sTotal > 0u) {
-                uint d = pg.nonNullOffset * width;
+                ulong d = (ulong)pg.nonNullOffset * width;
                 long v = sRunning;
                 for (uint k = 0u; k < width; k++) out[d + k] = (uchar)((v >> (8u * k)) & 0xFFL);
                 sEmitted = 1u;
@@ -856,7 +857,7 @@ enum ParquetDecodeSource {
                         sMiniOff[nMini] = pos;
                         sBlockOfMini[nMini] = blocks;
                         nMini++;
-                        pos += (sMiniValues * bw + 7u) >> 3;
+                        pos += (uint)(((ulong)sMiniValues * bw + 7ul) >> 3);
                         values += sMiniValues;
                     }
                     blocks++;
@@ -888,7 +889,7 @@ enum ParquetDecodeSource {
             long running = sRunning;
             for (uint i = lo; i < hi; i++) {
                 long v = running + before + deltas[i];
-                uint d = (pg.nonNullOffset + emitted + i) * width;
+                ulong d = (ulong)(pg.nonNullOffset + emitted + i) * width;
                 for (uint k = 0u; k < width; k++) out[d + k] = (uchar)((v >> (8u * k)) & 0xFFL);
             }
             long grand = sums[PQ_TG - 1u];

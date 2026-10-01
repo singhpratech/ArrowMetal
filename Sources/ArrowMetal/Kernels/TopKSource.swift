@@ -123,8 +123,9 @@ enum TopKSource {
 
             uint n = *nPtr;
             uint start = tgid * elemsPerBlock;
-            uint end = min(n, start + elemsPerBlock);
-            for (uint base = start; base < end; base += TG) {
+            uint blockLen = (start < n) ? min(elemsPerBlock, n - start) : 0u;
+            for (uint off = 0u; off < blockLen; off += TG) {
+                uint base = start + off;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (lid == 0u) shared_c = min(atomic_load_explicit(&held, memory_order_relaxed), cap);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -141,7 +142,7 @@ enum TopKSource {
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
                 uint i = base + lid;
-                if (i < end && (!hasValidity || bit_get(validity, i))) {
+                if (off + lid < blockLen && (!hasValidity || bit_get(validity, i))) {
                     \(K) key = tk_map(vals[i], inv);
                     if (tk_less(key, i, thrKey, thrRow)) {
                         uint slot = atomic_fetch_add_explicit(&held, 1u, memory_order_relaxed);

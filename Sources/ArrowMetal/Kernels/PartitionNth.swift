@@ -106,7 +106,7 @@ enum PartitionNthSource {
         for (uint d = lid; d < 256u; d += TG) atomic_store_explicit(&hist[d], 0u, memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         uint n = *nPtr;
-        for (uint i = gid; i < n; i += gridSize) {
+        AM_GRID_STRIDE(i, gid, n, gridSize,
             if (hasValidity && !bit_get(validity, i)) continue;
             \(K) key = keys[i];
             if (hasNaN && key == nanKey) continue;
@@ -114,7 +114,7 @@ enum PartitionNthSource {
                 uint d = (uint)((key >> shift) & (\(K))0xFF);
                 atomic_fetch_add_explicit(&hist[d], 1u, memory_order_relaxed);
             }
-        }
+        )
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint d = lid; d < 256u; d += TG) {
             uint c = atomic_load_explicit(&hist[d], memory_order_relaxed);
@@ -134,9 +134,9 @@ enum PartitionNthSource {
                          uint lid [[thread_index_in_threadgroup]], uint tgid [[threadgroup_position_in_grid]],
                          uint sgid [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
         threadgroup uint tot[PN_SLOTS * SIMDS];
-        uint n = *nPtr, start = tgid * elemsPerBlock, end = min(n, start + elemsPerBlock);
+        uint n = *nPtr, start = tgid * elemsPerBlock, len = (start < n) ? min(elemsPerBlock, n - start) : 0u;
         uint c0 = 0u, c1 = 0u, c2 = 0u, c3 = 0u, c4 = 0u;
-        for (uint i = start + lid; i < end; i += TG) {
+        for (uint off = lid; off < len; off += TG) { uint i = start + off;
             uint s = PN_SLOT_OF(i);
             c0 += s == 0u; c1 += s == 1u; c2 += s == 2u; c3 += s == 3u; c4 += s == 4u;
         }
@@ -180,10 +180,10 @@ enum PartitionNthSource {
         if (lid < PN_SLOTS) base[lid] = offsets[lid * blocks + tgid];
         for (uint j = lid; j < PN_SLOTS * SIMDS; j += TG) simdCount[j] = 0u;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        uint n = *nPtr, start = tgid * elemsPerBlock, end = min(n, start + elemsPerBlock);
-        for (uint chunk = start; chunk < end; chunk += TG) {
-            uint i = chunk + lid;
-            bool active = i < end;
+        uint n = *nPtr, start = tgid * elemsPerBlock, len = (start < n) ? min(elemsPerBlock, n - start) : 0u;
+        for (uint off = 0u; off < len; off += TG) {
+            uint chunk = start + off, i = chunk + lid;
+            bool active = off + lid < len;
             uint s = active ? PN_SLOT_OF(i) : 0u;
             uint b0 = (uint)((simd_vote::vote_t)simd_ballot(active && s == 0u));
             uint b1 = (uint)((simd_vote::vote_t)simd_ballot(active && s == 1u));

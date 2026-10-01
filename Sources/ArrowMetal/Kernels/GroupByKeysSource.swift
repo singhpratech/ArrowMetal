@@ -54,7 +54,7 @@ enum GroupByKeysSource {
                         device ulong* out [[buffer(4)]],
                         uint i [[thread_position_in_grid]]) {
         if (i >= *nPtr) return;
-        out[i] = vals[i * limbs + which];
+        out[i] = vals[(ulong)i * limbs + which];
     }
     """
 

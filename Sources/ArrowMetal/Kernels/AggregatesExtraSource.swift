@@ -72,7 +72,7 @@ enum AggregatesExtraSource {
         if (k >= K) return;
         uint s = segStart[k], e = segEnd[k];
         uint base = (uint)offsets[k];
-        for (uint t = s + lid; t < e; t += TG) out[base + (t - s)] = ord[t];
+        for (uint t = s + lid; t < e; t = (e - t > TG) ? t + TG : e) out[base + (t - s)] = ord[t];
     }
     """
 
@@ -156,7 +156,7 @@ enum AggregatesExtraSource {
             uint s = segStart[k], e = segEnd[k];
             \(KEYACC) lo = \(minInit), hi = \(maxInit);
             uint cnt = 0u;
-            for (uint t = s + lid; t < e; t += TG) {
+            for (uint t = s + lid; t < e; t = (e - t > TG) ? t + TG : e) {
                 uint i = (uint)ord[t];
                 if (hasValidity != 0u && !bit_get(validity, i)) continue;
                 if (!(\(include))) continue;
@@ -200,7 +200,7 @@ enum AggregatesExtraSource {
             uint s = segStart[k], e = segEnd[k];
             \(ACC) acc = \(productInit);
             uint cnt = 0u;
-            for (uint t = s + lid; t < e; t += TG) {
+            for (uint t = s + lid; t < e; t = (e - t > TG) ? t + TG : e) {
                 uint i = (uint)ord[t];
                 if (hasValidity != 0u && !bit_get(validity, i)) continue;
                 \(ACC) a = acc, b = \(productLoad);
@@ -246,7 +246,7 @@ enum AggregatesExtraSource {
             float mean = means[k];
             float2 a2 = float2(0.0f, 0.0f), a3 = a2, a4 = a2;
             uint cnt = 0u;
-            for (uint t = s + lid; t < e; t += TG) {
+            for (uint t = s + lid; t < e; t = (e - t > TG) ? t + TG : e) {
                 uint i = (uint)ord[t];
                 if (hasValidity != 0u && !bit_get(validity, i)) continue;
                 if (!(\(include))) continue;
@@ -294,12 +294,12 @@ enum AggregatesExtraSource {
             uint n = *nPtr;
             \(macc) a2 = \(minit), a3 = \(minit), a4 = \(minit);
             uint cnt = 0u;
-            for (uint i = gid; i < n; i += gridSize) {
+            AM_GRID_STRIDE(i, gid, n, gridSize,
                 if (hasValidity != 0u && !bit_get(validity, i)) continue;
                 if (!(\(minclude))) continue;
         \(scalarBody)
                 cnt++;
-            }
+            )
             s2[lid] = a2; s3[lid] = a3; s4[lid] = a4; scount[lid] = cnt;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint w = TG / 2u; w > 0u; w >>= 1) {

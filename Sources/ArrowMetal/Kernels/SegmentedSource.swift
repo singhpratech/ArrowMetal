@@ -140,7 +140,7 @@ enum SegmentedSource {
             uint s = segStart[k], e = segEnd[k];
             \(op.accType) acc = \(op.identity);
             uint cnt = 0u;
-            for (uint i = s + lid; i < e; i += TG) {
+            for (uint i = s + lid; i < e; i = (e - i > TG) ? i + TG : e) {
                 uint row = (uint)ord[i];
                 if (hasValidity && !bit_get(validity, row)) continue;
                 \(op.valueType) v = vals[row];
