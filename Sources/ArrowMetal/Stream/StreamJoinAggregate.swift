@@ -612,7 +612,7 @@ public final class BroadcastJoinAggregateOperator: StreamOperator {
         }
 
         let blocks = (n + Dispatch.threadgroupSize - 1) / Dispatch.threadgroupSize
-        let partials = try MetalArrowBuffer.allocate(byteCount: blocks * slots.count * 16, zeroed: false,
+        let partials = try MetalArrowBuffer.allocate(byteCount: Dispatch.launchedThreadgroups(blocks) * slots.count * 16, zeroed: false,
                                                      context: context)
         try context.run { enc in
             enc.setComputePipelineState(probePSO)

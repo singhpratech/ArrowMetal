@@ -55,7 +55,7 @@ public func hashJoin<K: ArrowJoinKey>(left: MetalArray<K>, right: MetalArray<K>,
     let counts = try MetalArrowBuffer.allocate(byteCount: nL * 4, zeroed: false, context: ctx)
     let offsets = try MetalArrowBuffer.allocate(byteCount: nL * 4, zeroed: false, context: ctx)
     let blocks = (nL + Dispatch.threadgroupSize - 1) / Dispatch.threadgroupSize
-    let blockTotals = try MetalArrowBuffer.allocate(byteCount: blocks * 4, zeroed: false, context: ctx)
+    let blockTotals = try MetalArrowBuffer.allocate(byteCount: Dispatch.launchedThreadgroups(blocks) * 4, zeroed: false, context: ctx)
     let grand = try MetalArrowBuffer.allocate(byteCount: 4, context: ctx)
     let errorFlag = try MetalArrowBuffer.allocate(byteCount: 4, context: ctx)
     let isLeft = kind == .left ? 1 : 0
@@ -106,7 +106,7 @@ public func hashJoin<K: ArrowJoinKey>(left: MetalArray<K>, right: MetalArray<K>,
         Dispatch.setLength(enc, nL, nil, index: 1)
         enc.setBuffer(offsets.mtl, offset: 0, index: 2)
         enc.setBuffer(blockTotals.mtl, offset: 0, index: 3)
-        enc.dispatchThreadgroups(MTLSize(width: blocks, height: 1, depth: 1), threadsPerThreadgroup: tg)
+        try Dispatch.dispatchRows(enc, threadgroups: blocks)
         enc.memoryBarrier(scope: .buffers)
         enc.setComputePipelineState(scanTotalsPSO)
         enc.setBuffer(blockTotals.mtl, offset: 0, index: 0)
@@ -118,7 +118,7 @@ public func hashJoin<K: ArrowJoinKey>(left: MetalArray<K>, right: MetalArray<K>,
         enc.setBuffer(offsets.mtl, offset: 0, index: 0)
         enc.setBuffer(blockTotals.mtl, offset: 0, index: 1)
         Dispatch.setLength(enc, nL, nil, index: 2)
-        enc.dispatchThreadgroups(MTLSize(width: blocks, height: 1, depth: 1), threadsPerThreadgroup: tg)
+        try Dispatch.dispatchRows(enc, threadgroups: blocks)
     }
     try ctx.syncPoint()      // the output size is decided by the GPU and sizes the next dispatch
     let total = withExtendedLifetime(grand) { Int(grand.typed(UInt32.self)[0]) }

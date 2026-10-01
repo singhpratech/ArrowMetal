@@ -104,6 +104,11 @@ public enum ExprUnaryOp: String, Hashable, Sendable {
     case negate, abs, sqrt, exp, ln, round
     case not
     case bitNot = "bit_not"
+    /// Boolean: the sign bit of a float is set (negative values, -0.0, -inf and a NaN with the sign bit
+    /// set); on a signed integer `x < 0`, on an unsigned integer `false`.
+    case signbit
+    /// Boolean: Arrow `is_nan` (a NaN of either sign and any payload); `false` on an integer.
+    case isNan = "is_nan"
 }
 
 /// Literal string predicates: the pattern is a compile-time constant baked into the kernel.
@@ -233,6 +238,10 @@ extension Expr {
     public var exponential: Expr { .unary(.exp, self) }
     public var naturalLog: Expr { .unary(.ln, self) }
     public var rounded: Expr { .unary(.round, self) }
+    /// `(signbit x)`: true for -0.0, negative values, -inf and a NaN with the sign bit set.
+    public var signBit: Expr { .unary(.signbit, self) }
+    /// `(is_nan x)`: Arrow `is_nan`.
+    public var isNaN: Expr { .unary(.isNan, self) }
 
     /// Every column this expression reads, in first-use order.
     public var referencedColumns: [String] {
@@ -311,9 +320,10 @@ extension Expr: CustomStringConvertible {
     }
 }
 
-/// Shortest decimal string that round-trips to the same Double.
+/// Shortest decimal string that round-trips to the same Double. A NaN keeps its sign (`-nan`), which
+/// `signbit` reads and the kernel cache key must tell apart; its payload is not kept.
 func fullPrecision(_ v: Double) -> String {
-    if v.isNaN { return "nan" }
+    if v.isNaN { return v.sign == .minus ? "-nan" : "nan" }
     if v.isInfinite { return v < 0 ? "-inf" : "inf" }
     return "\(v)"
 }

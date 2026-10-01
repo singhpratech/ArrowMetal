@@ -174,7 +174,8 @@ public final class MetalContext: @unchecked Sendable {
         } else {
             let opts = MTLCompileOptions()
             if #available(macOS 15.0, iOS 18.0, *) { opts.mathMode = .safe } else { opts.fastMathEnabled = false }
-            do { lib = try device.makeLibrary(source: source, options: opts) }
+            // Every kernel reads its grid position through the row fold (`Dispatch.foldGridPositions`).
+            do { lib = try device.makeLibrary(source: Dispatch.foldGridPositions(source), options: opts) }
             catch {
                 let detail = Self.describe(error)
                 if Self.debugShaders {

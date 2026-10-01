@@ -201,9 +201,9 @@ extension ExprCompiler {
             src += "        atomic_store_explicit(&thi[s], 0u, memory_order_relaxed);\n"
             src += "        atomic_store_explicit(&tcnt[s], 0u, memory_order_relaxed);\n    }\n"
             src += "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-            src += "    uint start = tgid * chunk;\n    uint end = min(n, start + chunk);\n"
+            src += "    uint start = tgid * chunk;\n    uint end = (uint)min((ulong)n, (ulong)start + (ulong)chunk);\n"
             src += declareOutputs(slots, indent: "    ")
-            src += "    for (uint i = start + lid; i < end; i += TG) {\n"
+            src += "    for (uint i = start + lid; i < end; i = (end - i > TG) ? i + TG : end) {\n"
             src += "        \(call)\n"
             src += rowGuard
             src += accumulate(space: "threadgroup", lo: { "&tlo[\($0)]" }, hi: { "&thi[\($0)]" }, cnt: { "&tcnt[\($0)]" })
@@ -219,9 +219,9 @@ extension ExprCompiler {
             src += ",\n                      uint lid [[thread_index_in_threadgroup]],\n"
             src += "                      uint tgid [[threadgroup_position_in_grid]]) {\n"
             src += "    uint n = *nPtr;\n"
-            src += "    uint start = tgid * chunk;\n    uint end = min(n, start + chunk);\n"
+            src += "    uint start = tgid * chunk;\n    uint end = (uint)min((ulong)n, (ulong)start + (ulong)chunk);\n"
             src += declareOutputs(slots, indent: "    ")
-            src += "    for (uint i = start + lid; i < end; i += TG) {\n"
+            src += "    for (uint i = start + lid; i < end; i = (end - i > TG) ? i + TG : end) {\n"
             src += "        \(call)\n"
             src += rowGuard
             src += accumulate(space: "device", lo: { "&dlo[\($0)]" }, hi: { "&dhi[\($0)]" }, cnt: { "&dcnt[\($0)]" })

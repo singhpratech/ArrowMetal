@@ -22,7 +22,7 @@ enum Conditional {
         let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(n, 1) * 4, zeroed: false, context: ctx)
         guard n > 0 else { return out }
         let blocks = (n + Dispatch.threadgroupSize - 1) / Dispatch.threadgroupSize
-        let totals = try MetalArrowBuffer.allocate(byteCount: blocks * 4, zeroed: false, context: ctx)
+        let totals = try MetalArrowBuffer.allocate(byteCount: Dispatch.launchedThreadgroups(blocks) * 4, zeroed: false, context: ctx)
         func pso(_ f: String) throws -> MTLComputePipelineState {
             try Dispatch.pipeline(ctx, family: "condscan", source: scanSource, function: f, type: "uint")
         }
@@ -30,7 +30,6 @@ enum Conditional {
         let totalsPSO = try pso("cum_totals_\(op)")
         let addPSO = try pso("cum_add_\(op)")
         let tg = MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1)
-        let grid = MTLSize(width: blocks, height: 1, depth: 1)
         try ctx.run { enc in
             enc.setComputePipelineState(blockPSO)
             enc.setBuffer(seed.mtl, offset: seed.offset, index: 0)
@@ -39,7 +38,7 @@ enum Conditional {
             Dispatch.setUInt(enc, 0, index: 3)
             enc.setBuffer(out.mtl, offset: out.offset, index: 4)
             enc.setBuffer(totals.mtl, offset: totals.offset, index: 5)
-            enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
+            try Dispatch.dispatchRows(enc, threadgroups: blocks)
             enc.memoryBarrier(scope: .buffers)
 
             enc.setComputePipelineState(totalsPSO)
@@ -52,7 +51,7 @@ enum Conditional {
             enc.setBuffer(out.mtl, offset: out.offset, index: 0)
             enc.setBuffer(totals.mtl, offset: totals.offset, index: 1)
             Dispatch.setLength(enc, n, nil, index: 2)
-            enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
+            try Dispatch.dispatchRows(enc, threadgroups: blocks)
         }
         ctx.retainUntilFlush(totals)
         return out

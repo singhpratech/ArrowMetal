@@ -2,6 +2,70 @@
 
 Things learned the hard way. Add to this whenever something surprises you.
 
+## Round 17 (2026-10-01): the 2^32-thread wrap on row-wise kernels, and a totalOrder argsort re-timed
+
+**What.** Round 13 folded the per-group grids; the row-wise ones were still `(groups, 1, 1)`. A kernel
+with one thread per element launches `ceil(n / 256)` threadgroups of 256 threads, which is 2^24
+threadgroups and 2^32 threads from n = 2^32 - 255, the width the GPU wraps. Measured on a UInt8 array of
+2^32 - 1 elements (`Benchmarks/results/grid_fold_limit_2026-10-01.txt`): `bitwise xor` on that grid
+got 0 of 4,294,967,295 bytes right, with no error. Arrays are limited to 2^32 - 1 elements, so the
+affected lengths were 2^32 - 255 to 2^32 - 1: every `dispatch1D` kernel, and the two-level scans that
+size their own grids (string offsets, hash-join offsets, unique runs, cumulative and forward-fill scans,
+window scans), whose add pass launches one more threadgroup and reached the width from 2^32 - 511.
+
+**Fix.** `Dispatch.dispatch1D` and `Dispatch.dispatchRows` fold a grid that would reach 2^32 threads into
+rows of 65,536 threadgroups, as `perGroup` does. At the limit that is 2^24 threadgroups in exactly 256
+rows, so the folded grid launches the same threadgroups. Rather than edit some 350 kernels,
+`MetalContext.pipeline` rewrites each kernel's text before compiling it (`Dispatch.foldGridPositions`):
+`uint i [[thread_position_in_grid]]` becomes a `uint2` and the body starts with
+`uint i = (p.y << 24) + p.x;`, and `threadgroup_position_in_grid` the same with a shift of 16. On a
+one-row grid `.y` is 0, so every kernel dispatched any other way computes the same index as before.
+Metal compiles a kernel only when its position inputs are all scalar or all vectors of one width ("expecting
+input declarations with either all scalar types or all vector types with the same number of elements"),
+so the kernel's other scalar position inputs (`thread_position_in_threadgroup`, `threads_per_threadgroup`,
+`threads_per_grid`) become `uint2` read as `.x`. A parameter inside a `#define` argument list gets its
+declaration in every kernel that names the macro. A grid past 2^32 threads cannot be indexed by a `uint`:
+`dispatch1D` stops with a message there and `dispatchRows` throws, which is where a string scan over more
+than 2^32 - 256 rows now ends. The fused expression group-by kernels computed each chunk's end as
+`start + chunk` in 32 bits, which wraps on the last chunk near 2^32 rows; the end is now taken in 64 bits
+and the row loop cannot step past it.
+
+**Cost.** Old and new builds alternated in one process, 8 rounds of 100 calls after a 100 ms warm-up
+(`Benchmarks/results/grid_fold_2026-10-01.csv`):
+
+| Case | Rows | Best before → after (ms) | Median before → after (ms) |
+|---|---|---|---|
+| add float64 + float64 | 10M | 0.625 → 0.626 | 0.781 → 0.788 |
+| bitwise_and int32 & scalar | 10M | 0.551 → 0.538 | 0.690 → 0.714 |
+| abs int64 | 10M | 0.585 → 0.579 | 0.819 → 0.830 |
+| fused group-by sum int32, 64 keys | 10M | 0.874 → 0.836 | 1.236 → 1.117 |
+| add float64 + float64 | 50M | 2.689 → 2.690 | 2.755 → 2.751 |
+| bitwise_and int32 & scalar | 50M | 0.981 → 0.987 | 1.061 → 1.057 |
+| abs int64 | 50M | 1.847 → 1.848 | 1.913 → 1.913 |
+| fused group-by sum int32, 64 keys | 50M | 1.663 → 1.663 | 1.768 → 1.784 |
+
+**Tests.** `GridRowFoldTests` checks the rewritten text, runs the rewritten kernels on a three-row folded
+grid at 40,000,003 elements (every element and threadgroup position, through a parameter and through a
+macro), runs xor, not, add, take, cumulative sum, forward fill and a fused expression with the fold
+forced on at 40M elements against the plain grid, and with `ARROWMETAL_BIG_TESTS=1` runs xor and not
+over 2^32 - 1 elements. The whole Swift suite (1,030 tests) also passes with the fold forced on from 2^20
+threads.
+
+**The totalOrder argsort row.** The sort-options benchmark had a float64 argsort at 1M rows at 1.41 ms
+in totalOrder against 0.97 ms in the default order, from a best of five after one call. With a 100 ms
+warm-up, the first call after a 500 ms idle kept apart, and 8 alternating rounds of 100 calls
+(`Benchmarks/results/argsort_total_order_2026-10-01.csv`), the two orders run in the same time:
+
+| Rows | Default best / median (ms) | totalOrder best / median (ms) | First call after idle, default / totalOrder (ms) |
+|---|---|---|---|
+| 1M | 1.119 / 1.876 | 1.096 / 1.607 | 5.112 / 5.188 |
+| 10M | 7.492 / 7.593 | 7.531 / 7.588 | 16.914 / 19.404 |
+| 50M | 37.911 / 38.109 | 37.934 / 38.068 | 45.869 / 51.189 |
+
+The first call after an idle gap takes 4.6x (default) and 4.7x (totalOrder) the best at 1M rows, so a
+best of five taken with only one call before it can carry part of that state; the key map, the only
+difference between the two orders, costs nothing measurable.
+
 ## Round 16 (2026-09-30): Float64 group sums without a group order
 
 **What.** Float64 group-by aggregates were the slowest ones ArrowMetal ran. Over 50M rows a Float64

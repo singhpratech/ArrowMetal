@@ -3223,6 +3223,17 @@ class Expr:
     def is_null(self): return Expr(f"(is_null {self._s})", f"{self._r}.is_null()")
     def is_valid(self): return Expr(f"(is_valid {self._s})", f"{self._r}.is_valid()")
 
+    def is_nan(self):
+        """Arrow `is_nan`: true for a NaN of either sign and any payload; false on an integer; null
+        where the input is null."""
+        return Expr(f"(is_nan {self._s})", f"{self._r}.is_nan()")
+
+    def signbit(self):
+        """The sign bit (numpy's `signbit`): true for -0.0, negative values, -inf and a NaN with the
+        sign bit set; `x < 0` on a signed integer, false on an unsigned one; null where the input is
+        null."""
+        return Expr(f"(signbit {self._s})", f"{self._r}.signbit()")
+
     def fill_null(self, other):
         o = _as_expr(other)
         return Expr(f"(fill_null {self._s} {o._s})", f"{self._r}.fill_null({o._r})")

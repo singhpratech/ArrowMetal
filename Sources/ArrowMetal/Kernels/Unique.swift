@@ -213,7 +213,7 @@ extension MetalArray {
         let m = runs.count
         let blocks = Swift.max(1, (m + Dispatch.threadgroupSize - 1) / Dispatch.threadgroupSize)
         let ranks = try MetalArrowBuffer.allocate(byteCount: m * 4, zeroed: false, context: ctx)
-        let blockTotals = try MetalArrowBuffer.allocate(byteCount: blocks * 4, zeroed: false, context: ctx)
+        let blockTotals = try MetalArrowBuffer.allocate(byteCount: Dispatch.launchedThreadgroups(blocks) * 4, zeroed: false, context: ctx)
         let codes = try MetalArrowBuffer.allocate(byteCount: rows * 4, context: ctx)
         func pso(_ f: String) throws -> MTLComputePipelineState {
             try Dispatch.pipeline(ctx, family: "unique", source: runs.source, function: f, type: runs.unsignedType)
@@ -221,14 +221,13 @@ extension MetalArray {
         let blockPSO = try pso("uq_scan_block"), totalsPSO = try pso("uq_scan_totals")
         let addPSO = try pso("uq_scan_add"), scatterPSO = try pso("uq_scatter_codes")
         let tg = MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1)
-        let grid = MTLSize(width: blocks, height: 1, depth: 1)
         try ctx.run { enc in
             enc.setComputePipelineState(blockPSO)
             enc.setBuffer(runs.markInts.mtl, offset: runs.markInts.offset, index: 0)
             Dispatch.setLength(enc, m, nil, index: 1)
             enc.setBuffer(ranks.mtl, offset: ranks.offset, index: 2)
             enc.setBuffer(blockTotals.mtl, offset: blockTotals.offset, index: 3)
-            enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
+            try Dispatch.dispatchRows(enc, threadgroups: blocks)
             enc.memoryBarrier(scope: .buffers)
             enc.setComputePipelineState(totalsPSO)
             enc.setBuffer(blockTotals.mtl, offset: blockTotals.offset, index: 0)
@@ -239,7 +238,7 @@ extension MetalArray {
             enc.setBuffer(ranks.mtl, offset: ranks.offset, index: 0)
             enc.setBuffer(blockTotals.mtl, offset: blockTotals.offset, index: 1)
             Dispatch.setLength(enc, m, nil, index: 2)
-            enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
+            try Dispatch.dispatchRows(enc, threadgroups: blocks)
             enc.memoryBarrier(scope: .buffers)
             enc.setComputePipelineState(scatterPSO)
             enc.setBuffer(runs.ord.values.mtl, offset: runs.ord.values.offset, index: 0)

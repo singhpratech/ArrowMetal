@@ -175,7 +175,7 @@ public final class StringViewStorage: @unchecked Sendable {
         let p3 = try ctx.pipeline(source: StringSource.source, function: "scan_add", cacheKey: "str/scan_add")
         let lens = try MetalArrowBuffer.allocate(byteCount: n * 4, zeroed: false, context: ctx)
         let blocks = Swift.max(1, (n + Dispatch.threadgroupSize - 1) / Dispatch.threadgroupSize)
-        let totals = try MetalArrowBuffer.allocate(byteCount: blocks * 4, zeroed: false, context: ctx)
+        let totals = try MetalArrowBuffer.allocate(byteCount: Dispatch.launchedThreadgroups(blocks) * 4, zeroed: false, context: ctx)
         let grand = try MetalArrowBuffer.allocate(byteCount: 4, zeroed: false, context: ctx)
         let vb = validity ?? views
         let tg = MTLSize(width: Dispatch.threadgroupSize, height: 1, depth: 1)
@@ -193,7 +193,7 @@ public final class StringViewStorage: @unchecked Sendable {
             Dispatch.setLength(enc, n, nil, index: 1)
             enc.setBuffer(offsets.mtl, offset: offsets.offset, index: 2)
             enc.setBuffer(totals.mtl, offset: 0, index: 3)
-            enc.dispatchThreadgroups(MTLSize(width: blocks, height: 1, depth: 1), threadsPerThreadgroup: tg)
+            try Dispatch.dispatchRows(enc, threadgroups: blocks)
             enc.memoryBarrier(scope: .buffers)
             enc.setComputePipelineState(p2)
             enc.setBuffer(totals.mtl, offset: 0, index: 0)
@@ -206,7 +206,7 @@ public final class StringViewStorage: @unchecked Sendable {
             enc.setBuffer(totals.mtl, offset: 0, index: 1)
             Dispatch.setLength(enc, n, nil, index: 2)
             enc.setBuffer(grand.mtl, offset: 0, index: 3)
-            enc.dispatchThreadgroups(MTLSize(width: blocks + 1, height: 1, depth: 1), threadsPerThreadgroup: tg)
+            try Dispatch.dispatchRows(enc, threadgroups: blocks + 1)
         }
         let total = Int(offsets.typed(Int32.self)[n])
         let data = try MetalArrowBuffer.allocate(byteCount: Swift.max(total, 1), zeroed: false, context: ctx)

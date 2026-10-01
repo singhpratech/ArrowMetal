@@ -115,7 +115,7 @@ expr    := "(col \"name\")"
          | "(str_eq"|"starts_with"|"contains" expr "\"pattern\"" ")"
 BINOP   := add sub mul div | eq ne lt le gt ge | and or and_kleene or_kleene
          | bit_and bit_or bit_xor shl shr
-UNOP    := negate abs sqrt exp ln round not bit_not
+UNOP    := negate abs sqrt exp ln round not bit_not signbit is_nan
 TYPE    := i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 bool str
 ```
 
@@ -153,11 +153,48 @@ applies inside `if_else`, `fill_null`, `coalesce` and `is_in`.
 `sqrt`, `exp` and `ln` on an integer column promote to `float64`, as Arrow's do. `round` puts halves
 **away from zero** (Arrow's `half_towards_infinity`), matching ArrowMetal's existing `round`.
 
+## Sign bit and NaN
+
+`(signbit x)` and `(is_nan x)` are boolean, null where `x` is null, and read the value's bits as stored:
+
+| `x` | `signbit` | `is_nan` |
+|---|---|---|
+| float: -0.0, a negative value, -inf, a NaN with the sign bit set (any payload) | true | false, except the NaN: true |
+| float: +0.0, a positive value, +inf, a NaN with the sign bit clear (any payload) | false | false, except the NaN: true |
+| signed integer | `x < 0` | false |
+| unsigned integer | false | false |
+| boolean, utf8 | error | error |
+
+`is_nan` is Arrow's `is_nan`; `signbit` is NumPy's `signbit` (Arrow's `sign` gives 0 for both zeros and
+NaN for NaN, so it cannot tell -0.0 or a negative NaN apart). Swift: `col("x").signBit`, `col("x").isNaN`;
+Python: `am.col("x").signbit()`, `am.col("x").is_nan()`. A float literal keeps its sign in the text form
+(`(f64 -nan)`, `(f64 -0.0)`); a NaN literal's payload is not kept.
+
+### totalOrder comparisons
+
+The comparison operators are IEEE: a NaN compares false (and `ne` true), and -0.0 equals +0.0. Arrow's
+Rust implementation and DataFusion compare floats by IEEE 754 totalOrder instead: -NaN < -inf < … < -0.0
+< +0.0 < … < +inf < +NaN. With `signbit` and `is_nan`, a column against a literal `c` in totalOrder is
+one expression (`x` the column, `s` = `(signbit x)`, `n` = `(is_nan x)`):
+
+| `c` | `x == c` | `x < c` | `x <= c` | `x > c` | `x >= c` |
+|---|---|---|---|---|---|
+| finite non-zero, ±inf | `(eq x c)` | `(or (lt x c) (and n s))` | `(or (le x c) (and n s))` | `(or (gt x c) (and n (not s)))` | `(or (ge x c) (and n (not s)))` |
+| +0.0 | `(and (eq x c) (not s))` | `s` | `(or s (eq x c))` | `(not (or s (eq x c)))` | `(not s)` |
+| -0.0 | `(and (eq x c) s)` | `(and s (ne x c))` | `s` | `(not s)` | `(not (and s (ne x c)))` |
+
+`x != c` is the `not` of the `x == c` column (for a non-zero `c` that is `(ne x c)`). Every entry is null
+where `x` is null, so a filter drops those rows as DataFusion does. A NaN literal is not in the table:
+totalOrder tells NaN payloads apart, and the grammar has no bit-pattern equality. `ExprSignBitTests` checks
+every cell against the totalOrder keys of Float32 and Float64 columns holding ±0.0, ±inf, subnormals,
+NaN of both signs with four payloads each, and nulls; `python/tests/test_expr.py` checks the same against
+NumPy.
+
 ## How nulls are compiled
 
 | Node | Result validity |
 |---|---|
-| arithmetic, comparison, bit ops, casts, `abs`/`negate`/`sqrt`/`exp`/`ln`/`round` | valid iff every input is valid |
+| arithmetic, comparison, bit ops, casts, `abs`/`negate`/`sqrt`/`exp`/`ln`/`round`, `signbit`, `is_nan` | valid iff every input is valid |
 | `and` / `or` | valid iff both inputs are valid |
 | `and_kleene` | `false` as soon as either side is a valid `false`; otherwise null if either side is null |
 | `or_kleene` | `true` as soon as either side is a valid `true`; otherwise null if either side is null |
