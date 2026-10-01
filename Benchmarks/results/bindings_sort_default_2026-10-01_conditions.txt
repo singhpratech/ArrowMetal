@@ -1,0 +1,40 @@
+Go and Node bindings: the default sort calls and the typed-array import, the commit before the
+nan_largest float order and the empty-input import fix (2d34522) against the commit with them
+(f42e9fd). 2026-10-01, Apple M4 Max, macOS 27.0; Go 1.27.1 and arrow-go v18.7.0; node v24.9.0 and
+apache-arrow 21.2.0. Both builds of each binding loaded the same libArrowMetalC.dylib (built -c
+release; Sources/ is identical in both commits).
+
+Data: one Float64 column of 1,000,000 rows, every tenth row null, the values from a 64-bit LCG
+(seed 12345), imported once per process. Rows: Go Argsort(false), ArgsortWith(SortOptions{}),
+SortWith(SortOptions{}), TopKWith(100, SortOptions{Descending: true}); Node argsort(), argsort({}),
+sort(), topK(100), and fromTypedArray(values, { validity, nullCount }).release() on the same
+column. Every result handle is released inside the timed call.
+
+Method. Each block ran only when no other timing or build held the machine, no compiler or test
+process ran, and the 1-minute load average was below 3.5. Per row: a 500 ms idle and one call timed
+on its own (first_after_500ms_idle_ms; the first row of each process also carries the process's
+first GPU work), then the same call untimed for 150 ms, then the timed calls (40 per row in the
+three rounds, 100 per row in the re-time), giving best and median wall time and process CPU time per
+call (getrusage / process.cpuUsage). One process per build, binding and round; the two builds
+alternate in every round, old-new, new-old, ...
+
+Blocks: name, start, end, load at start, load at end, last sleep entry of pmset -g log
+rounds (3),  02:28:15, 02:28:56, 3.31, 2.58, 2026-09-29 00:37:52 (no block spans a sleep)
+re-time (8), 02:31:27, 02:31:57, 3.47, 2.86, 2026-09-29 00:37:52
+
+Summary, old -> new, best of the rounds' bests and median of the rounds' medians, ms:
+  go   Argsort(false)              best 1.496 -> 1.262   median 1.723 -> 1.762
+  go   ArgsortWith(SortOptions{})  best 1.514 -> 1.767   median 2.051 -> 2.157   (flagged; re-timed)
+  go   SortWith(SortOptions{})     best 1.813 -> 2.152   median 2.129 -> 2.540   (flagged; re-timed)
+  go   TopKWith(100, descending)   best 1.199 -> 1.257   median 1.266 -> 1.404
+  node argsort()                   best 1.471 -> 1.557   median 1.683 -> 1.721
+  node argsort({})                 best 1.449 -> 1.503   median 2.385 -> 1.906
+  node sort()                      best 1.754 -> 1.503   median 2.240 -> 3.014
+  node topK(100)                   best 1.307 -> 1.204   median 1.380 -> 1.234
+  node fromTypedArray().release()  best 0.005 -> 0.005   median 0.006 -> 0.006
+Re-time of the two flagged rows alone, 8 alternating rounds of 100 calls
+(bindings_sort_default_retime_2026-10-01.csv):
+  go   ArgsortWith(SortOptions{})  best 1.221 -> 1.271   median 1.600 -> 1.494   CPU 0.908 -> 0.907
+  go   SortWith(SortOptions{})     best 1.683 -> 1.577   median 2.524 -> 2.358   CPU 1.444 -> 1.223
+Neither re-timed row is more than 5% slower in both best and median, and no row's process CPU time
+per call rose by more than 1.5x.
