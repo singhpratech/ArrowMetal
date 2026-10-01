@@ -13,9 +13,10 @@ it and compares, so a kernel that is wrong in an unanticipated way still fails.
 |---|---|
 | Files | `python/tests/test_differential.py` (the harness), `python/tests/differential_report.py` (the runner) |
 | Oracle | `pyarrow.compute` 25.0.1, plus a reference written in the harness for the 17 operations Arrow has no function for |
-| Cases in the default matrix | 40,824 — 212 operations over 46 column types (45 types plus `utf8_view`, the utf8 values imported as views), 1,512 applicable (operation, type) cells x 27 datasets — 249 s on an M4 Max on 2026-09-25; more with `DIFF_LARGE=1` |
+| Cases in the default matrix | 41,688 — 217 operations over 46 column types (45 types plus `utf8_view`, the utf8 values imported as views), 1,544 applicable (operation, type) cells x 27 datasets — 268 s on an M4 Max on 2026-10-01; the per-function table is generated from the recorded run (`docs/data/differential_coverage.json`, docs/COVERAGE.md); more with `DIFF_LARGE=1` |
 | Result at 0.1.0 | 36,486 pass, 1,566 fail across 22 documented divergences, 1,017 skip (an operation that does not apply to a type), **0 unclassified** |
 | Result on 2026-09-25, with `utf8_view` | 38,006 pass, 1,644 fail across the documented divergences, 1,174 skip, **0 unclassified**; the 1,755 `utf8_view` cases are the 65 utf8 operations again, with the same pass, fail and skip counts as their utf8 cells |
+| Result on 2026-10-01 (the recorded run) | 38,897 pass, 1,644 fail across the documented divergences, 1,147 skip, **0 unclassified** |
 
 ## Method
 
