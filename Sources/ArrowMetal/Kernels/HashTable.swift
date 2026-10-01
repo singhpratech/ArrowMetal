@@ -48,7 +48,7 @@ enum HashTable {
         /// Number of distinct non-null keys.
         let groupCount: Int
         /// Lowest row index of each group, in slot order.
-        let firstSlotOrder: MetalArray<Int32>
+        let firstSlotOrder: MetalArray<UInt32>
     }
 
     /// Set `ARROWMETAL_NO_HASH=1` to force every caller back onto the sort path. Nothing in the library
@@ -194,7 +194,7 @@ enum HashTable {
 
     /// One representative row per occupied slot, in slot order.
     static func compact(ctx: MetalContext, slots: MetalArrowBuffer, firstOfSlot: MetalArrowBuffer,
-                        cum: MetalArray<Int32>, slotCount: Int, groupCount: Int) throws -> MetalArray<Int32> {
+                        cum: MetalArray<Int32>, slotCount: Int, groupCount: Int) throws -> MetalArray<UInt32> {
         let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(groupCount, 1) * 4, zeroed: false, context: ctx)
         if groupCount > 0 {
             let p = try pso(ctx, "ht_compact")
@@ -210,12 +210,12 @@ enum HashTable {
             ctx.retainUntilFlush(slots); ctx.retainUntilFlush(firstOfSlot); ctx.retainUntilFlush(cum)
             try ctx.syncPoint()
         }
-        return MetalArray<Int32>(length: groupCount, nullCount: 0, validity: nil, values: out, context: ctx)
+        return MetalArray<UInt32>(length: groupCount, nullCount: 0, validity: nil, values: out, context: ctx)
     }
 
     /// One dense id per row: `relabel[rank[slot]]`, with null rows given `nullId`.
     static func writeIds(ctx: MetalContext, rows: Int, validity: MetalArrowBuffer?, fallbackBuffer: MetalArrowBuffer,
-                         groups: HashGroups, relabel: MetalArray<Int32>, nullId: Int) throws -> MetalArrowBuffer {
+                         groups: HashGroups, relabel: MetalArray<UInt32>, nullId: Int) throws -> MetalArrowBuffer {
         let ids = try MetalArrowBuffer.allocate(byteCount: Swift.max(rows, 1) * 4, zeroed: false, context: ctx)
         guard rows > 0 else { return ids }
         let p = try pso(ctx, "ht_ids")
@@ -247,9 +247,9 @@ struct HashDistinct<T: ArrowPrimitive> {
     let values: MetalArray<T>
     /// Lowest row index of each distinct value, in the same order as `values`. Ordering the groups by
     /// this instead gives first-appearance order without touching the rows again.
-    let firstRows: MetalArray<Int32>
+    let firstRows: MetalArray<UInt32>
     /// Slot-order rank -> position in `values`.
-    let relabel: MetalArray<Int32>
+    let relabel: MetalArray<UInt32>
     let groups: HashTable.HashGroups
     var count: Int { groups.groupCount }
 }

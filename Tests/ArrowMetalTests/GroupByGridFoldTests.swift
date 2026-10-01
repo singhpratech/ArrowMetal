@@ -115,7 +115,7 @@ final class GroupByGridFoldTests: XCTestCase {
         // bits, and a product that overflows to NaN is then equal to itself.
         func bits(_ a: [Double?]) -> [UInt64?] { a.map { $0?.bitPattern } }
         struct Answers: Equatable {
-            var ord: [Int32] = []
+            var ord: [UInt32] = []
             var sumD: [UInt64?] = [], meanD: [UInt64?] = [], sumF: [UInt64?] = [], meanF: [UInt64?] = []
             var minD: [UInt64?] = [], maxL: [Int64?] = [], varD: [UInt64?] = [], prodL: [Int64?] = []
             var prodF: [UInt64?] = [], listOffsets: [Int32] = [], listValues: [Int64?] = []

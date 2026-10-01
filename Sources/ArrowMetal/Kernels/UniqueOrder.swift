@@ -82,8 +82,8 @@ extension MetalArray {
     /// original row that represents each of them in that order, `codes` is the per-row sorted code and
     /// `sorted` the sorted distinct values. Returns nil when there is nothing to report at all.
     private struct FirstAppearance {
-        let order: MetalArray<Int32>
-        let rows: MetalArray<Int32>
+        let order: MetalArray<UInt32>
+        let rows: MetalArray<UInt32>
         let codes: MetalArray<Int32>
         let sorted: MetalArray<T>
     }
@@ -94,14 +94,15 @@ extension MetalArray {
         let nullRow = includeNulls ? UniqueOrder.firstNullRow(length: length, nullCount: nullCount,
                                                              validity: validity) : nil
         guard u > 0 || nullRow != nil else { return nil }
-        var firsts: MetalArray<Int32>
+        try Dispatch.checkIndexRows(length, "unique")
+        var firsts: MetalArray<UInt32>
         if u > 0 {
-            let rows = try MetalArray<Int32>.iota(length, context: context)
+            let rows = try MetalArray<UInt32>.iota(length, context: context)
             firsts = try (try GroupBy(keys: codes, keyCount: u)).min(rows)
         } else {
-            firsts = try MetalArray<Int32>([Int32](), context: context)
+            firsts = try MetalArray<UInt32>([UInt32](), context: context)
         }
-        if let nullRow { firsts = try UniqueOrder.appending(firsts, Int32(nullRow)) }
+        if let nullRow { firsts = try UniqueOrder.appending(firsts, UInt32(nullRow)) }
         // The minima are distinct row indices, so the order is total and stability is moot; the radix
         // argsort is used because it is the one that already exists.
         let order = try firsts.argsort()
@@ -192,7 +193,7 @@ extension MetalStringArray {
         // counts follow through the existing gather.
         let strings = values.toArray()
         let positions = strings.indices.sorted { MetalStringArray.utf8Less(strings[$0], strings[$1]) }
-        let perm = try MetalArray<Int32>(positions.map { Int32($0) }, context: context)
+        let perm = try MetalArray<UInt32>(positions.map { UInt32($0) }, context: context)
         return (try values.take(perm), try counts.take(perm))
     }
 }

@@ -69,7 +69,7 @@ Copy-free out, always. Copy-free in when the producer's buffers are page aligned
 
 ## Tests
 
-943 test functions in 73 files under `Tests/ArrowMetalTests`, run in release; the oracles are plain-Swift
+1,045 test functions in 86 files under `Tests/ArrowMetalTests`, run in release; the oracles are plain-Swift
 CPU references, hand-computed vectors and pyarrow answers pinned as literals ([TESTING.md](TESTING.md)).
 Tests that need a real GPU skip on virtual Metal devices.
 
@@ -85,3 +85,6 @@ kernels ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md)).
 - The kernels are generated Metal Shading Language, compiled at first use and cached per process, so the
   first call of each kernel family pays a compile of a few milliseconds.
 - Everything the other pages list under limits applies here first, since this is the layer they wrap.
+- Index arrays (`argsort`, `topK`, `partitionNthIndices`, `lexsortIndices`, `hashJoin`, the ranks) are
+  `MetalArray<UInt32>`, row numbers up to 2^32 - 1; a call past that throws. `take` accepts
+  `MetalArray<Int32>`, `MetalArray<Int64>` and `MetalArray<UInt32>` ([DESIGN.md](DESIGN.md)).

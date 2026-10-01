@@ -89,7 +89,7 @@ int  am_bool_not(am_array* a, am_array** out);
 // Selection
 int  am_filter(am_array* a, am_array* mask, am_array** out);
 int  am_filter_where(am_array* a, int op, const void* scalar, am_array** out);
-int  am_take(am_array* a, am_array* indices, am_array** out);
+int  am_take(am_array* a, am_array* indices, am_array** out);   // indices: int32, int64 or uint32
 int  am_slice(am_array* a, int64_t offset, int64_t length, am_array** out);
 
 // Sorting (GPU LSD radix sort; stable, nulls last, NaN after +inf).
@@ -98,9 +98,15 @@ int  am_slice(am_array* a, int64_t offset, int64_t length, am_array** out);
 // does not mirror them to the front -- and am_top_k maps its keys the same way, so it agrees with
 // am_argsort element for element. am_argsort_ex2 / am_sort_ex2 / am_top_k_ex / am_lexsort_ex2 below
 // take the null placement and IEEE 754 totalOrder or NaN-largest for floats as options.
-int  am_argsort(am_array* a, int descending, am_array** out);   // int32 indices
+//
+// Index arrays are uint32 ("I"): am_argsort*, am_top_k*, am_lexsort*, am_partition_nth*, am_join and
+// the row_number / rank / dense_rank results (am_window ops 0-2, am_rank_ex) hold row numbers up to
+// 2^32 - 1, the same width as arrow-rs sort_to_indices and Polars' IdxSize. A call whose row numbers
+// would pass 2^32 - 1 returns an error ("<op>: row N does not fit the UInt32 index type ...") rather
+// than wrapping. am_take accepts int32, int64 and uint32 indices.
+int  am_argsort(am_array* a, int descending, am_array** out);   // uint32 indices
 int  am_sort(am_array* a, int descending, am_array** out);      // sorted copy, same type
-int  am_top_k(am_array* a, int64_t k, int largest, am_array** out);  // int32 indices of the k largest/smallest
+int  am_top_k(am_array* a, int64_t k, int largest, am_array** out);  // uint32 indices of the k largest/smallest
 
 // Group-by over dense int32/int64 keys in [0, key_count). agg: 0 sum, 1 count(rows), 2 min, 3 max, 4 mean, 5 count(values)
 int  am_group_by(am_array* keys, int64_t key_count, int agg, am_array* values /* may be NULL for count rows */, am_array** out);
@@ -409,9 +415,9 @@ int  am_temporal_math(am_array* a, int op, int64_t p1, am_array* b /* or NULL */
 //
 //   op  name              p1              p2            scalar_or_null   output   notes
 //   --  ----------------  --------------  ------------  ---------------  -------  --------------------
-//    0  row_number        -               -             -                int32    1-based, sort order
-//    1  rank              -               -             -                int32    min rank of a tie
-//    2  dense_rank        -               -             -                int32    no gaps
+//    0  row_number        -               -             -                uint32   1-based, sort order
+//    1  rank              -               -             -                uint32   min rank of a tie
+//    2  dense_rank        -               -             -                uint32   no gaps
 //    3  percent_rank      -               -             -                float64  (rank - 1)/(n - 1)
 //    4  cume_dist         -               -             -                float64  rows <= value, / n
 //    5  shift             by (lag > 0)    -             fill or NULL     input    NULL fill = nulls
@@ -444,7 +450,7 @@ int  am_temporal_math(am_array* a, int op, int64_t p1, am_array* b /* or NULL */
 // infinity anywhere in a float column poisons every later window.
 int  am_window(am_array* a, int op, int64_t p1, int64_t p2, const void* scalar_or_null, am_array** out);
 
-// Multi-column (lexicographic) sort: int32 indices ordering the rows by each column in turn, the first
+// Multi-column (lexicographic) sort: uint32 indices ordering the rows by each column in turn, the first
 // column being the most significant. `descending` has one entry per column, or may be NULL for all
 // ascending. Successive stable radix argsorts from the least significant key upwards; nulls come last in
 // every key whichever direction it is sorted in. utf8, binary and dictionary columns are not sortable.
@@ -976,8 +982,10 @@ int  am_reduce_ex2(am_array* a, int op, double p1, double* out_f64, int* is_null
 // several positions name the same one the **last** wins (Arrow's rule, and deterministic here: the
 // scatter takes an atomic maximum over the source positions, and a maximum does not depend on thread
 // order). Null indices are skipped; an index outside [0, max_index] is an error. The inverse
-// permutation is always int32 (Arrow's output_type option is not implemented); scatter accepts any
-// column type, nested ones included, because take already turns a null index into a null row.
+// permutation is always int32, Arrow's signed default (the output_type option is not implemented), so
+// an index column of more than 2^31 rows, whose positions pass the int32 range, is refused; scatter
+// accepts any column type, nested ones included, because take already turns a null index into a null
+// row.
 int  am_inverse_permutation(am_array* a, int64_t max_index, am_array** out);
 int  am_scatter(am_array* values, am_array* indices, int64_t max_index, am_array** out);
 
@@ -1053,8 +1061,8 @@ int  am_make_struct(am_array** arrays, const char* const* names, int64_t count, 
 // unique returns the distinct non-null values; ArrowMetal orders them **ascending** (one GPU sort
 // plus a run scan) where Arrow orders them by first appearance. value_counts is the same pass,
 // returned as a struct ("+s") with fields `values` and `counts` (int64), in the same ascending
-// order. partition_nth_indices answers with the full stable argsort, which satisfies Arrow's
-// contract (the n smallest first) at the cost of one radix sort.
+// order. partition_nth_indices answers with uint32 indices that put the n smallest first, which is
+// Arrow's contract.
 int  am_unique(am_array* a, am_array** out);
 int  am_value_counts(am_array* a, am_array** out);
 int  am_partition_nth_indices(am_array* a, int64_t n, am_array** out);
@@ -1424,7 +1432,7 @@ int         am_plan_column(am_plan_result* r, int64_t i, am_array** out);
 void        am_plan_result_release(am_plan_result* r);
 // GPU hash join (equi-join) in index form. join_type: 0 inner, 1 left outer.
 //
-// Both outputs are int32 index arrays of the same length: out_left_idx[i] is a row of left_keys and
+// Both outputs are uint32 index arrays of the same length: out_left_idx[i] is a row of left_keys and
 // out_right_idx[i] the row of right_keys that matches it. Duplicate keys on either side yield every
 // combination (many to many); null keys never match; with a left join an unmatched left row appears once
 // with a null right index. The pair order is unspecified. Apply the pairs with am_take on the columns you
@@ -1435,6 +1443,7 @@ void        am_plan_result_release(am_plan_result* r);
 // dictionary column on its codes); a mixed int32/int64 pair is widened to int64. The right side is the
 // build side: a device-memory open-addressing table of 2^ceil(log2(2 * right rows)) slots with duplicate
 // keys chained per bucket, probed twice (count, GPU exclusive scan, write) so the output needs no atomics.
+// Each side holds at most 2^31 - 1 rows and the result at most 2^31 - 1 pairs; more is an error.
 int  am_join(am_array* left_keys, am_array* right_keys, int join_type,
              am_array** out_left_idx, am_array** out_right_idx);
 

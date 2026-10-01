@@ -61,7 +61,7 @@ am_sum(h); am_min(h); am_max(h); am_mean(h)          # scalar reductions, nulls 
 
 hits <- am_filter(h, am_compare(h, ">", 0.5))        # boolean mask, then gather
 sorted <- am_sort(h, descending = TRUE)              # stable radix sort, nulls last
-idx <- am_argsort(h)                                 # zero-based int32 indices
+idx <- am_argsort(h)                                 # zero-based uint32 indices
 top <- am_take(h, am_slice(idx, 0, 10))
 
 g <- am_group_by(sample(c("north", "south"), 1e7, TRUE))
@@ -344,7 +344,10 @@ There is also no dplyr backend and no `RecordBatch`/`Table` surface: everything 
   back; `am_array(c(1, 2, 3))` calls `arrow::Array$create()` for you.
 - **Zero-based indices** in `am_argsort()`, `am_take()` and `am_slice()`, following Arrow rather
   than R. `am_argsort(x)` matches `order(x, na.last = TRUE) - 1L`. `am_take()` rejects a
-  fractional index or one outside `[0, 2^31)` with an error rather than coercing it to `NA`.
+  fractional index or one outside `[0, 2^32)` with an error rather than coercing it to `NA`.
+- **Index arrays are uint32** (`am_argsort()`, `am_top_k()`, `am_lexsort()`, the ranks). R has no
+  unsigned 32-bit type, so they read back the way `arrow` reads a uint32 array: an R `integer` vector
+  when every value is at most 2^31 - 1, a `double` vector when one is larger (exact up to 2^32 - 1).
 - **`as_arrow_array()` is `arrow`'s own generic.** `arrow` exports
   `as_arrow_array(x, ..., type = NULL)` with eight methods; this package registers a ninth for
   `am_array` and re-exports the generic unchanged, rather than defining a second one. A second
@@ -366,7 +369,7 @@ There is also no dplyr backend and no `RecordBatch`/`Table` surface: everything 
 
 `src/arrowmetal.h` and `src/arrow_abi.h` are copies of the repository's `include/` headers; refresh them (`cp include/arrowmetal.h r/arrowmetal/src/`) whenever the header changes, or `python/tests/test_header_copies.py` and `test-header-copy.R` fail.
 
-83 `test_that()` blocks in the sources (84 as testthat runs them: the one in test-dispatch.R runs once per attach order), 778 expectations, against base R and against `arrow`'s own
+87 `test_that()` blocks in the sources (88 as testthat runs them: the one in test-dispatch.R runs once per attach order), 818 expectations, against base R and against `arrow`'s own
 kernels on the same data: nulls, all-null and empty columns, sliced input at three offsets, lengths
 of 1, 33, 1024, 65537 and 1,000,001 (crossing a threadgroup boundary), one group per row and one group for
 everything, int64 above 2^53, float32 accumulation, and every documented error path.

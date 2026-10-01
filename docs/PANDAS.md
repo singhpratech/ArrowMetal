@@ -46,7 +46,7 @@ df.am.query(am.filter(am.col("price") > 100).sum(am.col("size")))   # one fused 
 | `std(ddof=1)` `var(ddof=1)` `count()` `nunique(dropna=True)` | |
 | `value_counts(sort, ascending, dropna)` | counts descending, ties in first-seen order — pandas' own order |
 | `sort_values(ascending)` | stable, nulls last; the index is taken along |
-| `argsort(ascending)` | int32 positions |
+| `argsort(ascending)` | uint32 positions |
 | `top_k(k, largest)` / `nlargest(n)` / `nsmallest(n)` | pandas' `keep="first"` tie behaviour |
 | `isin(values)` `abs()` `round(ndigits=0)` | `round` is half-to-even, as pandas is |
 | `compare(op, other)` and `>` `>=` `<` `<=` `==` `!=` | scalar or another column |

@@ -15,7 +15,7 @@ import Foundation
 /// Cost is one argsort and two `take`s per key. For k keys over n rows that is k radix sorts, which is
 /// still far cheaper than a comparison sort with a k-way comparator, and it needs no new kernel.
 public func lexsortIndices(_ columns: [AnyMetalArray], descending: [Bool] = [],
-                           nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
+                           nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<UInt32> {
     try lexsortIndices(columns, descending: descending, nullPlacements: [nullPlacement], floatOrders: [])
 }
 
@@ -26,7 +26,7 @@ public func lexsortIndices(_ columns: [AnyMetalArray], descending: [Bool] = [],
 /// the null block at that key's chosen end, the float key map that key's order asks for — so a key
 /// with options costs exactly what a key without them does.
 public func lexsortIndices(_ columns: [AnyMetalArray], descending: [Bool] = [],
-                           nullPlacements: [NullPlacement], floatOrders: [FloatOrder]) throws -> MetalArray<Int32> {
+                           nullPlacements: [NullPlacement], floatOrders: [FloatOrder]) throws -> MetalArray<UInt32> {
     guard let first = columns.first else {
         throw ArrowMetalError.invalidArrowArray("lexsort needs at least one column")
     }
@@ -45,14 +45,15 @@ public func lexsortIndices(_ columns: [AnyMetalArray], descending: [Bool] = [],
     func order(_ k: Int) -> FloatOrder { floatOrders.isEmpty ? .ieee : floatOrders[floatOrders.count == 1 ? 0 : k] }
     let n = first.length
     for c in columns where c.length != n { throw ArrowMetalError.lengthMismatch(n, c.length) }
+    try Dispatch.checkIndexRows(n, "lexsort")
     let ctx = first.metalContext
     if columns.count == 1 {
         return try columns[0].argsortIndices(descending: descending.first ?? false, nullPlacement: placement(0),
                                              floatOrder: order(0))
     }
-    guard n > 0 else { return try MetalArray<Int32>([Int32](), context: ctx) }
+    guard n > 0 else { return try MetalArray<UInt32>([UInt32](), context: ctx) }
 
-    var perm: MetalArray<Int32>? = nil                  // nil means "the identity so far"
+    var perm: MetalArray<UInt32>? = nil                  // nil means "the identity so far"
     for k in columns.indices.reversed() {
         let desc = descending.isEmpty ? false : descending[k]
         // The first pass sees the column as it is; later ones see it in the order the previous passes left.
@@ -74,7 +75,7 @@ extension AnyMetalArray {
     /// columns (see `FloatOrder`) and is ignored by every other type.
     public func argsortIndices(descending: Bool = false,
                                nullPlacement: NullPlacement = .atEnd,
-                               floatOrder: FloatOrder = .ieee) throws -> MetalArray<Int32> {
+                               floatOrder: FloatOrder = .ieee) throws -> MetalArray<UInt32> {
         switch self {
         case .int8(let a): return try a.argsort(descending: descending, nullPlacement: nullPlacement)
         case .uint8(let a): return try a.argsort(descending: descending, nullPlacement: nullPlacement)

@@ -677,6 +677,54 @@ The radix sort's block size is also now adaptive below ~256k rows: a fixed 4096 
 20k-element sort — the size top-k's final ordering lands on — running on five threadgroups. Inputs above
 ~256k rows are unaffected, so the 50M argsort is unchanged.
 
+## Index arrays: UInt32 row numbers
+
+Every call that returns row numbers into its input returns them as **UInt32** (Arrow `uint32`, format
+`I`): `argsort` (numeric, boolean, temporal, utf8 and binary), `topK`, `partitionNthIndices`, the
+lexsort, the hash join's index pairs (`hashJoin`, `JoinExtra.indices`), the ranks (`rowNumber`, `rank`,
+`denseRank`, `maxRank`, `rank(tiebreaker:)`, and the engine's `row_number` / `rank` / `dense_rank`
+window columns), `GroupByKeys.representativeRows()` and `GroupByKeys.rowIndices(_:_:)`. UInt32 is the
+width the Int32 arrays had, so the kernels, the bytes they move and the values they write are the same;
+it is the type arrow-rs `sort_to_indices` and Polars' `IdxSize` use. pyarrow returns uint64 for the same
+functions, with the same values. Before, a row number of 2^31 or more came back negative in an Int32
+array.
+
+Arrays hold at most 2^32 - 1 elements, so every row number fits. A call whose row numbers would pass
+2^32 - 1 is refused rather than wrapped, with the error
+`"<op>: row N does not fit the UInt32 index type (row numbers go up to 4294967295)"`
+(`Dispatch.checkIndexRows`). `take` accepts Int32, Int64 and UInt32 indices, as Arrow's does; an Int64
+index the 32-bit gathers of nested, fixed-size-binary and interval columns would have to narrow is
+checked against the range first, so it is an error and never another row.
+
+The integer outputs that are not row numbers into the input keep their types: dictionary codes and
+`index_in` positions are int32 (Arrow's defaults), group ids are int32 (a group-by holds at most 2^30
+groups), `inverse_permutation` is Arrow's signed int32 and refuses an index column of more than 2^31
+rows, `list_parent_indices()` is int32 and refuses a list column of more than 2^31 rows
+(`listParentIndices64()` is int64), and `indices_nonzero` is uint64, as in Arrow. The hash join takes at
+most 2^31 - 1 rows per side and returns at most 2^31 - 1 pairs.
+
+Timed against the Int32 build, alternating in one process (`Benchmarks/index_type_bench.py`,
+`Benchmarks/results/index_type_2026-10-01.csv`): an untimed warm-up of at least 100 ms per call, 8
+rounds of up to 30 calls, and the three calls whose median moved by more than 1% timed again alone, 20
+rounds of 100 calls (marked *). No call is more than 1% slower in both best and median time:
+
+| Call | 10M best (ms) | 10M median (ms) | 50M best (ms) | 50M median (ms) |
+|---|---|---|---|---|
+| argsort int64 | 7.410 → 7.412 | 7.555 → 7.563 | 37.399 → 37.395 | 38.297 → 38.251 |
+| argsort float64, 5% nulls | 7.860 → 7.858 | 8.054 → 8.021 | 40.840 → 40.753 | 45.007 → 44.756 |
+| argsort utf8 | 20.402 → 20.339 | 20.928 → 20.773 | 120.588 → 121.152 | 122.698 → 122.940 |
+| top_k 10 int64 * | 3.898 → 3.811 | 4.878 → 5.243 | 6.106 → 6.190 | 6.915 → 6.960 |
+| top_k 5000 float64 * | 3.546 → 3.572 | 4.709 → 4.645 | 4.491 → 4.494 | 4.839 → 4.766 |
+| partition_nth_indices int64 * | 5.592 → 5.554 | 8.012 → 8.235 | 11.828 → 11.800 | 13.081 → 13.070 |
+| lexsort (int32, float64) | 11.991 → 11.898 | 12.257 → 12.229 | 70.462 → 70.462 | 71.681 → 71.602 |
+| rank int32 | 6.491 → 6.507 | 6.705 → 6.694 | 44.901 → 44.798 | 46.054 → 45.976 |
+| group_by keys, 1000 groups | 2.660 → 2.687 | 4.990 → 4.334 | 4.653 → 4.653 | 4.798 → 4.772 |
+| take int64 through its argsort | 1.646 → 1.641 | 1.704 → 1.702 | 10.207 → 10.222 | 10.307 → 10.318 |
+| join indices int64, n × n/4 | 5.103 → 5.098 | 5.268 → 5.257 | 44.425 → 44.229 | 50.299 → 49.478 |
+
+A median of a call of a few milliseconds moves by several percent from one block to the next (top_k 10
+at 10M: 5.453 → 5.012 in the first block, 4.878 → 5.243 alone); a loss shows in both columns.
+
 ## Chunked columns and the import
 
 A column often arrives as many Arrow arrays: a pyarrow `ChunkedArray`, a multi-chunk Polars Series, one

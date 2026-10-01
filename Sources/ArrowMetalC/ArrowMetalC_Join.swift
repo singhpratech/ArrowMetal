@@ -32,7 +32,7 @@ private func joinKey(_ a: AnyMetalArray, _ side: String) throws -> AnyMetalArray
 
 /// Arrow's `hash_join` index form: the matching (left row, right row) pairs of an equi-join.
 ///
-/// `join_type` is 0 for an inner join and 1 for a left outer join. Both outputs are int32 index arrays of
+/// `join_type` is 0 for an inner join and 1 for a left outer join. Both outputs are uint32 index arrays of
 /// the same length: `out_left_idx[i]` is a row of `left_keys` and `out_right_idx[i]` the row of
 /// `right_keys` it matches. Duplicate keys on either side produce every combination; null keys never match;
 /// with a left join an unmatched left row appears once with a null right index. The pair order is
@@ -50,7 +50,7 @@ public func am_join(_ left: OpaquePointer?, _ right: OpaquePointer?, _ joinType:
             throw ArrowMetalError.invalidArrowArray("am_join: join_type must be 0 (inner) or 1 (left), got \(joinType)")
         }
         let lk = try joinKey(l, "left"), rk = try joinKey(r, "right")
-        let pair: (leftIndices: MetalArray<Int32>, rightIndices: MetalArray<Int32>)
+        let pair: (leftIndices: MetalArray<UInt32>, rightIndices: MetalArray<UInt32>)
         switch (lk, rk) {
         case (.int32(let a), .int32(let b)): pair = try hashJoin(left: a, right: b, kind: kind)
         case (.int64(let a), .int64(let b)): pair = try hashJoin(left: a, right: b, kind: kind)
@@ -59,8 +59,8 @@ public func am_join(_ left: OpaquePointer?, _ right: OpaquePointer?, _ joinType:
         default:
             throw ArrowMetalError.unsupportedType("am_join: key types \(l.arrowFormat) and \(r.arrowFormat) do not match")
         }
-        produce(.int32(pair.leftIndices), outLeft)
-        produce(.int32(pair.rightIndices), outRight)
+        produce(.uint32(pair.leftIndices), outLeft)
+        produce(.uint32(pair.rightIndices), outRight)
         return 0
     } catch { return fail(error) }
 }

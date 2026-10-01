@@ -11,7 +11,7 @@ final class AdversarialRankTests: XCTestCase {
     private static let vals: [Double?] = [3, 1, nil, 3, 2, nil, 1, Double.nan]
 
     private func assertRank(_ tiebreaker: RankTiebreaker, descending: Bool, _ placement: NullPlacement,
-                            _ expected: [Int32], file: StaticString = #filePath, line: UInt = #line) throws {
+                            _ expected: [UInt32], file: StaticString = #filePath, line: UInt = #line) throws {
         let a = try MetalArray<Double>(Self.vals, context: .shared)
         let got = try a.rank(tiebreaker: tiebreaker, descending: descending, nullPlacement: placement)
         XCTAssertEqual(got.toRawArray(), expected,

@@ -184,6 +184,11 @@ boolean logic, group-by, the string kernels, `with am.batch():` against the unba
 interop. Every result is compared to `pyarrow.compute` or plain Python. Polars tests skip when Polars is
 absent; the suite needs a real Metal device.
 
+Index arrays — `argsort`, `top_k`, `partition_nth_indices`, `lexsort_indices`, `am.join`, `rank` and
+the window functions' `row_number` / `rank` / `dense_rank` — are `pa.uint32()`, row numbers up to
+2^32 - 1 (a longer input raises). pyarrow returns uint64 for the same functions, with the same values.
+`take` accepts int32, int64 and uint32 arrays, NumPy arrays and lists (`python/tests/test_index_type.py`).
+
 Not covered by the dense-key `MetalArray.group_by(key_count)` path: `min`/`max` on 64-bit values, `mean` on
 Float32, and Float64 values for any aggregate; `python/tests` pins those as expected errors. `am.group_by(keys)` runs every aggregate on Float64 values
 (python/tests/test_arrowmetal.py::test_group_by_arbitrary_keys_matches_pyarrow).

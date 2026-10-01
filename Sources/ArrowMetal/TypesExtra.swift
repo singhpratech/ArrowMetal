@@ -599,7 +599,7 @@ public final class MetalIntervalArray: @unchecked Sendable {
     public func toArray() -> [ArrowInterval?] { (0..<length).map { self[$0] } }
 
     public func take<I: ArrowIndex>(_ indices: MetalArray<I>) throws -> MetalIntervalArray {
-        let idx32: MetalArray<Int32> = try (indices as? MetalArray<Int32>) ?? indices.cast(to: Int32.self)
+        let idx32: MetalArray<Int32> = try indices.int32Rows()
         let r = try FixedWidth.take(context, values: values, validity: validity, length: length,
                                     byteWidth: unit.byteWidth, indices: idx32)
         let out = MetalIntervalArray(unit: unit, length: r.length, nullCount: 0, validity: r.validity,
@@ -609,7 +609,7 @@ public final class MetalIntervalArray: @unchecked Sendable {
     }
     public func filter(_ mask: MetalBooleanArray) throws -> MetalIntervalArray {
         guard mask.length == length else { throw ArrowMetalError.lengthMismatch(length, mask.length) }
-        return try take(try MetalArray<Int32>.iota(length, context: context).filter(mask))
+        return try take(try MetalArray<UInt32>.iota(length, context: context).filter(mask))
     }
     public func slice(offset: Int, length n: Int) throws -> MetalIntervalArray {
         guard offset >= 0, n >= 0, offset + n <= length else {
@@ -809,7 +809,7 @@ public final class MetalFixedBinaryArray: @unchecked Sendable {
     }
 
     public func take<I: ArrowIndex>(_ indices: MetalArray<I>) throws -> MetalFixedBinaryArray {
-        let idx32: MetalArray<Int32> = try (indices as? MetalArray<Int32>) ?? indices.cast(to: Int32.self)
+        let idx32: MetalArray<Int32> = try indices.int32Rows()
         let r = try FixedWidth.take(context, values: values, validity: validity, length: length,
                                     byteWidth: byteWidth, indices: idx32)
         let out = MetalFixedBinaryArray(byteWidth: byteWidth, length: r.length, nullCount: 0,
@@ -819,7 +819,7 @@ public final class MetalFixedBinaryArray: @unchecked Sendable {
     }
     public func filter(_ mask: MetalBooleanArray) throws -> MetalFixedBinaryArray {
         guard mask.length == length else { throw ArrowMetalError.lengthMismatch(length, mask.length) }
-        return try take(try MetalArray<Int32>.iota(length, context: context).filter(mask))
+        return try take(try MetalArray<UInt32>.iota(length, context: context).filter(mask))
     }
     public func slice(offset: Int, length n: Int) throws -> MetalFixedBinaryArray {
         guard offset >= 0, n >= 0, offset + n <= length else {

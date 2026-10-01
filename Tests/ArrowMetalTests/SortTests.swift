@@ -14,8 +14,8 @@ final class SortTests: XCTestCase {
             if a.isTotallyLess(b) { return true }
             if b.isTotallyLess(a) { return false }
             return x.offset < y.offset
-        }.map { Int32($0.offset) }
-        let nulls = vals.enumerated().filter { $0.element == nil }.map { Int32($0.offset) }
+        }.map { UInt32($0.offset) }
+        let nulls = vals.enumerated().filter { $0.element == nil }.map { UInt32($0.offset) }
         XCTAssertEqual(idx, sortedNonNull + nulls, "\(T.self) n=\(vals.count)", file: file, line: line)
         let desc = try a.argsort(descending: true).toRawArray()
         let sortedDesc = nonNull.sorted { x, y in
@@ -26,7 +26,7 @@ final class SortTests: XCTestCase {
             if b.isTotallyLess(a) { return true }
             if a.isTotallyLess(b) { return false }
             return x.offset < y.offset
-        }.map { Int32($0.offset) }
+        }.map { UInt32($0.offset) }
         XCTAssertEqual(desc, sortedDesc + nulls, "desc", file: file, line: line)
     }
 
@@ -71,8 +71,8 @@ final class SortTests: XCTestCase {
         try requireRealGPU()
         let f: [Float?] = [1.0, .nan, .infinity, -.infinity, -0.0, 0.0, nil, .nan]
         let d: [Double?] = f.map { $0.map { Double($0) } }
-        let ascending: [Int32] = [3, 4, 5, 0, 2, 1, 7, 6]
-        let descending: [Int32] = [2, 0, 4, 5, 3, 1, 7, 6]
+        let ascending: [UInt32] = [3, 4, 5, 0, 2, 1, 7, 6]
+        let descending: [UInt32] = [2, 0, 4, 5, 3, 1, 7, 6]
         func expect<T: ArrowPrimitive>(_ a: MetalArray<T>, _ name: String) throws {
             XCTAssertEqual(try a.argsort().toRawArray(), ascending,
                            "\(name) ascending: -0.0 ties with 0.0, NaN after +inf")

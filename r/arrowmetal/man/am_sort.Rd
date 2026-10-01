@@ -25,7 +25,9 @@ options; it holds in both directions.}
 \item{largest}{The \code{k} largest (default) or, with \code{FALSE}, the \code{k} smallest.}
 }
 \value{
-\code{am_argsort()} returns an int32 \code{am_array} of zero-based indices;
+\code{am_argsort()} returns a uint32 \code{am_array} of zero-based indices (row numbers up to
+2^32 - 1; \code{as.vector()} gives an integer vector when every index fits a 32-bit R integer and a
+double vector when one passes 2^31 - 1, which is how the \code{arrow} package reads uint32);
 \code{am_sort()} returns a sorted \code{am_array} of \code{x}'s type; \code{am_top_k()} returns the
 first \code{k} indices \code{am_argsort(x, descending = largest, ...)} gives, found by GPU selection.
 }

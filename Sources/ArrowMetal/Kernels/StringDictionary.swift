@@ -217,7 +217,7 @@ extension MetalStringArray {
         // it, which is exactly the old-code -> new-code relabelling.
         let perm = try firstIdx.argsort()
         let relabel = try perm.argsort()
-        let codes = try relabel.take(keyOrderCodes)
+        let codes = try relabel.reinterpreted(as: Int32.self).take(keyOrderCodes)
         let ordered = try reps.take(perm)
         // The dictionary has no nulls, so it carries no bitmap (the gather leaves an all-ones one).
         let unique = ordered.nullCount == 0 && ordered.validity != nil

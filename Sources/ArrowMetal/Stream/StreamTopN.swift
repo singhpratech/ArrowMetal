@@ -88,18 +88,18 @@ func topNThresholdMask(_ c: AnyMetalArray, _ threshold: StreamValue, largest: Bo
     }
 }
 
-/// The row numbers where `mask` is a valid `true`, as int32 gather indices, or nil when there are
+/// The row numbers where `mask` is a valid `true`, as UInt32 gather indices, or nil when there are
 /// none. Reading the length is the one host round trip a pruned batch pays.
-func survivorIndices(_ mask: MetalBooleanArray) throws -> MetalArray<Int32>? {
+func survivorIndices(_ mask: MetalBooleanArray) throws -> MetalArray<UInt32>? {
     let wide = try mask.indicesNonzero()
     guard wide.length > 0 else { return nil }
-    return try wide.cast(to: Int32.self)
+    return try wide.cast(to: UInt32.self)
 }
 
 /// `topKIndices` where the value type has a GPU selection, nil where it does not (`utf8`, `binary`,
 /// `boolean`, decimals, nested types), so the caller can fall back to the full ordering.
 func topKIndicesIfSupported(_ c: AnyMetalArray, k: Int, largest: Bool, nullPlacement: NullPlacement = .atEnd,
-                            floatOrder: FloatOrder = .ieee) throws -> MetalArray<Int32>? {
+                            floatOrder: FloatOrder = .ieee) throws -> MetalArray<UInt32>? {
     switch c {
     case .int8, .int16, .int32, .int64, .uint8, .uint16, .uint32, .uint64, .float32, .float64, .temporal:
         guard k > 0, k <= c.length else { return nil }

@@ -155,7 +155,11 @@ idle Mac.
   plain R vector to the GPU that does not go through an `arrow::Array` (`am_array(c(1,2,3))` calls
   `Array$create` for you).
 - **Zero-based indices.** `am_argsort()` and `am_take()` use Arrow's convention, not R's. An index
-  outside `[0, 2^31)`, or a fractional one, is an error rather than a silent `NA`.
+  outside `[0, 2^32)`, or a fractional one, is an error rather than a silent `NA`.
+- **uint32 index arrays.** `am_argsort()`, `am_top_k()` and `am_lexsort()` return uint32 indices,
+  so row numbers go up to 2^32 - 1 (a larger input is an error). R has no unsigned 32-bit type:
+  `as.vector()` reads them the way the `arrow` package reads uint32, an integer vector when every
+  index fits a 32-bit R integer and a double vector when one passes 2^31 - 1.
 - **`as_arrow_array()` is `arrow`'s generic**, not a new one: the package registers a method on it
   and re-exports it, so dispatch works whichever order the two packages are attached in.
 - **An `NA` scalar** in `am_compare()` gives an all-null mask, as base R and arrow do. The ABI
@@ -165,7 +169,7 @@ idle Mac.
 
 ## Tests
 
-83 `test_that()` blocks in the sources (84 as testthat runs them: the one in test-dispatch.R runs once per attach order), 778 expectations, comparing against base R and against `arrow`'s
+87 `test_that()` blocks in the sources (88 as testthat runs them: the one in test-dispatch.R runs once per attach order), 818 expectations, comparing against base R and against `arrow`'s
 own kernels on the same data: nulls, all-null and empty columns, sliced input, lengths of 1, 33,
 1024, 65537 and 1,000,001 (crossing a threadgroup boundary), int64 above 2^53, float32, strings and
 booleans, and every error path.

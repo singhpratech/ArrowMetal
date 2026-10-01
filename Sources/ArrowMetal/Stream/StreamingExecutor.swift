@@ -1643,7 +1643,7 @@ func topKRows(_ batch: MetalRecordBatch, column: String, k: Int, largest: Bool) 
 }
 
 func topKIndices(_ c: AnyMetalArray, k: Int, largest: Bool, nullPlacement: NullPlacement = .atEnd,
-                 floatOrder: FloatOrder = .ieee) throws -> MetalArray<Int32> {
+                 floatOrder: FloatOrder = .ieee) throws -> MetalArray<UInt32> {
     let p = nullPlacement
     switch c {
     case .int8(let a): return try a.topK(k, largest: largest, nullPlacement: p)
@@ -1669,7 +1669,7 @@ func topKIndices(_ c: AnyMetalArray, k: Int, largest: Bool, nullPlacement: NullP
 /// boolean and temporal columns use the GPU radix sort (`AnyMetalArray.argsortIndices`); utf8 and binary
 /// columns fall back to a host sort of the string values (documented in docs/STREAMING.md).
 func argsortAny(_ c: AnyMetalArray, descending: Bool, nullPlacement: NullPlacement = .atEnd,
-                floatOrder: FloatOrder = .ieee) throws -> MetalArray<Int32> {
+                floatOrder: FloatOrder = .ieee) throws -> MetalArray<UInt32> {
     switch c {
     case .string, .binary:
         let vals = try c.streamValues()
@@ -1679,7 +1679,8 @@ func argsortAny(_ c: AnyMetalArray, descending: Bool, nullPlacement: NullPlaceme
             let o = key.order(vals[i], vals[j])
             return o == 0 ? i < j : o < 0
         }
-        return try MetalArray<Int32>(order.map { Int32($0) }, context: c.anyContext)
+        try Dispatch.checkIndexRows(vals.count, "argsort")
+        return try MetalArray<UInt32>(order.map { UInt32($0) }, context: c.anyContext)
     default:
         return try c.argsortIndices(descending: descending, nullPlacement: nullPlacement, floatOrder: floatOrder)
     }

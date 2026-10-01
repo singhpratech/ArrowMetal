@@ -56,7 +56,7 @@ enum TopK {
 extension MetalArray {
     /// Row indices of the k best rows, selected per threadgroup and ordered by one small radix sort.
     /// Returns nil when this array's type or shape is better served by the full sort.
-    func topKSelect(_ k: Int, largest: Bool, floatOrder: FloatOrder = .ieee) throws -> MetalArray<Int32>? {
+    func topKSelect(_ k: Int, largest: Bool, floatOrder: FloatOrder = .ieee) throws -> MetalArray<UInt32>? {
         guard k > 0, k <= 1024, let kind = TopK.keyKind(T.self, floatOrder: floatOrder) else { return nil }
         let n = length
         // Fewer valid rows than k means the answer has to reach into the null rows, which the selection
@@ -96,7 +96,7 @@ extension MetalArray {
         // lower row indices than block b + 1. So candidate position is itself the tie-break the total
         // order wants, and one *stable* radix sort of the keys is the whole final ordering.
         let idx = MetalArray<UInt32>(length: m, nullCount: 0, validity: nil, values: candIdx, context: ctx)
-        let ord: MetalArray<Int32>
+        let ord: MetalArray<UInt32>
         if wide {
             ord = try MetalArray<UInt64>(length: m, nullCount: 0, validity: nil, values: candKeys, context: ctx).argsort()
         } else {
@@ -108,6 +108,6 @@ extension MetalArray {
         let gathered = try idx.take(ord)
         let ranked = try gathered.filter(try gathered.compare(.ne, UInt32.max))
         guard ranked.length >= k else { return nil }
-        return try ranked.slice(offset: 0, length: k).cast(to: Int32.self)
+        return try ranked.slice(offset: 0, length: k)
     }
 }

@@ -8,14 +8,14 @@ import Metal
 /// it is a value the caller can hold and pass to several aggregates. `GroupBy` also caches it.
 public final class GroupSegments {
     /// Row index of each non-null key, ascending by key (stable, so rows inside a group keep their order).
-    let ord: MetalArray<Int32>
+    let ord: MetalArray<UInt32>
     /// First and one-past-last sorted position of each key. A key with no rows keeps `start == end == 0`.
     let segStart: MetalArrowBuffer
     let segEnd: MetalArrowBuffer
     public let keyCount: Int
     public let rows: Int
 
-    init(ord: MetalArray<Int32>, segStart: MetalArrowBuffer, segEnd: MetalArrowBuffer, keyCount: Int, rows: Int) {
+    init(ord: MetalArray<UInt32>, segStart: MetalArrowBuffer, segEnd: MetalArrowBuffer, keyCount: Int, rows: Int) {
         self.ord = ord; self.segStart = segStart; self.segEnd = segEnd; self.keyCount = keyCount; self.rows = rows
     }
 }
@@ -53,7 +53,7 @@ extension GroupBy {
         let segStart = try MetalArrowBuffer.allocate(byteCount: keyCount * 4, context: ctx)
         let segEnd = try MetalArrowBuffer.allocate(byteCount: keyCount * 4, context: ctx)
         let ord = m > 0 ? try keys.argsort().slice(offset: 0, length: m)
-                        : try MetalArray<Int32>([Int32](), context: ctx)
+                        : try MetalArray<UInt32>([UInt32](), context: ctx)
         if m > 0 {
             let src = SegmentedSource.boundsSource(KT: K.mslType)
             let pso = try Dispatch.pipeline(ctx, family: "segmented", source: src, function: "seg_bounds", type: K.mslType)

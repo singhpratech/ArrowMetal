@@ -273,7 +273,7 @@ class ArrowMetalSeries:
         return self._back(self._m().sort(descending))
 
     def arg_sort(self, *, descending=False) -> pl.Series:
-        """The int32 indices that sort this Series."""
+        """The UInt32 indices that sort this Series (Polars' own index type, IdxSize)."""
         return to_polars(self._m().argsort(descending), self._s.name)
 
     def filter(self, mask) -> pl.Series:

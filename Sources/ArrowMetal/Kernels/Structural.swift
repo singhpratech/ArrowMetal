@@ -418,8 +418,12 @@ extension MetalArray {
     static func prepareIndexed(_ set: MetalArray<T>) throws -> LookupSet<T> {
         let (gb, unique) = try set.groupBy()
         guard unique.length > 0 else { return LookupSet(values: unique, firstIndex: nil) }
-        let rows = try MetalArray<Int32>.iota(set.length, context: set.context)
-        return LookupSet(values: unique, firstIndex: try gb.min(rows))
+        // index_in answers with Arrow's int32 position in the set.
+        guard set.length - 1 <= Int(Int32.max) else {
+            throw ArrowMetalError.invalidArrowArray("index_in: a value set of \(set.length) rows has positions past the int32 result")
+        }
+        let rows = try MetalArray<UInt32>.iota(set.length, context: set.context)
+        return LookupSet(values: unique, firstIndex: try gb.min(rows).reinterpreted(as: Int32.self))
     }
 
     func isIn(prepared set: LookupSet<T>) throws -> MetalBooleanArray {

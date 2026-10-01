@@ -42,8 +42,9 @@ extension MetalArray {
     /// Slots no index names are null; duplicate indices resolve to the **last** (largest) source
     /// position, as Arrow does; null indices are skipped. An index outside `[0, maxIndex]` throws.
     ///
-    /// The result is always `int32` — Arrow's `output_type` option is not implemented, and this
-    /// library caps arrays at 2^32 elements, so an int32 position is always enough.
+    /// The result is always `int32`, Arrow's default signed output type (the `output_type` option is
+    /// not implemented). Its values are positions in this column, so a column of more than 2^31 rows,
+    /// whose positions do not all fit an int32, is refused.
     public func inversePermutation(maxIndex: Int64 = -1) throws -> MetalArray<Int32> {
         guard !T.isFloatingPoint else {
             throw ArrowMetalError.unsupportedType("inverse_permutation needs an integer index column, got \(T.arrowFormat)")
@@ -51,6 +52,10 @@ extension MetalArray {
         let ctx = context
         let n = length
         try Dispatch.checkLength(n)
+        guard n - 1 <= Int(Int32.max) else {
+            throw ArrowMetalError.invalidArrowArray(
+                "inverse_permutation: position \(n - 1) does not fit the int32 output (positions go up to \(Int32.max))")
+        }
         let outLen = maxIndex < 0 ? n : Int(maxIndex) + 1
         guard outLen >= 0, outLen <= Int(UInt32.max) else {
             throw ArrowMetalError.invalidArrowArray("inverse_permutation max_index \(maxIndex) is out of range")
@@ -353,7 +358,7 @@ extension MetalArray {
 /// The sorted order and per-run bookkeeping the quantile-rank functions share: one argsort, one scan.
 final class RankOrder {
     /// Original row index of each sorted position (nulls last).
-    let ord: MetalArray<Int32>
+    let ord: MetalArray<UInt32>
     /// 1-based tie-group number of each sorted position (the inclusive scan of the run marks).
     let groups: MetalArray<Int32>
     /// First and one-past-last sorted position of each tie group, indexed by its 0-based number.
@@ -364,7 +369,7 @@ final class RankOrder {
     let source: String
     let unsignedType: String
 
-    init(ord: MetalArray<Int32>, groups: MetalArray<Int32>, runStart: MetalArrowBuffer,
+    init(ord: MetalArray<UInt32>, groups: MetalArray<Int32>, runStart: MetalArrowBuffer,
          runEnd: MetalArrowBuffer, n: Int, source: String, unsignedType: String) {
         self.ord = ord; self.groups = groups; self.runStart = runStart; self.runEnd = runEnd
         self.n = n; self.source = source; self.unsignedType = unsignedType

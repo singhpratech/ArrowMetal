@@ -9,7 +9,7 @@ mod common;
 
 use std::sync::Arc;
 
-use arrow::array::{Array as _, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array};
+use arrow::array::{Array as _, ArrayRef, Float32Array, Float64Array, Int64Array, UInt32Array};
 use arrow::compute::{lexsort_to_indices, sort, take, SortColumn};
 use arrowmetal::{lexsort, run_plan, Array, FloatOrder, SortOptions, Source};
 use rand::Rng;
@@ -111,7 +111,7 @@ fn check_column(a: ArrayRef, what: &str) {
         assert_eq!(got, want, "{what} sort n={n} {o:?}");
 
         let idx = gpu.argsort_with(opts).unwrap().to_arrow().unwrap();
-        let idx = idx.as_any().downcast_ref::<Int32Array>().unwrap().clone();
+        let idx = idx.as_any().downcast_ref::<UInt32Array>().unwrap().clone();
         let applied = bits(&take(a.as_ref(), &idx, None).unwrap());
         assert_eq!(applied, want, "{what} take(argsort) n={n} {o:?}");
         // Stable: equal keys (identical bits, or both null) keep their input order.
@@ -124,7 +124,7 @@ fn check_column(a: ArrayRef, what: &str) {
 
         for k in [1usize, 17, 100] {
             let top = gpu.top_k_with(k, opts).unwrap().to_arrow().unwrap();
-            let top = top.as_any().downcast_ref::<Int32Array>().unwrap();
+            let top = top.as_any().downcast_ref::<UInt32Array>().unwrap();
             let kk = k.min(n);
             assert_eq!(top.len(), kk, "{what} top_k len n={n} k={k} {o:?}");
             assert_eq!(top.values()[..], idx.values()[..kk], "{what} top_k n={n} k={k} {o:?}");
@@ -191,8 +191,8 @@ fn lexsort_with_per_key_options_matches_arrow_rs() {
                 ];
                 let want_idx = lexsort_to_indices(&cols, None).unwrap();
                 let got = lexsort(&[&g1, &g2], &[o1.into(), o2.into()]).unwrap().to_arrow().unwrap();
-                let got = got.as_any().downcast_ref::<Int32Array>().unwrap();
-                let got_idx: Vec<u32> = got.values().iter().map(|&v| v as u32).collect();
+                let got = got.as_any().downcast_ref::<UInt32Array>().unwrap();
+                let got_idx: Vec<u32> = got.values().to_vec();
                 let want_idx: Vec<u32> = want_idx.values().to_vec();
                 for c in [&k1, &k2] {
                     let w = bits(&take(c.as_ref(), &arrow::array::UInt32Array::from(want_idx.clone()), None).unwrap());

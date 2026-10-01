@@ -23,8 +23,9 @@ am_slice(x, offset, length)
 \item{mask}{A boolean column of the same length as \code{x}. A null in the mask drops the row,
 which is Arrow's default \code{null_selection_behavior = "drop"}.}
 
-\item{indices}{Zero-based indices: an \code{am_array} of integers, an \code{arrow} Array, or an R
-integer or numeric vector.}
+\item{indices}{Zero-based indices: an \code{am_array} or \code{arrow} Array of int32, int64 or
+uint32 integers (the uint32 index arrays \code{am_argsort()} returns included), or an R integer or
+numeric vector of whole numbers in [0, 2^32 - 1].}
 
 \item{offset}{Zero-based first row.}
 

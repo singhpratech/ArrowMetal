@@ -15,11 +15,11 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array as _, ArrayRef, BooleanArray, DictionaryArray, Float64Array, Int32Array, Int64Array,
-    Scalar as ArrowScalar, StructArray,
+    Scalar as ArrowScalar, StructArray, UInt32Array,
 };
 use arrow::compute::kernels::cmp;
-use arrow::compute::{filter, sort, take, SortOptions};
-use arrow::datatypes::{Field, Int32Type};
+use arrow::compute::{filter, sort, sort_to_indices, take, SortOptions};
+use arrow::datatypes::{DataType, Field, Int32Type};
 use arrowmetal::{group_by, Agg, Array, CompareOp, Scalar};
 
 use common::{arc, close, float64, int64, LENGTHS};
@@ -345,11 +345,12 @@ fn argsort_indices_reproduce_arrows_sorted_order() {
 
             let idx = gpu.argsort(descending).unwrap();
             let idx_arrow = idx.to_arrow().unwrap();
-            let idx_i32 = idx_arrow.as_any().downcast_ref::<Int32Array>().unwrap();
-            assert_eq!(idx_i32.len(), n, "argsort length at n={n}");
-            assert_eq!(idx_i32.null_count(), 0, "argsort indices are never null");
+            assert_eq!(idx_arrow.data_type(), &DataType::UInt32, "argsort indices are uint32");
+            let idx_u32 = idx_arrow.as_any().downcast_ref::<UInt32Array>().unwrap();
+            assert_eq!(idx_u32.len(), n, "argsort length at n={n}");
+            assert_eq!(idx_u32.null_count(), 0, "argsort indices are never null");
             let mut seen = vec![false; n];
-            for v in idx_i32.values() {
+            for v in idx_u32.values() {
                 let v = *v as usize;
                 assert!(v < n && !seen[v], "argsort indices are not a permutation at n={n}");
                 seen[v] = true;
@@ -357,10 +358,68 @@ fn argsort_indices_reproduce_arrows_sorted_order() {
 
             let opts = SortOptions { descending, nulls_first: false };
             let want = sort(a.as_ref(), Some(opts)).unwrap();
-            let got = take(a.as_ref(), idx_i32, None).unwrap();
+            let got = take(a.as_ref(), idx_u32, None).unwrap();
             assert_eq!(&got, &want, "take(argsort) at n={n} desc={descending}");
+            // The GPU take accepts the uint32 indices it returned.
+            let back = gpu.take(&idx).unwrap().to_arrow().unwrap();
+            assert_eq!(&back, &want, "gpu take(argsort) at n={n} desc={descending}");
         }
     }
+}
+
+/// On distinct values (no ties, no nulls, so the order is unique) the indices are exactly arrow-rs
+/// `sort_to_indices`'s, value for value and type for type (UInt32).
+#[test]
+fn argsort_matches_arrow_sort_to_indices_on_distinct_values() {
+    for &n in &[1usize, 1025, 1_000_001] {
+        // A permutation of 0..n: distinct, so every correct sort gives the same indices.
+        let vals: Vec<i64> = (0..n as i64).map(|i| (i * 7_919) % n as i64 - (n as i64) / 2).collect();
+        let a: ArrayRef = arc(Int64Array::from(vals));
+        let gpu = Array::from_arrow(a.as_ref()).unwrap();
+        for &descending in &[false, true] {
+            let opts = SortOptions { descending, nulls_first: false };
+            let want = sort_to_indices(a.as_ref(), Some(opts), None).unwrap();
+            let got = gpu.argsort(descending).unwrap().to_arrow().unwrap();
+            let got = got.as_any().downcast_ref::<UInt32Array>().unwrap();
+            assert_eq!(got, &want, "argsort vs sort_to_indices n={n} desc={descending}");
+        }
+    }
+}
+
+/// top_k returns uint32 indices: the first k that argsort gives.
+#[test]
+fn top_k_indices_are_uint32() {
+    let a: ArrayRef = arc(int64(10_001, 5, 7));
+    let gpu = Array::from_arrow(a.as_ref()).unwrap();
+    let all = gpu.argsort(true).unwrap().to_arrow().unwrap();
+    let all = all.as_any().downcast_ref::<UInt32Array>().unwrap();
+    for k in [1usize, 10, 5_000] {
+        let opts = arrowmetal::SortOptions { descending: true, ..Default::default() };
+        let top = gpu.top_k_with(k, opts).unwrap().to_arrow().unwrap();
+        assert_eq!(top.data_type(), &DataType::UInt32);
+        let top = top.as_any().downcast_ref::<UInt32Array>().unwrap();
+        assert_eq!(top.values()[..], all.values()[..k], "top_k k={k}");
+    }
+}
+
+/// take with Int32, Int64 and UInt32 index arrays gives the same rows as arrow-rs's take.
+#[test]
+fn take_accepts_int32_int64_and_uint32_indices() {
+    let a: ArrayRef = arc(int64(1_001, 4, 17));
+    let gpu = Array::from_arrow(a.as_ref()).unwrap();
+    let rows: Vec<Option<u32>> = (0..2_000u32).map(|i| if i % 97 == 0 { None } else { Some((i * 7919) % 1_001) }).collect();
+    let u: UInt32Array = rows.iter().copied().collect();
+    let i: Int32Array = rows.iter().map(|r| r.map(|v| v as i32)).collect();
+    let l: Int64Array = rows.iter().map(|r| r.map(|v| v as i64)).collect();
+    let want = take(a.as_ref(), &u, None).unwrap();
+    for idx in [Arc::new(u) as ArrayRef, Arc::new(i), Arc::new(l)] {
+        let gidx = Array::from_arrow(idx.as_ref()).unwrap();
+        let got = gpu.take(&gidx).unwrap().to_arrow().unwrap();
+        assert_eq!(&got, &want, "take with {:?} indices", idx.data_type());
+    }
+    // A uint32 index past the end is an error, not a wrapped row.
+    let bad = Array::from_arrow(&UInt32Array::from(vec![0u32, u32::MAX])).unwrap();
+    assert!(gpu.take(&bad).is_err());
 }
 
 /// `take` against `arrow::compute::take`, with out-of-order and repeated indices and a null index.

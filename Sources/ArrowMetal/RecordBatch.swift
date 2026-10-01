@@ -136,6 +136,7 @@ extension AnyMetalArray {
 
     /// Typed accessors (nil when the column has another type).
     public var asInt32: MetalArray<Int32>? { if case .int32(let a) = self { return a } else { return nil } }
+    public var asUInt32: MetalArray<UInt32>? { if case .uint32(let a) = self { return a } else { return nil } }
     public var asInt64: MetalArray<Int64>? { if case .int64(let a) = self { return a } else { return nil } }
     public var asFloat32: MetalArray<Float>? { if case .float32(let a) = self { return a } else { return nil } }
     public var asFloat64: MetalArray<Double>? { if case .float64(let a) = self { return a } else { return nil } }

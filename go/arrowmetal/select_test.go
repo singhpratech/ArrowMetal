@@ -241,7 +241,7 @@ func TestArgsortAgainstArrowGo(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer got.Release()
-	gi, _ := int32sOf(t, exportArr(t, got))
+	gi := rowsOf(t, exportArr(t, got))
 
 	key := compute.DefaultSortKey()
 	key.NullPlacement = compute.SortNullsAtEnd
@@ -289,7 +289,7 @@ func TestLexsort(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer got.Release()
-	gi, _ := int32sOf(t, exportArr(t, got))
+	gi := rowsOf(t, exportArr(t, got))
 
 	want := make([]int32, n)
 	for i := range want {

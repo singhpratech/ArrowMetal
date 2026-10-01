@@ -224,6 +224,30 @@ def _call(fn, *args):
     return MetalArray(out)
 
 
+
+def _index_array(indices):
+    """`take` indices as a pyarrow array of a type the GPU gather reads: int32, int64 and uint32 stay
+    as they are, int8 / int16 widen to int32 and uint8 / uint16 to uint32, uint64 narrows to int64 when
+    its values allow (an index past that range is out of range for any array anyway), and a plain
+    sequence becomes int64, so a row number of 2^31 or more needs no special spelling."""
+    if isinstance(indices, pa.ChunkedArray):
+        indices = indices.combine_chunks()
+    if not isinstance(indices, pa.Array):
+        if hasattr(indices, "dtype"):
+            indices = pa.array(indices)
+        else:
+            indices = pa.array(list(indices), type=pa.int64())
+    t = indices.type
+    if pa.types.is_int32(t) or pa.types.is_int64(t) or pa.types.is_uint32(t):
+        return indices
+    if pa.types.is_int8(t) or pa.types.is_int16(t):
+        return indices.cast(pa.int32())
+    if pa.types.is_uint8(t) or pa.types.is_uint16(t):
+        return indices.cast(pa.uint32())
+    if pa.types.is_null(t):
+        return indices.cast(pa.int64())
+    return indices.cast(pa.int64())
+
 class MetalArray:
     """A Metal-resident Arrow array. Immutable; every operation returns a new array."""
 
@@ -418,8 +442,11 @@ class MetalArray:
     def filter(self, mask): return _call(_lib.am_filter, self._h, mask._h)
     def filter_where(self, op, scalar): return _call(_lib.am_filter_where, self._h, _OPS[op], self._scalar(scalar))
     def take(self, indices):
+        """Arrow `take`. `indices` is a MetalArray, a pyarrow array, a NumPy array or a list; int32,
+        int64 and uint32 indices are taken as they are (the index arrays this package returns are
+        uint32), narrower integers widen to them, and a list becomes int64."""
         if not isinstance(indices, MetalArray):
-            indices = MetalArray.from_arrow(pa.array(indices, type=pa.int32()))
+            indices = MetalArray.from_arrow(_index_array(indices))
         return _call(_lib.am_take, self._h, indices._h)
     def slice(self, offset, length):
         """Arrow `slice`: a zero-copy view of `length` rows starting at `offset`.
@@ -431,7 +458,8 @@ class MetalArray:
 
     # ---- sorting (GPU radix sort; stable, nulls last)
     def argsort(self, descending=False):
-        """Int32 indices that sort the array (Arrow `array_sort_indices`).
+        """UInt32 indices that sort the array (Arrow `array_sort_indices`; pyarrow returns uint64,
+        with the same values). Row numbers stop at 2^32 - 1; a longer input raises.
 
         Numeric, boolean and temporal columns take the radix argsort. utf8 and binary columns take the
         prefix radix sort and come out in byte-wise lexicographic order — the order Arrow defines for
@@ -443,7 +471,7 @@ class MetalArray:
         return _call(_lib.am_sort, self._h, 1 if descending else 0)
 
     def top_k(self, k, largest=True, null_placement="at_end", float_order="ieee"):
-        """Int32 indices of the k largest (or smallest) values, in sorted order.
+        """UInt32 indices of the k largest (or smallest) values, in sorted order.
 
         The first k indices `argsort(descending=largest, null_placement=..., float_order=...)` gives:
         `null_placement="at_start"` puts the null rows first, `float_order="total"` orders floats by
@@ -1295,7 +1323,7 @@ del _op
 
 
 def lexsort_indices(columns, descending=None, null_placement="at_end", float_order="ieee"):
-    """Multi-column (lexicographic) sort: int32 indices ordering the rows by each column in turn, the
+    """Multi-column (lexicographic) sort: uint32 indices ordering the rows by each column in turn, the
     first column being the most significant.
 
     `descending` is one flag per column, or None for all ascending. Successive stable GPU radix argsorts
@@ -1349,7 +1377,7 @@ _JOIN_KIND = {"inner": 0, "left": 1}
 def join(left_keys, right_keys, how="inner"):
     """GPU hash join in index form: the (left row, right row) pairs whose keys are equal.
 
-    Returns two int32 index arrays of the same length. Apply them with `take` to build the joined
+    Returns two uint32 index arrays of the same length. Apply them with `take` to build the joined
     columns:
 
         li, ri = am.join(orders["customer_id"], customers["id"])
@@ -1357,7 +1385,8 @@ def join(left_keys, right_keys, how="inner"):
 
     `how` is "inner" (only matching left rows) or "left" (every left row once per match, and once with a
     null right index when it has none). Duplicate keys on either side produce every combination; null keys
-    never match; the pair order is unspecified. Keys must be int32 or int64 on both sides — a temporal
+    never match; the pair order is unspecified. Each side holds at most 2^31 - 1 rows and the result at
+    most 2^31 - 1 pairs. Keys must be int32 or int64 on both sides — a temporal
     column joins on its storage integer, a dictionary column on its codes.
 
     This is what `MetalRecordBatch.join(other, on:rightKey:kind:)` does on the Swift side: these indices,
@@ -2766,7 +2795,7 @@ def _value_counts(self):
 
 
 def _partition_nth_indices(self, n):
-    """Arrow `partition_nth_indices`: indices that put the n smallest values first.
+    """Arrow `partition_nth_indices`: uint32 indices that put the n smallest values first.
 
     Answered with the full stable GPU argsort, which satisfies the contract; there is no cheaper
     partial-partition kernel yet (`top_k` is the one that does less work than a full sort).
@@ -3956,7 +3985,8 @@ def _rank_ex(self, sort_keys="ascending", null_placement="at_end", tiebreaker="m
 
     `sort_keys` is `"ascending"` or `"descending"`, `null_placement` `"at_end"` or `"at_start"`, and
     `tiebreaker` one of `"min"` (Arrow's default), `"max"`, `"first"` or `"dense"`. One GPU argsort,
-    run marks, a scan and a scatter back to the original rows; the result never contains nulls.
+    run marks, a scan and a scatter back to the original rows; the result is uint32 (pyarrow returns
+    uint64, with the same values) and never contains nulls.
     """
     if sort_keys not in ("ascending", "descending"):
         raise ArrowMetalError('sort_keys must be "ascending" or "descending"')

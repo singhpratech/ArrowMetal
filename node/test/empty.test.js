@@ -51,9 +51,9 @@ test('fromTypedArray takes an empty array of every typed-array type', () => {
     // a view over a zero-byte ArrayBuffer, and an empty array still computes
     const m = MetalArray.fromTypedArray(new C(new ArrayBuffer(0)));
     checkEmpty(m, format, `${C.name}(ArrayBuffer(0))`);
-    checkEmpty(m.argsort(), 'i', `${C.name} argsort`);
+    checkEmpty(m.argsort(), 'I', `${C.name} argsort`);
     checkEmpty(m.sort({ descending: true, nulls: 'first', floatOrder: 'nan_largest' }), format, `${C.name} sort`);
-    checkEmpty(m.topK(3), 'i', `${C.name} topK`);
+    checkEmpty(m.topK(3), 'I', `${C.name} topK`);
     assert.equal(Number(m.sum() ?? 0), 0, `${C.name} sum`);
   }
 });

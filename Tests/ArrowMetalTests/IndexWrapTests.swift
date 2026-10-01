@@ -342,7 +342,7 @@ final class IndexWrapTests: XCTestCase {
         DispatchQueue.concurrentPerform(iterations: 256) { k in
             var local = 0, prev = -1
             for t in bounds[k].0..<bounds[k].1 {
-                let row = Int(UInt32(bitPattern: ord.value[t]))
+                let row = Int(ord.value[t])
                 if Int(Self.key8(row)) != k || row <= prev { local += 1 }
                 prev = row
             }
@@ -386,14 +386,14 @@ final class IndexWrapTests: XCTestCase {
         // The reference: the valid rows by (value desc, row asc).
         let rows = (from..<n).sorted { (Self.val8($0 % pe), -$0) > (Self.val8($1 % pe), -$1) }
         for k in [10, 5_000] {
-            let got = try a.topK(k, largest: true).toRawArray().map { Int(UInt32(bitPattern: $0)) }
+            let got = try a.topK(k, largest: true).toRawArray().map { Int($0) }
             XCTAssertEqual(got, Array(rows.prefix(k)), "top \(k)")
         }
-        let tk = try XCTUnwrap(try a.topKSelect(10, largest: true)).toRawArray().map { Int(UInt32(bitPattern: $0)) }
+        let tk = try XCTUnwrap(try a.topKSelect(10, largest: true)).toRawArray().map { Int($0) }
         XCTAssertEqual(tk, Array(rows.prefix(10)), "top 10 through the per-block selection")
         let small = (from..<n).sorted { (Self.val8($0 % pe), $0) < (Self.val8($1 % pe), $1) }
         for k in [10, 5_000] {
-            let got = try a.topK(k, largest: false).toRawArray().map { Int(UInt32(bitPattern: $0)) }
+            let got = try a.topK(k, largest: false).toRawArray().map { Int($0) }
             XCTAssertEqual(got, Array(small.prefix(k)), "bottom \(k)")
         }
 
@@ -417,7 +417,7 @@ final class IndexWrapTests: XCTestCase {
             let lo = c * (n / 64), hi = c == 63 ? n : (c + 1) * (n / 64)
             var local = 0, sum = 0, prev = -1
             for t in lo..<hi {
-                let row = Int(UInt32(bitPattern: out.value[t]))
+                let row = Int(out.value[t])
                 let key = UInt32(Self.val8(row % kpe)) << 8 | UInt32(Self.key8(row % kpe))
                 let bucket = t < less ? 0 : (t < lessEq ? 1 : 2)
                 if (bucket == 0 && key >= pivot) || (bucket == 1 && key != pivot) || (bucket == 2 && key <= pivot) { local += 1 }

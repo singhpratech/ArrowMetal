@@ -38,7 +38,7 @@ struct StringHashTableIds {
     /// Number of distinct non-null strings.
     let groupCount: Int
     /// The lowest row index of each group, in group order (which is first-seen order).
-    let firstRows: MetalArray<Int32>
+    let firstRows: MetalArray<UInt32>
 }
 
 extension MetalStringArray {
@@ -133,7 +133,7 @@ extension MetalStringArray {
             // what the zeroed buffer already holds.
             let ids = try MetalArrowBuffer.allocate(byteCount: Swift.max(n, 1) * 4, context: ctx)
             return StringHashTableIds(ids: ids, rows: n, groupCount: 0,
-                                      firstRows: try MetalArray<Int32>([Int32](), context: ctx))
+                                      firstRows: try MetalArray<UInt32>([UInt32](), context: ctx))
         }
 
         let keys = try hashes ?? hash64()

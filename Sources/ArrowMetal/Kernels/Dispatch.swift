@@ -187,6 +187,21 @@ enum Dispatch {
         guard n <= Int(UInt32.max) else { throw ArrowMetalError.invalidArrowArray("arrays above 2^32 elements are not supported yet") }
     }
 
+    /// The largest row number an index array holds. Index arrays (argsort, top-k, partition_nth, the
+    /// lexsort, join indices, ranks, representative rows) are UInt32, so this is 2^32 - 1; the tests lower
+    /// it to reach the refusal below at small sizes.
+    nonisolated(unsafe) static var maxRowIndex = Int(UInt32.max)
+
+    /// Refuses an index-returning call whose row numbers would pass `maxRowIndex`: `rows` rows are
+    /// numbered `0 ..< rows` (`base ..< base + rows` for a call that numbers from an offset), and a row
+    /// number that does not fit the UInt32 index type is an error, never a wrapped value.
+    static func checkIndexRows(_ rows: Int, base: Int = 0, _ op: String) throws {
+        let last = base + rows - 1
+        guard last > maxRowIndex else { return }
+        throw ArrowMetalError.invalidArrowArray(
+            "\(op): row \(last) does not fit the UInt32 index type (row numbers go up to \(maxRowIndex))")
+    }
+
     /// Metal has no `double`. False for Float64 only; the numeric cast and the Float64 overflow check use it to
     /// take their host loop. Arithmetic and sum on Float64 run on the GPU through software binary64
     /// (`DoubleMath`); compare, min, max, filter, take and slice treat the values as raw 64-bit patterns.

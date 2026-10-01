@@ -91,7 +91,9 @@ totalOrder, the order arrow-rs and Rust's `total_cmp` use: -NaN < -Infinity < �
 and NumPy's order: -0 ties +0, and every NaN is one value greater than every number, +Infinity
 included, in both directions (last ascending, first among the values descending); the null placement
 is independent of it. Integer, string and temporal keys ignore the float order. `topK(k, options)` answers with the first `k` indices `argsort` gives in that
-direction with the same options.
+direction with the same options. `argsort`, `topK` and `lexsort` return uint32 index arrays
+(`toTypedArray()` gives a `Uint32Array`; row numbers stop at 2^32 - 1 and a longer input throws), and
+`take` accepts Int32, BigInt64 and Uint32 indices.
 
 ```ts
 const x = MetalArray.fromArrow(vectorFromArray([2, null, NaN, -0, 7], new Float64()));
@@ -389,7 +391,7 @@ Every row, with first-call-after-idle and CPU time:
 
 ## Tests
 
-82 tests, `node:test`, oracles are Apache Arrow JS and plain JS over the same rows.
+84 tests, `node:test`, oracles are Apache Arrow JS and plain JS over the same rows.
 `npm test` sets `NODE_OPTIONS=--expose-gc`, which the lifetime tests need.
 
 ```
@@ -401,7 +403,7 @@ ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib npm test
 |---|---:|---|
 | `test/interop.test.js` | 21 | round trip for all 12 carried types with nulls; sliced, doubly sliced, sliced-with-nulls, sliced utf8 and bool; a chunked vector imported as one array, and chunks of two types and an unsupported type rejected by message; the alignment table above; wrapped-vs-copied proved by mutating the source buffer; short-buffer rejection with byte counts for validity, values, utf8 offsets, utf8 values and bool; utf8 offsets that decrease or start below zero, named by index; impossible `nullCount`s; type-tagged handles rejected across kinds; an argument-guard rejection never reporting a stale message; 10,000 import/compute/export cycles |
 | `test/reductions.test.js` | 10 | sum/min/max/mean against plain-JS oracles for Int64 and Float64, with nulls, all-null, empty; 1,000,001 rows; Kahan-summed float oracle to 1e-9 relative; validity bitmaps with a known and an unknown null count |
-| `test/compute.test.js` | 18 | all six comparison ops against JS; null masks; filter on empty and at 1,000,001 rows; sort and argsort with nulls last and stable ties; sort at 1,000,001 rows against `Array.prototype.sort`; take, slice, arith, cast; groupBy sum/mean/min/max/count against a JS `Map`, including a null key group and 1,000,001 rows; lexsort |
+| `test/compute.test.js` | 20 | all six comparison ops against JS; null masks; take with Int32, BigInt64 and Uint32 indices; Uint32 index arrays; filter on empty and at 1,000,001 rows; sort and argsort with nulls last and stable ties; sort at 1,000,001 rows against `Array.prototype.sort`; take, slice, arith, cast; groupBy sum/mean/min/max/count against a JS `Map`, including a null key group and 1,000,001 rows; lexsort |
 | `test/plan.test.js` | 7 | a filter → group_by → sort plan against the same steps in JS; optimized vs unoptimized agree; explain; a plan that does not type-check throws the engine's own message; an out-of-range column named by index and by name |
 | `test/lifetime.test.js` | 4 | a slice, a plan source and a group-by all still read the right bytes after the parent handle is released, every JS reference to the source array dropped, two collections forced and the freed pages trampled; and an exported `Vector` after its handle is released |
 | `test/sortoptions.test.js` | 11 | `argsort` / `sort` with every direction × null placement × float order (`ieee`, `total`, `nan_largest`), index for index and bit for bit against a stable plain-JS reference of the documented order, on Float64 columns holding NaN of both signs and several payloads, ±0, ±Infinity and subnormals, with nulls, at 0 to 100,001 rows; Int64 and Float32 columns; the boolean forms and the defaults equal to the options forms; `topK` against the head of `argsort` at k = 0 to past the length; `lexsort` with per-key options; `nan_largest` on a hand-picked column with NaN of both signs, ±0, ±Infinity and a null, against its expected indices for `argsort`, `sort`, `topK` and a two-key `lexsort`; a plan `sort` key with `nulls` and `float_order`, and `float_order: 'nan_largest'` in each key form and as the sort-level default, with and without a `limit`; the examples on this page |

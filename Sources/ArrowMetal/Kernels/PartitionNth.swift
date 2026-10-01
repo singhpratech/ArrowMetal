@@ -227,13 +227,14 @@ extension MetalArray {
     /// property holds. Within each of the blocks the rows keep their original relative order, because the
     /// partition that produces them is stable.
     public func partitionNthIndices(_ pivot: Int,
-                                    nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
+                                    nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<UInt32> {
         guard pivot >= 0, pivot <= length else {
             throw ArrowMetalError.invalidArrowArray("partition index \(pivot) is outside 0...\(length)")
         }
         let ctx = context, n = length
         try Dispatch.checkLength(n)
-        if n == 0 { return try MetalArray<Int32>([Int32](), context: ctx) }
+        try Dispatch.checkIndexRows(n, "partition_nth_indices")
+        if n == 0 { return try MetalArray<UInt32>([UInt32](), context: ctx) }
 
         // The order-preserving key the radix argsort would build, ascending.
         let wide = T.byteWidth == 8
@@ -309,7 +310,7 @@ extension MetalArray {
 
     /// The split itself, once the keys exist.
     private func partition<K>(keys: MetalArray<K>, pivot: Int,
-                              nullPlacement: NullPlacement) throws -> MetalArray<Int32>
+                              nullPlacement: NullPlacement) throws -> MetalArray<UInt32>
         where K: ArrowPrimitive & FixedWidthInteger & UnsignedInteger {
         let n = length, nulls = nullCount, m = n - nulls
         let bitmap = nulls > 0 ? validity : nil
@@ -420,7 +421,7 @@ enum PartitionNth {
     /// stay where it is; the values then share one bucket and the partition is just the null move.
     static func partition<K>(_ keys: MetalArray<K>, validity: MetalArrowBuffer?, threshold: K?,
                              nanKey: K?, nullPlacement: NullPlacement,
-                             owner: AnyObject) throws -> MetalArray<Int32>
+                             owner: AnyObject) throws -> MetalArray<UInt32>
         where K: ArrowPrimitive & FixedWidthInteger & UnsignedInteger {
         let ctx = keys.context, n = keys.length
         let type = K.bitWidth == 64 ? "ulong" : "uint"
@@ -474,6 +475,6 @@ enum PartitionNth {
         ctx.retainUntilFlush(keys)
         ctx.retainUntilFlush(counts)
         ctx.retainUntilFlush(owner)
-        return MetalArray<Int32>(length: n, nullCount: 0, validity: nil, values: out, context: ctx)
+        return MetalArray<UInt32>(length: n, nullCount: 0, validity: nil, values: out, context: ctx)
     }
 }

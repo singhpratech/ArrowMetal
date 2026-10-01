@@ -453,11 +453,12 @@ extension GroupBy {
 
     /// The first (or last) row index per key among the rows whose value is non-null, or null for a key
     /// with no such row. The row indices carry the values' validity bitmap, so nulls are skipped.
-    private func rowIndex<T: ArrowPrimitive>(_ values: MetalArray<T>, wantFirst: Bool) throws -> MetalArray<Int32> {
+    private func rowIndex<T: ArrowPrimitive>(_ values: MetalArray<T>, wantFirst: Bool) throws -> MetalArray<UInt32> {
         guard values.length == keys.length else { throw ArrowMetalError.lengthMismatch(keys.length, values.length) }
-        let iota = try MetalArray<Int32>.iota(values.length, context: values.context)
-        let masked = MetalArray<Int32>(length: values.length, nullCount: values.nullCount,
-                                       validity: values.validity, values: iota.values, context: values.context)
+        try Dispatch.checkIndexRows(values.length, wantFirst ? "first" : "last")
+        let iota = try MetalArray<UInt32>.iota(values.length, context: values.context)
+        let masked = MetalArray<UInt32>(length: values.length, nullCount: values.nullCount,
+                                        validity: values.validity, values: iota.values, context: values.context)
         // The fused sort-free extremes: one atomic pass and a GPU finalize, so a ten-million-group
         // `first` never walks the groups on the host.
         let e = try extrema(masked)

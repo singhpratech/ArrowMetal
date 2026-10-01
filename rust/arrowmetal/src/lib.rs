@@ -663,7 +663,8 @@ impl Array {
         })
     }
 
-    /// Gathers by index. `indices` is an int32 array; a null index gives a null output element.
+    /// Gathers by index. `indices` is an int32, int64 or uint32 array (the index arrays this crate
+    /// returns are uint32); a null index gives a null output element.
     pub fn take(&self, indices: &Array) -> Result<Array> {
         Self::produce("am_take", |out| unsafe {
             ffi::am_take(self.as_ptr(), indices.as_ptr(), out)
@@ -679,8 +680,10 @@ impl Array {
 
     // -- sorting ----------------------------------------------------------------------------------
 
-    /// The int32 indices that would sort the array. Stable, nulls last, NaN after `+inf`; nulls and
-    /// NaN stay at the end when `descending` is set rather than mirroring to the front.
+    /// The indices that would sort the array, as an arrow `UInt32Array` (the index type of arrow-rs
+    /// `sort_to_indices`; row numbers go up to 2^32 - 1, and a longer input is an error). Stable,
+    /// nulls last, NaN after `+inf`; nulls and NaN stay at the end when `descending` is set rather
+    /// than mirroring to the front.
     pub fn argsort(&self, descending: bool) -> Result<Array> {
         Self::produce("am_argsort", |out| unsafe {
             ffi::am_argsort(self.as_ptr(), descending as c_int, out)
@@ -694,7 +697,7 @@ impl Array {
         })
     }
 
-    /// The int32 indices that sort the array with the given [`SortOptions`]. Stable.
+    /// The uint32 indices that sort the array with the given [`SortOptions`]. Stable.
     ///
     /// `SortOptions::from(arrow::compute::SortOptions)` gives arrow-rs's order exactly: nulls where
     /// `nulls_first` puts them and floats by IEEE 754 totalOrder, so the permutation applied is what
@@ -725,7 +728,7 @@ impl Array {
         })
     }
 
-    /// The int32 indices of the first `k` rows [`argsort_with`](Array::argsort_with) would give with
+    /// The uint32 indices of the first `k` rows [`argsort_with`](Array::argsort_with) would give with
     /// the same options, selected on the GPU without a full sort where the options allow it.
     pub fn top_k_with(&self, k: usize, options: SortOptions) -> Result<Array> {
         Self::produce("am_top_k_ex", |out| unsafe {
@@ -780,7 +783,7 @@ impl From<arrow::compute::SortOptions> for SortOptions {
     }
 }
 
-/// Multi-column (lexicographic) sort: int32 indices ordering the rows by each column in turn, the
+/// Multi-column (lexicographic) sort: uint32 indices ordering the rows by each column in turn, the
 /// first column the most significant, each with its own [`SortOptions`] (one per column). Stable.
 pub fn lexsort(columns: &[&Array], options: &[SortOptions]) -> Result<Array> {
     if columns.is_empty() {

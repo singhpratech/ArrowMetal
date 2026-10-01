@@ -72,7 +72,7 @@ enum WindowOps {
             places.append(k.nullsFirst ? .atStart : .atEnd); orders.append(k.floatOrder)
         }
         let positions = try GroupByKeys.rowIndices(n, ctx)
-        let perm: MetalArray<Int32>
+        let perm: MetalArray<UInt32>
         if sortCols.isEmpty { perm = positions } else {
             perm = try lexsortIndices(sortCols, descending: sortDesc, nullPlacements: places, floatOrders: orders)
         }
@@ -83,8 +83,8 @@ enum WindowOps {
         // With no partitioning the whole input is one partition, so every row's start is 0 and its end
         // is n - 1; those constant columns are only materialised if the chosen function actually reads
         // them, because at 50M rows filling one costs more than the window function does.
-        var startPerRow: MetalArray<Int32>! = nil
-        var endPerRow: MetalArray<Int32>! = nil
+        var startPerRow: MetalArray<UInt32>! = nil
+        var endPerRow: MetalArray<UInt32>! = nil
         var sortedPartitionIds: MetalArray<Int32>? = nil
         var partitionCount = 1
         if !spec.partitionBy.isEmpty {
@@ -99,26 +99,26 @@ enum WindowOps {
             endPerRow = try ends.take(sortedIds)
             sortedPartitionIds = sortedIds
         }
-        func starts() throws -> MetalArray<Int32> {
+        func starts() throws -> MetalArray<UInt32> {
             if startPerRow == nil { startPerRow = try constant(0, n, ctx) }
             return startPerRow
         }
-        func ends() throws -> MetalArray<Int32> {
-            if endPerRow == nil { endPerRow = try constant(Int32(n - 1), n, ctx) }
+        func ends() throws -> MetalArray<UInt32> {
+            if endPerRow == nil { endPerRow = try constant(UInt32(n - 1), n, ctx) }
             return endPerRow
         }
 
         let result: AnyMetalArray
         switch spec.function {
         case .rowNumber:
-            result = .int32(try offsetFrom(positions, try starts(), ctx))
+            result = .uint32(try offsetFrom(positions, try starts(), ctx))
 
         case .rank, .denseRank:
             let tieStart = try tieGroupStarts(input, spec, perm, sortedPartitionIds, positions, partitionCount, ctx)
             if case .rank = spec.function {
-                result = .int32(try offsetFrom(tieStart.starts, try starts(), ctx))
+                result = .uint32(try offsetFrom(tieStart.starts, try starts(), ctx))
             } else {
-                result = .int32(try denseRanks(tieStart.starts, positions, try starts(), ctx))
+                result = .uint32(try denseRanks(tieStart.starts, positions, try starts(), ctx))
             }
 
         case .lag(let c, let k), .lead(let c, let k):
@@ -159,45 +159,47 @@ enum WindowOps {
         return try MetalRecordBatch(names: names, columns: cols)
     }
 
-    private static func constant(_ v: Int32, _ n: Int, _ ctx: MetalContext) throws -> MetalArray<Int32> {
-        try MetalArray<Int32>([Int32](repeating: v, count: n), context: ctx)
+    private static func constant(_ v: UInt32, _ n: Int, _ ctx: MetalContext) throws -> MetalArray<UInt32> {
+        try MetalArray<UInt32>([UInt32](repeating: v, count: n), context: ctx)
     }
 
     private static func broadcast(_ scalar: AnyMetalArray, to n: Int, _ ctx: MetalContext) throws -> AnyMetalArray {
         try scalar.take(try constant(0, n, ctx))
     }
 
-    /// `a - b + 1` as int32, in one fused kernel.
-    private static func offsetFrom(_ a: MetalArray<Int32>, _ b: MetalArray<Int32>, _ ctx: MetalContext) throws -> MetalArray<Int32> {
-        let r = try runExprQuery(query().project([("r", (col("a") - col("b") + 1).cast(to: .int32))]),
-                                 names: ["a", "b"], columns: [.int32(a), .int32(b)], context: ctx)
-        guard case .int32(let out) = r.columns[0] else {
-            throw ArrowMetalError.invalidArrowArray("window: rank did not come back as int32")
+    /// `a - b + 1` as uint32 (row positions are UInt32), in one fused kernel.
+    private static func offsetFrom(_ a: MetalArray<UInt32>, _ b: MetalArray<UInt32>, _ ctx: MetalContext) throws -> MetalArray<UInt32> {
+        let r = try runExprQuery(query().project([("r", (col("a") - col("b") + 1).cast(to: .uint32))]),
+                                 names: ["a", "b"], columns: [.uint32(a), .uint32(b)], context: ctx)
+        guard case .uint32(let out) = r.columns[0] else {
+            throw ArrowMetalError.invalidArrowArray("window: rank did not come back as uint32")
         }
         return out
     }
 
     /// `if_else(pos - delta >= start && pos - delta <= end, pos - delta, null)`: the index a `lag` or
     /// `lead` wants, null where it would leave its partition.
-    private static func neighbourIndex(_ pos: MetalArray<Int32>, _ start: MetalArray<Int32>,
-                                       _ end: MetalArray<Int32>, delta: Int, _ ctx: MetalContext) throws -> MetalArray<Int32> {
+    private static func neighbourIndex(_ pos: MetalArray<UInt32>, _ start: MetalArray<UInt32>,
+                                       _ end: MetalArray<UInt32>, delta: Int, _ ctx: MetalContext) throws -> MetalArray<UInt32> {
+        // Positions are UInt32. `p - k` below the partition start either goes below `s` or, past zero,
+        // wraps to a value above `e`; both fall outside `[s, e]` and give a null.
         let target = col("p") - delta
-        let e = Expr.ifElse((target >= col("s")) && (target <= col("e")), target.cast(to: .int32), nullLit(.int32))
+        let e = Expr.ifElse((target >= col("s")) && (target <= col("e")), target.cast(to: .uint32), nullLit(.uint32))
         let r = try runExprQuery(query().project([("i", e)]),
-                                 names: ["p", "s", "e"], columns: [.int32(pos), .int32(start), .int32(end)], context: ctx)
-        guard case .int32(let out) = r.columns[0] else {
-            throw ArrowMetalError.invalidArrowArray("window: neighbour index did not come back as int32")
+                                 names: ["p", "s", "e"], columns: [.uint32(pos), .uint32(start), .uint32(end)], context: ctx)
+        guard case .uint32(let out) = r.columns[0] else {
+            throw ArrowMetalError.invalidArrowArray("window: neighbour index did not come back as uint32")
         }
         return out
     }
 
-    private struct TieGroups { var starts: MetalArray<Int32> }
+    private struct TieGroups { var starts: MetalArray<UInt32> }
 
     /// The first sorted position of each row's tie group: rows agreeing on the partition and every
     /// order key are one group, which is exactly what `GroupByKeys` over those columns computes.
     private static func tieGroupStarts(_ input: MetalRecordBatch, _ spec: WindowSpec,
-                                       _ perm: MetalArray<Int32>, _ sortedPartitionIds: MetalArray<Int32>?,
-                                       _ positions: MetalArray<Int32>, _ partitionCount: Int,
+                                       _ perm: MetalArray<UInt32>, _ sortedPartitionIds: MetalArray<Int32>?,
+                                       _ positions: MetalArray<UInt32>, _ partitionCount: Int,
                                        _ ctx: MetalContext) throws -> TieGroups {
         var cols: [AnyMetalArray] = []
         if let p = sortedPartitionIds { cols.append(.int32(p)) }
@@ -237,33 +239,33 @@ enum WindowOps {
     /// A row that starts a tie group marks a 1; the inclusive running sum of those marks counts groups
     /// across the whole sorted array, and subtracting the count at the partition's first row (where the
     /// mark is always 1) turns the global count into a per-partition one.
-    private static func denseRanks(_ tieStart: MetalArray<Int32>, _ positions: MetalArray<Int32>,
-                                   _ partitionStart: MetalArray<Int32>, _ ctx: MetalContext) throws -> MetalArray<Int32> {
+    private static func denseRanks(_ tieStart: MetalArray<UInt32>, _ positions: MetalArray<UInt32>,
+                                   _ partitionStart: MetalArray<UInt32>, _ ctx: MetalContext) throws -> MetalArray<UInt32> {
         let marks = try runExprQuery(
-            query().project([("m", Expr.ifElse(col("t") == col("p"), .typedInt(1, .int32), .typedInt(0, .int32)))]),
-            names: ["t", "p"], columns: [.int32(tieStart), .int32(positions)], context: ctx)
-        guard case .int32(let m) = marks.columns[0] else {
-            throw ArrowMetalError.invalidArrowArray("window: dense_rank marks were not int32")
+            query().project([("m", Expr.ifElse(col("t") == col("p"), .typedInt(1, .uint32), .typedInt(0, .uint32)))]),
+            names: ["t", "p"], columns: [.uint32(tieStart), .uint32(positions)], context: ctx)
+        guard case .uint32(let m) = marks.columns[0] else {
+            throw ArrowMetalError.invalidArrowArray("window: dense_rank marks were not uint32")
         }
         let running = try m.cumulative(.sum)
         let base = try running.take(partitionStart)
-        let r = try runExprQuery(query().project([("r", (col("g") - col("b") + 1).cast(to: .int32))]),
-                                 names: ["g", "b"], columns: [.int32(running), .int32(base)], context: ctx)
-        guard case .int32(let out) = r.columns[0] else {
-            throw ArrowMetalError.invalidArrowArray("window: dense_rank did not come back as int32")
+        let r = try runExprQuery(query().project([("r", (col("g") - col("b") + 1).cast(to: .uint32))]),
+                                 names: ["g", "b"], columns: [.uint32(running), .uint32(base)], context: ctx)
+        guard case .uint32(let out) = r.columns[0] else {
+            throw ArrowMetalError.invalidArrowArray("window: dense_rank did not come back as uint32")
         }
         return out
     }
 
     /// The running and rolling functions, one contiguous partition at a time.
     private static func slicedPerPartition(_ sorted: AnyMetalArray, _ fn: WindowFunction,
-                                           _ startPerRow: MetalArray<Int32>, _ endPerRow: MetalArray<Int32>,
+                                           _ startPerRow: MetalArray<UInt32>, _ endPerRow: MetalArray<UInt32>,
                                            partitionCount: Int, n: Int, _ ctx: MetalContext) throws -> AnyMetalArray {
         try ctx.flush(reopen: true)
         // Partition boundaries in sorted order, read once.
         var bounds: [(Int, Int)] = []
-        let sp = startPerRow.values.typed(Int32.self)
-        let ep = endPerRow.values.typed(Int32.self)
+        let sp = startPerRow.values.typed(UInt32.self)
+        let ep = endPerRow.values.typed(UInt32.self)
         var i = 0
         while i < n {
             let lo = Int(sp[i]), hi = Int(ep[i])

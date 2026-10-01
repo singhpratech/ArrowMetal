@@ -212,21 +212,21 @@ public final class MetalStringArray: @unchecked Sendable {
     public func filter(_ mask: MetalBooleanArray) throws -> MetalStringArray {
         guard mask.length == length else { throw ArrowMetalError.lengthMismatch(length, mask.length) }
         // Source index per kept row = filter over an iota, then gather.
-        let iota = try MetalArray<Int32>.iota(length, context: context)
+        let iota = try MetalArray<UInt32>.iota(length, context: context)
         let src = try iota.filter(mask)
         return try gather(src)
     }
 
     /// Arrow `take`.
     public func take<I: ArrowIndex>(_ indices: MetalArray<I>) throws -> MetalStringArray {
-        let idx32: MetalArray<Int32> = I.self == Int32.self ? (indices as! MetalArray<Int32>) : try indices.cast(to: Int32.self)
         try Dispatch.checkLength(length)
-        // Bounds check on the CPU-visible index range is done by take on the lengths array below.
-        return try gather(idx32)
+        // Bounds check on the CPU-visible index range is done by take on the lengths array, in the
+        // indices' own type, inside `gather`.
+        return try gather(indices)
     }
 
     /// Builds a new string array from source indices (null index -> null string).
-    func gather(_ src: MetalArray<Int32>) throws -> MetalStringArray {
+    func gather<I: ArrowIndex>(_ src: MetalArray<I>) throws -> MetalStringArray {
         let n = src.length
         let ctx = context
         // Lengths of selected strings (bounds checked by take), then offsets via scan.
@@ -235,8 +235,18 @@ public final class MetalStringArray: @unchecked Sendable {
         let outOffsets = try lensNoNull.exclusiveScanToOffsets()
         let total = Int(withExtendedLifetime(outOffsets) { outOffsets.typed(Int32.self)[n] })
         let outData = try MetalArrowBuffer.allocate(byteCount: total, zeroed: false, context: ctx)
-        // Source index with -1 for nulls so the copy kernel skips them.
-        let srcFilled: MetalArray<Int32> = src.validity == nil ? src : try src.fillNull(-1)
+        // Source row as a 32-bit row number, with -1 (all bits set) for nulls so the copy kernel skips
+        // them. Int32 and UInt32 indices are the same bits (the take above already refused a negative
+        // one); Int64 indices narrow, after the take above checked them against the array's length.
+        let src32: MetalArray<UInt32>
+        switch src {
+        case let u as MetalArray<UInt32>: src32 = u
+        case let s as MetalArray<Int32>:
+            src32 = MetalArray<UInt32>(length: s.length, nullCount: s.nullCount, validity: s.validity,
+                                       values: s.values, context: s.context)
+        default: src32 = try src.cast(to: UInt32.self)
+        }
+        let srcFilled: MetalArray<UInt32> = src32.validity == nil ? src32 : try src32.fillNull(UInt32.max)
         let p = try pso(Self.kernelName("str_gather_bytes", self))
         if n > 0 {
             try ctx.run { enc in
@@ -262,14 +272,17 @@ public final class MetalStringArray: @unchecked Sendable {
     }
 }
 
-extension MetalArray where T == Int32 {
-    /// 0, 1, 2, ... n-1
-    static func iota(_ n: Int, context: MetalContext) throws -> MetalArray<Int32> {
+extension MetalArray where T == UInt32 {
+    /// Row numbers 0, 1, 2, ... n-1.
+    static func iota(_ n: Int, context: MetalContext) throws -> MetalArray<UInt32> {
         let out = try MetalArrowBuffer.allocate(byteCount: n * 4, zeroed: false, context: context)
-        let p = out.mutableTyped(Int32.self)
-        for i in 0..<n { p[i] = Int32(i) }
-        return MetalArray<Int32>(length: n, nullCount: 0, validity: nil, values: out, context: context)
+        let p = out.mutableTyped(UInt32.self)
+        for i in 0..<n { p[i] = UInt32(i) }
+        return MetalArray<UInt32>(length: n, nullCount: 0, validity: nil, values: out, context: context)
     }
+}
+
+extension MetalArray where T == Int32 {
 
     /// Exclusive prefix sum into an (n+1)-element offsets buffer, entirely on the GPU.
     func exclusiveScanToOffsets() throws -> MetalArrowBuffer {

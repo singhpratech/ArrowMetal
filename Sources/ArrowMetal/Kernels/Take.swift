@@ -1,11 +1,39 @@
 import Foundation
 import Metal
 
-/// Index types accepted by `take`.
+/// Index types accepted by `take`. The index arrays this package returns (argsort, top-k,
+/// partition_nth, the lexsort, join indices) are UInt32; `take` also accepts Int32 and Int64 indices,
+/// as Arrow's does.
 public protocol ArrowIndex: ArrowPrimitive {}
 extension Int32: ArrowIndex {}
 extension Int64: ArrowIndex {}
 extension UInt32: ArrowIndex {}
+
+extension MetalArray {
+    /// The same buffers seen as another element type of the same width (UInt32 and Int32 row numbers).
+    func reinterpreted<U: ArrowPrimitive>(as _: U.Type) -> MetalArray<U> {
+        precondition(U.byteWidth == T.byteWidth)
+        return MetalArray<U>(length: length, nullCount: nullCount, validity: validity, values: values,
+                             context: context)
+    }
+}
+
+extension MetalArray where T: ArrowIndex {
+    /// These indices as Int32 row numbers, for the gathers whose kernels read an `int` position (the
+    /// nested, fixed-size binary and interval takes). Int32 comes back as is and UInt32 as the same
+    /// bits: an index of 2^31 or more reads as negative there, which the gather's range check refuses.
+    /// Int64 is narrowed after a check that every valid index is in [0, 2^31), so an index the
+    /// narrowing would wrap is an error, never another row.
+    func int32Rows(_ op: String = "take") throws -> MetalArray<Int32> {
+        if let a = self as? MetalArray<Int32> { return a }
+        if T.self == UInt32.self { return reinterpreted(as: Int32.self) }
+        if let wide = self as? MetalArray<Int64>, let mm = try wide.minMax() {
+            if mm.min < 0 { throw ArrowMetalError.invalidArrowArray("\(op): index \(mm.min) out of range") }
+            if mm.max > Int64(Int32.max) { throw ArrowMetalError.invalidArrowArray("\(op): index \(mm.max) out of range") }
+        }
+        return try cast(to: Int32.self)
+    }
+}
 
 extension MetalArray {
     /// Arrow `take`: gathers `indices` from this array. A null index yields a null output element.

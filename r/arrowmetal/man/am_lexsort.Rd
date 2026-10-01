@@ -19,7 +19,7 @@ am_lexsort(
 \item{float_order}{`"ieee"` or `"total"`, one per column or one for all.}
 }
 \value{
-An int32 `am_array` of zero-based indices.
+A uint32 `am_array` of zero-based indices, read back as \code{am_argsort()}'s.
 }
 \description{
 Orders the rows by each column in turn, the first column the most significant. Each of

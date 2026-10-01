@@ -423,8 +423,9 @@ func (a *Array) Filter(mask *Array) (*Array, error) {
 	return wrap(out), nil
 }
 
-// Take gathers a[i] for each i in indices, which must be an int32 array. A null index gives a null
-// element.
+// Take gathers a[i] for each i in indices, which is an int32, int64 or uint32 array (the index
+// arrays Argsort, TopK and Lexsort return are uint32). A null index gives a null element; an index
+// outside [0, a.Len()) is an error.
 func (a *Array) Take(indices *Array) (*Array, error) {
 	h, err := a.ptr()
 	if err != nil {
@@ -443,8 +444,10 @@ func (a *Array) Take(indices *Array) (*Array, error) {
 	return wrap(out), nil
 }
 
-// Argsort returns the int32 indices that order the array. The sort is stable, nulls come last, and
+// Argsort returns the uint32 indices that order the array. The sort is stable, nulls come last, and
 // NaN sorts after +Inf — in both directions: descending does not mirror nulls and NaN to the front.
+// Index arrays are uint32, so row numbers go up to 2^32 - 1; an array whose row numbers would pass
+// that is an error rather than a wrapped index.
 func (a *Array) Argsort(descending bool) (*Array, error) {
 	h, err := a.ptr()
 	if err != nil {
@@ -472,7 +475,7 @@ func (a *Array) Sort(descending bool) (*Array, error) {
 	return wrap(out), nil
 }
 
-// Lexsort returns the int32 indices ordering the rows by each column in turn, the first column being
+// Lexsort returns the uint32 indices ordering the rows by each column in turn, the first column being
 // the most significant. descending may be nil for all-ascending, otherwise one entry per column.
 func Lexsort(columns []*Array, descending []bool) (*Array, error) {
 	if err := Init(); err != nil {

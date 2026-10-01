@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- Behaviour change: index arrays are UInt32 (Arrow `uint32`); rows beyond 2^32 - 1 are refused.
+  `argsort` (every sortable type), `topK`, `partitionNthIndices`, `lexsortIndices`, the hash join's
+  index pairs, the ranks (`rowNumber`, `rank`, `denseRank`, `maxRank`, `rank(tiebreaker:)` and the
+  engine's `row_number` / `rank` / `dense_rank` window columns), `GroupByKeys.representativeRows()` and
+  `GroupByKeys.rowIndices` return UInt32 where they returned Int32, so a row number of 2^31 or more comes
+  back as itself instead of negative. The width is unchanged; the type matches arrow-rs
+  `sort_to_indices` and Polars' `IdxSize` (pyarrow returns uint64, with the same values). A call whose
+  row numbers would pass 2^32 - 1 throws `"<op>: row N does not fit the UInt32 index type (row numbers
+  go up to 4294967295)"`. `take` accepts Int32, Int64 and UInt32 indices as before; an Int64 index that
+  the 32-bit gathers of nested, fixed-size-binary and interval columns, or `am_scatter`, would have
+  narrowed onto another row is now an out-of-range error. Unchanged types: dictionary codes, `index_in`,
+  group ids, `inverse_permutation` and `list_parent_indices()` (int32; `inverse_permutation` and
+  `list_parent_indices()` now refuse more than 2^31 rows, whose positions do not fit, and
+  `list_parent_indices64()` no longer goes through the int32 form; `dictionary_encode` and
+  `run_end_encode` refuse codes or run ends past 2^31 - 1), `indices_nonzero` (uint64). C ABI:
+  the same calls return format `I`. Python: `pa.uint32()`; `take` of a list builds int64 indices.
+  Rust: `UInt32Array`. Go and Node: uint32 / `Uint32Array`. R: an integer vector when every value fits,
+  a double vector otherwise, as `arrow` reads uint32. Tests: `IndexTypeTests` (7, one over 2^31 + 2^20
+  rows with `ARROWMETAL_BIG_TESTS=1`), `test_index_type.py`, and the index cases of the differential
+  harness compare values against pyarrow's uint64. Timed against the Int32 build, alternating, at
+  10M and 50M rows (argsort of int64, float64 and utf8, top-k, partition_nth, lexsort, rank, group-by
+  keys, take, join indices): none is more than 1% slower in both best and median time
+  (`Benchmarks/results/index_type_2026-10-01.csv`); docs/DESIGN.md has the table.
 - Kernels over arrays near 2^32 elements: 32-bit loop steps, block ends and byte positions that passed
   2^32 now stop at the end or are taken in 64 bits. Before, on 2^32 - 1 rows with no error: a group-by
   count missed the last block's 4,194,303 rows, the group order 2,097,151, the sort's digit histogram

@@ -61,12 +61,12 @@ enum NestedSupport {
         return b
     }
 
-    /// 0, 1, ... n - 1 as an int32 array, shifted by `from`.
-    static func iota(_ from: Int, _ n: Int, _ ctx: MetalContext) throws -> MetalArray<Int32> {
+    /// Row numbers 0, 1, ... n - 1, shifted by `from`.
+    static func iota(_ from: Int, _ n: Int, _ ctx: MetalContext) throws -> MetalArray<UInt32> {
         let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(n, 1) * 4, zeroed: false, context: ctx)
-        let p = out.mutableTyped(Int32.self)
-        for i in 0..<n { p[i] = Int32(from + i) }
-        return MetalArray<Int32>(length: n, nullCount: 0, validity: nil, values: out, context: ctx)
+        let p = out.mutableTyped(UInt32.self)
+        for i in 0..<n { p[i] = UInt32(from + i) }
+        return MetalArray<UInt32>(length: n, nullCount: 0, validity: nil, values: out, context: ctx)
     }
 }
 
@@ -231,7 +231,7 @@ public final class MetalListArray: @unchecked Sendable {
     /// `take` then gathers, so the child may be of any type, nested types included.
     public func take<I: ArrowIndex>(_ indices: MetalArray<I>) throws -> MetalListArray {
         let ctx = context
-        let idx32: MetalArray<Int32> = try (indices as? MetalArray<Int32>) ?? indices.cast(to: Int32.self)
+        let idx32: MetalArray<Int32> = try indices.int32Rows()
         let n = idx32.length
         try Dispatch.checkLength(Swift.max(n, length))
         // Row lengths of the result: the source row's length, or the fixed width for a fixed-size list,
@@ -269,7 +269,7 @@ public final class MetalListArray: @unchecked Sendable {
     /// Arrow `filter` (null mask entries drop the row, as everywhere else in this package).
     public func filter(_ mask: MetalBooleanArray) throws -> MetalListArray {
         guard mask.length == length else { throw ArrowMetalError.lengthMismatch(length, mask.length) }
-        return try take(try MetalArray<Int32>.iota(length, context: context).filter(mask))
+        return try take(try MetalArray<UInt32>.iota(length, context: context).filter(mask))
     }
 
     /// Zero-copy for a variable-length list — the offsets are a view into the same buffer, and the child is
@@ -341,7 +341,7 @@ public final class MetalStructArray: @unchecked Sendable {
         // A gather through a null-carrying iota is the one path that works for every child type,
         // nested children included.
         let base = try NestedSupport.iota(0, length, context)
-        let idx = MetalArray<Int32>(length: length, nullCount: nullCount, validity: v, values: base.values,
+        let idx = MetalArray<UInt32>(length: length, nullCount: nullCount, validity: v, values: base.values,
                                     context: context)
         return try child.take(idx)
     }
@@ -351,7 +351,7 @@ public final class MetalStructArray: @unchecked Sendable {
 
     /// Arrow `take`, by delegating to every child and gathering the struct's own validity.
     public func take<I: ArrowIndex>(_ indices: MetalArray<I>) throws -> MetalStructArray {
-        let idx32: MetalArray<Int32> = try (indices as? MetalArray<Int32>) ?? indices.cast(to: Int32.self)
+        let idx32: MetalArray<Int32> = try indices.int32Rows()
         let v = try NestedSupport.gatherValidity(context, validity, length: length, idx: idx32)
         let out = try MetalStructArray(length: idx32.length, nullCount: 0, validity: v, names: names,
                                        children: try children.map { try $0.take(idx32) }, context: context)
@@ -361,7 +361,7 @@ public final class MetalStructArray: @unchecked Sendable {
 
     public func filter(_ mask: MetalBooleanArray) throws -> MetalStructArray {
         guard mask.length == length else { throw ArrowMetalError.lengthMismatch(length, mask.length) }
-        return try take(try MetalArray<Int32>.iota(length, context: context).filter(mask))
+        return try take(try MetalArray<UInt32>.iota(length, context: context).filter(mask))
     }
 
     public func slice(offset: Int, length n: Int) throws -> MetalStructArray {
@@ -463,7 +463,7 @@ public final class MetalUnionArray: @unchecked Sendable {
     }
 
     public func take<I: ArrowIndex>(_ indices: MetalArray<I>) throws -> MetalUnionArray {
-        let idx32: MetalArray<Int32> = try (indices as? MetalArray<Int32>) ?? indices.cast(to: Int32.self)
+        let idx32: MetalArray<Int32> = try indices.int32Rows()
         // A union has no validity, so a null index has nothing to say; it selects the first child's slot 0.
         let ids = try dropNulls(try typeIds.take(idx32), fill: typeCodes.first ?? 0)
         switch mode {
@@ -480,7 +480,7 @@ public final class MetalUnionArray: @unchecked Sendable {
 
     public func filter(_ mask: MetalBooleanArray) throws -> MetalUnionArray {
         guard mask.length == length else { throw ArrowMetalError.lengthMismatch(length, mask.length) }
-        return try take(try MetalArray<Int32>.iota(length, context: context).filter(mask))
+        return try take(try MetalArray<UInt32>.iota(length, context: context).filter(mask))
     }
 
     public func slice(offset: Int, length n: Int) throws -> MetalUnionArray {

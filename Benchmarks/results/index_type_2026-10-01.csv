@@ -1,0 +1,57 @@
+block,case,rows,build,first_after_idle_ms,best_ms,median_ms,cpu_median_ms,rounds,reps
+all cases,argsort int64,10000000,before,18.666,7.41,7.555,0.783,8,30
+all cases,argsort int64,10000000,after,16.648,7.412,7.563,0.783,8,30
+all cases,argsort float64 (5% nulls),10000000,before,16.765,7.86,8.054,0.828,8,30
+all cases,argsort float64 (5% nulls),10000000,after,16.24,7.858,8.021,0.823,8,30
+all cases,argsort utf8,10000000,before,30.014,20.402,20.928,4.898,8,30
+all cases,argsort utf8,10000000,after,30.911,20.339,20.773,4.714,8,30
+all cases,top_k 10 int64,10000000,before,9.226,4.104,5.453,3.58,8,30
+all cases,top_k 10 int64,10000000,after,8.406,4.16,5.012,2.814,8,30
+all cases,top_k 5000 float64,10000000,before,5.523,3.524,3.932,2.455,8,30
+all cases,top_k 5000 float64,10000000,after,5.391,3.498,4.201,2.313,8,30
+all cases,partition_nth_indices int64,10000000,before,12.172,7.299,8.474,4.93,8,30
+all cases,partition_nth_indices int64,10000000,after,11.144,6.947,7.866,4.018,8,30
+all cases,"lexsort (int32, float64)",10000000,before,20.897,11.991,12.257,2.424,8,30
+all cases,"lexsort (int32, float64)",10000000,after,31.697,11.898,12.229,2.4,8,30
+all cases,rank int32,10000000,before,16.745,6.491,6.705,1.901,8,30
+all cases,rank int32,10000000,after,22.508,6.507,6.694,1.903,8,30
+all cases,group_by keys (1000 groups),10000000,before,9.046,2.66,4.99,2.057,8,30
+all cases,group_by keys (1000 groups),10000000,after,7.984,2.687,4.334,1.93,8,30
+all cases,take int64 by argsort,10000000,before,6.74,1.646,1.704,0.408,8,30
+all cases,take int64 by argsort,10000000,after,6.022,1.641,1.702,0.412,8,30
+all cases,join indices int64 (n x n/4),10000000,before,12.149,5.103,5.268,0.81,8,30
+all cases,join indices int64 (n x n/4),10000000,after,10.43,5.098,5.257,0.808,8,30
+all cases,argsort int64,50000000,before,46.224,37.399,38.297,0.848,8,26
+all cases,argsort int64,50000000,after,81.589,37.395,38.251,0.842,8,26
+all cases,argsort float64 (5% nulls),50000000,before,47.597,40.84,45.007,0.858,8,24
+all cases,argsort float64 (5% nulls),50000000,after,49.027,40.753,44.756,0.851,8,24
+all cases,argsort utf8,50000000,before,130.802,120.588,122.698,5.289,8,8
+all cases,argsort utf8,50000000,after,140.688,121.152,122.94,5.284,8,8
+all cases,top_k 10 int64,50000000,before,13.713,6.398,7.204,3.781,8,30
+all cases,top_k 10 int64,50000000,after,57.987,6.411,7.325,3.707,8,30
+all cases,top_k 5000 float64,50000000,before,14.626,4.916,5.428,2.939,8,30
+all cases,top_k 5000 float64,50000000,after,15.547,4.714,5.346,2.875,8,30
+all cases,partition_nth_indices int64,50000000,before,27.452,12.255,13.09,4.61,8,30
+all cases,partition_nth_indices int64,50000000,after,18.923,12.325,13.247,5.033,8,30
+all cases,"lexsort (int32, float64)",50000000,before,77.847,70.462,71.681,2.457,8,14
+all cases,"lexsort (int32, float64)",50000000,after,116.929,70.462,71.602,2.475,8,14
+all cases,rank int32,50000000,before,63.984,44.901,46.054,3.395,8,20
+all cases,rank int32,50000000,after,79.957,44.798,45.976,3.403,8,20
+all cases,group_by keys (1000 groups),50000000,before,10.039,4.653,4.798,1.81,8,30
+all cases,group_by keys (1000 groups),50000000,after,11.978,4.653,4.772,1.804,8,30
+all cases,take int64 by argsort,50000000,before,19.044,10.207,10.307,0.409,8,30
+all cases,take int64 by argsort,50000000,after,18.064,10.222,10.318,0.414,8,30
+all cases,join indices int64 (n x n/4),50000000,before,54.403,44.425,50.299,0.85,8,22
+all cases,join indices int64 (n x n/4),50000000,after,53.995,44.229,49.478,0.851,8,22
+re-timed alone,top_k 10 int64,10000000,before,8.801,3.898,4.878,2.728,20,100
+re-timed alone,top_k 10 int64,10000000,after,10.765,3.811,5.243,3.446,20,100
+re-timed alone,top_k 5000 float64,10000000,before,5.732,3.546,4.709,3.118,20,100
+re-timed alone,top_k 5000 float64,10000000,after,5.146,3.572,4.645,3.073,20,100
+re-timed alone,partition_nth_indices int64,10000000,before,12.73,5.592,8.012,4.039,20,100
+re-timed alone,partition_nth_indices int64,10000000,after,9.595,5.554,8.235,4.422,20,100
+re-timed alone,top_k 10 int64,50000000,before,13.987,6.106,6.915,3.483,20,100
+re-timed alone,top_k 10 int64,50000000,after,27.339,6.19,6.96,3.44,20,100
+re-timed alone,top_k 5000 float64,50000000,before,14.785,4.491,4.839,2.154,20,100
+re-timed alone,top_k 5000 float64,50000000,after,12.745,4.494,4.766,2.018,20,100
+re-timed alone,partition_nth_indices int64,50000000,before,19.913,11.828,13.081,4.1,20,78
+re-timed alone,partition_nth_indices int64,50000000,after,20.884,11.8,13.07,3.976,20,78

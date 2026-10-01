@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const A = require('apache-arrow');
-const { MetalArray, groupBy, lexsort } = require('../dist/index.js');
+const { MetalArray, groupBy, lexsort, PlanSource, runPlan } = require('../dist/index.js');
 
 test('compare against a scalar gives the same mask as JS', () => {
   const rows = [1n, 5n, 3n, 5n, 9n];
@@ -82,6 +82,52 @@ test('take gathers by Int32 indices', () => {
   const m = MetalArray.fromArrow(A.vectorFromArray([10n, 20n, 30n, 40n], new A.Int64()));
   const ix = MetalArray.fromTypedArray(new Int32Array([3, 0, 2]));
   assert.deepEqual([...m.take(ix).toArrow()], [40n, 10n, 30n]);
+});
+
+test('take accepts Int32, BigInt64 and Uint32 indices, nulls included', () => {
+  const m = MetalArray.fromArrow(A.vectorFromArray([10n, 20n, null, 40n], new A.Int64()));
+  const want = [40n, 10n, null, null, 20n];
+  for (const [type, vals] of [
+    [new A.Int32(), [3, 0, 2, null, 1]],
+    [new A.Int64(), [3n, 0n, 2n, null, 1n]],
+    [new A.Uint32(), [3, 0, 2, null, 1]],
+  ]) {
+    const ix = MetalArray.fromArrow(A.vectorFromArray(vals, type));
+    assert.deepEqual([...m.take(ix).toArrow()], want, String(type));
+  }
+  // Typed arrays without nulls, and a Uint32 index past the end (one above 2^31 included) throws.
+  assert.deepEqual([...m.take(MetalArray.fromTypedArray(new Uint32Array([1, 0]))).toArrow()], [20n, 10n]);
+  assert.deepEqual([...m.take(MetalArray.fromTypedArray(new BigInt64Array([1n, 3n]))).toArrow()], [20n, 40n]);
+  for (const bad of [4, 2 ** 31, 2 ** 32 - 1]) {
+    assert.throws(() => m.take(MetalArray.fromTypedArray(new Uint32Array([bad]))), /out of range/);
+  }
+});
+
+test('index arrays are Uint32: argsort, topK, lexsort and plan window ranks', () => {
+  const col = MetalArray.fromArrow(A.vectorFromArray([30n, 10n, 20n, 10n, null, 40n], new A.Int64()));
+  const check = (m, want, what) => {
+    assert.equal(m.format, 'I', what);
+    const t = m.toTypedArray();
+    assert.ok(t instanceof Uint32Array, `${what}: ${t.constructor.name}`);
+    assert.deepEqual([...t], want, what);
+  };
+  check(col.argsort(), [1, 3, 2, 0, 5, 4], 'argsort');
+  check(col.argsort({ descending: true, nulls: 'first' }), [4, 5, 0, 2, 1, 3], 'argsort options');
+  check(col.topK(2), [5, 0], 'topK');
+  check(col.topK(2, { largest: false }), [1, 3], 'topK options');
+  check(lexsort([col], [true]), [5, 0, 2, 1, 3, 4], 'lexsort');
+  check(lexsort([col], [{}]), [1, 3, 2, 0, 5, 4], 'lexsort options');
+
+  const src = PlanSource.create('t', {
+    g: MetalArray.fromArrow(A.vectorFromArray([1n, 1n, 1n, 2n, 2n], new A.Int64())),
+    v: MetalArray.fromArrow(A.vectorFromArray([5n, 5n, 9n, 7n, 1n], new A.Int64())),
+  });
+  const spec = (name, fn) => ({ name, fn, partition_by: ['g'], order_by: [['v', false]] });
+  const r = runPlan({ op: 'window', input: { op: 'scan', source: 't' },
+    specs: [spec('rn', 'row_number'), spec('rk', 'rank'), spec('dr', 'dense_rank')] }, [src]);
+  check(r.column('rn'), [1, 2, 3, 2, 1], 'row_number');
+  check(r.column('rk'), [1, 1, 3, 2, 1], 'rank');
+  check(r.column('dr'), [1, 1, 2, 2, 1], 'dense_rank');
 });
 
 test('take by argsort reproduces sort', () => {

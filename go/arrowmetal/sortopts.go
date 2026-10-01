@@ -100,7 +100,7 @@ func requireSortOptions(op string) error {
 	return nil
 }
 
-// ArgsortWith returns the int32 indices that order the array under o. The sort is stable.
+// ArgsortWith returns the uint32 indices that order the array under o. The sort is stable.
 func (a *Array) ArgsortWith(o SortOptions) (*Array, error) {
 	if err := requireSortOptions("ArgsortWith"); err != nil {
 		return nil, err
@@ -144,7 +144,7 @@ func (a *Array) SortWith(o SortOptions) (*Array, error) {
 	return wrap(out), nil
 }
 
-// TopK returns the int32 indices of the k largest (or, with largest false, the k smallest) values,
+// TopK returns the uint32 indices of the k largest (or, with largest false, the k smallest) values,
 // in sorted order: the first k indices Argsort(largest) gives.
 func (a *Array) TopK(k int64, largest bool) (*Array, error) {
 	if err := Init(); err != nil {
@@ -193,7 +193,7 @@ func (a *Array) TopKWith(k int64, o SortOptions) (*Array, error) {
 	return wrap(out), nil
 }
 
-// LexsortWith returns the int32 indices ordering the rows by each column in turn, the first column
+// LexsortWith returns the uint32 indices ordering the rows by each column in turn, the first column
 // being the most significant, each under its own options. keys holds one SortOptions per column.
 func LexsortWith(columns []*Array, keys []SortOptions) (*Array, error) {
 	if err := requireSortOptions("LexsortWith"); err != nil {

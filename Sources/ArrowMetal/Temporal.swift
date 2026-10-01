@@ -269,7 +269,7 @@ public final class MetalTemporalArray: @unchecked Sendable {
     }
 
     /// Indices that sort the values ascending (stable, nulls last).
-    public func argsort(descending: Bool = false) throws -> MetalArray<Int32> {
+    public func argsort(descending: Bool = false) throws -> MetalArray<UInt32> {
         switch storage {
         case .int32(let a): return try a.argsort(descending: descending)
         case .int64(let a): return try a.argsort(descending: descending)

@@ -156,6 +156,9 @@ extension MetalArray {
         let ctx = context
         let n = length
         try Dispatch.checkLength(n)
+        guard n <= Int(Int32.max) else {
+            throw ArrowMetalError.invalidArrowArray("run_end_encode: a run end of \(n) does not fit the int32 run ends")
+        }
         guard n > 0 else {
             return (try MetalArray<Int32>([Int32](), context: ctx), try MetalArray<T>([T](), context: ctx))
         }
@@ -176,7 +179,7 @@ extension MetalArray {
         ctx.retainUntilFlush(self)
         let selection = try BitmapOps.packBits(ctx, bytes: markBytes, bits: n)
         let mask = MetalBooleanArray(length: n, nullCount: 0, validity: nil, values: selection, context: ctx)
-        let starts = try MetalArray<Int32>.iota(n, context: ctx).filter(mask)
+        let starts = try MetalArray<UInt32>.iota(n, context: ctx).filter(mask)
         let runs = starts.length
         let ends = try MetalArrowBuffer.allocate(byteCount: Swift.max(runs, 1) * 4, zeroed: false, context: ctx)
         let endPSO = try Dispatch.pipeline(ctx, family: "ree", source: RunEndSource.source, function: "ree_ends", type: "int")

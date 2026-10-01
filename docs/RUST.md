@@ -214,7 +214,7 @@ data, at lengths 0, 1, 33, 1024, 1025, 100,001 and 1,000,001, with and without n
 | `filter` | `am_filter` | `arrow::compute::filter`, including a mask with nulls |
 | `take` | `am_take` | `arrow::compute::take`, with repeated, out-of-order and null indices |
 | `slice` | `am_slice` | `arrow::array::Array::slice` |
-| `sort`, `argsort` | `am_sort`, `am_argsort` | `arrow::compute::sort` with `nulls_first: false` |
+| `sort`, `argsort` | `am_sort`, `am_argsort` | `arrow::compute::sort` with `nulls_first: false`; `argsort` index for index against `sort_to_indices` (both `UInt32Array`) on distinct values at 1, 1,025 and 1,000,001 rows |
 | `sort_with`, `argsort_with`, `top_k_with` with `SortOptions { descending, nulls_first, float_order }`; `lexsort(columns, options)` | `am_sort_ex2`, `am_argsort_ex2`, `am_top_k_ex`, `am_lexsort_ex2` | `arrow::compute::sort` / `lexsort_to_indices` with every `SortOptions`, bit for bit on Float64 and Float32 columns holding NaN of both signs, ±0.0, ±inf and subnormals (`tests/sort_options.rs`) |
 | `cast` | `am_cast` | `arrow::compute::cast` |
 | `group_by(keys)` with `sum`, `min`, `max`, `mean`, `count`, `count_all`; `keys(i)`, `ids()`, `agg_raw` | `am_group_by_keys`, `am_group_agg_ex` | a plain `HashMap` fold — arrow-rs's `arrow` crate has no hash aggregation (it lives in DataFusion) |
@@ -222,7 +222,10 @@ data, at lengths 0, 1, 33, 1024, 1025, 100,001 and 1,000,001, with and without n
 | `batch(\|\| …)` | `am_batch_begin` / `am_batch_end` | the same chain unbatched, and arrow's answer; plus deferred-failure, nesting and panic-unwind cases |
 
 Element types: **Int64 and Float64** are swept against arrow-rs. Boolean arrays are exercised as
-comparison output and filter masks, and Int32 as sort indices. Every other Arrow type the ABI
+comparison output and filter masks, and UInt32 as sort indices: `argsort`, `argsort_with`,
+`top_k_with` and `lexsort` return an arrow `UInt32Array`, the type `sort_to_indices` returns (row
+numbers up to 2^32 - 1; a longer input is an error), and `take` accepts Int32, Int64 and UInt32
+indices. Every other Arrow type the ABI
 supports reaches the GPU through the same entry points but has **no test in this crate** — the Swift
 and Python suites cover them ([TESTING.md](TESTING.md)).
 
@@ -437,6 +440,5 @@ cd rust
 ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib cargo test --release
 ```
 
-48 tests, plus 4 `no_run` doc-tests (compiled, not executed); 0 failures on 2026-09-24 at
-`3c3ea1e` ([TESTING.md](TESTING.md)). What each file compares against is in
+71 tests, plus 4 `no_run` doc-tests (compiled, not executed); 0 failures on 2026-10-01 ([TESTING.md](TESTING.md)). What each file compares against is in
 [`rust/README.md`](../rust/README.md) and in [TESTING.md](TESTING.md).

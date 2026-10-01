@@ -43,9 +43,9 @@ extension MetalArray: WindowOps {
             return w
         }
         switch op {
-        case 0: return .int32(try rowNumber())
-        case 1: return .int32(try rank())
-        case 2: return .int32(try denseRank())
+        case 0: return .uint32(try rowNumber())
+        case 1: return .uint32(try rank())
+        case 2: return .uint32(try denseRank())
         case 3: return .float64(try percentRank())
         case 4: return .float64(try cumeDist())
         case 5: return wrap(try shift(by: Int(p1), fill: scalar.map { $0.loadUnaligned(as: T.self) }))
@@ -100,7 +100,7 @@ public func am_window(_ a: OpaquePointer?, _ op: Int32, _ p1: Int64, _ p2: Int64
     return run(out) { try withWindow(x) { try $0.amWindow(op, p1, p2, scalar) } }
 }
 
-/// Multi-column (lexicographic) sort: int32 indices that order the rows by every column in turn, the
+/// Multi-column (lexicographic) sort: uint32 indices that order the rows by every column in turn, the
 /// first being the most significant. `descending` has one entry per column (it may be NULL for all
 /// ascending). Stable, and nulls come last in every key whichever direction that key is sorted in.
 @_cdecl("am_lexsort")
@@ -114,5 +114,5 @@ public func am_lexsort(_ columns: UnsafeMutablePointer<OpaquePointer?>?, _ desce
         cols.append(c)
         desc.append(descending.map { $0[i] != 0 } ?? false)
     }
-    return run(out) { .int32(try lexsortIndices(cols, descending: desc)) }
+    return run(out) { .uint32(try lexsortIndices(cols, descending: desc)) }
 }

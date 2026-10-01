@@ -47,7 +47,7 @@ final class WindowTests: XCTestCase {
     }
 
     struct Ranking {
-        var rowNumber: [Int32] = [], rank: [Int32] = [], dense: [Int32] = []
+        var rowNumber: [UInt32] = [], rank: [UInt32] = [], dense: [UInt32] = []
         var percent: [Double] = [], cume: [Double] = []
     }
 
@@ -61,13 +61,13 @@ final class WindowTests: XCTestCase {
             if p == 0 || g[p] != g[p - 1] { start[g[p]] = p }
             if p == n - 1 || g[p] != g[p + 1] { end[g[p]] = p + 1 }
         }
-        r.rowNumber = [Int32](repeating: 0, count: n); r.rank = r.rowNumber; r.dense = r.rowNumber
+        r.rowNumber = [UInt32](repeating: 0, count: n); r.rank = r.rowNumber; r.dense = r.rowNumber
         r.percent = [Double](repeating: 0, count: n); r.cume = r.percent
         for p in 0..<n {
             let row = ord[p], d = g[p]
-            r.rowNumber[row] = Int32(p + 1)
-            r.rank[row] = Int32(start[d] + 1)
-            r.dense[row] = Int32(d + 1)
+            r.rowNumber[row] = UInt32(p + 1)
+            r.rank[row] = UInt32(start[d] + 1)
+            r.dense[row] = UInt32(d + 1)
             r.percent[row] = n <= 1 ? 0 : Double(start[d]) / Double(n - 1)
             r.cume[row] = Double(end[d]) / Double(n)
         }
@@ -396,7 +396,7 @@ final class WindowTests: XCTestCase {
     // MARK: - Multi-column sort
 
     /// Stable lexicographic order of the rows, nulls last in every key, as an index array.
-    static func lexOracle(_ keys: [[Int64?]], _ descending: [Bool], count: Int) -> [Int32] {
+    static func lexOracle(_ keys: [[Int64?]], _ descending: [Bool], count: Int) -> [UInt32] {
         (0..<count).sorted { i, j in
             for (k, col) in keys.enumerated() {
                 let a = col[i], b = col[j]
@@ -407,7 +407,7 @@ final class WindowTests: XCTestCase {
                 return descending[k] ? (a! > b!) : (a! < b!)
             }
             return i < j                                 // stable
-        }.map { Int32($0) }
+        }.map { UInt32($0) }
     }
 
     func testLexsortIndices() throws {

@@ -86,17 +86,19 @@ private func withSelection<R>(_ a: AnyMetalArray, _ body: (any SelectionCOps) th
     }
 }
 
-/// An int32 index column, narrowing int64 / uint32 index columns on the way in.
-private func indexColumn(_ a: AnyMetalArray) throws -> MetalArray<Int32> {
+/// `scattered(to:)` over an index column of any integer type. The 32- and 64-bit index types go in as
+/// they are, so an index is range-checked in its own type and never narrowed onto another position;
+/// int8 / int16 / uint8 / uint16 widen to int32.
+private func scattered(_ v: AnyMetalArray, _ a: AnyMetalArray, _ maxIndex: Int64) throws -> AnyMetalArray {
     switch a {
-    case .int32(let x): return x
-    case .int8(let x): return try x.cast(to: Int32.self)
-    case .uint8(let x): return try x.cast(to: Int32.self)
-    case .int16(let x): return try x.cast(to: Int32.self)
-    case .uint16(let x): return try x.cast(to: Int32.self)
-    case .uint32(let x): return try x.cast(to: Int32.self)
-    case .int64(let x): return try x.cast(to: Int32.self)
-    case .uint64(let x): return try x.cast(to: Int32.self)
+    case .int32(let x): return try v.scattered(to: x, maxIndex: maxIndex)
+    case .uint32(let x): return try v.scattered(to: x, maxIndex: maxIndex)
+    case .int64(let x): return try v.scattered(to: x, maxIndex: maxIndex)
+    case .uint64(let x): return try v.scattered(to: x, maxIndex: maxIndex)
+    case .int8(let x): return try v.scattered(to: try x.cast(to: Int32.self), maxIndex: maxIndex)
+    case .uint8(let x): return try v.scattered(to: try x.cast(to: Int32.self), maxIndex: maxIndex)
+    case .int16(let x): return try v.scattered(to: try x.cast(to: Int32.self), maxIndex: maxIndex)
+    case .uint16(let x): return try v.scattered(to: try x.cast(to: Int32.self), maxIndex: maxIndex)
     default: throw ArrowMetalError.unsupportedType("index columns must be integers, got \(a.arrowFormat)")
     }
 }
@@ -119,7 +121,7 @@ public func am_inverse_permutation(_ a: OpaquePointer?, _ maxIndex: Int64,
 public func am_scatter(_ values: OpaquePointer?, _ indices: OpaquePointer?, _ maxIndex: Int64,
                        _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
     guard let v = selHandle(values), let i = selHandle(indices) else { return 2 }
-    return selRun(out) { try v.scattered(to: try indexColumn(i), maxIndex: maxIndex) }
+    return selRun(out) { try scattered(v, i, maxIndex) }
 }
 
 /// Arrow `winsorize`: clamps to the nearest quantiles at `lower_limit` and `upper_limit`.
@@ -228,7 +230,7 @@ public func am_make_struct(_ arrays: UnsafeMutablePointer<OpaquePointer?>?,
 protocol AssociativeCOps {
     func selUnique() throws -> AnyMetalArray
     func selValueCounts() throws -> MetalStructArray
-    func selPartitionNth(_ n: Int64) throws -> MetalArray<Int32>
+    func selPartitionNth(_ n: Int64) throws -> MetalArray<UInt32>
 }
 
 extension MetalArray: AssociativeCOps {
@@ -239,7 +241,7 @@ extension MetalArray: AssociativeCOps {
                                     names: ["values", "counts"],
                                     children: [wrap(values), .int64(counts)], context: context)
     }
-    func selPartitionNth(_ n: Int64) throws -> MetalArray<Int32> { try partitionNthIndices(Int(n)) }
+    func selPartitionNth(_ n: Int64) throws -> MetalArray<UInt32> { try partitionNthIndices(Int(n)) }
 }
 
 private func withAssociative<R>(_ a: AnyMetalArray, _ body: (any AssociativeCOps) throws -> R) throws -> R {
@@ -288,5 +290,5 @@ public func am_value_counts(_ a: OpaquePointer?, _ out: UnsafeMutablePointer<Opa
 public func am_partition_nth_indices(_ a: OpaquePointer?, _ n: Int64,
                                      _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
     guard let x = selHandle(a) else { return 2 }
-    return selRun(out) { .int32(try withAssociative(x) { try $0.selPartitionNth(n) }) }
+    return selRun(out) { .uint32(try withAssociative(x) { try $0.selPartitionNth(n) }) }
 }

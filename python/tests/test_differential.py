@@ -963,12 +963,14 @@ def _sort(src, shape):
              src.take(pc.array_sort_indices(src, order="descending"))])
 
 
-@op("argsort", NUMERIC, note="both engines document a stable sort with nulls last")
+@op("argsort", NUMERIC, note="both engines document a stable sort with nulls last. pyarrow's indices are "
+                              "uint64 and ArrowMetal's uint32; the values are compared (pyarrow's cast to "
+                              "uint32), as in every index case below")
 def _argsort(src, shape):
     x = am.array(src)
     return ([arrow(x.argsort()), arrow(x.argsort(True))],
-            [pc.array_sort_indices(src).cast(pa.int32()),
-             pc.array_sort_indices(src, order="descending").cast(pa.int32())])
+            [pc.array_sort_indices(src).cast(pa.uint32()),
+             pc.array_sort_indices(src, order="descending").cast(pa.uint32())])
 
 
 @op("top_k", NUMERIC)
@@ -976,8 +978,8 @@ def _top_k(src, shape):
     x = am.array(src)
     k = min(len(src), 17)
     return ([arrow(x.top_k(k)), arrow(x.top_k(k, False))],
-            [pc.array_sort_indices(src, order="descending").cast(pa.int32()).slice(0, k),
-             pc.array_sort_indices(src).cast(pa.int32()).slice(0, k)])
+            [pc.array_sort_indices(src, order="descending").cast(pa.uint32()).slice(0, k),
+             pc.array_sort_indices(src).cast(pa.uint32()).slice(0, k)])
 
 
 @op("argsort_nulls_first", NUMERIC, note="null_placement='at_start' in both directions")
@@ -985,8 +987,8 @@ def _argsort_nulls_first(src, shape):
     x = am.array(src)
     return ([arrow(x.argsort(False, null_placement="at_start")),
              arrow(x.argsort(True, null_placement="at_start"))],
-            [pc.array_sort_indices(src, null_placement="at_start").cast(pa.int32()),
-             pc.array_sort_indices(src, order="descending", null_placement="at_start").cast(pa.int32())])
+            [pc.array_sort_indices(src, null_placement="at_start").cast(pa.uint32()),
+             pc.array_sort_indices(src, order="descending", null_placement="at_start").cast(pa.uint32())])
 
 
 @op("top_k_nulls_first", NUMERIC)
@@ -996,8 +998,8 @@ def _top_k_nulls_first(src, shape):
     return ([arrow(x.top_k(k, null_placement="at_start")),
              arrow(x.top_k(k, False, null_placement="at_start"))],
             [pc.array_sort_indices(src, order="descending", null_placement="at_start")
-             .cast(pa.int32()).slice(0, k),
-             pc.array_sort_indices(src, null_placement="at_start").cast(pa.int32()).slice(0, k)])
+             .cast(pa.uint32()).slice(0, k),
+             pc.array_sort_indices(src, null_placement="at_start").cast(pa.uint32()).slice(0, k)])
 
 
 def _total_order_indices(src, descending, null_placement):
@@ -1005,7 +1007,7 @@ def _total_order_indices(src, descending, null_placement):
     order; for integers it is pyarrow's own."""
     if src.type not in (pa.float32(), pa.float64()):
         return pc.array_sort_indices(src, order="descending" if descending else "ascending",
-                                     null_placement=null_placement).cast(pa.int32())
+                                     null_placement=null_placement).cast(pa.uint32())
     wide = src.type == pa.float64()
     valid = np.asarray(src.is_valid())
     raw = src.fill_null(0).to_numpy(zero_copy_only=False)
@@ -1020,7 +1022,7 @@ def _total_order_indices(src, descending, null_placement):
     ordered = rows[np.argsort(key[rows], kind="stable")]
     nulls = np.nonzero(~valid)[0]
     parts = [nulls, ordered] if null_placement == "at_start" else [ordered, nulls]
-    return pa.array(np.concatenate(parts).astype(np.int32), pa.int32())
+    return pa.array(np.concatenate(parts).astype(np.uint32), pa.uint32())
 
 
 @op("argsort_total_order", NUMERIC,
@@ -2919,7 +2921,7 @@ def _ranking(src, shape):
     for method, tiebreaker in [("row_number", "first"), ("rank", "min"), ("dense_rank", "dense")]:
         got.append(arrow(getattr(x, method)()))
         # null_placement defaults to "at_end", which is where ArrowMetal's ranks put them too.
-        expected.append(pc.rank(src, sort_keys="ascending", tiebreaker=tiebreaker).cast(pa.int32()))
+        expected.append(pc.rank(src, sort_keys="ascending", tiebreaker=tiebreaker).cast(pa.uint32()))
     return got, expected
 
 
@@ -3182,7 +3184,7 @@ def _lexsort(src, shape):
                  ("b", "descending" if descending[1] else "ascending")]
         # null_placement defaults to "at_end", which is where both engines put the nulls of every key.
         got.append(arrow(am.lexsort_indices([am.array(src), am.array(other)], descending)))
-        expected.append(pc.sort_indices(keys, sort_keys=order).cast(pa.int32()))
+        expected.append(pc.sort_indices(keys, sort_keys=order).cast(pa.uint32()))
     return got, expected
 
 
@@ -3992,14 +3994,14 @@ def _sort_indices(src, shape):
             got += [arrow(x.array_sort_indices(descending, placement)),
                     arrow(x.sort_indices(descending, placement))]
             reference = pc.array_sort_indices(src, order=order,
-                                              null_placement=placement).cast(pa.int32())
+                                              null_placement=placement).cast(pa.uint32())
             expected += [reference, reference]
     return got, expected
 
 
 @op("array_selection", ALL_TYPES,
     note="array_filter and array_take, Arrow's names for filter and take; the same kernels reached "
-         "through the second name")
+         "through the second name, the take with int32, int64 and uint32 indices")
 def _array_selection(src, shape):
     mask = make_array("bool", shape, seed=2)
     n = len(src)
@@ -4010,8 +4012,13 @@ def _array_selection(src, shape):
         raw = rng.integers(0, n, min(n, 977)).astype(np.int32)
         idx = pa.array(raw, mask=rng.random(len(raw)) < 0.1, type=pa.int32())
     x = am.array(src)
-    return ([arrow(x.array_filter(am.array(mask))), arrow(x.array_take(am.array(idx)))],
-            [src.filter(mask), src.take(idx)])
+    got = [arrow(x.array_filter(am.array(mask)))]
+    want = [src.filter(mask)]
+    for t in (pa.int32(), pa.int64(), pa.uint32()):
+        typed = idx.cast(t)
+        got.append(arrow(x.array_take(am.array(typed))))
+        want.append(src.take(typed))
+    return got, want
 
 
 @op("invert", ["bool"], note="pc.invert, Arrow's name for the ~ operator the bool_logic case uses")
@@ -5449,6 +5456,20 @@ def test_list_element_of_a_short_row_is_null_where_pyarrow_raises():
     assert pylist(am.array(a).list_element(1)) == [2, None, None]
     with pytest.raises(pa.ArrowInvalid):
         pc.list_element(a, 1)
+
+
+def test_index_arrays_are_uint32_where_pyarrow_returns_uint64():
+    """Index arrays are uint32, the width arrow-rs `sort_to_indices` and Polars' IdxSize use; pyarrow
+    returns uint64. The values agree, which is what every index case in the matrix compares."""
+    a = pa.array([5, None, 3, 9, 1, 9, 3], pa.int64())
+    x = am.array(a)
+    for got, want in [(x.argsort(), pc.array_sort_indices(a)),
+                      (x.partition_nth_indices(7), pc.array_sort_indices(a)),
+                      (x.rank(), pc.rank(a))]:
+        got = arrow(got)
+        assert got.type == pa.uint32() and want.type == pa.uint64()
+    assert arrow(x.argsort()).to_pylist() == pc.array_sort_indices(a).to_pylist()
+    assert arrow(x.rank()).to_pylist() == pc.rank(a, tiebreaker="min").to_pylist()
 
 
 def test_list_parent_indices_are_int32_where_pyarrow_returns_int64():

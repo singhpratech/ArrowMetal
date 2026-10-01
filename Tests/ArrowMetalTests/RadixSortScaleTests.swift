@@ -29,14 +29,14 @@ final class RadixSortScaleTests: XCTestCase {
                         4095, 4096, 4097, 65_536, (1 << 18) - 1, 1 << 18, (1 << 18) + 1]
 
     /// The permutation a stable sort in Arrow's order produces, computed on the host.
-    func expected(_ vals: [Int64?], descending: Bool, atStart: Bool) -> [Int32] {
+    func expected(_ vals: [Int64?], descending: Bool, atStart: Bool) -> [UInt32] {
         let present = vals.enumerated().filter { $0.element != nil }
         let sorted = present.sorted { x, y in
             let a = x.element!, b = y.element!
             if a != b { return descending ? a > b : a < b }
             return x.offset < y.offset
-        }.map { Int32($0.offset) }
-        let nulls = vals.enumerated().filter { $0.element == nil }.map { Int32($0.offset) }
+        }.map { UInt32($0.offset) }
+        let nulls = vals.enumerated().filter { $0.element == nil }.map { UInt32($0.offset) }
         return atStart ? nulls + sorted : sorted + nulls
     }
 
@@ -70,8 +70,8 @@ final class RadixSortScaleTests: XCTestCase {
         try requireRealGPU()
         for n in Self.sizes {
             let a = try MetalArray<Int64>([Int64](repeating: 42, count: n))
-            XCTAssertEqual(try a.argsort().toRawArray(), (0..<n).map { Int32($0) }, "all-equal n=\(n)")
-            XCTAssertEqual(try a.argsort(descending: true).toRawArray(), (0..<n).map { Int32($0) },
+            XCTAssertEqual(try a.argsort().toRawArray(), (0..<n).map { UInt32($0) }, "all-equal n=\(n)")
+            XCTAssertEqual(try a.argsort(descending: true).toRawArray(), (0..<n).map { UInt32($0) },
                            "all-equal descending n=\(n)")
         }
     }
@@ -153,7 +153,7 @@ final class RadixSortScaleTests: XCTestCase {
                     }
                     if x != y { return descending ? x > y : x < y }
                     return i < j
-                }.map { Int32($0) }
+                }.map { UInt32($0) }
                 XCTAssertEqual(got, want, "float specials n=\(n) descending=\(descending)")
             }
         }
@@ -188,7 +188,7 @@ final class RadixSortScaleTests: XCTestCase {
                 if i32[x] != i32[y] { return i32[x] < i32[y] }
                 return x < y
             }
-            XCTAssertEqual(try a.argsort().toRawArray(), orderI.map { Int32($0) }, "int32 n=\(n)")
+            XCTAssertEqual(try a.argsort().toRawArray(), orderI.map { UInt32($0) }, "int32 n=\(n)")
 
             let f32: [Float] = (0..<n).map { _ in Float(rng.next() % 100_000) / 7.0 }
             let b = try MetalArray<Float>(f32)
@@ -196,7 +196,7 @@ final class RadixSortScaleTests: XCTestCase {
                 if f32[x] != f32[y] { return f32[x] < f32[y] }
                 return x < y
             }
-            XCTAssertEqual(try b.argsort().toRawArray(), orderF.map { Int32($0) }, "float32 n=\(n)")
+            XCTAssertEqual(try b.argsort().toRawArray(), orderF.map { UInt32($0) }, "float32 n=\(n)")
         }
     }
 }

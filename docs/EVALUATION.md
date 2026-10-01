@@ -177,6 +177,7 @@ suite notices if either engine changes its mind.
 | `list_element` on a row shorter than the index | null | raises `ArrowInvalid` for the whole column | `test_list_element_of_a_short_row_is_null_where_pyarrow_raises` |
 | `parse` of a string that is not a number | null | `cast` raises, even with `safe=False` | `test_parse_returns_null_where_pyarrow_raises` |
 | adding a duration to a time of day past midnight | wraps inside the day | raises: the result is outside `[0, 86400)` | `test_time_of_day_addition_wraps_where_pyarrow_raises` |
+| `array_sort_indices`, `sort_indices`, `select_k_unstable`, `partition_nth_indices`, `rank` | `uint32` row numbers (arrow-rs's and Polars' index width); the same values | `uint64` | `test_index_arrays_are_uint32_where_pyarrow_returns_uint64` |
 | `list_parent_indices` | `int32` — list offsets are `int32` throughout this package | `int64` | `test_list_parent_indices_are_int32_where_pyarrow_returns_int64` |
 | the temporal extractors (`year`…`nanosecond`, `day_of_week` with the default options) | `int32` | `int64` (`us_week`, `us_year`, `week` and the option-carrying `day_of_week` are `int64` in both) | `test_temporal_extractors_return_int32_where_pyarrow_returns_int64` |
 | `null_count` of a run-end encoded column | the logical count | always 0 — the nulls live in the values child | `test_run_end_null_count_is_logical` |

@@ -55,12 +55,13 @@ extension MetalArray {
     /// row, which is an identity permutation and is dropped (see below).
     public func argsort(descending: Bool = false,
                         nullPlacement: NullPlacement = .atEnd,
-                        floatOrder: FloatOrder = .ieee) throws -> MetalArray<Int32> {
+                        floatOrder: FloatOrder = .ieee) throws -> MetalArray<UInt32> {
         try Dispatch.checkLength(length)
-        if length == 0 { return try MetalArray<Int32>([Int32](), context: context) }
+        try Dispatch.checkIndexRows(length, "argsort")
+        if length == 0 { return try MetalArray<UInt32>([UInt32](), context: context) }
         let run = try radixSortRun(descending: descending, nullPlacement: nullPlacement,
                                    floatOrder: floatOrder, wantOrder: true)
-        return MetalArray<Int32>(length: length, nullCount: 0, validity: nil, values: run.order!, context: context)
+        return MetalArray<UInt32>(length: length, nullCount: 0, validity: nil, values: run.order!, context: context)
     }
 
     /// Sorted copy (nulls at whichever end `nullPlacement` names, `atEnd` by default).
@@ -110,8 +111,9 @@ extension MetalArray {
     /// takes the full argsort, because the NaN rows move to the front with the nulls there. `.nanLargest`
     /// keeps NaN among the values, so it takes the selection like every other order.
     public func topK(_ k: Int, largest: Bool = true, nullPlacement: NullPlacement = .atEnd,
-                     floatOrder: FloatOrder = .ieee) throws -> MetalArray<Int32> {
-        guard k > 0 else { return try MetalArray<Int32>([Int32](), context: context) }
+                     floatOrder: FloatOrder = .ieee) throws -> MetalArray<UInt32> {
+        guard k > 0 else { return try MetalArray<UInt32>([UInt32](), context: context) }
+        try Dispatch.checkIndexRows(length, "top_k")
         if nullPlacement == .atStart {
             if T.isFloatingPoint && floatOrder == .ieee {
                 let idx = try argsort(descending: largest, nullPlacement: .atStart)
@@ -133,11 +135,11 @@ extension MetalArray {
     /// Top-k with the nulls first, for a column that has some: the first `min(k, nullCount)` null rows in
     /// input order (a host scan of the validity bitmap that stops at the k-th null), then the best
     /// `k - nullCount` values through the ordinary selection, which skips the null rows.
-    private func topKNullsFirst(_ k: Int, largest: Bool, floatOrder: FloatOrder) throws -> MetalArray<Int32> {
+    private func topKNullsFirst(_ k: Int, largest: Bool, floatOrder: FloatOrder) throws -> MetalArray<UInt32> {
         let n = length
         let want = Swift.min(k, n)
         let nulls = nullCount
-        var rows: [Int32] = []
+        var rows: [UInt32] = []
         rows.reserveCapacity(want)
         try context.syncPoint()
         if let v = rawValidity {
@@ -148,7 +150,7 @@ extension MetalArray {
                     let bit = offset + i
                     // A whole byte of valid rows is skipped at once when the scan is byte aligned.
                     if bit & 7 == 0 && i + 8 <= n && bits[bit >> 3] == 0xFF { i += 8; continue }
-                    if !Bitmap.isSet(bits, bit) { rows.append(Int32(i)) }
+                    if !Bitmap.isSet(bits, bit) { rows.append(UInt32(i)) }
                     i += 1
                 }
             }
@@ -159,7 +161,7 @@ extension MetalArray {
             try context.syncPoint()
             rows.append(contentsOf: best.withValues { Array($0) })
         }
-        return try MetalArray<Int32>(rows, context: context)
+        return try MetalArray<UInt32>(rows, context: context)
     }
 
     // MARK: - the sort itself
@@ -621,7 +623,7 @@ extension MetalRecordBatch {
     /// Sorts every column by one column (stable, nulls last).
     public func sorted(by column: String, descending: Bool = false) throws -> MetalRecordBatch {
         guard let c = self[column] else { throw ArrowMetalError.invalidArrowArray("no column named \(column)") }
-        let idx: MetalArray<Int32>
+        let idx: MetalArray<UInt32>
         switch c {
         case .int8(let a): idx = try a.argsort(descending: descending)
         case .uint8(let a): idx = try a.argsort(descending: descending)

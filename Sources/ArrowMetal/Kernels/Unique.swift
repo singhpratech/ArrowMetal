@@ -5,7 +5,7 @@ import Metal
 /// `unique`, `valueCounts` and `dictionaryEncode` so each of them is one argsort plus small passes.
 final class SortedRuns {
     /// Original row index of each non-null value, ascending by value (stable).
-    let ord: MetalArray<Int32>
+    let ord: MetalArray<UInt32>
     /// One byte per sorted position, 1 where a new distinct value starts. Feeds the bitmap packer.
     let markBytes: MetalArrowBuffer
     /// The same marks as int32, input to the rank scan.
@@ -16,7 +16,7 @@ final class SortedRuns {
     let source: String
     let unsignedType: String
 
-    init(ord: MetalArray<Int32>, markBytes: MetalArrowBuffer, markInts: MetalArrowBuffer, count: Int,
+    init(ord: MetalArray<UInt32>, markBytes: MetalArrowBuffer, markInts: MetalArrowBuffer, count: Int,
          source: String, unsignedType: String) {
         self.ord = ord
         self.markBytes = markBytes
@@ -90,6 +90,11 @@ extension MetalArray {
             return (codes, try MetalArray<T>([T](), context: ctx))
         }
         let (firstIdx, _) = try runStarts(runs)
+        // The codes are Arrow's int32 dictionary indices: a dictionary past 2^31 values is refused.
+        guard firstIdx.length - 1 <= Int(Int32.max) else {
+            throw ArrowMetalError.invalidArrowArray(
+                "dictionary_encode: \(firstIdx.length) distinct values do not fit int32 dictionary codes")
+        }
         let unique = try gatherUnique(firstIdx)
         let codes = try scatterRanks(runs, rows: n)
         return (codes, unique)
@@ -163,7 +168,7 @@ extension MetalArray {
 
     /// Compacts the marks into the sorted positions of the run starts (`pos`) and the original rows they
     /// point at (`firstIdx`), using the existing filter and take kernels.
-    func runStarts(_ runs: SortedRuns) throws -> (firstIdx: MetalArray<Int32>, pos: MetalArray<Int32>) {
+    func runStarts(_ runs: SortedRuns) throws -> (firstIdx: MetalArray<UInt32>, pos: MetalArray<UInt32>) {
         let ctx = context
         let selection = try BitmapOps.packBits(ctx, bytes: runs.markBytes, bits: runs.count)
         let mask = MetalBooleanArray(length: runs.count, nullCount: 0, validity: nil, values: selection, context: ctx)
@@ -175,20 +180,20 @@ extension MetalArray {
             Dispatch.setLength(enc, runs.count, nil, index: 1)
             Dispatch.dispatch1D(enc, iotaPSO, count: runs.count)
         }
-        let iota = MetalArray<Int32>(length: runs.count, nullCount: 0, validity: nil, values: iotaBuf, context: ctx)
+        let iota = MetalArray<UInt32>(length: runs.count, nullCount: 0, validity: nil, values: iotaBuf, context: ctx)
         let pos = try iota.filter(mask)
         return (try runs.ord.take(pos), pos)
     }
 
     /// Gathers the representative value of each run. The result never has nulls, so it carries no bitmap.
-    func gatherUnique(_ firstIdx: MetalArray<Int32>) throws -> MetalArray<T> {
+    func gatherUnique(_ firstIdx: MetalArray<UInt32>) throws -> MetalArray<T> {
         let gathered = try take(firstIdx)
         guard gathered.validity != nil else { return gathered }
         return MetalArray<T>(length: gathered.length, nullCount: 0, validity: nil, values: gathered.values, context: context)
     }
 
     /// Rows per distinct value: the gap between adjacent run starts, the last one closing at `runs.count`.
-    func runLengths(_ runs: SortedRuns, pos: MetalArray<Int32>) throws -> MetalArray<Int64> {
+    func runLengths(_ runs: SortedRuns, pos: MetalArray<UInt32>) throws -> MetalArray<Int64> {
         let ctx = context
         let u = pos.length
         let out = try MetalArrowBuffer.allocate(byteCount: Swift.max(u, 1) * 8, zeroed: false, context: ctx)

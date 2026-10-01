@@ -282,7 +282,7 @@ def ordinal(col):
         return m
     codes, uniques = m.dictionary_encode()
     import pyarrow.compute as pc
-    order = pc.sort_indices(uniques.to_arrow()).cast(pa.int32())
+    order = pc.sort_indices(uniques.to_arrow()).cast(pa.uint32())
     rank = MetalArray.from_arrow(order).inverse_permutation()
     return rank.take(codes)
 

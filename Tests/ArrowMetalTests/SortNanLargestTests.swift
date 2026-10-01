@@ -14,7 +14,7 @@ final class SortNanLargestTests: XCTestCase {
 
     // MARK: - the CPU reference
 
-    static func referenceDouble(_ v: [Double?], descending: Bool, nullsFirst: Bool, order: FloatOrder) -> [Int32] {
+    static func referenceDouble(_ v: [Double?], descending: Bool, nullsFirst: Bool, order: FloatOrder) -> [UInt32] {
         guard order == .nanLargest else {
             return R.referenceDouble(v, descending: descending, nullsFirst: nullsFirst, order: order)
         }
@@ -27,7 +27,7 @@ final class SortNanLargestTests: XCTestCase {
                            descending: descending, nullsFirst: nullsFirst, ieee: false)
     }
 
-    static func referenceFloat(_ v: [Float?], descending: Bool, nullsFirst: Bool, order: FloatOrder) -> [Int32] {
+    static func referenceFloat(_ v: [Float?], descending: Bool, nullsFirst: Bool, order: FloatOrder) -> [UInt32] {
         guard order == .nanLargest else {
             return R.referenceFloat(v, descending: descending, nullsFirst: nullsFirst, order: order)
         }
@@ -49,7 +49,7 @@ final class SortNanLargestTests: XCTestCase {
     static func ranks(_ v: [Double?], descending: Bool, nullsFirst: Bool, order: FloatOrder) -> [Int] {
         let perm = referenceDouble(v, descending: descending, nullsFirst: nullsFirst, order: order)
         var rank = [Int](repeating: 0, count: v.count)
-        var prev: Int32? = nil, r = 0
+        var prev: UInt32? = nil, r = 0
         for (j, i) in perm.enumerated() {
             if let p = prev, !tied(v[Int(p)], v[Int(i)], order: order) { r = j }
             rank[Int(i)] = r; prev = i
@@ -126,7 +126,7 @@ final class SortNanLargestTests: XCTestCase {
         try requireRealGPU()
         let v: [Double?] = [1, .nan, nil, -0.0, 0.0, -1, .infinity, -.infinity, -.nan, nil, 2, -0.0]
         let a = try MetalArray<Double>(v)
-        func rows(_ desc: Bool, _ nullsFirst: Bool) throws -> [Int32] {
+        func rows(_ desc: Bool, _ nullsFirst: Bool) throws -> [UInt32] {
             try a.argsort(descending: desc, nullPlacement: nullsFirst ? .atStart : .atEnd,
                           floatOrder: .nanLargest).toRawArray()
         }
@@ -155,7 +155,7 @@ final class SortNanLargestTests: XCTestCase {
                     let rank2 = Self.ranks(k2, descending: d2, nullsFirst: p2 == .atStart, order: .nanLargest)
                     let r1 = R.referenceInt(k1, descending: d1, nullsFirst: p1 == .atStart)
                     var rank1 = [Int](repeating: 0, count: n)
-                    var prev: Int32? = nil, r = 0
+                    var prev: UInt32? = nil, r = 0
                     for (j, i) in r1.enumerated() {
                         if let p = prev, k1[Int(p)] != k1[Int(i)] { r = j }
                         rank1[Int(i)] = r; prev = i
@@ -164,7 +164,7 @@ final class SortNanLargestTests: XCTestCase {
                         if rank1[a] != rank1[b] { return rank1[a] < rank1[b] }
                         if rank2[a] != rank2[b] { return rank2[a] < rank2[b] }
                         return a < b
-                    }.map { Int32($0) }
+                    }.map { UInt32($0) }
                     XCTAssertEqual(got, want, "lexsort n=\(n) \(d1) \(p1) / \(d2) \(p2)")
                 }
             }
@@ -176,16 +176,16 @@ final class SortNanLargestTests: XCTestCase {
         let n = 70_001
         let v = R.doubles(n, nullFraction: 0.05, seed: 13)
         let x = AnyMetalArray.float64(try MetalArray<Double>(v))
-        let row = AnyMetalArray.int32(try MetalArray<Int32>((0..<Int32(n)).map { $0 }))
+        let row = AnyMetalArray.uint32(try MetalArray<UInt32>((0..<UInt32(n)).map { $0 }))
         let sources = ["t": PlanSource(name: "t", batch: try MetalRecordBatch(names: ["x", "row"], columns: [x, row]))]
         for (desc, nullsFirst) in [(true, false), (true, true), (false, true), (false, false)] {
             let want = Self.referenceDouble(v, descending: desc, nullsFirst: nullsFirst, order: .nanLargest)
             let nulls = nullsFirst ? "first" : "last"
             let sort = #"{"op":"sort","by":[["x",\#(desc),{"nulls":"\#(nulls)","float_order":"nan_largest"}]],"input":{"op":"scan","source":"t"}}"#
-            XCTAssertEqual(try PlanJSON.run(sort, sources: sources)["row"]!.asInt32!.toRawArray(), want, sort)
+            XCTAssertEqual(try PlanJSON.run(sort, sources: sources)["row"]!.asUInt32!.toRawArray(), want, sort)
             let top = #"{"op":"limit","count":100,"input":\#(sort)}"#
             XCTAssertTrue(try PlanJSON.explain(top, sources: sources).contains("TOP"), "top-k fusion")
-            XCTAssertEqual(try PlanJSON.run(top, sources: sources)["row"]!.asInt32!.toRawArray(), Array(want.prefix(100)), top)
+            XCTAssertEqual(try PlanJSON.run(top, sources: sources)["row"]!.asUInt32!.toRawArray(), Array(want.prefix(100)), top)
         }
         XCTAssertEqual(SortKey("x", descending: true, nullsFirst: true, floatOrder: .nanLargest).description,
                        "x DESC NULLS FIRST NAN_LARGEST")
@@ -213,19 +213,19 @@ final class SortNanLargestTests: XCTestCase {
                     let key = #"["x",\#(desc),{"nulls":"\#(nulls)","float_order":"\#(order.rawValue)"}]"#
                     let plan = #"{"op":"window","input":{"op":"scan","source":"t"},"specs":[{"name":"rn","fn":"row_number","partition_by":["p"],"order_by":[\#(key)]},{"name":"rk","fn":"rank","partition_by":["p"],"order_by":[\#(key)]}]}"#
                     let out = try PlanJSON.run(plan, sources: sources)
-                    let rn = out["rn"]!.asInt32!.toRawArray(), rk = out["rk"]!.asInt32!.toRawArray()
+                    let rn = out["rn"]!.asUInt32!.toRawArray(), rk = out["rk"]!.asUInt32!.toRawArray()
                     let keyRank = Self.ranks(v, descending: desc, nullsFirst: place == .atStart, order: order)
                     let sorted = (0..<n).sorted { (a: Int, b: Int) -> Bool in
                         if part[a] != part[b] { return part[a] < part[b] }
                         if keyRank[a] != keyRank[b] { return keyRank[a] < keyRank[b] }
                         return a < b
                     }
-                    var wantRn = [Int32](repeating: 0, count: n), wantRk = [Int32](repeating: 0, count: n)
+                    var wantRn = [UInt32](repeating: 0, count: n), wantRk = [UInt32](repeating: 0, count: n)
                     var start = 0, tieStart = 0
                     for (j, i) in sorted.enumerated() {
                         if j == 0 || part[sorted[j - 1]] != part[i] { start = j; tieStart = j }
                         else if keyRank[sorted[j - 1]] != keyRank[i] { tieStart = j }
-                        wantRn[i] = Int32(j - start + 1); wantRk[i] = Int32(tieStart - start + 1)
+                        wantRn[i] = UInt32(j - start + 1); wantRk[i] = UInt32(tieStart - start + 1)
                     }
                     let what = "n=\(n) \(order) desc=\(desc) \(place)"
                     XCTAssertEqual(rn, wantRn, "row_number \(what)")
@@ -242,12 +242,12 @@ final class SortNanLargestTests: XCTestCase {
         let sources = ["t": PlanSource(name: "t", batch: try MetalRecordBatch(names: ["x"], columns: [x]))]
         // Nulls last and NaN next to them in both directions, as before the options existed.
         let asc = #"{"op":"window","input":{"op":"scan","source":"t"},"specs":[{"name":"rk","fn":"rank","order_by":[["x",false]]}]}"#
-        XCTAssertEqual(try PlanJSON.run(asc, sources: sources)["rk"]!.asInt32!.toRawArray(), [5, 7, 3, 6, 3, 7, 1, 1])
+        XCTAssertEqual(try PlanJSON.run(asc, sources: sources)["rk"]!.asUInt32!.toRawArray(), [5, 7, 3, 6, 3, 7, 1, 1])
         let desc = #"{"op":"window","input":{"op":"scan","source":"t"},"specs":[{"name":"rk","fn":"rank","order_by":[["x",true]]}]}"#
-        XCTAssertEqual(try PlanJSON.run(desc, sources: sources)["rk"]!.asInt32!.toRawArray(), [1, 7, 2, 6, 2, 7, 4, 4])
+        XCTAssertEqual(try PlanJSON.run(desc, sources: sources)["rk"]!.asUInt32!.toRawArray(), [1, 7, 2, 6, 2, 7, 4, 4])
         // The spec-level options are the defaults of its keys.
         let spec = #"{"op":"window","input":{"op":"scan","source":"t"},"specs":[{"name":"rk","fn":"rank","nulls":"first","float_order":"nan_largest","order_by":[["x",true]]}]}"#
-        XCTAssertEqual(try PlanJSON.run(spec, sources: sources)["rk"]!.asInt32!.toRawArray(), [4, 1, 5, 3, 5, 1, 7, 7])
+        XCTAssertEqual(try PlanJSON.run(spec, sources: sources)["rk"]!.asUInt32!.toRawArray(), [4, 1, 5, 3, 5, 1, 7, 7])
     }
 
     // MARK: - the streaming external sort
@@ -305,7 +305,7 @@ final class SortNanLargestTests: XCTestCase {
                             ExternalSortOperator.Key("x", descending: d2, nullsFirst: p2 == .atStart, floatOrder: order)]
                 let r1 = R.referenceInt(k, descending: true, nullsFirst: true)
                 var rank1 = [Int](repeating: 0, count: n)
-                var prev: Int32? = nil, r = 0
+                var prev: UInt32? = nil, r = 0
                 for (j, i) in r1.enumerated() {
                     if let p = prev, k[Int(p)] != k[Int(i)] { r = j }
                     rank1[Int(i)] = r; prev = i

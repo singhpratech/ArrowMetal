@@ -165,8 +165,7 @@ func optName(o am.SortOptions) string {
 func indicesOf(t *testing.T, h *am.Array) []int32 {
 	t.Helper()
 	defer h.Release()
-	gi, _ := int32sOf(t, exportArr(t, h))
-	return gi
+	return rowsOf(t, exportArr(t, h))
 }
 
 func equalIdx(t *testing.T, what string, got, want []int32) {

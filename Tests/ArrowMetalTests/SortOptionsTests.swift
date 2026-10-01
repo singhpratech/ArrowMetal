@@ -23,13 +23,13 @@ final class SortOptionsTests: XCTestCase {
     /// The reference permutation. `key` is nil for a NaN in IEEE order (its own block), otherwise an
     /// order-preserving key; nulls are nil values.
     static func reference(count n: Int, isNull: (Int) -> Bool, isNaN: (Int) -> Bool, key: (Int) -> UInt64,
-                          descending: Bool, nullsFirst: Bool, ieee: Bool) -> [Int32] {
-        var valueRows: [(UInt64, Int32)] = [], nanRows: [Int32] = [], nullRows: [Int32] = []
+                          descending: Bool, nullsFirst: Bool, ieee: Bool) -> [UInt32] {
+        var valueRows: [(UInt64, UInt32)] = [], nanRows: [UInt32] = [], nullRows: [UInt32] = []
         valueRows.reserveCapacity(n)
         for i in 0..<n {
-            if isNull(i) { nullRows.append(Int32(i)) }
-            else if ieee && isNaN(i) { nanRows.append(Int32(i)) }
-            else { let k = key(i); valueRows.append((descending ? ~k : k, Int32(i))) }
+            if isNull(i) { nullRows.append(UInt32(i)) }
+            else if ieee && isNaN(i) { nanRows.append(UInt32(i)) }
+            else { let k = key(i); valueRows.append((descending ? ~k : k, UInt32(i))) }
         }
         valueRows.sort { $0.0 != $1.0 ? $0.0 < $1.0 : $0.1 < $1.1 }
         let values = valueRows.map(\.1)
@@ -37,7 +37,7 @@ final class SortOptionsTests: XCTestCase {
         return nullsFirst ? nullRows + nanRows + values : values + nanRows + nullRows
     }
 
-    static func referenceDouble(_ v: [Double?], descending: Bool, nullsFirst: Bool, order: FloatOrder) -> [Int32] {
+    static func referenceDouble(_ v: [Double?], descending: Bool, nullsFirst: Bool, order: FloatOrder) -> [UInt32] {
         reference(count: v.count, isNull: { v[$0] == nil }, isNaN: { v[$0]!.isNaN },
                   key: { i in
                       let x = v[i]!
@@ -47,7 +47,7 @@ final class SortOptionsTests: XCTestCase {
                   descending: descending, nullsFirst: nullsFirst, ieee: order == .ieee)
     }
 
-    static func referenceFloat(_ v: [Float?], descending: Bool, nullsFirst: Bool, order: FloatOrder) -> [Int32] {
+    static func referenceFloat(_ v: [Float?], descending: Bool, nullsFirst: Bool, order: FloatOrder) -> [UInt32] {
         reference(count: v.count, isNull: { v[$0] == nil }, isNaN: { v[$0]!.isNaN },
                   key: { i in
                       let x = v[i]!
@@ -57,7 +57,7 @@ final class SortOptionsTests: XCTestCase {
                   descending: descending, nullsFirst: nullsFirst, ieee: order == .ieee)
     }
 
-    static func referenceInt(_ v: [Int64?], descending: Bool, nullsFirst: Bool) -> [Int32] {
+    static func referenceInt(_ v: [Int64?], descending: Bool, nullsFirst: Bool) -> [UInt32] {
         reference(count: v.count, isNull: { v[$0] == nil }, isNaN: { _ in false },
                   key: { UInt64(bitPattern: v[$0]!) ^ (1 << 63) },
                   descending: descending, nullsFirst: nullsFirst, ieee: false)
@@ -256,7 +256,7 @@ final class SortOptionsTests: XCTestCase {
                         let r2 = Self.referenceDouble(k2, descending: d2, nullsFirst: p2 == .atStart, order: o2)
                         var rank2 = [Int](repeating: 0, count: n)
                         // Rows tied under key 2 share a rank, so the tie falls through to row order.
-                        var prev: Int32? = nil, r = 0
+                        var prev: UInt32? = nil, r = 0
                         for (j, i) in r2.enumerated() {
                             if let p = prev, !Self.tied(k2[Int(p)], k2[Int(i)], order: o2) { r = j }
                             if prev == nil { r = 0 }
@@ -275,7 +275,7 @@ final class SortOptionsTests: XCTestCase {
                             if rank2[a] != rank2[b] { return rank2[a] < rank2[b] }
                             return a < b
                         }
-                        let want: [Int32] = ordered.map { Int32($0) }
+                        let want: [UInt32] = ordered.map { UInt32($0) }
                         XCTAssertEqual(got, want, "lexsort n=\(n) \(d1) \(p1) / \(d2) \(p2) \(o2)")
                     }
                 }
@@ -298,7 +298,7 @@ final class SortOptionsTests: XCTestCase {
         let n = 70_001
         let v = Self.doubles(n, nullFraction: 0.05, seed: 3)
         let x = AnyMetalArray.float64(try MetalArray<Double>(v))
-        let row = AnyMetalArray.int32(try MetalArray<Int32>((0..<Int32(n)).map { $0 }))
+        let row = AnyMetalArray.uint32(try MetalArray<UInt32>((0..<UInt32(n)).map { $0 }))
         let batch = try MetalRecordBatch(names: ["x", "row"], columns: [x, row])
         let sources = ["t": PlanSource(name: "t", batch: batch)]
         let want = Self.referenceDouble(v, descending: true, nullsFirst: true, order: .total)
@@ -309,15 +309,15 @@ final class SortOptionsTests: XCTestCase {
         ]
         for p in plans {
             let out = try PlanJSON.run(p, sources: sources)
-            XCTAssertEqual(out["row"]!.asInt32!.toRawArray(), want, p)
+            XCTAssertEqual(out["row"]!.asUInt32!.toRawArray(), want, p)
         }
         // sort + limit is the fused top-k in the physical plan.
         let topPlan = #"{"op":"limit","count":100,"input":{"op":"sort","by":[["x",true,{"nulls":"first","float_order":"total"}]],"input":{"op":"scan","source":"t"}}}"#
         XCTAssertTrue(try PlanJSON.explain(topPlan, sources: sources).contains("TOP"), "top-k fusion")
-        XCTAssertEqual(try PlanJSON.run(topPlan, sources: sources)["row"]!.asInt32!.toRawArray(), Array(want.prefix(100)))
+        XCTAssertEqual(try PlanJSON.run(topPlan, sources: sources)["row"]!.asUInt32!.toRawArray(), Array(want.prefix(100)))
         // A plan with no options parses and runs exactly as before.
         let old = #"{"op":"sort","by":[["x",true]],"input":{"op":"scan","source":"t"}}"#
-        XCTAssertEqual(try PlanJSON.run(old, sources: sources)["row"]!.asInt32!.toRawArray(),
+        XCTAssertEqual(try PlanJSON.run(old, sources: sources)["row"]!.asUInt32!.toRawArray(),
                        Self.referenceDouble(v, descending: true, nullsFirst: false, order: .ieee))
         XCTAssertThrowsError(try PlanJSON.run(#"{"op":"sort","by":[["x",true,{"nulls":"middle"}]],"input":{"op":"scan","source":"t"}}"#, sources: sources))
         XCTAssertThrowsError(try PlanJSON.run(#"{"op":"sort","float_order":"weird","by":[["x",true]],"input":{"op":"scan","source":"t"}}"#, sources: sources))

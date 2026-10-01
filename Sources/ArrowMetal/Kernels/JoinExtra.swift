@@ -85,8 +85,8 @@ extension AnyMetalArray {
 /// A join's index pairs. Either side may carry nulls: a null left index means "no left row"
 /// (the right tail of a full outer join), a null right index "no right row".
 public struct JoinIndexPairs {
-    public var left: MetalArray<Int32>
-    public var right: MetalArray<Int32>
+    public var left: MetalArray<UInt32>
+    public var right: MetalArray<UInt32>
     public var length: Int { left.length }
 }
 
@@ -135,7 +135,7 @@ public enum JoinExtra {
     }
 
     static func rawHashJoin(_ l: AnyMetalArray, _ r: AnyMetalArray, kind: JoinKind)
-        throws -> (MetalArray<Int32>, MetalArray<Int32>) {
+        throws -> (MetalArray<UInt32>, MetalArray<UInt32>) {
         switch (l, r) {
         case (.int32(let a), .int32(let b)): return try hashJoin(left: a, right: b, kind: kind)
         case (.int64(let a), .int64(let b)): return try hashJoin(left: a, right: b, kind: kind)
@@ -146,7 +146,7 @@ public enum JoinExtra {
     // MARK: - Match flags
 
     /// A boolean, one per row of a side, saying whether any index pair referenced that row.
-    static func matchedFlags(indices: MetalArray<Int32>, rows: Int, _ ctx: MetalContext) throws -> MetalBooleanArray {
+    static func matchedFlags(indices: MetalArray<UInt32>, rows: Int, _ ctx: MetalContext) throws -> MetalBooleanArray {
         let bytes = try MetalArrowBuffer.allocate(byteCount: Swift.max(rows, 1), context: ctx)
         let n = indices.length
         if n > 0 && rows > 0 {
@@ -170,15 +170,15 @@ public enum JoinExtra {
         return MetalBooleanArray(length: rows, nullCount: 0, validity: nil, values: bits, context: ctx)
     }
 
-    /// An all-null int32 index column of `n` rows: the "there is no row on that side" placeholder.
-    static func nullIndices(_ n: Int, _ ctx: MetalContext) throws -> MetalArray<Int32> {
+    /// An all-null UInt32 index column of `n` rows: the "there is no row on that side" placeholder.
+    static func nullIndices(_ n: Int, _ ctx: MetalContext) throws -> MetalArray<UInt32> {
         let values = try MetalArrowBuffer.allocate(byteCount: Swift.max(n * 4, 1), context: ctx)
         let validity = try MetalArrowBuffer.allocate(byteCount: Swift.max(Bitmap.byteCount(bits: n), 1), context: ctx)
-        return MetalArray<Int32>(length: n, nullCount: n, validity: validity, values: values, context: ctx)
+        return MetalArray<UInt32>(length: n, nullCount: n, validity: validity, values: values, context: ctx)
     }
 
-    static func concatIndices(_ a: MetalArray<Int32>, _ b: MetalArray<Int32>) throws -> MetalArray<Int32> {
-        guard case .int32(let m) = try concatMetalArrays([.int32(a), .int32(b)]) else {
+    static func concatIndices(_ a: MetalArray<UInt32>, _ b: MetalArray<UInt32>) throws -> MetalArray<UInt32> {
+        guard case .uint32(let m) = try concatMetalArrays([.uint32(a), .uint32(b)]) else {
             throw ArrowMetalError.invalidArrowArray("join: index concatenation lost its type")
         }
         return m
@@ -342,14 +342,15 @@ private func coalesceByGather(_ a: AnyMetalArray, _ b: AnyMetalArray, _ ctx: Met
     try ctx.flush()
     let n = a.length
     let merged = try concatMetalArrays([a, b])
-    var idx = [Int32](repeating: 0, count: n)
+    try Dispatch.checkIndexRows(2 * n, "coalesce")
+    var idx = [UInt32](repeating: 0, count: n)
     if let v = a.validityBuffer, a.nullCount > 0 {
         let p = v.typed(UInt8.self)
-        for i in 0..<n { idx[i] = Bitmap.isSet(p, i) ? Int32(i) : Int32(n + i) }
+        for i in 0..<n { idx[i] = Bitmap.isSet(p, i) ? UInt32(i) : UInt32(n + i) }
     } else {
-        for i in 0..<n { idx[i] = Int32(i) }
+        for i in 0..<n { idx[i] = UInt32(i) }
     }
-    return try merged.take(try MetalArray<Int32>(idx, context: ctx))
+    return try merged.take(try MetalArray<UInt32>(idx, context: ctx))
 }
 
 // MARK: - As-of join
@@ -455,7 +456,7 @@ extension MetalRecordBatch {
             ctx.retainUntilFlush(outIdx); ctx.retainUntilFlush(outValid)
         }
         let bits = try BitmapOps.packBits(ctx, bytes: outValid, bits: Swift.max(nL, 1))
-        let sortedPick = MetalArray<Int32>(length: nL, nullCount: 0, validity: bits, values: outIdx, context: ctx)
+        let sortedPick = MetalArray<UInt32>(length: nL, nullCount: 0, validity: bits, values: outIdx, context: ctx)
         sortedPick.recomputeNullCount()
         // The kernel answers in sorted-build coordinates; map back to the caller's row numbers.
         let rightIndices = m == 0 ? try JoinExtra.nullIndices(nL, ctx) : try buildRows.take(sortedPick)

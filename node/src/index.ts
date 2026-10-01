@@ -442,7 +442,10 @@ export class MetalArray {
   filter(mask: MetalArray): MetalArray {
     return new MetalArray(native.filter(this.handle, mask.handle));
   }
-  /** Gathers rows by an Int32 index array. */
+  /**
+   * Gathers rows by an index array: Int32, BigInt64 (int64) or Uint32 — the type `argsort`, `topK`
+   * and `lexsort` return. A null index gives a null row; an index outside the array is an error.
+   */
   take(indices: MetalArray): MetalArray {
     return new MetalArray(native.take(this.handle, indices.handle));
   }
@@ -454,7 +457,9 @@ export class MetalArray {
   // -- sorting ---------------------------------------------------------------------------------
 
   /**
-   * Int32 indices that put the array in order. Stable. With a boolean (or nothing): nulls last and
+   * Uint32 indices that put the array in order (`toTypedArray()` is a `Uint32Array`; row numbers go
+   * up to 2^32 - 1, and an array whose row numbers would pass that is an error). Stable. With a
+   * boolean (or nothing): nulls last and
    * NaN after +Infinity in both directions. With {@link SortOptions}: the null placement and the
    * float order as given.
    *
@@ -485,7 +490,7 @@ export class MetalArray {
     );
   }
   /**
-   * Int32 indices of the k largest (default) or k smallest rows, in sorted order: the first k
+   * Uint32 indices of the k largest (default) or k smallest rows, in sorted order: the first k
    * indices `argsort` gives in that direction with the same options, found by GPU selection rather
    * than a whole sort. A boolean is `largest`.
    *
@@ -660,7 +665,7 @@ export function groupBy(keys: MetalArray | MetalArray[]): GroupBy {
 }
 
 /**
- * Int32 indices ordering the rows by each column in turn, the first column most significant. The
+ * Uint32 indices ordering the rows by each column in turn, the first column most significant. The
  * second argument is one descending flag per column, or one {@link SortOptions} per column, which
  * gives each key its own direction, null placement and float order.
  *

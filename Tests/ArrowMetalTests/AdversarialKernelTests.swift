@@ -145,7 +145,7 @@ final class AdversarialKernelTests: XCTestCase {
     private static let lengths = [0, 1, 2, 31, 32, 33, 255, 256, 257, 1023, 1024, 1025, 65535, 65536, 65537]
 
     /// Indices of `vals` in stable ascending order — the order `argsort` promises.
-    private func stableOrder(_ vals: [Int64]) -> [Int32] {
+    private func stableOrder(_ vals: [Int64]) -> [UInt32] {
         var idx: [Int] = Array(0..<vals.count)
         idx.sort { (a: Int, b: Int) -> Bool in
             let x: Int64 = vals[a]
@@ -153,7 +153,7 @@ final class AdversarialKernelTests: XCTestCase {
             if x == y { return a < b }
             return x < y
         }
-        return idx.map { Int32($0) }
+        return idx.map { UInt32($0) }
     }
 
     func testArgsortAtBoundaryLengths() throws {
@@ -274,12 +274,12 @@ final class AdversarialKernelTests: XCTestCase {
             let expect = stableOrder(sub)
             XCTAssertEqual(try s.argsort().toRawArray(), expect, "argsort on slice offset \(off)")
             let ranks = try s.rank().toRawArray()
-            var wantRank = [Int32](repeating: 0, count: len)
-            for (r, i) in expect.enumerated() { wantRank[Int(i)] = Int32(r + 1) }
+            var wantRank = [UInt32](repeating: 0, count: len)
+            for (r, i) in expect.enumerated() { wantRank[Int(i)] = UInt32(r + 1) }
             // `rank` is Arrow's "min" tiebreaker by default in most engines; compare against argsort
             // positions only where the values are distinct, which they are not here — so just check
             // that equal values get equal ranks and the multiset of ranks is a permutation-consistent set.
-            var byValue: [Int64: Set<Int32>] = [:]
+            var byValue: [Int64: Set<UInt32>] = [:]
             for i in 0..<len { byValue[sub[i], default: []].insert(ranks[i]) }
             for (v, rs) in byValue { XCTAssertEqual(rs.count, 1, "value \(v) got ranks \(rs) at offset \(off)") }
         }

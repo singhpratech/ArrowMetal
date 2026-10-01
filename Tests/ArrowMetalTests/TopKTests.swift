@@ -15,7 +15,7 @@ final class TopKTests: XCTestCase {
     }
 
     /// The oracle: what `topK` did before there was a selection kernel — a full argsort, then a slice.
-    private func viaSort<T: ArrowPrimitive>(_ a: MetalArray<T>, _ k: Int, largest: Bool) throws -> [Int32] {
+    private func viaSort<T: ArrowPrimitive>(_ a: MetalArray<T>, _ k: Int, largest: Bool) throws -> [UInt32] {
         let idx = try a.argsort(descending: largest)
         return try idx.slice(offset: 0, length: Swift.min(k, idx.length)).toRawArray()
     }
@@ -336,14 +336,14 @@ final class TopKTests: XCTestCase {
 
     /// The k winning row indices computed on the CPU: valid rows only, ordered by the same total order
     /// (key, then row index), with NaN last in both directions, then the null rows in row order.
-    private func cpuTopK<T: ArrowPrimitive>(_ vals: [T?], _ k: Int, largest: Bool) -> [Int32] {
-        var valid: [(key: UInt64, nan: Bool, row: Int32)] = []
-        var nulls: [Int32] = []
+    private func cpuTopK<T: ArrowPrimitive>(_ vals: [T?], _ k: Int, largest: Bool) -> [UInt32] {
+        var valid: [(key: UInt64, nan: Bool, row: UInt32)] = []
+        var nulls: [UInt32] = []
         valid.reserveCapacity(vals.count)
         for (i, v) in vals.enumerated() {
-            guard let v else { nulls.append(Int32(i)); continue }
+            guard let v else { nulls.append(UInt32(i)); continue }
             let (key, nan) = Self.oracleKey(v)
-            valid.append((key, nan, Int32(i)))
+            valid.append((key, nan, UInt32(i)))
         }
         valid.sort { a, b in
             if a.nan != b.nan { return !a.nan }               // NaN last, ascending or descending
@@ -359,7 +359,7 @@ final class TopKTests: XCTestCase {
                                                     file: StaticString = #filePath, line: UInt = #line) throws {
         let a = try MetalArray<T>(vals)
         let want = cpuTopK(vals, k, largest: largest)
-        func compare(_ got: [Int32], _ via: String) {
+        func compare(_ got: [UInt32], _ via: String) {
             guard got != want else { return }
             var where_ = "lengths \(got.count) vs \(want.count)"
             for i in 0..<Swift.min(got.count, want.count) where got[i] != want[i] {

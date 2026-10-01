@@ -14,8 +14,8 @@ public protocol ArrowJoinKey: ArrowPrimitive {}
 extension Int32: ArrowJoinKey {}
 extension Int64: ArrowJoinKey {}
 
-/// GPU hash join over equal keys. Returns the index pairs of every match: `leftIndices[i]` is a row of
-/// `left` and `rightIndices[i]` a row of `right` with the same key. Duplicate keys on either side produce
+/// GPU hash join over equal keys. Returns the index pairs of every match as UInt32 row numbers:
+/// `leftIndices[i]` is a row of `left` and `rightIndices[i]` a row of `right` with the same key. Duplicate keys on either side produce
 /// every combination (many-to-many). Null keys never match; with `.left`, a left row with no match appears
 /// once with a null right index. The pair order is unspecified.
 ///
@@ -24,7 +24,7 @@ extension Int64: ArrowJoinKey {}
 /// scan on the GPU, write), so the output is written without atomics and every left row keeps its pairs
 /// together.
 public func hashJoin<K: ArrowJoinKey>(left: MetalArray<K>, right: MetalArray<K>,
-                                      kind: JoinKind) throws -> (leftIndices: MetalArray<Int32>, rightIndices: MetalArray<Int32>) {
+                                      kind: JoinKind) throws -> (leftIndices: MetalArray<UInt32>, rightIndices: MetalArray<UInt32>) {
     let ctx = left.context
     guard ctx === right.context else { throw ArrowMetalError.invalidArrowArray("join: both sides must share one MetalContext") }
     let nL = left.length, nR = right.length
@@ -34,7 +34,7 @@ public func hashJoin<K: ArrowJoinKey>(left: MetalArray<K>, right: MetalArray<K>,
         throw ArrowMetalError.invalidArrowArray("join: arrays above 2^31 rows are not supported")
     }
     if nL == 0 {
-        return (try MetalArray<Int32>([Int32](), context: ctx), try MetalArray<Int32>([Int32](), context: ctx))
+        return (try MetalArray<UInt32>([UInt32](), context: ctx), try MetalArray<UInt32>([UInt32](), context: ctx))
     }
 
     // Table size: the next power of two at least twice the build rows, so a free slot always exists.
@@ -153,8 +153,8 @@ public func hashJoin<K: ArrowJoinKey>(left: MetalArray<K>, right: MetalArray<K>,
         ctx.retainUntilFlush(rightValidBytes)
         rightValidity = try BitmapOps.packBits(ctx, bytes: rightValidBytes, bits: total)
     }
-    let li = MetalArray<Int32>(length: total, nullCount: 0, validity: nil, values: outLeft, context: ctx)
-    let ri = MetalArray<Int32>(length: total, nullCount: 0, validity: rightValidity, values: outRight, context: ctx)
+    let li = MetalArray<UInt32>(length: total, nullCount: 0, validity: nil, values: outLeft, context: ctx)
+    let ri = MetalArray<UInt32>(length: total, nullCount: 0, validity: rightValidity, values: outRight, context: ctx)
     ri.recomputeNullCount()
     return (li, ri)
 }
@@ -168,7 +168,7 @@ extension MetalRecordBatch {
     public func join(_ other: MetalRecordBatch, on leftKey: String, rightKey: String, kind: JoinKind) throws -> MetalRecordBatch {
         guard let lc = self[leftKey] else { throw ArrowMetalError.invalidArrowArray("no column named \(leftKey)") }
         guard let rc = other[rightKey] else { throw ArrowMetalError.invalidArrowArray("no column named \(rightKey)") }
-        let leftIndices: MetalArray<Int32>, rightIndices: MetalArray<Int32>
+        let leftIndices: MetalArray<UInt32>, rightIndices: MetalArray<UInt32>
         switch (lc, rc) {
         case (.int32(let a), .int32(let b)): (leftIndices, rightIndices) = try hashJoin(left: a, right: b, kind: kind)
         case (.int64(let a), .int64(let b)): (leftIndices, rightIndices) = try hashJoin(left: a, right: b, kind: kind)

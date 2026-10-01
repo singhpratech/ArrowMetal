@@ -67,7 +67,7 @@ public final class GroupByKeys {
     public let rows: Int
     public let context: MetalContext
 
-    private var cachedRepRows: MetalArray<Int32>?
+    private var cachedRepRows: MetalArray<UInt32>?
     private var cachedKeys: [AnyMetalArray]?
     private var cachedSegments: GroupSegments?
 
@@ -132,18 +132,18 @@ public final class GroupByKeys {
     }
 
     /// Row index of one representative row per group (the lowest row index in the group).
-    public func representativeRows() throws -> MetalArray<Int32> {
+    public func representativeRows() throws -> MetalArray<UInt32> {
         if let c = cachedRepRows { return c }
         guard groupCount > 0 else {
-            let empty = try MetalArray<Int32>([Int32](), context: context)
+            let empty = try MetalArray<UInt32>([UInt32](), context: context)
             cachedRepRows = empty
             return empty
         }
         let mins = try groupBy.min(try GroupByKeys.rowIndices(rows, context))
         let rep = groupCount == mins.length ? mins : try mins.slice(offset: 0, length: groupCount)
         // Every group has at least one row, so no representative is null; drop the all-ones bitmap.
-        let clean = MetalArray<Int32>(length: rep.length, nullCount: 0, validity: nil,
-                                      values: rep.values, context: context)
+        let clean = MetalArray<UInt32>(length: rep.length, nullCount: 0, validity: nil,
+                                       values: rep.values, context: context)
         cachedRepRows = clean
         return clean
     }
@@ -433,9 +433,10 @@ public final class GroupByKeys {
         return MetalArray<Int64>(length: n, nullCount: 0, validity: nil, values: out, context: ctx)
     }
 
-    /// `0 ..< n` as an int32 column, written by the GPU (a 50M-row host loop is not free).
-    public static func rowIndices(_ n: Int, _ ctx: MetalContext) throws -> MetalArray<Int32> {
-        guard n > 0 else { return try MetalArray<Int32>([Int32](), context: ctx) }
+    /// The row numbers `0 ..< n` as a UInt32 column, written by the GPU (a 50M-row host loop is not free).
+    public static func rowIndices(_ n: Int, _ ctx: MetalContext) throws -> MetalArray<UInt32> {
+        try Dispatch.checkIndexRows(n, "row indices")
+        guard n > 0 else { return try MetalArray<UInt32>([UInt32](), context: ctx) }
         let out = try MetalArrowBuffer.allocate(byteCount: n * 4, zeroed: false, context: ctx)
         let pso = try ctx.pipeline(source: GroupByKeysSource.source, function: "gk_iota", cacheKey: "groupbykeys/gk_iota")
         try ctx.run { enc in
@@ -445,7 +446,7 @@ public final class GroupByKeys {
             Dispatch.dispatch1D(enc, pso, count: n)
         }
         try ctx.syncPoint()
-        return MetalArray<Int32>(length: n, nullCount: 0, validity: nil, values: out, context: ctx)
+        return MetalArray<UInt32>(length: n, nullCount: 0, validity: nil, values: out, context: ctx)
     }
 
     /// One 64-bit limb of a decimal column as a uint64 array carrying the decimal's validity.

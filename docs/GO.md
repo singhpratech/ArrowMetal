@@ -105,7 +105,9 @@ Run it with `ARROWMETAL_LIB=/path/to/.build/release/libArrowMetalC.dylib go run 
 ## Sort options
 
 `Argsort`, `Sort`, `TopK` and `Lexsort` keep the order they always had: nulls last and NaN after
-+Inf in both directions, -0.0 tied with +0.0. The `With` forms take a `SortOptions` per key:
++Inf in both directions, -0.0 tied with +0.0. `Argsort`, `TopK`, `Lexsort` and their `With` forms
+return uint32 index arrays (row numbers up to 2^32 - 1; a longer input is an error), and `Take`
+accepts int32, int64 and uint32 indices. The `With` forms take a `SortOptions` per key:
 
 ```go
 type SortOptions struct {
@@ -367,8 +369,8 @@ for `Lexsort` at 1,000 and 1,000,000 rows. Every row, with first-call-after-idle
 
 `include/arrowmetal.h` and `include/arrow_abi.h` in the module are copies of the repository's `include/` headers; refresh them (`cp include/arrowmetal.h go/arrowmetal/include/`) whenever the header changes, or `python/tests/test_header_copies.py` and `TestHeadersMatchRepository` fail.
 
-Every item below has at least one test in `go/arrowmetal`; the oracle is named. 64 test functions and three `Example`s, 67 runnable;
-581 cases counting subtests, all green, plain, under `-race` and under `GOEXPERIMENT=cgocheck2`.
+Every item below has at least one test in `go/arrowmetal`; the oracle is named. 66 test functions and three `Example`s, 69 runnable;
+583 cases counting subtests, all green, plain, under `-race` and under `GOEXPERIMENT=cgocheck2`.
 
 | Surface | Go API | Oracle |
 |---|---|---|

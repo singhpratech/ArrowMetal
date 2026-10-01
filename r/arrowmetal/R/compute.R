@@ -127,8 +127,10 @@ am_filter <- function(x, mask) {
 #' Gather rows by index
 #'
 #' @param x An `am_array`, or anything [am_array()] accepts.
-#' @param indices Zero-based indices: an `am_array` of integers, or an R integer/numeric vector.
-#'   Arrow indices are zero based, so `am_take(x, am_argsort(x))` is the sorted column.
+#' @param indices Zero-based indices: an `am_array` of int32, int64 or uint32 integers (the uint32
+#'   index arrays [am_argsort()] returns included), or an R integer/numeric vector of whole numbers in
+#'   `[0, 2^32 - 1]`. Arrow indices are zero based, so `am_take(x, am_argsort(x))` is the sorted
+#'   column.
 #' @return An `am_array`.
 #' @export
 am_take <- function(x, indices) {
@@ -137,12 +139,18 @@ am_take <- function(x, indices) {
     if (!is.numeric(indices))
       stop("`indices` must be numeric, an arrow Array or an am_array", call. = FALSE)
     # as.integer() silently turns anything outside int32 into NA with a warning; refuse instead.
-    bad <- !is.na(indices) & (indices > .Machine$integer.max | indices < 0 | indices != trunc(indices))
+    # Row numbers go up to 2^32 - 1, the uint32 index type; past int32 the indices go in as uint32.
+    max_row <- 4294967295
+    bad <- !is.na(indices) & (indices > max_row | indices < 0 | indices != trunc(indices))
     if (any(bad)) {
-      stop("`indices` must be whole numbers in [0, ", .Machine$integer.max, "]; ",
+      stop("`indices` must be whole numbers in [0, ", format(max_row, scientific = FALSE), "]; ",
            "offending value: ", format(indices[which(bad)[1]], scientific = FALSE), call. = FALSE)
     }
-    indices <- arrow::Array$create(as.integer(indices))
+    if (any(!is.na(indices) & indices > .Machine$integer.max)) {
+      indices <- arrow::Array$create(as.double(indices), type = arrow::uint32())
+    } else {
+      indices <- arrow::Array$create(as.integer(indices))
+    }
   }
   .Call(C_am_take, am_array(x), am_array(indices))
 }
@@ -177,7 +185,9 @@ sort_defaults <- function(null_placement, float_order)
 #' @param descending Sort largest first.
 #' @param null_placement `"at_end"` (the default) or `"at_start"`, as in Arrow's sort options.
 #' @param float_order `"ieee"` (the default) or `"total"`.
-#' @return An int32 `am_array` of zero-based indices.
+#' @return A uint32 `am_array` of zero-based indices. Row numbers go up to 2^32 - 1; `as.vector()`
+#'   gives an integer vector when every index fits a 32-bit R integer and a double vector when one
+#'   passes 2^31 - 1, which is how the `arrow` package reads uint32.
 #' @examples
 #' if (am_available()) {
 #'   x <- c(2, NA, -0, NaN, 0, -Inf)
@@ -214,7 +224,7 @@ am_sort <- function(x, descending = FALSE, null_placement = "at_end", float_orde
 #' @inheritParams am_argsort
 #' @param k Number of rows (a whole number, 0 or more; past the length gives every row).
 #' @param largest The `k` largest (default) or, with `FALSE`, the `k` smallest.
-#' @return An int32 `am_array` of zero-based indices, in sorted order.
+#' @return A uint32 `am_array` of zero-based indices, in sorted order (read back as [am_argsort()]'s).
 #' @examples
 #' if (am_available()) as.vector(am_top_k(c(5, NA, 9, 1), 2))
 #' @export
@@ -239,7 +249,7 @@ am_top_k <- function(x, k, largest = TRUE, null_placement = "at_end", float_orde
 #' @param descending Logical, one per column or one for all.
 #' @param null_placement `"at_end"` or `"at_start"`, one per column or one for all.
 #' @param float_order `"ieee"` or `"total"`, one per column or one for all.
-#' @return An int32 `am_array` of zero-based indices.
+#' @return A uint32 `am_array` of zero-based indices (read back as [am_argsort()]'s).
 #' @examples
 #' if (am_available()) {
 #'   as.vector(am_lexsort(list(c(1, 1, 2), c(3, NA, 1)), descending = c(FALSE, TRUE),

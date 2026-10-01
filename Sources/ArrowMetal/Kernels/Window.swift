@@ -32,28 +32,28 @@ extension MetalArray {
     /// order, returned aligned to the original rows. Ties keep the input order (the argsort is stable).
     /// The result never contains nulls. Arrow spells this `rank(tiebreaker="first")`.
     public func rowNumber(descending: Bool = false,
-                          nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
+                          nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<UInt32> {
         try scatterIntRank(mode: 0, descending: descending, nullPlacement: nullPlacement)
     }
 
     /// SQL `RANK()`: the 1-based position of the *first* row of each tie group, so equal values share a
     /// rank and the following rank skips the gap. Arrow's `rank(tiebreaker="min")`.
     public func rank(descending: Bool = false,
-                     nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
+                     nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<UInt32> {
         try scatterIntRank(mode: 1, descending: descending, nullPlacement: nullPlacement)
     }
 
     /// SQL `DENSE_RANK()`: 1-based index of each distinct value in the order, with no gaps.
     /// Arrow's `rank(tiebreaker="dense")`.
     public func denseRank(descending: Bool = false,
-                          nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
+                          nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<UInt32> {
         try scatterIntRank(mode: 2, descending: descending, nullPlacement: nullPlacement)
     }
 
     /// Arrow `rank(tiebreaker="max")`: every row of a tie group takes the group's *last* 1-based
     /// position, so a group of three at positions 4, 5, 6 all rank 6.
     public func maxRank(descending: Bool = false,
-                        nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
+                        nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<UInt32> {
         try scatterIntRank(mode: 3, descending: descending, nullPlacement: nullPlacement)
     }
 
@@ -63,7 +63,7 @@ extension MetalArray {
     /// `rank(descending:nullPlacement:)`, `denseRank`, `maxRank` and `rowNumber` are the four
     /// tiebreakers under their SQL names; this is the same work behind Arrow's spelling.
     public func rank(tiebreaker: RankTiebreaker, descending: Bool = false,
-                     nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
+                     nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<UInt32> {
         let mode: Int
         switch tiebreaker {
         case .first: mode = 0
@@ -95,6 +95,7 @@ extension MetalArray {
         let n = length
         guard n > 0 else { return nil }
         try Dispatch.checkLength(n)
+        try Dispatch.checkIndexRows(n, "rank")
         // The nulls occupy one contiguous block of the sorted order: [m, n) at the end, [0, nullCount)
         // at the start. Everything downstream only needs those two bounds.
         let m = n - nullCount
@@ -180,10 +181,10 @@ extension MetalArray {
     }
 
     private func scatterIntRank(mode: Int, descending: Bool = false,
-                                nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
+                                nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<UInt32> {
         let ctx = context
         guard let o = try windowOrder(descending: descending, nullPlacement: nullPlacement) else {
-            return try MetalArray<Int32>([Int32](), context: ctx)
+            return try MetalArray<UInt32>([UInt32](), context: ctx)
         }
         let out = try MetalArrowBuffer.allocate(byteCount: o.n * 4, zeroed: false, context: ctx)
         let p = try Dispatch.pipeline(ctx, family: "window", source: o.source, function: "win_scatter_int", type: o.unsignedType)
@@ -200,7 +201,7 @@ extension MetalArray {
             Dispatch.dispatch1D(enc, p, count: o.n)
         }
         ctx.retainUntilFlush(o)
-        return MetalArray<Int32>(length: o.n, nullCount: 0, validity: nil, values: out, context: ctx)
+        return MetalArray<UInt32>(length: o.n, nullCount: 0, validity: nil, values: out, context: ctx)
     }
 
     private func scatterDoubleRank(mode: Int, descending: Bool = false,
@@ -571,7 +572,7 @@ extension MetalArray {
 /// The sorted order and the per-run bookkeeping every ranking function shares: one argsort, one scan.
 final class WindowOrder {
     /// Original row index of each sorted position (nulls last).
-    let ord: MetalArray<Int32>
+    let ord: MetalArray<UInt32>
     /// One int32 per sorted position, 1 where a new tie group starts (position 0 always reads 0).
     let marks: MetalArrowBuffer
     /// Exclusive prefix sum of `marks`; adding a position's own mark gives its 0-based dense rank.
@@ -584,7 +585,7 @@ final class WindowOrder {
     let source: String
     let unsignedType: String
 
-    init(ord: MetalArray<Int32>, marks: MetalArrowBuffer, ranks: MetalArrowBuffer, startPos: MetalArrowBuffer,
+    init(ord: MetalArray<UInt32>, marks: MetalArrowBuffer, ranks: MetalArrowBuffer, startPos: MetalArrowBuffer,
          endPos: MetalArrowBuffer, n: Int, source: String, unsignedType: String) {
         self.ord = ord; self.marks = marks; self.ranks = ranks
         self.startPos = startPos; self.endPos = endPos; self.n = n

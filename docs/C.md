@@ -27,6 +27,11 @@ swift build -c release --product ArrowMetalC        # .build/release/libArrowMet
   names it (for a dictionary array `am_format` reports the index type, and the kernels compute on the
   values).
 - Copy-free out, always. Copy-free in when the producer's buffers are page aligned; one copy otherwise.
+- Index arrays are uint32 (`I`): `am_argsort*`, `am_top_k*`, `am_lexsort*`, `am_partition_nth*`,
+  `am_join` and the ranks (`am_window` ops 0-2, `am_rank_ex`, a plan's `row_number` / `rank` /
+  `dense_rank`). A call whose row numbers would pass 2^32 - 1 returns an error. `am_take` accepts int32,
+  int64 and uint32 indices. Dictionary codes, `index_in`, group ids, `inverse_permutation` and
+  `list_parent_indices` stay int32; `indices_nonzero` is uint64 ([DESIGN.md](DESIGN.md)).
 - A column held as several arrays (a ChunkedArray, one column of a stream of RecordBatches) imports
   in one call: `am_import_chunks(schema, arrays, n, &out)` takes `n` contiguous `ArrowArray` structs
   of the one type `schema` describes and returns one array of their total length, the same array

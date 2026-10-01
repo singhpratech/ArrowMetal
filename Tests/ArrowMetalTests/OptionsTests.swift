@@ -31,14 +31,14 @@ final class OptionsTests: XCTestCase {
 
     /// The permutation `argsort` should produce: a stable sort of the non-null rows, with the null rows
     /// as one block in their original order at whichever end.
-    func expectedOrder(_ vals: [Int32?], descending: Bool, nullsFirst: Bool) -> [Int32] {
+    func expectedOrder(_ vals: [Int32?], descending: Bool, nullsFirst: Bool) -> [UInt32] {
         let nonNull = vals.enumerated().filter { $0.element != nil }
         let sorted = nonNull.sorted { x, y in
             let a = x.element!, b = y.element!
             if a != b { return descending ? a > b : a < b }
             return x.offset < y.offset
-        }.map { Int32($0.offset) }
-        let nulls = vals.enumerated().filter { $0.element == nil }.map { Int32($0.offset) }
+        }.map { UInt32($0.offset) }
+        let nulls = vals.enumerated().filter { $0.element == nil }.map { UInt32($0.offset) }
         return nullsFirst ? nulls + sorted : sorted + nulls
     }
 
@@ -107,10 +107,10 @@ final class OptionsTests: XCTestCase {
 
     /// `rank` on the host: the sorted order, then the tiebreaker's number for each tie group.
     func expectedRank(_ vals: [Int32?], tiebreaker: RankTiebreaker,
-                      descending: Bool, nullsFirst: Bool) -> [Int32] {
+                      descending: Bool, nullsFirst: Bool) -> [UInt32] {
         let order = expectedOrder(vals, descending: descending, nullsFirst: nullsFirst)
-        var out = [Int32](repeating: 0, count: vals.count)
-        var i = 0, dense: Int32 = 0
+        var out = [UInt32](repeating: 0, count: vals.count)
+        var i = 0, dense: UInt32 = 0
         while i < order.count {
             var j = i
             let v = vals[Int(order[i])]
@@ -118,9 +118,9 @@ final class OptionsTests: XCTestCase {
             dense += 1
             for k in i..<j {
                 switch tiebreaker {
-                case .min: out[Int(order[k])] = Int32(i + 1)
-                case .max: out[Int(order[k])] = Int32(j)
-                case .first: out[Int(order[k])] = Int32(k + 1)
+                case .min: out[Int(order[k])] = UInt32(i + 1)
+                case .max: out[Int(order[k])] = UInt32(j)
+                case .first: out[Int(order[k])] = UInt32(k + 1)
                 case .dense: out[Int(order[k])] = dense
                 }
             }
@@ -221,7 +221,7 @@ final class OptionsTests: XCTestCase {
         XCTAssertEqual(Set(idx).count, idx.count, "permutation, pivot=\(pivot)")
         guard pivot < vals.count else { return }
         // Ordering key: a null is past every value at the placement's end.
-        func key(_ i: Int32) -> OrderKey {
+        func key(_ i: UInt32) -> OrderKey {
             guard let v = vals[Int(i)] else { return OrderKey(bucket: placement == .atStart ? -1 : 1, value: 0) }
             return OrderKey(bucket: 0, value: v)
         }

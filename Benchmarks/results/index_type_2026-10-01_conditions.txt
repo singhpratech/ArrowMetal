@@ -1,0 +1,21 @@
+index_type_2026-10-01.csv
+
+Machine: Apple M4 Max, 64 GB, macOS (Darwin 27.0.0), on AC power. No sleep during either block (last
+sleep entry 2026-09-29).
+Builds: before = 4706f1c (Int32 index arrays); after = this change (UInt32 index arrays). Both
+`swift build -c release --product ArrowMetalC`, loaded side by side in one Python process
+(Benchmarks/index_type_bench.py, pyarrow inputs, seed 20261001), each with its own Python package.
+Each case: an untimed warm-up of at least 100 ms per build, the first call after a 500 ms idle per
+build (first_after_idle_ms), then `rounds` rounds alternating the builds (order flipped every round),
+`reps` calls per build per round. best/median wall time per call; cpu_median_ms is process CPU time per
+call (getrusage). "take int64 by argsort" takes through each build's own argsort output (Int32 before,
+UInt32 after).
+
+  block "all cases":       8 rounds, up to 30 calls (fewer for calls over 33 ms), 10M and 50M rows.
+                           2026-10-01 13:57:30 load 3.42 / 18.97 / 28.50 -> 14:00:44 load 2.86 / 11.40 / 23.32
+  block "re-timed alone":  the cases with a median more than 1% slower in the first block (top_k 10,
+                           top_k 5000, partition_nth_indices), 20 rounds of 100 calls (78 for the 50M
+                           partition), 10M and 50M rows.
+                           2026-10-01 14:06:27 load 3.41 / 6.54 / 17.09 -> 14:09:21 load 3.65 / 5.19 / 14.55
+
+No row is more than 1% slower in both best and median time in either block.

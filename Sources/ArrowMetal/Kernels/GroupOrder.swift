@@ -116,7 +116,7 @@ extension GroupBy {
             }
             ctx.retainUntilFlush(keys); ctx.retainUntilFlush(hist)
             try ctx.syncPoint()
-            let ordArray = MetalArray<Int32>(length: n, nullCount: 0, validity: nil, values: ord, context: ctx)
+            let ordArray = MetalArray<UInt32>(length: n, nullCount: 0, validity: nil, values: ord, context: ctx)
             return GroupSegments(ord: ordArray, segStart: segStart, segEnd: segEnd, keyCount: kc, rows: n)
         }
 
@@ -169,7 +169,7 @@ extension GroupBy {
         }
         ctx.retainUntilFlush(keys); ctx.retainUntilFlush(cursor)
         try ctx.syncPoint()
-        let ordArray = MetalArray<Int32>(length: n, nullCount: 0, validity: nil, values: ord, context: ctx)
+        let ordArray = MetalArray<UInt32>(length: n, nullCount: 0, validity: nil, values: ord, context: ctx)
         return GroupSegments(ord: ordArray, segStart: segStart, segEnd: segEnd, keyCount: kc, rows: n)
         }
 

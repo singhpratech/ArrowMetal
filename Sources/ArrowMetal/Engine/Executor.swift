@@ -192,7 +192,7 @@ public enum Executor {
     }
 
     static func topKIndices(_ c: AnyMetalArray, k: Int, largest: Bool, nullPlacement: NullPlacement = .atEnd,
-                            floatOrder: FloatOrder = .ieee) throws -> MetalArray<Int32> {
+                            floatOrder: FloatOrder = .ieee) throws -> MetalArray<UInt32> {
         let p = nullPlacement, f = floatOrder
         switch c {
         case .int8(let a): return try a.topK(k, largest: largest, nullPlacement: p)

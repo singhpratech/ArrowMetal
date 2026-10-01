@@ -73,7 +73,7 @@ So the engine is a plan, three layers of decision over it, and one of execution:
 | explode | `.explode(_:)` | `.explode(columns)` | list offsets to a gather index, then `take` |
 
 Aggregates are `sum`, `min`, `max`, `mean` and `count`, over any expression, whole-table or per group.
-Window functions are `row_number`, `rank`, `dense_rank`, `lag`, `lead`, `cum_sum`,
+Window functions are `row_number`, `rank`, `dense_rank` (uint32 columns), `lag`, `lead`, `cum_sum`,
 `rolling_sum` / `rolling_mean` / `rolling_min` / `rolling_max`, and any aggregate broadcast over its
 partition.
 
@@ -240,7 +240,8 @@ the `pyarrow.Table` case within 3 ms of the resident one; per-stage timings are 
 
 ## The join matrix
 
-`Kernels/Join.swift` does inner and left over one `int32` or `int64` key. `Kernels/JoinExtra.swift`
+`Kernels/Join.swift` does inner and left over one `int32` or `int64` key, returning uint32 index
+pairs (at most 2^31 - 1 rows per side and 2^31 - 1 pairs). `Kernels/JoinExtra.swift`
 does the rest.
 
 | | single int32/int64 key | multi-column keys | utf8 keys | mixed types |

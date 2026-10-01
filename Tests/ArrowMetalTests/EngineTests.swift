@@ -49,6 +49,10 @@ final class EngineTests: XCTestCase {
         guard case .int32(let a)? = b[n] else { return [] }
         return a.toArray()
     }
+    func u32col(_ b: MetalRecordBatch, _ n: String) -> [UInt32?] {
+        guard case .uint32(let a)? = b[n] else { return [] }
+        return a.toArray()
+    }
     func i64col(_ b: MetalRecordBatch, _ n: String) -> [Int64?] {
         guard case .int64(let a)? = b[n] else { return [] }
         return a.toArray()
@@ -562,9 +566,9 @@ final class EngineTests: XCTestCase {
             WindowSpec(name: "rk", function: .rank, partitionBy: ["g"], orderBy: [SortKey("v")]),
             WindowSpec(name: "dr", function: .denseRank, partitionBy: ["g"], orderBy: [SortKey("v")]),
         ]).collect()
-        XCTAssertEqual(i32col(out, "rn"), [1, 2, 3, 2, 1, 3])
-        XCTAssertEqual(i32col(out, "rk"), [1, 1, 3, 2, 1, 2])
-        XCTAssertEqual(i32col(out, "dr"), [1, 1, 2, 2, 1, 2])
+        XCTAssertEqual(u32col(out, "rn"), [1, 2, 3, 2, 1, 3])
+        XCTAssertEqual(u32col(out, "rk"), [1, 1, 3, 2, 1, 2])
+        XCTAssertEqual(u32col(out, "dr"), [1, 1, 2, 2, 1, 2])
     }
 
     func testWindowLagLeadAndRolling() throws {
@@ -598,11 +602,12 @@ final class EngineTests: XCTestCase {
             WindowSpec(name: "rn", function: .rowNumber, partitionBy: ["g"], orderBy: [SortKey("v")])
         ]).collect()
         // ROW_NUMBER over (partition g order v) is a permutation of 1...count within each partition.
-        var seen: [Int32: Set<Int32>] = [:]
-        let rn = i32col(out, "rn")
+        var seen: [Int32: Set<UInt32>] = [:]
+        let rn = u32col(out, "rn")
+        XCTAssertEqual(rn.count, n)
         for i in 0..<n { seen[g[i]!, default: []].insert(rn[i]!) }
         for (key, set) in seen {
-            XCTAssertEqual(set, Set(1...Int32(set.count)), "partition \(key)")
+            XCTAssertEqual(set, Set(1...UInt32(set.count)), "partition \(key)")
         }
     }
 
@@ -778,14 +783,14 @@ final class EngineTests: XCTestCase {
             return String((0..<Int.random(in: 0...20, using: &rng)).map { _ in alphabet.randomElement(using: &rng)! })
         }
         xs += [nil, "", "", nil, "abcdefghijklmnopqrst", "abcdefghijklmnopqrss"]
-        func reference(_ desc: Bool, _ placement: NullPlacement) -> [Int32] {
+        func reference(_ desc: Bool, _ placement: NullPlacement) -> [UInt32] {
             let valid = xs.indices.filter { xs[$0] != nil }.sorted { l, r in
                 let a = Array(xs[l]!.utf8), b = Array(xs[r]!.utf8)
                 if a == b { return l < r }
                 return desc ? b.lexicographicallyPrecedes(a) : a.lexicographicallyPrecedes(b)
             }
             let nulls = xs.indices.filter { xs[$0] == nil }
-            return (placement == .atStart ? nulls + valid : valid + nulls).map { Int32($0) }
+            return (placement == .atStart ? nulls + valid : valid + nulls).map { UInt32($0) }
         }
         let a = try MetalStringArray(xs)
         for desc in [false, true] {

@@ -113,7 +113,7 @@ public func am_argsort_ex(_ a: OpaquePointer?, _ descending: Int32, _ nullPlacem
     guard let x = optHandle(a) else { return 2 }
     return optRun(out) {
         // Sorting a dictionary column orders it by its values; the codes carry no order of their own.
-        .int32(try x.decodedIfDictionary().argsortIndices(descending: descending != 0,
+        .uint32(try x.decodedIfDictionary().argsortIndices(descending: descending != 0,
                                                           nullPlacement: placement(nullPlacement)))
     }
 }
@@ -138,7 +138,7 @@ public func am_partition_nth_ex(_ a: OpaquePointer?, _ pivot: Int64, _ nullPlace
                                 _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
     guard let x = optHandle(a) else { return 2 }
     return optRun(out) {
-        .int32(try withOptionPrimitive(x) { try $0.optPartitionNth(Int(pivot), placement(nullPlacement)) })
+        .uint32(try withOptionPrimitive(x) { try $0.optPartitionNth(Int(pivot), placement(nullPlacement)) })
     }
 }
 
@@ -157,7 +157,7 @@ public func am_lexsort_ex(_ columns: UnsafeMutablePointer<OpaquePointer?>?,
         desc.append(descending.map { $0[i] != 0 } ?? false)
     }
     return optRun(out) {
-        .int32(try lexsortIndices(cols, descending: desc, nullPlacement: placement(nullPlacement)))
+        .uint32(try lexsortIndices(cols, descending: desc, nullPlacement: placement(nullPlacement)))
     }
 }
 
@@ -168,7 +168,7 @@ public func am_argsort_ex2(_ a: OpaquePointer?, _ descending: Int32, _ nullPlace
                            _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
     guard let x = optHandle(a) else { return 2 }
     return optRun(out) {
-        .int32(try x.decodedIfDictionary().argsortIndices(descending: descending != 0,
+        .uint32(try x.decodedIfDictionary().argsortIndices(descending: descending != 0,
                                                           nullPlacement: placement(nullPlacement),
                                                           floatOrder: try floatOrder(order)))
     }
@@ -197,7 +197,7 @@ public func am_top_k_ex(_ a: OpaquePointer?, _ k: Int64, _ largest: Int32, _ nul
         // As `am_top_k`: a dictionary column selects by its values, float16 through its float32 widening.
         var v = try x.decodedIfDictionary()
         if case .float16(let h) = v { v = .float32(try h.toFloat32()) }
-        return .int32(try withOptionPrimitive(v) { try $0.optTopK(Int(k), largest != 0, placement(nullPlacement), f) })
+        return .uint32(try withOptionPrimitive(v) { try $0.optTopK(Int(k), largest != 0, placement(nullPlacement), f) })
     }
 }
 
@@ -219,7 +219,7 @@ public func am_lexsort_ex2(_ columns: UnsafeMutablePointer<OpaquePointer?>?,
         rawOrders.append(orders.map { $0[i] } ?? 0)
     }
     return optRun(out) {
-        .int32(try lexsortIndices(cols, descending: desc, nullPlacements: places,
+        .uint32(try lexsortIndices(cols, descending: desc, nullPlacements: places,
                                   floatOrders: try rawOrders.map(floatOrder)))
     }
 }
@@ -232,7 +232,7 @@ public func am_rank_ex(_ a: OpaquePointer?, _ tb: Int32, _ descending: Int32, _ 
                        _ out: UnsafeMutablePointer<OpaquePointer?>?) -> Int32 {
     guard let x = optHandle(a) else { return 2 }
     return optRun(out) {
-        .int32(try withOptionPrimitive(x) {
+        .uint32(try withOptionPrimitive(x) {
             try $0.optRank(try tiebreaker(tb), descending != 0, placement(nullPlacement))
         })
     }
@@ -401,22 +401,22 @@ public func am_list_parent_indices64(_ a: OpaquePointer?,
 
 /// The option-carrying operations on `MetalArray<T>`, erased so each entry point above stays one line.
 protocol OptionCOps {
-    func optPartitionNth(_ pivot: Int, _ placement: NullPlacement) throws -> MetalArray<Int32>
-    func optRank(_ tb: RankTiebreaker, _ descending: Bool, _ placement: NullPlacement) throws -> MetalArray<Int32>
+    func optPartitionNth(_ pivot: Int, _ placement: NullPlacement) throws -> MetalArray<UInt32>
+    func optRank(_ tb: RankTiebreaker, _ descending: Bool, _ placement: NullPlacement) throws -> MetalArray<UInt32>
     func optRankQuantile(_ op: Int32, _ descending: Bool, _ placement: NullPlacement) throws -> AnyMetalArray
     func optIsIn(_ set: AnyMetalArray, _ behavior: SetLookupNullMatching) throws -> MetalBooleanArray
     func optIndexIn(_ set: AnyMetalArray, _ behavior: SetLookupNullMatching) throws -> MetalArray<Int32>
     func optUnique(_ order: ValueOrder) throws -> AnyMetalArray
     func optValueCounts(_ order: ValueOrder) throws -> MetalStructArray
     func optDictionaryEncode(_ order: ValueOrder) throws -> (AnyMetalArray, AnyMetalArray)
-    func optTopK(_ k: Int, _ largest: Bool, _ placement: NullPlacement, _ order: FloatOrder) throws -> MetalArray<Int32>
+    func optTopK(_ k: Int, _ largest: Bool, _ placement: NullPlacement, _ order: FloatOrder) throws -> MetalArray<UInt32>
 }
 
 extension MetalArray: OptionCOps {
-    func optPartitionNth(_ pivot: Int, _ placement: NullPlacement) throws -> MetalArray<Int32> {
+    func optPartitionNth(_ pivot: Int, _ placement: NullPlacement) throws -> MetalArray<UInt32> {
         try partitionNthIndices(pivot, nullPlacement: placement)
     }
-    func optRank(_ tb: RankTiebreaker, _ descending: Bool, _ placement: NullPlacement) throws -> MetalArray<Int32> {
+    func optRank(_ tb: RankTiebreaker, _ descending: Bool, _ placement: NullPlacement) throws -> MetalArray<UInt32> {
         try rank(tiebreaker: tb, descending: descending, nullPlacement: placement)
     }
     func optRankQuantile(_ op: Int32, _ descending: Bool, _ placement: NullPlacement) throws -> AnyMetalArray {
@@ -450,7 +450,7 @@ extension MetalArray: OptionCOps {
         let (codes, unique) = try dictionaryEncode(order: order)
         return (.int32(codes), wrap(unique))
     }
-    func optTopK(_ k: Int, _ largest: Bool, _ placement: NullPlacement, _ order: FloatOrder) throws -> MetalArray<Int32> {
+    func optTopK(_ k: Int, _ largest: Bool, _ placement: NullPlacement, _ order: FloatOrder) throws -> MetalArray<UInt32> {
         try topK(k, largest: largest, nullPlacement: placement, floatOrder: order)
     }
 }

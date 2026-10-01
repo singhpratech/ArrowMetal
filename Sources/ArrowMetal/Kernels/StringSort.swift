@@ -26,15 +26,16 @@ import Metal
 // about fourteen leading bytes, and it costs a run-mark scan on every round.
 
 extension MetalStringArray {
-    /// Arrow `array_sort_indices` for utf8 / binary: int32 indices putting the rows in byte-wise
+    /// Arrow `array_sort_indices` for utf8 / binary: UInt32 indices putting the rows in byte-wise
     /// lexicographic order, stable, with the null rows at whichever end `nullPlacement` names (past the
     /// values in both directions, as Arrow specifies).
     public func argsort(descending: Bool = false,
-                        nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<Int32> {
+                        nullPlacement: NullPlacement = .atEnd) throws -> MetalArray<UInt32> {
         let n = length
         let ctx = context
         try Dispatch.checkLength(n)
-        if n == 0 { return try MetalArray<Int32>([Int32](), context: ctx) }
+        try Dispatch.checkIndexRows(n, "argsort")
+        if n == 0 { return try MetalArray<UInt32>([UInt32](), context: ctx) }
 
         // The null rows ride in bit 63 of every prefix key (see `StringSortSource`), so the stable passes
         // leave them as one block, in row order, at `nullPlacement`'s end: no separate partition and no
@@ -43,7 +44,7 @@ extension MetalStringArray {
         let nulls: (MetalArrowBuffer, NullPlacement)? = nullCount > 0 ? validity.map { ($0, nullPlacement) } : nil
         var chunks = try chunkCount()
         if nulls != nil && nullCount < n { chunks = max(chunks, 1) }
-        var perm: MetalArray<Int32>? = nil                  // nil means "the identity so far"
+        var perm: MetalArray<UInt32>? = nil                  // nil means "the identity so far"
         if chunks > 0 {
             for chunk in stride(from: chunks - 1, through: 0, by: -1) {
                 let keys = try prefixKeys(chunk: chunk, order: perm, descending: descending, nulls: nulls)
@@ -51,7 +52,7 @@ extension MetalStringArray {
                 perm = try perm.map { try $0.take(step) } ?? step
             }
         }
-        return try perm ?? MetalArray<Int32>.iota(n, context: ctx)
+        return try perm ?? MetalArray<UInt32>.iota(n, context: ctx)
     }
 
     /// The rows in byte-wise lexicographic order (`argsort` then `take`).
@@ -71,7 +72,7 @@ extension MetalStringArray {
 
     /// The 63-bit key of chunk `chunk` for each row, read in `order` (the identity when it is nil). With
     /// `nulls`, bit 63 moves the null rows to the placement's end (`StringSortSource`).
-    private func prefixKeys(chunk: Int, order: MetalArray<Int32>?, descending: Bool,
+    private func prefixKeys(chunk: Int, order: MetalArray<UInt32>?, descending: Bool,
                             nulls: (MetalArrowBuffer, NullPlacement)?) throws -> MetalArray<UInt64> {
         let n = length
         let ctx = context

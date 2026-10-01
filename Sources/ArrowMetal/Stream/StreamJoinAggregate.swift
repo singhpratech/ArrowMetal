@@ -773,7 +773,7 @@ public final class BroadcastJoinGroupByOperator: StreamOperator {
         guard let rc = build[buildKey] else {
             throw ArrowMetalError.invalidArrowArray("no column named \(buildKey) on the build side")
         }
-        let li: MetalArray<Int32>, ri: MetalArray<Int32>
+        let li: MetalArray<UInt32>, ri: MetalArray<UInt32>
         switch (lc, rc) {
         case (.int32(let a), .int32(let b)): (li, ri) = try hashJoin(left: a, right: b, kind: .inner)
         case (.int64(let a), .int64(let b)): (li, ri) = try hashJoin(left: a, right: b, kind: .inner)

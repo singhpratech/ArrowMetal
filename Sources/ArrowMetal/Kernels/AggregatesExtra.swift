@@ -636,7 +636,7 @@ enum ExtraAggregates {
         let gb: GroupBy<K>
         let values: MetalArray<T>
         /// Row indices, grouped by key and ascending by value inside each key.
-        let ord: MetalArray<Int32>
+        let ord: MetalArray<UInt32>
         /// First sorted position of each key; a key with no row keeps zero and is reported null.
         let segStart: MetalArrowBuffer
         /// Non-null values per key.
@@ -653,7 +653,7 @@ enum ExtraAggregates {
             let K = gb.keyCount
             let segStart = try MetalArrowBuffer.allocate(byteCount: K * 4, context: ctx)
             let segEnd = try MetalArrowBuffer.allocate(byteCount: K * 4, context: ctx)
-            var order = try MetalArray<Int32>([Int32](), context: ctx)
+            var order = try MetalArray<UInt32>([UInt32](), context: ctx)
             if m > 0 {
                 let byValue = try values.argsort()
                 let keysInValueOrder = try gb.keys.take(byValue)

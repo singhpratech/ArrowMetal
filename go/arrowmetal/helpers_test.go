@@ -165,6 +165,36 @@ func int32sOf(t *testing.T, a arrow.Array) ([]int32, []bool) {
 	return v, valid
 }
 
+// uint32sOf reads a uint32 array, the type every index array (Argsort, TopK, Lexsort) comes back as.
+func uint32sOf(t *testing.T, a arrow.Array) ([]uint32, []bool) {
+	t.Helper()
+	arr, ok := a.(*array.Uint32)
+	if !ok {
+		t.Fatalf("expected uint32 array, got %s", a.DataType())
+	}
+	v := make([]uint32, arr.Len())
+	valid := make([]bool, arr.Len())
+	for i := range v {
+		valid[i] = arr.IsValid(i)
+		if valid[i] {
+			v[i] = arr.Value(i)
+		}
+	}
+	return v, valid
+}
+
+// rowsOf reads an index array (which must be uint32) as int32 row numbers, for comparing against
+// the references, which build their permutations in int32.
+func rowsOf(t *testing.T, a arrow.Array) []int32 {
+	t.Helper()
+	u, _ := uint32sOf(t, a)
+	out := make([]int32, len(u))
+	for i, x := range u {
+		out[i] = int32(x)
+	}
+	return out
+}
+
 func boolsOf(t *testing.T, a arrow.Array) ([]bool, []bool) {
 	t.Helper()
 	arr, ok := a.(*array.Boolean)

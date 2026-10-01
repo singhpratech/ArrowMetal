@@ -188,7 +188,7 @@ final class AdversarialStringAndBatchTests: XCTestCase {
         let a = try MetalStringArray(xs, context: ctx)
         var upper: MetalStringArray! = nil
         var lengths: MetalArray<Int32>! = nil
-        var order: MetalArray<Int32>! = nil
+        var order: MetalArray<UInt32>! = nil
         try ctx.batch {
             upper = try a.utf8Upper()
             lengths = try a.byteLength()
@@ -205,8 +205,8 @@ final class AdversarialStringAndBatchTests: XCTestCase {
         let ctx = MetalContext.shared
         let vals = (0..<4096).map { Int32(($0 &* 7919) % 3001) }
         let a = try MetalArray<Int32>(vals, context: ctx)
-        var sliced: MetalArray<Int32>! = nil
-        var full: MetalArray<Int32>! = nil
+        var sliced: MetalArray<UInt32>! = nil
+        var full: MetalArray<UInt32>! = nil
         try ctx.batch {
             full = try a.argsort()
             sliced = try full.slice(offset: 33, length: 100)   // sliced while the batch is still open

@@ -5,26 +5,26 @@ final class JoinTests: XCTestCase {
     // MARK: - Oracle
 
     /// One (left row, right row) pair packed into an Int64; a null right index becomes -1.
-    private func pair(_ l: Int32, _ r: Int32?) -> Int64 { (Int64(l) << 32) | Int64(UInt32(bitPattern: r ?? -1)) }
+    private func pair(_ l: UInt32, _ r: UInt32?) -> Int64 { (Int64(l) << 32) | Int64(r ?? UInt32.max) }
 
     /// CPU reference: a dictionary of build rows per key. Null keys never match.
     private func oracle<K: Hashable>(_ left: [K?], _ right: [K?], _ kind: JoinKind) -> [Int64] {
-        var byKey: [K: [Int32]] = [:]
-        for (i, k) in right.enumerated() { if let k { byKey[k, default: []].append(Int32(i)) } }
+        var byKey: [K: [UInt32]] = [:]
+        for (i, k) in right.enumerated() { if let k { byKey[k, default: []].append(UInt32(i)) } }
         var out: [Int64] = []
         for (i, k) in left.enumerated() {
             let matches = k.flatMap { byKey[$0] } ?? []
             if matches.isEmpty {
-                if kind == .left { out.append(pair(Int32(i), nil)) }
+                if kind == .left { out.append(pair(UInt32(i), nil)) }
             } else {
-                for m in matches { out.append(pair(Int32(i), m)) }
+                for m in matches { out.append(pair(UInt32(i), m)) }
             }
         }
         return out.sorted()
     }
 
     /// The GPU result as the same sorted set of pairs (the join does not promise an order).
-    private func pairs(_ res: (leftIndices: MetalArray<Int32>, rightIndices: MetalArray<Int32>)) -> [Int64] {
+    private func pairs(_ res: (leftIndices: MetalArray<UInt32>, rightIndices: MetalArray<UInt32>)) -> [Int64] {
         XCTAssertEqual(res.leftIndices.length, res.rightIndices.length)
         let l = res.leftIndices.toRawArray(), r = res.rightIndices.toArray()
         return (0..<l.count).map { pair(l[$0], r[$0]) }.sorted()
@@ -118,7 +118,7 @@ final class JoinTests: XCTestCase {
         // Every left row matches exactly one right row.
         for kind in JoinKind.allCases {
             let res = try hashJoin(left: l, right: try MetalArray<Int32>(same), kind: kind)
-            XCTAssertEqual(pairs(res), (0..<n).map { pair(Int32($0), Int32($0)) })
+            XCTAssertEqual(pairs(res), (0..<n).map { pair(UInt32($0), UInt32($0)) })
         }
         // An empty build side: nothing for an inner join, every row for a left join.
         let empty = try MetalArray<Int32>([Int32]())
@@ -198,7 +198,7 @@ final class JoinTests: XCTestCase {
         var got = [Int64]()
         for i in 0..<j.length {
             XCTAssertEqual(k[i], kr[i])
-            got.append(pair(Int32(v[i]), Int32(w[i] - 1000)))
+            got.append(pair(UInt32(v[i]), UInt32(w[i] - 1000)))
         }
         XCTAssertEqual(got.sorted(), expected)
     }

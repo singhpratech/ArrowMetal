@@ -454,7 +454,7 @@ extension PlanSchema {
 
     func windowField(_ spec: WindowSpec) throws -> PlanField {
         switch spec.function {
-        case .rowNumber, .rank, .denseRank: return PlanField(name: spec.name, .int32, nullable: false)
+        case .rowNumber, .rank, .denseRank: return PlanField(name: spec.name, .uint32, nullable: false)
         case .lag(let c, _), .lead(let c, _), .rollingMin(let c, _), .rollingMax(let c, _), .cumSum(let c):
             guard var f = self[c] else { throw ArrowMetalError.invalidArrowArray("window: no column named \(c)") }
             f.name = spec.name; f.nullable = true
