@@ -18,6 +18,11 @@
 # script exists because a C-API extension is one translation unit and one link, and requiring a
 # build system for that is not worth anyone's afternoon.
 set -euo pipefail
+# With Xcode selected, link against Xcode's own SDK: Xcode 26.6's linker cannot read the Command Line
+# Tools' macOS 27 SDK that xcrun otherwise picks ("tapi error: unknown architecture").
+if [ -z "${SDKROOT:-}" ] && [ -d "${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk" ]; then
+  export SDKROOT="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
