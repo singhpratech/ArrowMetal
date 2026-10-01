@@ -107,6 +107,8 @@ struct Args {
     /// The first gap goes to the `*_idle_*` columns, the second to the `*_idle2_*` columns.
     idle_reps: usize,
     idle_gaps: Vec<u64>,
+    /// `--idle-gpu-only`: the idle runs only for a case some context ran on the GPU.
+    idle_gpu_only: bool,
     /// Only these (size, layout, case) triples, one `size,layout,case` per line.
     select: Option<std::collections::HashSet<(usize, String, String)>>,
 }
@@ -131,6 +133,7 @@ fn args() -> Args {
         alternate: 0,
         idle_reps: 0,
         idle_gaps: vec![500],
+        idle_gpu_only: false,
         select: None,
         lock_dir: None,
     };
@@ -176,6 +179,11 @@ fn args() -> Args {
             "--lock-dir" => a.lock_dir = Some(val),
             "--explain" => {
                 a.explain = true;
+                i += 1;
+                continue;
+            }
+            "--idle-gpu-only" => {
+                a.idle_gpu_only = true;
                 i += 1;
                 continue;
             }
@@ -293,6 +301,10 @@ fn acquire(a: &Args, what: &str) -> (f64, TimingLock) {
         let Some(d) = &a.lock_dir else { return (l, TimingLock(None, lane)) };
         let d = std::path::Path::new(d);
         let t = d.join("TIMING");
+        // Another process may have taken TIMING while this one waited for the load to settle.
+        if std::fs::read_to_string(&t).map(|s| !s.starts_with(&lane)).unwrap_or(false) {
+            continue;
+        }
         std::fs::write(&t, format!("{lane}{}\n", std::process::id())).unwrap();
         if building(d) {
             std::fs::remove_file(&t).ok();
@@ -1101,6 +1113,7 @@ async fn main() {
             drop(firsts);
             let mut round_bests: Vec<Vec<f64>> = vec![Vec::new(); ctxs.len()];
             let alternate = a.alternate > 0 && !gpu;
+            let idle_reps = if a.idle_gpu_only && !gpu { 0 } else { a.idle_reps };
             if alternate {
                 // CPU only in every context: warm each, then run them in turn, run by run.
                 for x in &ctxs {
@@ -1162,7 +1175,7 @@ async fn main() {
             let mut idle: BTreeMap<(usize, &str), Vec<f64>> = BTreeMap::new();
             let mut idle_cpu: BTreeMap<(usize, &str), Vec<f64>> = BTreeMap::new();
             let mut turn = 0;
-            for rep in 0..a.idle_reps {
+            for rep in 0..idle_reps {
                 let mut gaps: Vec<usize> = (0..a.idle_gaps.len()).collect();
                 if rep % 2 == 1 {
                     gaps.reverse();
@@ -1188,7 +1201,7 @@ async fn main() {
             let idle_cpu_med =
                 |g: usize, n: &str| idle_cpu.get(&(g, n)).map(|v| format!("{:.1}", median(v))).unwrap_or_default();
             let gap = |g: usize| {
-                if a.idle_reps > 0 { a.idle_gaps.get(g).map(|x| x.to_string()).unwrap_or_default() } else { String::new() }
+                if idle_reps > 0 { a.idle_gaps.get(g).map(|x| x.to_string()).unwrap_or_default() } else { String::new() }
             };
             let by = |n: &str| ctxs.iter().position(|x| x.name == n).map(|i| &res[i]);
             let off = &res[0];
@@ -1281,7 +1294,7 @@ async fn main() {
                 idle_max(0, "off"),
                 idle_cpu_med(0, "def"),
                 idle_cpu_med(0, "off"),
-                a.idle_reps,
+                idle_reps,
                 gap(1),
                 idle_med(1, "def"),
                 idle_max(1, "def"),

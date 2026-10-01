@@ -154,7 +154,7 @@
     (`Benchmarks/results/groupby_float64_profile_2026-09-30.csv`): `sum` 10.62 → 3.48 ms at 200
     groups, 39.78 → 14.17 ms at 1M and 227.11 → 110.43 ms at 25M; `min` + `max` 10.64 → 5.91 ms at
     1M and 82.82 → 35.65 ms at 25M. Polars `MetalEngine()` at 50M rows
-    (`Benchmarks/results/polars_engine_groupby_float64_2026-09-30.csv`): the Float64 `min` + `max` grid cases
+    (`Benchmarks/results/polars_engine_groupby_float64_2026-09-30.csv`): the grid's `min` + `max` cases (over an int64 column)
     the default runs on the GPU 1.19x-2.59x faster (1M groups: 48.36 → 18.67 ms), `(l)` Float64 `sum` + `mean` 46.12 →
     29.68 ms. Through the DataFusion rule forced on at 50M rows
     (`datafusion/results/datafusion_float64_groupby_2026-09-30.csv`): Float64 `sum` and `avg`
@@ -171,6 +171,51 @@
     `group_by_sum_correctly_rounded` and `group_by_mean_correctly_rounded`, bit for bit against the
     exact value rounded once.
 
+- Polars `MetalEngine()`: the group-by crossovers refitted after the grouped Float64 sum and mean and
+  the grouped min/max were rebuilt. The group-by cases that run them ((c), (l), (t3), (t4), (t6), (t7),
+  (v3), (v4) and the grid's mean and min + max cases; an int64 mean runs as a Float64 mean) were swept
+  again at the eight sizes, and the grid gained a Float64 sum over each key set and group count,
+  `(g1fsum200)` to `(g2fsumR2)` (`Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv`;
+  the table is regenerated from it with the margins, String floor, untaken rows/2 bucket and 1.5x
+  headroom unchanged), then held to the default benchmark (below): `Benchmarks/polars_engine_crossover.py
+  --bench` takes a class or group-count bucket only from the smallest benchmarked size above the
+  largest size at which a case of it the default took was behind the faster Polars engine on the best
+  run or the median (`BENCH_RATIO` 1.0; a case of several classes counts against the ones whose own
+  one-class cases there are not all ahead; the table records each benchmarked row as `benchmark`).
+  Buckets taken lower: one-key mean at 10,000 and 100,000 groups from 2,436,520 and 2,524,249 rows
+  (were 4,172,575 and 16,235,764) and at 1,000,000 from 7,500,000 (was not taken); one-key min + max
+  at 100,000 groups from 2,184,147 (was 2,961,043) and at 200 and 1,000 groups from 19,740,807 and
+  19,709,259 (were not taken); two-key mean at 200 groups from 9,923,043 (was not taken), at 1,000
+  from 9,720,262 (was 17,349,489) and at 1,000,000 from 7,500,000 (was 7,885,821); two-key min + max at
+  10,000 and 100,000 groups from 1,171,750 and 802,938 (were 2,365,095 and 2,029,638). Raised: one-key sum at 10,000 groups 3,987,931 →
+  6,041,361 and two-key sum at 1,000 groups 6,201,868 → 11,993,616 and at 10,000 2,453,179 →
+  2,777,623 (the new Float64 sums); one-key min + max at 10,000 groups 2,583,360 → 2,995,140; two-key
+  min + max at 200 and 1,000 groups 6,185,532 → 10,534,566 and 5,836,081 → 8,162,302; by the default
+  benchmark, two-key mean at 10,000 and 100,000 groups 1,790,854 and 3,902,244 → 50,000,000. With no
+  group-count estimate,
+  `group_by_multi:minmax`, `group_by:minmax` and `group_by_multi:mean` are taken from 11,675,406,
+  19,740,807 and 24,143,946 rows (were not taken).
+  - Measured (`Benchmarks/results/polars_engine_default_groupby_2026-09-30.csv`, the 75 group-by cases
+    at 2M and 50M rows, the table before the re-sweep and the re-swept table before the benchmark
+    rule, the same build, three alternating rounds, best of 5 after a 100 ms warm-up, the first run
+    after 500 ms of idle recorded on its own): newly taken, against the faster Polars engine on the
+    best run, at 50M `(g1mean1M)` 58.08 → 31.13 ms (1.87x), `(g2mean200)` 39.25 → 19.31 ms (2.03x),
+    `(g1minmax200)` 1.34x, `(t4)` 1.30x, `(g1minmax1k)` 1.24x (1.01x on the median), at 2M
+    `(g2minmax10k)` 1.18x and `(g2minmax100k)` 1.12x. The table in force takes 54 of the 150
+    case-size pairs (was 48), every one at 1.0x or more of the faster Polars engine on the best run
+    and the median there (1.24x to 10.69x at 50M, 1.12x to 1.63x at 2M).
+  - To improve: at 2M rows the two-key means `(c)` (0.82x), `(g2mean100k)` (0.65x) and `(g2mean10k)`
+    (0.87x, taken by the earlier table at 0.73x) are behind in that benchmark and the rule leaves them
+    to Polars' in-memory plan; re-timed, three alternating rounds
+    (`Benchmarks/results/polars_engine_default_groupby_retime_2026-10-01.csv`): 8.28 → 6.83, 6.54 →
+    6.78 and 8.24 → 7.39 ms best against the faster Polars engine's 5.49, 4.98 and 5.61 ms, at 77 to
+    90 CPU-ms instead of 4 to 6; `(g2minmax10k)`, in `(c)`'s 10,000-group min + max bucket, stays on
+    the GPU (4.04 ms, 1.34x). Run back to back with no idle gap
+    (`Benchmarks/results/polars_engine_groupby_backtoback_2026-10-01.csv`) the default runs the three
+    means in 2.89, 3.03 and 2.41 ms against Polars' streaming engine's 5.48, 5.74 and 5.09 ms.
+  - `Benchmarks/polars_engine_bench.py --idle` warms each call up again after the run it times after
+    the idle gap, so the timed runs do not start in the state the gap left.
+
 - `datafusion-arrowmetal` (`datafusion/`, docs/DATAFUSION.md): a physical optimizer rule for Apache
   DataFusion 55.1. Registered on a `SessionContext` (`session_context`, `with_arrowmetal` or
   `physical_optimizer_rules`), it replaces a full `ORDER BY` whose input has an exact row count of at
@@ -180,9 +225,13 @@
   generated by `datafusion/scripts/groupby_table.py` from the sweep and the default-check CSVs in
   `datafusion/results/`) takes its shape at the input's row count; when it runs, it estimates its
   number of groups from a sample of the keys and runs on the GPU where the table takes that number,
-  handing the node back to DataFusion's own operators otherwise. The table takes five series of two
-  shapes, over two int32 keys of a `MemTable`: `count(*)` at 31,623 to 3,162,277 groups from
-  10,000,000 rows; `DISTINCT` at 1 to 1,414 and at 31,623 to 3,162,277 groups from 50,000,000 rows.
+  handing the node back to DataFusion's own operators otherwise. The table takes ten series of three
+  shapes over integer keys of a `MemTable`: `count(*)` over two int32 keys at 31,623 to 3,162,277
+  groups from 10,000,000 rows; `DISTINCT` over two int32 keys at 1 to 1,414 and at 31,623 to
+  3,162,277 groups from 50,000,000 rows; `MIN`/`MAX` of an integer column over two int32 keys or two
+  keys with an int64 at 31,623 to 3,162,277 groups, and over one int64 key at 316,228 to 3,162,277
+  groups, from 50,000,000 rows (after the grouped min/max was rebuilt; the Float64 `sum`/`avg` and
+  both `MIN`/`MAX` families were swept again for it, `datafusion/results/datafusion_groupby_sweep_2026-09-30.csv`).
   A series is taken where the GPU was at least 1.65x faster warm in its worst case, its first run
   after 500 ms and after 5 s of idle each at least as fast as DataFusion alone's first run after the
   same idle, and every hand-back of its shape at 0.97x or better. Top-k and filters are translated too and switched off by default. Every node the rule looks at is reported with the reason it was taken or left, and every
@@ -206,15 +255,24 @@
     1.08x to 1.72x after the same 5 s, and 0.67x to 1.60x (500 ms) and 0.53x to 1.23x (5 s) of
     DataFusion alone's warm time. Measured twice, the same case's 500 ms idle-against-idle ratio
     differed by 0.65x to 1.80x. The same shapes handed back at run time are at 0.977x to 1.030x of DataFusion
-    alone on the best run and 0.971x to 1.081x on the median. The first GPU
+    alone on the best run and 0.971x to 1.081x on the median. The `MIN`/`MAX` series at 50M rows
+    (`datafusion/results/datafusion_groupby_resweep_recheck_2026-10-01.csv`, 10 cases): 2.64x to
+    3.60x warm (two int32 keys, 1,000,000 groups: 95.09 → 26.45 ms, 1,428 → 78 CPU-ms), 1.20x to
+    2.03x idle against idle after 500 ms and 1.16x to 1.56x after 5 s; their shapes handed back at
+    0.983x to 1.009x best and 0.971x to 1.049x median. The first GPU
     query of a process compiles its Metal pipelines, 42 to 66 ms at 10M rows
     (`datafusion/results/datafusion_coldstart_2026-09-29.csv`). With the rule switched on for them
     (DataFusion alone ÷ with the rule): top-k 0.14x to 0.41x from 250,000 to 50M rows, filters 0.51x
-    to 0.74x, Float64 `sum`/`avg` 0.22x to 1.68x and `min`/`max` 0.16x to 1.07x at 1M to 50M rows,
-    and about rows / 2 groups 0.26x to 0.94x at 50M rows; of the 26 aggregate series at least 1.65x
-    faster warm at two sizes, 5 are left by their first run after idle (0.84x to 0.99x of DataFusion
-    alone's first run after the same idle at 50M rows, after 500 ms or 5 s) and 16 by a hand-back of
-    the same shape at 50M rows below 0.97x on the best or the median run (lowest 0.901x).
+    to 0.74x, Float64 `sum`/`avg` 0.21x to 2.81x and Float64 `min`/`max` 0.11x to 1.31x at 1M to 50M
+    rows, and about rows / 2 groups 0.30x to 1.11x at 50M rows; of the 34 aggregate series at least
+    1.65x faster warm at two sizes, 21 are left by their first run after idle at 50M rows (5 at 0.80x
+    to 0.94x of DataFusion alone's first run after the same idle, 16 not measured after 5 s of idle
+    there) and 3 by a hand-back of the same shape at 50M rows below 0.97x on the best or the median
+    run (`MIN`/`MAX` over one int32 key, Float64 `sum`/`avg` over two int32 keys and over two keys
+    with an int64; lowest 0.925x). Through the rule a Float64 `MIN`/`MAX` carries four helper
+    aggregates per extreme: 36.88 ms on the GPU at 200 groups from 50M rows
+    (`datafusion/results/datafusion_float64_groupby_2026-09-30.csv`), where the plan runner's own
+    `min` + `max` of the column takes 7.34 ms (`Benchmarks/results/groupby_float64_2026-09-30.csv`).
 
 - Go, Node and R: the per-key sort options and the chunked import.
   - Go (`go/arrowmetal`): `SortOptions{Descending, Nulls, FloatOrder}` (`NullsLast` / `NullsFirst`,
