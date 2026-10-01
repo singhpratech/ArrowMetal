@@ -47,8 +47,8 @@
 - Fused expressions: `(signbit x)` and `(is_nan x)`, boolean, null where `x` is null. `signbit` is true
   for -0.0, negative values, -inf and a NaN with the sign bit set (any payload); on a signed integer it
   is `x < 0`, on an unsigned one false. `is_nan` is Arrow's. With them a float column compared with a
-  literal in IEEE 754 totalOrder (arrow-rs and DataFusion: -NaN below -inf, +NaN above +inf, -0.0 below
-  +0.0) is one fused expression; docs/EXPR.md has the expression for every operator against a finite,
+  literal in IEEE 754 totalOrder (arrow-rs: -NaN below -inf, +NaN above +inf, -0.0 below +0.0;
+  DataFusion 55.1 rewrites -0.0 to +0.0 before comparing) is one fused expression; docs/EXPR.md has the expression for every operator against a finite,
   zero or infinite literal. Swift `Expr.signBit` / `Expr.isNaN`, Python `Expr.signbit()` /
   `Expr.is_nan()`, the plan JSON and `am_query` text take the same names. A NaN literal now prints with
   its sign (`(f64 -nan)`), so +NaN and -NaN literals no longer share a compiled kernel. Tests:

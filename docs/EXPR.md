@@ -173,8 +173,10 @@ Python: `am.col("x").signbit()`, `am.col("x").is_nan()`. A float literal keeps i
 ### totalOrder comparisons
 
 The comparison operators are IEEE: a NaN compares false (and `ne` true), and -0.0 equals +0.0. Arrow's
-Rust implementation and DataFusion compare floats by IEEE 754 totalOrder instead: -NaN < -inf < … < -0.0
-< +0.0 < … < +inf < +NaN. With `signbit` and `is_nan`, a column against a literal `c` in totalOrder is
+Rust implementation compares floats by IEEE 754 totalOrder instead: -NaN < -inf < … < -0.0 < +0.0 < …
+< +inf < +NaN. DataFusion 55.1 uses those kernels after rewriting -0.0 to +0.0 on both sides
+(`normalize_float_zero`), so for DataFusion the two zeros are equal and the "finite non-zero" row
+below is the one to use for a zero literal; the -0.0 and +0.0 rows are arrow-rs's order. With `signbit` and `is_nan`, a column against a literal `c` in totalOrder is
 one expression (`x` the column, `s` = `(signbit x)`, `n` = `(is_nan x)`):
 
 | `c` | `x == c` | `x < c` | `x <= c` | `x > c` | `x >= c` |
