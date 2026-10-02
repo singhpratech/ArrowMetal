@@ -18,7 +18,7 @@ the differential grid, the measured numbers and the limits — is in
 # Cargo.toml
 [dependencies]
 datafusion = { version = "=55.1.0", default-features = false, features = ["sql"] }
-datafusion-arrowmetal = "0.4.0"          # crates.io; or { path = "../ArrowMetal/datafusion" } from a checkout
+datafusion-arrowmetal = "0.4.1"          # crates.io; or { path = "../ArrowMetal/datafusion" } from a checkout
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
