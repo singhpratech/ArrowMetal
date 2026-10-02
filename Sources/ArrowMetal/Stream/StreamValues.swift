@@ -11,6 +11,16 @@ import Metal
 // place a host loop touches every row is the external sort's k-way merge, which is documented as a
 // CPU merge in docs/STREAMING.md.
 
+/// A Float32 value as a Double, NaNs included bit for bit: the sign and the 23-bit payload move into
+/// the Double's sign and the top of its 52-bit payload, so a signaling NaN stays signaling and NaNs keep
+/// their totalOrder. `Double(_:)` would quiet a signaling NaN (the hardware conversion sets the quiet
+/// bit), which moves it among the NaNs and breaks the external sort's merge under `FloatOrder.total`.
+@inline(__always) func widenedFloat32(_ f: Float) -> Double {
+    guard f.isNaN else { return Double(f) }
+    let b = UInt64(f.bitPattern)
+    return Double(bitPattern: ((b & 0x8000_0000) << 32) | 0x7FF0_0000_0000_0000 | ((b & 0x007F_FFFF) << 29))
+}
+
 /// A single Arrow value, type erased, ordered and hashable.
 ///
 /// Used as the key of the streaming group-by's global table and as the sort key of the external
@@ -82,7 +92,7 @@ extension AnyMetalArray {
         case .uint16(let a): return a.toArray().map { $0.map { .uint(UInt64($0)) } ?? .null }
         case .uint32(let a): return a.toArray().map { $0.map { .uint(UInt64($0)) } ?? .null }
         case .uint64(let a): return a.toArray().map { $0.map { .uint($0) } ?? .null }
-        case .float32(let a): return a.toArray().map { $0.map { .double(Double($0)) } ?? .null }
+        case .float32(let a): return a.toArray().map { $0.map { .double(widenedFloat32($0)) } ?? .null }
         case .float64(let a): return a.toArray().map { $0.map { .double($0) } ?? .null }
         case .boolean(let a): return a.toArray().map { $0.map { .bool($0) } ?? .null }
         case .string(let a): return a.toArray().map { $0.map { .string($0) } ?? .null }
@@ -400,7 +410,7 @@ extension AnyMetalArray {
             return .uints((0..<n).map { p[$0] }, valid: validity(n, a.validity, a.nullCount))
         case .float32(let a):
             let n = a.length, p = a.valuePointer
-            return .doubles((0..<n).map { Double(p[$0]) }, valid: validity(n, a.validity, a.nullCount))
+            return .doubles((0..<n).map { widenedFloat32(p[$0]) }, valid: validity(n, a.validity, a.nullCount))
         case .float64(let a):
             let n = a.length, p = a.valuePointer
             return .doubles((0..<n).map { p[$0] }, valid: validity(n, a.validity, a.nullCount))

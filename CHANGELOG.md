@@ -84,7 +84,9 @@
     floatOrder:)`, `am_stream_sort_ex` (per key `null_placement` and `float_order`), and
     `Stream.sort(..., null_placement=, float_order=)` / `sort_to_ipc`. The per-batch GPU sort and the
     CPU k-way merge order by the same rules, so a NaN now merges where the batch sort put it (the merge
-    used to compare NaN as neither less nor greater). With a limit, the top-n threshold keeps the rows
+    used to compare NaN as neither less nor greater); a Float32 key reaches the merge with its NaN bits
+    as they are, so under `total` a signaling NaN keeps its place among the NaNs (widening it to a
+    Double quieted it, and the merge put it after the quiet NaNs; `StreamSortFloat32Tests`). With a limit, the top-n threshold keeps the rows
     that can still win under the key's options (a batch holding nulls when they sort first, NaN rows
     where the float order puts NaN ahead), and a NaN threshold no longer rejects the later rows.
   - Tests: `SortNanLargestTests` (argsort, sorted values, both top-k selections and lexsort under
