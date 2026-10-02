@@ -59,6 +59,9 @@ fi
 
 echo "==> bundling $(basename "$SRC") into python/arrowmetal/_lib/"
 mkdir -p "$DEST"
+# Only the two dylibs may be in _lib: a stray copy there (a file-sync conflict copy such as
+# "libArrowMetalC 2.dylib") would be packaged into the wheel.
+find "$DEST" -mindepth 1 ! -name libArrowMetalC.dylib ! -name libarrowmetal_polars.dylib -print -delete | sed "s/^/    removed stray file: /"
 cp "$SRC" "$DEST/libArrowMetalC.dylib"
 
 # SwiftPM bakes the build machine's toolchain directory in as an LC_RPATH entry. Nothing the dylib
@@ -134,6 +137,12 @@ for lib in libArrowMetalC.dylib libarrowmetal_polars.dylib; do
         exit 1
     fi
 done
+# And nothing else may be under _lib/ in the wheel.
+extra=$("$PYTHON" -c "import zipfile,sys; print('\n'.join(n for n in zipfile.ZipFile(sys.argv[1]).namelist() if n.startswith('arrowmetal/_lib/') and n not in ('arrowmetal/_lib/libArrowMetalC.dylib', 'arrowmetal/_lib/libarrowmetal_polars.dylib')))" "$WHEEL")
+if [ -n "$extra" ]; then
+    echo "error: $WHEEL carries unexpected files under arrowmetal/_lib/:" >&2; echo "$extra" >&2
+    exit 1
+fi
 
 echo
 echo "wheel: $WHEEL"
