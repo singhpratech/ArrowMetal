@@ -906,7 +906,7 @@ of `MetalEngine all, cold`):
 * **Joins and `unique`** on numeric keys: the left join is ahead from the smallest input measured,
   1,250,000 rows, and taken from 1,875,000; the inner join is fitted at 1,353,218 and taken from
   2,029,827, the anti join at 2,485,306 and from 3,727,959. The semi join is not taken: against a
-  1,000-row table, (f), it is behind at every size (at best 0.42x), though against a 1,000,000-row
+  1,000-row table, (f), it is behind at every size (at best 0.47x), though against a 1,000,000-row
   table, (w3), it is fitted at 2,464,828. `unique` is fitted at 1,252,378 rows over 10,000 groups (r)
   and at 3,662,727 over about as many groups as rows (x1), and taken from 5,494,090.
 * **Sorts** over in-memory frames are fitted at 250,000 rows (x2, the smallest input measured; 1.42x

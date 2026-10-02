@@ -25,7 +25,7 @@ own time divided by the time with ArrowMetal, with the CPU time of the call next
 A `MetalEngine` for `lf.collect(engine=…)`:
 
 ```
-pip install arrowmetal polars
+pip install "arrowmetal[polars]"      # pins the tested Polars range
 ```
 
 ```python
