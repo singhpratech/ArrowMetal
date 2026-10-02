@@ -18,13 +18,16 @@ Each query is the same SQL text run on the same connection three ways:
                                                the auto gate rewrote the query at this size
 
 The query is materialised into a DuckDB temp table (CREATE OR REPLACE TEMP TABLE r AS ...), so what
-is timed is the engine, not an export to Python. Wall ms is the best of --reps runs after one warm-up
-(which also compiles the GPU pipeline); CPU ms is the process's (getrusage), so it counts DuckDB's
-worker threads. Before timing, the rewritten answer is checked against DuckDB's own, row for row.
+is timed is the engine, not an export to Python. DuckDB and the rewrite alternate over --rounds rounds;
+in each round each of them first runs the query once after 500 ms of idle (recorded on its own as
+`*_idle_ms`, the best of the rounds), then untimed until at least 100 ms of the same call have run
+(which also compiles the GPU pipeline), then --reps timed runs. Wall ms is the best of all the timed runs and `*_median_ms` their
+median; CPU ms is the process's (getrusage) for the best run, so it counts DuckDB's worker threads.
+Before timing, the rewritten answer is checked against DuckDB's own, row for row.
 `path` and `gpu_ms` come from arrowmetal_rewrites() for the rewritten run: which GPU path ran, and
 the time spent in the operator's Finalize (import, GPU, and handing the result back).
 """
-import argparse, csv, datetime, os, platform, resource, subprocess, sys, time
+import argparse, csv, datetime, os, platform, resource, statistics, subprocess, sys, time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 EXTENSION = os.path.join(ROOT, "duckdb-extension", "build", "arrowmetal_rewrite.duckdb_extension")
@@ -85,17 +88,22 @@ def cpu_ms():
     return (r.ru_utime + r.ru_stime) * 1000.0
 
 
-def best_of(con, sql, reps):
+def timed(con, ctas):
+    c0, t0 = cpu_ms(), time.perf_counter()
+    con.execute(ctas)
+    return (time.perf_counter() - t0) * 1000.0, cpu_ms() - c0
+
+
+def one_round(con, sql, reps, idle_s=0.5, warm_ms=100.0):
+    """One round for one mode: the first run after idle_s of idle, an untimed warm-up of at least
+    warm_ms of the same call, then reps timed runs. Returns (idle run, [timed runs])."""
     ctas = "CREATE OR REPLACE TEMP TABLE r AS " + sql
-    con.execute(ctas)  # warm-up (and the GPU pipeline compile, for the rewrite)
-    best = None
-    for _ in range(reps):
-        c0, t0 = cpu_ms(), time.perf_counter()
+    time.sleep(idle_s)
+    idle = timed(con, ctas)
+    t0 = time.perf_counter()
+    while (time.perf_counter() - t0) * 1000.0 < warm_ms:
         con.execute(ctas)
-        wall, cpu = (time.perf_counter() - t0) * 1000.0, cpu_ms() - c0
-        if best is None or wall < best[0]:
-            best = (wall, cpu)
-    return best
+    return idle, [timed(con, ctas) for _ in range(reps)]
 
 
 def main():
@@ -103,6 +111,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("rows", nargs="*", type=int, default=[1_000_000, 10_000_000, 50_000_000])
     parser.add_argument("--reps", type=int, default=5)
+    parser.add_argument("--rounds", type=int, default=3, help="alternating rounds of DuckDB and the rewrite")
     parser.add_argument("--out", default=None,
                         help="default: Benchmarks/results/duckdb_rewrite_<date>[_provisional].csv")
     parser.add_argument("--provisional", action="store_true",
@@ -119,7 +128,8 @@ def main():
     threads = con.sql("SELECT current_setting('threads')").fetchone()[0]
     header = (f"# duckdb {duckdb.__version__}, threads={threads}, python {platform.python_version()}, "
               f"{sysctl('machdep.cpu.brand_string')}, macOS {platform.mac_ver()[0]}, "
-              f"loadavg at start {os.getloadavg()[0]:.1f}, {datetime.datetime.now().isoformat(timespec='seconds')}"
+              f"loadavg at start {os.getloadavg()[0]:.1f}, {datetime.datetime.now().isoformat(timespec='seconds')}, "
+              f"{args.rounds} alternating rounds of {args.reps} timed runs after a 100 ms warm-up"
               + ("; PROVISIONAL: measured while other work shared the machine" if args.provisional else ""))
     rows_out = []
     for n in args.rows:
@@ -127,13 +137,25 @@ def main():
         for family, op, sql in QUERIES:
             con.execute("SET arrowmetal_rewrite = 'off'")
             expected = sorted(con.sql(sql).fetchall(), key=repr)
-            duck = best_of(con, sql, args.reps)
 
             con.execute("SET arrowmetal_rewrite = 'force'")
             got = sorted(con.sql(sql).fetchall(), key=repr)
             assert got == expected, (op, n)
-            gpu = best_of(con, sql, args.reps)
-            path, gpu_ms = con.sql("SELECT path, gpu_ms FROM arrowmetal_rewrites() ORDER BY id DESC LIMIT 1").fetchone()
+            runs = {"off": ([], []), "force": ([], [])}
+            for _ in range(args.rounds):
+                for mode in ("off", "force"):
+                    con.execute(f"SET arrowmetal_rewrite = '{mode}'")
+                    idle, timed_runs = one_round(con, sql, args.reps)
+                    runs[mode][0].append(idle)
+                    runs[mode][1].extend(timed_runs)
+                    if mode == "force":
+                        path, gpu_ms = con.sql(
+                            "SELECT path, gpu_ms FROM arrowmetal_rewrites() ORDER BY id DESC LIMIT 1").fetchone()
+            duck, gpu = min(runs["off"][1]), min(runs["force"][1])
+            duck_med = statistics.median(w for w, _ in runs["off"][1])
+            gpu_med = statistics.median(w for w, _ in runs["force"][1])
+            duck_idle = min(w for w, _ in runs["off"][0])
+            gpu_idle = min(w for w, _ in runs["force"][0])
 
             con.execute("SET arrowmetal_rewrite = 'auto'")
             con.sql("EXPLAIN " + sql).fetchall()
@@ -143,15 +165,19 @@ def main():
             row = dict(family=family, op=op, rows=n, duckdb_ms=round(duck[0], 3), duckdb_cpu_ms=round(duck[1], 1),
                        rewrite_ms=round(gpu[0], 3), rewrite_cpu_ms=round(gpu[1], 1),
                        speedup=round(duck[0] / gpu[0], 2), path=path, gpu_ms=round(gpu_ms, 3),
+                       duckdb_median_ms=round(duck_med, 3), rewrite_median_ms=round(gpu_med, 3),
+                       speedup_median=round(duck_med / gpu_med, 2),
+                       duckdb_idle_ms=round(duck_idle, 3), rewrite_idle_ms=round(gpu_idle, 3),
                        auto=decision, shape_class=reason.split(": ", 1)[1] if ": " in reason else "",
                        auto_reason=reason, sql=sql)
             rows_out.append(row)
             print(f"{n:>10,d} {op:52s} duckdb {duck[0]:8.2f} ms  rewrite {gpu[0]:8.2f} ms  "
-                  f"x{duck[0] / gpu[0]:5.2f}  auto={decision:9s}  {path}", flush=True)
+                  f"x{duck[0] / gpu[0]:5.2f} (median x{duck_med / gpu_med:5.2f})  auto={decision:9s}  {path}", flush=True)
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w", newline="") as f:
         f.write(header + "\n")
+        f.write(f"# loadavg at end {os.getloadavg()[0]:.1f}, {datetime.datetime.now().isoformat(timespec='seconds')}\n")
         w = csv.DictWriter(f, fieldnames=list(rows_out[0].keys()))
         w.writeheader()
         w.writerows(rows_out)

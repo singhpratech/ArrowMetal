@@ -543,6 +543,16 @@
   printed link prefills them. `--calibrate` now runs before the report, so the block names the table it
   wrote. docs/BENCHMARKS.md says how to submit a result.
 
+- DuckDB rewrite benchmark (`Benchmarks/duckdb_rewrite_bench.py`): DuckDB and the rewrite alternate
+  over three rounds (`--rounds`), each with an untimed warm-up of at least 100 ms before five timed
+  runs; the file records the best and median wall time and each side's first run after 500 ms of
+  idle. Run again on 2026-10-02 (`Benchmarks/results/duckdb_rewrite_2026-10-02.csv`, which the `auto`
+  floors and `test_measured_floors_are_in_the_benchmark_results` now cite): the same four floors, every
+  query `auto` rewrites 1.09x to 5.03x faster than DuckDB on the best run and 1.04x to 4.66x on the
+  median (1.09x to 5.93x in `duckdb_rewrite_2026-09-24.csv`). On the first run after idle, five of the
+  thirteen rewritten query-size pairs are behind DuckDB's own first run (0.47x to 0.99x); docs/DUCKDB.md
+  lists them.
+
 ## 0.3.0 — 2026-09-26
 Everything below is new in 0.3.0. `MetalEngine()` decides per subtree from measured crossovers: in the
 default benchmark (194 case-size pairs at 2,000,000 and 50,000,000 rows) it took 62 pairs, 42 of them
