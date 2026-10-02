@@ -5,6 +5,10 @@
 Nothing yet.
 
 ## 0.4.0 — 2026-10-02
+`datafusion-arrowmetal` is 0.4.1 on crates.io, published the same day with no code change: docs.rs builds
+its documentation on its default Linux target, where 0.4.0 had asked for `aarch64-apple-darwin` and could not
+be built there. `datafusion-arrowmetal = "0.4.0"` in a Cargo.toml resolves to it.
+
 Everything below is new in 0.4.0. `datafusion-arrowmetal`, on crates.io, is a physical optimizer rule
 for Apache DataFusion 55.1: registered on a `SessionContext`, it runs full sorts of 250,000 rows and
 more on the GPU, 6.9x to 28.8x faster than DataFusion alone up to 50,000,000 rows

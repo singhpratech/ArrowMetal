@@ -6,7 +6,7 @@
 
 [package]
 name = "datafusion-arrowmetal"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/singhpratech/ArrowMetal"
@@ -45,5 +45,5 @@ libc = "0.2"
 [profile.release]
 lto = "thin"
 
-[package.metadata.docs.rs]
-targets = ["aarch64-apple-darwin"]
+# docs.rs builds on its default Linux target: DataFusion pulls zstd-sys, C code that docs.rs's Linux builder
+# cannot cross-compile for aarch64-apple-darwin; build.rs skips the dylib search under DOCS_RS.

@@ -4,6 +4,7 @@
 [![CI](https://github.com/singhpratech/ArrowMetal/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/singhpratech/ArrowMetal/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/arrowmetal)](https://pypi.org/project/arrowmetal/)
 [![crates.io](https://img.shields.io/crates/v/arrowmetal)](https://crates.io/crates/arrowmetal)
+[![crates.io datafusion-arrowmetal](https://img.shields.io/crates/v/datafusion-arrowmetal?label=datafusion-arrowmetal)](https://crates.io/crates/datafusion-arrowmetal)
 [![Go Reference](https://pkg.go.dev/badge/github.com/singhpratech/ArrowMetal/go/arrowmetal.svg)](https://pkg.go.dev/github.com/singhpratech/ArrowMetal/go/arrowmetal)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
@@ -30,7 +31,7 @@ DataFusion's group-bys are 1.24x to 2.17x and five of DuckDB's thirteen rewritte
 <picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/datafusion-dark.svg"><img src="docs/img/engines/datafusion.svg" height="22" alt="" align="top"></picture> **DataFusion.** A physical optimizer rule for DataFusion 55.1; the SQL is unchanged. A Rust crate used by
 [crates.io](https://crates.io/crates/datafusion-arrowmetal); it loads `libArrowMetalC.dylib` ([install](docs/DATAFUSION.md#install)):
 ```toml
-datafusion-arrowmetal = "0.4.0"   # beside datafusion = "=55.1.0"
+datafusion-arrowmetal = "0.4.1"   # beside datafusion = "=55.1.0"
 ```
 Full sorts **6.9x to 28.8x** faster than DataFusion alone (250,000 to 50,000,000 rows), ten group-by
 series **2.31x to 4.27x**; 13,632 query pairs, 0 mismatches. Left to DataFusion: top-k 0.14x to 0.41x,
@@ -85,7 +86,7 @@ A physical optimizer rule for DataFusion 55.1, the Rust crate `datafusion-arrowm
 # Cargo.toml
 [dependencies]
 datafusion = { version = "=55.1.0", default-features = false, features = ["sql"] }
-datafusion-arrowmetal = "0.4.0"
+datafusion-arrowmetal = "0.4.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -262,7 +263,7 @@ print(amount.filter_where(">", 15).to_arrow())          # [20, 30, 40]: GPU filt
 
 ### Release
 
-Listed on Apache Arrow's [Powered By](https://arrow.apache.org/powered_by/) page. Site and docs: <https://arrowmetal.org> · Python: `pip install arrowmetal` · Rust: `arrowmetal = "0.4.0"` · DataFusion: `datafusion-arrowmetal = "0.4.0"` · Release: [v0.4.0](https://github.com/singhpratech/ArrowMetal/releases/tag/v0.4.0)
+Listed on Apache Arrow's [Powered By](https://arrow.apache.org/powered_by/) page. Site and docs: <https://arrowmetal.org> · Python: `pip install arrowmetal` · Rust: `arrowmetal = "0.4.0"` · DataFusion: `datafusion-arrowmetal = "0.4.1"` · Release: [v0.4.0](https://github.com/singhpratech/ArrowMetal/releases/tag/v0.4.0)
 
 New in 0.4.0: `datafusion-arrowmetal`, a DataFusion optimizer rule on crates.io; the Polars engine's
 sort keys passed one to one with Polars' null placement and float order, and its group-by crossovers
