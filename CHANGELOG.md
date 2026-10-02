@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.4.0 — 2026-10-02
+Everything below is new in 0.4.0. `datafusion-arrowmetal`, on crates.io, is a physical optimizer rule
+for Apache DataFusion 55.1: registered on a `SessionContext`, it runs full sorts of 250,000 rows and
+more on the GPU, 6.9x to 28.8x faster than DataFusion alone up to 50,000,000 rows
+(`datafusion/results/datafusion_sort_warm_2026-09-29.csv`), and the `count(*)`, `DISTINCT` and integer
+`MIN`/`MAX` group-bys its measured table takes over `MemTable`s of 50,000,000 rows or more, 2.31x to
+4.27x faster warm (`datafusion/results/datafusion_groupby_refit_check_2026-10-02.csv`,
+`datafusion_groupby_default_import_2026-10-01.csv`); 13,632 query pairs run with and without the rule
+give the same answers. The Polars `MetalEngine` passes every Polars sort key as one key with Polars'
+null placement and float order, so a sort keeps Polars' key count and `sort().head()`, `top_k` and
+`bottom_k` run as the GPU top-k (the top 100 by a nullable Float64 key descending over 50,000,000 rows,
+`shapes="all"`: 129.53 → 11.07 ms, `Benchmarks/results/polars_engine_sort_options_2026-09-30.csv`); its
+group-by crossovers are refitted and held to the default benchmark, where the default takes 54 of the
+150 group-by case-size pairs, each 1.12x to 10.69x of the faster Polars engine on the best run
+(`Benchmarks/results/polars_engine_default_groupby_2026-09-30.csv`); the conformance grid compares
+15,376 cases with Polars, 0 unclassified. Every query the DuckDB rewrite's `auto` mode rewrites is 1.09x
+to 5.03x faster than DuckDB on the best run (`Benchmarks/results/duckdb_rewrite_2026-10-02.csv`). A
+column held as many Arrow arrays imports in one call with no concatenated copy (C, Swift, Python, Rust,
+Go, Node, R), and sorts take a null placement and a float order per key (`ieee`, `total`,
+`nan_largest`). Correctness: kernels over arrays near 2^32 elements, and row-wise grids of 2^32 threads,
+no longer wrap and skip rows; Parquet's fixed-width decode no longer overwrites a column whose decoded
+bytes pass 4 GB; `count(expr)` in a plan's `group_by` and the streaming group-by's `count(column)` count
+the non-null values for every type; the streaming external sort merges NaN where the GPU sort placed it;
+Node imports empty typed arrays and empty Arrow vectors. Behaviour changes: index arrays (argsort,
+top-k, lexsort, the ranks, join indices, a group's representative rows) are UInt32, and rows past
+2^32 - 1 are refused; a Float64 group `sum` is the correctly rounded sum of the group's values (equal
+to `math.fsum`, independent of row order) and a Float64 group `mean` that sum divided by the count,
+rounded once; the Polars engine's `sort_helper_keys` shape class is gone, and
+`MetalEngine(shapes={"sort_helper_keys"})` raises `ValueError`.
+
 - Behaviour change: index arrays are UInt32 (Arrow `uint32`); rows beyond 2^32 - 1 are refused.
   `argsort` (every sortable type), `topK`, `partitionNthIndices`, `lexsortIndices`, the hash join's
   index pairs, the ranks (`rowNumber`, `rank`, `denseRank`, `maxRank`, `rank(tiebreaker:)` and the
@@ -119,7 +151,8 @@
   so a sort keeps the key count Polars gave it, a single-key `sort().head()`, `top_k` or `bottom_k`
   runs as the GPU top-k, and a nullable temporal key sorted nulls first is taken over a join, a
   group-by or a Parquet file as well (it used to need a validity column added to its in-memory
-  scan). The `sort_helper_keys` shape class is gone with them (those sorts are `sort`).
+  scan). The `sort_helper_keys` shape class is gone with them (those sorts are `sort`), and
+  `MetalEngine(shapes={"sort_helper_keys"})` raises `ValueError` as an unknown shape class name.
   `test_polars_sort_order.py` pins Polars' ordering rules on the installed Polars (they hold for
   1.44.1 and 2.0.0rc2) and checks each dtype, direction, null placement and multi-key sort for one
   plan key per Polars key.
