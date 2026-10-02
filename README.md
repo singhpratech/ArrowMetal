@@ -27,7 +27,7 @@ in-memory and streaming engines. Each engine's second row is its lowest speed-up
 the cases its default takes. On the first run after 500 ms of idle, against the engine's own first run,
 DataFusion's group-bys are 1.24x to 2.17x and five of DuckDB's thirteen rewritten pairs are behind, down to 0.47x.
 
-**DataFusion.** A physical optimizer rule for DataFusion 55.1; the SQL is unchanged. A Rust crate used by
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/datafusion-dark.svg"><img src="docs/img/engines/datafusion.svg" height="22" alt="" align="top"></picture> **DataFusion.** A physical optimizer rule for DataFusion 55.1; the SQL is unchanged. A Rust crate used by
 [crates.io](https://crates.io/crates/datafusion-arrowmetal); it loads `libArrowMetalC.dylib` ([install](docs/DATAFUSION.md#install)):
 ```toml
 datafusion-arrowmetal = "0.4.0"   # beside datafusion = "=55.1.0"
@@ -36,7 +36,7 @@ Full sorts **6.9x to 28.8x** faster than DataFusion alone (250,000 to 50,000,000
 series **2.31x to 4.27x**; 13,632 query pairs, 0 mismatches. Left to DataFusion: top-k 0.14x to 0.41x,
 filters 0.31x to 0.79x. `rule.report()` gives each node, TAKEN or LEFT, and why. [DataFusion in full](#datafusion-in-full)
 
-**Polars.** `MetalEngine` runs the subtrees measured ahead (full sorts, inner, left and anti joins,
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/polars-dark.svg"><img src="docs/img/engines/polars.svg" height="22" alt="" align="top"></picture> **Polars.** `MetalEngine` runs the subtrees measured ahead (full sorts, inner, left and anti joins,
 `unique`, group-bys judged by their estimated number of groups); Polars runs the rest. **1.52x to 11.54x**
 on all 75 of 220 case-size pairs the default took; 15,376 generated cases, 0 different. Left to Polars:
 whole-frame aggregates 0.09x to 0.24x, filters 0.14x to 0.42x. [Polars in full](#polars-in-full)
@@ -51,7 +51,7 @@ engine = am.MetalEngine()                             # the measured defaults
 df = lf.sort("amount", descending=True).collect(engine=engine)  # the frame lf.collect() returns
 print(engine.last_report)                             # Metal or Polars, per node, and why
 ```
-**DuckDB.** An optimizer extension; the SQL is unchanged. Built from a checkout with
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/duckdb-dark.svg"><img src="docs/img/engines/duckdb.svg" height="22" alt="" align="top"></picture> **DuckDB.** An optimizer extension; the SQL is unchanged. Built from a checkout with
 `./duckdb-extension/build_rewrite.sh` (DuckDB 1.5.5), then `LOAD`ed, or opened by `am.duckdb_connect()`.
 Rewritten aggregates **1.09x to 5.03x** faster than DuckDB's own operators; 33,376 generated queries, 0
 different. Left to DuckDB: a single `sum` 0.33x, `VARCHAR` keys 0.23x. [DuckDB in full](#duckdb-in-full)
