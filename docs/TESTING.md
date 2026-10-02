@@ -12,7 +12,7 @@ pushed. Each row names the run its numbers are from, on an M4 Max.
 | Engine conformance grid (`python/tests/engine_report.py`, `engine_polars_grid.py`, `engine_duckdb_grid.py`) | 15,376 Polars cases and 33,376 DuckDB queries, generated over shapes, dtypes, null patterns and sizes (Polars run of 2026-10-02, DuckDB run of 2026-09-25: 0 unclassified; 33 documented, all float summation order) | Polars' own `lf.collect()`; DuckDB with the rewrite off ([COVERAGE.md](COVERAGE.md#engines)) |
 | TypeScript suites (`node/test`) | 84 tests in 9 files over the N-API addon (84 passed on 2026-10-02) | Apache Arrow JS 21.2.0 and plain JS over the same rows ([TYPESCRIPT.md](TYPESCRIPT.md)) |
 | Go binding (`go/arrowmetal`) | 66 test functions and three `Example`s, 69 runnable, and 515 subtests: 584 passing results as `go test -count=1 -v ./...` reported them on 2026-10-02, 0 failed, run three times (plain, under `-race`, and under the cgo pointer checker, `GOEXPERIMENT=cgocheck2`, with the same counts) | `arrow-go/v18`'s own `compute` where it has the function, plain Go loops where it does not ([GO.md](GO.md)) |
-| R suites (`r/arrowmetal/tests/testthat`) | 87 `test_that()` blocks in the sources (88 as testthat runs them: the one in test-dispatch.R runs once per attach order), 818 expectations (0 failed, 0 skipped on 2026-10-02; the four blocks in test-carriers.R cover the ArrowArray/ArrowSchema carriers the shim allocates: release on drop without import, refusal of a moved or unfilled pair, tag checks), over the 42 ABI entry points the R binding wraps | base R and the `arrow` R package's own kernels on the same data ([R.md](R.md)) |
+| R suites (`r/arrowmetal/tests/testthat`) | 88 `test_that()` blocks in the sources (89 as testthat runs them: the one in test-dispatch.R runs once per attach order), 920 expectations (0 failed, 0 skipped on 2026-10-02; the four blocks in test-carriers.R cover the ArrowArray/ArrowSchema carriers the shim allocates: release on drop without import, refusal of a moved or unfilled pair, tag checks), over the 42 ABI entry points the R binding wraps | base R and the `arrow` R package's own kernels on the same data ([R.md](R.md)) |
 | Review pass before release | the integrations, the engine, the kernels, the C ABI and the readers | each finding carries a regression test |
 | Benchmarks (`Benchmarks/`) | 339 operation-and-size rows over 173 operations, against four CPU libraries in two idioms each — the plain eager one and the most parallel one that library has for the same answer (`polars-lazy`, `pyarrow-threaded`); streaming and engine benches | measured, never estimated; the baseline is the fastest idiom of any library, and against it 145 rows are at or above 3x, 102 between 1x and 3x, 77 to improve, where the fastest CPU idiom is ahead, and 15 without a CPU equivalent ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md), [TO_IMPROVE.md](TO_IMPROVE.md)) |
 
@@ -213,7 +213,7 @@ Before a release the binding suites run as well:
 6. `cd rust && cargo test --release`: 66 tests and 5 compile-only doc-tests, 0 failures.
 7. `go test` plain and under `GOEXPERIMENT=cgocheck2`.
 8. `npm test` (84 tests).
-9. testthat (818 expectations).
+9. testthat (920 expectations).
 
 A benchmark comparison is never part of the release checks, because timings on a loaded machine are noise; the
 benchmark matrix is rerun on an idle machine before its numbers are published.

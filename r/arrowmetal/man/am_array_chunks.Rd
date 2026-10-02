@@ -5,23 +5,23 @@
 am_array_chunks(x)
 }
 \arguments{
-\item{x}{An [arrow::ChunkedArray], or a list of [arrow::Array]s (or R vectors) of one type.}
+\item{x}{An \code{\link[arrow]{ChunkedArray}}, or a list of \code{\link[arrow]{Array}}s (or R vectors) of one type.}
 }
 \value{
-An `am_array` handle.
+An \code{am_array} handle.
 }
 \description{
-Imports several Arrow arrays of one type -- the chunks of an [arrow::ChunkedArray], or a list of
-[arrow::Array]s such as one column of several record batches -- as one `am_array` of their total
-length (`am_import_chunks`). The column crosses the C Data Interface once, as a stream of
+Imports several Arrow arrays of one type -- the chunks of an \code{\link[arrow]{ChunkedArray}}, or a list of
+\code{\link[arrow]{Array}}s such as one column of several record batches -- as one \code{am_array} of their total
+length (\code{am_import_chunks}). The column crosses the C Data Interface once, as a stream of
 one-column record batches, and each chunk's buffers are copied straight into the final GPU
 buffers, on the CPU cores in parallel, with no concatenated copy first. Each chunk's offset,
 length and validity are honoured.
 }
 \details{
-One chunk is [am_array()]. A type the chunked import does not take (dictionary, nested, run-end
-encoded, extension) is concatenated and imported, as [am_array()] does. A list of arrays is made
-a [arrow::ChunkedArray] first, which checks that every chunk has one type.
+One chunk is \code{\link{am_array}()}. A type the chunked import does not take (dictionary, nested, run-end
+encoded, extension) is concatenated and imported, as \code{\link{am_array}()} does. A list of arrays is made
+a \code{\link[arrow]{ChunkedArray}} first, which checks that every chunk has one type.
 }
 \examples{
 if (am_available()) {

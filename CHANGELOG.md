@@ -73,7 +73,8 @@
   `am_sort_ex2`, `am_top_k_ex`, `am_lexsort_ex2`), plan JSON `"float_order": "nan_largest"`, Python
   `float_order="nan_largest"`, Rust `FloatOrder::NanLargest`, Go `FloatNanLargest` (on
   `ArgsortWith`, `SortWith`, `TopKWith`, `LexsortWith`), Node `floatOrder: 'nan_largest'` (on
-  `argsort`, `sort`, `topK`, `lexsort`).
+  `argsort`, `sort`, `topK`, `lexsort`), R `float_order = "nan_largest"` (on `am_argsort()`,
+  `am_sort()`, `am_top_k()`, `am_lexsort()`).
   - Window `order_by` keys take the sort key options: each key's null placement and float order, in
     the plan JSON (`[column, descending, {"nulls", "float_order"}]` or the key object, with a window
     spec's own `nulls` / `float_order` as the defaults) and in Python (`with_rank(...,
@@ -365,8 +366,8 @@
     entry points are resolved when the library has them: an older `libArrowMetalC.dylib` still loads,
     and a new call names the entry point it lacks.
   - Tests: Go 66 test functions and 3 examples (20 functions and 2 examples new), 584 results with
-    subtests, plain, under `-race` and under `GOEXPERIMENT=cgocheck2`; Node 84 tests (22 new); R 88
-    `test_that()` blocks as testthat runs them (19 new), 818 expectations. The sorts are checked index
+    subtests, plain, under `-race` and under `GOEXPERIMENT=cgocheck2`; Node 84 tests (22 new); R 89
+    `test_that()` blocks as testthat runs them (20 new), 920 expectations. The sorts are checked index
     for index against arrow-go's `SortIndices` and arrow R's `array_sort_indices` for the IEEE order
     with nulls last, and against a stable reference of the documented order for every direction,
     null placement and float order, on columns holding NaN of both signs and several payloads, ±0.0,

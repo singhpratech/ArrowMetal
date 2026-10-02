@@ -18,7 +18,7 @@ am_top_k(x, k, largest = TRUE, null_placement = "at_end", float_order = "ieee")
 \item{null_placement}{\code{"at_end"} (the default) or \code{"at_start"}, as in Arrow's sort
 options; it holds in both directions.}
 
-\item{float_order}{\code{"ieee"} (the default) or \code{"total"}.}
+\item{float_order}{\code{"ieee"} (the default), \code{"total"} or \code{"nan_largest"}.}
 
 \item{k}{Number of rows: a whole number, 0 or more; past the length gives every row.}
 
@@ -42,6 +42,8 @@ and every \code{NaN} is one value.
 value, and the \code{NaN} rows sit next to the nulls in both directions. \code{"total"} is IEEE 754
 totalOrder, as arrow-rs and Rust's \code{total_cmp} define it:
 \code{-NaN < -Inf < ... < -0 < 0 < ... < Inf < NaN}, and a descending sort is its exact mirror.
+\code{"nan_largest"} is Polars' and NumPy's order: every \code{NaN} is one value above \code{+Inf} in
+both directions (last ascending, first descending) and \code{-0} ties \code{0}.
 Integer, string and temporal columns ignore \code{float_order}. With the defaults each function runs
 the call it always ran.
 }
