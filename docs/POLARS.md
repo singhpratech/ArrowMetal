@@ -706,17 +706,22 @@ the default uses as `rows`:
   `vs_fastest_polars`), 1.2x at 2,000,000, 1.37x at 5,000,000 and 1.5x at
   10,000,000, so a fit at 15% would land where the two engines are within noise of each other.
 * **The String floor** (`STRING_FLOOR`). A shape with a String column is taken from 5,000,000 rows
-  at the earliest, whatever its fit says. Below that the String sorts are close to Polars: (o) 1.2x
-  and (p) 1.38x at 2,000,000 rows in the 2026-09-26 sweep, and 1.21x and 1.31x under `shapes="all"` at that size
-  in the benchmark below (`Benchmarks/results/polars_engine_bench_2026-09-26-final3.csv`, cold), inside its noise band
-  (0.62x to 1.31x); from 5,000,000 rows that sweep has them at 1.37x and up.
+  at the earliest, whatever its fit says. The floor is set from the 2026-09-26 runs, where the String
+  sorts below it are close to Polars: (o) 1.2x and (p) 1.38x at 2,000,000 rows in the 2026-09-26 sweep,
+  and 1.21x and 1.31x under `shapes="all"` at that size in the 2026-09-26 default benchmark
+  (`Benchmarks/results/polars_engine_bench_2026-09-26-final3.csv`, cold), inside that benchmark's noise
+  band (0.62x to 1.31x); from 5,000,000 rows that sweep has them at 1.37x and up. In the 0.4.0
+  benchmark below (`Benchmarks/results/polars_engine_bench_2026-10-02.csv`, cold) they are 1.39x and
+  1.84x under `shapes="all"` at 2,000,000 rows, against a noise band of 0.86x to 1.18x.
 * **The headroom** (`HEADROOM`). The default takes a shape from 1.5 times its fit (a String shape
   from the larger of that and the floor), and a shape whose 1.5 times passes the largest size
   measured is not taken. The fit interpolates between sizes measured 2 to 2.5 times apart
   (250,000, 500,000, 1,000,000, 2,000,000, 5,000,000 and so on), and shapes just past their
-  crossover were within run-to-run noise of Polars: two runs of the same Polars plan in the
-  benchmark below differ by 0.62x to 1.31x (`MetalEngine default, cold` where it took nothing, against
-  `polars in-memory`, rows of 5 ms or more in `Benchmarks/results/polars_engine_bench_2026-09-26-final3.csv`).
+  crossover were within run-to-run noise of Polars: two runs of the same Polars plan differ by 0.62x
+  to 1.31x in the 2026-09-26 default benchmark and by 0.86x to 1.18x in the 0.4.0 benchmark below
+  (`MetalEngine default, cold` where it took nothing, against `polars in-memory`, rows of 5 ms or more
+  in `Benchmarks/results/polars_engine_bench_2026-09-26-final3.csv` and
+  `Benchmarks/results/polars_engine_bench_2026-10-02.csv`).
 * **The default benchmark** (`BENCH_RATIO`, `BENCH`). The sweep times each case back to back; the
   default is also held to `Benchmarks/polars_engine_bench.py --idle` (a 100 ms warm-up, a first run
   after 500 ms of idle on its own, another warm-up, then best of 5 and their median), over the files
@@ -878,12 +883,13 @@ group-by at 2,000,000 rows is probed only for the two-key count and min/max, the
 bucket taken at that size; a one-key, String or two-key sum group-by there is not probed,
 and neither is a String group-by at 50,000,000 (only the (String, int32) sum has buckets). In the
 default benchmark below, where the probe runs in a process that holds every case's frames
-(`probe_us` in `Benchmarks/results/polars_engine_bench_2026-09-26-final3.csv`, the probes of one collect summed), its median
-is 99 µs at 2,000,000 rows (2.21% of the default's time for the case; 3 of the 14 probes under 1%)
-and 144 µs at 50,000,000 (0.53%; 54 of 65 under 1%). The eight probes over 5 ms, 5.2 to 13.5 ms, are
-all at 50,000,000 rows on frames with 0.43 times as many groups as rows or more ((g1minmaxR2) 5.2 ms,
-0.93% of the default's time; (g2minmaxR2) 13.5 ms, 1.65%), and its largest share is 11.43% at
-2,000,000 rows ((g2count100k), 461 µs of 4.0 ms). A second collect of the same frame reads its
+(`probe_us` in `Benchmarks/results/polars_engine_bench_2026-10-02.csv`, the probes of one collect summed), its median
+is 150.5 µs at 2,000,000 rows (2.90% of the default's time for the case; 1 of the 14 probes under 1%)
+and 126 µs at 50,000,000 (0.75%; 51 of 77 under 1%). The seven probes over 5 ms, 6.9 to 12.7 ms, are
+all at 50,000,000 rows on frames with 0.43 times as many groups as rows or more ((g1minmaxR2) 6.9 ms,
+1.41% of the default's time; (g2sumR2) 12.7 ms, 1.99%), and its largest shares are 15.96% at
+2,000,000 rows ((g2minmax100k), 390 µs of 2.4 ms) and 14.60% at 50,000,000 ((g2sum1M), 3.8 ms of
+26.2 ms). A second collect of the same frame reads its
 samples from the cache. Sampled until its denominator settles instead of until the decision does (`free_estimate` in `Benchmarks/results/group_probe_2026-09-26.csv`), the
 estimate falls in the bucket of the true count for every frame and key set of the grid at both sizes,
 within 29% of it up to 1,000,000 groups at 50,000,000 rows, and 24% to 31% above it at half the rows.
@@ -932,106 +938,125 @@ of `MetalEngine all, cold`):
   row groups, (s2), is ahead at every size snappy (1.24x to 2.48x) and at none uncompressed (at best
   0.99x). So the group-by and aggregate classes over a file are not taken.
 
-**The default against Polars and against `shapes="all"`.** `Benchmarks/polars_engine_bench.py` over
-the 93 in-memory cases at 2,000,000 and 50,000,000 rows and the four Parquet scan cases over the
-50,000,000-row files, snappy and uncompressed, 194 case-size pairs, best of 5, every result equal to
+**The default against Polars and against `shapes="all"`.** `Benchmarks/polars_engine_bench.py --scan`
+over the 106 in-memory cases at 2,000,000 and 50,000,000 rows and the four Parquet scan cases over the
+50,000,000-row files, snappy and uncompressed, 220 case-size pairs, best of 5, every result equal to
 Polars' (the cold runs of `MetalEngine()` clear the group-count cache too, so each pays its probe):
-`Benchmarks/results/polars_engine_bench_2026-09-26-final3.csv`, run conditions in
-`Benchmarks/results/bench_conditions_2026-09-26-final3.txt`. The default took a subtree in 62 pairs
-(10 at 2,000,000 rows and 52 at 50,000,000), 42 of them group-bys, and every one is ahead of the faster
-Polars engine, from 1.21x ((t6) at 50M) to 9.42x ((g2count1M) at 50M):
+`Benchmarks/results/polars_engine_bench_2026-10-02.csv`, run conditions in
+`Benchmarks/results/bench_conditions_2026-10-02.txt`. The default takes a subtree in 75 pairs
+(11 at 2,000,000 rows and 64 at 50,000,000), 55 of them group-bys, and every one is ahead of the faster
+Polars engine, from 1.52x ((g1minmax200) at 50M) to 11.54x ((r) at 50M):
 
 | case | rows | Polars in-memory | Polars streaming | `shapes="all"`, cold | `MetalEngine()`, cold | vs faster Polars |
 |---|---|---:|---:|---:|---:|---:|
-| (e) inner join then sum (the join taken) | 2M | 7.5 ms | 4.9 ms | 3.7 ms | **2.6 ms** | 1.87 |
-| (m) sort 3 columns by an int64 key | 2M | 12.1 ms | 13.0 ms | 3.4 ms | **2.5 ms** | 4.86 |
-| (q) filter, then sort by (int32 asc, int64 desc) | 2M | 14.4 ms | 14.4 ms | 4.0 ms | **3.9 ms** | 3.72 |
-| (v2) group-by (region, sub), count | 2M | 6.5 ms | 5.0 ms | 3.3 ms | **3.5 ms** | 1.43 |
-| (w1) inner join, 1M-row build side | 2M | 7.7 ms | 5.2 ms | 4.3 ms | **2.3 ms** | 2.31 |
-| (w2) left join, 1M-row build side | 2M | 10.2 ms | 6.0 ms | 3.2 ms | **2.6 ms** | 2.27 |
-| (x2) sort by a nullable Float64 key, descending | 2M | 18.2 ms | 19.3 ms | 6.3 ms | **6.4 ms** | 2.82 |
-| (g2count100k) group-by grid, 2 keys, 100,000 groups, count | 2M | 6.9 ms | 5.7 ms | 3.6 ms | **4.0 ms** | 1.42 |
-| (g2count10k) group-by grid, 2 keys, 10,000 groups, count | 2M | 5.8 ms | 5.3 ms | 3.4 ms | **3.4 ms** | 1.54 |
-| (g2mean10k) group-by grid, 2 keys, 10,000 groups, mean | 2M | 7.6 ms | 5.3 ms | 3.6 ms | **3.8 ms** | 1.39 |
-| (c) group-by (region, sub) mean + max | 50M | 208.7 ms | 109.4 ms | 61.4 ms | **61.0 ms** | 1.80 |
-| (e) inner join then sum (the join taken) | 50M | 21.6 ms | 15.6 ms | 9.1 ms | **9.0 ms** | 1.74 |
-| (i) group-by 1 key, 100,000 groups, sum | 50M | 90.3 ms | 45.6 ms | 24.2 ms | **24.3 ms** | 1.88 |
-| (k) group-by (String, int32), sum | 50M | 375.1 ms | 165.2 ms | 74.3 ms | **74.7 ms** | 2.21 |
-| (l) group-by (region, sub), Float64 sum + mean | 50M | 212.8 ms | 112.0 ms | 55.3 ms | **55.2 ms** | 2.03 |
-| (m) sort 3 columns by an int64 key | 50M | 377.8 ms | 441.9 ms | 72.4 ms | **74.6 ms** | 5.07 |
-| (o) sort with a String column, by an int64 key | 50M | 392.7 ms | 502.8 ms | 272.0 ms | **282.4 ms** | 1.39 |
-| (p) filter, then sort by (int32 asc, nullable Float64 desc) | 50M | 952.8 ms | 1009.3 ms | 406.9 ms | **394.7 ms** | 2.41 |
-| (q) filter, then sort by (int32 asc, int64 desc) | 50M | 720.8 ms | 734.8 ms | 114.7 ms | **116.5 ms** | 6.18 |
-| (r) unique over (region, sub), keep first | 50M | 172.5 ms | 172.9 ms | 28.4 ms | **30.3 ms** | 5.69 |
-| (s4) Parquet scan, sort 2 columns by a float64 key, uncompressed | 50M | 581.2 ms | 620.5 ms | 117.0 ms | **100.4 ms** | 5.79 |
-| (s4) Parquet scan, sort 2 columns by a float64 key, snappy | 50M | 604.3 ms | 632.9 ms | 125.5 ms | **188.6 ms** | 3.20 |
-| (t5) group-by 1 key, 100,000 groups, count | 50M | 75.3 ms | 44.2 ms | 14.0 ms | **13.9 ms** | 3.19 |
-| (t6) group-by 1 key, 100,000 groups, mean | 50M | 99.1 ms | 60.2 ms | 49.7 ms | **49.9 ms** | 1.21 |
-| (t7) group-by 1 key, 100,000 groups, min + max | 50M | 119.9 ms | 69.4 ms | 37.5 ms | **37.6 ms** | 1.85 |
-| (v1) group-by (region, sub), sum | 50M | 200.9 ms | 112.2 ms | 28.6 ms | **28.7 ms** | 3.92 |
-| (v2) group-by (region, sub), count | 50M | 166.5 ms | 103.7 ms | 18.5 ms | **18.2 ms** | 5.69 |
-| (w1) inner join, 1M-row build side | 50M | 95.2 ms | 82.2 ms | 35.1 ms | **35.2 ms** | 2.33 |
-| (w2) left join, 1M-row build side | 50M | 267.1 ms | 100.1 ms | 41.4 ms | **41.1 ms** | 2.43 |
-| (w4) anti join, 1M-row build side | 50M | 82.1 ms | 63.9 ms | 37.6 ms | **37.4 ms** | 1.71 |
-| (x1) unique over (k1, k2), keep first | 50M | 771.6 ms | 477.3 ms | 277.4 ms | **281.2 ms** | 1.70 |
-| (x2) sort by a nullable Float64 key, descending | 50M | 551.5 ms | 639.5 ms | 160.8 ms | **249.6 ms** | 2.21 |
-| (y5) unique over (String, int32), keep first | 50M | 401.7 ms | 434.4 ms | 75.5 ms | **67.7 ms** | 5.93 |
-| (g1count100k) group-by grid, 1 key, 100,000 groups, count | 50M | 74.5 ms | 86.3 ms | 19.2 ms | **16.9 ms** | 4.40 |
-| (g1count10k) group-by grid, 1 key, 10,000 groups, count | 50M | 63.6 ms | 84.7 ms | 18.0 ms | **15.8 ms** | 4.03 |
-| (g1count1M) group-by grid, 1 key, 1,000,000 groups, count | 50M | 154.3 ms | 96.9 ms | 20.4 ms | **18.7 ms** | 5.18 |
-| (g1mean100k) group-by grid, 1 key, 100,000 groups, mean | 50M | 112.0 ms | 86.8 ms | 57.6 ms | **59.3 ms** | 1.46 |
-| (g1mean10k) group-by grid, 1 key, 10,000 groups, mean | 50M | 96.5 ms | 94.9 ms | 54.5 ms | **51.6 ms** | 1.84 |
-| (g1minmax100k) group-by grid, 1 key, 100,000 groups, min + max | 50M | 124.5 ms | 145.9 ms | 50.8 ms | **43.9 ms** | 2.83 |
-| (g1minmax10k) group-by grid, 1 key, 10,000 groups, min + max | 50M | 110.7 ms | 153.7 ms | 42.9 ms | **37.4 ms** | 2.96 |
-| (g1minmax1M) group-by grid, 1 key, 1,000,000 groups, min + max | 50M | 210.7 ms | 123.1 ms | 64.5 ms | **60.2 ms** | 2.04 |
-| (g1sum100k) group-by grid, 1 key, 100,000 groups, sum | 50M | 103.0 ms | 122.8 ms | 38.1 ms | **30.3 ms** | 3.40 |
-| (g1sum10k) group-by grid, 1 key, 10,000 groups, sum | 50M | 96.6 ms | 97.1 ms | 35.9 ms | **29.1 ms** | 3.32 |
-| (g1sum1M) group-by grid, 1 key, 1,000,000 groups, sum | 50M | 182.4 ms | 103.2 ms | 38.4 ms | **34.2 ms** | 3.02 |
-| (g2count100k) group-by grid, 2 keys, 100,000 groups, count | 50M | 246.8 ms | 180.0 ms | 25.3 ms | **22.3 ms** | 8.07 |
-| (g2count10k) group-by grid, 2 keys, 10,000 groups, count | 50M | 209.9 ms | 147.1 ms | 25.3 ms | **21.6 ms** | 6.81 |
-| (g2count1M) group-by grid, 2 keys, 1,000,000 groups, count | 50M | 446.2 ms | 224.9 ms | 27.5 ms | **23.9 ms** | 9.42 |
-| (g2count1k) group-by grid, 2 keys, 1,000 groups, count | 50M | 189.0 ms | 53.2 ms | 23.6 ms | **19.8 ms** | 2.68 |
-| (g2count200) group-by grid, 2 keys, 200 groups, count | 50M | 37.5 ms | 37.4 ms | 19.3 ms | **18.3 ms** | 2.04 |
-| (g2mean100k) group-by grid, 2 keys, 100,000 groups, mean | 50M | 313.7 ms | 206.2 ms | 67.6 ms | **69.7 ms** | 2.96 |
-| (g2mean10k) group-by grid, 2 keys, 10,000 groups, mean | 50M | 250.8 ms | 174.8 ms | 62.1 ms | **55.8 ms** | 3.13 |
-| (g2mean1M) group-by grid, 2 keys, 1,000,000 groups, mean | 50M | 478.9 ms | 268.9 ms | 89.4 ms | **100.0 ms** | 2.69 |
-| (g2mean1k) group-by grid, 2 keys, 1,000 groups, mean | 50M | 257.0 ms | 62.4 ms | 56.0 ms | **50.4 ms** | 1.24 |
-| (g2minmax100k) group-by grid, 2 keys, 100,000 groups, min + max | 50M | 284.2 ms | 217.7 ms | 52.1 ms | **46.4 ms** | 4.69 |
-| (g2minmax10k) group-by grid, 2 keys, 10,000 groups, min + max | 50M | 260.7 ms | 169.5 ms | 48.3 ms | **41.2 ms** | 4.12 |
-| (g2minmax1M) group-by grid, 2 keys, 1,000,000 groups, min + max | 50M | 514.6 ms | 295.5 ms | 68.8 ms | **65.5 ms** | 4.51 |
-| (g2minmax1k) group-by grid, 2 keys, 1,000 groups, min + max | 50M | 269.8 ms | 66.9 ms | 50.2 ms | **31.9 ms** | 2.09 |
-| (g2minmax200) group-by grid, 2 keys, 200 groups, min + max | 50M | 67.4 ms | 97.6 ms | 43.0 ms | **32.9 ms** | 2.05 |
-| (g2sum100k) group-by grid, 2 keys, 100,000 groups, sum | 50M | 280.8 ms | 190.0 ms | 41.8 ms | **33.3 ms** | 5.70 |
-| (g2sum10k) group-by grid, 2 keys, 10,000 groups, sum | 50M | 237.8 ms | 191.5 ms | 45.7 ms | **32.7 ms** | 5.85 |
-| (g2sum1M) group-by grid, 2 keys, 1,000,000 groups, sum | 50M | 463.6 ms | 255.9 ms | 44.5 ms | **40.1 ms** | 6.39 |
-| (g2sum1k) group-by grid, 2 keys, 1,000 groups, sum | 50M | 244.4 ms | 53.8 ms | 37.3 ms | **29.4 ms** | 1.83 |
+| (e) inner join then sum (the join taken) | 2M | 7.6 ms | 5.0 ms | 1.8 ms | **1.8 ms** | 2.74 |
+| (m) sort 3 columns by an int64 key | 2M | 12.6 ms | 13.9 ms | 2.5 ms | **2.0 ms** | 6.40 |
+| (q) filter, then sort by (int32 asc, int64 desc) | 2M | 14.3 ms | 14.3 ms | 3.5 ms | **3.2 ms** | 4.54 |
+| (v2) group-by (region, sub), count | 2M | 6.1 ms | 4.8 ms | 2.6 ms | **2.7 ms** | 1.82 |
+| (w1) inner join, 1M-row build side | 2M | 7.3 ms | 5.1 ms | 3.2 ms | **1.6 ms** | 3.24 |
+| (w2) left join, 1M-row build side | 2M | 9.8 ms | 6.3 ms | 1.9 ms | **1.8 ms** | 3.46 |
+| (x2) sort by a nullable Float64 key, descending | 2M | 17.8 ms | 18.7 ms | 3.2 ms | **3.2 ms** | 5.63 |
+| (g2count100k) group-by grid, 2 keys, 100,000 groups, count | 2M | 6.7 ms | 5.9 ms | 3.0 ms | **3.8 ms** | 1.56 |
+| (g2count10k) group-by grid, 2 keys, 10,000 groups, count | 2M | 5.5 ms | 5.0 ms | 2.5 ms | **2.7 ms** | 1.88 |
+| (g2minmax100k) group-by grid, 2 keys, 100,000 groups, min + max | 2M | 7.9 ms | 6.4 ms | 4.2 ms | **2.4 ms** | 2.63 |
+| (g2minmax10k) group-by grid, 2 keys, 10,000 groups, min + max | 2M | 7.3 ms | 5.9 ms | 3.7 ms | **2.4 ms** | 2.49 |
+| (c) group-by (region, sub) mean + max | 50M | 198.1 ms | 104.7 ms | 31.8 ms | **32.0 ms** | 3.28 |
+| (e) inner join then sum (the join taken) | 50M | 21.1 ms | 15.5 ms | 5.9 ms | **5.9 ms** | 2.63 |
+| (i) group-by 1 key, 100,000 groups, sum | 50M | 88.0 ms | 46.6 ms | 14.4 ms | **14.8 ms** | 3.16 |
+| (k) group-by (String, int32), sum | 50M | 361.9 ms | 157.2 ms | 50.6 ms | **50.5 ms** | 3.11 |
+| (l) group-by (region, sub), Float64 sum + mean | 50M | 206.8 ms | 104.3 ms | 29.7 ms | **29.8 ms** | 3.50 |
+| (m) sort 3 columns by an int64 key | 50M | 380.5 ms | 451.2 ms | 53.6 ms | **53.0 ms** | 7.17 |
+| (o) sort with a String column, by an int64 key | 50M | 395.9 ms | 512.9 ms | 244.1 ms | **243.8 ms** | 1.62 |
+| (p) filter, then sort by (int32 asc, nullable Float64 desc) | 50M | 936.6 ms | 994.0 ms | 323.2 ms | **316.0 ms** | 2.96 |
+| (q) filter, then sort by (int32 asc, int64 desc) | 50M | 694.1 ms | 708.5 ms | 88.1 ms | **88.8 ms** | 7.82 |
+| (r) unique over (region, sub), keep first | 50M | 153.1 ms | 162.4 ms | 13.8 ms | **13.3 ms** | 11.54 |
+| (s4) Parquet scan, sort 2 columns by a float64 key, uncompressed | 50M | 576.2 ms | 574.9 ms | 73.9 ms | **74.4 ms** | 7.73 |
+| (s4) Parquet scan, sort 2 columns by a float64 key, snappy | 50M | 582.3 ms | 577.4 ms | 89.4 ms | **94.3 ms** | 6.12 |
+| (t4) group-by 1 key, 200 groups, min + max | 50M | 16.6 ms | 17.3 ms | 10.2 ms | **10.4 ms** | 1.59 |
+| (t5) group-by 1 key, 100,000 groups, count | 50M | 68.0 ms | 44.6 ms | 9.5 ms | **9.8 ms** | 4.53 |
+| (t6) group-by 1 key, 100,000 groups, mean | 50M | 95.9 ms | 53.2 ms | 23.6 ms | **23.5 ms** | 2.26 |
+| (t7) group-by 1 key, 100,000 groups, min + max | 50M | 119.8 ms | 61.0 ms | 16.3 ms | **16.6 ms** | 3.68 |
+| (v1) group-by (region, sub), sum | 50M | 178.9 ms | 107.5 ms | 16.8 ms | **16.3 ms** | 6.59 |
+| (v2) group-by (region, sub), count | 50M | 153.0 ms | 95.8 ms | 11.3 ms | **11.3 ms** | 8.50 |
+| (w1) inner join, 1M-row build side | 50M | 93.2 ms | 82.9 ms | 22.2 ms | **22.3 ms** | 3.71 |
+| (w2) left join, 1M-row build side | 50M | 269.3 ms | 98.9 ms | 25.3 ms | **25.2 ms** | 3.93 |
+| (w4) anti join, 1M-row build side | 50M | 80.8 ms | 63.8 ms | 25.1 ms | **24.7 ms** | 2.58 |
+| (x1) unique over (k1, k2), keep first | 50M | 755.7 ms | 453.2 ms | 240.1 ms | **240.3 ms** | 1.89 |
+| (x2) sort by a nullable Float64 key, descending | 50M | 553.0 ms | 598.1 ms | 96.4 ms | **97.0 ms** | 5.70 |
+| (y5) unique over (String, int32), keep first | 50M | 378.5 ms | 255.8 ms | 43.4 ms | **42.8 ms** | 5.98 |
+| (g1count100k) group-by grid, 1 key, 100,000 groups, count | 50M | 74.0 ms | 47.7 ms | 9.7 ms | **9.8 ms** | 4.85 |
+| (g1count10k) group-by grid, 1 key, 10,000 groups, count | 50M | 63.1 ms | 56.2 ms | 8.7 ms | **9.0 ms** | 6.25 |
+| (g1count1M) group-by grid, 1 key, 1,000,000 groups, count | 50M | 149.5 ms | 58.0 ms | 11.7 ms | **12.0 ms** | 4.85 |
+| (g1fsum100k) group-by grid, 1 key, 100,000 groups, Float64 sum | 50M | 97.0 ms | 55.9 ms | 20.0 ms | **19.9 ms** | 2.81 |
+| (g1fsum10k) group-by grid, 1 key, 10,000 groups, Float64 sum | 50M | 88.1 ms | 62.3 ms | 19.3 ms | **18.9 ms** | 3.29 |
+| (g1fsum1M) group-by grid, 1 key, 1,000,000 groups, Float64 sum | 50M | 177.3 ms | 65.5 ms | 26.9 ms | **26.7 ms** | 2.46 |
+| (g1mean100k) group-by grid, 1 key, 100,000 groups, mean | 50M | 102.3 ms | 55.2 ms | 24.1 ms | **24.0 ms** | 2.30 |
+| (g1mean10k) group-by grid, 1 key, 10,000 groups, mean | 50M | 89.3 ms | 63.9 ms | 22.9 ms | **22.7 ms** | 2.81 |
+| (g1mean1M) group-by grid, 1 key, 1,000,000 groups, mean | 50M | 178.3 ms | 68.4 ms | 31.3 ms | **31.3 ms** | 2.19 |
+| (g1minmax100k) group-by grid, 1 key, 100,000 groups, min + max | 50M | 118.0 ms | 68.3 ms | 16.7 ms | **16.9 ms** | 4.03 |
+| (g1minmax10k) group-by grid, 1 key, 10,000 groups, min + max | 50M | 109.4 ms | 73.6 ms | 15.8 ms | **15.7 ms** | 4.69 |
+| (g1minmax1M) group-by grid, 1 key, 1,000,000 groups, min + max | 50M | 196.3 ms | 77.9 ms | 19.0 ms | **19.9 ms** | 3.92 |
+| (g1minmax1k) group-by grid, 1 key, 1,000 groups, min + max | 50M | 101.1 ms | 18.6 ms | 11.2 ms | **11.1 ms** | 1.67 |
+| (g1minmax200) group-by grid, 1 key, 200 groups, min + max | 50M | 16.5 ms | 16.9 ms | 10.6 ms | **10.8 ms** | 1.52 |
+| (g1sum100k) group-by grid, 1 key, 100,000 groups, sum | 50M | 97.3 ms | 54.1 ms | 15.0 ms | **15.1 ms** | 3.58 |
+| (g1sum10k) group-by grid, 1 key, 10,000 groups, sum | 50M | 92.1 ms | 60.6 ms | 14.1 ms | **14.1 ms** | 4.31 |
+| (g1sum1M) group-by grid, 1 key, 1,000,000 groups, sum | 50M | 169.8 ms | 59.8 ms | 22.5 ms | **22.4 ms** | 2.67 |
+| (g2count100k) group-by grid, 2 keys, 100,000 groups, count | 50M | 166.9 ms | 113.9 ms | 12.2 ms | **12.5 ms** | 9.12 |
+| (g2count10k) group-by grid, 2 keys, 10,000 groups, count | 50M | 161.6 ms | 106.1 ms | 11.7 ms | **11.7 ms** | 9.08 |
+| (g2count1M) group-by grid, 2 keys, 1,000,000 groups, count | 50M | 355.4 ms | 164.9 ms | 14.1 ms | **14.8 ms** | 11.12 |
+| (g2count1k) group-by grid, 2 keys, 1,000 groups, count | 50M | 150.1 ms | 43.4 ms | 10.1 ms | **10.3 ms** | 4.23 |
+| (g2count200) group-by grid, 2 keys, 200 groups, count | 50M | 38.4 ms | 38.5 ms | 9.5 ms | **11.8 ms** | 3.26 |
+| (g2fsum100k) group-by grid, 2 keys, 100,000 groups, Float64 sum | 50M | 202.9 ms | 125.5 ms | 23.3 ms | **24.0 ms** | 5.23 |
+| (g2fsum10k) group-by grid, 2 keys, 10,000 groups, Float64 sum | 50M | 187.6 ms | 111.1 ms | 22.4 ms | **22.0 ms** | 5.05 |
+| (g2fsum1M) group-by grid, 2 keys, 1,000,000 groups, Float64 sum | 50M | 387.7 ms | 181.9 ms | 29.8 ms | **30.1 ms** | 6.04 |
+| (g2fsum1k) group-by grid, 2 keys, 1,000 groups, Float64 sum | 50M | 172.0 ms | 45.2 ms | 15.1 ms | **15.7 ms** | 2.89 |
+| (g2mean100k) group-by grid, 2 keys, 100,000 groups, mean | 50M | 193.6 ms | 134.9 ms | 27.1 ms | **26.8 ms** | 5.03 |
+| (g2mean10k) group-by grid, 2 keys, 10,000 groups, mean | 50M | 184.2 ms | 109.9 ms | 25.8 ms | **25.7 ms** | 4.28 |
+| (g2mean1M) group-by grid, 2 keys, 1,000,000 groups, mean | 50M | 387.2 ms | 188.4 ms | 34.2 ms | **34.9 ms** | 5.40 |
+| (g2mean1k) group-by grid, 2 keys, 1,000 groups, mean | 50M | 177.6 ms | 46.9 ms | 19.8 ms | **19.4 ms** | 2.42 |
+| (g2mean200) group-by grid, 2 keys, 200 groups, mean | 50M | 41.1 ms | 41.3 ms | 19.4 ms | **19.4 ms** | 2.12 |
+| (g2minmax100k) group-by grid, 2 keys, 100,000 groups, min + max | 50M | 216.7 ms | 138.5 ms | 20.0 ms | **19.9 ms** | 6.94 |
+| (g2minmax10k) group-by grid, 2 keys, 10,000 groups, min + max | 50M | 211.0 ms | 122.8 ms | 18.9 ms | **19.0 ms** | 6.46 |
+| (g2minmax1M) group-by grid, 2 keys, 1,000,000 groups, min + max | 50M | 405.5 ms | 216.7 ms | 22.0 ms | **22.1 ms** | 9.79 |
+| (g2minmax1k) group-by grid, 2 keys, 1,000 groups, min + max | 50M | 197.0 ms | 52.4 ms | 13.9 ms | **14.2 ms** | 3.70 |
+| (g2minmax200) group-by grid, 2 keys, 200 groups, min + max | 50M | 44.9 ms | 46.3 ms | 13.6 ms | **13.6 ms** | 3.31 |
+| (g2sum100k) group-by grid, 2 keys, 100,000 groups, sum | 50M | 196.0 ms | 126.7 ms | 18.3 ms | **18.0 ms** | 7.02 |
+| (g2sum10k) group-by grid, 2 keys, 10,000 groups, sum | 50M | 191.1 ms | 106.7 ms | 17.3 ms | **17.3 ms** | 6.18 |
+| (g2sum1M) group-by grid, 2 keys, 1,000,000 groups, sum | 50M | 378.8 ms | 176.2 ms | 26.3 ms | **26.2 ms** | 6.74 |
+| (g2sum1k) group-by grid, 2 keys, 1,000 groups, sum | 50M | 194.0 ms | 44.7 ms | 13.3 ms | **13.2 ms** | 3.38 |
 
-In the other 132 pairs the default took nothing and ran Polars' in-memory plan; there its time was
-0.39 to 2.92 times the `polars in-memory` row of the same case (`wall_ms` in
-`Benchmarks/results/polars_engine_bench_2026-09-26-final3.csv`), and 0.62 to 1.31 times in the 102 of
+In the other 145 pairs the default takes nothing and runs Polars' in-memory plan; there its time is
+0.40 to 1.42 times the `polars in-memory` row of the same case (`wall_ms` in
+`Benchmarks/results/polars_engine_bench_2026-10-02.csv`), and 0.86 to 1.18 times in the 112 of
 them where that row is 5 ms or more. That is the spread of two runs of the same Polars plan in this
-run, and the noise band the ratios above are read against. `shapes="all"` took a subtree and was
-ahead of the faster Polars engine in 34 of those 132 (`vs_fastest_polars` of `MetalEngine all, cold`), 14 of them above 1.31x, each left by the default
-because its class or bucket has a crossover above that size or none:
+run, and the noise band the ratios above are read against. `shapes="all"` takes a subtree and is
+ahead of the faster Polars engine in 64 of those 145 (`vs_fastest_polars` of `MetalEngine all, cold`),
+47 of them above 1.18x, each left by the default because its class or bucket has a crossover above
+that size or none:
 
-* at 2,000,000 rows: group-bys below the lowest bucket of their class, (g2minmax100k) 1.98x,
-  (g2minmax1M) 1.96x, (g2minmaxR2) 1.81x, (g2minmax10k) 1.70x and (c) 1.08x (`group_by_multi:minmax`
-  from 2,029,638), (l) 1.50x, (g2sum100k) 1.35x, (v1) 1.21x, (g2sum10k) 1.20x, (g2sum1M) 1.04x and
-  (g2sumR2) 1.04x (`group_by_multi:sum` from 2,288,101), (g1minmax10k) 1.57x, (g1minmax100k) 1.20x,
-  (t7) 1.18x and (g1minmax1M) 1.08x (`group_by:minmax` from 2,583,360), (g1count10k) 1.07x (from
-  3,123,562) and (g1mean10k) 1.02x (from 4,172,575); two-key counts over about 865,000 groups,
-  estimated above every bucket taken at that size, (g2count1M) 1.44x and (g2countR2) 1.35x; `unique`
-  (r) 1.57x (below 5,494,090); the String shapes (p) 1.31x and (y5) 1.07x (below the 5,000,000-row
-  floor) and (o) 1.21x (below 6,301,531);
-* at 50,000,000 rows: group-bys over 0.43 times as many groups as rows, estimated above every bucket
-  taken for their class, (g2countR2) 2.02x, (g2sumR2) 1.76x, (g2minmaxR2) 1.25x, (g2meanR2) 1.07x
-  and (g1countR2) 1.06x; group-bys in buckets not taken for their class, (g2sum200) 1.47x (200
-  groups), (g1mean1M) 1.20x (1,000,000 groups), (g1minmax1k) 1.16x and (g1count1k) 1.04x (1,000
-  groups); the semi join (w3) 1.68x (`join:semi` is not taken, (f)); over the
-  snappy Parquet file, the filter that skips row groups and group-by (s2) 1.14x (`group_by:sum` over a
-  file is not taken, (s1)).
+* at 2,000,000 rows: two-key min + max and count over about 1,000,000 groups, estimated above every
+  bucket taken for their class at that size, (g2minmaxR2) 3.07x, (g2minmax1M) 2.54x, (g2countR2)
+  1.68x and (g2count1M) 1.64x; group-bys below the lowest crossover of their class, (g2fsum100k)
+  2.47x, (g2sumR2) 1.80x, (g2fsumR2) 1.61x, (g2sum10k) 1.58x, (v1) 1.57x, (g2sum100k) 1.51x,
+  (g2fsum1M) 1.48x, (g2sum1M) 1.27x, (g2fsum1k) 1.26x and (g2fsum10k) 1.22x (`group_by_multi:sum`
+  from 2,288,101), (g2mean100k) 2.41x, (g2mean10k) 2.05x, (l) 2.00x, (c) 1.98x, (g2meanR2) 1.67x and
+  (g2mean1M) 1.65x (`group_by_multi:mean` from 7,500,000), (g1minmaxR2) 1.80x and (g1minmax1M) 1.56x
+  (`group_by:minmax` from 2,184,147), (g1fsum10k) 1.75x and (g1fsum100k) 1.35x (`group_by:sum` from
+  5,252,956), (g1mean10k) 1.57x and (t6) 1.31x (`group_by:mean` from 2,436,520) and (g1count10k)
+  1.35x (`group_by:count` from 3,123,562); `unique` (r) 2.07x and (x1) 1.24x (below 5,494,090); the
+  String shapes (p) 1.84x, (o) 1.39x and (y5) 1.31x (below the 5,000,000-row floor);
+* at 50,000,000 rows: group-bys estimated at 11,180,716 to 16,775,168 groups, above every bucket
+  taken for their class, (g2minmaxR2) 2.26x, (g2countR2) 2.11x, (g2sumR2) 1.59x, (g2fsumR2) 1.52x,
+  (g2meanR2) 1.51x, (v4) 1.45x and (g1minmaxR2) 1.34x; group-bys in buckets not taken for their
+  class, (g2sum200) 3.08x and (g2fsum200) 2.70x (two-key sum, 200 groups), (t2) 1.61x and
+  (g1count200) 1.58x (one-key count, 200 groups) and (g1count1k) 1.57x (1,000 groups); the semi join
+  (w3) 2.60x (`join:semi` is not taken, (f)); the top-k (n) 1.85x and (x3) 1.23x (`top_k` is not
+  taken, (x4)).
 
-**Sorts with one key per Polars key.** The benchmark above ran when a nulls-first nullable key and a
+The other 17 are 1.01x to 1.18x, inside the noise band.
+
+**Sorts with one key per Polars key.** The 2026-09-26 default benchmark
+(`Benchmarks/results/polars_engine_bench_2026-09-26-final3.csv`) ran when a nulls-first nullable key and a
 descending float key still carried an extra key column each. With Polars' order as options of the one
 key, the sort and top-k cases and four group-by controls were timed old against new, alternating, three
 rounds of best of 5 after a 100 ms warm-up (`Benchmarks/results/polars_engine_sort_options_2026-09-30.csv`,
@@ -1363,8 +1388,8 @@ per-shape table.
 ## Numbers
 
 These are tiers 1 and 2, and tier 4 over a Parquet file at the end; tier 4's measurements over
-in-memory frames are in `Benchmarks/results/polars_engine_bench_2026-09-26-final3.csv` and
-`Benchmarks/results/polars_engine_crossover_2026-09-26-final.csv` (see "Tier 4" above).
+in-memory frames are in `Benchmarks/results/polars_engine_bench_2026-10-02.csv` and
+`Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv` (see "Tier 4" above).
 
 Apple M4 Max, macOS 26.6.2, polars 1.44.1 (16 threads), pyarrow 25.0.1, ArrowMetal 0.1.0. Best of 5
 runs after a warm-up, one process, one data set. Every figure below is from

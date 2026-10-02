@@ -435,7 +435,11 @@ growing with size. The table in 0.3.0 is fitted from the final sweep, with three
 
 In the default benchmark on that table (`Benchmarks/results/polars_engine_bench_2026-09-26-final3.csv`,
 194 case-size pairs) the default took 62 pairs, 42 of them group-bys, every one ahead of the faster
-Polars engine, 1.21x to 9.42x.
+Polars engine, 1.21x to 9.42x. On the 0.4.0 table (fitted from
+`Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv`), in
+`Benchmarks/results/polars_engine_bench_2026-10-02.csv` (220 case-size pairs at 2,000,000 and
+50,000,000 rows), the default takes 75 pairs, 55 of them group-bys, every one ahead of the faster
+Polars engine, 1.52x to 11.54x, and every result is equal to Polars'.
 
 ## Round 13 (2026-09-26): a grid of 2^32 threads runs almost none of them
 
