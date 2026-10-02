@@ -2,9 +2,9 @@
 
 A physical optimizer rule for [Apache DataFusion](https://datafusion.apache.org) 55.1 that runs full
 `ORDER BY` sorts on Apple silicon GPUs through ArrowMetal, with DataFusion's answers. The default
-also takes the aggregate shapes a measured table takes (`count(*)` over two int32 keys of a
-`MemTable` of at least 10,000,000 rows; `DISTINCT` over two int32 keys, and `MIN`/`MAX` of an
-integer column over two integer keys or one int64 key, of one of at least 50,000,000 rows): such an
+also takes the aggregate shapes a measured table takes (`count(*)` and `DISTINCT` over two int32
+keys, and `MIN`/`MAX` of an integer column over two integer keys or one int64 key, of a `MemTable`
+of at least 50,000,000 rows): such an
 aggregate estimates its number of groups
 when it runs and runs on the GPU or hands the node back to DataFusion's own operators. Hash joins
 (inner, left, right on int32, int64 or Utf8 keys) are translated and decided by a measured join

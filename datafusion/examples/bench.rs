@@ -59,7 +59,8 @@
 //!   `--join-keys i64,i32,str`: the key types of the join family's cases.
 //! * `--families gsweep`: the aggregate sweep. One block per group count (200, 10k, 100k, 1M,
 //!   rows/2 in the key domain); per block, count / sum / avg / min+max over a Float64 and an int64
-//!   value column, and DISTINCT, each over one key and over two keys, int32 and int64 keys.
+//!   value column, min+max over a Float32 value column (`minmax_f32`), and DISTINCT, each over one
+//!   key and over two keys, int32 and int64 keys.
 //!   `out_rows` is the group count the data holds.
 
 use std::collections::BTreeMap;
@@ -441,10 +442,12 @@ fn data_grid(rng: &mut StdRng, n: usize, g: usize) -> RecordBatch {
 }
 
 /// The aggregate sweep's table: `data_grid`'s int32 keys, the same keys as int64 (`kl`, `kl1`,
-/// `kl2`), a Float64 value `x` [0, 1) and an int64 value `q` [0, 1e9).
+/// `kl2`), a Float64 value `x` [0, 1), an int64 value `q` [0, 1e9) and a Float32 value `y` [0, 1)
+/// (drawn last, so the other columns keep the values of the files without it).
 fn data_sweep(rng: &mut StdRng, n: usize, g: usize) -> RecordBatch {
     let t = data_grid(rng, n, g);
     let q = i64s(rng, n, 1_000_000_000);
+    let y: ArrayRef = Arc::new(Float32Array::from_iter_values((0..n).map(|_| rng.random::<f32>())));
     let wide = |i: usize| cast(t.column(i), &DataType::Int64).unwrap();
     batch(vec![
         ("k", Arc::clone(t.column(0))),
@@ -455,6 +458,7 @@ fn data_sweep(rng: &mut StdRng, n: usize, g: usize) -> RecordBatch {
         ("kl2", wide(2)),
         ("x", Arc::clone(t.column(3))),
         ("q", q),
+        ("y", y),
     ])
 }
 
@@ -468,6 +472,7 @@ fn sweep_cases(gn: &str) -> Vec<Case> {
                 ("sum_f64", Some("sum(x) AS s")),
                 ("avg_f64", Some("avg(x) AS m")),
                 ("minmax_f64", Some("min(x) AS lo, max(x) AS hi")),
+                ("minmax_f32", Some("min(y) AS lo, max(y) AS hi")),
                 ("sum_int", Some("sum(q) AS s")),
                 ("avg_int", Some("avg(q) AS m")),
                 ("minmax_int", Some("min(q) AS lo, max(q) AS hi")),

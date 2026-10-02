@@ -3,7 +3,7 @@
 
 The sweep is `examples/bench.rs --families gsweep --contexts off,on,...`: every aggregate family
 (count; sum and avg over int64; sum and avg over Float64; min + max over int64; min + max over
-Float64; DISTINCT) over one and two keys, int32 and int64 keys, at five group counts in the key
+Float64 and over Float32, one family as in the rule's shape; DISTINCT) over one and two keys, int32 and int64 keys, at five group counts in the key
 domain (200, 10k, 100k, 1M, rows/2), per input size and batch layout; DataFusion alone (`off`)
 against the rule with every replaced aggregate forced onto ArrowMetal (`on`), both warm, best of 5.
 
@@ -29,6 +29,8 @@ replaces an earlier one's for the same size, layout and case) then raise the thr
 Each constraint reads, per size, layout and case, the latest row in which the default took that path
 (ran it on ArrowMetal, or handed it back), whatever a later file decided. The check rows are the
 sweep's cases and the cases in EXTRA (queries outside the sweep with a shape the table decides).
+A check file with a `crate` column (the crate before a change timed against the current one)
+contributes its `new` rows only.
 
 * First run after idle, idle against idle, at every gap of IDLE_GAPS_MS: a series (family, keys,
   key class, input, bucket) is taken at a size only if, at that size and every larger measured size,
@@ -78,6 +80,8 @@ FAMILY = {
     "sum_f64": "sum_avg_f64",
     "avg_f64": "sum_avg_f64",
     "minmax_f64": "minmax_f64",
+    # The rule's shape puts min/max over Float32 in the same family as over Float64.
+    "minmax_f32": "minmax_f64",
     "sum_int": "sum_avg_int",
     "avg_int": "sum_avg_int",
     "minmax_int": "minmax_int",
@@ -145,14 +149,20 @@ def read_checks(paths, kind=None):
     measurement of that path for each size, layout and case, whatever later files decided."""
     merged = {}
     for path in paths:
-        with open(path) as fh:
-            for r in csv.DictReader(fh):
-                if shape_of(r) is None:
-                    continue
-                if kind is not None and state(r) != kind:
-                    continue
-                merged[(r["size"], r["layout"], r["case"])] = r
+        for r in check_rows(path):
+            if shape_of(r) is None:
+                continue
+            if kind is not None and state(r) != kind:
+                continue
+            merged[(r["size"], r["layout"], r["case"])] = r
     return list(merged.values())
+
+
+def check_rows(path):
+    """The rows of a check file. A file that times the crate before a change against the current
+    one (a `crate` column) contributes the current crate's rows (`new`) only."""
+    with open(path) as fh:
+        return [r for r in csv.DictReader(fh) if r.get("crate") in (None, "", "new")]
 
 
 def state(r):
@@ -186,13 +196,12 @@ def idle_times(paths):
     from the rows in which the default ran on ArrowMetal (files in order, both gap column sets)."""
     out = {}
     for path in paths:
-        with open(path) as fh:
-            for r in csv.DictReader(fh):
-                if shape_of(r) is None or state(r) != "gpu":
-                    continue
-                for g, o, d in (("idle_gap_ms", "off_idle_ms", "def_idle_ms"), ("idle_gap2_ms", "off_idle2_ms", "def_idle2_ms")):
-                    if r.get(g) and r.get(o) and r.get(d):
-                        out[(r["size"], r["layout"], r["case"], int(r[g]))] = (float(r[o]), float(r[d]))
+        for r in check_rows(path):
+            if shape_of(r) is None or state(r) != "gpu":
+                continue
+            for g, o, d in (("idle_gap_ms", "off_idle_ms", "def_idle_ms"), ("idle_gap2_ms", "off_idle2_ms", "def_idle2_ms")):
+                if r.get(g) and r.get(o) and r.get(d):
+                    out[(r["size"], r["layout"], r["case"], int(r[g]))] = (float(r[o]), float(r[d]))
     return out
 
 

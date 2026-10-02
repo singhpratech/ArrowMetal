@@ -249,12 +249,20 @@
   `datafusion/results/`) takes its shape at the input's row count; when it runs, it estimates its
   number of groups from a sample of the keys and runs on the GPU where the table takes that number,
   handing the node back to DataFusion's own operators otherwise. The table takes ten series of three
-  shapes over integer keys of a `MemTable`: `count(*)` over two int32 keys at 31,623 to 3,162,277
-  groups from 10,000,000 rows; `DISTINCT` over two int32 keys at 1 to 1,414 and at 31,623 to
-  3,162,277 groups from 50,000,000 rows; `MIN`/`MAX` of an integer column over two int32 keys or two
-  keys with an int64 at 31,623 to 3,162,277 groups, and over one int64 key at 316,228 to 3,162,277
-  groups, from 50,000,000 rows (after the grouped min/max was rebuilt; the Float64 `sum`/`avg` and
-  both `MIN`/`MAX` families were swept again for it, `datafusion/results/datafusion_groupby_sweep_2026-09-30.csv`).
+  shapes over integer keys of a `MemTable` of at least 50,000,000 rows: `count(*)` over two int32
+  keys at 31,623 to 3,162,277 groups; `DISTINCT` over two int32 keys at 1 to 1,414 and at 31,623 to
+  3,162,277 groups; `MIN`/`MAX` of an integer column over two int32 keys or two keys with an int64 at
+  31,623 to 3,162,277 groups, and over one int64 key at 316,228 to 3,162,277 groups
+  (`datafusion/results/datafusion_groupby_sweep_2026-10-01.csv`: the float `MIN`/`MAX` family,
+  Float64 and Float32, swept again after it moved to the plan runner's own min/max; the Float64
+  `sum`/`avg` and integer `MIN`/`MAX` families from the 2026-09-30 sweep). `count(*)` over two int32
+  keys is taken from 50M rows: at 10M its first run after 5 s of idle was 0.81x and 0.88x of
+  DataFusion alone's first run after the same idle on two of its four cases
+  (`datafusion/results/datafusion_groupby_default_import_2026-10-01.csv`). No float `MIN`/`MAX`
+  series is taken: four are at least 1.65x faster warm from 5M or 10M rows, and at 50M rows two have
+  a first run after 5 s of idle below DataFusion alone's (0.98x and 0.96x, Float32) and two a
+  hand-back of the shape below 0.97x on the median run (0.952x and 0.951x;
+  `datafusion/results/datafusion_groupby_float_minmax_check_2026-10-01.csv`).
   A series is taken where the GPU was at least 1.65x faster warm in its worst case, its first run
   after 500 ms and after 5 s of idle each at least as fast as DataFusion alone's first run after the
   same idle, and every hand-back of its shape at 0.97x or better. Top-k and filters are translated too and switched off by default. Hash joins (inner, left and right on
@@ -300,7 +308,7 @@
     (`datafusion/results/datafusion_filter_2026-10-01.csv`).
   - `examples/bench.rs` waits while any `BUILDING*` or `TIMING` file exists, creates `TIMING` with
     its own `<BENCH_LANE> <pid>` tag only if absent, and removes only a `TIMING` file holding that
-    tag.
+    tag. The aggregate sweep (`--families gsweep`) also times `min`/`max` over a Float32 column.
   - Measured on an M4 Max, DataFusion's defaults (16 partitions), with a warm-up before timing,
     best of 5 (`datafusion/results/datafusion_sort_warm_2026-09-29.csv`): full sorts by an int64,
     Float64, Float32 or string key are 6.9x to 28.8x faster than DataFusion alone from 250,000 to
@@ -308,28 +316,26 @@
     reader, 10.8x to 16.5x at 10M and 50M rows (`datafusion/results/datafusion_rule_2026-09-29.csv`).
     A sort over a Parquet file with a string column (read as Utf8View): 3.6x to 5.5x at 1M to 50M
     rows (`datafusion/results/datafusion_parquet_string_sort_2026-09-29.csv`). The aggregates the
-    default runs on the GPU (`datafusion/results/datafusion_groupby_idle_gaps_2026-09-29.csv`, 14
-    cases at 10M and 50M rows, both table layouts) are 2.14x to 4.11x faster than DataFusion alone
-    warm (`count(*)`, 1,000,000 groups, 50M rows: 74.10 → 19.33 ms, 1,112 → 52 CPU-ms); on the first
-    run after idle, 1.34x to 2.08x faster than DataFusion alone's first run after the same 500 ms and
-    1.08x to 1.72x after the same 5 s, and 0.67x to 1.60x (500 ms) and 0.53x to 1.23x (5 s) of
-    DataFusion alone's warm time. Measured twice, the same case's 500 ms idle-against-idle ratio
-    differed by 0.65x to 1.80x. The same shapes handed back at run time are at 0.977x to 1.030x of DataFusion
-    alone on the best run and 0.971x to 1.081x on the median. The `MIN`/`MAX` series at 50M rows
-    (`datafusion/results/datafusion_groupby_resweep_recheck_2026-10-01.csv`, 10 cases): 2.64x to
-    3.60x warm (two int32 keys, 1,000,000 groups: 95.09 → 26.45 ms, 1,428 → 78 CPU-ms), 1.20x to
-    2.03x idle against idle after 500 ms and 1.16x to 1.56x after 5 s; their shapes handed back at
-    0.983x to 1.009x best and 0.971x to 1.049x median. The first GPU
+    default runs on the GPU (20 cases at 50M rows, both table layouts, the latest measurement of each:
+    `datafusion/results/datafusion_groupby_default_import_2026-10-01.csv` and
+    `datafusion/results/datafusion_groupby_refit_check_2026-10-02.csv`) are 2.31x to 4.27x faster
+    than DataFusion alone warm (`count(*)`, 1,000,000 groups, one batch per partition: 75.36 → 17.63
+    ms, 1,128 → 62 CPU-ms); on the first run after idle, 1.24x to 2.17x faster than DataFusion alone's
+    first run after the same 500 ms and 1.11x to 1.68x after the same 5 s, and 0.89x to 1.78x
+    (500 ms) and 0.69x to 1.35x (5 s) of DataFusion alone's warm time. Measured twice, the same case's 500 ms idle-against-idle ratio
+    differed by 0.65x to 1.80x. The same shapes handed back at run time are at 0.980x to 1.030x of DataFusion
+    alone on the best run and 0.971x to 1.081x on the median. The first GPU
     query of a process compiles its Metal pipelines, 42 to 66 ms at 10M rows
     (`datafusion/results/datafusion_coldstart_2026-09-29.csv`). With the rule switched on for them
     (DataFusion alone ÷ with the rule): top-k 0.14x to 0.41x from 250,000 to 50M rows, filters 0.51x
-    to 0.74x, Float64 `sum`/`avg` 0.21x to 2.81x and Float64 `min`/`max` 0.11x to 1.31x (with the per-group helper counts above) at 1M to 50M
-    rows, and about rows / 2 groups 0.30x to 1.11x at 50M rows; of the 34 aggregate series at least
-    1.65x faster warm at two sizes, 21 are left by their first run after idle at 50M rows (5 at 0.80x
-    to 0.94x of DataFusion alone's first run after the same idle, 16 not measured after 5 s of idle
-    there) and 3 by a hand-back of the same shape at 50M rows below 0.97x on the best or the median
-    run (`MIN`/`MAX` over one int32 key, Float64 `sum`/`avg` over two int32 keys and over two keys
-    with an int64; lowest 0.925x).
+    to 0.74x, Float64 `sum`/`avg` 0.21x to 2.81x, Float64 `min`/`max` 0.33x to 3.41x and Float32
+    `min`/`max` 0.29x to 2.63x at 1M to 50M rows, and about rows / 2 groups 0.44x to 1.11x at 50M
+    rows; of the 38 aggregate series at least 1.65x faster warm at two sizes, 23 are left by their
+    first run after idle at 50M rows (7 at 0.80x to 0.98x of DataFusion alone's first run after the
+    same idle, 16 not measured after 5 s of idle there) and 5 by a hand-back of the same shape at 50M
+    rows below 0.97x on the best or the median run (integer `MIN`/`MAX` over one int32 key, Float64
+    `sum`/`avg` over two int32 keys and over two keys with an int64, float `MIN`/`MAX` over one int64
+    key and over two int32 keys; lowest 0.925x).
 
 - Go, Node and R: the per-key sort options and the chunked import.
   - Go (`go/arrowmetal`): `SortOptions{Descending, Nulls, FloatOrder}` (`NullsLast` / `NullsFirst`,
