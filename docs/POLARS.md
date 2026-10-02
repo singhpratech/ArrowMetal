@@ -584,11 +584,15 @@ against Polars itself.
   by at most twice the rounding bound of a sum, 2(n - 1) u sum(|x|) for a sum of n values and
   2 u sum(|x|) for a mean (u the unit roundoff of the type the sum accumulates in: 2^-24 for a
   Float32 sum, 2^-53 otherwise), and the engine conformance grid holds each such case to that bound.
-  In the run recorded in `Benchmarks/results/engine_conformance_2026-09-25.csv` the largest difference
-  was 0.216 u sum(|x|) for a Float32 sum (2.81e-5 of the answer) and 0.372 u sum(|x|) for a
-  Float64 sum or mean (8.96e-14 of the answer). A `mean` of an integer or Float32 column is
-  accumulated in Float64 by both (the engine casts the column, as Polars does) and matched bit for
-  bit; every other output of the grid is compared bit for bit. `test_polars_engine.py` compares these
+  In the run recorded in `Benchmarks/results/engine_conformance_2026-10-02_report.txt` (totals in
+  `engine_conformance_2026-10-02.csv`) the largest difference was 0.199 u sum(|x|) for a Float32 sum
+  (3.55e-5 of the answer), 0.372 u sum(|x|) for a Float64 sum (2.00e-14 of the answer) and
+  0.0033 u sum(|x|) for a Float64 mean (7.05e-14 of the answer). A `mean` of an integer or Float32
+  column is computed in Float64 by both (the engine casts the column, as Polars does); in that run
+  it matched bit for bit in every case but one int64 group mean over the integer extremes (1,000
+  rows), where the engine returns the correctly rounded mean of the cast values and the two differ
+  by 8.76e-8 u sum(|x|), as much as the answer itself. Every other output of the grid is compared
+  bit for bit. `test_polars_engine.py` compares these
   aggregates to a relative tolerance.
 * **Sort order.** Polars (1.44 and the 2.0 release candidate alike, pinned by
   `test_polars_sort_order.py`) places the nulls per key, first unless `nulls_last`, in either
@@ -698,19 +702,21 @@ the default uses as `rows`:
 * **The margin** (`MARGIN`). A case is ahead at a size when its MetalEngine time, raised by a margin,
   is at most the faster Polars engine's time: 15% for a numeric shape, 35% for a shape with a String
   column. A String shape's advantage grows slowly with size: the String sort (o) is 0.98x the faster
-  Polars engine at 1,000,000 rows in the 2026-09-26 sweep, 1.2x at 2,000,000, 1.37x at 5,000,000 and 1.5x at
+  Polars engine at 1,000,000 rows in the 2026-09-26 sweep (`Benchmarks/results/polars_engine_crossover_2026-09-26-final.csv`,
+  `vs_fastest_polars`), 1.2x at 2,000,000, 1.37x at 5,000,000 and 1.5x at
   10,000,000, so a fit at 15% would land where the two engines are within noise of each other.
 * **The String floor** (`STRING_FLOOR`). A shape with a String column is taken from 5,000,000 rows
   at the earliest, whatever its fit says. Below that the String sorts are close to Polars: (o) 1.2x
   and (p) 1.38x at 2,000,000 rows in the 2026-09-26 sweep, and 1.21x and 1.31x under `shapes="all"` at that size
-  in the benchmark below, inside its noise band (0.62x to 1.31x); from 5,000,000 rows that sweep has
-  them at 1.37x and up.
+  in the benchmark below (`Benchmarks/results/polars_engine_bench_2026-09-26-final3.csv`, cold), inside its noise band
+  (0.62x to 1.31x); from 5,000,000 rows that sweep has them at 1.37x and up.
 * **The headroom** (`HEADROOM`). The default takes a shape from 1.5 times its fit (a String shape
   from the larger of that and the floor), and a shape whose 1.5 times passes the largest size
   measured is not taken. The fit interpolates between sizes measured 2 to 2.5 times apart
   (250,000, 500,000, 1,000,000, 2,000,000, 5,000,000 and so on), and shapes just past their
   crossover were within run-to-run noise of Polars: two runs of the same Polars plan in the
-  benchmark below differ by 0.62x to 1.31x.
+  benchmark below differ by 0.62x to 1.31x (`MetalEngine default, cold` where it took nothing, against
+  `polars in-memory`, rows of 5 ms or more in `Benchmarks/results/polars_engine_bench_2026-09-26-final3.csv`).
 * **The default benchmark** (`BENCH_RATIO`, `BENCH`). The sweep times each case back to back; the
   default is also held to `Benchmarks/polars_engine_bench.py --idle` (a 100 ms warm-up, a first run
   after 500 ms of idle on its own, another warm-up, then best of 5 and their median), over the files
@@ -733,7 +739,8 @@ measures no class. The fitted table is `python/arrowmetal/_engine_crossovers.py`
 takes the larger of that crossover and the kernels' own: the router table in force
 (`am.router_table()`, [CROSSOVER.md](CROSSOVER.md)) for the kernels it routes, and for the sort
 classes the crossover of `argsort int64`, `argsort float64` and `lexsort (2 int32 keys)` against the
-fastest CPU library in `Benchmarks/results/router_2026-09-24.json`, 1,000,000 rows.
+fastest CPU library in `Benchmarks/results/router_2026-09-24.json`, 1,000,000 rows. The fits below are
+from `Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv`.
 
 | class | dtype | input | rows the default uses | the fit it came from | cases (their fit) |
 |---|---|---|---:|---|---|
@@ -763,7 +770,8 @@ measurement and is not taken. `arrowmetal.polars_engine.placement_rules()` retur
 table in force, and `group_placement_rules()` the group-count buckets below.
 
 **Group-bys: the number of groups.** Where the GPU group-by is ahead depends on the number of groups
-more than on the rows. In the sweep the one-key sum over 200 groups is behind at every size ((t1) at
+more than on the rows. In the sweep (`Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv`,
+`vs_fastest_polars` of `MetalEngine all, cold`) the one-key sum over 200 groups is behind at every size ((t1) at
 best 0.58x, (g1sum200) 0.51x); over 10,000, 100,000 and 1,000,000 groups it is ahead at 50,000,000
 rows by 2.65x, 2.97x and 2.74x ((g1sum10k), (g1sum100k), (g1sum1M)); over about 0.43 times as many
 groups as rows it is at 1.02x there ((g1sumR2)), inside the margin. So a group-by class is judged at
@@ -802,14 +810,16 @@ start. The rows the default uses, with the fit each came from in brackets (the r
 | `group_by:sum`, String column | | not taken | | | | |
 | `group_by:sum`, `group_by:count`, Parquet | | not taken | | | | |
 
-An empty cell has no measurement and is not taken. \* Raised by the default benchmark (`BENCH_RATIO`):
-at 2,000,000 rows the default took (c) (a mean and a max over two keys, 10,000 groups) at 0.82x of
+An empty cell has no measurement and is not taken. \* Raised by the default benchmark (`BENCH_RATIO`;
+`Benchmarks/results/polars_engine_default_groupby_raw_2026-09-30.csv`, the faster Polars engine ÷ the default over
+every run in which the default took the case): at 2,000,000 rows the default took (c) (a mean and a max over two keys, 10,000 groups) at 0.82x of
 the faster Polars engine on the best run and 0.75x on the median, (g2mean10k) at 0.87x and 0.75x
 and (g2mean100k) at 0.65x and 0.57x (both tables' runs where the default took them), all ahead at
 50,000,000 rows, so the two-key mean's 10,000 and 100,000 buckets are taken from 50,000,000 rows.
 (c)'s min + max class keeps its 10,000 bucket: (g2minmax10k), its one-class case there, was 1.18x and
 1.09x. **The rows/2 bucket is never taken**
-(`UNTAKEN_BUCKETS`), whatever its fit, because the sweep is not monotone there: the one-key count over
+(`UNTAKEN_BUCKETS`), whatever its fit, because the sweep (`Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv`) is not
+monotone there: the one-key count over
 0.43 times as many groups as rows, (g1countR2), is 0.78x, 1.9x, 4.04x, 2.21x and 1.18x the faster
 Polars engine at 2,000,000, 5,000,000, 10,000,000, 20,000,000 and 50,000,000 rows, and the two-key
 rows/2 cases peak at 10,000,000 rows the same way ((g2countR2) 6.47x there, 2.38x at 50,000,000).
@@ -867,13 +877,14 @@ That file was measured under the earlier group-count table. Under the table in f
 group-by at 2,000,000 rows is probed only for the two-key count and min/max, the classes with a
 bucket taken at that size; a one-key, String or two-key sum group-by there is not probed,
 and neither is a String group-by at 50,000,000 (only the (String, int32) sum has buckets). In the
-default benchmark below, where the probe runs in a process that holds every case's frames, its median
+default benchmark below, where the probe runs in a process that holds every case's frames
+(`probe_us` in `Benchmarks/results/polars_engine_bench_2026-09-26-final3.csv`, the probes of one collect summed), its median
 is 99 µs at 2,000,000 rows (2.21% of the default's time for the case; 3 of the 14 probes under 1%)
 and 144 µs at 50,000,000 (0.53%; 54 of 65 under 1%). The eight probes over 5 ms, 5.2 to 13.5 ms, are
 all at 50,000,000 rows on frames with 0.43 times as many groups as rows or more ((g1minmaxR2) 5.2 ms,
 0.93% of the default's time; (g2minmaxR2) 13.5 ms, 1.65%), and its largest share is 11.43% at
 2,000,000 rows ((g2count100k), 461 µs of 4.0 ms). A second collect of the same frame reads its
-samples from the cache. Sampled until its denominator settles instead of until the decision does (`free_estimate` in the results file), the
+samples from the cache. Sampled until its denominator settles instead of until the decision does (`free_estimate` in `Benchmarks/results/group_probe_2026-09-26.csv`), the
 estimate falls in the bucket of the true count for every frame and key set of the grid at both sizes,
 within 29% of it up to 1,000,000 groups at 50,000,000 rows, and 24% to 31% above it at half the rows.
 
@@ -888,6 +899,9 @@ names it:
   polars: GroupBy#1: rule: estimated 191 groups over (region), a Chao1 estimate from a 512-row sample, 189 to 196: below the measured band for group_by:sum at 50,000,000 input rows (taken at 3,163 to 3,162,277 groups; no count in the estimate's range is; ...)
   groups: GroupBy#1 over (region): 191 groups, a Chao1 estimate from a 512-row sample, 189 to 196 (probed in 76 us)
 ```
+
+The other classes in the sweep (`Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv`, `vs_fastest_polars`
+of `MetalEngine all, cold`):
 
 * **Joins and `unique`** on numeric keys: the left join is ahead from the smallest input measured,
   1,250,000 rows, and taken from 1,875,000; the inner join is fitted at 1,353,218 and taken from
@@ -993,10 +1007,11 @@ Polars engine, from 1.21x ((t6) at 50M) to 9.42x ((g2count1M) at 50M):
 | (g2sum1k) group-by grid, 2 keys, 1,000 groups, sum | 50M | 244.4 ms | 53.8 ms | 37.3 ms | **29.4 ms** | 1.83 |
 
 In the other 132 pairs the default took nothing and ran Polars' in-memory plan; there its time was
-0.39 to 2.92 times the `polars in-memory` row of the same case, and 0.62 to 1.31 times in the 102 of
+0.39 to 2.92 times the `polars in-memory` row of the same case (`wall_ms` in
+`Benchmarks/results/polars_engine_bench_2026-09-26-final3.csv`), and 0.62 to 1.31 times in the 102 of
 them where that row is 5 ms or more. That is the spread of two runs of the same Polars plan in this
 run, and the noise band the ratios above are read against. `shapes="all"` took a subtree and was
-ahead of the faster Polars engine in 34 of those 132, 14 of them above 1.31x, each left by the default
+ahead of the faster Polars engine in 34 of those 132 (`vs_fastest_polars` of `MetalEngine all, cold`), 14 of them above 1.31x, each left by the default
 because its class or bucket has a crossover above that size or none:
 
 * at 2,000,000 rows: group-bys below the lowest bucket of their class, (g2minmax100k) 1.98x,
@@ -1034,7 +1049,8 @@ run conditions in `…_conditions.txt`); best and median of the rounds, in ms:
 | (p) filter, then sort by (int32 asc, nullable Float64 desc) | 50M | `MetalEngine()`, cold | 350.54 / 351.84 | **317.39 / 317.96** | 374.03 → 344.01 |
 | (p) filter, then sort by (int32 asc, nullable Float64 desc) | 2M | `shapes="all"`, cold | 25.82 / 26.77 | **16.01 / 16.46** | 43.11 → 36.91 |
 
-The faster Polars engine in the same runs (best of the rounds of the new build): (x4) 9.75 ms at 50M
+The faster Polars engine in the same runs (best of the rounds of the new build, `new_best_ms` of the
+Polars rows): (x4) 9.75 ms at 50M
 and 1.21 ms at 2M (streaming), (n) 18.43 ms and 2.23 ms (streaming), (x2) 542.42 ms and 17.54 ms,
 (p) 978.94 ms and 22.02 ms (in-memory).
 The top-k cases are still left to Polars by the default (`top_k` has no crossover, above), so its rows
@@ -1042,7 +1058,8 @@ for them are Polars' in either build. The sorts whose keys carry no option ((m),
 (s4)), the top-k by an int64 key (x3), (y6), (b) and the group-by controls (c), (i), (j), (t1) are
 unchanged: every row that was more than 5% slower in both best and median over the three rounds, all
 of them on paths this change does not touch, was timed again alone over eight alternating rounds of
-100 runs, where before ÷ after is 0.95 to 1.25 in best and 0.96 to 1.22 in median. No row's median
+100 runs (the rows `flagged row re-timed alone` in the same file), where before ÷ after is 0.95 to
+1.25 in best and 0.96 to 1.22 in median. No row's median
 process CPU time rose by more than 1.5x.
 
 **Group-bys after the grouped Float64 sum, mean and min/max were rebuilt.** The 75 group-by cases
@@ -1069,7 +1086,8 @@ earlier table's default ran Polars' in-memory plan there):
 | (t4) group-by 1 key, 200 groups, min + max | 50M | 15.61 | 15.87 | **12.02** | 1.30x / 1.13x | 26.90 |
 | (g1minmax1k) group-by grid, 1 key, 1,000 groups, min + max | 50M | 16.05 | 97.29 | **12.94** | 1.24x / 1.01x | 34.00 |
 
-Every other pair it took was ahead of the faster Polars engine on the best run and on the median: at
+Every other pair it took was ahead of the faster Polars engine on the best run and on the median
+(`new_vs_fastest_polars_best` and `_median` in the same file): at
 50,000,000 rows from 1.24x ((g1minmax1k)) to 10.69x ((g2count1M)), at 2,000,000 rows from 1.12x to
 1.63x ((g2count10k)). Taken and behind at 2,000,000 rows were the two-key means (c) at 0.82x,
 (g2mean100k) at 0.65x and (g2mean10k), which the earlier table took as well, at 0.87x (5.83 against
@@ -1092,19 +1110,20 @@ of 5.49, 4.98, 5.61 and 5.44 ms:
 | (g2minmax10k) | taken: 4.63 / 4.83 (1.17x / 1.17x) | taken: 4.04 / 4.35 (1.34x / 1.30x) |
 
 Left to Polars, `MetalEngine()` runs Polars' in-memory plan, which uses the CPU cores (77 to 90 CPU-ms
-against 4 to 6 on the GPU path for these three). In this benchmark each engine's timed runs follow Polars' runs
+against 4 to 6 on the GPU path for these three, `new_cpu_ms` and `old_cpu_ms` in the retime file). In this benchmark each engine's timed runs follow Polars' runs
 of the same case and a 500 ms idle gap, and these three take 4.75 to 9.79 ms (best of 5) under
-`shapes="all"`, cold or warm, as well; run back to back, 15 runs of each way of collecting in turn, three
+`shapes="all"`, cold or warm, as well (the `reported` rounds of `…_raw_2026-09-30.csv`); run back to back, 15 runs of each way of collecting in turn, three
 rounds and no idle gap (`Benchmarks/results/polars_engine_groupby_backtoback_2026-10-01.csv`), the
 default runs them in 2.89 ms (c), 2.41 ms (g2mean10k) and 3.03 ms (g2mean100k) against Polars'
 streaming engine's 5.48, 5.09 and 5.74 ms, which is where the crossover sweep, measured the same
-back-to-back way, put them (2.09x, 2.19x and 2.34x at 2,000,000 rows). In the 150-pair benchmark the
+back-to-back way, put them (2.09x, 2.19x and 2.34x at 2,000,000 rows in
+`Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv`). In the 150-pair benchmark the
 pairs whose decision did not change ran the same plan under both tables; the rows of those that were
 more than 5% slower in best and median under one table than the other ((g1count10k) and (g1count1M)
 at 50,000,000 rows, taken by both; (g2count100k) at 2,000,000, taken by both; (g1minmax100k) and (t4)
 at 2,000,000, Polars' plan under both) differ between the two runs of one plan.
 
-**Float64 group sums and means at 2^24 groups.** The (v3) case of the crossover sweep, a mean over two keys with about as many groups as rows, found ArrowMetal's group-by returning null for most groups at 16,777,216 groups and above (16,777,215 were right): the per-group kernels dispatched one threadgroup per group and the grid wrapped past 2^32 threads. Fixed in the core ([FINDINGS.md](FINDINGS.md), round 13; `python/tests/test_group_by_2_24.py`), so no engine rule is needed and every group-by shape follows the policy above. The sweep and the benchmark above ran with the fix: under `shapes="all"` the cases the guard once kept with Polars, `(c)`, `(l)`, `(t3)`, `(t6)`, `(v3)` and the Parquet cases `(s1)` and `(s2)`, run on Metal and equal Polars' answers. At 50M rows, under `shapes="all"`, `(c)` is 1.78, `(l)` 2.03 and `(t6)` 1.21 times the faster Polars engine; `(t3)` is behind at 35.5 ms against 12.4 and `(v3)` at 612.0 ms against 421.7.
+**Float64 group sums and means at 2^24 groups.** The (v3) case of the crossover sweep, a mean over two keys with about as many groups as rows, found ArrowMetal's group-by returning null for most groups at 16,777,216 groups and above (16,777,215 were right): the per-group kernels dispatched one threadgroup per group and the grid wrapped past 2^32 threads. Fixed in the core ([FINDINGS.md](FINDINGS.md), round 13; `python/tests/test_group_by_2_24.py`), so no engine rule is needed and every group-by shape follows the policy above. The sweep and the benchmark above ran with the fix: under `shapes="all"` the cases the guard once kept with Polars, `(c)`, `(l)`, `(t3)`, `(t6)`, `(v3)` and the Parquet cases `(s1)` and `(s2)`, run on Metal and equal Polars' answers. At 50M rows, under `shapes="all"`, cold (`Benchmarks/results/polars_engine_bench_2026-09-26-final3.csv`), `(c)` is 1.78, `(l)` 2.03 and `(t6)` 1.21 times the faster Polars engine; `(t3)` is behind at 35.5 ms against 12.4 and `(v3)` at 612.0 ms against 421.7.
 
 ```python
 am.MetalEngine()                          # shapes="measured": the crossovers and buckets above
@@ -1312,8 +1331,9 @@ The sorts cover each direction with the nulls first and last, a stable sort in e
 (`maintain_order=True`: tied rows, the two zeros and every NaN keep their input order, compared bit
 for bit), two and three keys with a per-key null placement, a tie on one key falling through to the
 next, and top-k as `sort().head()`, `top_k`, `bottom_k` and over two keys. In the run recorded in
-`Benchmarks/results/engine_conformance_2026-09-30.csv` (the Polars half): 15,376 cases, 15,097
-identical on Metal, 32 within the float-summation bound above, none different otherwise, and 247
+`Benchmarks/results/engine_conformance_2026-10-02.csv` (the per-shape table in
+`engine_conformance_2026-10-02_report.txt`): 15,376 cases, 15,096 identical on Metal, 33 within the
+float-summation bound above, none different otherwise, and 247
 where Polars' optimised plan had nothing to run (all of them sorts over 0 or 1 row, which Polars
 leaves out). `python/tests/engine_report.py --engine polars` reruns it and prints the
 per-shape table.

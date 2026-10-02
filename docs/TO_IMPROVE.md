@@ -328,8 +328,8 @@ causes. The morning run of the same day
 
 A Metal dispatch costs 110–160 µs before the first byte is touched: command-buffer creation,
 encoding, commit and the completion wait.[^round4floor] A CPU library sums a thousand integers in a fraction of a
-microsecond. Below about a million rows the GPU cannot win a single operation, and this page will
-always carry these rows. What helps: batching several operations into one command buffer
+microsecond. Below about a million rows the GPU does not win a single operation in these measurements, and these rows
+stay on this page. What helps: batching several operations into one command buffer
 (`MetalContext.batch`, 8–32% off per call), the fused expression compiler (one dispatch for a whole
 expression tree), and the lazy engine (one command buffer for a whole plan) — all of which move the
 break-even point down, none of which remove the floor. The persistent-kernel approach that would
@@ -440,8 +440,8 @@ The full list is in the matrix page under ⚠️. The clusters:
 - **Software binary64 math** — `ln` 1.06–1.08x, `sin` 1.98–1.99x, `days_between` 1.04–1.11x,
   `sqrt` at 10M rows 1.83x (3.13x at 50M, where the dispatch floor no longer shows). Within 2 ulp of the host libm
   for `exp`, `ln`, `log2`, `log10` and `power` (the test bound), `sqrt` correctly rounded, 4–5 ulp for
-  trigonometry; the CPU has hardware doubles and the GPU does not. These will not reach
-  3x without a different numerical contract.
+  trigonometry; the CPU has hardware doubles and the GPU does not, and these rows are under 3x with this numerical
+  contract.
 - **Grouped aggregates against pyarrow at 1000 groups** — sum/count/min/max/mean by int32, float64 and
   utf8 key at 1.3–2.2x, two int32 keys at 1.11x (10M rows; 3.8x at 50M), and variance/stddev at
   1.0–2.4x. pyarrow's grouped kernels are memory-bound and 16-thread; the GPU's advantage grows with

@@ -36,7 +36,7 @@ test or the CSV a claim comes from.
 | [DECISIONS.md](DECISIONS.md) | Why it is built this way, one dated entry per decision |
 | [FINDINGS.md](FINDINGS.md) | Things learned the hard way: toolchain quirks, Metal limits, bugs and their lessons |
 | [RESIDENT.md](RESIDENT.md) | The resident-kernel experiment: where the ~65 µs per command buffer goes, and the two measured probes showing a persistent GPU worker polling shared memory does not beat it |
-| [ROADMAP.md](ROADMAP.md) | The directions the project is heading, and its non-goals |
+| [ROADMAP.md](ROADMAP.md) | The project's scope, and where its measured record is kept |
 | [../CHANGELOG.md](../CHANGELOG.md) | What each release delivered |
 | [../Benchmarks/README.md](../Benchmarks/README.md) | The benchmark programs and the fairness rules |
 | [../python/README.md](../python/README.md) | The Python package: install, wheel build, usage |

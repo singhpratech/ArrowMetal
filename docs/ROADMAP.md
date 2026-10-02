@@ -1,33 +1,17 @@
 # Roadmap
 
-Where ArrowMetal is heading. There are no dates, and the order can change. What each release delivered
-is in [CHANGELOG.md](../CHANGELOG.md).
+ArrowMetal's roadmap is its measured record. What each release added is in
+[CHANGELOG.md](../CHANGELOG.md), with the results file behind every number; what was measured and learned
+along the way is in [FINDINGS.md](FINDINGS.md); the shapes where a CPU library is ahead, with their
+numbers, are in [TO_IMPROVE.md](TO_IMPROVE.md). This page carries no dates and no plans.
 
-## Performance
+## Scope
 
-- Faster reads for the newer file and table formats.
-- Lower cost per call on small inputs.
-- More operations that choose between the CPU and the GPU on their own.
-
-## Types and interop
-
-- More of the Arrow type system and compute options.
-- Wider Arrow C Data Interface and IPC support.
-
-## Integrations
-
-- Deeper Polars and DuckDB integration.
-- More of the Python data ecosystem.
-
-## Languages
-
-Python, Swift, C, Rust, Go, TypeScript and R today, all over one C ABI; more languages can use the same
-header.
-
-## Non-goals
-
-- Anything but Apple silicon.
-- A dataframe API of its own: ArrowMetal is the engine under Polars, DuckDB and pandas.
-- Approximate answers where Arrow specifies exact ones.
+- Apple silicon only: every kernel is Metal, on the GPU of an M-series Mac.
+- No dataframe API of its own: ArrowMetal runs under Polars, DuckDB, DataFusion and pandas, and over
+  Arrow arrays directly.
+- Exact answers where Arrow specifies exact ones; each documented divergence is listed in
+  [EVALUATION.md](EVALUATION.md).
+- Python, Swift, C, Rust, Go, TypeScript and R, all over one C ABI (`include/arrowmetal.h`).
 
 Ideas and requests are welcome as GitHub issues.

@@ -370,7 +370,7 @@ for `Lexsort` at 1,000 and 1,000,000 rows. Every row, with first-call-after-idle
 `include/arrowmetal.h` and `include/arrow_abi.h` in the module are copies of the repository's `include/` headers; refresh them (`cp include/arrowmetal.h go/arrowmetal/include/`) whenever the header changes, or `python/tests/test_header_copies.py` and `TestHeadersMatchRepository` fail.
 
 Every item below has at least one test in `go/arrowmetal`; the oracle is named. 66 test functions and three `Example`s, 69 runnable;
-583 cases counting subtests, all green, plain, under `-race` and under `GOEXPERIMENT=cgocheck2`.
+584 cases counting subtests, all green, plain, under `-race` and under `GOEXPERIMENT=cgocheck2`.
 
 | Surface | Go API | Oracle |
 |---|---|---|

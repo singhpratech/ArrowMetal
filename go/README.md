@@ -40,7 +40,7 @@ ARROWMETAL_LIB=$PWD/../../.build/release/libArrowMetalC.dylib go test ./...
 GOEXPERIMENT=cgocheck2 ARROWMETAL_LIB=$PWD/../../.build/release/libArrowMetalC.dylib go test -count=1 ./...
 ```
 
-66 test functions and three `Example`s, 69 runnable; 583 cases with subtests, run three ways (plain,
+66 test functions and three `Example`s, 69 runnable; 584 cases with subtests, run three ways (plain,
 `-race`, `GOEXPERIMENT=cgocheck2`). Every wrapped operation is checked
 against Arrow Go's own compute where arrow-go has the function, and against a plain Go loop where it
 does not (arrow-go's compute package registers no aggregate function at all — no `sum`, `mean` or

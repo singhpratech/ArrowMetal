@@ -1,18 +1,18 @@
 # Testing
 
 How ArrowMetal is tested, what each layer compares against, and what "green" means before anything is
-pushed. Numbers are from the last full run of `main` (0.2.0) on an M4 Max.
+pushed. Each row names the run its numbers are from, on an M4 Max.
 
 | Layer | Size | Oracle |
 |---|---|---|
-| Swift suites (`Tests/ArrowMetalTests`) | 943 tests in 73 files, run in release (all 943 executed, 3 skipped in the run of 2026-09-24 at `89d4ed4`: the three opt-in throughput measurements) | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
-| Python suites (`python/tests`) | 5,892 collected cases over the ctypes API, the integrations and the readers in the run of 2026-09-24 at `89d4ed4` (5,867 passed and 25 skipped; the differential matrix in `test_differential.py` is counted in its own row) | `pyarrow.compute`, Polars, DuckDB, pandas |
-| Rust suites (`rust/arrowmetal/tests`, `rust/arrowmetal-sys`) | 48 tests, 46 in the safe crate against arrow-rs plus 2 in `arrowmetal-sys` over the raw ABI, run in release, plus 4 `no_run` doc-tests (compiled, not executed); all passed on 2026-09-24 at `3c3ea1e` | `arrow::compute` (arrow-rs 59) on the same data; a `HashMap` fold where arrow-rs has no kernel; `include/arrowmetal.h` re-parsed for the ABI signatures ([RUST.md](RUST.md)) |
+| Swift suites (`Tests/ArrowMetalTests`) | 1,045 tests in 86 files, run in release (all 1,045 executed, 13 skipped in the run of 2026-10-02 at `245990d`: the three opt-in throughput measurements and the ten 4 GiB-index tests behind `ARROWMETAL_BIG_TESTS`, which passed in a run with it set) | plain-Swift CPU references, hand-computed vectors, pyarrow 25.0.1 answers pinned as literals where noted |
+| Python suites (`python/tests`) | 7,188 collected cases over the ctypes API, the integrations and the readers in the run of 2026-10-02 at `245990d` (7,159 passed and 29 skipped; the differential matrix in `test_differential.py` is counted in its own row) | `pyarrow.compute`, Polars, DuckDB, pandas |
+| Rust suites (`rust/arrowmetal/tests`, `rust/arrowmetal-sys`) | 66 tests, 64 in the safe crate against arrow-rs plus 2 in `arrowmetal-sys` over the raw ABI, run in release, plus 5 `no_run` doc-tests (compiled, not executed); all passed on 2026-10-02 at `245990d` | `arrow::compute` (arrow-rs 59) on the same data; a `HashMap` fold where arrow-rs has no kernel; `include/arrowmetal.h` re-parsed for the ABI signatures ([RUST.md](RUST.md)) |
 | Differential matrix (`python/tests/test_differential.py`, `differential_report.py`) | generated cases over 46 column types (utf8 also imported as `utf8_view`), every public operation; the counts of the recorded run, in total and per Arrow function, are generated into [COVERAGE.md](COVERAGE.md#differential-cases-per-arrow-function) | `pyarrow.compute`, option by option ([EVALUATION.md](EVALUATION.md)) |
-| Engine conformance grid (`python/tests/engine_report.py`, `engine_polars_grid.py`, `engine_duckdb_grid.py`) | 15,376 Polars cases and 33,376 DuckDB queries, generated over shapes, dtypes, null patterns and sizes (Polars run of 2026-09-30, DuckDB run of 2026-09-25: 0 unclassified; 32 documented, all float summation order) | Polars' own `lf.collect()`; DuckDB with the rewrite off ([COVERAGE.md](COVERAGE.md#engines)) |
-| TypeScript suites (`node/test`) | 76 tests in 8 files over the N-API addon (76 passed on 2026-09-29) | Apache Arrow JS 21.2.0 and plain JS over the same rows ([TYPESCRIPT.md](TYPESCRIPT.md)) |
-| Go binding (`go/arrowmetal`) | 61 test functions and three `Example`s, 64 runnable, and 355 subtests: 419 passing results as `go test -count=1 -v ./...` reported them on 2026-09-29, 0 failed, run three times (plain, under `-race`, and under the cgo pointer checker, `GOEXPERIMENT=cgocheck2`, with the same counts) | `arrow-go/v18`'s own `compute` where it has the function, plain Go loops where it does not ([GO.md](GO.md)) |
-| R suites (`r/arrowmetal/tests/testthat`) | 83 `test_that()` blocks in the sources (84 as testthat runs them: the one in test-dispatch.R runs once per attach order), 778 expectations (0 failed, 0 skipped on 2026-09-29; the four blocks in test-carriers.R cover the ArrowArray/ArrowSchema carriers the shim allocates: release on drop without import, refusal of a moved or unfilled pair, tag checks), over the 42 ABI entry points the R binding wraps | base R and the `arrow` R package's own kernels on the same data ([R.md](R.md)) |
+| Engine conformance grid (`python/tests/engine_report.py`, `engine_polars_grid.py`, `engine_duckdb_grid.py`) | 15,376 Polars cases and 33,376 DuckDB queries, generated over shapes, dtypes, null patterns and sizes (Polars run of 2026-10-02, DuckDB run of 2026-09-25: 0 unclassified; 33 documented, all float summation order) | Polars' own `lf.collect()`; DuckDB with the rewrite off ([COVERAGE.md](COVERAGE.md#engines)) |
+| TypeScript suites (`node/test`) | 84 tests in 9 files over the N-API addon (84 passed on 2026-10-02) | Apache Arrow JS 21.2.0 and plain JS over the same rows ([TYPESCRIPT.md](TYPESCRIPT.md)) |
+| Go binding (`go/arrowmetal`) | 66 test functions and three `Example`s, 69 runnable, and 515 subtests: 584 passing results as `go test -count=1 -v ./...` reported them on 2026-10-02, 0 failed, run three times (plain, under `-race`, and under the cgo pointer checker, `GOEXPERIMENT=cgocheck2`, with the same counts) | `arrow-go/v18`'s own `compute` where it has the function, plain Go loops where it does not ([GO.md](GO.md)) |
+| R suites (`r/arrowmetal/tests/testthat`) | 87 `test_that()` blocks in the sources (88 as testthat runs them: the one in test-dispatch.R runs once per attach order), 818 expectations (0 failed, 0 skipped on 2026-10-02; the four blocks in test-carriers.R cover the ArrowArray/ArrowSchema carriers the shim allocates: release on drop without import, refusal of a moved or unfilled pair, tag checks), over the 42 ABI entry points the R binding wraps | base R and the `arrow` R package's own kernels on the same data ([R.md](R.md)) |
 | Review pass before release | the integrations, the engine, the kernels, the C ABI and the readers | each finding carries a regression test |
 | Benchmarks (`Benchmarks/`) | 339 operation-and-size rows over 173 operations, against four CPU libraries in two idioms each — the plain eager one and the most parallel one that library has for the same answer (`polars-lazy`, `pyarrow-threaded`); streaming and engine benches | measured, never estimated; the baseline is the fastest idiom of any library, and against it 145 rows are at or above 3x, 102 between 1x and 3x, 77 to improve, where the fastest CPU idiom is ahead, and 15 without a CPU equivalent ([BENCHMARKS_MATRIX.md](BENCHMARKS_MATRIX.md), [TO_IMPROVE.md](TO_IMPROVE.md)) |
 
@@ -210,10 +210,10 @@ in this order:
 
 Before a release the binding suites run as well:
 
-6. `cd rust && cargo test --release`: 48 tests and 4 compile-only doc-tests, 0 failures.
+6. `cd rust && cargo test --release`: 66 tests and 5 compile-only doc-tests, 0 failures.
 7. `go test` plain and under `GOEXPERIMENT=cgocheck2`.
-8. `npm test` (76 tests).
-9. testthat (266 expectations).
+8. `npm test` (84 tests).
+9. testthat (818 expectations).
 
 A benchmark comparison is never part of the release checks, because timings on a loaded machine are noise; the
 benchmark matrix is rerun on an idle machine before its numbers are published.

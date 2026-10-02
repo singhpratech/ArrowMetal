@@ -160,7 +160,8 @@ over 2^32 - 1 elements. The whole Swift suite (1,030 tests) also passes with the
 threads.
 
 **The totalOrder argsort row.** The sort-options benchmark had a float64 argsort at 1M rows at 1.41 ms
-in totalOrder against 0.97 ms in the default order, from a best of five after one call. With a 100 ms
+in totalOrder against 0.97 ms in the default order, from a best of five after one call
+(`Benchmarks/results/sort_options_2026-09-28.csv`: 1.411 and 0.968 ms). With a 100 ms
 warm-up, the first call after a 500 ms idle kept apart, and 8 alternating rounds of 100 calls
 (`Benchmarks/results/argsort_total_order_2026-10-01.csv`), the two orders run in the same time:
 
@@ -170,7 +171,8 @@ warm-up, the first call after a 500 ms idle kept apart, and 8 alternating rounds
 | 10M | 7.492 / 7.593 | 7.531 / 7.588 | 16.914 / 19.404 |
 | 50M | 37.911 / 38.109 | 37.934 / 38.068 | 45.869 / 51.189 |
 
-The first call after an idle gap takes 4.6x (default) and 4.7x (totalOrder) the best at 1M rows, so a
+The first call after an idle gap takes 4.6x (default) and 4.7x (totalOrder) the best at 1M rows
+(`first_after_idle_ms` ÷ `best_ms` in the same file), so a
 best of five taken with only one call before it can carry part of that state; the key map, the only
 difference between the two orders, costs nothing measurable.
 
@@ -185,8 +187,8 @@ where an Int64 `sum` took 1.73, 7.94 and 52.16 ms and `count` 1.00, 1.66 and 15.
 group id, `GroupBy.segments()`: 7.02 ms at 200 groups, 29.20 ms at 1M, 92.60 ms at 25M) and then gave
 a 256-thread threadgroup to each group, which added its run in a fixed tree order (3.64, 10.38 and
 134.15 ms). The order was the reason for the sort: the tree is what made the answer reproducible. At
-200 groups that reduction ran 200 threadgroups over 250,000 rows each; at 25M groups it launched 6.4
-billion threads for 50M additions. `min` and `max` took two passes of 32-bit atomics, with three
+200 groups that reduction ran 200 threadgroups over 250,000 rows each; at 25M groups it launched 25M
+threadgroups of 256 threads, 6.4 billion threads for 50M additions. `min` and `max` took two passes of 32-bit atomics, with three
 atomic updates per row in the first (the high word's minimum and maximum, and a count) spread over
 four arrays, and a plan with a `min` and a `max` of one column ran both passes twice.
 
@@ -242,10 +244,12 @@ runner is a warm `collect()`. At 50M rows, one int32 key, no nulls:
 | `min` + `max` | 1,000,000 | 14.04 → 9.57 ms (1.47x) | 28.86 → 13.63 ms (2.12x) |
 | `min` + `max` | 25,000,000 | 176.05 → 130.96 ms (1.34x) | 300.75 → 175.30 ms (1.72x) |
 
-Over every 50M-row case (one and two keys, 0 and 10% nulls, 200 to 25M groups), best of the rounds:
+Over every 50M-row case (one and two keys, 0 and 10% nulls, 200 to 25M groups), best of the rounds
+(the `speedup_best` column of `Benchmarks/results/groupby_float64_2026-09-30.csv`):
 `sum` and `mean` 1.41x-2.66x (array API) and 1.34x-2.33x (plan runner); `min` + `max` 0.98x-1.49x and
 1.29x-2.12x; `min` or `max` alone 0.96x-1.51x and 0.95x-1.35x. `count`, an Int64 `sum` and a Float32
-`sum` in the same runs are 0.96x-1.04x. The kernels alone at 50M rows: `sum` 10.62 → 3.48 ms (200
+`sum` in the same runs are 0.96x-1.04x. The kernels alone at 50M rows
+(`Benchmarks/results/groupby_float64_profile_2026-09-30.csv`, the Swift API, best of 5): `sum` 10.62 → 3.48 ms (200
 groups), 23.78 → 9.02 ms (10,000), 39.78 → 14.17 ms (1M), 227.11 → 110.43 ms (25M); `min` + `max`
 10.64 → 5.91 ms (1M) and 82.82 → 35.65 ms (25M).
 
@@ -265,29 +269,23 @@ alone's 55.51 ms), `MIN` + `MAX` 1.06x-1.19x.
 **The 10M-row, 10,000-group min/max rows.** In the alternating run and in eight further rounds of
 100 calls each (`Benchmarks/results/groupby_float64_retime_2026-09-30.csv`), ten Float64 `min`/`max`
 rows at 10M rows were slower in both best and median, nine of them at 10,000 groups (best
-0.60x-0.92x, median 0.71x-0.88x). Their first run after 500 ms of idle was faster than before in
-the same file (one key, `max`: 8.60 → 7.09 ms). The time they lost was in the GPU's state after a
-loop of the new kernel, not in the kernel
-(`Benchmarks/results/groupby_float64_minmax_state_2026-09-30.csv`, eight rounds per build):
+0.60x-0.92x, median 0.71x-0.88x). Their first run after 500 ms of idle was faster than before
+(`groupby_float64_2026-09-30.csv`; one key, `max`: 8.60 → 7.09 ms). In fresh processes that time
+only `am.group_by(keys).max(values)` (`Benchmarks/results/groupby_float64_minmax_state_2026-09-30.csv`,
+six rounds per build; median: the median of the rounds' medians), at 5M, 10M and 20M rows and
+3,000, 10,000 and 30,000 groups, in a warm loop and with a 50M-row Int64 group sum run before every
+timed call, the new build was faster in 17 of 18 cells in best and 17 of 18 in median (10M rows,
+10,000 groups, warm loop: 1.85 → 1.72 ms best, 3.21 → 2.38 ms median); no cell was slower in both.
 
-- A `count` over the same grouping, the same code in both builds, took 0.40 and 0.32 ms (best; one
-  key, two keys with nulls) after a loop of the earlier `max`, 0.46 and 0.49 ms after a loop of the
-  new one, and 0.41 and 0.38 ms on the new build with the earlier `max` kernel in place of the new
-  one; run first in the process, before any `max`, it took 0.44-0.47 ms in every build.
-- With the same 50M-row Int64 group sum run before every timed call in both builds, the new `max`
-  was faster: 1.38 → 1.12 ms best and 1.57 → 1.36 ms median (one key), 1.28 → 1.09 ms and 1.50 →
-  1.34 ms (two keys, 10% nulls); the `count` beside it was unchanged (0.42 → 0.40 ms and 0.38 →
-  0.39 ms best).
-- In fresh processes that time only `am.group_by(keys).max(values)`, at 5M, 10M and 20M rows and
-  3,000, 10,000 and 30,000 groups, warm loop and with the same heater, the new build was faster in
-  17 of 18 cells in best and 17 of 18 in median (10M rows, 10,000 groups, warm loop: 1.85 → 1.72 ms
-  best, 3.21 → 2.39 ms median); no cell was slower in both.
-
-**To improve.** Through the DataFusion rule, a Float64 `MIN`/`MAX` carries four helper aggregates per
-extreme (the NaN, value, zero and negative-zero counts, each a sum over an `if_else`), which take
-most of the plan: 36.88 ms at 200 groups from 50M rows, where the plan runner's own `min` + `max`
-takes 7.34 ms. At 25M groups from 50M rows the grouping itself (`am.group_by(keys)` with a `count`)
-is 110.12 ms of the 197.05 ms `sum`.
+**To improve.** Through the DataFusion rule, a Float64 `MIN`/`MAX` over a column holding a NaN or both
+zero signs carries four helper aggregates per extreme (the NaN, value, zero and negative-zero counts,
+each a sum over an `if_else`; when this was measured every Float64 column did, and since 2026-10-01
+the others run on the plan runner's own `min` + `max`, [DATAFUSION.md](DATAFUSION.md)), which take
+most of the plan: 36.88 ms at 200 groups from 50M rows
+(`datafusion/results/datafusion_float64_groupby_2026-09-30.csv`, `kernel_new_ms`), where the plan
+runner's own `min` + `max` takes 7.34 ms (`groupby_float64_2026-09-30.csv`). At 25M groups from 50M
+rows the grouping itself (`am.group_by(keys)` with a `count`) is 110.12 ms of the 197.05 ms `sum`
+(the same file, array API, best).
 
 **Tests.** `GroupSumExactTests` (Swift) checks sums and means against an independent correctly
 rounded reference (CPython's `msum` partials with its half-even correction, and a residual check of
@@ -334,16 +332,10 @@ path a count of an expression the kernel does not read as a number is taken the 
 kernel, and the whole-table aggregate does the same. The dense-key streaming result keeps a row count
 per key, taken from a count the batch already has when its column holds no null.
 
-**Cost.** Over 10,000,000 rows and 200 groups the one-kernel group-by shapes (a filtered `sum` and
-row count, `count` of an int32 or Float64 column with 10% nulls, an int32 `sum` with both counts) run
-in the same time as before, 2.0-2.7 ms, each within 0.1 ms of its time before (best of 15 per run,
-best of six runs of each library, interleaved). On the per-aggregate kernels a Float64 `sum` next to
-`count(*)` is 5.63 ms against 6.34, next to the count of an int32 column 6.37 ms against 5.33, inside
-those shapes' run-to-run spread of 5.3-9.0 ms; next to the count of the Float64 column, which failed
-before, 5.43 ms. The dense-key streaming group-by now counts a column once per batch where `sum` and
-`count` share it (21.0-21.2 ms against 21.6-21.8 for the two over a column with nulls); a `sum` alone
-over a column with nulls adds one row count per batch, 20.5-21.5 ms against 19.3-20.3 ms best, over
-10,000,000 rows in 1,048,576-row batches.
+**Cost.** The one-kernel group-by shapes run the same kernel as before. On the per-aggregate
+kernels a count reads only the validity bitmap. The dense-key streaming group-by counts a column once
+per batch where `sum` and `count` share it; a `sum` alone over a column with nulls adds one row count
+per batch.
 
 **Tests.** `GroupByCountTests` (Swift) checks 27 column types, the ten numeric types, boolean, utf8,
 utf8 views, binary, date32, timestamp, decimal128, list, struct, two dictionaries (null codes, null

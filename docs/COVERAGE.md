@@ -17,7 +17,7 @@ against `pyarrow.compute`. Go there for "is `<name>` covered?"; stay here for "h
 
 ## Summary
 
-| Arrow function category | GPU | GPU / CPU | CPU | Partial | Planned | Rows |
+| Arrow function category | GPU | GPU / CPU | CPU | Partial | Not implemented | Rows |
 |---|---:|---:|---:|---:|---:|---:|
 | Aggregations — scalar | 15 | 1 | 6 | 0 | 0 | 22 |
 | Aggregations — grouped (`hash_*`) | 14 | 1 | 0 | 0 | 0 | 15 |
@@ -41,7 +41,7 @@ against `pyarrow.compute`. Go there for "is `<name>` covered?"; stay here for "h
 | Arrow types (matrix below) | 21 | 0 | 0 | 7 | 0 | 28 |
 
 Interop uses a separate vocabulary and is counted apart: 9 in 0.1.0 (the IPC row among them, extended
-in 0.2.0), 9 in 0.2.0, 1 partial, 2 planned (21 rows). The "Hash join (Acero, not a compute function)" row in the grouped
+in 0.2.0), 9 in 0.2.0, 1 partial, 2 not implemented (21 rows). The "Hash join (Acero, not a compute function)" row in the grouped
 aggregations section below is likewise outside the compute-function total.
 
 A row here covers a family, so these are not function counts. The by-name numbers are in
@@ -123,7 +123,7 @@ The long form is at the bottom of this file.
 | **GPU / CPU** | Split evaluation: part of the work is a Metal kernel and part runs on the host. The note says where the seam is and what decides it. |
 | **CPU** | Implemented and reachable through the same ArrowMetal API, but the work runs on the host. |
 | **Partial** | Available with a stated limitation; the note says exactly what is missing. |
-| **Planned** | Not implemented. |
+| **Not implemented** | No ArrowMetal API for it. |
 | **In 0.2.0** | Added in 0.2.0. Used in the interop table below, where **In 0.1.0** marks what 0.1.0 already had and *extended in 0.3.0* what 0.3.0 added to a row. |
 
 A note that starts with *Routed* marks a row whose operation also has a single-threaded CPU loop with
@@ -827,8 +827,8 @@ Index arrays (the output of argsort, top-k, partition_nth, the lexsort, the join
 | Python: PyCapsule `__arrow_c_array__` | **In 0.1.0** | `python/arrowmetal/__init__.py` over the C ABI. |
 | Python: wheel with the dylib inside | **In 0.1.0** | `scripts/build_wheel.sh` copies `libArrowMetalC.dylib` into the package and builds a `macosx_*_arm64` wheel; 0.1.0 is on PyPI (`pip install arrowmetal`). |
 | Polars engine: `lf.collect(engine=am.MetalEngine())` | **In 0.2.0, extended in 0.3.0** | `python/arrowmetal/polars_engine.py`, tier 4 of [POLARS.md](POLARS.md): translates the subtrees of Polars' optimised plan that read in-memory frames (filter, projection, slice, sort, group-by, aggregate, inner/left/semi/anti join, `unique`) into ArrowMetal plans through Polars' post-optimisation callback and leaves every other node to Polars; results checked against Polars by `python/tests/test_polars_engine.py`. By default (`shapes="measured"`) it takes a subtree when its input rows are at or above the measured crossover of every shape class in it, per dtype class and input (POLARS.md, "Which translatable subtrees it runs: the defaults"; `Benchmarks/results/polars_engine_crossover_2026-09-26-final.csv`; a shape is ahead when its time plus 15%, or 35% with a String column, is at most the faster Polars engine's, the default takes it from 1.5 times that fitted crossover, and a String shape from 5M rows at the earliest): sorts from 1,026,501 rows (helper-key sorts from 1,000,000), numeric-key left joins from 1,875,000 input rows, inner joins from 2,029,827 and anti joins from 3,727,959, `unique` from 5,494,090, sorts of a Parquet file from 1,500,000, helper-key sorts and `unique` with a String column from 5,000,000 and sorts with one from 6,301,531. A group-by is judged at the bucket of its number of groups, which a fixed-seed sample of its key columns estimates at plan time (bias-corrected Chao1, from 512 sampled rows until the decision is settled; cached per frame and keys): over 10,000 and 100,000 groups every numeric group-by class is taken, from 1,082,526 to 16,235,764 rows by class and bucket, over 1,000,000 groups every class but the one-key mean, from 7,500,000 or 7,885,821, and over two keys the count and min/max also at 200 groups and the sum, count, mean and min/max at 1,000; one-key group-bys over a few hundred or thousand groups and group-bys over a quarter of the rows or more are not taken; the (String, int32) sum over about 1,000,000 groups is taken from 9,744,372. Whole-frame aggregates, top-k, semi joins, row-wise shapes and the other String shapes are not taken. In `Benchmarks/results/polars_engine_bench_2026-09-26-final3.csv` (194 case-size pairs, 2M and 50M rows, a 48-case group-by grid and Parquet included) the default took 62 pairs, 42 of them group-bys, every one ahead of the faster Polars engine, cold (1.21x to 9.42x); `shapes="all"` takes everything it can translate. Right, full, cross and as-of joins, windows and file scans other than one local Parquet file stay with Polars; a `scan_parquet` of one local file (0.3.0) is read on the GPU, with Polars' projection and the comparisons of its predicate handed to the reader (POLARS.md, "Parquet scans"). |
-| Python: `__arrow_c_device_array__` | **Planned** | Only `__arrow_c_array__` is defined. |
-| arrow-swift and MLX bridges, DuckDB/DataFusion UDF | **Planned** | Not implemented. |
+| Python: `__arrow_c_device_array__` | **Not implemented** | Only `__arrow_c_array__` is defined. |
+| arrow-swift and MLX bridges, DuckDB/DataFusion UDF | **Not implemented** | No bridge or UDF exists. |
 | DuckDB: aggregates of unchanged SQL on the GPU | **In 0.2.0, built from source** | `duckdb-extension/src/arrowmetal_rewrite.cpp`, a C++ optimizer extension for DuckDB 1.5.5 (the C extension API has no optimizer hook): `sum`/`avg` over integer columns, `min`/`max` over integer, `DATE` and `TIMESTAMP` columns, `count`, with no key or one integer, `DATE`, `TIMESTAMP` or `VARCHAR` key, over projections and filters of a table scan, replaced by `ARROWMETAL_AGGREGATE` with DuckDB's exact answers (`HUGEINT` sums, `avg` arithmetic, NULL groups). Floating-point `sum`/`avg`/`min`/`max`, `DECIMAL`, `DISTINCT`, several keys and joins below the aggregate stay DuckDB's. `SET arrowmetal_rewrite = 'auto' / 'off' / 'force'`; `arrowmetal_rewrites()` logs every decision. [DUCKDB.md](DUCKDB.md) §4b. |
 
 ## Engines
@@ -842,10 +842,10 @@ the DuckDB extension left the aggregate to DuckDB) is compared as well and count
 
 | Engine | Against | Cases | Pass | Documented | Unclassified | Not taken |
 |---|---|---:|---:|---:|---:|---:|
-| Polars `MetalEngine(shapes="all", min_rows=0)` | `lf.collect()`, polars 1.44.1 | 15,376 | 15,097 | 32 | 0 | 247 |
+| Polars `MetalEngine(shapes="all", min_rows=0)` | `lf.collect()`, polars 1.44.1 | 15,376 | 15,096 | 33 | 0 | 247 |
 | DuckDB optimizer extension, `arrowmetal_rewrite = 'force'` | `'off'`, DuckDB 1.5.5 | 33,376 | 21,844 | 0 | 0 | 11,532 |
 
-The Polars row from `Benchmarks/results/engine_conformance_2026-09-30.csv`, the DuckDB row from
+The Polars row from `Benchmarks/results/engine_conformance_2026-10-02.csv`, the DuckDB row from
 `Benchmarks/results/engine_conformance_2026-09-25.csv`; one row per shape is in the `_shapes.csv`
 file of each.
 

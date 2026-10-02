@@ -15,11 +15,14 @@ documentation = "https://github.com/singhpratech/ArrowMetal/blob/main/docs/DATAF
 readme = "README.md"
 # DataFusion 55.1.0 declares rust-version 1.94.0.
 rust-version = "1.94"
-description = "A DataFusion physical optimizer rule that runs full sorts on Apple silicon GPUs through ArrowMetal"
+description = "A DataFusion 55.1 physical optimizer rule that runs full sorts, and count(*), DISTINCT and integer MIN/MAX group-bys over tables of 50M rows or more in the measured group-count ranges, on Apple silicon GPUs through ArrowMetal; hash joins, top-k and filters are available and off by default"
 keywords = ["datafusion", "arrow", "metal", "gpu", "apple-silicon"]
 categories = ["database"]
 publish = false
 build = "build.rs"
+# The library, its build script, README and LICENSE; the benchmark results, the table generators,
+# the examples and the tests stay in the repository.
+include = ["/src", "/build.rs", "/README.md", "/LICENSE", "/Cargo.toml"]
 
 [dependencies]
 # By path for this repository, and by version for a registry build.

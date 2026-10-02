@@ -141,8 +141,11 @@
 - Engine conformance grid (Polars): seven more sort shapes — stable sorts with nulls first and last,
   three keys with per-key null placement, ties falling through to the next key, `top_k`, `bottom_k`
   and a two-key top-k — over every dtype. Recorded run
-  (`Benchmarks/results/engine_conformance_2026-09-30.csv`): 15,376 cases, 15,097 pass, 32 documented
-  (float summation order, as before), 0 unclassified, 247 where Polars' plan has nothing to run.
+  (`Benchmarks/results/engine_conformance_2026-10-02.csv`, the per-shape table and the largest
+  differences in `engine_conformance_2026-10-02_report.txt`): 15,376 cases, 15,096 pass, 33
+  documented (float summation order; one of them an int64 group mean over the integer extremes,
+  where the correctly rounded group mean and Polars' differ by 8.76e-8 u sum(|x|), as much as the
+  answer itself), 0 unclassified, 247 where Polars' plan has nothing to run.
   `docs/ENGINE_CAPABILITIES.md`: the Parquet sort by a nullable temporal column runs on Metal for
   every temporal type.
 - Grouped Float64 `sum` and `mean` are correctly rounded, and are computed without putting the rows
@@ -184,10 +187,12 @@
     1.33x-1.82x faster than before and 0.59x-2.55x of DataFusion alone; `MIN` + `MAX` 1.06x-1.19x
     faster and 0.31x-1.03x of DataFusion alone.
   - Through the DataFusion rule, a Float64 `MIN`/`MAX` runs on the plan runner's own `min` + `max`
-    (7.34 ms at 200 groups from 50M rows); only a column holding a NaN or both zero signs keeps the
-    four helper aggregates per extreme (36.88 ms there), as the `datafusion-arrowmetal` entry states.
-    To improve: at 25M groups from 50M rows, the grouping itself (`am.group_by(keys)` with a `count`)
-    is 110.12 ms of the 197.05 ms `sum`.
+    (7.34 ms at 200 groups from 50M rows, `Benchmarks/results/groupby_float64_2026-09-30.csv`); only
+    a column holding a NaN or both zero signs keeps the four helper aggregates per extreme (36.88 ms
+    there, `datafusion/results/datafusion_float64_groupby_2026-09-30.csv`), as the
+    `datafusion-arrowmetal` entry states. To improve: at 25M groups from 50M rows, the grouping itself
+    (`am.group_by(keys)` with a `count`) is 110.12 ms of the 197.05 ms `sum`
+    (`groupby_float64_2026-09-30.csv`).
   - Tests: `GroupSumExactTests` (Swift) and `python/tests/test_group_sum_exact.py` against
     correctly rounded references (special values, signed zeros, subnormals, overflow, ties,
     cancellation, 2^24 + 3 groups, min/max with NaN and both zeros), and the differential rows
@@ -287,7 +292,8 @@
     group. With the rule forced on (`datafusion/results/datafusion_minmax_2026-10-01.csv`, one and
     two int32 keys, 200 groups to rows / 2, 10M and 50M rows, both layouts, alternating with the
     crate before): 1.95x to 3.53x faster than before on the best run (two keys, 1,000,000 groups,
-    50M rows: 101.26 → 30.72 ms, DataFusion alone 96.12 ms), 0.70x to 3.26x of DataFusion alone.
+    50M rows: 101.26 → 30.72 ms, DataFusion alone 96.12 ms); against DataFusion alone 0.70x to 3.26x
+    over Float64 and 0.44x to 2.49x over Float32.
   - A node's columns are imported at the same time, one thread per column, from 1,000,000 input
     rows (`datafusion/results/datafusion_sort_import_2026-10-01.csv`): full sorts 1.008x to 1.060x
     faster than before at 10M rows and 1.017x to 1.046x at 50M (int64 at 50M with 8,192-row
@@ -358,9 +364,9 @@
   - With the default options every existing call runs the entry point it ran before. The six new
     entry points are resolved when the library has them: an older `libArrowMetalC.dylib` still loads,
     and a new call names the entry point it lacks.
-  - Tests: Go 61 test functions and 3 examples (15 functions and 2 examples new), 419 results with
-    subtests, plain, under `-race` and under `GOEXPERIMENT=cgocheck2`; Node 76 tests (14 new); R 84
-    `test_that()` blocks as testthat runs them (15 new), 778 expectations. The sorts are checked index
+  - Tests: Go 66 test functions and 3 examples (20 functions and 2 examples new), 584 results with
+    subtests, plain, under `-race` and under `GOEXPERIMENT=cgocheck2`; Node 84 tests (22 new); R 88
+    `test_that()` blocks as testthat runs them (19 new), 818 expectations. The sorts are checked index
     for index against arrow-go's `SortIndices` and arrow R's `array_sort_indices` for the IEEE order
     with nulls last, and against a stable reference of the documented order for every direction,
     null placement and float order, on columns holding NaN of both signs and several payloads, ±0.0,
@@ -440,8 +446,10 @@
     (`datafusion/results/datafusion_sort_import_2026-09-30.csv`).
 
 - A copy-free import checks that the producer's pages are mapped with `mach_vm_region` (one call per VM
-  region) instead of `mincore` (one entry per page). Importing a page-aligned 50M-row int64 pyarrow
-  column took 5.2 ms and takes 0.02 ms (8 MB: 0.11 → 0.005 ms). The pyarrow columns measured
+  region) instead of `mincore` (one entry per page). Importing three page-aligned 50M-row int64
+  pyarrow columns took 15.71 ms and takes 0.05 ms (10M rows: 3.10 → 0.02 ms; 1M rows: 0.32 → 0.01 ms;
+  `Benchmarks/results/chunked_import_2026-09-28.csv`, the int64 rows' `single_import_wall_ms`, best
+  of two rounds). The pyarrow columns measured
   (`pa.array` from numpy, compute results, `combine_chunks`; int64 and float64 at 1M, 10M and 50M rows)
   and arrow-rs `concat` results (int64, float64, utf8 at 1M rows and more) were page aligned, so their
   import is the probe alone. `MetalEngine(shapes="all")` with the import cache cleared, 50M rows
@@ -1412,7 +1420,7 @@ Fixed
 Quality
 - A CPU oracle behind every kernel test — `Sources/ArrowMetal/CPUReference.swift`, a hand-computed
   vector, or a pyarrow 25.0.1 answer pinned as a literal; 769 XCTest cases in 61 files, run in release
-  (all 769 executed, 7 skipped, in the last gated run), including a scenario
+  (all 769 executed, 7 skipped, in the last full run), including a scenario
   matrix over every type, null density, size and sliced input; concurrency and pool tests (docs/TESTING.md).
   CI on GitHub's hosted Apple silicon runs the suite in debug and release, but its GPU is virtual, so the
   GPU tests skip there and only the build, interop and CPU paths are proved (CONTRIBUTING.md).

@@ -81,8 +81,8 @@ the CPU idiom is ahead — is in [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MAT
 - **307 of Apache Arrow v25's 307 compute function names** — 283 on the GPU, 17 on the host, 7 with a
   stated limitation. The table is generated from a registry the test suite executes against
   `pyarrow.compute`. [`docs/ARROW_FUNCTIONS.md`](docs/ARROW_FUNCTIONS.md)
-- **40,824 differential cases against pyarrow over 46 column types**, 943 Swift tests against a CPU
-  oracle and 5,892 Python cases (5,867 passed, 25 skipped), all run in release.
+- **41,688 differential cases against pyarrow over 46 column types**, 1,045 Swift tests against a CPU
+  oracle and 7,188 Python cases (7,159 passed, 29 skipped), all run in release.
   [`docs/TESTING.md`](docs/TESTING.md)
 - **Seven languages on one C ABI** — Swift, Python, C, Rust, Go, TypeScript and R, each binding with its
   own suite against that language's Arrow library. [`docs/README.md`](docs/README.md)
@@ -256,10 +256,10 @@ exchanging columns through the Arrow C Data Interface and each with its own test
 
 | Binding | Where | Tests | Doc |
 |---|---|---|---|
-| Rust | `rust/arrowmetal`, `rust/arrowmetal-sys`; [crates.io](https://crates.io/crates/arrowmetal) | 48 tests plus 4 `no_run` doc-tests | [docs/RUST.md](docs/RUST.md) |
-| Go | `go/arrowmetal` | 61 test functions and three examples, 64 runnable | [docs/GO.md](docs/GO.md) |
-| TypeScript / JavaScript | `node/` (N-API addon) | 76 tests | [docs/TYPESCRIPT.md](docs/TYPESCRIPT.md) |
-| R | `r/arrowmetal` | 83 `test_that()` blocks in the sources (84 as testthat runs them: the one in test-dispatch.R runs once per attach order), 778 expectations | [docs/R.md](docs/R.md) |
+| Rust | `rust/arrowmetal`, `rust/arrowmetal-sys`; [crates.io](https://crates.io/crates/arrowmetal) | 66 tests plus 5 `no_run` doc-tests | [docs/RUST.md](docs/RUST.md) |
+| Go | `go/arrowmetal` | 66 test functions and three examples, 69 runnable | [docs/GO.md](docs/GO.md) |
+| TypeScript / JavaScript | `node/` (N-API addon) | 84 tests | [docs/TYPESCRIPT.md](docs/TYPESCRIPT.md) |
+| R | `r/arrowmetal` | 87 `test_that()` blocks in the sources (88 as testthat runs them: the one in test-dispatch.R runs once per attach order), 818 expectations | [docs/R.md](docs/R.md) |
 
 C and C++ callers use the header directly. Any language with an Arrow binding can use the same header.
 
@@ -449,7 +449,7 @@ Arrow type matrix and the interop status.
 - **Lifetime discipline.** Raw pointers are only valid while their owning object lives. Prefer the closure
   accessors (`withValues`, `withTyped`).
 
-See [ROADMAP.md](ROADMAP.md) for the directions the project is heading and [CONTRIBUTING.md](CONTRIBUTING.md) to get involved.
+See [ROADMAP.md](ROADMAP.md) for the project's scope and where its measured record is kept, and [CONTRIBUTING.md](CONTRIBUTING.md) to get involved.
 
 Questions, and timings from Macs we have not measured: [Discord](https://discord.gg/MEH7QQABUR) or a GitHub issue, whichever you prefer.
 

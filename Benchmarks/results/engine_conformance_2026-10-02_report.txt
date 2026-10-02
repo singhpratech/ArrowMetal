@@ -1,0 +1,75 @@
+ArrowMetal engines vs their hosts -- engine conformance grid
+arrowmetal 0.3.0 on Apple M4 Max | sizes 0, 1, 7, 1000, 100000 | null patterns none 0, sparse 0.05, dense 0.7, all 1 | flavours random, special
+
+polars: lf.collect(engine=MetalEngine(shapes='all', min_rows=0)) against lf.collect(), polars 1.44.1
+shape                         |  cases |   pass |   doc |  uncl | not taken
+------------------------------+--------+--------+-------+-------+----------
+filter_cmp                    |    244 |    244 |     0 |     0 |         0
+filter_is_not_null            |    244 |    244 |     0 |     0 |         0
+filter_other_column           |    397 |    397 |     0 |     0 |         0
+filter_is_in                  |    227 |    227 |     0 |     0 |         0
+select_arith                  |    210 |    210 |     0 |     0 |         0
+select_div                    |    210 |    210 |     0 |     0 |         0
+select_cmp                    |    227 |    227 |     0 |     0 |         0
+select_null                   |    244 |    244 |     0 |     0 |         0
+select_when                   |    227 |    227 |     0 |     0 |         0
+select_cast                   |    206 |    206 |     0 |     0 |         0
+select_logic                  |    185 |    185 |     0 |     0 |         0
+select_str                    |     17 |     17 |     0 |     0 |         0
+with_columns                  |    397 |    397 |     0 |     0 |         0
+slice                         |    397 |    397 |     0 |     0 |         0
+sort_asc                      |    397 |    329 |     0 |     0 |        68
+sort_desc                     |    397 |    397 |     0 |     0 |         0
+sort_nulls_last               |    397 |    360 |     0 |     0 |        37
+sort_desc_nulls_last          |    397 |    397 |     0 |     0 |         0
+sort_two_keys                 |    397 |    397 |     0 |     0 |         0
+top_k_asc                     |    397 |    329 |     0 |     0 |        68
+top_k_desc                    |    397 |    397 |     0 |     0 |         0
+sort_desc_stable              |    397 |    397 |     0 |     0 |         0
+sort_asc_nulls_last_stable    |    397 |    360 |     0 |     0 |        37
+sort_three_keys_per_key_nulls |    397 |    397 |     0 |     0 |         0
+sort_ties_fall_through        |    397 |    397 |     0 |     0 |         0
+top_k                         |    397 |    397 |     0 |     0 |         0
+bottom_k                      |    397 |    360 |     0 |     0 |        37
+top_k_two_keys                |    397 |    397 |     0 |     0 |         0
+group_by_key_sum              |    355 |    355 |     0 |     0 |         0
+group_by_key_min              |    355 |    355 |     0 |     0 |         0
+group_by_key_max              |    355 |    355 |     0 |     0 |         0
+group_by_key_mean             |    355 |    355 |     0 |     0 |         0
+group_by_key_count            |    355 |    355 |     0 |     0 |         0
+group_by_key_len              |    355 |    355 |     0 |     0 |         0
+group_by_value_sum            |    227 |    215 |    12 |     0 |         0
+group_by_value_min            |    189 |    189 |     0 |     0 |         0
+group_by_value_max            |    189 |    189 |     0 |     0 |         0
+group_by_value_mean           |    210 |    203 |     7 |     0 |         0
+group_by_value_count          |    227 |    227 |     0 |     0 |         0
+aggregate_sum                 |    227 |    218 |     9 |     0 |         0
+aggregate_min                 |    210 |    210 |     0 |     0 |         0
+aggregate_max                 |    210 |    210 |     0 |     0 |         0
+aggregate_mean                |    210 |    205 |     5 |     0 |         0
+aggregate_count               |    227 |    227 |     0 |     0 |         0
+join_inner                    |    355 |    355 |     0 |     0 |         0
+join_left                     |    355 |    355 |     0 |     0 |         0
+join_semi                     |    355 |    355 |     0 |     0 |         0
+join_anti                     |    355 |    355 |     0 |     0 |         0
+unique_subset                 |    355 |    355 |     0 |     0 |         0
+unique_all                    |    355 |    355 |     0 |     0 |         0
+
+polars: documented divergences
+  [float-summation-order] a float sum or mean adds in another order than Polars, and differs in the last bits -- docs/POLARS.md:581
+    float32 sum: 11 case(s), largest difference 3.55e-05 of the answer, 0.199 u*sum(|x|)
+    float64 mean: 11 case(s), largest difference 7.05e-14 of the answer, 0.0033 u*sum(|x|)
+    float64 sum: 10 case(s), largest difference 2.00e-14 of the answer, 0.372 u*sum(|x|)
+    int64 mean: 1 case(s), largest difference 1.00e+00 of the answer, 8.76e-08 u*sum(|x|)
+    33 case(s); e.g. aggregate_sum / float32 / 7rows-sparse-random: row 0: ['sum'] Metal (-0.24787135422229767,) vs Polars (-0.24787133932113647,)
+
+polars: not taken, by reason (compared, and equal)
+     247  Polars' optimised plan has no node to run
+
+polars: 86.2s
+
+engine polars: total 15376  pass 15096  documented 33  unclassified 0  not taken 247
+PASS
+String columns handed over as view; view columns converted to offsets + bytes during the run: 0 (0 rows)
+wrote Benchmarks/results/engine_conformance_2026-10-02.csv
+wrote Benchmarks/results/engine_conformance_2026-10-02_shapes.csv

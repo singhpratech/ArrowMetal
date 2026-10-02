@@ -796,9 +796,10 @@ together), and between two measured sizes the boundary is their geometric mean:
 Below about 2 MiB the copies are split into pieces of at least 1 MiB, so the first row's two threads
 run one piece; 250,000 int64 rows in 16 chunks take 0.10 ms on 1 to 16 threads. A memory copy of the
 largest columns stops gaining wall time at four threads until all sixteen cores run it, and those
-sixteen take 5.0-6.0x the one-thread CPU time, as the previous build's all-core copy did; the view pass, bound by its arithmetic, divides its wall
+sixteen take 5.6-6.0x the one-thread CPU time in 16 chunks (4.2-4.5x in 6,104 chunks); the view pass, bound by its arithmetic, divides its wall
 time by the thread count at almost no CPU cost up to six. Wall ms / CPU-ms, three columns, in 16 chunks
-and (last column) one utf8_view array with 6,104 data buffers:
+and (last column) one utf8_view array with 6,104 data buffers, best of 5 runs
+(`Benchmarks/results/import_threads_2026-09-30.csv`; the last column is its `single_import` columns):
 
 | threads | int64 10M | int64 50M | utf8 50M | utf8_view 50M | utf8_view 50M, one array |
 |---:|---:|---:|---:|---:|---:|
@@ -815,12 +816,13 @@ and (last column) one utf8_view array with 6,104 data buffers:
 threads; 1 keeps the import on the calling thread, 0 is the policy.
 
 **The page probe.** A copy-free import has to know that every page it wraps is mapped. The probe used to
-be `mincore`, which reports on every page: for a page-aligned pyarrow column of 50M int64 (400 MB) it
-took 5.2 ms, the whole of the import and as long as a 400 MB `memcpy` on the same machine (5.2-5.3 ms).
-`mach_vm_region` answers per VM region, and a large allocation is one region: the same import takes
-0.02 ms (0.005 ms at 8 MB, where `mincore` took 0.11 ms; 0.01 ms at 80 MB, where it took 1.04 ms). A buffer that is not page aligned is still copied:
-50M int64 at an 8-byte offset from a page imports in 6.8 ms, of which a plain `memcpy` of the bytes is
-5.3 ms.
+be `mincore`, which reports on every page. `mach_vm_region` answers per VM region, and a large
+allocation is one region. Three page-aligned pyarrow int64 columns of 50M rows (400 MB each) imported
+in 15.71 ms and 15.7 CPU-ms with `mincore` and import in 0.05 ms with `mach_vm_region`; at 10M rows
+3.10 against 0.02 ms, at 1M rows 0.32 against 0.01 ms (best of two rounds, the `single_import`
+columns of the int64 rows in 16 chunks of `Benchmarks/results/chunked_import_2026-09-28.csv`, where
+`old` is the build with `mincore`).
+A buffer that is not page aligned is still copied.
 
 In practice pyarrow's buffers of 1M rows and more (`pa.array` from numpy, compute results,
 `combine_chunks`) start on a 16 KiB page and are wrapped; so are arrow-rs `concat` results of fixed-width
@@ -850,10 +852,12 @@ import" is `combine_chunks()` and the import of the combined column (one round);
 | utf8_view 50M | 16 | 372.6 ms | 31.19 ms | 14.26 ms | 392 / 111 |
 | utf8_view 50M | 6,104 | 379.3 ms | 54.26 ms | 38.96 ms | 564 / 299 |
 
-Every case in the table is as fast as on the previous build or faster, on best and on median time.
-CPU time: the 50M copies, where the policy has no CPU limit, take 1.09-1.11x the previous build's
+Every case in the table is as fast as on the previous build or faster on the best run, and on the
+median run every case but utf8 at 50M in 16 chunks, whose median run is 14.77-14.82 ms in each of
+the eight rounds against 14.21-14.45 ms (`Benchmarks/results/chunked_import_2026-09-30.csv`, as are
+the figures below). CPU time: the 50M copies, where the policy has no CPU limit, take 1.09-1.11x the previous build's
 (and 4.8-6.0x the single-threaded `combine_chunks` and import, for 0.38-0.65x its wall time); the 10M copies take
-0.54-0.87x; the utf8_view pass takes 0.28x at 50M in 16 chunks and 0.41-0.56x elsewhere. At 20M and
+0.54-0.88x; the utf8_view pass takes 0.28x at 50M in 16 chunks and 0.41-0.56x elsewhere in the table. At 20M and
 30M rows (three rounds) every copy case is within 1.3% of the previous build's best time or faster,
 at 0.81-1.22x its CPU time (utf8 at 30M in 16 chunks: 8.67 against 8.56 ms, 128 against 104 CPU-ms);
 at 1M rows within 0.01 ms or faster (utf8_view 0.52 against 0.95 ms in 16 chunks). utf8_view imports
@@ -863,9 +867,10 @@ of view per row plus the string bytes, against 4 bytes of offset per row plus th
 utf8.
 
 One utf8_view array with 6,104 data buffers (`combine_chunks` of the 6,104-chunk column above) imports
-in 26.5 ms and 274 CPU-ms (previous build: 44.8 ms and 548 CPU-ms; the build before the merged copy
+in 26.5 ms and 274 CPU-ms (previous build: 44.8 ms and 548 CPU-ms; the `single_import` columns of
+`Benchmarks/results/chunked_import_2026-09-30.csv`; the build before the merged copy
 path: 150.5 ms and 143 CPU-ms, `Benchmarks/results/chunked_import_2026-09-28.csv`); at 10M rows in 5.6
-ms and 59 CPU-ms against 9.2 ms and 112 CPU-ms.
+ms and 59 CPU-ms against 9.2 ms and 112 CPU-ms (`chunked_import_2026-09-30.csv`).
 
 Through the engines, with the previous build alternating: `Benchmarks/polars_engine_bench.py --sizes
 2000000,50000000 --cases a,c,i,t1,w1,x2`, `MetalEngine` with the import cache cleared, takes 0.98-1.01x

@@ -32,7 +32,7 @@ cargo test --release
 ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib cargo test --release
 ```
 
-`cargo test --release` runs 71 tests, plus 4 doc-tests that are **`no_run`: they are compiled and
+`cargo test --release` runs 66 tests, plus 5 doc-tests that are **`no_run`: they are compiled and
 type-checked, not executed** (they would need a GPU inside a doctest binary). Release matters: this
 project has hit one release-only miscompile on the Swift side, and the sweeps run at 1,000,001
 elements, which is slow to build and run unoptimised.

@@ -262,7 +262,7 @@ exactly.
 | 22 | `winsorize-negative-zero-limit` | 3 | 2 |
 | | **Total** | **1,610** | **129** |
 
-The counts are the gated `differential_report.py` run of 2026-09-07. The column totals exceed the headline
+The counts are the full `differential_report.py` run of 2026-09-07. The column totals exceed the headline
 1,566 cases and the 126 distinct cells because
 `differential_report.py` counts a cell whole under every finding that claims it, and three cells are
 claimed twice: `round_extra/float32` (findings 1 and 20), `regex_match/utf8` (7 and 8) and
