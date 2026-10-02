@@ -678,5 +678,6 @@ ArrowMetal: Apache Arrow compute on Apple silicon GPUs via Metal.
 
 ### License
 
-Apache License 2.0. Apache Arrow is a trademark of the Apache Software Foundation; this project is
-independent and not endorsed by the ASF or Apple.
+Apache License 2.0. Apache Arrow and Apache DataFusion are trademarks of the Apache Software Foundation;
+Polars and DuckDB and their logos are trademarks of their respective owners. This project is independent
+and not affiliated with or endorsed by the ASF, Polars, DuckDB or Apple.
