@@ -183,11 +183,11 @@
     (`datafusion/results/datafusion_float64_groupby_2026-09-30.csv`): Float64 `sum` and `avg`
     1.33x-1.82x faster than before and 0.59x-2.55x of DataFusion alone; `MIN` + `MAX` 1.06x-1.19x
     faster and 0.31x-1.03x of DataFusion alone.
-  - To improve: through the DataFusion rule, a Float64 `MIN`/`MAX` carries four helper aggregates per
-    extreme (the NaN, value, zero and negative-zero counts, each a sum over an `if_else`), which take
-    most of the plan: 36.88 ms at 200 groups from 50M rows, where the plan runner's own `min` + `max`
-    takes 7.34 ms. At 25M groups from 50M rows, the grouping itself (`am.group_by(keys)` with a
-    `count`) is 110.12 ms of the 197.05 ms `sum`.
+  - Through the DataFusion rule, a Float64 `MIN`/`MAX` runs on the plan runner's own `min` + `max`
+    (7.34 ms at 200 groups from 50M rows); only a column holding a NaN or both zero signs keeps the
+    four helper aggregates per extreme (36.88 ms there), as the `datafusion-arrowmetal` entry states.
+    To improve: at 25M groups from 50M rows, the grouping itself (`am.group_by(keys)` with a `count`)
+    is 110.12 ms of the 197.05 ms `sum`.
   - Tests: `GroupSumExactTests` (Swift) and `python/tests/test_group_sum_exact.py` against
     correctly rounded references (special values, signed zeros, subnormals, overflow, ties,
     cancellation, 2^24 + 3 groups, min/max with NaN and both zeros), and the differential rows
