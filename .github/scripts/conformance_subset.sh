@@ -32,7 +32,9 @@ PIPELINE="Metal pipeline creation failed"
 # A virtual Metal device (GitHub's runner) is recognised before any part runs, so the parts that need
 # every kernel can be skipped even when the Python parts are not asked for.
 virtual=0
-case "$(system_profiler SPDisplaysDataType 2>/dev/null)" in *[Pp]aravirtual*) virtual=1; echo "metal device (system_profiler): Apple Paravirtual device" ;; esac
+early=$($PY -c "import ctypes,sys; l=ctypes.CDLL(sys.argv[1]); l.am_device_name.restype=ctypes.c_char_p; print(l.am_device_name().decode())" "$ARROWMETAL_LIB" 2>/dev/null || true)
+echo "metal device: ${early:-unknown}"
+case "$early" in *[Pp]aravirtual*) virtual=1 ;; esac
 
 has() { case " $PARTS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
@@ -40,7 +42,7 @@ if has differential || has standalone || has coverage || has engines; then
   loaded=$($PY -c "import arrowmetal as am; print(am._find_library())")
   echo "python loads: $loaded"; [ "$loaded" = "$ARROWMETAL_LIB" ] || { echo "SUBSET: python loads the wrong dylib"; exit 1; }
   device=$($PY -c "import arrowmetal as am; print(am.device_name())")
-  echo "metal device: $device"
+  [ "$device" = "$early" ] || echo "metal device (python): $device"
   case "$device" in *[Pp]aravirtual*) virtual=1 ;; esac
 fi
 
