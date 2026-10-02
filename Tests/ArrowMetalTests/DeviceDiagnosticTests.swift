@@ -19,13 +19,13 @@ final class DeviceDiagnosticTests: XCTestCase {
         let end = sortSrc.range(of: "kernel void", range: afterStart..<sortSrc.endIndex)?.lowerBound ?? sortSrc.endIndex
         let histogram = String(sortSrc[start..<end])
         let defines = "#define RADIX 256u\n#define DIGIT_BITS 8u\n#define DIGIT_MASK 0xFFu\n#define SIMDS (TG / 32u)\n"
-        let radixCurrent = KernelSource.prelude + defines + histogram
+        let radixCurrent = KernelSource.prelude + "\n" + defines + "\n" + histogram
         let oldLoop = histogram
             .replacingOccurrences(of: "len = (start < n) ? min(elemsPerBlock, n - start) : 0u;", with: "end = min(n, start + elemsPerBlock);")
             .replacingOccurrences(of: "for (uint off = lid; off < len; off += TG) { uint i = start + off;", with: "for (uint i = start + lid; i < end; i += TG) {")
-        let radixOld = KernelSource.prelude + defines + oldLoop
-        let radixNoTernary = KernelSource.prelude + defines + histogram.replacingOccurrences(of: "len = (start < n) ? min(elemsPerBlock, n - start) : 0u;", with: "len = min(elemsPerBlock, n - start);")
-        let radixEndLoop = KernelSource.prelude + defines + histogram.replacingOccurrences(of: "for (uint off = lid; off < len; off += TG) { uint i = start + off;", with: "for (uint i = start + lid; i < start + len; i += TG) {")
+        let radixOld = KernelSource.prelude + "\n" + defines + "\n" + oldLoop
+        let radixNoTernary = KernelSource.prelude + "\n" + defines + "\n" + histogram.replacingOccurrences(of: "len = (start < n) ? min(elemsPerBlock, n - start) : 0u;", with: "len = min(elemsPerBlock, n - start);")
+        let radixEndLoop = KernelSource.prelude + "\n" + defines + "\n" + histogram.replacingOccurrences(of: "for (uint off = lid; off < len; off += TG) { uint i = start + off;", with: "for (uint i = start + lid; i < start + len; i += TG) {")
         let all: [(String, String, String)] = [
             ("scalar", scalar, "k_scalar"),
             ("abs-lib", Dispatch.foldGridPositions(MetalArray<Double>.mathSource.0), "math_unary_abs"),
