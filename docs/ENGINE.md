@@ -447,15 +447,16 @@ Polars' `lf.collect(engine=am.MetalEngine())` runs this engine under Polars: it 
 of Polars' optimised plan into the grammar above and, by default, runs a subtree here only when its
 input rows are at or above the measured crossover of every shape class in it (sort, each join kind,
 `unique`, group-by and whole-frame aggregates per aggregate family, row-wise), per dtype class and
-input, fitted from `Benchmarks/results/polars_engine_crossover_2026-09-26-final.csv` against Polars'
+input, fitted from `Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv` against Polars'
 own engines. A group-by is judged at the bucket of its number of groups (200, 1,000, 10,000, 100,000,
 1,000,000, or at least a quarter of the rows, a bucket never taken), which a fixed-seed sample of its
 key columns estimates at plan time (bias-corrected Chao1, 512 sampled rows and up until the decision
 is settled). A shape counts as ahead at a size when its time, raised by 15% (35% for a shape with a
 String column), is at most the faster Polars engine's; the default takes it from 1.5 times that
 fitted crossover, and a shape with a String column from 5,000,000 rows at the earliest. In
-`Benchmarks/results/polars_engine_bench_2026-09-26-final3.csv` the default took 62 of 194 case-size
-pairs, all ahead of the faster Polars engine, 1.21x to 9.42x ([POLARS.md](POLARS.md), "Which
+`Benchmarks/results/polars_engine_bench_2026-10-02.csv` (2,000,000 and 50,000,000 rows, best of 5)
+the default takes 75 of 220 case-size pairs, 55 of them group-bys, all ahead of the faster Polars
+engine, 1.52x to 11.54x, with every result equal to Polars' ([POLARS.md](POLARS.md), "Which
 translatable subtrees it runs: the defaults").
 
 ## Limits

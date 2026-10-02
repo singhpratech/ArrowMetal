@@ -18,7 +18,10 @@ null placement and float order, so a sort keeps Polars' key count and `sort().he
 `shapes="all"`: 129.53 → 11.07 ms, `Benchmarks/results/polars_engine_sort_options_2026-09-30.csv`); its
 group-by crossovers are refitted and held to the default benchmark, where the default takes 54 of the
 150 group-by case-size pairs, each 1.12x to 10.69x of the faster Polars engine on the best run
-(`Benchmarks/results/polars_engine_default_groupby_2026-09-30.csv`); the conformance grid compares
+(`Benchmarks/results/polars_engine_default_groupby_2026-09-30.csv`); over the whole engine benchmark,
+220 case-size pairs at 2,000,000 and 50,000,000 rows, the default takes 75, each 1.52x to 11.54x faster
+than the faster Polars engine with none behind, and every result is equal to Polars'
+(`Benchmarks/results/polars_engine_bench_2026-10-02.csv`); the conformance grid compares
 15,376 cases with Polars, 0 unclassified. Every query the DuckDB rewrite's `auto` mode rewrites is 1.09x
 to 5.03x faster than DuckDB on the best run (`Benchmarks/results/duckdb_rewrite_2026-10-02.csv`). A
 column held as many Arrow arrays imports in one call with no concatenated copy (C, Swift, Python, Rust,
