@@ -108,6 +108,8 @@ def test_a_seeded_sample_of_cells_matches_a_fresh_run():
     if cr.default_matrix_problem():
         pytest.skip(cr.default_matrix_problem())
     import differential_report
+    if differential_report.VIRTUAL_DEVICE:
+        pytest.skip("the record is from a real GPU; a virtual Metal device cannot build every kernel")
     record = _record()
     rows = sorted(record["cells"])
     picked = random.Random(SAMPLE_SEED).sample(rows, SAMPLE_CELLS)

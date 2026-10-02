@@ -241,21 +241,27 @@ every (workload, engine) cell in its own subprocess so peak RSS is that engine's
 |---|---|
 | `conformance` | `swift build -c release --product ArrowMetalC`, then `.github/scripts/conformance_subset.sh differential standalone coverage engines`: 2,000 cases of the differential matrix sampled with seed 20261001 (`differential_report.py --sample 2000 --seed 20261001`), the standalone tests of `test_differential.py`, `test_coverage_report.py`, and the Polars engine grid without its 100,000-row tables over `int64`, `float64` and `string` columns (`engine_report.py --engine polars --quick --dtypes int64,float64,string`) |
 | `swift-tests` | `swift test -c release` |
-| `datafusion-rules` | the DataFusion crate's rule tests, `cargo test --test rule` (`conformance_subset.sh datafusion`), not its grid |
+| `datafusion-rules` | the DataFusion crate's rule tests, `cargo test --test rule` (`conformance_subset.sh datafusion`), not its grid; skipped on the virtual device (below) |
 
 The script prints the summary lines of the full run above (`differential:`, `differential-standalone:`,
 `engines:`, `datafusion:`, and a `GATE` line with `-` for the parts it did not run), plus a
 `coverage-table:` line, and runs the same way on a Mac: from the repository root, after the dylib build,
 `PY=python .github/scripts/conformance_subset.sh` runs all five parts.
 
-What the runner cannot do: its GPU is an "Apple Paravirtual device" on which pipeline creation fails at
-random even after the library's one retry ([FINDINGS.md](FINDINGS.md), FB24858160). The Swift GPU suites
-skip there (`requireRealGPU()`). The subset runs its GPU cases anyway: on a device whose name contains
-"Paravirtual", `differential_report.py` reruns a case that failed with `Metal pipeline creation failed`
-up to three times and prints how many reruns it took, and a pytest part whose every failure carries that
-error is rerun once on its failed tests, both lines printed. No timing is taken on the runner, and the
-full differential matrix, the full engine grids, the DataFusion grid and the binding suites run locally
-(section 5).
+What the runner cannot do: its GPU is an "Apple Paravirtual device" (GPU family `mac2` only). The
+Swift GPU suites skip there (`requireRealGPU()`). It cannot build every kernel: on 2026-10-02 it built
+the Float64 `math_unary_abs` kernel, the 32-bit-key radix histogram and single-construct kernels with
+threadgroup atomics, barriers, grid-stride loops and 64-bit shifts, but refused the 64-bit-key
+`radix_histogram` in every form tried, including the loop it had before 0.4.0; the reported error is
+`Compilation failed` with nothing else. After two pipeline creations have failed in one process, every
+later creation in that process fails too, even of a kernel that built a moment earlier (the
+`device-diag` workflow, `Tests/ArrowMetalTests/DeviceDiagnosticTests.swift`, runs each variant in its
+own process). The subset therefore treats a case that fails with `Metal pipeline creation failed` on a
+device whose name contains "Paravirtual" as skipped, with the kernel's name as the reason, and never runs
+it again; a pytest part whose every failure carries that error counts as passed with those tests noted
+as skipped; the `engines` and `datafusion` parts, which need every kernel, are skipped there. Each line
+says so in the log. No timing is taken on the runner, and the full differential matrix, the full engine
+grids, the DataFusion grid and the binding suites run locally (section 5).
 
 ## 8. Hardware and toolchain of the published numbers
 

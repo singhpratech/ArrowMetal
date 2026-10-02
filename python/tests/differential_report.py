@@ -39,15 +39,14 @@ import test_differential as diff                                      # noqa: E4
 if "ARROWMETAL_ROUTER" not in os.environ:
     am.set_router("gpu")
 
-#: GitHub's hosted macOS runners expose an "Apple Paravirtual device" whose pipeline creation fails at
-#: random (docs/FINDINGS.md, FB24858160); a failed pipeline is not cached, so the same case run again
-#: compiles it again. On such a device only, a case that failed with that error is rerun, up to
-#: PIPELINE_RETRIES times, and the report says how many reruns it took. On real Apple silicon the error
-#: has never occurred and nothing is rerun.
+#: GitHub's hosted macOS runners expose an "Apple Paravirtual device" that cannot build some kernels
+#: (the 64-bit-key radix histogram, for one; docs/TESTING.md), and once two pipeline creations have
+#: failed in a process every later one fails too. On such a device only, a case that fails with that
+#: error is counted as skipped, with the kernel's name as the reason, and is not run again; the report
+#: says how many cases that was. On real Apple silicon the error has never occurred.
 VIRTUAL_DEVICE = "paravirtual" in am.device_name().lower()
 PIPELINE_ERROR = "Metal pipeline creation failed"
-PIPELINE_RETRIES = 3
-RETRIES = [0]
+VIRTUAL_SKIPS = [0]
 
 
 class Cell:
@@ -102,12 +101,9 @@ def run(op_filter=None, type_filter=None, quiet=False, sample=None, seed=0, cell
             order_types.append(type_name)
 
         status, detail = diff.run_case(operation, type_name, shape)
-        tries = 0
-        while (VIRTUAL_DEVICE and status == diff.FAIL and PIPELINE_ERROR in detail
-               and tries < PIPELINE_RETRIES):
-            tries += 1
-            RETRIES[0] += 1
-            status, detail = diff.run_case(operation, type_name, shape)
+        if VIRTUAL_DEVICE and status == diff.FAIL and PIPELINE_ERROR in detail:
+            VIRTUAL_SKIPS[0] += 1
+            status, detail = diff.SKIP, "virtual Metal device: " + detail.split("\n")[0][:160]
         cell = cells[(operation.name, type_name)]
         total += 1
         if status == diff.PASS:
@@ -169,8 +165,8 @@ def render(cells, ops, types, total, elapsed):
     brand_new = sum(c.new for c in cells.values())
     add(f"total: {total} cases  |  pass {passed}  fail {failed} ({brand_new} unclassified, "
         f"{failed - brand_new} documented)  skip {skipped}  |  {elapsed:.1f}s")
-    if RETRIES[0]:
-        add(f"pipeline creation failed on the virtual device and the case was rerun: {RETRIES[0]} rerun(s)")
+    if VIRTUAL_SKIPS[0]:
+        add(f"pipeline creation failed on the virtual device: {VIRTUAL_SKIPS[0]} case(s) skipped (those kernels need a real GPU)")
     add("legend: 'ok N' all N datasets agree ('+Ns' = N skipped); 'known n/N' n datasets hit an open "
         "finding below; 'NEW n/N' an unclassified divergence; 'skip N' not implemented for that "
         "type; '-' out of scope")
