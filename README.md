@@ -74,8 +74,6 @@ takes the parts of the plan measured faster on the Apple GPU, hands back what th
 returned, and leaves every other node to the engine. Every figure below is from a run recorded in this
 repository, named beside it, on an Apple M4 Max (16 CPU cores, 64 GB); each speed-up is the engine's
 own time divided by the time with ArrowMetal, with the CPU time of the call next to its wall time.
-<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/datafusion-dark.svg"><img src="docs/img/engines/datafusion.svg" height="26" alt="" align="top"></picture>
-
 #### DataFusion in full
 
 A physical optimizer rule for DataFusion 55.1, the Rust crate `datafusion-arrowmetal` in
@@ -134,8 +132,6 @@ To improve, left to DataFusion by the default (DataFusion alone ÷ with the rule
 (`datafusion/results/datafusion_sort_warm_2026-09-29.csv`), and filters 0.31x to 0.79x at 10,000,000
 and 50,000,000 rows (`datafusion/results/datafusion_filter_2026-10-01.csv`); the other aggregate
 shapes are under [To improve](docs/DATAFUSION.md#to-improve).
-<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/polars-dark.svg"><img src="docs/img/engines/polars.svg" height="26" alt="" align="top"></picture>
-
 #### Polars in full
 
 A `MetalEngine` for `lf.collect(engine=…)`:
@@ -179,8 +175,6 @@ to 0.24x, row-wise filters and projections 0.14x to 0.42x, a semi join against a
 0.21x to 0.47x, and the top 100 by a nullable Float64 key 0.75x to 1.05x, which keeps top-k with
 Polars. Every translatable shape, with its measured result, is in
 [docs/ENGINE_CAPABILITIES.md](docs/ENGINE_CAPABILITIES.md).
-<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/duckdb-dark.svg"><img src="docs/img/engines/duckdb.svg" height="26" alt="" align="top"></picture>
-
 #### DuckDB in full
 
 An optimizer extension; the SQL is unchanged. Built once with `./duckdb-extension/build_rewrite.sh`
