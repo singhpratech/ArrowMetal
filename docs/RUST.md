@@ -10,7 +10,7 @@ Two crates live in [`rust/`](../rust):
 | `arrowmetal-sys` | Raw `extern "C"` declarations over [`include/arrowmetal.h`](../include/arrowmetal.h), plus the `build.rs` that finds and links `libArrowMetalC.dylib`. |
 | `arrowmetal` | The safe crate. An `arrow::array::ArrayRef` goes in, an `ArrayRef` comes out; every failure is a `Result` carrying `am_last_error()`'s message. |
 
-Both are on crates.io at 0.3.0; a path or git dependency on a checkout works too.
+Both are on crates.io at 0.4.0; a path or git dependency on a checkout works too.
 
 For Apache DataFusion, [`datafusion/`](../datafusion) holds `datafusion-arrowmetal`, built on the
 `arrowmetal` crate: a physical optimizer rule that runs full `ORDER BY` sorts on the GPU with
@@ -37,7 +37,7 @@ That produces `.build/release/libArrowMetalC.dylib`. Then, in your own crate:
 # Cargo.toml
 [dependencies]
 arrow = "59"
-arrowmetal = "0.3.0"          # crates.io; or { path = "../ArrowMetal/rust/arrowmetal" } from a checkout
+arrowmetal = "0.4.0"          # crates.io; or { path = "../ArrowMetal/rust/arrowmetal" } from a checkout
 ```
 
 and build with the dylib's location known:

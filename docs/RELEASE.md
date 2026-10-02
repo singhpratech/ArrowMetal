@@ -5,8 +5,8 @@ the repository itself never publishes anything.
 
 **The version number is changed only when a release is decided, in every manifest at once**, and not
 between releases: work after a release goes under an "Unreleased" heading in CHANGELOG.md until the
-next one. Read `X.Y.Z` below as the version being released: for 0.3.0, the wheel
-`arrowmetal-0.3.0-py3-none-macosx_14_0_arm64.whl` and the tags `v0.3.0` and `go/arrowmetal/v0.3.0`.
+next one. Read `X.Y.Z` below as the version being released: for 0.4.0, the wheel
+`arrowmetal-0.4.0-py3-none-macosx_14_0_arm64.whl` and the tags `v0.4.0` and `go/arrowmetal/v0.4.0`.
 
 ## 0. Preconditions
 
@@ -56,7 +56,7 @@ grep -n 'version' python/pyproject.toml                    # must be `dynamic`, 
 grep -nE 'X\.Y\.Z' rust/Cargo.toml rust/arrowmetal/Cargo.toml polars-plugin/Cargo.toml \
     polars-plugin/arrowmetal-sys/Cargo.toml node/package.json r/arrowmetal/DESCRIPTION \
     duckdb-extension/CMakeLists.txt duckdb-extension/build.sh duckdb-extension/build_rewrite.sh \
-    Sources/ArrowMetalC/ArrowMetalC.swift CITATION.cff   # all must read X.Y.Z
+    Sources/ArrowMetalC/ArrowMetalC.swift CITATION.cff datafusion/Cargo.toml   # all must read X.Y.Z
 git grep -nF '<previous version>'   # only history (changelog, findings, results headers) may name it
 ```
 
@@ -163,9 +163,11 @@ commit (`gh workflow run ci.yml --ref main`).
 
 ## 6. The crates
 
-`arrowmetal-sys` and `arrowmetal` are published from the `vX.Y.Z` tag in that order
-(`cargo publish -p arrowmetal-sys`, then `-p arrowmetal`, each with `ARROWMETAL_LIB` set so the
-packaging build finds the dylib; docs.rs builds skip the search). The crates link the dylib the user
+`arrowmetal-sys`, `arrowmetal` and `datafusion-arrowmetal` are published from the `vX.Y.Z` tag in
+that order (`cargo publish -p arrowmetal-sys`, then `-p arrowmetal` in `rust/`, then
+`cargo publish` in `datafusion/`, each with `ARROWMETAL_LIB` set so the packaging build finds the
+dylib; docs.rs builds skip the search). Each waits until the crate before it is in the crates.io
+index, because its packaging build resolves that version from the registry. The crates link the dylib the user
 already has, from the wheel or a Swift build, and [RUST.md](RUST.md) says how a binary carries the
 run-time path. Checked after publication: a scratch crate outside the repository depending on
 `arrowmetal = "X.Y.Z"` and pointed at the wheel's dylib prints the version and the device name.

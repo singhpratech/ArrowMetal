@@ -12,7 +12,21 @@ table, which takes no measured join.
 
 User documentation — registering the rule, what the default takes and leaves, the semantics matched,
 the differential grid, the measured numbers and the limits — is in
-[`docs/DATAFUSION.md`](../docs/DATAFUSION.md).
+[`docs/DATAFUSION.md`](https://github.com/singhpratech/ArrowMetal/blob/main/docs/DATAFUSION.md).
+
+```toml
+# Cargo.toml
+[dependencies]
+datafusion = { version = "=55.1.0", default-features = false, features = ["sql"] }
+datafusion-arrowmetal = "0.4.0"          # crates.io; or { path = "../ArrowMetal/datafusion" } from a checkout
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
+The crate links `libArrowMetalC.dylib` through the `arrowmetal` crate, which finds it through
+`ARROWMETAL_LIB` and the locations in
+[RUST.md, "Finding the dylib"](https://github.com/singhpratech/ArrowMetal/blob/main/docs/RUST.md#finding-the-dylib):
+a Swift build of the repository, or the copy the Python wheel installs at
+`site-packages/arrowmetal/_lib/libArrowMetalC.dylib`. From a checkout:
 
 ```sh
 # The GPU library, from the repository root

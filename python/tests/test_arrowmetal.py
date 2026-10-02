@@ -47,8 +47,8 @@ def approx(values):
 
 def test_device_and_version():
     assert isinstance(am.device_name(), str) and am.device_name()
-    assert am.version() == "0.3.0"
-    assert am.__version__ == "0.3.0"
+    assert am.version() == "0.4.0"
+    assert am.__version__ == "0.4.0"
 
 
 @pytest.mark.parametrize("name", sorted(ALL_ARRAYS))

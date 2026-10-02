@@ -56,15 +56,18 @@ cd datafusion
 ARROWMETAL_LIB=$PWD/../.build/release/libArrowMetalC.dylib cargo run --example quickstart
 ```
 
-The crate is not on crates.io; depend on it by path from a checkout:
+The crate is on crates.io:
 
 ```toml
 # Cargo.toml
 [dependencies]
 datafusion = { version = "=55.1.0", default-features = false, features = ["sql"] }
-datafusion-arrowmetal = { path = "../ArrowMetal/datafusion" }
+datafusion-arrowmetal = "0.4.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
+
+From a checkout, depend on it by path instead:
+`datafusion-arrowmetal = { path = "../ArrowMetal/datafusion" }`.
 
 It depends on the [`arrowmetal`](RUST.md) crate, which finds `libArrowMetalC.dylib` through
 `ARROWMETAL_LIB` and the other locations listed in [RUST.md, "Finding the dylib"](RUST.md#finding-the-dylib).
@@ -1125,7 +1128,6 @@ warm time for the same query (8.08 to 31.75 ms).
   naming the target; `arrowmetal-sys` refuses non-macOS targets as well.
 - **DataFusion 55.1.0 only.** The dependency is pinned with `=`; DataFusion's physical-plan API
   changes between releases.
-- **Not on crates.io.** The crate is used by path from a checkout.
 
 ---
 
