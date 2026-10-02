@@ -19,6 +19,7 @@ import sys
 
 import pyarrow.compute as pc
 
+import arrowmetal
 from arrowmetal import functions as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -32,7 +33,7 @@ Every [Arrow v25](https://arrow.apache.org/docs/cpp/compute.html) compute functi
 pyarrow's two internal meta-functions — {total} of them: the {listed} `pc.list_functions()` reports,
 less `index_in_meta_binary` and `is_in_meta_binary`, plus the three names pyarrow exposes only as
 Python wrappers (`fill_null`, `top_k_unstable`, `bottom_k_unstable`); {hashes} are `hash_*` grouped
-aggregates — with what ArrowMetal 0.3.0 does about it.
+aggregates — with what ArrowMetal {version} does about it.
 
 This is the by-name page. [COVERAGE.md](COVERAGE.md) is the by-family page: it groups these functions
 and explains how each family works, with the Arrow **type** matrix and the interop status alongside.
@@ -122,7 +123,7 @@ def page(record=None):
     total = len(F.list_functions())
     listed = len(pc.list_functions())
     oracles = sum(1 for n in F.list_functions() if F._REGISTRY[n].oracle is not None)
-    out = [_INTRO.format(total=total, listed=listed, hashes=hashes, oracles=oracles)]
+    out = [_INTRO.format(total=total, listed=listed, hashes=hashes, oracles=oracles, version=arrowmetal.__version__)]
     out.append(F.summary_markdown())
     out.append("")
     out.append(f"Totals: **{counts.get(F.GPU, 0)} gpu**, **{counts.get(F.CPU, 0)} cpu**, "
@@ -137,7 +138,7 @@ def page(record=None):
     out.append("")
     out.append("---")
     out.append("")
-    out.append("Version 0.3.0. Read alongside [COVERAGE.md](COVERAGE.md), [ROADMAP.md](../ROADMAP.md) "
+    out.append(f"Version {arrowmetal.__version__}. Read alongside [COVERAGE.md](COVERAGE.md), [ROADMAP.md](../ROADMAP.md) "
                "and [DESIGN.md](DESIGN.md).")
     return "\n".join(out)
 
