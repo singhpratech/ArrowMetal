@@ -24,9 +24,18 @@ final class DeviceDiagnosticTests: XCTestCase {
                            uint2 p [[thread_position_in_grid]]) { uint i = (p.y << 24u) + p.x; if (i < n) o[i] = fabs(a[i]); }
         """
         let real = MetalArray<Double>.mathSource.0   // the library's own Float64 abs kernel source, as the harness compiles it
-        let variants: [(String, String, String)] = [("scalar", scalar, "k_scalar"), ("folded", folded, "k_folded"), ("by-hand uint2", byHand, "k_hand"),
+        let pre = "#include <metal_stdlib>\nusing namespace metal;\n"
+        let lidK = pre + "kernel void k_lid(device float* o [[buffer(0)]], uint i [[thread_position_in_grid]], uint lid [[thread_index_in_threadgroup]]) { o[i] = float(lid); }"
+        let tpgK = pre + "kernel void k_tpg(device float* o [[buffer(0)]], uint i [[thread_position_in_grid]], uint n [[threads_per_grid]]) { for (uint j = i; j < 1000u; j += n) o[j] = 1.0f; }"
+        let tgK = pre + "kernel void k_tg(device atomic_uint* o [[buffer(0)]], uint tgid [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]]) { threadgroup atomic_uint h[4]; if (lid < 4u) atomic_store_explicit(&h[lid], 0u, memory_order_relaxed); threadgroup_barrier(mem_flags::mem_threadgroup); atomic_fetch_add_explicit(&h[lid & 3u], 1u, memory_order_relaxed); threadgroup_barrier(mem_flags::mem_threadgroup); if (lid == 0u) atomic_fetch_add_explicit(o, atomic_load_explicit(&h[0], memory_order_relaxed) + tgid, memory_order_relaxed); }"
+        let tgOnlyK = pre + "kernel void k_tgonly(device uint* o [[buffer(0)]], uint tgid [[threadgroup_position_in_grid]]) { o[tgid] = tgid; }"
+        let radix = SortSource.source(K: "ulong")
+        var variants: [(String, String, String)] = [("scalar", scalar, "k_scalar"), ("folded", folded, "k_folded"), ("by-hand uint2", byHand, "k_hand"),
                                                     ("library math_unary_abs (folded)", Dispatch.foldGridPositions(real), "math_unary_abs")]
-        for safe in [false, true] {
+        for (label, src, fn) in [("i+lid", lidK, "k_lid"), ("i+threads_per_grid loop", tpgK, "k_tpg"), ("tgid+lid+threadgroup atomics", tgK, "k_tg"), ("tgid only", tgOnlyK, "k_tgonly"), ("library radix_histogram", radix, "radix_histogram")] {
+            variants.append((label + " scalar", src, fn)); variants.append((label + " folded", Dispatch.foldGridPositions(src), fn))
+        }
+        for safe in [true] {
             for (label, src, fn) in variants {
                 let opts = MTLCompileOptions()
                 if safe { if #available(macOS 15.0, *) { opts.mathMode = .safe } else { opts.fastMathEnabled = false } }
@@ -38,6 +47,6 @@ final class DeviceDiagnosticTests: XCTestCase {
                 } catch { print("DIAG: \(label) safe=\(safe): LIBRARY FAILED: \(MetalContext.describe(error))") }
             }
         }
-        print("DIAG: folded source follows\n\(folded)\nDIAG: end")
+        print("DIAG: end")
     }
 }

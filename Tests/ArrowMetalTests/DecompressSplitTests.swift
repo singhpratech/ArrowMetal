@@ -215,7 +215,8 @@ final class DecompressSplitTests: XCTestCase {
         DecodeCandidate(codec: .snappy, srcLength: bytes + 20, dstLength: bytes)
     }
 
-    func testRouterGivesTheHostTokenDensePagesAndTheGPUTheLiteralOnes() {
+    func testRouterGivesTheHostTokenDensePagesAndTheGPUTheLiteralOnes() throws {
+        try requireRealGPU()   // the route depends on the GPU's measured decode cost; a virtual device gets none
         let saved = DecodeRouter.forced
         defer { DecodeRouter.forced = saved }
         DecodeRouter.forced = nil
