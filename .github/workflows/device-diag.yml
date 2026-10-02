@@ -16,7 +16,7 @@ jobs:
           swift build -c release --build-tests -Xswiftc -enable-testing 2>&1 | grep -E "error:|Build complete" | tail -5
       - name: One selection per process
         run: |
-          for sel in scalar abs-lib radix-current radix-oldloop radix-noternary radix-endloop radix-current-folded "radix-current,scalar" "radix-current,abs-lib" "scalar,radix-oldloop,radix-current,scalar"; do
+          for sel in radix-uint radix-nospan radix-nohist tg-atomic-or shift64 radix-current; do
             echo "=== $sel"
             ARROWMETAL_DEVICE_DIAG=1 ARROWMETAL_DIAG_ONLY="$sel" swift test -c release --skip-build --filter DeviceDiagnosticTests 2>&1 | grep -E "DIAG:" || true
           done
