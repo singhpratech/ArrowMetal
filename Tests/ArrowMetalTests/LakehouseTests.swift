@@ -585,8 +585,18 @@ final class LakehouseTests: XCTestCase {
         func str(_ s: String) -> [UInt8] { zz(Int64(s.utf8.count)) + Array(s.utf8) }
         let sync = [UInt8](repeating: 0xAB, count: 16)
         func container(_ schema: String, _ block: [UInt8]) -> [UInt8] {
-            [0x4F, 0x62, 0x6A, 0x01] + zz(2) + str("avro.schema") + str(schema) + str("avro.codec") + str("null")
-                + zz(0) + sync + block + sync
+            // Built in steps: as one expression the type checker on Xcode 16.4 gives up.
+            var out: [UInt8] = [0x4F, 0x62, 0x6A, 0x01]
+            out += zz(2)
+            out += str("avro.schema")
+            out += str(schema)
+            out += str("avro.codec")
+            out += str("null")
+            out += zz(0)
+            out += sync
+            out += block
+            out += sync
+            return out
         }
         let rec = #"{"type":"record","name":"r","fields":[{"name":"a","type":"long"}]}"#
         let cases: [(String, [UInt8], String)] = [
