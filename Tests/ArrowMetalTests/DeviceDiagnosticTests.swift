@@ -2,65 +2,51 @@ import XCTest
 import Metal
 @testable import ArrowMetal
 
-/// Prints which pipeline variants the current Metal device builds. It never fails: it is a report for a
-/// device that cannot be reproduced locally (GitHub's "Apple Paravirtual device"). Runs only when
-/// ARROWMETAL_DEVICE_DIAG is set.
+/// Prints which kernel variants the current Metal device builds. It never fails: it is a report for a device
+/// that cannot be reproduced locally (GitHub's "Apple Paravirtual device"). Runs only when ARROWMETAL_DEVICE_DIAG
+/// is set; ARROWMETAL_DIAG_ONLY=label,label,... runs just those variants, in that order, in this one process.
 final class DeviceDiagnosticTests: XCTestCase {
     func testPipelineVariants() throws {
         guard ProcessInfo.processInfo.environment["ARROWMETAL_DEVICE_DIAG"] != nil else { throw XCTSkip("set ARROWMETAL_DEVICE_DIAG") }
         guard let device = MTLCreateSystemDefaultDevice() else { print("DIAG: no Metal device"); return }
-        print("DIAG: device \(device.name) family apple7=\(device.supportsFamily(.apple7)) mac2=\(device.supportsFamily(.mac2)) common3=\(device.supportsFamily(.common3))")
-        let scalar = """
-        #include <metal_stdlib>
-        using namespace metal;
-        kernel void k_scalar(device const float* a [[buffer(0)]], device float* o [[buffer(1)]], constant uint& n [[buffer(2)]],
-                             uint i [[thread_position_in_grid]]) { if (i < n) o[i] = fabs(a[i]); }
-        """
-        let folded = Dispatch.foldGridPositions(scalar.replacingOccurrences(of: "k_scalar", with: "k_folded"))
-        let byHand = """
-        #include <metal_stdlib>
-        using namespace metal;
-        kernel void k_hand(device const float* a [[buffer(0)]], device float* o [[buffer(1)]], constant uint& n [[buffer(2)]],
-                           uint2 p [[thread_position_in_grid]]) { uint i = (p.y << 24u) + p.x; if (i < n) o[i] = fabs(a[i]); }
-        """
-        let real = MetalArray<Double>.mathSource.0   // the library's own Float64 abs kernel source, as the harness compiles it
         let pre = "#include <metal_stdlib>\nusing namespace metal;\n"
-        let lidK = pre + "kernel void k_lid(device float* o [[buffer(0)]], uint i [[thread_position_in_grid]], uint lid [[thread_index_in_threadgroup]]) { o[i] = float(lid); }"
-        let tpgK = pre + "kernel void k_tpg(device float* o [[buffer(0)]], uint i [[thread_position_in_grid]], uint n [[threads_per_grid]]) { for (uint j = i; j < 1000u; j += n) o[j] = 1.0f; }"
-        let tgK = pre + "kernel void k_tg(device atomic_uint* o [[buffer(0)]], uint tgid [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]]) { threadgroup atomic_uint h[4]; if (lid < 4u) atomic_store_explicit(&h[lid], 0u, memory_order_relaxed); threadgroup_barrier(mem_flags::mem_threadgroup); atomic_fetch_add_explicit(&h[lid & 3u], 1u, memory_order_relaxed); threadgroup_barrier(mem_flags::mem_threadgroup); if (lid == 0u) atomic_fetch_add_explicit(o, atomic_load_explicit(&h[0], memory_order_relaxed) + tgid, memory_order_relaxed); }"
-        let tgOnlyK = pre + "kernel void k_tgonly(device uint* o [[buffer(0)]], uint tgid [[threadgroup_position_in_grid]]) { o[tgid] = tgid; }"
-        let radix = SortSource.source(K: "ulong")
-        var variants: [(String, String, String)] = [("scalar", scalar, "k_scalar"), ("folded", folded, "k_folded"), ("by-hand uint2", byHand, "k_hand"),
-                                                    ("library math_unary_abs (folded)", Dispatch.foldGridPositions(real), "math_unary_abs")]
-        // The constructs the 2026-09-26 32-bit wrap rewrite introduced, one per kernel, in the current and the earlier form.
-        let P = KernelSource.prelude
-        let bmNew = P + "kernel void bm_new(device const uint* a [[buffer(0)]], device const uint* b [[buffer(1)]], device const uint* nPtr [[buffer(2)]], device uint* out [[buffer(3)]], uint w [[thread_position_in_grid]]) { if (w < ((*nPtr >> 5) + (uint)((*nPtr & 31u) != 0u))) out[w] = a[w] & b[w]; }"
-        let bmOld = P + "kernel void bm_old(device const uint* a [[buffer(0)]], device const uint* b [[buffer(1)]], device const uint* nPtr [[buffer(2)]], device uint* out [[buffer(3)]], uint w [[thread_position_in_grid]]) { if (w < (*nPtr + 31u) / 32u) out[w] = a[w] & b[w]; }"
-        let gsNew = P + "kernel void gs_new(device const int* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device int* out [[buffer(2)]], uint gid [[thread_position_in_grid]], uint gridSize [[threads_per_grid]]) { uint n = *nPtr; AM_GRID_STRIDE(i, gid, n, gridSize, out[i] = a[i] + 1;) }"
-        let gsPlain = P + "kernel void gs_plain(device const int* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device int* out [[buffer(2)]], uint gid [[thread_position_in_grid]], uint gridSize [[threads_per_grid]]) { uint n = *nPtr; for (uint i = gid; i < n; i += gridSize) { out[i] = a[i] + 1; } }"
-        let gsSat = P + "kernel void gs_sat(device const int* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device int* out [[buffer(2)]], uint gid [[thread_position_in_grid]], uint gridSize [[threads_per_grid]]) { uint n = *nPtr; for (uint i = gid; i < n; i = (n - i > gridSize) ? i + gridSize : n) { out[i] = a[i] + 1; } }"
-        let rhOld = radix.replacingOccurrences(of: "len = (start < n) ? min(elemsPerBlock, n - start) : 0u;", with: "end = min(n, start + elemsPerBlock);")
-                         .replacingOccurrences(of: "for (uint off = lid; off < len; off += TG) { uint i = start + off;", with: "for (uint i = start + lid; i < end; i += TG) {")
-        let rhNoTernary = radix.replacingOccurrences(of: "len = (start < n) ? min(elemsPerBlock, n - start) : 0u;", with: "len = min(elemsPerBlock, n - start);")
-        for (label, src, fn) in [("i+lid", lidK, "k_lid"), ("i+threads_per_grid loop", tpgK, "k_tpg"), ("tgid+lid+threadgroup atomics", tgK, "k_tg"), ("tgid only", tgOnlyK, "k_tgonly"),
-                                 ("library radix_histogram (current)", radix, "radix_histogram"), ("radix_histogram with the pre-wrap loop", rhOld, "radix_histogram"),
-                                 ("radix_histogram without the len ternary", rhNoTernary, "radix_histogram"),
-                                 ("bitmap word count new form", bmNew, "bm_new"), ("bitmap word count old form", bmOld, "bm_old"),
-                                 ("AM_GRID_STRIDE macro", gsNew, "gs_new"), ("plain grid-stride loop", gsPlain, "gs_plain"), ("saturating grid-stride loop", gsSat, "gs_sat")] {
-            variants.append((label + " scalar", src, fn))
-        }
-        variants.append(("library radix_histogram folded", Dispatch.foldGridPositions(radix), "radix_histogram"))
-        for safe in [true] {
-            for (label, src, fn) in variants {
-                let opts = MTLCompileOptions()
-                if safe { if #available(macOS 15.0, *) { opts.mathMode = .safe } else { opts.fastMathEnabled = false } }
-                do {
-                    let lib = try device.makeLibrary(source: src, options: opts)
-                    guard let f = lib.makeFunction(name: fn) else { print("DIAG: \(label) safe=\(safe): function missing"); continue }
-                    do { _ = try device.makeComputePipelineState(function: f); print("DIAG: \(label) safe=\(safe): pipeline OK") }
-                    catch { print("DIAG: \(label) safe=\(safe): PIPELINE FAILED: \(MetalContext.describe(error))") }
-                } catch { print("DIAG: \(label) safe=\(safe): LIBRARY FAILED: \(MetalContext.describe(error))") }
-            }
+        let scalar = pre + "kernel void k_scalar(device const float* a [[buffer(0)]], device float* o [[buffer(1)]], constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) { if (i < n) o[i] = fabs(a[i]); }"
+        // The radix histogram kernel alone, with the sort source's defines, in its current form and with the loop it had
+        // before the 2026-09-26 32-bit wrap rewrite.
+        let sortSrc = SortSource.source(K: "ulong")
+        let start = sortSrc.range(of: "kernel void radix_histogram")!.lowerBound
+        let afterStart = sortSrc.index(start, offsetBy: 30)
+        let end = sortSrc.range(of: "kernel void", range: afterStart..<sortSrc.endIndex)?.lowerBound ?? sortSrc.endIndex
+        let histogram = String(sortSrc[start..<end])
+        let defines = "#define RADIX 256u\n#define DIGIT_BITS 8u\n#define DIGIT_MASK 0xFFu\n#define SIMDS (TG / 32u)\n"
+        let radixCurrent = KernelSource.prelude + defines + histogram
+        let oldLoop = histogram
+            .replacingOccurrences(of: "len = (start < n) ? min(elemsPerBlock, n - start) : 0u;", with: "end = min(n, start + elemsPerBlock);")
+            .replacingOccurrences(of: "for (uint off = lid; off < len; off += TG) { uint i = start + off;", with: "for (uint i = start + lid; i < end; i += TG) {")
+        let radixOld = KernelSource.prelude + defines + oldLoop
+        let radixNoTernary = KernelSource.prelude + defines + histogram.replacingOccurrences(of: "len = (start < n) ? min(elemsPerBlock, n - start) : 0u;", with: "len = min(elemsPerBlock, n - start);")
+        let radixEndLoop = KernelSource.prelude + defines + histogram.replacingOccurrences(of: "for (uint off = lid; off < len; off += TG) { uint i = start + off;", with: "for (uint i = start + lid; i < start + len; i += TG) {")
+        let all: [(String, String, String)] = [
+            ("scalar", scalar, "k_scalar"),
+            ("abs-lib", Dispatch.foldGridPositions(MetalArray<Double>.mathSource.0), "math_unary_abs"),
+            ("radix-current", radixCurrent, "radix_histogram"),
+            ("radix-oldloop", radixOld, "radix_histogram"),
+            ("radix-noternary", radixNoTernary, "radix_histogram"),
+            ("radix-endloop", radixEndLoop, "radix_histogram"),
+            ("radix-current-folded", Dispatch.foldGridPositions(radixCurrent), "radix_histogram"),
+        ]
+        let only = ProcessInfo.processInfo.environment["ARROWMETAL_DIAG_ONLY"].map { $0.split(separator: ",").map(String.init) }
+        let run = only.map { names in names.compactMap { n in all.first { $0.0 == n } } } ?? all
+        print("DIAG: device \(device.name) apple7=\(device.supportsFamily(.apple7)) mac2=\(device.supportsFamily(.mac2)); order \(run.map(\.0).joined(separator: ","))")
+        for (label, src, fn) in run {
+            let opts = MTLCompileOptions()
+            if #available(macOS 15.0, *) { opts.mathMode = .safe } else { opts.fastMathEnabled = false }
+            do {
+                let lib = try device.makeLibrary(source: src, options: opts)
+                guard let f = lib.makeFunction(name: fn) else { print("DIAG: \(label): function missing"); continue }
+                do { _ = try device.makeComputePipelineState(function: f); print("DIAG: \(label): pipeline OK") }
+                catch { print("DIAG: \(label): PIPELINE FAILED: \(MetalContext.describe(error))") }
+            } catch { print("DIAG: \(label): LIBRARY FAILED: \(MetalContext.describe(error).prefix(300))") }
         }
         print("DIAG: end")
     }

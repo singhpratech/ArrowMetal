@@ -1,38 +1,22 @@
 name: device-diag
-# Reports what the runner's Metal device builds: kernel variants from a Swift test process, the same kernels
-# through the dylib from Python, and the full Swift suite's failures (Tests/ArrowMetalTests/DeviceDiagnosticTests.swift).
+# Reports what the runner's Metal device builds (Tests/ArrowMetalTests/DeviceDiagnosticTests.swift): each selection
+# runs in a fresh process, so a failure cannot affect the next one.
 on:
   workflow_dispatch:
-env:
-  ARROWMETAL_DEBUG_SHADERS: "1"
 jobs:
   device-diag:
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - run: sudo xcode-select -s /Applications/Xcode_16.4.app || true
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - run: swift --version
-      - name: Kernel variants from a Swift test process
+      - name: Build
         run: |
           set -o pipefail
-          ARROWMETAL_DEVICE_DIAG=1 swift test -c release --filter DeviceDiagnosticTests 2>&1 | grep -E "DIAG:|error:|Executed|Build complete" | head -40
-      - name: The same kernels through the dylib from Python
+          swift build -c release --build-tests -Xswiftc -enable-testing 2>&1 | grep -E "error:|Build complete" | tail -5
+      - name: One selection per process
         run: |
-          swift build -c release --product ArrowMetalC 2>&1 | tail -1
-          python -m pip install -q pyarrow numpy
-          export PYTHONPATH=$PWD/python ARROWMETAL_LIB=$PWD/.build/release/libArrowMetalC.dylib
-          python - <<'PY' 2>&1 | grep -v "^#\|^//\|^inline\|^    \|^}$\|^$\|^using\|^#define\|^kernel" | head -60
-          import pyarrow as pa, arrowmetal as am, os
-          print("PY: pid", os.getpid(), "device", am.device_name())
-          a = am.array(pa.array([1.0, -2.0, None, 3.5]))
-          for name, f in [("abs", lambda: a.abs()), ("sum", lambda: a.sum()), ("argsort", lambda: a.argsort())]:
-              try: print("PY:", name, "OK", f())
-              except Exception as e: print("PY:", name, "FAILED", str(e)[:300])
-          PY
-      - name: Full Swift suite, failures only
-        run: |
-          swift test -c release 2>&1 | grep -E "Test Case '.*' failed|error:|Fatal error|Executed [0-9]+ tests" | grep -v skipped | tail -40
+          for sel in scalar abs-lib radix-current radix-oldloop radix-noternary radix-endloop radix-current-folded "radix-current,scalar" "radix-current,abs-lib" "scalar,radix-oldloop,radix-current,scalar"; do
+            echo "=== $sel"
+            ARROWMETAL_DEVICE_DIAG=1 ARROWMETAL_DIAG_ONLY="$sel" swift test -c release --skip-build --filter DeviceDiagnosticTests 2>&1 | grep -E "DIAG:" || true
+          done
