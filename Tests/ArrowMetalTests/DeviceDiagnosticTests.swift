@@ -32,9 +32,24 @@ final class DeviceDiagnosticTests: XCTestCase {
         let radix = SortSource.source(K: "ulong")
         var variants: [(String, String, String)] = [("scalar", scalar, "k_scalar"), ("folded", folded, "k_folded"), ("by-hand uint2", byHand, "k_hand"),
                                                     ("library math_unary_abs (folded)", Dispatch.foldGridPositions(real), "math_unary_abs")]
-        for (label, src, fn) in [("i+lid", lidK, "k_lid"), ("i+threads_per_grid loop", tpgK, "k_tpg"), ("tgid+lid+threadgroup atomics", tgK, "k_tg"), ("tgid only", tgOnlyK, "k_tgonly"), ("library radix_histogram", radix, "radix_histogram")] {
-            variants.append((label + " scalar", src, fn)); variants.append((label + " folded", Dispatch.foldGridPositions(src), fn))
+        // The constructs the 2026-09-26 32-bit wrap rewrite introduced, one per kernel, in the current and the earlier form.
+        let P = KernelSource.prelude
+        let bmNew = P + "kernel void bm_new(device const uint* a [[buffer(0)]], device const uint* b [[buffer(1)]], device const uint* nPtr [[buffer(2)]], device uint* out [[buffer(3)]], uint w [[thread_position_in_grid]]) { if (w < ((*nPtr >> 5) + (uint)((*nPtr & 31u) != 0u))) out[w] = a[w] & b[w]; }"
+        let bmOld = P + "kernel void bm_old(device const uint* a [[buffer(0)]], device const uint* b [[buffer(1)]], device const uint* nPtr [[buffer(2)]], device uint* out [[buffer(3)]], uint w [[thread_position_in_grid]]) { if (w < (*nPtr + 31u) / 32u) out[w] = a[w] & b[w]; }"
+        let gsNew = P + "kernel void gs_new(device const int* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device int* out [[buffer(2)]], uint gid [[thread_position_in_grid]], uint gridSize [[threads_per_grid]]) { uint n = *nPtr; AM_GRID_STRIDE(i, gid, n, gridSize, out[i] = a[i] + 1;) }"
+        let gsPlain = P + "kernel void gs_plain(device const int* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device int* out [[buffer(2)]], uint gid [[thread_position_in_grid]], uint gridSize [[threads_per_grid]]) { uint n = *nPtr; for (uint i = gid; i < n; i += gridSize) { out[i] = a[i] + 1; } }"
+        let gsSat = P + "kernel void gs_sat(device const int* a [[buffer(0)]], device const uint* nPtr [[buffer(1)]], device int* out [[buffer(2)]], uint gid [[thread_position_in_grid]], uint gridSize [[threads_per_grid]]) { uint n = *nPtr; for (uint i = gid; i < n; i = (n - i > gridSize) ? i + gridSize : n) { out[i] = a[i] + 1; } }"
+        let rhOld = radix.replacingOccurrences(of: "len = (start < n) ? min(elemsPerBlock, n - start) : 0u;", with: "end = min(n, start + elemsPerBlock);")
+                         .replacingOccurrences(of: "for (uint off = lid; off < len; off += TG) { uint i = start + off;", with: "for (uint i = start + lid; i < end; i += TG) {")
+        let rhNoTernary = radix.replacingOccurrences(of: "len = (start < n) ? min(elemsPerBlock, n - start) : 0u;", with: "len = min(elemsPerBlock, n - start);")
+        for (label, src, fn) in [("i+lid", lidK, "k_lid"), ("i+threads_per_grid loop", tpgK, "k_tpg"), ("tgid+lid+threadgroup atomics", tgK, "k_tg"), ("tgid only", tgOnlyK, "k_tgonly"),
+                                 ("library radix_histogram (current)", radix, "radix_histogram"), ("radix_histogram with the pre-wrap loop", rhOld, "radix_histogram"),
+                                 ("radix_histogram without the len ternary", rhNoTernary, "radix_histogram"),
+                                 ("bitmap word count new form", bmNew, "bm_new"), ("bitmap word count old form", bmOld, "bm_old"),
+                                 ("AM_GRID_STRIDE macro", gsNew, "gs_new"), ("plain grid-stride loop", gsPlain, "gs_plain"), ("saturating grid-stride loop", gsSat, "gs_sat")] {
+            variants.append((label + " scalar", src, fn))
         }
+        variants.append(("library radix_histogram folded", Dispatch.foldGridPositions(radix), "radix_histogram"))
         for safe in [true] {
             for (label, src, fn) in variants {
                 let opts = MTLCompileOptions()
