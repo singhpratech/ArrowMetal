@@ -27,11 +27,26 @@ final class ExprSignBitTests: XCTestCase {
     ]
 
     /// `n` values cycling through the special patterns, with a null every 7th row from row 3.
+    // Written as statements: the one-expression closures time out Swift 6.1's type checker (Xcode 16.4).
     static func doubles(_ n: Int) -> [Double?] {
-        (0..<n).map { i in i % 7 == 3 ? nil : Double(bitPattern: doubleBits[(i * 5 + i / 3) % doubleBits.count]) }
+        var out: [Double?] = []
+        out.reserveCapacity(n)
+        for i in 0..<n {
+            if i % 7 == 3 { out.append(nil); continue }
+            let bits: UInt64 = doubleBits[(i * 5 + i / 3) % doubleBits.count]
+            out.append(Double(bitPattern: bits))
+        }
+        return out
     }
     static func floats(_ n: Int) -> [Float?] {
-        (0..<n).map { i in i % 7 == 3 ? nil : Float(bitPattern: floatBits[(i * 5 + i / 3) % floatBits.count]) }
+        var out: [Float?] = []
+        out.reserveCapacity(n)
+        for i in 0..<n {
+            if i % 7 == 3 { out.append(nil); continue }
+            let bits: UInt32 = floatBits[(i * 5 + i / 3) % floatBits.count]
+            out.append(Float(bitPattern: bits))
+        }
+        return out
     }
 
     /// The IEEE totalOrder key (arrow-rs `total_cmp`): the sign-flip transform of the bit pattern.

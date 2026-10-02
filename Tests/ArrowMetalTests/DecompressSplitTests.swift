@@ -285,7 +285,7 @@ final class DecompressSplitTests: XCTestCase {
                 }
                 XCTAssertTrue(pages(hostBlocks).isDisjoint(with: pages(gpuBlocks)), "\(leaf.name) pattern \(pattern)")
                 // Every page has its own slot, inside the staging buffer.
-                let slots = (st.dictOffsets + st.dataOffsets).map(Int.init)
+                let slots: [Int] = (st.dictOffsets + st.dataOffsets).map { Int($0) }   // not `Int.init`: ambiguous on Swift 6.1
                 XCTAssertEqual(Set(slots).count, slots.count)
                 for b in hostBlocks + gpuBlocks { XCTAssertLessThanOrEqual(Int(b.dstOffset) + Int(b.dstLength), st.size) }
                 checked += 1
