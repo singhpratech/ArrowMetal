@@ -1036,7 +1036,12 @@ impl ExecutionPlan for MetalExec {
                 return internal_err!("MetalExec join slot empty");
             };
             *taken += 1;
-            let s = partition_of(shared.clone(), partition, n, ctx);
+            let shared = shared.clone();
+            if *taken >= n {
+                // Every partition has its handle: the result lives as long as their streams.
+                *slot = None;
+            }
+            let s = partition_of(shared, partition, n, ctx);
             return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, s)));
         }
         let job = self.job(&ctx);

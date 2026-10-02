@@ -73,7 +73,8 @@
   `am_sort_ex2`, `am_top_k_ex`, `am_lexsort_ex2`), plan JSON `"float_order": "nan_largest"`, Python
   `float_order="nan_largest"`, Rust `FloatOrder::NanLargest`, Go `FloatNanLargest` (on
   `ArgsortWith`, `SortWith`, `TopKWith`, `LexsortWith`), Node `floatOrder: 'nan_largest'` (on
-  `argsort`, `sort`, `topK`, `lexsort`).
+  `argsort`, `sort`, `topK`, `lexsort`), R `float_order = "nan_largest"` (on `am_argsort()`,
+  `am_sort()`, `am_top_k()`, `am_lexsort()`).
   - Window `order_by` keys take the sort key options: each key's null placement and float order, in
     the plan JSON (`[column, descending, {"nulls", "float_order"}]` or the key object, with a window
     spec's own `nulls` / `float_order` as the defaults) and in Python (`with_rank(...,
@@ -83,7 +84,9 @@
     floatOrder:)`, `am_stream_sort_ex` (per key `null_placement` and `float_order`), and
     `Stream.sort(..., null_placement=, float_order=)` / `sort_to_ipc`. The per-batch GPU sort and the
     CPU k-way merge order by the same rules, so a NaN now merges where the batch sort put it (the merge
-    used to compare NaN as neither less nor greater). With a limit, the top-n threshold keeps the rows
+    used to compare NaN as neither less nor greater); a Float32 key reaches the merge with its NaN bits
+    as they are, so under `total` a signaling NaN keeps its place among the NaNs (widening it to a
+    Double quieted it, and the merge put it after the quiet NaNs; `StreamSortFloat32Tests`). With a limit, the top-n threshold keeps the rows
     that can still win under the key's options (a batch holding nulls when they sort first, NaN rows
     where the float order puts NaN ahead), and a NaN threshold no longer rejects the later rows.
   - Tests: `SortNanLargestTests` (argsort, sorted values, both top-k selections and lexsort under
@@ -235,8 +238,8 @@
   - To improve: at 2M rows the two-key means `(c)` (0.82x), `(g2mean100k)` (0.65x) and `(g2mean10k)`
     (0.87x, taken by the earlier table at 0.73x) are behind in that benchmark and the rule leaves them
     to Polars' in-memory plan; re-timed, three alternating rounds
-    (`Benchmarks/results/polars_engine_default_groupby_retime_2026-10-01.csv`): 8.28 → 6.83, 6.54 →
-    6.78 and 8.24 → 7.39 ms best against the faster Polars engine's 5.49, 4.98 and 5.61 ms, at 77 to
+    (`Benchmarks/results/polars_engine_default_groupby_retime_2026-10-01.csv`): 8.28 → 6.83, 8.24 →
+    7.39 and 6.54 → 6.78 ms best against the faster Polars engine's 5.49, 5.61 and 4.98 ms, at 77 to
     90 CPU-ms instead of 4 to 6; `(g2minmax10k)`, in `(c)`'s 10,000-group min + max bucket, stays on
     the GPU (4.04 ms, 1.34x). Run back to back with no idle gap
     (`Benchmarks/results/polars_engine_groupby_backtoback_2026-10-01.csv`) the default runs the three
@@ -276,7 +279,10 @@
   `datafusion/results/datafusion_join_2026-10-01.csv`), which takes none of its 18 cells, so the
   default replaces no join. Every node the rule looks at is reported with the reason it was taken or left, and every
   aggregate's run-time choice with its estimate; an ArrowMetal error, a panic in the GPU path or a
-  refused memory reservation runs the replaced DataFusion subtree instead.
+  refused memory reservation runs the replaced DataFusion subtree instead. A `GROUP BY` whose output
+  carries an ordering (its input sorted on the keys) is left to DataFusion, whose plan relies on that
+  order; a replaced join's result and its memory reservation are released once every output
+  partition has taken its share.
   - Correctness: `tests/grid.rs` runs 13,632 query pairs with and without the rule (sorts with every
     null placement and direction, floats with ±0.0, ±inf, NaN, -NaN and NaN payloads, strings as
     Utf8, Utf8View and LargeUtf8, nulls, one and several partitions; every `GROUP BY` forced onto the
@@ -312,9 +318,8 @@
     sign bit set and the refusal of zero and infinite literals are gone. Filters stay off by
     default: 0.31x to 0.79x of DataFusion alone
     (`datafusion/results/datafusion_filter_2026-10-01.csv`).
-  - `examples/bench.rs` waits while any `BUILDING*` or `TIMING` file exists, creates `TIMING` with
-    its own `<BENCH_LANE> <pid>` tag only if absent, and removes only a `TIMING` file holding that
-    tag. The aggregate sweep (`--families gsweep`) also times `min`/`max` over a Float32 column.
+  - The aggregate sweep of `examples/bench.rs` (`--families gsweep`) also times `min`/`max` over a
+    Float32 column.
   - Measured on an M4 Max, DataFusion's defaults (16 partitions), with a warm-up before timing,
     best of 5 (`datafusion/results/datafusion_sort_warm_2026-09-29.csv`): full sorts by an int64,
     Float64, Float32 or string key are 6.9x to 28.8x faster than DataFusion alone from 250,000 to
@@ -333,8 +338,8 @@
     alone on the best run and 0.971x to 1.081x on the median. The first GPU
     query of a process compiles its Metal pipelines, 42 to 66 ms at 10M rows
     (`datafusion/results/datafusion_coldstart_2026-09-29.csv`). With the rule switched on for them
-    (DataFusion alone ÷ with the rule): top-k 0.14x to 0.41x from 250,000 to 50M rows, filters 0.51x
-    to 0.74x, Float64 `sum`/`avg` 0.21x to 2.81x, Float64 `min`/`max` 0.33x to 3.41x and Float32
+    (DataFusion alone ÷ with the rule): top-k 0.14x to 0.41x from 250,000 to 50M rows, filters 0.31x
+    to 0.79x over `MemTable`s and 0.51x to 0.55x over Parquet, Float64 `sum`/`avg` 0.21x to 2.81x, Float64 `min`/`max` 0.33x to 3.41x and Float32
     `min`/`max` 0.29x to 2.63x at 1M to 50M rows, and about rows / 2 groups 0.44x to 1.11x at 50M
     rows; of the 38 aggregate series at least 1.65x faster warm at two sizes, 23 are left by their
     first run after idle at 50M rows (7 at 0.80x to 0.98x of DataFusion alone's first run after the
@@ -365,8 +370,8 @@
     entry points are resolved when the library has them: an older `libArrowMetalC.dylib` still loads,
     and a new call names the entry point it lacks.
   - Tests: Go 66 test functions and 3 examples (20 functions and 2 examples new), 584 results with
-    subtests, plain, under `-race` and under `GOEXPERIMENT=cgocheck2`; Node 84 tests (22 new); R 88
-    `test_that()` blocks as testthat runs them (19 new), 818 expectations. The sorts are checked index
+    subtests, plain, under `-race` and under `GOEXPERIMENT=cgocheck2`; Node 84 tests (22 new); R 89
+    `test_that()` blocks as testthat runs them (20 new), 920 expectations. The sorts are checked index
     for index against arrow-go's `SortIndices` and arrow R's `array_sort_indices` for the IEEE order
     with nulls last, and against a stable reference of the documented order for every direction,
     null placement and float order, on columns holding NaN of both signs and several payloads, ±0.0,

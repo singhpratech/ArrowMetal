@@ -156,7 +156,7 @@ am_take <- function(x, indices) {
 }
 
 null_placements <- c(at_end = 0L, at_start = 1L)
-float_orders <- c(ieee = 0L, total = 1L)
+float_orders <- c(ieee = 0L, total = 1L, nan_largest = 2L)
 
 sort_code <- function(value, table, what) {
   if (!is.character(value) || length(value) != 1L || is.na(value) || !(value %in% names(table)))
@@ -178,13 +178,15 @@ sort_defaults <- function(null_placement, float_order)
 #' "total"` orders a float column by IEEE 754 totalOrder, as arrow-rs and Rust's `total_cmp` define
 #' it: `-NaN < -Inf < ... < -0 < +0 < ... < +Inf < +NaN`, and a descending sort is its exact mirror.
 #' The default `"ieee"` is Arrow C++'s order: `-0` ties `+0`, every `NaN` is one value, and the `NaN`
-#' rows sit next to the nulls in both directions. Integer, string and temporal columns ignore
-#' `float_order`. Neither option adds a pass to the GPU sort.
+#' rows sit next to the nulls in both directions. `"nan_largest"` is Polars' and NumPy's order: every
+#' `NaN` is one value above `+Inf` in both directions (last ascending, first descending) and `-0` ties
+#' `+0`. Integer, string and temporal columns ignore `float_order`. Neither option adds a pass to the
+#' GPU sort.
 #'
 #' @param x An `am_array`, or anything [am_array()] accepts.
 #' @param descending Sort largest first.
 #' @param null_placement `"at_end"` (the default) or `"at_start"`, as in Arrow's sort options.
-#' @param float_order `"ieee"` (the default) or `"total"`.
+#' @param float_order `"ieee"` (the default), `"total"` or `"nan_largest"`.
 #' @return A uint32 `am_array` of zero-based indices. Row numbers go up to 2^32 - 1; `as.vector()`
 #'   gives an integer vector when every index fits a 32-bit R integer and a double vector when one
 #'   passes 2^31 - 1, which is how the `arrow` package reads uint32.
@@ -248,7 +250,7 @@ am_top_k <- function(x, k, largest = TRUE, null_placement = "at_end", float_orde
 #' @param columns A list of columns: `am_array`s or anything [am_array()] accepts, all one length.
 #' @param descending Logical, one per column or one for all.
 #' @param null_placement `"at_end"` or `"at_start"`, one per column or one for all.
-#' @param float_order `"ieee"` or `"total"`, one per column or one for all.
+#' @param float_order `"ieee"`, `"total"` or `"nan_largest"`, one per column or one for all.
 #' @return A uint32 `am_array` of zero-based indices (read back as [am_argsort()]'s).
 #' @examples
 #' if (am_available()) {

@@ -559,6 +559,12 @@ impl ArrowMetalRule {
             if !self.config.aggregate {
                 return Some(Candidate::new(Err("aggregate disabled in config".into()), Arc::clone(agg.input())));
             }
+            if node.output_ordering().is_some() {
+                return Some(Candidate::new(
+                    Err("the aggregate's output carries an ordering (sorted input), which the GPU group-by does not keep".into()),
+                    Arc::clone(agg.input()),
+                ));
+            }
             return Some(match agg.mode() {
                 AggregateMode::Single | AggregateMode::SinglePartitioned => {
                     Candidate::new(translate::aggregate_op(agg), Arc::clone(agg.input()))

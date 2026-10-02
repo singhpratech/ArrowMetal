@@ -76,7 +76,8 @@ as.vector(as_arrow_array(res$amount))                # back to plain R
 ## Sort options
 
 `am_argsort()`, `am_sort()`, `am_top_k()` and `am_lexsort()` take Arrow's `null_placement`
-(`"at_end"`, the default, or `"at_start"`) and a `float_order` (`"ieee"`, the default, or `"total"`):
+(`"at_end"`, the default, or `"at_start"`) and a `float_order` (`"ieee"`, the default, `"total"` or
+`"nan_largest"`):
 
 ```r
 x <- c(2, NA, NaN, -0, 7)
@@ -93,8 +94,10 @@ With the defaults each function runs the call it always ran: nulls last and `NaN
 tied with `0`. `"at_start"` puts the nulls first in either direction. `float_order = "ieee"` is Arrow
 C++'s order: `-0` ties `0`, every `NaN` is one value, and the `NaN` rows sit next to the nulls in both
 directions. `"total"` is IEEE 754 totalOrder, the order arrow-rs and Rust's `total_cmp` use:
-`-NaN < -Inf < ... < -0 < 0 < ... < Inf < NaN`, and a descending sort is its exact mirror. Integer,
-string and temporal columns ignore `float_order`. `am_top_k(x, k, largest, ...)` is the first `k`
+`-NaN < -Inf < ... < -0 < 0 < ... < Inf < NaN`, and a descending sort is its exact mirror.
+`"nan_largest"` is Polars' and NumPy's order: every `NaN` is one value above `+Inf` in both directions
+(last ascending, first descending) and `-0` ties `0`. Integer, string and temporal columns ignore
+`float_order`. `am_top_k(x, k, largest, ...)` is the first `k`
 indices of `am_argsort(x, descending = largest, ...)`. In `am_lexsort()` each option is one value for
 every key or a vector with one per key. A plan's `sort` key takes the same options as JSON:
 `{"column": "x", "descending": true, "nulls": "first", "float_order": "total"}` ([ENGINE.md](ENGINE.md)).
@@ -314,7 +317,7 @@ column; and multi-chunk, single-chunk and empty ChunkedArrays.
 
 ## Not covered
 
-The binding resolves 42 of the ABI's 283 entry points (36 it needs, and 6 newer ones it uses when the
+The binding resolves 42 of the ABI's 286 entry points (36 it needs, and 6 newer ones it uses when the
 loaded library has them). Not wrapped, and reachable only from
 Python or Swift for now:
 
@@ -369,7 +372,7 @@ There is also no dplyr backend and no `RecordBatch`/`Table` surface: everything 
 
 `src/arrowmetal.h` and `src/arrow_abi.h` are copies of the repository's `include/` headers; refresh them (`cp include/arrowmetal.h r/arrowmetal/src/`) whenever the header changes, or `python/tests/test_header_copies.py` and `test-header-copy.R` fail.
 
-87 `test_that()` blocks in the sources (88 as testthat runs them: the one in test-dispatch.R runs once per attach order), 818 expectations, against base R and against `arrow`'s own
+88 `test_that()` blocks in the sources (89 as testthat runs them: the one in test-dispatch.R runs once per attach order), 920 expectations, against base R and against `arrow`'s own
 kernels on the same data: nulls, all-null and empty columns, sliced input at three offsets, lengths
 of 1, 33, 1024, 65537 and 1,000,001 (crossing a threadgroup boundary), one group per row and one group for
 everything, int64 above 2^53, float32 accumulation, and every documented error path.

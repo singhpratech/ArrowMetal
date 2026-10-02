@@ -69,7 +69,7 @@ Copy-free out, always. Copy-free in when the producer's buffers are page aligned
 
 ## Tests
 
-1,045 test functions in 86 files under `Tests/ArrowMetalTests`, run in release; the oracles are plain-Swift
+1,046 test functions in 87 files under `Tests/ArrowMetalTests`, run in release; the oracles are plain-Swift
 CPU references, hand-computed vectors and pyarrow answers pinned as literals ([TESTING.md](TESTING.md)).
 Tests that need a real GPU skip on virtual Metal devices.
 

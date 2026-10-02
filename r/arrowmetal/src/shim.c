@@ -549,7 +549,8 @@ SEXP C_am_sort(SEXP h, SEXP descending) {
   return wrap_am_array(out);
 }
 
-/* The option-taking sorts. null_placement: 0 last, 1 first; float_order: 0 ieee, 1 total. */
+/* The option-taking sorts. null_placement: 0 last, 1 first; float_order: 0 ieee, 1 total,
+ * 2 nan_largest. */
 SEXP C_am_argsort_ex(SEXP h, SEXP descending, SEXP null_placement, SEXP float_order) {
   require_sym((const void *)p_am_argsort_ex2, "am_argsort_ex2");
   am_array *out = NULL;

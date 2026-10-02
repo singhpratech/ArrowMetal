@@ -221,3 +221,53 @@ test_that("the docs/R.md sort-options lines", {
   expect_identical(as.vector(am_lexsort(list(c(1, 1, 2), c(3, NA, 1)), descending = c(FALSE, TRUE),
                                         null_placement = c("at_end", "at_start"))), c(1L, 0L, 2L))
 })
+
+# nan_largest reference (Polars' and NumPy's order): NaN of either sign is one value above +Inf in
+# both directions, -0 ties +0, ties keep row order; the nulls placed as asked.
+ref_nan_largest <- function(a, descending, null_placement) {
+  x <- as.vector(a)
+  isnull <- as.vector(arrow::call_function("is_null", a))
+  valid <- which(!isnull)
+  v <- x[valid]
+  isn <- is.nan(v)
+  val <- ifelse(isn, 0, v) + 0  # -0 + 0 is +0
+  o <- order(isn, val, seq_along(valid), method = "radix",
+             decreasing = c(descending, descending, FALSE))
+  idx <- valid[o]
+  nulls <- which(isnull)
+  (if (null_placement == "at_start") c(nulls, idx) else c(idx, nulls)) - 1L
+}
+
+test_that("float_order = \"nan_largest\": argsort, sort, top_k and lexsort", {
+  skip_without_gpu()
+  for (n in c(0L, 1L, 33L, 1025L, 100001L)) {
+    a <- awkward_col(n, 7L, n + 11L)
+    h <- am_array(a)
+    x <- as.vector(a)
+    for (desc in c(FALSE, TRUE)) {
+      for (np in c("at_end", "at_start")) {
+        ref <- as.integer(ref_nan_largest(a, desc, np))
+        label <- sprintf("n=%d desc=%s %s", n, desc, np)
+        expect_identical(as.vector(as_arrow_array(am_argsort(h, desc, np, "nan_largest"))), ref,
+                         label = label)
+        out <- as_arrow_array(am_sort(h, desc, np, "nan_largest"))
+        got_null <- as.vector(arrow::call_function("is_null", out))
+        expect_identical(got_null, is.na(x[ref + 1L]) & !is.nan(x[ref + 1L]), label = label)
+        # the sorted copy holds the reference order's values (-0 and +0 tie, so compared as +0)
+        keep <- !got_null
+        expect_identical(as.vector(out)[keep] + 0, x[ref + 1L][keep] + 0, label = label)
+        k <- min(50L, n)
+        expect_identical(as.vector(as_arrow_array(am_top_k(h, k, desc, np, "nan_largest"))),
+                         ref[seq_len(k)], label = label)
+        expect_identical(as.vector(as_arrow_array(am_lexsort(list(h), desc, np, "nan_largest"))),
+                         ref, label = label)
+      }
+    }
+  }
+  # a float32 column takes it too
+  a32 <- arrow::Array$create(c(1.5, NaN, -Inf, NA, -0, 0, Inf, NaN), type = arrow::float32())
+  expect_identical(as.vector(am_argsort(a32, float_order = "nan_largest")),
+                   c(2L, 4L, 5L, 0L, 6L, 1L, 7L, 3L))
+  expect_identical(as.vector(am_argsort(a32, TRUE, float_order = "nan_largest")),
+                   c(1L, 7L, 6L, 0L, 4L, 5L, 2L, 3L))
+})

@@ -10,20 +10,20 @@ am_lexsort(
 )
 }
 \arguments{
-\item{columns}{A list of columns: `am_array`s or anything [am_array()] accepts, all one length.}
+\item{columns}{A list of columns: \code{am_array}s or anything \code{\link{am_array}()} accepts, all one length.}
 
 \item{descending}{Logical, one per column or one for all.}
 
-\item{null_placement}{`"at_end"` or `"at_start"`, one per column or one for all.}
+\item{null_placement}{\code{"at_end"} or \code{"at_start"}, one per column or one for all.}
 
-\item{float_order}{`"ieee"` or `"total"`, one per column or one for all.}
+\item{float_order}{\code{"ieee"}, \code{"total"} or \code{"nan_largest"}, one per column or one for all.}
 }
 \value{
-A uint32 `am_array` of zero-based indices, read back as \code{am_argsort()}'s.
+A uint32 \code{am_array} of zero-based indices, read back as \code{am_argsort()}'s.
 }
 \description{
 Orders the rows by each column in turn, the first column the most significant. Each of
-`descending`, `null_placement` and `float_order` is one value for every column or a vector with
+\code{descending}, \code{null_placement} and \code{float_order} is one value for every column or a vector with
 one per column, so each key can have its own direction, null placement and float order.
 }
 \examples{

@@ -384,6 +384,7 @@ ends with the reason ([Joins, rule on and off](#joins-rule-on-and-off)).
 | a sort over an estimated row count (above a filter, a join or an aggregate) | left | the threshold needs an exact count; `accept_inexact` takes it |
 | a sort key that is an expression, or a key or carried column of another type (Date, Timestamp, Decimal, Dictionary, nested) | left | not in the types the grid covers |
 | a per-partition sort with no merge above it, a merge whose ordering differs from its sort's | left | one sorted partition cannot stand in for several |
+| a `GROUP BY` whose output carries an ordering (its input sorted on the keys, where DataFusion drops the `ORDER BY` above it) | left | the GPU group-by does not keep that order |
 
 Each of these is a `LEFT` line in the report with its reason; the rule does not report the nodes it
 has no operator for (a nested-loop or sort-merge join, a window, a union).
@@ -1132,7 +1133,7 @@ warm time for the same query (8.08 to 31.75 ms).
 
 ```bash
 cd datafusion
-ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib cargo test                       # 37 tests + 1 doc-test
+ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib cargo test                       # 42 tests + 1 doc-test
 ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib cargo test --test rule -- --ignored   # default config at 2M rows
 ```
 
@@ -1141,9 +1142,10 @@ ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib cargo test --test rule -- --ignored
 | `tests/grid.rs` | the differential grid above (1 test) |
 | `tests/rule.rs` | 20 tests: the threshold and its reason, inexact statistics, the config switches, what the default leaves, unsupported shapes, `EXPLAIN` (an aggregate and a join), `ORDER BY` through a projection, replaced aggregates under a partitioned join, `count(DISTINCT)`, the forced hand-back, the measured choice's two branches, a refused memory reservation (a sort and a group-by; a join); joins replaced and matching with one and four partitions (collected and hash-partitioned plans, an aggregate above, an empty projection), an ordered inner join keeping the probe order, the joins the rule leaves with their reasons, the default config's join table; plus 1 ignored test of the default configuration at 2,000,000 rows |
 | `src/probe.rs`, `src/exec.rs` (unit tests) | 7 tests: the group-count estimate (exact small inputs, 200 to 1,000,000 groups, sorted keys, key tuples, the same estimate for the same input, a prefix of the input) and the whole-input check of a prefix that under-counts |
+| `tests/edge_paths.rs` | 5 tests: a `GROUP BY` over input declared sorted on its keys keeps the order (left), a replaced join's plan collected twice with nothing reserved after the query, the hand-back when the result's reservation is refused, a top-k under an `OFFSET`, an ordered right join keeping the probe order |
 | `tests/arrowmetal_repros.rs` | 9 tests of ArrowMetal's plan runner alone, no DataFusion: totalOrder against arrow-rs, NaN and zero group keys, `count` on every path, the chunked import, `signbit` and `is_nan` placing NaNs in a comparison |
 
-On 2026-10-01: 37 passed, 2 ignored, doc-test passed.
+On 2026-10-02: 42 passed, 2 ignored, doc-test passed.
 
 | Path | What it is |
 |---|---|
