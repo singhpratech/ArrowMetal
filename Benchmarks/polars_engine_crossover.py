@@ -91,7 +91,7 @@ ROWS_BUCKET = "rows/2"
 UNTAKEN_BUCKETS = (ROWS_BUCKET,)
 # Headroom over the fitted crossover: the fit interpolates between sizes measured 2-2.5x apart, and a
 # shape just past its crossover sits within run-to-run noise of Polars (the default benchmark's noise band
-# over untaken pairs is 0.62-1.31x). The default takes a shape from
+# over untaken pairs is 0.86-1.18x in the rows of 5 ms or more, polars_engine_bench_2026-10-02.csv). The default takes a shape from
 # HEADROOM times its fitted crossover; the fit itself is kept in the table as `fit`.
 HEADROOM = 1.5
 # The default benchmark (`--bench`, `Benchmarks/polars_engine_bench.py --idle`: a warm-up, a first run
