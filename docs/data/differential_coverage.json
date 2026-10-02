@@ -1,5 +1,5 @@
 {
-  "run": {"arrowmetal": "0.3.0", "pyarrow": "25.0.1", "device": "Apple M4 Max", "router": "gpu"},
+  "run": {"arrowmetal": "0.4.0", "pyarrow": "25.0.1", "device": "Apple M4 Max", "router": "gpu"},
   "fields": ["operation", "type", "cases", "pass", "documented", "unclassified", "skipped"],
   "cells": [
     ["abs", "float32", 27, 27, 0, 0, 0],

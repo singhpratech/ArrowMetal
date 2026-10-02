@@ -7,7 +7,7 @@ Every [Arrow v25](https://arrow.apache.org/docs/cpp/compute.html) compute functi
 pyarrow's two internal meta-functions — 307 of them: the 306 `pc.list_functions()` reports,
 less `index_in_meta_binary` and `is_in_meta_binary`, plus the three names pyarrow exposes only as
 Python wrappers (`fill_null`, `top_k_unstable`, `bottom_k_unstable`); 24 are `hash_*` grouped
-aggregates — with what ArrowMetal 0.3.0 does about it.
+aggregates — with what ArrowMetal 0.4.0 does about it.
 
 This is the by-name page. [COVERAGE.md](COVERAGE.md) is the by-family page: it groups these functions
 and explains how each family works, with the Arrow **type** matrix and the interop status alongside.
@@ -475,4 +475,4 @@ Separately from the row-by-row calls above, `python/tests/test_differential.py` 
 
 ---
 
-Version 0.3.0. Read alongside [COVERAGE.md](COVERAGE.md), [ROADMAP.md](../ROADMAP.md) and [DESIGN.md](DESIGN.md).
+Version 0.4.0. Read alongside [COVERAGE.md](COVERAGE.md), [ROADMAP.md](../ROADMAP.md) and [DESIGN.md](DESIGN.md).
