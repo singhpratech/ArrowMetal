@@ -6,13 +6,67 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Apache Arrow Powered By](https://img.shields.io/badge/Apache_Arrow-Powered_By-0B7285)](https://arrow.apache.org/powered_by/)
 
-**ArrowMetal runs Apache Arrow compute on the Apple silicon GPU: Arrow arrays that live in Metal shared
+**Apache Arrow compute on the Apple silicon GPU, inside DataFusion, Polars and DuckDB.**
+
+The CPU and the GPU of an Apple silicon Mac share one memory: the GPU scans an Arrow column where it
+already is, with no copy across a bus, and while it runs the CPU is free for the rest of your application.
+So every figure here gives the CPU time of a call beside its wall time.
+
+| 50,000,000 rows | speed-up | engine, ms (CPU-ms) | with ArrowMetal, ms (CPU-ms) |
+|---|---:|---:|---:|
+| **DataFusion**: `ORDER BY` int64 | **22.7x** | 1,581.22 (6,104.1) | 69.74 (125.8) |
+| **DataFusion**: `DISTINCT`, 200 groups | 2.31x | 30.16 (422.5) | 13.05 (47.7) |
+| **Polars**: `unique` over 2 keys, keep first | **11.54x** | 153.08 (2,063.6) | 13.26 (8.7) |
+| **Polars**: group-by over 1 key, 200 groups, min + max | 1.52x | 16.46 (245.8) | 10.82 (5.9) |
+| **DuckDB**: `sum`, `count`, 100,000 keys | **5.03x** | 79.44 (1,199.5) | 15.79 (100.5) |
+| **DuckDB**: `sum`, `max`, `avg`, no `GROUP BY` | 1.09x | 4.33 (62.8) | 3.98 (49.3) |
+
+Apple M4 Max. The engine's own time ÷ its time with ArrowMetal's default; for Polars, the faster of its
+in-memory and streaming engines. Each engine's second row is its lowest speed-up (best of the runs) among
+the cases its default takes. On the first run after 500 ms of idle, against the engine's own first run,
+DataFusion's group-bys are 1.24x to 2.17x and five of DuckDB's thirteen rewritten pairs are behind, down to 0.47x.
+
+**DataFusion.** A physical optimizer rule for DataFusion 55.1; the SQL is unchanged. A Rust crate used by
+[crates.io](https://crates.io/crates/datafusion-arrowmetal); it loads `libArrowMetalC.dylib` ([install](docs/DATAFUSION.md#install)):
+```toml
+datafusion-arrowmetal = "0.4.0"   # beside datafusion = "=55.1.0"
+```
+Full sorts **6.9x to 28.8x** faster than DataFusion alone (250,000 to 50,000,000 rows), ten group-by
+series **2.31x to 4.27x**; 13,632 query pairs, 0 mismatches. Left to DataFusion: top-k 0.14x to 0.41x,
+filters 0.31x to 0.79x. `rule.report()` gives each node, TAKEN or LEFT, and why. [DataFusion in full](#datafusion-in-full)
+
+**Polars.** `MetalEngine` runs the subtrees measured ahead (full sorts, inner, left and anti joins,
+`unique`, group-bys judged by their estimated number of groups); Polars runs the rest. **1.52x to 11.54x**
+on all 75 of 220 case-size pairs the default took; 15,376 generated cases, 0 different. Left to Polars:
+whole-frame aggregates 0.09x to 0.24x, filters 0.14x to 0.42x. [Polars in full](#polars-in-full)
+```
+pip install "arrowmetal[polars]"   # macOS 14 or later on Apple silicon; pins the tested Polars range
+python -m arrowmetal.bench         # your Mac, 30 s or less, every answer checked against pyarrow
+```
+```python
+import polars as pl, arrowmetal as am
+lf = pl.scan_parquet("orders.parquet")
+engine = am.MetalEngine()                             # the measured defaults
+df = lf.sort("amount", descending=True).collect(engine=engine)  # the frame lf.collect() returns
+print(engine.last_report)                             # Metal or Polars, per node, and why
+```
+**DuckDB.** An optimizer extension; the SQL is unchanged. Built from a checkout with
+`./duckdb-extension/build_rewrite.sh` (DuckDB 1.5.5), then `LOAD`ed, or opened by `am.duckdb_connect()`.
+Rewritten aggregates **1.09x to 5.03x** faster than DuckDB's own operators; 33,376 generated queries, 0
+different. Left to DuckDB: a single `sum` 0.33x, `VARCHAR` keys 0.23x. [DuckDB in full](#duckdb-in-full)
+
+339 benchmark rows, 77 where the CPU is ahead, each with its cause ([matrix](docs/BENCHMARKS_MATRIX.md),
+[to improve](docs/TO_IMPROVE.md)); 307 of Arrow v25's 307 compute function names, 283 on the GPU ([list](docs/ARROW_FUNCTIONS.md)).
+
+## Details
+
+ArrowMetal runs Apache Arrow compute on the Apple silicon GPU: Arrow arrays that live in Metal shared
 memory, GPU kernels that keep Arrow's semantics (validity bitmaps, packed booleans, the C Data and C
-Device Data Interfaces), and one C ABI reachable from Swift, Python, Rust, Go, TypeScript, R and C.**
+Device Data Interfaces), and one C ABI reachable from Swift, Python, Rust, Go, TypeScript, R and C.
 
-Contents: [Engines](#engines) ([Polars](#polars) · [DataFusion](#datafusion) · [DuckDB](#duckdb)) · [The one-row picture](#the-one-row-picture) · [The pitch](#the-pitch-in-one-paragraph) · [What was measured](#what-was-measured) · [Why this exists](#why-this-exists) · [Benchmarks](#benchmarks) · [From Python](#from-python) · [Bindings](#bindings) · [Quick start (Swift)](#quick-start-swift) · [Reading Arrow files](#reading-arrow-files) · [What is implemented](#what-is-implemented) · [Design notes](#design-notes) · [Citing](#citing) · [License](#license)
+Contents: [The engines in full](#the-engines-in-full) ([DataFusion](#datafusion-in-full) · [Polars](#polars-in-full) · [DuckDB](#duckdb-in-full)) · [The one-row picture](#the-one-row-picture) · [Measure it on your Mac](#measure-it-on-your-mac) · [Release](#release) · [The pitch](#the-pitch-in-one-paragraph) · [What was measured](#what-was-measured) · [Why this exists](#why-this-exists) · [Benchmarks](#benchmarks) · [From Python](#from-python) · [Bindings](#bindings) · [Quick start (Swift)](#quick-start-swift) · [Reading Arrow files](#reading-arrow-files) · [What is implemented](#what-is-implemented) · [Design notes](#design-notes) · [Citing](#citing) · [License](#license)
 
-## Engines
+### The engines in full
 
 ArrowMetal runs inside three query engines. Each one plans the query as it always does; ArrowMetal
 takes the parts of the plan measured faster on the Apple GPU, hands back what the engine would have
@@ -20,54 +74,10 @@ returned, and leaves every other node to the engine. Every figure below is from 
 repository, named beside it, on an Apple M4 Max (16 CPU cores, 64 GB); each speed-up is the engine's
 own time divided by the time with ArrowMetal, with the CPU time of the call next to its wall time.
 
-### Polars
-
-A `MetalEngine` for `lf.collect(engine=…)`:
-
-```
-pip install "arrowmetal[polars]"      # pins the tested Polars range
-```
-
-```python
-import polars as pl, arrowmetal as am
-lf = pl.scan_parquet("orders.parquet")
-engine = am.MetalEngine()                                         # the measured defaults
-df = lf.sort("amount", descending=True).collect(engine=engine)    # the frame lf.collect() returns
-print(engine.last_report)                                         # Metal or Polars, per node, and why
-```
-
-Polars optimises the lazy plan as it always does. `MetalEngine` replaces the subtrees it translates
-with ArrowMetal plans that run on the GPU and return Polars `DataFrame`s; Polars' in-memory engine runs
-everything else. The default takes the shapes measured ahead: full sorts from 1,000,000 rows, inner,
-left and anti joins, `unique`, String sorts and `unique` from 5,000,000 rows, a sort over a Parquet
-scan, and group-bys judged by their estimated number of groups
-([docs/POLARS.md](docs/POLARS.md#which-translatable-subtrees-it-runs-the-defaults)).
-
-- Over 194 benchmarked case-size pairs (2,000,000 and 50,000,000 rows), the default took a subtree in
-  62, and in every one of them it is **1.21x to 9.42x** faster than the faster Polars engine,
-  in-memory or streaming (`Benchmarks/results/polars_engine_bench_2026-09-26-final3.csv`).
-- 15,376 generated cases against Polars: 15,096 identical, 33 within the float-summation bound, 0
-  different, and 247 where Polars' plan had nothing to run
-  (`Benchmarks/results/engine_conformance_2026-10-02.csv`).
-
-| 50,000,000 rows | faster Polars engine, ms (CPU-ms) | `MetalEngine()`, ms (CPU-ms) | speed-up |
-|---|---:|---:|---:|
-| group-by over 2 keys, 1,000,000 groups, count | streaming 224.9 (3,207.1) | 23.9 (15.8) | **9.42x** |
-| sort 3 columns by an int64 key | in-memory 377.8 (4,647.8) | 74.6 (27.8) | **5.07x** |
-| inner join, 1,000,000-row build side | streaming 82.2 (1,223.7) | 35.2 (13.0) | **2.33x** |
-| group-by over 1 key, 100,000 groups, mean | streaming 60.2 (741.7) | 49.9 (14.6) | 1.21x |
-
-To improve, left to Polars by the default (Polars ÷ `MetalEngine`, 250,000 to 50,000,000 rows,
-`Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv`): whole-frame aggregates 0.09x
-to 0.24x, row-wise filters and projections 0.14x to 0.42x, a semi join against a 1,000-row table
-0.21x to 0.47x, and the top 100 by a nullable Float64 key 0.75x to 1.05x, which keeps top-k with
-Polars. Every translatable shape, with its measured result, is in
-[docs/ENGINE_CAPABILITIES.md](docs/ENGINE_CAPABILITIES.md).
-
-### DataFusion
+#### DataFusion in full
 
 A physical optimizer rule for DataFusion 55.1, the Rust crate `datafusion-arrowmetal` in
-[`datafusion/`](datafusion). The crate is not on crates.io; depend on it by path from a checkout. It loads
+[`datafusion/`](datafusion), on [crates.io](https://crates.io/crates/datafusion-arrowmetal). It loads
 `libArrowMetalC.dylib`, built from the repository root by `swift build -c release --product ArrowMetalC`
 ([docs/DATAFUSION.md](docs/DATAFUSION.md#install)):
 
@@ -75,7 +85,7 @@ A physical optimizer rule for DataFusion 55.1, the Rust crate `datafusion-arrowm
 # Cargo.toml
 [dependencies]
 datafusion = { version = "=55.1.0", default-features = false, features = ["sql"] }
-datafusion-arrowmetal = { path = "../ArrowMetal/datafusion" }
+datafusion-arrowmetal = "0.4.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -123,7 +133,51 @@ To improve, left to DataFusion by the default (DataFusion alone ÷ with the rule
 and 50,000,000 rows (`datafusion/results/datafusion_filter_2026-10-01.csv`); the other aggregate
 shapes are under [To improve](docs/DATAFUSION.md#to-improve).
 
-### DuckDB
+#### Polars in full
+
+A `MetalEngine` for `lf.collect(engine=…)`:
+
+```
+pip install "arrowmetal[polars]"      # pins the tested Polars range
+```
+
+```python
+import polars as pl, arrowmetal as am
+lf = pl.scan_parquet("orders.parquet")
+engine = am.MetalEngine()                                         # the measured defaults
+df = lf.sort("amount", descending=True).collect(engine=engine)    # the frame lf.collect() returns
+print(engine.last_report)                                         # Metal or Polars, per node, and why
+```
+
+Polars optimises the lazy plan as it always does. `MetalEngine` replaces the subtrees it translates
+with ArrowMetal plans that run on the GPU and return Polars `DataFrame`s; Polars' in-memory engine runs
+everything else. The default takes the shapes measured ahead: full sorts from 1,000,000 rows, inner,
+left and anti joins, `unique`, String sorts and `unique` from 5,000,000 rows, a sort over a Parquet
+scan, and group-bys judged by their estimated number of groups
+([docs/POLARS.md](docs/POLARS.md#which-translatable-subtrees-it-runs-the-defaults)).
+
+- Over 220 benchmarked case-size pairs (2,000,000 and 50,000,000 rows), the default took a subtree in
+  75, and in every one of them it is **1.52x to 11.54x** faster than the faster Polars engine,
+  in-memory or streaming (`Benchmarks/results/polars_engine_bench_2026-10-02.csv`).
+- 15,376 generated cases against Polars: 15,096 identical, 33 within the float-summation bound, 0
+  different, and 247 where Polars' plan had nothing to run
+  (`Benchmarks/results/engine_conformance_2026-10-02.csv`).
+
+| 50,000,000 rows | faster Polars engine, ms (CPU-ms) | `MetalEngine()`, ms (CPU-ms) | speed-up |
+|---|---:|---:|---:|
+| `unique` over 2 keys, keep first | in-memory 153.08 (2,063.6) | 13.26 (8.7) | **11.54x** |
+| sort 3 columns by an int64 key | in-memory 380.46 (4,709.0) | 53.03 (7.1) | **7.17x** |
+| inner join, 1,000,000-row build side | streaming 82.91 (1,248.3) | 22.33 (4.5) | **3.71x** |
+| group-by over 1 key, 200 groups, min + max | in-memory 16.46 (245.8) | 10.82 (5.9) | 1.52x |
+
+To improve, left to Polars by the default (Polars ÷ `MetalEngine`, 250,000 to 50,000,000 rows,
+`Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv`): whole-frame aggregates 0.09x
+to 0.24x, row-wise filters and projections 0.14x to 0.42x, a semi join against a 1,000-row table
+0.21x to 0.47x, and the top 100 by a nullable Float64 key 0.75x to 1.05x, which keeps top-k with
+Polars. Every translatable shape, with its measured result, is in
+[docs/ENGINE_CAPABILITIES.md](docs/ENGINE_CAPABILITIES.md).
+
+#### DuckDB in full
 
 An optimizer extension; the SQL is unchanged. Built once with `./duckdb-extension/build_rewrite.sh`
 (against DuckDB 1.5.5), and loaded into a connection opened with `allow_unsigned_extensions`, or by
@@ -162,7 +216,7 @@ default, each with a query behind at 50,000,000 rows in the same file: a single 
 0.33x), few groups with at most two aggregates (1,000 `INTEGER` keys, `sum`, 0.60x) and `VARCHAR`
 keys (1,000 long `VARCHAR` keys, `sum`, `count`, 0.23x).
 
-## The one-row picture
+### The one-row picture
 
 Apple silicon has one physical memory shared by the CPU and the GPU, so an Arrow buffer placed in a
 Metal shared buffer is at once a valid CPU Arrow buffer and a valid GPU buffer: a column is used where
@@ -175,6 +229,7 @@ One row, the same in-process data in every column:
 | `sum by int32 key (1000 groups)`, 50,000,000 rows | wall ms | CPU ms of that call |
 |---|---:|---:|
 | ArrowMetal | **4.89** | 1.2 |
+| DuckDB 1.5.5 (its own table, 16 threads) | 9.00 | 135 |
 | pyarrow Acero (`Table.group_by`, 16 threads) | 18.45 | 250 |
 | Polars lazy (16 threads) | 81.93 | 1,186 |
 | pandas | 247.93 | 248 |
@@ -182,6 +237,11 @@ One row, the same in-process data in every column:
 From `Benchmarks/results/full_matrix_2026-09-07-parallel.csv`, Apple M4 Max (16 CPU cores, 64 GB), best of
 up to five calls after one warm-up, release build; the 339-row matrix that row comes from, including the
 77 rows where the CPU idiom is ahead, is in [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MATRIX.md).
+The DuckDB row is from `Benchmarks/results/duckdb_matrix_2026-09-12.csv`, measured on 2026-09-12 with the
+matrix's generators and protocol over a native DuckDB table, the data loaded before timing
+([docs/DUCKDB.md](docs/DUCKDB.md#the-matrix-rows-duckdb-alongside)).
+
+### Measure it on your Mac
 
 ```
 pip install arrowmetal          # macOS 14 or later on Apple silicon; pyarrow is the only dependency
@@ -202,14 +262,15 @@ print(am.group_by([region]).sum(amount).to_arrow())     # [40, 60]: GPU group-by
 print(amount.filter_where(">", 15).to_arrow())          # [20, 30, 40]: GPU filter, back as a pyarrow array
 ```
 
-Listed on Apache Arrow's [Powered By](https://arrow.apache.org/powered_by/) page. Site and docs: <https://arrowmetal.org> · Python: `pip install arrowmetal` · Rust: `arrowmetal = "0.3.0"` · Release: [v0.3.0](https://github.com/singhpratech/ArrowMetal/releases/tag/v0.3.0)
+### Release
 
-New in 0.3.0: the Polars engine's default placement from measured crossovers, Polars `scan_parquet`
-read on the GPU, strings in Arrow's view layout (`utf8_view`), Parquet pages decompressed by the CPU and
-the GPU at the same time, per-machine router calibration, and a wheel that carries the Polars plugin
-([CHANGELOG.md](CHANGELOG.md)).
+Listed on Apache Arrow's [Powered By](https://arrow.apache.org/powered_by/) page. Site and docs: <https://arrowmetal.org> · Python: `pip install arrowmetal` · Rust: `arrowmetal = "0.4.0"` · DataFusion: `datafusion-arrowmetal = "0.4.0"` · Release: [v0.4.0](https://github.com/singhpratech/ArrowMetal/releases/tag/v0.4.0)
 
-## Details
+New in 0.4.0: `datafusion-arrowmetal`, a DataFusion optimizer rule on crates.io; the Polars engine's
+sort keys passed one to one with Polars' null placement and float order, and its group-by crossovers
+refitted; correctly rounded grouped Float64 sums and means; per-key sort options (`ieee`, `total`,
+`nan_largest`) in every binding; columns of many chunks imported without a concatenated copy; and
+UInt32 index arrays ([CHANGELOG.md](CHANGELOG.md)).
 
 ### The pitch in one paragraph
 
@@ -233,7 +294,7 @@ the CPU idiom is ahead — is in [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MAT
 - **307 of Apache Arrow v25's 307 compute function names** — 283 on the GPU, 17 on the host, 7 with a
   stated limitation. The table is generated from a registry the test suite executes against
   `pyarrow.compute`. [`docs/ARROW_FUNCTIONS.md`](docs/ARROW_FUNCTIONS.md)
-- **41,688 differential cases against pyarrow over 46 column types**, 1,045 Swift tests against a CPU
+- **41,688 differential cases against pyarrow over 46 column types**, 1,046 Swift tests against a CPU
   oracle and 7,188 Python cases (7,159 passed, 29 skipped), all run in release.
   [`docs/TESTING.md`](docs/TESTING.md)
 - **Seven languages on one C ABI** — Swift, Python, C, Rust, Go, TypeScript and R, each binding with its
@@ -356,7 +417,7 @@ PYTHONPATH=python python -c "import arrowmetal as am; print(am.device_name())"
 
 # From a wheel that carries the dylib (no Swift toolchain at install time)
 pip install build && scripts/build_wheel.sh         # or python/build_wheel.sh, if the dylib is built
-pip install python/dist/arrowmetal-0.3.0-*.whl      # macOS arm64 only, pyarrow comes with it
+pip install python/dist/arrowmetal-0.4.0-*.whl      # macOS arm64 only, pyarrow comes with it
 python -c "import arrowmetal as am; print(am.device_name())"
 ```
 ```python
@@ -411,7 +472,7 @@ exchanging columns through the Arrow C Data Interface and each with its own test
 | Rust | `rust/arrowmetal`, `rust/arrowmetal-sys`; [crates.io](https://crates.io/crates/arrowmetal) | 66 tests plus 5 `no_run` doc-tests | [docs/RUST.md](docs/RUST.md) |
 | Go | `go/arrowmetal` | 66 test functions and three examples, 69 runnable | [docs/GO.md](docs/GO.md) |
 | TypeScript / JavaScript | `node/` (N-API addon) | 84 tests | [docs/TYPESCRIPT.md](docs/TYPESCRIPT.md) |
-| R | `r/arrowmetal` | 87 `test_that()` blocks in the sources (88 as testthat runs them: the one in test-dispatch.R runs once per attach order), 818 expectations | [docs/R.md](docs/R.md) |
+| R | `r/arrowmetal` | 88 `test_that()` blocks in the sources (89 as testthat runs them: the one in test-dispatch.R runs once per attach order), 920 expectations | [docs/R.md](docs/R.md) |
 
 C and C++ callers use the header directly. Any language with an Arrow binding can use the same header.
 
