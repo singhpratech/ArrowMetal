@@ -992,7 +992,7 @@ if (c + TG > cap) {
 **TL;DR**
 
 - Extending `python/tests/test_differential.py` to every type ArrowMetal imports (45 columns, 181
-  operations, 33,156 cases at the time; 212 operations and 39,069 cases today) turned up three bugs
+  operations, 33,156 cases at the time; 217 operations and 41,688 cases in the run recorded in docs/EVALUATION.md) turned up three bugs
   and one unreproduced crash **in pyarrow 25.0.1**, not in ArrowMetal.
 - Each has a workaround in the harness and a test that fails if a later pyarrow fixes it.
 - Two properties of the harness itself: time-of-day cases have to drop their null rows, and a 38-digit
@@ -1007,8 +1007,8 @@ pyarrow fixes it.
 
 ### Research steps
 
-1. Extend the matrix to 45 columns and 181 operations, 33,156 cases (212 operations and 39,069 cases
-   today).
+1. Extend the matrix to 45 columns and 181 operations, 33,156 cases (217 operations and 41,688 cases
+   in the run recorded in docs/EVALUATION.md).
 2. Trace one segfault back from the faulting frame, `Array.nbytes` inside the harness's own array
    cache, to the preceding `pc.year_month_day` call, which cost an hour.
 3. Compare `pc.utf8_normalize` against Python's `unicodedata` and the Unicode annex for each form.

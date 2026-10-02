@@ -317,7 +317,7 @@ column; and multi-chunk, single-chunk and empty ChunkedArrays.
 
 ## Not covered
 
-The binding resolves 42 of the ABI's 283 entry points (36 it needs, and 6 newer ones it uses when the
+The binding resolves 42 of the ABI's 286 entry points (36 it needs, and 6 newer ones it uses when the
 loaded library has them). Not wrapped, and reachable only from
 Python or Swift for now:
 

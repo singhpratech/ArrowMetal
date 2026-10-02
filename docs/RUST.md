@@ -321,7 +321,7 @@ every other reduction test relies on.
 
 ## What is not wrapped
 
-`include/arrowmetal.h` has 283 entry points. `arrowmetal-sys` declares 41 of them — every one called
+`include/arrowmetal.h` has 286 entry points. `arrowmetal-sys` declares 41 of them — every one called
 by the safe crate, none declared and unused — and the safe crate covers the list above. Everything
 below is reachable from Swift, Python and the C ABI, and **not** from this crate. There is no
 technical obstacle to any of it; it is unwrapped because it is untested here, and an untested wrapper
@@ -415,7 +415,7 @@ reduction does not earn its import back.
 * **No `RecordBatch` type of its own.** Columns go across one at a time. The plan runner's `Source`
   takes a named set of columns, or a slice of arrow-rs `RecordBatch`es (`Source::from_batches`, each
   column imported with `Array::from_arrow_chunks`).
-* **`arrowmetal-sys` declares 41 of the ABI's 283 entry points**, and every one of them is called by
+* **`arrowmetal-sys` declares 41 of the ABI's 286 entry points**, and every one of them is called by
   the safe crate (nothing is declared and unused). The table above lists what is missing.
 * **The docs.rs build of 0.1.0 failed.** Under `DOCS_RS` the `-sys` build script returns before it
   emits anything, so the `env!("ARROWMETAL_SYS_LIB_DIR")` and `env!("ARROWMETAL_LINKED_LIB_DIR")`
@@ -440,5 +440,5 @@ cd rust
 ARROWMETAL_LIB=/path/to/libArrowMetalC.dylib cargo test --release
 ```
 
-71 tests, plus 4 `no_run` doc-tests (compiled, not executed); 0 failures on 2026-10-01 ([TESTING.md](TESTING.md)). What each file compares against is in
+66 tests, plus 5 `no_run` doc-tests (compiled, not executed); 0 failures on 2026-10-02 ([TESTING.md](TESTING.md)). What each file compares against is in
 [`rust/README.md`](../rust/README.md) and in [TESTING.md](TESTING.md).

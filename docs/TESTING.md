@@ -29,7 +29,7 @@ PYTHONPATH=python python -m pytest python/tests -q
 PYTHONPATH=python python python/tests/differential_report.py
 # both engines against their hosts; exit 0 = nothing unclassified (needs the DuckDB extension built)
 PYTHONPATH=python python python/tests/engine_report.py
-# TypeScript: builds the addon, then 62 node:test cases
+# TypeScript: builds the addon, then 84 node:test cases
 (cd node && npm install && npm test)
 # the Rust binding, against arrow-rs's own kernels
 (cd rust && cargo test --release)

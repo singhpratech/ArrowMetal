@@ -407,7 +407,7 @@ Sizes are at or below 10M elements throughout.
 
 ## What is not wrapped
 
-The C ABI has 283 entry points; this binding resolves 40 of them (34 it needs, and 6 newer ones it
+The C ABI has 286 entry points; this binding resolves 40 of them (34 it needs, and 6 newer ones it
 uses when the loaded library has them: an older library still loads, and the calls that need them
 return an error naming the missing entry point). Not wrapped, and not tested from
 Go:

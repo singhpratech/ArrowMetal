@@ -241,7 +241,7 @@ Handles are freed by the garbage collector; `release()` frees one now.
 
 ## Not covered
 
-The C ABI has 283 entry points. This binding wraps the ones above and no others. Not wrapped:
+The C ABI has 286 entry points. This binding wraps the ones above and no others. Not wrapped:
 
 * strings beyond `utf8` import/export — no `am_str_unary`, `am_str_match`, `am_str_transform`,
   `am_regex`, `am_to_strings`, `am_parse`
