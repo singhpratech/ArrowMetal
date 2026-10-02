@@ -1,10 +1,11 @@
 # ArrowMetal
 
+[![Apache Arrow Powered By](https://img.shields.io/badge/Apache_Arrow-Powered_By-0B7285)](https://arrow.apache.org/powered_by/)
 [![CI](https://github.com/singhpratech/ArrowMetal/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/singhpratech/ArrowMetal/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/arrowmetal)](https://pypi.org/project/arrowmetal/)
+[![crates.io](https://img.shields.io/crates/v/arrowmetal)](https://crates.io/crates/arrowmetal)
 [![Go Reference](https://pkg.go.dev/badge/github.com/singhpratech/ArrowMetal/go/arrowmetal.svg)](https://pkg.go.dev/github.com/singhpratech/ArrowMetal/go/arrowmetal)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![Apache Arrow Powered By](https://img.shields.io/badge/Apache_Arrow-Powered_By-0B7285)](https://arrow.apache.org/powered_by/)
 
 **Apache Arrow compute on the Apple silicon GPU, inside DataFusion, Polars and DuckDB.**
 
