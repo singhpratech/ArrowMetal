@@ -58,7 +58,6 @@ Kept so the same question is not asked twice.
 |---|---|---|
 | Apache Arrow (pyarrow, the vendored date library) | GitHub issues, and a pull request when the fix is ours | github.com/apache/arrow |
 | Swift compiler | GitHub issues, pull requests welcome | github.com/swiftlang/swift |
-| Apache DataFusion | GitHub issues and pull requests; the user guide's integrations list is where community crates are recorded ([apache/datafusion#26004](https://github.com/apache/datafusion/pull/26004), open) | github.com/apache/datafusion |
 | Apple Metal, the shading language, the driver | Feedback Assistant (private; the FB number is what goes in the Report column, and [APPLE_REPORTS.md](APPLE_REPORTS.md) carries a readable summary of each report), the Apple Developer Forums for a public thread, a Developer Technical Support incident or a WWDC lab for a conversation | none: Metal is not open source and has no public issue tracker |
 | Apple's open-source projects that touch this work (MLX, Swift packages) | GitHub, like any other project | github.com/ml-explore/mlx, github.com/apple |
 
