@@ -8,13 +8,14 @@
   On 1.5.6 the DuckDB tests pass as on 1.5.5 (`test_duckdb.py` and `test_duckdb_rewrite.py`, 252
   passed), and the conformance grid gives the same counts shape for shape: 33,376 queries, 21,844
   rewritten and identical, 11,532 left to DuckDB, 0 different
-  (`Benchmarks/results/engine_conformance_2026-10-04.csv`). The rewrite benchmark rerun on 1.5.6
-  (`Benchmarks/results/duckdb_rewrite_2026-10-04.csv`, conditions in
-  `duckdb_rewrite_2026-10-04_conditions.txt`) gives the same `auto` floors, and the floors now cite it:
-  every query `auto` rewrites is 1.08x to 5.15x faster than DuckDB on the best run and 1.00x to 4.56x
-  on the median; DuckDB's own best times are 0.95 to 1.12 times those of the 1.5.5 run of 2026-10-02.
-  On the first run after 500 ms of idle, four of the thirteen rewritten pairs are behind DuckDB's,
-  down to 0.47x.
+  (`Benchmarks/results/engine_conformance_2026-10-04.csv`). The rewrite benchmark rerun on 1.5.6 on
+  AC power (`Benchmarks/results/duckdb_rewrite_2026-10-04-ac.csv`, conditions in
+  `duckdb_rewrite_2026-10-04-ac_conditions.txt`) gives the same `auto` floors, and the floors now cite
+  it: every query `auto` rewrites is 1.08x to 5.32x faster than DuckDB on the best run and 1.04x to
+  4.54x on the median; DuckDB's own best times are 0.96 to 1.12 times those of the 1.5.5 run of
+  2026-10-02. On the first run after 500 ms of idle, four of the thirteen rewritten pairs are behind
+  DuckDB's, down to 0.38x. A run of the same day on battery power
+  (`Benchmarks/results/duckdb_rewrite_2026-10-04.csv`) gives the same floors.
 
 ## 0.4.0 — 2026-10-02
 `datafusion-arrowmetal` is 0.4.1 on crates.io, published the same day with no code change: docs.rs builds

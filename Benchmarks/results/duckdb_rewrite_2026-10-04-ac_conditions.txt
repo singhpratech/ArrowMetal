@@ -1,0 +1,11 @@
+DuckDB rewrite benchmark, duckdb 1.5.6, code at 0c8ee5a, dylib built Oct  4 12:42:49 2026; start 2026-10-04T18:50:29Z load averages:  3.32 13.06 24.34 
+power: Now drawing from 'AC Power'; idle sleep held off for the run (caffeinate -i)
+busiest processes at start: /usr/libexec/syspolicyd 36.6% CPU, WindowServer 24.6%, fileproviderd 10.7%; minute load averages through the run:
+14:50:29   3.32 13.06 24.34 
+14:51:29   3.91 11.45 22.97 
+14:52:29   7.77 10.93 21.97 
+14:53:29   6.11 9.89 20.83 
+14:54:29   4.18 8.62 19.61 
+14:55:29   3.80 7.72 18.52 
+rc=0 end 14:55:50 load averages:  3.28 7.34 18.13 
+local times are EDT (UTC-4); no system sleep between start and end (pmset log: last sleep 14:05:47 EDT, before the start)
