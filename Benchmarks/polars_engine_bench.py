@@ -178,6 +178,8 @@ def shapes(rows, rng):
             .filter(pl.col("x") > 0.2).sort(["k2", "q"], descending=[False, True]), ["k2", "q"]),
         ("(r) unique over (region, sub), keep first", f.unique(subset=["region", "sub"],
                                                                  keep="first"), False),
+        ("(r2) unique over (region, sub), keep any", f.unique(subset=["region", "sub"],
+                                                                keep="any"), False),
     ] + more_shapes(rows, rng, fact, extra) + group_grid(rows, rng)
 
 

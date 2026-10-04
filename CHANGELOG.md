@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Polars bench: `keep="any"`.** `Benchmarks/polars_engine_bench.py` gains case (r2), `unique` over
+  (region, sub) with `keep="any"`, beside (r) with `keep="first"`. A run of (r), (r2) and (m) at
+  50,000,000 rows on 2026-10-04 (`Benchmarks/results/polars_engine_bench_2026-10-04.csv`, conditions in
+  `bench_conditions_2026-10-04-polars.txt`): Polars in-memory 161.74 ms (keep first) and 150.31 ms (keep
+  any) against `MetalEngine()` 15.71 and 15.72 ms, 10.3x and 9.6x; the sort 414.61 against 58.77 ms,
+  7.06x. The README and docs/POLARS.md keep citing the 2026-10-02 run, the one every Polars figure
+  comes from.
 - **DuckDB 1.5.6.** Both DuckDB extensions are built and tested against DuckDB 1.5.6 (`source_id
   069cc9f9b5`), with no code change: `duckdb-extension/build.sh` fetches the v1.5.6 headers, and
   `build_rewrite.sh` builds the optimizer extension for the release of the installed `duckdb` module.

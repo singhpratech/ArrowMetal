@@ -1,0 +1,17 @@
+# ArrowMetal 0.4.0 on Apple M4 Max, polars 1.44.1 (16 threads), pyarrow 25.0.1, best of 5
+rows,case,engine,wall_ms,cpu_ms,taken,fallbacks,equal_to_polars,vs_fastest_polars,vs_polars_in_memory,shape,input_rows,rule,groups,groups_estimate,probe_us
+50000000,(m) sort 3 columns by an int64 key,polars in-memory,414.607,4506.6,,,,,,,,,,,
+50000000,(m) sort 3 columns by an int64 key,polars streaming,459.288,4809.9,,,,,,,,,,,
+50000000,(m) sort 3 columns by an int64 key,"MetalEngine all, cold",57.044,11.0,Sort#2[Sort>DataFrameScan],,True,7.27,7.27,sort|numeric|memory,50000000,,,,
+50000000,(m) sort 3 columns by an int64 key,"MetalEngine all, warm",47.819,1.7,Sort#2[Sort>DataFrameScan],,True,8.67,8.67,sort|numeric|memory,50000000,,,,
+50000000,(m) sort 3 columns by an int64 key,"MetalEngine default, cold",58.766,11.3,Sort#2,,True,7.06,7.06,,,"Sort#2: 50,000,000 input rows is at or above the 1,000,000-row crossover for sort (crossover sweep, argsort int64, argsort float64, lexsort (2 int32 keys), Benchmarks/results/router_2026-09-24.json)",,,
+50000000,"(r) unique over (region, sub), keep first",polars in-memory,161.735,2083.4,,,,,,,,,,,
+50000000,"(r) unique over (region, sub), keep first",polars streaming,168.250,2322.6,,,,,,,,,,,
+50000000,"(r) unique over (region, sub), keep first","MetalEngine all, cold",15.868,11.3,Distinct#1[Distinct>DataFrameScan],,True,10.19,10.19,distinct|numeric|memory,50000000,,,,
+50000000,"(r) unique over (region, sub), keep first","MetalEngine all, warm",7.632,2.9,Distinct#1[Distinct>DataFrameScan],,True,21.19,21.19,distinct|numeric|memory,50000000,,,,
+50000000,"(r) unique over (region, sub), keep first","MetalEngine default, cold",15.711,11.1,Distinct#1,,True,10.29,10.29,,,"Distinct#1: 50,000,000 input rows is at or above the 5,494,090-row crossover for distinct (engine table, Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv)",,,
+50000000,"(r2) unique over (region, sub), keep any",polars in-memory,150.309,1927.7,,,,,,,,,,,
+50000000,"(r2) unique over (region, sub), keep any",polars streaming,159.123,2149.1,,,,,,,,,,,
+50000000,"(r2) unique over (region, sub), keep any","MetalEngine all, cold",15.857,11.3,Distinct#1[Distinct>DataFrameScan],,True,9.48,9.48,distinct|numeric|memory,50000000,,,,
+50000000,"(r2) unique over (region, sub), keep any","MetalEngine all, warm",7.631,3.0,Distinct#1[Distinct>DataFrameScan],,True,19.70,19.70,distinct|numeric|memory,50000000,,,,
+50000000,"(r2) unique over (region, sub), keep any","MetalEngine default, cold",15.719,11.1,Distinct#1,,True,9.56,9.56,,,"Distinct#1: 50,000,000 input rows is at or above the 5,494,090-row crossover for distinct (engine table, Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv)",,,
