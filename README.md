@@ -10,6 +10,8 @@
 
 **Apache Arrow compute on the Apple silicon GPU, inside DataFusion, Polars and DuckDB.**
 
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/banner-dark.gif"><img src="docs/img/banner.gif" alt="Three measured queries, each engine alone on the CPU and the same engine with ArrowMetal: Apache DataFusion full sort 22.7x, Polars distinct 11.5x, DuckDB group-by 4.9x faster, 50,000,000 rows on an Apple M4 Max" width="100%"></picture>
+
 The CPU and the GPU of an Apple silicon Mac share one memory: the GPU scans an Arrow column where it
 already is, with no copy across a bus, and while it runs the CPU is free for the rest of your application.
 So every figure here gives the CPU time of a call beside its wall time.
