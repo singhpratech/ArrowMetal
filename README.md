@@ -20,13 +20,13 @@ So every figure here gives the CPU time of a call beside its wall time.
 | **DataFusion**: `DISTINCT`, 200 groups | 2.31x | 30.16 (422.5) | 13.05 (47.7) |
 | **Polars**: `unique` over 2 keys, keep first | **11.54x** | 153.08 (2,063.6) | 13.26 (8.7) |
 | **Polars**: group-by over 1 key, 200 groups, min + max | 1.52x | 16.46 (245.8) | 10.82 (5.9) |
-| **DuckDB**: `sum`, `count`, 100,000 keys | **5.03x** | 79.44 (1,199.5) | 15.79 (100.5) |
-| **DuckDB**: `sum`, `max`, `avg`, no `GROUP BY` | 1.09x | 4.33 (62.8) | 3.98 (49.3) |
+| **DuckDB**: `sum`, `count`, 100,000 keys | **4.59x** | 76.72 (1,177.7) | 16.73 (110.6) |
+| **DuckDB**: `sum`, `max`, `avg`, no `GROUP BY` | 1.08x | 4.21 (62.8) | 3.90 (48.8) |
 
 Apple M4 Max. The engine's own time ÷ its time with ArrowMetal's default; for Polars, the faster of its
 in-memory and streaming engines. Each engine's second row is its lowest speed-up (best of the runs) among
 the cases its default takes. On the first run after 500 ms of idle, against the engine's own first run,
-DataFusion's group-bys are 1.24x to 2.17x and five of DuckDB's thirteen rewritten pairs are behind, down to 0.47x.
+DataFusion's group-bys are 1.24x to 2.17x and four of DuckDB's thirteen rewritten pairs are behind, down to 0.47x.
 
 <picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/datafusion-dark.svg"><img src="docs/img/engines/datafusion.svg" height="22" alt="" align="top"></picture> **DataFusion.** A physical optimizer rule for DataFusion 55.1; the SQL is unchanged. A Rust crate used by
 [crates.io](https://crates.io/crates/datafusion-arrowmetal); it loads `libArrowMetalC.dylib` ([install](docs/DATAFUSION.md#install)):
@@ -53,9 +53,9 @@ df = lf.sort("amount", descending=True).collect(engine=engine)  # the frame lf.c
 print(engine.last_report)                             # Metal or Polars, per node, and why
 ```
 <picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/duckdb-dark.svg"><img src="docs/img/engines/duckdb.svg" height="22" alt="" align="top"></picture> **DuckDB.** An optimizer extension; the SQL is unchanged. Built from a checkout with
-`./duckdb-extension/build_rewrite.sh` (DuckDB 1.5.5), then `LOAD`ed, or opened by `am.duckdb_connect()`.
-Rewritten aggregates **1.09x to 5.03x** faster than DuckDB's own operators; 33,376 generated queries, 0
-different. Left to DuckDB: a single `sum` 0.33x, `VARCHAR` keys 0.23x. [DuckDB in full](#duckdb-in-full)
+`./duckdb-extension/build_rewrite.sh` (DuckDB 1.5.6), then `LOAD`ed, or opened by `am.duckdb_connect()`.
+Rewritten aggregates **1.08x to 5.15x** faster than DuckDB's own operators; 33,376 generated queries, 0
+different. Left to DuckDB: a single `sum` 0.32x, `VARCHAR` keys 0.22x. [DuckDB in full](#duckdb-in-full)
 
 339 benchmark rows, 77 where the CPU is ahead, each with its cause ([matrix](docs/BENCHMARKS_MATRIX.md),
 [to improve](docs/TO_IMPROVE.md)); 307 of Arrow v25's 307 compute function names, 283 on the GPU ([list](docs/ARROW_FUNCTIONS.md)).
@@ -179,7 +179,7 @@ Polars. Every translatable shape, with its measured result, is in
 #### DuckDB in full
 
 An optimizer extension; the SQL is unchanged. Built once with `./duckdb-extension/build_rewrite.sh`
-(against DuckDB 1.5.5), and loaded into a connection opened with `allow_unsigned_extensions`, or by
+(against DuckDB 1.5.6), and loaded into a connection opened with `allow_unsigned_extensions`, or by
 `am.duckdb_connect()` from Python:
 
 ```sql
@@ -196,24 +196,24 @@ columns, grouped by one column or none, over a table scan or `read_parquet`: a f
 estimated 10,000 groups or more from 10,000,000 rows, the other measured classes from 50,000,000
 ([docs/DUCKDB.md](docs/DUCKDB.md#when-auto-rewrites)).
 
-- Every query the default rewrote in the benchmark is **1.09x to 5.03x** faster than DuckDB's own
-  operators (`Benchmarks/results/duckdb_rewrite_2026-10-02.csv`).
+- Every query the default rewrote in the benchmark is **1.08x to 5.15x** faster than DuckDB's own
+  operators (`Benchmarks/results/duckdb_rewrite_2026-10-04.csv`).
 - 33,376 generated queries with the rewrite off and forced: 21,844 rewritten and identical, 11,532
-  left to DuckDB, 0 different (`Benchmarks/results/engine_conformance_2026-09-25.csv`).
+  left to DuckDB, 0 different (`Benchmarks/results/engine_conformance_2026-10-04.csv`).
 
 | | rows | DuckDB, ms (CPU-ms) | rewritten, ms (CPU-ms) | speed-up |
 |---|---:|---:|---:|---:|
-| 100,000 `INTEGER` keys: `sum`, `count` | 50,000,000 | 79.44 (1,199.5) | 15.79 (100.5) | **5.03x** |
-| `sum`, `max`, `avg` (`BIGINT`), no `GROUP BY` | 50,000,000 | 4.33 (62.8) | 3.98 (49.3) | 1.09x |
+| 100,000 `INTEGER` keys: `sum`, `count` | 50,000,000 | 76.72 (1,177.7) | 16.73 (110.6) | **4.59x** |
+| `sum`, `max`, `avg` (`BIGINT`), no `GROUP BY` | 50,000,000 | 4.21 (62.8) | 3.90 (48.8) | 1.08x |
 
-To improve: on the first run after 500 ms of idle, five of the thirteen rewritten query-size pairs
-are behind DuckDB's first run after the same idle (same file): `sum`, `max`, `avg` (`BIGINT`) at
-50,000,000 rows, 17.14 ms against 7.99 ms (0.47x); 1,000 `INTEGER` keys with five aggregates at
-50,000,000 rows, 29.92 against 20.36 ms (0.68x); `sum`, `min`, `max`, `avg` (`BIGINT`) at
-50,000,000 rows, 16.15 against 14.43 ms (0.89x); and two pairs at 0.99x. Left to DuckDB by the
+To improve: on the first run after 500 ms of idle, four of the thirteen rewritten query-size pairs
+are behind DuckDB's first run after the same idle (same file), all at 50,000,000 rows: `sum`, `min`,
+`max`, `avg` (`BIGINT`), 16.79 ms against 7.97 ms (0.47x); 1,000 `INTEGER` keys with five aggregates,
+35.90 against 18.86 ms (0.53x); `sum`, `min`, `max`, `avg` (`INTEGER`), 11.75 against 9.23 ms (0.79x);
+and `sum`, `max`, `avg` (`BIGINT`), 16.03 against 15.35 ms (0.96x). Left to DuckDB by the
 default, each with a query behind at 50,000,000 rows in the same file: a single `sum` (`sum(INTEGER)`,
-0.33x), few groups with at most two aggregates (1,000 `INTEGER` keys, `sum`, 0.60x) and `VARCHAR`
-keys (1,000 long `VARCHAR` keys, `sum`, `count`, 0.23x).
+0.32x), few groups with at most two aggregates (1,000 `INTEGER` keys, `sum`, 0.56x) and `VARCHAR`
+keys (1,000 long `VARCHAR` keys, `sum`, `count`, 0.22x).
 
 ### The one-row picture
 
