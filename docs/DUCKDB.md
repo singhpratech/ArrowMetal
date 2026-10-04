@@ -482,7 +482,8 @@ names it; a query the file does not list is in `auto` because of its class, not 
 `test_measured_floors_are_in_the_benchmark_results` requires every row of a rewritten class to be
 ahead at the class's floor, and no row of any other class to be rewritten.
 
-The measurements are in `Benchmarks/results/duckdb_rewrite_2026-10-02.csv`, a quiet run: for each
+The measurements are in `Benchmarks/results/duckdb_rewrite_2026-10-04.csv`, a quiet run on DuckDB
+1.5.6 (its conditions in `Benchmarks/results/duckdb_rewrite_2026-10-04_conditions.txt`): for each
 query and size (1M, 10M, 50M rows), DuckDB's time and the rewrite's in three alternating rounds, each
 mode's untimed warm-up of at least 100 ms followed by five timed runs: the best wall time with its CPU
 time, the median, the best first run after 500 ms of idle, the GPU path taken, and what `auto`
@@ -492,7 +493,9 @@ that file at its floor. The floors were first fitted to a run taken while other 
 machine, kept as history in `Benchmarks/results/duckdb_rewrite_2026-09-23_provisional.csv`, and
 checked by a second run on 2026-09-24 (`Benchmarks/results/duckdb_rewrite_2026-09-24.csv`, one
 warm-up and the best of five, its conditions in `Benchmarks/results/bench_conditions_2026-09-24.txt`);
-the 2026-10-02 run gives the same floors. Reproduce with:
+the run of 2026-10-02 on DuckDB 1.5.5 (`Benchmarks/results/duckdb_rewrite_2026-10-02.csv`) and the
+run of 2026-10-04 on DuckDB 1.5.6 give the same floors; DuckDB's own best times in the 1.5.6 run are
+0.95 to 1.12 times those of the 1.5.5 run, query for query. Reproduce with:
 
 ```
 ./duckdb-extension/build_rewrite.sh
@@ -501,34 +504,35 @@ PYTHONPATH=python python Benchmarks/duckdb_rewrite_bench.py        # 1M, 10M and
 
 Each floor is the smallest of the three sizes at which every query of the class is ahead of DuckDB,
 at that size and above, on the best and on the median run. Every query `auto` rewrote is ahead of
-DuckDB, by 1.09x (`sum, max, avg (BIGINT)` at 50M rows; 1.04x on the median) to 5.03x (`100k INTEGER
-keys: sum, count` at 50M rows), and one query of each rewritten class keeps the class out of `auto`
-at the size below its floor: `sum, max, avg (BIGINT)` at 10M rows (0.86x) for the ungrouped class,
-`100k INTEGER keys: sum, min, max, avg` at 1M (0.75x) for the fused group-by with many groups,
-`1k INTEGER keys: sum, count, min, max, avg` at 10M (0.58x) for the fused group-by with fewer groups,
-and `~1M wide BIGINT keys: sum, count` at 10M (0.94x) for the hash group-by with many groups.
+DuckDB, by 1.08x (`sum, max, avg (BIGINT)` at 50M rows; 1.04x on the median) to 5.15x (`100k INTEGER
+keys alone (no aggregates)` at 50M rows; 3.64x on the median). The narrowest median is `1k INTEGER
+keys: sum, count, min, max, avg` at 50M rows, 14.36 ms against DuckDB's 14.43 ms (1.00x; 1.16x on the
+best run). One query of each rewritten class keeps the class out of `auto` at the size below its floor:
+`sum, max, avg (BIGINT)` at 10M rows (0.90x) for the ungrouped class, `100k INTEGER keys: sum, min,
+max, avg` at 1M (0.73x) for the fused group-by with many groups, `1k INTEGER keys: sum, count, min,
+max, avg` at 10M (0.56x) for the fused group-by with fewer groups, and `~1M wide BIGINT keys: sum,
+count` at 10M (0.92x) for the hash group-by with many groups.
 
 The classes left to DuckDB are the ones where its own operators came out ahead in that file, or not
 ahead consistently: a single `sum` (DuckDB aggregates while it scans, and the rewrite has to copy the
 column out first), few groups with at most two aggregates, and `VARCHAR` keys that DuckDB keeps as
 strings. In each of them at least one query is behind DuckDB at every size, 50M rows included:
-`sum(INTEGER)` at 0.33x, `1k INTEGER keys: sum` at 0.60x, `~3k wide BIGINT keys: sum` at 0.94x and
-`1k long VARCHAR keys: sum, count` at 0.23x. Some of their queries were ahead: `sum` and `sum, avg`
-over full-range `BIGINT` values (1.91x and 3.68x at 50M rows), `10k INTEGER keys: sum, count` (1.50x
-at 50M, 0.92x at 10M) and `1k short VARCHAR keys: sum, count` (1.14x at 50M). In the ungrouped case
+`sum(INTEGER)` at 0.32x, `1k INTEGER keys: sum` at 0.56x, `~3k wide BIGINT keys: sum` at 0.89x and
+`1k long VARCHAR keys: sum, count` at 0.22x. Some of their queries were ahead: `sum` and `sum, avg`
+over full-range `BIGINT` values (1.87x and 3.69x at 50M rows), `10k INTEGER keys: sum, count` (1.54x
+at 50M, 0.84x at 10M) and `1k short VARCHAR keys: sum, count` (1.12x at 50M). In the ungrouped case
 DuckDB's time depends on the values, which the plan does not show: `avg` and `sum, avg` over
-non-negative `BIGINT` values are to improve (0.61x and 0.80x at 50M rows), while the same aggregates
+non-negative `BIGINT` values are to improve (0.59x and 0.79x at 50M rows), while the same aggregates
 over full-range `BIGINT` values are ahead. Below a rewritten class's floor, or below the router's
 crossover, some queries were ahead as well, for example `sum, count, min, max (BIGINT, 10% NULL)` at
-10M rows (1.41x) and `100k INTEGER keys alone (no aggregates)` at 1M (1.42x); the floor holds each class
+10M rows (1.33x) and `100k INTEGER keys alone (no aggregates)` at 1M (1.27x); the floor holds each class
 to its slowest query.
 
-To improve: on the first run after 500 ms of idle, five of the thirteen rewritten query-size pairs are
-behind DuckDB's first run after the same idle: `sum, max, avg (BIGINT)` at 50M rows 17.14 ms against
-7.99 ms (0.47x), `1k INTEGER keys: sum, count, min, max, avg` at 50M 29.92 against 20.36 ms (0.68x),
-`sum, min, max, avg (BIGINT)` at 50M 16.15 against 14.43 ms (0.89x), and `100k INTEGER keys: sum, min,
-max, avg` at 10M and `sum, min, max, avg (INTEGER)` at 50M at 0.99x. The other eight are 1.32x to
-2.09x ahead on that run.
+To improve: on the first run after 500 ms of idle, four of the thirteen rewritten query-size pairs are
+behind DuckDB's first run after the same idle, all at 50M rows: `sum, min, max, avg (BIGINT)` 16.79 ms
+against 7.97 ms (0.47x), `1k INTEGER keys: sum, count, min, max, avg` 35.90 against 18.86 ms (0.53x),
+`sum, min, max, avg (INTEGER)` 11.75 against 9.23 ms (0.79x) and `sum, max, avg (BIGINT)` 16.03
+against 15.35 ms (0.96x). The other nine are 1.12x to 1.94x ahead on that run.
 
 ### Limits
 
@@ -826,6 +830,7 @@ many keys and string matching are compute-heavy per byte; `sum` is not.
 | `python/tests/test_duckdb_rewrite.py` | tier 3, differential against DuckDB with the rewrite off |
 | `Benchmarks/duckdb_bench.py` | the tables in §5 |
 | `Benchmarks/duckdb_rewrite_bench.py` | tier 3 against DuckDB's own operators at 1M, 10M and 50M rows |
-| `Benchmarks/results/duckdb_rewrite_2026-10-02.csv` | its quiet run, which the `auto` floors cite |
+| `Benchmarks/results/duckdb_rewrite_2026-10-04.csv` | its quiet run on DuckDB 1.5.6, which the `auto` floors cite; run conditions in `duckdb_rewrite_2026-10-04_conditions.txt` |
+| `Benchmarks/results/duckdb_rewrite_2026-10-02.csv` | its quiet run on DuckDB 1.5.5, kept as history |
 | `Benchmarks/results/duckdb_rewrite_2026-09-24.csv` | its run of 2026-09-24 (one warm-up, best of five), kept as history |
 | `Benchmarks/results/duckdb_rewrite_2026-09-23_provisional.csv` | its first run, on a shared machine, kept as history |
