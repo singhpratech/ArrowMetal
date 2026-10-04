@@ -8,7 +8,7 @@
 // WHY A C++ EXTENSION. DuckDB's C extension API (duckdb_extension.h, which the table-function
 // extension in arrowmetal_extension.cpp uses) has no optimizer hook: its only planner-adjacent entry
 // point is the replacement scan. The optimizer hook, `OptimizerExtension`, is C++ only, so this file is
-// built against the DuckDB v1.5.5 headers and stamped with the CPP ABI, which DuckDB loads only into
+// built against the DuckDB v1.5.6 headers and stamped with the CPP ABI, which DuckDB loads only into
 // the exact engine version it was built for. See docs/DUCKDB.md §4b.
 //
 // WHAT IT DOES. After DuckDB's own optimizers have run, it looks for a LogicalAggregate whose shape it

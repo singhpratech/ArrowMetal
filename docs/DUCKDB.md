@@ -98,10 +98,10 @@ con.sql("SELECT arrowmetal_version(), arrowmetal_device()").show()
 
 From the CLI: `duckdb -unsigned`, then `LOAD '.../arrowmetal.duckdb_extension';`.
 
-**Versions.** Built and tested against **DuckDB 1.5.5** (`source_id d8cdaa33fd`), platform
+**Versions.** Built and tested against **DuckDB 1.5.6** (`source_id 069cc9f9b5`), platform
 `osx_arm64`, pyarrow 25.0.1, on an Apple M4 Max. The extension declares the **C extension API**
 version `v1.2.0`, not the DuckDB version - a `C_STRUCT` extension is compatible with any DuckDB
-whose C API is at least what it declares, so it is not pinned to 1.5.5. The **platform** string is
+whose C API is at least what it declares, so it is not pinned to 1.5.6. The **platform** string is
 checked strictly: an `osx_arm64` build will not load into an `osx_amd64` DuckDB. Rebuild with
 `DUCKDB_PLATFORM=... ./duckdb-extension/build.sh` to target another one.
 
@@ -116,8 +116,8 @@ matching DuckDB tag into `duckdb-extension/build/duckdb-<version>/` on first run
 used; nothing of DuckDB is compiled), checks the clone's commit against the `source_id`, compiles
 `src/arrowmetal_rewrite.cpp`, checks that the module exports every DuckDB symbol the extension needs,
 and stamps the footer with the `CPP` ABI and that exact release. The result is
-`duckdb-extension/build/arrowmetal_rewrite.duckdb_extension`. Built and tested against DuckDB 1.5.5
-(`source_id d8cdaa33fd`) in the duckdb 1.5.5 Python module.
+`duckdb-extension/build/arrowmetal_rewrite.duckdb_extension`. Built and tested against DuckDB 1.5.6
+(`source_id 069cc9f9b5`) in the duckdb 1.5.6 Python module.
 
 ```python
 import arrowmetal as am
@@ -340,7 +340,7 @@ From Python, `am.duckdb_connect()` opens a connection with the extension loaded,
 ### Why a C++ extension: the feasibility finding
 
 - **DuckDB's C extension API has no optimizer hook.** Tier 2 is built on it. Its header
-  (`duckdb_extension.h`, the v1.2.0 C API that DuckDB 1.5.5 ships) has one planner-adjacent entry
+  (`duckdb_extension.h`, the v1.2.0 C API that DuckDB 1.5.6 ships) has one planner-adjacent entry
   point, `duckdb_add_replacement_scan`, which swaps a table function in for a table name before
   binding; nothing in it sees or changes a logical plan.
 - **The C++ API has one.** `OptimizerExtension` (`duckdb/optimizer/optimizer_extension.hpp`) takes an
@@ -348,9 +348,9 @@ From Python, `am.duckdb_connect()` opens a connection with the extension loaded,
   with `OptimizerExtension::Register(DBConfig &, ...)`. `LogicalExtensionOperator` and
   `PhysicalOperator` let the extension put its own operator into the plan.
 - **A C++ extension loads into the Python module.** It leaves DuckDB's symbols unresolved and takes
-  them from the process that loads it, and the duckdb 1.5.5 Python module exports DuckDB's C++
-  symbols, `OptimizerExtension::Register` among them. Compiled against the v1.5.5 headers (the module's
-  `source_id`, `d8cdaa33fd`) with `-undefined dynamic_lookup` and stamped `CPP` / `v1.5.5`, the
+  them from the process that loads it, and the duckdb 1.5.6 Python module exports DuckDB's C++
+  symbols, `OptimizerExtension::Register` among them. Compiled against the v1.5.6 headers (the module's
+  `source_id`, `069cc9f9b5`) with `-undefined dynamic_lookup` and stamped `CPP` / `v1.5.6`, the
   extension loads into that module with `allow_unsigned_extensions`. No DuckDB build is needed, only
   its headers. `build_rewrite.sh` checks the symbols on every build, because a missing one would abort
   the process at its first call instead of failing the `LOAD`.
@@ -412,10 +412,10 @@ no key or one key of each kind it takes (`INTEGER` with NULLs, a wide `BIGINT`, 
 `UTINYINT`, `DATE`, `TIMESTAMP`, `VARCHAR` with NULLs), no filter or one of two, value columns with
 no, 5%, 70% or all NULLs, and tables of 0, 1, 7, 1,000 and 100,000 rows (the last also in 2,048-row
 blocks), plus integer extremes. Each query runs with the rewrite `'off'` and `'force'` on one
-connection. In the run recorded in `Benchmarks/results/engine_conformance_2026-09-25.csv`, 33,376
-queries: 21,844 rewritten and identical to DuckDB's answer, 11,532 left to DuckDB by the
+connection. In the run recorded in `Benchmarks/results/engine_conformance_2026-10-04.csv`, on DuckDB
+1.5.6, 33,376 queries: 21,844 rewritten and identical to DuckDB's answer, 11,532 left to DuckDB by the
 extension (and identical, as they must be), and none different. The per-shape counts are in
-`Benchmarks/results/engine_conformance_2026-09-25_shapes.csv`; [COVERAGE.md](COVERAGE.md#engines) has
+`Benchmarks/results/engine_conformance_2026-10-04_shapes.csv`; [COVERAGE.md](COVERAGE.md#engines) has
 the summary.
 
 ### How it runs
