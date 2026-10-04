@@ -898,6 +898,110 @@ cell the rule's first run after idle is below DataFusion alone's first run after
 some case at some probe size and gap (lowest 0.47x). Utf8 keys go through ArrowMetal's key densification
 before the hash join and are 0.22x to 1.60x warm.
 
+### A matmul chain in SQL (attention over coordinate-format matrices)
+
+The query is single-head attention written as one SQL statement, from the attention test of the
+[ddx](https://github.com/xqlsystems/ddx) project (`crates/ddx-datafusion/tests/attention.rs`,
+Apache-2.0), copied verbatim with its table names and its value function. Every matrix is a table of
+rows `(i BIGINT, j BIGINT, val DOUBLE)`: the input `x[t, d]`, the weights `wq`, `wk`, `wv[d, e]` and
+the target `tgt[t, e]`. Each matrix product is a `SUM(a.val * b.val)` over a `JOIN … GROUP BY`: the
+projections `q`, `k`, `v` (`x` joined with a weight matrix on `d`), the scores `s` (`q` joined with
+`k` on `e`), and the output `o` (the softmax weights joined with `v`); a max, a normalizing sum and a
+squared-error loss complete it. DataFusion inlines each common table expression at every read, so one
+plan holds 18 hash joins and 18 aggregates (53 nodes the rule looks at, counting each partial
+aggregate). The example is [`examples/attention.rs`](../datafusion/examples/attention.rs).
+
+The joins produce `t·d·e` rows for each projection and `t·t·e` rows for `s` and for `o` before the
+grouped sums, counted with SQL for every shape (`datafusion/results/attention_2026-10-03.csv`, rows
+`rows_*`):
+
+| shape (t, d, e) | joined rows of q (k, v) | grouped rows of q | joined rows of s | grouped rows of s | joined rows of o | grouped rows of o |
+|---|---:|---:|---:|---:|---:|---:|
+| 256, 128, 32 | 1,048,576 | 8,192 | 2,097,152 | 65,536 | 2,097,152 | 8,192 |
+| 512, 256, 64 | 8,388,608 | 32,768 | 16,777,216 | 262,144 | 16,777,216 | 32,768 |
+| 1024, 512, 64 | 33,554,432 | 65,536 | 67,108,864 | 1,048,576 | 67,108,864 | 65,536 |
+| 2048, 512, 64 | 67,108,864 | 131,072 | 268,435,456 | 4,194,304 | 268,435,456 | 131,072 |
+| 4096, 1024, 64 | 268,435,456 | 262,144 | 1,073,741,824 | 16,777,216 | 1,073,741,824 | 262,144 |
+
+Three configurations, timed in the same block per shape in alternating order: **alone**,
+`SessionContext::new()`; **default**, `session_context(SessionConfig::new(), rule)` with
+`ArrowMetalConfig::default()`; **forced**, `ArrowMetalConfig::all().with_min_rows(0)` with
+`AggregateChoice::ArrowMetal` and `JoinChoice::ArrowMetal`. `MemTable`s of 8,192-row batches over 16
+partitions. Each configuration's first run gives the loss and the rule's report; then five rounds, in
+each of which every configuration, in an order rotated by one per round, runs untimed for at least
+100 ms and then once timed; then three runs of each after 500 ms of idle. Timed: SQL to logical plan,
+physical planning and `collect`. CPU-ms is the process CPU time (user + system, all threads). Each
+shape's block started at a one-minute load of 2.97 to 3.48. From
+`datafusion/results/attention_2026-10-03.csv`:
+
+| shape (t, d, e) | configuration | best ms | median ms | CPU-ms of the best run | median CPU-ms | after 500 ms idle, median ms | nodes taken / left |
+|---|---|---:|---:|---:|---:|---:|---|
+| 256, 128, 32 | alone | 48.83 | 52.29 | 479.0 | 473.4 | 77.53 | |
+| | default | 48.79 | 50.25 | 468.3 | 468.5 | 76.71 | 0 / 53 |
+| | forced | 49.43 | 52.31 | 457.6 | 456.0 | 73.24 | 9 / 44 |
+| 512, 256, 64 | alone | 252.39 | 255.71 | 3,256.0 | 3,250.2 | 283.78 | |
+| | default | 248.90 | 257.40 | 3,258.8 | 3,250.5 | 281.82 | 0 / 53 |
+| | forced | 252.95 | 256.32 | 2,929.8 | 2,932.6 | 292.98 | 9 / 44 |
+| 1024, 512, 64 | alone | 1,067.26 | 1,175.74 | 15,282.9 | 16,937.2 | 1,225.16 | |
+| | default | 1,082.48 | 1,190.98 | 15,329.9 | 17,134.7 | 1,206.56 | 0 / 53 |
+| | forced | 1,060.19 | 1,126.93 | 13,685.3 | 14,711.7 | 1,213.69 | 9 / 44 |
+| 2048, 512, 64 | alone | 4,086.14 | 4,621.95 | 60,509.8 | 67,384.0 | 6,571.78 | |
+| | default | 4,242.26 | 4,654.40 | 62,642.1 | 68,246.9 | 6,078.59 | 0 / 53 |
+| | forced | 4,326.88 | 4,619.84 | 60,124.3 | 62,949.1 | 6,648.13 | 9 / 44 |
+| 4096, 1024, 64 | alone | 18,049.96 | 22,959.19 | 245,669.9 | 323,961.9 | 23,874.41 | |
+| | default | 18,536.87 | 23,913.96 | 254,263.2 | 329,441.7 | 24,029.14 | 0 / 53 |
+| | forced | 24,805.81 | 29,472.75 | 238,503.0 | 286,946.1 | 27,568.15 | 9 / 44 |
+
+From 1024, 512, 64 on, every configuration's later rounds are slower than its first (the CSV's
+`wall_runs_ms` rows, in round order); at 4096, 1024, 64 the first round's runs are 18,049.96 ms
+(alone), 18,536.87 ms (default) and 24,805.81 ms (forced), and the later rounds' 19,599.71 to
+30,177.41 ms.
+
+**The loss.** Every run of every configuration gives DataFusion alone's loss to within 1.464e-14
+relative (the largest difference, over every run of every shape and configuration, against DataFusion
+alone's first run of the shape); DataFusion alone's own runs differ from each other by up to that same
+1.464e-14. The report records no run-time choice and no runtime fallback under the default or the
+forced configuration.
+
+**What the rule did.** Under both configurations, the 14 grouped sums of a product (`SUM(x.val *
+w.val)`, `SUM(q.val * k.val)`, `SUM(a.val * v.val)`) are left, since the argument of the sum is an
+expression, not a column, and their 14 partial aggregates with them; so are the loss's whole-table
+sum (no `GROUP BY` keys) and its partial, and the nine joins and three aggregates whose input row
+counts DataFusion gives as estimates (above a join or an aggregate), with the partial aggregates of two
+of those three. The remaining nine joins are the
+`x` ⋈ weight joins, whose inputs have exact row counts.
+
+- 256, 128, 32: the default leaves those nine joins too, at 32,768 rows for the larger input against
+  `min_rows` 250,000 (0 taken, 53 left); forced takes them (9 taken, 44 left).
+- 512, 256, 64: the default leaves the nine joins at 131,072 rows against `min_rows` 250,000 (0 / 53);
+  forced takes them (9 / 44).
+- 1024, 512, 64: the nine joins pass `min_rows` (524,288 rows), and the default leaves them since no
+  build-side bucket of the measured join table holds 32,768 rows (0 / 53); forced takes them (9 / 44).
+- 2048, 512, 64: as at 1024 with 1,048,576 and 32,768 rows (0 / 53); forced takes the nine joins
+  (9 / 44).
+- 4096, 1024, 64: as at 1024 with 4,194,304 and 65,536 rows (0 / 53); forced takes the nine joins,
+  each producing 268,435,456 rows (9 / 44).
+
+**With estimated row counts accepted.** The forced configuration with `with_accept_inexact(true)`
+(the benchmark's **on**), against DataFusion alone in the same blocks, the same method, from
+`datafusion/results/attention_inexact_2026-10-03.csv`: it takes 21 nodes (all 18 joins and three
+aggregates: the maximum of each row of `s`, twice, and the normalizing sum, which ran on the GPU) and leaves
+30 (the 14 grouped sums of a product with their partial aggregates, and the whole-table sum with its
+partial).
+
+| shape (t, d, e) | alone, best / median ms | accepted, best / median ms | CPU-ms of the best run, alone / accepted | after 500 ms idle, median ms, alone / accepted |
+|---|---:|---:|---:|---:|
+| 256, 128, 32 | 49.72 / 53.77 | 39.92 / 43.03 | 469.7 / 276.3 | 75.63 / 56.97 |
+| 512, 256, 64 | 245.36 / 254.59 | 168.71 / 174.74 | 3,254.8 / 1,885.9 | 268.14 / 232.04 |
+| 1024, 512, 64 | 1,077.51 / 1,092.99 | 801.28 / 1,299.61 | 15,167.4 / 9,744.9 | 1,205.43 / 1,252.80 |
+
+At 1024, 512, 64 the accepted configuration's first timed round is 801.28 ms and the next four
+1,255.76 to 1,391.90 ms, with CPU-ms between 9,659.2 and 10,454.2 in all five. Its losses are within
+5.297e-15 relative of DataFusion alone's. At 2048, 512, 64 the accepted configuration was not timed:
+the process ended without output after its first run (6,217.90 ms), and one process running that
+shape's first run alone and then accepted has a peak memory footprint of 55,534,428,720 bytes on this
+64 GB machine. 4096, 1024, 64 was not run accepted.
+
 ---
 
 ## To improve
@@ -1085,6 +1189,19 @@ median of three runs after 500 ms and three after 5 s, the contexts and the gaps
 
 Every case is behind DataFusion alone warm (0.31x to 0.79x), so `filter` stays off by default.
 
+### A matmul chain in SQL with the joins taken
+
+The attention query of [A matmul chain in SQL](#a-matmul-chain-in-sql-attention-over-coordinate-format-matrices),
+DataFusion alone ÷ the rule, from `attention_2026-10-03.csv` and `attention_inexact_2026-10-03.csv`:
+
+- Forced (the nine `x` ⋈ weight joins taken), 4096, 1024, 64: 18,049.96 / 24,805.81 ms best (0.73x)
+  and 22,959.19 / 29,472.75 ms median (0.78x); each of the nine joins produces 268,435,456 rows.
+  At 2048, 512, 64: 4,086.14 / 4,326.88 ms best (0.94x), 4,621.95 / 4,619.84 ms median.
+- With estimated row counts accepted (all 18 joins and three aggregates taken), 1024, 512, 64:
+  1,092.99 / 1,299.61 ms median (0.84x), while the best run is 1,077.51 / 801.28 ms. At 2048, 512, 64
+  one process running the shape's first run alone and then accepted has a peak memory footprint of
+  55,534,428,720 bytes, and the shape was not timed.
+
 ### The first query of a process
 
 The first GPU query in a process also compiles the Metal pipelines. In the table above, the int64
@@ -1165,6 +1282,7 @@ On 2026-10-02: 42 passed, 2 ignored, doc-test passed.
 | `datafusion/examples/bench.rs` | the benchmark |
 | `datafusion/examples/coldstart.rs` | the first GPU query of a process, against the next one after idle |
 | `datafusion/examples/plancost.rs` | the rule's planning cost on a plan it leaves |
+| `datafusion/examples/attention.rs` | the attention query of the ddx test over coordinate-format matrices, DataFusion alone and with the rule |
 | `datafusion/results/datafusion_sort_warm_2026-09-29.csv` | sorts and top-k with the warm-up, 100,000 to 50M rows |
 | `datafusion/results/datafusion_rule_2026-09-29.csv` | every case, rule off and on, 100,000 to 50M rows, and the Parquet cases |
 | `datafusion/results/datafusion_groupby_sweep_2026-10-01.csv` | the aggregate sweep, rule forced on against off, 1M to 50M rows: the table's source (the Float64 and Float32 `min`/`max` cases measured on 2026-10-01, with the idle runs of the forced rule after 500 ms and 5 s; the Float64 `sum`/`avg` and int64 `min`/`max` cases from `datafusion_groupby_sweep_2026-09-30.csv`; the other cases from `datafusion_groupby_sweep_2026-09-29.csv`, which also has the rule forced back) |
@@ -1179,6 +1297,7 @@ On 2026-10-02: 42 passed, 2 ignored, doc-test passed.
 | `datafusion/results/datafusion_sort_import_2026-10-01.csv` | the sort family, the crate before and now: the columns imported at the same time |
 | `datafusion/results/datafusion_groupby_default_import_2026-10-01.csv`, `…_retime_…` | the default's aggregates, the crate before and now; two rows timed again alone |
 | `datafusion/results/datafusion_filter_2026-10-01.csv` | float comparisons in a filter, rule off and on |
+| `datafusion/results/attention_2026-10-03.csv`, `datafusion/results/attention_inexact_2026-10-03.csv` (each with a `_conditions.txt`) | the attention query, DataFusion alone, the default and the rule forced; the rule forced with estimated row counts accepted; the row counts of the joins and grouped sums; each configuration's report |
 
 The first two CSVs also hold rows with `crate = before`: an earlier state of this crate, measured in the same
 sessions. The tables on this page use the rows with `crate = now`.

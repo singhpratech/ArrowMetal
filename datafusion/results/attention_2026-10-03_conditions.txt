@@ -1,0 +1,592 @@
+Run conditions of attention_2026-10-03.csv (datafusion/examples/attention.rs).
+
+Machine: Apple M4 Max (16 CPU cores: 12 performance, 4 efficiency), 64 GB, macOS 27.0.
+Software: rustc 1.95.0, DataFusion 55.1.0, arrow-rs 59.3.0; the example built --release with thin LTO.
+Repository commit: e7090c6, with the example added (no library, kernel or rule change).
+ArrowMetal library: libArrowMetalC.dylib built from that commit with `swift build -c release --product
+ArrowMetalC` at 2026-10-03 19:40:51, named by ARROWMETAL_LIB for every run.
+SessionConfig::new(): 16 target partitions. Tables: MemTables of 8,192-row batches dealt round-robin over
+the 16 partitions.
+Each shape's timed block started at a one-minute load below 3.5 with no compiler or test process
+running; the load at the start and end of each block is below and in every CSV row. The end load is
+the query's own: from 1024x512x64 on, each run keeps the 16 cores busy for one to thirty seconds, and
+the blocks last one to seventeen minutes. In those blocks the wall time rises from round to round in
+every configuration (column wall_runs_ms, in round order); the configurations' order rotates by one
+per round.
+The last Sleep entry of pmset (2026-10-03 13:22:58) is before every block: no block spans a sleep.
+The rows of 4096x1024x64 come from a second process started after the first ended (same binary, same
+library), since each 2048x512x64 run finished under 60 s.
+The row counts (rows_*) were counted with SQL on DataFusion alone after the timed blocks, untimed.
+
+Below: per shape and configuration b and c, the rule's report for the plan of the configuration's first
+run (TAKEN / LEFT at plan time; GPU / HANDBACK run-time choices; FALLBACK), then each block's times.
+
+# run started 2026-10-03 19:46:33 (pid 9056)
+attention: target_partitions 16; batch 8192; rounds 5; warm 100 ms; idle 500 ms x 3; max load 3.5; configs ["a", "b", "c"]
+
+[256x128x32 b] session_context(SessionConfig::new(), ArrowMetalRule::new(ArrowMetalConfig::default())) -- report of the first run's plan:
+  LEFT     AggregateExec: mode=Final, gby=[], aggr=[sum(0.5 * power(o.val - tgt.val, Float64(2))) as sum(Float64(0.5) * power(o.val - tgt.val,Int64(2)))] -- no GROUP BY keys (a whole-table aggregate)
+  LEFT     AggregateExec: mode=Partial, gby=[], aggr=[sum(0.5 * power(o.val - tgt.val, Float64(2))) as sum(Float64(0.5) * power(o.val - tgt.val,Int64(2)))] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0), (e@1, e@1)], projection=[val@2, val@5] -- left (build) rows ~4096 (an estimate; accept_inexact is off), right (probe) rows 8192 (exact): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(a.val * v.val)] -- sum(a.val * v.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(a.val * v.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(u@1, t@0)], projection=[t@0, val@2, e@4, val@5] -- left (build) rows ~4096 (an estimate; accept_inexact is off), right (probe) rows ~4096 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@2, u@3, val@4, val@1] -- left (build) rows ~4096 (an estimate; accept_inexact is off), right (probe) rows ~4096 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=SinglePartitioned, gby=[t@0 as t], aggr=[sum(ex.val)] -- input rows ~4096 are an estimate (accept_inexact is off)
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@0, val@1, m@3] -- left (build) rows ~4096 (an estimate; accept_inexact is off), right (probe) rows ~4096 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~4096 (an estimate; accept_inexact is off), right (probe) rows ~4096 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 4096 (exact), right (probe) rows 32768 (exact); the larger vs min_rows 250000
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 4096 (exact), right (probe) rows 32768 (exact); the larger vs min_rows 250000
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[max(s.val)] -- input rows ~4096 are an estimate (accept_inexact is off)
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[max(s.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~4096 (an estimate; accept_inexact is off), right (probe) rows ~4096 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 4096 (exact), right (probe) rows 32768 (exact); the larger vs min_rows 250000
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 4096 (exact), right (probe) rows 32768 (exact); the larger vs min_rows 250000
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@2, u@3, val@4, m@1] -- left (build) rows ~4096 (an estimate; accept_inexact is off), right (probe) rows ~4096 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[max(s.val)] -- input rows ~4096 are an estimate (accept_inexact is off)
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[max(s.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~4096 (an estimate; accept_inexact is off), right (probe) rows ~4096 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 4096 (exact), right (probe) rows 32768 (exact); the larger vs min_rows 250000
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 4096 (exact), right (probe) rows 32768 (exact); the larger vs min_rows 250000
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~4096 (an estimate; accept_inexact is off), right (probe) rows ~4096 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 4096 (exact), right (probe) rows 32768 (exact); the larger vs min_rows 250000
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 4096 (exact), right (probe) rows 32768 (exact); the larger vs min_rows 250000
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 4096 (exact), right (probe) rows 32768 (exact); the larger vs min_rows 250000
+
+[256x128x32 c] ArrowMetalConfig::all().with_min_rows(0), AggregateChoice::ArrowMetal, JoinChoice::ArrowMetal -- report of the first run's plan:
+  LEFT     AggregateExec: mode=Final, gby=[], aggr=[sum(0.5 * power(o.val - tgt.val, Float64(2))) as sum(Float64(0.5) * power(o.val - tgt.val,Int64(2)))] -- no GROUP BY keys (a whole-table aggregate)
+  LEFT     AggregateExec: mode=Partial, gby=[], aggr=[sum(0.5 * power(o.val - tgt.val, Float64(2))) as sum(Float64(0.5) * power(o.val - tgt.val,Int64(2)))] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0), (e@1, e@1)], projection=[val@2, val@5] -- left (build) rows ~4096 (an estimate; accept_inexact is off), right (probe) rows 8192 (exact): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(a.val * v.val)] -- sum(a.val * v.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(a.val * v.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(u@1, t@0)], projection=[t@0, val@2, e@4, val@5] -- left (build) rows ~4096 (an estimate; accept_inexact is off), right (probe) rows ~4096 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@2, u@3, val@4, val@1] -- left (build) rows ~4096 (an estimate; accept_inexact is off), right (probe) rows ~4096 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=SinglePartitioned, gby=[t@0 as t], aggr=[sum(ex.val)] -- input rows ~4096 are an estimate (accept_inexact is off)
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@0, val@1, m@3] -- left (build) rows ~4096 (an estimate; accept_inexact is off), right (probe) rows ~4096 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~4096 (an estimate; accept_inexact is off), right (probe) rows ~4096 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 4096 (exact), right (probe) rows 32768 (exact); the larger vs min_rows 0; output in 16 partitions
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 4096 (exact), right (probe) rows 32768 (exact); the larger vs min_rows 0; output in 16 partitions
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[max(s.val)] -- input rows ~4096 are an estimate (accept_inexact is off)
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[max(s.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~4096 (an estimate; accept_inexact is off), right (probe) rows ~4096 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 4096 (exact), right (probe) rows 32768 (exact); the larger vs min_rows 0; output in 16 partitions
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 4096 (exact), right (probe) rows 32768 (exact); the larger vs min_rows 0; output in 16 partitions
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@2, u@3, val@4, m@1] -- left (build) rows ~4096 (an estimate; accept_inexact is off), right (probe) rows ~4096 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[max(s.val)] -- input rows ~4096 are an estimate (accept_inexact is off)
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[max(s.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~4096 (an estimate; accept_inexact is off), right (probe) rows ~4096 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 4096 (exact), right (probe) rows 32768 (exact); the larger vs min_rows 0; output in 16 partitions
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 4096 (exact), right (probe) rows 32768 (exact); the larger vs min_rows 0; output in 16 partitions
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~4096 (an estimate; accept_inexact is off), right (probe) rows ~4096 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 4096 (exact), right (probe) rows 32768 (exact); the larger vs min_rows 0; output in 16 partitions
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 4096 (exact), right (probe) rows 32768 (exact); the larger vs min_rows 0; output in 16 partitions
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 4096 (exact), right (probe) rows 32768 (exact); the larger vs min_rows 0; output in 16 partitions
+
+[256x128x32] block 2026-10-03 19:48:14 - 2026-10-03 19:48:28, load 3.10 - 4.03, last sleep 2026-10-03 13:22:58
+
+[512x256x64 b] session_context(SessionConfig::new(), ArrowMetalRule::new(ArrowMetalConfig::default())) -- report of the first run's plan:
+  LEFT     AggregateExec: mode=Final, gby=[], aggr=[sum(0.5 * power(o.val - tgt.val, Float64(2))) as sum(Float64(0.5) * power(o.val - tgt.val,Int64(2)))] -- no GROUP BY keys (a whole-table aggregate)
+  LEFT     AggregateExec: mode=Partial, gby=[], aggr=[sum(0.5 * power(o.val - tgt.val, Float64(2))) as sum(Float64(0.5) * power(o.val - tgt.val,Int64(2)))] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0), (e@1, e@1)], projection=[val@2, val@5] -- left (build) rows ~16384 (an estimate; accept_inexact is off), right (probe) rows 32768 (exact): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(a.val * v.val)] -- sum(a.val * v.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(a.val * v.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(u@1, t@0)], projection=[t@0, val@2, e@4, val@5] -- left (build) rows ~16384 (an estimate; accept_inexact is off), right (probe) rows ~16384 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@2, u@3, val@4, val@1] -- left (build) rows ~16384 (an estimate; accept_inexact is off), right (probe) rows ~16384 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=SinglePartitioned, gby=[t@0 as t], aggr=[sum(ex.val)] -- input rows ~16384 are an estimate (accept_inexact is off)
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@0, val@1, m@3] -- left (build) rows ~16384 (an estimate; accept_inexact is off), right (probe) rows ~16384 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~16384 (an estimate; accept_inexact is off), right (probe) rows ~16384 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 16384 (exact), right (probe) rows 131072 (exact); the larger vs min_rows 250000
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 16384 (exact), right (probe) rows 131072 (exact); the larger vs min_rows 250000
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[max(s.val)] -- input rows ~16384 are an estimate (accept_inexact is off)
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[max(s.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~16384 (an estimate; accept_inexact is off), right (probe) rows ~16384 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 16384 (exact), right (probe) rows 131072 (exact); the larger vs min_rows 250000
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 16384 (exact), right (probe) rows 131072 (exact); the larger vs min_rows 250000
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@2, u@3, val@4, m@1] -- left (build) rows ~16384 (an estimate; accept_inexact is off), right (probe) rows ~16384 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[max(s.val)] -- input rows ~16384 are an estimate (accept_inexact is off)
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[max(s.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~16384 (an estimate; accept_inexact is off), right (probe) rows ~16384 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 16384 (exact), right (probe) rows 131072 (exact); the larger vs min_rows 250000
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 16384 (exact), right (probe) rows 131072 (exact); the larger vs min_rows 250000
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~16384 (an estimate; accept_inexact is off), right (probe) rows ~16384 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 16384 (exact), right (probe) rows 131072 (exact); the larger vs min_rows 250000
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 16384 (exact), right (probe) rows 131072 (exact); the larger vs min_rows 250000
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 16384 (exact), right (probe) rows 131072 (exact); the larger vs min_rows 250000
+
+[512x256x64 c] ArrowMetalConfig::all().with_min_rows(0), AggregateChoice::ArrowMetal, JoinChoice::ArrowMetal -- report of the first run's plan:
+  LEFT     AggregateExec: mode=Final, gby=[], aggr=[sum(0.5 * power(o.val - tgt.val, Float64(2))) as sum(Float64(0.5) * power(o.val - tgt.val,Int64(2)))] -- no GROUP BY keys (a whole-table aggregate)
+  LEFT     AggregateExec: mode=Partial, gby=[], aggr=[sum(0.5 * power(o.val - tgt.val, Float64(2))) as sum(Float64(0.5) * power(o.val - tgt.val,Int64(2)))] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0), (e@1, e@1)], projection=[val@2, val@5] -- left (build) rows ~16384 (an estimate; accept_inexact is off), right (probe) rows 32768 (exact): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(a.val * v.val)] -- sum(a.val * v.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(a.val * v.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(u@1, t@0)], projection=[t@0, val@2, e@4, val@5] -- left (build) rows ~16384 (an estimate; accept_inexact is off), right (probe) rows ~16384 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@2, u@3, val@4, val@1] -- left (build) rows ~16384 (an estimate; accept_inexact is off), right (probe) rows ~16384 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=SinglePartitioned, gby=[t@0 as t], aggr=[sum(ex.val)] -- input rows ~16384 are an estimate (accept_inexact is off)
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@0, val@1, m@3] -- left (build) rows ~16384 (an estimate; accept_inexact is off), right (probe) rows ~16384 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~16384 (an estimate; accept_inexact is off), right (probe) rows ~16384 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 16384 (exact), right (probe) rows 131072 (exact); the larger vs min_rows 0; output in 16 partitions
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 16384 (exact), right (probe) rows 131072 (exact); the larger vs min_rows 0; output in 16 partitions
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[max(s.val)] -- input rows ~16384 are an estimate (accept_inexact is off)
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[max(s.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~16384 (an estimate; accept_inexact is off), right (probe) rows ~16384 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 16384 (exact), right (probe) rows 131072 (exact); the larger vs min_rows 0; output in 16 partitions
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 16384 (exact), right (probe) rows 131072 (exact); the larger vs min_rows 0; output in 16 partitions
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@2, u@3, val@4, m@1] -- left (build) rows ~16384 (an estimate; accept_inexact is off), right (probe) rows ~16384 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[max(s.val)] -- input rows ~16384 are an estimate (accept_inexact is off)
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[max(s.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~16384 (an estimate; accept_inexact is off), right (probe) rows ~16384 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 16384 (exact), right (probe) rows 131072 (exact); the larger vs min_rows 0; output in 16 partitions
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 16384 (exact), right (probe) rows 131072 (exact); the larger vs min_rows 0; output in 16 partitions
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~16384 (an estimate; accept_inexact is off), right (probe) rows ~16384 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 16384 (exact), right (probe) rows 131072 (exact); the larger vs min_rows 0; output in 16 partitions
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 16384 (exact), right (probe) rows 131072 (exact); the larger vs min_rows 0; output in 16 partitions
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 16384 (exact), right (probe) rows 131072 (exact); the larger vs min_rows 0; output in 16 partitions
+
+[512x256x64] block 2026-10-03 19:48:54 - 2026-10-03 19:49:15, load 2.97 - 4.72, last sleep 2026-10-03 13:22:58
+
+[1024x512x64 b] session_context(SessionConfig::new(), ArrowMetalRule::new(ArrowMetalConfig::default())) -- report of the first run's plan:
+  LEFT     AggregateExec: mode=Final, gby=[], aggr=[sum(0.5 * power(o.val - tgt.val, Float64(2))) as sum(Float64(0.5) * power(o.val - tgt.val,Int64(2)))] -- no GROUP BY keys (a whole-table aggregate)
+  LEFT     AggregateExec: mode=Partial, gby=[], aggr=[sum(0.5 * power(o.val - tgt.val, Float64(2))) as sum(Float64(0.5) * power(o.val - tgt.val,Int64(2)))] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0), (e@1, e@1)], projection=[val@2, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows 65536 (exact): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(a.val * v.val)] -- sum(a.val * v.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(a.val * v.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(u@1, t@0)], projection=[t@0, val@2, e@4, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@2, u@3, val@4, val@1] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=SinglePartitioned, gby=[t@0 as t], aggr=[sum(ex.val)] -- input rows ~32768 are an estimate (accept_inexact is off)
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@0, val@1, m@3] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 524288 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 32768 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 524288 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 32768 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[max(s.val)] -- input rows ~32768 are an estimate (accept_inexact is off)
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[max(s.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 524288 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 32768 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 524288 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 32768 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@2, u@3, val@4, m@1] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[max(s.val)] -- input rows ~32768 are an estimate (accept_inexact is off)
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[max(s.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 524288 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 32768 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 524288 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 32768 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 524288 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 32768 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 524288 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 32768 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 524288 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 32768 rows (results/datafusion_join_2026-10-01.csv)
+
+[1024x512x64 c] ArrowMetalConfig::all().with_min_rows(0), AggregateChoice::ArrowMetal, JoinChoice::ArrowMetal -- report of the first run's plan:
+  LEFT     AggregateExec: mode=Final, gby=[], aggr=[sum(0.5 * power(o.val - tgt.val, Float64(2))) as sum(Float64(0.5) * power(o.val - tgt.val,Int64(2)))] -- no GROUP BY keys (a whole-table aggregate)
+  LEFT     AggregateExec: mode=Partial, gby=[], aggr=[sum(0.5 * power(o.val - tgt.val, Float64(2))) as sum(Float64(0.5) * power(o.val - tgt.val,Int64(2)))] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0), (e@1, e@1)], projection=[val@2, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows 65536 (exact): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(a.val * v.val)] -- sum(a.val * v.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(a.val * v.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(u@1, t@0)], projection=[t@0, val@2, e@4, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@2, u@3, val@4, val@1] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=SinglePartitioned, gby=[t@0 as t], aggr=[sum(ex.val)] -- input rows ~32768 are an estimate (accept_inexact is off)
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@0, val@1, m@3] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 524288 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 524288 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[max(s.val)] -- input rows ~32768 are an estimate (accept_inexact is off)
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[max(s.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 524288 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 524288 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@2, u@3, val@4, m@1] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[max(s.val)] -- input rows ~32768 are an estimate (accept_inexact is off)
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[max(s.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 524288 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 524288 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 524288 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 524288 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 524288 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+
+[1024x512x64] block 2026-10-03 19:50:01 - 2026-10-03 19:51:01, load 3.04 - 12.07, last sleep 2026-10-03 13:22:58
+
+[2048x512x64 b] session_context(SessionConfig::new(), ArrowMetalRule::new(ArrowMetalConfig::default())) -- report of the first run's plan:
+  LEFT     AggregateExec: mode=Final, gby=[], aggr=[sum(0.5 * power(o.val - tgt.val, Float64(2))) as sum(Float64(0.5) * power(o.val - tgt.val,Int64(2)))] -- no GROUP BY keys (a whole-table aggregate)
+  LEFT     AggregateExec: mode=Partial, gby=[], aggr=[sum(0.5 * power(o.val - tgt.val, Float64(2))) as sum(Float64(0.5) * power(o.val - tgt.val,Int64(2)))] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0), (e@1, e@1)], projection=[val@2, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows 131072 (exact): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(a.val * v.val)] -- sum(a.val * v.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(a.val * v.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(u@1, t@0)], projection=[t@0, val@2, e@4, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@2, u@3, val@4, val@1] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=SinglePartitioned, gby=[t@0 as t], aggr=[sum(ex.val)] -- input rows ~32768 are an estimate (accept_inexact is off)
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@0, val@1, m@3] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 1048576 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 32768 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 1048576 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 32768 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[max(s.val)] -- input rows ~32768 are an estimate (accept_inexact is off)
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[max(s.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 1048576 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 32768 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 1048576 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 32768 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@2, u@3, val@4, m@1] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[max(s.val)] -- input rows ~32768 are an estimate (accept_inexact is off)
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[max(s.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 1048576 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 32768 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 1048576 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 32768 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 1048576 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 32768 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 1048576 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 32768 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 1048576 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 32768 rows (results/datafusion_join_2026-10-01.csv)
+
+[2048x512x64 c] ArrowMetalConfig::all().with_min_rows(0), AggregateChoice::ArrowMetal, JoinChoice::ArrowMetal -- report of the first run's plan:
+  LEFT     AggregateExec: mode=Final, gby=[], aggr=[sum(0.5 * power(o.val - tgt.val, Float64(2))) as sum(Float64(0.5) * power(o.val - tgt.val,Int64(2)))] -- no GROUP BY keys (a whole-table aggregate)
+  LEFT     AggregateExec: mode=Partial, gby=[], aggr=[sum(0.5 * power(o.val - tgt.val, Float64(2))) as sum(Float64(0.5) * power(o.val - tgt.val,Int64(2)))] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0), (e@1, e@1)], projection=[val@2, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows 131072 (exact): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(a.val * v.val)] -- sum(a.val * v.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(a.val * v.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(u@1, t@0)], projection=[t@0, val@2, e@4, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@2, u@3, val@4, val@1] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=SinglePartitioned, gby=[t@0 as t], aggr=[sum(ex.val)] -- input rows ~32768 are an estimate (accept_inexact is off)
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@0, val@1, m@3] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 1048576 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 1048576 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[max(s.val)] -- input rows ~32768 are an estimate (accept_inexact is off)
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[max(s.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 1048576 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 1048576 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(t@0, t@0)], projection=[t@2, u@3, val@4, m@1] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[max(s.val)] -- input rows ~32768 are an estimate (accept_inexact is off)
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[max(s.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 1048576 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 1048576 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~32768 (an estimate; accept_inexact is off), right (probe) rows ~32768 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 1048576 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 1048576 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 32768 (exact), right (probe) rows 1048576 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+
+[2048x512x64] block 2026-10-03 19:52:48 - 2026-10-03 19:56:27, load 3.48 - 17.37, last sleep 2026-10-03 13:22:58
+
+# run ended 2026-10-03 19:56:50
+
+# run started 2026-10-03 19:57:05 (pid 12437)
+attention: target_partitions 16; batch 8192; rounds 5; warm 100 ms; idle 500 ms x 3; max load 3.5; configs ["a", "b", "c"]
+
+[4096x1024x64 b] session_context(SessionConfig::new(), ArrowMetalRule::new(ArrowMetalConfig::default())) -- report of the first run's plan:
+  LEFT     AggregateExec: mode=Final, gby=[], aggr=[sum(0.5 * power(o.val - tgt.val, Float64(2))) as sum(Float64(0.5) * power(o.val - tgt.val,Int64(2)))] -- no GROUP BY keys (a whole-table aggregate)
+  LEFT     AggregateExec: mode=Partial, gby=[], aggr=[sum(0.5 * power(o.val - tgt.val, Float64(2))) as sum(Float64(0.5) * power(o.val - tgt.val,Int64(2)))] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(t@0, t@0), (e@1, e@1)], projection=[val@2, val@5] -- left (build) rows ~65536 (an estimate; accept_inexact is off), right (probe) rows 262144 (exact): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(a.val * v.val)] -- sum(a.val * v.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(a.val * v.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(u@1, t@0)], projection=[t@0, val@2, e@4, val@5] -- left (build) rows ~65536 (an estimate; accept_inexact is off), right (probe) rows ~65536 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(t@0, t@0)], projection=[t@2, u@3, val@4, val@1] -- left (build) rows ~65536 (an estimate; accept_inexact is off), right (probe) rows ~65536 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=SinglePartitioned, gby=[t@0 as t], aggr=[sum(ex.val)] -- input rows ~65536 are an estimate (accept_inexact is off)
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(t@0, t@0)], projection=[t@0, val@1, m@3] -- left (build) rows ~65536 (an estimate; accept_inexact is off), right (probe) rows ~65536 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~65536 (an estimate; accept_inexact is off), right (probe) rows ~65536 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 65536 (exact), right (probe) rows 4194304 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 65536 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 65536 (exact), right (probe) rows 4194304 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 65536 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[max(s.val)] -- input rows ~65536 are an estimate (accept_inexact is off)
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[max(s.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~65536 (an estimate; accept_inexact is off), right (probe) rows ~65536 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 65536 (exact), right (probe) rows 4194304 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 65536 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 65536 (exact), right (probe) rows 4194304 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 65536 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(t@0, t@0)], projection=[t@2, u@3, val@4, m@1] -- left (build) rows ~65536 (an estimate; accept_inexact is off), right (probe) rows ~65536 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[max(s.val)] -- input rows ~65536 are an estimate (accept_inexact is off)
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[max(s.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~65536 (an estimate; accept_inexact is off), right (probe) rows ~65536 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 65536 (exact), right (probe) rows 4194304 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 65536 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 65536 (exact), right (probe) rows 4194304 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 65536 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~65536 (an estimate; accept_inexact is off), right (probe) rows ~65536 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 65536 (exact), right (probe) rows 4194304 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 65536 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 65536 (exact), right (probe) rows 4194304 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 65536 rows (results/datafusion_join_2026-10-01.csv)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 65536 (exact), right (probe) rows 4194304 (exact); the larger vs min_rows 250000; inner join on i64 keys (memory inputs): no build-side bucket of the measured join table holds 65536 rows (results/datafusion_join_2026-10-01.csv)
+
+[4096x1024x64 c] ArrowMetalConfig::all().with_min_rows(0), AggregateChoice::ArrowMetal, JoinChoice::ArrowMetal -- report of the first run's plan:
+  LEFT     AggregateExec: mode=Final, gby=[], aggr=[sum(0.5 * power(o.val - tgt.val, Float64(2))) as sum(Float64(0.5) * power(o.val - tgt.val,Int64(2)))] -- no GROUP BY keys (a whole-table aggregate)
+  LEFT     AggregateExec: mode=Partial, gby=[], aggr=[sum(0.5 * power(o.val - tgt.val, Float64(2))) as sum(Float64(0.5) * power(o.val - tgt.val,Int64(2)))] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(t@0, t@0), (e@1, e@1)], projection=[val@2, val@5] -- left (build) rows ~65536 (an estimate; accept_inexact is off), right (probe) rows 262144 (exact): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(a.val * v.val)] -- sum(a.val * v.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(a.val * v.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(u@1, t@0)], projection=[t@0, val@2, e@4, val@5] -- left (build) rows ~65536 (an estimate; accept_inexact is off), right (probe) rows ~65536 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(t@0, t@0)], projection=[t@2, u@3, val@4, val@1] -- left (build) rows ~65536 (an estimate; accept_inexact is off), right (probe) rows ~65536 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=SinglePartitioned, gby=[t@0 as t], aggr=[sum(ex.val)] -- input rows ~65536 are an estimate (accept_inexact is off)
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(t@0, t@0)], projection=[t@0, val@1, m@3] -- left (build) rows ~65536 (an estimate; accept_inexact is off), right (probe) rows ~65536 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~65536 (an estimate; accept_inexact is off), right (probe) rows ~65536 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 65536 (exact), right (probe) rows 4194304 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 65536 (exact), right (probe) rows 4194304 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[max(s.val)] -- input rows ~65536 are an estimate (accept_inexact is off)
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[max(s.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~65536 (an estimate; accept_inexact is off), right (probe) rows ~65536 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 65536 (exact), right (probe) rows 4194304 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 65536 (exact), right (probe) rows 4194304 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(t@0, t@0)], projection=[t@2, u@3, val@4, m@1] -- left (build) rows ~65536 (an estimate; accept_inexact is off), right (probe) rows ~65536 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t], aggr=[max(s.val)] -- input rows ~65536 are an estimate (accept_inexact is off)
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t], aggr=[max(s.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~65536 (an estimate; accept_inexact is off), right (probe) rows ~65536 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 65536 (exact), right (probe) rows 4194304 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 65536 (exact), right (probe) rows 4194304 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, t@1 as t], aggr=[sum(q.val * k.val)] -- sum(q.val * k.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, t@2 as t], aggr=[sum(q.val * k.val)] -- Partial aggregate whose Final was not replaced
+  LEFT     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(e@1, e@1)], projection=[t@0, val@2, t@3, val@5] -- left (build) rows ~65536 (an estimate; accept_inexact is off), right (probe) rows ~65536 (an estimate; accept_inexact is off): a join needs both row counts
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 65536 (exact), right (probe) rows 4194304 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 65536 (exact), right (probe) rows 4194304 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+  LEFT     AggregateExec: mode=FinalPartitioned, gby=[t@0 as t, e@1 as e], aggr=[sum(x.val * w.val)] -- sum(x.val * w.val): argument val@1 * val@3 is an expression, not a column
+  LEFT     AggregateExec: mode=Partial, gby=[t@0 as t, e@2 as e], aggr=[sum(x.val * w.val)] -- Partial aggregate whose Final was not replaced
+  TAKEN    HashJoinExec: mode=Partitioned, join_type=Inner, on=[(d@0, d@1)], projection=[t@3, val@5, e@1, val@2] -- left (build) rows 65536 (exact), right (probe) rows 4194304 (exact); the larger vs min_rows 0; output in 16 partitions; output re-partitioned to Hash([d@4], 16) where the parent requires it (to keep the parent's distribution)
+
+[4096x1024x64] block 2026-10-03 20:13:51 - 2026-10-03 20:30:49, load 3.29 - 13.61, last sleep 2026-10-03 13:22:58
+
+# run ended 2026-10-03 20:31:37
