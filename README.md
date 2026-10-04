@@ -30,7 +30,7 @@ in-memory and streaming engines. Each engine's second row is its lowest speed-up
 the cases its default takes. On the first run after 500 ms of idle, against the engine's own first run,
 DataFusion's group-bys are 1.24x to 2.17x and four of DuckDB's thirteen rewritten pairs are behind, down to 0.38x.
 
-<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/datafusion-dark.svg"><img src="docs/img/engines/datafusion.svg" height="22" alt="" align="top"></picture> **DataFusion.** A physical optimizer rule for DataFusion 55.1; the SQL is unchanged. A Rust crate used by
+<a href="https://datafusion.apache.org"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/datafusion-dark.svg"><img src="docs/img/engines/datafusion.svg" height="22" alt="Apache DataFusion" align="top"></picture></a> **DataFusion.** A physical optimizer rule for DataFusion 55.1; the SQL is unchanged. A Rust crate used by
 [crates.io](https://crates.io/crates/datafusion-arrowmetal); it loads `libArrowMetalC.dylib` ([install](docs/DATAFUSION.md#install)):
 ```toml
 datafusion-arrowmetal = "0.4.1"   # beside datafusion = "=55.1.0"
@@ -39,7 +39,7 @@ Full sorts **6.9x to 28.8x** faster than DataFusion alone (250,000 to 50,000,000
 series **2.31x to 4.27x**; 13,632 query pairs, 0 mismatches. Left to DataFusion: top-k 0.14x to 0.41x,
 filters 0.31x to 0.79x. `rule.report()` gives each node, TAKEN or LEFT, and why. [DataFusion in full](#datafusion-in-full)
 
-<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/polars-dark.svg"><img src="docs/img/engines/polars.svg" height="22" alt="" align="top"></picture> **Polars.** `MetalEngine` runs the subtrees measured ahead (full sorts, inner, left and anti joins,
+<a href="https://pola.rs"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/polars-dark.svg"><img src="docs/img/engines/polars.svg" height="22" alt="Polars" align="top"></picture></a> **Polars.** `MetalEngine` runs the subtrees measured ahead (full sorts, inner, left and anti joins,
 `unique`, group-bys judged by their estimated number of groups); Polars runs the rest. **1.52x to 11.54x**
 on all 75 of 220 case-size pairs the default took; 15,376 generated cases, 0 different. Left to Polars:
 whole-frame aggregates 0.09x to 0.24x, filters 0.14x to 0.42x. [Polars in full](#polars-in-full)
@@ -54,7 +54,7 @@ engine = am.MetalEngine()                             # the measured defaults
 df = lf.sort("amount", descending=True).collect(engine=engine)  # the frame lf.collect() returns
 print(engine.last_report)                             # Metal or Polars, per node, and why
 ```
-<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/duckdb-dark.svg"><img src="docs/img/engines/duckdb.svg" height="22" alt="" align="top"></picture> **DuckDB.** An optimizer extension; the SQL is unchanged. Built from a checkout with
+<a href="https://duckdb.org"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/duckdb-dark.svg"><img src="docs/img/engines/duckdb.svg" height="22" alt="DuckDB" align="top"></picture></a> **DuckDB.** An optimizer extension; the SQL is unchanged. Built from a checkout with
 `./duckdb-extension/build_rewrite.sh` (DuckDB 1.5.6), then `LOAD`ed, or opened by `am.duckdb_connect()`.
 Rewritten aggregates **1.08x to 5.32x** faster than DuckDB's own operators; 33,376 generated queries, 0
 different. Left to DuckDB: a single `sum` 0.32x, `VARCHAR` keys 0.22x. [DuckDB in full](#duckdb-in-full)
@@ -115,7 +115,11 @@ the query runs ([docs/DATAFUSION.md](docs/DATAFUSION.md#what-the-default-takes))
 
 - Full sorts of 250,000 to 50,000,000 rows: **6.9x to 28.8x** faster than DataFusion alone; at
   50,000,000 rows, 96.2 to 125.8 CPU-ms against DataFusion's 6,104.1 to 8,310.5
-  (`datafusion/results/datafusion_sort_warm_2026-09-29.csv`).
+  (`datafusion/results/datafusion_sort_warm_2026-09-29.csv`). DataFusion's own sort of 50,000,000 rows
+  spends 6,104.1 CPU-ms in 1,581.22 ms, about four of the sixteen cores on average, which is part of why
+  the figure is large; Polars sorts the same three columns by the same int64 key in 380.46 ms on this
+  machine, and ArrowMetal under Polars in 53.03 ms, 7.17x
+  (`Benchmarks/results/polars_engine_bench_2026-10-02.csv`).
 - The ten group-by series the default runs on the GPU, in both table layouts (20 cases), at
   50,000,000 rows: **2.31x to 4.27x** warm;
   on the first run after 500 ms of idle against DataFusion's first run after the same idle, 1.24x to
