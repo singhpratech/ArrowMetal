@@ -1,0 +1,25 @@
+crossover sweep on polars 2.0.0, main 1160626, dylib Oct 08 00:01, AC; --crossover --iters 7, one process per size; then --scan-only per size; then --idle --iters 5 over 87 cases at 2M and 50M
+mem_250000: rc=0 start=2026-10-08T04:29:37Z secs=5 load_start=[1.63 3.41 4.23] load_end=[2.14 3.48 4.25]
+mem_500000: rc=0 start=2026-10-08T04:29:42Z secs=8 load_start=[2.14 3.48 4.25] load_end=[3.55 3.75 4.33]
+mem_1000000: rc=0 start=2026-10-08T04:30:30Z secs=11 load_start=[2.51 3.45 4.20] load_end=[5.34 4.02 4.39]
+mem_2000000: rc=0 start=2026-10-08T04:32:31Z secs=18 load_start=[2.29 3.42 4.11] load_end=[3.25 3.56 4.15]
+mem_5000000: rc=0 start=2026-10-08T04:33:09Z secs=37 load_start=[2.85 3.46 4.10] load_end=[6.60 4.37 4.40]
+mem_10000000: rc=0 start=2026-10-08T04:35:46Z secs=72 load_start=[2.22 3.45 4.03] load_end=[8.90 4.98 4.55]
+mem_20000000: rc=0 start=2026-10-08T04:39:28Z secs=146 load_start=[1.95 3.49 4.00] load_end=[10.18 5.91 4.87]
+mem_50000000: rc=0 start=2026-10-08T04:45:55Z secs=420 load_start=[1.44 3.49 4.04] load_end=[10.80 10.38 7.47]
+crossover sweep, scan sizes and idle benchmark (in-memory sizes done above; the 1-minute load gate from here), on polars 2.0.0, main c9ff994, dylib Oct 08 00:01, AC; --crossover --iters 7, one process per size; then --scan-only per size; then --idle --iters 5 over 87 cases at 2M and 50M
+scan_1000000: rc=0 start=2026-10-08T04:59:28Z secs=3 load_start=[1.74 4.08 5.35] load_end=[1.74 4.08 5.35]
+scan_2000000: rc=0 start=2026-10-08T04:59:31Z secs=2 load_start=[1.74 4.08 5.35] load_end=[1.76 4.05 5.33]
+scan_5000000: rc=0 start=2026-10-08T04:59:33Z secs=5 load_start=[1.76 4.05 5.33] load_end=[3.14 4.30 5.41]
+scan_10000000: rc=0 start=2026-10-08T04:59:38Z secs=8 load_start=[3.14 4.30 5.41] load_end=[3.05 4.26 5.39]
+scan_20000000: rc=0 start=2026-10-08T04:59:46Z secs=14 load_start=[3.05 4.26 5.39] load_end=[3.88 4.37 5.41]
+scan_50000000: rc=0 start=2026-10-08T05:00:20Z secs=31 load_start=[3.13 4.16 5.31] load_end=[7.80 5.21 5.65]
+idle_2000000: rc=0 start=2026-10-08T05:02:02Z secs=339 load_start=[3.21 4.37 5.30] load_end=[3.49 3.69 4.66]
+idle_50000000: rc=0 start=2026-10-08T05:07:41Z secs=832 load_start=[3.49 3.69 4.66] load_end=[11.85 9.89 7.81]
+end 2026-10-08T05:21:33Z
+idle_5000000: rc=0 start=2026-10-08T05:42:59Z secs=121 load_start=[2.45 6.31 6.45] load_end=[3.43 5.47 6.10] (sort, unique and the 1,000- and 10,000-group group-by cases, added after the first fit charged the numeric sort class from 2M straight to 50M)
+idle_10000000: rc=0 start=2026-10-08T05:45:00Z secs=137 load_start=[3.43 5.47 6.10] load_end=[9.40 6.84 6.54] (sort, unique and the 1,000- and 10,000-group group-by cases, added after the first fit charged the numeric sort class from 2M straight to 50M)
+idle_20000000: rc=0 start=2026-10-08T05:48:37Z secs=174 load_start=[3.32 5.53 6.07] load_end=[4.72 5.65 6.04] (sort, unique and the 1,000- and 10,000-group group-by cases, added after the first fit charged the numeric sort class from 2M straight to 50M)
+idle_5000000 (rerun with the sweep-only 2.0 table in force, so the sort and unique classes are taken at these sizes): rc=0 start=2026-10-08T05:54:03Z secs=120 load_start=[2.47 4.27 5.41] load_end=[2.60 3.88 5.12]
+idle_10000000 (rerun with the sweep-only 2.0 table in force, so the sort and unique classes are taken at these sizes): rc=0 start=2026-10-08T05:56:03Z secs=136 load_start=[2.60 3.88 5.12] load_end=[3.58 4.43 5.20]
+idle_20000000 (rerun with the sweep-only 2.0 table in force, so the sort and unique classes are taken at these sizes): rc=0 start=2026-10-08T05:58:39Z secs=170 load_start=[3.24 4.30 5.14] load_end=[5.67 5.42 5.49]

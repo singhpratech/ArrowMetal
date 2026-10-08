@@ -331,7 +331,13 @@ def test_every_fitted_case_is_ahead_from_its_crossover_on(each_table):
         assert all(r >= ahead - 0.005 for n, r in f["ratios"].items() if n >= f["step"]), (case, f)
     for key, e in table.ENGINE.items():
         rows = [table.CASES[c]["rows"] for c in e["cases"]]
-        assert e["rows"] == (None if None in rows else max(rows)), key
+        fitted = None if None in rows else max(rows)
+        if any(v.startswith("behind") for v in e.get("benchmark", {}).values()):
+            # The default benchmark charged the class: its row can only have moved up from the
+            # fit, or to None when the class was behind at its largest benchmarked size.
+            assert e["rows"] is None or (fitted is not None and e["rows"] >= fitted), key
+        else:
+            assert e["rows"] == fitted, key
 
 
 # =============================================================================================
@@ -372,12 +378,18 @@ def test_every_bucket_is_ahead_from_its_crossover_on(each_table):
         e = table.GROUPS[key]
         ahead = 1.0 + table.MARGIN[key[1]]
         assert e["cases"] and e["smallest"] <= e["largest"]
+        charged = any(v.startswith("behind") for v in e.get("benchmark", {}).values())
         if e["rows"] is None:
+            # No crossover: the sweep was not ahead at the largest size (or ahead there alone), or
+            # the default benchmark found the bucket behind at its largest benchmarked size.
             last = sorted(e["ratios"])[-2:]
-            assert len(e["ratios"]) == 1 or not all(e["ratios"][n] >= ahead + 0.005 for n in last), key
+            assert charged or len(e["ratios"]) == 1 or not all(e["ratios"][n] >= ahead + 0.005 for n in last), key
             continue
         assert e["smallest"] <= e["rows"] <= e["largest"], key
-        assert all(r >= ahead - 0.005 for n, r in e["ratios"].items() if n >= e["step"]), (key, e)
+        # From the crossover's step on, every measured size is ahead by the margin; a benchmark
+        # charge moves the row up, so the sizes below it are not held to that.
+        floor = e["rows"] if charged else e["step"]
+        assert all(r >= ahead - 0.005 for n, r in e["ratios"].items() if n >= floor), (key, e)
 
 
 @pytest.mark.parametrize("each_table, key", _per_table(group_keys_of), ids=_param_id,

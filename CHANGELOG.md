@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **The default's crossover table for polars 2.0.0.** `python/arrowmetal/_engine_crossovers_pl2.py`,
+  fitted from a sweep on polars 2.0.0 (`Benchmarks/results/polars_engine_crossover_2026-10-08-polars2.csv`:
+  250,000 to 50,000,000 rows in memory and the Parquet scan cases at 1,000,000 to 50,000,000 rows,
+  one process per size, every one started at a 1-minute load below 3.5 on AC power; conditions in
+  `polars_engine_crossover_2026-10-08-polars2_conditions.txt`) and the default benchmark
+  (`polars_engine_default_groupby_raw_2026-10-08-polars2.csv`: 87 group-by, unique and sort cases at
+  2,000,000 and 50,000,000 rows, and the sort, unique and 1,000- and 10,000-group cases at 5,000,000,
+  10,000,000 and 20,000,000 rows). Polars 2.0.0 runs its group-bys, joins and sorts faster than 1.44.1
+  (its own time is 0.72x of 1.44.1's at the median over the cases the 1.44 default takes, down to
+  0.25x on `unique` over two keys), so on 2.0 the default leaves more to Polars: two-key and
+  one-key `sum` and `mean` at 200 to 10,000 groups, the String-column sort (and `(p)` of the same
+  class), the String-key join, semi join and top-k; the numeric sort crossover is 10,000,000 rows
+  (1.44: 947,836), `unique` 2,943,034 (1.44: 5,494,090). Measured with the table in force
+  (`polars_engine_bench_2026-10-08-polars2-refit.csv`, 50,000,000 rows, AC): the default takes 52 of
+  107 in-memory cases, every one 1.35x to 7.94x faster than the faster Polars 2.0.0 engine, none
+  behind; the 12 cases it stopped taking were 0.89x to 2.75x. `Benchmarks/polars_engine_crossover.py
+  --check` regenerates both modules from their own inputs.
+- **Group-count estimates cached on polars 2.0.0.** The engine keys its group-count estimate cache
+  on the key columns' buffer addresses through `Series._get_buffer_info()`, which polars 2.0 removed;
+  on 2.0 every probe sampled again. A single-chunk column is now named through the pointer the
+  Series exposes (`PySeries.as_single_ptr()`), so the cache holds on 2.0 as on 1.44; a chunked or
+  String column still gets no entry and is probed each time.
 - **One crossover table per Polars major.** `MetalEngine()`'s default policy loads its crossover
   table by the running Polars' major (`_engine_policy.TABLES`, `table_for`), on its first decision
   rather than at import: Polars 1.x loads `_engine_crossovers.py`, the 1.44.1 table, unchanged;

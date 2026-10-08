@@ -1010,9 +1010,11 @@ for name, e in cases.items():
     eng = am.MetalEngine(min_rows=0, shapes="all", raise_on_fail=True)
     assert_frame_equal(lf.collect(engine=eng), lf.collect())
     out[name] = [bool(eng.last_report.taken), list(eng.last_report.fallbacks)]
-# The shape the default engine takes: a large sort (from 1,026,501 rows, the table's crossover with
+# The shape the default engine takes: a large sort (from the table's crossover for sort with
 # its headroom), here with a filter against such a literal.
-n = 2_000_000
+from arrowmetal import _engine_policy as _policy
+# One row past the sort crossover of the table in force (1.44: 1,026,501; 2.0: 10,000,000).
+n = max(2_000_000, (_policy.table().ENGINE[("sort", "numeric", "memory")]["rows"] or 0) + 1)
 rng = np.random.default_rng(3)
 big = pl.DataFrame({"q": rng.integers(0, 10**9, n), "x": rng.standard_normal(n) * 1e19})
 lf = big.lazy().filter(pl.col("x") < 1e19).sort("q")

@@ -1957,14 +1957,25 @@ def _footer_groups(leaf, columns):
 
 def _identity(df, columns):
     """The frame's identity over `columns` (dtype, length and buffer address of each), or None
-    when a column has no single buffer to name (a String column, several chunks)."""
+    when a column has no single buffer to name (a String column, several chunks). polars 1.44
+    names the buffer through `Series._get_buffer_info()`; polars 2.0 removed that method, and
+    there a single-chunk column is named through `PySeries.as_single_ptr()` (which would rechunk
+    a chunked column, so those give None)."""
     out = []
     for c in columns:
         s = df.get_column(c)
         try:
-            out.append((c, str(s.dtype), s.len(), s._get_buffer_info()))
+            info = s._get_buffer_info()
+        except AttributeError:
+            try:
+                info = (s._s.as_single_ptr(), 0, s.len()) if s.n_chunks() == 1 else None
+            except Exception:             # noqa: BLE001 -- not a physical buffer (String, nested)
+                info = None
         except Exception:                 # noqa: BLE001 -- not a single-chunk physical buffer
+            info = None
+        if info is None:
             return None
+        out.append((c, str(s.dtype), s.len(), info))
     return tuple(out)
 
 
