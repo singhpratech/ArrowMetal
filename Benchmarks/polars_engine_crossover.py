@@ -40,10 +40,15 @@ table to `BENCH_RATIO`: a class or bucket of which a case the default took is be
 Polars engine on the best run or the median is taken only from the smallest benchmarked size above
 the largest size it was behind at, or not at all (`apply_bench`).
 
+There is one table per Polars major (`TABLES`), each fitted from a sweep run on that major (the
+sweep header names the Polars version): `_engine_crossovers.py` from the Polars 1.44 sweep and
+`_engine_crossovers_pl2.py` from the Polars 2.0.0 sweep. `--out` names the module to write; a
+module of `TABLES` is written only from a sweep on its own major.
+
 Usage:
     python Benchmarks/polars_engine_crossover.py Benchmarks/results/polars_engine_crossover_<date>.csv \\
-        --bench Benchmarks/results/polars_engine_default_<...>_raw_<date>.csv
-    python Benchmarks/polars_engine_crossover.py --check     # exit 1 if the committed table is stale
+        --bench Benchmarks/results/polars_engine_default_<...>_raw_<date>.csv [--out MODULE]
+    python Benchmarks/polars_engine_crossover.py --check     # exit 1 if a committed table is stale
     python Benchmarks/polars_engine_crossover.py CSV --print # the per-case and per-class fits
 """
 import argparse
@@ -58,6 +63,9 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "python", "arrowmetal", "_engine_crossovers.py")
+# The generated tables, one per Polars major ({major: module path}); `_engine_policy.TABLES` loads
+# them by the running Polars' major. `--check` checks every one that is there.
+TABLES = {1: OUT, 2: os.path.join(ROOT, "python", "arrowmetal", "_engine_crossovers_pl2.py")}
 SWEEP_JSON = "Benchmarks/results/router_2026-09-24.json"
 SWEEP_LABELS = {
     "sort": ["sort: argsort int64", "sort: argsort float64", "sort: lexsort (2 int32 keys)"],
@@ -412,6 +420,36 @@ def apply_bench(table, groups, bench):
             e["rows"] = start
 
 
+def polars_versions(header):
+    """The Polars versions a sweep header names ("polars 1.44.1 (16 threads)"), in order, once each."""
+    return list(dict.fromkeys(re.findall(r"\bpolars (\d+(?:\.\w+)*)", header)))
+
+
+def major_error(out, header):
+    """Why a sweep with this header cannot be the table at `out`, or None: the module of a Polars
+    major in TABLES is fitted only from a sweep on that major (a module outside TABLES from any)."""
+    major = next((m for m, p in TABLES.items() if os.path.abspath(out) == os.path.abspath(p)), None)
+    if major is None:
+        return None
+    name = os.path.relpath(os.path.abspath(out), ROOT)
+    versions = polars_versions(header)
+    if not versions:
+        return f"the sweep header names no Polars version; {name} is the Polars {major} table"
+    other = [v for v in versions if v.split(".")[0] != str(major)]
+    if other:
+        return f"the sweep ran on polars {', '.join(other)}; {name} is the Polars {major} table"
+    return None
+
+
+def committed_inputs(out):
+    """(sweep CSV, default benchmark CSVs) a generated module names as its SOURCE and BENCH."""
+    with open(out) as fh:
+        committed = fh.read()
+    path = os.path.join(ROOT, re.search(r"^SOURCE = '([^']+)'", committed, re.M).group(1))
+    m = re.search(r"^BENCH = (\[.*\])$", committed, re.M)
+    return path, [os.path.join(ROOT, p) for p in (ast.literal_eval(m.group(1)) if m else [])]
+
+
 def generate(csv_path, bench_paths=()):
     source = os.path.relpath(os.path.abspath(csv_path), ROOT)
     header, cases = read_sweep(csv_path)
@@ -431,16 +469,27 @@ def main():
     ap.add_argument("--bench", action="append", default=[],
                     help="a default benchmark CSV for the BENCH_RATIO rule (repeatable; default with "
                          "--check: the ones the committed table names)")
+    ap.add_argument("--out", help="the generated module to write or check (default: "
+                                  "python/arrowmetal/_engine_crossovers.py; with --check and neither "
+                                  "a CSV nor --out: every module of TABLES that is there)")
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--print", action="store_true")
     args = ap.parse_args()
+    if args.check and args.csv is None and args.out is None:
+        outs = [p for _m, p in sorted(TABLES.items()) if p == OUT or os.path.exists(p)]
+    else:
+        outs = [os.path.abspath(args.out) if args.out else OUT]
+    stale = 0
+    for out in outs:
+        stale += run(args, out)
+    return 1 if stale else 0
+
+
+def run(args, out):
+    """Fits, prints, checks or writes the module at `out`; 1 when it is stale or not written."""
     path, benches = args.csv, args.bench
     if path is None:
-        with open(OUT) as fh:
-            committed = fh.read()
-        path = os.path.join(ROOT, re.search(r"^SOURCE = '([^']+)'", committed, re.M).group(1))
-        m = re.search(r"^BENCH = (\[.*\])$", committed, re.M)
-        benches = [os.path.join(ROOT, p) for p in (ast.literal_eval(m.group(1)) if m else [])]
+        path, benches = committed_inputs(out)
     text, per_case, groups, table = generate(path, benches)
     if args.print:
         for case, f in per_case.items():
@@ -459,17 +508,24 @@ def main():
             x = f"{e['rows']:,}" if e["rows"] else "not reached"
             print(f"{k[0]:<22} {k[1]:<8} {k[2]:<8} {k[3]:>10} groups {x:>12}  "
                   f"({e['groups'][0]:,} to {e['groups'][1]:,} groups measured)  {e['ratios']}")
+    why = major_error(out, read_sweep(path)[0]) if args.check or args.csv else None
     if args.check:
-        with open(OUT) as fh:
+        if why is not None:
+            print(f"{out} does not match its sweep: {why}", file=sys.stderr)
+            return 1
+        with open(out) as fh:
             if fh.read() != text:
-                print(f"{OUT} is stale: regenerate it from {path}", file=sys.stderr)
+                print(f"{out} is stale: regenerate it from {path}", file=sys.stderr)
                 return 1
-        print(f"{OUT} matches {path}")
+        print(f"{out} matches {path}")
         return 0
     if args.csv:
-        with open(OUT, "w") as fh:
+        if why is not None:
+            print(f"{os.path.relpath(out, ROOT)} not written: {why}", file=sys.stderr)
+            return 1
+        with open(out, "w") as fh:
             fh.write(text)
-        print(f"wrote {os.path.relpath(OUT, ROOT)} from {os.path.relpath(path, ROOT)}")
+        print(f"wrote {os.path.relpath(out, ROOT)} from {os.path.relpath(path, ROOT)}")
     return 0
 
 

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **One crossover table per Polars major.** `MetalEngine()`'s default policy loads its crossover
+  table by the running Polars' major (`_engine_policy.TABLES`, `table_for`), on its first decision
+  rather than at import: Polars 1.x loads `_engine_crossovers.py`, the 1.44.1 table, unchanged;
+  Polars 2.x loads `_engine_crossovers_pl2.py`, the module generated from the 2.0.0 sweep, or, in
+  an install without it, the 1.44.1 table with a warning the first time. `compatibility()` gains
+  `crossover_table` (the module, its `SOURCE` and the Polars version of its sweep), and
+  `python -m arrowmetal.polars_engine check` prints it. `Benchmarks/polars_engine_crossover.py`
+  gains `--out` (the module to write or check), writes a major's module only from a sweep run on
+  that major, and `--check` checks every table module present. `test_engine_policy.py` runs the
+  table tests and the `--check` test once per table module.
 - **Integer means in the Polars and plan engines, one pass.** A `mean` over an integer column
   (Int8 to Int64, UInt8 to UInt64) is computed from the integer column itself by the group-by's
   integer mean kernel: the exact sum of each group divided by its count, rounded once. Before, the

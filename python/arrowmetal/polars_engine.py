@@ -28,8 +28,10 @@ a one-line reason in `engine.last_report`.
 Which of those it does take is a second decision (`_engine_policy.py`). By default
 (`shapes="measured"`) it takes a subtree when its input rows are at or above the measured crossover
 of every shape class in it, for its dtype class and input, and a group-by by the bucket of its
-estimated group count; `shapes="all"` takes everything it can translate. docs/POLARS.md says how
-the crossovers were measured and which results files they come from.
+estimated group count; `shapes="all"` takes everything it can translate. The crossovers come from
+one table per Polars major, chosen by the running Polars' major (`_engine_policy.TABLES`;
+`compatibility()["crossover_table"]` names it). docs/POLARS.md says how the crossovers were
+measured and which results files they come from.
 
 Results are Polars' results
 ---------------------------
@@ -1917,7 +1919,7 @@ def _frame_groups(df, columns, settled=None, stats=None):
         if settled is not None:
             if settled(lo, hi):
                 break
-        elif est <= 2 * d or f2 >= _GROUP_SETTLED_F2 or lo * _policy.NEAR_ROWS >= rows:
+        elif est <= 2 * d or f2 >= _GROUP_SETTLED_F2 or lo * _policy.table().NEAR_ROWS >= rows:
             break
         n *= _GROUP_GROWTH
     est, lo, hi = (int(round(x)) for x in (est, lo, hi))
@@ -2580,7 +2582,9 @@ def compatibility():
     TESTED_POLARS, the IR version, whether its major is one of TESTED_IR_VERSION's
     (`ir_compatible`) and whether it is one of them exactly (`ir_tested`), whether the callback
     API is there (`missing` names what is not), the IR node kinds this Polars has that
-    KNOWN_NODE_KINDS lacks, and whether OFF_ENV is set."""
+    KNOWN_NODE_KINDS lacks, whether OFF_ENV is set, and the crossover table the default policy
+    uses for this Polars' major (`crossover_table`: its module, the sweep file it was fitted from
+    and the Polars version that sweep ran on)."""
     missing = [f"_LocalEngine.{m}" for m in ("_post_opt_callback", "collect")
                if not hasattr(_LocalEngine, m)]
     seen = {}
@@ -2599,6 +2603,7 @@ def compatibility():
     missing += seen.get("missing", [])
     kinds = sorted(k for k, v in vars(_in).items() if isinstance(v, type) and not k.startswith("_"))
     ir = seen.get("ir")
+    table = _policy.table()
     return {
         "polars": pl.__version__,
         "polars_tested": pl.__version__ in TESTED_POLARS,
@@ -2609,6 +2614,8 @@ def compatibility():
         "missing": missing,
         "unknown_node_kinds": [k for k in kinds if k not in KNOWN_NODE_KINDS],
         "engine_off": _engine_off(),
+        "crossover_table": {"module": table.__name__, "source": table.SOURCE,
+                            "polars": _policy.table_polars(table)},
     }
 
 
@@ -2655,6 +2662,8 @@ def check(out=None):
         + " (a plan holding one stays with Polars)")
     say(f"{OFF_ENV}: " + (f"{c['engine_off']} (every plan stays with Polars)"
                           if c["engine_off"] is not None else "not set"))
+    t = c["crossover_table"]
+    say(f"crossover table: {t['module']}, fitted from {t['source']} (polars {t['polars']})")
     head = capability_header()
     say()
     if head is None:

@@ -22,24 +22,101 @@ The measured default (`shapes="measured"`) takes a subtree when its input rows a
 crossover of every class in it, for the subtree's dtype class (`numeric`, or `string` when a String
 column is among its inputs) and input (`memory` or `parquet`). A class's crossover is the largest of
 
-* the engine table (`_engine_crossovers.ENGINE`): the whole subtree through `MetalEngine`, cold,
-  against the faster of Polars' in-memory and streaming engines, fitted per class from
+* the engine table (the table in force's `ENGINE`, below): the whole subtree through `MetalEngine`,
+  cold, against the faster of Polars' in-memory and streaming engines, fitted per class from
   `Benchmarks/polars_engine_crossover.py`'s sweep. A class with no measurement for that dtype class
   and input, or one that was not ahead at the largest size measured, is not taken at any size;
 * the router table in force (`arrowmetal.router_table()`, the GPU kernel against the CPU loop the
   router would run) for the kernels the class runs (`ROUTER_OPS`);
-* the crossover sweep (`_engine_crossovers.SWEEP`, the GPU kernel against the fastest CPU library)
+* the crossover sweep (the table's `SWEEP`, the GPU kernel against the fastest CPU library)
   for the sort kernels, which the router table does not route.
 
-A group-by class the sweep measured at several group counts (`_engine_crossovers.GROUPS`) is judged
+A group-by class the sweep measured at several group counts (the table's `GROUPS`) is judged
 by the bucket its estimated group count falls in (`group_bucket`) instead of the engine table's row:
 the bucket's own crossover, with the same floors. A group count in a bucket with no crossover, or in
 no bucket, is not taken; a group-by with no estimate (its keys are not columns of one input frame)
 is judged by the engine table's row, which every group count measured has to be ahead for.
+
+There is one crossover table per Polars major (`TABLES`), each fitted from a sweep run on that
+major: `_engine_crossovers` from the Polars 1.44 sweep, `_engine_crossovers_pl2` from the Polars
+2.0.0 sweep. The table in force (`table()`) is chosen on first use, not at import, by the running
+Polars' major (`table_for`): major 1 loads `_engine_crossovers`; major 2 and above load
+`_engine_crossovers_pl2`, or, when that module is not in the install, `_engine_crossovers` with a
+warning the first time.
 """
+import importlib
+import re
+import warnings
 from collections import namedtuple
 
-from . import _engine_crossovers as _table
+# {Polars major: the crossover table module of this package fitted on that major}. A major loads the
+# table of the largest major here at or below it.
+TABLES = {1: "_engine_crossovers", 2: "_engine_crossovers_pl2"}
+
+_by_major = {}        # Polars major -> the table module `table_for` chose for it
+_active = None        # the table in force, set by `table()` on first use
+
+
+def _load(name):
+    """The table module `name` of this package, or None when it is not there."""
+    try:
+        return importlib.import_module(f"{__package__}.{name}")
+    except ModuleNotFoundError as e:
+        if e.name != f"{__package__}.{name}":
+            raise
+        return None
+
+
+def table_polars(mod):
+    """The Polars versions named in a table module's sweep header (`HEADER`), as text: '1.44.1'."""
+    return ", ".join(dict.fromkeys(re.findall(r"\bpolars (\d+(?:\.\w+)*)", mod.HEADER)))
+
+
+def table_for(polars_major):
+    """The crossover table module for a Polars major (None: Polars is not installed, which loads
+    the major-1 table): the table of the largest major in TABLES at or below it; when that module is
+    not there, the major-1 table, with a warning the first time it is chosen for that major."""
+    if polars_major in _by_major:
+        return _by_major[polars_major]
+    base = min(TABLES)
+    want = max((m for m in TABLES if polars_major is not None and m <= polars_major), default=base)
+    mod = _load(TABLES[want])
+    if mod is None:
+        mod = _load(TABLES[base])
+        if mod is None:
+            raise ImportError(f"{__package__}.{TABLES[base]} is not in this install")
+        warnings.warn(f"MetalEngine: no crossover table for Polars {polars_major} in this install "
+                      f"({__package__}.{TABLES[want]} is not there); the default policy uses "
+                      f"{mod.__name__}, fitted on Polars {table_polars(mod)}", stacklevel=2)
+    _by_major[polars_major] = mod
+    return mod
+
+
+def _polars_major():
+    """The running Polars' major version, or None when Polars is not installed."""
+    try:
+        import polars
+    except ImportError:
+        return None
+    return int(re.match(r"\d+", polars.__version__).group())
+
+
+def table():
+    """The crossover table in force: `table_for` the running Polars' major, chosen on first use."""
+    global _active
+    if _active is None:
+        _active = table_for(_polars_major())
+    return _active
+
+
+class _Table:
+    """The table in force's attributes, read through `table()` each time one is used."""
+
+    def __getattr__(self, name):
+        return getattr(table(), name)
+
+
+_table = _Table()
 
 FAMILIES = ("sum", "count", "mean", "minmax")
 
@@ -73,10 +150,26 @@ report prints it. `binding`: the class whose crossover decided (None under an ov
 `crossover`: the row count it needed (None when no row count is enough). `groups`: the group-count
 estimate the decision used, or None when it used none."""
 
-# The group-count buckets, in order, and the (class, dtype class, input) the sweep measured per bucket.
-BUCKETS = tuple(b[0] for b in _table.GROUP_BUCKETS) + (_table.ROWS_BUCKET,)
-_BUCKETED = frozenset(k[:3] for k in _table.GROUPS)
-NEAR_ROWS = _table.NEAR_ROWS
+
+def _buckets():
+    """The group-count buckets of the table in force, in order."""
+    return tuple(b[0] for b in _table.GROUP_BUCKETS) + (_table.ROWS_BUCKET,)
+
+
+def _bucketed():
+    """The (class, dtype class, input) the table in force measured per group-count bucket."""
+    return frozenset(k[:3] for k in _table.GROUPS)
+
+
+def __getattr__(name):
+    # BUCKETS, _BUCKETED and NEAR_ROWS of the table in force, read when used.
+    if name == "BUCKETS":
+        return _buckets()
+    if name == "_BUCKETED":
+        return _bucketed()
+    if name == "NEAR_ROWS":
+        return _table.NEAR_ROWS
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def node_of(cls):
@@ -102,7 +195,7 @@ def _what(cls, dclass, source):
 
 def group_bucket(groups, rows):
     """The bucket of a group-by with `groups` groups over `rows` input rows: the name of one of
-    `_engine_crossovers.GROUP_BUCKETS` (fewest to most groups), `ROWS_BUCKET` for at least
+    the table's `GROUP_BUCKETS` (fewest to most groups), `ROWS_BUCKET` for at least
     rows / NEAR_ROWS groups, or None (no groups, or a count between the last bucket and that)."""
     if groups is None or groups <= 0:
         return None
@@ -176,7 +269,7 @@ def group_crossover(cls, dclass, source, bucket, router=None):
 
 def group_band(cls, dclass, source, rows, router=None):
     """The buckets in which `cls` is taken at `rows` input rows, fewest groups first."""
-    return [b for b in BUCKETS
+    return [b for b in _buckets()
             if (group_crossover(cls, dclass, source, b, router)[0] or rows + 1) <= rows]
 
 
@@ -184,16 +277,17 @@ def _band_text(band, rows):
     """'taken at 3,163 to 316,227 groups', adjacent buckets merged."""
     if not band:
         return "taken at no group count"
+    buckets = _buckets()
     runs = []
     for b in band:
-        i = BUCKETS.index(b)
+        i = buckets.index(b)
         if runs and runs[-1][1] == i - 1 and b != _table.ROWS_BUCKET:
             runs[-1][1] = i
         else:
             runs.append([i, i])
     parts = []
     for lo, hi in runs:
-        if BUCKETS[lo] == _table.ROWS_BUCKET:
+        if buckets[lo] == _table.ROWS_BUCKET:
             parts.append(bucket_range(_table.ROWS_BUCKET, rows))
             continue
         first = _table.GROUP_BUCKETS[lo][1]
@@ -288,7 +382,8 @@ def decide(classes, dtypes, rows, source="memory", *, shapes="measured", min_row
         return Decision(True, f"{rule} takes every translatable subtree of at least {need:,} rows",
                         None, need)
     dclass = dtype_class(dtypes)
-    grouped = [c for c in classes if is_group_by(c) and (c, dclass, source) in _BUCKETED]
+    buckets, bucketed = _buckets(), _bucketed()
+    grouped = [c for c in classes if is_group_by(c) and (c, dclass, source) in bucketed]
     found = [(c,) + crossover(c, dclass, source, router) for c in classes if c not in grouped]
     for c, x, where in found:
         if x is None:
@@ -299,7 +394,7 @@ def decide(classes, dtypes, rows, source="memory", *, shapes="measured", min_row
         # Below the smallest crossover any group count has, no estimate can take the subtree.
         low = []
         for c in grouped:
-            xs = [x for x in (group_crossover(c, dclass, source, b, router)[0] for b in BUCKETS)
+            xs = [x for x in (group_crossover(c, dclass, source, b, router)[0] for b in buckets)
                   if x is not None]
             low.append((c, min(xs) if xs else None))
         rest = max((x for _c, x, _w in found), default=0)
@@ -355,9 +450,9 @@ def decide(classes, dtypes, rows, source="memory", *, shapes="measured", min_row
                     x, where = group_crossover(c, dclass, source, bucket, router)
                 if x is None:
                     band = group_band(c, dclass, source, rows, router)
-                    if band and bucket is not None and BUCKETS.index(bucket) < BUCKETS.index(band[0]):
+                    if band and bucket is not None and buckets.index(bucket) < buckets.index(band[0]):
                         side = "below"
-                    elif band and (bucket is None or BUCKETS.index(bucket) > BUCKETS.index(band[-1])):
+                    elif band and (bucket is None or buckets.index(bucket) > buckets.index(band[-1])):
                         side = "above"
                     else:
                         side = "outside"
@@ -394,7 +489,8 @@ def group_rule_table(router=None):
     """Every (class, dtype class, input, bucket) the group-count table knows, with its crossover:
     [(class, dtype class, input, bucket, rows or None, where)], buckets fewest groups first."""
     out = []
-    for key in sorted(_table.GROUPS, key=lambda k: (k[:3], BUCKETS.index(k[3]))):
+    buckets = _buckets()
+    for key in sorted(_table.GROUPS, key=lambda k: (k[:3], buckets.index(k[3]))):
         x, where = group_crossover(*key, router)
         out.append(key + (x, where))
     return out

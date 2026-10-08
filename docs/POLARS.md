@@ -756,13 +756,27 @@ the default uses as `rows`:
 A class's crossover is the largest over the cases whose classes all belong to its node, so every case
 that measures a class has to be ahead; if one of them has no fit, the class has no crossover. A case
 whose classes span two nodes, (b) (a group-by under a top-k) and (e) (a whole-frame sum over a join),
-measures no class. The fitted table is `python/arrowmetal/_engine_crossovers.py`, and
-`polars_engine_crossover.py --check` fails when it and the results file disagree. The policy then
+measures no class. There is one fitted table per Polars major, chosen by the running Polars' major
+the first time the policy decides, and `python -m arrowmetal.polars_engine check` names the one in
+force (`compatibility()["crossover_table"]`):
+
+* Polars 1.x loads `python/arrowmetal/_engine_crossovers.py`, the table fitted from the polars 1.44.1
+  sweep above, unchanged.
+* Polars 2.x loads `python/arrowmetal/_engine_crossovers_pl2.py`, the module generated from the 2.0.0
+  sweep: `Benchmarks/results/polars_engine_crossover_2026-10-08-polars2.csv` as its `SOURCE` and
+  `Benchmarks/results/polars_engine_default_groupby_raw_2026-10-08-polars2.csv` as its `BENCH`
+  (`polars_engine_crossover.py <sweep> --bench <benchmark> --out python/arrowmetal/_engine_crossovers_pl2.py`).
+  An install without that module loads the 1.44 table and warns once.
+
+Each module records its own `SOURCE`, `BENCH` and the sweep's `HEADER`, which names the Polars
+version the sweep ran on; `polars_engine_crossover.py` writes a major's module only from a sweep on
+that major, and `polars_engine_crossover.py --check` fails when any module and its results files
+disagree. The policy then
 takes the larger of that crossover and the kernels' own: the router table in force
 (`am.router_table()`, [CROSSOVER.md](CROSSOVER.md)) for the kernels it routes, and for the sort
 classes the crossover of `argsort int64`, `argsort float64` and `lexsort (2 int32 keys)` against the
 fastest CPU library in `Benchmarks/results/router_2026-09-24.json`, 1,000,000 rows. The fits below are
-from `Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv`.
+the Polars 1.44 table's, from `Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv`.
 
 | class | dtype | input | rows the default uses | the fit it came from | cases (their fit) |
 |---|---|---|---:|---|---|

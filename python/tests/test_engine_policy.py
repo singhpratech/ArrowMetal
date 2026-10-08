@@ -3,16 +3,20 @@ on Metal by default, and the overrides.
 
 Run: PYTHONPATH=python python -m pytest python/tests/test_engine_policy.py -q
 
-The pure half checks `decide()` itself against the committed crossover table
-(python/arrowmetal/_engine_crossovers.py): the same decision for the same (classes, dtypes, rows,
-input) across calls and across processes, and every rule just below and at its crossover. The
-engine half collects plans through `MetalEngine()` and checks that the report says which rule took
-or left each subtree, that a Parquet scan is judged by its footer's row count, and that the table
-is the one `Benchmarks/polars_engine_crossover.py` fits from the results file it names.
+The pure half checks `decide()` itself against each committed crossover table, one per Polars major
+(python/arrowmetal/_engine_crossovers.py, and _engine_crossovers_pl2.py when it is there): the same
+decision for the same (classes, dtypes, rows, input) across calls and across processes, and every
+rule just below and at its crossover; and that the running Polars' major picks its table. The
+engine half collects plans through `MetalEngine()` with the table in force for the running Polars
+and checks that the report says which rule took or left each subtree, that a Parquet scan is judged
+by its footer's row count, and that each table is the one `Benchmarks/polars_engine_crossover.py`
+fits from the results file it names.
 """
 import os
 import subprocess
 import sys
+import types
+import warnings
 
 import numpy as np
 import pyarrow as pa
@@ -22,17 +26,68 @@ import pytest
 import arrowmetal as am
 
 pl = pytest.importorskip("polars")
-from arrowmetal import _engine_crossovers as table  # noqa: E402
 from arrowmetal import _engine_policy as policy  # noqa: E402
 from arrowmetal import polars_engine as pe  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 ROUTER = policy.router_crossovers(am.router_table())
-KEYS = sorted(table.ENGINE)
-# The (class, dtype class, input) judged by the engine table's row alone; a group-by class the sweep
-# measured per group count is judged by its buckets (below), and by its row only without an estimate.
-CLASS_KEYS = [k for k in KEYS if k not in policy._BUCKETED]
+# Every crossover table module in this install, fewest Polars major first, and the one in force for
+# the running Polars (the engine half runs against it).
+TABLE_MODULES = [m for m in (policy._load(policy.TABLES[k]) for k in sorted(policy.TABLES))
+                 if m is not None]
+IN_FORCE = policy.table()
+
+
+def table_id(t):
+    return t.__name__.rsplit(".", 1)[-1]
+
+
+def keys_of(t):
+    return sorted(t.ENGINE)
+
+
+def class_keys_of(t):
+    """The (class, dtype class, input) judged by the engine table's row alone; a group-by class the
+    sweep measured per group count is judged by its buckets (below), and by its row only without an
+    estimate."""
+    bucketed = {k[:3] for k in t.GROUPS}
+    return [k for k in keys_of(t) if k not in bucketed]
+
+
+def group_keys_of(t):
+    order = [b[0] for b in t.GROUP_BUCKETS] + [t.ROWS_BUCKET]
+    return sorted(t.GROUPS, key=lambda k: (k[:3], order.index(k[3])))
+
+
+def _bind(t):
+    """Puts the table module `t` in force: in the policy, and in this module's `table`, `KEYS`,
+    `CLASS_KEYS` and `GROUP_KEYS`."""
+    global table, KEYS, CLASS_KEYS, GROUP_KEYS
+    policy._active = t
+    table, KEYS, CLASS_KEYS, GROUP_KEYS = t, keys_of(t), class_keys_of(t), group_keys_of(t)
+
+
+_bind(IN_FORCE)
+
+
+@pytest.fixture(params=TABLE_MODULES, ids=table_id)
+def each_table(request):
+    """Runs a test once per table module, with that table in force; the table of the running Polars
+    is put back afterwards."""
+    _bind(request.param)
+    yield request.param
+    _bind(IN_FORCE)
+
+
+def _per_table(keys_of_table):
+    """(table, key) for every key of every table, for a test parametrized indirectly by
+    `each_table`."""
+    return [(t, k) for t in TABLE_MODULES for k in keys_of_table(t)]
+
+
+def _param_id(v):
+    return table_id(v) if isinstance(v, types.ModuleType) else "|".join(v)
 
 
 def dtypes_of(dclass):
@@ -70,20 +125,21 @@ def _decisions(router):
             for c, d, s, n, g in _grid()]
 
 
-def test_the_policy_is_pure_across_calls_and_processes():
+def test_the_policy_is_pure_across_calls_and_processes(each_table):
     first = _decisions(ROUTER)
     assert len(first) > len(KEYS) * 8
     for _ in range(200):
         assert _decisions(ROUTER) == first
     code = ("import sys; sys.path.insert(0, %r); import test_engine_policy as t; "
-            "print(repr(t._decisions(t.ROUTER)))" % HERE)
+            "t._bind(t.policy._load(%r)); print(repr(t._decisions(t.ROUTER)))"
+            % (HERE, table_id(each_table)))
     env = dict(os.environ, PYTHONPATH=os.path.join(REPO, "python"))
     out = subprocess.run([sys.executable, "-c", code], check=True, env=env, cwd=REPO,
                          capture_output=True, text=True).stdout.strip().splitlines()[-1]
     assert out == repr(first)
 
 
-def test_the_table_covers_the_translator_classes_it_measured():
+def test_the_table_covers_the_translator_classes_it_measured(each_table):
     for cls, dclass, source in KEYS:
         assert cls in policy.CLASSES, cls
         assert dclass in ("numeric", "string") and source in ("memory", "parquet")
@@ -92,8 +148,9 @@ def test_the_table_covers_the_translator_classes_it_measured():
         assert e["rows"] is None or 0 < e["rows"] <= e["largest"]
 
 
-@pytest.mark.parametrize("key", CLASS_KEYS, ids=lambda k: "|".join(k))
-def test_each_rule_just_below_and_at_its_crossover(key):
+@pytest.mark.parametrize("each_table, key", _per_table(class_keys_of), ids=_param_id,
+                         indirect=["each_table"])
+def test_each_rule_just_below_and_at_its_crossover(each_table, key):
     cls, dclass, source = key
     x, where = policy.crossover(cls, dclass, source, ROUTER)
     dt = dtypes_of(dclass)
@@ -113,7 +170,7 @@ def test_each_rule_just_below_and_at_its_crossover(key):
     assert where in at.reason
 
 
-def test_a_subtree_needs_the_crossover_of_every_class_in_it():
+def test_a_subtree_needs_the_crossover_of_every_class_in_it(each_table):
     numeric = [(k[0], policy.crossover(*k, ROUTER)[0]) for k in KEYS
                if k[1:] == ("numeric", "memory") and reached(k)]
     missing = [k[0] for k in KEYS if k[1:] == ("numeric", "memory") and not reached(k)]
@@ -127,7 +184,7 @@ def test_a_subtree_needs_the_crossover_of_every_class_in_it():
         assert not d.take and d.binding == missing[0]
 
 
-def test_the_string_rule_uses_the_string_rows_only():
+def test_the_string_rule_uses_the_string_rows_only(each_table):
     """A String column among the inputs selects the table's `string` rows: a class measured over
     numeric columns only is not taken with a String column at any size."""
     for cls, dclass, source in KEYS:
@@ -137,13 +194,13 @@ def test_the_string_rule_uses_the_string_rows_only():
         assert not d.take and d.reason.startswith(f"no measurement of {cls} with a String column")
 
 
-def test_unmeasured_shapes_are_left_to_polars():
+def test_unmeasured_shapes_are_left_to_polars(each_table):
     d = policy.decide(["join:anti"], dtypes_of("numeric"), 10**12, "parquet", router=ROUTER)
     if ("join:anti", "numeric", "parquet") not in table.ENGINE:
         assert not d.take and d.reason.startswith("no measurement of join:anti over a Parquet file")
 
 
-def test_the_router_table_and_the_sort_sweep_are_floors():
+def test_the_router_table_and_the_sort_sweep_are_floors(each_table):
     """A class's crossover is at least the router table's for the kernels it runs and the crossover
     sweep's for the sort kernels; a floor above the engine table's figure is the one the reason
     names."""
@@ -165,7 +222,7 @@ def test_the_router_table_and_the_sort_sweep_are_floors():
         assert not d.take and d.crossover == 10**11 and "router table, a test row" in d.reason
 
 
-def test_overrides():
+def test_overrides(each_table):
     dt = dtypes_of("numeric")
     d = policy.decide(["join:anti"], dt, 999_999, shapes="all")
     assert not d.take and "below min_rows=1,000,000 (shapes='all')" in d.reason
@@ -199,14 +256,68 @@ def test_engine_arguments():
     assert [r[:3] for r in rules] == KEYS
 
 
-def test_the_committed_table_is_the_fit_of_the_results_file_it_names():
-    assert os.path.exists(os.path.join(REPO, table.SOURCE)), table.SOURCE
-    assert os.path.exists(os.path.join(REPO, table.SWEEP_SOURCE)), table.SWEEP_SOURCE
-    subprocess.run([sys.executable, os.path.join(REPO, "Benchmarks", "polars_engine_crossover.py"),
-                    "--check"], check=True, cwd=REPO, capture_output=True)
+FIT = os.path.join(REPO, "Benchmarks", "polars_engine_crossover.py")
 
 
-def test_every_fitted_case_is_ahead_from_its_crossover_on():
+@pytest.mark.parametrize("t", TABLE_MODULES, ids=table_id)
+def test_the_committed_table_is_the_fit_of_the_results_file_it_names(t):
+    for path in [t.SOURCE, t.SWEEP_SOURCE] + list(t.BENCH):
+        assert os.path.exists(os.path.join(REPO, path)), path
+    module = os.path.join(REPO, "python", "arrowmetal", table_id(t) + ".py")
+    subprocess.run([sys.executable, FIT, "--check", "--out", module], check=True, cwd=REPO,
+                   capture_output=True)
+
+
+def test_the_check_covers_every_table():
+    out = subprocess.run([sys.executable, FIT, "--check"], check=True, cwd=REPO,
+                         capture_output=True, text=True).stdout
+    for t in TABLE_MODULES:
+        assert f"{table_id(t)}.py matches " in out, out
+
+
+def test_the_table_is_chosen_by_the_polars_major(monkeypatch):
+    """Major 1 loads `_engine_crossovers`; major 2 and above `_engine_crossovers_pl2` when it is
+    there, else `_engine_crossovers` with one warning naming the fallback."""
+    real = policy._load
+    base = real(policy.TABLES[1])
+    pl2 = types.ModuleType(f"arrowmetal.{policy.TABLES[2]}")
+    pl2.HEADER = "ArrowMetal on a test machine, polars 2.0.0 (16 threads)"
+    monkeypatch.setattr(policy, "_by_major", {})
+    monkeypatch.setattr(policy, "_active", None)
+    monkeypatch.setattr(policy, "_load", lambda name: pl2 if name == policy.TABLES[2] else real(name))
+    monkeypatch.setattr(policy, "_polars_major", lambda: 2)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert policy.table_for(1) is base and policy.table_for(None) is base
+        assert policy.table_for(2) is pl2 and policy.table_for(3) is pl2
+        assert policy.table() is pl2
+        assert policy.table_polars(pl2) == "2.0.0" and policy.table_polars(base) == "1.44.1"
+    # Without the major-2 module: the major-1 table, and a warning the first time only.
+    monkeypatch.setattr(policy, "_by_major", {})
+    monkeypatch.setattr(policy, "_active", None)
+    monkeypatch.setattr(policy, "_load", lambda name: None if name == policy.TABLES[2] else real(name))
+    with pytest.warns(UserWarning, match=r"no crossover table for Polars 2 in this install "
+                                         r"\(arrowmetal\._engine_crossovers_pl2 is not there\); the "
+                                         r"default policy uses arrowmetal\._engine_crossovers, fitted "
+                                         r"on Polars 1\.44\.1"):
+        assert policy.table() is base
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert policy.table_for(2) is base and policy.table_for(1) is base
+    # The policy reads the table in force through `table()`.
+    monkeypatch.setattr(policy, "_active", pl2)
+    assert policy._table.HEADER == pl2.HEADER
+
+
+def test_compatibility_names_the_table_in_force():
+    major = int(pl.__version__.split(".")[0])
+    assert IN_FORCE is policy.table_for(major)
+    assert pe.compatibility()["crossover_table"] == {
+        "module": IN_FORCE.__name__, "source": IN_FORCE.SOURCE,
+        "polars": policy.table_polars(IN_FORCE)}
+
+
+def test_every_fitted_case_is_ahead_from_its_crossover_on(each_table):
     """The per-case fits in the table: at every measured size at or above a case's crossover the
     MetalEngine was at least as fast as the faster Polars engine, and a class's crossover is the
     largest of its cases'."""
@@ -227,8 +338,6 @@ def test_every_fitted_case_is_ahead_from_its_crossover_on():
 # group-by: the group-count buckets
 # =============================================================================================
 
-GROUP_KEYS = sorted(table.GROUPS, key=lambda k: (k[:3], policy.BUCKETS.index(k[3])))
-
 
 def _middle(bucket, rows):
     """A group count inside `bucket` at `rows` input rows (its geometric middle)."""
@@ -238,7 +347,7 @@ def _middle(bucket, rows):
     return int(round((lo * hi) ** 0.5))
 
 
-def test_the_buckets_tile_the_group_counts():
+def test_the_buckets_tile_the_group_counts(each_table):
     b = table.GROUP_BUCKETS
     assert b[0][1] == 1 and all(b[i][2] + 1 == b[i + 1][1] for i in range(len(b) - 1))
     rows = 10**12
@@ -254,7 +363,7 @@ def test_the_buckets_tile_the_group_counts():
             assert policy.group_bucket(edge - 1, rows) != table.ROWS_BUCKET
 
 
-def test_every_bucket_is_ahead_from_its_crossover_on():
+def test_every_bucket_is_ahead_from_its_crossover_on(each_table):
     """The per-bucket fits: at every size measured in a bucket from its crossover's step on, the
     worst case there is ahead by the margin; a bucket without a crossover is not ahead at its
     largest size, or ahead there alone."""
@@ -271,8 +380,9 @@ def test_every_bucket_is_ahead_from_its_crossover_on():
         assert all(r >= ahead - 0.005 for n, r in e["ratios"].items() if n >= e["step"]), (key, e)
 
 
-@pytest.mark.parametrize("key", GROUP_KEYS, ids=lambda k: "|".join(k))
-def test_each_bucket_rule_just_below_and_at_its_crossover(key):
+@pytest.mark.parametrize("each_table, key", _per_table(group_keys_of), ids=_param_id,
+                         indirect=["each_table"])
+def test_each_bucket_rule_just_below_and_at_its_crossover(each_table, key):
     cls, dclass, source, bucket = key
     x, where = policy.group_crossover(cls, dclass, source, bucket, ROUTER)
     dt = dtypes_of(dclass)
@@ -295,7 +405,7 @@ def test_each_bucket_rule_just_below_and_at_its_crossover(key):
     assert not below.take and below.binding == cls
 
 
-def test_a_losing_bucket_is_named_below_or_above_the_band():
+def test_a_losing_bucket_is_named_below_or_above_the_band(each_table):
     """A group count in a bucket the sweep did not bring ahead stays with Polars at every size, and
     the reason places the estimate against the buckets taken at those rows."""
     seen = 0
@@ -315,7 +425,7 @@ def test_a_losing_bucket_is_named_below_or_above_the_band():
     assert seen, "no bucket outside a band in the table in force"
 
 
-def test_no_estimate_falls_back_to_the_class_row():
+def test_no_estimate_falls_back_to_the_class_row(each_table):
     """Without an estimate a bucketed class is judged by the engine table's row (every group count
     measured) and the reason says so; below every bucket's crossover no probe is asked for."""
     for cls, dclass, source in sorted({k[:3] for k in GROUP_KEYS}):
@@ -377,7 +487,7 @@ def test_the_probe_on_nearly_unique_keys():
     assert int(how.split("from a ")[1].split("-row")[0].replace(",", "")) <= 8_192, how
 
 
-def test_settled_means_one_answer_over_the_range():
+def test_settled_means_one_answer_over_the_range(each_table):
     """`settled_for`: a range of group counts is settled when every bucket it reaches is taken, or
     none is; the regions tile every count from 1 up."""
     for cls, dclass, source in sorted({k[:3] for k in GROUP_KEYS}):
@@ -399,9 +509,11 @@ def test_settled_means_one_answer_over_the_range():
                         assert take(a) == take(b), (cls, rows, a, b)
 
 
-def test_an_estimate_range_is_taken_only_where_every_count_in_it_is():
-    key = next(k for k in GROUP_KEYS if k[:3] == ("group_by_multi:sum", "numeric", "memory")
-               and k[3] == "10,000" and policy.group_crossover(*k, ROUTER)[0])
+def test_an_estimate_range_is_taken_only_where_every_count_in_it_is(each_table):
+    key = next((k for k in GROUP_KEYS if k[:3] == ("group_by_multi:sum", "numeric", "memory")
+                and k[3] == "10,000" and policy.group_crossover(*k, ROUTER)[0]), None)
+    if key is None:
+        pytest.skip("the table has no crossover for group_by_multi:sum at the 10,000-group bucket")
     x = policy.group_crossover(*key, ROUTER)[0]
     rows = max(x, 2_000_000)
     dt = [pl.Int32, pl.Int64]
