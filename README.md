@@ -25,9 +25,9 @@ So every figure here gives the CPU time of a call beside its wall time.
 | **DuckDB**: `sum`, `count`, 100,000 keys | **4.89x** | 79.86 (1,201.4) | 16.33 (99.9) |
 | **DuckDB**: `sum`, `max`, `avg`, no `GROUP BY` | 1.08x | 4.28 (61.6) | 3.98 (45.1) |
 
-Apple M4 Max. The engine's own time ÷ its time with ArrowMetal's default; for Polars, the faster of its
-in-memory and streaming engines. Each engine's second row is its lowest speed-up (best of the runs) among
-the cases its default takes. On the first run after 500 ms of idle, against the engine's own first run,
+Apple M4 Max. The engine's own time ÷ its time with ArrowMetal's default; for Polars 1.44.1, the faster
+of its in-memory and streaming engines (Polars 2.0.0 is under [Polars in full](#polars-in-full)). Each
+engine's second row is its lowest speed-up (best of the runs) among the cases its default takes. On the first run after 500 ms of idle, against the engine's own first run,
 DataFusion's group-bys are 1.24x to 2.17x and four of DuckDB's thirteen rewritten pairs are behind, down to 0.38x.
 
 <a href="https://datafusion.apache.org"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/datafusion-dark.svg"><img src="docs/img/engines/datafusion.svg" height="22" alt="Apache DataFusion" align="top"></picture></a> **DataFusion.** A physical optimizer rule for DataFusion 55.1; the SQL is unchanged. A Rust crate used by
@@ -40,9 +40,11 @@ series **2.31x to 4.27x**; 13,632 query pairs, 0 mismatches. Left to DataFusion:
 filters 0.31x to 0.79x. `rule.report()` gives each node, TAKEN or LEFT, and why. [DataFusion in full](#datafusion-in-full)
 
 <a href="https://pola.rs"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/polars-dark.svg"><img src="docs/img/engines/polars.svg" height="22" alt="Polars" align="top"></picture></a> **Polars.** `MetalEngine` runs the subtrees measured ahead (full sorts, inner, left and anti joins,
-`unique`, group-bys judged by their estimated number of groups); Polars runs the rest. **1.52x to 11.54x**
-on all 75 of 220 case-size pairs the default took; 15,376 generated cases, 0 different. Left to Polars:
-whole-frame aggregates 0.09x to 0.24x, filters 0.14x to 0.42x. [Polars in full](#polars-in-full)
+`unique`, group-bys judged by their estimated number of groups); Polars runs the rest. On Polars 1.44.1,
+**1.52x to 11.54x** on all 75 of 220 case-size pairs the default took, and 15,376 generated cases, 0
+different; on Polars 2.0.0, **1.35x to 7.94x** on all 52 of 107 cases it took at 50,000,000 rows. Left to
+Polars: whole-frame aggregates 0.09x to 0.24x on 1.44.1 and 0.11x to 0.47x on 2.0.0, filters 0.14x to
+0.42x and 0.16x to 0.40x. [Polars in full](#polars-in-full)
 ```
 pip install "arrowmetal[polars]"   # macOS 14 or later on Apple silicon; pins the tested Polars range
 python -m arrowmetal.bench         # your Mac, 30 s or less, every answer checked against pyarrow
@@ -117,9 +119,10 @@ the query runs ([docs/DATAFUSION.md](docs/DATAFUSION.md#what-the-default-takes))
   50,000,000 rows, 96.2 to 125.8 CPU-ms against DataFusion's 6,104.1 to 8,310.5
   (`datafusion/results/datafusion_sort_warm_2026-09-29.csv`). DataFusion's own sort of 50,000,000 rows
   spends 6,104.1 CPU-ms in 1,581.22 ms, about four of the sixteen cores on average, which is part of why
-  the figure is large; Polars sorts the same three columns by the same int64 key in 380.46 ms on this
-  machine, and ArrowMetal under Polars in 53.03 ms, 7.17x
-  (`Benchmarks/results/polars_engine_bench_2026-10-02.csv`).
+  the figure is large; Polars 1.44.1 sorts the same three columns by the same int64 key in 380.46 ms on
+  this machine, and ArrowMetal under Polars in 53.03 ms, 7.17x
+  (`Benchmarks/results/polars_engine_bench_2026-10-02.csv`); Polars 2.0.0 in 148.79 ms, and ArrowMetal
+  under it in 52.70 ms, 2.82x (`Benchmarks/results/polars_engine_bench_2026-10-08-polars2-refit.csv`).
 - The ten group-by series the default runs on the GPU, in both table layouts (20 cases), at
   50,000,000 rows: **2.31x to 4.27x** warm;
   on the first run after 500 ms of idle against DataFusion's first run after the same idle, 1.24x to
@@ -144,7 +147,7 @@ shapes are under [To improve](docs/DATAFUSION.md#to-improve).
 A `MetalEngine` for `lf.collect(engine=…)`:
 
 ```
-pip install "arrowmetal[polars]"      # pins the tested Polars range
+pip install "arrowmetal[polars]"      # polars>=1.44,<2.1, the tested range
 ```
 
 ```python
@@ -157,31 +160,66 @@ print(engine.last_report)                                         # Metal or Pol
 
 Polars optimises the lazy plan as it always does. `MetalEngine` replaces the subtrees it translates
 with ArrowMetal plans that run on the GPU and return Polars `DataFrame`s; Polars' in-memory engine runs
-everything else. The default takes the shapes measured ahead: full sorts from 1,000,000 rows, inner,
-left and anti joins, `unique`, String sorts and `unique` from 5,000,000 rows, a sort over a Parquet
-scan, and group-bys judged by their estimated number of groups
+everything else, on Polars 2.0.0 as on 1.44 (a plain `collect()` on 2.0.0 runs the streaming engine).
+The default takes the shapes measured ahead, from one crossover table per Polars major. On Polars 1.x
+(the table measured on 1.44.1): full sorts from 1,000,000 rows, inner, left and anti joins, `unique`,
+String sorts and `unique` from 5,000,000 rows, a sort over a Parquet scan, and group-bys judged by their
+estimated number of groups. On Polars 2.x (the table measured on 2.0.0): numeric full sorts from
+10,000,000 rows, `unique` from 2,943,034, inner, left and anti joins, String `unique` from 5,000,000
+rows, a sort over a Parquet scan, and group-bys judged by their estimated number of groups, where
+`sum` and `mean` at 200 to 10,000 groups stay with Polars except a two-key `sum` over 1,000 groups
+(from 28,976,995 rows) and a one-key `mean` over 10,000 groups (from 50,000,000 rows)
 ([docs/POLARS.md](docs/POLARS.md#which-translatable-subtrees-it-runs-the-defaults)).
 
-- Over 220 benchmarked case-size pairs (2,000,000 and 50,000,000 rows), the default took a subtree in
-  75, and in every one of them it is **1.52x to 11.54x** faster than the faster Polars engine,
-  in-memory or streaming (`Benchmarks/results/polars_engine_bench_2026-10-02.csv`).
-- 15,376 generated cases against Polars: 15,096 identical, 33 within the float-summation bound, 0
-  different, and 247 where Polars' plan had nothing to run
+- On Polars 1.44.1, over 220 benchmarked case-size pairs (2,000,000 and 50,000,000 rows), the default
+  took a subtree in 75, and in every one of them it is **1.52x to 11.54x** faster than the faster
+  Polars engine, in-memory or streaming (`Benchmarks/results/polars_engine_bench_2026-10-02.csv`).
+- On Polars 2.0.0, over 107 benchmarked cases at 50,000,000 rows, the default took a subtree in 52,
+  and in every one of them it is **1.35x to 7.94x** faster than the faster Polars 2.0.0 engine, none
+  behind (`Benchmarks/results/polars_engine_bench_2026-10-08-polars2-refit.csv`).
+- Polars 2.0.0 (released 2026-10-06) runs `collect()` on its streaming engine by default, and runs
+  group-bys, joins and sorts faster than 1.44.1: over the 62 cases the 1.44 default takes at
+  50,000,000 rows, its own time is 0.72x of 1.44.1's at the median, and 0.25x on `unique` over two
+  keys (153.1 ms to 38.5 ms); ArrowMetal's times are unchanged (median ratio 1.03)
+  (`Benchmarks/results/polars_engine_bench_2026-10-02.csv` and
+  `Benchmarks/results/polars_engine_bench_2026-10-07-polars2.csv`).
+- `MetalEngine` is tested on Polars 1.44.1, 1.44.2 and 2.0.0 (`TESTED_POLARS`), and
+  `pip install "arrowmetal[polars]"` installs `polars>=1.44,<2.1`. Polars 2.0 removed
+  `LazyFrame.profile`; on 2.0.0 `MetalEngine.profile` raises `NotImplementedError`. On 2.0.0 the engine
+  takes the same 1,326 of 2,523 plans of the capability grid, and Polars 2.0.0 itself rejects 63 plans
+  that 1.44.1 accepted ([docs/ENGINE_CAPABILITIES_POLARS2.md](docs/ENGINE_CAPABILITIES_POLARS2.md)).
+- 15,376 generated cases against Polars 1.44.1: 15,096 identical, 33 within the float-summation
+  bound, 0 different, and 247 where Polars' plan had nothing to run
   (`Benchmarks/results/engine_conformance_2026-10-02.csv`).
 
-| 50,000,000 rows | faster Polars engine, ms (CPU-ms) | `MetalEngine()`, ms (CPU-ms) | speed-up |
+| 50,000,000 rows, Polars 1.44.1 | faster Polars engine, ms (CPU-ms) | `MetalEngine()`, ms (CPU-ms) | speed-up |
 |---|---:|---:|---:|
 | `unique` over 2 keys, keep first | in-memory 153.08 (2,063.6) | 13.26 (8.7) | **11.54x** |
 | sort 3 columns by an int64 key | in-memory 380.46 (4,709.0) | 53.03 (7.1) | **7.17x** |
 | inner join, 1,000,000-row build side | streaming 82.91 (1,248.3) | 22.33 (4.5) | **3.71x** |
 | group-by over 1 key, 200 groups, min + max | in-memory 16.46 (245.8) | 10.82 (5.9) | 1.52x |
 
-To improve, left to Polars by the default (Polars ÷ `MetalEngine`, 250,000 to 50,000,000 rows,
-`Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv`): whole-frame aggregates 0.09x
-to 0.24x, row-wise filters and projections 0.14x to 0.42x, a semi join against a 1,000-row table
-0.21x to 0.47x, and the top 100 by a nullable Float64 key 0.75x to 1.05x, which keeps top-k with
-Polars. Every translatable shape, with its measured result, is in
-[docs/ENGINE_CAPABILITIES.md](docs/ENGINE_CAPABILITIES.md).
+| 50,000,000 rows, Polars 2.0.0 | faster Polars engine, ms (CPU-ms) | `MetalEngine()`, ms (CPU-ms) | speed-up |
+|---|---:|---:|---:|
+| `unique` over 2 keys, keep first | streaming 38.01 (571.8) | 13.42 (8.7) | **2.83x** |
+| sort 3 columns by an int64 key | streaming 148.79 (2,113.2) | 52.70 (7.0) | **2.82x** |
+| inner join, 1,000,000-row build side | streaming 57.97 (829.5) | 22.63 (4.9) | **2.56x** |
+| group-by over 1 key, 200 groups, min + max | in-memory 17.20 (260.0) | 10.54 (5.8) | 1.63x |
+| inner join, then a whole-frame sum | streaming 8.24 (110.3) | 6.12 (5.5) | 1.35x |
+
+To improve, left to Polars by the default (Polars ÷ `MetalEngine`, 250,000 to 50,000,000 rows). On
+Polars 1.44.1 (`Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv`): whole-frame
+aggregates 0.09x to 0.24x, row-wise filters and projections 0.14x to 0.42x, a semi join against a
+1,000-row table 0.21x to 0.47x, and the top 100 by a nullable Float64 key 0.75x to 1.05x, which keeps
+top-k with Polars. On Polars 2.0.0 (`Benchmarks/results/polars_engine_crossover_2026-10-08-polars2.csv`):
+whole-frame aggregates 0.11x to 0.47x, row-wise filters and projections 0.16x to 0.40x, a semi join
+against a 1,000-row table 0.42x to 0.82x, top-k 0.20x to 1.02x, a join on a String key 0.24x to 0.48x,
+group-by `sum` and `mean` at 200 to 10,000 groups 0.36x to 0.97x at 250,000 and 500,000 rows, and the
+sort with a String column, 0.89x at 50,000,000 rows (244.77 ms against Polars' 217.88 ms,
+`Benchmarks/results/polars_engine_bench_2026-10-08-polars2-after.csv`), which leaves the
+filter-then-sort of its class with Polars too. Every translatable shape, with its measured result, is
+in [docs/ENGINE_CAPABILITIES.md](docs/ENGINE_CAPABILITIES.md) (Polars 1.44.1) and
+[docs/ENGINE_CAPABILITIES_POLARS2.md](docs/ENGINE_CAPABILITIES_POLARS2.md) (Polars 2.0.0).
 #### DuckDB in full
 
 An optimizer extension; the SQL is unchanged. Built once with `./duckdb-extension/build_rewrite.sh`
