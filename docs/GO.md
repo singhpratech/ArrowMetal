@@ -23,7 +23,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 go get github.com/singhpratech/ArrowMetal/go/arrowmetal
 ```
 
-The module is tagged `go/arrowmetal/v0.4.0`: the module lives in a subdirectory, so the Go module
+The module is tagged `go/arrowmetal/v0.5.0`: the module lives in a subdirectory, so the Go module
 proxy wants the tag prefixed with the module's path within the repository, not a bare `vX.Y.Z`. A
 checkout works too: clone the repository and add
 

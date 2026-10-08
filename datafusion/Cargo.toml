@@ -6,7 +6,7 @@
 
 [package]
 name = "datafusion-arrowmetal"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/singhpratech/ArrowMetal"
@@ -25,7 +25,7 @@ include = ["/src", "/build.rs", "/README.md", "/LICENSE", "/Cargo.toml"]
 
 [dependencies]
 # By path for this repository, and by version for a registry build.
-arrowmetal = { path = "../rust/arrowmetal", version = "0.4.0" }
+arrowmetal = { path = "../rust/arrowmetal", version = "0.5.0" }
 # Pinned to the release the differential grid and the benchmark ran on: DataFusion's physical-plan
 # API changes between releases. 55.1.0 depends on arrow ^59.2.0, the same arrow-rs major as the
 # arrowmetal crate, so RecordBatches pass between the two with no bridge.

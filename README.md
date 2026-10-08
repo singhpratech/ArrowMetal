@@ -33,7 +33,7 @@ DataFusion's group-bys are 1.24x to 2.17x and four of DuckDB's thirteen rewritte
 <a href="https://datafusion.apache.org"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/datafusion-dark.svg"><img src="docs/img/engines/datafusion.svg" height="22" alt="Apache DataFusion" align="top"></picture></a> **DataFusion.** A physical optimizer rule for DataFusion 55.1; the SQL is unchanged. A Rust crate used by
 [crates.io](https://crates.io/crates/datafusion-arrowmetal); it loads `libArrowMetalC.dylib` ([install](docs/DATAFUSION.md#install)):
 ```toml
-datafusion-arrowmetal = "0.4.1"   # beside datafusion = "=55.1.0"
+datafusion-arrowmetal = "0.5.0"   # beside datafusion = "=55.1.0"
 ```
 Full sorts **6.9x to 28.8x** faster than DataFusion alone (250,000 to 50,000,000 rows), ten group-by
 series **2.31x to 4.27x**; 13,632 query pairs, 0 mismatches. Left to DataFusion: top-k 0.14x to 0.41x,
@@ -90,7 +90,7 @@ A physical optimizer rule for DataFusion 55.1, the Rust crate `datafusion-arrowm
 # Cargo.toml
 [dependencies]
 datafusion = { version = "=55.1.0", default-features = false, features = ["sql"] }
-datafusion-arrowmetal = "0.4.1"
+datafusion-arrowmetal = "0.5.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -307,13 +307,15 @@ print(amount.filter_where(">", 15).to_arrow())          # [20, 30, 40]: GPU filt
 
 ### Release
 
-Listed on Apache Arrow's [Powered By](https://arrow.apache.org/powered_by/) page. Site and docs: <https://arrowmetal.org> · Python: `pip install arrowmetal` · Rust: `arrowmetal = "0.4.0"` · DataFusion: `datafusion-arrowmetal = "0.4.1"` · Release: [v0.4.0](https://github.com/singhpratech/ArrowMetal/releases/tag/v0.4.0)
+Listed on Apache Arrow's [Powered By](https://arrow.apache.org/powered_by/) page. Site and docs: <https://arrowmetal.org> · Python: `pip install arrowmetal` · Rust: `arrowmetal = "0.5.0"` · DataFusion: `datafusion-arrowmetal = "0.5.0"` · Release: [v0.5.0](https://github.com/singhpratech/ArrowMetal/releases/tag/v0.5.0)
 
-New in 0.4.0: `datafusion-arrowmetal`, a DataFusion optimizer rule on crates.io; the Polars engine's
-sort keys passed one to one with Polars' null placement and float order, and its group-by crossovers
-refitted; correctly rounded grouped Float64 sums and means; per-key sort options (`ieee`, `total`,
-`nan_largest`) in every binding; columns of many chunks imported without a concatenated copy; and
-UInt32 index arrays ([CHANGELOG.md](CHANGELOG.md)).
+New in 0.5.0: the Polars engine runs on polars 2.0.0 as on 1.44, with one measured crossover table per
+Polars major (on 2.0.0 the default takes 52 of 107 benchmarked cases at 50,000,000 rows, 1.35x to 7.94x
+ahead of the faster Polars engine, none behind); integer means in the Polars and plan engines run in one
+pass from the integer column (two-key means at 200 to 1,000,000 groups 1.41x to 1.49x faster than before);
+the group-count estimate cache holds on polars 2.0.0; the DuckDB extensions are built and tested against
+DuckDB 1.5.6. Before, 0.4.0 brought `datafusion-arrowmetal`, the DataFusion optimizer rule on crates.io,
+Polars sort keys passed one to one, and correctly rounded grouped Float64 sums and means.
 
 ### The pitch in one paragraph
 
@@ -460,7 +462,7 @@ PYTHONPATH=python python -c "import arrowmetal as am; print(am.device_name())"
 
 # From a wheel that carries the dylib (no Swift toolchain at install time)
 pip install build && scripts/build_wheel.sh         # or python/build_wheel.sh, if the dylib is built
-pip install python/dist/arrowmetal-0.4.0-*.whl      # macOS arm64 only, pyarrow comes with it
+pip install python/dist/arrowmetal-0.5.0-*.whl      # macOS arm64 only, pyarrow comes with it
 python -c "import arrowmetal as am; print(am.device_name())"
 ```
 ```python

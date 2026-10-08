@@ -47,7 +47,7 @@ def _result(parquet=False, polars=True, match=True):
             row["polars"] = timing
         timings[op] = row
     r = {"machine": {"chip": "Apple M9 Test", "cores": 12, "memory_gb": 32, "macos": "26.1", "gpu": "Apple M9 Test"},
-         "versions": {"arrowmetal": "0.4.0", "pyarrow": "25.0.1", "polars": "1.44.1" if polars else None,
+         "versions": {"arrowmetal": "0.5.0", "pyarrow": "25.0.1", "polars": "1.44.1" if polars else None,
                       "python": "3.13.9"},
          "rows": 2_000_000, "timings": timings, "match": match, "problems": [], "import_ms": 3.0,
          "generate_s": 0.5, "total_s": 9.0, "router_table": "shipped (`python -m arrowmetal.bench --calibrate` "
@@ -81,7 +81,7 @@ def test_the_block_parses_back_into_its_parts():
     assert parsed["chip"] == "Apple M9 Test"
     assert parsed["macos"] == "26.1"
     assert parsed["machine"] == "12 CPU cores, 32 GB, Metal device Apple M9 Test"
-    assert parsed["versions"] == {"ArrowMetal": "0.4.0", "pyarrow": "25.0.1", "Polars": "1.44.1", "Python": "3.13.9"}
+    assert parsed["versions"] == {"ArrowMetal": "0.5.0", "pyarrow": "25.0.1", "Polars": "1.44.1", "Python": "3.13.9"}
     assert parsed["run"].startswith("python -m arrowmetal.bench, generated data, 2,000,000 rows, router ")
     assert parsed["run"].endswith("results match pyarrow")
     assert parsed["router_table"] == r["router_table"]

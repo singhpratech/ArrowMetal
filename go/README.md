@@ -11,7 +11,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build -c release 
 go get github.com/singhpratech/ArrowMetal/go/arrowmetal
 ```
 
-The module is tagged `go/arrowmetal/v0.4.0`; the module sits in a subdirectory, so the proxy wants
+The module is tagged `go/arrowmetal/v0.5.0`; the module sits in a subdirectory, so the proxy wants
 the tag prefixed with that path. A `replace` directive against a checkout, or working inside
 `go/arrowmetal`, works too.
 

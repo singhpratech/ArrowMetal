@@ -62,7 +62,7 @@ The crate is on crates.io:
 # Cargo.toml
 [dependencies]
 datafusion = { version = "=55.1.0", default-features = false, features = ["sql"] }
-datafusion-arrowmetal = "0.4.1"
+datafusion-arrowmetal = "0.5.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 

@@ -163,7 +163,7 @@ fn cstring(s: &str, what: &str) -> Result<CString> {
 // Identity
 // =================================================================================================
 
-/// ArrowMetal's version string, e.g. `"0.4.0"`.
+/// ArrowMetal's version string, e.g. `"0.5.0"`.
 pub fn version() -> &'static str {
     unsafe { CStr::from_ptr(ffi::am_version()) }.to_str().unwrap_or("unknown")
 }

@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.5.0 — 2026-10-08
+
+Everything below is new in 0.5.0. The Polars `MetalEngine` runs on polars 2.0.0 (IR (15, 2)) as on 1.44, and
+the default policy loads one measured crossover table per Polars major: on 2.0.0, whose own group-bys,
+joins and sorts run at 0.72x of 1.44.1's time at the median, the default takes 52 of 107 benchmarked
+in-memory cases at 50,000,000 rows, every one 1.35x to 7.94x faster than the faster Polars 2.0.0 engine and
+none behind (`Benchmarks/results/polars_engine_bench_2026-10-08-polars2-refit.csv`); on 1.44.1 the 0.4.0
+table and its numbers stand. A `mean` over an integer column runs in one pass from the integer column in
+the Polars and plan engines, with the same bits as before (two int32 keys, 200 groups: 20.7 to 14.3 ms at
+50,000,000 rows on polars 2.0.0). The group-count estimate cache holds on polars 2.0.0. The pip extra
+installs `polars>=1.44,<2.1`. The DuckDB extensions are built and tested against DuckDB 1.5.6.
+
 - **The default's crossover table for polars 2.0.0.** `python/arrowmetal/_engine_crossovers_pl2.py`,
   fitted from a sweep on polars 2.0.0 (`Benchmarks/results/polars_engine_crossover_2026-10-08-polars2.csv`:
   250,000 to 50,000,000 rows in memory and the Parquet scan cases at 1,000,000 to 50,000,000 rows,
@@ -43,9 +57,9 @@
   path as before (`Executor.integerMeanIfExact`, `test_integer_mean_matches_polars_for_ordinary_and_extreme_values`).
   On Polars 2.0.0 at 50,000,000 rows (`Benchmarks/results/polars_engine_bench_2026-10-07-polars2.csv`
   before, `polars_engine_bench_2026-10-08-polars2-after.csv` after, both on AC power with their
-  conditions files): two int32 keys, mean of an int64 column, 200 groups 20.7 -> 13.7 ms, 1,000
-  groups 20.9 -> 13.9 ms, 100,000 groups 28.2 -> 18.0 ms, 1,000,000 groups 36.6 -> 23.3 ms; one
-  key, 100,000 groups 24.5 -> 15.4 ms. Over the 62 cases the default takes on 2.0.0: 0.86x to
+  conditions files): two int32 keys, mean of an int64 column, 200 groups 20.7 -> 14.3 ms, 1,000
+  groups 20.9 -> 14.8 ms, 100,000 groups 28.2 -> 18.9 ms, 1,000,000 groups 36.6 -> 25.5 ms; one
+  key, 100,000 groups 24.5 -> 16.7 ms. Over the 62 cases the default takes on 2.0.0: 0.86x to
   7.72x with four behind before, 0.89x to 7.88x with one behind after (the sort with a String
   column, 0.89x).
 - **Polars 2.0.0 and the engine.** `MetalEngine` runs on polars 2.0.0 (IR (15, 2)) as on 1.44
