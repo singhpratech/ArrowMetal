@@ -9,10 +9,13 @@
   answer is the same: the engine checks in one min/max pass that every value converts to Float64
   exactly (below 2^53) and that no group's sum can wrap 64 bits, and otherwise takes the Float64
   path as before (`Executor.integerMeanIfExact`, `test_integer_mean_matches_polars_for_ordinary_and_extreme_values`).
-  On Polars 2.0.0 at 50,000,000 rows (`private` measurement 2026-10-07, same conditions as the
-  2.0 run): two int32 keys, mean of an int64 column, 200 groups 20.7 -> 13.7 ms, 1,000 groups
-  20.9 -> 13.9 ms, 100,000 groups 28.2 -> 18.0 ms, 1,000,000 groups 36.6 -> 23.3 ms; one key,
-  100,000 groups 24.5 -> 15.4 ms.
+  On Polars 2.0.0 at 50,000,000 rows (`Benchmarks/results/polars_engine_bench_2026-10-07-polars2.csv`
+  before, `polars_engine_bench_2026-10-08-polars2-after.csv` after, both on AC power with their
+  conditions files): two int32 keys, mean of an int64 column, 200 groups 20.7 -> 13.7 ms, 1,000
+  groups 20.9 -> 13.9 ms, 100,000 groups 28.2 -> 18.0 ms, 1,000,000 groups 36.6 -> 23.3 ms; one
+  key, 100,000 groups 24.5 -> 15.4 ms. Over the 62 cases the default takes on 2.0.0: 0.86x to
+  7.72x with four behind before, 0.89x to 7.88x with one behind after (the sort with a String
+  column, 0.89x).
 - **Polars 2.0.0 and the engine.** `MetalEngine` runs on polars 2.0.0 (IR (15, 2)) as on 1.44
   (IR (14, 7)). `TESTED_IR_VERSION` is now one version per IR major, `((14, 7), (15, 2))`, and
   `TESTED_POLARS` is `("1.44.1", "1.44.2", "2.0.0")`; an IR major outside these keeps every plan with
@@ -22,7 +25,9 @@
   the capability table was generated on when it differs. Polars 2.0 removed `LazyFrame.profile`;
   there `MetalEngine.profile` raises `NotImplementedError`. On polars 2.0.0 `test_polars_engine.py`,
   `test_polars.py` and `test_polars_sort_order.py` pass, with the `profile` tests and the
-  capability-table comparison skipped (docs/ENGINE_CAPABILITIES.md is the 1.44.1 table). The
+  capability-table comparison skipped (docs/ENGINE_CAPABILITIES.md is the 1.44.1 table;
+  docs/ENGINE_CAPABILITIES_POLARS2.md is the same generator run on 2.0.0: the engine takes the same
+  1,326 of 2,523 plans, and 63 plans Polars 1.44.1 accepted are rejected by Polars 2.0.0 itself). The
   in-memory engine of 2.0.0 lowers `x * -1.0` to a negation and `x / c` to a multiply by the
   reciprocal as 1.44.1 does; the streaming engine, the default of `collect()` on 2.0.0, evaluated
   frames of 2 and 9 rows element-wise on both versions, so `test_multiply_by_minus_one_is_a_negation_like_polars`

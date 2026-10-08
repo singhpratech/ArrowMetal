@@ -504,7 +504,7 @@ its `collect` calls, `ARROWMETAL_METAL_ENGINE=off` sends every path to Polars.
 
 ### What it translates
 
-[ENGINE_CAPABILITIES.md](ENGINE_CAPABILITIES.md) is the same boundary measured: 29 plan shapes
+[ENGINE_CAPABILITIES.md](ENGINE_CAPABILITIES.md) is the same boundary measured on polars 1.44.1, and [ENGINE_CAPABILITIES_POLARS2.md](ENGINE_CAPABILITIES_POLARS2.md) the same generator run on polars 2.0.0 (the engine takes the same 1,326 of 2,523 plans; 63 plans that 1.44.1 accepted are rejected by 2.0.0 itself and show as `n/a`): 29 plan shapes
 (filters, projections, `with_columns`, `slice`, sorts, top-k, group-by with `x` as the key and as the
 value of each aggregate, whole-frame aggregates, the four joins, `unique`, and Parquet scans) over 29
 input dtypes and three null patterns, each run through the engine and marked `Metal` or `Polars`
