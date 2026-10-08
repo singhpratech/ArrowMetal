@@ -1113,6 +1113,29 @@ def test_integer_arithmetic_wraps_like_polars():
     check(big.lazy().select((pl.col("a") + 1).alias("s"), (pl.col("a") * 3).alias("m")), order=True)
 
 
+def test_integer_mean_matches_polars_for_ordinary_and_extreme_values():
+    """A `mean` over an integer column: the engine averages from the integer column itself (one
+    pass, the exact sum of each group rounded once) when no value is above 2**53 and no group sum
+    can wrap 64 bits, and through the float64-converted column otherwise. Both give Polars' answer:
+    ordinary values exactly, extreme ones bit for bit with Polars' own float64 accumulation."""
+    rng = np.random.default_rng(3)
+    n = 20_000
+    ordinary = pl.DataFrame({"k": rng.integers(0, 7, n).astype(np.int32),
+                             "v": rng.integers(-1_000_000, 1_000_000, n).astype(np.int64),
+                             "w": rng.integers(0, 60_000, n).astype(np.uint16),
+                             "x": rng.integers(-120, 120, n).astype(np.int8)})
+    check(ordinary.lazy().group_by("k").agg(pl.col("v").mean().alias("mv"), pl.col("w").mean().alias("mw"),
+                                             pl.col("x").mean().alias("mx")), kinds=("GroupBy",))
+    # Values near 2**62: a group's sum wraps a 64-bit accumulator, so the float64 path must be taken.
+    big = pl.DataFrame({"k": [0, 0, 0, 1, 1], "v": [2**62, 2**62, 2**62, -(2**62), 2**62 - 1]},
+                       schema={"k": pl.Int32, "v": pl.Int64})
+    check(big.lazy().group_by("k").agg(pl.col("v").mean().alias("mv")), kinds=("GroupBy",))
+    # Values above 2**53 but with a sum that fits: the conversion to float64 is lossy, so the
+    # float64 path is the one Polars matches.
+    lossy = pl.DataFrame({"k": [0, 0, 1], "v": [2**53 + 1, 2**53 + 3, 5]}, schema={"k": pl.Int32, "v": pl.Int64})
+    check(lossy.lazy().group_by("k").agg(pl.col("v").mean().alias("mv")), kinds=("GroupBy",))
+
+
 def test_is_in_of_a_null_is_null():
     df = pl.DataFrame({"k": [1, None, 3]})
     eng = check(df.lazy().select(pl.col("k").is_in([1, None]).alias("i")), order=True)

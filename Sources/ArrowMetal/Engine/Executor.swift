@@ -312,6 +312,10 @@ public enum Executor {
             guard a.op == .count else { throw ArrowMetalError.invalidArrowArray("\(a.op.rawValue) needs an expression") }
             return .int64(try gb.count())
         }
+        if a.op == .mean, case .cast(let inner, .float64) = e, case .column(let name) = inner, let raw = input[name],
+           let exact = try integerMeanIfExact(raw, gb) {
+            return .float64(exact)
+        }
         let values = try column(e, of: input)
         switch a.op {
         case .count:
@@ -364,6 +368,36 @@ public enum Executor {
             case .float64(let v): return .float64(try mm(v))
             default: throw ArrowMetalError.unsupportedType("group-by \(a.op.rawValue) over \(values.arrowFormat)")
             }
+        }
+    }
+
+    /// A `mean` written as `(cast (col) f64)` over an integer column, computed by `GroupBy.meanInteger`
+    /// from the integer column itself: one pass, the exact integer sum of each group divided by its
+    /// count and rounded once. That is the same number the cast path produces (the correctly rounded
+    /// mean of the float64-converted values) as long as every value converts to float64 exactly
+    /// (|v| < 2^53) and no group's sum can wrap a 64-bit accumulator (rows * max|v| < 2^63). One
+    /// min/max pass over the column decides; when it cannot promise both, nil, and the caller
+    /// materialises the cast and takes the float64 path.
+    static func integerMeanIfExact(_ raw: AnyMetalArray, _ gb: GroupBy<Int32>) throws -> MetalArray<Double>? {
+        func exact<T: ArrowPrimitive & FixedWidthInteger>(_ v: MetalArray<T>) throws -> MetalArray<Double>? {
+            // Every value null: both paths give a null mean for every key.
+            guard let (lo, hi) = try v.minMax() else { return try gb.mean(v) }
+            let bound = UInt64(Swift.max(lo.magnitude, hi.magnitude))
+            guard bound < (1 << 53) else { return nil }
+            let (product, overflow) = bound.multipliedReportingOverflow(by: UInt64(v.length))
+            guard !overflow, product < (1 << 63) else { return nil }
+            return try gb.mean(v)
+        }
+        switch raw {
+        case .int8(let v): return try exact(v)
+        case .int16(let v): return try exact(v)
+        case .int32(let v): return try exact(v)
+        case .int64(let v): return try exact(v)
+        case .uint8(let v): return try exact(v)
+        case .uint16(let v): return try exact(v)
+        case .uint32(let v): return try exact(v)
+        case .uint64(let v): return try exact(v)
+        default: return nil
         }
     }
 
