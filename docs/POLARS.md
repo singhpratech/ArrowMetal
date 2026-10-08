@@ -586,8 +586,10 @@ against Polars itself.
 * **Aggregates.** A `sum` over no values is 0 in Polars (ArrowMetal: null) and gets a `fill_null`; a
   `min`/`max` over only NaN is NaN in Polars (ArrowMetal: null over a whole frame, an infinity per
   group), so the engine counts the non-null and non-NaN values and decides from the two; a `mean` of
-  an Int64/UInt64 column is taken over the values cast to Float64, because ArrowMetal's integer mean
-  sums in 64-bit integers and wraps on extreme values where Polars does not; every result is cast
+  an Int64/UInt64 column is planned over the values cast to Float64, because ArrowMetal's integer mean
+  sums in 64-bit integers and wraps on extreme values where Polars does not (the executor runs it from
+  the integer column in one pass when a min/max pass shows every value below 2^53 and the sum below
+  2^63, and over the cast values otherwise; the two give the same bits); every result is cast
   to Polars' dtype (UInt32 counts, the Int32 sum of an Int32 column, Float32 of a Float32, UInt32
   for the sum of a Boolean). A per-group `count` of a Float64 or Boolean column is the sum of its
   validity bits, because ArrowMetal's group-by will not read those values even to count them, and
@@ -606,7 +608,8 @@ against Polars itself.
   `engine_conformance_2026-10-02.csv`) the largest difference was 0.199 u sum(|x|) for a Float32 sum
   (3.55e-5 of the answer), 0.372 u sum(|x|) for a Float64 sum (2.00e-14 of the answer) and
   0.0033 u sum(|x|) for a Float64 mean (7.05e-14 of the answer). A `mean` of an integer or Float32
-  column is computed in Float64 by both (the engine casts the column, as Polars does); in that run
+  column is computed in Float64 by both (the engine plans the cast as Polars does, and runs an
+  integer mean from the integer column where that gives the same bits); in that run
   it matched bit for bit in every case but one int64 group mean over the integer extremes (1,000
   rows), where the engine returns the correctly rounded mean of the cast values and the two differ
   by 8.76e-8 u sum(|x|), as much as the answer itself. Every other output of the grid is compared
