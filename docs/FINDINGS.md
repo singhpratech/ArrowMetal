@@ -2,6 +2,106 @@
 
 Things learned the hard way. Add to this whenever something surprises you.
 
+## Round 19 (2026-10-07): Polars 2.0.0
+
+**What.** Polars 2.0.0 (released 2026-10-06) changed five things the engine stands on. `collect()` runs
+the streaming engine by default (1.44: in-memory); `engine="in-memory"` and `"streaming"` are still
+accepted. The plan's IR version is (15, 2) (1.44: (14, 7)), and `MetalEngine` fails closed on a major it
+has not been tested on, so on 2.0.0 the engine as shipped in 0.4.0 left every plan to Polars. The
+post-optimisation callback is called with one argument (the plan; 1.44 also passed the time since the
+start). `LazyFrame.profile` and `LazyFrame.with_context` are gone, and with them the `ExtContext` node
+kind, the only IR node kind that changed. `Series._get_buffer_info()` is gone too: the engine named a
+key column by its buffer address to cache its group-count estimate between calls, and on 2.0.0 every
+probe sampled again. Polars 2.0.0 itself rejects 63 plans that 1.44.1 accepted (`sum`, `min`, `max`
+and `mean` over Date, Datetime, Time, Categorical and Enum), and keeps the input NaN under `x * -1.0`
+where the in-memory engine of both versions flips its sign: the one bit-level difference the suites
+found was the test baseline moving to the streaming engine, not the arithmetic.
+
+**Measured.** With the version gate opened, 50,000,000 rows, Apple M4 Max on AC power, the faster of
+Polars' two engines in each run (`Benchmarks/results/polars_engine_bench_2026-10-02.csv` on 1.44.1,
+`polars_engine_bench_2026-10-07-polars2.csv` on 2.0.0): over the 62 cases the default takes on both,
+Polars 2.0.0's own time is 0.72x of 1.44.1's at the median, down to 0.25x on `unique` over two keys
+(153.1 ms to 38.5 ms), and the streaming engine is the faster one in 56 of the 62. ArrowMetal's time
+is unchanged (median ratio 1.03). So the same code that was 1.52x to 11.54x ahead on 1.44.1 was 0.86x
+to 7.72x on 2.0.0, with four cases behind: two-key `mean` at 200 and 1,000 groups (0.88x, 0.97x),
+`mean + max` over two String keys (0.98x) and the sort with a String column (0.86x).
+
+**What shipped.** `TESTED_IR_VERSION` holds one tested version per IR major ((14, 7) and (15, 2)),
+`TESTED_POLARS` adds 2.0.0, the extra installs `polars>=1.44,<2.1`, `MetalEngine.profile` raises
+`NotImplementedError` on 2.0, a single-chunk key column is named through `PySeries.as_single_ptr()`
+so the estimate cache holds on 2.0 as on 1.44, and the capability table generated on 2.0.0 is
+`docs/ENGINE_CAPABILITIES_POLARS2.md`: the same 1,326 of 2,523 plans run on Metal. The 1.44-built
+expression plugin loads on 2.0.0 and passes its 151 tests.
+
+## Round 20 (2026-10-07): the integer mean paid for a Float64 column, not for atomics
+
+**What.** The first explanation for the four cases behind was the fused expression group-by kernel
+(`ExprGroupBy.swift`: privatised 32-bit atomic tables per threadgroup, 64-bit sums as lo/hi pairs),
+which the planner picks whenever every aggregate is of a fusable type, against `GroupBy`'s own
+per-aggregate kernels. Measured through the plan executor on 50,000,000 rows
+(`Benchmarks/results/groupby_fused_matrix_2026-10-07.csv`: one and two Int32 keys, 200 to 1,000,000
+groups, `sum`, `mean`, `count`, `sum + min + max`, a Float32 sum, a sum over an expression), the two
+paths are equal on every integer shape, within 0.3 ms; the fused kernel is 2x to 3x faster on the
+Float32 sums. The hypothesis was wrong. What the matrix did show is that `mean` costs twice `sum` on
+every shape (14 to 28 ms against 6.6 to 18 ms): the translator plans a `mean` over an integer column as
+a mean over the column cast to Float64, so that extreme values average as Polars averages them, and the
+executor materialised that cast, a 400 MB column for 50,000,000 Int64 values, before the group-by.
+
+**Fix.** `Executor.integerMeanIfExact`: one min/max pass over the integer column; when every |v| is
+below 2^53 and rows times the largest |v| is below 2^63, the mean runs from the integer column in one
+pass (`GroupBy.meanInteger`), otherwise the Float64 path as before. The two give the same bits; a test
+covers ordinary values, values near 2^62 and values above 2^53 on both Polars versions. Before and
+after on Polars 2.0.0, 50,000,000 rows, AC (`polars_engine_bench_2026-10-07-polars2.csv` and
+`polars_engine_bench_2026-10-08-polars2-after.csv`, the faster Polars engine in each run):
+
+| case | Polars 2.0.0 | ArrowMetal before | after | before | after |
+|---|---:|---:|---:|---:|---:|
+| two String keys, `mean + max` (c) | 32.0 ms | 32.7 ms | 22.7 ms | 0.98x | 1.41x |
+| 2 keys, 200 groups, `mean` | 18.0 | 20.7 | 14.3 | 0.88x | 1.26x |
+| 2 keys, 1,000 groups, `mean` | 20.9 | 20.9 | 14.8 | 0.97x | 1.41x |
+| 2 keys, 10,000 groups, `mean` | 34.6 | 26.5 | 18.4 | 1.27x | 1.88x |
+| 2 keys, 100,000 groups, `mean` | 101.2 | 28.2 | 18.9 | 3.56x | 5.34x |
+| 2 keys, 1,000,000 groups, `mean` | 128.9 | 36.6 | 25.5 | 3.72x | 5.05x |
+| 1 key, 10,000 groups, `mean` | 24.9 | 23.0 | 15.8 | 1.07x | 1.58x |
+| 1 key, 100,000 groups, `mean` | 58.4 | 24.5 | 16.7 | 2.02x | 3.50x |
+| 1 key, 1,000,000 groups, `mean` | 56.5 | 34.6 | 22.1 | 1.46x | 2.56x |
+| two String keys, Float64 `sum + mean` (l) | 34.4 | 29.9 | 29.8 | 1.04x | 1.15x |
+| sort with a String column (o) | 217.9 | 249.7 | 244.8 | 0.86x | 0.89x |
+
+The Float64 case is unchanged, as expected; the String-column sort is sort-kernel time and stays
+behind. Every other case in the run is within noise of before.
+
+## Round 21 (2026-10-08): fitting the default's table on Polars 2.0.0
+
+**What.** The default's crossover table is fitted from a sweep (every case at 250,000 to 50,000,000
+rows, Polars against the engine with everything taken) and then charged with an idle benchmark: the
+default as it would run, at a few sizes, and any case it takes and loses moves its class up to the
+next benchmarked size. Two things about that procedure showed up on 2.0.0
+(`Benchmarks/results/polars_engine_crossover_2026-10-08-polars2.csv`,
+`polars_engine_default_groupby_raw_2026-10-08-polars2.csv`, conditions files beside them).
+
+- **The idle benchmark can only measure what the table in force takes.** The first fit, charged from
+  runs at 2,000,000 and 50,000,000 rows, moved the numeric sort class from 2,000,000 to 50,000,000
+  rows, since the sort was 0.94x at 2,000,000. Runs at 5,000,000, 10,000,000 and 20,000,000 rows with
+  that table in force then recorded the sort as left to Polars at every one of them, and the fit could
+  not see where it is ahead. Those sizes were run again with the sweep-only table in force; the sort is
+  taken from 10,000,000 rows on 2.0.0 (1.44.1: 947,836).
+- **A plan the default leaves runs on Polars' in-memory engine.** The callback hands the plan back to
+  the engine Polars named, and `MetalEngine` registers as the in-memory engine on both versions. On
+  2.0.0 a plain `collect()` runs the streaming engine, the faster one for sorts: a three-column sort by
+  an Int64 key, Polars streaming against in-memory, 5.95 against 12.13 ms at 2,000,000 rows, 13.55
+  against 32.88 at 5,000,000, 52.88 against 149.27 at 20,000,000, 157.84 against 399.22 at
+  50,000,000. A `MetalEngine()` user on 2.0.0 pays the in-memory time on every plan the default leaves.
+
+**Result.** One table per Polars major (`_engine_policy.table_for`, `_engine_crossovers_pl2.py`).
+Against Polars 2.0.0's faster hash tables the table gives up the one- and two-key `sum` and `mean` at
+200 to 10,000 groups, the String-column sort, the String-key join, semi join and top-k; `unique` is
+taken from 2,943,034 rows (1.44.1: 5,494,090). Measured with it in force
+(`polars_engine_bench_2026-10-08-polars2-refit.csv`, 50,000,000 rows, AC): 52 of 107 in-memory cases
+taken, every one 1.35x to 7.94x faster than the faster Polars 2.0.0 engine, none behind; of the 12
+cases it stopped taking, 11 were ahead by 1.15x to 2.75x in the run before, and one (the String-column
+sort) was 0.89x.
+
 ## Round 18 (2026-10-01): 32-bit loop steps, block ends and byte positions near 2^32
 
 **What.** Round 17 made the grid itself safe up to 2^32 - 1 elements. Inside the kernels, four kinds of
