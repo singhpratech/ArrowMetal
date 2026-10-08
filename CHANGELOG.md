@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Polars 2.0.0 and the engine.** `MetalEngine` runs on polars 2.0.0 (IR (15, 2)) as on 1.44
+  (IR (14, 7)). `TESTED_IR_VERSION` is now one version per IR major, `((14, 7), (15, 2))`, and
+  `TESTED_POLARS` is `("1.44.1", "1.44.2", "2.0.0")`; an IR major outside these keeps every plan with
+  Polars, and a newer minor of a tested major runs and warns once. `KNOWN_NODE_KINDS` keeps
+  `ExtContext`, which polars 2.0.0 no longer has (2.0 removed `LazyFrame.with_context`).
+  `compatibility()` gains `ir_tested`, and `python -m arrowmetal.polars_engine check` names the Polars
+  the capability table was generated on when it differs. Polars 2.0 removed `LazyFrame.profile`;
+  there `MetalEngine.profile` raises `NotImplementedError`. On polars 2.0.0 `test_polars_engine.py`,
+  `test_polars.py` and `test_polars_sort_order.py` pass, with the `profile` tests and the
+  capability-table comparison skipped (docs/ENGINE_CAPABILITIES.md is the 1.44.1 table). The
+  in-memory engine of 2.0.0 lowers `x * -1.0` to a negation and `x / c` to a multiply by the
+  reciprocal as 1.44.1 does; the streaming engine, the default of `collect()` on 2.0.0, evaluated
+  frames of 2 and 9 rows element-wise on both versions, so `test_multiply_by_minus_one_is_a_negation_like_polars`
+  compares with `engine="in-memory"`.
 - **Polars bench: `keep="any"`.** `Benchmarks/polars_engine_bench.py` gains case (r2), `unique` over
   (region, sub) with `keep="any"`, beside (r) with `keep="first"`. A run of (r), (r2) and (m) at
   50,000,000 rows on 2026-10-04 (`Benchmarks/results/polars_engine_bench_2026-10-04.csv`, conditions in

@@ -39,6 +39,18 @@ from arrowmetal import polars_engine as pe  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 QUICK = os.environ.get("DIFF_QUICK") == "1"
+# Polars 2.0 removed `LazyFrame.profile` and `LazyFrame.with_context` (its IR has no ExtContext).
+HAS_PROFILE = hasattr(pl.LazyFrame, "profile")
+HAS_WITH_CONTEXT = hasattr(pl.LazyFrame, "with_context")
+NO_PROFILE = f"polars {pl.__version__} has no LazyFrame.profile (Polars 2.0 removed it)"
+
+
+def _running_ir():
+    """`NodeTraverser.version()` of the running Polars."""
+    seen = []
+    pl.LazyFrame({"a": [1]}).collect(
+        post_opt_callback=lambda nt, *_: seen.append(tuple(nt.version())))
+    return seen[0]
 
 INTS = td.INTEGER
 FLOATS = td.FLOATING
@@ -220,12 +232,18 @@ def test_polars_surfaces_this_module_uses_exist():
 
     pl.LazyFrame({"a": [1]}).collect(post_opt_callback=cb)
     assert all(v for k, v in seen.items() if k != "version()"), seen
-    assert seen["version()"] == pe.TESTED_IR_VERSION == (14, 7)
-    assert isinstance(pe.TESTED_POLARS, tuple) and pl.__version__ in pe.TESTED_POLARS
-    # Every IR node class this Polars has is one the walk knows; a new one would make every plan
-    # holding it stay with Polars (`test_an_unknown_node_kind_keeps_the_whole_plan_on_polars`).
+    assert pe.TESTED_IR_VERSION == ((14, 7), (15, 2))
+    ir = seen["version()"]
+    assert ir in pe.TESTED_IR_VERSION, (ir, pe.TESTED_IR_VERSION)
+    assert pe.TESTED_POLARS == ("1.44.1", "1.44.2", "2.0.0")
+    assert pl.__version__ in pe.TESTED_POLARS
+    # Every IR node class this Polars has is one the walk knows, and the list for its IR major is
+    # exact; a new one would make every plan holding it stay with Polars
+    # (`test_an_unknown_node_kind_keeps_the_whole_plan_on_polars`).
     kinds = {k for k, v in vars(pe._in).items() if isinstance(v, type) and not k.startswith("_")}
-    assert kinds == set(pe.KNOWN_NODE_KINDS), kinds ^ set(pe.KNOWN_NODE_KINDS)
+    mine = set(pe._NODE_KINDS_BY_IR_MAJOR[ir[0]])
+    assert kinds == mine, kinds ^ mine
+    assert set(pe.KNOWN_NODE_KINDS) == set().union(*pe._NODE_KINDS_BY_IR_MAJOR.values())
 
 
 def _node_kind_plans(tmp_path):
@@ -235,10 +253,7 @@ def _node_kind_plans(tmp_path):
     lf2 = pl.LazyFrame({"k": [1, 3], "w": [7, 8]})
     path = str(tmp_path / "a.parquet")
     pq.write_table(pa.table({"k": [1, 2]}), path)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        ctx = lf.select("k").with_context(lf2.select("w")).select(pl.col("k") + pl.col("w").sum())
-    return {
+    plans = {
         # kind: (plan, runs entirely on Metal)
         "DataFrameScan": (lf.select("k", "v").filter(pl.col("v") > 4), True),
         "Filter": (lf.filter(pl.col("v") > 4), False),          # carries a List column
@@ -259,9 +274,15 @@ def _node_kind_plans(tmp_path):
                         False),
         "Scan": (pl.scan_parquet(path).filter(pl.col("k") > 1), True),
         "PythonScan": (pl.scan_pyarrow_dataset(ds.dataset(path)), False),
-        "ExtContext": (ctx, False),
         "Sink": (lf.select("k").sink_parquet(str(tmp_path / "o.parquet"), lazy=True), False),
     }
+    if HAS_WITH_CONTEXT:            # Polars 1.44; Polars 2.0 has no ExtContext node
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ctx = lf.select("k").with_context(lf2.select("w")).select(
+                pl.col("k") + pl.col("w").sum())
+        plans["ExtContext"] = (ctx, False)
+    return plans
 
 
 def test_every_node_kind_walks_and_collects_identically(tmp_path):
@@ -287,14 +308,14 @@ def test_raise_on_fail_names_the_node_and_reason(tmp_path):
     ipc = str(tmp_path / "a.arrow")
     pl.DataFrame({"k": [1, 2]}).write_ipc(ipc)
     plans["Scan"] = (pl.scan_ipc(ipc).sort("k"), False)      # polars 1.44.1 cannot show it
-    for kind in ("Cache", "Union", "HConcat", "MapFunction", "MergeSorted", "Scan",
-                 "PythonScan", "ExtContext"):
+    kinds = ["Cache", "Union", "HConcat", "MapFunction", "MergeSorted", "Scan", "PythonScan"]
+    for kind in kinds + (["ExtContext"] if HAS_WITH_CONTEXT else []):
         lf, _ = plans[kind]
         with pytest.raises(pl.exceptions.ComputeError) as err:
             lf.collect(engine=metal())
         text = str(err.value)
         assert "ArrowMetal MetalEngine:" in text and kind in text, text
-        assert "'cuda' conversion failed" in text      # hardcoded in polars 1.44.1
+        assert "'cuda' conversion failed" in text      # hardcoded in polars 1.44.1 and 2.0.0
         assert pe.FORCE_POLARS in text, text
     # A plan with nothing unsupported does not raise.
     plans["Sort"][0].collect(engine=metal())
@@ -366,6 +387,7 @@ def test_eager_and_background_callbacks_are_none():
     assert callable(e._post_opt_callback(background=False, eager=False))
 
 
+@pytest.mark.skipif(not HAS_PROFILE, reason=NO_PROFILE)
 def test_profile_shows_a_metal_row():
     lf = pl.LazyFrame({"k": [1, 2, 1, 3] * 50, "v": list(range(200))}).sort("v", descending=True)
     eng = pe.MetalEngine(min_rows=0, shapes="all")
@@ -377,22 +399,35 @@ def test_profile_shows_a_metal_row():
     assert (row["end"] >= row["start"]).all()
 
 
-def test_callback_second_argument_is_none_under_collect_and_an_int_under_profile(monkeypatch):
+def test_callback_gets_the_traverser_and_at_most_a_duration(monkeypatch):
+    """polars 1.44 calls the callback with the traverser and `duration_since_start` (None under
+    collect, an int under profile); polars 2.0.0 with the traverser alone."""
     seen = []
     real = pe.execute_with_metal
 
-    def spy(nt, duration, **kw):
-        seen.append(duration)
-        return real(nt, duration, **kw)
+    def spy(nt, *args, **kw):
+        seen.append(args)
+        return real(nt, *args, **kw)
 
     monkeypatch.setattr(pe, "execute_with_metal", spy)
     lf = pl.LazyFrame({"v": [3, 1, 2]}).sort("v")
     eng = pe.MetalEngine(min_rows=0, shapes="all")
     lf.collect(engine=eng)
-    eng.profile(lf)
-    assert seen[0] is None and isinstance(seen[1], int), seen
+    assert seen[0] in ((), (None,)), seen
+    if HAS_PROFILE:
+        eng.profile(lf)
+        assert len(seen[1]) == 1 and isinstance(seen[1][0], int), seen
 
 
+@pytest.mark.skipif(HAS_PROFILE, reason=f"polars {pl.__version__} has LazyFrame.profile")
+def test_profile_without_lazyframe_profile_raises_not_implemented():
+    eng = pe.MetalEngine(min_rows=0, shapes="all")
+    with pytest.raises(NotImplementedError, match=re.escape(f"polars {pl.__version__} does not")):
+        eng.profile(_path_plan())
+    assert eng.last_report is None
+
+
+@pytest.mark.skipif(not HAS_PROFILE, reason=NO_PROFILE)
 def test_lazyframe_profile_with_engine_runs_polars_only():
     """polars 1.44.1's `LazyFrame.profile` passes the callback only for a GPUEngine, so
     `lf.profile(engine=MetalEngine())` profiles Polars; `MetalEngine.profile(lf)` is the way."""
@@ -470,7 +505,9 @@ def _in_config_rows(fn):
         return fn()
 
 
-@pytest.mark.parametrize("path", list(COLLECT_PATHS))
+@pytest.mark.parametrize("path", [
+    pytest.param(p, marks=pytest.mark.skipif(not HAS_PROFILE, reason=NO_PROFILE))
+    if p == "engine.profile(lf)" else p for p in COLLECT_PATHS])
 def test_every_collect_path_is_explicit(path, tmp_path):
     """Each path either runs on Metal and the report names the path, or runs the whole plan on
     Polars, the report says why, and (except `eager`) a MetalEngineFallbackWarning says so once."""
@@ -496,15 +533,16 @@ def test_every_collect_path_is_explicit(path, tmp_path):
 
 
 def test_polars_side_entry_points_that_never_call_the_engine():
-    """`lf.explain(engine=)` and `lf.profile(engine=)` read nothing from the engine but its
-    `plan_engine`, and an eager DataFrame method runs on Polars' in-memory engine whatever the
-    configured affinity: no callback, no report."""
+    """`lf.explain(engine=)` and `lf.profile(engine=)` (Polars 1.44; Polars 2.0 has no
+    `profile`) read nothing from the engine but its `plan_engine`, and an eager DataFrame method
+    runs on Polars' in-memory engine whatever the configured affinity: no callback, no report."""
     lf = _path_plan()
     eng = pe.MetalEngine(min_rows=0, shapes="all")
     assert lf.explain(engine=eng) == lf.explain()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        lf.profile(engine=eng)
+    if HAS_PROFILE:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            lf.profile(engine=eng)
     pl.Config.set_engine_affinity(eng)
     try:
         pl.DataFrame({"v": [3, 1, 2]}).sort("v")
@@ -607,10 +645,13 @@ def test_the_check_command_prints_versions_and_the_capability_header():
     assert r.returncode == 0, r.stdout + r.stderr
     out = r.stdout
     assert f"polars {pl.__version__}: a tested release" in out, out
-    assert f"IR version {pe.TESTED_IR_VERSION}: the tested major" in out, out
+    assert f"IR version {_running_ir()}: a tested major (tested: (14, 7), (15, 2))" in out, out
     assert "callback API: present" in out and "unknown to the engine: none" in out, out
     assert "capability table (docs/ENGINE_CAPABILITIES.md):" in out, out
-    assert re.search(r"- Polars (\S+), IR \(14, 7\)", out).group(1) in pe.TESTED_POLARS, out
+    recorded = re.search(r"- Polars (\S+), IR \(14, 7\)", out).group(1)
+    assert recorded in pe.TESTED_POLARS, out
+    made_on = f"(generated on polars {recorded}; this is polars {pl.__version__})"
+    assert (made_on in out) == (recorded != pl.__version__), out
 
 
 # =============================================================================================
@@ -620,16 +661,22 @@ def test_the_check_command_prints_versions_and_the_capability_header():
 
 def test_the_capability_table_is_current():
     """docs/ENGINE_CAPABILITIES.md is what `engine_capabilities.py` generates now (apart from the
-    line naming the commit), and no cell of it is a wrong answer or an exception."""
+    line naming the commit), and no cell of it is a wrong answer or an exception. It holds the run
+    of one IR major; on a Polars of another major the test is skipped."""
     import engine_capabilities as ecap
-    results = ecap.run_all()
-    assert not ecap.bad_cells(results), ecap.bad_cells(results)
     with open(ecap.DOC, encoding="utf-8") as f:
         committed = f.read()
+    head = re.search(r"^- Polars (\S+), IR \((\d+), (\d+)\)", committed, re.M)
+    recorded, table_ir = head.group(1), (int(head.group(2)), int(head.group(3)))
+    ir = _running_ir()
+    if ir[0] != table_ir[0]:
+        pytest.skip(f"docs/ENGINE_CAPABILITIES.md is the table of polars {recorded}, IR {table_ir}; "
+                    f"polars {pl.__version__} has IR {ir}, another major")
+    results = ecap.run_all()
+    assert not ecap.bad_cells(results), ecap.bad_cells(results)
     fresh = ecap.render(results)
-    # The table was generated on one of TESTED_POLARS; on another tested release it must be the
-    # same table, apart from the line naming the Polars version.
-    recorded = re.search(r"^- Polars (\S+), IR ", committed, re.M).group(1)
+    # The table was generated on one of TESTED_POLARS; on another tested release of the same IR
+    # major it must be the same table, apart from the line naming the Polars version.
     assert recorded in pe.TESTED_POLARS, recorded
     if pl.__version__ != recorded:
         assert pl.__version__ in pe.TESTED_POLARS, pl.__version__
@@ -787,8 +834,24 @@ def test_a_translator_bug_falls_back_instead_of_failing(monkeypatch):
 
 
 def test_a_newer_ir_major_falls_back_entirely(monkeypatch):
-    monkeypatch.setattr(pe, "TESTED_IR_VERSION", (13, 0))
-    check_fallback(pl.LazyFrame({"v": [2, 1]}).sort("v"), "not the tested", order=True)
+    monkeypatch.setattr(pe, "TESTED_IR_VERSION", ((13, 0), (99, 0)))
+    check_fallback(pl.LazyFrame({"v": [2, 1]}).sort("v"),
+                   "is not of a tested major (tested: (13, 0), (99, 0))", order=True)
+
+
+def test_a_newer_ir_minor_of_a_tested_major_runs_and_warns_once(monkeypatch):
+    """The minor is compared with the tested version of the same major only."""
+    major, minor = _running_ir()
+    monkeypatch.setattr(pe, "TESTED_IR_VERSION", ((major - 1, minor + 50), (major, minor - 1)))
+    monkeypatch.setattr(pe, "_warned_minor", [False])
+    lf = pl.LazyFrame({"v": [2, 1]}).sort("v")
+    eng = pe.MetalEngine(min_rows=0, shapes="all")
+    with pytest.warns(UserWarning, match=re.escape(f"Polars IR {(major, minor - 1)} ")):
+        assert lf.collect(engine=eng).equals(lf.collect())
+    assert eng.last_report.taken, eng.last_report
+    with warnings.catch_warnings():                                   # once per process
+        warnings.simplefilter("error")
+        lf.collect(engine=eng)
 
 
 def test_existing_polars_suites_collect_identically(tmp_path):
@@ -972,9 +1035,13 @@ def test_a_float_literal_of_magnitude_2_63_or_more_runs_on_metal():
 
 
 def test_multiply_by_minus_one_is_a_negation_like_polars():
-    """Polars multiplies a float by a scalar -1 (either side, or divides by -1) as a negation, so a
-    NaN comes back with its sign bit flipped; the engine emits `negate` and matches the raw bits,
-    which `assert_frame_equal` cannot see. Any other multiplier keeps the input NaN in both."""
+    """Polars' in-memory engine (1.44.1 and 2.0.0 alike) multiplies a float by a scalar -1 (either
+    side, or divides by -1) as a negation, so a NaN comes back with its sign bit flipped; the
+    engine emits `negate` and matches the raw bits, which `assert_frame_equal` cannot see. Any
+    other multiplier keeps the input NaN in both. The oracle is `engine="in-memory"`, the engine
+    MetalEngine leaves the rest of a plan to (its `_name`): the streaming engine, the default of
+    `collect()` on Polars 2.0, evaluates this 9-row frame element-wise on 1.44.1 and 2.0.0 alike,
+    keeping the input NaN and dividing exactly."""
     nan = float("nan")
     x = np.array([nan, -nan, 1.0, 0.0, -0.0, np.inf, 5e-324, -2.5, 3.0])
     df = pl.DataFrame({"x": x, "f": x.astype(np.float32), "i": np.arange(9) - 4}).with_columns(
@@ -987,7 +1054,7 @@ def test_multiply_by_minus_one_is_a_negation_like_polars():
                  f"{c}*-2.5": col * -2.5, f"{c}*-1.0000000000000002": col * -1.0000000000000002,
                  f"{c}/3.0": col / 3.0}
         lf = df.lazy().select([e.alias(k) for k, e in cases.items()])
-        want = lf.collect()
+        want = lf.collect(engine="in-memory")
         eng = metal()
         got = lf.collect(engine=eng)
         assert got.schema == want.schema

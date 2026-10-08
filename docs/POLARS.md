@@ -57,9 +57,9 @@ Per tier:
 | 1. Bridge and namespaces | any `polars>=1.0` (pure Python over the Arrow C Data Interface) |
 | 3. Streaming hand-off | any `polars>=1.0` (pure Python over the Arrow C Data Interface) |
 | 2. Expression plugin | 1.44.x: the plugin is built on the polars 0.55 crates, and Polars refuses a plugin built for another minor's ABI (Version pinning, below) |
-| 4. `MetalEngine` | tested on 1.44.1 and 1.44.2 (`TESTED_POLARS`: the full engine suite passes and the capability table is the same on both; 1.44.2 also by `scripts/check_wheel.sh`); it walks Polars' unstable IR, checked against `TESTED_IR_VERSION` (14, 7). `python -m arrowmetal.polars_engine check` reports the installed Polars against these |
+| 4. `MetalEngine` | tested on 1.44.1, 1.44.2 and 2.0.0 (`TESTED_POLARS`). On 1.44.1 and 1.44.2 the full engine suite passes and the capability table is the same on both (1.44.2 also by `scripts/check_wheel.sh`); on 2.0.0 `test_polars_engine.py`, `test_polars.py` and `test_polars_sort_order.py` pass, with the `profile` tests and the capability-table comparison skipped ([ENGINE_CAPABILITIES.md](ENGINE_CAPABILITIES.md) is the 1.44.1 table). It walks Polars' unstable IR, checked against `TESTED_IR_VERSION`: (14, 7) for 1.44, (15, 2) for 2.0.0. `python -m arrowmetal.polars_engine check` reports the installed Polars against these |
 
-A Polars outside 1.44 installed without the extra keeps tiers 1 and 3.
+A Polars outside 1.44 installed without the extra keeps tiers 1 and 3, and on 2.0.0 tier 4.
 
 ### From source
 
@@ -418,18 +418,22 @@ happen is that nothing moves, and then the answer is plain Polars'.
 `import arrowmetal` still does not import Polars: `am.MetalEngine` loads the module on first touch,
 like the other three tiers.
 
-### How it plugs into Polars 1.44.1
+### How it plugs into Polars 1.44.1 and 2.0.0
 
-Read from the installed package and checked by `python/tests/test_polars_engine.py`:
+Read from the installed package (polars 1.44.1, and where it says so 2.0.0) and checked by
+`python/tests/test_polars_engine.py`, which passes on both:
 
 * `lf.collect(engine=<an Engine object>)` passes the object through unchanged, so no Polars change
   is needed. The name the engine gives Rust is `"in-memory"`: Rust accepts only its four engine
   names, and with a callback supplied it runs the callback for any of them; the in-memory engine is
   also what runs every node the callback leaves. `engine.name` is `"in-memory"`, `engine.plan_engine`
   and `repr(engine)` say `metal`.
-* The callback receives the `NodeTraverser` and a second argument that is `None` under `collect`
-  and an integer under `profile` (the time since the query started, which the engine uses to place
-  its rows in the profile).
+* The callback receives the `NodeTraverser` and, on polars 1.44.1, a second argument that is `None`
+  under `collect` and an integer under `profile` (the time since the query started, which the
+  engine uses to place its rows in the profile). polars 2.0.0 passes the `NodeTraverser` alone.
+* On polars 2.0.0 `collect()` without `engine=` runs Polars' streaming engine (on 1.44.1 the
+  in-memory engine). `MetalEngine` gives Rust the name `"in-memory"` on both, so the nodes it leaves
+  run on the in-memory engine.
 * `set_udf` turns the current node into a `PythonScan` whose function Polars calls as
   `f(with_columns, predicate, n_rows, should_time)`. That function takes no input, so **a replaced
   subtree is a leaf**: the only subtrees that can move are ones whose leaves are in-memory frames
@@ -447,15 +451,21 @@ Read from the installed package and checked by `python/tests/test_polars_engine.
 * `LazyFrame.profile(engine=...)` passes the callback only for a `GPUEngine`, so
   `lf.profile(engine=MetalEngine())` profiles plain Polars. `engine.profile(lf)` passes the callback
   through `profile`'s own keyword, and each replaced subtree appears as a `metal:<Node>#<id>` row.
+  Polars 2.0 removed `LazyFrame.profile`; on polars 2.0.0 `engine.profile(lf)` raises
+  `NotImplementedError`.
 * Only `collect` and the paths built on it run the callback; the next section lists every path and
   what the engine does on it.
-* The IR version the engine was written against, `(14, 7)`, is pinned by a test, as is every Polars
-  surface it touches (`_LocalEngine`, `_post_opt_callback`, the `NodeTraverser` methods, the node
-  classes), so a Polars upgrade that moves one fails a named test instead of changing an answer.
-  A different IR major makes the engine leave the whole plan to Polars. So does a node kind outside
-  `KNOWN_NODE_KINDS` (the 20 node classes of polars 1.44.1) or a node Polars fails to show to the
-  engine: the report line is `The plan holds an unknown node <kind> in polars <version>, so the
-  whole plan stays with Polars.`, and the query is not an error.
+* The IR versions the engine was written against, `TESTED_IR_VERSION` = `((14, 7), (15, 2))`
+  (polars 1.44.1 and 1.44.2 report (14, 7), polars 2.0.0 reports (15, 2)), are pinned by a test, as
+  is every Polars surface it touches (`_LocalEngine`, `_post_opt_callback`, the `NodeTraverser`
+  methods, the node classes), so a Polars upgrade that moves one fails a named test instead of
+  changing an answer. An IR major that neither tested version has makes the engine leave the whole
+  plan to Polars; a newer minor of a tested major runs and warns once, naming the tested version of
+  that major. A node kind outside `KNOWN_NODE_KINDS` (the 20 node classes of polars 1.44.1; polars
+  2.0.0 has 19, the same less `ExtContext`, since 2.0 removed `LazyFrame.with_context`) or a node
+  Polars fails to show to the engine also keeps the whole plan with Polars: the report line is
+  `The plan holds an unknown node <kind> in polars <version>, so the whole plan stays with
+  Polars.`, and the query is not an error.
 * `ARROWMETAL_METAL_ENGINE=off` (or `0`, `false`, `no`, `polars`) makes every `MetalEngine` leave every
   plan to Polars, `raise_on_fail=True` included; the report says so.
 
@@ -465,7 +475,9 @@ What each Polars 1.44.1 entry point does with a `MetalEngine` (`eng` below), rea
 package and checked by `test_every_collect_path_is_explicit` and
 `test_polars_side_entry_points_that_never_call_the_engine`. `last_report.path` names the path; a
 path on which the whole plan runs on Polars says why in `last_report.fallbacks` and issues a
-`MetalEngineFallbackWarning` (a `UserWarning`) once per process.
+`MetalEngineFallbackWarning` (a `UserWarning`) once per process. On polars 2.0.0 the same tests
+pass apart from the two `profile` rows, which they skip: Polars 2.0 removed `LazyFrame.profile`, and
+`eng.profile(lf)` raises `NotImplementedError` there.
 
 | Entry point | Runs on | `last_report.path` | Warning |
 |---|---|---|---|
@@ -565,6 +577,11 @@ against Polars itself.
   (`test_multiply_by_minus_one_is_a_negation_like_polars`, which compares the raw bits). Over a
   column of one row Polars multiplies, and the NaN keeps its sign; the engine chooses by the row
   count as for a division.
+* **The streaming engine.** The two forms above are those of Polars' in-memory engine, the one
+  `MetalEngine` leaves the rest of a plan to, in polars 1.44.1 and 2.0.0 alike. Polars' streaming
+  engine, the default of `collect()` on 2.0.0, evaluated frames of 2 and 9 rows element-wise on both
+  versions (the correctly rounded `x / c`, and a NaN that keeps its sign under `* -1`), and frames
+  of 100 rows and more as the in-memory engine does.
 * **Aggregates.** A `sum` over no values is 0 in Polars (ArrowMetal: null) and gets a `fill_null`; a
   `min`/`max` over only NaN is NaN in Polars (ArrowMetal: null over a whole frame, an infinity per
   group), so the engine counts the non-null and non-NaN values and decides from the two; a `mean` of
@@ -594,7 +611,7 @@ against Polars itself.
   by 8.76e-8 u sum(|x|), as much as the answer itself. Every other output of the grid is compared
   bit for bit. `test_polars_engine.py` compares these
   aggregates to a relative tolerance.
-* **Sort order.** Polars (1.44 and the 2.0 release candidate alike, pinned by
+* **Sort order.** Polars (1.44.1 and 2.0.0 alike, pinned by
   `test_polars_sort_order.py`) places the nulls per key, first unless `nulls_last`, in either
   direction; orders a float key with every NaN (of either sign) one value above every number, +inf
   included, in both directions, and -0.0 equal to 0.0; keeps tied rows in input order in both
@@ -1321,15 +1338,17 @@ checks the result is still Polars' and the report names the reason. One case rer
 plan ran, the report's `path` and reason, and that the warning comes once.
 `test_the_capability_table_is_current` regenerates [ENGINE_CAPABILITIES.md](ENGINE_CAPABILITIES.md)
 and compares it with the committed file; no cell of it may be a Metal answer that differs from
-Polars' or an engine exception. `test_an_unknown_node_kind_keeps_the_whole_plan_on_polars` and
+Polars' or an engine exception. The committed table is from polars 1.44.1, IR (14, 7); on a Polars
+of another IR major (2.0.0) the test is skipped. `test_an_unknown_node_kind_keeps_the_whole_plan_on_polars` and
 `test_a_node_polars_cannot_describe_keeps_the_whole_plan_on_polars` check the fail-closed walk, and
 `test_the_check_command_prints_versions_and_the_capability_header` the command below.
 
 `python -m arrowmetal.polars_engine check` prints the installed Polars version and whether it is one
 of `TESTED_POLARS`, the IR version against `TESTED_IR_VERSION`, whether the callback API is present,
 the IR node kinds of this Polars the engine does not know, whether `ARROWMETAL_METAL_ENGINE` is set,
-and the header of the capability table (in a source checkout). It exits 1 when the callback API is
-missing or the IR major differs, since then every plan stays with Polars.
+and the header of the capability table (in a source checkout), with a line naming both versions
+when the table was generated on another Polars. It exits 1 when the callback API is missing or the
+IR major is not a tested one, since then every plan stays with Polars.
 
 The Parquet scan cases (212 tests) run fourteen scan shapes -- filters over every numeric dtype,
 Polars' float total order, `!=`, String predicates, projections, group-by on one and two keys,
@@ -1375,7 +1394,7 @@ per-shape table.
    `PerformanceWarning` listing it.
 4. `am.zero_copy_report(df["v"])` on a single-chunk numeric column of a million rows says the two
    addresses are the same.
-5. `out, timings = engine.profile(lf)` shows a `metal:` row, and
+5. On polars 1.44, `out, timings = engine.profile(lf)` shows a `metal:` row, and
    `PYTHONPATH=python python -m arrowmetal.polars_engine check` prints the versions it was tested with.
 6. Run `PYTHONPATH=python python Benchmarks/polars_engine_bench.py --sizes 2000000,50000000 --out a.csv`
    twice on a quiet machine, compare the two files, and read the `taken` and `rule` columns of the
@@ -1570,8 +1589,8 @@ takes no lock of its own.
 **Version coupling.** Tier 2: the plugin is pinned to polars 0.55.1 / pyo3-polars 0.28 for
 py-polars 1.44.x. Tiers 1 and 3 speak the C Data Interface and are not coupled to a Polars
 version. Tier 4 is pure Python but reads Polars' optimised IR through an API Polars calls unstable;
-it was written against IR version (14, 7) of polars 1.44.1, a test pins both, and a different IR
-major makes it leave every plan to Polars.
+it was written against IR version (14, 7) of polars 1.44.1 and (15, 2) of polars 2.0.0, a test
+pins them, and an IR major outside these makes it leave every plan to Polars.
 
 ---
 
