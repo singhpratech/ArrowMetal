@@ -30,10 +30,11 @@ classifiers = [
 test = ["pytest>=7"]
 # None of these are hard dependencies: `import arrowmetal` imports only pyarrow, and each bridge
 # module loads its dataframe library on first use.
-# The Polars bridge and the .arrowmetal namespaces (docs/POLARS.md). Pinned to the minor the packaged
-# expression plugin (tier 2) is built for: Polars refuses a plugin built for another minor's ABI.
+# The Polars bridge and the .arrowmetal namespaces (docs/POLARS.md). The range the engine suites
+# passed on: polars 1.44.1, 1.44.2 and 2.0.0. The packaged expression plugin (tier 2) is built on the
+# polars 0.55 crates and loads on all three (Polars checks the plugin ABI, polars_ffi's major/minor).
 # Tiers 1 and 3 run on any polars>=1.0 installed without the extra.
-polars = ["polars>=1.44,<1.45"]
+polars = ["polars>=1.44,<2.1"]
 # The DuckDB bridge: replacement scans and the Arrow hand-off (docs/DUCKDB.md).
 duckdb = ["duckdb>=1.0"]
 # The pandas bridge, the .am accessor and accel mode (docs/PANDAS.md).

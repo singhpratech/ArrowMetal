@@ -46,8 +46,9 @@ The Polars surfaces used
 `polars.lazyframe.engine._LocalEngine`, its `_name` and `_post_opt_callback`, and the
 `NodeTraverser` methods `version`, `get_node`, `set_node`, `get_inputs`, `view_current_node`,
 `view_expression`, `get_dtype`, `get_schema` and `set_udf`. They are unstable Polars API; the IR
-version this module was written against is `TESTED_IR_VERSION` and a test fails loudly when an
-upgrade moves it. A node kind outside `KNOWN_NODE_KINDS` keeps the whole plan with Polars, and
+versions this module was written against are `TESTED_IR_VERSION`, (14, 7) for Polars 1.44 and
+(15, 2) for Polars 2.0, and a test fails loudly when an upgrade moves the running one. A node kind
+outside `KNOWN_NODE_KINDS` keeps the whole plan with Polars, and
 `python -m arrowmetal.polars_engine check` reports what the installed Polars offers.
 """
 import contextlib
@@ -76,20 +77,36 @@ __all__ = ["MetalEngine", "MetalPlanReport", "MetalEngineFallbackWarning", "TEST
            "group_placement_rules", "FORCE_POLARS", "clear_import_cache", "import_cache_limit",
            "import_cache_info", "clear_group_estimates"]
 
-# `NodeTraverser.version()` on the polars this module was written and tested against. The major is
-# bumped by Polars for incompatible IR changes (renamed nodes, reshaped tuples); a different major
-# makes the engine decline every plan. A newer minor only adds nodes, so the engine still runs and
-# warns once.
-TESTED_IR_VERSION = (14, 7)
-# The Polars releases the full engine suite (test_polars_engine.py, test_engine_conformance.py and
-# the capability table) passed on.
-TESTED_POLARS = ("1.44.1", "1.44.2")
-# Every IR node class of those releases (`polars._plr._ir_nodes`). A node of any other kind makes the
-# whole plan stay with Polars: the walk cannot know what such a node does to the rows under it.
-KNOWN_NODE_KINDS = frozenset({
-    "Cache", "DataFrameScan", "Distinct", "ExtContext", "Filter", "GroupBy", "HConcat", "HStack",
-    "Join", "MapFunction", "MergeSorted", "PythonScan", "Reduce", "Scan", "Select",
-    "SimpleProjection", "Sink", "Slice", "Sort", "Union"})
+# `NodeTraverser.version()` on the Polars releases this module was written and tested against, one
+# per IR major: (14, 7) on Polars 1.44, (15, 2) on Polars 2.0. The major is bumped by Polars for
+# incompatible IR changes (renamed nodes, reshaped tuples); a major that none of these has makes the
+# engine decline every plan. A newer minor of a tested major only adds nodes, so the engine still
+# runs and warns once.
+TESTED_IR_VERSION = ((14, 7), (15, 2))
+# The Polars releases the engine suites passed on. 1.44.1 and 1.44.2: test_polars_engine.py,
+# test_engine_conformance.py and the capability table. 2.0.0: test_polars_engine.py, test_polars.py
+# and test_polars_sort_order.py (docs/ENGINE_CAPABILITIES.md is the 1.44.1 table).
+TESTED_POLARS = ("1.44.1", "1.44.2", "2.0.0")
+# Every IR node class of those releases (`polars._plr._ir_nodes`), per IR major: IR 15 has no
+# `ExtContext` (Polars 2.0 removed `LazyFrame.with_context`). A node of a kind outside
+# KNOWN_NODE_KINDS makes the whole plan stay with Polars: the walk cannot know what such a node
+# does to the rows under it. A kind that the running Polars lacks is never seen, so it is no error.
+_NODE_KINDS_BY_IR_MAJOR = {15: frozenset({
+    "Cache", "DataFrameScan", "Distinct", "Filter", "GroupBy", "HConcat", "HStack", "Join",
+    "MapFunction", "MergeSorted", "PythonScan", "Reduce", "Scan", "Select", "SimpleProjection",
+    "Sink", "Slice", "Sort", "Union"})}
+_NODE_KINDS_BY_IR_MAJOR[14] = _NODE_KINDS_BY_IR_MAJOR[15] | {"ExtContext"}
+KNOWN_NODE_KINDS = frozenset().union(*_NODE_KINDS_BY_IR_MAJOR.values())
+
+
+def _tested_minor(version):
+    """The minor of the TESTED_IR_VERSION entry with `version`'s major, or None when none has it."""
+    return next((minor for major, minor in TESTED_IR_VERSION if major == version[0]), None)
+
+
+def _ir_text():
+    """TESTED_IR_VERSION as text: "(14, 7), (15, 2)"."""
+    return ", ".join(str(tuple(v)) for v in TESTED_IR_VERSION)
 
 # Setting this environment variable to "off" (or "0", "false", "no", "polars") makes every
 # MetalEngine leave every plan to Polars, whatever the code that built it asked for.
@@ -1372,8 +1389,9 @@ class _Translator:
             # `arithmetic_helper`): over a column of one row the two sides have the same length and
             # the operation is element-wise; over any other length the scalar is broadcast, and
             # there a true division is a multiply by the reciprocal and a float multiply by -1 is a
-            # negation. `_row_dependent` emits the element-wise form, the broadcast form, or a
-            # choice between them made when the plan runs.
+            # negation (the in-memory engine of polars 1.44.1 and 2.0.0 alike). `_row_dependent`
+            # emits the element-wise form, the broadcast form, or a choice between them made when
+            # the plan runs.
             plain = self._arith_text(am, l2, r2, want)
             if name == "TrueDivide" and not r2.has_col:
                 # Broadcast: `x * (1 / c)` with the reciprocal rounded in the result type, which is
@@ -2169,7 +2187,7 @@ def execute_with_metal(nt, duration_since_start=None, *, config, path="collect")
     """The post-optimisation callback: translate what can run on Metal, replace it with a udf, and
     leave the rest of the plan to Polars. Works by mutating `nt`; returns None. `path` is the
     Polars entry point that ran it, for the report. polars 1.44 passes `duration_since_start`
-    (None, or an int under `profile`); polars 2.0.0rc2 passes the traverser alone."""
+    (None, or an int under `profile`); polars 2.0.0 passes the traverser alone."""
     callback_ns = time.monotonic_ns()
     report = MetalPlanReport(pl.__version__, None, path)
     config.last_report = report
@@ -2182,15 +2200,16 @@ def execute_with_metal(nt, duration_since_start=None, *, config, path="collect")
         report.fallbacks.append(f"plan#{root}: {OFF_ENV}={off} is set, so the whole plan runs on "
                                 "Polars.")
         return None
-    if version[0] != TESTED_IR_VERSION[0]:
-        report.fallbacks.append(f"plan#{root}: Polars IR version {version} is not the tested "
-                                f"{TESTED_IR_VERSION}, so the whole plan runs on Polars.")
+    tested_minor = _tested_minor(version)
+    if tested_minor is None:
+        report.fallbacks.append(f"plan#{root}: Polars IR version {version} is not of a tested "
+                                f"major (tested: {_ir_text()}), so the whole plan runs on Polars.")
         return _finish(config, report)
-    if version[1] > TESTED_IR_VERSION[1] and not _warned_minor[0]:
+    if version[1] > tested_minor and not _warned_minor[0]:
         _warned_minor[0] = True
-        warnings.warn(f"arrowmetal MetalEngine was tested against Polars IR {TESTED_IR_VERSION} "
-                      f"(polars {', '.join(TESTED_POLARS)}); this polars reports {version}",
-                      stacklevel=2)
+        warnings.warn(f"arrowmetal MetalEngine was tested against Polars IR "
+                      f"{(version[0], tested_minor)} (tested: {_ir_text()}; polars "
+                      f"{', '.join(TESTED_POLARS)}); this polars reports {version}", stacklevel=2)
     tr = _Translator(nt, report)
     try:
         tr.collect_names(root)
@@ -2492,7 +2511,11 @@ class MetalEngine(_LocalEngine):
         honours an `engine=` that is a `GPUEngine`, so `lf.profile(engine=MetalEngine())` would
         profile plain Polars; this passes the callback through `profile`'s own
         `post_opt_callback` keyword instead. Subtrees that ran on Metal appear as `metal:<node>`
-        rows of the timings frame."""
+        rows of the timings frame. Polars 2.0 removed `LazyFrame.profile`; there this raises
+        NotImplementedError."""
+        if not hasattr(pl.LazyFrame, "profile"):
+            raise NotImplementedError(f"MetalEngine.profile needs LazyFrame.profile, which polars "
+                                      f"{pl.__version__} does not have (Polars 2.0 removed it).")
         return lf.profile(post_opt_callback=partial(execute_with_metal, config=self,
                                                     path="profile"), **kwargs)
 
@@ -2554,9 +2577,10 @@ CAPABILITIES_DOC = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
 
 def compatibility():
     """What this Polars offers the engine: a dict with the Polars version and whether it is one of
-    TESTED_POLARS, the IR version, whether the callback API is there (`missing` names what is
-    not), the IR node kinds this Polars has that KNOWN_NODE_KINDS lacks, and whether OFF_ENV is
-    set."""
+    TESTED_POLARS, the IR version, whether its major is one of TESTED_IR_VERSION's
+    (`ir_compatible`) and whether it is one of them exactly (`ir_tested`), whether the callback
+    API is there (`missing` names what is not), the IR node kinds this Polars has that
+    KNOWN_NODE_KINDS lacks, and whether OFF_ENV is set."""
     missing = [f"_LocalEngine.{m}" for m in ("_post_opt_callback", "collect")
                if not hasattr(_LocalEngine, m)]
     seen = {}
@@ -2579,7 +2603,8 @@ def compatibility():
         "polars": pl.__version__,
         "polars_tested": pl.__version__ in TESTED_POLARS,
         "ir": ir,
-        "ir_compatible": ir is not None and ir[0] == TESTED_IR_VERSION[0],
+        "ir_compatible": ir is not None and _tested_minor(ir) is not None,
+        "ir_tested": ir is not None and ir in {tuple(v) for v in TESTED_IR_VERSION},
         "callback_api": not missing,
         "missing": missing,
         "unknown_node_kinds": [k for k in kinds if k not in KNOWN_NODE_KINDS],
@@ -2605,7 +2630,7 @@ def capability_header(path=CAPABILITIES_DOC):
 
 def check(out=None):
     """Prints what `compatibility()` found and the capability table's header. Returns 0 when the
-    engine can run on this Polars (the callback API is there and the IR major is the tested one),
+    engine can run on this Polars (the callback API is there and the IR major is a tested one),
     else 1."""
     import sys
     out = out or sys.stdout
@@ -2620,10 +2645,10 @@ def check(out=None):
     if c["ir"] is None:
         say("IR version: unknown (the callback did not run)")
     elif c["ir_compatible"]:
-        say(f"IR version {c['ir']}: the tested major (tested {TESTED_IR_VERSION})")
+        say(f"IR version {c['ir']}: a tested major (tested: {_ir_text()})")
     else:
-        say(f"IR version {c['ir']}: not the tested {TESTED_IR_VERSION}; every plan stays with "
-            "Polars")
+        say(f"IR version {c['ir']}: not of a tested major (tested: {_ir_text()}); every plan "
+            "stays with Polars")
     say("callback API: " + ("present" if c["callback_api"] else
                             "missing: " + "; ".join(c["missing"])))
     say("IR node kinds unknown to the engine: " + (", ".join(c["unknown_node_kinds"]) or "none")
@@ -2639,6 +2664,9 @@ def check(out=None):
         say("capability table (docs/ENGINE_CAPABILITIES.md):")
         for line in head.splitlines():
             say(f"  {line}" if line else "")
+        made_on = re.search(r"^- Polars (\S+), IR ", head, re.M)
+        if made_on and made_on.group(1) != c["polars"]:
+            say(f"  (generated on polars {made_on.group(1)}; this is polars {c['polars']})")
     return 0 if c["callback_api"] and c["ir_compatible"] else 1
 
 
