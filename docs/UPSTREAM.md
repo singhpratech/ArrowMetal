@@ -14,6 +14,9 @@ the allocator alignment docs ([#1302](https://github.com/apache/arrow-go/pull/13
 ([#1320](https://github.com/apache/arrow-go/pull/1320)). Fixed by others from our reports: the boolean
 fill-null offset ([apache/arrow#51240](https://github.com/apache/arrow/pull/51240), 26.0.0) and
 `winsorize` on a sliced array ([apache/arrow#51251](https://github.com/apache/arrow/pull/51251)).
+Listed in Apache DataFusion's user guide: `datafusion-arrowmetal` on the
+[integrations list](https://datafusion.apache.org/user-guide/introduction.html#integrations)
+([apache/datafusion#26004](https://github.com/apache/datafusion/pull/26004), merged 2026-10-09).
 
 | Project | Finding | Our evidence | Report | Status |
 |---|---|---|---|---|
@@ -57,6 +60,7 @@ Kept so the same question is not asked twice.
 | Project | Route | Public tracker |
 |---|---|---|
 | Apache Arrow (pyarrow, the vendored date library) | GitHub issues, and a pull request when the fix is ours | github.com/apache/arrow |
+| Apache DataFusion | GitHub issues and pull requests; the user guide's integrations list is where community crates are recorded ([apache/datafusion#26004](https://github.com/apache/datafusion/pull/26004), merged 2026-10-09) | github.com/apache/datafusion |
 | Swift compiler | GitHub issues, pull requests welcome | github.com/swiftlang/swift |
 | Apple Metal, the shading language, the driver | Feedback Assistant (private; the FB number is what goes in the Report column, and [APPLE_REPORTS.md](APPLE_REPORTS.md) carries a readable summary of each report), the Apple Developer Forums for a public thread, a Developer Technical Support incident or a WWDC lab for a conversation | none: Metal is not open source and has no public issue tracker |
 | Apple's open-source projects that touch this work (MLX, Swift packages) | GitHub, like any other project | github.com/ml-explore/mlx, github.com/apple |

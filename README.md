@@ -1,6 +1,7 @@
 # ArrowMetal
 
 [![Apache Arrow Powered By](https://img.shields.io/badge/Apache_Arrow-Powered_By-0B7285)](https://arrow.apache.org/powered_by/)
+[![Apache DataFusion Integration](https://img.shields.io/badge/Apache_DataFusion-Integration-0B7285)](https://datafusion.apache.org/user-guide/introduction.html#integrations)
 [![CI](https://github.com/singhpratech/ArrowMetal/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/singhpratech/ArrowMetal/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/arrowmetal)](https://pypi.org/project/arrowmetal/)
 [![crates.io](https://img.shields.io/crates/v/arrowmetal)](https://crates.io/crates/arrowmetal)
@@ -9,6 +10,8 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 **Apache Arrow compute on the Apple silicon GPU, inside DataFusion, Polars and DuckDB.**
+
+Listed on Apache Arrow's [Powered By](https://arrow.apache.org/powered_by/) page and on Apache DataFusion's [integrations list](https://datafusion.apache.org/user-guide/introduction.html#integrations).
 
 <picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/banner-dark.gif"><img src="docs/img/banner.gif" alt="Three measured queries, each engine alone on the CPU and the same engine with ArrowMetal: Apache DataFusion full sort 22.7x, Polars distinct 11.5x, DuckDB group-by 4.9x faster, 50,000,000 rows on an Apple M4 Max" width="100%"></picture>
 
@@ -307,7 +310,7 @@ print(amount.filter_where(">", 15).to_arrow())          # [20, 30, 40]: GPU filt
 
 ### Release
 
-Listed on Apache Arrow's [Powered By](https://arrow.apache.org/powered_by/) page. Site and docs: <https://arrowmetal.org> · Python: `pip install arrowmetal` · Rust: `arrowmetal = "0.5.0"` · DataFusion: `datafusion-arrowmetal = "0.5.0"` · Release: [v0.5.0](https://github.com/singhpratech/ArrowMetal/releases/tag/v0.5.0)
+Listed on Apache Arrow's [Powered By](https://arrow.apache.org/powered_by/) page and on Apache DataFusion's [integrations list](https://datafusion.apache.org/user-guide/introduction.html#integrations). Site and docs: <https://arrowmetal.org> · Python: `pip install arrowmetal` · Rust: `arrowmetal = "0.5.0"` · DataFusion: `datafusion-arrowmetal = "0.5.0"` · Release: [v0.5.0](https://github.com/singhpratech/ArrowMetal/releases/tag/v0.5.0)
 
 New in 0.5.0: the Polars engine runs on polars 2.0.0 as on 1.44, with one measured crossover table per
 Polars major (on 2.0.0 the default takes 52 of 107 benchmarked cases at 50,000,000 rows, 1.35x to 7.94x
