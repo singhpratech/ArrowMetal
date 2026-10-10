@@ -1,5 +1,5 @@
 {
- "as_of": "2026-10-09T18:09:41Z",
+ "as_of": "2026-10-10T11:15:00Z",
  "window_days": 14,
  "count": 15,
  "with_project_activity": 15,
@@ -732,7 +732,7 @@
    "reporter_comments": 1,
    "community_comments": 0,
    "last_activity": "2026-09-25T00:19:15Z",
-   "pulse": true
+   "pulse": false
   },
   {
    "project": "Arrow (vendored date library)",
