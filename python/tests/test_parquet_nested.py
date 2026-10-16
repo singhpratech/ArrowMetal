@@ -416,14 +416,15 @@ def test_arrow_types_parquet_cannot_name():
 
 
 def test_fixed_size_list_with_null_rows():
-    """pyarrow 25 writes this file but its own reader rejects it; ArrowMetal reads the fixed-size
-    list back with its null rows (each padded with three null child slots, as the layout requires)."""
+    """pyarrow 25.0.1 wrote this file but its own reader rejected it (`ArrowInvalid`); 26.0.0 reads it.
+    ArrowMetal reads the fixed-size list back with its null rows (each padded with three null child
+    slots, as the layout requires), and the two readers agree."""
     path = os.path.join(NESTED, "arrowschema__pa_fslnull.parquet")
-    with pytest.raises(pa.ArrowInvalid):
-        pq.read_table(path)
+    rows = [None if i % 7 == 0 else [i, -i, None if i % 5 == 0 else i * 2] for i in range(60)]
     got = am.read_parquet_table(path)["fsl"]
     assert got.type == pa.list_(pa.int32(), 3)
-    assert got.to_pylist() == [None if i % 7 == 0 else [i, -i, None if i % 5 == 0 else i * 2] for i in range(60)]
+    assert got.to_pylist() == rows
+    assert pq.read_table(path)["fsl"].to_pylist() == rows
 
 
 # --------------------------------------------------------------- 5. page-level skipping

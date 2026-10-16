@@ -4,7 +4,7 @@
      PYTHONPATH=python python python/tests/function_table_report.py --page > docs/ARROW_FUNCTIONS.md -->
 
 Every [Arrow v25](https://arrow.apache.org/docs/cpp/compute.html) compute function name except
-pyarrow's two internal meta-functions — 307 of them: the 306 `pc.list_functions()` reports,
+pyarrow's two internal meta-functions — 312 of them: the 311 `pc.list_functions()` reports,
 less `index_in_meta_binary` and `is_in_meta_binary`, plus the three names pyarrow exposes only as
 Python wrappers (`fill_null`, `top_k_unstable`, `bottom_k_unstable`); 24 are `hash_*` grouped
 aggregates — with what ArrowMetal 0.5.0 does about it.
@@ -86,7 +86,8 @@ runs the matrix, records it and rewrites this page together with the per-functio
 | Section | GPU | CPU | Partial | Missing | Pending | Rows |
 |---|---:|---:|---:|---:|---:|---:|
 | Aggregations | 16 | 7 | 1 | 0 | 0 | 24 |
-| Arithmetic | 20 | 0 | 0 | 0 | 0 | 20 |
+| Arithmetic | 21 | 0 | 0 | 3 | 0 | 24 |
+| Sorts | 8 | 0 | 2 | 1 | 0 | 11 |
 | Bitwise | 8 | 0 | 0 | 0 | 0 | 8 |
 | Rounding | 6 | 0 | 0 | 0 | 0 | 6 |
 | Logarithmic | 10 | 0 | 0 | 0 | 0 | 10 |
@@ -111,15 +112,14 @@ runs the matrix, records it and rewrites this page together with the per-functio
 | Random | 1 | 0 | 0 | 0 | 0 | 1 |
 | Associative | 4 | 0 | 0 | 0 | 0 | 4 |
 | Selections | 7 | 0 | 0 | 0 | 0 | 7 |
-| Sorts | 8 | 0 | 2 | 0 | 0 | 10 |
 | NullFilling | 3 | 0 | 0 | 0 | 0 | 3 |
 | Structural | 8 | 1 | 0 | 0 | 0 | 9 |
 | Pairwise | 2 | 0 | 0 | 0 | 0 | 2 |
 | Cumulative | 7 | 0 | 0 | 0 | 0 | 7 |
 | GroupedAggregations | 23 | 0 | 1 | 0 | 0 | 24 |
-| Total | 283 | 17 | 7 | 0 | 0 | 307 |
+| Total | 284 | 17 | 7 | 4 | 0 | 312 |
 
-Totals: **283 gpu**, **17 cpu**, **7 partial**, **0 missing**, **0 pending** over 307 Arrow function names.
+Totals: **284 gpu**, **17 cpu**, **7 partial**, **4 missing**, **0 pending** over 312 Arrow function names.
 
 ## Every Arrow function name
 
@@ -163,12 +163,27 @@ Totals: **283 gpu**, **17 cpu**, **7 partial**, **0 missing**, **0 pending** ove
 | `add_checked` | Arithmetic | **GPU** | `add_checked(other)` | `Kernels/Checked.swift` | Wrapping is an error rather than a result: an `ArrowMetalError` naming the Arrow message and the first offending row. Float columns never raise, as in Arrow. |
 | `divide_checked` | Arithmetic | **GPU** | `divide_checked(other)` | `Kernels/Checked.swift` | Raises `divide by zero` for a zero divisor on any type, and `overflow` for INT_MIN / -1. |
 | `multiply_checked` | Arithmetic | **GPU** | `multiply_checked(other)` | `Kernels/Checked.swift` | As `add_checked`. |
+| `remainder` | Arithmetic | **GPU** | `modulo(other)` | `Kernels/Rounding.swift` | Arrow's `remainder` (26.0.0): the C `%`, truncated division with the sign of the dividend, which is what `modulo()` / `__mod__` have always computed here. Deliberate difference: Arrow raises `divide by zero` for an integer zero divisor, here `x % 0` is 0. |
+| `remainder_checked` | Arithmetic | Missing | `-` | `-` | Arrow's checked `remainder` (26.0.0), which raises on a zero divisor; no checked remainder kernel yet, `modulo()` defines `x % 0` as 0. |
+| `modulo` | Arithmetic | Missing | `-` | `-` | Arrow's `modulo` (26.0.0) is Python's `%`: floored division, the sign of the divisor. Not implemented; `modulo()` here is the C remainder, Arrow's `remainder`. |
+| `modulo_checked` | Arithmetic | Missing | `-` | `-` | Arrow's checked floored `modulo` (26.0.0). Not implemented. |
 | `negate_checked` | Arithmetic | **GPU** | `negate_checked()` | `Kernels/Checked.swift` | Raises for INT_MIN on a signed column and — unlike pyarrow, which has no unsigned kernel at all — for every non-zero value on an unsigned one. |
 | `power_checked` | Arithmetic | **GPU** | `power_checked(other)` | `Kernels/Checked.swift` | Raises for a negative integer exponent and for any repeated-squaring step that would wrap. A float column never raises, as in Arrow, and is bit-identical to the unchecked `power` — so on float64 it is the same 1-ulp software binary64 answer. |
 | `sqrt_checked` | Arithmetic | **GPU** | `sqrt_checked()` | `Kernels/Checked.swift` | Raises `square root of negative number`; NaN, -0.0 and +inf do not raise. Bit-identical to the unchecked `sqrt`, and so correctly rounded on a float64 column too. |
 | `subtract_checked` | Arithmetic | **GPU** | `subtract_checked(other)` | `Kernels/Checked.swift` | As `add_checked`. |
 | `expm1` | Arithmetic | **GPU** | `expm1()` | `Kernels/MathExtra.swift` | exp(x) - 1, accurate for small x, through the software binary64 routine on a float64 column (measured <= 2 ulp against the host libm over 10^6 inputs). Float columns only, as in Arrow. |
 | `hypot` | Arithmetic | **GPU** | `hypot(other)` | `Kernels/MathExtra.swift` | sqrt(x^2 + y^2), scaled so a large or tiny pair neither overflows nor underflows on the way. An infinite operand gives inf even opposite a NaN, as IEEE-754 prescribes. |
+| `search_sorted` | Sorts | Missing | `-` | `-` | Arrow's `search_sorted` (26.0.0): the insertion index of each needle in a sorted column, `side` left or right. Not implemented. |
+| `array_sort_indices` | Sorts | **GPU** | `array_sort_indices(descending, null_placement, float_order)` | `Kernels/Sort.swift` | LSD radix sort, stable. Floats order as pyarrow orders them (-0.0 ties +0.0, NaN next to the nulls in both directions); `float_order="total"` is IEEE 754 totalOrder, arrow-rs's order, and `float_order="nan_largest"` NaN above +inf in both directions, Polars' order, through the same passes. utf8 and binary columns take the prefix radix sort in `Kernels/StringSort.swift`, byte-wise lexicographic, index for index with pyarrow. Both of Arrow's `null_placement` values are implemented, in both directions: the nulls are one block at whichever end, moved there by a stable partition of the index array. |
+| `sort_indices` | Sorts | **Partial** | `sort_indices() / am.lexsort_indices(cols)` | `Kernels/MultiSort.swift` | Single key through the radix argsort; multiple keys through `lexsort_indices`, which is successive stable argsorts from the least significant key upwards. Both `null_placement` values are implemented, and apply to every key as Arrow's do; `lexsort_indices` also takes `null_placement` and `float_order` per key. utf8 and binary keys sort through `Kernels/StringSort.swift`; dictionary and nested key columns are still not sortable, which is what keeps this row `partial`. |
+| `partition_nth_indices` | Sorts | **GPU** | `partition_nth_indices(pivot, null_placement)` | `Kernels/PartitionNth.swift` | A real selection, not a sort: an MSB-first GPU radix select finds the pivot value in a fixed four (32-bit keys) or eight (64-bit) histogram passes, and three GPU stream compactions split the row indices around it. O(length). Both `null_placement` values are implemented. The permutation is not the sorted one, and Arrow does not promise it is — only the partition property, which the check below verifies. |
+| `select_k_unstable` | Sorts | **GPU** | `select_k_unstable(k, largest)` | `Kernels/TopK.swift` | For k <= 1024 each threadgroup keeps the best k of its own block and one radix sort orders the survivors; larger k falls back to the full sort. Single key. |
+| `top_k_unstable` | Sorts | **GPU** | `top_k_unstable(k)` | `Kernels/TopK.swift` | `select_k_unstable` with the descending order. |
+| `bottom_k_unstable` | Sorts | **GPU** | `bottom_k_unstable(k)` | `Kernels/TopK.swift` | `select_k_unstable` with the ascending order. |
+| `rank` | Sorts | **GPU** | `rank(sort_keys, null_placement, tiebreaker)` | `Kernels/Window.swift` | One argsort, run marks, a scan and a scatter back to the original rows, with Arrow's whole option surface: the sort direction, both `null_placement` values and all four tiebreakers (`min`, `max`, `first`, `dense`, which are also spelled `rank()`, `max_rank()`, `row_number()` and `dense_rank()`). The result never contains nulls. |
+| `rank_quantile` | Sorts | **GPU** | `rank_quantile(sort_keys, null_placement)` | `Kernels/Selection.swift` | (average 1-based rank of the tie group - 0.5) / n, computed on the GPU as (s + e) / (2n) over the run's sorted positions with the correctly rounded software binary64 divide. Arrow's `sort_keys` direction and both `null_placement` values are implemented; the nulls are one tie group at whichever end. |
+| `rank_normal` | Sorts | **Partial** | `rank_normal(sort_keys, null_placement, float32=False)` | `Kernels/Selection.swift` | The normal percent-point function of `rank_quantile`, with the same `sort_keys` and `null_placement` options. float64 evaluates the inverse CDF **on the host** with Wichura's AS 241 (about 1e-16 relative) because Metal has no `double` and the software binary64 has no log/exp/erfc — that host step is what keeps this row `partial`; `float32=True` runs Acklam plus one Halley refinement entirely on the GPU, within about 1e-6. |
+| `winsorize` | Sorts | **GPU** | `winsorize(lower_limit, upper_limit)` | `Kernels/Selection.swift` | One GPU sort for the two nearest quantiles, then a clamp kernel. Nulls stay null and NaNs pass through, taking part in neither the limits nor the comparison. |
 | `bit_wise_and` | Bitwise | **GPU** | `bitwise_and(other)` | `Kernels/Bitwise.swift` | One thread per element. |
 | `bit_wise_not` | Bitwise | **GPU** | `bitwise_not()` | `Kernels/Bitwise.swift` | One thread per element. |
 | `bit_wise_or` | Bitwise | **GPU** | `bitwise_or(other)` | `Kernels/Bitwise.swift` | One thread per element. |
@@ -289,15 +304,15 @@ Totals: **283 gpu**, **17 cpu**, **7 partial**, **0 missing**, **0 pending** ove
 | `utf8_ltrim` | StringTrimming | **GPU** | `utf8_ltrim(characters)` | `Kernels/StringUnicode.swift` | Leading-only form of `utf8_trim`, with the same per-row GPU/host split. |
 | `utf8_rtrim` | StringTrimming | **GPU** | `utf8_rtrim(characters)` | `Kernels/StringUnicode.swift` | Trailing-only form, with the same per-row split. |
 | `ascii_split_whitespace` | StringSplitting | **GPU** | `split_whitespace(unicode=False, max_splits, reverse)` | `Kernels/StringSplit.swift` | Splits at every maximal run of ASCII whitespace (the space and `\t`-`\r`), on the GPU: three passes and two scans — count the pieces of every row, measure them, copy the bytes — returning a real `list<utf8>`. Every separator makes a boundary, so a leading or trailing run leaves an empty end piece and the empty string splits to one empty piece, as Arrow's does. `max_splits` and `reverse` are implemented; the `(offsets, values)` pair is still available as `split_whitespace_pair`. |
-| `utf8_split_whitespace` | StringSplitting | **GPU** | `split_whitespace(unicode=True, max_splits, reverse)` | `Kernels/StringSplit.swift` | The same kernel over the full **Unicode** whitespace class — Zs/Zl/Zp plus U+0009-U+000D, U+001C-U+001F and U+0085, and not U+200B — which is small enough to spell out in MSL, so this stays on the GPU too. Deliberate difference: with `reverse` and a finite `max_splits`, pyarrow 25.0.1 fails to merge a multi-byte whitespace character with the whitespace beside it (`" \u3000x"` split once in reverse gives it `[" ", "x"]`); the runs here stay maximal in both directions. |
+| `utf8_split_whitespace` | StringSplitting | **GPU** | `split_whitespace(unicode=True, max_splits, reverse)` | `Kernels/StringSplit.swift` | The same kernel over the full **Unicode** whitespace class — Zs/Zl/Zp plus U+0009-U+000D, U+001C-U+001F and U+0085, and not U+200B — which is small enough to spell out in MSL, so this stays on the GPU too. Deliberate difference: with `reverse` and a finite `max_splits`, pyarrow (25.0.1 and 26.0.0) fails to merge a multi-byte whitespace character with the whitespace beside it (`" \u3000x"` split once in reverse gives it `[" ", "x"]`); the runs here stay maximal in both directions. |
 | `split_pattern` | StringSplitting | **GPU** | `split_pattern(pattern, max_splits, reverse)` | `Kernels/StringSplit.swift` | The same three-pass GPU splitter with a literal byte separator, returning a `list<utf8>`. `max_splits` and `reverse` are implemented; an empty pattern is refused, as in Arrow. |
 | `split_pattern_regex` | StringSplitting | **CPU** | `split_pattern(pattern, regex=True, max_splits)` | `Kernels/Regex.swift` | The host backtracking engine, returning the same `list<utf8>`. `max_splits` is implemented; `reverse` is refused, exactly as Arrow refuses it ("cannot split in reverse with regex"). |
 | `extract_regex` | StringExtraction | **CPU** | `extract_regex_struct(pattern)` | `Kernels/StringStructs.swift` | A **struct column** with one `utf8` field per named capture group, which is Arrow's own shape; the dictionary-of-columns form stays available as `extract_regex`. A row that does not match and a null row are both a null struct. ICU decides the match on the host, but the GPU literal pre-filter keeps the rows that cannot match away from it. RE2's `(?P<name>...)` spelling, which pyarrow uses, is rewritten to ICU's `(?<name>...)` by the Python wrapper. |
 | `extract_regex_span` | StringExtraction | **CPU** | `extract_regex_span_struct(pattern)` | `Kernels/StringStructs.swift` | The same struct, each field a `fixed_size_list<int32>[2]` holding that group's `(start, length)` in **bytes** — exactly pyarrow's type. A row that does not match and a null row are a null struct; a group that took part in no alternative is a null list. Host-side (ICU, sharded over 4096-row chunks) behind the same GPU pre-filter. The `{group: (start, length)}` dictionary form stays available as `extract_regex_span`. |
 | `binary_join` | StringJoining | **GPU** | `binary_join(separator)` | `Kernels/StringContainment.swift` | Joins the child strings of every row of a `list<utf8>`, two-pass on the GPU. The separator is a scalar or a per-row column. An empty row joins to the empty string; a null row, a null element inside a row and a null separator all give a null output row. |
-| `binary_join_element_wise` | StringJoining | **GPU** | `binary_join_element_wise(columns, separator, null_handling, null_replacement)` | `Kernels/StringBytes.swift` | N columns and a scalar separator, GPU throughout: a left fold of one two-pass join step, so N columns cost N-1 passes and the data never leaves the device. All three of Arrow's `null_handling` modes are implemented — `emit_null`, `skip` (a null column contributes nothing, not even its separator, the fold leaves the accumulator null until something has been joined) and `replace`. Deliberate difference: under `skip`, a row whose columns are *all* null joins to the empty string here, where pyarrow 25.0.1 drops the row from its output entirely and returns an array shorter than its input. |
+| `binary_join_element_wise` | StringJoining | **GPU** | `binary_join_element_wise(columns, separator, null_handling, null_replacement)` | `Kernels/StringBytes.swift` | N columns and a scalar separator, GPU throughout: a left fold of one two-pass join step, so N columns cost N-1 passes and the data never leaves the device. All three of Arrow's `null_handling` modes are implemented — `emit_null`, `skip` (a null column contributes nothing, not even its separator, the fold leaves the accumulator null until something has been joined) and `replace`. Deliberate difference: under `skip`, a row whose columns are *all* null joins to the empty string here, where pyarrow (25.0.1 and 26.0.0) drops the row from its output entirely and returns an array shorter than its input. |
 | `utf8_slice_codeunits` | StringSlicing | **GPU** | `slice_codeunits(start, stop, step)` | `Kernels/StringBytes.swift` | Code-point slicing with Python's slice rules, two-pass on the GPU: a negative index counts from the end, both ends clamp, and a negative `step` walks backwards — which the byte kernel does in one forward walk by filling the output from its end. The cut always lands on a code point boundary. |
-| `binary_slice` | StringSlicing | **GPU** | `binary_slice(start, stop, step)` | `Kernels/StringBytes.swift` | The same slice indexed in **bytes**, which can split a UTF-8 sequence and is why Arrow types the result `binary` and refuses a `string` input. Deliberate difference: Arrow's default `stop` is `INT64_MAX`, and with a negative `step` pyarrow 25.0.1 overflows on it and reads out of bounds; here an absent `stop` means the beginning of the value, which is what the option intends. |
+| `binary_slice` | StringSlicing | **GPU** | `binary_slice(start, stop, step)` | `Kernels/StringBytes.swift` | The same slice indexed in **bytes**, which can split a UTF-8 sequence and is why Arrow types the result `binary` and refuses a `string` input. Arrow's default `stop` is `INT64_MAX`; with a negative `step` pyarrow 25.0.1 overflowed on it and read out of bounds, and 26.0.0 walks to the beginning of the value, which is what an absent `stop` has always meant here. |
 | `count_substring` | Containment | **GPU** | `count_substring(pattern)` | `Kernels/StringTransforms.swift` | Byte-wise search, one thread per row. |
 | `find_substring` | Containment | **GPU** | `find_substring(pattern)` | `Kernels/StringTransforms.swift` | First byte offset, -1 when absent. |
 | `match_substring` | Containment | **GPU** | `str_contains(pattern)` | `Sources/ArrowMetal/MetalStringArray.swift` | Byte-wise containment. `ignore_case` is not implemented. |
@@ -377,16 +392,6 @@ Totals: **283 gpu**, **17 cpu**, **7 partial**, **0 missing**, **0 pending** ove
 | `drop_null` | Selections | **GPU** | `drop_null()` | `Kernels/Structural.swift` | The filter kernel driven by the validity bitmap. |
 | `inverse_permutation` | Selections | **GPU** | `inverse_permutation(max_index)` | `Kernels/Selection.swift` | An atomic scatter: for the i-th index the index-th output is i. Unassigned slots are null and duplicates resolve to the last source position, deterministically (the scatter is an atomic maximum). Always int32 — Arrow's `output_type` is not implemented. |
 | `scatter` | Selections | **GPU** | `scatter(indices, max_index)` | `Kernels/Selection.swift` | The inverse permutation used as a `take`, so it works for every column type. Unassigned positions are null and duplicate indices resolve to the last value. |
-| `array_sort_indices` | Sorts | **GPU** | `array_sort_indices(descending, null_placement, float_order)` | `Kernels/Sort.swift` | LSD radix sort, stable. Floats order as pyarrow orders them (-0.0 ties +0.0, NaN next to the nulls in both directions); `float_order="total"` is IEEE 754 totalOrder, arrow-rs's order, and `float_order="nan_largest"` NaN above +inf in both directions, Polars' order, through the same passes. utf8 and binary columns take the prefix radix sort in `Kernels/StringSort.swift`, byte-wise lexicographic, index for index with pyarrow. Both of Arrow's `null_placement` values are implemented, in both directions: the nulls are one block at whichever end, moved there by a stable partition of the index array. |
-| `sort_indices` | Sorts | **Partial** | `sort_indices() / am.lexsort_indices(cols)` | `Kernels/MultiSort.swift` | Single key through the radix argsort; multiple keys through `lexsort_indices`, which is successive stable argsorts from the least significant key upwards. Both `null_placement` values are implemented, and apply to every key as Arrow's do; `lexsort_indices` also takes `null_placement` and `float_order` per key. utf8 and binary keys sort through `Kernels/StringSort.swift`; dictionary and nested key columns are still not sortable, which is what keeps this row `partial`. |
-| `partition_nth_indices` | Sorts | **GPU** | `partition_nth_indices(pivot, null_placement)` | `Kernels/PartitionNth.swift` | A real selection, not a sort: an MSB-first GPU radix select finds the pivot value in a fixed four (32-bit keys) or eight (64-bit) histogram passes, and three GPU stream compactions split the row indices around it. O(length). Both `null_placement` values are implemented. The permutation is not the sorted one, and Arrow does not promise it is — only the partition property, which the check below verifies. |
-| `select_k_unstable` | Sorts | **GPU** | `select_k_unstable(k, largest)` | `Kernels/TopK.swift` | For k <= 1024 each threadgroup keeps the best k of its own block and one radix sort orders the survivors; larger k falls back to the full sort. Single key. |
-| `top_k_unstable` | Sorts | **GPU** | `top_k_unstable(k)` | `Kernels/TopK.swift` | `select_k_unstable` with the descending order. |
-| `bottom_k_unstable` | Sorts | **GPU** | `bottom_k_unstable(k)` | `Kernels/TopK.swift` | `select_k_unstable` with the ascending order. |
-| `rank` | Sorts | **GPU** | `rank(sort_keys, null_placement, tiebreaker)` | `Kernels/Window.swift` | One argsort, run marks, a scan and a scatter back to the original rows, with Arrow's whole option surface: the sort direction, both `null_placement` values and all four tiebreakers (`min`, `max`, `first`, `dense`, which are also spelled `rank()`, `max_rank()`, `row_number()` and `dense_rank()`). The result never contains nulls. |
-| `rank_quantile` | Sorts | **GPU** | `rank_quantile(sort_keys, null_placement)` | `Kernels/Selection.swift` | (average 1-based rank of the tie group - 0.5) / n, computed on the GPU as (s + e) / (2n) over the run's sorted positions with the correctly rounded software binary64 divide. Arrow's `sort_keys` direction and both `null_placement` values are implemented; the nulls are one tie group at whichever end. |
-| `rank_normal` | Sorts | **Partial** | `rank_normal(sort_keys, null_placement, float32=False)` | `Kernels/Selection.swift` | The normal percent-point function of `rank_quantile`, with the same `sort_keys` and `null_placement` options. float64 evaluates the inverse CDF **on the host** with Wichura's AS 241 (about 1e-16 relative) because Metal has no `double` and the software binary64 has no log/exp/erfc — that host step is what keeps this row `partial`; `float32=True` runs Acklam plus one Halley refinement entirely on the GPU, within about 1e-6. |
-| `winsorize` | Sorts | **GPU** | `winsorize(lower_limit, upper_limit)` | `Kernels/Selection.swift` | One GPU sort for the two nearest quantiles, then a clamp kernel. Nulls stay null and NaNs pass through, taking part in neither the limits nor the comparison. |
 | `fill_null` | NullFilling | **GPU** | `fill_null(value)` | `Kernels/Structural.swift` | One thread per element; the result carries no validity bitmap when the fill removes every null. |
 | `fill_null_forward` | NullFilling | **GPU** | `fill_null_forward()` | `Kernels/Conditional.swift` | One GPU max-scan over the last valid row index plus a gather. Leading nulls stay null. |
 | `fill_null_backward` | NullFilling | **GPU** | `fill_null_backward()` | `Kernels/Conditional.swift` | The same scan run the other way. Trailing nulls stay null. |
@@ -435,12 +440,13 @@ Totals: **283 gpu**, **17 cpu**, **7 partial**, **0 missing**, **0 pending** ove
 
 ## Differential matrix cases, by section
 
-Separately from the row-by-row calls above, `python/tests/test_differential.py` runs every ArrowMetal operation over generated columns of every type it accepts: 41,688 cases in the recorded run, 38,897 pass, 1,644 documented divergences, 1,147 skipped, 0 unclassified. [COVERAGE.md](COVERAGE.md#differential-cases-per-arrow-function) has the count for each name; this is how many names in each section the matrix reaches.
+Separately from the row-by-row calls above, `python/tests/test_differential.py` runs every ArrowMetal operation over generated columns of every type it accepts: 41,688 cases in the recorded run, 38,898 pass, 1,643 documented divergences, 1,147 skipped, 0 unclassified. [COVERAGE.md](COVERAGE.md#differential-cases-per-arrow-function) has the count for each name; this is how many names in each section the matrix reaches.
 
 | Section | Names | With matrix cases | Names without |
 |---|---:|---:|---|
 | Aggregations | 24 | 21 | `count`, `count_all`, `pivot_wider` |
-| Arithmetic | 20 | 20 | - |
+| Arithmetic | 24 | 21 | `remainder_checked`, `modulo`, `modulo_checked` |
+| Sorts | 11 | 10 | `search_sorted` |
 | Bitwise | 8 | 8 | - |
 | Rounding | 6 | 6 | - |
 | Logarithmic | 10 | 10 | - |
@@ -465,13 +471,12 @@ Separately from the row-by-row calls above, `python/tests/test_differential.py` 
 | Random | 1 | 0 | `random` |
 | Associative | 4 | 4 | - |
 | Selections | 7 | 7 | - |
-| Sorts | 10 | 10 | - |
 | NullFilling | 3 | 3 | - |
 | Structural | 9 | 8 | `make_struct` |
 | Pairwise | 2 | 2 | - |
 | Cumulative | 7 | 7 | - |
 | GroupedAggregations | 24 | 6 | `hash_min_max`, `hash_all`, `hash_any`, `hash_approximate_median`, `hash_count_distinct`, `hash_distinct`, `hash_first`, `hash_first_last`, `hash_last`, `hash_list`, `hash_one`, `hash_product`, `hash_stddev`, `hash_variance`, `hash_pivot_wider`, `hash_kurtosis`, `hash_skew`, `hash_tdigest` |
-| **Total** | **307** | **280** | |
+| **Total** | **312** | **281** | |
 
 ---
 

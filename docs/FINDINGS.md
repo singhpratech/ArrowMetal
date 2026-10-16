@@ -2,6 +2,44 @@
 
 Things learned the hard way. Add to this whenever something surprises you.
 
+## Round 22 (2026-10-15): the matrix moves to pyarrow 26.0.0
+
+**What.** Apache Arrow 26.0.0 shipped on 2026-10-09 with four of the pyarrow bugs the differential
+matrix had been working around since Round 8b: `utf8_normalize` composing for NFC and NFKC (our
+apache/arrow#51237), and `pairwise_diff`, the boolean `fill_null_forward` / `_backward` /
+`replace_with_mask` kernels and `winsorize` honouring `ArrowArray.offset` on a sliced array
+(apache/arrow#50858, #51240, #51251). Each workaround had a pinning test written to fail on the day
+pyarrow changed the behaviour it pinned. The venv and the CI pin moved from 25.0.1 to 26.0.0.
+
+- **The pinning tests did their job.** On 26.0.0 the four failed, every one on the `!=` or `==` that
+  asserted pyarrow's wrong answer, and nothing else in the suites moved: `test_json.py` and
+  `test_csv.py`, which pin the documented differences from pyarrow, 979 passed unchanged. The fifth,
+  `test_pyarrow_binary_slice_overflows_on_its_own_default_stop`, still passes: the `binary_slice`
+  default-stop overflow is not in 26.0.0 (apache/arrow#51222, a contributor's fix #52451 under review).
+- **One documented divergence was pyarrow's.** The matrix on 26.0.0 (264.3 s): 38,898
+  pass, 1,643 fail, all documented, 1,147 skip, 0 unclassified, against 38,897 / 1,644 / 1,147 on
+  25.0.1. The one case gained is `winsorize/float64` on the negative-zero dataset, which the classifier
+  had counted under finding 22 (`winsorize-negative-zero-limit`); it was the offset bug. The finding
+  keeps its two float32 cases.
+- **Four more pinning tests moved, in the gate.** `pc.cumulative_max`'s default `start` no longer
+  clamps negative floats to 1.18e-38 (the matrix still names the identity, the same answer either way);
+  an out-of-range `safe=false` float-to-int cast wraps as the GPU does on every value the test holds,
+  where 25.0.1 saturated; pyarrow reads the fixed-size-list-with-null-rows Parquet file its own writer
+  produced, which 25.0.1 rejected, and agrees with ArrowMetal's rows; and five compute function names
+  are new, `remainder` / `remainder_checked` (the C `%`, which `modulo()` here has always been, so
+  `remainder` gets a GPU registry row), `modulo` / `modulo_checked` (Python's floored `%`) and
+  `search_sorted`, the last four `missing` in the registry. The matrix's `modulo` operation checks
+  against `pc.remainder` now instead of a `divide` / `multiply` / `subtract` construction.
+- **`binary_slice` with a negative step and no stop.** The function note recorded that pyarrow 25.0.1
+  overflowed on its `INT64_MAX` default and read out of bounds; 26.0.0 walks to the beginning of the
+  value, the answer ArrowMetal has always given for an absent stop.
+
+**Result.** The four pinning tests and the `_materialised` copies are retired; the oracle for
+`string_normalize` is `pc.utf8_normalize` again and `pairwise_diff`, the fill-null kernels,
+`replace_with_mask` and `winsorize` hand pyarrow the slice itself; the operations Arrow has no
+function for keep their references written in the harness, as before. The tracker rows in
+[UPSTREAM.md](UPSTREAM.md) read "fixed in 26.0.0" and stay as history.
+
 ## Round 19 (2026-10-07): Polars 2.0.0
 
 **What.** Polars 2.0.0 (released 2026-10-06) changed five things the engine stands on. `collect()` runs
@@ -1158,7 +1196,8 @@ def _materialised(src):
     return pa.concat_arrays([src.slice(0, 0), src])
 ```
 
-Fixed upstream in pyarrow 26.0.0; the workaround stays only while 25.0.1 is the pinned version.
+Fixed upstream in pyarrow 26.0.0; the workaround stayed while 25.0.1 was the pinned version and was
+retired with its pinning test on 2026-10-15, when the matrix moved to 26.0.0 (Round 22).
 
 ### Finding 4: the same offset bug on boolean columns
 
@@ -1192,7 +1231,7 @@ def _unscaled_magnitude(value):
 - The pinning tests in the same file: `test_pyarrow_utf8_normalize_ignores_its_form_option`,
   `test_pyarrow_pairwise_diff_ignores_the_array_offset` and
   `test_pyarrow_boolean_fill_null_forward_ignores_the_array_offset`; each fails when a later pyarrow
-  changes the behaviour it pins.
+  changes the behaviour it pins. (They did, on 26.0.0, and were retired on 2026-10-15: Round 22.)
 
 ## Round 7 (2026-09-06): strings and sort
 

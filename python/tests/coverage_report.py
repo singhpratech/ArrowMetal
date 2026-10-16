@@ -255,6 +255,7 @@ OPERATION_FUNCTIONS = {
     "byte_transforms": ("binary_slice", "binary_reverse", "ascii_reverse"),
     "extract_regex_structs": ("extract_regex", "extract_regex_span"),
     "timezone_metadata": ("cast",),
+    "modulo": ("remainder",),
 }
 
 #: Differential operations that check no Arrow compute function, and what they check instead.
@@ -265,7 +266,6 @@ OUTSIDE = {
     "slice_ext": "zero-copy slicing of the extended types",
     "str_hash32": "ArrowMetal's 32-bit string hash: null positions kept, no collisions over the data",
     "hash64": "ArrowMetal's 64-bit hash: null positions kept, equal values hash equal, no collisions",
-    "modulo": "integer remainder, against Arrow's `divide`, `multiply` and `subtract` (Arrow has no modulo)",
     "months_between": "whole months between two dates, against Arrow's `year` and `month` arithmetic",
     "temporal_field_types": "the result type of every temporal extractor",
     "percent_rank_and_cume_dist": "window functions, against a reference written in the harness",

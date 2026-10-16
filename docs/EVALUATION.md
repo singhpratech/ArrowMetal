@@ -12,11 +12,12 @@ it and compares, so a kernel that is wrong in an unanticipated way still fails.
 | What | Detail |
 |---|---|
 | Files | `python/tests/test_differential.py` (the harness), `python/tests/differential_report.py` (the runner) |
-| Oracle | `pyarrow.compute` 25.0.1, plus a reference written in the harness for the 17 operations Arrow has no function for |
+| Oracle | `pyarrow.compute` 26.0.0 since 2026-10-15 (25.0.1 before; four of its bugs the matrix worked around are fixed in 26.0.0, see below), plus a reference written in the harness for the 16 operations Arrow has no function for ([COVERAGE.md](COVERAGE.md)) |
 | Cases in the default matrix | 41,688 — 217 operations over 46 column types (45 types plus `utf8_view`, the utf8 values imported as views), 1,544 applicable (operation, type) cells x 27 datasets — 268 s on an M4 Max on 2026-10-01; the per-function table is generated from the recorded run (`docs/data/differential_coverage.json`, docs/COVERAGE.md); more with `DIFF_LARGE=1` |
 | Result at 0.1.0 | 36,486 pass, 1,566 fail across 22 documented divergences, 1,017 skip (an operation that does not apply to a type), **0 unclassified** |
 | Result on 2026-09-25, with `utf8_view` | 38,006 pass, 1,644 fail across the documented divergences, 1,174 skip, **0 unclassified**; the 1,755 `utf8_view` cases are the 65 utf8 operations again, with the same pass, fail and skip counts as their utf8 cells |
-| Result on 2026-10-01 (the recorded run) | 38,897 pass, 1,644 fail across the documented divergences, 1,147 skip, **0 unclassified** |
+| Result on 2026-10-01 | 38,897 pass, 1,644 fail across the documented divergences, 1,147 skip, **0 unclassified** |
+| Result on 2026-10-15, pyarrow 26.0.0 (the recorded run) | 38,898 pass, 1,643 fail across the documented divergences, 1,147 skip, **0 unclassified**; the case gained is `winsorize/float64` on the negative-zero dataset, which had been pyarrow's offset bug counted under finding 22 |
 
 ## Method
 
@@ -48,7 +49,6 @@ each is compared against a reference written out in the harness rather than agai
 | `temporal_field_types` | the recorded result-type contract (`_TEMPORAL_RESULT_TYPES`) |
 | `interval_layouts` | the `month_day_nano` result, which pyarrow *does* compute and the matrix compares against it |
 | `add_interval` | `pc.add` of the equivalent duration for the day/time half, and a Python calendar reference for the month half |
-| `string_normalize` | Python's `unicodedata` — pyarrow 25.0.1's `utf8_normalize` ignores its `form` option |
 | `extension_type` | the round trip through pyarrow's own extension registry |
 | `nulls_constructor` | `pa.nulls(n)` |
 
@@ -156,7 +156,7 @@ suite notices if either engine changes its mind.
 | Integer division by zero | 0 | raises `ArrowInvalid` | `test_integer_division_by_zero_returns_zero_where_pyarrow_raises` |
 | Integer overflow | wraps | `pc.add` wraps, `pc.add_checked` raises — the harness uses the unchecked variants | `test_integer_overflow_wraps_where_checked_pyarrow_raises` |
 | `INT_MIN / -1` (undefined in C) | `INT_MIN` (the hardware answer) | 0 | `test_int_min_divided_by_minus_one_wraps_where_pyarrow_yields_zero` |
-| Out-of-range float → int cast (undefined in C) | wraps | saturates to `INT32_MAX` | `test_out_of_range_float_to_int_cast_diverges` |
+| Out-of-range float → int cast (undefined in C) | wraps | 26.0.0 wraps the same way on every value the test holds; 25.0.1 saturated to `INT32_MAX` | `test_out_of_range_float_to_int_cast_agrees_since_pyarrow_26` |
 | Float division by zero | ±inf / NaN | ±inf / NaN — identical | `test_float_division_by_zero_is_ieee_754_in_both` |
 | `&` / `\|` with nulls | null-propagating, like `pc.and_`/`pc.or_` — *not* `and_kleene`/`or_kleene` | both available | `test_boolean_and_or_are_not_kleene` |
 | NaN in `min`/`max` | skipped | skipped — identical | `test_nan_is_skipped_by_min_and_max_in_both` |
@@ -191,15 +191,18 @@ suite notices if either engine changes its mind.
 | decimal `+`/`-`/`*` past the column's precision | wraps modulo 2^128, the storage width | `pc.add` refuses precision 39 outright; its unchecked cast wraps modulo 10^precision | `test_decimal_arithmetic_wraps_modulo_two_to_the_128` |
 
 Five of the divergences the harness turned up are **pyarrow's**, not ArrowMetal's. They are recorded
-here because the matrix has to work around them, and each has a test that fails if pyarrow fixes it:
+here because the matrix had to work around them, each with a test that fails when pyarrow fixes it. Four
+are fixed in pyarrow 26.0.0 ([UPSTREAM.md](UPSTREAM.md)): on 2026-10-15 the matrix moved to 26.0.0, the
+four pinning tests failed as designed and were retired with their workarounds, and the oracle is
+`pyarrow.compute` on the slice itself again. One remains:
 
 | Case | pyarrow 25.0.1 | Correct | Test |
 |---|---|---|---|
-| `pc.utf8_normalize` | decomposes whatever `form` says — its NFC is NFD | ArrowMetal and Python's `unicodedata` agree | `test_pyarrow_utf8_normalize_ignores_its_form_option` |
-| `pc.pairwise_diff` on a sliced column | reads the values buffer without `ArrowArray.offset` | ArrowMetal honours the offset; the matrix hands the oracle a materialised copy | `test_pyarrow_pairwise_diff_ignores_the_array_offset` |
-| `pc.fill_null_forward`/`_backward`/`replace_with_mask` on a sliced **boolean** column | the same offset bug | same | `test_pyarrow_boolean_fill_null_forward_ignores_the_array_offset` |
-| `pc.winsorize` on a sliced column | the same offset bug — it answers with the *wrong rows* null, and puts values where the input has nulls | ArrowMetal honours the offset; the matrix hands the oracle a materialised copy | `test_pyarrow_winsorize_ignores_the_array_offset` |
-| `pc.binary_slice` with its own default `stop` | `sys.maxsize` overflows the output-size arithmetic: `ArrowInvalid: Negative buffer resize` | the matrix names an explicit stop past every generated value | `test_pyarrow_binary_slice_overflows_on_its_own_default_stop` |
+| `pc.utf8_normalize` | decomposed whatever `form` said — its NFC was NFD | fixed in 26.0.0 by our [apache/arrow#51237](https://github.com/apache/arrow/pull/51237); the oracle was Python's `unicodedata` until then | retired |
+| `pc.pairwise_diff` on a sliced column | read the values buffer without `ArrowArray.offset` | fixed in 26.0.0; the oracle was given a materialised copy until then | retired |
+| `pc.fill_null_forward`/`_backward`/`replace_with_mask` on a sliced **boolean** column | the same offset bug | fixed in 26.0.0 | retired |
+| `pc.winsorize` on a sliced column | the same offset bug — it answered with the *wrong rows* null, and put values where the input has nulls | fixed in 26.0.0 | retired |
+| `pc.binary_slice` with its own default `stop` | `sys.maxsize` overflows the output-size arithmetic: `ArrowInvalid: Negative buffer resize` (still so in 26.0.0) | the matrix names an explicit stop past every generated value | `test_pyarrow_binary_slice_overflows_on_its_own_default_stop` |
 
 And one was a crash rather than a wrong answer: in the first run of this matrix `pc.year_month_day` and
 `pc.iso_calendar` corrupted the heap in pyarrow 25.0.1 and the process segfaulted a couple of allocations
@@ -209,12 +212,14 @@ as a confirmed bug, and the matrix still never calls them — `temporal_struct` 
 `pc.year`/`pc.month`/`pc.day` and `pc.iso_year`/`pc.iso_week`/`pc.day_of_week` instead, which is a
 stronger check anyway. See `docs/FINDINGS.md`.
 
-Two of Arrow's own defaults would make the matrix meaningless if the harness accepted them, so the oracle
-states the option instead and a test records why. `pc.cumulative_max`'s default `start` is
-`numeric_limits<T>::min()`, which on a float column is the smallest positive *normal* — so Arrow's default
-clamps every negative running maximum to 1.18e-38 (`test_arrow_cumulative_max_default_start_clamps_negative_floats`);
-the matrix passes ∓inf explicitly. And `pc.round` defaults to half-to-even where ArrowMetal rounds halves
-away from zero, so the oracle asks for `half_towards_infinity`, the mode the kernel documents.
+Two of Arrow's own defaults would have made the matrix meaningless if the harness accepted them, so the
+oracle states the option instead and a test records why. `pc.cumulative_max`'s default `start` in pyarrow
+25.0.1 was `numeric_limits<T>::min()`, which on a float column is the smallest positive *normal* — so the
+default clamped every negative running maximum to 1.18e-38; 26.0.0 answers the running maximum, and the
+matrix still passes ∓inf explicitly, the same answer either way
+(`test_arrow_cumulative_max_default_start_takes_negative_floats_since_pyarrow_26`). And `pc.round` defaults
+to half-to-even where ArrowMetal rounds halves away from zero, so the oracle asks for
+`half_towards_infinity`, the mode the kernel documents.
 
 Because `min`/`max` skip NaN in both engines but disagree on what is left when *every* value is NaN, the
 matrix compares `min`/`max`/`mean` on NaN-free input and the NaN behaviour is pinned in tests of its own.
@@ -259,8 +264,8 @@ exactly.
 | 19 | `logb-of-zero-against-a-small-base` | 4 | 1 |
 | 20 | `round-scales-before-it-rounds` | 19 | 2 |
 | 21 | `high-moment-accumulator-overflow` | 14 | 4 |
-| 22 | `winsorize-negative-zero-limit` | 3 | 2 |
-| | **Total** | **1,610** | **129** |
+| 22 | `winsorize-negative-zero-limit` | 2 | 1 |
+| | **Total** | **1,609** | **128** |
 
 The counts are the full `differential_report.py` run of 2026-09-07. The column totals exceed the headline
 1,566 cases and the 126 distinct cells because
@@ -698,7 +703,7 @@ Reproduction: `test_skew_and_kurtosis_share_the_variance_accumulator`.
 
 ### 22. `winsorize` clamps to the `-0.0` of a zero tie
 
-*3 failing cases: `winsorize/float32` and `winsorize/float64`, the datasets containing a negative zero.*
+*2 failing cases: `winsorize/float32`, the datasets containing a negative zero. (On pyarrow 25.0.1 a `winsorize/float64` case was counted here too; it was pyarrow's offset bug, gone on 26.0.0.)*
 
 `winsorize` takes its two limits out of the sorted values — Arrow's *nearest* quantile, not an interpolated
 one. `-0.0` and `0.0` are one tie group in every sort order both engines use, so which of the pair becomes

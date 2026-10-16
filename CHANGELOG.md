@@ -2,7 +2,17 @@
 
 ## Unreleased
 
-Nothing yet.
+- The differential matrix and the Python test suites run on pyarrow 26.0.0 (CI pin, venv). Four pyarrow
+  bugs the matrix worked around on 25.0.1 are fixed in 26.0.0 (`utf8_normalize` composing for NFC and
+  NFKC, by our apache/arrow#51237; `pairwise_diff`, the boolean fill-null kernels and `winsorize` on a
+  sliced array honouring the offset): their pinning tests failed on 26.0.0 as designed and were retired
+  with the workarounds, so the oracle is `pyarrow.compute` on the slice itself again. The `binary_slice`
+  default-stop overflow remains (apache/arrow#51222), with its pinning test. Three more pinned behaviours
+  changed in 26.0.0 and their tests say so now (`cumulative_max`'s default start, the out-of-range
+  float-to-int cast, the fixed-size-list Parquet file pyarrow's reader used to reject), and the registry
+  carries 26.0.0's five new function names: `remainder` runs on the GPU as `modulo()` has always computed
+  it (the C `%`), `remainder_checked`, the floored `modulo` / `modulo_checked` and `search_sorted` are
+  recorded as missing.
 
 ## 0.5.0 — 2026-10-08
 

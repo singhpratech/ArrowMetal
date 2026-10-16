@@ -562,6 +562,22 @@ _ROWS = [
      _b("divide_checked"), ((_INT, _INT2), {})),
     ("multiply_checked", "Arithmetic", GPU, "Kernels/Checked.swift", "multiply_checked(other)",
      "As `add_checked`.", _b("multiply_checked"), ((_INT, _INT2), {})),
+    ("remainder", "Arithmetic", GPU, "Kernels/Rounding.swift", "modulo(other)",
+     "Arrow's `remainder` (26.0.0): the C `%`, truncated division with the sign of the dividend, which "
+     "is what `modulo()` / `__mod__` have always computed here. Deliberate difference: Arrow raises "
+     "`divide by zero` for an integer zero divisor, here `x % 0` is 0.",
+     _b("modulo"), ((_INT, _INT2), {})),
+    ("remainder_checked", "Arithmetic", MISSING, "-", "-",
+     "Arrow's checked `remainder` (26.0.0), which raises on a zero divisor; no checked remainder kernel "
+     "yet, `modulo()` defines `x % 0` as 0."),
+    ("modulo", "Arithmetic", MISSING, "-", "-",
+     "Arrow's `modulo` (26.0.0) is Python's `%`: floored division, the sign of the divisor. Not "
+     "implemented; `modulo()` here is the C remainder, Arrow's `remainder`."),
+    ("modulo_checked", "Arithmetic", MISSING, "-", "-",
+     "Arrow's checked floored `modulo` (26.0.0). Not implemented."),
+    ("search_sorted", "Sorts", MISSING, "-", "-",
+     "Arrow's `search_sorted` (26.0.0): the insertion index of each needle in a sorted column, "
+     "`side` left or right. Not implemented."),
     ("negate_checked", "Arithmetic", GPU, "Kernels/Checked.swift", "negate_checked()",
      "Raises for INT_MIN on a signed column and — unlike pyarrow, which has no unsigned kernel at "
      "all — for every non-zero value on an unsigned one.", _u("negate_checked"), ((_INT,), {})),
@@ -1020,7 +1036,7 @@ _ROWS = [
      "The same kernel over the full **Unicode** whitespace class — Zs/Zl/Zp plus U+0009-U+000D, "
      "U+001C-U+001F and U+0085, and not U+200B — which is small enough to spell out in MSL, so this "
      "stays on the GPU too. Deliberate difference: with `reverse` and a finite `max_splits`, pyarrow "
-     "25.0.1 fails to merge a multi-byte whitespace character with the whitespace beside it "
+     "(25.0.1 and 26.0.0) fails to merge a multi-byte whitespace character with the whitespace beside it "
      "(`\" \\u3000x\"` split once in reverse gives it `[\" \", \"x\"]`); the runs here stay maximal in "
      "both directions.",
      _split("split_whitespace", unicode=True), ((_STR_WS,), {})),
@@ -1068,7 +1084,7 @@ _ROWS = [
      "`null_handling` modes are implemented — `emit_null`, `skip` (a null column contributes nothing, "
      "not even its separator, the fold leaves the accumulator null until something has been joined) "
      "and `replace`. Deliberate difference: under `skip`, a row "
-     "whose columns are *all* null joins to the empty string here, where pyarrow 25.0.1 drops the row "
+     "whose columns are *all* null joins to the empty string here, where pyarrow (25.0.1 and 26.0.0) drops the row "
      "from its output entirely and returns an array shorter than its input.",
      lambda args, options: _out(binary_join_element_wise(
          list(args), options.get("separator", ""), options.get("null_handling", "emit_null"),
@@ -1086,9 +1102,9 @@ _ROWS = [
      ((_STR_UNI,), {"start": 1, "stop": 4})),
     ("binary_slice", "StringSlicing", GPU, "Kernels/StringBytes.swift", "binary_slice(start, stop, step)",
      "The same slice indexed in **bytes**, which can split a UTF-8 sequence and is why Arrow types the "
-     "result `binary` and refuses a `string` input. Deliberate difference: Arrow's default `stop` is "
-     "`INT64_MAX`, and with a negative `step` pyarrow 25.0.1 overflows on it and reads out of bounds; "
-     "here an absent `stop` means the beginning of the value, which is what the option intends.",
+     "result `binary` and refuses a `string` input. Arrow's default `stop` is `INT64_MAX`; with a "
+     "negative `step` pyarrow 25.0.1 overflowed on it and read out of bounds, and 26.0.0 walks to the "
+     "beginning of the value, which is what an absent `stop` has always meant here.",
      lambda args, options: _out(_a(args[0]).binary_slice(options["start"], options.get("stop"),
                                                          options.get("step", 1))),
      ((_BIN,), {"start": 1, "stop": 4}),

@@ -190,7 +190,7 @@ parse, bit for bit, by every float case in `test_csv.py`.
 ## Matching pyarrow
 
 pyarrow's rules were established by probing pyarrow 25.0.1 (the probe below), and every row of this table
-is a case in `python/tests/test_csv.py`.
+is a case in `python/tests/test_csv.py`; the cases pass unchanged on pyarrow 26.0.0 (run on 2026-10-15).
 
 | Rule | pyarrow 25.0.1, matched |
 |---|---|

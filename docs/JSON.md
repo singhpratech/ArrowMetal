@@ -221,9 +221,10 @@ the type as pyarrow holds it before conversion (`bool`; numbers and strings as
 `dictionary<values=string, indices=int32, ordered=0>`; `struct<...>` and `list<item: ...>` of those;
 the `null_*` explicit cases, as top-level, list-item and struct-field types).
 
-## Differences from pyarrow 25.0.1
+## Differences from pyarrow
 
-Each has a test of its own in `python/tests/test_json.py` that checks the difference is exactly this.
+Established against pyarrow 25.0.1 and unchanged on 26.0.0 (the suite ran on it on 2026-10-15). Each has a
+test of its own in `python/tests/test_json.py` that checks the difference is exactly this.
 
 - **Row numbers in error messages count from the start of the file.** pyarrow parses in 1 MiB blocks and
   counts rows from the start of the block; the two agree for files within one block and whenever pyarrow

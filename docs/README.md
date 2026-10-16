@@ -7,7 +7,7 @@ test or the CSV a claim comes from.
 | Read this | To learn |
 |---|---|
 | [../README.md](../README.md) | What ArrowMetal is, the pitch, headline numbers, quick start in Swift and Python |
-| [ARROW_FUNCTIONS.md](ARROW_FUNCTIONS.md) | Coverage of Apache Arrow compute by **exact name**: all 307 v25 function names, one row each, generated from a registry the test suite executes against `pyarrow.compute` |
+| [ARROW_FUNCTIONS.md](ARROW_FUNCTIONS.md) | Coverage of Apache Arrow compute by **exact name**: all 307 v25 function names and the 5 added in v26, one row each, generated from a registry the test suite executes against `pyarrow.compute` |
 | [COVERAGE.md](COVERAGE.md) | The same ground by **family**, with the Arrow type matrix and interop: which functions and types are supported, and how (GPU, GPU/CPU, CPU, partial) |
 | [EVALUATION.md](EVALUATION.md) | How correctness is checked: CPU oracles, the scenario matrix, bit-exact IEEE-754 tests, and the differential harness against pyarrow.compute, with open findings |
 | [UPSTREAM.md](UPSTREAM.md) | What the matrix and the bindings found in other projects (pyarrow, the Arrow tz database, Apple Metal, the Arrow JS, R and Go libraries, the Swift compiler), the test behind each finding, and where every upstream report stands |

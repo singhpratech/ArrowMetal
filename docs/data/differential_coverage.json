@@ -1,5 +1,5 @@
 {
-  "run": {"arrowmetal": "0.5.0", "pyarrow": "25.0.1", "device": "Apple M4 Max", "router": "gpu"},
+  "run": {"arrowmetal": "0.5.0", "pyarrow": "26.0.0", "device": "Apple M4 Max", "router": "gpu"},
   "fields": ["operation", "type", "cases", "pass", "documented", "unclassified", "skipped"],
   "cells": [
     ["abs", "float32", 27, 27, 0, 0, 0],
@@ -1537,7 +1537,7 @@
     ["weeks_between", "ts_us", 27, 27, 0, 0, 0],
     ["weeks_between", "ts_us_tz", 27, 11, 16, 0, 0],
     ["winsorize", "float32", 27, 25, 2, 0, 0],
-    ["winsorize", "float64", 27, 26, 1, 0, 0],
+    ["winsorize", "float64", 27, 27, 0, 0, 0],
     ["winsorize", "int16", 27, 27, 0, 0, 0],
     ["winsorize", "int32", 27, 27, 0, 0, 0],
     ["winsorize", "int64", 27, 27, 0, 0, 0],

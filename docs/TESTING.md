@@ -266,5 +266,5 @@ grids, the DataFusion grid and the binding suites run locally (section 5).
 ## 8. Hardware and toolchain of the published numbers
 
 Apple M4 Max (16 cores, 64 GB unified memory, internal SSD), macOS 26.6.2, Swift 6.3.3 (Xcode
-toolchain), Python 3.13, pyarrow 25.0.1, Polars 1.44.1 (and Polars 2.0.0 where a figure names it), DuckDB
-1.5.6, pandas 3.0.5.
+toolchain), Python 3.13, pyarrow 25.0.1 for the timings (the conformance matrix runs on pyarrow 26.0.0 since
+2026-10-15), Polars 1.44.1 (and Polars 2.0.0 where a figure names it), DuckDB 1.5.6, pandas 3.0.5.

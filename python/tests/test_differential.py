@@ -1286,10 +1286,11 @@ _unary_optional("bitwise_not", "bitwise_not", pc.bit_wise_not, INTEGER)
 #     output null exactly where the input is, which is Arrow's `skip_nulls=True`. Arrow's *default* is
 #     False -- the first null poisons the rest of the column. ArrowMetal has no such mode;
 #     test_cumulative_functions_skip_nulls_where_arrow_propagates_them pins the difference.
-#   * `start`. Arrow's default start for `cumulative_max` is `numeric_limits<T>::min()`, which on a
-#     float column is the smallest positive *normal*, so Arrow's default clamps every negative maximum
-#     to 1.18e-38 (and `cumulative_min` clamps +inf down to FLT_MAX). The neutral identity is passed
-#     explicitly instead; test_arrow_cumulative_max_default_start_clamps_negative_floats pins why.
+#   * `start`. pyarrow 25.0.1's default start for `cumulative_max` was `numeric_limits<T>::min()`, which on
+#     a float column is the smallest positive normal, so every negative running maximum came back clamped
+#     to 1.18e-38 (and `cumulative_min` clamped +inf down to FLT_MAX); 26.0.0 answers the running value.
+#     The neutral identity is still passed explicitly, the same answer on both;
+#     test_arrow_cumulative_max_default_start_takes_negative_floats_since_pyarrow_26 records the history.
 
 def _cumulative_oracle(fn, float_start=None):
     def oracle(src):
@@ -1551,17 +1552,18 @@ _register_optional("element_wise_min_max", NUMERIC, ["min_element_wise", "max_el
 
 
 def _modulo(src, shape):
-    """C remainder, built from the truncating division both engines already agree on. 0 and -1 are
-    kept out of the divisor for the same reason `arith_array` keeps them out."""
+    """C remainder against `pc.remainder` (truncated division, the sign of the dividend), an Arrow
+    function since 26.0.0; before it the oracle was built from `divide`, `multiply` and `subtract`.
+    0 and -1 are kept out of the divisor for the same reason `arith_array` keeps them out (Arrow's
+    `remainder` raises on a zero divisor; `x % 0` is 0 here)."""
     name = type_name_of(src)
     other = make_array(name, shape, seed=1)
     bad = pc.is_in(other, value_set=pa.array([0, -1] if name in SIGNED else [0], other.type))
     divisor = pc.if_else(bad, pa.scalar(1, other.type), other)
-    expected = pc.subtract(src, pc.multiply(pc.divide(src, divisor), divisor))
-    return arrow(am.array(src).modulo(am.array(divisor))), expected
+    return arrow(am.array(src).modulo(am.array(divisor))), pc.remainder(src, divisor)
 
 
-_register_optional("modulo", INTEGER, ["modulo"], _modulo)
+_register_optional("modulo", INTEGER, ["modulo"], _modulo, note="pc.remainder, the C `%`")
 
 
 def _power(src, shape):
@@ -2220,18 +2222,14 @@ def _string_trim(src, shape):
 
 
 @op("string_normalize", ["utf8"],
-    note=_no_oracle("string_normalize",
-                    "pyarrow 25.0.1's utf8_normalize ignores its `form` option and always decomposes, "
-                    "so the oracle is Python's own unicodedata "
-                    "(test_pyarrow_utf8_normalize_ignores_its_form_option pins the bug)"))
+    note="pc.utf8_normalize for NFC, NFKC, NFD and NFKD (pyarrow composes for NFC and NFKC since 26.0.0; "
+         "on 25.0.1 the oracle was Python's unicodedata)")
 def _string_normalize(src, shape):
-    import unicodedata
     x = am.array(src)
     got, expected = [], []
     for form in ("NFC", "NFKC", "NFD", "NFKD"):
         got.append(arrow(x.utf8_normalize(form)))
-        expected.append(pa.array([None if s is None else unicodedata.normalize(form, s)
-                                  for s in src.to_pylist()], pa.string()))
+        expected.append(pc.utf8_normalize(src, form=form))
     return got, expected
 
 
@@ -2989,26 +2987,13 @@ def _shift(src, shape):
     return got, expected
 
 
-def _materialised(src):
-    """The same values with the Arrow offset folded away.
-
-    `pc.pairwise_diff` reads the values buffer without honouring `ArrowArray.offset` in pyarrow 25.0.1,
-    so on a sliced column it answers with the wrong rows entirely; the oracle is given a copy while
-    ArrowMetal still gets the slice, which is what makes the case a test of the offset handling rather
-    than of pyarrow's bug (test_pyarrow_pairwise_diff_ignores_the_array_offset pins it)."""
-    if src.offset == 0:
-        return src
-    return pa.concat_arrays([src.slice(0, 0), src])
-
-
 @op("pairwise_diff", NUMERIC, note="pc.pairwise_diff, the unchecked form: it wraps as ArrowMetal's does")
 def _pairwise_diff(src, shape):
     x = am.array(src)
-    flat = _materialised(src)
     got, expected = [], []
     for period in (1, 2, 5):
         got.append(arrow(x.pairwise_diff(period)))
-        expected.append(pc.pairwise_diff(flat, period=period))
+        expected.append(pc.pairwise_diff(src, period=period))
     return got, expected
 
 
@@ -3524,14 +3509,11 @@ def _float_class(src, shape):
             [pc.is_nan(src), pc.is_inf(src), pc.is_finite(src)])
 
 
-@op("fill_null_direction", NUMERIC + ["bool"],
-    note="pc.fill_null_forward / _backward, on a materialised copy: pyarrow reads a *boolean* "
-         "column's values bitmap without its offset")
+@op("fill_null_direction", NUMERIC + ["bool"], note="pc.fill_null_forward / _backward")
 def _fill_null_direction(src, shape):
     x = am.array(src)
-    flat = _materialised(src)
     return ([arrow(x.fill_null_forward()), arrow(x.fill_null_backward())],
-            [pc.fill_null_forward(flat), pc.fill_null_backward(flat)])
+            [pc.fill_null_forward(src), pc.fill_null_backward(src)])
 
 
 @op("case_when", NUMERIC + ["bool"], note="pc.case_when over a struct of conditions")
@@ -3564,10 +3546,8 @@ def _replace_with_mask(src, shape):
     replacements = make_array(type_name_of(src), shape, seed=1).slice(0, needed)
     if len(replacements) < needed:
         raise Unsupported("not enough replacement values for this mask")
-    # As above: pyarrow's boolean replace_with_mask reads the values bitmap without the offset.
     return (arrow(am.array(src).replace_with_mask(am.array(mask), am.array(replacements))),
-            pc.replace_with_mask(_materialised(src), _materialised(mask),
-                                 _materialised(replacements)))
+            pc.replace_with_mask(src, mask, replacements))
 
 
 @op("indices_nonzero", NUMERIC + ["bool"], note="pc.indices_nonzero: -0.0 is zero, every NaN is not")
@@ -3878,14 +3858,13 @@ def _cumulative_checked(src, shape):
     for period in (1, 2, 5):
         # x[i] - x[i - period] can leave the type wherever the plain difference can.
         shifted = pc.if_else(pa.array(np.arange(len(src)) >= period, pa.bool_()),
-                             _materialised(src).take(pa.array(np.maximum(np.arange(len(src)) - period, 0),
-                                                              pa.int32())),
+                             src.take(pa.array(np.maximum(np.arange(len(src)) - period, 0), pa.int32())),
                              pa.scalar(0, src.type))
         bad = _checked_objects(src, shifted, "-", name)
         keep = pc.invert(pc.fill_null(bad, False))
         if pc.all(keep).as_py() is not False:
             got.append(arrow(am.array(src).pairwise_diff_checked(period)))
-            expected.append(pc.pairwise_diff_checked(_materialised(src), period=period))
+            expected.append(pc.pairwise_diff_checked(src, period=period))
     return got, expected
 
 
@@ -4171,14 +4150,11 @@ def _tdigest(src, shape):
 
 
 @op("winsorize", NUMERIC,
-    note="pc.winsorize on a materialised copy: the values below the lower quantile and above the "
-         "upper one are clamped to them, with Arrow's *nearest* (not interpolated) quantiles. "
-         "pyarrow 25.0.1 reads a sliced column's validity bitmap without its offset "
-         "(test_pyarrow_winsorize_ignores_the_array_offset pins that), so only the oracle is "
-         "materialised -- ArrowMetal still gets the slice")
+    note="pc.winsorize: the values below the lower quantile and above the upper one are clamped to "
+         "them, with Arrow's *nearest* (not interpolated) quantiles")
 def _winsorize(src, shape):
     x = am.array(src)
-    flat = _materialised(src)
+    flat = src
     got, expected = [], []
     for lower, upper in [(0.0, 1.0), (0.05, 0.95), (0.25, 0.75), (0.5, 0.5)]:
         got.append(arrow(x.winsorize(lower, upper)))
@@ -4684,8 +4660,8 @@ FINDINGS = [
             "holding a value at the top of a 32- or 64-bit type answers null where pyarrow answers "
             "in double",
             ["skew_kurtosis"], INTEGER, data_check=_reaches_the_integer_extremes),
-    # Listed before the ±0 finding so a float64 winsorize cell is attributed to the bug rather than
-    # to the sign of zero, which only decides the float32 cells.
+    # The sign of zero decides float32 cells only; on pyarrow 25.0.1 a float64 cell also failed here,
+    # which was pyarrow's offset bug (fixed in 26.0.0), not this finding.
     Finding("winsorize-negative-zero-limit",
             "the winsorize limits are picked out of the sorted values, where -0.0 and 0.0 are one tie "
             "group; ArrowMetal clamps to the -0.0 of that pair and Arrow to the 0.0",
@@ -5006,13 +4982,16 @@ def test_int_min_divided_by_minus_one_wraps_where_pyarrow_yields_zero():
     assert pc.divide(a, pa.scalar(-1, pa.int8())).to_pylist() == [0, -127, 0]
 
 
-def test_out_of_range_float_to_int_cast_diverges():
-    """Arrow saturates an out-of-range float -> int cast; the GPU wraps. Undefined in C either way."""
-    a = pa.array([1e20, -1.7, 2.9, math.nan], pa.float64())
+def test_out_of_range_float_to_int_cast_agrees_since_pyarrow_26():
+    """An out-of-range float -> int cast is undefined in C. pyarrow 25.0.1 saturated it and the GPU
+    wrapped, which this test pinned as a divergence; pyarrow 26.0.0 wraps the same way on every value
+    here. The matrix keeps the exclusion (`cast`, "out-of-range float->int excluded"), since neither
+    side promises the value."""
+    a = pa.array([1e20, -1.7, 2.9, math.nan, 3e9, -3e9, 2.0 ** 31, -2.0 ** 31 - 1], pa.float64())
     got = pylist(am.array(a).cast("int32"))
     expected = a.cast(pa.int32(), safe=False).to_pylist()
-    assert got[1:] == expected[1:] == [-1, 2, 0]
-    assert expected[0] == 2 ** 31 - 1 and got[0] != expected[0]
+    assert got == expected
+    assert got[1:4] == [-1, 2, 0]
 
 
 @pytest.mark.parametrize("ty", [pa.float32(), pa.float64()])
@@ -5118,12 +5097,13 @@ def test_cumulative_functions_skip_nulls_where_arrow_propagates_them():
         pc.cumulative_max(a, skip_nulls=True).to_pylist() == [1, 2, None, 4]
 
 
-def test_arrow_cumulative_max_default_start_clamps_negative_floats():
-    """Why the matrix passes `start` explicitly: Arrow's default start for `cumulative_max` is the
-    type's `numeric_limits::min()`, which on a float column is the smallest positive normal, so every
-    negative running maximum comes back clamped to 1.18e-38."""
+def test_arrow_cumulative_max_default_start_takes_negative_floats_since_pyarrow_26():
+    """Why the matrix passed `start` explicitly: pyarrow 25.0.1's default start for `cumulative_max`
+    was the type's `numeric_limits::min()`, on a float column the smallest positive normal, so every
+    negative running maximum came back clamped to 1.18e-38. 26.0.0 answers the running maximum; the
+    matrix still names the identity, which is the same answer either way."""
     a = pa.array([-1.0, -2.0], pa.float32())
-    assert pc.cumulative_max(a).to_pylist() == [float(np.finfo(np.float32).tiny)] * 2
+    assert pc.cumulative_max(a).to_pylist() == [-1.0, -1.0]
     assert pc.cumulative_max(a, start=pa.scalar(-math.inf, pa.float32())).to_pylist() == [-1.0, -1.0]
     assert pylist(am.array(a).cumulative_max()) == [-1.0, -1.0]
 
@@ -5564,16 +5544,6 @@ def test_split_whitespace_agrees_with_arrow_away_from_a_trailing_run():
     assert got.to_pylist() == pc.ascii_split_whitespace(a).to_pylist()
 
 
-def test_pyarrow_utf8_normalize_ignores_its_form_option():
-    """Not our divergence: pyarrow 25.0.1 decomposes whatever `form` says, so the matrix's oracle for
-    utf8_normalize is Python's unicodedata. ArrowMetal agrees with Python."""
-    import unicodedata
-    composed = "héllo"
-    a = pa.array([composed], pa.string())
-    assert pc.utf8_normalize(a, form="NFC").to_pylist() == ["héllo"]
-    assert unicodedata.normalize("NFC", composed) == composed
-    assert pylist(am.array(a).utf8_normalize("NFC")) == [composed]
-
 
 @pytest.mark.xfail(strict=True, reason="float-text-swift-format: Swift keeps the .0 and switches to "
                                        "scientific notation at a different magnitude")
@@ -5822,23 +5792,6 @@ def test_time_of_day_addition_wraps_where_pyarrow_raises():
         pc.add(a, delta)
 
 
-def test_pyarrow_pairwise_diff_ignores_the_array_offset():
-    """Not our divergence: pyarrow 25.0.1 reads the values buffer of a sliced column without honouring
-    ArrowArray.offset, so the matrix hands its oracle a materialised copy."""
-    full = pa.array([10, 20, 30, 40, 50, 7, 3, 99, 1, 60, 2, 5], pa.int32())
-    sliced = full.slice(5, 6)
-    copy = pa.array(sliced.to_pylist(), pa.int32())
-    assert pylist(am.array(sliced).pairwise_diff()) == pc.pairwise_diff(copy).to_pylist()
-    assert pc.pairwise_diff(sliced).to_pylist() != pc.pairwise_diff(copy).to_pylist()
-
-
-def test_pyarrow_boolean_fill_null_forward_ignores_the_array_offset():
-    """The same bug on a boolean column, for fill_null_forward / _backward and replace_with_mask."""
-    full = pa.array([True, False, None, True, True, False, None, True], pa.bool_())
-    sliced = full.slice(3, 5)
-    copy = pa.array(sliced.to_pylist(), pa.bool_())
-    assert pylist(am.array(sliced).fill_null_forward()) == pc.fill_null_forward(copy).to_pylist()
-    assert pc.fill_null_forward(sliced).to_pylist() != pc.fill_null_forward(copy).to_pylist()
 
 
 def test_hash64_is_deterministic_and_canonicalises_equal_values():
@@ -5990,18 +5943,6 @@ def test_unique_drops_the_null_row_of_a_string_column():
     numbers = pa.array([1, None, 1], pa.int32())
     assert pylist(am.array(numbers).unique()) == pc.unique(numbers).to_pylist() == [1, None]
 
-
-def test_pyarrow_winsorize_ignores_the_array_offset():
-    """Not our divergence: pyarrow 25.0.1 reads a sliced column's validity bitmap without honouring
-    ArrowArray.offset, so it answers with the wrong rows null. The matrix gives the oracle a
-    materialised copy and ArrowMetal the slice."""
-    flat = pa.array([1.0, 2.0, None, 4.0, None, 6.0, 7.0, 8.0], pa.float64())
-    sliced = flat.slice(2, 5)
-    assert pylist(am.array(sliced).winsorize(0.0, 1.0)) == sliced.to_pylist()
-    assert pc.winsorize(sliced, lower_limit=0.0, upper_limit=1.0).to_pylist() != sliced.to_pylist()
-    materialised = pa.concat_arrays([flat.slice(0, 0), sliced])
-    assert pc.winsorize(materialised, lower_limit=0.0, upper_limit=1.0).to_pylist() == \
-        sliced.to_pylist()
 
 
 def test_pyarrow_binary_slice_overflows_on_its_own_default_stop():
