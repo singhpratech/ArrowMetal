@@ -1,5 +1,5 @@
 {
- "as_of": "2026-10-16T01:17:27Z",
+ "as_of": "2026-10-16T09:56:25Z",
  "window_days": 14,
  "count": 15,
  "with_project_activity": 15,
@@ -968,7 +968,7 @@
    "reporter_comments": 3,
    "community_comments": 0,
    "last_activity": "2026-10-01T02:43:20Z",
-   "pulse": true
+   "pulse": false
   },
   {
    "project": "arrow R 25.0.0",
@@ -1051,7 +1051,7 @@
    "reporter_comments": 0,
    "community_comments": 0,
    "last_activity": "2026-10-01T02:43:20Z",
-   "pulse": true
+   "pulse": false
   },
   {
    "project": "Apache Arrow Go v18.7.0",
