@@ -1,5 +1,5 @@
 {
- "as_of": "2026-10-16T09:56:25Z",
+ "as_of": "2026-10-18T09:43:01Z",
  "window_days": 14,
  "count": 15,
  "with_project_activity": 15,
@@ -716,11 +716,22 @@
      "at": "2026-10-14T17:12:15Z",
      "actor": "Dricmoy",
      "url": "https://github.com/apache/arrow/commit/749b54206bb8476b247fe7ea81e22f81c2952f4d"
+    },
+    {
+     "type": "review",
+     "at": "2026-10-17T21:53:33Z",
+     "actor": "dmitry-chirkov-dremio",
+     "association": "contributor",
+     "state": "commented",
+     "text": "This fixes the default stop case, but the calculation can still overflow with valid values. Check start=INT64_MIN, stop=-1, and step=1 overflows at INT64_MAX + 1.",
+     "inline": 1,
+     "url": "https://github.com/apache/arrow/pull/52451#pullrequestreview-5560273587",
+     "pr": "https://github.com/apache/arrow/pull/52451"
     }
    ],
    "reporter_comments": 1,
    "community_comments": 1,
-   "last_activity": "2026-10-14T17:12:15Z",
+   "last_activity": "2026-10-17T21:53:33Z",
    "pulse": true
   },
   {
