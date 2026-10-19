@@ -1,5 +1,5 @@
 {
- "as_of": "2026-10-18T09:43:01Z",
+ "as_of": "2026-10-19T10:56:54Z",
  "window_days": 14,
  "count": 15,
  "with_project_activity": 15,
@@ -727,11 +727,17 @@
      "inline": 1,
      "url": "https://github.com/apache/arrow/pull/52451#pullrequestreview-5560273587",
      "pr": "https://github.com/apache/arrow/pull/52451"
+    },
+    {
+     "type": "commit",
+     "at": "2026-10-18T22:18:37Z",
+     "actor": "Dricmoy",
+     "url": "https://github.com/apache/arrow/commit/61c9a9ca5aeeead5c485b6f302a52ee40c629610"
     }
    ],
    "reporter_comments": 1,
    "community_comments": 1,
-   "last_activity": "2026-10-17T21:53:33Z",
+   "last_activity": "2026-10-18T22:18:37Z",
    "pulse": true
   },
   {
