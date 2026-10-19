@@ -1,5 +1,5 @@
 {
- "as_of": "2026-10-19T10:56:54Z",
+ "as_of": "2026-10-19T21:35:58Z",
  "window_days": 14,
  "count": 15,
  "with_project_activity": 15,
@@ -1346,15 +1346,67 @@
      "type": "pull_request",
      "at": "2026-10-14T17:06:43Z",
      "actor": "Asthenia0412",
-     "title": "compute: fix NewDatumWithoutOwning ownership semantics",
+     "title": "fix(arrow/compute)!: fix NewDatumWithoutOwning ownership semantics",
      "url": "https://github.com/apache/arrow-go/pull/1377",
      "state": "open",
      "by_reporter": false
+    },
+    {
+     "type": "review",
+     "at": "2026-10-19T15:04:00Z",
+     "actor": "zeroshade",
+     "association": "member",
+     "state": "changes_requested",
+     "text": "Thanks for picking up #1298. The `borrowed` flag does fix the reported case: with a checked allocator, `NewDatumWithoutOwning(arr).Release()` now leaves the caller's 128 bytes alone. Before this can land, two compatibility questions need answers, and the fix needs a test. **Trans…",
+     "inline": 4,
+     "url": "https://github.com/apache/arrow-go/pull/1377#pullrequestreview-5573567459",
+     "pr": "https://github.com/apache/arrow-go/pull/1377"
+    },
+    {
+     "type": "commit",
+     "at": "2026-10-19T16:54:51Z",
+     "actor": "Asthenia0412",
+     "url": "https://github.com/apache/arrow-go/commit/1df09efd716c2376febf133fe1d097b77b768452"
+    },
+    {
+     "type": "commit",
+     "at": "2026-10-19T16:54:51Z",
+     "actor": "Asthenia0412",
+     "url": "https://github.com/apache/arrow-go/commit/031260e9390f85cb0a6727979630b747b38b39e9"
+    },
+    {
+     "type": "pr_comment",
+     "at": "2026-10-19T16:57:03Z",
+     "actor": "Asthenia0412",
+     "association": "contributor",
+     "text": "test comment",
+     "url": "https://github.com/apache/arrow-go/pull/1377#issuecomment-6272568636",
+     "pr": "https://github.com/apache/arrow-go/pull/1377"
+    },
+    {
+     "type": "pr_comment",
+     "at": "2026-10-19T16:57:27Z",
+     "actor": "Asthenia0412",
+     "association": "contributor",
+     "text": "@zeroshade thanks again for the thorough review — pushed an update that addresses every actionable point: - **Breaking-change surface (datum.go:147, datum.go:307)**: PR title updated to `fix(arrow/compute)!:` and the godoc for `NewDatumWithoutOwning` now calls out the transfer-pa…",
+     "url": "https://github.com/apache/arrow-go/pull/1377#issuecomment-6272575915",
+     "pr": "https://github.com/apache/arrow-go/pull/1377"
+    },
+    {
+     "type": "review",
+     "at": "2026-10-19T20:43:41Z",
+     "actor": "zeroshade",
+     "association": "member",
+     "state": "commented",
+     "text": "Thanks for working through the last round so thoroughly. I need to correct my earlier review: on a closer look, this is **not** a breaking change, so please drop the `!` from the title and the \"Behaviour change (breaking)\" paragraph I asked for. Sorry for the churn. - **The new `…",
+     "inline": 4,
+     "url": "https://github.com/apache/arrow-go/pull/1377#pullrequestreview-5577520216",
+     "pr": "https://github.com/apache/arrow-go/pull/1377"
     }
    ],
    "reporter_comments": 0,
    "community_comments": 1,
-   "last_activity": "2026-10-14T17:06:43Z",
+   "last_activity": "2026-10-19T20:43:41Z",
    "pulse": true
   },
   {
