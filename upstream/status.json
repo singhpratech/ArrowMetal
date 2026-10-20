@@ -1,5 +1,5 @@
 {
- "as_of": "2026-10-20T10:11:17Z",
+ "as_of": "2026-10-20T20:42:15Z",
  "window_days": 14,
  "count": 15,
  "with_project_activity": 15,
@@ -1402,11 +1402,40 @@
      "inline": 4,
      "url": "https://github.com/apache/arrow-go/pull/1377#pullrequestreview-5577520216",
      "pr": "https://github.com/apache/arrow-go/pull/1377"
+    },
+    {
+     "type": "pr_comment",
+     "at": "2026-10-20T16:44:57Z",
+     "actor": "Asthenia0412",
+     "association": "contributor",
+     "text": "@zeroshade — thanks again for the second pass. Quick recap of what's addressed and confirmed: **1. `!` in title/body — NOT a breaking change** ✅ Title is `fix(arrow/compute): fix NewDatumWithoutOwning ownership semantics` (no `!`). The godoc uses a neutral note: \"Release on a Dat…",
+     "url": "https://github.com/apache/arrow-go/pull/1377#issuecomment-6296137846",
+     "pr": "https://github.com/apache/arrow-go/pull/1377"
+    },
+    {
+     "type": "pr_comment",
+     "at": "2026-10-20T17:03:48Z",
+     "actor": "zeroshade",
+     "association": "member",
+     "text": "Looks good in general, just needs the lint issue fixed.",
+     "url": "https://github.com/apache/arrow-go/pull/1377#issuecomment-6296512804",
+     "pr": "https://github.com/apache/arrow-go/pull/1377"
+    },
+    {
+     "type": "review",
+     "at": "2026-10-20T18:07:12Z",
+     "actor": "zeroshade",
+     "association": "member",
+     "state": "commented",
+     "text": "Thanks, this addresses everything. The regression test now fails for every Datum kind when its `borrowed` check is disabled, and `TestNewDatumOwns` catches a missing `Retain`. Two small things: - `arrow/compute/datum_test.go` isn't gofmt-clean (the numbered list at L37-40 needs `…",
+     "inline": 2,
+     "url": "https://github.com/apache/arrow-go/pull/1377#pullrequestreview-5589467136",
+     "pr": "https://github.com/apache/arrow-go/pull/1377"
     }
    ],
    "reporter_comments": 0,
    "community_comments": 1,
-   "last_activity": "2026-10-19T20:43:41Z",
+   "last_activity": "2026-10-20T18:07:12Z",
    "pulse": true
   },
   {
