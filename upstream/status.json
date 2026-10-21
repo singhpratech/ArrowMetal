@@ -1,5 +1,5 @@
 {
- "as_of": "2026-10-20T20:42:15Z",
+ "as_of": "2026-10-21T10:18:57Z",
  "window_days": 14,
  "count": 15,
  "with_project_activity": 15,
@@ -680,6 +680,14 @@
    "reactions": 0,
    "maintainer_events": [
     {
+     "type": "comment",
+     "at": "2026-09-16T22:58:25Z",
+     "actor": "Dricmoy",
+     "association": "contributor",
+     "text": "take",
+     "url": "https://github.com/apache/arrow/issues/51222#issuecomment-5705733308"
+    },
+    {
      "type": "pull_request",
      "at": "2026-10-08T23:51:33Z",
      "actor": "Dricmoy",
@@ -733,11 +741,22 @@
      "at": "2026-10-18T22:18:37Z",
      "actor": "Dricmoy",
      "url": "https://github.com/apache/arrow/commit/61c9a9ca5aeeead5c485b6f302a52ee40c629610"
+    },
+    {
+     "type": "review",
+     "at": "2026-10-21T07:26:30Z",
+     "actor": "dmitry-chirkov-dremio",
+     "association": "contributor",
+     "state": "changes_requested",
+     "text": "Check: input \"abc\", start=1, the default stop, and step=INT64_MAX The code around here is short, but the arithmetic is fragile. See if you can separate out boundary checks although this might as well be \"one last boundary to enforce\"...",
+     "inline": 1,
+     "url": "https://github.com/apache/arrow/pull/52451#pullrequestreview-5596277531",
+     "pr": "https://github.com/apache/arrow/pull/52451"
     }
    ],
    "reporter_comments": 1,
-   "community_comments": 1,
-   "last_activity": "2026-10-18T22:18:37Z",
+   "community_comments": 0,
+   "last_activity": "2026-10-21T07:26:30Z",
    "pulse": true
   },
   {
