@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Sorts and group-bys compile on M1 GPUs.** The GPU compiler on an M1 Max (macOS 27.2) aborts on a `ulong` joined
+  with shifts from two `threadgroup atomic_uint` loads, which `radix_histogram`, `gb_accumulate_priv` and `am_gb_priv`
+  did, so every sort of 64-bit keys (Int64, Double, temporal, utf8, binary) and those group-bys failed to create their
+  pipelines there. The three join with `as_type<ulong>(uint2(lo, hi))` instead (#1).
 - The differential matrix and the Python test suites run on pyarrow 26.0.0 (CI pin, venv). Four pyarrow
   bugs the matrix worked around on 25.0.1 are fixed in 26.0.0 (`utf8_normalize` composing for NFC and
   NFKC, by our apache/arrow#51237; `pairwise_diff`, the boolean fill-null kernels and `winsorize` on a
