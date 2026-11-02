@@ -60,12 +60,12 @@ enum SortSource {
         for (uint d = lid; d < RADIX; d += TG)
             atomic_store_explicit(&counts[d * blocks + tgid], atomic_load_explicit(&hist[d], memory_order_relaxed), memory_order_relaxed);
         if (lid == 0) {
-            ulong ov = (ulong)atomic_load_explicit(&orLo, memory_order_relaxed);
-            ulong av = (ulong)atomic_load_explicit(&andLo, memory_order_relaxed);
-            if (sizeof(\(K)) > 4) {
-                ov |= (ulong)atomic_load_explicit(&orHi, memory_order_relaxed) << 32;
-                av |= (ulong)atomic_load_explicit(&andHi, memory_order_relaxed) << 32;
-            }
+            // Joined with as_type, not shifts: the M1's GPU compiler aborts on (ulong)lo | (ulong)hi << 32
+            // of two threadgroup atomics.
+            ulong ov = as_type<ulong>(uint2(atomic_load_explicit(&orLo, memory_order_relaxed),
+                                            sizeof(\(K)) > 4 ? atomic_load_explicit(&orHi, memory_order_relaxed) : 0u));
+            ulong av = as_type<ulong>(uint2(atomic_load_explicit(&andLo, memory_order_relaxed),
+                                            sizeof(\(K)) > 4 ? atomic_load_explicit(&andHi, memory_order_relaxed) : 0u));
             // An empty block must not claim every bit is constant, so it reports "nothing set" for the
             // OR and "nothing clear" for the AND, which is what the identities above already give.
             spanOr[tgid] = (\(K))ov; spanAnd[tgid] = (\(K))av;

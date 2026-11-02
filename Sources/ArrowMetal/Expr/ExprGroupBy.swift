@@ -212,7 +212,7 @@ extension ExprCompiler {
             src += "    for (uint s = lid; s < slots; s += TG) {\n"
             src += "        uint l = atomic_load_explicit(&tlo[s], memory_order_relaxed);\n"
             src += "        uint h = atomic_load_explicit(&thi[s], memory_order_relaxed);\n"
-            src += "        partials[tgid * slots + s] = ((ulong)h << 32) | (ulong)l;\n"
+            src += "        partials[tgid * slots + s] = as_type<ulong>(uint2(l, h));\n"
             src += "        pcounts[tgid * slots + s] = atomic_load_explicit(&tcnt[s], memory_order_relaxed);\n    }\n}\n"
 
             src += "\nkernel void am_gb_dev(" + devParams.joined(separator: ", ")

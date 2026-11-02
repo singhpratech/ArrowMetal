@@ -169,7 +169,7 @@ enum GroupBySource {
             for (uint k = lid; k < K; k += TG) {
                 uint l = atomic_load_explicit(&lo[k], memory_order_relaxed);
                 uint h = atomic_load_explicit(&hi[k], memory_order_relaxed);
-                partials[tgid * K + k] = ((ulong)h << 32) | (ulong)l;
+                partials[tgid * K + k] = as_type<ulong>(uint2(l, h));
                 pcounts[tgid * K + k] = atomic_load_explicit(&cnt[k], memory_order_relaxed);
             }
             """ : "")
