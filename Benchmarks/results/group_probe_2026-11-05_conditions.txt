@@ -1,0 +1,4 @@
+Run conditions of group_probe_2026-11-05.csv (Apple M4 Max, macOS, Polars 1.44.1, python/arrowmetal from the
+working tree: 1f21115 plus the probe change of this file's date). Run on AC power directly after the
+group_skew runs of the same evening in one sequence (the one-minute load at the start was that run's
+load_end=14.36); started 22:02:08, finished 22:04:16, 2026-11-05. No sleep between the start and the end.

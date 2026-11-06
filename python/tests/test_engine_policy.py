@@ -539,11 +539,12 @@ def test_an_estimate_range_is_taken_only_where_every_count_in_it_is(each_table):
 
 
 def test_the_probe_samples_until_the_decision_is_settled():
-    """In the engine the probe stops at the first sample whose range settles the decision: 512 rows
-    for 200 and 10,000 groups at 2,000,000 rows, more for 100,000; the same frame gets the same
-    estimate and decision on every collect, cached or not."""
+    """In the engine the probe stops at the first sample whose range settles the decision and is
+    confirmed by the sample before it: 2,048 rows for 200 and 10,000 groups at 2,000,000 rows (512
+    and its confirmation), more for 100,000; the same frame gets the same estimate and decision on
+    every collect, cached or not."""
     rows = 2_000_000
-    for groups, most in ((200, 512), (10_000, 512), (100_000, 8_192), (1_000_000, 65_536)):
+    for groups, most in ((200, 2_048), (10_000, 2_048), (100_000, 8_192), (1_000_000, 65_536)):
         df = _grid_frame(rows, groups)
         lf = df.lazy().group_by("k1", "k2").agg(pl.col("q").sum())
         # The decision the true group count gets, which the estimate's must equal.
@@ -565,6 +566,77 @@ def test_the_probe_samples_until_the_decision_is_settled():
             assert bool(rep.taken) == want, (groups, true, g[0], rep)
             seen.add((g[0]["estimate"], g[0]["how"], bool(rep.taken)))
         assert len(seen) <= 1, seen
+
+
+def test_the_estimator_samples_without_replacement():
+    """Chao and Lin's Chao1 for sampling without replacement: with no pairs in the sample each
+    singleton stands for (N - n) / n groups (100 singletons in a 1,000-row sample of 1,000,000 rows:
+    100 + 100 x 999 = 100,000 groups, where the classic form gives 100 + 100 x 99 / 2 = 5,050); with
+    a small sampling fraction and pairs seen it is the classic form."""
+    est, lo, hi = pe._chao1(100, 100, 0, 1_000, 1_000_000)
+    assert abs(est - 100_000) < 1 and lo < est < hi
+    est, _lo, _hi = pe._chao1(500, 300, 100, 1_000, 1_000_000_000)
+    assert abs(est / (500 + 300 * 300 / (2 * 100 * 1_000 / 999)) - 1) < 1e-3
+    assert pe._chao1(37, 0, 5, 512, 10_000) == (37, 37, 37)
+    assert pe._coverage_high(200, 20, 2_048, 10_000_000) > 20 * 10_000_000 / 2_048
+
+
+def _skewed_frames(rows, seed=3):
+    rng = np.random.default_rng(seed)
+    heavy = rng.integers(0, 200, rows)
+    tail = rng.random(rows) < 0.01
+    yield "200 frequent keys + 1% unique rows", np.where(tail, 10_000_000 + np.arange(rows), heavy)
+    for a in (1.1, 1.6):
+        yield f"zipf a={a}", rng.zipf(a, rows)
+
+
+def test_skewed_keys_never_take_the_gpu_where_the_true_count_does_not(each_table):
+    """Keys with a long tail fooled the classic probe at its first sample: a narrow range far below
+    the true count (200 frequent keys and 1% unique rows at 10,000,000 rows: 224 estimated, 99,673
+    true), which settled at once. Now a sample's range must meet the next one's, and a range still
+    unconfirmed at the largest sample reaches the Good-Turing bound, so a skewed frame never takes
+    the GPU where the true group count would not, and the long tail's range holds the true count."""
+    rows = 10_000_000
+    for name, k in _skewed_frames(rows):
+        df = pl.DataFrame({"k": k.astype(np.int64)})
+        true = df["k"].n_unique()
+        for f in ("sum", "minmax", "mean", "count"):
+            cls, dt = f"group_by:{f}", [pl.Int64, pl.Int64]
+            settled = policy.settled_for([cls], policy.dtype_class(dt), "memory", rows, ROUTER)
+            pe.clear_group_estimates()
+            est, how, _c, lo, hi, conc = pe._frame_groups(df, ["k"], settled)
+            got = policy.decide([cls], dt, rows, router=ROUTER, groups=(est, how, lo, hi, conc)).take
+            want = policy.decide([cls], dt, rows, router=ROUTER, groups=true).take
+            assert want or not got, (name, cls, true, est, how)
+            if name.startswith("200"):
+                assert lo <= true <= hi, (name, cls, true, how)
+
+
+def test_rows_concentrated_on_a_few_keys_are_left_to_polars():
+    """A few frequent keys with a long tail of rare ones, and Zipf-like keys, are flagged as
+    concentrated (the estimate at least 30 times the effective number of keys) and left to Polars
+    whatever their count, with the reason in the decision; log-normal group sizes, where the GPU
+    group-by measured ahead, are not flagged."""
+    rows = 4_000_000
+    rng = np.random.default_rng(7)
+    tail = rng.random(rows) < 0.01
+    frames = {
+        "200 frequent keys + 1% unique rows": (np.where(tail, 10_000_000 + np.arange(rows),
+                                                        rng.integers(0, 200, rows)), True),
+        "zipf a=1.6": (rng.zipf(1.6, rows), True),
+    }
+    w = rng.lognormal(0.0, 1.0, 100_000)
+    frames["100,000 keys, log-normal sizes s=1.0"] = (rng.choice(100_000, rows, p=w / w.sum()), False)
+    for name, (k, want) in frames.items():
+        df = pl.DataFrame({"k": k.astype(np.int64)})
+        pe.clear_group_estimates()
+        est, how, _c, lo, hi, conc = pe._frame_groups(df, ["k"], lambda a, b: False)
+        assert conc == want, (name, est, how)
+        if want:
+            # At 50,000,000 rows, above every crossover the class has.
+            d = policy.decide(["group_by:sum"], [pl.Int64, pl.Int64], 50_000_000, router=ROUTER,
+                              groups=(est, how, lo, hi, conc))
+            assert not d.take and "concentrated on a few of the keys" in d.reason, d
 
 
 def _probe_decisions(seed=5):

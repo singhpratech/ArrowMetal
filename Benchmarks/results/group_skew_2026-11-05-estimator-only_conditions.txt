@@ -1,0 +1,3 @@
+Run conditions of group_skew_2026-11-05-estimator-only.csv (Apple M4 Max; the estimator changes without the concentration rule: Chao and Lin, the confirming sample, and a mixed-frequency test that widened the range, since removed; one-minute load average at the start and end; power source at the start and end; python/arrowmetal from the working tree (1f21115 plus the probe change)).
+rc=0 start=00:36:13 secs=154 load_start=10.73 load_end=6.27 power_start=['AC Power'] power_end=['AC Power']
+last_sleep=[2026-11-03 23:40:59 -0500 Sleep               	Entering Sleep state due to 'Maintenance Sleep':TCPKeepAlive=active Using]

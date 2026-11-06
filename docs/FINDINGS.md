@@ -2,6 +2,55 @@
 
 Things learned the hard way. Add to this whenever something surprises you.
 
+## Round 23 (2026-11-05): the group-count probe on keys that are not evenly frequent
+
+**What.** A reader asked whether the probe's Chao1 estimator, on heavily skewed keys, would
+overestimate the group count and send a group-by to the GPU that the CPU would run faster. Measured,
+it fails the other way. Chao1 is a lower bound: with a few frequent keys and a long tail of rare ones,
+a 512-row sample sees the frequent keys twice and more and the tail barely at all, so the range is
+narrow and far below the true count, and it settled at once. 200 frequent keys with 1% of the rows
+unique, 10,000,000 rows: 100,328 groups, estimated at 216 (210 to 226). Every crossover table was fitted
+on keys of even frequencies, so the question was also whether the GPU's timings hold on such keys.
+
+- **On skewed keys the GPU group-by is slower whatever the count.** `Benchmarks/group_skew_bench.py`
+  (one int64 key; sum, min + max, mean, count; 10,000,000 and 50,000,000 rows; Zipf a = 1.1 to 2.0 and
+  frequent-keys-plus-tail mixtures, 72 cases): the GPU runs at 0.23x to 0.96x of the faster Polars
+  engine in 69 of 72 on Polars 1.44.1 (`group_skew_2026-11-05.csv`). Polars' streaming engine is 2.2
+  to 20.5 times faster than its in-memory engine on these keys (median 5.3): its hash table stays in
+  cache on the frequent keys, and the GPU kernel gains nothing from the skew. On log-normal group sizes
+  (10,000 to 1,000,000 keys, sigma 0.5 to 1.5; `group_skew_mild_2026-11-05.csv`) the GPU is ahead in all
+  72, 1.49x to 5.36x.
+- **A better estimate alone made the routing worse.** Chao1 for sampling without replacement (Chao
+  and Lin 2012), a confirming second sample and a range widened to the Good-Turing bound where the
+  counts show mixed frequencies brought the estimate's range to the true count, and the uniform-key
+  table then sent skewed keys to the GPU: the default was right in 30 of 72 skewed cases
+  (`group_skew_2026-11-05-estimator-only.csv`), against 59 for 0.5.0's underestimates, which had kept
+  most of them below the crossovers by accident. The mixed-frequency test also fired on log-normal
+  sizes, where it left GPU wins on the CPU; it was removed.
+- **What separates the two families is concentration, not the count.** The effective number of
+  keys, n (n - 1) / Σ c (c - 1) over a sample's counts, is about the group count on even keys and
+  exp(sigma^2) times below it on log-normal sizes. The estimate over it is at most 9.5 on the
+  log-normal frames at every sample with 50 pairs or more, and passes 30 on every skewed frame by the
+  512-, 2,048- or 8,192-row sample, at 38 or more (`Benchmarks/group_skew_probe_stats.py`,
+  `group_skew_probe_stats_2026-11-05.jsonl`). The probe flags a sample whose estimate is at least 30
+  times its effective number of keys (with at least 50 pairs of sampled rows sharing a key), and the
+  policy leaves that group-by to the CPU engine.
+- **Confirmation needs slack.** A small sample's range can be a little narrow: 200 even keys all seen
+  in 512 rows give 191.5 to 199.4, the next sample exactly 200. A range confirms the one before when
+  it starts at most 1.25 times above that one's high end and ends at or above the keys it saw.
+
+**Result.** Polars 1.44.1: the default is right in 68 of 72 skewed cases (0.5.0: 59) and 72 of 72
+log-normal ones (0.5.0: 65), and runs the GPU where it is slower in none (0.5.0: 13, 0.42x to 0.93x).
+Polars 2.0.0: 59 and 52 right (0.5.0: 60 and 51), no slower GPU run (0.5.0: 5); 13 skewed cases where
+the GPU was 1.02x to 1.41x faster stay on the CPU (8 found concentrated, 5 left by the 2.0.0 table at
+their true count). On uniform keys every decision of the probe benchmark is 0.5.0's, at 71 to 720 µs
+a probe, 0.15% to 1.58% of the group-by (`group_probe_2026-11-05.csv`); the confirming sample adds up
+to 262 µs. DataFusion (`datafusion/results/datafusion_gskew_2026-11-05-*.csv`) took none of the 144
+cases onto the GPU with either probe, and now names the concentration in 9 of its hand-backs. Two
+things the runs show and this round does not change: a plan the Polars default leaves runs on Polars'
+in-memory engine, a median 4.5 to 5.3 times slower than the streaming engine on skewed keys; and
+DataFusion's table leaves 61 log-normal cases where the GPU was faster, up to 7.54x.
+
 ## Round 22 (2026-10-15): the matrix moves to pyarrow 26.0.0
 
 **What.** Apache Arrow 26.0.0 shipped on 2026-10-09 with four of the pyarrow bugs the differential

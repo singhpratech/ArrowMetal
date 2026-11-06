@@ -13,6 +13,17 @@
   carries 26.0.0's five new function names: `remainder` runs on the GPU as `modulo()` has always computed
   it (the C `%`), `remainder_checked`, the floored `modulo` / `modulo_checked` and `search_sorted` are
   recorded as missing.
+- The group-count probe of the Polars engine and of `datafusion-arrowmetal` estimates with Chao1 for
+  sampling without replacement (Chao and Lin 2012) and takes an estimate only when the sample before
+  it confirms it; a range still unconfirmed at the largest sample reaches the Good-Turing bound. A
+  group-by whose rows are concentrated on a few of its keys (the estimate at least 30 times the
+  effective number of keys) is left to the CPU engine whatever its count: on such keys the GPU
+  group-by measured slower than Polars in 69 of 72 cases (`Benchmarks/results/group_skew_2026-11-05.csv`).
+  On Polars 1.44.1 the default picks the faster engine in 68 of 72 skewed cases (was 59) and 72 of 72
+  with log-normal group sizes (was 65), and no longer runs the GPU where it is slower (was 13 cases,
+  0.42x to 0.93x); on 2.0.0, 0 such runs (was 5). Uniform keys get the same decisions, at 71 to 720 µs
+  a probe. `Benchmarks/group_skew_bench.py` and the `gskew` family of `datafusion/examples/bench.rs`
+  time it (docs/FINDINGS.md, Round 23).
 
 ## 0.5.0 — 2026-10-08
 

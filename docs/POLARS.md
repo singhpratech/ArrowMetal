@@ -880,15 +880,60 @@ rows, (g1minmax1k) 1.06x, 1.27x and 1.64x.
 frame's count is an upper bound), the engine estimates the number of distinct key tuples in that
 frame at plan time. It reads the keys of a stratified sample of n of the frame's N rows, row
 i·(N / n) + h(i) with h a fixed-seed hash, so the same frame always gets the same sample; counts the
-distinct tuples d and those seen exactly once (f1) and twice (f2); and scales them with the
-bias-corrected Chao1 estimator (Chao, Biometrics 2005), D = d + f1 (f1 - 1) / (2 (f2 + 1)), clipped
-to [d, N]. Its range is D with f2 moved by two Poisson standard deviations (and one or two more)
-either way, the high end being the whole frame while fewer than about 6 pairs have been seen. The
-samples are 512, 2,048, 8,192 and so on, at most 65,536 rows and a quarter of the frame, and the
-probe stops at the first whose range the decision does not depend on: every bucket the range reaches
-is taken at these rows, or none is. So a few hundred groups or ten thousand settle on 512 rows, a
-hundred thousand on 2,048, and a count near a quarter of the rows takes more. A frame of at most
-4,096 rows is counted exactly. One integer key is read as it is; several keys, and a String, Boolean
+distinct tuples d and those seen exactly once (f1), twice (f2) and three times (f3); and scales them
+with Chao1 for sampling without replacement (Chao and Lin, Biometrics 2012),
+D = d + f1² / (2 f2 n / (n - 1) + f1 q / (1 - q)) with q = n / N, clipped to [d, N]: with q small it
+is the classic Chao1, and with no pairs it is f1 (1 - q) / q, each singleton standing for the rows of
+its stratum the sample did not read. Its range is D with f2 moved by two Poisson standard deviations
+(and one or two more) either way. The samples are 512, 2,048, 8,192 and so on, at most 65,536 rows and
+a quarter of the frame, and the probe stops at the first whose range the decision does not depend on
+(every bucket the range reaches is taken at these rows, or none is) and that the sample before it
+confirms: the range starts at most 1.25 times above that sample's high end and ends at or above the
+keys it saw. A frame of at most 4,096 rows is counted exactly.
+
+Keys that are not evenly frequent are where the classic estimator failed. With a few frequent keys
+and a long tail of rare ones, a small sample sees the frequent keys twice and more and the tail
+barely at all, so its range is narrow and far below the true count: 200 frequent keys and 1% unique
+rows at 10,000,000 rows hold 100,328 groups, and the classic probe's 512-row sample put them at 210
+to 226 (`default_how` of ArrowMetal 0.5.0 in `Benchmarks/results/group_skew_2026-11-05.csv`). Two checks keep that from deciding:
+
+- **Confirmation.** The narrow range of the first sample is not taken on its own; the next sample, which
+  sees more of the tail, does not confirm it. A range still unconfirmed at the largest sample gets the
+  Good-Turing bound d + f1 (1 - q) / q as its high end.
+- **Concentration.** The effective number of keys, n (n - 1) / Σ c (c - 1) over the sample's counts c,
+  is the number of equally frequent keys that would make two sampled rows share a key as often as they
+  do. When the estimate is at least 30 times that (with at least 50 pairs of sampled rows sharing a
+  key), the rows are concentrated on a few of the keys, and the policy leaves the group-by to Polars
+  whatever its count. On such keys Polars' hash table stays in cache, and the GPU group-by measured
+  slower than Polars at group counts where it is ahead on evenly frequent keys (the timings below).
+
+**Keys that are not evenly frequent, timed.** `Benchmarks/group_skew_bench.py` runs a group-by over one
+int64 key (sum, min + max, mean, count of an int64 column) through both Polars engines, through
+`MetalEngine(shapes="all", min_rows=0)` (the GPU's time) and through the default, best of 5, at
+10,000,000 and 50,000,000 rows: 72 cases on skewed keys (Zipf, a = 1.1 to 2.0; 200 frequent keys
+with 1%, 5% or 20% of the rows unique, or 5% of the rows in keys of 3 or of 100 rows), and 72 on
+10,000, 100,000 or 1,000,000 keys whose sizes are log-normal (sigma 0.5, 1.0, 1.5). A case counts as
+right when the default ran on the GPU exactly where the GPU was faster than the faster Polars engine.
+
+| keys | Polars | GPU faster | default right, 0.5.0 | default right | GPU runs slower than Polars, 0.5.0 | now |
+|---|---|---:|---:|---:|---:|---:|
+| skewed | 1.44.1 | 3 to 4 of 72 | 59 | 68 | 13 (0.42x to 0.93x) | 0 |
+| skewed | 2.0.0 | 12 to 13 of 72 | 60 | 59 | 5 (0.45x to 0.72x) | 0 |
+| log-normal sizes | 1.44.1 | 72 of 72 | 65 | 72 | 0 | 0 |
+| log-normal sizes | 2.0.0 | 72 of 72 | 51 | 52 | 0 | 0 |
+
+`Benchmarks/results/group_skew_2026-11-05.csv` and `group_skew_mild_2026-11-05.csv` are ArrowMetal
+0.5.0, the files with `-fixed` the probe as described here, and those with `-polars2` Polars 2.0.0;
+each has its conditions file. In `group_skew_2026-11-05.csv` (Polars 1.44.1) the GPU group-by runs at
+0.23x to 0.96x of the faster Polars engine in 69 of the 72 skewed cases; the other three are Zipf
+a = 1.1 at 50,000,000 rows, 1.07x to 1.25x on min + max, mean and count. Polars' streaming engine is
+2.2 to 20.5 times faster than its in-memory engine on these keys (median 5.3), and the GPU kernel
+gains nothing from the skew. On 2.0.0 the
+default leaves 13 skewed cases where the GPU was 1.02x to 1.41x faster (8 found concentrated, 5 left
+by the table at their true count) and 20 log-normal ones, 15 of them left by the 2.0.0 table at the
+true count and 5 estimated in a lower bucket. `group_skew_2026-11-05-estimator-only.csv` records the
+estimator changes without the concentration rule: with the range now reaching the true count, the
+uniform-key crossovers sent skewed keys to the GPU, and the default was right in 30 of 72. One integer key is read as it is; several keys, and a String, Boolean
 or temporal key or one holding nulls, through Polars' hash. The samples' counts are cached per frame,
 key columns and sample size, keyed by the columns' buffers (the cache keeps those columns alive, so no
 other frame can take their addresses while it stands), so collecting the same frame again samples
@@ -905,19 +950,27 @@ class is judged by its row in the class table: `group_by_multi:minmax` from 11,6
 **What the probe costs, and how close it gets.** `Benchmarks/group_probe_bench.py` collects a
 group-by sum over the grid's frames (one int32 key, two, and one String key, at each group count)
 through `MetalEngine()` nine times with its caches cleared and reads the probe's time from the
-report: `Benchmarks/results/group_probe_2026-09-26.csv`, run conditions in
-`Benchmarks/results/group_probe_2026-09-26_conditions.txt`. Against the fastest of Polars' two engines
-and the default for the same group-by:
+report: `Benchmarks/results/group_probe_2026-11-05.csv`, run conditions in
+`Benchmarks/results/group_probe_2026-11-05_conditions.txt` (the probe as described above; the run of
+`Benchmarks/results/group_probe_2026-09-26.csv` is the probe of ArrowMetal 0.5.0, without the
+confirming sample and the concentration rule). Against the fastest of Polars' two engines and the
+default for the same group-by, at 50,000,000 rows (at 2,000,000 the table in force takes no bucket
+of a group-by sum, so nothing is probed):
 
-| rows | groups | probe (median of 9) | share of the group-by |
-|---|---|---:|---:|
-| 50,000,000 | 200 to 100,000 | 66 to 199 µs | 0.30% to 0.77% |
-| 50,000,000 | 1,000,000 | 279 µs (one key), 461 µs (two) | 0.84%, 1.19% |
-| 50,000,000 | half the rows | 255 µs (one key), 458 µs (two) | 0.12%, 0.10% |
-| 2,000,000 | 200 to 100,000, two keys | 50 to 123 µs | 1.09% to 3.17% |
-| 2,000,000 | a quarter of the rows or more, two keys | 366 and 393 µs | 4.70%, 4.90% |
+| groups | probe (median of 9) | share of the group-by | 0.5.0's probe |
+|---|---:|---:|---:|
+| 200 to 100,000 | 71 to 230 µs | 0.32% to 0.89% | 66 to 199 µs |
+| 1,000,000 | 279 µs (one key), 505 µs (two) | 0.95%, 1.58% | 279, 461 µs |
+| half the rows | 375 µs (one key), 720 µs (two) | 0.17%, 0.15% | 255, 458 µs |
 
-That file was measured under the earlier group-count table. Under the table in force, a
+Every one of these probes stops at the 2,048-row sample (a few hundred groups to a hundred thousand)
+or the 8,192-row one, and the decision is the one 0.5.0 made for every frame. Sampled until its
+denominator settles instead of until the decision does (`free_estimate`), the estimate falls in the
+bucket of the true count for every frame and key set of the grid at both sizes, within 40% of it up
+to 1,000,000 groups at 50,000,000 rows; near a quarter of the rows it reaches the frame's row count,
+in the same bucket.
+
+With the probe of 0.5.0, under the table in force, a
 group-by at 2,000,000 rows is probed only for the two-key count and min/max, the classes with a
 bucket taken at that size; a one-key, String or two-key sum group-by there is not probed,
 and neither is a String group-by at 50,000,000 (only the (String, int32) sum has buckets). In the
@@ -928,21 +981,18 @@ and 126 µs at 50,000,000 (0.75%; 51 of 77 under 1%). The seven probes over 5 ms
 all at 50,000,000 rows on frames with 0.43 times as many groups as rows or more ((g1minmaxR2) 6.9 ms,
 1.41% of the default's time; (g2sumR2) 12.7 ms, 1.99%), and its largest shares are 15.96% at
 2,000,000 rows ((g2minmax100k), 390 µs of 2.4 ms) and 14.60% at 50,000,000 ((g2sum1M), 3.8 ms of
-26.2 ms). A second collect of the same frame reads its
-samples from the cache. Sampled until its denominator settles instead of until the decision does (`free_estimate` in `Benchmarks/results/group_probe_2026-09-26.csv`), the
-estimate falls in the bucket of the true count for every frame and key set of the grid at both sizes,
-within 29% of it up to 1,000,000 groups at 50,000,000 rows, and 24% to 31% above it at half the rows.
+26.2 ms). A second collect of the same frame reads its samples from the cache.
 
 Each probe is listed in the report, and the rule of a group-by the policy judged by its estimate
 names it:
 
 ```
   metal:  GroupBy#1 [GroupBy > DataFrameScan] over 50,000,000 rows, ran in <t> ms -> 100,000 rows
-          rule: 50,000,000 input rows is at or above the 2,961,043-row crossover for group_by:minmax at an estimated 102,981 groups over (k1), a Chao1 estimate from a 2,048-row sample, 67,758 to 198,392 (engine table, the 100,000-group bucket, ...)
-  groups: GroupBy#1 over (k1): 102,981 groups, a Chao1 estimate from a 2,048-row sample, 67,758 to 198,392 (probed in 132 us)
+          rule: 50,000,000 input rows is at or above the 2,184,147-row crossover for group_by:minmax at an estimated 102,574 groups over (k1), a Chao1 estimate from a 2,048-row sample, 67,060 to 201,600 (engine table, the 100,000-group bucket, Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv)
+  groups: GroupBy#1 over (k1): 102,574 groups, a Chao1 estimate from a 2,048-row sample, 67,060 to 201,600 (probed in <t> us)
 
-  polars: GroupBy#1: rule: estimated 191 groups over (region), a Chao1 estimate from a 512-row sample, 189 to 196: below the measured band for group_by:sum at 50,000,000 input rows (taken at 3,163 to 3,162,277 groups; no count in the estimate's range is; ...)
-  groups: GroupBy#1 over (region): 191 groups, a Chao1 estimate from a 512-row sample, 189 to 196 (probed in 76 us)
+  polars: GroupBy#1: rule: estimated 200 groups over (region), a Chao1 estimate from a 2,048-row sample, 200 to 200: below the measured band for group_by:sum at 50,000,000 input rows (taken at 3,163 to 3,162,277 groups; group_by:sum at the 200-group bucket was not measured ahead of Polars up to 50,000,000 input rows (Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv))
+  groups: GroupBy#1 over (region): 200 groups, a Chao1 estimate from a 2,048-row sample, 200 to 200 (probed in <t> us)
 ```
 
 The other classes in the sweep (`Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv`, `vs_fastest_polars`
