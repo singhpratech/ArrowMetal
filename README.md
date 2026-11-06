@@ -45,7 +45,8 @@ filters 0.31x to 0.79x. `rule.report()` gives each node, TAKEN or LEFT, and why.
 <a href="https://pola.rs"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/polars-dark.svg"><img src="docs/img/engines/polars.svg" height="22" alt="Polars" align="top"></picture></a> **Polars.** `MetalEngine` runs the subtrees measured ahead (full sorts, inner, left and anti joins,
 `unique`, group-bys judged by their estimated number of groups); Polars runs the rest. On Polars 1.44.1,
 **1.52x to 11.54x** on all 75 of 220 case-size pairs the default took, and 15,376 generated cases, 0
-different; on Polars 2.0.0, **1.35x to 7.94x** on all 52 of 107 cases it took at 50,000,000 rows. Left to
+different; on Polars 2.0.0, **1.35x to 7.94x** on all 52 of 107 cases it took at 50,000,000 rows, and on
+2.1.0 **1.31x to 10.31x** on the same 52. Left to
 Polars: whole-frame aggregates 0.09x to 0.24x on 1.44.1 and 0.11x to 0.47x on 2.0.0, filters 0.14x to
 0.42x and 0.16x to 0.40x. [Polars in full](#polars-in-full)
 ```
@@ -150,7 +151,7 @@ shapes are under [To improve](docs/DATAFUSION.md#to-improve).
 A `MetalEngine` for `lf.collect(engine=…)`:
 
 ```
-pip install "arrowmetal[polars]"      # polars>=1.44,<2.1, the tested range
+pip install "arrowmetal[polars]"      # polars>=1.44,<2.2, the tested range
 ```
 
 ```python
@@ -186,14 +187,18 @@ rows, a sort over a Parquet scan, and group-bys judged by their estimated number
   keys (153.1 ms to 38.5 ms); ArrowMetal's times are unchanged (median ratio 1.03)
   (`Benchmarks/results/polars_engine_bench_2026-10-02.csv` and
   `Benchmarks/results/polars_engine_bench_2026-10-07-polars2.csv`).
-- `MetalEngine` is tested on Polars 1.44.1, 1.44.2 and 2.0.0 (`TESTED_POLARS`), and
-  `pip install "arrowmetal[polars]"` installs `polars>=1.44,<2.1`. Polars 2.0 removed
+- `MetalEngine` is tested on Polars 1.44.1, 1.44.2, 2.0.0 and 2.1.0 (`TESTED_POLARS`), and
+  `pip install "arrowmetal[polars]"` installs `polars>=1.44,<2.2`. Polars 2.0 removed
   `LazyFrame.profile`; on 2.0.0 `MetalEngine.profile` raises `NotImplementedError`. On 2.0.0 the engine
   takes the same 1,326 of 2,523 plans of the capability grid, and Polars 2.0.0 itself rejects 63 plans
   that 1.44.1 accepted ([docs/ENGINE_CAPABILITIES_POLARS2.md](docs/ENGINE_CAPABILITIES_POLARS2.md)).
+  On 2.1.0 a join holding a filter over both sides (`join(...).filter(pl.col("x") < pl.col("y"))`)
+  runs as the join, then the filter; Polars 2.0.0 kept such a join from engines.
 - 15,376 generated cases against Polars 1.44.1: 15,096 identical, 33 within the float-summation
   bound, 0 different, and 247 where Polars' plan had nothing to run
-  (`Benchmarks/results/engine_conformance_2026-10-02.csv`).
+  (`Benchmarks/results/engine_conformance_2026-10-02.csv`). On 2.0.0 and 2.1.0, 0 different as well;
+  36 more cases are divisions by a literal over 7-row frames, where Polars 2.x's `collect()` divides
+  element-wise and the engine gives the in-memory engine's bits.
 
 | 50,000,000 rows, Polars 1.44.1 | faster Polars engine, ms (CPU-ms) | `MetalEngine()`, ms (CPU-ms) | speed-up |
 |---|---:|---:|---:|
