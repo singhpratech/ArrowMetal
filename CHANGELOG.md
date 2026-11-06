@@ -2,7 +2,17 @@
 
 ## Unreleased
 
-Nothing yet.
+- **Polars 2.1.0.** `MetalEngine` runs on polars 2.1.0 (IR (16, 0)); `TESTED_POLARS` adds 2.1.0 and the
+  `polars` extra installs `polars>=1.44,<2.2`. Polars 2.1 shows engines a join holding a predicate over
+  both sides (`join(...).filter(pl.col("x") < pl.col("y"))` becomes one inner join of kind
+  `("Inner", "fused_predicate")`): the engine runs it as the join, then the filter; other join kinds
+  with a predicate stay with Polars (on 2.0.0 Polars kept such a join from engines). With the 2.0.0
+  crossover table, the default on 2.1.0 takes 52 of 107 benchmarked cases at 50,000,000 rows, each
+  1.31x to 10.31x faster than the faster Polars 2.1.0 engine, none behind
+  (`Benchmarks/results/polars_engine_bench_2026-11-06-polars21.csv`). The engine conformance grid,
+  run on 2.0.0 and 2.1.0 for the first time, records the streaming engine's element-wise division of
+  frames under 100 rows as a documented divergence (36 cases); 0 unclassified on 1.44.1, 2.0.0 and
+  2.1.0 (docs/FINDINGS.md, Round 24).
 
 ## 0.6.0 — 2026-11-06
 

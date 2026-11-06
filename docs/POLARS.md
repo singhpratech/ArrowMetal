@@ -49,17 +49,17 @@ polars 0.55 crates, loads in py-polars 1.44.2. The plugin adds 5.0 MB to the com
 
 ### Which Polars
 
-`pip install 'arrowmetal[polars]'` installs `polars>=1.44,<2.1`: polars 1.44.1, 1.44.2 and 2.0.0 are the releases the engine suites passed on.
+`pip install 'arrowmetal[polars]'` installs `polars>=1.44,<2.2`: polars 1.44.1, 1.44.2, 2.0.0 and 2.1.0 are the releases the engine suites passed on.
 Per tier:
 
 | Tier | Polars |
 |---|---|
 | 1. Bridge and namespaces | any `polars>=1.0` (pure Python over the Arrow C Data Interface) |
 | 3. Streaming hand-off | any `polars>=1.0` (pure Python over the Arrow C Data Interface) |
-| 2. Expression plugin | 1.44.x and 2.0.0: the plugin is built on the polars 0.55 crates; Polars checks a plugin's ABI (`polars_ffi`'s major/minor) when it loads it, and the 1.44-built plugin loads on 2.0.0 (its 151 tests pass there) (Version pinning, below) |
-| 4. `MetalEngine` | tested on 1.44.1, 1.44.2 and 2.0.0 (`TESTED_POLARS`). On 1.44.1 and 1.44.2 the full engine suite passes and the capability table is the same on both (1.44.2 also by `scripts/check_wheel.sh`); on 2.0.0 `test_polars_engine.py`, `test_polars.py` and `test_polars_sort_order.py` pass, with the `profile` tests and the capability-table comparison skipped ([ENGINE_CAPABILITIES.md](ENGINE_CAPABILITIES.md) is the 1.44.1 table). It walks Polars' unstable IR, checked against `TESTED_IR_VERSION`: (14, 7) for 1.44, (15, 2) for 2.0.0. `python -m arrowmetal.polars_engine check` reports the installed Polars against these |
+| 2. Expression plugin | 1.44.x, 2.0.0 and 2.1.0: the plugin is built on the polars 0.55 crates; Polars checks a plugin's ABI (`polars_ffi`'s major/minor) when it loads it, and the 1.44-built plugin loads on 2.0.0 (its 151 tests pass there) and on 2.1.0 (`test_polars.py`, 93 tests, passes as on 2.0.0) (Version pinning, below) |
+| 4. `MetalEngine` | tested on 1.44.1, 1.44.2, 2.0.0 and 2.1.0 (`TESTED_POLARS`). On 1.44.1 and 1.44.2 the full engine suite passes and the capability table is the same on both (1.44.2 also by `scripts/check_wheel.sh`); on 2.0.0 and 2.1.0 `test_polars_engine.py`, `test_polars.py` and `test_polars_sort_order.py` pass, with the `profile` tests and the capability-table comparison skipped ([ENGINE_CAPABILITIES.md](ENGINE_CAPABILITIES.md) is the 1.44.1 table). It walks Polars' unstable IR, checked against `TESTED_IR_VERSION`: (14, 7) for 1.44, (15, 2) for 2.0.0, (16, 0) for 2.1.0. `python -m arrowmetal.polars_engine check` reports the installed Polars against these |
 
-A Polars outside 1.44 installed without the extra keeps tiers 1 and 3, and on 2.0.0 tier 4.
+A Polars outside 1.44 installed without the extra keeps tiers 1 and 3, and on 2.0.0 and 2.1.0 tier 4.
 
 ### From source
 
@@ -579,10 +579,13 @@ against Polars itself.
   column of one row Polars multiplies, and the NaN keeps its sign; the engine chooses by the row
   count as for a division.
 * **The streaming engine.** The two forms above are those of Polars' in-memory engine, the one
-  `MetalEngine` leaves the rest of a plan to, in polars 1.44.1 and 2.0.0 alike. Polars' streaming
-  engine, the default of `collect()` on 2.0.0, evaluated frames of 2 and 9 rows element-wise on both
-  versions (the correctly rounded `x / c`, and a NaN that keeps its sign under `* -1`), and frames
-  of 100 rows and more as the in-memory engine does.
+  `MetalEngine` leaves the rest of a plan to, in polars 1.44.1, 2.0.0 and 2.1.0 alike. Polars' streaming
+  engine, the default of `collect()` on 2.0.0 and 2.1.0, evaluated frames of 2 and 9 rows
+  element-wise on all three versions (the correctly rounded `x / c`, and a NaN that keeps its sign
+  under `* -1`), and frames of 100 rows and more as the in-memory engine does. The engine
+  conformance grid compares with `collect()`, so on 2.0.0 and 2.1.0 its 36 divisions by a literal
+  over 7-row frames are the documented divergence `streaming-small-frame-division`; every one
+  equals `collect(engine="in-memory")`.
 * **Aggregates.** A `sum` over no values is 0 in Polars (ArrowMetal: null) and gets a `fill_null`; a
   `min`/`max` over only NaN is NaN in Polars (ArrowMetal: null over a whole frame, an infinity per
   group), so the engine counts the non-null and non-NaN values and decides from the two; a `mean` of

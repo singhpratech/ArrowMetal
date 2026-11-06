@@ -2,6 +2,51 @@
 
 Things learned the hard way. Add to this whenever something surprises you.
 
+## Round 24 (2026-11-06): Polars 2.1.0
+
+**What.** Polars 2.1.0 (released 2026-10-25) reports IR version (16, 0), a new major, so `MetalEngine`
+declined every plan on it until the IR was checked. The Python-visible node and expression classes
+are those of IR 15 with two additions: a `predicate` on `Join` and an `Operator.TruncDivide`
+(`Expr.truncdiv`). A truncating division has no translation and stays with Polars.
+
+**A join that holds a filter.** Polars 2.1 shows engines a join holding a predicate over both sides
+(pola-rs/polars#30176). An ordinary `left.join(right, on="k").filter(pl.col("x") < pl.col("y"))`
+becomes one inner join node of kind `("Inner", "fused_predicate")` with the comparison inside it. A
+walk that read only the keys would have returned the join without the filter, every pair of rows that
+shares a key. The engine now runs such a node as the join, then the filter over the joined columns
+by their output names (`v < v_right` included); a `join_where` other than inner (`how="left"`,
+`"full"`, kind `cross_and_filter`) stays with Polars. Polars 2.0.0 does not show such a join to an
+engine at all (its visitor raises "join with a fused predicate", and the plan stays with Polars);
+1.44.1 kept a `Filter` above the `Join`, and the engine ran both. On 2.1.0 the five shapes of
+`test_an_inner_join_with_a_predicate_runs_as_the_join_then_the_filter` run on Metal and equal Polars.
+
+**Two behaviours of Polars 2.1 that tests pinned.** A select of literals only is folded into a
+one-row frame before the engine sees it, so there is no `Select` left to decline. A Parquet file whose
+stored `ARROW:schema` names more fields than the file holds is read by the file's own columns, as Arrow
+reads it, where 2.0.0 applied the stored schema.
+
+**The grid on 2.x.** The engine conformance grid had run on 1.44.1 only. On 2.0.0 and 2.1.0 alike it
+showed 36 unclassified divisions by a literal, all over 7-row frames: `collect()` there is the
+streaming engine, which divides frames of 2 to 9 rows element-wise (the correctly rounded x / c),
+while the engine gives the in-memory engine's multiply by the reciprocal, as POLARS.md states. All
+36 equal `collect(engine="in-memory")`; they are now the documented divergence
+`streaming-small-frame-division`. 15,376 cases, 0 unclassified on 2.1.0 (15,055 pass, 74
+documented), 2.0.0 (15,056, 73) and 1.44.1 (15,096, 33).
+
+**Speed.** Polars 2.1 is a major version 2, so the engine uses the 2.0.0 crossover table. The default
+benchmark at 50,000,000 rows, run on 2.1.0 and then on 2.0.0 with the same code in one session on AC
+power (`Benchmarks/results/polars_engine_bench_2026-11-06-polars21.csv` and `-polars2.csv`, with
+their conditions files; `Benchmarks/polars_bench_compare.py` reads them): on 2.1.0 the default takes
+the same 52 of 107 cases, each 1.31x to 10.31x faster than the faster Polars 2.1.0 engine, none
+behind (2.0.0 in the same session: 1.34x to 7.99x). Polars 2.1.0's own time is 1.12x of 2.0.0's at
+the median (0.77x on `row_number` over partitions, 1.55x to 1.71x on one-key group-bys at 1,000,000
+groups). Four cases the table leaves to Polars are 1.18x to 1.24x faster on the GPU on 2.1.0 (1.02x
+to 1.15x on 2.0.0); the table is not refitted for them.
+
+**What shipped.** `TESTED_IR_VERSION` adds (16, 0) and `TESTED_POLARS` 2.1.0; the `polars` extra
+installs `polars>=1.44,<2.2`. The Polars suites pass on 2.1.0 (2,347), 2.0.0 (2,345) and 1.44.1
+(2,348).
+
 ## Round 23 (2026-11-05): the group-count probe on keys that are not evenly frequent
 
 **What.** A reader asked whether the probe's Chao1 estimator, on heavily skewed keys, would
