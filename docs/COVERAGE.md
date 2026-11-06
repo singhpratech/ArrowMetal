@@ -882,7 +882,7 @@ included.
 
 ## What ArrowMetal 0.4.0 claims, and what it does not
 
-**The claim.** ArrowMetal 0.5.0 answers to **all 307 of the Apache Arrow v25 compute function names** (and to `remainder` of the five v26 added; the other four are recorded as missing) —
+**The claim.** ArrowMetal 0.6.0 answers to **all 307 of the Apache Arrow v25 compute function names** (and to `remainder` of the five v26 added; the other four are recorded as missing) —
 the 283 in the C++ docs plus the 24 `hash_*` grouped aggregates — over `int8/16/32/64`, `uint8/16/32/64`,
 `float16/32/64`, `bool`, `utf8`, `binary`, `fixed_size_binary`, `decimal32/64/128`, `date32/64`,
 `time32/64`, `timestamp`, `duration`, the three `interval` layouts, `list` / `large_list` /
