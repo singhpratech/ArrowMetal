@@ -84,11 +84,12 @@ __all__ = ["MetalEngine", "MetalPlanReport", "MetalEngineFallbackWarning", "TEST
 # incompatible IR changes (renamed nodes, reshaped tuples); a major that none of these has makes the
 # engine decline every plan. A newer minor of a tested major only adds nodes, so the engine still
 # runs and warns once.
-TESTED_IR_VERSION = ((14, 7), (15, 2))
+TESTED_IR_VERSION = ((14, 7), (15, 2), (16, 0))
 # The Polars releases the engine suites passed on. 1.44.1 and 1.44.2: test_polars_engine.py,
 # test_engine_conformance.py and the capability table. 2.0.0: test_polars_engine.py, test_polars.py
-# and test_polars_sort_order.py (docs/ENGINE_CAPABILITIES.md is the 1.44.1 table).
-TESTED_POLARS = ("1.44.1", "1.44.2", "2.0.0")
+# and test_polars_sort_order.py (docs/ENGINE_CAPABILITIES.md is the 1.44.1 table). 2.1.0 (IR (16, 0)):
+# the same suites; its IR visitor adds a join predicate (a join holding one stays with Polars).
+TESTED_POLARS = ("1.44.1", "1.44.2", "2.0.0", "2.1.0")
 # Every IR node class of those releases (`polars._plr._ir_nodes`), per IR major: IR 15 has no
 # `ExtContext` (Polars 2.0 removed `LazyFrame.with_context`). A node of a kind outside
 # KNOWN_NODE_KINDS makes the whole plan stay with Polars: the walk cannot know what such a node
@@ -98,6 +99,7 @@ _NODE_KINDS_BY_IR_MAJOR = {15: frozenset({
     "MapFunction", "MergeSorted", "PythonScan", "Reduce", "Scan", "Select", "SimpleProjection",
     "Sink", "Slice", "Sort", "Union"})}
 _NODE_KINDS_BY_IR_MAJOR[14] = _NODE_KINDS_BY_IR_MAJOR[15] | {"ExtContext"}
+_NODE_KINDS_BY_IR_MAJOR[16] = _NODE_KINDS_BY_IR_MAJOR[15]
 KNOWN_NODE_KINDS = frozenset().union(*_NODE_KINDS_BY_IR_MAJOR.values())
 
 
@@ -1014,6 +1016,14 @@ class _Translator:
 
     def _node_Join(self, n, node, inputs, kids, check_only=False):
         how, nulls_equal, slc, suffix, coalesce, maintain = node.options
+        # IR 16 (Polars 2.1) can carry a filter over both sides inside an inner join node, its kind
+        # then ("Inner", "fused_predicate"): a filter over the joined rows, translated as such.
+        fused = getattr(node, "predicate", None)
+        if fused is not None:
+            if how != ("Inner", "fused_predicate"):
+                raise _Unsupported(f"A {how!r} join with a predicate is not translated (an inner "
+                                   "one is: the join, then the filter).")
+            how = "Inner"
         if not isinstance(how, str) or how not in ("Inner", "Left", "Semi", "Anti"):
             raise _Unsupported(f"A {how if isinstance(how, str) else how[0]} join is not "
                                "translated (inner, left, semi and anti are taken).")
@@ -1057,9 +1067,18 @@ class _Translator:
             cols[name] = _base(name, dt, m[2])
         plan = {"op": "join", "left": left.final_plan(), "right": right.final_plan(),
                 "left_on": lkeys, "right_on": rkeys, "how": how.lower(), "suffix": suffix}
-        return _Sub(plan, cols, [m[0] for m in meta], left.leaves + right.leaves,
-                    left.rows + right.rows, True, (), left.classes | right.classes
-                    | {"join:" + how.lower()}, groups=left.groups + right.groups)
+        sub = _Sub(plan, cols, [m[0] for m in meta], left.leaves + right.leaves,
+                   left.rows + right.rows, True, (), left.classes | right.classes
+                   | {"join:" + how.lower()}, groups=left.groups + right.groups)
+        if fused is None:
+            return sub
+        # The fused predicate reads the joined columns by their output names.
+        self.nt.set_node(n)
+        pred = self._predicate(fused.node, cols)
+        if pred is None or pred.code != "bool":
+            raise _Unsupported("The join's predicate is not a boolean ArrowMetal translates.")
+        return sub.derive(plan={"op": "filter", "input": sub.plan, "predicate": pred.s}, work=True,
+                          exact=None)
 
     def _node_Distinct(self, n, node, inputs, kids, check_only=False):
         keep, subset, maintain, slc = node.options
