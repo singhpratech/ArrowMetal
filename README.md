@@ -36,7 +36,7 @@ DataFusion's group-bys are 1.24x to 2.17x and four of DuckDB's thirteen rewritte
 <a href="https://datafusion.apache.org"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/datafusion-dark.svg"><img src="docs/img/engines/datafusion.svg" height="22" alt="Apache DataFusion" align="top"></picture></a> **DataFusion.** A physical optimizer rule for DataFusion 55.1; the SQL is unchanged. A Rust crate used by
 [crates.io](https://crates.io/crates/datafusion-arrowmetal); it loads `libArrowMetalC.dylib` ([install](docs/DATAFUSION.md#install)):
 ```toml
-datafusion-arrowmetal = "0.5.0"   # beside datafusion = "=55.1.0"
+datafusion-arrowmetal = "0.6.0"   # beside datafusion = "=55.1.0"
 ```
 Full sorts **6.9x to 28.8x** faster than DataFusion alone (250,000 to 50,000,000 rows), ten group-by
 series **2.31x to 4.27x**; 13,632 query pairs, 0 mismatches. Left to DataFusion: top-k 0.14x to 0.41x,
@@ -65,7 +65,7 @@ Rewritten aggregates **1.08x to 5.32x** faster than DuckDB's own operators; 33,3
 different. Left to DuckDB: a single `sum` 0.32x, `VARCHAR` keys 0.22x. [DuckDB in full](#duckdb-in-full)
 
 339 benchmark rows, 77 where the CPU is ahead, each with its cause ([matrix](docs/BENCHMARKS_MATRIX.md),
-[to improve](docs/TO_IMPROVE.md)); 307 of Arrow v25's 307 compute function names, 283 on the GPU ([list](docs/ARROW_FUNCTIONS.md)).
+[to improve](docs/TO_IMPROVE.md)); 307 of Arrow v25's 307 compute function names, 284 on the GPU, and 1 of the 5 added in v26 ([list](docs/ARROW_FUNCTIONS.md)).
 
 ## Details
 
@@ -93,7 +93,7 @@ A physical optimizer rule for DataFusion 55.1, the Rust crate `datafusion-arrowm
 # Cargo.toml
 [dependencies]
 datafusion = { version = "=55.1.0", default-features = false, features = ["sql"] }
-datafusion-arrowmetal = "0.5.0"
+datafusion-arrowmetal = "0.6.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -310,15 +310,14 @@ print(amount.filter_where(">", 15).to_arrow())          # [20, 30, 40]: GPU filt
 
 ### Release
 
-Listed on Apache Arrow's [Powered By](https://arrow.apache.org/powered_by/) page and on Apache DataFusion's [integrations list](https://datafusion.apache.org/user-guide/introduction.html#integrations). Site and docs: <https://arrowmetal.org> · Python: `pip install arrowmetal` · Rust: `arrowmetal = "0.5.0"` · DataFusion: `datafusion-arrowmetal = "0.5.0"` · Release: [v0.5.0](https://github.com/singhpratech/ArrowMetal/releases/tag/v0.5.0)
+Listed on Apache Arrow's [Powered By](https://arrow.apache.org/powered_by/) page and on Apache DataFusion's [integrations list](https://datafusion.apache.org/user-guide/introduction.html#integrations). Site and docs: <https://arrowmetal.org> · Python: `pip install arrowmetal` · Rust: `arrowmetal = "0.6.0"` · DataFusion: `datafusion-arrowmetal = "0.6.0"` · Release: [v0.6.0](https://github.com/singhpratech/ArrowMetal/releases/tag/v0.6.0)
 
-New in 0.5.0: the Polars engine runs on polars 2.0.0 as on 1.44, with one measured crossover table per
-Polars major (on 2.0.0 the default takes 52 of 107 benchmarked cases at 50,000,000 rows, 1.35x to 7.94x
-ahead of the faster Polars engine, none behind); integer means in the Polars and plan engines run in one
-pass from the integer column (two-key means at 200 to 1,000,000 groups 1.41x to 1.49x faster than before);
-the group-count estimate cache holds on polars 2.0.0; the DuckDB extensions are built and tested against
-DuckDB 1.5.6. Before, 0.4.0 brought `datafusion-arrowmetal`, the DataFusion optimizer rule on crates.io,
-Polars sort keys passed one to one, and correctly rounded grouped Float64 sums and means.
+New in 0.6.0: the group-count probe of the Polars engine and of `datafusion-arrowmetal` leaves a
+group-by whose rows are concentrated on a few of its keys to the CPU engine (on Polars 1.44.1 the default
+picks the faster engine in 68 of 72 skewed-key cases, 0.5.0: 59, and runs the GPU where it is slower in 0,
+0.5.0: 13); the test suites run on pyarrow 26.0.0, and `remainder`, new in Arrow v26, runs on the GPU.
+Before, 0.5.0 brought Polars 2.0.0 support with one measured crossover table per Polars major, and
+one-pass integer means in the Polars and plan engines.
 
 ### The pitch in one paragraph
 
@@ -339,9 +338,9 @@ the CPU idiom is ahead — is in [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MAT
   used recorded beside it. 145 rows at or above 3x, 102 between 1x and 3x, 77 where the CPU idiom is
   ahead, 15 with no CPU equivalent; each of the 77 has its cause written down.
   [`docs/BENCHMARKS_MATRIX.md`](docs/BENCHMARKS_MATRIX.md), [`docs/TO_IMPROVE.md`](docs/TO_IMPROVE.md)
-- **307 of Apache Arrow v25's 307 compute function names** — 283 on the GPU, 17 on the host, 7 with a
-  stated limitation. The table is generated from a registry the test suite executes against
-  `pyarrow.compute`. [`docs/ARROW_FUNCTIONS.md`](docs/ARROW_FUNCTIONS.md)
+- **307 of Apache Arrow v25's 307 compute function names** — 284 on the GPU, 17 on the host, 7 with a
+  stated limitation; of the 5 names v26 added, `remainder` runs on the GPU and 4 are recorded as missing.
+  The table is generated from a registry the test suite executes against `pyarrow.compute`. [`docs/ARROW_FUNCTIONS.md`](docs/ARROW_FUNCTIONS.md)
 - **41,688 differential cases against pyarrow over 46 column types**, 1,046 Swift tests against a CPU
   oracle and 7,188 Python cases (7,159 passed, 29 skipped), all run in release.
   [`docs/TESTING.md`](docs/TESTING.md)
@@ -465,7 +464,7 @@ PYTHONPATH=python python -c "import arrowmetal as am; print(am.device_name())"
 
 # From a wheel that carries the dylib (no Swift toolchain at install time)
 pip install build && scripts/build_wheel.sh         # or python/build_wheel.sh, if the dylib is built
-pip install python/dist/arrowmetal-0.5.0-*.whl      # macOS arm64 only, pyarrow comes with it
+pip install python/dist/arrowmetal-0.6.0-*.whl      # macOS arm64 only, pyarrow comes with it
 python -c "import arrowmetal as am; print(am.device_name())"
 ```
 ```python
@@ -624,8 +623,9 @@ type is covered by.
 
 ### What is implemented
 
-**307 of Apache Arrow v25's 307 compute function names** — 283 entirely on the GPU, 17 on the host, 7
-with a stated limitation, none missing. Every one of those names has a row in
+**307 of Apache Arrow v25's 307 compute function names** — 284 entirely on the GPU, 17 on the host, 7
+with a stated limitation, none missing; of the 5 names Arrow v26 added, `remainder` runs on the GPU and
+4 are recorded as missing. Every one of those names has a row in
 [docs/ARROW_FUNCTIONS.md](docs/ARROW_FUNCTIONS.md) naming the Swift file behind it, the ArrowMetal call
 that reaches it and what it does differently, and that table is generated from a registry the test suite
 *executes*: `python/tests/test_functions.py` calls every runnable row and compares the answer to
