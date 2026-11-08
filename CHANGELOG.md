@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Sorts and group-bys compile on M1 GPUs.** The GPU compiler on an M1 Max (macOS 27.2) aborts on a `ulong` joined
+  with shifts from two `threadgroup atomic_uint` loads, which `radix_histogram`, `gb_accumulate_priv` and `am_gb_priv`
+  did, so every sort of 64-bit keys (Int64, Double, temporal, utf8, binary) and those group-bys failed to create their
+  pipelines there. The three join with `as_type<ulong>(uint2(lo, hi))` instead (#1).
 - **Polars 2.1.0.** `MetalEngine` runs on polars 2.1.0 (IR (16, 0)); `TESTED_POLARS` adds 2.1.0 and the
   `polars` extra installs `polars>=1.44,<2.2`. Polars 2.1 shows engines a join holding a predicate over
   both sides (`join(...).filter(pl.col("x") < pl.col("y"))` becomes one inner join of kind
