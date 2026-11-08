@@ -256,7 +256,12 @@ Swift GPU suites skip there (`requireRealGPU()`). It cannot build every kernel: 
 the Float64 `math_unary_abs` kernel, the 32-bit-key radix histogram and single-construct kernels with
 threadgroup atomics, barriers, grid-stride loops and 64-bit shifts, but refused the 64-bit-key
 `radix_histogram` in every form tried, including the loop it had before 0.4.0; the reported error is
-`Compilation failed` with nothing else. After two pipeline creations have failed in one process, every
+`Compilation failed` with nothing else. That refusal ended with 0.6.1's kernels: the construct the runner
+refused is the one FINDINGS Round 25 names (a `ulong` joined with shifts from two `threadgroup atomic_uint`
+loads), and in the run of 2026-11-08 at 0.6.1 the subset built every kernel its 2,000 sampled cases asked
+for: 1,868 pass, 81 documented divergences, 0 unclassified, 51 not implemented for the type, 0 pipeline
+failures; the run of 2026-11-06 on 0.6.0's kernels had 496 pass and 1,491 cases skipped on pipeline
+failures. After two pipeline creations have failed in one process, every
 later creation in that process fails too, even of a kernel that built a moment earlier (the
 `device-diag` workflow, `Tests/ArrowMetalTests/DeviceDiagnosticTests.swift`, runs each variant in its
 own process). The subset therefore treats a case that fails with `Metal pipeline creation failed` on a

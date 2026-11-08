@@ -14,7 +14,9 @@ group-bys failed to create their pipelines; the fix is the first outside contrib
   with shifts from two `threadgroup atomic_uint` loads, which `radix_histogram`, `gb_accumulate_priv` and `am_gb_priv`
   did, so every sort of 64-bit keys (Int64, Double, temporal, utf8, binary) and those group-bys failed to create their
   pipelines there. The three join with `as_type<ulong>(uint2(lo, hi))` instead (#1, d-polikhranidi's #2), and so does
-  `gs_b_priv`, whose four such loads passed on that machine but had the same shape.
+  `gs_b_priv`, whose four such loads passed on that machine but had the same shape. GitHub's `macos-15` runner
+  refused the same construct: its conformance subset now builds every kernel its 2,000 sampled cases ask for
+  (1,868 pass, 81 documented, 0 pipeline failures on 2026-11-08; 496 pass and 1,491 pipeline skips on 2026-11-06).
 - **Polars 2.1.0.** `MetalEngine` runs on polars 2.1.0 (IR (16, 0)); `TESTED_POLARS` adds 2.1.0 and the
   `polars` extra installs `polars>=1.44,<2.2`. Polars 2.1 shows engines a join holding a predicate over
   both sides (`join(...).filter(pl.col("x") < pl.col("y"))` becomes one inner join of kind

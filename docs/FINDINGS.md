@@ -43,6 +43,17 @@ runs, and every row's answer agreed with the CPU libraries in all three
 radix-histogram tail alone, 16,777,216 random 64-bit keys, the two forms alternated, median of 15 GPU
 timings: ratios 1.000, 0.999 and 0.996 over three runs.
 
+**GitHub's runner.** The "Apple Paravirtual device" of GitHub's `macos-15` runner had refused the 64-bit-key
+`radix_histogram` in every form tried since 2026-10-02 (docs/TESTING.md section 7), and after two failed
+pipeline creations every later one in the process fails too, so the pull-request conformance subset ran
+few of its GPU cases: on 2026-11-06, at 0.6.0's kernels, 496 of its 2,000 sampled cases passed and 1,491
+were skipped on pipeline failures. With 0.6.1's `as_type` joins the same subset on 2026-11-08 built every
+kernel it asked for: 1,868 pass, 81 documented divergences, 0 unclassified, 51 not implemented for the type,
+0 pipeline failures. The refused construct was the one this round names. The first run at 0.6.1 crashed in
+the harness instead, on a documented divergence whose timestamp[ns] values are not whole microseconds:
+pyarrow's `to_pylist()` raises on those without pandas, which the runner does not install. The harness
+now compares timestamp, duration, time and date arrays that differ as their tick counts.
+
 ## Round 24 (2026-11-06): Polars 2.1.0
 
 **What.** Polars 2.1.0 (released 2026-10-25) reports IR version (16, 0), a new major, so `MetalEngine`
