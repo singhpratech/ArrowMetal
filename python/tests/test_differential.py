@@ -632,7 +632,8 @@ def _diff_arrays(got, expected, tol):
                 return None
         elif got.equals(expected):
             return None
-    if pa.types.is_temporal(got.type):
+    if (pa.types.is_timestamp(got.type) or pa.types.is_duration(got.type) or pa.types.is_time(got.type)
+            or pa.types.is_date(got.type)):
         # Compare the tick counts: a timestamp[ns] whose value is not a whole microsecond cannot
         # become a datetime without pandas, and the ticks name the difference exactly.
         storage = pa.int32() if got.type.bit_width == 32 else pa.int64()
