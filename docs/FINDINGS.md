@@ -34,6 +34,15 @@ words): 0 mismatches against the CPU's join, the two forms identical bit for bit
 remains outside this fix: `MathExtraTests.testTranscendentalsAtEverySize` reports float32 `logb` 231 ulp
 off at one row against 16 allowed, the same with and without the change.
 
+**Speed.** The matrix's sort, group-by and window families at 50,000,000 rows (`Benchmarks/full_matrix.py
+--families sort,group-by,window`, 63 ArrowMetal rows), run on the M4 Max in one session with the 0.6.0
+wheel's dylib (the shift joins) and then twice with 0.6.1's (the `as_type` joins): the median of 0.6.1's
+time over 0.6.0's is 1.003 in the first run and 0.991 in the second, no row is slower than 0.6.0 in both
+runs, and every row's answer agreed with the CPU libraries in all three
+(`Benchmarks/results/m1_join_ab_2026-11-08-0.6.0.csv`, `-0.6.1.csv`, `-0.6.1-second.csv`). The
+radix-histogram tail alone, 16,777,216 random 64-bit keys, the two forms alternated, median of 15 GPU
+timings: ratios 1.000, 0.999 and 0.996 over three runs.
+
 ## Round 24 (2026-11-06): Polars 2.1.0
 
 **What.** Polars 2.1.0 (released 2026-10-25) reports IR version (16, 0), a new major, so `MetalEngine`

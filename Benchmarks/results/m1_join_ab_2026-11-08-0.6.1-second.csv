@@ -1,0 +1,437 @@
+family,op,rows,library,wall_ms,cpu_ms,gb_per_s,iterations,status,note
+sort,argsort int64,50000000,arrowmetal,38.5445,0.9200,15.566,5,ok,
+sort,argsort int64,50000000,polars,301.7738,3527.2610,1.988,4,ok,
+sort,argsort int64,50000000,pyarrow,19996.5792,19996.1480,0.030,2,ok,
+sort,argsort int64,50000000,numpy,4468.8079,4468.3030,0.134,2,ok,pandas argsort delegates to numpy
+sort,argsort int64,50000000,polars-lazy,302.0615,3600.1880,1.986,4,ok,"parallel idiom: pl.LazyFrame.select(...).collect(), in-memory engine, 16 threads"
+sort,argsort int64,50000000,pyarrow-threaded,,,,0,no equivalent,"Acero's order_by node sorts rows; no node returns the sort permutation, so pyarrow.compute is the only idiom for an index-producing sort"
+sort,argsort int64,50000000,numpy-parallel,,,,0,no equivalent,numpy has no parallel idiom: its ufuncs are single-threaded
+sort,argsort float64,50000000,arrowmetal,37.9359,0.8580,15.816,5,ok,
+sort,argsort float64,50000000,polars,420.3160,5514.3760,1.427,3,ok,
+sort,argsort float64,50000000,pyarrow,21205.8297,21205.4290,0.028,2,ok,
+sort,argsort float64,50000000,numpy,5375.4353,5374.8670,0.112,2,ok,
+sort,argsort float64,50000000,polars-lazy,417.4315,5518.4170,1.437,3,ok,"parallel idiom: pl.LazyFrame.select(...).collect(), in-memory engine, 16 threads"
+sort,argsort float64,50000000,pyarrow-threaded,,,,0,no equivalent,"Acero's order_by node sorts rows; no node returns the sort permutation, so pyarrow.compute is the only idiom for an index-producing sort"
+sort,argsort float64,50000000,numpy-parallel,,,,0,no equivalent,numpy has no parallel idiom: its ufuncs are single-threaded
+sort,argsort utf8,10000000,arrowmetal,12.9882,3.2500,13.570,5,ok,
+sort,argsort utf8,10000000,polars,226.4060,3222.4960,0.778,5,ok,
+sort,argsort utf8,10000000,pyarrow,1573.6773,1573.5520,0.112,2,ok,
+sort,argsort utf8,10000000,pandas,1585.9083,1585.8090,0.111,2,ok,
+sort,argsort utf8,10000000,polars-lazy,223.9452,3174.3530,0.787,5,ok,"parallel idiom: pl.LazyFrame.select(...).collect(), in-memory engine, 16 threads"
+sort,argsort utf8,10000000,pyarrow-threaded,,,,0,no equivalent,"Acero's order_by node sorts rows; no node returns the sort permutation, so pyarrow.compute is the only idiom for an index-producing sort"
+sort,argsort utf8,10000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+sort,sort utf8,10000000,arrowmetal,21.7339,7.0810,16.219,5,ok,
+sort,sort utf8,10000000,polars,128.2266,1310.2020,2.749,5,ok,
+sort,sort utf8,10000000,pyarrow,1835.2644,1835.1040,0.192,2,ok,
+sort,sort utf8,10000000,pandas,1864.4819,1864.3620,0.189,2,ok,
+sort,sort utf8,10000000,polars-lazy,125.0760,1326.8250,2.818,5,ok,"parallel idiom: pl.LazyFrame.select(...).collect(), in-memory engine, 16 threads"
+sort,sort utf8,10000000,pyarrow-threaded,2384.6988,2388.1190,0.148,2,ok,"parallel idiom: Acero order_by node over 16 record batches, to_table(use_threads=True), 16 threads"
+sort,sort utf8,10000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+sort,sort float64,50000000,arrowmetal,29.5777,1.2940,27.047,5,ok,
+sort,sort float64,50000000,polars,136.4975,1286.3220,5.861,5,ok,
+sort,sort float64,50000000,pyarrow,21136.2049,21135.8140,0.038,2,ok,
+sort,sort float64,50000000,numpy,1726.3876,1726.2280,0.463,2,ok,
+sort,sort float64,50000000,polars-lazy,140.3633,1289.2370,5.699,5,ok,"parallel idiom: pl.LazyFrame.select(...).collect(), in-memory engine, 16 threads"
+sort,sort float64,50000000,pyarrow-threaded,23662.8615,23685.7160,0.034,2,ok,"parallel idiom: Acero order_by node over 16 record batches, to_table(use_threads=True), 16 threads"
+sort,sort float64,50000000,numpy-parallel,,,,0,no equivalent,numpy has no parallel idiom: its ufuncs are single-threaded
+sort,"top_k (k=100, int64)",50000000,arrowmetal,3.2339,1.4800,123.689,5,ok,
+sort,"top_k (k=100, int64)",50000000,polars,63.4862,63.5480,6.301,5,ok,
+sort,"top_k (k=100, int64)",50000000,pyarrow,23.9447,23.9420,16.705,5,ok,
+sort,"top_k (k=100, int64)",50000000,numpy,299.5105,299.4920,1.336,4,ok,
+sort,"top_k (k=100, int64)",50000000,polars-lazy,64.6207,64.6690,6.190,5,ok,"parallel idiom: pl.LazyFrame.select(...).collect(), in-memory engine, 16 threads"
+sort,"top_k (k=100, int64)",50000000,pyarrow-threaded,,,,0,no equivalent,pyarrow exposes no top-k node in Acero; pc.select_k_unstable is the only idiom
+sort,"top_k (k=100, int64)",50000000,numpy-parallel,,,,0,no equivalent,numpy has no parallel idiom: its ufuncs are single-threaded
+sort,"top_k (k=10000, int64)",50000000,arrowmetal,2.7620,1.6210,144.820,5,ok,
+sort,"top_k (k=10000, int64)",50000000,polars,63.4744,63.5620,6.302,5,ok,
+sort,"top_k (k=10000, int64)",50000000,pyarrow,34.4551,34.4440,11.609,5,ok,
+sort,"top_k (k=10000, int64)",50000000,numpy,300.2297,300.1960,1.332,4,ok,
+sort,"top_k (k=10000, int64)",50000000,polars-lazy,64.6600,64.7250,6.186,5,ok,"parallel idiom: pl.LazyFrame.select(...).collect(), in-memory engine, 16 threads"
+sort,"top_k (k=10000, int64)",50000000,pyarrow-threaded,,,,0,no equivalent,pyarrow exposes no top-k node in Acero; pc.select_k_unstable is the only idiom
+sort,"top_k (k=10000, int64)",50000000,numpy-parallel,,,,0,no equivalent,numpy has no parallel idiom: its ufuncs are single-threaded
+sort,rank (min),50000000,arrowmetal,64.3951,3.1560,12.423,5,ok,
+sort,rank (min),50000000,polars,685.5058,3962.2550,1.167,2,ok,
+sort,rank (min),50000000,pyarrow,20117.9349,20117.5470,0.040,2,ok,
+sort,rank (min),50000000,pandas,20743.5098,20743.0830,0.039,2,ok,
+sort,rank (min),50000000,polars-lazy,700.7293,4006.3300,1.142,2,ok,"parallel idiom: pl.LazyFrame.select(...).collect(), in-memory engine, 16 threads"
+sort,rank (min),50000000,pyarrow-threaded,,,,0,no equivalent,"not an Acero expression: this is a pyarrow *vector* function, and a project node executes scalar expressions only"
+sort,rank (min),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+sort,dense_rank,50000000,arrowmetal,63.7089,3.1200,12.557,5,ok,
+sort,dense_rank,50000000,polars,686.2555,3952.8170,1.166,2,ok,
+sort,dense_rank,50000000,pyarrow,20083.4779,20083.0770,0.040,2,ok,
+sort,dense_rank,50000000,pandas,20658.0849,20657.6650,0.039,2,ok,
+sort,dense_rank,50000000,polars-lazy,709.9443,4022.0970,1.127,2,ok,"parallel idiom: pl.LazyFrame.select(...).collect(), in-memory engine, 16 threads"
+sort,dense_rank,50000000,pyarrow-threaded,,,,0,no equivalent,"not an Acero expression: this is a pyarrow *vector* function, and a project node executes scalar expressions only"
+sort,dense_rank,50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+sort,lexsort (2 int32 keys),50000000,arrowmetal,34.8996,2.4890,22.923,5,ok,
+sort,lexsort (2 int32 keys),50000000,polars,905.5415,10093.1440,0.883,2,ok,
+sort,lexsort (2 int32 keys),50000000,pyarrow,11971.2424,11970.1880,0.067,2,ok,
+sort,lexsort (2 int32 keys),50000000,numpy,28793.6495,28793.0810,0.028,2,ok,
+sort,lexsort (2 int32 keys),50000000,polars-lazy,897.2785,10102.1690,0.892,2,ok,"parallel idiom: pl.LazyFrame.select(...).collect(), in-memory engine, 16 threads"
+sort,lexsort (2 int32 keys),50000000,pyarrow-threaded,,,,0,no equivalent,"Acero's order_by node sorts rows; no node returns the sort permutation, so pyarrow.compute is the only idiom for an index-producing sort"
+sort,lexsort (2 int32 keys),50000000,numpy-parallel,,,,0,no equivalent,numpy has no parallel idiom: its ufuncs are single-threaded
+sort,partition_nth_indices (n/2),50000000,arrowmetal,12.3259,4.0430,48.678,5,ok,
+sort,partition_nth_indices (n/2),50000000,polars,,,,0,no equivalent,polars has no partial-partition function
+sort,partition_nth_indices (n/2),50000000,pyarrow,308.9991,308.9770,1.942,4,ok,
+sort,partition_nth_indices (n/2),50000000,numpy,356.5324,356.4720,1.683,4,ok,
+sort,partition_nth_indices (n/2),50000000,pyarrow-threaded,,,,0,no equivalent,"not an Acero expression: this is a pyarrow *vector* function, and a project node executes scalar expressions only"
+sort,partition_nth_indices (n/2),50000000,numpy-parallel,,,,0,no equivalent,numpy has no parallel idiom: its ufuncs are single-threaded
+sort,"unique (int32, 1000 distinct)",50000000,arrowmetal,11.7288,5.7970,17.052,5,ok,
+sort,"unique (int32, 1000 distinct)",50000000,polars,93.6398,452.6170,2.136,5,ok,
+sort,"unique (int32, 1000 distinct)",50000000,pyarrow,228.2426,228.2230,0.876,5,ok,
+sort,"unique (int32, 1000 distinct)",50000000,pandas,65.6706,65.6720,3.046,5,ok,
+sort,"unique (int32, 1000 distinct)",50000000,polars-lazy,95.1056,457.9240,2.103,5,ok,"parallel idiom: pl.LazyFrame.select(...).collect(), in-memory engine, 16 threads"
+sort,"unique (int32, 1000 distinct)",50000000,pyarrow-threaded,12.3909,169.7120,16.141,5,ok,"parallel idiom: pa.Table.group_by(['x'], use_threads=True) over a 16-chunk table, 16 threads"
+sort,"unique (int32, 1000 distinct)",50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+sort,"value_counts (int32, 1000 distinct)",50000000,arrowmetal,13.0569,6.4830,15.318,5,ok,
+sort,"value_counts (int32, 1000 distinct)",50000000,polars,121.5108,121.4960,1.646,5,ok,
+sort,"value_counts (int32, 1000 distinct)",50000000,pyarrow,309.9118,309.8940,0.645,4,ok,
+sort,"value_counts (int32, 1000 distinct)",50000000,pandas,59.0999,59.0920,3.384,5,ok,
+sort,"value_counts (int32, 1000 distinct)",50000000,polars-lazy,114.1588,114.1460,1.752,5,ok,"parallel idiom: pl.LazyFrame.select(...).collect(), in-memory engine, 16 threads"
+sort,"value_counts (int32, 1000 distinct)",50000000,pyarrow-threaded,13.6315,187.1910,14.672,5,ok,"parallel idiom: pa.Table.group_by(['x'], use_threads=True) over a 16-chunk table, 16 threads"
+sort,"value_counts (int32, 1000 distinct)",50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+sort,dictionary_encode (int32),50000000,arrowmetal,13.9993,6.8890,28.573,5,ok,
+sort,dictionary_encode (int32),50000000,polars,,,,0,no equivalent,polars has no eager dictionary_encode for an integer Series
+sort,dictionary_encode (int32),50000000,pyarrow,272.2859,272.2660,1.469,5,ok,
+sort,dictionary_encode (int32),50000000,pandas,85.1097,85.1240,4.700,5,ok,
+sort,dictionary_encode (int32),50000000,pyarrow-threaded,,,,0,no equivalent,"not an Acero expression: this is a pyarrow *vector* function, and a project node executes scalar expressions only"
+sort,dictionary_encode (int32),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+sort,dictionary_encode (utf8),10000000,arrowmetal,4.2055,3.4260,41.910,5,ok,
+sort,dictionary_encode (utf8),10000000,polars,111.3477,111.3400,1.583,5,ok,
+sort,dictionary_encode (utf8),10000000,pyarrow,124.3152,124.3050,1.418,5,ok,
+sort,dictionary_encode (utf8),10000000,pandas,133.1240,133.1060,1.324,5,ok,
+sort,dictionary_encode (utf8),10000000,polars-lazy,112.7373,112.7250,1.563,5,ok,"parallel idiom: pl.LazyFrame.select(...).collect(), in-memory engine, 16 threads"
+sort,dictionary_encode (utf8),10000000,pyarrow-threaded,,,,0,no equivalent,"not an Acero expression: this is a pyarrow *vector* function, and a project node executes scalar expressions only"
+sort,dictionary_encode (utf8),10000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,sum by int32 key (1000 groups),50000000,arrowmetal,4.0552,1.2820,147.959,5,ok,
+group-by,sum by int32 key (1000 groups),50000000,polars,91.0516,1155.0240,6.590,5,ok,
+group-by,sum by int32 key (1000 groups),50000000,pyarrow,17.8594,242.0050,33.596,5,ok,
+group-by,sum by int32 key (1000 groups),50000000,pandas,226.0865,226.1380,2.654,5,ok,
+group-by,sum by int32 key (1000 groups),50000000,polars-lazy,79.5248,1197.8960,7.545,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,sum by int32 key (1000 groups),50000000,pyarrow-threaded,17.6000,238.4860,34.091,5,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,sum by int32 key (1000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,mean by int32 key (1000 groups),50000000,arrowmetal,4.1847,1.2800,143.381,5,ok,
+group-by,mean by int32 key (1000 groups),50000000,polars,79.5516,1198.2700,7.542,5,ok,
+group-by,mean by int32 key (1000 groups),50000000,pyarrow,17.8891,243.1430,33.540,5,ok,
+group-by,mean by int32 key (1000 groups),50000000,pandas,263.3242,263.3200,2.279,5,ok,
+group-by,mean by int32 key (1000 groups),50000000,polars-lazy,78.9560,1197.9750,7.599,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,mean by int32 key (1000 groups),50000000,pyarrow-threaded,17.7459,242.0130,33.811,5,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,mean by int32 key (1000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,min by int32 key (1000 groups),50000000,arrowmetal,4.9770,1.5550,120.555,5,ok,
+group-by,min by int32 key (1000 groups),50000000,polars,81.6302,1199.2030,7.350,5,ok,
+group-by,min by int32 key (1000 groups),50000000,pyarrow,18.7782,255.0890,31.952,5,ok,
+group-by,min by int32 key (1000 groups),50000000,pandas,261.8516,261.8480,2.291,5,ok,
+group-by,min by int32 key (1000 groups),50000000,polars-lazy,79.8462,1199.9570,7.514,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,min by int32 key (1000 groups),50000000,pyarrow-threaded,18.6200,254.4150,32.223,5,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,min by int32 key (1000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,max by int32 key (1000 groups),50000000,arrowmetal,5.0124,1.5900,119.703,5,ok,
+group-by,max by int32 key (1000 groups),50000000,polars,79.2399,1202.4200,7.572,5,ok,
+group-by,max by int32 key (1000 groups),50000000,pyarrow,18.7815,256.0550,31.946,5,ok,
+group-by,max by int32 key (1000 groups),50000000,pandas,259.6446,259.6740,2.311,5,ok,
+group-by,max by int32 key (1000 groups),50000000,polars-lazy,78.3031,1189.3510,7.663,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,max by int32 key (1000 groups),50000000,pyarrow-threaded,18.5828,254.6770,32.288,5,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,max by int32 key (1000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,count by int32 key (1000 groups),50000000,arrowmetal,3.4965,1.3010,171.600,5,ok,
+group-by,count by int32 key (1000 groups),50000000,polars,88.3215,805.4050,6.793,5,ok,
+group-by,count by int32 key (1000 groups),50000000,pyarrow,16.8033,227.5060,35.707,5,ok,
+group-by,count by int32 key (1000 groups),50000000,pandas,136.6018,136.5930,4.392,5,ok,
+group-by,count by int32 key (1000 groups),50000000,polars-lazy,89.1689,810.0580,6.729,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,count by int32 key (1000 groups),50000000,pyarrow-threaded,16.5765,225.9990,36.196,5,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,count by int32 key (1000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,sum by utf8 key (1000 distinct),50000000,arrowmetal,14.3736,3.3040,69.572,5,ok,
+group-by,sum by utf8 key (1000 distinct),50000000,polars,129.9686,1861.1200,7.694,5,ok,
+group-by,sum by utf8 key (1000 distinct),50000000,pyarrow,35.7046,523.8890,28.008,5,ok,
+group-by,sum by utf8 key (1000 distinct),50000000,pandas,524.8430,524.8190,1.905,3,ok,
+group-by,sum by utf8 key (1000 distinct),50000000,polars-lazy,135.3325,1962.5270,7.389,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,sum by utf8 key (1000 distinct),50000000,pyarrow-threaded,37.3558,516.3860,26.770,5,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,sum by utf8 key (1000 distinct),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,sum by two int32 keys (~1024 groups),50000000,arrowmetal,5.7607,2.2190,138.873,5,ok,
+group-by,sum by two int32 keys (~1024 groups),50000000,polars,161.0691,2167.9120,4.967,5,ok,
+group-by,sum by two int32 keys (~1024 groups),50000000,pyarrow,21.2772,287.5120,37.599,5,ok,
+group-by,sum by two int32 keys (~1024 groups),50000000,pandas,416.6326,416.6020,1.920,3,ok,
+group-by,sum by two int32 keys (~1024 groups),50000000,polars-lazy,165.1305,2128.2030,4.845,5,ok,"parallel idiom: pl.LazyFrame.group_by(['a', 'b']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,sum by two int32 keys (~1024 groups),50000000,pyarrow-threaded,20.8568,286.1690,38.357,5,ok,"parallel idiom: pa.Table.group_by(['a', 'b'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,sum by two int32 keys (~1024 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,sum by int32 key (100000 groups),50000000,arrowmetal,6.8175,1.2730,88.009,5,ok,
+group-by,sum by int32 key (100000 groups),50000000,polars,94.8858,1414.6530,6.323,5,ok,
+group-by,sum by int32 key (100000 groups),50000000,pyarrow,44.7829,520.0410,13.398,5,ok,
+group-by,sum by int32 key (100000 groups),50000000,pandas,333.9122,333.9120,1.797,4,ok,
+group-by,sum by int32 key (100000 groups),50000000,polars-lazy,93.5606,1384.8860,6.413,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,sum by int32 key (100000 groups),50000000,pyarrow-threaded,44.2734,515.5290,13.552,5,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,sum by int32 key (100000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,mean by int32 key (100000 groups),50000000,arrowmetal,6.8814,1.3110,87.192,5,ok,
+group-by,mean by int32 key (100000 groups),50000000,polars,96.1669,1413.2230,6.239,5,ok,
+group-by,mean by int32 key (100000 groups),50000000,pyarrow,44.6447,513.2360,13.439,5,ok,
+group-by,mean by int32 key (100000 groups),50000000,pandas,427.5210,427.5070,1.403,3,ok,
+group-by,mean by int32 key (100000 groups),50000000,polars-lazy,92.3354,1400.9640,6.498,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,mean by int32 key (100000 groups),50000000,pyarrow-threaded,44.2072,516.5620,13.572,5,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,mean by int32 key (100000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,min by int32 key (100000 groups),50000000,arrowmetal,8.0585,1.5500,74.456,5,ok,
+group-by,min by int32 key (100000 groups),50000000,polars,97.0508,1430.9320,6.182,5,ok,
+group-by,min by int32 key (100000 groups),50000000,pyarrow,48.1905,552.9730,12.451,5,ok,
+group-by,min by int32 key (100000 groups),50000000,pandas,329.5016,329.4690,1.821,4,ok,
+group-by,min by int32 key (100000 groups),50000000,polars-lazy,94.1650,1402.1620,6.372,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,min by int32 key (100000 groups),50000000,pyarrow-threaded,48.1953,548.2770,12.449,5,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,min by int32 key (100000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,max by int32 key (100000 groups),50000000,arrowmetal,8.0262,1.5240,74.755,5,ok,
+group-by,max by int32 key (100000 groups),50000000,polars,97.1246,1448.0020,6.178,5,ok,
+group-by,max by int32 key (100000 groups),50000000,pyarrow,48.5865,552.7320,12.349,5,ok,
+group-by,max by int32 key (100000 groups),50000000,pandas,331.4666,331.5070,1.810,4,ok,
+group-by,max by int32 key (100000 groups),50000000,polars-lazy,96.0770,1411.5840,6.245,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,max by int32 key (100000 groups),50000000,pyarrow-threaded,49.4162,554.2550,12.142,5,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,max by int32 key (100000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,count by int32 key (100000 groups),50000000,arrowmetal,4.3090,1.2720,139.245,5,ok,
+group-by,count by int32 key (100000 groups),50000000,polars,108.3051,1010.6910,5.540,5,ok,
+group-by,count by int32 key (100000 groups),50000000,pyarrow,35.6894,409.0490,16.812,5,ok,
+group-by,count by int32 key (100000 groups),50000000,pandas,160.5088,160.4950,3.738,5,ok,
+group-by,count by int32 key (100000 groups),50000000,polars-lazy,107.4084,1008.4740,5.586,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,count by int32 key (100000 groups),50000000,pyarrow-threaded,35.6948,407.6990,16.809,5,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,count by int32 key (100000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,sum by utf8 key (100000 distinct),50000000,arrowmetal,20.6608,3.6330,48.401,5,ok,
+group-by,sum by utf8 key (100000 distinct),50000000,polars,162.8469,2306.4740,6.141,5,ok,
+group-by,sum by utf8 key (100000 distinct),50000000,pyarrow,136.8608,1639.7550,7.307,5,ok,
+group-by,sum by utf8 key (100000 distinct),50000000,pandas,803.3048,803.2660,1.245,2,ok,
+group-by,sum by utf8 key (100000 distinct),50000000,polars-lazy,162.9493,2297.8290,6.137,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,sum by utf8 key (100000 distinct),50000000,pyarrow-threaded,131.0807,1610.7550,7.629,5,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,sum by utf8 key (100000 distinct),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,sum by two int32 keys (~100489 groups),50000000,arrowmetal,8.0355,2.2910,99.558,5,ok,
+group-by,sum by two int32 keys (~100489 groups),50000000,polars,182.4623,2488.3760,4.384,5,ok,
+group-by,sum by two int32 keys (~100489 groups),50000000,pyarrow,55.7373,633.5630,14.353,5,ok,
+group-by,sum by two int32 keys (~100489 groups),50000000,pandas,543.1985,543.0170,1.473,3,ok,
+group-by,sum by two int32 keys (~100489 groups),50000000,polars-lazy,194.1299,2564.4620,4.121,5,ok,"parallel idiom: pl.LazyFrame.group_by(['a', 'b']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,sum by two int32 keys (~100489 groups),50000000,pyarrow-threaded,54.7030,610.2590,14.624,5,ok,"parallel idiom: pa.Table.group_by(['a', 'b'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,sum by two int32 keys (~100489 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,sum by int32 key (10000000 groups),50000000,arrowmetal,44.9053,2.2390,13.361,5,ok,
+group-by,sum by int32 key (10000000 groups),50000000,polars,310.6366,4588.4090,1.932,4,ok,
+group-by,sum by int32 key (10000000 groups),50000000,pyarrow,1222.6189,3723.2330,0.491,2,ok,
+group-by,sum by int32 key (10000000 groups),50000000,pandas,1254.2690,1254.1880,0.478,2,ok,
+group-by,sum by int32 key (10000000 groups),50000000,polars-lazy,311.9441,4601.7490,1.923,4,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,sum by int32 key (10000000 groups),50000000,pyarrow-threaded,1216.3983,3704.2810,0.493,2,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,sum by int32 key (10000000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,mean by int32 key (10000000 groups),50000000,arrowmetal,48.0748,2.1610,12.481,5,ok,
+group-by,mean by int32 key (10000000 groups),50000000,polars,326.5223,4852.0000,1.838,4,ok,
+group-by,mean by int32 key (10000000 groups),50000000,pyarrow,1186.2222,3630.9090,0.506,2,ok,
+group-by,mean by int32 key (10000000 groups),50000000,pandas,1297.8212,1297.7230,0.462,2,ok,
+group-by,mean by int32 key (10000000 groups),50000000,polars-lazy,325.3895,4848.3660,1.844,4,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,mean by int32 key (10000000 groups),50000000,pyarrow-threaded,1184.0638,3621.2620,0.507,2,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,mean by int32 key (10000000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,min by int32 key (10000000 groups),50000000,arrowmetal,32.5566,1.9710,18.429,5,ok,
+group-by,min by int32 key (10000000 groups),50000000,polars,314.6370,4727.9380,1.907,4,ok,
+group-by,min by int32 key (10000000 groups),50000000,pyarrow,1236.7706,3746.7410,0.485,2,ok,
+group-by,min by int32 key (10000000 groups),50000000,pandas,1356.9283,1356.8150,0.442,2,ok,
+group-by,min by int32 key (10000000 groups),50000000,polars-lazy,319.5745,4755.2560,1.877,4,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,min by int32 key (10000000 groups),50000000,pyarrow-threaded,1249.0955,3874.4510,0.480,2,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,min by int32 key (10000000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,max by int32 key (10000000 groups),50000000,arrowmetal,32.4222,1.8580,18.506,5,ok,
+group-by,max by int32 key (10000000 groups),50000000,polars,316.8674,4779.5040,1.894,4,ok,
+group-by,max by int32 key (10000000 groups),50000000,pyarrow,1240.5941,3773.3330,0.484,2,ok,
+group-by,max by int32 key (10000000 groups),50000000,pandas,1348.4652,1348.3690,0.445,2,ok,
+group-by,max by int32 key (10000000 groups),50000000,polars-lazy,321.3652,4779.5030,1.867,4,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,max by int32 key (10000000 groups),50000000,pyarrow-threaded,1208.3175,3716.0940,0.497,2,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,max by int32 key (10000000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,count by int32 key (10000000 groups),50000000,arrowmetal,15.8987,2.0380,37.739,5,ok,
+group-by,count by int32 key (10000000 groups),50000000,polars,428.3902,4151.9610,1.401,3,ok,
+group-by,count by int32 key (10000000 groups),50000000,pyarrow,979.7323,3155.8720,0.612,2,ok,
+group-by,count by int32 key (10000000 groups),50000000,pandas,714.8018,714.7710,0.839,2,ok,
+group-by,count by int32 key (10000000 groups),50000000,polars-lazy,426.3320,4088.6610,1.407,3,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,count by int32 key (10000000 groups),50000000,pyarrow-threaded,981.7105,3170.7090,0.611,2,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,count by int32 key (10000000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,sum by utf8 key (10000000 distinct),50000000,arrowmetal,117.6357,6.2120,8.501,5,ok,
+group-by,sum by utf8 key (10000000 distinct),50000000,polars,516.4390,7468.1910,1.936,3,ok,
+group-by,sum by utf8 key (10000000 distinct),50000000,pyarrow,2742.8820,6247.7960,0.365,2,ok,
+group-by,sum by utf8 key (10000000 distinct),50000000,pandas,4213.9969,4213.8990,0.237,2,ok,
+group-by,sum by utf8 key (10000000 distinct),50000000,polars-lazy,516.3448,7545.3060,1.937,3,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,sum by utf8 key (10000000 distinct),50000000,pyarrow-threaded,2740.0693,6230.6760,0.365,2,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,sum by utf8 key (10000000 distinct),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,sum by two int32 keys (~10004569 groups),50000000,arrowmetal,46.6434,3.3290,17.151,5,ok,
+group-by,sum by two int32 keys (~10004569 groups),50000000,polars,535.9646,7815.7230,1.493,3,ok,
+group-by,sum by two int32 keys (~10004569 groups),50000000,pyarrow,1321.5357,3846.4530,0.605,2,ok,
+group-by,sum by two int32 keys (~10004569 groups),50000000,pandas,1575.1877,1574.9560,0.508,2,ok,
+group-by,sum by two int32 keys (~10004569 groups),50000000,polars-lazy,546.0516,7925.6480,1.465,3,ok,"parallel idiom: pl.LazyFrame.group_by(['a', 'b']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,sum by two int32 keys (~10004569 groups),50000000,pyarrow-threaded,1327.3163,3818.2920,0.603,2,ok,"parallel idiom: pa.Table.group_by(['a', 'b'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,sum by two int32 keys (~10004569 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,variance by key (1000 groups),50000000,arrowmetal,29.3805,1.9910,20.422,5,ok,
+group-by,variance by key (1000 groups),50000000,polars,82.7552,1218.1870,7.250,5,ok,
+group-by,variance by key (1000 groups),50000000,pyarrow,25.8250,347.3740,23.233,5,ok,
+group-by,variance by key (1000 groups),50000000,pandas,245.3381,245.3310,2.446,5,ok,
+group-by,variance by key (1000 groups),50000000,polars-lazy,82.4551,1214.8690,7.277,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,variance by key (1000 groups),50000000,pyarrow-threaded,26.5067,353.4930,22.636,5,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,variance by key (1000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,stddev by key (1000 groups),50000000,arrowmetal,29.4258,2.0200,20.390,5,ok,
+group-by,stddev by key (1000 groups),50000000,polars,84.4958,1241.2600,7.101,5,ok,
+group-by,stddev by key (1000 groups),50000000,pyarrow,26.8614,363.1850,22.337,5,ok,
+group-by,stddev by key (1000 groups),50000000,pandas,244.6223,244.5880,2.453,5,ok,
+group-by,stddev by key (1000 groups),50000000,polars-lazy,83.5505,1220.9750,7.181,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,stddev by key (1000 groups),50000000,pyarrow-threaded,26.7883,366.9010,22.398,5,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,stddev by key (1000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,"min by key, float64 (1000 groups)",50000000,arrowmetal,4.9614,1.5570,120.933,5,ok,
+group-by,"min by key, float64 (1000 groups)",50000000,polars,83.9304,1260.0700,7.149,5,ok,
+group-by,"min by key, float64 (1000 groups)",50000000,pyarrow,20.4644,280.1490,29.319,5,ok,
+group-by,"min by key, float64 (1000 groups)",50000000,pandas,231.2090,231.2580,2.595,5,ok,
+group-by,"min by key, float64 (1000 groups)",50000000,polars-lazy,84.5799,1224.0780,7.094,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,"min by key, float64 (1000 groups)",50000000,pyarrow-threaded,20.2552,276.7810,29.622,5,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,"min by key, float64 (1000 groups)",50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,"max by key, float64 (1000 groups)",50000000,arrowmetal,4.9097,1.5020,122.207,5,ok,
+group-by,"max by key, float64 (1000 groups)",50000000,polars,84.7903,1257.4870,7.076,5,ok,
+group-by,"max by key, float64 (1000 groups)",50000000,pyarrow,21.3840,281.5680,28.058,5,ok,
+group-by,"max by key, float64 (1000 groups)",50000000,pandas,240.3060,240.3540,2.497,5,ok,
+group-by,"max by key, float64 (1000 groups)",50000000,polars-lazy,83.2124,1222.3240,7.210,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,"max by key, float64 (1000 groups)",50000000,pyarrow-threaded,20.7223,275.5600,28.954,5,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,"max by key, float64 (1000 groups)",50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,count_distinct by key (1000 groups),50000000,arrowmetal,36.6271,2.4700,16.381,5,ok,
+group-by,count_distinct by key (1000 groups),50000000,polars,156.6857,2390.0990,3.829,5,ok,
+group-by,count_distinct by key (1000 groups),50000000,pyarrow,1812.0282,4176.0280,0.331,2,ok,
+group-by,count_distinct by key (1000 groups),50000000,pandas,4277.4913,4270.4030,0.140,2,ok,
+group-by,count_distinct by key (1000 groups),50000000,polars-lazy,154.0048,2305.4980,3.896,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,count_distinct by key (1000 groups),50000000,pyarrow-threaded,1826.2194,4181.0300,0.329,2,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,count_distinct by key (1000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,first by key (1000 groups),50000000,arrowmetal,6.1871,3.5090,96.976,5,ok,
+group-by,first by key (1000 groups),50000000,polars,55.6264,779.3580,10.786,5,ok,
+group-by,first by key (1000 groups),50000000,pyarrow,204.3168,204.3160,2.937,5,ok,
+group-by,first by key (1000 groups),50000000,pandas,197.5174,197.5080,3.038,5,ok,
+group-by,first by key (1000 groups),50000000,polars-lazy,54.5177,781.8480,11.006,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,first by key (1000 groups),50000000,pyarrow-threaded,,,,0,no equivalent,"Acero refuses hash_first in a threaded plan: ""Using ordered aggregator in multiple threaded execution is not supported""; the default row already runs it with use_threads=False"
+group-by,first by key (1000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,list by key (1000 groups),50000000,arrowmetal,27.6267,4.2820,36.197,5,ok,
+group-by,list by key (1000 groups),50000000,polars,320.1141,1041.6550,3.124,4,ok,
+group-by,list by key (1000 groups),50000000,pyarrow,405.1840,644.8010,2.468,3,ok,
+group-by,list by key (1000 groups),50000000,pandas,7982.5643,7981.8230,0.125,2,ok,pandas has no vectorised list aggregation; apply(list) is its idiom
+group-by,list by key (1000 groups),50000000,polars-lazy,313.7088,1030.8370,3.188,4,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,list by key (1000 groups),50000000,pyarrow-threaded,389.5126,614.3690,2.567,3,ok,"the same lists, but the order of the values inside each group follows batch arrival, so --verify does not compare them element by element (parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads)"
+group-by,list by key (1000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,variance by key (100000 groups),50000000,arrowmetal,36.9220,2.4050,16.250,5,ok,
+group-by,variance by key (100000 groups),50000000,polars,93.3627,1404.6130,6.427,5,ok,
+group-by,variance by key (100000 groups),50000000,pyarrow,124.2592,1561.9310,4.829,5,ok,
+group-by,variance by key (100000 groups),50000000,pandas,421.7837,421.7290,1.423,3,ok,
+group-by,variance by key (100000 groups),50000000,polars-lazy,92.2365,1401.4770,6.505,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,variance by key (100000 groups),50000000,pyarrow-threaded,124.1103,1560.8450,4.834,5,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,variance by key (100000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,stddev by key (100000 groups),50000000,arrowmetal,37.0669,2.6100,16.187,5,ok,
+group-by,stddev by key (100000 groups),50000000,polars,93.7410,1419.6610,6.401,5,ok,
+group-by,stddev by key (100000 groups),50000000,pyarrow,125.4415,1567.4550,4.783,5,ok,
+group-by,stddev by key (100000 groups),50000000,pandas,428.6015,428.5730,1.400,3,ok,
+group-by,stddev by key (100000 groups),50000000,polars-lazy,94.3325,1412.5390,6.360,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,stddev by key (100000 groups),50000000,pyarrow-threaded,127.2665,1571.9820,4.715,5,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,stddev by key (100000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,"min by key, float64 (100000 groups)",50000000,arrowmetal,6.9490,1.5550,86.343,5,ok,
+group-by,"min by key, float64 (100000 groups)",50000000,polars,97.0697,1435.8300,6.181,5,ok,
+group-by,"min by key, float64 (100000 groups)",50000000,pyarrow,47.7172,543.4840,12.574,5,ok,
+group-by,"min by key, float64 (100000 groups)",50000000,pandas,316.4025,316.4380,1.896,4,ok,
+group-by,"min by key, float64 (100000 groups)",50000000,polars-lazy,94.6261,1409.5460,6.341,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,"min by key, float64 (100000 groups)",50000000,pyarrow-threaded,48.2749,540.3290,12.429,5,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,"min by key, float64 (100000 groups)",50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,"max by key, float64 (100000 groups)",50000000,arrowmetal,6.9944,1.5640,85.783,5,ok,
+group-by,"max by key, float64 (100000 groups)",50000000,polars,97.9130,1477.1530,6.128,5,ok,
+group-by,"max by key, float64 (100000 groups)",50000000,pyarrow,48.6100,537.3370,12.343,5,ok,
+group-by,"max by key, float64 (100000 groups)",50000000,pandas,315.7492,315.7700,1.900,4,ok,
+group-by,"max by key, float64 (100000 groups)",50000000,polars-lazy,100.3192,1400.5540,5.981,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,"max by key, float64 (100000 groups)",50000000,pyarrow-threaded,48.0787,530.0060,12.480,5,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,"max by key, float64 (100000 groups)",50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,count_distinct by key (100000 groups),50000000,arrowmetal,37.3898,2.5370,16.047,5,ok,
+group-by,count_distinct by key (100000 groups),50000000,polars,150.7355,2295.4860,3.980,5,ok,
+group-by,count_distinct by key (100000 groups),50000000,pyarrow,1951.5902,4948.6150,0.307,2,ok,
+group-by,count_distinct by key (100000 groups),50000000,pandas,4219.3344,4219.0260,0.142,2,ok,
+group-by,count_distinct by key (100000 groups),50000000,polars-lazy,143.4720,2180.1410,4.182,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,count_distinct by key (100000 groups),50000000,pyarrow-threaded,1974.1272,4951.8190,0.304,2,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,count_distinct by key (100000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,first by key (100000 groups),50000000,arrowmetal,8.9794,3.4750,66.819,5,ok,
+group-by,first by key (100000 groups),50000000,polars,66.4150,954.5340,9.034,5,ok,
+group-by,first by key (100000 groups),50000000,pyarrow,256.7770,256.8250,2.337,5,ok,
+group-by,first by key (100000 groups),50000000,pandas,242.1695,242.1590,2.478,5,ok,
+group-by,first by key (100000 groups),50000000,polars-lazy,64.4631,950.7720,9.308,5,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,first by key (100000 groups),50000000,pyarrow-threaded,,,,0,no equivalent,"Acero refuses hash_first in a threaded plan: ""Using ordered aggregator in multiple threaded execution is not supported""; the default row already runs it with use_threads=False"
+group-by,first by key (100000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,list by key (100000 groups),50000000,arrowmetal,34.8395,4.5620,28.703,5,ok,
+group-by,list by key (100000 groups),50000000,polars,354.9792,1270.9460,2.817,4,ok,
+group-by,list by key (100000 groups),50000000,pyarrow,491.3842,856.6390,2.035,3,ok,
+group-by,list by key (100000 groups),50000000,pandas,9360.8422,9360.0860,0.107,2,ok,pandas has no vectorised list aggregation; apply(list) is its idiom
+group-by,list by key (100000 groups),50000000,polars-lazy,343.8805,1258.1820,2.908,4,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,list by key (100000 groups),50000000,pyarrow-threaded,492.0834,825.8280,2.032,3,ok,"the same lists, but the order of the values inside each group follows batch arrival, so --verify does not compare them element by element (parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads)"
+group-by,list by key (100000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,variance by key (10000000 groups),50000000,arrowmetal,67.8834,3.0650,8.839,5,ok,
+group-by,variance by key (10000000 groups),50000000,polars,325.5289,4828.4890,1.843,4,ok,
+group-by,variance by key (10000000 groups),50000000,pyarrow,2378.9914,11654.0280,0.252,2,ok,
+group-by,variance by key (10000000 groups),50000000,pandas,1365.1139,1365.0080,0.440,2,ok,
+group-by,variance by key (10000000 groups),50000000,polars-lazy,320.0459,4809.1850,1.875,4,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,variance by key (10000000 groups),50000000,pyarrow-threaded,2391.3060,11966.0790,0.251,2,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,variance by key (10000000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,stddev by key (10000000 groups),50000000,arrowmetal,81.8028,15.9740,7.335,5,ok,
+group-by,stddev by key (10000000 groups),50000000,polars,323.8312,4828.6440,1.853,4,ok,
+group-by,stddev by key (10000000 groups),50000000,pyarrow,2387.5852,11776.7440,0.251,2,ok,
+group-by,stddev by key (10000000 groups),50000000,pandas,1356.9089,1356.8490,0.442,2,ok,
+group-by,stddev by key (10000000 groups),50000000,polars-lazy,321.3874,4808.8390,1.867,4,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,stddev by key (10000000 groups),50000000,pyarrow-threaded,2398.0782,11758.7670,0.250,2,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,stddev by key (10000000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,"min by key, float64 (10000000 groups)",50000000,arrowmetal,32.7231,1.9440,18.336,5,ok,
+group-by,"min by key, float64 (10000000 groups)",50000000,polars,324.7798,4781.3510,1.847,4,ok,
+group-by,"min by key, float64 (10000000 groups)",50000000,pyarrow,1193.0030,3815.2830,0.503,2,ok,
+group-by,"min by key, float64 (10000000 groups)",50000000,pandas,1306.0382,1305.9310,0.459,2,ok,
+group-by,"min by key, float64 (10000000 groups)",50000000,polars-lazy,322.7834,4812.9830,1.859,4,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,"min by key, float64 (10000000 groups)",50000000,pyarrow-threaded,1194.2852,3718.1720,0.502,2,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,"min by key, float64 (10000000 groups)",50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,"max by key, float64 (10000000 groups)",50000000,arrowmetal,32.6692,1.9240,18.366,5,ok,
+group-by,"max by key, float64 (10000000 groups)",50000000,polars,325.5871,4899.5850,1.843,4,ok,
+group-by,"max by key, float64 (10000000 groups)",50000000,pyarrow,1195.4370,3639.0860,0.502,2,ok,
+group-by,"max by key, float64 (10000000 groups)",50000000,pandas,1314.1967,1314.0570,0.457,2,ok,
+group-by,"max by key, float64 (10000000 groups)",50000000,polars-lazy,319.1619,4779.0310,1.880,4,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,"max by key, float64 (10000000 groups)",50000000,pyarrow-threaded,1197.7250,3692.7810,0.501,2,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,"max by key, float64 (10000000 groups)",50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,count_distinct by key (10000000 groups),50000000,arrowmetal,55.9398,2.9850,10.726,5,ok,
+group-by,count_distinct by key (10000000 groups),50000000,polars,407.0688,6128.6240,1.474,3,ok,
+group-by,count_distinct by key (10000000 groups),50000000,pyarrow,3104.6278,7827.7820,0.193,2,ok,
+group-by,count_distinct by key (10000000 groups),50000000,pandas,4900.5662,4835.9870,0.122,2,ok,
+group-by,count_distinct by key (10000000 groups),50000000,polars-lazy,408.2800,6106.6480,1.470,3,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,count_distinct by key (10000000 groups),50000000,pyarrow-threaded,3109.5073,7782.5870,0.193,2,ok,"parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads"
+group-by,count_distinct by key (10000000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,first by key (10000000 groups),50000000,arrowmetal,28.1514,4.1610,21.313,5,ok,
+group-by,first by key (10000000 groups),50000000,polars,351.8095,4049.5380,1.705,4,ok,
+group-by,first by key (10000000 groups),50000000,pyarrow,1112.4258,1112.3190,0.539,2,ok,
+group-by,first by key (10000000 groups),50000000,pandas,1019.3495,1019.2890,0.589,2,ok,
+group-by,first by key (10000000 groups),50000000,polars-lazy,343.0156,4069.8870,1.749,4,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,first by key (10000000 groups),50000000,pyarrow-threaded,,,,0,no equivalent,"Acero refuses hash_first in a threaded plan: ""Using ordered aggregator in multiple threaded execution is not supported""; the default row already runs it with use_threads=False"
+group-by,first by key (10000000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+group-by,list by key (10000000 groups),50000000,arrowmetal,77.4387,5.9030,12.913,5,ok,
+group-by,list by key (10000000 groups),50000000,polars,815.0830,4486.9240,1.227,2,ok,
+group-by,list by key (10000000 groups),50000000,pyarrow,1433.7153,3538.9920,0.697,2,ok,
+group-by,list by key (10000000 groups),50000000,pandas,87632.8527,87625.8180,0.011,2,ok,pandas has no vectorised list aggregation; apply(list) is its idiom
+group-by,list by key (10000000 groups),50000000,polars-lazy,799.3434,4508.7970,1.251,2,ok,"parallel idiom: pl.LazyFrame.group_by(['k']).agg(...).collect(), in-memory engine, 16 threads"
+group-by,list by key (10000000 groups),50000000,pyarrow-threaded,1411.2493,3543.8440,0.709,2,ok,"the same lists, but the order of the values inside each group follows batch arrival, so --verify does not compare them element by element (parallel idiom: pa.Table.group_by(['k'], use_threads=True) over a 16-chunk table, 16 threads)"
+group-by,list by key (10000000 groups),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+window,cumulative_sum (float64),50000000,arrowmetal,11.7227,0.4290,68.244,5,ok,
+window,cumulative_sum (float64),50000000,polars,130.5531,130.5550,6.128,5,ok,
+window,cumulative_sum (float64),50000000,pyarrow,100.8314,100.8750,7.934,5,ok,
+window,cumulative_sum (float64),50000000,pandas,122.4629,122.4570,6.533,5,ok,
+window,cumulative_sum (float64),50000000,polars-lazy,131.8142,131.7950,6.069,5,ok,"parallel idiom: pl.LazyFrame.select(...).collect(), in-memory engine, 16 threads"
+window,cumulative_sum (float64),50000000,pyarrow-threaded,,,,0,no equivalent,"not an Acero expression: this is a pyarrow *vector* function, and a project node executes scalar expressions only; a running total is sequential; polars keeps it in one pass and Acero has no node for it, so there is no parallel idiom on either side"
+window,cumulative_sum (float64),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+window,cumulative_prod (float64),50000000,arrowmetal,11.1776,0.4290,71.572,5,ok,
+window,cumulative_prod (float64),50000000,polars,131.5953,131.5880,6.079,5,ok,
+window,cumulative_prod (float64),50000000,pyarrow,101.5592,101.5580,7.877,5,ok,
+window,cumulative_prod (float64),50000000,pandas,122.6363,122.6380,6.523,5,ok,
+window,cumulative_prod (float64),50000000,polars-lazy,132.7814,132.7610,6.025,5,ok,"parallel idiom: pl.LazyFrame.select(...).collect(), in-memory engine, 16 threads"
+window,cumulative_prod (float64),50000000,pyarrow-threaded,,,,0,no equivalent,"not an Acero expression: this is a pyarrow *vector* function, and a project node executes scalar expressions only; a running total is sequential; polars keeps it in one pass and Acero has no node for it, so there is no parallel idiom on either side"
+window,cumulative_prod (float64),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+window,"shift (lag 1, int64)",50000000,arrowmetal,2.5146,0.9200,318.144,5,ok,
+window,"shift (lag 1, int64)",50000000,polars,0.0463,0.0870,17297.297,5,ok,
+window,"shift (lag 1, int64)",50000000,pyarrow,,,,0,no equivalent,pyarrow.compute has no shift/lag kernel
+window,"shift (lag 1, int64)",50000000,pandas,0.1307,0.1320,6120.466,5,ok,
+window,"shift (lag 1, int64)",50000000,polars-lazy,0.0437,0.0690,18303.286,5,ok,"parallel idiom: pl.LazyFrame.select(...).collect(), in-memory engine, 16 threads"
+window,"shift (lag 1, int64)",50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+window,pairwise_diff (float64),50000000,arrowmetal,2.4468,0.8530,326.953,5,ok,
+window,pairwise_diff (float64),50000000,polars,24.8215,24.9040,32.230,5,ok,
+window,pairwise_diff (float64),50000000,pyarrow,99.9576,99.9500,8.003,5,ok,
+window,pairwise_diff (float64),50000000,pandas,29.4355,29.4260,27.178,5,ok,
+window,pairwise_diff (float64),50000000,polars-lazy,24.5160,24.5790,32.632,5,ok,"parallel idiom: pl.LazyFrame.select(...).collect(), in-memory engine, 16 threads"
+window,pairwise_diff (float64),50000000,pyarrow-threaded,,,,0,no equivalent,"not an Acero expression: this is a pyarrow *vector* function, and a project node executes scalar expressions only"
+window,pairwise_diff (float64),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+window,rolling_sum (window 64),50000000,arrowmetal,17.4566,2.0760,45.828,5,ok,
+window,rolling_sum (window 64),50000000,polars,435.2757,435.2220,1.838,3,ok,
+window,rolling_sum (window 64),50000000,pyarrow,,,,0,no equivalent,pyarrow.compute has no rolling-window kernels
+window,rolling_sum (window 64),50000000,pandas,240.3802,240.3610,3.328,5,ok,
+window,rolling_sum (window 64),50000000,polars-lazy,433.7186,433.6970,1.845,3,ok,"parallel idiom: pl.LazyFrame.select(...).collect(), in-memory engine, 16 threads"
+window,rolling_sum (window 64),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
+window,rolling_mean (window 64),50000000,arrowmetal,20.2635,2.0640,39.480,5,ok,
+window,rolling_mean (window 64),50000000,polars,427.2115,427.1950,1.873,3,ok,
+window,rolling_mean (window 64),50000000,pyarrow,,,,0,no equivalent,
+window,rolling_mean (window 64),50000000,pandas,219.9015,219.8810,3.638,5,ok,
+window,rolling_mean (window 64),50000000,polars-lazy,427.2546,427.2380,1.872,3,ok,"parallel idiom: pl.LazyFrame.select(...).collect(), in-memory engine, 16 threads"
+window,rolling_mean (window 64),50000000,pandas-parallel,,,,0,no equivalent,"pandas has no parallel idiom here: its kernels are single-threaded by design and its two threaded paths are numexpr (element-wise arithmetic through pd.eval / DataFrame.eval) and the numba engine with parallel=True (rolling, groupby.agg / transform, apply), neither of which is installed in this environment"
