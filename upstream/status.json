@@ -1,5 +1,5 @@
 {
- "as_of": "2026-11-08T13:41:08Z",
+ "as_of": "2026-11-08T21:14:47Z",
  "window_days": 14,
  "count": 16,
  "with_project_activity": 15,
@@ -886,7 +886,7 @@
    "labels": [],
    "reactions": 0,
    "maintainer_events": [],
-   "reporter_comments": 0,
+   "reporter_comments": 1,
    "community_comments": 0,
    "last_activity": "2026-11-08T05:42:10Z",
    "pulse": true
