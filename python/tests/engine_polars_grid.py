@@ -616,9 +616,22 @@ def _summation_order(case, extra):
     return extra["ulps_of_magnitude"] <= bound
 
 
+def _streaming_small_frame(case, extra):
+    """A division by a literal over a frame of under 100 rows on Polars 2.x, whose `collect()` is
+    the streaming engine: it divides such frames element-wise (the correctly rounded x / c) where
+    the in-memory engine, the one MetalEngine matches, multiplies by the reciprocal."""
+    major = int(pl.__version__.split(".")[0])
+    return major >= 2 and case["ds"][0] < 100 and extra.get("kind") == "values"
+
+
 DIVERGENCES = [
     ec.Divergence("float-summation-order", ENGINE,
                   "a float sum or mean adds in another order than Polars, and differs in the last bits",
                   "docs/POLARS.md", "**Float sums and means.**",
                   check=_summation_order),
+    ec.Divergence("streaming-small-frame-division", ENGINE,
+                  "on Polars 2.x, collect() (streaming) divides a frame of under 100 rows by a literal "
+                  "element-wise; the engine gives the in-memory engine's bits",
+                  "docs/POLARS.md", "**The streaming engine.**", shapes=["select_div"],
+                  check=_streaming_small_frame),
 ]

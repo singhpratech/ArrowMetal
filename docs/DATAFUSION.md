@@ -62,7 +62,7 @@ The crate is on crates.io:
 # Cargo.toml
 [dependencies]
 datafusion = { version = "=55.1.0", default-features = false, features = ["sql"] }
-datafusion-arrowmetal = "0.5.0"
+datafusion-arrowmetal = "0.6.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -276,10 +276,23 @@ in two steps:
   ([`src/agg_table.rs`](../datafusion/src/agg_table.rs)) takes that shape at some number of groups
   at the input's exact row count.
 - When it runs, `MetalExec` reads the first batches of each input partition (262,144 rows in all),
-  estimates the number of groups from a stratified sample of their keys (the bias-corrected Chao1
-  estimator over 512 to 8,192 sampled rows), and looks the shape up at that number of groups. If the
-  table takes it, the rest of the input is collected, a 2,048-row sample of the whole input must
-  agree with the estimate, and the aggregate runs on the GPU. Otherwise the batches read so far and
+  estimates the number of groups from a stratified sample of their keys (Chao1 for sampling without
+  replacement, Chao and Lin 2012, over 512 to 8,192 sampled rows, each estimate confirmed by the
+  sample before it; the Polars engine's probe, [POLARS.md](POLARS.md#which-translatable-subtrees-it-runs-the-defaults)),
+  and looks the shape up at that number of groups. Rows concentrated on a few of the keys (the
+  estimate at least 30 times the effective number of keys) are handed back whatever the count: the
+  table was measured on keys of even frequencies. If the table takes it, the rest of the input is
+  collected, a 2,048-row sample of the whole input must agree with the estimate, and the aggregate
+  runs on the GPU.
+  On keys that are not evenly frequent (`--families gskew` of `examples/bench.rs`: one int64 key,
+  count, sum, avg and min + max over int64, 72 cases on skewed keys and 72 on log-normal group
+  sizes, the same families as the Polars engine's run, at 10M and 50M rows;
+  `results/datafusion_gskew_2026-11-05-before.csv` with the probe of 0.5.0, `-after.csv` with this
+  one), the rule leaves 126 of the 144 at planning time and replaces 18 min + max aggregates at 50M
+  rows that the probe hands back at run time, with either probe; with this one, 9 of the 18 name the
+  concentration. The GPU was faster in 10 of the 72 skewed cases (0.28x to 1.62x) and in 61 of the
+  72 log-normal ones (0.82x to 7.54x), which the table, fitted on keys of even frequencies, does not
+  take. Otherwise the batches read so far and
   the rest of each partition stream into DataFusion's own partial and final aggregates, over the
   same partitions as without the rule.
 

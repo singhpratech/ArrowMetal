@@ -3,22 +3,30 @@
 //!
 //! A port of the Polars engine's probe (`python/arrowmetal/polars_engine.py`, "The group-count
 //! probe"). The distinct key tuples of a fixed sample of n of the input's N rows are scaled to the
-//! input by the bias-corrected Chao1 estimator (Chao, Biometrics 2005),
+//! input by Chao1 for sampling without replacement (Chao and Lin, Biometrics 2012),
 //!
 //! ```text
-//!     D = d + f1 (f1 - 1) / (2 (f2 + 1)),
+//!     D = d + f1^2 / (2 f2 n / (n - 1) + f1 q / (1 - q)),     q = n / N,
 //! ```
 //!
 //! where d is the number of distinct tuples in the sample and f1, f2 the number seen exactly once
-//! and exactly twice, clipped to [d, N]. The sample is stratified: row `i * (N / n) + h(i)` for
-//! `i < n`, `h` a fixed-seed splitmix64 hash of `i`, so the same input always gets the same sample
-//! and the same estimate.
+//! and exactly twice, clipped to [d, N]. With q small it is the classic Chao1; when f2 is 0 it is
+//! f1 (1 - q) / q, where the classic form grows as f1^2 / 2. The sample is stratified: row
+//! `i * (N / n) + h(i)` for `i < n`, `h` a fixed-seed splitmix64 hash of `i`, so the same input
+//! always gets the same sample and the same estimate.
 //!
-//! The samples are 512, 2,048, 8,192, ... rows, at most 65,536 and a quarter of the input, and the
-//! probe stops at the first whose range settles the decision: the range is D with f2 moved by two
-//! of its Poisson standard deviations (and one or two more) either way, and the caller's
-//! `settled(lo, hi)` says whether every group count in it gets the same answer. An input of at most
-//! 4,096 rows is counted exactly.
+//! The samples are 512, 2,048, 8,192, ... rows, at most 65,536 and a quarter of the input. The range
+//! is D with f2 moved by two of its Poisson standard deviations (and one or two more) either way,
+//! and the caller's `settled(lo, hi)` says whether every group count in it gets the same answer. The
+//! probe stops at the first sample whose range is settled and meets the range of the sample before
+//! it: keys with a long tail (a few frequent keys and many rare ones) give a small sample a narrow
+//! range far below the true count, because the frequent keys fill f2 and the rare ones are not seen,
+//! and the next sample, which sees more of the tail, does not agree. A range still unconfirmed at
+//! the largest sample is widened to the Good-Turing bound d + f1 (1 - q) / q, f1 at two Poisson
+//! deviations up. With a `settled`
+//! predicate the probe also stops at the first sample whose rows are concentrated on a few keys
+//! (`concentrated`), which the caller leaves to DataFusion. An input of at most 4,096 rows is counted
+//! exactly.
 
 use std::time::{Duration, Instant};
 
@@ -35,6 +43,13 @@ const SAMPLE_MAX: usize = 65_536;
 const EXACT: usize = 4_096;
 const SEED: u64 = 0xA6_5EED;
 const SETTLED_F2: u64 = 8;
+/// The ratio of the estimate to the effective number of keys from which the rows count as
+/// concentrated on a few keys (see [`concentrated`]).
+const CONCENTRATED: f64 = 30.0;
+/// A sample's range meets the one before if it starts at most this far above that one's high end: a
+/// small sample's range can be a little narrow, while a long tail moves the next sample several times
+/// higher.
+const SLACK: f64 = 1.25;
 /// What a null key hashes to (a null is a group of its own, as in SQL GROUP BY).
 const NULL_KEY: u64 = 0x6E75_6C6C_6B65_7931;
 
@@ -56,6 +71,12 @@ pub struct GroupEstimate {
     pub exact: bool,
     /// Wall time of the probe.
     pub time: Duration,
+    /// True when the last sample's range did not meet the range of the sample before it, so the high
+    /// end was widened to the Good-Turing bound (only when a `settled` predicate was given).
+    pub unconfirmed: bool,
+    /// True when the rows are concentrated on a few keys (only when a `settled` predicate was
+    /// given): the probe stopped there, and the caller leaves the aggregate to DataFusion.
+    pub concentrated: bool,
 }
 
 fn splitmix(mut z: u64) -> u64 {
@@ -162,9 +183,10 @@ fn sample(batches: &[&RecordBatch], keys: &[usize], pos: &[usize]) -> Vec<u64> {
     out
 }
 
-/// (d, f1, f2) of a sample of key tuples: an open-addressing count (the values are already mixed
+/// (d, f1, f2, s2) of a sample of key tuples (distinct, seen once, twice, and the sum of c (c - 1)
+/// over the tuples' counts c): an open-addressing count (the values are already mixed
 /// hashes), about a quarter of the time of sorting them.
-fn stats(v: Vec<u64>) -> (u64, u64, u64) {
+fn stats(v: Vec<u64>) -> (u64, u64, u64, u64) {
     let size = (v.len() * 2).next_power_of_two().max(16);
     let mask = size - 1;
     let mut keys = vec![0u64; size];
@@ -188,25 +210,52 @@ fn stats(v: Vec<u64>) -> (u64, u64, u64) {
     }
     let f1 = counts.iter().filter(|&&c| c == 1).count() as u64;
     let f2 = counts.iter().filter(|&&c| c == 2).count() as u64;
-    (d, f1, f2)
+    let s2 = counts.iter().map(|&c| c as u64 * (c as u64).saturating_sub(1)).sum();
+    (d, f1, f2, s2)
 }
 
-/// (estimate, low end, high end), each clipped to [d, rows]. The high end is the whole input while
-/// f2 could still be 0 (below about 6 pairs seen), because Chao1 cannot see a group count much past
-/// n^2 / 2 without pairs.
-fn chao1(d: u64, f1: u64, f2: u64, rows: usize) -> (f64, f64, f64) {
-    let (d, f1, f2, rows) = (d as f64, f1 as f64, f2 as f64, rows as f64);
-    let s = f2.sqrt();
-    let at = |f: f64| rows.min(d.max(d + f1 * (f1 - 1.0) / (2.0 * (f + 1.0))));
-    let low_f2 = f2 - 2.0 * s - 1.0;
-    let hi = if low_f2 > 0.0 {
-        at(low_f2)
-    } else if f1 == 0.0 {
-        d
-    } else {
-        rows
+/// (estimate, low end, high end) of Chao1 for sampling without replacement (Chao and Lin 2012) from a
+/// sample of `n` of `rows` rows, each clipped to [d, rows]. The low end takes f2 two Poisson
+/// deviations (and two) up, the high end two (and one) down; while f2 could still be 0 (below about 6
+/// pairs seen) the high end is the f2 = 0 bound with f1 two deviations up.
+fn chao1(d: u64, f1: u64, f2: u64, n: usize, rows: usize) -> (f64, f64, f64) {
+    let (d, f1, f2, nf, rowsf) = (d as f64, f1 as f64, f2 as f64, n as f64, rows as f64);
+    if f1 == 0.0 {
+        return (d, d, d);
+    }
+    let r = if rows > n { nf / (rowsf - nf) } else { f64::INFINITY };
+    let at = |a: f64, b: f64| {
+        let den = 2.0 * b * nf / (nf - 1.0) + a * r;
+        if den > 0.0 {
+            rowsf.min(d.max(d + a * a / den))
+        } else {
+            rowsf
+        }
     };
-    (at(f2), at(f2 + 2.0 * s + 2.0), hi)
+    let s = f2.sqrt();
+    let low_f2 = f2 - 2.0 * s - 1.0;
+    let hi = if low_f2 > 0.0 { at(f1, low_f2) } else { at(f1 + 2.0 * f1.sqrt() + 1.0, 0.0) };
+    (at(f1, f2), at(f1, f2 + 2.0 * s + 2.0), hi)
+}
+
+/// Whether the rows are concentrated on a few of the keys: the estimated group count is at least
+/// [`CONCENTRATED`] times the effective number of keys, n (n - 1) / s2 (the number of equally
+/// frequent keys that would make two sampled rows share a key as often as they do), with at least 50
+/// pairs of sampled rows sharing a key. Keys of even frequencies give a ratio near 1, log-normal group
+/// sizes about exp(sigma^2); a few frequent keys with a long tail of rare ones, and Zipf-like keys,
+/// give far more.
+fn concentrated(est: f64, n: usize, s2: u64) -> bool {
+    s2 >= 100 && est * s2 as f64 >= CONCENTRATED * n as f64 * (n as f64 - 1.0)
+}
+
+/// The Good-Turing bound on the group count: every singleton of a sample of `n` of `rows` rows (f1 at
+/// two Poisson deviations up) standing for (rows - n) / n groups the sample did not see.
+fn coverage_high(d: u64, f1: u64, n: usize, rows: usize) -> f64 {
+    let (d, f1) = (d as f64, f1 as f64);
+    if f1 == 0.0 {
+        return d;
+    }
+    (rows as f64).min(d + (f1 + 2.0 * f1.sqrt() + 1.0) * (rows as f64 - n as f64) / n as f64)
 }
 
 /// Estimates the groups of `keys` (column indices) over an input of `total` rows (`None`: the rows
@@ -239,7 +288,7 @@ pub(crate) fn estimate_up_to(
     let rows = total.unwrap_or(avail).max(avail);
     if avail == rows && rows <= EXACT {
         let all: Vec<usize> = (0..rows).collect();
-        let (d, _, _) = stats(sample(&batches, keys, &all));
+        let (d, _, _, _) = stats(sample(&batches, keys, &all));
         return GroupEstimate {
             estimate: d,
             low: d,
@@ -248,18 +297,44 @@ pub(crate) fn estimate_up_to(
             rows,
             exact: true,
             time: t.elapsed(),
+            unconfirmed: false,
+            concentrated: false,
         };
     }
     let cap = max_sample.min(SAMPLE_MAX).min(avail / 4).max(FIRST.min(avail));
     let mut n = FIRST.min(avail);
+    // (d, high end) of the sample before, which this one's range must meet (with a `settled`
+    // predicate): the keys a sample has seen are a lower bound on the count, below the estimator's
+    // low end (which adds a little for every singleton).
+    let mut prev: Option<(f64, f64)> = None;
     loop {
-        let (d, f1, f2) = stats(sample(&batches, keys, &positions(avail, n)));
-        let (est, lo, hi) = chao1(d, f1, f2, rows);
-        let done = n * GROWTH > cap
-            || match settled {
-                Some(s) => s(lo.round() as u64, hi.round() as u64),
-                None => est <= 2.0 * d as f64 || f2 >= SETTLED_F2 || lo * 4.0 >= rows as f64,
-            };
+        let (d, f1, f2, s2) = stats(sample(&batches, keys, &positions(avail, n)));
+        let (est, lo, mut hi) = chao1(d, f1, f2, n, rows);
+        let last = n * GROWTH > cap;
+        let mut unconfirmed = false;
+        let conc = settled.is_some() && concentrated(est, n, s2);
+        let done = conc || match settled {
+            Some(s) => {
+                // A single sample is all an input of fewer than 4 x 2,048 rows gets: nothing to meet.
+                let agrees = match prev {
+                    None => last,
+                    Some((pd, phi)) => lo <= SLACK * phi && hi >= pd,
+                };
+                if s(lo.round() as u64, hi.round() as u64) && agrees {
+                    true
+                } else if last {
+                    if !agrees {
+                        unconfirmed = true;
+                        hi = hi.max(coverage_high(d, f1, n, rows));
+                    }
+                    true
+                } else {
+                    prev = Some((d as f64, hi));
+                    false
+                }
+            }
+            None => last || est <= 2.0 * d as f64 || f2 >= SETTLED_F2 || lo * 4.0 >= rows as f64,
+        };
         if done {
             return GroupEstimate {
                 estimate: est.round() as u64,
@@ -269,6 +344,8 @@ pub(crate) fn estimate_up_to(
                 rows,
                 exact: false,
                 time: t.elapsed(),
+                unconfirmed,
+                concentrated: conc,
             };
         }
         n *= GROWTH;
@@ -383,6 +460,57 @@ mod tests {
             let tt = t.elapsed() / 100;
             println!("n {n}: sample {ts:?}, stats {tt:?}");
         }
+    }
+
+    #[test]
+    fn without_pairs_each_singleton_stands_for_its_stratum() {
+        // 100 singletons and no pairs in a 1,000-row sample of 1,000,000 rows: Chao and Lin's form
+        // gives d + f1 (1 - q) / q = 100 + 100 x 999 = 100,000, where the classic form gives
+        // d + f1 (f1 - 1) / 2 = 5,050.
+        let (est, lo, hi) = chao1(100, 100, 0, 1_000, 1_000_000);
+        assert!((est - 100_000.0).abs() < 1.0, "{est}");
+        assert!(lo < est && hi > est, "{lo} {est} {hi}");
+        // With the sampling fraction small and pairs seen it is the classic Chao1, to 0.1%.
+        let (est, _, _) = chao1(500, 300, 100, 1_000, 1_000_000_000);
+        let classic = 500.0 + 300.0 * 300.0 / (2.0 * 100.0 * 1_000.0 / 999.0);
+        assert!((est / classic - 1.0).abs() < 1e-3, "{est} {classic}");
+    }
+
+    #[test]
+    fn concentration_against_the_effective_number_of_keys() {
+        // 2,048 rows sampled: even keys (est about the effective count) are not concentrated; 200
+        // frequent keys holding the pairs and an estimate of 100,000 groups are.
+        assert!(!concentrated(10_000.0, 2_048, 2_048 * 2_047 / 10_000));
+        assert!(concentrated(100_000.0, 2_048, 2_048 * 2_047 / 210));
+        // Too few pairs to tell.
+        assert!(!concentrated(1_000_000.0, 512, 60));
+    }
+
+    #[test]
+    fn a_long_tail_is_not_settled_on_the_first_sample() {
+        // 200 frequent keys and 1% of the rows unique, 2,000,000 rows: about 20,200 groups. A
+        // 512-row sample sees the frequent keys twice and more and almost none of the tail, so its
+        // range is narrow and about 100 times too low; the probe must not stop there.
+        let rows = 2_000_000usize;
+        let keys: Vec<i32> = (0..rows as u64)
+            .map(|i| if splitmix(i ^ 0xF00D) % 100 == 0 { 1_000_000 + i as i32 } else { (splitmix(i) % 200) as i32 })
+            .collect();
+        let mut seen = keys.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        let truth = seen.len() as u64;
+        let b = batches(keys, 8192);
+        let r: Vec<&RecordBatch> = b.iter().collect();
+        // Any range inside one decade of group counts counts as settled.
+        let decade = |x: u64| (x.max(1) as f64).log10().floor() as i64;
+        let settled = |lo: u64, hi: u64| decade(lo) == decade(hi);
+        let first = estimate_up_to(&r, &[0], Some(&settled), Some(rows), FIRST);
+        assert!(first.high < truth / 10, "the first sample alone: {first:?}, truth {truth}");
+        let e = estimate(&r, &[0], Some(&settled), None);
+        assert!(e.sample_rows > FIRST, "{e:?}");
+        // Either the rows are found concentrated on the frequent keys (the caller leaves the
+        // aggregate to DataFusion), or the range holds the true count.
+        assert!(e.concentrated || (e.low <= truth && e.high >= truth), "{e:?}, truth {truth}");
     }
 
     #[test]

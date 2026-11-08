@@ -1,0 +1,38 @@
+# ArrowMetal 0.5.0 on Apple M4 Max, polars 1.44.1 (16 threads), probe median of 9 cold collects, group-by best of 5
+rows,grid_groups,keys,dtype,true_groups,true_bucket,free_estimate,free_how,free_bucket,estimate,how,default_took,probe_us,probe_min_us,polars_in_memory_ms,polars_streaming_ms,metal_default_cold_ms,probe_pct
+2000000,200,k,int32,200,200,205,"a Chao1 estimate from a 512-row sample, 201 to 212",200,,no probe (no bucket taken at these rows),False,,,1.322,0.941,3.626,
+2000000,200,k1+k2,int32,200,200,198,"a Chao1 estimate from a 512-row sample, 195 to 203",200,,no probe (no bucket taken at these rows),False,,,2.351,2.136,2.570,
+2000000,200,s,String,200,200,195,"a Chao1 estimate from a 512-row sample, 192 to 200",200,,no probe (no bucket taken at these rows),False,,,1.733,1.512,2.180,
+2000000,1000,k,int32,1000,"1,000",872,"a Chao1 estimate from a 512-row sample, 782 to 1,007","1,000",,no probe (no bucket taken at these rows),False,,,3.551,1.119,4.251,
+2000000,1000,k1+k2,int32,1000,"1,000",987,"a Chao1 estimate from a 512-row sample, 874 to 1,158","1,000",,no probe (no bucket taken at these rows),False,,,6.110,2.876,6.506,
+2000000,1000,s,String,1000,"1,000",811,"a Chao1 estimate from a 512-row sample, 733 to 928","1,000",,no probe (no bucket taken at these rows),False,,,5.435,1.908,5.806,
+2000000,10000,k,int32,10000,"10,000",13940,"a Chao1 estimate from a 512-row sample, 7,640 to 59,530","10,000",,no probe (no bucket taken at these rows),False,,,4.586,3.610,5.055,
+2000000,10000,k1+k2,int32,10000,"10,000",11332,"a Chao1 estimate from a 512-row sample, 6,584 to 35,439","10,000",,no probe (no bucket taken at these rows),False,,,6.643,6.151,7.375,
+2000000,10000,s,String,10000,"10,000",7178,"a Chao1 estimate from a 512-row sample, 4,670 to 15,085","10,000",,no probe (no bucket taken at these rows),False,,,7.337,5.117,7.028,
+2000000,100000,k,int32,100000,"100,000",102833,"a Chao1 estimate from a 2,048-row sample, 67,695 to 197,829","100,000",,no probe (no bucket taken at these rows),False,,,6.793,3.521,5.944,
+2000000,100000,k1+k2,int32,100000,"100,000",102833,"a Chao1 estimate from a 2,048-row sample, 67,695 to 197,829","100,000",,no probe (no bucket taken at these rows),False,,,8.719,7.407,9.634,
+2000000,100000,s,String,100000,"100,000",97852,"a Chao1 estimate from a 2,048-row sample, 65,052 to 183,820","100,000",,no probe (no bucket taken at these rows),False,,,9.305,5.599,9.700,
+2000000,1000000,k,int32,864953,rows/2,2000000,"a Chao1 estimate from a 2,048-row sample, 689,497 to 2,000,000",rows/2,,no probe (no bucket taken at these rows),False,,,11.523,4.986,13.276,
+2000000,1000000,k1+k2,int32,864399,rows/2,599249,"a Chao1 estimate from a 8,192-row sample, 477,195 to 788,232",rows/2,,no probe (no bucket taken at these rows),False,,,17.872,10.037,19.641,
+2000000,1000000,s,String,864502,rows/2,2000000,"a Chao1 estimate from a 2,048-row sample, 689,497 to 2,000,000",rows/2,,no probe (no bucket taken at these rows),False,,,18.317,7.063,19.795,
+2000000,rows/2,k,int32,864675,rows/2,715784,"a Chao1 estimate from a 8,192-row sample, 562,172 to 959,101",rows/2,,no probe (no bucket taken at these rows),False,,,11.607,5.114,13.990,
+2000000,rows/2,k1+k2,int32,864213,rows/2,672270,"a Chao1 estimate from a 8,192-row sample, 530,519 to 895,115",rows/2,,no probe (no bucket taken at these rows),False,,,18.055,10.205,19.093,
+2000000,rows/2,s,String,864671,rows/2,731553,"a Chao1 estimate from a 8,192-row sample, 573,627 to 982,316",rows/2,,no probe (no bucket taken at these rows),False,,,17.672,7.530,20.598,
+50000000,200,k,int32,200,200,192,"a Chao1 estimate from a 512-row sample, 189 to 197",200,200,"a Chao1 estimate from a 2,048-row sample, 200 to 200",False,94.9,82.8,10.960,10.982,11.906,0.87
+50000000,200,k1+k2,int32,200,200,196,"a Chao1 estimate from a 512-row sample, 192 to 205",200,200,"a Chao1 estimate from a 2,048-row sample, 200 to 200",False,229.8,173.8,72.749,72.462,73.749,0.32
+50000000,200,s,String,200,200,200,"a Chao1 estimate from a 512-row sample, 196 to 207",200,,no probe (no bucket taken at these rows),False,,,30.875,43.709,47.134,
+50000000,1000,k,int32,1000,"1,000",923,"a Chao1 estimate from a 512-row sample, 821 to 1,078","1,000",974,"a Chao1 estimate from a 2,048-row sample, 962 to 990",False,145.2,91.0,110.336,17.480,116.275,0.83
+50000000,1000,k1+k2,int32,1000,"1,000",1049,"a Chao1 estimate from a 512-row sample, 922 to 1,246","1,000",1028,"a Chao1 estimate from a 2,048-row sample, 1,011 to 1,051",True,172.9,146.7,198.863,61.080,19.404,0.89
+50000000,1000,s,String,1000,"1,000",936,"a Chao1 estimate from a 512-row sample, 831 to 1,097","1,000",,no probe (no bucket taken at these rows),False,,,240.659,39.555,232.241,
+50000000,10000,k,int32,10000,"10,000",7589,"a Chao1 estimate from a 512-row sample, 4,861 to 16,709","10,000",10310,"a Chao1 estimate from a 2,048-row sample, 9,098 to 11,935",True,71.1,67.8,91.995,71.807,16.992,0.42
+50000000,10000,k1+k2,int32,10000,"10,000",11391,"a Chao1 estimate from a 512-row sample, 6,603 to 36,062","10,000",8997,"a Chao1 estimate from a 2,048-row sample, 8,023 to 10,281",True,164.3,142.3,219.544,175.446,22.586,0.73
+50000000,10000,s,String,10000,"10,000",14030,"a Chao1 estimate from a 512-row sample, 7,665 to 61,316","10,000",,no probe (no bucket taken at these rows),False,,,251.765,119.015,260.881,
+50000000,100000,k,int32,100000,"100,000",97604,"a Chao1 estimate from a 2,048-row sample, 64,469 to 186,934","100,000",97604,"a Chao1 estimate from a 2,048-row sample, 64,469 to 186,934",True,91.9,73.1,101.021,74.655,18.643,0.49
+50000000,100000,k1+k2,int32,100000,"100,000",102574,"a Chao1 estimate from a 2,048-row sample, 67,060 to 201,600","100,000",102574,"a Chao1 estimate from a 2,048-row sample, 67,060 to 201,600",True,159.3,143.1,217.951,248.004,24.062,0.66
+50000000,100000,s,String,100000,"100,000",102574,"a Chao1 estimate from a 2,048-row sample, 67,060 to 201,600","100,000",,no probe (no bucket taken at these rows),False,,,272.008,179.383,266.052,
+50000000,1000000,k,int32,1000000,"1,000,000",859849,"a Chao1 estimate from a 8,192-row sample, 629,562 to 1,307,910","1,000,000",859849,"a Chao1 estimate from a 8,192-row sample, 629,562 to 1,307,910",True,279.3,199.6,169.479,99.247,29.405,0.95
+50000000,1000000,k1+k2,int32,1000000,"1,000,000",1162584,"a Chao1 estimate from a 8,192-row sample, 810,433 to 1,945,306","1,000,000",1162584,"a Chao1 estimate from a 8,192-row sample, 810,433 to 1,945,306",True,504.7,471.7,427.065,275.938,31.977,1.58
+50000000,1000000,s,String,1000000,"1,000,000",932847,"a Chao1 estimate from a 8,192-row sample, 674,441 to 1,452,518","1,000,000",,no probe (no bucket taken at these rows),False,,,470.964,187.674,438.082,
+50000000,rows/2,k,int32,21615905,rows/2,50000000,"a Chao1 estimate from a 8,192-row sample, 12,568,608 to 50,000,000",rows/2,50000000,"a Chao1 estimate from a 8,192-row sample, 12,568,608 to 50,000,000",False,374.8,192.7,496.971,225.110,505.105,0.17
+50000000,rows/2,k1+k2,int32,21615785,rows/2,50000000,"a Chao1 estimate from a 8,192-row sample, 12,568,608 to 50,000,000",rows/2,50000000,"a Chao1 estimate from a 8,192-row sample, 12,568,608 to 50,000,000",False,719.9,489.6,814.482,492.125,809.138,0.15
+50000000,rows/2,s,String,21615802,rows/2,18676403,"a Chao1 estimate from a 32,768-row sample, 13,691,807 to 27,864,322",rows/2,,no probe (no bucket taken at these rows),False,,,775.116,364.845,812.877,

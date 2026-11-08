@@ -84,11 +84,12 @@ __all__ = ["MetalEngine", "MetalPlanReport", "MetalEngineFallbackWarning", "TEST
 # incompatible IR changes (renamed nodes, reshaped tuples); a major that none of these has makes the
 # engine decline every plan. A newer minor of a tested major only adds nodes, so the engine still
 # runs and warns once.
-TESTED_IR_VERSION = ((14, 7), (15, 2))
+TESTED_IR_VERSION = ((14, 7), (15, 2), (16, 0))
 # The Polars releases the engine suites passed on. 1.44.1 and 1.44.2: test_polars_engine.py,
 # test_engine_conformance.py and the capability table. 2.0.0: test_polars_engine.py, test_polars.py
-# and test_polars_sort_order.py (docs/ENGINE_CAPABILITIES.md is the 1.44.1 table).
-TESTED_POLARS = ("1.44.1", "1.44.2", "2.0.0")
+# and test_polars_sort_order.py (docs/ENGINE_CAPABILITIES.md is the 1.44.1 table). 2.1.0 (IR (16, 0)):
+# the same suites; its IR visitor adds a join predicate (a join holding one stays with Polars).
+TESTED_POLARS = ("1.44.1", "1.44.2", "2.0.0", "2.1.0")
 # Every IR node class of those releases (`polars._plr._ir_nodes`), per IR major: IR 15 has no
 # `ExtContext` (Polars 2.0 removed `LazyFrame.with_context`). A node of a kind outside
 # KNOWN_NODE_KINDS makes the whole plan stay with Polars: the walk cannot know what such a node
@@ -98,6 +99,7 @@ _NODE_KINDS_BY_IR_MAJOR = {15: frozenset({
     "MapFunction", "MergeSorted", "PythonScan", "Reduce", "Scan", "Select", "SimpleProjection",
     "Sink", "Slice", "Sort", "Union"})}
 _NODE_KINDS_BY_IR_MAJOR[14] = _NODE_KINDS_BY_IR_MAJOR[15] | {"ExtContext"}
+_NODE_KINDS_BY_IR_MAJOR[16] = _NODE_KINDS_BY_IR_MAJOR[15]
 KNOWN_NODE_KINDS = frozenset().union(*_NODE_KINDS_BY_IR_MAJOR.values())
 
 
@@ -1014,6 +1016,14 @@ class _Translator:
 
     def _node_Join(self, n, node, inputs, kids, check_only=False):
         how, nulls_equal, slc, suffix, coalesce, maintain = node.options
+        # IR 16 (Polars 2.1) can carry a filter over both sides inside an inner join node, its kind
+        # then ("Inner", "fused_predicate"): a filter over the joined rows, translated as such.
+        fused = getattr(node, "predicate", None)
+        if fused is not None:
+            if how != ("Inner", "fused_predicate"):
+                raise _Unsupported(f"A {how!r} join with a predicate is not translated (an inner "
+                                   "one is: the join, then the filter).")
+            how = "Inner"
         if not isinstance(how, str) or how not in ("Inner", "Left", "Semi", "Anti"):
             raise _Unsupported(f"A {how if isinstance(how, str) else how[0]} join is not "
                                "translated (inner, left, semi and anti are taken).")
@@ -1057,9 +1067,18 @@ class _Translator:
             cols[name] = _base(name, dt, m[2])
         plan = {"op": "join", "left": left.final_plan(), "right": right.final_plan(),
                 "left_on": lkeys, "right_on": rkeys, "how": how.lower(), "suffix": suffix}
-        return _Sub(plan, cols, [m[0] for m in meta], left.leaves + right.leaves,
-                    left.rows + right.rows, True, (), left.classes | right.classes
-                    | {"join:" + how.lower()}, groups=left.groups + right.groups)
+        sub = _Sub(plan, cols, [m[0] for m in meta], left.leaves + right.leaves,
+                   left.rows + right.rows, True, (), left.classes | right.classes
+                   | {"join:" + how.lower()}, groups=left.groups + right.groups)
+        if fused is None:
+            return sub
+        # The fused predicate reads the joined columns by their output names.
+        self.nt.set_node(n)
+        pred = self._predicate(fused.node, cols)
+        if pred is None or pred.code != "bool":
+            raise _Unsupported("The join's predicate is not a boolean ArrowMetal translates.")
+        return sub.derive(plan={"op": "filter", "input": sub.plan, "predicate": pred.s}, work=True,
+                          exact=None)
 
     def _node_Distinct(self, n, node, inputs, kids, check_only=False):
         keep, subset, maintain, slc = node.options
@@ -1784,21 +1803,30 @@ def import_cache_info():
 #
 # The default policy judges a group-by by the bucket of its number of groups (_engine_policy.py,
 # `group_bucket`), which the plan does not state. The probe estimates it from the frame the keys come
-# from: the distinct key tuples of a fixed sample of n of its N rows, scaled to the frame by the
-# bias-corrected Chao1 estimator (Chao, Biometrics 2005),
-#     D = d + f1 (f1 - 1) / (2 (f2 + 1)),
+# from: the distinct key tuples of a fixed sample of n of its N rows, scaled to the frame by Chao1 for
+# sampling without replacement (Chao and Lin, Biometrics 2012),
+#     D = d + f1^2 / (2 f2 n / (n - 1) + f1 q / (1 - q)),     q = n / N,
 # where d is the number of distinct tuples in the sample and f1, f2 the number seen exactly once and
-# exactly twice, clipped to [d, N]. The sample is stratified: row i * (N // n) + h(i) for i < n, h a
-# fixed-seed splitmix64 hash of i, so the same frame always gets the same samples and estimates.
+# exactly twice, clipped to [d, N]. With q small it is the classic Chao1; when f2 is 0 it is
+# f1 (1 - q) / q, every singleton of the sample standing for the unsampled rows of its stratum, where
+# the classic form grows as f1^2 / 2. The sample is stratified: row i * (N // n) + h(i) for i < n, h
+# a fixed-seed splitmix64 hash of i, so the same frame always gets the same samples and estimates.
 #
-# The samples are 512, 2,048, 8,192, ... rows, at most 65,536 and a quarter of the frame, and the
-# probe stops at the first whose range settles the decision: the range is D with f2 moved by two of
-# its Poisson standard deviations (and one or two more) either way, and the policy's `settled(lo, hi)`
-# says whether every group count in it gets the same answer (`_engine_policy.settled_for`). Without a
-# decision to settle, the probe stops once D is within twice d, f2 reaches 8, or the low end of the
-# range is at least a quarter of the frame. A frame of at most 4,096 rows is counted exactly. A
-# Parquet file's footer answers only when every row group states a distinct count for each key column
-# (`_footer_groups`).
+# The samples are 512, 2,048, 8,192, ... rows, at most 65,536 and a quarter of the frame. The range
+# is D with f2 moved by two of its Poisson standard deviations (and one or two more) either way, and
+# the policy's `settled(lo, hi)` says whether every group count in it gets the same answer
+# (`_engine_policy.settled_for`). The probe stops at the first sample whose range is settled and meets
+# the range of the sample before it: keys with a long tail (a few frequent keys and many rare ones)
+# give a small sample a narrow range far below the true count, because the frequent keys fill f2 and
+# the rare ones are not seen, and the next sample, which sees more of the tail, does not agree. A
+# range still unconfirmed at the largest sample is widened to the Good-Turing bound
+# d + f1 (1 - q) / q, f1 at two Poisson deviations up: the decision then takes the subtree only if
+# every count up to that is taken. The probe also stops at the first sample whose rows are
+# concentrated on a few of the keys (`_concentrated`), which the policy leaves to Polars whatever the
+# count: there Polars' hash table stays in cache and the GPU group-by measured slower. Without a decision to settle, the probe stops once D is within
+# twice d, f2 reaches 8, or the low end of the range is at least a quarter of the frame. A frame of at
+# most 4,096 rows is counted exactly. A Parquet file's footer answers only when every row group states
+# a distinct count for each key column (`_footer_groups`).
 
 _GROUP_FIRST = 512
 _GROUP_GROWTH = 4
@@ -1806,6 +1834,11 @@ _GROUP_SAMPLE_MAX = 65_536
 _GROUP_EXACT = 4_096
 _GROUP_SEED = 0xA6_5EED
 _GROUP_SETTLED_F2 = 8
+_GROUP_CONCENTRATED = 30
+# A sample's range meets the one before if it starts at most this far above that one's high end: a
+# small sample's range can be a little narrow (200 keys all seen in 512 rows: 191.5 to 199.4, the next
+# sample exactly 200), while a long tail moves the next sample several times higher.
+_GROUP_SLACK = 1.25
 _GROUP_CACHE_MAX = 64
 
 
@@ -1869,61 +1902,112 @@ def _sample_tuples(np, df, columns, pos):
 
 
 def _sample_stats(np, values):
-    """(d, f1, f2) of a sample of key tuples."""
+    """(d, f1, f2, s2) of a sample of key tuples: distinct tuples, those seen exactly once and
+    twice, and s2 = sum of c (c - 1) over the tuples' counts c (twice the pairs of sampled rows that
+    share a tuple)."""
     n = len(values)
     s = np.sort(values)
     edges = np.flatnonzero(s[1:] != s[:-1])
     runs = np.diff(np.concatenate(([-1], edges, [n - 1])))
     f = np.bincount(runs, minlength=3)
-    return len(runs), int(f[1]), int(f[2])
+    return len(runs), int(f[1]), int(f[2]), int((runs * (runs - 1)).sum())
 
 
-def _chao1(d, f1, f2, rows):
-    """(estimate, its low end, its high end), each clipped to [d, rows]. The high end is the whole
-    frame while f2 could still be 0 (below about 6 pairs seen), because Chao1 cannot see a group
-    count much past n^2 / 2 without pairs."""
+def _chao1(d, f1, f2, n, rows):
+    """(estimate, its low end, its high end) of Chao1 for sampling without replacement (Chao and Lin
+    2012) from a sample of n of `rows` rows, each clipped to [d, rows]. The low end takes f2 two
+    Poisson deviations (and two) up, the high end two (and one) down; while f2 could still be 0
+    (below about 6 pairs seen) the high end is the f2 = 0 bound with f1 two deviations up."""
+    if f1 == 0:
+        return d, d, d
+    r = n / (rows - n) if rows > n else math.inf
+
+    def at(a, b):
+        den = 2 * b * n / (n - 1) + a * r
+        return min(rows, max(d, d + a * a / den)) if den > 0 else rows
     s = math.sqrt(f2)
-
-    def at(f):
-        return min(rows, max(d, d + f1 * (f1 - 1) / (2 * (f + 1))))
     low_f2 = f2 - 2 * s - 1
-    hi = at(low_f2) if low_f2 > 0 else (d if f1 == 0 else rows)
-    return at(f2), at(f2 + 2 * s + 2), hi
+    hi = at(f1, low_f2) if low_f2 > 0 else at(f1 + 2 * math.sqrt(f1) + 1, 0)
+    return at(f1, f2), at(f1, f2 + 2 * s + 2), hi
+
+
+
+def _concentrated(est, n, s2):
+    """Whether the rows are concentrated on a few of the keys: the estimated group count is at least
+    `_GROUP_CONCENTRATED` times the effective number of keys, n (n - 1) / s2 (the number of equally
+    frequent keys that would make two sampled rows share a key as often as they do), with at least
+    50 pairs of sampled rows sharing a key. Keys of even frequencies give a ratio near 1 and log-normal
+    group sizes about exp(sigma^2), where the GPU group-by measured ahead
+    (`Benchmarks/results/group_skew_mild_2026-11-05.csv`); a few frequent keys with a long tail of
+    rare ones, and Zipf-like keys, give far more, where it measured slower than Polars
+    (`Benchmarks/results/group_skew_2026-11-05.csv`)."""
+    return s2 >= 100 and est * s2 >= _GROUP_CONCENTRATED * n * (n - 1)
+
+
+def _coverage_high(d, f1, n, rows):
+    """The Good-Turing bound on the group count: every singleton of a sample of n of `rows` rows (f1
+    at two Poisson deviations up) standing for (rows - n) / n groups the sample did not see."""
+    if f1 == 0:
+        return d
+    return min(rows, d + (f1 + 2 * math.sqrt(f1) + 1) * (rows - n) / n)
 
 
 def _frame_groups(df, columns, settled=None, stats=None):
-    """(estimated groups, how, whether every sample came from `stats`, low end, high end) of
-    in-memory frame `df` over `columns`. `settled`: the policy's predicate; `stats`:
-    {n: (d, f1, f2)}, the samples already counted for this frame and keys, which the probe adds to."""
+    """(estimated groups, how, whether every sample came from `stats`, low end, high end, whether the
+    rows are concentrated on a few keys) of in-memory frame `df` over `columns`. `settled`: the
+    policy's predicate (the concentration test runs only with one); `stats`: {n: (d, f1, f2, s2)},
+    the samples already counted for this frame and keys, which the probe adds to."""
     try:
         import numpy as np
     except ImportError:
-        return None, "no group-count estimate: the probe needs numpy", False, None, None
+        return None, "no group-count estimate: the probe needs numpy", False, None, None, False
     rows = df.height
     if rows <= _GROUP_EXACT:
         count = df.select(columns).n_unique()
-        return count, f"counted over all {rows:,} rows", False, count, count
+        return count, f"counted over all {rows:,} rows", False, count, count, False
     stats = {} if stats is None else stats
     cached = True
     n = _GROUP_FIRST
     cap = min(_GROUP_SAMPLE_MAX, rows // 4)
+    prev = None     # (d, high end) of the sample before, which this one's range must meet
+    unconfirmed = concentrated = False
     while True:
         if n not in stats:
             cached = False
             stats[n] = _sample_stats(np, _sample_tuples(np, df, columns,
                                                         _sample_positions(np, rows, n)))
-        d, f1, f2 = stats[n]
-        est, lo, hi = _chao1(d, f1, f2, rows)
-        if n * _GROUP_GROWTH > cap:
+        d, f1, f2, s2 = stats[n]
+        est, lo, hi = _chao1(d, f1, f2, n, rows)
+        last = n * _GROUP_GROWTH > cap
+        if settled is not None and _concentrated(est, n, s2):
+            concentrated = True        # the policy leaves it to Polars whatever the count
             break
         if settled is not None:
-            if settled(lo, hi):
+            # A single sample is all a frame of fewer than 4 x 2,048 rows gets: nothing to meet.
+            agrees = (prev is None and last) or (prev is not None and lo <= _GROUP_SLACK * prev[1]
+                                                 and hi >= prev[0])
+            if settled(lo, hi) and agrees:
                 break
-        elif est <= 2 * d or f2 >= _GROUP_SETTLED_F2 or lo * _policy.table().NEAR_ROWS >= rows:
+            if last:
+                if not agrees:
+                    unconfirmed = True
+                    hi = max(hi, _coverage_high(d, f1, n, rows))
+                break
+            # The keys a sample has seen are a lower bound on the count, below the estimator's
+            # low end (which adds a little for every singleton): 200 keys all seen in 512 rows
+            # give a low end just above 200, the next sample exactly 200.
+            prev = (d, hi)
+        elif last or est <= 2 * d or f2 >= _GROUP_SETTLED_F2 or lo * _policy.table().NEAR_ROWS >= rows:
             break
         n *= _GROUP_GROWTH
     est, lo, hi = (int(round(x)) for x in (est, lo, hi))
-    return est, f"a Chao1 estimate from a {n:,}-row sample, {lo:,} to {hi:,}", cached, lo, hi
+    how = f"a Chao1 estimate from a {n:,}-row sample, {lo:,} to {hi:,}"
+    if concentrated:
+        how += (f" (the rows concentrated on about {round(n * (n - 1) / s2):,} keys' worth of"
+                f" frequency)")
+    elif unconfirmed:
+        how += " (not confirmed by the sample before it: the high end is the Good-Turing bound)"
+    return est, how, cached, lo, hi, concentrated
 
 
 def _footer_groups(leaf, columns):
@@ -1980,11 +2064,12 @@ def _identity(df, columns):
 
 
 def _probe_groups(g, report, root, settled=None):
-    """(estimated groups or None, how, low end, high end) for one group-by (`_GroupKeys`);
-    recorded in the report."""
+    """(estimated groups or None, how, low end, high end, whether the rows are concentrated on a few
+    keys) for one group-by (`_GroupKeys`); recorded in the report."""
     start = time.perf_counter()
     cached = False
     lo = hi = None
+    concentrated = False
     if g.why is not None:
         count, how = None, g.why
     elif _is_file(g.leaf[1]):
@@ -2008,8 +2093,8 @@ def _probe_groups(g, report, root, settled=None):
                                              "stats": {}}
         elif key is not None:
             _group_estimates.move_to_end(key)
-        count, how, cached, lo, hi = _frame_groups(df, g.columns, settled,
-                                                   None if entry is None else entry["stats"])
+        count, how, cached, lo, hi, concentrated = _frame_groups(
+            df, g.columns, settled, None if entry is None else entry["stats"])
     while len(_group_estimates) > _GROUP_CACHE_MAX:
         _group_estimates.popitem(last=False)
     seconds = time.perf_counter() - start
@@ -2017,14 +2102,15 @@ def _probe_groups(g, report, root, settled=None):
     text = how if count is None else f"{count:,} groups over ({keys}), {how}"
     report.groups.append({"root": root, "keys": list(g.keys), "estimate": count, "how": how,
                           "range": None if count is None else (lo, hi),
-                          "seconds": seconds, "cached": cached})
-    return count, text, lo, hi
+                          "concentrated": concentrated, "seconds": seconds, "cached": cached})
+    return count, text, lo, hi, concentrated
 
 
 def _groups_of(sub, report, root, settled=None):
     """The policy's `groups` for subtree `sub`: the probe of its one group-by."""
     if len(sub.groups) != 1:
-        return None, f"no group-count estimate: the subtree holds {len(sub.groups)} group-bys", None, None
+        return (None, f"no group-count estimate: the subtree holds {len(sub.groups)} group-bys", None,
+                None, False)
     g = sub.groups[0]
     return _probe_groups(g, report, f"GroupBy#{g.node}", settled)
 

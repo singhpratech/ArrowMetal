@@ -858,12 +858,30 @@ fn decide(
     let how = if e.exact {
         format!("{} groups, counted over all {} rows", e.estimate, e.rows)
     } else {
-        format!("an estimated {} groups ({} to {}, Chao1 over a {}-row sample)", e.estimate, e.low, e.high, e.sample_rows)
+        format!(
+            "an estimated {} groups ({} to {}, Chao1 over a {}-row sample{})",
+            e.estimate,
+            e.low,
+            e.high,
+            e.sample_rows,
+            if e.unconfirmed {
+                ", not confirmed by the sample before it: the high end is the Good-Turing bound"
+            } else {
+                ""
+            }
+        )
     };
     let at_text = match table_rows {
         Some(n) => format!("{} rows (table_rows; input {rows})", crate::choice::rows_text(n as u64)),
         None => format!("{rows} rows"),
     };
+    if e.concentrated {
+        return (
+            false,
+            format!("{how} at {at_text}: the rows are concentrated on a few of the keys, where the measured table does not hold (keys of even frequencies); left to DataFusion"),
+            Some(e),
+        );
+    }
     if !settled(e.low, e.high) {
         return (
             false,

@@ -9,7 +9,7 @@ on this page is in
 
 ```swift
 // Package.swift
-dependencies: [.package(url: "https://github.com/singhpratech/ArrowMetal", from: "0.5.0")],
+dependencies: [.package(url: "https://github.com/singhpratech/ArrowMetal", from: "0.6.0")],
 targets: [.target(name: "MyApp", dependencies: [.product(name: "ArrowMetal", package: "ArrowMetal")])]
 ```
 
@@ -69,7 +69,7 @@ Copy-free out, always. Copy-free in when the producer's buffers are page aligned
 
 ## Tests
 
-1,046 test functions in 87 files under `Tests/ArrowMetalTests`, run in release; the oracles are plain-Swift
+1,047 test functions in 88 files under `Tests/ArrowMetalTests`, run in release; the oracles are plain-Swift
 CPU references, hand-computed vectors and pyarrow answers pinned as literals ([TESTING.md](TESTING.md)).
 Tests that need a real GPU skip on virtual Metal devices.
 

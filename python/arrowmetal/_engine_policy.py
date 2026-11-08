@@ -332,18 +332,25 @@ def settled_for(classes, dclass, source, rows, router=None):
     return settled
 
 
+#: Where keys concentrated on a few of them (the probe's `concentrated`: a few frequent keys with a
+#: long tail of rare ones, or Zipf-like keys) were timed: the GPU group-by against both Polars engines.
+SKEW_SOURCE = "Benchmarks/results/group_skew_2026-11-05.csv"
+
+
 def _estimate(groups, settled=None):
-    """(groups or None, what the estimate is, its low end, its high end) from `decide`'s `groups`
-    argument."""
+    """(groups or None, what the estimate is, its low end, its high end, whether the keys are
+    concentrated on a few of them) from `decide`'s `groups` argument."""
     if callable(groups):
         groups = groups(settled)
     if groups is None:
-        return None, "no group-count estimate", None, None
+        return None, "no group-count estimate", None, None, False
     if isinstance(groups, tuple):
-        if len(groups) == 4:
+        if len(groups) == 5:
             return groups
-        return groups[0], groups[1], groups[0], groups[0]
-    return int(groups), f"{int(groups):,} groups", int(groups), int(groups)
+        if len(groups) == 4:
+            return groups + (False,)
+        return groups[0], groups[1], groups[0], groups[0], False
+    return int(groups), f"{int(groups):,} groups", int(groups), int(groups), False
 
 
 def _band_counts(band, rows):
@@ -413,7 +420,14 @@ def decide(classes, dtypes, rows, source="memory", *, shapes="measured", min_row
             return Decision(False, f"{rows:,} input rows is below the {x:,}-row crossover for "
                                    f"{_what(c, dclass, source)} at every group count measured "
                                    f"({_table.SOURCE})", c, x)
-        count, text, lo, hi = _estimate(groups, settled_for(grouped, dclass, source, rows, router))
+        count, text, lo, hi, concentrated = _estimate(groups, settled_for(grouped, dclass, source,
+                                                                          rows, router))
+        if concentrated:
+            # The crossovers were measured on keys of even frequencies; on keys concentrated on a
+            # few of them Polars' hash table stays in cache and the GPU group-by measured slower.
+            return Decision(False, f"estimated {text}: the rows are concentrated on a few of the "
+                                   f"keys, where the GPU group-by measured slower than Polars "
+                                   f"({SKEW_SOURCE})", grouped[0], None, text)
         if count is not None and lo != hi:
             # A range: taken only when every group count in it is.
             for c in grouped:

@@ -43,6 +43,9 @@ QUICK = os.environ.get("DIFF_QUICK") == "1"
 HAS_PROFILE = hasattr(pl.LazyFrame, "profile")
 HAS_WITH_CONTEXT = hasattr(pl.LazyFrame, "with_context")
 NO_PROFILE = f"polars {pl.__version__} has no LazyFrame.profile (Polars 2.0 removed it)"
+# Polars 2.1 folds a select of literals into a one-row frame and reads a Parquet file's own columns
+# where a stored ARROW:schema disagrees with them.
+POLARS_21 = tuple(int(x) for x in pl.__version__.split(".")[:2]) >= (2, 1)
 
 
 def _running_ir():
@@ -232,10 +235,10 @@ def test_polars_surfaces_this_module_uses_exist():
 
     pl.LazyFrame({"a": [1]}).collect(post_opt_callback=cb)
     assert all(v for k, v in seen.items() if k != "version()"), seen
-    assert pe.TESTED_IR_VERSION == ((14, 7), (15, 2))
+    assert pe.TESTED_IR_VERSION == ((14, 7), (15, 2), (16, 0))
     ir = seen["version()"]
     assert ir in pe.TESTED_IR_VERSION, (ir, pe.TESTED_IR_VERSION)
-    assert pe.TESTED_POLARS == ("1.44.1", "1.44.2", "2.0.0")
+    assert pe.TESTED_POLARS == ("1.44.1", "1.44.2", "2.0.0", "2.1.0")
     assert pl.__version__ in pe.TESTED_POLARS
     # Every IR node class this Polars has is one the walk knows, and the list for its IR major is
     # exact; a new one would make every plan holding it stay with Polars
@@ -645,7 +648,7 @@ def test_the_check_command_prints_versions_and_the_capability_header():
     assert r.returncode == 0, r.stdout + r.stderr
     out = r.stdout
     assert f"polars {pl.__version__}: a tested release" in out, out
-    assert f"IR version {_running_ir()}: a tested major (tested: (14, 7), (15, 2))" in out, out
+    assert f"IR version {_running_ir()}: a tested major (tested: (14, 7), (15, 2), (16, 0))" in out, out
     assert "callback API: present" in out and "unknown to the engine: none" in out, out
     assert "capability table (docs/ENGINE_CAPABILITIES.md):" in out, out
     recorded = re.search(r"- Polars (\S+), IR \(14, 7\)", out).group(1)
@@ -1511,6 +1514,12 @@ FALLBACKS = {
 def test_unsupported_expressions_fall_back_with_a_reason(case):
     build, reason = FALLBACKS[case]
     df = frame("int64", ("random", 4097, 0.3)).with_columns(pl.col("a").cast(pl.Float64).alias("f"))
+    if case == "literals_only" and POLARS_21:
+        # Polars 2.1 folds the select into a one-row frame before the callback: nothing to decline.
+        eng = pe.MetalEngine(min_rows=0, shapes="all")
+        compare(build(df.lazy()).collect(engine=eng), build(df.lazy()).collect(), order=True)
+        assert not eng.last_report.taken and not eng.last_report.fallbacks, eng.last_report
+        return
     check_fallback(build(df.lazy()), reason, order=True if case in ("tail",) else None)
 
 
@@ -2076,7 +2085,13 @@ def test_a_stored_schema_polars_applies_and_arrowmetal_ignores_falls_back():
     Polars applies it (and names or types columns after it); ArrowMetal's reader ignores it, as
     Arrow's does. The engine sees the difference and leaves the scan to Polars."""
     more = pl.scan_parquet(os.path.join(NESTED, "arrowschema__duckdb_more.parquet"))
-    check_fallback(more.sort("x0"), "is not a column of the file", order=True)
+    if POLARS_21:
+        # Polars 2.1 reads the file's own columns, as Arrow does: no x0, the same schema as ArrowMetal.
+        import pyarrow.parquet as pq
+        assert list(more.collect_schema()) == pq.read_schema(
+            os.path.join(NESTED, "arrowschema__duckdb_more.parquet")).names
+    else:
+        check_fallback(more.sort("x0"), "is not a column of the file", order=True)
     fewer = pl.scan_parquet(os.path.join(NESTED, "arrowschema__duckdb_fewer.parquet"))
     eng = check_fallback(fewer.select("ts_paris").sort("ts_paris", nulls_last=True), "rejected",
                          order=True)
@@ -2089,6 +2104,51 @@ def test_a_bare_scan_stays_with_polars_reader(scan_files):
     lf = pl.scan_parquet(scan_files["polars"]).select("id", "i64")
     compare(lf.collect(engine=eng), lf.collect(), order=True)
     assert not eng.last_report.taken and not eng.last_report.fallbacks
+
+
+# -- a join holding a predicate over both sides: Polars 2.1 (IR 16) shows it to an engine as an inner
+# join of kind ("Inner", "fused_predicate"); 2.0 (IR 15) hides it; 1.44 keeps a Filter above the Join.
+
+def _join_frames():
+    rng = np.random.default_rng(11)
+    n = 20_000
+    left = pl.DataFrame({"k": rng.integers(0, 500, n), "x": rng.integers(0, 100, n),
+                         "v": rng.normal(size=n)}).lazy()
+    right = pl.DataFrame({"k": rng.integers(0, 500, n // 2), "y": rng.integers(0, 100, n // 2),
+                          "v": rng.normal(size=n // 2)}).lazy()
+    return left, right
+
+
+JOIN_PREDICATES = {
+    "across_sides": lambda l, r: l.join(r, on="k").filter(pl.col("x") < pl.col("y")),
+    "suffixed_name": lambda l, r: l.join(r, on="k").filter(pl.col("v") < pl.col("v_right")),
+    "compound": lambda l, r: l.join(r, on="k").filter((pl.col("x") + pl.col("y") > 120)
+                                                      & (pl.col("v") > 0)),
+    "then_group_by": lambda l, r: (l.join(r, on="k").filter(pl.col("x") < pl.col("y"))
+                                   .group_by("k").agg(pl.len(), pl.col("x").sum())),
+    "join_where": lambda l, r: l.join_where(r.rename({"k": "k2", "v": "w"}),
+                                            pl.col("k") == pl.col("k2"), pl.col("x") < pl.col("y")),
+}
+
+
+@pytest.mark.parametrize("case", sorted(JOIN_PREDICATES))
+def test_an_inner_join_with_a_predicate_runs_as_the_join_then_the_filter(case):
+    lf = JOIN_PREDICATES[case](*_join_frames())
+    if _running_ir()[0] == 15:
+        check_fallback(lf, "join with a fused predicate")
+    else:
+        check(lf, kinds=["Join"])
+
+
+@pytest.mark.parametrize("how", ["left", "full"])
+def test_a_join_where_other_than_inner_stays_with_polars(how):
+    left, right = _join_frames()
+    lf = left.join_where(right.rename({"k": "k2", "v": "w"}), pl.col("k") == pl.col("k2"),
+                         pl.col("x") < pl.col("y"), how=how)
+    if not POLARS_21:
+        pytest.skip(f"polars {pl.__version__} has no join_where(how={how!r})")
+    eng = check_fallback(lf, "join with a predicate is not translated")
+    assert not any("Join" in t["kinds"] for t in eng.last_report.taken)
 
 
 def test_a_scan_joined_with_a_scan_runs_as_one_subtree(scan_files):

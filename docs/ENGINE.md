@@ -450,8 +450,9 @@ input rows are at or above the measured crossover of every shape class in it (so
 input, fitted from `Benchmarks/results/polars_engine_crossover_2026-09-30-groupby.csv` against Polars'
 own engines. A group-by is judged at the bucket of its number of groups (200, 1,000, 10,000, 100,000,
 1,000,000, or at least a quarter of the rows, a bucket never taken), which a fixed-seed sample of its
-key columns estimates at plan time (bias-corrected Chao1, 512 sampled rows and up until the decision
-is settled). A shape counts as ahead at a size when its time, raised by 15% (35% for a shape with a
+key columns estimates at plan time (Chao1 for sampling without replacement, 512 sampled rows and up
+until the decision is settled and the sample before confirms it); a group-by whose rows are
+concentrated on a few of its keys stays with Polars ([POLARS.md](POLARS.md#which-translatable-subtrees-it-runs-the-defaults)). A shape counts as ahead at a size when its time, raised by 15% (35% for a shape with a
 String column), is at most the faster Polars engine's; the default takes it from 1.5 times that
 fitted crossover, and a shape with a String column from 5,000,000 rows at the earliest. In
 `Benchmarks/results/polars_engine_bench_2026-10-02.csv` (2,000,000 and 50,000,000 rows, best of 5)

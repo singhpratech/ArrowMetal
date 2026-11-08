@@ -62,6 +62,11 @@
 //!   value column, min+max over a Float32 value column (`minmax_f32`), and DISTINCT, each over one
 //!   key and over two keys, int32 and int64 keys.
 //!   `out_rows` is the group count the data holds.
+//! * `--families gskew`: keys that are not evenly frequent, one int64 key `kl`, count / sum / avg /
+//!   min+max over an int64 value column: Zipf keys (a = 1.1, 1.3, 1.6, 2.0, drawn as NumPy's
+//!   `zipf`), 200 frequent keys with 1%, 5% or 20% of the rows unique, or with 5% of the rows in
+//!   keys of 3 or of 100 rows; then 10k, 100k and 1M keys whose sizes are log-normal (sigma 0.5,
+//!   1.0, 1.5). The same families as `Benchmarks/group_skew_bench.py`, from this crate's generator.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -529,6 +534,60 @@ struct Block {
     cases: Vec<Case>,
 }
 
+/// One Zipf(a) draw, a > 1, by NumPy's rejection method (`random_zipf`).
+fn zipf(rng: &mut StdRng, a: f64) -> i64 {
+    let am1 = a - 1.0;
+    let b = 2f64.powf(am1);
+    loop {
+        let u = 1.0 - rng.random::<f64>();
+        let v = rng.random::<f64>();
+        let x = u.powf(-1.0 / am1).floor();
+        if !(1.0..=i64::MAX as f64).contains(&x) {
+            continue;
+        }
+        let t = (1.0 + 1.0 / x).powf(am1);
+        if v * x * (t - 1.0) / (b - 1.0) <= t / b {
+            return x as i64;
+        }
+    }
+}
+
+/// The skewed-key frames of `gskew`: (name, int64 keys).
+fn skew_frames(rng: &mut StdRng, n: usize) -> Vec<(String, Vec<i64>)> {
+    let mut out = Vec::new();
+    for a in [1.1, 1.3, 1.6, 2.0] {
+        out.push((format!("zipf a={a}"), (0..n).map(|_| zipf(rng, a)).collect()));
+    }
+    for (pct, frac) in [(1, 0.01), (5, 0.05), (20, 0.2)] {
+        out.push((
+            format!("200 frequent + {pct}% unique rows"),
+            (0..n).map(|i| if rng.random::<f64>() < frac { 10_000_000 + i as i64 } else { rng.random_range(0..200) }).collect(),
+        ));
+    }
+    for c in [3usize, 100] {
+        out.push((
+            format!("200 frequent + 5% rows in keys of {c}"),
+            (0..n).map(|i| if rng.random::<f64>() < 0.05 { 10_000_000 + (i / c) as i64 } else { rng.random_range(0..200) }).collect(),
+        ));
+    }
+    for g in [10_000usize, 100_000, 1_000_000] {
+        for sigma in [0.5f64, 1.0, 1.5] {
+            // Log-normal weights (Box-Muller), then each row draws a key by its weight.
+            let mut cum = Vec::with_capacity(g);
+            let mut total = 0.0;
+            for _ in 0..g {
+                let (u, v) = (1.0 - rng.random::<f64>(), rng.random::<f64>());
+                let z = (-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos();
+                total += (sigma * z).exp();
+                cum.push(total);
+            }
+            let keys = (0..n).map(|_| cum.partition_point(|&w| w < rng.random::<f64>() * total) as i64).collect();
+            out.push((format!("{} keys, log-normal sizes s={sigma}", gname(g, n)), keys));
+        }
+    }
+    out
+}
+
 fn gname(g: usize, rows: usize) -> String {
     match g {
         200 => "200".into(),
@@ -669,6 +728,31 @@ fn blocks(rows: usize, fam: &str, join_keys: &[String], rng: &mut StdRng) -> Vec
                     Block { family: "groupby_i64", source: Source::Mem(vec![("grid", t)]), cases }
                 }));
             }
+        }
+        "gskew" => {
+            out.push(Box::new(move |rng| {
+                let mut tables = Vec::new();
+                let mut cases = Vec::new();
+                for (i, (name, keys)) in skew_frames(rng, rows).into_iter().enumerate() {
+                    let t: &'static str = Box::leak(format!("skew{i}").into_boxed_str());
+                    let q = i64s(rng, rows, 1_000_000_000);
+                    tables.push((t, batch(vec![("kl", Arc::new(Int64Array::from(keys)) as ArrayRef), ("q", q)])));
+                    for (fam, agg) in [
+                        ("count", "count(*) AS n"),
+                        ("sum_int", "sum(q) AS s"),
+                        ("avg_int", "avg(q) AS m"),
+                        ("minmax_int", "min(q) AS lo, max(q) AS hi"),
+                    ] {
+                        cases.push(case(
+                            &format!("{fam}_skew{i}"),
+                            &format!("{fam}, 1 int64 key, {name}"),
+                            &format!("SELECT kl, {agg} FROM {t} GROUP BY kl"),
+                            Order::Any,
+                        ));
+                    }
+                }
+                Block { family: "gskew", source: Source::Mem(tables), cases }
+            }));
         }
         "gsweep" => {
             let mut gs = vec![200usize, 10_000, 100_000, 1_000_000, rows / 2];

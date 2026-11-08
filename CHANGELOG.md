@@ -6,17 +6,48 @@
   with shifts from two `threadgroup atomic_uint` loads, which `radix_histogram`, `gb_accumulate_priv` and `am_gb_priv`
   did, so every sort of 64-bit keys (Int64, Double, temporal, utf8, binary) and those group-bys failed to create their
   pipelines there. The three join with `as_type<ulong>(uint2(lo, hi))` instead (#1).
-- The differential matrix and the Python test suites run on pyarrow 26.0.0 (CI pin, venv). Four pyarrow
-  bugs the matrix worked around on 25.0.1 are fixed in 26.0.0 (`utf8_normalize` composing for NFC and
-  NFKC, by our apache/arrow#51237; `pairwise_diff`, the boolean fill-null kernels and `winsorize` on a
-  sliced array honouring the offset): their pinning tests failed on 26.0.0 as designed and were retired
-  with the workarounds, so the oracle is `pyarrow.compute` on the slice itself again. The `binary_slice`
+- **Polars 2.1.0.** `MetalEngine` runs on polars 2.1.0 (IR (16, 0)); `TESTED_POLARS` adds 2.1.0 and the
+  `polars` extra installs `polars>=1.44,<2.2`. Polars 2.1 shows engines a join holding a predicate over
+  both sides (`join(...).filter(pl.col("x") < pl.col("y"))` becomes one inner join of kind
+  `("Inner", "fused_predicate")`): the engine runs it as the join, then the filter; other join kinds
+  with a predicate stay with Polars (on 2.0.0 Polars kept such a join from engines). With the 2.0.0
+  crossover table, the default on 2.1.0 takes 52 of 107 benchmarked cases at 50,000,000 rows, each
+  1.31x to 10.31x faster than the faster Polars 2.1.0 engine, none behind
+  (`Benchmarks/results/polars_engine_bench_2026-11-06-polars21.csv`). The engine conformance grid,
+  run on 2.0.0 and 2.1.0 for the first time, records the streaming engine's element-wise division of
+  frames under 100 rows as a documented divergence (36 cases); 0 unclassified on 1.44.1, 2.0.0 and
+  2.1.0 (docs/FINDINGS.md, Round 24).
+
+## 0.6.0 — 2026-11-06
+
+Everything below is new in 0.6.0. The group-count probe of the Polars engine and of `datafusion-arrowmetal`
+leaves a group-by whose rows are concentrated on a few of its keys to the CPU engine: on Polars 1.44.1 the
+default no longer runs the GPU where it is slower on skewed keys (0.5.0: 13 of 72 cases) and picks the faster
+engine in 68 of 72 (0.5.0: 59). The differential matrix and the Python suites run on pyarrow 26.0.0, and
+`remainder`, new in Arrow v26, runs on the GPU.
+
+- **pyarrow 26.0.0.** The differential matrix and the Python test suites run on pyarrow 26.0.0 (CI pin, venv).
+  Four pyarrow bugs the matrix worked around on 25.0.1 are fixed in 26.0.0 (`utf8_normalize` composing for NFC
+  and NFKC, by our apache/arrow#51237; `pairwise_diff`, the boolean fill-null kernels and `winsorize` on a
+  sliced array honouring the offset): their pinning tests failed on 26.0.0 as designed and were retired with
+  the workarounds, so the oracle is `pyarrow.compute` on the slice itself again. The `binary_slice`
   default-stop overflow remains (apache/arrow#51222), with its pinning test. Three more pinned behaviours
   changed in 26.0.0 and their tests say so now (`cumulative_max`'s default start, the out-of-range
   float-to-int cast, the fixed-size-list Parquet file pyarrow's reader used to reject), and the registry
-  carries 26.0.0's five new function names: `remainder` runs on the GPU as `modulo()` has always computed
-  it (the C `%`), `remainder_checked`, the floored `modulo` / `modulo_checked` and `search_sorted` are
-  recorded as missing.
+  carries 26.0.0's five new function names: `remainder` runs on the GPU as `modulo()` has always computed it
+  (the C `%`), `remainder_checked`, the floored `modulo` / `modulo_checked` and `search_sorted` are recorded
+  as missing.
+- **The group-count probe on keys that are not evenly frequent.** The group-count probe of the Polars engine
+  and of `datafusion-arrowmetal` estimates with Chao1 for sampling without replacement (Chao and Lin 2012) and
+  takes an estimate only when the sample before it confirms it; a range still unconfirmed at the largest
+  sample reaches the Good-Turing bound. A group-by whose rows are concentrated on a few of its keys (the
+  estimate at least 30 times the effective number of keys) is left to the CPU engine whatever its count: on
+  such keys the GPU group-by measured slower than Polars in 69 of 72 cases
+  (`Benchmarks/results/group_skew_2026-11-05.csv`). On Polars 1.44.1 the default picks the faster engine in 68
+  of 72 skewed cases (was 59) and 72 of 72 with log-normal group sizes (was 65), and no longer runs the GPU
+  where it is slower (was 13 cases, 0.42x to 0.93x); on 2.0.0, 0 such runs (was 5). Uniform keys get the same
+  decisions, at 71 to 720 µs a probe. `Benchmarks/group_skew_bench.py` and the `gskew` family of
+  `datafusion/examples/bench.rs` time it (docs/FINDINGS.md, Round 23).
 
 ## 0.5.0 — 2026-10-08
 

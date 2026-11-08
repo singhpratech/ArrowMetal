@@ -2,6 +2,100 @@
 
 Things learned the hard way. Add to this whenever something surprises you.
 
+## Round 24 (2026-11-06): Polars 2.1.0
+
+**What.** Polars 2.1.0 (released 2026-10-25) reports IR version (16, 0), a new major, so `MetalEngine`
+declined every plan on it until the IR was checked. The Python-visible node and expression classes
+are those of IR 15 with two additions: a `predicate` on `Join` and an `Operator.TruncDivide`
+(`Expr.truncdiv`). A truncating division has no translation and stays with Polars.
+
+**A join that holds a filter.** Polars 2.1 shows engines a join holding a predicate over both sides
+(pola-rs/polars#30176). An ordinary `left.join(right, on="k").filter(pl.col("x") < pl.col("y"))`
+becomes one inner join node of kind `("Inner", "fused_predicate")` with the comparison inside it. A
+walk that read only the keys would have returned the join without the filter, every pair of rows that
+shares a key. The engine now runs such a node as the join, then the filter over the joined columns
+by their output names (`v < v_right` included); a `join_where` other than inner (`how="left"`,
+`"full"`, kind `cross_and_filter`) stays with Polars. Polars 2.0.0 does not show such a join to an
+engine at all (its visitor raises "join with a fused predicate", and the plan stays with Polars);
+1.44.1 kept a `Filter` above the `Join`, and the engine ran both. On 2.1.0 the five shapes of
+`test_an_inner_join_with_a_predicate_runs_as_the_join_then_the_filter` run on Metal and equal Polars.
+
+**Two behaviours of Polars 2.1 that tests pinned.** A select of literals only is folded into a
+one-row frame before the engine sees it, so there is no `Select` left to decline. A Parquet file whose
+stored `ARROW:schema` names more fields than the file holds is read by the file's own columns, as Arrow
+reads it, where 2.0.0 applied the stored schema.
+
+**The grid on 2.x.** The engine conformance grid had run on 1.44.1 only. On 2.0.0 and 2.1.0 alike it
+showed 36 unclassified divisions by a literal, all over 7-row frames: `collect()` there is the
+streaming engine, which divides frames of 2 to 9 rows element-wise (the correctly rounded x / c),
+while the engine gives the in-memory engine's multiply by the reciprocal, as POLARS.md states. All
+36 equal `collect(engine="in-memory")`; they are now the documented divergence
+`streaming-small-frame-division`. 15,376 cases, 0 unclassified on 2.1.0 (15,055 pass, 74
+documented), 2.0.0 (15,056, 73) and 1.44.1 (15,096, 33).
+
+**Speed.** Polars 2.1 is a major version 2, so the engine uses the 2.0.0 crossover table. The default
+benchmark at 50,000,000 rows, run on 2.1.0 and then on 2.0.0 with the same code in one session on AC
+power (`Benchmarks/results/polars_engine_bench_2026-11-06-polars21.csv` and `-polars2.csv`, with
+their conditions files; `Benchmarks/polars_bench_compare.py` reads them): on 2.1.0 the default takes
+the same 52 of 107 cases, each 1.31x to 10.31x faster than the faster Polars 2.1.0 engine, none
+behind (2.0.0 in the same session: 1.34x to 7.99x). Polars 2.1.0's own time is 1.12x of 2.0.0's at
+the median (0.77x on `row_number` over partitions, 1.55x to 1.71x on one-key group-bys at 1,000,000
+groups). Four cases the table leaves to Polars are 1.18x to 1.24x faster on the GPU on 2.1.0 (1.02x
+to 1.15x on 2.0.0); the table is not refitted for them.
+
+**What shipped.** `TESTED_IR_VERSION` adds (16, 0) and `TESTED_POLARS` 2.1.0; the `polars` extra
+installs `polars>=1.44,<2.2`. The Polars suites pass on 2.1.0 (2,347), 2.0.0 (2,345) and 1.44.1
+(2,348).
+
+## Round 23 (2026-11-05): the group-count probe on keys that are not evenly frequent
+
+**What.** A reader asked whether the probe's Chao1 estimator, on heavily skewed keys, would
+overestimate the group count and send a group-by to the GPU that the CPU would run faster. Measured,
+it fails the other way. Chao1 is a lower bound: with a few frequent keys and a long tail of rare ones,
+a 512-row sample sees the frequent keys twice and more and the tail barely at all, so the range is
+narrow and far below the true count, and it settled at once. 200 frequent keys with 1% of the rows
+unique, 10,000,000 rows: 100,328 groups, estimated at 216 (210 to 226). Every crossover table was fitted
+on keys of even frequencies, so the question was also whether the GPU's timings hold on such keys.
+
+- **On skewed keys the GPU group-by is slower whatever the count.** `Benchmarks/group_skew_bench.py`
+  (one int64 key; sum, min + max, mean, count; 10,000,000 and 50,000,000 rows; Zipf a = 1.1 to 2.0 and
+  frequent-keys-plus-tail mixtures, 72 cases): the GPU runs at 0.23x to 0.96x of the faster Polars
+  engine in 69 of 72 on Polars 1.44.1 (`group_skew_2026-11-05.csv`). Polars' streaming engine is 2.2
+  to 20.5 times faster than its in-memory engine on these keys (median 5.3): its hash table stays in
+  cache on the frequent keys, and the GPU kernel gains nothing from the skew. On log-normal group sizes
+  (10,000 to 1,000,000 keys, sigma 0.5 to 1.5; `group_skew_mild_2026-11-05.csv`) the GPU is ahead in all
+  72, 1.49x to 5.36x.
+- **A better estimate alone made the routing worse.** Chao1 for sampling without replacement (Chao
+  and Lin 2012), a confirming second sample and a range widened to the Good-Turing bound where the
+  counts show mixed frequencies brought the estimate's range to the true count, and the uniform-key
+  table then sent skewed keys to the GPU: the default was right in 30 of 72 skewed cases
+  (`group_skew_2026-11-05-estimator-only.csv`), against 59 for 0.5.0's underestimates, which had kept
+  most of them below the crossovers by accident. The mixed-frequency test also fired on log-normal
+  sizes, where it left GPU wins on the CPU; it was removed.
+- **What separates the two families is concentration, not the count.** The effective number of
+  keys, n (n - 1) / Σ c (c - 1) over a sample's counts, is about the group count on even keys and
+  exp(sigma^2) times below it on log-normal sizes. The estimate over it is at most 9.5 on the
+  log-normal frames at every sample with 50 pairs or more, and passes 30 on every skewed frame by the
+  512-, 2,048- or 8,192-row sample, at 38 or more (`Benchmarks/group_skew_probe_stats.py`,
+  `group_skew_probe_stats_2026-11-05.jsonl`). The probe flags a sample whose estimate is at least 30
+  times its effective number of keys (with at least 50 pairs of sampled rows sharing a key), and the
+  policy leaves that group-by to the CPU engine.
+- **Confirmation needs slack.** A small sample's range can be a little narrow: 200 even keys all seen
+  in 512 rows give 191.5 to 199.4, the next sample exactly 200. A range confirms the one before when
+  it starts at most 1.25 times above that one's high end and ends at or above the keys it saw.
+
+**Result.** Polars 1.44.1: the default is right in 68 of 72 skewed cases (0.5.0: 59) and 72 of 72
+log-normal ones (0.5.0: 65), and runs the GPU where it is slower in none (0.5.0: 13, 0.42x to 0.93x).
+Polars 2.0.0: 59 and 52 right (0.5.0: 60 and 51), no slower GPU run (0.5.0: 5); 13 skewed cases where
+the GPU was 1.02x to 1.41x faster stay on the CPU (8 found concentrated, 5 left by the 2.0.0 table at
+their true count). On uniform keys every decision of the probe benchmark is 0.5.0's, at 71 to 720 µs
+a probe, 0.15% to 1.58% of the group-by (`group_probe_2026-11-05.csv`); the confirming sample adds up
+to 262 µs. DataFusion (`datafusion/results/datafusion_gskew_2026-11-05-*.csv`) took none of the 144
+cases onto the GPU with either probe, and now names the concentration in 9 of its hand-backs. Two
+things the runs show and this round does not change: a plan the Polars default leaves runs on Polars'
+in-memory engine, a median 4.5 to 5.3 times slower than the streaming engine on skewed keys; and
+DataFusion's table leaves 61 log-normal cases where the GPU was faster, up to 7.54x.
+
 ## Round 22 (2026-10-15): the matrix moves to pyarrow 26.0.0
 
 **What.** Apache Arrow 26.0.0 shipped on 2026-10-09 with four of the pyarrow bugs the differential
