@@ -632,6 +632,11 @@ def _diff_arrays(got, expected, tol):
                 return None
         elif got.equals(expected):
             return None
+    if pa.types.is_temporal(got.type):
+        # Compare the tick counts: a timestamp[ns] whose value is not a whole microsecond cannot
+        # become a datetime without pandas, and the ticks name the difference exactly.
+        storage = pa.int32() if got.type.bit_width == 32 else pa.int64()
+        return diff(got.cast(storage).to_pylist(), expected.cast(storage).to_pylist(), tol)
     return diff(got.to_pylist(), expected.to_pylist(), tol)
 
 
