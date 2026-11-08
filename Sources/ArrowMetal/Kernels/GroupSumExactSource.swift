@@ -415,7 +415,7 @@ enum GroupSumExactSource {
                 uint a3 = atomic_load_explicit(&tA[k * 4u + 3u], memory_order_relaxed);
                 if ((a0 | a1 | a2 | a3) == 0u) continue;
                 // The partial is a 128-bit two's-complement value: adding it modulo 2^128 is exact.
-                gs_acc_d(&g[4], (ulong)a0 | ((ulong)a1 << 32), (ulong)a2 | ((ulong)a3 << 32), false);
+                gs_acc_d(&g[4], as_type<ulong>(uint2(a0, a1)), as_type<ulong>(uint2(a2, a3)), false);
             }
         }
 
