@@ -347,7 +347,7 @@ the CPU idiom is ahead — is in [docs/BENCHMARKS_MATRIX.md](docs/BENCHMARKS_MAT
   stated limitation; of the 5 names v26 added, `remainder` runs on the GPU and 4 are recorded as missing.
   The table is generated from a registry the test suite executes against `pyarrow.compute`. [`docs/ARROW_FUNCTIONS.md`](docs/ARROW_FUNCTIONS.md)
 - **41,688 differential cases against pyarrow over 46 column types**, 1,047 Swift tests against a CPU
-  oracle and 7,282 Python cases (7,252 passed, 30 skipped), all run in release.
+  oracle and 7,289 Python cases (7,257 passed, 32 skipped), all run in release.
   [`docs/TESTING.md`](docs/TESTING.md)
 - **Seven languages on one C ABI** — Swift, Python, C, Rust, Go, TypeScript and R, each binding with its
   own suite against that language's Arrow library. [`docs/README.md`](docs/README.md)
