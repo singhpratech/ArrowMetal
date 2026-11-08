@@ -2,6 +2,38 @@
 
 Things learned the hard way. Add to this whenever something surprises you.
 
+## Round 25 (2026-11-08): sorts and group-bys on M1 GPUs
+
+**What.** On an M1 Max (MacBookPro18,2, macOS 27.2 26B123, Xcode 27.2), every ArrowMetal sort of 64-bit
+keys (Int64, Double, temporal, utf8, binary) and the two privatised group-by paths failed to create their
+pipelines: `Metal pipeline creation failed: radix_histogram on Apple M1 Max: Compilation failed due to an
+interrupted connection: XPC_ERROR_CONNECTION_INTERRUPTED`. At 1f21115, `swift test -c release --filter Sort`
+failed 61 of 73 tests there, 44 on `radix_histogram` and the rest on `gb_accumulate_priv` and `am_gb_priv`;
+sorts of 32-bit keys worked. Reported with a reproducer in issue #1 by d-polikhranidi, who also sent the
+fix (#2), the project's first outside contribution.
+
+**The shape the compiler aborts on.** MTLCompilerService dies with SIGABRT (`llvm::report_fatal_error`
+in a MachineFunctionPass of AGXCompilerCore) whenever two `threadgroup atomic_uint` loads are joined into
+one `ulong` with shifts, `(ulong)lo | ((ulong)hi << 32)`. A kernel of those few lines reproduces it. The
+same join from two plain `threadgroup uint`s compiles, and so does `as_type<ulong>(uint2(lo, hi))` over
+the atomics. The M4 Max's compiler accepts all of them, which is why the suite had never seen it: no
+M1-generation machine runs the GPU suites here, and GitHub's runners skip them (Round 4).
+
+**The fix.** `radix_histogram` (`Kernels/SortSource.swift`), `gb_accumulate_priv`
+(`Kernels/GroupBySource.swift`), `am_gb_priv` (`Expr/ExprGroupBy.swift`) and, with the same shape but
+no failure observed, `gs_b_priv` (`Kernels/GroupSumExactSource.swift`) join with
+`as_type<ulong>(uint2(lo, hi))`. On a little-endian GPU that is the same 64 bits; a 32-bit key's
+histogram still stores only its low word. The other `<< 32` joins in the kernels take plain or device
+values, not threadgroup atomics.
+
+**Checked.** On the M1 Max with the fix, `--filter "Sort|GroupBy|TopK|Window"` gives 160 tests, 2 skipped,
+0 failures, and a sort of 11,914,043 rows comes out in order on the CPU. On the M4 Max, the full release
+suite gives 1,047 tests, 35 skipped, 0 failures, and a Metal program ran the shift and the `as_type` forms,
+plain and through threadgroup atomics, on 65,536 word pairs (every pair of ten edge words, then random
+words): 0 mismatches against the CPU's join, the two forms identical bit for bit. One M1 difference
+remains outside this fix: `MathExtraTests.testTranscendentalsAtEverySize` reports float32 `logb` 231 ulp
+off at one row against 16 allowed, the same with and without the change.
+
 ## Round 24 (2026-11-06): Polars 2.1.0
 
 **What.** Polars 2.1.0 (released 2026-10-25) reports IR version (16, 0), a new major, so `MetalEngine`

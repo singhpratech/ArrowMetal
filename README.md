@@ -36,7 +36,7 @@ DataFusion's group-bys are 1.24x to 2.17x and four of DuckDB's thirteen rewritte
 <a href="https://datafusion.apache.org"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/datafusion-dark.svg"><img src="docs/img/engines/datafusion.svg" height="22" alt="Apache DataFusion" align="top"></picture></a> **DataFusion.** A physical optimizer rule for DataFusion 55.1; the SQL is unchanged. A Rust crate used by
 [crates.io](https://crates.io/crates/datafusion-arrowmetal); it loads `libArrowMetalC.dylib` ([install](docs/DATAFUSION.md#install)):
 ```toml
-datafusion-arrowmetal = "0.6.0"   # beside datafusion = "=55.1.0"
+datafusion-arrowmetal = "0.6.1"   # beside datafusion = "=55.1.0"
 ```
 Full sorts **6.9x to 28.8x** faster than DataFusion alone (250,000 to 50,000,000 rows), ten group-by
 series **2.31x to 4.27x**; 13,632 query pairs, 0 mismatches. Left to DataFusion: top-k 0.14x to 0.41x,
@@ -94,7 +94,7 @@ A physical optimizer rule for DataFusion 55.1, the Rust crate `datafusion-arrowm
 # Cargo.toml
 [dependencies]
 datafusion = { version = "=55.1.0", default-features = false, features = ["sql"] }
-datafusion-arrowmetal = "0.6.0"
+datafusion-arrowmetal = "0.6.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -315,14 +315,14 @@ print(amount.filter_where(">", 15).to_arrow())          # [20, 30, 40]: GPU filt
 
 ### Release
 
-Listed on Apache Arrow's [Powered By](https://arrow.apache.org/powered_by/) page and on Apache DataFusion's [integrations list](https://datafusion.apache.org/user-guide/introduction.html#integrations). Site and docs: <https://arrowmetal.org> · Python: `pip install arrowmetal` · Rust: `arrowmetal = "0.6.0"` · DataFusion: `datafusion-arrowmetal = "0.6.0"` · Release: [v0.6.0](https://github.com/singhpratech/ArrowMetal/releases/tag/v0.6.0)
+Listed on Apache Arrow's [Powered By](https://arrow.apache.org/powered_by/) page and on Apache DataFusion's [integrations list](https://datafusion.apache.org/user-guide/introduction.html#integrations). Site and docs: <https://arrowmetal.org> · Python: `pip install arrowmetal` · Rust: `arrowmetal = "0.6.1"` · DataFusion: `datafusion-arrowmetal = "0.6.1"` · Release: [v0.6.1](https://github.com/singhpratech/ArrowMetal/releases/tag/v0.6.1)
 
-New in 0.6.0: the group-count probe of the Polars engine and of `datafusion-arrowmetal` leaves a
-group-by whose rows are concentrated on a few of its keys to the CPU engine (on Polars 1.44.1 the default
-picks the faster engine in 68 of 72 skewed-key cases, 0.5.0: 59, and runs the GPU where it is slower in 0,
-0.5.0: 13); the test suites run on pyarrow 26.0.0, and `remainder`, new in Arrow v26, runs on the GPU.
-Before, 0.5.0 brought Polars 2.0.0 support with one measured crossover table per Polars major, and
-one-pass integer means in the Polars and plan engines.
+New in 0.6.1: sorts of 64-bit keys and the privatised group-bys create their pipelines on M1-generation
+GPUs, where 0.6.0's failed (the fix is the first outside contribution, by d-polikhranidi, #1); the Polars
+engine runs on polars 2.1.0 (the default takes 52 of 107 benchmarked cases at 50,000,000 rows, 1.31x to
+10.31x ahead of the faster Polars engine, none behind) and the `polars` extra installs `polars>=1.44,<2.2`.
+Before, 0.6.0 brought the group-count probe that leaves skewed-key group-bys to the CPU engine, the test
+suites on pyarrow 26.0.0, and `remainder` on the GPU.
 
 ### The pitch in one paragraph
 
@@ -469,7 +469,7 @@ PYTHONPATH=python python -c "import arrowmetal as am; print(am.device_name())"
 
 # From a wheel that carries the dylib (no Swift toolchain at install time)
 pip install build && scripts/build_wheel.sh         # or python/build_wheel.sh, if the dylib is built
-pip install python/dist/arrowmetal-0.6.0-*.whl      # macOS arm64 only, pyarrow comes with it
+pip install python/dist/arrowmetal-0.6.1-*.whl      # macOS arm64 only, pyarrow comes with it
 python -c "import arrowmetal as am; print(am.device_name())"
 ```
 ```python

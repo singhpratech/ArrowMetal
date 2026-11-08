@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.6.1 — 2026-11-08
+
+Everything below is new in 0.6.1. On M1-generation GPUs, 0.6.0's sorts of 64-bit keys and its privatised
+group-bys failed to create their pipelines; the fix is the first outside contribution, by d-polikhranidi
+(#1, #2). The Polars engine runs on polars 2.1.0, and the `polars` extra installs `polars>=1.44,<2.2`.
+
 - **Sorts and group-bys compile on M1 GPUs.** The GPU compiler on an M1 Max (macOS 27.2) aborts on a `ulong` joined
   with shifts from two `threadgroup atomic_uint` loads, which `radix_histogram`, `gb_accumulate_priv` and `am_gb_priv`
   did, so every sort of 64-bit keys (Int64, Double, temporal, utf8, binary) and those group-bys failed to create their
