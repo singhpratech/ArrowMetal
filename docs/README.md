@@ -68,7 +68,10 @@ beside a source checkout. See [../python/README.md](../python/README.md).
 
 ## Reproducing everything
 
-All of it runs on an Apple silicon Mac on macOS 14 or later (the package's floor) with Xcode installed:
+All of it runs on an Apple silicon Mac on macOS 14 or later (the package's floor) with Xcode installed.
+The numbers in these pages are from an M4 Max; on an M1 Max the Sort, GroupBy, TopK and Window suites
+pass with 0.6.1's kernels (160 tests, run by the contributor of #2), where 0.6.0's sorts of 64-bit keys
+failed to create their pipelines ([FINDINGS.md, Round 25](FINDINGS.md#round-25-2026-11-08-sorts-and-group-bys-on-m1-gpus)):
 
 ```
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test               # Swift suite, debug

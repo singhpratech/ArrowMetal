@@ -1,7 +1,10 @@
 # Testing
 
 How ArrowMetal is tested, what each layer compares against, and what "green" means before anything is
-pushed. Each row names the run its numbers are from, on an M4 Max.
+pushed. Each row names the run its numbers are from, on an M4 Max. The GPU suites have also run on an
+M1 Max (macOS 27.2) with 0.6.1's kernels: Sort, GroupBy, TopK and Window, 160 tests, 2 skipped, 0 failures,
+by the contributor of #2; with 0.6.0's kernels 61 of the 73 Sort tests failed there on pipeline creation
+([FINDINGS.md, Round 25](FINDINGS.md#round-25-2026-11-08-sorts-and-group-bys-on-m1-gpus)).
 
 | Layer | Size | Oracle |
 |---|---|---|
