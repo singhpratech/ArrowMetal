@@ -1,5 +1,5 @@
 {
- "as_of": "2026-11-10T13:36:55Z",
+ "as_of": "2026-11-11T23:31:27Z",
  "window_days": 14,
  "count": 16,
  "with_project_activity": 15,
@@ -752,12 +752,45 @@
      "inline": 1,
      "url": "https://github.com/apache/arrow/pull/52451#pullrequestreview-5596277531",
      "pr": "https://github.com/apache/arrow/pull/52451"
+    },
+    {
+     "type": "pr_comment",
+     "at": "2026-11-11T22:18:51Z",
+     "actor": "Dricmoy",
+     "association": "contributor",
+     "text": "Thanks for the reviews. Updated and rebased onto main: - The size estimate is split into `MaxSliceBytes` (clamps start/stop) and `NumSelectedBytes` (`ceil(span / |step|)` without overflow). This fixes the `\"abc\"`, start=1, step=INT64_MAX case. - The lower clamp is now `-len - 1`,…",
+     "url": "https://github.com/apache/arrow/pull/52451#issuecomment-6808417120",
+     "pr": "https://github.com/apache/arrow/pull/52451"
+    },
+    {
+     "type": "commit",
+     "at": "2026-11-11T22:18:53Z",
+     "actor": "Dricmoy",
+     "url": "https://github.com/apache/arrow/commit/becd14518e44711d743f88c49e4e8c55a2236452"
+    },
+    {
+     "type": "commit",
+     "at": "2026-11-11T22:18:53Z",
+     "actor": "Dricmoy",
+     "url": "https://github.com/apache/arrow/commit/e7e6639ca4d9357e77ae65e2f8147900ace164b0"
+    },
+    {
+     "type": "commit",
+     "at": "2026-11-11T22:18:54Z",
+     "actor": "Dricmoy",
+     "url": "https://github.com/apache/arrow/commit/4b75d502fcf515e6f78abfe5fdbc1082cf1e6c49"
+    },
+    {
+     "type": "commit",
+     "at": "2026-11-11T22:18:54Z",
+     "actor": "Dricmoy",
+     "url": "https://github.com/apache/arrow/commit/6c0d83f99d85088e6dc38d70a690ae2e8855920a"
     }
    ],
    "reporter_comments": 1,
    "community_comments": 0,
-   "last_activity": "2026-10-21T07:26:30Z",
-   "pulse": false
+   "last_activity": "2026-11-11T22:18:54Z",
+   "pulse": true
   },
   {
    "project": "pyarrow 25.0.1",
@@ -1560,17 +1593,11 @@
      "actor": "zeroshade",
      "reason": null,
      "commit": null
-    },
-    {
-     "type": "commit",
-     "at": "2026-10-13T13:43:16Z",
-     "actor": "zeroshade",
-     "url": "https://github.com/apache/arrow-go/commit/7090f9eddcd53a4909c401c7e33b6b567fa3f322"
     }
    ],
    "reporter_comments": 0,
    "community_comments": 0,
-   "last_activity": "2026-10-13T13:43:16Z",
+   "last_activity": "2026-10-13T12:21:45Z",
    "pulse": false
   },
   {
