@@ -1,5 +1,5 @@
 {
- "as_of": "2026-11-11T23:31:27Z",
+ "as_of": "2026-11-12T13:51:34Z",
  "window_days": 14,
  "count": 16,
  "with_project_activity": 15,
@@ -691,7 +691,7 @@
      "type": "pull_request",
      "at": "2026-10-08T23:51:33Z",
      "actor": "Dricmoy",
-     "title": "GH-51222: [C++] Avoid overflow in binary_slice output sizing",
+     "title": "GH-51222: [C++] Fix integer overflows in binary_slice",
      "url": "https://github.com/apache/arrow/pull/52451",
      "state": "open",
      "by_reporter": false
