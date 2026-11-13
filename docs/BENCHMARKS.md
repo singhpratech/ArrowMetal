@@ -2,7 +2,8 @@
 
 ## Submitting a result from your Mac
 
-Every round below was measured on one Apple M4 Max. A run on another Mac goes in as a GitHub issue:
+Every round below was measured on one Apple M4 Max, except the section of results submitted from other
+Macs. A run on another Mac goes in as a GitHub issue:
 
 1. Run `python -m arrowmetal.bench` (10,000,000 generated rows; `--rows N` for another size,
    `--parquet FILE` for your own file). With `--calibrate` it also runs the router's quick calibration
@@ -23,6 +24,25 @@ Every round below was measured on one Apple M4 Max. A run on another Mac goes in
 Nothing is sent by the command. Submitted results are reviewed. `python/tests/test_bench_share.py`
 checks that the block parses back into the form's fields (`arrowmetal.bench.parse_share_block` and
 `form_fields`) and that the form declares exactly those fields.
+
+## Results submitted from other Macs
+
+Each row group is one submitted issue, copied from its Share it block; the block is kept as a file under
+`Benchmarks/results/submitted/`. The speedup is against the fastest CPU number on the row. These runs
+were made by their submitters on their own machines and were not repeated here.
+
+### Apple M5 Max, 2026-11-13 ([#3](https://github.com/singhpratech/ArrowMetal/issues/3), submitted by selasley)
+
+18 CPU cores, 64 GB, macOS 27.2.1; ArrowMetal 0.6.1, pyarrow 26.0.1, Polars 2.1.0, Python 3.15.2;
+`python -m arrowmetal.bench`, generated data, 10,000,000 rows, router auto, the shipped router table,
+every answer matched pyarrow (`Benchmarks/results/submitted/issue-3_apple-m5-max_2026-11-13.txt`).
+
+| op | rows | pyarrow ms (cpu-ms) | Polars ms (cpu-ms) | ArrowMetal ms (cpu-ms) | speedup |
+|---|---:|---:|---:|---:|---:|
+| sum int64 (10% nulls) | 10,000,000 | 8.98 (9.0) | 2.76 (2.8) | 0.40 (0.4) | 6.87x |
+| filter int64 > 0 | 10,000,000 | 38.87 (38.8) | 4.37 (4.4) | 1.31 (0.7) | 3.33x |
+| sort float64 | 10,000,000 | 2152.98 (2151.0) | 22.45 (213.8) | 5.45 (1.2) | 4.12x |
+| sum by int32 key (1000 groups) | 10,000,000 | 5.59 (50.4) | 15.61 (244.9) | 3.84 (1.3) | 1.46x |
 
 ## 2026-09-07, Apple M4 Max, round 10: the integration benchmarks rerun and recorded
 

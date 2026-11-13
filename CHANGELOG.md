@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-Nothing yet.
+- **The first benchmark from another Mac.** docs/BENCHMARKS.md has a section for results submitted from other
+  Macs; its first entry is an Apple M5 Max at 10,000,000 rows on 0.6.1 (#3, submitted by selasley): sum 6.87x,
+  filter 3.33x, sort 4.12x and group-by sum 1.46x against the fastest CPU number on each row.
 
 ## 0.6.1 — 2026-11-08
 
