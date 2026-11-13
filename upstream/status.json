@@ -1,5 +1,5 @@
 {
- "as_of": "2026-11-12T13:51:34Z",
+ "as_of": "2026-11-13T13:14:50Z",
  "window_days": 14,
  "count": 16,
  "with_project_activity": 15,
@@ -785,11 +785,22 @@
      "at": "2026-11-11T22:18:54Z",
      "actor": "Dricmoy",
      "url": "https://github.com/apache/arrow/commit/6c0d83f99d85088e6dc38d70a690ae2e8855920a"
+    },
+    {
+     "type": "review",
+     "at": "2026-11-13T05:32:33Z",
+     "actor": "dmitry-chirkov-dremio",
+     "association": "contributor",
+     "state": "approved",
+     "text": "Lgtm. My earlier feedback is addressed. @pitrou's too it seems?",
+     "inline": 0,
+     "url": "https://github.com/apache/arrow/pull/52451#pullrequestreview-5886639103",
+     "pr": "https://github.com/apache/arrow/pull/52451"
     }
    ],
    "reporter_comments": 1,
    "community_comments": 0,
-   "last_activity": "2026-11-11T22:18:54Z",
+   "last_activity": "2026-11-13T05:32:33Z",
    "pulse": true
   },
   {
