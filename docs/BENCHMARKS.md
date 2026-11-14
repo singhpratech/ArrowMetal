@@ -44,6 +44,38 @@ every answer matched pyarrow (`Benchmarks/results/submitted/issue-3_apple-m5-max
 | sort float64 | 10,000,000 | 2152.98 (2151.0) | 22.45 (213.8) | 5.45 (1.2) | 4.12x |
 | sum by int32 key (1000 groups) | 10,000,000 | 5.59 (50.4) | 15.61 (244.9) | 3.84 (1.3) | 1.46x |
 
+### Apple M5 Max, 2026-11-14, 50,000,000 rows on its own router table ([#3](https://github.com/singhpratech/ArrowMetal/issues/3), submitted by selasley)
+
+The same Mac Studio (18 CPU cores: 6 performance and 12 efficiency; 40 GPU cores; 64 GB; macOS 27.2.1) and
+the same versions; `python -m arrowmetal.bench --rows 50000000`, generated data, router auto, the router
+table this Mac wrote with `--calibrate` at 2026-11-14T20:10:54Z, every answer matched pyarrow
+(`Benchmarks/results/submitted/issue-3_apple-m5-max_2026-11-14_50000000.txt`).
+
+| op | rows | pyarrow ms (cpu-ms) | Polars ms (cpu-ms) | ArrowMetal ms (cpu-ms) | speedup |
+|---|---:|---:|---:|---:|---:|
+| sum int64 (10% nulls) | 50,000,000 | 44.70 (44.7) | 13.99 (14.0) | 1.41 (0.5) | 9.91x |
+| filter int64 > 0 | 50,000,000 | 194.74 (194.6) | 22.18 (22.2) | 3.02 (0.8) | 7.36x |
+| sort float64 | 50,000,000 | 21940.59 (21931.0) | 114.64 (1125.5) | 24.94 (1.3) | 4.60x |
+| sum by int32 key (1000 groups) | 50,000,000 | 14.96 (230.9) | 77.10 (1306.8) | 3.82 (1.2) | 3.92x |
+
+The router table itself is `Benchmarks/results/submitted/issue-3_apple-m5-max_router_2026-11-14.json`
+(quick grid, int64 with 10% nulls, 30,000 to 10,000,000 rows, GPU path against ArrowMetal's own CPU path).
+Its crossovers, the row count from which the GPU path is the faster one on this Mac:
+
+| op | crossover rows |
+|---|---:|
+| sum(int64) | 215,964 |
+| min(int64) | 209,605 |
+| max(int64) | 217,328 |
+| filter(int64, mask) | 666,523 |
+| multiply(int64, 3) | 725,584 |
+| group-by sum (1000 keys) | 778,701 |
+| add(int64, 1) | 1,401,194 |
+| compare(int64 > 0) | 2,362,163 |
+
+The file's own comparison with the shipped table: on all 48 measured pairs of operation and size the two
+tables choose the same path, and that path was the faster one measured.
+
 ## 2026-09-07, Apple M4 Max, round 10: the integration benchmarks rerun and recorded
 
 The four integration benchmark scripts were rerun and their complete stdout recorded as tracked

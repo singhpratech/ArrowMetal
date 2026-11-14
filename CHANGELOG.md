@@ -5,6 +5,9 @@
 - **The first benchmark from another Mac.** docs/BENCHMARKS.md has a section for results submitted from other
   Macs; its first entry is an Apple M5 Max at 10,000,000 rows on 0.6.1 (#3, submitted by selasley): sum 6.87x,
   filter 3.33x, sort 4.12x and group-by sum 1.46x against the fastest CPU number on each row.
+- **The M5 Max at 50,000,000 rows, and its router table.** The same submitter's second run (#3), on the
+  table the Mac calibrated for itself: sum 9.91x, filter 7.36x, sort 4.60x and group-by sum 3.92x. The table is
+  kept beside the block; on all 48 pairs it measured it chooses the same path as the shipped one.
 
 ## 0.6.1 — 2026-11-08
 

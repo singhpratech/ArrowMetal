@@ -1,0 +1,590 @@
+{
+ "format": "arrowmetal-router-table/1",
+ "machine": {
+  "chip": "Apple M5 Max",
+  "chip_id": "apple-m5-max",
+  "metal_device": "Apple M5 Max",
+  "cpu_cores": 18,
+  "performance_cores": 6,
+  "efficiency_cores": 12,
+  "gpu_cores": 40,
+  "memory_gb": 64,
+  "macos": "27.2.1"
+ },
+ "date": "2026-11-14T20:10:54Z",
+ "arrowmetal_version": "0.6.1",
+ "grid": {
+  "name": "quick",
+  "sizes": [
+   30000,
+   100000,
+   300000,
+   1000000,
+   3000000,
+   10000000
+  ],
+  "reps": 10,
+  "reps_large_from_rows": 3000000,
+  "reps_large": 5,
+  "modes": [
+   "gpu",
+   "cpu"
+  ],
+  "cases": [
+   "add(int64, 1)",
+   "compare(int64 > 0)",
+   "filter(int64, mask)",
+   "group-by sum (1000 keys)",
+   "max(int64)",
+   "min(int64)",
+   "multiply(int64, 3)",
+   "sum(int64)"
+  ],
+  "elapsed_s": 0.9
+ },
+ "shape": {
+  "dtype": "int64",
+  "null_fraction": 0.1,
+  "resident": true
+ },
+ "source": "python -m arrowmetal.router calibrate --quick",
+ "header": "ArrowMetal router check on Apple M5 Max, 18 CPU cores, Apple M5 Max, best of 10 (5 at 3M rows and above), int64 with 10% nulls, Python binding on resident arrays, 2026-11-14T20:10:54Z; quick grid, python -m arrowmetal.router calibrate",
+ "crossovers": {
+  "sum": {
+   "label": "sum(int64)",
+   "crossover_rows": 215964,
+   "step_rows": 300000,
+   "bracket_low_rows": 100000,
+   "points": [
+    {
+     "rows": 100000,
+     "gpu_us": 143.6,
+     "cpu_us": 55.7
+    },
+    {
+     "rows": 300000,
+     "gpu_us": 121.3,
+     "cpu_us": 185.0
+    }
+   ]
+  },
+  "min": {
+   "label": "min(int64)",
+   "crossover_rows": 209605,
+   "step_rows": 300000,
+   "bracket_low_rows": 100000,
+   "points": [
+    {
+     "rows": 100000,
+     "gpu_us": 140.2,
+     "cpu_us": 62.6
+    },
+    {
+     "rows": 300000,
+     "gpu_us": 140.6,
+     "cpu_us": 204.6
+    }
+   ]
+  },
+  "max": {
+   "label": "max(int64)",
+   "crossover_rows": 217328,
+   "step_rows": 300000,
+   "bracket_low_rows": 100000,
+   "points": [
+    {
+     "rows": 100000,
+     "gpu_us": 144.5,
+     "cpu_us": 64.6
+    },
+    {
+     "rows": 300000,
+     "gpu_us": 151.6,
+     "cpu_us": 207.9
+    }
+   ]
+  },
+  "compare": {
+   "label": "compare(int64 > 0)",
+   "crossover_rows": 2362163,
+   "step_rows": 3000000,
+   "bracket_low_rows": 1000000,
+   "points": [
+    {
+     "rows": 1000000,
+     "gpu_us": 126.2,
+     "cpu_us": 75.8
+    },
+    {
+     "rows": 3000000,
+     "gpu_us": 206.0,
+     "cpu_us": 229.6
+    }
+   ]
+  },
+  "arithmetic": {
+   "label": "add(int64, 1)",
+   "crossover_rows": 1401194,
+   "step_rows": 3000000,
+   "bracket_low_rows": 1000000,
+   "points": [
+    {
+     "rows": 1000000,
+     "gpu_us": 148.8,
+     "cpu_us": 121.9
+    },
+    {
+     "rows": 3000000,
+     "gpu_us": 260.0,
+     "cpu_us": 367.2
+    }
+   ]
+  },
+  "filter": {
+   "label": "filter(int64, mask)",
+   "crossover_rows": 666523,
+   "step_rows": 1000000,
+   "bracket_low_rows": 300000,
+   "points": [
+    {
+     "rows": 300000,
+     "gpu_us": 421.3,
+     "cpu_us": 203.9
+    },
+    {
+     "rows": 1000000,
+     "gpu_us": 477.7,
+     "cpu_us": 675.5
+    }
+   ]
+  },
+  "group_by_sum": {
+   "label": "group-by sum (1000 keys)",
+   "crossover_rows": 778701,
+   "step_rows": 1000000,
+   "bracket_low_rows": 300000,
+   "points": [
+    {
+     "rows": 300000,
+     "gpu_us": 269.1,
+     "cpu_us": 167.0
+    },
+    {
+     "rows": 1000000,
+     "gpu_us": 505.5,
+     "cpu_us": 552.7
+    }
+   ]
+  },
+  "multiply": {
+   "label": "multiply(int64, 3)",
+   "crossover_rows": 725584,
+   "step_rows": 1000000,
+   "bracket_low_rows": 300000,
+   "points": [
+    {
+     "rows": 300000,
+     "gpu_us": 150.5,
+     "cpu_us": 69.7
+    },
+    {
+     "rows": 1000000,
+     "gpu_us": 176.1,
+     "cpu_us": 228.2
+    }
+   ]
+  }
+ },
+ "measurements": [
+  {
+   "op": "sum(int64)",
+   "rows": 30000,
+   "gpu_us": 131.5,
+   "cpu_us": 13.8,
+   "faster_path": "cpu",
+   "margin": 9.53
+  },
+  {
+   "op": "min(int64)",
+   "rows": 30000,
+   "gpu_us": 132.8,
+   "cpu_us": 18.8,
+   "faster_path": "cpu",
+   "margin": 7.08
+  },
+  {
+   "op": "max(int64)",
+   "rows": 30000,
+   "gpu_us": 105.8,
+   "cpu_us": 18.8,
+   "faster_path": "cpu",
+   "margin": 5.63
+  },
+  {
+   "op": "compare(int64 > 0)",
+   "rows": 30000,
+   "gpu_us": 142.5,
+   "cpu_us": 4.0,
+   "faster_path": "cpu",
+   "margin": 35.99
+  },
+  {
+   "op": "add(int64, 1)",
+   "rows": 30000,
+   "gpu_us": 140.6,
+   "cpu_us": 5.3,
+   "faster_path": "cpu",
+   "margin": 26.36
+  },
+  {
+   "op": "multiply(int64, 3)",
+   "rows": 30000,
+   "gpu_us": 114.0,
+   "cpu_us": 8.6,
+   "faster_path": "cpu",
+   "margin": 13.29
+  },
+  {
+   "op": "filter(int64, mask)",
+   "rows": 30000,
+   "gpu_us": 819.8,
+   "cpu_us": 22.0,
+   "faster_path": "cpu",
+   "margin": 37.19
+  },
+  {
+   "op": "group-by sum (1000 keys)",
+   "rows": 30000,
+   "gpu_us": 193.7,
+   "cpu_us": 20.2,
+   "faster_path": "cpu",
+   "margin": 9.58
+  },
+  {
+   "op": "sum(int64)",
+   "rows": 100000,
+   "gpu_us": 143.6,
+   "cpu_us": 55.7,
+   "faster_path": "cpu",
+   "margin": 2.58
+  },
+  {
+   "op": "min(int64)",
+   "rows": 100000,
+   "gpu_us": 140.2,
+   "cpu_us": 62.6,
+   "faster_path": "cpu",
+   "margin": 2.24
+  },
+  {
+   "op": "max(int64)",
+   "rows": 100000,
+   "gpu_us": 144.5,
+   "cpu_us": 64.6,
+   "faster_path": "cpu",
+   "margin": 2.24
+  },
+  {
+   "op": "compare(int64 > 0)",
+   "rows": 100000,
+   "gpu_us": 131.7,
+   "cpu_us": 8.9,
+   "faster_path": "cpu",
+   "margin": 14.77
+  },
+  {
+   "op": "add(int64, 1)",
+   "rows": 100000,
+   "gpu_us": 113.9,
+   "cpu_us": 13.6,
+   "faster_path": "cpu",
+   "margin": 8.36
+  },
+  {
+   "op": "multiply(int64, 3)",
+   "rows": 100000,
+   "gpu_us": 114.3,
+   "cpu_us": 24.5,
+   "faster_path": "cpu",
+   "margin": 4.67
+  },
+  {
+   "op": "filter(int64, mask)",
+   "rows": 100000,
+   "gpu_us": 376.1,
+   "cpu_us": 69.2,
+   "faster_path": "cpu",
+   "margin": 5.43
+  },
+  {
+   "op": "group-by sum (1000 keys)",
+   "rows": 100000,
+   "gpu_us": 148.2,
+   "cpu_us": 59.4,
+   "faster_path": "cpu",
+   "margin": 2.5
+  },
+  {
+   "op": "sum(int64)",
+   "rows": 300000,
+   "gpu_us": 121.3,
+   "cpu_us": 185.0,
+   "faster_path": "gpu",
+   "margin": 1.52
+  },
+  {
+   "op": "min(int64)",
+   "rows": 300000,
+   "gpu_us": 140.6,
+   "cpu_us": 204.6,
+   "faster_path": "gpu",
+   "margin": 1.46
+  },
+  {
+   "op": "max(int64)",
+   "rows": 300000,
+   "gpu_us": 151.6,
+   "cpu_us": 207.9,
+   "faster_path": "gpu",
+   "margin": 1.37
+  },
+  {
+   "op": "compare(int64 > 0)",
+   "rows": 300000,
+   "gpu_us": 136.0,
+   "cpu_us": 23.5,
+   "faster_path": "cpu",
+   "margin": 5.8
+  },
+  {
+   "op": "add(int64, 1)",
+   "rows": 300000,
+   "gpu_us": 138.0,
+   "cpu_us": 37.8,
+   "faster_path": "cpu",
+   "margin": 3.65
+  },
+  {
+   "op": "multiply(int64, 3)",
+   "rows": 300000,
+   "gpu_us": 150.5,
+   "cpu_us": 69.7,
+   "faster_path": "cpu",
+   "margin": 2.16
+  },
+  {
+   "op": "filter(int64, mask)",
+   "rows": 300000,
+   "gpu_us": 421.3,
+   "cpu_us": 203.9,
+   "faster_path": "cpu",
+   "margin": 2.07
+  },
+  {
+   "op": "group-by sum (1000 keys)",
+   "rows": 300000,
+   "gpu_us": 269.1,
+   "cpu_us": 167.0,
+   "faster_path": "cpu",
+   "margin": 1.61
+  },
+  {
+   "op": "sum(int64)",
+   "rows": 1000000,
+   "gpu_us": 141.1,
+   "cpu_us": 702.2,
+   "faster_path": "gpu",
+   "margin": 4.98
+  },
+  {
+   "op": "min(int64)",
+   "rows": 1000000,
+   "gpu_us": 208.4,
+   "cpu_us": 703.8,
+   "faster_path": "gpu",
+   "margin": 3.38
+  },
+  {
+   "op": "max(int64)",
+   "rows": 1000000,
+   "gpu_us": 200.5,
+   "cpu_us": 709.6,
+   "faster_path": "gpu",
+   "margin": 3.54
+  },
+  {
+   "op": "compare(int64 > 0)",
+   "rows": 1000000,
+   "gpu_us": 126.2,
+   "cpu_us": 75.8,
+   "faster_path": "cpu",
+   "margin": 1.67
+  },
+  {
+   "op": "add(int64, 1)",
+   "rows": 1000000,
+   "gpu_us": 148.8,
+   "cpu_us": 121.9,
+   "faster_path": "cpu",
+   "margin": 1.22
+  },
+  {
+   "op": "multiply(int64, 3)",
+   "rows": 1000000,
+   "gpu_us": 176.1,
+   "cpu_us": 228.2,
+   "faster_path": "gpu",
+   "margin": 1.3
+  },
+  {
+   "op": "filter(int64, mask)",
+   "rows": 1000000,
+   "gpu_us": 477.7,
+   "cpu_us": 675.5,
+   "faster_path": "gpu",
+   "margin": 1.41
+  },
+  {
+   "op": "group-by sum (1000 keys)",
+   "rows": 1000000,
+   "gpu_us": 505.5,
+   "cpu_us": 552.7,
+   "faster_path": "gpu",
+   "margin": 1.09
+  },
+  {
+   "op": "sum(int64)",
+   "rows": 3000000,
+   "gpu_us": 214.7,
+   "cpu_us": 2394.4,
+   "faster_path": "gpu",
+   "margin": 11.15
+  },
+  {
+   "op": "min(int64)",
+   "rows": 3000000,
+   "gpu_us": 317.1,
+   "cpu_us": 2142.3,
+   "faster_path": "gpu",
+   "margin": 6.76
+  },
+  {
+   "op": "max(int64)",
+   "rows": 3000000,
+   "gpu_us": 314.5,
+   "cpu_us": 2158.3,
+   "faster_path": "gpu",
+   "margin": 6.86
+  },
+  {
+   "op": "compare(int64 > 0)",
+   "rows": 3000000,
+   "gpu_us": 206.0,
+   "cpu_us": 229.6,
+   "faster_path": "gpu",
+   "margin": 1.11
+  },
+  {
+   "op": "add(int64, 1)",
+   "rows": 3000000,
+   "gpu_us": 260.0,
+   "cpu_us": 367.2,
+   "faster_path": "gpu",
+   "margin": 1.41
+  },
+  {
+   "op": "multiply(int64, 3)",
+   "rows": 3000000,
+   "gpu_us": 290.4,
+   "cpu_us": 689.7,
+   "faster_path": "gpu",
+   "margin": 2.38
+  },
+  {
+   "op": "filter(int64, mask)",
+   "rows": 3000000,
+   "gpu_us": 640.2,
+   "cpu_us": 2025.6,
+   "faster_path": "gpu",
+   "margin": 3.16
+  },
+  {
+   "op": "group-by sum (1000 keys)",
+   "rows": 3000000,
+   "gpu_us": 1493.2,
+   "cpu_us": 1661.0,
+   "faster_path": "gpu",
+   "margin": 1.11
+  },
+  {
+   "op": "sum(int64)",
+   "rows": 10000000,
+   "gpu_us": 395.9,
+   "cpu_us": 7856.0,
+   "faster_path": "gpu",
+   "margin": 19.84
+  },
+  {
+   "op": "min(int64)",
+   "rows": 10000000,
+   "gpu_us": 616.6,
+   "cpu_us": 7178.8,
+   "faster_path": "gpu",
+   "margin": 11.64
+  },
+  {
+   "op": "max(int64)",
+   "rows": 10000000,
+   "gpu_us": 634.8,
+   "cpu_us": 7231.1,
+   "faster_path": "gpu",
+   "margin": 11.39
+  },
+  {
+   "op": "compare(int64 > 0)",
+   "rows": 10000000,
+   "gpu_us": 408.9,
+   "cpu_us": 837.0,
+   "faster_path": "gpu",
+   "margin": 2.05
+  },
+  {
+   "op": "add(int64, 1)",
+   "rows": 10000000,
+   "gpu_us": 619.5,
+   "cpu_us": 1252.0,
+   "faster_path": "gpu",
+   "margin": 2.02
+  },
+  {
+   "op": "multiply(int64, 3)",
+   "rows": 10000000,
+   "gpu_us": 439.7,
+   "cpu_us": 2312.7,
+   "faster_path": "gpu",
+   "margin": 5.26
+  },
+  {
+   "op": "filter(int64, mask)",
+   "rows": 10000000,
+   "gpu_us": 715.8,
+   "cpu_us": 6770.0,
+   "faster_path": "gpu",
+   "margin": 9.46
+  },
+  {
+   "op": "group-by sum (1000 keys)",
+   "rows": 10000000,
+   "gpu_us": 2484.1,
+   "cpu_us": 5548.5,
+   "faster_path": "gpu",
+   "margin": 2.23
+  }
+ ],
+ "comparison_with_shipped": {
+  "pairs": 48,
+  "agree": 48,
+  "machine_picked_faster": 48,
+  "shipped_picked_faster": 48
+ }
+}

@@ -1,0 +1,14 @@
+ArrowMetal bench result
+chip: Apple M5 Max
+macOS: 27.2.1
+machine: 18 CPU cores, 64 GB, Metal device Apple M5 Max
+versions: ArrowMetal 0.6.1, pyarrow 26.0.1, Polars 2.1.0, Python 3.15.2
+run: python -m arrowmetal.bench, generated data, 50,000,000 rows, router auto, results match pyarrow
+router table: ~/.arrowmetal/router/apple-m5-max.json (this Mac's, 2026-11-14T20:10:54Z)
+
+| op | rows | pyarrow ms (cpu-ms) | Polars ms (cpu-ms) | ArrowMetal ms (cpu-ms) | speedup |
+|---|---:|---:|---:|---:|---:|
+| sum int64 (10% nulls) | 50,000,000 | 44.70 (44.7) | 13.99 (14.0) | 1.41 (0.5) | 9.91x |
+| filter int64 > 0 | 50,000,000 | 194.74 (194.6) | 22.18 (22.2) | 3.02 (0.8) | 7.36x |
+| sort float64 | 50,000,000 | 21940.59 (21931.0) | 114.64 (1125.5) | 24.94 (1.3) | 4.60x |
+| sum by int32 key (1000 groups) | 50,000,000 | 14.96 (230.9) | 77.10 (1306.8) | 3.82 (1.2) | 3.92x |
