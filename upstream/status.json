@@ -1,5 +1,5 @@
 {
- "as_of": "2026-11-13T13:14:50Z",
+ "as_of": "2026-11-14T12:18:56Z",
  "window_days": 14,
  "count": 16,
  "with_project_activity": 15,
@@ -375,12 +375,18 @@
      "at": "2026-09-23T13:36:09Z",
      "actor": "pitrou",
      "label": "Component: C++"
+    },
+    {
+     "type": "commit",
+     "at": "2026-11-14T01:07:31Z",
+     "actor": "Hor911",
+     "url": "https://github.com/apache/arrow/commit/4ceb419582b9d74ddfad4e8a495742863423ee85"
     }
    ],
    "reporter_comments": 0,
    "community_comments": 0,
-   "last_activity": "2026-09-23T13:36:09Z",
-   "pulse": false
+   "last_activity": "2026-11-14T01:07:31Z",
+   "pulse": true
   },
   {
    "project": "pyarrow 25.0.1",
