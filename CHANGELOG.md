@@ -8,13 +8,13 @@
 - **The M5 Max at 50,000,000 rows, and its router table.** The same submitter's second run (#3), on the
   table the Mac calibrated for itself: sum 9.91x, filter 7.36x, sort 4.60x and group-by sum 3.92x. The table is
   kept beside the block; on all 48 pairs it measured it chooses the same path as the shipped one.
-- **Apache Spark on the GPU.** `spark/` is a Spark SQL extension (`spark.sql.extensions=
-  org.arrowmetal.spark.ArrowMetalExtensions`) that runs the filters, projections and partial aggregate
-  directly above a Parquet or ORC scan as one GPU stage, translated from Spark's expressions with Spark's
-  semantics, and one-key sorts; it calls the C ABI from Java through the foreign function API. On Spark
-  4.3.0, 800 random queries gave the same result with and without it (646 of them run a GPU stage; a query
-  that raises on both sides counts as the same, and -0.0 and 0.0 compare equal); the timings and how they
-  were taken are in docs/SPARK.md ([docs/SPARK.md](docs/SPARK.md)).
+- **Apache Spark on the GPU.** `spark/` is a Spark SQL extension that runs the filters, projections and
+  partial `GROUP BY` directly above a Parquet or ORC scan as one GPU stage, translated with Spark's semantics,
+  calling the C ABI from Java through the foreign function API; sorts, ungrouped aggregates and plain
+  filter/projection stages are opt-in. On Spark 4.3.0, 1,300 random queries: 1,277 with identical rows, 23
+  raising on both sides, 0 different. At 50,000,000 rows, each side at its better partition count, a
+  1,000,000-group `GROUP BY` measures 2.3x to 2.6x, 100,000 groups 1.6x, few groups about level
+  ([docs/SPARK.md](docs/SPARK.md)).
 
 ## 0.6.1 — 2026-11-08
 

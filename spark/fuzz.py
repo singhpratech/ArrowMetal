@@ -33,6 +33,8 @@ spark = (SparkSession.builder.master("local[*]").appName("arrowmetal-spark-fuzz"
          .config("spark.sql.extensions", "org.arrowmetal.spark.ArrowMetalExtensions")
          .config("spark.driver.extraJavaOptions", "--enable-native-access=ALL-UNNAMED")
          .config("spark.driver.memory", os.environ.get("SPARK_DRIVER_MEMORY", "24g"))
+         .config("spark.arrowmetal.sort.enabled", "true").config("spark.arrowmetal.stage.rows", "true")
+         .config("spark.arrowmetal.stage.ungrouped", "true")      # everything on, the opt-in parts included
          .config("spark.ui.enabled", "false")
          .getOrCreate())
 spark.sparkContext.setLogLevel("ERROR")
@@ -169,6 +171,7 @@ by_form = {}
 for qn in range(N):
     form, sql = query()
     ansi = qn % 2 == 0
+    spark.conf.set("spark.arrowmetal.stage.batchRows", "20000" if qn % 4 < 2 else "16000000")   # many chunks, or one
     spark.conf.set("spark.sql.ansi.enabled", str(ansi).lower())
     try:
         spark.conf.set("spark.arrowmetal.enabled", "false")

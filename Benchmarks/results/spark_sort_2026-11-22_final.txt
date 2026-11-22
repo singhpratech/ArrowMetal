@@ -1,0 +1,46 @@
+ArrowMetal Spark plugin check: Apple M4 Max, 16 CPU cores, macOS 27.2.1; Spark 4.3.0 local[*], Java 27.0.1.1, ArrowMetal 0.6.1; 2026-11-22T16:25:51Z
+3,000,000 rows in 4 partitions; each sorted key column compared, in order, with Spark's own sort
+  k_long    asc  nulls first  sortWithinPartitions  identical
+  k_long    asc  nulls first  ORDER BY (global)     identical
+  k_long    asc  nulls last   sortWithinPartitions  identical
+  k_long    desc nulls first  sortWithinPartitions  identical
+  k_long    desc nulls last   sortWithinPartitions  identical
+  k_double  asc  nulls first  sortWithinPartitions  identical
+  k_double  asc  nulls first  ORDER BY (global)     identical
+  k_double  asc  nulls last   sortWithinPartitions  identical
+  k_double  desc nulls first  sortWithinPartitions  identical
+  k_double  desc nulls last   sortWithinPartitions  identical
+  k_int     asc  nulls first  sortWithinPartitions  identical
+  k_int     asc  nulls first  ORDER BY (global)     identical
+  k_int     asc  nulls last   sortWithinPartitions  identical
+  k_int     desc nulls first  sortWithinPartitions  identical
+  k_int     desc nulls last   sortWithinPartitions  identical
+  k_float   asc  nulls first  sortWithinPartitions  identical
+  k_float   asc  nulls first  ORDER BY (global)     identical
+  k_float   asc  nulls last   sortWithinPartitions  identical
+  k_float   desc nulls first  sortWithinPartitions  identical
+  k_float   desc nulls last   sortWithinPartitions  identical
+  k_date    asc  nulls first  sortWithinPartitions  identical
+  k_date    asc  nulls first  ORDER BY (global)     identical
+  k_date    asc  nulls last   sortWithinPartitions  identical
+  k_date    desc nulls first  sortWithinPartitions  identical
+  k_date    desc nulls last   sortWithinPartitions  identical
+MetalSortExec in the plan: True; 25 of 25 identical to Spark's sort
+ArrowMetal Spark plugin bench: Apple M4 Max, 16 CPU cores, macOS 27.2.1; Spark 4.3.0 local[*], Java 27.0.1.1, ArrowMetal 0.6.1; 2026-11-22T16:26:18Z
+50,000,000 rows, 16 partitions, cached; median [min-max] of 5 runs each after 2 warm-up runs, the first side alternating, written to Spark's noop sink
+  k_long sortWithinPartitions                        Spark 0.58 s [0.47-1.67], with ArrowMetal 0.45 s [0.39-0.66], 1.27x
+  k_long ORDER BY (global)                           Spark 2.59 s [2.29-2.96], with ArrowMetal 2.69 s [2.44-3.26], 0.96x
+  k_double sortWithinPartitions                      Spark 0.57 s [0.49-0.70], with ArrowMetal 0.69 s [0.65-0.97], 0.83x
+  k_double ORDER BY (global)                         Spark 2.64 s [2.38-3.14], with ArrowMetal 2.98 s [2.59-3.55], 0.89x
+ArrowMetal Spark plugin bench: Apple M4 Max, 16 CPU cores, macOS 27.2.1; Spark 4.3.0 local[*], Java 27.0.1.1, ArrowMetal 0.6.1; 2026-11-22T16:28:02Z
+50,000,000 rows, 4 partitions, cached; median [min-max] of 5 runs each after 2 warm-up runs, the first side alternating, written to Spark's noop sink
+  k_long sortWithinPartitions                        Spark 1.21 s [1.20-1.23], with ArrowMetal 1.17 s [0.98-1.26], 1.03x
+  k_long ORDER BY (global)                           Spark 4.46 s [4.20-4.96], with ArrowMetal 4.75 s [4.16-4.81], 0.94x
+  k_double sortWithinPartitions                      Spark 1.29 s [1.26-1.40], with ArrowMetal 1.40 s [1.30-1.59], 0.92x
+  k_double ORDER BY (global)                         Spark 3.99 s [3.86-4.30], with ArrowMetal 3.93 s [3.58-4.78], 1.02x
+ArrowMetal Spark plugin bench: Apple M4 Max, 16 CPU cores, macOS 27.2.1; Spark 4.3.0 local[*], Java 27.0.1.1, ArrowMetal 0.6.1; 2026-11-22T16:30:46Z
+50,000,000 rows, 1 partitions, cached; median [min-max] of 5 runs each after 2 warm-up runs, the first side alternating, written to Spark's noop sink
+  k_long sortWithinPartitions                        Spark 4.50 s [4.45-4.64], with ArrowMetal 3.48 s [3.23-3.90], 1.29x
+  k_long ORDER BY (global)                           Spark 4.46 s [4.46-4.58], with ArrowMetal 3.29 s [3.16-3.39], 1.35x
+  k_double sortWithinPartitions                      Spark 4.71 s [4.69-4.74], with ArrowMetal 3.26 s [3.24-3.67], 1.44x
+  k_double ORDER BY (global)                         Spark 4.85 s [4.68-5.05], with ArrowMetal 3.25 s [3.12-3.59], 1.49x

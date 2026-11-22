@@ -1,0 +1,18 @@
+ArrowMetal Spark plugin agg-check: Apple M4 Max, 16 CPU cores, macOS 27.2.1; Spark 4.3.0 local[*], Java 27.0.1.1, ArrowMetal 0.6.1; 2026-11-22T15:45:47Z
+20,000,000 rows of Parquet; each GROUP BY compared group by group with Spark's own aggregation (double sums to 1e-9 relative: the summation order differs)
+  GROUP BY k_int       1,001 groups: identical
+  GROUP BY k_long  1,000,000 groups: identical
+  GROUP BY k_date      3,650 groups: identical
+MetalStage in the plan: True; 3 of 3 identical to Spark
+ArrowMetal Spark plugin agg-bench: Apple M4 Max, 16 CPU cores, macOS 27.2.1; Spark 4.3.0 local[*], Java 27.0.1.1, ArrowMetal 0.6.1; 2026-11-22T15:46:01Z
+50,000,000 rows of Parquet (1267 MB) read in 16 partitions; best of 2 runs each, alternating, written to Spark's noop sink
+  SUM, COUNT, MIN, MAX by k_int                      Spark 0.52 s [0.46-0.53], with ArrowMetal 0.58 s [0.53-0.63], 0.89x
+  SUM(v_double) by k_int                             Spark 0.45 s [0.44-0.47], with ArrowMetal 0.49 s [0.48-0.50], 0.91x
+  SUM, COUNT, MIN, MAX by k_long                     Spark 2.11 s [2.04-2.18], with ArrowMetal 1.45 s [1.42-1.54], 1.45x
+  SUM(v_double) by k_long                            Spark 1.35 s [1.33-1.39], with ArrowMetal 0.88 s [0.86-0.93], 1.54x
+ArrowMetal Spark plugin agg-bench: Apple M4 Max, 16 CPU cores, macOS 27.2.1; Spark 4.3.0 local[*], Java 27.0.1.1, ArrowMetal 0.6.1; 2026-11-22T15:47:03Z
+50,000,000 rows of Parquet (1267 MB) read in 6 partitions; best of 2 runs each, alternating, written to Spark's noop sink
+  SUM, COUNT, MIN, MAX by k_int                      Spark 0.56 s [0.54-0.59], with ArrowMetal 0.47 s [0.40-0.49], 1.20x
+  SUM(v_double) by k_int                             Spark 0.29 s [0.29-0.30], with ArrowMetal 0.24 s [0.24-0.27], 1.20x
+  SUM, COUNT, MIN, MAX by k_long                     Spark 3.11 s [3.10-3.12], with ArrowMetal 0.90 s [0.89-0.90], 3.45x
+  SUM(v_double) by k_long                            Spark 1.79 s [1.78-1.83], with ArrowMetal 0.49 s [0.47-0.49], 3.68x

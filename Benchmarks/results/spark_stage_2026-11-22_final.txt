@@ -1,0 +1,10 @@
+ArrowMetal Spark plugin stage-bench: Apple M4 Max, 16 CPU cores, macOS 27.2.1; Spark 4.3.0 local[*], Java 27.0.1.1, ArrowMetal 0.6.1; 2026-11-22T16:37:06Z
+50,000,000 rows of Parquet (698 MB) read in 16 partitions; median [min-max] of 5 runs each after 2 warm-up runs, the first side alternating; both answers compared
+  filtered revenue, no GROUP BY (TPC-H Q6 shape)     Spark 0.11 s [0.11-0.15], with ArrowMetal 0.16 s [0.15-0.17], 0.69x  (same answer)
+  pricing summary by flag (TPC-H Q1 shape, int key)  Spark 0.28 s [0.27-0.29], with ArrowMetal 0.28 s [0.27-0.29], 1.00x  (same answer)
+  revenue by part, 100,000 groups                    Spark 0.73 s [0.69-0.76], with ArrowMetal 0.75 s [0.66-0.80], 0.97x  (same answer)
+ArrowMetal Spark plugin stage-bench: Apple M4 Max, 16 CPU cores, macOS 27.2.1; Spark 4.3.0 local[*], Java 27.0.1.1, ArrowMetal 0.6.1; 2026-11-22T16:37:31Z
+50,000,000 rows of Parquet (698 MB) read in 6 partitions; median [min-max] of 5 runs each after 2 warm-up runs, the first side alternating; both answers compared
+  filtered revenue, no GROUP BY (TPC-H Q6 shape)     Spark 0.17 s [0.17-0.18], with ArrowMetal 0.20 s [0.19-0.20], 0.88x  (same answer)
+  pricing summary by flag (TPC-H Q1 shape, int key)  Spark 0.49 s [0.47-0.53], with ArrowMetal 0.32 s [0.32-0.37], 1.53x  (same answer)
+  revenue by part, 100,000 groups                    Spark 0.73 s [0.71-0.77], with ArrowMetal 0.51 s [0.49-0.52], 1.43x  (same answer)

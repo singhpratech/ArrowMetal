@@ -1,0 +1,18 @@
+ArrowMetal Spark plugin agg-check: Apple M4 Max, 16 CPU cores, macOS 27.2.1; Spark 4.3.0 local[*], Java 27.0.1.1, ArrowMetal 0.6.1; 2026-11-22T16:34:42Z
+20,000,000 rows of Parquet; each GROUP BY compared group by group with Spark's own aggregation (double sums to 1e-9 relative: the summation order differs)
+  GROUP BY k_int       1,001 groups: identical
+  GROUP BY k_long  1,000,000 groups: identical
+  GROUP BY k_date      3,650 groups: identical
+MetalStage in the plan: True; 3 of 3 identical to Spark
+ArrowMetal Spark plugin agg-bench: Apple M4 Max, 16 CPU cores, macOS 27.2.1; Spark 4.3.0 local[*], Java 27.0.1.1, ArrowMetal 0.6.1; 2026-11-22T16:34:57Z
+50,000,000 rows of Parquet (1267 MB) read in 16 partitions; median [min-max] of 5 runs each after 2 warm-up runs, the first side alternating, written to Spark's noop sink
+  SUM, COUNT, MIN, MAX by k_int                      Spark 0.55 s [0.51-0.57], with ArrowMetal 0.56 s [0.55-0.60], 0.99x
+  SUM(v_double) by k_int                             Spark 0.46 s [0.43-0.50], with ArrowMetal 0.47 s [0.45-0.49], 0.97x
+  SUM, COUNT, MIN, MAX by k_long                     Spark 1.95 s [1.94-1.96], with ArrowMetal 1.49 s [1.41-1.53], 1.31x
+  SUM(v_double) by k_long                            Spark 1.21 s [1.19-1.23], with ArrowMetal 0.81 s [0.80-0.85], 1.49x
+ArrowMetal Spark plugin agg-bench: Apple M4 Max, 16 CPU cores, macOS 27.2.1; Spark 4.3.0 local[*], Java 27.0.1.1, ArrowMetal 0.6.1; 2026-11-22T16:35:56Z
+50,000,000 rows of Parquet (1267 MB) read in 6 partitions; median [min-max] of 5 runs each after 2 warm-up runs, the first side alternating, written to Spark's noop sink
+  SUM, COUNT, MIN, MAX by k_int                      Spark 0.58 s [0.56-0.59], with ArrowMetal 0.45 s [0.44-0.52], 1.28x
+  SUM(v_double) by k_int                             Spark 0.30 s [0.29-0.31], with ArrowMetal 0.27 s [0.27-0.28], 1.10x
+  SUM, COUNT, MIN, MAX by k_long                     Spark 3.03 s [2.99-3.08], with ArrowMetal 1.82 s [1.79-1.86], 1.67x
+  SUM(v_double) by k_long                            Spark 1.74 s [1.72-1.75], with ArrowMetal 0.86 s [0.83-0.89], 2.03x

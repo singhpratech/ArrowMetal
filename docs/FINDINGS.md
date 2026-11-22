@@ -55,14 +55,16 @@ stays on Spark. After that, 800 of 800 queries over two seeds were the same (bot
 same, -0.0 equal to 0.0), 646 with a GPU stage
 (`Benchmarks/results/spark_fuzz_2026-11-22.txt`).
 
-**The whole stage.** At 50,000,000 lineitem-shaped Parquet rows, a TPC-H Q1-shaped pricing summary (filter,
-four sums of expressions, three averages, a count, by an int key) measures 1.96x at 16 partitions and a
-100,000-group revenue query 1.89x at 6 (`Benchmarks/results/spark_stage_2026-11-22.txt`); the `GROUP BY`
-runs through the same plan engine measure 0.99x to 3.38x (`spark_groupby_2026-11-22.txt`). The stage holds
-a partition in memory: with Spark's default 1 GB driver heap a 50,000,000-row file ran out of heap with the
-plugin (the same query without it was not run at that heap). The rows at 6 partitions hold Spark to six
-tasks on 16 cores; best against best, the 1,000,000-group query is 2.21 s against 0.95 s, 2.3x. Sort runs
-outside the recorded files measured as low as 0.75x.
+**What the fair timings changed.** The first recordings were best of two, Spark first on a cold JVM, and their
+largest rows held Spark to 6 of 16 tasks. With warm-up, five runs a side in alternating order and each side at
+its better partition count, the 1,000,000-group query is 2.3x to 2.6x, not 3.38x; the GPU sort is 0.8x to 1.3x
+and is now opt-in; aggregates without `GROUP BY` are 0.6x and opt-in.
+
+**Byte and short columns.** They were imported but not read back: 76 of 300 queries failed once the fuzz had
+such columns. **Heap.** With the partition gathered on Java's heap, a query plain Spark completes at its default
+1 GB ran out of memory; the columns now go off-heap in chunks (`spark_heap_2026-11-22.txt`). Chunks of
+4,000,000 rows doubled the 1,000,000-group time at 6 partitions (0.90 s to 1.82 s: `_warm` and `_final`);
+at 16,000,000 rows it is 1.01 s. The build also moved the Q1 shape between 1.4x and 1.0x across runs.
 
 ## Round 25 (2026-11-08): sorts and group-bys on M1 GPUs
 

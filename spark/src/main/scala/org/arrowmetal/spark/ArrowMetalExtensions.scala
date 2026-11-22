@@ -19,10 +19,11 @@ import org.apache.spark.sql.types._
 /**
  * Spark on the Apple silicon GPU. Enable with
  *   --conf spark.sql.extensions=org.arrowmetal.spark.ArrowMetalExtensions
- * Settings: spark.arrowmetal.enabled (default true), spark.arrowmetal.sort.minRows (default 1000000:
- * smaller partitions are sorted by Spark's own ordering on the CPU), spark.arrowmetal.stage.enabled
- * (default true: filters, projections and the partial GROUP BY above a columnar scan, MetalStageExec) and
- * spark.arrowmetal.stage.rows (default true: a filter/projection chain with no aggregate above it too).
+ * Settings: spark.arrowmetal.enabled (true), spark.arrowmetal.stage.enabled (true: the filters, projections
+ * and partial GROUP BY above a columnar scan), spark.arrowmetal.stage.batchRows (16000000 rows a GPU chunk, which also ends at 1 GiB of off-heap columns);
+ * off by default: spark.arrowmetal.stage.ungrouped (aggregates without GROUP BY), spark.arrowmetal.stage.rows
+ * (filter/projection chains with no aggregate) and spark.arrowmetal.sort.enabled (one-key sorts, from
+ * spark.arrowmetal.sort.minRows, 1000000, rows a partition).
  */
 class ArrowMetalExtensions extends (SparkSessionExtensions => Unit) {
   override def apply(e: SparkSessionExtensions): Unit = e.injectColumnar(_ => new MetalColumnarRule)
@@ -36,7 +37,8 @@ class MetalColumnarRule extends ColumnarRule {
 /** Replaces a SortExec on one key of a supported type with MetalSortExec. */
 object MetalSortRule extends Rule[SparkPlan] {
   override def apply(plan: SparkPlan): SparkPlan = {
-    if (!SQLConf.get.getConfString("spark.arrowmetal.enabled", "true").toBoolean) return plan
+    if (!SQLConf.get.getConfString("spark.arrowmetal.enabled", "true").toBoolean ||
+        !SQLConf.get.getConfString("spark.arrowmetal.sort.enabled", "false").toBoolean) return plan
     plan.transformUp {
       case SortExec(order, global, child, _) if order.size == 1 && MetalSortExec.format(order.head.child.dataType).isDefined =>
         MetalSortExec(order, global, child)

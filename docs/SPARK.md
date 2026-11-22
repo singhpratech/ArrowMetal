@@ -41,8 +41,11 @@ property), the path of `libArrowMetalC.dylib`.
 |---|---|---|
 | `spark.arrowmetal.enabled` | `true` | `false` leaves every query to Spark |
 | `spark.arrowmetal.stage.enabled` | `true` | `false` leaves filters, projections and aggregates to Spark |
-| `spark.arrowmetal.stage.rows` | `true` | `false` takes a filter/projection chain only when an aggregate sits on it |
-| `spark.arrowmetal.sort.minRows` | `1000000` | partitions with fewer rows are sorted by Spark's own ordering |
+| `spark.arrowmetal.stage.batchRows` | `16000000` | rows a GPU chunk holds; a chunk also ends at 1 GiB of off-heap columns |
+| `spark.arrowmetal.stage.ungrouped` | `false` | `true` takes aggregates without `GROUP BY` too |
+| `spark.arrowmetal.stage.rows` | `false` | `true` takes filter/projection chains with no aggregate on them |
+| `spark.arrowmetal.sort.enabled` | `false` | `true` sorts one-key partitions on the GPU |
+| `spark.arrowmetal.sort.minRows` | `1000000` | with sorting on, smaller partitions are sorted by Spark's own ordering |
 
 ## How a column reaches the GPU
 
@@ -52,7 +55,9 @@ columns (C Data Interface `ArrowArray` / `ArrowSchema` pairs, `am_import`), runs
 them (`am_plan_run`: filter, `select`, `group_by` or `aggregate`, written by `SparkToArrowMetal.scala`) and
 reads the result back through `am_export`. A string column that is only carried to the output stays on
 the JVM and is joined back by row number. The sort writes the key of every row into one Arrow column and
-emits the rows in the order `am_argsort_ex2` returns. A partition is held in memory while it is processed.
+emits the rows in the order `am_argsort_ex2` returns. The columns are copied off-heap in chunks;
+at Spark's default 1 GB driver heap a 100,000-group query over 50,000,000 rows completes with the plugin and
+without it (`Benchmarks/results/spark_heap_2026-11-22.txt`).
 
 ## What it takes
 
@@ -76,14 +81,14 @@ The translation keeps Spark's semantics where Arrow's differ:
 
 ## Correctness
 
-`spark/fuzz.py` writes a 1,000,000-row Parquet table holding nulls, NaN, -0.0 and 0.0, both infinities,
-the int32 extremes and non-ASCII strings, generates random queries over it (filters nested up to two
-levels, projections, grouped and ungrouped aggregates), runs each with and without the plugin, half under
-ANSI and half not, and compares the rows as multisets (double sums and averages to 1e-9 relative, the
-summation order being different; everything else by value). Two runs: 300 queries (seed 1) and 500
-queries (seed 2), 800 of 800 the same, 646 of them with a
-`MetalStage` in the executed plan. A query that raises on both sides counts as the same, -0.0 and 0.0 compare
-equal, most sums over the double column are NaN, and the table has no byte, short or timestamp column.
+`spark/fuzz.py` writes a 1,000,000-row Parquet table holding nulls, NaN, -0.0 and 0.0, both infinities, the
+int32 extremes, non-ASCII strings and byte, short, date and timestamp columns, generates random queries over
+it, runs each with and without the plugin, half under ANSI, and compares the rows as multisets: double sums
+and averages to 1e-9 relative (the summation order differs), everything else exactly, -0.0 apart from 0.0.
+Three runs, 1,300 queries on the build of `spark_fuzz_2026-11-22_final.txt`: 1,277 with identical rows, 23
+where both raise, 0 different, 1,081 with a `MetalStage` in the executed plan. The fuzz of an earlier build
+found 76 of 300 queries failing, all on byte or short columns read back from the GPU. The chunk-size
+change after it ran 100 more (`spark_fuzz_2026-11-22_smoke16m.txt`).
 
 `spark/check.py check` compares 25 sorted key columns, in order, with Spark's sort (five key types, both
 directions, both null placements, global `ORDER BY`): 25 of 25 identical. `spark/check.py agg-check` compares
@@ -91,49 +96,26 @@ three `GROUP BY` queries over 20,000,000 Parquet rows group by group: 3 of 3 ide
 
 ## Timings
 
-Best of two runs each, Spark first, with no warm-up, in one process per table: Spark's first run is the one
-on a cold JVM. At 6 and 4 partitions Spark runs at most that many tasks at once, on a 16-core machine, so
-those rows are not Spark at its fastest: for the 1,000,000-group query its best recorded time is 2.21 s (16
-partitions) and the plugin's 0.95 s (6 partitions), 2.3x. Development runs of the sort recorded outside these
-files measured as low as 0.75x (`sortWithinPartitions` long, 16 partitions) and 0.86x (`ORDER BY` double, 4).
+Median of five runs a side after two warm-up runs, the side that goes first alternating; 50,000,000 rows,
+M4 Max, 16 cores, local mode, everything on. Each side at the better of the partition counts tried (16 and
+6; 16, 4 and 1 for the sorts). Files: `spark_groupby_2026-11-22_16m.txt`, `spark_stage_2026-11-22_16m.txt`,
+`spark_sort_2026-11-22_final.txt` under `Benchmarks/results/`.
 
-**Filter, expressions and aggregate in one stage**, a 698 MB Parquet file of 50,000,000 lineitem-shaped
-rows, both answers compared:
+| Query | Spark | With ArrowMetal | |
+|---|---:|---:|---:|
+| `SUM, COUNT, MIN, MAX`, 1,000,000 groups | 2.35 s | 1.01 s | 2.3x |
+| `SUM(double)`, 1,000,000 groups | 1.40 s | 0.53 s | 2.6x |
+| revenue by part, 100,000 groups | 0.88 s | 0.54 s | 1.6x |
+| `SUM, COUNT, MIN, MAX`, 1,001 groups | 0.55 s | 0.49 s | 1.1x |
+| `SUM(double)`, 1,001 groups | 0.31 s | 0.29 s | 1.1x |
+| pricing summary, 4 groups (TPC-H Q1 shape) | 0.39 s | 0.40 s | 1.0x |
+| filtered revenue, no `GROUP BY` (TPC-H Q6 shape), off by default | 0.13 s | 0.23 s | 0.6x |
+| `sortWithinPartitions` long, off by default | 0.58 s | 0.45 s | 1.3x |
+| `sortWithinPartitions` double, off by default | 0.57 s | 0.69 s | 0.8x |
+| `ORDER BY` long, off by default | 2.59 s | 2.69 s | 1.0x |
+| `ORDER BY` double, off by default | 2.64 s | 2.98 s | 0.9x |
 
-| Query | Partitions | Spark | With ArrowMetal | |
-|---|---:|---:|---:|---:|
-| filtered revenue, no `GROUP BY` (TPC-H Q6 shape) | 16 | 0.24 s | 0.20 s | 1.22x |
-| pricing summary by flag (TPC-H Q1 shape, int key) | 16 | 0.51 s | 0.26 s | 1.96x |
-| revenue by part, 100,000 groups | 16 | 0.79 s | 0.78 s | 1.01x |
-| filtered revenue, no `GROUP BY` | 6 | 0.27 s | 0.25 s | 1.09x |
-| pricing summary by flag | 6 | 0.58 s | 0.36 s | 1.60x |
-| revenue by part, 100,000 groups | 6 | 0.87 s | 0.46 s | 1.89x |
-
-**`GROUP BY` from Parquet**, a 1,267 MB file of 50,000,000 rows, written to Spark's `noop` sink:
-
-| Query | Partitions | Spark | With ArrowMetal | |
-|---|---:|---:|---:|---:|
-| `SUM, COUNT, MIN, MAX` by int key (1,001 groups) | 16 | 0.61 s | 0.61 s | 0.99x |
-| `SUM(double)` by int key | 16 | 0.63 s | 0.49 s | 1.29x |
-| `SUM, COUNT, MIN, MAX` by long key (1,000,000 groups) | 16 | 2.21 s | 1.47 s | 1.50x |
-| `SUM(double)` by long key | 16 | 1.55 s | 0.99 s | 1.56x |
-| `SUM, COUNT, MIN, MAX` by int key | 6 | 0.61 s | 0.46 s | 1.31x |
-| `SUM(double)` by int key | 6 | 0.37 s | 0.29 s | 1.26x |
-| `SUM, COUNT, MIN, MAX` by long key | 6 | 3.20 s | 0.95 s | 3.38x |
-| `SUM(double)` by long key | 6 | 1.73 s | 0.53 s | 3.24x |
-
-**Sort, 50,000,000 cached rows**, written to Spark's `noop` sink:
-
-| Query | Partitions | Spark | With ArrowMetal | |
-|---|---:|---:|---:|---:|
-| `sortWithinPartitions` long | 16 | 0.79 s | 0.50 s | 1.60x |
-| `sortWithinPartitions` double | 16 | 0.69 s | 0.63 s | 1.09x |
-| `ORDER BY` long | 16 | 2.53 s | 2.46 s | 1.03x |
-| `ORDER BY` double | 16 | 2.87 s | 2.54 s | 1.13x |
-| `sortWithinPartitions` double | 4 | 1.49 s | 1.17 s | 1.28x |
-| `ORDER BY` double | 1 | 4.74 s | 3.27 s | 1.45x |
-
-The largest gains are on many groups: on the same file at 6 partitions, Spark's time for the four
-aggregates grows from 0.61 s to 3.20 s between 1,001 and 1,000,000 groups, and the plugin's from 0.46 s to
-0.95 s. A global `ORDER BY` adds Spark's range exchange in front of the sort: at 16 partitions, 2.53 s
-against 0.79 s for the same long key sorted within partitions.
+Runs of the same query on the same day moved: the Q1 shape measured 1.4x in an earlier build's run
+(`spark_stage_2026-11-22_warm.txt`) and 1.0x in this one, and at 16 partitions the 1,001-group rows are 1.10x
+and 0.97x. The earlier recordings (`spark_*_2026-11-22.txt`, best of two, Spark first on a cold JVM; `_warm`;
+`_final`) are kept beside these.

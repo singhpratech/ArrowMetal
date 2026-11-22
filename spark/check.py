@@ -32,6 +32,8 @@ spark = (SparkSession.builder.master("local[*]").appName("arrowmetal-spark")
          .config("spark.sql.extensions", "org.arrowmetal.spark.ArrowMetalExtensions")
          .config("spark.driver.extraJavaOptions", "--enable-native-access=ALL-UNNAMED")
          .config("spark.driver.memory", os.environ.get("SPARK_DRIVER_MEMORY", "48g"))
+         .config("spark.arrowmetal.sort.enabled", "true").config("spark.arrowmetal.stage.rows", "true")
+         .config("spark.arrowmetal.stage.ungrouped", "true")      # everything on, the opt-in parts included
          .config("spark.ui.enabled", "false")
          .getOrCreate())
 spark.sparkContext.setLogLevel("ERROR")
@@ -206,8 +208,8 @@ elif mode == "agg-bench":
     spark.conf.set("spark.sql.files.minPartitionNum", str(parts))   # else the split size follows the core count
     spark.read.parquet(path).createOrReplaceTempView("t")
     nparts = spark.read.parquet(path).rdd.getNumPartitions()
-    print(f"{rows:,} rows of Parquet ({size / 1e6:.0f} MB) read in {nparts} partitions; best of 2 runs each, "
-          "alternating, written to Spark's noop sink")
+    print(f"{rows:,} rows of Parquet ({size / 1e6:.0f} MB) read in {nparts} partitions; median [min-max] of 5 runs each after 2 warm-up runs, "
+          "the first side alternating, written to Spark's noop sink")
     for key in ("k_int", "k_long"):
         for label, sql in ((f"SUM, COUNT, MIN, MAX by {key}", f"SELECT {key}, {AGG} FROM t GROUP BY {key}"),
                            (f"SUM(v_double) by {key}", f"SELECT {key}, SUM(v_double) FROM t GROUP BY {key}")):
@@ -239,8 +241,8 @@ if mode == "stage-bench":
     spark.conf.set("spark.sql.files.minPartitionNum", str(parts))
     spark.read.parquet(path).createOrReplaceTempView("lineitem")
     nparts = spark.read.parquet(path).rdd.getNumPartitions()
-    print(f"{rows:,} rows of Parquet ({size / 1e6:.0f} MB) read in {nparts} partitions; best of 2 runs each, "
-          "alternating; both answers compared")
+    print(f"{rows:,} rows of Parquet ({size / 1e6:.0f} MB) read in {nparts} partitions; median [min-max] of 5 runs each after 2 warm-up runs, "
+          "the first side alternating; both answers compared")
     queries = [
         ("filtered revenue, no GROUP BY (TPC-H Q6 shape)",
          "SELECT SUM(price * discount) AS revenue FROM lineitem WHERE shipdate >= DATE'1994-01-01' "

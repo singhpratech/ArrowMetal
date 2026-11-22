@@ -29,9 +29,10 @@ object MetalStageRule extends Rule[SparkPlan] {
   override def apply(plan: SparkPlan): SparkPlan = {
     if (!conf("spark.arrowmetal.enabled", "true").toBoolean || !conf("spark.arrowmetal.stage.enabled", "true").toBoolean) return plan
     val ansi = SQLConf.get.ansiEnabled
-    val rowsToo = conf("spark.arrowmetal.stage.rows", "true").toBoolean
+    val rowsToo = conf("spark.arrowmetal.stage.rows", "false").toBoolean
+    val ungrouped = conf("spark.arrowmetal.stage.ungrouped", "false").toBoolean
     plan.transformDown {
-      case agg: HashAggregateExec if MetalStage.build(agg, ansi).isDefined => MetalStage.build(agg, ansi).get
+      case agg: HashAggregateExec if (ungrouped || agg.groupingExpressions.nonEmpty) && MetalStage.build(agg, ansi).isDefined => MetalStage.build(agg, ansi).get
       case p @ (_: FilterExec | _: ProjectExec) if rowsToo && MetalStage.build(p, ansi).isDefined => MetalStage.build(p, ansi).get
     }
   }
@@ -53,7 +54,8 @@ case class MetalStageExec(output: Seq[Attribute], child: SparkPlan, json: String
 
   override protected def doExecute(): RDD[InternalRow] = {
     val (j, ins, out, empty, na, pt, m) = (json, inputs, output.map(_.dataType), emptyRow, nullAs, passthrough, metrics)
-    child.executeColumnar().mapPartitions(batches => MetalStage.run(batches, j, ins, out, empty, na, pt, m))
+    val batchRows = math.max(1L, conf.getConfString("spark.arrowmetal.stage.batchRows", "16000000").toLong)
+    child.executeColumnar().mapPartitions(batches => MetalStage.run(batches, j, ins, out, empty, na, pt, batchRows, m))
   }
 }
 
@@ -173,98 +175,81 @@ object MetalStage {
     Some(MetalStageExec(top.output, scan, json, inputs, emptyRow, nullAs, passthrough.toMap, label))
   }
 
-  /** One input column gathered from a partition's batches. */
-  private final class Gather(dt: DataType) {
-    private val chunks = new ArrayBuffer[AnyRef]
-    private val nullRows = new ArrayBuffer[Long]
-    private var bytes = 0L
+  /** One input column of a chunk, copied batch by batch into off-heap memory that grows by doubling. */
+  private final class Gather(dt: DataType, arena: Arena) {
+    private val (w, fmt) = dt match {
+      case ByteType => (1, "c")
+      case ShortType => (2, "s")
+      case IntegerType | DateType => (4, "i")
+      case LongType | TimestampType | TimestampNTZType => (8, "l")
+      case FloatType => (4, "f")
+      case DoubleType => (8, "g")
+      case BooleanType => (0, "b")
+      case StringType => (4, "u")
+    }
+    private var values = arena.allocate(1L << 16, 64)
+    private var data = if (dt == StringType) arena.allocate(1L << 16, 64) else null
+    private var validity = arena.allocate(1L << 12, 64)          // set bits are valid
+    private var nulls = 0L
+    var bytes = 0L
     var n = 0L
+    def held: Long = values.byteSize() + validity.byteSize() + (if (data == null) 0L else data.byteSize())
+
+    private def grow(seg: MemorySegment, need: Long): MemorySegment =
+      if (need <= seg.byteSize()) seg
+      else {
+        val bigger = arena.allocate(math.max(need, seg.byteSize() * 2), 64)
+        MemorySegment.copy(seg, 0L, bigger, 0L, seg.byteSize())
+        bigger
+      }
+    private def setBit(seg: MemorySegment, r: Long): Unit =
+      seg.set(ValueLayout.JAVA_BYTE, r >>> 3, (seg.get(ValueLayout.JAVA_BYTE, r >>> 3) | (1 << (r & 7).toInt)).toByte)
+
     def add(b: ColumnarBatch, idx: Int): Unit = {
       val v = b.column(idx)
       val rows = b.numRows()
+      val end = n + rows
+      values = grow(values, if (dt == StringType) 4L * (end + 1) else if (dt == BooleanType) (end + 7) / 8 + 8 else w * end)
+      validity = grow(validity, (end + 7) / 8 + 8)
+      val at = w * n
       dt match {
-        case ByteType => chunks += v.getBytes(0, rows)
-        case ShortType => chunks += v.getShorts(0, rows)
-        case IntegerType | DateType => chunks += v.getInts(0, rows)
-        case LongType | TimestampType | TimestampNTZType => chunks += v.getLongs(0, rows)
-        case FloatType => chunks += v.getFloats(0, rows)
-        case DoubleType => chunks += v.getDoubles(0, rows)
-        case BooleanType => chunks += v.getBooleans(0, rows)
+        case ByteType => MemorySegment.copy(v.getBytes(0, rows), 0, values, ValueLayout.JAVA_BYTE, at, rows)
+        case ShortType => MemorySegment.copy(v.getShorts(0, rows), 0, values, ValueLayout.JAVA_SHORT, at, rows)
+        case IntegerType | DateType => MemorySegment.copy(v.getInts(0, rows), 0, values, ValueLayout.JAVA_INT, at, rows)
+        case LongType | TimestampType | TimestampNTZType => MemorySegment.copy(v.getLongs(0, rows), 0, values, ValueLayout.JAVA_LONG, at, rows)
+        case FloatType => MemorySegment.copy(v.getFloats(0, rows), 0, values, ValueLayout.JAVA_FLOAT, at, rows)
+        case DoubleType => MemorySegment.copy(v.getDoubles(0, rows), 0, values, ValueLayout.JAVA_DOUBLE, at, rows)
+        case BooleanType =>
+          val x = v.getBooleans(0, rows)
+          var i = 0
+          while (i < rows) { if (x(i)) setBit(values, n + i); i += 1 }
         case StringType =>
-          val strs = new Array[Array[Byte]](rows)
           var i = 0
           while (i < rows) {
-            if (!v.isNullAt(i)) { val s = v.getUTF8String(i).getBytes; strs(i) = s; bytes += s.length }
+            values.setAtIndex(ValueLayout.JAVA_INT, n + i, bytes.toInt)
+            if (!v.isNullAt(i)) {
+              val x = v.getUTF8String(i).getBytes
+              if (bytes + x.length > Int.MaxValue) throw new IllegalStateException("MetalStage: one chunk's strings do not fit 32-bit offsets; lower spark.arrowmetal.stage.batchRows")
+              data = grow(data, bytes + x.length)
+              MemorySegment.copy(x, 0, data, ValueLayout.JAVA_BYTE, bytes, x.length)
+              bytes += x.length
+            }
             i += 1
           }
-          chunks += strs
       }
-      if (v.hasNull) { var i = 0; while (i < rows) { if (v.isNullAt(i)) nullRows += n + i; i += 1 } }
-      n += rows
+      var i = 0
+      if (v.hasNull) while (i < rows) { if (v.isNullAt(i)) nulls += 1 else setBit(validity, n + i); i += 1 }
+      else {
+        while (i < rows && ((n + i) & 7) != 0) { setBit(validity, n + i); i += 1 }
+        while (i + 8 <= rows) { validity.set(ValueLayout.JAVA_BYTE, (n + i) >>> 3, 0xFF.toByte); i += 8 }
+        while (i < rows) { setBit(validity, n + i); i += 1 }
+      }
+      n = end
     }
 
-    def importInto(arena: Arena): MemorySegment = {
-      var validity = MemorySegment.NULL
-      if (nullRows.nonEmpty) {
-        validity = arena.allocate(math.max(8L, ((n + 63) / 64) * 8), 64)
-        validity.fill(0xFF.toByte)
-        nullRows.foreach { r =>
-          val b = r >>> 3
-          validity.set(ValueLayout.JAVA_BYTE, b, (validity.get(ValueLayout.JAVA_BYTE, b) & ~(1 << (r & 7)).toInt).toByte)
-        }
-      }
-      val nulls = nullRows.size.toLong
-      dt match {
-        case StringType =>
-          if (bytes > Int.MaxValue) throw new IllegalStateException(
-            s"MetalStage: $bytes bytes of strings in one partition do not fit 32-bit offsets; use more partitions")
-          val offs = arena.allocate(4L * (n + 1), 64)
-          val data = arena.allocate(math.max(1L, bytes), 64)
-          var row = 0L
-          var at = 0L
-          chunks.foreach { c =>
-            c.asInstanceOf[Array[Array[Byte]]].foreach { s =>
-              offs.setAtIndex(ValueLayout.JAVA_INT, row, at.toInt)
-              if (s != null) { MemorySegment.copy(s, 0, data, ValueLayout.JAVA_BYTE, at, s.length); at += s.length }
-              row += 1
-            }
-          }
-          offs.setAtIndex(ValueLayout.JAVA_INT, row, at.toInt)
-          chunks.clear()
-          ArrowMetalNative.importColumn(arena, "u", offs, data, validity, n, nulls)
-        case BooleanType =>
-          val bits = arena.allocate(math.max(8L, ((n + 63) / 64) * 8), 64)
-          var row = 0L
-          chunks.foreach { c =>
-            c.asInstanceOf[Array[Boolean]].foreach { x =>
-              if (x) bits.set(ValueLayout.JAVA_BYTE, row >>> 3, (bits.get(ValueLayout.JAVA_BYTE, row >>> 3) | (1 << (row & 7)).toInt).toByte)
-              row += 1
-            }
-          }
-          chunks.clear()
-          ArrowMetalNative.importColumn(arena, "b", bits, validity, n, nulls)
-        case _ =>
-          val (w, fmt) = dt match {
-            case ByteType => (1, "c")
-            case ShortType => (2, "s")
-            case IntegerType | DateType => (4, "i")
-            case LongType | TimestampType | TimestampNTZType => (8, "l")
-            case FloatType => (4, "f")
-            case DoubleType => (8, "g")
-          }
-          val values = arena.allocate(math.max(8L, w * n), 64)
-          var at = 0L
-          chunks.foreach {
-            case a: Array[Byte] => MemorySegment.copy(a, 0, values, ValueLayout.JAVA_BYTE, at, a.length); at += a.length
-            case a: Array[Short] => MemorySegment.copy(a, 0, values, ValueLayout.JAVA_SHORT, at, a.length); at += 2L * a.length
-            case a: Array[Int] => MemorySegment.copy(a, 0, values, ValueLayout.JAVA_INT, at, a.length); at += 4L * a.length
-            case a: Array[Long] => MemorySegment.copy(a, 0, values, ValueLayout.JAVA_LONG, at, a.length); at += 8L * a.length
-            case a: Array[Float] => MemorySegment.copy(a, 0, values, ValueLayout.JAVA_FLOAT, at, a.length); at += 4L * a.length
-            case a: Array[Double] => MemorySegment.copy(a, 0, values, ValueLayout.JAVA_DOUBLE, at, a.length); at += 8L * a.length
-          }
-          chunks.clear()
-          ArrowMetalNative.importColumn(arena, fmt, values, validity, n, nulls)
-      }
+    def importInto(): MemorySegment = {
+      if (dt == StringType) values.setAtIndex(ValueLayout.JAVA_INT, n, bytes.toInt)
+      ArrowMetalNative.importColumn(arena, fmt, values, data, validity, n, nulls)
     }
   }
 
@@ -300,75 +285,80 @@ object MetalStage {
     case (_, x) => row.update(j, x)
   }
 
+  /** Runs the plan over the partition in chunks of about `batchRows` rows. A chunk of a partial aggregate
+   *  emits its own partial groups; Spark's final aggregate merges them as it merges partitions'. */
   def run(batches: Iterator[ColumnarBatch], json: String, inputs: Seq[(Int, String, DataType)],
           outTypes: Seq[DataType], emptyRow: Option[Seq[Any]], nullAs: Seq[Option[Any]],
-          passthrough: Map[Int, Int], m: Map[String, SQLMetric]): Iterator[InternalRow] = {
-    val t0 = System.nanoTime()
-    val real = inputs.filter(_._1 >= 0)
-    val gathers = real.map { case (_, _, dt) => new Gather(dt) }
-    val ptCols = passthrough.values.toSeq.distinct
-    val strings = ptCols.map(c => c -> new ArrayBuffer[UTF8String]).toMap
-    var n = 0L
-    while (batches.hasNext) {
-      val b = batches.next()
-      var k = 0
-      while (k < real.size) { gathers(k).add(b, real(k)._1); k += 1 }
-      ptCols.foreach { c =>
-        val v = b.column(c); val buf = strings(c); var i = 0
-        while (i < b.numRows()) { buf += (if (v.isNullAt(i)) null else v.getUTF8String(i).clone()); i += 1 }
-      }
-      n += b.numRows()
-    }
-    if (n > Int.MaxValue) throw new IllegalStateException(s"MetalStage: $n rows in one partition; use more partitions")
+          passthrough: Map[Int, Int], batchRows: Long, m: Map[String, SQLMetric]): Iterator[InternalRow] = {
     val proj = UnsafeProjection.create(outTypes.toArray)
     val row = new SpecificInternalRow(outTypes)
-    if (n == 0) {
-      return emptyRow match {
-        case Some(vals) =>
-          vals.zipWithIndex.foreach { case (v, j) => setValue(row, j, outTypes(j), v) }
-          m("outputRows") += 1
-          Iterator.single(proj(row).copy())
-        case None => Iterator.empty
+    val real = inputs.filter(_._1 >= 0)
+    val ptCols = passthrough.values.toSeq.distinct
+    var total = 0L
+
+    def chunk(): Iterator[InternalRow] = {
+      val t0 = System.nanoTime()
+      val arena = Arena.ofConfined()
+      var cols: Array[ArrowMetalNative.Column] = null
+      val strings = ptCols.map(c => c -> new ArrayBuffer[UTF8String]).toMap
+      try {
+        val gathers = real.map { case (_, _, dt) => new Gather(dt, arena) }
+        var n = 0L
+        while (batches.hasNext && n < batchRows && gathers.forall(_.bytes < (512L << 20)) && gathers.map(_.held).sum < (1L << 30)) {
+          val b = batches.next()
+          var k = 0
+          while (k < real.size) { gathers(k).add(b, real(k)._1); k += 1 }
+          ptCols.foreach { c =>
+            val v = b.column(c); val buf = strings(c); var i = 0
+            while (i < b.numRows()) { buf += (if (v.isNullAt(i)) null else v.getUTF8String(i).clone()); i += 1 }
+          }
+          n += b.numRows()
+        }
+        total += n
+        if (n == 0) return Iterator.empty
+        val handles = inputs.map { case (i, _, _) =>
+          if (i >= 0) gathers(real.indexWhere(_._1 == i)).importInto()
+          else {
+            val ids = arena.allocate(8L * n, 64)
+            var r = 0L
+            while (r < n) { ids.setAtIndex(ValueLayout.JAVA_LONG, r, r); r += 1 }
+            ArrowMetalNative.importColumn(arena, "l", ids, MemorySegment.NULL, n, 0L)
+          }
+        }
+        val t1 = System.nanoTime()
+        try cols = ArrowMetalNative.runPlan(json, handles.toArray, inputs.map(_._2).toArray)
+        finally handles.foreach(ArrowMetalNative.release)
+        m("copyTime") += t1 - t0
+        m("gpuTime") += System.nanoTime() - t1
+        m("inputRows") += n
+      } finally arena.close()
+      if (cols.length != outTypes.size)
+        throw new IllegalStateException(s"MetalStage: the plan returned ${cols.length} columns, Spark expects ${outTypes.size}")
+      val rows = if (cols.isEmpty) 0 else cols(0).length
+      m("outputRows") += rows
+      Iterator.range(0, rows).map { g =>
+        var j = 0
+        while (j < outTypes.size) {
+          passthrough.get(j) match {
+            case Some(c) =>
+              val v = strings(c)(cols(j).longs(g).toInt)
+              if (v == null) row.setNullAt(j) else row.update(j, v)
+            case None => set(row, j, outTypes(j), cols(j), g, nullAs(j))
+          }
+          j += 1
+        }
+        proj(row)
       }
     }
-    val arena = Arena.ofConfined()
-    var cols: Array[ArrowMetalNative.Column] = null
-    val t1 = System.nanoTime()
-    var t2 = 0L
-    try {
-      val handles = inputs.map { case (i, _, _) =>
-        if (i >= 0) gathers(real.indexWhere(_._1 == i)).importInto(arena)
-        else {
-          val ids = arena.allocate(8L * n, 64)
-          var r = 0L
-          while (r < n) { ids.setAtIndex(ValueLayout.JAVA_LONG, r, r); r += 1 }
-          ArrowMetalNative.importColumn(arena, "l", ids, MemorySegment.NULL, n, 0L)
-        }
-      }
-      t2 = System.nanoTime()
-      try cols = ArrowMetalNative.runPlan(json, handles.toArray, inputs.map(_._2).toArray)
-      finally handles.foreach(ArrowMetalNative.release)
-    } finally arena.close()
-    val t3 = System.nanoTime()
-    m("copyTime") += t2 - t0
-    m("gpuTime") += t3 - t2
-    m("inputRows") += n
-    if (cols.length != outTypes.size)
-      throw new IllegalStateException(s"MetalStage: the plan returned ${cols.length} columns, Spark expects ${outTypes.size}")
-    val rows = if (cols.isEmpty) 0 else cols(0).length
-    m("outputRows") += rows
-    Iterator.range(0, rows).map { g =>
-      var j = 0
-      while (j < outTypes.size) {
-        passthrough.get(j) match {
-          case Some(c) =>
-            val v = strings(c)(cols(j).longs(g).toInt)
-            if (v == null) row.setNullAt(j) else row.update(j, v)
-          case None => set(row, j, outTypes(j), cols(j), g, nullAs(j))
-        }
-        j += 1
-      }
-      proj(row)
+
+    val body = Iterator.continually(()).takeWhile(_ => batches.hasNext).flatMap(_ => chunk())
+    def initial: Iterator[InternalRow] = emptyRow match {
+      case Some(vals) if total == 0 =>
+        vals.zipWithIndex.foreach { case (v, j) => setValue(row, j, outTypes(j), v) }
+        m("outputRows") += 1
+        Iterator.single(proj(row))
+      case _ => Iterator.empty
     }
+    body ++ initial
   }
 }
