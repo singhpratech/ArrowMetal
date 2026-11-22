@@ -51,14 +51,18 @@ infinities, int32 extremes and non-ASCII strings) found no wrong answer; its fir
 errors, all from two limits of the plan engine on strings: a `select` does not materialise a utf8 output
 and `is_in` takes no utf8 column. String outputs that are scan columns now ride on the JVM and are joined
 back by row number, string `IN` lists are written as `OR`s of `str_eq`, and a string key among several
-stays on Spark. After that, 800 of 800 queries over two seeds were identical, 646 with a GPU stage
+stays on Spark. After that, 800 of 800 queries over two seeds were the same (both-raise counted as the
+same, -0.0 equal to 0.0), 646 with a GPU stage
 (`Benchmarks/results/spark_fuzz_2026-11-22.txt`).
 
 **The whole stage.** At 50,000,000 lineitem-shaped Parquet rows, a TPC-H Q1-shaped pricing summary (filter,
 four sums of expressions, three averages, a count, by an int key) measures 1.96x at 16 partitions and a
 100,000-group revenue query 1.89x at 6 (`Benchmarks/results/spark_stage_2026-11-22.txt`); the `GROUP BY`
 runs through the same plan engine measure 0.99x to 3.38x (`spark_groupby_2026-11-22.txt`). The stage holds
-a partition in memory: Spark's default 1 GB driver heap ran out on a 50,000,000-row file in 16 partitions.
+a partition in memory: with Spark's default 1 GB driver heap a 50,000,000-row file ran out of heap with the
+plugin (the same query without it was not run at that heap). The rows at 6 partitions hold Spark to six
+tasks on 16 cores; best against best, the 1,000,000-group query is 2.21 s against 0.95 s, 2.3x. Sort runs
+outside the recorded files measured as low as 0.75x.
 
 ## Round 25 (2026-11-08): sorts and group-bys on M1 GPUs
 

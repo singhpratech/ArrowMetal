@@ -80,8 +80,10 @@ The translation keeps Spark's semantics where Arrow's differ:
 the int32 extremes and non-ASCII strings, generates random queries over it (filters nested up to two
 levels, projections, grouped and ungrouped aggregates), runs each with and without the plugin, half under
 ANSI and half not, and compares the rows as multisets (double sums and averages to 1e-9 relative, the
-summation order being different; everything else exactly). Two runs: 300 queries (seed 1) and 500
-queries (seed 2), **800 of 800 identical to Spark**, 646 of them with a `MetalStage` in the executed plan.
+summation order being different; everything else by value). Two runs: 300 queries (seed 1) and 500
+queries (seed 2), 800 of 800 the same, 646 of them with a
+`MetalStage` in the executed plan. A query that raises on both sides counts as the same, -0.0 and 0.0 compare
+equal, most sums over the double column are NaN, and the table has no byte, short or timestamp column.
 
 `spark/check.py check` compares 25 sorted key columns, in order, with Spark's sort (five key types, both
 directions, both null placements, global `ORDER BY`): 25 of 25 identical. `spark/check.py agg-check` compares
@@ -89,7 +91,11 @@ three `GROUP BY` queries over 20,000,000 Parquet rows group by group: 3 of 3 ide
 
 ## Timings
 
-Best of two runs each, alternating with and without the plugin. Local mode, 16 cores.
+Best of two runs each, Spark first, with no warm-up, in one process per table: Spark's first run is the one
+on a cold JVM. At 6 and 4 partitions Spark runs at most that many tasks at once, on a 16-core machine, so
+those rows are not Spark at its fastest: for the 1,000,000-group query its best recorded time is 2.21 s (16
+partitions) and the plugin's 0.95 s (6 partitions), 2.3x. Development runs of the sort recorded outside these
+files measured as low as 0.75x (`sortWithinPartitions` long, 16 partitions) and 0.86x (`ORDER BY` double, 4).
 
 **Filter, expressions and aggregate in one stage**, a 698 MB Parquet file of 50,000,000 lineitem-shaped
 rows, both answers compared:

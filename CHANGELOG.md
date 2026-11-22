@@ -12,9 +12,9 @@
   org.arrowmetal.spark.ArrowMetalExtensions`) that runs the filters, projections and partial aggregate
   directly above a Parquet or ORC scan as one GPU stage, translated from Spark's expressions with Spark's
   semantics, and one-key sorts; it calls the C ABI from Java through the foreign function API. On Spark
-  4.3.0, 800 of 800 random queries are identical with and without it (646 of them run a GPU stage); at
-  50,000,000 rows a TPC-H Q1-shaped query measures 1.96x and a 1,000,000-group `GROUP BY` 3.38x against
-  Spark's own operators, no measured query slower than 0.99x ([docs/SPARK.md](docs/SPARK.md)).
+  4.3.0, 800 random queries gave the same result with and without it (646 of them run a GPU stage; a query
+  that raises on both sides counts as the same, and -0.0 and 0.0 compare equal); the timings and how they
+  were taken are in docs/SPARK.md ([docs/SPARK.md](docs/SPARK.md)).
 
 ## 0.6.1 — 2026-11-08
 
