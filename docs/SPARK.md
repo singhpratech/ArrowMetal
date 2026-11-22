@@ -1,9 +1,9 @@
 # Apache Spark
 
 `spark/` is a Spark SQL extension that runs Spark's work on the Apple silicon GPU through ArrowMetal.
-Queries do not change. Two kinds of operator are replaced:
+Queries do not change. Two kinds of operator are replaced, the second only when switched on:
 
-- **The stage above a Parquet or ORC scan** (`MetalStage`): any chain of filters (`WHERE`) and projections
+- **The stage above a Parquet scan** (`MetalStage`): any chain of filters (`WHERE`) and projections
   (`SELECT` expressions) directly over a columnar scan, optionally topped by the partial (map-side) half of
   a `GROUP BY` or of an ungrouped aggregate, runs as one ArrowMetal plan per partition.
 - **A sort on one key** (`MetalSortExec`), for `ORDER BY` and `sortWithinPartitions`.
@@ -116,6 +116,6 @@ M4 Max, 16 cores, local mode, everything on. Each side at the better of the part
 | `ORDER BY` double, off by default | 2.64 s | 2.98 s | 0.9x |
 
 Runs of the same query on the same day moved: the Q1 shape measured 1.4x in an earlier build's run
-(`spark_stage_2026-11-22_warm.txt`) and 1.0x in this one, and at 16 partitions the 1,001-group rows are 1.10x
-and 0.97x. The earlier recordings (`spark_*_2026-11-22.txt`, best of two, Spark first on a cold JVM; `_warm`;
+(`spark_stage_2026-11-22_warm.txt`) and 1.0x in this one, at 16 partitions the 1,001-group rows are 1.10x
+and 0.97x, and the long `sortWithinPartitions` measured 0.8x in the `_warm` run. The earlier recordings (`spark_*_2026-11-22.txt`, best of two, Spark first on a cold JVM; `_warm`;
 `_final`) are kept beside these.

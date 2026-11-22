@@ -1,7 +1,8 @@
 # ArrowMetal for Apache Spark
 
 A Spark SQL extension that runs Spark's work on the Apple silicon GPU through ArrowMetal: the filters,
-projections and partial aggregate directly above a Parquet or ORC scan as one GPU stage, and one-key sorts.
+projections and partial aggregate directly above a Parquet scan as one GPU stage. Sorts, aggregates
+without `GROUP BY` and plain filter/projection stages are opt-in.
 Everything it does not take stays on Spark's own operators.
 
 ```bash

@@ -9,7 +9,7 @@
   table the Mac calibrated for itself: sum 9.91x, filter 7.36x, sort 4.60x and group-by sum 3.92x. The table is
   kept beside the block; on all 48 pairs it measured it chooses the same path as the shipped one.
 - **Apache Spark on the GPU.** `spark/` is a Spark SQL extension that runs the filters, projections and
-  partial `GROUP BY` directly above a Parquet or ORC scan as one GPU stage, translated with Spark's semantics,
+  partial `GROUP BY` directly above a Parquet scan as one GPU stage, translated with Spark's semantics,
   calling the C ABI from Java through the foreign function API; sorts, ungrouped aggregates and plain
   filter/projection stages are opt-in. On Spark 4.3.0, 1,300 random queries: 1,277 with identical rows, 23
   raising on both sides, 0 different. At 50,000,000 rows, each side at its better partition count, a
