@@ -85,10 +85,10 @@ The translation keeps Spark's semantics where Arrow's differ:
 int32 extremes, non-ASCII strings and byte, short, date and timestamp columns, generates random queries over
 it, runs each with and without the plugin, half under ANSI, and compares the rows as multisets: double sums
 and averages to 1e-9 relative (the summation order differs), everything else exactly, -0.0 apart from 0.0.
-Three runs, 1,300 queries on the build of `spark_fuzz_2026-11-22_final.txt`: 1,277 with identical rows, 23
-where both raise, 0 different, 1,081 with a `MetalStage` in the executed plan. The fuzz of an earlier build
-found 76 of 300 queries failing, all on byte or short columns read back from the GPU. The chunk-size
-change after it ran 100 more (`spark_fuzz_2026-11-22_smoke16m.txt`).
+Three runs, 1,300 queries on the code of commit 70f20d8 with every opt-in part on
+(`Benchmarks/results/spark_fuzz_2026-11-22_published.txt`): 1,277 with identical rows, 23 where both raise,
+0 different, 1,081 with a `MetalStage` in the executed plan. The fuzz of an earlier build
+found 76 of 300 queries failing, all on byte or short columns read back from the GPU.
 
 `spark/check.py check` compares 25 sorted key columns, in order, with Spark's sort (five key types, both
 directions, both null placements, global `ORDER BY`): 25 of 25 identical. `spark/check.py agg-check` compares
