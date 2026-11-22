@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Discord](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fdiscord.com%2Fapi%2Fv10%2Finvites%2FMEH7QQABUR%3Fwith_counts%3Dtrue&query=%24.approximate_presence_count&suffix=%20online&label=Discord&logo=discord&logoColor=white&color=5865F2)](https://discord.gg/MEH7QQABUR)
 
-**Apache Arrow compute on the Apple silicon GPU, inside DataFusion, Polars and DuckDB.**
+**Apache Arrow compute on the Apple silicon GPU, inside DataFusion, Polars, DuckDB and Apache Spark.**
 
 Listed on Apache Arrow's [Powered By](https://arrow.apache.org/powered_by/) page and on Apache DataFusion's [integrations list](https://datafusion.apache.org/user-guide/introduction.html#integrations).
 
@@ -34,7 +34,7 @@ of its in-memory and streaming engines (Polars 2.0.0 is under [Polars in full](#
 engine's second row is its lowest speed-up (best of the runs) among the cases its default takes. On the first run after 500 ms of idle, against the engine's own first run,
 DataFusion's group-bys are 1.24x to 2.17x and four of DuckDB's thirteen rewritten pairs are behind, down to 0.38x.
 
-<a href="https://datafusion.apache.org"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/datafusion-dark.svg"><img src="docs/img/engines/datafusion.svg" height="22" alt="Apache DataFusion" align="top"></picture></a> **DataFusion.** A physical optimizer rule for DataFusion 55.1; the SQL is unchanged. A Rust crate used by
+**DataFusion.** A physical optimizer rule for DataFusion 55.1; the SQL is unchanged. A Rust crate used by
 [crates.io](https://crates.io/crates/datafusion-arrowmetal); it loads `libArrowMetalC.dylib` ([install](docs/DATAFUSION.md#install)):
 ```toml
 datafusion-arrowmetal = "0.6.1"   # beside datafusion = "=55.1.0"
@@ -43,7 +43,7 @@ Full sorts **6.9x to 28.8x** faster than DataFusion alone (250,000 to 50,000,000
 series **2.31x to 4.27x**; 13,632 query pairs, 0 mismatches. Left to DataFusion: top-k 0.14x to 0.41x,
 filters 0.31x to 0.79x. `rule.report()` gives each node, TAKEN or LEFT, and why. [DataFusion in full](#datafusion-in-full)
 
-<a href="https://pola.rs"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/polars-dark.svg"><img src="docs/img/engines/polars.svg" height="22" alt="Polars" align="top"></picture></a> **Polars.** `MetalEngine` runs the subtrees measured ahead (full sorts, inner, left and anti joins,
+**Polars.** `MetalEngine` runs the subtrees measured ahead (full sorts, inner, left and anti joins,
 `unique`, group-bys judged by their estimated number of groups); Polars runs the rest. On Polars 1.44.1,
 **1.52x to 11.54x** on all 75 of 220 case-size pairs the default took, and 15,376 generated cases, 0
 different; on Polars 2.0.0, **1.35x to 7.94x** on all 52 of 107 cases it took at 50,000,000 rows, and on
@@ -61,10 +61,16 @@ engine = am.MetalEngine()                             # the measured defaults
 df = lf.sort("amount", descending=True).collect(engine=engine)  # the frame lf.collect() returns
 print(engine.last_report)                             # Metal or Polars, per node, and why
 ```
-<a href="https://duckdb.org"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/engines/duckdb-dark.svg"><img src="docs/img/engines/duckdb.svg" height="22" alt="DuckDB" align="top"></picture></a> **DuckDB.** An optimizer extension; the SQL is unchanged. Built from a checkout with
+**DuckDB.** An optimizer extension; the SQL is unchanged. Built from a checkout with
 `./duckdb-extension/build_rewrite.sh` (DuckDB 1.5.6), then `LOAD`ed, or opened by `am.duckdb_connect()`.
 Rewritten aggregates **1.08x to 5.32x** faster than DuckDB's own operators; 33,376 generated queries, 0
 different. Left to DuckDB: a single `sum` 0.32x, `VARCHAR` keys 0.22x. [DuckDB in full](#duckdb-in-full)
+
+**Apache Spark.** A Spark SQL extension; the SQL is unchanged. On `main`, not in 0.6.1: built from a checkout
+with `spark/build.sh` (Spark 4.3.0, JDK 22 or newer), then set as `spark.sql.extensions`. `GROUP BY` over a
+Parquet scan **2.3x to 2.6x** faster than Spark's own operators on 1,000,000 groups and **1.6x** on 100,000; 0.97x
+to 1.1x on few. 1,300 generated queries, 1,277 with identical rows, 23 raising on both sides, 0 different. Off
+by default: aggregates without `GROUP BY` 0.6x, sorts 0.8x to 1.3x. [Apache Spark in full](#apache-spark-in-full)
 
 339 benchmark rows, 77 where the CPU is ahead, each with its cause ([matrix](docs/BENCHMARKS_MATRIX.md),
 [to improve](docs/TO_IMPROVE.md)); 307 of Arrow v25's 307 compute function names, 284 on the GPU, and 1 of the 5 added in v26 ([list](docs/ARROW_FUNCTIONS.md)).
@@ -75,13 +81,13 @@ ArrowMetal runs Apache Arrow compute on the Apple silicon GPU: Arrow arrays that
 memory, GPU kernels that keep Arrow's semantics (validity bitmaps, packed booleans, the C Data and C
 Device Data Interfaces), and one C ABI reachable from Swift, Python, Rust, Go, TypeScript, R and C.
 
-Contents: [The engines in full](#the-engines-in-full) ([DataFusion](#datafusion-in-full) · [Polars](#polars-in-full) · [DuckDB](#duckdb-in-full) · [Apache Spark](#apache-spark)) · [The one-row picture](#the-one-row-picture) · [Measure it on your Mac](#measure-it-on-your-mac) · [Release](#release) · [The pitch](#the-pitch-in-one-paragraph) · [What was measured](#what-was-measured) · [Why this exists](#why-this-exists) · [Benchmarks](#benchmarks) · [From Python](#from-python) · [Bindings](#bindings) · [Quick start (Swift)](#quick-start-swift) · [Reading Arrow files](#reading-arrow-files) · [What is implemented](#what-is-implemented) · [Design notes](#design-notes) · [Citing](#citing) · [License](#license)
+Contents: [The engines in full](#the-engines-in-full) ([DataFusion](#datafusion-in-full) · [Polars](#polars-in-full) · [DuckDB](#duckdb-in-full) · [Apache Spark](#apache-spark-in-full)) · [The one-row picture](#the-one-row-picture) · [Measure it on your Mac](#measure-it-on-your-mac) · [Release](#release) · [The pitch](#the-pitch-in-one-paragraph) · [What was measured](#what-was-measured) · [Why this exists](#why-this-exists) · [Benchmarks](#benchmarks) · [From Python](#from-python) · [Bindings](#bindings) · [Quick start (Swift)](#quick-start-swift) · [Reading Arrow files](#reading-arrow-files) · [What is implemented](#what-is-implemented) · [Design notes](#design-notes) · [Citing](#citing) · [License](#license)
 
 ### The engines in full
 
-ArrowMetal runs inside three query engines. Each one plans the query as it always does; ArrowMetal
-takes the parts of the plan measured faster on the Apple GPU, hands back what the engine would have
-returned, and leaves every other node to the engine. Every figure below is from a run recorded in this
+ArrowMetal runs inside four query engines. Each one plans the query as it always does; ArrowMetal takes,
+in DataFusion, Polars and DuckDB, the parts of the plan measured faster on the Apple GPU and, in Spark, the
+grouped aggregates it can translate, hands back what the engine would have returned, and leaves every other node to the engine. Every figure below is from a run recorded in this
 repository, named beside it, on an Apple M4 Max (16 CPU cores, 64 GB); each speed-up is the engine's
 own time divided by the time with ArrowMetal, with the CPU time of the call next to its wall time.
 #### DataFusion in full
@@ -268,7 +274,7 @@ default, each with a query behind at 50,000,000 rows in the same file: a single 
 0.32x), few groups with at most two aggregates (1,000 `INTEGER` keys, `sum`, 0.59x) and `VARCHAR`
 keys (1,000 long `VARCHAR` keys, `sum`, `count`, 0.22x).
 
-#### Apache Spark
+#### Apache Spark in full
 
 A Spark SQL extension runs a partial `GROUP BY` above a Parquet scan, with the filters and projections under it, as one GPU stage. The SQL is unchanged; what it does not translate stays on Spark.
 
