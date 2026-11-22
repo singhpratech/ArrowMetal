@@ -38,3 +38,6 @@ r/*.tar.gz
 r/arrowmetal/src/lib_path*.h
 # DataFusion crate build artefacts
 datafusion/target/
+
+# Spark plugin build output
+spark/build/

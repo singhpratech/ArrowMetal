@@ -2,6 +2,45 @@
 
 Things learned the hard way. Add to this whenever something surprises you.
 
+## Round 26 (2026-11-22): Apache Spark on the GPU
+
+**What.** A Spark SQL extension (`spark/`) that replaces Spark's `SortExec` on one key, and the partial
+`HashAggregateExec` over a columnar scan, with operators that call ArrowMetal. Spark 4.3.0, local mode,
+M4 Max, OpenJDK 27.0.1.1, ArrowMetal 0.6.1. Runs: `Benchmarks/results/spark_sort_2026-11-22.txt` and
+`Benchmarks/results/spark_groupby_2026-11-22.txt`.
+
+**Java reaches the C ABI with no glue.** Java's foreign function API (final since JDK 22) calls
+`am_import`, `am_argsort_ex2`, `am_group_by_keys`, `am_group_agg_ex` and `am_export` directly; the C Data
+Interface structs are laid out in off-heap memory by hand (72 and 80 bytes) and their release callbacks are
+upcall stubs. Spark 4.3.0 runs on JDK 27 with `--enable-native-access=ALL-UNNAMED`. A null argument to a
+downcall has to be a typed `MemorySegment` variable: a conditional expression passed to `invokeExact`
+compiles to an `Object` parameter and fails at run time with `WrongMethodTypeException`.
+
+**Spark's float order is ArrowMetal's NaN-largest order.** NaN above +infinity in both directions, -0.0
+tying 0.0: float order 2 of `am_argsort_ex2`. With it, 25 of 25 sorted key columns are identical to Spark's
+own sort, nulls first and last, ascending and descending, global `ORDER BY` included.
+
+**A columnar consumer has to be placed after Spark's transitions.** Spark inserts `ColumnarToRowExec`
+between a columnar scan and every operator that does not declare columnar input, so an operator substituted
+in `preColumnarTransitions` and calling `executeColumnar()` on its child gets the converter and fails
+("column support mismatch"). Substituting in `postColumnarTransitions`, on the pattern
+`HashAggregateExec(ColumnarToRowExec(scan))`, takes the scan's batches directly.
+
+**Row conversion decides the sort; columns decide the aggregate.** The sort takes rows, so every key is
+read row by row into an Arrow column and the rows are emitted in the GPU's order: at 50,000,000 cached rows
+it measures 1.03x to 1.60x against Spark's sort. The partial `GROUP BY` copies the Parquet reader's column
+batches with one bulk copy per column and batch: 1.32x to 1.48x at 16 partitions and 1.33x to 4.03x at 6, the
+largest on 1,000,000 groups, where Spark's time on the same file grows from 0.64 s (1,001 groups) to 3.02 s
+and the plugin's from 0.47 s to 0.87 s.
+
+**Partition count is set by the core count, not only `maxPartitionBytes`.** Spark sizes file splits as
+`min(maxPartitionBytes, max(openCostInBytes, totalBytes / parallelism))`, so with 16 cores a larger
+`maxPartitionBytes` alone still reads 16 partitions; `spark.sql.files.minPartitionNum` sets the divisor.
+
+**Exactness rules kept.** `SUM` of longs stays on Spark: in ANSI mode, Spark 4's default, Spark raises on
+overflow and the GPU sum wraps. Double sums agree to 1e-9 relative, the summation order being different.
+`COUNT` of a group with only nulls is 0, as Spark's partial buffer holds it.
+
 ## Round 25 (2026-11-08): sorts and group-bys on M1 GPUs
 
 **What.** On an M1 Max (MacBookPro18,2, macOS 27.2 26B123, Xcode 27.2), every ArrowMetal sort of 64-bit

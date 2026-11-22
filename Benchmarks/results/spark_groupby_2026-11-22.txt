@@ -1,0 +1,18 @@
+ArrowMetal Spark plugin agg-check: Apple M4 Max, 16 CPU cores, macOS 27.2.1; Spark 4.3.0 local[*], Java 27.0.1.1, ArrowMetal 0.6.1; 2026-11-22T07:02:27Z
+20,000,000 rows of Parquet; each GROUP BY compared group by group with Spark's own aggregation (double sums to 1e-9 relative: the summation order differs)
+  GROUP BY k_int       1,001 groups: identical
+  GROUP BY k_long  1,000,000 groups: identical
+  GROUP BY k_date      3,650 groups: identical
+MetalPartialAggregate in the plan: True; 3 of 3 identical to Spark
+ArrowMetal Spark plugin agg-bench: Apple M4 Max, 16 CPU cores, macOS 27.2.1; Spark 4.3.0 local[*], Java 27.0.1.1, ArrowMetal 0.6.1; 2026-11-22T07:02:41Z
+50,000,000 rows of Parquet (1267 MB) read in 16 partitions; best of 2 runs each, alternating, written to Spark's noop sink
+  SUM, COUNT, MIN, MAX by k_int      Spark 0.76 s, with ArrowMetal 0.55 s, 1.38x
+  SUM(v_double) by k_int             Spark 0.61 s, with ArrowMetal 0.46 s, 1.32x
+  SUM, COUNT, MIN, MAX by k_long     Spark 2.22 s, with ArrowMetal 1.51 s, 1.48x
+  SUM(v_double) by k_long            Spark 1.33 s, with ArrowMetal 0.90 s, 1.47x
+ArrowMetal Spark plugin agg-bench: Apple M4 Max, 16 CPU cores, macOS 27.2.1; Spark 4.3.0 local[*], Java 27.0.1.1, ArrowMetal 0.6.1; 2026-11-22T07:03:03Z
+50,000,000 rows of Parquet (1267 MB) read in 6 partitions; best of 2 runs each, alternating, written to Spark's noop sink
+  SUM, COUNT, MIN, MAX by k_int      Spark 0.64 s, with ArrowMetal 0.47 s, 1.34x
+  SUM(v_double) by k_int             Spark 0.35 s, with ArrowMetal 0.27 s, 1.33x
+  SUM, COUNT, MIN, MAX by k_long     Spark 3.02 s, with ArrowMetal 0.87 s, 3.47x
+  SUM(v_double) by k_long            Spark 1.96 s, with ArrowMetal 0.49 s, 4.03x
