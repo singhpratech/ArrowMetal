@@ -58,7 +58,7 @@ emits the rows in the order `am_argsort_ex2` returns. A partition is held in mem
 
 | | Taken | Left to Spark |
 |---|---|---|
-| Column types | byte, short, int, long, float, double, boolean, string, date, timestamp, timestamp_ntz (the fuzz table has no byte, short or timestamp column) | decimal, binary, nested types |
+| Column types | int, long, float, double, boolean, string, date; timestamp and timestamp_ntz are taken and no test covers them | decimal, binary, nested types. Byte and short columns are taken and a query that reads one back from the GPU fails with `ArrowMetal returned a column of format c` (or `s`): set `spark.arrowmetal.stage.enabled=false` for those |
 | Predicates | `=`, `<>`, `<`, `<=`, `>`, `>=` on numbers, dates, timestamps and booleans; `=` of a string with a literal; `AND`, `OR`, `NOT`; `IS [NOT] NULL`; `IN` lists of literals; `LIKE 'abc'`, `'abc%'`, `'%abc%'`; `startswith`, `contains` | string ordering, `LIKE '%abc'` and patterns with `_` |
 | Expressions | `+ - *` and unary minus on floats, and on integers when `spark.sql.ansi.enabled` is false; `/` by a non-zero literal; `abs`; widening casts; `coalesce`; `IF`; `CASE WHEN` | integer arithmetic under ANSI (Spark raises on overflow, the GPU wraps), division by a column, narrowing casts, string-valued expressions, everything else |
 | Aggregates (partial) | `SUM` of integers and floats (of longs only without ANSI), `COUNT(*)`, `COUNT(col)`, `MIN` and `MAX` of integers and dates, `AVG` of integers and floats; with any number of non-string keys, or one string key, or none | `MIN`/`MAX` of floats, `DISTINCT`, `FILTER`, several keys with a string among them, other aggregates |
