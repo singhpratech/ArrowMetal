@@ -34,7 +34,7 @@ of its in-memory and streaming engines (Polars 2.0.0 is under [Polars in full](#
 engine's second row is its lowest speed-up (best of the runs) among the cases its default takes. On the first run after 500 ms of idle, against the engine's own first run,
 DataFusion's group-bys are 1.24x to 2.17x and four of DuckDB's thirteen rewritten pairs are behind, down to 0.38x.
 
-**DataFusion.** A physical optimizer rule for DataFusion 55.1; the SQL is unchanged. A Rust crate used by
+[![DataFusion](https://img.shields.io/badge/DataFusion-0B7285)](https://datafusion.apache.org) A physical optimizer rule for DataFusion 55.1; the SQL is unchanged. A Rust crate used by
 [crates.io](https://crates.io/crates/datafusion-arrowmetal); it loads `libArrowMetalC.dylib` ([install](docs/DATAFUSION.md#install)):
 ```toml
 datafusion-arrowmetal = "0.6.1"   # beside datafusion = "=55.1.0"
@@ -43,7 +43,7 @@ Full sorts **6.9x to 28.8x** faster than DataFusion alone (250,000 to 50,000,000
 series **2.31x to 4.27x**; 13,632 query pairs, 0 mismatches. Left to DataFusion: top-k 0.14x to 0.41x,
 filters 0.31x to 0.79x. `rule.report()` gives each node, TAKEN or LEFT, and why. [DataFusion in full](#datafusion-in-full)
 
-**Polars.** `MetalEngine` runs the subtrees measured ahead (full sorts, inner, left and anti joins,
+[![Polars](https://img.shields.io/badge/Polars-0B7285)](https://pola.rs) `MetalEngine` runs the subtrees measured ahead (full sorts, inner, left and anti joins,
 `unique`, group-bys judged by their estimated number of groups); Polars runs the rest. On Polars 1.44.1,
 **1.52x to 11.54x** on all 75 of 220 case-size pairs the default took, and 15,376 generated cases, 0
 different; on Polars 2.0.0, **1.35x to 7.94x** on all 52 of 107 cases it took at 50,000,000 rows, and on
@@ -61,12 +61,12 @@ engine = am.MetalEngine()                             # the measured defaults
 df = lf.sort("amount", descending=True).collect(engine=engine)  # the frame lf.collect() returns
 print(engine.last_report)                             # Metal or Polars, per node, and why
 ```
-**DuckDB.** An optimizer extension; the SQL is unchanged. Built from a checkout with
+[![DuckDB](https://img.shields.io/badge/DuckDB-0B7285)](https://duckdb.org) An optimizer extension; the SQL is unchanged. Built from a checkout with
 `./duckdb-extension/build_rewrite.sh` (DuckDB 1.5.6), then `LOAD`ed, or opened by `am.duckdb_connect()`.
 Rewritten aggregates **1.08x to 5.32x** faster than DuckDB's own operators; 33,376 generated queries, 0
 different. Left to DuckDB: a single `sum` 0.32x, `VARCHAR` keys 0.22x. [DuckDB in full](#duckdb-in-full)
 
-**Apache Spark.** A Spark SQL extension; the SQL is unchanged. On `main`, not in 0.6.1: built from a checkout
+[![Apache Spark](https://img.shields.io/badge/Apache_Spark-0B7285)](https://spark.apache.org) A Spark SQL extension; the SQL is unchanged. On `main`, not in 0.6.1: built from a checkout
 with `spark/build.sh` (Spark 4.3.0, JDK 22 or newer), then set as `spark.sql.extensions`. `GROUP BY` over a
 Parquet scan **2.3x to 2.6x** faster than Spark's own operators on 1,000,000 groups and **1.6x** on 100,000; 0.97x
 to 1.1x on few. 1,300 generated queries, 1,277 with identical rows, 23 raising on both sides, 0 different. Off
@@ -751,6 +751,6 @@ ArrowMetal: Apache Arrow compute on Apple silicon GPUs via Metal.
 
 ### License
 
-Apache License 2.0. Apache Arrow and Apache DataFusion are trademarks of the Apache Software Foundation;
-Polars and DuckDB and their logos are trademarks of their respective owners. This project is independent
+Apache License 2.0. Apache Arrow, Apache DataFusion and Apache Spark are trademarks of the Apache Software Foundation;
+Polars and DuckDB are trademarks of their respective owners. This project is independent
 and not affiliated with or endorsed by the ASF, Polars, DuckDB or Apple.
