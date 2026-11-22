@@ -13,7 +13,8 @@
   calling the C ABI from Java through the foreign function API; sorts, ungrouped aggregates and plain
   filter/projection stages are opt-in. On Spark 4.3.0, 1,300 random queries: 1,277 with identical rows, 23
   raising on both sides, 0 different. At 50,000,000 rows, each side at its better partition count, a
-  1,000,000-group `GROUP BY` measures 2.3x to 2.6x, 100,000 groups 1.6x, few groups about level
+  1,000,000-group `GROUP BY` measures 2.1x to 2.6x over two recorded runs, 100,000 groups 1.3x to 1.6x, few
+  groups about level
   ([docs/SPARK.md](docs/SPARK.md)).
 
 ## 0.6.1 — 2026-11-08

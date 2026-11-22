@@ -71,21 +71,28 @@ def run(enabled, fn):
 
 def versus(q):
     """Seconds for Spark and for the plugin: 2 unrecorded warm-up runs of each, then 5 recorded runs of
-    each, the side that goes first alternating. Returns {enabled: sorted times}."""
+    each, the side that goes first alternating. Returns {enabled: [(wall s, JVM CPU s), ...] by wall}."""
     res = {False: [], True: []}
+    pid = str(jvm.java.lang.ProcessHandle.current().pid())
+
+    def cpu():
+        t = subprocess.run(["ps", "-o", "time=", "-p", pid], capture_output=True, text=True, check=True).stdout.strip()
+        return sum(float(x) * 60 ** k for k, x in enumerate(reversed(t.split(":"))))
+
     for i in range(7):
         for enabled in ((False, True) if i % 2 == 0 else (True, False)):
-            t0 = time.perf_counter()
+            c0, t0 = cpu(), time.perf_counter()
             run(enabled, q)
+            t1, c1 = time.perf_counter(), cpu()
             if i >= 2:
-                res[enabled].append(time.perf_counter() - t0)
+                res[enabled].append((t1 - t0, c1 - c0))
     return {k: sorted(v) for k, v in res.items()}
 
 
 def report(label, res, tail=""):
-    c, g = res[False], res[True]
-    print(f"  {label:50s} Spark {c[2]:.2f} s [{c[0]:.2f}-{c[-1]:.2f}], with ArrowMetal {g[2]:.2f} s "
-          f"[{g[0]:.2f}-{g[-1]:.2f}], {c[2] / g[2]:.2f}x{tail}")
+    (c, cc), (g, gc) = [([w for w, _ in res[e]], sorted(x for _, x in res[e])[2]) for e in (False, True)]
+    print(f"  {label:50s} Spark {c[2]:.3f} s [{c[0]:.3f}-{c[-1]:.3f}] (CPU {cc:.2f} s), with ArrowMetal {g[2]:.3f} s "
+          f"[{g[0]:.3f}-{g[-1]:.3f}] (CPU {gc:.2f} s), {c[2] / g[2]:.2f}x{tail}")
 
 
 def keys(df, col):

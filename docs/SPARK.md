@@ -98,22 +98,29 @@ three `GROUP BY` queries over 20,000,000 Parquet rows group by group: 3 of 3 ide
 
 Median of five runs a side after two warm-up runs, the side that goes first alternating; 50,000,000 rows,
 M4 Max, 16 cores, local mode, everything on. Each side at the better of the partition counts tried (16 and
-6; 16, 4 and 1 for the sorts). Files: `spark_groupby_2026-11-22_16m.txt`, `spark_stage_2026-11-22_16m.txt`,
-`spark_sort_2026-11-22_final.txt` under `Benchmarks/results/`.
+6; 16, 4 and 1 for the sorts). Two recorded runs of the same build, both given: A is
+`spark_groupby_2026-11-22_16m.txt` and `spark_stage_2026-11-22_16m.txt`, B is `spark_cpu_2026-11-22.txt` under
+`Benchmarks/results/`, which adds the CPU time of the Spark process. Sorts: `spark_sort_2026-11-22_final.txt`.
 
-| Query | Spark | With ArrowMetal | |
+| Query | A | B | B: Spark (CPU) | B: with ArrowMetal (CPU) |
+|---|---:|---:|---:|---:|
+| `SUM, COUNT, MIN, MAX`, 1,000,000 groups | 2.3x | 2.1x | 2.046 s (26.66 s) | 0.974 s (5.76 s) |
+| `SUM(double)`, 1,000,000 groups | 2.6x | 2.4x | 1.211 s (15.88 s) | 0.514 s (3.08 s) |
+| revenue by part, 100,000 groups | 1.6x | 1.3x | 0.668 s (6.89 s) | 0.499 s (2.04 s) |
+| `SUM, COUNT, MIN, MAX`, 1,001 groups | 1.1x | 1.1x | 0.530 s (4.62 s) | 0.466 s (2.29 s) |
+| `SUM(double)`, 1,001 groups | 1.1x | 1.1x | 0.295 s (1.38 s) | 0.273 s (1.27 s) |
+| pricing summary, 4 groups (TPC-H Q1 shape) | 0.97x | 0.97x | 0.271 s (3.30 s) | 0.279 s (2.52 s) |
+| filtered revenue, no `GROUP BY` (TPC-H Q6 shape), off by default | 0.6x | 0.5x | 0.120 s (1.30 s) | 0.237 s (2.41 s) |
+
+| Sort, off by default | Spark | With ArrowMetal | |
 |---|---:|---:|---:|
-| `SUM, COUNT, MIN, MAX`, 1,000,000 groups | 2.35 s | 1.01 s | 2.3x |
-| `SUM(double)`, 1,000,000 groups | 1.40 s | 0.53 s | 2.6x |
-| revenue by part, 100,000 groups | 0.88 s | 0.54 s | 1.6x |
-| `SUM, COUNT, MIN, MAX`, 1,001 groups | 0.55 s | 0.49 s | 1.1x |
-| `SUM(double)`, 1,001 groups | 0.31 s | 0.29 s | 1.1x |
-| pricing summary, 4 groups (TPC-H Q1 shape) | 0.39 s | 0.40 s | 1.0x |
-| filtered revenue, no `GROUP BY` (TPC-H Q6 shape), off by default | 0.13 s | 0.23 s | 0.6x |
-| `sortWithinPartitions` long, off by default | 0.58 s | 0.45 s | 1.3x |
-| `sortWithinPartitions` double, off by default | 0.57 s | 0.69 s | 0.8x |
-| `ORDER BY` long, off by default | 2.59 s | 2.69 s | 1.0x |
-| `ORDER BY` double, off by default | 2.64 s | 2.98 s | 0.9x |
+| `sortWithinPartitions` long | 0.58 s | 0.45 s | 1.3x |
+| `sortWithinPartitions` double | 0.57 s | 0.69 s | 0.8x |
+| `ORDER BY` long | 2.59 s | 2.69 s | 1.0x |
+| `ORDER BY` double | 2.64 s | 2.98 s | 0.9x |
+
+Each side's better partition count differs (Spark 16, the plugin 6 on the many-group rows). At the same count
+the many-group rows are 1.5x to 1.6x at 16 and 3.2x to 3.4x at 6 in B, where Spark runs six tasks.
 
 Runs of the same query on the same day moved: the Q1 shape measured 1.4x in an earlier build's run
 (`spark_stage_2026-11-22_warm.txt`) and 1.0x in this one, at 16 partitions the 1,001-group rows are 1.10x

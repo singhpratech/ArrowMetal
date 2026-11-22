@@ -57,7 +57,7 @@ same, -0.0 equal to 0.0), 646 with a GPU stage
 
 **What the fair timings changed.** The first recordings were best of two, Spark first on a cold JVM, and their
 largest rows held Spark to 6 of 16 tasks. With warm-up, five runs a side in alternating order and each side at
-its better partition count, the 1,000,000-group query is 2.3x to 2.6x, not 3.38x; the GPU sort is 0.8x to 1.3x
+its better partition count, the 1,000,000-group queries are 2.1x to 2.6x over two runs, not 3.38x; the GPU sort is 0.8x to 1.3x
 and is now opt-in; aggregates without `GROUP BY` are 0.6x and opt-in.
 
 **Byte and short columns.** They were imported but not read back: 76 of 300 queries failed once the fuzz had
