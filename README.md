@@ -75,7 +75,7 @@ ArrowMetal runs Apache Arrow compute on the Apple silicon GPU: Arrow arrays that
 memory, GPU kernels that keep Arrow's semantics (validity bitmaps, packed booleans, the C Data and C
 Device Data Interfaces), and one C ABI reachable from Swift, Python, Rust, Go, TypeScript, R and C.
 
-Contents: [The engines in full](#the-engines-in-full) ([DataFusion](#datafusion-in-full) · [Polars](#polars-in-full) · [DuckDB](#duckdb-in-full)) · [The one-row picture](#the-one-row-picture) · [Measure it on your Mac](#measure-it-on-your-mac) · [Release](#release) · [The pitch](#the-pitch-in-one-paragraph) · [What was measured](#what-was-measured) · [Why this exists](#why-this-exists) · [Benchmarks](#benchmarks) · [From Python](#from-python) · [Bindings](#bindings) · [Quick start (Swift)](#quick-start-swift) · [Reading Arrow files](#reading-arrow-files) · [What is implemented](#what-is-implemented) · [Design notes](#design-notes) · [Citing](#citing) · [License](#license)
+Contents: [The engines in full](#the-engines-in-full) ([DataFusion](#datafusion-in-full) · [Polars](#polars-in-full) · [DuckDB](#duckdb-in-full) · [Apache Spark](#apache-spark)) · [The one-row picture](#the-one-row-picture) · [Measure it on your Mac](#measure-it-on-your-mac) · [Release](#release) · [The pitch](#the-pitch-in-one-paragraph) · [What was measured](#what-was-measured) · [Why this exists](#why-this-exists) · [Benchmarks](#benchmarks) · [From Python](#from-python) · [Bindings](#bindings) · [Quick start (Swift)](#quick-start-swift) · [Reading Arrow files](#reading-arrow-files) · [What is implemented](#what-is-implemented) · [Design notes](#design-notes) · [Citing](#citing) · [License](#license)
 
 ### The engines in full
 
@@ -267,6 +267,20 @@ and 1,000 `INTEGER` keys with five aggregates, 36.68 against 32.61 ms (0.89x). L
 default, each with a query behind at 50,000,000 rows in the same file: a single `sum` (`sum(INTEGER)`,
 0.32x), few groups with at most two aggregates (1,000 `INTEGER` keys, `sum`, 0.59x) and `VARCHAR`
 keys (1,000 long `VARCHAR` keys, `sum`, `count`, 0.22x).
+
+#### Apache Spark
+
+A Spark SQL extension runs a partial `GROUP BY` above a Parquet scan, with the filters and projections under it, as one GPU stage. The SQL is unchanged; what it does not translate stays on Spark.
+
+```bash
+JAVA_HOME=<JDK 22+> PYTHON=<python with pyspark> spark/build.sh
+export ARROWMETAL_LIB=$PWD/.build/release/libArrowMetalC.dylib
+pyspark --jars spark/build/arrowmetal-spark.jar \
+  --conf spark.sql.extensions=org.arrowmetal.spark.ArrowMetalExtensions \
+  --conf spark.driver.extraJavaOptions=--enable-native-access=ALL-UNNAMED
+```
+
+On Spark 4.3.0, 50,000,000 rows, each side at its better partition count: 2.3x to 2.6x on 1,000,000 groups, 1.6x on 100,000, about level on few (`Benchmarks/results/spark_groupby_2026-11-22_16m.txt`, `spark_stage_2026-11-22_16m.txt`). It is on `main`, built from source and not in the 0.6.1 release. [docs/SPARK.md](docs/SPARK.md)
 
 ### The one-row picture
 
