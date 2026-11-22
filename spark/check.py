@@ -66,6 +66,26 @@ def run(enabled, fn):
     return fn()
 
 
+
+def versus(q):
+    """Seconds for Spark and for the plugin: 2 unrecorded warm-up runs of each, then 5 recorded runs of
+    each, the side that goes first alternating. Returns {enabled: sorted times}."""
+    res = {False: [], True: []}
+    for i in range(7):
+        for enabled in ((False, True) if i % 2 == 0 else (True, False)):
+            t0 = time.perf_counter()
+            run(enabled, q)
+            if i >= 2:
+                res[enabled].append(time.perf_counter() - t0)
+    return {k: sorted(v) for k, v in res.items()}
+
+
+def report(label, res, tail=""):
+    c, g = res[False], res[True]
+    print(f"  {label:50s} Spark {c[2]:.2f} s [{c[0]:.2f}-{c[-1]:.2f}], with ArrowMetal {g[2]:.2f} s "
+          f"[{g[0]:.2f}-{g[-1]:.2f}], {c[2] / g[2]:.2f}x{tail}")
+
+
 def keys(df, col):
     return df.select(col).toArrow().column(0).to_pylist()
 
@@ -108,17 +128,11 @@ elif mode == "bench":
     parts = int(sys.argv[3]) if len(sys.argv) > 3 else 16
     base = frame(rows, parts).select("id", "k_long", "k_double").cache()
     base.count()
-    print(f"{rows:,} rows, {parts} partitions, cached; best of 2 runs each, alternating, written to Spark's noop sink")
+    print(f"{rows:,} rows, {parts} partitions, cached; median [min-max] of 5 runs each after 2 warm-up runs, the first side alternating, written to Spark's noop sink")
     for col in ("k_long", "k_double"):
         for label, q in (("sortWithinPartitions", lambda: base.sortWithinPartitions(col)),
                          ("ORDER BY (global)", lambda: base.orderBy(col))):
-            res = {}
-            for enabled in (False, True, False, True):
-                t0 = time.perf_counter()
-                run(enabled, lambda: q().write.format("noop").mode("overwrite").save())
-                res.setdefault(enabled, []).append(time.perf_counter() - t0)
-            cpu, gpu = min(res[False]), min(res[True])
-            print(f"  {col:9s} {label:21s} Spark {cpu:.2f} s, with ArrowMetal {gpu:.2f} s, {cpu / gpu:.2f}x")
+            report(f"{col} {label}", versus(lambda: q().write.format("noop").mode("overwrite").save()))
 
 
 def parquet(n):
@@ -197,13 +211,7 @@ elif mode == "agg-bench":
     for key in ("k_int", "k_long"):
         for label, sql in ((f"SUM, COUNT, MIN, MAX by {key}", f"SELECT {key}, {AGG} FROM t GROUP BY {key}"),
                            (f"SUM(v_double) by {key}", f"SELECT {key}, SUM(v_double) FROM t GROUP BY {key}")):
-            res = {}
-            for enabled in (False, True, False, True):
-                t0 = time.perf_counter()
-                run(enabled, lambda: spark.sql(sql).write.format("noop").mode("overwrite").save())
-                res.setdefault(enabled, []).append(time.perf_counter() - t0)
-            cpu, gpu = min(res[False]), min(res[True])
-            print(f"  {label:34s} Spark {cpu:.2f} s, with ArrowMetal {gpu:.2f} s, {cpu / gpu:.2f}x")
+            report(label, versus(lambda: spark.sql(sql).write.format("noop").mode("overwrite").save()))
 
 
 def lineitem(n):
@@ -246,18 +254,12 @@ if mode == "stage-bench":
          "WHERE quantity > 10.0 GROUP BY partkey"),
     ]
     for label, sql in queries:
-        res, answers = {}, {}
-        for enabled in (False, True, False, True):
-            t0 = time.perf_counter()
-            out = run(enabled, lambda: spark.sql(sql).collect())
-            res.setdefault(enabled, []).append(time.perf_counter() - t0)
-            answers[enabled] = out
+        answers = {e: run(e, lambda: spark.sql(sql).collect()) for e in (False, True)}
+        res = versus(lambda: spark.sql(sql).collect())
         a = {tuple(r)[0] if len(r) > 1 else 0: tuple(r) for r in answers[False]}
         b = {tuple(r)[0] if len(r) > 1 else 0: tuple(r) for r in answers[True]}
         ok = a.keys() == b.keys() and all(
             all((x == y) or (isinstance(x, float) and isinstance(y, float) and abs(x - y) <= 1e-9 * max(abs(x), abs(y)))
                 for x, y in zip(a[k], b[k])) for k in a)
-        cpu, gpu = min(res[False]), min(res[True])
-        print(f"  {label:50s} Spark {cpu:.2f} s, with ArrowMetal {gpu:.2f} s, {cpu / gpu:.2f}x  "
-              f"({'same answer' if ok else 'DIFFERENT ANSWER'})")
+        report(label, res, f"  ({'same answer' if ok else 'DIFFERENT ANSWER'})")
 spark.stop()

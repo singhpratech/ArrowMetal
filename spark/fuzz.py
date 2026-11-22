@@ -42,7 +42,7 @@ print(f"ArrowMetal Spark plugin fuzz: {chip}, macOS {platform.mac_ver()[0]}; Spa
       f"Java {jvm.System.getProperty('java.version')}, ArrowMetal {jvm.org.arrowmetal.spark.ArrowMetalNative.version()}; "
       f"{N} queries, seed {SEED}, {ROWS:,} rows; {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}")
 
-path = os.environ.get("SPARK_DATA", f"{R}/spark/build/data") + f"/fuzz_{ROWS}.parquet"
+path = os.environ.get("SPARK_DATA", f"{R}/spark/build/data") + f"/fuzz2_{ROWS}.parquet"
 if not os.path.exists(path):
     h = F.xxhash64("id")
     u = F.abs(h)
@@ -60,13 +60,17 @@ if not os.path.exists(path):
         F.when(m == 11, F.lit(None)).otherwise(u % 2 == 0).alias("b"),
         F.when(m == 12, F.lit(None)).otherwise(F.element_at(strings, (u % 11 + 1).cast("int"))).alias("s"),
         F.when(m == 13, F.lit(None)).otherwise(F.date_add(F.lit("2000-01-01"), (u % 9000).cast("int"))).alias("dt"),
+        ((h % 2_000_001).cast("double") / 8.0).alias("x"),          # finite: sums that are not NaN
+        F.when(m == 14, F.lit(None)).otherwise((h % 128).cast("byte")).alias("y"),
+        F.when(m == 15, F.lit(None)).otherwise((h % 32768).cast("short")).alias("sh"),
+        F.when(m == 16, F.lit(None)).otherwise(F.timestamp_seconds(u % 1_700_000_000)).alias("ts"),
         (u % 20).cast("int").alias("k1"),
         (u % 1000).alias("k2"))
      .write.mode("overwrite").parquet(path))
 spark.read.parquet(path).createOrReplaceTempView("t")
 
 rnd = random.Random(SEED)
-NUM = {"i": "int", "l": "long", "d": "double", "f": "float", "k1": "int", "k2": "long"}
+NUM = {"i": "int", "l": "long", "d": "double", "f": "float", "x": "double", "y": "int", "sh": "int", "k1": "int", "k2": "long"}
 LIT = {"int": ["0", "-1", "7", "1000", "-50000"], "long": ["0", "123456789", "-5"],
        "double": ["0.0", "-0.0", "1.5", "-2.25", "100000.0"], "float": ["0.0", "1.5", "-3.0"]}
 
@@ -100,6 +104,8 @@ def pred(depth=0):
                            "startswith(s, 'ba')", "contains(s, 'p')", "s LIKE '%e'"])
     if kind == "bool":
         return rnd.choice(["b", "NOT b", "b = true", "b IS TRUE"])
+    if rnd.random() < 0.3:
+        return f"ts {op} TIMESTAMP'{rnd.choice(['1980-01-01 00:00:00', '2001-09-09 01:46:40'])}'"
     return f"dt {op} DATE'{rnd.choice(['2000-01-01', '2010-06-15', '2024-12-31'])}'"
 
 
@@ -108,13 +114,13 @@ def proj():
         "d * 2.5", "d + 1.25", "-d", "abs(d)", "d / 4.0", "CAST(i AS DOUBLE) + d", "f * 2.0",
         "i + 1", "l - k2", "k1 * 3", "-i", "CAST(k1 AS BIGINT)", "coalesce(d, 0.0)", "coalesce(i, k1)",
         "IF(d > 0.0, d, -1.0)", "CASE WHEN k1 < 5 THEN 'low' WHEN k1 < 15 THEN 'mid' ELSE s END",
-        "IF(b, i, k1)", "s", "dt", "b", "l", "k1 < 10 AND b", "d IS NULL", "isnan(d)", "i % 7"])
+        "IF(b, i, k1)", "s", "dt", "b", "l", "k1 < 10 AND b", "d IS NULL", "isnan(d)", "i % 7", "x * 2.5", "x / 3.0", "y", "sh", "ts", "coalesce(y, sh)"])
 
 
 def agg():
     return rnd.choice(["SUM(i)", "SUM(d)", "SUM(f)", "SUM(l)", "SUM(k1)", "COUNT(*)", "COUNT(d)", "COUNT(s)",
                        "MIN(i)", "MAX(l)", "MIN(dt)", "MAX(k2)", "AVG(i)", "AVG(d)", "AVG(k1)",
-                       "MIN(d)", "SUM(d * 2.0)", "COUNT(DISTINCT k1)"])
+                       "MIN(d)", "SUM(x)", "SUM(x)", "AVG(x)", "SUM(x * 1.5)", "SUM(y)", "AVG(sh)", "MIN(y)", "MAX(sh)", "COUNT(ts)", "SUM(d * 2.0)", "COUNT(DISTINCT k1)"])
 
 
 def query():
@@ -126,13 +132,13 @@ def query():
     aggs = ", ".join(f"{agg()} AS a{j}" for j in range(rnd.randint(1, 4)))
     if form == "global":
         return form, f"SELECT {aggs} FROM t{where}"
-    keys = rnd.choice([["k1"], ["k2"], ["k1", "k2"], ["s"], ["b"], ["dt"], ["k1", "s"], ["i"]])
+    keys = rnd.choice([["k1"], ["k2"], ["k1", "k2"], ["s"], ["b"], ["dt"], ["k1", "s"], ["i"], ["y"], ["sh", "k1"], ["ts"], ["x"], ["d"], ["f"]])
     return form, f"SELECT {', '.join(keys)}, {aggs} FROM t{where} GROUP BY {', '.join(keys)}"
 
 
 def norm(v):
     if isinstance(v, float):
-        return ("nan",) if math.isnan(v) else ("f", v)
+        return ("nan",) if math.isnan(v) else ("f", v.hex())      # hex keeps -0.0 apart from 0.0
     return ("v", v)
 
 
@@ -158,7 +164,7 @@ def same(x, y, tolerant):
     return None
 
 
-taken = differ = errors = 0
+taken = differ = errors = both = 0
 by_form = {}
 for qn in range(N):
     form, sql = query()
@@ -188,6 +194,7 @@ for qn in range(N):
     f[0] += 1
     f[1] += used
     if cpu_err or gpu_err:
+        both += bool(cpu_err) and bool(gpu_err)
         if bool(cpu_err) != bool(gpu_err):
             differ += 1
             print(f"  [{qn}] DIFFERENT (ansi={ansi}, gpu={used}): Spark {cpu_err or 'ok'}, plugin {gpu_err or 'ok'}: {sql}")
@@ -196,6 +203,6 @@ for qn in range(N):
     if d:
         differ += 1
         print(f"  [{qn}] DIFFERENT (ansi={ansi}, gpu={used}): {d}: {sql}")
-print(f"{N} queries: {N - differ - errors} identical to Spark, {differ} different, {errors} harness errors; "
+print(f"{N} queries: {N - differ - errors - both} with identical rows, {both} where both raise, {differ} different, {errors} harness errors; "
       f"{taken} ran a MetalStage on the GPU ({', '.join(f'{k} {v[1]}/{v[0]}' for k, v in sorted(by_form.items()))})")
 spark.stop()

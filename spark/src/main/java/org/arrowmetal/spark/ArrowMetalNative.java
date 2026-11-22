@@ -298,6 +298,20 @@ public final class ArrowMetalNative {
                         MemorySegment.copy(data.reinterpret((off + len) * 8), ValueLayout.JAVA_LONG, off * 8, v, 0, len);
                         return new Column(format, len, v, null, null, validity);
                     }
+                    case "c": {
+                        byte[] b = new byte[len];
+                        MemorySegment.copy(data.reinterpret(off + len), ValueLayout.JAVA_BYTE, off, b, 0, len);
+                        int[] v = new int[len];
+                        for (int i = 0; i < len; i++) v[i] = b[i];
+                        return new Column(format, len, null, v, null, validity);
+                    }
+                    case "s": {
+                        short[] b = new short[len];
+                        MemorySegment.copy(data.reinterpret((off + len) * 2), ValueLayout.JAVA_SHORT, off * 2, b, 0, len);
+                        int[] v = new int[len];
+                        for (int i = 0; i < len; i++) v[i] = b[i];
+                        return new Column(format, len, null, v, null, validity);
+                    }
                     case "i": case "tdD": {
                         int[] v = new int[len];
                         MemorySegment.copy(data.reinterpret((off + len) * 4), ValueLayout.JAVA_INT, off * 4, v, 0, len);

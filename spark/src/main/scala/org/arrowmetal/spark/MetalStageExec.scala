@@ -216,6 +216,8 @@ object MetalStage {
       val nulls = nullRows.size.toLong
       dt match {
         case StringType =>
+          if (bytes > Int.MaxValue) throw new IllegalStateException(
+            s"MetalStage: $bytes bytes of strings in one partition do not fit 32-bit offsets; use more partitions")
           val offs = arena.allocate(4L * (n + 1), 64)
           val data = arena.allocate(math.max(1L, bytes), 64)
           var row = 0L
@@ -317,6 +319,7 @@ object MetalStage {
       }
       n += b.numRows()
     }
+    if (n > Int.MaxValue) throw new IllegalStateException(s"MetalStage: $n rows in one partition; use more partitions")
     val proj = UnsafeProjection.create(outTypes.toArray)
     val row = new SpecificInternalRow(outTypes)
     if (n == 0) {
