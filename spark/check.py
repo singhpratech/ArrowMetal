@@ -4,6 +4,7 @@
     JAVA_HOME=<JDK 22+> python spark/check.py bench [rows] [partitions]     # Spark's CPU sort vs the GPU
     JAVA_HOME=<JDK 22+> python spark/check.py agg-check [rows]              # GROUP BY from Parquet, same answers?
     JAVA_HOME=<JDK 22+> python spark/check.py agg-bench [rows] [partitions] # Spark's GROUP BY vs the GPU
+    JAVA_HOME=<JDK 22+> python spark/check.py stage-bench [rows] [partitions] # filter + expressions + aggregate
 
 Needs pyspark (4.x), spark/build/arrowmetal-spark.jar (spark/build.sh) and libArrowMetalC.dylib
 (ARROWMETAL_LIB, default .build/release/libArrowMetalC.dylib). Spark runs in local mode on this Mac.
@@ -78,7 +79,7 @@ def same(a, b):
     return True
 
 
-if mode in ("agg-check", "agg-bench"):
+if mode in ("agg-check", "agg-bench", "stage-bench"):
     pass
 elif mode == "check":
     spark.conf.set("spark.arrowmetal.sort.minRows", "1000")      # every partition takes the GPU path
@@ -176,13 +177,13 @@ if mode == "agg-check":
         g = run(True, q)
         gr = agg_rows(g)
         if plan_ok is None:      # adaptive execution: the final plan exists once the query has run
-            plan_ok = "MetalPartialAggregate" in g._jdf.queryExecution().executedPlan().toString()
+            plan_ok = "MetalStage" in g._jdf.queryExecution().executedPlan().toString()
         cr = agg_rows(run(False, q))
         d = agg_same(gr, cr)
         bad += d is not None
         total += 1
         print(f"  GROUP BY {key:7s} {len(gr):>9,} groups: {'identical' if d is None else 'DIFFERENT: ' + d}")
-    print(f"MetalPartialAggregate in the plan: {plan_ok}; {total - bad} of {total} identical to Spark")
+    print(f"MetalStage in the plan: {plan_ok}; {total - bad} of {total} identical to Spark")
 elif mode == "agg-bench":
     parts = int(sys.argv[3]) if len(sys.argv) > 3 else 16
     path = parquet(rows)
@@ -203,4 +204,60 @@ elif mode == "agg-bench":
                 res.setdefault(enabled, []).append(time.perf_counter() - t0)
             cpu, gpu = min(res[False]), min(res[True])
             print(f"  {label:34s} Spark {cpu:.2f} s, with ArrowMetal {gpu:.2f} s, {cpu / gpu:.2f}x")
+
+
+def lineitem(n):
+    """A lineitem-shaped Parquet file: quantities, prices, discounts, dates and two small keys."""
+    path = os.environ.get("SPARK_DATA", f"{R}/spark/build/data") + f"/lineitem_{n}.parquet"
+    if not os.path.exists(path):
+        h = F.abs(F.xxhash64("id"))
+        (spark.range(0, n, 1, 16).select(
+            (h % 50 + 1).cast("double").alias("quantity"),
+            ((h % 9_000_000) / 100.0 + 900.0).alias("price"),
+            ((h % 11) / 100.0).alias("discount"),
+            ((F.abs(F.xxhash64(F.col("id") + 3)) % 9) / 100.0).alias("tax"),
+            F.date_add(F.lit("1992-01-01"), (F.abs(F.xxhash64(F.col("id") + 5)) % 2526).cast("int")).alias("shipdate"),
+            (h % 4).cast("int").alias("flag"),
+            (F.abs(F.xxhash64(F.col("id") + 9)) % 100_000).alias("partkey"))
+         .write.mode("overwrite").parquet(path))
+    return path
+
+
+if mode == "stage-bench":
+    parts = int(sys.argv[3]) if len(sys.argv) > 3 else 16
+    path = lineitem(rows)
+    size = sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(path) for f in fs)
+    spark.conf.set("spark.sql.files.maxPartitionBytes", str(max(1 << 20, size // parts + 1)))
+    spark.conf.set("spark.sql.files.minPartitionNum", str(parts))
+    spark.read.parquet(path).createOrReplaceTempView("lineitem")
+    nparts = spark.read.parquet(path).rdd.getNumPartitions()
+    print(f"{rows:,} rows of Parquet ({size / 1e6:.0f} MB) read in {nparts} partitions; best of 2 runs each, "
+          "alternating; both answers compared")
+    queries = [
+        ("filtered revenue, no GROUP BY (TPC-H Q6 shape)",
+         "SELECT SUM(price * discount) AS revenue FROM lineitem WHERE shipdate >= DATE'1994-01-01' "
+         "AND shipdate < DATE'1995-01-01' AND discount >= 0.05 AND discount <= 0.07 AND quantity < 24.0"),
+        ("pricing summary by flag (TPC-H Q1 shape, int key)",
+         "SELECT flag, SUM(quantity), SUM(price), SUM(price * (1.0 - discount)), "
+         "SUM(price * (1.0 - discount) * (1.0 + tax)), AVG(quantity), AVG(price), AVG(discount), COUNT(*) "
+         "FROM lineitem WHERE shipdate <= DATE'1998-09-02' GROUP BY flag"),
+        ("revenue by part, 100,000 groups",
+         "SELECT partkey, SUM(price * (1.0 - discount)) AS rev, COUNT(*) AS n FROM lineitem "
+         "WHERE quantity > 10.0 GROUP BY partkey"),
+    ]
+    for label, sql in queries:
+        res, answers = {}, {}
+        for enabled in (False, True, False, True):
+            t0 = time.perf_counter()
+            out = run(enabled, lambda: spark.sql(sql).collect())
+            res.setdefault(enabled, []).append(time.perf_counter() - t0)
+            answers[enabled] = out
+        a = {tuple(r)[0] if len(r) > 1 else 0: tuple(r) for r in answers[False]}
+        b = {tuple(r)[0] if len(r) > 1 else 0: tuple(r) for r in answers[True]}
+        ok = a.keys() == b.keys() and all(
+            all((x == y) or (isinstance(x, float) and isinstance(y, float) and abs(x - y) <= 1e-9 * max(abs(x), abs(y)))
+                for x, y in zip(a[k], b[k])) for k in a)
+        cpu, gpu = min(res[False]), min(res[True])
+        print(f"  {label:50s} Spark {cpu:.2f} s, with ArrowMetal {gpu:.2f} s, {cpu / gpu:.2f}x  "
+              f"({'same answer' if ok else 'DIFFERENT ANSWER'})")
 spark.stop()

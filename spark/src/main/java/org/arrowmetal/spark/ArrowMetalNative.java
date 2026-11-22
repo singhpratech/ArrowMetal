@@ -29,6 +29,7 @@ public final class ArrowMetalNative {
     private static final Linker LINKER = Linker.nativeLinker();
     private static final MethodHandle AM_IMPORT, AM_ARGSORT_EX2, AM_EXPORT, AM_RELEASE, AM_LAST_ERROR, AM_VERSION;
     private static final MethodHandle AM_GROUP_BY_KEYS, AM_GROUP_COUNT, AM_GROUP_KEYS_RESULT, AM_GROUP_AGG_EX, AM_GROUP_RELEASE;
+    private static final MethodHandle AM_PLAN_SOURCE_CREATE, AM_PLAN_SOURCE_RELEASE, AM_PLAN_RUN, AM_PLAN_COLUMN_COUNT, AM_PLAN_COLUMN, AM_PLAN_RESULT_RELEASE;
     private static final MemorySegment RELEASE_SCHEMA_STUB, RELEASE_ARRAY_STUB;
     private static final FunctionDescriptor RELEASE_DESC = FunctionDescriptor.ofVoid(ADDRESS);
 
@@ -59,6 +60,18 @@ public final class ArrowMetalNative {
         AM_GROUP_AGG_EX = LINKER.downcallHandle(sym.find("am_group_agg_ex").orElseThrow(),
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ValueLayout.JAVA_DOUBLE, ADDRESS));
         AM_GROUP_RELEASE = LINKER.downcallHandle(sym.find("am_group_by_release").orElseThrow(),
+                FunctionDescriptor.ofVoid(ADDRESS));
+        AM_PLAN_SOURCE_CREATE = LINKER.downcallHandle(sym.find("am_plan_source_create").orElseThrow(),
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_LONG, ADDRESS));
+        AM_PLAN_SOURCE_RELEASE = LINKER.downcallHandle(sym.find("am_plan_source_release").orElseThrow(),
+                FunctionDescriptor.ofVoid(ADDRESS));
+        AM_PLAN_RUN = LINKER.downcallHandle(sym.find("am_plan_run").orElseThrow(),
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG, JAVA_INT, ADDRESS));
+        AM_PLAN_COLUMN_COUNT = LINKER.downcallHandle(sym.find("am_plan_column_count").orElseThrow(),
+                FunctionDescriptor.of(JAVA_LONG, ADDRESS));
+        AM_PLAN_COLUMN = LINKER.downcallHandle(sym.find("am_plan_column").orElseThrow(),
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_LONG, ADDRESS));
+        AM_PLAN_RESULT_RELEASE = LINKER.downcallHandle(sym.find("am_plan_result_release").orElseThrow(),
                 FunctionDescriptor.ofVoid(ADDRESS));
         try {
             MethodHandles.Lookup l = MethodHandles.lookup();
@@ -185,6 +198,10 @@ public final class ArrowMetalNative {
         public final int[] ints;        // format "i" (and date32 storage)
         public final double[] doubles;  // format "g"
         public final byte[] validity;   // Arrow bitmap, bit set = valid; null when the column has no nulls
+        public float[] floats;          // format "f"
+        public boolean[] booleans;      // format "b"
+        public int[] offsets;           // format "u": length + 1 offsets into utf8
+        public byte[] utf8;
         Column(String format, int length, long[] longs, int[] ints, double[] doubles, byte[] validity) {
             this.format = format; this.length = length; this.longs = longs; this.ints = ints;
             this.doubles = doubles; this.validity = validity;
@@ -196,12 +213,20 @@ public final class ArrowMetalNative {
      *  The memory stays the caller's: `arena` must outlive the returned handle (release with release()). */
     public static MemorySegment importColumn(Arena arena, String format, MemorySegment values, MemorySegment validity,
                                              long n, long nullCount) {
+        return importColumn(arena, format, values, null, validity, n, nullCount);
+    }
+
+    /** As above; for utf8 ("u") `values` is the int32 offsets buffer and `data` the bytes. */
+    public static MemorySegment importColumn(Arena arena, String format, MemorySegment values, MemorySegment data,
+                                             MemorySegment validity, long n, long nullCount) {
         try {
+            int nb = data == null ? 2 : 3;
             MemorySegment schema = arena.allocate(SCHEMA_SIZE, 8);
             MemorySegment array = arena.allocate(ARRAY_SIZE, 8);
-            MemorySegment buffers = arena.allocate(16, 8);
+            MemorySegment buffers = arena.allocate(8L * nb, 8);
             buffers.set(ADDRESS, 0, nullCount > 0 ? validity : MemorySegment.NULL);
             buffers.set(ADDRESS, 8, values);
+            if (data != null) buffers.set(ADDRESS, 16, data);
             schema.set(ADDRESS, 0, arena.allocateFrom(format));
             schema.set(ADDRESS, 8, MemorySegment.NULL);
             schema.set(ADDRESS, 16, MemorySegment.NULL);
@@ -214,7 +239,7 @@ public final class ArrowMetalNative {
             array.set(JAVA_LONG, 0, n);
             array.set(JAVA_LONG, 8, nullCount);
             array.set(JAVA_LONG, 16, 0L);
-            array.set(JAVA_LONG, 24, 2L);
+            array.set(JAVA_LONG, 24, (long) nb);
             array.set(JAVA_LONG, 32, 0L);
             array.set(ADDRESS, 40, buffers);
             array.set(ADDRESS, 48, MemorySegment.NULL);
@@ -254,7 +279,7 @@ public final class ArrowMetalNative {
                 int len = (int) xa.get(JAVA_LONG, 0);
                 long nulls = xa.get(JAVA_LONG, 8);
                 long off = xa.get(JAVA_LONG, 16);
-                MemorySegment bufs = xa.get(ADDRESS, 40).reinterpret(16);
+                MemorySegment bufs = xa.get(ADDRESS, 40).reinterpret(8L * xa.get(JAVA_LONG, 24));
                 byte[] validity = null;
                 MemorySegment vb = bufs.get(ADDRESS, 0);
                 if (nulls != 0 && !vb.equals(MemorySegment.NULL)) {
@@ -282,6 +307,38 @@ public final class ArrowMetalNative {
                         double[] v = new double[len];
                         MemorySegment.copy(data.reinterpret((off + len) * 8), ValueLayout.JAVA_DOUBLE, off * 8, v, 0, len);
                         return new Column(format, len, null, null, v, validity);
+                    }
+                    case "f": {
+                        float[] v = new float[len];
+                        MemorySegment.copy(data.reinterpret((off + len) * 4), ValueLayout.JAVA_FLOAT, off * 4, v, 0, len);
+                        Column c = new Column(format, len, null, null, null, validity);
+                        c.floats = v;
+                        return c;
+                    }
+                    case "b": {
+                        MemorySegment bits = data.reinterpret((off + len + 7) / 8 + 1);
+                        boolean[] v = new boolean[len];
+                        for (int i = 0; i < len; i++) {
+                            long bit = off + i;
+                            v[i] = (bits.get(ValueLayout.JAVA_BYTE, bit >>> 3) & (1 << (bit & 7))) != 0;
+                        }
+                        Column c = new Column(format, len, null, null, null, validity);
+                        c.booleans = v;
+                        return c;
+                    }
+                    case "u": {
+                        MemorySegment offs = data.reinterpret((off + len + 1) * 4);
+                        int[] o = new int[len + 1];
+                        MemorySegment.copy(offs, ValueLayout.JAVA_INT, off * 4, o, 0, len + 1);
+                        int base = o[0];
+                        for (int i = 0; i <= len; i++) o[i] -= base;
+                        MemorySegment bytes = bufs.reinterpret(24).get(ADDRESS, 16).reinterpret(base + (long) o[len]);
+                        byte[] b = new byte[o[len]];
+                        MemorySegment.copy(bytes, ValueLayout.JAVA_BYTE, base, b, 0, o[len]);
+                        Column c = new Column(format, len, null, null, null, validity);
+                        c.offsets = o;
+                        c.utf8 = b;
+                        return c;
                     }
                     default:
                         throw new IllegalStateException("ArrowMetal returned a column of format " + format);
@@ -341,6 +398,47 @@ public final class ArrowMetalNative {
     public static void groupRelease(MemorySegment gb) {
         try {
             AM_GROUP_RELEASE.invokeExact(gb);
+        } catch (Throwable t) {
+            throw new RuntimeException(t);
+        }
+    }
+
+    /** Runs a lazy-engine plan (am_plan_run) over one source table "t" made of `columns` (am_array
+     *  handles, retained by the source) and returns every result column. */
+    public static Column[] runPlan(String json, MemorySegment[] columns, String[] names) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment cols = arena.allocate(ADDRESS, Math.max(1, columns.length));
+            MemorySegment nms = arena.allocate(ADDRESS, Math.max(1, columns.length));
+            for (int i = 0; i < columns.length; i++) {
+                cols.setAtIndex(ADDRESS, i, columns[i]);
+                nms.setAtIndex(ADDRESS, i, arena.allocateFrom(names[i]));
+            }
+            MemorySegment srcOut = arena.allocate(ADDRESS);
+            check((int) AM_PLAN_SOURCE_CREATE.invokeExact(arena.allocateFrom("t"), cols, nms, (long) columns.length, srcOut), "plan_source_create");
+            MemorySegment src = srcOut.get(ADDRESS, 0);
+            try {
+                MemorySegment srcs = arena.allocate(ADDRESS);
+                srcs.set(ADDRESS, 0, src);
+                MemorySegment resOut = arena.allocate(ADDRESS);
+                check((int) AM_PLAN_RUN.invokeExact(arena.allocateFrom(json), srcs, 1L, 1, resOut), "plan_run");
+                MemorySegment res = resOut.get(ADDRESS, 0);
+                try {
+                    int n = (int) (long) AM_PLAN_COLUMN_COUNT.invokeExact(res);
+                    Column[] out = new Column[n];
+                    for (int i = 0; i < n; i++) {
+                        MemorySegment c = arena.allocate(ADDRESS);
+                        check((int) AM_PLAN_COLUMN.invokeExact(res, (long) i, c), "plan_column");
+                        out[i] = readAndRelease(c.get(ADDRESS, 0));
+                    }
+                    return out;
+                } finally {
+                    AM_PLAN_RESULT_RELEASE.invokeExact(res);
+                }
+            } finally {
+                AM_PLAN_SOURCE_RELEASE.invokeExact(src);
+            }
+        } catch (RuntimeException e) {
+            throw e;
         } catch (Throwable t) {
             throw new RuntimeException(t);
         }

@@ -11,7 +11,7 @@ JAVA_HOME="${JAVA_HOME:?set JAVA_HOME to a JDK 22 or newer}"
 JARS="$("$PYTHON" -c 'import os, pyspark; print(os.path.join(os.path.dirname(pyspark.__file__), "jars"))')"
 SCALA_VER="$(ls "$JARS" | sed -n 's/^scala-library-\(.*\)\.jar$/\1/p')"
 CP="$(ls "$JARS"/*.jar | tr '\n' ':')"
-rm -rf build && mkdir -p build/classes
+rm -rf build/classes build/arrowmetal-spark.jar && mkdir -p build/classes
 "$JAVA_HOME/bin/javac" --release 22 -d build/classes src/main/java/org/arrowmetal/spark/*.java
 "$JAVA_HOME/bin/java" -cp "$JARS/scala-compiler-$SCALA_VER.jar:$JARS/scala-library-$SCALA_VER.jar:$JARS/scala-reflect-$SCALA_VER.jar" \
   scala.tools.nsc.Main -nowarn -classpath "$CP:build/classes" -d build/classes src/main/scala/org/arrowmetal/spark/*.scala

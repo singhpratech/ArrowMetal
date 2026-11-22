@@ -4,10 +4,10 @@ Things learned the hard way. Add to this whenever something surprises you.
 
 ## Round 26 (2026-11-22): Apache Spark on the GPU
 
-**What.** A Spark SQL extension (`spark/`) that replaces Spark's `SortExec` on one key, and the partial
-`HashAggregateExec` over a columnar scan, with operators that call ArrowMetal. Spark 4.3.0, local mode,
-M4 Max, OpenJDK 27.0.1.1, ArrowMetal 0.6.1. Runs: `Benchmarks/results/spark_sort_2026-11-22.txt` and
-`Benchmarks/results/spark_groupby_2026-11-22.txt`.
+**What.** A Spark SQL extension (`spark/`) that replaces Spark's `SortExec` on one key with a GPU sort, and
+the filters, projections and partial `HashAggregateExec` above a columnar scan with one GPU stage. Spark 4.3.0, local mode,
+M4 Max, OpenJDK 27.0.1.1, ArrowMetal 0.6.1. Runs: `Benchmarks/results/spark_sort_2026-11-22.txt`,
+`spark_groupby_2026-11-22.txt`, `spark_stage_2026-11-22.txt` and `spark_fuzz_2026-11-22.txt`.
 
 **Java reaches the C ABI with no glue.** Java's foreign function API (final since JDK 22) calls
 `am_import`, `am_argsort_ex2`, `am_group_by_keys`, `am_group_agg_ex` and `am_export` directly; the C Data
@@ -28,10 +28,10 @@ in `preColumnarTransitions` and calling `executeColumnar()` on its child gets th
 
 **Row conversion decides the sort; columns decide the aggregate.** The sort takes rows, so every key is
 read row by row into an Arrow column and the rows are emitted in the GPU's order: at 50,000,000 cached rows
-it measures 1.03x to 1.60x against Spark's sort. The partial `GROUP BY` copies the Parquet reader's column
-batches with one bulk copy per column and batch: 1.32x to 1.48x at 16 partitions and 1.33x to 4.03x at 6, the
-largest on 1,000,000 groups, where Spark's time on the same file grows from 0.64 s (1,001 groups) to 3.02 s
-and the plugin's from 0.47 s to 0.87 s.
+it measures 1.03x to 1.60x against Spark's sort. The aggregate copies the Parquet reader's column batches
+with one bulk copy per column and batch: 0.99x to 1.56x at 16 partitions and 1.26x to 3.38x at 6, the
+largest on 1,000,000 groups, where Spark's time on the same file grows from 0.61 s (1,001 groups) to 3.20 s
+and the plugin's from 0.46 s to 0.95 s.
 
 **Partition count is set by the core count, not only `maxPartitionBytes`.** Spark sizes file splits as
 `min(maxPartitionBytes, max(openCostInBytes, totalBytes / parallelism))`, so with 16 cores a larger
@@ -40,6 +40,25 @@ and the plugin's from 0.47 s to 0.87 s.
 **Exactness rules kept.** `SUM` of longs stays on Spark: in ANSI mode, Spark 4's default, Spark raises on
 overflow and the GPU sum wraps. Double sums agree to 1e-9 relative, the summation order being different.
 `COUNT` of a group with only nulls is 0, as Spark's partial buffer holds it.
+
+**One translator instead of one operator at a time.** The filters, projections and partial aggregate above a
+columnar scan become one lazy-engine plan (`am_plan_run`), written from Spark's expressions by
+`SparkToArrowMetal.scala`. Where Arrow's semantics differ from Spark's the expression is written Spark's way
+or refused: float comparisons with NaN equal to NaN and above everything, three-valued `AND`/`OR`, the
+`ELSE` branch on a null `IF`/`CASE` condition, null for `x IN (...)` on a null `x`, and no integer
+arithmetic under ANSI. A random-query fuzz (`spark/fuzz.py`, a table with nulls, NaN, signed zeros,
+infinities, int32 extremes and non-ASCII strings) found no wrong answer; its first 300 queries found 20
+errors, all from two limits of the plan engine on strings: a `select` does not materialise a utf8 output
+and `is_in` takes no utf8 column. String outputs that are scan columns now ride on the JVM and are joined
+back by row number, string `IN` lists are written as `OR`s of `str_eq`, and a string key among several
+stays on Spark. After that, 800 of 800 queries over two seeds were identical, 646 with a GPU stage
+(`Benchmarks/results/spark_fuzz_2026-11-22.txt`).
+
+**The whole stage.** At 50,000,000 lineitem-shaped Parquet rows, a TPC-H Q1-shaped pricing summary (filter,
+four sums of expressions, three averages, a count, by an int key) measures 1.96x at 16 partitions and a
+100,000-group revenue query 1.89x at 6 (`Benchmarks/results/spark_stage_2026-11-22.txt`); the `GROUP BY`
+runs through the same plan engine measure 0.99x to 3.38x (`spark_groupby_2026-11-22.txt`). The stage holds
+a partition in memory: Spark's default 1 GB driver heap ran out on a 50,000,000-row file in 16 partitions.
 
 ## Round 25 (2026-11-08): sorts and group-bys on M1 GPUs
 

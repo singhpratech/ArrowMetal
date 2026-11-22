@@ -1,0 +1,4 @@
+ArrowMetal Spark plugin fuzz: Apple M4 Max, macOS 27.2.1; Spark 4.3.0, Java 27.0.1.1, ArrowMetal 0.6.1; 300 queries, seed 1, 1,000,000 rows; 2026-11-22T07:18:05Z
+300 queries: 300 identical to Spark, 0 different, 0 harness errors; 251 ran a MetalStage on the GPU (global 73/79, group 121/151, select 57/70)
+ArrowMetal Spark plugin fuzz: Apple M4 Max, macOS 27.2.1; Spark 4.3.0, Java 27.0.1.1, ArrowMetal 0.6.1; 500 queries, seed 2, 1,000,000 rows; 2026-11-22T07:22:27Z
+500 queries: 500 identical to Spark, 0 different, 0 harness errors; 395 ran a MetalStage on the GPU (global 115/130, group 167/228, select 113/142)

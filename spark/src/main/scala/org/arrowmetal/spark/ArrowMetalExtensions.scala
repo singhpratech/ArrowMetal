@@ -20,8 +20,9 @@ import org.apache.spark.sql.types._
  * Spark on the Apple silicon GPU. Enable with
  *   --conf spark.sql.extensions=org.arrowmetal.spark.ArrowMetalExtensions
  * Settings: spark.arrowmetal.enabled (default true), spark.arrowmetal.sort.minRows (default 1000000:
- * smaller partitions are sorted by Spark's own ordering on the CPU), spark.arrowmetal.aggregate.enabled
- * (default true: the partial GROUP BY over a columnar scan, MetalPartialAggExec).
+ * smaller partitions are sorted by Spark's own ordering on the CPU), spark.arrowmetal.stage.enabled
+ * (default true: filters, projections and the partial GROUP BY above a columnar scan, MetalStageExec) and
+ * spark.arrowmetal.stage.rows (default true: a filter/projection chain with no aggregate above it too).
  */
 class ArrowMetalExtensions extends (SparkSessionExtensions => Unit) {
   override def apply(e: SparkSessionExtensions): Unit = e.injectColumnar(_ => new MetalColumnarRule)
@@ -29,7 +30,7 @@ class ArrowMetalExtensions extends (SparkSessionExtensions => Unit) {
 
 class MetalColumnarRule extends ColumnarRule {
   override def preColumnarTransitions: Rule[SparkPlan] = MetalSortRule
-  override def postColumnarTransitions: Rule[SparkPlan] = MetalAggRule
+  override def postColumnarTransitions: Rule[SparkPlan] = MetalStageRule
 }
 
 /** Replaces a SortExec on one key of a supported type with MetalSortExec. */

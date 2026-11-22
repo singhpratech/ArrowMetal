@@ -1,7 +1,8 @@
 # ArrowMetal for Apache Spark
 
-A Spark SQL extension that runs sorts and the partial `GROUP BY` of a Parquet or ORC scan on the Apple
-silicon GPU through ArrowMetal. Everything it does not take stays on Spark's own operators.
+A Spark SQL extension that runs Spark's work on the Apple silicon GPU through ArrowMetal: the filters,
+projections and partial aggregate directly above a Parquet or ORC scan as one GPU stage, and one-key sorts.
+Everything it does not take stays on Spark's own operators.
 
 ```bash
 JAVA_HOME=<a JDK 22 or newer> PYTHON=<a python with pyspark> spark/build.sh     # spark/build/arrowmetal-spark.jar
@@ -17,4 +18,5 @@ spark-submit \
 ```
 
 What it covers, how it reaches the GPU and what was measured: [docs/SPARK.md](../docs/SPARK.md).
-`spark/check.py` compares every answer with Spark's own and times both.
+`spark/fuzz.py` runs random queries with and without the plugin and compares the answers;
+`spark/check.py` checks and times the sort, the `GROUP BY` and whole stages.
