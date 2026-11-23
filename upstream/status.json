@@ -1,5 +1,5 @@
 {
- "as_of": "2026-11-22T17:28:26Z",
+ "as_of": "2026-11-23T16:12:00Z",
  "window_days": 14,
  "count": 20,
  "with_project_activity": 19,
@@ -946,7 +946,7 @@
    "reporter_comments": 1,
    "community_comments": 0,
    "last_activity": "2026-11-08T05:42:10Z",
-   "pulse": true
+   "pulse": false
   },
   {
    "project": "Apache Arrow JS",
