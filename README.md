@@ -80,9 +80,9 @@ different. Left to DuckDB: a single `sum` 0.32x, `VARCHAR` keys 0.22x. [DuckDB i
 
 A Spark SQL extension; the SQL is unchanged. On `main`, not in 0.6.1: built from a checkout
 with `spark/build.sh` (Spark 4.3.0, JDK 22 or newer), then set as `spark.sql.extensions`. `GROUP BY` over a
-Parquet scan **2.3x to 2.6x** faster than Spark's own operators on 1,000,000 groups and **1.6x** on 100,000; 0.97x
+Parquet scan **2.1x to 2.6x** faster than Spark's own operators on 1,000,000 groups and **1.3x to 1.6x** on 100,000; 0.97x
 to 1.1x on few. 1,300 generated queries, 1,277 with identical rows, 23 raising on both sides, 0 different. Off
-by default: aggregates without `GROUP BY` 0.6x, sorts 0.8x to 1.3x. [Apache Spark in full](#apache-spark-in-full)
+by default: aggregates without `GROUP BY` 0.5x to 0.6x, sorts 0.8x to 1.3x. [Apache Spark in full](#apache-spark-in-full)
 
 339 benchmark rows, 77 where the CPU is ahead, each with its cause ([matrix](docs/BENCHMARKS_MATRIX.md),
 [to improve](docs/TO_IMPROVE.md)); 307 of Arrow v25's 307 compute function names, 284 on the GPU, and 1 of the 5 added in v26 ([list](docs/ARROW_FUNCTIONS.md)).
@@ -298,7 +298,7 @@ pyspark --jars spark/build/arrowmetal-spark.jar \
   --conf spark.driver.extraJavaOptions=--enable-native-access=ALL-UNNAMED
 ```
 
-On Spark 4.3.0, 50,000,000 rows, each side at its better partition count: 2.3x to 2.6x on 1,000,000 groups, 1.6x on 100,000, about level on few (`Benchmarks/results/spark_groupby_2026-11-22_16m.txt`, `spark_stage_2026-11-22_16m.txt`). It is on `main`, built from source and not in the 0.6.1 release. [docs/SPARK.md](docs/SPARK.md)
+On Spark 4.3.0, 50,000,000 rows, each side at its better partition count: 2.1x to 2.6x on 1,000,000 groups, 1.3x to 1.6x on 100,000, about level on few, over two runs (`Benchmarks/results/spark_groupby_2026-11-22_16m.txt`, `spark_stage_2026-11-22_16m.txt`, `spark_cpu_2026-11-22.txt`). It is on `main`, built from source and not in the 0.6.1 release. [docs/SPARK.md](docs/SPARK.md)
 
 ### The one-row picture
 
