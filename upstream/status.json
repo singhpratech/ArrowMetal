@@ -1,5 +1,5 @@
 {
- "as_of": "2026-11-23T16:12:00Z",
+ "as_of": "2026-11-24T15:59:38Z",
  "window_days": 14,
  "count": 20,
  "with_project_activity": 19,
@@ -802,11 +802,20 @@
      "inline": 0,
      "url": "https://github.com/apache/arrow/pull/52451#pullrequestreview-5886639103",
      "pr": "https://github.com/apache/arrow/pull/52451"
+    },
+    {
+     "type": "pr_comment",
+     "at": "2026-11-24T15:36:56Z",
+     "actor": "Dricmoy",
+     "association": "contributor",
+     "text": "@pitrou Could you take another look? I addressed your comments, and Dmitry has approved.",
+     "url": "https://github.com/apache/arrow/pull/52451#issuecomment-7136324804",
+     "pr": "https://github.com/apache/arrow/pull/52451"
     }
    ],
    "reporter_comments": 1,
    "community_comments": 0,
-   "last_activity": "2026-11-13T05:32:33Z",
+   "last_activity": "2026-11-24T15:36:56Z",
    "pulse": true
   },
   {
