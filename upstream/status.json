@@ -1,5 +1,5 @@
 {
- "as_of": "2026-11-24T15:59:38Z",
+ "as_of": "2026-11-26T01:02:02Z",
  "window_days": 14,
  "count": 20,
  "with_project_activity": 19,
@@ -935,7 +935,7 @@
    "reporter_comments": 4,
    "community_comments": 0,
    "last_activity": "2026-11-10T11:44:42Z",
-   "pulse": true
+   "pulse": false
   },
   {
    "project": "Apple Metal",
